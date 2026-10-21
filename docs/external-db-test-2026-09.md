@@ -1,7 +1,7 @@
-# 外部 DB 連携 検証手順（S3 手動 smoke / S7 実 DB 検証）
+# 外部 DB 連携 検証手順（S3 手動 smoke / S7 実 DB 検証 / R2a の DB ブリッジ）
 
 作成日: 2026-09-07
-状態: **手順のみ（未実施）**。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
+状態: **手順のみ（未実施）**。2026-10-21（R2a-3c）: §3.1 に DB ブリッジ（取り込み口 `push`）の実機確認 B-16〜B-28 を追加（Hub 内の DB Source と同じ SQL を読むブリッジを並べて値と品質の一致を確かめる。自動テスト `bridge_parity.rs` の実機版、オーナー同席で行う。未実施）。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
 対象: [banto-hub-external-db-design.md](banto-hub-external-db-design.md) の DB Source（#228）と DB Sink（#229）。設計の決定事項は同書 §6、実装の所在は §7。
 
 関連: [real-machine-test-2026-09.md](real-machine-test-2026-09.md)（実機検証の記録の書き方の先例）、[banto-hub-operations.md](banto-hub-operations.md)（Hub の起動・サービス化）。
@@ -71,12 +71,33 @@ CREATE TABLE tag_history (ts timestamptz NOT NULL, tag_id bigint NOT NULL, exter
 | B-14 | 既設の `BantoHub` と `BantoHubSink` に対し、管理者で `banto-hub.exe install` と `banto-hub-sink.exe install` を再実行（#589）                                                                                                                | エラーにならない。`sc qc` の `START_TYPE` は更新前と同じ。レジストリ `HKLM\SYSTEM\CurrentControlSet\Services\<名前>\PreshutdownTimeout` が両方とも `30000`。出力に「起動種別と ACL は変更していません」                                                         |
 | B-15 | 新しいバイナリで両サービスを再起動し、収集と sink の INSERT が続いている状態で OS を再起動                                                                                                                                                   | Hub のサービスログに PRESHUTDOWN の「受けました」と「完了しました」（または予算超過の warn）。sink のログに「完了しました」または「打ち切りました」と送信できなかった行数。再起動直前の行が PostgreSQL に残る。`Stop-Service` だけでは PRESHUTDOWN の行は出ない |
 
+## 3.1 DB ブリッジ（取り込み口 `push`、R2a）の実機確認
+
+R2a-3c（2026-10-21）で追加。**オーナー同席で行う（未実施）**。§2・§3 と同じ機材で、Hub 内の DB Source（A-1〜A-5 の接続・グループ・タグ）を残したまま、同じ SQL を読む DB ブリッジの `push` 接続を並べ、両方のタグが同じ値・同じ品質を出すことを確かめる（自動テストは `apps/banto-hub-sink/tests/bridge_parity.rs`、[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §10.4 の 11 場面。実機ではネットワーク越しの DB・サービスとしてのサイドカー・画面を確かめる）。運用の手順は [banto-hub-operations.md](banto-hub-operations.md) §12「DB ブリッジ（取り込み口 `push`）」。
+
+| #    | 手順                                                                                                                                                                                                                                        | 期待                                                                                                                                                                                                                 |
+| ---- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| B-16 | 接続を作成: protocol `push`、受信のタイムアウト 10 秒、ブリッジの区画で読み取り先 = A-1 の接続、クエリ = A-3 と同じ SQL・周期 1000ms、列 = 4 列（キー = 列名）。この接続の下にグループを作り、A-5 と同じ型で 4 タグ（address = キー）を登録 | 量の見積もり（約 1 メッセージ/秒・4 件/秒）が上限の 8 割以内と表示されて保存できる。再設定のドロワーに送り手向けの URL（`/api/v1/ingest/{id}/…`）とスコープ `ingest:#{id}` が出る                                    |
+| B-17 | API キー画面で `admin` + `read` + `ingest:#{B-16 の id}` のキーを発行 → `banto-hub-sink.toml` の `api_key` を差し替え → `prepare-sink-config` → 管理者のコンソールで `banto-hub-sink.exe run`（収集は停止中）                               | ログに「ブリッジ {名前}（#id）を開始します」「送信口に繋がりました（… 収集 停止）」。パスワード・キーがログに出ない。DB の `pg_stat_activity` に `banto-hub-sink-bridge {名前}` の接続が**無い**（停止中は繋がない） |
+| B-18 | 収集を開始し、DB Source の 4 タグと B-16 の 4 タグをタグ一覧（または `GET /api/v1/values`）で並べる                                                                                                                                         | 1〜2 周期で両方 Good、**同じ値**（numeric の pressure・bool の running = 1・timestamptz の updated_at = epoch ミリ秒も一致）。状態画面の B-16 の接続は「受信中」、ドロワーの送り手にキーの名前と接続元が出る         |
+| B-19 | A-7（`UPDATE ... temperature = 42.0`）・A-8（`pressure = NULL`）・A-9（`DELETE`、0 行）を順に行い、それぞれ戻す                                                                                                                             | どの段も両方のタグが同じ品質で追従する（A-8 は pressure だけ Bad、A-9 は 4 タグとも Bad で Stale を挟まない）。0 行の間、ドロワーの送り手の状態に「結果が 0 行です」                                                 |
+| B-20 | DB 側で `ALTER TABLE machine_status RENAME TO machine_status_x`（クエリの失敗）→ 10 秒後に名前を戻す                                                                                                                                        | 両方とも 1 周期だけ前の値で Stale、その後 Bad。名前を戻すと設定の変更なしで Good（DB Source は 5 秒以内）。送り手の状態に「クエリが失敗しました」                                                                    |
+| B-21 | PostgreSQL を停止して 1 分、再起動                                                                                                                                                                                                          | 両方 Bad、送り手の状態に「DB に接続できません」（パスワードは出ない）。B-16 の接続は「受信中」のまま（サイドカーと Hub は繋がっている）。再起動で両方とも自動で Good                                                 |
+| B-22 | 収集を停止 → 停止中に `UPDATE ... temperature = 43.0` → 収集を開始                                                                                                                                                                          | 停止で両方 Bad、`pg_stat_activity` にブリッジと DB Source の接続が無い。開始の直後に停止前の 42.0 が Good で出ない（トレンド・記録にも出ない）。最初の問い合わせの後で両方 43.0 の Good                              |
+| B-23 | 収集を停止 → PostgreSQL を停止 → 収集を開始し、30 秒見る → PostgreSQL を起動                                                                                                                                                                | 開始の後も B-16 の 4 タグは Bad のまま（「受信中」= `ping` は続いている）。停止前の値の行が記録に無い。起動で Good                                                                                                   |
+| B-24 | 稼働中に B-16 のブリッジの列から 1 つ（running）を外す（ロックダウン済みなら pending queue → 適用）。タグは残す                                                                                                                             | 適用で running のタグがすぐ Bad、ほかの 3 タグは次の周期から Good（途切れは 1〜2 周期）。サイドカーのログに設定の反映。DB Source の running は Good のまま。列を戻すと running も Good                               |
+| B-25 | サイドカーを Ctrl+C（サービスなら `Stop-Service BantoHubSink`）で止めて 30 秒、再開                                                                                                                                                         | 止めてから約 10 秒（受信のタイムアウト）は直前の値で Good、その後 4 タグ Bad・「送り手待ち」・接続イベント `plc_disconnected`（「送り手からの通信が … 秒ありません」）。再開で Good。DB Source は影響を受けない      |
+| B-26 | B-17 のキーを `admin` + `read` だけのキーに戻して起動                                                                                                                                                                                       | ログに「ブリッジ … は動かしません: 権限なし」が 1 回。DB に繋がず、B-16 の接続は「送り手待ち」。Sink（B-4）は動き続ける                                                                                              |
+| B-27 | Hub を再起動（B-17 のキーに戻した後）                                                                                                                                                                                                       | サイドカーは落ちずに 1 秒 → 30 秒のバックオフで再接続し、Hub の収集が Running に戻ると Good。Sink の購読も再開                                                                                                       |
+| B-28 | **S7 本番**: B-13 の 24 時間に B-16 のブリッジを含める（同じ DB を DB Source とブリッジの両方で読む）                                                                                                                                       | 24 時間の間、両方のタグの値と品質が一致し続ける。状態画面の取り込み口の `rateLimited`・`tooManyItems`・`rejected` が 0。切断・再接続・DB 再起動の後も両方が同じ状態に戻る                                            |
+
 ## 4. 記録すべきもの
 
 - Hub と サイドカーの版（コミット）、PostgreSQL の版、ネットワーク構成（同一機 / LAN）
 - 各項目の合否と、期待と違った挙動（機材の癖と製品の問題を分けて書く。先例: real-machine-test-2026-09.md §「機材の癖」）
 - 24 時間の間の `dropped` / `restarts` / `lastError` の推移と、DB 側の行数・欠落
 - サイドカーのログのうち warn 以上
+- DB ブリッジ（§3.1）: DB Source とブリッジのタグの値・品質が食い違った時刻と内容、取り込み口の状態（`accepted`・`rejected`・`rateLimited`・送り手の状態）の推移
 
 ## 5. 結果
 

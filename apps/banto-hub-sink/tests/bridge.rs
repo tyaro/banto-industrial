@@ -26,9 +26,10 @@
 //!   （DB に繋がない・送信口に繋がない・パスワードを受け取らない）。
 //! - `an_unreachable_db_sends_bad_and_reports_it`: DB に届かない（接続の失敗）で全キー
 //!   `bad` を送り、`status` で知らせる。
-//! - `three_queries_at_the_registration_limit_are_never_rate_limited`: §10.4 の 9（上限
-//!   ちょうどの 3 クエリで 60 秒間 `rate_limited` / `too_many_items` が 0 件、全キーが Good、
-//!   Hub 内の Source と同じ値）。
+//! - §10.4 の 9（上限ちょうどの 3 クエリで 60 秒間 `rate_limited` / `too_many_items` が
+//!   0 件）は、R2a-3c で突き合わせのテスト `tests/bridge_parity.rs` の
+//!   `parity_9_three_queries_at_the_registration_limit` へ移した（§10.4 の 11 場面を 1 つの
+//!   ファイルに並べるため。60 秒のテストを 2 本にしない）。
 //! - `a_config_change_while_disconnected_is_fetched_before_sending` ほか 3 本: §10.3 の
 //!   実装の注 (3)（PR #764 のオーナー再レビュー P2）。`welcome` のたびに設定を取り直し、
 //!   `welcome` の後に始まった取得が成功するまで送らない。実 Hub は購読の後の変更にしか
@@ -67,7 +68,7 @@ use banto_hub_sink::SidecarConfig;
 use banto_server::{start, AuthState, Identity, ServerConfig, SessionValidation};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
-    TagInput, TagService, DB_TAG_KIND, PLC_TAG_KIND, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
+    TagInput, TagService, PLC_TAG_KIND, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
 };
 use banto_tstore::SystemClock;
 use futures_util::{SinkExt, StreamExt};
@@ -1006,179 +1007,6 @@ async fn an_unreachable_db_sends_bad_and_reports_it() {
     );
     let status = hub.sender_status(push.id).unwrap_or_default();
     assert!(!status.contains(&role.password), "{status}");
-
-    assert!(bridge.shutdown(Duration::from_secs(10)).await);
-    app.shutdown().await;
-    role.drop_role(&admin).await;
-    admin.close().await;
-}
-
-/// §10.4 の 9（§11 の R2a-3b「複数クエリの合計」）: 見積もりの上限ちょうどの設定（周期
-/// 500 ms のクエリ 3 本、A は 1,800 件で 2 メッセージ、B・C は各 100 件。合計 8 メッセージ /
-/// 秒・4,000 件 / 秒）で、60 秒の間 `rate_limited` / `too_many_items` が 0 件、全キーが Good で、
-/// Hub 内の Source（同じ SQL の `db` タグ）と同じ値。
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn three_queries_at_the_registration_limit_are_never_rate_limited() {
-    let target = require_pg!();
-    let admin = PgPool::connect(&target.url).await.expect("connect test pg");
-    let role = TestRole::create(&admin, "limit").await;
-    let app = test_app().await;
-    let connections = PlcConnectionService::new(app.pool.clone());
-    let pg = connections
-        .create(postgres_input("pg-limit", &target, &role))
-        .await
-        .expect("postgres connection");
-    let source_name = format!("Limit-{}", std::process::id());
-    // A は 1,800 キーを 18 列に（同じ列を複数のキーへ - 射影は 18 列）。
-    let sql_a = format!(
-        "SELECT {}",
-        (0..18)
-            .map(|c| format!("{}.25::float8 AS a{c}", c + 1))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    let keys_a: Vec<(String, String)> = (0..1_800)
-        .map(|i| (format!("a{}", i % 18), format!("A.{i:04}")))
-        .collect();
-    let keys_b: Vec<(String, String)> = (0..100)
-        .map(|i| ("b".to_string(), format!("B.{i:03}")))
-        .collect();
-    let keys_c: Vec<(String, String)> = (0..100)
-        .map(|i| ("c".to_string(), format!("C.{i:03}")))
-        .collect();
-    let settings = bridge_settings(
-        pg.id,
-        10_000,
-        &[
-            Query {
-                name: "A",
-                period_ms: 500,
-                sql: &sql_a,
-                columns: keys_a.clone(),
-            },
-            Query {
-                name: "B",
-                period_ms: 500,
-                sql: "SELECT 2.5::float8 AS b",
-                columns: keys_b.clone(),
-            },
-            Query {
-                name: "C",
-                period_ms: 500,
-                sql: "SELECT true AS c",
-                columns: keys_c.clone(),
-            },
-        ],
-    );
-    // 登録時の見積もりがちょうど上限（8 割）であること（拒否の例は単体テスト）。
-    let load = banto_tags::bridge_load(
-        &banto_tags::validate_push_settings(&settings)
-            .expect("the §10.4 #9 configuration is accepted")
-            .bridge
-            .unwrap(),
-    );
-    assert_eq!(load.items_per_minute, 4_000 * 60);
-    assert_eq!(load.messages_per_minute, 8 * 60);
-    let push = connections
-        .create(push_input(&source_name, settings))
-        .await
-        .expect("push connection");
-    let all_keys: Vec<(String, &str)> = keys_a
-        .iter()
-        .chain(&keys_b)
-        .chain(&keys_c)
-        .map(|(_, key)| (key.clone(), "f64"))
-        .collect();
-    push_tags(&app, push.id, &all_keys).await;
-    // Hub 内の Source（同じ SQL の `db` タグ）- 値の一致の比較用。
-    let db_group = CollectionGroupService::new(app.pool.clone())
-        .create(CollectionGroupInput {
-            name: "q".to_string(),
-            plc_connection_id: pg.id,
-            period_ms: 500,
-            enabled: true,
-            default_writable: false,
-            query_sql: Some(sql_a.clone()),
-        })
-        .await
-        .expect("db group");
-    TagService::new(app.pool.clone())
-        .create(tag_input("a5", db_group.id, "a5", "f32", DB_TAG_KIND))
-        .await
-        .expect("db tag");
-    app.manager.rebuild().await.expect("rebuild");
-    let api_key = issue_key(
-        &app,
-        "bridge-limit",
-        &[
-            "admin".to_string(),
-            "read".to_string(),
-            format!("ingest:#{}", push.id),
-        ],
-    )
-    .await;
-    collection(&app, "start").await;
-    let bridge = spawn_bridge(&app, &api_key);
-
-    // 全キーが Good になるまで待つ（立ち上がり）。
-    let ext = |i: usize| push_external(&source_name, i);
-    let all_good = |values: &std::collections::HashMap<String, (Option<f64>, String)>| {
-        (0..all_keys.len()).all(|i| {
-            values
-                .get(&ext(i))
-                .is_some_and(|(v, q)| q == "good" && v.is_some())
-        })
-    };
-    let ready = wait_until(Duration::from_secs(30), || async {
-        all_good(&all_values(&app).await)
-    })
-    .await;
-    assert!(ready, "{:?}", bridge.statuses());
-    let hub = app.manager.ingest_hub();
-    let hub_status = |hub: &banto_hub_core::ingest::IngestHub| {
-        hub.status()
-            .into_iter()
-            .find(|s| s.connection_id == push.id)
-            .unwrap()
-    };
-    let accepted_before = hub_status(&hub).accepted;
-
-    // 60 秒（§10.4 の 9）。途中も全キーが Good のまま。
-    let started = tokio::time::Instant::now();
-    while started.elapsed() < Duration::from_secs(60) {
-        tokio::time::sleep(Duration::from_secs(10)).await;
-        let values = all_values(&app).await;
-        assert!(all_good(&values), "a key dropped out of Good");
-        let status = hub_status(&hub);
-        assert_eq!(status.rate_limited, 0, "{status:?}");
-        assert_eq!(status.too_many_items, 0, "{status:?}");
-    }
-    let status = hub_status(&hub);
-    assert_eq!(status.rate_limited, 0, "{status:?}");
-    assert_eq!(status.too_many_items, 0, "{status:?}");
-    assert_eq!(status.rejected, 0, "{status:?}");
-    // 60 秒で 4,000 件 / 秒の 9 割以上が受け付けられた（毎周期送れている）。
-    let accepted = status.accepted - accepted_before;
-    assert!(accepted >= 4_000 * 60 * 9 / 10, "accepted {accepted}");
-    let bridge_side = bridge_status(&bridge, push.id).unwrap();
-    assert_eq!(bridge_side.rate_limited, 0, "{bridge_side:?}");
-    assert_eq!(bridge_side.too_many_items, 0, "{bridge_side:?}");
-    assert_eq!(bridge_side.superseded_cycles, 0, "{bridge_side:?}");
-    // 1 周期は 4 メッセージ（A が 2 つに分かれる）。
-    assert!(
-        bridge_side.sent_messages >= bridge_side.sent_items / 1_000,
-        "{bridge_side:?}"
-    );
-
-    // Hub 内の Source と同じ値（A の列 a5 = 6.25 を送るキーと、`db` タグ a5）。
-    let values = all_values(&app).await;
-    let bridge_value = values.get(&ext(5)).cloned().unwrap();
-    let source_value = values.get("pg-limit.q.a5").cloned().unwrap();
-    assert_eq!(bridge_value, (Some(6.25), "good".into()));
-    assert_eq!(bridge_value, source_value);
-    // B（2.5）と C（bool → 1.0）。
-    assert_eq!(values.get(&ext(1_800)).cloned().unwrap().0, Some(2.5));
-    assert_eq!(values.get(&ext(1_900)).cloned().unwrap().0, Some(1.0));
 
     assert!(bridge.shutdown(Duration::from_secs(10)).await);
     app.shutdown().await;

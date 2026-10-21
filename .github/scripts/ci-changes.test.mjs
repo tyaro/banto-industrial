@@ -508,6 +508,12 @@ const TABLE = [
 		['apps/banto-hub-sink/src/main.rs'],
 		{ ...NONE, run_rust: true, rust_args: '-p banto-hub-sink', run_rust_db_source: true }
 	],
+	// R2a-3c: 突き合わせのテスト（§10.4、R2a の完了条件）は PostgreSQL のジョブで走る。
+	[
+		'banto-hub-sink の統合テストだけ',
+		['apps/banto-hub-sink/tests/bridge_parity.rs'],
+		{ ...NONE, run_rust: true, rust_args: '-p banto-hub-sink', run_rust_db_source: true }
+	],
 	['Cargo.lock', ['Cargo.lock'], ALL_BUT_FRONTEND()],
 	['root Cargo.toml', ['Cargo.toml'], ALL_BUT_FRONTEND()],
 	['rust-toolchain.toml', ['rust-toolchain.toml'], ALL_BUT_FRONTEND()],
