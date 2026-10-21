@@ -34,7 +34,13 @@ const REPO_ROOT = fileURLToPath(new URL('../../', import.meta.url));
 const G = {
 	packages: [
 		{ name: 'banto-plc-address', dir: 'crates/banto-plc-address', deps: [] },
-		{ name: 'banto-tags', dir: 'crates/banto-tags', deps: ['banto-plc-address'] },
+		// R2b-1c: 接続の settings を `banto_driver_api::Settings` に直して検証する
+		// （`settings_json.rs`、`with_registry`）ので banto-driver-api に依存する。
+		{
+			name: 'banto-tags',
+			dir: 'crates/banto-tags',
+			deps: ['banto-driver-api', 'banto-plc-address']
+		},
 		// R1-1: 公開するドライバ API（依存ゼロ）と、その型を再輸出する banto-plc。
 		{ name: 'banto-driver-api', dir: 'crates/banto-driver-api', deps: [] },
 		// R1-2: 公開する適合テスト一式（API にだけ依存）。
@@ -406,16 +412,17 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-driver-api（R1-1 の公開 crate。MSRV / semver の driver-api ジョブが走る。R1-3b から core が直接依存するので hub 側も走る）',
+		'banto-driver-api（R1-1 の公開 crate。MSRV / semver の driver-api ジョブが走る。R1-3b から core が直接依存するので hub 側も走る。R2b-1c から banto-tags が依存するので、その逆依存の chronogazer も走る）',
 		['crates/banto-driver-api/src/types.rs', 'crates/banto-driver-api/CHANGELOG.md'],
 		{
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
+			run_e2e_chronogazer: true,
 			run_driver_api: true
 		}
 	],

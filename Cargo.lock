@@ -1074,6 +1074,7 @@ name = "banto-tags"
 version = "0.2.0-alpha.33"
 dependencies = [
  "banto-core",
+ "banto-driver-api",
  "banto-plc-address",
  "banto-storage",
  "serde",

@@ -7,7 +7,7 @@
 //! - [`LegacyDriver`] is [`SlmpDriver`]'s `DriverBase` plus a `connect`
 //!   that builds the connection the way `dial` does (`slmp_config_for` on
 //!   a `PlcConnection` made from the settings, the inverse of
-//!   `banto_drivers::settings_from_connection`), with the context's
+//!   `banto_tags::settings_to_api`), with the context's
 //!   timeouts, and runs this crate's `connector`.
 //! - [`LegacySession`] turns each `TagSpec` back into the request the
 //!   production read / write paths build (`Address::parse_slmp` of the
@@ -99,7 +99,7 @@ impl DriverBase for LegacyDriver {
     }
 }
 
-/// The `PlcConnection` whose `banto_drivers::settings_from_connection` is
+/// The `PlcConnection` whose `banto_tags::settings_to_api` is
 /// `settings` (absent keys take the column defaults).
 fn connection_from(settings: &Settings) -> Result<(PlcConnection, u16), FatalError> {
     let port: u16 = settings

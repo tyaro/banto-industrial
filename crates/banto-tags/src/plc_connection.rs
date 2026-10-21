@@ -241,7 +241,10 @@
 //! connection with `pushSourceUnavailable`, and ChronoGazer's own protocol
 //! allow-list never offered it.
 
+use std::sync::Arc;
+
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
+use banto_driver_api::DriverRegistry;
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
@@ -439,7 +442,7 @@ fn default_word_order() -> String {
 /// `"virtual"`/`"postgres"` fall in the `else` arm and get
 /// [`WORD_ORDER_LOW_HIGH`]; neither ever reads the column, and
 /// [`normalize_postgres_input`] overwrites it for `"postgres"` anyway.
-fn default_word_order_for(protocol: &str) -> String {
+pub(crate) fn default_word_order_for(protocol: &str) -> String {
     if protocol == MODBUS_PROTOCOL {
         WORD_ORDER_HIGH_LOW.to_string()
     } else {
@@ -534,7 +537,7 @@ fn normalize_push_input(mut input: PlcConnectionInput) -> PlcConnectionInput {
 /// `word_order` unconditionally for their protocol), so a
 /// `"postgres"`/`"hub"`/`"push"` row still ends up carrying the plain column
 /// default no matter what - or whether - the caller sent.
-fn normalize_plc_connection_input(input: PlcConnectionInput) -> PlcConnectionInput {
+pub(crate) fn normalize_plc_connection_input(input: PlcConnectionInput) -> PlcConnectionInput {
     normalize_push_input(normalize_hub_input(normalize_postgres_input(
         normalize_word_order_input(input),
     )))
@@ -1336,11 +1339,35 @@ const COLUMNS: &str =
 #[derive(Clone)]
 pub struct PlcConnectionService {
     pool: SqlitePool,
+    /// R2b-1c（docs/banto-hub-connection-settings-design.md §4.2）:
+    /// [`Self::with_registry`] で渡されたレジストリ。**保存の経路はまだ読まない**
+    /// （旧い検証のまま）。R2b-1d が検証の正をこちらへ移す。
+    registry: Option<Arc<DriverRegistry>>,
 }
 
 impl PlcConnectionService {
+    /// 旧規則（[`ALLOWED_PROTOCOLS`] と手書きの検証）のサービス。ChronoGazer と
+    /// `banto-tags` のテストが使う。
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            registry: None,
+        }
+    }
+
+    /// レジストリを持つサービス（Hub、設計 §4.2）。R2b-1c では保存の振る舞いは
+    /// [`Self::new`] と同じ（レジストリは [`Self::registry`] で取り出して
+    /// [`crate::settings_json::validate_settings_with_registry`] に渡すためだけにある）。
+    pub fn with_registry(pool: SqlitePool, registry: Arc<DriverRegistry>) -> Self {
+        Self {
+            pool,
+            registry: Some(registry),
+        }
+    }
+
+    /// [`Self::with_registry`] で渡されたレジストリ。[`Self::new`] では `None`。
+    pub fn registry(&self) -> Option<&Arc<DriverRegistry>> {
+        self.registry.as_ref()
     }
 
     pub async fn list(&self, params: ListParams) -> Result<ListResult<PlcConnection>, BantoError> {
