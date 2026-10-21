@@ -533,6 +533,8 @@
 		// 決着した古い応答は状態へ書かない。
 		const poller = createSerialPoller({
 			intervalMs: INGEST_STATUS_POLL_MS,
+			// 応答が来ない回は 10 秒で打ち切り、時間切れを表示して次を予約する。
+			timeoutMs: 10_000,
 			run: (signal) => getHubStatus(signal),
 			onResult: (status) => {
 				ingestStatus = status.ingest.find((entry) => entry.connection_id === id) ?? null;
