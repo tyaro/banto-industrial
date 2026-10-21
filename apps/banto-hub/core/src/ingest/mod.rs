@@ -28,6 +28,9 @@
 //!     `denied`（[`audit::KeyDenialThrottle`]）は `IngestHub` に 1 つ置く
 //!     （[`IngestHub::throttle_key_denial`]）。
 //!   - [`rest`] モジュール: `POST /api/v1/ingest/{id}/values`（§6.2）。
+//! - [`ws`] モジュール（R2a-2d）: WebSocket `GET /api/v1/ingest/{id}/stream`（§6.1）。
+//!   1 接続に 1 本だけ（新しい方を使う）の制限と、commit で閉じる理由はこのファイルの
+//!   [`IngestHub::open_ws_session`]（下の「WebSocket の 1 本の制限」）。
 //!
 //! 規則そのもの（キーの文法、`settings` の検証、上限の定数 `PUSH_LIMITS`、ブリッジの
 //! 量の見積もり `bridge_load`）は `banto_tags::push` にあり、ここは包むだけ
@@ -52,8 +55,13 @@
 //!   **1 メッセージにつき 1 回**書き込みで取り、全件をその中で判定・反映する
 //!   （スナップショットがメッセージの途中を見ない）。`snapshot` は読み取りで取り、
 //!   保持値の `HashMap` を複製するだけ。
-//! - 順序は常に「外側 → 接続」。どちらも `.await` をまたいで持たない（同期の
-//!   区間だけ）。`apply` は接続のロックを持つ間ずっと外側の読み取りも持つので、
+//! - 順序は常に「外側 → WS の登録（`SlotShared::ws`）→ 接続の保持値」。保持値を
+//!   持ったまま WS の登録を取る経路は無い（`open_ws_session` は保持値を読み終えてから
+//!   登録を取り、`commit` は保持値と登録を別々に取る）。上限・監査の抑制（slot の
+//!   未知のキー、`IngestHub` の `key_denials`）・送り手の `status` の `Mutex` は
+//!   末端で、他のロックを中で取らない（`key_denials` は外側のロックも持たずに取る）。
+//!   どれも `.await` をまたいで持たない（同期の区間だけ）。`apply` は接続のロックを
+//!   持つ間ずっと外側の読み取りも持つので、
 //!   `commit` が接続の設定（登録済みのキー・送る集合）を入れ替える瞬間に、古い
 //!   設定で判定した値が新しい設定の下へ書き込まれることは無い。
 //! - 接続の保持値（`SlotShared`）は `Arc` で、`commit` は設定（`SlotConfig`）だけを
@@ -77,6 +85,30 @@
 //! （[`IngestHub::subscribe_state`]）。R2a-2d の WebSocket がこれを読んで
 //! `{"op":"state",..}` を送る。R2a-1c ではテストがこれで「`collecting: true` が
 //! 送られたか」を確かめる。
+//!
+//! ## WebSocket の 1 本の制限（§6.1・§7、Q10 = (a)「新しい方を使う」、R2a-2d）
+//!
+//! 接続の slot（`SlotShared::ws`）に「今の WS」を 1 つだけ登録する（番号と、閉じる
+//! 理由を渡す `oneshot`）。
+//!
+//! - [`IngestHub::open_ws_session`] は、外側の読み取りロックの下で接続の有無・有効を
+//!   確かめ、前の WS を [`WsEnd::Superseded`] で閉じさせてから自分を登録する。外側の
+//!   ロックの下なので、`commit` と順序が付く（commit が接続を消した・無効にした後の
+//!   登録は断られ、前の登録は commit が閉じさせる）。同時に 2 本が開いても登録は
+//!   `Mutex` の順で、後の方が前の方を閉じさせる。
+//! - [`IngestHub::apply_ws`] / [`IngestHub::ping_ws`] は、登録の `Mutex` を持ったまま
+//!   「自分が今の WS か」を確かめて保持値を書く。閉じさせられた WS の値は、新しい
+//!   WS が登録された後には 1 件も入らない（確かめてから書くまでの間に登録が替わる
+//!   ことは無い）。
+//! - 登録を外すのは [`WsSession`] の `Drop` だけで、**自分の番号のときだけ**外す
+//!   （閉じさせられた古い WS の後片付けが新しい WS の登録を消さない）。
+//! - [`IngestHub::commit`] は、接続が消えたら [`WsEnd::ConnectionRemoved`]、`push` でなく
+//!   なった・有効 / 無効が変わったら [`WsEnd::ConnectionChanged`] で閉じさせる。改名・
+//!   `stale_timeout_ms`・ブリッジの設定の変更では閉じない（束縛は id。ブリッジの設定の
+//!   変更は `state { config_changed: true }`）。
+//! - 再検証（`crate::stream::Revalidator`）は WS 1 本ごとのタイマーで、登録には触れ
+//!   ない。失効で閉じる古い WS と、それを置き換える新しい WS が競っても、古い方の
+//!   `Drop` は自分の番号しか外さない。
 
 pub mod audit;
 pub mod auth;
@@ -84,10 +116,12 @@ pub mod driver;
 pub mod limits;
 pub mod rest;
 pub mod validate;
+pub mod ws;
 
 pub use validate::validate_item;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use banto_collect::{
@@ -101,7 +135,7 @@ use banto_tags::{
 use banto_tstore::Clock;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use utoipa::ToSchema;
 
 /// Hub の収集の計画（厳格版）: `push` 接続を外部の接続として計画する
@@ -246,6 +280,73 @@ pub struct IngestState {
     pub epoch: u64,
     /// ブリッジの設定が変わったことによる通知か（§4.6。ブリッジは設定を取り直す）。
     pub config_changed: bool,
+}
+
+/// `IngestHub` が WS を閉じさせる理由（§6.1。close 1008 の理由文）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsEnd {
+    /// 同じ接続に新しい WS が開いた（Q10 = (a)）。
+    Superseded,
+    /// 接続のプロトコルが `push` でなくなった・有効 / 無効が変わった。
+    ConnectionChanged,
+    /// 接続が削除された。
+    ConnectionRemoved,
+}
+
+impl WsEnd {
+    /// close フレームの理由文・監査の `reason`。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Superseded => "superseded",
+            Self::ConnectionChanged => "connection_changed",
+            Self::ConnectionRemoved => "connection_removed",
+        }
+    }
+}
+
+/// WS の値・`ping` を反映できなかった理由（[`IngestHub::apply_ws`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsRefusal {
+    /// この WS はもう今の WS ではない（新しい WS に置き換えられた・commit が閉じさせた）。
+    NotCurrent,
+    /// REST と同じメッセージ全体の拒否。
+    Refused(ApplyRefusal),
+}
+
+/// 開いている WS 1 本の登録（モジュールの doc「WebSocket の 1 本の制限」）。`Drop` で
+/// 自分の登録だけを外す。
+#[derive(Debug)]
+pub struct WsSession {
+    id: u64,
+    conn_id: i64,
+    shared: Arc<SlotShared>,
+    /// `IngestHub` が閉じさせるときに理由が届く（1 回だけ）。
+    pub ended: oneshot::Receiver<WsEnd>,
+    /// 送り手へ知らせる `state`（開いた時点の値は既読にしてある）。
+    pub state: watch::Receiver<IngestState>,
+}
+
+impl WsSession {
+    /// 接続 id。
+    pub fn connection_id(&self) -> i64 {
+        self.conn_id
+    }
+}
+
+impl Drop for WsSession {
+    fn drop(&mut self) {
+        let mut ws = lock(&self.shared.ws);
+        if ws.as_ref().is_some_and(|entry| entry.id == self.id) {
+            *ws = None;
+        }
+    }
+}
+
+/// slot に登録した今の WS。
+#[derive(Debug)]
+struct WsEntry {
+    id: u64,
+    end: oneshot::Sender<WsEnd>,
 }
 
 /// 1 つの `push` 接続の今の様子（送信口の `welcome` と状態表示、テスト用）。
@@ -440,6 +541,11 @@ struct SlotShared {
     state: watch::Sender<IngestState>,
     limiter: Mutex<limits::ConnectionLimiter>,
     unknown_keys: Mutex<audit::UnknownKeyThrottle>,
+    /// 今の WS（R2a-2d、1 接続に 1 本。モジュールの doc「WebSocket の 1 本の制限」）。
+    ws: Mutex<Option<WsEntry>>,
+    /// 送り手の最後の `status`（§6.1、制御文字を落として 1 KiB に切り詰めたもの）。
+    /// 状態の表示（R2a-2e）が読む。
+    sender_status: Mutex<Option<String>>,
 }
 
 impl SlotShared {
@@ -458,6 +564,16 @@ impl SlotShared {
             state,
             limiter: Mutex::new(limits::ConnectionLimiter::new(limits::PUSH_LIMITS)),
             unknown_keys: Mutex::new(audit::UnknownKeyThrottle::default()),
+            ws: Mutex::new(None),
+            sender_status: Mutex::new(None),
+        }
+    }
+
+    /// 今の WS を `end` で閉じさせて登録を外す（無ければ何もしない）。
+    fn end_ws(&self, end: WsEnd) {
+        if let Some(entry) = lock(&self.ws).take() {
+            // 受け手（WS のループ）が既に終わっていれば届かないが、それで良い。
+            let _ = entry.end.send(end);
         }
     }
 
@@ -502,8 +618,10 @@ pub struct IngestHub {
     inner: RwLock<Inner>,
     clock: Arc<dyn Clock>,
     /// 照合できたキーの `denied` の行の間引き（R2a-2c、§8）。末端のロックで、`inner`
-    /// とも接続のロックとも同時には持たない。
+    /// とも接続のロックとも WS の登録とも同時には持たない。
     key_denials: Mutex<audit::KeyDenialThrottle>,
+    /// WS の登録の番号（[`WsSession`]）。Hub の起動から単調増加。
+    next_ws_id: AtomicU64,
 }
 
 impl std::fmt::Debug for IngestHub {
@@ -522,6 +640,23 @@ fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `ws_id` が今の WS なら登録の `Mutex` を持ったまま返す（呼び出し側は保持値を書き
+/// 終えるまで持つ）。`None`（REST）は登録を見ない。
+fn current_ws_guard(
+    shared: &SlotShared,
+    ws_id: Option<u64>,
+) -> Result<Option<MutexGuard<'_, Option<WsEntry>>>, WsRefusal> {
+    let Some(id) = ws_id else {
+        return Ok(None);
+    };
+    let guard = lock(&shared.ws);
+    if guard.as_ref().is_some_and(|entry| entry.id == id) {
+        Ok(Some(guard))
+    } else {
+        Err(WsRefusal::NotCurrent)
+    }
 }
 
 /// `"conn:{id}"`（`banto_collect` の `ConnectionPlan.key`）の id。
@@ -608,6 +743,7 @@ impl IngestHub {
             inner: RwLock::new(Inner::default()),
             clock,
             key_denials: Mutex::new(audit::KeyDenialThrottle::default()),
+            next_ws_id: AtomicU64::new(1),
         }
     }
 
@@ -650,11 +786,28 @@ impl IngestHub {
                         });
                     }
                     old.shared.apply_effect(effect, collecting, bridge_changed);
+                    // §6.1: 有効 / 無効が変わったら WS を閉じさせる（改名では閉じない）。
+                    if old.config.enabled != config.enabled {
+                        old.shared.end_ws(WsEnd::ConnectionChanged);
+                    }
                     old.shared.clone()
                 }
                 None => Arc::new(SlotShared::new(collecting)),
             };
             next.insert(id, Arc::new(IngestSlot { config, shared }));
+        }
+        // §6.1: 表から消えた接続の WS を閉じさせる。行が残っていれば `push` でなくなった
+        // （プロトコルの変更）、無ければ削除。
+        for (id, old) in &inner.slots {
+            if next.contains_key(id) {
+                continue;
+            }
+            let still_registered = snapshot.connections.iter().any(|conn| conn.id == *id);
+            old.shared.end_ws(if still_registered {
+                WsEnd::ConnectionChanged
+            } else {
+                WsEnd::ConnectionRemoved
+            });
         }
         inner.slots = next;
     }
@@ -709,21 +862,60 @@ impl IngestHub {
         items: &[IngestItem],
         now_ms: i64,
     ) -> ApplyOutcome {
+        self.apply_inner(conn_id, None, message_epoch, items, now_ms)
+            .map_err(|refusal| match refusal {
+                WsRefusal::Refused(refusal) => refusal,
+                // 番号を渡さないので起きない。
+                WsRefusal::NotCurrent => ApplyRefusal::UnknownConnection,
+            })
+    }
+
+    /// WS（R2a-2d）の `values`: [`Self::apply`] と同じ判定を、`session` が今の WS で
+    /// ある間だけ行う（登録の `Mutex` を持ったまま確かめて書く。モジュールの doc
+    /// 「WebSocket の 1 本の制限」）。
+    pub fn apply_ws(
+        &self,
+        session: &WsSession,
+        message_epoch: Option<u64>,
+        items: &[IngestItem],
+        now_ms: i64,
+    ) -> Result<ApplyAck, WsRefusal> {
+        self.apply_inner(
+            session.conn_id,
+            Some(session.id),
+            message_epoch,
+            items,
+            now_ms,
+        )
+    }
+
+    fn apply_inner(
+        &self,
+        conn_id: i64,
+        ws_id: Option<u64>,
+        message_epoch: Option<u64>,
+        items: &[IngestItem],
+        now_ms: i64,
+    ) -> Result<ApplyAck, WsRefusal> {
         let inner = read(&self.inner);
         let slot = inner
             .slots
             .get(&conn_id)
-            .ok_or(ApplyRefusal::UnknownConnection)?;
+            .ok_or(WsRefusal::Refused(ApplyRefusal::UnknownConnection))?;
         if !slot.config.enabled {
-            return Err(ApplyRefusal::ConnectionDisabled);
+            return Err(WsRefusal::Refused(ApplyRefusal::ConnectionDisabled));
         }
+        // 順序: 外側 → WS の登録 → 保持値（モジュールの doc「ロックの形」）。
+        let _current = current_ws_guard(&slot.shared, ws_id)?;
         let mut held = write(&slot.shared.held);
         let epoch_matches = match message_epoch {
             Some(epoch) => epoch == held.epoch,
             None => slot.config.bridge.is_none(),
         };
         if !epoch_matches {
-            return Err(ApplyRefusal::StaleEpoch { epoch: held.epoch });
+            return Err(WsRefusal::Refused(ApplyRefusal::StaleEpoch {
+                epoch: held.epoch,
+            }));
         }
         held.last_seen_ms = Some(now_ms);
 
@@ -755,6 +947,57 @@ impl IngestHub {
     /// 値を伴わない通信（WS の `ping` / `status`）: 最後の通信の時刻だけを進める
     /// （§4.3）。epoch は見ない（`ping` は epoch を持たない）。
     pub fn ping(&self, conn_id: i64, now_ms: i64) -> Result<(), ApplyRefusal> {
+        self.ping_inner(conn_id, None, None, now_ms)
+            .map_err(|refusal| match refusal {
+                WsRefusal::Refused(refusal) => refusal,
+                WsRefusal::NotCurrent => ApplyRefusal::UnknownConnection,
+            })
+    }
+
+    /// WS の `ping`（`status` は `status = Some(..)`）: [`Self::ping`] と同じく最後の通信の
+    /// 時刻を進める。`status` は送り手の最後の状態の文として控える（呼び出し側が
+    /// 制御文字を落として切り詰めたもの）。`session` が今の WS である間だけ。
+    pub fn ping_ws(
+        &self,
+        session: &WsSession,
+        status: Option<String>,
+        now_ms: i64,
+    ) -> Result<(), WsRefusal> {
+        self.ping_inner(session.conn_id, Some(session.id), status, now_ms)
+    }
+
+    fn ping_inner(
+        &self,
+        conn_id: i64,
+        ws_id: Option<u64>,
+        status: Option<String>,
+        now_ms: i64,
+    ) -> Result<(), WsRefusal> {
+        let inner = read(&self.inner);
+        let slot = inner
+            .slots
+            .get(&conn_id)
+            .ok_or(WsRefusal::Refused(ApplyRefusal::UnknownConnection))?;
+        if !slot.config.enabled {
+            return Err(WsRefusal::Refused(ApplyRefusal::ConnectionDisabled));
+        }
+        let _current = current_ws_guard(&slot.shared, ws_id)?;
+        write(&slot.shared.held).last_seen_ms = Some(now_ms);
+        if let Some(status) = status {
+            *lock(&slot.shared.sender_status) = Some(status);
+        }
+        Ok(())
+    }
+
+    /// WS を 1 本開く（R2a-2d、モジュールの doc「WebSocket の 1 本の制限」）。接続が
+    /// 無い・無効なら断る（認証の層を通った後に commit と競った場合）。前の WS は
+    /// [`WsEnd::Superseded`] で閉じさせる。返す [`IngestConnectionInfo`] は登録した時点の
+    /// 様子（`welcome` に使う）で、[`WsSession::state`] はその時点の値を既読にしてある
+    /// （後の変化だけが届く）。
+    pub fn open_ws_session(
+        &self,
+        conn_id: i64,
+    ) -> Result<(WsSession, IngestConnectionInfo), ApplyRefusal> {
         let inner = read(&self.inner);
         let slot = inner
             .slots
@@ -763,8 +1006,53 @@ impl IngestHub {
         if !slot.config.enabled {
             return Err(ApplyRefusal::ConnectionDisabled);
         }
-        write(&slot.shared.held).last_seen_ms = Some(now_ms);
-        Ok(())
+        // 既読にしてから今の様子を読む: 読んだ後の変化は必ず通知として届く。
+        let mut state = slot.shared.state.subscribe();
+        state.borrow_and_update();
+        let info = {
+            let held = read(&slot.shared.held);
+            IngestConnectionInfo {
+                name: slot.config.name.clone(),
+                enabled: slot.config.enabled,
+                bridge: slot.config.bridge.is_some(),
+                epoch: held.epoch,
+                stale_timeout_ms: slot.config.stale_timeout_ms,
+                collecting: inner.collecting,
+                held_values: held.values.len(),
+            }
+        };
+        let id = self.next_ws_id.fetch_add(1, Ordering::Relaxed);
+        let (end, ended) = oneshot::channel();
+        let previous = lock(&slot.shared.ws).replace(WsEntry { id, end });
+        if let Some(previous) = previous {
+            let _ = previous.end.send(WsEnd::Superseded);
+        }
+        Ok((
+            WsSession {
+                id,
+                conn_id,
+                shared: slot.shared.clone(),
+                ended,
+                state,
+            },
+            info,
+        ))
+    }
+
+    /// 接続 `conn_id` に WS が開いているか（状態の表示・テスト用）。
+    pub fn has_ws_session(&self, conn_id: i64) -> bool {
+        read(&self.inner)
+            .slots
+            .get(&conn_id)
+            .is_some_and(|slot| lock(&slot.shared.ws).is_some())
+    }
+
+    /// 送り手の最後の `status`（WS の `status`、R2a-2e の状態の表示が読む）。
+    pub fn sender_status(&self, conn_id: i64) -> Option<String> {
+        let inner = read(&self.inner);
+        let slot = inner.slots.get(&conn_id)?;
+        let status = lock(&slot.shared.sender_status).clone();
+        status
     }
 
     /// 送信口の上限（R2a-2c、§7）: 1 メッセージ（`item_count` 件）を受けてよいか。

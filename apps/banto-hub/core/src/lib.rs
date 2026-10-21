@@ -186,7 +186,9 @@
 //!   `ExternalSource`、R2a-1c）。REST の送信口 `POST /api/v1/ingest/{id}/values`
 //!   （[`ingest::rest`]）と、WebSocket（R2a-2d）も使う共通部品（認証の層
 //!   [`ingest::auth`]・検証 [`ingest::validate`]・上限 [`ingest::limits`]・監査
-//!   [`ingest::audit`]）は R2a-2c
+//!   [`ingest::audit`]）は R2a-2c。WebSocket の送信口
+//!   `GET /api/v1/ingest/{id}/stream`（[`ingest::ws`]、1 接続に 1 本・再検証・背圧）は
+//!   R2a-2d
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み

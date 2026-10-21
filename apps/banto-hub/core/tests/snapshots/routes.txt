@@ -35,6 +35,7 @@ GET /api/tags/group-counts
 GET /api/tags/{id}
 GET /api/users
 GET /api/v1/events
+GET /api/v1/ingest/{id}/stream
 GET /api/v1/openapi.json
 GET /api/v1/status
 GET /api/v1/stream

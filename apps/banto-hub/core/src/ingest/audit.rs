@@ -1,5 +1,5 @@
 //! 送信口の監査（R2a-2c、docs/banto-hub-ingest-design.md §8）。REST と R2a-2d の
-//! WebSocket が同じ関数で記録する。
+//! WebSocket（`super::ws`）が同じ関数で記録する。
 //!
 //! `AuditLogService::record`（DB が応答しないときは保留ファイルへ退避、
 //! `crate::audit_spool`）を使う。`origin` は `"ingest"`、`resource` は `"ingest"`
@@ -16,6 +16,8 @@
 //! | 認証の失敗 | `denied` | 失効・期限切れ・トリップのキー（`resource: "api_keys"`）、`missing_ingest_scope`・`unknown_connection`（`resource: "ingest"`）。存在しないキーは記録しない。**キーごとに 1 時間に 100 行**、超えた分は数だけを 1 行（[`KeyDenialThrottle`]） |
 //! | 未知のキー | `ingest_unknown_key` | (接続, キー) ごとに 1 時間に 1 回。1 時間に 100 キーを超えた分は数だけを 1 行（[`UnknownKeyThrottle`]） |
 //! | 上限の超過 | `ingest_limit_exceeded` / `ingest_limit_cleared` | 超過の始まりと終わりの端だけ（`super::limits`）。**接続ごとに 1 時間に 20 組**、超えた分は組の数だけを 1 行（[`LimitEdgeThrottle`]） |
+//! | WS の接続 | `ingest_connected`（`result: "ok"`） | WS を開いたとき（R2a-2d。REST は記録しない） |
+//! | WS の切断 | `ingest_disconnected`（`result: "ok"`） | WS を閉じたとき。`reason` と受け付けた件数（R2a-2d） |
 //!
 //! ## 監査の行の間引き（2026-10-21 オーナー決定、§8）
 //!
@@ -36,7 +38,9 @@
 //!
 //! 記録は `tokio::spawn` で切り離し、ハンドラはその終わりを待つ
 //! （implementation-checklist §5「handler の中で `await` をまたぐ副作用は接続の
-//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。
+//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。WebSocket は
+//! 受信のループを監査で止めないよう、接続ごとの記録のタスク（[`IngestAuditWriter`]）へ
+//! 渡して待たず、切断の後片付けでその終わりを待つ。
 
 use std::collections::{HashMap, HashSet};
 
@@ -144,6 +148,8 @@ pub struct IngestAuditRow {
     pub resource: &'static str,
     pub entity_id: String,
     pub detail: Value,
+    /// 監査の `result`（拒否・未知のキー・上限は `denied`、WS の接続・切断は `ok`）。
+    pub result: &'static str,
 }
 
 impl IngestAuditRow {
@@ -154,6 +160,7 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail: ctx.detail(json!({ "reason": reason })),
+            result: "denied",
         }
     }
 
@@ -179,6 +186,7 @@ impl IngestAuditRow {
                 "peer": peer,
                 "transport": transport.as_str(),
             }),
+            result: "denied",
         }
     }
 
@@ -200,6 +208,7 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail,
+            result: "denied",
         }
     }
 
@@ -219,6 +228,7 @@ impl IngestAuditRow {
                 "suppressed": record.suppressed.count,
                 "window_start_ms": record.suppressed.window_start_ms,
             }),
+            result: "denied",
         }
     }
 
@@ -252,6 +262,41 @@ impl IngestAuditRow {
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
             detail,
+            result: "denied",
+        }
+    }
+
+    /// WS を開いた（`ingest_connected`、R2a-2d）。REST は記録しない（要求ごとになる）。
+    pub fn connected(ctx: &IngestAuditContext) -> Self {
+        Self {
+            action: "ingest_connected",
+            resource: RESOURCE,
+            entity_id: ctx.connection_id.to_string(),
+            detail: ctx.detail(json!({})),
+            result: "ok",
+        }
+    }
+
+    /// WS を閉じた（`ingest_disconnected`、R2a-2d）。`reason` は §8 の綴り
+    /// （`client_closed` / `superseded` / `revoked` / `connection_changed` /
+    /// `connection_removed` / `backpressure` / `message_too_big`）、`revoked` のときは
+    /// `revoked_reason`（`api_key_revoked` 等）。`accepted` はこの WS で受け付けた件数。
+    pub fn disconnected(
+        ctx: &IngestAuditContext,
+        reason: &'static str,
+        revoked_reason: Option<&'static str>,
+        accepted: u64,
+    ) -> Self {
+        let mut extra = json!({ "reason": reason, "accepted": accepted });
+        if let (Some(revoked), Value::Object(map)) = (revoked_reason, &mut extra) {
+            map.insert("revoked_reason".into(), json!(revoked));
+        }
+        Self {
+            action: "ingest_disconnected",
+            resource: RESOURCE,
+            entity_id: ctx.connection_id.to_string(),
+            detail: ctx.detail(extra),
+            result: "ok",
         }
     }
 }
@@ -263,24 +308,98 @@ pub async fn record(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
         return;
     }
     let audit = audit.clone();
-    let task = tokio::spawn(async move {
-        for row in rows {
-            audit
-                .record(AuditEntry {
-                    actor_username: None,
-                    actor_role: None,
-                    action: row.action,
-                    resource: row.resource,
-                    entity_id: Some(&row.entity_id),
-                    detail: Some(row.detail),
-                    origin: ORIGIN,
-                    result: "denied",
-                })
-                .await;
-        }
-    });
+    let task = tokio::spawn(async move { record_rows(&audit, rows).await });
     if let Err(err) = task.await {
         eprintln!("banto-hub: 取り込みの監査の記録が異常終了しました: {err}");
+    }
+}
+
+/// 1 本の WebSocket の監査の行を、受信のループから切り離して順に記録する送り手
+/// （R2a-2d、PR #759 のレビュー P2-2）。
+///
+/// WS の受信のループは ping・close の知らせ（`superseded` 等）・`state`・キーの再検証を
+/// 1 本の `select!` で回すので、そこで [`record`] を待つと、遅い監査の DB（保留つきで
+/// 1 行あたり最大 `SpoolConfig::timeout`、3 秒）の間ループ全体が止まる（100 個の未知の
+/// キーで数分、`stale_timeout_ms` で Down・置き換えの遅れ）。そこで行は接続ごとの
+/// 記録のタスク（`tokio::spawn`）へチャンネルで渡し、ループは待たない。
+///
+/// - **行を落とさない**: チャンネルは容量なし（unbounded）。積み残しの上限は間引きが
+///   決める: 1 本の接続で 1 時間に出る行は未知のキー 101・上限の端 41 で頭打ちで、
+///   ほかは接続・切断と、WS を閉じる拒否の `denied`（1 本に 1 回）だけ（このモジュールの
+///   doc「監査の行の間引き」）。記録は 1 行あたり保留の上限（3 秒）で終わるので、DB が止まったままでも
+///   1 時間に 1,200 行は捌け、積み残しは増え続けない。容量つきにして満杯で待つとループが
+///   止まり（P2-2 そのもの）、満杯で捨てると監査を落とすので、どちらも採らない。
+/// - **順序**: 消費するのは 1 つのタスクだけなので、積んだ順（`ingest_connected` →
+///   …→ `ingest_disconnected`）に記録する。
+/// - **切断で捨てられない**: 記録は切り離したタスクで走る（[`record`] と同じ理由、
+///   implementation-checklist §5）。WS の後片付けは [`Self::finish`] でその終わりを待つ
+///   （REST の「切り離したタスクをハンドラが待つ」と同じ形。待つのは TCP を閉じた後・
+///   登録を外した後なので、待っている間に止まるものは無い）。
+/// - 記録のタスクが先に終わっていた（panic）ときは、その行を [`record`] と同じく
+///   切り離したタスクで記録し直す（黙って落とさない）。
+pub struct IngestAuditWriter {
+    audit: AuditLogService,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<IngestAuditRow>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl IngestAuditWriter {
+    /// 記録のタスクを立てる。
+    pub fn spawn(audit: &AuditLogService) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<IngestAuditRow>>();
+        let service = audit.clone();
+        let task = tokio::spawn(async move {
+            while let Some(rows) = rx.recv().await {
+                record_rows(&service, rows).await;
+            }
+        });
+        Self {
+            audit: audit.clone(),
+            tx,
+            task,
+        }
+    }
+
+    /// 行を積む（待たない）。空なら何もしない。
+    pub fn push(&self, rows: Vec<IngestAuditRow>) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(tokio::sync::mpsc::error::SendError(rows)) = self.tx.send(rows) {
+            eprintln!(
+                "banto-hub: 取り込みの監査の記録のタスクが終わっていたので、{} 行を別に記録します",
+                rows.len()
+            );
+            let audit = self.audit.clone();
+            tokio::spawn(async move { record_rows(&audit, rows).await });
+        }
+    }
+
+    /// 最後の行を積み、積んだ行がすべて記録されるまで待つ。
+    pub async fn finish(self, rows: Vec<IngestAuditRow>) {
+        self.push(rows);
+        let Self { tx, task, .. } = self;
+        drop(tx);
+        if let Err(err) = task.await {
+            eprintln!("banto-hub: 取り込みの監査の記録が異常終了しました: {err}");
+        }
+    }
+}
+
+async fn record_rows(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
+    for row in rows {
+        audit
+            .record(AuditEntry {
+                actor_username: None,
+                actor_role: None,
+                action: row.action,
+                resource: row.resource,
+                entity_id: Some(&row.entity_id),
+                detail: Some(row.detail),
+                origin: ORIGIN,
+                result: row.result,
+            })
+            .await;
     }
 }
 
@@ -1117,5 +1236,35 @@ mod tests {
         assert_eq!(rows[2].detail["kind"], "items_per_sec");
         assert_eq!(rows[3].action, "ingest_limit_cleared");
         assert_eq!(rows[3].detail["rejected"], 3);
+        for row in &rows {
+            assert_eq!(row.result, "denied");
+        }
+    }
+
+    /// WS の接続・切断（R2a-2d）は `result: "ok"`。切断は理由と受け付けた件数だけで、
+    /// 値は載らない。`revoked` のときだけ理由文が付く。
+    #[test]
+    fn ws_session_rows_are_ok_and_carry_reason_and_count() {
+        let ctx = IngestAuditContext {
+            transport: Transport::Ws,
+            ..ctx()
+        };
+        let connected = IngestAuditRow::connected(&ctx);
+        assert_eq!(
+            (connected.action, connected.result, connected.resource),
+            ("ingest_connected", "ok", "ingest")
+        );
+        assert_eq!(connected.detail["transport"], "ws");
+        let closed = IngestAuditRow::disconnected(&ctx, "superseded", None, 42);
+        assert_eq!(
+            (closed.action, closed.result),
+            ("ingest_disconnected", "ok")
+        );
+        assert_eq!(closed.detail["reason"], "superseded");
+        assert_eq!(closed.detail["accepted"], 42);
+        assert!(closed.detail.get("revoked_reason").is_none());
+        let revoked = IngestAuditRow::disconnected(&ctx, "revoked", Some("api_key_revoked"), 0);
+        assert_eq!(revoked.detail["revoked_reason"], "api_key_revoked");
+        assert_eq!(revoked.entity_id, "12");
     }
 }
