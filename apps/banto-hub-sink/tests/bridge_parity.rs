@@ -236,12 +236,17 @@ impl TestRole {
 
     async fn drop_role(self, admin: &PgPool) {
         self.terminate_sessions(admin).await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP ROLE IF EXISTS \"{}\"",
-            self.name
-        )))
-        .execute(admin)
-        .await;
+        // 表への権限が残っていると `DROP ROLE` が依存で失敗するので、先に権限を外す。失敗を
+        // 握りつぶすと開発用 DB に LOGIN ロールが残り続けるため、ここで落とす。
+        for sql in [
+            format!("DROP OWNED BY \"{}\"", self.name),
+            format!("DROP ROLE \"{}\"", self.name),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(admin)
+                .await
+                .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        }
     }
 }
 
@@ -935,13 +940,21 @@ impl Fixture {
             );
         }
         self.app.shutdown().await;
-        self.role.drop_role(&self.admin).await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TABLE IF EXISTS \"{}\"",
-            self.table
-        )))
-        .execute(&self.admin)
+        // 表を先に落とす（ロールは表への権限を持つ）。その後にロールを落とし、残っていない
+        // ことまで確かめる。
+        execute(
+            &self.admin,
+            &format!("DROP TABLE IF EXISTS \"{}\"", self.table),
+        )
         .await;
+        let role_name = self.role.name.clone();
+        self.role.drop_role(&self.admin).await;
+        let leftover: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_roles WHERE rolname = $1")
+            .bind(&role_name)
+            .fetch_optional(&self.admin)
+            .await
+            .expect("check role");
+        assert_eq!(leftover, None, "role {role_name} must be dropped");
         self.admin.close().await;
     }
 }

@@ -190,12 +190,17 @@ impl TestRole {
 
     async fn drop_role(self, admin: &PgPool) {
         self.terminate_sessions(admin).await;
-        let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP ROLE IF EXISTS \"{}\"",
-            self.name
-        )))
-        .execute(admin)
-        .await;
+        // 表への権限が残っていると `DROP ROLE` が依存で失敗するので、先に権限を外す。失敗を
+        // 握りつぶすと開発用 DB に LOGIN ロールが残り続けるため、ここで落とす。
+        for sql in [
+            format!("DROP OWNED BY \"{}\"", self.name),
+            format!("DROP ROLE \"{}\"", self.name),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(admin)
+                .await
+                .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        }
     }
 }
 
