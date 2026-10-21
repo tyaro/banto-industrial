@@ -203,7 +203,15 @@ pub const INGEST_SCOPE_PREFIX: &str = "ingest:#";
 /// 発行時の検証（[`validate_scope`]）と、一覧の表示で id を取り出す側
 /// （`crate::mcp` の `list_api_keys`）が同じこの関数を使う。
 pub fn parse_ingest_scope(scope: &str) -> Option<i64> {
-    let digits = scope.strip_prefix(INGEST_SCOPE_PREFIX)?;
+    parse_canonical_connection_id(scope.strip_prefix(INGEST_SCOPE_PREFIX)?)
+}
+
+/// 接続 id の 10 進の正規形（`[1-9][0-9]*`・`i64` の範囲）だけを受ける。
+/// [`parse_ingest_scope`] の `#` の後ろと、送信口のパスの `{id}`
+/// （R2a-2c、`crate::ingest::auth`。docs/banto-hub-ingest-design.md §6 の
+/// 404 `unknown_connection`（パスの形））が同じこの関数を使う - スコープの
+/// 文字列とパスの id が同じ規則で 1 対 1 に対応するように。
+pub fn parse_canonical_connection_id(digits: &str) -> Option<i64> {
     let mut bytes = digits.bytes();
     if !matches!(bytes.next(), Some(b'1'..=b'9')) {
         return None;

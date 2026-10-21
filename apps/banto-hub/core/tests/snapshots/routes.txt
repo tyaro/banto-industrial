@@ -80,6 +80,7 @@ POST /api/tags/expression/check
 POST /api/tags/list
 POST /api/users
 POST /api/users/{id}/reset-password
+POST /api/v1/ingest/{id}/values
 POST /api/v1/values/batch
 POST /api/v1/values/{tag}
 POST /api/write-audit/list

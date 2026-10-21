@@ -95,7 +95,11 @@ banto-expr = { path = "../../../crates/banto-expr" }
 # sources`/`advisories` が deny.toml 無改造で green と確認済み。
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate", "postgres", "tls-rustls-ring-native-roots"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# R2a-2c（docs/banto-hub-ingest-design.md §6.3）: `float_roundtrip` - 取り込み口
+# `push` の値（`src/ingest/validate.rs`）の浮動小数を往復で一致させる。既定の解析は
+# 最後の桁がずれうるので、DB ブリッジと Hub 内の Source の値の一致（§10.4）の前提。
+# 新しい crate は増えない（serde_json の feature だけ）。
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 # T14-1 (docs/banto-hub-t14-design.md §3「D1」): runtime.rs の
 # `HubStartError` - 既存クレート（banto-collect 等）と同じ thiserror 由来の
 # 列挙型エラーに揃える。

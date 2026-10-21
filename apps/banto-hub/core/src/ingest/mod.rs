@@ -14,9 +14,17 @@
 //!   epoch・ブリッジの送る集合。Hub の収集（`crate::hub::CollectorManager`）は
 //!   [`build_hub_config`]（`PushSource::Available`）で `push` 接続を計画し、
 //!   `Collector::start_with_sources` にこれを源として渡す。
-//! - 送信口（R2a-2c の REST、R2a-2d の WebSocket）と、その認証・上限・監査。
-//!   **R2a-1c の時点では送信口は無い**: 値は [`IngestHub::apply`] / [`IngestHub::ping`]
-//!   を直接呼ぶテストからだけ入る。
+//! - 送信口と、その共通部品（R2a-2c）。WS（R2a-2d）も同じ部品を使う:
+//!   - [`auth`] モジュール: 認証の層 [`auth::require_ingest_auth`]（API キーだけ・`ingest:#{id}`・
+//!     接続の有無を権限の確認より前に明かさない順序、§5・§6 の表）。
+//!   - [`validate`] モジュール: メッセージの形（[`validate::parse_values_message`]）と件ごとの
+//!     検証（[`validate_item`]、§6.3）。
+//!   - [`limits`] モジュール: 件数の上限と接続ごとの頻度のトークンバケット
+//!     （[`limits::ConnectionLimiter`]、§7）。状態は接続の slot に置き、REST と WS で
+//!     共有する（[`IngestHub::admit`]）。
+//!   - [`audit`] モジュール: 監査の行（§8）。値は載せない。未知のキーの抑制
+//!     （[`audit::UnknownKeyThrottle`]）も slot に置く。
+//!   - [`rest`] モジュール: `POST /api/v1/ingest/{id}/values`（§6.2）。
 //!
 //! 規則そのもの（キーの文法、`settings` の検証、上限の定数 `PUSH_LIMITS`、ブリッジの
 //! 量の見積もり `bridge_load`）は `banto_tags::push` にあり、ここは包むだけ
@@ -67,14 +75,21 @@
 //! `{"op":"state",..}` を送る。R2a-1c ではテストがこれで「`collecting: true` が
 //! 送られたか」を確かめる。
 
+pub mod audit;
+pub mod auth;
 pub mod driver;
+pub mod limits;
+pub mod rest;
+pub mod validate;
+
+pub use validate::validate_item;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use banto_collect::{
-    build_config_from_with, CollectError, CollectorConfig, ExternalLink, ExternalQuality,
-    ExternalReading, ExternalSnapshot, ExternalSource, PushSource, RegistrySnapshot,
+    build_config_from_with, CollectError, CollectorConfig, ExternalLink, ExternalReading,
+    ExternalSnapshot, ExternalSource, PushSource, RegistrySnapshot,
 };
 use banto_tags::{
     validate_push_key, validate_push_settings, DEFAULT_STALE_TIMEOUT_MS, PLC_TAG_KIND,
@@ -84,6 +99,7 @@ use banto_tstore::Clock;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tokio::sync::watch;
+use utoipa::ToSchema;
 
 /// Hub の収集の計画（厳格版）: `push` 接続を外部の接続として計画する
 /// （`PushSource::Available`、§4.1・§4.2）。Hub の計画を作る全部の点
@@ -94,18 +110,27 @@ pub fn build_hub_config(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, 
     build_config_from_with(snapshot, PushSource::Available)
 }
 
-/// 1 件の値（§6.1・§6.2 の `items[]` の 1 要素）。形だけを持ち、中身の検証は
-/// [`IngestHub::apply`]（[`validate_item`]）が件ごとに行う。`v` が無いのと
-/// `null` は同じ。`q` が無ければ `good`。`q` / `t` の明示的な `null` は省略と
-/// 区別し、それぞれ `invalid_quality` / `invalid_time`（[`validate_item`]）。
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+/// 1 件の値。
+// 実装の注（§6.1・§6.2 の `items[]` の 1 要素）: 形だけを持ち、中身の検証は
+// `IngestHub::apply`（`validate_item`）が件ごとに行う。`v` が無いのと `null` は同じ。
+// `q` が無ければ `good`。`q` / `t` の明示的な `null` は省略と区別し、それぞれ
+// `invalid_quality` / `invalid_time`。doc comment は OpenAPI の説明になるので wire の
+// 言葉だけにしている（R2a-2c）。
+#[derive(Debug, Clone, PartialEq, Deserialize, ToSchema)]
 pub struct IngestItem {
+    /// タグのキー（送り手が決めた文字列。大文字小文字を区別）。
     pub key: String,
+    /// 値: 数値・bool（1 / 0）・null。`q` が `good`（省略を含む）なら null は不可。
+    /// `bit` のタグは 0・1・bool だけ。
     #[serde(default)]
     pub v: Value,
+    /// 品質: `good`（省略時）/ `stale` / `bad`。
     #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<String>)]
     pub q: Option<Value>,
+    /// 発生時刻（epoch ms、任意）。鮮度・記録の時刻には使わない。
     #[serde(default, deserialize_with = "present")]
+    #[schema(value_type = Option<i64>)]
     pub t: Option<Value>,
 }
 
@@ -350,48 +375,6 @@ pub fn link_state(last_seen_ms: Option<i64>, stale_timeout_ms: u64, now_ms: i64)
     }
 }
 
-/// 1 件の値と品質の検証（§6.3 の `invalid_*`、純関数）。キーの照合（登録・有効・
-/// 送る集合・重複）は [`IngestHub::apply`] が先に済ませる。`data_type` はタグの型
-/// （`bit` は 0・1・bool だけ）。数値の範囲は見ない（§6.3）。
-pub fn validate_item(item: &IngestItem, data_type: &str) -> Result<ExternalReading, RejectCode> {
-    let quality = match &item.q {
-        None => ExternalQuality::Good,
-        Some(Value::String(q)) => match q.as_str() {
-            "good" => ExternalQuality::Good,
-            "stale" => ExternalQuality::Stale,
-            "bad" => ExternalQuality::Bad,
-            _ => return Err(RejectCode::InvalidQuality),
-        },
-        Some(_) => return Err(RejectCode::InvalidQuality),
-    };
-    if let Some(t) = &item.t {
-        if t.as_i64().is_none() {
-            return Err(RejectCode::InvalidTime);
-        }
-    }
-    let value = match &item.v {
-        Value::Null => None,
-        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
-        Value::Number(n) => match n.as_f64() {
-            Some(v) if v.is_finite() => Some(v),
-            _ => return Err(RejectCode::InvalidValue),
-        },
-        _ => return Err(RejectCode::InvalidValue),
-    };
-    if data_type == "bit" && value.is_some_and(|v| v != 0.0 && v != 1.0) {
-        return Err(RejectCode::InvalidValue);
-    }
-    match (quality, value) {
-        (ExternalQuality::Good, None) => Err(RejectCode::InvalidValue),
-        // bad は値を持たない（表示も記録も Bad / NULL、§4.4）。
-        (ExternalQuality::Bad, _) => Ok(ExternalReading {
-            value: None,
-            quality,
-        }),
-        _ => Ok(ExternalReading { value, quality }),
-    }
-}
-
 /// 登録済みのキー 1 つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct KeyInfo {
@@ -442,10 +425,17 @@ struct Held {
 }
 
 /// commit をまたいで引き継ぐ部分。
+///
+/// `limiter` と `unknown_keys`（R2a-2c）は送信口の上限と監査の抑制の状態。接続の slot に
+/// 置くので、REST と WS が同じバケットを使い（§7「WS と REST の合計」）、改名をまたいで
+/// 続き、削除された接続の分は slot と一緒に消える（メモリは `push` 接続の数で頭打ち）。
+/// どちらも末端のロックで、`held` と同時には持たない。
 #[derive(Debug)]
 struct SlotShared {
     held: RwLock<Held>,
     state: watch::Sender<IngestState>,
+    limiter: Mutex<limits::ConnectionLimiter>,
+    unknown_keys: Mutex<audit::UnknownKeyThrottle>,
 }
 
 impl SlotShared {
@@ -462,6 +452,8 @@ impl SlotShared {
                 last_seen_ms: None,
             }),
             state,
+            limiter: Mutex::new(limits::ConnectionLimiter::new(limits::PUSH_LIMITS)),
+            unknown_keys: Mutex::new(audit::UnknownKeyThrottle::default()),
         }
     }
 
@@ -519,6 +511,10 @@ fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
 
 fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 /// `"conn:{id}"`（`banto_collect` の `ConnectionPlan.key`）の id。
@@ -763,6 +759,46 @@ impl IngestHub {
         Ok(())
     }
 
+    /// 送信口の上限（R2a-2c、§7）: 1 メッセージ（`item_count` 件）を受けてよいか。
+    /// 件数の上限と接続ごとの頻度のバケット（REST と WS の合計）を
+    /// [`limits::ConnectionLimiter::admit`] で判定し、超過の始まり・終わり（監査の端、
+    /// §8）も返す。`apply` より前に呼ぶ（断ったメッセージは何も反映せず、
+    /// `last_seen_ms` も進めない）。接続が無い・無効なら `apply` と同じ拒否。
+    pub fn admit(
+        &self,
+        conn_id: i64,
+        item_count: usize,
+        now_ms: i64,
+    ) -> Result<limits::Admission, ApplyRefusal> {
+        let inner = read(&self.inner);
+        let slot = inner
+            .slots
+            .get(&conn_id)
+            .ok_or(ApplyRefusal::UnknownConnection)?;
+        if !slot.config.enabled {
+            return Err(ApplyRefusal::ConnectionDisabled);
+        }
+        let admission = lock(&slot.shared.limiter).admit(item_count, now_ms);
+        Ok(admission)
+    }
+
+    /// 未知のキー（`apply` が `unknown_key` で断ったもの）の監査の間引き（§8）。
+    /// 記録すべき行だけを返す（(接続, キー) ごとに 1 時間に 1 回、1 時間に 100 キーを
+    /// 超えた分は数だけ）。接続が無ければ空。
+    pub fn throttle_unknown_keys<'a>(
+        &self,
+        conn_id: i64,
+        keys: impl IntoIterator<Item = &'a str>,
+        now_ms: i64,
+    ) -> Vec<audit::UnknownKeyRecord> {
+        let inner = read(&self.inner);
+        let Some(slot) = inner.slots.get(&conn_id) else {
+            return Vec::new();
+        };
+        let records = lock(&slot.shared.unknown_keys).observe(keys, now_ms);
+        records
+    }
+
     /// 接続 `conn_id` の `state` の購読（R2a-2d の WebSocket が `state` を送るため）。
     /// `push` 接続でなければ `None`。commit をまたいで同じチャンネル。
     pub fn subscribe_state(&self, conn_id: i64) -> Option<watch::Receiver<IngestState>> {
@@ -834,6 +870,9 @@ impl ExternalSource for IngestHub {
         }
     }
 }
+
+#[cfg(test)]
+use banto_collect::ExternalQuality;
 
 #[cfg(test)]
 mod tests;

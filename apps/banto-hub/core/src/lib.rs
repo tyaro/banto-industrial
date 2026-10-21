@@ -183,7 +183,10 @@
 //!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
 //!   [`ingest::driver::PushDriver`]（`DriverBase`、レジストリには登録しない、R2a-2a）と、
 //!   受信側の [`ingest::IngestHub`]（保持値・Live の判定・epoch。Hub の収集の
-//!   `ExternalSource`、R2a-1c）。送信口（REST・WebSocket）は R2a-2c / R2a-2d
+//!   `ExternalSource`、R2a-1c）。REST の送信口 `POST /api/v1/ingest/{id}/values`
+//!   （[`ingest::rest`]）と、WebSocket（R2a-2d）も使う共通部品（認証の層
+//!   [`ingest::auth`]・検証 [`ingest::validate`]・上限 [`ingest::limits`]・監査
+//!   [`ingest::audit`]）は R2a-2c
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
