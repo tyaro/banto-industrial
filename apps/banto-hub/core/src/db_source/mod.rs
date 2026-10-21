@@ -756,6 +756,38 @@ mod tests {
         );
     }
 
+    /// Hub の PostgreSQL Source の接続（`pg_connect_options` の薄い写し経由）にも
+    /// 共有 crate のサーバー側 `statement_timeout`（30 秒）が載る。
+    /// `BANTO_TEST_PG_URL` が無ければスキップ。
+    #[tokio::test]
+    async fn hub_connections_carry_the_server_statement_timeout() {
+        use sqlx::Connection;
+
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let parsed: PgConnectOptions = url
+            .parse()
+            .expect("BANTO_TEST_PG_URL should be a valid postgres:// URL");
+        let options = pg_connect_options(
+            parsed.get_host(),
+            parsed.get_port(),
+            parsed.get_database().unwrap_or("postgres"),
+            parsed.get_username(),
+            &url_password(&url).unwrap_or_default(),
+            "statement-timeout-check",
+        );
+        let mut conn = sqlx::PgConnection::connect_with(&options)
+            .await
+            .expect("connect to BANTO_TEST_PG_URL");
+        let value: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&mut conn)
+            .await
+            .expect("SHOW statement_timeout");
+        assert_eq!(value, "30s");
+    }
+
     /// Tiny helper for the real-PostgreSQL test above:
     /// `sqlx::postgres::PgConnectOptions` deliberately does not expose the
     /// password back out (by design - it is a write-only builder field), so

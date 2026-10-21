@@ -1055,6 +1055,10 @@ async fn a_key_removed_from_the_bridge_config_goes_bad_and_is_then_refused() {
 /// 稼働中の再適用（`commit_catalog_and_apply_live`）は epoch を進めず `state` も
 /// 送らない。グループの周期の変更でタスクが作り直されても（`apply_config` の
 /// replaced）保持値は残り、Good のまま続く（§4.2・§4.5）。
+/// 作り直したタスクの最初の tick は CI の負荷で遅れうる（周期 × 2.5 を超えると読み出しが
+/// Stale になる）ので、固定の sleep で作り直したタスクが回るのを待ち、その後の一致は
+/// 条件待ちで Good を見る。
+/// 2026-10-21 Windows CI のフレーク（PR #769 の run）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_live_reapply_keeps_the_epoch_and_the_held_values() {
     let env = env("ingest-live-reapply").await;
@@ -1087,7 +1091,7 @@ async fn a_live_reapply_keeps_the_epoch_and_the_held_values() {
     assert_eq!(env.epoch(bridge), epoch);
     assert_eq!(env.ingest.connection_info(bridge).unwrap().held_values, 1);
     tokio::time::sleep(Duration::from_millis(400)).await;
-    assert_eq!(env.current(temp), good(8.0));
+    env.wait_current(temp, good(8.0)).await;
     // 同じ epoch のまま送り続けられる。
     env.apply(bridge, Some(epoch), &[value("b.temp", 9.0)])
         .unwrap();
