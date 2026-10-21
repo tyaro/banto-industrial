@@ -302,7 +302,7 @@ async fn create_connection(pool: &SqlitePool, name: &str, protocol: &str, port: 
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

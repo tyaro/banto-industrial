@@ -174,7 +174,7 @@ async fn register(pool: &SqlitePool, port: u16) -> Vec<RegisteredGroup> {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

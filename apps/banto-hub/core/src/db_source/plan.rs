@@ -270,6 +270,26 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             continue;
         }
 
+        // R2b-1d (design §5.4): the password is opened from the sealed row the snapshot
+        // carries. No password set = connect without one (a postgres password is
+        // optional). One that is set but cannot be read is **not** collapsed to an empty
+        // password - the connection is not started.
+        // TODO(R2b-1d part B / R2b-1e): keep the sealed row in the plan, open it at
+        // connect time and report the connection as Bad「パスワードを読めません」 (design
+        // §5.4・§5.5); for now it is listed as `disabled` (never dialled).
+        let password = match crate::secrets::open_connection_secret(
+            &crate::secrets::r2b1d_connection_secrets(),
+            conn,
+            banto_tags::PASSWORD_KEY,
+            &snapshot.secrets,
+        ) {
+            Ok(password) => password.map_or_else(String::new, |plain| plain.as_str().to_owned()),
+            Err(_unreadable) => {
+                disabled.push((conn.id, conn.name.clone()));
+                continue;
+            }
+        };
+
         connections.push(DbConnectionPlan {
             connection_id: conn.id,
             connection_name: conn.name.clone(),
@@ -277,7 +297,7 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             port,
             database: conn.database.clone().unwrap_or_default(),
             username: conn.username.clone().unwrap_or_default(),
-            password: conn.password.clone().unwrap_or_default(),
+            password,
             groups,
         });
     }
@@ -307,9 +327,25 @@ mod tests {
             cpu_type: "R".to_string(),
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
-            password: Some("s3cret".to_string()),
-            settings: None,
+            // R2b-1d: the password is a reference to a sealed row ([`secret_rows`]).
+            settings: serde_json::json!({ "password": { "$secret": PW_REF } })
+                .as_object()
+                .unwrap()
+                .clone(),
+            settings_version: 1,
         }
+    }
+
+    const PW_REF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The sealed (`plain-v1`) password row of connection 1 (what
+    /// `RegistrySnapshot::load` reads from `plc_connection_secrets`).
+    fn secret_rows() -> Vec<banto_tags::StoredSecretRow> {
+        vec![banto_tags::StoredSecretRow {
+            connection_id: 1,
+            key: "password".to_string(),
+            sealed: banto_tags::SealedSecretRow::new(PW_REF, "plain-v1", b"s3cret".to_vec()),
+        }]
     }
 
     fn plc_connection(id: i64, name: &str) -> PlcConnection {
@@ -317,7 +353,6 @@ mod tests {
             protocol: "slmp".to_string(),
             database: None,
             username: None,
-            password: None,
             ..pg_connection(id, name, true)
         }
     }
@@ -370,6 +405,7 @@ mod tests {
             connections: vec![plc_connection(1, "line1")],
             groups: vec![group(1, "fast", 1, None, true)],
             tags: vec![],
+            secrets: secret_rows(),
         };
         assert!(build_plan(&snapshot).unwrap().is_empty());
     }
@@ -387,6 +423,7 @@ mod tests {
                 db_tag(11, "B", 1, "b", false),
                 db_tag(12, "C", 2, "c", true),
             ],
+            secrets: secret_rows(),
         };
         let plan = build_plan(&snapshot).unwrap();
         assert_eq!(plan.connections.len(), 1);
@@ -409,6 +446,7 @@ mod tests {
             connections: vec![pg_connection(1, "erp", false)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
         let plan = build_plan(&snapshot).unwrap();
         assert!(plan.connections.is_empty());
@@ -421,6 +459,7 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", false)],
+            secrets: secret_rows(),
         };
         let plan = build_plan(&snapshot).unwrap();
         assert!(plan.connections.is_empty(), "{plan:?}");
@@ -432,6 +471,7 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, None, true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
         let err = build_plan(&snapshot).unwrap_err();
         assert!(err.contains("querySql"), "{err}");
@@ -445,6 +485,7 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![tag],
+            secrets: secret_rows(),
         };
         let err = build_plan(&snapshot).unwrap_err();
         assert!(err.contains("db 以外"), "{err}");
@@ -458,9 +499,56 @@ mod tests {
             connections: vec![conn],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
         let err = build_plan(&snapshot).unwrap_err();
         assert!(err.contains("ポート"), "{err}");
+    }
+
+    /// R2b-1d (design §5.4): the plan opens the sealed password; a connection with no
+    /// password connects without one; one whose reference has no readable row is not
+    /// started (listed as disabled) - never dialled with an empty password.
+    #[test]
+    fn build_plan_opens_the_sealed_password_and_never_collapses_an_unreadable_one() {
+        let snapshot = RegistrySnapshot {
+            connections: vec![pg_connection(1, "erp", true)],
+            groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
+            tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
+        };
+        let plan = build_plan(&snapshot).unwrap();
+        assert_eq!(plan.connections[0].password, "s3cret");
+
+        let mut no_password = snapshot.clone();
+        no_password.connections[0].settings.clear();
+        no_password.secrets.clear();
+        let plan = build_plan(&no_password).unwrap();
+        assert_eq!(plan.connections[0].password, "");
+
+        for broken in [
+            // The row is missing.
+            Vec::new(),
+            // The row belongs to another connection.
+            vec![banto_tags::StoredSecretRow {
+                connection_id: 2,
+                ..secret_rows().remove(0)
+            }],
+            // The row's scheme cannot be opened here.
+            vec![banto_tags::StoredSecretRow {
+                sealed: banto_tags::SealedSecretRow::new(
+                    PW_REF,
+                    "dpapi-machine-v1",
+                    b"blob".to_vec(),
+                ),
+                ..secret_rows().remove(0)
+            }],
+        ] {
+            let mut unreadable = snapshot.clone();
+            unreadable.secrets = broken;
+            let plan = build_plan(&unreadable).unwrap();
+            assert!(plan.connections.is_empty(), "{plan:?}");
+            assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
+        }
     }
 
     /// このモジュールの doc comment「平文パスワードの扱い」節。
@@ -470,6 +558,7 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
         let plan = build_plan(&snapshot).unwrap();
         let rendered = format!("{plan:?}");

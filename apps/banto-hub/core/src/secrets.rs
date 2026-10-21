@@ -4,10 +4,17 @@
 //! # 何をするか
 //!
 //! 平文の秘密値を [`ConnectionSecrets::seal`] で [`SealedSecret`]（参照・方式・blob）に
-//! 変え、[`ConnectionSecrets::open`] で平文（`Zeroizing<String>`）に戻す。blob は後の段
-//! （R2b-1d）で DB の秘密の表 `plc_connection_secrets` に置き、接続の `settings` には値の
-//! 代わりに参照 `{"$secret": "<ref>"}` を置く（設計 §3.3）。**このモジュールはまだどこにも
-//! 配線していない**（R2b-1b は部品だけ。DB・REST・キューに繋ぐのは R2b-1d・1e）。
+//! 変え、[`ConnectionSecrets::open`] で平文（`Zeroizing<String>`）に戻す。blob は DB の
+//! 秘密の表 `plc_connection_secrets`（migration `0025`、banto-tags の
+//! `connection_secret`）に置き、接続の `settings` には値の代わりに参照
+//! `{"$secret": "<ref>"}` を置く（設計 §3.3）。
+//!
+//! R2b-1d（part A）から配線した: REST・MCP・未適用キューの適用の入口が
+//! [`password_changes`] で平文を封印して banto-tags へ渡し、読む側（DB Source の計画・
+//! 接続のテスト・`GET /api/sink/config`・`GET /api/ingest/bridge-config`）が
+//! [`open_connection_secret`] で使う直前に開く。封印は全 OS で `plain-v1`
+//! （[`r2b1d_connection_secrets`]）。Windows の DPAPI・起動時の封印し直し・
+//! `passwordState`・`unavailable*` は R2b-1e。
 //!
 //! # なぜ DB に DPAPI の blob を置くか（設計 §5.1 の Q1 (c)）
 //!
@@ -502,6 +509,113 @@ impl ConnectionSecrets {
     }
 }
 
+// ---- R2b-1d: banto-tags の秘密の行との橋渡し（設計 §5.3・§5.4） ----------------------------
+//
+// banto-tags はこの crate に依存できないので、封印した値を同じ中身の
+// `banto_tags::SealedSecretRow`（`ref`・`scheme`・`blob`）で運ぶ。変換はここに置く。
+//
+// **R2b-1d（part A）の範囲**: 封印は全 OS で `plain-v1`（[`r2b1d_connection_secrets`]。設計 §10 の
+// R2b-1d の行「Windows でもこの PR では `plain-v1`」）。Windows の `dpapi-machine-v1` への
+// 切り替えと起動時の封印し直しは R2b-1e。
+
+/// R2b-1d の封印・開封に使う [`ConnectionSecrets`]: protector 無し（`plain-v1`）。
+///
+/// TODO(R2b-1e): `ConnectionSecrets::platform_default()` に替え、起動時に `plain-v1` の行を
+/// 封印し直す（設計 §6.5）。開封は今も `dpapi-machine-v1` を知っている（protector が無ければ
+/// [`SecretError::ProtectorUnavailable`] = 読めない）。
+pub fn r2b1d_connection_secrets() -> ConnectionSecrets {
+    ConnectionSecrets::new(None)
+}
+
+impl From<SealedSecret> for banto_tags::SealedSecretRow {
+    fn from(sealed: SealedSecret) -> Self {
+        banto_tags::SealedSecretRow {
+            r#ref: sealed.r#ref.as_str().to_owned(),
+            scheme: sealed.scheme.as_str().to_owned(),
+            blob: sealed.blob,
+        }
+    }
+}
+
+impl SealedSecret {
+    /// banto-tags の行から読む（参照と方式を確かめ直す。外れれば
+    /// [`SecretError::InvalidRef`] / [`SecretError::UnknownScheme`]、値は載せない）。
+    pub fn from_row(row: &banto_tags::SealedSecretRow) -> Result<Self, SecretError> {
+        Ok(SealedSecret {
+            r#ref: SecretRef::parse(&row.r#ref)?,
+            scheme: SecretScheme::parse(&row.scheme)?,
+            blob: row.blob.clone(),
+        })
+    }
+}
+
+/// REST・MCP・未適用キューの平らな形の `password`（tri-state）を、banto-tags の
+/// [`banto_tags::SecretChanges`] に写す（設計 §5.3）。平文はここで封印し、banto-tags へは
+/// 封印した値だけを渡す。
+///
+/// | `password`        | 結果                                                  |
+/// | ----------------- | ----------------------------------------------------- |
+/// | `None`（省略・`null`） | 空（= `Keep`。作成では「パスワード無し」）      |
+/// | `Some("")`        | `Clear`（作成では「パスワード無し」、更新では消す）  |
+/// | `Some(値)`        | `Set(封印した値)`（新しい参照）                       |
+///
+/// `postgres` 以外のプロトコルに値を送ったときは、`Set` を受けた banto-tags が今と同じ
+/// 「postgres接続以外では指定できません」で断る（封印した値はどこにも書かれない）。
+pub fn password_changes(
+    secrets: &ConnectionSecrets,
+    password: Option<&str>,
+) -> Result<banto_tags::SecretChanges, SecretError> {
+    let mut changes = banto_tags::SecretChanges::new();
+    match password {
+        None => {}
+        Some("") => {
+            changes.insert(
+                banto_tags::PASSWORD_KEY.to_owned(),
+                banto_tags::SecretChange::Clear,
+            );
+        }
+        Some(plain) => {
+            let sealed = secrets.seal(banto_tags::PASSWORD_KEY, plain)?;
+            changes.insert(
+                banto_tags::PASSWORD_KEY.to_owned(),
+                banto_tags::SecretChange::Set(sealed.into()),
+            );
+        }
+    }
+    Ok(changes)
+}
+
+/// 接続 `conn` の秘密のキー `key` を開く（設計 §5.4。使う直前にだけ呼ぶ）。
+///
+/// - `settings[key]` に参照が無い → `Ok(None)`（値が設定されていない）。
+/// - 参照があるのに、その参照・接続・キーの行が `rows` に無い → `Err(Missing)`。
+/// - 行はあるが開けない（方式・参照の形が違う、DPAPI の失敗、空・UTF-8 でない）→
+///   `Err(Undecryptable)`。
+///
+/// **「無い」と「読めない」を分ける**（checklist §5「エラーを空に潰さない」、設計 §5.5）。
+/// 呼び出し側は `Err` を空のパスワードとして使わない。
+pub fn open_connection_secret(
+    secrets: &ConnectionSecrets,
+    conn: &banto_tags::PlcConnection,
+    key: &str,
+    rows: &[banto_tags::StoredSecretRow],
+) -> Result<Option<Zeroizing<String>>, UnreadableReason> {
+    let Some(r#ref) = conn.secret_ref(key) else {
+        return Ok(None);
+    };
+    let row = rows
+        .iter()
+        .find(|row| row.sealed.r#ref == r#ref && row.connection_id == conn.id && row.key == key)
+        .ok_or(UnreadableReason::Missing)?;
+    let sealed =
+        SealedSecret::from_row(&row.sealed).map_err(|_| UnreadableReason::Undecryptable)?;
+    secrets.open(key, &sealed).map(Some).map_err(|error| {
+        error
+            .unreadable_reason()
+            .unwrap_or(UnreadableReason::Undecryptable)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -994,6 +1108,116 @@ mod tests {
             assert_eq!(resealed.scheme, SecretScheme::DpapiMachineV1);
             assert!(!contains(&resealed.blob, SECRET.as_bytes()));
             assert_eq!(&*secrets.open(KEY, &resealed).unwrap(), SECRET);
+        }
+    }
+}
+
+/// R2b-1d: the bridge to banto-tags' secret rows.
+#[cfg(test)]
+mod r2b1d_tests {
+    use super::*;
+
+    fn connection(settings: serde_json::Value) -> banto_tags::PlcConnection {
+        banto_tags::PlcConnection::from_settings(
+            7,
+            "pg".to_string(),
+            "postgres".to_string(),
+            true,
+            false,
+            settings.as_object().unwrap().clone(),
+            1,
+        )
+    }
+
+    #[test]
+    fn password_changes_maps_the_rest_tri_state() {
+        let secrets = r2b1d_connection_secrets();
+        assert!(password_changes(&secrets, None).unwrap().is_empty());
+        assert_eq!(
+            password_changes(&secrets, Some("")).unwrap()["password"],
+            banto_tags::SecretChange::Clear
+        );
+        let changes = password_changes(&secrets, Some("pw-1")).unwrap();
+        let banto_tags::SecretChange::Set(row) = &changes["password"] else {
+            panic!("expected Set: {changes:?}");
+        };
+        assert_eq!(row.scheme, "plain-v1");
+        assert_eq!(row.blob.as_slice(), b"pw-1");
+        assert!(banto_tags::connection_secret::is_valid_secret_ref(
+            &row.r#ref
+        ));
+        // A new reference per call.
+        let again = password_changes(&secrets, Some("pw-1")).unwrap();
+        let banto_tags::SecretChange::Set(other) = &again["password"] else {
+            panic!("expected Set");
+        };
+        assert_ne!(row.r#ref, other.r#ref);
+        assert!(!format!("{changes:?}").contains("pw-1"));
+    }
+
+    #[test]
+    fn open_connection_secret_tells_none_set_and_unreadable_apart() {
+        let secrets = r2b1d_connection_secrets();
+        let sealed = secrets.seal("password", "pw-2").unwrap();
+        let r#ref = sealed.r#ref.as_str().to_owned();
+        let row = banto_tags::StoredSecretRow {
+            connection_id: 7,
+            key: "password".to_string(),
+            sealed: sealed.into(),
+        };
+        let with_ref = connection(serde_json::json!({ "password": { "$secret": r#ref } }));
+
+        // No reference: no password.
+        assert_eq!(
+            open_connection_secret(
+                &secrets,
+                &connection(serde_json::json!({})),
+                "password",
+                &[]
+            )
+            .unwrap(),
+            None
+        );
+        // Reference and row: the value.
+        assert_eq!(
+            open_connection_secret(&secrets, &with_ref, "password", std::slice::from_ref(&row))
+                .unwrap()
+                .as_deref()
+                .map(String::as_str),
+            Some("pw-2")
+        );
+        // Reference without its row (or a row of another connection / key): Missing.
+        for rows in [
+            vec![],
+            vec![banto_tags::StoredSecretRow {
+                connection_id: 8,
+                ..row.clone()
+            }],
+            vec![banto_tags::StoredSecretRow {
+                key: "token".to_string(),
+                ..row.clone()
+            }],
+        ] {
+            assert_eq!(
+                open_connection_secret(&secrets, &with_ref, "password", &rows),
+                Err(UnreadableReason::Missing)
+            );
+        }
+        // A row that cannot be opened here: Undecryptable (never an empty password).
+        for sealed in [
+            banto_tags::SealedSecretRow::new(r#ref.clone(), "dpapi-machine-v1", b"x".to_vec()),
+            banto_tags::SealedSecretRow::new(r#ref.clone(), "rot13", b"x".to_vec()),
+            banto_tags::SealedSecretRow::new(r#ref.clone(), "plain-v1", Vec::new()),
+            banto_tags::SealedSecretRow::new(r#ref.clone(), "plain-v1", vec![0xff, 0xfe]),
+        ] {
+            let broken = banto_tags::StoredSecretRow {
+                sealed,
+                ..row.clone()
+            };
+            assert_eq!(
+                open_connection_secret(&secrets, &with_ref, "password", &[broken]),
+                Err(UnreadableReason::Undecryptable)
+            );
         }
     }
 }

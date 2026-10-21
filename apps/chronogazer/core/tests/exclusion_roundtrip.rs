@@ -124,7 +124,7 @@ async fn connection(pool: &SqlitePool, name: &str, port: u16) -> i64 {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await
@@ -195,11 +195,14 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
     let broken_conn = connection(&pool, "broken-plc", 1).await;
     let broken_grp = group(&pool, "壊れた接続のグループ", broken_conn).await;
     let orphan = tag(&pool, "orphan", broken_grp, "40001").await;
-    sqlx::query("UPDATE plc_connections SET port = 70000 WHERE id = ?")
-        .bind(broken_conn)
-        .execute(&pool)
-        .await
-        .expect("ポートを壊す");
+    // R2b-1d (migration 0025): the port lives in `settings`.
+    sqlx::query(
+        "UPDATE plc_connections SET settings = json_set(settings, '$.port', 70000) WHERE id = ?",
+    )
+    .bind(broken_conn)
+    .execute(&pool)
+    .await
+    .expect("ポートを壊す");
 
     let good_key = format!("tag:{good}");
     let legacy_key = format!("tag:{legacy}");

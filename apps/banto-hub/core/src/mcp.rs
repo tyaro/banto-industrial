@@ -1957,6 +1957,11 @@ async fn tool_create_connection(
     }
 
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = match input.into_input() {
+        Ok(input) => input,
+        Err(err) => return Ok(banto_error_tool_error(&err)),
+    };
     let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
@@ -1973,7 +1978,7 @@ async fn tool_create_connection(
             return Ok(banto_error_tool_error(&err.0));
         }
     };
-    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+    let created = match state.plc_connections.create_tx(&mut tx, input).await {
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2332,6 +2337,11 @@ async fn tool_update_connection(
     }
 
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = match input.into_input() {
+        Ok(input) => input,
+        Err(err) => return Ok(banto_error_tool_error(&err)),
+    };
     let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
         Ok(tx) => tx,
         Err(err) => {
@@ -2348,11 +2358,7 @@ async fn tool_update_connection(
             return Ok(banto_error_tool_error(&err.0));
         }
     };
-    let updated = match state
-        .plc_connections
-        .update_tx(&mut tx, id, input.into())
-        .await
-    {
+    let updated = match state.plc_connections.update_tx(&mut tx, id, input).await {
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2452,7 +2458,11 @@ async fn tool_test_saved_connection(
         ));
     }
 
-    let outcome = crate::db_source::test_connection(&conn).await;
+    let secret_rows = match state.plc_connections.secret_rows(id).await {
+        Ok(rows) => rows,
+        Err(err) => return Ok(banto_error_tool_error(&err)),
+    };
+    let outcome = crate::db_source::test_connection(&conn, &secret_rows).await;
     Ok(tool_ok(
         serde_json::to_value(outcome).unwrap_or_else(|_| json!({})),
     ))

@@ -29,7 +29,13 @@
 //!   `Settings` ([`settings_to_api`]), the flat-columns <-> `settings` adapter
 //!   (`settings_json::legacy`) and validation through a `DriverRegistry`
 //!   ([`validate_settings_with_registry`], [`PlcConnectionService::with_registry`]).
-//!   Not used by the save path yet.
+//!   Since R2b-1d (migration `0025`) the save path stores `settings` for every protocol
+//!   and the flat fields of [`PlcConnection`] are a read-only projection of it.
+//! - [`connection_secret`] (R2b-1d, design §3.3・§5.3): the sealed secret rows
+//!   (`plc_connection_secrets`) a connection's `settings` refers to with
+//!   `{"$secret": "<ref>"}`, written and deleted in the connection's own transaction.
+//!   This crate never seals or opens a secret (banto-hub's `secrets` module does) and
+//!   refuses a plaintext value under a secret key ([`check_settings_shape`]).
 //!
 //! This crate is also the first real-world proof of consuming `banto-core`/
 //! `banto-storage` via a git tag reference rather than a workspace path
@@ -44,6 +50,7 @@
 //! file, plan.md §5), so connecting is the consuming app's job.
 
 pub mod collection_group;
+pub mod connection_secret;
 pub mod plc_connection;
 pub mod push;
 pub mod scaling;
@@ -57,6 +64,10 @@ mod support;
 pub use collection_group::{
     CollectionGroup, CollectionGroupCascadeOutcome, CollectionGroupInput, CollectionGroupService,
     ALLOWED_PERIOD_MS,
+};
+pub use connection_secret::{
+    builtin_secret_keys, check_settings_shape, SealedSecretRow, SecretChange, SecretChanges,
+    StoredSecretRow, PASSWORD_KEY, SCHEME_DPAPI_MACHINE_V1, SCHEME_PLAIN_V1, SECRET_REF_LEN,
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
@@ -134,6 +145,9 @@ mod tests {
             tables,
             vec![
                 "collection_groups".to_string(),
+                // R2b-1d (migration 0025): the sealed secrets a connection's
+                // `settings` refers to.
+                "plc_connection_secrets".to_string(),
                 "plc_connections".to_string(),
                 "tags".to_string(),
             ]

@@ -583,6 +583,8 @@ pub async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::Bant
         connections,
         groups,
         tags,
+        // The catalog never reads secrets (R2b-1d: they stay sealed in the DB).
+        secrets: Vec::new(),
     })
 }
 
@@ -2784,7 +2786,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2904,7 +2906,7 @@ mod tests {
             let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
             seed_running_simulation(&pool).await;
             // Convert the fixture into a valid reserved internal connection.
-            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', host='', port=0, simulation=0")
+            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', settings='{}', simulation=0")
                 .execute(&pool).await.unwrap();
             sqlx::query("UPDATE collection_groups SET name='memory'")
                 .execute(&pool)
@@ -3176,8 +3178,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 2,
@@ -3193,8 +3195,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 3,
@@ -3210,8 +3212,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 4,
@@ -3227,12 +3229,13 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
             ],
             groups: Vec::new(),
             tags: Vec::new(),
+            secrets: Vec::new(),
         };
 
         let configured =
@@ -3276,8 +3279,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
         let conn2 = PlcConnection {
             id: 2,
@@ -3293,8 +3296,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
         let group1 = banto_tags::CollectionGroup {
             id: 10,
@@ -3348,6 +3351,7 @@ mod tests {
             connections: vec![conn1, conn2],
             groups: vec![group1, group2],
             tags: vec![tag_in_group1, tag_in_group2],
+            secrets: Vec::new(),
         };
 
         let map = build_catalog_from(&snapshot).expect("build_catalog_from");
@@ -3386,8 +3390,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 })
                 .collect(),
             groups: groups
@@ -3426,6 +3430,7 @@ mod tests {
                     revision: 1,
                 })
                 .collect(),
+            secrets: Vec::new(),
         }
     }
 
@@ -3652,7 +3657,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3730,7 +3735,7 @@ mod tests {
                     cpu_type: None,
                     database: None,
                     username: None,
-                    password: None,
+                    secrets: Default::default(),
                     settings: None,
                 })
                 .await
@@ -3814,7 +3819,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3866,7 +3871,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3944,7 +3949,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4046,7 +4051,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4118,7 +4123,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }

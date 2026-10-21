@@ -463,7 +463,12 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
             cpu_type: None,
             database: Some(target.database.clone()),
             username: Some(target.username.clone()),
-            password: target.password.clone(),
+            // R2b-1d: sealed at the entrance (`plain-v1`), like banto-hub's REST/MCP do.
+            secrets: banto_hub_core::secrets::password_changes(
+                &banto_hub_core::secrets::r2b1d_connection_secrets(),
+                target.password.as_deref(),
+            )
+            .expect("seal the test password"),
             settings: None,
         })
         .await

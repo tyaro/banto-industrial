@@ -456,6 +456,29 @@ impl DbConnectionTestOutcome {
     }
 }
 
+/// R2b-1d (design §5.4・§5.5): the password of `conn` opened from its sealed row,
+/// right before connecting. `Ok("")` when none is set (a postgres password is optional);
+/// `Err(message)` when one is set but cannot be read - the caller fails the test instead
+/// of connecting with an empty password (checklist §5「エラーを空に潰さない」).
+fn connection_password(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+) -> Result<zeroize::Zeroizing<String>, String> {
+    match crate::secrets::open_connection_secret(
+        &crate::secrets::r2b1d_connection_secrets(),
+        conn,
+        banto_tags::PASSWORD_KEY,
+        secret_rows,
+    ) {
+        Ok(Some(password)) => Ok(password),
+        Ok(None) => Ok(zeroize::Zeroizing::new(String::new())),
+        Err(reason) => Err(format!(
+            "パスワードを読めません（{}）。接続の編集でパスワードを入れ直してください。",
+            reason.as_str()
+        )),
+    }
+}
+
 /// `conn`（`protocol == "postgres"`である前提 - 呼び出し側が
 /// [`banto_tags::PlcConnection::is_db_source`]で確認する）へ接続し、
 /// `SELECT version()`を1回実行して切断する。接続・クエリを合わせて
@@ -464,7 +487,14 @@ impl DbConnectionTestOutcome {
 /// 呼び出し側の責務（このモジュールの doc comment参照）: `protocol`が
 /// `"postgres"`かどうかの判定・認可（REST の`require_editor`/MCP の
 /// `require_admin_scope`）はここでは行わない - 疎通確認そのものだけを担う。
-pub async fn test_connection(conn: &PlcConnection) -> DbConnectionTestOutcome {
+///
+/// R2b-1d: `secret_rows` are `conn`'s sealed secret rows
+/// (`PlcConnectionService::secret_rows`); a password that cannot be opened fails the
+/// test without connecting.
+pub async fn test_connection(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+) -> DbConnectionTestOutcome {
     let port = if conn.port < 1 || conn.port > 65535 {
         return DbConnectionTestOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
@@ -473,12 +503,16 @@ pub async fn test_connection(conn: &PlcConnection) -> DbConnectionTestOutcome {
         conn.port as u16
     };
 
+    let password = match connection_password(conn, secret_rows) {
+        Ok(password) => password,
+        Err(message) => return DbConnectionTestOutcome::failed(message),
+    };
     let options = pg_connect_options(
         &conn.host,
         port,
         conn.database.as_deref().unwrap_or(""),
         conn.username.as_deref().unwrap_or(""),
-        conn.password.as_deref().unwrap_or(""),
+        &password,
         &conn.name,
     );
 
@@ -592,7 +626,13 @@ impl DescribeGroupOutcome {
 /// グレーアウトして選べないようにする。呼び出し側の責務
 /// （`protocol`が`postgres`かどうかの判定・認可・`query_sql`が`Some`か
 /// どうかの確認）はここでは行わない - [`test_connection`]と同じ役割分担。
-pub async fn describe_group(conn: &PlcConnection, query_sql: &str) -> DescribeGroupOutcome {
+///
+/// R2b-1d: `secret_rows` as in [`test_connection`].
+pub async fn describe_group(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+    query_sql: &str,
+) -> DescribeGroupOutcome {
     let port = if conn.port < 1 || conn.port > 65535 {
         return DescribeGroupOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
@@ -601,12 +641,16 @@ pub async fn describe_group(conn: &PlcConnection, query_sql: &str) -> DescribeGr
         conn.port as u16
     };
 
+    let password = match connection_password(conn, secret_rows) {
+        Ok(password) => password,
+        Err(message) => return DescribeGroupOutcome::failed(message),
+    };
     let options = pg_connect_options(
         &conn.host,
         port,
         conn.database.as_deref().unwrap_or(""),
         conn.username.as_deref().unwrap_or(""),
-        conn.password.as_deref().unwrap_or(""),
+        &password,
         &conn.name,
     );
 
@@ -654,7 +698,7 @@ mod tests {
     use banto_tstore::SystemClock;
 
     fn base_conn() -> PlcConnection {
-        PlcConnection {
+        let conn = PlcConnection {
             id: 1,
             name: "Test DB".to_string(),
             protocol: "postgres".to_string(),
@@ -667,9 +711,38 @@ mod tests {
             cpu_type: "R".to_string(),
             database: Some("appdb".to_string()),
             username: Some("appuser".to_string()),
-            password: Some("s3cret-password".to_string()),
-            settings: None,
-        }
+            settings: Default::default(),
+            settings_version: 1,
+        };
+        with_password(conn, "s3cret-password").0
+    }
+
+    const PW_REF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// R2b-1d: `conn` with a sealed (`plain-v1`) password - the reference in its
+    /// `settings` and the row `PlcConnectionService::secret_rows` would return.
+    fn with_password(
+        mut conn: PlcConnection,
+        password: &str,
+    ) -> (PlcConnection, Vec<banto_tags::StoredSecretRow>) {
+        conn.settings.insert(
+            "password".to_string(),
+            serde_json::json!({ "$secret": PW_REF }),
+        );
+        let rows = vec![banto_tags::StoredSecretRow {
+            connection_id: conn.id,
+            key: "password".to_string(),
+            sealed: banto_tags::SealedSecretRow::new(
+                PW_REF,
+                "plain-v1",
+                password.as_bytes().to_vec(),
+            ),
+        }];
+        (conn, rows)
+    }
+
+    fn base_rows() -> Vec<banto_tags::StoredSecretRow> {
+        with_password(base_conn(), "s3cret-password").1
     }
 
     /// A closed port fails fast (well within [`DB_TEST_TIMEOUT`]) with
@@ -678,7 +751,7 @@ mod tests {
     #[tokio::test]
     async fn test_connection_against_a_closed_port_fails_without_leaking_the_password() {
         let conn = base_conn();
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.server_version.is_none());
         let error = outcome.error.expect("a failed test should carry an error");
@@ -693,6 +766,32 @@ mod tests {
         );
     }
 
+    /// R2b-1d (design §5.4・§5.5): a password that is set but cannot be read (its row
+    /// is missing) fails the test and the describe **without connecting** - it is never
+    /// tried as an empty password. A connection with no password at all still tries
+    /// (and fails here on the closed port, not on the password).
+    #[tokio::test]
+    async fn an_unreadable_password_fails_without_connecting() {
+        let conn = base_conn();
+        let outcome = test_connection(&conn, &[]).await;
+        assert!(!outcome.ok);
+        let error = outcome.error.expect("error");
+        assert!(error.contains("パスワードを読めません"), "{error}");
+        assert!(error.contains("missing"), "{error}");
+        let outcome = describe_group(&conn, &[], "SELECT 1 AS a").await;
+        assert!(!outcome.ok);
+        assert!(outcome
+            .error
+            .expect("error")
+            .contains("パスワードを読めません"));
+
+        let mut no_password = base_conn();
+        no_password.settings.clear();
+        let outcome = test_connection(&no_password, &[]).await;
+        assert!(!outcome.ok);
+        assert!(!outcome.error.expect("error").contains("パスワード"));
+    }
+
     /// An invalid port number is rejected before any connection attempt,
     /// with a friendly message (mirrors `test_modbus_connection`'s own
     /// port-range guard).
@@ -702,13 +801,13 @@ mod tests {
 
         // Test port > 65535
         conn.port = 70_000;
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
 
         // Test port = 0
         conn.port = 0;
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
     }
@@ -740,11 +839,15 @@ mod tests {
             cpu_type: "R".to_string(),
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
-            password: url_password(&url),
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
 
-        let outcome = test_connection(&conn).await;
+        let (conn, rows) = match url_password(&url) {
+            Some(password) => with_password(conn, &password),
+            None => (conn, Vec::new()),
+        };
+        let outcome = test_connection(&conn, &rows).await;
         assert!(outcome.ok, "expected ok, got: {outcome:?}");
         let server_version = outcome
             .server_version
@@ -808,7 +911,7 @@ mod tests {
     #[tokio::test]
     async fn describe_group_against_a_closed_port_fails_without_leaking_the_password() {
         let conn = base_conn();
-        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        let outcome = describe_group(&conn, &base_rows(), "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome.columns.is_none());
         let error = outcome
@@ -826,7 +929,7 @@ mod tests {
     async fn describe_group_rejects_an_out_of_range_port() {
         let mut conn = base_conn();
         conn.port = 70_000;
-        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        let outcome = describe_group(&conn, &base_rows(), "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
     }
@@ -882,12 +985,17 @@ mod tests {
             cpu_type: "R".to_string(),
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
-            password: url_password(&url),
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
 
+        let (conn, rows) = match url_password(&url) {
+            Some(password) => with_password(conn, &password),
+            None => (conn, Vec::new()),
+        };
         let outcome = describe_group(
             &conn,
+            &rows,
             "SELECT 1::int4 AS n, true AS b, now() AS t, 'x'::text AS s",
         )
         .await;

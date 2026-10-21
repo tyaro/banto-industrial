@@ -1,5 +1,5 @@
 use super::super::*;
-use super::common::{admin_post, admin_put, test_env, CLIENT_HEADER};
+use super::common::{admin_post, admin_put, stored_password, test_env, CLIENT_HEADER};
 use crate::pending_changes::PendingChangeState;
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
@@ -90,11 +90,10 @@ async fn update_omitting_password_keeps_the_existing_password() {
         "omitting password must keep it set"
     );
 
-    let stored = PlcConnectionService::new(env.pool.clone())
-        .get(conn_id)
-        .await
-        .unwrap();
-    assert_eq!(stored.password.as_deref(), Some("original-secret"));
+    assert_eq!(
+        stored_password(&env.pool, conn_id).await.as_deref(),
+        Some("original-secret")
+    );
 }
 
 /// `PUT`で`password: ""`を送ると、パスワードが消去される。
@@ -141,11 +140,7 @@ async fn update_with_empty_password_clears_it() {
     assert_eq!(status, StatusCode::OK, "{updated:?}");
     assert_eq!(updated["passwordSet"], false);
 
-    let stored = PlcConnectionService::new(env.pool.clone())
-        .get(conn_id)
-        .await
-        .unwrap();
-    assert_eq!(stored.password, None);
+    assert_eq!(stored_password(&env.pool, conn_id).await, None);
 }
 
 /// 非 postgres 接続に`database`を付けると`422 Validation`で拒否される
@@ -653,7 +648,7 @@ async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_b
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             },
         )
@@ -813,7 +808,7 @@ async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprin
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             },
         )

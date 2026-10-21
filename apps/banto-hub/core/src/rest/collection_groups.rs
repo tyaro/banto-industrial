@@ -146,7 +146,8 @@ pub(super) async fn collection_groups_describe(
             .into_response());
     };
 
-    let outcome = crate::db_source::describe_group(&conn, query_sql).await;
+    let secret_rows = state.plc_connections.secret_rows(conn.id).await?;
+    let outcome = crate::db_source::describe_group(&conn, &secret_rows, query_sql).await;
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }
 

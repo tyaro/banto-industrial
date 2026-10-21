@@ -131,35 +131,53 @@ pub struct PlcConnectionPayload {
     pub settings: Option<serde_json::Value>,
 }
 
-impl From<PlcConnectionPayload> for PlcConnectionInput {
-    fn from(payload: PlcConnectionPayload) -> Self {
-        Self {
-            name: payload.name,
-            protocol: payload.protocol,
-            host: payload.host,
-            port: payload.port,
-            unit_id: payload.unit_id,
-            enabled: payload.enabled,
+impl PlcConnectionPayload {
+    /// banto-tags の入力に写す。R2b-1d（docs/banto-hub-connection-settings-design.md §5.3）
+    /// から、`password` の平文は**ここで封印**して `PlcConnectionInput::secrets` に載せる
+    /// （banto-tags は平文を受けない）。tri-state は [`crate::secrets::password_changes`]:
+    /// 省略・`null` は `Keep`、空文字は `Clear`、値は `Set(封印した値)`。封印は R2b-1d では
+    /// 全 OS で `plain-v1`（[`crate::secrets::r2b1d_connection_secrets`]、R2b-1e で
+    /// DPAPI）。封印に失敗したとき（大きすぎる値・乱数源の失敗）は `password` の項目
+    /// エラーで、値は載せない。
+    ///
+    /// 未適用キューは今どおり平文の `password` を持ち、適用の時点でここを通って封印される
+    /// （設計 §10 の R2b-1d。積む時点の封印は R2b-1e）。
+    pub(crate) fn into_input(self) -> Result<PlcConnectionInput, BantoError> {
+        let secrets = crate::secrets::password_changes(
+            &crate::secrets::r2b1d_connection_secrets(),
+            self.password.as_deref(),
+        )
+        .map_err(|error| BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "password".to_string(),
+                message: error.to_string(),
+            }],
+        })?;
+        Ok(PlcConnectionInput {
+            name: self.name,
+            protocol: self.protocol,
+            host: self.host,
+            port: self.port,
+            unit_id: self.unit_id,
+            enabled: self.enabled,
             // T9-2: wired through - see `PlcConnectionPayload::simulation`'s
             // doc comment.
-            simulation: payload.simulation,
+            simulation: self.simulation,
             // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
             // doc comment.
-            word_order: payload.word_order,
+            word_order: self.word_order,
             // #605: 省略は None のままサービスへ渡す（作成は R、更新は既存を保つ）。
-            cpu_type: payload.cpu_type,
-            // S1: wired through verbatim - see `PlcConnectionPayload::database`/
-            // `::username`/`::password`'s doc comments for the (create vs.
-            // update) semantics of `password` specifically.
-            database: payload.database,
-            username: payload.username,
-            password: payload.password,
+            cpu_type: self.cpu_type,
+            // S1: wired through verbatim.
+            database: self.database,
+            username: self.username,
+            secrets,
             // R2a-2e: wired through - `None`（省略）は create では既定、update では
             // 「保存済みの値を保つ」（`banto_tags::PlcConnectionInput::settings`）
             // ので、この項目を知らないクライアントの更新が push 接続の設定を
             // 消すことは無い。
-            settings: payload.settings,
-        }
+            settings: self.settings,
+        })
     }
 }
 
@@ -217,14 +235,24 @@ pub struct PlcConnectionResponse {
     /// （値そのものは返さない）。
     pub password_set: bool,
     /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
-    /// （無ければ `null`。他プロトコルでは常に `null`）。秘密値を持たない
-    /// （`banto_tags::PlcConnection::settings` の doc）のでそのまま返す。
+    /// （R2b-1d から既定のままなら `{}`。他プロトコルでは常に `null`）。`push` の
+    /// `settings` は秘密値を持たないのでそのまま返す。
     pub settings: Option<serde_json::Value>,
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
     fn from(conn: PlcConnection) -> Self {
-        let password_set = conn.password.as_deref().is_some_and(|s| !s.is_empty());
+        // R2b-1d: a password is "set" when `settings.password` holds a secret reference
+        // (design §3.3). Whether it can be opened (`passwordState: "unreadable"`) is
+        // R2b-1e (design §5.5).
+        let password_set = conn.secret_ref(banto_tags::PASSWORD_KEY).is_some();
+        // The wire keeps R2a's shape (design §2, Q4): `settings` is a push row's settings
+        // object (`{}` on its defaults - the column is NOT NULL since migration 0025, so
+        // "never set" and "set to `{}`" are one state) and `null` for every other
+        // protocol - never another protocol's settings object (a postgres one holds the
+        // secret reference; the flat fields above are its wire form until R2b-7).
+        let settings = (conn.protocol == banto_tags::PUSH_PROTOCOL)
+            .then(|| serde_json::Value::Object(conn.settings.clone()));
         Self {
             id: conn.id,
             name: conn.name,
@@ -239,7 +267,7 @@ impl From<PlcConnection> for PlcConnectionResponse {
             database: conn.database,
             username: conn.username,
             password_set,
-            settings: conn.settings,
+            settings,
         }
     }
 }
@@ -294,6 +322,8 @@ pub(super) async fn plc_connections_create(
         )
         .await;
     }
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input().map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -309,7 +339,7 @@ pub(super) async fn plc_connections_create(
             return Err(err.into());
         }
     };
-    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+    let created = match state.plc_connections.create_tx(&mut tx, input).await {
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -373,6 +403,8 @@ pub(super) async fn plc_connections_update(
         )
         .await;
     }
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input().map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -388,11 +420,7 @@ pub(super) async fn plc_connections_update(
             return Err(err.into());
         }
     };
-    let updated = match state
-        .plc_connections
-        .update_tx(&mut tx, id, input.into())
-        .await
-    {
+    let updated = match state.plc_connections.update_tx(&mut tx, id, input).await {
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -574,7 +602,8 @@ pub(super) async fn plc_connections_test_saved(
             .into_response());
     }
 
-    let outcome = crate::db_source::test_connection(&conn).await;
+    let secret_rows = state.plc_connections.secret_rows(id).await?;
+    let outcome = crate::db_source::test_connection(&conn, &secret_rows).await;
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }
 

@@ -94,14 +94,32 @@
 //! doc comment), and `banto_broker`'s `DriverTable` has no entry for it
 //! either, so nothing ever tries to open a broker session against it.
 //!
-//! Three columns exist only for this protocol: [`PlcConnection::database`]/
-//! [`PlcConnection::username`]/[`PlcConnection::password`] (§2.2's "v1 は
-//! MQTT と同じ平文" decision - plaintext storage, no encryption/keyring in
-//! this version). [`validate_plc_connection_input`] enforces the two
-//! directions of one rule: `database`/`username` are required (non-empty,
-//! trimmed, capped) when `protocol == `[`POSTGRES_PROTOCOL`], and all three
-//! columns must be empty/`None` for every other protocol - a `"modbus-tcp"`
-//! row can never carry a stray DB password.
+//! Three settings exist only for this protocol: [`PlcConnection::database`]/
+//! [`PlcConnection::username`] and the password. [`validate_plc_connection_input`]
+//! enforces the two directions of one rule: `database`/`username` are required
+//! (non-empty, trimmed, capped) when `protocol == `[`POSTGRES_PROTOCOL`], and they
+//! and a password must be empty/absent for every other protocol - a
+//! `"modbus-tcp"` row can never carry a stray DB password.
+//!
+//! The password was a plaintext column until R2b-1d (§2.2's "v1 は MQTT と同じ平文").
+//! Since migration `0025` (docs/banto-hub-connection-settings-design.md §3.3・§5) it is
+//! a sealed row of `plc_connection_secrets` that `settings.password` refers to with
+//! `{"$secret": "<ref>"}`; this crate receives it already sealed
+//! ([`PlcConnectionInput::secrets`]) and never sees the plaintext
+//! ([`crate::connection_secret`]).
+//!
+//! ## R2b-1d: `settings` for every protocol (migration `0025`)
+//!
+//! The table now has only `id`・`name`・`protocol`・`enabled`・`simulation`・`settings`・
+//! `settings_version`; every per-protocol value lives in the JSON `settings`
+//! (design §3.2's table) and the flat fields of [`PlcConnection`] are a read-only
+//! projection of it (`settings_json::legacy::flat_view`). The SQL `CHECK` on
+//! `protocol` is only the `DriverId` grammar now - [`ALLOWED_PROTOCOLS`] (and the
+//! hand-written validation) is the old rule set a service without a registry
+//! ([`PlcConnectionService::new`], ChronoGazer, R2b-7) still enforces; a service
+//! with one ([`PlcConnectionService::with_registry`], banto-hub) adds the driver's
+//! validation after it. Each write runs in one transaction that also writes/deletes
+//! the connection's sealed secret rows (design §5.3).
 //!
 //! `unit_id`/`word_order`/`simulation` are meaningless for a DB connection
 //! (they are wire-protocol/PLC concepts) - but instead of `"virtual"`'s
@@ -220,8 +238,8 @@
 //! connection per sender, §9.5-1).
 //!
 //! The same migration adds the `settings` column ([`PlcConnection::settings`]),
-//! a JSON object that only `"push"` uses so far (`stale_timeout_ms` and the
-//! bridge section, §3.2; R2b-1 widens it to every protocol). Its rules are
+//! a JSON object that only `"push"` used at first (`stale_timeout_ms` and the
+//! bridge section, §3.2; R2b-1d widened it to every protocol). Its rules are
 //! the pure [`crate::push::validate_push_settings`] - every write method of
 //! [`PlcConnectionService`] runs it - plus one registry lookup this module
 //! does itself: `bridge.db_connection_id` must name a `"postgres"`
@@ -231,7 +249,7 @@
 //! reasoning: an update from a caller that does not know the field - today
 //! every REST/MCP payload - must not silently wipe a bridge's configuration).
 //! An explicit object replaces it; switching to a non-`"push"` protocol
-//! always stores `NULL`.
+//! drops it (that protocol's `settings` come from its flat fields).
 //!
 //! A `"push"` tag's `address` is the sender's opaque key, unique per
 //! connection - see `crate::tag`'s placement rules and migration `0024`.
@@ -247,9 +265,17 @@ use banto_core::{BantoError, FieldError, ListParams, ListResult};
 use banto_driver_api::DriverRegistry;
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
+use crate::connection_secret::{
+    builtin_secret_keys, check_settings_shape, delete_all_secret_rows, delete_secret_rows_except,
+    insert_secret_rows, load_all_secret_rows, load_secret_rows_of, secret_ref_of, secret_ref_value,
+    SecretChange, SecretChanges, StoredSecretRow, PASSWORD_KEY,
+};
 use crate::push::{validate_push_settings, PushSettings};
+use crate::settings_json::legacy::{settings_from_flat, SLMP_PROTOCOL};
+use crate::settings_json::validate_settings_with_registry;
 use crate::support::{
     map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
 };
@@ -655,77 +681,6 @@ fn push_protocol_switch_error(
     })
 }
 
-/// [`PlcConnectionService::create`]'s password rule (this crate's
-/// `PlcConnectionInput::password` doc comment, "create" case): `None` and
-/// `Some("")` both mean "no password yet" (stored as SQL `NULL`); any other
-/// `Some(s)` is stored verbatim.
-fn stored_password_for_create(password: &Option<String>) -> Option<String> {
-    match password {
-        Some(s) if !s.is_empty() => Some(s.clone()),
-        _ => None,
-    }
-}
-
-/// #605: 作成時に保存する CPU 種別。未指定は [`CPU_TYPE_R`]。
-/// 呼び出し前に [`validate_plc_connection_input`] を通していること。
-fn cpu_type_for_create(value: &Option<String>) -> String {
-    match value.as_deref() {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => CPU_TYPE_R.to_string(),
-    }
-}
-
-/// #605: 更新時にバインドする CPU 種別。`None` は SQL の `NULL` になり、
-/// `COALESCE(NULL, cpu_type)` が既存値を保つ。空文字も未指定と同じ。
-/// 呼び出し前に [`validate_plc_connection_input`] を通していること。
-fn cpu_type_for_update(value: &Option<String>) -> Option<String> {
-    match value.as_deref() {
-        Some(s) if !s.is_empty() => Some(s.to_string()),
-        _ => None,
-    }
-}
-
-/// [`PlcConnectionService::update`]'s password rule (this crate's
-/// `PlcConnectionInput::password` doc comment, "update" case): `None` keeps
-/// `existing`, `Some("")` clears it, any other `Some(s)` replaces it.
-fn stored_password_for_update(
-    password: &Option<String>,
-    existing: Option<String>,
-) -> Option<String> {
-    match password {
-        None => existing,
-        Some(s) if s.is_empty() => None,
-        Some(s) => Some(s.clone()),
-    }
-}
-
-/// [`PlcConnectionService::create`]'s `settings` rule
-/// ([`PlcConnectionInput::settings`], "create" case): the JSON text to store,
-/// or `None` (SQL `NULL`). Only a `"push"` row stores anything - validation
-/// has already refused `settings` on every other protocol.
-fn settings_for_create(input: &PlcConnectionInput) -> Option<String> {
-    if input.protocol != PUSH_PROTOCOL {
-        return None;
-    }
-    input.settings.as_ref().map(serde_json::Value::to_string)
-}
-
-/// [`PlcConnectionService::update`]'s `settings` rule
-/// ([`PlcConnectionInput::settings`], "update" case), as the two binds of
-/// `settings = CASE WHEN ? THEN settings ELSE ? END`: `(true, _)` keeps the
-/// stored value (a `"push"` payload that omits `settings`), `(false, value)`
-/// stores `value` (an explicit object, or `NULL` for every non-`"push"`
-/// protocol - leaving `"push"` drops the settings).
-fn settings_for_update(input: &PlcConnectionInput) -> (bool, Option<String>) {
-    if input.protocol != PUSH_PROTOCOL {
-        return (false, None);
-    }
-    match &input.settings {
-        None => (true, None),
-        Some(value) => (false, Some(value.to_string())),
-    }
-}
-
 /// The parsed settings of a payload that is about to *write* them (`"push"`
 /// with an explicit object). `None` when nothing new is written. Call after
 /// [`validate_plc_connection_input`] passed (so the parse cannot fail).
@@ -861,100 +816,136 @@ where
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
+///
+/// ## R2b-1d: `settings` is the truth, the flat fields are a read-only projection
+///
+/// Since migration `0025` (docs/banto-hub-connection-settings-design.md §3.1・§3.2) the
+/// table has only `id`・`name`・`protocol`・`enabled`・`simulation`・`settings`・
+/// `settings_version`. The per-protocol endpoint/PLC settings live in [`Self::settings`]
+/// (a JSON object, every protocol); [`Self::host`]・[`Self::port`]・[`Self::unit_id`]・
+/// [`Self::word_order`]・[`Self::cpu_type`]・[`Self::database`]・[`Self::username`] are
+/// **built from it** by `settings_json::legacy::flat_view` (in [`Self::from_settings`],
+/// which `FromRow` calls) so the collection, the broker and ChronoGazer keep reading the
+/// flat fields until R2b-7 (design §4.3・§7). Writing to them changes nothing in the
+/// database. A key a protocol does not read, or that is absent, reads as today's default.
+///
+/// The postgres password is **not** a field any more: `settings.password` holds only a
+/// reference `{"$secret": "<ref>"}` to a sealed row of `plc_connection_secrets`
+/// (design §3.3, [`crate::connection_secret`]). [`Self::secret_ref`] reads the reference;
+/// opening the sealed value is banto-hub's `secrets` module's job.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnection {
     pub id: i64,
     pub name: String,
     pub protocol: String,
+    /// Read-only projection of `settings.host` (`""` when absent or not read by the protocol).
     pub host: String,
+    /// Read-only projection of `settings.port` (`0` when absent or not read by the protocol).
     pub port: i64,
+    /// Read-only projection of `settings.unit_id` (`modbus-tcp` only; `1` otherwise).
     pub unit_id: i64,
     pub enabled: bool,
-    /// T9-1 (this module's doc comment, "simulation" section).
+    /// T9-1 (this module's doc comment, "simulation" section). Still a column (a host
+    /// concept, design §3.1).
     pub simulation: bool,
-    /// P3-b (this module's doc comment, [`ALLOWED_WORD_ORDERS`]). Meaningful
-    /// for `"slmp"` **and `"modbus-tcp"`** connections (#325, 2026-09-08 -
-    /// this module's doc comment, "`word_order` is a Modbus setting too";
-    /// migration `0010` originally claimed it was SLMP-only and migration
-    /// `0017` is where that was corrected). `"virtual"`/`"postgres"` rows
-    /// simply carry a value nothing reads, the same treatment `unit_id` gets
-    /// for SLMP (this module's doc comment, above).
+    /// P3-b (this module's doc comment, [`ALLOWED_WORD_ORDERS`]). Read-only projection
+    /// of `settings.word_order` - meaningful for `"slmp"` **and `"modbus-tcp"`** (#325,
+    /// 2026-09-08 - this module's doc comment, "`word_order` is a Modbus setting too");
+    /// every other protocol reads as its default ([`default_word_order_for`]).
     pub word_order: String,
-    /// #605: SLMP の CPU 種別（[`CPU_TYPE_Q`] / [`CPU_TYPE_R`]）。既定は
-    /// [`CPU_TYPE_R`] で、この列を足す前のフレーム形式を保つ。SLMP 以外の
-    /// プロトコルでは収集・broker は読まない。
+    /// #605: SLMP の CPU 種別（[`CPU_TYPE_Q`] / [`CPU_TYPE_R`]）。`settings.cpu_type` の
+    /// 読み取りの写し（`slmp` だけ。ほかのプロトコルと無いときは [`CPU_TYPE_R`]）。
     pub cpu_type: String,
-    /// S1 (this module's doc comment, "`\"postgres\"`" section): the DB name
-    /// a `"postgres"` connection targets. Always `None` for every other
-    /// protocol.
+    /// S1: read-only projection of `settings.database` (`"postgres"` only, `None`
+    /// otherwise).
     pub database: Option<String>,
-    /// S1: the DB user a `"postgres"` connection authenticates as. Always
-    /// `None` for every other protocol.
+    /// S1: read-only projection of `settings.username` (`"postgres"` only, `None`
+    /// otherwise).
     pub username: Option<String>,
-    /// S1: the DB password, stored **in plain text** (§2.2 of
-    /// docs/banto-hub-external-db-design.md, 2026-09-06 決定「v1 は MQTT と
-    /// 同じ平文」- same posture as `apps/banto-hub/core/src/settings.rs`'s
-    /// MQTT password). Always `None` for every other protocol.
-    ///
-    /// **Never serialize this field to an external caller.** `PlcConnection`
-    /// derives `Serialize` for internal use (config-package export, the
-    /// registry's own round-trip), but every REST/MCP surface that reads a
-    /// connection back (`apps/banto-hub/core/src/rest.rs`'s response DTO,
-    /// `crate::mcp`'s `list_connections`/`create_connection` results) must
-    /// redact this to a `passwordSet: bool` before it leaves the process -
-    /// see this crate's `PlcConnectionService::update`/`update_tx` doc
-    /// comment for the write-side semantics this field participates in.
-    pub password: Option<String>,
-    /// R2a-2a (this module's doc comment, "`\"push\"`" section): the
-    /// connection's JSON settings (migration `0023`'s `settings` column).
-    /// Only a `"push"` row carries one today - always an object that passed
-    /// [`crate::push::validate_push_settings`] when it was written; `None`
-    /// for every other protocol and for a `"push"` row on its defaults.
-    /// Holds no secrets (a bridge's DB password stays on the referenced
-    /// `"postgres"` row, §10.2).
+    /// R2b-1d: the connection's JSON settings (migration `0025`'s `settings` column,
+    /// `NOT NULL`, always an object). Per-protocol keys are design §3.2's table; a
+    /// `"push"` row's object is what [`crate::push::validate_push_settings`] accepted
+    /// (R2a). Secret keys hold only references (`{"$secret": "<ref>"}`), never a value,
+    /// so this may be serialized as is.
     #[serde(default)]
-    pub settings: Option<serde_json::Value>,
+    pub settings: Map<String, Value>,
+    /// R2b-1d (design §3.4): the driver's settings-shape version the row was written
+    /// with. Always `1` in R2b-1.
+    #[serde(default = "default_settings_version")]
+    pub settings_version: i64,
 }
 
-/// Hand-written instead of `#[derive(sqlx::FromRow)]` only because of
-/// [`PlcConnection::settings`]: the column is JSON text, and the derive's
-/// `#[sqlx(json)]` needs sqlx's `json` feature, which this workspace does not
-/// enable (turning it on for one column would change sqlx's feature set for
-/// every crate). Every other column is read by name exactly as the derive
-/// would (so `COLUMNS` and `banto_collect`'s `load_connection` SELECT must
-/// still name every column - implementation-checklist §5, #605).
+fn default_settings_version() -> i64 {
+    1
+}
+
+/// Hand-written instead of `#[derive(sqlx::FromRow)]` because of
+/// [`PlcConnection::settings`]: the column is JSON text (the derive's `#[sqlx(json)]`
+/// needs sqlx's `json` feature, which this workspace does not enable) and the flat
+/// fields are projected from it ([`PlcConnection::from_settings`]). `COLUMNS` and
+/// `banto_collect`'s `load_connection` SELECT must still name every column
+/// (implementation-checklist §5, #605). A `settings` that is not a JSON object fails the
+/// row (the column's `CHECK` makes that impossible for a row SQLite accepted, design §4.4).
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for PlcConnection {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
-        let settings: Option<String> = row.try_get("settings")?;
-        let settings = settings
-            .map(|text| serde_json::from_str(&text))
-            .transpose()
-            .map_err(|err| sqlx::Error::ColumnDecode {
+        let text: String = row.try_get("settings")?;
+        let settings: Map<String, Value> =
+            serde_json::from_str(&text).map_err(|err| sqlx::Error::ColumnDecode {
                 index: "settings".to_string(),
                 source: Box::new(err),
             })?;
-        Ok(PlcConnection {
-            id: row.try_get("id")?,
-            name: row.try_get("name")?,
-            protocol: row.try_get("protocol")?,
-            host: row.try_get("host")?,
-            port: row.try_get("port")?,
-            unit_id: row.try_get("unit_id")?,
-            enabled: row.try_get("enabled")?,
-            simulation: row.try_get("simulation")?,
-            word_order: row.try_get("word_order")?,
-            cpu_type: row.try_get("cpu_type")?,
-            database: row.try_get("database")?,
-            username: row.try_get("username")?,
-            password: row.try_get("password")?,
+        Ok(PlcConnection::from_settings(
+            row.try_get("id")?,
+            row.try_get("name")?,
+            row.try_get("protocol")?,
+            row.try_get("enabled")?,
+            row.try_get("simulation")?,
             settings,
-        })
+            row.try_get("settings_version")?,
+        ))
     }
 }
 
 impl PlcConnection {
+    /// Build a connection from its stored columns, projecting the flat fields from
+    /// `settings` (`settings_json::legacy::flat_view`, design §4.3). `FromRow` uses this;
+    /// so can a test or a caller that holds a `settings` object.
+    pub fn from_settings(
+        id: i64,
+        name: String,
+        protocol: String,
+        enabled: bool,
+        simulation: bool,
+        settings: Map<String, Value>,
+        settings_version: i64,
+    ) -> Self {
+        let flat = crate::settings_json::legacy::flat_view(&protocol, &settings);
+        PlcConnection {
+            id,
+            name,
+            protocol,
+            host: flat.host,
+            port: flat.port,
+            unit_id: flat.unit_id,
+            enabled,
+            simulation,
+            word_order: flat.word_order,
+            cpu_type: flat.cpu_type,
+            database: flat.database,
+            username: flat.username,
+            settings,
+            settings_version,
+        }
+    }
+
+    /// The secret reference stored under `key` (`settings[key] = {"$secret": ref}`), if
+    /// any (design §3.3). `postgres`'s password is `secret_ref(`[`PASSWORD_KEY`]`)`.
+    pub fn secret_ref(&self, key: &str) -> Option<&str> {
+        secret_ref_of(&self.settings, key)
+    }
+
     /// S1 (this module's doc comment, "`\"postgres\"`" section): whether this
     /// row is a DB Source/Sink connection (`protocol == `[`POSTGRES_PROTOCOL`])
     /// rather than a wire-protocol PLC connection. Downstream code that must
@@ -1047,8 +1038,9 @@ pub struct PlcConnectionInput {
     ///
     /// - 作成: `None`（省略）と `Some("")` は [`CPU_TYPE_R`]。`Some("Q")` /
     ///   `Some("R")` はその値。それ以外は検証エラー。
-    /// - 更新: `None` と `Some("")` は**既存行の値を保つ**
-    ///   （`cpu_type = COALESCE(NULL, cpu_type)`）。明示した `"Q"` / `"R"`
+    /// - 更新: `None` と `Some("")` は**既存行の値を保つ**（R2b-1d から: 同じ書き込みの
+    ///   トランザクションの中で今の `settings.cpu_type` を読んで合わせる。今の行が `slmp`
+    ///   でない・値が無いときは [`CPU_TYPE_R`]。設計 §4.3）。明示した `"Q"` / `"R"`
     ///   だけ置き換える。未知の値は検証エラーで、既定へのフォールバックは
     ///   しない。
     #[serde(default)]
@@ -1062,39 +1054,45 @@ pub struct PlcConnectionInput {
     /// required-for-postgres/forbidden-otherwise rule as [`Self::database`].
     #[serde(default)]
     pub username: Option<String>,
-    /// S1. See [`PlcConnection::password`]'s doc comment. Optional even for
-    /// `protocol == `[`POSTGRES_PROTOCOL`] (a DB Source may be configured
-    /// before its password is known), forbidden (must be `None`/empty)
-    /// otherwise.
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.3): what to do with each
+    /// secret key of the connection, **already sealed** by the caller (banto-hub's
+    /// `secrets` module) - this crate never receives a plaintext secret. A key that is
+    /// absent means [`SecretChange::Keep`]. Replaces the plaintext `password` field.
     ///
-    /// **This field's meaning is not the same on every call** -
-    /// [`PlcConnectionService::create`]/[`PlcConnectionService::create_tx`]
-    /// treat it as a plain "the password to store" (`None`/`Some("")` both
-    /// mean "no password yet"). [`PlcConnectionService::update`]/
-    /// [`PlcConnectionService::update_tx`] treat it as a **tri-state PATCH**
-    /// instead, because a bare `PUT`-style "always echo the current value"
-    /// contract would force every editor UI/MCP caller to have already
-    /// fetched (and therefore received) the plaintext password just to
-    /// leave it unchanged - exactly the exposure [`PlcConnection::password`]'s
-    /// own doc comment says to avoid:
+    /// The REST/MCP tri-state of the old `password` maps onto it at the Hub's entrance:
+    /// omitted / `null` → `Keep`, `""` → `Clear`, a value → `Set(sealed)`. Per call:
     ///
-    /// - `None` (omitted, or explicit JSON `null`): **keep** the row's
-    ///   current password unchanged.
-    /// - `Some("")` (empty string): **clear** the stored password (set the
-    ///   column to `NULL`).
-    /// - `Some(s)` for non-empty `s`: **replace** the stored password with
-    ///   `s`.
-    #[serde(default)]
-    pub password: Option<String>,
+    /// - **create** ([`PlcConnectionService::create`]/[`PlcConnectionService::create_tx`]):
+    ///   `Set` writes the sealed row and puts `{"$secret": ref}` under the key; `Keep`
+    ///   and `Clear` both mean "no value yet" (the old create rule: `None` and `Some("")`
+    ///   both stored no password).
+    /// - **update** ([`PlcConnectionService::update`] and its siblings): `Keep` keeps the
+    ///   stored reference and row - only when the new protocol still holds that key as a
+    ///   secret; `Clear` removes reference and row; `Set` adds the new row, removes the old
+    ///   one and switches the reference. A protocol change removes every reference and row
+    ///   that is not a secret key of the new protocol. All in the write's transaction.
+    ///
+    /// `Set` is accepted only for the protocol's secret keys (the driver's
+    /// `secret_keys()` with a registry, [`crate::connection_secret::builtin_secret_keys`]
+    /// without: `postgres` → `password`); any other key is a field error on that key,
+    /// with the old `password` wording ("postgres接続以外では指定できません").
+    ///
+    /// Not part of the wire form (`#[serde(skip)]`): a deserialized input always has no
+    /// change, so a plaintext `password` in a JSON payload can never reach the database
+    /// through this type.
+    #[serde(skip)]
+    pub secrets: SecretChanges,
     /// R2a-2a. See [`PlcConnection::settings`]'s doc comment. Allowed only
     /// when `protocol == `[`PUSH_PROTOCOL`] (validated by
     /// [`crate::push::validate_push_settings`]); must be `None` otherwise.
     ///
     /// **Like [`Self::cpu_type`], omission means different things on create
-    /// and update**: create stores `None` as SQL `NULL` (the protocol's
-    /// defaults); update keeps the stored value when this is `None` and
-    /// replaces it with an explicit object. A non-`"push"` row always stores
-    /// `NULL` (switching a connection away from `"push"` drops its settings).
+    /// and update**: create stores `{}` (the protocol's defaults); update keeps the
+    /// stored object when this is `None` and the row already is `"push"` (read inside
+    /// the write's transaction, design §4.3) and replaces it with an explicit object.
+    /// Every other protocol's `settings` is built from the flat fields
+    /// (`settings_json::legacy::settings_from_flat`, design §3.2), so switching a
+    /// connection away from `"push"` drops its push settings.
     #[serde(default)]
     pub settings: Option<serde_json::Value>,
 }
@@ -1115,9 +1113,18 @@ pub struct PlcConnectionInput {
 /// through [`normalize_postgres_input`] (so `unit_id`/`word_order`/
 /// `simulation` never fail their own checks above for a `"postgres"` row):
 /// `database`/`username` are required (trimmed non-empty, capped) when
-/// `protocol == `[`POSTGRES_PROTOCOL`], and `database`/`username`/`password`
-/// must all be empty/`None` for every other protocol.
-fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), BantoError> {
+/// `protocol == `[`POSTGRES_PROTOCOL`], and `database`/`username` must be
+/// empty/`None` for every other protocol. R2b-1d: a sealed secret
+/// ([`PlcConnectionInput::secrets`]'s `Set`) is accepted only for one of
+/// `secret_keys` (the protocol's secret keys - `password` for postgres).
+///
+/// This is step (1) of design §4.2 (the old flat rules, R2b-7 removes it). With a
+/// registry, steps (2)-(4) run only when this passes
+/// ([`PlcConnectionService::with_registry`]).
+fn validate_plc_connection_input(
+    input: &PlcConnectionInput,
+    secret_keys: &[String],
+) -> Result<(), BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
     let trimmed_name = input.name.trim();
@@ -1221,10 +1228,9 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
 
     // S1 (this module's doc comment, "`\"postgres\"`" section): database/
     // username required (and capped) for postgres, forbidden for everyone
-    // else. password has no format rule of its own (any string, including
-    // empty, is acceptable for postgres - see `PlcConnectionInput::password`'s
-    // doc comment) but is still forbidden outside postgres, same as the
-    // other two.
+    // else. The password has no format rule of its own (R2b-1d: it arrives
+    // sealed, `PlcConnectionInput::secrets`); setting one outside postgres is
+    // refused below, by the protocol's secret keys.
     let is_postgres = input.protocol == POSTGRES_PROTOCOL;
     if is_postgres {
         let database = input.database.as_deref().unwrap_or("").trim();
@@ -1273,10 +1279,19 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
                 message: "postgres接続以外では指定できません".to_string(),
             });
         }
-        if input.password.as_deref().is_some_and(|s| !s.is_empty()) {
+    }
+
+    // R2b-1d (design §5.3): a sealed value may only be set for one of the protocol's
+    // secret keys. The `password` wording is the old plaintext column's (S1).
+    for (key, change) in &input.secrets {
+        if matches!(change, SecretChange::Set(_)) && !secret_keys.iter().any(|k| k == key) {
             errors.push(FieldError {
-                field: "password".to_string(),
-                message: "postgres接続以外では指定できません".to_string(),
+                field: key.clone(),
+                message: if key == PASSWORD_KEY {
+                    "postgres接続以外では指定できません".to_string()
+                } else {
+                    format!("{} 接続では {key} を指定できません", input.protocol)
+                },
             });
         }
     }
@@ -1307,47 +1322,80 @@ fn validate_plc_connection_input(input: &PlcConnectionInput) -> Result<(), Banto
 }
 
 fn column_map() -> ColumnMap {
+    // R2b-1d (design §7): only the columns that still exist. `host`・`port`・`unitId`・
+    // `wordOrder`・`cpuType`・`database`・`username` moved into `settings` (no REST
+    // surface filters or sorts connections - banto-hub and ChronoGazer both list with
+    // `ListParams::default()`).
     ColumnMap::new()
         .column("id", "id")
         .column("name", "name")
         .column("protocol", "protocol")
-        .column("host", "host")
-        .column("port", "port")
-        .column("unitId", "unit_id")
         .column("enabled", "enabled")
         .column("simulation", "simulation")
-        .column("wordOrder", "word_order")
-        .column("cpuType", "cpu_type")
-        .column("database", "database")
-        .column("username", "username")
-    // R2a-2a: `settings` (a JSON object) is not listed either - nothing
-    // filters or sorts by it, and a text match against JSON would be
-    // meaningless.
-    // S1: `password` is deliberately NOT listed here - filtering/sorting
-    // a list by password value would let a caller confirm a guess about
-    // its content through a side channel (an otherwise-plain `list`
-    // parameter), which nothing else in this API needs to support.
+    // `settings` (a JSON object) is not listed - nothing filters or sorts by it, a
+    // text match against JSON would be meaningless, and it holds secret references.
 }
 
 const RESOURCE: &str = "plc_connections";
-const COLUMNS: &str =
-    "id, name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password, settings";
+const COLUMNS: &str = "id, name, protocol, enabled, simulation, settings, settings_version";
+
+/// `SELECT protocol, settings` of the row an update is about to overwrite.
+const EXISTING_ROW_SQL: &str = "SELECT protocol, settings FROM plc_connections WHERE id = ?";
+
+/// The refusal for editing a reserved `"virtual"` connection.
+fn reserved_edit_error() -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "id".to_string(),
+            message: "予約接続（calc/mem）は編集できません".to_string(),
+        }],
+    }
+}
+
+/// The refusal for deleting a reserved `"virtual"` connection.
+fn reserved_delete_error() -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "id".to_string(),
+            message: "予約接続（calc/mem）は削除できません".to_string(),
+        }],
+    }
+}
+
+fn validation(field_errors: Vec<FieldError>) -> Result<(), BantoError> {
+    if field_errors.is_empty() {
+        Ok(())
+    } else {
+        Err(BantoError::Validation { field_errors })
+    }
+}
 
 /// Service layer for the `plc_connections` resource. `Clone` is cheap
 /// (`SqlitePool` is `Arc`-backed), matching the pattern of every resource
 /// service in the banto template repo.
+///
+/// ## R2b-1d: one transaction per write (design §4.3・§5.3)
+///
+/// A write now touches two tables - the connection row (whose `settings` is merged with
+/// the stored one for the "omitted keeps" fields) and its sealed secret rows
+/// (`plc_connection_secrets`, [`crate::connection_secret`]) - so every write runs in one
+/// transaction: the `*_tx` methods inside the caller's, the others open their own
+/// `BEGIN IMMEDIATE` (they read before they write, checklist §5). The merge reads the
+/// stored row **inside** that transaction; nothing is read outside and written back.
 #[derive(Clone)]
 pub struct PlcConnectionService {
     pool: SqlitePool,
-    /// R2b-1c（docs/banto-hub-connection-settings-design.md §4.2）:
-    /// [`Self::with_registry`] で渡されたレジストリ。**保存の経路はまだ読まない**
-    /// （旧い検証のまま）。R2b-1d が検証の正をこちらへ移す。
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §4.2）: [`Self::with_registry`]
+    /// で渡されたレジストリ。あるときは書き込みが旧い検証 (1) の後に (2)〜(4)（平らな形 →
+    /// `settings` → `registry.get` → `validate_config`）を走らせ、秘密のキーと
+    /// `settings_version` をドライバから引く。
     registry: Option<Arc<DriverRegistry>>,
 }
 
 impl PlcConnectionService {
-    /// 旧規則（[`ALLOWED_PROTOCOLS`] と手書きの検証）のサービス。ChronoGazer と
-    /// `banto-tags` のテストが使う。
+    /// 旧規則（[`ALLOWED_PROTOCOLS`] と手書きの検証、秘密のキーは
+    /// [`crate::connection_secret::builtin_secret_keys`]）のサービス。ChronoGazer と
+    /// `banto-tags` のテストが使う（設計 §4.2、Q6）。
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
@@ -1355,9 +1403,11 @@ impl PlcConnectionService {
         }
     }
 
-    /// レジストリを持つサービス（Hub、設計 §4.2）。R2b-1c では保存の振る舞いは
-    /// [`Self::new`] と同じ（レジストリは [`Self::registry`] で取り出して
-    /// [`crate::settings_json::validate_settings_with_registry`] に渡すためだけにある）。
+    /// レジストリを正にするサービス（Hub、設計 §4.2）。書き込みは旧い検証 (1) が通った
+    /// ときだけ (2) 平らな形を `settings` に写し（「省略は保つ」を合わせた最終の形）→ (3)
+    /// `registry.get(protocol)` が無ければ `protocol` の項目エラー → (4) `settings_to_api` →
+    /// `validate_config` を走らせる。**(1) が断ったら (1) のエラーだけを返す**。秘密のキーは
+    /// ドライバの `secret_keys()`、`settings_version` はドライバの記述子から引く。
     pub fn with_registry(pool: SqlitePool, registry: Arc<DriverRegistry>) -> Self {
         Self {
             pool,
@@ -1368,6 +1418,55 @@ impl PlcConnectionService {
     /// [`Self::with_registry`] で渡されたレジストリ。[`Self::new`] では `None`。
     pub fn registry(&self) -> Option<&Arc<DriverRegistry>> {
         self.registry.as_ref()
+    }
+
+    /// The secret keys of `protocol`: the driver's `secret_keys()` with a registry (none
+    /// for an unregistered protocol - step (3) refuses it anyway), the built-in table
+    /// without (design §3.3).
+    pub fn secret_keys(&self, protocol: &str) -> Vec<String> {
+        match &self.registry {
+            Some(registry) => registry
+                .get(protocol)
+                .map(|entry| entry.base().secret_keys())
+                .unwrap_or_default(),
+            None => builtin_secret_keys(protocol)
+                .iter()
+                .map(|key| key.to_string())
+                .collect(),
+        }
+    }
+
+    /// The `settings_version` a write stores (design §3.4): the driver's with a
+    /// registry, `1` without (or for an unregistered protocol).
+    fn settings_version(&self, protocol: &str) -> i64 {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.get(protocol))
+            .map_or(1, |entry| i64::from(entry.descriptor().settings_version))
+    }
+
+    /// Steps (2)-(4) of design §4.2 plus the storage-layer checks, on the **final**
+    /// `settings` a write is about to store (after the "omitted keeps" merge and the
+    /// secret references). Called only after step (1) passed.
+    ///
+    /// With a registry: the driver's validation first; only if that passes, the shape
+    /// check. Without: the shape check. The shape check ([`check_settings_shape`]) refuses a
+    /// plaintext (or any non-reference) value under a secret key - the last line that keeps
+    /// a plaintext secret out of the database whichever entrance forgot to seal it (design
+    /// §3.3・§8-1) - and enforces design §3.2's JSON types for the built-in protocols so
+    /// that `flat_view` reads back exactly what was validated (§10's R2b-1d note).
+    fn validate_settings(
+        &self,
+        protocol: &str,
+        settings: &Map<String, Value>,
+        secret_keys: &[String],
+    ) -> Result<(), BantoError> {
+        if let Some(registry) = &self.registry {
+            validation(validate_settings_with_registry(
+                registry, protocol, settings,
+            ))?;
+        }
+        validation(check_settings_shape(protocol, settings, secret_keys))
     }
 
     pub async fn list(&self, params: ListParams) -> Result<ListResult<PlcConnection>, BantoError> {
@@ -1413,97 +1512,98 @@ impl PlcConnectionService {
         .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
     }
 
+    /// The sealed secret rows of connection `id` (design §5.4: the readers open them
+    /// in banto-hub's `secrets` module, this crate does not). Empty when it has none.
+    pub async fn secret_rows(&self, id: i64) -> Result<Vec<StoredSecretRow>, BantoError> {
+        load_secret_rows_of(&self.pool, id)
+            .await
+            .map_err(banto_storage::storage_error)
+    }
+
+    /// Every sealed secret row (all connections).
+    pub async fn all_secret_rows(&self) -> Result<Vec<StoredSecretRow>, BantoError> {
+        load_all_secret_rows(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)
+    }
+
+    /// Create, in its own `BEGIN IMMEDIATE` transaction (the row and its sealed secrets
+    /// commit together). See [`Self::create_tx`].
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
-        let input = normalize_plc_connection_input(input);
-        validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&self.pool, &input, None).await?;
-        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
-        let stored_database =
-            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
-        let stored_username =
-            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
-        let stored_password = is_postgres
-            .then(|| stored_password_for_create(&input.password))
-            .flatten();
-        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
-        // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password, settings) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
-        )))
-        .bind(input.name.trim())
-        .bind(&input.protocol)
-        .bind(input.host.trim())
-        .bind(input.port)
-        .bind(input.unit_id)
-        .bind(input.enabled)
-        .bind(input.simulation)
-        .bind(&input.word_order)
-        .bind(cpu_type_for_create(&input.cpu_type))
-        .bind(stored_database)
-        .bind(stored_username)
-        .bind(stored_password)
-        .bind(settings_for_create(&input))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_connection_write_error)
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let created = self.create_tx(&mut tx, input).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(created)
     }
 
     /// Transaction-compatible counterpart of [`Self::create`]. The caller
     /// owns the transaction and may run additional registry preflight queries
-    /// before deciding to commit or roll it back.
+    /// before deciding to commit or roll it back. The connection row and its
+    /// sealed secret rows ([`PlcConnectionInput::secrets`]'s `Set`) are written
+    /// through `connection`, so a rollback leaves neither.
     pub async fn create_tx(
         &self,
         connection: &mut SqliteConnection,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
-        validate_plc_connection_input(&input)?;
+        let secret_keys = self.secret_keys(&input.protocol);
+        // (1) the old flat rules; with a registry, (2)-(4) only when they pass.
+        validate_plc_connection_input(&input, &secret_keys)?;
         check_bridge_db_connection(&mut *connection, &input, None).await?;
-        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
-        let stored_database =
-            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
-        let stored_username =
-            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
-        let stored_password = is_postgres
-            .then(|| stored_password_for_create(&input.password))
-            .flatten();
+
+        let mut settings = settings_from_flat(&input);
+        // #605: an omitted cpu_type creates as R (stored explicitly, like migration 0025).
+        if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
+            settings.insert("cpu_type".into(), CPU_TYPE_R.into());
+        }
+        let mut new_rows = Vec::new();
+        for key in &secret_keys {
+            if let Some(SecretChange::Set(row)) = input.secrets.get(key) {
+                settings.insert(key.clone(), secret_ref_value(&row.r#ref));
+                new_rows.push((key.clone(), row.clone()));
+            }
+        }
+        self.validate_settings(&input.protocol, &settings, &secret_keys)?;
+
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, simulation, word_order, cpu_type, database, username, password, settings) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
+        let created = sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO plc_connections (name, protocol, enabled, simulation, settings, settings_version) \
+             VALUES (?, ?, ?, ?, ?, ?) RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
-        .bind(input.host.trim())
-        .bind(input.port)
-        .bind(input.unit_id)
         .bind(input.enabled)
         .bind(input.simulation)
-        .bind(&input.word_order)
-        .bind(cpu_type_for_create(&input.cpu_type))
-        .bind(stored_database)
-        .bind(stored_username)
-        .bind(stored_password)
-        .bind(settings_for_create(&input))
+        .bind(Value::Object(settings).to_string())
+        .bind(self.settings_version(&input.protocol))
         .fetch_one(&mut *connection)
         .await
-        .map_err(map_connection_write_error)
+        .map_err(map_connection_write_error)?;
+        insert_secret_rows(&mut *connection, created.id, &new_rows)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        Ok(created)
     }
 
     /// **T6-2 addition**: a `"virtual"`-protocol connection cannot be edited
     /// either (same reservation as [`Self::delete`] - the admin UI shows
     /// `calc`/`mem` as read-only rows, this is the API-layer enforcement of
     /// that "編集・削除不可" decision, this module's doc comment).
+    ///
+    /// R2b-1d: runs in its own `BEGIN IMMEDIATE` transaction ([`Self::update_tx`]).
     pub async fn update(
         &self,
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
         let simulation = input.simulation;
-        self.update_with_simulation(id, input, Some(simulation))
-            .await
+        self.update_own_tx(id, input, Some(simulation)).await
     }
 
     /// Like [`Self::update`], but **leaves the stored `simulation` column as
@@ -1526,115 +1626,23 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
-        self.update_with_simulation(id, input, None).await
+        self.update_own_tx(id, input, None).await
     }
 
-    /// Shared body of [`Self::update`] (`simulation = Some(value)`: store
-    /// `value`) and [`Self::update_preserving_simulation`] (`None`: keep the
-    /// stored value at `UPDATE` time).
-    async fn update_with_simulation(
+    async fn update_own_tx(
         &self,
         id: i64,
-        mut input: PlcConnectionInput,
+        input: PlcConnectionInput,
         simulation: Option<bool>,
     ) -> Result<PlcConnection, BantoError> {
-        // Validation/normalization see `false` when the caller keeps the
-        // stored value - `false` is valid for every protocol, and the kept
-        // value was already valid when it was stored.
-        input.simulation = simulation.unwrap_or(false);
-        let input = normalize_plc_connection_input(input);
-        validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&self.pool, &input, Some(id)).await?;
-        // `None` binds SQL NULL -> `COALESCE(NULL, simulation)` keeps the
-        // column. Protocols without a meaningful simulation always store the
-        // normalized value, same as a plain `update`.
-        let simulation_to_store = match simulation {
-            None if !has_no_simulation(&input.protocol) => None,
-            _ => Some(input.simulation),
-        };
-
-        let existing: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-        let existing_protocol = existing.as_ref().map(|(protocol, _)| protocol.as_str());
-        if existing_protocol == Some(VIRTUAL_PROTOCOL) {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: "予約接続（calc/mem）は編集できません".to_string(),
-                }],
-            });
-        }
-        if crosses_hub_boundary(existing_protocol, &input.protocol) {
-            let group_count: i64 = sqlx::query_scalar(GROUP_COUNT_SQL)
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-            if let Some(err) =
-                hub_protocol_switch_error(existing_protocol, &input.protocol, group_count)
-            {
-                return Err(err);
-            }
-        }
-        if crosses_push_boundary(existing_protocol, &input.protocol) {
-            let tag_count: i64 = sqlx::query_scalar(TAG_COUNT_SQL)
-                .bind(id)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-            if let Some(err) =
-                push_protocol_switch_error(existing_protocol, &input.protocol, tag_count)
-            {
-                return Err(err);
-            }
-        }
-        let existing_password = existing.and_then(|(_, password)| password);
-
-        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
-        let stored_database =
-            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
-        let stored_username =
-            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
-        let stored_password = if is_postgres {
-            stored_password_for_update(&input.password, existing_password)
-        } else {
-            None
-        };
-
-        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
-        // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = COALESCE(?, simulation), word_order = ?, cpu_type = COALESCE(?, cpu_type), database = ?, username = ?, password = ?, settings = CASE WHEN ? THEN settings ELSE ? END \
-             WHERE id = ? RETURNING {COLUMNS}"
-        )))
-        .bind(input.name.trim())
-        .bind(&input.protocol)
-        .bind(input.host.trim())
-        .bind(input.port)
-        .bind(input.unit_id)
-        .bind(input.enabled)
-        .bind(simulation_to_store)
-        .bind(&input.word_order)
-        .bind(cpu_type_for_update(&input.cpu_type))
-        .bind(stored_database)
-        .bind(stored_username)
-        .bind(stored_password)
-        .bind(settings_for_update(&input).0)
-        .bind(settings_for_update(&input).1)
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| match err {
-            sqlx::Error::RowNotFound => BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            },
-            other => map_connection_write_error(other),
-        })
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let updated = self.update_in(&mut tx, id, input, simulation).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(updated)
     }
 
     /// Transaction-compatible counterpart of [`Self::update`].
@@ -1644,23 +1652,51 @@ impl PlcConnectionService {
         id: i64,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        let simulation = input.simulation;
+        self.update_in(connection, id, input, Some(simulation))
+            .await
+    }
+
+    /// Shared body of every update (`simulation = Some(value)`: store `value`;
+    /// `None`: keep the stored value at `UPDATE` time).
+    ///
+    /// The "omitted keeps" fields are merged with the stored row **inside** this
+    /// transaction (design §4.3, #417 owner review P2): `cpu_type` (an `slmp` row's
+    /// stored value when the input omits it), `settings` (a `"push"` row's stored object
+    /// when the input omits it) and each secret key's [`SecretChange::Keep`]. The secret
+    /// rows are then brought in line with the new `settings` (design §5.3): rows whose
+    /// reference is not kept are deleted, `Set` rows inserted.
+    async fn update_in(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        mut input: PlcConnectionInput,
+        simulation: Option<bool>,
+    ) -> Result<PlcConnection, BantoError> {
+        // Validation/normalization see `false` when the caller keeps the
+        // stored value - `false` is valid for every protocol, and the kept
+        // value was already valid when it was stored.
+        input.simulation = simulation.unwrap_or(false);
         let input = normalize_plc_connection_input(input);
-        validate_plc_connection_input(&input)?;
+        let secret_keys = self.secret_keys(&input.protocol);
+        validate_plc_connection_input(&input, &secret_keys)?;
         check_bridge_db_connection(&mut *connection, &input, Some(id)).await?;
-        let existing: Option<(String, Option<String>)> =
-            sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&mut *connection)
-                .await
-                .map_err(banto_storage::storage_error)?;
+        // `None` binds SQL NULL -> `COALESCE(NULL, simulation)` keeps the
+        // column. Protocols without a meaningful simulation always store the
+        // normalized value, same as a plain `update`.
+        let simulation_to_store = match simulation {
+            None if !has_no_simulation(&input.protocol) => None,
+            _ => Some(input.simulation),
+        };
+
+        let existing: Option<(String, String)> = sqlx::query_as(EXISTING_ROW_SQL)
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
         let existing_protocol = existing.as_ref().map(|(protocol, _)| protocol.as_str());
         if existing_protocol == Some(VIRTUAL_PROTOCOL) {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: "予約接続（calc/mem）は編集できません".to_string(),
-                }],
-            });
+            return Err(reserved_edit_error());
         }
         if crosses_hub_boundary(existing_protocol, &input.protocol) {
             let group_count: i64 = sqlx::query_scalar(GROUP_COUNT_SQL)
@@ -1686,39 +1722,73 @@ impl PlcConnectionService {
                 return Err(err);
             }
         }
-        let existing_password = existing.and_then(|(_, password)| password);
-
-        let is_postgres = input.protocol == POSTGRES_PROTOCOL;
-        let stored_database =
-            is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
-        let stored_username =
-            is_postgres.then(|| input.username.as_deref().unwrap_or("").trim().to_string());
-        let stored_password = if is_postgres {
-            stored_password_for_update(&input.password, existing_password)
-        } else {
-            None
+        let existing_settings: Map<String, Value> = match &existing {
+            Some((_, text)) => serde_json::from_str(text).map_err(|err| {
+                BantoError::Storage(format!(
+                    "plc_connections.settings of id {id} is not a JSON object: {err}"
+                ))
+            })?,
+            None => Map::new(),
         };
+        let old_secret_keys = existing_protocol
+            .map(|protocol| self.secret_keys(protocol))
+            .unwrap_or_default();
+
+        let mut settings = settings_from_flat(&input);
+        // #605: an omitted cpu_type keeps the stored one (an slmp row's), else R.
+        if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
+            let kept = (existing_protocol == Some(SLMP_PROTOCOL))
+                .then(|| existing_settings.get("cpu_type"))
+                .flatten()
+                .filter(|value| value.is_string())
+                .cloned();
+            settings.insert("cpu_type".into(), kept.unwrap_or_else(|| CPU_TYPE_R.into()));
+        }
+        // R2a-2a: an omitted push `settings` keeps the stored object (only when the row
+        // already is push - another protocol's settings are not push settings).
+        if input.protocol == PUSH_PROTOCOL
+            && input.settings.is_none()
+            && existing_protocol == Some(PUSH_PROTOCOL)
+        {
+            settings = existing_settings.clone();
+        }
+
+        let mut kept_refs = Vec::new();
+        let mut new_rows = Vec::new();
+        for key in &secret_keys {
+            match input.secrets.get(key).unwrap_or(&SecretChange::Keep) {
+                SecretChange::Keep => {
+                    if old_secret_keys.contains(key) {
+                        if let Some(r#ref) = secret_ref_of(&existing_settings, key) {
+                            settings.insert(key.clone(), secret_ref_value(r#ref));
+                            kept_refs.push(r#ref.to_string());
+                        }
+                    }
+                }
+                SecretChange::Clear => {
+                    settings.remove(key);
+                }
+                SecretChange::Set(row) => {
+                    settings.insert(key.clone(), secret_ref_value(&row.r#ref));
+                    new_rows.push((key.clone(), row.clone()));
+                }
+            }
+        }
+        self.validate_settings(&input.protocol, &settings, &secret_keys)?;
 
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
-            "UPDATE plc_connections SET name = ?, protocol = ?, host = ?, port = ?, unit_id = ?, enabled = ?, simulation = ?, word_order = ?, cpu_type = COALESCE(?, cpu_type), database = ?, username = ?, password = ?, settings = CASE WHEN ? THEN settings ELSE ? END \
+        let updated = sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
+            "UPDATE plc_connections SET name = ?, protocol = ?, enabled = ?, \
+             simulation = COALESCE(?, simulation), settings = ?, settings_version = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
         .bind(input.name.trim())
         .bind(&input.protocol)
-        .bind(input.host.trim())
-        .bind(input.port)
-        .bind(input.unit_id)
         .bind(input.enabled)
-        .bind(input.simulation)
-        .bind(&input.word_order)
-        .bind(cpu_type_for_update(&input.cpu_type))
-        .bind(stored_database)
-        .bind(stored_username)
-        .bind(stored_password)
-        .bind(settings_for_update(&input).0)
-        .bind(settings_for_update(&input).1)
+        .bind(simulation_to_store)
+        .bind(Value::Object(settings).to_string())
+        .bind(self.settings_version(&input.protocol))
         .bind(id)
         .fetch_one(&mut *connection)
         .await
@@ -1728,7 +1798,16 @@ impl PlcConnectionService {
                 id: id.to_string(),
             },
             other => map_connection_write_error(other),
-        })
+        })?;
+        // Design §5.3: the old row of a `Set`/`Clear`, and every row whose key the new
+        // protocol does not hold as a secret, goes; the `Set` rows come in.
+        delete_secret_rows_except(&mut *connection, id, &kept_refs)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        insert_secret_rows(&mut *connection, id, &new_rows)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        Ok(updated)
     }
 
     /// Delete, refusing when any [`crate::collection_group::CollectionGroup`]
@@ -1751,56 +1830,22 @@ impl PlcConnectionService {
     /// relying on self-healing at the next boot (design test plan #6:
     /// "通常 CRUD で calc の削除が拒否されるか...実装した保護レベルをテスト
     /// で固定").
+    ///
+    /// R2b-1d: runs in its own `BEGIN IMMEDIATE` transaction ([`Self::delete_tx`]) so
+    /// the connection's sealed secret rows go with it (design §5.3).
     pub async fn delete(&self, id: i64) -> Result<(), BantoError> {
-        let protocol: Option<String> =
-            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-        if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: "予約接続（calc/mem）は削除できません".to_string(),
-                }],
-            });
-        }
-        reject_delete_if_referenced_by_push_bridge(&self.pool, id).await?;
-
-        let group_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
-        )
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-        if group_count > 0 {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: format!(
-                        "この接続を使用している収集グループが{group_count}件あるため削除できません"
-                    ),
-                }],
-            });
-        }
-
-        let result = sqlx::query("DELETE FROM plc_connections WHERE id = ?")
-            .bind(id)
-            .execute(&self.pool)
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
-        if result.rows_affected() == 0 {
-            return Err(BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            });
-        }
+        self.delete_tx(&mut tx, id).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
         Ok(())
     }
 
-    /// Transaction-compatible counterpart of [`Self::delete`].
+    /// Transaction-compatible counterpart of [`Self::delete`]. Removes the
+    /// connection's sealed secret rows in the same transaction (design §5.3).
     pub async fn delete_tx(
         &self,
         connection: &mut SqliteConnection,
@@ -1813,12 +1858,7 @@ impl PlcConnectionService {
                 .await
                 .map_err(banto_storage::storage_error)?;
         if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: "予約接続（calc/mem）は削除できません".to_string(),
-                }],
-            });
+            return Err(reserved_delete_error());
         }
         reject_delete_if_referenced_by_push_bridge(&mut *connection, id).await?;
         let group_count: i64 = sqlx::query_scalar(
@@ -1849,6 +1889,9 @@ impl PlcConnectionService {
                 id: id.to_string(),
             });
         }
+        delete_all_secret_rows(&mut *connection, id)
+            .await
+            .map_err(banto_storage::storage_error)?;
         Ok(())
     }
 
@@ -1895,12 +1938,7 @@ impl PlcConnectionService {
                 .await
                 .map_err(banto_storage::storage_error)?;
         if protocol.as_deref() == Some(VIRTUAL_PROTOCOL) {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "id".to_string(),
-                    message: "予約接続（calc/mem）は削除できません".to_string(),
-                }],
-            });
+            return Err(reserved_delete_error());
         }
         // R2a-2e: DB ブリッジの読み取り先は、配下ごと消すカスケードでも消さない
         // （参照先が消えるとブリッジは二度と読めない。§3.2）。
@@ -1936,6 +1974,10 @@ impl PlcConnectionService {
                 id: id.to_string(),
             });
         }
+        // R2b-1d (design §5.3): the connection's sealed secrets go in the same transaction.
+        delete_all_secret_rows(&mut *connection, id)
+            .await
+            .map_err(banto_storage::storage_error)?;
 
         Ok(PlcConnectionCascadeOutcome {
             deleted_groups,
@@ -1974,6 +2016,7 @@ pub struct PlcConnectionCascadeOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection_secret::SealedSecretRow;
     use crate::migrate;
     use banto_core::{FilterOp, FilterState, Pagination, SortDirection, SortState};
     use serde_json::json;
@@ -2000,7 +2043,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
@@ -2026,30 +2069,40 @@ mod tests {
 
     /// #605: 作成の省略は R。更新の省略は既存の Q を保つ。未知の値は拒否し、
     /// 行は Q のまま。空文字の更新も省略と同じ（R に戻さない）。
+    ///
+    /// R2b-1d: `cpu_type` は `slmp` の `settings` にだけある（設計 §3.2）ので、`slmp` の
+    /// 接続で確かめる。省略の保持は書き込みのトランザクションの中で今の `settings` を
+    /// 読んで合わせる（§4.3）。`modbus-tcp` の行は `cpu_type` を持たず、常に R と読める。
     #[tokio::test]
     async fn cpu_type_omitted_on_update_preserves_q_and_unknown_is_rejected() {
         let svc = service().await;
-        let created = svc.create(sample_input("cpu-line")).await.unwrap();
+        let slmp = |name: &str| {
+            let mut input = sample_input(name);
+            input.protocol = "slmp".to_string();
+            input
+        };
+        let created = svc.create(slmp("cpu-line")).await.unwrap();
+        assert_eq!(created.settings.get("cpu_type"), Some(&json!("R")));
         assert_eq!(created.cpu_type, "R");
 
-        let mut q = sample_input("cpu-line");
+        let mut q = slmp("cpu-line");
         q.cpu_type = Some("Q".to_string());
         let updated = svc.update(created.id, q).await.unwrap();
         assert_eq!(updated.cpu_type, "Q");
 
-        let mut omit = sample_input("cpu-line");
+        let mut omit = slmp("cpu-line");
         omit.host = "192.168.1.11".to_string();
         omit.cpu_type = None;
         let kept = svc.update(created.id, omit).await.unwrap();
         assert_eq!(kept.host, "192.168.1.11");
         assert_eq!(kept.cpu_type, "Q");
 
-        let mut blank = sample_input("cpu-line");
+        let mut blank = slmp("cpu-line");
         blank.cpu_type = Some(String::new());
         let kept_blank = svc.update(created.id, blank).await.unwrap();
         assert_eq!(kept_blank.cpu_type, "Q");
 
-        let mut bad = sample_input("cpu-line");
+        let mut bad = slmp("cpu-line");
         bad.cpu_type = Some("L".to_string());
         match svc.update(created.id, bad).await.unwrap_err() {
             BantoError::Validation { field_errors } => {
@@ -2061,6 +2114,25 @@ mod tests {
             other => panic!("expected validation, got {other:?}"),
         }
         assert_eq!(svc.get(created.id).await.unwrap().cpu_type, "Q");
+
+        // update_tx keeps it too (the merge reads inside the caller's transaction).
+        let mut tx = svc.pool.begin().await.unwrap();
+        let kept_tx = svc
+            .update_tx(&mut tx, created.id, slmp("cpu-line"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(kept_tx.cpu_type, "Q");
+
+        // A modbus row has no cpu_type (design §3.2); switching it to slmp without
+        // naming one gives R, and a modbus payload's cpu_type is not stored.
+        let mut modbus = sample_input("modbus-line");
+        modbus.cpu_type = Some("Q".to_string());
+        let modbus = svc.create(modbus).await.unwrap();
+        assert_eq!(modbus.cpu_type, "R");
+        assert!(!modbus.settings.contains_key("cpu_type"));
+        let switched = svc.update(modbus.id, slmp("modbus-line")).await.unwrap();
+        assert_eq!(switched.cpu_type, "R");
     }
 
     #[tokio::test]
@@ -2487,7 +2559,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2536,7 +2608,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2572,7 +2644,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3004,7 +3076,7 @@ mod tests {
         let mut input = sample_input("NotPg");
         input.database = Some("somedb".to_string());
         input.username = Some("someone".to_string());
-        input.password = Some("secret".to_string());
+        let input = with_password(input, REF_A, "secret");
         let err = svc.create(input).await.unwrap_err();
         match err {
             BantoError::Validation { field_errors } => {
@@ -3030,14 +3102,77 @@ mod tests {
             cpu_type: None,
             database: Some("appdb".to_string()),
             username: Some("appuser".to_string()),
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
 
-    /// A `"postgres"` connection created with `password: None` stores no
-    /// password (this crate's `PlcConnectionInput::password` doc comment,
-    /// "create" case) - round-trips as `None`, not an empty string.
+    /// R2b-1d test helpers: a `plain-v1` sealed row (the blob is the plaintext itself)
+    /// under a fixed, well-formed reference.
+    fn sealed(r#ref: &str, plain: &str) -> SealedSecretRow {
+        SealedSecretRow {
+            r#ref: r#ref.to_string(),
+            scheme: crate::SCHEME_PLAIN_V1.to_string(),
+            blob: zeroize::Zeroizing::new(plain.as_bytes().to_vec()),
+        }
+    }
+
+    const REF_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const REF_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const REF_C: &str = "cccccccccccccccccccccccccccccccc";
+
+    fn with_password(
+        mut input: PlcConnectionInput,
+        r#ref: &str,
+        plain: &str,
+    ) -> PlcConnectionInput {
+        input.secrets.insert(
+            PASSWORD_KEY.to_string(),
+            SecretChange::Set(sealed(r#ref, plain)),
+        );
+        input
+    }
+
+    fn with_secret_change(
+        mut input: PlcConnectionInput,
+        change: SecretChange,
+    ) -> PlcConnectionInput {
+        input.secrets.insert(PASSWORD_KEY.to_string(), change);
+        input
+    }
+
+    /// The plaintext of connection `id`'s password as stored, checking that the
+    /// reference in `settings` and the secret rows agree (one row per reference, no
+    /// stray row). `None` = no password (no reference and no row).
+    async fn stored_password(svc: &PlcConnectionService, id: i64) -> Option<String> {
+        let conn = svc.get(id).await.unwrap();
+        let rows = svc.secret_rows(id).await.unwrap();
+        match conn.secret_ref(PASSWORD_KEY) {
+            None => {
+                assert!(rows.is_empty(), "rows without a reference: {rows:?}");
+                None
+            }
+            Some(r#ref) => {
+                assert_eq!(rows.len(), 1, "{rows:?}");
+                assert_eq!(rows[0].sealed.r#ref, r#ref);
+                assert_eq!(rows[0].key, PASSWORD_KEY);
+                assert_eq!(rows[0].sealed.scheme, crate::SCHEME_PLAIN_V1);
+                Some(String::from_utf8(rows[0].sealed.blob.to_vec()).unwrap())
+            }
+        }
+    }
+
+    /// Every secret row in the database, as `(ref, connection_id, key)`.
+    async fn all_secret_rows(svc: &PlcConnectionService) -> Vec<(String, i64, String)> {
+        sqlx::query_as("SELECT ref, connection_id, key FROM plc_connection_secrets ORDER BY ref")
+            .fetch_all(&svc.pool)
+            .await
+            .unwrap()
+    }
+
+    /// A `"postgres"` connection created without a password stores none -
+    /// no reference in `settings` and no secret row (`Keep` and `Clear` alike on
+    /// create, the old `None`/`Some("")` rule).
     #[tokio::test]
     async fn create_postgres_without_password_stores_none() {
         let svc = service().await;
@@ -3047,61 +3182,114 @@ mod tests {
             .expect("postgres without a password should be accepted");
         assert_eq!(created.database.as_deref(), Some("appdb"));
         assert_eq!(created.username.as_deref(), Some("appuser"));
-        assert_eq!(created.password, None);
+        assert_eq!(created.secret_ref(PASSWORD_KEY), None);
+        assert_eq!(stored_password(&svc, created.id).await, None);
+        let cleared = svc
+            .create(with_secret_change(
+                postgres_input("PgCleared"),
+                SecretChange::Clear,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(stored_password(&svc, cleared.id).await, None);
+        assert!(all_secret_rows(&svc).await.is_empty());
     }
 
-    /// A `"postgres"` connection created with `Some(s)` stores `s` verbatim.
+    /// A `"postgres"` connection created with a sealed password stores the row and
+    /// a reference to it; `settings` never carries the value.
     #[tokio::test]
     async fn create_postgres_with_password_stores_it() {
         let svc = service().await;
-        let mut input = postgres_input("PgWithPassword");
-        input.password = Some("s3cret".to_string());
+        let input = with_password(postgres_input("PgWithPassword"), REF_A, "s3cret");
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.password.as_deref(), Some("s3cret"));
+        assert_eq!(created.secret_ref(PASSWORD_KEY), Some(REF_A));
+        assert_eq!(
+            created.settings,
+            json!({
+                "host": "10.0.0.50", "port": 5432, "database": "appdb",
+                "username": "appuser", "password": {"$secret": REF_A}
+            })
+            .as_object()
+            .unwrap()
+            .clone()
+        );
+        assert!(!Value::Object(created.settings.clone())
+            .to_string()
+            .contains("s3cret"));
+        assert_eq!(
+            stored_password(&svc, created.id).await.as_deref(),
+            Some("s3cret")
+        );
     }
 
-    /// Update's tri-state PATCH semantics (this crate's
-    /// `PlcConnectionInput::password` doc comment, "update" case): omitting
-    /// `password` (`None`) keeps whatever is already stored.
+    /// Update's tri-state (design §5.3): `Keep` (no entry) keeps whatever is
+    /// already stored - reference and row.
     #[tokio::test]
     async fn update_with_password_none_keeps_the_existing_password() {
         let svc = service().await;
-        let mut create_input = postgres_input("PgKeep");
-        create_input.password = Some("original".to_string());
-        let created = svc.create(create_input).await.unwrap();
+        let created = svc
+            .create(with_password(postgres_input("PgKeep"), REF_A, "original"))
+            .await
+            .unwrap();
 
-        let mut update_input = postgres_input("PgKeep");
-        update_input.password = None;
-        let updated = svc.update(created.id, update_input).await.unwrap();
-        assert_eq!(updated.password.as_deref(), Some("original"));
+        let updated = svc
+            .update(created.id, postgres_input("PgKeep"))
+            .await
+            .unwrap();
+        assert_eq!(updated.secret_ref(PASSWORD_KEY), Some(REF_A));
+        assert_eq!(
+            stored_password(&svc, created.id).await.as_deref(),
+            Some("original")
+        );
+        let explicit_keep = with_secret_change(postgres_input("PgKeep"), SecretChange::Keep);
+        svc.update(created.id, explicit_keep).await.unwrap();
+        assert_eq!(
+            stored_password(&svc, created.id).await.as_deref(),
+            Some("original")
+        );
     }
 
-    /// `Some("")` clears a previously-stored password.
+    /// `Clear` removes a previously-stored password - reference and row.
     #[tokio::test]
     async fn update_with_password_empty_string_clears_it() {
         let svc = service().await;
-        let mut create_input = postgres_input("PgClear");
-        create_input.password = Some("original".to_string());
-        let created = svc.create(create_input).await.unwrap();
+        let created = svc
+            .create(with_password(postgres_input("PgClear"), REF_A, "original"))
+            .await
+            .unwrap();
 
-        let mut update_input = postgres_input("PgClear");
-        update_input.password = Some(String::new());
+        let update_input = with_secret_change(postgres_input("PgClear"), SecretChange::Clear);
         let updated = svc.update(created.id, update_input).await.unwrap();
-        assert_eq!(updated.password, None);
+        assert_eq!(updated.secret_ref(PASSWORD_KEY), None);
+        assert_eq!(stored_password(&svc, created.id).await, None);
+        assert!(all_secret_rows(&svc).await.is_empty());
     }
 
-    /// `Some(s)` for a non-empty `s` replaces the stored password.
+    /// `Set` replaces the stored password: a new row under a new reference, the
+    /// old row gone, `settings` pointing at the new one.
     #[tokio::test]
     async fn update_with_password_some_replaces_it() {
         let svc = service().await;
-        let mut create_input = postgres_input("PgReplace");
-        create_input.password = Some("original".to_string());
-        let created = svc.create(create_input).await.unwrap();
+        let created = svc
+            .create(with_password(
+                postgres_input("PgReplace"),
+                REF_A,
+                "original",
+            ))
+            .await
+            .unwrap();
 
-        let mut update_input = postgres_input("PgReplace");
-        update_input.password = Some("replacement".to_string());
+        let update_input = with_password(postgres_input("PgReplace"), REF_B, "replacement");
         let updated = svc.update(created.id, update_input).await.unwrap();
-        assert_eq!(updated.password.as_deref(), Some("replacement"));
+        assert_eq!(updated.secret_ref(PASSWORD_KEY), Some(REF_B));
+        assert_eq!(
+            stored_password(&svc, created.id).await.as_deref(),
+            Some("replacement")
+        );
+        assert_eq!(
+            all_secret_rows(&svc).await,
+            [(REF_B.to_string(), created.id, PASSWORD_KEY.to_string())]
+        );
     }
 
     /// `unit_id`/`word_order`/`simulation` are silently normalized to their
@@ -3186,7 +3374,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3221,7 +3409,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3403,13 +3591,15 @@ mod tests {
             .expect("connect_sqlite_memory");
         migrate(&pool).await.expect("migrate");
 
+        // R2b-1d: a row whose `settings` has no `word_order` (migration 0025 always
+        // writes one; a hand-edited row may not) reads as the protocol's default.
         sqlx::query(
-            "INSERT INTO plc_connections (name, protocol, host, port) \
-             VALUES ('Legacy', 'slmp', '192.168.1.20', 5007)",
+            "INSERT INTO plc_connections (name, protocol, settings) \
+             VALUES ('Legacy', 'slmp', '{\"host\":\"192.168.1.20\",\"port\":5007}')",
         )
         .execute(&pool)
         .await
-        .expect("insert without word_order should use the column default");
+        .expect("insert without word_order");
 
         let svc = PlcConnectionService::new(pool);
         let rows = svc
@@ -3965,7 +4155,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4078,16 +4268,18 @@ mod tests {
             svc.create(input).await.unwrap();
         }
 
+        // R2b-1d: `port` moved into `settings` and is no longer a list column
+        // (design §7) - sort/filter by `name` instead.
         let result = svc
             .list(ListParams {
                 sort: vec![SortState {
-                    field: "port".to_string(),
+                    field: "name".to_string(),
                     direction: SortDirection::Desc,
                 }],
                 filters: vec![FilterState {
-                    field: "port".to_string(),
+                    field: "name".to_string(),
                     op: FilterOp::Gte,
-                    value: json!(502),
+                    value: json!("B"),
                 }],
                 pagination: Some(Pagination {
                     offset: 0,
@@ -4182,7 +4374,7 @@ mod tests {
         let mut input = hub_input("Hub");
         input.database = Some("db".to_string());
         input.username = Some("user".to_string());
-        input.password = Some("pw".to_string());
+        let input = with_password(input, REF_A, "pw");
         match svc.create(input).await.unwrap_err() {
             BantoError::Validation { field_errors } => {
                 let fields: Vec<&str> = field_errors.iter().map(|e| e.field.as_str()).collect();
@@ -4705,7 +4897,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
@@ -4734,14 +4926,14 @@ mod tests {
         assert_eq!(created.unit_id, 1);
         assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
         assert!(!created.simulation);
-        assert_eq!(created.settings, None);
+        assert!(created.settings.is_empty());
         svc.create(push_input("Bridge2"))
             .await
             .expect("push connections have no per-registry limit");
 
         let mut with_db = push_input("Bridge3");
         with_db.database = Some("erp".to_string());
-        with_db.password = Some("s".to_string());
+        let with_db = with_password(with_db, REF_A, "s");
         let fields: Vec<String> = only_fields(svc.create(with_db).await.unwrap_err());
         assert_eq!(fields, ["database", "password"]);
 
@@ -4772,7 +4964,10 @@ mod tests {
         let mut input = push_input("Bridge1");
         input.settings = Some(bridge_settings(db.id));
         let created = svc.create(input).await.expect("push with settings");
-        assert_eq!(created.settings, Some(bridge_settings(db.id)));
+        assert_eq!(
+            Value::Object(created.settings.clone()),
+            bridge_settings(db.id)
+        );
         assert_eq!(
             svc.get(created.id).await.unwrap().settings,
             created.settings
@@ -4855,8 +5050,8 @@ mod tests {
         let mut ok = push_input("B1");
         ok.settings = Some(bridge_settings(db.id));
         assert_eq!(
-            svc.update(created.id, ok).await.unwrap().settings,
-            Some(bridge_settings(db.id))
+            Value::Object(svc.update(created.id, ok).await.unwrap().settings),
+            bridge_settings(db.id)
         );
     }
 
@@ -4920,47 +5115,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(kept.name, "Bridge1 renamed");
-        assert_eq!(kept.settings, Some(json!({ "stale_timeout_ms": 2000 })));
+        assert_eq!(
+            Value::Object(kept.settings),
+            json!({ "stale_timeout_ms": 2000 })
+        );
         let mut tx = svc.pool.begin().await.unwrap();
         let kept_tx = svc
             .update_tx(&mut tx, created.id, push_input("Bridge1"))
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(kept_tx.settings, Some(json!({ "stale_timeout_ms": 2000 })));
+        assert_eq!(
+            Value::Object(kept_tx.settings),
+            json!({ "stale_timeout_ms": 2000 })
+        );
 
         let mut replace = push_input("Bridge1");
         replace.settings = Some(json!({}));
-        assert_eq!(
-            svc.update(created.id, replace).await.unwrap().settings,
-            Some(json!({}))
-        );
+        assert!(svc
+            .update(created.id, replace)
+            .await
+            .unwrap()
+            .settings
+            .is_empty());
 
         let cleared = svc
             .update(created.id, sample_input("Now modbus"))
             .await
             .unwrap();
         assert_eq!(cleared.protocol, "modbus-tcp");
-        assert_eq!(cleared.settings, None);
+        assert_eq!(
+            Value::Object(cleared.settings),
+            json!({"host": "192.168.1.10", "port": 502, "unit_id": 1, "word_order": "low_high"})
+        );
     }
 
-    /// The SQL side of `settings`: `json_valid` refuses broken JSON even when
-    /// the service is bypassed; NULL is fine.
+    /// The SQL side of `settings` (migration 0025): `json_valid` and "an object"
+    /// refuse broken JSON and non-objects even when the service is bypassed, and the
+    /// column is NOT NULL (an omitted column defaults to `{}`).
     #[tokio::test]
     async fn the_settings_column_refuses_invalid_json() {
         let svc = service().await;
-        let insert = |settings: Option<&'static str>| {
+        let insert = |name: &'static str, settings: Option<&'static str>| {
             sqlx::query(
-                "INSERT INTO plc_connections (name, protocol, host, port, settings) \
-                 VALUES (?, 'push', '', 0, ?)",
+                "INSERT INTO plc_connections (name, protocol, settings) VALUES (?, 'push', ?)",
             )
-            .bind(format!("p{}", settings.map_or(0, str::len)))
+            .bind(name)
             .bind(settings)
             .execute(&svc.pool)
         };
-        assert!(insert(Some("{not json")).await.is_err());
-        insert(Some(r#"{"stale_timeout_ms":1000}"#)).await.unwrap();
-        insert(None).await.unwrap();
+        assert!(insert("a", Some("{not json")).await.is_err());
+        assert!(insert("b", Some("[1]")).await.is_err());
+        assert!(insert("c", Some("null")).await.is_err());
+        assert!(insert("d", None).await.is_err(), "NOT NULL");
+        insert("e", Some(r#"{"stale_timeout_ms":1000}"#))
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO plc_connections (name, protocol) VALUES ('f', 'push')")
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        let defaulted: String =
+            sqlx::query_scalar("SELECT settings FROM plc_connections WHERE name = 'f'")
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+        assert_eq!(defaulted, "{}");
     }
 
     #[test]
@@ -5494,8 +5714,958 @@ mod tests {
         let y = svc.create(postgres_input("Y")).await.unwrap();
         input.settings = Some(bridge_settings(y.id));
         assert_eq!(
-            svc.update(x.id, input).await.unwrap().settings,
-            Some(bridge_settings(y.id))
+            Value::Object(svc.update(x.id, input).await.unwrap().settings),
+            bridge_settings(y.id)
         );
+    }
+
+    // ---- R2b-1d: migration 0025 (docs/banto-hub-connection-settings-design.md §6.2・§9) ----
+
+    /// Every trigger and `idx_*` index, with its full SQL text, sorted.
+    async fn trigger_and_index_sql(conn: &mut SqliteConnection) -> Vec<(String, String, String)> {
+        sqlx::query_as(
+            "SELECT type, name, sql FROM sqlite_master \
+             WHERE type = 'trigger' OR (type = 'index' AND name LIKE 'idx_%') \
+             ORDER BY type, name",
+        )
+        .fetch_all(conn)
+        .await
+        .unwrap()
+    }
+
+    /// Migration 0025, applied the way sqlx applies a migration (whole file, one pinned
+    /// connection, one transaction) to a database the real migrator brought up to 0024 and
+    /// that holds every protocol variant of design §9: `modbus-tcp` (`low_high` /
+    /// `high_low`, `unit_id` 0 and 255, a stray `cpu_type = 'Q'`), `slmp` (`Q` / `R`, a
+    /// non-default `unit_id`), `postgres` (password set / empty / NULL), `virtual`
+    /// (`calc` / `mem`), `push` (no settings / `stale_timeout_ms` only / a bridge) and
+    /// `hub`; a non-max and the max id deleted beforehand.
+    ///
+    /// Checks: each row's `settings` is exactly design §3.2's mapping (dropped columns
+    /// gone), the flat projection reads back the old columns except the dropped ones,
+    /// `settings_version = 1`; the one non-empty password became a `plain-v1` secret row
+    /// whose reference is in `settings` (and nowhere else holds the plaintext);
+    /// `sqlite_sequence` is unchanged and a new connection does not reuse a deleted id;
+    /// the 6 triggers and the index have byte-identical SQL and still fire; groups and
+    /// tags are untouched; FKs and integrity hold; the new `protocol` CHECK is the
+    /// DriverId grammar.
+    #[tokio::test]
+    async fn migration_0025_moves_columns_to_settings_and_secrets_on_a_populated_database() {
+        use sqlx::{Acquire, Executor};
+
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        migrator
+            .run_to(24, &pool)
+            .await
+            .expect("migrate up to 0024");
+        let mut conn = pool.acquire().await.expect("acquire one pinned connection");
+
+        const BRIDGE: &str = r#"{"stale_timeout_ms":5000,"bridge":{"kind":"db","db_connection_id":5,"queries":[{"name":"q","period_ms":1000,"sql":"SELECT 1 AS v","columns":[{"column":"v","key":"k"}]}]}}"#;
+        let seed = [
+            // (id, name, protocol, host, port, unit_id, enabled, simulation, word_order,
+            //  database, username, password, cpu_type, settings)
+            "INSERT INTO plc_connections VALUES (1, 'M-lh', 'modbus-tcp', '10.0.0.1', 502, 0, \
+             1, 1, 'low_high', NULL, NULL, NULL, 'Q', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (2, 'M-hl', 'modbus-tcp', '10.0.0.2', 1502, 255, \
+             0, 0, 'high_low', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (3, 'S-Q', 'slmp', '10.0.0.3', 5007, 3, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'Q', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (4, 'S-R', 'slmp', '10.0.0.4', 5008, 1, \
+             0, 1, 'high_low', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (5, 'PG-pw', 'postgres', '10.0.0.50', 5432, 1, \
+             1, 0, 'low_high', 'erp', 'reader', 's3cret-pw', 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (6, 'PG-empty', 'postgres', '10.0.0.51', 5433, 1, \
+             1, 0, 'low_high', 'erp2', 'reader2', '', 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (7, 'PG-null', 'postgres', '10.0.0.52', 5434, 1, \
+             1, 0, 'low_high', 'erp3', 'reader3', NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (8, 'calc', 'virtual', '', 0, 1, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (9, 'mem', 'virtual', 'stray-host', 7, 1, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (10, 'P-none', 'push', '', 0, 1, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (11, 'P-stale', 'push', '', 0, 1, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'R', '{\"stale_timeout_ms\":5000}')"
+                .to_string(),
+            format!(
+                "INSERT INTO plc_connections VALUES (12, 'P-bridge', 'push', '', 0, 1, \
+                 1, 0, 'low_high', NULL, NULL, NULL, 'R', '{BRIDGE}')"
+            ),
+            "INSERT INTO plc_connections VALUES (13, 'Hub', 'hub', '', 0, 1, \
+             1, 0, 'low_high', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (14, 'GoneMid', 'modbus-tcp', '1.2.3.4', 502, 1, \
+             1, 0, 'high_low', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "INSERT INTO plc_connections VALUES (15, 'GoneMax', 'modbus-tcp', '1.2.3.5', 502, 1, \
+             1, 0, 'high_low', NULL, NULL, NULL, 'R', NULL)"
+                .to_string(),
+            "DELETE FROM plc_connections WHERE id IN (14, 15)".to_string(),
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable) VALUES (4, 'G1', 3, 2000, 0, 0)"
+                .to_string(),
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms, enabled, \
+             default_writable, query_sql) VALUES (5, 'Q1', 5, 5000, 1, 1, 'SELECT 1 AS v')"
+                .to_string(),
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms) \
+             VALUES (6, 'H', 13, 1000)"
+                .to_string(),
+            "INSERT INTO collection_groups (id, name, plc_connection_id, period_ms) \
+             VALUES (7, 'P', 11, 1000)"
+                .to_string(),
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, string_length, \
+             raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, writable, tag_kind, \
+             expression, retain, revision, string_encoding) VALUES (11, 'T1', 4, 'D100', \
+             'string', 8, 0, 100, 0, 50, 'degC', 2, 0, 1, 'plc', NULL, 1, 3, 'shift_jis')"
+                .to_string(),
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type, tag_kind) \
+             VALUES (12, 'V', 5, 'v', 'f64', 'db')"
+                .to_string(),
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type) \
+             VALUES (13, 't', 6, 'L1.fast.t', 'f64')"
+                .to_string(),
+            "INSERT INTO tags (id, name, collection_group_id, address, data_type) \
+             VALUES (14, 'k', 7, 'line1.temp', 'f64')"
+                .to_string(),
+        ];
+        for sql in &seed {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(sql.clone()))
+                .execute(&mut *conn)
+                .await
+                .unwrap_or_else(|e| panic!("seed failed ({sql}): {e}"));
+        }
+
+        const GROUP_ROW_SQL: &str = "SELECT quote(id) || '|' || quote(name) || '|' || \
+             quote(plc_connection_id) || '|' || quote(period_ms) || '|' || quote(enabled) || \
+             '|' || quote(default_writable) || '|' || quote(query_sql) \
+             FROM collection_groups ORDER BY id";
+        const TAG_ROW_SQL: &str = "SELECT quote(id) || '|' || quote(name) || '|' || \
+             quote(collection_group_id) || '|' || quote(address) || '|' || quote(data_type) || \
+             '|' || quote(string_length) || '|' || quote(raw_lo) || '|' || quote(raw_hi) || \
+             '|' || quote(eng_lo) || '|' || quote(eng_hi) || '|' || quote(unit) || '|' || \
+             quote(decimals) || '|' || quote(enabled) || '|' || quote(writable) || '|' || \
+             quote(tag_kind) || '|' || quote(expression) || '|' || quote(retain) || '|' || \
+             quote(revision) || '|' || quote(string_encoding) FROM tags ORDER BY id";
+        const SEQ_SQL: &str = "SELECT name, seq FROM sqlite_sequence ORDER BY name";
+
+        let rows = |sql: &'static str| sqlx::query_scalar::<_, String>(sql);
+        let groups_before = rows(GROUP_ROW_SQL).fetch_all(&mut *conn).await.unwrap();
+        let tags_before = rows(TAG_ROW_SQL).fetch_all(&mut *conn).await.unwrap();
+        let seq_before: Vec<(String, i64)> =
+            sqlx::query_as(SEQ_SQL).fetch_all(&mut *conn).await.unwrap();
+        assert!(seq_before.contains(&("plc_connections".to_string(), 15)));
+        let schema_before = trigger_and_index_sql(&mut conn).await;
+        assert_eq!(
+            schema_before
+                .iter()
+                .filter(|(kind, _, _)| kind == "trigger")
+                .count(),
+            6,
+            "{schema_before:?}"
+        );
+
+        let mut tx = conn.begin().await.expect("begin, as the migrator does");
+        tx.execute(include_str!(
+            "../migrations/0025_plc_connections_settings_json.sql"
+        ))
+        .await
+        .expect("0025 should apply");
+        tx.commit().await.expect("0025 should commit");
+
+        // The new shape (design §3.1).
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('plc_connections') ORDER BY cid",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "name",
+                "protocol",
+                "enabled",
+                "simulation",
+                "settings",
+                "settings_version"
+            ]
+        );
+        let autoincrement: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'plc_connections' \
+             AND sql LIKE '%id INTEGER PRIMARY KEY AUTOINCREMENT%'",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(autoincrement, 1);
+
+        // Every row's settings, exactly design §3.2.
+        let stored: Vec<(i64, String, String, bool, bool, String, i64)> = sqlx::query_as(
+            "SELECT id, name, protocol, enabled, simulation, settings, settings_version \
+             FROM plc_connections ORDER BY id",
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        let secret: (String, i64, String, String, Vec<u8>) = sqlx::query_as(
+            "SELECT ref, connection_id, key, scheme, blob FROM plc_connection_secrets",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("exactly one secret row (the non-empty password)");
+        let secret_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connection_secrets")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(secret_count, 1);
+        let (secret_ref, secret_conn, secret_key, scheme, blob) = secret;
+        assert!(
+            crate::connection_secret::is_valid_secret_ref(&secret_ref),
+            "{secret_ref}"
+        );
+        assert_eq!(
+            (secret_conn, secret_key.as_str(), scheme.as_str()),
+            (5, "password", "plain-v1")
+        );
+        assert_eq!(blob, b"s3cret-pw");
+
+        let bridge: Value = serde_json::from_str(BRIDGE).unwrap();
+        let expected: Vec<(i64, &str, &str, bool, bool, Value)> = vec![
+            (
+                1,
+                "M-lh",
+                "modbus-tcp",
+                true,
+                true,
+                json!({"host": "10.0.0.1", "port": 502, "unit_id": 0, "word_order": "low_high"}),
+            ),
+            (
+                2,
+                "M-hl",
+                "modbus-tcp",
+                false,
+                false,
+                json!({"host": "10.0.0.2", "port": 1502, "unit_id": 255, "word_order": "high_low"}),
+            ),
+            (
+                3,
+                "S-Q",
+                "slmp",
+                true,
+                false,
+                json!({"host": "10.0.0.3", "port": 5007, "word_order": "low_high", "cpu_type": "Q"}),
+            ),
+            (
+                4,
+                "S-R",
+                "slmp",
+                false,
+                true,
+                json!({"host": "10.0.0.4", "port": 5008, "word_order": "high_low", "cpu_type": "R"}),
+            ),
+            (
+                5,
+                "PG-pw",
+                "postgres",
+                true,
+                false,
+                json!({"host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader",
+                       "password": {"$secret": secret_ref}}),
+            ),
+            (
+                6,
+                "PG-empty",
+                "postgres",
+                true,
+                false,
+                json!({"host": "10.0.0.51", "port": 5433, "database": "erp2", "username": "reader2"}),
+            ),
+            (
+                7,
+                "PG-null",
+                "postgres",
+                true,
+                false,
+                json!({"host": "10.0.0.52", "port": 5434, "database": "erp3", "username": "reader3"}),
+            ),
+            (8, "calc", "virtual", true, false, json!({})),
+            (9, "mem", "virtual", true, false, json!({})),
+            (10, "P-none", "push", true, false, json!({})),
+            (
+                11,
+                "P-stale",
+                "push",
+                true,
+                false,
+                json!({"stale_timeout_ms": 5000}),
+            ),
+            (12, "P-bridge", "push", true, false, bridge),
+            (13, "Hub", "hub", true, false, json!({})),
+        ];
+        assert_eq!(stored.len(), expected.len());
+        for (row, want) in stored.iter().zip(&expected) {
+            let (id, name, protocol, enabled, simulation, settings, version) = row;
+            let settings: Value = serde_json::from_str(settings).unwrap();
+            assert_eq!(
+                (*id, name.as_str(), protocol.as_str(), *enabled, *simulation),
+                (want.0, want.1, want.2, want.3, want.4),
+                "row {id}"
+            );
+            assert_eq!(settings, want.5, "row {id} ({name})");
+            assert_eq!(*version, 1, "row {id}");
+        }
+        // The plaintext survives only in the secret row's blob.
+        let plaintext_in_settings: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM plc_connections WHERE instr(settings, 's3cret-pw') > 0",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(plaintext_in_settings, 0);
+
+        // The flat projection reads the old columns back, except design §3.2's dropped
+        // ones (S-Q's unit_id 3 → 1, M-lh's cpu_type Q → R, mem's host/port → ""/0).
+        let svc = PlcConnectionService::new(pool.clone());
+        let listed = svc.list(ListParams::default()).await.unwrap().rows;
+        type Flat<'a> = (
+            i64,
+            &'a str,
+            i64,
+            i64,
+            &'a str,
+            &'a str,
+            Option<&'a str>,
+            Option<&'a str>,
+        );
+        let flat: Vec<Flat<'_>> = listed
+            .iter()
+            .map(|c| {
+                (
+                    c.id,
+                    c.host.as_str(),
+                    c.port,
+                    c.unit_id,
+                    c.word_order.as_str(),
+                    c.cpu_type.as_str(),
+                    c.database.as_deref(),
+                    c.username.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            flat,
+            vec![
+                (1, "10.0.0.1", 502, 0, "low_high", "R", None, None),
+                (2, "10.0.0.2", 1502, 255, "high_low", "R", None, None),
+                (3, "10.0.0.3", 5007, 1, "low_high", "Q", None, None),
+                (4, "10.0.0.4", 5008, 1, "high_low", "R", None, None),
+                (
+                    5,
+                    "10.0.0.50",
+                    5432,
+                    1,
+                    "low_high",
+                    "R",
+                    Some("erp"),
+                    Some("reader")
+                ),
+                (
+                    6,
+                    "10.0.0.51",
+                    5433,
+                    1,
+                    "low_high",
+                    "R",
+                    Some("erp2"),
+                    Some("reader2")
+                ),
+                (
+                    7,
+                    "10.0.0.52",
+                    5434,
+                    1,
+                    "low_high",
+                    "R",
+                    Some("erp3"),
+                    Some("reader3")
+                ),
+                (8, "", 0, 1, "low_high", "R", None, None),
+                (9, "", 0, 1, "low_high", "R", None, None),
+                (10, "", 0, 1, "low_high", "R", None, None),
+                (11, "", 0, 1, "low_high", "R", None, None),
+                (12, "", 0, 1, "low_high", "R", None, None),
+                (13, "", 0, 1, "low_high", "R", None, None),
+            ]
+        );
+        assert_eq!(
+            listed[4].secret_ref(PASSWORD_KEY),
+            Some(secret_ref.as_str())
+        );
+        assert_eq!(
+            svc.secret_rows(5).await.unwrap()[0].sealed.blob.as_slice(),
+            b"s3cret-pw"
+        );
+
+        // Children untouched; every AUTOINCREMENT high-water mark unchanged.
+        assert_eq!(
+            rows(GROUP_ROW_SQL).fetch_all(&mut *conn).await.unwrap(),
+            groups_before
+        );
+        assert_eq!(
+            rows(TAG_ROW_SQL).fetch_all(&mut *conn).await.unwrap(),
+            tags_before
+        );
+        let seq_after: Vec<(String, i64)> =
+            sqlx::query_as(SEQ_SQL).fetch_all(&mut *conn).await.unwrap();
+        assert_eq!(seq_after, seq_before);
+
+        // The 6 triggers and the index: byte-identical SQL.
+        assert_eq!(trigger_and_index_sql(&mut conn).await, schema_before);
+
+        let violations: Vec<(String,)> = sqlx::query_as("PRAGMA foreign_key_check")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap();
+        assert!(violations.is_empty(), "dangling FKs: {violations:?}");
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert!(
+            conn.execute("DELETE FROM plc_connections WHERE id = 3")
+                .await
+                .is_err(),
+            "a connection with groups cannot be deleted (ON DELETE RESTRICT)"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+                 VALUES ('orphan', 999, 1000)"
+            )
+            .await
+            .is_err(),
+            "group -> connection FK"
+        );
+
+        // The triggers still fire: hub external name, push key, protocol switch.
+        let expect_trigger = |result: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>,
+                              message: &str| {
+            let err = result.expect_err("the trigger should refuse");
+            assert!(
+                err.as_database_error()
+                    .is_some_and(|e| e.message().contains(message)),
+                "{err:?}"
+            );
+        };
+        expect_trigger(
+            conn.execute(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('t2', 6, 'L1.fast.t', 'f64')",
+            )
+            .await,
+            "hub external name already registered",
+        );
+        expect_trigger(
+            conn.execute(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES ('k2', 7, 'line1.temp', 'f64')",
+            )
+            .await,
+            "push key already registered",
+        );
+        conn.execute(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) \
+             VALUES ('d2', 4, 'D100', 'u16')",
+        )
+        .await
+        .expect("a duplicate address under slmp is not a push key");
+        expect_trigger(
+            conn.execute("UPDATE plc_connections SET protocol = 'push' WHERE id = 3")
+                .await,
+            "push key already registered",
+        );
+        // The hub partial unique index still holds.
+        assert!(conn
+            .execute("INSERT INTO plc_connections (name, protocol) VALUES ('Hub2', 'hub')")
+            .await
+            .is_err());
+
+        // No id is reused: the next connection gets 16, above the deleted max (15).
+        let next_id: i64 = sqlx::query_scalar(
+            "INSERT INTO plc_connections (name, protocol) VALUES ('New', 'push') RETURNING id",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(next_id, 16);
+
+        // The protocol CHECK is the DriverId grammar (Q14), not a list.
+        conn.execute("INSERT INTO plc_connections (name, protocol) VALUES ('Opc', 'opc-ua')")
+            .await
+            .expect("a well-formed driver id is the registry's business, not SQL's");
+        for bad in ["Opc-UA", "-x", "", "a b", "x_y", &"a".repeat(65)] {
+            assert!(
+                sqlx::query("INSERT INTO plc_connections (name, protocol) VALUES (?, ?)")
+                    .bind(format!("bad-{bad}"))
+                    .bind(bad)
+                    .execute(&mut *conn)
+                    .await
+                    .is_err(),
+                "{bad:?}"
+            );
+        }
+        sqlx::query("INSERT INTO plc_connections (name, protocol) VALUES ('Max', ?)")
+            .bind("a".repeat(64))
+            .execute(&mut *conn)
+            .await
+            .expect("64 characters is the limit");
+        // The secret table's CHECKs.
+        for (r#ref, scheme) in [
+            ("ABCDEF0123456789abcdef0123456789", "plain-v1"),
+            ("abc", "plain-v1"),
+            ("0123456789abcdef0123456789abcdef", "rot13"),
+        ] {
+            assert!(
+                sqlx::query(
+                    "INSERT INTO plc_connection_secrets (ref, connection_id, key, scheme, blob) \
+                     VALUES (?, 1, 'k', ?, x'00')"
+                )
+                .bind(r#ref)
+                .bind(scheme)
+                .execute(&mut *conn)
+                .await
+                .is_err(),
+                "{ref} {scheme}"
+            );
+        }
+    }
+
+    /// Design §1.1 要確認 / §9 「戻せないこと」: a database migrated through 0025 cannot be
+    /// opened by a migrator that knows only 0001-0024 (an older Hub/ChronoGazer) - sqlx
+    /// refuses an applied version missing from its source (`ignore_missing` is `false`),
+    /// so an old build fails at startup instead of reading a table it does not understand.
+    #[tokio::test]
+    async fn a_database_migrated_through_0025_is_refused_by_a_0024_migrator() {
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate through 0025");
+
+        let mut old = sqlx::migrate!("./migrations");
+        old.dangerous_set_table_name(crate::MIGRATIONS_TABLE);
+        old.migrations = std::borrow::Cow::Owned(
+            old.migrations
+                .iter()
+                .filter(|m| m.version <= 24)
+                .cloned()
+                .collect(),
+        );
+        assert_eq!(old.migrations.len(), 24);
+        assert!(!old.ignore_missing);
+        match old.run(&pool).await {
+            Err(sqlx::migrate::MigrateError::VersionMissing(25)) => {}
+            other => panic!("expected VersionMissing(25), got {other:?}"),
+        }
+    }
+
+    // ---- R2b-1d: the secret lifecycle (design §5.3) and the storage-layer checks ----
+
+    /// Protocol change (postgres → modbus-tcp) removes the reference and the row in the
+    /// update's transaction; changing back with `Keep` does not resurrect anything.
+    #[tokio::test]
+    async fn a_protocol_change_removes_the_secret_reference_and_row() {
+        let svc = service().await;
+        let pg = svc
+            .create(with_password(postgres_input("PG"), REF_A, "pw-a"))
+            .await
+            .unwrap();
+        let other = svc
+            .create(with_password(postgres_input("PG2"), REF_B, "pw-b"))
+            .await
+            .unwrap();
+        let switched = svc.update(pg.id, sample_input("PG")).await.unwrap();
+        assert_eq!(switched.protocol, "modbus-tcp");
+        assert_eq!(switched.secret_ref(PASSWORD_KEY), None);
+        assert!(svc.secret_rows(pg.id).await.unwrap().is_empty());
+        // The other connection's secret is untouched.
+        assert_eq!(
+            all_secret_rows(&svc).await,
+            [(REF_B.to_string(), other.id, PASSWORD_KEY.to_string())]
+        );
+        let back = svc.update(pg.id, postgres_input("PG")).await.unwrap();
+        assert_eq!(stored_password(&svc, back.id).await, None);
+
+        // Same through update_tx and update_preserving_simulation.
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.update_tx(&mut tx, other.id, sample_input("PG2"))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(all_secret_rows(&svc).await.is_empty());
+        let c = svc
+            .create(with_password(postgres_input("PG3"), REF_C, "pw-c"))
+            .await
+            .unwrap();
+        svc.update_preserving_simulation(c.id, sample_input("PG3"))
+            .await
+            .unwrap();
+        assert!(all_secret_rows(&svc).await.is_empty());
+    }
+
+    /// Delete, delete_tx, cascade_delete and cascade_delete_tx all remove the
+    /// connection's secret rows with it - and only its own.
+    #[tokio::test]
+    async fn every_delete_entry_removes_the_connections_secret_rows() {
+        let svc = service().await;
+        let keep = svc
+            .create(with_password(postgres_input("Keep"), REF_A, "keep"))
+            .await
+            .unwrap();
+        let refs = [
+            "11111111111111111111111111111111",
+            "22222222222222222222222222222222",
+            "33333333333333333333333333333333",
+            "44444444444444444444444444444444",
+        ];
+        let mut ids = Vec::new();
+        for (i, r#ref) in refs.iter().enumerate() {
+            let created = svc
+                .create(with_password(postgres_input(&format!("D{i}")), r#ref, "x"))
+                .await
+                .unwrap();
+            ids.push(created.id);
+        }
+        // A group (and a db tag) under the cascade targets.
+        for id in [ids[2], ids[3]] {
+            sqlx::query(
+                "INSERT INTO collection_groups (name, plc_connection_id, period_ms, query_sql) \
+                 VALUES ('g', ?, 1000, 'SELECT 1 AS v')",
+            )
+            .bind(id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        }
+        svc.delete(ids[0]).await.unwrap();
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.delete_tx(&mut tx, ids[1]).await.unwrap();
+        tx.commit().await.unwrap();
+        svc.cascade_delete(ids[2]).await.unwrap();
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.cascade_delete_tx(&mut tx, ids[3]).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            all_secret_rows(&svc).await,
+            [(REF_A.to_string(), keep.id, PASSWORD_KEY.to_string())]
+        );
+
+        // A rolled-back delete leaves the row and its secret.
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.delete_tx(&mut tx, keep.id).await.unwrap();
+        drop(tx);
+        assert_eq!(
+            stored_password(&svc, keep.id).await.as_deref(),
+            Some("keep")
+        );
+    }
+
+    /// A failed write leaves nothing: a secret insert that fails (its reference is
+    /// already used by another connection) rolls back the connection row on create
+    /// and keeps the old password on update; a caller's rolled-back transaction leaves
+    /// neither the row nor the secret.
+    #[tokio::test]
+    async fn a_failed_write_leaves_neither_the_row_nor_the_secret() {
+        let svc = service().await;
+        let first = svc
+            .create(with_password(postgres_input("First"), REF_A, "first"))
+            .await
+            .unwrap();
+
+        // Create: the secret insert collides -> no connection row either.
+        let err = svc
+            .create(with_password(postgres_input("Dup"), REF_A, "dup"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Storage(_)), "{err:?}");
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM plc_connections")
+            .fetch_all(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(names, ["First"]);
+
+        // Update: the collision keeps the old reference and row.
+        let second = svc
+            .create(with_password(postgres_input("Second"), REF_B, "second"))
+            .await
+            .unwrap();
+        svc.update(
+            second.id,
+            with_password(postgres_input("Second renamed"), REF_A, "new"),
+        )
+        .await
+        .unwrap_err();
+        let unchanged = svc.get(second.id).await.unwrap();
+        assert_eq!(unchanged.name, "Second");
+        assert_eq!(
+            stored_password(&svc, second.id).await.as_deref(),
+            Some("second")
+        );
+        assert_eq!(
+            stored_password(&svc, first.id).await.as_deref(),
+            Some("first")
+        );
+
+        // The caller's transaction rolls back: nothing of create_tx / update_tx stays.
+        let mut tx = svc.pool.begin().await.unwrap();
+        let created = svc
+            .create_tx(
+                &mut tx,
+                with_password(postgres_input("Gone"), REF_C, "gone"),
+            )
+            .await
+            .unwrap();
+        svc.update_tx(
+            &mut tx,
+            first.id,
+            with_secret_change(postgres_input("First"), SecretChange::Clear),
+        )
+        .await
+        .unwrap();
+        drop(tx);
+        assert!(svc.get(created.id).await.is_err());
+        assert_eq!(
+            all_secret_rows(&svc).await,
+            [
+                (REF_A.to_string(), first.id, PASSWORD_KEY.to_string()),
+                (REF_B.to_string(), second.id, PASSWORD_KEY.to_string()),
+            ]
+        );
+    }
+
+    /// Design §3.3・§8-1: the storage layer refuses a plaintext value under a secret
+    /// key whatever the entrance. The flat path never puts one there, so this drives the
+    /// last line directly with a registry whose `push` driver declares `stale_timeout_ms`
+    /// a secret key: the old validation (1) and the driver (4) both pass the plain number,
+    /// and only the storage check refuses it - on create and update, writing nothing.
+    #[tokio::test]
+    async fn a_plaintext_value_under_a_secret_key_is_refused_at_storage() {
+        let svc = registry_service(&[("push", &["stale_timeout_ms"], 1)]).await;
+        let mut input = push_input("P");
+        input.settings = Some(json!({"stale_timeout_ms": 5000}));
+        let err = svc.create(input.clone()).await.unwrap_err();
+        assert_eq!(only_fields(err), ["stale_timeout_ms"]);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections")
+            .fetch_one(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+
+        let created = svc.create(push_input("P")).await.unwrap();
+        let err = svc.update(created.id, input).await.unwrap_err();
+        assert_eq!(only_fields(err), ["stale_timeout_ms"]);
+        assert!(svc.get(created.id).await.unwrap().settings.is_empty());
+    }
+
+    /// A test driver for [`registry_service`]: accepts everything, declares the given
+    /// secret keys and settings version; refuses `port = 1` so a registry error is
+    /// observable.
+    struct TestDriver {
+        descriptor: banto_driver_api::DriverDescriptor,
+        secret_keys: Vec<String>,
+    }
+
+    impl banto_driver_api::DriverBase for TestDriver {
+        fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+            &self.descriptor
+        }
+        fn validate_config(
+            &self,
+            settings: &banto_driver_api::Settings,
+        ) -> Vec<banto_driver_api::FieldError> {
+            if settings.get("port") == Some("1") {
+                vec![banto_driver_api::FieldError::new("port", "driver says no")]
+            } else {
+                Vec::new()
+            }
+        }
+        fn secret_keys(&self) -> Vec<String> {
+            self.secret_keys.clone()
+        }
+        fn parse_address(
+            &self,
+            _text: &str,
+            _kind: &banto_driver_api::TagKind,
+        ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+            Err(banto_driver_api::AddressError::new("none"))
+        }
+        fn offset_address(
+            &self,
+            canonical: &str,
+            _kind: &banto_driver_api::TagKind,
+            _n: i64,
+        ) -> Result<String, banto_driver_api::AddressError> {
+            Ok(canonical.to_owned())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+
+    async fn registry_service(drivers: &[(&str, &[&str], u32)]) -> PlcConnectionService {
+        let mut registry = DriverRegistry::new();
+        for (id, secret_keys, version) in drivers {
+            let descriptor = banto_driver_api::DriverDescriptor::new(
+                banto_driver_api::DriverId::new(id).unwrap(),
+                "0.0.0",
+                *id,
+                banto_driver_api::Capabilities::READ_ONLY,
+            )
+            .with_settings_version(*version);
+            registry
+                .register(banto_driver_api::DriverEntry::host_provided(Arc::new(
+                    TestDriver {
+                        descriptor,
+                        secret_keys: secret_keys.iter().map(|k| k.to_string()).collect(),
+                    },
+                )))
+                .unwrap();
+        }
+        let pool = banto_storage::connect_sqlite_memory()
+            .await
+            .expect("connect_sqlite_memory");
+        migrate(&pool).await.expect("migrate");
+        PlcConnectionService::with_registry(pool, Arc::new(registry))
+    }
+
+    /// Design §4.2 with a registry: (1) first - when it refuses, only its errors come
+    /// back (the driver is not consulted); when it passes, the driver's errors on the
+    /// final `settings` come back in the REST spelling; an unregistered protocol is a
+    /// `protocol` error. Secret keys and `settings_version` come from the driver.
+    #[tokio::test]
+    async fn with_a_registry_the_old_rules_run_first_then_the_driver() {
+        let svc = registry_service(&[("modbus-tcp", &[], 1), ("postgres", &["password"], 3)]).await;
+
+        // (1) refuses (port 0 and unit 300): only the old errors, no driver error.
+        let mut bad = sample_input("Bad");
+        bad.port = 0;
+        bad.unit_id = 300;
+        let mut fields = only_fields(svc.create(bad).await.unwrap_err());
+        fields.sort();
+        assert_eq!(fields, ["port", "unitId"]);
+
+        // (1) passes, the driver refuses port 1.
+        let mut port1 = sample_input("Port1");
+        port1.port = 1;
+        let err = svc.create(port1).await.unwrap_err();
+        let BantoError::Validation { field_errors } = err else {
+            panic!("expected validation");
+        };
+        assert_eq!(field_errors.len(), 1);
+        assert_eq!(
+            (
+                field_errors[0].field.as_str(),
+                field_errors[0].message.as_str()
+            ),
+            ("port", "driver says no")
+        );
+
+        // An unregistered protocol (slmp is in ALLOWED_PROTOCOLS, not in this registry).
+        let mut slmp = sample_input("Slmp");
+        slmp.protocol = "slmp".to_string();
+        assert_eq!(
+            only_fields(svc.create(slmp).await.unwrap_err()),
+            ["protocol"]
+        );
+
+        // settings_version and secret keys from the driver.
+        let pg = svc
+            .create(with_password(postgres_input("PG"), REF_A, "pw"))
+            .await
+            .unwrap();
+        assert_eq!(pg.settings_version, 3);
+        assert_eq!(pg.secret_ref(PASSWORD_KEY), Some(REF_A));
+        let modbus = svc.create(sample_input("M")).await.unwrap();
+        assert_eq!(modbus.settings_version, 1);
+        // A secret set on a protocol whose driver holds no secret key is refused by (1).
+        assert_eq!(
+            only_fields(
+                svc.create(with_password(sample_input("M2"), REF_B, "x"))
+                    .await
+                    .unwrap_err()
+            ),
+            ["password"]
+        );
+    }
+
+    /// §10's R2b-1d note: what the write path stores reads back unchanged through the
+    /// flat projection - every value the old validation accepts for a built-in protocol
+    /// round-trips (`create` → `get`) through `settings` and `flat_view`.
+    #[tokio::test]
+    async fn validated_settings_read_back_identically_through_the_flat_view() {
+        let svc = service().await;
+        let cases: Vec<PlcConnectionInput> = vec![
+            {
+                let mut i = sample_input("m");
+                i.host = " h ".to_string();
+                i.port = 65535;
+                i.unit_id = 0;
+                i.word_order = "high_low".to_string();
+                i
+            },
+            {
+                let mut i = sample_input("s");
+                i.protocol = "slmp".to_string();
+                i.port = 1;
+                i.cpu_type = Some("Q".to_string());
+                i
+            },
+            {
+                let mut i = postgres_input("p");
+                i.database = Some(" d ".to_string());
+                i.username = Some("u".repeat(128));
+                i
+            },
+        ];
+        for input in cases {
+            let created = svc.create(input.clone()).await.unwrap();
+            let again = svc.get(created.id).await.unwrap();
+            assert_eq!(again, created);
+            let normalized = normalize_plc_connection_input(input);
+            let flat = crate::settings_json::legacy::flat_view(&again.protocol, &again.settings);
+            assert_eq!(flat.host, normalized.host.trim(), "{}", again.name);
+            assert_eq!(flat.port, normalized.port, "{}", again.name);
+            if again.protocol == MODBUS_PROTOCOL {
+                assert_eq!(flat.unit_id, normalized.unit_id);
+            }
+            if again.protocol != POSTGRES_PROTOCOL {
+                assert_eq!(flat.word_order, normalized.word_order);
+            }
+            if again.protocol == "slmp" {
+                assert_eq!(Some(flat.cpu_type.clone()), normalized.cpu_type);
+            }
+            if again.protocol == POSTGRES_PROTOCOL {
+                assert_eq!(
+                    flat.database.as_deref(),
+                    normalized.database.as_deref().map(str::trim)
+                );
+                assert_eq!(flat.username, normalized.username);
+            }
+        }
     }
 }

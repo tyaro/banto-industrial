@@ -1573,7 +1573,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             };
             let group_input = |conn: i64| CollectionGroupInput {

@@ -41,7 +41,7 @@ use banto_core::ListParams;
 use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
-    Tag, TagService, PUSH_PROTOCOL,
+    StoredSecretRow, Tag, TagService, PUSH_PROTOCOL,
 };
 use banto_tstore::{GroupConfig, StoreConfig, TagColumn};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -470,6 +470,13 @@ pub struct RegistrySnapshot {
     pub connections: Vec<PlcConnection>,
     pub groups: Vec<CollectionGroup>,
     pub tags: Vec<Tag>,
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§7): the **sealed**
+    /// secret rows (`plc_connection_secrets`) the connections' `settings` refer to with
+    /// `{"$secret": "<ref>"}`, read in the same transaction as the rows above. Never
+    /// plaintext: the reader that needs a value (banto-hub's DB Source) opens it in
+    /// banto-hub's `secrets` module right before use. The collection plan itself does
+    /// not read them.
+    pub secrets: Vec<StoredSecretRow>,
 }
 
 impl RegistrySnapshot {
@@ -488,6 +495,9 @@ impl RegistrySnapshot {
                 .list(ListParams::default())
                 .await?
                 .rows,
+            secrets: PlcConnectionService::new(pool.clone())
+                .all_secret_rows()
+                .await?,
         })
     }
 
@@ -498,9 +508,10 @@ impl RegistrySnapshot {
         // Column names must match `PlcConnection` (`banto-tags`' `COLUMNS`).
         // `FromRow` looks them up by name, so a missing name fails every
         // preflight with "no column found" even though the table has the column.
+        // R2b-1d (migration 0025): the flat endpoint columns moved into `settings`;
+        // `FromRow` projects them back (`banto_tags::PlcConnection::from_settings`).
         let connections = sqlx::query_as::<_, PlcConnection>(
-            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
-             cpu_type, database, username, password, settings \
+            "SELECT id, name, protocol, enabled, simulation, settings, settings_version \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -523,10 +534,17 @@ impl RegistrySnapshot {
         .await
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
 
+        let secrets = banto_tags::connection_secret::load_all_secret_rows(&mut *connection)
+            .await
+            .map_err(|err| {
+                CollectError::Registry(banto_core::BantoError::Storage(err.to_string()))
+            })?;
+
         Ok(Self {
             connections,
             groups,
             tags,
+            secrets,
         })
     }
 }
@@ -1719,7 +1737,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
@@ -2547,7 +2565,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2610,7 +2628,7 @@ mod tests {
                 cpu_type: None,
                 database: Some("erp".to_string()),
                 username: Some("reader".to_string()),
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3585,8 +3603,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 
@@ -3636,7 +3654,51 @@ mod tests {
                 tag_of(703, 70, "label", "string"),
                 tag_of(704, 70, "count", "u64"),
             ],
+            secrets: Vec::new(),
         }
+    }
+
+    /// R2b-1d (implementation-checklist §5, #605; design §7): both registry readers
+    /// see the new columns (`load_connection`'s hand-written SELECT included) and the
+    /// same sealed secret rows - read in the same transaction as the connections, and
+    /// only sealed (no plaintext field exists on the snapshot).
+    #[tokio::test]
+    async fn both_registry_readers_see_the_new_columns_and_the_sealed_secrets() {
+        let pool = registry().await;
+        let service = PlcConnectionService::new(pool.clone());
+        let mut pg = PlcConnectionInput {
+            protocol: banto_tags::POSTGRES_PROTOCOL.to_string(),
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            ..conn_input("PG", 5432)
+        };
+        pg.secrets.insert(
+            banto_tags::PASSWORD_KEY.to_string(),
+            banto_tags::SecretChange::Set(banto_tags::SealedSecretRow::new(
+                "0123456789abcdef0123456789abcdef",
+                banto_tags::SCHEME_PLAIN_V1,
+                b"pw".to_vec(),
+            )),
+        );
+        let pg = service.create(pg).await.unwrap();
+        service.create(conn_input_slmp("S", 5007)).await.unwrap();
+
+        let loaded = RegistrySnapshot::load(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let in_tx = RegistrySnapshot::load_connection(&mut tx).await.unwrap();
+        drop(tx);
+        assert_eq!(loaded, in_tx);
+        assert_eq!(in_tx.connections.len(), 2);
+        assert_eq!(in_tx.connections[0].host, "127.0.0.1");
+        assert_eq!(in_tx.connections[0].port, 5432);
+        assert_eq!(in_tx.connections[0].database.as_deref(), Some("erp"));
+        assert_eq!(in_tx.connections[1].settings_version, 1);
+        assert_eq!(in_tx.secrets.len(), 1);
+        assert_eq!(in_tx.secrets[0].connection_id, pg.id);
+        assert_eq!(
+            Some(in_tx.secrets[0].sealed.r#ref.as_str()),
+            in_tx.connections[0].secret_ref(banto_tags::PASSWORD_KEY)
+        );
     }
 
     /// R2a-2a: a "push" row saved through the services (now that the CHECK
@@ -3677,12 +3739,8 @@ mod tests {
         drop(tx);
         assert_eq!(loaded.connections, in_tx.connections);
         assert_eq!(
-            in_tx.connections[0]
-                .settings
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some(r#"{"stale_timeout_ms":2000}"#)
+            in_tx.connections[0].settings.get("stale_timeout_ms"),
+            Some(&2000.into())
         );
 
         let config = build_config_from_with(&in_tx, PushSource::Available).unwrap();
@@ -3763,6 +3821,7 @@ mod tests {
                 connections: vec![push_conn(7, "mes")],
                 groups: vec![group_of(70, 7, 1000)],
                 tags,
+                secrets: Vec::new(),
             };
             let (config, _) = build_config_lenient_inner(
                 &snapshot,

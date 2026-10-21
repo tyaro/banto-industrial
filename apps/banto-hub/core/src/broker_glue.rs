@@ -1002,8 +1002,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 

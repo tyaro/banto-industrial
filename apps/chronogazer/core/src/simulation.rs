@@ -156,7 +156,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

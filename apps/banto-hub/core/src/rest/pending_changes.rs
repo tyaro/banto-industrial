@@ -275,7 +275,13 @@ async fn execute_pending_apply(
                 .map_err(PendingApplyError::Api)?;
             state
                 .plc_connections
-                .create_tx(&mut tx, body.input.into())
+                .create_tx(
+                    &mut tx,
+                    body.input
+                        .into_input()
+                        .map_err(ApiError)
+                        .map_err(PendingApplyError::Api)?,
+                )
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -313,7 +319,14 @@ async fn execute_pending_apply(
             }
             state
                 .plc_connections
-                .update_tx(&mut tx, body.id, body.input.into())
+                .update_tx(
+                    &mut tx,
+                    body.id,
+                    body.input
+                        .into_input()
+                        .map_err(ApiError)
+                        .map_err(PendingApplyError::Api)?,
+                )
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;

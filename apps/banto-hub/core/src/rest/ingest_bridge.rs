@@ -163,8 +163,15 @@ pub(crate) fn bridge_fingerprint(bridge: &Value) -> String {
 /// 接続の一覧から応答の `sources` を作る（純関数。DB を読まない - 表のテストに掛ける）。
 /// `caller` は通ったキー（admin ロールのセッションなら `None` = どの接続にも送れない）。
 /// 戻りの 2 つ目は載せなかった接続の warn の文言（パスワードを含まない）。
+///
+/// R2b-1d: `secret_rows` are the sealed secret rows (`plc_connection_secrets`); the
+/// referenced `postgres` connection's password is opened from them only for a source
+/// whose caller may ingest (design §5.4). A password that cannot be opened is never sent
+/// as `null`/empty: the source is left out with a warning (TODO(R2b-1d part B /
+/// R2b-1e): `unavailableSources`).
 pub(crate) fn build_sources(
     connections: &[PlcConnection],
+    secret_rows: &[banto_tags::StoredSecretRow],
     caller: Option<&ApiKeyContext>,
 ) -> (Vec<BridgeSourceEntry>, Vec<String>) {
     let mut sources = Vec::new();
@@ -173,9 +180,7 @@ pub(crate) fn build_sources(
         if conn.protocol != PUSH_PROTOCOL || !conn.enabled {
             continue;
         }
-        let Some(raw) = conn.settings.as_ref() else {
-            continue;
-        };
+        let raw = &Value::Object(conn.settings.clone());
         let Some(raw_bridge) = raw.get("bridge") else {
             continue;
         };
@@ -210,6 +215,29 @@ pub(crate) fn build_sources(
             continue;
         }
         let ingest_allowed = caller.is_some_and(|ctx| ctx.can_ingest(conn.id));
+        let password = if ingest_allowed {
+            match crate::secrets::open_connection_secret(
+                &crate::secrets::r2b1d_connection_secrets(),
+                db,
+                banto_tags::PASSWORD_KEY,
+                secret_rows,
+            ) {
+                Ok(password) => password.map(|plain| plain.as_str().to_owned()),
+                Err(reason) => {
+                    warnings.push(format!(
+                        "接続 {}（#{}）のブリッジの読み取り先 {}（#{}）のパスワードを読めません（{}）",
+                        conn.name,
+                        conn.id,
+                        db.name,
+                        db.id,
+                        reason.as_str()
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
         sources.push(BridgeSourceEntry {
             connection_id: conn.id,
             name: conn.name.clone(),
@@ -241,11 +269,7 @@ pub(crate) fn build_sources(
                 port: db.port,
                 database: db.database.clone(),
                 username: db.username.clone(),
-                password: if ingest_allowed {
-                    db.password.clone()
-                } else {
-                    None
-                },
+                password,
             },
         });
     }
@@ -262,7 +286,11 @@ async fn build_response(state: &BridgeConfigState, caller: Option<&ApiKeyContext
         Ok(result) => result.rows,
         Err(err) => return ApiError(err).into_response(),
     };
-    let (sources, warnings) = build_sources(&connections, caller);
+    let secret_rows = match state.plc_connections.all_secret_rows().await {
+        Ok(rows) => rows,
+        Err(err) => return ApiError(err).into_response(),
+    };
+    let (sources, warnings) = build_sources(&connections, &secret_rows, caller);
     for warning in warnings {
         eprintln!("banto-hub: warn: GET {BRIDGE_CONFIG_PATH}: {warning}");
     }
@@ -337,9 +365,42 @@ mod tests {
             cpu_type: String::new(),
             database: (protocol == POSTGRES_PROTOCOL).then(|| "mes".to_string()),
             username: (protocol == POSTGRES_PROTOCOL).then(|| "reader".to_string()),
-            password: (protocol == POSTGRES_PROTOCOL).then(|| "s3cret-pw".to_string()),
-            settings,
+            // R2b-1d: a postgres row's password is a reference to its sealed row
+            // ([`secret_rows`]); a push row's settings are the object itself.
+            settings: if protocol == POSTGRES_PROTOCOL {
+                json!({ "password": { "$secret": pw_ref(id) } })
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            } else {
+                settings
+                    .map(|value| value.as_object().unwrap().clone())
+                    .unwrap_or_default()
+            },
+            settings_version: 1,
         }
+    }
+
+    fn pw_ref(id: i64) -> String {
+        format!("{id:032x}")
+    }
+
+    /// The sealed (`plain-v1`) password rows of every postgres connection in
+    /// `connections` (what `PlcConnectionService::all_secret_rows` returns).
+    fn secret_rows(connections: &[PlcConnection]) -> Vec<banto_tags::StoredSecretRow> {
+        connections
+            .iter()
+            .filter(|c| c.protocol == POSTGRES_PROTOCOL)
+            .map(|c| banto_tags::StoredSecretRow {
+                connection_id: c.id,
+                key: "password".to_string(),
+                sealed: banto_tags::SealedSecretRow::new(
+                    pw_ref(c.id),
+                    "plain-v1",
+                    b"s3cret-pw".to_vec(),
+                ),
+            })
+            .collect()
     }
 
     fn bridge(db_id: i64) -> Value {
@@ -375,7 +436,8 @@ mod tests {
             conn(6, "modbus-tcp", true, None),
         ];
         let ctx = key(&["admin", "ingest:#2"]);
-        let (sources, warnings) = build_sources(&connections, Some(&ctx));
+        let (sources, warnings) =
+            build_sources(&connections, &secret_rows(&connections), Some(&ctx));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(sources.len(), 1);
         let source = &sources[0];
@@ -402,7 +464,8 @@ mod tests {
             conn(2, PUSH_PROTOCOL, true, Some(bridge(1))),
         ];
         for caller in [Some(key(&["admin", "read", "ingest:#3"])), None] {
-            let (sources, _) = build_sources(&connections, caller.as_ref());
+            let (sources, _) =
+                build_sources(&connections, &secret_rows(&connections), caller.as_ref());
             assert_eq!(sources.len(), 1);
             assert!(!sources[0].ingest_allowed);
             assert_eq!(sources[0].db.password, None);
@@ -444,7 +507,8 @@ mod tests {
             conn(6, PUSH_PROTOCOL, true, Some(broken)),
         ];
         let ctx = key(&["admin", "ingest:#2", "ingest:#3", "ingest:#4", "ingest:#6"]);
-        let (sources, warnings) = build_sources(&connections, Some(&ctx));
+        let (sources, warnings) =
+            build_sources(&connections, &secret_rows(&connections), Some(&ctx));
         assert_eq!(
             sources.iter().map(|s| s.connection_id).collect::<Vec<_>>(),
             vec![2]
@@ -457,6 +521,40 @@ mod tests {
         assert!(!format!("{:?}", sources[0].db).contains("s3cret-pw"));
     }
 
+    /// R2b-1d (design §5.4): a source whose `postgres` password cannot be read (its row
+    /// is missing) is left out with a warning - never sent with a `null`/empty password -
+    /// while the others still go; without the ingest scope nothing is opened at all.
+    #[test]
+    fn an_unreadable_password_leaves_only_that_source_out() {
+        let connections = vec![
+            conn(1, POSTGRES_PROTOCOL, true, None),
+            conn(2, PUSH_PROTOCOL, true, Some(bridge(1))),
+            conn(3, POSTGRES_PROTOCOL, true, None),
+            conn(4, PUSH_PROTOCOL, true, Some(bridge(3))),
+        ];
+        let rows: Vec<_> = secret_rows(&connections)
+            .into_iter()
+            .filter(|row| row.connection_id != 3)
+            .collect();
+        let ctx = key(&["admin", "ingest:#2", "ingest:#4"]);
+        let (sources, warnings) = build_sources(&connections, &rows, Some(&ctx));
+        assert_eq!(
+            sources.iter().map(|s| s.connection_id).collect::<Vec<_>>(),
+            vec![2]
+        );
+        assert_eq!(sources[0].db.password.as_deref(), Some("s3cret-pw"));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("パスワードを読めません"),
+            "{warnings:?}"
+        );
+        // Without the scope nothing is opened, so the unreadable one is listed (no password).
+        let (sources, warnings) = build_sources(&connections, &rows, Some(&key(&["admin"])));
+        assert_eq!(sources.len(), 2);
+        assert!(warnings.is_empty());
+        assert!(sources.iter().all(|s| s.db.password.is_none()));
+    }
+
     /// 応答の wire 形（camelCase、§10.2）。
     #[test]
     fn response_is_camel_case() {
@@ -464,7 +562,11 @@ mod tests {
             conn(1, POSTGRES_PROTOCOL, true, None),
             conn(2, PUSH_PROTOCOL, true, Some(bridge(1))),
         ];
-        let (sources, _) = build_sources(&connections, Some(&key(&["admin", "ingest:#2"])));
+        let (sources, _) = build_sources(
+            &connections,
+            &secret_rows(&connections),
+            Some(&key(&["admin", "ingest:#2"])),
+        );
         let body = serde_json::to_value(BridgeConfigResponse {
             generated_at: 5,
             sources,

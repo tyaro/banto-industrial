@@ -895,6 +895,8 @@ pub async fn registry_exclusions(
         connections: plc_connections.list(ListParams::default()).await?.rows,
         groups: collection_groups.list(ListParams::default()).await?.rows,
         tags: tags.list(ListParams::default()).await?.rows,
+        // The exclusions never read secrets (ChronoGazer's rows have none, design §6.7).
+        secrets: Vec::new(),
     };
     Ok(exclusion_views(&config_exclusions(&snapshot)))
 }
@@ -3461,7 +3463,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3965,7 +3967,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4112,7 +4114,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4195,7 +4197,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4417,8 +4419,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
         let group = |id: i64, conn: i64, enabled: bool| CollectionGroup {
             id,
@@ -4454,6 +4456,7 @@ mod tests {
             connections: vec![conn(1, "modbus-tcp", true)],
             groups: vec![group(10, 1, true)],
             tags: vec![tag(100, 10, "40001", true)],
+            secrets: Vec::new(),
         };
         assert_eq!(hub_external_names(&plc_only), None);
 
@@ -4468,6 +4471,7 @@ mod tests {
                 tag(203, 21, "A.G.group_off", true),
                 tag(204, 20, "A.G.a", true),
             ],
+            secrets: Vec::new(),
         };
         assert_eq!(
             hub_external_names(&snapshot),
@@ -5613,8 +5617,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 
@@ -5634,6 +5638,7 @@ mod tests {
             ],
             groups: Vec::new(),
             tags: Vec::new(),
+            secrets: Vec::new(),
         };
         let keys = simulated_connection_keys(&snapshot);
         let expected: HashSet<String> = ["conn:2".to_string()].into_iter().collect();

@@ -397,7 +397,7 @@ async fn prepare_root_db(layout: &DataLayout, plc_port: Option<u16>) {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await

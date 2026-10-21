@@ -122,8 +122,8 @@ fn connection_from(settings: &Settings) -> Result<(PlcConnection, u16), FatalErr
         cpu_type: settings.get(keys::CPU_TYPE).unwrap_or("R").to_string(),
         database: None,
         username: None,
-        password: None,
-        settings: None,
+        settings: Default::default(),
+        settings_version: 1,
     };
     Ok((conn, port))
 }

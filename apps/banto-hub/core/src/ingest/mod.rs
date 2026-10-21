@@ -810,31 +810,30 @@ fn slot_configs(snapshot: &RegistrySnapshot) -> HashMap<i64, SlotConfig> {
         .iter()
         .filter(|conn| conn.protocol == PUSH_PROTOCOL)
         .map(|conn| {
-            let (stale_timeout_ms, bridge) = match &conn.settings {
-                None => (DEFAULT_STALE_TIMEOUT_MS, None),
-                Some(raw) => match validate_push_settings(raw) {
-                    Ok(settings) => (
-                        settings.stale_timeout_ms,
-                        settings.bridge.map(|bridge| BridgeSendSet {
-                            fingerprint: raw.get("bridge").cloned().unwrap_or(Value::Null),
-                            keys: bridge
-                                .queries
-                                .iter()
-                                .flat_map(|query| query.columns.iter())
-                                .map(|column| column.key.clone())
-                                .collect(),
-                        }),
-                    ),
-                    // 書き込みの入口が検証するので本来は起きない（手で書き換えた DB）。
-                    // ブリッジの区画があれば送る集合を空にして全部を断る（fail closed）。
-                    Err(_) => (
-                        DEFAULT_STALE_TIMEOUT_MS,
-                        raw.get("bridge").map(|fingerprint| BridgeSendSet {
-                            fingerprint: fingerprint.clone(),
-                            keys: HashSet::new(),
-                        }),
-                    ),
-                },
+            // R2b-1d: `settings` is always an object (`{}` = the defaults).
+            let raw = &Value::Object(conn.settings.clone());
+            let (stale_timeout_ms, bridge) = match validate_push_settings(raw) {
+                Ok(settings) => (
+                    settings.stale_timeout_ms,
+                    settings.bridge.map(|bridge| BridgeSendSet {
+                        fingerprint: raw.get("bridge").cloned().unwrap_or(Value::Null),
+                        keys: bridge
+                            .queries
+                            .iter()
+                            .flat_map(|query| query.columns.iter())
+                            .map(|column| column.key.clone())
+                            .collect(),
+                    }),
+                ),
+                // 書き込みの入口が検証するので本来は起きない（手で書き換えた DB）。
+                // ブリッジの区画があれば送る集合を空にして全部を断る（fail closed）。
+                Err(_) => (
+                    DEFAULT_STALE_TIMEOUT_MS,
+                    raw.get("bridge").map(|fingerprint| BridgeSendSet {
+                        fingerprint: fingerprint.clone(),
+                        keys: HashSet::new(),
+                    }),
+                ),
             };
             (
                 conn.id,

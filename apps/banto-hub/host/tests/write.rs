@@ -92,7 +92,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         cpu_type: None,
         database: None,
         username: None,
-        password: None,
+        secrets: Default::default(),
         settings: None,
     }
 }

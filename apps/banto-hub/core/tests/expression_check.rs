@@ -97,7 +97,7 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         cpu_type: None,
         database: None,
         username: None,
-        password: None,
+        secrets: Default::default(),
         settings: None,
     }
 }

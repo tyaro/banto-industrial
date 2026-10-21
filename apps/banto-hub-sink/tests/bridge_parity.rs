@@ -513,7 +513,12 @@ fn postgres_input(name: &str, target: &PgTarget, role: &TestRole) -> PlcConnecti
         cpu_type: None,
         database: Some(target.database.clone()),
         username: Some(role.name.clone()),
-        password: Some(role.password.clone()),
+        // R2b-1d: sealed at the entrance (`plain-v1`), like banto-hub's REST/MCP do.
+        secrets: banto_hub_core::secrets::password_changes(
+            &banto_hub_core::secrets::r2b1d_connection_secrets(),
+            Some(role.password.as_str()),
+        )
+        .expect("seal the test password"),
         settings: None,
     }
 }
@@ -531,7 +536,7 @@ fn push_input(name: &str, settings: Value) -> PlcConnectionInput {
         cpu_type: None,
         database: None,
         username: None,
-        password: None,
+        secrets: Default::default(),
         settings: Some(settings),
     }
 }

@@ -96,7 +96,7 @@ async fn register(pool: &SqlitePool, port: u16) -> i64 {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

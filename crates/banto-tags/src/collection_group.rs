@@ -752,7 +752,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -786,7 +786,7 @@ mod tests {
             cpu_type: None,
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
@@ -935,7 +935,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -976,7 +976,7 @@ mod tests {
                         cpu_type: None,
                         database: None,
                         username: None,
-                        password: None,
+                        secrets: Default::default(),
                         settings: None,
                     },
                 )

@@ -564,8 +564,9 @@ mod tests {
 
     async fn seed_postgres_connection(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar(
-            "INSERT INTO plc_connections (name, protocol, host, port, database, username) \
-             VALUES ('pg1', 'postgres', 'localhost', 5432, 'db1', 'user1') RETURNING id",
+            "INSERT INTO plc_connections (name, protocol, settings) \
+             VALUES ('pg1', 'postgres', json_object('host', 'localhost', 'port', 5432, \
+             'database', 'db1', 'username', 'user1')) RETURNING id",
         )
         .fetch_one(pool)
         .await
@@ -574,8 +575,9 @@ mod tests {
 
     async fn seed_modbus_connection(pool: &SqlitePool) -> i64 {
         sqlx::query_scalar(
-            "INSERT INTO plc_connections (name, protocol, host, port) \
-             VALUES ('plc1', 'modbus-tcp', '127.0.0.1', 502) RETURNING id",
+            "INSERT INTO plc_connections (name, protocol, settings) \
+             VALUES ('plc1', 'modbus-tcp', json_object('host', '127.0.0.1', 'port', 502)) \
+             RETURNING id",
         )
         .fetch_one(pool)
         .await

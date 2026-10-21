@@ -328,6 +328,33 @@ async fn build_sink_config_response(
     let mut connections = Vec::with_capacity(connection_ids.len());
     for connection_id in connection_ids {
         let conn = state.plc_connections.get(connection_id).await?;
+        // R2b-1d (design §5.4): the password is opened from its sealed row right before
+        // the response is built. "No password" (`None`) and "unreadable" stay apart: an
+        // unreadable one is never sent as an absent/empty password (a `trust`-auth DB
+        // would accept that, checklist §5「エラーを空に潰さない」).
+        let rows = state.plc_connections.secret_rows(connection_id).await?;
+        let password = match crate::secrets::open_connection_secret(
+            &crate::secrets::r2b1d_connection_secrets(),
+            &conn,
+            banto_tags::PASSWORD_KEY,
+            &rows,
+        ) {
+            Ok(password) => password.map(|plain| plain.as_str().to_owned()),
+            Err(reason) => {
+                // TODO(R2b-1d part B / R2b-1e): list it in `unavailableConnections:
+                // [{id, name, reason}]` (design §5.4). Until then it is left out of
+                // `connections`, so a sidecar (old or new) does not connect for its
+                // groups (`GroupSetupError::MissingConnection`).
+                eprintln!(
+                    "banto-hub: warn: GET /api/sink/config: 接続 {}（#{}）のパスワードを読めません\
+                     （{}）。この接続を設定に載せません",
+                    conn.name,
+                    conn.id,
+                    reason.as_str()
+                );
+                continue;
+            }
+        };
         connections.push(SinkConfigConnectionEntry {
             id: conn.id,
             name: conn.name,
@@ -335,7 +362,7 @@ async fn build_sink_config_response(
             port: conn.port,
             database: conn.database,
             username: conn.username,
-            password: conn.password,
+            password,
         });
     }
 

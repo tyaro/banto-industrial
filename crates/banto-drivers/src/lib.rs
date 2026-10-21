@@ -194,8 +194,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 
@@ -318,7 +318,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }

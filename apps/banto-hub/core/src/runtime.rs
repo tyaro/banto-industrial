@@ -1192,7 +1192,7 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await
