@@ -229,6 +229,9 @@
 	 */
 	function dataTypeOptionsFor(protocol: PlcProtocol | undefined): typeof dataTypeOptions {
 		if (protocol === 'modbus-tcp') return dataTypeOptions;
+		// R2a-2e（docs/banto-hub-ingest-design.md §3.3）: push のタグは数値（64bit を
+		// 含む）と bit だけ。string は送れない（サーバーの `push_tag_errors` が断る）。
+		if (protocol === 'push') return dataTypeOptions.filter((opt) => opt.value !== 'string');
 		return dataTypeOptions.filter((opt) => !MODBUS_ONLY_DATA_TYPES.includes(opt.value));
 	}
 
@@ -446,6 +449,9 @@
 		const isPlc = form.tagKind === 'plc';
 		const isComputed = form.tagKind === 'computed';
 		const isDb = form.tagKind === DB_TAG_KIND;
+		// R2a-2e（§3.3）: push 接続のタグは書き込み不可（サーバーは true を断る。
+		// 正規化しない）。フォームのチェックも止めているが、送信直前にも揃える。
+		const isPush = connectionForGroupId(form.collectionGroupId)?.protocol === 'push';
 		return {
 			name: form.name,
 			collectionGroupId: Number(form.collectionGroupId),
@@ -463,7 +469,7 @@
 			// computed/db タグは常に writable=false（computed: 値は式が決める、
 			// db: v1 は読み取り専用 §6-10）- フォーム自体もこの2種でチェック
 			// ボックスを隠すが、送信直前にも強制する。
-			writable: isComputed || isDb ? false : form.writable,
+			writable: isComputed || isDb || isPush ? false : form.writable,
 			tagKind: form.tagKind,
 			expression: isComputed ? form.expression : undefined,
 			retain: form.tagKind === 'internal' ? form.retain : false
@@ -518,7 +524,9 @@
 	}
 
 	function confirmWriteLabel(form: FormState): string {
-		return writePermissionLabel(form.tagKind, form.writable);
+		// R2a-2e: push 接続のタグは送信時に writable=false へ揃える（`toInput`）。
+		const isPush = connectionForGroupId(form.collectionGroupId)?.protocol === 'push';
+		return writePermissionLabel(form.tagKind, isPush ? false : form.writable);
 	}
 
 	/**
@@ -5421,7 +5429,10 @@
 			preflight 等でこの判定結果を返すようになったら、その値を
 			第2引数として渡すだけで絞り込みが有効になる。
 		-->
-		{@const writableBlockedReason = writableDefaultBlockedReason(form.tagKind)}
+		{@const writableBlockedReason =
+			connectionForGroupId(form.collectionGroupId)?.protocol === 'push'
+				? 'push（取り込み）接続のタグは書き込みできません（送り手が値を送るだけです）。'
+				: writableDefaultBlockedReason(form.tagKind)}
 		<details class="detail-group" bind:open={detailOpen.write}>
 			<summary>書き込み安全設定</summary>
 			<div class="form-grid">
@@ -6768,6 +6779,7 @@
 	open={connectionDrawerOpen}
 	connection={connectionDrawerTarget}
 	existingNames={connections.map((c) => c.name)}
+	{connections}
 	{groups}
 	{tags}
 	requestDelete={connectionDrawerRequestDelete}

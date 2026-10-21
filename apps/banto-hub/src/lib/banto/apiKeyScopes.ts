@@ -31,8 +31,9 @@ export const PUSH_PROTOCOL = 'push';
 
 /**
  * 表示とフォームが読む接続の最小の形。`tagRegistryAdmin.ts` の
- * `PlcConnection` は構造的にこれを満たす（`protocol` は文字列として比べる -
- * `PlcProtocol` に `push` を足すのは接続のフォームの段、R2a-2e）。
+ * `PlcConnection` は構造的にこれを満たす（`protocol` は文字列として比べる。
+ * R2a-2e で `PlcProtocol` にも `push` を足したが、このモジュールは
+ * `tagRegistryAdmin.ts` を import しない純関数のまま保つ）。
  */
 export interface ScopeConnection {
 	id: number;

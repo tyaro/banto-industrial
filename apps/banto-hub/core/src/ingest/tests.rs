@@ -1323,3 +1323,184 @@ async fn a_ws_session_sees_only_state_changes_after_it_opened() {
     drop(session);
     env.finish().await;
 }
+
+/// R2a-2e（§9）: 状態の表示（`IngestHub::status`）。数・未知のキー・送り手（WS と
+/// REST）・受けた `t` の最大・送り手の `status` を出し、値と資格情報は出さない。
+/// 数は commit・収集の遷移で消えない。
+/// REST の最後の送り手は、最後に受け付けた反映の送り手（P3）。記録は反映と同じ
+/// 保持値のロックの中なので、並行しても「反映 A → 反映 B → 記録 B → 記録 A」の
+/// 交錯は起きない。ここでは逐次に 2 人の送り手で呼び、断ったときは記録を
+/// 書き換えないことも確かめる。
+#[tokio::test]
+async fn rest_sender_follows_last_accepted_apply() {
+    let env = env("ingest-rest-sender").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+    let sender = |name: &str, at_ms: i64| IngestSender {
+        api_key_name: name.to_string(),
+        peer: None,
+        at_ms,
+    };
+    let rest_sender = |hub: &IngestHub| {
+        hub.status()
+            .into_iter()
+            .find(|s| s.connection_id == conn)
+            .unwrap()
+            .senders
+            .into_iter()
+            .find(|s| s.transport == SenderTransport::Rest)
+            .map(|s| s.sender.api_key_name)
+    };
+    assert_eq!(rest_sender(&hub), None);
+    let now = env.now_ms();
+    hub.apply_rest(conn, None, &[value("k", 1.0)], now, sender("A", now))
+        .unwrap();
+    hub.apply_rest(conn, None, &[value("k", 2.0)], now, sender("B", now))
+        .unwrap();
+    assert_eq!(rest_sender(&hub).as_deref(), Some("B"));
+    // epoch が合わない要求は断られ、送り手を書き換えない。
+    assert!(hub
+        .apply_rest(conn, Some(999), &[value("k", 3.0)], now, sender("C", now))
+        .is_err());
+    assert_eq!(rest_sender(&hub).as_deref(), Some("B"));
+    // 存在しない接続も記録しない。
+    assert!(hub
+        .apply_rest(conn + 999, None, &[value("k", 3.0)], now, sender("D", now))
+        .is_err());
+    assert_eq!(rest_sender(&hub).as_deref(), Some("B"));
+}
+
+#[tokio::test]
+async fn status_reports_counts_senders_and_no_values() {
+    let env = env("ingest-status").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    let other = env.push_connection("Q", None).await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+
+    let before = hub.status();
+    assert_eq!(
+        before.iter().map(|s| s.connection_id).collect::<Vec<_>>(),
+        vec![conn, other],
+        "接続 id の昇順"
+    );
+    let first = &before[0];
+    assert!(!first.live);
+    assert_eq!(
+        first.link_detail.as_deref(),
+        Some("送り手が一度も接続していません")
+    );
+    assert_eq!(
+        (first.accepted, first.rejected, first.held_values),
+        (0, 0, 0)
+    );
+    assert!(first.senders.is_empty());
+
+    let now = env.now_ms();
+    let mut with_time = value("k", 12.5);
+    with_time.t = Some(json!(1_761_000_000_000_i64));
+    let unknown = |key: &str| value(key, 1.0);
+    let ack = hub
+        .apply_rest(
+            conn,
+            None,
+            &[with_time, unknown("line1.tmp"), unknown("a\u{7}b")],
+            now,
+            IngestSender {
+                api_key_name: "script".to_string(),
+                peer: Some("127.0.0.1:5000".to_string()),
+                at_ms: now,
+            },
+        )
+        .unwrap();
+    assert_eq!((ack.accepted, ack.rejected.len()), (1, 2));
+    let (session, _) = hub
+        .open_ws_session_from(
+            conn,
+            Some(IngestSender {
+                api_key_name: "db-bridge".to_string(),
+                peer: None,
+                at_ms: now,
+            }),
+        )
+        .unwrap();
+    hub.ping_ws(
+        &session,
+        Some("line1: クエリが失敗しました".to_string()),
+        now,
+    )
+    .unwrap();
+    // 件数の上限で断ったメッセージを 1 つ数える。
+    assert!(hub.admit(conn, 1_001, now).unwrap().outcome.is_err());
+
+    let status = hub
+        .status()
+        .into_iter()
+        .find(|s| s.connection_id == conn)
+        .unwrap();
+    assert!(status.live);
+    assert_eq!(status.link_detail, None);
+    assert_eq!(status.name, "P");
+    assert!(!status.bridge && status.enabled && !status.collecting);
+    assert_eq!(status.epoch, 1);
+    assert_eq!(status.held_values, 1);
+    assert_eq!((status.accepted, status.rejected), (1, 2));
+    assert_eq!((status.rate_limited, status.too_many_items), (0, 1));
+    // 新しい順、制御文字は落とす。
+    assert_eq!(
+        status.unknown_keys,
+        vec!["ab".to_string(), "line1.tmp".to_string()]
+    );
+    assert_eq!(status.last_source_time_ms, Some(1_761_000_000_000));
+    assert_eq!(
+        status.sender_status.as_deref(),
+        Some("line1: クエリが失敗しました")
+    );
+    assert_eq!(
+        status
+            .senders
+            .iter()
+            .map(|s| (s.transport, s.sender.api_key_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (SenderTransport::Ws, "db-bridge"),
+            (SenderTransport::Rest, "script")
+        ]
+    );
+    // 値（12.5）は状態のどこにも出ない。
+    assert!(!format!("{status:?}").contains("12.5"), "{status:?}");
+
+    // 同じ未知のキーをもう一度送っても重複しない（前に出る）。20 件で頭打ち。
+    let many: Vec<IngestItem> = (0..30).map(|i| unknown(&format!("u{i}"))).collect();
+    hub.apply(conn, None, &many, now).unwrap();
+    hub.apply(conn, None, &[unknown("u3")], now).unwrap();
+    let keys = hub.status()[0].unknown_keys.clone();
+    assert_eq!(keys.len(), STATUS_UNKNOWN_KEYS);
+    assert_eq!(keys[0], "u3");
+    assert_eq!(keys.iter().filter(|k| *k == "u3").count(), 1);
+
+    // WS を閉じると WS の送り手は消える。数は commit・停止で消えない。
+    drop(session);
+    env.commit().await;
+    hub.on_collection_stopped();
+    let after = hub
+        .status()
+        .into_iter()
+        .find(|s| s.connection_id == conn)
+        .unwrap();
+    assert_eq!(
+        after
+            .senders
+            .iter()
+            .map(|s| s.transport)
+            .collect::<Vec<_>>(),
+        vec![SenderTransport::Rest]
+    );
+    assert_eq!(after.accepted, 1);
+    assert_eq!(after.held_values, 0, "停止で保持値は捨てる（§4.5）");
+}

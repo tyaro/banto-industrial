@@ -13,6 +13,7 @@ import {
 	type CollectionGroup,
 	type CollectionGroupInput,
 	type PlcConnection,
+	type PlcConnectionInput,
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
@@ -32,8 +33,11 @@ import {
 	describeConfigPackageTagRef,
 	planByKey,
 	planByName,
+	resolvePushSettings,
 	serializeConfigPackage,
 	type ConfigPackage,
+	type ConfigPackageIngestConnection,
+	type ConfigPackagePlcConnection,
 	type ConfigPackageImportOptions,
 	type ConfigPackageImportSummary,
 	type ConfigPackageInspection
@@ -342,8 +346,25 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 					({ incoming, existing }) => incoming.protocol === 'postgres' && !existing.passwordSet
 				)
 				.map(({ incoming }) => incoming.name)
-		]
+		],
+		// R2a-2e（docs/banto-hub-ingest-design.md §5.1）: API キーは移らない。
+		ingestConnections: pkg.plcConnections
+			.filter((connection) => connection.protocol === 'push')
+			.map((connection) => connection.name)
 	};
+}
+
+/**
+ * R2a-2e: 接続を取り込む順。push 接続のブリッジは読む `postgres` 接続を id で
+ * 持つ（§10.2）ので、ブリッジを持つ push 接続は他の全接続の**後**に作成・更新
+ * する（同じパッケージで作る postgres 接続の新しい id を引くため）。それ以外の
+ * 並びはパッケージのまま。
+ */
+export function connectionImportOrder(
+	connections: readonly ConfigPackagePlcConnection[]
+): ConfigPackagePlcConnection[] {
+	const hasBridge = (c: ConfigPackagePlcConnection) => c.settings?.bridge !== undefined;
+	return [...connections.filter((c) => !hasBridge(c)), ...connections.filter(hasBridge)];
 }
 
 export async function applyConfigPackage(
@@ -377,19 +398,36 @@ async function applyConfigPackageInner(
 
 	const warnings: string[] = [];
 	const connectionByName = buildConnectionMap(currentConnections);
-	for (const connection of pkg.plcConnections) {
-		if (isVirtualConnection(connection)) {
-			warnings.push(`virtual connection '${connection.name}' は構成パッケージに含めません`);
+	const ingestConnections: ConfigPackageIngestConnection[] = [];
+	for (const pkgConnection of connectionImportOrder(pkg.plcConnections)) {
+		if (isVirtualConnection(pkgConnection)) {
+			warnings.push(`virtual connection '${pkgConnection.name}' は構成パッケージに含めません`);
 			continue;
 		}
-		const existing = connectionByName.get(connection.name);
-		if (existing) {
-			const updated = await updatePlcConnection(existing.id, connection);
-			connectionByName.set(updated.name, updated);
-		} else {
-			const created = await createPlcConnection(connection);
-			connectionByName.set(created.name, created);
+		const { settings: pkgSettings, ...rest } = pkgConnection;
+		let connection: PlcConnectionInput = rest;
+		if (pkgConnection.protocol === 'push') {
+			// R2a-2e（§3.1・§5.1）: ブリッジの読む DB の名前を、取り込み先の id に
+			// 付け直す（上の順で postgres 接続は作成・更新済み）。引けなければ
+			// 壊れた参照で作らず、警告を積んでこの接続を飛ばす。
+			const settings = resolvePushSettings(
+				pkgSettings ?? {},
+				(name) => connectionByName.get(name)?.id
+			);
+			if (settings === null) {
+				warnings.push(
+					`push 接続 '${pkgConnection.name}' のブリッジが読む接続 '${pkgSettings?.bridge?.dbConnectionName}' を解決できませんでした`
+				);
+				continue;
+			}
+			connection = { ...rest, settings };
 		}
+		const existing = connectionByName.get(connection.name);
+		const saved = existing
+			? await updatePlcConnection(existing.id, connection)
+			: await createPlcConnection(connection);
+		connectionByName.set(saved.name, saved);
+		if (saved.protocol === 'push') ingestConnections.push({ name: saved.name, id: saved.id });
 	}
 
 	// 版 2: 現在の環境のグループ・タグをパッケージと同じキーで引く。接続名は
@@ -582,6 +620,7 @@ async function applyConfigPackageInner(
 		},
 		mqttApplied: true,
 		grpcApplied: true,
-		warnings: uniqueWarnings(warnings)
+		warnings: uniqueWarnings(warnings),
+		ingestConnections
 	};
 }

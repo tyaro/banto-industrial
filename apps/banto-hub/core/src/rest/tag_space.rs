@@ -756,6 +756,97 @@ impl From<crate::db_source::DbConnectionStatus> for DbSourceStatusEntry {
     }
 }
 
+/// `GET /api/v1/status` の `ingest`（取り込み口 `push`、R2a-2e、
+/// docs/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。
+/// `crate::ingest::IngestHub::status` のプロセス内メモリを写したもので、
+/// **資格情報と値は含まない**（送り手は API キーの名前・接続元・時刻だけ、保持値は
+/// 数だけ。`sender_status` は送り手の `status` を制御文字を落として 1 KiB に
+/// 切り詰めたもの、`unknown_keys` も同じく切り詰めたキー）ため、`db_source` 節と
+/// 同じく admin 限定にはしていない。
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct IngestStatusEntry {
+    pub(super) connection_id: i64,
+    pub(super) name: String,
+    pub(super) enabled: bool,
+    /// `settings.bridge` がある（DB ブリッジの接続）。
+    pub(super) bridge: bool,
+    /// `live`（送り手の最後の通信から `stale_timeout_ms` 以内）/ `down`（§4.3）。
+    pub(super) link: String,
+    /// `down` の理由（「送り手からの通信が {n} 秒ありません」など）。`live` なら `null`。
+    pub(super) link_detail: Option<String>,
+    pub(super) last_seen_at: Option<i64>,
+    pub(super) stale_timeout_ms: u64,
+    pub(super) collecting: bool,
+    pub(super) epoch: u64,
+    /// 保持している値の数（値そのものは出さない）。
+    pub(super) held_values: u64,
+    pub(super) senders: Vec<IngestSenderStatusEntry>,
+    /// 受け付けた件数（Hub の起動から）。
+    pub(super) accepted: u64,
+    /// 件ごとに断った件数（§6.3）。
+    pub(super) rejected: u64,
+    /// 頻度の上限で断ったメッセージの数。
+    pub(super) rate_limited: u64,
+    /// 件数の上限（1 メッセージ 1,000 件）で断ったメッセージの数。
+    pub(super) too_many_items: u64,
+    /// 直近の未知のキー（新しい順、20 件まで）。
+    pub(super) unknown_keys: Vec<String>,
+    /// 受け付けた件の `t` の最大（任意）。
+    pub(super) last_source_time: Option<i64>,
+    /// 送り手の最後の `status`（任意、1 KiB まで）。
+    pub(super) sender_status: Option<String>,
+}
+
+/// [`IngestStatusEntry`] の送り手 1 つ。`transport` は `ws`（開いている WS、
+/// `connected_at` は開いた時刻）か `rest`（最後に受け付けた要求、`last_seen_at`）。
+#[derive(Debug, Serialize, ToSchema)]
+pub(super) struct IngestSenderStatusEntry {
+    pub(super) transport: String,
+    pub(super) api_key_name: String,
+    pub(super) peer: Option<String>,
+    pub(super) connected_at: Option<i64>,
+    pub(super) last_seen_at: Option<i64>,
+}
+
+impl From<crate::ingest::IngestConnectionStatus> for IngestStatusEntry {
+    fn from(status: crate::ingest::IngestConnectionStatus) -> Self {
+        Self {
+            connection_id: status.connection_id,
+            name: status.name,
+            enabled: status.enabled,
+            bridge: status.bridge,
+            link: if status.live { "live" } else { "down" }.to_string(),
+            link_detail: status.link_detail,
+            last_seen_at: status.last_seen_ms,
+            stale_timeout_ms: status.stale_timeout_ms,
+            collecting: status.collecting,
+            epoch: status.epoch,
+            held_values: status.held_values as u64,
+            senders: status
+                .senders
+                .into_iter()
+                .map(|sender| {
+                    let ws = sender.transport == crate::ingest::SenderTransport::Ws;
+                    IngestSenderStatusEntry {
+                        transport: sender.transport.as_str().to_string(),
+                        api_key_name: sender.sender.api_key_name,
+                        peer: sender.sender.peer,
+                        connected_at: ws.then_some(sender.sender.at_ms),
+                        last_seen_at: (!ws).then_some(sender.sender.at_ms),
+                    }
+                })
+                .collect(),
+            accepted: status.accepted,
+            rejected: status.rejected,
+            rate_limited: status.rate_limited,
+            too_many_items: status.too_many_items,
+            unknown_keys: status.unknown_keys,
+            last_source_time: status.last_source_time_ms,
+            sender_status: status.sender_status,
+        }
+    }
+}
+
 /// `GET /api/v1/status`の`sink.sidecar`（外部 DB 連携 S4、design §5.2・
 /// §5.5）。`crate::sink::status::SinkStatusSnapshot`のwire形。
 #[derive(Debug, Serialize, ToSchema)]
@@ -859,6 +950,9 @@ pub(crate) struct StatusResponse {
     /// 外部 DB 連携 S2（§4.2・§4.3）: DB Source の接続ごとの運転状態。
     /// `postgres` 接続が1つも無い通常構成では空配列。
     pub(super) db_source: Vec<DbSourceStatusEntry>,
+    /// 取り込み口 `push`（R2a-2e、docs/banto-hub-ingest-design.md §9）: `push`
+    /// 接続ごとの受信の状態。`push` 接続が無ければ空配列。
+    pub(super) ingest: Vec<IngestStatusEntry>,
     /// T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46「サーバー状態の
     /// 拡充」）: サーバー自身の CPU 使用率・メモリ使用量。
     /// `crate::system_info::SystemInfoSampler`のモジュール doc comment
@@ -1023,6 +1117,13 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
             .db_source_status()
             .into_iter()
             .map(DbSourceStatusEntry::from)
+            .collect(),
+        ingest: state
+            .manager
+            .ingest_hub()
+            .status()
+            .into_iter()
+            .map(IngestStatusEntry::from)
             .collect(),
         system: state.system_info.sample(),
         sink: state

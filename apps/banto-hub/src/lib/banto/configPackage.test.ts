@@ -3,10 +3,12 @@ import {
 	CONFIG_PACKAGE_EXCLUDED_SECRETS,
 	CONFIG_PACKAGE_PRODUCT,
 	CONFIG_PACKAGE_SCHEMA_VERSION,
+	INGEST_KEYS_NOT_MIGRATED_MESSAGE,
 	buildConfigPackage,
 	parseConfigPackage,
 	planByKey,
 	planByName,
+	resolvePushSettings,
 	serializeConfigPackage,
 	type ConfigPackage
 } from './configPackage';
@@ -920,5 +922,159 @@ describe('configPackage', () => {
 		expect(plan.create).toEqual([{ name: 'alpha' }, { name: 'gamma' }]);
 		expect(plan.update).toEqual([{ incoming: { name: 'beta' }, existing: { name: 'beta' } }]);
 		expect(plan.missing).toEqual(plan.create);
+	});
+});
+
+// R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: push 接続の `settings`
+// の往復。ブリッジの読む DB は id ではなく接続名（`dbConnectionName`）で持ち運ぶ。
+const PUSH_BRIDGE_CONNECTION: PlcConnection = {
+	...BASE_CONNECTION,
+	id: 12,
+	name: 'Bridge1',
+	protocol: 'push',
+	host: '',
+	port: 0,
+	settings: {
+		stale_timeout_ms: 5000,
+		bridge: {
+			kind: 'db',
+			db_connection_id: DB_CONNECTION.id,
+			queries: [
+				{
+					name: 'line1',
+					period_ms: 1000,
+					sql: 'SELECT temp, run FROM line1_now',
+					columns: [
+						{ column: 'temp', key: 'line1.temp' },
+						{ column: 'run', key: 'line1.run' }
+					]
+				}
+			]
+		}
+	}
+};
+
+const PUSH_PLAIN_CONNECTION: PlcConnection = {
+	...BASE_CONNECTION,
+	id: 13,
+	name: 'Script1',
+	protocol: 'push',
+	host: '',
+	port: 0,
+	settings: null
+};
+
+function makePushPackage(): ConfigPackage {
+	return buildConfigPackage({
+		// push 接続を postgres 接続より前に並べても export は名前で書ける。
+		plcConnections: [PUSH_BRIDGE_CONNECTION, PUSH_PLAIN_CONNECTION, DB_CONNECTION, BASE_CONNECTION],
+		collectionGroups: [],
+		tags: [],
+		mqtt: MQTT,
+		grpc: GRPC,
+		exportedAt: '2026-10-21T00:00:00.000Z'
+	});
+}
+
+describe('configPackage: R2a-2e push 接続の settings（dbConnectionName）', () => {
+	it('export はブリッジの db_connection_id を接続名に写し、既定のままの push は settings: {} を書く', () => {
+		const pkg = makePushPackage();
+		const bridge = pkg.plcConnections.find((c) => c.name === 'Bridge1');
+		expect(bridge?.settings).toEqual({
+			stale_timeout_ms: 5000,
+			bridge: {
+				kind: 'db',
+				dbConnectionName: 'pg-a',
+				queries: [
+					{
+						name: 'line1',
+						period_ms: 1000,
+						sql: 'SELECT temp, run FROM line1_now',
+						columns: [
+							{ column: 'temp', key: 'line1.temp' },
+							{ column: 'run', key: 'line1.run' }
+						]
+					}
+				]
+			}
+		});
+		expect(JSON.stringify(bridge)).not.toContain('db_connection_id');
+		expect(pkg.plcConnections.find((c) => c.name === 'Script1')?.settings).toEqual({});
+		// push 以外の接続は settings を書かない。
+		expect('settings' in pkg.plcConnections.find((c) => c.name === 'pg-a')!).toBe(false);
+		expect('settings' in pkg.plcConnections.find((c) => c.name === 'line-a')!).toBe(false);
+		// API キーは持ち運ばない（項目そのものが無い）。
+		expect(serializeConfigPackage(pkg)).not.toContain('ingest:#');
+	});
+
+	it('serializeConfigPackage と parseConfigPackage で往復できる', () => {
+		const pkg = makePushPackage();
+		expect(parseConfigPackage(serializeConfigPackage(pkg))).toEqual(pkg);
+	});
+
+	it('取り込み先の id に付け直す（resolvePushSettings）。名前を引けなければ null', () => {
+		const pkg = makePushPackage();
+		const settings = pkg.plcConnections.find((c) => c.name === 'Bridge1')!.settings!;
+		const resolved = resolvePushSettings(settings, (name) => (name === 'pg-a' ? 77 : undefined));
+		expect(resolved?.bridge?.db_connection_id).toBe(77);
+		expect(resolved?.stale_timeout_ms).toBe(5000);
+		expect(resolved?.bridge?.queries).toEqual(settings.bridge!.queries);
+		expect(resolvePushSettings(settings, () => undefined)).toBeNull();
+		// ブリッジの無い settings は名前を引かない。
+		expect(resolvePushSettings({}, () => undefined)).toEqual({});
+	});
+
+	it('export の時点でブリッジの読む接続を引けなければ断る（壊れた参照を書き出さない）', () => {
+		expect(() =>
+			buildConfigPackage({
+				plcConnections: [PUSH_BRIDGE_CONNECTION],
+				collectionGroups: [],
+				tags: [],
+				mqtt: MQTT,
+				grpc: GRPC
+			})
+		).toThrow(/Bridge1/);
+	});
+
+	it('parseConfigPackage はパッケージに無い接続・postgres でない接続を読むブリッジを断る', () => {
+		const pkg = makePushPackage();
+		const missing = structuredClone(pkg);
+		missing.plcConnections = missing.plcConnections.filter((c) => c.name !== 'pg-a');
+		expect(() => parseConfigPackage(serializeConfigPackage(missing))).toThrow(
+			/settings\.bridge\.dbConnectionName.*pg-a/
+		);
+		const notPg = structuredClone(pkg);
+		notPg.plcConnections.find((c) => c.name === 'Bridge1')!.settings!.bridge!.dbConnectionName =
+			'line-a';
+		expect(() => parseConfigPackage(serializeConfigPackage(notPg))).toThrow(/postgres/);
+	});
+
+	it('parseConfigPackage は push 以外の settings と、形の崩れた settings を断る', () => {
+		const pkg = makePushPackage();
+		const onModbus = JSON.parse(serializeConfigPackage(pkg));
+		onModbus.plcConnections.find((c: { name: string }) => c.name === 'line-a').settings = {};
+		expect(() => parseConfigPackage(JSON.stringify(onModbus))).toThrow(/push 接続でだけ/);
+		const badKind = JSON.parse(serializeConfigPackage(pkg));
+		badKind.plcConnections.find(
+			(c: { name: string }) => c.name === 'Bridge1'
+		).settings.bridge.kind = 'mqtt';
+		expect(() => parseConfigPackage(JSON.stringify(badKind))).toThrow(/bridge\.kind/);
+		const noColumns = JSON.parse(serializeConfigPackage(pkg));
+		delete noColumns.plcConnections.find((c: { name: string }) => c.name === 'Bridge1').settings
+			.bridge.queries[0].columns;
+		expect(() => parseConfigPackage(JSON.stringify(noColumns))).toThrow(/columns/);
+	});
+
+	it('settings を持たない push 接続（手で書いたパッケージ）は既定（{}）として読む', () => {
+		const raw = JSON.parse(serializeConfigPackage(makePushPackage()));
+		delete raw.plcConnections.find((c: { name: string }) => c.name === 'Script1').settings;
+		expect(
+			parseConfigPackage(JSON.stringify(raw)).plcConnections.find((c) => c.name === 'Script1')
+				?.settings
+		).toEqual({});
+	});
+
+	it('案内の見出しは「取り込みのキーは移りません」', () => {
+		expect(INGEST_KEYS_NOT_MIGRATED_MESSAGE).toBe('取り込みのキーは移りません');
 	});
 });

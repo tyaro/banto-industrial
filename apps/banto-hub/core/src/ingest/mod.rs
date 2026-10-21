@@ -59,7 +59,9 @@
 //!   持ったまま WS の登録を取る経路は無い（`open_ws_session` は保持値を読み終えてから
 //!   登録を取り、`commit` は保持値と登録を別々に取る）。上限・監査の抑制（slot の
 //!   未知のキー、`IngestHub` の `key_denials`）・送り手の `status` の `Mutex` は
-//!   末端で、他のロックを中で取らない（`key_denials` は外側のロックも持たずに取る）。
+//!   末端で、他のロックを中で取らない（REST の最後の送り手 `rest_sender` も末端で、
+//!   `apply_rest` が反映の順序と揃うよう保持値の書き込みロックの中で取る。逆に
+//!   `rest_sender` を持ったまま他のロックを取る経路は無い）（`key_denials` は外側のロックも持たずに取る）。
 //!   どれも `.await` をまたいで持たない（同期の区間だけ）。`apply` は接続のロックを
 //!   持つ間ずっと外側の読み取りも持つので、
 //!   `commit` が接続の設定（登録済みのキー・送る集合）を入れ替える瞬間に、古い
@@ -109,6 +111,18 @@
 //! - 再検証（`crate::stream::Revalidator`）は WS 1 本ごとのタイマーで、登録には触れ
 //!   ない。失効で閉じる古い WS と、それを置き換える新しい WS が競っても、古い方の
 //!   `Drop` は自分の番号しか外さない。
+//!
+//! ## 状態の表示（§9、R2a-2e）
+//!
+//! [`IngestHub::status`] が `GET /api/status`・`GET /api/v1/status` の `ingest` 節の元
+//! （[`IngestConnectionStatus`]）を返す。**資格情報と値は載せない**: 送り手は API キーの
+//! **名前**と接続元（`IP:port`）と時刻だけ（キーの値・ハッシュ・id は持たない）、
+//! 保持値は数（`held_values`）だけ。受け付けた件数・断った件数・上限で断った
+//! メッセージの数・直近の未知のキー（20 件まで、制御文字を落として
+//! [`banto_tags::MAX_PUSH_KEY_LEN`] 文字に切り詰めたもの）・受けた `t` の最大・送り手の
+//! 最後の `status`（WS が制御文字を落として 1 KiB に切り詰めたもの）を持つ。数は
+//! Hub の起動からで、commit・収集の遷移では消えない（接続の削除で slot と一緒に
+//! 消える）。
 
 pub mod audit;
 pub mod auth;
@@ -120,7 +134,7 @@ pub mod ws;
 
 pub use validate::validate_item;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -129,8 +143,8 @@ use banto_collect::{
     ExternalSnapshot, ExternalSource, PushSource, RegistrySnapshot,
 };
 use banto_tags::{
-    validate_push_key, validate_push_settings, DEFAULT_STALE_TIMEOUT_MS, PLC_TAG_KIND,
-    PUSH_PROTOCOL,
+    validate_push_key, validate_push_settings, DEFAULT_STALE_TIMEOUT_MS, MAX_PUSH_KEY_LEN,
+    PLC_TAG_KIND, PUSH_PROTOCOL,
 };
 use banto_tstore::Clock;
 use serde::{Deserialize, Deserializer};
@@ -347,6 +361,97 @@ impl Drop for WsSession {
 struct WsEntry {
     id: u64,
     end: oneshot::Sender<WsEnd>,
+    /// 状態の表示の `senders`（R2a-2e）。`connected_at` は開いた時刻。
+    sender: Option<IngestSender>,
+}
+
+/// 送り手 1 つの控え（§9 の `senders`、R2a-2e）。**資格情報は持たない**: API キーは
+/// 名前だけ（値・ハッシュ・id は持たない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestSender {
+    /// 送り手の API キーの名前（表示用）。
+    pub api_key_name: String,
+    /// 接続元（`IP:port`）。分からなければ `None`。
+    pub peer: Option<String>,
+    /// WS は開いた時刻、REST は最後に受け付けた要求の時刻（epoch ms）。
+    pub at_ms: i64,
+}
+
+/// 送り手の経路（§9 の `senders[].transport`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderTransport {
+    /// WebSocket（開いている 1 本）。
+    Ws,
+    /// REST の一括送信（最後に受け付けた要求）。
+    Rest,
+}
+
+impl SenderTransport {
+    /// wire の綴り。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ws => "ws",
+            Self::Rest => "rest",
+        }
+    }
+}
+
+/// 状態の表示の送り手 1 つ（[`IngestConnectionStatus::senders`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestSenderStatus {
+    pub transport: SenderTransport,
+    pub sender: IngestSender,
+}
+
+/// 状態の表示の直近の未知のキーの数（§9「直近の 20 件まで」）。
+pub const STATUS_UNKNOWN_KEYS: usize = 20;
+
+/// `push` 接続 1 つの状態（§9 の `ingest` 節の 1 件、R2a-2e）。資格情報と値は
+/// 載せない（モジュールの doc「状態の表示」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IngestConnectionStatus {
+    pub connection_id: i64,
+    /// 今の接続名（表示用。束縛は id）。
+    pub name: String,
+    pub enabled: bool,
+    /// `settings.bridge` があるか（DB ブリッジの接続）。
+    pub bridge: bool,
+    /// §4.3 の Live か。
+    pub live: bool,
+    /// Down の理由（`link_state` の文。資格情報・アドレスを含まない）。Live なら `None`。
+    pub link_detail: Option<String>,
+    /// 受け付けた最後の通信（値・`ping`・`status`）の時刻。
+    pub last_seen_ms: Option<i64>,
+    pub stale_timeout_ms: u64,
+    pub collecting: bool,
+    pub epoch: u64,
+    /// 保持している値の数（値そのものは載せない）。
+    pub held_values: usize,
+    /// 開いている WS（0 か 1）と、最後に受け付けた REST の送り手。
+    pub senders: Vec<IngestSenderStatus>,
+    /// 受け付けた件数（Hub の起動から）。
+    pub accepted: u64,
+    /// 件ごとに断った件数（§6.3）。
+    pub rejected: u64,
+    /// 頻度の上限で断ったメッセージの数（429 / `rate_limited`）。
+    pub rate_limited: u64,
+    /// 件数の上限で断ったメッセージの数（422 / `too_many_items`）。
+    pub too_many_items: u64,
+    /// 直近の未知のキー（新しい順、[`STATUS_UNKNOWN_KEYS`] 件まで、重複なし）。
+    pub unknown_keys: Vec<String>,
+    /// 受け付けた件の `t` の最大（任意、epoch ms）。
+    pub last_source_time_ms: Option<i64>,
+    /// 送り手の最後の `status`（制御文字を落として 1 KiB に切り詰めたもの）。
+    pub sender_status: Option<String>,
+}
+
+/// 状態の表示の未知のキー 1 つ: 制御文字を落とし、[`MAX_PUSH_KEY_LEN`] 文字に切り詰める
+/// （未知のキーは登録の検証を通っていない送り手の文字列なので）。
+fn status_key(key: &str) -> String {
+    key.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_PUSH_KEY_LEN)
+        .collect()
 }
 
 /// 1 つの `push` 接続の今の様子（送信口の `welcome` と状態表示、テスト用）。
@@ -526,6 +631,30 @@ struct Held {
     values: HashMap<String, ExternalReading>,
     /// 受け付けた最後の通信（値・ping）の時刻。
     last_seen_ms: Option<i64>,
+    /// 状態の表示の数（R2a-2e）。保持値と違い、遷移・commit では消さない。
+    stats: HeldStats,
+}
+
+/// 状態の表示の数（[`IngestConnectionStatus`]）。`apply` が保持値と同じロックの中で
+/// 数える。
+#[derive(Debug, Default)]
+struct HeldStats {
+    accepted: u64,
+    rejected: u64,
+    /// 新しいものが前（重複なし、[`STATUS_UNKNOWN_KEYS`] 件まで）。
+    unknown_keys: VecDeque<String>,
+    last_source_time_ms: Option<i64>,
+}
+
+impl HeldStats {
+    fn note_unknown_key(&mut self, key: &str) {
+        let key = status_key(key);
+        if let Some(pos) = self.unknown_keys.iter().position(|k| *k == key) {
+            self.unknown_keys.remove(pos);
+        }
+        self.unknown_keys.push_front(key);
+        self.unknown_keys.truncate(STATUS_UNKNOWN_KEYS);
+    }
 }
 
 /// commit をまたいで引き継ぐ部分。
@@ -546,6 +675,12 @@ struct SlotShared {
     /// 送り手の最後の `status`（§6.1、制御文字を落として 1 KiB に切り詰めたもの）。
     /// 状態の表示（R2a-2e）が読む。
     sender_status: Mutex<Option<String>>,
+    /// 最後に受け付けた REST の送り手（状態の表示、R2a-2e）。
+    rest_sender: Mutex<Option<IngestSender>>,
+    /// 頻度の上限で断ったメッセージの数（状態の表示）。
+    rate_limited: AtomicU64,
+    /// 件数の上限で断ったメッセージの数（状態の表示）。
+    too_many_items: AtomicU64,
 }
 
 impl SlotShared {
@@ -560,12 +695,16 @@ impl SlotShared {
                 epoch: 1,
                 values: HashMap::new(),
                 last_seen_ms: None,
+                stats: HeldStats::default(),
             }),
             state,
             limiter: Mutex::new(limits::ConnectionLimiter::new(limits::PUSH_LIMITS)),
             unknown_keys: Mutex::new(audit::UnknownKeyThrottle::default()),
             ws: Mutex::new(None),
             sender_status: Mutex::new(None),
+            rest_sender: Mutex::new(None),
+            rate_limited: AtomicU64::new(0),
+            too_many_items: AtomicU64::new(0),
         }
     }
 
@@ -862,7 +1001,30 @@ impl IngestHub {
         items: &[IngestItem],
         now_ms: i64,
     ) -> ApplyOutcome {
-        self.apply_inner(conn_id, None, message_epoch, items, now_ms)
+        self.apply_inner(conn_id, None, message_epoch, items, now_ms, None)
+            .map_err(|refusal| match refusal {
+                WsRefusal::Refused(refusal) => refusal,
+                // 番号を渡さないので起きない。
+                WsRefusal::NotCurrent => ApplyRefusal::UnknownConnection,
+            })
+    }
+
+    /// REST（R2a-2c）の `values`: [`Self::apply`] と同じ判定・反映に加えて、受け付けた
+    /// ときだけ状態の表示の送り手（R2a-2e）を、**反映と同じ保持値の書き込みロックの
+    /// 中で**控える。反映と送り手の記録を別々のロック区間にすると、並行する 2 つの要求が
+    /// 反映 A → 反映 B → 記録 B → 記録 A と交錯して、最後に受け付けたのは B なのに
+    /// 「最後の送り手」が A になる。保持値のロックが反映の順序を決めるので、その中で
+    /// 記録すれば最後の送り手は常に最後に反映した要求になる。断ったとき（接続なし・
+    /// 無効・epoch 不一致）は記録しない。
+    pub fn apply_rest(
+        &self,
+        conn_id: i64,
+        message_epoch: Option<u64>,
+        items: &[IngestItem],
+        now_ms: i64,
+        sender: IngestSender,
+    ) -> ApplyOutcome {
+        self.apply_inner(conn_id, None, message_epoch, items, now_ms, Some(sender))
             .map_err(|refusal| match refusal {
                 WsRefusal::Refused(refusal) => refusal,
                 // 番号を渡さないので起きない。
@@ -886,9 +1048,12 @@ impl IngestHub {
             message_epoch,
             items,
             now_ms,
+            None,
         )
     }
 
+    /// `rest_sender` が `Some` なら、受け付けた時点（epoch の照合を通った後）に保持値の
+    /// 書き込みロックの中で `SlotShared::rest_sender` を置き換える（[`Self::apply_rest`]）。
     fn apply_inner(
         &self,
         conn_id: i64,
@@ -896,6 +1061,7 @@ impl IngestHub {
         message_epoch: Option<u64>,
         items: &[IngestItem],
         now_ms: i64,
+        rest_sender: Option<IngestSender>,
     ) -> Result<ApplyAck, WsRefusal> {
         let inner = read(&self.inner);
         let slot = inner
@@ -918,15 +1084,24 @@ impl IngestHub {
             }));
         }
         held.last_seen_ms = Some(now_ms);
+        // 送り手の記録は反映と同じ保持値のロックの中（`apply_rest` の doc）。末端の
+        // `Mutex` を保持値を持ったまま取る（保持値 → 末端。逆順に取る経路は無い）。
+        if let Some(sender) = rest_sender {
+            *lock(&slot.shared.rest_sender) = Some(sender);
+        }
 
         let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
         let mut accepted = 0;
         let mut rejected = Vec::new();
+        let mut max_source_time: Option<i64> = None;
         for (index, item) in items.iter().enumerate() {
             match judge_item(&slot.config, &mut seen, item) {
                 Ok(reading) => {
                     held.values.insert(item.key.clone(), reading);
                     accepted += 1;
+                    if let Some(t) = item.t.as_ref().and_then(Value::as_i64) {
+                        max_source_time = Some(max_source_time.map_or(t, |m| m.max(t)));
+                    }
                 }
                 Err(code) => rejected.push(ItemRejection {
                     index,
@@ -934,6 +1109,18 @@ impl IngestHub {
                     code,
                 }),
             }
+        }
+        // 状態の表示の数（R2a-2e）。同じロックの中なので、数と保持値がずれない。
+        let stats = &mut held.stats;
+        stats.accepted = stats.accepted.saturating_add(accepted as u64);
+        stats.rejected = stats.rejected.saturating_add(rejected.len() as u64);
+        for rejection in &rejected {
+            if rejection.code == RejectCode::UnknownKey {
+                stats.note_unknown_key(&rejection.key);
+            }
+        }
+        if let Some(t) = max_source_time {
+            stats.last_source_time_ms = Some(stats.last_source_time_ms.map_or(t, |m| m.max(t)));
         }
         Ok(ApplyAck {
             accepted,
@@ -998,6 +1185,16 @@ impl IngestHub {
         &self,
         conn_id: i64,
     ) -> Result<(WsSession, IngestConnectionInfo), ApplyRefusal> {
+        self.open_ws_session_from(conn_id, None)
+    }
+
+    /// [`Self::open_ws_session`] に、状態の表示に出す送り手（API キーの名前・接続元・
+    /// 開いた時刻、R2a-2e）を添える。WS の送信口（[`ws`]）はこちらを使う。
+    pub fn open_ws_session_from(
+        &self,
+        conn_id: i64,
+        sender: Option<IngestSender>,
+    ) -> Result<(WsSession, IngestConnectionInfo), ApplyRefusal> {
         let inner = read(&self.inner);
         let slot = inner
             .slots
@@ -1023,7 +1220,7 @@ impl IngestHub {
         };
         let id = self.next_ws_id.fetch_add(1, Ordering::Relaxed);
         let (end, ended) = oneshot::channel();
-        let previous = lock(&slot.shared.ws).replace(WsEntry { id, end });
+        let previous = lock(&slot.shared.ws).replace(WsEntry { id, end, sender });
         if let Some(previous) = previous {
             let _ = previous.end.send(WsEnd::Superseded);
         }
@@ -1075,7 +1272,76 @@ impl IngestHub {
             return Err(ApplyRefusal::ConnectionDisabled);
         }
         let admission = lock(&slot.shared.limiter).admit(item_count, now_ms);
+        if let Err(limit) = &admission.outcome {
+            let counter = match limit.kind {
+                limits::LimitKind::TooManyItems => &slot.shared.too_many_items,
+                limits::LimitKind::MessageRate | limits::LimitKind::ItemRate => {
+                    &slot.shared.rate_limited
+                }
+            };
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(admission)
+    }
+
+    /// 全 `push` 接続の状態（§9 の `ingest` 節、R2a-2e）。接続 id の昇順。資格情報と
+    /// 値は載せない（モジュールの doc「状態の表示」）。ロックは接続ごとに読み取りで
+    /// 短く取るだけ（`snapshot` と同じ）。
+    pub fn status(&self) -> Vec<IngestConnectionStatus> {
+        let now_ms = self.clock.now_ms();
+        let inner = read(&self.inner);
+        let mut ids: Vec<i64> = inner.slots.keys().copied().collect();
+        ids.sort_unstable();
+        ids.into_iter()
+            .filter_map(|id| inner.slots.get(&id).map(|slot| (id, slot)))
+            .map(|(id, slot)| {
+                // 順序: 外側 → WS の登録 → 保持値（モジュールの doc「ロックの形」）。
+                let mut senders = Vec::new();
+                if let Some(sender) = lock(&slot.shared.ws)
+                    .as_ref()
+                    .and_then(|entry| entry.sender.clone())
+                {
+                    senders.push(IngestSenderStatus {
+                        transport: SenderTransport::Ws,
+                        sender,
+                    });
+                }
+                if let Some(sender) = lock(&slot.shared.rest_sender).clone() {
+                    senders.push(IngestSenderStatus {
+                        transport: SenderTransport::Rest,
+                        sender,
+                    });
+                }
+                let sender_status = lock(&slot.shared.sender_status).clone();
+                let held = read(&slot.shared.held);
+                let (live, link_detail) =
+                    match link_state(held.last_seen_ms, slot.config.stale_timeout_ms, now_ms) {
+                        ExternalLink::Live => (true, None),
+                        ExternalLink::Down { detail } => (false, detail),
+                    };
+                IngestConnectionStatus {
+                    connection_id: id,
+                    name: slot.config.name.clone(),
+                    enabled: slot.config.enabled,
+                    bridge: slot.config.bridge.is_some(),
+                    live,
+                    link_detail,
+                    last_seen_ms: held.last_seen_ms,
+                    stale_timeout_ms: slot.config.stale_timeout_ms,
+                    collecting: inner.collecting,
+                    epoch: held.epoch,
+                    held_values: held.values.len(),
+                    senders,
+                    accepted: held.stats.accepted,
+                    rejected: held.stats.rejected,
+                    rate_limited: slot.shared.rate_limited.load(Ordering::Relaxed),
+                    too_many_items: slot.shared.too_many_items.load(Ordering::Relaxed),
+                    unknown_keys: held.stats.unknown_keys.iter().cloned().collect(),
+                    last_source_time_ms: held.stats.last_source_time_ms,
+                    sender_status,
+                }
+            })
+            .collect()
     }
 
     /// 未知のキー（`apply` が `unknown_key` で断ったもの）の監査の間引き（§8）。
@@ -1200,5 +1466,7 @@ impl ExternalSource for IngestHub {
 #[cfg(test)]
 use banto_collect::ExternalQuality;
 
+#[cfg(test)]
+mod bridge_load_fixtures;
 #[cfg(test)]
 mod tests;

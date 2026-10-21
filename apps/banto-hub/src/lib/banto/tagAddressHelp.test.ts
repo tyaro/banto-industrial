@@ -130,3 +130,19 @@ describe('addressHelpFor: protocol 未選択（グループ未選択）', () => 
 		expect(addressHelpFor(undefined, 'f32').examples).toEqual([]);
 	});
 });
+
+describe('addressHelpFor: push（R2a-2e、送り手が決めるキー）', () => {
+	it('PLC アドレスではなくキーの説明を出し、PLC の例を混ぜない', () => {
+		const help = addressHelpFor('push', 'f32');
+		expect(help.placeholder).toContain('line1.temp');
+		expect(help.deviceHint).toContain('送り手');
+		expect(help.deviceHint).toContain('大文字小文字を区別');
+		expect(help.examples.map((e) => e.address)).toEqual(['line1.temp', 'Line1/Temp']);
+		expect(help.examples.some((e) => e.address === 'D100' || e.address === '40001')).toBe(false);
+		expect(help.occupancyHint).toContain('スケーリング');
+	});
+
+	it('string 型は使えないことを出す', () => {
+		expect(addressHelpFor('push', 'string').occupancyHint).toContain('string 型は使えません');
+	});
+});

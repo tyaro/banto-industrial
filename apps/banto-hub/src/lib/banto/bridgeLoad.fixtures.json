@@ -1,0 +1,616 @@
+{
+  "description": "R2a-2e（docs/banto-hub-ingest-design.md §7.1）: ブリッジの送る量の見積もり bridge_load の表。Rust（apps/banto-hub/core/src/ingest/bridge_load_fixtures.rs が banto_tags::bridge_load に掛ける）と TS（bridgeLoad.test.ts が bridgeLoad.ts に掛ける）が同じ expected を出すことを確かめる。keys は配列（そのままのキー）か { count, template（{i} を 0 始まりの番号に置き換える）, padStart・padChar（左を埋める）, repeat・times（1 文字を times 回）}。expected は Rust の UPDATE_BRIDGE_LOAD_FIXTURES=1 で作り直せる",
+  "cases": [
+    {
+      "name": "1,000 件は 1 メッセージ",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 1000,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1000,
+            "itemBytes": 99890,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 60,
+        "itemsPerMinute": 60000,
+        "messagesPerSecText": "1",
+        "itemsPerSecText": "1,000",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "1,001 件は 2 メッセージ",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 1001,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1001,
+            "itemBytes": 99991,
+            "messagesPerCycle": 2
+          }
+        ],
+        "messagesPerMinute": 120,
+        "itemsPerMinute": 60060,
+        "messagesPerSecText": "2",
+        "itemsPerSecText": "1,001",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "200 バイトのキー × 1,000 件はバイト数で 2 メッセージに分かれる",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 1000,
+            "template": "{i}",
+            "padStart": 200,
+            "padChar": "0"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1000,
+            "itemBytes": 296000,
+            "messagesPerCycle": 2
+          }
+        ],
+        "messagesPerMinute": 120,
+        "itemsPerMinute": 60000,
+        "messagesPerSecText": "2",
+        "itemsPerSecText": "1,000",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "バイト数の境界ちょうど（261,024 バイトのキー 1 件）は 1 メッセージ",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 1,
+            "repeat": "x",
+            "times": 261024
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 261120,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 60,
+        "itemsPerMinute": 60,
+        "messagesPerSecText": "1",
+        "itemsPerSecText": "1",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "バイト数の境界を 1 バイト超えると 2 メッセージ",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 1,
+            "repeat": "x",
+            "times": 261025
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 261121,
+            "messagesPerCycle": 2
+          }
+        ],
+        "messagesPerMinute": 120,
+        "itemsPerMinute": 60,
+        "messagesPerSecText": "2",
+        "itemsPerSecText": "1",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "マルチバイトのキーは UTF-8 のバイト数で数える",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": ["温度", "line1/温度 1"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 2,
+            "itemBytes": 212,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 60,
+        "itemsPerMinute": 120,
+        "messagesPerSecText": "1",
+        "itemsPerSecText": "2",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "16 メッセージ/秒ちょうどは通る（100 ms + 200 ms + 1000 ms）",
+      "queries": [
+        {
+          "periodMs": 100,
+          "keys": ["a"]
+        },
+        {
+          "periodMs": 200,
+          "keys": ["b"]
+        },
+        {
+          "periodMs": 1000,
+          "keys": ["c"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 960,
+        "itemsPerMinute": 960,
+        "messagesPerSecText": "16",
+        "itemsPerSecText": "16",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "17 メッセージ/秒は上限を超える",
+      "queries": [
+        {
+          "periodMs": 100,
+          "keys": ["a"]
+        },
+        {
+          "periodMs": 200,
+          "keys": ["b"]
+        },
+        {
+          "periodMs": 1000,
+          "keys": ["c"]
+        },
+        {
+          "periodMs": 1000,
+          "keys": ["d"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 1020,
+        "itemsPerMinute": 1020,
+        "messagesPerSecText": "17",
+        "itemsPerSecText": "17",
+        "withinLimit": false,
+        "message": "この設定は 1 秒あたり約 17 メッセージ・17 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください"
+      }
+    },
+    {
+      "name": "4,000 件/秒ちょうどは通る（1000 ms × 4,000 件）",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 4000,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 4000,
+            "itemBytes": 402890,
+            "messagesPerCycle": 4
+          }
+        ],
+        "messagesPerMinute": 240,
+        "itemsPerMinute": 240000,
+        "messagesPerSecText": "4",
+        "itemsPerSecText": "4,000",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "4,001 件/秒は上限を超える",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": {
+            "count": 4001,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 4001,
+            "itemBytes": 402991,
+            "messagesPerCycle": 5
+          }
+        ],
+        "messagesPerMinute": 300,
+        "itemsPerMinute": 240060,
+        "messagesPerSecText": "5",
+        "itemsPerSecText": "4,001",
+        "withinLimit": false,
+        "message": "この設定は 1 秒あたり約 5 メッセージ・4,001 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください"
+      }
+    },
+    {
+      "name": "100 ms × 400 件は通る",
+      "queries": [
+        {
+          "periodMs": 100,
+          "keys": {
+            "count": 400,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 400,
+            "itemBytes": 39890,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 600,
+        "itemsPerMinute": 240000,
+        "messagesPerSecText": "10",
+        "itemsPerSecText": "4,000",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "100 ms × 401 件は上限を超える",
+      "queries": [
+        {
+          "periodMs": 100,
+          "keys": {
+            "count": 401,
+            "template": "k{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 401,
+            "itemBytes": 39990,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 600,
+        "itemsPerMinute": 240600,
+        "messagesPerSecText": "10",
+        "itemsPerSecText": "4,010",
+        "withinLimit": false,
+        "message": "この設定は 1 秒あたり約 10 メッセージ・4,010 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください"
+      }
+    },
+    {
+      "name": "100 ms のクエリ 3 本（30 メッセージ/秒）は上限を超える",
+      "queries": [
+        {
+          "periodMs": 100,
+          "keys": ["a"]
+        },
+        {
+          "periodMs": 100,
+          "keys": ["b"]
+        },
+        {
+          "periodMs": 100,
+          "keys": ["c"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 1800,
+        "itemsPerMinute": 1800,
+        "messagesPerSecText": "30",
+        "itemsPerSecText": "30",
+        "withinLimit": false,
+        "message": "この設定は 1 秒あたり約 30 メッセージ・30 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください"
+      }
+    },
+    {
+      "name": "200 ms のクエリ 3 本（15 メッセージ/秒）は通る",
+      "queries": [
+        {
+          "periodMs": 200,
+          "keys": ["a"]
+        },
+        {
+          "periodMs": 200,
+          "keys": ["b"]
+        },
+        {
+          "periodMs": 200,
+          "keys": ["c"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 1,
+            "itemBytes": 97,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 900,
+        "itemsPerMinute": 900,
+        "messagesPerSecText": "15",
+        "itemsPerSecText": "15",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "60,000 ms の周期は 1 秒あたり 0.1 と書く",
+      "queries": [
+        {
+          "periodMs": 60000,
+          "keys": ["slow"]
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1,
+            "itemBytes": 100,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 1,
+        "itemsPerMinute": 1,
+        "messagesPerSecText": "0.1",
+        "itemsPerSecText": "0.1",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "§10.4 の 9: 500 ms のクエリ 3 本（1,800 件・100 件・100 件）は 8 割の上限ちょうどで通る",
+      "queries": [
+        {
+          "periodMs": 500,
+          "keys": {
+            "count": 1800,
+            "template": "a{i}"
+          }
+        },
+        {
+          "periodMs": 500,
+          "keys": {
+            "count": 100,
+            "template": "b{i}"
+          }
+        },
+        {
+          "periodMs": 500,
+          "keys": {
+            "count": 100,
+            "template": "c{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1800,
+            "itemBytes": 180690,
+            "messagesPerCycle": 2
+          },
+          {
+            "items": 100,
+            "itemBytes": 9890,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 100,
+            "itemBytes": 9890,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 480,
+        "itemsPerMinute": 240000,
+        "messagesPerSecText": "8",
+        "itemsPerSecText": "4,000",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "§10.4 の 9: 同じ構成で A だけ 200 ms にすると上限を超える",
+      "queries": [
+        {
+          "periodMs": 200,
+          "keys": {
+            "count": 1800,
+            "template": "a{i}"
+          }
+        },
+        {
+          "periodMs": 500,
+          "keys": {
+            "count": 100,
+            "template": "b{i}"
+          }
+        },
+        {
+          "periodMs": 500,
+          "keys": {
+            "count": 100,
+            "template": "c{i}"
+          }
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 1800,
+            "itemBytes": 180690,
+            "messagesPerCycle": 2
+          },
+          {
+            "items": 100,
+            "itemBytes": 9890,
+            "messagesPerCycle": 1
+          },
+          {
+            "items": 100,
+            "itemBytes": 9890,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 840,
+        "itemsPerMinute": 564000,
+        "messagesPerSecText": "14",
+        "itemsPerSecText": "9,400",
+        "withinLimit": false,
+        "message": "この設定は 1 秒あたり約 14 メッセージ・9,400 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください"
+      }
+    },
+    {
+      "name": "列の対応が無いクエリは 0 件・1 メッセージ",
+      "queries": [
+        {
+          "periodMs": 1000,
+          "keys": []
+        }
+      ],
+      "expected": {
+        "queries": [
+          {
+            "items": 0,
+            "itemBytes": 0,
+            "messagesPerCycle": 1
+          }
+        ],
+        "messagesPerMinute": 60,
+        "itemsPerMinute": 0,
+        "messagesPerSecText": "1",
+        "itemsPerSecText": "0",
+        "withinLimit": true,
+        "message": null
+      }
+    },
+    {
+      "name": "クエリが無いブリッジは 0",
+      "queries": [],
+      "expected": {
+        "queries": [],
+        "messagesPerMinute": 0,
+        "itemsPerMinute": 0,
+        "messagesPerSecText": "0",
+        "itemsPerSecText": "0",
+        "withinLimit": true,
+        "message": null
+      }
+    }
+  ]
+}

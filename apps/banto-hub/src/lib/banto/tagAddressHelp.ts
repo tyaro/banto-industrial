@@ -2,7 +2,7 @@
  * T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
  * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-6 / TAG-UX-B）: `tags/+page.svelte`
  * の単票 create/edit フォーム（`tagFields` スニペット）のアドレス欄が、
- * 選択中の接続プロトコル（`slmp` / `modbus-tcp` / `virtual`）に応じて
+ * 選択中の接続プロトコル（`slmp` / `modbus-tcp` / `virtual`、R2a-2e で `push`）に応じて
  * 「アドレス例」「対応デバイス／占有範囲」「bit 指定可否」を切り替えるための
  * 依存ゼロの純関数・定数モジュール。`tagFormLayout.ts` と同じ方針 -
  * Svelte 側は `connectionForGroupId(form.collectionGroupId)?.protocol` と
@@ -136,6 +136,32 @@ const MODBUS_BIT_HINT =
 const VIRTUAL_BIT_HINT = '該当なし（PLC アドレスを使わないため）。';
 
 /**
+ * R2a-2e（docs/banto-hub-ingest-design.md §3.3）: `push` 接続のタグの `address` は
+ * PLC アドレスではなく、**送り手が決めるキー**（送り手が値に付けて送る文字列）。
+ * 規則は `banto_tags::validate_push_key`（前後の空白を除いて保存、1〜256 文字、
+ * 制御文字なし、大文字小文字を区別）と、`push_tag_errors`（同じ接続の中で一意、
+ * `string` 不可、書き込み不可、スケーリングなし）。
+ */
+const PUSH_EXAMPLES: AddressExample[] = [
+	{ address: 'line1.temp', description: '送り手が付けるキー（例: DB ブリッジの列の対応）' },
+	{ address: 'Line1/Temp', description: '大文字小文字を区別します' }
+];
+
+const PUSH_DEVICE_HINT =
+	'push 接続のタグのアドレスは、送り手（DB ブリッジ・スクリプト）が値に付けて送るキーです' +
+	'（1〜256 文字、前後の空白は除いて保存、大文字小文字を区別）。同じ接続の中では一意にしてください。' +
+	'送り手が登録の無いキーで送った値は受け付けられず、状態の「未知のキー」に出ます。';
+
+function pushOccupancyHint(kind: OccupancyKind): string {
+	return kind === 'string'
+		? 'push のタグに string 型は使えません（数値と bit だけ）。'
+		: '送り手は工学値をそのまま送ります（スケーリングは使えません）。書き込みはできません。';
+}
+
+const PUSH_BIT_HINT =
+	'該当なし（ビット指定はありません）。bit 型のタグには 0 / 1 / true / false を送ります。';
+
+/**
  * 接続が未選択（`protocol === undefined`）のときの汎用ヒント。TAG-UX-B の
  * 入力順（種別→接続／グループ→名前→アドレス→型）どおりならアドレス欄に
  * 到達する時点でプロトコルは確定しているはずだが、フォームは自由な順で
@@ -179,6 +205,14 @@ export function addressHelpFor(
 				deviceHint: MODBUS_DEVICE_HINT,
 				occupancyHint: modbusOccupancyHint(kind),
 				bitHint: MODBUS_BIT_HINT
+			};
+		case 'push':
+			return {
+				placeholder: 'line1.temp（送り手が付けるキー）',
+				examples: PUSH_EXAMPLES,
+				deviceHint: PUSH_DEVICE_HINT,
+				occupancyHint: pushOccupancyHint(kind),
+				bitHint: PUSH_BIT_HINT
 			};
 		case 'virtual':
 			return {

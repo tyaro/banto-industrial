@@ -165,7 +165,7 @@ use super::auth::{require_ingest_auth, IngestAuthState, IngestCaller};
 use super::limits::PUSH_LIMITS;
 use super::rest::IngestRejectedItem;
 use super::validate::{parse_values_message, MessageError};
-use super::{ApplyRefusal, IngestHub, RejectCode, WsEnd, WsRefusal, WsSession};
+use super::{ApplyRefusal, IngestHub, IngestSender, RejectCode, WsEnd, WsRefusal, WsSession};
 
 /// WebSocket の送信口のパス。
 pub const STREAM_PATH: &str = "/api/v1/ingest/{id}/stream";
@@ -423,7 +423,16 @@ async fn run_socket(
     let mut writer = tokio::spawn(writer_task(sink, data_rx, close_rx));
     let outbound = Outbound { data_tx };
 
-    let (end, conn) = match state.ingest.open_ws_session(caller.connection_id) {
+    // 状態の表示の送り手（R2a-2e）: キーは名前だけ（値・ハッシュは載せない）。
+    let sender = IngestSender {
+        api_key_name: caller.key.name.clone(),
+        peer: caller.peer.clone(),
+        at_ms: state.clock.now_ms(),
+    };
+    let (end, conn) = match state
+        .ingest
+        .open_ws_session_from(caller.connection_id, Some(sender))
+    {
         Ok((session, info)) => {
             let ctx = IngestAuditContext {
                 // 登録した時点の名前を控える（認証の層の後に改名されていても今の名前）。

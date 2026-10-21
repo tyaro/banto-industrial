@@ -416,6 +416,168 @@
         ],
         "type": "object"
       },
+      "IngestSenderStatusEntry": {
+        "description": "[`IngestStatusEntry`] の送り手 1 つ。`transport` は `ws`（開いている WS、\n`connected_at` は開いた時刻）か `rest`（最後に受け付けた要求、`last_seen_at`）。",
+        "properties": {
+          "api_key_name": {
+            "type": "string"
+          },
+          "connected_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_seen_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "peer": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transport": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "transport",
+          "api_key_name"
+        ],
+        "type": "object"
+      },
+      "IngestStatusEntry": {
+        "description": "`GET /api/v1/status` の `ingest`（取り込み口 `push`、R2a-2e、\ndocs/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。\n`crate::ingest::IngestHub::status` のプロセス内メモリを写したもので、\n**資格情報と値は含まない**（送り手は API キーの名前・接続元・時刻だけ、保持値は\n数だけ。`sender_status` は送り手の `status` を制御文字を落として 1 KiB に\n切り詰めたもの、`unknown_keys` も同じく切り詰めたキー）ため、`db_source` 節と\n同じく admin 限定にはしていない。",
+        "properties": {
+          "accepted": {
+            "description": "受け付けた件数（Hub の起動から）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bridge": {
+            "description": "`settings.bridge` がある（DB ブリッジの接続）。",
+            "type": "boolean"
+          },
+          "collecting": {
+            "type": "boolean"
+          },
+          "connection_id": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "epoch": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "held_values": {
+            "description": "保持している値の数（値そのものは出さない）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_seen_at": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_source_time": {
+            "description": "受け付けた件の `t` の最大（任意）。",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "link": {
+            "description": "`live`（送り手の最後の通信から `stale_timeout_ms` 以内）/ `down`（§4.3）。",
+            "type": "string"
+          },
+          "link_detail": {
+            "description": "`down` の理由（「送り手からの通信が {n} 秒ありません」など）。`live` なら `null`。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "rate_limited": {
+            "description": "頻度の上限で断ったメッセージの数。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "rejected": {
+            "description": "件ごとに断った件数（§6.3）。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sender_status": {
+            "description": "送り手の最後の `status`（任意、1 KiB まで）。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "senders": {
+            "items": {
+              "$ref": "#/components/schemas/IngestSenderStatusEntry"
+            },
+            "type": "array"
+          },
+          "stale_timeout_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "too_many_items": {
+            "description": "件数の上限（1 メッセージ 1,000 件）で断ったメッセージの数。",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "unknown_keys": {
+            "description": "直近の未知のキー（新しい順、20 件まで）。",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "connection_id",
+          "name",
+          "enabled",
+          "bridge",
+          "link",
+          "stale_timeout_ms",
+          "collecting",
+          "epoch",
+          "held_values",
+          "senders",
+          "accepted",
+          "rejected",
+          "rate_limited",
+          "too_many_items",
+          "unknown_keys"
+        ],
+        "type": "object"
+      },
       "IngestValuesMessage": {
         "description": "値のメッセージ 1 つ（REST の本文・WebSocket の `values` の中身）。知らない\nフィールドは読み飛ばす。",
         "properties": {
@@ -746,6 +908,13 @@
             "$ref": "#/components/schemas/GrpcStatusEntry",
             "description": "T4（設計 §5.4）: gRPC サーバーの設定。"
           },
+          "ingest": {
+            "description": "取り込み口 `push`（R2a-2e、docs/banto-hub-ingest-design.md §9）: `push`\n接続ごとの受信の状態。`push` 接続が無ければ空配列。",
+            "items": {
+              "$ref": "#/components/schemas/IngestStatusEntry"
+            },
+            "type": "array"
+          },
           "last_apply": {
             "oneOf": [
               {
@@ -834,6 +1003,7 @@
           "mqtt",
           "grpc",
           "db_source",
+          "ingest",
           "system",
           "sink"
         ],

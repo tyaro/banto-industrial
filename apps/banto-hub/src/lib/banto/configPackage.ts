@@ -11,6 +11,8 @@ import type {
 	PlcConnection,
 	PlcConnectionInput,
 	PlcProtocol,
+	PushBridgeQueryWire,
+	PushSettingsWire,
 	WordOrder,
 	StringEncoding,
 	Tag,
@@ -71,10 +73,35 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
  * 「うっかり詰め忘れる」ではなく「そもそも代入できない」という形で
  * コンパイル時に保証する。
  */
-export type ConfigPackagePlcConnection = Omit<PlcConnectionInput, 'password' | 'cpuType'> & {
+export type ConfigPackagePlcConnection = Omit<
+	PlcConnectionInput,
+	'password' | 'cpuType' | 'settings'
+> & {
 	/** 版 2 では必須（REST の作成・更新と違い「省略は既存を保つ」を持たない）。 */
 	cpuType: CpuType;
+	/**
+	 * R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: `push` 接続の
+	 * `settings`。export は push 接続で常に書き（既定のままなら `{}`）、他の
+	 * プロトコルでは書かない。ブリッジの読む DB は**接続名**
+	 * （`bridge.dbConnectionName`）で持ち運ぶ（sink group の `dbConnectionName` と
+	 * 同じ。id は環境をまたぐと変わる）。取り込みはパッケージの中の名前を、
+	 * 取り込み先で作成・更新した `postgres` 接続の id に付け直す。
+	 */
+	settings?: ConfigPackagePushSettings;
 };
+
+/** R2a-2e: パッケージの中の `settings.bridge`（`db_connection_id` の代わりに接続名）。 */
+export interface ConfigPackagePushBridge {
+	kind: 'db';
+	dbConnectionName: string;
+	queries: PushBridgeQueryWire[];
+}
+
+/** R2a-2e: パッケージの中の push 接続の `settings`（§3.2 の形。ブリッジは名前で参照）。 */
+export interface ConfigPackagePushSettings {
+	stale_timeout_ms?: number;
+	bridge?: ConfigPackagePushBridge;
+}
 
 export interface ConfigPackageCollectionGroup extends Omit<
 	CollectionGroupInput,
@@ -195,6 +222,19 @@ export interface ConfigPackageInspection {
 	 * 「インポート後にパスワードの再設定が必要」の案内を出すために使う。
 	 */
 	dbConnectionsPasswordRequired: string[];
+	/**
+	 * R2a-2e（docs/banto-hub-ingest-design.md §5.1）: このパッケージが含む `push`
+	 * 接続の名前。設定パッケージは API キーを持ち運ばず、取り込み先では接続の id
+	 * が変わる（送り手の URL `/api/v1/ingest/{id}/…` とスコープ `ingest:#{id}` も
+	 * 変わる）ので、画面は「取り込みのキーは移りません」と案内する。
+	 */
+	ingestConnections: string[];
+}
+
+/** R2a-2e: 取り込んだ `push` 接続 1 つ（取り込み先での id、§5.1）。 */
+export interface ConfigPackageIngestConnection {
+	name: string;
+	id: number;
 }
 
 export interface ConfigPackageImportSummary {
@@ -202,7 +242,15 @@ export interface ConfigPackageImportSummary {
 	mqttApplied: boolean;
 	grpcApplied: boolean;
 	warnings: string[];
+	/**
+	 * R2a-2e（§5.1）: 取り込んだ `push` 接続と取り込み先での id。キーは移らない
+	 * ので、結果の画面はこの id で送り手の URL とスコープを直すよう案内する。
+	 */
+	ingestConnections: ConfigPackageIngestConnection[];
 }
+
+/** R2a-2e（§5.1）: 取り込みの結果の画面・確認の画面に出す案内の見出し。 */
+export const INGEST_KEYS_NOT_MIGRATED_MESSAGE = '取り込みのキーは移りません';
 
 export interface ConfigPackageImportOptions {
 	mqttUsername?: string;
@@ -369,7 +417,10 @@ function filterVirtualConnections(connections: readonly PlcConnection[]): PlcCon
  * 省略を許す - `expectOptionalString`参照）。`password`はそもそも入力に存在しない（`PlcConnection`型に
  * フィールド自体が無い）ため、詰め忘れようがない。
  */
-function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
+function sanitizeConnection(
+	input: PlcConnection,
+	connectionNameById: ReadonlyMap<number, string>
+): ConfigPackagePlcConnection {
 	const {
 		name,
 		protocol,
@@ -394,8 +445,70 @@ function sanitizeConnection(input: PlcConnection): ConfigPackagePlcConnection {
 		wordOrder,
 		cpuType,
 		database: database ?? undefined,
-		username: username ?? undefined
+		username: username ?? undefined,
+		...(protocol === 'push'
+			? { settings: sanitizePushSettings(name, input.settings ?? null, connectionNameById) }
+			: {})
 	};
+}
+
+/**
+ * R2a-2e: push 接続の `settings` を export の形へ。ブリッジの `db_connection_id` を
+ * 接続名に写す（§3.1「`dbConnectionName` に写して持ち運ぶ」）。名前を引けない
+ * （参照先が一覧に無い）なら、壊れた参照を書き出さずに断る（sink group の
+ * 接続が引けないときと同じ）。秘密値は無い（DB のパスワードは参照先の
+ * `postgres` 接続の列で、`plc_connections.password` として除外済み）。
+ */
+function sanitizePushSettings(
+	connectionName: string,
+	settings: PushSettingsWire | null,
+	connectionNameById: ReadonlyMap<number, string>
+): ConfigPackagePushSettings {
+	const out: ConfigPackagePushSettings = {};
+	if (settings?.stale_timeout_ms !== undefined) out.stale_timeout_ms = settings.stale_timeout_ms;
+	const bridge = settings?.bridge;
+	if (bridge) {
+		const dbConnectionName = connectionNameById.get(bridge.db_connection_id);
+		if (dbConnectionName === undefined) {
+			throw new ConfigPackageParseError(
+				`push 接続 '${connectionName}' のブリッジが読む接続 id=${bridge.db_connection_id} に対応する connection が見つかりません`
+			);
+		}
+		out.bridge = {
+			kind: 'db',
+			dbConnectionName,
+			queries: bridge.queries.map((query) => ({
+				name: query.name,
+				period_ms: query.period_ms,
+				sql: query.sql,
+				columns: query.columns.map((column) => ({ column: column.column, key: column.key }))
+			}))
+		};
+	}
+	return out;
+}
+
+/**
+ * R2a-2e: パッケージの中の push 接続の `settings` を、取り込み先の接続 id で
+ * REST の `settings` に戻す（`sanitizePushSettings` の逆）。`resolveId` が
+ * 名前を引けなければ `null`（呼び出し側が警告を積んでその接続を飛ばす）。
+ */
+export function resolvePushSettings(
+	settings: ConfigPackagePushSettings,
+	resolveId: (connectionName: string) => number | undefined
+): PushSettingsWire | null {
+	const out: PushSettingsWire = {};
+	if (settings.stale_timeout_ms !== undefined) out.stale_timeout_ms = settings.stale_timeout_ms;
+	if (settings.bridge) {
+		const id = resolveId(settings.bridge.dbConnectionName);
+		if (id === undefined) return null;
+		out.bridge = {
+			kind: 'db',
+			db_connection_id: id,
+			queries: settings.bridge.queries
+		};
+	}
+	return out;
 }
 
 function sanitizeGroup(
@@ -487,6 +600,9 @@ export function buildConfigPackage(input: {
 		input.plcConnections.map((connection) => [connection.id, connection])
 	);
 	const groupById = new Map(input.collectionGroups.map((group) => [group.id, group]));
+	const connectionNameById = new Map(
+		input.plcConnections.map((connection) => [connection.id, connection.name])
+	);
 
 	const collectionGroups = input.collectionGroups.map((group) => {
 		const connection = connectionById.get(group.plcConnectionId);
@@ -535,7 +651,9 @@ export function buildConfigPackage(input: {
 		product: CONFIG_PACKAGE_PRODUCT,
 		exportedAt: input.exportedAt ?? new Date().toISOString(),
 		excludedSecrets: CONFIG_PACKAGE_EXCLUDED_SECRETS,
-		plcConnections: filterVirtualConnections(input.plcConnections).map(sanitizeConnection),
+		plcConnections: filterVirtualConnections(input.plcConnections).map((connection) =>
+			sanitizeConnection(connection, connectionNameById)
+		),
 		collectionGroups,
 		tags,
 		sinkGroups,
@@ -591,11 +709,25 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			protocol !== 'modbus-tcp' &&
 			protocol !== 'slmp' &&
 			protocol !== 'virtual' &&
-			protocol !== 'postgres'
+			protocol !== 'postgres' &&
+			protocol !== 'push'
 		) {
 			throw new ConfigPackageParseError(
-				`plcConnections[${index}].protocol は modbus-tcp / slmp / virtual / postgres のいずれかである必要があります`
+				`plcConnections[${index}].protocol は modbus-tcp / slmp / virtual / postgres / push のいずれかである必要があります`
 			);
+		}
+		// R2a-2e: `settings` は push 接続でだけ意味を持つ（省略は既定）。他の
+		// プロトコルで値があれば断る（サーバーも断る。黙って捨てない）。
+		let settings: ConfigPackagePushSettings | undefined;
+		if (item.settings !== undefined && item.settings !== null) {
+			if (protocol !== 'push') {
+				throw new ConfigPackageParseError(
+					`plcConnections[${index}].settings は push 接続でだけ指定できます`
+				);
+			}
+			settings = parsePushSettings(item.settings, `plcConnections[${index}].settings`);
+		} else if (protocol === 'push') {
+			settings = {};
 		}
 		return {
 			name: expectString(item.name, `plcConnections[${index}].name`),
@@ -608,9 +740,59 @@ function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`),
 			cpuType: expectCpuType(item.cpuType, `plcConnections[${index}].cpuType`),
 			database: expectOptionalString(item.database, `plcConnections[${index}].database`),
-			username: expectOptionalString(item.username, `plcConnections[${index}].username`)
+			username: expectOptionalString(item.username, `plcConnections[${index}].username`),
+			...(settings !== undefined ? { settings } : {})
 		};
 	});
+}
+
+/**
+ * R2a-2e: パッケージの push 接続の `settings` の形を確かめる（中身の規則 -
+ * 範囲・SQL・見積もり - は取り込みの作成・更新でサーバーが確かめる。他の
+ * パーサーと同じ「形として妥当か」だけの方針）。
+ */
+function parsePushSettings(raw: unknown, path: string): ConfigPackagePushSettings {
+	const item = expectRecord(raw, path);
+	const out: ConfigPackagePushSettings = {};
+	if (item.stale_timeout_ms !== undefined) {
+		out.stale_timeout_ms = expectInteger(item.stale_timeout_ms, `${path}.stale_timeout_ms`);
+	}
+	if (item.bridge !== undefined) {
+		const bridge = expectRecord(item.bridge, `${path}.bridge`);
+		if (bridge.kind !== 'db') {
+			throw new ConfigPackageParseError(`${path}.bridge.kind は db である必要があります`);
+		}
+		const queries = bridge.queries;
+		if (!Array.isArray(queries)) {
+			throw new ConfigPackageParseError(`${path}.bridge.queries は配列である必要があります`);
+		}
+		out.bridge = {
+			kind: 'db',
+			dbConnectionName: expectString(bridge.dbConnectionName, `${path}.bridge.dbConnectionName`),
+			queries: queries.map((entry, qIndex) => {
+				const qPath = `${path}.bridge.queries[${qIndex}]`;
+				const query = expectRecord(entry, qPath);
+				const columns = query.columns;
+				if (!Array.isArray(columns)) {
+					throw new ConfigPackageParseError(`${qPath}.columns は配列である必要があります`);
+				}
+				return {
+					name: expectString(query.name, `${qPath}.name`),
+					period_ms: expectInteger(query.period_ms, `${qPath}.period_ms`),
+					sql: expectString(query.sql, `${qPath}.sql`),
+					columns: columns.map((value, cIndex) => {
+						const cPath = `${qPath}.columns[${cIndex}]`;
+						const column = expectRecord(value, cPath);
+						return {
+							column: expectString(column.column, `${cPath}.column`),
+							key: expectString(column.key, `${cPath}.key`)
+						};
+					})
+				};
+			})
+		};
+	}
+	return out;
 }
 
 function parseCollectionGroups(raw: unknown): ConfigPackageCollectionGroup[] {
@@ -826,6 +1008,25 @@ function validateReferences(pkg: ConfigPackage): void {
 		if (!groupKeys.has(configPackageGroupKey(tag.plcConnectionName, tag.collectionGroupName))) {
 			throw new ConfigPackageParseError(
 				`tags[${index}].collectionGroupName: タグ '${tag.name}' が参照する接続 '${tag.plcConnectionName}' のグループ '${tag.collectionGroupName}' が見つかりません`
+			);
+		}
+	});
+
+	// R2a-2e: push 接続のブリッジが読む接続がパッケージ内の postgres 接続で
+	// あること（名前で持ち運ぶので、ここで引けないと取り込み先で付け直せない）。
+	const protocolByName = new Map(pkg.plcConnections.map((c) => [c.name, c.protocol]));
+	pkg.plcConnections.forEach((connection, index) => {
+		const bridge = connection.settings?.bridge;
+		if (!bridge) return;
+		const protocol = protocolByName.get(bridge.dbConnectionName);
+		if (protocol === undefined) {
+			throw new ConfigPackageParseError(
+				`plcConnections[${index}].settings.bridge.dbConnectionName: push 接続 '${connection.name}' のブリッジが読む connection '${bridge.dbConnectionName}' が見つかりません`
+			);
+		}
+		if (protocol !== 'postgres') {
+			throw new ConfigPackageParseError(
+				`plcConnections[${index}].settings.bridge.dbConnectionName: push 接続 '${connection.name}' のブリッジが読む connection '${bridge.dbConnectionName}' は postgres 接続ではありません（${protocol}）`
 			);
 		}
 	});

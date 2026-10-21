@@ -76,6 +76,18 @@
 	 * 同じ文言・同じ順序）。3ステップの作成ウィザードでも `baseline` は
 	 * 開いた時点のまま変わらないため、ステップを進めて入力するだけで自然に
 	 * `dirty` になる。
+	 *
+	 * **R2a-2e（docs/banto-hub-ingest-design.md §3.1・§3.2・§7.1・§9）: 取り込み口
+	 * `push`**。プロトコルに `push` を選ぶと、接続先（ホスト・ポート等）の代わりに
+	 * `stale_timeout_ms` とブリッジの区画（読む `postgres` 接続・クエリ・列とキーの
+	 * 対応）を出し、ブリッジの送る量の見積もり（`bridgeLoad.ts`、§7.1）をその場で
+	 * 出す。上限の 8 割を超えたら赤く示し、保存の前に断る（`validatePushFields`）。
+	 * 再設定のドロワーでは、送り手向けの URL（`/api/v1/ingest/{id}/…`）とスコープ
+	 * （`ingest:#{id}`）、受信の状態（`GET /api/status` の `ingest` 節、3 秒ごと）を
+	 * 出す。状態は資格情報と値を含まない（サーバーが出さない）。送り手の `status` の
+	 * 文は画面でも 1 KiB に切り詰める（`ingestStatusView.ts`）。ブリッジの区画は
+	 * 入れ子の配列なので、`baseline` は `$state.snapshot` で取る（`{ ...form }` の
+	 * 浅い複製では入れ子が `form` と共有されて `dirty` にならない）。
 	 */
 	import { isProviderError } from '@banto/admin-core';
 	import { Drawer, Modal } from '@banto/ui';
@@ -88,6 +100,7 @@
 	import {
 		createPlcConnection,
 		deletePlcConnection,
+		PUSH_PROTOCOL,
 		isQueuedWhileRunningError,
 		testPlcConnection,
 		testSavedPlcConnection,
@@ -102,7 +115,20 @@
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		PROTOCOL_OPTIONS,
+		BRIDGE_PERIOD_OPTIONS,
+		DEFAULT_STALE_TIMEOUT_MS,
+		blankBridgeQuery,
 		blankConnectionForm,
+		bridgeQueryErrorKey,
+		formatBridgeReferenceDeleteRefusal,
+		ingestEndpoints,
+		isSavedPushConnection,
+		resolveSavedConnection,
+		type SavedConnectionRecord,
+		mapPushFieldErrors,
+		pushBridgeLoad,
+		pushBridgesReferencing,
+		validatePushFields,
 		connectionToForm,
 		defaultPortFor,
 		defaultWordOrderFor,
@@ -118,6 +144,18 @@
 		formatConnectionDeleteConfirmMessage
 	} from '#lib/banto/registryCascadeImpact.js';
 	import type { CollectionGroup, Tag } from '#lib/banto/tagRegistryAdmin.js';
+	import {
+		REGISTRATION_ITEMS_PER_SEC,
+		REGISTRATION_MESSAGES_PER_SEC
+	} from '#lib/banto/bridgeLoad.js';
+	import { getHubStatus, type IngestStatusEntry } from '#lib/banto/hubStatus.js';
+	import {
+		describeIngestSender,
+		formatIngestTime,
+		ingestLinkClass,
+		ingestLinkLabel,
+		truncateSenderStatus
+	} from '#lib/banto/ingestStatusView.js';
 
 	/** `pendingChangesAdmin.ts::PendingChange.source` - `rest.rs::plc_connections_create` が `queue_pending_registry_change` に渡す文字列と一致させる。 */
 	const PENDING_SOURCE = 'plc_connections.create';
@@ -137,6 +175,11 @@
 		 */
 		groups: CollectionGroup[];
 		tags: Tag[];
+		/**
+		 * R2a-2e: ページが読み込み済みの接続の一覧（push のブリッジが読む `postgres`
+		 * 接続の選択肢と、削除の前の参照の確認に使う）。省略時は空（選択肢なし）。
+		 */
+		connections?: PlcConnection[];
 		/**
 		 * T18-6d（タグツリー右クリック「接続を削除」からの起動）: `true` かつ
 		 * `connection` が非 `null`（再設定モード）で Drawer を開いた直後、
@@ -187,6 +230,7 @@
 		existingNames,
 		groups,
 		tags,
+		connections = [],
 		requestDelete = false,
 		readOnly = false,
 		onClose,
@@ -208,7 +252,8 @@
 		if (isProviderError(err) && err.body.kind === 'validation') {
 			const map: Record<string, string> = {};
 			for (const fe of err.body.field_errors) map[fe.field] = fe.message;
-			return map;
+			// R2a-2e: サーバーの `settings.*` の項目エラーを push の欄へ写す。
+			return mapPushFieldErrors(map);
 		}
 		return null;
 	}
@@ -317,7 +362,7 @@
 			form = blank;
 			void refinePendingNamePrefill(key);
 		}
-		baseline = { ...form };
+		baseline = $state.snapshot(form);
 		errors = {};
 		testState = blankTestState();
 		dbTestState = blankDbTestState();
@@ -368,7 +413,7 @@
 			// してはいけない（`tags/+page.svelte::openCreateDrawer` の
 			// 「プリセットした値は createBaseline にも入れる」と同じ配慮）。
 			form.name = refined;
-			baseline.name = refined;
+			baseline = { ...baseline, name: refined };
 		}
 		provisionalName = refined;
 	}
@@ -405,13 +450,18 @@
 		// （destinationFields スニペット内、下記マークアップ参照）。
 		database: 2,
 		username: 2,
-		password: 2
+		password: 2,
+		// R2a-2e: push の欄も「2. プロトコルと接続先」（`bridgeQueries[i].*` は
+		// 下の `stepForFieldErrors` が接頭辞で 2 へ寄せる）。
+		staleTimeoutMs: 2,
+		bridgeDbConnectionId: 2,
+		bridge: 2
 	};
 
 	function stepForFieldErrors(fieldErrors: Record<string, string>): 1 | 2 | 3 | null {
 		let target: 1 | 2 | 3 | null = null;
 		for (const field of Object.keys(fieldErrors)) {
-			const s = FIELD_STEP[field];
+			const s = FIELD_STEP[field] ?? (field.startsWith('bridgeQueries[') ? 2 : undefined);
 			if (s !== undefined && (target === null || s < target)) target = s;
 		}
 		return target;
@@ -426,9 +476,87 @@
 	 * 送信時（`handleCreate`/`handleSave`）の`validatePostgresFields`が出す。
 	 */
 	const canAdvanceFromStep2 = $derived(
-		form.host.trim() !== '' &&
-			(form.protocol !== POSTGRES_PROTOCOL ||
-				(form.database.trim() !== '' && form.username.trim() !== ''))
+		// R2a-2e: push は接続先を持たない（ホスト不要）。push の欄の誤りは送信時の
+		// `validatePushFields` が出し、見積もりの超過は欄の下にその場で赤く出る。
+		(form.protocol === PUSH_PROTOCOL && (pushBridgeLoad(form)?.withinLimit ?? true)) ||
+			(form.protocol !== PUSH_PROTOCOL &&
+				form.host.trim() !== '' &&
+				(form.protocol !== POSTGRES_PROTOCOL ||
+					(form.database.trim() !== '' && form.username.trim() !== '')))
+	);
+
+	/** R2a-2e: ブリッジの送る量の見積もり（§7.1）。push でブリッジを持つときだけ。 */
+	const bridgeLoadEstimate = $derived(pushBridgeLoad(form));
+
+	/** R2a-2e: ブリッジが読める接続（`postgres` だけ。自分自身は出さない）。 */
+	const postgresConnections = $derived(
+		connections.filter((c) => c.protocol === POSTGRES_PROTOCOL && c.id !== connection?.id)
+	);
+
+	function addBridgeQuery(): void {
+		form.bridgeQueries = [...form.bridgeQueries, blankBridgeQuery(form.bridgeQueries)];
+	}
+
+	function removeBridgeQuery(index: number): void {
+		form.bridgeQueries = form.bridgeQueries.filter((_, i) => i !== index);
+	}
+
+	/**
+	 * R2a-2e（§9）: 再設定のドロワーで、push 接続の受信の状態（`GET /api/status`
+	 * の `ingest` 節）。開いている間だけ 3 秒ごとに取り直す。取得の失敗は状態を
+	 * 空にせず、失敗した旨を別に出す（checklist §5「エラーを空に潰さない」）。
+	 */
+	const INGEST_STATUS_POLL_MS = 3000;
+	let ingestStatus: IngestStatusEntry | null = $state(null);
+	let ingestStatusLoaded = $state(false);
+	let ingestStatusError: string | null = $state(null);
+
+	/**
+	 * 保存成功時に更新 API が返した接続（P2 レビュー対応）。親は一覧を取り直す
+	 * だけで `connection` prop を差し替えないため、保存したプロトコルの変更
+	 * （空の PLC 接続 → push など）を表示・ポーリングへ反映する基準にする。
+	 * 未保存の `form.protocol` は基準にしない。
+	 */
+	let savedRecord: SavedConnectionRecord | null = $state.raw(null);
+	const savedConnection = $derived(resolveSavedConnection(connection, savedRecord));
+	const savedIsPush = $derived(isSavedPushConnection(connection, savedRecord));
+
+	$effect(() => {
+		const id = savedConnection?.id;
+		if (!open || id === undefined || !savedIsPush) return;
+		let cancelled = false;
+		ingestStatus = null;
+		ingestStatusLoaded = false;
+		ingestStatusError = null;
+		const load = async () => {
+			try {
+				const status = await getHubStatus();
+				if (cancelled) return;
+				ingestStatus = status.ingest.find((entry) => entry.connection_id === id) ?? null;
+				ingestStatusError = null;
+			} catch (err) {
+				if (cancelled) return;
+				ingestStatusError = errorMessage(err);
+			} finally {
+				if (!cancelled) ingestStatusLoaded = true;
+			}
+		};
+		void load();
+		const timer = setInterval(() => void load(), INGEST_STATUS_POLL_MS);
+		return () => {
+			cancelled = true;
+			clearInterval(timer);
+		};
+	});
+
+	/** 送り手向けの URL とスコープ（保存済みの push 接続だけ）。 */
+	const endpoints = $derived(
+		savedConnection && savedIsPush
+			? ingestEndpoints(
+					typeof window === 'undefined' ? '' : window.location.origin,
+					savedConnection.id
+				)
+			: null
 	);
 
 	function goNext(): void {
@@ -502,7 +630,8 @@
 	 * ルールを反映する」）。
 	 */
 	function validateBeforeSubmit(): boolean {
-		const fieldErrors = validatePostgresFields(form);
+		// R2a-2e: push の欄（範囲・ブリッジの形・§7.1 の見積もり）も送る前に確かめる。
+		const fieldErrors = { ...validatePostgresFields(form), ...validatePushFields(form) };
 		if (Object.keys(fieldErrors).length === 0) return true;
 		errors = fieldErrors;
 		const target = stepForFieldErrors(fieldErrors);
@@ -550,7 +679,8 @@
 			// の saveEdit と同じ方針）。Drawer は閉じない。baseline も同じ値へ
 			// 揃えることで、保存直後は dirty ではない状態に戻す。
 			form = connectionToForm(updated);
-			baseline = { ...form };
+			baseline = $state.snapshot(form);
+			savedRecord = { base: connection, saved: updated };
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -574,6 +704,14 @@
 	 */
 	async function handleDelete(): Promise<void> {
 		if (!connection) return;
+		// R2a-2e（§3.2）: push のブリッジが読んでいる postgres 接続は削除できない。
+		// 読み込み済みの一覧で分かるなら確認ダイアログより前に止める（サーバーも
+		// 同じ理由で断る - 一覧が古いときは下の catch に同じ趣旨の文言が来る）。
+		const bridges = pushBridgesReferencing(connections, connection.id);
+		if (bridges.length > 0) {
+			toastStore.push('error', formatBridgeReferenceDeleteRefusal(connection.name, bridges));
+			return;
+		}
 		const impact = countConnectionCascadeImpact(connection.id, groups, tags);
 		if (!window.confirm(formatConnectionDeleteConfirmMessage(connection.name, impact))) return;
 		deleting = true;
@@ -588,9 +726,10 @@
 				toastStore.push('info', err.message);
 				return;
 			}
-			// 収集グループが参照している場合はサービス層の分かりやすい
-			// Validation エラー（件数入り）がここに来る。
-			toastStore.push('error', errorMessage(err));
+			// 収集グループ・sink group・push のブリッジ（R2a-2e）が参照している
+			// 場合はサービス層の分かりやすい Validation エラー（件数・名前入り）が
+			// ここに来る。項目の文言があればそれを出す。
+			toastStore.push('error', applyFieldErrors(err)?.id ?? errorMessage(err));
 		} finally {
 			deleting = false;
 		}
@@ -637,122 +776,128 @@
 			</select>
 			{#if errors.protocol}<span class="err">{errors.protocol}</span>{/if}
 		</label>
-		<label class="field">
-			ホスト
-			<input type="text" bind:value={form.host} placeholder="192.168.1.10" disabled={readOnly} />
-			{#if errors.host}<span class="err">{errors.host}</span>{/if}
-		</label>
-		<label class="field">
-			ポート
-			<input
-				type="number"
-				min="1"
-				max="65535"
-				bind:value={form.port}
-				oninput={onPortInput}
-				disabled={readOnly}
-			/>
+		{#if form.protocol === PUSH_PROTOCOL}
+			{@render pushFields()}
+		{:else}
+			<label class="field">
+				ホスト
+				<input type="text" bind:value={form.host} placeholder="192.168.1.10" disabled={readOnly} />
+				{#if errors.host}<span class="err">{errors.host}</span>{/if}
+			</label>
+			<label class="field">
+				ポート
+				<input
+					type="number"
+					min="1"
+					max="65535"
+					bind:value={form.port}
+					oninput={onPortInput}
+					disabled={readOnly}
+				/>
+				{#if form.protocol === POSTGRES_PROTOCOL}
+					<span class="hint">PostgreSQL の待受ポート（既定 5432）。</span>
+				{/if}
+				{#if errors.port}<span class="err">{errors.port}</span>{/if}
+			</label>
 			{#if form.protocol === POSTGRES_PROTOCOL}
-				<span class="hint">PostgreSQL の待受ポート（既定 5432）。</span>
-			{/if}
-			{#if errors.port}<span class="err">{errors.port}</span>{/if}
-		</label>
-		{#if form.protocol === POSTGRES_PROTOCOL}
-			<!--
+				<!--
 				S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続
 				専用フィールド。unitId/wordOrder/simulation は modbus-tcp/slmp
 				固有の意味しか持たないため（後述の {:else} 分岐）ここでは
 				出さない。
 			-->
-			<label class="field">
-				データベース
-				<input type="text" bind:value={form.database} placeholder="appdb" disabled={readOnly} />
-				{#if errors.database}<span class="err">{errors.database}</span>{/if}
-			</label>
-			<label class="field">
-				ユーザー名
-				<input
-					type="text"
-					bind:value={form.username}
-					placeholder="appuser"
-					disabled={readOnly}
-					autocomplete="off"
-				/>
-				{#if errors.username}<span class="err">{errors.username}</span>{/if}
-			</label>
-			{#if !readOnly}
-				{#if isCreate}
+				<label class="field">
+					データベース
+					<input type="text" bind:value={form.database} placeholder="appdb" disabled={readOnly} />
+					{#if errors.database}<span class="err">{errors.database}</span>{/if}
+				</label>
+				<label class="field">
+					ユーザー名
+					<input
+						type="text"
+						bind:value={form.username}
+						placeholder="appuser"
+						disabled={readOnly}
+						autocomplete="off"
+					/>
+					{#if errors.username}<span class="err">{errors.username}</span>{/if}
+				</label>
+				{#if !readOnly}
+					{#if isCreate}
+						<label class="field">
+							パスワード
+							<input type="password" bind:value={form.password} autocomplete="new-password" />
+							<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
+						</label>
+					{:else}
+						<div class="field password-status">
+							パスワード: {connection?.passwordSet ? '設定済み' : '未設定'}
+						</div>
+						<label class="field">
+							新しいパスワード（変更する場合のみ入力）
+							<input
+								type="password"
+								bind:value={form.password}
+								placeholder="変更しない"
+								autocomplete="new-password"
+								disabled={form.clearPassword}
+							/>
+						</label>
+						<label class="field checkbox">
+							<input type="checkbox" bind:checked={form.clearPassword} />
+							パスワードを消去する
+						</label>
+					{/if}
+					{#if errors.password}<span class="err">{errors.password}</span>{/if}
+				{/if}
+			{:else}
+				<label class="field">
+					ユニットID
+					<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
+					<span class="hint"
+						>Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span
+					>
+					{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
+				</label>
+				{#if hasWordOrder(form)}
 					<label class="field">
-						パスワード
-						<input type="password" bind:value={form.password} autocomplete="new-password" />
-						<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
-					</label>
-				{:else}
-					<div class="field password-status">
-						パスワード: {connection?.passwordSet ? '設定済み' : '未設定'}
-					</div>
-					<label class="field">
-						新しいパスワード（変更する場合のみ入力）
-						<input
-							type="password"
-							bind:value={form.password}
-							placeholder="変更しない"
-							autocomplete="new-password"
-							disabled={form.clearPassword}
-						/>
-					</label>
-					<label class="field checkbox">
-						<input type="checkbox" bind:checked={form.clearPassword} />
-						パスワードを消去する
+						ワード順
+						<select bind:value={form.wordOrder} onchange={onWordOrderInput} disabled={readOnly}>
+							{#each WORD_ORDER_OPTIONS as opt (opt.value)}
+								<option value={opt.value}>{opt.label}</option>
+							{/each}
+						</select>
+						<span class="hint">
+							32bit値（u32/f32等）および64bit値（i64/u64/f64、4レジスタ）の上位/下位ワードの並び。既定は
+							Modbus が high_low（Modbus/IEEE慣習）、MELSEC/SLMPが
+							low_high。機種のマニュアルで確認してください — 例: オムロン
+							KM-D1-ETN（電力量モニタ）は low_high
+							が必要です。間違えると値が化けます（上位/下位が入れ替わります）。
+						</span>
+						{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
 					</label>
 				{/if}
-				{#if errors.password}<span class="err">{errors.password}</span>{/if}
-			{/if}
-		{:else}
-			<label class="field">
-				ユニットID
-				<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
-				<span class="hint">Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span
-				>
-				{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
-			</label>
-			{#if hasWordOrder(form)}
-				<label class="field">
-					ワード順
-					<select bind:value={form.wordOrder} onchange={onWordOrderInput} disabled={readOnly}>
-						{#each WORD_ORDER_OPTIONS as opt (opt.value)}
-							<option value={opt.value}>{opt.label}</option>
-						{/each}
-					</select>
-					<span class="hint">
-						32bit値（u32/f32等）および64bit値（i64/u64/f64、4レジスタ）の上位/下位ワードの並び。既定は
-						Modbus が high_low（Modbus/IEEE慣習）、MELSEC/SLMPが
-						low_high。機種のマニュアルで確認してください — 例: オムロン KM-D1-ETN（電力量モニタ）は
-						low_high が必要です。間違えると値が化けます（上位/下位が入れ替わります）。
-					</span>
-					{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
-				</label>
-			{/if}
-			{#if form.protocol === 'slmp'}
-				<label class="field">
-					CPU種別
-					<select bind:value={form.cpuType} disabled={readOnly}>
-						{#each CPU_TYPE_OPTIONS as opt (opt.value)}
-							<option value={opt.value}>{opt.label}</option>
-						{/each}
-					</select>
-					<span class="hint">
-						MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R、L シリーズは Q
-						を選んでください。違うと接続できてもタグが Bad になります。既定は R です。
-					</span>
-				</label>
+				{#if form.protocol === 'slmp'}
+					<label class="field">
+						CPU種別
+						<select bind:value={form.cpuType} disabled={readOnly}>
+							{#each CPU_TYPE_OPTIONS as opt (opt.value)}
+								<option value={opt.value}>{opt.label}</option>
+							{/each}
+						</select>
+						<span class="hint">
+							MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R、L シリーズは Q
+							を選んでください。違うと接続できてもタグが Bad になります。既定は R です。
+						</span>
+					</label>
+				{/if}
 			{/if}
 		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
-		{#if form.protocol !== POSTGRES_PROTOCOL}
+		{#if form.protocol !== POSTGRES_PROTOCOL && form.protocol !== PUSH_PROTOCOL}
 			<label class="field checkbox">
 				<input type="checkbox" bind:checked={form.simulation} disabled={readOnly} />
 				シミュレーションモード
@@ -762,6 +907,236 @@
 			</span>
 		{/if}
 	</div>
+{/snippet}
+
+{#snippet pushFields()}
+	<!--
+		R2a-2e（docs/banto-hub-ingest-design.md §3.2・§4.3・§7.1）: push 接続は接続先を
+		持たず（サーバーが host / port を正規化する）、受信のタイムアウトと DB ブリッジの
+		区画だけを持つ。ブリッジの送る量の見積もりは入力のたびに出し、上限の 8 割を
+		超えたら赤くする（保存の前に `validatePushFields` が断る）。
+	-->
+	<label class="field">
+		受信のタイムアウト（ms）
+		<input
+			type="text"
+			inputmode="numeric"
+			bind:value={form.staleTimeoutMs}
+			placeholder={String(DEFAULT_STALE_TIMEOUT_MS)}
+			disabled={readOnly}
+		/>
+		<span class="hint"
+			>送り手からの最後の通信からこの時間が過ぎると、この接続のタグは Bad になります（空欄は既定の
+			10,000 ms、1,000〜3,600,000）。</span
+		>
+		{#if errors.staleTimeoutMs}<span class="err">{errors.staleTimeoutMs}</span>{/if}
+	</label>
+	<label class="field checkbox wide">
+		<input type="checkbox" bind:checked={form.bridgeEnabled} disabled={readOnly} />
+		DB ブリッジ（PostgreSQL を読んで送る）
+	</label>
+	{#if form.bridgeEnabled}
+		<div class="bridge wide">
+			<label class="field">
+				ブリッジが読む PostgreSQL 接続
+				<select bind:value={form.bridgeDbConnectionId} disabled={readOnly}>
+					<option value="">（選択してください）</option>
+					{#each postgresConnections as pg (pg.id)}
+						<option value={String(pg.id)}>{pg.name}</option>
+					{/each}
+				</select>
+				{#if postgresConnections.length === 0}
+					<span class="hint">PostgreSQL（DB Source）接続を先に作ってください。</span>
+				{/if}
+				{#if errors.bridgeDbConnectionId}<span class="err">{errors.bridgeDbConnectionId}</span>{/if}
+			</label>
+			{#each form.bridgeQueries as query, index (index)}
+				{@const queryLoad = bridgeLoadEstimate?.queries[index]}
+				<fieldset class="bridge-query">
+					<legend>クエリ {index + 1}</legend>
+					<label class="field">
+						クエリの名前
+						<input type="text" bind:value={query.name} disabled={readOnly} />
+						{#if errors[bridgeQueryErrorKey(index, 'name')]}<span class="err"
+								>{errors[bridgeQueryErrorKey(index, 'name')]}</span
+							>{/if}
+					</label>
+					<label class="field">
+						周期
+						<select bind:value={query.periodMs} disabled={readOnly}>
+							{#each BRIDGE_PERIOD_OPTIONS as ms (ms)}
+								<option value={ms}>{ms} ms</option>
+							{/each}
+						</select>
+					</label>
+					<label class="field">
+						SQL
+						<textarea
+							rows="3"
+							bind:value={query.sql}
+							placeholder="SELECT temp, run FROM line1_now"
+							disabled={readOnly}></textarea>
+						{#if errors[bridgeQueryErrorKey(index, 'sql')]}<span class="err"
+								>{errors[bridgeQueryErrorKey(index, 'sql')]}</span
+							>{/if}
+					</label>
+					<label class="field">
+						列とキーの対応（1 行に 1 つ「列名=キー」）
+						<textarea
+							rows="3"
+							bind:value={query.columnsText}
+							placeholder="temp=line1.temp&#10;run=line1.run"
+							disabled={readOnly}></textarea>
+						{#if errors[bridgeQueryErrorKey(index, 'columns')]}<span class="err"
+								>{errors[bridgeQueryErrorKey(index, 'columns')]}</span
+							>{/if}
+					</label>
+					{#if queryLoad}
+						<span class="hint"
+							>このクエリ: {queryLoad.items} 件・1 周期 {queryLoad.messagesPerCycle} メッセージ</span
+						>
+					{/if}
+					{#if !readOnly}
+						<button type="button" class="secondary" onclick={() => removeBridgeQuery(index)}
+							>このクエリを外す</button
+						>
+					{/if}
+				</fieldset>
+			{/each}
+			{#if !readOnly}
+				<button type="button" class="secondary" onclick={addBridgeQuery}>クエリを追加</button>
+			{/if}
+			{#if bridgeLoadEstimate}
+				<p
+					class="bridge-load"
+					class:over={!bridgeLoadEstimate.withinLimit}
+					data-testid="bridge-load-estimate"
+				>
+					送る量の見積もり: 約 {bridgeLoadEstimate.messagesPerSecText} メッセージ/秒・{bridgeLoadEstimate.itemsPerSecText}
+					件/秒（上限の 8 割: {REGISTRATION_MESSAGES_PER_SEC} メッセージ・{REGISTRATION_ITEMS_PER_SEC.toLocaleString(
+						'ja-JP'
+					)} 件）
+				</p>
+				{#if bridgeLoadEstimate.message}
+					<span class="err" role="alert">{bridgeLoadEstimate.message}</span>
+				{/if}
+			{/if}
+			{#if errors.bridge && errors.bridge !== bridgeLoadEstimate?.message}
+				<span class="err">{errors.bridge}</span>
+			{/if}
+		</div>
+	{/if}
+{/snippet}
+
+{#snippet ingestInfoBlock()}
+	<!--
+		R2a-2e（§5・§6）: 送り手向けの URL とスコープ。接続は id で指す（Q9 = (b)）ので、
+		改名しても変わらない。保存前（作成ウィザード）は id が無いので案内だけ。
+	-->
+	<section class="ingest-info" aria-label="送り手向けの URL とスコープ">
+		<h3>送り手向けの URL とスコープ</h3>
+		{#if endpoints}
+			<dl class="summary">
+				<dt>REST（一括送信）</dt>
+				<dd><code data-testid="ingest-rest-url">POST {endpoints.restUrl}</code></dd>
+				<dt>WebSocket</dt>
+				<dd><code data-testid="ingest-ws-url">{endpoints.wsUrl}</code></dd>
+				<dt>API キーのスコープ</dt>
+				<dd><code data-testid="ingest-scope">{endpoints.scope}</code></dd>
+			</dl>
+			<p class="hint">
+				送り手の API キーは「API キー」の画面で、取り込み（この接続）を選んで発行します（スコープ
+				{endpoints.scope}）。URL とスコープは接続の id で決まるので、名前を変えても変わりません。
+				構成パッケージで別の Hub に移すと id が変わり、キーも移りません。
+			</p>
+		{:else}
+			<p class="hint">
+				作成すると、ここに送り手向けの URL（/api/v1/ingest/接続 id/…）と API キーのスコープ
+				ingest:#接続 id が出ます。
+			</p>
+		{/if}
+	</section>
+{/snippet}
+
+{#snippet ingestStatusBlock()}
+	<!--
+		R2a-2e（§9）: 受信の状態。`GET /api/status` の `ingest` 節（資格情報と値は
+		含まない）。送り手の `status` の文は画面でも 1 KiB に切り詰める。
+	-->
+	<section class="ingest-status" aria-label="受信の状態" data-testid="ingest-status">
+		<h3>受信の状態</h3>
+		{#if !ingestStatusLoaded}
+			<p class="hint">読み込み中…</p>
+		{:else if ingestStatus === null}
+			{#if ingestStatusError}
+				<p class="err">状態を読めませんでした: {ingestStatusError}</p>
+			{:else}
+				<p class="hint">まだ収集の構成に入っていません（保存の直後は反映を待ってください）。</p>
+			{/if}
+		{:else}
+			<p>
+				<span class="state-chip {ingestLinkClass(ingestStatus)}" data-testid="ingest-link"
+					>{ingestLinkLabel(ingestStatus)}</span
+				>
+				{#if ingestStatus.link !== 'live' && ingestStatus.link_detail}
+					<span class="hint">{ingestStatus.link_detail}</span>
+				{/if}
+			</p>
+			<dl class="summary">
+				<dt>最後の通信</dt>
+				<dd>{formatIngestTime(ingestStatus.last_seen_at)}</dd>
+				<dt>収集</dt>
+				<dd>{ingestStatus.collecting ? '収集中' : '停止中（値は受けますが記録しません）'}</dd>
+				{#if ingestStatus.bridge}
+					<dt>世代（epoch）</dt>
+					<dd>{ingestStatus.epoch}</dd>
+				{/if}
+				<dt>受信のタイムアウト</dt>
+				<dd>{ingestStatus.stale_timeout_ms.toLocaleString('ja-JP')} ms</dd>
+				<dt>保持している値</dt>
+				<dd>{ingestStatus.held_values} 件</dd>
+				<dt>受け付けた / 断った</dt>
+				<dd>
+					{ingestStatus.accepted.toLocaleString('ja-JP')} 件 / {ingestStatus.rejected.toLocaleString(
+						'ja-JP'
+					)} 件
+				</dd>
+				<dt>上限で断ったメッセージ</dt>
+				<dd>
+					頻度 {ingestStatus.rate_limited.toLocaleString('ja-JP')} / 件数 {ingestStatus.too_many_items.toLocaleString(
+						'ja-JP'
+					)}
+				</dd>
+				<dt>送り手</dt>
+				<dd>
+					{#if ingestStatus.senders.length === 0}
+						（まだありません）
+					{:else}
+						<ul class="plain-list">
+							{#each ingestStatus.senders as sender (sender.transport)}
+								<li>{describeIngestSender(sender)}</li>
+							{/each}
+						</ul>
+					{/if}
+				</dd>
+				{#if ingestStatus.last_source_time !== null}
+					<dt>送り手の時刻（最大）</dt>
+					<dd>{formatIngestTime(ingestStatus.last_source_time)}</dd>
+				{/if}
+				{#if ingestStatus.unknown_keys.length > 0}
+					<dt>未知のキー（直近）</dt>
+					<dd class="unknown-keys">{ingestStatus.unknown_keys.join('、')}</dd>
+				{/if}
+				{#if ingestStatus.sender_status}
+					<dt>送り手の状態</dt>
+					<dd class="sender-status">{truncateSenderStatus(ingestStatus.sender_status)}</dd>
+				{/if}
+			</dl>
+			{#if ingestStatusError}
+				<p class="hint">最新の状態を読めませんでした（前回の内容を表示しています）。</p>
+			{/if}
+		{/if}
+	</section>
 {/snippet}
 
 {#snippet testConnectionBlock()}
@@ -828,9 +1203,31 @@
 		<dd>{form.name || '（未入力）'}</dd>
 		<dt>プロトコル</dt>
 		<dd>{PROTOCOL_OPTIONS.find((o) => o.value === form.protocol)?.label ?? form.protocol}</dd>
-		<dt>ホスト</dt>
-		<dd>{form.host || '（未入力）'}:{form.port}</dd>
-		{#if form.protocol === POSTGRES_PROTOCOL}
+		{#if form.protocol === PUSH_PROTOCOL}
+			<dt>受信のタイムアウト</dt>
+			<dd>
+				{String(form.staleTimeoutMs).trim() === ''
+					? `既定（${DEFAULT_STALE_TIMEOUT_MS.toLocaleString('ja-JP')} ms）`
+					: `${form.staleTimeoutMs} ms`}
+			</dd>
+			<dt>DB ブリッジ</dt>
+			<dd>
+				{#if form.bridgeEnabled}
+					{postgresConnections.find((c) => String(c.id) === form.bridgeDbConnectionId)?.name ??
+						'（接続未選択）'} を読む・クエリ {form.bridgeQueries.length} 本{#if bridgeLoadEstimate}（約
+						{bridgeLoadEstimate.messagesPerSecText} メッセージ/秒・{bridgeLoadEstimate.itemsPerSecText}
+						件/秒）{/if}
+				{:else}
+					なし（スクリプトなどの送り手が送る）
+				{/if}
+			</dd>
+		{:else}
+			<dt>ホスト</dt>
+			<dd>{form.host || '（未入力）'}:{form.port}</dd>
+		{/if}
+		{#if form.protocol === PUSH_PROTOCOL}
+			<!-- R2a-2e: push は接続先・PLC の項目を持たない。 -->
+		{:else if form.protocol === POSTGRES_PROTOCOL}
 			<dt>データベース</dt>
 			<dd>{form.database || '（未入力）'}</dd>
 			<dt>ユーザー名</dt>
@@ -855,7 +1252,7 @@
 		{/if}
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
-		{#if form.protocol !== POSTGRES_PROTOCOL}
+		{#if form.protocol !== POSTGRES_PROTOCOL && form.protocol !== PUSH_PROTOCOL}
 			<dt>シミュレーション</dt>
 			<dd>{form.simulation ? '⚠ シミュレーション中' : 'いいえ'}</dd>
 		{/if}
@@ -885,7 +1282,9 @@
 			{@render destinationFields()}
 		{:else}
 			{@render confirmSummary()}
-			{#if form.protocol === POSTGRES_PROTOCOL}
+			{#if form.protocol === PUSH_PROTOCOL}
+				{@render ingestInfoBlock()}
+			{:else if form.protocol === POSTGRES_PROTOCOL}
 				{@render dbTestConnectionBlock()}
 			{:else}
 				{@render testConnectionBlock()}
@@ -918,8 +1317,14 @@
 	>
 		{@render nameField()}
 		{@render destinationFields()}
+		{#if savedIsPush}
+			{@render ingestInfoBlock()}
+			{@render ingestStatusBlock()}
+		{/if}
 		{#if !readOnly}
-			{#if form.protocol === POSTGRES_PROTOCOL}
+			{#if form.protocol === PUSH_PROTOCOL}
+				<!-- R2a-2e: push は接続テストを持たない（受信の状態を上に出す）。 -->
+			{:else if form.protocol === POSTGRES_PROTOCOL}
 				{@render dbTestConnectionBlock()}
 			{:else}
 				{@render testConnectionBlock()}
@@ -990,6 +1395,97 @@
 	.err {
 		color: var(--banto-danger);
 		font-size: 0.75rem;
+	}
+
+	/* R2a-2e: push の欄・送り手向けの情報・受信の状態。 */
+	.wide {
+		grid-column: 1 / -1;
+	}
+
+	.bridge {
+		display: flex;
+		flex-direction: column;
+		gap: 0.5rem;
+	}
+
+	.bridge-query {
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		padding: 0.5rem 0.75rem;
+		margin: 0;
+	}
+
+	.bridge-query legend {
+		font-size: 0.75rem;
+		color: var(--banto-text-muted);
+	}
+
+	.field textarea {
+		padding: 0.4rem 0.5rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+		background: var(--banto-bg);
+		color: var(--banto-text);
+		font-family: var(--banto-font-mono, monospace);
+	}
+
+	.bridge-load {
+		margin: 0;
+		font-size: 0.8rem;
+		color: var(--banto-text);
+	}
+
+	.bridge-load.over {
+		color: var(--banto-danger);
+		font-weight: 600;
+	}
+
+	.ingest-info,
+	.ingest-status {
+		margin-bottom: 0.75rem;
+	}
+
+	.ingest-info h3,
+	.ingest-status h3 {
+		font-size: 0.85rem;
+		margin: 0 0 0.5rem;
+	}
+
+	.ingest-info code {
+		word-break: break-all;
+	}
+
+	.state-chip {
+		display: inline-block;
+		padding: 0.1rem 0.5rem;
+		border-radius: var(--banto-radius);
+		font-size: 0.8rem;
+		font-weight: 600;
+	}
+
+	.state-chip.ok {
+		color: var(--banto-success, #1a7f37);
+		border: 1px solid var(--banto-success, #1a7f37);
+	}
+
+	.state-chip.warn {
+		color: var(--banto-warning, #8a5a00);
+		border: 1px solid var(--banto-warning, #8a5a00);
+	}
+
+	.state-chip.muted {
+		color: var(--banto-text-muted);
+		border: 1px solid var(--banto-border);
+	}
+
+	.plain-list {
+		margin: 0;
+		padding-left: 1rem;
+	}
+
+	.unknown-keys,
+	.sender-status {
+		word-break: break-all;
 	}
 
 	.wizard-steps {
