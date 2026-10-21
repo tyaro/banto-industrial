@@ -35,6 +35,12 @@
 //! - 接続の照会は `IngestHub`（catalog の commit と同じ点で更新される受信側の表）を
 //!   読む。DB は読まない（送り手ごとの要求で DB に負荷を掛けない）。
 //!
+//! - 監査の `denied`（表の 3・5・6）はキーごとに 1 時間に 100 行までに間引く
+//!   （2026-10-21 オーナー決定、`super::audit::KeyDenialThrottle`）。キーを照合できた
+//!   要求は、断ったものも通ったものも [`IngestHub::throttle_key_denial`] で観測する
+//!   （窓が明けた後の最初の観測で抑えた数を 1 行。悪い要求が止み、同じキーが正しく
+//!   送るようになっても数は残る）。WS（R2a-2d）もこの層を通るので同じに掛かる。
+//!
 //! 通った要求には [`IngestCaller`]（キー・接続 id・その時点の名前・接続元・経路）を
 //! extension に載せる。ハンドラはこれで監査の行を作る。
 
@@ -221,7 +227,11 @@ pub async fn require_ingest_auth(
                     peer.as_deref(),
                     state.transport,
                 );
-                ingest_audit::record(&state.audit, vec![row]).await;
+                let rows =
+                    state
+                        .ingest
+                        .throttle_key_denial(denied.id, &denied.name, Some(row), now_ms);
+                ingest_audit::record(&state.audit, rows).await;
             }
             return api_key_rejection_response(rejection);
         }
@@ -242,7 +252,7 @@ pub async fn require_ingest_auth(
     let (connection_id, connection_name) = match gate {
         Ok(found) => found,
         Err(denial) => {
-            if let Some(connection_id) = denial.audited_connection() {
+            let row = denial.audited_connection().map(|connection_id| {
                 let ctx = IngestAuditContext {
                     api_key_id: key.id,
                     api_key_name: key.name.clone(),
@@ -252,15 +262,21 @@ pub async fn require_ingest_auth(
                     peer: peer.clone(),
                     transport: state.transport,
                 };
-                ingest_audit::record(
-                    &state.audit,
-                    vec![IngestAuditRow::denied(&ctx, denial.code())],
-                )
-                .await;
-            }
+                IngestAuditRow::denied(&ctx, denial.code())
+            });
+            // 記録しない拒否（パスの形・無効）もキーの観測（抑えた数を出す点）にする。
+            let rows = state
+                .ingest
+                .throttle_key_denial(key.id, &key.name, row, now_ms);
+            ingest_audit::record(&state.audit, rows).await;
             return error_response(denial.status(), denial.code(), json!({}));
         }
     };
+    // 通った要求もキーの観測（窓が明けていれば抑えた `denied` の数を 1 行）。
+    let rows = state
+        .ingest
+        .throttle_key_denial(key.id, &key.name, None, now_ms);
+    ingest_audit::record(&state.audit, rows).await;
 
     if let Err(err) = state
         .api_keys

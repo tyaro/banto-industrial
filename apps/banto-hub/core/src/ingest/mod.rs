@@ -22,8 +22,11 @@
 //!   - [`limits`] モジュール: 件数の上限と接続ごとの頻度のトークンバケット
 //!     （[`limits::ConnectionLimiter`]、§7）。状態は接続の slot に置き、REST と WS で
 //!     共有する（[`IngestHub::admit`]）。
-//!   - [`audit`] モジュール: 監査の行（§8）。値は載せない。未知のキーの抑制
-//!     （[`audit::UnknownKeyThrottle`]）も slot に置く。
+//!   - [`audit`] モジュール: 監査の行（§8）。値は載せない。行の間引き（2026-10-21
+//!     オーナー決定）: 未知のキー（[`audit::UnknownKeyThrottle`]）と上限の端
+//!     （[`audit::LimitEdgeThrottle`]、limiter の中）は接続の slot に、照合できたキーの
+//!     `denied`（[`audit::KeyDenialThrottle`]）は `IngestHub` に 1 つ置く
+//!     （[`IngestHub::throttle_key_denial`]）。
 //!   - [`rest`] モジュール: `POST /api/v1/ingest/{id}/values`（§6.2）。
 //!
 //! 規則そのもの（キーの文法、`settings` の検証、上限の定数 `PUSH_LIMITS`、ブリッジの
@@ -426,7 +429,8 @@ struct Held {
 
 /// commit をまたいで引き継ぐ部分。
 ///
-/// `limiter` と `unknown_keys`（R2a-2c）は送信口の上限と監査の抑制の状態。接続の slot に
+/// `limiter`（上限の端の行の間引きを含む）と `unknown_keys`（R2a-2c）は送信口の上限と
+/// 監査の抑制の状態。接続の slot に
 /// 置くので、REST と WS が同じバケットを使い（§7「WS と REST の合計」）、改名をまたいで
 /// 続き、削除された接続の分は slot と一緒に消える（メモリは `push` 接続の数で頭打ち）。
 /// どちらも末端のロックで、`held` と同時には持たない。
@@ -497,6 +501,9 @@ struct Inner {
 pub struct IngestHub {
     inner: RwLock<Inner>,
     clock: Arc<dyn Clock>,
+    /// 照合できたキーの `denied` の行の間引き（R2a-2c、§8）。末端のロックで、`inner`
+    /// とも接続のロックとも同時には持たない。
+    key_denials: Mutex<audit::KeyDenialThrottle>,
 }
 
 impl std::fmt::Debug for IngestHub {
@@ -600,6 +607,7 @@ impl IngestHub {
         Self {
             inner: RwLock::new(Inner::default()),
             clock,
+            key_denials: Mutex::new(audit::KeyDenialThrottle::default()),
         }
     }
 
@@ -797,6 +805,36 @@ impl IngestHub {
         };
         let records = lock(&slot.shared.unknown_keys).observe(keys, now_ms);
         records
+    }
+
+    /// 照合できたキー `key_id` の監査の観測（§8 の `denied` の間引き、2026-10-21
+    /// オーナー決定）。`denial` は記録したい `denied` の行（無ければ拒否でない観測 -
+    /// 認証の層を通った要求・接続の確認で記録しない理由で断った要求）。記録すべき行を
+    /// 返す: 窓が明けて出す抑えた数の行（[`audit::IngestAuditRow::key_denials_suppressed`]）
+    /// が先、次に `denial`（キーごとに 1 時間に 100 行まで）。REST と WS（R2a-2d）は
+    /// 認証の層（`auth::require_ingest_auth`）と [`audit::refusal_rows`] でこれを通る。
+    pub fn throttle_key_denial(
+        &self,
+        key_id: i64,
+        key_name: &str,
+        denial: Option<audit::IngestAuditRow>,
+        now_ms: i64,
+    ) -> Vec<audit::IngestAuditRow> {
+        let verdict = lock(&self.key_denials).observe(key_id, key_name, denial.is_some(), now_ms);
+        let mut rows: Vec<audit::IngestAuditRow> = verdict
+            .flushed
+            .iter()
+            .map(audit::IngestAuditRow::key_denials_suppressed)
+            .collect();
+        if verdict.record {
+            rows.extend(denial);
+        }
+        rows
+    }
+
+    /// [`Self::throttle_key_denial`] が状態を持つキーの数（テスト用）。
+    pub fn tracked_key_denials(&self) -> usize {
+        lock(&self.key_denials).tracked()
     }
 
     /// 接続 `conn_id` の `state` の購読（R2a-2d の WebSocket が `state` を送るため）。

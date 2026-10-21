@@ -41,8 +41,18 @@
 //! 「超過中か」を持ち、超過が**始まったとき**に [`LimitEdge::Exceeded`]（種類・上限値）
 //! を 1 つ、次に上限をすべて通ったメッセージで [`LimitEdge::Cleared`]（その間に断った
 //! 件数）を 1 つ返す。超過が続く間は行を増やさない。
+//!
+//! 端の**行を書くこと**は、さらに接続ごとに 1 時間に 20 組（`Exceeded` と対の
+//! `Cleared` で 1 組）までに間引く（2026-10-21 オーナー決定、
+//! [`super::audit::LimitEdgeThrottle`]）。良いメッセージと悪いメッセージが交互に来ると
+//! 端がメッセージごとに出うる（20 / 秒のバケットでしか抑えられない）ため。超えた分は
+//! 組の数だけを、窓が明けた後に判定を受けた最初のメッセージで
+//! [`LimitEdge::Suppressed`] の 1 行にする。端の状態（`exceeded`）は間引きと関係なく
+//! 今までどおり持つ - 抑えた組の `Cleared` も状態としては正しく起きる。
 
 pub use banto_tags::{PushLimits, PUSH_LIMITS};
+
+use super::audit::LimitEdgeThrottle;
 
 /// 1 トークン（= 1 メッセージ・1 件）の milli 単位。
 const MILLI: u64 = 1_000;
@@ -87,7 +97,7 @@ impl LimitKind {
         }
     }
 
-    fn index(self) -> usize {
+    pub(crate) fn index(self) -> usize {
         match self {
             Self::TooManyItems => 0,
             Self::MessageRate => 1,
@@ -112,6 +122,9 @@ pub enum LimitEdge {
     Exceeded { kind: LimitKind, limit: u64 },
     /// 超過が終わった（`ingest_limit_cleared`、その間に断ったメッセージの数）。
     Cleared { kind: LimitKind, rejected: u64 },
+    /// 前の 1 時間の窓で行を書かずに抑えた超過の組の数（`ingest_limit_exceeded` に
+    /// `suppressed`）。[`super::audit::LimitEdgeThrottle`] だけが作る。
+    Suppressed { episodes: u64, window_start_ms: i64 },
 }
 
 /// [`ConnectionLimiter::admit`] の結果。
@@ -119,7 +132,8 @@ pub enum LimitEdge {
 pub struct Admission {
     /// 通したか、どの上限で断ったか。
     pub outcome: Result<(), LimitRefusal>,
-    /// このメッセージで起きた監査の端（無ければ空）。
+    /// このメッセージで記録する監査の端（無ければ空）。間引いた後のもの
+    /// （モジュールの doc「監査の端」）。
     pub edges: Vec<LimitEdge>,
 }
 
@@ -190,6 +204,8 @@ pub struct ConnectionLimiter {
     items: TokenBucket,
     /// 種類ごとの「超過中」と、その間に断ったメッセージの数（[`LimitKind::index`]）。
     exceeded: [Option<u64>; 3],
+    /// 端の行の間引き（行を書くことだけ。`exceeded` は間引かない）。
+    edge_audit: LimitEdgeThrottle,
 }
 
 impl ConnectionLimiter {
@@ -199,6 +215,7 @@ impl ConnectionLimiter {
             messages: TokenBucket::new(limits.messages_per_sec, limits.messages_burst),
             items: TokenBucket::new(limits.items_per_sec, limits.items_burst),
             exceeded: [None; 3],
+            edge_audit: LimitEdgeThrottle::default(),
         }
     }
 
@@ -228,6 +245,7 @@ impl ConnectionLimiter {
                 }
             }
         }
+        let edges = self.edge_audit.filter(edges, now_ms);
         Admission { outcome, edges }
     }
 
@@ -417,6 +435,62 @@ mod tests {
             }]
         );
         assert!(limiter.admit(1, 1_000).edges.is_empty());
+    }
+
+    /// 良いメッセージと悪いメッセージが交互に来ても、端の行は 1 時間に 20 組まで。
+    /// 抑えた組の間も端の状態は正しく動き（21 組目以降も「始まり」と「終わり」を
+    /// 判定し、記録した組の `rejected` は正しい）、窓が明けた後に通ったメッセージで
+    /// 抑えた組の数を 1 行。
+    #[test]
+    fn alternating_messages_produce_at_most_20_edge_pairs_per_hour() {
+        let mut limiter = ConnectionLimiter::new(PUSH_LIMITS);
+        let mut edges = Vec::new();
+        for n in 0..25_i64 {
+            let bad = limiter.admit(1_001, n * 1_000);
+            assert_eq!(kind_of(&bad), Some(LimitKind::TooManyItems), "{n}");
+            edges.extend(bad.edges);
+            let good = limiter.admit(1, n * 1_000);
+            assert_eq!(good.outcome, Ok(()), "{n}");
+            edges.extend(good.edges);
+        }
+        let mut expected = Vec::new();
+        for _ in 0..20 {
+            expected.push(LimitEdge::Exceeded {
+                kind: LimitKind::TooManyItems,
+                limit: 1_000,
+            });
+            expected.push(LimitEdge::Cleared {
+                kind: LimitKind::TooManyItems,
+                rejected: 1,
+            });
+        }
+        assert_eq!(edges, expected);
+        // 抑えている間も状態は動いている: 26 組目の `Exceeded` は抑えられ、`Cleared`
+        // も書かない（`exceeded` が残っていれば `rejected` が溜まり、ここで 2 になる）。
+        assert!(limiter.admit(1_001, 30_000).edges.is_empty());
+        assert!(limiter.admit(1, 30_000).edges.is_empty());
+        assert_eq!(
+            limiter.admit(1, 3_600_000).edges,
+            vec![LimitEdge::Suppressed {
+                episodes: 6,
+                window_start_ms: 0
+            }]
+        );
+        // 新しい窓では記録に戻り、`rejected` は 1（抑えた組の分を持ち越さない）。
+        assert_eq!(
+            limiter.admit(1_001, 3_601_000).edges,
+            vec![LimitEdge::Exceeded {
+                kind: LimitKind::TooManyItems,
+                limit: 1_000
+            }]
+        );
+        assert_eq!(
+            limiter.admit(1, 3_601_000).edges,
+            vec![LimitEdge::Cleared {
+                kind: LimitKind::TooManyItems,
+                rejected: 1
+            }]
+        );
     }
 
     /// 件数の超過の後に通ったメッセージで `TooManyItems` の `Cleared`（断った数 3）。
