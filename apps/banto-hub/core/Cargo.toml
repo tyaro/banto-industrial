@@ -33,6 +33,9 @@ banto-admin-services = { workspace = true }
 # I1: tag registry (PlcConnection/CollectionGroup/Tag) - hub's own SQLite
 # DB doubles as the registry DB (docs/tag-server-design.md §3.2 table).
 banto-tags = { path = "../../../crates/banto-tags" }
+# R2a-3a: 列→f64 の変換・列の解決・品質の梯子・PostgreSQL の接続オプションとエラー文言は
+# DB ブリッジ（banto-hub-sink、R2a-3b）と共有する crate に置く（`db_source` はそれを使う）。
+banto-db-source = { path = "../../../crates/banto-db-source" }
 # #392 A1（2026-10-10）: `profile_lock.rs` の排他の仕組み（Windows named mutex /
 # 非 Windows の flock / `profile.lock` 診断ファイル）は共有 crate に移した。
 # 以前ここにあった `[target.'cfg(not(windows))'.dependencies] libc` は

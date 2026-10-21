@@ -22,6 +22,11 @@
 //!
 //! ## Quality の状態機械（§4.3 の表）
 //!
+//! 梯子の**判断**（どの事象でどの品質にするか）は R2a-3a で共有 crate
+//! `banto-db-source` の純関数の状態機械（`GroupLadder`・`Verdict`）へ移した
+//! （DB ブリッジと同じ梯子を通すため）。ここは判断を受けて `ServerTagStore` へ
+//! 書く側（直前値・`ptime` の据え置きを含む）と、時刻・ログ・状態表示を持つ。
+//!
 //! | 事象                       | 書く値   | quality | 単位     |
 //! | -------------------------- | -------- | ------- | -------- |
 //! | 正常に列が取れた           | 変換値   | Good    | タグ     |
@@ -48,6 +53,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use banto_collect::Quality;
+use banto_db_source::{cell_verdict, GroupLadder, Verdict};
 use banto_tstore::Clock;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Executor, Row, SqlSafeStr};
@@ -168,14 +174,15 @@ struct GroupRuntime {
     plan: DbGroupPlan,
     resolved: ResolvedGroup,
     next_due: Instant,
-    /// 連続したグループ単位の失敗回数（§4.3「2周期連続で失敗したら Bad」）。
-    consecutive_failures: u32,
+    /// 連続したグループ単位の失敗の梯子（§4.3「2周期連続で失敗したら Bad」）。
+    /// 判断は `banto-db-source` の純関数の状態機械、書き込みはこちら。
+    ladder: GroupLadder,
     /// 「2行以上」の `warn` をこの接続世代で既に出したか（§6-8「先頭行採用
     /// ＋warn 1回」）。
     warned_multi_row: bool,
     /// 次に `describe_group` を再試行してよい時刻（レビュー対応）。`None`
     /// は「まだ一度もこの世代で再試行していない」-
-    /// `consecutive_failures` が初めて 2 に達したティックでは即座に
+    /// 梯子が初めて Bad に達したティックでは即座に
     /// 再試行してよい、という意味で使う（`wrapper_sql: None` のグループは
     /// [`poll_forever`] の起動時 describe が失敗した時点で `Some` を積む -
     /// そちらは「直前の describe からまだ間隔が空いていない」の意味）。
@@ -343,7 +350,7 @@ async fn poll_forever(pool: &PgPool, plan: &DbConnectionPlan, deps: &TaskDeps) -
             plan: group.clone(),
             resolved,
             next_due: now,
-            consecutive_failures: 0,
+            ladder: GroupLadder::new(),
             warned_multi_row: false,
             next_describe_retry,
             last_describe_error,
@@ -476,7 +483,7 @@ fn apply_redescribe_result(
                 return RedescribeEffect::NoChange;
             }
             group.resolved = resolved;
-            group.consecutive_failures = 0;
+            group.ladder.reset();
             group.last_describe_error = None;
             let info_log = format!(
                 "banto-hub: DB Source: {}.{} の SQL を再解析して復帰しました",
@@ -558,7 +565,7 @@ async fn run_group_tick(
     // レート制限付きで再 describe する - `describe` 失敗のまま・古い
     // wrapper のまま固定されないようにする（このモジュール doc comment
     // 「構造」節・PR レビュー指摘）。
-    let needs_redescribe = group.resolved.wrapper_sql.is_none() || group.consecutive_failures >= 2;
+    let needs_redescribe = group.resolved.wrapper_sql.is_none() || group.ladder.is_degraded();
     if needs_redescribe {
         let now = Instant::now();
         if describe_retry_due(group.next_describe_retry, now) {
@@ -601,11 +608,11 @@ async fn run_group_tick(
     if rows.is_empty() {
         // §4.3「0 行 → グループ単位 Bad」。クエリ自体は成功しているので
         // Stale の梯子（2周期）には乗せず、直ちに Bad にする。
+        let verdict = group.ladder.on_zero_rows();
         write_bad_tags(&group.resolved.bad_tags, deps, now_ms);
         for tag in &group.resolved.value_tags {
-            deps.store.set(&tag.tag_key, None, Quality::Bad, now_ms);
+            write_verdict(&deps.store, tag, verdict, now_ms);
         }
-        group.consecutive_failures = 0;
         deps.status
             .update_group(plan.connection_id, group.plan.group_id, |status| {
                 status.row_count_last = Some(0);
@@ -629,17 +636,14 @@ async fn run_group_tick(
     let row = &rows[0];
     for (index, tag) in group.resolved.value_tags.iter().enumerate() {
         let value: Option<f64> = row.try_get(index).unwrap_or(None);
-        // 非有限値（`'NaN'::float8` など）は JSON にも載せられないため Bad
-        // に倒す - 「欠測を隠さない」（設計 §4）の一環。
-        let (value, quality) = match value {
-            Some(x) if x.is_finite() => (Some(x), Quality::Good),
-            _ => (None, Quality::Bad),
-        };
-        deps.store.set(&tag.tag_key, value, quality, now_ms);
+        // NULL と非有限値（`'NaN'::float8` など）は Bad（`cell_verdict`）-
+        // 非有限値は JSON にも載せられない。「欠測を隠さない」（設計 §4）の
+        // 一環。
+        write_verdict(&deps.store, tag, cell_verdict(value), now_ms);
     }
     write_bad_tags(&group.resolved.bad_tags, deps, now_ms);
 
-    group.consecutive_failures = 0;
+    group.ladder.on_success();
     deps.status
         .update_group(plan.connection_id, group.plan.group_id, |status| {
             status.last_ok_at = Some(now_ms);
@@ -659,10 +663,10 @@ fn on_group_failure(
     deps: &TaskDeps,
     message: String,
 ) {
-    group.consecutive_failures = group.consecutive_failures.saturating_add(1);
+    let failure = group.ladder.on_query_failure();
     let now_ms = deps.clock.now_ms();
 
-    if group.consecutive_failures == 1 {
+    if failure.first {
         // 初回だけ warn（このモジュール doc comment「ログの抑制」節）。
         deps.log.err_line(&format!(
             "banto-hub: [WARN] DB Source: {}.{} のクエリが失敗しました: {message}",
@@ -670,18 +674,13 @@ fn on_group_failure(
         ));
     }
 
-    let degrade_to_bad = group.consecutive_failures >= 2;
     for tag in group
         .resolved
         .value_tags
         .iter()
         .chain(group.resolved.bad_tags.iter().map(|(tag, _)| tag))
     {
-        if degrade_to_bad {
-            deps.store.set(&tag.tag_key, None, Quality::Bad, now_ms);
-        } else {
-            write_stale(&deps.store, tag, now_ms);
-        }
+        write_verdict(&deps.store, tag, failure.verdict, now_ms);
     }
 
     deps.status
@@ -693,22 +692,34 @@ fn on_group_failure(
     });
 }
 
-/// 「直前値を残したまま Stale にする」（このモジュール doc comment の
-/// Quality 表）。直前値そのものが無い（まだ一度も読めていない）場合は
-/// Stale にする古い値が存在しないので `(None, Bad, now)` を書く - 値なしの
-/// Stale は「古い値がある」という嘘になるため。
-fn write_stale(store: &ServerTagStore, tag: &DbTagPlan, now_ms: i64) {
-    match store.get(&tag.tag_key) {
-        Some(previous) if previous.value.is_some() => {
-            store.set_with_observation_time(
-                &tag.tag_key,
-                previous.value,
-                Quality::Stale,
-                previous.ptime_ms,
-                now_ms,
-            );
+/// 梯子の判断（[`Verdict`]）を `ServerTagStore` へ書く、たった1つの経路。
+///
+/// - `Good(値)`: 値を Good で書く。
+/// - `Bad`: 値なしで Bad を書く。
+/// - `Stale`: 「直前値を残したまま Stale にする」（このモジュール doc comment の
+///   Quality 表）- 直前値と**直前の `ptime_ms`** を据え置く（値が実際に読めた
+///   時刻を後ろへずらさない）。直前値そのものが無い（まだ一度も読めていない）
+///   場合は `Verdict::settle` が Bad に落とす - 値なしの Stale は「古い値が
+///   ある」という嘘になるため。
+fn write_verdict(store: &ServerTagStore, tag: &DbTagPlan, verdict: Verdict, now_ms: i64) {
+    let previous = match verdict {
+        Verdict::Stale => store.get(&tag.tag_key).filter(|p| p.value.is_some()),
+        Verdict::Good(_) | Verdict::Bad => None,
+    };
+    match (verdict.settle(previous.is_some()), previous) {
+        (Verdict::Good(value), _) => store.set(&tag.tag_key, Some(value), Quality::Good, now_ms),
+        (Verdict::Stale, Some(previous)) => store.set_with_observation_time(
+            &tag.tag_key,
+            previous.value,
+            Quality::Stale,
+            previous.ptime_ms,
+            now_ms,
+        ),
+        // `settle` が直前値の無い Stale を Bad にするので `(Stale, None)` は
+        // 来ないが、来ても値なしの Stale は書かない。
+        (Verdict::Stale, None) | (Verdict::Bad, _) => {
+            store.set(&tag.tag_key, None, Quality::Bad, now_ms)
         }
-        _ => store.set(&tag.tag_key, None, Quality::Bad, now_ms),
     }
 }
 
@@ -718,7 +729,7 @@ fn write_bad_tags(
     now_ms: i64,
 ) {
     for (tag, _) in bad_tags {
-        deps.store.set(&tag.tag_key, None, Quality::Bad, now_ms);
+        write_verdict(&deps.store, tag, Verdict::Bad, now_ms);
     }
 }
 
@@ -753,7 +764,7 @@ fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
 pub(crate) fn mark_connection_bad(plan: &DbConnectionPlan, store: &ServerTagStore, now_ms: i64) {
     for group in &plan.groups {
         for tag in &group.tags {
-            store.set(&tag.tag_key, None, Quality::Bad, now_ms);
+            write_verdict(store, tag, GroupLadder::connection_lost(), now_ms);
         }
     }
 }
@@ -810,7 +821,7 @@ mod tests {
                 bad_tags: Vec::new(),
             },
             next_due: Instant::now(),
-            consecutive_failures: 0,
+            ladder: GroupLadder::new(),
             warned_multi_row: false,
             next_describe_retry: None,
             last_describe_error: None,
@@ -889,7 +900,7 @@ mod tests {
         let stale = deps.store.get_reading("tag:1").unwrap();
         assert_eq!(stale.last_good_ms, Some(1_000));
         assert_eq!(stale.quality_since_ms, Some(2_000));
-        write_stale(&deps.store, &tag(1), 2_500);
+        write_verdict(&deps.store, &tag(1), Verdict::Stale, 2_500);
         assert_eq!(deps.store.get_reading("tag:1"), Some(stale));
         clock.set_now_ms(3_000);
 
@@ -901,12 +912,12 @@ mod tests {
         let bad = deps.store.get_reading("tag:1").unwrap();
         assert_eq!(bad.quality_since_ms, Some(3_000));
         assert_eq!(bad.last_good_ms, Some(1_000));
-        assert_eq!(group.consecutive_failures, 2);
+        assert_eq!(group.ladder.consecutive_failures(), 2);
         let status = deps.status.snapshot();
         assert_eq!(status[0].groups[0].last_error.as_deref(), Some("boom"));
     }
 
-    /// 直前値が無いタグは Stale ではなく Bad（`write_stale` の doc comment）。
+    /// 直前値が無いタグは Stale ではなく Bad（`write_verdict` の doc comment）。
     #[test]
     fn a_tag_that_never_had_a_value_goes_straight_to_bad() {
         let deps = deps();
@@ -1051,7 +1062,7 @@ mod tests {
 
     /// §4.3 拡張: `wrapper_sql: None` のグループが再 describe に成功すると
     /// 復帰する - `resolved` が差し替わり、`last_describe_error` が消え、
-    /// `consecutive_failures` が 0 に戻り、`Recovered` を返す。
+    /// 梯子が最初に戻り、`Recovered` を返す。
     #[test]
     fn apply_redescribe_result_recovers_a_group_whose_statement_was_broken() {
         let mut group = group_runtime();
@@ -1063,7 +1074,7 @@ mod tests {
                 TagBadReason::StatementNotPrepared("relation does not exist".to_string()),
             )],
         };
-        group.consecutive_failures = 0;
+        group.ladder.reset();
         group.last_describe_error = Some("relation does not exist".to_string());
 
         let recovered = ResolvedGroup {
@@ -1074,7 +1085,7 @@ mod tests {
         let effect = apply_redescribe_result(&mut group, "erp", Ok(recovered.clone()));
 
         assert_eq!(group.resolved, recovered);
-        assert_eq!(group.consecutive_failures, 0);
+        assert_eq!(group.ladder.consecutive_failures(), 0);
         assert_eq!(group.last_describe_error, None);
         match effect {
             RedescribeEffect::Recovered {
@@ -1095,7 +1106,8 @@ mod tests {
     #[test]
     fn apply_redescribe_result_keeps_the_old_wrapper_when_describe_is_unchanged() {
         let mut group = group_runtime();
-        group.consecutive_failures = 2;
+        group.ladder.on_query_failure();
+        group.ladder.on_query_failure();
         let before = group.resolved.clone();
 
         let same = before.clone();
@@ -1106,7 +1118,8 @@ mod tests {
             "unchanged describe keeps the wrapper"
         );
         assert_eq!(
-            group.consecutive_failures, 2,
+            group.ladder.consecutive_failures(),
+            2,
             "no reset without an actual change"
         );
         assert_eq!(effect, RedescribeEffect::NoChange);

@@ -152,7 +152,9 @@ export const RUST_PACKAGES = {
 /**
  * Rust の対象（`-p` に並ぶパッケージ）にこれらのどれかが入ったら走らせるジョブ。
  * 各ジョブが build / test するパッケージ（ci.yml の各ジョブの cargo の `-p`）。
- * - rust-db-source: `-p banto-hub-core`（db_source）と `-p banto-hub-sink`
+ * - rust-db-source: `-p banto-hub-core`（db_source）と `-p banto-hub-sink`、加えて
+ *   `-p banto-db-source`（R2a-3a。db_source・DB ブリッジが共有する crate。単体テストは
+ *   PostgreSQL なしで走るが、ジョブの段で `cargo test -p banto-db-source` も流す）
  * - linux-clippy: `-p chronogazer-elev -p banto-hub-core --lib`、`-p banto-hub-host
  *   --all-targets`（R1-7a で bin が移った先）、加えて
  *   `-p banto-instance-lock` の clippy・test（その段は Rust の対象にこの crate が
@@ -166,7 +168,7 @@ export const RUST_PACKAGES = {
  */
 export const JOB_PACKAGES = {
 	run_driver_api: ['banto-driver-api', 'banto-driver-conformance'],
-	run_rust_db_source: ['banto-hub-core', 'banto-hub-sink'],
+	run_rust_db_source: ['banto-db-source', 'banto-hub-core', 'banto-hub-sink'],
 	run_linux_clippy: [
 		'chronogazer-elev',
 		'banto-hub-core',
