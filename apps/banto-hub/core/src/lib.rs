@@ -180,9 +180,10 @@
 //!   ここに残る。挙動は不変）
 //!
 //! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
-//!   （外の送り手が Hub へ値を送り込む接続）。R2a-2a の時点では静的な部分の
-//!   [`ingest::driver::PushDriver`]（`DriverBase`、レジストリには登録しない）だけ。
-//!   受信（`IngestHub`）は R2a-1c、送信口は R2a-2c / R2a-2d
+//!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
+//!   [`ingest::driver::PushDriver`]（`DriverBase`、レジストリには登録しない、R2a-2a）と、
+//!   受信側の [`ingest::IngestHub`]（保持値・Live の判定・epoch。Hub の収集の
+//!   `ExternalSource`、R2a-1c）。送信口（REST・WebSocket）は R2a-2c / R2a-2d
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み

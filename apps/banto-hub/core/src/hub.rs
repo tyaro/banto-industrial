@@ -198,9 +198,9 @@ use tokio::sync::{broadcast, watch};
 
 use banto_broker::{BrokerConnectionStatus, BrokerError, BrokerHandle, ReadOnlyHandle};
 use banto_collect::{
-    build_config_from, connections_with_collected_groups, ApplyReport, CollectEvent, Collector,
-    CollectorOptions, ConnectionStatus, CurrentReading, CurrentSample, CurrentValuesHandle,
-    EventSink, Quality, RegistrySnapshot,
+    connections_with_collected_groups, ApplyReport, CollectEvent, Collector, CollectorOptions,
+    ConnectionStatus, CurrentReading, CurrentSample, CurrentValuesHandle, EventSink,
+    ExternalSource, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
@@ -213,6 +213,7 @@ use crate::broker_glue::{hub_client_factory, BrokerSimRegistry, HubSessions};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::db_source::{self, DbConnectionStatus, DbSourceEngine};
 use crate::diag_log::DiagLog;
+use crate::ingest::{build_hub_config, IngestHub};
 
 /// Build the non-persistent runtime snapshot for a collection mode.
 ///
@@ -476,6 +477,12 @@ pub struct TagEntry {
     /// `banto_collect::simulation`/`crate::broker_glue::BrokerSimRegistry`),
     /// not read from a real PLC.
     pub simulation: bool,
+    /// R2a-1c（docs/banto-hub-ingest-design.md §3.3・§12 Q14）: 持ち主の接続が
+    /// `push`（送り手が値を送り込む接続）か。**wire には出さない**（catalog の形は
+    /// 変えない）- `crate::value_source` が `value_source = "push"` を決めるためだけに
+    /// 持つ（`push` の値は実機でもシミュレーションでもない）。
+    #[serde(skip)]
+    pub push: bool,
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
@@ -672,6 +679,7 @@ fn catalog_entries(snapshot: &RegistrySnapshot) -> Vec<TagEntry> {
             expression: tag.expression.clone(),
             retain: tag.retain,
             simulation: conn.simulation,
+            push: conn.protocol == banto_tags::PUSH_PROTOCOL,
         });
     }
 
@@ -912,7 +920,7 @@ pub struct CollectorManager {
     /// /events` reads the durable `collect_events` table directly - but the
     /// collector-internal event flow (`plc_connected`/`plc_disconnected`/etc.)
     /// still needs a stable sink to persist to. #533: no threshold edges -
-    /// [`build_config_from`] gives no tag any limits, so the hub never
+    /// [`banto_collect::build_config_from`] gives no tag any limits, so the hub never
     /// judges a threshold.)
     events: EventSink,
     /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory,
@@ -975,6 +983,16 @@ pub struct CollectorManager {
     /// （設計 §3-3: `read_current` は `tag_kind != "plc"` を全部そこから
     /// 読むので、新しい種別を足しても読み出し側は無改造）。
     db_source: Arc<DbSourceEngine>,
+    /// R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 取り込み口 `push` の受信側。
+    /// `push` 接続の外部ソースとして、この manager が作る `Collector` に
+    /// `start_with_sources` で渡す（`apply_config` は作った時の源を使い続ける）。
+    /// 計画の commit（`push` 接続・キーの集合・ブリッジの送る集合）は catalog の
+    /// 入れ替えと同じ点（[`Self::rebuild`] の 2 つの枝と [`Self::commit_catalog`]）、
+    /// 収集の遷移に連動する保持値の破棄と epoch は
+    /// `crate::controller::CollectionController`（[`Self::ingest_hub`] 経由。
+    /// `db_source` と同じ理由で manager の側には置かない）。`db_source` と同じく
+    /// この manager の内部で作る（`Self::new` の引数を増やさない）。
+    ingest: Arc<IngestHub>,
     /// The running `Collector` itself (`None` when nothing is enabled to
     /// collect - a normal state, not an error, see
     /// [`CollectorManager::rebuild`]). **`tokio::sync::Mutex`, not
@@ -1171,6 +1189,7 @@ impl CollectorManager {
         let events = EventSink::new(pool.clone());
         let (revision_tx, _revision_rx) = watch::channel(0);
         let db_source = Arc::new(DbSourceEngine::new(computed.server_store(), clock.clone()));
+        let ingest = Arc::new(IngestHub::new(clock.clone()));
         Self {
             #[cfg(test)]
             fail_next_apply: std::sync::atomic::AtomicBool::new(false),
@@ -1185,6 +1204,7 @@ impl CollectorManager {
             sim_registry,
             computed,
             db_source,
+            ingest,
             collector: AsyncMutex::new(None),
             inner: Mutex::new(Inner {
                 map: Arc::new(TagMap::empty()),
@@ -1244,6 +1264,13 @@ impl CollectorManager {
     /// comment 参照）。
     pub fn db_source_engine(&self) -> Arc<DbSourceEngine> {
         self.db_source.clone()
+    }
+
+    /// R2a-1c: 取り込み口 `push` の受信側（`ingest` フィールドの doc comment 参照）。
+    /// `crate::controller::CollectionController` が収集の遷移で
+    /// `on_collection_*` を呼ぶため、送信口（R2a-2c / R2a-2d）が `apply` を呼ぶために取る。
+    pub fn ingest_hub(&self) -> Arc<IngestHub> {
+        self.ingest.clone()
     }
 
     /// 外部 DB 連携 S2: `GET /api/v1/status`・`GET /api/status` の
@@ -1445,7 +1472,7 @@ impl CollectorManager {
             }
         };
 
-        let mut config = match build_config_from(&snapshot) {
+        let mut config = match build_hub_config(&snapshot) {
             Ok(config) => config,
             Err(err) => {
                 let message = err.to_string();
@@ -1529,6 +1556,7 @@ impl CollectorManager {
             // `computed_plan`'s own comment above.
             self.computed.commit(computed_plan);
             self.db_source.commit(db_source_plan);
+            self.ingest.commit(&snapshot);
             // 停止は削除と直列（`Self::writer_gate`）。`stop` が終わるまで持つ。
             let _writer_gate = self.writer_gate.lock().await;
             let old_collector = self.collector.lock().await.take();
@@ -1586,13 +1614,14 @@ impl CollectorManager {
                     Err(err) => Err(err.to_string()),
                 }
             } else {
-                match Collector::start_with_client_factory(
+                match Collector::start_with_sources(
                     config,
                     &self.data_dir,
                     self.clock.clone(),
                     self.events.clone(),
                     self.options,
                     factory,
+                    Some(self.ingest.clone() as Arc<dyn ExternalSource>),
                 )
                 .await
                 {
@@ -1628,6 +1657,7 @@ impl CollectorManager {
         // reasoning as the `group_count() == 0` branch above.
         self.computed.commit(computed_plan);
         self.db_source.commit(db_source_plan);
+        self.ingest.commit(&snapshot);
         let new_revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             self.server_store()
@@ -2301,7 +2331,7 @@ impl CollectorManager {
                 return Err(message);
             }
         };
-        if let Err(err) = build_config_from(snapshot) {
+        if let Err(err) = build_hub_config(snapshot) {
             let message = err.to_string();
             self.set_last_error(message.clone());
             return Err(message);
@@ -2309,6 +2339,7 @@ impl CollectorManager {
 
         self.computed.commit(computed_plan);
         self.db_source.commit(db_source_plan);
+        self.ingest.commit(snapshot);
         let revision = {
             let mut inner = self.inner.lock().expect("hub state lock poisoned");
             self.server_store()
@@ -2407,7 +2438,7 @@ impl CollectorManager {
             message
         })?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
-        let mut config = build_config_from(&runtime_snapshot).map_err(|err| {
+        let mut config = build_hub_config(&runtime_snapshot).map_err(|err| {
             let message = err.to_string();
             self.set_last_error(message.clone());
             message
@@ -2463,13 +2494,14 @@ impl CollectorManager {
                     Err(err) => Err(err.to_string()),
                 }
             } else {
-                match Collector::start_with_client_factory(
+                match Collector::start_with_sources(
                     config,
                     &self.data_dir,
                     self.clock.clone(),
                     self.events.clone(),
                     self.options,
                     factory,
+                    Some(self.ingest.clone() as Arc<dyn ExternalSource>),
                 )
                 .await
                 {

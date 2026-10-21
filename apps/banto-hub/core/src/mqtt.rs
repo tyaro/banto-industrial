@@ -690,6 +690,7 @@ mod tests {
             expression: None,
             retain: false,
             simulation: false,
+            push: false,
         };
         assert_eq!(topic_for("banto", &entry), "banto/line1/fast/temp01");
     }

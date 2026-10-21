@@ -930,6 +930,7 @@ mod tests {
             expression: None,
             retain: false,
             simulation: false,
+            push: false,
         }
     }
 
@@ -952,6 +953,7 @@ mod tests {
             expression: Some(expression.to_string()),
             retain: false,
             simulation: false,
+            push: false,
         }
     }
 

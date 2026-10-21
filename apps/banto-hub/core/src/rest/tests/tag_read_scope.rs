@@ -161,6 +161,7 @@ fn metadata_test_tag(tag_kind: &str, simulation: bool, enabled: bool) -> TagEntr
             .then(|| "line1.fast.temp + 1".to_string()),
         retain: false,
         simulation,
+        push: false,
     }
 }
 

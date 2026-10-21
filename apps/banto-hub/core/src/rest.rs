@@ -95,8 +95,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use banto_broker::{BrokerConnectionStatus, BrokerError};
 use banto_collect::{
-    build_config_from, connections_with_collected_groups, ApplyReport, ConnectionStatus, Quality,
-    RegistrySnapshot,
+    connections_with_collected_groups, ApplyReport, ConnectionStatus, Quality, RegistrySnapshot,
 };
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
 use banto_tstore::LocalDate;
@@ -1060,7 +1059,11 @@ fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
     // 実行可能」を保証する T14-3 の設計どおり）。
     crate::db_source::build_plan(snapshot)
         .map_err(|err| preflight_api_error(format!("DB Source の検証に失敗しました: {err}")))?;
-    build_config_from(snapshot)
+    // R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 収集と同じ計画
+    // （`push` 接続を受信側から収集する `PushSource::Available`）で検証する。
+    // R2a-2a〜R2a-1c の間は厳格版の `build_config_from` で、有効な `push` 接続を
+    // `pushSourceUnavailable` で断っていた。
+    crate::ingest::build_hub_config(snapshot)
         .map(|_| ())
         .map_err(|err| preflight_api_error(err.to_string()))
 }
