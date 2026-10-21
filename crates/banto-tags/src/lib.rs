@@ -29,7 +29,17 @@
 //!   `Settings` ([`settings_to_api`]), the flat-columns <-> `settings` adapter
 //!   (`settings_json::legacy`) and validation through a `DriverRegistry`
 //!   ([`validate_settings_with_registry`], [`PlcConnectionService::with_registry`]).
-//!   Not used by the save path yet.
+//!   Since R2b-1d (migration `0025`) the save path stores `settings` for every protocol
+//!   and the flat fields of [`PlcConnection`] are a read-only projection of it.
+//! - [`connection_secret`] (R2b-1d, design §3.3・§5.3): the sealed secret rows
+//!   (`plc_connection_secrets`) a connection's `settings` refers to with
+//!   `{"$secret": "<ref>"}`, written and deleted in the connection's own transaction.
+//!   This crate never seals or opens a secret (banto-hub's `secrets` module does) and
+//!   refuses a plaintext value under a secret key ([`check_settings_shape`]).
+//! - [`upgrade`] (R2b-1d, design §6.4・§6.7): the app-independent pieces of the run-up to
+//!   the irreversible migration `0025` - leftover cleanup, "is `0025` pending", and the
+//!   password-free backup (`upgrade::backup_before_0025`) - shared by banto-hub and
+//!   ChronoGazer, which call them before [`migrate`].
 //!
 //! This crate is also the first real-world proof of consuming `banto-core`/
 //! `banto-storage` via a git tag reference rather than a workspace path
@@ -44,11 +54,13 @@
 //! file, plan.md §5), so connecting is the consuming app's job.
 
 pub mod collection_group;
+pub mod connection_secret;
 pub mod plc_connection;
 pub mod push;
 pub mod scaling;
 pub mod settings_json;
 pub mod tag;
+pub mod upgrade;
 
 // Crate-internal helpers shared by the three entity modules above - not
 // part of the public API (see `support.rs`'s doc comment).
@@ -57,6 +69,11 @@ mod support;
 pub use collection_group::{
     CollectionGroup, CollectionGroupCascadeOutcome, CollectionGroupInput, CollectionGroupService,
     ALLOWED_PERIOD_MS,
+};
+pub use connection_secret::{
+    builtin_secret_keys, check_settings_shape, SealedSecretRow, SecretChange, SecretChanges,
+    SecretRefLookup, StoredSecretRow, PASSWORD_KEY, SCHEME_DPAPI_MACHINE_V1, SCHEME_PLAIN_V1,
+    SECRET_REF_LEN,
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
@@ -99,10 +116,26 @@ pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_tags";
 /// migrator tracks applied versions in [`MIGRATIONS_TABLE`]), so it is safe
 /// to call on every app startup, same as banto's `db.rs::init_db`.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), BantoError> {
+    migrator()
+        .run(pool)
+        .await
+        .map_err(|err| BantoError::Storage(err.to_string()))
+}
+
+/// The embedded migrator with this crate's bookkeeping table.
+fn migrator() -> sqlx::migrate::Migrator {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
     migrator
-        .run(pool)
+}
+
+/// Run this crate's embedded migrations up to and including `target` only
+/// (sqlx's `run_to`). The Hub's dry run (R2b-1d, `upgrade::migrate_before_0025`)
+/// brings an older copy (alpha.32 and before: no `settings`, no `cpu_type`...)
+/// up to `0024` before it reads the pre-`0025` columns.
+pub async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<(), BantoError> {
+    migrator()
+        .run_to(target, pool)
         .await
         .map_err(|err| BantoError::Storage(err.to_string()))
 }
@@ -134,6 +167,9 @@ mod tests {
             tables,
             vec![
                 "collection_groups".to_string(),
+                // R2b-1d (migration 0025): the sealed secrets a connection's
+                // `settings` refers to.
+                "plc_connection_secrets".to_string(),
                 "plc_connections".to_string(),
                 "tags".to_string(),
             ]

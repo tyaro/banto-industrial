@@ -52,7 +52,7 @@
 //! 完了と打ち切りを終了前のログで区別する。通常の STOP / Ctrl-C は
 //! 設定の flush のまま打ち切らない。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant as StdInstant};
@@ -71,6 +71,7 @@ use crate::group::{
 };
 use crate::hub_api::{
     HubApi, HubApiError, SinkConfig, SinkConfigConnection, SinkConfigGroup, SinkStatusPush,
+    UnavailableConnection,
 };
 use crate::log::{log_err_line, log_line};
 use crate::source::{BridgeStop, BridgeSupervisor};
@@ -230,6 +231,34 @@ pub fn plan_changes(
             plan.groups_to_start.push(group.clone());
         }
     }
+    // R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: グループの中身は同じでも、
+    // 引く接続が設定から**消えた**（削除・Hub がパスワードを読めなくなった
+    // `unavailableConnections`）か、**現れた**（入れ直して読めるようになった）なら、その
+    // グループも作り直す。消えた接続の flusher は止めるので、そのまま走らせると誰も書かない
+    // キューに溜め続け、状態も古いまま。現れた接続では、壊れたままの（`MissingConnection` /
+    // 読めない）グループを動かす。接続の中身が変わっただけ（同じ id が残る）では作り直さない
+    // （キューを失わない）。
+    let appeared: HashSet<i64> = desired
+        .connections
+        .iter()
+        .map(|c| c.id)
+        .filter(|id| !applied_connections.contains_key(id))
+        .collect();
+    let vanished: HashSet<i64> = applied_connections
+        .keys()
+        .copied()
+        .filter(|id| !desired_connections.contains_key(id))
+        .collect();
+    for group in &desired.groups {
+        let unchanged = applied_groups.get(&group.id) == Some(group);
+        if unchanged
+            && (appeared.contains(&group.db_connection_id)
+                || vanished.contains(&group.db_connection_id))
+        {
+            plan.groups_to_stop.push(group.id);
+            plan.groups_to_start.push(group.clone());
+        }
+    }
 
     plan.groups_to_stop.sort_unstable();
     plan.connections_to_stop.sort_unstable();
@@ -386,6 +415,13 @@ impl Engine {
             .iter()
             .map(|c| (c.id, c.clone()))
             .collect();
+        // R2b-1d（設計 §5.4）: Hub がパスワードを読めない接続（`connections` には無い）。
+        // これを引くグループは繋がずに理由を出す（[`Self::start_group`]）。
+        let unavailable: HashMap<i64, UnavailableConnection> = desired
+            .unavailable_connections
+            .iter()
+            .map(|c| (c.id, c.clone()))
+            .collect();
         for connection in &plan.connections_to_start {
             match build_pool(connection) {
                 Ok(pool) => {
@@ -410,7 +446,7 @@ impl Engine {
         // 4. グループを開始する。
         for group in &plan.groups_to_start {
             let carried = carried_dropped.get(&group.id).copied().unwrap_or(0);
-            self.start_group(group, &connections, carried);
+            self.start_group(group, &connections, &unavailable, carried);
         }
 
         self.applied_groups = desired.groups.iter().map(|g| (g.id, g.clone())).collect();
@@ -423,8 +459,22 @@ impl Engine {
         &mut self,
         group: &SinkConfigGroup,
         connections: &HashMap<i64, SinkConfigConnection>,
+        unavailable: &HashMap<i64, UnavailableConnection>,
         carried_dropped: u64,
     ) {
+        if let Some(connection) = unavailable.get(&group.db_connection_id) {
+            self.mark_broken(
+                group.id,
+                GroupSetupError::ConnectionUnavailable {
+                    id: connection.id,
+                    name: connection.name.clone(),
+                    reason: connection.reason.clone(),
+                }
+                .message(),
+                carried_dropped,
+            );
+            return;
+        }
         if !connections.contains_key(&group.db_connection_id) {
             self.mark_broken(
                 group.id,
@@ -1110,7 +1160,75 @@ mod tests {
             generated_at: 0,
             groups,
             connections,
+            unavailable_connections: Vec::new(),
         }
+    }
+
+    /// R2b-1d (design §5.4): when the group's connection disappears from `connections`
+    /// (Hub cannot read its password any more → `unavailableConnections`, or deleted),
+    /// the unchanged group is restarted too (so it is marked broken with the reason and
+    /// does not queue rows nobody will write); when the connection comes back (password
+    /// re-entered), the still-broken group is restarted again. A connection whose
+    /// content changed (same id stays) still restarts only the connection.
+    #[test]
+    fn a_vanished_or_reappeared_connection_restarts_its_unchanged_groups() {
+        let groups = vec![group(1, 10, "t1"), group(2, 11, "t2")];
+        let both = vec![connection(10, "pw"), connection(11, "pw")];
+        let (ag, ac) = applied(&groups, &both);
+        let mut gone = desired(groups.clone(), vec![connection(11, "pw")]);
+        gone.unavailable_connections = vec![UnavailableConnection {
+            id: 10,
+            name: "db10".to_string(),
+            reason: "undecryptable".to_string(),
+        }];
+        let plan = plan_changes(&ag, &ac, &gone);
+        assert_eq!(plan.connections_to_stop, vec![10]);
+        assert_eq!(plan.groups_to_stop, vec![1]);
+        assert_eq!(
+            plan.groups_to_start
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+
+        let (ag, ac) = applied(&groups, &[connection(11, "pw")]);
+        let plan = plan_changes(&ag, &ac, &desired(groups.clone(), both));
+        assert_eq!(
+            plan.connections_to_start
+                .iter()
+                .map(|c| c.id)
+                .collect::<Vec<_>>(),
+            vec![10]
+        );
+        assert_eq!(plan.groups_to_stop, vec![1]);
+        assert_eq!(
+            plan.groups_to_start
+                .iter()
+                .map(|g| g.id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+
+    /// R2b-1d (design §5.4): a group whose connection the Hub lists as unavailable is
+    /// never given a flusher - its setup error says the Hub cannot read the password.
+    #[test]
+    fn the_unavailable_message_names_the_connection_and_the_reason() {
+        let message = GroupSetupError::ConnectionUnavailable {
+            id: 10,
+            name: "erp".to_string(),
+            reason: "missing".to_string(),
+        }
+        .message();
+        assert!(
+            message.contains("Hub でパスワードを読めません"),
+            "{message}"
+        );
+        assert!(
+            message.contains("erp") && message.contains("missing"),
+            "{message}"
+        );
     }
 
     #[test]

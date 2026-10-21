@@ -7,7 +7,8 @@
 //!
 //! - 旧: `PlcConnectionService::create` の入口の `validate_plc_connection_input`
 //!   （非公開なので、実際の書き込みの入口を通す。DB は `banto_tags::migrate` を流した
-//!   メモリの SQLite）。
+//!   メモリの SQLite。R2b-1d から `with_registry` は (1) の後にレジストリも走らせるので、
+//!   旧規則だけの `PlcConnectionService::new` を通す）。
 //! - 新: `legacy::validate_flat_with_registry`（正規化 → `settings_from_flat` →
 //!   `settings_to_api` → 実ドライバの `validate_config` → REST の綴りの項目名）。レジストリは
 //!   `tests/common` の `hub_drivers()`（`banto_drivers::builtin()` + `host_provided_drivers()`、
@@ -128,9 +129,18 @@ fn base(protocol: &str) -> PlcConnectionInput {
         cpu_type: None,
         database: is_postgres.then(|| "appdb".to_string()),
         username: is_postgres.then(|| "alice".to_string()),
-        password: None,
+        secrets: Default::default(),
         settings: None,
     }
+}
+
+/// R2b-1d: the REST tri-state of `password`, sealed the way banto-hub's entrances seal it.
+fn sealed_password(password: Option<&str>) -> banto_tags::SecretChanges {
+    banto_hub_core::secrets::password_changes(
+        &banto_hub_core::secrets::r2b1d_connection_secrets(),
+        password,
+    )
+    .expect("seal")
 }
 
 fn with(protocol: &str, edit: impl FnOnce(&mut PlcConnectionInput)) -> PlcConnectionInput {
@@ -143,7 +153,10 @@ fn field_set(errors: impl IntoIterator<Item = String>) -> BTreeSet<String> {
     errors.into_iter().collect()
 }
 
-async fn memory_service(registry: std::sync::Arc<DriverRegistry>) -> PlcConnectionService {
+/// 書き込みの入口を通すメモリの SQLite のサービス。`registry` が `None` なら旧規則だけ
+/// （`PlcConnectionService::new`、設計 §4.2 の (1)）、`Some` なら R2b-1d の配線
+/// （`with_registry`: (1) が通ったときだけ (2)〜(4)）。
+async fn memory_service(registry: Option<std::sync::Arc<DriverRegistry>>) -> PlcConnectionService {
     let pool = SqlitePoolOptions::new()
         .max_connections(1)
         .connect("sqlite::memory:")
@@ -151,7 +164,10 @@ async fn memory_service(registry: std::sync::Arc<DriverRegistry>) -> PlcConnecti
         .expect("memory sqlite");
     banto_tags::migrate(&pool).await.expect("migrate");
     // `settings.bridge.db_connection_id` が指す postgres 接続（id = 1）。
-    let service = PlcConnectionService::with_registry(pool, registry);
+    let service = match registry {
+        Some(registry) => PlcConnectionService::with_registry(pool, registry),
+        None => PlcConnectionService::new(pool),
+    };
     service
         .create(base("postgres"))
         .await
@@ -349,7 +365,7 @@ fn rows() -> Vec<Row> {
     for password in [None, Some(""), Some("pw"), Some("   ")] {
         add(
             format!("postgres: password {password:?}"),
-            with("postgres", |i| i.password = password.map(str::to_string)),
+            with("postgres", |i| i.secrets = sealed_password(password)),
             ok(),
         );
     }
@@ -366,7 +382,7 @@ fn rows() -> Vec<Row> {
         );
         add(
             format!("{protocol}: password set (dropped)"),
-            with(protocol, |i| i.password = Some("pw".to_string())),
+            with(protocol, |i| i.secrets = sealed_password(Some("pw"))),
             dropped(
                 "postgres 以外の database / username / password は旧い検証が断る（設計 §4.2 (1)）",
                 &["password"],
@@ -545,7 +561,7 @@ fn rows() -> Vec<Row> {
 async fn the_old_flat_validation_and_the_registry_reject_the_same_inputs() {
     let drivers = common::hub_drivers();
     let registry = drivers.registry.clone();
-    let service = memory_service(registry.clone()).await;
+    let service = memory_service(None).await;
 
     let mut report = Vec::new();
     for row in rows() {
@@ -595,7 +611,7 @@ async fn the_old_flat_validation_and_the_registry_reject_the_same_inputs() {
 async fn message_differences_are_exactly_the_known_ones() {
     let drivers = common::hub_drivers();
     let registry = drivers.registry.clone();
-    let service = memory_service(registry.clone()).await;
+    let service = memory_service(None).await;
     let mut seen = BTreeSet::new();
     for row in rows() {
         let old = old_errors(&service, &row.input).await;
@@ -629,4 +645,31 @@ async fn message_differences_are_exactly_the_known_ones() {
         "\n{}",
         seen.iter().cloned().collect::<Vec<_>>().join("\n")
     );
+}
+
+/// R2b-1d の配線（設計 §4.2、2026-10-21 の決定「(1) が断ったら (2)〜(4) は走らせず、(1) の
+/// エラーだけを返す」）: 本番と同じレジストリの `with_registry` の書き込みの入口は、表の全行で、
+/// 旧い検証 (1) が断るならその `(項目, 文言)` をそのまま、通るならレジストリの検証の
+/// `(項目, 文言)` を返す（どちらも通れば保存する）。今の画面とテストが見るエラーの文言は
+/// (1) のまま。
+#[tokio::test]
+async fn the_registry_service_returns_the_old_errors_first_then_the_registrys() {
+    let drivers = common::hub_drivers();
+    let registry = drivers.registry.clone();
+    let old_service = memory_service(None).await;
+    let service = memory_service(Some(registry.clone())).await;
+    let mut report = Vec::new();
+    for row in rows() {
+        let old = old_errors(&old_service, &row.input).await;
+        let new = new_errors(&registry, &row.input);
+        let combined = old_errors(&service, &row.input).await;
+        let want = if old.is_empty() { new } else { old };
+        if combined != want {
+            report.push(format!(
+                "{}: want {want:?} but the registry service returned {combined:?}",
+                row.label
+            ));
+        }
+    }
+    assert!(report.is_empty(), "\n{}", report.join("\n"));
 }

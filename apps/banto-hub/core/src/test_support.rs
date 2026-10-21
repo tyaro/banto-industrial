@@ -158,11 +158,14 @@ impl Drop for TempDir {
 /// - `client_factory`: `banto_collect::default_client_factory()` - what
 ///   `builtin()` returns too (design §2.3), and `banto-collect` is a normal
 ///   dependency of this crate already.
-/// - `registry`: the host-provided protocols only (`push` / `postgres` /
-///   `virtual`, R2b-1a), as a host registers them; the `HostBound` ids
-///   (`slmp` / `modbus-tcp`) are not in it (their static half lives in
-///   `banto-drivers`, which core cannot name). Nothing on the production path
-///   reads it yet (design §6.2).
+/// - `registry`: the host-provided protocols (`push` / `postgres` /
+///   `virtual`, R2b-1a), as a host registers them, plus **fake** `HostBound`
+///   entries for `slmp` / `modbus-tcp` ([`FakePlcDriver`]: their real static
+///   half lives in `banto-drivers`, which core cannot name). R2b-1d: the Hub's
+///   entrances, plan and preflight read the registry (design §4.2・§4.4), so a
+///   registry without the two would exclude every PLC connection as
+///   `driverUnavailable`. The fakes accept every setting (the real rules are
+///   covered in `banto-hub-host`, `tests/connection_validation_consistency.rs`).
 ///
 /// The tests that need a real SLMP / Modbus session went to
 /// `apps/banto-hub/host/tests/` (R2b-0).
@@ -174,6 +177,13 @@ pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
     ])
     .expect("distinct fake driver ids");
     let mut registry = banto_driver_api::DriverRegistry::new();
+    for protocol in ["modbus-tcp", "slmp"] {
+        registry
+            .register(banto_driver_api::DriverEntry::host_bound(
+                std::sync::Arc::new(FakePlcDriver::new(protocol)),
+            ))
+            .expect("fake PLC driver ids are distinct");
+    }
     crate::host_provided::register_host_provided(&mut registry)
         .expect("host-provided ids are distinct");
     crate::broker_glue::HubDrivers::new(
@@ -181,6 +191,58 @@ pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
         broker,
         banto_collect::default_client_factory(),
     )
+}
+
+/// R2b-1d: a stand-in for `banto-driver-slmp` / `banto-driver-modbus`'s static half in
+/// [`test_drivers`]'s registry - the id is right, every setting is accepted, no secret
+/// keys, no address rules (the collection plan parses addresses itself).
+pub(crate) struct FakePlcDriver {
+    descriptor: banto_driver_api::DriverDescriptor,
+}
+
+impl FakePlcDriver {
+    pub(crate) fn new(protocol: &str) -> Self {
+        Self {
+            descriptor: banto_driver_api::DriverDescriptor::new(
+                banto_driver_api::DriverId::new(protocol).expect("valid driver id"),
+                "0.0.0-test",
+                protocol,
+                banto_driver_api::Capabilities::READ_WRITE,
+            ),
+        }
+    }
+}
+
+impl banto_driver_api::DriverBase for FakePlcDriver {
+    fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+        &self.descriptor
+    }
+    fn validate_config(
+        &self,
+        _settings: &banto_driver_api::Settings,
+    ) -> Vec<banto_driver_api::FieldError> {
+        Vec::new()
+    }
+    fn parse_address(
+        &self,
+        _text: &str,
+        _kind: &banto_driver_api::TagKind,
+    ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+        Err(banto_driver_api::AddressError::new(
+            "fake driver: no address rules",
+        ))
+    }
+    fn offset_address(
+        &self,
+        canonical: &str,
+        _kind: &banto_driver_api::TagKind,
+        _n: i64,
+    ) -> Result<String, banto_driver_api::AddressError> {
+        Ok(canonical.to_owned())
+    }
+    fn address_help(&self) -> String {
+        String::new()
+    }
 }
 
 fn fake_slmp_dial(conn: &banto_tags::PlcConnection, port: u16) -> banto_broker::DriverDial {

@@ -1254,7 +1254,12 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         .into_iter()
         .find(|c| c.name == "pgdb-pw-redact")
         .expect("the queued postgres connection should have been created");
-    assert_eq!(created.password.as_deref(), Some(SECRET));
+    assert_eq!(
+        super::common::stored_password(&env.pool, created.id)
+            .await
+            .as_deref(),
+        Some(SECRET)
+    );
 }
 
 /// #341（2026-09-14 オーナー回答「明示適用も無停止」）: 旧

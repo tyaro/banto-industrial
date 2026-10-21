@@ -11,10 +11,10 @@ use super::{
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, Address,
     ApiError, BantoError, BatchReadRequest, BatchReadResult, BrokerError, CollectorManager,
-    DataType, Deserialize, Duration, FieldError, HeaderMap, IntoResponse, Json, ListParams,
-    ModbusTcpClient, ModbusTcpConfig, Path, PlcClient, PlcConnection, PlcConnectionInput, PlcError,
-    ReadRequest, ReadResult, RegistryMutationError, RegistryMutationResult, Response, Serialize,
-    SlmpClient, SlmpConfig, State, StatusCode, TagRegistryState,
+    DataType, Deserialize, Duration, FieldError, HeaderMap, IntoResponse, Json, ModbusTcpClient,
+    ModbusTcpConfig, Path, PlcClient, PlcConnection, PlcConnectionInput, PlcError, ReadRequest,
+    ReadResult, RegistryMutationError, RegistryMutationResult, Response, Serialize, SlmpClient,
+    SlmpConfig, State, StatusCode, TagRegistryState,
 };
 
 fn default_plc_protocol() -> String {
@@ -131,35 +131,53 @@ pub struct PlcConnectionPayload {
     pub settings: Option<serde_json::Value>,
 }
 
-impl From<PlcConnectionPayload> for PlcConnectionInput {
-    fn from(payload: PlcConnectionPayload) -> Self {
-        Self {
-            name: payload.name,
-            protocol: payload.protocol,
-            host: payload.host,
-            port: payload.port,
-            unit_id: payload.unit_id,
-            enabled: payload.enabled,
+impl PlcConnectionPayload {
+    /// banto-tags の入力に写す。R2b-1d（docs/banto-hub-connection-settings-design.md §5.3）
+    /// から、`password` の平文は**ここで封印**して `PlcConnectionInput::secrets` に載せる
+    /// （banto-tags は平文を受けない）。tri-state は [`crate::secrets::password_changes`]:
+    /// 省略・`null` は `Keep`、空文字は `Clear`、値は `Set(封印した値)`。封印は R2b-1d では
+    /// 全 OS で `plain-v1`（[`crate::secrets::r2b1d_connection_secrets`]、R2b-1e で
+    /// DPAPI）。封印に失敗したとき（大きすぎる値・乱数源の失敗）は `password` の項目
+    /// エラーで、値は載せない。
+    ///
+    /// 未適用キューは今どおり平文の `password` を持ち、適用の時点でここを通って封印される
+    /// （設計 §10 の R2b-1d。積む時点の封印は R2b-1e）。
+    pub(crate) fn into_input(self) -> Result<PlcConnectionInput, BantoError> {
+        let secrets = crate::secrets::password_changes(
+            &crate::secrets::r2b1d_connection_secrets(),
+            self.password.as_deref(),
+        )
+        .map_err(|error| BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "password".to_string(),
+                message: error.to_string(),
+            }],
+        })?;
+        Ok(PlcConnectionInput {
+            name: self.name,
+            protocol: self.protocol,
+            host: self.host,
+            port: self.port,
+            unit_id: self.unit_id,
+            enabled: self.enabled,
             // T9-2: wired through - see `PlcConnectionPayload::simulation`'s
             // doc comment.
-            simulation: payload.simulation,
+            simulation: self.simulation,
             // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
             // doc comment.
-            word_order: payload.word_order,
+            word_order: self.word_order,
             // #605: 省略は None のままサービスへ渡す（作成は R、更新は既存を保つ）。
-            cpu_type: payload.cpu_type,
-            // S1: wired through verbatim - see `PlcConnectionPayload::database`/
-            // `::username`/`::password`'s doc comments for the (create vs.
-            // update) semantics of `password` specifically.
-            database: payload.database,
-            username: payload.username,
-            password: payload.password,
+            cpu_type: self.cpu_type,
+            // S1: wired through verbatim.
+            database: self.database,
+            username: self.username,
+            secrets,
             // R2a-2e: wired through - `None`（省略）は create では既定、update では
             // 「保存済みの値を保つ」（`banto_tags::PlcConnectionInput::settings`）
             // ので、この項目を知らないクライアントの更新が push 接続の設定を
             // 消すことは無い。
-            settings: payload.settings,
-        }
+            settings: self.settings,
+        })
     }
 }
 
@@ -192,11 +210,18 @@ pub(crate) fn reject_hub_connection_protocol(
 }
 
 /// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: GET/list が返す
-/// `plc_connections` の読み取り DTO。`banto_tags::PlcConnection`をそのまま
-/// `Serialize`すると`password`列（平文）がそのまま応答に出てしまうため、
-/// 代わりにこの型へ変換してから返す - `password`は決して外部へ出さず、
-/// [`Self::password_set`]（非空パスワードが保存されているかの bool）だけを
-/// 返す。
+/// `plc_connections` の読み取り DTO。パスワードは決して外部へ出さず、
+/// [`Self::password_set`]（設定されているかの bool）と [`Self::password_state`]
+/// （R2b-1d、読めるか）だけを返す。
+///
+/// ## 2 つの組み立て方（R2b-1d）
+///
+/// - 応答（REST・MCP）は [`PlcConnectionResponse::with_secret_rows`]。`passwordState`
+///   （`none` / `set` / `unreadable`、設計 §5.5）を秘密の行を開いて決める。
+/// - `From<PlcConnection>` は未適用キューの指紋（`crate::rest::compute_pending_base_fingerprint`
+///   と適用時の照合）。**alpha.33 の応答と同じ形**（`passwordState` を持たない）にして、
+///   版を上げる前に積んだ更新・削除の指紋が上げた後も一致するようにする（設計 §2・§5.3、
+///   R2b-7 まで REST の形を保つ）。読めるかどうか（PC を移した）で指紋を変えない。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionResponse {
@@ -213,18 +238,63 @@ pub struct PlcConnectionResponse {
     pub cpu_type: String,
     pub database: Option<String>,
     pub username: Option<String>,
-    /// S1: true のとき、この接続には非空のパスワードが保存されている
-    /// （値そのものは返さない）。
+    /// S1: true のとき、この接続にはパスワードが保存されている（値そのものは返さない）。
+    /// R2b-1d から「`passwordState == "set"`」（読めないものは `false`）。
     pub password_set: bool,
-    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
-    /// （無ければ `null`。他プロトコルでは常に `null`）。秘密値を持たない
-    /// （`banto_tags::PlcConnection::settings` の doc）のでそのまま返す。
+    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`。
+    /// **既定のままなら `null`**（R2b-1d: 0025 から列は `NOT NULL` で既定は `{}` だが、
+    /// alpha.33 の応答は既定のままの push 接続に `null` を返していた。`{}` と `null` は同じ
+    /// 意味（既定）なので、REST の形と指紋を保つために `null` に戻す。設計 §2）。他の
+    /// プロトコルでは常に `null`。`push` の `settings` は秘密値を持たないのでそのまま返す。
     pub settings: Option<serde_json::Value>,
+    /// R2b-1d（設計 §5.5）: `"none"`（無い）/ `"set"`（ある・読める）/ `"unreadable"`
+    /// （参照はあるが行が無い・この PC で開けない）。応答だけに付く（指紋の形には
+    /// 無い: `From<PlcConnection>` は `None` で、そのときは項目ごと出さない）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password_state: Option<&'static str>,
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
+    /// 指紋の形（`passwordState` なし、`passwordSet` は参照の有無）。応答には
+    /// [`PlcConnectionResponse::with_secret_rows`] を使う。
     fn from(conn: PlcConnection) -> Self {
-        let password_set = conn.password.as_deref().is_some_and(|s| !s.is_empty());
+        // R2b-1d: a password is "set" when `settings.password` holds a secret reference
+        // (design §3.3) - the same bool alpha.33 derived from its plaintext column.
+        let password_set = conn.secret_ref(banto_tags::PASSWORD_KEY).is_some();
+        Self::build(conn, password_set, None)
+    }
+}
+
+impl PlcConnectionResponse {
+    /// 応答の形: `passwordState` を `rows`（その接続の秘密の行）を開いて決め、
+    /// `passwordSet` を `passwordState == "set"` にする（設計 §5.5）。
+    pub fn with_secret_rows(conn: PlcConnection, rows: &[banto_tags::StoredSecretRow]) -> Self {
+        let state = crate::secrets::secret_state(
+            &crate::secrets::r2b1d_connection_secrets(),
+            &conn,
+            banto_tags::PASSWORD_KEY,
+            rows,
+        );
+        Self::build(
+            conn,
+            state == crate::secrets::SecretState::Set,
+            Some(state.as_str()),
+        )
+    }
+
+    fn build(
+        conn: PlcConnection,
+        password_set: bool,
+        password_state: Option<&'static str>,
+    ) -> Self {
+        // The wire keeps R2a's / alpha.33's shape (design §2, Q4): `settings` is a push
+        // row's settings object, `null` while it is still the defaults (`{}` since
+        // migration 0025 made the column NOT NULL - semantically identical to alpha.33's
+        // `NULL`), and `null` for every other protocol - never another protocol's
+        // settings object (a postgres one holds the secret reference; the flat fields
+        // above are its wire form until R2b-7).
+        let settings = (conn.protocol == banto_tags::PUSH_PROTOCOL && !conn.settings.is_empty())
+            .then(|| serde_json::Value::Object(conn.settings.clone()));
         Self {
             id: conn.id,
             name: conn.name,
@@ -239,31 +309,56 @@ impl From<PlcConnection> for PlcConnectionResponse {
             database: conn.database,
             username: conn.username,
             password_set,
-            settings: conn.settings,
+            settings,
+            password_state,
         }
     }
+}
+
+/// [`PlcConnectionResponse::with_secret_rows`] for one connection, reading its sealed
+/// rows (R2b-1d).
+pub(crate) async fn connection_response(
+    service: &banto_tags::PlcConnectionService,
+    conn: PlcConnection,
+) -> Result<PlcConnectionResponse, BantoError> {
+    let rows = service.secret_rows(conn.id).await?;
+    Ok(PlcConnectionResponse::with_secret_rows(conn, &rows))
+}
+
+/// [`PlcConnectionResponse::with_secret_rows`] for every connection. The connections
+/// and the sealed rows are read in one read transaction (PR #777 review P2: a password
+/// update committing between two separate reads would show a healthy connection as
+/// `unreadable`).
+pub(crate) async fn connection_responses(
+    service: &banto_tags::PlcConnectionService,
+) -> Result<Vec<PlcConnectionResponse>, BantoError> {
+    let (connections, rows) = service.list_with_secret_rows().await?;
+    Ok(connections
+        .into_iter()
+        .map(|conn| {
+            let own: Vec<banto_tags::StoredSecretRow> = rows
+                .iter()
+                .filter(|row| row.connection_id == conn.id)
+                .cloned()
+                .collect();
+            PlcConnectionResponse::with_secret_rows(conn, &own)
+        })
+        .collect())
 }
 
 pub(super) async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
-    Ok(Json(
-        state
-            .plc_connections
-            .list(ListParams::default())
-            .await?
-            .rows
-            .into_iter()
-            .map(PlcConnectionResponse::from)
-            .collect(),
-    ))
+    Ok(Json(connection_responses(&state.plc_connections).await?))
 }
 
 pub(super) async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
-    Ok(Json(state.plc_connections.get(id).await?.into()))
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, rows) = state.plc_connections.get_with_secret_rows(id).await?;
+    Ok(Json(PlcConnectionResponse::with_secret_rows(conn, &rows)))
 }
 
 pub(super) async fn plc_connections_create(
@@ -294,6 +389,8 @@ pub(super) async fn plc_connections_create(
         )
         .await;
     }
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input().map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -302,14 +399,14 @@ pub(super) async fn plc_connections_create(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
             return Err(err.into());
         }
     };
-    let created = match state.plc_connections.create_tx(&mut tx, input.into()).await {
+    let created = match state.plc_connections.create_tx(&mut tx, input).await {
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -341,7 +438,10 @@ pub(super) async fn plc_connections_create(
     commit_catalog_and_notify(&state.controller, &state.events, "plc_connections")
         .await
         .map_err(RegistryMutationError::LiveApplyFailed)?;
-    Ok(Json(PlcConnectionResponse::from(created)).into_response())
+    let response = connection_response(&state.plc_connections, created)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(response).into_response())
 }
 
 pub(super) async fn plc_connections_update(
@@ -373,6 +473,8 @@ pub(super) async fn plc_connections_update(
         )
         .await;
     }
+    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input().map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -381,18 +483,14 @@ pub(super) async fn plc_connections_update(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
             return Err(err.into());
         }
     };
-    let updated = match state
-        .plc_connections
-        .update_tx(&mut tx, id, input.into())
-        .await
-    {
+    let updated = match state.plc_connections.update_tx(&mut tx, id, input).await {
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -424,7 +522,10 @@ pub(super) async fn plc_connections_update(
     commit_catalog_and_notify(&state.controller, &state.events, "plc_connections")
         .await
         .map_err(RegistryMutationError::LiveApplyFailed)?;
-    Ok(Json(PlcConnectionResponse::from(updated)).into_response())
+    let response = connection_response(&state.plc_connections, updated)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(response).into_response())
 }
 
 pub(super) async fn plc_connections_delete(
@@ -459,7 +560,7 @@ pub(super) async fn plc_connections_delete(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -563,7 +664,8 @@ pub(super) async fn plc_connections_test_saved(
     )
     .await?;
 
-    let conn = state.plc_connections.get(id).await?;
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, secret_rows) = state.plc_connections.get_with_secret_rows(id).await?;
     if !conn.is_db_source() {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -574,7 +676,7 @@ pub(super) async fn plc_connections_test_saved(
             .into_response());
     }
 
-    let outcome = crate::db_source::test_connection(&conn).await;
+    let outcome = crate::db_source::test_connection(&conn, &secret_rows).await;
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }
 

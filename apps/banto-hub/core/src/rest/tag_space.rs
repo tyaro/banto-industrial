@@ -16,10 +16,10 @@ use super::{
     AuditLogService, AuthState, BantoError, BrokerConnectionStatus, CollectionController,
     CollectionGroupService, CollectionState, CollectionStatus, CollectorManager, ComputedEngine,
     ConnectionStatus, Db, Deserialize, Extension, HubSettingsExt, IntoResponse, Json, ListParams,
-    Method, MqttPublisher, Path, PlcConnectionService, Query, Response, Router, RunMode, Serialize,
-    ServerEvent, SettingsService, SinkStatusSnapshot, SinkStatusStore, State, StatusCode,
-    SystemInfoSampler, SystemInfoSnapshot, TagEntry, TagMap, ToSchema, WriteAuditService,
-    WriteControl, WriteRateLimiter, WriteState,
+    Method, MqttPublisher, Path, Query, Response, Router, RunMode, Serialize, ServerEvent,
+    SettingsService, SinkStatusSnapshot, SinkStatusStore, State, StatusCode, SystemInfoSampler,
+    SystemInfoSnapshot, TagEntry, TagMap, ToSchema, WriteAuditService, WriteControl,
+    WriteRateLimiter, WriteState,
 };
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
@@ -998,7 +998,9 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
     let last_config_error = state.manager.last_error();
     let statuses = state.manager.connection_status().await;
 
-    let connections = PlcConnectionService::new(state.manager.pool())
+    let connections = state
+        .manager
+        .plc_connections()
         .list(ListParams::default())
         .await?
         .rows;

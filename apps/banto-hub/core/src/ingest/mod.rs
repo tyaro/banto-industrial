@@ -139,7 +139,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use banto_collect::{
-    build_config_from_with, CollectError, CollectorConfig, ExternalLink, ExternalReading,
+    build_config_from_with_registry, CollectError, CollectorConfig, ExternalLink, ExternalReading,
     ExternalSnapshot, ExternalSource, PushSource, RegistrySnapshot,
 };
 use banto_tags::{
@@ -157,8 +157,18 @@ use utoipa::ToSchema;
 /// （`CollectorManager::rebuild` / `commit_catalog` / `apply_run` と REST の
 /// preflight）がこれを通る - preflight と実際の計画がずれて「保存できたのに収集が
 /// 断る」ことが無いように。
-pub fn build_hub_config(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
-    build_config_from_with(snapshot, PushSource::Available)
+///
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §4.4・§7）: Hub のレジストリ
+/// （`HubConfig.drivers.registry`）で各接続のドライバ・`settings`・設定の版を確かめる
+/// （`banto_collect::build_config_from_with_registry`）。ドライバが無い（手で書いた
+/// `hub` の行・外したプラグイン）・設定が検証を通らない・版が新しすぎる接続は
+/// `driverUnavailable` / `invalidSettings` / `settingsVersionTooNew` の除外で、厳格版なので
+/// 今の不正なポートと同じく計画全体を断る（行は消さない・読み替えない）。
+pub fn build_hub_config(
+    snapshot: &RegistrySnapshot,
+    registry: &banto_driver_api::DriverRegistry,
+) -> Result<CollectorConfig, CollectError> {
+    build_config_from_with_registry(snapshot, PushSource::Available, registry)
 }
 
 /// 1 件の値。
@@ -810,31 +820,30 @@ fn slot_configs(snapshot: &RegistrySnapshot) -> HashMap<i64, SlotConfig> {
         .iter()
         .filter(|conn| conn.protocol == PUSH_PROTOCOL)
         .map(|conn| {
-            let (stale_timeout_ms, bridge) = match &conn.settings {
-                None => (DEFAULT_STALE_TIMEOUT_MS, None),
-                Some(raw) => match validate_push_settings(raw) {
-                    Ok(settings) => (
-                        settings.stale_timeout_ms,
-                        settings.bridge.map(|bridge| BridgeSendSet {
-                            fingerprint: raw.get("bridge").cloned().unwrap_or(Value::Null),
-                            keys: bridge
-                                .queries
-                                .iter()
-                                .flat_map(|query| query.columns.iter())
-                                .map(|column| column.key.clone())
-                                .collect(),
-                        }),
-                    ),
-                    // 書き込みの入口が検証するので本来は起きない（手で書き換えた DB）。
-                    // ブリッジの区画があれば送る集合を空にして全部を断る（fail closed）。
-                    Err(_) => (
-                        DEFAULT_STALE_TIMEOUT_MS,
-                        raw.get("bridge").map(|fingerprint| BridgeSendSet {
-                            fingerprint: fingerprint.clone(),
-                            keys: HashSet::new(),
-                        }),
-                    ),
-                },
+            // R2b-1d: `settings` is always an object (`{}` = the defaults).
+            let raw = &Value::Object(conn.settings.clone());
+            let (stale_timeout_ms, bridge) = match validate_push_settings(raw) {
+                Ok(settings) => (
+                    settings.stale_timeout_ms,
+                    settings.bridge.map(|bridge| BridgeSendSet {
+                        fingerprint: raw.get("bridge").cloned().unwrap_or(Value::Null),
+                        keys: bridge
+                            .queries
+                            .iter()
+                            .flat_map(|query| query.columns.iter())
+                            .map(|column| column.key.clone())
+                            .collect(),
+                    }),
+                ),
+                // 書き込みの入口が検証するので本来は起きない（手で書き換えた DB）。
+                // ブリッジの区画があれば送る集合を空にして全部を断る（fail closed）。
+                Err(_) => (
+                    DEFAULT_STALE_TIMEOUT_MS,
+                    raw.get("bridge").map(|fingerprint| BridgeSendSet {
+                        fingerprint: fingerprint.clone(),
+                        keys: HashSet::new(),
+                    }),
+                ),
             };
             (
                 conn.id,

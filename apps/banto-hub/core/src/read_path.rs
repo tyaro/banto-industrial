@@ -58,9 +58,7 @@ use banto_core::BantoError;
 use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, StringReadRequest,
 };
-use banto_tags::{
-    scale_raw, PlcConnectionService, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE,
-};
+use banto_tags::{scale_raw, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE};
 
 use crate::hub::CollectorManager;
 use crate::write_path::string_encoding_from_tag;
@@ -170,7 +168,8 @@ pub async fn execute_read_now(
 
     let (connection_id, _group_id, tag_id) = entry.ids;
 
-    let conn = PlcConnectionService::new(manager.pool())
+    let conn = manager
+        .plc_connections()
         .get(connection_id)
         .await
         .map_err(map_registry_error)?;

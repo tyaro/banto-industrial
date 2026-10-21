@@ -203,7 +203,7 @@ use banto_collect::{
     ExternalSource, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
-use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
+use banto_tags::{PlcConnection, PlcConnectionService, Tag};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -566,24 +566,14 @@ impl TagMap {
 /// are `NOT NULL REFERENCES ... ON DELETE RESTRICT` - but defensive against
 /// a future relaxation) is skipped rather than panicking.
 pub async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoError> {
-    let connections = PlcConnectionService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let groups = CollectionGroupService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let tags: Vec<Tag> = TagService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-
-    build_catalog_from(&RegistrySnapshot {
-        connections,
-        groups,
-        tags,
-    })
+    // R2b-1d: read through `RegistrySnapshot::load` (read-only) rather than a
+    // `PlcConnectionService` of its own - banto-hub's non-test code builds connection
+    // services only with the registry (design §4.2). The catalog never reads secrets.
+    let mut snapshot = RegistrySnapshot::load(pool)
+        .await
+        .map_err(|err| banto_core::BantoError::Storage(err.to_string()))?;
+    snapshot.secrets.clear();
+    build_catalog_from(&snapshot)
 }
 
 /// The external name of one tag: `{connection}.{group}.{tag}` (design §4.1).
@@ -1293,6 +1283,21 @@ impl CollectorManager {
         &self.sessions
     }
 
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §4.2）: Hub のドライバの
+    /// レジストリ（`HubConfig.drivers.registry`。`HubSessions` が持つ）。プロトコルの有無・
+    /// 設定の検証・秘密のキーの正。
+    pub fn registry(&self) -> &Arc<banto_driver_api::DriverRegistry> {
+        &self.sessions.drivers().registry
+    }
+
+    /// R2b-1d（設計 §4.2）: Hub の入口が使う接続のサービス。必ずレジストリつき
+    /// （`PlcConnectionService::with_registry`）。旧規則の `PlcConnectionService::new` を
+    /// Hub の非テストのコードで使わないことは `banto-hub-host` の
+    /// `tests/registry_entrances.rs` が grep で固定する。
+    pub fn plc_connections(&self) -> PlcConnectionService {
+        PlcConnectionService::with_registry(self.pool.clone(), self.registry().clone())
+    }
+
     /// The shared clock (design: 値のタイムスタンプはサンプル取得時刻 - `rest.rs`
     /// uses this for the `/api/v1/values` snapshot's own `t` field and for a
     /// sample-less tag's fallback timestamp).
@@ -1463,7 +1468,7 @@ impl CollectorManager {
         // commit は catalog/`Collector` の入れ替えと同じ点で行う。DB Source
         // の計画が不整合なら rebuild 全体が失敗し、走行中のタスクは
         // 一切触られない（§4.3(a) の all-or-nothing）。
-        let db_source_plan = match db_source::build_plan(&snapshot) {
+        let db_source_plan = match db_source::build_plan(&snapshot, self.registry()) {
             Ok(plan) => plan,
             Err(err) => {
                 let message = format!("DB Source の検証に失敗しました: {err}");
@@ -1472,7 +1477,7 @@ impl CollectorManager {
             }
         };
 
-        let mut config = match build_hub_config(&snapshot) {
+        let mut config = match build_hub_config(&snapshot, self.registry()) {
             Ok(config) => config,
             Err(err) => {
                 let message = err.to_string();
@@ -2140,10 +2145,7 @@ impl CollectorManager {
     /// `rebuild`・`apply_run` が続けて呼ばれ、同じ時刻に 2〜4 回出ていた）。起動直後・
     /// 再び有効にしたとき・文面が変わったとき・[`SIM_WARNING_REPEAT_MS`] を過ぎた後は出す。
     async fn log_simulation_warnings(&self) {
-        let connections = match PlcConnectionService::new(self.pool.clone())
-            .list(ListParams::default())
-            .await
-        {
+        let connections = match self.plc_connections().list(ListParams::default()).await {
             Ok(result) => result.rows,
             Err(err) => {
                 self.diag_log.err_line(&format!(
@@ -2323,7 +2325,7 @@ impl CollectorManager {
         // （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
         // グループ集合を再読込する」- 稼働中の pending queue 適用がここを
         // 通るので、走行中の DB Source もこの1点で追従する）。
-        let db_source_plan = match db_source::build_plan(snapshot) {
+        let db_source_plan = match db_source::build_plan(snapshot, self.registry()) {
             Ok(plan) => plan,
             Err(err) => {
                 let message = format!("DB Source の検証に失敗しました: {err}");
@@ -2331,7 +2333,7 @@ impl CollectorManager {
                 return Err(message);
             }
         };
-        if let Err(err) = build_hub_config(snapshot) {
+        if let Err(err) = build_hub_config(snapshot, self.registry()) {
             let message = err.to_string();
             self.set_last_error(message.clone());
             return Err(message);
@@ -2432,13 +2434,13 @@ impl CollectorManager {
         // `commit_catalog_and_notify` の legacy live reconfigure）からも
         // 呼ばれるので、ここを起動点にすると停止中でも DB へ繋いでしまう
         // （controller の `db_source` フィールド doc comment 参照）。
-        db_source::build_plan(&snapshot).map_err(|err| {
+        db_source::build_plan(&snapshot, self.registry()).map_err(|err| {
             let message = format!("DB Source の検証に失敗しました: {err}");
             self.set_last_error(message.clone());
             message
         })?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
-        let mut config = build_hub_config(&runtime_snapshot).map_err(|err| {
+        let mut config = build_hub_config(&runtime_snapshot, self.registry()).map_err(|err| {
             let message = err.to_string();
             self.set_last_error(message.clone());
             message
@@ -2685,6 +2687,7 @@ mod tests {
     use banto_collect::CollectorOptions;
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnection, PlcConnectionInput, TagInput,
+        TagService,
     };
     use banto_tstore::SystemClock;
     use std::time::Duration;
@@ -2784,7 +2787,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2904,7 +2907,7 @@ mod tests {
             let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
             seed_running_simulation(&pool).await;
             // Convert the fixture into a valid reserved internal connection.
-            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', host='', port=0, simulation=0")
+            sqlx::query("UPDATE plc_connections SET name='mem', protocol='virtual', settings='{}', simulation=0")
                 .execute(&pool).await.unwrap();
             sqlx::query("UPDATE collection_groups SET name='memory'")
                 .execute(&pool)
@@ -3176,8 +3179,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 2,
@@ -3193,8 +3196,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 3,
@@ -3210,8 +3213,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
                 PlcConnection {
                     id: 4,
@@ -3227,12 +3230,13 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 },
             ],
             groups: Vec::new(),
             tags: Vec::new(),
+            secrets: Vec::new(),
         };
 
         let configured =
@@ -3276,8 +3280,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
         let conn2 = PlcConnection {
             id: 2,
@@ -3293,8 +3297,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
         let group1 = banto_tags::CollectionGroup {
             id: 10,
@@ -3348,6 +3352,7 @@ mod tests {
             connections: vec![conn1, conn2],
             groups: vec![group1, group2],
             tags: vec![tag_in_group1, tag_in_group2],
+            secrets: Vec::new(),
         };
 
         let map = build_catalog_from(&snapshot).expect("build_catalog_from");
@@ -3386,8 +3391,8 @@ mod tests {
                     cpu_type: "R".to_string(),
                     database: None,
                     username: None,
-                    password: None,
-                    settings: None,
+                    settings: Default::default(),
+                    settings_version: 1,
                 })
                 .collect(),
             groups: groups
@@ -3426,6 +3431,7 @@ mod tests {
                     revision: 1,
                 })
                 .collect(),
+            secrets: Vec::new(),
         }
     }
 
@@ -3652,7 +3658,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3730,7 +3736,7 @@ mod tests {
                     cpu_type: None,
                     database: None,
                     username: None,
-                    password: None,
+                    secrets: Default::default(),
                     settings: None,
                 })
                 .await
@@ -3814,7 +3820,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3866,7 +3872,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3944,7 +3950,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4046,7 +4052,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4118,7 +4124,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }

@@ -225,7 +225,10 @@ use crud::{
 };
 #[cfg(test)]
 use plc_connections::slmp_session_cpu_refusal;
-pub(crate) use plc_connections::{reject_hub_connection_protocol, run_plc_connection_test};
+pub(crate) use plc_connections::{
+    connection_response, connection_responses, reject_hub_connection_protocol,
+    run_plc_connection_test,
+};
 pub use plc_connections::{
     PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestError, PlcConnectionTestPayload,
     PlcConnectionTestResponse,
@@ -1083,7 +1086,10 @@ fn api_router_with_controller_mode(
 /// services remain the authority for SQL FK/UNIQUE/shape validation; this
 /// helper covers the cross-table collector rules (address/data type and
 /// computed dependency validation).
-fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
+fn preflight_snapshot(
+    snapshot: &RegistrySnapshot,
+    registry: &banto_driver_api::DriverRegistry,
+) -> Result<(), ApiError> {
     let map = crate::hub::build_catalog_from(snapshot)
         .map_err(|err| preflight_api_error(format!("catalog の検証に失敗しました: {err}")))?;
     crate::computed::build_plan(&map)
@@ -1096,13 +1102,15 @@ fn preflight_snapshot(snapshot: &RegistrySnapshot) -> Result<(), ApiError> {
     // 3つ揃えたことで、保存後の commit で残る失敗要因はストレージ障害と
     // 走行中の collector 側の適用失敗だけになる（保存前検証が「保存成功 ＝
     // 実行可能」を保証する T14-3 の設計どおり）。
-    crate::db_source::build_plan(snapshot)
+    crate::db_source::build_plan(snapshot, registry)
         .map_err(|err| preflight_api_error(format!("DB Source の検証に失敗しました: {err}")))?;
     // R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 収集と同じ計画
     // （`push` 接続を受信側から収集する `PushSource::Available`）で検証する。
     // R2a-2a〜R2a-1c の間は厳格版の `build_config_from` で、有効な `push` 接続を
     // `pushSourceUnavailable` で断っていた。
-    crate::ingest::build_hub_config(snapshot)
+    // R2b-1d（docs/banto-hub-connection-settings-design.md §4.4・§7）: 収集の計画と同じ
+    // レジストリで各接続のドライバ・settings・版も確かめる（計画と preflight がずれない）。
+    crate::ingest::build_hub_config(snapshot, registry)
         .map(|_| ())
         .map_err(|err| preflight_api_error(err.to_string()))
 }
@@ -1127,14 +1135,20 @@ fn storage_api_error(error: sqlx::Error) -> ApiError {
 /// before 2026-10-17) do not block unrelated edits or the edits that
 /// resolve them. Read it with [`registry_before`] right after `BEGIN
 /// IMMEDIATE` and before any write, on the same transaction.
-pub(crate) struct RegistryBefore(RegistrySnapshot);
+///
+/// R2b-1d: it also carries the Hub's driver registry
+/// (`crate::hub::CollectorManager::registry`), so that [`preflight_transaction`] checks
+/// the written registry against the same drivers the collection plan uses (design
+/// §4.4・§7) without every write path passing it twice.
+pub(crate) struct RegistryBefore(RegistrySnapshot, Arc<banto_driver_api::DriverRegistry>);
 
 pub(crate) async fn registry_before(
     connection: &mut sqlx::SqliteConnection,
+    registry: &Arc<banto_driver_api::DriverRegistry>,
 ) -> Result<RegistryBefore, ApiError> {
     RegistrySnapshot::load_connection(connection)
         .await
-        .map(RegistryBefore)
+        .map(|snapshot| RegistryBefore(snapshot, registry.clone()))
         .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))
 }
 
@@ -1176,7 +1190,7 @@ pub(crate) async fn preflight_transaction(
         .await
         .map_err(|err| preflight_api_error(format!("レジストリの読み取りに失敗しました: {err}")))?;
     reject_new_external_name_collisions(before, &snapshot)?;
-    preflight_snapshot(&snapshot)?;
+    preflight_snapshot(&snapshot, &before.1)?;
     Ok(snapshot)
 }
 

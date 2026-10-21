@@ -98,7 +98,7 @@ use tokio::time::Instant;
 
 use crate::config::SidecarConfig;
 use crate::flush::backoff_delay;
-use crate::hub_api::{BridgeConfig, BridgeSourceConfig, HubApi, HubApiError};
+use crate::hub_api::{BridgeConfig, BridgeSourceConfig, HubApi, HubApiError, UnavailableSource};
 use crate::log::{log_err_line, log_line};
 use crate::status::Redactor;
 
@@ -132,6 +132,16 @@ impl Parked {
             Self::NothingToQuery => "クエリがありません",
         }
     }
+}
+
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の
+/// パスワードを読めない source の状態の文言（値は含まない）。
+pub fn unavailable_message(source: &UnavailableSource) -> String {
+    format!(
+        "Hub でパスワードを読めません（読み先の DB 接続 #{}、{}）。Hub の接続の編集で\
+         パスワードを入れ直してください",
+        source.db_connection_id, source.reason
+    )
 }
 
 /// source を動かせるか。
@@ -329,6 +339,7 @@ impl BridgeSupervisor {
             retiring: Vec::new(),
             statuses: statuses.clone(),
             logged_parked: HashMap::new(),
+            logged_unavailable: HashMap::new(),
             logged_error: None,
             attempt: 0,
         };
@@ -413,6 +424,8 @@ struct Supervisor {
     statuses: Arc<Mutex<BTreeMap<i64, Arc<Mutex<SourceStatus>>>>>,
     /// 1 回だけ warn した「動かさない」理由。
     logged_parked: HashMap<i64, Parked>,
+    /// R2b-1d: 1 回だけ warn した「Hub でパスワードを読めません」（文言ごと）。
+    logged_unavailable: HashMap<i64, String>,
     logged_error: Option<HubApiError>,
     attempt: u32,
 }
@@ -456,7 +469,7 @@ impl Supervisor {
                     log_line("banto-hub-sink: ブリッジの設定を取得できるようになりました");
                 }
                 self.attempt = 0;
-                self.apply(config.sources);
+                self.apply(config.sources, &config.unavailable_sources);
                 (self.refresh_interval, true)
             }
             // この版のブリッジを知らない古い Hub: source なしとして扱う。
@@ -468,7 +481,7 @@ impl Supervisor {
                     self.logged_error = Some(HubApiError::Status(404));
                 }
                 self.attempt = 0;
-                self.apply(Vec::new());
+                self.apply(Vec::new(), &[]);
                 (self.refresh_interval, true)
             }
             Err(err) => {
@@ -487,7 +500,10 @@ impl Supervisor {
         }
     }
 
-    fn apply(&mut self, desired: Vec<BridgeSourceConfig>) {
+    /// `unavailable`（R2b-1d、設計 §5.4）: Hub が読み先のパスワードを読めないので
+    /// `desired` に載せなかった source。動かさず（`desired` に無いので、動いていれば
+    /// 止まる）、状態に「Hub でパスワードを読めません」を出す。
+    fn apply(&mut self, desired: Vec<BridgeSourceConfig>, unavailable: &[UnavailableSource]) {
         for source in &desired {
             if let Some(password) = source.db.password.as_deref() {
                 self.redactor.add_secret(password);
@@ -520,7 +536,33 @@ impl Supervisor {
         });
 
         let mut statuses = lock(&self.statuses);
-        statuses.retain(|id, _| desired.iter().any(|s| s.connection_id == *id));
+        statuses.retain(|id, _| {
+            desired.iter().any(|s| s.connection_id == *id)
+                || unavailable.iter().any(|s| s.connection_id == *id)
+        });
+        for source in unavailable {
+            let message = unavailable_message(source);
+            if self.logged_unavailable.get(&source.connection_id) != Some(&message) {
+                log_err_line(&format!(
+                    "banto-hub-sink: warn: ブリッジ {}（#{}）は動かしません: {message}",
+                    source.name, source.connection_id
+                ));
+                self.logged_unavailable
+                    .insert(source.connection_id, message.clone());
+            }
+            statuses.insert(
+                source.connection_id,
+                Arc::new(Mutex::new(SourceStatus {
+                    connection_id: source.connection_id,
+                    name: source.name.clone(),
+                    state: SourceState::PasswordUnreadable,
+                    last_status: Some(message),
+                    ..SourceStatus::default()
+                })),
+            );
+        }
+        self.logged_unavailable
+            .retain(|id, _| unavailable.iter().any(|s| s.connection_id == *id));
         let parked_ids: Vec<i64> = plan.parked.iter().map(|(id, _, _)| *id).collect();
         self.logged_parked.retain(|id, _| parked_ids.contains(id));
         for (id, name, reason) in &plan.parked {

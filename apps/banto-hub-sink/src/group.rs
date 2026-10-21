@@ -108,6 +108,13 @@ pub enum GroupSetupError {
     UnknownMode(String),
     InvalidTableName(String),
     MissingConnection(i64),
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub がその接続の
+    /// パスワードを読めない（`unavailableConnections`）。繋がない。
+    ConnectionUnavailable {
+        id: i64,
+        name: String,
+        reason: String,
+    },
     NoTags,
 }
 
@@ -122,6 +129,10 @@ impl GroupSetupError {
             ),
             Self::MissingConnection(id) => format!(
                 "参照している DB 接続 (id={id}) が設定に含まれていません（接続が削除された、または postgres 以外になっています）"
+            ),
+            Self::ConnectionUnavailable { id, name, reason } => format!(
+                "Hub でパスワードを読めません（DB 接続 {name}、id={id}、{reason}）。この接続には\
+                 書きません。Hub の接続の編集でパスワードを入れ直してください"
             ),
             Self::NoTags => {
                 "対象タグが 1 つもありません（タグが削除された可能性があります）".to_string()

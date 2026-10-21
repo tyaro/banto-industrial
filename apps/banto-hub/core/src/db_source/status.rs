@@ -186,6 +186,40 @@ impl DbSourceStatusStore {
                 },
             );
         }
+        // R2b-1d（設計 §5.4・§5.5）: パスワードを読めない接続は、収集の状態に依らず
+        // `error`「パスワードを読めません」（構成上の事実。タスクは起動しないので再試行も
+        // しない）。
+        // PR #777 review P2: a connection the registry refuses (`plan.excluded`) the same
+        // way, with the exclusion's wording.
+        for (conn, message) in plan.blocked() {
+            if preserve.contains(&conn.connection_id) {
+                continue;
+            }
+            map.insert(
+                conn.connection_id,
+                DbConnectionStatus {
+                    connection_id: conn.connection_id,
+                    connection_name: conn.connection_name.to_string(),
+                    state: DbConnectionState::Error,
+                    last_poll_at: None,
+                    last_error: Some(message),
+                    consecutive_failures: 0,
+                    restarts: 0,
+                    last_restart_reason: None,
+                    groups: conn
+                        .groups
+                        .iter()
+                        .map(|group| DbGroupStatus {
+                            group_id: group.group_id,
+                            group_name: group.group_name.clone(),
+                            last_ok_at: None,
+                            last_error: None,
+                            row_count_last: None,
+                        })
+                        .collect(),
+                },
+            );
+        }
         for (id, name) in &plan.disabled {
             if preserve.contains(id) {
                 continue;
@@ -261,6 +295,8 @@ mod tests {
                 }],
             }],
             disabled: vec![(2, "old-erp".to_string())],
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         }
     }
 

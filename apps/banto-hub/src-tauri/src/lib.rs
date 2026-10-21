@@ -283,7 +283,8 @@ mod tray_status;
 fn hub_drivers() -> HubDrivers {
     let builtin = banto_drivers::builtin();
     // R2b-1a: `modbus-tcp` / `slmp`（`HostBound`）に、host が I/O を持つ `push` /
-    // `postgres` / `virtual`（`HostProvided`）を足す。本番の経路はまだ読まない。
+    // `postgres` / `virtual`（`HostProvided`）を足す。R2b-1d から Hub の入口・収集の計画・
+    // 移行の preflight がこのレジストリを正にする（docs/banto-hub-connection-settings-design.md §4）。
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");

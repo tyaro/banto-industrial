@@ -10,6 +10,23 @@ use banto_tstore::{Clock, SystemClock};
 use tokio::sync::broadcast as tokio_broadcast;
 use tower::ServiceExt;
 
+/// R2b-1d: the stored password of connection `id`, opened from its sealed row the way
+/// the readers open it (`crate::secrets::open_connection_secret`). `None` = no password.
+/// Panics when one is set but unreadable (a test bug, never collapsed to `None`).
+pub(super) async fn stored_password(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+    let service = PlcConnectionService::new(pool.clone());
+    let conn = service.get(id).await.unwrap();
+    let rows = service.secret_rows(id).await.unwrap();
+    crate::secrets::open_connection_secret(
+        &crate::secrets::r2b1d_connection_secrets(),
+        &conn,
+        banto_tags::PASSWORD_KEY,
+        &rows,
+    )
+    .expect("a stored password must be readable")
+    .map(|plain| plain.as_str().to_owned())
+}
+
 pub(super) const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
 /// A `CollectorManager` for router-composition tests that never actually

@@ -169,7 +169,7 @@ async fn plc_connections_delete_still_refuses_a_virtual_connection() {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

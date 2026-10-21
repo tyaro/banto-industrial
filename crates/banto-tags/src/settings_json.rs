@@ -2,10 +2,13 @@
 //! レジストリによる検証（R2b-1c、docs/banto-hub-connection-settings-design.md
 //! §3.2・§3.3・§3.5・§4.2・§4.3）。
 //!
-//! **R2b-1c では保存にまだ使わない**（DB の列は固定列のまま。migration と
-//! `PlcConnection` の形の切り替えは R2b-1d）。ここにあるのは、R2b-1d がそのまま使う
-//! 純関数と、「旧い平らな形の検証」と「レジストリの検証」が同じ入力を断ることを
-//! 表のテストで固定するための部品だけ。
+//! R2b-1c で部品として足し、**R2b-1d から保存と読み込みが使う**（migration `0025` で
+//! `plc_connections` の固定列は `settings` へ移った）: 書き込みの全入口は
+//! [`legacy::settings_from_flat`] で平らな入力を `settings` に写し（「省略は保つ」欄は
+//! 書き込みのトランザクションの中で今の行と合わせる、`plc_connection.rs`）、
+//! `PlcConnection` の `FromRow` は [`legacy::flat_view`] で平らな欄を作る。レジストリを持つ
+//! サービス（`PlcConnectionService::with_registry`）は [`validate_settings_with_registry`] を
+//! 旧い検証 (1) の後に走らせる。
 //!
 //! ## [`settings_to_api`]（設計 §3.5）
 //!
@@ -25,7 +28,7 @@
 //! **文字列**のオブジェクト（`{"$secret": "<ref>"}`、設計 §3.3）。キーが増えている・値が
 //! 文字列でない・`"$secret"` 以外のキーのオブジェクトは秘密の参照ではなく、ふつうの
 //! オブジェクトとして詰めた JSON の文字列になる（秘密のキーに平文を置く取りこぼしを
-//! 断るのは保存の層、R2b-1d）。`serde_json` の `Map` は既定では順序を持たない（キーの
+//! 断るのは保存の層: `crate::connection_secret::check_settings_shape`、R2b-1d）。`serde_json` の `Map` は既定では順序を持たない（キーの
 //! 辞書順）ので、`Settings` の並びも辞書順になる。並びに意味を持たせる呼び出し側は
 //! 無い（検証は `get` で引く）。
 //!
@@ -154,7 +157,7 @@ pub mod legacy {
     };
 
     /// `slmp` の綴り（`ALLOWED_PROTOCOLS` と同じ。定数は無い）。
-    const SLMP_PROTOCOL: &str = "slmp";
+    pub(crate) const SLMP_PROTOCOL: &str = "slmp";
 
     /// 平らな欄を `settings` から作った読み取りの写し（`PlcConnection` の同名の欄）。
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,11 +186,12 @@ pub mod legacy {
     ///
     /// - `host`・`database`・`username` は保存と同じく前後の空白を除く。
     /// - `slmp` の `cpu_type` は、入力が `None`・空のとき**キーを置かない**（作成は既定の
-    ///   `R`、更新は既存を保つ、`PlcConnectionInput::cpu_type`。R2b-1d が書き込みの
-    ///   トランザクションの中で合わせる。`flat_view` は無ければ `R`）。
-    /// - **`postgres` の `password` は写さない**。パスワードは秘密値で、`settings` には
-    ///   `{"$secret": "<ref>"}` しか置かない（設計 §3.3）。R2b-1c にはまだ封印が無いので
-    ///   平文を `settings` に入れず、R2b-1d（封印の配線は R2b-1e）が参照を挿す。
+    ///   `R`、更新は既存を保つ、`PlcConnectionInput::cpu_type`。書き込みの入口が
+    ///   トランザクションの中で合わせて、保存する `settings` には必ず置く。`flat_view` は
+    ///   無ければ `R`）。
+    /// - **秘密値（`postgres` の `password`）は写さない**。`settings` には
+    ///   `{"$secret": "<ref>"}` しか置かない（設計 §3.3）。参照は書き込みの入口が
+    ///   `PlcConnectionInput::secrets`（封印済みの値）から挿す（R2b-1d）。
     /// - `push` で `settings` がオブジェクトでないとき（検証が先に断る入力）は `{}`。
     ///   この関数は検証の後に呼ぶ前提で、断る責任は旧い検証が持つ。
     pub fn settings_from_flat(input: &PlcConnectionInput) -> Map<String, Value> {
@@ -224,10 +228,11 @@ pub mod legacy {
     }
 
     /// 設計 §4.2 の (2)〜(4) を平らな入力から続けて行う: 正規化 → [`settings_from_flat`] →
-    /// [`super::validate_settings_with_registry`]。旧い平らな形の検証 (1) は含まない
-    /// （それは `PlcConnectionService` の書き込みの入口が先に行う）。R2b-1c では保存に
-    /// 使わず、旧い検証とレジストリの検証が同じ入力を断ることの表のテスト
-    /// （`apps/banto-hub/host/tests/connection_validation_consistency.rs`）が呼ぶ。
+    /// [`super::validate_settings_with_registry`]。旧い平らな形の検証 (1) は含まない。
+    /// 保存の入口（`PlcConnectionService::with_registry`）は同じ (2)〜(4) を、「省略は保つ」を
+    /// 合わせた**最終の** `settings` に掛ける。これは旧い検証とレジストリの検証が同じ入力を
+    /// 断ることの表のテスト（`apps/banto-hub/host/tests/connection_validation_consistency.rs`）
+    /// が呼ぶ。
     pub fn validate_flat_with_registry(
         registry: &DriverRegistry,
         input: PlcConnectionInput,
@@ -418,7 +423,18 @@ mod tests {
             cpu_type: Some("Q".to_string()),
             database: Some(" appdb ".to_string()),
             username: Some(" alice ".to_string()),
-            password: Some("secret-plaintext".to_string()),
+            // A sealed `plain-v1` secret (the blob is the plaintext): `settings_from_flat`
+            // must not carry it - the write path inserts only the reference.
+            secrets: [(
+                "password".to_string(),
+                crate::SecretChange::Set(crate::SealedSecretRow {
+                    r#ref: "0123456789abcdef0123456789abcdef".to_string(),
+                    scheme: crate::SCHEME_PLAIN_V1.to_string(),
+                    blob: zeroize::Zeroizing::new(b"secret-plaintext".to_vec()),
+                }),
+            )]
+            .into_iter()
+            .collect(),
             settings: Some(json!({"stale_timeout_ms": 5000})),
         }
     }

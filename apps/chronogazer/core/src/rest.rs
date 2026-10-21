@@ -965,7 +965,7 @@ impl PlcConnectionPayload {
             // が postgres 接続の作成を拒否するので常に `None` でよい。
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }

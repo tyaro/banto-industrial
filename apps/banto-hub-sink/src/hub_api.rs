@@ -53,6 +53,23 @@ pub struct SinkConfig {
     pub generated_at: i64,
     pub groups: Vec<SinkConfigGroup>,
     pub connections: Vec<SinkConfigConnection>,
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub がパスワードを
+    /// 読めないので `connections` に載せなかった接続。この接続を引くグループは繋がずに
+    /// 「Hub でパスワードを読めません」を状態に出す。古い Hub は返さない（空）。
+    #[serde(default)]
+    pub unavailable_connections: Vec<UnavailableConnection>,
+}
+
+/// R2b-1d: Hub がパスワードを読めない接続 1 件（Hub 側
+/// `SinkConfigUnavailableConnection`）。値も参照も持たない。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnavailableConnection {
+    pub id: i64,
+    pub name: String,
+    /// `missing`（Hub に秘密値の行が無い）/ `undecryptable`（その PC で開けない）。
+    /// 未知の値もそのまま表示する（前方互換）。
+    pub reason: String,
 }
 
 /// 有効な sink group 1 件（Hub 側 `SinkConfigGroupEntry`）。
@@ -133,6 +150,25 @@ impl fmt::Debug for SinkConfigConnection {
 pub struct BridgeConfig {
     pub generated_at: i64,
     pub sources: Vec<BridgeSourceConfig>,
+    /// R2b-1d（設計 §5.4）: 読み先の `postgres` 接続のパスワードを Hub が読めないので
+    /// `sources` に載せなかった source。動かさず、状態に「Hub でパスワードを読めません」を
+    /// 出す。古い Hub は返さない（空）。
+    #[serde(default)]
+    pub unavailable_sources: Vec<UnavailableSource>,
+}
+
+/// R2b-1d: Hub が読み先のパスワードを読めない source 1 件（Hub 側
+/// `BridgeUnavailableSource`）。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct UnavailableSource {
+    /// ブリッジの `push` 接続の id。
+    pub connection_id: i64,
+    pub name: String,
+    /// 読めない `postgres` 接続の id。
+    pub db_connection_id: i64,
+    /// `missing` / `undecryptable`。
+    pub reason: String,
 }
 
 /// ブリッジの source 1 件（= Hub のブリッジの `push` 接続 1 つ。Hub 側
@@ -413,6 +449,37 @@ mod tests {
         );
         let parsed: SinkConfig = serde_json::from_str(&raw).expect("parse with unknown field");
         assert_eq!(parsed.generated_at, 1000);
+    }
+
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.4): `unavailableConnections`
+    /// / `unavailableSources` are read when present and default to empty (an older Hub
+    /// does not send them); an unavailable connection is never in `connections`.
+    #[test]
+    fn unavailable_lists_are_read_and_default_to_empty() {
+        let parsed: SinkConfig = serde_json::from_str(SAMPLE).expect("parse");
+        assert!(parsed.unavailable_connections.is_empty());
+        let raw = SAMPLE.replace(
+            "\"generatedAt\": 1000,",
+            "\"generatedAt\": 1000, \"unavailableConnections\": [{\"id\": 4, \"name\": \"pg-b\", \"reason\": \"undecryptable\"}],",
+        );
+        let parsed: SinkConfig = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(
+            parsed.unavailable_connections,
+            vec![UnavailableConnection {
+                id: 4,
+                name: "pg-b".to_string(),
+                reason: "undecryptable".to_string(),
+            }]
+        );
+        let parsed: BridgeConfig = serde_json::from_str(BRIDGE_SAMPLE).expect("parse");
+        assert!(parsed.unavailable_sources.is_empty());
+        let raw = BRIDGE_SAMPLE.replace(
+            "\"generatedAt\": 2000,",
+            "\"generatedAt\": 2000, \"unavailableSources\": [{\"connectionId\": 13, \"name\": \"B2\", \"dbConnectionId\": 8, \"reason\": \"missing\"}],",
+        );
+        let parsed: BridgeConfig = serde_json::from_str(&raw).expect("parse");
+        assert_eq!(parsed.unavailable_sources[0].db_connection_id, 8);
+        assert_eq!(parsed.unavailable_sources[0].reason, "missing");
     }
 
     /// 接続の `Debug` にパスワードを出さない。

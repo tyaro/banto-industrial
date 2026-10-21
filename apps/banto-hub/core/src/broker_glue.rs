@@ -227,16 +227,27 @@ impl HubDrivers {
         }
     }
 
-    /// No drivers: an empty broker table (every connection is rejected as
+    /// No PLC drivers: an empty broker table (every connection is rejected as
     /// [`BrokerError::UnsupportedProtocol`]) and a client factory whose
     /// clients answer every call with [`PlcError::NotConnected`].
+    ///
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.2): the registry still
+    /// holds the Hub's own host-provided protocols (`push` / `postgres` / `virtual`,
+    /// [`crate::host_provided::register_host_provided`]) - their I/O is the Hub's, not a
+    /// driver's, and without `virtual` the Hub could not even create its reserved
+    /// `calc` / `mem` connections now that every entrance validates through the
+    /// registry. `modbus-tcp` / `slmp` are absent (a connection of either is excluded as
+    /// `driverUnavailable`).
     pub fn none() -> Self {
         let client_factory: banto_collect::ClientFactory =
             Arc::new(|_spec: &banto_collect::ClientSpec| -> Box<dyn PlcClient> {
                 Box::new(NoDriverClient)
             });
+        let mut registry = DriverRegistry::new();
+        crate::host_provided::register_host_provided(&mut registry)
+            .expect("the host-provided ids are distinct");
         Self {
-            registry: Arc::new(DriverRegistry::new()),
+            registry: Arc::new(registry),
             broker: DriverTable::new(vec![]).expect("an empty driver table has no duplicates"),
             client_factory,
         }
@@ -1002,8 +1013,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 

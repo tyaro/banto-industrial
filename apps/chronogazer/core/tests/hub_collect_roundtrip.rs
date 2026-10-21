@@ -324,7 +324,7 @@ async fn register_hub_specs(
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

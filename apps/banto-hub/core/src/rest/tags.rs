@@ -364,7 +364,7 @@ async fn tags_create(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -468,7 +468,7 @@ async fn tags_update(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -549,7 +549,7 @@ async fn tags_delete(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -754,7 +754,7 @@ async fn tags_batch(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -977,7 +977,7 @@ async fn tags_batch_update(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -1147,7 +1147,7 @@ async fn tags_batch_delete(
         .await
         .map_err(storage_api_error)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;

@@ -2799,7 +2799,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3407,7 +3407,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -4097,7 +4097,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -5007,10 +5007,11 @@ mod tests {
     /// Source slice unlocks (`crate::collection_group` のモジュール doc
     /// comment「DB Source のグループ」節)。
     async fn postgres_group(pool: &SqlitePool) -> i64 {
+        // R2b-1d (migration 0025): the endpoint lives in `settings`.
         sqlx::query(
-            "INSERT INTO plc_connections (name, protocol, host, port, unit_id, enabled, \
-             database, username, password) \
-             VALUES ('erp', 'postgres', '10.0.0.50', 5432, 1, 1, 'erp', 'reader', 'pw')",
+            "INSERT INTO plc_connections (name, protocol, enabled, settings) \
+             VALUES ('erp', 'postgres', 1, json_object('host', '10.0.0.50', 'port', 5432, \
+             'database', 'erp', 'username', 'reader'))",
         )
         .execute(pool)
         .await
@@ -6032,7 +6033,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -6841,7 +6842,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -7306,7 +7307,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await

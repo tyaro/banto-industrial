@@ -13,7 +13,9 @@
 //! `modbus-tcp` / `slmp`（`banto_drivers::builtin().registry`）に host がこの 3 つを足す。
 //! `hub` は Hub のレジストリに載せない（Hub は `hub` 接続を作らない、§4.1）。
 //!
-//! **R2b-1a では本番の経路はレジストリを読まない**（振る舞いは変わらない）。
+//! **R2b-1a では本番の経路はレジストリを読まない**（振る舞いは変わらない）。R2b-1d から
+//! Hub の入口（`PlcConnectionService::with_registry`）・収集の計画
+//! （`crate::ingest::build_hub_config`）・移行の preflight（`crate::upgrade`）が読む。
 
 use std::sync::Arc;
 

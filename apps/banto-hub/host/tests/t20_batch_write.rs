@@ -92,7 +92,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         cpu_type: None,
         database: None,
         username: None,
-        password: None,
+        secrets: Default::default(),
         settings: None,
     }
 }
@@ -1255,7 +1255,7 @@ async fn record_only_happens_for_entries_that_actually_reach_insert_pending() {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

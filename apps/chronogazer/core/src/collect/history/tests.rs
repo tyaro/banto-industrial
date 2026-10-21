@@ -301,7 +301,7 @@ async fn connection(pool: &SqlitePool, name: &str, simulation: bool) -> i64 {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await

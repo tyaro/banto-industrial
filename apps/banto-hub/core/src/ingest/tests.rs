@@ -1281,8 +1281,8 @@ async fn ws_sessions_are_one_per_connection_and_ended_by_commit() {
     // `push` でなくなる（タグの無い接続）: ConnectionChanged。
     let (mut on_bare, _) = hub.open_ws_session(bare).unwrap();
     env.sql(&format!(
-        "UPDATE plc_connections SET protocol = 'modbus-tcp', host = '127.0.0.1', port = 502, \
-         enabled = 0 WHERE id = {bare}"
+        "UPDATE plc_connections SET protocol = 'modbus-tcp', \
+         settings = '{{\"host\":\"127.0.0.1\",\"port\":502}}', enabled = 0 WHERE id = {bare}"
     ))
     .await;
     env.commit().await;

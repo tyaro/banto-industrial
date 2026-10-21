@@ -11,6 +11,11 @@ publish.workspace = true
 # assemble a CollectorConfig snapshot. This is the one crate that bridges
 # I1/I2/I3a (see plan.md's dependency graph: I3b depends on I1, I2, I3a).
 banto-tags = { path = "../banto-tags" }
+# R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): the strict build can
+# check each connection against the host's `DriverRegistry`
+# (`build_config_from_with_registry`). A dependency-free crate; banto-tags already
+# depends on it.
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 # I2: PlcClient trait + Modbus TCP client + address/type parsing.
 #
 # T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): the `simulator` feature
@@ -61,3 +66,5 @@ tempfile = { workspace = true }
 # (`Migrator::run_to`) to seed a pre-0018 database whose `threshold_*`
 # columns still hold values, then lets `banto_tags::migrate` apply the rest.
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate"] }
+# R2b-1d: the §4.4 exclusion tests build connections' JSON `settings`.
+serde_json = { workspace = true }

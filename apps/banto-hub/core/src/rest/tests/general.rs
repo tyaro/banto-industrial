@@ -24,8 +24,8 @@ fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
         cpu_type: cpu.to_string(),
         database: None,
         username: None,
-        password: None,
-        settings: None,
+        settings: Default::default(),
+        settings_version: 1,
     }
 }
 
@@ -608,7 +608,8 @@ async fn commit_catalog_and_notify_does_not_dial_a_session_while_collection_is_s
                 "port": 15041,
             }))
             .unwrap()
-            .into(),
+            .into_input()
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -668,7 +669,8 @@ async fn commit_catalog_and_notify_syncs_a_session_for_a_newly_tagged_connection
                 "port": 15042,
             }))
             .unwrap()
-            .into(),
+            .into_input()
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -742,7 +744,8 @@ async fn commit_catalog_and_notify_removes_a_session_once_the_last_group_is_disa
                 "port": 15043,
             }))
             .unwrap()
-            .into(),
+            .into_input()
+            .unwrap(),
         )
         .await
         .unwrap();

@@ -37,11 +37,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use banto_core::ListParams;
+use banto_driver_api::DriverRegistry;
 use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
-    scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
-    Tag, TagService, PUSH_PROTOCOL,
+    scaling::Scaling, CollectionGroup, PlcConnection, StoredSecretRow, Tag, PUSH_PROTOCOL,
 };
 use banto_tstore::{GroupConfig, StoreConfig, TagColumn};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -470,37 +469,66 @@ pub struct RegistrySnapshot {
     pub connections: Vec<PlcConnection>,
     pub groups: Vec<CollectionGroup>,
     pub tags: Vec<Tag>,
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§7): the **sealed**
+    /// secret rows (`plc_connection_secrets`) the connections' `settings` refer to with
+    /// `{"$secret": "<ref>"}`, read in the same transaction as the rows above. Never
+    /// plaintext: the reader that needs a value (banto-hub's DB Source) opens it in
+    /// banto-hub's `secrets` module right before use. The collection plan itself does
+    /// not read them.
+    pub secrets: Vec<StoredSecretRow>,
 }
 
 impl RegistrySnapshot {
     /// Read the registry rows once into a reusable logical snapshot.
+    ///
+    /// PR #777 owner review P2: all four reads (connections, groups, tags, secret rows)
+    /// run in **one** read transaction ([`Self::load_connection`] on a deferred
+    /// `BEGIN`), so a write that commits in between - e.g. a password update that writes
+    /// a new reference + row and deletes the old row - cannot leave the snapshot with a
+    /// connection that refers to a row it does not hold (a healthy DB Source connection
+    /// read as `Missing`).
     pub async fn load(pool: &SqlitePool) -> Result<Self, CollectError> {
-        Ok(Self {
-            connections: PlcConnectionService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-            groups: CollectionGroupService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-            tags: TagService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-        })
+        Self::load_between(pool, || async {}).await
+    }
+
+    /// [`Self::load`] with `between` awaited after the connection rows are read and
+    /// before the secret rows are (the tests commit a write there).
+    async fn load_between<F, Fut>(pool: &SqlitePool, between: F) -> Result<Self, CollectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let storage = |err: sqlx::Error| {
+            CollectError::Registry(banto_core::BantoError::Storage(err.to_string()))
+        };
+        let mut tx = pool.begin().await.map_err(storage)?;
+        let snapshot = Self::load_connection_between(&mut tx, between).await?;
+        tx.rollback().await.map_err(storage)?;
+        Ok(snapshot)
     }
 
     /// Read the same registry snapshot from an already-open SQLite connection.
     /// Callers use this with a transaction/savepoint so proposed mutations and
     /// all three registry reads observe one transaction-local state.
     pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
+        Self::load_connection_between(connection, || async {}).await
+    }
+
+    async fn load_connection_between<F, Fut>(
+        connection: &mut SqliteConnection,
+        between: F,
+    ) -> Result<Self, CollectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         // Column names must match `PlcConnection` (`banto-tags`' `COLUMNS`).
         // `FromRow` looks them up by name, so a missing name fails every
         // preflight with "no column found" even though the table has the column.
+        // R2b-1d (migration 0025): the flat endpoint columns moved into `settings`;
+        // `FromRow` projects them back (`banto_tags::PlcConnection::from_settings`).
         let connections = sqlx::query_as::<_, PlcConnection>(
-            "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
-             cpu_type, database, username, password, settings \
+            "SELECT id, name, protocol, enabled, simulation, settings, settings_version \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -523,10 +551,18 @@ impl RegistrySnapshot {
         .await
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
 
+        between().await;
+        let secrets = banto_tags::connection_secret::load_all_secret_rows(&mut *connection)
+            .await
+            .map_err(|err| {
+                CollectError::Registry(banto_core::BantoError::Storage(err.to_string()))
+            })?;
+
         Ok(Self {
             connections,
             groups,
             tags,
+            secrets,
         })
     }
 }
@@ -615,10 +651,88 @@ pub fn build_config_from_with(
         ThresholdSource::None,
         HubSource::Unavailable,
         push,
+        None,
     );
     match exclusions.iter().find_map(ConfigExclusion::strict_error) {
         Some(err) => Err(err),
         None => Ok(config),
+    }
+}
+
+/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): [`build_config_from_with`]
+/// that also checks every collected connection against `registry` first
+/// ([`driver_exclusion`]): a connection whose driver is missing, whose stored
+/// `settings` the driver refuses, or whose settings shape is newer than the driver is
+/// an exclusion ([`ExclusionReason::DriverUnavailable`] /
+/// [`ExclusionReason::InvalidSettings`] / [`ExclusionReason::SettingsVersionTooNew`]).
+/// This being the strict build, it then fails the build with that item's wording, the
+/// same way an unusable port does (banto-hub's plan and its save-time preflight; the
+/// lenient builders keep the rest running). banto-hub's plan goes through this
+/// (`banto_hub_core::ingest::build_hub_config`); ChronoGazer has no registry (Q6) and
+/// keeps the registry-free builders.
+pub fn build_config_from_with_registry(
+    snapshot: &RegistrySnapshot,
+    push: PushSource,
+    registry: &DriverRegistry,
+) -> Result<CollectorConfig, CollectError> {
+    let (config, exclusions) = build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::None,
+        HubSource::Unavailable,
+        push,
+        Some(registry),
+    );
+    match exclusions.iter().find_map(ConfigExclusion::strict_error) {
+        Some(err) => Err(err),
+        None => Ok(config),
+    }
+}
+
+/// R2b-1d (design §4.4): why `conn` cannot be collected under `registry`, if it
+/// cannot - checked in this order:
+///
+/// 1. `registry.get(protocol)` is `None` → [`ExclusionReason::DriverUnavailable`].
+/// 2. `settings_version` > the driver's `settings_version` →
+///    [`ExclusionReason::SettingsVersionTooNew`] (design §3.4).
+/// 3. the driver's `validate_config` (`banto_tags::validate_settings_with_registry`),
+///    then the storage-layer shape check (`banto_tags::check_settings_shape`: a secret
+///    key holds only a reference, design §3.2's JSON types) → [`ExclusionReason::InvalidSettings`].
+///
+/// Pure; also used by banto-hub's migration preflight and status surfaces.
+pub fn driver_exclusion(
+    conn: &PlcConnection,
+    registry: &DriverRegistry,
+) -> Option<ExclusionReason> {
+    let Some(entry) = registry.get(&conn.protocol) else {
+        return Some(ExclusionReason::DriverUnavailable {
+            protocol: conn.protocol.clone(),
+        });
+    };
+    let supported = i64::from(entry.descriptor().settings_version);
+    if conn.settings_version > supported {
+        return Some(ExclusionReason::SettingsVersionTooNew {
+            stored: conn.settings_version,
+            supported,
+        });
+    }
+    let mut errors =
+        banto_tags::validate_settings_with_registry(registry, &conn.protocol, &conn.settings);
+    if errors.is_empty() {
+        errors = banto_tags::check_settings_shape(
+            &conn.protocol,
+            &conn.settings,
+            &entry.base().secret_keys(),
+        );
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(ExclusionReason::InvalidSettings {
+            errors: errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect(),
+        })
     }
 }
 
@@ -702,6 +816,23 @@ pub enum ExclusionReason {
         data_type: String,
         issue: TagAddressIssue,
     },
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4): the connection's
+    /// `protocol` is not in the caller's driver registry - a `"hub"` row in banto-hub
+    /// (the Hub registers no `hub` driver), or a plugin that was removed. The row is
+    /// kept (never deleted or reinterpreted as another protocol, plugin-design §7.5);
+    /// only this connection is left out. Only a build given a registry
+    /// ([`build_config_from_with_registry`]) raises it.
+    DriverUnavailable { protocol: String },
+    /// R2b-1d (design §4.4): the driver's `validate_config` (or the storage-layer shape
+    /// check, `banto_tags::check_settings_shape`) refuses the stored `settings` - a row
+    /// edited by hand. `errors` are `"<field>: <message>"` (REST spellings), never a
+    /// secret value (secret keys hold only references, and references are not passed to
+    /// `validate_config`).
+    InvalidSettings { errors: Vec<String> },
+    /// R2b-1d (design §3.4): the row was written with a newer settings shape than this
+    /// driver reads (`settings_version` > the driver's `settings_version`) - a database
+    /// written by a newer Hub or a plugin rolled back.
+    SettingsVersionTooNew { stored: i64, supported: i64 },
     /// The owning connection was excluded.
     ConnectionExcluded { connection_name: String },
     /// The owning group was excluded.
@@ -726,6 +857,9 @@ impl ExclusionReason {
                 TagAddressIssue::UnknownDataType => "unknownDataType",
                 TagAddressIssue::BitAddressOnNonBitType => "bitAddressOnNonBitType",
             },
+            ExclusionReason::DriverUnavailable { .. } => "driverUnavailable",
+            ExclusionReason::InvalidSettings { .. } => "invalidSettings",
+            ExclusionReason::SettingsVersionTooNew { .. } => "settingsVersionTooNew",
             ExclusionReason::ConnectionExcluded { .. } => "connectionExcluded",
             ExclusionReason::GroupExcluded { .. } => "groupExcluded",
         }
@@ -768,6 +902,15 @@ impl ExclusionReason {
                 format!("収集周期（period_ms）が不正です: {period_ms}")
             }
             ExclusionReason::InvalidTag { issue, .. } => issue.message(),
+            ExclusionReason::DriverUnavailable { protocol } => format!(
+                "プロトコル {protocol} のドライバがこの実行形態にありません（接続は残しています）"
+            ),
+            ExclusionReason::InvalidSettings { errors } => {
+                format!("接続の設定が検証を通りません: {}", errors.join(" / "))
+            }
+            ExclusionReason::SettingsVersionTooNew { stored, supported } => format!(
+                "接続の設定の版（{stored}）がドライバの読める版（{supported}）より新しいため収集しません"
+            ),
             ExclusionReason::ConnectionExcluded { connection_name } => {
                 format!("所属する接続「{connection_name}」が除外されたため、収集しません")
             }
@@ -884,6 +1027,16 @@ impl ConfigExclusion {
                      data_type=bit のタグでのみ使えます（現在のデータ型: {data_type}）"
                 ),
             },
+            ExclusionReason::DriverUnavailable { protocol } => format!(
+                "接続 {name} のプロトコル {protocol} のドライバがありません（接続は残しています）"
+            ),
+            ExclusionReason::InvalidSettings { errors } => format!(
+                "接続 {name} の設定が検証を通りません: {}",
+                errors.join(" / ")
+            ),
+            ExclusionReason::SettingsVersionTooNew { stored, supported } => format!(
+                "接続 {name} の設定の版（{stored}）がドライバの読める版（{supported}）より新しいです"
+            ),
             ExclusionReason::ConnectionExcluded { .. } | ExclusionReason::GroupExcluded { .. } => {
                 return None
             }
@@ -931,6 +1084,7 @@ pub fn build_config_lenient_from(
         ThresholdSource::None,
         HubSource::Unavailable,
         PushSource::Unavailable,
+        None,
     )
 }
 
@@ -961,6 +1115,7 @@ pub fn build_config_lenient_with_thresholds(
         ThresholdSource::Supplied(thresholds),
         hub,
         PushSource::Unavailable,
+        None,
     )
 }
 
@@ -995,6 +1150,7 @@ fn build_config_lenient_inner(
     threshold_source: ThresholdSource<'_>,
     hub: HubSource<'_>,
     push: PushSource,
+    drivers: Option<&DriverRegistry>,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
@@ -1074,7 +1230,7 @@ fn build_config_lenient_inner(
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
 
-        let resolved = match resolve_connection(conn, hub, push) {
+        let resolved = match resolve_connection(conn, hub, push, drivers) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 // The connection first (it is what needs fixing), then
@@ -1311,6 +1467,7 @@ pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
         ThresholdSource::None,
         HubSource::Available { catalog: None },
         PushSource::Unavailable,
+        None,
     )
     .1
 }
@@ -1322,7 +1479,18 @@ fn resolve_connection<'a>(
     conn: &PlcConnection,
     hub: HubSource<'a>,
     push: PushSource,
+    drivers: Option<&DriverRegistry>,
 ) -> Result<ResolvedConnection<'a>, ExclusionReason> {
+    // R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): with a registry,
+    // the connection's driver and settings are checked first - a row the registry does
+    // not know (a hand-written `hub` row in banto-hub, a removed plugin), whose settings
+    // the driver refuses (hand-edited) or whose settings shape is newer than the driver
+    // is excluded alone; the row itself is kept.
+    if let Some(registry) = drivers {
+        if let Some(reason) = driver_exclusion(conn, registry) {
+            return Err(reason);
+        }
+    }
     if conn.protocol == PUSH_PROTOCOL {
         return match push {
             PushSource::Unavailable => Err(ExclusionReason::PushSourceUnavailable),
@@ -1697,7 +1865,10 @@ pub fn check_tag_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use banto_tags::{CollectionGroupInput, PlcConnectionInput, TagInput};
+    use banto_tags::{
+        CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
+        TagInput, TagService,
+    };
 
     async fn registry() -> SqlitePool {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
@@ -1719,7 +1890,7 @@ mod tests {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         }
     }
@@ -2547,7 +2718,7 @@ mod tests {
                 cpu_type: None,
                 database: None,
                 username: None,
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -2610,7 +2781,7 @@ mod tests {
                 cpu_type: None,
                 database: Some("erp".to_string()),
                 username: Some("reader".to_string()),
-                password: None,
+                secrets: Default::default(),
                 settings: None,
             })
             .await
@@ -3585,8 +3756,8 @@ mod tests {
             cpu_type: "R".to_string(),
             database: None,
             username: None,
-            password: None,
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         }
     }
 
@@ -3636,7 +3807,110 @@ mod tests {
                 tag_of(703, 70, "label", "string"),
                 tag_of(704, 70, "count", "u64"),
             ],
+            secrets: Vec::new(),
         }
+    }
+
+    /// R2b-1d (implementation-checklist §5, #605; design §7): both registry readers
+    /// see the new columns (`load_connection`'s hand-written SELECT included) and the
+    /// same sealed secret rows - read in the same transaction as the connections, and
+    /// only sealed (no plaintext field exists on the snapshot).
+    #[tokio::test]
+    async fn both_registry_readers_see_the_new_columns_and_the_sealed_secrets() {
+        let pool = registry().await;
+        let service = PlcConnectionService::new(pool.clone());
+        let mut pg = PlcConnectionInput {
+            protocol: banto_tags::POSTGRES_PROTOCOL.to_string(),
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            ..conn_input("PG", 5432)
+        };
+        pg.secrets.insert(
+            banto_tags::PASSWORD_KEY.to_string(),
+            banto_tags::SecretChange::Set(banto_tags::SealedSecretRow::new(
+                "0123456789abcdef0123456789abcdef",
+                banto_tags::SCHEME_PLAIN_V1,
+                b"pw".to_vec(),
+            )),
+        );
+        let pg = service.create(pg).await.unwrap();
+        service.create(conn_input_slmp("S", 5007)).await.unwrap();
+
+        let loaded = RegistrySnapshot::load(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let in_tx = RegistrySnapshot::load_connection(&mut tx).await.unwrap();
+        drop(tx);
+        assert_eq!(loaded, in_tx);
+        assert_eq!(in_tx.connections.len(), 2);
+        assert_eq!(in_tx.connections[0].host, "127.0.0.1");
+        assert_eq!(in_tx.connections[0].port, 5432);
+        assert_eq!(in_tx.connections[0].database.as_deref(), Some("erp"));
+        assert_eq!(in_tx.connections[1].settings_version, 1);
+        assert_eq!(in_tx.secrets.len(), 1);
+        assert_eq!(in_tx.secrets[0].connection_id, pg.id);
+        assert_eq!(
+            Some(in_tx.secrets[0].sealed.r#ref.as_str()),
+            in_tx.connections[0].secret_ref(banto_tags::PASSWORD_KEY)
+        );
+    }
+
+    /// PR #777 owner review P2: [`RegistrySnapshot::load`] reads the connections and
+    /// the secret rows in one read transaction. A password update committed (from
+    /// another pool connection, a file DB in WAL) between the connection read and the
+    /// secret rows read is not seen half: the snapshot keeps the old reference **and**
+    /// the old row, so DB Source does not read a healthy connection as `Missing`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_reads_connections_and_secret_rows_in_one_snapshot() {
+        const OLD: &str = "0123456789abcdef0123456789abcdef";
+        const NEW: &str = "fedcba9876543210fedcba9876543210";
+        fn with_password(r#ref: &str) -> PlcConnectionInput {
+            let mut pg = PlcConnectionInput {
+                protocol: banto_tags::POSTGRES_PROTOCOL.to_string(),
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                ..conn_input("PG", 5432)
+            };
+            pg.secrets.insert(
+                banto_tags::PASSWORD_KEY.to_string(),
+                banto_tags::SecretChange::Set(banto_tags::SealedSecretRow::new(
+                    r#ref,
+                    banto_tags::SCHEME_PLAIN_V1,
+                    b"pw".to_vec(),
+                )),
+            );
+            pg
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pool = banto_storage::connect_sqlite(dir.path().join("snapshot.sqlite3"))
+            .await
+            .unwrap();
+        banto_tags::migrate(&pool).await.unwrap();
+        let service = PlcConnectionService::new(pool.clone());
+        let id = service.create(with_password(OLD)).await.unwrap().id;
+
+        let writer = service.clone();
+        let snapshot = RegistrySnapshot::load_between(&pool, || async move {
+            writer
+                .update(id, with_password(NEW))
+                .await
+                .expect("the update commits while the snapshot is being read");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot.connections[0].secret_ref(banto_tags::PASSWORD_KEY),
+            Some(OLD)
+        );
+        assert_eq!(snapshot.secrets.len(), 1, "{:?}", snapshot.secrets);
+        assert_eq!(snapshot.secrets[0].sealed.r#ref, OLD);
+
+        let after = RegistrySnapshot::load(&pool).await.unwrap();
+        assert_eq!(
+            after.connections[0].secret_ref(banto_tags::PASSWORD_KEY),
+            Some(NEW)
+        );
+        assert_eq!(after.secrets[0].sealed.r#ref, NEW);
+        pool.close().await;
     }
 
     /// R2a-2a: a "push" row saved through the services (now that the CHECK
@@ -3677,12 +3951,8 @@ mod tests {
         drop(tx);
         assert_eq!(loaded.connections, in_tx.connections);
         assert_eq!(
-            in_tx.connections[0]
-                .settings
-                .as_ref()
-                .map(ToString::to_string)
-                .as_deref(),
-            Some(r#"{"stale_timeout_ms":2000}"#)
+            in_tx.connections[0].settings.get("stale_timeout_ms"),
+            Some(&2000.into())
         );
 
         let config = build_config_from_with(&in_tx, PushSource::Available).unwrap();
@@ -3740,6 +4010,7 @@ mod tests {
             ThresholdSource::None,
             HubSource::Unavailable,
             PushSource::Available,
+            None,
         );
         let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
             .iter()
@@ -3763,12 +4034,14 @@ mod tests {
                 connections: vec![push_conn(7, "mes")],
                 groups: vec![group_of(70, 7, 1000)],
                 tags,
+                secrets: Vec::new(),
             };
             let (config, _) = build_config_lenient_inner(
                 &snapshot,
                 ThresholdSource::None,
                 HubSource::Unavailable,
                 PushSource::Available,
+                None,
             );
             assert!(config.connections.is_empty());
             assert!(config.store_config.groups.is_empty());
@@ -3865,5 +4138,225 @@ mod tests {
         assert!(config_exclusions(&snapshot)
             .iter()
             .any(|e| e.reason.code() == "pushSourceUnavailable"));
+    }
+
+    // ---- R2b-1d: §4.4 exclusion reasons (a driver registry) ---------------
+
+    /// A minimal driver for the registry: refuses `port == "1"`, holds `secret_keys`.
+    struct FakeDriver {
+        descriptor: banto_driver_api::DriverDescriptor,
+        secret_keys: Vec<String>,
+    }
+
+    impl banto_driver_api::DriverBase for FakeDriver {
+        fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+            &self.descriptor
+        }
+        fn validate_config(
+            &self,
+            settings: &banto_driver_api::Settings,
+        ) -> Vec<banto_driver_api::FieldError> {
+            if settings.get("port") == Some("1") {
+                vec![banto_driver_api::FieldError::new("port", "driver says no")]
+            } else {
+                Vec::new()
+            }
+        }
+        fn secret_keys(&self) -> Vec<String> {
+            self.secret_keys.clone()
+        }
+        fn parse_address(
+            &self,
+            _text: &str,
+            _kind: &banto_driver_api::TagKind,
+        ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+            Err(banto_driver_api::AddressError::new("none"))
+        }
+        fn offset_address(
+            &self,
+            canonical: &str,
+            _kind: &banto_driver_api::TagKind,
+            _n: i64,
+        ) -> Result<String, banto_driver_api::AddressError> {
+            Ok(canonical.to_owned())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn fake_registry(drivers: &[(&str, &[&str])]) -> DriverRegistry {
+        let mut registry = DriverRegistry::new();
+        for (id, secret_keys) in drivers {
+            registry
+                .register(banto_driver_api::DriverEntry::host_provided(
+                    std::sync::Arc::new(FakeDriver {
+                        descriptor: banto_driver_api::DriverDescriptor::new(
+                            banto_driver_api::DriverId::new(id).unwrap(),
+                            "0.0.0",
+                            *id,
+                            banto_driver_api::Capabilities::READ_ONLY,
+                        ),
+                        secret_keys: secret_keys.iter().map(|k| k.to_string()).collect(),
+                    }),
+                ))
+                .unwrap();
+        }
+        registry
+    }
+
+    fn modbus_conn(id: i64, name: &str, settings: serde_json::Value) -> PlcConnection {
+        PlcConnection::from_settings(
+            id,
+            name.to_string(),
+            "modbus-tcp".to_string(),
+            true,
+            false,
+            settings.as_object().unwrap().clone(),
+            1,
+        )
+    }
+
+    /// Design §4.4・§7: with a registry, a connection whose driver is missing, whose
+    /// settings the driver (or the storage-layer shape check) refuses, or whose
+    /// settings version is newer than the driver's is excluded **alone** - its groups
+    /// and tags cascade, every other connection is planned, the row itself is untouched.
+    /// The strict build fails with that connection's wording; without a registry
+    /// (ChronoGazer) nothing changes.
+    #[test]
+    fn a_registry_excludes_only_the_connection_it_cannot_drive() {
+        let registry = fake_registry(&[("modbus-tcp", &[]), ("push", &[])]);
+        let good = modbus_conn(1, "good", serde_json::json!({"host": "h", "port": 502}));
+        let refused = modbus_conn(2, "refused", serde_json::json!({"host": "h", "port": 1}));
+        let wrong_type = modbus_conn(
+            3,
+            "wrong-type",
+            serde_json::json!({"host": "h", "port": "502"}),
+        );
+        let mut too_new = modbus_conn(4, "too-new", serde_json::json!({"host": "h", "port": 502}));
+        too_new.settings_version = 2;
+        let mut no_driver = modbus_conn(5, "no-driver", serde_json::json!({}));
+        no_driver.protocol = "slmp".to_string();
+        let mut hub = modbus_conn(6, "hub", serde_json::json!({}));
+        hub.protocol = banto_tags::HUB_PROTOCOL.to_string();
+        let connections = vec![good, refused, wrong_type, too_new, no_driver, hub];
+        let groups: Vec<CollectionGroup> = (1..=6).map(|id| group_of(id * 10, id, 1000)).collect();
+        let tags: Vec<Tag> = (1..=6)
+            .map(|id| tag_of(id * 100, id * 10, "40001", "u16"))
+            .collect();
+        let snapshot = RegistrySnapshot {
+            connections,
+            groups,
+            tags,
+            secrets: Vec::new(),
+        };
+
+        let (config, exclusions) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            Some(&registry),
+        );
+        let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(planned, vec!["conn:1"]);
+        let own: Vec<(i64, &str)> = exclusions
+            .iter()
+            .filter(|e| e.unit == ExclusionUnit::Connection)
+            .map(|e| (e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            own,
+            vec![
+                (2, "invalidSettings"),
+                (3, "invalidSettings"),
+                (4, "settingsVersionTooNew"),
+                (5, "driverUnavailable"),
+                (6, "driverUnavailable"),
+            ]
+        );
+        // Each excluded connection takes its group and tag along as cascades.
+        assert_eq!(
+            exclusions
+                .iter()
+                .filter(|e| e.reason.code() == "connectionExcluded")
+                .count(),
+            10
+        );
+        let reason_of = |id: i64| {
+            exclusions
+                .iter()
+                .find(|e| e.unit == ExclusionUnit::Connection && e.id == id)
+                .unwrap()
+                .reason
+                .clone()
+        };
+        assert_eq!(
+            reason_of(2),
+            ExclusionReason::InvalidSettings {
+                errors: vec!["port: driver says no".to_string()]
+            }
+        );
+        assert!(matches!(
+            reason_of(3),
+            ExclusionReason::InvalidSettings { errors } if errors[0].starts_with("port: ")
+        ));
+        assert_eq!(
+            reason_of(4),
+            ExclusionReason::SettingsVersionTooNew {
+                stored: 2,
+                supported: 1
+            }
+        );
+        assert!(reason_of(5).message().contains("slmp"));
+
+        // The strict build (banto-hub) fails on the first one, by name.
+        let err = build_config_from_with_registry(&snapshot, PushSource::Available, &registry)
+            .unwrap_err();
+        assert!(err.to_string().contains("接続 refused の設定"), "{err}");
+        // A snapshot of only good rows builds.
+        let only_good = RegistrySnapshot {
+            connections: vec![snapshot.connections[0].clone()],
+            groups: vec![snapshot.groups[0].clone()],
+            tags: vec![snapshot.tags[0].clone()],
+            secrets: Vec::new(),
+        };
+        assert!(
+            build_config_from_with_registry(&only_good, PushSource::Available, &registry).is_ok()
+        );
+        // Without a registry the old rules decide (no driver checks at all).
+        let (_, without) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            None,
+        );
+        assert!(without.iter().all(|e| !matches!(
+            e.reason,
+            ExclusionReason::DriverUnavailable { .. }
+                | ExclusionReason::InvalidSettings { .. }
+                | ExclusionReason::SettingsVersionTooNew { .. }
+        )));
+    }
+
+    /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -
+    /// and the message names the field only, never the value.
+    #[test]
+    fn a_plaintext_under_a_secret_key_is_invalid_settings_without_the_value() {
+        let registry = fake_registry(&[("modbus-tcp", &["password"])]);
+        let conn = modbus_conn(
+            1,
+            "m",
+            serde_json::json!({"host": "h", "port": 502, "password": "TOPSECRET"}),
+        );
+        let reason = driver_exclusion(&conn, &registry).unwrap();
+        assert_eq!(reason.code(), "invalidSettings");
+        assert!(
+            !reason.message().contains("TOPSECRET"),
+            "{}",
+            reason.message()
+        );
+        assert!(!format!("{reason:?}").contains("TOPSECRET"));
     }
 }

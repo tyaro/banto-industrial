@@ -239,7 +239,9 @@ async fn push_settings_round_trip_through_rest() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{cleared:?}");
-    assert_eq!(cleared["settings"], json!({}));
+    // R2b-1d: the defaults read back as `null` (the column is `{}`, alpha.33 answered `null`
+    // for a push row on its defaults - design §2 keeps the REST shape).
+    assert_eq!(cleared["settings"], Value::Null);
 
     // push 以外で settings は 422（項目は settings）。
     let (status, refused) = admin_post(

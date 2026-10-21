@@ -294,6 +294,13 @@ impl DbSourceEngine {
         // 2) 状態表は「残す接続以外」を作り直す。
         self.status.apply_plan(&plan, &preserved, true);
 
+        // R2b-1d（設計 §5.4・§5.5）: パスワードを読めない接続はタスクを起こさず、配下の
+        // タグへ Bad を書く（走っていたタスクは 1) で止めた。前の Good を残さない）。
+        let now_ms = self.clock.now_ms();
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
+        }
+
         // 3) 新規／再起動対象を spawn する。
         for conn in plan.connections {
             if preserved.contains(&conn.connection_id) {
@@ -326,6 +333,11 @@ impl DbSourceEngine {
 
         let plan = state.plan.clone();
         self.status.apply_plan(&plan, &HashSet::new(), true);
+        // R2b-1d: パスワードを読めない接続は起こさず、配下のタグは Bad（[`Self::commit`]）。
+        let now_ms = self.clock.now_ms();
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
+        }
         for conn in plan.connections {
             let connection_id = conn.connection_id;
             let task = self.spawn_connection(conn.clone(), &log);
@@ -359,6 +371,9 @@ impl DbSourceEngine {
         let now_ms = self.clock.now_ms();
         for conn in &plan.connections {
             task::mark_connection_bad(conn, &self.store, now_ms);
+        }
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
         }
         self.status.apply_plan(&plan, &HashSet::new(), false);
     }
@@ -456,6 +471,26 @@ impl DbConnectionTestOutcome {
     }
 }
 
+/// R2b-1d (design §5.4・§5.5): the password of `conn` opened from its sealed row,
+/// right before connecting. `Ok("")` when none is set (a postgres password is optional);
+/// `Err(message)` when one is set but cannot be read - the caller fails the test instead
+/// of connecting with an empty password (checklist §5「エラーを空に潰さない」).
+fn connection_password(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+) -> Result<zeroize::Zeroizing<String>, String> {
+    match crate::secrets::open_connection_secret(
+        &crate::secrets::r2b1d_connection_secrets(),
+        conn,
+        banto_tags::PASSWORD_KEY,
+        secret_rows,
+    ) {
+        Ok(Some(password)) => Ok(password),
+        Ok(None) => Ok(zeroize::Zeroizing::new(String::new())),
+        Err(reason) => Err(plan::unreadable_password_message(reason)),
+    }
+}
+
 /// `conn`（`protocol == "postgres"`である前提 - 呼び出し側が
 /// [`banto_tags::PlcConnection::is_db_source`]で確認する）へ接続し、
 /// `SELECT version()`を1回実行して切断する。接続・クエリを合わせて
@@ -464,7 +499,14 @@ impl DbConnectionTestOutcome {
 /// 呼び出し側の責務（このモジュールの doc comment参照）: `protocol`が
 /// `"postgres"`かどうかの判定・認可（REST の`require_editor`/MCP の
 /// `require_admin_scope`）はここでは行わない - 疎通確認そのものだけを担う。
-pub async fn test_connection(conn: &PlcConnection) -> DbConnectionTestOutcome {
+///
+/// R2b-1d: `secret_rows` are `conn`'s sealed secret rows
+/// (`PlcConnectionService::secret_rows`); a password that cannot be opened fails the
+/// test without connecting.
+pub async fn test_connection(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+) -> DbConnectionTestOutcome {
     let port = if conn.port < 1 || conn.port > 65535 {
         return DbConnectionTestOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
@@ -473,12 +515,16 @@ pub async fn test_connection(conn: &PlcConnection) -> DbConnectionTestOutcome {
         conn.port as u16
     };
 
+    let password = match connection_password(conn, secret_rows) {
+        Ok(password) => password,
+        Err(message) => return DbConnectionTestOutcome::failed(message),
+    };
     let options = pg_connect_options(
         &conn.host,
         port,
         conn.database.as_deref().unwrap_or(""),
         conn.username.as_deref().unwrap_or(""),
-        conn.password.as_deref().unwrap_or(""),
+        &password,
         &conn.name,
     );
 
@@ -592,7 +638,13 @@ impl DescribeGroupOutcome {
 /// グレーアウトして選べないようにする。呼び出し側の責務
 /// （`protocol`が`postgres`かどうかの判定・認可・`query_sql`が`Some`か
 /// どうかの確認）はここでは行わない - [`test_connection`]と同じ役割分担。
-pub async fn describe_group(conn: &PlcConnection, query_sql: &str) -> DescribeGroupOutcome {
+///
+/// R2b-1d: `secret_rows` as in [`test_connection`].
+pub async fn describe_group(
+    conn: &PlcConnection,
+    secret_rows: &[banto_tags::StoredSecretRow],
+    query_sql: &str,
+) -> DescribeGroupOutcome {
     let port = if conn.port < 1 || conn.port > 65535 {
         return DescribeGroupOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
@@ -601,12 +653,16 @@ pub async fn describe_group(conn: &PlcConnection, query_sql: &str) -> DescribeGr
         conn.port as u16
     };
 
+    let password = match connection_password(conn, secret_rows) {
+        Ok(password) => password,
+        Err(message) => return DescribeGroupOutcome::failed(message),
+    };
     let options = pg_connect_options(
         &conn.host,
         port,
         conn.database.as_deref().unwrap_or(""),
         conn.username.as_deref().unwrap_or(""),
-        conn.password.as_deref().unwrap_or(""),
+        &password,
         &conn.name,
     );
 
@@ -654,7 +710,7 @@ mod tests {
     use banto_tstore::SystemClock;
 
     fn base_conn() -> PlcConnection {
-        PlcConnection {
+        let conn = PlcConnection {
             id: 1,
             name: "Test DB".to_string(),
             protocol: "postgres".to_string(),
@@ -667,9 +723,38 @@ mod tests {
             cpu_type: "R".to_string(),
             database: Some("appdb".to_string()),
             username: Some("appuser".to_string()),
-            password: Some("s3cret-password".to_string()),
-            settings: None,
-        }
+            settings: Default::default(),
+            settings_version: 1,
+        };
+        with_password(conn, "s3cret-password").0
+    }
+
+    const PW_REF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// R2b-1d: `conn` with a sealed (`plain-v1`) password - the reference in its
+    /// `settings` and the row `PlcConnectionService::secret_rows` would return.
+    fn with_password(
+        mut conn: PlcConnection,
+        password: &str,
+    ) -> (PlcConnection, Vec<banto_tags::StoredSecretRow>) {
+        conn.settings.insert(
+            "password".to_string(),
+            serde_json::json!({ "$secret": PW_REF }),
+        );
+        let rows = vec![banto_tags::StoredSecretRow {
+            connection_id: conn.id,
+            key: "password".to_string(),
+            sealed: banto_tags::SealedSecretRow::new(
+                PW_REF,
+                "plain-v1",
+                password.as_bytes().to_vec(),
+            ),
+        }];
+        (conn, rows)
+    }
+
+    fn base_rows() -> Vec<banto_tags::StoredSecretRow> {
+        with_password(base_conn(), "s3cret-password").1
     }
 
     /// A closed port fails fast (well within [`DB_TEST_TIMEOUT`]) with
@@ -678,7 +763,7 @@ mod tests {
     #[tokio::test]
     async fn test_connection_against_a_closed_port_fails_without_leaking_the_password() {
         let conn = base_conn();
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.server_version.is_none());
         let error = outcome.error.expect("a failed test should carry an error");
@@ -693,6 +778,32 @@ mod tests {
         );
     }
 
+    /// R2b-1d (design §5.4・§5.5): a password that is set but cannot be read (its row
+    /// is missing) fails the test and the describe **without connecting** - it is never
+    /// tried as an empty password. A connection with no password at all still tries
+    /// (and fails here on the closed port, not on the password).
+    #[tokio::test]
+    async fn an_unreadable_password_fails_without_connecting() {
+        let conn = base_conn();
+        let outcome = test_connection(&conn, &[]).await;
+        assert!(!outcome.ok);
+        let error = outcome.error.expect("error");
+        assert!(error.contains("パスワードを読めません"), "{error}");
+        assert!(error.contains("missing"), "{error}");
+        let outcome = describe_group(&conn, &[], "SELECT 1 AS a").await;
+        assert!(!outcome.ok);
+        assert!(outcome
+            .error
+            .expect("error")
+            .contains("パスワードを読めません"));
+
+        let mut no_password = base_conn();
+        no_password.settings.clear();
+        let outcome = test_connection(&no_password, &[]).await;
+        assert!(!outcome.ok);
+        assert!(!outcome.error.expect("error").contains("パスワード"));
+    }
+
     /// An invalid port number is rejected before any connection attempt,
     /// with a friendly message (mirrors `test_modbus_connection`'s own
     /// port-range guard).
@@ -702,13 +813,13 @@ mod tests {
 
         // Test port > 65535
         conn.port = 70_000;
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
 
         // Test port = 0
         conn.port = 0;
-        let outcome = test_connection(&conn).await;
+        let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
     }
@@ -740,11 +851,15 @@ mod tests {
             cpu_type: "R".to_string(),
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
-            password: url_password(&url),
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
 
-        let outcome = test_connection(&conn).await;
+        let (conn, rows) = match url_password(&url) {
+            Some(password) => with_password(conn, &password),
+            None => (conn, Vec::new()),
+        };
+        let outcome = test_connection(&conn, &rows).await;
         assert!(outcome.ok, "expected ok, got: {outcome:?}");
         let server_version = outcome
             .server_version
@@ -808,7 +923,7 @@ mod tests {
     #[tokio::test]
     async fn describe_group_against_a_closed_port_fails_without_leaking_the_password() {
         let conn = base_conn();
-        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        let outcome = describe_group(&conn, &base_rows(), "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome.columns.is_none());
         let error = outcome
@@ -826,7 +941,7 @@ mod tests {
     async fn describe_group_rejects_an_out_of_range_port() {
         let mut conn = base_conn();
         conn.port = 70_000;
-        let outcome = describe_group(&conn, "SELECT 1 AS a").await;
+        let outcome = describe_group(&conn, &base_rows(), "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
     }
@@ -882,12 +997,17 @@ mod tests {
             cpu_type: "R".to_string(),
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
-            password: url_password(&url),
-            settings: None,
+            settings: Default::default(),
+            settings_version: 1,
         };
 
+        let (conn, rows) = match url_password(&url) {
+            Some(password) => with_password(conn, &password),
+            None => (conn, Vec::new()),
+        };
         let outcome = describe_group(
             &conn,
+            &rows,
             "SELECT 1::int4 AS n, true AS b, now() AS t, 'x'::text AS s",
         )
         .await;
@@ -954,6 +1074,8 @@ mod tests {
                 conn_plan(2, "SELECT a FROM v2"),
             ],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         let ids_after_first: Vec<i64> = {
             let state = engine.state.lock().unwrap();
@@ -976,6 +1098,8 @@ mod tests {
                 conn_plan(3, "SELECT a FROM v3"),
             ],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -993,6 +1117,8 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -1029,6 +1155,8 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
 
         assert!(
@@ -1056,6 +1184,8 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         assert!(engine.state.lock().unwrap().tasks.is_empty());
 
@@ -1094,6 +1224,84 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: パスワードを読めない
+    /// 接続はタスクを起こさず（＝再試行でも繋ぎに行かない）、その接続だけ状態が `error`
+    /// 「パスワードを読めません」、配下のタグは Bad。読める接続は今どおり起きる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_connection_is_bad_and_never_started() {
+        let store = Arc::new(ServerTagStore::new());
+        let engine = DbSourceEngine::new(store.clone(), Arc::new(SystemClock));
+        let broken = conn_plan(2, "SELECT a FROM v2");
+        // A Good value from before the password became unreadable must not linger.
+        store.set("tag:2", Some(7.0), banto_collect::Quality::Good, 1_000);
+        store.set("tag:3", Some(8.0), banto_collect::Quality::Good, 1_000);
+        engine.start();
+        engine.commit(DbSourcePlan {
+            connections: vec![conn_plan(1, "SELECT a FROM v1")],
+            disabled: Vec::new(),
+            unreadable: vec![plan::UnreadableDbConnection {
+                connection_id: 2,
+                connection_name: "db2".to_string(),
+                reason: crate::secrets::UnreadableReason::Undecryptable,
+                groups: broken.groups.clone(),
+            }],
+            // PR #777 review P2: a connection the registry refuses is handled the same way.
+            excluded: vec![plan::ExcludedDbConnection {
+                connection_id: 3,
+                connection_name: "db3".to_string(),
+                reason: banto_collect::ExclusionReason::SettingsVersionTooNew {
+                    stored: 2,
+                    supported: 1,
+                },
+                groups: conn_plan(3, "SELECT a FROM v3").groups,
+            }],
+        });
+        assert_eq!(
+            engine
+                .state
+                .lock()
+                .unwrap()
+                .tasks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1],
+            "no task for the unreadable or excluded connection"
+        );
+        let sample = store.get("tag:2").expect("tag:2 written");
+        assert_eq!(sample.quality, banto_collect::Quality::Bad);
+        assert_eq!(sample.value, None);
+        let status = engine.status_snapshot();
+        let entry = status.iter().find(|s| s.connection_id == 2).unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        let message = entry.last_error.as_deref().unwrap();
+        assert!(message.contains("パスワードを読めません"), "{message}");
+        assert!(message.contains("undecryptable"), "{message}");
+        assert_eq!(entry.groups.len(), 1);
+        let sample = store.get("tag:3").expect("tag:3 written");
+        assert_eq!(sample.quality, banto_collect::Quality::Bad);
+        assert_eq!(sample.value, None);
+        let entry = status.iter().find(|s| s.connection_id == 3).unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        let message = entry.last_error.as_deref().unwrap();
+        assert!(message.contains("版"), "{message}");
+        assert_eq!(entry.groups.len(), 1);
+
+        // Stopping keeps it `error` (a configuration fact, not a running state) and Bad.
+        engine.stop().await;
+        let entry = engine
+            .status_snapshot()
+            .into_iter()
+            .find(|s| s.connection_id == 2)
+            .unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        assert_eq!(
+            store.get("tag:2").unwrap().quality,
+            banto_collect::Quality::Bad
+        );
+        engine.shutdown().await;
+    }
+
     /// `start`/`stop` は冪等（`CollectionController::start`/`stop` 自身が
     /// 冪等なのと揃える - 二重呼び出しでタスクが二重に起きない）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1102,6 +1310,8 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
 
         engine.start();

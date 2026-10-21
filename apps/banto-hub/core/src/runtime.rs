@@ -166,7 +166,7 @@ use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
-use crate::db::{init_db, Db, InitDbError, LegacyDatabase};
+use crate::db::{init_db_with_registry, Db, InitDbError, LegacyDatabase};
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
@@ -258,6 +258,24 @@ pub enum HubStartError {
     /// または退避して起動し直す、手順は docs/banto-hub-operations.md）を含む。
     #[error("banto-hub: {0}")]
     LegacyDatabase(LegacyDatabase),
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §6.3）: 戻せない移行
+    /// （`banto-tags` の 0025）の写しでの予行が、新しい検証を通らない接続（`rows`）や
+    /// 行に結び付かない問題（`problems`: 秘密値の行の数の食い違い・写しへの migrate の
+    /// 失敗）を見つけた - 移行せずに起動を断る。DB は一切変わっていない。メッセージに
+    /// 直し方（旧版の Hub でその接続を直すか消す）と行の一覧を含む
+    /// （`crate::upgrade::PreflightRefusal` の `Display`）。コンソールの stderr・
+    /// サービスのログは [`Self::LegacyDatabase`] と同じ起動失敗の経路に乗る。
+    #[error("banto-hub: {}", crate::upgrade::PreflightRefusal { db_path: db_path.clone(), rows: rows.clone(), problems: problems.clone() })]
+    ConnectionSettingsPreflight {
+        db_path: PathBuf,
+        rows: Vec<crate::upgrade::PreflightRow>,
+        problems: Vec<String>,
+    },
+    /// R2b-1d（設計 §6.1 の 2-b・§6.4）: 移行の前後処理のそれ以外の失敗（残り物・予行の
+    /// 写しを消せない・バックアップを作れない・予行そのものの失敗）。メッセージにパスと
+    /// 対処を含む。DB は変わっていない。
+    #[error("banto-hub: {0}")]
+    Upgrade(crate::upgrade::UpgradeError),
     /// `SettingsService::server_config`失敗（旧: `"server_config should
     /// succeed"`で `expect`）。
     #[error("banto-hub: サーバー設定の読み取りに失敗しました: {0}")]
@@ -374,10 +392,35 @@ impl HubRuntime {
             None => db_path,
         };
 
-        let pool = init_db(&db_path).await.map_err(|err| match err {
-            InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
-            InitDbError::Storage(err) => HubStartError::InitDb(err),
-        })?;
+        // R2b-1d（docs/banto-hub-connection-settings-design.md §6.1）: 2-a〜2-c。レジストリは
+        // `drivers` を `HubSessions` へ渡す前に写しておく（予行の preflight・入口の
+        // `with_registry`・予約接続が使う）。
+        let registry = drivers.registry.clone();
+        let pool = init_db_with_registry(&db_path, &registry)
+            .await
+            .map_err(|err| match err {
+                InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
+                InitDbError::Upgrade(crate::upgrade::UpgradeError::Preflight(refusal)) => {
+                    HubStartError::ConnectionSettingsPreflight {
+                        db_path: refusal.db_path,
+                        rows: refusal.rows,
+                        problems: refusal.problems,
+                    }
+                }
+                InitDbError::Upgrade(err) => HubStartError::Upgrade(err),
+                InitDbError::Storage(err) => HubStartError::InitDb(err),
+            })?;
+
+        // R2b-1d（設計 §5.3 の最後の行、毎回の起動）: 秘密値の行と `settings` の参照の
+        // 突き合わせ。参照があって行が無い接続はログに出す（読む側は `Unreadable {
+        // Missing }` として空のパスワードで繋がない）。参照の無い行は消す。失敗しても
+        // 起動は止めない（読む側の判断は行ごとに同じ）。
+        match crate::upgrade::check_secret_integrity(&pool).await {
+            Ok(report) => crate::upgrade::log_integrity(&report),
+            Err(err) => log_err_line(&format!(
+                "banto-hub: [WARN] 秘密値の整合の確認に失敗しました: {err}"
+            )),
+        }
 
         // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): auto-provision the
         // reserved `calc`/`mem` virtual connections BEFORE the first rebuild
@@ -386,8 +429,8 @@ impl HubRuntime {
         // what then protects both names from ever being claimed by a real
         // connection (`banto_tags::plc_connection`'s module doc "virtual"
         // section).
-        ensure_virtual_connection(&pool, CALC_CONNECTION_NAME).await;
-        ensure_virtual_connection(&pool, MEM_CONNECTION_NAME).await;
+        ensure_virtual_connection(&pool, &registry, CALC_CONNECTION_NAME).await;
+        ensure_virtual_connection(&pool, &registry, MEM_CONNECTION_NAME).await;
 
         let events = event_channel();
         let users = UsersService::new(Db::Sqlite(pool.clone()));
@@ -644,7 +687,9 @@ impl HubRuntime {
             })
         };
 
-        let plc_connections = PlcConnectionService::new(pool.clone());
+        // R2b-1d（設計 §4.2）: Hub の入口（REST・MCP・未適用キューの適用・Sink とブリッジの
+        // 設定）の接続のサービスはレジストリつき。`manager.plc_connections()` と同じもの。
+        let plc_connections = PlcConnectionService::with_registry(pool.clone(), registry.clone());
         let collection_groups = CollectionGroupService::new(pool.clone());
         let tags = TagService::new(pool.clone());
         let api_keys = ApiKeysService::new(pool.clone());
@@ -1161,7 +1206,11 @@ fn is_profile_dir(path: &Path, dir: &banto_safe_root::ManagedDir) -> bool {
 /// for `"virtual"`). A failure here (e.g. a corrupt registry) is logged and
 /// never fatal - same "must not prevent the server from starting" posture
 /// as the startup rebuild just above.
-async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
+async fn ensure_virtual_connection(
+    pool: &SqlitePool,
+    registry: &Arc<banto_driver_api::DriverRegistry>,
+    name: &str,
+) {
     let already_exists: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE name = ?")
             .bind(name)
@@ -1177,7 +1226,9 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
         return;
     }
 
-    let svc = PlcConnectionService::new(pool.clone());
+    // R2b-1d（設計 §4.2）: 予約接続もレジストリつきの入口で作る（`virtual` は
+    // `crate::computed::driver::VirtualDriver`、host が登録する）。
+    let svc = PlcConnectionService::with_registry(pool.clone(), registry.clone());
     if let Err(err) = svc
         .create(PlcConnectionInput {
             name: name.to_string(),
@@ -1192,7 +1243,7 @@ async fn ensure_virtual_connection(pool: &SqlitePool, name: &str) {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await
@@ -1360,6 +1411,7 @@ fn with_hub_security_headers(router: axum::Router) -> axum::Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::init_db;
 
     /// PR1a オーナーレビュー P3: the startup log's URLs come from the bound
     /// address - a loopback bind lists exactly that URL, and an unspecified
@@ -2026,7 +2078,12 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let pool = init_db(&db_path).await.expect("init DB");
-        ensure_virtual_connection(&pool, MEM_CONNECTION_NAME).await;
+        ensure_virtual_connection(
+            &pool,
+            &crate::test_support::test_drivers().registry,
+            MEM_CONNECTION_NAME,
+        )
+        .await;
         let connection_id: i64 =
             sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = ?")
                 .bind(MEM_CONNECTION_NAME)

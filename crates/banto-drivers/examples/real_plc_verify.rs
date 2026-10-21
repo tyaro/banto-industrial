@@ -874,8 +874,8 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         cpu_type: cpu_name(ctx.target.cpu).to_string(),
         database: None,
         username: None,
-        password: None,
-        settings: None,
+        settings: Default::default(),
+        settings_version: 1,
     };
 
     let supervisor =

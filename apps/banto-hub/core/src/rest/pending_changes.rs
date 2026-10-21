@@ -258,7 +258,7 @@ async fn execute_pending_apply(
         .map_err(storage_api_error)
         .map_err(PendingApplyError::Api)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -275,7 +275,13 @@ async fn execute_pending_apply(
                 .map_err(PendingApplyError::Api)?;
             state
                 .plc_connections
-                .create_tx(&mut tx, body.input.into())
+                .create_tx(
+                    &mut tx,
+                    body.input
+                        .into_input()
+                        .map_err(ApiError)
+                        .map_err(PendingApplyError::Api)?,
+                )
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -313,7 +319,14 @@ async fn execute_pending_apply(
             }
             state
                 .plc_connections
-                .update_tx(&mut tx, body.id, body.input.into())
+                .update_tx(
+                    &mut tx,
+                    body.id,
+                    body.input
+                        .into_input()
+                        .map_err(ApiError)
+                        .map_err(PendingApplyError::Api)?,
+                )
                 .await
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;

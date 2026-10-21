@@ -85,7 +85,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         cpu_type: None,
         database: None,
         username: None,
-        password: None,
+        secrets: Default::default(),
         settings: None,
     }
 }
@@ -2289,7 +2289,11 @@ async fn update_connection_password_tri_state_semantics() {
             cpu_type: None,
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
-            password: Some("original-secret".to_string()),
+            secrets: banto_hub_core::secrets::password_changes(
+                &banto_hub_core::secrets::r2b1d_connection_secrets(),
+                Some("original-secret"),
+            )
+            .expect("seal the test password"),
             settings: None,
         })
         .await
@@ -2322,11 +2326,10 @@ async fn update_connection_password_tri_state_semantics() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["updated"]["passwordSet"], true);
-    let stored = PlcConnectionService::new(app.pool.clone())
-        .get(created.id)
-        .await
-        .unwrap();
-    assert_eq!(stored.password.as_deref(), Some("original-secret"));
+    assert_eq!(
+        stored_password(&app.pool, created.id).await.as_deref(),
+        Some("original-secret")
+    );
 
     // password: "" -> 消去する。
     let (status, body) = mcp_post(
@@ -2355,11 +2358,7 @@ async fn update_connection_password_tri_state_semantics() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["updated"]["passwordSet"], false);
-    let stored = PlcConnectionService::new(app.pool.clone())
-        .get(created.id)
-        .await
-        .unwrap();
-    assert_eq!(stored.password, None);
+    assert_eq!(stored_password(&app.pool, created.id).await, None);
 }
 
 /// `test_saved_connection`: 非 postgres 接続に対しては`unsupported`エラーで
@@ -2414,7 +2413,11 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
             cpu_type: None,
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
-            password,
+            secrets: banto_hub_core::secrets::password_changes(
+                &banto_hub_core::secrets::r2b1d_connection_secrets(),
+                password.as_deref(),
+            )
+            .expect("seal the test password"),
             settings: None,
         })
         .await
@@ -2494,7 +2497,7 @@ async fn create_group_under_a_postgres_connection_requires_query_sql() {
             cpu_type: None,
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await
@@ -5042,6 +5045,22 @@ async fn after_lock_down_config_tools_still_work_but_writes_become_advisory() {
 // 関与しないため、稼働中/停止中の分岐は無い(§6-13)。
 // ---------------------------------------------------------------------------
 
+/// R2b-1d: the stored password of connection `id`, opened from its sealed row the way
+/// banto-hub's readers do. `None` = no password; panics when one is set but unreadable.
+async fn stored_password(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+    let service = PlcConnectionService::new(pool.clone());
+    let conn = service.get(id).await.unwrap();
+    let rows = service.secret_rows(id).await.unwrap();
+    banto_hub_core::secrets::open_connection_secret(
+        &banto_hub_core::secrets::r2b1d_connection_secrets(),
+        &conn,
+        banto_tags::PASSWORD_KEY,
+        &rows,
+    )
+    .expect("a stored password must be readable")
+    .map(|plain| plain.as_str().to_owned())
+}
+
 fn postgres_conn_input(name: &str) -> PlcConnectionInput {
     PlcConnectionInput {
         name: name.to_string(),
@@ -5055,7 +5074,11 @@ fn postgres_conn_input(name: &str) -> PlcConnectionInput {
         cpu_type: None,
         database: Some("erp".to_string()),
         username: Some("reader".to_string()),
-        password: Some("s3cret".to_string()),
+        secrets: banto_hub_core::secrets::password_changes(
+            &banto_hub_core::secrets::r2b1d_connection_secrets(),
+            Some("s3cret"),
+        )
+        .expect("seal the test password"),
         settings: None,
     }
 }
@@ -5437,7 +5460,7 @@ async fn create_bridge_source_postgres(app: &TestApp, name: &str) -> i64 {
             cpu_type: None,
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
-            password: None,
+            secrets: Default::default(),
             settings: None,
         })
         .await
@@ -5567,7 +5590,7 @@ async fn update_connection_push_settings_omitted_null_object_and_empty() {
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: Some(original.clone()),
         })
         .await
@@ -5632,10 +5655,10 @@ async fn update_connection_push_settings_omitted_null_object_and_empty() {
     )
     .await;
     let payload = tool_ok_payload(status, &body);
-    assert_eq!(payload["updated"]["settings"], json!({}), "{payload:?}");
+    // R2b-1d: a push row on its defaults reads back as `null` (alpha.33's shape, design §2).
+    assert_eq!(payload["updated"]["settings"], Value::Null, "{payload:?}");
     let listed = listed_settings(&app, &admin_key, id).await;
-    assert_eq!(listed, json!({}));
-    assert!(listed.get("bridge").is_none(), "{listed:?}");
+    assert_eq!(listed, Value::Null);
 }
 
 /// 不正な `settings` は tool error（項目名つき）で断り、レジストリは変わらない。
@@ -5744,7 +5767,7 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
             cpu_type: None,
             database: None,
             username: None,
-            password: None,
+            secrets: Default::default(),
             settings: Some(good.clone()),
         })
         .await
@@ -5782,7 +5805,7 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
             .await
             .unwrap();
         assert_eq!(stored.name, "sender", "{settings:?}");
-        assert_eq!(stored.settings, Some(good.clone()), "{settings:?}");
+        assert_eq!(Value::Object(stored.settings), good, "{settings:?}");
         assert_eq!(listed_settings(&app, &admin_key, created.id).await, good);
     }
 }

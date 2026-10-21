@@ -32,8 +32,11 @@
 
 use std::fmt;
 
-use banto_collect::RegistrySnapshot;
+use banto_collect::{ExclusionReason, RegistrySnapshot};
+use banto_driver_api::DriverRegistry;
 use banto_tags::{DB_TAG_KIND, POSTGRES_PROTOCOL};
+
+use crate::secrets::UnreadableReason;
 
 /// 1回の commit で engine が受け取る計画一式。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -45,12 +48,95 @@ pub struct DbSourcePlan {
     /// `(id, name)`。タスクは起動しないが、状態表示で `disabled` として
     /// 見せるために持ち回る（[`crate::db_source::status`]）。
     pub disabled: Vec<(i64, String)>,
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: 有効で回す
+    /// グループもあるが、**パスワードを読めない**接続（秘密値の行が無い・この PC で
+    /// 開けない）。タスクを起動せず（再試行でも繋ぎに行かない）、状態表示はその接続だけ
+    /// `error`「パスワードを読めません」、配下のタグは Bad（[`crate::db_source::DbSourceEngine`]
+    /// が書く）。空のパスワードで繋がない（`trust` 認証の DB なら別の資格で繋がって
+    /// しまう、checklist §5「エラーを空に潰さない」）。
+    pub unreadable: Vec<UnreadableDbConnection>,
+    /// PR #777 のオーナーレビュー P2（設計 §4.4・§3.4）: 有効で回すグループもあるが、
+    /// レジストリで確かめると使えない接続（`postgres` のドライバが無い・`settings` が
+    /// 検証を通らない・設定の版がドライバより新しい。`banto_collect::driver_exclusion`、
+    /// PLC の収集と同じ判断）。[`Self::unreadable`] と同じく、タスクを起動せず、状態表示は
+    /// その接続だけ `error`（理由の文言）、配下のタグは Bad。
+    pub excluded: Vec<ExcludedDbConnection>,
+}
+
+/// [`DbSourcePlan`] の中で、タスクを起こさず配下のタグを Bad にする接続 1 件
+/// （[`DbSourcePlan::unreadable`] と [`DbSourcePlan::excluded`] をまとめて読む形。
+/// [`DbSourcePlan::blocked`]）。
+#[derive(Debug, Clone, Copy)]
+pub struct BlockedDbConnection<'a> {
+    pub connection_id: i64,
+    pub connection_name: &'a str,
+    pub groups: &'a [DbGroupPlan],
+}
+
+impl DbSourcePlan {
+    /// タスクを起こさない（配下のタグを Bad にし、状態を `error` にする）接続を、
+    /// 状態の画面の文言と一緒に並べる（パスワードを読めない接続、次にレジストリで外した接続）。
+    pub fn blocked(&self) -> impl Iterator<Item = (BlockedDbConnection<'_>, String)> + '_ {
+        let unreadable = self.unreadable.iter().map(|conn| {
+            (
+                BlockedDbConnection {
+                    connection_id: conn.connection_id,
+                    connection_name: &conn.connection_name,
+                    groups: &conn.groups,
+                },
+                unreadable_password_message(conn.reason),
+            )
+        });
+        let excluded = self.excluded.iter().map(|conn| {
+            (
+                BlockedDbConnection {
+                    connection_id: conn.connection_id,
+                    connection_name: &conn.connection_name,
+                    groups: &conn.groups,
+                },
+                conn.reason.message(),
+            )
+        });
+        unreadable.chain(excluded)
+    }
+}
+
+/// PR #777 のオーナーレビュー P2: レジストリで確かめると使えないので起動しない接続 1 件
+/// （[`DbSourcePlan::excluded`]）。`groups` は配下のタグへ Bad を書くため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExcludedDbConnection {
+    pub connection_id: i64,
+    pub connection_name: String,
+    pub reason: ExclusionReason,
+    pub groups: Vec<DbGroupPlan>,
 }
 
 impl DbSourcePlan {
     pub fn is_empty(&self) -> bool {
-        self.connections.is_empty() && self.disabled.is_empty()
+        self.connections.is_empty()
+            && self.disabled.is_empty()
+            && self.unreadable.is_empty()
+            && self.excluded.is_empty()
     }
+}
+
+/// R2b-1d: パスワードを読めないので起動しない接続 1 件（[`DbSourcePlan::unreadable`]）。
+/// パスワードも参照も持たない。`groups` は配下のタグへ Bad を書くため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableDbConnection {
+    pub connection_id: i64,
+    pub connection_name: String,
+    pub reason: UnreadableReason,
+    pub groups: Vec<DbGroupPlan>,
+}
+
+/// R2b-1d（設計 §5.5）: パスワードを読めない接続の理由の文言（状態の画面の
+/// `dbSource` 節・接続のテストの `error`）。秘密値を含まない。
+pub fn unreadable_password_message(reason: UnreadableReason) -> String {
+    format!(
+        "パスワードを読めません（{}）。接続の編集でパスワードを入れ直してください。",
+        reason.as_str()
+    )
 }
 
 /// 1接続分（= tokio task 1本、`PgPool` 1つ）。
@@ -179,10 +265,22 @@ pub fn resolve_group(group: &DbGroupPlan, described: &[(String, String)]) -> Res
 ///
 /// - `postgres` 接続配下の有効なグループに `query_sql` が無い
 /// - `postgres` 接続配下に `db` 以外の種別のタグがいる
-/// - `port` が `1..=65535` に収まらない
-pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
+/// - `port` が `1..=65535` に収まらない（レジストリで外した接続は除く）
+///
+/// PR #777 のオーナーレビュー P2（設計 §4.4・§3.4）: 有効な `postgres` 接続は、PLC の収集
+/// （`banto_collect::build_config_from_with_registry`）と同じ
+/// `banto_collect::driver_exclusion` で `registry` に照らす。ドライバが無い・`settings` が
+/// 検証を通らない・設定の版が新しすぎる接続は [`DbSourcePlan::excluded`] に載せ、タスクを
+/// 起こさない（配下のタグは Bad）。計画全体は落とさない（他の接続は動かす、#414 の
+/// 「外して残りを動かす」）。
+pub fn build_plan(
+    snapshot: &RegistrySnapshot,
+    registry: &DriverRegistry,
+) -> Result<DbSourcePlan, String> {
     let mut connections = Vec::new();
     let mut disabled = Vec::new();
+    let mut unreadable = Vec::new();
+    let mut excluded = Vec::new();
 
     for conn in &snapshot.connections {
         if conn.protocol != POSTGRES_PROTOCOL {
@@ -193,15 +291,22 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             continue;
         }
 
-        let port = u16::try_from(conn.port)
-            .ok()
-            .filter(|port| *port >= 1)
-            .ok_or_else(|| {
-                format!(
-                    "DB 接続 {} のポート番号が不正です（1〜65535）: {}",
-                    conn.name, conn.port
-                )
-            })?;
+        let exclusion = banto_collect::driver_exclusion(conn, registry);
+        // A connection the registry refuses is not parsed further (its port may be
+        // exactly what the driver refused); it is listed below once its groups are known.
+        let port = if exclusion.is_some() {
+            0
+        } else {
+            u16::try_from(conn.port)
+                .ok()
+                .filter(|port| *port >= 1)
+                .ok_or_else(|| {
+                    format!(
+                        "DB 接続 {} のポート番号が不正です（1〜65535）: {}",
+                        conn.name, conn.port
+                    )
+                })?
+        };
 
         let mut groups = Vec::new();
         for group in snapshot
@@ -270,6 +375,41 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             continue;
         }
 
+        if let Some(reason) = exclusion {
+            excluded.push(ExcludedDbConnection {
+                connection_id: conn.id,
+                connection_name: conn.name.clone(),
+                reason,
+                groups,
+            });
+            continue;
+        }
+
+        // R2b-1d (design §5.4・§5.5): the password is opened from the sealed row the
+        // snapshot carries. No password set = connect without one (a postgres password is
+        // optional). One that is set but cannot be read is **not** collapsed to an empty
+        // password: the connection is not started (no task, so no retry dials it either),
+        // its status reads「パスワードを読めません」 and its tags read Bad.
+        // TODO(R2b-1e): hold the sealed row in the plan and open it at connect time
+        // (design §5.4's table); the plan carries the opened value as before for now.
+        let password = match crate::secrets::open_connection_secret(
+            &crate::secrets::r2b1d_connection_secrets(),
+            conn,
+            banto_tags::PASSWORD_KEY,
+            &snapshot.secrets,
+        ) {
+            Ok(password) => password.map_or_else(String::new, |plain| plain.as_str().to_owned()),
+            Err(reason) => {
+                unreadable.push(UnreadableDbConnection {
+                    connection_id: conn.id,
+                    connection_name: conn.name.clone(),
+                    reason,
+                    groups,
+                });
+                continue;
+            }
+        };
+
         connections.push(DbConnectionPlan {
             connection_id: conn.id,
             connection_name: conn.name.clone(),
@@ -277,7 +417,7 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             port,
             database: conn.database.clone().unwrap_or_default(),
             username: conn.username.clone().unwrap_or_default(),
-            password: conn.password.clone().unwrap_or_default(),
+            password,
             groups,
         });
     }
@@ -285,6 +425,8 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
     Ok(DbSourcePlan {
         connections,
         disabled,
+        unreadable,
+        excluded,
     })
 }
 
@@ -294,22 +436,40 @@ mod tests {
     use banto_tags::{CollectionGroup, PlcConnection, Tag};
 
     fn pg_connection(id: i64, name: &str, enabled: bool) -> PlcConnection {
-        PlcConnection {
+        // R2b-1d: the endpoint lives in `settings` (what the registry check validates),
+        // the password is a reference to a sealed row ([`secret_rows`]).
+        PlcConnection::from_settings(
             id,
-            name: name.to_string(),
-            protocol: POSTGRES_PROTOCOL.to_string(),
-            host: "10.0.0.50".to_string(),
-            port: 5432,
-            unit_id: 1,
+            name.to_string(),
+            POSTGRES_PROTOCOL.to_string(),
             enabled,
-            simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: Some("erp".to_string()),
-            username: Some("reader".to_string()),
-            password: Some("s3cret".to_string()),
-            settings: None,
-        }
+            false,
+            serde_json::json!({
+                "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader",
+                "password": { "$secret": PW_REF }
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            1,
+        )
+    }
+
+    /// The Hub's registry in tests (`postgres` is the real host-provided entry).
+    fn registry() -> std::sync::Arc<DriverRegistry> {
+        crate::test_support::test_drivers().registry
+    }
+
+    const PW_REF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// The sealed (`plain-v1`) password row of connection 1 (what
+    /// `RegistrySnapshot::load` reads from `plc_connection_secrets`).
+    fn secret_rows() -> Vec<banto_tags::StoredSecretRow> {
+        vec![banto_tags::StoredSecretRow {
+            connection_id: 1,
+            key: "password".to_string(),
+            sealed: banto_tags::SealedSecretRow::new(PW_REF, "plain-v1", b"s3cret".to_vec()),
+        }]
     }
 
     fn plc_connection(id: i64, name: &str) -> PlcConnection {
@@ -317,7 +477,6 @@ mod tests {
             protocol: "slmp".to_string(),
             database: None,
             username: None,
-            password: None,
             ..pg_connection(id, name, true)
         }
     }
@@ -370,8 +529,9 @@ mod tests {
             connections: vec![plc_connection(1, "line1")],
             groups: vec![group(1, "fast", 1, None, true)],
             tags: vec![],
+            secrets: secret_rows(),
         };
-        assert!(build_plan(&snapshot).unwrap().is_empty());
+        assert!(build_plan(&snapshot, &registry()).unwrap().is_empty());
     }
 
     #[test]
@@ -387,8 +547,9 @@ mod tests {
                 db_tag(11, "B", 1, "b", false),
                 db_tag(12, "C", 2, "c", true),
             ],
+            secrets: secret_rows(),
         };
-        let plan = build_plan(&snapshot).unwrap();
+        let plan = build_plan(&snapshot, &registry()).unwrap();
         assert_eq!(plan.connections.len(), 1);
         let conn = &plan.connections[0];
         assert_eq!(conn.port, 5432);
@@ -409,8 +570,9 @@ mod tests {
             connections: vec![pg_connection(1, "erp", false)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
-        let plan = build_plan(&snapshot).unwrap();
+        let plan = build_plan(&snapshot, &registry()).unwrap();
         assert!(plan.connections.is_empty());
         assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
     }
@@ -421,8 +583,9 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", false)],
+            secrets: secret_rows(),
         };
-        let plan = build_plan(&snapshot).unwrap();
+        let plan = build_plan(&snapshot, &registry()).unwrap();
         assert!(plan.connections.is_empty(), "{plan:?}");
     }
 
@@ -432,8 +595,9 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, None, true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
-        let err = build_plan(&snapshot).unwrap_err();
+        let err = build_plan(&snapshot, &registry()).unwrap_err();
         assert!(err.contains("querySql"), "{err}");
     }
 
@@ -445,8 +609,9 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![tag],
+            secrets: secret_rows(),
         };
-        let err = build_plan(&snapshot).unwrap_err();
+        let err = build_plan(&snapshot, &registry()).unwrap_err();
         assert!(err.contains("db 以外"), "{err}");
     }
 
@@ -458,9 +623,259 @@ mod tests {
             connections: vec![conn],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
-        let err = build_plan(&snapshot).unwrap_err();
+        let err = build_plan(&snapshot, &registry()).unwrap_err();
         assert!(err.contains("ポート"), "{err}");
+    }
+
+    /// R2b-1d (design §5.4): the plan opens the sealed password; a connection with no
+    /// password connects without one; one whose reference has no readable row is not
+    /// started (listed as unreadable with its reason) - never dialled with an empty
+    /// password.
+    #[test]
+    fn build_plan_opens_the_sealed_password_and_never_collapses_an_unreadable_one() {
+        let snapshot = RegistrySnapshot {
+            connections: vec![pg_connection(1, "erp", true)],
+            groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
+            tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
+        };
+        let plan = build_plan(&snapshot, &registry()).unwrap();
+        assert_eq!(plan.connections[0].password, "s3cret");
+
+        let mut no_password = snapshot.clone();
+        no_password.connections[0].settings.remove("password");
+        no_password.secrets.clear();
+        let plan = build_plan(&no_password, &registry()).unwrap();
+        assert_eq!(plan.connections[0].password, "");
+
+        for broken in [
+            // The row is missing.
+            Vec::new(),
+            // The row belongs to another connection.
+            vec![banto_tags::StoredSecretRow {
+                connection_id: 2,
+                ..secret_rows().remove(0)
+            }],
+            // The row's scheme cannot be opened here.
+            vec![banto_tags::StoredSecretRow {
+                sealed: banto_tags::SealedSecretRow::new(
+                    PW_REF,
+                    "dpapi-machine-v1",
+                    b"blob".to_vec(),
+                ),
+                ..secret_rows().remove(0)
+            }],
+        ] {
+            let mut unreadable = snapshot.clone();
+            unreadable.secrets = broken;
+            let plan = build_plan(&unreadable, &registry()).unwrap();
+            assert!(plan.connections.is_empty(), "{plan:?}");
+            assert!(plan.disabled.is_empty(), "{plan:?}");
+            assert_eq!(plan.unreadable.len(), 1, "{plan:?}");
+            assert_eq!(plan.unreadable[0].connection_id, 1);
+            assert_eq!(plan.unreadable[0].groups[0].tags[0].tag_key, "tag:10");
+            assert!(!format!("{plan:?}").contains("s3cret"));
+        }
+        // The reason is kept apart: a missing row vs. a row that cannot be opened.
+        let mut missing = snapshot.clone();
+        missing.secrets.clear();
+        assert_eq!(
+            build_plan(&missing, &registry()).unwrap().unreadable[0].reason,
+            UnreadableReason::Missing
+        );
+        let mut undecryptable = snapshot.clone();
+        undecryptable.secrets[0].sealed =
+            banto_tags::SealedSecretRow::new(PW_REF, "dpapi-machine-v1", b"blob".to_vec());
+        assert_eq!(
+            build_plan(&undecryptable, &registry()).unwrap().unreadable[0].reason,
+            UnreadableReason::Undecryptable
+        );
+        // A disabled connection with an unreadable password stays `disabled` (it would
+        // not be dialled anyway).
+        let mut disabled = missing.clone();
+        disabled.connections[0].enabled = false;
+        let plan = build_plan(&disabled, &registry()).unwrap();
+        assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
+        assert!(plan.unreadable.is_empty());
+    }
+
+    /// PR #777 のオーナーレビュー P2（設計 §4.4・§3.4）: DB Source も PLC の収集と同じ
+    /// `driver_exclusion` で接続を確かめる。設定の版がドライバより新しい・`postgres` の
+    /// ドライバが無い・`settings` が検証を通らない（範囲外のポート・形の違う秘密の参照）
+    /// 接続は計画に載らず（タスクなし）、理由つきで `excluded` に出る（配下のタグを Bad に
+    /// するためのグループを持つ）。計画全体は落ちず、他の接続は動く。
+    #[test]
+    fn build_plan_excludes_connections_the_registry_refuses() {
+        // Connection 2 has no password (its plan needs no secret row).
+        let mut mes = pg_connection(2, "mes", true);
+        mes.settings.remove("password");
+        let base = RegistrySnapshot {
+            connections: vec![pg_connection(1, "erp", true), mes],
+            groups: vec![
+                group(1, "q1", 1, Some("SELECT a FROM v1"), true),
+                group(2, "q2", 2, Some("SELECT b FROM v2"), true),
+            ],
+            tags: vec![db_tag(10, "A", 1, "a", true), db_tag(20, "B", 2, "b", true)],
+            secrets: secret_rows(),
+        };
+        let only_first_excluded = |plan: &DbSourcePlan| {
+            assert_eq!(plan.excluded.len(), 1, "{plan:?}");
+            assert_eq!(plan.excluded[0].connection_id, 1);
+            assert_eq!(plan.excluded[0].groups[0].tags[0].tag_key, "tag:10");
+            let ids: Vec<i64> = plan.connections.iter().map(|c| c.connection_id).collect();
+            assert_eq!(ids, vec![2], "the other connection still runs");
+            assert!(plan.unreadable.is_empty(), "{plan:?}");
+            let blocked: Vec<(i64, String)> = plan
+                .blocked()
+                .map(|(conn, message)| (conn.connection_id, message))
+                .collect();
+            assert_eq!(blocked.len(), 1);
+            assert_eq!(blocked[0].0, 1);
+            blocked[0].1.clone()
+        };
+
+        // settings_version newer than the postgres driver's (1).
+        let mut too_new = base.clone();
+        too_new.connections[0].settings_version = 2;
+        let plan = build_plan(&too_new, &registry()).unwrap();
+        assert_eq!(
+            plan.excluded[0].reason,
+            ExclusionReason::SettingsVersionTooNew {
+                stored: 2,
+                supported: 1
+            }
+        );
+        let message = only_first_excluded(&plan);
+        assert!(message.contains("版"), "{message}");
+
+        // No postgres driver in the registry: every postgres connection is out.
+        let empty = DriverRegistry::new();
+        let plan = build_plan(&base, &empty).unwrap();
+        assert!(plan.connections.is_empty(), "{plan:?}");
+        assert_eq!(plan.excluded.len(), 2, "{plan:?}");
+        for conn in &plan.excluded {
+            assert_eq!(
+                conn.reason,
+                ExclusionReason::DriverUnavailable {
+                    protocol: "postgres".to_string()
+                }
+            );
+        }
+
+        // Stored settings the driver refuses (a port out of range written by hand): left
+        // out, not a failure of the whole plan.
+        let mut bad_port = base.clone();
+        bad_port.connections[0]
+            .settings
+            .insert("port".to_string(), serde_json::json!(70_000));
+        let plan = build_plan(&bad_port, &registry()).unwrap();
+        assert!(
+            matches!(
+                plan.excluded[0].reason,
+                ExclusionReason::InvalidSettings { .. }
+            ),
+            "{plan:?}"
+        );
+        only_first_excluded(&plan);
+
+        // A malformed secret reference (key present, not `{"$secret": "<32 hex>"}`):
+        // left out - never planned with an empty password.
+        let mut malformed = base.clone();
+        malformed.connections[0].settings.insert(
+            "password".to_string(),
+            serde_json::json!({ "$secret": 123 }),
+        );
+        let plan = build_plan(&malformed, &registry()).unwrap();
+        match &plan.excluded[0].reason {
+            ExclusionReason::InvalidSettings { errors } => {
+                assert!(
+                    errors.iter().any(|e| e.starts_with("password")),
+                    "{errors:?}"
+                )
+            }
+            other => panic!("expected InvalidSettings, got {other:?}"),
+        }
+        only_first_excluded(&plan);
+
+        // A disabled connection stays `disabled` (not dialled anyway).
+        let mut disabled = too_new.clone();
+        disabled.connections[0].enabled = false;
+        let plan = build_plan(&disabled, &registry()).unwrap();
+        assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
+        assert!(plan.excluded.is_empty());
+    }
+
+    /// PR #777 のオーナーレビュー P2: 生の SQL で `settings.password` を形の違う参照
+    /// （`{"$secret": 123}`）にした接続は、DB から読んだ計画でもタスクを持たず（空の
+    /// パスワードで繋がない）、配下のタグを Bad にする側（`excluded`）に出る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_malformed_reference_written_by_raw_sql_never_plans_a_task() {
+        let pool = crate::db::init_db_memory().await.unwrap();
+        let service = banto_tags::PlcConnectionService::with_registry(pool.clone(), registry());
+        let secrets = crate::secrets::r2b1d_connection_secrets();
+        let conn = service
+            .create(banto_tags::PlcConnectionInput {
+                name: "erp".to_string(),
+                protocol: POSTGRES_PROTOCOL.to_string(),
+                host: "10.0.0.50".to_string(),
+                port: 5432,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: String::new(),
+                cpu_type: None,
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                secrets: crate::secrets::password_changes(&secrets, Some("s3cret")).unwrap(),
+                settings: None,
+            })
+            .await
+            .unwrap();
+        let group = banto_tags::CollectionGroupService::new(pool.clone())
+            .create(banto_tags::CollectionGroupInput {
+                name: "q1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: Some("SELECT a FROM v1".to_string()),
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type, tag_kind) \
+             VALUES ('A', ?, 'a', 'f32', 'db')",
+        )
+        .bind(group.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        assert_eq!(
+            build_plan(&snapshot, &registry())
+                .unwrap()
+                .connections
+                .len(),
+            1
+        );
+
+        sqlx::query(
+            "UPDATE plc_connections SET settings = json_set(settings, '$.password', \
+             json('{\"$secret\":123}')) WHERE id = ?",
+        )
+        .bind(conn.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let plan = build_plan(&snapshot, &registry()).unwrap();
+        assert!(plan.connections.is_empty(), "{plan:?}");
+        let blocked: Vec<i64> = plan.blocked().map(|(c, _)| c.connection_id).collect();
+        assert_eq!(blocked, vec![conn.id], "{plan:?}");
+        assert_eq!(plan.excluded[0].groups[0].tags.len(), 1);
+        assert!(!format!("{plan:?}").contains("s3cret"));
     }
 
     /// このモジュールの doc comment「平文パスワードの扱い」節。
@@ -470,8 +885,9 @@ mod tests {
             connections: vec![pg_connection(1, "erp", true)],
             groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
             tags: vec![db_tag(10, "A", 1, "a", true)],
+            secrets: secret_rows(),
         };
-        let plan = build_plan(&snapshot).unwrap();
+        let plan = build_plan(&snapshot, &registry()).unwrap();
         let rendered = format!("{plan:?}");
         assert!(
             !rendered.contains("s3cret"),
