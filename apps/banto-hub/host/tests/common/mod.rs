@@ -26,8 +26,12 @@ pub use core_common::*;
 /// `HubSessions::new` / `HubConfig` (docs/banto-driver-api-design.md §6.4).
 pub fn hub_drivers() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
+    // R2b-1a: the host-provided protocols join the built-ins, as a host does.
+    let mut registry = builtin.registry;
+    banto_hub_core::register_host_provided(&mut registry)
+        .expect("host-provided driver ids are distinct from the built-ins");
     banto_hub_core::broker_glue::HubDrivers::new(
-        std::sync::Arc::new(builtin.registry),
+        std::sync::Arc::new(registry),
         builtin.broker,
         builtin.client_factory,
     )

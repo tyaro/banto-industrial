@@ -4,6 +4,8 @@
 //!
 //! ## 構成（S2）
 //!
+//! - [`driver`]: R2b-1a。`postgres` の静的な部分（`DriverBase`、レジストリには
+//!   `HostProvided`。I/O は本モジュールのまま）。
 //! - [`plan`]: レジストリのスナップショット → 実行計画（純関数。
 //!   `crate::computed::build_plan` と同じ立ち位置）。
 //! - [`convert`]: 「列 → f64」の変換戦略（describe した型に応じたキャストを
@@ -64,6 +66,7 @@
 //! メッセージにクライアントの送信したパスワードを含めることはない）だけを
 //! 取り出す。
 
+pub mod driver;
 pub mod plan;
 pub mod status;
 pub mod supervisor;

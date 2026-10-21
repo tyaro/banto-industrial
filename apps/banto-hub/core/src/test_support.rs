@@ -158,8 +158,11 @@ impl Drop for TempDir {
 /// - `client_factory`: `banto_collect::default_client_factory()` - what
 ///   `builtin()` returns too (design §2.3), and `banto-collect` is a normal
 ///   dependency of this crate already.
-/// - `registry`: empty. R1 reads it nowhere on the production path (§6.2);
-///   only `banto-drivers`' tripwire tests do.
+/// - `registry`: the host-provided protocols only (`push` / `postgres` /
+///   `virtual`, R2b-1a), as a host registers them; the `HostBound` ids
+///   (`slmp` / `modbus-tcp`) are not in it (their static half lives in
+///   `banto-drivers`, which core cannot name). Nothing on the production path
+///   reads it yet (design §6.2).
 ///
 /// The tests that need a real SLMP / Modbus session went to
 /// `apps/banto-hub/host/tests/` (R2b-0).
@@ -170,8 +173,11 @@ pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
         (id("modbus-tcp"), fake_modbus_dial as banto_broker::DialFn),
     ])
     .expect("distinct fake driver ids");
+    let mut registry = banto_driver_api::DriverRegistry::new();
+    crate::host_provided::register_host_provided(&mut registry)
+        .expect("host-provided ids are distinct");
     crate::broker_glue::HubDrivers::new(
-        std::sync::Arc::new(banto_driver_api::DriverRegistry::new()),
+        std::sync::Arc::new(registry),
         broker,
         banto_collect::default_client_factory(),
     )

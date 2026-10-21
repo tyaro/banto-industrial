@@ -146,7 +146,7 @@
 | C. `HostBound` で registry に登録                        | B と同じで、`builtin()` か host が registry に足す                                                                                              | トリップワイヤ 2（broker の表 == `HostBound`）が落ちる。broker に `push` は無い。ワイヤを緩めると Modbus / SLMP の表の漏れを検出できなくなる                                                                                                                                                                   | 採らない                 |
 
 - B は §9.5-2（値は収集を通す）・§9.5-6（`classify_external`）をそのまま満たす。§9.5-1 の「`hub` 接続と同じ種類」は、R2a では「同じ `ExternalSource` に乗る」という形で実現する。
-- **R2b での扱い（本書では決めない）**: R2b-1 で registry が正になる時点で `push` を登録する。そのときの `DriverKind` は、(a) 品質を運べる読み取り（`Reading { value, quality }`）を `Session` に足す、(b) `DriverKind` に「値をホストが受ける」種類を足す（`#[non_exhaustive]` なので追加は破壊にならない）のどちらか。ChronoGazer の `hub` 接続の寄せ方（api-design Q5 の後半）と一緒に R2b-3 の前に決める（§12 Q1）。
+- **R2b での扱い（本書では決めない）**: R2b-1 で registry が正になる時点で `push` を登録する。そのときの `DriverKind` は、(a) 品質を運べる読み取り（`Reading { value, quality }`）を `Session` に足す、(b) `DriverKind` に「値をホストが受ける」種類を足す（`#[non_exhaustive]` なので追加は破壊にならない）のどちらか。ChronoGazer の `hub` 接続の寄せ方（api-design Q5 の後半）と一緒に R2b-3 の前に決める（§12 Q1）。**→ (b) に決定・実装済み**（2026-10-21、connection-settings-design §4.1 の Q5。R2b-1a で `DriverKind::HostProvided` を足し、host が `push` を登録する。I/O は Hub の `ExternalSource` のまま）。
 
 ```rust
 // apps/banto-hub/core/src/ingest/driver.rs（R2a-2a。登録はしない。core の単体テストで
