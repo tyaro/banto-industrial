@@ -3,11 +3,12 @@
 //!
 //! `push` は R2a では Hub 側の `ExternalSource` で、`DriverKind::Session` でも
 //! `HostBound` でもない（§2 の表、Q1）。それでも識別・設定の検証・キーの検証は
-//! ドライバと同じ形（`DriverBase`）で持っておき、R2b-1 でレジストリが正になる
-//! ときにそのまま登録できるようにする。**今は登録しない**: `banto_drivers::builtin()`
-//! にも `HubDrivers` の registry にも入れない（トリップワイヤ 2「broker の表 ==
+//! ドライバと同じ形（`DriverBase`）で持つ。**R2b-1a から host が `DriverKind::HostProvided`
+//! でレジストリへ登録する**（[`crate::host_provided`]、設計
+//! docs/banto-hub-connection-settings-design.md §4.1。I/O は Hub の収集の外部ソースのまま）。
+//! `banto_drivers::builtin()` には入れない（トリップワイヤ 2「broker の表 ==
 //! `HostBound`」を崩さない、§2 の案 C）。core はこのために `banto-drivers` に
-//! 依存しない（R2b-0 の決まりのまま）。
+//! 依存しない（R2b-0 の決まりのまま）。本番の経路はまだレジストリを読まない。
 //!
 //! 中身は `banto_tags::push` の純関数を包むだけ:
 //!
@@ -76,7 +77,7 @@ impl Default for PushDriver {
     }
 }
 
-/// R2b-1 で host がレジストリへ登録するときの入口（§12 Q5）。R2a では誰も登録しない。
+/// host がレジストリへ登録するときの入口（§12 Q5、[`crate::host_provided`]）。
 pub fn push_driver() -> PushDriver {
     PushDriver::new()
 }

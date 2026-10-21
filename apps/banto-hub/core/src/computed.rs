@@ -74,6 +74,8 @@
 //! へ変換するので、「retain=false は起動時 Bad」は特別なコードなしに成立
 //! する。
 
+pub mod driver;
+
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 

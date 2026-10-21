@@ -102,8 +102,13 @@ use banto_hub_core::runtime::HubRuntime;
 /// （docs/banto-driver-api-design.md §6.4）。
 fn hub_drivers() -> HubDrivers {
     let builtin = banto_drivers::builtin();
+    // R2b-1a: `modbus-tcp` / `slmp`（`HostBound`）に、host が I/O を持つ `push` /
+    // `postgres` / `virtual`（`HostProvided`）を足す。本番の経路はまだ読まない。
+    let mut registry = builtin.registry;
+    banto_hub_core::register_host_provided(&mut registry)
+        .expect("host-provided driver ids are distinct from the built-ins");
     HubDrivers::new(
-        std::sync::Arc::new(builtin.registry),
+        std::sync::Arc::new(registry),
         builtin.broker,
         builtin.client_factory,
     )

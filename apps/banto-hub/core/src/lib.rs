@@ -179,9 +179,11 @@
 //!   `banto-service-elev`へ移した（アクション・引数の検証・手順・文言は
 //!   ここに残る。挙動は不変）
 //!
+//! - [`host_provided`]: R2b-1a。`push`・`postgres`・`virtual` を `DriverKind::HostProvided`
+//!   で返す `host_provided_drivers()`（host がレジストリへ足す。本番の経路はまだ読まない）。
 //! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
 //!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
-//!   [`ingest::driver::PushDriver`]（`DriverBase`、レジストリには登録しない、R2a-2a）と、
+//!   [`ingest::driver::PushDriver`]（`DriverBase`。R2b-1a から host が `HostProvided` でレジストリに登録する、[`host_provided`]）と、
 //!   受信側の [`ingest::IngestHub`]（保持値・Live の判定・epoch。Hub の収集の
 //!   `ExternalSource`、R2a-1c）。REST の送信口 `POST /api/v1/ingest/{id}/values`
 //!   （[`ingest::rest`]）と、WebSocket（R2a-2d）も使う共通部品（認証の層
@@ -210,6 +212,7 @@ pub mod desktop_log;
 pub mod diag_log;
 pub mod events;
 pub mod grpc;
+pub mod host_provided;
 pub mod host_switch;
 pub mod http_hub_health;
 pub mod hub;
@@ -261,6 +264,8 @@ pub mod write_rate;
 // 増幅（banto #278）- は、`crate::rest` が使う banto のルーターと合わせて
 // これで入る。
 pub use banto_admin_services::{audit, users};
+
+pub use host_provided::{host_provided_drivers, register_host_provided};
 
 pub use controller::{
     CollectionController, CollectionState, CollectionStatus, RunContext, RunId, RunMode,

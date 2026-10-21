@@ -69,6 +69,8 @@ futures-util = { workspace = true }
 banto-core = { workspace = true }
 banto-server = { workspace = true }
 banto-tags = { path = "../../../crates/banto-tags" }
+# R2b-1a: `tests/registry_tripwire.rs`（Hub のレジストリの `DriverKind` を見る）。
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.1.0" }
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }
 banto-broker = { path = "../../../crates/banto-broker" }

@@ -40,6 +40,25 @@ pub enum DriverKind {
     /// built-ins to [`Frame`](Self::Frame) and removes this variant (a 0.x
     /// minor break, design §9.1).
     HostBound(Arc<dyn DriverBase>),
+    /// **A permanent kind** (R2b-1a, docs/banto-hub-connection-settings-design.md
+    /// §4.1). A protocol the *host* implements itself - banto-hub's `push`
+    /// (ingest), `postgres` (DB source) and `virtual` (computed) - whose
+    /// identification, settings validation, secret keys and address
+    /// functions are in API form ([`DriverBase`]) while **all of its I/O
+    /// stays in the host** (the ingest hub, the DB source engine, the
+    /// computed engine). The driver never opens a connection: there is no
+    /// `create_connection` / `connect` to call, and nothing about it goes
+    /// through the engine's frame / session machinery.
+    ///
+    /// Unlike [`HostBound`](Self::HostBound), which exists only until R2b-3
+    /// moves the built-ins to [`Frame`](Self::Frame) and then disappears
+    /// (a 0.x minor break), `HostProvided` stays: it is how a host registers
+    /// a protocol that is not a device driver at all, so that settings
+    /// validation and address checks have one registry to ask. The two
+    /// differ in what is missing, too: a `HostBound` driver's I/O is a real
+    /// driver the host reaches through a side table (`DriverTable`); a
+    /// `HostProvided` one has no driver-shaped I/O to reach.
+    HostProvided(Arc<dyn DriverBase>),
 }
 
 impl fmt::Debug for DriverKind {
@@ -48,6 +67,7 @@ impl fmt::Debug for DriverKind {
             DriverKind::Frame(d) => ("Frame", &d.descriptor().id),
             DriverKind::Session(d) => ("Session", &d.descriptor().id),
             DriverKind::HostBound(d) => ("HostBound", &d.descriptor().id),
+            DriverKind::HostProvided(d) => ("HostProvided", &d.descriptor().id),
         };
         f.debug_tuple(kind).field(id).finish()
     }
@@ -85,6 +105,16 @@ impl DriverEntry {
         DriverEntry {
             base: Arc::clone(&driver),
             kind: DriverKind::HostBound(driver),
+        }
+    }
+
+    /// A protocol whose I/O the host implements itself (see
+    /// [`DriverKind::HostProvided`]; permanent, unlike
+    /// [`host_bound`](Self::host_bound)).
+    pub fn host_provided(driver: Arc<dyn DriverBase>) -> Self {
+        DriverEntry {
+            base: Arc::clone(&driver),
+            kind: DriverKind::HostProvided(driver),
         }
     }
 
@@ -347,6 +377,10 @@ mod tests {
         let host = DriverEntry::host_bound(Arc::new(Probe::new("h")));
         assert!(matches!(host.kind(), DriverKind::HostBound(_)));
         assert_forwards(&host, "h");
+
+        let provided = DriverEntry::host_provided(Arc::new(Probe::new("p")));
+        assert!(matches!(provided.kind(), DriverKind::HostProvided(_)));
+        assert_forwards(&provided, "p");
     }
 
     #[test]
@@ -396,6 +430,11 @@ mod tests {
         assert_eq!(
             format!("{:?}", reg.get("echo").unwrap()),
             r#"DriverEntry { kind: Frame(DriverId("echo")), .. }"#
+        );
+        let hp = DriverEntry::host_provided(Arc::new(Probe::new("push")));
+        assert_eq!(
+            format!("{hp:?}"),
+            r#"DriverEntry { kind: HostProvided(DriverId("push")), .. }"#
         );
     }
 }
