@@ -51,10 +51,16 @@
 # R1-4a: crates/banto-driver-slmp, crates/banto-driver-modbus (banto-broker から
 # SLMP / Modbus TCP のドライバ（`BrokerSession` の実装と `dial`）を移した内部 crate。
 # broker はこれらに依存しない. docs/banto-driver-api-design.md §2.3・§4.4).
+# R2a-3a: crates/banto-db-source (Hub 内の DB Source（apps/banto-hub/core の
+# db_source）が持っていた「列→f64 の変換 SQL・列の解決・品質の梯子（純関数の状態機械）・
+# PostgreSQL の接続オプションとエラー文言」を、DB ブリッジ（R2a-3b、banto-hub-sink）と
+# 共有するために切り出した内部 crate。依存は sqlx（postgres）だけ.
+# docs/banto-hub-ingest-design.md §10.1).
 [workspace]
 resolver = "2"
 members = [
     "crates/banto-tags",
+    "crates/banto-db-source",
     "crates/banto-plc-address",
     "crates/banto-driver-api",
     "crates/banto-driver-conformance",

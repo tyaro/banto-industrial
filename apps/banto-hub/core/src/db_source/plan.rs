@@ -30,13 +30,10 @@
 //! （S1a のレビューで `PlcConnection::password` について同じ指摘が2箇所
 //! 出ている）。
 
-use std::collections::HashMap;
 use std::fmt;
 
 use banto_collect::RegistrySnapshot;
 use banto_tags::{DB_TAG_KIND, POSTGRES_PROTOCOL};
-
-use super::convert::ColumnKind;
 
 /// 1回の commit で engine が受け取る計画一式。
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -112,32 +109,11 @@ pub struct DbTagPlan {
 /// 毎ティック Bad を書きつつ、`warn` はプラン単位で1回だけ出す
 /// （§4.3 の表「列が無い / 型変換不能 → タグ単位 Bad（起動時と設定変更時に
 /// `warn`）」）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagBadReason {
-    /// SELECT の結果にその名前の列が無い。
-    MissingColumn,
-    /// 列はあるが v1 が扱えない型（`text`/`bytea`/配列/`json`…、§4.4）。
-    UnsupportedColumnType(String),
-    /// グループの SQL 自体を describe（prepare）できなかった - 構文エラー・
-    /// 存在しない表・権限不足など。列単位ではなくグループ全体の問題だが、
-    /// 値を書く単位はタグなので同じ列挙で扱う（`crate::db_source::task` の
-    /// `poll_forever` 参照）。
-    StatementNotPrepared(String),
-}
-
-impl TagBadReason {
-    pub fn message(&self) -> String {
-        match self {
-            TagBadReason::MissingColumn => "SELECT の結果にこの列がありません".to_string(),
-            TagBadReason::UnsupportedColumnType(type_name) => {
-                format!("列の型 {type_name} は v1 では扱えません（数値・bool・timestamp のみ）")
-            }
-            TagBadReason::StatementNotPrepared(detail) => {
-                format!("グループの SQL を実行できません: {detail}")
-            }
-        }
-    }
-}
+///
+/// R2a-3a: 実体は共有 crate の [`banto_db_source::ColumnBadReason`]
+/// （`MissingColumn` / `UnsupportedColumnType` / `StatementNotPrepared`）。
+/// Hub では「列 = タグ」なので従来の名前で再輸出している。
+pub use banto_db_source::ColumnBadReason as TagBadReason;
 
 /// describe の結果とグループの計画を突き合わせた、1グループ分の実行形
 /// （[`crate::db_source::task`] が毎ティック使う）。
@@ -157,45 +133,27 @@ pub struct ResolvedGroup {
 
 /// `describe` が返した「列名 → PostgreSQL 型名」に対して、グループの
 /// タグを解決する（純関数 - 実 DB を触らないのでユニットテストできる）。
+///
+/// R2a-3a: 判断の本体は共有 crate の [`banto_db_source::resolve_columns`]
+/// （Hub の型に依存しない、列名の並びと添字の入出力）にあり、ここは
+/// `group.tags` の列名を渡して、返ってきた添字をタグへ写し戻すだけの
+/// アダプタ。
 pub fn resolve_group(group: &DbGroupPlan, described: &[(String, String)]) -> ResolvedGroup {
-    // §4.1「大文字小文字は DB 側の規則に委ねずそのまま比較」: 完全一致の
-    // マップを作る。同名列が2つある SELECT（`SELECT a, a FROM t`）では
-    // 先に現れた方が勝つ - どちらを採るかは本質的に恣意的で、先頭優先は
-    // 「先頭行を採る」§4.2 と同じ一貫した選択。
-    let mut by_name: HashMap<&str, &str> = HashMap::with_capacity(described.len());
-    for (name, type_name) in described {
-        by_name.entry(name.as_str()).or_insert(type_name.as_str());
-    }
-
-    let mut columns = Vec::new();
-    let mut value_tags = Vec::new();
-    let mut bad_tags = Vec::new();
-    for tag in &group.tags {
-        match by_name.get(tag.column.as_str()) {
-            None => bad_tags.push((tag.clone(), TagBadReason::MissingColumn)),
-            Some(type_name) => match ColumnKind::classify(type_name) {
-                None => bad_tags.push((
-                    tag.clone(),
-                    TagBadReason::UnsupportedColumnType((*type_name).to_string()),
-                )),
-                Some(kind) => {
-                    columns.push(super::convert::MappedColumn {
-                        column: tag.column.clone(),
-                        kind,
-                    });
-                    value_tags.push(tag.clone());
-                }
-            },
-        }
-    }
-
-    let wrapper_sql = (!columns.is_empty())
-        .then(|| super::convert::build_wrapper_sql(&group.query_sql, &columns));
+    let wanted: Vec<&str> = group.tags.iter().map(|tag| tag.column.as_str()).collect();
+    let resolved = banto_db_source::resolve_columns(&group.query_sql, &wanted, described);
 
     ResolvedGroup {
-        wrapper_sql,
-        value_tags,
-        bad_tags,
+        wrapper_sql: resolved.wrapper_sql,
+        value_tags: resolved
+            .value_columns
+            .into_iter()
+            .map(|index| group.tags[index].clone())
+            .collect(),
+        bad_tags: resolved
+            .bad_columns
+            .into_iter()
+            .map(|(index, reason)| (group.tags[index].clone(), reason))
+            .collect(),
     }
 }
 
@@ -520,74 +478,5 @@ mod tests {
             "the plan's Debug must never carry the plaintext password: {rendered}"
         );
         assert!(rendered.contains("<redacted>"), "{rendered}");
-    }
-
-    // --- resolve_group -----------------------------------------------------
-
-    fn one_group(columns: &[&str]) -> DbGroupPlan {
-        DbGroupPlan {
-            group_id: 1,
-            group_name: "q1".to_string(),
-            period_ms: 1_000,
-            query_sql: "SELECT * FROM v1".to_string(),
-            tags: columns
-                .iter()
-                .enumerate()
-                .map(|(i, column)| DbTagPlan {
-                    tag_key: format!("tag:{}", i + 1),
-                    external_name: format!("erp.q1.T{i}"),
-                    column: (*column).to_string(),
-                })
-                .collect(),
-        }
-    }
-
-    #[test]
-    fn resolve_group_splits_value_tags_from_bad_ones() {
-        let group = one_group(&["a", "flag", "ts", "note", "missing"]);
-        let described = vec![
-            ("a".to_string(), "INT4".to_string()),
-            ("flag".to_string(), "BOOL".to_string()),
-            ("ts".to_string(), "TIMESTAMPTZ".to_string()),
-            ("note".to_string(), "TEXT".to_string()),
-        ];
-        let resolved = resolve_group(&group, &described);
-        assert_eq!(
-            resolved
-                .value_tags
-                .iter()
-                .map(|t| t.column.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "flag", "ts"]
-        );
-        assert_eq!(resolved.bad_tags.len(), 2);
-        assert_eq!(
-            resolved.bad_tags[0].1,
-            TagBadReason::UnsupportedColumnType("TEXT".to_string())
-        );
-        assert_eq!(resolved.bad_tags[1].1, TagBadReason::MissingColumn);
-        let sql = resolved.wrapper_sql.expect("three value columns");
-        assert!(sql.contains("(\"a\")::float8 AS c0"), "{sql}");
-        assert!(sql.contains("(\"flag\")::int4::float8 AS c1"), "{sql}");
-    }
-
-    /// 列名の比較は大文字小文字を区別する（§4.1）。
-    #[test]
-    fn resolve_group_compares_column_names_case_sensitively() {
-        let group = one_group(&["Rate"]);
-        let described = vec![("rate".to_string(), "INT4".to_string())];
-        let resolved = resolve_group(&group, &described);
-        assert!(resolved.wrapper_sql.is_none());
-        assert_eq!(resolved.bad_tags[0].1, TagBadReason::MissingColumn);
-    }
-
-    #[test]
-    fn resolve_group_with_no_usable_column_emits_no_sql() {
-        let group = one_group(&["note"]);
-        let described = vec![("note".to_string(), "TEXT".to_string())];
-        let resolved = resolve_group(&group, &described);
-        assert!(resolved.wrapper_sql.is_none());
-        assert!(resolved.value_tags.is_empty());
-        assert_eq!(resolved.bad_tags.len(), 1);
     }
 }

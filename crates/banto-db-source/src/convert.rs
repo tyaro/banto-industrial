@@ -3,8 +3,8 @@
 //!
 //! ## なぜ describe + 生成ラッパーなのか
 //!
-//! [`crate::computed::ServerTagStore`] の値スロットは `Option<f64>` 1種類
-//! しかない（設計 §3-5）。一方 PostgreSQL の結果列は `int4`/`numeric`/
+//! Hub の `ServerTagStore`（`banto-hub-core` の `crate::computed`）の値スロット
+//! は `Option<f64>` 1種類しかない（設計 §3-5）。一方 PostgreSQL の結果列は `int4`/`numeric`/
 //! `bool`/`timestamptz`/… と多様で、sqlx で素直に受けようとすると列型ごとに
 //! `try_get::<i32>` / `try_get::<rust_decimal::Decimal>` /
 //! `try_get::<chrono::DateTime<Utc>>` … と**型ごとの feature とクレート**が
@@ -59,7 +59,7 @@ pub enum ColumnKind {
 impl ColumnKind {
     /// `sqlx` の `PgTypeInfo::name()` が返す型名（大文字、例 `"INT4"`・
     /// `"TIMESTAMPTZ"`）から分類する。未対応型は `None`（そのタグは Bad -
-    /// [`crate::db_source::plan::TagBadReason::UnsupportedColumnType`]）。
+    /// [`crate::ColumnBadReason::UnsupportedColumnType`]）。
     ///
     /// ドメイン型・列挙型など、名前が既知集合に無いものはすべて未対応扱い
     /// にする（安全側 - 知らない型を `::float8` へキャストしようとして
@@ -110,7 +110,7 @@ pub fn quote_ident(name: &str) -> String {
 /// 末尾の `LIMIT 2` は「先頭1行採用・2行以上なら warn 1回」（§4.2・§6-8）を
 /// 判定するのに必要十分な行数 - 1周期ごとに何万行も Hub のメモリへ引き込む
 /// ことを防ぐ。結果として状態表示の `row_count_last` は 0/1/2 の3値になり、
-/// `2` は「2行以上」を意味する（[`crate::db_source::status`] 参照）。
+/// `2` は「2行以上」を意味する（Hub の `db_source::status` 参照）。
 pub fn build_wrapper_sql(query_sql: &str, columns: &[MappedColumn]) -> String {
     debug_assert!(
         !columns.is_empty(),

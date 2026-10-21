@@ -7,9 +7,13 @@
 //! - [`plan`]: レジストリのスナップショット → 実行計画（純関数。
 //!   `crate::computed::build_plan` と同じ立ち位置）。
 //! - [`convert`]: 「列 → f64」の変換戦略（describe した型に応じたキャストを
-//!   生成 SQL に埋め込む）。
+//!   生成 SQL に埋め込む）。R2a-3a で共有 crate `banto-db-source` へ移した
+//!   （DB ブリッジと同じ変換を使うため。ここは再輸出だけ）。
 //! - [`task`]: 1接続 = 1 tokio task のポーリング本体（最小デッドライン方式・
-//!   Quality の状態機械・再接続バックオフ）。
+//!   Quality の梯子の適用・再接続バックオフ）。梯子の判断そのもの（純関数の
+//!   状態機械）と `sanitize_postgres_error`・`pg_connect_options` は
+//!   `banto-db-source`（R2a-3a）にあり、ここは書き込み・時刻・ログ・状態表示を
+//!   受け持つ。
 //! - [`supervisor`]: その task を監督する外側の task（S2b・§4.8・§6-17。
 //!   panic / 予期せぬ終了をバックオフ付きで作り直す）。
 //! - [`status`]: プロセス内メモリの運転状態（`GET /api/status` の
@@ -60,7 +64,6 @@
 //! メッセージにクライアントの送信したパスワードを含めることはない）だけを
 //! 取り出す。
 
-pub mod convert;
 pub mod plan;
 pub mod status;
 pub mod supervisor;
@@ -73,7 +76,7 @@ use std::time::Duration;
 use banto_tags::PlcConnection;
 use banto_tstore::Clock;
 use serde::Serialize;
-use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, Error as SqlxError, Executor, SqlSafeStr};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -81,6 +84,10 @@ use tokio::task::JoinHandle;
 use crate::computed::ServerTagStore;
 use crate::diag_log::DiagLog;
 
+/// R2a-3a: 「列 → f64」の変換は共有 crate `banto-db-source` にある。これまでの
+/// パス（`db_source::convert::...`）を保つための再輸出。
+pub use banto_db_source::convert;
+pub(crate) use banto_db_source::sanitize_postgres_error;
 pub use plan::{build_plan, DbSourcePlan};
 pub use status::{DbConnectionState, DbConnectionStatus, DbGroupStatus, DbSourceStatusStore};
 
@@ -105,12 +112,11 @@ pub(crate) fn application_name(connection_name: &str) -> String {
     format!("{APPLICATION_NAME_PREFIX} {connection_name}")
 }
 
-/// PostgreSQL 接続オプションの唯一の組み立て点 - [`test_connection`]
-/// （単発の疎通確認）と [`task`]（ポーリングタスクの `PgPool`）が同じ
-/// 設定で繋ぐことを保証する。特に `sslmode` の選択（design §4.2
-/// 「sslmode prefer」: TLS が使えれば使う、使えなければ平文にフォール
-/// バック - v1 は閉域 LAN 前提（§2.2）で、PostgreSQL 側の証明書運用を
-/// 必須にしない）は片方だけ変わると挙動が食い違うので、ここ1箇所に置く。
+/// PostgreSQL 接続オプションの組み立て - [`test_connection`]（単発の疎通確認）
+/// と [`task`]（ポーリングタスクの `PgPool`）が同じ設定で繋ぐことを保証する。
+/// 設定の本体（`sslmode=prefer` など）は共有 crate
+/// [`banto_db_source::pg_connect_options`]（R2a-3a）にあり、ここは
+/// Hub 固有の `application_name`（[`application_name`]）を足すだけの薄い写し。
 pub(crate) fn pg_connect_options(
     host: &str,
     port: u16,
@@ -119,14 +125,14 @@ pub(crate) fn pg_connect_options(
     password: &str,
     connection_name: &str,
 ) -> PgConnectOptions {
-    PgConnectOptions::new()
-        .host(host)
-        .port(port)
-        .database(database)
-        .username(username)
-        .password(password)
-        .application_name(&application_name(connection_name))
-        .ssl_mode(PgSslMode::Prefer)
+    banto_db_source::pg_connect_options(
+        host,
+        port,
+        database,
+        username,
+        password,
+        &application_name(connection_name),
+    )
 }
 
 /// DB Source のエンジン本体（このモジュールの doc comment「エンジンの
@@ -636,30 +642,6 @@ async fn run_describe(options: PgConnectOptions, query_sql: &str) -> DescribeGro
                 .collect(),
         ),
         Err(err) => DescribeGroupOutcome::failed(sanitize_postgres_error(&err)),
-    }
-}
-
-/// `sqlx::Error`を「短いカテゴリ + DB 自身のメッセージ」へ変換する。この
-/// モジュールの doc comment「資格情報の扱い」節参照 -
-/// パスワード・接続文字列全体を含めない。
-pub(crate) fn sanitize_postgres_error(err: &SqlxError) -> String {
-    match err {
-        SqlxError::Database(db_err) => {
-            format!("データベースエラー: {}", db_err.message())
-        }
-        SqlxError::Io(io_err) => {
-            format!("接続エラー(ポートが閉じている、または到達できません): {io_err}")
-        }
-        SqlxError::Tls(tls_err) => format!("TLS接続に失敗しました: {tls_err}"),
-        SqlxError::Configuration(_) => "接続設定が不正です。".to_string(),
-        SqlxError::PoolTimedOut => "接続プールがタイムアウトしました。".to_string(),
-        SqlxError::PoolClosed => "接続プールが閉じられています。".to_string(),
-        // 他のバリアント（Protocol/RowNotFound 等）はこの用途では通常
-        // 発生しない防御的ケース。`Display`実装自体が接続文字列や
-        // パスワードを含まないことは sqlx のソース上保証されている
-        // (これらは全て「サーバーから返った」情報かクライアント側の
-        // 状態を記述するものであり、渡した認証情報を含まない)。
-        other => format!("接続に失敗しました: {other}"),
     }
 }
 

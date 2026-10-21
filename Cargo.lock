@@ -685,6 +685,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "banto-db-source"
+version = "0.2.0-alpha.32"
+dependencies = [
+ "sqlx",
+]
+
+[[package]]
 name = "banto-desktop-tray"
 version = "0.1.0"
 dependencies = [
@@ -787,6 +794,7 @@ dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-core",
+ "banto-db-source",
  "banto-driver-api",
  "banto-driver-conformance",
  "banto-expr",

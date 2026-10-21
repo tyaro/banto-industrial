@@ -73,6 +73,8 @@ const G = {
 			deps: ['banto-driver-api', 'banto-plc-address']
 		},
 		{ name: 'banto-instance-lock', dir: 'crates/banto-instance-lock', deps: [] },
+		// R2a-3a: db_source・DB ブリッジが共有する crate（依存は sqlx だけ）。
+		{ name: 'banto-db-source', dir: 'crates/banto-db-source', deps: [] },
 		{ name: 'banto-rtsp', dir: 'crates/banto-rtsp', deps: [] },
 		{ name: 'banto-tagclient', dir: 'crates/banto-tagclient', deps: [] },
 		{ name: 'banto-hub-bootstrap', dir: 'crates/banto-hub-bootstrap', deps: ['banto-tagclient'] },
@@ -120,6 +122,7 @@ const G = {
 			// 単体テストは偽のドライバ表、tests/ に残った統合テストは HubDrivers::none()）。
 			// R2a-2a: 適合テスト一式は dev-dependency（`PushDriver` の static_checks）。
 			deps: [
+				'banto-db-source',
 				'banto-driver-api',
 				'banto-driver-conformance',
 				'banto-instance-lock',
@@ -296,6 +299,24 @@ const TABLE = [
 			rust_args: '-p banto-secret-store -p chronogazer -p chronogazer-core -p chronogazer-elev',
 			run_linux_clippy: true,
 			run_e2e_chronogazer: true
+		}
+	],
+	[
+		'banto-db-source（R2a-3a の新 crate。db_source の逆依存の hub-core・host・shell と、hub-core を dev-dependency に持つ sink に届き、PostgreSQL のジョブが走る）',
+		['crates/banto-db-source/src/ladder.rs', 'crates/banto-db-source/Cargo.toml'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args: [
+				'-p banto-db-source',
+				'-p banto-hub-core',
+				'-p banto-hub-host',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink'
+			].join(' '),
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true
 		}
 	],
 	[
@@ -814,6 +835,8 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 			'banto-hub-sink'
 		],
 		'banto-secret-store': ['chronogazer-core', 'chronogazer'],
+		// R2a-3a: db_source（hub-core）が使い、host・shell・sink が hub-core を経由する。
+		'banto-db-source': ['banto-hub-core', 'banto-hub-host', 'banto-hub-shell', 'banto-hub-sink'],
 		'banto-instance-lock': [
 			'chronogazer-core',
 			'chronogazer',
