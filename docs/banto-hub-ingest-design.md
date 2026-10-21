@@ -1,0 +1,681 @@
+# banto-hub 取り込み口 `push` 詳細設計（R2a）
+
+作成日: 2026-10-21
+状態: **設計確定（2026-10-21 オーナー決定。§12 の Q1〜Q20）・未着手**。**§12 の Q1〜Q17 は 2026-10-21 オーナー決定**（Q9 だけ推奨から変えて (b) 接続 id への束縛、ほかは推奨どおり。§12.1）。同日のオーナーレビューの 3 件（P2: ブリッジの送信の単位と受信の上限の衝突、P2: ブリッジが更新を止めたときの保持値の無効化、P3: `stale` + 値なしの表示品質）を反映して §3.2・§4・§6・§7・§10・§11 を改訂し、**その改訂の再レビュー待ち**。改訂で生じた新しい問い Q18〜Q20（§12.2）も同日すべて推奨どおりに決定。コード調査（§1）は 2026-10-21 の main（`94b19322`、R2b-0 の後）に対して行った。§0.1 に [banto-hub-external-db-design.md](banto-hub-external-db-design.md) §9.5 と [banto-driver-api-design.md](banto-driver-api-design.md) の決定済み事項から外れる提案をまとめた（詳細は §13）。
+対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2a（R2a-1〜R2a-3）を実装できる粒度に落とす。接続の種類 `push`・タグの扱い・収集への組み込み・`ingest:#{id}` の権限（接続 id に束縛）・WebSocket / REST の送信口・上限・監査・状態表示・`banto-hub-sink` の DB ブリッジ化と、Hub 内の PostgreSQL Source との突き合わせ。R2a は**互換を壊さない**（既存の接続・タグ・API・設定パッケージはそのまま動く。足すだけ）。
+関連: [banto-hub-external-db-design.md](banto-hub-external-db-design.md)（§9.5 が本書の元の決定。§4 は今の `db_source`、§5 は Sink のサイドカー）、[banto-driver-api-design.md](banto-driver-api-design.md)（R1 の詳細設計。§5 のセッション型・§6 の `DriverRegistry`・§12 の Q5）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §12（破壊的変更を許す構成）、[tag-server-design.md](tag-server-design.md) §5.6（認証）・§6（書き込みの安全）、[h10-3-read-scope-proposal.md](h10-3-read-scope-proposal.md)（スコープの文法の先例）、[implementation-checklist.md](implementation-checklist.md)。
+
+---
+
+## 0. 要約（Q1〜Q20 は 2026-10-21 オーナー決定。§7.1・§4.5・§4.6 はレビューの改訂で再レビュー待ち）
+
+| #   | 提案                                                                                                                                                                                                                                                                                                                                                                                                      | 根拠の節   |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1   | `push` は R2a では **Hub 側の外部ソース**（`banto_collect::ExternalSource` の実装）として作り、`DriverKind::Session` にはしない。静的な部分（識別・設定の検証・キーの検証）だけ `DriverBase` の形で core に置き、レジストリへの登録は R2b-1（レジストリが正になる段）で行う                                                                                                                               | §2         |
+| 2   | `ExternalSource::snapshot` を**接続ごと**にする（`snapshot(&self, connection_key)`）。今は 1 つの収集に 1 つの源・1 つのリンク状態しか無く、`push` 接続を複数持てない                                                                                                                                                                                                                                     | §1.1, §4.1 |
+| 3   | 接続の種類 `push` は migration `0023` の 1 回のテーブル再構築で `CHECK` に足し、同時に `plc_connections.settings`（JSON、`push` のみ）を足す。R2b-1 はこの列を全プロトコルの設定の置き場に広げる                                                                                                                                                                                                          | §3.1       |
+| 4   | タグは普通の `plc` タグ。アドレスは送り手が決める**不透明なキー**（前後の空白を除いた 1〜256 文字、制御文字なし、大文字小文字を区別）。キーは**接続の中で一意**（トリガ）。`string`・書き込み可・スケーリングは断る（`hub` 接続のタグと同じ）                                                                                                                                                             | §3.3       |
+| 5   | 値は収集を通す。Hub の収集は `start_with_sources` で `IngestHub` を源として受け、`run_external_connection` がグループの周期ごとに保持値を記録する。収集の停止では収集そのものが無いので Bad。**停止の時点で全 `push` 接続の保持値を捨て**（`db_source` の停止で Bad と同じ）、ブリッジの接続は**世代（epoch）**で収集の開始・設定の変更の前の値を無効にし、開始後の最初の送信まで Good を戻さない         | §4.5, §4.6 |
+| 6   | リンクが Live = 送り手の最後の通信（値・`ping`・REST の一括送信）から `stale_timeout_ms`（既定 **10 秒**、接続ごとに 1 秒〜1 時間）以内。WebSocket が切れてもその時間までは Live のまま（§9.5-6 の「切断から一定時間」）                                                                                                                                                                                  | §4.3       |
+| 7   | API キーのスコープに `ingest:#{接続 id}` を足す（例 `ingest:#12`。完全一致、ワイルドカードなし。2026-10-21 オーナー決定 Q9 = (b)。改名に追従し、削除した接続の id は再利用されないので古いキーは戻らない）。`read` / `write` / `admin` と直交。`write_path` の関門は通さない（PLC への書き込みではない）                                                                                                  | §5         |
+| 8   | 送信口は `GET /api/v1/ingest/{id}/stream`（WebSocket）と `POST /api/v1/ingest/{id}/values`（REST の一括）。接続は id で指す（改名で送り手の URL も壊れない）。`/api/v1/*` の `require_tag_space_auth` の下には置かず、専用の認証層を持つ（read スコープを要求する層のため）。v1 の値は数値と bool だけ                                                                                                    | §6         |
+| 9   | 上限: 1 メッセージ 1,000 件・WebSocket 1 メッセージ 256 KiB・REST 1 MiB・接続ごとに 20 メッセージ/秒（瞬間 40）と 5,000 件/秒（瞬間 10,000）。超えたらメッセージ全体を断る。未知のキーは 1 件ずつ断り、監査はキーごとに 1 時間に 1 回。**ブリッジの設定は登録時に上限の 8 割に収まるか見積もって断り（UI に見積もりを出す）、ブリッジは件数・バイト数で分けて送り、接続ごとに速さを抑える**（両方。§7.1） | §7, §8     |
+| 10  | DB ブリッジ（R2a-3）は、DB の接続先を**既存の `postgres` 接続を id で参照**して持つ（Sink の `db_connection_id` と同じ）。パスワードは今の列のまま（`banto-secret-store` は R2b-1）。値の変換と品質の梯子は `db_source` から共有 crate `banto-db-source` へ移し、Hub 内の Source とブリッジが同じコードを使う                                                                                             | §10        |
+| 11  | 完了条件の突き合わせは、同じ SQL を Hub 内の Source とブリッジの両方で読み、7 つの場面（正常・NULL・未対応型・0 行・クエリエラー・DB 停止・収集停止）とブリッジだけの 4 場面（ブリッジの停止・開始直後の DB 停止・対応の削除・上限ちょうどの複数クエリ ほか、§10.4）で「落ち着いた後の値と品質」が一致することを `banto-hub-sink` の統合テスト（CI の PostgreSQL ジョブ）で確かめる                       | §10.4      |
+
+### 0.1 既存の決定から外れる点（§13 の要約。Q1・Q7・Q8・Q9 として 2026-10-21 オーナー決定）
+
+| 既存の決定                                                                                                                     | 本書の提案                                                                     | 理由（コードの事実）                                                                                                                                                                                                                                                                                      |
+| ------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| api-design §12 Q5（2026-10-19 決定）「R2a で `push` を `SessionDriver` にする」、external-db §9.5-1「`DriverRegistry` に登録」 | R2a は Hub 側の `ExternalSource`。登録は R2b-1、セッション型にするかは R2b-3   | (1) `SessionDriver` を動かすホストは R2b-3 のエンジンまで無い（`DriverKind::Session` を読む本番経路が 0）。(2) `Session::read_batch` の戻りは `Result<Value, ItemError>` で、送り手の `stale` を表せない（`session.rs:74-78`）。(3) `Err` は「接続致命 → バックオフして再接続」で、送り手不在と意味が違う |
+| external-db §9.5-7「ブリッジの設定（接続先・SQL・列の対応）は `push` の `settings` に」                                        | 接続先は既存の `postgres` 接続を id で参照（R2a）。`settings` に写すのは R2b-8 | パスワードの新しい置き場を R2a で作らずに済む（今の `password` 列の秘匿処理をそのまま使える）。Sink が同じ形（`hub_sink_groups.db_connection_id`、`sink/service.rs:520-535`）                                                                                                                             |
+| external-db §9.5-7「DB のパスワードは `banto-secret-store`」                                                                   | R2b-1 で行う                                                                   | Hub は `banto-secret-store` をまだ使っていない（`apps/banto-hub/core` に参照 0）。秘密値の置き場の切り替えは R2b-1 の「接続設定を JSON へ・秘密値を `banto-secret-store` へ」と同じ作業                                                                                                                   |
+| read / write のスコープは外部名（名前）で縛る（h10-3、`api_keys.rs:464-470`）                                                  | `ingest:` は接続 id で縛る（`ingest:#12`、2026-10-21 オーナー決定 Q9）         | 取り込みのキーはブリッジ・スクリプトに長く置かれ、接続の改名で黙って止まると全タグが Bad になる。AUTOINCREMENT の id は再利用されない（§5.1）ので、削除して同名で作り直しても古いキーは通らない                                                                                                           |
+| refactor-plan §2-2「P0 → R1 → R2a → R2b」、§3「設定の JSON は R2b-1」                                                          | `plc_connections.settings` 列は R2a で足す（`push` だけが使う）                | `push` の設定（`stale_timeout_ms`・ブリッジの区画）の置き場が今の固定列に無い。`CHECK` を広げる再構築（R2a で必須）と同じ migration で足せば再構築は 1 回で済む                                                                                                                                           |
+
+## 1. 前提（コードの現状、2026-10-21 の main `94b19322` に照合）
+
+行番号は目安。各 PR は着手時に再確認する。
+
+### 1.1 外部ソース（`banto-collect`、#383）
+
+| 項目             | 場所                                                                                                                                                                                                                                                                                           | 事実                                                                                                                                                                            |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| trait            | `crates/banto-collect/src/external.rs:151-153` `pub trait ExternalSource: Send + Sync { fn snapshot(&self) -> ExternalSnapshot }`                                                                                                                                                              | **引数なし**。1 つの収集に 1 つの源（`collector.rs:315` の `external: Option<Arc<dyn ExternalSource>>`）                                                                        |
+| スナップショット | `external.rs:72-80` `ExternalLink { Live, Down { detail } }`、`:84-91` `ExternalQuality { Good, Stale, Bad, Unknown }`、`:95-98` `ExternalReading { value: Option<f64>, quality }`、`:104-109` `ExternalSnapshot { link, values: HashMap<String, ExternalReading> }`                           | **リンク状態はスナップショット全体で 1 つ**。値は外部名で引く                                                                                                                   |
+| 品質と記録の写像 | `external.rs:168-192` `classify_external`（純関数、表はモジュール doc `:33-40`）                                                                                                                                                                                                               | Live + good + 値あり → 値・Good・記録。stale → 値・Stale・記録は NULL。bad / 不明 / 値なし / 非 Live → Bad・NULL。**送り手の時刻は鮮度の判定に使わない**（H4、`:25-28`）        |
+| リンクの事象     | `external.rs:210-230` `LinkTracker::observe`                                                                                                                                                                                                                                                   | 端だけ（`plc_connected` / `plc_disconnected` / `plc_reconnected`、新しい `EventKind` なし）                                                                                     |
+| 周期の記録       | `task.rs:1081-1189` `run_external_connection`（tick ごとに 1 回 `source.snapshot()`、`:1133`）、`:900-931` `record_external_group`、`:936-1074` `record_ticks`（PLC と共通）                                                                                                                   | sample and hold。変わらない値も毎周期 Good で記録。状態は Live で `Connected`、それ以外は `Reconnecting { attempt: 0 }`（`:1135-1148`、`EXTERNAL_RECONNECT_ATTEMPT` は `:199`） |
+| 計画             | `config.rs:111-115` `ProtocolConfig::External`（`pub(crate)`）、`:219-221` `GroupPlan::external_names`、`:925-930` `ResolvedConnection::{Plc, Hub}`、`:1239-1256` `resolve_connection`、`:1096-1110`（hub のタグはスケーリングを当てない）、`:1161-1163`（タグの無い外部グループは計画しない） | `hub` かどうかは `PlcConnection::is_hub_source()`。それ以外は `parse_protocol`（`:1293-1301`、`modbus-tcp` / `slmp` 以外は `UnsupportedProtocol`）                              |
+| 源の有無         | `config.rs:450-460` `HubSource { Unavailable, NotConfigured, Available { catalog } }`、`collector.rs:393-395`・`:508-511`（外部接続があるのに源が無ければ `Config` エラー）、`:846` `MISSING_EXTERNAL_SOURCE`（文言は「Hub 経由の接続」）、`:853-875` `spawn_task`                             |                                                                                                                                                                                 |
+| 実装             | `apps/chronogazer/core/src/hub.rs:1383-1396` `impl ExternalSource for HubSampler`、`apps/chronogazer/core/src/collect.rs:2863` `start_with_sources`                                                                                                                                            | ChronoGazer だけ。hub 接続は 1 つまで（migration `0019` の部分一意索引）                                                                                                        |
+
+### 1.2 Hub の収集の組み立て
+
+| 項目                | 場所                                                                                                                                                                                                     | 事実                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 計画の作成          | `apps/banto-hub/core/src/hub.rs:1448`（`rebuild`）・`:2304`（`commit_catalog`）・`apply_run`（`:2369-`）が `build_config_from`（**厳格版**、`config.rs:598-604`: 除外が 1 件でもあれば全体が失敗）を呼ぶ | 今の Hub に `push` 接続があると `UnsupportedProtocol` で収集全体が止まる                                         |
+| 収集の起動          | `hub.rs:1589`・`:2466` `Collector::start_with_client_factory`（源なし）、`apply_config`（`:1584`）                                                                                                       | ここを `start_with_sources(.., Some(ingest))` に替えるのが R2a-1 の差し込み口                                    |
+| 計画と同時の commit | `hub.rs:1529-1531`・`:1629-1630`・`:2310-2311` で `computed.commit` と `db_source.commit` を catalog の入れ替えと同じ点で行う                                                                            | `IngestHub::commit` も同じ点に置く                                                                               |
+| Running / Stopped   | `controller.rs:640`（Running になったら `db_source.start()`）、`:662`（停止で `db_source.stop()` → `manager.stop()`）                                                                                    | 停止中は `Collector` が無く、`plc` タグは `read_current` で Bad（`hub.rs:318-326`）                              |
+| 読み出しの統一点    | `hub.rs:283-291` `read_current`、`:375` `tag_kind == plc` なら収集のキャッシュ、それ以外は `ServerTagStore`                                                                                              | `push` のタグは `plc` なので収集のキャッシュを読む                                                               |
+| ビットの値          | `hub.rs:308-310` `valid_current_value`（`bit` は 0 / 1 以外を Bad）                                                                                                                                      |                                                                                                                  |
+| 全シミュレーション  | `hub.rs:233` `matches!(protocol, "modbus-tcp" \| "slmp")` だけを simulation にする                                                                                                                       | `push` はシミュレーションに切り替わらない（そのまま受けた値）                                                    |
+| broker の対象       | `HubSessions::is_broker_managed`（`DriverTable::is_supported`）。`write_path.rs:670-680`・`read_path.rs:177-179` は broker に無いプロトコルを `UnsupportedProtocol` で断る                               | `push` のタグへの書き込み・read-now は追加の分岐なしで断られる（登録時の `writable = false` に加えた二重の防御） |
+
+### 1.3 今の `db_source`（Hub 内の PostgreSQL Source）
+
+| 項目         | 場所                                                                                                                                                                                | 事実                                                                                                            |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| 書き先       | `db_source/task.rs:598-639`（`deps.store.set(&tag.tag_key, value, quality, now_ms)`）、`hub.rs:1173` `DbSourceEngine::new(computed.server_store(), ..)`                             | **収集を通らず `ServerTagStore` に直接書く**。tstore には記録しない                                             |
+| 品質の梯子   | `db_source/task.rs:23-33`（表）、`:656-694` `on_group_failure`（2 回連続で Bad）、`:700-713` `write_stale`（直前値が無ければ Bad、直前の時刻を据え置く）、`:753-759` 接続断で全 Bad | 0 行は即 Bad（`:601-607`）。非有限値は Bad（`:634-637`）                                                        |
+| 値の変換     | `db_source/convert.rs:1-45`（DB 側で `float8` にキャストするラッパー SQL）、`:68` `ColumnKind::classify`、`:114` `build_wrapper_sql`、`db_source/plan.rs:160` `resolve_group`       | bool は `1.0` / `0.0`、timestamp は epoch ms、text 等は Bad。スケーリングは当てない                             |
+| 監督・状態   | `db_source/supervisor.rs`、`db_source/status.rs`、`rest/tag_space.rs:702-760` `DbSourceStatusEntry`                                                                                 | 状態 API の `db_source` 節                                                                                      |
+| エラーの文言 | `db_source/mod.rs:645` `sanitize_postgres_error`                                                                                                                                    | 接続文字列を出さない                                                                                            |
+| CI           | `.github/workflows/ci.yml:477-512`（PostgreSQL のサービスコンテナ、`BANTO_TEST_PG_URL`）、`.github/scripts/ci-changes.mjs:169`・`:393` `run_rust_db_source`                         | `cargo test -p banto-hub-core --test db_source`・`--lib db_source`・`cargo test -p banto-hub-sink` が同じジョブ |
+
+### 1.4 接続の種類の検証
+
+| 項目                    | 場所                                                                                                                                                                                                                                                                     | 事実                                                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------ |
+| 許可リスト              | `crates/banto-tags/src/plc_connection.rs:236` `ALLOWED_PROTOCOLS = ["modbus-tcp", "slmp", "virtual", "postgres", "hub"]`、定数 `:298-317`、照合 `:801-809`                                                                                                               | SQL の `CHECK` と手書きの二重。両者のずれはテスト `:1801-1869` が双方向に断る                                                        |
+| SQL の `CHECK`          | `crates/banto-tags/migrations/0019_plc_connections_allow_hub.sql:61`（`protocol IN ('modbus-tcp', 'slmp', 'virtual', 'postgres', 'hub')`）                                                                                                                               | SQLite は `CHECK` を ALTER できないので**再構築**（park-and-restore、`0019` の header の手順、`sqlite_sequence` の引き継ぎ）         |
+| 再構築の注意            | `0022_collection_groups_unique_name_per_connection.sql:32-56`・`:109-110`（`0020` のトリガを先に外して戻した後に作り直す、「後の migration でも作り直すこと」）、`0019:100` 前後の `idx_plc_connections_single_hub`、`0021`（`cpu_type` は ADD COLUMN で後から足した列） | `0023` は `cpu_type` を含む現在の全列を写し、部分一意索引と `0020` のトリガを作り直す                                                |
+| 正規化                  | `plc_connection.rs:452-461` `normalize_hub_input`（host `""`・port `0`・他は既定）、`:480-482` `has_no_simulation`、`:820-821` `has_no_endpoint`                                                                                                                         | `push` も同じ扱いにする                                                                                                              |
+| 列                      | `plc_connection.rs:588-631` `PlcConnection`、`:662-765` `PlcConnectionInput`、`:975-976` `COLUMNS`、`crates/banto-collect/src/config.rs:499-503` `RegistrySnapshot::load_connection` の SELECT                                                                           | 列を足すときは両方の SELECT を直す（checklist §5、#605）。`PlcConnectionInput {` のリテラルは 141 か所、`PlcConnection {` は 45 か所 |
+| Hub が作らない種類      | `apps/banto-hub/core/src/rest/plc_connections.rs:163-177` `reject_hub_connection_protocol`（REST・MCP・保留中の変更の適用の全入口）                                                                                                                                      | `push` は Hub が作る種類なので断らない                                                                                               |
+| ChronoGazer             | `apps/chronogazer/src-tauri/src/lib.rs:2279` `ALLOWED = ["modbus-tcp", "slmp", "hub"]`                                                                                                                                                                                   | ChronoGazer の UI は `push` を作れない。寛容版の計画では除外理由になる（§4.1）                                                       |
+| UI・MCP・設定パッケージ | `apps/banto-hub/src/lib/banto/plcConnectionForm.ts:59-81`、`apps/banto-hub/core/src/mcp.rs:596`・`:663`・`:722`（JSON スキーマの `enum`）、`apps/banto-hub/src/lib/banto/configPackage.ts:50-63`（秘密値の除外）・`:146`（Sink は `dbConnectionName` で持ち運ぶ）        |                                                                                                                                      |
+
+### 1.5 タグの配置検証
+
+- `crates/banto-tags/src/tag.rs:891-974` `placement_verdict`（`tag_kind` と接続のプロトコルの組み合わせ）。`hub` 接続の `plc` タグは `:993-1022` `hub_tag_errors`（外部名の形 `:221-239`・`string` 不可・`writable` 不可・恒等でないスケーリング不可）。
+- 外部名の一意性は書き込み前の照会（`:1108-1111`）と migration `0020` のトリガ（`tags_hub_external_name_unique_insert` / `_update`）の二重。どちらも**レジストリ全体**で一意（`hub` は 1 つなので）。
+- `db` タグは `postgres` 接続の下だけ（`:937-942`）、`address` は列名（`:674-698`）。
+
+### 1.6 API キーのスコープ
+
+| 項目     | 場所                                                                                                                                                                                                                               | 事実                                                                                                     |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| 文法     | `apps/banto-hub/core/src/api_keys.rs:185-214` `validate_scope`（`read`・`read:{c}.{g}.{t}`・`read:{c}.{g}.*`・`write:{c}.{g}.{t}`・`admin`）、`:230-254` `validate_read_scope`、`:258-278` `validate_scopes`（発行時だけ）         | 発行時の構文検証のみ。存在の確認はしない。スコープは発行後に変えられない（発行・一覧・失効だけ、`:1-7`） |
+| 判定     | `api_keys.rs:424-431` `ApiKeyContext { id, name, scopes, last_used_at_ms }`、`:443-447` `has_any_read`、`:471-487` `can_read_value`、`:493-496` `has_write_scope`（完全一致）、`:506-508` `has_admin_scope`（read / write と直交） | read / write は外部名（名前）で縛る。改名では追従しない（fail-closed、`:464-470`）                       |
+| 照合     | `api_keys.rs:121-140`（`check` は 5 秒の上限 `:156`、`api_key_verdict` で拒否の形を決める）、`rest.rs:598-607` `api_key_rejection_response`（失効・期限切れ・存在しない 401、トリップ 403、照合不能 500）                          |                                                                                                          |
+| 管理の型 | `apps/banto-hub/core/src/rest.rs:634-680` `require_session_role`、`:685-718` `require_editor`（banto の `Role`）                                                                                                                   | API キーとロール（RBAC）は別系統                                                                         |
+
+### 1.7 WebSocket と認証
+
+- `apps/banto-hub/core/src/stream.rs:1-19`（`/api/v1/stream` のメッセージ）、`:170` 送信キュー 256、`:175` 背圧の close 1013、`:182` 再検証 15 秒・`:185` 上限 5 秒、`:192` 失効の close 1008、`:260-262` `StreamCredential`、`:395-446` `Revalidator`、`:477-520` `ws_upgrade`。
+- 認証は `apps/banto-hub/core/src/rest/tag_space.rs:1103-1209` `require_tag_space_auth`。`bh_` は API キー、それ以外はセッション。**書き込みのルート以外は `has_any_read` を要求する**（`:1140-1142`）ので、read の無いキーはこの層の下のルートに入れない。ルーターは `:1223-1312`（`/api/v1/stream` は `:1294`）。
+- ブラウザ向けの `Sec-WebSocket-Protocol` からのトークン取り出しは**パスの完全一致**で `/api/v1/stream` と `/api/tag-stream` だけ（`rest.rs:533-546`）。
+
+### 1.8 監査
+
+- `AuditLogService::record(AuditEntry { actor_username, actor_role, action, resource, entity_id, detail, origin, result })`（例 `rest/tag_space.rs:1165-1182` の API キーの `denied`）。失効・期限切れ・トリップのキーは監査し、存在しないキーは監査しない（`tag_space.rs:1081-1097`）。
+- DB が応答しないときは保留ファイルへ退避（`apps/banto-hub/core/src/audit_spool.rs:1-40`、3 秒、30 秒ごとに流し込み）。
+- 書き込みの監査は別表で log-before-write（`write_audit.rs`）。`push` は書き込みではないので使わない。
+
+### 1.9 今ある量・頻度の上限
+
+| 対象                         | 場所                                                    | 値                                                                  |
+| ---------------------------- | ------------------------------------------------------- | ------------------------------------------------------------------- |
+| 書き込みの頻度               | `apps/banto-hub/core/src/write_rate.rs:27-36`・`:44-60` | 60 秒窓で全体 30・タグごと 10。超えたらキーを**トリップ**           |
+| `/api/v1/stream` の送信      | `stream.rs:170`・`:175`                                 | キュー 256、満杯で close 1013                                       |
+| HTTP の本文・WS のメッセージ | 明示の設定なし（`DefaultBodyLimit` 等の grep で 0 件）  | axum 0.8 の既定（`Json` は 2 MiB、WebSocket は tungstenite の既定） |
+| 一括書き込み                 | `rest/write.rs:251-382`（T20-3a）                       | 件数の上限は無い（重複キーは拒否）                                  |
+
+### 1.10 Sink のサイドカー
+
+- `apps/banto-hub-sink/src/lib.rs:24-43`（構成）、`Cargo.toml`（`banto-tagclient`・`sqlx` の `postgres` + `tls-rustls-ring-native-roots`・`reqwest`。`tokio-tungstenite` は `banto-tagclient` 経由で既にある）。
+- 設定は `banto-hub-sink.toml`（`src/config.rs:377-390` `SidecarConfig`: `hub_url`・`api_key` ほか）。**置き場は `%ProgramData%\BantoHub\sink\` だけ**（#630）。
+- Hub からの設定取得は `GET /api/sink/config`、状態は `PUT /api/sink/status`。どちらも `apps/banto-hub/core/src/rest/sink.rs:197-241` `require_sink_admin`（`admin` スコープのキーか admin ロールのセッション）。応答は DB のパスワードを平文で含む（`:294-309`）ので、ループバックの運用が前提（初回に warn、`:373-390`）。
+- 統合テスト `apps/banto-hub-sink/tests/sidecar.rs:15-32`・`:96-145` は Hub をプロセス内に立て、`BANTO_TEST_PG_URL` の PostgreSQL に繋ぐ（無ければスキップ）。
+
+### 1.11 R1 のレジストリと `HubDrivers`
+
+- `crates/banto-driver-api/src/registry.rs:30-43` `#[non_exhaustive] enum DriverKind { Frame, Session, HostBound }`。`session.rs:58-98` `SessionDriver::connect` / `Session::read_batch(&[TagSpec]) -> Result<Vec<Result<Value, ItemError>>, FatalError>`（`Err` は接続致命）。
+- `crates/banto-drivers/src/lib.rs:64-81` `builtin()`（registry は `slmp`・`modbus-tcp` の `HostBound` だけ）。トリップワイヤ 1（`:266-276`、registry の id ⊆ `ALLOWED_PROTOCOLS`）、**トリップワイヤ 2（`:281-288`、broker の表の id == registry の `HostBound` の id）**。
+- `apps/banto-hub/core/src/broker_glue.rs:211-215` `HubDrivers { registry, broker, client_factory }`。**R1 では registry を読む本番経路は無い**（api-design §6.2）。
+- `Settings` は**文字列の対の並び**（api-design §3.5、`banto-driver-api/src/settings.rs`）。入れ子の JSON は持てない。
+
+## 2. `push` の位置づけ: セッション型か Hub 側か
+
+| 案                                                       | 中身                                                                                                                                            | 問題                                                                                                                                                                                                                                                                                                           | 判定                     |
+| -------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| A. `DriverKind::Session`（api-design Q5、§9.5-1 の字面） | `PushDriver: SessionDriver`。`connect` は受信側を握った `Session` を返し、`read_batch` が保持値を返す                                           | **動かすホストが無い**: Hub の収集は `banto-collect` のタスクと broker で、`SessionDriver` を `connect` する経路は R2b-3 のエンジンまで無い。**品質を運べない**: `read_batch` は `Value` か `ItemError` で、送り手の `stale`（§9.5-5）を表せない。**`Err` の意味が違う**: 送り手不在は「切って再接続」ではない | 採らない（R2b-3 で再考） |
+| **B. Hub 側の `ExternalSource`（推奨）**                 | 受信（`IngestHub`）は core。収集は `run_external_connection` を通す（§4）。静的な部分は `PushDriver: DriverBase` を core に置く（登録はしない） | レジストリに載らない期間（R2a〜R2b-1）がある。ただし R1 の registry を読む本番経路は無く、R2a の正は今までどおり `ALLOWED_PROTOCOLS` と `CHECK`                                                                                                                                                                | **R2a**                  |
+| C. `HostBound` で registry に登録                        | B と同じで、`builtin()` か host が registry に足す                                                                                              | トリップワイヤ 2（broker の表 == `HostBound`）が落ちる。broker に `push` は無い。ワイヤを緩めると Modbus / SLMP の表の漏れを検出できなくなる                                                                                                                                                                   | 採らない                 |
+
+- B は §9.5-2（値は収集を通す）・§9.5-6（`classify_external`）をそのまま満たす。§9.5-1 の「`hub` 接続と同じ種類」は、R2a では「同じ `ExternalSource` に乗る」という形で実現する。
+- **R2b での扱い（本書では決めない）**: R2b-1 で registry が正になる時点で `push` を登録する。そのときの `DriverKind` は、(a) 品質を運べる読み取り（`Reading { value, quality }`）を `Session` に足す、(b) `DriverKind` に「値をホストが受ける」種類を足す（`#[non_exhaustive]` なので追加は破壊にならない）のどちらか。ChronoGazer の `hub` 接続の寄せ方（api-design Q5 の後半）と一緒に R2b-3 の前に決める（§12 Q1）。
+
+```rust
+// apps/banto-hub/core/src/ingest/driver.rs（R2a-2a。登録はしない。core の単体テストで
+// banto-driver-conformance の static_checks（C1・C2）に掛ける）
+pub const PUSH_PROTOCOL: &str = banto_tags::PUSH_PROTOCOL;   // "push"
+pub struct PushDriver { descriptor: DriverDescriptor }        // Capabilities::READ_ONLY、transports = []
+impl DriverBase for PushDriver {
+    fn descriptor(&self) -> &DriverDescriptor;
+    /// keys::* は読まない。"stale_timeout_ms" と "bridge"（JSON の文字列。§3.2）を banto_tags::validate_push_settings で
+    fn validate_config(&self, settings: &Settings) -> Vec<FieldError>;
+    /// banto_tags::validate_push_key を包む。canonical = 前後の空白を除いた文字列、area = "key"、
+    /// writable_area = false、bit = None、word_count = kind.word_count()（意味はない。C1 の冪等だけを満たす）
+    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError>;
+    /// n == 0 は canonical をそのまま返す（C1）。それ以外は「push のキーは連番にできません」
+    fn offset_address(&self, canonical: &str, kind: &TagKind, n: i64) -> Result<String, AddressError>;
+    fn address_help(&self) -> String;   // 「送り手が決めるキー（1〜256 文字、大文字小文字を区別）」
+}
+```
+
+## 3. 接続とタグ
+
+### 3.1 接続の種類 `push`（R2a-2a）
+
+- `banto-tags` に `PUSH_PROTOCOL = "push"` を足し、`ALLOWED_PROTOCOLS` に加える。`normalize_push_input`（host `""`・port `0`・unit_id / word_order / cpu_type は既定・simulation `false`。`normalize_hub_input` と同じ）、`has_no_simulation` と `has_no_endpoint` に `push` を足す。`database` / `username` / `password` は `push` でも禁止のまま（§10.2 で DB は参照で持つ）。
+- `push` 接続の数に上限は設けない（部分一意索引は付けない）。1 接続 = 送り手 1 つ（§9.5-1）。
+- **migration `0023_plc_connections_allow_push.sql`**: `0019` の手順で `plc_connections` を作り直し、`CHECK` に `'push'` を足し、列 `settings TEXT`（NULL 可、`CHECK (settings IS NULL OR json_valid(settings))`）を足す。写す列は `cpu_type` を含む今の全列。`idx_plc_connections_single_hub` を作り直す。`tags` の行を戻す前に `0020` のトリガを外し、戻した後に作り直す（`0022` の header の手順）。`sqlite_sequence` の位置を引き継ぐ。検証は `0019` と同じく populated な DB に実ファイルを `include_str!` で適用するテスト。
+- **migration `0024_tags_push_key_unique.sql`**: `push` 接続の下の `plc` タグの `address` を**接続ごとに**一意にするトリガ 2 本（`0020` と同じ形で、条件の `c.protocol = 'hub'` を `'push'` と「同じ `plc_connection_id`」に替える）。書き込み前の照会（`tag.rs:1108-1111` と同じ形）と二重にする。
+- `PlcConnection` / `PlcConnectionInput` に `settings: Option<serde_json::Value>` を足す（`#[serde(default)]`）。`COLUMNS` と `RegistrySnapshot::load_connection` の SELECT を直す。リテラル 186 か所の機械的な追加（`settings: None`）は haiku に任せられる。`push` 以外で `settings` が非 NULL なら検証エラー（R2b-1 で広げる）。
+- REST の `PlcConnectionPayload`・応答 DTO（`rest/plc_connections.rs:59-122`・`:185-`）、MCP の `create_connection` / `update_connection` のスキーマ（`mcp.rs:596`・`:663`・`:722` の `enum` に `push`、`settings` を足す）、設定パッケージ（`configPackage.ts`。`settings.bridge.db_connection_id` は `dbConnectionName` に写して持ち運ぶ。Sink と同じ）。
+
+### 3.2 `settings` の JSON（`push` だけ）
+
+```jsonc
+{
+	"stale_timeout_ms": 10000, // 任意。既定 10000、1000..=3600000（§4.3）
+	"bridge": {
+		// 任意。ブリッジが定義する区画（§9.5-7）。R2a で Hub が知る kind は "db" だけ
+		"kind": "db",
+		"db_connection_id": 12, // protocol = "postgres" の接続（§10.2）
+		"queries": [
+			{
+				"name": "line1", // 区画の中で一意、1..=64 文字
+				"period_ms": 1000, // collection_groups の period_ms と同じ集合（100〜60000）
+				"sql": "SELECT temp, run FROM line1_now", // validate_query_sql と同じ規則（SELECT / WITH・単文）
+				"columns": [
+					{ "column": "temp", "key": "line1.temp" },
+					{ "column": "run", "key": "line1.run" }
+				]
+			}
+		]
+	}
+}
+```
+
+- 検証は `banto_tags::validate_push_settings`（純関数。`PlcConnectionService` の全入口が通る）。未知のキーは断る（Hub が書く唯一の正なので、綴りの間違いを黙って通さない）。`bridge.kind` が `"db"` 以外は断る（R2a は fail closed。別の種類のブリッジは足すときに検証を足す）。大きさは 64 KiB まで。キーは区画全体で一意。**加えて、送る量が受信の上限に収まるかを見積もって断る**（§7.1 の `bridge_load`。64 KiB の中には 1,000 件を超える対応も、合計で 20 メッセージ/秒を超える周期の組み合わせも書けるため。2026-10-21 レビュー P2）。`columns[].key` が実在するタグのキーかは**検証しない**（タグは後から作る。ブリッジは未知のキーの拒否で気づく）。
+- `db_connection_id` が指す接続は `postgres` でなければならない。`postgres` 接続の削除は、`push` の `settings` が参照していれば断る（`reject_delete_if_referenced_by_sink_group` と同じ形、`json_extract(settings, '$.bridge.db_connection_id')`）。
+- **`Settings`（API）との対応**: `Settings` は文字列の対しか持てない（§1.11）ので、`PushDriver::validate_config` へは `stale_timeout_ms` を文字列、`bridge` を JSON の文字列として渡す。入れ子の設定を API でどう表すかは R2b-1 の課題として残す（§13 の 5）。
+- 秘密値は持たない（`secret_keys` は空）。DB のパスワードは参照先の `postgres` 接続の `password` 列のまま（§10.2）。
+
+### 3.3 タグ
+
+- 普通の `plc` タグ。`push` 接続の下に普通のグループ（`period_ms` は記録の周期）を作り、その下に置く。`placement_verdict` に `push_tag_errors` を足す（`hub_tag_errors` と同じ並び）:
+
+| 項目              | 規則                                                                                                            | 理由                                                                                  |
+| ----------------- | --------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| `address`（キー） | `validate_push_key`: 前後の空白を除いて保存、1..=256 文字、制御文字なし。大文字小文字を区別し、そのまま照合する | 送り手が決める（§9.5-3）。DB の列名・MES の識別子・`line1/temp` のどれでも使える      |
+| 一意性            | 同じ接続の中で一意（照会 + `0024` のトリガ）。接続が違えば同じキーを使える                                      | 1 つのキーが 2 本のタグに割れると、どちらに値が入ったか分からない                     |
+| `data_type`       | `bit` と数値（64bit を含む）。`string` は断る                                                                   | 収集の記録は数値だけ（v1、§9.5-5）。`hub` のタグと同じ                                |
+| `writable`        | `false` のみ（`true` は断る。正規化しない）                                                                     | 書き込みの方向は持たない（§9.5-8）                                                    |
+| スケーリング      | 恒等以外は断る                                                                                                  | 送り手は工学値を送る。`db_source` もスケーリングを当てない（同じ値にするため、§10.4） |
+| `value_source`    | `"push"`（`value_source.rs:92-114` に腕を足す。§12 Q14）                                                        | 状態画面で出どころが分かる。SDK は未知のラベルを `Unknown(raw)` で持つので互換        |
+
+- キーの「解析」は検証と前後の空白の除去だけで、正規形 = 保存する文字列（`parse(canonical) == canonical`）。キーを変える（タグの `address` の変更）と、受信側が保持していた古いキーの値は次の commit で捨てる（§4.2）。
+
+## 4. 収集への組み込み（R2a-1）
+
+### 4.1 `banto-collect` の変更
+
+```rust
+// crates/banto-collect/src/external.rs（R2a-1a）
+pub trait ExternalSource: Send + Sync {
+    /// connection_key は ConnectionPlan.key（"conn:{id}"、config.rs:56-58）。
+    /// ChronoGazer の HubSampler は使わない（hub 接続は高々 1 つ）。
+    fn snapshot(&self, connection_key: &str) -> ExternalSnapshot;
+}
+// task.rs:1133 を source.snapshot(&conn_key) に。collector.rs:846 の文言を「外部の接続」に一般化。
+
+// crates/banto-collect/src/config.rs（R2a-1b）
+/// push 接続を収集できる実行形態か（banto-hub = Available、ChronoGazer = Unavailable）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushSource { Unavailable, Available }
+enum ResolvedConnection<'a> { Plc(..), Hub { catalog }, Push }          // :925-930 に腕を足す
+// resolve_connection（:1239-）: conn.protocol == PUSH_PROTOCOL → Available なら Push、Unavailable なら
+//   ExclusionReason::PushSourceUnavailable（wire 名 "pushSourceUnavailable"）
+// Push のタグ: external_names に tag.address.trim()、scaling は None、DataType::parse できなければ InvalidTag
+// Push も「タグが 1 本も無い外部グループは計画しない」（:1161-1163）に含める
+pub fn build_config_from_with(snapshot: &RegistrySnapshot, push: PushSource) -> Result<CollectorConfig, CollectError>;
+// 既存の build_config_from / build_config_lenient_* は PushSource::Unavailable を渡す（ChronoGazer は無変更）
+```
+
+- `ProtocolConfig::External` は `hub` と `push` で共用する（違いは源とキーの意味だけ）。`has_external_connections` / `external_names` は両方を数える。ChronoGazer の `external_names()`（Hub への購読の要求）に `push` のキーが混ざらないよう、ChronoGazer は `PushSource::Unavailable` で `push` を除外して作る（混ざる経路が無い）。
+- 代わりに `ExternalSource` に既定実装つきの `snapshot_for(&self, key)` を足す案もある（ChronoGazer の差分が 0）。Hub の実装に意味の無い `snapshot()` が残るので推奨しない（§12 Q16）。
+
+### 4.2 Hub 側: `IngestHub`（R2a-1c）
+
+```rust
+// apps/banto-hub/core/src/ingest/mod.rs
+pub struct IngestHub { slots: RwLock<HashMap<i64 /* connection id */, Arc<IngestSlot>>>, clock: Arc<dyn Clock> }
+struct IngestSlot {
+    name: String,                       // 今の接続名（表示・監査の名前の控え用。束縛は id、§5）
+    keys: HashMap<String, KeyInfo>,     // commit 時の登録済みキー → (tag_key, data_type, enabled)
+    stale_timeout: Duration,
+    bridge: Option<BridgeSendSet>,      // settings.bridge があるとき: 送るキーの集合と設定の指紋（§4.6）
+    held: RwLock<Held>,                 // { epoch, values: HashMap<String, ExternalReading>, last_seen_ms, sessions, counters }
+}
+impl IngestHub {
+    /// catalog の入れ替えと同じ点で呼ぶ（hub.rs:1529-1531, 1629-1630, 2310-2311）。push 接続の追加・削除と
+    /// キーの集合の更新。登録から消えたキーの保持値は捨てる。ブリッジの設定が変わった接続は epoch を進める（§4.6）。
+    /// 有効・プロトコルが変わった接続・削除された接続の WS は閉じる（§6.1。改名では閉じない）
+    pub fn commit(&self, map: &TagMap, snapshot: &RegistrySnapshot);
+    /// 収集の停止（controller.rs:663 の manager.stop() の後）: 全接続の保持値を捨て、ブリッジの接続は epoch を進める（§4.5）
+    pub fn on_collection_stopped(&self);
+    /// 収集の開始（controller.rs:614 の apply_run より前）: ブリッジの接続の保持値を捨て epoch を進める（§4.5）。
+    /// ここではブリッジに何も送らない（collecting は false のまま）
+    pub fn on_collection_starting(&self);
+    /// apply_run が成功して Running が確定した後（controller.rs:614-640 の started の枝。db_source.start() と同じ位置）:
+    /// ブリッジの接続へ state { collecting: true, epoch } を送る。apply_run が失敗して Faulted になったときは呼ばない
+    pub fn on_collection_started(&self);
+    /// 1 メッセージ分を 1 回の書き込みロックで反映する（スナップショットが途中を見ない）。結果は §6.3 の件ごとの結果。
+    /// ブリッジの接続では message_epoch が今の epoch と違えばメッセージ全体を断る（§4.6）
+    pub(crate) fn apply(&self, conn_id: i64, message_epoch: Option<u64>, items: &[IngestItem], now_ms: i64) -> ApplyOutcome;
+}
+impl ExternalSource for IngestHub {
+    fn snapshot(&self, connection_key: &str) -> ExternalSnapshot;   // "conn:{id}" → slot。無ければ down(None)
+}
+```
+
+- Hub の `rebuild` / `commit_catalog` / `apply_run` は `build_config_from_with(snapshot, PushSource::Available)` を使い、`Collector` は `start_with_sources(.., Some(ingest.clone()))` で作る（`hub.rs:1589`・`:2466`）。`apply_config` は収集を作った時の源を使い続ける（`collector.rs:315`）。
+- 保持値は `IngestSlot` が持ち、収集のタスクの作り直し（`apply_config` の replaced）では消えない。
+- `snapshot` は読み取りロック 1 回と値の複製だけ（`external.rs:146-150` の契約。tick を止めない）。
+
+### 4.3 Live / Down とタイムアウト
+
+```text
+live(slot, now) = now - last_seen_ms <= stale_timeout_ms
+  last_seen_ms は「受け付けた最後の通信」: WS の values / ping / status、REST の一括送信（認証と上限を通ったもの）
+```
+
+- **WS の切断は即座に Down にしない**。最後の通信から `stale_timeout_ms` まで Live のまま（§9.5-6「切断から一定時間」）。ブリッジの再接続（Hub の再起動・一時的な網の断）で Bad が挟まらない。
+- WS が開いていても通信が途絶えれば Down（ハングした送り手を Live に見せない）。送り手は値が変わらなくても `stale_timeout_ms / 3` ごとに `ping` を送る（ブリッジは自動で送る）。
+- **既定 10 秒**（§12 Q3）。根拠: Sink の状態 push は 15 秒で `unknown`（external-db §5.2）、再検証は 15 秒（`stream.rs:182`）。Bad になるまでの遅れを PLC の切断（応答タイムアウト 1 秒 + 再接続）と大きく違えない範囲で、ブリッジの ping 3 秒の取りこぼし 2 回に耐える値。周期の長い REST の送り手は接続ごとに伸ばす（1 秒〜1 時間）。
+- Down の理由（`ExternalLink::Down { detail }`、`plc_disconnected` の detail）は「送り手からの通信が {n} 秒ありません」「送り手が一度も接続していません」。資格情報・アドレスは含めない（`external.rs:76-78`）。
+- **キーごとの古さは見ない**（v1、H4 と同じ。§12 Q15 決定）。一般の送り手が特定のキーだけ送らなくなっても、そのキーは最後の値で Good のまま（on-change の送り手のため）。**DB ブリッジの接続はこの規則に頼らない**: 送る集合から外れたキー・収集の停止と開始・設定の変更は §4.5・§4.6 の規則で無効にする（`ping` が続いても古い Good を残さない）。
+
+### 4.4 品質の表（`push` のタグ）
+
+| 受けたもの（Live のとき）                  | 表示（値・品質）  | 記録（tstore） | 備考                                                                                                                                                                                                                                                       |
+| ------------------------------------------ | ----------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `q: "good"`（省略時も）・`v` が数値/bool   | 値・Good          | 値             | bool は 1.0 / 0.0                                                                                                                                                                                                                                          |
+| `q: "stale"`・`v` あり                     | 送り手の値・Stale | NULL           | ブリッジはクエリ失敗の 1 回目にこれを送る（§10.3）                                                                                                                                                                                                         |
+| `q: "stale"`・`v: null`                    | **値なし・Bad**   | NULL           | `classify_external` は `Stale` + 値なしをキャッシュに書くが、読み出しの `effective_current_view` が値なしを Bad にする（`hub.rs:328-339`）。今の読み出しの規則を変えない（互換。2026-10-21 レビュー P3）。ブリッジは直前値の無い Stale を送らない（§10.3） |
+| `q: "bad"`                                 | 値なし・Bad       | NULL           |                                                                                                                                                                                                                                                            |
+| まだ一度も受けていないキー                 | 値なし・Bad       | NULL           |                                                                                                                                                                                                                                                            |
+| Down（タイムアウト）                       | 値なし・Bad       | NULL           | 全キー                                                                                                                                                                                                                                                     |
+| 収集の停止中・接続 / グループ / タグが無効 | 値なし・Bad       | -              | 収集が無い（`hub.rs:318-326`）、または計画に無い                                                                                                                                                                                                           |
+
+`q` の不明な綴りと `good` で `v: null` はメッセージの受け付けで件ごとに断る（§6.3）ので、`ExternalQuality::Unknown` は `push` では生じない。
+
+### 4.5 Running / Stopped との連動
+
+- 収集の開始で `push` 接続のタスクが立ち、停止で止まる（PLC と同じ `Collector` の中なので追加の分岐なし。§9.5-2）。停止中のタグは Bad。
+- **停止中も受信は続ける**（WS は閉じない、REST は 200。§12 Q11 決定）。応答と WS の通知に `collecting: false` を載せる。
+- ブリッジは `collecting: false` を受けたら DB への問い合わせを止め、プールを閉じる（external-db §4.8「停止中は DB へ接続しない」を保つ）。`true` で再開する。
+
+**停止前の Good を開始後に戻さない規則（2026-10-21 レビュー P2 で追加）**。コードの事実: 収集を開始すると `apply_run`（`controller.rs:614`）が収集のタスクを立て、外部接続のタスクは**最初の tick を待たずにすぐ**スナップショットを取って記録する（`task.rs:1089-1090` で `next_fire` が開始の時刻、`:1133` で `snapshot`）。保持値と `ping` がそのまま残っていると、ブリッジが再接続・再問い合わせする前に、停止前の値が新しい収集の Good として tstore に書かれる。今の `db_source` は停止で全タグに Bad を書き、開始で古い Good を戻さない（`db_source/mod.rs:306-354`、`stop` は join の後に `mark_connection_bad`）。これに合わせる:
+
+| 時点                                                                                               | 一般の送り手の接続（`settings.bridge` なし）                            | ブリッジの接続（`settings.bridge` あり）                                                                                                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 停止（`stop_locked` の `manager.stop()` の後 = 収集のタスクが join された後、`controller.rs:663`） | **保持値を全部捨てる**（`on_collection_stopped`）。停止前の値は残らない | 保持値を全部捨て、**epoch を進める**。`state { collecting: false, epoch }` を送る                                                                                                                                                                                          |
+| 停止中に届いた値                                                                                   | 受けて保持する（Q11。送り手が今送っている値）                           | epoch が今のものなら受けて保持する（停止の後の問い合わせの値。ただし次の開始で捨てる）                                                                                                                                                                                     |
+| 開始（`start_locked` の `apply_run` **より前**、`controller.rs:614`）                              | 何もしない（停止中に届いた値で記録を始める）                            | **保持値を全部捨て、epoch を進める**（`on_collection_starting`）。`state { collecting: true, epoch }` は送らず、`apply_run` が成功して Running が確定した後に `on_collection_started` で送る（失敗して Faulted なら `collecting: false` のまま。2026-10-21 再レビュー P2） |
+| 開始の直後の最初の tick                                                                            | 停止中に届いた値があれば Good、無ければ Bad                             | 保持値が空なので **Bad**。ブリッジが新しい epoch で最初の周期を送った後の tick から Good                                                                                                                                                                                   |
+
+- epoch を進めるのは収集の**遷移**（`start_locked` / `stop_locked`）とブリッジの設定の変更（§4.6）だけ。稼働中の構成の再適用（`commit_catalog_and_apply_live` → `apply_run`）では進めない（値は連続している）。
+- 停止の処理の順序は `db_source` と同じく「タスクを止めてから捨てる」。捨てる前に収集は無いので、捨てるまでの間に Good が記録されることも無い。
+- 一般の送り手の開始の扱いを変えないのは Q11（停止中も受ける）の決定のため。停止の時点で捨てるので「停止前の Good」は戻らない。停止中に届いた値は送り手が今送っているもので、古さは Q15（キーごとの期限なし）の扱い。
+
+### 4.6 ブリッジの世代（epoch）と送る集合（2026-10-21 レビュー P2 で追加）
+
+- **epoch**: 接続ごとの単調増加の整数（`Held.epoch`、Hub の起動で 1 から）。ブリッジの接続では `values` メッセージと REST の要求に `epoch` が**必須**で、今の epoch と違えばメッセージ全体を断る（WS `error` `stale_epoch` / REST 409 `stale_epoch`、何も反映しない、`last_seen_ms` も進めない）。`welcome` と `state` が今の epoch を知らせる。一般の送り手の接続では `epoch` は任意で、付ければ同じく照合する。
+- これで、停止・開始・設定の変更の**前に**ブリッジが問い合わせた値（送信が遷移をまたいで届いた分）を確実に捨てられる。ブリッジは `state` を受けたら、新しい epoch で describe と最初の問い合わせからやり直し、その周期の全キーを送る（§10.3）。
+- **送る集合**: ブリッジの接続では、`settings.bridge.queries[].columns[].key` の集合を `BridgeSendSet` として `commit` で持つ。送る集合に無いキーは、タグが登録されていても値を受けない（件ごとに `not_in_bridge_set`）。
+- **設定の変更**（`commit` で `settings.bridge` の指紋が変わった）: その接続の保持値を全部捨て、epoch を進め、`state { collecting, epoch, config_changed: true }` を送る。ブリッジは設定を取り直してから送る（`config_refresh_secs` を待たない）。対応から外したキー（タグは残っている）は値が来ないので Bad のまま。列の付け替え（同じキーが別の列を指す）でも古い列の値は残らない。
+- **ブリッジが送らなくなったキー**: 上の 2 つ（送る集合・epoch）で、`ping` だけが続いて古い Good が残る経路は無くなる。ブリッジの問い合わせのタスクが落ちた・止まった場合は、ブリッジがそのクエリのキーに `bad` を送る（§10.3）。
+
+## 5. 認証: `ingest:#{id}` のスコープ
+
+| 項目         | 内容                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 文法         | `ingest:#{id}`（2026-10-21 オーナー決定 Q9 = (b)）。`{id}` は `plc_connections.id` の 10 進で、正規形だけを受ける: `[1-9][0-9]*`・`i64` の範囲（先頭の 0・符号・空白・`*` は断る）。正規形に限るので照合は文字列の完全一致で済む。発行時に構文だけ検証し、存在は確かめない（read / write と同じ）。UI は接続の一覧から選ばせ、id を詰める                                                                                     |
+| 文法の理由   | (1) 接頭辞 `ingest:` は新しく、`read:` / `write:` の名前の文法（`{c}.{g}.{t}`、`api_keys.rs:185-254`）と同じ文字列になることは無い。(2) `#` は「名前ではなく id」であることを文字列の上で示す。名前は `#` で始まりうる（接続名の文字は制限していない）ので、**`ingest:` の後ろに名前を置く形は今後も足さない**（足すなら別の接頭辞にする）。こうすれば `ingest:#12` が「id 12」と「名前 `#12`」のどちらかで迷うことが起きない |
+| 判定         | `ApiKeyContext::can_ingest(connection_id: i64) -> bool`（`ingest:#{id}` の完全一致）。`has_any_read` / `has_write_scope` / `has_admin_scope` とは直交: `ingest:` だけのキーはタグの値を読めず、`read` / `admin` のキーは送れない                                                                                                                                                                                              |
+| 接続への束縛 | 要求のパスの id（§6）とスコープの id を照合し、その接続の今のプロトコル（`push`）・有効を確かめる。**改名には追従する**（キーも送り手の URL も壊れない）。削除した接続の id は再利用されない（§5.1）ので、削除して同じ名前で作り直しても古いキーは通らない（新しい id になる）                                                                                                                                                |
+| セッション   | 管理 UI のセッションでは送れない（403 `session_token_cannot_ingest`。書き込みと同じ「機械のキーだけ」、`tag_space.rs:1192`）                                                                                                                                                                                                                                                                                                  |
+| キーの作成   | 既存の `POST /api/api-keys`（`rest/api_keys.rs:219-221`）と MCP の発行ツールに `ingest:` を通すだけ。UI（`apiKeysAdmin.ts` とキーの作成画面）に「取り込み（接続を選ぶ）」を足す                                                                                                                                                                                                                                               |
+| キーの一覧   | `GET /api/api-keys` はスコープの文字列をそのまま返す（変えない）。UI（とMCP の一覧）は `ingest:#12` を接続の一覧から引いた**今の名前**で「取り込み: Bridge1（#12）」と出す。接続が無ければ「取り込み: （削除済み #12）」と出し、そのキーは送れない（fail-closed。送れば 403 `missing_ingest_scope` ではなく 404 `unknown_connection`、§6）                                                                                    |
+| 関門         | `write_path` の関門（`writable`・受付トグル・書き込みの頻度・log-before-write・broker の直列化）は**通さない**。PLC への書き込みではなく、値はタグの現在値（収集のキャッシュ）にしか入らない。PLC 側の安全（tag-server-design §6）に関わらない。代わりに §7 の上限と §8 の監査を持つ                                                                                                                                          |
+| トリップ     | 上限の超過ではトリップしない（§7）。トリップ中のキー（書き込みで超過したもの）は今の照合どおり 403 `key_tripped`                                                                                                                                                                                                                                                                                                              |
+
+### 5.1 id が再利用されないこと・設定パッケージとの関係
+
+- `plc_connections.id` は `INTEGER PRIMARY KEY AUTOINCREMENT`（`migrations/0001_plc_connections.sql:7`、再構築後も `0004:72` ほか同じ定義）。SQLite の AUTOINCREMENT は `sqlite_sequence` の高水位より小さい id を出さないので、**削除した id は同じ表の中で再利用されない**。
+- ただし**表を作り直す migration が `sqlite_sequence` を引き継がないと、高水位が残った行の最大 id に戻り、削除済みの id が再び出る**。コードの事実: `0004` / `0007` / `0014` は引き継がなかった（`0004` の header `:58-63`「an id freed by an earlier DELETE can be reused after this migration. Harmless」）。`0019` 以降は引き継いでいる（`0019` の header「AUTOINCREMENT の採番位置を引き継ぐ」、テスト `plc_connection.rs:3896` の `migration_0019_preserves_rows_sequence_and_foreign_keys_on_a_populated_database` が `sqlite_sequence` を前後で比べる `:4035-4040`・`:4182-4187`）。`ingest:#{id}` のキーは `0023` の後にしか発行できないので、`0019` より前の再利用は関係しない。
+- **`0023` の決まり**: `plc_connections` を `id INTEGER PRIMARY KEY AUTOINCREMENT` のまま作り直し、`0019` と同じ書き方で `sqlite_sequence` の高水位（大きい方）を新しい表へ写す。テスト（R2a-2a）: populated な DB で最大でない id と最大の id の行を消してから `0023` を当て、(1) `sqlite_sequence` が前後で同じ、(2) その後に作った接続の id が消す前の最大 id より大きい（消した id が出ない）、を確かめる。**R2b-1 で `plc_connections` を作り直すときも同じ決まりとテストを守る**（R2b-1 の指示書に書く。破ると古い `ingest:#{id}` のキーが別の接続に通る）。
+- **設定パッケージ**: 今の設定パッケージは API キーを持ち運ばない（`configPackage.ts:50-63` の除外の一覧に `api_keys.key_hash`。キーの節そのものが無い）。`ingest:` のキーも持ち運ばない。別の Hub に取り込むと接続の id は変わる（取り込みは REST の作成を呼ぶので新しい id が付く）ので、**取り込み先の Hub でキーを発行し直し、ブリッジ・送り手の設定（URL の id とキー）を直す**。運用ガイドと取り込みの結果の画面に「取り込みのキーは移りません」と出す。`settings.bridge.db_connection_id` は名前（`dbConnectionName`）で持ち運ぶ（§3.1）ので、取り込み先で付け直される。
+
+## 6. 送信口
+
+両方とも `require_ingest_auth`（新設）の下に置く。`require_tag_space_auth`（read を要求、`tag_space.rs:1140`）の下には置かない。照合は `ApiKeysService::check` → `api_key_verdict` → `api_key_rejection_response`（今の 3 経路と同じ）。`Sec-WebSocket-Protocol` からのトークン取り出し（`rest.rs:533-546`）は**広げない**（ブラウザの送り手は対象にしない）。
+
+| 応答                                 | いつ                                                                                                           | 監査（§8）         |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------- | ------------------ |
+| 401                                  | トークンなし・キーが存在しない / 失効 / 期限切れ                                                               | 失効・期限切れだけ |
+| 403 `key_tripped`                    | トリップ中                                                                                                     | する               |
+| 404 `unknown_connection`（パスの形） | パスの `{id}` が正規形の 10 進でない（`012`・`-1`・名前など）。スコープを見る前に断る（id の存在には触れない） | しない             |
+| 403 `missing_ingest_scope`           | キーは有効だがその id の `ingest:#{id}` が無い。**接続の有無はここでは明かさない**                             | する               |
+| 403 `session_token_cannot_ingest`    | セッションのトークン                                                                                           | しない             |
+| 404 `unknown_connection`             | スコープは合うが、その id の接続が無い（削除済み）・`push` でない                                              | する               |
+| 409 `connection_disabled`            | 接続が無効                                                                                                     | しない             |
+| 409 `stale_epoch`（REST）            | ブリッジの接続で `epoch` が無い・今のものと違う（§4.6）。WS は `error` で返す                                  | しない             |
+| 500                                  | 照合できない（#434）                                                                                           | しない             |
+
+### 6.1 WebSocket: `GET /api/v1/ingest/{id}/stream`
+
+`{id}` は接続 id の 10 進（2026-10-21 オーナー決定 Q9 = (b)。改名しても URL は変わらない）。`Authorization: Bearer bh_...` で認証してから upgrade。1 つの接続に開ける WS は 1 本で、2 本目が来たら**古い方を閉じて新しい方を使う**（close 1008 `superseded`。半開きの TCP が残ったときに送り手が復帰できる。§12 Q10）。
+
+```jsonc
+// 送り手 → Hub
+{ "op": "values", "seq": 17, "epoch": 3, "items": [ { "key": "line1.temp", "v": 12.5, "q": "good", "t": 1761000000000 } ] }
+{ "op": "ping", "seq": 18 }
+{ "op": "status", "detail": "line1: クエリが失敗しました（...）" }   // 任意。1 KiB まで。状態画面に出す（§9）
+// Hub → 送り手
+{ "op": "welcome", "connection_id": 12, "connection": "Bridge1", "collecting": true, "epoch": 3,
+  "stale_timeout_ms": 10000, "limits": { "max_items": 1000, "max_message_bytes": 262144, "messages_per_sec": 20, "items_per_sec": 5000 } }
+{ "op": "ack", "seq": 17, "accepted": 1, "rejected": [ { "index": 0, "key": "line1.tmp", "code": "unknown_key" } ] }
+{ "op": "pong", "seq": 18 }
+{ "op": "error", "seq": 19, "code": "too_many_items" | "rate_limited" | "invalid_message" | "stale_epoch", "detail": "..." }  // メッセージ全体を断った
+{ "op": "state", "collecting": false, "epoch": 4, "config_changed": false }   // 収集の開始・停止・ブリッジの設定の変更のたびに（§4.5・§4.6）
+```
+
+- `seq` は送り手が付ける任意の整数（応答の対応付けだけ。順序の検査はしない）。`epoch` はブリッジの接続で必須、一般の送り手では任意（§4.6）。`welcome` の `connection` は今の名前（表示用。束縛は `connection_id`）。`values` 1 件ごとに `ack` を 1 つ返す。`t`（発生時刻、epoch ms）は任意で、v1 は保持して状態に出すだけ（鮮度・記録の時刻には使わない。H4。記録の時刻は収集の周期）。
+- テキストのフレームだけ受ける。バイナリ・解析できない JSON は `error` `invalid_message`。メッセージが 256 KiB を超えたら close 1009。
+- 再検証は `/api/v1/stream` と同じ `Revalidator`（15 秒、`stream.rs:395-446`）で、失効等は close 1008（`api_key_revoked` ほか）。加えて `IngestHub::commit` で接続のプロトコル・有効が変わったら close 1008 `connection_changed`、削除されたら `connection_removed`。**改名では閉じない**（束縛は id）。
+- 送信キューは `/api/v1/stream` と同じく容量を持ち、満杯なら close 1013（`ack` を読まない送り手で Hub のメモリが膨らまない）。
+- 「Live」は §4.3 の式で決める（WS が開いていることそのものではない）。
+
+### 6.2 REST: `POST /api/v1/ingest/{id}/values`
+
+```jsonc
+// 要求（Content-Type: application/json、1 MiB まで）
+{ "epoch": 3, "items": [ { "key": "line1.temp", "v": 12.5, "q": "good", "t": 1761000000000 }, { "key": "line1.run", "v": true } ] }
+// 200（一部を断っても 200。T20-3a の一括書き込みと同じ「件ごとの結果」）
+{ "accepted": 1, "rejected": [ { "index": 1, "key": "line1.run", "code": "unknown_key" } ], "collecting": true, "epoch": 3, "stale_timeout_ms": 10000 }
+```
+
+- 400 `invalid_message`（JSON・形の誤り）、409 `stale_epoch`、413（本文の上限）、422 `too_many_items`、429 `rate_limited`（`Retry-After`）。これらは全体を断り、何も反映しない。
+- 受け付けた要求は `last_seen_ms` を進める（§4.3）。REST だけの送り手は `stale_timeout_ms` より短い間隔で送る。
+- OpenAPI（`/api/v1/openapi.json`）に載せる。スナップショット `openapi_snapshot_matches` は意図して更新する（R2a-2c の完了条件に差分を貼る）。WebSocket は OpenAPI に載せない（`/api/v1/stream` と同じ）。
+
+### 6.3 件ごとの検証（WS と REST で共通、純関数 `validate_item`）
+
+| `code`              | 条件                                                                                                     | 監査                           |
+| ------------------- | -------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| （受け付け）        | キーが登録済み・有効、値と品質が下の規則に合う                                                           | しない                         |
+| `unknown_key`       | その接続に無いキー                                                                                       | キーごとに 1 時間に 1 回（§8） |
+| `inactive_key`      | 登録はあるがタグ・グループが無効                                                                         | しない                         |
+| `not_in_bridge_set` | ブリッジの接続で、`settings.bridge` の対応に無いキー（タグは登録されている。§4.6）                       | しない                         |
+| `duplicate_key`     | 同じメッセージに同じキーが 2 回（後の方を断る）                                                          | しない                         |
+| `invalid_value`     | `v` が数値・bool・null 以外 / `bit` のタグに 0・1・bool 以外 / `q` が `good`（省略を含む）で `v` が null | しない                         |
+| `invalid_quality`   | `q` が `good` / `stale` / `bad` 以外（不明を Bad に丸めず断る）                                          | しない                         |
+| `invalid_time`      | `t` が整数でない                                                                                         | しない                         |
+
+- 数値の範囲は見ない（`i16` のタグに 70000 も受ける）。`db_source` と `hub` のタグも範囲を見ないので、同じ値になる（§10.4）。非有限値は JSON に書けない。
+- **浮動小数の読み取りは往復で一致させる**: workspace の `serde_json` は `float_roundtrip` を付けていない（`Cargo.lock` の 1.0.154 の依存に無い）。既定の解析は最後の桁がずれうるので、Hub（`banto-hub-core`）で `serde_json/float_roundtrip` を有効にする（新しい crate は増えない。§10.4 の一致の前提）。
+
+## 7. 上限（§12 Q4）
+
+| 対象                                            | 既定                                 | 超えたとき                                                            |
+| ----------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------- |
+| 1 メッセージの件数                              | 1,000                                | 全体を断る（WS `error` `too_many_items` / REST 422）                  |
+| WS の 1 メッセージ・1 フレーム                  | 256 KiB                              | close 1009（`WebSocketUpgrade::max_message_size` / `max_frame_size`） |
+| REST の本文                                     | 1 MiB                                | 413（`DefaultBodyLimit`、このルートだけ）                             |
+| メッセージの頻度（接続ごと、WS と REST の合計） | 20 / 秒、瞬間 40（トークンバケット） | 全体を断る（`rate_limited` / 429）。切断しない・トリップしない        |
+| 件数の頻度（接続ごと）                          | 5,000 / 秒、瞬間 10,000              | 同上                                                                  |
+| WS の本数                                       | 接続ごとに 1（新しい方を使う）       | 古い方を close 1008 `superseded`                                      |
+| `status` の detail                              | 1 KiB                                | 切り詰める                                                            |
+| 保持値                                          | 登録済みのキーだけ                   | 未知のキーは保持しない（メモリはタグ数で頭打ち）                      |
+
+- 値は Hub の起動中の固定値（`write_rate.rs` と同じく T2 の流儀。設定に昇格するのは必要が出てから）。上限は `welcome` と REST の 429 の本文で送り手に知らせる。
+- 頻度を超えた送り手を切らない理由: DB ブリッジの不具合で頻度が上がったとき、切ると再接続の嵐になり、Live の判定も乱れる。断ったメッセージの分だけ値が遅れるが、次の周期で追いつく。
+- 上限の数値は `banto-tags` の定数 `PUSH_LIMITS` に 1 か所で置き、受信（core）・登録時の見積もり（`validate_push_settings`）・ブリッジ（`welcome` で受けた値）が同じ値を使う。
+
+### 7.1 ブリッジの送信の単位と上限（2026-10-21 レビュー P2 で追加）
+
+**問題**: 初版はブリッジが「1 周期 = 1 メッセージ（そのクエリの全キー）」で送るとしていた。`settings` は 64 KiB まで書けるので 1,000 件を超える対応も正しい設定として通り、その設定では毎回 `too_many_items` で全体が断られて値が 1 つも届かない。周期 100 ms のクエリが 3 本あれば 30 メッセージ/秒で、持続の上限 20 を超える。キーは 256 文字（UTF-8 で最大 1 KiB）まで書けるので、1,000 件でも 256 KiB を超えうる。
+
+**決め方（推奨は両方を組み合わせる。§12 Q18）**:
+
+1. **登録時に断る（(b)）**: `validate_push_settings` が `bridge_load`（純関数）で接続全体の量を見積もり、上限の **8 割**を超える設定を断る（残りの 2 割は `ping`・`status`・瞬間の重なりの余裕）。
+
+   ```text
+   クエリ q ごと:
+     item_bytes(q)  = Σ (key の UTF-8 バイト数 + 96)          // 1 件の JSON の最悪の大きさの見積もり（値・品質・時刻・区切り）
+     msgs(q)        = max(ceil(件数(q) / 1000), ceil((item_bytes(q) + 512) / (256 KiB − 512)))   // 1 周期のメッセージ数
+     per_sec(q)     = 1000 / period_ms(q)
+   接続の合計:
+     messages/s = Σ msgs(q) × per_sec(q)   ≤ 16（20 の 8 割）
+     items/s    = Σ 件数(q) × per_sec(q)   ≤ 4,000（5,000 の 8 割）
+   ```
+
+   断るときは項目のエラーに「この設定は 1 秒あたり約 {m} メッセージ・{n} 件になり、上限（{16} メッセージ・{4,000} 件）を超えます。周期を長くするか、クエリを別の `push` 接続に分けてください」と出す。1 クエリの件数そのものの上限は設けない（分けて送るので、8 割の範囲なら 1,000 件を超えてもよい）。
+
+2. **ブリッジが分けて送り、速さを抑える（(a)）**: 1 周期の値を、件数 1,000 件以下かつ JSON で 256 KiB − 512 バイト以下になるように**複数のメッセージに分けて**送る（同じ `epoch`、`seq` は連番）。接続ごとに `welcome` の上限の 8 割のトークンバケットを持ち、それを超える分は待たせる。送りきる前に同じクエリの次の周期の値が出たら、**まだ送っていない古い周期の分を捨てて新しい方を送る**（最新を優先。キューを膨らませない）。捨てた数は `status` で知らせる。分けて送ると 1 周期の値が 2 つのスナップショットにまたがることがあるが、次の tick でそろう（§10.4 は落ち着いた後で比べる）。
+3. **UI に見積もりを出す（(b) の表示）**: 接続のフォームのブリッジの区画に、クエリごとの件数・1 周期のメッセージ数と、接続の合計「約 {m} メッセージ/秒・{n} 件/秒（上限の 8 割: 16・4,000）」をその場で出し、超えたら保存の前に赤で示す（計算は `bridge_load` と同じ式を TS に写し、Rust の表のテストの値を fixtures にして一致させる）。
+
+- 一般の送り手（REST のスクリプト等）は登録時に量が分からないので見積もらない。§7 の上限と `429` / `rate_limited` で守る。
+- (a) だけだと、上限を超える設定が保存できてしまい、ブリッジが待ち・捨てを続けて値が常に遅れる（設定の誤りに気づけない）。(b) だけだと、キーの長さの見積もりの外れや瞬間の重なりで断られうる。両方なら、通る設定は必ず送りきれ、送れない設定は保存の時点で分かる。
+
+## 8. 監査
+
+`AuditLogService::record` を使う（保留つき、§1.8）。`resource: "ingest"`、`entity_id` は接続 id、`origin: "ingest"`、`detail` は `api_key_id`・`api_key_name`・`connection_id`・`connection_name_snapshot`（その時点の名前。改名・削除の後も読めるように控える。書き込み監査の `api_key_name_snapshot` と同じ考え方）・`peer`（IP:port）・`transport`（`ws` / `rest`）と事象ごとの項目。値そのものは載せない。
+
+| 事象       | `action`                | `result` | いつ・どれだけ                                                                                                                                                                                                                   |
+| ---------- | ----------------------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 接続       | `ingest_connected`      | `ok`     | WS を開いたとき（REST は記録しない - 要求ごとになるため。REST の送り手は状態に出す）                                                                                                                                             |
+| 切断       | `ingest_disconnected`   | `ok`     | WS を閉じたとき。`reason`（`client_closed` / `superseded` / `revoked` / `connection_changed` / `backpressure` / `message_too_big` / `server_shutdown`）、受け付けた件数                                                          |
+| 認証の失敗 | `denied`                | `denied` | 失効・期限切れ・トリップのキー（`resource: "api_keys"`、今の `/api/v1/*` と同じ）。`missing_ingest_scope`・`unknown_connection` は `resource: "ingest"`、`entity_id` はパスの id（削除済みの id でも記録する。名前の控えは無い） |
+| 未知のキー | `ingest_unknown_key`    | `denied` | (接続, キー) ごとに 1 時間に 1 回。1 時間に 100 キーを超えた分は数だけを 1 行（`suppressed`）                                                                                                                                    |
+| 上限の超過 | `ingest_limit_exceeded` | `denied` | 超過が**始まったとき**に 1 行（種類・上限値）。終わったとき `ingest_limit_cleared`（断った件数）。append-health の端の規則と同じ（`task.rs:1037-1073`）                                                                          |
+
+- 存在しないキーでの試行は今と同じく監査しない（だれか分からないノイズ）。
+- `collect_events` には別に `plc_connected` / `plc_disconnected` / `plc_reconnected`（リンクの端、§1.1）が残る。監査は「だれがどのキーで送ったか」、事象は「値が届いているか」。
+
+## 9. 状態の表示
+
+- `GET /api/status`（管理）と `GET /api/v1/status` に `ingest` 節を足す（`db_source` 節 `tag_space.rs:861` と同じ並び）:
+
+```jsonc
+"ingest": [ {
+  "connectionId": 12, "name": "Bridge1", "link": "live" | "down", "lastSeenAt": 1761000000000, "staleTimeoutMs": 10000,
+  "collecting": true, "epoch": 3,
+  "senders": [ { "transport": "ws", "apiKeyName": "db-bridge", "peer": "127.0.0.1:53122", "connectedAt": 1760999000000 } ],
+  "accepted": 120345, "rejected": 2, "rateLimited": 0,
+  "unknownKeys": [ "line1.tmp" ],           // 直近の 20 件まで
+  "lastSourceTime": 1760999999000,          // 受けた t の最大（任意）
+  "senderStatus": "line1: クエリが失敗しました（...）"   // 最後の status（任意）
+} ]
+```
+
+- 接続の状態（`ConnectionStatusEntry`）は今のまま `Connected` / `Reconnecting { attempt: 0 }` を出す。UI は `push` 接続では `attempt: 0` を「送り手待ち」と表示し、ドロワーに `ingest` 節を出す（R2a-2e）。
+- 送り手の `status` の文言は送り手が整える（ブリッジは `sanitize_postgres_error` を通す）。Hub は制御文字を落として切り詰めるだけ。
+
+## 10. DB ブリッジ（R2a-3）
+
+### 10.1 共有 crate `banto-db-source`（R2a-3a）
+
+`db_source` から次を `crates/banto-db-source` へ移し（`git mv`）、Hub の `db_source` はそれを使う形にする（振る舞い不変、`db_source` のテストはそのまま通す）。
+
+| 移すもの                                                                                                        | 元                                        |
+| --------------------------------------------------------------------------------------------------------------- | ----------------------------------------- |
+| `ColumnKind`・`describe_wrapper_sql`・`build_wrapper_sql`・`quote_ident`・`describe_columns`                    | `db_source/convert.rs`                    |
+| `resolve_group`（列名 → タグの対応、未対応型の Bad）                                                            | `db_source/plan.rs:160`                   |
+| 品質の梯子（純関数の状態機械: 成功・NULL・0 行・クエリ失敗 1 回目は直前値で Stale・2 回目で Bad・接続断で Bad） | `db_source/task.rs:598-713` の判断部分    |
+| `sanitize_postgres_error`・`pg_connect_options`                                                                 | `db_source/mod.rs:114`・`:645`            |
+| `validate_query_sql`（今は `banto-tags`）                                                                       | 移さない（`banto-tags` のまま両方が呼ぶ） |
+
+- 依存は `sqlx`（`postgres`）だけ。Hub と sink の両方が既に持つ。Hub 内の Source とブリッジが**同じ変換と同じ梯子**を使うので、§10.4 の一致が構造で保たれ、R2b-8 で `db_source` を消すときもブリッジ側は変わらない。
+
+### 10.2 設定の取得: `GET /api/ingest/bridge-config`（R2a-3b、Hub）
+
+- `require_sink_admin` と同じゲート（`admin` スコープのキーか admin ロールのセッション）。パスワードを平文で返すので、初回に Sink と同じ warn を出し、ループバックの運用を docs と UI に書く（external-db §2.2・§6-15 の延長）。
+- 応答: 有効な `push` 接続のうち `settings.bridge.kind == "db"` のもの。
+
+```jsonc
+{
+	"generatedAt": 1761000000000,
+	"sources": [
+		{
+			"connectionId": 12, // 送信の URL とスコープ（ingest:#12）はこの id
+			"name": "Bridge1", // 表示・ログ用
+			"staleTimeoutMs": 10000,
+			"configFingerprint": "sha256:…", // settings.bridge の指紋（§4.6 の設定の変更と同じ）
+			"queries": [
+				{
+					"name": "line1",
+					"periodMs": 1000,
+					"sql": "...",
+					"columns": [{ "column": "temp", "key": "line1.temp" }]
+				}
+			],
+			"db": {
+				"id": 7,
+				"name": "pg-a",
+				"host": "db01",
+				"port": 5432,
+				"database": "mes",
+				"username": "reader",
+				"password": "..."
+			}
+		}
+	]
+}
+```
+
+- `/api/sink/config` に混ぜない（Sink の設定は Sink のグループの単位で、取り込みとは寿命が違う。§12 Q13 決定）。
+- 登録時に §7.1 の見積もりを通った設定だけがここに出る（保存できない設定はそもそも無い）。
+
+### 10.3 ブリッジの動き（R2a-3b、`apps/banto-hub-sink/src/source/`）
+
+| 項目         | 内容                                                                                                                                                                                                                                                                                                                                                               |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 設定         | `config_refresh_secs`（既存）ごとに `GET /api/ingest/bridge-config`。差分で source を起動・停止。toml の項目は増やさない。API キーは今の 1 本に `ingest:#{id}` を足す（`admin` + `read` + `ingest:#12` …）。スコープの無い接続は状態に「権限なし」と出して動かさない。`configFingerprint` が変わった source は問い合わせを止め、新しい設定で describe からやり直す |
+| 送信         | source ごとに WS を 1 本（`/api/v1/ingest/{connectionId}/stream`、`tokio-tungstenite`。改名しても URL は同じ）。切れたら 1 秒 → 30 秒のバックオフ。`values` を送っていない間だけ `stale_timeout_ms / 3` ごとに `ping`。送る `values` には `welcome` / `state` で受けた今の `epoch` を付ける。`stale_epoch` で断られた分は送り直さない（次の `state` を待つ）       |
+| 読み取り     | source ごとに `PgPool`（最大 2）。クエリごとに最小デッドライン方式（`db_source` と同じ）。起動時と再接続後に describe → ラッパー SQL。結果の先頭行の列を `columns` で `key` に写す。1 周期の値は §7.1 の (a) のとおり件数・バイト数で分け、接続ごとのトークンバケットで速さを抑えて送る（送りきる前に次の周期が出たら古い方を捨てる）                              |
+| 品質         | 共有 crate の梯子をそのまま使う。成功: `q: good`。NULL・未対応型・列なし: `q: bad`。0 行: 全キー `bad`。クエリ失敗 1 回目: 直前値で `stale`（直前値が無ければ `bad`）、2 回目から `bad`。DB の接続断: 全キー `bad` を送ってからバックオフ                                                                                                                          |
+| 収集の停止   | `state { collecting: false }` で問い合わせを止めてプールを閉じる。`state { collecting: true, epoch }` で describe からやり直し、すぐ最初の問い合わせをしてその周期の全キーを新しい epoch で送る（§4.5。Hub は開始の時点で保持値を捨てているので、これが届くまでタグは Bad）                                                                                        |
+| 設定の変更   | `state { config_changed: true, epoch }` を受けたら `config_refresh_secs` を待たずに `GET /api/ingest/bridge-config` を取り直し、新しい設定と epoch で最初の周期から送る（§4.6）                                                                                                                                                                                    |
+| タスクの異常 | クエリのタスクが落ちたら、監督が作り直す前にそのクエリの全キーへ `bad` を送る（`ping` だけ続いて古い値が残らないように。Hub 側でも送る集合の外は受けない）                                                                                                                                                                                                         |
+| 状態         | DB 側の失敗は `status` で Hub に送る（`sanitize_postgres_error` を通した文）。Sink の `PUT /api/sink/status` には載せない                                                                                                                                                                                                                                          |
+| 停止         | 今の停止予算（external-db §5.6）の中で WS を閉じる（close 1000）。値の flush は無い（送れなかった周期は捨てる）                                                                                                                                                                                                                                                    |
+
+- Sink のエンジン（購読 → INSERT）と同じプロセスで動かす。片方の不具合がもう片方を止めないよう、source は別のタスク群で、設定の取得の失敗は互いに独立に扱う。
+
+### 10.4 併用と突き合わせ（R2a-3c、完了条件）
+
+**テスト**: `apps/banto-hub-sink/tests/bridge_parity.rs`（`tests/sidecar.rs` と同じくプロセス内の Hub と `BANTO_TEST_PG_URL`。CI は `ci.yml:477-512` のジョブの `cargo test -p banto-hub-sink` で走る）。
+
+構成: PostgreSQL に表を作る。Hub に `postgres` 接続 P（グループの `query_sql` = 同じ SQL、`db` タグ = 列名）と `push` 接続 Q（`bridge.db_connection_id = P`、同じ SQL、`columns` = 同じ列、タグのキー = 列）。ブリッジの source を同じプロセスで動かす。両方のタグを `read_current` で読み、**落ち着いた後**（両方が上限つきの待ちで同じ状態に着く）の値と品質を比べる。時刻（`ptime`）と `value_source`（`db` / `push`）は比べない。
+
+| #   | 場面                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 期待（両方）                                                                                            |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------- |
+| 1   | int・numeric・float・bool・timestamp の列                                                                                                                                                                                                                                                                                                                                                                                                              | 同じ値（f64 でビット一致）・Good                                                                        |
+| 2   | NULL の列                                                                                                                                                                                                                                                                                                                                                                                                                                              | Bad                                                                                                     |
+| 3   | text の列・SQL に無い列                                                                                                                                                                                                                                                                                                                                                                                                                                | Bad                                                                                                     |
+| 4   | 0 行                                                                                                                                                                                                                                                                                                                                                                                                                                                   | Bad                                                                                                     |
+| 5   | クエリの失敗（表を消す）                                                                                                                                                                                                                                                                                                                                                                                                                               | 1 回目に直前値で Stale、2 回目から Bad。表を戻すと Good                                                 |
+| 6   | DB の停止（接続を断つ）                                                                                                                                                                                                                                                                                                                                                                                                                                | Bad。復帰で Good                                                                                        |
+| 7   | 収集の停止・開始                                                                                                                                                                                                                                                                                                                                                                                                                                       | 停止で Bad。開始の直後の最初の tick は Bad（停止前の Good を記録しない）、新しい問い合わせの後で Good   |
+| 7b  | （ブリッジだけ）開始の直後に DB を止めておく                                                                                                                                                                                                                                                                                                                                                                                                           | 開始の後、停止前の値で Good にならず Bad のまま（`ping` が続いていても）。tstore に停止前の値の行が無い |
+| 7c  | （ブリッジだけ）`columns` から 1 つ外す（タグは残す）                                                                                                                                                                                                                                                                                                                                                                                                  | 外したキーは設定の commit で Bad。残りは次の周期で Good。外したキーの値を送っても `not_in_bridge_set`   |
+| 8   | （ブリッジだけ）ブリッジを止める                                                                                                                                                                                                                                                                                                                                                                                                                       | `stale_timeout_ms` 以内は直前の状態、その後 Bad                                                         |
+| 9   | （ブリッジだけ）見積もりの上限ちょうどの設定（受理される例: 周期 500 ms のクエリ 3 本、A は 1,800 件で 2 メッセージに分かれ 4 メッセージ/秒・3,600 件/秒、B・C は各 100 件で各 2 メッセージ/秒・200 件/秒。合計 8 メッセージ/秒・4,000 件/秒で、件数が 8 割の上限ちょうど。拒否される例は同じ構成で A の周期だけ 200 ms にしたもの（A だけで 10 メッセージ/秒・9,000 件/秒）で、登録の時点で `FieldError` になることを R2a-3b の単体テストで確かめる） | 60 秒の間 `rate_limited` / `too_many_items` が 0 件、全キーが毎周期 Good で、Hub 内の Source と同じ値   |
+
+- 5 は 2 つの Source が別々に問い合わせるので「同じ瞬間に同じ」ではなく「同じ状態の並びを通る」ことを確かめる（同じ梯子の実装なので並びは同じ）。
+- 反証: ブリッジの梯子を 1 か所変える（2 回目も Stale）と 5 が落ちること、`float_roundtrip` を外すと 1 の境界値（例 `0.1 + 0.2` 相当の値）が落ちうることを 1 回ずつ手で確かめて PR に書く（checklist §5）。
+- 実機の確かめ（S7 と同じ手順に B-16 以降を足す）は [external-db-test-2026-09.md](external-db-test-2026-09.md) に追記し、オーナー同席で行う。
+
+## 11. PR の分け方（R2a-1〜R2a-3 の詳細化）
+
+共通の決まり: 各 PR で `cargo fmt --all --check` → `cargo test -p <触った crate>` → `cargo clippy -p <触った crate> --all-targets -- -D warnings` → 公開 API の形を変える PR は `cargo check --workspace --all-targets`（checklist §2-3）→ TS を触った PR は eslint・`pnpm --filter banto-hub check`・`test` → `pnpm exec prettier --write <触った md/ts/svelte>` → 新しい crate・ディレクトリは `ci-changes.test.mjs` の固定グラフに足して `git add` 後に `node --test .github/scripts/ci-changes.test.mjs` → `cargo deny check`。Hub の E2E は R2a-2e だけ。**R2a-2a は migration を含むので revert では戻らない**（DB は前の版の Hub で開けなくなる。`0019` 以降と同じ扱い）。順番は表の上から（R2a-2a を R2a-1c より前に置く: Hub の統合テストが `push` の行を作るため）。
+
+| PR     | 範囲                                                                                                                                                                                                                                                                                                                                                                                                                                                | 触るファイル                                                                                                                                                                                                                                              | 完了の確かめ                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | 安全の見どころ                                                                                                                                                                                                               |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R2a-1a | `ExternalSource::snapshot(&self, connection_key)`。`run_external_connection` が自分のキーで引く。`MISSING_EXTERNAL_SOURCE` の文言の一般化。ChronoGazer の `HubSampler` は引数を無視                                                                                                                                                                                                                                                                 | `crates/banto-collect/src/{external.rs,task.rs,collector.rs}`（テストの `MockSource` を含む）、`apps/chronogazer/core/src/hub.rs`                                                                                                                         | 既存テスト全通過（件数が前後で同じ）。新テスト: 2 つの外部接続に別々のリンク状態を返す源で、片方だけ `plc_disconnected` になる                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   | 振る舞い不変。ChronoGazer の記録が変わらないこと                                                                                                                                                                             |
+| R2a-1b | `PushSource`・`ResolvedConnection::Push`・`ExclusionReason::PushSourceUnavailable`・`build_config_from_with`。`banto-tags` に定数 `PUSH_PROTOCOL` だけ足す（`ALLOWED_PROTOCOLS` は変えない）                                                                                                                                                                                                                                                        | `crates/banto-collect/src/config.rs`、`crates/banto-tags/src/{plc_connection.rs,lib.rs}`                                                                                                                                                                  | `RegistrySnapshot` を手で組んだ単体テスト: Available で外部計画（キー = 前後の空白を除いた address、スケーリングなし、string は除外）、Unavailable で除外理由。既存の golden（strict の文言）が変わらない                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | ChronoGazer の計画に `push` が入らない                                                                                                                                                                                       |
+| R2a-2a | 接続の種類 `push`: migration `0023`（`CHECK` + `settings` 列）と `0024`（キーの一意のトリガ）、`ALLOWED_PROTOCOLS`、正規化、`validate_push_settings`、`validate_push_key`、`push_tag_errors`、`PlcConnection(Input).settings`（リテラル 186 か所）、`COLUMNS`・`load_connection`、`PushDriver: DriverBase`（core、登録しない）                                                                                                                      | `crates/banto-tags/{migrations/0023_*.sql,migrations/0024_*.sql,src/plc_connection.rs,src/tag.rs,src/lib.rs}`、`crates/banto-collect/src/config.rs`（SELECT）、`apps/banto-hub/core/src/ingest/driver.rs`、リテラルのある全ファイル                       | populated な DB への `0023` / `0024` の適用テスト（行・`sqlite_sequence`・FK・トリガ・部分一意索引が残る）。`ALLOWED_PROTOCOLS` と `CHECK` の双方向のテストが `push` で通る。`PushDriver` が `static_checks`（C1・C2）を通る。**id を再利用しない**: 最大でない id と最大の id の行を消してから `0023` を当て、`sqlite_sequence` が前後で同じ・その後に作った接続の id が消す前の最大より大きい（§5.1）。**`bridge_load` の境界値**（§7.1）: 1 クエリ 1,000 件 → 1 メッセージ、1,001 件 → 2 メッセージ、バイト数で分かれる長いキー、合計 16 メッセージ/秒ちょうど・4,000 件/秒ちょうどは通り、それぞれ 1 つ超えると断る。**複数クエリの合計**: 周期 100 ms のクエリ 3 本（30 メッセージ/秒）は断り、200 ms の 3 本（15）は通る。`cargo check --workspace --all-targets`                                                          | migration の列の写し漏れ（`cpu_type`）。AUTOINCREMENT と `sqlite_sequence` の引き継ぎ（落とすと古い `ingest:#{id}` が別の接続に通る）。`0020` のトリガの作り直し。`settings` の大きさの上限。`push` 以外で `settings` を断る |
+| R2a-1c | `IngestHub`（受信側・保持値・Live の判定・commit・epoch・送る集合）。`controller.rs` の `start_locked`（`apply_run` の前）と `stop_locked`（`manager.stop()` の後）から `on_collection_starting` / `on_collection_stopped` を呼び、`apply_run` が成功した枝（`db_source.start()` と同じ位置）から `on_collection_started` を呼ぶ。Hub の収集を `build_config_from_with(.., Available)` と `start_with_sources` に替える。`value_source` の `"push"` | `apps/banto-hub/core/src/{ingest/mod.rs,hub.rs,controller.rs,value_source.rs,lib.rs}`                                                                                                                                                                     | `IngestHub::apply` を直接呼ぶ統合テスト: 値が周期ごとに記録される、`stale` は NULL、タイムアウトで Bad と `plc_disconnected`、収集の停止で Bad、**停止前に Good だった値が開始の直後の最初の tick で Good にならない**（`ping` を送り続けても。tstore に停止前の値の行が無い）、一般の送り手は停止中に届いた値で開始の直後から Good、ブリッジの接続は開始の後の epoch の値が届くまで Bad・古い epoch のメッセージは `stale_epoch`、ブリッジの設定から外したキーは commit で Bad・その後の値は `not_in_bridge_set`、稼働中の再適用（`commit_catalog_and_apply_live`）では epoch が進まない、キーの改名で古い値が消える、`apply_config` の作り直しで保持値が残る、**`apply_run` を失敗させる（Faulted）と `collecting: true` が送られず、ブリッジが DB に接続・問い合わせを始めない**。Live の判定と §4.5 の表は純関数の表のテスト | 停止前の値が開始後に記録されない（`on_collection_starting` を `apply_run` より前に呼ぶ順序）。`snapshot` がロックを長く持たない                                                                                              |
+| R2a-2b | スコープ `ingest:#{id}`: `validate_scope`・`can_ingest(id)`。API キーの作成 UI（接続を選んで id を詰める）・一覧の表示（今の名前、無ければ「（削除済み #12）」）・MCP の発行と一覧                                                                                                                                                                                                                                                                  | `apps/banto-hub/core/src/{api_keys.rs,mcp.rs}`、`apps/banto-hub/src/lib/banto/apiKeysAdmin.ts` とキーの画面、`docs/banto-hub-mcp-reference.md`                                                                                                            | 文法の表のテスト（`ingest:#12` は通る。`ingest:`・`ingest:#`・`ingest:#0`・`ingest:#012`・`ingest:#-1`・`ingest:# 12`・`ingest:#12x`・`ingest:#*`・`ingest:Bridge1`（名前）・`i64` を超える数は断る）。一覧の表示の TS テスト（名前の解決・削除済み）。`ingest:` だけのキーが `has_any_read` / `has_admin_scope` で false、`read` だけのキーが `can_ingest` で false                                                                                                                                                                                                                                                                                                                                                                                                                                                             | 直交性（`ingest` で値が読めない、`read` で送れない）                                                                                                                                                                         |
+| R2a-2c | REST の送信口と共通部品: `require_ingest_auth`、`validate_item`、上限（バケット・本文・件数）、監査、`serde_json/float_roundtrip`、OpenAPI                                                                                                                                                                                                                                                                                                          | 新 `apps/banto-hub/core/src/ingest/{auth.rs,limits.rs,validate.rs,audit.rs,rest.rs}`、`apps/banto-hub/core/src/rest.rs`（ルーターの組み立て）、`apps/banto-hub/core/Cargo.toml`、OpenAPI のスナップショット                                               | §6 の応答の表を総当たりする統合テスト（401・403 の 3 種・404 の 2 種（パスの形・削除済みの id）・409 の 2 種・413・422・429・200 の件ごとの結果）。**改名の後も同じキーと URL で送れる**、削除して同名で作り直した接続には古いキーで送れない。**上限の境界値**: 1,000 件ちょうどは通り 1,001 件は 422、本文 1 MiB ちょうどは通り 1 バイト超は 413、21 メッセージ目（瞬間の 40 を使い切った後）は 429、件数のバケットも同様。監査の行（`denied`・`ingest_unknown_key` の抑制・`ingest_limit_exceeded` の端）。ルート一覧のスナップショットに 1 本だけ増える                                                                                                                                                                                                                                                                       | 接続の有無を 403 より前に漏らさない。セッションで送れない。本文の上限がこのルートだけに掛かる。監査に値を載せない                                                                                                            |
+| R2a-2d | WebSocket の送信口: upgrade・`welcome` / `ack` / `pong` / `error` / `state`、1 本だけ（新しい方を使う）、再検証、`connection_changed`、送信キューの背圧、close コード                                                                                                                                                                                                                                                                               | 新 `apps/banto-hub/core/src/ingest/ws.rs`、`apps/banto-hub/core/src/stream.rs`（`Revalidator` を `pub(crate)` で共用するだけ）                                                                                                                            | `tokio-tungstenite` のクライアントで: 値が収集に届く、2 本目で古い方が 1008 `superseded`、キーの失効で 1008、**接続の改名では閉じない**・無効化で `connection_changed`・削除で `connection_removed`、256 KiB ちょうどは通り 1 バイト超で 1009、収集の停止・開始とブリッジの設定の変更で `state`（epoch が進む）が届く、`ack` を読まない送り手で 1013、切断後 `stale_timeout_ms` までは Live                                                                                                                                                                                                                                                                                                                                                                                                                                      | 認証の前に upgrade しない。`Sec-WebSocket-Protocol` の取り出しを広げていない。1 本の制限と再検証の競合                                                                                                                       |
+| R2a-2e | 状態と UI: `ingest` 節（`/api/status`・`/api/v1/status`）、接続のフォームに `push`（`stale_timeout_ms` とブリッジの区画、**§7.1 の量の見積もりの表示**）、送り手向けの URL（`/api/v1/ingest/{id}/…`）とスコープ `ingest:#{id}` の表示、取り込みの結果の画面の「取り込みのキーは移りません」、ドロワーの状態、タグの登録（キーの説明）、設定パッケージの往復（`dbConnectionName`）、`postgres` 接続の削除の拒否                                      | `apps/banto-hub/core/src/rest/{tag_space.rs,admin_status.rs,plc_connections.rs}`、`apps/banto-hub/src/lib/banto/{plcConnectionForm.ts,tagAddressHelp.ts,configPackage.ts,configPackageAdmin.ts,tagRegistryAdmin.ts}`、`ConnectionDrawer.svelte`、E2E 1 本 | 単体（TS）と E2E（`push` 接続を作り、REST で送った値がタグ一覧に出る）。設定パッケージの往復テスト。量の見積もりの TS が Rust の `bridge_load` の表のテストと同じ値を出す（fixtures を共有）、上限を超える設定は保存の前に赤く示される                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 状態に資格情報・値を出さない。`status` の文言の切り詰め                                                                                                                                                                      |
+| R2a-3a | 共有 crate `banto-db-source`（§10.1）。Hub の `db_source` を載せ替える                                                                                                                                                                                                                                                                                                                                                                              | 新 `crates/banto-db-source/`、`apps/banto-hub/core/src/db_source/*`、`.github/scripts/ci-changes.{mjs,test.mjs}`（新 crate を `run_rust_db_source` の対象に）                                                                                             | `cargo test -p banto-hub-core --test db_source` と `--lib db_source` が件数そのままで通る（PostgreSQL あり）。`git log --follow` で移動が追える                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  | 振る舞い不変（梯子の境界: 直前値なしの Stale は Bad）                                                                                                                                                                        |
+| R2a-3b | Hub の `GET /api/ingest/bridge-config`。ブリッジの source（§10.3）                                                                                                                                                                                                                                                                                                                                                                                  | `apps/banto-hub/core/src/rest/ingest_bridge.rs`（新）、`apps/banto-hub-sink/src/{source/*.rs,run.rs,lib.rs,hub_api.rs}`、`apps/banto-hub-sink/Cargo.toml`（`tokio-tungstenite` を直接、`banto-db-source`）                                                | 単体: 設定の差分の適用、梯子の写し、`collecting: false` で問い合わせを止める、`state` の epoch で送り直す、送りきる前に次の周期が出たら古い方を捨てる、**送信の分割の境界値**（1,000 件 → 1 メッセージ、1,001 件 → 2、バイト数の境界でも分かれる）、トークンバケットが 8 割を超えない。統合（PostgreSQL）: 値が Hub に届く、DB 停止で `bad`、WS の切断と再接続、**複数クエリの合計**（§10.4 の 9: 上限ちょうどの 3 クエリで 60 秒間 `rate_limited` 0 件）                                                                                                                                                                                                                                                                                                                                                                        | パスワードをログ・`status` に出さない。admin のゲート。スコープの無い接続を動かさない                                                                                                                                        |
+| R2a-3c | 突き合わせのテスト（§10.4）と docs（運用ガイドのブリッジの節、検証手順 B-16〜、external-db §9.5 の実装状況）                                                                                                                                                                                                                                                                                                                                        | `apps/banto-hub-sink/tests/bridge_parity.rs`、`docs/{banto-hub-operations.md,external-db-test-2026-09.md,banto-hub-external-db-design.md,banto-hub-driver-refactor-plan.md}`                                                                              | §10.4 の 11 場面（1〜9、7b・7c）が CI の PostgreSQL ジョブで緑。反証 2 件を PR に書く。**これが R2a の完了条件**                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 | -                                                                                                                                                                                                                            |
+
+推定の規模: 1a 小、1b 中、2a 中〜大（migration と機械的なリテラル 186 か所）、1c 中、2b 小、2c 大、2d 中、2e 中（UI）、3a 中（移動）、3b 大、3c 中。モデル（CLAUDE.md の分担）: 2a のリテラルの追加は haiku、1a・1b・2b・2e・3a は sonnet、1c・2c・2d・3b（並行・認証・監査・上限）は上位。
+
+**オーナーの監査で見てほしい点（安全）**: (1) `ingest` が `read` / `write` / `admin` と直交していること（R2a-2b）。(2) 認証の前に upgrade・本文の読み込みをしない、接続の有無を権限の前に漏らさない（R2a-2c / 2d）。(3) 上限で Hub のメモリ・CPU・監査の行数が頭打ちになること（未知のキーを保持しない、監査の抑制）。(4) `write_path` を通らない代わりに、`push` のタグへの書き込みが登録時と `is_broker_managed` の二重で断られること（§1.2）。(5) `/api/ingest/bridge-config` がパスワードを返すこと（ループバックの前提、admin のゲート）。(6) migration `0023` / `0024` の写し漏れと、`sqlite_sequence` の引き継ぎ（`ingest:#{id}` の id が再利用されないことの前提、§5.1）。(7) 収集の停止・開始・ブリッジの設定の変更で停止前・変更前の Good が戻らないこと（epoch と呼ぶ順序、§4.5・§4.6）。(8) ブリッジの登録時の見積もりと送信の分割が同じ上限の定数（`PUSH_LIMITS`）を使うこと（§7.1）。
+
+## 12. オーナー判断
+
+### 12.1 決定（2026-10-21 オーナー決定）
+
+2026-10-21 にオーナーが Q1〜Q17 を決めた。**Q9 だけ推奨の (a) 接続名から (b) 接続 id へ変えた**（下の表の Q9 と §5・§5.1・§6）。ほかはすべて推奨どおり。Q11・Q15 は同日のレビュー P2 の改訂（§4.5・§4.6）で、ブリッジの接続の扱いを分けて書き直した（決定の中身は変えていない）。
+
+| Q   | 問い                                                                      | 選択肢                                                                                                                                                   | 推奨 → 決定                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| --- | ------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Q1  | `push` を R2a で `SessionDriver` にするか（api-design Q5 の決定の見直し） | (a) Hub 側の `ExternalSource`、登録は R2b-1、`DriverKind` は R2b-3 の前に決める / (b) `SessionDriver` を作る（本番では使わない）/ (c) `HostBound` で登録 | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。§2 の 3 つの事実（ホストが無い・Stale を運べない・`Err` の意味）。(b) は使われない実装、(c) はトリップワイヤ 2 を壊す                                                                                                                                                                                                                                                                                                                                                                                            |
+| Q2  | 先に作る送信口                                                            | (a) REST を先（2c）、WS を次（2d）/ (b) WS を先 / (c) 1 PR で両方                                                                                        | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。認証・検証・上限・監査の共通部品を小さい面で固めてから、セッションの寿命（1 本の制限・再検証・背圧）を足す。ブリッジは WS を使う                                                                                                                                                                                                                                                                                                                                                                                 |
+| Q3  | `stale_timeout_ms` の既定                                                 | 5 秒 / **10 秒** / 30 秒 / グループの最小周期 × 2.5                                                                                                      | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**10 秒**（接続ごとに 1 秒〜1 時間）。§4.3                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| Q4  | 上限の値と超えたときの扱い                                                | §7 の表 / それぞれ倍・半分 / 超過で切断・トリップ                                                                                                        | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**§7 の表**。超過はメッセージを断るだけで、切断もトリップもしない                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Q5  | `push` の置き場所                                                         | (a) core の `ingest/`（受信・送信口・`PushDriver`）/ (b) 静的な部分だけ `crates/banto-driver-push` / (c) 全部を crate                                    | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。I/O が Hub の認証・監査・収集そのもの。キーの文法は `banto-tags`（タグの検証が使う）。R2b-1 で host が `banto_hub_core::ingest::push_driver()` を registry に登録する                                                                                                                                                                                                                                                                                                                                            |
+| Q6  | `CHECK` の広げ方                                                          | (a) `0023` の 1 回の再構築で `push` と `settings` 列 / (b) `settings` は ADD COLUMN、`CHECK` は別の再構築 / (c) R2b-1 の撤去を待つ                       | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。再構築は 1 回で済み、`settings` は R2b-1 の JSON 化の受け皿になる。(c) は段の順番（R2a → R2b）を逆にする                                                                                                                                                                                                                                                                                                                                                                                                         |
+| Q7  | ブリッジの DB のパスワードを `banto-secret-store` へ移す時期              | R2a / **R2b-1**                                                                                                                                          | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**R2b-1**。Hub はまだ `banto-secret-store` を使っておらず、全プロトコルの秘密値の移行と一緒にやる方が 1 回で済む。R2a は新しい秘密値を作らない（Q8）                                                                                                                                                                                                                                                                                                                                                                      |
+| Q8  | ブリッジの DB の接続先の持ち方                                            | (a) 既存の `postgres` 接続を id で参照 / (b) `settings.bridge` に接続先、パスワードは `password` 列 / (c) 全部 `settings` に                             | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。Sink と同じ形で、秘匿処理（`passwordSet`・設定パッケージの除外・MCP の伏せ字）を全部流用できる。突き合わせ（§10.4）も同じ接続を使える。R2b-8 で `postgres` を消すときに (c) へ移す                                                                                                                                                                                                                                                                                                                               |
+| Q9  | スコープで接続をどう指すか                                                | (a) 接続名 / (b) 接続 id（`ingest:#12`）                                                                                                                 | **決定（2026-10-21 オーナー決定）: (b) 接続 id**（推奨の (a) から変更）。スコープは `ingest:#{id}`（`#` で名前の文法と区別し、`ingest:` の後ろに名前を置く形は足さない。§5）、送信口も `/api/v1/ingest/{id}/…`（改名でキーも URL も壊れない）。AUTOINCREMENT の id は再利用されない（`0023` で `sqlite_sequence` を引き継ぎ、テストで確かめる。§5.1）ので、削除して同名で作り直しても古いキーは通らない。UI とキーの一覧は id から今の名前を引き、無ければ「（削除済み #12）」と出して fail-closed。設定パッケージはキーを持ち運ばないので、取り込み先で発行し直す（§5.1） |
+| Q10 | 1 つの接続に 2 本目の WS が来たとき                                       | (a) 古い方を閉じて新しい方を使う / (b) 2 本目を断る                                                                                                      | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。半開きの TCP が残っても送り手が戻れる。乗っ取りは同じキーを持つ者にしかできない（監査に `superseded` が残る）                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Q11 | 収集の停止中の受信とブリッジ                                              | (a) 受信は続け `collecting: false` を知らせ、ブリッジは DB への問い合わせを止める / (b) 受信を断る（503）/ (c) 受信は続け、ブリッジも問い合わせを続ける  | **決定（2026-10-21 オーナー決定）: (a)**。受信は続け `collecting: false` を知らせ、ブリッジは DB への問い合わせを止める。**改訂（同日のレビュー P2）**: 停止の時点で全接続の保持値を捨てる。停止中に届いた値を開始後に使うのは一般の送り手だけで、ブリッジの接続は開始の時点で epoch を進めて捨て、開始後の最初の送信まで Bad（§4.5）                                                                                                                                                                                                                                      |
+| Q12 | 値の変換と品質の梯子を共有 crate にするか                                 | (a) `crates/banto-db-source` に移して両方が使う / (b) ブリッジに写す                                                                                     | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。完了条件の一致が構造で保たれる。写しは #334 / #605 と同じずれ方をする                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Q13 | ブリッジの設定の取得口                                                    | (a) 新しい `GET /api/ingest/bridge-config`（admin）/ (b) `GET /api/sink/config` に `sources` を足す                                                      | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。Sink の設定とは単位も寿命も違う。ゲートは同じ（新しい信頼の形を作らない）                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| Q14 | `push` のタグの `value_source`                                            | `"push"` / `"real"` / `"external"`                                                                                                                       | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**`"push"`**。出どころが分かる。SDK は未知のラベルを保持するので互換                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Q15 | キーごとの古さの期限                                                      | (a) v1 は持たない（リンクのタイムアウトだけ）/ (b) 接続ごとの `value_timeout_ms`（既定オフ）                                                             | **決定（2026-10-21 オーナー決定）: (a)**。一般の送り手にはキーごとの期限を持たない。**改訂（同日のレビュー P2）**: ブリッジの接続はこの規則に頼らず、送る集合と epoch で無効にする（§4.6）。on-change の送り手の需要が出たら (b) を足す                                                                                                                                                                                                                                                                                                                                    |
+| Q16 | `ExternalSource` の変え方                                                 | (a) `snapshot(&self, connection_key)` に変える / (b) 既定実装つきの `snapshot_for` を足す                                                                | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。workspace の中だけの trait で、実装は ChronoGazer の 1 つ。(b) は Hub の実装に意味の無いメソッドが残る                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Q17 | 不明な品質の綴り（`q: "uncertain"` 等）                                   | (a) その件を断る（`invalid_quality`）/ (b) Bad として受ける                                                                                              | **決定（2026-10-21 オーナー決定）: 推奨どおり**。**(a)**。送り手の誤りに気づける。どちらでも Good に丸めることはない（H4）                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+
+### 12.2 改訂で生じた問い（2026-10-21 オーナー決定）
+
+2026-10-21 のレビュー P2 の 2 件の改訂で生じた問い。**同日、Q18〜Q20 はすべて推奨どおりにオーナー決定**（Q18 = (c) 両方、Q19 = (a)、Q20 = 80 %）。
+
+| Q   | 問い                                                     | 選択肢                                                                                                                                                                 | 推奨                                                                                                                                                                                                                                                                                  |
+| --- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Q18 | ブリッジの送信の単位と受信の上限の衝突の解き方（§7.1）   | (a) ブリッジが件数・バイト数で分けて送り、接続ごとに速さを抑える / (b) 登録時に上限に収まらない設定を断り、UI に量を出す / (c) 両方                                    | **(c)**。(b) で「保存できた設定は必ず送りきれる」を保ち、(a) でキーの長さの見積もりの外れと瞬間の重なりに耐える。(a) だけでは送れない設定が保存できて値が常に遅れ、(b) だけでは境界で断られうる                                                                                       |
+| Q19 | 停止前・設定の変更前の Good を戻さない方法（§4.5・§4.6） | (a) 停止で全接続の保持値を捨て、ブリッジの接続だけ epoch で開始・設定の変更の前の値を無効にする / (b) 全接続に epoch を必須にする / (c) 停止で捨てるだけ（epoch なし） | **(a)**。一般の送り手は Q11（停止中も受ける）・Q15（キーごとの期限なし）のまま。(b) は REST のスクリプトにも epoch の往復を強い、Q11 の「停止中に届いた値で開始」を壊す。(c) は停止の直前に問い合わせた値が遷移をまたいで届くと、停止中ずっと保持されて開始の直後に Good で記録される |
+| Q20 | 登録時の見積もりの余裕（§7.1）                           | 上限の 100 % / **80 %** / 50 %                                                                                                                                         | **80 %**。残りは `ping`・`status`・同じ時刻に周期が重なる分。50 % は 100 ms の周期の設定の幅を狭めすぎ、100 % は `ping` 1 つで断られうる                                                                                                                                              |
+
+## 13. 既存の計画と食い違う点（レビューで直す候補）
+
+1〜10 は初版、11〜13 は 2026-10-21 の決定とレビューの改訂で足した。
+
+1. **api-design §12 Q5（決定済み）と §5 の `push` の段落、external-db §9.5-1・plugin-design §12.2-2**: 「R2a で `push` を `SessionDriver` に」「`DriverRegistry` に登録」→ R2a は Hub 側の `ExternalSource` で、登録は R2b-1（§2、Q1。2026-10-21 オーナー決定）。api-design の §5・§12 Q5 と refactor-plan §4 の R2a-2 の行を直す（本書の外、別の docs の変更）。
+2. **external-db §9.5-7**: ブリッジの設定に「接続先」を含める → R2a は既存の `postgres` 接続を id で参照し、`settings` に写すのは R2b-8（Q8）。パスワードの `banto-secret-store` は R2b-1（Q7）。
+3. **refactor-plan §3・§4 の R2b-1「接続設定を固定列から JSON へ」**: `plc_connections.settings` 列は R2a で先に足す（`push` だけが使う）。R2b-1 はこの列を全プロトコルに広げる形になる（Q6）。
+4. **external-db §9.5-1「`hub` 接続と同じ種類」**: 今の `ExternalSource` は 1 つの収集に 1 つ・リンク状態が 1 つで、そのままでは `push` 接続を複数持てない。R2a-1a で接続ごとにする（§1.1、Q16）。
+5. **api-design §3.5 の `Settings`（文字列の対）と §9.5-7 の「`settings`（JSON）」**: 入れ子（ブリッジのクエリの並び）は `Settings` に載らない。R2a は `bridge` を JSON の文字列として 1 つのキーに入れる。API で入れ子をどう表すか（`Settings` に JSON の値を許すか、スキーマで平らにするか）は R2b-1 で決める必要がある。
+6. **external-db §9.5-6「WebSocket の切断から一定時間で Bad」**: そのとおりにする。加えて、WS が開いていても通信が途絶えたら Bad（ハングした送り手を Live に見せない）。送り手は `ping` を送る義務を負う（§4.3）。
+7. **external-db §9.5-1「1 接続 = 送り手 1 つ」**: WS は 1 本に制限する（新しい方を使う）。REST は WS と並べて送れる（同じ送り手の別の経路として扱い、拒否しない）。
+8. **refactor-plan §4 の R2a の完了条件「値と品質が一致」**: 「落ち着いた後に同じ状態の並びを通る」と定義する。時刻と `value_source` は比べない。一致の前提として `serde_json` の `float_roundtrip` を有効にする（§6.3）。
+9. **`db_source` との記録の違い**: `db` タグは tstore に記録されない（`ServerTagStore` だけ）が、`push` のタグは収集を通るので Hub の tstore に記録される（§9.5-2 の「周期ごとの記録」のとおり。移行後の振る舞いの変化として R2b-8 の説明に書く）。
+10. **refactor-plan §4 の R2a-1 → R2a-2 の順**: PR は R2a-1a → 1b → 2a → 1c → 2b → … の順に混ぜる（Hub の統合テストが `push` の行を要るため。§11）。段としての完了条件は変えない。
+11. **read / write のスコープの名前の束縛（h10-3、`api_keys.rs:464-470`）との違い**: `ingest:` は接続 id で縛る（`ingest:#{id}`、送信口も `/api/v1/ingest/{id}/…`。2026-10-21 オーナー決定 Q9 = (b)）。理由: read / write は人がタグを指して与える権限で、改名で見えなくなる（fail-closed）ことを許した。取り込みのキーはブリッジ・スクリプトの設定ファイルに長く置かれ、改名で黙って送れなくなると接続の全タグが Bad になり、気づくのが遅れる。id は AUTOINCREMENT で再利用されない（§5.1）ので、名前の束縛の弱点（削除して同名で作り直すと古いキーが通る）も無い。代わりに、別の Hub へ移すとキーと URL を直す必要がある（設定パッケージはキーを持ち運ばない、§5.1）。read / write を id の束縛に揃えるかは本書の範囲外。
+12. **external-db §9.5-6・§4.8 と今の `db_source` の停止の扱い（`db_source/mod.rs:306-354`）**: 初版は停止中の保持値をそのまま開始に持ち越していた。2026-10-21 のレビュー P2 で、停止で全接続の保持値を捨て、ブリッジの接続は epoch で開始・設定の変更の前の値を無効にする形に改めた（§4.5・§4.6、Q19）。`db_source` の「停止で Bad・開始で古い Good を戻さない」と同じ振る舞いになる。
+13. **初版の §4.4 の「`stale` + 値なし → Stale」**: 今の読み出し（`hub.rs:328-339`）では Bad になる。読み出しの規則は変えず、表を Bad に直した（2026-10-21 レビュー P3）。
