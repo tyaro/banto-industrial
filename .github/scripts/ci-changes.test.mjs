@@ -121,12 +121,14 @@ const G = {
 			// banto-hub-host へ移り、R2b-0 で実ドライバを使うテストも host へ移した。src 内の
 			// 単体テストは偽のドライバ表、tests/ に残った統合テストは HubDrivers::none()）。
 			// R2a-2a: 適合テスト一式は dev-dependency（`PushDriver` の static_checks）。
+			// R2b-1b: 接続の秘密値の封印（`src/secrets.rs`）で banto-secret-store に依存する。
 			deps: [
 				'banto-db-source',
 				'banto-driver-api',
 				'banto-driver-conformance',
 				'banto-instance-lock',
 				'banto-safe-root',
+				'banto-secret-store',
 				'banto-service-control',
 				'banto-service-elev',
 				'banto-tags'
@@ -293,13 +295,24 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-secret-store だけ（chronogazer にだけ届く。hub の E2E・PostgreSQL は走らない）',
+		'banto-secret-store だけ（chronogazer と、R2b-1b から banto-hub-core（`src/secrets.rs`）とその逆依存に届く。windows-latest で DPAPI の封印のテストが走る）',
 		['crates/banto-secret-store/src/acl.rs', 'crates/banto-secret-store/Cargo.toml'],
 		{
 			...NONE,
 			run_rust: true,
-			rust_args: '-p banto-secret-store -p chronogazer -p chronogazer-core -p chronogazer-elev',
+			rust_args: [
+				'-p banto-hub-core',
+				'-p banto-hub-host',
+				'-p banto-hub-shell',
+				'-p banto-hub-sink',
+				'-p banto-secret-store',
+				'-p chronogazer',
+				'-p chronogazer-core',
+				'-p chronogazer-elev'
+			].join(' '),
+			run_rust_db_source: true,
 			run_linux_clippy: true,
+			run_e2e_hub: true,
 			run_e2e_chronogazer: true
 		}
 	],
@@ -369,13 +382,16 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-tagclient（sink に届くので PostgreSQL は走る。hub の E2E は走らない）',
+		'banto-tagclient（sink に届くので PostgreSQL は走る。R2b-1b から banto-hub-bootstrap → banto-secret-store → banto-hub-core の辺で hub 側と hub の E2E も走る）',
 		['crates/banto-tagclient/src/lib.rs'],
 		{
 			...NONE,
 			run_rust: true,
 			rust_args: [
 				'-p banto-hub-bootstrap',
+				'-p banto-hub-core',
+				'-p banto-hub-host',
+				'-p banto-hub-shell',
 				'-p banto-hub-sink',
 				'-p banto-secret-store',
 				'-p banto-tagclient',
@@ -385,6 +401,7 @@ const TABLE = [
 			].join(' '),
 			run_rust_db_source: true,
 			run_linux_clippy: true,
+			run_e2e_hub: true,
 			run_e2e_chronogazer: true
 		}
 	],
@@ -842,7 +859,8 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 			'banto-hub-core',
 			'banto-hub-sink'
 		],
-		'banto-secret-store': ['chronogazer-core', 'chronogazer'],
+		// R2b-1b から banto-hub-core（`src/secrets.rs`）も使う。
+		'banto-secret-store': ['chronogazer-core', 'chronogazer', 'banto-hub-core'],
 		// R2a-3a: db_source（hub-core）が使い、host・shell が hub-core を経由する。sink は
 		// R2a-3b から DB ブリッジが直接使う（hub-core は dev-dependency）。
 		'banto-db-source': ['banto-hub-core', 'banto-hub-host', 'banto-hub-shell', 'banto-hub-sink'],

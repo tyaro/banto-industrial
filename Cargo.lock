@@ -803,6 +803,7 @@ dependencies = [
  "banto-plc",
  "banto-plc-write",
  "banto-safe-root",
+ "banto-secret-store",
  "banto-server",
  "banto-service-control",
  "banto-service-elev",
@@ -834,6 +835,7 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
