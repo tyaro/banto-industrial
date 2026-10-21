@@ -7585,4 +7585,90 @@ mod tests {
         ];
         assert_eq!(duplicate_unique_addresses(&rows), vec![1, 4, 0, 5]);
     }
+
+    /// PR #753 review P2, service side: a group that has tags cannot move
+    /// into, out of, or between push connections (update and update_tx), so
+    /// the reviewer's repro - B's group with "temperature" moved under A,
+    /// which already has "temperature" - cannot happen, and PLC tags that
+    /// break the push rules cannot ride in. Empty groups move freely and an
+    /// in-place update of a push group is not a move.
+    #[tokio::test]
+    async fn groups_with_tags_cannot_move_into_out_of_or_between_push_connections() {
+        let (svc, plc_group) = setup().await;
+        let groups = CollectionGroupService::new(svc.pool.clone());
+        let ga = push_group(&svc.pool, "A").await;
+        let gb = push_group(&svc.pool, "B").await;
+        svc.create(hub_tag("t", ga, "temperature")).await.unwrap();
+        svc.create(hub_tag("t", gb, "temperature")).await.unwrap();
+        let conn_of = |group: i64| {
+            let pool = svc.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT plc_connection_id FROM collection_groups WHERE id = ?",
+                )
+                .bind(group)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let a = conn_of(ga).await;
+        let b = conn_of(gb).await;
+        let plc_conn = conn_of(plc_group).await;
+        let input = |name: &str, conn: i64| CollectionGroupInput {
+            name: name.to_string(),
+            plc_connection_id: conn,
+            period_ms: 1_000,
+            enabled: true,
+            default_writable: false,
+            query_sql: None,
+        };
+        let expect_move_refused = |err: BantoError| {
+            let errors = field_errors_of(err);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].field, "plcConnectionId");
+            assert!(errors[0].message.contains("push"), "{}", errors[0].message);
+        };
+
+        // push -> push (the repro), with update and update_tx.
+        expect_move_refused(groups.update(gb, input("B-g", a)).await.unwrap_err());
+        let mut tx = svc.pool.begin().await.unwrap();
+        expect_move_refused(
+            groups
+                .update_tx(&mut tx, gb, input("B-g", a))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+        // push -> modbus and modbus -> push (a writable/scaled PLC tag would ride in).
+        expect_move_refused(groups.update(gb, input("B-g", plc_conn)).await.unwrap_err());
+        let mut plc_tag = sample_input("w", plc_group);
+        plc_tag.writable = true;
+        svc.create(plc_tag).await.unwrap();
+        expect_move_refused(groups.update(plc_group, input("G1", a)).await.unwrap_err());
+        let keys_in_a: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tags t JOIN collection_groups g ON g.id = t.collection_group_id \
+             WHERE g.plc_connection_id = ?",
+        )
+        .bind(a)
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+        assert_eq!(keys_in_a, 1);
+
+        // In place is not a move; an empty group may move anywhere.
+        groups
+            .update(gb, input("B-renamed", b))
+            .await
+            .expect("same connection");
+        let empty = push_group_under(&svc.pool, b, "empty").await;
+        groups
+            .update(empty, input("empty", a))
+            .await
+            .expect("empty push -> push");
+        groups
+            .update(empty, input("empty", plc_conn))
+            .await
+            .expect("empty push -> modbus");
+    }
 }

@@ -607,6 +607,51 @@ fn crosses_hub_boundary(existing_protocol: Option<&str>, new_protocol: &str) -> 
         .is_some_and(|existing| (existing == HUB_PROTOCOL) != (new_protocol == HUB_PROTOCOL))
 }
 
+/// R2a-2a (PR #753 review P2): whether an update switches a connection's
+/// protocol into or out of `"push"`.
+fn crosses_push_boundary(existing_protocol: Option<&str>, new_protocol: &str) -> bool {
+    existing_protocol
+        .is_some_and(|existing| (existing == PUSH_PROTOCOL) != (new_protocol == PUSH_PROTOCOL))
+}
+
+/// `SELECT COUNT(*)` of the tags under connection `id` (through its groups) -
+/// the input [`push_protocol_switch_error`] needs, only queried when the
+/// `"push"` boundary is crossed.
+const TAG_COUNT_SQL: &str = "SELECT COUNT(*) FROM tags t \
+     JOIN collection_groups g ON g.id = t.collection_group_id \
+     WHERE g.plc_connection_id = ?";
+
+/// R2a-2a (PR #753 review P2): refuse switching a connection's protocol into
+/// or out of `"push"` while it still has tags. A `"push"` tag's `address` is
+/// the sender's key, unique per connection, and its tags follow
+/// `crate::tag`'s push rules (no `string`/`writable`/scaling); a PLC tag's
+/// `address` is a device address with none of those rules. Flipping the
+/// protocol under existing tags would carry them across without the tag-level
+/// checks (duplicate keys, a writable or string tag under `"push"`), so the
+/// switch is refused outright - the same stance [`hub_protocol_switch_error`]
+/// takes, counted in tags rather than groups (an empty group carries nothing
+/// across). Migration `0024`'s `plc_connections_push_key_unique_protocol`
+/// trigger is the database-side backstop for the uniqueness half.
+fn push_protocol_switch_error(
+    existing_protocol: Option<&str>,
+    new_protocol: &str,
+    tag_count: i64,
+) -> Option<BantoError> {
+    if !crosses_push_boundary(existing_protocol, new_protocol) || tag_count == 0 {
+        return None;
+    }
+    Some(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "protocol".to_string(),
+            message: format!(
+                "この接続にはタグが{tag_count}件あるため、push 接続と他のプロトコルの間で\
+                 変更できません（push のタグのアドレスは送り手が決めるキーで、PLC のアドレスとは\
+                 規則が違います）"
+            ),
+        }],
+    })
+}
+
 /// [`PlcConnectionService::create`]'s password rule (this crate's
 /// `PlcConnectionInput::password` doc comment, "create" case): `None` and
 /// `Some("")` both mean "no password yet" (stored as SQL `NULL`); any other
@@ -715,12 +760,33 @@ fn bridge_db_connection_error(db_connection_id: i64, protocol: Option<&str>) -> 
     })
 }
 
+/// The refusal for a bridge whose `db_connection_id` is the connection being
+/// written itself (PR #753 review P2). Only a `"push"` row can carry
+/// `settings`, so after the write that row is `"push"`, never `"postgres"` -
+/// reading its *pre-update* protocol (e.g. a `postgres` → `push` update)
+/// would wrongly accept it.
+fn bridge_self_reference_error(db_connection_id: i64) -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "settings.bridge.db_connection_id".to_string(),
+            message: format!(
+                "db_connection_id {db_connection_id} はこの接続自身です（push 接続は postgres \
+                 接続を指してください）"
+            ),
+        }],
+    }
+}
+
 /// Run [`bridge_db_connection_error`] for a payload whose settings are being
 /// written, through `executor` (the pool, or the caller's transaction so it
-/// sees that transaction's own writes).
+/// sees that transaction's own writes). `updated_id` is the row an update is
+/// about to overwrite (`None` on create): a reference to it is judged against
+/// its post-update state ([`bridge_self_reference_error`]), not the row as
+/// it stands.
 async fn check_bridge_db_connection<'c, E>(
     executor: E,
     input: &PlcConnectionInput,
+    updated_id: Option<i64>,
 ) -> Result<(), BantoError>
 where
     E: sqlx::Executor<'c, Database = Sqlite>,
@@ -728,6 +794,9 @@ where
     let Some(bridge) = settings_to_write(input).and_then(|settings| settings.bridge) else {
         return Ok(());
     };
+    if updated_id == Some(bridge.db_connection_id) {
+        return Err(bridge_self_reference_error(bridge.db_connection_id));
+    }
     let protocol: Option<String> = sqlx::query_scalar(BRIDGE_DB_CONNECTION_SQL)
         .bind(bridge.db_connection_id)
         .fetch_optional(executor)
@@ -1273,7 +1342,7 @@ impl PlcConnectionService {
     pub async fn create(&self, input: PlcConnectionInput) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&self.pool, &input).await?;
+        check_bridge_db_connection(&self.pool, &input, None).await?;
         let is_postgres = input.protocol == POSTGRES_PROTOCOL;
         let stored_database =
             is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
@@ -1316,7 +1385,7 @@ impl PlcConnectionService {
     ) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&mut *connection, &input).await?;
+        check_bridge_db_connection(&mut *connection, &input, None).await?;
         let is_postgres = input.protocol == POSTGRES_PROTOCOL;
         let stored_database =
             is_postgres.then(|| input.database.as_deref().unwrap_or("").trim().to_string());
@@ -1401,7 +1470,7 @@ impl PlcConnectionService {
         input.simulation = simulation.unwrap_or(false);
         let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&self.pool, &input).await?;
+        check_bridge_db_connection(&self.pool, &input, Some(id)).await?;
         // `None` binds SQL NULL -> `COALESCE(NULL, simulation)` keeps the
         // column. Protocols without a meaningful simulation always store the
         // normalized value, same as a plain `update`.
@@ -1433,6 +1502,18 @@ impl PlcConnectionService {
                 .map_err(banto_storage::storage_error)?;
             if let Some(err) =
                 hub_protocol_switch_error(existing_protocol, &input.protocol, group_count)
+            {
+                return Err(err);
+            }
+        }
+        if crosses_push_boundary(existing_protocol, &input.protocol) {
+            let tag_count: i64 = sqlx::query_scalar(TAG_COUNT_SQL)
+                .bind(id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            if let Some(err) =
+                push_protocol_switch_error(existing_protocol, &input.protocol, tag_count)
             {
                 return Err(err);
             }
@@ -1491,7 +1572,7 @@ impl PlcConnectionService {
     ) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
         validate_plc_connection_input(&input)?;
-        check_bridge_db_connection(&mut *connection, &input).await?;
+        check_bridge_db_connection(&mut *connection, &input, Some(id)).await?;
         let existing: Option<(String, Option<String>)> =
             sqlx::query_as("SELECT protocol, password FROM plc_connections WHERE id = ?")
                 .bind(id)
@@ -1515,6 +1596,18 @@ impl PlcConnectionService {
                 .map_err(banto_storage::storage_error)?;
             if let Some(err) =
                 hub_protocol_switch_error(existing_protocol, &input.protocol, group_count)
+            {
+                return Err(err);
+            }
+        }
+        if crosses_push_boundary(existing_protocol, &input.protocol) {
+            let tag_count: i64 = sqlx::query_scalar(TAG_COUNT_SQL)
+                .bind(id)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(banto_storage::storage_error)?;
+            if let Some(err) =
+                push_protocol_switch_error(existing_protocol, &input.protocol, tag_count)
             {
                 return Err(err);
             }
@@ -5023,8 +5116,11 @@ mod tests {
             .expect("0024 should apply");
         tx.commit().await.expect("0024 should commit");
         let mut expected_0024 = expected_0023.clone();
+        expected_0024.push(("trigger", "collection_groups_push_key_unique_move"));
+        expected_0024.push(("trigger", "plc_connections_push_key_unique_protocol"));
         expected_0024.push(("trigger", "tags_push_key_unique_insert"));
         expected_0024.push(("trigger", "tags_push_key_unique_update"));
+        expected_0024.sort();
         assert_eq!(schema_objects(&mut conn).await, to_owned(&expected_0024));
         assert_eq!(
             rows(TAG_ROW_SQL).fetch_all(&mut *conn).await.unwrap(),
@@ -5076,5 +5172,206 @@ mod tests {
         )
         .await
         .expect("a modbus tag may use the same text");
+    }
+
+    // ---- PR #753 review P2: parent changes and bridge self-reference --------
+
+    /// A connection created through the service, with one group holding a tag
+    /// at each of `addresses` (inserted directly - the tag rules are not what
+    /// these tests exercise). Returns `(connection id, group id)`.
+    async fn connection_with_tags(
+        svc: &PlcConnectionService,
+        input: PlcConnectionInput,
+        addresses: &[&str],
+    ) -> (i64, i64) {
+        let conn = svc.create(input).await.expect("create connection");
+        let group: i64 = sqlx::query_scalar(
+            "INSERT INTO collection_groups (name, plc_connection_id, period_ms) \
+             VALUES (?, ?, 1000) RETURNING id",
+        )
+        .bind(format!("{}-g", conn.name))
+        .bind(conn.id)
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+        for (i, address) in addresses.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO tags (name, collection_group_id, address, data_type) \
+                 VALUES (?, ?, ?, 'f64')",
+            )
+            .bind(format!("t{i}"))
+            .bind(group)
+            .bind(*address)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        }
+        (conn.id, group)
+    }
+
+    fn assert_push_key_trigger(result: Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error>) {
+        let err = result.expect_err("the 0024 trigger should refuse");
+        assert!(
+            err.as_database_error()
+                .is_some_and(|e| e.message().contains("push key already registered")),
+            "{err:?}"
+        );
+    }
+
+    /// DB side (migration 0024's parent-change triggers), bypassing the
+    /// services: moving a group into a push connection where a key already
+    /// exists, moving a group that itself holds a duplicate into push, and
+    /// switching a connection with duplicate addresses to push are all
+    /// refused; the same changes without a duplicate pass.
+    #[tokio::test]
+    async fn the_0024_parent_change_triggers_refuse_duplicate_push_keys() {
+        let svc = service().await;
+        let (a, _ga) = connection_with_tags(&svc, push_input("A"), &["temperature"]).await;
+        let (_b, gb) = connection_with_tags(&svc, push_input("B"), &["temperature"]).await;
+        let (_m, gm) = connection_with_tags(&svc, sample_input("M"), &["D100", "D100"]).await;
+        let (_c, gc) = connection_with_tags(&svc, push_input("C"), &["pressure"]).await;
+        let move_group = |group: i64, to: i64| {
+            sqlx::query("UPDATE collection_groups SET plc_connection_id = ? WHERE id = ?")
+                .bind(to)
+                .bind(group)
+                .execute(&svc.pool)
+        };
+
+        // The reviewer's repro: B's "temperature" moved under A.
+        assert_push_key_trigger(move_group(gb, a).await);
+        // A group carrying its own duplicate into push.
+        assert_push_key_trigger(move_group(gm, a).await);
+        // No duplicate: C's "pressure" may join A.
+        move_group(gc, a).await.expect("distinct keys may move");
+        // Rewriting the same connection id is not a move.
+        move_group(gb, _b).await.expect("same connection");
+
+        // A Modbus connection with duplicate addresses cannot become push...
+        let (m2, _) = connection_with_tags(&svc, sample_input("M2"), &["40001", "40001"]).await;
+        assert_push_key_trigger(
+            sqlx::query("UPDATE plc_connections SET protocol = 'push' WHERE id = ?")
+                .bind(m2)
+                .execute(&svc.pool)
+                .await,
+        );
+        // ...one with distinct addresses can (at the DB level).
+        let (m3, _) = connection_with_tags(&svc, sample_input("M3"), &["40001", "40002"]).await;
+        sqlx::query("UPDATE plc_connections SET protocol = 'push' WHERE id = ?")
+            .bind(m3)
+            .execute(&svc.pool)
+            .await
+            .expect("distinct addresses");
+    }
+
+    /// Service side: switching a connection that has tags into or out of
+    /// push is refused on `protocol` (update and update_tx), so neither
+    /// duplicate keys nor tags breaking `push_tag_errors` (writable, string,
+    /// scaling) are carried across; a connection with only empty groups may
+    /// switch.
+    #[tokio::test]
+    async fn switching_to_or_from_push_is_refused_while_tags_exist() {
+        let svc = service().await;
+        let (m, _) = connection_with_tags(&svc, sample_input("M"), &["40001", "40001"]).await;
+        sqlx::query("UPDATE tags SET writable = 1")
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            only_fields(svc.update(m, push_input("M")).await.unwrap_err()),
+            ["protocol"]
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        assert_eq!(
+            only_fields(
+                svc.update_tx(&mut tx, m, push_input("M"))
+                    .await
+                    .unwrap_err()
+            ),
+            ["protocol"]
+        );
+        drop(tx);
+
+        let (p, _) = connection_with_tags(&svc, push_input("P"), &["k"]).await;
+        assert_eq!(
+            only_fields(svc.update(p, sample_input("P")).await.unwrap_err()),
+            ["protocol"]
+        );
+        let protocol: String =
+            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                .bind(m)
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+        assert_eq!(protocol, "modbus-tcp");
+
+        // Only an empty group: nothing is carried across.
+        let (e, _) = connection_with_tags(&svc, sample_input("E"), &[]).await;
+        assert_eq!(
+            svc.update(e, push_input("E")).await.unwrap().protocol,
+            PUSH_PROTOCOL
+        );
+        assert_eq!(
+            svc.update(e, sample_input("E")).await.unwrap().protocol,
+            "modbus-tcp"
+        );
+    }
+
+    #[test]
+    fn push_protocol_switch_error_table() {
+        let cases: &[(Option<&str>, &str, i64, bool)] = &[
+            (Some("modbus-tcp"), "push", 1, true),
+            (Some("push"), "slmp", 2, true),
+            (Some("postgres"), "push", 1, true),
+            (Some("modbus-tcp"), "push", 0, false),
+            (Some("push"), "push", 5, false),
+            (Some("modbus-tcp"), "slmp", 5, false),
+            (None, "push", 5, false),
+        ];
+        for &(existing, new, tags, refused) in cases {
+            assert_eq!(
+                push_protocol_switch_error(existing, new, tags).is_some(),
+                refused,
+                "{existing:?} -> {new} with {tags} tags"
+            );
+        }
+    }
+
+    /// PR #753 review P2: a postgres connection X updated to push with a
+    /// bridge pointing at X itself is refused (the check must judge X's
+    /// post-update protocol, push, not the stored postgres) - on update and
+    /// update_tx - and nothing is written.
+    #[tokio::test]
+    async fn a_postgres_to_push_update_cannot_reference_itself() {
+        let svc = service().await;
+        let x = svc.create(postgres_input("X")).await.unwrap();
+        let mut input = push_input("X");
+        input.settings = Some(bridge_settings(x.id));
+
+        let err = svc.update(x.id, input.clone()).await.unwrap_err();
+        assert_eq!(only_fields(err), ["settings.bridge.db_connection_id"]);
+        let mut tx = svc.pool.begin().await.unwrap();
+        let err = svc
+            .update_tx(&mut tx, x.id, input.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(only_fields(err), ["settings.bridge.db_connection_id"]);
+        drop(tx);
+        assert_eq!(svc.get(x.id).await.unwrap(), x);
+
+        // A push connection cannot point at itself either, and another
+        // postgres connection is still fine.
+        let p = svc.create(push_input("P")).await.unwrap();
+        let mut own = push_input("P");
+        own.settings = Some(bridge_settings(p.id));
+        assert_eq!(
+            only_fields(svc.update(p.id, own).await.unwrap_err()),
+            ["settings.bridge.db_connection_id"]
+        );
+        let y = svc.create(postgres_input("Y")).await.unwrap();
+        input.settings = Some(bridge_settings(y.id));
+        assert_eq!(
+            svc.update(x.id, input).await.unwrap().settings,
+            Some(bridge_settings(y.id))
+        );
     }
 }
