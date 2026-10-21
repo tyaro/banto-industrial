@@ -845,6 +845,7 @@ dependencies = [
  "banto-broker",
  "banto-collect",
  "banto-core",
+ "banto-driver-api",
  "banto-drivers",
  "banto-hub-core",
  "banto-plc",

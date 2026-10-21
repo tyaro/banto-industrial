@@ -761,6 +761,8 @@ async fn values_are_recorded_every_cycle_stale_records_null_and_stop_gives_bad()
 }
 
 /// タイムアウトで Bad と `plc_disconnected`（理由つき）。送り直せば戻る。
+/// Good の観測の間は `ping` で送り手を生かす（stale 1 秒だと、CI の負荷で観測が
+/// 間に合わず Bad に戻る。2026-10-21 Windows CI のフレーク）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_silent_sender_goes_bad_with_plc_disconnected() {
     let env = env("ingest-timeout").await;
@@ -773,8 +775,10 @@ async fn a_silent_sender_goes_bad_with_plc_disconnected() {
     let mut events = env.manager.subscribe_events();
     env.start().await;
 
+    let ping = env.keep_pinging(conn);
     env.apply(conn, None, &[value("line1.temp", 3.0)]).unwrap();
     env.wait_current(temp, good(3.0)).await;
+    drop(ping);
     env.wait_current(temp, BAD).await;
 
     let conn_key = format!("conn:{conn}");
@@ -793,8 +797,10 @@ async fn a_silent_sender_goes_bad_with_plc_disconnected() {
     let detail = disconnected.detail.unwrap_or_default();
     assert!(detail.starts_with("送り手からの通信が "), "{detail}");
 
+    let ping = env.keep_pinging(conn);
     env.apply(conn, None, &[value("line1.temp", 4.0)]).unwrap();
     env.wait_current(temp, good(4.0)).await;
+    drop(ping);
     env.finish().await;
 }
 

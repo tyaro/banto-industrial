@@ -1,0 +1,514 @@
+# banto-hub 接続設定の JSON 化と秘密値の保管 詳細設計（R2b-1）
+
+作成日: 2026-10-21
+状態: **設計確定（2026-10-21 オーナー決定。§11 の Q1〜Q15 はすべて推奨どおり。同日のレビューの P2 3 件（作りかけのバックアップの平文・古いサイドカーと `trust` 認証・`plain-v1` のキューの封印し直し）と再レビューの P2 1 件（`VACUUM` の印を清掃待ちの印に）を §5.3・§5.4・§6.4〜§6.6・§9 に反映）・R2b-1a 実装済み（2026-10-21。`DriverKind::HostProvided`・`DriverDescriptor::settings_version`・`push` / `postgres` / `virtual` の登録とトリップワイヤ `apps/banto-hub/host/tests/registry_tripwire.rs`。本番の経路はまだレジストリを読まない）・R2b-1b 以降は未着手**。コード調査（§1）は 2026-10-21 の main（`55b58253`、v0.2.0-alpha.33、R2a 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる提案をまとめた（詳細は §12）。
+対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-1「接続設定を固定列から JSON（ドライバのスキーマで検証）へ移し、秘密値を `banto-secret-store` へ。SQL の `CHECK` を撤去してレジストリを正にする」を実装できる粒度に落とす。`plc_connections` の新しい形・プロトコルごとの `settings`・レジストリによる検証・秘密値の封印と寿命・移行（migration `0025` と起動時の前後処理）・互換の範囲（R2b-7 との境）・PR の分け方。
+関連: [banto-driver-api-design.md](banto-driver-api-design.md)（R1。§3.5 の `Settings`・§6 のレジストリ）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（§5 の秘密値・検証の注入、§7.4 の preflight、§7.5 のドライバが無いとき、§12.2-5）、[banto-hub-ingest-design.md](banto-hub-ingest-design.md)（R2a。`settings` 列を足した migration `0023`、§5.1 の `sqlite_sequence` の決まり、§13 の 5）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md)（§2.2 の平文保存の決定、§9.5）、[chronogazer-service-design.md](chronogazer-service-design.md)（§3.1(c)・§6: `banto-secret-store` と DPAPI の machine スコープの決定）、[tag-server-design.md](tag-server-design.md) §5.6、[implementation-checklist.md](implementation-checklist.md)（§5 の migration の 2 項目）。
+
+---
+
+## 0. 要約（2026-10-21 オーナー決定。§11 の Q1〜Q15 はすべて推奨どおり）
+
+| #   | 提案                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 根拠の節   |
+| --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
+| 1   | `plc_connections` の列は **`id`・`name`・`protocol`・`enabled`・`simulation`・`settings`・`settings_version`** だけにする。`host`・`port`・`unit_id`・`word_order`・`cpu_type`・`database`・`username`・`password` は `settings`（JSON のオブジェクト、`NOT NULL`）へ移す。`enabled`・`simulation`（ホストの概念。R2b-5 で値の層へ移る）と名前は列のまま                                                                                                                  | §3.1, §3.2 |
+| 2   | `settings` のキーは R1 の `banto_driver_api::keys`（`host`・`port`・`unit_id`・`word_order`・`cpu_type`）と同じ名前。値は型つきの JSON（`port` は数）。プロトコルが読まない列（SLMP の `unit_id`、Modbus の `cpu_type`、`virtual`・`hub`・`push` の `host` ほか）は移さず捨て、捨てた値で既定と違うものを移行の報告に出す                                                                                                                                                 | §3.2       |
+| 3   | SQL の `CHECK (protocol IN (...))`・`word_order`・`cpu_type` の `CHECK` を撤去し、`protocol` には `DriverId` の文法（`[a-z0-9][a-z0-9-]*`）だけを `CHECK` で残す。何が存在するかの正は Hub の `DriverRegistry`（`HubDrivers.registry`）                                                                                                                                                                                                                                   | §3.1, §4   |
+| 4   | Hub のレジストリに、I/O をホストが持つ組み込み（`push`・`postgres`・`virtual`）を **`DriverKind::HostProvided`**（`#[non_exhaustive]` への追加）で登録する。`modbus-tcp`・`slmp` は R1 のまま `HostBound`。これでプロトコルの一覧・設定の検証・秘密のキーがすべてレジストリから引ける                                                                                                                                                                                     | §4.1       |
+| 5   | 検証は `banto-tags` にレジストリを注入して行う（`banto-tags` → `banto-driver-api` は依存ゼロの crate への依存なので循環しない）。R2b-7 までは REST・MCP・設定パッケージ・ChronoGazer の**平らな形**を保ち、`banto-tags` の中の「平らな形 ⇔ `settings`」のアダプタで受ける。ChronoGazer は R2b-7 まで旧規則（注入なしの既定）のまま                                                                                                                                        | §2, §4.2   |
+| 6   | 秘密値（R2b-1 の時点では `postgres` の `password` だけ）は、**`banto-secret-store` の `Protector`（`DpapiMachine`）で封印した blob を DB の秘密の表 `plc_connection_secrets` に置く**。`settings` には値の代わりに参照 `{"$secret": "<ref>"}` を置く。ファイルの保存先（`FileSecretStore`）は使わない。DB のトランザクションと秘密値が同じ単位で確定し、孤児のファイル・掃除・二相の書き込みが要らない                                                                    | §5.1       |
+| 7   | 非 Windows（開発・CI・E2E）は封印の方式 `plain-v1`（平文。今の列と同じ守り）で同じ表に置き、状態とログで警告する。Windows の Hub は起動時に `plain-v1` の行を `dpapi-machine-v1` に封印し直し、`VACUUM` で解放済みのページの平文も消す                                                                                                                                                                                                                                    | §5.8, §6.5 |
+| 8   | 未適用キューの `pending_changes.payload` に今は平文のパスワードが残る（`crud.rs` の `redact_pending_payload` は応答の写しだけを伏せる）。R2b-1 からは積む時点で封印した blob を載せ、既存の行は起動時に封印し直す（適用済み・取消済みの行からは消す）                                                                                                                                                                                                                     | §1.5, §5.3 |
+| 9   | 秘密値が読めない PC（DB を別の PC に戻した・OS を入れ直した）では、その接続だけを「パスワードを読めません」で止め（Bad）、空のパスワードで繋ぎに行かない。REST に `passwordState`（`none` / `set` / `unreadable`）を足す。Sink とブリッジの設定は、読めない接続を `connections`・`sources` に**載せず**、新しい `unavailableConnections`・`unavailableSources` に理由つきで出す（どちらも追加だけ。古いサイドカーは載っていない接続に繋がない。2026-10-21 レビュー P2-2） | §5.5       |
+| 10  | 移行は `banto-tags` の SQL の migration `0025`（表の作り直し・JSON への変換・秘密の表への退避）と、Hub の起動時の前後処理（自動バックアップ・写しでの予行と preflight・封印し直し・`VACUUM`）に分ける。preflight で 1 件でも検証に通らなければ**移行せずに起動を断る**                                                                                                                                                                                                    | §6         |
+| 11  | 設定パッケージは今どおり秘密値を持ち運ばない（版 2 のまま）。DB の複製・バックアップにも平文が載らなくなる（DPAPI の blob は別の PC では開けない）。R2b-1 で互換を壊すのは DB（戻せない）だけで、REST・MCP・設定パッケージ・ChronoGazer の形は R2b-7 まで変えない                                                                                                                                                                                                         | §2, §5.6   |
+| 12  | PR は R2b-1a〜R2b-1f の 6 本。1a〜1c は配線しない部品（振る舞い不変）、1d が DB の切り替え（戻せない）、1e が秘密値の封印、1f が docs と版。版は R2b-1 の全部が終わった時点で一度上げる                                                                                                                                                                                                                                                                                   | §10        |
+
+### 0.1 既存の決定・計画から外れる点（§12 の要約。オーナー判断の対象）
+
+| 既存の決定・計画                                                                                                                  | 本書の提案                                                                                                                  | 理由（コードの事実）                                                                                                                                                                                                                                                                                   |
+| --------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| refactor-plan §4 R2b-1・plugin-design §5「秘密値を `banto-secret-store` に保存」（字面ではファイルの保存先 `FileSecretStore`）    | 同じ crate の `Protector`（`DpapiMachine`）で封印した blob を DB に置く（Q1）                                               | Hub の接続の書き込みは DB のトランザクション（`BEGIN IMMEDIATE`、`rest/plc_connections.rs:296-339`）と未適用キューで確定する。ファイルに置くと DB と二相になり、取り消し・失敗・クラッシュで孤児と食い違いが出る。保存先のディレクトリの ACL は profile の DB と同じ相手（§5.1）で、守りは弱くならない |
+| plugin-design §5「共通の列（`host` / `port` / `word_order` / タイムアウト等）は従来どおり固定列」                                 | 全部 `settings` へ移す（plugin-design §12.2-5・refactor-plan と同じ）                                                       | §12.2-5（後の決定）が「接続は共通列（名前・有効・ドライバ ID）と `settings`」と決めている。§5 は §12 の前の版の記述                                                                                                                                                                                    |
+| api-design §6.2「`ALLOWED_PROTOCOLS` と SQL の `CHECK` は R2b-1 で撤去」                                                          | SQL の `CHECK` は撤去。`ALLOWED_PROTOCOLS` は Hub では使わなくなるが、ChronoGazer のための旧規則として R2b-7 まで残す（Q6） | ChronoGazer はレジストリを持たない（`banto-drivers` に依存していない）。refactor-plan §4 で ChronoGazer の追従は R2b-7                                                                                                                                                                                 |
+| ingest-design §2「`push` の `DriverKind` は R2b-3 の前に決める（(a) `Session` に品質を足す / (b) ホストが値を受ける種類を足す）」 | R2b-1 で (b) に当たる `DriverKind::HostProvided` を足し、`push`・`postgres`・`virtual` を登録する（Q5）                     | 登録しないとレジストリを正にできない（R2b-1 の完了条件）。`HostBound` で登録するとトリップワイヤ 2（broker の表 == `HostBound`、`banto-drivers/src/lib.rs:281-288`）が落ちる                                                                                                                           |
+| external-db §2.2・tag-server-design §5.6「v1 は平文 + 閉域 LAN」                                                                  | Windows では DPAPI で封印。非 Windows は平文のまま（Q2）                                                                    | refactor-plan の R2b-1 の決定どおり。非 Windows は `banto-secret-store` が fail closed する（`banto-safe-root` の `UnsupportedPlatform`）ので別の扱いが要る                                                                                                                                            |
+
+## 1. 前提（コードの現状、2026-10-21 の main `55b58253` に照合）
+
+行番号は目安。各 PR は着手時に再確認する。
+
+### 1.1 表と migration
+
+| 項目                           | 場所                                                                                                                                                                                                                                                                                    | 事実                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 今の `plc_connections`         | `crates/banto-tags/migrations/0023_plc_connections_allow_push.sql:74-90`                                                                                                                                                                                                                | 14 列: `id`（AUTOINCREMENT）・`name`（UNIQUE）・`protocol`（`CHECK IN ('modbus-tcp','slmp','virtual','postgres','hub','push')`）・`host`・`port`・`unit_id`・`enabled`・`simulation`・`word_order`（`CHECK`）・`database`・`username`・`password`（平文）・`cpu_type`（`CHECK`）・`settings`（`json_valid`、NULL 可） |
+| 索引                           | `0023:115-116`                                                                                                                                                                                                                                                                          | `idx_plc_connections_single_hub`（`protocol = 'hub'` の部分一意）と `name` の自動索引だけ                                                                                                                                                                                                                             |
+| `plc_connections` を見るトリガ | `0023:141-176`（`0020` の 2 本を作り直したもの）、`migrations/0024_tags_push_key_unique.sql`（4 本: `tags` の 2 本・`collection_groups_push_key_unique_move`・`plc_connections_push_key_unique_protocol`）                                                                              | 6 本すべてが本体で `plc_connections` を参照する。うち 1 本は `plc_connections` 自身の `BEFORE UPDATE OF protocol` で、表を作り直すと一緒に消える                                                                                                                                                                      |
+| 子の表                         | `collection_groups.plc_connection_id REFERENCES plc_connections(id) ON DELETE RESTRICT`（`0022:65`）。`hub_sink_groups.db_connection_id` は FK を張らない（`apps/banto-hub/core/migrations-sqlite/0106_hub_sink_groups.sql:6-10`）                                                      | 作り直しは `0004` の header の 3 つの前提（1 トランザクション・FK 強制・参照されている表の DROP は失敗）に従う park-and-restore（`0023:16-25`）                                                                                                                                                                       |
+| `sqlite_sequence` の決まり     | `0023:46-53`・`:101-111`、ingest-design §5.1                                                                                                                                                                                                                                            | 作り直しで高水位を引き継がないと、削除した接続の id が再び出て、古い `ingest:#{id}` のキーが別の接続に通る。「後の migration（R2b-1 ほか）で作り直すときも、同じ書き方で引き継ぎ、同じテストを足すこと」                                                                                                              |
+| migrator                       | `crates/banto-tags/src/lib.rs:92-99`（`sqlx::migrate!("./migrations")`、記録表 `_sqlx_migrations_banto_tags`）。Hub は `apps/banto-hub/core/src/db.rs:191-212` で自分の migrator → `banto_tags::migrate` → `banto_collect::migrate` の順                                                | **ChronoGazer も同じ `banto_tags::migrate` を流す**（`apps/chronogazer/core/src/db.rs:231`）。R2b-1 の migration は ChronoGazer の DB にも当たる                                                                                                                                                                      |
+| 戻せないこと                   | `apps/banto-hub/core/src/db.rs:364-366`（`ignore_missing` は「DB にあってソースに無い」側だけに効く。既定は `false`）                                                                                                                                                                   | 新しい migration を当てた DB を古い Hub で開くと、sqlx が適用済みの版をソースに見つけられず起動に失敗する見込み（**要確認**: R2b-1d のテストで確かめる。§9）                                                                                                                                                          |
+| テストの決まり                 | implementation-checklist §5（`run_to(N)` で流す・作り直しは `0020`・`0024` のトリガを先に外し `sqlite_sequence` を引き継ぐ）、前例のテスト `crates/banto-tags/src/plc_connection.rs:4974` `migration_0023_and_0024_preserve_rows_sequence_triggers_and_indexes_on_a_populated_database` | populated な DB に実ファイルを `include_str!` で当てる。DB の実物の fixture（`.sqlite3`）はリポジトリに 1 つも無い                                                                                                                                                                                                    |
+
+### 1.2 `banto-tags` の型と検証
+
+| 項目           | 場所（`crates/banto-tags/src/plc_connection.rs`）                                                                                                                                                                | 事実                                                                                                                                          |
+| -------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| 許可リスト     | `:274-275` `ALLOWED_PROTOCOLS`、照合 `:1133-1141`                                                                                                                                                                | SQL の `CHECK` と手書きの二重（トリップワイヤのテストが双方向に断る）                                                                         |
+| 行の型         | `:861-922` `PlcConnection`（14 欄、`password` は「外へ決してシリアライズしない」の doc）、`:924-952` 手書きの `FromRow`（`settings` を JSON として読む。sqlx の `json` feature は使っていない）                  | `PlcConnection {` のリテラルは workspace に 33 か所                                                                                           |
+| 入力の型       | `:982-1104` `PlcConnectionInput`。`word_order` は `""` が「未指定」の番兵、`cpu_type`・`settings` は「作成は既定・更新は保つ」、`password` は作成と更新で意味が違う tri-state（`:1058-1080`、規則は `:659-701`） | `PlcConnectionInput {` のリテラルは 104 か所                                                                                                  |
+| 正規化         | `:467-546`（`normalize_postgres_input`・`normalize_hub_input`・`normalize_push_input`。読まない列を既定に揃える）                                                                                                | 「読まない列にも既定値が入っている」のが今の形                                                                                                |
+| 検証           | `:1117-1304` `validate_plc_connection_input`（名前・プロトコル・host/port（`virtual`・`hub`・`push` は飛ばす）・unit_id・word_order・cpu_type・postgres の 3 列・`push` の `settings`）                          | エラーの `field` は REST の綴り（`unitId`・`wordOrder`・`cpuType`・`settings.*`）                                                             |
+| 列の一覧       | `:1306-1327` `column_map`（`host`・`port` ほかで並べ替え・絞り込みができる）、`:1330-1331` `COLUMNS`、`INSERT` は `:1404`・`:1447`、更新は `:1530`（`password` を読む）・`:1584`                                 | Hub の REST の一覧は `ListParams::default()`（`apps/banto-hub/core/src/rest/plc_connections.rs:253`）で、並べ替え・絞り込みを外へ出していない |
+| テストの生 SQL | `crates/banto-tags/src/tag.rs:4556` ほか約 12 か所、`collection_group.rs:1620-1625`                                                                                                                              | `INSERT INTO plc_connections (id, name, protocol, host, port, ...)` を直接書いている。列を消すと全部直す                                      |
+
+### 1.3 固定列を読む側
+
+| 読む側                       | 場所                                                                                                                                                                                        | 読む列                                                                    |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------- |
+| 収集の計画                   | `crates/banto-collect/src/config.rs:497-510` `RegistrySnapshot::load_connection`（手書きの SELECT。checklist §5 の #605）、`:1437-1458` `modbus_config_for`、`:1479-1494` `slmp_config_for` | host・port・unit_id・word_order・cpu_type                                 |
+| broker                       | `crates/banto-broker/src/lib.rs:828`、`crates/banto-driver-modbus/src/lib.rs:108-111`、`crates/banto-driver-slmp/src/lib.rs:93-105`                                                         | port・host・unit_id・word_order・cpu_type                                 |
+| Hub のシミュレータの付け替え | `apps/banto-hub/core/src/broker_glue.rs:839`・`:847`・`:1075-1077`                                                                                                                          | host・port・cpu_type・unit_id                                             |
+| R1 の `Settings`             | `crates/banto-drivers/src/lib.rs:94-105` `settings_from_connection`（SLMP にも `unit_id` を渡す）                                                                                           | 固定列 → `Settings`。本番の経路はまだ読まない（`broker_glue.rs:205-209`） |
+| ChronoGazer                  | `apps/chronogazer/core/src/hub.rs:4828-4833`・`:4926-4931`、`hub_tags.rs:680-685`、`rest.rs:919-945`（`PlcConnectionPayload`、`password` ほかを持たない）・`:955-975`・`:1022-1050`         | host・port・unit_id・word_order（読んだ行を入力へ写し直す）               |
+| Hub の予約接続               | `apps/banto-hub/core/src/runtime.rs:1180-1197` `ensure_virtual_connection`                                                                                                                  | `PlcConnectionInput` を全欄で組む                                         |
+
+### 1.4 R1 のレジストリと `Settings`
+
+- `crates/banto-driver-api/src/settings.rs:17-45` の `keys`（`host`・`port`・`unit_id`・`word_order`・`connect_timeout_ms`・`response_timeout_ms`・`cpu_type`・`transport`・`serial_port`・`station`）。doc に「R2b-1 moves the columns to JSON under the same keys」。`Settings` は**文字列の対の並び**で、入れ子を持てない。
+- `crates/banto-driver-api/src/driver.rs:139-155`: `DriverBase::validate_config(&Settings) -> Vec<FieldError>`（「未知のキーを断ってはならない」、適合テスト C2）と `secret_keys()`（既定は空）。**設定のスキーマ（キーの一覧・型・既定値）を返す口は無い**。
+- `crates/banto-driver-api/src/registry.rs:28-43`: `#[non_exhaustive] enum DriverKind { Frame, Session, HostBound }`。`HostBound` は「R1 だけ。R2b-3 で `Frame` へ移して消す」。
+- `crates/banto-drivers/src/lib.rs:72-81`: registry は `slmp`・`modbus-tcp` の `HostBound` だけ。トリップワイヤ 1（registry の id ⊆ `ALLOWED_PROTOCOLS`）・2（broker の表 == `HostBound` の id）。
+- Hub のエンジンは `HubDrivers { registry: Arc<DriverRegistry>, broker, client_factory }`（`apps/banto-hub/core/src/broker_glue.rs:211-215`）を `HubConfig.drivers`（`runtime.rs:206-207`）で受ける。**`init_db`（`runtime.rs:377`）の前にレジストリが手元にある**。core は `banto-drivers` に依存できない（R2b-0）。
+- `push` の静的な部分 `PushDriver: DriverBase` は core にあり、登録していない（ingest-design §2、Q5 で「R2b-1 で host が registry に登録する」と決定済み）。
+
+### 1.5 秘密値の今の置き場と通り道
+
+| 置き場・通り道                             | 場所                                                                                                                                                              | 事実                                                                                                                                                            |
+| ------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| DB の列                                    | `plc_connections.password`（平文、external-db §2.2）                                                                                                              | 秘密値は R2b-1 の時点で**これ 1 つ**（`modbus-tcp`・`slmp`・`push`・`virtual`・`hub` は持たない。ChronoGazer の Hub の API キーは別の保存先、下）               |
+| 未適用キュー                               | `apps/banto-hub/core/src/rest/crud.rs:137-189` `redact_pending_payload`                                                                                           | `pending_changes.payload` は `PlcConnectionPayload` を**平文のパスワードごと**保存する。伏せるのは応答の写しだけ。指紋（`:230-252`）は `passwordSet` だけを使う |
+| 応答                                       | `rest/plc_connections.rs:200-246` `PlcConnectionResponse`（`passwordSet` だけ）、MCP の `list_connections`（`mcp.rs:1858-`）                                      | 平文は返さない                                                                                                                                                  |
+| 平文を返す口（ループバック・admin の前提） | `rest/sink.rs:304-339`（`GET /api/sink/config`）、`rest/ingest_bridge.rs:129`・`:244-245`（`GET /api/ingest/bridge-config`、`ingestAllowed` のときだけ）          | サイドカーとブリッジが DB に繋ぐため                                                                                                                            |
+| 使う側                                     | `db_source/plan.rs:67`・`:280`（`Debug` は伏せる `:80`）、`db_source/mod.rs:478`・`:606`（接続と保存済みの接続のテスト `rest/plc_connections.rs:551-579`）        | `conn.password.unwrap_or_default()`。**「パスワード無し」と「読めない」を区別しない**（今は読めないことが無い）                                                 |
+| 設定パッケージ                             | `apps/banto-hub/src/lib/banto/configPackage.ts:50-63`（`CONFIG_PACKAGE_EXCLUDED_SECRETS` に `plc_connections.password`）・`:74-90`（型で `password` を持てない）  | 持ち運ばない                                                                                                                                                    |
+| MCP の説明                                 | `apps/banto-hub/core/src/mcp.rs:626-629`「パスワード(平文保存)」                                                                                                  | 文言の更新が要る                                                                                                                                                |
+| 接続以外（R2b-1 の範囲外の候補）           | `apps/banto-hub/core/src/settings.rs:89`・`:194-214`（MQTT のパスワード、`settings` 表に平文）、サイドカーの `banto-hub-sink.toml` の `api_key`（運用ガイド §12） | Q12                                                                                                                                                             |
+
+### 1.6 `banto-secret-store`
+
+- `crates/banto-secret-store/src/lib.rs:1-73`: DPAPI の **machine スコープ**で守った 1 アカウント 1 ファイルの保存先 `FileSecretStore`（`store.rs:134` `open`・`:150` `open_in`・`:263` `load`・`:301` `store`・`:331` `remove`）。ディレクトリの DACL を確かめ、**非 Windows では `SafeRootError::UnsupportedPlatform` で fail closed**（`lib.rs:42-47`）。アカウントの一覧を返す口は無い（ファイル名は `sha256(account)`）。
+- 封印の部品は公開されている: `pub trait Protector { fn protect(&self, plain, entropy) -> Vec<u8>; fn unprotect(&self, blob, entropy) -> Zeroizing<Vec<u8>> }`（`protector.rs:22-25`）、`#[cfg(windows)] pub struct DpapiMachine`（`:76`）。暗号化しない `PlainProtector` は `test-support` feature の中だけ（`:34`、`Cargo.toml` の `[features]`）。
+- 使っているのは ChronoGazer だけ（`apps/chronogazer/core/src/key_store.rs:107-126`・`:154-163`、Hub の API キー）。**Hub（`apps/banto-hub/core`）は使っていない**（`Cargo.toml` のコメントで `banto-safe-root` だけ）。
+- machine スコープの意味（`lib.rs:39-53`、chronogazer-service-design §6）: 同じ PC でファイルを読めるプロセスはすべて復号できる。守るのは**別の PC へのコピーとオフラインの盗難**。同じ PC の中の境界はファイルの ACL。OS の入れ直しで復号できなくなる。VM の複製先では復号できる。
+
+### 1.7 Hub の置き場と実行環境
+
+- profile のレイアウト（`apps/banto-hub/core/src/profile_paths.rs:10-16`・`:120-132`）: `{root}/profiles/<id>/{config/banto-hub.sqlite3, data/, logs/}`。ACL は SYSTEM・Administrators・インストール利用者（運用モードでは利用者は「読み取りと実行」だけ。運用ガイド §11 の「profile ディレクトリの権限」「設定モード ⇔ 運用モード」）。サービスは LocalSystem、デスクトップは利用者で、同じ profile を（排他つきで）交互に開く。
+- **Hub は非 Windows でも動く**: `resolve_hub_root` は非 Windows の既定を持ち（`profile_paths.rs:19-21`）、CI の `rust-db-source`（実 PostgreSQL、`.github/workflows/ci.yml:474-512`）と `e2e-hub` は ubuntu-latest で Hub を動かす。製品として Linux に出す計画は docs に無い（**要確認**: 非 Windows を「開発・CI 専用」と書いた決定は見つからなかった）。
+
+## 2. 範囲: R2b-1 で壊すもの・保つもの（R2b-7 との境）
+
+refactor-plan §4 で R2b は「互換を壊す」段だが、壊す面を R2b-1 と R2b-7 に分ける。**R2b-1 は保存の形だけを変え、外から見える形は R2b-7 まで保つ**（Q4）。
+
+| 面                                                      | R2b-1                                                                                                                                                                                                                                         | R2b-7                       |
+| ------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| DB（`plc_connections` の列・`CHECK`）                   | **壊す（戻せない）**。§3・§6                                                                                                                                                                                                                  | -                           |
+| 秘密値の置き場                                          | **変える**。DB のバックアップ・複製にパスワードが載らなくなり、別の PC では読めない（§5.6）                                                                                                                                                   | -                           |
+| `banto-tags` の Rust の型（workspace の中だけ）         | 変える: `PlcConnection` から `password` を除き、`settings` を全プロトコルで `Map`（`NOT NULL`）に。平らな欄（`host` ほか）は `settings` から作る**読み取りの写し**として残す。`PlcConnectionInput` の `password` は封印済みの値の欄（§5.3）へ | 平らな欄を消す              |
+| REST `/api/plc-connections`（Hub）                      | 保つ（平らな形）。追加は応答の `passwordState` だけ                                                                                                                                                                                           | `{driver, settings}` の形へ |
+| MCP の接続のツール                                      | 保つ。説明の「平文保存」を直す・一覧に `passwordState` を足す                                                                                                                                                                                 | 形を変える                  |
+| 設定パッケージ                                          | 保つ（版 2、秘密値は持たない）                                                                                                                                                                                                                | 版を上げる                  |
+| `GET /api/sink/config`・`GET /api/ingest/bridge-config` | 保つ。パスワードの出どころが封印した blob に替わる。読めない接続は載せず、`unavailableConnections`・`unavailableSources` を足す（§5.4）                                                                                                       | -                           |
+| ChronoGazer（REST・Tauri・UI・`ALLOWED`）               | 保つ。DB の migration だけは当たる（§6.7）                                                                                                                                                                                                    | 追従                        |
+| UI（`plcConnectionForm.ts`・`ConnectionDrawer.svelte`） | 保つ。表示だけ「パスワード: 読めません（再入力してください）」を足す                                                                                                                                                                          | R2b-6 で汎用フォーム        |
+| 未適用キューの中身（内部）                              | 変える: パスワードを封印済みで持つ（§5.3）                                                                                                                                                                                                    | -                           |
+
+## 3. データモデル
+
+### 3.1 新しい `plc_connections` と秘密の表
+
+```sql
+CREATE TABLE plc_connections_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    -- 何が存在するかの正はレジストリ（§4）。SQL は DriverId の文法だけを見る（Q14）
+    protocol TEXT NOT NULL
+        CHECK (length(protocol) BETWEEN 1 AND 64
+               AND protocol NOT GLOB '*[^a-z0-9-]*'
+               AND substr(protocol, 1, 1) <> '-'),
+    enabled INTEGER NOT NULL DEFAULT 1,
+    simulation INTEGER NOT NULL DEFAULT 0,
+    settings TEXT NOT NULL DEFAULT '{}'
+        CHECK (json_valid(settings) AND json_type(settings) = 'object'),
+    settings_version INTEGER NOT NULL DEFAULT 1 CHECK (settings_version >= 1)
+);
+
+-- 秘密値（§5）。FK は張らない（hub_sink_groups と同じ慣行。Q15）。消すのは banto-tags の
+-- 削除の全入口が同じトランザクションの中で行い、起動時に整合を確かめる（§5.3）
+CREATE TABLE plc_connection_secrets (
+    ref TEXT PRIMARY KEY CHECK (length(ref) = 32 AND ref NOT GLOB '*[^0-9a-f]*'),
+    connection_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    scheme TEXT NOT NULL CHECK (scheme IN ('plain-v1', 'dpapi-machine-v1')),
+    blob BLOB NOT NULL,
+    UNIQUE (connection_id, key)
+);
+```
+
+- `enabled`・`simulation` は列のまま（ドライバではなくホストの概念。`simulation` は R2b-5 で値の層へ移るときに扱いを決める）。`postgres`・`virtual`・`hub`・`push` は今も `simulation = false` に正規化されている（`plc_connection.rs:548-559`）。
+- `idx_plc_connections_single_hub` は同じ定義で作り直す（`hub` は ChronoGazer の概念で、レジストリの外の不変条件。R2b-7 で ChronoGazer を追従させるときに見直す）。
+- `protocol` の文法の `CHECK` は `DriverId`（`banto-driver-api/src/address.rs:18-34`）と同じ。長さの上限 64 は本書の提案（`DriverId` に上限は無い。Q14）。
+
+### 3.2 プロトコルごとの `settings`（移行の写し方）
+
+| `protocol`   | `settings`（JSON の型）                                                                                                                  | 捨てる列（読まない）                                                                          |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `modbus-tcp` | `host`（文字列）・`port`（整数）・`unit_id`（整数）・`word_order`（`"high_low"` / `"low_high"`）                                         | `cpu_type`（常に既定の `R`。`settings_from_connection` も渡していない）                       |
+| `slmp`       | `host`・`port`・`word_order`・`cpu_type`（`"Q"` / `"R"`）                                                                                | `unit_id`（SLMP は読まない。`plc_connection.rs` の module doc、`slmp_config_for` も読まない） |
+| `postgres`   | `host`・`port`・`database`（文字列）・`username`（文字列）・`password`（**参照** `{"$secret": "<ref>"}`、空・NULL なら欄そのものが無い） | `unit_id`・`word_order`・`cpu_type`（`normalize_postgres_input` で既定に揃えてある）          |
+| `virtual`    | `{}`                                                                                                                                     | `host`・`port`・`unit_id`・`word_order`・`cpu_type`                                           |
+| `hub`        | `{}`（ChronoGazer。Hub の URL と API キーは ChronoGazer の別の保存先）                                                                   | 同上                                                                                          |
+| `push`       | 今の `settings` をそのまま（NULL なら `{}`）                                                                                             | 同上                                                                                          |
+
+- **捨てた値で既定と違うもの**（例: SLMP の行の `unit_id = 3`、手で書き換えた `virtual` の `host`）は、移行の preflight の報告に「捨てる値」として出す（移行は止めない。Q9）。読む経路が無いので振る舞いは変わらない。REST の平らな形で読み返すと既定の値が返る（`slmp` の `unitId` は 1）。
+- タイムアウト（`connect_timeout_ms`・`response_timeout_ms`）は今は列が無く、収集の一律の値（`CollectorOptions`）。R2b-1 では書かない（無い = ドライバの既定）。
+- 型つきで保存するのは、人と SQL（`json_extract`）が読みやすく、R2b-6 の汎用フォームが型を知るため。ドライバへは §3.5 の規則で文字列に直して渡す。
+
+### 3.3 秘密値の参照
+
+- `settings` の秘密のキー（ドライバの `secret_keys()` が返すもの。`postgres` は `password`）の値は、**常に** `{"$secret": "<ref>"}`。`<ref>` は 128 ビットの乱数の小文字 16 進 32 文字で、`plc_connection_secrets.ref` と一致する。平文の文字列が秘密のキーに来たら `banto-tags` が保存の層で断る（入口の取りこぼしで平文が DB に入らない最後の砦、§8）。
+- 接続 id ではなく乱数の参照にする理由: 作成では封印の時点で id がまだ無い。参照を封印の entropy に入れる（§5.2）ので、行どうしで blob を入れ替えても開けない。
+
+### 3.4 `settings_version`
+
+- 行の `settings_version` は「書いた時点のドライバの設定の形の版」。`DriverDescriptor` に `settings_version: u32`（`DriverDescriptor::new` で 1。`#[non_exhaustive]` の struct への追加なので壊さない）を足す。
+- 読むとき: 行の版 > ドライバの版なら、その接続を `SettingsVersionTooNew` で外す（新しい Hub で書いた DB を古い Hub で開いた・プラグインの版を戻した、の守り。plugin-design §7.4 のロールバックと同じ考え方）。行の版 < ドライバの版の変換（ドライバの「設定の版上げ」の口）は、最初に要るドライバが出たときに API に足す。R2b-1 では全部 1。
+- 列を今足す理由: 後で足すとまた表の作り直しになる（作り直しは毎回トリガと `sqlite_sequence` の事故の元。checklist §5）。Q10。
+
+### 3.5 JSON と `Settings`（API）の対応
+
+`Settings` は文字列の対しか持たない（§1.4）。入れ子をどう渡すかは ingest-design §13 の 5 が R2b-1 に残した問い。**API は変えず、ホストの純関数 1 つで変換する**（Q11）:
+
+| JSON の値          | `Settings` の値                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------------ |
+| 文字列             | そのまま                                                                                               |
+| 整数・小数         | 10 進の文字列（`serde_json` の表記）                                                                   |
+| `true` / `false`   | `"true"` / `"false"`                                                                                   |
+| オブジェクト・配列 | 詰めた JSON の文字列（R2a の `push` の `bridge` と同じ、ingest-design §3.2）                           |
+| `{"$secret": ...}` | 検証（`validate_config`）には**渡さない**。接続（R2b-3 の `SessionDriver::connect`）にだけ開封して渡す |
+| `null`             | キーを渡さない                                                                                         |
+
+- 置き場は `banto-tags`（`serde_json` を既に持つ）の純関数 `settings_to_api(&Map) -> Settings`。R1 の `banto_drivers::settings_from_connection`（固定列から作る）はこれに置き換えて消す。
+- 秘密のキーを検証に渡さないので、ドライバの `validate_config` は秘密値の形を見られない（`password` に形の規則は今も無い）。秘密のキーの「必須」は、ドライバが必須にするなら別の口が要る（R2b-1 では無い。`postgres` のパスワードは任意、`plc_connection.rs:1062-1066`）。
+
+## 4. 検証: レジストリを正にする
+
+### 4.1 登録するもの
+
+| id           | `DriverKind`               | 静的な部分（`DriverBase`）の置き場                                                                                                                                                                       | 登録する host                                                                                           |
+| ------------ | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `modbus-tcp` | `HostBound`（R1 のまま）   | `banto-driver-modbus`                                                                                                                                                                                    | `banto_drivers::builtin()`                                                                              |
+| `slmp`       | `HostBound`                | `banto-driver-slmp`                                                                                                                                                                                      | 同上                                                                                                    |
+| `push`       | **`HostProvided`（新設）** | `apps/banto-hub/core/src/ingest/driver.rs`（`PushDriver`、R2a で作って登録していないもの）                                                                                                               | Hub の host（`banto-hub-host`・`src-tauri`・テスト）が `banto_hub_core::host_provided_drivers()` を足す |
+| `postgres`   | `HostProvided`             | core に新設（`db_source/driver.rs`。`validate_plc_connection_input` の postgres の規則を写す: `host` 必須・`port` 1..=65535・`database` / `username` 必須で 128 文字まで。`secret_keys = ["password"]`） | 同上                                                                                                    |
+| `virtual`    | `HostProvided`             | core に新設（`computed/driver.rs`。`validate_config` は何も断らない: 適合テスト C2 が未知のキーの許容を求めるため。「`settings` は `{}` だけ」は JSON の層（R2b-1c/1d）が持つ。R2b-1a の実装で調停）     | 同上                                                                                                    |
+| `hub`        | Hub には登録しない         | -                                                                                                                                                                                                        | -                                                                                                       |
+
+- `HostProvided(Arc<dyn DriverBase>)` の意味: 「識別・設定の検証・秘密のキー・アドレスの関数はドライバの形。I/O はホストが自分で持つ（収集の外部ソース・`db_source`・計算）」。`HostBound`（R2b-3 で `Frame` へ移して消える一時の種類）とは寿命が違う。`#[non_exhaustive]` の enum への追加なので API の破壊ではない（`banto-driver-api` は 0.1 の minor）。
+- `push` の `DriverKind` をこれで決めるので、ingest-design §2 の「R2b-3 の前に決める」問いのうち (b) を採ることになる（Q5）。`Session` に品質を運ぶ読み取りを足す (a) は不要になる。
+- Hub のレジストリに `hub` を載せない: Hub は `hub` 接続を作らない（`rest/plc_connections.rs:163-191` `reject_hub_connection_protocol`）。手で書き換えた DB に `hub` の行があれば §4.4 の「ドライバが無い接続」として扱う（今の厳格版の計画が「未対応」で断るのと同じ結果）。
+- トリップワイヤ: 2（broker の表 == `HostBound` の id）は変えない。新しく「Hub の registry の id の集合 == Hub の収集が計画できるプロトコルの集合」（`push`・`postgres`・`virtual` は host 側の実装があること）を `banto-hub-host` のテストに足す。トリップワイヤ 1（registry ⊆ `ALLOWED_PROTOCOLS`）は R2b-1f で「registry ⊆ 旧規則の一覧（ChronoGazer 用）」に読み替えるか消す。
+- `postgres` は R2b-8 で撤去する予定（refactor-plan）。そのときは登録を外すだけで、行が残っていれば §4.4 の扱いになる。
+
+### 4.2 `banto-tags` への注入
+
+```rust
+// crates/banto-tags/src/plc_connection.rs
+impl PlcConnectionService {
+    /// 旧規則（ALLOWED_PROTOCOLS と今の手書きの検証）。ChronoGazer と banto-tags のテストが使う
+    pub fn new(pool: SqlitePool) -> Self;
+    /// レジストリを正にする（Hub）。プロトコルの有無・settings の検証・秘密のキーをここから引く
+    pub fn with_registry(pool: SqlitePool, registry: Arc<DriverRegistry>) -> Self;
+}
+```
+
+- `banto-tags` は `banto-driver-api`（依存ゼロ、`crates/banto-driver-api/Cargo.toml`）に依存する。`banto-driver-api` は `banto-tags` に依存しないので循環しない。plugin-design §5 の「`banto-tags` に検証のコールバックを渡す」をレジストリそのものを渡す形で行う。
+- Hub は `TagRegistryState`・MCP の状態・`PendingChangesAdminState`・`runtime` の予約接続・移行の preflight のすべてで `with_registry` を使う。`new` を使ったままの入口が残ると旧規則で書けてしまうので、Hub の core の非テストのコードに `PlcConnectionService::new(` が残っていないことを grep のテスト（`banto-hub-host` の tests）で固定する。
+- 検証の順: (1) 旧い平らな形の検証（今の `validate_plc_connection_input`。文言は今のまま。R2b-7 で消える）→ (2) 平らな形を `settings` に写す（§4.3）→ (3) `registry.get(protocol)` が無ければ `protocol` の項目エラー → (4) `settings_to_api` → `validate_config` → `FieldError.key` を REST の綴り（`unit_id` → `unitId`、`word_order` → `wordOrder`、`cpu_type` → `cpuType`、`push` は今の `settings.*`）に写して返す。組み込みについては (1) と (4) が同じ集合を断ることを表のテストで固定する（§9）ので、今の画面とテストが見るエラーの文言は変わらない。
+
+### 4.3 平らな形のアダプタ（R2b-7 まで）
+
+- `legacy::settings_from_flat(&PlcConnectionInput) -> Map`: §3.2 の表のとおりにプロトコルごとに写す（正規化の後）。
+- `legacy::flat_view(protocol, &Map) -> FlatView`: `PlcConnection` の平らな欄（`host`・`port`・`unit_id`・`word_order`・`cpu_type`・`database`・`username`）を `settings` から作る。無いキーは今の既定（`host` は `""`、`port` は 0、`unit_id` は 1、`word_order` はプロトコルの既定、`cpu_type` は `R`）。`FromRow` がこれを呼ぶので、収集・broker・ChronoGazer は R2b-1 では書き換えない（§7）。
+- 更新の「省略は保つ」（`cpu_type`・`push` の `settings`・パスワードの tri-state・ChronoGazer の `simulation` の #417）は、**同じ書き込みトランザクションの中**で今の `settings` を読んで合わせる（REST・MCP・キューの適用は既に `BEGIN IMMEDIATE`）。トランザクションの外で読んで書き戻す形は作らない（#417 のオーナーレビュー P2。`update_preserving_simulation` は SQL の `COALESCE` のまま）。`update()`（トランザクションを持たない形）は中で `BEGIN IMMEDIATE` を張る。
+
+### 4.4 ドライバが無い接続・読めない `settings`
+
+- 行の `protocol` がレジストリに無い（`hub` の行・将来プラグインを外した）・`settings` がドライバの検証に通らない（手で書き換えた）・版が新しすぎる: 行は残し、収集の計画で**その接続だけ**を外す（新しい `ExclusionReason::{DriverUnavailable, InvalidSettings { errors }, SettingsVersionTooNew}`）。plugin-design §7.5「設定を消したり別プロトコルに読み替えたりしない」と、checklist §5「1 件の事故で全体を止めない」。
+- `FromRow` は `settings` を JSON として読めなければ失敗する（今の `:924-952` と同じ）。`CHECK (json_valid AND object)` があるので SQL を通る行では起きない。
+
+## 5. 秘密値
+
+### 5.1 保管方式（Q1）
+
+| 案                                                                             | 中身                                                                                                  | 長所                                                                                                                                                              | 短所                                                                                                                                                                                                                                                                                                     |
+| ------------------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| (a) `FileSecretStore` に 1 秘密 1 ファイル（`{profile}/secrets/connections/`） | 字面どおり。`settings` には参照                                                                       | 監査済みの保存先をそのまま使う。DB の複製に blob も載らない                                                                                                       | DB のトランザクションと二相になる。書いてから DB が失敗・クラッシュ → 孤児、DB を確定してから消す前に落ちる → 孤児。掃除にはアカウントの一覧の口（crate に無い）と、作成中のものを消さない猶予が要る。未適用キューの間の置き場も要る。古い DB のバックアップを同じ PC に戻すと、掃除済みの参照は読めない |
+| (b) 封筒の暗号（鍵を `FileSecretStore`、暗号文を DB）                          | 1 つの鍵を DPAPI で守り、`ring` の AEAD で値を暗号化                                                  | DB と同じ単位で確定する。`ring` は既に `Cargo.lock` にある                                                                                                        | 暗号の組み立て（nonce・AAD・鍵の回転）を自前で書いて監査する。鍵のファイルと DB の 2 つが揃わないと読めない                                                                                                                                                                                              |
+| **(c) DPAPI の blob を DB に（推奨）**                                         | `banto_secret_store::DpapiMachine::protect(平文, entropy)` の blob を `plc_connection_secrets` に置く | DB と同じ単位で確定する（孤児・掃除・二相が無い）。暗号は DPAPI に任せ、監査済みの crate の部品を使う。バックアップと複製は同じ PC なら戻る、別の PC では読めない | DB の複製に blob が載る（ただし別の PC では開けない）。`FileSecretStore` の「ディレクトリの ACL を毎回確かめる」守りは使わない（下）                                                                                                                                                                     |
+
+- (c) で守りが弱くならない理由: machine スコープの DPAPI が守るのは別の PC とオフラインだけで、同じ PC の境界はファイルの ACL（§1.6）。秘密の専用ディレクトリを作っても、その ACL の相手は profile の DB（`config/`）と同じ SYSTEM・Administrators・インストール利用者になる（運用ガイド §11）。DB の中に置いても、読める人は変わらない。
+- (c) で増える守り（今の平文の列との比較）: DB のファイル・バックアップ・サポートのための複製（checklist §2-7 のような DB の複製での確認）・未適用キューの行を、別の PC へ持ち出しても平文が出ない。
+- user スコープの DPAPI・Windows の資格情報マネージャーは採らない: サービス（LocalSystem）とデスクトップ（利用者）が同じ profile を交互に開くので、どちらかが読めなくなる（chronogazer-service-design の決定 4 と同じ理由）。
+
+### 5.2 封印と開封
+
+```rust
+// apps/banto-hub/core/src/secrets.rs（新設）
+pub enum SecretScheme { PlainV1, DpapiMachineV1 }
+pub struct SealedSecret { pub r#ref: SecretRef, pub scheme: SecretScheme, pub blob: Vec<u8> }   // Debug は ref と scheme だけ
+pub enum SecretState { None, Set, Unreadable { reason: UnreadableReason } }
+pub struct ConnectionSecrets { protector: Option<Arc<dyn Protector>> }   // Windows = Some(DpapiMachine)、非 Windows = None
+impl ConnectionSecrets {
+    pub fn seal(&self, key: &str, plain: &str) -> Result<SealedSecret, SecretError>;          // 新しい ref を作る
+    pub fn open(&self, key: &str, sealed: &SealedSecret) -> Result<Zeroizing<String>, SecretError>;
+    pub fn reseal_plain(&self, key: &str, sealed: &SealedSecret) -> Result<Option<SealedSecret>, SecretError>; // §6.5
+}
+// entropy = "banto-hub/plc-connection-secret/v1:" + ref + ":" + key
+```
+
+- entropy に参照とキーを入れる（`banto-secret-store` の `entropy_for` と同じ考え方）。行の blob を別の行へ写しても開けない。
+- 平文は `Zeroizing` で持ち、開封は**使う直前**（DB への接続を張るとき・設定を返す応答を組むとき）だけ。収集の計画（`RegistrySnapshot`）は封印した行（`SealedSecret`）を持ち、平文を持たない（checklist §5「平文の資格情報は、それを持つ層の外に出さない」）。
+- `SecretError` と `Debug` は平文・blob を持たない（`banto-secret-store` と同じ約束）。
+
+### 5.3 寿命
+
+| 場面                                               | すること                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 作成（REST・MCP・キューの適用）                    | Hub の入口で平文を `seal` し、`PlcConnectionInput.secrets` に `SecretChange::Set(SealedSecret)` を渡す。`banto-tags` は同じトランザクションで接続の行と秘密の行を書き、`settings.password = {"$secret": ref}`。どこかで失敗すれば全部が戻る                                                                                                                                                                                                                                                              |
+| 更新（パスワードの tri-state を保つ）              | 省略・`null` → `Keep`（`settings` の参照も行もそのまま）。空文字 → `Clear`（参照を消し、行を消す）。値 → `Set`（新しい ref の行を足し、古い行を消し、参照を替える）。すべて同じトランザクション                                                                                                                                                                                                                                                                                                          |
+| プロトコルの変更（`postgres` → 他）                | 新しいプロトコルの `secret_keys` に無い参照と行を同じトランザクションで消す                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| 改名                                               | 何もしない（参照は名前を含まない）                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 削除・一括削除（`delete_tx`・`cascade_delete_tx`） | 同じトランザクションで `connection_id` の行を消す                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| 未適用キューに積む                                 | 積む時点で `seal` し、ペイロードには平文ではなく封印した値（`sealedPassword: {ref, scheme, blob(base64)}`）を載せる。取り消し・失敗・再投入はペイロードごと動くので孤児にならない。応答の写しの伏せ字（`redact_pending_payload`）は封印した値も外して `passwordSet` を出す。`applied`・`canceled` へ移すときは同じトランザクションで `sealedPassword` を外して `passwordSet` に置き換える（履歴の行に blob を残さない。非 Windows の `plain-v1` の blob は平文そのものなので。2026-10-21 レビュー P2-3） |
+| 指紋（`compute_pending_base_fingerprint`）         | 今どおり `PlcConnectionResponse`（`passwordSet` / `passwordState` だけ）。パスワードだけの変更が指紋に出ないのは今と同じ（`crud.rs:236-246` の判断）                                                                                                                                                                                                                                                                                                                                                     |
+| 監査                                               | 接続の作成・更新の監査に `secretsChanged: ["password"]`（値も参照も載せない）を足す                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 起動時の整合の確認                                 | `settings` の参照と `plc_connection_secrets` の行の突き合わせ。参照があって行が無い → その接続は `Unreadable { Missing }`。行があって参照が無い → ログに 1 行出して消す（FK を張らない代わり。Q15）                                                                                                                                                                                                                                                                                                      |
+
+### 5.4 読む側
+
+| 読む側                                                                    | R2b-1 の後                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `db_source`（`plan.rs:280`・`mod.rs:478`）                                | 計画は `SealedSecret` を持ち、接続を張るときに `open`。`Unreadable` ならその接続だけを「パスワードを読めません」で Bad にし、再試行で繋ぎに行かない（§5.5）                                                                                                                                                                                                                                                                                                                                                                                          |
+| 保存済みの接続のテスト（`mod.rs:606`）                                    | 同じ。読めなければ `ok: false` と理由                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `GET /api/sink/config`（`sink.rs:330-339`）                               | `open` して返す。読めない接続は `connections` に**載せない**。代わりに `unavailableConnections: [{id, name, reason}]`（`reason` は `missing` / `undecryptable`）に出す。`password: null` で返すことはしない                                                                                                                                                                                                                                                                                                                                          |
+| `GET /api/ingest/bridge-config`（`ingest_bridge.rs:244-245`）             | 同じ形: 読めない接続を引くソースは `sources` に載せず、`unavailableSources: [{connectionId, name, dbConnectionId, reason}]`（`connectionId` は `push` の接続、`dbConnectionId` は読めない `postgres` の接続） に出す（`ingestAllowed: false` なら今どおり開封もしない）                                                                                                                                                                                                                                                                              |
+| サイドカー（`apps/banto-hub-sink/src/flush.rs`・`run.rs`、`src/source/`） | `unavailable*` に出た接続・ソースは繋がず、状態に「Hub でパスワードを読めません」を出す。**古いサイドカーも繋がない**: 応答に載っていない接続を引くグループは今の `GroupSetupError::MissingConnection`（`run.rs:428-441`）で書かず、載っていないソースは引かない（`hub_api.rs` は `deny_unknown_fields` を付けないので新しい欄は無視される）。`password: null` を返す案は、今の `build_pool`（`flush.rs:103-121`）が `null` を空文字にして繋ぐので、DB が `trust` 認証なら繋がってしまう（2026-10-21 レビュー P2-2。§5.5「読めないときは繋がない」） |
+
+### 5.5 秘密値が読めない PC
+
+- 起こる場面: DB を別の PC に戻した、OS を入れ直した（machine の鍵が変わる）、秘密の行を消した。DPAPI の失敗は `Unreadable { Undecryptable }`、行が無いのは `Unreadable { Missing }`。
+- 「パスワード無し」（`None`）と「読めない」（`Unreadable`）を分ける。今の `unwrap_or_default()` のように空に潰すと、`trust` 認証の DB なら**別の資格で繋がってしまう**（checklist §5「エラーを空に潰さない」）。
+- 表示: REST の応答に `passwordState: "none" | "set" | "unreadable"`（`passwordSet` は今どおり `state == "set"`）。ドロワーは「パスワード: 読めません（この PC で再入力してください）」。状態の画面の `db_source` 節の理由にも同じ文言。
+- 直し方: 接続の編集でパスワードを入れ直す（`Set`）。運用ガイドに「DB を別の PC に移したら postgres 接続のパスワードを入れ直す」を書く。
+
+### 5.6 設定パッケージ・バックアップ・DB の複製
+
+- 設定パッケージは今どおり秘密値を持ち運ばない（Q3）。パスフレーズで暗号化して持ち運ぶ案は、鍵の導出・パスフレーズの UI・監査が要るので、需要が出てから別の段で。取り込み後の画面に「パスワードは移りません。postgres 接続 n 件で入れ直してください」を出す（`push` の「取り込みのキーは移りません」と同じ置き場）。
+- DB のバックアップ（`VACUUM INTO`・ファイルのコピー）: 同じ PC に戻せばパスワードも戻る（DPAPI の machine の鍵が同じ）。別の PC に戻すと読めない（§5.5）。運用ガイドのバックアップの節にこの違いを書く。
+- 今の平文の列は、DROP した後も SQLite の空きページと WAL に残りうる。移行の後処理で `VACUUM` と WAL の切り詰めをする（§6.5）。
+
+### 5.7 Windows サービスと DPAPI の範囲
+
+- machine スコープなので、サービス（LocalSystem）・デスクトップ（利用者）・昇格ヘルパーのどれでも開ける。境界は profile の ACL（運用モードでは利用者は読み取りだけ。読めるので開封はできるが、Hub の profile の排他でサービスと同時には動かない）。
+- 運用モード（#661）で利用者が DB を書けない間も、封印・開封は DB の読み書きの権限だけに依存する（秘密の別ディレクトリを作らないので、ACL の締め・緩めの対象は増えない）。
+
+### 5.8 非 Windows（Q2）
+
+- `ConnectionSecrets { protector: None }` は `plain-v1`（blob = UTF-8 の平文）で封印する。守りは今の列と同じ。起動時のログに 1 行と、状態の画面（管理者向け）に「秘密値を平文で保存しています（Windows 以外）」を出す。
+- Windows の Hub が `plain-v1` の行を見つけたら、起動時に `dpapi-machine-v1` に封印し直す（§6.5）。逆（Windows の DB を非 Windows で開く）は `Unreadable { Undecryptable }`。
+
+## 6. 移行
+
+### 6.1 起動時の手順（Hub）
+
+```text
+HubRuntime::start（runtime.rs:340-）
+  1. profile の排他（今どおり）
+  2. init_db を 2 つに分ける:
+     a. 接続・旧形式の拒否・Hub 自身の migrator（今の db.rs:135-, :191-198）
+     b. banto-tags の未適用の版を調べる（_sqlx_migrations_banto_tags）。0025 が未適用なら §6.3〜§6.4:
+        バックアップ → 写しで予行と preflight → 通らなければ HubStartError::ConnectionSettingsPreflight で止まる
+     c. banto_tags::migrate（0025 を含む）→ banto_collect::migrate（今どおり）
+  3. 秘密値の後処理（§6.5）: Windows なら plain-v1 → dpapi-machine-v1、未適用キューの平文の封印、
+     整合の確認（§5.3）、必要なら VACUUM
+  4. 以降は今どおり（予約接続・CollectorManager::rebuild ほか）
+```
+
+- 2-b のレジストリは `HubConfig.drivers.registry`（`runtime.rs:206-207`、`init_db` より前に手元にある）。
+- 3 は**毎回の起動で冪等**（`plain-v1` の行・平文の `password` か `plain-v1` の `sealedPassword` を持つ未適用キューの行・`password` か `sealedPassword` を持つ履歴の行が無ければ何もしない）。0025 の直後に限らない（非 Windows の DB を Windows へ移した場合も拾う）。
+
+### 6.2 migration `0025_plc_connections_settings_json.sql`（`banto-tags`）
+
+`0023` の header の手順をそのまま踏む（park-and-restore）。違いは次のとおり。
+
+1. **トリガ 6 本を先に外す**: `0020` の 2 本（`tags_hub_external_name_unique_insert` / `_update`）と `0024` の 4 本（`tags_push_key_unique_insert` / `_update`・`collection_groups_push_key_unique_move`・`plc_connections_push_key_unique_protocol`）。最後の 1 本は `plc_connections` 自身のトリガで、表を DROP すると消えるが、明示して外す（作り直しの対で読めるように）。
+2. 子孫（`tags` → `collection_groups`）を一時表へ退避して消す。
+3. 秘密の参照を先に決める: `CREATE TEMPORARY TABLE _m0025_refs AS SELECT id, lower(hex(randomblob(16))) AS ref FROM plc_connections WHERE protocol = 'postgres' AND password IS NOT NULL AND password <> ''`。
+4. `plc_connections_new`（§3.1）を作り、§3.2 の表を `CASE protocol WHEN ... THEN json_object(...)` で写す。`postgres` で参照がある行は `json_set(..., '$.password', json_object('$secret', r.ref))`。`push` は `COALESCE(settings, '{}')`。どの `WHEN` にも当たらない `protocol` は今の `CHECK` の下では存在しないが、`ELSE '{}'` にして `settings_version = 1`。
+5. `plc_connection_secrets` を作り、`_m0025_refs` と旧表から `(ref, id, 'password', 'plain-v1', CAST(password AS BLOB))` を入れる。
+6. `sqlite_sequence` の高水位（大きい方）を新表へ写す（`0023:101-111` と同じ書き方）。旧表を DROP、新表を RENAME、`idx_plc_connections_single_hub` を作り直す。
+7. 子孫を戻し、一時表を消し、トリガ 6 本を**同じ定義で**作り直す（`plc_connections_push_key_unique_protocol` も）。header に「後の migration で作り直すときもこの 6 本」を書く。
+
+- 旧表の `host`・`database`・`username` は保存時に前後の空白を除いてある（`plc_connection.rs:1395-1409`・`:1438-1450`）ので、`json_object` へはそのまま写す（手で書き換えた行の空白は preflight の検証が拾う）。
+- 純粋な SQL なので、ChronoGazer の DB にもそのまま当たる（§6.7）。
+
+### 6.3 写しでの予行と preflight
+
+plugin-design §7.4（有効化の前に保存済みの設定を新しい版で検証し、1 件でも通らなければ切り替えない）と同じ考え方を移行に当てる。**変換の正は SQL（§6.2）の 1 つだけ**にし、Rust で同じ変換を書き直さない（#334 / #605 の写しのずれと同じ事故を避ける）。
+
+1. `VACUUM INTO '{config}/.banto-hub-0025-dryrun-{nonce}.sqlite3'`（profile の `config/` の中。ACL は DB と同じ）。
+2. その写しに `banto_tags::migrate` を流す（0025 を含む未適用の版が全部当たる）。
+3. 写しの全接続を `RegistrySnapshot::load` 相当で読み、`registry.get(protocol)` と `validate_config(settings_to_api(settings))` にかける。秘密の行の数が「旧表の非空のパスワードの数」と一致することも確かめる。
+4. 写しを消す（成功・失敗・パニックのどれでも。`Drop` で消す形にし、消せなければ起動を止めてパスを出す。写しには平文のパスワードがある）。
+5. 結果: **断る**（移行しない）= ドライバが無い行（Hub の DB の `hub` の行を除く）・検証に通らない行・秘密の数の食い違い。**報告だけ**（移行する）= 捨てる値（§3.2）、Hub の DB の `hub` の行（移行後は §4.4 で外れる。今も厳格版の計画で収集できない）。
+
+- 断ったとき: `HubStartError::ConnectionSettingsPreflight { rows: Vec<(id, name, protocol, errors)> }`。コンソールの stderr・サービスのログ（今の起動失敗の経路、`db.rs` の `LegacyDatabase` と同じ）に、直し方（旧版の Hub でその接続を直すか消す）と一緒に出す。DB は一切変わっていない（予行は写しだけ）。
+- 予行の時間: `VACUUM INTO` は DB 全体（監査ログを含む）を写す。監査ログが大きい DB で何秒かかるかは**要確認**（R2b-1d で 100 MB 級の DB で測り、PR に書く）。
+
+### 6.4 バックアップと戻し方（Q8）
+
+- 移行の直前に、作りかけの名前で `VACUUM INTO '{config}/banto-hub.sqlite3.before-0025-{UTC の日時}.bak.partial'`。その写しを `journal_mode = DELETE` で開き、`plc_connections.password` を NULL に・キューのペイロード（状態を問わず）から `password` を外し、`VACUUM` してから閉じる（**バックアップにパスワードを残さない**。空きページにも残さないため `VACUUM` まで。WAL を作らないため `DELETE`）。閉じた後に `.partial` を外す名前へ `rename` し、ここで初めて完成したバックアップとして扱う。
+- **作りかけのバックアップを残さない**（2026-10-21 レビュー P2-1）: 平文を含みうるのは `.partial` の名前のものだけ。起動時の手順（§6.1 の 2-b）の最初に `{config}/banto-hub.sqlite3.before-0025-*.bak.partial`（と `-journal`）を探して消し、消せなければ起動を止めてパスを出す（予行の写し §6.3 の 4 と同じ扱い）。0025 の前後を問わず毎回の起動で探す（名前の型を探すだけなので安い）。完成した `.bak` は除去と `VACUUM` が済んでいるので消さない。
+- 戻し方（運用ガイドと CHANGELOG に書く）: Hub を止める → 旧版（alpha.33）を入れ直す → バックアップを `banto-hub.sqlite3` に戻す（`-wal`・`-shm` は消す）→ 起動 → postgres 接続のパスワードを入れ直す。新しい DB を旧版でそのまま開くことはできない（§1.1 の `ignore_missing`。要確認の項目）。
+- バックアップは自動では消さない。運用ガイドに「動作を確かめたら消してよい」と書く。
+
+### 6.5 Hub の後処理（毎回の起動、冪等）
+
+1. `BEGIN IMMEDIATE` の 1 トランザクションで:
+   - Windows: `plc_connection_secrets` の `plain-v1` の行を `open` → `DpapiMachine` で封印し直して `UPDATE`（ref は変えない）。
+   - `pending_changes` の `state IN ('pending', 'applying', 'failed')` で `plc_connections.create` / `.update` のペイロードに平文の `password` がある行: 封印した値に置き換える（`applying` の行は R2b-1 の前の Hub が落ちた跡。適用の再開の扱いは今の `pending_changes` の規則のまま）。
+   - 同じ 3 つの状態で `sealedPassword.scheme = "plain-v1"` の行（非 Windows で積んだキューを Windows へ移した跡）: Windows なら `DpapiMachine` で封印し直して `sealedPassword` を置き換える（ref は変えない。2026-10-21 レビュー P2-3）。
+   - `applied` / `canceled` の行: `password` と `sealedPassword` の**両方**を外して `passwordSet` に置き換える（履歴の行に平文も blob も残さない。§5.3 の移すときの規則を持たない R2b-1d の版（1e の前）で移った行を拾う）。
+2. **清掃待ちの印**（Hub の `settings` 表の `secrets.vacuum_pending = true`）があるときだけ、トランザクションの外で `PRAGMA wal_checkpoint(TRUNCATE)` と `VACUUM`（DROP した旧表・書き換えた行の平文が空きページと WAL に残るため）。`VACUUM` が成功した後に印を消す。
+   - 印を立てるのは、平文を空きページへ追い出しうる書き込みと**同じトランザクション**: 1 で何か書き換えたとき（毎回の起動の再処理を含む）。0025 の旧表の DROP の跡は、0025 が未適用と分かった時点（§6.1 の 2-b、migrate の**前**）に印を立てて覆う（0025 は `banto-tags` の migrator のトランザクションなので同じトランザクションにできない。先に立てておけば、migrate の直後に落ちても印は残る。余分な `VACUUM` は害が無い）。印は「その起動の後処理が済んだ」ではなく「清掃がまだ」を表すので、前の起動の完了が後の書き換えを覆わない（2026-10-21 再レビュー P2: 完了の印 `vacuumed_after_0025 = true` を一度書くと、2 回目以降の再封印の commit の直後に落ちたとき `VACUUM` が省かれる）。
+3. 整合の確認（§5.3）。
+
+- 1 が途中で失敗すればトランザクションごと戻り、次の起動でやり直す。封印し直しの失敗（DPAPI のエラー）は起動を止めない: その行は `plain-v1` のまま残し、状態の画面に「移行待ちの秘密値が平文で残っています」を出す（収集は動く。平文は今と同じ守り）。
+
+### 6.6 冪等性と途中で落ちたとき
+
+| 落ちた位置                                       | 次の起動                                                                                                                                                                                                                                                                   |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 予行の途中                                       | DB は変わっていない。写しのファイルが残っていれば、名前の型（`.banto-hub-0025-dryrun-*`）で見つけて消してからやり直す                                                                                                                                                      |
+| バックアップの途中                               | DB は変わっていない。途中のファイルは `.partial` の名前なので、次の起動で消してから作り直す（§6.4）。`VACUUM INTO`・除去・`VACUUM`・`rename` のどの間で落ちても、`.partial` のまま残るか完成した `.bak` になるかのどちらかで、平文を含む `.bak` はできない                 |
+| `banto_tags::migrate` の途中                     | sqlx の migration は 1 トランザクション（`0004` の header の前提 1）。戻って未適用のまま → 最初からやり直す                                                                                                                                                                |
+| 後処理（§6.5）の途中                             | トランザクションが戻る → 次の起動でやり直す（冪等）                                                                                                                                                                                                                        |
+| 1 の commit の後・`VACUUM` の前、`VACUUM` の途中 | SQLite が戻す。1 で書き換えるものはもう無いが、清掃待ちの印（§6.5 の 2）が 1 と同じトランザクションで立っているので、次の起動で `VACUUM` だけやり直す。前の起動で印を消した後の 2 回目以降の再処理（DPAPI の失敗で残った `plain-v1`・非 Windows から移したキュー）でも同じ |
+
+### 6.7 ChronoGazer
+
+- `banto_tags::migrate` を流すので 0025 が当たる。ChronoGazer の行は `modbus-tcp`・`slmp`・`hub` だけ（`apps/chronogazer/src-tauri/src/lib.rs:2278-2292`、`core/src/rest.rs` の同名の関数）で、秘密値は無い。
+- ChronoGazer にはレジストリが無い（Q6 で R2b-7 まで旧規則）。予行と preflight は旧規則の検証で行い、バックアップ（§6.4）も同じ部品で作る（`banto-tags` に置く `upgrade::backup_before_0025(pool, db_path)`）。ChronoGazer の起動の失敗の経路にどう出すかは ChronoGazer のライフサイクルの表（checklist §5、`src-tauri/src/lifecycle.rs`）に当たる必要がある（**要確認**: R2b-1d の着手時に、起動時の DB の失敗がどの `Event` になるかを確かめる）。
+- ChronoGazer は版を上げない・CHANGELOG を書かない（checklist §7）が、banto-hub の CHANGELOG に「ChronoGazer の DB にも同じ移行が当たる」を書く。
+
+## 7. 収集・レジストリ・周辺への影響
+
+| 対象                                                             | R2b-1 の変更                                                                                                                                                                    |
+| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `RegistrySnapshot::load_connection`（`config.rs:497-510`）       | SELECT を新しい列に（checklist §5 の #605: `COLUMNS` と同時に直す）。`secrets: Vec<SealedSecretRow>` を足し、同じ接続（トランザクション）で `plc_connection_secrets` を読む     |
+| 計画（`modbus_config_for`・`slmp_config_for`）                   | 変えない（平らな欄の読み取りの写しを読む）。`settings` が検証に通らない・ドライバが無い・版が新しすぎる接続は §4.4 の除外。厳格版（Hub の preflight）は今どおり除外があれば断る |
+| broker・ドライバの `dial`                                        | 変えない（R2b-3 で `Settings` を直接使う）                                                                                                                                      |
+| `banto_drivers::settings_from_connection`                        | `banto_tags::settings_to_api` に置き換えて消す（R2b-1c）                                                                                                                        |
+| `PushSource`・`IngestHub`                                        | 変えない（`push` の `settings` の中身と形は R2a のまま）。`push` がレジストリに載るだけ                                                                                         |
+| `banto-db-source`・ブリッジ                                      | 共有 crate は変えない。ブリッジは `unavailableSources` を読む（§5.4）                                                                                                           |
+| `sqlite_sequence`・`ingest:#{id}`                                | 引き継ぐ（§6.2-6）。テストで固定（§9）                                                                                                                                          |
+| `hub_sink_groups.db_connection_id`・`push` の `db_connection_id` | id は変わらないので、そのまま                                                                                                                                                   |
+| REST の一覧の並べ替え・絞り込み（`column_map`）                  | `host` ほかの列が無くなるので外す。Hub の REST は使っていない（§1.2）。ChronoGazer の REST も `ListParams` を外へ出していないか R2b-1d の着手時に確かめる（**要確認**）         |
+
+## 8. 失敗のしかたと安全（監査で見てほしい点）
+
+1. **平文が DB に入らないこと**: 秘密のキーに平文の文字列が来たら `banto-tags` が断る（§3.3）。入口（REST・MCP・キューの適用・予約接続・ChronoGazer）のどれかで封印を忘れても保存されない。テストで「Hub の全入口から非空のパスワードを送り、DB のファイルと WAL のバイト列に平文が無い」を確かめる（Windows の CI）。
+2. **空に潰さないこと**: `Unreadable` を空のパスワードにしない（§5.5）。`db_source`・接続のテスト・Sink・ブリッジの 4 か所すべてで、読めないときに繋ぎに行かないことをテストする。
+3. **1 件で全体を止めないこと**: 読めない秘密値・ドライバが無い・検証に通らない接続は、その接続だけを外す（§4.4）。例外は移行の preflight（戻せない段の前だけは全体を止める。Q7）。
+4. **トランザクションの外で読んで書き戻さないこと**: 「省略は保つ」の合わせ込みは書き込みのトランザクションの中（§4.3）。
+5. **移行の写し漏れ**: 0025 の列の写し・トリガ 6 本・索引・`sqlite_sequence`（§6.2）。checklist §5 の 2 項目。
+6. **予行の写しとバックアップに平文を残さないこと**: 予行の写しは必ず消す（§6.3-4）、バックアップは `VACUUM` まで（§6.4）、本体も後処理で `VACUUM`（§6.5・§6.6）。
+7. **封印の entropy**: 参照とキーを含む（§5.2）。blob を別の行へ写しても開けないことをテストする。
+8. **ログ・監査・`Debug` に平文・blob を出さないこと**: `SealedSecret` の `Debug`、`SecretError`、監査の `secretsChanged`（キーの名前だけ）。
+9. **非 Windows の平文**: 状態とログで分かること（§5.8）。Windows で `plain-v1` が残ったら状態に出ること（§6.5）。
+10. **レジストリを通らない入口が残らないこと**: Hub の非テストのコードに `PlcConnectionService::new(` が無いことを固定（§4.2）。
+
+## 9. テスト
+
+| 種類                       | 内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | PR     |
+| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------ |
+| migration（全プロトコル）  | `run_to(24)` で作った DB に、`modbus-tcp`（`low_high` / `high_low`、`unit_id` 0 と 255）・`slmp`（`Q` / `R`、`unit_id` が既定でない行）・`postgres`（パスワードあり・空文字・NULL）・`virtual`（`calc` / `mem`）・`push`（`settings` なし・`stale_timeout_ms` だけ・ブリッジあり）・`hub` を入れ、最大でない id と最大の id を消してから 0025 を `include_str!` で 1 トランザクションで当てる。前後の行を JSON のスナップショット（`crates/banto-tags/tests/snapshots/0025_*.json`）で比べ、平らな欄の読み取りの写しが移行前の列と一致すること（§3.2 の「捨てる値」の表を除く）、`sqlite_sequence` が同じ・その後の作成で消した id が出ない、トリガ 6 本の `sqlite_master.sql` が `0020`・`0024` の定義と一致、`idx_plc_connections_single_hub`、`collection_groups`・`tags` が変わらない、秘密の行の数と参照の一致、`PRAGMA foreign_key_check`・`integrity_check` | R2b-1d |
+| 実物の古い DB              | alpha.33 の Hub（タグ `v0.2.0-alpha.33`）の REST で全プロトコルの接続を作った DB を、作り方のスクリプトと一緒に fixture としてコミットする（`crates/banto-tags/tests/fixtures/alpha33-registry.sqlite3`、数十 KB）。上と同じ確かめをこれにもかける。正規化の経路を通った本物の行で確かめるため。オーナーの実機の DB の複製での確認は §10 の R2b-1f（コミットしない）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               | R2b-1d |
+| 予行と preflight           | 生の SQL で壊した行（`port = 70000` の `modbus-tcp`、`host` が空の `slmp`。今の `CHECK` が通す範囲で、ドライバの検証に落ちるもの）で起動が断られ、元の DB が変わっていない（ファイルのハッシュ）・予行の写しが残っていない。`hub` の行は報告だけで移行が進む                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | R2b-1d |
+| 戻せないこと               | 0025 を当てた DB を 0001〜0024 だけの migrator で開くと失敗する（§1.1 の要確認を確かめる）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         | R2b-1d |
+| 冪等                       | 起動を 2 回。後処理（§6.5）の途中で失敗を注入して戻り、次の起動で完了。清掃待ちの印: 印が無い DB で再処理（`plain-v1` の行を残した DB で封印し直し）を commit した直後・`VACUUM` の前に止め、次の起動で `VACUUM` が走って DB・WAL に既知のパスワードのバイト列が無い。バックアップ（§6.4）の `VACUUM INTO` の後・除去の後・`VACUUM` の後・`rename` の前のそれぞれで止めて（工程の間に失敗の注入点を置く）、次の起動で `.partial` が消え、残った `.bak` に既知のパスワードのバイト列が無い                                                                                                                                                                                                                                                                                                                                                                          | R2b-1e |
+| 平らな形とレジストリの一致 | 組み込みのプロトコルごとに、旧い検証（`validate_plc_connection_input`）とレジストリの検証が同じ入力の集合を断る表のテスト（境界: port 0 / 1 / 65535 / 65536、unit_id -1 / 0 / 255 / 256、word_order・cpu_type の綴り違い、host の空白、database・username の 128 / 129 文字）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | R2b-1c |
+| JSON ⇔ `Settings`          | §3.5 の表を 1 行 1 ケースで。秘密の参照が検証に渡らないこと                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        | R2b-1c |
+| 封印                       | 往復、entropy の束縛（別の ref の blob で開けない）、`Debug` に平文・blob が出ない、`plain-v1` → `dpapi-machine-v1`。DPAPI は windows-latest の CI だけ（`#[cfg(windows)]`）                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       | R2b-1b |
+| 寿命                       | 作成・更新の 3 態・プロトコルの変更・削除・一括削除・キューに積む / 取り消す / 適用する、で秘密の行と参照が常に一致し、失敗したトランザクションで何も残らない                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | R2b-1d |
+| 平文が残らない             | Windows: 全入口から既知のパスワードを送り、後処理と `VACUUM` の後に DB・WAL のバイト列に含まれない。バックアップのファイルにも含まれない                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | R2b-1e |
+| 読めない                   | entropy を壊した blob・行の欠け: `db_source` はその接続だけ Bad・他の接続は動く、接続のテストは `ok: false`、Sink・ブリッジの設定は読めない接続を載せず `unavailableConnections`・`unavailableSources` に出す、サイドカーは繋がない。**alpha.33 のサイドカー**（タグ `v0.2.0-alpha.33` の `banto-hub-sink` の応答の型）にこの応答を食わせ、`trust` 認証の PostgreSQL（CI の `rust-db-source` の台で `pg_hba` を `trust` にした DB）へ書かない・引かないこと、REST は `passwordState: "unreadable"`                                                                                                                                                                                                                                                                                                                                                                 | R2b-1e |
+| キューの移設               | 非 Windows（`plain-v1`）で `pending`・`applying`・`failed`・`applied`・`canceled` のキューを作った DB を Windows の Hub で起動し、未適用の 3 つは `dpapi-machine-v1` に封印し直され（適用すれば正しいパスワードで繋がる）、履歴の 2 つは `password` も `sealedPassword` も無いこと。DB・WAL に既知のパスワードのバイト列が無い。Windows の CI だけ                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| 既存のテスト               | 生 SQL の `INSERT INTO plc_connections (... host, port ...)`（§1.2）を新しい列に直して全部通す。E2E（Hub の postgres を含むスペック）は ubuntu で `plain-v1` のまま通る                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            | R2b-1d |
+
+反証（checklist §5）: `sqlite_sequence` の写しを外す → migration のテストが落ちる、秘密のキーの平文の拒否を外す → 「平文が残らない」が落ちる、`Unreadable` を空に潰す → 「読めない」が落ちる、を各 PR で 1 回ずつ確かめて PR に書く。
+
+## 10. PR の分け方
+
+共通の決まり: ingest-design §11 と同じ検証の順（`cargo fmt --all --check` → test → clippy → 公開 API を変える PR は `cargo check --workspace --all-targets` → TS を触ったら eslint・check・test → prettier → 新しいファイルは `ci-changes.test.mjs` → `cargo deny check`）。**R2b-1d は migration を含むので revert では戻らない**（DB は前に進んだまま）。1a〜1c は配線しない部品で、振る舞いを変えない。
+
+| PR     | 範囲                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           | 主な触るファイル                                                                                                                                                                                                                                              | テスト                                                     | 監査の焦点                                                                                                                               | モデル                                                |
+| ------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
+| R2b-1a | `DriverKind::HostProvided`・`DriverEntry::host_provided`・`DriverDescriptor::settings_version`。core に `postgres`・`virtual` の `DriverBase`、`push` と合わせて `host_provided_drivers()`。host（`banto-hub-host`・`src-tauri`・`test_support::test_drivers`）が登録。適合テストの `static_checks` を 3 つにかける。新しいトリップワイヤ（§4.1）。**本番の経路はまだレジストリを読まない**                                                                                                    | `crates/banto-driver-api/src/{registry,driver}.rs`、`crates/banto-driver-conformance`、`apps/banto-hub/core/src/{ingest/driver.rs,db_source/driver.rs,computed 側}`、`apps/banto-hub/host`、`apps/banto-hub/src-tauri`                                        | 適合テスト C1・C2、トリップワイヤ                          | `HostBound` との違いが doc で明確か。`banto-driver-api` の変更が追加だけか（§5 の公開の契約）                                            | sonnet                                                |
+| R2b-1b | Hub の `secrets` モジュール（§5.2）。`banto-secret-store` を core の依存に足す（Windows は `DpapiMachine`）。配線しない                                                                                                                                                                                                                                                                                                                                                                        | `apps/banto-hub/core/src/secrets.rs`、`apps/banto-hub/core/Cargo.toml`                                                                                                                                                                                        | 封印の表（§9）。windows-latest で DPAPI                    | entropy・`Zeroizing`・`Debug`・エラーに平文が出ないこと                                                                                  | 上位（安全）                                          |
+| R2b-1c | `banto-tags`: `settings_to_api`、`legacy::{settings_from_flat, flat_view}`、`PlcConnectionService::with_registry`（まだ保存には使わない。検証の一致の表のテストのため）。`banto-tags` → `banto-driver-api` の依存。`banto_drivers::settings_from_connection` を置き換える                                                                                                                                                                                                                      | `crates/banto-tags/src/{plc_connection.rs,settings_json.rs(新)}`、`crates/banto-tags/Cargo.toml`、`crates/banto-drivers/src/lib.rs`                                                                                                                           | 一致の表、JSON ⇔ `Settings`                                | 写し方が §3.2 の表と一字一句同じか。旧い検証とレジストリの検証の食い違い                                                                 | sonnet                                                |
+| R2b-1d | **切り替え（戻せない）**: migration `0025`、`PlcConnection` / `PlcConnectionInput` の形（`password` を外し `secrets` へ、`settings` を `NOT NULL`）、`COLUMNS`・`load_connection`・`RegistrySnapshot.secrets`、`with_registry` を Hub の全入口へ、平文の拒否、起動時の手順（§6.1〜§6.4）、`plain-v1` で全 OS 共通に封印（Windows でもこの PR では `plain-v1`）、読む側（§5.4）、§4.4 の除外の理由、テストの生 SQL の直し。キューのペイロードは今どおり平文の `password` を持ち、適用で封印する | `crates/banto-tags/migrations/0025_*.sql`、`crates/banto-tags/src/*`、`crates/banto-collect/src/config.rs`、`apps/banto-hub/core/src/{db.rs,runtime.rs,upgrade.rs(新),rest/*,mcp.rs,db_source/*}`、ChronoGazer の機械的な追従、テスト多数                     | §9 の migration・実物の古い DB・予行・戻せない・寿命・既存 | checklist §5 の migration の 2 項目、トランザクションの外の読み書き、`load_connection` の SELECT、予行の写しの削除、1 件で全体を止めない | 上位（実装は sonnet、リテラルの機械的な追加は haiku） |
+| R2b-1e | **封印**: Windows で `dpapi-machine-v1`、後処理（§6.5）・`VACUUM` と清掃待ちの印、キューを積む時点の封印と既存の行の置き換え、`passwordState`・`unavailableConnections`・`unavailableSources`、サイドカーとブリッジの扱い、ドロワーの表示、MCP の説明の文言                                                                                                                                                                                                                                    | `apps/banto-hub/core/src/{secrets.rs,upgrade.rs,rest/{crud,pending_changes,plc_connections,sink,ingest_bridge}.rs,mcp.rs}`、`apps/banto-hub-sink/src/*`、`apps/banto-hub/src/lib/banto/{tagRegistryAdmin.ts,plcConnectionForm.ts}`・`ConnectionDrawer.svelte` | 冪等・平文が残らない・読めない・キューの移設               | 平文が DB・WAL・バックアップ・キューに残らないこと、空に潰さないこと、古いサイドカーとの組み合わせ                                       | 上位                                                  |
+| R2b-1f | docs（運用ガイドのバックアップ・戻し方・別の PC への移設・非 Windows の平文、external-db §2.2、本書と refactor-plan の状態）、CHANGELOG と版の 4 点セット、`ALLOWED_PROTOCOLS` の扱いの整理（旧規則として残す doc）、オーナー同席の実機の確かめ（オーナーの DB の複製で起動 → 移行 → postgres の接続が動く → 戻し方）                                                                                                                                                                          | `docs/*`、`CHANGELOG.md`、版の 4 点、`crates/banto-tags/src/plc_connection.rs`（doc）                                                                                                                                                                         | -                                                          | CHANGELOG の「戻せない」「バックアップにパスワードが入らない」の書き方                                                                   | haiku（docs）＋ 上位の確認                            |
+
+- 1a・1b・1c は互いに独立で、どの順でも並行でもよい（worktree と `CARGO_TARGET_DIR` を分ける。checklist §5）。1d は 3 つの後、1e は 1d の後、1f は最後。
+- 1d が大きい: 規模の見積もりは R2a-2a（migration とリテラル 186 か所）より大きい。1d の中で「migration と `banto-tags` の型」と「Hub の起動時の手順と入口」をコミットで分け、レビューはコミットごとに見られるようにする。PR を分けると、間の main で「型は変わったが起動時の手順が無い」状態になり、DB を戻せない段の途中で CI を緑に保てないので、PR は 1 本にする。
+
+## 11. オーナー判断
+
+**2026-10-21 オーナー決定: Q1〜Q15 はすべて下の表の「推奨」のとおり。**
+
+| Q   | 問い                                                            | 選択肢                                                                                                                                                                             | 推奨                                                                                                                                                                                                        |
+| --- | --------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Q1  | 秘密値の保管方式                                                | (a) `FileSecretStore` に 1 秘密 1 ファイル / (b) 鍵を `FileSecretStore`・暗号文を DB（封筒） / (c) `DpapiMachine` の blob を DB に                                                 | **(c)**。DB のトランザクションと同じ単位で確定し、孤児・掃除・二相が無い。暗号は DPAPI と監査済みの crate の部品。同じ PC の境界（ACL）は (a) と変わらない（§5.1）                                          |
+| Q2  | 非 Windows の扱い                                               | (a) `plain-v1` で自動・状態とログで警告 / (b) 秘密値を持つ接続を断る / (c) 環境変数で明示したときだけ `plain-v1`                                                                   | **(a)**。非 Windows は開発・CI・E2E で、今も平文（後退は無い）。(b) は CI の PostgreSQL ジョブと E2E が動かない。製品として非 Windows に出すと決めたら (c) へ締める                                         |
+| Q3  | 設定パッケージに秘密値を載せるか                                | (a) 載せない（今どおり）/ (b) パスフレーズで暗号化して載せる / (c) 平文を明示の選択で                                                                                              | **(a)**。取り込み後に入れ直す件数を画面に出す。(b) は需要が出てから別の段で                                                                                                                                 |
+| Q4  | REST・MCP・設定パッケージの形を R2b-1 で変えるか                | (a) R2b-7 まで平らな形を保ち、追加は `passwordState` だけ / (b) R2b-1 で汎用の形（`{driver, settings}`）を並べる / (c) R2b-1 で切り替える                                          | **(a)**。R2b-1 で戻せないのは DB だけにし、外の形の変更は R2b-7 にまとめる（UI の R2b-6 と同時に変えられる）。エラーの文言も今のまま（§4.2）                                                                |
+| Q5  | ドライバでないプロトコル（`push`・`postgres`・`virtual`）の登録 | (a) `DriverKind::HostProvided` を足して登録 / (b) `banto-tags` に予約の一覧を残し、レジストリには載せない / (c) `HostBound` で登録                                                 | **(a)**。レジストリを正にでき、plugin-design §4 の「組み込みの ID をプラグインで上書きできない」もレジストリで判定できる。ingest-design の `push` の種類の問いもこれで閉じる。(c) はトリップワイヤ 2 を壊す |
+| Q6  | ChronoGazer の検証                                              | (a) R2b-1 で ChronoGazer の host もレジストリ（`modbus-tcp`・`slmp` + `hub`）を注入 / (b) R2b-7 まで旧規則（`PlcConnectionService::new`）                                          | **(b)**。ChronoGazer の追従は R2b-7（refactor-plan）。ChronoGazer の入口は自前の許可リストで `modbus-tcp`・`slmp`・`hub` に絞っている。`ALLOWED_PROTOCOLS` はそのための旧規則として残る                     |
+| Q7  | 移行の preflight に通らない行があったとき                       | (a) 移行せずに起動を断り、一覧を出す / (b) 移行して、その接続だけを外す                                                                                                            | **(a)**。戻せない段の前だけは全体を止める（plugin-design §7.4 と同じ）。通らないのは手で書き換えた行だけで、旧版の Hub で直せる                                                                             |
+| Q8  | 移行の前のバックアップ                                          | (a) 自動で作り、パスワードを消して `VACUUM` / (b) パスワード入りのまま自動で作る / (c) 作らない（CHANGELOG で手動を案内）                                                          | **(a)**。戻すときに postgres の接続のパスワードを入れ直す手間（件数は少ない）より、平文の写しを残さない方を取る                                                                                             |
+| Q9  | プロトコルが読まない列の値                                      | (a) 捨てて preflight の報告に出す / (b) `settings` の `legacy` 区画に残す                                                                                                          | **(a)**。読む経路が無いので振る舞いは変わらない。残すと汎用フォーム（R2b-6）が知らないキーを抱える                                                                                                          |
+| Q10 | 設定の形の版                                                    | (a) 列 `settings_version` と `DriverDescriptor::settings_version` を R2b-1 で足す（全部 1）/ (b) 要るときに足す                                                                    | **(a)**。後で足すとまた表の作り直しになる。新しすぎる版の行を外す守りだけ今入れ、版上げの口は要るときに                                                                                                     |
+| Q11 | 入れ子の設定と `Settings`（API）                                | (a) JSON の文字列にする慣習（R2a のまま、§3.5）/ (b) `Settings` に型つきの値を足す / (c) スキーマで平らにする                                                                      | **(a)**。API（と WIT）を変えない。R2b-6 のスキーマを作るときに見直す                                                                                                                                        |
+| Q12 | 接続以外の秘密値（MQTT のパスワード）                           | (a) R2b-1 の範囲外。R2b-1 の後に同じ封印で別の PR / (b) R2b-1 に含める / (c) 触らない                                                                                              | **(a)**。R2b-1 は接続の表に絞る。`secrets` の部品はそのまま使える。サイドカーの TOML の `api_key` は別の話（ファイルの ACL で守る、#630）                                                                   |
+| Q13 | 版と CHANGELOG                                                  | (a) R2b-1 の全部（1f）の後に alpha を 1 つ上げ、CHANGELOG に「戻せない DB 移行・バックアップ・別の PC ではパスワードの入れ直し」/ (b) 0.3.0-alpha.1 に上げる / (c) PR ごとに上げる | **(a)**（R2a と同じ）。外の形を変える R2b-7 で 0.3.0 系へ上げるのが分かりやすい                                                                                                                             |
+| Q14 | `protocol` 列の SQL の `CHECK`                                  | (a) `DriverId` の文法と長さ 64 だけ / (b) 何も付けない                                                                                                                             | **(a)**。存在の正はレジストリで、SQL は形の最後の砦（`settings` の `json_valid` と同じ考え方）                                                                                                              |
+| Q15 | 秘密の表の FK                                                   | (a) 張らない（`hub_sink_groups` と同じ）・削除の全入口が同じトランザクションで消す・起動時に整合を確かめる / (b) `REFERENCES plc_connections(id) ON DELETE CASCADE`                | **(a)**。FK を張ると、後の `plc_connections` の作り直しで退避する子の表が 1 つ増える（`0004` の前提 2: 参照されている表の DROP は失敗）。整合は起動時の確認とテストで守る                                   |
+
+## 12. 既存の計画と食い違う点（レビューで直す候補）
+
+1. **refactor-plan §4 R2b-1・§3「秘密値は `banto-secret-store`」、plugin-design §5・§12.2-5**: 推奨（Q1 (c)）は crate の `Protector` で封印した blob を DB に置き、ファイルの保存先は使わない。決まったら refactor-plan の R2b-1 の行と plugin-design §5 の「秘密値」の段落を直す。
+2. **plugin-design §5「共通の列（`host` / `port` / `word_order` / タイムアウト等）は従来どおり固定列」**: §12.2-5 と refactor-plan（「接続は共通列（名前・有効・ドライバ ID）と `settings`」）と食い違っている。本書は後者に従う。plugin-design §5 を直す。
+3. **plugin-design §5「既存の `postgres` の平文保存の扱いは本書の範囲外」**: R2b-1 で扱う。
+4. **api-design §6.2「`ALLOWED_PROTOCOLS` は R2b-1 で撤去」**: Hub では使わなくなるが、ChronoGazer の旧規則として R2b-7 まで残る（Q6）。
+5. **api-design §3.5 の `settings_from_connection`（「R2b-1 の JSON 化の両方がこれを通る」）**: R2b-1 で `banto_tags::settings_to_api`（JSON から）に置き換えて消す。SLMP には `unit_id` を渡さなくなる（SLMP のドライバは読まないので振る舞いは同じ）。
+6. **api-design §4.4・`registry.rs:36-41` の `DriverKind`**: `HostProvided` を足す（Q5）。`HostBound` の「R2b-3 で消す」はそのまま。
+7. **ingest-design §2「`push` の `DriverKind` は R2b-3 の前に決める」・§12 Q1**: R2b-1 で `HostProvided` に決める（Q5）。ingest-design §2 の表の「R2b での扱い」を直す。
+8. **ingest-design §3.1「MCP の `create_connection` / `update_connection` の `enum` に `push`、`settings` を足す」**: 今の `mcp.rs:597`・`:664` の `enum` は `["modbus-tcp", "slmp", "postgres"]` のままで、`settings` も無い（R2a-2e の状態の記述とも食い違う）。R2b-1 の範囲外（MCP の形は R2b-7）だが、R2a の docs の訂正候補として挙げる。
+9. **external-db §2.2・tag-server-design §5.6「v1 は平文 + 閉域 LAN」**: Windows では封印に替わる（非 Windows は平文のまま、Q2）。external-db §2.2 に R2b-1 の決定を追記する。
+10. **refactor-plan §4 R2b の完了条件「既存の設定は移行して同じ値・品質で動く」**: 同じ PC では満たす。DB を別の PC に移した場合だけ、postgres の接続のパスワードの入れ直しが要る（§5.5）。完了条件の注として書く。
+11. **ingest-design §5.1・migration `0023` の header「後の migration（R2b-1 ほか）で作り直すときも引き継ぐ」**: §6.2-6 で守る。トリガは `0024` の 4 本を含めて 6 本（`0023` の header は `0020` の 2 本だけを挙げている）。

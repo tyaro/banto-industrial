@@ -3,8 +3,10 @@
 //! docs/banto-driver-api-design.md §4.1).
 //!
 //! Every driver kind - frame ([`FrameDriver`](crate::FrameDriver)), session
-//! ([`SessionDriver`](crate::SessionDriver)) and R1's host-bound built-ins
-//! ([`DriverKind::HostBound`](crate::DriverKind::HostBound)) - implements
+//! ([`SessionDriver`](crate::SessionDriver)), R1's host-bound built-ins
+//! ([`DriverKind::HostBound`](crate::DriverKind::HostBound)) and the
+//! host-provided protocols whose I/O the host keeps
+//! ([`DriverKind::HostProvided`](crate::DriverKind::HostProvided)) - implements
 //! [`DriverBase`], so REST / MCP / CSV import / configuration packages / the
 //! UI can validate a connection and parse an address without opening one.
 //! These calls come in concurrently from many places (design §6.5), hence
@@ -49,11 +51,25 @@ pub struct DriverDescriptor {
     pub capabilities: Capabilities,
     /// [`API_VERSION`] at build time (set by [`DriverDescriptor::new`]).
     pub api_version: u32,
+    /// The version of the shape of this driver's `settings` (R2b-1a,
+    /// docs/banto-hub-connection-settings-design.md §3.4). A host stores it
+    /// next to a connection's settings when it writes them and refuses to
+    /// read settings written under a *newer* version than the driver's
+    /// (a rolled-back host or plugin). Starts at 1
+    /// ([`DriverDescriptor::new`]); a driver that changes its settings shape
+    /// raises it with [`with_settings_version`](Self::with_settings_version).
+    #[cfg_attr(feature = "serde", serde(default = "default_settings_version"))]
+    pub settings_version: u32,
+}
+
+/// The `settings_version` of a descriptor that does not state one.
+const fn default_settings_version() -> u32 {
+    1
 }
 
 impl DriverDescriptor {
-    /// A descriptor with `transports = [Tcp]`, no vendor and
-    /// `api_version = API_VERSION`.
+    /// A descriptor with `transports = [Tcp]`, no vendor,
+    /// `api_version = API_VERSION` and `settings_version = 1`.
     pub fn new(
         id: DriverId,
         version: impl Into<String>,
@@ -68,6 +84,7 @@ impl DriverDescriptor {
             transports: vec![Transport::Tcp],
             capabilities,
             api_version: API_VERSION,
+            settings_version: default_settings_version(),
         }
     }
 
@@ -75,6 +92,14 @@ impl DriverDescriptor {
     pub fn with_vendor(self, vendor: impl Into<String>) -> Self {
         DriverDescriptor {
             vendor: Some(vendor.into()),
+            ..self
+        }
+    }
+
+    /// The same descriptor with `settings_version` replaced.
+    pub fn with_settings_version(self, settings_version: u32) -> Self {
+        DriverDescriptor {
+            settings_version,
             ..self
         }
     }
@@ -224,10 +249,13 @@ mod tests {
         assert_eq!(d.transports, vec![Transport::Tcp]);
         assert_eq!(d.capabilities, Capabilities::new(true, false));
         assert_eq!(d.api_version, API_VERSION);
+        assert_eq!(d.settings_version, 1);
 
         let d = d
+            .with_settings_version(3)
             .with_vendor("tyaro")
             .with_transports(vec![Transport::Serial, Transport::SerialOverTcp]);
+        assert_eq!(d.settings_version, 3);
         assert_eq!(d.vendor.as_deref(), Some("tyaro"));
         assert_eq!(
             d.transports,
@@ -287,5 +315,26 @@ mod tests {
         )));
         assert!(d.secret_keys().is_empty());
         assert_eq!(d.descriptor().id.as_str(), "m");
+    }
+
+    /// A descriptor written before `settings_version` existed reads as 1, and
+    /// the field round-trips.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn settings_version_serde_defaults_to_one() {
+        let d = DriverDescriptor::new(
+            DriverId::new("echo").unwrap(),
+            "0.1.0",
+            "Echo",
+            Capabilities::READ_ONLY,
+        )
+        .with_settings_version(2);
+        let json = serde_json::to_string(&d).unwrap();
+        assert_eq!(serde_json::from_str::<DriverDescriptor>(&json).unwrap(), d);
+
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("settings_version");
+        let old: DriverDescriptor = serde_json::from_value(value).unwrap();
+        assert_eq!(old.settings_version, 1);
     }
 }
