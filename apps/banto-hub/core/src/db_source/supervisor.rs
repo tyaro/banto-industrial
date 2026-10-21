@@ -279,6 +279,7 @@ mod tests {
                 }],
                 disabled: Vec::new(),
                 unreadable: Vec::new(),
+                excluded: Vec::new(),
             },
             &std::collections::HashSet::new(),
             true,

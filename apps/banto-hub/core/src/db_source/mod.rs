@@ -297,8 +297,8 @@ impl DbSourceEngine {
         // R2b-1d（設計 §5.4・§5.5）: パスワードを読めない接続はタスクを起こさず、配下の
         // タグへ Bad を書く（走っていたタスクは 1) で止めた。前の Good を残さない）。
         let now_ms = self.clock.now_ms();
-        for conn in &plan.unreadable {
-            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
         }
 
         // 3) 新規／再起動対象を spawn する。
@@ -335,8 +335,8 @@ impl DbSourceEngine {
         self.status.apply_plan(&plan, &HashSet::new(), true);
         // R2b-1d: パスワードを読めない接続は起こさず、配下のタグは Bad（[`Self::commit`]）。
         let now_ms = self.clock.now_ms();
-        for conn in &plan.unreadable {
-            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
         }
         for conn in plan.connections {
             let connection_id = conn.connection_id;
@@ -372,8 +372,8 @@ impl DbSourceEngine {
         for conn in &plan.connections {
             task::mark_connection_bad(conn, &self.store, now_ms);
         }
-        for conn in &plan.unreadable {
-            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
+        for (conn, _) in plan.blocked() {
+            task::mark_groups_bad(conn.groups, &self.store, now_ms);
         }
         self.status.apply_plan(&plan, &HashSet::new(), false);
     }
@@ -1075,6 +1075,7 @@ mod tests {
             ],
             disabled: Vec::new(),
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         let ids_after_first: Vec<i64> = {
             let state = engine.state.lock().unwrap();
@@ -1098,6 +1099,7 @@ mod tests {
             ],
             disabled: Vec::new(),
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -1116,6 +1118,7 @@ mod tests {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -1153,6 +1156,7 @@ mod tests {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
 
         assert!(
@@ -1181,6 +1185,7 @@ mod tests {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
         assert!(engine.state.lock().unwrap().tasks.is_empty());
 
@@ -1229,6 +1234,7 @@ mod tests {
         let broken = conn_plan(2, "SELECT a FROM v2");
         // A Good value from before the password became unreadable must not linger.
         store.set("tag:2", Some(7.0), banto_collect::Quality::Good, 1_000);
+        store.set("tag:3", Some(8.0), banto_collect::Quality::Good, 1_000);
         engine.start();
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
@@ -1238,6 +1244,16 @@ mod tests {
                 connection_name: "db2".to_string(),
                 reason: crate::secrets::UnreadableReason::Undecryptable,
                 groups: broken.groups.clone(),
+            }],
+            // PR #777 review P2: a connection the registry refuses is handled the same way.
+            excluded: vec![plan::ExcludedDbConnection {
+                connection_id: 3,
+                connection_name: "db3".to_string(),
+                reason: banto_collect::ExclusionReason::SettingsVersionTooNew {
+                    stored: 2,
+                    supported: 1,
+                },
+                groups: conn_plan(3, "SELECT a FROM v3").groups,
             }],
         });
         assert_eq!(
@@ -1250,7 +1266,7 @@ mod tests {
                 .copied()
                 .collect::<Vec<_>>(),
             vec![1],
-            "no task for the unreadable connection"
+            "no task for the unreadable or excluded connection"
         );
         let sample = store.get("tag:2").expect("tag:2 written");
         assert_eq!(sample.quality, banto_collect::Quality::Bad);
@@ -1261,6 +1277,14 @@ mod tests {
         let message = entry.last_error.as_deref().unwrap();
         assert!(message.contains("パスワードを読めません"), "{message}");
         assert!(message.contains("undecryptable"), "{message}");
+        assert_eq!(entry.groups.len(), 1);
+        let sample = store.get("tag:3").expect("tag:3 written");
+        assert_eq!(sample.quality, banto_collect::Quality::Bad);
+        assert_eq!(sample.value, None);
+        let entry = status.iter().find(|s| s.connection_id == 3).unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        let message = entry.last_error.as_deref().unwrap();
+        assert!(message.contains("版"), "{message}");
         assert_eq!(entry.groups.len(), 1);
 
         // Stopping keeps it `error` (a configuration fact, not a running state) and Bad.
@@ -1287,6 +1311,7 @@ mod tests {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
             unreadable: Vec::new(),
+            excluded: Vec::new(),
         });
 
         engine.start();

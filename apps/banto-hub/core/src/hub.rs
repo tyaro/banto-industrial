@@ -1468,7 +1468,7 @@ impl CollectorManager {
         // commit は catalog/`Collector` の入れ替えと同じ点で行う。DB Source
         // の計画が不整合なら rebuild 全体が失敗し、走行中のタスクは
         // 一切触られない（§4.3(a) の all-or-nothing）。
-        let db_source_plan = match db_source::build_plan(&snapshot) {
+        let db_source_plan = match db_source::build_plan(&snapshot, self.registry()) {
             Ok(plan) => plan,
             Err(err) => {
                 let message = format!("DB Source の検証に失敗しました: {err}");
@@ -2325,7 +2325,7 @@ impl CollectorManager {
         // （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
         // グループ集合を再読込する」- 稼働中の pending queue 適用がここを
         // 通るので、走行中の DB Source もこの1点で追従する）。
-        let db_source_plan = match db_source::build_plan(snapshot) {
+        let db_source_plan = match db_source::build_plan(snapshot, self.registry()) {
             Ok(plan) => plan,
             Err(err) => {
                 let message = format!("DB Source の検証に失敗しました: {err}");
@@ -2434,7 +2434,7 @@ impl CollectorManager {
         // `commit_catalog_and_notify` の legacy live reconfigure）からも
         // 呼ばれるので、ここを起動点にすると停止中でも DB へ繋いでしまう
         // （controller の `db_source` フィールド doc comment 参照）。
-        db_source::build_plan(&snapshot).map_err(|err| {
+        db_source::build_plan(&snapshot, self.registry()).map_err(|err| {
             let message = format!("DB Source の検証に失敗しました: {err}");
             self.set_last_error(message.clone());
             message

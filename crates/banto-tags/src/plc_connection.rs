@@ -270,8 +270,9 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::connection_secret::{
     builtin_secret_keys, check_settings_shape, delete_all_secret_rows, delete_secret_rows_except,
-    insert_secret_rows, load_all_secret_rows, load_secret_rows_of, secret_ref_of, secret_ref_value,
-    SecretChange, SecretChanges, StoredSecretRow, PASSWORD_KEY,
+    insert_secret_rows, load_all_secret_rows, load_secret_rows_of, secret_ref_lookup,
+    secret_ref_of, secret_ref_value, SecretChange, SecretChanges, SecretRefLookup, StoredSecretRow,
+    PASSWORD_KEY,
 };
 use crate::push::{validate_push_settings, PushSettings};
 use crate::settings_json::legacy::{settings_from_flat, SLMP_PROTOCOL};
@@ -946,6 +947,13 @@ impl PlcConnection {
         secret_ref_of(&self.settings, key)
     }
 
+    /// `settings[key]` を秘密の参照として読む（キーが無い・形の正しい参照・キーはあるが
+    /// 形が違う、を分ける。PR #777 のオーナーレビュー P2）。秘密値を読む側はこちらを使い、
+    /// 形の違う値を「値が無い」として扱わない。
+    pub fn secret_ref_lookup(&self, key: &str) -> SecretRefLookup<'_> {
+        secret_ref_lookup(&self.settings, key)
+    }
+
     /// S1 (this module's doc comment, "`\"postgres\"`" section): whether this
     /// row is a DB Source/Sink connection (`protocol == `[`POSTGRES_PROTOCOL`])
     /// rather than a wire-protocol PLC connection. Downstream code that must
@@ -1525,6 +1533,92 @@ impl PlcConnectionService {
         load_all_secret_rows(&self.pool)
             .await
             .map_err(banto_storage::storage_error)
+    }
+
+    /// Connection `id` and its sealed secret rows, read in **one** read transaction (one
+    /// snapshot). PR #777 owner review P2: reading them with two separate statements lets
+    /// a password update commit in between (new reference + new row, old row deleted), so
+    /// the connection read first refers to a row that is already gone and a healthy
+    /// connection reads as `Missing` - `GET /api/sink/config` would drop it and the sidecar
+    /// would rebuild its groups and discard their unsent rows. Readers that open a secret
+    /// (sink config, connection test) use this instead of [`Self::get`] +
+    /// [`Self::secret_rows`].
+    pub async fn get_with_secret_rows(
+        &self,
+        id: i64,
+    ) -> Result<(PlcConnection, Vec<StoredSecretRow>), BantoError> {
+        self.get_with_secret_rows_between(id, || async {}).await
+    }
+
+    /// [`Self::get_with_secret_rows`] with `between` awaited after the connection read and
+    /// before the secret rows read (the tests commit an update there).
+    async fn get_with_secret_rows_between<F, Fut>(
+        &self,
+        id: i64,
+        between: F,
+    ) -> Result<(PlcConnection, Vec<StoredSecretRow>), BantoError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        // A deferred `BEGIN`: SQLite takes the read snapshot at the first SELECT and keeps
+        // it to the end of the transaction (WAL: writers are not blocked meanwhile).
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数のみ。
+        let conn = sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLUMNS} FROM plc_connections WHERE id = ?"
+        )))
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))?;
+        between().await;
+        let rows = load_secret_rows_of(&mut *tx, id)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        tx.rollback().await.map_err(banto_storage::storage_error)?;
+        Ok((conn, rows))
+    }
+
+    /// Every connection (by id) and every sealed secret row, read in **one** read
+    /// transaction (see [`Self::get_with_secret_rows`] for why). Used by
+    /// `GET /api/ingest/bridge-config`.
+    pub async fn list_with_secret_rows(
+        &self,
+    ) -> Result<(Vec<PlcConnection>, Vec<StoredSecretRow>), BantoError> {
+        self.list_with_secret_rows_between(|| async {}).await
+    }
+
+    async fn list_with_secret_rows_between<F, Fut>(
+        &self,
+        between: F,
+    ) -> Result<(Vec<PlcConnection>, Vec<StoredSecretRow>), BantoError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(banto_storage::storage_error)?;
+        // AssertSqlSafe: 補間されるのは COLUMNS 定数のみ。
+        let connections = sqlx::query_as::<_, PlcConnection>(sqlx::AssertSqlSafe(format!(
+            "SELECT {COLUMNS} FROM plc_connections ORDER BY id"
+        )))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(banto_storage::storage_error)?;
+        between().await;
+        let rows = load_all_secret_rows(&mut *tx)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        tx.rollback().await.map_err(banto_storage::storage_error)?;
+        Ok((connections, rows))
     }
 
     /// Create, in its own `BEGIN IMMEDIATE` transaction (the row and its sealed secrets
@@ -2339,37 +2433,76 @@ mod tests {
         assert_eq!(ALLOWED_PROTOCOLS[0], MODBUS_PROTOCOL);
     }
 
-    /// The reverse direction: a protocol the SQL `CHECK` would accept must not
-    /// be missing from [`ALLOWED_PROTOCOLS`], or callers would get SQLite's raw
-    /// constraint-violation text instead of a field-level message. Bypasses the
-    /// service layer deliberately - that is the only way to ask the schema
-    /// directly what it allows.
+    /// R2b-1d (migration 0025, design Q14): the SQL `CHECK` on `protocol` checks only the
+    /// DriverId grammar (1-64 of `[a-z0-9-]`, not starting with `-`); what exists is the
+    /// registry's call. Bypasses the service layer deliberately - that is the only way to
+    /// ask the schema directly what it allows - and inserts only the columns 0025 keeps,
+    /// so a rejection here is the `protocol` CHECK and nothing else (PR #777 Codex P2:
+    /// the old version inserted `host`/`port`, which 0025 removed, so every case failed
+    /// on "no such column" and the test passed even with a broken CHECK).
     #[tokio::test]
-    async fn the_sql_check_accepts_nothing_beyond_allowed_protocols() {
+    async fn the_sql_check_on_protocol_follows_the_driver_id_grammar() {
         let pool = banto_storage::connect_sqlite_memory()
             .await
             .expect("connect_sqlite_memory");
         migrate(&pool).await.expect("migrate");
 
-        for protocol in [
+        let insert = |name: String, protocol: String| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO plc_connections (name, protocol, enabled, simulation, settings, \
+                     settings_version) VALUES (?, ?, 1, 0, '{}', 1)",
+                )
+                .bind(name)
+                .bind(protocol)
+                .execute(&pool)
+                .await
+            }
+        };
+
+        let longest = "a".repeat(64);
+        for (i, protocol) in [
+            "modbus-tcp",
             "ethernet-ip",
             "opc-ua",
+            "a",
+            "0",
+            "x-1-",
+            longest.as_str(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            insert(format!("ok-{i}"), protocol.to_string())
+                .await
+                .unwrap_or_else(|err| panic!("the CHECK refused the valid id {protocol:?}: {err}"));
+        }
+
+        let too_long = "a".repeat(65);
+        for (i, protocol) in [
             "",
+            too_long.as_str(),
             "MODBUS-TCP",
-            "SLMP",
-            "PUSH",
+            "Slmp",
+            "modbus_tcp",
+            "-modbus",
             "push ",
-        ] {
-            let result = sqlx::query(
-                "INSERT INTO plc_connections (name, protocol, host, port) VALUES (?, ?, '1.2.3.4', 502)",
-            )
-            .bind(protocol)
-            .bind(protocol)
-            .execute(&pool)
-            .await;
+            " push",
+            "op c",
+            "modbüs",
+            "プロトコル",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let err = insert(format!("bad-{i}"), protocol.to_string())
+                .await
+                .expect_err(&format!("the CHECK accepted the malformed id {protocol:?}"));
+            let text = err.to_string();
             assert!(
-                result.is_err(),
-                "the SQL CHECK accepted {protocol:?}, which is not in ALLOWED_PROTOCOLS"
+                text.contains("CHECK constraint failed"),
+                "{protocol:?} must fail on the CHECK, not on something else: {text}"
             );
         }
     }
@@ -3168,6 +3301,75 @@ mod tests {
             .fetch_all(&svc.pool)
             .await
             .unwrap()
+    }
+
+    /// PR #777 owner review P2: the connection and its secret rows are read in one
+    /// snapshot. A password update that commits between the two reads (new reference +
+    /// new row, old row deleted) must not make the connection read first refer to a row
+    /// the second read no longer sees (`Missing` for a healthy connection). The update is
+    /// committed from another pool connection while the reader holds its transaction (a
+    /// file DB in WAL, like the apps').
+    #[tokio::test]
+    async fn connection_and_secret_rows_are_read_in_one_snapshot_across_a_password_update() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = banto_storage::connect_sqlite(dir.path().join("snapshot.sqlite3"))
+            .await
+            .expect("connect_sqlite");
+        migrate(&pool).await.expect("migrate");
+        let svc = PlcConnectionService::new(pool.clone());
+        let id = svc
+            .create(with_password(postgres_input("Pg"), REF_A, "old"))
+            .await
+            .unwrap()
+            .id;
+
+        let writer = svc.clone();
+        let (conn, rows) = svc
+            .get_with_secret_rows_between(id, || async move {
+                writer
+                    .update(id, with_password(postgres_input("Pg"), REF_B, "new"))
+                    .await
+                    .expect("the update commits while the reader holds its snapshot");
+            })
+            .await
+            .unwrap();
+        assert_eq!(conn.secret_ref(PASSWORD_KEY), Some(REF_A));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].sealed.r#ref, REF_A,
+            "the row the connection refers to"
+        );
+
+        let writer = svc.clone();
+        let (connections, rows) = svc
+            .list_with_secret_rows_between(|| async move {
+                writer
+                    .update(id, with_password(postgres_input("Pg"), REF_C, "newer"))
+                    .await
+                    .expect("the update commits while the reader holds its snapshot");
+            })
+            .await
+            .unwrap();
+        let conn = connections.iter().find(|c| c.id == id).unwrap();
+        assert_eq!(conn.secret_ref(PASSWORD_KEY), Some(REF_B));
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].sealed.r#ref, REF_B,
+            "the row the connection refers to"
+        );
+
+        // A read after the update sees the new pair.
+        let (conn, rows) = svc.get_with_secret_rows(id).await.unwrap();
+        assert_eq!(conn.secret_ref(PASSWORD_KEY), Some(REF_C));
+        assert_eq!(rows[0].sealed.r#ref, REF_C);
+        let (connections, rows) = svc.list_with_secret_rows().await.unwrap();
+        assert_eq!(connections.len(), 1);
+        assert_eq!(rows[0].sealed.r#ref, REF_C);
+        assert!(matches!(
+            svc.get_with_secret_rows(id + 100).await,
+            Err(BantoError::NotFound { .. })
+        ));
+        pool.close().await;
     }
 
     /// A `"postgres"` connection created without a password stores none -

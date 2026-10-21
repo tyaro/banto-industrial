@@ -1102,7 +1102,7 @@ fn preflight_snapshot(
     // 3つ揃えたことで、保存後の commit で残る失敗要因はストレージ障害と
     // 走行中の collector 側の適用失敗だけになる（保存前検証が「保存成功 ＝
     // 実行可能」を保証する T14-3 の設計どおり）。
-    crate::db_source::build_plan(snapshot)
+    crate::db_source::build_plan(snapshot, registry)
         .map_err(|err| preflight_api_error(format!("DB Source の検証に失敗しました: {err}")))?;
     // R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 収集と同じ計画
     // （`push` 接続を受信側から収集する `PushSource::Available`）で検証する。

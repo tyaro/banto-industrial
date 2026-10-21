@@ -1868,15 +1868,12 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
         return err;
     }
-    let listed = match state.plc_connections.list(ListParams::default()).await {
-        Ok(result) => result.rows,
-        Err(err) => return tool_error(format!("接続一覧の取得に失敗しました: {err}")),
-    };
     // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
     // を返さない - `PlcConnectionResponse`（`passwordSet`・R2b-1d の `passwordState`）
     // へ変換してから返す（`crate::rest::PlcConnectionResponse`の doc comment参照、
     // REST の `plc_connections_list`と同じ変換）。
-    match crate::rest::connection_responses(&state.plc_connections, listed).await {
+    // PR #777 review P2: the rows and their sealed rows in one read transaction.
+    match crate::rest::connection_responses(&state.plc_connections).await {
         Ok(connections) => tool_ok(json!({ "connections": connections })),
         Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
     }
@@ -2452,8 +2449,9 @@ async fn tool_test_saved_connection(
         .and_then(Value::as_i64)
         .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
 
-    let conn = match state.plc_connections.get(id).await {
-        Ok(conn) => conn,
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, secret_rows) = match state.plc_connections.get_with_secret_rows(id).await {
+        Ok(pair) => pair,
         Err(err) => return Ok(banto_error_tool_error(&err)),
     };
     if !conn.is_db_source() {
@@ -2462,10 +2460,6 @@ async fn tool_test_saved_connection(
         ));
     }
 
-    let secret_rows = match state.plc_connections.secret_rows(id).await {
-        Ok(rows) => rows,
-        Err(err) => return Ok(banto_error_tool_error(&err)),
-    };
     let outcome = crate::db_source::test_connection(&conn, &secret_rows).await;
     Ok(tool_ok(
         serde_json::to_value(outcome).unwrap_or_else(|_| json!({})),

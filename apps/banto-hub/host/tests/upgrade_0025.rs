@@ -17,6 +17,11 @@ use sqlx::SqlitePool;
 
 /// alpha.33 の形の DB（Hub の migrator 全部 + banto-tags 0001〜0024）を作る。
 async fn old_db(path: &Path) -> SqlitePool {
+    old_db_at(path, 24).await
+}
+
+/// Hub の migrator 全部 + banto-tags 0001〜`tags_version` の DB（alpha.32 は 0022 まで）。
+async fn old_db_at(path: &Path, tags_version: i64) -> SqlitePool {
     // WAL, like every Hub DB (`banto_storage::connect_sqlite`): a DB in another journal
     // mode would have its header rewritten by the Hub's ordinary connect (2-a), which is
     // not what this test is about.
@@ -37,7 +42,9 @@ async fn old_db(path: &Path) -> SqlitePool {
             .await
             .expect("banto-tags migrations");
     tags.dangerous_set_table_name(banto_tags::MIGRATIONS_TABLE);
-    tags.run_to(24, &pool).await.expect("banto-tags up to 0024");
+    tags.run_to(tags_version, &pool)
+        .await
+        .expect("banto-tags up to the old version");
     pool
 }
 
@@ -230,4 +237,119 @@ async fn a_hub_row_is_reported_only_and_the_migration_proceeds() {
         .unwrap();
     assert_eq!(secrets, 1);
     pool.close().await;
+}
+
+/// Opens `db_path` after a start and returns `(0025 applied, settings by id, secret rows)`.
+async fn migrated_state(db_path: &Path) -> (i64, Vec<(i64, String)>, i64) {
+    let pool =
+        SqlitePool::connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(db_path))
+            .await
+            .unwrap();
+    let applied: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+        "SELECT COUNT(*) FROM {} WHERE version = 25",
+        banto_tags::MIGRATIONS_TABLE
+    )))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let settings: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, settings FROM plc_connections ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    let secrets: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connection_secrets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    (applied, settings, secrets)
+}
+
+fn backups_in(config_dir: &Path) -> Vec<String> {
+    names(config_dir)
+        .into_iter()
+        .filter(|n| n.starts_with("banto-hub.sqlite3.before-0025-") && n.ends_with(".bak"))
+        .collect()
+}
+
+/// PR #777 のオーナーレビュー P2: alpha.32 の DB（banto-tags は 0022 まで。`settings`（0023）
+/// がまだ無い）でも、予行が写しを先に 0024 まで進めてから旧い値を読むので、起動の全体が
+/// 通って移行される（予行が `no such column: settings` で断らない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_alpha32_db_before_0023_upgrades_through_the_full_startup() {
+    let env = common::TempEnv::new("banto-hub-upgrade-0025", "alpha32");
+    let config_dir = env.registry_path().parent().unwrap().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let db_path = config_dir.join("banto-hub.sqlite3");
+    let pool = old_db_at(&db_path, 22).await;
+    // 0022 の表の列（`settings` は無い。`cpu_type` は 0021 から）。
+    sqlx::raw_sql(
+        "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+         simulation, word_order, database, username, password, cpu_type) VALUES \
+         (1, 'M', 'modbus-tcp', '10.0.0.1', 502, 1, 1, 0, 'high_low', NULL, NULL, NULL, 'R'), \
+         (2, 'pg', 'postgres', '10.0.0.50', 5432, 1, 1, 0, 'low_high', 'erp', 'reader', \
+          'TOPSECRET-host-test', 'R')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the alpha.32 rows");
+    pool.close().await;
+
+    let running = HubRuntime::start(config(&db_path, env.data_dir()))
+        .await
+        .expect("an alpha.32 DB upgrades");
+    running.shutdown().await;
+
+    let backups = backups_in(&config_dir);
+    assert_eq!(backups.len(), 1, "{:?}", names(&config_dir));
+    let backup = std::fs::read(config_dir.join(&backups[0])).unwrap();
+    assert!(
+        !backup
+            .windows("TOPSECRET-host-test".len())
+            .any(|w| w == b"TOPSECRET-host-test"),
+        "the backup holds no password"
+    );
+    let (applied, settings, secrets) = migrated_state(&db_path).await;
+    assert_eq!(applied, 1);
+    // The start also adds its own reserved connections after ids 1 and 2.
+    assert!(settings.len() >= 2, "{settings:?}");
+    assert_eq!((settings[0].0, settings[1].0), (1, 2), "{settings:?}");
+    assert!(settings[0].1.contains("10.0.0.1"), "{settings:?}");
+    assert!(settings[1].1.contains("$secret"), "{settings:?}");
+    assert!(!settings[1].1.contains("TOPSECRET"), "{settings:?}");
+    assert_eq!(secrets, 1);
+}
+
+/// さらに古い DB（banto-tags 0013 まで: `password`（0014）も `cpu_type`（0021）も無い）でも、
+/// 予行・バックアップ（`password` の列が無ければ除くものが無い）・移行が通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_db_before_0014_without_a_password_column_upgrades_through_the_full_startup() {
+    let env = common::TempEnv::new("banto-hub-upgrade-0025", "before-0014");
+    let config_dir = env.registry_path().parent().unwrap().join("config");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    let db_path = config_dir.join("banto-hub.sqlite3");
+    let pool = old_db_at(&db_path, 13).await;
+    sqlx::raw_sql(
+        "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+         simulation, word_order) VALUES \
+         (1, 'M', 'modbus-tcp', '10.0.0.1', 502, 1, 1, 0, 'high_low'), \
+         (2, 'S', 'slmp', '10.0.0.3', 5007, 1, 1, 0, 'low_high')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed the 0013 rows");
+    pool.close().await;
+
+    let running = HubRuntime::start(config(&db_path, env.data_dir()))
+        .await
+        .expect("a DB before 0014 upgrades");
+    running.shutdown().await;
+
+    assert_eq!(backups_in(&config_dir).len(), 1, "{:?}", names(&config_dir));
+    let (applied, settings, secrets) = migrated_state(&db_path).await;
+    assert_eq!(applied, 1);
+    assert_eq!((settings[0].0, settings[1].0), (1, 2), "{settings:?}");
+    assert!(settings[0].1.contains("10.0.0.1"), "{settings:?}");
+    assert!(settings[1].1.contains("10.0.0.3"), "{settings:?}");
+    assert_eq!(secrets, 0);
 }

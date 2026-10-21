@@ -38,9 +38,10 @@
 //!
 //! # 予行と preflight（§6.3）
 //!
-//! `VACUUM INTO` で config/ の中（ACL は DB と同じ）に写しを作り、写しに
-//! `banto_tags::migrate` を当て、**変換の正は SQL の 1 つだけ**（Rust で写し方を書き直さ
-//! ない）のまま、移行後の全接続をレジストリで確かめる
+//! `VACUUM INTO` で config/ の中（ACL は DB と同じ）に写しを作り、写しをまず 0024 まで
+//! 進めて（`banto_tags::upgrade::migrate_before_0025`。alpha.32 以前の DB には 0021・0023 の
+//! 列がまだ無い）移行の前の値を読み、それから `banto_tags::migrate`（0025）を当て、
+//! **変換の正は SQL の 1 つだけ**（Rust で写し方を書き直さない）のまま、移行後の全接続をレジストリで確かめる
 //! （`banto_collect::driver_exclusion`: ドライバの有無・設定の版・`validate_config`・
 //! 保存の層の形の検査）。
 //!
@@ -379,7 +380,17 @@ async fn preflight_copy(
     registry: &Arc<DriverRegistry>,
 ) -> Result<PreflightReport, UpgradeError> {
     let dry = |err: sqlx::Error| UpgradeError::DryRun(err.to_string());
-    // 移行の前の写しから読むもの: 旧表の行・非空のパスワードの数・オブジェクトでない
+    // まず写しを 0024 まで進める（alpha.32 以前の DB には `settings`（0023）・`cpu_type`
+    // （0021）などの列がまだ無く、下の SELECT が読めない）。0024 までは戻せる移行で、当てる
+    // のは写しだけ（本物は予行が通ってから banto_tags::migrate で全部を当てる）。
+    let mut report = PreflightReport::default();
+    if let Err(err) = banto_tags::upgrade::migrate_before_0025(copy).await {
+        report.problems.push(format!(
+            "移行（migration 0024 まで）を写しに当てると失敗しました: {err}"
+        ));
+        return Ok(report);
+    }
+    // 移行の前（0024 の形）の写しから読むもの: 旧表の行・非空のパスワードの数・オブジェクトでない
     // push の settings（0025 の CHECK に落ちる行）。
     let old_rows: Vec<OldRow> = sqlx::query_as(
         "SELECT id, host, port, unit_id, word_order, cpu_type, database, username \
@@ -404,7 +415,6 @@ async fn preflight_copy(
     .await
     .map_err(dry)?;
 
-    let mut report = PreflightReport::default();
     if let Err(err) = banto_tags::migrate(copy).await {
         report.refused = non_object_push
             .into_iter()
@@ -467,14 +477,24 @@ async fn preflight_copy(
         ));
     }
     let integrity = integrity_of(
-        connections
-            .iter()
-            .map(|conn| (conn.id, conn.name.clone(), conn.settings.clone())),
+        connections.iter().map(|conn| {
+            (
+                conn.id,
+                conn.name.clone(),
+                conn.protocol.clone(),
+                conn.settings.clone(),
+            )
+        }),
         &secret_rows,
     );
     for (id, name, key) in &integrity.missing {
         report.problems.push(format!(
             "移行後の接続 #{id} {name} の {key} の参照に秘密値の行がありません"
+        ));
+    }
+    for (id, name, key) in &integrity.malformed {
+        report.problems.push(format!(
+            "移行後の接続 #{id} {name} の {key} が秘密の参照の形になっていません"
         ));
     }
     for orphan in &integrity.orphans {
@@ -574,6 +594,10 @@ pub struct IntegrityReport {
     /// 参照があって行が無い `(接続 id, 接続名, キー)`。その接続のその値は
     /// `Unreadable { Missing }`（読む側が `secrets::open_connection_secret` で同じ判断をする）。
     pub missing: Vec<(i64, String, String)>,
+    /// キーはあるが形の正しい参照でない `(接続 id, 接続名, キー)`（PR #777 のオーナー
+    /// レビュー P2）。その接続のその値は `Unreadable { Invalid }`（読む側が
+    /// `secrets::open_connection_secret` で同じ判断をする）。値は持たない。
+    pub malformed: Vec<(i64, String, String)>,
     /// 参照の無い行（消した）。
     pub orphans: Vec<OrphanSecret>,
 }
@@ -589,8 +613,19 @@ pub struct OrphanSecret {
 /// 参照と行の突き合わせ（純関数）。参照は `settings` のどのキーでも `{"$secret": ref}`
 /// の形の値（レジストリの秘密のキーに限らない: 参照されている行は消さない側に倒す）。
 /// 行が参照と合うのは、同じ接続・同じキー・同じ参照のときだけ。
+///
+/// 形の違う参照（`malformed`）: 組み込みのプロトコルの秘密のキー（`postgres` の
+/// `password`）にある、形の正しい参照でない値と、どのキーでも `$secret` を持つのに形の
+/// 正しい参照でない値。
 fn integrity_of(
-    connections: impl IntoIterator<Item = (i64, String, serde_json::Map<String, serde_json::Value>)>,
+    connections: impl IntoIterator<
+        Item = (
+            i64,
+            String,
+            String,
+            serde_json::Map<String, serde_json::Value>,
+        ),
+    >,
     rows: &[banto_tags::StoredSecretRow],
 ) -> IntegrityReport {
     let mut wanted: HashSet<(i64, String, String)> = HashSet::new();
@@ -605,12 +640,33 @@ fn integrity_of(
             )
         })
         .collect();
-    for (id, name, settings) in connections {
+    for (id, name, protocol, settings) in connections {
+        let secret_keys = banto_tags::builtin_secret_keys(&protocol);
         let mut keys: Vec<&String> = settings.keys().collect();
         keys.sort();
         for key in keys {
-            let Some(r#ref) = banto_tags::connection_secret::secret_ref_of(&settings, key) else {
-                continue;
+            use banto_tags::SecretRefLookup;
+            let r#ref = match banto_tags::connection_secret::secret_ref_lookup(&settings, key) {
+                SecretRefLookup::Ref(r#ref) => r#ref,
+                SecretRefLookup::Malformed => {
+                    let claimed = settings
+                        .get(key)
+                        .is_some_and(banto_tags::connection_secret::looks_like_secret_ref);
+                    if claimed || secret_keys.contains(&key.as_str()) {
+                        report.malformed.push((id, name.clone(), key.clone()));
+                    }
+                    // A row under the string it names is kept (not an orphan): the value is
+                    // reported, not repaired here, and deleting the row would lose it.
+                    if let Some(r#ref) = settings
+                        .get(key)
+                        .and_then(|value| value.get(banto_tags::settings_json::SECRET_REF_KEY))
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        wanted.insert((id, key.clone(), r#ref.to_string()));
+                    }
+                    continue;
+                }
+                SecretRefLookup::Absent => continue,
             };
             if !have.contains(&(id, key.as_str(), r#ref)) {
                 report.missing.push((id, name.clone(), key.clone()));
@@ -635,6 +691,7 @@ fn integrity_of(
 ///
 /// - 参照があって行が無い → 報告だけ（その接続は読む側で `Unreadable { Missing }`。空の
 ///   パスワードにしない）。
+/// - キーはあるが形の正しい参照でない → 報告だけ（読む側で `Unreadable { Invalid }`）。
 /// - 行があって参照が無い → 消す（同じ `BEGIN IMMEDIATE` のトランザクションで読んで消す。
 ///   トランザクションの外で読んで書き戻さない）。
 ///
@@ -644,19 +701,21 @@ pub async fn check_secret_integrity(pool: &SqlitePool) -> Result<IntegrityReport
         .begin_with("BEGIN IMMEDIATE")
         .await
         .map_err(banto_storage::storage_error)?;
-    let connections: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT id, name, settings FROM plc_connections ORDER BY id")
+    let connections: Vec<(i64, String, String, String)> =
+        sqlx::query_as("SELECT id, name, protocol, settings FROM plc_connections ORDER BY id")
             .fetch_all(&mut *tx)
             .await
             .map_err(banto_storage::storage_error)?;
     let rows = banto_tags::connection_secret::load_all_secret_rows(&mut *tx)
         .await
         .map_err(banto_storage::storage_error)?;
-    let parsed = connections.into_iter().map(|(id, name, settings)| {
-        let map = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&settings)
-            .unwrap_or_default();
-        (id, name, map)
-    });
+    let parsed = connections
+        .into_iter()
+        .map(|(id, name, protocol, settings)| {
+            let map = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&settings)
+                .unwrap_or_default();
+            (id, name, protocol, map)
+        });
     let report = integrity_of(parsed, &rows);
     for orphan in &report.orphans {
         sqlx::query("DELETE FROM plc_connection_secrets WHERE ref = ?")
@@ -674,6 +733,13 @@ pub fn log_integrity(report: &IntegrityReport) {
     for (id, name, key) in &report.missing {
         log_err_line(&format!(
             "banto-hub: [WARN] 接続 {name}（#{id}）の {key} の秘密値の行がありません。\
+             この接続の {key} は読めません（passwordState: unreadable）。接続の編集で入れ直して\
+             ください"
+        ));
+    }
+    for (id, name, key) in &report.malformed {
+        log_err_line(&format!(
+            "banto-hub: [WARN] 接続 {name}（#{id}）の {key} が秘密の参照の形になっていません。\
              この接続の {key} は読めません（passwordState: unreadable）。接続の編集で入れ直して\
              ください"
         ));

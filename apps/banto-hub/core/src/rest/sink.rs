@@ -345,12 +345,18 @@ async fn build_sink_config_response(
     let mut connections = Vec::with_capacity(connection_ids.len());
     let mut unavailable_connections = Vec::new();
     for connection_id in connection_ids {
-        let conn = state.plc_connections.get(connection_id).await?;
         // R2b-1d (design §5.4): the password is opened from its sealed row right before
         // the response is built. "No password" (`None`) and "unreadable" stay apart: an
         // unreadable one is never sent as an absent/empty password (a `trust`-auth DB
         // would accept that, checklist §5「エラーを空に潰さない」).
-        let rows = state.plc_connections.secret_rows(connection_id).await?;
+        // PR #777 review P2: the connection and its rows come from one read transaction -
+        // a password update committing between two separate reads would make a healthy
+        // connection read as `missing`, drop it from `connections`, and the sidecar would
+        // rebuild its groups and discard their unsent rows.
+        let (conn, rows) = state
+            .plc_connections
+            .get_with_secret_rows(connection_id)
+            .await?;
         let password = match crate::secrets::open_connection_secret(
             &crate::secrets::r2b1d_connection_secrets(),
             &conn,

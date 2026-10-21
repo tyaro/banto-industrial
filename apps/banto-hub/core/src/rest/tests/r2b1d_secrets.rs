@@ -5,7 +5,8 @@
 //!
 //! 「読めない」は 2 通りを作る: 秘密値の行を生の SQL で消す（`missing`）、行の方式を
 //! この PC で開けない `dpapi-machine-v1` に書き換える（`undecryptable`。R2b-1d の Hub は
-//! protector を持たない）。
+//! protector を持たない）。PR #777 のオーナーレビュー P2 で 3 通り目: `settings.password` を
+//! 形の違う参照（`{"$secret": 123}`）に書き換える（`invalid`）。
 
 use super::super::*;
 use super::common::{
@@ -54,6 +55,19 @@ async fn make_undecryptable(pool: &sqlx::SqlitePool, connection_id: i64) {
     .unwrap();
 }
 
+/// PR #777 のオーナーレビュー P2: `settings.password` のキーはあるが形の正しい参照でない
+/// （生の SQL で書いた `{"$secret": 123}`）。読む側は「パスワード無し」に潰さず `invalid`。
+async fn make_malformed(pool: &sqlx::SqlitePool, connection_id: i64) {
+    sqlx::query(
+        "UPDATE plc_connections SET settings = json_set(settings, '$.password', \
+         json('{\"$secret\":123}')) WHERE id = ?",
+    )
+    .bind(connection_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 /// §5.5: `passwordState` は `none` / `set` / `unreadable`、`passwordSet` は
 /// `passwordState == "set"`（読めないものは `false`）。一覧・単体・更新の応答が同じ。
 #[tokio::test]
@@ -63,14 +77,17 @@ async fn password_state_tells_none_set_and_unreadable_apart() {
     let set = create_pg(&env, "pg-set", Some(PASSWORD)).await;
     let missing = create_pg(&env, "pg-missing", Some(PASSWORD)).await;
     let undecryptable = create_pg(&env, "pg-undecryptable", Some(PASSWORD)).await;
+    let invalid = create_pg(&env, "pg-invalid", Some(PASSWORD)).await;
     drop_secret_row(&env.pool, missing).await;
     make_undecryptable(&env.pool, undecryptable).await;
+    make_malformed(&env.pool, invalid).await;
 
     let expect = [
         (none, "none", false),
         (set, "set", true),
         (missing, "unreadable", false),
         (undecryptable, "unreadable", false),
+        (invalid, "unreadable", false),
     ];
     let (status, listed) = admin_get(&env.router, "/api/plc-connections", &env.admin_token).await;
     assert_eq!(status, StatusCode::OK, "{listed:?}");
@@ -113,12 +130,12 @@ async fn password_state_tells_none_set_and_unreadable_apart() {
 #[tokio::test]
 async fn testing_a_saved_connection_with_an_unreadable_password_does_not_connect() {
     let env = test_env().await;
-    for (break_it, reason) in [(true, "missing"), (false, "undecryptable")] {
+    for reason in ["missing", "undecryptable", "invalid"] {
         let id = create_pg(&env, &format!("pg-test-{reason}"), Some(PASSWORD)).await;
-        if break_it {
-            drop_secret_row(&env.pool, id).await;
-        } else {
-            make_undecryptable(&env.pool, id).await;
+        match reason {
+            "missing" => drop_secret_row(&env.pool, id).await,
+            "undecryptable" => make_undecryptable(&env.pool, id).await,
+            _ => make_malformed(&env.pool, id).await,
         }
         let (status, body) = admin_post(
             &env.router,
@@ -169,10 +186,12 @@ async fn sink_config_lists_unreadable_connections_apart() {
     let readable = create_pg(&env, "pg-ok", Some(PASSWORD)).await;
     let missing = create_pg(&env, "pg-missing", Some(PASSWORD)).await;
     let undecryptable = create_pg(&env, "pg-undecryptable", Some(PASSWORD)).await;
+    let invalid = create_pg(&env, "pg-invalid", Some(PASSWORD)).await;
     for (name, db) in [
         ("g-ok", readable),
         ("g-missing", missing),
         ("g-undec", undecryptable),
+        ("g-invalid", invalid),
     ] {
         let (status, body) = admin_post(
             &env.router,
@@ -187,6 +206,7 @@ async fn sink_config_lists_unreadable_connections_apart() {
     }
     drop_secret_row(&env.pool, missing).await;
     make_undecryptable(&env.pool, undecryptable).await;
+    make_malformed(&env.pool, invalid).await;
 
     let (status, body) = v1_get(&env.router, &env.admin_token, "/api/sink/config").await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -199,10 +219,11 @@ async fn sink_config_lists_unreadable_connections_apart() {
         json!([
             { "id": missing, "name": "pg-missing", "reason": "missing" },
             { "id": undecryptable, "name": "pg-undecryptable", "reason": "undecryptable" },
+            { "id": invalid, "name": "pg-invalid", "reason": "invalid" },
         ])
     );
     // The groups are still listed (the sidecar shows why it does not write them).
-    assert_eq!(body["groups"].as_array().unwrap().len(), 3);
+    assert_eq!(body["groups"].as_array().unwrap().len(), 4);
 }
 
 /// §5.4: `GET /api/ingest/bridge-config` は、読み先のパスワードを読めない source を
@@ -210,6 +231,12 @@ async fn sink_config_lists_unreadable_connections_apart() {
 /// するので、スコープの無いキーでは今どおり `password: null` で載る）。
 #[tokio::test]
 async fn bridge_config_lists_sources_with_an_unreadable_password_apart() {
+    for reason in ["missing", "invalid"] {
+        bridge_config_lists_a_source_apart(reason).await;
+    }
+}
+
+async fn bridge_config_lists_a_source_apart(reason: &str) {
     let env = test_env().await;
     let pg = create_pg(&env, "erp-db", Some(PASSWORD)).await;
     let bridge = json!({ "stale_timeout_ms": 4000, "bridge": { "kind": "db",
@@ -225,7 +252,11 @@ async fn bridge_config_lists_sources_with_an_unreadable_password_apart() {
     .await;
     assert_eq!(status, StatusCode::OK, "{push:?}");
     let push_id = push["id"].as_i64().unwrap();
-    drop_secret_row(&env.pool, pg).await;
+    if reason == "missing" {
+        drop_secret_row(&env.pool, pg).await;
+    } else {
+        make_malformed(&env.pool, pg).await;
+    }
 
     let scope = format!("ingest:#{push_id}");
     let (_, issued) = issue_api_key(
@@ -242,7 +273,7 @@ async fn bridge_config_lists_sources_with_an_unreadable_password_apart() {
     assert_eq!(
         body["unavailableSources"],
         json!([{ "connectionId": push_id, "name": "Bridge1", "dbConnectionId": pg,
-                 "reason": "missing" }])
+                 "reason": reason }])
     );
     // Without the ingest scope nothing is opened: listed as before, no password.
     let (status, body) = v1_get(&env.router, &env.admin_token, "/api/ingest/bridge-config").await;

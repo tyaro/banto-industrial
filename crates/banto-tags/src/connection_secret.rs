@@ -155,13 +155,51 @@ pub fn secret_ref_value(r#ref: &str) -> Value {
     Value::Object(object)
 }
 
-/// `settings[key]` が秘密の参照なら、その参照の文字列。
-pub fn secret_ref_of<'a>(settings: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
-    let value = settings.get(key)?;
+/// `settings[key]` の秘密の参照を読んだ結果（PR #777 のオーナーレビュー P2）。
+///
+/// **「キーが無い」と「キーはあるが参照の形でない」を分ける**: 後者を「値が無い」に潰すと、
+/// 読む側が空のパスワードで繋ぎに行く（`trust` 認証なら通ってしまう）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretRefLookup<'a> {
+    /// キーが無い（値が設定されていない）。
+    Absent,
+    /// 形の正しい参照（`{"$secret": "<32 文字の小文字 16 進>"}`、余計なキーなし）。
+    Ref(&'a str),
+    /// キーはあるが形の正しい参照ではない（`{"$secret": 123}`・余計なキー・16 進でない
+    /// 参照・平文の文字列・`null` など）。書き込みの入口は [`check_settings_shape`] で
+    /// 断るので、生の SQL や壊れた DB でだけ起こる。読む側は「読めない」に倒す。
+    Malformed,
+}
+
+/// `settings[key]` を秘密の参照として読む（[`SecretRefLookup`]）。
+pub fn secret_ref_lookup<'a>(settings: &'a Map<String, Value>, key: &str) -> SecretRefLookup<'a> {
+    let Some(value) = settings.get(key) else {
+        return SecretRefLookup::Absent;
+    };
     if !is_secret_ref(value) {
-        return None;
+        return SecretRefLookup::Malformed;
     }
-    value.get(SECRET_REF_KEY).and_then(Value::as_str)
+    match value.get(SECRET_REF_KEY).and_then(Value::as_str) {
+        Some(r#ref) if is_valid_secret_ref(r#ref) => SecretRefLookup::Ref(r#ref),
+        _ => SecretRefLookup::Malformed,
+    }
+}
+
+/// `settings[key]` が形の正しい秘密の参照なら、その参照の文字列。キーが無いときと形が
+/// 違うときを分けるには [`secret_ref_lookup`] を使う（読む側はそちら）。
+pub fn secret_ref_of<'a>(settings: &'a Map<String, Value>, key: &str) -> Option<&'a str> {
+    match secret_ref_lookup(settings, key) {
+        SecretRefLookup::Ref(r#ref) => Some(r#ref),
+        SecretRefLookup::Absent | SecretRefLookup::Malformed => None,
+    }
+}
+
+/// `value` が秘密の参照のつもりの値か（`$secret` のキーを持つオブジェクト。形が正しいかは
+/// 問わない）。起動時の整合の確認が、レジストリの秘密のキー以外の壊れた参照も拾うため。
+pub fn looks_like_secret_ref(value: &Value) -> bool {
+    value
+        .as_object()
+        .is_some_and(|object| object.contains_key(SECRET_REF_KEY))
 }
 
 /// 参照の形（32 文字の小文字 16 進。DB の `CHECK` と同じ）。
@@ -488,6 +526,35 @@ mod tests {
         assert_eq!(secret_ref_of(&settings, "password"), Some(REF));
         assert_eq!(secret_ref_of(&settings, "host"), None);
         assert_eq!(secret_ref_of(&settings, "missing"), None);
+        assert_eq!(
+            secret_ref_lookup(&settings, "missing"),
+            SecretRefLookup::Absent
+        );
+        assert_eq!(
+            secret_ref_lookup(&settings, "password"),
+            SecretRefLookup::Ref(REF)
+        );
+        // A present key that is not a well-formed reference is Malformed, never Absent.
+        for bad in [
+            serde_json::json!({ "$secret": 123 }),
+            serde_json::json!({ "$secret": REF, "extra": 1 }),
+            serde_json::json!({ "$secret": "NOT-HEX" }),
+            serde_json::json!({ "$secret": REF.to_uppercase() }),
+            serde_json::json!("plain-text"),
+            serde_json::Value::Null,
+            serde_json::json!({}),
+        ] {
+            let mut settings = Map::new();
+            settings.insert("password".to_string(), bad.clone());
+            assert_eq!(
+                secret_ref_lookup(&settings, "password"),
+                SecretRefLookup::Malformed,
+                "{bad}"
+            );
+            assert_eq!(secret_ref_of(&settings, "password"), None, "{bad}");
+        }
+        assert!(looks_like_secret_ref(&serde_json::json!({ "$secret": 1 })));
+        assert!(!looks_like_secret_ref(&serde_json::json!("x")));
         assert!(is_valid_secret_ref(REF));
         assert!(!is_valid_secret_ref(&REF[..31]));
         assert_eq!(builtin_secret_keys("postgres"), ["password"]);

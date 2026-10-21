@@ -159,6 +159,15 @@ pub async fn pending_0025(pool: &SqlitePool) -> Result<bool, UpgradeError> {
     Ok(applied == 0)
 }
 
+/// 0025 の直前（0024）までの未適用の migration だけを当てる（Hub の予行の写しに、0025 の前の
+/// 列を読む前に当てる。alpha.32 以前の DB には `settings`（0023）・`cpu_type`（0021）などが
+/// まだ無い）。本物の DB には当てない（予行が通るまで本物は変えない、§6.3）。
+pub async fn migrate_before_0025(pool: &SqlitePool) -> Result<(), UpgradeError> {
+    crate::migrate_to(pool, MIGRATION_0025_VERSION - 1)
+        .await
+        .map_err(storage)
+}
+
 /// バックアップを取る価値のある中身があるか（0025 が未適用の DB で、接続・収集グループ・
 /// タグのどれかに 1 行でもある）。空のままの DB（記録表だけ作って落ちた起動など）には
 /// `.bak` を作らない。0025 が未適用であることは呼び出し側が [`pending_0025`] で確かめる。
@@ -190,6 +199,18 @@ where
             .bind(name)
             .fetch_one(executor)
             .await?;
+    Ok(count > 0)
+}
+
+async fn column_exists<'e, E>(executor: E, table: &str, column: &str) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info(?) WHERE name = ?")
+        .bind(table)
+        .bind(column)
+        .fetch_one(executor)
+        .await?;
     Ok(count > 0)
 }
 
@@ -385,9 +406,12 @@ async fn strip_secrets(
     conn: &mut SqliteConnection,
     crash_after: Option<BackupStep>,
 ) -> Result<(), StripError> {
-    sqlx::query("UPDATE plc_connections SET password = NULL WHERE password IS NOT NULL")
-        .execute(&mut *conn)
-        .await?;
+    // `password` は 0014（postgres）から。それより古い DB（列が無い）には除くものが無い。
+    if column_exists(&mut *conn, "plc_connections", "password").await? {
+        sqlx::query("UPDATE plc_connections SET password = NULL WHERE password IS NOT NULL")
+            .execute(&mut *conn)
+            .await?;
+    }
     // キューのペイロード（状態を問わず）から password を外す。`pending_changes` は Hub だけの
     // 表（ChronoGazer には無い）。読めない JSON の行は中身ごと落とす（バックアップの中だけ。
     // 平文を含みうるものを残さない）。

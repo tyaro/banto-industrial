@@ -601,6 +601,66 @@ async fn the_integrity_check_reports_missing_rows_and_deletes_orphans() {
         .is_empty());
 }
 
+/// PR #777 のオーナーレビュー P2: 形の違う参照（生の SQL で書いた `{"$secret": 123}`・
+/// 余計なキー・平文の文字列）は起動時の整合の確認が `malformed` として報告し、読む側は
+/// `Unreadable { Invalid }`（「パスワード無し」にしない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_integrity_check_reports_malformed_references() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    let service = PlcConnectionService::with_registry(pool.clone(), registry());
+    let secrets = crate::secrets::r2b1d_connection_secrets();
+    let mut ids = Vec::new();
+    for (name, password) in [
+        ("pg-number", r#"{"$secret":123}"#),
+        (
+            "pg-extra",
+            r#"{"$secret":"0123456789abcdef0123456789abcdef","x":1}"#,
+        ),
+        ("pg-plain", r#""plain-text""#),
+    ] {
+        let id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO plc_connections (name, protocol, enabled, simulation, settings, \
+             settings_version) VALUES ('{name}', 'postgres', 1, 0, \
+             '{{\"host\":\"db\",\"port\":5432,\"password\":{password}}}', 1) RETURNING id"
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        ids.push((id, name.to_string()));
+    }
+    // The row the extra-key value names is kept (reported, not deleted as an orphan).
+    sqlx::query(
+        "INSERT INTO plc_connection_secrets (ref, connection_id, key, scheme, blob) \
+         VALUES ('0123456789abcdef0123456789abcdef', ?, 'password', 'plain-v1', X'6f')",
+    )
+    .bind(ids[1].0)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let report = check_secret_integrity(&pool).await.unwrap();
+    assert!(report.orphans.is_empty(), "{report:?}");
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connection_secrets")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kept, 1);
+    let expected: Vec<(i64, String, String)> = ids
+        .iter()
+        .map(|(id, name)| (*id, name.clone(), "password".to_string()))
+        .collect();
+    assert_eq!(report.malformed, expected, "{report:?}");
+    assert!(report.missing.is_empty(), "{report:?}");
+    for (id, _) in &ids {
+        let conn = service.get(*id).await.unwrap();
+        assert_eq!(
+            crate::secrets::secret_state(&secrets, &conn, "password", &[]),
+            crate::secrets::SecretState::Unreadable {
+                reason: crate::secrets::UnreadableReason::Invalid
+            }
+        );
+    }
+}
+
 #[test]
 fn the_refusal_message_lists_rows_problems_and_the_remedy() {
     let refusal = PreflightRefusal {

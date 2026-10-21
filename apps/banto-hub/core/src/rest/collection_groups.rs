@@ -123,7 +123,11 @@ pub(super) async fn collection_groups_describe(
     .await?;
 
     let group = state.collection_groups.get(id).await?;
-    let conn = state.plc_connections.get(group.plc_connection_id).await?;
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, secret_rows) = state
+        .plc_connections
+        .get_with_secret_rows(group.plc_connection_id)
+        .await?;
     if !conn.is_db_source() {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -146,7 +150,6 @@ pub(super) async fn collection_groups_describe(
             .into_response());
     };
 
-    let secret_rows = state.plc_connections.secret_rows(conn.id).await?;
     let outcome = crate::db_source::describe_group(&conn, &secret_rows, query_sql).await;
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }

@@ -222,14 +222,20 @@ pub enum UnreadableReason {
     /// entropy の違い）、`dpapi-machine-v1` を protector の無い PC（非 Windows）で開いた、
     /// 開いた値が UTF-8 でない・空（空は封印しないので、壊れた行）。
     Undecryptable,
+    /// `settings` にキーはあるが、形の正しい参照（`{"$secret": "<32 文字の小文字 16 進>"}`）
+    /// ではない（`{"$secret": 123}`・余計なキー・平文の文字列など。書き込みの入口は断るので、
+    /// 生の SQL・壊れた DB でだけ起こる。PR #777 のオーナーレビュー P2）。「値が無い」に
+    /// 潰さない（潰すと空のパスワードで繋ぎに行く）。
+    Invalid,
 }
 
 impl UnreadableReason {
-    /// REST の `reason` の綴り（`missing` / `undecryptable`）。
+    /// REST の `reason` の綴り（`missing` / `undecryptable` / `invalid`）。
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Missing => "missing",
             Self::Undecryptable => "undecryptable",
+            Self::Invalid => "invalid",
         }
     }
 }
@@ -589,7 +595,8 @@ pub fn password_changes(
 
 /// 接続 `conn` の秘密のキー `key` を開く（設計 §5.4。使う直前にだけ呼ぶ）。
 ///
-/// - `settings[key]` に参照が無い → `Ok(None)`（値が設定されていない）。
+/// - `settings` に `key` が無い → `Ok(None)`（値が設定されていない）。
+/// - `key` はあるが形の正しい参照でない → `Err(Invalid)`（「無い」に潰さない）。
 /// - 参照があるのに、その参照・接続・キーの行が `rows` に無い → `Err(Missing)`。
 /// - 行はあるが開けない（方式・参照の形が違う、DPAPI の失敗、空・UTF-8 でない）→
 ///   `Err(Undecryptable)`。
@@ -602,8 +609,10 @@ pub fn open_connection_secret(
     key: &str,
     rows: &[banto_tags::StoredSecretRow],
 ) -> Result<Option<Zeroizing<String>>, UnreadableReason> {
-    let Some(r#ref) = conn.secret_ref(key) else {
-        return Ok(None);
+    let r#ref = match conn.secret_ref_lookup(key) {
+        banto_tags::SecretRefLookup::Absent => return Ok(None),
+        banto_tags::SecretRefLookup::Malformed => return Err(UnreadableReason::Invalid),
+        banto_tags::SecretRefLookup::Ref(r#ref) => r#ref,
     };
     let row = rows
         .iter()
@@ -619,8 +628,9 @@ pub fn open_connection_secret(
 }
 
 /// 接続 `conn` の秘密のキー `key` の状態（設計 §5.5 の `passwordState`）。開けるかを
-/// 実際に開いて確かめ、平文はすぐ捨てる（`Zeroizing`）。参照が無い → [`SecretState::None`]、
-/// 開ける → [`SecretState::Set`]、行が無い・開けない → [`SecretState::Unreadable`]。
+/// 実際に開いて確かめ、平文はすぐ捨てる（`Zeroizing`）。キーが無い → [`SecretState::None`]、
+/// 開ける → [`SecretState::Set`]、参照の形が違う・行が無い・開けない →
+/// [`SecretState::Unreadable`]。
 pub fn secret_state(
     secrets: &ConnectionSecrets,
     conn: &banto_tags::PlcConnection,
@@ -1237,5 +1247,27 @@ mod r2b1d_tests {
                 Err(UnreadableReason::Undecryptable)
             );
         }
+        // PR #777 review P2: a present key that is not a well-formed reference is Invalid
+        // (unreadable), never "no password" - even with a row under a matching ref.
+        for bad in [
+            serde_json::json!({ "$secret": 123 }),
+            serde_json::json!({ "$secret": r#ref.clone(), "extra": true }),
+            serde_json::json!({ "$secret": "not-a-ref" }),
+            serde_json::json!("plain-text-pw"),
+            serde_json::Value::Null,
+        ] {
+            let conn = connection(serde_json::json!({ "password": bad.clone() }));
+            assert_eq!(
+                open_connection_secret(&secrets, &conn, "password", std::slice::from_ref(&row)),
+                Err(UnreadableReason::Invalid),
+                "{bad}"
+            );
+            assert_eq!(
+                secret_state(&secrets, &conn, "password", std::slice::from_ref(&row)).as_str(),
+                "unreadable",
+                "{bad}"
+            );
+        }
+        assert_eq!(UnreadableReason::Invalid.as_str(), "invalid");
     }
 }

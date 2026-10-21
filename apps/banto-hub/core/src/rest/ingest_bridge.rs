@@ -56,7 +56,6 @@ use super::{
     PlcConnectionService, Response, Router, Serialize, State,
 };
 use crate::api_keys::ApiKeyContext;
-use banto_core::ListParams;
 use banto_tags::{
     validate_push_settings, PlcConnection, BRIDGE_KIND_DB, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
 };
@@ -322,12 +321,11 @@ pub(crate) fn build_sources(
 static BRIDGE_CONFIG_LOOPBACK_WARNING: std::sync::Once = std::sync::Once::new();
 
 async fn build_response(state: &BridgeConfigState, caller: Option<&ApiKeyContext>) -> Response {
-    let connections = match state.plc_connections.list(ListParams::default()).await {
-        Ok(result) => result.rows,
-        Err(err) => return ApiError(err).into_response(),
-    };
-    let secret_rows = match state.plc_connections.all_secret_rows().await {
-        Ok(rows) => rows,
+    // PR #777 review P2: the connections and the secret rows come from one read
+    // transaction (a password update committing between two separate reads would make
+    // the source's DB connection read as `missing`).
+    let (connections, secret_rows) = match state.plc_connections.list_with_secret_rows().await {
+        Ok(pair) => pair,
         Err(err) => return ApiError(err).into_response(),
     };
     let built = build_sources(&connections, &secret_rows, caller);

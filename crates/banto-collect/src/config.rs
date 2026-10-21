@@ -37,12 +37,10 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use banto_core::ListParams;
 use banto_driver_api::DriverRegistry;
 use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
-    scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
-    StoredSecretRow, Tag, TagService, PUSH_PROTOCOL,
+    scaling::Scaling, CollectionGroup, PlcConnection, StoredSecretRow, Tag, PUSH_PROTOCOL,
 };
 use banto_tstore::{GroupConfig, StoreConfig, TagColumn};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -482,30 +480,48 @@ pub struct RegistrySnapshot {
 
 impl RegistrySnapshot {
     /// Read the registry rows once into a reusable logical snapshot.
+    ///
+    /// PR #777 owner review P2: all four reads (connections, groups, tags, secret rows)
+    /// run in **one** read transaction ([`Self::load_connection`] on a deferred
+    /// `BEGIN`), so a write that commits in between - e.g. a password update that writes
+    /// a new reference + row and deletes the old row - cannot leave the snapshot with a
+    /// connection that refers to a row it does not hold (a healthy DB Source connection
+    /// read as `Missing`).
     pub async fn load(pool: &SqlitePool) -> Result<Self, CollectError> {
-        Ok(Self {
-            connections: PlcConnectionService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-            groups: CollectionGroupService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-            tags: TagService::new(pool.clone())
-                .list(ListParams::default())
-                .await?
-                .rows,
-            secrets: PlcConnectionService::new(pool.clone())
-                .all_secret_rows()
-                .await?,
-        })
+        Self::load_between(pool, || async {}).await
+    }
+
+    /// [`Self::load`] with `between` awaited after the connection rows are read and
+    /// before the secret rows are (the tests commit a write there).
+    async fn load_between<F, Fut>(pool: &SqlitePool, between: F) -> Result<Self, CollectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let storage = |err: sqlx::Error| {
+            CollectError::Registry(banto_core::BantoError::Storage(err.to_string()))
+        };
+        let mut tx = pool.begin().await.map_err(storage)?;
+        let snapshot = Self::load_connection_between(&mut tx, between).await?;
+        tx.rollback().await.map_err(storage)?;
+        Ok(snapshot)
     }
 
     /// Read the same registry snapshot from an already-open SQLite connection.
     /// Callers use this with a transaction/savepoint so proposed mutations and
     /// all three registry reads observe one transaction-local state.
     pub async fn load_connection(connection: &mut SqliteConnection) -> Result<Self, CollectError> {
+        Self::load_connection_between(connection, || async {}).await
+    }
+
+    async fn load_connection_between<F, Fut>(
+        connection: &mut SqliteConnection,
+        between: F,
+    ) -> Result<Self, CollectError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         // Column names must match `PlcConnection` (`banto-tags`' `COLUMNS`).
         // `FromRow` looks them up by name, so a missing name fails every
         // preflight with "no column found" even though the table has the column.
@@ -535,6 +551,7 @@ impl RegistrySnapshot {
         .await
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
 
+        between().await;
         let secrets = banto_tags::connection_secret::load_all_secret_rows(&mut *connection)
             .await
             .map_err(|err| {
@@ -1848,7 +1865,10 @@ pub fn check_tag_address(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use banto_tags::{CollectionGroupInput, PlcConnectionInput, TagInput};
+    use banto_tags::{
+        CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
+        TagInput, TagService,
+    };
 
     async fn registry() -> SqlitePool {
         let pool = banto_storage::connect_sqlite_memory().await.unwrap();
@@ -3832,6 +3852,65 @@ mod tests {
             Some(in_tx.secrets[0].sealed.r#ref.as_str()),
             in_tx.connections[0].secret_ref(banto_tags::PASSWORD_KEY)
         );
+    }
+
+    /// PR #777 owner review P2: [`RegistrySnapshot::load`] reads the connections and
+    /// the secret rows in one read transaction. A password update committed (from
+    /// another pool connection, a file DB in WAL) between the connection read and the
+    /// secret rows read is not seen half: the snapshot keeps the old reference **and**
+    /// the old row, so DB Source does not read a healthy connection as `Missing`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_reads_connections_and_secret_rows_in_one_snapshot() {
+        const OLD: &str = "0123456789abcdef0123456789abcdef";
+        const NEW: &str = "fedcba9876543210fedcba9876543210";
+        fn with_password(r#ref: &str) -> PlcConnectionInput {
+            let mut pg = PlcConnectionInput {
+                protocol: banto_tags::POSTGRES_PROTOCOL.to_string(),
+                database: Some("erp".to_string()),
+                username: Some("reader".to_string()),
+                ..conn_input("PG", 5432)
+            };
+            pg.secrets.insert(
+                banto_tags::PASSWORD_KEY.to_string(),
+                banto_tags::SecretChange::Set(banto_tags::SealedSecretRow::new(
+                    r#ref,
+                    banto_tags::SCHEME_PLAIN_V1,
+                    b"pw".to_vec(),
+                )),
+            );
+            pg
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pool = banto_storage::connect_sqlite(dir.path().join("snapshot.sqlite3"))
+            .await
+            .unwrap();
+        banto_tags::migrate(&pool).await.unwrap();
+        let service = PlcConnectionService::new(pool.clone());
+        let id = service.create(with_password(OLD)).await.unwrap().id;
+
+        let writer = service.clone();
+        let snapshot = RegistrySnapshot::load_between(&pool, || async move {
+            writer
+                .update(id, with_password(NEW))
+                .await
+                .expect("the update commits while the snapshot is being read");
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            snapshot.connections[0].secret_ref(banto_tags::PASSWORD_KEY),
+            Some(OLD)
+        );
+        assert_eq!(snapshot.secrets.len(), 1, "{:?}", snapshot.secrets);
+        assert_eq!(snapshot.secrets[0].sealed.r#ref, OLD);
+
+        let after = RegistrySnapshot::load(&pool).await.unwrap();
+        assert_eq!(
+            after.connections[0].secret_ref(banto_tags::PASSWORD_KEY),
+            Some(NEW)
+        );
+        assert_eq!(after.secrets[0].sealed.r#ref, NEW);
+        pool.close().await;
     }
 
     /// R2a-2a: a "push" row saved through the services (now that the CHECK

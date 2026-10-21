@@ -72,7 +72,8 @@ pub use collection_group::{
 };
 pub use connection_secret::{
     builtin_secret_keys, check_settings_shape, SealedSecretRow, SecretChange, SecretChanges,
-    StoredSecretRow, PASSWORD_KEY, SCHEME_DPAPI_MACHINE_V1, SCHEME_PLAIN_V1, SECRET_REF_LEN,
+    SecretRefLookup, StoredSecretRow, PASSWORD_KEY, SCHEME_DPAPI_MACHINE_V1, SCHEME_PLAIN_V1,
+    SECRET_REF_LEN,
 };
 pub use plc_connection::{
     PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
@@ -115,10 +116,26 @@ pub const MIGRATIONS_TABLE: &str = "_sqlx_migrations_banto_tags";
 /// migrator tracks applied versions in [`MIGRATIONS_TABLE`]), so it is safe
 /// to call on every app startup, same as banto's `db.rs::init_db`.
 pub async fn migrate(pool: &SqlitePool) -> Result<(), BantoError> {
+    migrator()
+        .run(pool)
+        .await
+        .map_err(|err| BantoError::Storage(err.to_string()))
+}
+
+/// The embedded migrator with this crate's bookkeeping table.
+fn migrator() -> sqlx::migrate::Migrator {
     let mut migrator = sqlx::migrate!("./migrations");
     migrator.dangerous_set_table_name(MIGRATIONS_TABLE);
     migrator
-        .run(pool)
+}
+
+/// Run this crate's embedded migrations up to and including `target` only
+/// (sqlx's `run_to`). The Hub's dry run (R2b-1d, `upgrade::migrate_before_0025`)
+/// brings an older copy (alpha.32 and before: no `settings`, no `cpu_type`...)
+/// up to `0024` before it reads the pre-`0025` columns.
+pub async fn migrate_to(pool: &SqlitePool, target: i64) -> Result<(), BantoError> {
+    migrator()
+        .run_to(target, pool)
         .await
         .map_err(|err| BantoError::Storage(err.to_string()))
 }

@@ -837,6 +837,7 @@ mod tests {
                 connections: vec![plan.clone()],
                 disabled: Vec::new(),
                 unreadable: Vec::new(),
+                excluded: Vec::new(),
             },
             &std::collections::HashSet::new(),
             true,

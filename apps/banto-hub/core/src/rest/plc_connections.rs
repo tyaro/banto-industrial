@@ -11,10 +11,10 @@ use super::{
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, Address,
     ApiError, BantoError, BatchReadRequest, BatchReadResult, BrokerError, CollectorManager,
-    DataType, Deserialize, Duration, FieldError, HeaderMap, IntoResponse, Json, ListParams,
-    ModbusTcpClient, ModbusTcpConfig, Path, PlcClient, PlcConnection, PlcConnectionInput, PlcError,
-    ReadRequest, ReadResult, RegistryMutationError, RegistryMutationResult, Response, Serialize,
-    SlmpClient, SlmpConfig, State, StatusCode, TagRegistryState,
+    DataType, Deserialize, Duration, FieldError, HeaderMap, IntoResponse, Json, ModbusTcpClient,
+    ModbusTcpConfig, Path, PlcClient, PlcConnection, PlcConnectionInput, PlcError, ReadRequest,
+    ReadResult, RegistryMutationError, RegistryMutationResult, Response, Serialize, SlmpClient,
+    SlmpConfig, State, StatusCode, TagRegistryState,
 };
 
 fn default_plc_protocol() -> String {
@@ -325,13 +325,14 @@ pub(crate) async fn connection_response(
     Ok(PlcConnectionResponse::with_secret_rows(conn, &rows))
 }
 
-/// [`PlcConnectionResponse::with_secret_rows`] for a list of connections (one read of
-/// every sealed row).
+/// [`PlcConnectionResponse::with_secret_rows`] for every connection. The connections
+/// and the sealed rows are read in one read transaction (PR #777 review P2: a password
+/// update committing between two separate reads would show a healthy connection as
+/// `unreadable`).
 pub(crate) async fn connection_responses(
     service: &banto_tags::PlcConnectionService,
-    connections: Vec<PlcConnection>,
 ) -> Result<Vec<PlcConnectionResponse>, BantoError> {
-    let rows = service.all_secret_rows().await?;
+    let (connections, rows) = service.list_with_secret_rows().await?;
     Ok(connections
         .into_iter()
         .map(|conn| {
@@ -348,24 +349,16 @@ pub(crate) async fn connection_responses(
 pub(super) async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
-    let rows = state
-        .plc_connections
-        .list(ListParams::default())
-        .await?
-        .rows;
-    Ok(Json(
-        connection_responses(&state.plc_connections, rows).await?,
-    ))
+    Ok(Json(connection_responses(&state.plc_connections).await?))
 }
 
 pub(super) async fn plc_connections_get(
     State(state): State<TagRegistryState>,
     Path(id): Path<i64>,
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
-    let conn = state.plc_connections.get(id).await?;
-    Ok(Json(
-        connection_response(&state.plc_connections, conn).await?,
-    ))
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, rows) = state.plc_connections.get_with_secret_rows(id).await?;
+    Ok(Json(PlcConnectionResponse::with_secret_rows(conn, &rows)))
 }
 
 pub(super) async fn plc_connections_create(
@@ -671,7 +664,8 @@ pub(super) async fn plc_connections_test_saved(
     )
     .await?;
 
-    let conn = state.plc_connections.get(id).await?;
+    // One read transaction for the row and its sealed rows (PR #777 review P2).
+    let (conn, secret_rows) = state.plc_connections.get_with_secret_rows(id).await?;
     if !conn.is_db_source() {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -682,7 +676,6 @@ pub(super) async fn plc_connections_test_saved(
             .into_response());
     }
 
-    let secret_rows = state.plc_connections.secret_rows(id).await?;
     let outcome = crate::db_source::test_connection(&conn, &secret_rows).await;
     Ok((StatusCode::OK, Json(outcome)).into_response())
 }
