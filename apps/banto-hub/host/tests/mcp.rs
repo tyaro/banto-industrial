@@ -4654,6 +4654,131 @@ async fn list_api_keys_returns_issued_keys_without_plaintext_or_hash() {
     }
 }
 
+/// R2a-2b（docs/banto-hub-ingest-design.md §5「キーの作成」「キーの一覧」）:
+/// MCP で `ingest:#{id}` のキーを発行でき（接続名では断る）、`list_api_keys`
+/// の `ingestTargets` が今の名前（改名に追従）と「（削除済み #id）」を出す。
+/// `ingest:` だけのキーは MCP でも値を読めず、構成も触れない（直交性）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ingest_keys_are_issued_and_listed_with_the_current_connection_name() {
+    let app = test_app("keys-ingest").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+
+    let connections = PlcConnectionService::new(app.pool.clone());
+    let push_input = |name: &str| -> PlcConnectionInput {
+        serde_json::from_value(json!({
+            "name": name, "protocol": "push", "host": "", "port": 0,
+        }))
+        .unwrap()
+    };
+    let kept = connections.create(push_input("Bridge1")).await.unwrap().id;
+    let removed = connections.create(push_input("Bridge2")).await.unwrap().id;
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "by-name", "scopes": ["ingest:Bridge1"] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+
+    let scopes = [format!("ingest:#{kept}"), format!("ingest:#{removed}")];
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_api_key",
+            json!({ "name": "bridge", "scopes": scopes }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["scopes"], json!(scopes));
+    let ingest_key = payload["key"].as_str().unwrap().to_string();
+
+    // 改名と削除の後の一覧。
+    connections
+        .update(kept, push_input("Bridge1-renamed"))
+        .await
+        .unwrap();
+    connections.delete(removed).await.unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_api_keys", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    let keys = payload["apiKeys"].as_array().expect("apiKeys array");
+    let row = keys
+        .iter()
+        .find(|k| k["name"] == "bridge")
+        .expect("bridge row");
+    assert_eq!(row["scopes"], json!(scopes), "scopes stay verbatim");
+    assert_eq!(
+        row["ingestTargets"],
+        json!([
+            {
+                "scope": format!("ingest:#{kept}"),
+                "connectionId": kept,
+                "connectionName": "Bridge1-renamed",
+                "state": "present",
+                "label": format!("取り込み: Bridge1-renamed（#{kept}）"),
+            },
+            {
+                "scope": format!("ingest:#{removed}"),
+                "connectionId": removed,
+                "connectionName": null,
+                "state": "deleted",
+                "label": format!("取り込み: （削除済み #{removed}）"),
+            },
+        ])
+    );
+    let admin_row = keys
+        .iter()
+        .find(|k| k["name"] == "admin-key")
+        .expect("admin row");
+    assert_eq!(admin_row["ingestTargets"], json!([]));
+
+    // 直交性: ingest だけのキーは読めず、構成も触れない。
+    for (tool, arguments, code) in [
+        (
+            "list_tags",
+            json!({}),
+            "read スコープを持つ API キーが必要です",
+        ),
+        (
+            "read_tag_values",
+            json!({}),
+            "read スコープを持つ API キーが必要です",
+        ),
+        (
+            "get_server_status",
+            json!({}),
+            "read スコープを持つ API キーが必要です",
+        ),
+        ("list_connections", json!({}), "missing_admin_scope"),
+        ("list_api_keys", json!({}), "missing_admin_scope"),
+    ] {
+        let (status, body) =
+            mcp_post(&app.router, Some(&ingest_key), tools_call(tool, arguments)).await;
+        assert_eq!(status, StatusCode::OK, "{tool}: {body:?}");
+        assert_eq!(body["result"]["isError"], true, "{tool}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(code), "{tool}: {text}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn revoke_api_key_without_confirm_is_rejected_and_key_remains_valid() {
     let app = test_app("keys-revoke-no-confirm").await;
