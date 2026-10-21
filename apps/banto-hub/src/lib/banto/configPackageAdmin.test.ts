@@ -20,7 +20,7 @@
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ConfigPackage } from './configPackage';
-import { parseConfigPackage } from './configPackage';
+import { buildConfigPackage, parseConfigPackage, serializeConfigPackage } from './configPackage';
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
 
 // `vi.mock` ファクトリはファイル先頭に hoist されるため、参照するクラスは
@@ -93,7 +93,8 @@ import {
 	inspectConfigPackage,
 	isConfigPackageImportAbortedError,
 	ConfigPackageImportAbortedError,
-	configPackageExportFilename
+	configPackageExportFilename,
+	connectionImportOrder
 } from './configPackageAdmin';
 
 const pkg: ConfigPackage = {
@@ -1212,5 +1213,197 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 		expect(inspection.warnings).toEqual([
 			"sink group 'log' のタグ 'plc2 / group1 / temp01' は現在の環境で見つかりません"
 		]);
+	});
+});
+
+// R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1・§10.2）: push 接続の
+// ブリッジは読む postgres 接続を id で持つので、取り込みは postgres 接続を先に
+// 作成・更新し、パッケージの名前（`dbConnectionName`）を取り込み先の id に付け
+// 直す。API キーは移らないので、結果に push 接続の新しい id を返す。
+describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionName の付け直し）', () => {
+	function pushPackage(): ConfigPackage {
+		return {
+			...pkg,
+			plcConnections: [
+				// わざと push を postgres より前に並べる。
+				{
+					name: 'Bridge1',
+					protocol: 'push',
+					host: '',
+					port: 0,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high',
+					cpuType: 'R',
+					settings: {
+						stale_timeout_ms: 5000,
+						bridge: {
+							kind: 'db',
+							dbConnectionName: 'pg-a',
+							queries: [
+								{
+									name: 'line1',
+									period_ms: 1000,
+									sql: 'SELECT temp FROM line1_now',
+									columns: [{ column: 'temp', key: 'line1.temp' }]
+								}
+							]
+						}
+					}
+				},
+				{
+					name: 'pg-a',
+					protocol: 'postgres',
+					host: '10.0.0.5',
+					port: 5432,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high',
+					cpuType: 'R',
+					database: 'appdb',
+					username: 'appuser'
+				}
+			],
+			collectionGroups: [],
+			tags: []
+		};
+	}
+
+	function savedConnection(
+		input: { name: string; protocol: string; settings?: unknown },
+		id: number
+	): PlcConnection {
+		return {
+			...plcConnection(id, input.name),
+			protocol: input.protocol as PlcConnection['protocol'],
+			settings: (input.settings ?? null) as PlcConnection['settings']
+		};
+	}
+
+	it('postgres 接続を先に作り、push のブリッジをその新しい id で作る。結果に push 接続の id を返す', async () => {
+		let nextId = 40;
+		vi.mocked(createPlcConnection).mockImplementation(async (input) =>
+			savedConnection(input, nextId++)
+		);
+		const summary = await applyConfigPackage(pushPackage());
+
+		const calls = vi.mocked(createPlcConnection).mock.calls.map(([input]) => input);
+		expect(calls.map((c) => c.name)).toEqual(['pg-a', 'Bridge1']);
+		expect(calls[0].settings).toBeUndefined();
+		expect(calls[1].settings).toEqual({
+			stale_timeout_ms: 5000,
+			bridge: {
+				kind: 'db',
+				db_connection_id: 40,
+				queries: [
+					{
+						name: 'line1',
+						period_ms: 1000,
+						sql: 'SELECT temp FROM line1_now',
+						columns: [{ column: 'temp', key: 'line1.temp' }]
+					}
+				]
+			}
+		});
+		expect(JSON.stringify(calls[1])).not.toContain('dbConnectionName');
+		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 41 }]);
+		expect(summary.warnings).toEqual([]);
+	});
+
+	it('既存の postgres・push 接続を更新するときは、取り込み先の既存の id に付け直す', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([
+			savedConnection({ name: 'pg-a', protocol: 'postgres' }, 7),
+			savedConnection({ name: 'Bridge1', protocol: 'push' }, 9)
+		]);
+		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+			savedConnection(input, id)
+		);
+		const summary = await applyConfigPackage(pushPackage());
+		const calls = vi.mocked(updatePlcConnection).mock.calls;
+		expect(calls.map(([id]) => id)).toEqual([7, 9]);
+		expect(calls[1][1].settings?.bridge?.db_connection_id).toBe(7);
+		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 9 }]);
+	});
+
+	it('ブリッジの読む接続を引けなければ、壊れた参照で作らず警告を積んで飛ばす', async () => {
+		vi.mocked(createPlcConnection).mockImplementation(async (input) => savedConnection(input, 50));
+		const broken = pushPackage();
+		broken.plcConnections = broken.plcConnections.filter((c) => c.name !== 'pg-a');
+		const summary = await applyConfigPackage(broken);
+		expect(vi.mocked(createPlcConnection)).not.toHaveBeenCalled();
+		expect(summary.warnings).toEqual([
+			"push 接続 'Bridge1' のブリッジが読む接続 'pg-a' を解決できませんでした"
+		]);
+		expect(summary.ingestConnections).toEqual([]);
+	});
+
+	it('往復: 書き出した Hub の id（12 → 3）が、取り込み先の新しい id（81 → 80）に付け直される', async () => {
+		const exported = serializeConfigPackage(
+			buildConfigPackage({
+				plcConnections: [
+					{
+						...savedConnection({ name: 'Bridge1', protocol: 'push' }, 12),
+						settings: {
+							bridge: {
+								kind: 'db',
+								db_connection_id: 3,
+								queries: [
+									{
+										name: 'q',
+										period_ms: 500,
+										sql: 'SELECT 1 AS v',
+										columns: [{ column: 'v', key: 'k' }]
+									}
+								]
+							}
+						}
+					},
+					{
+						...savedConnection({ name: 'pg-a', protocol: 'postgres' }, 3),
+						database: 'd',
+						username: 'u'
+					}
+				],
+				collectionGroups: [],
+				tags: [],
+				mqtt: { ...currentMqtt },
+				grpc: { enabled: false, bind: '127.0.0.1', port: 50051 }
+			})
+		);
+		let nextId = 80;
+		vi.mocked(createPlcConnection).mockImplementation(async (input) =>
+			savedConnection(input, nextId++)
+		);
+		const summary = await applyConfigPackage(parseConfigPackage(exported));
+		const bridgeCall = vi
+			.mocked(createPlcConnection)
+			.mock.calls.map(([input]) => input)
+			.find((input) => input.name === 'Bridge1');
+		expect(bridgeCall?.settings).toEqual({
+			bridge: {
+				kind: 'db',
+				db_connection_id: 80,
+				queries: [
+					{ name: 'q', period_ms: 500, sql: 'SELECT 1 AS v', columns: [{ column: 'v', key: 'k' }] }
+				]
+			}
+		});
+		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 81 }]);
+	});
+
+	it('connectionImportOrder はブリッジを持つ push 接続だけを後ろへ回す（他は元の順）', () => {
+		const order = connectionImportOrder([
+			...pushPackage().plcConnections,
+			{ ...pkg.plcConnections[0], name: 'plc-z' }
+		]);
+		expect(order.map((c) => c.name)).toEqual(['pg-a', 'plc-z', 'Bridge1']);
+	});
+
+	it('inspectConfigPackage は push 接続の名前を ingestConnections に出す（キーは移らない案内用）', async () => {
+		const inspection = await inspectConfigPackage(pushPackage());
+		expect(inspection.ingestConnections).toEqual(['Bridge1']);
+		expect((await inspectConfigPackage(pkg)).ingestConnections).toEqual([]);
 	});
 });

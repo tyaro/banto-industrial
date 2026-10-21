@@ -153,6 +153,49 @@ export interface SinkStatusEntry {
 	groups: SinkGroupStatusEntry[];
 }
 
+/**
+ * R2a-2e（docs/banto-hub-ingest-design.md §9）: `GET /api/status` の `ingest`
+ * 配列の送り手 1 つ - mirrors `AdminIngestSenderStatusEntry`。`transport` は
+ * `ws`（開いている WS、`connected_at` は開いた時刻）か `rest`（最後に受け付けた
+ * 要求、`last_seen_at`）。API キーは名前だけ（値は来ない）。
+ */
+export interface IngestSenderStatusEntry {
+	transport: 'ws' | 'rest' | string;
+	api_key_name: string;
+	peer: string | null;
+	connected_at: number | null;
+	last_seen_at: number | null;
+}
+
+/**
+ * R2a-2e: `GET /api/status` の `ingest` 配列 1 件（`push` 接続ごとの受信の状態） -
+ * mirrors `AdminIngestStatusEntry`。資格情報と値は来ない（保持値は数だけ）。
+ */
+export interface IngestStatusEntry {
+	connection_id: number;
+	name: string;
+	enabled: boolean;
+	bridge: boolean;
+	/** `live`（送り手の最後の通信から `stale_timeout_ms` 以内）/ `down`。 */
+	link: 'live' | 'down' | string;
+	link_detail: string | null;
+	last_seen_at: number | null;
+	stale_timeout_ms: number;
+	collecting: boolean;
+	epoch: number;
+	held_values: number;
+	senders: IngestSenderStatusEntry[];
+	accepted: number;
+	rejected: number;
+	rate_limited: number;
+	too_many_items: number;
+	/** 直近の未知のキー（新しい順、20 件まで）。 */
+	unknown_keys: string[];
+	last_source_time: number | null;
+	/** 送り手の最後の `status`（サーバーが 1 KiB に切り詰め済み。画面でも切り詰める）。 */
+	sender_status: string | null;
+}
+
 /** `GET /api/status` の応答。 */
 export interface StatusResponse {
 	version: string;
@@ -204,6 +247,8 @@ export interface StatusResponse {
 	system: SystemInfoEntry;
 	/** S3（docs/banto-hub-external-db-design.md §7 row S3）: DB Source の接続ごとの運転状態。 */
 	db_source: DbSourceStatusEntry[];
+	/** R2a-2e（docs/banto-hub-ingest-design.md §9）: `push` 接続ごとの受信の状態。 */
+	ingest: IngestStatusEntry[];
 	/** S6（docs/banto-hub-external-db-design.md §5.2・§5.5・§7 row S6）: DB Sink サイドカーの運転状態。 */
 	sink: SinkStatusEntry;
 }
@@ -252,6 +297,38 @@ interface RawDbSourceStatusEntry {
 	groups: RawDbSourceGroupStatusEntry[];
 }
 
+/** サーバーの camelCase 応答（`AdminIngestSenderStatusEntry`）の生形。 */
+interface RawIngestSenderStatusEntry {
+	transport: string;
+	apiKeyName: string;
+	peer: string | null;
+	connectedAt: number | null;
+	lastSeenAt: number | null;
+}
+
+/** サーバーの camelCase 応答（`AdminIngestStatusEntry`）の生形。 */
+interface RawIngestStatusEntry {
+	connectionId: number;
+	name: string;
+	enabled: boolean;
+	bridge: boolean;
+	link: string;
+	linkDetail: string | null;
+	lastSeenAt: number | null;
+	staleTimeoutMs: number;
+	collecting: boolean;
+	epoch: number;
+	heldValues: number;
+	senders: RawIngestSenderStatusEntry[];
+	accepted: number;
+	rejected: number;
+	rateLimited: number;
+	tooManyItems: number;
+	unknownKeys: string[];
+	lastSourceTime: number | null;
+	senderStatus: string | null;
+}
+
 /** サーバーから受け取る camelCase の生レスポンス形（`AdminStatusResponse`）。 */
 interface RawStatusResponse {
 	version: string;
@@ -277,7 +354,40 @@ interface RawStatusResponse {
 		hostMemoryTotalBytes: number;
 	};
 	dbSource: RawDbSourceStatusEntry[];
+	/** R2a-2e。古いサーバーは返さないので省略を許す（空配列として扱う）。 */
+	ingest?: RawIngestStatusEntry[];
 	sink: RawSinkStatusEntry;
+}
+
+/** R2a-2e: `ingest` 1 件を snake_case の公開形へ。 */
+function fromRawIngestStatus(entry: RawIngestStatusEntry): IngestStatusEntry {
+	return {
+		connection_id: entry.connectionId,
+		name: entry.name,
+		enabled: entry.enabled,
+		bridge: entry.bridge,
+		link: entry.link,
+		link_detail: entry.linkDetail,
+		last_seen_at: entry.lastSeenAt,
+		stale_timeout_ms: entry.staleTimeoutMs,
+		collecting: entry.collecting,
+		epoch: entry.epoch,
+		held_values: entry.heldValues,
+		senders: entry.senders.map((sender) => ({
+			transport: sender.transport,
+			api_key_name: sender.apiKeyName,
+			peer: sender.peer,
+			connected_at: sender.connectedAt,
+			last_seen_at: sender.lastSeenAt
+		})),
+		accepted: entry.accepted,
+		rejected: entry.rejected,
+		rate_limited: entry.rateLimited,
+		too_many_items: entry.tooManyItems,
+		unknown_keys: entry.unknownKeys,
+		last_source_time: entry.lastSourceTime,
+		sender_status: entry.senderStatus
+	};
 }
 
 /** サーバーの camelCase 応答を、このファイルが公開する既存の型（snake_case
@@ -326,6 +436,7 @@ function fromRawStatus(raw: RawStatusResponse): StatusResponse {
 				row_count_last: group.rowCountLast
 			}))
 		})),
+		ingest: (raw.ingest ?? []).map(fromRawIngestStatus),
 		sink: {
 			sidecar: {
 				state: raw.sink.sidecar.state,

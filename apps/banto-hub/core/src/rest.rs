@@ -268,8 +268,9 @@ use tag_space::{
     __path_v1_status, __path_v1_tags, __path_v1_value_read_now, __path_v1_value_single,
     __path_v1_values, build_catalog_response, build_values_response, resolve_value_names,
     tag_space_router, CatalogResponse, CatalogTagEntry, ConnectionStatusEntry, DbSourceStatusEntry,
-    GrpcStatusEntry, LastApplyEntry, MqttStatusEntry, ReadNowResponse, SingleValueResponse,
-    SinkStatusEntry, StatusResponse, TagsQuery, ValueEntry, ValuesQuery, ValuesResponse,
+    GrpcStatusEntry, IngestStatusEntry, LastApplyEntry, MqttStatusEntry, ReadNowResponse,
+    SingleValueResponse, SinkStatusEntry, StatusResponse, TagsQuery, ValueEntry, ValuesQuery,
+    ValuesResponse,
 };
 pub(crate) use tag_space::{compute_status, TagSpaceState};
 #[cfg(test)]

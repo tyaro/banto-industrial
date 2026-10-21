@@ -119,6 +119,16 @@ pub struct PlcConnectionPayload {
     /// パスワードを一度保存した接続を読み返すだけで露出させないため。
     #[serde(default)]
     pub password: Option<String>,
+    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `protocol: "push"` 接続の
+    /// `settings`（`stale_timeout_ms` とブリッジの区画、JSON のオブジェクト）。
+    /// 他プロトコルでは省略する（`banto_tags::PlcConnectionInput::settings` が
+    /// push 以外での指定を拒否する）。**create と update で意味が異なる**
+    /// （`cpuType` と同じ）: create の省略は既定（SQL の `NULL`）、update の省略・
+    /// `null` は「保存済みの値を保つ」、オブジェクトは置き換え（`{}` でブリッジを
+    /// 外せる）。秘密値は持たない（ブリッジの DB のパスワードは参照先の `postgres`
+    /// 接続の列のまま、§10.2）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
 }
 
 impl From<PlcConnectionPayload> for PlcConnectionInput {
@@ -144,12 +154,11 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             database: payload.database,
             username: payload.username,
             password: payload.password,
-            // R2a-2a: the REST payload does not carry `settings` yet (R2a-2e adds
-            // it with the push form). `None` = defaults on create and "keep the
-            // stored value" on update (`banto_tags::PlcConnectionInput::settings`),
-            // so an update through this payload never wipes a push connection's
-            // settings.
-            settings: None,
+            // R2a-2e: wired through - `None`（省略）は create では既定、update では
+            // 「保存済みの値を保つ」（`banto_tags::PlcConnectionInput::settings`）
+            // ので、この項目を知らないクライアントの更新が push 接続の設定を
+            // 消すことは無い。
+            settings: payload.settings,
         }
     }
 }
@@ -207,6 +216,10 @@ pub struct PlcConnectionResponse {
     /// S1: true のとき、この接続には非空のパスワードが保存されている
     /// （値そのものは返さない）。
     pub password_set: bool,
+    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
+    /// （無ければ `null`。他プロトコルでは常に `null`）。秘密値を持たない
+    /// （`banto_tags::PlcConnection::settings` の doc）のでそのまま返す。
+    pub settings: Option<serde_json::Value>,
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
@@ -226,6 +239,7 @@ impl From<PlcConnection> for PlcConnectionResponse {
             database: conn.database,
             username: conn.username,
             password_set,
+            settings: conn.settings,
         }
     }
 }

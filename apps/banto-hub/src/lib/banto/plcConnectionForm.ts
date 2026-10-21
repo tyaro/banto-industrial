@@ -34,15 +34,27 @@
  *    `modbus-tcp` = `high_low`（Modbus/IEEE慣習に統一 - 収集ポーリング経路と
  *    read-on-demand/書き込み経路とでワード順の解釈が食い違っていた実バグの
  *    是正）、`slmp` = `low_high`（MELSEC標準、従来どおり変更無し）。
+ * 5. **取り込み口 `push` の設定**（R2a-2e、docs/banto-hub-ingest-design.md
+ *    §3.2・§7.1）: `stale_timeout_ms` とブリッジの区画（読む `postgres` 接続・
+ *    クエリ・列とキーの対応）のフォーム状態と `settings` の JSON の往復
+ *    （{@link pushSettingsFromForm}・{@link pushFormFromSettings}）、保存前の
+ *    検証（{@link validatePushFields}。§7.1 の量の見積もり {@link pushBridgeLoad}
+ *    が上限の 8 割を超えたら保存の前に断る）、サーバーの項目エラーの写し
+ *    （{@link mapPushFieldErrors}）、送り手向けの URL とスコープ
+ *    （{@link ingestEndpoints}）。`push` は host / port / unitId / ワード順 /
+ *    シミュレーションを持たない（サーバーが正規化する、§3.1）。
  */
 import type {
 	CpuType,
 	PlcConnection,
 	PlcConnectionInput,
 	PlcProtocol,
+	PushBridgeColumnWire,
+	PushSettingsWire,
 	WordOrder
 } from './tagRegistryAdmin';
 import { nextSequentialName } from './sequentialName';
+import { bridgeLoad, type BridgeLoad } from './bridgeLoad';
 
 /**
  * S1: `banto_tags::plc_connection::POSTGRES_PROTOCOL`/
@@ -58,6 +70,9 @@ import { nextSequentialName } from './sequentialName';
  */
 const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 
+/** R2a-2e: `tagRegistryAdmin.ts::PUSH_PROTOCOL` と同じ値（上の `POSTGRES_PROTOCOL` と同じ理由で複製）。 */
+const PUSH_PROTOCOL: PlcProtocol = 'push';
+
 // "virtual" is intentionally NOT offered here — the two virtual connections
 // (calc/mem) are auto-provisioned by the backend, not created through this
 // form (plc-connections/+page.svelte の元コメントを踏襲)。
@@ -69,7 +84,10 @@ const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 export const PROTOCOL_OPTIONS: { value: PlcProtocol; label: string }[] = [
 	{ value: 'modbus-tcp', label: 'Modbus TCP' },
 	{ value: 'slmp', label: 'SLMP（MELSEC）' },
-	{ value: 'postgres', label: 'PostgreSQL（DB Source）' }
+	{ value: 'postgres', label: 'PostgreSQL（DB Source）' },
+	// R2a-2e（docs/banto-hub-ingest-design.md §3.1）: 取り込み口。送り手（DB
+	// ブリッジ・スクリプト）が Hub へ値を送る接続で、接続先を持たない。
+	{ value: 'push', label: '取り込み（push・送り手が値を送る）' }
 ];
 
 /**
@@ -235,6 +253,61 @@ export interface PlcConnectionFormState {
 	 * 常に空文字列（=消去）を送る。
 	 */
 	clearPassword: boolean;
+	/**
+	 * R2a-2e: `protocol === 'push'` のときだけ意味を持つ。送り手が黙ってから
+	 * Down とみなすまで（ms、§4.3）。空欄は既定（{@link DEFAULT_STALE_TIMEOUT_MS}）。
+	 */
+	staleTimeoutMs: string;
+	/** R2a-2e: push の DB ブリッジの区画を持つか（§3.2）。 */
+	bridgeEnabled: boolean;
+	/** R2a-2e: ブリッジが読む `postgres` 接続の id（`<select>` の値、未選択は `''`）。 */
+	bridgeDbConnectionId: string;
+	/** R2a-2e: ブリッジのクエリ（§3.2）。 */
+	bridgeQueries: BridgeQueryFormState[];
+}
+
+/**
+ * R2a-2e: ブリッジのクエリ 1 本のフォーム状態。列とキーの対応は 1 行に 1 つの
+ * `列名=キー` で書く（{@link parseBridgeColumns}）。
+ */
+export interface BridgeQueryFormState {
+	name: string;
+	periodMs: number;
+	sql: string;
+	columnsText: string;
+}
+
+/** `stale_timeout_ms` の既定・下限・上限 - mirrors `banto_tags::push`（§4.3、Q3）。 */
+export const DEFAULT_STALE_TIMEOUT_MS = 10_000;
+export const MIN_STALE_TIMEOUT_MS = 1_000;
+export const MAX_STALE_TIMEOUT_MS = 3_600_000;
+/** `push` のキーの文字数の上限 - mirrors `banto_tags::MAX_PUSH_KEY_LEN`（§3.3）。 */
+export const MAX_PUSH_KEY_LEN = 256;
+/** ブリッジのクエリの名前の文字数の上限 - mirrors `banto_tags::MAX_BRIDGE_QUERY_NAME_LEN`。 */
+export const MAX_BRIDGE_QUERY_NAME_LEN = 64;
+/** 結果列名の上限 - mirrors `banto_tags::tag::MAX_DB_COLUMN_NAME_LEN`。 */
+const MAX_DB_COLUMN_NAME_LEN = 63;
+const DB_COLUMN_IDENTIFIER_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+/**
+ * ブリッジのクエリの周期 - mirrors `banto_tags::ALLOWED_PERIOD_MS`
+ * （`tagRegistryAdmin.ts::ALLOWED_PERIOD_MS` と同じ値。上の `POSTGRES_PROTOCOL`
+ * と同じ理由で複製する）。
+ */
+export const BRIDGE_PERIOD_OPTIONS: readonly number[] = [
+	100, 200, 500, 1000, 2000, 5000, 10000, 60000
+];
+
+/** 新しいクエリの初期値。名前は既存のクエリ名と衝突しない `query{n}`。 */
+export function blankBridgeQuery(existing: readonly BridgeQueryFormState[]): BridgeQueryFormState {
+	return {
+		name: nextSequentialName(
+			existing.map((q) => q.name),
+			'query'
+		),
+		periodMs: 1000,
+		sql: '',
+		columnsText: ''
+	};
 }
 
 /**
@@ -262,7 +335,11 @@ export function blankConnectionForm(): PlcConnectionFormState {
 		database: '',
 		username: '',
 		password: '',
-		clearPassword: false
+		clearPassword: false,
+		staleTimeoutMs: '',
+		bridgeEnabled: false,
+		bridgeDbConnectionId: '',
+		bridgeQueries: []
 	};
 }
 
@@ -285,7 +362,8 @@ export function connectionToForm(c: PlcConnection): PlcConnectionFormState {
 		database: c.database ?? '',
 		username: c.username ?? '',
 		password: '',
-		clearPassword: false
+		clearPassword: false,
+		...pushFormFromSettings(c.protocol === PUSH_PROTOCOL ? c.settings : null)
 	};
 }
 
@@ -352,6 +430,23 @@ export function validatePostgresFields(
  * `validatePostgresFields`のdoc comment参照）。
  */
 export function formToConnectionInput(form: PlcConnectionFormState): PlcConnectionInput {
+	if (form.protocol === PUSH_PROTOCOL) {
+		// R2a-2e: push は接続先を持たない（サーバーが host "" / port 0 / 既定へ
+		// 正規化する、§3.1）。`settings` は常に送る（update の省略は「保存済みの
+		// 値を保つ」なので、フォームでブリッジを外したことが伝わるように）。
+		return {
+			name: form.name,
+			protocol: form.protocol,
+			host: '',
+			port: 0,
+			unitId: 1,
+			enabled: form.enabled,
+			simulation: false,
+			wordOrder: form.wordOrder,
+			cpuType: form.cpuType,
+			settings: pushSettingsFromForm(form)
+		};
+	}
 	const base: PlcConnectionInput = {
 		name: form.name,
 		protocol: form.protocol,
@@ -370,4 +465,260 @@ export function formToConnectionInput(form: PlcConnectionFormState): PlcConnecti
 		username: form.username,
 		password: passwordForSubmit(form)
 	};
+}
+
+// --- R2a-2e: 取り込み口 `push` の設定（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
+
+/** {@link parseBridgeColumns} の結果。`error` は最初に見つけた行の誤り（無ければ `null`）。 */
+export interface ParsedBridgeColumns {
+	columns: PushBridgeColumnWire[];
+	error: string | null;
+}
+
+/**
+ * ブリッジのクエリの「列とキーの対応」の欄（1 行に 1 つの `列名=キー`）を読む。
+ * 空行は飛ばす。列名とキーは前後の空白を除く（タグのキーは前後の空白を除いて
+ * 保存されるので、§3.2 の「key の前後に空白」の拒否に当てない）。規則は
+ * サーバー（`banto_tags::push` の `parse_column`）と同じ: 列名は結果列名
+ * （英字か `_` で始まる英数字と `_`、63 文字まで）、キーは 1〜256 文字・制御
+ * 文字なし。
+ */
+export function parseBridgeColumns(text: string): ParsedBridgeColumns {
+	const columns: PushBridgeColumnWire[] = [];
+	const lines = text.split(/\r?\n/);
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i].trim();
+		if (line === '') continue;
+		const at = `${i + 1} 行目`;
+		const eq = line.indexOf('=');
+		if (eq < 0) return { columns, error: `${at}: 「列名=キー」の形で書いてください` };
+		const column = line.slice(0, eq).trim();
+		const key = line.slice(eq + 1).trim();
+		if (
+			Array.from(column).length > MAX_DB_COLUMN_NAME_LEN ||
+			!DB_COLUMN_IDENTIFIER_RE.test(column)
+		) {
+			return {
+				columns,
+				error: `${at}: 列名は結果列名（英字またはアンダースコアで始まる英数字/アンダースコア、${MAX_DB_COLUMN_NAME_LEN} 文字まで）で書いてください`
+			};
+		}
+		if (key === '') return { columns, error: `${at}: キーを書いてください` };
+		if (Array.from(key).length > MAX_PUSH_KEY_LEN) {
+			return { columns, error: `${at}: キーは ${MAX_PUSH_KEY_LEN} 文字までです` };
+		}
+		// eslint-disable-next-line no-control-regex
+		if (/[\u0000-\u001f\u007f-\u009f]/.test(key)) {
+			return { columns, error: `${at}: キーに制御文字は使えません` };
+		}
+		columns.push({ column, key });
+	}
+	return { columns, error: null };
+}
+
+/** フォームの push の欄から `settings`（§3.2）を組み立てる。 */
+export function pushSettingsFromForm(form: PlcConnectionFormState): PushSettingsWire {
+	const settings: PushSettingsWire = {};
+	const stale = String(form.staleTimeoutMs).trim();
+	if (stale !== '') settings.stale_timeout_ms = Number(stale);
+	if (form.bridgeEnabled) {
+		settings.bridge = {
+			kind: 'db',
+			db_connection_id: Number(form.bridgeDbConnectionId),
+			queries: form.bridgeQueries.map((query) => ({
+				name: query.name.trim(),
+				period_ms: query.periodMs,
+				sql: query.sql,
+				columns: parseBridgeColumns(query.columnsText).columns
+			}))
+		};
+	}
+	return settings;
+}
+
+/** 保存済みの `settings` をフォームの push の欄へ（{@link pushSettingsFromForm} の逆）。 */
+export function pushFormFromSettings(
+	settings: PushSettingsWire | null | undefined
+): Pick<
+	PlcConnectionFormState,
+	'staleTimeoutMs' | 'bridgeEnabled' | 'bridgeDbConnectionId' | 'bridgeQueries'
+> {
+	const bridge = settings?.bridge;
+	return {
+		staleTimeoutMs:
+			settings?.stale_timeout_ms === undefined ? '' : String(settings.stale_timeout_ms),
+		bridgeEnabled: bridge !== undefined,
+		bridgeDbConnectionId: bridge ? String(bridge.db_connection_id) : '',
+		bridgeQueries: (bridge?.queries ?? []).map((query) => ({
+			name: query.name,
+			periodMs: query.period_ms,
+			sql: query.sql,
+			columnsText: query.columns.map((c) => `${c.column}=${c.key}`).join('\n')
+		}))
+	};
+}
+
+/**
+ * ブリッジの区画の送る量の見積もり（§7.1、`bridgeLoad.ts`）。ブリッジを持たない・
+ * push でないなら `null`。列の欄が読めないクエリは読めた行までで数える（誤りは
+ * {@link validatePushFields} が別に出す）。
+ */
+export function pushBridgeLoad(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'bridgeEnabled' | 'bridgeQueries'>
+): BridgeLoad | null {
+	if (form.protocol !== PUSH_PROTOCOL || !form.bridgeEnabled) return null;
+	return bridgeLoad(
+		form.bridgeQueries.map((query) => ({
+			periodMs: query.periodMs,
+			keys: parseBridgeColumns(query.columnsText).columns.map((c) => c.key)
+		}))
+	);
+}
+
+/** `bridgeQueries[i].<項目>` のエラーのキー（フォームの `errors` の添字）。 */
+export function bridgeQueryErrorKey(index: number, field: 'name' | 'sql' | 'columns'): string {
+	return `bridgeQueries[${index}].${field}`;
+}
+
+/**
+ * 保存前の検証（push のときだけ。他プロトコルは空）。サーバー
+ * （`validate_push_settings`）の規則のうち、画面で先に分かるものを写す:
+ * `stale_timeout_ms` の範囲、ブリッジの読む接続の選択、クエリの名前（必須・
+ * 64 文字・一意）と SQL（必須）、列の欄の形、キーの区画全体での一意、
+ * **§7.1 の量の見積もり**（上限の 8 割を超えたら `bridge` に、サーバーと同じ
+ * 文言で）。SQL の中身（SELECT / WITH・単文）はサーバーに任せる。
+ */
+export function validatePushFields(form: PlcConnectionFormState): Record<string, string> {
+	const errors: Record<string, string> = {};
+	if (form.protocol !== PUSH_PROTOCOL) return errors;
+
+	const stale = String(form.staleTimeoutMs).trim();
+	if (stale !== '') {
+		const ms = Number(stale);
+		if (!Number.isInteger(ms) || ms < MIN_STALE_TIMEOUT_MS || ms > MAX_STALE_TIMEOUT_MS) {
+			errors.staleTimeoutMs = `${MIN_STALE_TIMEOUT_MS}〜${MAX_STALE_TIMEOUT_MS} の整数（ms）で入力してください`;
+		}
+	}
+	if (!form.bridgeEnabled) return errors;
+
+	if (form.bridgeDbConnectionId === '') {
+		errors.bridgeDbConnectionId = 'ブリッジが読む PostgreSQL 接続を選んでください';
+	}
+	const names = new Set<string>();
+	const keys = new Set<string>();
+	form.bridgeQueries.forEach((query, index) => {
+		const name = query.name.trim();
+		if (name === '') {
+			errors[bridgeQueryErrorKey(index, 'name')] = '必須項目です';
+		} else if (Array.from(name).length > MAX_BRIDGE_QUERY_NAME_LEN) {
+			errors[bridgeQueryErrorKey(index, 'name')] =
+				`${MAX_BRIDGE_QUERY_NAME_LEN}文字以内で入力してください`;
+		} else if (names.has(name)) {
+			errors[bridgeQueryErrorKey(index, 'name')] = `クエリの名前 ${name} が重複しています`;
+		}
+		names.add(name);
+		if (query.sql.trim() === '') errors[bridgeQueryErrorKey(index, 'sql')] = '必須項目です';
+		const parsed = parseBridgeColumns(query.columnsText);
+		if (parsed.error !== null) {
+			errors[bridgeQueryErrorKey(index, 'columns')] = parsed.error;
+			return;
+		}
+		for (const column of parsed.columns) {
+			if (keys.has(column.key)) {
+				errors[bridgeQueryErrorKey(index, 'columns')] =
+					`キー ${column.key} が区画の中で重複しています`;
+				return;
+			}
+			keys.add(column.key);
+		}
+	});
+	const load = pushBridgeLoad(form);
+	if (load && load.message !== null) errors.bridge = load.message;
+	return errors;
+}
+
+/**
+ * サーバーの項目エラー（`settings.*` の field）をフォームの `errors` の添字へ写す。
+ * `settings.stale_timeout_ms` → `staleTimeoutMs`、`settings.bridge.db_connection_id`
+ * → `bridgeDbConnectionId`、`settings.bridge.queries[i].name|sql` → その欄、
+ * `settings.bridge.queries[i].columns…`・`.period_ms` → 列の欄、それ以外の
+ * `settings…`（大きさ・見積もり・未知の項目）→ `bridge`。他の field はそのまま。
+ */
+export function mapPushFieldErrors(fieldErrors: Record<string, string>): Record<string, string> {
+	const mapped: Record<string, string> = {};
+	const put = (key: string, message: string) => {
+		mapped[key] = mapped[key] ? `${mapped[key]} / ${message}` : message;
+	};
+	for (const [field, message] of Object.entries(fieldErrors)) {
+		if (field === 'settings.stale_timeout_ms') {
+			put('staleTimeoutMs', message);
+			continue;
+		}
+		if (field === 'settings.bridge.db_connection_id') {
+			put('bridgeDbConnectionId', message);
+			continue;
+		}
+		const query = /^settings\.bridge\.queries\[(\d+)\](?:\.(\w+))?/.exec(field);
+		if (query) {
+			const index = Number(query[1]);
+			const sub = query[2];
+			const target = sub === 'name' || sub === 'sql' ? sub : 'columns';
+			put(bridgeQueryErrorKey(index, target), message);
+			continue;
+		}
+		if (field === 'settings' || field.startsWith('settings.')) {
+			put('bridge', message);
+			continue;
+		}
+		put(field, message);
+	}
+	return mapped;
+}
+
+/** 送り手向けの URL とスコープ（§5・§6。接続は id で指す、Q9 = (b)）。 */
+export interface IngestEndpoints {
+	/** REST の一括送信 `POST /api/v1/ingest/{id}/values`。 */
+	restUrl: string;
+	/** WebSocket `GET /api/v1/ingest/{id}/stream`。 */
+	wsUrl: string;
+	/** 送り手の API キーに要るスコープ `ingest:#{id}`。 */
+	scope: string;
+}
+
+/**
+ * `origin`（`window.location.origin`。管理画面を開いている Hub）と接続 id から、
+ * 送り手向けの URL とスコープを組み立てる。WS は `http` → `ws`・`https` → `wss`。
+ */
+export function ingestEndpoints(origin: string, connectionId: number): IngestEndpoints {
+	const base = origin.replace(/\/+$/, '');
+	return {
+		restUrl: `${base}/api/v1/ingest/${connectionId}/values`,
+		wsUrl: `${base.replace(/^http/, 'ws')}/api/v1/ingest/${connectionId}/stream`,
+		scope: `ingest:#${connectionId}`
+	};
+}
+
+/**
+ * R2a-2e（§3.2「`postgres` 接続の削除は、`push` の `settings` が参照していれば
+ * 断る」）: 接続 `connectionId` を DB ブリッジの読み取り先にしている push 接続
+ * （画面が読み込み済みの一覧から引く）。削除の前に画面で先に止めるために使う
+ * （最終の判定はサーバー - `banto_tags` の削除がどの入口でも断る）。
+ */
+export function pushBridgesReferencing(
+	connections: readonly Pick<PlcConnection, 'id' | 'name' | 'protocol' | 'settings'>[],
+	connectionId: number
+): string[] {
+	return connections
+		.filter(
+			(c) => c.protocol === PUSH_PROTOCOL && c.settings?.bridge?.db_connection_id === connectionId
+		)
+		.map((c) => c.name);
+}
+
+/** {@link pushBridgesReferencing} が空でないときの削除の拒否の文言。 */
+export function formatBridgeReferenceDeleteRefusal(
+	connectionName: string,
+	bridgeNames: readonly string[]
+): string {
+	return `${connectionName} は push 接続（${bridgeNames.join('、')}）の DB ブリッジが読んでいるため削除できません。先にその push 接続のブリッジの設定を外すか、別の接続に変えてください。`;
 }

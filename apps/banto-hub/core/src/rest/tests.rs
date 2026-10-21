@@ -8,6 +8,7 @@ mod general;
 mod hub_connection;
 mod i3_router;
 mod ingest;
+mod ingest_status;
 mod ingest_ws;
 mod postgres_connections;
 mod session_revocation;

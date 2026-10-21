@@ -18,6 +18,16 @@ import {
 	nextConnectionName,
 	passwordForSubmit,
 	validatePostgresFields,
+	blankBridgeQuery,
+	formatBridgeReferenceDeleteRefusal,
+	ingestEndpoints,
+	mapPushFieldErrors,
+	parseBridgeColumns,
+	pushBridgeLoad,
+	pushBridgesReferencing,
+	pushFormFromSettings,
+	pushSettingsFromForm,
+	validatePushFields,
 	type PlcConnectionFormState
 } from './plcConnectionForm';
 import { isFormDirty } from './formDirty';
@@ -171,7 +181,11 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			database: '',
 			username: '',
 			password: '',
-			clearPassword: false
+			clearPassword: false,
+			staleTimeoutMs: '',
+			bridgeEnabled: false,
+			bridgeDbConnectionId: '',
+			bridgeQueries: []
 		});
 	});
 
@@ -204,7 +218,11 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			database: '',
 			username: '',
 			password: '',
-			clearPassword: false
+			clearPassword: false,
+			staleTimeoutMs: '',
+			bridgeEnabled: false,
+			bridgeDbConnectionId: '',
+			bridgeQueries: []
 		});
 	});
 
@@ -456,5 +474,261 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 		// - つまり form は常に baseline と同一のまま。
 		const form = baseline;
 		expect(isFormDirty(baseline, form)).toBe(false);
+	});
+});
+
+// --- R2a-2e: 取り込み口 push（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
+
+function pushForm(overrides: Partial<PlcConnectionFormState> = {}): PlcConnectionFormState {
+	return {
+		...blankConnectionForm(),
+		name: 'Bridge1',
+		protocol: 'push',
+		...overrides
+	};
+}
+
+const PUSH_CONNECTION: PlcConnection = {
+	id: 12,
+	name: 'Bridge1',
+	protocol: 'push',
+	host: '',
+	port: 0,
+	unitId: 1,
+	enabled: true,
+	simulation: false,
+	wordOrder: 'low_high',
+	cpuType: 'R',
+	database: null,
+	username: null,
+	passwordSet: false,
+	settings: {
+		stale_timeout_ms: 5000,
+		bridge: {
+			kind: 'db',
+			db_connection_id: 3,
+			queries: [
+				{
+					name: 'line1',
+					period_ms: 1000,
+					sql: 'SELECT temp, run FROM line1_now',
+					columns: [
+						{ column: 'temp', key: 'line1.temp' },
+						{ column: 'run', key: 'line1.run' }
+					]
+				}
+			]
+		}
+	}
+};
+
+describe('R2a-2e: PROTOCOL_OPTIONS に push（取り込み）が含まれる', () => {
+	it('push を日本語ラベル付きで持つ', () => {
+		expect(PROTOCOL_OPTIONS.find((opt) => opt.value === 'push')?.label).toBe(
+			'取り込み（push・送り手が値を送る）'
+		);
+	});
+});
+
+describe('R2a-2e: push の settings とフォームの往復', () => {
+	it('connectionToForm → formToConnectionInput で settings がそのまま戻る', () => {
+		const form = connectionToForm(PUSH_CONNECTION);
+		expect(form.staleTimeoutMs).toBe('5000');
+		expect(form.bridgeEnabled).toBe(true);
+		expect(form.bridgeDbConnectionId).toBe('3');
+		expect(form.bridgeQueries).toEqual([
+			{
+				name: 'line1',
+				periodMs: 1000,
+				sql: 'SELECT temp, run FROM line1_now',
+				columnsText: 'temp=line1.temp\nrun=line1.run'
+			}
+		]);
+		const input = formToConnectionInput(form);
+		expect(input.settings).toEqual(PUSH_CONNECTION.settings);
+		// push は接続先を持たない（サーバーが正規化する）。postgres の項目も送らない。
+		expect(input.host).toBe('');
+		expect(input.port).toBe(0);
+		expect(input.simulation).toBe(false);
+		expect(input).not.toHaveProperty('database');
+		expect(input).not.toHaveProperty('password');
+	});
+
+	it('既定のまま（settings: null）の push は空の settings を送る（update で保存済みの値を消せるように）', () => {
+		const form = connectionToForm({ ...PUSH_CONNECTION, settings: null });
+		expect(form.staleTimeoutMs).toBe('');
+		expect(form.bridgeEnabled).toBe(false);
+		expect(formToConnectionInput(form).settings).toEqual({});
+	});
+
+	it('ブリッジを外すと settings から bridge が消える', () => {
+		const form = { ...connectionToForm(PUSH_CONNECTION), bridgeEnabled: false };
+		expect(pushSettingsFromForm(form)).toEqual({ stale_timeout_ms: 5000 });
+	});
+
+	it('push 以外の接続は settings を送らない', () => {
+		expect(formToConnectionInput(blankConnectionForm())).not.toHaveProperty('settings');
+		expect(pushFormFromSettings(undefined).bridgeQueries).toEqual([]);
+	});
+
+	it('blankBridgeQuery は既存のクエリ名と衝突しない query{n} を付ける', () => {
+		const first = blankBridgeQuery([]);
+		expect(first).toEqual({ name: 'query1', periodMs: 1000, sql: '', columnsText: '' });
+		expect(blankBridgeQuery([first]).name).toBe('query2');
+	});
+});
+
+describe('R2a-2e: parseBridgeColumns（1 行に 1 つの「列名=キー」）', () => {
+	it('空行を飛ばし、前後の空白を除く', () => {
+		expect(parseBridgeColumns(' temp = line1.temp \n\nrun=line1/温度 1\r\n')).toEqual({
+			columns: [
+				{ column: 'temp', key: 'line1.temp' },
+				{ column: 'run', key: 'line1/温度 1' }
+			],
+			error: null
+		});
+	});
+
+	it('形の誤りは行番号つきで返す', () => {
+		expect(parseBridgeColumns('temp').error).toBe('1 行目: 「列名=キー」の形で書いてください');
+		expect(parseBridgeColumns('ok=k\n1bad=k').error).toContain('2 行目: 列名は結果列名');
+		expect(parseBridgeColumns('temp=').error).toBe('1 行目: キーを書いてください');
+		expect(parseBridgeColumns(`temp=${'k'.repeat(257)}`).error).toBe(
+			'1 行目: キーは 256 文字までです'
+		);
+		expect(parseBridgeColumns(`temp=${'あ'.repeat(256)}`).error).toBeNull();
+		expect(parseBridgeColumns('temp=a\u0007b').error).toBe('1 行目: キーに制御文字は使えません');
+	});
+});
+
+describe('R2a-2e: validatePushFields（保存前の検証）', () => {
+	it('push 以外・ブリッジなしで既定のままなら何も出さない', () => {
+		expect(validatePushFields(blankConnectionForm())).toEqual({});
+		expect(validatePushFields(pushForm())).toEqual({});
+	});
+
+	it('受信のタイムアウトは 1,000〜3,600,000 の整数', () => {
+		expect(validatePushFields(pushForm({ staleTimeoutMs: '1000' }))).toEqual({});
+		expect(validatePushFields(pushForm({ staleTimeoutMs: '3600000' }))).toEqual({});
+		for (const bad of ['999', '3600001', '1500.5', 'abc']) {
+			expect(validatePushFields(pushForm({ staleTimeoutMs: bad })).staleTimeoutMs).toBeDefined();
+		}
+	});
+
+	it('欄が数として束縛されていても壊れない（`<input type="number">` の bind は数になる）', () => {
+		const form = pushForm({ staleTimeoutMs: 60000 as unknown as string });
+		expect(validatePushFields(form)).toEqual({});
+		expect(pushSettingsFromForm(form)).toEqual({ stale_timeout_ms: 60000 });
+	});
+
+	it('ブリッジ: 読む接続・クエリの名前と SQL・列の欄・キーの重複', () => {
+		const errors = validatePushFields(
+			pushForm({
+				bridgeEnabled: true,
+				bridgeQueries: [
+					{ name: 'a', periodMs: 1000, sql: 'SELECT 1 AS v', columnsText: 'v=k' },
+					{ name: 'a', periodMs: 1000, sql: ' ', columnsText: 'v=k' },
+					{ name: '', periodMs: 1000, sql: 'SELECT 1', columnsText: 'oops' }
+				]
+			})
+		);
+		expect(errors).toEqual({
+			bridgeDbConnectionId: 'ブリッジが読む PostgreSQL 接続を選んでください',
+			'bridgeQueries[1].name': 'クエリの名前 a が重複しています',
+			'bridgeQueries[1].sql': '必須項目です',
+			'bridgeQueries[1].columns': 'キー k が区画の中で重複しています',
+			'bridgeQueries[2].name': '必須項目です',
+			'bridgeQueries[2].columns': '1 行目: 「列名=キー」の形で書いてください'
+		});
+	});
+
+	it('§7.1: 上限の 8 割を超える設定は保存の前に断る（サーバーと同じ文言）', () => {
+		const query = (name: string, periodMs: number) => ({
+			name,
+			periodMs,
+			sql: 'SELECT 1 AS v',
+			columnsText: `v=${name}`
+		});
+		const over = pushForm({
+			bridgeEnabled: true,
+			bridgeDbConnectionId: '3',
+			bridgeQueries: [query('a', 100), query('b', 100), query('c', 100)]
+		});
+		expect(pushBridgeLoad(over)?.withinLimit).toBe(false);
+		expect(validatePushFields(over).bridge).toBe(
+			'この設定は 1 秒あたり約 30 メッセージ・30 件になり、上限（16 メッセージ・4,000 件）を超えます。周期を長くするか、クエリを別の push 接続に分けてください'
+		);
+		const within = pushForm({
+			...over,
+			bridgeQueries: [query('a', 200), query('b', 200), query('c', 200)]
+		});
+		expect(pushBridgeLoad(within)?.messagesPerSecText).toBe('15');
+		expect(validatePushFields(within)).toEqual({});
+	});
+
+	it('pushBridgeLoad はブリッジを持つ push だけ', () => {
+		expect(pushBridgeLoad(blankConnectionForm())).toBeNull();
+		expect(pushBridgeLoad(pushForm())).toBeNull();
+		expect(pushBridgeLoad(connectionToForm(PUSH_CONNECTION))?.queries).toEqual([
+			{ items: 2, itemBytes: 10 + 96 + 9 + 96, messagesPerCycle: 1 }
+		]);
+	});
+});
+
+describe('R2a-2e: mapPushFieldErrors（サーバーの settings.* の項目エラーを欄へ写す）', () => {
+	it('field の形ごとに欄へ寄せる。他の field はそのまま', () => {
+		expect(
+			mapPushFieldErrors({
+				'settings.stale_timeout_ms': 't',
+				'settings.bridge.db_connection_id': 'd',
+				'settings.bridge.queries[0].name': 'n',
+				'settings.bridge.queries[0].sql': 's',
+				'settings.bridge.queries[1].columns[2].key': 'k',
+				'settings.bridge.queries[1].period_ms': 'p',
+				'settings.bridge': 'load',
+				settings: 'size',
+				name: 'dup'
+			})
+		).toEqual({
+			staleTimeoutMs: 't',
+			bridgeDbConnectionId: 'd',
+			'bridgeQueries[0].name': 'n',
+			'bridgeQueries[0].sql': 's',
+			'bridgeQueries[1].columns': 'k / p',
+			bridge: 'load / size',
+			name: 'dup'
+		});
+	});
+});
+
+describe('R2a-2e: ingestEndpoints（送り手向けの URL とスコープ）', () => {
+	it('接続 id で組み立てる（http → ws、https → wss）', () => {
+		expect(ingestEndpoints('http://127.0.0.1:8765', 12)).toEqual({
+			restUrl: 'http://127.0.0.1:8765/api/v1/ingest/12/values',
+			wsUrl: 'ws://127.0.0.1:8765/api/v1/ingest/12/stream',
+			scope: 'ingest:#12'
+		});
+		expect(ingestEndpoints('https://hub.example/', 3).wsUrl).toBe(
+			'wss://hub.example/api/v1/ingest/3/stream'
+		);
+	});
+});
+
+describe('R2a-2e: pushBridgesReferencing（postgres 接続の削除の拒否）', () => {
+	it('ブリッジがその id を読む push 接続の名前を返す', () => {
+		const other = {
+			...PUSH_CONNECTION,
+			id: 13,
+			name: 'Bridge2',
+			settings: { bridge: { ...PUSH_CONNECTION.settings!.bridge!, db_connection_id: 4 } }
+		};
+		const plain = { ...PUSH_CONNECTION, id: 14, name: 'Script', settings: null };
+		const connections = [PUSH_CONNECTION, other, plain];
+		expect(pushBridgesReferencing(connections, 3)).toEqual(['Bridge1']);
+		expect(pushBridgesReferencing(connections, 4)).toEqual(['Bridge2']);
+		expect(pushBridgesReferencing(connections, 5)).toEqual([]);
+		expect(formatBridgeReferenceDeleteRefusal('pg-a', ['Bridge1'])).toContain(
+			'pg-a は push 接続（Bridge1）の DB ブリッジが読んでいるため削除できません'
+		);
 	});
 });

@@ -33,8 +33,13 @@ import { deferredDelete } from './deferredDelete.svelte';
  * S1（docs/banto-hub-external-db-design.md §4.1・§6-4）: `'postgres'` は
  * PLC ではなく PostgreSQL への DB Source 接続 - mirrors
  * `banto_tags::plc_connection::POSTGRES_PROTOCOL`。
+ *
+ * R2a-2e（docs/banto-hub-ingest-design.md §3.1）: `'push'` は取り込み口 -
+ * 外の送り手（DB ブリッジ・スクリプト）が Hub へ値を送り込む接続（mirrors
+ * `banto_tags::PUSH_PROTOCOL`）。R2a-2b のキーの画面（`apiKeyScopes.ts`）は
+ * 文字列で比べていたので、ここで型に足す。
  */
-export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres';
+export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres' | 'push';
 
 /**
  * S1: mirrors `banto_tags::plc_connection::POSTGRES_PROTOCOL`。この文字列を
@@ -42,6 +47,45 @@ export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres';
  * コンテキストメニューのグループ作成禁止等）はすべてこの定数を使う。
  */
 export const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
+
+/** R2a-2e: mirrors `banto_tags::PUSH_PROTOCOL`（取り込み口 `push`）。 */
+export const PUSH_PROTOCOL: PlcProtocol = 'push';
+
+/**
+ * R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings` の
+ * ブリッジの列の対応 1 つ（wire はサーバーの JSON のまま snake_case）。
+ */
+export interface PushBridgeColumnWire {
+	column: string;
+	key: string;
+}
+
+/** R2a-2e: ブリッジのクエリ 1 本（§3.2）。 */
+export interface PushBridgeQueryWire {
+	name: string;
+	period_ms: number;
+	sql: string;
+	columns: PushBridgeColumnWire[];
+}
+
+/**
+ * R2a-2e: `settings.bridge`（§3.2）。`db_connection_id` は読む DB の
+ * `postgres` 接続の id（§10.2、Q8）。
+ */
+export interface PushBridgeWire {
+	kind: 'db';
+	db_connection_id: number;
+	queries: PushBridgeQueryWire[];
+}
+
+/**
+ * R2a-2e: `push` 接続の `settings`（mirrors `banto_tags::push::validate_push_settings`
+ * の入力。§3.2）。秘密値は持たない。
+ */
+export interface PushSettingsWire {
+	stale_timeout_ms?: number;
+	bridge?: PushBridgeWire;
+}
 
 /**
  * P3-b（監査指摘 2026-08-12）: PLC接続のワード順（32bit値/64bit値の上位/下位
@@ -115,6 +159,13 @@ export interface PlcConnection {
 	 * 未設定」表示に使う。
 	 */
 	passwordSet: boolean;
+	/**
+	 * R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
+	 * （既定のままなら `null`。他プロトコルでは常に `null`）- mirrors
+	 * `banto_hub_core::rest::PlcConnectionResponse::settings`。古いサーバーは
+	 * 項目を返さないので省略も許す。
+	 */
+	settings?: PushSettingsWire | null;
 }
 
 /**
@@ -144,6 +195,11 @@ export function isVirtualConnection(conn: Pick<PlcConnection, 'protocol'>): bool
  */
 export function isDbSourceConnection(conn: Pick<PlcConnection, 'protocol'>): boolean {
 	return conn.protocol === POSTGRES_PROTOCOL;
+}
+
+/** R2a-2e: `protocol === 'push'`（取り込み口）判定 - mirrors `banto_tags::PUSH_PROTOCOL`。 */
+export function isPushConnection(conn: Pick<PlcConnection, 'protocol'>): boolean {
+	return conn.protocol === PUSH_PROTOCOL;
 }
 
 /**
@@ -198,6 +254,14 @@ export interface PlcConnectionInput {
 	 * `form.clearPassword` をここへ直接詰めない。
 	 */
 	password?: string;
+	/**
+	 * R2a-2e: `protocol: 'push'` 接続の `settings`（§3.2）。他プロトコルでは
+	 * 省略する（サーバーは push 以外での指定を拒否する）。**create と update で
+	 * 意味が異なる**（`cpuType` と同じ）: 省略は create で既定、update で
+	 * 「保存済みの値を保つ」。オブジェクトは置き換え（`{}` でブリッジを外せる）。
+	 * フォーム（`plcConnectionForm.ts::formToConnectionInput`）は push では常に送る。
+	 */
+	settings?: PushSettingsWire;
 }
 
 /**

@@ -50,7 +50,7 @@ use super::audit::{self as ingest_audit, IngestAuditRow, Transport};
 use super::auth::{error_response, require_ingest_auth, IngestAuthState, IngestCaller};
 use super::limits::{LimitKind, PUSH_LIMITS};
 use super::validate::parse_values_message;
-use super::{ApplyRefusal, IngestHub, RejectCode};
+use super::{ApplyRefusal, IngestHub, IngestSender, RejectCode};
 
 /// REST の送信口のパス。
 pub const VALUES_PATH: &str = "/api/v1/ingest/{id}/values";
@@ -268,6 +268,16 @@ pub async fn v1_ingest_values(
             return refusal_response(refusal);
         }
     };
+
+    // 状態の表示の送り手（R2a-2e）: キーは名前だけ（値・ハッシュは載せない）。
+    state.ingest.note_rest_sender(
+        conn_id,
+        IngestSender {
+            api_key_name: caller.key.name.clone(),
+            peer: caller.peer.clone(),
+            at_ms: now_ms,
+        },
+    );
 
     let unknown = ack
         .rejected

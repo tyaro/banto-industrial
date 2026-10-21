@@ -40,6 +40,7 @@
 		exportConfigPackageToDownload
 	} from '#lib/banto/configPackageAdmin.js';
 	import {
+		INGEST_KEYS_NOT_MIGRATED_MESSAGE,
 		parseConfigPackage,
 		type ConfigPackage,
 		type ConfigPackageInspection,
@@ -409,6 +410,19 @@
 						{configPackageInspection.dbConnectionsPasswordRequired.join('、')}
 					</p>
 				{/if}
+				{#if configPackageInspection.ingestConnections.length > 0}
+					<!--
+						R2a-2e（docs/banto-hub-ingest-design.md §5.1）: 構成パッケージは
+						API キーを持ち運ばず、取り込み先では push 接続の id が変わる
+						（送り手の URL とスコープ ingest:#{id} も変わる）。
+					-->
+					<p class="note warning" data-testid="config-package-ingest-keys-notice">
+						{INGEST_KEYS_NOT_MIGRATED_MESSAGE}。このパッケージの push（取り込み）接続 （{configPackageInspection.ingestConnections.join(
+							'、'
+						)}）の送り手には、インポート後に この Hub で API キーを発行し直し、送信先の URL の接続
+						id を直してください。
+					</p>
+				{/if}
 				{#if configPackageInspection.warnings.length > 0}
 					<ul class="warnings">
 						{#each configPackageInspection.warnings as warning (warning)}
@@ -441,6 +455,29 @@
 						{configPackageImportSummary.counts.sinkGroups.create} 追加 /
 						{configPackageImportSummary.counts.sinkGroups.update} 更新。
 					</p>
+					{#if configPackageImportSummary.ingestConnections.length > 0}
+						<div class="note warning" data-testid="config-package-ingest-keys-result">
+							<p>
+								<strong>{INGEST_KEYS_NOT_MIGRATED_MESSAGE}。</strong>取り込んだ
+								push（取り込み）接続の 送り手には、この Hub で API キー（スコープ ingest:#接続
+								id）を発行し直し、送信先の URL を次の接続 id に直してください:
+							</p>
+							<ul class="warnings">
+								{#each configPackageImportSummary.ingestConnections as conn (conn.id)}
+									<li>
+										{conn.name}: 接続 id {conn.id}（/api/v1/ingest/{conn.id}/…、スコープ ingest:#{conn.id}）
+									</li>
+								{/each}
+							</ul>
+						</div>
+					{/if}
+					{#if configPackageImportSummary.warnings.length > 0}
+						<ul class="warnings">
+							{#each configPackageImportSummary.warnings as warning (warning)}
+								<li>{warning}</li>
+							{/each}
+						</ul>
+					{/if}
 				{/if}
 
 				{#if importGuardActive}

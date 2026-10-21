@@ -808,6 +808,53 @@ where
     }
 }
 
+/// Names of the `"push"` connections whose bridge reads from connection `id`
+/// (`settings.bridge.db_connection_id`), oldest first.
+const PUSH_BRIDGES_REFERENCING_SQL: &str = "SELECT name FROM plc_connections \
+     WHERE protocol = 'push' AND settings IS NOT NULL \
+     AND json_extract(settings, '$.bridge.db_connection_id') = ? ORDER BY id";
+
+/// R2a-2e (docs/banto-hub-ingest-design.md §3.2): refuse to delete a
+/// connection that a `"push"` bridge's `settings.bridge.db_connection_id`
+/// still names - the same RESTRICT-style refusal banto-hub's
+/// `reject_delete_if_referenced_by_sink_group` gives a sink group's
+/// `db_connection_id`, as a `Validation` error on `id` that names the bridges
+/// in the way. The reference is **by id** (§10.2, Q8): the bridge would
+/// otherwise point at a deleted id (and, ids not being reused, never at
+/// anything again) and its DB bridge could only fail. Every delete entry
+/// ([`PlcConnectionService::delete`], [`PlcConnectionService::delete_tx`],
+/// [`PlcConnectionService::cascade_delete_tx`]) runs this, so REST, MCP and
+/// the pending-change apply all refuse alike. Runs through `executor` (the
+/// caller's transaction when there is one) so it sees that transaction's own
+/// writes.
+async fn reject_delete_if_referenced_by_push_bridge<'c, E>(
+    executor: E,
+    id: i64,
+) -> Result<(), BantoError>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
+    let names: Vec<String> = sqlx::query_scalar(PUSH_BRIDGES_REFERENCING_SQL)
+        .bind(id)
+        .fetch_all(executor)
+        .await
+        .map_err(banto_storage::storage_error)?;
+    if names.is_empty() {
+        return Ok(());
+    }
+    Err(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "id".to_string(),
+            message: format!(
+                "この接続を DB ブリッジの読み取り先にしている push 接続が{}件あるため削除できません\
+                 （{}）。先にその push 接続のブリッジの設定を外すか、別の接続に変えてください",
+                names.len(),
+                names.join("、")
+            ),
+        }],
+    })
+}
+
 /// A row of the `plc_connections` table, wire-shaped (camelCase) for a
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
@@ -1692,6 +1739,7 @@ impl PlcConnectionService {
                 }],
             });
         }
+        reject_delete_if_referenced_by_push_bridge(&self.pool, id).await?;
 
         let group_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
@@ -1745,6 +1793,7 @@ impl PlcConnectionService {
                 }],
             });
         }
+        reject_delete_if_referenced_by_push_bridge(&mut *connection, id).await?;
         let group_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM collection_groups WHERE plc_connection_id = ?",
         )
@@ -1826,6 +1875,9 @@ impl PlcConnectionService {
                 }],
             });
         }
+        // R2a-2e: DB ブリッジの読み取り先は、配下ごと消すカスケードでも消さない
+        // （参照先が消えるとブリッジは二度と読めない。§3.2）。
+        reject_delete_if_referenced_by_push_bridge(&mut *connection, id).await?;
 
         // FK 順: tags -> collection_groups -> plc_connections。
         let deleted_tags = sqlx::query(
@@ -4779,6 +4831,51 @@ mod tests {
             svc.update(created.id, ok).await.unwrap().settings,
             Some(bridge_settings(db.id))
         );
+    }
+
+    /// R2a-2e (docs/banto-hub-ingest-design.md §3.2): a postgres connection
+    /// a push bridge reads from cannot be deleted through any delete entry
+    /// (`delete`, `delete_tx`, `cascade_delete_tx`); the message names the
+    /// bridge. Once the bridge no longer names it (settings replaced), the
+    /// delete goes through. An unrelated postgres connection is unaffected.
+    #[tokio::test]
+    async fn a_postgres_connection_a_bridge_reads_from_cannot_be_deleted() {
+        let svc = service().await;
+        let db = svc.create(postgres_input("ERP")).await.unwrap();
+        let other = svc.create(postgres_input("ERP-other")).await.unwrap();
+        let mut bridge = push_input("Bridge1");
+        bridge.settings = Some(bridge_settings(db.id));
+        let bridge = svc.create(bridge).await.unwrap();
+
+        let expect_refused = |err: BantoError| {
+            let BantoError::Validation { field_errors } = err else {
+                panic!("expected a validation error, got {err:?}");
+            };
+            assert_eq!(field_errors.len(), 1);
+            assert_eq!(field_errors[0].field, "id");
+            assert!(
+                field_errors[0].message.contains("Bridge1"),
+                "{}",
+                field_errors[0].message
+            );
+        };
+        expect_refused(svc.delete(db.id).await.unwrap_err());
+        let mut tx = svc.pool.begin().await.unwrap();
+        expect_refused(svc.delete_tx(&mut tx, db.id).await.unwrap_err());
+        expect_refused(svc.cascade_delete_tx(&mut tx, db.id).await.unwrap_err());
+        drop(tx);
+        expect_refused(svc.cascade_delete(db.id).await.unwrap_err());
+        assert!(svc.get(db.id).await.is_ok(), "the row must survive");
+
+        // Unreferenced postgres connections delete as before.
+        svc.delete(other.id).await.unwrap();
+
+        // Dropping the bridge from the push connection's settings frees it.
+        let mut no_bridge = push_input("Bridge1");
+        no_bridge.settings = Some(json!({ "stale_timeout_ms": 5000 }));
+        svc.update(bridge.id, no_bridge).await.unwrap();
+        svc.cascade_delete(db.id).await.unwrap();
+        assert!(svc.get(db.id).await.is_err());
     }
 
     /// Update semantics (`PlcConnectionInput::settings`): omitted keeps the

@@ -73,6 +73,7 @@
 		type StatusResponse
 	} from '#lib/banto/hubStatus.js';
 	import { formatBytes, formatPercent } from '#lib/banto/systemInfoFormat.js';
+	import { pushConnectionStatusLabel } from '#lib/banto/ingestStatusView.js';
 	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
 	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
 	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
@@ -138,6 +139,20 @@
 
 	function statusLabel(status: string): string {
 		return statusLabels[status] ?? status;
+	}
+
+	/**
+	 * R2a-2e（docs/banto-hub-ingest-design.md §9）: push（取り込み）接続は送り手を
+	 * 待つ側なので、`reconnecting`（`attempt: 0`）を「再接続中」ではなく
+	 * 「送り手待ち」、`connected` を「受信中」と読む。push かどうかは `ingest` 節に
+	 * その接続 id があるかで決める（接続の一覧の項目は増やさない）。
+	 */
+	function connectionStatusLabel(
+		conn: { id: number; status: string },
+		ingest: readonly { connection_id: number }[]
+	): string {
+		const isPush = ingest.some((entry) => entry.connection_id === conn.id);
+		return (isPush ? pushConnectionStatusLabel(conn.status) : null) ?? statusLabel(conn.status);
 	}
 
 	function statusClass(status: string): string {
@@ -821,7 +836,7 @@
 						{#each status.connections as conn (conn.id)}
 							<tr class={connectionRowClass(conn)}>
 								<td>{conn.name}</td>
-								<td>{statusLabel(conn.status)}</td>
+								<td>{connectionStatusLabel(conn, status.ingest)}</td>
 								<td>{conn.attempt ?? '-'}</td>
 							</tr>
 						{/each}

@@ -592,6 +592,17 @@ impl BridgeLoad {
         self.items_per_minute as f64 / 60.0
     }
 
+    /// 接続の合計のメッセージ数 / 秒の表示（小数 1 桁まで切り上げ、整数なら小数なし、
+    /// 3 桁区切り）。UI の見積もり（R2a-2e、`bridgeLoad.ts`）が同じ書き方をする。
+    pub fn messages_per_sec_text(&self) -> String {
+        format_rate(self.messages_per_minute)
+    }
+
+    /// 接続の合計の件数 / 秒の表示（[`Self::messages_per_sec_text`] と同じ書き方）。
+    pub fn items_per_sec_text(&self) -> String {
+        format_rate(self.items_per_minute)
+    }
+
     /// 登録時の上限（持続の 8 割）に収まるか。ちょうどは通す。
     pub fn within_registration_limit(&self) -> bool {
         self.messages_per_minute <= PUSH_LIMITS.registration_messages_per_sec() * 60

@@ -10,11 +10,11 @@ use super::{
     build_catalog_response, build_values_response, compute_status, get, json, middleware,
     require_session, resolve_value_names, ApiError, Arc, AuditLogService, AuthGate, AuthState,
     CatalogResponse, CatalogTagEntry, CollectionController, CollectorManager,
-    ConnectionStatusEntry, DbSourceStatusEntry, Deserialize, GrpcStatusEntry, IntoResponse, Json,
-    LastApplyEntry, MqttPublisher, MqttStatusEntry, OperationKind, Query, Response, Router,
-    Serialize, SinkStatusEntry, SinkStatusStore, State, StatusCode, StatusResponse,
-    SystemInfoSampler, SystemInfoSnapshot, TagSpaceState, TagsQuery, ToSchema, ValueEntry,
-    ValuesQuery, ValuesResponse, WriteControl,
+    ConnectionStatusEntry, DbSourceStatusEntry, Deserialize, GrpcStatusEntry, IngestStatusEntry,
+    IntoResponse, Json, LastApplyEntry, MqttPublisher, MqttStatusEntry, OperationKind, Query,
+    Response, Router, Serialize, SinkStatusEntry, SinkStatusStore, State, StatusCode,
+    StatusResponse, SystemInfoSampler, SystemInfoSnapshot, TagSpaceState, TagsQuery, ToSchema,
+    ValueEntry, ValuesQuery, ValuesResponse, WriteControl,
 };
 
 // --- 管理系 `GET /api/status`・`GET /api/values`・`GET /api/tag-catalog`・
@@ -202,6 +202,79 @@ impl From<DbSourceStatusEntry> for AdminDbSourceStatusEntry {
     }
 }
 
+/// [`IngestStatusEntry`]のcamelCase版（取り込み口 `push`、R2a-2e、
+/// docs/banto-hub-ingest-design.md §9）。資格情報・値を含まないのは元の型と同じ。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminIngestStatusEntry {
+    connection_id: i64,
+    name: String,
+    enabled: bool,
+    bridge: bool,
+    link: String,
+    link_detail: Option<String>,
+    last_seen_at: Option<i64>,
+    stale_timeout_ms: u64,
+    collecting: bool,
+    epoch: u64,
+    held_values: u64,
+    senders: Vec<AdminIngestSenderStatusEntry>,
+    accepted: u64,
+    rejected: u64,
+    rate_limited: u64,
+    too_many_items: u64,
+    unknown_keys: Vec<String>,
+    last_source_time: Option<i64>,
+    sender_status: Option<String>,
+}
+
+/// [`AdminIngestStatusEntry`]の送り手 1 つ。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminIngestSenderStatusEntry {
+    transport: String,
+    api_key_name: String,
+    peer: Option<String>,
+    connected_at: Option<i64>,
+    last_seen_at: Option<i64>,
+}
+
+impl From<IngestStatusEntry> for AdminIngestStatusEntry {
+    fn from(entry: IngestStatusEntry) -> Self {
+        Self {
+            connection_id: entry.connection_id,
+            name: entry.name,
+            enabled: entry.enabled,
+            bridge: entry.bridge,
+            link: entry.link,
+            link_detail: entry.link_detail,
+            last_seen_at: entry.last_seen_at,
+            stale_timeout_ms: entry.stale_timeout_ms,
+            collecting: entry.collecting,
+            epoch: entry.epoch,
+            held_values: entry.held_values,
+            senders: entry
+                .senders
+                .into_iter()
+                .map(|sender| AdminIngestSenderStatusEntry {
+                    transport: sender.transport,
+                    api_key_name: sender.api_key_name,
+                    peer: sender.peer,
+                    connected_at: sender.connected_at,
+                    last_seen_at: sender.last_seen_at,
+                })
+                .collect(),
+            accepted: entry.accepted,
+            rejected: entry.rejected,
+            rate_limited: entry.rate_limited,
+            too_many_items: entry.too_many_items,
+            unknown_keys: entry.unknown_keys,
+            last_source_time: entry.last_source_time,
+            sender_status: entry.sender_status,
+        }
+    }
+}
+
 /// `GET /api/status`の応答 - [`StatusResponse`]（`/api/v1/status`）と
 /// 完全に同じ情報をcamelCaseで運ぶ。`mqtt`/`grpc`は元の型
 /// （`MqttStatusEntry`/`GrpcStatusEntry`）をそのまま再利用する -
@@ -231,6 +304,8 @@ struct AdminStatusResponse {
     last_apply: Option<AdminLastApplyEntry>,
     /// 外部 DB 連携 S2: [`DbSourceStatusEntry`]のcamelCase版。
     db_source: Vec<AdminDbSourceStatusEntry>,
+    /// 取り込み口 `push`（R2a-2e）: [`IngestStatusEntry`]のcamelCase版。
+    ingest: Vec<AdminIngestStatusEntry>,
     /// T19 S3-b（UX-46）: [`SystemInfoSnapshot`]のcamelCase版。
     system: AdminSystemInfoEntry,
     /// 外部 DB 連携 S4: [`SinkStatusEntry`]のcamelCase版。
@@ -312,6 +387,7 @@ impl From<StatusResponse> for AdminStatusResponse {
             grpc: status.grpc,
             last_apply: status.last_apply.map(Into::into),
             db_source: status.db_source.into_iter().map(Into::into).collect(),
+            ingest: status.ingest.into_iter().map(Into::into).collect(),
             system: status.system.into(),
             sink: status.sink.into(),
         }
