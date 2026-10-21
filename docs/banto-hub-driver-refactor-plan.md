@@ -78,7 +78,7 @@ external-db-design §9.5 の形で作る。
 | R2a-2 | `push` ドライバ（接続の種類を足す）、`ingest:{接続}` の権限、WebSocket / REST の送信口、接続単位の監査 |
 | R2a-3 | `banto-hub-sink` を DB ブリッジに広げ、Source を担わせる。Hub 内の PostgreSQL Source と併用する        |
 
-- **2026-10-21 オーナー決定**: banto-hub の版（4 点セット）は R2a 全体（R2a-3c まで）が終わった時点で一度に上げる。R2a の途中の PR では版を上げない。
+- **2026-10-21 オーナー決定**: banto-hub の版（4 点セット）は R2a 全体（R2a-3c まで）が終わった時点で一度に上げる。R2a の途中の PR では版を上げない。**2026-10-21 実施済み**: R2a-3c の後に `0.2.0-alpha.33` へ上げた（4 点セットと Cargo.lock。CHANGELOG に取り込み口 `push`・DB ブリッジ・DB マイグレーション 0023・0024 を記載）。
 
 完了条件: 同じ DB の値を Hub 内の Source とブリッジ版の両方で取り込み、値と品質が一致する。
 
