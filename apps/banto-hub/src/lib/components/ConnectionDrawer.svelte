@@ -149,6 +149,7 @@
 		REGISTRATION_MESSAGES_PER_SEC
 	} from '#lib/banto/bridgeLoad.js';
 	import { getHubStatus, type IngestStatusEntry } from '#lib/banto/hubStatus.js';
+	import { createSerialPoller } from '#lib/banto/serialPoller.js';
 	import {
 		describeIngestSender,
 		formatIngestTime,
@@ -524,29 +525,29 @@
 	$effect(() => {
 		const id = savedConnection?.id;
 		if (!open || id === undefined || !savedIsPush) return;
-		let cancelled = false;
 		ingestStatus = null;
 		ingestStatusLoaded = false;
 		ingestStatusError = null;
-		const load = async () => {
-			try {
-				const status = await getHubStatus();
-				if (cancelled) return;
+		// 直列ポーラー（PR #760 の Codex レビュー P2）: 前の取得が決着してから次を
+		// 予約し、閉じる・push でなくなる・破棄で進行中の要求を中断する。止めた後に
+		// 決着した古い応答は状態へ書かない。
+		const poller = createSerialPoller({
+			intervalMs: INGEST_STATUS_POLL_MS,
+			// 応答が来ない回は 10 秒で打ち切り、時間切れを表示して次を予約する。
+			timeoutMs: 10_000,
+			run: (signal) => getHubStatus(signal),
+			onResult: (status) => {
 				ingestStatus = status.ingest.find((entry) => entry.connection_id === id) ?? null;
 				ingestStatusError = null;
-			} catch (err) {
-				if (cancelled) return;
+			},
+			onError: (err) => {
 				ingestStatusError = errorMessage(err);
-			} finally {
-				if (!cancelled) ingestStatusLoaded = true;
+			},
+			onSettled: () => {
+				ingestStatusLoaded = true;
 			}
-		};
-		void load();
-		const timer = setInterval(() => void load(), INGEST_STATUS_POLL_MS);
-		return () => {
-			cancelled = true;
-			clearInterval(timer);
-		};
+		});
+		return () => poller.stop();
 	});
 
 	/** 送り手向けの URL とスコープ（保存済みの push 接続だけ）。 */

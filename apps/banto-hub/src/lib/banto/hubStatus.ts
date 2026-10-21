@@ -491,14 +491,19 @@ function currentToken(): string | null {
 	return auth.getToken ? auth.getToken() : null;
 }
 
-async function httpGet<T>(path: string): Promise<T> {
+/**
+ * `signal` は呼び出し側が要求を中断するため（ポーリングの後始末など）。省略可で、
+ * 渡さない既存の呼び出しは従来どおり。中断された fetch もネットワークエラーと
+ * 同じ `ProviderError` になるので、呼び出し側は `signal.aborted` で見分ける。
+ */
+async function httpGet<T>(path: string, signal?: AbortSignal): Promise<T> {
 	const headers: Record<string, string> = { ...CSRF_HEADER };
 	const token = currentToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
 
 	let response: Response;
 	try {
-		response = await fetch(path, { method: 'GET', headers });
+		response = await fetch(path, { method: 'GET', headers, signal });
 	} catch {
 		throw new ProviderError({ kind: 'other', message: NETWORK_ERROR_MESSAGE });
 	}
@@ -523,8 +528,8 @@ async function httpGet<T>(path: string): Promise<T> {
 	return (await response.json()) as T;
 }
 
-export async function getHubStatus(): Promise<StatusResponse> {
-	const raw = await httpGet<RawStatusResponse>('/api/status');
+export async function getHubStatus(signal?: AbortSignal): Promise<StatusResponse> {
+	const raw = await httpGet<RawStatusResponse>('/api/status', signal);
 	return fromRawStatus(raw);
 }
 
