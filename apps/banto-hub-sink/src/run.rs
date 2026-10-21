@@ -38,6 +38,11 @@
 //! 最後の push まで済ませてから終了コード 0 で抜けるので、Hub 側には
 //! 「取りこぼした行数」まで残る。
 //!
+//! DB ブリッジ（[`crate::source`]、R2a-3b）は同じ停止の合図で並行して止める: 各 source が
+//! close 1000 を送り、問い合わせのタスクの終わりを待つ。待つのは
+//! [`BRIDGE_STOP_CAP`]（OS シャットダウンでは残り時間との短い方）まで。ブリッジには
+//! flush は無い（送れなかった周期は捨てる、docs/banto-hub-ingest-design.md §10.3「停止」）。
+//!
 //! OS の PRESHUTDOWN（#589）では、この列の合計が SCM の待ち時間を超えうる
 //! （flush 秒数は全体の上限ではない。flusher ごとに最大 2 秒、状態 push は
 //! HTTP の上限 10 秒）。そのときは残り時間で各段階を頭打ちにし、
@@ -65,6 +70,7 @@ use crate::hub_api::{
     HubApi, HubApiError, SinkConfig, SinkConfigConnection, SinkConfigGroup, SinkStatusPush,
 };
 use crate::log::{log_err_line, log_line};
+use crate::source::BridgeSupervisor;
 use crate::status::{push_entry, GroupState, Redactor};
 use crate::values::{normalize_names, plan_subscription, BindingPlan, Subscription, ValueView};
 
@@ -86,6 +92,10 @@ const DRAIN_POLL: Duration = Duration::from_millis(50);
 /// OS シャットダウンで購読の停止に使ってよい上限。通常停止では掛けない
 /// （購読の停止が延びても、これまでどおり終わるまで待つ）。
 const OS_SUBSCRIPTION_STOP_CAP: Duration = Duration::from_secs(2);
+
+/// 停止で DB ブリッジ（[`crate::source`]）の終わりを待つ上限（close 1000 と問い合わせの
+/// タスクの終わり）。Sink の flush と並行して待つ。
+const BRIDGE_STOP_CAP: Duration = Duration::from_secs(3);
 
 /// OS シャットダウンで最後の状態 push に使ってよい上限。
 /// HTTP クライアントの上限は 10 秒なので、flush のあとに予算を使い切らない
@@ -824,12 +834,14 @@ where
         );
     }
 
+    // R2a-3b: DB ブリッジ。エンジンとは別のタスク群で、設定の取得も独立（`crate::source`）。
+    let bridge = BridgeSupervisor::spawn(&config)?;
     let mut engine = Engine::new(config, options)?;
     tokio::pin!(shutdown);
 
     // 起動直後は「取れるまで待つ」だけ - 取れなくても終了しない。
     let ok = tokio::select! {
-        request = &mut shutdown => { engine.shutdown(request).await; return Ok(()); }
+        request = &mut shutdown => { shutdown_all(engine, bridge, request).await; return Ok(()); }
         ok = engine.refresh_config() => ok,
     };
     let now = Instant::now();
@@ -892,8 +904,25 @@ where
     }
 
     // ループを抜けるのは停止合図を受け取ったときだけ。
-    engine.shutdown(stop_request).await;
+    shutdown_all(engine, bridge, stop_request).await;
     Ok(())
+}
+
+/// エンジンの停止（flush・最後の状態 push）と DB ブリッジの停止を並行して行う。
+async fn shutdown_all(engine: Engine, bridge: BridgeSupervisor, request: StopRequest) {
+    let limit = match request {
+        StopRequest::Graceful => BRIDGE_STOP_CAP,
+        StopRequest::OsShutdown { deadline } => phase_limit(
+            Some(deadline.saturating_duration_since(StdInstant::now())),
+            BRIDGE_STOP_CAP,
+        ),
+    };
+    let (bridge_done, ()) = tokio::join!(bridge.shutdown(limit), engine.shutdown(request));
+    if !bridge_done {
+        log_err_line(
+            "banto-hub-sink: warn: DB ブリッジの停止を予算内に終えられませんでした（送れなかった周期は捨てます）",
+        );
+    }
 }
 
 /// 周期的な再計画の判定結果（[`replan_decision`]）。

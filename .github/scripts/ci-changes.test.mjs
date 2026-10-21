@@ -148,8 +148,10 @@ const G = {
 		{
 			name: 'banto-hub-sink',
 			dir: 'apps/banto-hub-sink',
-			// banto-drivers・banto-hub-core・banto-tags は dev-dependency。
+			// banto-drivers・banto-hub-core・banto-tags は dev-dependency。banto-db-source は
+			// R2a-3b の DB ブリッジ（src/source/）が normal で使う。
 			deps: [
+				'banto-db-source',
 				'banto-drivers',
 				'banto-hub-core',
 				'banto-safe-root',
@@ -835,7 +837,8 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 			'banto-hub-sink'
 		],
 		'banto-secret-store': ['chronogazer-core', 'chronogazer'],
-		// R2a-3a: db_source（hub-core）が使い、host・shell・sink が hub-core を経由する。
+		// R2a-3a: db_source（hub-core）が使い、host・shell が hub-core を経由する。sink は
+		// R2a-3b から DB ブリッジが直接使う（hub-core は dev-dependency）。
 		'banto-db-source': ['banto-hub-core', 'banto-hub-host', 'banto-hub-shell', 'banto-hub-sink'],
 		'banto-instance-lock': [
 			'chronogazer-core',

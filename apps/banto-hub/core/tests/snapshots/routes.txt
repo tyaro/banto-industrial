@@ -14,6 +14,7 @@ GET /api/collection/simulation-coverage
 GET /api/commissioning/status
 GET /api/events
 GET /api/grpc-settings
+GET /api/ingest/bridge-config
 GET /api/mqtt-settings
 GET /api/opcua-settings
 GET /api/opcua-status

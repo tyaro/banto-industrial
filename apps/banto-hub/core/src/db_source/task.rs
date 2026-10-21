@@ -53,7 +53,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use banto_collect::Quality;
-use banto_db_source::{cell_verdict, GroupLadder, Verdict};
+use banto_db_source::{
+    cell_verdict, classify, describe_retry_interval, query_timeout, GroupLadder, PgFailure, Verdict,
+};
 use banto_tstore::Clock;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::{Executor, Row, SqlSafeStr};
@@ -61,9 +63,9 @@ use sqlx::{Executor, Row, SqlSafeStr};
 use crate::computed::ServerTagStore;
 use crate::diag_log::DiagLog;
 
+use super::pg_connect_options;
 use super::plan::{resolve_group, DbConnectionPlan, DbGroupPlan, DbTagPlan, ResolvedGroup};
 use super::status::{DbConnectionState, DbConnectionStatus, DbSourceStatusStore};
-use super::{pg_connect_options, sanitize_postgres_error};
 
 /// 接続プールの最大接続数（§4.2「最大接続数は小さく固定、例 2」）。
 /// 1接続タスクは同時に1本のクエリしか投げないので 1 でも足りるが、
@@ -72,9 +74,6 @@ const POOL_MAX_CONNECTIONS: u32 = 2;
 
 /// プールから接続を取り出すまでの上限（S1a の接続テストと同じ5秒）。
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// 1クエリのタイムアウト上限（§4.2「`min(period_ms * 0.8, 30s)`」）。
-const MAX_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 再接続バックオフ（§4.2「1s → 30s 上限、`banto-broker` の `backoff_delay`
 /// と同じ定数」）。`banto_broker::BackoffConfig::default()` の
@@ -101,63 +100,11 @@ pub(crate) fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis(ms).min(BACKOFF_CAP)
 }
 
-/// describe 再試行の最短間隔（レビュー対応: 「groups never re-describe
-/// after a describe failure or after degrading to Bad」）。周期が極端に
-/// 短いグループ（100ms 等）で describe を毎ティック投げ続けないための
-/// 下限 - `query_timeout` が `period_ms` を下げ方向に丸めるのと対称に、
-/// こちらは上げ方向に丸める。
-const DESCRIBE_RETRY_MIN: Duration = Duration::from_secs(5);
-
-/// 1グループが再 describe を試みてよい最短間隔 - `max(period, 5s)`。
-fn describe_retry_interval(period_ms: u64) -> Duration {
-    Duration::from_millis(period_ms).max(DESCRIBE_RETRY_MIN)
-}
-
-/// 1グループのクエリタイムアウト（§4.2）。
-pub(crate) fn query_timeout(period_ms: u64) -> Duration {
-    // `period_ms * 0.8` を整数で（`* 4 / 5`）。周期が極端に短い設定
-    // （100ms → 80ms）でも設計どおり周期未満を守る - 遅い DB に対して
-    // 100ms 周期を選ぶこと自体が構成側の判断であり、ここで勝手に伸ばすと
-    // 「1本の遅いクエリが接続全体の周期を崩さない」という §4.2 の要求を
-    // 破ってしまう。
-    Duration::from_millis(period_ms.saturating_mul(4) / 5).min(MAX_QUERY_TIMEOUT)
-}
-
-/// 失敗の粒度（§4.3 の「グループ単位」と「接続単位」の分かれ目）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PgFailure {
-    /// サーバーへ届いていない・セッションが壊れた - 接続単位で扱い、
-    /// 配下の全タグを Bad にしてバックオフへ入る。
-    Connection(String),
-    /// サーバーは応答したが文が失敗した（構文エラー・権限・存在しない表）
-    /// - グループ単位で扱い、他のグループには波及させない。
-    Statement(String),
-}
-
-impl PgFailure {
-    pub(crate) fn message(&self) -> &str {
-        match self {
-            PgFailure::Connection(message) | PgFailure::Statement(message) => message,
-        }
-    }
-}
-
-/// `sqlx::Error` を [`PgFailure`] へ分類する。**未知のバリアントは
-/// `Statement` 側**に倒す - 誤って `Connection` に倒すと、実際には健全な
-/// プールを毎回捨てて再接続し続けることになり、他の（正常な）グループまで
-/// 巻き込むため。
-pub(crate) fn classify(err: &sqlx::Error) -> PgFailure {
-    let message = sanitize_postgres_error(err);
-    match err {
-        sqlx::Error::Io(_)
-        | sqlx::Error::Tls(_)
-        | sqlx::Error::Protocol(_)
-        | sqlx::Error::PoolTimedOut
-        | sqlx::Error::PoolClosed
-        | sqlx::Error::Configuration(_) => PgFailure::Connection(message),
-        _ => PgFailure::Statement(message),
-    }
-}
+// describe の再試行の間隔（`max(period, 5s)`、レビュー対応: 「groups never re-describe
+// after a describe failure or after degrading to Bad」）・クエリのタイムアウト
+// （`min(period_ms * 0.8, 30s)`、§4.2）・失敗の粒度の分類（`PgFailure`・`classify`）は、
+// R2a-3b で DB ブリッジと共有するため `banto-db-source` の `poll` へ移した（振る舞い
+// 不変。分類は梯子の入り口を決めるので、Hub とブリッジで同じものを使う）。
 
 /// [`run_connection`] が使う共有物（`crate::db_source::DbSourceEngine` が
 /// タスク生成時に clone して渡す）。

@@ -413,6 +413,100 @@ async fn sink_config_get_requires_admin_and_carries_password_and_stable_ids() {
     assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
 }
 
+/// R2a-3b（docs/banto-hub-ingest-design.md §10.2、§11 のオーナーの監査 (5)）:
+/// `GET /api/ingest/bridge-config` のゲートは `/api/sink/config` と同じ（admin スコープの
+/// キーか admin ロールのセッション）。`ingest:` だけのキー・`read` だけのキー・viewer は
+/// 断る。パスワードは呼び出し手のキーがその接続の `ingest:#{id}` を持つときだけ返し、
+/// 無効な `push` 接続は載せない。
+#[tokio::test]
+async fn bridge_config_requires_admin_and_returns_the_password_only_with_the_ingest_scope() {
+    let env = test_env().await;
+    let (status, pg) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "erp-db", "protocol": "postgres", "host": "10.0.0.50", "port": 5432,
+                "database": "erp", "username": "reader", "password": "s3cret" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{pg:?}");
+    let bridge_settings = json!({ "stale_timeout_ms": 4000, "bridge": { "kind": "db",
+        "db_connection_id": pg["id"], "queries": [ { "name": "line1", "period_ms": 1000,
+        "sql": "SELECT temp FROM t", "columns": [ { "column": "temp", "key": "line1.temp" } ] } ] } });
+    let mut push_ids = Vec::new();
+    for (name, enabled) in [("Bridge1", true), ("Bridge2", false)] {
+        let (status, push) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": name, "protocol": "push", "host": "", "port": 0, "enabled": enabled,
+                    "settings": bridge_settings }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{push:?}");
+        push_ids.push(push["id"].as_i64().unwrap());
+    }
+    let bridge = push_ids[0];
+    let path = "/api/ingest/bridge-config";
+
+    let (status, _) = v1_get(&env.router, "", path).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, body) = v1_get(&env.router, &env.viewer_token, path).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    let ingest_scope = format!("ingest:#{bridge}");
+    for (name, scopes) in [
+        ("read-only", vec!["read"]),
+        ("ingest-only", vec![ingest_scope.as_str()]),
+    ] {
+        let (status, issued) = issue_api_key(&env.router, &env.admin_token, name, &scopes).await;
+        assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+        let (status, body) = v1_get(&env.router, issued["key"].as_str().unwrap(), path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{scopes:?}: {body:?}");
+    }
+
+    // admin ロールのセッション（動作確認用）: 通るが、送れないのでパスワードは無い。
+    let (status, body) = v1_get(&env.router, &env.admin_token, path).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let sources = body["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 1, "disabled push connections are not listed");
+    assert_eq!(sources[0]["connectionId"], json!(bridge));
+    assert_eq!(sources[0]["ingestAllowed"], json!(false));
+    assert!(sources[0]["db"]["password"].is_null());
+    assert!(!body.to_string().contains("s3cret"));
+
+    // admin だけのキー: 同じ。admin + ingest:#{id}: パスワードを返す（§10.2 の形）。
+    let (_, issued) = issue_api_key(&env.router, &env.admin_token, "sink", &["admin"]).await;
+    let (status, body) = v1_get(&env.router, issued["key"].as_str().unwrap(), path).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["sources"][0]["ingestAllowed"], json!(false));
+    assert!(body["sources"][0]["db"]["password"].is_null());
+    let (_, issued) = issue_api_key(
+        &env.router,
+        &env.admin_token,
+        "bridge",
+        &["admin", "read", ingest_scope.as_str()],
+    )
+    .await;
+    let (status, body) = v1_get(&env.router, issued["key"].as_str().unwrap(), path).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let source = &body["sources"][0];
+    assert_eq!(source["ingestAllowed"], json!(true));
+    assert_eq!(source["name"], json!("Bridge1"));
+    assert_eq!(source["staleTimeoutMs"], json!(4000));
+    assert!(source["configFingerprint"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    assert_eq!(
+        source["queries"][0]["columns"][0]["key"],
+        json!("line1.temp")
+    );
+    assert_eq!(source["db"]["id"], pg["id"]);
+    assert_eq!(source["db"]["enabled"], json!(true));
+    assert_eq!(source["db"]["host"], json!("10.0.0.50"));
+    assert_eq!(source["db"]["password"], json!("s3cret"));
+}
+
 /// 無効な sink group のみの構成では`groups`/`connections`とも空配列。
 #[tokio::test]
 async fn sink_config_get_excludes_disabled_groups() {

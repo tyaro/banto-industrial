@@ -59,6 +59,12 @@
 //!   バックオフ（1s → 30s、DB Source と同じ定数）を持つ。
 //! - [`status`][]: グループ単位の運転状態（`running`/`backoff`/`error`）と
 //!   Hub への push 本体。
+//! - [`source`][]: **DB ブリッジ**（R2a-3b、docs/banto-hub-ingest-design.md §10.3）。
+//!   Hub のブリッジの `push` 接続ごとに PostgreSQL へ問い合わせ、取り込み口の
+//!   WebSocket（`/api/v1/ingest/{id}/stream`）へ値を送る。設定は
+//!   `GET /api/ingest/bridge-config`。値の変換と品質の梯子は Hub 内の DB Source と同じ
+//!   共有 crate `banto-db-source`。上のエンジン（購読 → INSERT）とは別のタスク群で、
+//!   設定の取得の失敗も互いに独立。
 //! - [`run`][]: 上記を束ねる実行ループ（設定の差分適用・状態 push・SDK の
 //!   監督・停止時の flush）。テスト可能にするため `main.rs` ではなくこの
 //!   lib 側に置いてある。
@@ -77,6 +83,9 @@
 //!   運用前提。キーを守る境界は置き場の ACL（SYSTEM・Administrators だけ。#630）。
 //!   Hub が止まっている間に一般の利用者がループバックのポートを先に取ると、キーを
 //!   送ってしまう穴はこの ACL では塞がらない（#644）。
+//! - DB ブリッジ（[`source`]）は同じキーに `ingest:#{id}` のスコープを足して使う
+//!   （`admin` + `read` + `ingest:#12` …）。`GET /api/ingest/bridge-config` も読む DB の
+//!   パスワードを平文で返す（同じループバックの前提）。スコープの無い接続は動かさない。
 //! - API キーと DB パスワードは**ログにも Hub への status push にも
 //!   出さない**。sqlx のエラーは [`status::sanitize_db_error`] で
 //!   カテゴリ + DB 自身のメッセージだけに縮め、さらに
@@ -101,6 +110,7 @@ pub mod queue;
 pub mod run;
 #[cfg(windows)]
 pub mod service;
+pub mod source;
 pub mod sql;
 pub mod status;
 pub mod values;

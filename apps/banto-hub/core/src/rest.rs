@@ -249,6 +249,7 @@ use tags::{TxTestHook, TX_TEST_HOOK};
 // 保留中の変更（pending changes）API と外部 DB 連携（Sink）API は
 // `rest/{pending_changes,sink}.rs` へ移した（docs/banto-hub-driver-refactor-plan.md §8.1）。
 // ルーターは composition から使うのでここで取り込む。
+mod ingest_bridge;
 mod pending_changes;
 mod sink;
 use pending_changes::pending_changes_router;
@@ -1016,9 +1017,21 @@ fn api_router_with_controller_mode(
         // 行うため CSRF ヘッダは不要（`/api/v1/*`・`POST /mcp`と同じ扱い）。
         .merge(sink_admin_router(
             sink_groups,
-            plc_connections,
+            // R2a-3b: 下の `ingest_bridge_router` も参照先の `postgres` 接続を読む。
+            plc_connections.clone(),
             manager.clone(),
             sink_status.clone(),
+            api_keys.clone(),
+            auth.clone(),
+        ))
+        // R2a-3b（docs/banto-hub-ingest-design.md §10.2）: DB ブリッジの設定の取得口
+        // `GET /api/ingest/bridge-config`。ゲートは上の `sink_admin_router` と同じ
+        // `require_sink_admin`（admin スコープのキーか admin ロールのセッション、§12 Q13）で、
+        // 同じく CSRF のレイヤー（`admin`）の外側。パスワードを平文で返す
+        // （`ingest_bridge` のモジュール doc）。
+        .merge(ingest_bridge::ingest_bridge_router(
+            plc_connections,
+            manager.clone(),
             api_keys.clone(),
             auth.clone(),
         ))
