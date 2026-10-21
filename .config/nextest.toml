@@ -50,7 +50,7 @@
 # `banto-hub-elev` の bin は requireAdministrator のマニフェストが付き、非管理者では
 # テスト一覧の取得が os error 740 で失敗する（cargo test でも同じ。GitHub の Windows の
 # ランナーは管理者なので CI は影響を受けない）。ローカルでは
-# `cargo nextest run --workspace -E 'not binary_id(banto-hub-core::bin/banto-hub-elev)'`
+# `cargo nextest run --workspace -E 'not binary_id(banto-hub-host::bin/banto-hub-elev)'`
 # で除く。
 #
 # 新しく「同時に走るとぶつかる」テストを足したら、ここのグループに入れる

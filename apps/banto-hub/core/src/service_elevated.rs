@@ -1,6 +1,6 @@
 //! T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」・P3、
 //! docs/banto-hub-desktop-plan.md §8.3）: UAC 昇格ヘルパー
-//! `banto-hub-elev.exe`（`src/bin/banto-hub-elev.rs`）が呼ぶ実装本体。
+//! `banto-hub-elev.exe`（`banto-hub-host` の `src/bin/banto-hub-elev.rs`）が呼ぶ実装本体。
 //!
 //! [`crate::service_operators`]（slice 1）はローカルグループ
 //! `BantoHub Operators`への**メンバーシップ判定**だけを行い、グループ自体の

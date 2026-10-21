@@ -45,7 +45,7 @@
 //! ```powershell
 //! # 1. 先に4つの release バイナリをビルド（docs/banto-hub-installer-design.md §4.6）
 //! pnpm --filter banto-hub build
-//! cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui
+//! cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui
 //! cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui
 //! cargo build --release -p banto-hub-sink
 //!
@@ -103,9 +103,9 @@ const PRODUCT_NAME: &str = "BantoHub";
 /// `banto-hub-shell`）。I1 で main バイナリになった
 /// （モジュール doc「同梱バイナリ」節参照）。
 const SHELL_BINARY_NAME: &str = "banto-hub-shell";
-/// Hub 本体（`apps/banto-hub/core/src/bin/banto-hub.rs`）。
+/// Hub 本体（`apps/banto-hub/host/src/bin/banto-hub.rs`）。
 const HUB_BINARY_NAME: &str = "banto-hub";
-/// UAC 昇格ヘルパー（`apps/banto-hub/core/src/bin/banto-hub-elev.rs`）。
+/// UAC 昇格ヘルパー（`apps/banto-hub/host/src/bin/banto-hub-elev.rs`）。
 const ELEV_BINARY_NAME: &str = "banto-hub-elev";
 /// DB Sink サイドカー（`apps/banto-hub-sink`）。
 const SINK_BINARY_NAME: &str = "banto-hub-sink";
@@ -147,7 +147,7 @@ fn main() -> Result<()> {
             "次の実行ファイルが見つかりません（対象ディレクトリ: {}）: {missing_list}\n\
              先に以下を実行してから再度お試しください:\n\
              \u{20}\u{20}pnpm --filter banto-hub build\n\
-             \u{20}\u{20}cargo build --release -p banto-hub-core --bin banto-hub --bin banto-hub-elev --features embed-ui\n\
+             \u{20}\u{20}cargo build --release -p banto-hub-host --bin banto-hub --bin banto-hub-elev --features embed-ui\n\
              \u{20}\u{20}cargo build --release -p banto-hub-shell --features banto-hub-core/embed-ui\n\
              \u{20}\u{20}cargo build --release -p banto-hub-sink\n\
              別のディレクトリに4つの exe が揃っている場合は、第1引数でそのディレクトリを指定してください。",

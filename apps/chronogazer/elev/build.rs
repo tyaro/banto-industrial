@@ -1,5 +1,5 @@
 //! #392 B3-3b: `chronogazer-elev.exe` にだけ `requireAdministrator` のマニフェスト
-//! （`chronogazer-elev.manifest`）を埋め込む（banto-hub-core の `build.rs` の
+//! （`chronogazer-elev.manifest`）を埋め込む（banto-hub-host の `build.rs` の
 //! `banto-hub-elev` と同じ作り）。
 //!
 //! `embed_resource::compile_for` は指定した `[[bin]]` 名にだけ

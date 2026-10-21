@@ -35,7 +35,7 @@
 //! ## 実行方法
 //!
 //! ```text
-//! cargo build -p banto-hub-core --bin banto-hub
+//! cargo build -p banto-hub-host --bin banto-hub
 //! PLC_HOST=<PLC の IP> P6_WORK_DIR=<一時ディレクトリ> \
 //!   cargo run --example hub_p6_compare -p chronogazer-core
 //! ```

@@ -54,7 +54,7 @@
 
 ```sh
 pnpm --filter banto-hub build     # 先に管理 UI をビルド（Node 24 で）
-cargo run -p banto-hub-core --bin banto-hub --features embed-ui
+cargo run -p banto-hub-host --bin banto-hub --features embed-ui
 ```
 
 - 既定 `PORT=8722` / `BANTO_BIND=127.0.0.1` / DB `./banto-hub.sqlite3` /

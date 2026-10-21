@@ -4,7 +4,7 @@
  * 基盤を T18-1 の成果物へ前倒し」）。
  *
  * `e2e/tests/smoke.spec.ts`（ChronoGazer）と同じ設計: 実際の
- * `banto-hub`（`banto-hub-core`、`embed-ui` feature）バイナリを LAN/REST
+ * `banto-hub`（`banto-hub-host`、`embed-ui` feature）バイナリを LAN/REST
  * モードで起動し、新規 SQLite DB に対して初回セットアップ画面が実際に出る
  * ことを含めて確認する。scenario 群は1つの `page` を
  * `test.describe.serial` + config 全体の `workers: 1` で共有し、直前の

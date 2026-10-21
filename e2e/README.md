@@ -79,7 +79,7 @@ pnpm build                                                          # フロン�
 cargo build -p chronogazer-core --bin banto-serve --features embed-ui   # pnpm e2e 用
 cargo build -p chronogazer-core --example dev_plc                      # pnpm e2e 用（開発用 PLC）
 cargo build -p chronogazer-core --bin chronogazer-server --features embed-ui  # pnpm e2e:server 用
-cargo build -p banto-hub-core --bin banto-hub --features embed-ui       # pnpm e2e:banto-hub / :perf 用
+cargo build -p banto-hub-host --bin banto-hub --features embed-ui       # pnpm e2e:banto-hub / :perf 用
 pnpm exec playwright install chromium                               # 初回のみ
 ```
 

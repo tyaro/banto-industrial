@@ -13,7 +13,7 @@
 //! 作らない」、`docs/tag-server-design.md` §3.1 T0 の 2026-08-09 追記
 //! 「フル Tauri アプリ（独自 frontendDist + invoke 面）にはしない」）。
 //!
-//! ヘッドレス bin `banto-hub`（`apps/banto-hub/core/src/bin/banto-hub.rs`）
+//! ヘッドレス bin `banto-hub`（`apps/banto-hub/host/src/bin/banto-hub.rs`）
 //! が一次形態であることは変わらない - このシェルは同じ
 //! [`banto_hub_core::runtime::HubRuntime`] を薄く包む二次ホストにすぎない
 //! （設計 §2「T0 再解釈」）。
@@ -78,7 +78,7 @@
 //! `crates/banto-collect`本体・収集の開始/停止・タグ CRUD 等の実処理は一切
 //! ここに書かない - [`banto_hub_core::runtime::HubRuntime`] に完全に委譲する
 //! （このモジュール自身が新規実装するのは「どのホストで、何を起動/終了の
-//! トリガーにするか」という composition だけ - `apps/banto-hub/core/src/bin/
+//! トリガーにするか」という composition だけ - `apps/banto-hub/host/src/bin/
 //! banto-hub.rs`のモジュール doc と同じ役割分担）。「収集を停止」も
 //! [`banto_hub_core::controller::CollectionController::stop`] を直接呼ぶだけで、
 //! Hub REST の運転 API を再実装するものではない。サービスの起動/停止も

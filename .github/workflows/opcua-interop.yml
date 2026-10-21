@@ -8,6 +8,7 @@ on:
       - '.github/workflows/opcua-interop.yml'
       - 'interop/opcua/**'
       - 'apps/banto-hub/core/**'
+      - 'apps/banto-hub/host/**'
       - 'apps/banto-hub/README.md'
       - 'crates/**'
       - 'Cargo.toml'
@@ -19,6 +20,7 @@ on:
       - '.github/workflows/opcua-interop.yml'
       - 'interop/opcua/**'
       - 'apps/banto-hub/core/**'
+      - 'apps/banto-hub/host/**'
       - 'apps/banto-hub/README.md'
       - 'crates/**'
       - 'Cargo.toml'
@@ -46,7 +48,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Build Hub (REST only)
-        run: cargo build --locked -p banto-hub-core --bin banto-hub
+        run: cargo build --locked -p banto-hub-host --bin banto-hub
       - name: Install pinned asyncua client
         run: python -m pip install -r interop/opcua/requirements.txt
       - name: Verify Hub through independent OPC UA client

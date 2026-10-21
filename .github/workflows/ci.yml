@@ -470,7 +470,7 @@ jobs:
   #
   # apt でのシステムパッケージ導入は不要: banto-hub-core は Tauri/WebKitGTK に
   # 依存しない（`e2e-hub` ジョブが同じ ubuntu-latest で
-  # `cargo build -p banto-hub-core --bin banto-hub` を素で通しているのが実証）。
+  # `cargo build -p banto-hub-host --bin banto-hub`（core を含む）を素で通しているのが実証）。
   rust-db-source:
     name: Rust (db-source / PostgreSQL)
     needs: changes
@@ -540,6 +540,12 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: clippy (chronogazer-elev / banto-hub-core の lib)
         run: cargo clippy -p chronogazer-elev -p banto-hub-core --lib -- -D warnings
+      # R1-7a（docs/banto-driver-api-design.md §2.4）: banto-hub の bin（`banto-hub`・
+      # `banto-hub-elev`）は `banto-hub-host` へ移った。bin は lib を持たないので `--lib`
+      # とは別の段にする。Windows 専用の `win_service` は `cfg(windows)` で外れ、非 Windows の
+      # 分岐（`banto-hub-elev` の案内だけの `main` など）とマニフェストのテストを見る。
+      - name: clippy (banto-hub-host の bin)
+        run: cargo clippy -p banto-hub-host --all-targets -- -D warnings
       # #623 PR-2 のレビュー P2-1: `banto-instance-lock` は非 Windows に別の実装
       # （flock・`O_NOFOLLOW` の診断ファイル）とテストの分岐を持つが、メインの Rust
       # ジョブは windows-latest なので、ここで走らせないと一度もコンパイル・実行されない。
@@ -758,10 +764,10 @@ jobs:
       # directly - must exist before `pnpm e2e:banto-hub` below. banto-hub
       # itself is Windows-service-oriented (§8「常駐」) but the console-mode
       # binary this config runs is cross-platform (the Windows-only SCM code
-      # is `#[cfg(windows)]`-gated - see apps/banto-hub/core/src/bin/banto-hub.rs's
+      # is `#[cfg(windows)]`-gated - see apps/banto-hub/host/src/bin/banto-hub.rs's
       # doc comment), so it builds and runs fine here on ubuntu-latest.
       - name: Build banto-hub (embed-ui)
-        run: cargo build -p banto-hub-core --bin banto-hub --features embed-ui
+        run: cargo build -p banto-hub-host --bin banto-hub --features embed-ui
 
       - name: Install Playwright Chromium
         run: pnpm exec playwright install --with-deps chromium

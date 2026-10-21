@@ -1,0 +1,67 @@
+[package]
+name = "banto-hub-host"
+description = "banto-hub's headless executables (R1-7a, docs/banto-driver-api-design.md §2.4): the `banto-hub` console/Windows-service binary and the `banto-hub-elev` UAC helper. Assembles the built-in drivers (`banto-drivers`) and hands them to `banto-hub-core`"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = []
+# 管理 UI（`apps/banto-hub/build`）の埋め込み。中身は `banto-hub-core` の
+# `assets.rs` にあり、ここは転送するだけ（R1-7a で bin と一緒にこの package へ
+# 移した入口。`cargo build -p banto-hub-host --bin banto-hub --features embed-ui`）。
+embed-ui = ["banto-hub-core/embed-ui"]
+
+[dependencies]
+banto-hub-core = { path = "../core" }
+# R1-3b / R1-7a（docs/banto-driver-api-design.md §6.4）: bin が
+# `banto_drivers::builtin()` で組み込みドライバ一式を組み立て、`HubDrivers` として
+# core へ注入する。R1-3b では bin が core の中にあったので core が一時的に normal で
+# 持っていた（2026-10-20 オーナー決定）。R1-7a でこの package へ移し、core は dev のみ。
+banto-drivers = { path = "../../../crates/banto-drivers" }
+# `bin/banto_hub/win_service.rs`（Windows 専用）が profile のルートの締める・緩める・
+# 見張り（`banto_safe_root::mode`・`guard`・`open_root` 等）を直接使う。
+banto-safe-root = { path = "../../../crates/banto-safe-root" }
+# コンソールモードと Windows サービスがそれぞれ自前で tokio ランタイムを組み立てる
+# （`Runtime::new`）。`signal` はコンソールモードの Ctrl-C 待ち。
+tokio = { workspace = true, features = ["rt-multi-thread", "signal"] }
+
+# banto-hub は Windows 専用前提だが、このワークスペースは非 Windows でも
+# `cargo check --workspace --all-targets` を通す。Windows 限定の依存を使うコードは
+# 必ず `#[cfg(windows)]` で囲む。
+[target.'cfg(windows)'.dependencies]
+# #392 B3-3b（監査 C4）: `banto-hub-elev` の `main` の先頭の
+# `SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32)`（昇格したプロセスの DLL の
+# 探し先を System32 に限る）。R1-7a で core から移した。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# `bin/banto_hub/win_service_tests.rs`（Windows 専用）の
+# `#[tokio::test(flavor = "multi_thread")]` と `tokio::time::timeout`。
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[build-dependencies]
+# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: build.rs が
+# `banto-hub-elev.exe`にだけ`requireAdministrator`マニフェストを埋め込む
+# （`compile_for`は指定した`[[bin]]`名にのみ`cargo:rustc-link-arg-bin`を
+# 発行するため、`banto-hub`本体には影響しない）。R1-7a で core から移した。
+# Cargo.lock には既に`embed-resource 3.0.11`が（Tauri の`tauri-build`経由で）
+# 存在しており、新規バージョン系列は増えない。
+embed-resource = "3.0"
+
+[[bin]]
+name = "banto-hub"
+path = "src/bin/banto-hub.rs"
+
+# T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: UAC 昇格ヘルパー
+# - 固定のアクションだけを受け付ける薄い CLI（本体は `banto-hub-core` の
+# `service_elevated`）。`banto-hub-elev.manifest`（`requireAdministrator`、
+# `build.rs`が embed-resource でこのバイナリにだけリンクする）により、実行する
+# だけで OS が UAC 昇格プロンプトを出す。
+[[bin]]
+name = "banto-hub-elev"
+path = "src/bin/banto-hub-elev.rs"

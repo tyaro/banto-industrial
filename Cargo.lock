@@ -802,7 +802,6 @@ dependencies = [
  "banto-tags",
  "banto-tstore",
  "base64 0.23.1",
- "embed-resource",
  "futures-util",
  "getrandom 0.4.3",
  "hex",
@@ -827,6 +826,18 @@ dependencies = [
  "tower",
  "utoipa",
  "utoipa-swagger-ui",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "banto-hub-host"
+version = "0.2.0-alpha.32"
+dependencies = [
+ "banto-drivers",
+ "banto-hub-core",
+ "banto-safe-root",
+ "embed-resource",
+ "tokio",
  "windows-sys 0.61.2",
 ]
 
