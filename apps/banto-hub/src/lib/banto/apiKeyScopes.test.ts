@@ -11,6 +11,7 @@ import {
 	ingestScope,
 	parseIngestScope,
 	pushConnectionOptions,
+	reconcileIngestSelection,
 	type ScopeConnection
 } from './apiKeyScopes';
 
@@ -88,5 +89,33 @@ describe('pushConnectionOptions', () => {
 	it('offers only push connections in their original order', () => {
 		expect(pushConnectionOptions(CONNECTIONS).map((c) => c.id)).toEqual([12, 14]);
 		expect(pushConnectionOptions([])).toEqual([]);
+	});
+});
+
+describe('reconcileIngestSelection', () => {
+	it('returns [] when the connection list could not be read', () => {
+		expect(reconcileIngestSelection([12, 14], null)).toEqual([]);
+	});
+
+	it('drops ids whose connection was deleted', () => {
+		expect(reconcileIngestSelection([12, 99], CONNECTIONS)).toEqual([12]);
+	});
+
+	it('drops ids that are not push connections', () => {
+		expect(reconcileIngestSelection([3, 12, 20], CONNECTIONS)).toEqual([12]);
+	});
+
+	it('keeps present push ids in the selected order', () => {
+		expect(reconcileIngestSelection([14, 12], CONNECTIONS)).toEqual([14, 12]);
+		expect(reconcileIngestSelection([], CONNECTIONS)).toEqual([]);
+	});
+
+	it('選択 → 別キーの失効 → 接続一覧の取得失敗 → 発行 で ingest スコープが付かない', () => {
+		const selected = [12];
+		// 取得失敗の reload（connections = null）で選択が空に整えられる。
+		const reconciled = reconcileIngestSelection(selected, null);
+		const scopes = reconciled.map(ingestScope);
+		expect(reconciled).toEqual([]);
+		expect(scopes).not.toContain('ingest:#12');
 	});
 });

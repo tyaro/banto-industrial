@@ -66,6 +66,22 @@ export function pushConnectionOptions(connections: readonly ScopeConnection[]): 
 }
 
 /**
+ * 作成フォームで選択中の接続 id を、今の接続の一覧に合わせて整える。
+ * `connections` が `null`（一覧を読めなかった = チェックボックスが出ない）
+ * なら空、そうでなければ「一覧にあり、かつ `push`」の id だけを選んだ順の
+ * まま残す。見えない・外せない選択が `ingest:#{id}` として発行されるのを防ぐ
+ * （接続の削除・protocol 変更・一覧の取得失敗の後も選択が残る事故）。
+ */
+export function reconcileIngestSelection(
+	selected: readonly number[],
+	connections: readonly ScopeConnection[] | null
+): number[] {
+	if (connections === null) return [];
+	const pushIds = new Set(pushConnectionOptions(connections).map((c) => c.id));
+	return selected.filter((id) => pushIds.has(id));
+}
+
+/**
  * 一覧の 1 つのスコープの表示。`ingest:#{id}` は `connections`（`null` = 一覧を
  * 読めなかった）から今の名前を引いて上のモジュール doc comment の文言にする。
  * それ以外のスコープは文字列をそのまま返す。

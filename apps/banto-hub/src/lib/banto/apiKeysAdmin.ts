@@ -45,6 +45,7 @@ export {
 	ingestScope,
 	parseIngestScope,
 	pushConnectionOptions,
+	reconcileIngestSelection,
 	INGEST_SCOPE_PREFIX,
 	PUSH_PROTOCOL,
 	type ScopeConnection

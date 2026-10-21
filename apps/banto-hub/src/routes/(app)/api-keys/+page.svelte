@@ -64,6 +64,7 @@
 		describeApiKeyScope,
 		ingestScope,
 		pushConnectionOptions,
+		reconcileIngestSelection,
 		type ApiKeySummary,
 		type IssuedApiKey
 	} from '#lib/banto/apiKeysAdmin.js';
@@ -111,6 +112,9 @@
 					`接続の一覧を読めませんでした: ${errorMessage(connectionsResult.reason)}`
 				);
 			}
+			// 一覧を読めなかった/接続が消えた・push でなくなった場合、見えない選択が
+			// ingest スコープとして残らないよう選択を整える。
+			ingestConnectionIds = reconcileIngestSelection(ingestConnectionIds, connections);
 			if (keysResult.status === 'fulfilled') {
 				keys = keysResult.value;
 				nowMs = Date.now();
@@ -213,8 +217,11 @@
 			if (trimmed === '') continue;
 			scopes.push(trimmed.startsWith('write:') ? trimmed : `write:${trimmed}`);
 		}
-		// R2a-2b: 選んだ push 接続の id を詰める（名前は使わない）。
-		for (const id of ingestConnectionIds) scopes.push(ingestScope(id));
+		// R2a-2b: 選んだ push 接続の id を詰める（名前は使わない）。画面に見えて
+		// いる接続（reload 後の一覧にある push）だけを対象にする。
+		for (const id of reconcileIngestSelection(ingestConnectionIds, connections)) {
+			scopes.push(ingestScope(id));
+		}
 		return scopes;
 	}
 
