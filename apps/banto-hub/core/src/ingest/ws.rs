@@ -72,15 +72,39 @@
 //! 1 本 = 受信のループ（このタスク）+ 送信のタスク（[`writer_task`]）。応答は容量
 //! [`OUTBOUND_QUEUE_CAPACITY`]（256）の `mpsc` に `try_send` で積み、満杯なら close 1013
 //! `backpressure` で閉じる（`ack` を読まない送り手で Hub のメモリが膨らまない）。close
-//! は容量 1 の別のチャンネルで送り、送信のタスクはそちらを優先する。
+//! は容量 1 の別のチャンネルで送り、送信のタスクはそちらを優先する（満杯のキューに
+//! 積まれた応答は送らずに close を送る）。**送信のタスクは応答のチャンネルが閉じただけ
+//! では終わらない**: close のチャンネルが閉じるまで待つ（PR #759 のレビュー P2-1。応答の
+//! 送り手を先に捨てた後、空のキューで送信のタスクが先に走ると close を積む前に終わって
+//! しまい、1008 / 1009 が届かなかった）。
 //!
-//! **送信のタスクの終わりは上限つきで待つ**（[`WRITER_DRAIN_TIMEOUT`]、5 秒）。読まない
-//! 送り手・半開きの TCP（§12 Q10 の理由）では送信のタスクが送り先の読み出しを待って
-//! 止まったままになるので、上限を過ぎたら `abort` する（DB を触らないタスクなので
-//! implementation-checklist §5 の「DB を触る背景タスクを abort で止めない」に当たらない）。
-//! そのときは close フレームは届かず TCP ごと閉じる。どの閉じ方でも、受信のループ・
-//! 送信のタスク・再検証のタイマー・slot の登録（[`super::WsSession`] の `Drop`）は
-//! この関数の終わりまでにすべて片付く。
+//! ## 閉じ方（RFC 6455 の閉じる手順、PR #759 の Windows の CI）
+//!
+//! 閉じると決めたら（どの理由でも）、まず登録・再検証・受信のループを片付け
+//! （[`super::WsSession`] の `Drop` で slot の登録はその場で外れる）、close フレームを
+//! 送ってから、**受信の半分を読み捨て続ける**（値は処理しない・数えない・`IngestHub` に
+//! 触らない。1 メッセージは tungstenite の 256 KiB の上限のまま、溜めない）。相手の
+//! close の返事・ストリームの終わり・読み取りのエラーまで読んでから TCP を手放す。
+//! 読み残しのある受信のバッファを抱えたままソケットを閉じると OS は FIN ではなく RST を
+//! 送り、Windows の相手は受け取り済みで未読の close フレームごと捨てる（ECONNRESET。
+//! Linux は読める）。上限の超過（1009）は tungstenite がそれ以上読ませないので、
+//! close を送った後は読まずに上限までソケットを持ったまま待つ（相手が close を読む
+//! 時間を残す）。
+//!
+//! **後片付けは全体で上限つき**（[`WRITER_DRAIN_TIMEOUT`]、5 秒。close を決めた時点
+//! から）。読まない送り手・半開きの TCP（§12 Q10 の理由）では送信のタスクが送り先の
+//! 読み出しを待って止まったままになるので、上限を過ぎたら `abort` する（DB を触らない
+//! タスクなので implementation-checklist §5 の「DB を触る背景タスクを abort で止めない」に
+//! 当たらない）。そのときは close フレームは届かず TCP ごと閉じる。どの閉じ方でも、
+//! 受信のループ・送信のタスク・再検証のタイマー・slot の登録・ソケットはこの関数の
+//! 終わりまでにすべて片付く。監査の `ingest_disconnected` は読み捨てと並んで 1 回だけ
+//! 積み、記録のタスク（[`super::audit::IngestAuditWriter`]）の終わりを待つ。
+//!
+//! ## 監査（PR #759 のレビュー P2-2）
+//!
+//! 受信のループは監査の記録を待たない: 行は接続ごとの記録のタスクへ積むだけ
+//! （[`super::audit::IngestAuditWriter`]。順序を保ち、落とさない）。遅い監査の DB でも
+//! ping・close の知らせ・`state`・再検証は止まらない。`ack` は行を積んだ時点で返す。
 //!
 //! ## close コード
 //!
@@ -121,7 +145,7 @@ use axum::routing::get;
 use axum::Router;
 use banto_server::AuthState;
 use banto_tstore::Clock;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 use tokio::sync::mpsc;
@@ -134,7 +158,9 @@ use crate::stream::{
     StreamRevalidationTiming, REVOKED_CLOSE_CODE,
 };
 
-use super::audit::{self as ingest_audit, IngestAuditContext, IngestAuditRow, Transport};
+use super::audit::{
+    self as ingest_audit, IngestAuditContext, IngestAuditRow, IngestAuditWriter, Transport,
+};
 use super::auth::{require_ingest_auth, IngestAuthState, IngestCaller};
 use super::limits::PUSH_LIMITS;
 use super::rest::IngestRejectedItem;
@@ -382,7 +408,8 @@ struct Envelope {
     detail: Option<Value>,
 }
 
-/// 1 本の WS（upgrade の後）。モジュールの doc「1 本の制限」「送信キューと背圧」。
+/// 1 本の WS（upgrade の後）。モジュールの doc「1 本の制限」「送信キューと背圧」
+/// 「閉じ方」。
 async fn run_socket(
     socket: WebSocket,
     state: IngestWsState,
@@ -390,20 +417,21 @@ async fn run_socket(
     revalidator: Revalidator,
     tuning: IngestWsTuning,
 ) {
-    let (sink, incoming) = socket.split();
+    let (sink, mut incoming) = socket.split();
     let (data_tx, data_rx) = mpsc::channel::<Message>(tuning.queue_capacity.max(1));
     let (close_tx, close_rx) = mpsc::channel::<CloseFrame>(1);
     let mut writer = tokio::spawn(writer_task(sink, data_rx, close_rx));
     let outbound = Outbound { data_tx };
 
-    let end = match state.ingest.open_ws_session(caller.connection_id) {
+    let (end, conn) = match state.ingest.open_ws_session(caller.connection_id) {
         Ok((session, info)) => {
             let ctx = IngestAuditContext {
                 // 登録した時点の名前を控える（認証の層の後に改名されていても今の名前）。
                 connection_name: Some(info.name.clone()),
                 ..caller.audit_context()
             };
-            ingest_audit::record(&state.audit, vec![IngestAuditRow::connected(&ctx)]).await;
+            let audit = IngestAuditWriter::spawn(&state.audit);
+            audit.push(vec![IngestAuditRow::connected(&ctx)]);
             let welcome = WelcomeWire {
                 op: "welcome",
                 connection_id: caller.connection_id,
@@ -420,26 +448,25 @@ async fn run_socket(
             };
             let mut conn = Conn {
                 ingest: state.ingest.clone(),
-                audit: state.audit.clone(),
+                audit,
                 clock: state.clock.clone(),
                 ctx,
                 outbound,
                 accepted: 0,
             };
-            let (end, accepted) = if conn.outbound.send(&welcome) {
-                let end = conn.run(session, incoming, revalidator).await;
-                (end, conn.accepted)
+            let end = if conn.outbound.send(&welcome) {
+                conn.run(session, &mut incoming, revalidator).await
             } else {
-                (End::Backpressure, 0)
+                End::Backpressure
             };
-            // ここで登録・再検証・受信の半分は片付いている（`run` が持って行って捨てた）。
-            Some((end, accepted, conn.ctx))
+            // ここで登録・再検証は片付いている（`run` が持って行って捨てた。`run` を
+            // 通らないときはこの腕の終わりで捨てる）。
+            (end, Some(conn))
         }
         // 認証の層を通った後、登録までの間に commit と競った（§6.1）。監査の
         // `ingest_connected` は出していないので、切断の行も出さない。
         Err(refusal) => {
             drop(outbound);
-            drop(incoming);
             drop(revalidator);
             let end = match refusal {
                 ApplyRefusal::ConnectionDisabled => WsEnd::ConnectionChanged,
@@ -447,51 +474,106 @@ async fn run_socket(
                     WsEnd::ConnectionRemoved
                 }
             };
-            if let Some(frame) = End::Hub(end).close_frame() {
-                let _ = close_tx.try_send(frame);
-            }
-            None
+            (End::Hub(end), None)
         }
     };
 
-    if let Some((end, _, _)) = &end {
-        if let Some(frame) = end.close_frame() {
-            let _ = close_tx.try_send(frame);
-        }
+    // close を積んでからチャンネルを閉じる（送信のタスクは close のチャンネルが閉じる
+    // まで終わらないので、応答の送り手を先に捨てていても close は届く）。
+    let deadline = tokio::time::Instant::now() + tuning.drain_timeout;
+    let close_frame = end.close_frame();
+    let sends_close = close_frame.is_some();
+    if let Some(frame) = close_frame {
+        let _ = close_tx.try_send(frame);
     }
-    // チャンネルを閉じて送信のタスクに終わりを伝え、上限つきで待つ（読まない送り手・
-    // 半開きの TCP で止まったままなら abort して TCP ごと閉じる）。
     drop(close_tx);
-    if tokio::time::timeout(tuning.drain_timeout, &mut writer)
-        .await
-        .is_err()
-    {
+
+    // 送信のタスクの終わりを上限つきで待つ。その間も受信の半分を読み捨てる（相手の送信が
+    // 詰まったままにならない・受信のバッファに読み残しを溜めない）。
+    let mut read = if end == End::MessageTooBig {
+        ReadHalf::Unread
+    } else {
+        ReadHalf::Open
+    };
+    let writer_done = loop {
+        tokio::select! {
+            biased;
+            _ = &mut writer => break true,
+            () = tokio::time::sleep_until(deadline) => break false,
+            msg = incoming.next(), if read == ReadHalf::Open => read = ReadHalf::after(msg),
+        }
+    };
+    if !writer_done {
+        // 読まない送り手・半開きの TCP: abort して TCP ごと閉じる（close は届かない）。
         writer.abort();
         let _ = writer.await;
     }
 
-    if let Some((end, accepted, ctx)) = end {
-        let (reason, revoked_reason) = end.audit_reason();
-        ingest_audit::record(
-            &state.audit,
-            vec![IngestAuditRow::disconnected(
-                &ctx,
-                reason,
-                revoked_reason,
-                accepted,
-            )],
-        )
-        .await;
+    // 閉じる手順の残り（相手の close の返事まで読み捨てる）と、監査の切断の行を並べて
+    // 進める。ソケットは `closing` の終わりで手放す（送信の半分は送信のタスクと一緒に
+    // もう無い）。
+    let closing = async move {
+        if writer_done {
+            let linger = sends_close;
+            let _ = tokio::time::timeout_at(deadline, async {
+                while read == ReadHalf::Open {
+                    read = ReadHalf::after(incoming.next().await);
+                }
+                if read == ReadHalf::Unread && linger {
+                    // 読めない読み残しがある（1009）: 上限まで持ったまま、相手が close を
+                    // 読む時間を残す（すぐ閉じると RST で close ごと捨てられる）。
+                    std::future::pending::<()>().await;
+                }
+            })
+            .await;
+        }
+        drop(incoming);
+    };
+    let audit = async move {
+        if let Some(conn) = conn {
+            let (reason, revoked_reason) = end.audit_reason();
+            let row =
+                IngestAuditRow::disconnected(&conn.ctx, reason, revoked_reason, conn.accepted);
+            conn.audit.finish(vec![row]).await;
+        }
+    };
+    tokio::join!(closing, audit);
+}
+
+/// close を決めた後の受信の半分（モジュールの doc「閉じ方」）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadHalf {
+    /// まだ読める（読み捨てる）。
+    Open,
+    /// 終わった（相手の close の後のストリームの終わり・TCP の終わり・読み取りのエラー）。
+    Ended,
+    /// 上限の超過で tungstenite がそれ以上読ませない（受信のバッファに読み残しがある）。
+    Unread,
+}
+
+impl ReadHalf {
+    /// 読み捨てた 1 つの後の状態。メッセージは中身を見ずに捨てる。
+    fn after(msg: Option<Result<Message, axum::Error>>) -> Self {
+        match msg {
+            Some(Ok(_)) => Self::Open,
+            Some(Err(err)) if is_message_too_big(&err) => Self::Unread,
+            Some(Err(_)) | None => Self::Ended,
+        }
     }
 }
 
-/// 送信専用のタスク（`/api/v1/stream` の `writer_task` と同じ形）: close を優先し、
-/// どちらかのチャンネルが閉じたら終わる。
-async fn writer_task(
-    mut sink: futures_util::stream::SplitSink<WebSocket, Message>,
+/// 送信専用のタスク（`/api/v1/stream` の `writer_task` と同じ形）: close を優先する。
+/// 終わるのは close を送ったとき・close のチャンネルが閉じたとき・送れなかったとき。
+/// **応答のチャンネルが閉じただけでは終わらない**（モジュールの doc「送信キューと背圧」、
+/// P2-1）: その後は close のチャンネルだけを待つ。
+async fn writer_task<S>(
+    mut sink: S,
     mut data_rx: mpsc::Receiver<Message>,
     mut close_rx: mpsc::Receiver<CloseFrame>,
-) {
+) where
+    S: Sink<Message> + Unpin,
+{
+    let mut data_open = true;
     loop {
         tokio::select! {
             biased;
@@ -501,13 +583,13 @@ async fn writer_task(
                 }
                 break;
             }
-            msg = data_rx.recv() => match msg {
+            msg = data_rx.recv(), if data_open => match msg {
                 Some(msg) => {
                     if sink.send(msg).await.is_err() {
                         break;
                     }
                 }
-                None => break,
+                None => data_open = false,
             },
         }
     }
@@ -516,7 +598,8 @@ async fn writer_task(
 /// 受信のループの状態。
 struct Conn {
     ingest: Arc<IngestHub>,
-    audit: AuditLogService,
+    /// 監査の行を積む先（待たない。モジュールの doc「監査」）。
+    audit: IngestAuditWriter,
     clock: Arc<dyn Clock>,
     ctx: IngestAuditContext,
     outbound: Outbound,
@@ -529,12 +612,13 @@ type Step = Result<(), End>;
 
 impl Conn {
     /// 受信・`state`・再検証・`IngestHub` からの close を 1 本の `select!` で直列に処理する
-    /// （`/api/v1/stream` の `handle_socket` と同じ）。`session`・`incoming`・
-    /// `revalidator` はここで捨てる（登録は `WsSession` の `Drop` で外れる）。
+    /// （`/api/v1/stream` の `handle_socket` と同じ）。`session`・`revalidator` はここで
+    /// 捨てる（登録は `WsSession` の `Drop` で外れる）。`incoming` は閉じる手順の読み捨てに
+    /// 使うので呼び出し側に残す（モジュールの doc「閉じ方」）。
     async fn run(
         &mut self,
         mut session: WsSession,
-        mut incoming: futures_util::stream::SplitStream<WebSocket>,
+        incoming: &mut futures_util::stream::SplitStream<WebSocket>,
         mut revalidator: Revalidator,
     ) -> End {
         loop {
@@ -559,7 +643,7 @@ impl Conn {
                     Err(_) => Err(End::Hub(WsEnd::ConnectionRemoved)),
                 },
                 msg = incoming.next() => match msg {
-                    Some(Ok(Message::Text(text))) => self.handle_text(&session, text.as_str()).await,
+                    Some(Ok(Message::Text(text))) => self.handle_text(&session, text.as_str()),
                     Some(Ok(Message::Binary(_))) => self.send_error(
                         None,
                         "invalid_message",
@@ -595,7 +679,9 @@ impl Conn {
         })
     }
 
-    async fn handle_text(&mut self, session: &WsSession, text: &str) -> Step {
+    /// 1 つのテキストのメッセージ。**待たない**（監査は積むだけ、モジュールの doc「監査」）
+    /// ので、受信の `select!` の他の腕（close の知らせ・再検証・`state`）を止めない。
+    fn handle_text(&mut self, session: &WsSession, text: &str) -> Step {
         let envelope: Envelope = match serde_json::from_str(text) {
             Ok(envelope) => envelope,
             Err(err) => {
@@ -618,7 +704,7 @@ impl Conn {
             }
         };
         match envelope.op.as_str() {
-            "values" => self.handle_values(session, seq.as_ref(), text).await,
+            "values" => self.handle_values(session, seq.as_ref(), text),
             "ping" => match self.ingest.ping_ws(session, None, self.clock.now_ms()) {
                 Ok(()) => self.send(&PongWire {
                     op: "pong",
@@ -650,12 +736,7 @@ impl Conn {
     }
 
     /// `values`（モジュールの doc の判定の順序。REST の 3〜5 と同じ）。
-    async fn handle_values(
-        &mut self,
-        session: &WsSession,
-        seq: Option<&Number>,
-        text: &str,
-    ) -> Step {
+    fn handle_values(&mut self, session: &WsSession, seq: Option<&Number>, text: &str) -> Step {
         let message = match parse_values_message(text.as_bytes()) {
             Ok(message) => message,
             Err(err) => {
@@ -670,7 +751,7 @@ impl Conn {
             Ok(admission) => admission,
             Err(refusal) => {
                 let rows = ingest_audit::refusal_rows(&self.ingest, &self.ctx, refusal, now_ms);
-                ingest_audit::record(&self.audit, rows).await;
+                self.audit.push(rows);
                 return Err(apply_refusal_end(refusal));
             }
         };
@@ -680,7 +761,7 @@ impl Conn {
             .map(|edge| IngestAuditRow::limit_edge(&self.ctx, edge))
             .collect();
         if let Err(limit) = admission.outcome {
-            ingest_audit::record(&self.audit, rows).await;
+            self.audit.push(rows);
             let detail = match limit.retry_after_secs {
                 Some(secs) => format!(
                     "上限（{}）を超えました。{secs} 秒ほど待ってから送ってください",
@@ -700,7 +781,7 @@ impl Conn {
         {
             Ok(ack) => ack,
             Err(WsRefusal::Refused(ApplyRefusal::StaleEpoch { epoch })) => {
-                ingest_audit::record(&self.audit, rows).await;
+                self.audit.push(rows);
                 return self.send_error(
                     seq,
                     "stale_epoch",
@@ -716,7 +797,7 @@ impl Conn {
                         now_ms,
                     ));
                 }
-                ingest_audit::record(&self.audit, rows).await;
+                self.audit.push(rows);
                 return Err(refusal_end(refusal));
             }
         };
@@ -735,7 +816,7 @@ impl Conn {
                 .iter()
                 .map(|record| IngestAuditRow::unknown_key(&self.ctx, record)),
         );
-        ingest_audit::record(&self.audit, rows).await;
+        self.audit.push(rows);
 
         self.send(&AckWire {
             op: "ack",
@@ -876,5 +957,123 @@ mod tests {
         assert!(is_message_too_big(&too_big));
         let other = axum::Error::new(WsError::ConnectionClosed);
         assert!(!is_message_too_big(&other));
+    }
+
+    type RecordingSink =
+        std::pin::Pin<Box<dyn Sink<Message, Error = std::convert::Infallible> + Send>>;
+
+    /// 送った順を受け取れる sink（送信のタスクの試験用）。
+    fn recording_sink() -> (RecordingSink, mpsc::UnboundedReceiver<Message>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let sink = futures_util::sink::unfold(tx, |tx, msg: Message| async move {
+            let _ = tx.send(msg);
+            Ok::<_, std::convert::Infallible>(tx)
+        });
+        (Box::pin(sink), rx)
+    }
+
+    fn close_of(msg: &Message) -> Option<(u16, String)> {
+        match msg {
+            Message::Close(Some(frame)) => Some((frame.code, frame.reason.to_string())),
+            _ => None,
+        }
+    }
+
+    /// 回帰（P2-1）: 応答の送り手を先に捨て、空のキューで送信のタスクが先に走っても、
+    /// close を積む前に終わらない。後から積んだ close が届く。登録の後の腕（`superseded`・
+    /// 1009 など、腕を出るときに `conn.outbound` が落ちる）と、登録を断られた腕
+    /// （`drop(outbound)` の後に `connection_removed`）はどちらも「応答の送り手を捨てた後に
+    /// close を積む」同じ順序なので、その順序をそれぞれの close で再現する。単一スレッドの
+    /// ランタイムで、close を積む前に送信のタスクを確実に走らせる。
+    #[tokio::test]
+    async fn the_writer_waits_for_the_close_after_the_data_channel_closes() {
+        for end in [
+            End::Hub(WsEnd::Superseded),
+            End::MessageTooBig,
+            End::Hub(WsEnd::ConnectionRemoved),
+        ] {
+            let (sink, mut sent) = recording_sink();
+            let (data_tx, data_rx) = mpsc::channel::<Message>(4);
+            let (close_tx, close_rx) = mpsc::channel::<CloseFrame>(1);
+            let writer = tokio::spawn(writer_task(sink, data_rx, close_rx));
+            drop(data_tx);
+            for _ in 0..16 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                !writer.is_finished(),
+                "{end:?}: 応答のチャンネルが閉じただけで送信のタスクが終わった"
+            );
+            let frame = end.close_frame().unwrap();
+            let expected = (frame.code, frame.reason.to_string());
+            close_tx.try_send(frame).unwrap();
+            drop(close_tx);
+            writer.await.unwrap();
+            let msg = sent.recv().await.expect("close が送られた");
+            assert_eq!(close_of(&msg), Some(expected), "{end:?}");
+            assert!(sent.recv().await.is_none());
+        }
+    }
+
+    /// 背圧（満杯のキュー）: 積まれた応答より close を先に送り、残りの応答は送らない。
+    #[tokio::test]
+    async fn the_close_bypasses_a_full_queue() {
+        let (sink, mut sent) = recording_sink();
+        let (data_tx, data_rx) = mpsc::channel::<Message>(2);
+        let (close_tx, close_rx) = mpsc::channel::<CloseFrame>(1);
+        data_tx.try_send(Message::Text("a".into())).unwrap();
+        data_tx.try_send(Message::Text("b".into())).unwrap();
+        assert!(data_tx.try_send(Message::Text("c".into())).is_err());
+        close_tx
+            .try_send(End::Backpressure.close_frame().unwrap())
+            .unwrap();
+        drop(data_tx);
+        drop(close_tx);
+        writer_task(sink, data_rx, close_rx).await;
+        let msg = sent.recv().await.expect("close が送られた");
+        assert_eq!(close_of(&msg), Some((1013, "backpressure".to_string())));
+        assert!(sent.recv().await.is_none());
+    }
+
+    /// close を送らない閉じ方（`client_closed`）: close のチャンネルが閉じたら、積まれた
+    /// 応答を送り終えて終わる（ぶら下がらない）。
+    #[tokio::test]
+    async fn the_writer_ends_when_both_channels_close_without_a_close() {
+        let (sink, mut sent) = recording_sink();
+        let (data_tx, data_rx) = mpsc::channel::<Message>(2);
+        let (close_tx, close_rx) = mpsc::channel::<CloseFrame>(1);
+        data_tx.try_send(Message::Text("a".into())).unwrap();
+        drop(data_tx);
+        let writer = tokio::spawn(writer_task(sink, data_rx, close_rx));
+        assert!(matches!(sent.recv().await, Some(Message::Text(_))));
+        drop(close_tx);
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("送信のタスクが終わる")
+            .unwrap();
+        assert!(sent.recv().await.is_none());
+    }
+
+    /// 閉じる手順の読み捨て: メッセージは読み続け、上限の超過は「読めない読み残し」、
+    /// それ以外のエラー・終わりは「終わり」。
+    #[test]
+    fn the_read_half_after_the_close_decision() {
+        use tokio_tungstenite::tungstenite::error::{CapacityError, Error as WsError};
+        assert_eq!(
+            ReadHalf::after(Some(Ok(Message::Text("x".into())))),
+            ReadHalf::Open
+        );
+        assert_eq!(
+            ReadHalf::after(Some(Ok(Message::Close(None)))),
+            ReadHalf::Open
+        );
+        assert_eq!(ReadHalf::after(None), ReadHalf::Ended);
+        let too_big = axum::Error::new(WsError::Capacity(CapacityError::MessageTooLong {
+            size: 262_145,
+            max_size: 262_144,
+        }));
+        assert_eq!(ReadHalf::after(Some(Err(too_big))), ReadHalf::Unread);
+        let reset = axum::Error::new(WsError::ConnectionClosed);
+        assert_eq!(ReadHalf::after(Some(Err(reset))), ReadHalf::Ended);
     }
 }

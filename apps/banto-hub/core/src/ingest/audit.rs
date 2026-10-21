@@ -38,7 +38,9 @@
 //!
 //! 記録は `tokio::spawn` で切り離し、ハンドラはその終わりを待つ
 //! （implementation-checklist §5「handler の中で `await` をまたぐ副作用は接続の
-//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。
+//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。WebSocket は
+//! 受信のループを監査で止めないよう、接続ごとの記録のタスク（[`IngestAuditWriter`]）へ
+//! 渡して待たず、切断の後片付けでその終わりを待つ。
 
 use std::collections::{HashMap, HashSet};
 
@@ -306,24 +308,98 @@ pub async fn record(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
         return;
     }
     let audit = audit.clone();
-    let task = tokio::spawn(async move {
-        for row in rows {
-            audit
-                .record(AuditEntry {
-                    actor_username: None,
-                    actor_role: None,
-                    action: row.action,
-                    resource: row.resource,
-                    entity_id: Some(&row.entity_id),
-                    detail: Some(row.detail),
-                    origin: ORIGIN,
-                    result: row.result,
-                })
-                .await;
-        }
-    });
+    let task = tokio::spawn(async move { record_rows(&audit, rows).await });
     if let Err(err) = task.await {
         eprintln!("banto-hub: 取り込みの監査の記録が異常終了しました: {err}");
+    }
+}
+
+/// 1 本の WebSocket の監査の行を、受信のループから切り離して順に記録する送り手
+/// （R2a-2d、PR #759 のレビュー P2-2）。
+///
+/// WS の受信のループは ping・close の知らせ（`superseded` 等）・`state`・キーの再検証を
+/// 1 本の `select!` で回すので、そこで [`record`] を待つと、遅い監査の DB（保留つきで
+/// 1 行あたり最大 `SpoolConfig::timeout`、3 秒）の間ループ全体が止まる（100 個の未知の
+/// キーで数分、`stale_timeout_ms` で Down・置き換えの遅れ）。そこで行は接続ごとの
+/// 記録のタスク（`tokio::spawn`）へチャンネルで渡し、ループは待たない。
+///
+/// - **行を落とさない**: チャンネルは容量なし（unbounded）。積み残しの上限は間引きが
+///   決める: 1 本の接続で 1 時間に出る行は未知のキー 101・上限の端 41 で頭打ちで、
+///   ほかは接続・切断と、WS を閉じる拒否の `denied`（1 本に 1 回）だけ（このモジュールの
+///   doc「監査の行の間引き」）。記録は 1 行あたり保留の上限（3 秒）で終わるので、DB が止まったままでも
+///   1 時間に 1,200 行は捌け、積み残しは増え続けない。容量つきにして満杯で待つとループが
+///   止まり（P2-2 そのもの）、満杯で捨てると監査を落とすので、どちらも採らない。
+/// - **順序**: 消費するのは 1 つのタスクだけなので、積んだ順（`ingest_connected` →
+///   …→ `ingest_disconnected`）に記録する。
+/// - **切断で捨てられない**: 記録は切り離したタスクで走る（[`record`] と同じ理由、
+///   implementation-checklist §5）。WS の後片付けは [`Self::finish`] でその終わりを待つ
+///   （REST の「切り離したタスクをハンドラが待つ」と同じ形。待つのは TCP を閉じた後・
+///   登録を外した後なので、待っている間に止まるものは無い）。
+/// - 記録のタスクが先に終わっていた（panic）ときは、その行を [`record`] と同じく
+///   切り離したタスクで記録し直す（黙って落とさない）。
+pub struct IngestAuditWriter {
+    audit: AuditLogService,
+    tx: tokio::sync::mpsc::UnboundedSender<Vec<IngestAuditRow>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl IngestAuditWriter {
+    /// 記録のタスクを立てる。
+    pub fn spawn(audit: &AuditLogService) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<IngestAuditRow>>();
+        let service = audit.clone();
+        let task = tokio::spawn(async move {
+            while let Some(rows) = rx.recv().await {
+                record_rows(&service, rows).await;
+            }
+        });
+        Self {
+            audit: audit.clone(),
+            tx,
+            task,
+        }
+    }
+
+    /// 行を積む（待たない）。空なら何もしない。
+    pub fn push(&self, rows: Vec<IngestAuditRow>) {
+        if rows.is_empty() {
+            return;
+        }
+        if let Err(tokio::sync::mpsc::error::SendError(rows)) = self.tx.send(rows) {
+            eprintln!(
+                "banto-hub: 取り込みの監査の記録のタスクが終わっていたので、{} 行を別に記録します",
+                rows.len()
+            );
+            let audit = self.audit.clone();
+            tokio::spawn(async move { record_rows(&audit, rows).await });
+        }
+    }
+
+    /// 最後の行を積み、積んだ行がすべて記録されるまで待つ。
+    pub async fn finish(self, rows: Vec<IngestAuditRow>) {
+        self.push(rows);
+        let Self { tx, task, .. } = self;
+        drop(tx);
+        if let Err(err) = task.await {
+            eprintln!("banto-hub: 取り込みの監査の記録が異常終了しました: {err}");
+        }
+    }
+}
+
+async fn record_rows(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
+    for row in rows {
+        audit
+            .record(AuditEntry {
+                actor_username: None,
+                actor_role: None,
+                action: row.action,
+                resource: row.resource,
+                entity_id: Some(&row.entity_id),
+                detail: Some(row.detail),
+                origin: ORIGIN,
+                result: row.result,
+            })
+            .await;
     }
 }
 

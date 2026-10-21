@@ -9,7 +9,9 @@
 //!   無効化で `connection_changed`・削除で `connection_removed`。
 //! - 256 KiB ちょうどは通り、1 バイト超で 1009。
 //! - 収集の停止・開始とブリッジの設定の変更で `state`（epoch が進む）が届く。
-//! - `ack` を読まない送り手で 1013。
+//! - `ack` を読まない送り手で 1013。閉じる手順は読み残しを読み捨ててから FIN で終わる（RST に
+//!   しない）。
+//! - 監査の DB が止まっても `ack`・`pong`・置き換え・再検証の close は遅れず、行は落ちない。
 //! - 切断後 `stale_timeout_ms` までは Live。
 //!
 //! 待ちはすべて上限つき（`RECV_BOUND`）。固定の sleep は「読まない送り手」の再現で、
@@ -889,6 +891,21 @@ async fn a_sender_that_does_not_read_is_closed_with_1013() {
     .await
     .expect("close within the bound");
     assert_eq!(close, Some((1013, "backpressure".to_string())));
+    // 閉じる手順が最後まで進む: 次の読み取りで close の返事が出て、サーバーは読み残しを
+    // 読み捨ててから TCP を閉じる（FIN でストリームが終わる）。読み残しを抱えたまま
+    // 閉じると RST になり、ここが `ECONNRESET` のエラーになる（Windows ではその RST で
+    // 未読の close フレームごと捨てられていた、PR #759 の CI）。
+    let rest = tokio::time::timeout(RECV_BOUND, async {
+        loop {
+            match client.next().await {
+                Some(Ok(_)) => continue,
+                other => return other.map(|res| res.map(|_| ())),
+            }
+        }
+    })
+    .await
+    .expect("the stream ends within the bound");
+    assert!(rest.is_none(), "{rest:?}");
     let rows = wait_disconnected_rows(env, 1).await;
     assert_eq!(rows[0]["reason"], "backpressure");
 }
@@ -923,4 +940,189 @@ async fn the_link_stays_live_until_stale_timeout_after_disconnect() {
     assert_eq!(hub.snapshot(&key).link, ExternalLink::Live);
     clock.advance_ms(1);
     assert!(matches!(hub.snapshot(&key).link, ExternalLink::Down { .. }));
+}
+
+/// 監査の DB（別のファイルの SQLite）の `audit_log` の行: (action, entity_id)。id 順。
+async fn audit_actions(pool: &sqlx::SqlitePool) -> Vec<(String, Option<String>)> {
+    sqlx::query_as("SELECT action, entity_id FROM audit_log WHERE origin = 'ingest' ORDER BY id")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// 回帰（PR #759 のレビュー P2-2）: 監査の DB が止まっている（記録が終わらない）間も、
+/// 受信のループは `ack`・`pong`・置き換えの close・再検証の close を遅らせない。行は
+/// 落とさず、DB が戻ったら 1 本ごとに積んだ順（接続 → 未知のキー → 切断）で記録される。
+///
+/// 止まった監査の DB: 接続 1 本だけのプールの、その 1 本をテストが握る（記録は空きを
+/// 2 分待つ）。修正前は `values` の監査を待つ間ループが止まり、`ack` から先が
+/// `RECV_BOUND`（10 秒）に届かなかった。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stalled_audit_store_does_not_stall_the_socket() {
+    let env = test_env().await;
+    let (a, _) = push_connection(&env, "Bridge1").await;
+    let (b, _) = push_connection(&env, "Bridge2").await;
+    let (key_a_id, key_a) = ingest_key(&env, "a", a).await;
+    let (_, key_b) = ingest_key(&env, "b", b).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("audit.db");
+    crate::db::init_db(&path)
+        .await
+        .expect("init_db")
+        .close()
+        .await;
+    let audit_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(120))
+        .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+        .await
+        .unwrap();
+    let audit = AuditLogService::new(Db::Sqlite(audit_pool.clone()));
+    // `bh_` のキーは認証の層が API キーで照合するので、ログインの照合は使わない。
+    let auth = AuthState::new(
+        |_u: String,
+         _p: String|
+         -> futures_util::future::BoxFuture<'static, Option<banto_server::Identity>> {
+            Box::pin(async { None })
+        },
+        banto_server::SessionValidation::DisabledNoRevocation,
+    );
+    let router = crate::ingest::ws::ingest_ws_router(
+        env.manager.ingest_hub(),
+        env.manager.clock(),
+        auth,
+        env.api_keys.clone(),
+        audit,
+    )
+    .layer(axum::Extension(StreamRevalidationTiming {
+        interval: Duration::from_millis(100),
+        timeout: Duration::from_secs(1),
+    }));
+    let server = banto_server::start(
+        banto_server::ServerConfig {
+            bind: "127.0.0.1".to_string(),
+            port: 0,
+        },
+        router,
+    )
+    .await
+    .expect("server should start");
+    let ws = WsEnv { env, server };
+
+    let (mut client_a, _) = ws.open(a, &key_a).await;
+    let (mut client_b, _) = ws.open(b, &key_b).await;
+    // 接続の 2 行が記録されてから DB を止める。
+    let deadline = tokio::time::Instant::now() + RECV_BOUND;
+    while audit_actions(&audit_pool).await.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "接続の行が記録されない"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let held = audit_pool.acquire().await.unwrap();
+
+    // 未知のキー 100 個（監査の行 100 本、記録は DB の空きを待つ）。
+    let unknown: Vec<Value> = (0..100)
+        .map(|n| json!({ "key": format!("u{n}"), "v": 1 }))
+        .collect();
+    for client in [&mut client_a, &mut client_b] {
+        send_text(
+            client,
+            json!({ "op": "values", "seq": 1, "items": unknown }).to_string(),
+        )
+        .await;
+        let ack = recv_json(client).await;
+        assert_eq!(
+            (
+                ack["op"].as_str(),
+                ack["accepted"].as_u64(),
+                ack["rejected"].as_array().map(Vec::len)
+            ),
+            (Some("ack"), Some(0), Some(100)),
+            "{ack}"
+        );
+    }
+    // ping は止まらない。
+    assert_pong(&mut client_a, 2).await;
+    // 置き換えの close は止まらない（2 本目の `ingest_connected` も DB を待つ）。
+    let _second_b = ws
+        .try_connect(&b.to_string(), Some(&key_b), &[])
+        .await
+        .expect("ws handshake");
+    assert_eq!(
+        wait_close(&mut client_b).await,
+        (1008, "superseded".to_string())
+    );
+    // 再検証の close は止まらない。
+    ws.env.api_keys.revoke(key_a_id).await.unwrap();
+    assert_eq!(
+        wait_close(&mut client_a).await,
+        (1008, "api_key_revoked".to_string())
+    );
+    // ここまで DB は止まったまま（1 本目の未知のキーの行も記録されていない）。
+    let mut held = held;
+    let stalled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log WHERE origin = 'ingest'")
+        .fetch_one(&mut *held)
+        .await
+        .unwrap();
+    assert_eq!(stalled, 2);
+    drop(held);
+
+    // 落とさず、1 本ごとに積んだ順で記録される。
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let rows = loop {
+        let rows = audit_actions(&audit_pool).await;
+        let disconnected = rows
+            .iter()
+            .filter(|(action, _)| action == "ingest_disconnected")
+            .count();
+        if disconnected >= 2 && rows.len() >= 2 + 200 + 1 + 2 {
+            break rows;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "監査の行が揃わない: {} 行",
+            rows.len()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    for id in [a, b] {
+        let actions: Vec<&str> = rows
+            .iter()
+            .filter(|(_, entity)| entity.as_deref() == Some(id.to_string().as_str()))
+            .map(|(action, _)| action.as_str())
+            .collect();
+        let first_socket: Vec<&str> = if id == a {
+            actions.clone()
+        } else {
+            // b は 2 本目の `ingest_connected` が 1 本目の行と混ざりうるので除いて見る。
+            let mut seen_connected = false;
+            actions
+                .iter()
+                .copied()
+                .filter(|action| {
+                    if *action == "ingest_connected" {
+                        let keep = !seen_connected;
+                        seen_connected = true;
+                        keep
+                    } else {
+                        true
+                    }
+                })
+                .collect()
+        };
+        assert_eq!(first_socket.first(), Some(&"ingest_connected"), "{id}");
+        assert_eq!(first_socket.last(), Some(&"ingest_disconnected"), "{id}");
+        assert_eq!(
+            first_socket
+                .iter()
+                .filter(|action| **action == "ingest_unknown_key")
+                .count(),
+            100,
+            "{id}"
+        );
+        assert_eq!(first_socket.len(), 102, "{id}: {first_socket:?}");
+    }
 }
