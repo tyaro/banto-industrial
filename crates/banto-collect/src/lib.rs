@@ -93,10 +93,10 @@ mod task;
 
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{
-    build_config, build_config_from, build_config_lenient_from,
+    build_config, build_config_from, build_config_from_with, build_config_lenient_from,
     build_config_lenient_with_thresholds, check_tag_address, config_exclusions,
     connections_with_collected_groups, CollectorConfig, ConfigExclusion, ExclusionReason,
-    ExclusionUnit, HubCatalog, HubSource, Protocol, RegistrySnapshot, TagAddressField,
+    ExclusionUnit, HubCatalog, HubSource, Protocol, PushSource, RegistrySnapshot, TagAddressField,
     TagAddressIssue, Thresholds,
 };
 pub use current::{

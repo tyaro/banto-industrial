@@ -41,7 +41,7 @@ use banto_core::ListParams;
 use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
-    Tag, TagService,
+    Tag, TagService, PUSH_PROTOCOL,
 };
 use banto_tstore::{GroupConfig, StoreConfig, TagColumn};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -392,13 +392,15 @@ impl CollectorConfig {
                         cfg.port = port;
                     }
                 }
-                // Never broker-routed (banto-hub has no hub connections).
+                // Never broker-routed (external plans - hub or push - have
+                // no endpoint to rewrite).
                 ProtocolConfig::External => {}
             }
         }
     }
 
-    /// #383 段階3 P3: does this config collect any external (`"hub"`)
+    /// #383 段階3 P3: does this config collect any external (`"hub"` or,
+    /// R2a-1b, `"push"`)
     /// connection? [`crate::Collector::start_with_sources`] refuses such a
     /// config without an [`crate::external::ExternalSource`]. For a config
     /// from the lenient build this means "at least one hub tag is
@@ -596,7 +598,24 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 /// change by a character (the goldens in this module's tests were run
 /// against the pre-段階2 implementation first).
 pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
-    let (config, exclusions) = build_config_lenient_from(snapshot);
+    build_config_from_with(snapshot, PushSource::Unavailable)
+}
+
+/// [`build_config_from`] for a runtime that can (or cannot) collect `"push"`
+/// connections (docs/banto-hub-ingest-design.md §4.1, R2a-1b). Identical to
+/// the strict build in every other respect; [`PushSource::Unavailable`] is
+/// exactly [`build_config_from`]. banto-hub switches to
+/// [`PushSource::Available`] in R2a-1c.
+pub fn build_config_from_with(
+    snapshot: &RegistrySnapshot,
+    push: PushSource,
+) -> Result<CollectorConfig, CollectError> {
+    let (config, exclusions) = build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::None,
+        HubSource::Unavailable,
+        push,
+    );
     match exclusions.iter().find_map(ConfigExclusion::strict_error) {
         Some(err) => Err(err),
         None => Ok(config),
@@ -648,6 +667,13 @@ pub enum ExclusionReason {
     /// `hubSourceNotYetCollected`; P3 added the sampler, so the reason is now
     /// about the runtime, not the crate.)
     HubSourceUnavailable,
+    /// R2a-1b (docs/banto-hub-ingest-design.md §4.1): a `"push"` connection
+    /// (`banto_tags::PUSH_PROTOCOL`) in a runtime that cannot receive pushed
+    /// values ([`PushSource::Unavailable`]: ChronoGazer, and every build that
+    /// is not banto-hub's ingest-enabled one). Cascades like
+    /// [`Self::HubSourceUnavailable`]: the connection is left out with its
+    /// groups and tags, the rest keeps running.
+    PushSourceUnavailable,
     /// #383 段階3 P3: a `"hub"` connection while no Hub connection is set up
     /// ([`HubSource::NotConfigured`]). Cascades like the one above.
     HubNotConfigured,
@@ -688,6 +714,7 @@ impl ExclusionReason {
         match self {
             ExclusionReason::UnsupportedProtocol { .. } => "unsupportedProtocol",
             ExclusionReason::HubSourceUnavailable => "hubSourceUnavailable",
+            ExclusionReason::PushSourceUnavailable => "pushSourceUnavailable",
             ExclusionReason::HubNotConfigured => "hubNotConfigured",
             ExclusionReason::HubTagNotFound { .. } => "hubTagNotFound",
             ExclusionReason::HubTagTypeChanged { .. } => "hubTagTypeChanged",
@@ -715,6 +742,9 @@ impl ExclusionReason {
             }
             ExclusionReason::HubSourceUnavailable => {
                 "この実行形態では Hub 経由の接続から収集できません".to_string()
+            }
+            ExclusionReason::PushSourceUnavailable => {
+                "この実行形態では push 接続から収集できません".to_string()
             }
             ExclusionReason::HubNotConfigured => {
                 "Hub への接続が設定されていないため収集しません（Hub に接続してから収集を再起動してください）"
@@ -813,6 +843,9 @@ impl ConfigExclusion {
             ExclusionReason::HubSourceUnavailable => format!(
                 "接続 {name} は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
             ),
+            ExclusionReason::PushSourceUnavailable => format!(
+                "接続 {name} は push 接続です。この実行形態では push 接続から収集できません"
+            ),
             ExclusionReason::HubNotConfigured => format!(
                 "接続 {name} は Hub 経由の接続ですが、Hub への接続が設定されていません"
             ),
@@ -893,7 +926,12 @@ impl ConfigExclusion {
 pub fn build_config_lenient_from(
     snapshot: &RegistrySnapshot,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
-    build_config_lenient_inner(snapshot, ThresholdSource::None, HubSource::Unavailable)
+    build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::None,
+        HubSource::Unavailable,
+        PushSource::Unavailable,
+    )
 }
 
 /// [`build_config_lenient_from`] with the tags' H/HH/L/LL limits **supplied
@@ -918,7 +956,26 @@ pub fn build_config_lenient_with_thresholds(
     thresholds: &HashMap<i64, Thresholds>,
     hub: HubSource<'_>,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
-    build_config_lenient_inner(snapshot, ThresholdSource::Supplied(thresholds), hub)
+    build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::Supplied(thresholds),
+        hub,
+        PushSource::Unavailable,
+    )
+}
+
+/// R2a-1b (docs/banto-hub-ingest-design.md §4.1): whether the calling runtime
+/// can collect `"push"` connections (values pushed into banto-hub by an
+/// external sender, read through an [`crate::external::ExternalSource`]).
+///
+/// | value | a `"push"` connection is |
+/// | --- | --- |
+/// | [`Self::Unavailable`] | excluded ([`ExclusionReason::PushSourceUnavailable`]) with its groups and tags - ChronoGazer, and every existing entry point |
+/// | [`Self::Available`] | collected as [`ProtocolConfig::External`] (key = trimmed address, no scaling), like a `"hub"` connection; a group without a collectable tag is not planned |
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushSource {
+    Unavailable,
+    Available,
 }
 
 /// How one enabled connection is collected, once its row is understood.
@@ -927,12 +984,17 @@ enum ResolvedConnection<'a> {
     Plc(Protocol, ProtocolConfig),
     /// Sampled from an [`crate::external::ExternalSource`] (#383 段階3 P3).
     Hub { catalog: Option<&'a HubCatalog> },
+    /// Received from pushed values (R2a-1b): same [`ProtocolConfig::External`]
+    /// plan as `Hub`, but the key is the sender's own name and nothing is
+    /// reconciled against a catalog.
+    Push,
 }
 
 fn build_config_lenient_inner(
     snapshot: &RegistrySnapshot,
     threshold_source: ThresholdSource<'_>,
     hub: HubSource<'_>,
+    push: PushSource,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
@@ -1012,7 +1074,7 @@ fn build_config_lenient_inner(
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
 
-        let resolved = match resolve_connection(conn, hub) {
+        let resolved = match resolve_connection(conn, hub, push) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 // The connection first (it is what needs fixing), then
@@ -1093,6 +1155,19 @@ fn build_config_lenient_inner(
                             continue;
                         }
                     },
+                    ResolvedConnection::Push => match push_external_key(tag) {
+                        Ok(key) => {
+                            external_names.push(key);
+                            // The sender delivers engineering values; the
+                            // registry only accepts an identity scaling for a
+                            // push tag (§3.3), and none is applied here.
+                            None
+                        }
+                        Err(reason) => {
+                            exclusions.push(ConfigExclusion::tag(tag, reason));
+                            continue;
+                        }
+                    },
                     ResolvedConnection::Hub { catalog } => match hub_external_name(tag, *catalog) {
                         Ok(name) => {
                             external_names.push(name);
@@ -1158,7 +1233,11 @@ fn build_config_lenient_inner(
             // deciding "do I still need the Hub subscription for this run"
             // (ChronoGazer's demand) cannot be told "yes" for a connection
             // that records nothing.
-            if matches!(resolved, ResolvedConnection::Hub { .. }) && tag_plans.is_empty() {
+            if matches!(
+                resolved,
+                ResolvedConnection::Hub { .. } | ResolvedConnection::Push
+            ) && tag_plans.is_empty()
+            {
                 continue;
             }
 
@@ -1192,7 +1271,9 @@ fn build_config_lenient_inner(
             // Connection-level simulation does not apply to a Hub connection
             // (banto-tags stores it as `false`; the Hub labels its own
             // simulated values, `crate::external`).
-            ResolvedConnection::Hub { .. } => (ProtocolConfig::External, false),
+            ResolvedConnection::Hub { .. } | ResolvedConnection::Push => {
+                (ProtocolConfig::External, false)
+            }
         };
         connection_plans.push(ConnectionPlan {
             key: connection_key(conn.id),
@@ -1229,6 +1310,7 @@ pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
         snapshot,
         ThresholdSource::None,
         HubSource::Available { catalog: None },
+        PushSource::Unavailable,
     )
     .1
 }
@@ -1239,7 +1321,14 @@ pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
 fn resolve_connection<'a>(
     conn: &PlcConnection,
     hub: HubSource<'a>,
+    push: PushSource,
 ) -> Result<ResolvedConnection<'a>, ExclusionReason> {
+    if conn.protocol == PUSH_PROTOCOL {
+        return match push {
+            PushSource::Unavailable => Err(ExclusionReason::PushSourceUnavailable),
+            PushSource::Available => Ok(ResolvedConnection::Push),
+        };
+    }
     if conn.is_hub_source() {
         return match hub {
             HubSource::Unavailable => Err(ExclusionReason::HubSourceUnavailable),
@@ -1288,6 +1377,21 @@ fn hub_external_name(tag: &Tag, catalog: Option<&HubCatalog>) -> Result<String, 
         }
     }
     Ok(name)
+}
+
+/// R2a-1b: a push tag's external key - the trimmed `address` (the registry
+/// already validated the shape on save, §3.3), provided its data type is one
+/// the store knows. `string` tags never get here (skipped before the
+/// per-protocol match, like every other protocol).
+fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
+    if DataType::parse(&tag.data_type).is_none() {
+        return Err(ExclusionReason::InvalidTag {
+            address: tag.address.clone(),
+            data_type: tag.data_type.clone(),
+            issue: TagAddressIssue::UnknownDataType,
+        });
+    }
+    Ok(tag.address.trim().to_string())
 }
 
 fn parse_protocol(protocol: &str) -> Result<Protocol, ExclusionReason> {
@@ -3457,5 +3561,251 @@ mod tests {
             exclusions[0].reason.message(),
             "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）"
         );
+    }
+
+    // ---- R2a-1b: "push" connections (hand-built snapshots) ----------------
+    // `ALLOWED_PROTOCOLS` / the SQL CHECK do not accept "push" until R2a-2a,
+    // so these cannot go through the services.
+
+    fn push_conn(id: i64, name: &str) -> PlcConnection {
+        PlcConnection {
+            id,
+            name: name.to_string(),
+            protocol: PUSH_PROTOCOL.to_string(),
+            host: String::new(),
+            port: 0,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "high-low".to_string(),
+            cpu_type: "R".to_string(),
+            database: None,
+            username: None,
+            password: None,
+        }
+    }
+
+    fn group_of(id: i64, conn: i64, period_ms: i64) -> CollectionGroup {
+        CollectionGroup {
+            id,
+            name: format!("g{id}"),
+            plc_connection_id: conn,
+            period_ms,
+            enabled: true,
+            default_writable: false,
+            query_sql: None,
+        }
+    }
+
+    fn tag_of(id: i64, group: i64, address: &str, data_type: &str) -> Tag {
+        Tag {
+            id,
+            name: format!("t{id}"),
+            collection_group_id: group,
+            address: address.to_string(),
+            data_type: data_type.to_string(),
+            string_length: None,
+            string_encoding: "utf-8".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            revision: 1,
+        }
+    }
+
+    fn push_snapshot() -> RegistrySnapshot {
+        RegistrySnapshot {
+            connections: vec![push_conn(7, "mes")],
+            groups: vec![group_of(70, 7, 1000)],
+            tags: vec![
+                tag_of(701, 70, "  line1/temp \t", "f32"),
+                tag_of(702, 70, "Line1/Temp", "bit"),
+                tag_of(703, 70, "label", "string"),
+                tag_of(704, 70, "count", "u64"),
+            ],
+        }
+    }
+
+    #[test]
+    fn push_available_plans_an_external_connection_with_trimmed_keys() {
+        let snapshot = push_snapshot();
+        let config = build_config_from_with(&snapshot, PushSource::Available).unwrap();
+        assert_eq!(config.connections.len(), 1);
+        let conn = &config.connections[0];
+        assert_eq!(conn.key, "conn:7");
+        assert_eq!(conn.config, ProtocolConfig::External);
+        assert!(!conn.simulation);
+        assert!(config.has_external_connections());
+        let group = &conn.groups[0];
+        assert!(group.requests.is_empty());
+        // Trimmed, case preserved, string tag (703) skipped, in tag-id order.
+        assert_eq!(
+            group.external_names,
+            vec!["line1/temp", "Line1/Temp", "count"]
+        );
+        assert_eq!(
+            config.external_names(),
+            vec!["Line1/Temp", "count", "line1/temp"]
+        );
+        let plan_keys: Vec<&str> = group.tags.iter().map(|t| t.key.as_str()).collect();
+        assert_eq!(plan_keys, vec!["tag:701", "tag:702", "tag:704"]);
+        assert!(group.tags.iter().all(|t| t.scaling.is_none()));
+        assert_eq!(config.store_config.groups.len(), 1);
+        assert_eq!(config.store_config.groups[0].tags.len(), 3);
+    }
+
+    #[test]
+    fn push_scaling_on_the_row_is_never_applied() {
+        let mut snapshot = push_snapshot();
+        snapshot.tags[0].raw_lo = Some(0.0);
+        snapshot.tags[0].raw_hi = Some(100.0);
+        snapshot.tags[0].eng_lo = Some(0.0);
+        snapshot.tags[0].eng_hi = Some(1000.0);
+        let config = build_config_from_with(&snapshot, PushSource::Available).unwrap();
+        assert!(config.connections[0].groups[0].tags[0].scaling.is_none());
+    }
+
+    #[test]
+    fn push_unparseable_data_type_is_an_invalid_tag_and_the_rest_collects() {
+        let mut snapshot = push_snapshot();
+        snapshot.tags.push(tag_of(705, 70, "weird", "complex128"));
+        let (config, exclusions) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+        );
+        let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
+            .iter()
+            .map(|e| (e.unit, e.id, e.reason.code()))
+            .collect();
+        assert_eq!(listed, vec![(ExclusionUnit::Tag, 705, "unknownDataType")]);
+        assert_eq!(config.connections[0].groups[0].external_names.len(), 3);
+        // The strict build fails with the tag's wording.
+        let err = build_config_from_with(&snapshot, PushSource::Available).unwrap_err();
+        assert!(err.to_string().contains("complex128"), "{err}");
+    }
+
+    #[test]
+    fn push_group_without_a_collectable_tag_is_not_planned() {
+        for tags in [
+            vec![],
+            vec![tag_of(1, 70, "only-string", "string")],
+            vec![tag_of(1, 70, "bad", "complex128")],
+        ] {
+            let snapshot = RegistrySnapshot {
+                connections: vec![push_conn(7, "mes")],
+                groups: vec![group_of(70, 7, 1000)],
+                tags,
+            };
+            let (config, _) = build_config_lenient_inner(
+                &snapshot,
+                ThresholdSource::None,
+                HubSource::Unavailable,
+                PushSource::Available,
+            );
+            assert!(config.connections.is_empty());
+            assert!(config.store_config.groups.is_empty());
+            assert!(!config.has_external_connections());
+        }
+    }
+
+    #[test]
+    fn push_unavailable_excludes_the_connection_with_cascades() {
+        let snapshot = push_snapshot();
+        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        assert!(config.connections.is_empty());
+        assert!(config.store_config.groups.is_empty());
+        let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
+            .iter()
+            .map(|e| (e.unit, e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            listed,
+            vec![
+                (ExclusionUnit::Connection, 7, "pushSourceUnavailable"),
+                (ExclusionUnit::Group, 70, "connectionExcluded"),
+                (ExclusionUnit::Tag, 701, "connectionExcluded"),
+                (ExclusionUnit::Tag, 702, "connectionExcluded"),
+                (ExclusionUnit::Tag, 704, "connectionExcluded"),
+            ]
+        );
+        assert_eq!(
+            exclusions[0].reason.message(),
+            "この実行形態では push 接続から収集できません"
+        );
+        // Strict wording, and `build_config_from` == `..._with(Unavailable)`.
+        let expected = "接続 mes は push 接続です。この実行形態では push 接続から収集できません";
+        for err in [
+            build_config_from(&snapshot).unwrap_err(),
+            build_config_from_with(&snapshot, PushSource::Unavailable).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, CollectError::Config(m) if m == expected),
+                "{err}"
+            );
+        }
+    }
+
+    /// The regression R2a-1b must prevent: ChronoGazer's entry points (the
+    /// lenient builders and the registry-editor marks) never plan a `push`
+    /// connection, so its Hub-demand (`external_names`) cannot pick up a
+    /// push key.
+    #[test]
+    fn existing_entry_points_never_plan_a_push_connection() {
+        let mut snapshot = push_snapshot();
+        // A hub-less PLC next to it, to show the rest still runs.
+        snapshot.connections.push(PlcConnection {
+            protocol: "modbus-tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 502,
+            ..push_conn(8, "plc")
+        });
+        snapshot.groups.push(group_of(80, 8, 1000));
+        snapshot.tags.push(tag_of(801, 80, "40001", "u16"));
+
+        let mut configs = vec![
+            build_config_lenient_from(&snapshot).0,
+            build_config_lenient_with_thresholds(
+                &snapshot,
+                &HashMap::new(),
+                HubSource::Unavailable,
+            )
+            .0,
+            build_config_lenient_with_thresholds(
+                &snapshot,
+                &HashMap::new(),
+                HubSource::Available { catalog: None },
+            )
+            .0,
+            build_config_lenient_with_thresholds(
+                &snapshot,
+                &HashMap::new(),
+                HubSource::NotConfigured,
+            )
+            .0,
+        ];
+        configs.push(build_config_from_with(&snapshot, PushSource::Available).unwrap());
+        let (last, rest) = configs.split_last().unwrap();
+        for config in rest {
+            let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+            assert_eq!(keys, vec!["conn:8"]);
+            assert!(!config.has_external_connections());
+            assert!(config.external_names().is_empty());
+        }
+        // ... whereas the explicit opt-in does (so the assertions above bite).
+        assert!(last.has_external_connections());
+        // The editor marks flag the push connection too (never silently drop).
+        assert!(config_exclusions(&snapshot)
+            .iter()
+            .any(|e| e.reason.code() == "pushSourceUnavailable"));
     }
 }
