@@ -1,7 +1,7 @@
 # banto-hub MCP リファレンス（MES / ゲートウェイ実装者向け）
 
 作成日: 2026-09-05
-状態: **現行**。2026-10-19: §2 の「グループ名は全体で一意」を「接続内で一意」に直した（banto-tags migration 0022、オーナー決定。`create_group`/`update_group` の重複は `name` の項目エラー「この接続内では既に使用されています」）。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
+状態: **現行**。2026-10-21（R2a-2b、[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5）: §2 にスコープ `ingest:#{接続 id}`（`push` 接続へ値を送る。read / write / admin と直交）を足し、`create_api_key` で発行でき、`list_api_keys` の各行に `ingestTargets`（今の接続名・削除済み）を足した（§6）。送信口は R2a-2c / R2a-2d で、まだ無い。2026-10-19: §2 の「グループ名は全体で一意」を「接続内で一意」に直した（banto-tags migration 0022、オーナー決定。`create_group`/`update_group` の重複は `name` の項目エラー「この接続内では既に使用されています」）。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-10-09 に #533 で `create_tag` / `update_tag` からしきい値（`thresholdH`〜`thresholdLl`）を外した（§6。値付きで送ると入力エラー、`update_tag` の必須項目からも外した）。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で 37 ツール、2026-09-15 の `check_expression`（#342 段階A）で **38 ツール**となる。構成補助（管理面）ツールは §6。
@@ -43,12 +43,24 @@ API キーは発行時に**スコープの明示列挙**を持つ（`banto_hub_c
 | `read:{connection}.{group}.{tag}`  | 単一タグの読み取り（完全一致）                             |
 | `read:{connection}.{group}.*`      | グループ単位の読み取り                                     |
 | `write:{connection}.{group}.{tag}` | 単一タグの書き込み（**ワイルドカード不可・明示列挙のみ**） |
+| `admin`                            | 構成補助ツール（§6）。タグの値は読み書きできない           |
+| `ingest:#{id}`                     | `push` 接続 `{id}` へ値を送る（取り込み、R2a-2b）          |
 
 - 外部名は常に `{connection}.{group}.{tag}` の3セグメント。接続名は全体で一意、**グループ名は接続内で一意**
   （2026-10-19 オーナー決定。別の接続には同じ名前のグループを置ける）、タグ名はグループ内で一意なので、
   外部名は全体で一意。
 - write スコープにワイルドカードは使えない（レシピで複数タグへ書くなら、その全タグを
   個別に列挙する）。
+- `ingest:#{id}`（2026-10-21 オーナー決定、[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5）は
+  接続の**名前ではなく id**（`list_connections` の `id`）で指す。`{id}` は 10 進の正規形だけ
+  （`[1-9][0-9]*`・`i64` の範囲。`ingest:#012`・`ingest:#0`・`ingest:#-1`・`ingest:#*`・
+  `ingest:Bridge1`（名前）は発行で断る）。接続を改名してもキーは使え、削除した接続の id は
+  再利用されない。発行時に接続の存在は確かめない。
+- `ingest` は read / write / admin と**直交**: `ingest:` だけのキーはタグの値を読めず
+  （`list_tags`・`read_tag_values`・`read_tag_now`・`get_server_status` は read スコープ不足）、
+  書けず、構成補助ツールも使えない。逆に `read`・`write:`・`admin` のキーでは送れない
+  （`admin` も `ingest:` を含まない）。値を送る口（`/api/v1/ingest/{id}/…`）は R2a-2c / R2a-2d で
+  入り、MCP からは送れない。
 
 ## 3. ロックダウンと書き込み受付（安全ゲート）
 
@@ -240,9 +252,15 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 | `check_expression`                                                                                                                 | 演算タグ            | 式を**保存せずに検証だけ**する（#342 段階A、2026-09-15）。入力は `{ expression, externalName? }`。応答は結果型・参照タグ一覧（型/単位/種別）・現在値での試算値・エラー（`kind` と文字オフセット `pos`。`source_too_long` のみ `pos` なし）。`externalName` を渡すと「その名前で保存したら循環するか」も判定する（`kind: "cycle"`）。REST の `POST /api/tags/expression/check` と同じ関数を共有する                                  |
 | `set_collection` / `set_write_control`                                                                                             | 運転制御            | start は `RunMode::Configured`。write_enabled は既定で有効・収集の開始/停止では変わらない（2026-09-09 オーナー決定 #340）。無効なら `set_write_control {enabled:true}`                                                                                                                                                                                                                                                              |
 | `get_grpc_settings` / `set_grpc_settings` / `get_mqtt_settings` / `set_mqtt_settings` / `get_retention` / `set_retention`          | 設定                | set は REST と同じ validation＋即時 apply（retention は永続のみ）。MQTT パスワード等は応答でマスク                                                                                                                                                                                                                                                                                                                                  |
-| `create_api_key` / `list_api_keys` / `revoke_api_key`                                                                              | API キー            | create は**任意スコープ発行可**（admin 含む＝オーナー決定）。応答の平文 `key` は発行時のみ。revoke は confirm。list は平文/hash を含まない                                                                                                                                                                                                                                                                                          |
+| `create_api_key` / `list_api_keys` / `revoke_api_key`                                                                              | API キー            | create は**任意スコープ発行可**（admin 含む＝オーナー決定）。応答の平文 `key` は発行時のみ。revoke は confirm。list は平文/hash を含まない。list の各行に `ingestTargets`（表の下）                                                                                                                                                                                                                                                 |
 | `lock_down`                                                                                                                        | 運用                | **不可逆**・confirm 必須。以降 write 系データツールはアドバイザリのみ（構成ツールは admin で継続可）                                                                                                                                                                                                                                                                                                                                |
 | `list_sink_groups` / `get_sink_group` / `create_sink_group` / `update_sink_group` / `delete_sink_group`                            | Sink / 外部 DB 連携 | delete は confirm。即時適用（pending queue に載らない）。`dbConnectionId` は `postgres` 接続のみ。`mode` = `interval` \| `on_change`。`intervalMs` は 100〜3600000。`tableName` は `schema.table` 形式で修飾可。`storeBad` で Bad/Stale 行も保存。`tagIds` は非空配列。update は全項目必須（PUT 置換）。詳細は [banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2（2026-09-06 S4）                             |
+
+`list_api_keys` の `ingestTargets`（R2a-2b）: 各キーの `ingest:#{id}` ごとに
+`{scope, connectionId, connectionName, state, label}`。`scopes` の文字列は変えない。`state` は
+`present`（今の名前。「取り込み: Bridge1（#12）」）・`deleted`（接続が無い。「取り込み: （削除済み #12）」で、
+そのキーは二度と送れない）・`notPush`（接続が `push` でない）・`unknown`（接続の一覧を読めなかった。
+削除済みとは言わない）。`ingest:` を持たないキーは空の配列。
 
 **セキュリティ姿勢（設計 §3・§8）**: `admin` スコープのキー1本が構成全権（任意 host への
 接続作成・別 admin キー発行・設定変更・lock_down）を持つ。ガードは **admin スコープ・

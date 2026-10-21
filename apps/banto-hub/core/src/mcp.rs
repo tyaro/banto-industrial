@@ -67,6 +67,7 @@
 //! `initialize`/`tools/list`/`ping` には無く、`tools/call` の各ツール実装が
 //! 個別に行う。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::Bytes;
@@ -82,7 +83,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use banto_core::{BantoError, FieldError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService, TagUpdateError};
 
-use crate::api_keys::{api_key_verdict, ApiKeyContext, ApiKeysService};
+use crate::api_keys::{api_key_verdict, parse_ingest_scope, ApiKeyContext, ApiKeysService};
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::commissioning::{CommissioningService, CommissioningState};
 use crate::controller::{CollectionController, RunMode};
@@ -1140,7 +1141,7 @@ fn tool_definitions() -> Vec<Value> {
                     "scopes": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "少なくとも1つ必須。例: [\"read\", \"write:line1.fast.temp01\", \"admin\"]。",
+                        "description": "少なくとも1つ必須。例: [\"read\", \"write:line1.fast.temp01\", \"admin\"]。push 接続へ値を送る取り込みのキーは \"ingest:#{接続 id}\"(例 \"ingest:#12\"。id は list_connections の id、接続名では指定できない。read/write/admin とは直交で、admin も送れない)。",
                     },
                     "expiresAt": {
                         "type": "integer",
@@ -1153,7 +1154,7 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "list_api_keys",
-            "description": "発行済み API キーの一覧を返す(admin スコープ必須)。平文 key・key_hash は含まれない。",
+            "description": "発行済み API キーの一覧を返す(admin スコープ必須)。平文 key・key_hash は含まれない。各キーの ingestTargets に、ingest:#{id} のスコープが指す接続の今の名前(改名に追従)を出す。接続が無ければ state=deleted・label「取り込み: （削除済み #12）」(そのキーは送れない)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -3763,14 +3764,103 @@ async fn tool_create_api_key(
 /// 既に`key_hash`/平文キーを含まない（読み取り専用のため監査しない、
 /// [`require_admin_scope`]のdoc comment「ゲート拒否は監査しない」と同じ
 /// 「読み取り専用ルートは監査しない」規律）。
+///
+/// R2a-2b（docs/banto-hub-ingest-design.md §5「キーの一覧」）: REST の一覧と
+/// 同じ各行に `ingestTargets`（[`ingest_targets`]）を足す。`scopes` の文字列は
+/// そのまま返す（変えない）。`ingest:` のスコープを持つキーがあるときだけ
+/// 接続の一覧を 1 回読み、読めなければキーの一覧は返したまま各行を
+/// `state: "unknown"` にする（「削除済み」と取り違えない）。
 async fn tool_list_api_keys(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
         return err;
     }
-    match state.api_keys.list().await {
-        Ok(keys) => tool_ok(json!({ "apiKeys": keys })),
-        Err(err) => tool_error(format!("API キー一覧の取得に失敗しました: {err}")),
-    }
+    let keys = match state.api_keys.list().await {
+        Ok(keys) => keys,
+        Err(err) => return tool_error(format!("API キー一覧の取得に失敗しました: {err}")),
+    };
+    let needs_connections = keys
+        .iter()
+        .any(|key| key.scopes.iter().any(|s| parse_ingest_scope(s).is_some()));
+    let connections: Option<HashMap<i64, (String, String)>> = if needs_connections {
+        state
+            .plc_connections
+            .list(ListParams::default())
+            .await
+            .ok()
+            .map(|result| {
+                result
+                    .rows
+                    .into_iter()
+                    .map(|c| (c.id, (c.name, c.protocol)))
+                    .collect()
+            })
+    } else {
+        Some(HashMap::new())
+    };
+    let rows: Vec<Value> = keys
+        .into_iter()
+        .map(|key| {
+            let targets = ingest_targets(&key.scopes, connections.as_ref());
+            let mut row = json!(key);
+            if let Value::Object(map) = &mut row {
+                map.insert("ingestTargets".to_string(), Value::Array(targets));
+            }
+            row
+        })
+        .collect();
+    tool_ok(json!({ "apiKeys": rows }))
+}
+
+/// R2a-2b: キーの `ingest:#{id}` のスコープを、接続の一覧（id → (名前,
+/// プロトコル)）から引いた表示に直す（docs/banto-hub-ingest-design.md §5
+/// 「キーの一覧」）。画面の `apiKeyScopes.ts` の `describeApiKeyScope` と同じ
+/// 文言・同じ場合分け:
+///
+/// - `present`: 「取り込み: Bridge1（#12）」（今の名前。改名に追従する）。
+/// - `notPush`: 接続はあるがプロトコルが `push` でない。そのキーは送れない。
+/// - `deleted`: 接続が無い。「取り込み: （削除済み #12）」。id は再利用されない
+///   （設計 §5.1）ので、そのキーは二度と送れない（fail-closed）。
+/// - `unknown`: 接続の一覧を読めなかった（`connections` が `None`）。削除済みと
+///   は言わない。
+///
+/// `ingest:` 以外のスコープは含めない（空の配列もありうる）。
+fn ingest_targets(
+    scopes: &[String],
+    connections: Option<&HashMap<i64, (String, String)>>,
+) -> Vec<Value> {
+    scopes
+        .iter()
+        .filter_map(|scope| parse_ingest_scope(scope).map(|id| (scope, id)))
+        .map(|(scope, id)| {
+            let (state, name, label) = match connections {
+                None => (
+                    "unknown",
+                    None,
+                    format!("取り込み: #{id}（接続の一覧を読めませんでした）"),
+                ),
+                Some(map) => match map.get(&id) {
+                    None => ("deleted", None, format!("取り込み: （削除済み #{id}）")),
+                    Some((name, protocol)) if protocol == banto_tags::PUSH_PROTOCOL => (
+                        "present",
+                        Some(name.clone()),
+                        format!("取り込み: {name}（#{id}）"),
+                    ),
+                    Some((name, _)) => (
+                        "notPush",
+                        Some(name.clone()),
+                        format!("取り込み: {name}（#{id}、push 接続ではありません）"),
+                    ),
+                },
+            };
+            json!({
+                "scope": scope,
+                "connectionId": id,
+                "connectionName": name,
+                "state": state,
+                "label": label,
+            })
+        })
+        .collect()
 }
 
 // --- 30. revoke_api_key -------------------------------------------------------
@@ -4037,5 +4127,63 @@ async fn tool_delete_sink_group(
             Ok(tool_ok(json!({ "deleted": true })))
         }
         Err(err) => Ok(banto_error_tool_error(&err)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scopes(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn connections() -> HashMap<i64, (String, String)> {
+        HashMap::from([
+            (12, ("Bridge1".to_string(), "push".to_string())),
+            (3, ("line1".to_string(), "slmp".to_string())),
+        ])
+    }
+
+    /// R2a-2b: `ingest:#{id}` の一覧の表示（今の名前・削除済み・push でない・
+    /// 一覧を読めなかった）。他のスコープは出さない。
+    #[test]
+    fn ingest_targets_resolve_names_and_mark_deleted_connections() {
+        let map = connections();
+        let targets = ingest_targets(
+            &scopes(&["read", "ingest:#12", "ingest:#99", "ingest:#3", "admin"]),
+            Some(&map),
+        );
+        assert_eq!(
+            targets,
+            vec![
+                json!({ "scope": "ingest:#12", "connectionId": 12, "connectionName": "Bridge1",
+                        "state": "present", "label": "取り込み: Bridge1（#12）" }),
+                json!({ "scope": "ingest:#99", "connectionId": 99, "connectionName": null,
+                        "state": "deleted", "label": "取り込み: （削除済み #99）" }),
+                json!({ "scope": "ingest:#3", "connectionId": 3, "connectionName": "line1",
+                        "state": "notPush",
+                        "label": "取り込み: line1（#3、push 接続ではありません）" }),
+            ]
+        );
+    }
+
+    #[test]
+    fn ingest_targets_do_not_claim_deleted_when_connections_could_not_be_read() {
+        let targets = ingest_targets(&scopes(&["ingest:#12"]), None);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0]["state"], "unknown");
+        assert_eq!(targets[0]["connectionName"], Value::Null);
+        assert_eq!(
+            targets[0]["label"],
+            "取り込み: #12（接続の一覧を読めませんでした）"
+        );
+    }
+
+    #[test]
+    fn ingest_targets_are_empty_for_keys_without_ingest_scopes() {
+        let map = connections();
+        assert!(ingest_targets(&scopes(&["read", "write:a.b.c", "admin"]), Some(&map)).is_empty());
+        assert!(ingest_targets(&[], None).is_empty());
     }
 }

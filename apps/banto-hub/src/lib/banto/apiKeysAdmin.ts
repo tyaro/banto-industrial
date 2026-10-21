@@ -22,6 +22,12 @@
  * しない。実体は `./apiKeyWarnings` に切り出してある（このファイルは
  * `@banto/admin-core` を import するため vitest の最小構成では単体
  * テストできない - 同ファイルの doc comment参照）。
+ *
+ * R2a-2b（docs/banto-hub-ingest-design.md §5）: スコープ `ingest:#{接続 id}`
+ * の組み立て・一覧の表示（今の接続名、無ければ「（削除済み #12）」）は
+ * `./apiKeyScopes`（純関数、同じ理由で切り出し）に置き、ここから re-export
+ * する。`GET /api/api-keys` はスコープの文字列をそのまま返す（名前の解決は
+ * 画面の側）。
  */
 import { getAuthProvider, ProviderError, type ErrorBody } from '@banto/admin-core';
 import { CSRF_HEADER } from './setup';
@@ -33,6 +39,17 @@ export {
 	type ApiKeyWarnings,
 	type ApiKeyExpiryInfo
 } from './apiKeyWarnings';
+
+export {
+	describeApiKeyScope,
+	ingestScope,
+	parseIngestScope,
+	pushConnectionOptions,
+	reconcileIngestSelection,
+	INGEST_SCOPE_PREFIX,
+	PUSH_PROTOCOL,
+	type ScopeConnection
+} from './apiKeyScopes';
 
 /** Mirrors `banto_hub_core::api_keys::ApiKeySummary`（wire は camelCase）。 */
 export interface ApiKeySummary {

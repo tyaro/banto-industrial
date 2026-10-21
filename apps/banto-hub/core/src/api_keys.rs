@@ -52,7 +52,8 @@
 //! ## スコープ構文検証（設計 §5.6・T0-2 スコープ外の明示、H10 ③・T21 で拡張）
 //!
 //! `read`・`read:{connection}.{group}.{tag}`・`read:{connection}.{group}.*`・
-//! `write:{connection}.{group}.{tag}`・`admin` のみを許可する。write
+//! `write:{connection}.{group}.{tag}`・`admin`・`ingest:#{id}`（R2a-2b、下の
+//! 「取り込み」）のみを許可する。write
 //! スコープはワイルドカード不可・3セグメントちょうど・各セグメント非空を
 //! 発行時に検証するが、**実際の書き込み検査（T2）はここでは行わない**
 //! （書き込み API 自体が T0-2 の時点でまだ存在しない）。
@@ -64,6 +65,31 @@
 //! （[`ApiKeyContext::has_admin_scope`] 参照）。T21 S1-b で MCP 構成補助
 //! ツール（接続 CRUD: create/delete/list_connections）が既に `admin` を
 //! 要求する形で配線済み。以降のスライスでグループ/タグ/設定へ拡張予定。
+//!
+//! ### 取り込み `ingest:#{id}`（R2a-2b、docs/banto-hub-ingest-design.md §5・
+//! §12 Q9、2026-10-21 オーナー決定）
+//!
+//! `ingest:#{id}` は `push` 接続（`plc_connections.id` = `{id}`）へ値を送る
+//! 権限。`{id}` は 10 進の正規形だけを受ける（`[1-9][0-9]*`・`i64` の範囲。
+//! 先頭の 0・符号・空白・`*` は断る - [`parse_ingest_scope`]）。正規形に限る
+//! ので、判定（[`ApiKeyContext::can_ingest`]）は文字列の完全一致で済む。
+//! 発行時は構文だけを確かめ、接続の存在は確かめない（read / write と同じ）。
+//!
+//! - **名前ではなく id で縛る**（Q9 = (b)）: 接続を改名してもキーは通り続け、
+//!   削除した接続の id は AUTOINCREMENT で再利用されない（設計 §5.1）ので、
+//!   削除して同じ名前で作り直しても古いキーは通らない。`#` は「名前ではなく
+//!   id」であることを文字列の上で示す。接続名は `#` で始まりうるので、
+//!   **`ingest:` の後ろに名前を置く形は今後も足さない**（足すなら別の接頭辞）。
+//! - **read / write / admin と直交**（設計 §5「判定」）: `ingest:` だけの
+//!   キーは [`ApiKeyContext::has_any_read`]・[`ApiKeyContext::can_read_value`]・
+//!   [`ApiKeyContext::has_write_scope`]・[`ApiKeyContext::has_admin_scope`] が
+//!   すべて false（タグの値を読めず、PLC へ書けず、構成も触れない）。逆に
+//!   `read` / `write:` / `admin` のキーは `can_ingest` が false で、**`admin` も
+//!   送れない**（`admin` は `ingest:` を含意しない）。どの判定も接頭辞
+//!   （`read` / `read:` / `write:` / `admin`）の一致で見るので、`ingest:` の
+//!   文字列が他の判定に当たることは無い。
+//! - 送信口（`/api/v1/ingest/{id}/…`、R2a-2c / 2d）はまだ無い。`can_ingest`
+//!   はその認証層が、パスの id とこのスコープを照合するために使う。
 //!
 //! ### read のタグ単位化（H10 ③、Option B、2026-08-08 オーナー決定・
 //! docs/h10-3-read-scope-proposal.md §5 S1・§6）
@@ -165,6 +191,36 @@ const LAST_USED_THROTTLE_MS: i64 = 60_000;
 
 // --- スコープ構文検証 -------------------------------------------------------
 
+/// `ingest:#{id}` の接頭辞（R2a-2b、このモジュールの doc comment「取り込み」）。
+pub const INGEST_SCOPE_PREFIX: &str = "ingest:#";
+
+/// `ingest:#{id}` の `{id}` を取り出す（R2a-2b、docs/banto-hub-ingest-design.md
+/// §5「文法」）。正規形だけを受ける: `ingest:#` の直後が `[1-9][0-9]*` で
+/// 終わり、`i64` に収まること。`ingest:`・`ingest:#`・`ingest:#0`・
+/// `ingest:#012`・`ingest:#-1`・`ingest:#+1`・`ingest:# 12`・`ingest:#12x`・
+/// `ingest:#*`・`ingest:Bridge1`（名前）・`i64` を超える数は `None`。
+///
+/// 発行時の検証（[`validate_scope`]）と、一覧の表示で id を取り出す側
+/// （`crate::mcp` の `list_api_keys`）が同じこの関数を使う。
+pub fn parse_ingest_scope(scope: &str) -> Option<i64> {
+    let digits = scope.strip_prefix(INGEST_SCOPE_PREFIX)?;
+    let mut bytes = digits.bytes();
+    if !matches!(bytes.next(), Some(b'1'..=b'9')) {
+        return None;
+    }
+    if !bytes.all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    // 先頭が 1〜9・残りが ASCII の数字だけなので、失敗するのは i64 の
+    // 範囲を超えるときだけ。
+    digits.parse::<i64>().ok()
+}
+
+/// 接続 id から `ingest:#{id}` を組み立てる（[`parse_ingest_scope`] の逆）。
+pub fn ingest_scope(connection_id: i64) -> String {
+    format!("{INGEST_SCOPE_PREFIX}{connection_id}")
+}
+
 /// 1つのスコープ文字列の構文検証（設計 §5.6、H10 ③ で read 側を拡張 -
 /// このモジュールの doc comment「スコープ構文検証」参照）。
 ///
@@ -178,6 +234,9 @@ const LAST_USED_THROTTLE_MS: i64 = 60_000;
 /// - `"admin"`: そのまま許可（T21 S1-a、構成操作専用 - このモジュールの
 ///   doc comment「スコープ構文検証」参照。read/write とは直交で、
 ///   データアクセスは付与しない）。
+/// - `"ingest:#{id}"`: [`parse_ingest_scope`] の正規形だけ（R2a-2b、この
+///   モジュールの doc comment「取り込み」参照）。`ingest:` の後ろが `#` で
+///   始まらない（名前など）ものは別の文言で断る。
 /// - それ以外は全て不正。
 ///
 /// **実際の読み取り/書き込み可否判定（値ハンドラ側）はここでは行わない**
@@ -192,11 +251,14 @@ fn validate_scope(scope: &str) -> Result<(), String> {
     if let Some(pattern) = scope.strip_prefix("read:") {
         return validate_read_scope(pattern, scope);
     }
+    if let Some(target) = scope.strip_prefix("ingest:") {
+        return validate_ingest_scope(target, scope);
+    }
     let Some(pattern) = scope.strip_prefix("write:") else {
         return Err(format!(
             "不明なスコープです（'read'、'read:{{connection}}.{{group}}.{{tag}}'、\
              'read:{{connection}}.{{group}}.*'、'write:{{connection}}.{{group}}.{{tag}}'、\
-             'admin' のいずれかのみ許可）: {scope}"
+             'admin'、'ingest:#{{接続 id}}' のいずれかのみ許可）: {scope}"
         ));
     };
     if pattern.contains('*') {
@@ -251,6 +313,26 @@ fn validate_read_scope(pattern: &str, scope: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// `"ingest:"` の後半（`target`）の構文検証（R2a-2b）。判定そのものは
+/// [`parse_ingest_scope`]。`target` が `#` で始まらないもの（`ingest:Bridge1`
+/// のような名前・空）は「id で指定する」ことを、`#` の後ろが正規形でない
+/// ものは id の形を、それぞれ文言で示す。
+fn validate_ingest_scope(target: &str, scope: &str) -> Result<(), String> {
+    if parse_ingest_scope(scope).is_some() {
+        return Ok(());
+    }
+    if !target.starts_with('#') {
+        return Err(format!(
+            "ingest スコープは接続の id で ingest:#{{id}} の形で指定してください\
+             （接続名では指定できません）: {scope}"
+        ));
+    }
+    Err(format!(
+        "ingest スコープの id は 1 以上の 10 進の整数で指定してください\
+         （先頭の 0・符号・空白・ワイルドカードは使えません）: {scope}"
+    ))
 }
 
 /// [`validate_scope`] をリスト全体に適用し、1件でも空・不正なら
@@ -505,6 +587,27 @@ impl ApiKeyContext {
     /// （`crate::mcp` の `require_admin_scope` 参照）。
     pub fn has_admin_scope(&self) -> bool {
         self.scopes.iter().any(|s| s == "admin")
+    }
+
+    /// R2a-2b（docs/banto-hub-ingest-design.md §5「判定」）: `push` 接続
+    /// `connection_id` へ値を送れるか。`ingest:#{connection_id}` の**完全
+    /// 一致**だけで true（ワイルドカードは無い）。発行時に正規形へ限っている
+    /// （[`parse_ingest_scope`]）ので、文字列の比較で足りる。0 以下の id は
+    /// どのスコープにも当たらない。
+    ///
+    /// read / write / admin とは**直交**: `read`・`write:…`・`admin` だけの
+    /// キーはどの id でも false（`admin` も送れない）。逆に `ingest:` だけの
+    /// キーは [`has_any_read`](Self::has_any_read)・
+    /// [`has_write_scope`](Self::has_write_scope)・
+    /// [`has_admin_scope`](Self::has_admin_scope) がいずれも false のまま
+    /// （このモジュールの doc comment「取り込み」参照）。接続がいまも `push`
+    /// で有効かどうかは、ここではなく送信口（R2a-2c / 2d）が確かめる。
+    pub fn can_ingest(&self, connection_id: i64) -> bool {
+        if connection_id <= 0 {
+            return false;
+        }
+        let needle = ingest_scope(connection_id);
+        self.scopes.iter().any(|scope| scope == &needle)
     }
 }
 
@@ -1249,6 +1352,84 @@ mod tests {
         assert!(validate_scope("read:line1.fast.*temp01").is_err());
     }
 
+    // --- R2a-2b: ingest:#{id} の文法 -----------------------------------------
+
+    /// docs/banto-hub-ingest-design.md §11 の R2a-2b の文法の表。
+    #[test]
+    fn ingest_scope_grammar_table() {
+        let accepted: &[(&str, i64)] = &[
+            ("ingest:#12", 12),
+            ("ingest:#1", 1),
+            ("ingest:#9223372036854775807", i64::MAX),
+        ];
+        for (scope, id) in accepted {
+            assert_eq!(parse_ingest_scope(scope), Some(*id), "{scope}");
+            assert!(validate_scope(scope).is_ok(), "{scope}");
+        }
+        let rejected = [
+            "ingest:",
+            "ingest:#",
+            "ingest:#0",
+            "ingest:#012",
+            "ingest:#00",
+            "ingest:#-1",
+            "ingest:#+1",
+            "ingest:# 12",
+            "ingest:#12 ",
+            "ingest:#12x",
+            "ingest:#1.5",
+            "ingest:#*",
+            "ingest:*",
+            "ingest:Bridge1",
+            "ingest:#Bridge1",
+            "ingest:##12",
+            "ingest:#１２",
+            "ingest:#9223372036854775808",
+            "ingest:#99999999999999999999",
+            "ingest",
+            "Ingest:#12",
+            " ingest:#12",
+        ];
+        for scope in rejected {
+            assert_eq!(parse_ingest_scope(scope), None, "{scope}");
+            assert!(validate_scope(scope).is_err(), "{scope}");
+        }
+    }
+
+    /// 名前で指したものは「id で指定する」文言、`#` の後ろが崩れたものは
+    /// id の形の文言で断る（発行の画面・MCP の利用者が直し方を読めるように）。
+    #[test]
+    fn ingest_scope_rejection_messages_say_how_to_fix_it() {
+        let by_name = validate_scope("ingest:Bridge1").unwrap_err();
+        assert!(by_name.contains("接続名では指定できません"), "{by_name}");
+        let empty = validate_scope("ingest:").unwrap_err();
+        assert!(empty.contains("ingest:#{id}"), "{empty}");
+        let bad_id = validate_scope("ingest:#012").unwrap_err();
+        assert!(bad_id.contains("1 以上の 10 進の整数"), "{bad_id}");
+    }
+
+    #[test]
+    fn ingest_scope_round_trips_through_parse() {
+        for id in [1, 12, 4096, i64::MAX] {
+            assert_eq!(parse_ingest_scope(&ingest_scope(id)), Some(id));
+        }
+    }
+
+    #[tokio::test]
+    async fn issue_accepts_an_ingest_scope_and_rejects_a_name() {
+        let service = service().await;
+        let issued = service
+            .issue("bridge", vec!["ingest:#12".to_string()], None)
+            .await
+            .expect("ingest:#12 must be issuable");
+        assert_eq!(issued.scopes, vec!["ingest:#12".to_string()]);
+        let err = service
+            .issue("by-name", vec!["ingest:Bridge1".to_string()], None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::Validation { .. }), "{err:?}");
+    }
+
     // --- キー生成・パース・ハッシュ ---------------------------------------
 
     #[test]
@@ -1667,6 +1848,70 @@ mod tests {
         assert!(!ctx.has_any_read());
         assert!(!ctx.can_read_value("line1.fast.temp01"));
         assert!(!ctx.has_write_scope("line1.fast.temp01"));
+    }
+
+    // --- R2a-2b: can_ingest と直交性 ------------------------------------------
+
+    #[test]
+    fn can_ingest_requires_an_exact_id_match() {
+        let ctx = ctx_with(&["ingest:#12"]);
+        assert!(ctx.can_ingest(12));
+        assert!(!ctx.can_ingest(1));
+        assert!(!ctx.can_ingest(120));
+        assert!(!ctx.can_ingest(0));
+        assert!(!ctx.can_ingest(-12));
+    }
+
+    #[test]
+    fn can_ingest_unions_several_ingest_scopes() {
+        let ctx = ctx_with(&["ingest:#3", "ingest:#12"]);
+        assert!(ctx.can_ingest(3));
+        assert!(ctx.can_ingest(12));
+        assert!(!ctx.can_ingest(4));
+    }
+
+    /// 設計 §5「判定」: `ingest:` だけのキーはタグの値を読めず、PLC へ書けず、
+    /// 構成も触れない（R2a-2b の監査: 直交性）。
+    #[test]
+    fn ingest_only_key_has_no_read_write_or_admin_access() {
+        let ctx = ctx_with(&["ingest:#12"]);
+        assert!(!ctx.has_any_read());
+        assert!(!ctx.can_read_value("line1.fast.temp01"));
+        assert!(!ctx.has_write_scope("line1.fast.temp01"));
+        assert!(!ctx.has_admin_scope());
+    }
+
+    /// 設計 §5「判定」: `read` / `write:` / `admin` のキーは送れない。
+    /// `admin` も `ingest:` を含意しない。
+    #[test]
+    fn read_write_and_admin_keys_cannot_ingest() {
+        for scopes in [
+            &["read"][..],
+            &["read:line1.fast.*"][..],
+            &["read:line1.fast.temp01"][..],
+            &["write:line1.fast.temp01"][..],
+            &["admin"][..],
+            &["read", "admin", "write:line1.fast.temp01"][..],
+            &[][..],
+        ] {
+            let ctx = ctx_with(scopes);
+            for id in [1, 12, i64::MAX] {
+                assert!(!ctx.can_ingest(id), "{scopes:?} must not ingest into #{id}");
+            }
+        }
+    }
+
+    /// 他のスコープと併せ持つキーでも、`ingest:` は他の判定を広げない
+    /// （`read:` の値の絞り込みは `read:` のスコープだけで決まる）。
+    #[test]
+    fn ingest_scope_does_not_widen_other_scopes() {
+        let ctx = ctx_with(&["read:line1.fast.temp01", "ingest:#12"]);
+        assert!(ctx.has_any_read());
+        assert!(ctx.can_read_value("line1.fast.temp01"));
+        assert!(!ctx.can_read_value("line1.fast.temp02"));
+        assert!(!ctx.has_write_scope("line1.fast.temp01"));
+        assert!(!ctx.has_admin_scope());
+        assert!(ctx.can_ingest(12));
     }
 
     // --- T2-4: trip/clear_trip/lookup ordering -----------------------------

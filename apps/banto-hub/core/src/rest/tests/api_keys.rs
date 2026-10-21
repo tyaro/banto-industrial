@@ -1,5 +1,8 @@
 use super::super::*;
-use super::common::{issue_api_key, test_env, test_env_with_clock, CLIENT_HEADER};
+use super::common::{
+    admin_get, issue_api_key, seed_scope_fixture, test_env, test_env_with_clock, v1_get,
+    CLIENT_HEADER,
+};
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
 use banto_tstore::{Clock, ManualClock};
@@ -476,6 +479,68 @@ async fn issuing_with_invalid_scope_syntax_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert_eq!(body["kind"], "validation");
+}
+
+/// R2a-2b（docs/banto-hub-ingest-design.md §5・§11 の監査「直交性」）:
+/// `ingest:#{id}` は REST で発行でき、`ingest:` だけのキーはタグ空間
+/// （catalog・値の読み取り・書き込み）にも、`admin` を要求するサイドカーの
+/// 口にも入れない。接続名で指した `ingest:Bridge1` は発行で断る。
+#[tokio::test]
+async fn ingest_only_key_is_issuable_but_cannot_read_write_or_administer() {
+    let env = test_env().await;
+    seed_scope_fixture(&env.router, &env.admin_token).await;
+
+    let (status, body) = issue_api_key(
+        &env.router,
+        &env.admin_token,
+        "by-name",
+        &["ingest:Bridge1"],
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["kind"], "validation");
+
+    let (status, issued) =
+        issue_api_key(&env.router, &env.admin_token, "bridge", &["ingest:#12"]).await;
+    assert_eq!(status, StatusCode::CREATED, "{issued:?}");
+    assert_eq!(issued["scopes"], serde_json::json!(["ingest:#12"]));
+    let key = issued["key"].as_str().unwrap();
+
+    for path in [
+        "/api/v1/tags",
+        "/api/v1/values",
+        "/api/v1/values/line1.fast.temp01",
+        "/api/sink/config",
+    ] {
+        let (status, body) = v1_get(&env.router, key, path).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body:?}");
+    }
+
+    let response = env
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/v1/values/line1.fast.temp01")
+                .header("Authorization", format!("Bearer {key}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::json!({ "v": 1 }).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    // 一覧はスコープの文字列をそのまま返す（設計 §5「キーの一覧」- 名前の
+    // 解決は画面と MCP の側）。
+    let (status, list) = admin_get(&env.router, "/api/api-keys", &env.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{list:?}");
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["name"] == "bridge")
+        .expect("bridge key row");
+    assert_eq!(row["scopes"], serde_json::json!(["ingest:#12"]));
 }
 
 /// viewer ロールで `POST /api/api-keys` すると 403（admin 限定、

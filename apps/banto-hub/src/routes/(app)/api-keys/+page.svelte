@@ -41,6 +41,16 @@
 	 * （実際の発行操作自体はこの画面で行う - キー全体はこの画面の応答
 	 * でしか手に入らないため、遷移元に平文キーを持ち帰らせない設計は
 	 * 変えていない）。
+	 *
+	 * **R2a-2b（docs/banto-hub-ingest-design.md §5・§12 Q9）**: 取り込みの
+	 * スコープ `ingest:#{接続 id}` は、`push` 接続の一覧からチェックで選ばせて
+	 * id を詰める（名前ではなく id で縛る - 改名してもキーは通り、削除した
+	 * id は再利用されない）。一覧・発行直後の表示は `describeApiKeyScope` で
+	 * 今の接続名に直し、接続が無ければ「（削除済み #12）」と出す。接続の
+	 * 一覧（`GET /api/plc-connections`）を読めなかったときは削除済みとは
+	 * 言わず「接続の一覧を読めませんでした」と出す（`connections = null`）。
+	 * `ingest` は read / write / admin と直交（`admin` でも送れない、`ingest`
+	 * だけのキーは値を読めない）。
 	 */
 	import { page } from '$app/state';
 	import { isProviderError } from '@banto/admin-core';
@@ -51,9 +61,14 @@
 		revokeApiKey,
 		clearTripApiKey,
 		apiKeyWarnings,
+		describeApiKeyScope,
+		ingestScope,
+		pushConnectionOptions,
+		reconcileIngestSelection,
 		type ApiKeySummary,
 		type IssuedApiKey
 	} from '#lib/banto/apiKeysAdmin.js';
+	import { listPlcConnections, type PlcConnection } from '#lib/banto/tagRegistryAdmin.js';
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
@@ -76,16 +91,43 @@
 	 *  1秒後に切り替わる」精度は不要な表示用途のため。 */
 	let nowMs = $state(Date.now());
 
+	/** R2a-2b: `ingest:#{id}` の名前の解決と、作成フォームの `push` 接続の
+	 *  選択肢。`null` = 一覧を読めなかった（「削除済み」と取り違えない）。 */
+	let connections: PlcConnection[] | null = $state(null);
+	let pushConnections = $derived(pushConnectionOptions(connections ?? []));
+
 	async function reload(): Promise<void> {
 		loading = true;
 		try {
-			keys = await listApiKeys();
-			nowMs = Date.now();
-		} catch (err) {
-			toastStore.push('error', errorMessage(err));
+			const [keysResult, connectionsResult] = await Promise.allSettled([
+				listApiKeys(),
+				listPlcConnections()
+			]);
+			if (connectionsResult.status === 'fulfilled') {
+				connections = connectionsResult.value;
+			} else {
+				connections = null;
+				toastStore.push(
+					'error',
+					`接続の一覧を読めませんでした: ${errorMessage(connectionsResult.reason)}`
+				);
+			}
+			// 一覧を読めなかった/接続が消えた・push でなくなった場合、見えない選択が
+			// ingest スコープとして残らないよう選択を整える。
+			ingestConnectionIds = reconcileIngestSelection(ingestConnectionIds, connections);
+			if (keysResult.status === 'fulfilled') {
+				keys = keysResult.value;
+				nowMs = Date.now();
+			} else {
+				toastStore.push('error', errorMessage(keysResult.reason));
+			}
 		} finally {
 			loading = false;
 		}
+	}
+
+	function describeScopes(scopes: string[]): string {
+		return scopes.map((scope) => describeApiKeyScope(scope, connections)).join(', ');
 	}
 
 	$effect(() => {
@@ -109,6 +151,8 @@
 	 *  チェックボックスとは独立に併用できる）。 */
 	let readScopesText = $state('');
 	let writeScopesText = $state('');
+	/** R2a-2b: 取り込み（`ingest:#{id}`）で選んだ `push` 接続の id。 */
+	let ingestConnectionIds: number[] = $state([]);
 	/** H10 ①: `"YYYY-MM-DD"` または空文字（空 = 無期限）。 */
 	let expiresAtInput = $state('');
 	let createErrors: Record<string, string> = $state({});
@@ -173,6 +217,11 @@
 			if (trimmed === '') continue;
 			scopes.push(trimmed.startsWith('write:') ? trimmed : `write:${trimmed}`);
 		}
+		// R2a-2b: 選んだ push 接続の id を詰める（名前は使わない）。画面に見えて
+		// いる接続（reload 後の一覧にある push）だけを対象にする。
+		for (const id of reconcileIngestSelection(ingestConnectionIds, connections)) {
+			scopes.push(ingestScope(id));
+		}
 		return scopes;
 	}
 
@@ -193,6 +242,7 @@
 			adminScope = false;
 			readScopesText = '';
 			writeScopesText = '';
+			ingestConnectionIds = [];
 			expiresAtInput = '';
 			await reload();
 		} catch (err) {
@@ -279,7 +329,7 @@
 				<button type="button" onclick={copyIssuedKey}>{copied ? 'コピー済み' : 'コピー'}</button>
 			</div>
 			<p class="note">
-				プレフィックス: {issuedKey.prefix} ・ スコープ: {issuedKey.scopes.join(', ')}
+				プレフィックス: {issuedKey.prefix} ・ スコープ: {describeScopes(issuedKey.scopes)}
 			</p>
 			<button type="button" class="secondary" onclick={dismissIssuedKey}>閉じる</button>
 		</section>
@@ -327,6 +377,26 @@
 					>ワイルドカードは使えません（タグを明示列挙）。実際の書き込みAPI自体は本スライスの範囲外です。</span
 				>
 			</label>
+			<fieldset class="field wide ingest">
+				<legend>取り込み（任意、push 接続へ値を送る。接続を選ぶと id で縛ります）</legend>
+				{#if connections === null}
+					<span class="hint">接続の一覧を読めませんでした。再読み込みしてください。</span>
+				{:else if pushConnections.length === 0}
+					<span class="hint">push 接続がありません。接続の画面で作成してください。</span>
+				{:else}
+					{#each pushConnections as connection (connection.id)}
+						<label class="checkbox">
+							<input type="checkbox" value={connection.id} bind:group={ingestConnectionIds} />
+							{connection.name}（#{connection.id}）
+						</label>
+					{/each}
+				{/if}
+				<span class="hint"
+					>スコープは ingest:#&lbrace;接続 id&rbrace;
+					になり、接続を改名しても使い続けられます。取り込みのスコープだけではタグの値を読めず、read・admin
+					のスコープでは送れません（それぞれ別に付けます）。</span
+				>
+			</fieldset>
 			{#if createErrors.scopes}<span class="err">{createErrors.scopes}</span>{/if}
 			<label class="field">
 				有効期限（任意）
@@ -364,7 +434,7 @@
 						<tr class:revoked={key.revokedAt !== null} class:tripped={key.trippedAt !== null}>
 							<td>{key.name}</td>
 							<td><code>{key.prefix}</code></td>
-							<td>{key.scopes.join(', ')}</td>
+							<td>{describeScopes(key.scopes)}</td>
 							<td>{key.createdAt}</td>
 							<td>
 								{formatLastUsed(key.lastUsedAt)}
@@ -520,6 +590,28 @@
 	}
 
 	.field.checkbox input {
+		width: auto;
+	}
+
+	fieldset.ingest {
+		margin: 0;
+		padding: 0.5rem 0.75rem;
+		border: 1px solid var(--banto-border);
+		border-radius: var(--banto-radius);
+	}
+
+	fieldset.ingest legend {
+		padding: 0 0.3rem;
+	}
+
+	fieldset.ingest .checkbox {
+		display: flex;
+		align-items: center;
+		gap: 0.4rem;
+		color: var(--banto-text);
+	}
+
+	fieldset.ingest .checkbox input {
 		width: auto;
 	}
 
