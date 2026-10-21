@@ -214,7 +214,8 @@ pub enum UnknownKeyRecord {
 
 /// 未知のキーの監査の間引き（§8、接続ごと）。1 時間の固定の窓で、窓の中で初めて見た
 /// キーを 100 個まで記録し、それを超えた分（同じ窓で既に記録したキーは数えない）は
-/// 数だけを数え、窓が明けた後の最初の観測で 1 行にする。持つのは窓の中の 100 個の
+/// 数だけを数え、窓が明けた後の最初の観測で 1 行にする（その観測が未知のキーを
+/// 含まない場合も同じ。正常な送信に戻った後の最初の要求でも 1 行出る）。持つのは窓の中の 100 個の
 /// キー（各 256 文字まで）だけなので、送り手が未知のキーを何種類送ってもメモリと
 /// 監査の行は頭打ちになる（1 時間に高々 101 行、§11 のオーナーの監査 (3)）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -225,7 +226,8 @@ pub struct UnknownKeyThrottle {
 }
 
 impl UnknownKeyThrottle {
-    /// 1 メッセージで断った未知のキーを観測し、記録すべきものを返す。
+    /// 1 メッセージで断った未知のキーを観測し、記録すべきものを返す。`keys` が空でも
+    /// 窓が明けていれば抑えた数の `Suppressed` を 1 回だけ返し、窓なしに戻す。
     pub fn observe<'a>(
         &mut self,
         keys: impl IntoIterator<Item = &'a str>,
@@ -233,22 +235,32 @@ impl UnknownKeyThrottle {
     ) -> Vec<UnknownKeyRecord> {
         let mut out = Vec::new();
         let mut keys = keys.into_iter().peekable();
-        if keys.peek().is_none() {
-            return out;
-        }
+        let no_keys = keys.peek().is_none();
         let expired = self
             .window_start_ms
             .is_none_or(|start| now_ms.saturating_sub(start) >= UNKNOWN_KEY_WINDOW_MS);
         if expired {
+            // 窓が明けていたら、未知のキーが来たかどうかによらず `Suppressed` を 1 回だけ出す
+            // （送り手が未知のキーを送るのをやめても、抑えた数が行方不明にならない）。
             if let (Some(start), true) = (self.window_start_ms, self.suppressed > 0) {
                 out.push(UnknownKeyRecord::Suppressed {
                     count: self.suppressed,
                     window_start_ms: start,
                 });
             }
+            if no_keys {
+                // 未知のキーの無い観測では新しい窓を始めず「窓なし」に戻す。
+                self.window_start_ms = None;
+                self.seen.clear();
+                self.suppressed = 0;
+                return out;
+            }
             self.window_start_ms = Some(now_ms);
             self.seen.clear();
             self.suppressed = 0;
+        }
+        if no_keys {
+            return out;
         }
         for key in keys {
             let key = truncate_chars(key, UNKNOWN_KEY_MAX_CHARS);
@@ -326,6 +338,29 @@ mod tests {
             throttle.observe(["z"], 3 * UNKNOWN_KEY_WINDOW_MS),
             vec![UnknownKeyRecord::Key("z".into())]
         );
+    }
+
+    /// 回帰: 送り手が未知のキーを送るのをやめても（空の観測だけが続いても）、窓が明けた
+    /// 最初の観測で `Suppressed` が 1 回だけ出る。
+    #[test]
+    fn suppressed_is_flushed_by_empty_observation_after_window() {
+        let mut throttle = UnknownKeyThrottle::default();
+        let many: Vec<String> = (0..101).map(|n| format!("k{n}")).collect();
+        let records = throttle.observe(many.iter().map(String::as_str), 0);
+        assert_eq!(records.len(), 100);
+        assert!(records
+            .iter()
+            .all(|record| matches!(record, UnknownKeyRecord::Key(_))));
+        assert_eq!(
+            throttle.observe(std::iter::empty(), UNKNOWN_KEY_WINDOW_MS),
+            vec![UnknownKeyRecord::Suppressed {
+                count: 1,
+                window_start_ms: 0
+            }]
+        );
+        assert!(throttle
+            .observe(std::iter::empty(), 2 * UNKNOWN_KEY_WINDOW_MS)
+            .is_empty());
     }
 
     /// 長いキーは 256 文字で切る（文字の境界で）。切った後の名前で重複を数える。
