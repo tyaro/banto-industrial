@@ -251,9 +251,19 @@ pub async fn v1_ingest_values(
         };
     }
 
-    let outcome = state
-        .ingest
-        .apply(conn_id, message.epoch, &message.items, now_ms);
+    let outcome = state.ingest.apply_rest(
+        conn_id,
+        message.epoch,
+        &message.items,
+        now_ms,
+        // 状態の表示の送り手（R2a-2e）: キーは名前だけ（値・ハッシュは載せない）。
+        // 反映と同じロックの中で控える（並行する要求で順序が入れ替わらない）。
+        IngestSender {
+            api_key_name: caller.key.name.clone(),
+            peer: caller.peer.clone(),
+            at_ms: now_ms,
+        },
+    );
     let ack = match outcome {
         Ok(ack) => ack,
         Err(refusal) => {
@@ -268,16 +278,6 @@ pub async fn v1_ingest_values(
             return refusal_response(refusal);
         }
     };
-
-    // 状態の表示の送り手（R2a-2e）: キーは名前だけ（値・ハッシュは載せない）。
-    state.ingest.note_rest_sender(
-        conn_id,
-        IngestSender {
-            api_key_name: caller.key.name.clone(),
-            peer: caller.peer.clone(),
-            at_ms: now_ms,
-        },
-    );
 
     let unknown = ack
         .rejected

@@ -122,6 +122,9 @@
 		bridgeQueryErrorKey,
 		formatBridgeReferenceDeleteRefusal,
 		ingestEndpoints,
+		isSavedPushConnection,
+		resolveSavedConnection,
+		type SavedConnectionRecord,
 		mapPushFieldErrors,
 		pushBridgeLoad,
 		pushBridgesReferencing,
@@ -508,9 +511,19 @@
 	let ingestStatusLoaded = $state(false);
 	let ingestStatusError: string | null = $state(null);
 
+	/**
+	 * 保存成功時に更新 API が返した接続（P2 レビュー対応）。親は一覧を取り直す
+	 * だけで `connection` prop を差し替えないため、保存したプロトコルの変更
+	 * （空の PLC 接続 → push など）を表示・ポーリングへ反映する基準にする。
+	 * 未保存の `form.protocol` は基準にしない。
+	 */
+	let savedRecord: SavedConnectionRecord | null = $state.raw(null);
+	const savedConnection = $derived(resolveSavedConnection(connection, savedRecord));
+	const savedIsPush = $derived(isSavedPushConnection(connection, savedRecord));
+
 	$effect(() => {
-		const id = connection?.id;
-		if (!open || id === undefined || connection?.protocol !== PUSH_PROTOCOL) return;
+		const id = savedConnection?.id;
+		if (!open || id === undefined || !savedIsPush) return;
 		let cancelled = false;
 		ingestStatus = null;
 		ingestStatusLoaded = false;
@@ -538,8 +551,11 @@
 
 	/** 送り手向けの URL とスコープ（保存済みの push 接続だけ）。 */
 	const endpoints = $derived(
-		connection && connection.protocol === PUSH_PROTOCOL
-			? ingestEndpoints(typeof window === 'undefined' ? '' : window.location.origin, connection.id)
+		savedConnection && savedIsPush
+			? ingestEndpoints(
+					typeof window === 'undefined' ? '' : window.location.origin,
+					savedConnection.id
+				)
 			: null
 	);
 
@@ -664,6 +680,7 @@
 			// 揃えることで、保存直後は dirty ではない状態に戻す。
 			form = connectionToForm(updated);
 			baseline = $state.snapshot(form);
+			savedRecord = { base: connection, saved: updated };
 			onSaved(updated);
 		} catch (err) {
 			if (isQueuedWhileRunningError(err)) {
@@ -1300,7 +1317,7 @@
 	>
 		{@render nameField()}
 		{@render destinationFields()}
-		{#if connection?.protocol === PUSH_PROTOCOL}
+		{#if savedIsPush}
 			{@render ingestInfoBlock()}
 			{@render ingestStatusBlock()}
 		{/if}

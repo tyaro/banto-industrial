@@ -699,6 +699,40 @@ export function ingestEndpoints(origin: string, connectionId: number): IngestEnd
 }
 
 /**
+ * 保存成功時の「保存済みの接続」の記録。`base` は保存時に親から渡されていた
+ * `connection` prop（参照）、`saved` は更新 API が返した正規化済みの接続。
+ */
+export interface SavedConnectionRecord {
+	base: PlcConnection;
+	saved: PlcConnection;
+}
+
+/**
+ * push 受信の表示（送り手 URL・スコープ・受信状態）と 3 秒ポーリングの基準に
+ * する「保存済みの接続」を決める。親は保存後に一覧を取り直すだけで
+ * `connection` prop を差し替えないため、プロトコル変更を保存した直後は prop が
+ * 古いままになる。`record.base` が今の prop と同じ参照なら保存済みの `saved` を
+ * 優先し、別の接続を開き直した（prop が変わった）ときは prop に戻す。
+ * 未保存のフォーム（`form.protocol`）は決して基準にしない（保存前の切替に
+ * 反応させない）。
+ */
+export function resolveSavedConnection(
+	connection: PlcConnection | null,
+	record: SavedConnectionRecord | null
+): PlcConnection | null {
+	if (connection && record && record.base === connection) return record.saved;
+	return connection;
+}
+
+/** 保存済みの接続が push か（ingest ブロック表示・ポーリングの要否）。 */
+export function isSavedPushConnection(
+	connection: PlcConnection | null,
+	record: SavedConnectionRecord | null
+): boolean {
+	return resolveSavedConnection(connection, record)?.protocol === PUSH_PROTOCOL;
+}
+
+/**
  * R2a-2e（§3.2「`postgres` 接続の削除は、`push` の `settings` が参照していれば
  * 断る」）: 接続 `connectionId` を DB ブリッジの読み取り先にしている push 接続
  * （画面が読み込み済みの一覧から引く）。削除の前に画面で先に止めるために使う

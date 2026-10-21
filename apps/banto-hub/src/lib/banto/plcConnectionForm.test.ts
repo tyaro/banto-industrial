@@ -21,6 +21,8 @@ import {
 	blankBridgeQuery,
 	formatBridgeReferenceDeleteRefusal,
 	ingestEndpoints,
+	isSavedPushConnection,
+	resolveSavedConnection,
 	mapPushFieldErrors,
 	parseBridgeColumns,
 	pushBridgeLoad,
@@ -730,5 +732,45 @@ describe('R2a-2e: pushBridgesReferencing（postgres 接続の削除の拒否）'
 		expect(formatBridgeReferenceDeleteRefusal('pg-a', ['Bridge1'])).toContain(
 			'pg-a は push 接続（Bridge1）の DB ブリッジが読んでいるため削除できません'
 		);
+	});
+});
+
+describe('resolveSavedConnection / isSavedPushConnection（P2: 保存後のプロトコル変更）', () => {
+	const conn = (protocol: string): PlcConnection =>
+		({ id: 7, name: 'c', protocol }) as unknown as PlcConnection;
+
+	it('保存前は prop のプロトコルが基準（push 以外 → 表示・ポーリングなし）', () => {
+		const prop = conn('slmp');
+		expect(resolveSavedConnection(prop, null)).toBe(prop);
+		expect(isSavedPushConnection(prop, null)).toBe(false);
+		expect(isSavedPushConnection(conn('push'), null)).toBe(true);
+	});
+
+	it('push 以外 → push を保存すると、prop が古いままでも push 扱い（表示・ポーリング開始）', () => {
+		const prop = conn('slmp');
+		const saved = conn('push');
+		expect(isSavedPushConnection(prop, { base: prop, saved })).toBe(true);
+		expect(resolveSavedConnection(prop, { base: prop, saved })).toBe(saved);
+	});
+
+	it('push → 他のプロトコルを保存すると、prop が古いままでも push 扱いを外す（停止）', () => {
+		const prop = conn('push');
+		const saved = conn('slmp');
+		expect(isSavedPushConnection(prop, { base: prop, saved })).toBe(false);
+	});
+
+	it('未保存のフォーム切替は基準に入らない（引数に form を取らない）', () => {
+		// 保存記録が無い限り、判定は prop のみに依存する。
+		const prop = conn('slmp');
+		expect(isSavedPushConnection(prop, null)).toBe(false);
+	});
+
+	it('別の接続を開き直した（prop が別参照）ら古い保存記録は無視する', () => {
+		const oldProp = conn('slmp');
+		const record = { base: oldProp, saved: conn('push') };
+		const newProp = conn('slmp');
+		expect(resolveSavedConnection(newProp, record)).toBe(newProp);
+		expect(isSavedPushConnection(newProp, record)).toBe(false);
+		expect(isSavedPushConnection(null, record)).toBe(false);
 	});
 });

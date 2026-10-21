@@ -59,7 +59,9 @@
 //!   持ったまま WS の登録を取る経路は無い（`open_ws_session` は保持値を読み終えてから
 //!   登録を取り、`commit` は保持値と登録を別々に取る）。上限・監査の抑制（slot の
 //!   未知のキー、`IngestHub` の `key_denials`）・送り手の `status` の `Mutex` は
-//!   末端で、他のロックを中で取らない（`key_denials` は外側のロックも持たずに取る）。
+//!   末端で、他のロックを中で取らない（REST の最後の送り手 `rest_sender` も末端で、
+//!   `apply_rest` が反映の順序と揃うよう保持値の書き込みロックの中で取る。逆に
+//!   `rest_sender` を持ったまま他のロックを取る経路は無い）（`key_denials` は外側のロックも持たずに取る）。
 //!   どれも `.await` をまたいで持たない（同期の区間だけ）。`apply` は接続のロックを
 //!   持つ間ずっと外側の読み取りも持つので、
 //!   `commit` が接続の設定（登録済みのキー・送る集合）を入れ替える瞬間に、古い
@@ -999,7 +1001,30 @@ impl IngestHub {
         items: &[IngestItem],
         now_ms: i64,
     ) -> ApplyOutcome {
-        self.apply_inner(conn_id, None, message_epoch, items, now_ms)
+        self.apply_inner(conn_id, None, message_epoch, items, now_ms, None)
+            .map_err(|refusal| match refusal {
+                WsRefusal::Refused(refusal) => refusal,
+                // 番号を渡さないので起きない。
+                WsRefusal::NotCurrent => ApplyRefusal::UnknownConnection,
+            })
+    }
+
+    /// REST（R2a-2c）の `values`: [`Self::apply`] と同じ判定・反映に加えて、受け付けた
+    /// ときだけ状態の表示の送り手（R2a-2e）を、**反映と同じ保持値の書き込みロックの
+    /// 中で**控える。反映と送り手の記録を別々のロック区間にすると、並行する 2 つの要求が
+    /// 反映 A → 反映 B → 記録 B → 記録 A と交錯して、最後に受け付けたのは B なのに
+    /// 「最後の送り手」が A になる。保持値のロックが反映の順序を決めるので、その中で
+    /// 記録すれば最後の送り手は常に最後に反映した要求になる。断ったとき（接続なし・
+    /// 無効・epoch 不一致）は記録しない。
+    pub fn apply_rest(
+        &self,
+        conn_id: i64,
+        message_epoch: Option<u64>,
+        items: &[IngestItem],
+        now_ms: i64,
+        sender: IngestSender,
+    ) -> ApplyOutcome {
+        self.apply_inner(conn_id, None, message_epoch, items, now_ms, Some(sender))
             .map_err(|refusal| match refusal {
                 WsRefusal::Refused(refusal) => refusal,
                 // 番号を渡さないので起きない。
@@ -1023,9 +1048,12 @@ impl IngestHub {
             message_epoch,
             items,
             now_ms,
+            None,
         )
     }
 
+    /// `rest_sender` が `Some` なら、受け付けた時点（epoch の照合を通った後）に保持値の
+    /// 書き込みロックの中で `SlotShared::rest_sender` を置き換える（[`Self::apply_rest`]）。
     fn apply_inner(
         &self,
         conn_id: i64,
@@ -1033,6 +1061,7 @@ impl IngestHub {
         message_epoch: Option<u64>,
         items: &[IngestItem],
         now_ms: i64,
+        rest_sender: Option<IngestSender>,
     ) -> Result<ApplyAck, WsRefusal> {
         let inner = read(&self.inner);
         let slot = inner
@@ -1055,6 +1084,11 @@ impl IngestHub {
             }));
         }
         held.last_seen_ms = Some(now_ms);
+        // 送り手の記録は反映と同じ保持値のロックの中（`apply_rest` の doc）。末端の
+        // `Mutex` を保持値を持ったまま取る（保持値 → 末端。逆順に取る経路は無い）。
+        if let Some(sender) = rest_sender {
+            *lock(&slot.shared.rest_sender) = Some(sender);
+        }
 
         let mut seen: HashSet<&str> = HashSet::with_capacity(items.len());
         let mut accepted = 0;
@@ -1248,15 +1282,6 @@ impl IngestHub {
             counter.fetch_add(1, Ordering::Relaxed);
         }
         Ok(admission)
-    }
-
-    /// REST の送信口が要求を受け付けた後に、状態の表示の送り手を控える（R2a-2e）。
-    /// 接続が無ければ何もしない。
-    pub fn note_rest_sender(&self, conn_id: i64, sender: IngestSender) {
-        let inner = read(&self.inner);
-        if let Some(slot) = inner.slots.get(&conn_id) {
-            *lock(&slot.shared.rest_sender) = Some(sender);
-        }
     }
 
     /// 全 `push` 接続の状態（§9 の `ingest` 節、R2a-2e）。接続 id の昇順。資格情報と
