@@ -191,6 +191,10 @@
 //!   [`ingest::audit`]）は R2a-2c。WebSocket の送信口
 //!   `GET /api/v1/ingest/{id}/stream`（[`ingest::ws`]、1 接続に 1 本・再検証・背圧）は
 //!   R2a-2d
+//! - [`secrets`]: R2b-1b（docs/banto-hub-connection-settings-design.md §5）。接続の秘密値の
+//!   封印と開封（[`secrets::ConnectionSecrets`]。Windows は `banto-secret-store` の
+//!   `DpapiMachine` で `dpapi-machine-v1`、それ以外は `plain-v1`）。entropy に参照とキーを
+//!   入れ、`Debug`・エラーに平文と blob を出さない。**まだ配線しない**（DB・REST は R2b-1d・1e）
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
@@ -231,6 +235,7 @@ pub mod profile_paths;
 pub mod read_path;
 pub mod rest;
 pub mod runtime;
+pub mod secrets;
 pub mod service_elevated;
 pub mod service_install;
 pub mod service_manager;

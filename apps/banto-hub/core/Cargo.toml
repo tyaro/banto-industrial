@@ -59,6 +59,21 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # Cargo.lock に新しい crate は増えない。これらの部品は `banto-safe-root`（#623 PR-1a で
 # `banto-secret-store` から分けた共有 crate）にある。
 banto-safe-root = { path = "../../../crates/banto-safe-root" }
+# R2b-1b（docs/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
+# 秘密値を封印する部品（`Protector`・Windows の `DpapiMachine`・`MAX_SECRET_LEN`）を使う。
+# 保存先のファイル（`FileSecretStore`）は使わない - blob は DB に置く（設計 §5.1 の Q1 (c)）。
+# 以前は ACL の部品のために `banto-safe-root` だけに依存していた。`banto-secret-store` に
+# 付いてくる workspace の crate は `banto-hub-bootstrap`・`banto-tagclient`（KeyStore の
+# アダプタ用。この crate からは使わない）で、その外の依存（reqwest・tungstenite・sha2・hex・
+# zeroize・windows-sys 0.61）はこの crate が既に持つもの。Cargo.lock に新しい crate は
+# 増えない（この crate の依存の行が増えるだけ）。CI の変更判定（`.github/scripts/ci-changes.mjs`
+# の依存グラフ）では、`banto-secret-store`・`banto-hub-bootstrap`・`banto-tagclient` の変更で
+# hub 側も走るようになる（`ci-changes.test.mjs` の G と表を合わせた）。非 Windows でも
+# コンパイルは通る（`DpapiMachine` は `#[cfg(windows)]`、`secrets` は非 Windows では
+# protector 無しの `plain-v1`）。
+banto-secret-store = { path = "../../../crates/banto-secret-store" }
+# R2b-1b: 開封した秘密値と中間のバッファを `Zeroizing` で持つ（`banto-secret-store` と同じ版）。
+zeroize = { workspace = true }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
