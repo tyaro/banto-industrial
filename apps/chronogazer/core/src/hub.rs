@@ -1381,7 +1381,10 @@ pub struct HubSampler {
 }
 
 impl ExternalSource for HubSampler {
-    fn snapshot(&self) -> ExternalSnapshot {
+    /// `connection_key` は使わない: hub 接続は高々 1 つ（migration 0019 の
+    /// 部分一意索引）で、源も 1 つの購読だけなので、どの接続から呼ばれても
+    /// 同じ状態を返す。
+    fn snapshot(&self, _connection_key: &str) -> ExternalSnapshot {
         let feed = self
             .feed
             .0
@@ -4511,7 +4514,7 @@ mod tests {
         let (_settings, hub) = service().await;
         let source = hub.collect_source();
         assert_eq!(
-            source.snapshot(),
+            source.snapshot("conn:1"),
             ExternalSnapshot::down(Some(DETAIL_NO_SUBSCRIPTION.to_owned()))
         );
 
@@ -5776,7 +5779,7 @@ mod tests {
             wait_live(&hub).await;
             assert_eq!(hub.subscription().await.subscribed_count, 2);
 
-            let snapshot = hub.collect_source().snapshot();
+            let snapshot = hub.collect_source().snapshot("conn:1");
             assert!(snapshot.is_live());
             assert_eq!(snapshot.reading("alpha").map(|r| r.value), Some(Some(10.0)));
             assert_eq!(
@@ -5793,10 +5796,10 @@ mod tests {
                 assert!(slot.collect_demand.is_empty());
                 assert!(slot.demand_pending);
             }
-            assert!(hub.collect_source().snapshot().is_live());
+            assert!(hub.collect_source().snapshot("conn:1").is_live());
 
             hub.inner.subscription.lock().await.stop(None).await;
-            assert!(!hub.collect_source().snapshot().is_live());
+            assert!(!hub.collect_source().snapshot("conn:1").is_live());
             server.abort();
         }
 

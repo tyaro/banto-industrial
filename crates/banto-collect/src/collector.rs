@@ -843,7 +843,7 @@ fn plan_for_task(
 /// The [`CollectError::Config`] text for a config with external (`"hub"`)
 /// connections handed to a collector that has no [`ExternalSource`] - shared
 /// by [`Collector::start_with_sources`] and [`Collector::apply_config`].
-const MISSING_EXTERNAL_SOURCE: &str = "Hub 経由の接続を収集するための値の取得元が渡されていません";
+const MISSING_EXTERNAL_SOURCE: &str = "外部の接続を収集するための値の取得元が渡されていません";
 
 /// Spawn one connection's task with its own stop channel: the socket loop
 /// for a PLC plan, the sampling loop for an external one (#383 段階3 P3).
@@ -882,7 +882,7 @@ fn spawn_task(
 struct MissingSource;
 
 impl ExternalSource for MissingSource {
-    fn snapshot(&self) -> crate::external::ExternalSnapshot {
+    fn snapshot(&self, _connection_key: &str) -> crate::external::ExternalSnapshot {
         crate::external::ExternalSnapshot::down(None)
     }
 }
@@ -1502,7 +1502,7 @@ mod tests {
         }
 
         impl ExternalSource for MockSource {
-            fn snapshot(&self) -> ExternalSnapshot {
+            fn snapshot(&self, _connection_key: &str) -> ExternalSnapshot {
                 self.samples.fetch_add(1, Ordering::SeqCst);
                 self.snapshot.lock().unwrap().clone()
             }
@@ -1971,6 +1971,169 @@ mod tests {
                 matches!(result, Err(CollectError::Config(_))),
                 "{:?}",
                 result.err()
+            );
+        }
+
+        /// R2a-1a: one source serves two external connections, asking with
+        /// each connection's own key, and each task keeps its own link
+        /// state. The source reports `conn:2` Down while `conn:1` stays Live:
+        /// exactly `conn:2` emits `plc_disconnected` (and goes Bad + null),
+        /// `conn:1` stays Good, and each connection's values are the ones
+        /// held under its own key (the same external name carries 1.0 for
+        /// `conn:1` and 2.0 for `conn:2`). A hand-built config, because the
+        /// registry allows a single `hub` row (migration 0019).
+        struct KeyedSource {
+            by_key: Mutex<HashMap<String, ExternalSnapshot>>,
+            samples: Mutex<HashMap<String, usize>>,
+        }
+
+        impl KeyedSource {
+            fn samples_of(&self, key: &str) -> usize {
+                self.samples.lock().unwrap().get(key).copied().unwrap_or(0)
+            }
+
+            async fn wait_samples(&self, key: &str, more: usize) {
+                let target = self.samples_of(key) + more;
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                while self.samples_of(key) < target {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "{key} was sampled only {} of {target} times",
+                        self.samples_of(key)
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+
+        impl ExternalSource for KeyedSource {
+            fn snapshot(&self, connection_key: &str) -> ExternalSnapshot {
+                *self
+                    .samples
+                    .lock()
+                    .unwrap()
+                    .entry(connection_key.to_string())
+                    .or_insert(0) += 1;
+                self.by_key
+                    .lock()
+                    .unwrap()
+                    .get(connection_key)
+                    .cloned()
+                    .unwrap_or_else(|| ExternalSnapshot::down(None))
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn two_external_connections_have_independent_link_states() {
+            const NAME: &str = "X.shared";
+            let dir = TempDir::new();
+            let live_with = |value: f64| {
+                ExternalSnapshot::live(HashMap::from([(
+                    NAME.to_string(),
+                    reading(value, ExternalQuality::Good),
+                )]))
+            };
+            let source = Arc::new(KeyedSource {
+                by_key: Mutex::new(HashMap::from([
+                    ("conn:1".to_string(), live_with(1.0)),
+                    ("conn:2".to_string(), live_with(2.0)),
+                ])),
+                samples: Mutex::new(HashMap::new()),
+            });
+
+            let mut config = n_conn_config(2);
+            for conn in &mut config.connections {
+                conn.config = ProtocolConfig::External;
+                conn.groups[0].requests.clear();
+                conn.groups[0].external_names = vec![NAME.to_string()];
+            }
+
+            let events_pool = banto_storage::connect_sqlite_memory().await.unwrap();
+            let events = EventSink::new(events_pool);
+            let mut rx = events.subscribe();
+            let collector = Collector::start_with_sources(
+                config,
+                dir.path(),
+                Arc::new(SystemClock),
+                events,
+                CollectorOptions::default(),
+                default_client_factory(),
+                Some(source.clone() as Arc<dyn ExternalSource>),
+            )
+            .await
+            .expect("start_with_sources");
+            let current = collector.current_values();
+
+            source.wait_samples("conn:1", 3).await;
+            source.wait_samples("conn:2", 3).await;
+            let good = |key: &str| current.get(key).map(|s| (s.value, s.quality));
+            assert_eq!(good("tag:1"), Some((Some(1.0), Quality::Good)));
+            assert_eq!(good("tag:2"), Some((Some(2.0), Quality::Good)));
+
+            // Only conn:2's link drops (still holding its value).
+            source.by_key.lock().unwrap().insert(
+                "conn:2".to_string(),
+                ExternalSnapshot {
+                    link: crate::external::ExternalLink::Down {
+                        detail: Some("conn:2 down".to_string()),
+                    },
+                    values: live_with(2.0).values,
+                },
+            );
+            source.wait_samples("conn:2", 4).await;
+            source.wait_samples("conn:1", 4).await;
+            assert_eq!(good("tag:2"), Some((None, Quality::Bad)));
+            assert_eq!(good("tag:1"), Some((Some(1.0), Quality::Good)));
+            assert_eq!(
+                collector.status().get("conn:2"),
+                Some(&ConnectionStatus::Reconnecting {
+                    attempt: crate::task::EXTERNAL_RECONNECT_ATTEMPT
+                })
+            );
+            assert_eq!(
+                collector.status().get("conn:1"),
+                Some(&ConnectionStatus::Connected)
+            );
+
+            collector.stop().await.expect("stop");
+
+            let mut all = Vec::new();
+            while let Ok(event) = rx.try_recv() {
+                all.push(event);
+            }
+            assert_eq!(
+                connection_kinds(&all, "conn:1"),
+                vec![EventKind::PlcConnected],
+                "{all:?}"
+            );
+            assert_eq!(
+                connection_kinds(&all, "conn:2"),
+                vec![EventKind::PlcConnected, EventKind::PlcDisconnected],
+                "{all:?}"
+            );
+            let disconnects: Vec<_> = all
+                .iter()
+                .filter(|e| e.kind == EventKind::PlcDisconnected)
+                .collect();
+            assert_eq!(disconnects.len(), 1, "{all:?}");
+            assert_eq!(disconnects[0].detail.as_deref(), Some("conn:2 down"));
+
+            let col = |rows: Vec<Vec<Option<f64>>>| -> Vec<Option<f64>> {
+                rows.iter().map(|row| row[0]).collect()
+            };
+            let rows_1 = col(rows(&dir, "grp:1").await);
+            let rows_2 = col(rows(&dir, "grp:2").await);
+            assert!(
+                rows_1.iter().all(|v| *v == Some(1.0)),
+                "conn:1 only ever records its own 1.0: {rows_1:?}"
+            );
+            assert!(
+                rows_2.contains(&Some(2.0)) && rows_2.contains(&None),
+                "{rows_2:?}"
+            );
+            assert!(
+                rows_2.iter().all(|v| v.is_none() || *v == Some(2.0)),
+                "{rows_2:?}"
             );
         }
     }

@@ -1130,7 +1130,7 @@ pub(crate) async fn run_external_connection(
 
                 // One snapshot per wake: every group firing now sees the same
                 // link state and values (`crate::external`'s module doc).
-                let snapshot = source.snapshot();
+                let snapshot = source.snapshot(&conn_key);
                 let live = snapshot.is_live();
                 set_status(
                     &ctx,
