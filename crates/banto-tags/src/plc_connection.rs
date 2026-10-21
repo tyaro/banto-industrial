@@ -316,6 +316,14 @@ pub const POSTGRES_PROTOCOL: &str = "postgres";
 /// [`crate::tag::TagService`]'s hub-tag placement rules.
 pub const HUB_PROTOCOL: &str = "hub";
 
+/// The push-ingest protocol's spelling (docs/banto-hub-ingest-design.md §3.3,
+/// R2a-1b): a connection whose values are pushed *into* banto-hub by an
+/// external sender rather than dialed or subscribed to. Only the constant
+/// exists so far - it is **not** in [`ALLOWED_PROTOCOLS`] (nor the SQL
+/// `CHECK`) until R2a-2a, so no such connection can be saved yet;
+/// `banto_collect::config` already understands the spelling.
+pub const PUSH_PROTOCOL: &str = "push";
+
 /// Field-error message for a second `"hub"` connection (this module's doc
 /// comment, "`\"hub\"`" section - at most one per registry).
 const SECOND_HUB_MESSAGE: &str = "Hub 接続は 1 つまでです（既に登録されています）";
