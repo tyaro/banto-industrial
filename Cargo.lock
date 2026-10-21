@@ -689,6 +689,7 @@ name = "banto-db-source"
 version = "0.2.0-alpha.33"
 dependencies = [
  "sqlx",
+ "tokio",
 ]
 
 [[package]]

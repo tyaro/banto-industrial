@@ -14,7 +14,7 @@
 //! | [`convert`]  | 列型の分類 [`ColumnKind`]、`describe` 用・実行用の生成 SQL、識別子のクォート                  |
 //! | [`resolve`]  | `describe` の結果と欲しい列名の突き合わせ [`resolve_columns`]（未対応型・列なしは Bad）       |
 //! | [`ladder`]   | 品質の梯子の純関数の状態機械 [`GroupLadder`]・[`Verdict`]（Good / Stale / Bad の判断だけ）    |
-//! | [`pg`]       | [`pg_connect_options`]（`sslmode=prefer`）と [`sanitize_postgres_error`]（資格情報を出さない） |
+//! | [`pg`]       | [`pg_connect_options`]（`sslmode=prefer`・サーバー側 `statement_timeout` = [`SERVER_STATEMENT_TIMEOUT`]）と [`sanitize_postgres_error`]（資格情報を出さない） |
 //! | [`poll`]     | 失敗の粒度の分類 [`classify`]・[`PgFailure`]（接続か文か）とクエリのタイムアウト・再 describe の間隔（R2a-3b） |
 //!
 //! `validate_query_sql`（登録時の SQL の検証）はここへ**移さない**。`banto-tags`
@@ -46,6 +46,6 @@ pub use convert::{
     MappedColumn,
 };
 pub use ladder::{cell_verdict, GroupLadder, QueryFailure, Verdict};
-pub use pg::{pg_connect_options, sanitize_postgres_error};
+pub use pg::{pg_connect_options, sanitize_postgres_error, SERVER_STATEMENT_TIMEOUT};
 pub use poll::{classify, describe_retry_interval, query_timeout, PgFailure};
 pub use resolve::{resolve_columns, ColumnBadReason, ResolvedColumns};

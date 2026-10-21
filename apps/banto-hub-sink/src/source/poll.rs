@@ -1122,4 +1122,43 @@ mod tests {
             Some(Some("DB に接続できません".to_string()))
         );
     }
+
+    /// ブリッジの接続（`connect` が組み立てるプール）にも共有 crate のサーバー側
+    /// `statement_timeout`（30 秒）が載る。`BANTO_TEST_PG_URL` が無ければスキップ。
+    #[tokio::test]
+    async fn bridge_connections_carry_the_server_statement_timeout() {
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let parsed: sqlx::postgres::PgConnectOptions = url
+            .parse()
+            .expect("BANTO_TEST_PG_URL should be a valid postgres:// URL");
+        // `PgConnectOptions` はパスワードを読み出せないので URL から取る。
+        let password = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password.to_string());
+        let db = BridgeDbConfig {
+            id: 1,
+            name: "statement-timeout".to_string(),
+            enabled: true,
+            host: parsed.get_host().to_string(),
+            port: i64::from(parsed.get_port()),
+            database: parsed.get_database().map(str::to_string),
+            username: Some(parsed.get_username().to_string()),
+            password,
+        };
+        let spec = PollerSpec::new("statement-timeout-check", &db, &[]);
+        let pool = connect(&spec)
+            .await
+            .expect("connect via the bridge's connect()");
+        let value: String = sqlx::query_scalar("SHOW statement_timeout")
+            .fetch_one(&pool)
+            .await
+            .expect("SHOW statement_timeout");
+        assert_eq!(value, "30s");
+        pool.close().await;
+    }
 }
