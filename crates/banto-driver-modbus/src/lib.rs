@@ -137,6 +137,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         };
         assert_eq!(dial(&conn, 502).slmp_cpu, None);
     }

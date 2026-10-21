@@ -196,23 +196,8 @@ fn validate_query_sql(
             let Some(sql) = trimmed else {
                 return Err(error(required_message()));
             };
-            if sql.chars().count() > MAX_QUERY_SQL_LEN {
-                return Err(error(max_length_message(MAX_QUERY_SQL_LEN)));
-            }
-            if sql.contains(';') {
-                return Err(error(
-                    "SQL は単文で指定してください（';' は使用できません）".to_string(),
-                ));
-            }
-            let first_keyword: String = sql
-                .chars()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .collect::<String>()
-                .to_ascii_uppercase();
-            if first_keyword != "SELECT" && first_keyword != "WITH" {
-                return Err(error(
-                    "SQL は SELECT または WITH で始まる必要があります".to_string(),
-                ));
+            if let Some(message) = query_sql_error(sql) {
+                return Err(error(message));
             }
             Ok(Some(sql.to_string()))
         }
@@ -225,6 +210,33 @@ fn validate_query_sql(
             Ok(None)
         }
     }
+}
+
+/// [`validate_query_sql`] の SQL の形の規則（純関数）: 前後の空白を除いて空でない・
+/// [`MAX_QUERY_SQL_LEN`] 文字以内・`;` なし・先頭のキーワードが `SELECT` か `WITH`。
+/// 破っていればその文言。R2a-2a で `push` のブリッジのクエリ
+/// （`crate::push::validate_push_settings`、ingest-design §3.2「`validate_query_sql`
+/// と同じ規則」）と共有するために切り出した。
+pub(crate) fn query_sql_error(sql: &str) -> Option<String> {
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Some(required_message());
+    }
+    if sql.chars().count() > MAX_QUERY_SQL_LEN {
+        return Some(max_length_message(MAX_QUERY_SQL_LEN));
+    }
+    if sql.contains(';') {
+        return Some("SQL は単文で指定してください（';' は使用できません）".to_string());
+    }
+    let first_keyword: String = sql
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if first_keyword != "SELECT" && first_keyword != "WITH" {
+        return Some("SQL は SELECT または WITH で始まる必要があります".to_string());
+    }
+    None
 }
 
 /// #383 段階3 P2（`crate::plc_connection` の "`\"hub\"`" 節）: グループの現在の
@@ -687,6 +699,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -720,6 +733,7 @@ mod tests {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: None,
+            settings: None,
         }
     }
 
@@ -868,6 +882,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap()
@@ -908,6 +923,7 @@ mod tests {
                         database: None,
                         username: None,
                         password: None,
+                        settings: None,
                     },
                 )
                 .await
@@ -1572,7 +1588,11 @@ mod tests {
         assert_eq!(groups_before.len(), 3);
         assert_eq!(tags_before.len(), 3);
 
-        migrate(&pool).await.expect("0022 should apply");
+        // Up to 0022 only (not `crate::migrate`): the object list below is
+        // 0022's world. Later migrations add their own objects (0024's push
+        // triggers) and are checked by their own tests
+        // (`plc_connection`'s `migration_0023_and_0024_*`).
+        migrator.run_to(22, &pool).await.expect("0022 should apply");
 
         let groups_after: Vec<String> = sqlx::query_scalar(GROUP_ROW_SQL)
             .fetch_all(&pool)

@@ -144,6 +144,12 @@ impl From<PlcConnectionPayload> for PlcConnectionInput {
             database: payload.database,
             username: payload.username,
             password: payload.password,
+            // R2a-2a: the REST payload does not carry `settings` yet (R2a-2e adds
+            // it with the push form). `None` = defaults on create and "keep the
+            // stored value" on update (`banto_tags::PlcConnectionInput::settings`),
+            // so an update through this payload never wipes a push connection's
+            // settings.
+            settings: None,
         }
     }
 }

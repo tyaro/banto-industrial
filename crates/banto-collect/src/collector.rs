@@ -1574,6 +1574,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             };
             let group_input = |conn: i64| CollectionGroupInput {
                 name: format!("G{conn}"),

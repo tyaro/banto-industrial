@@ -303,6 +303,7 @@ async fn create_connection(pool: &SqlitePool, name: &str, protocol: &str, port: 
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("create connection")

@@ -104,6 +104,7 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 
@@ -1285,6 +1286,7 @@ async fn mqtt_payload_carries_value_source_across_run_modes() {
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .unwrap();

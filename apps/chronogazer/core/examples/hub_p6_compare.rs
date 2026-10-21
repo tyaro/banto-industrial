@@ -682,6 +682,7 @@ async fn register_direct(
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .map_err(|e| format!("直結の接続を登録できない: {e}"))?;

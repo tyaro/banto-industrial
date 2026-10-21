@@ -398,6 +398,7 @@ async fn prepare_root_db(layout: &DataLayout, plc_port: Option<u16>) {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("接続");

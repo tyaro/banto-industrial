@@ -308,6 +308,7 @@ async fn register(
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("接続");

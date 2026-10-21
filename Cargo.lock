@@ -788,6 +788,7 @@ dependencies = [
  "banto-collect",
  "banto-core",
  "banto-driver-api",
+ "banto-driver-conformance",
  "banto-expr",
  "banto-instance-lock",
  "banto-opcua-server",

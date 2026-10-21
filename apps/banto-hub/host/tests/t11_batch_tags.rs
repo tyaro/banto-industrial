@@ -100,6 +100,7 @@ fn disabled_conn_input(name: &str) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

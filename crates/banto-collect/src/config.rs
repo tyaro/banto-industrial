@@ -500,7 +500,7 @@ impl RegistrySnapshot {
         // preflight with "no column found" even though the table has the column.
         let connections = sqlx::query_as::<_, PlcConnection>(
             "SELECT id, name, protocol, host, port, unit_id, enabled, simulation, word_order, \
-             cpu_type, database, username, password \
+             cpu_type, database, username, password, settings \
              FROM plc_connections ORDER BY id",
         )
         .fetch_all(&mut *connection)
@@ -1720,6 +1720,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         }
     }
 
@@ -2547,6 +2548,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -2609,6 +2611,7 @@ mod tests {
                 database: Some("erp".to_string()),
                 username: Some("reader".to_string()),
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3564,8 +3567,9 @@ mod tests {
     }
 
     // ---- R2a-1b: "push" connections (hand-built snapshots) ----------------
-    // `ALLOWED_PROTOCOLS` / the SQL CHECK do not accept "push" until R2a-2a,
-    // so these cannot go through the services.
+    // Written before R2a-2a let `ALLOWED_PROTOCOLS` / the SQL CHECK accept
+    // "push"; hand-built snapshots keep these independent of the services.
+    // `load_connection_reads_a_push_row_with_settings` goes through them.
 
     fn push_conn(id: i64, name: &str) -> PlcConnection {
         PlcConnection {
@@ -3582,6 +3586,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         }
     }
 
@@ -3632,6 +3637,59 @@ mod tests {
                 tag_of(704, 70, "count", "u64"),
             ],
         }
+    }
+
+    /// R2a-2a: a "push" row saved through the services (now that the CHECK
+    /// accepts it) reads back through both registry readers with its
+    /// `settings` - `load_connection`'s hand-written SELECT names the new
+    /// column (implementation-checklist §5, #605) - and plans as an external
+    /// connection when the runtime can receive pushes.
+    #[tokio::test]
+    async fn load_connection_reads_a_push_row_with_settings() {
+        let pool = registry().await;
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                protocol: PUSH_PROTOCOL.to_string(),
+                ..conn_input("Bridge1", 0)
+            })
+            .await
+            .unwrap();
+        // (This crate has no serde_json of its own; the column is JSON text.)
+        sqlx::query(
+            "UPDATE plc_connections SET settings = '{\"stale_timeout_ms\":2000}' WHERE id = ?",
+        )
+        .bind(conn.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", conn.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, " line1.temp "))
+            .await
+            .unwrap();
+
+        let loaded = RegistrySnapshot::load(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let in_tx = RegistrySnapshot::load_connection(&mut tx).await.unwrap();
+        drop(tx);
+        assert_eq!(loaded.connections, in_tx.connections);
+        assert_eq!(
+            in_tx.connections[0]
+                .settings
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some(r#"{"stale_timeout_ms":2000}"#)
+        );
+
+        let config = build_config_from_with(&in_tx, PushSource::Available).unwrap();
+        assert_eq!(config.connections[0].config, ProtocolConfig::External);
+        assert_eq!(config.external_names(), vec!["line1.temp".to_string()]);
+        // ChronoGazer's (and today's Hub's) strict build still refuses it.
+        assert!(build_config_from(&in_tx).is_err());
     }
 
     #[test]

@@ -4835,6 +4835,7 @@ mod tests {
                             database: None,
                             username: None,
                             password: None,
+                            settings: None,
                         },
                     )
                     .await
@@ -4932,6 +4933,7 @@ mod tests {
                             database: None,
                             username: None,
                             password: None,
+                            settings: None,
                         },
                     )
                     .await

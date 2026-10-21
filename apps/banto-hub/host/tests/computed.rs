@@ -108,6 +108,7 @@ fn modbus_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 
@@ -126,6 +127,7 @@ fn virtual_conn_input(name: &str) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 
@@ -1136,6 +1138,7 @@ fn slmp_conn_input(name: &str, simulation: bool) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

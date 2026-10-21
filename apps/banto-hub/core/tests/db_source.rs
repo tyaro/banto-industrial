@@ -165,6 +165,7 @@ fn pg_conn_input(name: &str, target: &PgTarget) -> PlcConnectionInput {
         database: Some(target.database.clone()),
         username: Some(target.username.clone()),
         password: target.password.clone(),
+        settings: None,
     }
 }
 

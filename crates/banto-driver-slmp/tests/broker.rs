@@ -45,6 +45,7 @@ fn conn(id: i64, protocol: &str, host: &str, port: u16) -> PlcConnection {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

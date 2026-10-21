@@ -31,6 +31,7 @@ fn slmp_conn(id: i64, port: u16) -> PlcConnection {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

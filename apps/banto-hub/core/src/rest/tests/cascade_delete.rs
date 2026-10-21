@@ -170,6 +170,7 @@ async fn plc_connections_delete_still_refuses_a_virtual_connection() {
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .unwrap();

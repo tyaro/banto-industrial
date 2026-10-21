@@ -325,6 +325,7 @@ async fn register_hub_specs(
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("Hub 接続を登録できる");

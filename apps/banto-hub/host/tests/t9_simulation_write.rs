@@ -102,6 +102,7 @@ fn conn_input(name: &str, protocol: &str, port: u16, simulation: bool) -> PlcCon
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

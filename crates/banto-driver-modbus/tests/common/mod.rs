@@ -123,6 +123,7 @@ fn connection_from(settings: &Settings) -> Result<(PlcConnection, u16), FatalErr
         database: None,
         username: None,
         password: None,
+        settings: None,
     };
     Ok((conn, port))
 }

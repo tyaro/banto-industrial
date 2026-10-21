@@ -464,6 +464,7 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
             database: Some(target.database.clone()),
             username: Some(target.username.clone()),
             password: target.password.clone(),
+            settings: None,
         })
         .await
         .expect("postgres connection");

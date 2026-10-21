@@ -175,6 +175,7 @@ async fn register(pool: &SqlitePool, port: u16) -> Vec<RegisteredGroup> {
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("PLC 接続を登録できる");

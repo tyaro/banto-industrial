@@ -133,6 +133,7 @@ async fn register(pool: &SqlitePool, protocol: &str, port: u16, address: &str) -
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("PLC 接続を登録できる");
