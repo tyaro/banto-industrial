@@ -16,6 +16,11 @@ banto-storage = { workspace = true, features = ["sqlite"] }
 # deliberately avoids (tokio/slmp/encoding_rs - see `tag.rs`'s
 # `modbus_read_only_area` doc comment).
 banto-plc-address = { path = "../banto-plc-address" }
+# R2b-1c (docs/banto-hub-connection-settings-design.md §4.2): `settings_json.rs` turns a
+# connection's JSON `settings` into `banto_driver_api::Settings` and validates it through a
+# `DriverRegistry` (`PlcConnectionService::with_registry`). Dependency-free, and it does not
+# depend on this crate, so there is no cycle.
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # `migrate`: this crate embeds its own schema (`migrations/`) via

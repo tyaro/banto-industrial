@@ -18,7 +18,8 @@ banto-collect = { path = "../banto-collect" }
 # R1-4a: `builtin().broker` の 2 行（`("slmp", ..)`・`("modbus-tcp", ..)`）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }
-# R1-4b: `settings_from_connection(&PlcConnection)`、トリップワイヤ（`ALLOWED_PROTOCOLS`）。
+# R1-4b: トリップワイヤ（`ALLOWED_PROTOCOLS`）。R2b-1c: `settings_to_api(settings_from_flat(..))`
+# （R1 の `settings_from_connection` の後継）のテスト。
 banto-tags = { path = "../banto-tags" }
 
 [dev-dependencies]

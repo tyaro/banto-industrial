@@ -33,17 +33,17 @@
 //!   `DriverKind::HostBound` entries (their `DriverBase`: identity, settings
 //!   validation, address functions; the I/O stays in `broker`). Nothing on the
 //!   production path reads it yet (design §6.2); the tripwire tests below do
-//!   (§6.3 items 1, 2, 4), and [`settings_from_connection`] is the pure
-//!   function that turns a connection row into the `Settings` the registry's
-//!   `validate_config` takes (§3.5).
+//!   (§6.3 items 1, 2, 4). The `Settings` the registry's `validate_config`
+//!   takes come from `banto_tags::settings_to_api` over the connection's
+//!   `settings` (R2b-1c replaced the R1 `settings_from_connection`, which
+//!   built them from the fixed columns; connection-settings design §3.5).
 //! - `examples/real_plc_verify.rs` (the real-PLC check, moved here from
 //!   `banto-broker` by R1-4a) spawns its broker with `builtin().broker`, so
 //!   it exercises exactly the table a host injects.
 
 use banto_broker::{DialFn, DriverTable};
 use banto_collect::ClientFactory;
-use banto_driver_api::{keys, DriverEntry, DriverId, DriverRegistry, Settings};
-use banto_tags::PlcConnection;
+use banto_driver_api::{DriverEntry, DriverId, DriverRegistry};
 
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {
@@ -78,29 +78,6 @@ fn registry() -> DriverRegistry {
             .expect("builtin driver ids are distinct");
     }
     registry
-}
-
-/// The [`Settings`] a connection row stands for (design §3.5): its fixed
-/// columns under the shared keys, in the UI's order - `host`, `port`,
-/// `unit_id`, `word_order`, and `cpu_type` for `"slmp"` only (#605; no other
-/// protocol reads it). `unit_id` is carried for every protocol (SLMP ignores
-/// it, the column's default is in the row anyway). No timeouts and no
-/// `transport` (the columns do not exist; absent means the driver's default,
-/// and R1's transport is always `tcp`).
-///
-/// A pure function: the row's own validity is `banto-tags`' job, so `port`
-/// and `unit_id` are written as they are (even out of range) and the driver's
-/// `validate_config` is what reports them.
-pub fn settings_from_connection(conn: &PlcConnection) -> Settings {
-    let mut settings = Settings::new();
-    settings.insert(keys::HOST, conn.host.as_str());
-    settings.insert(keys::PORT, conn.port.to_string());
-    settings.insert(keys::UNIT_ID, conn.unit_id.to_string());
-    settings.insert(keys::WORD_ORDER, conn.word_order.as_str());
-    if conn.protocol == banto_driver_slmp::PROTOCOL {
-        settings.insert(keys::CPU_TYPE, conn.cpu_type.as_str());
-    }
-    settings
 }
 
 /// The broker table of the built-in drivers (see [`Builtin::broker`]).
@@ -313,23 +290,51 @@ mod tests {
         }
     }
 
-    // ---- settings_from_connection (design §3.5) ----
+    // ---- settings_to_api(settings_from_flat(..)) (connection-settings design §3.5) ----
+
+    use banto_driver_api::Settings;
+    use banto_tags::settings_json::legacy::settings_from_flat;
+    use banto_tags::{settings_to_api, PlcConnectionInput};
 
     fn pairs(settings: &Settings) -> Vec<(&str, &str)> {
-        settings
+        let mut pairs: Vec<(&str, &str)> = settings
             .iter()
             .map(|s| (s.key.as_str(), s.value.as_str()))
-            .collect()
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    fn input(protocol: &str, port: i64) -> PlcConnectionInput {
+        PlcConnectionInput {
+            name: "c".to_string(),
+            protocol: protocol.to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: None,
+            username: None,
+            password: None,
+            settings: None,
+        }
+    }
+
+    fn settings_of(input: &PlcConnectionInput) -> Settings {
+        settings_to_api(&settings_from_flat(input))
     }
 
     #[test]
     fn settings_from_a_modbus_connection() {
-        let mut c = conn(1, "modbus-tcp", 502);
+        let mut c = input("modbus-tcp", 502);
         c.unit_id = 7;
         c.word_order = "high_low".to_string();
-        c.cpu_type = "Q".to_string(); // a stray value: Modbus does not carry it
+        c.cpu_type = Some("Q".to_string()); // a stray value: Modbus does not carry it
         assert_eq!(
-            pairs(&settings_from_connection(&c)),
+            pairs(&settings_of(&c)),
             [
                 ("host", "127.0.0.1"),
                 ("port", "502"),
@@ -339,50 +344,51 @@ mod tests {
         );
     }
 
+    /// SLMP carries `cpu_type` and (unlike R1's `settings_from_connection`) no
+    /// `unit_id`: the driver never read it (design §3.2).
     #[test]
-    fn settings_from_an_slmp_connection_carry_the_cpu_type() {
-        let mut c = conn(2, "slmp", 5000);
-        c.cpu_type = "Q".to_string();
+    fn settings_from_an_slmp_connection_carry_the_cpu_type_and_no_unit_id() {
+        let mut c = input("slmp", 5000);
+        c.cpu_type = Some("Q".to_string());
         assert_eq!(
-            pairs(&settings_from_connection(&c)),
+            pairs(&settings_of(&c)),
             [
+                ("cpu_type", "Q"),
                 ("host", "127.0.0.1"),
                 ("port", "5000"),
-                ("unit_id", "1"),
                 ("word_order", "low_high"),
-                ("cpu_type", "Q"),
             ]
         );
     }
 
     /// What the host does with the pair: the registry's `validate_config`
     /// accepts a valid row's settings, and reports (not panics on) a row
-    /// whose columns are out of range.
+    /// whose settings are out of range.
     #[test]
-    fn registered_drivers_validate_settings_from_connection() {
+    fn registered_drivers_validate_settings_from_flat() {
         let registry = builtin().registry;
         for (protocol, port) in [("modbus-tcp", 502), ("slmp", 5000)] {
             let driver = registry.get(protocol).unwrap().base();
-            let ok = settings_from_connection(&conn(1, protocol, port));
+            let ok = settings_of(&input(protocol, port));
             assert_eq!(driver.validate_config(&ok), vec![], "{protocol}");
 
-            let mut bad = conn(1, protocol, port);
-            bad.port = 70_000;
+            let mut bad = input(protocol, 70_000);
             bad.host = String::new();
-            let keys: Vec<String> = driver
-                .validate_config(&settings_from_connection(&bad))
+            let mut keys: Vec<String> = driver
+                .validate_config(&settings_of(&bad))
                 .into_iter()
                 .map(|e| e.key)
                 .collect();
+            keys.sort();
             assert_eq!(keys, ["host", "port"], "{protocol}");
         }
-        let mut bad_cpu = conn(1, "slmp", 5000);
-        bad_cpu.cpu_type = "L".to_string();
+        let mut bad_cpu = input("slmp", 5000);
+        bad_cpu.cpu_type = Some("L".to_string());
         let errors = registry
             .get("slmp")
             .unwrap()
             .base()
-            .validate_config(&settings_from_connection(&bad_cpu));
+            .validate_config(&settings_of(&bad_cpu));
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].key, "cpu_type");
     }

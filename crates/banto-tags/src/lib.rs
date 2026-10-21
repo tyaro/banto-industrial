@@ -24,6 +24,13 @@
 //!   (#533, 2026-10-08 owner decision: しきい値は使う側（記録計・SCADA）の
 //!   設定) - migration 0018 dropped the `threshold_*` columns
 //!
+//! - [`settings_json`] (R2b-1c, docs/banto-hub-connection-settings-design.md
+//!   §3.5・§4.2・§4.3): a connection's JSON `settings` -> the driver API's
+//!   `Settings` ([`settings_to_api`]), the flat-columns <-> `settings` adapter
+//!   (`settings_json::legacy`) and validation through a `DriverRegistry`
+//!   ([`validate_settings_with_registry`], [`PlcConnectionService::with_registry`]).
+//!   Not used by the save path yet.
+//!
 //! This crate is also the first real-world proof of consuming `banto-core`/
 //! `banto-storage` via a git tag reference rather than a workspace path
 //! (banto's `docs/publishing.md`) - see `Cargo.toml`.
@@ -40,6 +47,7 @@ pub mod collection_group;
 pub mod plc_connection;
 pub mod push;
 pub mod scaling;
+pub mod settings_json;
 pub mod tag;
 
 // Crate-internal helpers shared by the three entity modules above - not
@@ -62,6 +70,7 @@ pub use push::{
     MAX_PUSH_KEY_LEN, MAX_STALE_TIMEOUT_MS, MIN_STALE_TIMEOUT_MS, PUSH_LIMITS,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
+pub use settings_json::{settings_to_api, validate_settings_with_registry};
 pub use tag::{
     validate_hub_tag_address, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
     BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput,
