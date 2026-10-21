@@ -115,11 +115,11 @@ const G = {
 		{
 			name: 'banto-hub-core',
 			dir: 'apps/banto-hub/core',
-			// R1-7a: banto-drivers は dev-dependency だけ（bin が banto-hub-host へ移った。
-			// src 内の単体テストと tests/ が実ドライバを使う。R2b-0 で外す）。
+			// R2b-0: banto-drivers には dev-dependency でも依存しない（R1-7a で bin が
+			// banto-hub-host へ移り、R2b-0 で実ドライバを使うテストも host へ移した。src 内の
+			// 単体テストは偽のドライバ表、tests/ に残った統合テストは HubDrivers::none()）。
 			deps: [
 				'banto-driver-api',
-				'banto-drivers',
 				'banto-instance-lock',
 				'banto-safe-root',
 				'banto-service-control',
@@ -128,10 +128,12 @@ const G = {
 			]
 		},
 		// R1-7a: bin `banto-hub`・`banto-hub-elev` の package。banto-drivers を normal で持つ。
+		// R2b-0: core から移した統合テスト（tests/）の dev-dependency に banto-tags（ほかに
+		// banto-plc・broker・collect なども持つが、core と同じく G には写していない）。
 		{
 			name: 'banto-hub-host',
 			dir: 'apps/banto-hub/host',
-			deps: ['banto-drivers', 'banto-hub-core', 'banto-safe-root']
+			deps: ['banto-drivers', 'banto-hub-core', 'banto-safe-root', 'banto-tags']
 		},
 		{
 			name: 'banto-hub-shell',
@@ -376,7 +378,7 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-driver-conformance（R1-2 の公開 crate。driver-api ジョブが走る。R1-5 から Modbus / SLMP のドライバが dev-dependency で使うので、その逆依存の hub 側も走る）',
+		'banto-driver-conformance（R1-2 の公開 crate。driver-api ジョブが走る。R1-5 から Modbus / SLMP のドライバが dev-dependency で使うので、その逆依存の hub 側も走る。R2b-0 から banto-hub-core は入らない）',
 		[
 			'crates/banto-driver-conformance/src/frame.rs',
 			'crates/banto-driver-conformance/CHANGELOG.md'
@@ -385,7 +387,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -393,26 +395,25 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-drivers（R1-3b の内部 crate）は hub の 4 パッケージが使う（R1-7a から host は normal、core・sink は dev）。公開 crate ではないので driver-api ジョブは走らない',
+		'banto-drivers（R1-3b の内部 crate）は hub の 3 パッケージが使う（host は normal、sink は dev。banto-hub-core は R2b-0 で dev からも外した）。公開 crate ではないので driver-api ジョブは走らない',
 		['crates/banto-drivers/src/lib.rs'],
 		{
 			...NONE,
 			run_rust: true,
-			rust_args:
-				'-p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			rust_args: '-p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
 		}
 	],
 	[
-		'banto-driver-modbus（R1-6 の行。lib.rs だけの変更。banto-drivers 経由で hub の 4 パッケージへ届く。banto-hub-core へは dev-dependency 経由で届くが、R2b-0 でこの行を書き換えて banto-hub-core を外す）',
+		'banto-driver-modbus（R1-6 の行、R2b-0 で書き換え。lib.rs だけの変更。banto-drivers 経由で hub の 3 パッケージ（host・shell・sink）へ届く。banto-hub-core は banto-drivers に dev-dependency でも依存しないので入らない。Hub の E2E は host が対象なので走る）',
 		['crates/banto-driver-modbus/src/lib.rs'],
 		{
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-modbus -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-modbus -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true

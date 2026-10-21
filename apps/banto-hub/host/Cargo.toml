@@ -43,6 +43,47 @@ windows-sys = { version = "0.61", features = [
 # `bin/banto_hub/win_service_tests.rs`（Windows 専用）の
 # `#[tokio::test(flavor = "multi_thread")]` と `tokio::time::timeout`。
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# R2b-0: `tests/soak.rs` の RSS サンプリング（`GetProcessMemoryInfo`）。core の
+# `[target.'cfg(windows)'.dev-dependencies]` から写した（同じ 0.61 系。新しい版は増えない）。
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+# R2b-0（docs/banto-driver-api-design.md §2.4）: 実ドライバ（`banto-drivers`、上の normal
+# の依存）で SLMP / Modbus を Hub に通す統合テスト（`tests/*.rs`）を
+# `apps/banto-hub/core/tests/` から移した。core は `banto-drivers` に dev でも依存しなく
+# なり、ドライバだけの変更で core が CI に選ばれない。ここに並ぶのは、それらのテストが
+# 使う分を core の `[dev-dependencies]` / `[dependencies]` から写したもの（features も同じ）。
+# `tests/common/mod.rs` は core の `tests/common/mod.rs` を `#[path]` で読み、
+# `hub_drivers()`（`builtin()`）だけを足す。
+[dev-dependencies]
+# `net` は空きポートの探索と TCP のプローブ、`test-util` は core と同じ（仮想時計）。
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true, features = ["util"] }
+serde_json = { workspace = true }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate", "postgres", "tls-rustls-ring-native-roots"] }
+futures-util = { workspace = true }
+banto-core = { workspace = true }
+banto-server = { workspace = true }
+banto-tags = { path = "../../../crates/banto-tags" }
+banto-tstore = { path = "../../../crates/banto-tstore" }
+banto-collect = { path = "../../../crates/banto-collect" }
+banto-broker = { path = "../../../crates/banto-broker" }
+# Modbus TCP のシミュレータ（`banto-plc` の `simulator` feature）と、読み書きできる
+# SLMP のシミュレータ（`banto-plc-write` の同 feature）。
+banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
+banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
+# `tests/grpc.rs` のクライアント（`tonic::transport::Channel`）。
+tonic = { workspace = true }
+# `tests/stream.rs`・`tests/soak.rs` の WebSocket クライアント。
+tokio-tungstenite = { workspace = true }
+# `tests/mqtt.rs`・`tests/soak.rs`: 購読側のクライアントと、組み込みのブローカー
+# （core の dev と同じ 0.20.x。本番の bin はブローカーを持たない）。
+rumqttc = { workspace = true }
+rumqttd = { version = "0.20", default-features = false }
 
 [build-dependencies]
 # T17-2 スライス2（docs/banto-hub-t17-design.md §3「T17-2」）: build.rs が

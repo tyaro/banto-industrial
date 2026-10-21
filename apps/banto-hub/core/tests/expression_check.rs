@@ -3,10 +3,10 @@
 //! と、同じロジックを共有する MCP ツール `check_expression`
 //! （`crate::mcp::tool_check_expression`）。
 //!
-//! `tests/computed.rs`/`tests/mcp.rs` と同じ理由でこのファイル自身が
+//! `apps/banto-hub/host/tests/computed.rs`/`apps/banto-hub/host/tests/mcp.rs` と同じ理由でこのファイル自身が
 //! `test_app`/`admin_post`/`mcp_post` 等を複製している（各 `tests/*.rs` は
 //! 独立クレートとしてコンパイルされ、private helper を共有できない -
-//! `tests/computed.rs` 冒頭の doc comment参照）。PLC 実機・シミュレータは
+//! `apps/banto-hub/host/tests/computed.rs` 冒頭の doc comment参照）。PLC 実機・シミュレータは
 //! 一切使わない - この API が読むのは `calc`/`mem`（仮想接続）の
 //! 演算タグ・内部タグだけで十分にすべての分岐を再現できる。
 //!
@@ -217,7 +217,9 @@ async fn test_app(label: &str) -> TestApp {
 
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
-        common::hub_drivers(),
+        // R2b-0: ドライバ無し（このテストは PLC と通信しない。core は
+        // banto-drivers に依存しない。docs/banto-driver-api-design.md §2.4）。
+        banto_hub_core::broker_glue::HubDrivers::none(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
@@ -233,7 +235,7 @@ async fn test_app(label: &str) -> TestApp {
 
     // T6-2 (design §4.2/§4.3(a)): the real binary auto-provisions these at
     // startup - this harness does the same directly against the registry
-    // (`tests/computed.rs::test_app` と同じ手順).
+    // (`apps/banto-hub/host/tests/computed.rs::test_app` と同じ手順).
     for name in [CALC_CONNECTION_NAME, MEM_CONNECTION_NAME] {
         PlcConnectionService::new(pool.clone())
             .create(virtual_conn_input(name))

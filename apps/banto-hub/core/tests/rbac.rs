@@ -3,7 +3,7 @@
 //! `apps/banto-hub/core/src/rest.rs`の書き込み系 REST エンドポイントに掛かる
 //! 認可(`require_editor`ゲート・`RoleGuard`)を role 別の拒否/許可として
 //! **表駆動で REST テストに固定する**(E2E は使わない、機械的なカバレッジ
-//! 埋め)。`tests/t12_connection_test.rs`と同じ理由(各`tests/*.rs`は独立した
+//! 埋め)。`apps/banto-hub/host/tests/t12_connection_test.rs`と同じ理由(各`tests/*.rs`は独立した
 //! クレートとしてコンパイルされ、private helper を共有できない)で
 //! `TestApp`/`test_app`/`admin_write`相当をこのファイル内に複製している
 //! (t12 のものをベースにした)。
@@ -140,7 +140,9 @@ async fn test_app(label: &str) -> TestApp {
 
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
-        common::hub_drivers(),
+        // R2b-0: ドライバ無し（このテストは PLC と通信しない。core は
+        // banto-drivers に依存しない。docs/banto-driver-api-design.md §2.4）。
+        banto_hub_core::broker_glue::HubDrivers::none(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));

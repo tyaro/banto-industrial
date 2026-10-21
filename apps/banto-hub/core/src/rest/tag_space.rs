@@ -29,7 +29,7 @@ use super::{
 // `ApiDoc`（このセクション末尾）にまとめて `GET /api/v1/openapi.json` で
 // 配信する。**wire 形式（フィールド名・JSON 形）は T0-1 から一切変えて
 // いない** - 型を導入しただけで、実際に流れる JSON は
-// `apps/banto-hub/core/tests/integration.rs` の T0-1 時点のアサーションと
+// `apps/banto-hub/host/tests/integration.rs` の T0-1 時点のアサーションと
 // 完全に同じ（このセクションの各関数 doc comment に旧来の json! リテラルの
 // 形を残してあるのはそのため）。
 

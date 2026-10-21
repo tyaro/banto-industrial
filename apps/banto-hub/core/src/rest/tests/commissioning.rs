@@ -369,7 +369,7 @@ async fn the_commissioning_grant_can_delete_users_but_not_the_last_admin() {
 /// 認証が必要な `GET /api/users` は 401、status の `grants.commissioning` は
 /// false。保留は `GrantSpec.enabled` を包んで「判定の結果を返す前に待つ」
 /// ことで作る（判定と挿入のあいだに失効が割り込む形）。開いていたストリームが
-/// 再検証で閉じることは `tests/stream.rs` の
+/// 再検証で閉じることは `apps/banto-hub/host/tests/stream.rs` の
 /// `a_commissioning_grant_stream_closes_within_an_interval_after_lock_down`
 /// （実 TCP が要る）が同じ失効で固定する。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

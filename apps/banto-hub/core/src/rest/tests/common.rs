@@ -267,7 +267,7 @@ pub(super) async fn issue_api_key(
 }
 
 /// 同型の汎用ヘルパ(H10 ③ のタグ seed フィクスチャで複数リソースを
-/// 作るため、`tests/grpc.rs`/`tests/computed.rs` の `admin_post` と
+/// 作るため、`apps/banto-hub/host/tests/grpc.rs`/`apps/banto-hub/host/tests/computed.rs` の `admin_post` と
 /// 同じ形をここにも用意する)。
 pub(super) async fn admin_post(
     router: &Router,

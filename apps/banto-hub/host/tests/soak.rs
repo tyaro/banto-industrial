@@ -18,7 +18,7 @@
 //! - 通常の `cargo test` では短時間版（[`mini_soak_collect_ws_mqtt_stay_alive`]）
 //!   だけが走る。
 //! - 長時間版（[`long_soak_collect_ws_mqtt_stay_alive`]）は `#[ignore]` 付き。
-//!   `cargo test -p banto-hub-core --test soak -- --ignored` で明示実行する。
+//!   `cargo test -p banto-hub-host --test soak -- --ignored` で明示実行する。
 //!   既定の実行時間は 60 秒（このセッションで実際に動作確認できる長さ） -
 //!   `SOAK_DURATION_SECS` 環境変数で上書きできる。**本番の 72h ソーク**は
 //!   `SOAK_DURATION_SECS=259200`（72*3600）を指定して明示実行する
@@ -1033,7 +1033,7 @@ async fn mini_soak_collect_ws_mqtt_stay_alive_for_several_seconds() {
 /// 収集 + WS 購読 + MQTT 発行を同時に維持した長時間ソーク。既定 60 秒
 /// （このセッションで実際に動作確認できる長さ）。`SOAK_DURATION_SECS`
 /// 環境変数で上書き可能 - **本番の 72h 出荷判定ソーク**は
-/// `SOAK_DURATION_SECS=259200 cargo test -p banto-hub-core --test soak -- \
+/// `SOAK_DURATION_SECS=259200 cargo test -p banto-hub-host --test soak -- \
 /// --ignored --nocapture` で明示実行する(手順は
 /// docs/banto-hub-operations.md「72h 出荷判定ソークテスト」節、判定基準の
 /// 一次ソースは docs/recorder-requirements.md §4・docs/tag-server-design.md
