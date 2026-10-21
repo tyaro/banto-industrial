@@ -41,6 +41,14 @@
 //! クエリ [`query_timeout`]）で終わるのを待ってから抜け、プールを閉じる。止める側
 //! （[`super::session`]）は `JoinHandle` を手放さずに終わりを待つ。
 //!
+//! **止めた後は新しい SQL を 1 本も始めない**（PR #764 のオーナーレビュー P2）。止める合図
+//! （`stop` が `true`・合図の送り手が居なくなった・送り手の受け口が閉じた -
+//! [`should_stop`]）を、接続が終わった直後・describe（最初の describe の各クエリと、
+//! describe し直し）の前・クエリの前に毎回見る。飛行中の 1 本は上限まで待つが、その後に
+//! 残りのクエリの describe を始めてプールを最大 30 秒 × 本数まで持ち続けることはしない
+//! （新しい世代の問い合わせのタスクと DB 上で重ならない）。止めたら全キー `bad` も送らずに
+//! 戻り、プールを閉じる。
+//!
 //! ## 資格情報
 //!
 //! エラーの文言は [`banto_db_source::sanitize_postgres_error`]（[`classify`] の中）を通した
@@ -370,6 +378,13 @@ impl Events<'_> {
     }
 }
 
+/// 止めるべきか（止める合図・合図の送り手が居なくなった・送り手の受け口が閉じた）。
+/// 新しい SQL（describe・クエリ）を始める前と接続の直後に見る（このモジュールの doc
+/// 「止め方」）。
+fn should_stop(stop: &watch::Receiver<bool>, tx: &mpsc::Sender<PollEvent>) -> bool {
+    *stop.borrow() || stop.has_changed().is_err() || tx.is_closed()
+}
+
 /// 合図が来るまで `duration` 眠る。合図が来た（か送り手が居なくなった）ら `true`。
 async fn sleep_or_stop(duration: Duration, stop: &mut watch::Receiver<bool>) -> bool {
     if *stop.borrow() {
@@ -397,10 +412,18 @@ pub async fn run_poller(
     let mut attempt: u32 = 0;
     let mut last_delay: Option<Duration> = None;
     loop {
-        if *stop.borrow() {
+        if should_stop(&stop, &tx) {
             return;
         }
-        let failure = match connect(&spec).await {
+        let connected = connect(&spec).await;
+        // 接続の間に止められた: 問い合わせを始めず、全キー `bad` も送らずに戻る。
+        if should_stop(&stop, &tx) {
+            if let Ok(pool) = connected {
+                pool.close().await;
+            }
+            return;
+        }
+        let failure = match connected {
             Ok(pool) => {
                 if attempt > 0 {
                     log_line(&format!(
@@ -415,6 +438,8 @@ pub async fn run_poller(
                 pool.close().await;
                 match outcome {
                     PollOutcome::Stopped => return,
+                    // 接続の失敗で抜けたときも、止められていれば `bad` を送らずに戻る。
+                    PollOutcome::ConnectionLost(_) if should_stop(&stop, &tx) => return,
                     PollOutcome::ConnectionLost(message) => message,
                 }
             }
@@ -509,6 +534,10 @@ async fn poll_until_failure(
     let now = Instant::now();
     let mut queries = Vec::with_capacity(spec.queries.len());
     for (index, plan) in spec.queries.iter().enumerate() {
+        // 止めたら残りのクエリの describe を始めない。
+        if should_stop(stop, events.tx) {
+            return PollOutcome::Stopped;
+        }
         let (state, next_describe_retry) = match describe(pool, &plan.sql).await {
             Ok(described) => {
                 events.status.queries[index] = None;
@@ -568,12 +597,12 @@ async fn poll_until_failure(
         if due > now && sleep_or_stop(due - now, stop).await {
             return PollOutcome::Stopped;
         }
-        if *stop.borrow() {
+        if should_stop(stop, events.tx) {
             return PollOutcome::Stopped;
         }
 
         let query = &mut queries[index];
-        match run_tick(pool, spec, index, query, events).await {
+        match run_tick(pool, spec, index, query, events, stop).await {
             TickOutcome::Continue => {}
             TickOutcome::ConnectionLost(message) => return PollOutcome::ConnectionLost(message),
             TickOutcome::Stopped => return PollOutcome::Stopped,
@@ -605,6 +634,7 @@ async fn run_tick(
     index: usize,
     query: &mut QueryRuntime,
     events: &mut Events<'_>,
+    stop: &watch::Receiver<bool>,
 ) -> TickOutcome {
     let name = query.state.plan.name.clone();
     // describe し直す（Hub 内の Source と同じ: SQL を投げていない・Bad の梯子に乗った
@@ -640,6 +670,10 @@ async fn run_tick(
         let items = query.state.without_query();
         return cycle_outcome(events.cycle(index, items).await);
     };
+    // describe し直している間に止められたら、クエリを始めない。
+    if should_stop(stop, events.tx) {
+        return TickOutcome::Stopped;
+    }
 
     let timeout = query_timeout(query.state.plan.period_ms);
     // AssertSqlSafe: `describe` と同じ理由（列名は共有 crate の `quote_ident` を必ず通る）。
@@ -853,6 +887,204 @@ mod tests {
         // 同じ describe の結果はもう採らない（SQL を投げている間）。
         assert!(!state.adopt_redescribed(&described(&[("a", "INT4"), ("b", "INT4")])));
         assert!(state.adopt_redescribed(&described(&[("a", "INT4"), ("b", "TEXT")])));
+    }
+
+    // --- 止め方（PR #764 のオーナーレビュー P2）--------------------------------
+
+    fn db_config(
+        host: &str,
+        port: i64,
+        database: &str,
+        user: &str,
+        password: &str,
+    ) -> BridgeDbConfig {
+        BridgeDbConfig {
+            id: 1,
+            name: "pg".to_string(),
+            enabled: true,
+            host: host.to_string(),
+            port,
+            database: Some(database.to_string()),
+            username: Some(user.to_string()),
+            password: Some(password.to_string()),
+        }
+    }
+
+    fn query_config(name: &str, sql: &str) -> BridgeQueryConfig {
+        BridgeQueryConfig {
+            name: name.to_string(),
+            period_ms: 1_000,
+            sql: sql.to_string(),
+            columns: vec![BridgeColumnConfig {
+                column: "a".to_string(),
+                key: format!("{name}.a"),
+            }],
+        }
+    }
+
+    /// 接続の途中で止められたら、接続の結果（ここでは失敗）を待った後に、全キー `bad` も
+    /// 送らず・バックオフもせずに戻る（DB なし: 握手に応えない偽のサーバー）。
+    #[tokio::test]
+    async fn a_stop_during_connect_ends_without_sending_anything() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = i64::from(listener.local_addr().unwrap().port());
+        let spec = PollerSpec::new(
+            "stop-during-connect",
+            &db_config("127.0.0.1", port, "db", "u", "pw"),
+            &[query_config("q1", "SELECT 1 AS a")],
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+        // 接続が来た（握手の途中）ところで止め、それから接続を落とす。
+        let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+            .await
+            .expect("the poller connects")
+            .unwrap();
+        stop_tx.send(true).unwrap();
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the poller ends after the connect attempt")
+            .unwrap();
+        assert_eq!(rx.try_recv().ok(), None, "nothing is sent after stop");
+    }
+
+    /// 最初の describe の途中で止められたら、飛行中の 1 本は終わるまで待つが、残りの
+    /// クエリの describe を始めずに戻ってプールを閉じる（`BANTO_TEST_PG_URL` があるときだけ）。
+    ///
+    /// Q1・Q2 の表をそれぞれ別のトランザクションで `ACCESS EXCLUSIVE` で掴む。Q1 の describe
+    /// （解析で `ACCESS SHARE` を取る）がロック待ちになったのを `pg_stat_activity` で見てから
+    /// 止め、Q1 の表だけを放す。Q2 の表は掴んだままなので、Q2 の describe を始めていたら
+    /// ロック待ちで 30 秒（describe の上限）戻らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_during_the_initial_describe_starts_no_further_describe() {
+        use sqlx::postgres::PgConnectOptions;
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let options: PgConnectOptions = url.parse().expect("BANTO_TEST_PG_URL");
+        let admin = PgPool::connect(&url).await.expect("connect test pg");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let suffix = format!("{}_{nanos}", std::process::id());
+        let role = format!("poll_stop_{suffix}");
+        let password = format!("pw-{suffix}");
+        let t1 = format!("poll_stop_t1_{suffix}");
+        let t2 = format!("poll_stop_t2_{suffix}");
+        for sql in [
+            format!("CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'"),
+            format!("CREATE TABLE \"{t1}\" (a float8)"),
+            format!("CREATE TABLE \"{t2}\" (a float8)"),
+            format!("GRANT SELECT ON \"{t1}\", \"{t2}\" TO \"{role}\""),
+        ] {
+            sqlx::query(sqlx::AssertSqlSafe(sql))
+                .execute(&admin)
+                .await
+                .expect("setup");
+        }
+        let mut lock1 = admin.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE \"{t1}\" IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *lock1)
+        .await
+        .unwrap();
+        let mut lock2 = admin.begin().await.unwrap();
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "LOCK TABLE \"{t2}\" IN ACCESS EXCLUSIVE MODE"
+        )))
+        .execute(&mut *lock2)
+        .await
+        .unwrap();
+
+        let source_name = format!("poll-stop-{suffix}");
+        let spec = PollerSpec::new(
+            &source_name,
+            &db_config(
+                options.get_host(),
+                i64::from(options.get_port()),
+                options.get_database().unwrap_or("postgres"),
+                &role,
+                &password,
+            ),
+            &[
+                query_config("q1", &format!("SELECT a FROM \"{t1}\"")),
+                query_config("q2", &format!("SELECT a FROM \"{t2}\"")),
+            ],
+        );
+        let application_name = format!("{APPLICATION_NAME_PREFIX} {source_name}");
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let mut task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+
+        let waiting = |admin: PgPool, application_name: String| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1 AND wait_event_type = 'Lock'",
+            )
+            .bind(application_name)
+            .fetch_one(&admin)
+            .await
+            .unwrap()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while waiting(admin.clone(), application_name.clone()).await == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "q1's describe never waited on the lock"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // 止めてから Q1 の表を放す。Q2 の表は掴んだまま。
+        stop_tx.send(true).unwrap();
+        lock1.commit().await.unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        let still_waiting = waiting(admin.clone(), application_name.clone()).await;
+        lock2.commit().await.unwrap();
+        if ended.is_err() {
+            // 後始末（Q2 の表を放したので describe は終わる）。
+            let _ = tokio::time::timeout(Duration::from_secs(30), &mut task).await;
+        }
+        assert!(
+            ended.is_ok(),
+            "the poller started q2's describe after stop (lock waiters: {still_waiting})"
+        );
+        assert_eq!(still_waiting, 0);
+        // プールを閉じた（ブリッジのセッションが残らない）。
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let sessions: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity WHERE application_name = $1",
+            )
+            .bind(&application_name)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+            if sessions == 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{sessions} sessions left open");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // 止めた後は周期も `bad` も送らない。
+        while let Ok(event) = rx.try_recv() {
+            assert!(
+                !matches!(event, PollEvent::Cycle { .. }),
+                "a cycle after stop: {event:?}"
+            );
+        }
+
+        for sql in [
+            format!("DROP TABLE IF EXISTS \"{t1}\", \"{t2}\""),
+            format!("DROP ROLE IF EXISTS \"{role}\""),
+        ] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(sql)).execute(&admin).await;
+        }
+        admin.close().await;
     }
 
     #[test]

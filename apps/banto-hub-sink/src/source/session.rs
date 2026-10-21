@@ -32,6 +32,13 @@
 //! epoch が変わったら送信待ちは捨てる（古い epoch の値は Hub が `stale_epoch` で断る）。
 //! `stale_epoch` で断られた分は送り直さない（次の `state` を待つ）。
 //!
+//! **設定の取り直しの待ちは WS をまたいで持つ**（[`Runtime`] の `awaiting_config`）。
+//! `config_changed` を受けた後、取得が遅れている・失敗している間に WS が切れても、張り直した
+//! `welcome` が `collecting: true` だからといって手元の古い設定で問い合わせを始めない
+//! （古い設定の値が新しい epoch で Hub に受け付けられてしまう）。再開は、取り直しを頼んだ
+//! 時点より**後に始まった**取得が成功したとき（§10.3 の実装の注 (3)）。その取得が張り直しの
+//! 前に終わっていれば、`welcome` の時点でそれを見て再開する。
+//!
 //! ## WS の切断
 //!
 //! 切れたら問い合わせを止めて（DB に繋いだまま値を捨て続けない）、1 秒 → 30 秒の
@@ -43,7 +50,11 @@
 //!
 //! 問い合わせのタスクが止めていないのに終わった（panic）ら、そのクエリ群の全キーへ
 //! `bad` を送ってから、バックオフして作り直す（§10.3。`ping` だけが続いて古い Good が
-//! 残らないように）。
+//! 残らないように）。全キーの `bad` は送信待ちの**失敗の列**（[`Outbox::push_failure`]）に
+//! 置く: 作り直したタスクの周期で置き換わらず、周期より先に、同じバケットの速さで送る。
+//! 作り直しは送りきるのを待たないが、どのキーにも新しい値より先に `bad` が届く
+//! （送りきる前に WS が切れたら、張り直しで describe から作り直したタスクが最初の周期で
+//! 全キーを送り直す）。
 //!
 //! ## 止め方
 //!
@@ -83,7 +94,8 @@ use crate::source::outbox::Outbox;
 use crate::source::poll::{run_poller, PollEvent, PollerSpec, QueryPlan};
 use crate::source::split::split_cycle;
 use crate::source::wire::{
-    parse_server_message, ping_message, status_message, values_message, ServerMessage, WireLimits,
+    parse_server_message, ping_message, status_message, values_message, ServerMessage, ValueItem,
+    WireLimits,
 };
 use crate::status::Redactor;
 
@@ -352,6 +364,7 @@ async fn run_source(
         seq: 0,
         retiring: Vec::new(),
         logged_connect_error: None,
+        awaiting_config: None,
     };
     let mut attempt: u32 = 0;
     loop {
@@ -407,6 +420,10 @@ struct Runtime {
     retiring: Vec<JoinHandle<()>>,
     /// 直前にログに出した upgrade の失敗（同じものを繰り返し出さない）。
     logged_connect_error: Option<ConnectError>,
+    /// 設定の取り直しを待っている（`config_changed` を受けた）。値は取り直しを頼んだ時点の
+    /// [`SourceContext::fetch_started`]（これより後に始まった取得の成功を待つ）。WS をまたいで
+    /// 持つ（このモジュールの doc「`state`」）。
+    awaiting_config: Option<u64>,
 }
 
 impl Runtime {
@@ -450,6 +467,17 @@ impl Runtime {
             self.logged_connect_error = Some(err);
         }
         self.update(|s| s.last_close = Some(err.describe()));
+    }
+
+    /// 取り直しを待っていて、頼んだ後に始まった取得がもう成功していれば待ちを解く。
+    /// 待ちが残っていれば `true`。
+    fn still_awaiting_config(&mut self) -> bool {
+        if let Some(after) = self.awaiting_config {
+            if *self.ctx.config_generation.borrow() > after {
+                self.awaiting_config = None;
+            }
+        }
+        self.awaiting_config.is_some()
     }
 
     /// 問い合わせのタスクを止める（合図だけ。終わりは `retiring` で確かめる）。
@@ -552,8 +580,6 @@ impl Runtime {
             limits,
             poller: None,
             events: None,
-            awaiting_config: false,
-            awaiting_after: 0,
             poller_failures: 0,
             poller_restart_at: None,
             last_sent: now,
@@ -564,14 +590,15 @@ impl Runtime {
         };
         let mut config_generation = self.ctx.config_generation.clone();
         config_generation.borrow_and_update();
-        if collecting {
-            let (poller, rx) = self.start_poller(epoch);
-            s.poller = Some(poller);
-            s.events = Some(rx);
-            self.set_state(SourceState::Running);
-        } else {
-            self.set_state(SourceState::Idle);
+        // 前の WS で頼んだ取り直しがまだ終わっていなければ、`collecting: true` でも
+        // 問い合わせない（古い設定の値を新しい epoch で送らない）。
+        if self.still_awaiting_config() {
+            log_line(&format!(
+                "banto-hub-sink: {}: 設定の取り直しを待っています（終わるまで問い合わせません）",
+                self.label()
+            ));
         }
+        self.resume(&mut s, collecting, epoch);
 
         let end = loop {
             let now = Instant::now();
@@ -588,7 +615,7 @@ impl Runtime {
                 incoming = ws_rx.next() => Event::Incoming(incoming),
                 ended = join_poller(&mut s.poller), if s.poller.is_some() => Event::PollerEnded(ended),
                 polled = recv_events(&mut s.events), if s.events.is_some() => Event::Polled(polled),
-                changed = config_generation.changed(), if s.awaiting_config => {
+                changed = config_generation.changed(), if self.awaiting_config.is_some() => {
                     // 監督が居なくなったら止まる（閉じたチャンネルで空回りしない）。
                     if changed.is_ok() { Event::ConfigConfirmed } else { Event::Stop }
                 }
@@ -628,8 +655,8 @@ impl Runtime {
                             });
                             if config_changed {
                                 // §4.6: 設定を取り直してから送る（`config_refresh_secs` を待たない）。
-                                s.awaiting_config = true;
-                                s.awaiting_after = self.ctx.fetch_started.load(Ordering::SeqCst);
+                                self.awaiting_config =
+                                    Some(self.ctx.fetch_started.load(Ordering::SeqCst));
                                 config_generation.borrow_and_update();
                                 self.ctx.refresh.notify_one();
                             }
@@ -723,15 +750,7 @@ impl Runtime {
                         if result.as_ref().is_err_and(JoinError::is_panic) { "panic" } else { "終了" },
                         delay.as_secs_f64()
                     ));
-                    s.outbox.clear();
-                    for (index, query) in s.queries.iter().enumerate() {
-                        let messages = split_cycle(
-                            query.all_bad(),
-                            s.limits.max_items,
-                            s.limits.max_message_bytes,
-                        );
-                        s.outbox.push_cycle(index, messages);
-                    }
+                    s.queue_failure_notices();
                 }
                 Event::Polled(None) => {
                     // 送り手の口が閉じた = 問い合わせのタスクが終わる。終わりは PollerEnded で拾う。
@@ -753,8 +772,8 @@ impl Runtime {
                 Event::ConfigConfirmed => {
                     // 頼んだ後に始まった取得が終わった: 設定は変わっていなかった（変わっていれば
                     // 監督がこの source を止めている - 止める合図は `biased` の先頭で拾う）。
-                    if *config_generation.borrow_and_update() > s.awaiting_after {
-                        s.awaiting_config = false;
+                    config_generation.borrow_and_update();
+                    if !self.still_awaiting_config() {
                         self.resume(&mut s, collecting, epoch);
                     }
                 }
@@ -782,7 +801,7 @@ impl Runtime {
             self.set_state(SourceState::Idle);
             return;
         }
-        if s.awaiting_config {
+        if self.awaiting_config.is_some() {
             self.set_state(SourceState::AwaitingConfig);
             return;
         }
@@ -807,7 +826,7 @@ impl Runtime {
         // タスクの異常からの作り直し。
         if s.poller_restart_at.is_some_and(|at| now >= at) {
             s.poller_restart_at = None;
-            if collecting && !s.awaiting_config && s.poller.is_none() {
+            if collecting && self.awaiting_config.is_none() && s.poller.is_none() {
                 let (poller, rx) = self.start_poller(epoch);
                 s.poller = Some(poller);
                 s.events = Some(rx);
@@ -816,16 +835,10 @@ impl Runtime {
         // values（バケットが許すだけ）。
         let mut sent = 0;
         while sent < MAX_SENDS_PER_WAKE {
-            let Some(len) = s.outbox.peek_len() else {
+            let budget = self.budget.as_mut().expect("welcome で作った");
+            let Some(items) = s.take_sendable(budget, Instant::now()) else {
                 break;
             };
-            let budget = self.budget.as_mut().expect("welcome で作った");
-            let now = Instant::now();
-            if !budget.wait_for(len, now).is_zero() {
-                break;
-            }
-            let (_, items) = s.outbox.pop().expect("peek_len が Some");
-            budget.take(items.len(), now);
             let seq = self.next_seq();
             send_text(ws_tx, values_message(seq, epoch, &items)).await?;
             s.last_sent = Instant::now();
@@ -865,9 +878,6 @@ struct SessionState {
     outbox: Outbox,
     poller: Option<Poller>,
     events: Option<mpsc::Receiver<PollEvent>>,
-    awaiting_config: bool,
-    /// 取り直しを頼んだ時点の取得の番号（これより後に始まった取得の終わりを待つ）。
-    awaiting_after: u64,
     poller_failures: u32,
     poller_restart_at: Option<Instant>,
     last_sent: Instant,
@@ -881,6 +891,32 @@ struct SessionState {
 }
 
 impl SessionState {
+    /// 問い合わせのタスクが止めていないのに終わった: 全クエリの全キー `bad` を送信待ちの
+    /// 失敗の列へ（作り直したタスクの周期で置き換わらない。このモジュールの doc
+    /// 「タスクの異常」）。
+    fn queue_failure_notices(&mut self) {
+        for (index, query) in self.queries.iter().enumerate() {
+            let messages = split_cycle(
+                query.all_bad(),
+                self.limits.max_items,
+                self.limits.max_message_bytes,
+            );
+            self.outbox.push_failure(index, messages);
+        }
+    }
+
+    /// バケットが今送ることを許す次のメッセージを取り出し、バケットから引く（無い・待つ
+    /// 必要があれば `None`）。
+    fn take_sendable(&mut self, budget: &mut SendBudget, now: Instant) -> Option<Vec<ValueItem>> {
+        let len = self.outbox.peek_len()?;
+        if !budget.wait_for(len, now).is_zero() {
+            return None;
+        }
+        let (_, items) = self.outbox.pop()?;
+        budget.take(items.len(), now);
+        Some(items)
+    }
+
     /// 今の `status` の文言（DB 側の状態と、捨てた周期・上限で断られた数）。
     fn compose_status(&self, status: &Mutex<SourceStatus>) -> Option<String> {
         let st = lock(status).clone();
@@ -1082,8 +1118,6 @@ mod tests {
             outbox: Outbox::new(0),
             poller: None,
             events: None,
-            awaiting_config: false,
-            awaiting_after: 0,
             poller_failures: 0,
             poller_restart_at: None,
             last_sent: now,
@@ -1092,6 +1126,115 @@ mod tests {
             status_ready_at: now,
             logged_codes: HashSet::new(),
         }
+    }
+
+    /// §10.3「タスクの異常」（PR #764 のオーナーレビュー P2）: 64 クエリ × 1 キー（周期 60 秒）で
+    /// タスクが止まり、1 秒後に作り直したタスクがすぐ全クエリの周期を出しても、バケットの
+    /// 速さ（16 メッセージ / 秒）で送る間に、どのキーにも新しい値より先に `bad` が届く。
+    /// 送る速さはバケットを超えない。
+    #[test]
+    fn failure_bads_reach_every_key_before_newer_values() {
+        use crate::hub_api::{BridgeColumnConfig, BridgeQueryConfig};
+        use crate::source::wire::WireQuality;
+        const QUERIES: usize = 64;
+        let key = |q: usize| format!("k{q:02}");
+        let mut s = session_state();
+        s.queries = (0..QUERIES)
+            .map(|q| {
+                QueryPlan::from_config(&BridgeQueryConfig {
+                    name: format!("q{q}"),
+                    period_ms: 60_000,
+                    sql: "SELECT 1 AS a".to_string(),
+                    columns: vec![BridgeColumnConfig {
+                        column: "a".to_string(),
+                        key: key(q),
+                    }],
+                })
+            })
+            .collect();
+        s.outbox = Outbox::new(QUERIES);
+        let limits = WireLimits {
+            max_items: 1000,
+            max_message_bytes: 262_144,
+            messages_per_sec: 20,
+            items_per_sec: 5000,
+        };
+        s.limits = limits;
+        let start = Instant::now();
+        let mut budget = SendBudget::new(limits, start);
+        let step = Duration::from_millis(10);
+        let mut now = start;
+        let mut sent: Vec<(Instant, ValueItem)> = Vec::new();
+        let mut send_ready = |s: &mut SessionState, now: Instant, sent: &mut Vec<_>| {
+            while let Some(items) = s.take_sendable(&mut budget, now) {
+                sent.extend(items.into_iter().map(|item| (now, item)));
+            }
+        };
+        // 動いていたタスクの周期（Good 1.0）を送りきる。
+        for q in 0..QUERIES {
+            s.outbox
+                .push_cycle(q, vec![vec![ValueItem::good(&key(q), 1.0)]]);
+        }
+        while !s.outbox.is_empty() {
+            send_ready(&mut s, now, &mut sent);
+            now += step;
+        }
+        // 2 周目の周期の途中（半分だけ入った）でタスクが止まる。
+        for q in 0..QUERIES / 2 {
+            s.outbox
+                .push_cycle(q, vec![vec![ValueItem::good(&key(q), 1.5)]]);
+        }
+        let failed_at = now;
+        s.queue_failure_notices();
+        // 1 秒後に作り直したタスクが、すぐ全クエリの最初の周期（Good 2.0）を出す。
+        let restart_at = failed_at + Duration::from_secs(1);
+        let mut restarted = false;
+        while !restarted || !s.outbox.is_empty() {
+            if !restarted && now >= restart_at {
+                for q in 0..QUERIES {
+                    s.outbox
+                        .push_cycle(q, vec![vec![ValueItem::good(&key(q), 2.0)]]);
+                }
+                restarted = true;
+            }
+            send_ready(&mut s, now, &mut sent);
+            now += step;
+        }
+        for q in 0..QUERIES {
+            let after: Vec<&ValueItem> = sent
+                .iter()
+                .filter(|(at, item)| *at >= failed_at && item.key == key(q))
+                .map(|(_, item)| item)
+                .collect();
+            assert_eq!(
+                after.first().map(|i| i.q),
+                Some(WireQuality::Bad),
+                "{}: {after:?}",
+                key(q)
+            );
+            assert_eq!(
+                after.last().map(|i| (i.q, i.v)),
+                Some((WireQuality::Good, Some(2.0))),
+                "{}",
+                key(q)
+            );
+            // 止まったタスクの未送信の周期（1.5）は送らない。
+            assert!(after.iter().all(|i| i.v != Some(1.5)), "{after:?}");
+        }
+        // 速さはバケット（容量 16 + 持続 16 / 秒）を超えない。
+        for (i, (t0, _)) in sent.iter().enumerate() {
+            let in_window = sent[i..]
+                .iter()
+                .take_while(|(t, _)| *t < *t0 + Duration::from_secs(1))
+                .count();
+            assert!(in_window <= 32, "{in_window} messages in 1 s");
+        }
+        let total = now.duration_since(start).as_secs_f64();
+        assert!(
+            (sent.len() as f64) <= 16.0 + 16.0 * total,
+            "{} messages in {total} s",
+            sent.len()
+        );
     }
 
     /// `status` は変わったときだけ。問題が消えたら「正常」を 1 回。
@@ -1371,6 +1514,100 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(closed, Some(1000));
+    }
+
+    /// §10.3 の実装の注 (3)（PR #764 のオーナーレビュー P2）: `config_changed` の取り直しが
+    /// 遅れている・失敗している間に WS が切れても、張り直した `welcome` の `collecting: true`
+    /// で手元の古い設定のまま問い合わせ・送信を始めない。頼む前から走っていた取得が終わっても
+    /// 再開せず、頼んだ後に始まった取得の成功で、新しい epoch の最初の周期から送る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_config_refetch_survives_a_reconnect() {
+        let (listener, url) = fake_hub().await;
+        let (ctx, generation_tx) = context(&url);
+        let refresh = ctx.refresh.clone();
+        let fetch_started = ctx.fetch_started.clone();
+        let handle = SourceHandle::spawn(test_source(7), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        assert_eq!(hub.next_values().await["epoch"], json!(1));
+
+        // 頼む前から取得（番号 1）が走っている（遅れている）ところへ設定の変更。
+        fetch_started.store(1, Ordering::SeqCst);
+        hub.state(true, 2, true).await;
+        tokio::time::timeout(Duration::from_secs(5), refresh.notified())
+            .await
+            .expect("config_changed must ask the supervisor to refetch");
+        let wait_awaiting = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.status().state != SourceState::AwaitingConfig {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        wait_awaiting.await.expect("AwaitingConfig");
+        let pollers_before = handle.status().pollers_started;
+
+        // 取り直しが終わらないうちに WS が切れる（close を送らずに落とす）。
+        drop(hub);
+        // 頼む前から走っていた取得が（古い設定を返して）終わる - これでは再開しない。
+        generation_tx.send_replace(1);
+
+        // 張り直し: Hub は収集中・新しい epoch。
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 2).await;
+        let during = hub.values_within(Duration::from_millis(1_500)).await;
+        assert!(
+            during.is_empty(),
+            "no values before the requested refetch succeeds: {during:?}"
+        );
+        let status = handle.status();
+        assert_eq!(status.state, SourceState::AwaitingConfig);
+        assert_eq!(status.pollers_started, pollers_before, "{status:?}");
+        assert_eq!(status.sessions, 2, "{status:?}");
+
+        // 取得の失敗（番号 2 が始まったが成功しない）: generation は進まず、送らない。
+        fetch_started.store(2, Ordering::SeqCst);
+        assert!(hub
+            .values_within(Duration::from_millis(500))
+            .await
+            .is_empty());
+
+        // 頼んだ後に始まった取得（番号 3）が成功したら、新しい epoch で最初の周期から送る。
+        fetch_started.store(3, Ordering::SeqCst);
+        generation_tx.send_replace(3);
+        let after = hub.next_values().await;
+        assert_eq!(after["epoch"], json!(2));
+        assert_eq!(handle.status().state, SourceState::Running);
+        assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
+    }
+
+    /// 取り直しを頼んだ後に始まった取得が WS の切断中に成功していれば、張り直した `welcome`
+    /// でそれを見て（`config_generation` の変化を待たずに）すぐ再開する。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refetch_that_finished_while_disconnected_resumes_on_welcome() {
+        let (listener, url) = fake_hub().await;
+        let (ctx, generation_tx) = context(&url);
+        let refresh = ctx.refresh.clone();
+        let fetch_started = ctx.fetch_started.clone();
+        let handle = SourceHandle::spawn(test_source(7), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        hub.next_values().await;
+        hub.state(true, 2, true).await;
+        tokio::time::timeout(Duration::from_secs(5), refresh.notified())
+            .await
+            .expect("refetch requested");
+        let wait_awaiting = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.status().state != SourceState::AwaitingConfig {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        wait_awaiting.await.expect("AwaitingConfig");
+        drop(hub);
+        fetch_started.store(1, Ordering::SeqCst);
+        generation_tx.send_replace(1);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 2).await;
+        assert_eq!(hub.next_values().await["epoch"], json!(2));
+        assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
     }
 
     /// 問い合わせのタスクの `status`（DB に届かない）は Hub に届き、パスワードを含まない。
