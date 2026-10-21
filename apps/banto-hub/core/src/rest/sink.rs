@@ -256,12 +256,29 @@ struct SinkAdminState {
 }
 
 /// `GET /api/sink/config`の応答（設計 §5.2）。
+///
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4、追加だけ）: パスワードを
+/// 読めない接続（秘密値の行が無い・この PC で開けない）は `connections` に**載せず**、
+/// `unavailable_connections` に理由つきで出す。`password: null` で返すことはしない
+/// （古いサイドカーの `build_pool` は `null` を空文字にして繋ぐので、`trust` 認証の DB
+/// なら繋がってしまう。載っていなければ、そのグループは `MissingConnection` で書かない）。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SinkConfigResponse {
     generated_at: i64,
     groups: Vec<SinkConfigGroupEntry>,
     connections: Vec<SinkConfigConnectionEntry>,
+    unavailable_connections: Vec<SinkConfigUnavailableConnection>,
+}
+
+/// R2b-1d（設計 §5.4）: パスワードを読めないので載せなかった接続 1 件。値も参照も
+/// 持たない。`reason` は `missing`（行が無い）/ `undecryptable`（この PC で開けない）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SinkConfigUnavailableConnection {
+    id: i64,
+    name: String,
+    reason: &'static str,
 }
 
 /// 有効な sink group 1件分。`db_connection_id`は`connections`から対応する
@@ -326,6 +343,7 @@ async fn build_sink_config_response(
     connection_ids.sort_unstable();
     connection_ids.dedup();
     let mut connections = Vec::with_capacity(connection_ids.len());
+    let mut unavailable_connections = Vec::new();
     for connection_id in connection_ids {
         let conn = state.plc_connections.get(connection_id).await?;
         // R2b-1d (design §5.4): the password is opened from its sealed row right before
@@ -341,10 +359,14 @@ async fn build_sink_config_response(
         ) {
             Ok(password) => password.map(|plain| plain.as_str().to_owned()),
             Err(reason) => {
-                // TODO(R2b-1d part B / R2b-1e): list it in `unavailableConnections:
-                // [{id, name, reason}]` (design §5.4). Until then it is left out of
-                // `connections`, so a sidecar (old or new) does not connect for its
-                // groups (`GroupSetupError::MissingConnection`).
+                // Left out of `connections` (a sidecar - old or new - does not connect for
+                // its groups: an old one reports `GroupSetupError::MissingConnection`) and
+                // listed with the reason (design §5.4).
+                unavailable_connections.push(SinkConfigUnavailableConnection {
+                    id: conn.id,
+                    name: conn.name.clone(),
+                    reason: reason.as_str(),
+                });
                 eprintln!(
                     "banto-hub: warn: GET /api/sink/config: 接続 {}（#{}）のパスワードを読めません\
                      （{}）。この接続を設定に載せません",
@@ -399,6 +421,7 @@ async fn build_sink_config_response(
         generated_at: state.manager.clock().now_ms(),
         groups: group_entries,
         connections,
+        unavailable_connections,
     })
 }
 

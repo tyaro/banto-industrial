@@ -203,7 +203,7 @@ use banto_collect::{
     ExternalSource, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
-use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
+use banto_tags::{PlcConnection, PlcConnectionService, Tag};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -566,26 +566,14 @@ impl TagMap {
 /// are `NOT NULL REFERENCES ... ON DELETE RESTRICT` - but defensive against
 /// a future relaxation) is skipped rather than panicking.
 pub async fn build_catalog(pool: &SqlitePool) -> Result<TagMap, banto_core::BantoError> {
-    let connections = PlcConnectionService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let groups = CollectionGroupService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-    let tags: Vec<Tag> = TagService::new(pool.clone())
-        .list(ListParams::default())
-        .await?
-        .rows;
-
-    build_catalog_from(&RegistrySnapshot {
-        connections,
-        groups,
-        tags,
-        // The catalog never reads secrets (R2b-1d: they stay sealed in the DB).
-        secrets: Vec::new(),
-    })
+    // R2b-1d: read through `RegistrySnapshot::load` (read-only) rather than a
+    // `PlcConnectionService` of its own - banto-hub's non-test code builds connection
+    // services only with the registry (design §4.2). The catalog never reads secrets.
+    let mut snapshot = RegistrySnapshot::load(pool)
+        .await
+        .map_err(|err| banto_core::BantoError::Storage(err.to_string()))?;
+    snapshot.secrets.clear();
+    build_catalog_from(&snapshot)
 }
 
 /// The external name of one tag: `{connection}.{group}.{tag}` (design §4.1).
@@ -1295,6 +1283,21 @@ impl CollectorManager {
         &self.sessions
     }
 
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §4.2）: Hub のドライバの
+    /// レジストリ（`HubConfig.drivers.registry`。`HubSessions` が持つ）。プロトコルの有無・
+    /// 設定の検証・秘密のキーの正。
+    pub fn registry(&self) -> &Arc<banto_driver_api::DriverRegistry> {
+        &self.sessions.drivers().registry
+    }
+
+    /// R2b-1d（設計 §4.2）: Hub の入口が使う接続のサービス。必ずレジストリつき
+    /// （`PlcConnectionService::with_registry`）。旧規則の `PlcConnectionService::new` を
+    /// Hub の非テストのコードで使わないことは `banto-hub-host` の
+    /// `tests/registry_entrances.rs` が grep で固定する。
+    pub fn plc_connections(&self) -> PlcConnectionService {
+        PlcConnectionService::with_registry(self.pool.clone(), self.registry().clone())
+    }
+
     /// The shared clock (design: 値のタイムスタンプはサンプル取得時刻 - `rest.rs`
     /// uses this for the `/api/v1/values` snapshot's own `t` field and for a
     /// sample-less tag's fallback timestamp).
@@ -1474,7 +1477,7 @@ impl CollectorManager {
             }
         };
 
-        let mut config = match build_hub_config(&snapshot) {
+        let mut config = match build_hub_config(&snapshot, self.registry()) {
             Ok(config) => config,
             Err(err) => {
                 let message = err.to_string();
@@ -2142,10 +2145,7 @@ impl CollectorManager {
     /// `rebuild`・`apply_run` が続けて呼ばれ、同じ時刻に 2〜4 回出ていた）。起動直後・
     /// 再び有効にしたとき・文面が変わったとき・[`SIM_WARNING_REPEAT_MS`] を過ぎた後は出す。
     async fn log_simulation_warnings(&self) {
-        let connections = match PlcConnectionService::new(self.pool.clone())
-            .list(ListParams::default())
-            .await
-        {
+        let connections = match self.plc_connections().list(ListParams::default()).await {
             Ok(result) => result.rows,
             Err(err) => {
                 self.diag_log.err_line(&format!(
@@ -2333,7 +2333,7 @@ impl CollectorManager {
                 return Err(message);
             }
         };
-        if let Err(err) = build_hub_config(snapshot) {
+        if let Err(err) = build_hub_config(snapshot, self.registry()) {
             let message = err.to_string();
             self.set_last_error(message.clone());
             return Err(message);
@@ -2440,7 +2440,7 @@ impl CollectorManager {
             message
         })?;
         let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
-        let mut config = build_hub_config(&runtime_snapshot).map_err(|err| {
+        let mut config = build_hub_config(&runtime_snapshot, self.registry()).map_err(|err| {
             let message = err.to_string();
             self.set_last_error(message.clone());
             message
@@ -2687,6 +2687,7 @@ mod tests {
     use banto_collect::CollectorOptions;
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnection, PlcConnectionInput, TagInput,
+        TagService,
     };
     use banto_tstore::SystemClock;
     use std::time::Duration;

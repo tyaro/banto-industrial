@@ -258,7 +258,7 @@ async fn execute_pending_apply(
         .map_err(storage_api_error)
         .map_err(PendingApplyError::Api)?;
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;

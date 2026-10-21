@@ -180,7 +180,11 @@
 //!   ここに残る。挙動は不変）
 //!
 //! - [`host_provided`]: R2b-1a。`push`・`postgres`・`virtual` を `DriverKind::HostProvided`
-//!   で返す `host_provided_drivers()`（host がレジストリへ足す。本番の経路はまだ読まない）。
+//!   で返す `host_provided_drivers()`（host がレジストリへ足す。R2b-1d から入口・計画・
+//!   移行の preflight が読む）。
+//! - [`upgrade`]: R2b-1d。戻せない移行（`banto-tags` の 0025）の前の残り物の掃除・写しでの
+//!   予行と preflight・パスワードを除いたバックアップと、毎回の起動の秘密値の整合の確認
+//!   （docs/banto-hub-connection-settings-design.md §6.1〜§6.4・§5.3）。
 //! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
 //!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
 //!   [`ingest::driver::PushDriver`]（`DriverBase`。R2b-1a から host が `HostProvided` でレジストリに登録する、[`host_provided`]）と、
@@ -248,6 +252,10 @@ pub mod subscribe_core;
 pub mod system_info;
 #[cfg(test)]
 pub(crate) mod test_support;
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §6.1〜§6.4）: 戻せない移行
+/// （`banto-tags` の 0025）の前の掃除・写しでの予行と preflight・バックアップ・
+/// 起動時の秘密値の整合の確認。
+pub mod upgrade;
 /// #335（2026-09-15 追補）: `value_source_for_tag`/`effective_simulation_for_tag`
 /// を `crate::rest` と `crate::mqtt` が共有するための crate 内限定モジュール
 /// （`pub(crate) mod`）。

@@ -74,11 +74,39 @@ struct BridgeConfigState {
 }
 
 /// `GET /api/ingest/bridge-config` の応答（§10.2）。
+///
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4、追加だけ）: 読み先の
+/// `postgres` 接続のパスワードを読めない source は `sources` に**載せず**、
+/// `unavailable_sources` に理由つきで出す（`password: null` では返さない。古いブリッジは
+/// 載っていない source を引かない）。`ingestAllowed: false` の source は今どおり開封も
+/// しないので、ここには出ない。
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct BridgeConfigResponse {
     pub generated_at: i64,
     pub sources: Vec<BridgeSourceEntry>,
+    pub unavailable_sources: Vec<BridgeUnavailableSource>,
+}
+
+/// R2b-1d（設計 §5.4）: 読み先のパスワードを読めないので載せなかった source 1 件。
+/// `connection_id` は `push` の接続、`db_connection_id` は読めない `postgres` の接続。
+/// `reason` は `missing` / `undecryptable`。値も参照も持たない。
+#[derive(Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BridgeUnavailableSource {
+    pub connection_id: i64,
+    pub name: String,
+    pub db_connection_id: i64,
+    pub reason: &'static str,
+}
+
+/// [`build_sources`] の結果。
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct BuiltSources {
+    pub sources: Vec<BridgeSourceEntry>,
+    pub unavailable: Vec<BridgeUnavailableSource>,
+    /// 載せなかった接続の warn の文言（パスワードを含まない）。
+    pub warnings: Vec<String>,
 }
 
 /// ブリッジの source 1 件（= ブリッジの `push` 接続 1 つ）。
@@ -160,21 +188,22 @@ pub(crate) fn bridge_fingerprint(bridge: &Value) -> String {
     format!("sha256:{}", hex::encode(Sha256::digest(&bytes)))
 }
 
-/// 接続の一覧から応答の `sources` を作る（純関数。DB を読まない - 表のテストに掛ける）。
-/// `caller` は通ったキー（admin ロールのセッションなら `None` = どの接続にも送れない）。
-/// 戻りの 2 つ目は載せなかった接続の warn の文言（パスワードを含まない）。
+/// 接続の一覧から応答の `sources`・`unavailableSources` を作る（純関数。DB を読まない -
+/// 表のテストに掛ける）。`caller` は通ったキー（admin ロールのセッションなら `None` =
+/// どの接続にも送れない）。
 ///
 /// R2b-1d: `secret_rows` are the sealed secret rows (`plc_connection_secrets`); the
 /// referenced `postgres` connection's password is opened from them only for a source
 /// whose caller may ingest (design §5.4). A password that cannot be opened is never sent
-/// as `null`/empty: the source is left out with a warning (TODO(R2b-1d part B /
-/// R2b-1e): `unavailableSources`).
+/// as `null`/empty: the source is left out of `sources` and listed in `unavailable`
+/// with the reason (and a warning line).
 pub(crate) fn build_sources(
     connections: &[PlcConnection],
     secret_rows: &[banto_tags::StoredSecretRow],
     caller: Option<&ApiKeyContext>,
-) -> (Vec<BridgeSourceEntry>, Vec<String>) {
+) -> BuiltSources {
     let mut sources = Vec::new();
+    let mut unavailable = Vec::new();
     let mut warnings = Vec::new();
     for conn in connections {
         if conn.protocol != PUSH_PROTOCOL || !conn.enabled {
@@ -224,6 +253,12 @@ pub(crate) fn build_sources(
             ) {
                 Ok(password) => password.map(|plain| plain.as_str().to_owned()),
                 Err(reason) => {
+                    unavailable.push(BridgeUnavailableSource {
+                        connection_id: conn.id,
+                        name: conn.name.clone(),
+                        db_connection_id: db.id,
+                        reason: reason.as_str(),
+                    });
                     warnings.push(format!(
                         "接続 {}（#{}）のブリッジの読み取り先 {}（#{}）のパスワードを読めません（{}）",
                         conn.name,
@@ -274,7 +309,12 @@ pub(crate) fn build_sources(
         });
     }
     sources.sort_by_key(|source| source.connection_id);
-    (sources, warnings)
+    unavailable.sort_by_key(|source| source.connection_id);
+    BuiltSources {
+        sources,
+        unavailable,
+        warnings,
+    }
 }
 
 /// パスワードの平文の返却はループバックの前提（このモジュールの doc）を、プロセスの
@@ -290,13 +330,14 @@ async fn build_response(state: &BridgeConfigState, caller: Option<&ApiKeyContext
         Ok(rows) => rows,
         Err(err) => return ApiError(err).into_response(),
     };
-    let (sources, warnings) = build_sources(&connections, &secret_rows, caller);
-    for warning in warnings {
+    let built = build_sources(&connections, &secret_rows, caller);
+    for warning in built.warnings {
         eprintln!("banto-hub: warn: GET {BRIDGE_CONFIG_PATH}: {warning}");
     }
     Json(BridgeConfigResponse {
         generated_at: state.manager.clock().now_ms(),
-        sources,
+        sources: built.sources,
+        unavailable_sources: built.unavailable,
     })
     .into_response()
 }
@@ -436,8 +477,9 @@ mod tests {
             conn(6, "modbus-tcp", true, None),
         ];
         let ctx = key(&["admin", "ingest:#2"]);
-        let (sources, warnings) =
-            build_sources(&connections, &secret_rows(&connections), Some(&ctx));
+        let BuiltSources {
+            sources, warnings, ..
+        } = build_sources(&connections, &secret_rows(&connections), Some(&ctx));
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(sources.len(), 1);
         let source = &sources[0];
@@ -464,8 +506,8 @@ mod tests {
             conn(2, PUSH_PROTOCOL, true, Some(bridge(1))),
         ];
         for caller in [Some(key(&["admin", "read", "ingest:#3"])), None] {
-            let (sources, _) =
-                build_sources(&connections, &secret_rows(&connections), caller.as_ref());
+            let sources =
+                build_sources(&connections, &secret_rows(&connections), caller.as_ref()).sources;
             assert_eq!(sources.len(), 1);
             assert!(!sources[0].ingest_allowed);
             assert_eq!(sources[0].db.password, None);
@@ -507,12 +549,17 @@ mod tests {
             conn(6, PUSH_PROTOCOL, true, Some(broken)),
         ];
         let ctx = key(&["admin", "ingest:#2", "ingest:#3", "ingest:#4", "ingest:#6"]);
-        let (sources, warnings) =
-            build_sources(&connections, &secret_rows(&connections), Some(&ctx));
+        let BuiltSources {
+            sources,
+            unavailable,
+            warnings,
+        } = build_sources(&connections, &secret_rows(&connections), Some(&ctx));
         assert_eq!(
             sources.iter().map(|s| s.connection_id).collect::<Vec<_>>(),
             vec![2]
         );
+        // Broken references are not "unreadable" - nothing is listed there.
+        assert!(unavailable.is_empty(), "{unavailable:?}");
         assert!(!sources[0].db.enabled);
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         for warning in &warnings {
@@ -522,8 +569,10 @@ mod tests {
     }
 
     /// R2b-1d (design §5.4): a source whose `postgres` password cannot be read (its row
-    /// is missing) is left out with a warning - never sent with a `null`/empty password -
-    /// while the others still go; without the ingest scope nothing is opened at all.
+    /// is missing, or its scheme cannot be opened here) is left out of `sources` - never
+    /// sent with a `null`/empty password - and listed in `unavailableSources` with the
+    /// reason, while the others still go; without the ingest scope nothing is opened at
+    /// all.
     #[test]
     fn an_unreadable_password_leaves_only_that_source_out() {
         let connections = vec![
@@ -537,20 +586,52 @@ mod tests {
             .filter(|row| row.connection_id != 3)
             .collect();
         let ctx = key(&["admin", "ingest:#2", "ingest:#4"]);
-        let (sources, warnings) = build_sources(&connections, &rows, Some(&ctx));
+        let BuiltSources {
+            sources,
+            unavailable,
+            warnings,
+        } = build_sources(&connections, &rows, Some(&ctx));
         assert_eq!(
             sources.iter().map(|s| s.connection_id).collect::<Vec<_>>(),
             vec![2]
         );
         assert_eq!(sources[0].db.password.as_deref(), Some("s3cret-pw"));
+        assert_eq!(
+            unavailable,
+            vec![BridgeUnavailableSource {
+                connection_id: 4,
+                name: "c4".to_string(),
+                db_connection_id: 3,
+                reason: "missing",
+            }]
+        );
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(
             warnings[0].contains("パスワードを読めません"),
             "{warnings:?}"
         );
+        // A row whose scheme cannot be opened here: `undecryptable`.
+        let mut undecryptable = secret_rows(&connections);
+        for row in &mut undecryptable {
+            if row.connection_id == 3 {
+                row.sealed = banto_tags::SealedSecretRow::new(
+                    row.sealed.r#ref.clone(),
+                    "dpapi-machine-v1",
+                    b"blob".to_vec(),
+                );
+            }
+        }
+        let built = build_sources(&connections, &undecryptable, Some(&ctx));
+        assert_eq!(built.sources.len(), 1);
+        assert_eq!(built.unavailable[0].reason, "undecryptable");
         // Without the scope nothing is opened, so the unreadable one is listed (no password).
-        let (sources, warnings) = build_sources(&connections, &rows, Some(&key(&["admin"])));
+        let BuiltSources {
+            sources,
+            unavailable,
+            warnings,
+        } = build_sources(&connections, &rows, Some(&key(&["admin"])));
         assert_eq!(sources.len(), 2);
+        assert!(unavailable.is_empty());
         assert!(warnings.is_empty());
         assert!(sources.iter().all(|s| s.db.password.is_none()));
     }
@@ -562,16 +643,27 @@ mod tests {
             conn(1, POSTGRES_PROTOCOL, true, None),
             conn(2, PUSH_PROTOCOL, true, Some(bridge(1))),
         ];
-        let (sources, _) = build_sources(
+        let sources = build_sources(
             &connections,
             &secret_rows(&connections),
             Some(&key(&["admin", "ingest:#2"])),
-        );
+        )
+        .sources;
         let body = serde_json::to_value(BridgeConfigResponse {
             generated_at: 5,
             sources,
+            unavailable_sources: vec![BridgeUnavailableSource {
+                connection_id: 7,
+                name: "p".to_string(),
+                db_connection_id: 8,
+                reason: "undecryptable",
+            }],
         })
         .unwrap();
+        assert_eq!(
+            body["unavailableSources"],
+            json!([{"connectionId": 7, "name": "p", "dbConnectionId": 8, "reason": "undecryptable"}])
+        );
         let source = &body["sources"][0];
         assert_eq!(body["generatedAt"], json!(5));
         assert_eq!(source["connectionId"], json!(2));

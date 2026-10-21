@@ -298,8 +298,16 @@ fn fast_options() -> CollectorOptions {
 
 fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
+    // R2b-1d (docs/banto-hub-connection-settings-design.md §10): the Hub's entrances,
+    // plan and preflight read the registry now, so the host-provided protocols
+    // (`push` / `postgres` / `virtual`) join the built-ins exactly as the real hosts'
+    // `hub_drivers()` do - without them every postgres / push connection here would be
+    // refused or excluded as `driverUnavailable`.
+    let mut registry = builtin.registry;
+    banto_hub_core::register_host_provided(&mut registry)
+        .expect("host-provided driver ids are distinct from the built-ins");
     banto_hub_core::broker_glue::HubDrivers::new(
-        Arc::new(builtin.registry),
+        Arc::new(registry),
         builtin.broker,
         builtin.client_factory,
     )

@@ -97,8 +97,8 @@ use crate::rest::{
     registry_before, run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
     validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
     CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
-    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestPayload,
-    StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
+    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionTestPayload, StoreSettingsRequest,
+    StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
@@ -191,7 +191,8 @@ struct McpState {
     // （tx → preflight → commit → catalog commit・pending queue）を再利用
     // するための最小限のサービス一式 - 二重実装しない（モジュール doc
     // comment「§3.7」節と同じ規律）。
-    /// `PlcConnectionService::new(manager.pool())`で構築（REST の
+    /// `manager.plc_connections()`（R2b-1d: レジストリつきの
+    /// `PlcConnectionService::with_registry`、設計 §4.2）で構築（REST の
     /// `tag_registry_router`と同じ生成方法）。
     plc_connections: PlcConnectionService,
     /// [`compute_pending_base_fingerprint`]が要求する2引数目 - 構成ツールは
@@ -299,10 +300,10 @@ pub(crate) fn mcp_router(
         audit: audit.clone(),
     };
     // T21 S1-b: REST の `tag_registry_router`と同じ生成方法
-    // （`PlcConnectionService::new(manager.pool())`等）- `SqlitePool`は
+    // （`manager.plc_connections()`等。R2b-1d から接続はレジストリつき）- `SqlitePool`は
     // `Arc`-backed なので REST 側のサービスと同じ DB を指す別ハンドルに
     // なるだけで、状態は分裂しない。
-    let plc_connections = PlcConnectionService::new(manager.pool());
+    let plc_connections = manager.plc_connections();
     let collection_groups = CollectionGroupService::new(manager.pool());
     // T21 S1-d: REST の `tag_registry_router`と同じ生成方法。
     let tags = TagService::new(manager.pool());
@@ -578,7 +579,7 @@ fn tool_definitions() -> Vec<Value> {
         // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
         json!({
             "name": "list_connections",
-            "description": "PLC 接続の一覧を返す(admin スコープ必須)。",
+            "description": "PLC 接続の一覧を返す(admin スコープ必須)。パスワードの値は返さず、passwordSet と passwordState(none: 無い / set: ある / unreadable: 参照はあるが Hub が読めない - 別の PC へ DB を移した等。update_connection で入れ直す)を返す。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -625,7 +626,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "password": {
                         "type": ["string", "null"],
-                        "description": "protocol: postgres 接続のパスワード(平文保存)。省略/null は「パスワード無し」。他プロトコルでは null。",
+                        "description": "protocol: postgres 接続のパスワード。Hub が封印して保存する(平文の列には置かない。Windows 以外と R2b-1e までは封印の方式が plain-v1)。応答には値を返さず passwordSet / passwordState だけを返す。省略/null は「パスワード無し」。他プロトコルでは null。",
                     },
                     "settings": {
                         "type": ["object", "null"],
@@ -696,7 +697,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "password": {
                         "type": ["string", "null"],
-                        "description": "protocol: postgres 接続のパスワード。null は「現在のパスワードを変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」(banto_tags::PlcConnectionInput::password のtri-state PATCH意味論)。他プロトコルでは null。",
+                        "description": "protocol: postgres 接続のパスワード(Hub が封印して保存する)。null は「現在のパスワードを変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」(tri-state PATCH意味論。banto_tags::PlcConnectionInput::secrets の Keep / Clear / Set)。passwordState が unreadable(この PC で読めない)の接続は、ここで入れ直すと直る。他プロトコルでは null。",
                     },
                     "settings": {
                         "type": ["object", "null"],
@@ -1867,19 +1868,16 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     if let Err(err) = require_admin_scope(ctx) {
         return err;
     }
-    match state.plc_connections.list(ListParams::default()).await {
-        // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
-        // を返さない - `password`列を持たない`PlcConnectionResponse`
-        // （`passwordSet`のみ）へ変換してから返す
-        // （`crate::rest::PlcConnectionResponse`の doc comment参照、REST の
-        // `plc_connections_list`と同じ変換）。
-        Ok(result) => tool_ok(json!({
-            "connections": result
-                .rows
-                .into_iter()
-                .map(PlcConnectionResponse::from)
-                .collect::<Vec<_>>()
-        })),
+    let listed = match state.plc_connections.list(ListParams::default()).await {
+        Ok(result) => result.rows,
+        Err(err) => return tool_error(format!("接続一覧の取得に失敗しました: {err}")),
+    };
+    // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
+    // を返さない - `PlcConnectionResponse`（`passwordSet`・R2b-1d の `passwordState`）
+    // へ変換してから返す（`crate::rest::PlcConnectionResponse`の doc comment参照、
+    // REST の `plc_connections_list`と同じ変換）。
+    match crate::rest::connection_responses(&state.plc_connections, listed).await {
+        Ok(connections) => tool_ok(json!({ "connections": connections })),
         Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
     }
 }
@@ -1971,7 +1969,7 @@ async fn tool_create_connection(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2013,9 +2011,12 @@ async fn tool_create_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    Ok(tool_ok(
-        json!({ "created": PlcConnectionResponse::from(created) }),
-    ))
+    match crate::rest::connection_response(&state.plc_connections, created).await {
+        Ok(created) => Ok(tool_ok(json!({ "created": created }))),
+        Err(err) => Ok(tool_error(format!(
+            "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
+        ))),
+    }
 }
 
 // --- 9. delete_connection ----------------------------------------------------
@@ -2102,7 +2103,7 @@ async fn tool_delete_connection(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2351,7 +2352,7 @@ async fn tool_update_connection(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2393,9 +2394,12 @@ async fn tool_update_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    Ok(tool_ok(
-        json!({ "updated": PlcConnectionResponse::from(updated) }),
-    ))
+    match crate::rest::connection_response(&state.plc_connections, updated).await {
+        Ok(updated) => Ok(tool_ok(json!({ "updated": updated }))),
+        Err(err) => Ok(tool_error(format!(
+            "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
+        ))),
+    }
 }
 
 // --- 11. test_connection ----------------------------------------------------
@@ -2554,7 +2558,7 @@ async fn tool_create_group(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2682,7 +2686,7 @@ async fn tool_update_group(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2813,7 +2817,7 @@ async fn tool_delete_group(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2981,7 +2985,7 @@ async fn tool_create_tag(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3111,7 +3115,7 @@ async fn tool_update_tag(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -3284,7 +3288,7 @@ async fn tool_delete_tag(
         }
     };
     // #635: 書き込みの前の registry。書き込みで新しく生まれた外部名の重なりだけを断る。
-    let registry_before = match registry_before(&mut tx).await {
+    let registry_before = match registry_before(&mut tx, state.manager.registry()).await {
         Ok(before) => before,
         Err(err) => {
             let _ = tx.rollback().await;

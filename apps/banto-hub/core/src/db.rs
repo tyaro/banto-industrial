@@ -112,6 +112,11 @@ pub enum InitDbError {
     /// 旧形式の DB。起動を拒否する。
     #[error(transparent)]
     Legacy(#[from] LegacyDatabase),
+    /// R2b-1d: 戻せない移行（`banto-tags` の 0025）の前後処理が起動を止めた
+    /// （`crate::upgrade`。予行の preflight が断った・残り物を消せない・バックアップを
+    /// 作れない・レジストリを持たない入口で未移行の DB を開いた）。DB は変わっていない。
+    #[error(transparent)]
+    Upgrade(#[from] crate::upgrade::UpgradeError),
     /// 接続または migration の失敗。
     #[error(transparent)]
     Storage(#[from] BantoError),
@@ -123,6 +128,7 @@ impl From<InitDbError> for BantoError {
     fn from(err: InitDbError) -> Self {
         match err {
             InitDbError::Legacy(legacy) => BantoError::Other(legacy.to_string()),
+            InitDbError::Upgrade(err) => BantoError::Other(err.to_string()),
             InitDbError::Storage(err) => err,
         }
     }
@@ -130,10 +136,43 @@ impl From<InitDbError> for BantoError {
 
 /// Connect to the SQLite database at `path`, refuse it if it is in the
 /// pre-2026-10-02 format, and apply the full schema (this app's own, then
-/// `banto_tags`, then `banto_collect`). Used by `bin/banto-hub.rs` with a
-/// path under the app's data directory.
+/// `banto_tags`, then `banto_collect`).
+///
+/// R2b-1d: **without a driver registry**, so it cannot run the migration preflight
+/// of `banto-tags`' irreversible `0025` (docs/banto-hub-connection-settings-design.md
+/// §6.1・§6.3). A populated database that still needs `0025` is refused with
+/// [`crate::upgrade::UpgradeError::NeedsHubStartup`] (nothing is migrated) - the Hub's own
+/// start goes through [`init_db_with_registry`]. New databases and already-migrated ones
+/// pass as before. Used by the elevated helper (`crate::service_elevated`) and tests.
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
-    let path = path.as_ref();
+    init_db_inner(path.as_ref(), None).await
+}
+
+/// [`init_db`] for the Hub's start (`crate::runtime::HubRuntime::start`), with the Hub's
+/// driver registry (`HubConfig.drivers.registry`): design §6.1's 2-a → 2-b → 2-c.
+///
+/// 1. (2-a) connect, refuse the old format, this app's own migrator;
+/// 2. (2-b) [`crate::upgrade::remove_leftovers`] (every start: the dry-run copies and
+///    unfinished backups a crash may have left - they can hold plaintext passwords; a
+///    file that cannot be deleted stops the start), then, only while `0025` is
+///    unapplied, [`crate::upgrade::prepare_0025`]: dry run + preflight on a copy (a
+///    refusal stops the start with the database untouched), the password-free backup
+///    and the "VACUUM pending" mark;
+/// 3. (2-c) `banto_tags::migrate` (`0025` included), `banto_collect::migrate`.
+///
+/// On any 2-b failure the pool is closed before returning (the database file is not
+/// held open).
+pub async fn init_db_with_registry(
+    path: impl AsRef<Path>,
+    registry: &std::sync::Arc<banto_driver_api::DriverRegistry>,
+) -> Result<SqlitePool, InitDbError> {
+    init_db_inner(path.as_ref(), Some(registry)).await
+}
+
+async fn init_db_inner(
+    path: &Path,
+    registry: Option<&std::sync::Arc<banto_driver_api::DriverRegistry>>,
+) -> Result<SqlitePool, InitDbError> {
     let pool = banto_storage::connect_sqlite(path).await?;
     if is_legacy_schema(&pool).await? {
         pool.close().await;
@@ -141,7 +180,31 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
             path: path.to_path_buf(),
         }));
     }
-    run_migrations(&pool).await?;
+    if let Err(err) = run_hub_migrations(&pool).await {
+        pool.close().await;
+        return Err(err.into());
+    }
+    // 2-b の 1（残り物の掃除）は DB を開く前でもよいが、設計 §6.1 の順（2-a の後）に合わせる。
+    let prepared = match crate::upgrade::remove_leftovers(path) {
+        Ok(removed) => {
+            for leftover in removed {
+                crate::hub_log::log_line(&format!(
+                    "banto-hub: 前回の起動で残った移行の一時ファイルを消しました: {}",
+                    leftover.display()
+                ));
+            }
+            crate::upgrade::prepare_0025(&pool, path, registry).await
+        }
+        Err(err) => Err(err),
+    };
+    if let Err(err) = prepared {
+        pool.close().await;
+        return Err(InitDbError::Upgrade(err));
+    }
+    if let Err(err) = run_shared_migrations(&pool).await {
+        pool.close().await;
+        return Err(err.into());
+    }
     Ok(pool)
 }
 
@@ -189,6 +252,12 @@ async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
+    run_hub_migrations(pool).await?;
+    run_shared_migrations(pool).await
+}
+
+/// 設計 §6.1 の 2-a の migrator: この app 自身の分だけ。
+async fn run_hub_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // この app 自身の分（admin-template のコピー + 0101 以降の Hub 固有）。
     // 記録テーブルを分ける理由はモジュール doc 参照。
     let mut migrator = sqlx::migrate!("./migrations-sqlite");
@@ -196,7 +265,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     migrator
         .run(pool)
         .await
-        .map_err(|err| BantoError::Storage(err.to_string()))?;
+        .map_err(|err| BantoError::Storage(err.to_string()))
+}
+
+/// 設計 §6.1 の 2-c: 共有 crate の migrator（`banto_tags`・`banto_collect`）。
+async fn run_shared_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // I1: banto-tags owns its own migrations/ directory and is applied here,
     // right after this app's own schema. It records into its own
     // `_sqlx_migrations_banto_tags`, so it no longer collides with this

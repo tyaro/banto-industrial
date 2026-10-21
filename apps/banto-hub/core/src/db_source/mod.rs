@@ -294,6 +294,13 @@ impl DbSourceEngine {
         // 2) 状態表は「残す接続以外」を作り直す。
         self.status.apply_plan(&plan, &preserved, true);
 
+        // R2b-1d（設計 §5.4・§5.5）: パスワードを読めない接続はタスクを起こさず、配下の
+        // タグへ Bad を書く（走っていたタスクは 1) で止めた。前の Good を残さない）。
+        let now_ms = self.clock.now_ms();
+        for conn in &plan.unreadable {
+            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
+        }
+
         // 3) 新規／再起動対象を spawn する。
         for conn in plan.connections {
             if preserved.contains(&conn.connection_id) {
@@ -326,6 +333,11 @@ impl DbSourceEngine {
 
         let plan = state.plan.clone();
         self.status.apply_plan(&plan, &HashSet::new(), true);
+        // R2b-1d: パスワードを読めない接続は起こさず、配下のタグは Bad（[`Self::commit`]）。
+        let now_ms = self.clock.now_ms();
+        for conn in &plan.unreadable {
+            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
+        }
         for conn in plan.connections {
             let connection_id = conn.connection_id;
             let task = self.spawn_connection(conn.clone(), &log);
@@ -359,6 +371,9 @@ impl DbSourceEngine {
         let now_ms = self.clock.now_ms();
         for conn in &plan.connections {
             task::mark_connection_bad(conn, &self.store, now_ms);
+        }
+        for conn in &plan.unreadable {
+            task::mark_groups_bad(&conn.groups, &self.store, now_ms);
         }
         self.status.apply_plan(&plan, &HashSet::new(), false);
     }
@@ -472,10 +487,7 @@ fn connection_password(
     ) {
         Ok(Some(password)) => Ok(password),
         Ok(None) => Ok(zeroize::Zeroizing::new(String::new())),
-        Err(reason) => Err(format!(
-            "パスワードを読めません（{}）。接続の編集でパスワードを入れ直してください。",
-            reason.as_str()
-        )),
+        Err(reason) => Err(plan::unreadable_password_message(reason)),
     }
 }
 
@@ -1062,6 +1074,7 @@ mod tests {
                 conn_plan(2, "SELECT a FROM v2"),
             ],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
         });
         let ids_after_first: Vec<i64> = {
             let state = engine.state.lock().unwrap();
@@ -1084,6 +1097,7 @@ mod tests {
                 conn_plan(3, "SELECT a FROM v3"),
             ],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -1101,6 +1115,7 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
+            unreadable: Vec::new(),
         });
         {
             let state = engine.state.lock().unwrap();
@@ -1137,6 +1152,7 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: vec![(2, "db2".to_string())],
+            unreadable: Vec::new(),
         });
 
         assert!(
@@ -1164,6 +1180,7 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
         });
         assert!(engine.state.lock().unwrap().tasks.is_empty());
 
@@ -1202,6 +1219,65 @@ mod tests {
         engine.shutdown().await;
     }
 
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: パスワードを読めない
+    /// 接続はタスクを起こさず（＝再試行でも繋ぎに行かない）、その接続だけ状態が `error`
+    /// 「パスワードを読めません」、配下のタグは Bad。読める接続は今どおり起きる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unreadable_connection_is_bad_and_never_started() {
+        let store = Arc::new(ServerTagStore::new());
+        let engine = DbSourceEngine::new(store.clone(), Arc::new(SystemClock));
+        let broken = conn_plan(2, "SELECT a FROM v2");
+        // A Good value from before the password became unreadable must not linger.
+        store.set("tag:2", Some(7.0), banto_collect::Quality::Good, 1_000);
+        engine.start();
+        engine.commit(DbSourcePlan {
+            connections: vec![conn_plan(1, "SELECT a FROM v1")],
+            disabled: Vec::new(),
+            unreadable: vec![plan::UnreadableDbConnection {
+                connection_id: 2,
+                connection_name: "db2".to_string(),
+                reason: crate::secrets::UnreadableReason::Undecryptable,
+                groups: broken.groups.clone(),
+            }],
+        });
+        assert_eq!(
+            engine
+                .state
+                .lock()
+                .unwrap()
+                .tasks
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![1],
+            "no task for the unreadable connection"
+        );
+        let sample = store.get("tag:2").expect("tag:2 written");
+        assert_eq!(sample.quality, banto_collect::Quality::Bad);
+        assert_eq!(sample.value, None);
+        let status = engine.status_snapshot();
+        let entry = status.iter().find(|s| s.connection_id == 2).unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        let message = entry.last_error.as_deref().unwrap();
+        assert!(message.contains("パスワードを読めません"), "{message}");
+        assert!(message.contains("undecryptable"), "{message}");
+        assert_eq!(entry.groups.len(), 1);
+
+        // Stopping keeps it `error` (a configuration fact, not a running state) and Bad.
+        engine.stop().await;
+        let entry = engine
+            .status_snapshot()
+            .into_iter()
+            .find(|s| s.connection_id == 2)
+            .unwrap();
+        assert_eq!(entry.state, DbConnectionState::Error);
+        assert_eq!(
+            store.get("tag:2").unwrap().quality,
+            banto_collect::Quality::Bad
+        );
+        engine.shutdown().await;
+    }
+
     /// `start`/`stop` は冪等（`CollectionController::start`/`stop` 自身が
     /// 冪等なのと揃える - 二重呼び出しでタスクが二重に起きない）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1210,6 +1286,7 @@ mod tests {
         engine.commit(DbSourcePlan {
             connections: vec![conn_plan(1, "SELECT a FROM v1")],
             disabled: Vec::new(),
+            unreadable: Vec::new(),
         });
 
         engine.start();

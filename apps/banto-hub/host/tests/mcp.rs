@@ -5655,10 +5655,10 @@ async fn update_connection_push_settings_omitted_null_object_and_empty() {
     )
     .await;
     let payload = tool_ok_payload(status, &body);
-    assert_eq!(payload["updated"]["settings"], json!({}), "{payload:?}");
+    // R2b-1d: a push row on its defaults reads back as `null` (alpha.33's shape, design §2).
+    assert_eq!(payload["updated"]["settings"], Value::Null, "{payload:?}");
     let listed = listed_settings(&app, &admin_key, id).await;
-    assert_eq!(listed, json!({}));
-    assert!(listed.get("bridge").is_none(), "{listed:?}");
+    assert_eq!(listed, Value::Null);
 }
 
 /// 不正な `settings` は tool error（項目名つき）で断り、レジストリは変わらない。

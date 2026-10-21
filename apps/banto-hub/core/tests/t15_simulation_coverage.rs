@@ -172,7 +172,7 @@ async fn test_app(label: &str) -> TestApp {
         // R2b-0: ドライバ無し（このテストはプリフライトの一覧と開始の可否だけを
         // 見て、収集した値は見ない。core は banto-drivers に依存しない。
         // docs/banto-driver-api-design.md §2.4）。
-        banto_hub_core::broker_glue::HubDrivers::none(),
+        common::no_io_drivers(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));

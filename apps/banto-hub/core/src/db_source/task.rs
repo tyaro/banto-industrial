@@ -709,7 +709,13 @@ fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
 /// §6-16）が共有する - どちらも「この接続はいま値を作れない」を意味する
 /// ので、書き方が食い違ってはいけない。
 pub(crate) fn mark_connection_bad(plan: &DbConnectionPlan, store: &ServerTagStore, now_ms: i64) {
-    for group in &plan.groups {
+    mark_groups_bad(&plan.groups, store, now_ms);
+}
+
+/// R2b-1d: [`mark_connection_bad`] for groups without a connection plan (a connection
+/// whose password cannot be read, `DbSourcePlan::unreadable`).
+pub(crate) fn mark_groups_bad(groups: &[DbGroupPlan], store: &ServerTagStore, now_ms: i64) {
+    for group in groups {
         for tag in &group.tags {
             write_verdict(store, tag, GroupLadder::connection_lost(), now_ms);
         }
@@ -830,6 +836,7 @@ mod tests {
             &crate::db_source::plan::DbSourcePlan {
                 connections: vec![plan.clone()],
                 disabled: Vec::new(),
+                unreadable: Vec::new(),
             },
             &std::collections::HashSet::new(),
             true,

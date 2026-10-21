@@ -13,8 +13,10 @@
 //! [`password_changes`] で平文を封印して banto-tags へ渡し、読む側（DB Source の計画・
 //! 接続のテスト・`GET /api/sink/config`・`GET /api/ingest/bridge-config`）が
 //! [`open_connection_secret`] で使う直前に開く。封印は全 OS で `plain-v1`
-//! （[`r2b1d_connection_secrets`]）。Windows の DPAPI・起動時の封印し直し・
-//! `passwordState`・`unavailable*` は R2b-1e。
+//! （[`r2b1d_connection_secrets`]）。R2b-1d（part B）で、読めないものを空に潰さず
+//! `passwordState`（[`secret_state`]）・`unavailableConnections` / `unavailableSources`・
+//! DB Source の「パスワードを読めません」に出すところまで配線した。Windows の DPAPI・
+//! 起動時の封印し直しは R2b-1e。
 //!
 //! # なぜ DB に DPAPI の blob を置くか（設計 §5.1 の Q1 (c)）
 //!
@@ -614,6 +616,22 @@ pub fn open_connection_secret(
             .unreadable_reason()
             .unwrap_or(UnreadableReason::Undecryptable)
     })
+}
+
+/// 接続 `conn` の秘密のキー `key` の状態（設計 §5.5 の `passwordState`）。開けるかを
+/// 実際に開いて確かめ、平文はすぐ捨てる（`Zeroizing`）。参照が無い → [`SecretState::None`]、
+/// 開ける → [`SecretState::Set`]、行が無い・開けない → [`SecretState::Unreadable`]。
+pub fn secret_state(
+    secrets: &ConnectionSecrets,
+    conn: &banto_tags::PlcConnection,
+    key: &str,
+    rows: &[banto_tags::StoredSecretRow],
+) -> SecretState {
+    match open_connection_secret(secrets, conn, key, rows) {
+        Ok(None) => SecretState::None,
+        Ok(Some(_plain)) => SecretState::Set,
+        Err(reason) => SecretState::Unreadable { reason },
+    }
 }
 
 #[cfg(test)]

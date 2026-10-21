@@ -162,9 +162,7 @@ use banto_plc_write::{
     WriteResult as PlcWriteResult,
 };
 use banto_server::ServerEvent;
-use banto_tags::{
-    unscale, PlcConnectionService, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE,
-};
+use banto_tags::{unscale, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE};
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
@@ -668,7 +666,9 @@ async fn resolve_write_target(
     // `internal` タグにもそのまま一様に適用する - タグ種別で緩めない保守的
     // な一様ルール(プロトコルゲートだけがタグ種別で分岐する唯一の例外)。
     let conn = if entry.tag_kind == PLC_TAG_KIND {
-        let conn = PlcConnectionService::new(deps.manager.pool())
+        let conn = deps
+            .manager
+            .plc_connections()
             .get(connection_id)
             .await
             .map_err(map_registry_error)?;

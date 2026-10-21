@@ -139,7 +139,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use banto_collect::{
-    build_config_from_with, CollectError, CollectorConfig, ExternalLink, ExternalReading,
+    build_config_from_with_registry, CollectError, CollectorConfig, ExternalLink, ExternalReading,
     ExternalSnapshot, ExternalSource, PushSource, RegistrySnapshot,
 };
 use banto_tags::{
@@ -157,8 +157,18 @@ use utoipa::ToSchema;
 /// （`CollectorManager::rebuild` / `commit_catalog` / `apply_run` と REST の
 /// preflight）がこれを通る - preflight と実際の計画がずれて「保存できたのに収集が
 /// 断る」ことが無いように。
-pub fn build_hub_config(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
-    build_config_from_with(snapshot, PushSource::Available)
+///
+/// R2b-1d（docs/banto-hub-connection-settings-design.md §4.4・§7）: Hub のレジストリ
+/// （`HubConfig.drivers.registry`）で各接続のドライバ・`settings`・設定の版を確かめる
+/// （`banto_collect::build_config_from_with_registry`）。ドライバが無い（手で書いた
+/// `hub` の行・外したプラグイン）・設定が検証を通らない・版が新しすぎる接続は
+/// `driverUnavailable` / `invalidSettings` / `settingsVersionTooNew` の除外で、厳格版なので
+/// 今の不正なポートと同じく計画全体を断る（行は消さない・読み替えない）。
+pub fn build_hub_config(
+    snapshot: &RegistrySnapshot,
+    registry: &banto_driver_api::DriverRegistry,
+) -> Result<CollectorConfig, CollectError> {
+    build_config_from_with_registry(snapshot, PushSource::Available, registry)
 }
 
 /// 1 件の値。

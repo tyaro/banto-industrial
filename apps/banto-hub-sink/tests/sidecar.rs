@@ -109,8 +109,16 @@ struct PgTarget {
 /// (docs/banto-driver-api-design.md §6.4).
 fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
     let builtin = banto_drivers::builtin();
+    // R2b-1d (docs/banto-hub-connection-settings-design.md §10): the Hub's entrances,
+    // plan and preflight read the registry now, so the host-provided protocols
+    // (`push` / `postgres` / `virtual`) join the built-ins exactly as the real hosts'
+    // `hub_drivers()` do - without them every postgres / push connection here would be
+    // refused or excluded as `driverUnavailable`.
+    let mut registry = builtin.registry;
+    banto_hub_core::register_host_provided(&mut registry)
+        .expect("host-provided driver ids are distinct from the built-ins");
     banto_hub_core::broker_glue::HubDrivers::new(
-        Arc::new(builtin.registry),
+        Arc::new(registry),
         builtin.broker,
         builtin.client_factory,
     )
@@ -857,4 +865,140 @@ async fn starting_without_a_hub_waits_instead_of_exiting() {
         .unwrap()
         .expect("sidecar task panicked")
         .expect("run() should end cleanly");
+}
+
+/// R2b-1d (docs/banto-hub-connection-settings-design.md §5.4・§9 「読めない」): when the
+/// Hub cannot read a `postgres` connection's password (here its sealed row is gone), the
+/// sidecar must **not** connect to that DB - not with an empty password either (a `trust`
+/// DB would accept it). Runs without `BANTO_TEST_PG_URL`: the "DB" is a plain TCP
+/// listener that must never see a connection.
+///
+/// 1. `GET /api/sink/config` leaves the connection out of `connections` and lists it in
+///    `unavailableConnections` with `reason: "missing"`.
+/// 2. An **old-shape** client (alpha.33's `SinkConfig`, which knows no
+///    `unavailableConnections`) reads the same body: the group's `dbConnectionId` is not
+///    among `connections`, so its `start_group` stops at `GroupSetupError::MissingConnection`
+///    and never builds a pool.
+/// 3. This sidecar marks the group `error` with「Hub でパスワードを読めません」and the
+///    listener never accepts a connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unreadable_password_is_listed_and_never_dialled() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the fake DB");
+    listener
+        .set_nonblocking(true)
+        .expect("non-blocking listener");
+    let db_port = listener.local_addr().expect("addr").port();
+
+    let app = test_app().await;
+    let target = PgTarget {
+        host: "127.0.0.1".to_string(),
+        port: i64::from(db_port),
+        database: "erp".to_string(),
+        username: "app".to_string(),
+        password: Some("unreadable-pw".to_string()),
+        url: String::new(),
+    };
+    let (db_connection_id, tag_id, _) = seed_source(&app, &target).await;
+    // The sealed row is gone (a DB restored without it, design §5.5): `Unreadable { Missing }`.
+    sqlx::query("DELETE FROM plc_connection_secrets")
+        .execute(&app.pool)
+        .await
+        .expect("drop the sealed row");
+    let group_id = create_sink_group(&app, db_connection_id, tag_id, "public.never").await;
+    let api_key = issue_sidecar_key(&app).await;
+
+    // 1. The new fields.
+    let (status, body) = get_json(&app.router, "/api/sink/config", &api_key).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["connections"], json!([]), "{body:?}");
+    assert_eq!(
+        body["unavailableConnections"],
+        json!([{ "id": db_connection_id, "name": "erp", "reason": "missing" }]),
+        "{body:?}"
+    );
+    assert!(!body.to_string().contains("unreadable-pw"));
+
+    // 2. An alpha.33 client: no `unavailableConnections`, and the group's connection is
+    // simply absent (never `password: null`).
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldSinkConfig {
+        groups: Vec<OldGroup>,
+        connections: Vec<OldConnection>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct OldGroup {
+        id: i64,
+        db_connection_id: i64,
+    }
+    #[derive(serde::Deserialize)]
+    struct OldConnection {
+        id: i64,
+    }
+    let old: OldSinkConfig = serde_json::from_value(body.clone()).expect("old shape parses");
+    let old_group = old
+        .groups
+        .iter()
+        .find(|group| group.id == group_id)
+        .expect("the group is still listed");
+    assert!(
+        !old.connections
+            .iter()
+            .any(|conn| conn.id == old_group.db_connection_id),
+        "an old sidecar must not find the connection (it would MissingConnection, not dial)"
+    );
+
+    // 3. This sidecar: the group is `error` with the reason, nothing dials the DB.
+    let config_dir = tempfile::Builder::new()
+        .prefix("banto-hub-sink-cfg-")
+        .tempdir()
+        .expect("config dir");
+    let config_path = config_dir.path().join("banto-hub-sink.toml");
+    std::fs::write(&config_path, sidecar_toml(app.port, &api_key)).expect("write toml");
+    let config = banto_hub_sink::config::load_config_from(&config_path).expect("load config");
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_signal = shutdown.clone();
+    let sidecar = tokio::spawn(async move {
+        run(config, fast_sidecar_options(), async move {
+            shutdown_signal.notified().await;
+            StopRequest::Graceful
+        })
+        .await
+    });
+
+    let reported = wait_until(WAIT, || async {
+        let sink = sink_status(&app).await;
+        sink["groups"].as_array().is_some_and(|groups| {
+            groups.iter().any(|entry| {
+                entry["id"].as_i64() == Some(group_id)
+                    && entry["state"] == json!("error")
+                    && entry["lastError"]
+                        .as_str()
+                        .is_some_and(|text| text.contains("Hub でパスワードを読めません"))
+            })
+        })
+    })
+    .await;
+    assert!(
+        reported,
+        "the group does not report the unreadable password: {:?}",
+        sink_status(&app).await
+    );
+    // Give a would-be dial a moment, then make sure nothing ever connected.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    match listener.accept() {
+        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+        Ok((_, peer)) => panic!("something dialled the unreadable DB from {peer}"),
+        Err(err) => panic!("accept failed: {err}"),
+    }
+
+    shutdown.notify_one();
+    let joined = tokio::time::timeout(Duration::from_secs(30), sidecar).await;
+    assert!(joined.is_ok(), "サイドカーが停止しない");
+    joined
+        .unwrap()
+        .expect("sidecar task panicked")
+        .expect("sidecar run() should not fail");
+    app.shutdown().await;
 }

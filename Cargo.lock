@@ -663,11 +663,13 @@ name = "banto-collect"
 version = "0.2.0-alpha.33"
 dependencies = [
  "banto-core",
+ "banto-driver-api",
  "banto-plc",
  "banto-storage",
  "banto-tags",
  "banto-tstore",
  "serde",
+ "serde_json",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",

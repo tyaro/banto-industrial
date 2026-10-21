@@ -219,3 +219,63 @@ pub fn shutdown_test_app(manager: &CollectorManager, pool: &SqlitePool) {
         });
     }));
 }
+
+/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.2・§4.4): `HubDrivers::none()`
+/// (no PLC I/O) whose registry also holds **stand-in** `modbus-tcp` / `slmp` entries.
+/// Since R2b-1d the Hub's entrances, plan and preflight read the registry, and `none()`
+/// carries only the host-provided protocols - a test that merely stores a Modbus / SLMP
+/// connection (RBAC, catalog, expression checks) would otherwise be refused as
+/// `driverUnavailable`. The stand-ins accept every setting; the real drivers' rules are
+/// covered in `banto-hub-host` (`tests/connection_validation_consistency.rs`,
+/// `tests/upgrade_0025.rs`). (The host's `hub_drivers()` uses the real ones.)
+pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
+    struct StandIn(banto_driver_api::DriverDescriptor);
+    impl banto_driver_api::DriverBase for StandIn {
+        fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+            &self.0
+        }
+        fn validate_config(
+            &self,
+            _settings: &banto_driver_api::Settings,
+        ) -> Vec<banto_driver_api::FieldError> {
+            Vec::new()
+        }
+        fn parse_address(
+            &self,
+            _text: &str,
+            _kind: &banto_driver_api::TagKind,
+        ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+            Err(banto_driver_api::AddressError::new(
+                "stand-in: no address rules",
+            ))
+        }
+        fn offset_address(
+            &self,
+            canonical: &str,
+            _kind: &banto_driver_api::TagKind,
+            _n: i64,
+        ) -> Result<String, banto_driver_api::AddressError> {
+            Ok(canonical.to_owned())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+    let mut registry = banto_driver_api::DriverRegistry::new();
+    for protocol in ["modbus-tcp", "slmp"] {
+        registry
+            .register(banto_driver_api::DriverEntry::host_bound(
+                std::sync::Arc::new(StandIn(banto_driver_api::DriverDescriptor::new(
+                    banto_driver_api::DriverId::new(protocol).expect("valid id"),
+                    "0.0.0-test",
+                    protocol,
+                    banto_driver_api::Capabilities::READ_WRITE,
+                ))),
+            ))
+            .expect("distinct stand-in ids");
+    }
+    banto_hub_core::register_host_provided(&mut registry).expect("distinct host-provided ids");
+    let mut drivers = banto_hub_core::broker_glue::HubDrivers::none();
+    drivers.registry = std::sync::Arc::new(registry);
+    drivers
+}

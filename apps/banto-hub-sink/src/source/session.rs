@@ -179,6 +179,9 @@ pub enum SourceState {
     NoPermission,
     /// 参照先の DB 接続が Hub で無効になっている。
     DbDisabled,
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4）: Hub が読み先の DB 接続の
+    /// パスワードを読めない（`unavailableSources`）。動かさない。
+    PasswordUnreadable,
     /// 止めた。
     Stopped,
 }
@@ -194,6 +197,7 @@ impl SourceState {
             Self::Backoff => "backoff",
             Self::NoPermission => "no_permission",
             Self::DbDisabled => "db_disabled",
+            Self::PasswordUnreadable => "password_unreadable",
             Self::Stopped => "stopped",
         }
     }

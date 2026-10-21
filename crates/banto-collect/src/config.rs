@@ -38,6 +38,7 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use banto_core::ListParams;
+use banto_driver_api::DriverRegistry;
 use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService,
@@ -633,10 +634,88 @@ pub fn build_config_from_with(
         ThresholdSource::None,
         HubSource::Unavailable,
         push,
+        None,
     );
     match exclusions.iter().find_map(ConfigExclusion::strict_error) {
         Some(err) => Err(err),
         None => Ok(config),
+    }
+}
+
+/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): [`build_config_from_with`]
+/// that also checks every collected connection against `registry` first
+/// ([`driver_exclusion`]): a connection whose driver is missing, whose stored
+/// `settings` the driver refuses, or whose settings shape is newer than the driver is
+/// an exclusion ([`ExclusionReason::DriverUnavailable`] /
+/// [`ExclusionReason::InvalidSettings`] / [`ExclusionReason::SettingsVersionTooNew`]).
+/// This being the strict build, it then fails the build with that item's wording, the
+/// same way an unusable port does (banto-hub's plan and its save-time preflight; the
+/// lenient builders keep the rest running). banto-hub's plan goes through this
+/// (`banto_hub_core::ingest::build_hub_config`); ChronoGazer has no registry (Q6) and
+/// keeps the registry-free builders.
+pub fn build_config_from_with_registry(
+    snapshot: &RegistrySnapshot,
+    push: PushSource,
+    registry: &DriverRegistry,
+) -> Result<CollectorConfig, CollectError> {
+    let (config, exclusions) = build_config_lenient_inner(
+        snapshot,
+        ThresholdSource::None,
+        HubSource::Unavailable,
+        push,
+        Some(registry),
+    );
+    match exclusions.iter().find_map(ConfigExclusion::strict_error) {
+        Some(err) => Err(err),
+        None => Ok(config),
+    }
+}
+
+/// R2b-1d (design §4.4): why `conn` cannot be collected under `registry`, if it
+/// cannot - checked in this order:
+///
+/// 1. `registry.get(protocol)` is `None` → [`ExclusionReason::DriverUnavailable`].
+/// 2. `settings_version` > the driver's `settings_version` →
+///    [`ExclusionReason::SettingsVersionTooNew`] (design §3.4).
+/// 3. the driver's `validate_config` (`banto_tags::validate_settings_with_registry`),
+///    then the storage-layer shape check (`banto_tags::check_settings_shape`: a secret
+///    key holds only a reference, design §3.2's JSON types) → [`ExclusionReason::InvalidSettings`].
+///
+/// Pure; also used by banto-hub's migration preflight and status surfaces.
+pub fn driver_exclusion(
+    conn: &PlcConnection,
+    registry: &DriverRegistry,
+) -> Option<ExclusionReason> {
+    let Some(entry) = registry.get(&conn.protocol) else {
+        return Some(ExclusionReason::DriverUnavailable {
+            protocol: conn.protocol.clone(),
+        });
+    };
+    let supported = i64::from(entry.descriptor().settings_version);
+    if conn.settings_version > supported {
+        return Some(ExclusionReason::SettingsVersionTooNew {
+            stored: conn.settings_version,
+            supported,
+        });
+    }
+    let mut errors =
+        banto_tags::validate_settings_with_registry(registry, &conn.protocol, &conn.settings);
+    if errors.is_empty() {
+        errors = banto_tags::check_settings_shape(
+            &conn.protocol,
+            &conn.settings,
+            &entry.base().secret_keys(),
+        );
+    }
+    if errors.is_empty() {
+        None
+    } else {
+        Some(ExclusionReason::InvalidSettings {
+            errors: errors
+                .into_iter()
+                .map(|error| format!("{}: {}", error.field, error.message))
+                .collect(),
+        })
     }
 }
 
@@ -720,6 +799,23 @@ pub enum ExclusionReason {
         data_type: String,
         issue: TagAddressIssue,
     },
+    /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4): the connection's
+    /// `protocol` is not in the caller's driver registry - a `"hub"` row in banto-hub
+    /// (the Hub registers no `hub` driver), or a plugin that was removed. The row is
+    /// kept (never deleted or reinterpreted as another protocol, plugin-design §7.5);
+    /// only this connection is left out. Only a build given a registry
+    /// ([`build_config_from_with_registry`]) raises it.
+    DriverUnavailable { protocol: String },
+    /// R2b-1d (design §4.4): the driver's `validate_config` (or the storage-layer shape
+    /// check, `banto_tags::check_settings_shape`) refuses the stored `settings` - a row
+    /// edited by hand. `errors` are `"<field>: <message>"` (REST spellings), never a
+    /// secret value (secret keys hold only references, and references are not passed to
+    /// `validate_config`).
+    InvalidSettings { errors: Vec<String> },
+    /// R2b-1d (design §3.4): the row was written with a newer settings shape than this
+    /// driver reads (`settings_version` > the driver's `settings_version`) - a database
+    /// written by a newer Hub or a plugin rolled back.
+    SettingsVersionTooNew { stored: i64, supported: i64 },
     /// The owning connection was excluded.
     ConnectionExcluded { connection_name: String },
     /// The owning group was excluded.
@@ -744,6 +840,9 @@ impl ExclusionReason {
                 TagAddressIssue::UnknownDataType => "unknownDataType",
                 TagAddressIssue::BitAddressOnNonBitType => "bitAddressOnNonBitType",
             },
+            ExclusionReason::DriverUnavailable { .. } => "driverUnavailable",
+            ExclusionReason::InvalidSettings { .. } => "invalidSettings",
+            ExclusionReason::SettingsVersionTooNew { .. } => "settingsVersionTooNew",
             ExclusionReason::ConnectionExcluded { .. } => "connectionExcluded",
             ExclusionReason::GroupExcluded { .. } => "groupExcluded",
         }
@@ -786,6 +885,15 @@ impl ExclusionReason {
                 format!("収集周期（period_ms）が不正です: {period_ms}")
             }
             ExclusionReason::InvalidTag { issue, .. } => issue.message(),
+            ExclusionReason::DriverUnavailable { protocol } => format!(
+                "プロトコル {protocol} のドライバがこの実行形態にありません（接続は残しています）"
+            ),
+            ExclusionReason::InvalidSettings { errors } => {
+                format!("接続の設定が検証を通りません: {}", errors.join(" / "))
+            }
+            ExclusionReason::SettingsVersionTooNew { stored, supported } => format!(
+                "接続の設定の版（{stored}）がドライバの読める版（{supported}）より新しいため収集しません"
+            ),
             ExclusionReason::ConnectionExcluded { connection_name } => {
                 format!("所属する接続「{connection_name}」が除外されたため、収集しません")
             }
@@ -902,6 +1010,16 @@ impl ConfigExclusion {
                      data_type=bit のタグでのみ使えます（現在のデータ型: {data_type}）"
                 ),
             },
+            ExclusionReason::DriverUnavailable { protocol } => format!(
+                "接続 {name} のプロトコル {protocol} のドライバがありません（接続は残しています）"
+            ),
+            ExclusionReason::InvalidSettings { errors } => format!(
+                "接続 {name} の設定が検証を通りません: {}",
+                errors.join(" / ")
+            ),
+            ExclusionReason::SettingsVersionTooNew { stored, supported } => format!(
+                "接続 {name} の設定の版（{stored}）がドライバの読める版（{supported}）より新しいです"
+            ),
             ExclusionReason::ConnectionExcluded { .. } | ExclusionReason::GroupExcluded { .. } => {
                 return None
             }
@@ -949,6 +1067,7 @@ pub fn build_config_lenient_from(
         ThresholdSource::None,
         HubSource::Unavailable,
         PushSource::Unavailable,
+        None,
     )
 }
 
@@ -979,6 +1098,7 @@ pub fn build_config_lenient_with_thresholds(
         ThresholdSource::Supplied(thresholds),
         hub,
         PushSource::Unavailable,
+        None,
     )
 }
 
@@ -1013,6 +1133,7 @@ fn build_config_lenient_inner(
     threshold_source: ThresholdSource<'_>,
     hub: HubSource<'_>,
     push: PushSource,
+    drivers: Option<&DriverRegistry>,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
@@ -1092,7 +1213,7 @@ fn build_config_lenient_inner(
         let mut conn_groups = groups_by_connection.remove(&conn.id).unwrap_or_default();
         conn_groups.sort_by_key(|g| g.id);
 
-        let resolved = match resolve_connection(conn, hub, push) {
+        let resolved = match resolve_connection(conn, hub, push, drivers) {
             Ok(resolved) => resolved,
             Err(reason) => {
                 // The connection first (it is what needs fixing), then
@@ -1329,6 +1450,7 @@ pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
         ThresholdSource::None,
         HubSource::Available { catalog: None },
         PushSource::Unavailable,
+        None,
     )
     .1
 }
@@ -1340,7 +1462,18 @@ fn resolve_connection<'a>(
     conn: &PlcConnection,
     hub: HubSource<'a>,
     push: PushSource,
+    drivers: Option<&DriverRegistry>,
 ) -> Result<ResolvedConnection<'a>, ExclusionReason> {
+    // R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): with a registry,
+    // the connection's driver and settings are checked first - a row the registry does
+    // not know (a hand-written `hub` row in banto-hub, a removed plugin), whose settings
+    // the driver refuses (hand-edited) or whose settings shape is newer than the driver
+    // is excluded alone; the row itself is kept.
+    if let Some(registry) = drivers {
+        if let Some(reason) = driver_exclusion(conn, registry) {
+            return Err(reason);
+        }
+    }
     if conn.protocol == PUSH_PROTOCOL {
         return match push {
             PushSource::Unavailable => Err(ExclusionReason::PushSourceUnavailable),
@@ -3798,6 +3931,7 @@ mod tests {
             ThresholdSource::None,
             HubSource::Unavailable,
             PushSource::Available,
+            None,
         );
         let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
             .iter()
@@ -3828,6 +3962,7 @@ mod tests {
                 ThresholdSource::None,
                 HubSource::Unavailable,
                 PushSource::Available,
+                None,
             );
             assert!(config.connections.is_empty());
             assert!(config.store_config.groups.is_empty());
@@ -3924,5 +4059,225 @@ mod tests {
         assert!(config_exclusions(&snapshot)
             .iter()
             .any(|e| e.reason.code() == "pushSourceUnavailable"));
+    }
+
+    // ---- R2b-1d: §4.4 exclusion reasons (a driver registry) ---------------
+
+    /// A minimal driver for the registry: refuses `port == "1"`, holds `secret_keys`.
+    struct FakeDriver {
+        descriptor: banto_driver_api::DriverDescriptor,
+        secret_keys: Vec<String>,
+    }
+
+    impl banto_driver_api::DriverBase for FakeDriver {
+        fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+            &self.descriptor
+        }
+        fn validate_config(
+            &self,
+            settings: &banto_driver_api::Settings,
+        ) -> Vec<banto_driver_api::FieldError> {
+            if settings.get("port") == Some("1") {
+                vec![banto_driver_api::FieldError::new("port", "driver says no")]
+            } else {
+                Vec::new()
+            }
+        }
+        fn secret_keys(&self) -> Vec<String> {
+            self.secret_keys.clone()
+        }
+        fn parse_address(
+            &self,
+            _text: &str,
+            _kind: &banto_driver_api::TagKind,
+        ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+            Err(banto_driver_api::AddressError::new("none"))
+        }
+        fn offset_address(
+            &self,
+            canonical: &str,
+            _kind: &banto_driver_api::TagKind,
+            _n: i64,
+        ) -> Result<String, banto_driver_api::AddressError> {
+            Ok(canonical.to_owned())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn fake_registry(drivers: &[(&str, &[&str])]) -> DriverRegistry {
+        let mut registry = DriverRegistry::new();
+        for (id, secret_keys) in drivers {
+            registry
+                .register(banto_driver_api::DriverEntry::host_provided(
+                    std::sync::Arc::new(FakeDriver {
+                        descriptor: banto_driver_api::DriverDescriptor::new(
+                            banto_driver_api::DriverId::new(id).unwrap(),
+                            "0.0.0",
+                            *id,
+                            banto_driver_api::Capabilities::READ_ONLY,
+                        ),
+                        secret_keys: secret_keys.iter().map(|k| k.to_string()).collect(),
+                    }),
+                ))
+                .unwrap();
+        }
+        registry
+    }
+
+    fn modbus_conn(id: i64, name: &str, settings: serde_json::Value) -> PlcConnection {
+        PlcConnection::from_settings(
+            id,
+            name.to_string(),
+            "modbus-tcp".to_string(),
+            true,
+            false,
+            settings.as_object().unwrap().clone(),
+            1,
+        )
+    }
+
+    /// Design §4.4・§7: with a registry, a connection whose driver is missing, whose
+    /// settings the driver (or the storage-layer shape check) refuses, or whose
+    /// settings version is newer than the driver's is excluded **alone** - its groups
+    /// and tags cascade, every other connection is planned, the row itself is untouched.
+    /// The strict build fails with that connection's wording; without a registry
+    /// (ChronoGazer) nothing changes.
+    #[test]
+    fn a_registry_excludes_only_the_connection_it_cannot_drive() {
+        let registry = fake_registry(&[("modbus-tcp", &[]), ("push", &[])]);
+        let good = modbus_conn(1, "good", serde_json::json!({"host": "h", "port": 502}));
+        let refused = modbus_conn(2, "refused", serde_json::json!({"host": "h", "port": 1}));
+        let wrong_type = modbus_conn(
+            3,
+            "wrong-type",
+            serde_json::json!({"host": "h", "port": "502"}),
+        );
+        let mut too_new = modbus_conn(4, "too-new", serde_json::json!({"host": "h", "port": 502}));
+        too_new.settings_version = 2;
+        let mut no_driver = modbus_conn(5, "no-driver", serde_json::json!({}));
+        no_driver.protocol = "slmp".to_string();
+        let mut hub = modbus_conn(6, "hub", serde_json::json!({}));
+        hub.protocol = banto_tags::HUB_PROTOCOL.to_string();
+        let connections = vec![good, refused, wrong_type, too_new, no_driver, hub];
+        let groups: Vec<CollectionGroup> = (1..=6).map(|id| group_of(id * 10, id, 1000)).collect();
+        let tags: Vec<Tag> = (1..=6)
+            .map(|id| tag_of(id * 100, id * 10, "40001", "u16"))
+            .collect();
+        let snapshot = RegistrySnapshot {
+            connections,
+            groups,
+            tags,
+            secrets: Vec::new(),
+        };
+
+        let (config, exclusions) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            Some(&registry),
+        );
+        let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(planned, vec!["conn:1"]);
+        let own: Vec<(i64, &str)> = exclusions
+            .iter()
+            .filter(|e| e.unit == ExclusionUnit::Connection)
+            .map(|e| (e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            own,
+            vec![
+                (2, "invalidSettings"),
+                (3, "invalidSettings"),
+                (4, "settingsVersionTooNew"),
+                (5, "driverUnavailable"),
+                (6, "driverUnavailable"),
+            ]
+        );
+        // Each excluded connection takes its group and tag along as cascades.
+        assert_eq!(
+            exclusions
+                .iter()
+                .filter(|e| e.reason.code() == "connectionExcluded")
+                .count(),
+            10
+        );
+        let reason_of = |id: i64| {
+            exclusions
+                .iter()
+                .find(|e| e.unit == ExclusionUnit::Connection && e.id == id)
+                .unwrap()
+                .reason
+                .clone()
+        };
+        assert_eq!(
+            reason_of(2),
+            ExclusionReason::InvalidSettings {
+                errors: vec!["port: driver says no".to_string()]
+            }
+        );
+        assert!(matches!(
+            reason_of(3),
+            ExclusionReason::InvalidSettings { errors } if errors[0].starts_with("port: ")
+        ));
+        assert_eq!(
+            reason_of(4),
+            ExclusionReason::SettingsVersionTooNew {
+                stored: 2,
+                supported: 1
+            }
+        );
+        assert!(reason_of(5).message().contains("slmp"));
+
+        // The strict build (banto-hub) fails on the first one, by name.
+        let err = build_config_from_with_registry(&snapshot, PushSource::Available, &registry)
+            .unwrap_err();
+        assert!(err.to_string().contains("接続 refused の設定"), "{err}");
+        // A snapshot of only good rows builds.
+        let only_good = RegistrySnapshot {
+            connections: vec![snapshot.connections[0].clone()],
+            groups: vec![snapshot.groups[0].clone()],
+            tags: vec![snapshot.tags[0].clone()],
+            secrets: Vec::new(),
+        };
+        assert!(
+            build_config_from_with_registry(&only_good, PushSource::Available, &registry).is_ok()
+        );
+        // Without a registry the old rules decide (no driver checks at all).
+        let (_, without) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            None,
+        );
+        assert!(without.iter().all(|e| !matches!(
+            e.reason,
+            ExclusionReason::DriverUnavailable { .. }
+                | ExclusionReason::InvalidSettings { .. }
+                | ExclusionReason::SettingsVersionTooNew { .. }
+        )));
+    }
+
+    /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -
+    /// and the message names the field only, never the value.
+    #[test]
+    fn a_plaintext_under_a_secret_key_is_invalid_settings_without_the_value() {
+        let registry = fake_registry(&[("modbus-tcp", &["password"])]);
+        let conn = modbus_conn(
+            1,
+            "m",
+            serde_json::json!({"host": "h", "port": 502, "password": "TOPSECRET"}),
+        );
+        let reason = driver_exclusion(&conn, &registry).unwrap();
+        assert_eq!(reason.code(), "invalidSettings");
+        assert!(
+            !reason.message().contains("TOPSECRET"),
+            "{}",
+            reason.message()
+        );
+        assert!(!format!("{reason:?}").contains("TOPSECRET"));
     }
 }

@@ -35,6 +35,8 @@ use std::fmt;
 use banto_collect::RegistrySnapshot;
 use banto_tags::{DB_TAG_KIND, POSTGRES_PROTOCOL};
 
+use crate::secrets::UnreadableReason;
+
 /// 1回の commit で engine が受け取る計画一式。
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DbSourcePlan {
@@ -45,12 +47,38 @@ pub struct DbSourcePlan {
     /// `(id, name)`。タスクは起動しないが、状態表示で `disabled` として
     /// 見せるために持ち回る（[`crate::db_source::status`]）。
     pub disabled: Vec<(i64, String)>,
+    /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: 有効で回す
+    /// グループもあるが、**パスワードを読めない**接続（秘密値の行が無い・この PC で
+    /// 開けない）。タスクを起動せず（再試行でも繋ぎに行かない）、状態表示はその接続だけ
+    /// `error`「パスワードを読めません」、配下のタグは Bad（[`crate::db_source::DbSourceEngine`]
+    /// が書く）。空のパスワードで繋がない（`trust` 認証の DB なら別の資格で繋がって
+    /// しまう、checklist §5「エラーを空に潰さない」）。
+    pub unreadable: Vec<UnreadableDbConnection>,
 }
 
 impl DbSourcePlan {
     pub fn is_empty(&self) -> bool {
-        self.connections.is_empty() && self.disabled.is_empty()
+        self.connections.is_empty() && self.disabled.is_empty() && self.unreadable.is_empty()
     }
+}
+
+/// R2b-1d: パスワードを読めないので起動しない接続 1 件（[`DbSourcePlan::unreadable`]）。
+/// パスワードも参照も持たない。`groups` は配下のタグへ Bad を書くため。
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnreadableDbConnection {
+    pub connection_id: i64,
+    pub connection_name: String,
+    pub reason: UnreadableReason,
+    pub groups: Vec<DbGroupPlan>,
+}
+
+/// R2b-1d（設計 §5.5）: パスワードを読めない接続の理由の文言（状態の画面の
+/// `dbSource` 節・接続のテストの `error`）。秘密値を含まない。
+pub fn unreadable_password_message(reason: UnreadableReason) -> String {
+    format!(
+        "パスワードを読めません（{}）。接続の編集でパスワードを入れ直してください。",
+        reason.as_str()
+    )
 }
 
 /// 1接続分（= tokio task 1本、`PgPool` 1つ）。
@@ -183,6 +211,7 @@ pub fn resolve_group(group: &DbGroupPlan, described: &[(String, String)]) -> Res
 pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
     let mut connections = Vec::new();
     let mut disabled = Vec::new();
+    let mut unreadable = Vec::new();
 
     for conn in &snapshot.connections {
         if conn.protocol != POSTGRES_PROTOCOL {
@@ -270,13 +299,13 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             continue;
         }
 
-        // R2b-1d (design §5.4): the password is opened from the sealed row the snapshot
-        // carries. No password set = connect without one (a postgres password is
+        // R2b-1d (design §5.4・§5.5): the password is opened from the sealed row the
+        // snapshot carries. No password set = connect without one (a postgres password is
         // optional). One that is set but cannot be read is **not** collapsed to an empty
-        // password - the connection is not started.
-        // TODO(R2b-1d part B / R2b-1e): keep the sealed row in the plan, open it at
-        // connect time and report the connection as Bad「パスワードを読めません」 (design
-        // §5.4・§5.5); for now it is listed as `disabled` (never dialled).
+        // password: the connection is not started (no task, so no retry dials it either),
+        // its status reads「パスワードを読めません」 and its tags read Bad.
+        // TODO(R2b-1e): hold the sealed row in the plan and open it at connect time
+        // (design §5.4's table); the plan carries the opened value as before for now.
         let password = match crate::secrets::open_connection_secret(
             &crate::secrets::r2b1d_connection_secrets(),
             conn,
@@ -284,8 +313,13 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
             &snapshot.secrets,
         ) {
             Ok(password) => password.map_or_else(String::new, |plain| plain.as_str().to_owned()),
-            Err(_unreadable) => {
-                disabled.push((conn.id, conn.name.clone()));
+            Err(reason) => {
+                unreadable.push(UnreadableDbConnection {
+                    connection_id: conn.id,
+                    connection_name: conn.name.clone(),
+                    reason,
+                    groups,
+                });
                 continue;
             }
         };
@@ -305,6 +339,7 @@ pub fn build_plan(snapshot: &RegistrySnapshot) -> Result<DbSourcePlan, String> {
     Ok(DbSourcePlan {
         connections,
         disabled,
+        unreadable,
     })
 }
 
@@ -507,7 +542,8 @@ mod tests {
 
     /// R2b-1d (design §5.4): the plan opens the sealed password; a connection with no
     /// password connects without one; one whose reference has no readable row is not
-    /// started (listed as disabled) - never dialled with an empty password.
+    /// started (listed as unreadable with its reason) - never dialled with an empty
+    /// password.
     #[test]
     fn build_plan_opens_the_sealed_password_and_never_collapses_an_unreadable_one() {
         let snapshot = RegistrySnapshot {
@@ -547,8 +583,33 @@ mod tests {
             unreadable.secrets = broken;
             let plan = build_plan(&unreadable).unwrap();
             assert!(plan.connections.is_empty(), "{plan:?}");
-            assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
+            assert!(plan.disabled.is_empty(), "{plan:?}");
+            assert_eq!(plan.unreadable.len(), 1, "{plan:?}");
+            assert_eq!(plan.unreadable[0].connection_id, 1);
+            assert_eq!(plan.unreadable[0].groups[0].tags[0].tag_key, "tag:10");
+            assert!(!format!("{plan:?}").contains("s3cret"));
         }
+        // The reason is kept apart: a missing row vs. a row that cannot be opened.
+        let mut missing = snapshot.clone();
+        missing.secrets.clear();
+        assert_eq!(
+            build_plan(&missing).unwrap().unreadable[0].reason,
+            UnreadableReason::Missing
+        );
+        let mut undecryptable = snapshot.clone();
+        undecryptable.secrets[0].sealed =
+            banto_tags::SealedSecretRow::new(PW_REF, "dpapi-machine-v1", b"blob".to_vec());
+        assert_eq!(
+            build_plan(&undecryptable).unwrap().unreadable[0].reason,
+            UnreadableReason::Undecryptable
+        );
+        // A disabled connection with an unreadable password stays `disabled` (it would
+        // not be dialled anyway).
+        let mut disabled = missing.clone();
+        disabled.connections[0].enabled = false;
+        let plan = build_plan(&disabled).unwrap();
+        assert_eq!(plan.disabled, vec![(1, "erp".to_string())]);
+        assert!(plan.unreadable.is_empty());
     }
 
     /// このモジュールの doc comment「平文パスワードの扱い」節。
