@@ -15,8 +15,10 @@
 //!
 //! 比べるのは**拒否の有無と項目名の集合**。文言は別の表（[`message_differences`]）で、
 //! 食い違っているものを**そのまま固定**する（直すかどうかは設計の判断、報告済み）。
-//! 表の各行は `Verdict` を持ち、実際の結果と一致しないと落ちる。食い違いが増えても減っても
-//! 落ちるので、どちらかの検証を変えたら表を見直すことになる。
+//! 表の各行は `Verdict` と、旧・新それぞれが断る項目名の集合の**期待そのもの**（`Expect`）を持ち、
+//! 実際の結果と一致しないと落ちる。食い違いの行も「どの項目を旧が断り、新が断らないか」まで
+//! 固定するので、食い違いが別の食い違いに変わっても、増えても減っても落ちる。どちらかの検証を
+//! 変えたら表を見直すことになる。
 
 mod common;
 
@@ -51,10 +53,62 @@ impl Verdict {
     }
 }
 
+/// 行の期待。判定と、旧・新が断る項目名（REST の綴り）の集合の正確な期待。
+struct Expect {
+    verdict: Verdict,
+    old: BTreeSet<&'static str>,
+    new: BTreeSet<&'static str>,
+}
+
+fn set(fields: &[&'static str]) -> BTreeSet<&'static str> {
+    fields.iter().copied().collect()
+}
+
+/// 旧も新も何も断らない。
+fn ok() -> Expect {
+    agree_on(&[])
+}
+
+/// 旧も新も同じ項目の集合を断る。
+fn agree_on(fields: &[&'static str]) -> Expect {
+    Expect {
+        verdict: Verdict::Agree,
+        old: set(fields),
+        new: set(fields),
+    }
+}
+
+/// `bad` なら旧も新も `field` を断り、そうでなければどちらも断らない。
+fn agree_if(bad: bool, field: &'static str) -> Expect {
+    if bad {
+        agree_on(&[field])
+    } else {
+        ok()
+    }
+}
+
+/// 旧だけが `old` を断り、新は何も断らない（読まない欄）。
+fn dropped(reason: &'static str, old: &[&'static str]) -> Expect {
+    Expect {
+        verdict: Verdict::DroppedFieldOldOnly(reason),
+        old: set(old),
+        new: BTreeSet::new(),
+    }
+}
+
+/// 旧が `old`、新が `new` を断る食い違い。
+fn discrepancy(reason: &'static str, old: &[&'static str], new: &[&'static str]) -> Expect {
+    Expect {
+        verdict: Verdict::Discrepancy(reason),
+        old: set(old),
+        new: set(new),
+    }
+}
+
 struct Row {
     label: String,
     input: PlcConnectionInput,
-    verdict: Verdict,
+    expect: Expect,
 }
 
 static NAME_SEQ: AtomicU32 = AtomicU32::new(0);
@@ -151,31 +205,30 @@ fn bridge(period_ms: u64) -> Value {
 
 #[allow(clippy::too_many_lines)]
 fn rows() -> Vec<Row> {
-    use Verdict::{Agree, Discrepancy, DroppedFieldOldOnly};
     let mut rows = Vec::new();
-    let mut add = |label: String, input: PlcConnectionInput, verdict: Verdict| {
+    let mut add = |label: String, input: PlcConnectionInput, expect: Expect| {
         rows.push(Row {
             label,
             input,
-            verdict,
+            expect,
         });
     };
 
     // ---- modbus-tcp / slmp / postgres 共通の host・port ----
     for protocol in ["modbus-tcp", "slmp", "postgres"] {
-        add(format!("{protocol}: valid"), base(protocol), Agree);
+        add(format!("{protocol}: valid"), base(protocol), ok());
         for port in [0, 1, 65535, 65536, -1] {
             add(
                 format!("{protocol}: port {port}"),
                 with(protocol, |i| i.port = port),
-                Agree,
+                agree_if(!(1..=65535).contains(&port), "port"),
             );
         }
         for host in ["", "  ", "\t\n", " h ", "h"] {
             add(
                 format!("{protocol}: host {host:?}"),
                 with(protocol, |i| i.host = host.to_string()),
-                Agree,
+                agree_if(host.trim().is_empty(), "host"),
             );
         }
     }
@@ -185,16 +238,17 @@ fn rows() -> Vec<Row> {
         add(
             format!("modbus-tcp: unit_id {unit_id}"),
             with("modbus-tcp", |i| i.unit_id = unit_id),
-            Agree,
+            agree_if(!(0..=255).contains(&unit_id), "unitId"),
         );
         add(
             format!("slmp: unit_id {unit_id} (dropped)"),
             with("slmp", |i| i.unit_id = unit_id),
             if (0..=255).contains(&unit_id) {
-                Agree
+                ok()
             } else {
-                DroppedFieldOldOnly(
+                dropped(
                     "slmp は unit_id を読まない: 旧は範囲を検証する（設計 §3.2 で捨てる欄）",
+                    &["unitId"],
                 )
             },
         );
@@ -202,7 +256,7 @@ fn rows() -> Vec<Row> {
         add(
             format!("postgres: unit_id {unit_id} (normalized)"),
             with("postgres", |i| i.unit_id = unit_id),
-            Agree,
+            ok(),
         );
     }
 
@@ -220,7 +274,10 @@ fn rows() -> Vec<Row> {
             add(
                 format!("{protocol}: word_order {word_order:?}"),
                 with(protocol, |i| i.word_order = word_order.to_string()),
-                Agree,
+                agree_if(
+                    !matches!(word_order, "" | "low_high" | "high_low"),
+                    "wordOrder",
+                ),
             );
         }
     }
@@ -236,49 +293,54 @@ fn rows() -> Vec<Row> {
         Some("QQ"),
         Some(" Q"),
     ] {
+        let valid = matches!(cpu_type, None | Some("" | "Q" | "R"));
         add(
             format!("slmp: cpu_type {cpu_type:?}"),
             with("slmp", |i| i.cpu_type = cpu_type.map(str::to_string)),
-            Agree,
+            agree_if(!valid, "cpuType"),
         );
-        let valid = matches!(cpu_type, None | Some("" | "Q" | "R"));
         add(
             format!("modbus-tcp: cpu_type {cpu_type:?} (dropped)"),
             with("modbus-tcp", |i| i.cpu_type = cpu_type.map(str::to_string)),
             if valid {
-                Agree
+                ok()
             } else {
-                DroppedFieldOldOnly("modbus-tcp は cpu_type を読まない: 旧は全プロトコルで検証する")
+                dropped(
+                    "modbus-tcp は cpu_type を読まない: 旧は全プロトコルで検証する",
+                    &["cpuType"],
+                )
             },
         );
     }
 
     // ---- postgres の database・username（128 文字まで、前後の空白は除く）----
     for key in ["database", "username"] {
-        let set = |i: &mut PlcConnectionInput, v: Option<String>| {
+        let key: &'static str = key;
+        let set_field = |i: &mut PlcConnectionInput, v: Option<String>| {
             if key == "database" {
                 i.database = v;
             } else {
                 i.username = v;
             }
         };
-        let cases: Vec<(&str, Option<String>)> = vec![
-            ("none", None),
-            ("empty", Some(String::new())),
-            ("spaces", Some("   ".to_string())),
-            ("127", Some(long(127))),
-            ("128", Some(long(128))),
-            ("129", Some(long(129))),
-            ("128 padded", Some(format!(" {} ", long(128)))),
-            ("129 padded", Some(format!(" {} ", long(129)))),
-            ("128 multibyte", Some("あ".repeat(128))),
-            ("129 multibyte", Some("あ".repeat(129))),
+        // (名前, 値, 断られるはずか)
+        let cases: Vec<(&str, Option<String>, bool)> = vec![
+            ("none", None, true),
+            ("empty", Some(String::new()), true),
+            ("spaces", Some("   ".to_string()), true),
+            ("127", Some(long(127)), false),
+            ("128", Some(long(128)), false),
+            ("129", Some(long(129)), true),
+            ("128 padded", Some(format!(" {} ", long(128))), false),
+            ("129 padded", Some(format!(" {} ", long(129))), true),
+            ("128 multibyte", Some("あ".repeat(128)), false),
+            ("129 multibyte", Some("あ".repeat(129)), true),
         ];
-        for (name, value) in cases {
+        for (name, value, bad) in cases {
             add(
                 format!("postgres: {key} {name}"),
-                with("postgres", |i| set(i, value.clone())),
-                Agree,
+                with("postgres", |i| set_field(i, value.clone())),
+                agree_if(bad, key),
             );
         }
     }
@@ -288,7 +350,7 @@ fn rows() -> Vec<Row> {
         add(
             format!("postgres: password {password:?}"),
             with("postgres", |i| i.password = password.map(str::to_string)),
-            Agree,
+            ok(),
         );
     }
 
@@ -297,15 +359,17 @@ fn rows() -> Vec<Row> {
         add(
             format!("{protocol}: database set (dropped)"),
             with(protocol, |i| i.database = Some("d".to_string())),
-            DroppedFieldOldOnly(
+            dropped(
                 "postgres 以外の database / username / password は旧い検証が断る（設計 §4.2 (1)）",
+                &["database"],
             ),
         );
         add(
             format!("{protocol}: password set (dropped)"),
             with(protocol, |i| i.password = Some("pw".to_string())),
-            DroppedFieldOldOnly(
+            dropped(
                 "postgres 以外の database / username / password は旧い検証が断る（設計 §4.2 (1)）",
+                &["password"],
             ),
         );
     }
@@ -317,7 +381,7 @@ fn rows() -> Vec<Row> {
             i.host = String::new();
             i.port = 0;
         }),
-        Agree,
+        ok(),
     );
     add(
         "virtual: host/port junk".into(),
@@ -325,36 +389,48 @@ fn rows() -> Vec<Row> {
             i.host = " x ".into();
             i.port = -5;
         }),
-        Agree,
+        ok(),
     );
     add(
         "virtual: unit_id 256 (dropped)".into(),
         with("virtual", |i| i.unit_id = 256),
-        DroppedFieldOldOnly("virtual は unit_id を読まない（正規化もしない）: 旧は範囲を検証する"),
+        dropped(
+            "virtual は unit_id を読まない（正規化もしない）: 旧は範囲を検証する",
+            &["unitId"],
+        ),
     );
     add(
         "virtual: word_order junk (dropped)".into(),
         with("virtual", |i| i.word_order = "x".into()),
-        DroppedFieldOldOnly("virtual は word_order を読まない（正規化もしない）: 旧は検証する"),
+        dropped(
+            "virtual は word_order を読まない（正規化もしない）: 旧は検証する",
+            &["wordOrder"],
+        ),
     );
     add(
         "virtual: settings set (dropped)".into(),
         with("virtual", |i| i.settings = Some(json!({"a": 1}))),
-        DroppedFieldOldOnly("settings は push 以外には指定できない: 旧い検証が断る。virtual のドライバは何も断らない"),
+        dropped(
+            "settings は push 以外には指定できない: 旧い検証が断る。virtual のドライバは何も断らない",
+            &["settings"],
+        ),
     );
     // simulation + virtual は旧い検証の規則で、settings に写らない。
     add(
         "virtual: simulation (not a setting)".into(),
         with("virtual", |i| i.simulation = true),
-        DroppedFieldOldOnly("simulation は settings の外（列）。旧い検証だけが見る"),
+        dropped(
+            "simulation は settings の外（列）。旧い検証だけが見る",
+            &["simulation"],
+        ),
     );
 
     // ---- push の settings ----
-    add("push: settings none".into(), base("push"), Agree);
+    add("push: settings none".into(), base("push"), ok());
     add(
         "push: settings {}".into(),
         with("push", |i| i.settings = Some(json!({}))),
-        Agree,
+        ok(),
     );
     for ms in [0u64, 999, 1000, 3_600_000, 3_600_001] {
         add(
@@ -362,7 +438,10 @@ fn rows() -> Vec<Row> {
             with("push", |i| {
                 i.settings = Some(json!({"stale_timeout_ms": ms}))
             }),
-            Agree,
+            agree_if(
+                !(1000..=3_600_000).contains(&ms),
+                "settings.stale_timeout_ms",
+            ),
         );
     }
     add(
@@ -370,66 +449,70 @@ fn rows() -> Vec<Row> {
         with("push", |i| {
             i.settings = Some(json!({"stale_timeout_ms": -1}))
         }),
-        Agree,
+        agree_on(&["settings.stale_timeout_ms"]),
     );
     add(
         "push: stale_timeout_ms 1.5".into(),
         with("push", |i| {
             i.settings = Some(json!({"stale_timeout_ms": 1.5}))
         }),
-        Agree,
+        agree_on(&["settings.stale_timeout_ms"]),
     );
     add(
         "push: stale_timeout_ms \"5000\" (string)".into(),
         with("push", |i| i.settings = Some(json!({"stale_timeout_ms": "5000"}))),
-        Discrepancy("stale_timeout_ms が文字列 \"5000\": 旧は断る（整数でない）。新は 10 進の文字列として受かる（Settings は型を持たない）"),
+        discrepancy("stale_timeout_ms が文字列 \"5000\": 旧は断る（整数でない）。新は 10 進の文字列として受かる（Settings は型を持たない）", &["settings.stale_timeout_ms"], &[]),
     );
     add(
         "push: stale_timeout_ms true".into(),
         with("push", |i| {
             i.settings = Some(json!({"stale_timeout_ms": true}))
         }),
-        Agree,
+        agree_on(&["settings.stale_timeout_ms"]),
     );
     add(
         "push: unknown key".into(),
         with("push", |i| i.settings = Some(json!({"nope": 1}))),
-        Discrepancy("未知のキー: 旧は断る（reject_unknown_keys）。ドライバは未知のキーを断らない（DriverBase の約束・適合テスト C2）"),
+        discrepancy("未知のキー: 旧は断る（reject_unknown_keys）。ドライバは未知のキーを断らない（DriverBase の約束・適合テスト C2）", &["settings"], &[]),
     );
     add(
         "push: host key (other layer's key)".into(),
         with("push", |i| i.settings = Some(json!({"host": "x"}))),
-        Discrepancy("未知のキー（host）: 旧は断る。ドライバは断らない"),
+        discrepancy(
+            "未知のキー（host）: 旧は断る。ドライバは断らない",
+            &["settings"],
+            &[],
+        ),
     );
     add(
         "push: valid bridge".into(),
         with("push", |i| i.settings = Some(bridge(1000))),
-        Agree,
+        ok(),
     );
     add(
         "push: bridge period 300".into(),
         with("push", |i| i.settings = Some(bridge(300))),
-        Agree,
+        agree_on(&["settings.bridge.queries[0].period_ms"]),
     );
     add(
         "push: bridge not an object".into(),
         with("push", |i| i.settings = Some(json!({"bridge": 5}))),
-        Agree,
+        agree_on(&["settings.bridge"]),
     );
     add(
         "push: bridge as a JSON string".into(),
         with("push", |i| i.settings = Some(json!({"bridge": bridge(1000)["bridge"].to_string()}))),
-        Discrepancy("bridge が JSON を入れた文字列: 旧は断る（オブジェクトでない）。新は文字列をそのまま JSON として読んで受かる"),
+        discrepancy("bridge が JSON を入れた文字列: 旧は断る（オブジェクトでない）。新は文字列をそのまま JSON として読んで受かる", &["settings.bridge"], &[]),
     );
     add(
         "push: settings not an object (array)".into(),
         with("push", |i| i.settings = Some(json!([1]))),
-        Discrepancy("settings がオブジェクトでない: 旧は断る。settings_from_flat は {} にして検証に渡す（旧い検証が先に断る前提）"),
+        discrepancy("settings がオブジェクトでない: 旧は断る。settings_from_flat は {} にして検証に渡す（旧い検証が先に断る前提）", &["settings"], &[]),
     );
     add(
         "push: settings null".into(),
         with("push", |i| i.settings = Some(Value::Null)),
-        Discrepancy("settings が null: 旧は断る（オブジェクトでない）。settings_from_flat は null を {} にする（§3.2「NULL なら {}」）"),
+        discrepancy("settings が null: 旧は断る（オブジェクトでない）。settings_from_flat は null を {} にする（§3.2「NULL なら {}」）", &["settings"], &[]),
     );
     // push の host・port・unit_id は正規化が既定に揃える。
     add(
@@ -439,17 +522,21 @@ fn rows() -> Vec<Row> {
             i.port = 99_999;
             i.unit_id = 999;
         }),
-        Agree,
+        ok(),
     );
 
     // ---- hub / 未知 / 綴り ----
     add(
         "hub".into(),
         base("hub"),
-        Discrepancy("hub: 旧の許可リストに含まれて受かる。Hub のレジストリには hub が無い（設計 §4.1）ので protocol の項目エラー。Hub の REST は reject_hub_connection_protocol で元から断る"),
+        discrepancy("hub: 旧の許可リストに含まれて受かる。Hub のレジストリには hub が無い（設計 §4.1）ので protocol の項目エラー。Hub の REST は reject_hub_connection_protocol で元から断る", &[], &["protocol"]),
     );
     for protocol in ["bogus", "", "SLMP", "Modbus-TCP", "modbus", "slmp "] {
-        add(format!("protocol {protocol:?}"), base(protocol), Agree);
+        add(
+            format!("protocol {protocol:?}"),
+            base(protocol),
+            agree_on(&["protocol"]),
+        );
     }
     rows
 }
@@ -465,18 +552,34 @@ async fn the_old_flat_validation_and_the_registry_reject_the_same_inputs() {
         let old = old_errors(&service, &row.input).await;
         let new = new_errors(&registry, &row.input);
         let (old_fields, new_fields) = (fields(&old), fields(&new));
-        let agree = old_fields == new_fields;
-        let ok = match row.verdict {
-            Verdict::Agree => agree,
-            Verdict::DroppedFieldOldOnly(_) => !old.is_empty() && !agree,
-            Verdict::Discrepancy(_) => !agree,
-        };
-        if !ok {
+        let expect = &row.expect;
+        // 期待そのものの整合: Agree は old == new、それ以外は old != new。
+        let expect_agree = expect.old == expect.new;
+        assert_eq!(
+            matches!(expect.verdict, Verdict::Agree),
+            expect_agree,
+            "{}: verdict {:?} contradicts the expected sets old={:?} new={:?}",
+            row.label,
+            expect.verdict,
+            expect.old,
+            expect.new
+        );
+        if matches!(expect.verdict, Verdict::DroppedFieldOldOnly(_)) {
+            assert!(
+                !expect.old.is_empty() && expect.new.is_empty(),
+                "{}: DroppedFieldOldOnly means old rejects and new rejects nothing",
+                row.label
+            );
+        }
+        // 旧と新、それぞれの項目名の集合が期待と**完全に**一致すること。
+        let want_old: BTreeSet<String> = expect.old.iter().map(|f| (*f).to_string()).collect();
+        let want_new: BTreeSet<String> = expect.new.iter().map(|f| (*f).to_string()).collect();
+        if old_fields != want_old || new_fields != want_new {
             report.push(format!(
-                "{}: verdict {:?} ({}) but old={old_fields:?} new={new_fields:?}\n  old messages: {old:?}\n  new messages: {new:?}",
+                "{}: verdict {:?} ({}) expected old={want_old:?} new={want_new:?} but old={old_fields:?} new={new_fields:?}\n  old messages: {old:?}\n  new messages: {new:?}",
                 row.label,
-                row.verdict,
-                row.verdict.reason()
+                expect.verdict,
+                expect.verdict.reason()
             ));
         }
     }
