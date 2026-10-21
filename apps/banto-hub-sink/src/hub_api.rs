@@ -1,7 +1,9 @@
 //! Hub 側のサイドカー専用 API（設計 §5.2・§6-15）へのクライアント:
 //! `GET /api/sink/config`（設定の取得）と `PUT /api/sink/status`（運転状態の
-//! push）。どちらも `Authorization: Bearer <api_key>` の admin スコープ限定
-//! （`banto_hub_core::rest::require_sink_admin`）。
+//! push）、R2a-3b の DB ブリッジの `GET /api/ingest/bridge-config`
+//! （docs/banto-hub-ingest-design.md §10.2、[`BridgeConfig`]）。どれも
+//! `Authorization: Bearer <api_key>` の admin スコープ限定
+//! （`banto_hub_core::rest::require_sink_admin`、ブリッジの設定も同じゲート - §12 Q13）。
 //!
 //! ## DTO は Hub 側の応答型の鏡写し
 //!
@@ -18,7 +20,8 @@
 //! `connections[].password` は**平文**（§6-15 のオーナー決定: admin
 //! スコープ + ループバック運用がその埋め合わせ）。この型の値は
 //! `Debug` でダンプしない - [`SinkConfigConnection`] は `Debug` を
-//! 手書きし、パスワードを `<redacted>` にしてある。
+//! 手書きし、パスワードを `<redacted>` にしてある。ブリッジの設定の
+//! `sources[].db.password`（[`BridgeDbConfig`]）も同じ扱い。
 //!
 //! ## エラー
 //!
@@ -123,6 +126,103 @@ impl fmt::Debug for SinkConfigConnection {
     }
 }
 
+/// `GET /api/ingest/bridge-config` の応答（R2a-3b、docs/banto-hub-ingest-design.md
+/// §10.2。Hub 側 `rest/ingest_bridge.rs` の `BridgeConfigResponse`）。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeConfig {
+    pub generated_at: i64,
+    pub sources: Vec<BridgeSourceConfig>,
+}
+
+/// ブリッジの source 1 件（= Hub のブリッジの `push` 接続 1 つ。Hub 側
+/// `BridgeSourceEntry`）。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeSourceConfig {
+    /// 送信の URL（`/api/v1/ingest/{id}/stream`）とスコープ（`ingest:#{id}`）の id。
+    /// 改名しても変わらない（§12 Q9）。
+    pub connection_id: i64,
+    /// 表示・ログ用。
+    pub name: String,
+    pub stale_timeout_ms: u64,
+    /// `settings.bridge` の指紋。変わったら問い合わせを止めて describe からやり直す
+    /// （§10.3）。
+    pub config_fingerprint: String,
+    /// この API キーが `ingest:#{connection_id}` を持つか。持たなければ動かさない
+    /// （§10.3「スコープの無い接続は状態に権限なしと出して動かさない」）。古い Hub が
+    /// 返さないときは `false`（fail closed）。
+    #[serde(default)]
+    pub ingest_allowed: bool,
+    pub queries: Vec<BridgeQueryConfig>,
+    pub db: BridgeDbConfig,
+}
+
+/// ブリッジのクエリ 1 本（Hub 側 `BridgeQueryEntry`）。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeQueryConfig {
+    pub name: String,
+    pub period_ms: i64,
+    pub sql: String,
+    pub columns: Vec<BridgeColumnConfig>,
+}
+
+/// 結果の 1 列 → 送るキー 1 つ（Hub 側 `BridgeColumnEntry`）。同じ列を複数のキーへ
+/// 送ってよい（キーは区画の中で一意、列は一意でなくてよい - `banto_tags` の
+/// `validate_push_settings`）。
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeColumnConfig {
+    pub column: String,
+    pub key: String,
+}
+
+/// ブリッジが読む DB（Hub の `postgres` 接続。Hub 側 `BridgeDbEntry`）。**パスワードを
+/// 平文で含む**（このモジュールの doc comment参照）。`ingest_allowed: false` の source
+/// では Hub が `null` にする。
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeDbConfig {
+    pub id: i64,
+    pub name: String,
+    /// 参照先の `postgres` 接続が有効か。無効なら動かさない（古い Hub が返さないときは
+    /// 有効とみなす - 項目が無かった頃の Hub は無効を区別しなかった）。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    pub host: String,
+    pub port: i64,
+    pub database: Option<String>,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl fmt::Debug for BridgeDbConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BridgeDbConfig")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("enabled", &self.enabled)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("database", &self.database)
+            .field("username", &self.username)
+            .field(
+                "password",
+                &self
+                    .password
+                    .as_ref()
+                    .map(|_| "<redacted>")
+                    .unwrap_or("None"),
+            )
+            .finish()
+    }
+}
+
 /// `PUT /api/sink/status` のボディ（Hub 側 `SinkStatusPushRequest`）。
 #[derive(Debug, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -187,6 +287,7 @@ pub struct HubApi {
     http: Client,
     config_url: String,
     status_url: String,
+    bridge_config_url: String,
     api_key: String,
 }
 
@@ -203,6 +304,7 @@ impl HubApi {
             http,
             config_url: format!("{base}/api/sink/config"),
             status_url: format!("{base}/api/sink/status"),
+            bridge_config_url: format!("{base}/api/ingest/bridge-config"),
             api_key: config.api_key.clone(),
         })
     }
@@ -212,6 +314,25 @@ impl HubApi {
         let response = self
             .http
             .get(&self.config_url)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .map_err(|_| HubApiError::Transport)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(classify_status(status));
+        }
+        let body = response.bytes().await.map_err(|_| HubApiError::Transport)?;
+        serde_json::from_slice(&body).map_err(|_| HubApiError::Protocol)
+    }
+
+    /// `GET /api/ingest/bridge-config`（R2a-3b）。この版のブリッジを知らない古い Hub は
+    /// 404（[`HubApiError::Status`]）を返す - 呼び出し側（[`crate::source`]）は source が
+    /// 無いものとして扱う。
+    pub async fn fetch_bridge_config(&self) -> Result<BridgeConfig, HubApiError> {
+        let response = self
+            .http
+            .get(&self.bridge_config_url)
             .bearer_auth(&self.api_key)
             .send()
             .await
@@ -300,6 +421,52 @@ mod tests {
         let parsed: SinkConfig = serde_json::from_str(SAMPLE).expect("parse");
         let rendered = format!("{:?}", parsed.connections[0]);
         assert!(!rendered.contains("s3cret"), "{rendered}");
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+    }
+
+    const BRIDGE_SAMPLE: &str = r#"{
+      "generatedAt": 2000,
+      "sources": [{
+        "connectionId": 12, "name": "Bridge1", "staleTimeoutMs": 10000,
+        "configFingerprint": "sha256:ab", "ingestAllowed": true,
+        "queries": [{"name": "line1", "periodMs": 1000, "sql": "SELECT temp FROM t",
+                     "columns": [{"column": "temp", "key": "line1.temp"}]}],
+        "db": {"id": 7, "name": "pg-a", "enabled": true, "host": "db01", "port": 5432,
+               "database": "mes", "username": "reader", "password": "br1dge-pw"}
+      }]
+    }"#;
+
+    /// §10.2 の wire 形をそのまま読む。
+    #[test]
+    fn bridge_config_maps_the_hub_wire_shape() {
+        let parsed: BridgeConfig = serde_json::from_str(BRIDGE_SAMPLE).expect("parse");
+        assert_eq!(parsed.generated_at, 2000);
+        let source = &parsed.sources[0];
+        assert_eq!(source.connection_id, 12);
+        assert_eq!(source.stale_timeout_ms, 10_000);
+        assert!(source.ingest_allowed);
+        assert_eq!(source.queries[0].period_ms, 1000);
+        assert_eq!(source.queries[0].columns[0].key, "line1.temp");
+        assert_eq!(source.db.password.as_deref(), Some("br1dge-pw"));
+    }
+
+    /// `ingestAllowed` が無い（古い Hub）なら動かさない側、`db.enabled` が無ければ有効。
+    #[test]
+    fn bridge_config_defaults_fail_closed_on_the_scope() {
+        let raw = BRIDGE_SAMPLE
+            .replace("\"ingestAllowed\": true,", "")
+            .replace("\"enabled\": true,", "");
+        let parsed: BridgeConfig = serde_json::from_str(&raw).expect("parse");
+        assert!(!parsed.sources[0].ingest_allowed);
+        assert!(parsed.sources[0].db.enabled);
+    }
+
+    /// ブリッジの DB の `Debug` にパスワードを出さない。
+    #[test]
+    fn bridge_db_debug_redacts_the_password() {
+        let parsed: BridgeConfig = serde_json::from_str(BRIDGE_SAMPLE).expect("parse");
+        let rendered = format!("{:?}", parsed.sources[0]);
+        assert!(!rendered.contains("br1dge-pw"), "{rendered}");
         assert!(rendered.contains("<redacted>"), "{rendered}");
     }
 

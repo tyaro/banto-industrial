@@ -56,6 +56,18 @@ time = { version = "0.3", default-features = false, features = ["local-offset"] 
 # サイドカーには複製しない。依存（banto-hub-bootstrap・
 # windows-sys など）はどれも既にこの exe の依存木にある。
 banto-safe-root = { path = "../../crates/banto-safe-root" }
+# R2a-3b（docs/banto-hub-ingest-design.md §10.3）: DB ブリッジ（`source/`）。Hub 内の
+# DB Source（`banto_hub_core::db_source`）と同じ「列 → f64 の変換」「列の解決」「品質の
+# 梯子」「失敗の粒度の分類」「接続オプションとエラー文言」を使うための共有 crate（§12 Q12、
+# 依存は `sqlx` の `postgres` だけで、上の sqlx と同じ版）。
+banto-db-source = { path = "../../crates/banto-db-source" }
+# R2a-3b: ブリッジの送信口 `GET /api/v1/ingest/{id}/stream`（WebSocket）のクライアント。
+# `banto-tagclient` は `/api/v1/stream` の購読専用で取り込みの口を持たないので直接使う。
+# workspace の 0.29 系（axum 0.8・`banto-tagclient` と同じ版）なので Cargo.lock に新しい
+# 系統は増えない。`futures-util` の `sink` は WS の送信（`SinkExt`）用で、これも
+# `banto-tagclient` が同じ feature で既に持つ。
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true, features = ["sink"] }
 
 [dev-dependencies]
 # 管理者でしか走らない確かめ（保護された置き場から読む）のゲート（#630。

@@ -78,7 +78,11 @@
 //! `admin` だけのキーでは `/api/v1/{tags,values,stream}`（SDK の購読経路）が
 //! 403 になる。したがってサイドカーのキーは **`admin` と `read` の両方**を
 //! 持つ必要がある（`["admin", "read"]` で発行する）。この 1 本を
-//! `api_key` に書く。
+//! `api_key` に書く。DB ブリッジ（[`crate::source`]、R2a-3b）を動かすときは、同じキーに
+//! ブリッジの `push` 接続ごとの `ingest:#{接続 id}` も足す（`admin` + `read` +
+//! `ingest:#12` …。docs/banto-hub-ingest-design.md §10.3）。スコープの無い接続のブリッジは
+//! 動かさない。`config_refresh_secs` はブリッジの設定（`GET /api/ingest/bridge-config`）の
+//! 取得の間隔にも使う（項目は増やさない）。
 
 pub mod place;
 

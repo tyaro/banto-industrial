@@ -15,6 +15,7 @@
 //! | [`resolve`]  | `describe` の結果と欲しい列名の突き合わせ [`resolve_columns`]（未対応型・列なしは Bad）       |
 //! | [`ladder`]   | 品質の梯子の純関数の状態機械 [`GroupLadder`]・[`Verdict`]（Good / Stale / Bad の判断だけ）    |
 //! | [`pg`]       | [`pg_connect_options`]（`sslmode=prefer`）と [`sanitize_postgres_error`]（資格情報を出さない） |
+//! | [`poll`]     | 失敗の粒度の分類 [`classify`]・[`PgFailure`]（接続か文か）とクエリのタイムアウト・再 describe の間隔（R2a-3b） |
 //!
 //! `validate_query_sql`（登録時の SQL の検証）はここへ**移さない**。`banto-tags`
 //! にあり、Hub の登録・ブリッジの設定の取得の両方がそちらを呼ぶ。
@@ -37,6 +38,7 @@
 pub mod convert;
 pub mod ladder;
 pub mod pg;
+pub mod poll;
 pub mod resolve;
 
 pub use convert::{
@@ -45,4 +47,5 @@ pub use convert::{
 };
 pub use ladder::{cell_verdict, GroupLadder, QueryFailure, Verdict};
 pub use pg::{pg_connect_options, sanitize_postgres_error};
+pub use poll::{classify, describe_retry_interval, query_timeout, PgFailure};
 pub use resolve::{resolve_columns, ColumnBadReason, ResolvedColumns};

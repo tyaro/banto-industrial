@@ -517,6 +517,9 @@ jobs:
       # （tests/sidecar.rs - interval/on_change・テーブル消失からの復帰・
       # 停止時の最終 status push）。banto-hub-core を dev-dependency として
       # ビルドするので、上の2ステップとキャッシュを共有できるこの位置に置く。
+      # R2a-3b: DB ブリッジの統合テスト（tests/bridge.rs - 値が Hub に届く・収集の停止と
+      # 開始・WS の切断と再接続・DB の停止・スコープの無い接続・§10.4 の 9 の 60 秒の
+      # 上限ちょうどの 3 クエリ）も同じ `cargo test -p banto-hub-sink` で走る。
       - name: test (banto-hub-sink)
         run: cargo test -p banto-hub-sink
 

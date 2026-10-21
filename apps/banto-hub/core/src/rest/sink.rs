@@ -191,15 +191,20 @@ pub(super) fn sink_groups_router(
 /// [`require_sink_admin`]の判定結果。`Err`はそのまま返せる`Response`
 /// （401/403）を運ぶ - 呼び出し元のハンドラは`if let Err(resp) = ... { return
 /// resp; }`の1行で済む。`Response`は大きい（axum の`http::Response<Body>`）
-/// ため`clippy::result_large_err`が付くが、この関数は2エンドポイントだけが
+/// ため`clippy::result_large_err`が付くが、この関数は数エンドポイントだけが
 /// 呼ぶ低頻度のゲートで、ボックス化するほどのホットパスではない。
+///
+/// `Ok` は通った呼び出し手の API キー（admin ロールのセッションなら `None`）。
+/// R2a-3b の `GET /api/ingest/bridge-config`（`super::ingest_bridge`）が同じゲートを
+/// 使い（docs/banto-hub-ingest-design.md §10.2・§12 Q13「新しい信頼の形を作らない」）、
+/// キーの `ingest:#{id}` で source ごとに `ingestAllowed` を詰めるために使う。
 #[allow(clippy::result_large_err)]
-async fn require_sink_admin(
+pub(super) async fn require_sink_admin(
     api_keys: &ApiKeysService,
     auth: &AuthState,
     headers: &HeaderMap,
     now_ms: i64,
-) -> Result<(), Response> {
+) -> Result<Option<crate::api_keys::ApiKeyContext>, Response> {
     let Some(token) = bearer_token(headers) else {
         return Err(unauthorized_response());
     };
@@ -215,7 +220,7 @@ async fn require_sink_admin(
                     );
                 }
                 if ctx.has_admin_scope() {
-                    Ok(())
+                    Ok(Some(ctx))
                 } else {
                     Err(forbidden_response())
                 }
@@ -232,7 +237,7 @@ async fn require_sink_admin(
                     .map(|role| role.at_least(Role::Admin))
                     .unwrap_or(false) =>
             {
-                Ok(())
+                Ok(None)
             }
             Some(_) => Err(forbidden_response()),
             None => Err(unauthorized_response()),
