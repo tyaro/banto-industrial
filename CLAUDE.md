@@ -9,6 +9,13 @@
 全体計画は [docs/plan.md](docs/plan.md)、タグサーバー banto-hub の設計は
 [docs/tag-server-design.md](docs/tag-server-design.md)。
 
+## 作業の引き継ぎ（2026-10-21 オーナー指示）
+
+トークン節約のため、PR のマージ後や Issue がひと段落したときに `/clear` する。
+**`/clear` の直前に @docs/STATUS.md を更新し（いまの状態・次にすること・決めたこと）、
+`/clear` の直後はそれを読んで続きから始める**。STATUS.md は次の作業の PR に
+相乗りさせてコミットする（それだけのための PR は作らない）。
+
 ## AI モデルの役割分担（2026-08-05 オーナー指示）
 
 本プロジェクトの AI 作業は、コストと品質の分担として次の2層で行う:
