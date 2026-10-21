@@ -803,11 +803,11 @@ impl BrokerSimRegistry {
     /// という既存の潜在的な不具合があった - 「直前のダイヤル先」を接続 id
     /// ごとに記録・比較するこの仕組みは、その不具合も副次的に(正しく)
     /// 修正する。これは回帰リスクではない:
-    /// `apps/banto-hub/core/tests/integration.rs`には「同じ接続の別グループ
+    /// `apps/banto-hub/host/tests/integration.rs`には「同じ接続の別グループ
     /// へのタグ追加のような無関係な編集ではセッションを再生成しない」ことを
     /// 保証するテストが既にあり、ダイヤル先が実際に変わっていない限り
     /// `changed`は`false`のままであることを、この T9-2 のテスト
-    /// (`apps/banto-hub/core/tests/t9_simulation.rs`)でも同様に確認する。
+    /// (`apps/banto-hub/host/tests/t9_simulation.rs`)でも同様に確認する。
     pub async fn resolve(&self, conn: &PlcConnection) -> (String, i64, bool) {
         let mut simulators = self.simulators.lock().await;
         let target = if conn.simulation {
@@ -938,7 +938,7 @@ impl Default for BrokerSimRegistry {
 /// a collection tick. That is not a new behavior in this hub - it is exactly
 /// what SLMP connections have done since T2-2 - just newly true for Modbus.
 ///
-/// Regression coverage: `apps/banto-hub/core/tests/integration.rs`'s
+/// Regression coverage: `apps/banto-hub/host/tests/integration.rs`'s
 /// `modbus_collection_uses_exactly_one_socket`.
 pub fn hub_client_factory(
     broker_handles: Arc<HashMap<String, ReadOnlyHandle>>,
@@ -972,7 +972,20 @@ pub fn hub_client_factory(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use banto_plc_write::slmp::simulator::Simulator;
+
+    /// R2b-0: the "device" these tests point a session at. The fake drivers
+    /// (`crate::test_support::test_drivers`) only dial TCP - a session is up
+    /// iff something accepts on the port - so a bound listener stands in for
+    /// the SLMP simulator these tests used while core still ran the real
+    /// drivers (the kernel completes the handshake from the backlog; nothing
+    /// needs to `accept`). None of them looks at the protocol on the wire.
+    fn fake_device() -> std::net::TcpListener {
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake device")
+    }
+
+    fn device_port(device: &std::net::TcpListener) -> u16 {
+        device.local_addr().expect("local_addr").port()
+    }
 
     fn slmp_conn(id: i64, port: u16) -> PlcConnection {
         PlcConnection {
@@ -1000,8 +1013,8 @@ mod tests {
     /// なぜ `ensure_connection` を使ってはいけないかを実証する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn write_handle_for_does_not_resurrect_a_stopped_session() {
-        let sim = Simulator::start().await;
-        let conn = slmp_conn(1, sim.addr.port());
+        let device = fake_device();
+        let conn = slmp_conn(1, device_port(&device));
 
         let sessions = HubSessions::new(
             banto_broker::BackoffConfig::default(),
@@ -1037,7 +1050,7 @@ mod tests {
         assert_eq!(sessions.connection_count(), 1);
 
         sessions.shutdown().await;
-        sim.stop();
+        drop(device);
     }
 
     fn modbus_conn(id: i64, port: u16) -> PlcConnection {
@@ -1047,71 +1060,9 @@ mod tests {
         }
     }
 
-    /// #605: 同じ host/port で CPU だけ R→Q に変えると `resolve` が changed を
-    /// 返し、セッションを捨てて作り直すとフレームのサブコマンドが Q になる。
-    /// 捨てずに `ensure_connection` だけ呼ぶと id 再利用で R のまま残る。
-    /// Modbus は CPU 列をセッションの同一性に含めない。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn cpu_only_change_replaces_the_slmp_broker_session() {
-        use banto_plc::{Address, BatchReadRequest, DataType, ReadRequest};
-
-        let sim = Simulator::start().await;
-        let sessions = HubSessions::new(
-            banto_broker::BackoffConfig::default(),
-            crate::test_support::test_drivers(),
-        );
-        let registry = BrokerSimRegistry::new();
-        let mut conn = slmp_conn(1, sim.addr.port());
-
-        let (_, _, changed) = registry.resolve(&conn).await;
-        assert!(changed);
-        sessions.ensure_connection(&conn).expect("R session");
-        read_until_connected(&sessions, conn.id).await;
-        assert_eq!(sim.last_subcommand(), Some(0x0002), "既定 R のワード読み");
-
-        let (_, _, changed) = registry.resolve(&conn).await;
-        assert!(!changed, "同じ CPU ではセッションを捨てない");
-
-        conn.cpu_type = "Q".to_string();
-        let (_, _, changed) = registry.resolve(&conn).await;
-        assert!(changed, "CPU だけの変更でも changed");
-        assert!(sessions.remove(conn.id));
-        sessions.ensure_connection(&conn).expect("Q session");
-        read_until_connected(&sessions, conn.id).await;
-        assert_eq!(
-            sim.last_subcommand(),
-            Some(0x0000),
-            "作り直したセッションは Q"
-        );
-
-        let mut modbus = modbus_conn(2, 502);
-        let (_, _, changed) = registry.resolve(&modbus).await;
-        assert!(changed);
-        modbus.cpu_type = "Q".to_string();
-        let (_, _, changed) = registry.resolve(&modbus).await;
-        assert!(!changed, "Modbus は CPU 列では再接続しない");
-
-        sessions.shutdown().await;
-        sim.stop();
-
-        async fn read_until_connected(sessions: &HubSessions, id: i64) {
-            let handle = sessions.handle_for(id).expect("handle");
-            let request = BatchReadRequest::Numeric(ReadRequest {
-                address: Address::parse_slmp("D0").expect("addr"),
-                data_type: DataType::U16,
-            });
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match handle.read(vec![request]).await {
-                    Ok(_) => return,
-                    Err(_) if tokio::time::Instant::now() < deadline => {
-                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-                    }
-                    Err(err) => panic!("read failed: {err}"),
-                }
-            }
-        }
-    }
+    // #605 `cpu_only_change_replaces_the_slmp_broker_session` は R2b-0 で
+    // `apps/banto-hub/host/tests/broker_glue.rs` へ移した（SLMP のフレームの
+    // サブコマンドを実シミュレータで見るので、実ドライバが要る）。
 
     fn spec_for(conn: &PlcConnection) -> banto_collect::ClientSpec {
         banto_collect::ClientSpec {
@@ -1143,11 +1094,12 @@ mod tests {
     /// clients by *whose* failure it is - a `BrokerReadClient` pointed at a
     /// down session reports the broker's own wording (and never dials), while
     /// the direct fallback client reports a real TCP dial failure against the
-    /// closed port. A live-simulator connection is kept alongside it so the
-    /// success path is covered too.
+    /// closed port. A live-device connection ([`fake_device`]; a live SLMP
+    /// simulator until R2b-0) is kept alongside it so the success path is
+    /// covered too.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn modbus_reads_route_through_the_broker_handle_like_slmp() {
-        let sim = Simulator::start().await;
+        let device = fake_device();
         let sessions = HubSessions::new(
             banto_broker::BackoffConfig::default(),
             crate::test_support::test_drivers(),
@@ -1161,7 +1113,7 @@ mod tests {
             port
         };
 
-        let slmp = slmp_conn(1, sim.addr.port());
+        let slmp = slmp_conn(1, device_port(&device));
         let modbus = modbus_conn(2, dead_port);
         let unhandled_modbus = modbus_conn(3, dead_port);
 
@@ -1175,7 +1127,7 @@ mod tests {
 
         let factory = hub_client_factory(Arc::new(handles), &sessions);
 
-        // SLMP, live simulator: the broker session comes up on its own, so
+        // SLMP, live device: the broker session comes up on its own, so
         // the routed `BrokerReadClient` reports success.
         let mut slmp_client = factory(&spec_for(&slmp));
         assert!(
@@ -1212,7 +1164,7 @@ mod tests {
         );
 
         sessions.shutdown().await;
-        sim.stop();
+        drop(device);
     }
 
     // --- #344 (2026-09-15): `connect()` follows the broker's real state ----

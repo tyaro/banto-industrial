@@ -157,7 +157,7 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
 /// connection at a time via `sqlx::SqlitePool`'s default pooling behavior
 /// against `:memory:` - `banto_storage::connect_sqlite_memory` pins this to
 /// one connection internally), but the T0-1 E2E integration test
-/// (`tests/integration.rs`) uses [`init_db`] against a real temp file
+/// (`apps/banto-hub/host/tests/integration.rs`) uses [`init_db`] against a real temp file
 /// instead, exactly like `banto-collect`'s own integration tests.
 pub async fn init_db_memory() -> Result<SqlitePool, BantoError> {
     let pool = banto_storage::connect_sqlite_memory().await?;

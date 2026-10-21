@@ -4,6 +4,12 @@
 //! pattern: naming it `common.rs` instead would make cargo treat it as its
 //! own test binary).
 //!
+//! R2b-0: `banto-hub-host`'s integration tests (the ones that moved there
+//! because they need the real drivers) include this same file through
+//! `#[path]` from `apps/banto-hub/host/tests/common/mod.rs`, which adds
+//! `hub_drivers()` on top. Keep this file free of `banto-drivers` (core does
+//! not depend on it); the tests here inject `HubDrivers::none()`.
+//!
 //! Until 2026-08-08 every `tests/*.rs` file in this crate carried its own,
 //! byte-for-byte copy of `TempEnv` (12 copies - see PR #54's investigation
 //! notes). That PR discovered the leak; this module fixes it and becomes the
@@ -212,18 +218,4 @@ pub fn shutdown_test_app(manager: &CollectorManager, pool: &SqlitePool) {
             });
         });
     }));
-}
-
-/// R1-3b: the built-in drivers as the `HubDrivers` an integration test
-/// injects into `HubSessions::new` / `HubConfig`
-/// (docs/banto-driver-api-design.md §6.4). Integration tests keep running the
-/// real SLMP / Modbus drivers until R2b-0.
-#[allow(dead_code)]
-pub fn hub_drivers() -> banto_hub_core::broker_glue::HubDrivers {
-    let builtin = banto_drivers::builtin();
-    banto_hub_core::broker_glue::HubDrivers::new(
-        std::sync::Arc::new(builtin.registry),
-        builtin.broker,
-        builtin.client_factory,
-    )
 }

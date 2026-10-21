@@ -42,7 +42,8 @@
 # - 重いランタイムを複数立てるテスト（`heavy-runtime`）: banto-collect の統合テストは
 #   `static TEST_SERIAL`（#227）で「multi_thread ランタイムは同時に 1 つ」に絞って
 #   いた。プロセスが別になるとこの守りが効かないので、グループで置き換える。
-#   hub の soak（収集 + WS + MQTT を同時に維持して件数の下限を見る）と tsquery の
+#   hub の soak（収集 + WS + MQTT を同時に維持して件数の下限を見る。R2b-0 で
+#   banto-hub-core から banto-hub-host へ移った）と tsquery の
 #   performance_smoke / concurrency も、CPU を奪い合うと下限・時間切れで落ちるので同じ扱い。
 #
 # ## ローカル（非管理者）での注意
@@ -65,7 +66,7 @@ filter = 'package(banto-hub-core) & binary_id(banto-hub-core) & test(/^http_hub_
 test-group = 'hub-default-mutex'
 
 [[profile.default.overrides]]
-filter = '(package(banto-collect) & kind(test)) | (package(banto-hub-core) & binary(soak)) | (package(banto-tsquery) & (binary(performance_smoke) | binary(concurrency)))'
+filter = '(package(banto-collect) & kind(test)) | (package(banto-hub-host) & binary(soak)) | (package(banto-tsquery) & (binary(performance_smoke) | binary(concurrency)))'
 test-group = 'heavy-runtime'
 
 # CI 用: `cargo nextest run --profile ci`。

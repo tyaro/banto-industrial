@@ -32,7 +32,7 @@
 //! （Stale → Bad の梯子）だけで、そこはテストごとに固有名の表を作って
 //! 最後に落とす。
 //!
-//! `tests/t11_batch_tags.rs` と同じ理由で `TestApp`/`get_json`/`write_json`
+//! `apps/banto-hub/host/tests/t11_batch_tags.rs` と同じ理由で `TestApp`/`get_json`/`write_json`
 //! 相当をこのファイル内に複製している（各 `tests/*.rs` は独立クレートと
 //! してコンパイルされ、private helper を共有できない）。`TempEnv` は
 //! `tests/common/mod.rs` に集約済み。
@@ -281,7 +281,9 @@ async fn test_app(label: &str) -> TestApp {
 
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
-        common::hub_drivers(),
+        // R2b-0: ドライバ無し（このテストは PLC と通信しない。core は
+        // banto-drivers に依存しない。docs/banto-driver-api-design.md §2.4）。
+        banto_hub_core::broker_glue::HubDrivers::none(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
@@ -415,7 +417,7 @@ async fn write_json(
 
 /// `/api/v1/*` への書き込みはセッショントークンでは行えない
 /// （`session_token_cannot_write`）ので、write スコープ付きの API キーを
-/// 発行する - `tests/computed.rs` の同名ヘルパと同じ。
+/// 発行する - `apps/banto-hub/host/tests/computed.rs` の同名ヘルパと同じ。
 async fn issue_key(app: &TestApp, name: &str, scopes: &[&str]) -> String {
     let (status, body) = write_json(
         &app.router,

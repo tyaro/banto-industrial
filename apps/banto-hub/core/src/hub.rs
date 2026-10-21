@@ -99,7 +99,7 @@
 //! ないように、独立に積み上げない）- 同 fn の doc comment 参照。
 //!
 //! **ここまでだけでは実は不十分**（自前の E2E テスト
-//! `apps/banto-hub/core/tests/t9_simulation.rs`で発覚）: `simulation`を
+//! `apps/banto-hub/host/tests/t9_simulation.rs`で発覚）: `simulation`を
 //! 常に`false`へ強制すると、broker 経由 SLMP 接続の`ConnectionPlan`は
 //! トグル前後で構造的に同一と比較され、`Collector::apply_config`はそれを
 //! 「unchanged」と分類してその接続の収集タスクに一切手を触れない -
@@ -1869,7 +1869,7 @@ impl CollectorManager {
     /// simulation toggle or a simulator restart on its own - see
     /// `CollectorConfig::set_broker_dial_target`'s own doc comment for the
     /// full derivation (found necessary by this crate's own E2E coverage of
-    /// the toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`).
+    /// the toggle path, `apps/banto-hub/host/tests/t9_simulation.rs`).
     /// `set_broker_dial_target` used to mutate SLMP plans only, which was
     /// correct while a Modbus plan's `simulation` flag still varied across a
     /// toggle (it was never suppressed, so `apply_config`'s diff noticed the

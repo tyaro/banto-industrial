@@ -1098,7 +1098,7 @@ pub(crate) mod tests {
     //! #430: 接続中の再検証。照合を差し替えられる [`StreamCredential`] の
     //! 偽物で、[`Revalidator`] の時間の規律（仮想時間）と、[`handle_socket`]
     //! に載せたときの振る舞い（実 WebSocket）を確かめる。実際の API キーでの
-    //! 確認は `tests/stream.rs`（失効・トリップ・期限切れ・DB エラー・DB が
+    //! 確認は `apps/banto-hub/host/tests/stream.rs`（失効・トリップ・期限切れ・DB エラー・DB が
     //! 答えない）。
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};

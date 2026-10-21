@@ -59,7 +59,8 @@ banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # I2: only pulled in transitively via banto-collect in production builds;
 # named directly here too since `hub.rs`'s doc comments reference its
 # PlcClient boundary. No `simulator` feature at the non-dev level - hub talks
-# to real PLCs; the simulator is dev-only (see [dev-dependencies]).
+# to real PLCs; the simulator is dev-only (R2b-0: in `banto-hub-host`'s
+# [dev-dependencies], with the integration tests that use it).
 banto-plc = { path = "../../../crates/banto-plc" }
 # I3a: local tstore recording (§3.3 決定: 記録あり・既定7日保持) + prune_files
 # for the retention sweep.
@@ -145,10 +146,11 @@ protoc-bin-vendored = { workspace = true }
 
 [dev-dependencies]
 async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "60c4f9d72218d78177e59c70a03db7fddcf9d857", default-features = false, features = ["client"] }
-# T3（docs/tag-server-design.md §5.3）: `net`は tests/mqtt.rs のポート探索
+# T3（docs/tag-server-design.md §5.3）: `net`は元は tests/mqtt.rs のポート探索
 # （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
 # TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも
-# unify されていたが、明示しておく。
+# unify されていたが、明示しておく。R2b-0 で tests/mqtt.rs は `banto-hub-host` へ
+# 移ったが、`src/test_support.rs` の偽ドライバ（TCP の接続だけをする）が使う。
 # 外部 DB 連携 S2b（docs/banto-hub-external-db-design.md §4.8・§6-17）:
 # `test-util` は `#[tokio::test(start_paused = true)]` の仮想時計のため -
 # `crate::db_source::supervisor` のバックオフ（1s → 30s）と「60 秒以上
@@ -166,35 +168,21 @@ tempfile = { workspace = true }
 # 配布バイナリには入らない（[dependencies] 側の banto-broker は既定features
 # のまま）。
 banto-broker = { path = "../../../crates/banto-broker", features = ["test-util"] }
-# T1: `/api/v1/stream` の統合テスト用 WebSocket クライアント
-# (tests/stream.rs)。サーバー側は axum 自身の `ws` feature(上の
-# [dependencies] 参照)で完結するので、これは test コードのみが使う。
+# T1: `/api/v1/stream` のテスト用 WebSocket クライアント（`src/stream.rs` の単体
+# テスト）。サーバー側は axum 自身の `ws` feature(上の [dependencies] 参照)で完結する
+# ので、これは test コードのみが使う。
 tokio-tungstenite = { workspace = true }
-# Modbus TCP simulator for the T0 E2E integration test
-# (apps/banto-hub/core/tests/integration.rs) - same reuse chain
-# banto-collect's own integration tests already exercise (banto-plc's
-# `simulator` feature, made public for exactly this).
-banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
-# T2-4: the read+write SLMP simulator used by tests/write.rs's E2E test
-# (write through the broker, then read the value back through the same
-# session - see that test's module doc).
-banto-plc-write = { path = "../../../crates/banto-plc-write", features = ["simulator"] }
-# R1-3b / R1-7a: `src/test_support.rs::test_drivers` と `tests/common/mod.rs` が
-# `banto_drivers::builtin()` で実ドライバを組み立てる（テストだけ）。core のライブラリ
-# 本体は `HubDrivers` を注入で受け取るだけで、具体的なドライバを知らない
-# （docs/banto-driver-api-design.md §6.4）。bin が組み立てる normal の依存は
-# `banto-hub-host` 側にある。R2b-0 で core の dev-dependency からも外す（§2.4）。
-banto-drivers = { path = "../../../crates/banto-drivers" }
-# T3（docs/tag-server-design.md §5.3）: tests/mqtt.rs が in-process ブローカー
-# として起動する組み込み MQTT ブローカー。rumqttc と同じ bytebeamio/rumqtt
-# リポジトリ・同時期リリースの系列（0.25.x クライアント / 0.20.x ブローカー）
-# を選び、Cargo.lock に無関係な世代を増やさない。`banto-hub-core` のテストの
-# みが使う - 本番の bin `banto-hub`（`banto-hub-host`）は外部ブローカーへ接続するクライアント
-# モードのみ（組み込みブローカーは §10-4 の判断待ち、実装しない）。
-rumqttd = { version = "0.20", default-features = false }
+# R2b-0（docs/banto-driver-api-design.md §2.4）: `banto-drivers`（実ドライバ）は dev でも
+# 持たない。ドライバだけの変更で core が CI に選ばれないようにするため。`src` の単体
+# テストは `src/test_support.rs::test_drivers`（偽のドライバ表）、`tests/` に残った統合
+# テストは `HubDrivers::none()` で動く。実ドライバとシミュレータ（`banto-plc` /
+# `banto-plc-write` の `simulator` feature）・組み込み MQTT ブローカー（`rumqttd`）を
+# 使う統合テストは `apps/banto-hub/host/tests/` へ移した（dev-dependency も同じく）。
 
 # T5-4（docs/t5-handoff.md §3「ソークテスト」）: tests/soak.rs の RSS
-# サンプリング（`GetProcessMemoryInfo`）専用。新規の依存ノードは増えない -
+# サンプリング（`GetProcessMemoryInfo`）専用だった（R2b-0 で tests/soak.rs は
+# `banto-hub-host` へ移り、`Win32_System_ProcessStatus` は向こうでも持つ。Windows で
+# 確かめるまでここからは外していない）。新規の依存ノードは増えない -
 # tokio/mio/tempfile 等が既に windows-sys 0.61 系を依存木に持っている
 # （Cargo.lock 参照）ので、同じバージョン系列を明示するだけ。テストコードの
 # みが使うので dev-dependency。

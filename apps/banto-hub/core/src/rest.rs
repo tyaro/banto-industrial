@@ -555,7 +555,7 @@ fn extract_ws_protocol_token(path: &str, headers: &HeaderMap) -> Option<String> 
 /// [`require_session`] は #431 の例外（[`GateDecision::AllowUnverifiedStop`]、
 /// DB が照合に答えられないときの緊急停止 `POST /api/write-control/disable`）で
 /// まさにそのセッションを載せずに通すので、banto の床に替えると緊急停止が
-/// 床で 500 になり、#431 が無効になる（tests/write.rs の
+/// 床で 500 になり、#431 が無効になる（apps/banto-hub/host/tests/write.rs の
 /// 「照合できないときも止められる」テストが落ちる）。こちらはメモリ上の
 /// トークン（`identity_for`）に戻る。`/api/tag-stream` の
 /// `Sec-WebSocket-Protocol` からの bearer も見る（[`extract_ws_protocol_token`]）。

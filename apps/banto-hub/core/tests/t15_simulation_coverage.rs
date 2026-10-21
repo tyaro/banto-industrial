@@ -3,7 +3,7 @@
 //! M タグ」を一覧表示する `GET /api/collection/simulation-coverage` の配線を
 //! 確認する。
 //!
-//! `tests/t9_simulation.rs`と同じ理由（各`tests/*.rs`は独立したクレートとして
+//! `apps/banto-hub/host/tests/t9_simulation.rs`と同じ理由（各`tests/*.rs`は独立したクレートとして
 //! コンパイルされ、private helper を共有できない）で`fast_options`/`TestApp`
 //! 相当をこのファイル内に複製している（`t9_simulation.rs`のものをベースに
 //! した、SLMP シミュレータ/broker セッション周りの検証は不要なので簡略化）。
@@ -169,7 +169,10 @@ async fn test_app(label: &str) -> TestApp {
 
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
-        common::hub_drivers(),
+        // R2b-0: ドライバ無し（このテストはプリフライトの一覧と開始の可否だけを
+        // 見て、収集した値は見ない。core は banto-drivers に依存しない。
+        // docs/banto-driver-api-design.md §2.4）。
+        banto_hub_core::broker_glue::HubDrivers::none(),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));

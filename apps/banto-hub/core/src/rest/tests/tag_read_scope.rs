@@ -181,7 +181,7 @@ fn metadata_test_status(state: CollectionState, mode: RunMode) -> CollectionStat
 /// `ComputedEngine`。PLC/internal/db タグの分類は `map`/`computed` を
 /// 見ないので影響を受けない - computed タグは「入力なし」(`None`)扱いに
 /// なり、真にシミュレーション中の入力から`derived_simulation`に
-/// 昇格する経路は通らない(その経路は`tests/computed.rs`の統合テストで
+/// 昇格する経路は通らない(その経路は`apps/banto-hub/host/tests/computed.rs`の統合テストで
 /// 検証する)。
 fn empty_computed_engine() -> ComputedEngine {
     ComputedEngine::new(Arc::new(crate::computed::ServerTagStore::new()))
@@ -322,7 +322,7 @@ fn rest_catalog_dto_separates_configured_and_effective_simulation() {
 
 /// #335（2026-09-14 オーナー決定）: computed の既定ラベルは
 /// `"computed"` - `derived_simulation`は AllSimulation 運転中（または
-/// 入力が真にシミュレーション中、`tests/computed.rs`の統合テスト参照）
+/// 入力が真にシミュレーション中、`apps/banto-hub/host/tests/computed.rs`の統合テスト参照）
 /// だけの情報ラベルに変わった。
 #[test]
 fn rest_value_source_uses_safe_tag_kind_classification() {

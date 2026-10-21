@@ -138,14 +138,138 @@ impl Drop for TempDir {
     }
 }
 
-/// R1-3b: the built-in drivers as the `HubDrivers` a unit test injects into
-/// `HubSessions::new` / `HubConfig` (docs/banto-driver-api-design.md §6.4).
-/// `src` tests keep running the real SLMP / Modbus drivers until R2b-0.
+/// R2b-0: the drivers a unit test injects into `HubSessions::new` /
+/// `HubConfig` (docs/banto-driver-api-design.md §6.4・§7.4). Until R2b-0 this
+/// was `banto_drivers::builtin()`; core no longer depends on `banto-drivers`
+/// (not even as a dev-dependency, §2.4), so a driver-only change does not
+/// select this crate in CI. The `src` tests are about the hub's own machinery
+/// (the session directory, routing, the runtime), not about a protocol, so a
+/// fake is enough:
+///
+/// - `broker`: the same two ids as the built-in table (`slmp`,
+///   `modbus-tcp`), so `HubSessions::is_broker_managed` answers exactly as in
+///   production. Each dial is [`fake_dial`]: the session connects iff
+///   something accepts TCP on `host:port` (a dead port fails like a real
+///   driver's dial), and the session behind it is a tiny fake device
+///   ([`FakeSession`]: numeric reads answer [`FAKE_WORD`], writes are
+///   accepted) - there is no protocol on the wire. `slmp` carries the
+///   connection's `cpu_type` as `DriverDial::slmp_cpu` the way
+///   `banto_driver_slmp::dial` does (#605).
+/// - `client_factory`: `banto_collect::default_client_factory()` - what
+///   `builtin()` returns too (design §2.3), and `banto-collect` is a normal
+///   dependency of this crate already.
+/// - `registry`: empty. R1 reads it nowhere on the production path (§6.2);
+///   only `banto-drivers`' tripwire tests do.
+///
+/// The tests that need a real SLMP / Modbus session went to
+/// `apps/banto-hub/host/tests/` (R2b-0).
 pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
-    let builtin = banto_drivers::builtin();
+    let id = |s: &str| banto_driver_api::DriverId::new(s).expect("valid driver id");
+    let broker = banto_broker::DriverTable::new(vec![
+        (id("slmp"), fake_slmp_dial as banto_broker::DialFn),
+        (id("modbus-tcp"), fake_modbus_dial as banto_broker::DialFn),
+    ])
+    .expect("distinct fake driver ids");
     crate::broker_glue::HubDrivers::new(
-        std::sync::Arc::new(builtin.registry),
-        builtin.broker,
-        builtin.client_factory,
+        std::sync::Arc::new(banto_driver_api::DriverRegistry::new()),
+        broker,
+        banto_collect::default_client_factory(),
     )
+}
+
+fn fake_slmp_dial(conn: &banto_tags::PlcConnection, port: u16) -> banto_broker::DriverDial {
+    // `banto_driver_slmp::parse_cpu_type` と同じ: `"Q"` だけ Q、それ以外は R。
+    let cpu = match conn.cpu_type.as_str() {
+        "Q" => banto_plc::SlmpCpu::Q,
+        _ => banto_plc::SlmpCpu::R,
+    };
+    banto_broker::DriverDial {
+        slmp_cpu: Some(cpu),
+        ..fake_dial(conn, port)
+    }
+}
+
+fn fake_modbus_dial(conn: &banto_tags::PlcConnection, port: u16) -> banto_broker::DriverDial {
+    fake_dial(conn, port)
+}
+
+/// See [`test_drivers`]: TCP connect only, then a [`FakeSession`].
+fn fake_dial(conn: &banto_tags::PlcConnection, port: u16) -> banto_broker::DriverDial {
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+    let host = conn.host.clone();
+    let connector: banto_broker::Connector = std::sync::Arc::new(move || {
+        let host = host.clone();
+        Box::pin(async move {
+            let stream = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                tokio::net::TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            .map_err(|_| format!("fake driver: connect to {host}:{port} timed out"))?
+            .map_err(|err| format!("fake driver: connect to {host}:{port}: {err}"))?;
+            Ok(Box::new(FakeSession { _stream: stream }) as Box<dyn banto_broker::BrokerSession>)
+        })
+    });
+    banto_broker::DriverDial {
+        connector,
+        slmp_cpu: None,
+    }
+}
+
+/// The word every numeric read on a [`FakeSession`] returns (a bit reads as
+/// `true`). Not `0` / `1`, so a test waiting for a real (non-default) sample
+/// gets one - `hub::tests::invalid_plc_bit_metadata_is_stable_across_derived_stale`
+/// collects a simulation connection, which the broker dials through this table
+/// (the in-process simulator only supplies the listening port).
+pub(crate) const FAKE_WORD: f64 = 1234.0;
+
+/// A connected socket with no protocol behind it: a tiny fake device. Every
+/// numeric read answers [`FAKE_WORD`], every write is accepted, a string read
+/// is a per-item `Bad` (strings are protocol behaviour - tested with the real
+/// drivers in `banto-hub-host` and the driver crates).
+struct FakeSession {
+    _stream: tokio::net::TcpStream,
+}
+
+impl banto_broker::BrokerSession for FakeSession {
+    fn read_batch<'a>(
+        &'a mut self,
+        requests: &'a [banto_plc::BatchReadRequest],
+    ) -> banto_plc::BoxFuture<'a, Result<Vec<banto_plc::BatchReadResult>, banto_broker::SessionError>>
+    {
+        use banto_plc::{BatchReadRequest, BatchReadResult, DataType, PlcError, PlcValue};
+        Box::pin(async move {
+            Ok(requests
+                .iter()
+                .map(|request| match request {
+                    BatchReadRequest::Numeric(r) => BatchReadResult::Value(match r.data_type {
+                        DataType::Bit => PlcValue::Bit(true),
+                        _ => PlcValue::F64(FAKE_WORD),
+                    }),
+                    BatchReadRequest::String(_) => BatchReadResult::Bad(PlcError::Protocol(
+                        "fake driver: string reads are not supported".to_string(),
+                    )),
+                })
+                .collect())
+        })
+    }
+
+    fn write_batch<'a>(
+        &'a mut self,
+        requests: &'a [banto_plc_write::BatchWriteRequest],
+    ) -> banto_plc::BoxFuture<
+        'a,
+        Result<Vec<banto_plc_write::WriteResult>, banto_broker::SessionError>,
+    > {
+        Box::pin(async move {
+            Ok(requests
+                .iter()
+                .map(|_| banto_plc_write::WriteResult::Ok)
+                .collect())
+        })
+    }
+
+    fn disconnect(&mut self) -> banto_plc::BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
 }
