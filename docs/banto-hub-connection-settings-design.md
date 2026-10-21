@@ -412,7 +412,8 @@ plugin-design §7.4（有効化の前に保存済みの設定を新しい版で�
 ### 6.7 ChronoGazer
 
 - `banto_tags::migrate` を流すので 0025 が当たる。ChronoGazer の行は `modbus-tcp`・`slmp`・`hub` だけ（`apps/chronogazer/src-tauri/src/lib.rs:2278-2292`、`core/src/rest.rs` の同名の関数）で、秘密値は無い。
-- ChronoGazer にはレジストリが無い（Q6 で R2b-7 まで旧規則）。予行と preflight は旧規則の検証で行い、バックアップ（§6.4）も同じ部品で作る（`banto-tags` に置く `upgrade::backup_before_0025(pool, db_path)`）。ChronoGazer の起動の失敗の経路にどう出すかは ChronoGazer のライフサイクルの表（checklist §5、`src-tauri/src/lifecycle.rs`）に当たる必要がある（**要確認**: R2b-1d の着手時に、起動時の DB の失敗がどの `Event` になるかを確かめる）。
+- ChronoGazer にはレジストリが無い（Q6 で R2b-7 まで旧規則）。行は `modbus-tcp` / `slmp` / `hub` だけで 0025 が断れないので、**予行と preflight は行わない**（`banto_tags::migrate` が失敗すれば sqlx がトランザクションを巻き戻す）。バックアップ（§6.4）は Hub と同じ部品で作る: `banto_tags::upgrade::{remove_leftovers, pending_0025, has_rows_to_protect, backup_before_0025}`（R2b-1d で Hub の `upgrade.rs` から移した。`pending_changes` が無い DB でも動く）。ChronoGazer の `db::init_db` は、自分の migrator の後・`banto_tags::migrate` の前に、毎回 `.bak.partial` を消し、0025 が未適用で行のある DB だけ `<DB>.before-0025-<UTC>.bak` を作って、パスを標準エラーに `banto: ...` で出す（新規・適用済み・空の DB には作らない）。
+- 起動の失敗の経路（2026-10-21 確認）: 掃除・バックアップの失敗は `InitDbError::Storage` に包まれ、他の DB 初期化の失敗と同じく `EngineStartError::Database` → `startup_recovery::classify` の `DatabaseUnopenable`（文言に corrupt / malformed があれば `DatabaseCorrupt`）になり、対処の窓（バックアップから戻す・DB を作り直す・終了）が開く。DB は変わらない。
 - ChronoGazer は版を上げない・CHANGELOG を書かない（checklist §7）が、banto-hub の CHANGELOG に「ChronoGazer の DB にも同じ移行が当たる」を書く。
 
 ## 7. 収集・レジストリ・周辺への影響

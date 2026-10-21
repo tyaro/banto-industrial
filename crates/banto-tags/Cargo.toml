@@ -22,6 +22,8 @@ banto-plc-address = { path = "../banto-plc-address" }
 # depend on this crate, so there is no cycle.
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
 serde = { workspace = true }
+# `upgrade.rs`: the error type of the pre-0025 backup (shared by banto-hub and ChronoGazer).
+thiserror = { workspace = true }
 serde_json = { workspace = true }
 # R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§5.3): the sealed secret rows
 # (`plc_connection_secrets.blob`) are carried in `Zeroizing` - a `plain-v1` blob is the
@@ -34,4 +36,5 @@ zeroize = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
 
 [dev-dependencies]
+tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros", "time"] }

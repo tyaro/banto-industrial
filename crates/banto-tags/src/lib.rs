@@ -36,6 +36,10 @@
 //!   `{"$secret": "<ref>"}`, written and deleted in the connection's own transaction.
 //!   This crate never seals or opens a secret (banto-hub's `secrets` module does) and
 //!   refuses a plaintext value under a secret key ([`check_settings_shape`]).
+//! - [`upgrade`] (R2b-1d, design §6.4・§6.7): the app-independent pieces of the run-up to
+//!   the irreversible migration `0025` - leftover cleanup, "is `0025` pending", and the
+//!   password-free backup (`upgrade::backup_before_0025`) - shared by banto-hub and
+//!   ChronoGazer, which call them before [`migrate`].
 //!
 //! This crate is also the first real-world proof of consuming `banto-core`/
 //! `banto-storage` via a git tag reference rather than a workspace path
@@ -56,6 +60,7 @@ pub mod push;
 pub mod scaling;
 pub mod settings_json;
 pub mod tag;
+pub mod upgrade;
 
 // Crate-internal helpers shared by the three entity modules above - not
 // part of the public API (see `support.rs`'s doc comment).

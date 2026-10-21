@@ -64,7 +64,8 @@
 //!
 //! - Windows での `plain-v1` → `dpapi-machine-v1` の封印し直し・未適用キューの封印・
 //!   `VACUUM` と清掃待ちの印を消すこと（§6.5、R2b-1e）。ここは印を**立てる**だけ。
-//! - ChronoGazer の DB の予行・バックアップ（§6.7。ChronoGazer の起動の経路は別）。
+//! - ChronoGazer の DB の起動（§6.7）。掃除・未適用の検出・バックアップの部品は
+//!   `banto_tags::upgrade` に置き、ここはそれを呼ぶ（予行と preflight はレジストリを持つ Hub だけ）。
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -73,31 +74,24 @@ use std::time::{Duration, Instant};
 
 use banto_core::{BantoError, ListParams};
 use banto_driver_api::DriverRegistry;
+use banto_tags::upgrade::{copy_options, vacuum_into, TempFile};
 use banto_tags::{PlcConnection, PlcConnectionService, HUB_PROTOCOL};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Connection, SqliteConnection, SqlitePool};
+use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::SqlitePool;
 
 use crate::hub_log::{log_err_line, log_line};
 
-/// 戻せない移行の版（`crates/banto-tags/migrations/0025_plc_connections_settings_json.sql`）。
-pub const MIGRATION_0025_VERSION: i64 = 25;
+// 名前の型と工程は `banto_tags::upgrade`（ChronoGazer と共有。R2b-1d、設計 §6.7）。
+pub use banto_tags::upgrade::{
+    config_dir_of, BackupStep, BACKUP_INFIX, BACKUP_SUFFIX, DRYRUN_PREFIX, MIGRATION_0025_VERSION,
+    PARTIAL_SUFFIX,
+};
 
-/// 予行の写しの名前の頭（config/ の中、`{prefix}{nonce}.sqlite3`）。
-pub const DRYRUN_PREFIX: &str = ".banto-hub-0025-dryrun-";
+/// 予行の写しの末尾（`{DRYRUN_PREFIX}{nonce}{DRYRUN_SUFFIX}`）。
 const DRYRUN_SUFFIX: &str = ".sqlite3";
-
-/// バックアップの名前の中ほど（`<DB のファイル名>.before-0025-<UTC>.bak`）。
-pub const BACKUP_INFIX: &str = ".before-0025-";
-/// 完成したバックアップの末尾。
-pub const BACKUP_SUFFIX: &str = ".bak";
-/// 作りかけのバックアップの末尾（平文を含みうる。毎回の起動で消す）。
-pub const PARTIAL_SUFFIX: &str = ".bak.partial";
 
 /// 清掃待ちの印（Hub の `settings` 表、§6.5 の 2）。R2b-1d は立てるだけ。
 pub const VACUUM_PENDING_KEY: &str = "secrets.vacuum_pending";
-
-/// SQLite が DB のファイルの横に作りうる付随ファイルの末尾。
-const SIDE_FILES: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 /// preflight の 1 行（断った行・報告だけの行）。`errors` は人が読む文言で、秘密値を
 /// 含まない（秘密のキーは参照しか持たず、参照は検証に渡さない）。
@@ -211,90 +205,28 @@ fn storage(err: impl std::fmt::Display) -> UpgradeError {
     UpgradeError::Storage(err.to_string())
 }
 
-/// DB のファイルの置き場（profile の `config/`）。
-pub fn config_dir_of(db_path: &Path) -> PathBuf {
-    match db_path.parent() {
-        Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
-        _ => PathBuf::from("."),
+/// `banto_tags::upgrade` の失敗は同じ文言の変種へ写す（Hub の起動の失敗の型は変えない）。
+impl From<banto_tags::upgrade::UpgradeError> for UpgradeError {
+    fn from(err: banto_tags::upgrade::UpgradeError) -> Self {
+        use banto_tags::upgrade::UpgradeError as Tags;
+        match err {
+            Tags::LeftoverNotRemoved { path, error } => Self::LeftoverNotRemoved { path, error },
+            Tags::Backup { path, message } => Self::Backup { path, message },
+            Tags::Storage(message) => Self::Storage(message),
+        }
     }
-}
-
-fn db_file_name(db_path: &Path) -> String {
-    db_path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| crate::profile_paths::DB_FILE_NAME.to_string())
-}
-
-/// `name` が前の起動の残り物か（予行の写しと、`db_name` の作りかけのバックアップ、と
-/// その付随ファイル）。完成した `.bak` は残り物ではない。
-fn is_leftover(name: &str, db_name: &str) -> bool {
-    if name.starts_with(DRYRUN_PREFIX) {
-        return true;
-    }
-    let backup_prefix = format!("{db_name}{BACKUP_INFIX}");
-    if !name.starts_with(&backup_prefix) {
-        return false;
-    }
-    name.ends_with(PARTIAL_SUFFIX)
-        || SIDE_FILES
-            .iter()
-            .any(|side| name.ends_with(&format!("{PARTIAL_SUFFIX}{side}")))
 }
 
 /// 2-b の 1（§6.3 の 4・§6.4、毎回の起動）: config/ の残り物を消す。消したパスを返す。
 /// 1 つでも消せなければ [`UpgradeError::LeftoverNotRemoved`]（起動を止める）。
 pub fn remove_leftovers(db_path: &Path) -> Result<Vec<PathBuf>, UpgradeError> {
-    let dir = config_dir_of(db_path);
-    let db_name = db_file_name(db_path);
-    let entries = match std::fs::read_dir(&dir) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(UpgradeError::LeftoverNotRemoved { path: dir, error }),
-    };
-    let mut removed = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| UpgradeError::LeftoverNotRemoved {
-            path: dir.clone(),
-            error,
-        })?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_leftover(&name, &db_name) {
-            continue;
-        }
-        let path = entry.path();
-        match std::fs::remove_file(&path) {
-            Ok(()) => removed.push(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(UpgradeError::LeftoverNotRemoved { path, error }),
-        }
-    }
-    removed.sort();
-    Ok(removed)
+    Ok(banto_tags::upgrade::remove_leftovers(db_path)?)
 }
 
 /// 0025 が未適用か（2-b の 2）。banto-tags の記録表が無い（新規の DB。migrate が全部を
 /// 作るので、写すものもバックアップするものも無い）なら `false`。
 pub async fn pending_0025(pool: &SqlitePool) -> Result<bool, UpgradeError> {
-    let has_table: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?")
-            .bind(banto_tags::MIGRATIONS_TABLE)
-            .fetch_one(pool)
-            .await
-            .map_err(storage)?;
-    if has_table == 0 {
-        return Ok(false);
-    }
-    // AssertSqlSafe: 補間するのは banto-tags の定数の表の名前だけ。
-    let applied: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-        "SELECT COUNT(*) FROM {} WHERE version = ?",
-        banto_tags::MIGRATIONS_TABLE
-    )))
-    .bind(MIGRATION_0025_VERSION)
-    .fetch_one(pool)
-    .await
-    .map_err(storage)?;
-    Ok(applied == 0)
+    Ok(banto_tags::upgrade::pending_0025(pool).await?)
 }
 
 /// 2-b の 2〜5 をまとめた入口（`crate::db::init_db_with_registry` が Hub の migrator の
@@ -382,96 +314,12 @@ pub async fn set_vacuum_pending(pool: &SqlitePool) -> Result<(), UpgradeError> {
     Ok(())
 }
 
-// ---- 一時ファイルの後始末 ----------------------------------------------------------------
-
-/// 平文を含みうる一時ファイル（予行の写し・作りかけのバックアップ）。`Drop` で本体と
-/// 付随ファイルを消す（パニックの経路でも）。[`TempFile::finish`] は消して結果を返す
-/// （消せなければ起動を止める）。[`TempFile::keep`] は消さずに手放す（完成した
-/// バックアップ、テストの「落ちた」の再現）。
-struct TempFile {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TempFile {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
-    }
-
-    fn remove_all(path: &Path) -> Result<(), (PathBuf, std::io::Error)> {
-        let mut result = Ok(());
-        let mut paths = vec![path.to_path_buf()];
-        for side in SIDE_FILES {
-            let mut name = path.as_os_str().to_owned();
-            name.push(side);
-            paths.push(PathBuf::from(name));
-        }
-        for candidate in paths {
-            match std::fs::remove_file(&candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    if result.is_ok() {
-                        result = Err((candidate, error));
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    fn finish(mut self) -> Result<(), (PathBuf, std::io::Error)> {
-        self.armed = false;
-        Self::remove_all(&self.path)
-    }
-
-    fn keep(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TempFile {
-    fn drop(&mut self) {
-        if self.armed {
-            if let Err((path, error)) = Self::remove_all(&self.path) {
-                log_err_line(&format!(
-                    "banto-hub: [WARN] 一時ファイル {} を消せませんでした（次の起動で消します）: {error}",
-                    path.display()
-                ));
-            }
-        }
-    }
-}
+// ---- 一時ファイルの後始末は banto_tags::upgrade::TempFile ---------------------------------
 
 fn random_hex(bytes: usize) -> Result<String, UpgradeError> {
     let mut buf = vec![0u8; bytes];
     getrandom::fill(&mut buf).map_err(|_| storage("乱数を作れませんでした"))?;
     Ok(hex::encode(buf))
-}
-
-fn path_text(path: &Path) -> Result<&str, String> {
-    path.to_str()
-        .ok_or_else(|| format!("パスが UTF-8 ではありません: {}", path.display()))
-}
-
-/// `VACUUM INTO` で `pool` の DB の一貫した写しを `dest` に作る（`dest` は無いこと）。
-async fn vacuum_into(pool: &SqlitePool, dest: &Path) -> Result<(), String> {
-    sqlx::query("VACUUM INTO ?")
-        .bind(path_text(dest)?)
-        .execute(pool)
-        .await
-        .map(|_| ())
-        .map_err(|err| err.to_string())
-}
-
-/// 写し（予行・バックアップ）を開く設定: 作らない・ロールバックジャーナル（WAL を作らない）・
-/// FK を強制（0025 の park-and-restore の前提）。
-fn copy_options(path: &Path) -> SqliteConnectOptions {
-    SqliteConnectOptions::new()
-        .filename(path)
-        .create_if_missing(false)
-        .journal_mode(SqliteJournalMode::Delete)
-        .foreign_keys(true)
 }
 
 // ---- 予行と preflight（§6.3） --------------------------------------------------------------
@@ -697,135 +545,25 @@ fn dropped_values(old: &OldRow, new: &PlcConnection) -> Vec<String> {
 
 // ---- バックアップ（§6.4） -----------------------------------------------------------------
 
-/// バックアップの工程（テストで「その工程の直後に落ちた」を再現する注入点）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupStep {
-    /// `VACUUM INTO` の後（まだ平文を含む）。
-    AfterVacuumInto,
-    /// パスワードを除いた後（空きページに平文が残りうる）。
-    AfterStrip,
-    /// `VACUUM` の後（閉じる前）。
-    AfterVacuum,
-    /// 閉じた後・`rename` の前。
-    BeforeRename,
-}
-
-/// 移行の直前のバックアップ（§6.4）。完成した `.bak` のパスを返す。
+/// 移行の直前のバックアップ（§6.4）。完成した `.bak` のパスを返す。手順は
+/// `banto_tags::upgrade::backup_before_0025`（ChronoGazer と共有。`pending_changes` を持つ
+/// Hub では、キューのペイロードの `password` も除く）。
 pub async fn backup_before_0025(
     pool: &SqlitePool,
     db_path: &Path,
 ) -> Result<PathBuf, UpgradeError> {
-    backup_with(pool, db_path, None).await
+    Ok(banto_tags::upgrade::backup_before_0025(pool, db_path).await?)
 }
 
 /// [`backup_before_0025`] の本体。`crash_after` の工程に来たら、作りかけを**残したまま**
 /// 失敗で返る（プロセスが落ちたのと同じ。テストだけが使う）。
+#[cfg(test)]
 pub(crate) async fn backup_with(
     pool: &SqlitePool,
     db_path: &Path,
     crash_after: Option<BackupStep>,
 ) -> Result<PathBuf, UpgradeError> {
-    let dir = config_dir_of(db_path);
-    let db_name = db_file_name(db_path);
-    let stamp: String = sqlx::query_scalar("SELECT strftime('%Y%m%dT%H%M%SZ', 'now')")
-        .fetch_one(pool)
-        .await
-        .map_err(storage)?;
-    // 同じ秒に 2 回作る（移行が失敗して起動し直した）ときは連番を足す。
-    let mut base = format!("{db_name}{BACKUP_INFIX}{stamp}");
-    let mut n = 1;
-    while dir.join(format!("{base}{BACKUP_SUFFIX}")).exists()
-        || dir.join(format!("{base}{PARTIAL_SUFFIX}")).exists()
-    {
-        n += 1;
-        base = format!("{db_name}{BACKUP_INFIX}{stamp}-{n}");
-    }
-    let partial_path = dir.join(format!("{base}{PARTIAL_SUFFIX}"));
-    let final_path = dir.join(format!("{base}{BACKUP_SUFFIX}"));
-    let fail = |message: String| UpgradeError::Backup {
-        path: final_path.clone(),
-        message,
-    };
-
-    let partial = TempFile::new(partial_path.clone());
-    vacuum_into(pool, &partial_path).await.map_err(&fail)?;
-    if crash_after == Some(BackupStep::AfterVacuumInto) {
-        partial.keep();
-        return Err(fail("（テスト）VACUUM INTO の後で落ちた".to_string()));
-    }
-
-    let mut conn = SqliteConnection::connect_with(&copy_options(&partial_path))
-        .await
-        .map_err(|err| fail(err.to_string()))?;
-    let stripped = strip_secrets(&mut conn, crash_after).await;
-    let closed = conn.close().await;
-    match stripped {
-        Ok(()) => {}
-        Err(StripError::Crash(message)) => {
-            partial.keep();
-            return Err(fail(message));
-        }
-        Err(StripError::Sql(err)) => return Err(fail(err.to_string())),
-    }
-    closed.map_err(|err| fail(err.to_string()))?;
-    if crash_after == Some(BackupStep::BeforeRename) {
-        partial.keep();
-        return Err(fail("（テスト）rename の前で落ちた".to_string()));
-    }
-
-    std::fs::rename(&partial_path, &final_path).map_err(|err| fail(err.to_string()))?;
-    partial.keep();
-    // `journal_mode = DELETE` の正常な終わりではジャーナルは残らないが、念のため。
-    let mut journal = partial_path.into_os_string();
-    journal.push("-journal");
-    let _ = std::fs::remove_file(PathBuf::from(journal));
-    Ok(final_path)
-}
-
-enum StripError {
-    Sql(sqlx::Error),
-    Crash(String),
-}
-
-impl From<sqlx::Error> for StripError {
-    fn from(err: sqlx::Error) -> Self {
-        Self::Sql(err)
-    }
-}
-
-/// 作りかけのバックアップからパスワードを除いて `VACUUM` する（§6.4）。
-async fn strip_secrets(
-    conn: &mut SqliteConnection,
-    crash_after: Option<BackupStep>,
-) -> Result<(), StripError> {
-    sqlx::query("UPDATE plc_connections SET password = NULL WHERE password IS NOT NULL")
-        .execute(&mut *conn)
-        .await?;
-    // キューのペイロード（状態を問わず）から password を外す。読めない JSON の行は中身ごと
-    // 落とす（バックアップの中だけ。平文を含みうるものを残さない）。
-    sqlx::query("UPDATE pending_changes SET payload = '{}' WHERE json_valid(payload) = 0")
-        .execute(&mut *conn)
-        .await?;
-    sqlx::query(
-        "UPDATE pending_changes \
-         SET payload = json_remove(payload, '$.input.password', '$.password') \
-         WHERE json_type(payload, '$.input.password') IS NOT NULL \
-            OR json_type(payload, '$.password') IS NOT NULL",
-    )
-    .execute(&mut *conn)
-    .await?;
-    if crash_after == Some(BackupStep::AfterStrip) {
-        return Err(StripError::Crash(
-            "（テスト）パスワードを除いた後で落ちた".to_string(),
-        ));
-    }
-    sqlx::query("VACUUM").execute(&mut *conn).await?;
-    if crash_after == Some(BackupStep::AfterVacuum) {
-        return Err(StripError::Crash(
-            "（テスト）VACUUM の後で落ちた".to_string(),
-        ));
-    }
-    Ok(())
+    Ok(banto_tags::upgrade::backup_with(pool, db_path, crash_after).await?)
 }
 
 // ---- 起動時の整合の確認（§5.3 の最後の行） ------------------------------------------------

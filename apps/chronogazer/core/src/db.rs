@@ -174,11 +174,57 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
             path: path.to_path_buf(),
         }));
     }
-    if let Err(err) = run_migrations(&pool).await {
+    // R2b-1d（docs/banto-hub-connection-settings-design.md §6.7）: 戻せない migration 0025
+    // （`banto_tags::migrate` に入っている）の前に、残り物の掃除とバックアップ。
+    let prepared = match run_app_migrations(&pool).await {
+        Ok(()) => prepare_0025(&pool, path).await,
+        Err(err) => Err(err),
+    };
+    if let Err(err) = prepared {
+        pool.close().await;
+        return Err(err.into());
+    }
+    if let Err(err) = run_shared_migrations(&pool).await {
         pool.close().await;
         return Err(err.into());
     }
     Ok(pool)
+}
+
+/// 0025 の前処理（設計 §6.7）。ChronoGazer の行は `modbus-tcp` / `slmp` / `hub` だけで 0025 が
+/// 断れず、秘密値も無いので、Hub のような予行と preflight は要らない（`banto_tags::migrate`
+/// が失敗しても sqlx がトランザクションを巻き戻す）。
+///
+/// 1. 毎回: 前回の起動の作りかけのバックアップ（パスワードの平文を含みうる）を消す。
+/// 2. 0025 が未適用で中身のある DB だけ、パスワードを除いたバックアップ
+///    （`<DB>.before-0025-<UTC>.bak`）を作り、パスを標準エラーに出す。新規の DB・適用済みの
+///    DB・空のままの DB には作らない。
+///
+/// 失敗は [`InitDbError::Storage`] に包む（他の DB 初期化の失敗と同じ経路:
+/// `EngineStartError::Database` → `startup_recovery::classify` の
+/// `DatabaseUnopenable`）。
+async fn prepare_0025(pool: &SqlitePool, path: &Path) -> Result<(), BantoError> {
+    use banto_tags::upgrade;
+    let to_err = |err: upgrade::UpgradeError| BantoError::Storage(err.to_string());
+    for leftover in upgrade::remove_leftovers(path).map_err(to_err)? {
+        eprintln!(
+            "banto: 前回の起動で残った移行の一時ファイルを消しました: {}",
+            leftover.display()
+        );
+    }
+    if upgrade::pending_0025(pool).await.map_err(to_err)?
+        && upgrade::has_rows_to_protect(pool).await.map_err(to_err)?
+    {
+        let backup = upgrade::backup_before_0025(pool, path)
+            .await
+            .map_err(to_err)?;
+        eprintln!(
+            "banto: 接続設定の移行（migration 0025）の前に、DB のバックアップを作りました\
+             （postgres 接続のパスワードは含みません。戻すときは入れ直してください）: {}",
+            backup.display()
+        );
+    }
+    Ok(())
 }
 
 /// Same as [`init_db`] but against a private in-memory database. Used by
@@ -215,6 +261,12 @@ async fn is_legacy_schema(pool: &SqlitePool) -> Result<bool, BantoError> {
 }
 
 async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
+    run_app_migrations(pool).await?;
+    run_shared_migrations(pool).await
+}
+
+/// この app 自身の migrator（`banto_tags::migrate` の前。`init_db` が間に 0025 の前処理を挟む）。
+async fn run_app_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // この app 自身の分（admin-template のコピー）。記録テーブルを分ける理由は
     // モジュール doc 参照。
     let mut migrator = sqlx::migrate!("./migrations-sqlite");
@@ -223,6 +275,11 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
         .run(pool)
         .await
         .map_err(|err| BantoError::Storage(err.to_string()))?;
+    Ok(())
+}
+
+/// `banto_tags::migrate`（0025 を含む）→ `banto_collect::migrate`。
+async fn run_shared_migrations(pool: &SqlitePool) -> Result<(), BantoError> {
     // I1 (docs/plan.md): banto-tags owns its own migrations/ directory and
     // is applied here, right after this app's own schema, so every caller
     // of init_db/init_db_memory gets the full schema in one call. It records
@@ -515,6 +572,180 @@ mod tests {
             names.contains(&applied.pre_restore_backup_file_name),
             "{names:?}"
         );
+        pool.close().await;
+    }
+
+    // ---- R2b-1d: 0025 の前のバックアップ（設計 §6.7） ----------------------------------
+
+    const PG_PASSWORD: &str = "TOPSECRET-pg-pw-7f3a";
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn contains(haystack: &[u8], needle: &str) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle.as_bytes())
+    }
+
+    /// 0025 より前（banto-tags 0001〜0024）の ChronoGazer の DB。`rows` なら
+    /// `modbus-tcp` と、平文のパスワードを持つ `postgres` の行（古い表の列は生の SQL で入れる）。
+    async fn db_before_0025(path: &Path, rows: bool) {
+        let pool = banto_storage::connect_sqlite(path).await.unwrap();
+        run_app_migrations(&pool).await.unwrap();
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../crates/banto-tags/migrations");
+        let mut tags = sqlx::migrate::Migrator::new(dir.as_path()).await.unwrap();
+        tags.dangerous_set_table_name(banto_tags::MIGRATIONS_TABLE);
+        tags.run_to(24, &pool).await.unwrap();
+        if rows {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO plc_connections (id, name, protocol, host, port, unit_id, enabled, \
+                 simulation, word_order, database, username, password, cpu_type, settings) \
+                 VALUES (1, 'plc', 'modbus-tcp', '10.0.0.5', 502, 1, 1, 0, 'low_high', NULL, NULL, NULL, 'R', NULL), \
+                 (2, 'pg', 'postgres', 'db.local', 5432, 1, 1, 0, 'low_high', 'plant', 'reader', '{PG_PASSWORD}', 'R', NULL)"
+            )))
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        pool.close().await;
+    }
+
+    /// 0025 より前で行のある DB: 起動で `.bak` ができ（パスワードのバイト列は無く、行は
+    /// 残る）、DB 本体は移行され、次の起動で前回の作りかけは消える（完成した `.bak` は残る）。
+    #[tokio::test]
+    async fn a_populated_db_before_0025_is_backed_up_without_passwords() {
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        db_before_0025(&db_path, true).await;
+
+        let pool = init_db(&db_path).await.expect("init_db");
+        let applied: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {} WHERE version = 25",
+            banto_tags::MIGRATIONS_TABLE
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 1, "0025 is applied to the live DB");
+        pool.close().await;
+
+        let backups: Vec<String> = file_names(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".bak"))
+            .collect();
+        assert_eq!(backups.len(), 1, "{:?}", file_names(dir.path()));
+        assert!(
+            backups[0].starts_with("chronogazer.sqlite3.before-0025-"),
+            "{backups:?}"
+        );
+        let bak = dir.path().join(&backups[0]);
+        let bytes = std::fs::read(&bak).unwrap();
+        assert!(
+            !contains(&bytes, PG_PASSWORD),
+            "the password is in the backup"
+        );
+        // The backup is the old schema with every row (passwords cleared).
+        let opened = banto_storage::connect_sqlite(&bak).await.unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections")
+            .fetch_one(&opened)
+            .await
+            .unwrap();
+        assert_eq!(rows, 2);
+        let passwords: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE password IS NOT NULL")
+                .fetch_one(&opened)
+                .await
+                .unwrap();
+        assert_eq!(passwords, 0);
+        opened.close().await;
+
+        // A second start does not make another backup (0025 is applied).
+        let pool = init_db(&db_path).await.expect("second init_db");
+        pool.close().await;
+        let again = file_names(dir.path())
+            .into_iter()
+            .filter(|name| name.ends_with(".bak"))
+            .count();
+        assert_eq!(again, 1);
+    }
+
+    /// 前回の起動の作りかけ（`.bak.partial` と付随ファイル、Hub の予行の写し）は、次の
+    /// 起動で消える。完成した `.bak` と DB は残る。
+    #[tokio::test]
+    async fn partial_backups_left_by_a_crash_are_removed_on_the_next_init() {
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        db_before_0025(&db_path, true).await;
+        let partial = "chronogazer.sqlite3.before-0025-20261021T000000Z.bak.partial";
+        let finished = "chronogazer.sqlite3.before-0025-20261020T000000Z.bak";
+        std::fs::write(dir.path().join(partial), PG_PASSWORD).unwrap();
+        std::fs::write(dir.path().join(format!("{partial}-journal")), PG_PASSWORD).unwrap();
+        std::fs::write(dir.path().join(finished), b"finished").unwrap();
+
+        let pool = init_db(&db_path).await.expect("init_db");
+        pool.close().await;
+
+        let names = file_names(dir.path());
+        assert!(
+            !names.iter().any(|name| name.contains(".bak.partial")),
+            "{names:?}"
+        );
+        assert!(names.iter().any(|name| name == finished), "{names:?}");
+    }
+
+    /// 新規の DB・0025 の後の DB・行の無い 0025 より前の DB には、バックアップを作らない。
+    #[tokio::test]
+    async fn no_backup_for_a_fresh_migrated_or_empty_db() {
+        let dir = crate::test_support::TempDir::new();
+        let fresh = dir.path().join("fresh.sqlite3");
+        init_db(&fresh).await.expect("fresh").close().await;
+        init_db(&fresh).await.expect("migrated").close().await;
+
+        let empty = dir.path().join("empty.sqlite3");
+        db_before_0025(&empty, false).await;
+        init_db(&empty).await.expect("empty").close().await;
+
+        let names = file_names(dir.path());
+        assert!(!names.iter().any(|name| name.contains(".bak")), "{names:?}");
+    }
+
+    /// 前回の作りかけを消せない（`.bak.partial` の名前をディレクトリが塞ぐ）ときは、バックアップも
+    /// 移行もせずに `InitDbError::Storage` で失敗する（他の DB 初期化の失敗と同じ経路）。
+    #[tokio::test]
+    async fn a_leftover_that_cannot_be_removed_fails_init_db_without_migrating() {
+        let dir = crate::test_support::TempDir::new();
+        let db_path = dir.path().join("chronogazer.sqlite3");
+        db_before_0025(&db_path, true).await;
+        // A leftover that cannot be deleted stops the start (here: a directory of that name).
+        let stuck = dir
+            .path()
+            .join("chronogazer.sqlite3.before-0025-20261021T000000Z.bak.partial");
+        std::fs::create_dir(&stuck).unwrap();
+
+        match init_db(&db_path).await {
+            Err(InitDbError::Storage(err)) => {
+                assert!(err.to_string().contains("bak.partial"), "{err}")
+            }
+            other => panic!("expected InitDbError::Storage, got {other:?}"),
+        }
+        std::fs::remove_dir(&stuck).unwrap();
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let applied: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {} WHERE version = 25",
+            banto_tags::MIGRATIONS_TABLE
+        )))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(applied, 0, "0025 must not be applied");
         pool.close().await;
     }
 }

@@ -122,29 +122,6 @@ fn sha256_of(path: &Path) -> String {
     hex::encode(Sha256::digest(std::fs::read(path).expect("read file")))
 }
 
-#[test]
-fn leftover_names_cover_dry_runs_and_partial_backups_only() {
-    let db = "banto-hub.sqlite3";
-    for name in [
-        ".banto-hub-0025-dryrun-0011223344556677.sqlite3",
-        ".banto-hub-0025-dryrun-0011223344556677.sqlite3-journal",
-        "banto-hub.sqlite3.before-0025-20261021T190331Z.bak.partial",
-        "banto-hub.sqlite3.before-0025-20261021T190331Z.bak.partial-journal",
-        "banto-hub.sqlite3.before-0025-20261021T190331Z-2.bak.partial",
-    ] {
-        assert!(is_leftover(name, db), "{name}");
-    }
-    for name in [
-        "banto-hub.sqlite3",
-        "banto-hub.sqlite3-wal",
-        "banto-hub.sqlite3.before-0025-20261021T190331Z.bak",
-        "other.sqlite3.before-0025-20261021T190331Z.bak.partial",
-        "notes.bak.partial",
-    ] {
-        assert!(!is_leftover(name, db), "{name}");
-    }
-}
-
 /// §6.4・§6.6: 毎回の起動の掃除は残り物だけを消し（完成した `.bak`・DB は残す）、消せない
 /// ものがあれば、そのパスを持って起動を止める。
 #[test]
