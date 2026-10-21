@@ -406,6 +406,19 @@ const TABLE = [
 		}
 	],
 	[
+		'banto-driver-modbus（R1-6 の行。lib.rs だけの変更。banto-drivers 経由で hub の 4 パッケージへ届く。banto-hub-core へは dev-dependency 経由で届くが、R2b-0 でこの行を書き換えて banto-hub-core を外す）',
+		['crates/banto-driver-modbus/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args:
+				'-p banto-driver-modbus -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true
+		}
+	],
+	[
 		'banto-driver-api の逆依存（banto-plc）だけの変更では driver-api ジョブは走らない',
 		['crates/banto-plc/src/decode.rs'],
 		{ ...NONE, run_rust: true, rust_args: '-p banto-plc' }
