@@ -331,14 +331,10 @@ pub struct UpgradeOutcome {
 /// トランザクションなので同じトランザクションにできない。先に立てておけば migrate の
 /// 直後に落ちても印は残る）。印を見て `VACUUM` し、消すのは [`vacuum_if_pending`]。
 pub async fn set_vacuum_pending(pool: &SqlitePool) -> Result<(), UpgradeError> {
-    sqlx::query(
-        "INSERT INTO settings (key, value) VALUES (?, 'true') \
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind(VACUUM_PENDING_KEY)
-    .execute(pool)
-    .await
-    .map_err(storage)?;
+    let mut conn = pool.acquire().await.map_err(storage)?;
+    crate::pending_changes::set_vacuum_pending_in(&mut conn)
+        .await
+        .map_err(|err| storage(err.to_string()))?;
     Ok(())
 }
 
@@ -984,14 +980,7 @@ async fn rewrite_secrets_inner(
 
     // (e) 平文を空きページへ追い出しうる書き込みと同じトランザクションで印を立てる。
     if report.rewrote() {
-        sqlx::query(
-            "INSERT INTO settings (key, value) VALUES (?, 'true') \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(VACUUM_PENDING_KEY)
-        .execute(&mut *tx)
-        .await
-        .map_err(storage)?;
+        crate::pending_changes::set_vacuum_pending_in(&mut tx).await?;
     }
     if fail_before_commit {
         drop(tx);

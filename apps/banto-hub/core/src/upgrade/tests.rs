@@ -1070,6 +1070,111 @@ async fn a_failed_reseal_keeps_the_row_and_is_counted_as_remaining_plaintext() {
     assert_eq!(plaintext_remaining(&pool, &secrets).await.unwrap(), 0);
 }
 
+const MOVE_PASSWORD: &str = "TOPSECRET-move-to-history-5e1a";
+
+/// 接続の作成の提案を `state` で 1 行積む。パスワードは `secrets` で封印した
+/// `sealedPassword`。
+async fn insert_sealed_queue_row(
+    pool: &SqlitePool,
+    state: &str,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> i64 {
+    let sealed = secrets
+        .seal(banto_tags::PASSWORD_KEY, MOVE_PASSWORD)
+        .unwrap();
+    let payload = serde_json::json!({ "input": {
+        "name": "pg-move", "protocol": "postgres", "host": "db", "port": 5432,
+        "database": "erp", "username": "reader",
+        "sealedPassword": crate::secrets::sealed_password_json(&sealed),
+    }});
+    insert_queue_row(pool, state, "plc_connections.create", &payload).await
+}
+
+async fn move_to_history(
+    service: &crate::pending_changes::PendingChangesService,
+    via_cancel: bool,
+    id: i64,
+) {
+    if via_cancel {
+        service.cancel_pending(id).await.unwrap();
+    } else {
+        service.mark_applied(id).await.unwrap();
+    }
+}
+
+/// #778 のレビュー P2: 起動時の封印し直しに失敗して未適用キューに平文が残り、その起動の
+/// VACUUM で印が消えた後に、取り消し / 適用で履歴へ移しても、平文を外したので同じ
+/// トランザクションで清掃待ちの印が立つ。次の起動で VACUUM が走り、印が消え、DB・WAL に
+/// 既知のパスワードが残らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_plaintext_row_to_history_marks_the_database_for_vacuum() {
+    for (via_cancel, state) in [(true, "pending"), (false, "applying")] {
+        let dir = TempDir::new("upkeep-move-history");
+        let path = dir.path().join("banto-hub.sqlite3");
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let id = insert_sealed_queue_row(&pool, state, &plain_secrets()).await;
+        let failing = crate::secrets::ConnectionSecrets::new(Some(Arc::new(
+            crate::test_support::FailingProtector,
+        )));
+
+        // The reseal fails, the row keeps the plain-v1 value; the VACUUM of this start
+        // (forced by a mark) clears the mark.
+        set_vacuum_pending(&pool).await.unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.vacuumed, "{report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{state}");
+        assert_eq!(
+            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            "plain-v1"
+        );
+
+        // Moving it to history strips the plain value and marks the database.
+        let service = crate::pending_changes::PendingChangesService::new(pool.clone());
+        move_to_history(&service, via_cancel, id).await;
+        assert!(queue_payload(&pool, id).await["input"]
+            .get("sealedPassword")
+            .is_none());
+        assert_eq!(vacuum_mark(&pool).await.as_deref(), Some("true"), "{state}");
+        pool.close().await;
+
+        // The next start: nothing to rewrite, the mark makes it VACUUM.
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert!(!report.rewrote(), "{report:?}");
+        assert!(report.vacuumed, "{report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None);
+        pool.close().await;
+        let leaks = leaked_in_files(&path, &[MOVE_PASSWORD]);
+        assert!(leaks.is_empty(), "{state}: left in the files: {leaks:?}");
+    }
+}
+
+/// 上の逆: DPAPI で封印した `sealedPassword` だけを履歴へ移すときは、空きページに残るのは
+/// 暗号文で平文ではないので、印を立てない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_dpapi_sealed_row_to_history_does_not_mark_the_database() {
+    for (via_cancel, state) in [(true, "pending"), (false, "applying")] {
+        let pool = crate::db::init_db_memory().await.unwrap();
+        let id =
+            insert_sealed_queue_row(&pool, state, &crate::test_support::protected_secrets()).await;
+        assert_eq!(
+            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            "dpapi-machine-v1"
+        );
+        let service = crate::pending_changes::PendingChangesService::new(pool.clone());
+        move_to_history(&service, via_cancel, id).await;
+        assert!(queue_payload(&pool, id).await["input"]
+            .get("sealedPassword")
+            .is_none());
+        assert_eq!(vacuum_mark(&pool).await, None, "{state}");
+    }
+}
+
 /// 非 Windows の Hub（protector 無し）の後処理: `plain-v1` の行はそのまま（封印し直さない）、
 /// 古い平文の `password` のキューの行は `plain-v1` の `sealedPassword` に揃え、履歴からは外す。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

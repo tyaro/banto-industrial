@@ -159,13 +159,16 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
                 attempt = attempt.saturating_add(1);
                 let message = super::plan::unreadable_password_message(reason);
                 deps.status.update_connection(plan.connection_id, |status| {
-                    record_connection_failure(status, DbConnectionState::Error, attempt, message);
-                    status.password_unreadable = Some(reason);
+                    record_password_unreadable(status, attempt, reason, message);
                 });
                 wait_before_retry(&plan, &deps, attempt, &mut last_delay).await;
                 continue;
             }
         };
+        // 開封が回復したら「読めません」を外す（#778 のレビュー P3）。続く接続が失敗しても
+        // 「読めない」が残らないように、接続の結果を待たずにここで外す。
+        deps.status
+            .update_connection(plan.connection_id, record_password_opened);
         let connected = connect(&plan, &password).await;
         drop(password);
         match connected {
@@ -748,6 +751,23 @@ fn record_connection_failure(
     status.last_error = Some(message);
 }
 
+/// パスワードを開けなかったときの状態（`state` は `error`、`passwordState` 用の理由つき）。
+fn record_password_unreadable(
+    status: &mut DbConnectionStatus,
+    attempt: u32,
+    reason: crate::secrets::UnreadableReason,
+    message: String,
+) {
+    record_connection_failure(status, DbConnectionState::Error, attempt, message);
+    status.password_unreadable = Some(reason);
+}
+
+/// パスワードを開けたときの状態: 「読めません」の印だけを外す。`state`・`last_error` は
+/// 続く接続の結果が上書きする。
+fn record_password_opened(status: &mut DbConnectionStatus) {
+    status.password_unreadable = None;
+}
+
 /// §4.3「接続断（バックオフ中）→ 接続単位で全タグ Bad」。
 fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
     mark_connection_bad(plan, &deps.store, deps.clock.now_ms());
@@ -992,6 +1012,49 @@ mod tests {
             "接続できません".to_string(),
         );
         assert_eq!(status.consecutive_failures, 2);
+        assert_eq!(status.last_error.as_deref(), Some("接続できません"));
+    }
+
+    /// #778 のレビュー P3: 開封に失敗 → 開封に成功 → 接続に失敗、の順で状態を更新しても、
+    /// 「パスワードを読めません」は開封に成功した時点で外れ、接続の失敗が残らず上書きする。
+    #[test]
+    fn password_unreadable_is_cleared_once_the_password_opens_again() {
+        use crate::secrets::UnreadableReason;
+        let mut status = DbConnectionStatus {
+            connection_id: 1,
+            connection_name: "erp".to_string(),
+            state: DbConnectionState::Backoff,
+            last_poll_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+            restarts: 0,
+            last_restart_reason: None,
+            password_unreadable: None,
+            groups: Vec::new(),
+        };
+        record_password_unreadable(
+            &mut status,
+            1,
+            UnreadableReason::Undecryptable,
+            "開けません".to_string(),
+        );
+        assert_eq!(
+            status.password_unreadable,
+            Some(UnreadableReason::Undecryptable)
+        );
+        assert_eq!(status.state, DbConnectionState::Error);
+
+        record_password_opened(&mut status);
+        assert_eq!(status.password_unreadable, None);
+
+        // 続く DB 接続の失敗（`Err` 分岐）。
+        record_connection_failure(
+            &mut status,
+            DbConnectionState::Backoff,
+            2,
+            "接続できません".to_string(),
+        );
+        assert_eq!(status.password_unreadable, None);
         assert_eq!(status.last_error.as_deref(), Some("接続できません"));
     }
 

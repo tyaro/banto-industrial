@@ -402,7 +402,7 @@ plugin-design §7.4（有効化の前に保存済みの設定を新しい版で�
 
 - 1 が途中で失敗すればトランザクションごと戻り、次の起動でやり直す。封印し直しの失敗（DPAPI のエラー）は起動を止めない: その行は `plain-v1` のまま残し、状態の画面に「移行待ちの秘密値が平文で残っています」を出す（収集は動く。平文は今と同じ守り）。
 
-- **実装の注（R2b-1e、2026-10-21）**: 1 が DB の失敗で戻ったときも起動を止めない（ログに WARN、次の起動でやり直す。整合の確認（§5.3）と同じ扱い。平文は今と同じ守りで残る）。2 は `wal_checkpoint(TRUNCATE)` → `VACUUM` → もう一度 `wal_checkpoint(TRUNCATE)`（WAL の DB では `VACUUM` の結果がまず WAL に入り、本体の古いページは checkpoint まで残るため）。後ろの checkpoint が終わり切らなければ印を残す。非 Windows でも、旧い平文の `password` を持つ未適用キューは `plain-v1` の `sealedPassword` に揃える（(b) は OS を問わない）。「移行待ちの秘密値が平文で残っています」の件数は状態の API を呼ぶたびに DB から数える（入れ直せばすぐ消える）。状態の欄（`secretStorage`）は管理系の `GET /api/status` だけに足し、`/api/v1/status` の形は変えない。キューの封印した値（`sealedPassword`）はキューの中だけの欄で、REST・MCP の入力の型は受けない（外から封印した値を差し込ませない）。適用は平文に戻さず `SecretChange::Set` で渡し、この PC で開けなければ `password` の項目エラーで適用しない。
+- **実装の注（R2b-1e、2026-10-21）**: 1 が DB の失敗で戻ったときも起動を止めない（ログに WARN、次の起動でやり直す。整合の確認（§5.3）と同じ扱い。平文は今と同じ守りで残る）。2 は `wal_checkpoint(TRUNCATE)` → `VACUUM` → もう一度 `wal_checkpoint(TRUNCATE)`（WAL の DB では `VACUUM` の結果がまず WAL に入り、本体の古いページは checkpoint まで残るため）。後ろの checkpoint が終わり切らなければ印を残す。非 Windows でも、旧い平文の `password` を持つ未適用キューは `plain-v1` の `sealedPassword` に揃える（(b) は OS を問わない）。「移行待ちの秘密値が平文で残っています」の件数は状態の API を呼ぶたびに DB から数える（入れ直せばすぐ消える）。状態の欄（`secretStorage`）は管理系の `GET /api/status` だけに足し、`/api/v1/status` の形は変えない。キューの封印した値（`sealedPassword`）はキューの中だけの欄で、REST・MCP の入力の型は受けない（外から封印した値を差し込ませない）。適用は平文に戻さず `SecretChange::Set` で渡し、この PC で開けなければ `password` の項目エラーで適用しない。履歴へ移すとき（`mark_applied`・`cancel_pending`）に平文の `password` か `plain-v1` の `sealedPassword` を外したら、同じトランザクションで清掃待ちの印を立てる（DPAPI の封印し直しに失敗して残った行を、VACUUM の後に取り消した場合。#778 のレビュー P2）。
 
 ### 6.6 冪等性と途中で落ちたとき
 

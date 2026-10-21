@@ -489,9 +489,9 @@ async fn strip_history_row(
         // 読めないペイロードは触らない（`row_to_pending` が同じ理由で失敗を返す）。
         return Ok(row);
     };
-    if !strip_queued_password(source, &mut payload) {
+    let Some(plaintext) = strip_queued_password_detail(source, &mut payload) else {
         return Ok(row);
-    }
+    };
     let text = serde_json::to_string(&payload)
         .map_err(|err| BantoError::Other(format!("payload のシリアライズに失敗しました: {err}")))?;
     sqlx::query("UPDATE pending_changes SET payload = ? WHERE id = ?")
@@ -500,8 +500,30 @@ async fn strip_history_row(
         .execute(&mut *tx)
         .await
         .map_err(banto_storage::storage_error)?;
+    if plaintext {
+        // 平文を外したら、同じトランザクションで清掃待ちの印を立てる（#778 のレビュー P2。
+        // 起動時の封印し直しに失敗して未適用キューに残った行を、VACUUM の後に履歴へ移す
+        // 場合。印が無いと、空きページと WAL の平文が次の起動でも掃除されない）。
+        set_vacuum_pending_in(&mut *tx).await?;
+    }
     row.3 = text;
     Ok(row)
+}
+
+/// 清掃待ちの印 `secrets.vacuum_pending` を、呼び出し側のトランザクションの中で立てる
+/// （設計 §6.5 の 2。消すのは `crate::upgrade::vacuum_if_pending`）。
+pub(crate) async fn set_vacuum_pending_in(
+    conn: &mut sqlx::SqliteConnection,
+) -> Result<(), BantoError> {
+    sqlx::query(
+        "INSERT INTO settings (key, value) VALUES (?, 'true') \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind(crate::upgrade::VACUUM_PENDING_KEY)
+    .execute(conn)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    Ok(())
 }
 
 // ---- 接続のパスワードのペイロードの扱い（R2b-1e、このモジュールの doc） ---------------------
@@ -587,12 +609,21 @@ pub fn reseal_queued_password(
 /// `input` に `password` か `sealedPassword` があれば外して `passwordSet` に替える。
 /// `passwordSet` は、封印した値があれば `true`、`password` が文字列なら非空かどうか、
 /// `null` なら作成は `false`・更新は `null`（「保つ」）、それ以外の値は `false`。
-fn strip_input(source: &str, input: &mut Map<String, Value>) -> bool {
+///
+/// 何も外さなければ `None`。外したら `Some(平文を外したか)`: 非空の文字列の `password`、
+/// または `dpapi-machine-v1` と読めない `sealedPassword`（`plain-v1`・形が違うもの。blob が
+/// 平文の base64 でありうるので安全側）。DPAPI の blob だけなら `false`。
+fn strip_input(source: &str, input: &mut Map<String, Value>) -> Option<bool> {
     let password = input.remove(PASSWORD_FIELD);
     let sealed = input.remove(SEALED_PASSWORD_FIELD);
     if password.is_none() && sealed.is_none() {
-        return false;
+        return None;
     }
+    let plaintext_password = matches!(&password, Some(Value::String(plain)) if !plain.is_empty());
+    let plaintext_sealed = sealed.as_ref().is_some_and(|value| {
+        value.get("scheme").and_then(Value::as_str)
+            != Some(crate::secrets::SecretScheme::DpapiMachineV1.as_str())
+    });
     let password_set = if sealed.is_some() {
         Value::Bool(true)
     } else {
@@ -604,7 +635,7 @@ fn strip_input(source: &str, input: &mut Map<String, Value>) -> bool {
         }
     };
     input.insert(PASSWORD_SET_FIELD.to_string(), password_set);
-    true
+    Some(plaintext_password || plaintext_sealed)
 }
 
 /// パスワードの指定が無いときの `passwordSet`: 作成は `false`（無し）、更新は `null`
@@ -620,10 +651,13 @@ fn absent_password_set(source: &str) -> Value {
 /// 履歴へ移すとき・起動時の後処理（設計 §5.3・§6.5）: `input` から `password` と
 /// `sealedPassword` の**両方**を外して `passwordSet` に替える。書き換えたら `true`。
 pub fn strip_queued_password(source: &str, payload: &mut Value) -> bool {
-    match connection_input_mut(source, payload) {
-        Some(input) => strip_input(source, input),
-        None => false,
-    }
+    strip_queued_password_detail(source, payload).is_some()
+}
+
+/// [`strip_queued_password`] に、外したのが平文だったか（[`strip_input`] の戻り値）を足した形。
+/// 平文を外したら呼び出し側は清掃待ちの印を立てる（設計 §6.5 の 2）。
+pub fn strip_queued_password_detail(source: &str, payload: &mut Value) -> Option<bool> {
+    connection_input_mut(source, payload).and_then(|input| strip_input(source, input))
 }
 
 /// 応答の写し（S1a レビュー対応、R2b-1e で封印した値にも広げた）: `password` と
@@ -633,7 +667,7 @@ pub fn strip_queued_password(source: &str, payload: &mut Value) -> bool {
 pub fn redact_queued_password(source: &str, payload: &Value) -> Value {
     let mut payload = payload.clone();
     if let Some(input) = connection_input_mut(source, &mut payload) {
-        if !strip_input(source, input) && !input.contains_key(PASSWORD_SET_FIELD) {
+        if strip_input(source, input).is_none() && !input.contains_key(PASSWORD_SET_FIELD) {
             input.insert(PASSWORD_SET_FIELD.to_string(), absent_password_set(source));
         }
     }
