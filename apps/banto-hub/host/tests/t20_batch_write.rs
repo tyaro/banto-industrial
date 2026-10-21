@@ -93,6 +93,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 
@@ -1255,6 +1256,7 @@ async fn record_only_happens_for_entries_that_actually_reach_insert_pending() {
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("mem connection should be provisioned");

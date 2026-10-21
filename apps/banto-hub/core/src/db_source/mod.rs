@@ -683,6 +683,7 @@ mod tests {
             database: Some("appdb".to_string()),
             username: Some("appuser".to_string()),
             password: Some("s3cret-password".to_string()),
+            settings: None,
         }
     }
 
@@ -755,6 +756,7 @@ mod tests {
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
             password: url_password(&url),
+            settings: None,
         };
 
         let outcome = test_connection(&conn).await;
@@ -864,6 +866,7 @@ mod tests {
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
             password: url_password(&url),
+            settings: None,
         };
 
         let outcome = describe_group(

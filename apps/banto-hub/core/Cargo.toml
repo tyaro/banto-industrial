@@ -172,6 +172,12 @@ banto-broker = { path = "../../../crates/banto-broker", features = ["test-util"]
 # テスト）。サーバー側は axum 自身の `ws` feature(上の [dependencies] 参照)で完結する
 # ので、これは test コードのみが使う。
 tokio-tungstenite = { workspace = true }
+# R2a-2a（docs/banto-hub-ingest-design.md §2・§11）: `src/ingest/driver.rs` の `PushDriver` を
+# 適合テストの静的な部分（`static_checks`、C1・C2）に掛ける。適合テスト一式は
+# `banto-driver-api` にだけ依存する公開 crate なので、下の「`banto-drivers` には dev でも
+# 依存しない」は崩れない（CI では conformance の変更で core も走るようになる。
+# `.github/scripts/ci-changes.test.mjs` の G に辺を足した）。
+banto-driver-conformance = { path = "../../../crates/banto-driver-conformance", version = "0.1.0" }
 # R2b-0（docs/banto-driver-api-design.md §2.4）: `banto-drivers`（実ドライバ）は dev でも
 # 持たない。ドライバだけの変更で core が CI に選ばれないようにするため。`src` の単体
 # テストは `src/test_support.rs::test_drivers`（偽のドライバ表）、`tests/` に残った統合

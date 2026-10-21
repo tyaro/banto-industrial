@@ -25,6 +25,7 @@ fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 

@@ -118,8 +118,10 @@ const G = {
 			// R2b-0: banto-drivers には dev-dependency でも依存しない（R1-7a で bin が
 			// banto-hub-host へ移り、R2b-0 で実ドライバを使うテストも host へ移した。src 内の
 			// 単体テストは偽のドライバ表、tests/ に残った統合テストは HubDrivers::none()）。
+			// R2a-2a: 適合テスト一式は dev-dependency（`PushDriver` の static_checks）。
 			deps: [
 				'banto-driver-api',
+				'banto-driver-conformance',
 				'banto-instance-lock',
 				'banto-safe-root',
 				'banto-service-control',
@@ -378,7 +380,7 @@ const TABLE = [
 		}
 	],
 	[
-		'banto-driver-conformance（R1-2 の公開 crate。driver-api ジョブが走る。R1-5 から Modbus / SLMP のドライバが dev-dependency で使うので、その逆依存の hub 側も走る。R2b-0 から banto-hub-core は入らない）',
+		'banto-driver-conformance（R1-2 の公開 crate。driver-api ジョブが走る。R1-5 から Modbus / SLMP のドライバが dev-dependency で使うので、その逆依存の hub 側も走る。R2b-0 で外れた banto-hub-core は、R2a-2a から PushDriver の適合テストの dev-dependency で戻る）',
 		[
 			'crates/banto-driver-conformance/src/frame.rs',
 			'crates/banto-driver-conformance/CHANGELOG.md'
@@ -387,7 +389,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,

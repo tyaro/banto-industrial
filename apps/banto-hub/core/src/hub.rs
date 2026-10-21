@@ -2753,6 +2753,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3144,6 +3145,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 },
                 PlcConnection {
                     id: 2,
@@ -3160,6 +3162,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 },
                 PlcConnection {
                     id: 3,
@@ -3176,6 +3179,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 },
                 PlcConnection {
                     id: 4,
@@ -3192,6 +3196,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 },
             ],
             groups: Vec::new(),
@@ -3240,6 +3245,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         };
         let conn2 = PlcConnection {
             id: 2,
@@ -3256,6 +3262,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         };
         let group1 = banto_tags::CollectionGroup {
             id: 10,
@@ -3348,6 +3355,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 })
                 .collect(),
             groups: groups
@@ -3613,6 +3621,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3690,6 +3699,7 @@ mod tests {
                     database: None,
                     username: None,
                     password: None,
+                    settings: None,
                 })
                 .await
                 .unwrap();
@@ -3773,6 +3783,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3824,6 +3835,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3901,6 +3913,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -4002,6 +4015,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -4073,6 +4087,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         }
     }
 

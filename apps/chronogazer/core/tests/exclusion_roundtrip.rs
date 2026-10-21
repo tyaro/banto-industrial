@@ -125,6 +125,7 @@ async fn connection(pool: &SqlitePool, name: &str, port: u16) -> i64 {
             database: None,
             username: None,
             password: None,
+            settings: None,
         })
         .await
         .expect("PLC 接続を登録できる")

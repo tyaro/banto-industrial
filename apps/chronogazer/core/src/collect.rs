@@ -3462,6 +3462,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("create plc connection");
@@ -3965,6 +3966,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("create plc connection");
@@ -4111,6 +4113,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("create hub connection");
@@ -4193,6 +4196,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("create hub connection");
@@ -4414,6 +4418,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         };
         let group = |id: i64, conn: i64, enabled: bool| CollectionGroup {
             id,
@@ -5609,6 +5614,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         }
     }
 

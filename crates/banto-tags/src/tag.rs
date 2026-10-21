@@ -12,8 +12,9 @@ use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{
     CALC_CONNECTION_NAME, HUB_PROTOCOL, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL,
-    VIRTUAL_PROTOCOL,
+    PUSH_PROTOCOL, VIRTUAL_PROTOCOL,
 };
+use crate::push::validate_push_key;
 use crate::scaling::Scaling;
 use crate::support::{map_write_error, max_length_message, range_message, required_message};
 
@@ -842,7 +843,7 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
 /// shape. Rejecting the rest at registration keeps the wrapper SQL builder
 /// (`apps/banto-hub/core/src/db_source/convert.rs`) free of quoting corner
 /// cases.
-fn is_db_column_identifier(address: &str) -> bool {
+pub(crate) fn is_db_column_identifier(address: &str) -> bool {
     let mut chars = address.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -855,7 +856,8 @@ fn is_db_column_identifier(address: &str) -> bool {
 /// [`validate_tag_kind_placement_tx`]: a tag's collection group joined back
 /// to the connection it collects from. Kept as a constant so the pool-taking
 /// and transaction-taking twins cannot query different things.
-const PLACEMENT_CONNECTION_SQL: &str = "SELECT pc.name, pc.protocol FROM collection_groups cg \
+const PLACEMENT_CONNECTION_SQL: &str =
+    "SELECT pc.id, pc.name, pc.protocol FROM collection_groups cg \
      JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
      WHERE cg.id = ?";
 
@@ -888,12 +890,18 @@ const PLACEMENT_CONNECTION_SQL: &str = "SELECT pc.name, pc.protocol FROM collect
 /// precision trade-off [`MODBUS_ONLY_DATA_TYPES`] already accepts), and
 /// `writable` must be `false` (no writes through the Hub). Every violation
 /// of this family is reported together.
+///
+/// A fourth family (R2a-2a, docs/banto-hub-ingest-design.md §3.3) applies to
+/// a `plc` tag under a [`PUSH_PROTOCOL`] connection - see [`push_tag_errors`]:
+/// the same shape as the hub family, with the sender's opaque key
+/// ([`crate::push::validate_push_key`]) in place of the external name.
 fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Result<(), BantoError> {
     let tag_kind = input.tag_kind.as_str();
     let data_type = input.data_type.as_str();
     let is_virtual = protocol == VIRTUAL_PROTOCOL;
     let is_postgres = protocol == POSTGRES_PROTOCOL;
     let is_hub = protocol == HUB_PROTOCOL;
+    let is_push = protocol == PUSH_PROTOCOL;
 
     let placement_error = |field: &str, message: String| -> Result<(), BantoError> {
         Err(BantoError::Validation {
@@ -950,6 +958,17 @@ fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Resul
     // `hub` 配下だと上で拒否済み）か未知の値（validate_tag_input が拒否済み）。
     if is_hub && tag_kind == PLC_TAG_KIND {
         let errors = hub_tag_errors(input);
+        if !errors.is_empty() {
+            return Err(BantoError::Validation {
+                field_errors: errors,
+            });
+        }
+        return Ok(());
+    }
+
+    // R2a-2a: `push` 接続配下の `plc` タグの規則（hub と同じ並び。64bit 型も可）。
+    if is_push && tag_kind == PLC_TAG_KIND {
+        let errors = push_tag_errors(input);
         if !errors.is_empty() {
             return Err(BantoError::Validation {
                 field_errors: errors,
@@ -1021,8 +1040,49 @@ fn hub_tag_errors(input: &TagInput) -> Vec<FieldError> {
     errors
 }
 
-/// Whether a hub tag carries a real (non-identity) linear scaling - the
-/// #383 段階3 P4 rule in [`hub_tag_errors`]. Only a complete set of the four
+/// The push-tag family of [`placement_verdict`] (R2a-2a,
+/// docs/banto-hub-ingest-design.md §3.3), every violation at once - the
+/// [`hub_tag_errors`] rules with the key grammar swapped in: `address` is the
+/// sender's opaque key ([`crate::push::validate_push_key`]: 1..=256
+/// characters after trimming, no control characters, case-sensitive), no
+/// `string` (the recorder pipeline is numeric-only, §9.5-5), `writable`
+/// refused (no write direction, §9.5-8 - refused rather than normalized, as
+/// for hub tags), and no non-identity scaling (the sender sends engineering
+/// values; `db_source` applies none either, so the bridge parity of §10.4
+/// holds). The 64-bit types are allowed.
+fn push_tag_errors(input: &TagInput) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if let Err(message) = validate_push_key(&input.address) {
+        errors.push(FieldError {
+            field: "address".to_string(),
+            message,
+        });
+    }
+    if input.data_type == STRING_DATA_TYPE {
+        errors.push(FieldError {
+            field: "dataType".to_string(),
+            message: "string 型は push 接続のタグに設定できません（数値・bit のみ）".to_string(),
+        });
+    }
+    if input.writable {
+        errors.push(FieldError {
+            field: "writable".to_string(),
+            message: "push 接続のタグは書き込み可にできません（値は送り手から受けるだけです）"
+                .to_string(),
+        });
+    }
+    if hub_scaling_is_not_identity(input) {
+        errors.push(FieldError {
+            field: "scaling".to_string(),
+            message: "push 接続のタグにはスケーリングを設定できません（送り手は工学値を送ります）"
+                .to_string(),
+        });
+    }
+    errors
+}
+
+/// Whether a hub (or push) tag carries a real (non-identity) linear scaling - the
+/// #383 段階3 P4 rule in [`hub_tag_errors`] (and [`push_tag_errors`]). Only a complete set of the four
 /// bounds is judged (a partial set is [`Scaling::from_parts`]' error).
 fn hub_scaling_is_not_identity(input: &TagInput) -> bool {
     match (input.raw_lo, input.raw_hi, input.eng_lo, input.eng_hi) {
@@ -1070,30 +1130,27 @@ async fn validate_tag_kind_placement(
     pool: &SqlitePool,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
-) -> Result<bool, BantoError> {
-    let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
+) -> Result<Option<UniqueAddress>, BantoError> {
+    let row: Option<(i64, String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(pool)
         .await
         .map_err(banto_storage::storage_error)?;
 
-    let Some((conn_name, protocol)) = row else {
-        return Ok(false);
+    let Some((conn_id, conn_name, protocol)) = row else {
+        return Ok(None);
     };
     placement_verdict(&conn_name, &protocol, input)?;
-    if !is_hub_plc_tag(&protocol, input) {
-        return Ok(false);
-    }
-    let taken: Option<i64> = sqlx::query_scalar(HUB_EXTERNAL_NAME_TAKEN_SQL)
-        .bind(HUB_PROTOCOL)
-        .bind(input.address.trim())
-        .bind(exclude_tag_id)
-        .bind(exclude_tag_id)
+    let Some(unique) = unique_address(conn_id, &protocol, input) else {
+        return Ok(None);
+    };
+    let taken: Option<i64> = unique
+        .taken_query(exclude_tag_id)
         .fetch_optional(pool)
         .await
         .map_err(banto_storage::storage_error)?;
-    hub_external_name_verdict(input, taken)?;
-    Ok(true)
+    unique.verdict(taken)?;
+    Ok(Some(unique))
 }
 
 /// #383 段階3 P4（2026-10-11、Codex の指摘）: Hub 経由のタグの外部名は
@@ -1128,32 +1185,119 @@ const HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE: &str =
 pub(crate) const HUB_EXTERNAL_NAME_TRIGGER_MESSAGE: &str =
     "banto_tags: hub external name already registered";
 
-/// `plc` タグが `hub` 接続の下にあるか（外部名の一意性を調べる対象）。
-fn is_hub_plc_tag(protocol: &str, input: &TagInput) -> bool {
-    protocol == HUB_PROTOCOL && input.tag_kind == PLC_TAG_KIND
+/// R2a-2a（docs/banto-hub-ingest-design.md §3.3）: `push` 接続の下の `plc` タグの
+/// キーは**接続ごとに**一意（1 つのキーが 2 本のタグに割れると、送られた値が
+/// どちらに入ったか分からない）。Hub の外部名と同じく、書き込みの前の照会と
+/// migration `0024_tags_push_key_unique.sql` のトリガの二重。`exclude_tag_id` の
+/// 意味も [`HUB_EXTERNAL_NAME_TAKEN_SQL`] と同じ。
+const PUSH_KEY_TAKEN_SQL: &str = "SELECT t.id FROM tags t \
+     JOIN collection_groups g ON g.id = t.collection_group_id \
+     WHERE g.plc_connection_id = ? AND t.tag_kind = 'plc' AND t.address = ? \
+     AND (? IS NULL OR t.id <> ?) LIMIT 1";
+
+/// キーが重複したときのメッセージ（接続の中で）。
+fn push_key_taken_message(key: &str) -> String {
+    format!("キー {key} はこの接続で既に使われています（同じ接続の中でキーは一意です）")
 }
 
-fn hub_external_name_verdict(input: &TagInput, taken: Option<i64>) -> Result<(), BantoError> {
-    match taken {
-        Some(_) => Err(BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "address".to_string(),
-                message: hub_external_name_taken_message(input.address.trim()),
-            }],
+/// トリガ（migration 0024）で断ったとき（検査と書き込みの間に割り込まれた）の文言。
+const PUSH_KEY_TAKEN_RACE_MESSAGE: &str =
+    "このキーはこの接続で既に使われています（同じ接続の中でキーは一意です）";
+
+/// migration 0024 のトリガが `RAISE(ABORT, ...)` で返す文言（[`map_tag_write_error`]
+/// が `address` の検証エラーに載せ替える）。
+pub(crate) const PUSH_KEY_TRIGGER_MESSAGE: &str = "banto_tags: push key already registered";
+
+const DUPLICATE_PUSH_KEY_IN_BATCH: &str = "リクエスト内の他の行と同じ接続・同じキーを指しています";
+
+/// 一意でなければならないタグの `address`（[`unique_address`]）。同じ値どうしが
+/// 衝突する: Hub の外部名はレジストリ全体、`push` のキーは接続の中。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum UniqueAddress {
+    /// `hub` 接続の下の `plc` タグの外部名（#383 段階3 P4）。
+    Hub(String),
+    /// `push` 接続の下の `plc` タグのキー（R2a-2a）。
+    Push { connection_id: i64, key: String },
+}
+
+/// タグの `address` が一意性の対象なら、その範囲と値（前後の空白を除いた形）。
+fn unique_address(conn_id: i64, protocol: &str, input: &TagInput) -> Option<UniqueAddress> {
+    if input.tag_kind != PLC_TAG_KIND {
+        return None;
+    }
+    let address = input.address.trim().to_string();
+    match protocol {
+        HUB_PROTOCOL => Some(UniqueAddress::Hub(address)),
+        PUSH_PROTOCOL => Some(UniqueAddress::Push {
+            connection_id: conn_id,
+            key: address,
         }),
-        None => Ok(()),
+        _ => None,
     }
 }
 
-/// [`map_write_error`] に、migration 0020 のトリガ（Hub の外部名の一意性）の
-/// 拒否を `address` の検証エラーとして足したもの。タグの書き込みはすべてこれを使う。
+impl UniqueAddress {
+    /// 同じ値を持つ別のタグの id を引く照会（無ければ行なし）。
+    fn taken_query(
+        &self,
+        exclude_tag_id: Option<i64>,
+    ) -> sqlx::query::QueryScalar<'_, Sqlite, i64, sqlx::sqlite::SqliteArguments> {
+        match self {
+            UniqueAddress::Hub(address) => sqlx::query_scalar(HUB_EXTERNAL_NAME_TAKEN_SQL)
+                .bind(HUB_PROTOCOL)
+                .bind(address.as_str())
+                .bind(exclude_tag_id)
+                .bind(exclude_tag_id),
+            UniqueAddress::Push { connection_id, key } => sqlx::query_scalar(PUSH_KEY_TAKEN_SQL)
+                .bind(*connection_id)
+                .bind(key.as_str())
+                .bind(exclude_tag_id)
+                .bind(exclude_tag_id),
+        }
+    }
+
+    fn verdict(&self, taken: Option<i64>) -> Result<(), BantoError> {
+        if taken.is_none() {
+            return Ok(());
+        }
+        let message = match self {
+            UniqueAddress::Hub(address) => hub_external_name_taken_message(address),
+            UniqueAddress::Push { key, .. } => push_key_taken_message(key),
+        };
+        Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "address".to_string(),
+                message,
+            }],
+        })
+    }
+
+    /// バッチの中で同じ値の行が重なったときの文言。
+    fn duplicate_in_batch_message(&self) -> &'static str {
+        match self {
+            UniqueAddress::Hub(_) => DUPLICATE_HUB_ADDRESS_IN_BATCH,
+            UniqueAddress::Push { .. } => DUPLICATE_PUSH_KEY_IN_BATCH,
+        }
+    }
+}
+
+/// [`map_write_error`] に、migration 0020 のトリガ（Hub の外部名の一意性）と
+/// 0024 のトリガ（`push` のキーの接続内の一意性）の拒否を `address` の検証エラー
+/// として足したもの。タグの書き込みはすべてこれを使う。
 fn map_tag_write_error(err: sqlx::Error) -> BantoError {
     if let Some(db_err) = err.as_database_error() {
-        if db_err.message().contains(HUB_EXTERNAL_NAME_TRIGGER_MESSAGE) {
+        let race_message = if db_err.message().contains(HUB_EXTERNAL_NAME_TRIGGER_MESSAGE) {
+            Some(HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE)
+        } else if db_err.message().contains(PUSH_KEY_TRIGGER_MESSAGE) {
+            Some(PUSH_KEY_TAKEN_RACE_MESSAGE)
+        } else {
+            None
+        };
+        if let Some(message) = race_message {
             return BantoError::Validation {
                 field_errors: vec![FieldError {
                     field: "address".to_string(),
-                    message: HUB_EXTERNAL_NAME_TAKEN_RACE_MESSAGE.to_string(),
+                    message: message.to_string(),
                 }],
             };
         }
@@ -1167,14 +1311,15 @@ fn map_tag_write_error(err: sqlx::Error) -> BantoError {
     )
 }
 
-/// バッチの中で、Hub 経由のタグ同士が同じ外部名を指している行（**純関数**）。
-/// `hub_rows[i]` が `Some(address)` の行だけを比べ、重なった行の位置を全部返す。
-fn duplicate_hub_addresses(hub_rows: &[Option<String>]) -> Vec<usize> {
-    let mut first_seen: HashMap<&str, usize> = HashMap::new();
+/// バッチの中で、一意でなければならない `address`（Hub の外部名・`push` の
+/// 接続ごとのキー、[`UniqueAddress`]）が重なっている行（**純関数**）。
+/// `unique_rows[i]` が `Some` の行だけを比べ、重なった行の位置を全部返す。
+fn duplicate_unique_addresses(unique_rows: &[Option<UniqueAddress>]) -> Vec<usize> {
+    let mut first_seen: HashMap<&UniqueAddress, usize> = HashMap::new();
     let mut dupes: Vec<usize> = Vec::new();
-    for (index, address) in hub_rows.iter().enumerate() {
+    for (index, address) in unique_rows.iter().enumerate() {
         let Some(address) = address else { continue };
-        match first_seen.get(address.as_str()) {
+        match first_seen.get(address) {
             Some(&first) => {
                 if !dupes.contains(&first) {
                     dupes.push(first);
@@ -1182,7 +1327,7 @@ fn duplicate_hub_addresses(hub_rows: &[Option<String>]) -> Vec<usize> {
                 dupes.push(index);
             }
             None => {
-                first_seen.insert(address.as_str(), index);
+                first_seen.insert(address, index);
             }
         }
     }
@@ -1200,29 +1345,26 @@ async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
-) -> Result<bool, BantoError> {
-    let row: Option<(String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
+) -> Result<Option<UniqueAddress>, BantoError> {
+    let row: Option<(i64, String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
-    let Some((conn_name, protocol)) = row else {
-        return Ok(false);
+    let Some((conn_id, conn_name, protocol)) = row else {
+        return Ok(None);
     };
     placement_verdict(&conn_name, &protocol, input)?;
-    if !is_hub_plc_tag(&protocol, input) {
-        return Ok(false);
-    }
-    let taken: Option<i64> = sqlx::query_scalar(HUB_EXTERNAL_NAME_TAKEN_SQL)
-        .bind(HUB_PROTOCOL)
-        .bind(input.address.trim())
-        .bind(exclude_tag_id)
-        .bind(exclude_tag_id)
+    let Some(unique) = unique_address(conn_id, &protocol, input) else {
+        return Ok(None);
+    };
+    let taken: Option<i64> = unique
+        .taken_query(exclude_tag_id)
         .fetch_optional(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
-    hub_external_name_verdict(input, taken)?;
-    Ok(true)
+    unique.verdict(taken)?;
+    Ok(Some(unique))
 }
 
 fn column_map() -> ColumnMap {
@@ -1852,8 +1994,8 @@ impl TagService {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); updates.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(updates.len());
 
-        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
-        let mut hub_rows: Vec<Option<String>> = vec![None; updates.len()];
+        // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; updates.len()];
         for (index, (id, input)) in updates.iter().enumerate() {
             match validate_tag_input(input) {
                 Ok(value) => validated.push(Some(value)),
@@ -1864,8 +2006,7 @@ impl TagService {
                 Err(other) => return Err(other),
             }
             match validate_tag_kind_placement_tx(connection, input, Some(*id)).await {
-                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
-                Ok(false) => {}
+                Ok(unique) => hub_rows[index] = unique,
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -1873,10 +2014,14 @@ impl TagService {
             }
         }
 
-        for index in duplicate_hub_addresses(&hub_rows) {
+        for index in duplicate_unique_addresses(&hub_rows) {
+            let message = hub_rows[index].as_ref().map_or(
+                DUPLICATE_HUB_ADDRESS_IN_BATCH,
+                UniqueAddress::duplicate_in_batch_message,
+            );
             row_errors[index].push(FieldError {
                 field: "address".to_string(),
-                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+                message: message.to_string(),
             });
         }
 
@@ -2256,8 +2401,8 @@ impl TagService {
     ) -> Result<BatchTagOutcome, BantoError> {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
-        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
-        let mut hub_rows: Vec<Option<String>> = vec![None; inputs.len()];
+        // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; inputs.len()];
 
         for (index, input) in inputs.iter().enumerate() {
             match validate_tag_input(input) {
@@ -2269,8 +2414,7 @@ impl TagService {
                 Err(other) => return Err(other),
             }
             match validate_tag_kind_placement_tx(connection, input, None).await {
-                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
-                Ok(false) => {}
+                Ok(unique) => hub_rows[index] = unique,
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -2278,10 +2422,14 @@ impl TagService {
             }
         }
 
-        for index in duplicate_hub_addresses(&hub_rows) {
+        for index in duplicate_unique_addresses(&hub_rows) {
+            let message = hub_rows[index].as_ref().map_or(
+                DUPLICATE_HUB_ADDRESS_IN_BATCH,
+                UniqueAddress::duplicate_in_batch_message,
+            );
             row_errors[index].push(FieldError {
                 field: "address".to_string(),
-                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+                message: message.to_string(),
             });
         }
 
@@ -2455,8 +2603,8 @@ impl TagService {
     ) -> Result<BatchTagOutcome, BantoError> {
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
-        // #383 段階3 P4: Hub 経由のタグの外部名（行ごと。バッチ内の重複を下で調べる）。
-        let mut hub_rows: Vec<Option<String>> = vec![None; inputs.len()];
+        // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
+        let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; inputs.len()];
 
         for (index, input) in inputs.iter().enumerate() {
             match validate_tag_input(input) {
@@ -2468,8 +2616,7 @@ impl TagService {
                 Err(other) => return Err(other),
             }
             match validate_tag_kind_placement(&self.pool, input, None).await {
-                Ok(true) => hub_rows[index] = Some(input.address.trim().to_string()),
-                Ok(false) => {}
+                Ok(unique) => hub_rows[index] = unique,
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -2477,10 +2624,14 @@ impl TagService {
             }
         }
 
-        for index in duplicate_hub_addresses(&hub_rows) {
+        for index in duplicate_unique_addresses(&hub_rows) {
+            let message = hub_rows[index].as_ref().map_or(
+                DUPLICATE_HUB_ADDRESS_IN_BATCH,
+                UniqueAddress::duplicate_in_batch_message,
+            );
             row_errors[index].push(FieldError {
                 field: "address".to_string(),
-                message: DUPLICATE_HUB_ADDRESS_IN_BATCH.to_string(),
+                message: message.to_string(),
             });
         }
 
@@ -2649,6 +2800,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -3256,6 +3408,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("slmp connection should be creatable");
@@ -3945,6 +4098,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("virtual connection should be creatable");
@@ -5879,6 +6033,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -6687,6 +6842,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .expect("hub connection should be creatable");
@@ -7131,5 +7287,388 @@ mod tests {
         input.data_type = "f64".to_string();
         let errors = field_errors_of(svc.create(input).await.unwrap_err());
         assert_eq!(errors[0].field, "dataType");
+    }
+
+    // --- R2a-2a: tags under a "push" connection --------------------------
+
+    /// A new `push` connection named `name` with one group; returns the group id.
+    async fn push_group(pool: &SqlitePool, name: &str) -> i64 {
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: name.to_string(),
+                protocol: PUSH_PROTOCOL.to_string(),
+                host: String::new(),
+                port: 0,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: String::new(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                password: None,
+                settings: None,
+            })
+            .await
+            .expect("push connection should be creatable");
+        push_group_under(pool, conn.id, &format!("{name}-g")).await
+    }
+
+    async fn push_group_under(pool: &SqlitePool, connection_id: i64, name: &str) -> i64 {
+        CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: name.to_string(),
+                plc_connection_id: connection_id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: false,
+                query_sql: None,
+            })
+            .await
+            .expect("group under the push connection should be creatable")
+            .id
+    }
+
+    fn expect_key_taken(err: BantoError) {
+        let errors = field_errors_of(err);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "address");
+        assert!(
+            errors[0].message.contains("既に使われています"),
+            "{}",
+            errors[0].message
+        );
+    }
+
+    /// §3.3 の表: キーの規則・`string` 不可・`writable` 不可・恒等でないスケーリング
+    /// 不可を一度に全部返す。64bit 型と bit は通り、キーは前後の空白を除いて保存。
+    #[tokio::test]
+    async fn push_tag_rules() {
+        let (svc, _) = setup().await;
+        let group = push_group(&svc.pool, "Bridge1").await;
+
+        let mut bad = hub_tag("Bad", group, &"k".repeat(257));
+        bad.writable = true;
+        bad.raw_lo = Some(0.0);
+        bad.raw_hi = Some(100.0);
+        bad.eng_lo = Some(0.0);
+        bad.eng_hi = Some(10.0);
+        let fields: Vec<String> = field_errors_of(svc.create(bad).await.unwrap_err())
+            .into_iter()
+            .map(|e| e.field)
+            .collect();
+        assert_eq!(fields, ["address", "writable", "scaling"]);
+
+        let mut text = hub_tag("Text", group, "k.text");
+        text.data_type = STRING_DATA_TYPE.to_string();
+        text.string_length = Some(4);
+        let errors = field_errors_of(svc.create(text).await.unwrap_err());
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].field, "dataType");
+
+        let errors = field_errors_of(
+            svc.create(hub_tag("Ctl", group, "a\u{7}b"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors[0].field, "address");
+
+        // 64bit 型も可（Modbus 限定の規則の外）、恒等のスケーリングは通る、キーは
+        // 前後の空白を除いて保存、大文字小文字はそのまま。
+        let mut wide = hub_tag("Wide", group, "  Line1/Temp ");
+        wide.data_type = "f64".to_string();
+        wide.raw_lo = Some(0.0);
+        wide.raw_hi = Some(1.0);
+        wide.eng_lo = Some(0.0);
+        wide.eng_hi = Some(1.0);
+        let created = svc.create(wide).await.expect("f64 push tag");
+        assert_eq!(created.address, "Line1/Temp");
+        let mut bit = hub_tag("Run", group, "line1/temp");
+        bit.data_type = "bit".to_string();
+        svc.create(bit).await.expect("case differs -> another key");
+
+        // computed / internal / db は push 接続の下に置けない（既存の種別の規則）。
+        let mut db = hub_tag("Db", group, "v");
+        db.tag_kind = DB_TAG_KIND.to_string();
+        let errors = field_errors_of(svc.create(db).await.unwrap_err());
+        assert_eq!(errors[0].field, "tagKind");
+    }
+
+    /// キーは**接続ごとに**一意（§3.3）: 同じ接続の別のグループでも断り、別の接続
+    /// なら同じキーを使える。create / create_tx / update / update_tx のどれでも。
+    #[tokio::test]
+    async fn a_push_key_is_unique_per_connection_on_single_writes() {
+        let (svc, plc_group) = setup().await;
+        let group = push_group(&svc.pool, "Bridge1").await;
+        let conn_id: i64 =
+            sqlx::query_scalar("SELECT plc_connection_id FROM collection_groups WHERE id = ?")
+                .bind(group)
+                .fetch_one(&svc.pool)
+                .await
+                .unwrap();
+        let sibling = push_group_under(&svc.pool, conn_id, "Bridge1-g2").await;
+        let other = push_group(&svc.pool, "Bridge2").await;
+
+        let first = svc.create(hub_tag("A", group, "line1.temp")).await.unwrap();
+        expect_key_taken(
+            svc.create(hub_tag("A2", sibling, "line1.temp"))
+                .await
+                .unwrap_err(),
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        expect_key_taken(
+            svc.create_tx(&mut tx, hub_tag("A3", sibling, " line1.temp "))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+        svc.create(hub_tag("A", other, "line1.temp"))
+            .await
+            .expect("another push connection may reuse the key");
+
+        svc.update(first.id, hub_tag("A-renamed", group, "line1.temp"))
+            .await
+            .expect("own key");
+        let second = svc
+            .create(hub_tag("B", sibling, "line1.run"))
+            .await
+            .unwrap();
+        expect_key_taken(
+            svc.update(second.id, hub_tag("B", sibling, "line1.temp"))
+                .await
+                .unwrap_err(),
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc
+            .update_tx(&mut tx, second.id, hub_tag("B", sibling, "line1.temp"))
+            .await
+            .unwrap_err()
+        {
+            TagUpdateError::Banto(err) => expect_key_taken(err),
+            other => panic!("expected Banto(Validation), got {other:?}"),
+        }
+        drop(tx);
+
+        // A PLC address with the same text elsewhere is unaffected.
+        let mut plc = sample_input("P", plc_group);
+        plc.address = "40001".to_string();
+        svc.create(plc).await.unwrap();
+    }
+
+    /// The batch paths report push-key duplicates per row (against existing
+    /// tags and within the request), scoped to the connection: the same key
+    /// under two push connections in one batch is fine.
+    #[tokio::test]
+    async fn a_push_key_is_unique_per_connection_in_batches() {
+        let (svc, _) = setup().await;
+        let group = push_group(&svc.pool, "Bridge1").await;
+        let other = push_group(&svc.pool, "Bridge2").await;
+        svc.create(hub_tag("A", group, "k.a")).await.unwrap();
+        let by_index = |errors: Vec<BatchTagError>| -> Vec<(usize, Vec<String>)> {
+            errors
+                .into_iter()
+                .map(|e| {
+                    (
+                        e.index,
+                        e.field_errors.into_iter().map(|f| f.message).collect(),
+                    )
+                })
+                .collect()
+        };
+        let rows = vec![
+            hub_tag("X", group, "k.a"),
+            hub_tag("Y", group, "k.y"),
+            hub_tag("Z", group, "k.y"),
+            hub_tag("Y", other, "k.y"),
+            hub_tag("OK", group, "k.ok"),
+        ];
+        let check = |errors: Vec<BatchTagError>| {
+            let got = by_index(errors);
+            assert_eq!(
+                got.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+                [0, 1, 2],
+                "{got:?}"
+            );
+            assert!(got[0].1[0].contains("既に使われています"), "{got:?}");
+            assert_eq!(got[1].1, [DUPLICATE_PUSH_KEY_IN_BATCH]);
+            assert_eq!(got[2].1, [DUPLICATE_PUSH_KEY_IN_BATCH]);
+        };
+        match svc.create_batch(rows.clone(), true).await.unwrap() {
+            BatchTagOutcome::Invalid(errors) => check(errors),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc.create_batch_tx(&mut tx, &rows).await.unwrap() {
+            BatchTagOutcome::Invalid(errors) => check(errors),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        drop(tx);
+
+        let b = svc.create(hub_tag("B", group, "k.b")).await.unwrap();
+        let mut tx = svc.pool.begin().await.unwrap();
+        match svc
+            .update_batch_tx(&mut tx, &[(b.id, hub_tag("B", group, "k.a"))])
+            .await
+            .unwrap()
+        {
+            BatchTagUpdateOutcome::Invalid(errors) => {
+                assert_eq!(errors[0].id, b.id);
+                assert_eq!(errors[0].field_errors[0].field, "address");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        drop(tx);
+    }
+
+    /// Migration 0024's triggers refuse a duplicate key under the same push
+    /// connection even when the application check is bypassed, allow it
+    /// under another connection, and the error maps to the `address` field.
+    #[tokio::test]
+    async fn the_push_trigger_refuses_a_duplicate_that_bypasses_the_check() {
+        let (svc, _) = setup().await;
+        let group = push_group(&svc.pool, "Bridge1").await;
+        let other = push_group(&svc.pool, "Bridge2").await;
+        let a = svc.create(hub_tag("A", group, "k.a")).await.unwrap();
+        let b = svc.create(hub_tag("B", group, "k.b")).await.unwrap();
+        let insert_sql = "INSERT INTO tags (name, collection_group_id, address, data_type, \
+             string_encoding, decimals, enabled, writable, tag_kind, retain) \
+             VALUES (?, ?, 'k.a', 'f32', 'utf8', 0, 1, 0, 'plc', 0)";
+
+        let insert = sqlx::query(insert_sql)
+            .bind("A2")
+            .bind(group)
+            .execute(&svc.pool)
+            .await
+            .unwrap_err();
+        expect_key_taken(map_tag_write_error(insert));
+        sqlx::query(insert_sql)
+            .bind("A")
+            .bind(other)
+            .execute(&svc.pool)
+            .await
+            .expect("another push connection may use the same key");
+
+        let update = sqlx::query("UPDATE tags SET address = 'k.a' WHERE id = ?")
+            .bind(b.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap_err();
+        assert!(
+            update
+                .as_database_error()
+                .is_some_and(|e| e.message().contains(PUSH_KEY_TRIGGER_MESSAGE)),
+            "{update:?}"
+        );
+        sqlx::query("UPDATE tags SET address = 'k.a' WHERE id = ?")
+            .bind(a.id)
+            .execute(&svc.pool)
+            .await
+            .expect("own key is not a duplicate");
+    }
+
+    #[test]
+    fn duplicate_unique_addresses_scopes_push_keys_by_connection() {
+        let hub = |a: &str| Some(UniqueAddress::Hub(a.to_string()));
+        let push = |c: i64, k: &str| {
+            Some(UniqueAddress::Push {
+                connection_id: c,
+                key: k.to_string(),
+            })
+        };
+        let rows = vec![
+            hub("x"),
+            push(1, "x"),
+            push(2, "x"),
+            None,
+            push(1, "x"),
+            hub("x"),
+        ];
+        assert_eq!(duplicate_unique_addresses(&rows), vec![1, 4, 0, 5]);
+    }
+
+    /// PR #753 review P2, service side: a group that has tags cannot move
+    /// into, out of, or between push connections (update and update_tx), so
+    /// the reviewer's repro - B's group with "temperature" moved under A,
+    /// which already has "temperature" - cannot happen, and PLC tags that
+    /// break the push rules cannot ride in. Empty groups move freely and an
+    /// in-place update of a push group is not a move.
+    #[tokio::test]
+    async fn groups_with_tags_cannot_move_into_out_of_or_between_push_connections() {
+        let (svc, plc_group) = setup().await;
+        let groups = CollectionGroupService::new(svc.pool.clone());
+        let ga = push_group(&svc.pool, "A").await;
+        let gb = push_group(&svc.pool, "B").await;
+        svc.create(hub_tag("t", ga, "temperature")).await.unwrap();
+        svc.create(hub_tag("t", gb, "temperature")).await.unwrap();
+        let conn_of = |group: i64| {
+            let pool = svc.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT plc_connection_id FROM collection_groups WHERE id = ?",
+                )
+                .bind(group)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        let a = conn_of(ga).await;
+        let b = conn_of(gb).await;
+        let plc_conn = conn_of(plc_group).await;
+        let input = |name: &str, conn: i64| CollectionGroupInput {
+            name: name.to_string(),
+            plc_connection_id: conn,
+            period_ms: 1_000,
+            enabled: true,
+            default_writable: false,
+            query_sql: None,
+        };
+        let expect_move_refused = |err: BantoError| {
+            let errors = field_errors_of(err);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].field, "plcConnectionId");
+            assert!(errors[0].message.contains("push"), "{}", errors[0].message);
+        };
+
+        // push -> push (the repro), with update and update_tx.
+        expect_move_refused(groups.update(gb, input("B-g", a)).await.unwrap_err());
+        let mut tx = svc.pool.begin().await.unwrap();
+        expect_move_refused(
+            groups
+                .update_tx(&mut tx, gb, input("B-g", a))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+        // push -> modbus and modbus -> push (a writable/scaled PLC tag would ride in).
+        expect_move_refused(groups.update(gb, input("B-g", plc_conn)).await.unwrap_err());
+        let mut plc_tag = sample_input("w", plc_group);
+        plc_tag.writable = true;
+        svc.create(plc_tag).await.unwrap();
+        expect_move_refused(groups.update(plc_group, input("G1", a)).await.unwrap_err());
+        let keys_in_a: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM tags t JOIN collection_groups g ON g.id = t.collection_group_id \
+             WHERE g.plc_connection_id = ?",
+        )
+        .bind(a)
+        .fetch_one(&svc.pool)
+        .await
+        .unwrap();
+        assert_eq!(keys_in_a, 1);
+
+        // In place is not a move; an empty group may move anywhere.
+        groups
+            .update(gb, input("B-renamed", b))
+            .await
+            .expect("same connection");
+        let empty = push_group_under(&svc.pool, b, "empty").await;
+        groups
+            .update(empty, input("empty", a))
+            .await
+            .expect("empty push -> push");
+        groups
+            .update(empty, input("empty", plc_conn))
+            .await
+            .expect("empty push -> modbus");
     }
 }

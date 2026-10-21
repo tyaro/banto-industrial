@@ -86,6 +86,7 @@ fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
         database: None,
         username: None,
         password: None,
+        settings: None,
     }
 }
 
@@ -2289,6 +2290,7 @@ async fn update_connection_password_tri_state_semantics() {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: Some("original-secret".to_string()),
+            settings: None,
         })
         .await
         .unwrap();
@@ -2413,6 +2415,7 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
             password,
+            settings: None,
         })
         .await
         .unwrap();
@@ -2492,6 +2495,7 @@ async fn create_group_under_a_postgres_connection_requires_query_sql() {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: None,
+            settings: None,
         })
         .await
         .expect("postgres connection");
@@ -4927,6 +4931,7 @@ fn postgres_conn_input(name: &str) -> PlcConnectionInput {
         database: Some("erp".to_string()),
         username: Some("reader".to_string()),
         password: Some("s3cret".to_string()),
+        settings: None,
     }
 }
 

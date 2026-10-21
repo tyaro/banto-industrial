@@ -179,6 +179,11 @@
 //!   `banto-service-elev`へ移した（アクション・引数の検証・手順・文言は
 //!   ここに残る。挙動は不変）
 //!
+//! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
+//!   （外の送り手が Hub へ値を送り込む接続）。R2a-2a の時点では静的な部分の
+//!   [`ingest::driver::PushDriver`]（`DriverBase`、レジストリには登録しない）だけ。
+//!   受信（`IngestHub`）は R2a-1c、送信口は R2a-2c / R2a-2d
+//!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み
 //! 経路（`write:` スコープの受理・保存は T0-2 で実装済み、実際の書き込み
@@ -204,6 +209,7 @@ pub mod http_hub_health;
 pub mod hub;
 pub mod hub_health;
 pub mod hub_log;
+pub mod ingest;
 pub mod mcp;
 pub mod mqtt;
 pub mod opcua;

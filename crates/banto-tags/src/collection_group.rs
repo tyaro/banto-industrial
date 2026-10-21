@@ -26,7 +26,7 @@ use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
-use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL};
+use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL, PUSH_PROTOCOL};
 use crate::support::{map_write_error, max_length_message, required_message};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
@@ -196,23 +196,8 @@ fn validate_query_sql(
             let Some(sql) = trimmed else {
                 return Err(error(required_message()));
             };
-            if sql.chars().count() > MAX_QUERY_SQL_LEN {
-                return Err(error(max_length_message(MAX_QUERY_SQL_LEN)));
-            }
-            if sql.contains(';') {
-                return Err(error(
-                    "SQL は単文で指定してください（';' は使用できません）".to_string(),
-                ));
-            }
-            let first_keyword: String = sql
-                .chars()
-                .take_while(|c| c.is_ascii_alphabetic())
-                .collect::<String>()
-                .to_ascii_uppercase();
-            if first_keyword != "SELECT" && first_keyword != "WITH" {
-                return Err(error(
-                    "SQL は SELECT または WITH で始まる必要があります".to_string(),
-                ));
+            if let Some(message) = query_sql_error(sql) {
+                return Err(error(message));
             }
             Ok(Some(sql.to_string()))
         }
@@ -227,10 +212,38 @@ fn validate_query_sql(
     }
 }
 
+/// [`validate_query_sql`] の SQL の形の規則（純関数）: 前後の空白を除いて空でない・
+/// [`MAX_QUERY_SQL_LEN`] 文字以内・`;` なし・先頭のキーワードが `SELECT` か `WITH`。
+/// 破っていればその文言。R2a-2a で `push` のブリッジのクエリ
+/// （`crate::push::validate_push_settings`、ingest-design §3.2「`validate_query_sql`
+/// と同じ規則」）と共有するために切り出した。
+pub(crate) fn query_sql_error(sql: &str) -> Option<String> {
+    let sql = sql.trim();
+    if sql.is_empty() {
+        return Some(required_message());
+    }
+    if sql.chars().count() > MAX_QUERY_SQL_LEN {
+        return Some(max_length_message(MAX_QUERY_SQL_LEN));
+    }
+    if sql.contains(';') {
+        return Some("SQL は単文で指定してください（';' は使用できません）".to_string());
+    }
+    let first_keyword: String = sql
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if first_keyword != "SELECT" && first_keyword != "WITH" {
+        return Some("SQL は SELECT または WITH で始まる必要があります".to_string());
+    }
+    None
+}
+
 /// #383 段階3 P2（`crate::plc_connection` の "`\"hub\"`" 節）: グループの現在の
-/// 接続のプロトコルと、配下のタグ数。[`hub_group_move_error`] の入力。
+/// 接続のプロトコルと、配下のタグ数。[`hub_group_move_error`] の入力。R2a-2a で
+/// 今の接続の id を足した（[`push_group_move_error`] の入力）。
 const GROUP_PROTOCOL_AND_TAG_COUNT_SQL: &str = "SELECT pc.protocol, \
-     (SELECT COUNT(*) FROM tags WHERE collection_group_id = cg.id) \
+     (SELECT COUNT(*) FROM tags WHERE collection_group_id = cg.id), cg.plc_connection_id \
      FROM collection_groups cg JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
      WHERE cg.id = ?";
 
@@ -258,6 +271,41 @@ fn hub_group_move_error(
             message: format!(
                 "このグループにはタグが{tag_count}件あるため、Hub 接続と他の接続の間で移せません\
                  （Hub 経由のタグのアドレスは外部名で、PLC のアドレスとは互換がありません）"
+            ),
+        }],
+    })
+}
+
+/// R2a-2a（PR #753 のレビュー P2）: タグを持つグループを、`push` 接続へ・`push`
+/// 接続から**別の接続へ**移すことを拒否する（`push` 接続どうしの移動も含む）。
+/// `push` のタグのキーは**接続ごとに**一意（`crate::tag`、migration `0024`）で、
+/// `push` のタグだけの規則（`string`・書き込み可・スケーリング不可）もある。グループを
+/// 移すとタグの書き込みを通らずに接続が変わるので、移動先で重複したキーや規則に
+/// 合わないタグが生まれうる。移動先の接続全体を検査し直す代わりに、`hub` と同じく
+/// 移動そのものを断る（空のグループは移せる。同じ接続の中での更新は移動ではない）。
+/// DB 側の最後の砦は `0024` の `collection_groups_push_key_unique_move` トリガ。
+///
+/// `current` は (今の接続のプロトコル, 配下のタグ数, 今の接続の id)、`None` は
+/// グループが存在しない。`new` は (移動先の接続の id, そのプロトコル)、プロトコルが
+/// `None` は接続が存在しない（FK が拒否する）。
+fn push_group_move_error(
+    current: Option<(&str, i64, i64)>,
+    new_connection_id: i64,
+    new_protocol: Option<&str>,
+) -> Option<BantoError> {
+    let (current_protocol, tag_count, current_connection_id) = current?;
+    let new_protocol = new_protocol?;
+    let touches_push = current_protocol == PUSH_PROTOCOL || new_protocol == PUSH_PROTOCOL;
+    if !touches_push || current_connection_id == new_connection_id || tag_count == 0 {
+        return None;
+    }
+    Some(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: "plcConnectionId".to_string(),
+            message: format!(
+                "このグループにはタグが{tag_count}件あるため、push 接続へ・push 接続から別の接続へ\
+                 移せません（push のタグのキーは接続ごとに一意で、移すと重複や規則に合わない\
+                 タグが生まれうるため）"
             ),
         }],
     })
@@ -435,7 +483,7 @@ impl CollectionGroupService {
                 .map_err(banto_storage::storage_error)?;
         let stored_query_sql =
             validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
-        let current: Option<(String, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
+        let current: Option<(String, i64, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
             .bind(id)
             .fetch_optional(&self.pool)
             .await
@@ -443,7 +491,16 @@ impl CollectionGroupService {
         if let Some(err) = hub_group_move_error(
             current
                 .as_ref()
-                .map(|(protocol, count)| (protocol.as_str(), *count)),
+                .map(|(protocol, count, _)| (protocol.as_str(), *count)),
+            existing_protocol.as_deref(),
+        ) {
+            return Err(err);
+        }
+        if let Some(err) = push_group_move_error(
+            current
+                .as_ref()
+                .map(|(protocol, count, conn)| (protocol.as_str(), *count, *conn)),
+            input.plc_connection_id,
             existing_protocol.as_deref(),
         ) {
             return Err(err);
@@ -488,7 +545,7 @@ impl CollectionGroupService {
                 .map_err(banto_storage::storage_error)?;
         let stored_query_sql =
             validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
-        let current: Option<(String, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
+        let current: Option<(String, i64, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
             .bind(id)
             .fetch_optional(&mut *connection)
             .await
@@ -496,7 +553,16 @@ impl CollectionGroupService {
         if let Some(err) = hub_group_move_error(
             current
                 .as_ref()
-                .map(|(protocol, count)| (protocol.as_str(), *count)),
+                .map(|(protocol, count, _)| (protocol.as_str(), *count)),
+            existing_protocol.as_deref(),
+        ) {
+            return Err(err);
+        }
+        if let Some(err) = push_group_move_error(
+            current
+                .as_ref()
+                .map(|(protocol, count, conn)| (protocol.as_str(), *count, *conn)),
+            input.plc_connection_id,
             existing_protocol.as_deref(),
         ) {
             return Err(err);
@@ -687,6 +753,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap();
@@ -720,6 +787,7 @@ mod tests {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: None,
+            settings: None,
         }
     }
 
@@ -868,6 +936,7 @@ mod tests {
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             })
             .await
             .unwrap()
@@ -908,6 +977,7 @@ mod tests {
                         database: None,
                         username: None,
                         password: None,
+                        settings: None,
                     },
                 )
                 .await
@@ -1489,6 +1559,28 @@ mod tests {
         }
     }
 
+    #[test]
+    fn push_group_move_error_table() {
+        type Case<'a> = (Option<(&'a str, i64, i64)>, i64, Option<&'a str>, bool);
+        let cases: &[Case] = &[
+            (Some(("push", 1, 1)), 2, Some("push"), true),
+            (Some(("modbus-tcp", 1, 1)), 2, Some("push"), true),
+            (Some(("push", 3, 1)), 2, Some("slmp"), true),
+            (Some(("push", 3, 1)), 1, Some("push"), false),
+            (Some(("push", 0, 1)), 2, Some("push"), false),
+            (Some(("modbus-tcp", 3, 1)), 2, Some("slmp"), false),
+            (None, 2, Some("push"), false),
+            (Some(("push", 3, 1)), 2, None, false),
+        ];
+        for &(current, new_id, new, refused) in cases {
+            assert_eq!(
+                push_group_move_error(current, new_id, new).is_some(),
+                refused,
+                "{current:?} -> {new_id}/{new:?}"
+            );
+        }
+    }
+
     // --- migration 0022 (collection_groups: 全体一意 → 接続内一意) ----------
 
     const TAG_ROW_SQL: &str = "SELECT quote(id) || '|' || quote(name) || '|' || \
@@ -1572,7 +1664,11 @@ mod tests {
         assert_eq!(groups_before.len(), 3);
         assert_eq!(tags_before.len(), 3);
 
-        migrate(&pool).await.expect("0022 should apply");
+        // Up to 0022 only (not `crate::migrate`): the object list below is
+        // 0022's world. Later migrations add their own objects (0024's push
+        // triggers) and are checked by their own tests
+        // (`plc_connection`'s `migration_0023_and_0024_*`).
+        migrator.run_to(22, &pool).await.expect("0022 should apply");
 
         let groups_after: Vec<String> = sqlx::query_scalar(GROUP_ROW_SQL)
             .fetch_all(&pool)

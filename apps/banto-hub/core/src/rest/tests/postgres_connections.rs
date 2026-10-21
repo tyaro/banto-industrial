@@ -654,6 +654,7 @@ async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_b
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             },
         )
         .await
@@ -813,6 +814,7 @@ async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprin
                 database: None,
                 username: None,
                 password: None,
+                settings: None,
             },
         )
         .await

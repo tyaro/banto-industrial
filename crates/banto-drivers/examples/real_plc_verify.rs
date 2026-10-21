@@ -875,6 +875,7 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         database: None,
         username: None,
         password: None,
+        settings: None,
     };
 
     let supervisor =

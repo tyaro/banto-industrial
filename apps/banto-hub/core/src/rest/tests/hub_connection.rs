@@ -111,3 +111,89 @@ async fn pending_apply_rejects_a_queued_hub_connection() {
             .unwrap();
     assert_eq!(rows, 0);
 }
+
+// --- R2a-2a: `push` 接続（docs/banto-hub-ingest-design.md §3.1） -------------
+//
+// REST は `push` を `hub` のように入口で断らない（Hub が作る種類、§1.4）。ただし受信
+// （`IngestHub`）を収集に繋ぐのは R2a-1c で、それまで Hub の preflight は厳格版の
+// `build_config_from`（`PushSource::Unavailable`）なので、**有効な** `push` 接続は
+// `pushSourceUnavailable` で保存前に断られる（収集全体を止める行を作らない）。
+// 無効な行は作れる。R2a-1c が Hub を `PushSource::Available` に替えたら、この
+// テストの「有効は 422」を「有効も 200」に書き換えること。
+
+/// 有効な `push` 接続の作成は preflight（`configuration`）で断られ何も書かない。
+/// 無効なら作れ、host/port は正規化される。REST の更新は `settings` を運ばないので、
+/// 保存済みの `settings` を消さない（`PlcConnectionInput::settings` の「省略は保つ」）。
+#[tokio::test]
+async fn push_connections_are_held_back_by_preflight_until_the_receiver_exists() {
+    let env = test_env().await;
+
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "bridge-1", "protocol": "push", "host": "", "port": 0 }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(
+        body["field_errors"][0]["field"], "configuration",
+        "{body:?}"
+    );
+    let rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections WHERE protocol = 'push'")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(rows, 0);
+
+    let (status, conn) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "bridge-1", "protocol": "push", "host": "x", "port": 9,
+                "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conn:?}");
+    assert_eq!(conn["protocol"], "push");
+    assert_eq!(conn["host"], "");
+    assert_eq!(conn["port"], 0);
+    let id = conn["id"].as_i64().unwrap();
+
+    sqlx::query("UPDATE plc_connections SET settings = '{\"stale_timeout_ms\":2000}' WHERE id = ?")
+        .bind(id)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let (status, body) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        json!({ "name": "bridge-1-renamed", "protocol": "push", "host": "", "port": 0,
+                "enabled": false }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let settings: Option<String> =
+        sqlx::query_scalar("SELECT settings FROM plc_connections WHERE id = ?")
+            .bind(id)
+            .fetch_one(&env.pool)
+            .await
+            .unwrap();
+    assert_eq!(settings.as_deref(), Some(r#"{"stale_timeout_ms":2000}"#));
+
+    let (status, body) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        json!({ "name": "bridge-1-renamed", "protocol": "push", "host": "", "port": 0,
+                "enabled": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(
+        body["field_errors"][0]["field"], "configuration",
+        "{body:?}"
+    );
+}

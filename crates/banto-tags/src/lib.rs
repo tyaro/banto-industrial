@@ -8,11 +8,15 @@
 //! - [`PlcConnection`]: one data source. Started as one PLC endpoint
 //!   (`"modbus-tcp"` first for debuggability, plan.md §3's I2 decision, then
 //!   `"slmp"`); the vocabulary is now `"modbus-tcp"`/`"slmp"`/`"virtual"`/
-//!   `"postgres"`/`"hub"` ([`ALLOWED_PROTOCOLS`]). `"hub"` (#383 段階3 P2,
+//!   `"postgres"`/`"hub"`/`"push"` ([`ALLOWED_PROTOCOLS`]). `"hub"` (#383 段階3 P2,
 //!   2026-10-10 オーナー決定 H1) is banto-hub as a source: at most one per
 //!   registry, no endpoint of its own (ChronoGazer's `hub.record` owns it),
 //!   and its tags' `address` is the Hub tag's external name - see
-//!   [`plc_connection`]'s "`\"hub\"`" section
+//!   [`plc_connection`]'s "`\"hub\"`" section. `"push"` (R2a-2a,
+//!   docs/banto-hub-ingest-design.md §3) is a connection banto-hub *receives*
+//!   values on: no endpoint either, a JSON `settings` column of its own, and
+//!   tags whose `address` is an opaque sender-chosen key - the pure rules
+//!   (limits, settings, keys, the bridge's load estimate) live in [`push`]
 //! - [`CollectionGroup`]: the unit of periodic PLC bulk read
 //!   (recorder-requirements.md §3.1: "収集周期はタグ毎ではなく収集グループ毎")
 //! - [`Tag`]: one collection point - address + data type + scaling + unit +
@@ -34,6 +38,7 @@
 
 pub mod collection_group;
 pub mod plc_connection;
+pub mod push;
 pub mod scaling;
 pub mod tag;
 
@@ -50,6 +55,11 @@ pub use plc_connection::{
     ALLOWED_CPU_TYPES, ALLOWED_PROTOCOLS, ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, CPU_TYPE_Q,
     CPU_TYPE_R, HUB_PROTOCOL, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL,
     PUSH_PROTOCOL, VIRTUAL_PROTOCOL, WORD_ORDER_HIGH_LOW, WORD_ORDER_LOW_HIGH,
+};
+pub use push::{
+    bridge_load, validate_push_key, validate_push_settings, BridgeColumn, BridgeLoad, BridgeQuery,
+    PushBridge, PushLimits, PushSettings, QueryLoad, BRIDGE_KIND_DB, DEFAULT_STALE_TIMEOUT_MS,
+    MAX_PUSH_KEY_LEN, MAX_STALE_TIMEOUT_MS, MIN_STALE_TIMEOUT_MS, PUSH_LIMITS,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use tag::{

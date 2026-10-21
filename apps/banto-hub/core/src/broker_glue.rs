@@ -1003,6 +1003,7 @@ mod tests {
             database: None,
             username: None,
             password: None,
+            settings: None,
         }
     }
 

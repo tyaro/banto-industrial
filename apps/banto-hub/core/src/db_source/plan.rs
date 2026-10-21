@@ -350,6 +350,7 @@ mod tests {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             password: Some("s3cret".to_string()),
+            settings: None,
         }
     }
 
