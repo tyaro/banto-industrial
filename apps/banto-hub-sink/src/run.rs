@@ -42,6 +42,9 @@
 //! close 1000 を送り、問い合わせのタスクの終わりを待つ。待つのは
 //! [`BRIDGE_STOP_CAP`]（OS シャットダウンでは残り時間との短い方）まで。ブリッジには
 //! flush は無い（送れなかった周期は捨てる、docs/banto-hub-ingest-design.md §10.3「停止」）。
+//! 上限までに止まらなければ、ブリッジは自分のタスクを全部 `abort` して落ちるのを待ってから
+//! 戻る（handle を切り離したまま runtime の終わりに任せない。その待ちも上限の内、
+//! [`crate::source::BridgeSupervisor::shutdown`]）。
 //!
 //! OS の PRESHUTDOWN（#589）では、この列の合計が SCM の待ち時間を超えうる
 //! （flush 秒数は全体の上限ではない。flusher ごとに最大 2 秒、状態 push は
@@ -70,7 +73,7 @@ use crate::hub_api::{
     HubApi, HubApiError, SinkConfig, SinkConfigConnection, SinkConfigGroup, SinkStatusPush,
 };
 use crate::log::{log_err_line, log_line};
-use crate::source::BridgeSupervisor;
+use crate::source::{BridgeStop, BridgeSupervisor};
 use crate::status::{push_entry, GroupState, Redactor};
 use crate::values::{normalize_names, plan_subscription, BindingPlan, Subscription, ValueView};
 
@@ -917,11 +920,22 @@ async fn shutdown_all(engine: Engine, bridge: BridgeSupervisor, request: StopReq
             BRIDGE_STOP_CAP,
         ),
     };
-    let (bridge_done, ()) = tokio::join!(bridge.shutdown(limit), engine.shutdown(request));
-    if !bridge_done {
-        log_err_line(
-            "banto-hub-sink: warn: DB ブリッジの停止を予算内に終えられませんでした（送れなかった周期は捨てます）",
-        );
+    let (bridge_stop, ()) = tokio::join!(bridge.shutdown(limit), engine.shutdown(request));
+    if let Some(line) = bridge_stop_log_line(bridge_stop) {
+        log_err_line(line);
+    }
+}
+
+/// DB ブリッジの停止の結果のログ行（予算内に止まったら出さない）。
+fn bridge_stop_log_line(stop: BridgeStop) -> Option<&'static str> {
+    match stop {
+        BridgeStop::Stopped => None,
+        BridgeStop::Aborted => Some(
+            "banto-hub-sink: warn: DB ブリッジが予算内に止まらなかったため、問い合わせを打ち切りました（送れなかった周期は捨てます）",
+        ),
+        BridgeStop::Detached => Some(
+            "banto-hub-sink: warn: DB ブリッジが予算内に止まらず、打ち切りも終わりませんでした（残りはプロセスの終了で止まります。送れなかった周期は捨てます）",
+        ),
     }
 }
 
