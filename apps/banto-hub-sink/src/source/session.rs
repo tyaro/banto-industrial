@@ -12,8 +12,10 @@
 //! 2. `welcome` を待つ（10 秒）。`epoch`・`collecting`・`stale_timeout_ms`・`limits` を受ける。
 //!    速さのバケット（[`super::budget::SendBudget`]）は source ごとに 1 つで WS をまたいで
 //!    持ち続け、`limits` が変わったときだけ作り直す。
-//! 3. `collecting: true` なら問い合わせのタスクを起こす（describe → すぐ最初の問い合わせ →
-//!    その周期の全キー）。`false` なら起こさない（DB へ繋がない。external-db §4.8）。
+//! 3. 監督（[`super`]）に設定を取り直させ、`welcome` の後に**始まった**取得が成功するまで
+//!    待つ（下の「設定の取り直しの待ち」）。その後 `collecting: true` なら問い合わせのタスクを
+//!    起こす（describe → すぐ最初の問い合わせ → その周期の全キー）。`false` なら起こさない
+//!    （DB へ繋がない。external-db §4.8）。
 //! 4. 周期の値は件数・バイト数で分けて送信待ち（[`super::outbox::Outbox`]）へ入れ、バケットが
 //!    許す速さで `values`（今の `epoch`・連番の `seq`）を送る。送りきる前に同じクエリの次の
 //!    周期が来たら、送っていない古い分を捨てる。
@@ -32,12 +34,23 @@
 //! epoch が変わったら送信待ちは捨てる（古い epoch の値は Hub が `stale_epoch` で断る）。
 //! `stale_epoch` で断られた分は送り直さない（次の `state` を待つ）。
 //!
-//! **設定の取り直しの待ちは WS をまたいで持つ**（[`Runtime`] の `awaiting_config`）。
-//! `config_changed` を受けた後、取得が遅れている・失敗している間に WS が切れても、張り直した
-//! `welcome` が `collecting: true` だからといって手元の古い設定で問い合わせを始めない
-//! （古い設定の値が新しい epoch で Hub に受け付けられてしまう）。再開は、取り直しを頼んだ
-//! 時点より**後に始まった**取得が成功したとき（§10.3 の実装の注 (3)）。その取得が張り直しの
-//! 前に終わっていれば、`welcome` の時点でそれを見て再開する。
+//! ## 設定の取り直しの待ち（§10.3 の実装の注 (3)）
+//!
+//! 取り直しを頼むのは `config_changed` を受けたときと、**`welcome` のたび**（初回の接続も
+//! 張り直しも）。Hub は購読した後の設定の変更にしか `config_changed` を送らないので、WS の
+//! 切断中や、監督の最初の取得と最初の `welcome` の間に変わった設定は `state` では届かない。
+//! 手元の設定のまま `collecting: true` の `welcome` で問い合わせを始めると、キーが同じなら
+//! 古い SQL の値が新しい epoch で Hub に受け付けられてしまう。そこで、頼んだ時点の
+//! [`SourceContext::fetch_started`] を [`Runtime`] の `awaiting_config` に置き、それより
+//! **後に始まった**取得が成功するまで問い合わせも送信もしない（頼む前から走っていた取得は古い
+//! 設定を返しうる）。設定が変わっていれば監督がこの source を止めて新しい設定で作り直し、
+//! 同じなら今の epoch の最初の周期から送る。取得が失敗している間は待ち続ける（監督が
+//! バックオフ・`config_refresh_secs` で取り直す）。待ちは WS をまたいで持ち、張り直しの
+//! `welcome` はそれをより新しい取得の待ちに置き換える。
+//!
+//! 取り直しの依頼は [`Notify`] の 1 つの許可に畳まれる: 監督が取得している間に何本の source
+//! が頼んでも、その取得の後に 1 回取るだけ。`welcome` は WS の張り直しのバックオフ
+//! （1 秒 → 30 秒）より速くは来ないので、取得の回数もそれで頭打ちになる。
 //!
 //! ## WS の切断
 //!
@@ -136,7 +149,7 @@ pub enum SourceState {
     Idle,
     /// WS が開いていて、問い合わせて送っている。
     Running,
-    /// Hub が設定の変更を知らせた。取り直しを待っている（問い合わせない）。
+    /// 設定の取り直しを待っている（`welcome` の直後と `config_changed` の後。問い合わせない）。
     AwaitingConfig,
     /// WS が切れた・張れない。バックオフしている。
     Backoff,
@@ -201,11 +214,11 @@ pub struct SourceContext {
     pub ws_url: String,
     pub api_key: String,
     pub redactor: Redactor,
-    /// 設定を取り直させる（`config_changed`・404・409・`connection_changed`）。
+    /// 設定を取り直させる（`welcome`・`config_changed`・404・409・`connection_changed`）。
     pub refresh: Arc<Notify>,
     /// 監督が始めた設定の取得の番号（取得を始めるたびに 1 つ進める）。
     pub fetch_started: Arc<AtomicU64>,
-    /// 監督が終えた（成功した）設定の取得の番号（`config_changed` の後の再開の合図）。
+    /// 監督が終えた（成功した）設定の取得の番号（`welcome`・`config_changed` の後の再開の合図）。
     /// source は「取り直しを頼んだ時点の [`Self::fetch_started`] より後に始まった取得」が
     /// 終わるまで待つ - 頼む前から走っていた取得（古い設定を返しうる）で再開しない。
     pub config_generation: watch::Receiver<u64>,
@@ -420,9 +433,9 @@ struct Runtime {
     retiring: Vec<JoinHandle<()>>,
     /// 直前にログに出した upgrade の失敗（同じものを繰り返し出さない）。
     logged_connect_error: Option<ConnectError>,
-    /// 設定の取り直しを待っている（`config_changed` を受けた）。値は取り直しを頼んだ時点の
-    /// [`SourceContext::fetch_started`]（これより後に始まった取得の成功を待つ）。WS をまたいで
-    /// 持つ（このモジュールの doc「`state`」）。
+    /// 設定の取り直しを待っている（`welcome` の直後・`config_changed` を受けた）。値は取り直しを
+    /// 頼んだ時点の [`SourceContext::fetch_started`]（これより後に始まった取得の成功を待つ）。
+    /// WS をまたいで持つ（このモジュールの doc「設定の取り直しの待ち」）。
     awaiting_config: Option<u64>,
 }
 
@@ -588,16 +601,20 @@ impl Runtime {
             status_ready_at: now,
             logged_codes: HashSet::new(),
         };
+        // `welcome` のたびに（初回も張り直しも）設定を取り直し、この時点より**後に始まった**
+        // 取得が成功するまで問い合わせない（§10.3 の実装の注 (3)）。Hub は `config_changed` を
+        // 購読した後の変更にしか送らないので、切断中・初回の取得と最初の `welcome` の間の変更は
+        // `state` では届かない - 手元の設定のまま新しい epoch で送ると、キーが同じなら古い SQL の
+        // 値が受け付けられてしまう。前の WS から持ち越した待ちがあっても、ここで頼む方が後なので
+        // 置き換えてよい（より新しい取得を待つ）。
+        //
+        // 順序: 先に `config_generation` を既読にしてから番号を読む。既読にした後に終わった取得は
+        // `changed()` で拾え、既読にする前に終わった取得の番号は読む番号以下（取得は番号を進めて
+        // から始まる）なので、待ちを解く取得を取り逃さない。
         let mut config_generation = self.ctx.config_generation.clone();
         config_generation.borrow_and_update();
-        // 前の WS で頼んだ取り直しがまだ終わっていなければ、`collecting: true` でも
-        // 問い合わせない（古い設定の値を新しい epoch で送らない）。
-        if self.still_awaiting_config() {
-            log_line(&format!(
-                "banto-hub-sink: {}: 設定の取り直しを待っています（終わるまで問い合わせません）",
-                self.label()
-            ));
-        }
+        self.awaiting_config = Some(self.ctx.fetch_started.load(Ordering::SeqCst));
+        self.ctx.refresh.notify_one();
         self.resume(&mut s, collecting, epoch);
 
         let end = loop {
@@ -771,7 +788,14 @@ impl Runtime {
                 }
                 Event::ConfigConfirmed => {
                     // 頼んだ後に始まった取得が終わった: 設定は変わっていなかった（変わっていれば
-                    // 監督がこの source を止めている - 止める合図は `biased` の先頭で拾う）。
+                    // 監督が知らせる前にこの source を止めている - 止める合図は `biased` の先頭で
+                    // 拾うが、同じ起床で両方が見えたときのためにここでも確かめ、古い設定で
+                    // 問い合わせを始めない）。
+                    if *stop.borrow() {
+                        self.retire(&mut s.poller);
+                        close_ws(&mut ws_tx, &mut ws_rx).await;
+                        break SessionEnd::Stopped;
+                    }
                     config_generation.borrow_and_update();
                     if !self.still_awaiting_config() {
                         self.resume(&mut s, collecting, epoch);
@@ -1408,21 +1432,71 @@ mod tests {
         }
     }
 
-    fn context(url: &str) -> (SourceContext, watch::Sender<u64>) {
+    /// 監督の代わり（設定の取得の番号と、取り直しの依頼）。
+    struct FakeSupervisor {
+        refresh: Arc<Notify>,
+        fetch_started: Arc<AtomicU64>,
+        generation_tx: watch::Sender<u64>,
+    }
+
+    impl FakeSupervisor {
+        /// 取り直しの依頼を待つ（5 秒）。
+        async fn requested(&self) {
+            tokio::time::timeout(Duration::from_secs(5), self.refresh.notified())
+                .await
+                .expect("the source must ask the supervisor to refetch");
+        }
+
+        /// 取得を 1 つ始める（番号を進める）。戻り値はその番号。
+        fn start_fetch(&self) -> u64 {
+            self.fetch_started.fetch_add(1, Ordering::SeqCst) + 1
+        }
+
+        /// 番号 `id` の取得が成功した（設定は同じ）。
+        fn finish_fetch(&self, id: u64) {
+            self.generation_tx.send_replace(id);
+        }
+
+        /// 依頼を待って、取得を 1 つ始めて成功させる（設定は同じ）。
+        async fn refetch(&self) {
+            self.requested().await;
+            let id = self.start_fetch();
+            self.finish_fetch(id);
+        }
+    }
+
+    fn context(url: &str) -> (SourceContext, FakeSupervisor) {
         let (generation_tx, generation_rx) = watch::channel(0);
         let mut redactor = Redactor::new();
         redactor.add_secret("pw-unit");
+        let refresh = Arc::new(Notify::new());
+        let fetch_started = Arc::new(AtomicU64::new(0));
         (
             SourceContext {
                 ws_url: url.to_string(),
                 api_key: "bh_unit_test_key".to_string(),
                 redactor,
-                refresh: Arc::new(Notify::new()),
-                fetch_started: Arc::new(AtomicU64::new(0)),
+                refresh: refresh.clone(),
+                fetch_started: fetch_started.clone(),
                 config_generation: generation_rx,
             },
-            generation_tx,
+            FakeSupervisor {
+                refresh,
+                fetch_started,
+                generation_tx,
+            },
         )
+    }
+
+    async fn wait_for_state(handle: &SourceHandle, state: SourceState) {
+        let waited = tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.status().state != state {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+        waited.await.unwrap_or_else(|_| {
+            panic!("{state:?} within 5 s: {:?}", handle.status());
+        });
     }
 
     /// §11 の R2a-3b: `collecting: false` で問い合わせを止める・`state` の epoch で送り直す・
@@ -1430,9 +1504,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_session_follows_state_and_epochs() {
         let (listener, url) = fake_hub().await;
-        let (ctx, generation_tx) = context(&url);
-        let refresh = ctx.refresh.clone();
-        let fetch_started = ctx.fetch_started.clone();
+        let (ctx, supervisor) = context(&url);
         let handle = SourceHandle::spawn(test_source(7), ctx);
         let mut hub = accept(&listener).await;
         assert_eq!(
@@ -1440,8 +1512,9 @@ mod tests {
             Some("Bearer bh_unit_test_key")
         );
 
-        // 収集の停止中: 問い合わせない・送らない。
+        // 収集の停止中: 問い合わせない・送らない。`welcome` の後の取り直しは済ませる。
         hub.welcome(false, 1).await;
+        supervisor.refetch().await;
         assert!(hub
             .values_within(Duration::from_millis(700))
             .await
@@ -1468,27 +1541,27 @@ mod tests {
         assert_eq!(resent["epoch"], json!(3));
         assert!(handle.status().pollers_started >= 2);
 
-        // 設定の変更: 取り直しを頼み、取得が終わるまで送らない。
+        // 設定の変更: 取り直しを頼み、取得が終わるまで送らない。頼む前から取得（番号 2）が
+        // 走っている（遅れている）。
+        let running = supervisor.start_fetch();
         hub.state(true, 4, true).await;
-        tokio::time::timeout(Duration::from_secs(5), refresh.notified())
-            .await
-            .expect("config_changed must ask the supervisor to refetch");
+        supervisor.requested().await;
         let during = hub.values_within(Duration::from_millis(1_200)).await;
         assert!(
             during.iter().all(|v| v["epoch"] == json!(3)),
             "no values with the new epoch before the refetch: {during:?}"
         );
         assert_eq!(handle.status().state, SourceState::AwaitingConfig);
-        // 頼む前から走っていた取得の終わり（番号 0）では再開しない。
-        generation_tx.send_replace(0);
+        // 頼む前から走っていた取得の終わりでは再開しない。
+        supervisor.finish_fetch(running);
         assert!(hub
             .values_within(Duration::from_millis(500))
             .await
             .iter()
             .all(|v| v["epoch"] != json!(4)));
-        // 頼んだ後に始まった取得（番号 1）が終わったら、新しい epoch で送る。
-        fetch_started.store(1, Ordering::SeqCst);
-        generation_tx.send_replace(1);
+        // 頼んだ後に始まった取得が終わったら、新しい epoch で送る。
+        let id = supervisor.start_fetch();
+        supervisor.finish_fetch(id);
         let mut after = hub.next_values().await;
         while after["epoch"] != json!(4) {
             after = hub.next_values().await;
@@ -1516,43 +1589,76 @@ mod tests {
         assert_eq!(closed, Some(1000));
     }
 
-    /// §10.3 の実装の注 (3)（PR #764 のオーナーレビュー P2）: `config_changed` の取り直しが
-    /// 遅れている・失敗している間に WS が切れても、張り直した `welcome` の `collecting: true`
-    /// で手元の古い設定のまま問い合わせ・送信を始めない。頼む前から走っていた取得が終わっても
-    /// 再開せず、頼んだ後に始まった取得の成功で、新しい epoch の最初の周期から送る。
+    /// §10.3 の実装の注 (3)（PR #764 のオーナーレビュー P2）: 最初の `welcome` でも、監督が
+    /// 既に取得を終えていても（source はその取得の設定で作られている）、`welcome` の後に
+    /// 始まった取得が成功するまで問い合わせ・送信を始めない（最初の取得と `welcome` の間の
+    /// 変更を取り逃さない）。取得の失敗では再開しない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_pending_config_refetch_survives_a_reconnect() {
+    async fn the_first_welcome_waits_for_a_fetch_started_after_it() {
         let (listener, url) = fake_hub().await;
-        let (ctx, generation_tx) = context(&url);
-        let refresh = ctx.refresh.clone();
-        let fetch_started = ctx.fetch_started.clone();
+        let (ctx, supervisor) = context(&url);
+        // この source を作った取得（番号 1）は終わっている。
+        let initial = supervisor.start_fetch();
+        supervisor.finish_fetch(initial);
         let handle = SourceHandle::spawn(test_source(7), ctx);
         let mut hub = accept(&listener).await;
         hub.welcome(true, 1).await;
+        supervisor.requested().await;
+        let during = hub.values_within(Duration::from_millis(1_200)).await;
+        assert!(
+            during.is_empty(),
+            "no values before the refetch: {during:?}"
+        );
+        let status = handle.status();
+        assert_eq!(status.state, SourceState::AwaitingConfig);
+        assert_eq!(status.pollers_started, 0, "{status:?}");
+
+        // 取得の失敗（番号 2 が始まったが成功しない）: 送らない。
+        supervisor.start_fetch();
+        assert!(hub
+            .values_within(Duration::from_millis(700))
+            .await
+            .is_empty());
+        assert_eq!(handle.status().state, SourceState::AwaitingConfig);
+
+        // 次の取得（番号 3）が成功したら（設定は同じ）、今の epoch の最初の周期から送る。
+        let id = supervisor.start_fetch();
+        supervisor.finish_fetch(id);
+        assert_eq!(hub.next_values().await["epoch"], json!(1));
+        assert_eq!(handle.status().state, SourceState::Running);
+        assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
+    }
+
+    /// §10.3 の実装の注 (3)（PR #764 のオーナーレビュー P2）: `config_changed` の取り直しが
+    /// 遅れている・失敗している間に WS が切れても、張り直した `welcome` の `collecting: true`
+    /// で手元の古い設定のまま問い合わせ・送信を始めない。頼む前から走っていた取得が終わっても
+    /// 再開せず、張り直しの後に始まった取得の成功で、新しい epoch の最初の周期から送る。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pending_config_refetch_survives_a_reconnect() {
+        let (listener, url) = fake_hub().await;
+        let (ctx, supervisor) = context(&url);
+        let handle = SourceHandle::spawn(test_source(7), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        supervisor.refetch().await;
         assert_eq!(hub.next_values().await["epoch"], json!(1));
 
-        // 頼む前から取得（番号 1）が走っている（遅れている）ところへ設定の変更。
-        fetch_started.store(1, Ordering::SeqCst);
+        // 頼む前から取得が走っている（遅れている）ところへ設定の変更。
+        let running = supervisor.start_fetch();
         hub.state(true, 2, true).await;
-        tokio::time::timeout(Duration::from_secs(5), refresh.notified())
-            .await
-            .expect("config_changed must ask the supervisor to refetch");
-        let wait_awaiting = tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.status().state != SourceState::AwaitingConfig {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-        wait_awaiting.await.expect("AwaitingConfig");
+        supervisor.requested().await;
+        wait_for_state(&handle, SourceState::AwaitingConfig).await;
         let pollers_before = handle.status().pollers_started;
 
         // 取り直しが終わらないうちに WS が切れる（close を送らずに落とす）。
         drop(hub);
         // 頼む前から走っていた取得が（古い設定を返して）終わる - これでは再開しない。
-        generation_tx.send_replace(1);
+        supervisor.finish_fetch(running);
 
         // 張り直し: Hub は収集中・新しい epoch。
         let mut hub = accept(&listener).await;
         hub.welcome(true, 2).await;
+        supervisor.requested().await;
         let during = hub.values_within(Duration::from_millis(1_500)).await;
         assert!(
             during.is_empty(),
@@ -1563,61 +1669,101 @@ mod tests {
         assert_eq!(status.pollers_started, pollers_before, "{status:?}");
         assert_eq!(status.sessions, 2, "{status:?}");
 
-        // 取得の失敗（番号 2 が始まったが成功しない）: generation は進まず、送らない。
-        fetch_started.store(2, Ordering::SeqCst);
+        // 取得の失敗（始まったが成功しない）: generation は進まず、送らない。
+        supervisor.start_fetch();
         assert!(hub
             .values_within(Duration::from_millis(500))
             .await
             .is_empty());
 
-        // 頼んだ後に始まった取得（番号 3）が成功したら、新しい epoch で最初の周期から送る。
-        fetch_started.store(3, Ordering::SeqCst);
-        generation_tx.send_replace(3);
+        // 張り直しの後に始まった取得が成功したら、新しい epoch で最初の周期から送る。
+        let id = supervisor.start_fetch();
+        supervisor.finish_fetch(id);
         let after = hub.next_values().await;
         assert_eq!(after["epoch"], json!(2));
         assert_eq!(handle.status().state, SourceState::Running);
         assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
     }
 
-    /// 取り直しを頼んだ後に始まった取得が WS の切断中に成功していれば、張り直した `welcome`
-    /// でそれを見て（`config_generation` の変化を待たずに）すぐ再開する。
+    /// §10.3 の実装の注 (3)（PR #764 のオーナーレビュー P2）: `config_changed` を一度も受けて
+    /// いなくても、張り直した `welcome` は設定を取り直させ、張り直しの後に始まった取得が
+    /// 成功するまで送らない（切断中の設定の変更は `state` では届かない）。切断中に終わった
+    /// 取得（`welcome` より前に始まった）では再開しない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_refetch_that_finished_while_disconnected_resumes_on_welcome() {
+    async fn a_reconnect_waits_for_a_fetch_started_after_the_welcome() {
         let (listener, url) = fake_hub().await;
-        let (ctx, generation_tx) = context(&url);
-        let refresh = ctx.refresh.clone();
-        let fetch_started = ctx.fetch_started.clone();
+        let (ctx, supervisor) = context(&url);
         let handle = SourceHandle::spawn(test_source(7), ctx);
         let mut hub = accept(&listener).await;
         hub.welcome(true, 1).await;
-        hub.next_values().await;
-        hub.state(true, 2, true).await;
-        tokio::time::timeout(Duration::from_secs(5), refresh.notified())
-            .await
-            .expect("refetch requested");
-        let wait_awaiting = tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.status().state != SourceState::AwaitingConfig {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        });
-        wait_awaiting.await.expect("AwaitingConfig");
+        supervisor.refetch().await;
+        assert_eq!(hub.next_values().await["epoch"], json!(1));
+        let pollers_before = handle.status().pollers_started;
+
+        // 切断。切断中に周期の取得が 1 つ終わる（`welcome` より前に始まった）。
         drop(hub);
-        fetch_started.store(1, Ordering::SeqCst);
-        generation_tx.send_replace(1);
+        let id = supervisor.start_fetch();
+        supervisor.finish_fetch(id);
+
         let mut hub = accept(&listener).await;
         hub.welcome(true, 2).await;
+        supervisor.requested().await;
+        let during = hub.values_within(Duration::from_millis(1_200)).await;
+        assert!(
+            during.is_empty(),
+            "no values before the refetch: {during:?}"
+        );
+        assert_eq!(handle.status().state, SourceState::AwaitingConfig);
+        assert_eq!(handle.status().pollers_started, pollers_before);
+
+        // `welcome` の後に始まった取得が成功した（設定は同じ）: すぐ新しい epoch で送る。
+        let id = supervisor.start_fetch();
+        let confirmed_at = Instant::now();
+        supervisor.finish_fetch(id);
         assert_eq!(hub.next_values().await["epoch"], json!(2));
+        assert!(
+            confirmed_at.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            confirmed_at.elapsed()
+        );
         assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
+    }
+
+    /// 取り直しを待っている間に監督が source を止めたら（設定が変わった）、同時に取得の終わりが
+    /// 見えても古い設定で問い合わせを始めない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stopped_source_never_starts_on_the_refetch_signal() {
+        let (listener, url) = fake_hub().await;
+        let (ctx, supervisor) = context(&url);
+        let handle = SourceHandle::spawn(test_source(7), ctx);
+        let mut hub = accept(&listener).await;
+        hub.welcome(true, 1).await;
+        supervisor.requested().await;
+        wait_for_state(&handle, SourceState::AwaitingConfig).await;
+        // 監督の順序（止める合図 → 取得の終わりの知らせ）。
+        let id = supervisor.start_fetch();
+        handle.request_stop();
+        supervisor.finish_fetch(id);
+        let shared = handle.shared_status();
+        assert!(handle.stop(Duration::from_secs(5)).await.is_ok());
+        let status = lock(&shared).clone();
+        assert_eq!(status.pollers_started, 0, "{status:?}");
+        assert_eq!(status.state, SourceState::Stopped, "{status:?}");
+        assert!(hub
+            .values_within(Duration::from_millis(300))
+            .await
+            .is_empty());
     }
 
     /// 問い合わせのタスクの `status`（DB に届かない）は Hub に届き、パスワードを含まない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn db_failures_are_reported_through_status_without_secrets() {
         let (listener, url) = fake_hub().await;
-        let (ctx, _generation_tx) = context(&url);
+        let (ctx, supervisor) = context(&url);
         let handle = SourceHandle::spawn(test_source(7), ctx);
         let mut hub = accept(&listener).await;
         hub.welcome(true, 1).await;
+        supervisor.refetch().await;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let detail = loop {
             let message = tokio::time::timeout_at(deadline, hub.ws.next())

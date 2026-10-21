@@ -29,11 +29,17 @@
 //! - `three_queries_at_the_registration_limit_are_never_rate_limited`: §10.4 の 9（上限
 //!   ちょうどの 3 クエリで 60 秒間 `rate_limited` / `too_many_items` が 0 件、全キーが Good、
 //!   Hub 内の Source と同じ値）。
+//! - `a_config_change_while_disconnected_is_fetched_before_sending` ほか 3 本: §10.3 の
+//!   実装の注 (3)（PR #764 のオーナー再レビュー P2）。`welcome` のたびに設定を取り直し、
+//!   `welcome` の後に始まった取得が成功するまで送らない。実 Hub は購読の後の変更にしか
+//!   `config_changed` を送らず「切断中の変更」を作りにくいので、設定の取得と送信口だけの
+//!   偽の Hub（[`FakeBridgeHub`]）に本物の監督と実 PostgreSQL を繋ぐ。
 //!
 //! 正の条件は [`wait_until`]（上限つきのポーリング）で待つ。負の条件（「繋がない」）だけ
 //! 短い固定の待ちを使う。
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -64,11 +70,15 @@ use banto_tags::{
     TagInput, TagService, DB_TAG_KIND, PLC_TAG_KIND, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
 };
 use banto_tstore::SystemClock;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPool};
 use sqlx::SqlitePool;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+use tokio_tungstenite::WebSocketStream;
 use tower::ServiceExt;
 
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
@@ -1172,6 +1182,443 @@ async fn three_queries_at_the_registration_limit_are_never_rate_limited() {
 
     assert!(bridge.shutdown(Duration::from_secs(10)).await);
     app.shutdown().await;
+    role.drop_role(&admin).await;
+    admin.close().await;
+}
+
+// --- 偽の Hub（設定の取得と送信口だけ）: §10.3 の実装の注 (3) ---------------
+//
+// 実 Hub は購読した後の変更にしか `config_changed` を送らないので、「切断中・最初の取得と
+// 最初の `welcome` の間の設定の変更」は実 Hub では作りにくい。設定の取得
+// （`GET /api/ingest/bridge-config`）と送信口の WS を 1 つのポートで受ける偽の Hub を立て、
+// 本物の監督（`BridgeSupervisor`）と実 PostgreSQL で、`welcome` の後に始まった取得の前に
+// 値を送らないこと・取得の後は新しい SQL の値を送ることを見る。
+
+/// 偽の Hub の操作口。
+struct FakeBridgeHub {
+    /// `GET /api/ingest/bridge-config` が返す本文。
+    config: Arc<std::sync::Mutex<Value>>,
+    /// `true` の間、設定の取得に 500 を返す。
+    fail: Arc<AtomicBool>,
+    /// `true` の間、設定の取得の応答を止めておく（取得が遅れている）。
+    hold: Arc<AtomicBool>,
+    /// 応答した設定の取得の数（成功・失敗とも）。
+    fetches: Arc<AtomicU64>,
+    sockets: tokio::sync::mpsc::UnboundedReceiver<WebSocketStream<TcpStream>>,
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeBridgeHub {
+    async fn start(config: Value) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let config = Arc::new(std::sync::Mutex::new(config));
+        let fail = Arc::new(AtomicBool::new(false));
+        let hold = Arc::new(AtomicBool::new(false));
+        let fetches = Arc::new(AtomicU64::new(0));
+        let (socket_tx, sockets) = tokio::sync::mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let (config, fail, hold, fetches) =
+                (config.clone(), fail.clone(), hold.clone(), fetches.clone());
+            async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (config, fail, hold, fetches, socket_tx) = (
+                        config.clone(),
+                        fail.clone(),
+                        hold.clone(),
+                        fetches.clone(),
+                        socket_tx.clone(),
+                    );
+                    tokio::spawn(async move {
+                        if is_config_request(&stream).await {
+                            serve_config(stream, &config, &fail, &hold, &fetches).await;
+                        } else if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
+                            let _ = socket_tx.send(ws);
+                        }
+                    });
+                }
+            }
+        });
+        Self {
+            config,
+            fail,
+            hold,
+            fetches,
+            sockets,
+            port,
+            task,
+        }
+    }
+
+    fn set_config(&self, config: Value) {
+        *self.config.lock().unwrap() = config;
+    }
+
+    fn fetches(&self) -> u64 {
+        self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// ブリッジが張った次の WS。
+    async fn next_socket(&mut self) -> WebSocketStream<TcpStream> {
+        tokio::time::timeout(WAIT, self.sockets.recv())
+            .await
+            .expect("the bridge connects to the ingest stream")
+            .expect("fake hub running")
+    }
+
+    fn spawn_bridge(&self) -> BridgeSupervisor {
+        let config = SidecarConfig::from_toml_str(
+            &format!(
+                "hub_url = \"http://127.0.0.1:{}\"\n\
+                 api_key = \"bh_fake.bridge\"\n\
+                 config_refresh_secs = 60\n",
+                self.port
+            ),
+            Path::new("banto-hub-sink.toml"),
+        )
+        .expect("config");
+        BridgeSupervisor::spawn(&config).expect("bridge")
+    }
+}
+
+impl Drop for FakeBridgeHub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// 要求の行が `GET /api/ingest/bridge-config` か（読まずに覗く）。
+async fn is_config_request(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 128];
+    for _ in 0..200 {
+        let n = stream.peek(&mut buf).await.unwrap_or(0);
+        if n == buf.len() || buf[..n].contains(&b'\n') {
+            return buf[..n].starts_with(b"GET /api/ingest/bridge-config");
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    false
+}
+
+async fn serve_config(
+    mut stream: TcpStream,
+    config: &std::sync::Mutex<Value>,
+    fail: &AtomicBool,
+    hold: &AtomicBool,
+    fetches: &AtomicU64,
+) {
+    let mut request = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => request.extend_from_slice(&buf[..n]),
+        }
+    }
+    while hold.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let response = if fail.load(Ordering::SeqCst) {
+        "HTTP/1.1 500 Internal Server Error\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            .to_string()
+    } else {
+        let body = config.lock().unwrap().to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    };
+    fetches.fetch_add(1, Ordering::SeqCst);
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.shutdown().await;
+}
+
+const FAKE_ID: i64 = 7;
+
+/// 偽の Hub が返すブリッジの設定（source 1 つ・キー `k1` 1 つ）。`sql` だけを変えて
+/// 「キーは同じで SQL を変えた」を作る。
+fn fake_bridge_config(
+    target: &PgTarget,
+    role: &TestRole,
+    name: &str,
+    fingerprint: &str,
+    sql: &str,
+) -> Value {
+    json!({ "generatedAt": 0, "sources": [ {
+        "connectionId": FAKE_ID, "name": name, "staleTimeoutMs": 3_000,
+        "configFingerprint": fingerprint, "ingestAllowed": true,
+        "queries": [ { "name": "q", "periodMs": 500, "sql": sql,
+                       "columns": [ { "column": "a", "key": "k1" } ] } ],
+        "db": { "id": 1, "name": "pg", "enabled": true, "host": target.host,
+                "port": target.port, "database": target.database,
+                "username": role.name, "password": role.password } } ] })
+}
+
+const SQL_A: &str = "SELECT 1.5::float8 AS a";
+const SQL_B: &str = "SELECT 2.5::float8 AS a";
+
+async fn fake_welcome(ws: &mut WebSocketStream<TcpStream>, collecting: bool, epoch: u64) {
+    let welcome = json!({ "op": "welcome", "connection_id": FAKE_ID, "connection": "fake",
+        "collecting": collecting, "epoch": epoch, "stale_timeout_ms": 3_000,
+        "limits": { "max_items": 1000, "max_message_bytes": 262_144,
+                    "messages_per_sec": 20, "items_per_sec": 5000 } });
+    ws.send(WsMessage::Text(welcome.to_string().into()))
+        .await
+        .unwrap();
+}
+
+/// `within` の間に届いた `values` と、その間にブリッジが WS を閉じたか。
+async fn fake_values_within(
+    ws: &mut WebSocketStream<TcpStream>,
+    within: Duration,
+) -> (Vec<Value>, bool) {
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => return (out, false),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMessage::Close(_)))) => return (out, true),
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["op"] == "values" {
+                    out.push(value);
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// 次の `values`（[`WAIT`] まで）。
+async fn fake_next_values(ws: &mut WebSocketStream<TcpStream>) -> Value {
+    let (values, closed) = fake_values_until(ws, |_| true).await;
+    assert!(!closed, "the bridge closed the stream: {values:?}");
+    values.into_iter().last().expect("values")
+}
+
+/// `done` が真になる `values` まで（[`WAIT`] まで）。それまでに届いた `values` を全部返す。
+async fn fake_values_until(
+    ws: &mut WebSocketStream<TcpStream>,
+    done: impl Fn(&Value) -> bool,
+) -> (Vec<Value>, bool) {
+    let mut out = Vec::new();
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        match tokio::time::timeout_at(deadline, ws.next()).await {
+            Err(_) => panic!("values within {WAIT:?}: {out:?}"),
+            Ok(None) | Ok(Some(Err(_))) | Ok(Some(Ok(WsMessage::Close(_)))) => return (out, true),
+            Ok(Some(Ok(WsMessage::Text(text)))) => {
+                let value: Value = serde_json::from_str(text.as_str()).unwrap();
+                if value["op"] == "values" {
+                    let finished = done(&value);
+                    out.push(value);
+                    if finished {
+                        return (out, false);
+                    }
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// `values` の 1 件目（キー `k1`）の (値, 品質, epoch)。
+fn k1(value: &Value) -> (Option<f64>, String, u64) {
+    let item = &value["items"][0];
+    assert_eq!(item["key"], json!("k1"), "{value}");
+    (
+        item["v"].as_f64(),
+        item["q"].as_str().unwrap_or_default().to_string(),
+        value["epoch"].as_u64().unwrap(),
+    )
+}
+
+/// ブリッジが WS を閉じるまで待つ（その間の `values` を返す）。
+async fn fake_until_closed(ws: &mut WebSocketStream<TcpStream>) -> Vec<Value> {
+    let (values, closed) = fake_values_within(ws, WAIT).await;
+    assert!(closed, "the bridge must close the old stream: {values:?}");
+    values
+}
+
+/// 回帰（PR #764 のオーナー再レビュー P2、§10.3 の実装の注 (3)）: 切断 → 同じキーで SQL を
+/// 変更 → `config_changed` を一度も受信しないまま再接続 → 設定の取得の完了まで値を送らない
+/// → 取得の後は新しい SQL の値を送る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_change_while_disconnected_is_fetched_before_sending() {
+    let target = require_pg!();
+    let admin = PgPool::connect(&target.url).await.expect("connect test pg");
+    let role = TestRole::create(&admin, "fresh_a").await;
+    let name = unique("fresh_a");
+    let mut hub =
+        FakeBridgeHub::start(fake_bridge_config(&target, &role, &name, "sha256:a", SQL_A)).await;
+    let bridge = hub.spawn_bridge();
+
+    let mut ws = hub.next_socket().await;
+    fake_welcome(&mut ws, true, 1).await;
+    let (_, closed) = fake_values_until(&mut ws, |v| k1(v) == (Some(1.5), "good".into(), 1)).await;
+    assert!(!closed);
+
+    // 取得を遅らせ、切断（close なし）→ 切断中に SQL だけを変える（キーは同じ。
+    // `config_changed` は送らない）。
+    hub.hold.store(true, Ordering::SeqCst);
+    drop(ws);
+    hub.set_config(fake_bridge_config(&target, &role, &name, "sha256:b", SQL_B));
+
+    // 張り直し（新しい epoch・収集中）: 取得が終わるまで値を送らない。
+    let mut ws = hub.next_socket().await;
+    fake_welcome(&mut ws, true, 2).await;
+    let (during, _) = fake_values_within(&mut ws, Duration::from_millis(1_500)).await;
+    assert!(
+        during.is_empty(),
+        "no values before the post-welcome fetch: {during:?}"
+    );
+    assert_eq!(
+        bridge_status(&bridge, FAKE_ID).map(|s| s.state),
+        Some(SourceState::AwaitingConfig),
+        "{:?}",
+        bridge.statuses()
+    );
+
+    // 取得が終わる: SQL が変わったので、監督が古い source（SQL A）を止める - その WS では
+    // 何も送らずに閉じる。新しい source（SQL B）が張り直して B の値を送る。
+    hub.hold.store(false, Ordering::SeqCst);
+    let old = fake_until_closed(&mut ws).await;
+    assert!(old.is_empty(), "the stale source sent: {old:?}");
+    let mut ws = hub.next_socket().await;
+    fake_welcome(&mut ws, true, 2).await;
+    let (values, closed) = fake_values_until(&mut ws, |v| k1(v).0.is_some()).await;
+    assert!(!closed);
+    for value in &values {
+        let (v, _, epoch) = k1(value);
+        assert_eq!(epoch, 2, "{value}");
+        assert_ne!(v, Some(1.5), "a value of the old SQL: {value}");
+    }
+    assert_eq!(k1(values.last().unwrap()), (Some(2.5), "good".into(), 2));
+    let next = fake_next_values(&mut ws).await;
+    assert_eq!(k1(&next).0, Some(2.5), "{next}");
+
+    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    role.drop_role(&admin).await;
+    admin.close().await;
+}
+
+/// 回帰（同上、最初の接続）: 監督が SQL A の設定で source を作った後、最初の `welcome` までに
+/// 設定が B に変わる → `welcome` の後に始まった取得が成功するまで値を送らず、その後は B の値。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_config_change_before_the_first_welcome_is_fetched_before_sending() {
+    let target = require_pg!();
+    let admin = PgPool::connect(&target.url).await.expect("connect test pg");
+    let role = TestRole::create(&admin, "fresh_b").await;
+    let name = unique("fresh_b");
+    let mut hub =
+        FakeBridgeHub::start(fake_bridge_config(&target, &role, &name, "sha256:a", SQL_A)).await;
+    let bridge = hub.spawn_bridge();
+
+    // source（SQL A）が繋いできた。`welcome` を返す前に設定が B に変わる。
+    let mut ws = hub.next_socket().await;
+    hub.hold.store(true, Ordering::SeqCst);
+    hub.set_config(fake_bridge_config(&target, &role, &name, "sha256:b", SQL_B));
+    fake_welcome(&mut ws, true, 1).await;
+    let (during, _) = fake_values_within(&mut ws, Duration::from_millis(1_500)).await;
+    assert!(
+        during.is_empty(),
+        "no values before the post-welcome fetch: {during:?}"
+    );
+
+    hub.hold.store(false, Ordering::SeqCst);
+    let old = fake_until_closed(&mut ws).await;
+    assert!(old.is_empty(), "the stale source sent: {old:?}");
+    let mut ws = hub.next_socket().await;
+    fake_welcome(&mut ws, true, 1).await;
+    let (values, closed) = fake_values_until(&mut ws, |v| k1(v).0.is_some()).await;
+    assert!(!closed);
+    assert!(
+        values.iter().all(|v| k1(v).0 != Some(1.5)),
+        "a value of the old SQL: {values:?}"
+    );
+    assert_eq!(k1(values.last().unwrap()), (Some(2.5), "good".into(), 1));
+
+    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    role.drop_role(&admin).await;
+    admin.close().await;
+}
+
+/// 回帰（同上）: `welcome` の後の取得が失敗している間は送らない（古い設定のまま再開しない）。
+/// 取得が成功するようになったら送る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failing_post_welcome_fetch_keeps_the_bridge_silent() {
+    let target = require_pg!();
+    let admin = PgPool::connect(&target.url).await.expect("connect test pg");
+    let role = TestRole::create(&admin, "fresh_c").await;
+    let name = unique("fresh_c");
+    let mut hub =
+        FakeBridgeHub::start(fake_bridge_config(&target, &role, &name, "sha256:a", SQL_A)).await;
+    let bridge = hub.spawn_bridge();
+
+    let mut ws = hub.next_socket().await;
+    hub.fail.store(true, Ordering::SeqCst);
+    let fetches_before = hub.fetches();
+    fake_welcome(&mut ws, true, 1).await;
+    let (during, closed) = fake_values_within(&mut ws, Duration::from_secs(3)).await;
+    assert!(!closed);
+    assert!(
+        during.is_empty(),
+        "no values while the fetch fails: {during:?}"
+    );
+    assert!(hub.fetches() > fetches_before, "the welcome must refetch");
+    assert_eq!(
+        bridge_status(&bridge, FAKE_ID).map(|s| (s.state, s.pollers_started)),
+        Some((SourceState::AwaitingConfig, 0)),
+        "{:?}",
+        bridge.statuses()
+    );
+
+    // 取得が直る: 監督のバックオフの取り直しで成功し、送り始める（設定は同じ）。
+    hub.fail.store(false, Ordering::SeqCst);
+    let (_, closed) = fake_values_until(&mut ws, |v| k1(v) == (Some(1.5), "good".into(), 1)).await;
+    assert!(!closed);
+
+    assert!(bridge.shutdown(Duration::from_secs(10)).await);
+    role.drop_role(&admin).await;
+    admin.close().await;
+}
+
+/// 回帰（同上）: 設定が変わっていなければ、張り直しの後の取得が終わり次第すぐ送る
+/// （source は作り直さない・WS も張り直さない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_config_resumes_promptly_after_a_reconnect() {
+    let target = require_pg!();
+    let admin = PgPool::connect(&target.url).await.expect("connect test pg");
+    let role = TestRole::create(&admin, "fresh_d").await;
+    let name = unique("fresh_d");
+    let mut hub =
+        FakeBridgeHub::start(fake_bridge_config(&target, &role, &name, "sha256:a", SQL_A)).await;
+    let bridge = hub.spawn_bridge();
+
+    let mut ws = hub.next_socket().await;
+    fake_welcome(&mut ws, true, 1).await;
+    let (_, closed) = fake_values_until(&mut ws, |v| k1(v) == (Some(1.5), "good".into(), 1)).await;
+    assert!(!closed);
+    drop(ws);
+
+    let mut ws = hub.next_socket().await;
+    let fetches_before = hub.fetches();
+    let welcomed_at = tokio::time::Instant::now();
+    fake_welcome(&mut ws, true, 2).await;
+    let (_, closed) = fake_values_until(&mut ws, |v| k1(v) == (Some(1.5), "good".into(), 2)).await;
+    assert!(!closed, "the source must not be rebuilt");
+    assert!(
+        welcomed_at.elapsed() < Duration::from_secs(5),
+        "resumed after {:?}",
+        welcomed_at.elapsed()
+    );
+    assert!(hub.fetches() > fetches_before, "the welcome must refetch");
+    let status = bridge_status(&bridge, FAKE_ID).unwrap();
+    assert_eq!(status.sessions, 2, "{status:?}");
+    assert_eq!(status.state, SourceState::Running, "{status:?}");
+
+    assert!(bridge.shutdown(Duration::from_secs(10)).await);
     role.drop_role(&admin).await;
     admin.close().await;
 }

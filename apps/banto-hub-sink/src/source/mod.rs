@@ -33,9 +33,11 @@
 //!
 //! ## 設定の差分（§10.3「設定」）
 //!
-//! `config_refresh_secs`（既存の設定、既定 30 秒）ごとと、source が頼んだとき（Hub の
-//! `state { config_changed: true }`・404・409・close の `connection_changed` /
-//! `connection_removed`）にすぐ取り直す。toml の項目は増やさない。差分は純関数
+//! `config_refresh_secs`（既存の設定、既定 30 秒）ごとと、source が頼んだとき（WS の
+//! `welcome` のたび・Hub の `state { config_changed: true }`・404・409・close の
+//! `connection_changed` / `connection_removed`）にすぐ取り直す。依頼は 1 つの許可に畳むので、
+//! 取得の最中に何本の source が頼んでも、その後に 1 回取るだけ（[`session`] の「設定の
+//! 取り直しの待ち」）。toml の項目は増やさない。差分は純関数
 //! [`plan_sources`]: 内容が 1 バイトも変わっていない source はそのまま（WS を張り直さない）、
 //! 変わった（`configFingerprint`・DB の接続先とパスワード・`staleTimeoutMs` を含む）ものは
 //! 止めて作り直し（describe からやり直す）、消えたものは止める。
