@@ -500,6 +500,7 @@ live(slot, now) = now - last_seen_ms <= stale_timeout_ms
 | 上限の超過の端            | 接続                                                                                              | 20 組（`ingest_limit_exceeded` と対の `ingest_limit_cleared` で 1 組、種類をまたいで数える） | `ingest_limit_exceeded` `{ suppressed: 組の数, window_start_ms }`（`kind`・`limit` は無い）                                                  |
 
 - 窓は 1 時間の固定の窓で、最初の記録したい事象で始まる。超えた分は数だけを数え、**窓が明けた後の最初の観測**で 1 行にする（1 回だけ。その後は窓なしに戻る）。観測は記録したい事象に限らない: キーの間引きは、そのキーを照合できた要求すべて（通った要求・記録しない理由で断った要求を含む）、端の間引きは上限の判定を受けたメッセージすべて、未知のキーは値を反映したメッセージすべて。悪い振る舞いが止んで正しい送信に戻っても、抑えた数は失われない。
+- 抑えた数の行（未知のキー・上限の超過の端）の `detail` は接続の項目（`connection_id`・`connection_name_snapshot`）と `suppressed`・`window_start_ms` だけで、`api_key_id`・`api_key_name`・`peer`・`transport` は載せない。接続ごとの間引きで抑えた分は複数のキー・接続元にまたがり、窓明けの観測をした要求のものではないため。
 - 端の**状態**（超過中か・断った数）は間引きと関係なく持ち続ける。間引くのは行を書くことだけ: 抑えた `Exceeded` と対の `Cleared` は書かず、書いた `Exceeded` の対の `Cleared` は窓をまたいでも書く。
 - キーの間引きの状態は `IngestHub` に 1 つ（REST と WS で共有）。持つのは窓が動いている照合できたキーだけで、窓が明けたら捨てる（そのキーの次の観測か、1 時間に 1 回の全体の掃除で。失効したキーなどもう成功しないキーの抑えた数は掃除で出す）。上限 1,024 キーに届いたら、持っていないキーの行は間引かずに記録する（監査を落とさない側。キーは管理者しか作れないので本来は届かない）。未知のキーと端の状態は接続の slot にあり、接続の削除で消える。
 - 実装は `apps/banto-hub/core/src/ingest/audit.rs` の `WindowedAuditThrottle`（共通）・`UnknownKeyThrottle`・`KeyDenialThrottle`・`LimitEdgeThrottle`。WS（R2a-2d）も認証の層 `require_ingest_auth`・`IngestHub::admit`・`audit::refusal_rows` を通るので、同じ間引きが掛かる。

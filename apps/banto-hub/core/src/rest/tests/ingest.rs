@@ -718,6 +718,65 @@ async fn unknown_key_audit_is_throttled_and_carries_no_values() {
     }
 }
 
+/// 抑えた組の数の行は、窓明けの観測をした要求のキー・接続元を載せない（接続ごとの間引き
+/// なので、抑えたのはキー A の組でも、窓明けに観測するのはキー B の要求でありうる）。
+/// B の通常の要求の応答は変わらない。
+#[tokio::test]
+async fn suppressed_limit_edges_do_not_carry_the_observing_key() {
+    let clock = Arc::new(ManualClock::new(1_000_000, 0));
+    let env = test_env_with_clock(clock.clone()).await;
+    let a = push_connection(&env, "Bridge1", true).await;
+    let (key_a_id, key_a) = key_with(&env, "key-a", &[&format!("ingest:#{a}")]).await;
+    let (key_b_id, key_b) = key_with(&env, "key-b", &[&format!("ingest:#{a}")]).await;
+    let empty = || json!({ "items": [] });
+
+    // キー A が 21 組の超過（バケットを使い切って 429 → 1 秒後に通って解消）を起こす。
+    // 20 組は個別に記録され、21 組目だけ抑えられる。
+    for n in 0..21 {
+        loop {
+            let sent = send_json(&env.router, a, &key_a, empty()).await;
+            if sent.status == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            assert_eq!(sent.status, StatusCode::OK, "{n}: {:?}", sent.body);
+        }
+        clock.advance_ms(1_000);
+        let sent = send_json(&env.router, a, &key_a, empty()).await;
+        assert_eq!(sent.status, StatusCode::OK, "{n}: {:?}", sent.body);
+    }
+    let edge_rows = || async {
+        ingest_audit_rows(&env)
+            .await
+            .into_iter()
+            .filter(|(action, ..)| action.starts_with("ingest_limit_"))
+            .collect::<Vec<_>>()
+    };
+    let before = edge_rows().await;
+    assert_eq!(before.len(), 40);
+    assert!(before
+        .iter()
+        .all(|(_, _, _, d)| d["api_key_id"] == key_a_id));
+
+    // 窓が明けた後、キー B の通常の要求が抑えた数を出す。
+    clock.advance_ms(3_600_000);
+    let sent = send_json(&env.router, a, &key_b, empty()).await;
+    assert_eq!(sent.status, StatusCode::OK, "{:?}", sent.body);
+    let after = edge_rows().await;
+    assert_eq!(after.len(), 41);
+    let (action, resource, entity, detail) = &after[40];
+    assert_eq!(action, "ingest_limit_exceeded");
+    assert_eq!(resource, "ingest");
+    assert_eq!(entity.as_deref(), Some(a.to_string().as_str()));
+    assert_eq!(detail["suppressed"], 1);
+    assert_eq!(detail["connection_id"], a);
+    assert_eq!(detail["connection_name_snapshot"], "Bridge1");
+    assert!(detail.get("window_start_ms").is_some());
+    for gone in ["api_key_id", "api_key_name", "peer", "transport"] {
+        assert!(detail.get(gone).is_none(), "{gone}: {detail}");
+    }
+    assert_ne!(detail.get("api_key_id"), Some(&json!(key_b_id)));
+}
+
 /// 照合できたキーの `denied` の間引き（2026-10-21 オーナー決定、§8）: スコープの無い
 /// 接続へ送り続けるキーの行は 1 時間に 100 行まで。窓が明けた後、そのキーの**成功した**
 /// 要求（拒否でない観測）で抑えた数を 1 行出す（1 回だけ）。

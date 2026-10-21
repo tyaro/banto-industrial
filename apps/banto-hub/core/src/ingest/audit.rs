@@ -119,6 +119,22 @@ impl IngestAuditContext {
         }
         Value::Object(map)
     }
+
+    /// 接続の項目だけの `detail`（キー・接続元・経路は載せない）。抑えた数の行用。
+    /// 抑えた分は複数のキー・接続元にまたがり、窓明けの観測をした要求のものではない
+    /// ので載せない。接続名の控えは接続の性質なので残す。
+    fn connection_detail(&self, extra: Value) -> Value {
+        let mut map = Map::new();
+        map.insert("connection_id".into(), json!(self.connection_id));
+        map.insert(
+            "connection_name_snapshot".into(),
+            json!(self.connection_name),
+        );
+        if let Value::Object(extra) = extra {
+            map.extend(extra);
+        }
+        Value::Object(map)
+    }
 }
 
 /// 記録する 1 行（所有する形。`tokio::spawn` へ渡すため）。
@@ -168,18 +184,22 @@ impl IngestAuditRow {
 
     /// 未知のキー（[`UnknownKeyThrottle`] が返した 1 つ）。
     pub fn unknown_key(ctx: &IngestAuditContext, record: &UnknownKeyRecord) -> Self {
-        let extra = match record {
-            UnknownKeyRecord::Key(key) => json!({ "key": key }),
+        // 抑えた数の行は接続の項目だけ（`key_denials_suppressed` と同じ理由: 抑えた行は
+        // 複数のキー・接続元にまたがり、窓明けの観測をした要求のものではないので載せない）。
+        let detail = match record {
+            UnknownKeyRecord::Key(key) => ctx.detail(json!({ "key": key })),
             UnknownKeyRecord::Suppressed {
                 count,
                 window_start_ms,
-            } => json!({ "suppressed": count, "window_start_ms": window_start_ms }),
+            } => ctx.connection_detail(
+                json!({ "suppressed": count, "window_start_ms": window_start_ms }),
+            ),
         };
         Self {
             action: "ingest_unknown_key",
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
-            detail: ctx.detail(extra),
+            detail,
         }
     }
 
@@ -206,28 +226,32 @@ impl IngestAuditRow {
     /// `ingest_limit_exceeded` に `suppressed`・`window_start_ms` を載せた行（`kind`・
     /// `limit` は無い。種類をまたいで数えるため）。
     pub fn limit_edge(ctx: &IngestAuditContext, edge: &LimitEdge) -> Self {
-        let (action, extra) = match edge {
+        // 抑えた数の行は接続の項目だけ（`key_denials_suppressed` と同じ理由: 抑えた組は
+        // 複数のキー・接続元にまたがり、窓明けの観測をした要求のものではないので載せない）。
+        let (action, detail) = match edge {
             LimitEdge::Exceeded { kind, limit } => (
                 "ingest_limit_exceeded",
-                json!({ "kind": kind.as_str(), "limit": limit }),
+                ctx.detail(json!({ "kind": kind.as_str(), "limit": limit })),
             ),
             LimitEdge::Cleared { kind, rejected } => (
                 "ingest_limit_cleared",
-                json!({ "kind": kind.as_str(), "rejected": rejected }),
+                ctx.detail(json!({ "kind": kind.as_str(), "rejected": rejected })),
             ),
             LimitEdge::Suppressed {
                 episodes,
                 window_start_ms,
             } => (
                 "ingest_limit_exceeded",
-                json!({ "suppressed": episodes, "window_start_ms": window_start_ms }),
+                ctx.connection_detail(
+                    json!({ "suppressed": episodes, "window_start_ms": window_start_ms }),
+                ),
             ),
         };
         Self {
             action,
             resource: RESOURCE,
             entity_id: ctx.connection_id.to_string(),
-            detail: ctx.detail(extra),
+            detail,
         }
     }
 }
@@ -975,6 +999,60 @@ mod tests {
         assert_eq!(edge_row.detail["window_start_ms"], 2_000);
         assert!(edge_row.detail.get("kind").is_none());
         assert_eq!(edge_row.detail["connection_name_snapshot"], "Bridge1");
+    }
+
+    /// 抑えた数の行（上限の端・未知のキー）には、観測した要求のキー・接続元・経路が
+    /// 載らない（接続の項目と `suppressed`・`window_start_ms` だけ）。通常の行は載る。
+    #[test]
+    fn suppressed_rows_omit_observer_key_and_peer() {
+        let rows = [
+            IngestAuditRow::limit_edge(
+                &ctx(),
+                &LimitEdge::Suppressed {
+                    episodes: 3,
+                    window_start_ms: 2_000,
+                },
+            ),
+            IngestAuditRow::unknown_key(
+                &ctx(),
+                &UnknownKeyRecord::Suppressed {
+                    count: 4,
+                    window_start_ms: 3_000,
+                },
+            ),
+        ];
+        for row in &rows {
+            let detail = row.detail.as_object().unwrap();
+            for gone in ["api_key_id", "api_key_name", "peer", "transport"] {
+                assert!(!detail.contains_key(gone), "{gone}: {detail:?}");
+            }
+            for kept in [
+                "connection_id",
+                "connection_name_snapshot",
+                "suppressed",
+                "window_start_ms",
+            ] {
+                assert!(detail.contains_key(kept), "{kept}: {detail:?}");
+            }
+            assert_eq!(detail["connection_id"], 12);
+        }
+
+        let normal = [
+            IngestAuditRow::unknown_key(&ctx(), &UnknownKeyRecord::Key("k".into())),
+            IngestAuditRow::limit_edge(
+                &ctx(),
+                &LimitEdge::Exceeded {
+                    kind: LimitKind::ItemRate,
+                    limit: 1,
+                },
+            ),
+        ];
+        for row in &normal {
+            let detail = row.detail.as_object().unwrap();
+            for kept in ["api_key_id", "api_key_name", "peer", "transport"] {
+                assert!(detail.contains_key(kept), "{kept}: {detail:?}");
+            }
+        }
     }
 
     /// 長いキーは 256 文字で切る（文字の境界で）。切った後の名前で重複を数える。
