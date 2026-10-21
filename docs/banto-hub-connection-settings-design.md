@@ -311,6 +311,7 @@ impl ConnectionSecrets {
 ### 5.5 秘密値が読めない PC
 
 - 起こる場面: DB を別の PC に戻した、OS を入れ直した（machine の鍵が変わる）、秘密の行を消した。DPAPI の失敗は `Unreadable { Undecryptable }`、行が無いのは `Unreadable { Missing }`。
+- **形の違う参照**（2026-10-21、#777 のレビュー P2）: `settings` に秘密のキーがあるのに値が `{"$secret": "<32 桁の小文字 16 進>"}` の形でない（壊れた DB・手の書き換え）ものも「読めない」（理由 `invalid`）。キーが無いときだけ「パスワード無し」。`passwordState` は `unreadable`、sink / bridge の設定には載せず、DB Source はその接続を外す。起動時の整合の確認（§5.3）は `malformed` として報告し、値が参照の文字列を含むならその行は孤児として消さない。
 - 「パスワード無し」（`None`）と「読めない」（`Unreadable`）を分ける。今の `unwrap_or_default()` のように空に潰すと、`trust` 認証の DB なら**別の資格で繋がってしまう**（checklist §5「エラーを空に潰さない」）。
 - 表示: REST の応答に `passwordState: "none" | "set" | "unreadable"`（`passwordSet` は今どおり `state == "set"`）。ドロワーは「パスワード: 読めません（この PC で再入力してください）」。状態の画面の `db_source` 節の理由にも同じ文言。
 - 直し方: 接続の編集でパスワードを入れ直す（`Set`）。運用ガイドに「DB を別の PC に移したら postgres 接続のパスワードを入れ直す」を書く。
@@ -349,7 +350,7 @@ HubRuntime::start（runtime.rs:340-）
 ```
 
 - 2-b のレジストリは `HubConfig.drivers.registry`（`runtime.rs:206-207`、`init_db` より前に手元にある）。
-- **実装の注（R2b-1d、2026-10-21）**: 2-b の順は「残り物の掃除（毎回）→ 予行と preflight → バックアップ（§6.4）→ 清掃待ちの印（§6.5）→ 2-c」。**予行をバックアップより先にした**（断られる起動が続いても `.bak` が溜まらず、バックアップは本番の migrate の直前になる）。レジストリを持たない `init_db`（昇格ヘルパー・テスト）は、行のある未移行の DB を `NeedsHubStartup` で断る（予行もバックアップも無しに 0025 を当てない）。バックアップの名前は DB のファイル名から作る（`<DB>.before-0025-<UTC>.bak`）。共通の部品（掃除・未適用の判定・バックアップ）は `banto_tags::upgrade`、レジストリによる preflight と清掃待ちの印は Hub の `upgrade.rs`。3 のうち整合の確認（§5.3）は毎回の起動で行う。封印し直し・キューの封印・`VACUUM` と印を消すのは R2b-1e。
+- **実装の注（R2b-1d、2026-10-21）**: 接続と秘密の行は 1 つの読み取りトランザクションで読む（`get_with_secret_rows`・`list_with_secret_rows`・`RegistrySnapshot::load`。#777 のレビュー P2: 別々に読むと、間に入ったパスワードの更新で正常な接続が「読めない」に見え、サイドカーがグループを作り直して未送信の行を捨てる）。DB Source の計画も §4.4 の除外（ドライバが無い・版が新しすぎる・検証に通らない）を通し、その接続だけを外す。2-b の順は「残り物の掃除（毎回）→ 予行と preflight → バックアップ（§6.4）→ 清掃待ちの印（§6.5）→ 2-c」。**予行をバックアップより先にした**（断られる起動が続いても `.bak` が溜まらず、バックアップは本番の migrate の直前になる）。レジストリを持たない `init_db`（昇格ヘルパー・テスト）は、行のある未移行の DB を `NeedsHubStartup` で断る（予行もバックアップも無しに 0025 を当てない）。バックアップの名前は DB のファイル名から作る（`<DB>.before-0025-<UTC>.bak`）。共通の部品（掃除・未適用の判定・バックアップ）は `banto_tags::upgrade`、レジストリによる preflight と清掃待ちの印は Hub の `upgrade.rs`。3 のうち整合の確認（§5.3）は毎回の起動で行う。封印し直し・キューの封印・`VACUUM` と印を消すのは R2b-1e。
 - 3 は**毎回の起動で冪等**（`plain-v1` の行・平文の `password` か `plain-v1` の `sealedPassword` を持つ未適用キューの行・`password` か `sealedPassword` を持つ履歴の行が無ければ何もしない）。0025 の直後に限らない（非 Windows の DB を Windows へ移した場合も拾う）。
 
 ### 6.2 migration `0025_plc_connections_settings_json.sql`（`banto-tags`）
@@ -379,6 +380,7 @@ plugin-design §7.4（有効化の前に保存済みの設定を新しい版で�
 
 - 断ったとき: `HubStartError::ConnectionSettingsPreflight { rows: Vec<(id, name, protocol, errors)> }`。コンソールの stderr・サービスのログ（今の起動失敗の経路、`db.rs` の `LegacyDatabase` と同じ）に、直し方（旧版の Hub でその接続を直すか消す）と一緒に出す。DB は一切変わっていない（予行は写しだけ）。
 - 予行の時間: `VACUUM INTO` は DB 全体（監査ログを含む）を写す。監査ログが大きい DB で何秒かかるか: R2b-1d で 120 MB（ほとんど監査ログ）の DB を debug ビルドで測り、予行 0.58 秒・バックアップ 1.66 秒（2026-10-21）。
+- **実装の注（R2b-1d、2026-10-21、#777 のレビュー P2）**: 予行は写しを**まず 0024 まで**進めてから旧い値を読み、その後に 0025 を当てて確かめる（0023 より前の DB（alpha.32 以前）は `settings` 列が、0014 より前は `password` 列が無い）。バックアップの消し込みも列や表の有無を見てから行う。`run_to(22)`・`run_to(13)` の DB から Hub の起動を通すテストがある。
 
 ### 6.4 バックアップと戻し方（Q8）
 
