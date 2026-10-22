@@ -54,7 +54,6 @@
 
 use crate::error::PlcError;
 use crate::slmp::address::{self as slmp_address, RegisterAddressDialect, SlmpDevice};
-use banto_driver_api::DriverAddress;
 
 /// Which register/coil space an [`Address`] falls in, and (via
 /// [`crate::planning`]) which Modbus function code reads it.
@@ -131,59 +130,6 @@ pub enum Address {
 }
 
 impl Address {
-    /// The HostBound bridge (R2b-2a, docs/banto-hub-driver-address-design.md
-    /// §4.2, Q3): turn the [`DriverAddress`] a driver's `parse_address`
-    /// produced back into the [`Address`] this crate's planners and clients
-    /// take. `modbus-tcp` goes through [`Address::parse`], `slmp` through
-    /// [`Address::parse_slmp`], on the driver's `canonical` text; since both
-    /// parsers are idempotent on their own canonical form (conformance C1)
-    /// this only fails for a hand-edited `DriverAddress`. Any other driver is
-    /// [`PlcError::UnsupportedDriver`].
-    ///
-    /// This is the only place outside the drivers that names protocols to
-    /// choose an address grammar. Since R2b-3a-2 (docs/banto-hub-driver-io-design.md
-    /// §4.2) the broker and the Hub's instant reads / writes carry
-    /// `DriverAddress` straight to `Session::read_batch`; the one caller left
-    /// is the collection plan (`banto_collect::config::build_request_with_registry`).
-    // R2b-3a-3 で消す（収集の計画が `TagSpec` になったら呼ぶ側が無くなる、設計 §4.3）。
-    pub fn from_driver_address(address: &DriverAddress) -> Result<Self, PlcError> {
-        match address.driver.as_str() {
-            "modbus-tcp" => Address::parse(&address.canonical),
-            "slmp" => Address::parse_slmp(&address.canonical),
-            other => Err(PlcError::UnsupportedDriver(other.to_string())),
-        }
-    }
-
-    /// The temporary inverse of [`Self::from_driver_address`] (R2b-3a-2,
-    /// docs/banto-hub-driver-io-design.md §4.2): the [`DriverAddress`] the
-    /// driver's own `parse_address` reports for this address and `kind`
-    /// (`canonical = Display`, the same text R2b-2 stores, address design
-    /// §1.4; the driver id, area, writability and bit as the Modbus / SLMP
-    /// drivers set them). banto-hub's `BrokerReadClient` uses it to hand the
-    /// collection's `ReadRequest`s to the broker, whose requests are
-    /// `TagSpec`s since 3a-2, while the collection plan still produces
-    /// `ReadRequest` (until 3a-3).
-    // R2b-3a-3 で消す（収集の計画が `TagSpec` を作るようになったら要らない、設計 §4.3）。
-    pub fn to_driver_address(&self, kind: &banto_driver_api::TagKind) -> DriverAddress {
-        let (driver, area, writable, bit) = match *self {
-            Address::ModbusRef { area, bit, .. } => {
-                ("modbus-tcp", area.to_string(), area.is_writable(), bit)
-            }
-            Address::Slmp { device, bit, .. } => ("slmp", device.mnemonic().to_string(), true, bit),
-        };
-        let address = DriverAddress::new(
-            banto_driver_api::DriverId::new(driver).expect("a built-in driver id"),
-            self.to_string(),
-            area,
-            writable,
-            kind.word_count(),
-        );
-        match bit {
-            Some(bit) => address.with_bit(bit),
-            None => address,
-        }
-    }
-
     /// Parse instrumentation reference-number notation (Modbus). Accepts
     /// leading/trailing whitespace (trimmed, matching how
     /// `banto-tags::TagInput` itself trims `address` before storing it -
@@ -670,78 +616,6 @@ mod tests {
                 Address::parse(&rendered).unwrap()
             };
             assert_eq!(reparsed, addr, "{raw} should survive a round trip");
-        }
-    }
-
-    /// R2b-3a-2: the temporary inverse gives back the canonical text and
-    /// the bit, and the bridge reads it again to the same address.
-    #[test]
-    fn to_driver_address_round_trips_through_the_bridge() {
-        use banto_driver_api::{DataType, TagKind};
-        let kind = TagKind::numeric(DataType::Bit);
-        for (address, driver, area, writable) in [
-            (
-                Address::parse("40001.3").unwrap(),
-                "modbus-tcp",
-                "holding_register",
-                true,
-            ),
-            (
-                Address::parse("30005").unwrap(),
-                "modbus-tcp",
-                "input_register",
-                false,
-            ),
-            (Address::parse_slmp("D100.A").unwrap(), "slmp", "D", true),
-            (Address::parse_slmp("M50").unwrap(), "slmp", "M", true),
-        ] {
-            let da = address.to_driver_address(&kind);
-            assert_eq!(da.driver.as_str(), driver);
-            assert_eq!(da.canonical, address.to_string());
-            assert_eq!(da.area, area);
-            assert_eq!(da.writable_area, writable);
-            assert_eq!(
-                da.bit,
-                address
-                    .as_modbus_ref()
-                    .map(|(_, _, b)| b)
-                    .or(address.as_slmp().map(|(_, _, b)| b))
-                    .flatten()
-            );
-            assert_eq!(Address::from_driver_address(&da).unwrap(), address);
-        }
-    }
-
-    /// The HostBound bridge (R2b-2a): by driver id, on the canonical text.
-    #[test]
-    fn from_driver_address_picks_the_grammar_by_driver() {
-        use banto_driver_api::DriverId;
-        let da = |driver: &str, canonical: &str| {
-            DriverAddress::new(DriverId::new(driver).unwrap(), canonical, "x", true, 1)
-        };
-        assert_eq!(
-            Address::from_driver_address(&da("modbus-tcp", "400001.3")).unwrap(),
-            Address::parse("40001.3").unwrap()
-        );
-        assert_eq!(
-            Address::from_driver_address(&da("slmp", "D100.A")).unwrap(),
-            Address::parse_slmp("d100.a").unwrap()
-        );
-        // The grammar is the named driver's: a Modbus number under `slmp` is
-        // not an SLMP device, and vice versa.
-        assert!(matches!(
-            Address::from_driver_address(&da("slmp", "400001")),
-            Err(PlcError::InvalidAddress(_))
-        ));
-        assert!(matches!(
-            Address::from_driver_address(&da("modbus-tcp", "D100")),
-            Err(PlcError::InvalidAddress(_))
-        ));
-        for other in ["push", "postgres", "opc-ua"] {
-            assert!(matches!(
-                Address::from_driver_address(&da(other, "400001")),
-                Err(PlcError::UnsupportedDriver(d)) if d == other
-            ));
         }
     }
 }

@@ -534,6 +534,7 @@ pub fn lock_held(
 /// `chronogazer-server` のエンジンの設定（[`lock`]・[`lock_held`] で同じ）。
 fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) -> EngineConfig {
     EngineConfig {
+        drivers: EngineConfig::builtin_drivers(),
         data_base,
         db_path,
         // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。

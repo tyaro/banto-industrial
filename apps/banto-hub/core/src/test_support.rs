@@ -161,9 +161,8 @@ impl Drop for TempDir {
 ///   `banto_plc`'s grammar of their id (R2b-2c), so the Hub's plan and its
 ///   immediate reads / writes parse as in production. (Design Q14 (a): the
 ///   Hub's REST test harness is not moved to the real drivers here.)
-/// - `client_factory`: `banto_collect::default_client_factory()` - what
-///   `builtin()` returns too (design §2.3), and `banto-collect` is a normal
-///   dependency of this crate already.
+///   Collection reads go through the same fakes since R2b-3a-3 (the broker
+///   read client; there is no direct collection client any more).
 ///
 /// The tests that need a real SLMP / Modbus session went to
 /// `apps/banto-hub/host/tests/` (R2b-0).
@@ -178,10 +177,7 @@ pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
     }
     crate::host_provided::register_host_provided(&mut registry)
         .expect("host-provided ids are distinct");
-    crate::broker_glue::HubDrivers::new(
-        std::sync::Arc::new(registry),
-        banto_collect::default_client_factory(),
-    )
+    crate::broker_glue::HubDrivers::new(std::sync::Arc::new(registry))
 }
 
 /// A connection row of `protocol` at `127.0.0.1:port`, built from its

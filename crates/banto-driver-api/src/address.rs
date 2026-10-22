@@ -10,9 +10,9 @@
 //! the broker's requests are [`TagSpec`](crate::TagSpec) /
 //! [`WriteItem`](crate::WriteItem), which carry it to the driver as is; the
 //! Modbus / SLMP session drivers turn `canonical` back into their own
-//! `banto_plc::Address` privately. The collection plan still goes through
-//! the public bridge `Address::from_driver_address` until R2b-3a-3.
-//! ChronoGazer has no registry and keeps the legacy rules until R2b-7.
+//! `banto_plc::Address` privately. Since R2b-3a-3 the collection plan (Hub
+//! and ChronoGazer) carries the driver's `TagSpec` as is too; ChronoGazer
+//! keeps the legacy rules for saving until R2b-7.
 //!
 //! [`DriverId`] is defined here (rather than with
 //! [`DriverDescriptor`](crate::DriverDescriptor) in [`crate::driver`])

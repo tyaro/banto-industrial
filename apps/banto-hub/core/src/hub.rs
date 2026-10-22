@@ -64,7 +64,7 @@
 //! だけを意味し、Modbus の**収集読み取り**は broker 経由ではなかったが、
 //! #337（2026-09-08）でその収集読み取りも broker セッションへ相乗りした
 //! ため、現在は SLMP と Modbus TCP で扱いが完全に同一である
-//! （`crate::broker_glue::hub_client_factory`の doc comment 参照）。
+//! （`banto_collect::broker_client_factory`の doc comment 参照）。
 //!
 //! ## 接続単位のシミュレーションモード（T9-2、2026-08-06/07。#337 で
 //! Modbus TCP にも同じ扱いが及ぶ）
@@ -105,7 +105,7 @@
 //! 「unchanged」と分類してその接続の収集タスクに一切手を触れない -
 //! ところがタスクが起動時に捕まえた`ClientFactory`（そのクロージャが閉じる
 //! `ReadOnlyHandle`）はタスクの生存期間を通じて固定なので、rebuild の度に
-//! 新しく組み立てる`hub_client_factory`はタスクへ届かない。結果、broker
+//! 新しく組み立てる`banto_collect::broker_client_factory`はタスクへ届かない。結果、broker
 //! セッションが`BrokerSimRegistry::resolve`の`changed`検出で実際には
 //! 入れ替わっていても、動き続けている収集タスクは古い（既に directory
 //! から外れた）セッションを黙って読み続けてしまう。そこで`Self::rebuild`は
@@ -178,7 +178,7 @@
 //! 切れない。`rebuild` は毎回 [`CollectorManager::sync_broker_sessions_from`] で
 //! レジストリの現在の broker 管理対象接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
-//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - broker
+//! ハンドル群を `banto_collect::broker_client_factory` に渡す - broker
 //! 管理対象の接続（SLMP、および #337 以降は Modbus TCP）は
 //! [`crate::broker_glue::BrokerReadClient`] で、その共有セッションを通して
 //! 読む（セッションが張れなかった接続だけが防御的に直接クライアントへ
@@ -209,7 +209,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
-use crate::broker_glue::{hub_client_factory, BrokerSimRegistry, HubSessions};
+use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::db_source::{self, DbConnectionStatus, DbSourceEngine};
 use crate::diag_log::DiagLog;
@@ -1560,8 +1560,8 @@ impl CollectorManager {
         // task wired to a now-superseded broker session forever. See
         // `CollectorConfig::set_broker_dial_target`'s doc comment
         // (`crates/banto-collect/src/config.rs`) for the full derivation.
-        for (key, (host, port)) in &resolved_broker_targets {
-            config.set_broker_dial_target(key, host.clone(), *port);
+        for (key, fingerprint) in &resolved_broker_targets {
+            config.set_broker_dial_target(key, *fingerprint);
         }
 
         // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
@@ -1622,10 +1622,10 @@ impl CollectorManager {
         // effect on failure" contract themselves now. T2-2/#337: the client
         // factory routes every broker-managed connection (SLMP since T2-2,
         // Modbus TCP since #337) through the broker sessions just synced
-        // above, falling back to a direct client only when a connection is
-        // defensively missing from the handle map
-        // (`crate::broker_glue::hub_client_factory`'s doc comment).
-        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
+        // above; a connection defensively missing from the handle map gets a
+        // client that never connects (R2b-3a-3: there is no direct client to
+        // fall back to any more - `banto_collect::broker_client_factory`).
+        let factory = banto_collect::broker_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(collector) = collector_guard.as_mut() {
@@ -1847,7 +1847,7 @@ impl CollectorManager {
     /// enabled-and-broker-managed-protocol connection set (`#131`,
     /// 2026-09-01: `HubSessions::is_broker_managed` - `"slmp"` and
     /// `"modbus-tcp"` today), returning the `"conn:{id}"`-keyed handle map
-    /// [`crate::broker_glue::hub_client_factory`] needs, the connection ids
+    /// [`banto_collect::broker_client_factory`] needs, the connection ids
     /// `self.sessions` still tracks that are NOT in that set (deleted from
     /// the registry, disabled, or changed to a protocol the broker no longer
     /// manages), resolved dial targets, and (see the fourth return value's
@@ -1856,7 +1856,7 @@ impl CollectorManager {
     /// (`crate::write_path`) and *status* (`Self::broker_status`)
     /// broker-routed under #131; **#337 (2026-09-08)** then moved a Modbus
     /// connection's *collection reads* onto the same session too
-    /// (`crate::broker_glue::hub_client_factory`'s doc comment), so the
+    /// (`banto_collect::broker_client_factory`'s doc comment), so the
     /// read-routed subset is no longer narrower than the handle map - see the
     /// fourth return value's own doc paragraph. See
     /// `crate::broker_glue::HubSessions`'s doc comment
@@ -1890,9 +1890,9 @@ impl CollectorManager {
     ///
     /// A registry read failure here is logged and treated as "no
     /// broker-managed connections this rebuild, nothing stale either" (empty
-    /// on both counts: every broker-managed connection falls back to
-    /// `banto_collect::default_client_factory` for this one rebuild, per
-    /// `hub_client_factory`'s defensive fallback, and no session is removed
+    /// on both counts: every broker-managed connection reads Bad for this one
+    /// rebuild (`banto_collect::broker_client_factory` hands a client that
+    /// never connects for a missing handle), and no session is removed
     /// on a registry hiccup) rather than failing the whole `rebuild` - this
     /// sync step is additive/best-effort infrastructure wiring, not a
     /// correctness precondition for the collector build that follows it
@@ -1901,8 +1901,9 @@ impl CollectorManager {
     /// avoids tearing down a session that is still wanted just because the
     /// registry could not be read this one time.
     ///
-    /// **T9-2 third return value**: `resolved_targets` (`"conn:{id}"` ->
-    /// `(host, port)`) carries the SAME resolved dial target `resolve` just
+    /// **T9-2 third return value**: `resolved_targets` (`"conn:{id}"` -> the
+    /// session's settings fingerprint since R2b-3a-3, `(host, port)` before)
+    /// carries the SAME resolved dial target `resolve` just
     /// computed for every broker-routed connection, regardless of
     /// whether it changed. [`Self::rebuild`] feeds every entry into
     /// `banto_collect::CollectorConfig::set_broker_dial_target` - necessary
@@ -1940,7 +1941,7 @@ impl CollectorManager {
     /// connection held a broker session for writes/status while its reads
     /// stayed on banto-collect's own direct `ModbusTcpClient`. #337 moved
     /// Modbus reads onto the broker session too
-    /// (`crate::broker_glue::hub_client_factory`), so "holds a broker
+    /// (`banto_collect::broker_client_factory`), so "holds a broker
     /// session" and "reads through the broker" are now the same set, and
     /// this value is **derived from `handles`** at the end of this fn instead
     /// of accumulated alongside it.
@@ -1956,12 +1957,12 @@ impl CollectorManager {
     /// Deriving it from `handles` also closes a latent hole in the accumulate
     /// version: a key was inserted *before* `ensure_connection` ran, so a
     /// connection whose session failed to spawn was still reported
-    /// read-routed even though `hub_client_factory` would fall back to a
-    /// direct client for it - a `simulation = true` connection in that state
-    /// had `Collector`'s own simulator suppressed and dialed its real
-    /// host/port. `handles` only contains connections whose
+    /// read-routed even though the client factory then had no broker session
+    /// for it (before R2b-3a-3 it fell back to a direct client, and a
+    /// `simulation = true` connection in that state had `Collector`'s own
+    /// simulator suppressed and dialed its real host/port). `handles` only contains connections whose
     /// `ensure_connection` actually succeeded, which is exactly the condition
-    /// `hub_client_factory` routes on.
+    /// `banto_collect::broker_client_factory` routes on.
     ///
     /// **T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8)**: a connection
     /// with nothing to collect - no *enabled* [`banto_tags::CollectionGroup`]
@@ -2014,7 +2015,7 @@ impl CollectorManager {
     ) -> (
         HashMap<String, ReadOnlyHandle>,
         Vec<i64>,
-        HashMap<String, (String, i64)>,
+        HashMap<String, banto_broker::SettingsFingerprint>,
         HashSet<String>,
     ) {
         let mut handles = HashMap::new();
@@ -2033,7 +2034,7 @@ impl CollectorManager {
         // too, so "the broker manages this protocol" and "this connection's
         // reads are broker-routed" have become one and the same question -
         // see this fn's `read_routed_keys` doc paragraph and
-        // `crate::broker_glue::hub_client_factory`'s doc comment.
+        // `banto_collect::broker_client_factory`'s doc comment.
         for conn in snapshot.connections.iter().filter(|c| {
             c.enabled
                 && self.sessions.is_broker_managed(&c.protocol)
@@ -2057,20 +2058,21 @@ impl CollectorManager {
                 self.sessions.remove(conn.id);
             }
             let key = format!("conn:{}", conn.id);
-            let host = dial_settings
-                .get(banto_driver_api::keys::HOST)
-                .unwrap_or_default()
-                .to_string();
-            let port = dial_settings
-                .get(banto_driver_api::keys::PORT)
-                .and_then(|p| p.parse::<i64>().ok())
-                .unwrap_or(0);
-            resolved_targets.insert(key.clone(), (host, port));
+            // R2b-3a-3: the fingerprint of the session (not just its
+            // endpoint), stamped on the plan (`set_broker_dial_target`).
+            resolved_targets.insert(
+                key.clone(),
+                banto_collect::dial_fingerprint(
+                    conn,
+                    &dial_settings,
+                    &self.sessions.drivers().registry,
+                ),
+            );
 
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
             // "slmp"` filter here, deliberately narrower than the
             // `is_broker_managed` filter above, building a separate
-            // `read_routed_keys` set. Its reason: `hub_client_factory`'s
+            // `read_routed_keys` set. Its reason: `banto_collect::broker_client_factory`'s
             // `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
             // the broker), so putting a Modbus key into the set
@@ -2103,8 +2105,8 @@ impl CollectorManager {
                     // (UnsupportedProtocol) and the save path's validation
                     // by the same driver (InvalidSettings) - logged and skipped rather
                     // than failing the rebuild, matching this fn's doc
-                    // comment. `hub_client_factory`'s defensive fallback
-                    // covers this connection for the current rebuild.
+                    // comment. The connection reads Bad for the current
+                    // rebuild (no handle: `banto_collect::broker_client_factory`).
                     self.diag_log.err_line(&format!(
                         "banto-hub: ブローカーセッションの起動に失敗しました (接続 {}): {err}",
                         conn.id
@@ -2243,7 +2245,7 @@ impl CollectorManager {
     /// 統合方針の核心 - 設計 §6 item 5。Modbus TCP は #131 で書き込みが、
     /// #337（2026-09-08）で収集読み取りもこの同じセッションを通るように
     /// なり、現在は SLMP と完全に同じ扱いである -
-    /// `crate::broker_glue::hub_client_factory`の doc comment 参照）。
+    /// `banto_collect::broker_client_factory`の doc comment 参照）。
     ///
     /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
     /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
@@ -2482,8 +2484,8 @@ impl CollectorManager {
         // and why it is `sync_broker_sessions_from`'s job to derive it (#131's
         // narrowing, reworked by #337).
         config.suppress_simulation_for(&read_routed_keys);
-        for (key, (host, port)) in &resolved_broker_targets {
-            config.set_broker_dial_target(key, host.clone(), *port);
+        for (key, fingerprint) in &resolved_broker_targets {
+            config.set_broker_dial_target(key, *fingerprint);
         }
 
         if config.group_count() == 0 {
@@ -2509,7 +2511,7 @@ impl CollectorManager {
             return Ok(());
         }
 
-        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
+        let factory = banto_collect::broker_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(message) = self.take_injected_apply_failure() {

@@ -10,6 +10,7 @@ use std::sync::Arc;
 fn config(dir: &Path) -> EngineConfig {
     let db_path = dir.join("chronogazer.sqlite3");
     EngineConfig {
+        drivers: crate::test_support::drivers(),
         data_base: dir.to_path_buf(),
         db_path,
         key_store: Arc::new(UnavailableKeyStore),
@@ -719,6 +720,7 @@ async fn unwritable_store_dir_stops_until_it_becomes_writable() {
 
     // banto-serve の設定は確かめない（今までどおり起動する）。
     let engine = EngineRuntime::start(EngineConfig {
+        drivers: crate::test_support::drivers(),
         store_dir_check_required: false,
         store_config_required: false,
         ..config(dir.path())

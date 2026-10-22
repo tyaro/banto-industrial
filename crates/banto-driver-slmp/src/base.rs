@@ -9,9 +9,10 @@
 //! the production path: the save path of `banto-tags` (built with a
 //! registry) and the Hub's plan, instant read and write paths call
 //! `parse_address`; since R2b-3a-2 the broker carries the resulting
-//! `TagSpec` to this driver's session as is. Only the collection plan still
-//! goes through the public bridge `Address::from_driver_address` until
-//! R2b-3a-3. ChronoGazer keeps the legacy rules until R2b-7.
+//! `TagSpec` to this driver's session as is, and since R2b-3a-3 so does the
+//! collection plan (banto-hub and ChronoGazer; the public bridge back
+//! to `banto_plc::Address` is gone). ChronoGazer keeps the legacy
+//! rules for saving until R2b-7.
 //!
 //! ## Address functions
 //!
@@ -795,27 +796,11 @@ mod tests {
             let again = SlmpDriver.parse_address(&a.canonical, &k).unwrap();
             assert_eq!(again, a, "{text:?}: parse(canonical) == parse(text)");
             assert_eq!(
-                Address::from_driver_address(&a).unwrap(),
+                Address::parse_slmp(&a.canonical).unwrap(),
                 Address::parse_slmp(text).unwrap(),
                 "{text:?}: bridge"
             );
         }
-    }
-
-    #[test]
-    fn a_driver_address_from_another_driver_is_refused_by_the_bridge() {
-        let a = SlmpDriver.parse_address("D100", &one_word()).unwrap();
-        let foreign = DriverAddress::new(
-            DriverId::new("opc-ua").unwrap(),
-            a.canonical.clone(),
-            a.area.clone(),
-            a.writable_area,
-            a.word_count,
-        );
-        assert!(matches!(
-            Address::from_driver_address(&foreign),
-            Err(banto_plc::PlcError::UnsupportedDriver(d)) if d == "opc-ua"
-        ));
     }
 
     #[test]

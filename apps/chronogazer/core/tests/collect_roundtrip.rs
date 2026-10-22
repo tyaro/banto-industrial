@@ -247,7 +247,11 @@ async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
     let group_key = format!("grp:{group_id}");
     let tag_key = format!("tag:{tag_id}");
 
-    let svc = CollectorService::new(pool.clone(), data_dir.clone());
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir.clone(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
 
     // (a) 開始して Running。
     let outcome = svc.start().await.expect("収集を開始できる");

@@ -114,7 +114,11 @@ async fn fixture_with(
         PlcConnectionService::new(pool.clone()),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
-        CollectorService::new(pool.clone(), PathBuf::from("unused-in-tests")),
+        CollectorService::new(
+            pool.clone(),
+            PathBuf::from("unused-in-tests"),
+            crate::test_support::drivers(),
+        ),
         DisplayGroupService::new(pool),
         auth.clone(),
         tx,

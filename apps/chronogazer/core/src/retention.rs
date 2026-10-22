@@ -449,7 +449,11 @@ mod tests {
         let old = touch(&dir, date(0));
         let today_file = touch(&dir, date(100));
         let pool = migrate_memory().await.expect("migrate_memory");
-        let collect = CollectorService::new(pool, dir.path().to_path_buf());
+        let collect = CollectorService::new(
+            pool,
+            dir.path().to_path_buf(),
+            crate::test_support::drivers(),
+        );
         let report = collect.prune_data_files(7, date(100)).await.unwrap();
         assert_eq!(report.deleted, vec![old.clone()]);
         assert!(!old.exists());

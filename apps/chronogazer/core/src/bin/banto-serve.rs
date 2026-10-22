@@ -122,6 +122,7 @@ async fn main() {
     // 待ち受けは `BANTO_BIND`/`PORT` から決まり、保存済みの `server.*` 設定は
     // 使わない（必須: 開けなければ起動を止める）。
     let engine = match EngineRuntime::start(EngineConfig {
+        drivers: EngineConfig::builtin_drivers(),
         data_base: EngineConfig::db_dir_of(&db_path_buf),
         db_path: db_path_buf,
         key_store,

@@ -261,7 +261,7 @@ fn banto_drivers_helper() -> banto_hub_core::broker_glue::HubDrivers {
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");
-    banto_hub_core::broker_glue::HubDrivers::new(Arc::new(registry), builtin.client_factory)
+    banto_hub_core::broker_glue::HubDrivers::new(Arc::new(registry))
 }
 
 async fn test_app() -> TestApp {

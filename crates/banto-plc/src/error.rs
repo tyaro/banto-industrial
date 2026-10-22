@@ -53,11 +53,13 @@ pub enum PlcError {
     #[error("アドレス形式が不正です: {0}")]
     InvalidAddress(String),
 
-    /// [`crate::address::Address::from_driver_address`] was handed a
-    /// [`banto_driver_api::DriverAddress`] parsed by a driver this crate has
+    /// A [`banto_driver_api::DriverAddress`] parsed by a driver this crate has
     /// no address grammar for (only `modbus-tcp` and `slmp`). A host-side
     /// configuration error resolved before any wire traffic, so it is not
-    /// connection-fatal. Goes away with the bridge (R2b-3a-3).
+    /// connection-fatal. Its producer, the public bridge
+    /// `Address::from_driver_address`, is gone since R2b-3a-3; the variant
+    /// stays in the drivers' classification tables until 3c / 3d remove this
+    /// crate's I/O (docs/banto-hub-driver-io-design.md §6).
     #[error("ドライバ {0:?} のアドレスは banto-plc では扱えません")]
     UnsupportedDriver(String),
 

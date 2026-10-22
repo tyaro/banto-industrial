@@ -425,7 +425,11 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
     let group_key = format!("grp:{group_id}");
     let key = |i: usize| format!("tag:{}", ids[i]);
 
-    let svc = CollectorService::new(pool.clone(), data_dir.clone());
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir.clone(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     assert!(svc.attach_hub(hub.clone()));
 
     // (a) 消えたタグだけ外れて Running。
@@ -659,7 +663,11 @@ impl Fixture {
         );
         let pairs: Vec<(&str, &str)> = specs.iter().map(|s| (s.name, s.data_type)).collect();
         let (conn_id, group_id, ids) = register_hub_specs(&pool, &pairs).await;
-        let svc = CollectorService::new(pool.clone(), data_dir.clone());
+        let svc = CollectorService::new(
+            pool.clone(),
+            data_dir.clone(),
+            chronogazer_core::engine::EngineConfig::builtin_drivers(),
+        );
         assert!(svc.attach_hub(hub.clone()));
         Self {
             _dir: dir,

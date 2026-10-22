@@ -42,6 +42,29 @@
 //! （P2 で `banto-tags` に入った種別。Hub は 1 つ）も**同じ収集エンジン**で
 //! 収集する - 下の「Hub 経由の接続」。
 //!
+//! # PLC は broker のセッションを通して読む（R2b-3a-3）
+//!
+//! docs/banto-hub-driver-io-design.md §8（Q5）: SLMP / Modbus TCP の接続は、
+//! 接続タスクが自分でソケットを張るのではなく、banto-hub と同じ
+//! `banto-broker` のセッション（[`banto_collect::BrokerSessions`]）を通して読む。
+//! 計画もドライバの `parse_address` で組む（`EngineConfig::drivers`）。保存時の
+//! 規則は変えていない（`crate::tag_address`、R2b-7 まで旧い規則）。
+//!
+//! * 開始で計画のどの接続にもセッションを用意し、停止で全部閉じる
+//!   （[`Lifecycle::stop`]。止めた収集のために PLC と繋いだままにしない）。
+//! * シミュレーションの接続は、セッションを用意する前にシミュレータを起動して
+//!   設定の `host` / `port` を差し替える（`banto_collect::BrokerSimRegistry`、
+//!   banto-hub と同じ部品）。シミュレーションの値は記録しない（今までどおり）。
+//! * **出来事の時刻の変化**: `plc_disconnected` / `plc_reconnected` は banto-hub と
+//!   同じ #344 の形になる - 読み取りが失敗した周期で `plc_disconnected`、broker が
+//!   セッションを張り直した（broker の再接続の間隔、1 秒から 30 秒）後の最初の
+//!   読み取りの成功で `plc_reconnected`（1 回の断に 1 組。二重には出さない）。
+//!   読み取りと読み取りの間に収まる瞬断は、どの読み取りも見ていないので出来事に
+//!   ならない。読み取りが見た瞬断は、セッションが
+//!   `banto_collect::BROKER_RECONNECT_GRACE`（3 秒）以内に戻れば、収集の側は
+//!   接続を待ち直すだけで自分の再試行の間隔を重ねない。理由の文言（`detail`、
+//!   画面には出さない）は broker のもの。
+//!
 //! # Hub 経由の接続（#383 段階3 P3）
 //!
 //! * 値は `crate::hub` の購読から取る（[`HubService::collect_source`]、
@@ -644,9 +667,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use banto_collect::{
-    build_config_lenient_with_thresholds, config_exclusions, ClientFactory, CollectError,
-    CollectEvent, Collector, CollectorOptions, ConfigExclusion, ConnectionStatus, CurrentReading,
-    CurrentValuesHandle, EventSink, ExclusionUnit, HubSource, Quality, RegistrySnapshot,
+    build_config_lenient_with_thresholds, config_exclusions, BrokerSessions, ClientFactory,
+    CollectError, CollectEvent, Collector, CollectorOptions, ConfigExclusion, ConnectionStatus,
+    CurrentReading, CurrentValuesHandle, EventSink, ExclusionUnit, HubSource, Quality,
+    RegistrySnapshot,
 };
 use banto_core::{BantoError, ListParams};
 use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
@@ -890,6 +914,7 @@ pub async fn registry_exclusions(
     plc_connections: &PlcConnectionService,
     collection_groups: &CollectionGroupService,
     tags: &TagService,
+    drivers: &banto_driver_api::DriverRegistry,
 ) -> Result<Vec<ExclusionView>, BantoError> {
     let snapshot = RegistrySnapshot {
         connections: plc_connections.list(ListParams::default()).await?.rows,
@@ -898,7 +923,7 @@ pub async fn registry_exclusions(
         // The exclusions never read secrets (ChronoGazer's rows have none, design §6.7).
         secrets: Vec::new(),
     };
-    Ok(exclusion_views(&config_exclusions(&snapshot)))
+    Ok(exclusion_views(&config_exclusions(&snapshot, drivers)))
 }
 
 impl CollectorState {
@@ -1704,10 +1729,18 @@ struct CollectorContext {
     /// rebuild をまたいで `EventSink` を使い回しているのと同じ理由）。
     events: EventSink,
     options: CollectorOptions,
-    /// 接続タスクが再接続に使うクライアントの生成口。本番は
-    /// [`banto_collect::default_client_factory`]（SLMP / Modbus TCP の直結）。
-    /// テストだけが差し替える。
-    factory: ClientFactory,
+    /// 計画を組むドライバと、broker のセッションがダイヤルするドライバ
+    /// （R2b-3a-3、docs/banto-hub-driver-io-design.md §8。host が
+    /// `banto_drivers::builtin().registry` を [`crate::engine::EngineConfig::drivers`] で渡す）。
+    drivers: Arc<banto_driver_api::DriverRegistry>,
+    /// 収集が読む broker のセッション（R2b-3a-3、§8。以前は接続タスクが自分で
+    /// ソケットを張っていた）。**最初の開始で作る**（[`CollectorService::new`] は
+    /// ランタイムの外で呼ばれうる、[`CollectorInner::channels`] と同じ理由）。
+    /// 停止で全部のセッションを閉じる（[`Lifecycle::stop`]）。
+    sessions: OnceLock<BrokerSessions>,
+    /// **テスト専用の差し替え**: `Some` なら broker を使わずにこの生成口で読む
+    /// （偽のクライアント）。本番は常に `None`。
+    factory_override: Option<ClientFactory>,
     /// **公開ロック（葉）**。**書くのは [`Lifecycle`] タスクだけ**なので、
     /// `Collector` の実体と食い違わない。読み取りはどこからでもよい
     /// （[`CollectorService::state`] / [`CollectorService::current_values`] は
@@ -1733,7 +1766,7 @@ struct CollectorContext {
     /// その後タスク側が完了すると追いつく）を、**実時間を待たずに**
     /// 固定するためだけのもの。
     ///
-    /// 偽 [`ClientFactory`] では作れない: `Collector::start` が `await` する
+    /// 偽 [`ClientFactory`] では作れない: `Collector::start_with_sources` が `await` する
     /// のは `TsWriter` を開く往復で、`factory` が呼ばれるのは**その後に
     /// spawn される接続タスクの中**だから（`banto_collect::collector` の
     /// `start_with_client_factory`）。止めたい一点がクライアント生成の手前に
@@ -1858,6 +1891,21 @@ impl CollectorContext {
         published.writer = Some(writer);
     }
 
+    /// 収集が読む broker のセッション（最初の呼び出しで作る、
+    /// [`Self::sessions`] の doc）。
+    fn sessions(&self) -> &BrokerSessions {
+        self.sessions.get_or_init(|| {
+            BrokerSessions::new(self.drivers.clone(), self.options.broker_options())
+        })
+    }
+
+    /// 張っている broker のセッションを全部閉じる（作っていなければ何もしない）。
+    async fn stop_sessions(&self) {
+        if let Some(sessions) = self.sessions.get() {
+            sessions.stop_all().await;
+        }
+    }
+
     /// 走っている書き手の受け口。走っていなければ `None`。
     fn writer(&self) -> Option<std::sync::Weak<banto_tstore::TsWriter>> {
         self.published
@@ -1912,14 +1960,28 @@ impl CollectorService {
     /// 持たない、という invariant）が [`SystemClock`] を名指しできないため。
     /// 本番の時計は 1 つしかないので、差し替えはテスト専用の
     /// `new_for_test` に閉じている。
-    pub fn new(pool: SqlitePool, data_dir: PathBuf) -> Self {
+    ///
+    /// `drivers` は計画を組み、broker のセッションがダイヤルするドライバ
+    /// （R2b-3a-3。host が `banto_drivers::builtin().registry` を詰める）。
+    pub fn new(
+        pool: SqlitePool,
+        data_dir: PathBuf,
+        drivers: Arc<banto_driver_api::DriverRegistry>,
+    ) -> Self {
         Self::build(
             pool.clone(),
             data_dir,
             Arc::new(SystemClock),
             CollectorOptions::default(),
-            banto_collect::default_client_factory(),
+            drivers,
+            None,
         )
+    }
+
+    /// 計画を組むドライバ（`/tags` の除外の印も同じもので判定する、
+    /// [`registry_exclusions`]）。
+    pub fn drivers(&self) -> &Arc<banto_driver_api::DriverRegistry> {
+        &self.inner.ctx.drivers
     }
 
     /// 時系列データの置き場（解決した `data.dir`。サービスが外部かどうかをログに出すため。
@@ -1933,7 +1995,8 @@ impl CollectorService {
         data_dir: PathBuf,
         clock: Arc<dyn Clock>,
         options: CollectorOptions,
-        factory: ClientFactory,
+        drivers: Arc<banto_driver_api::DriverRegistry>,
+        factory_override: Option<ClientFactory>,
     ) -> Self {
         let events = EventSink::new(pool.clone());
         Self::from_context(CollectorContext {
@@ -1942,7 +2005,9 @@ impl CollectorService {
             clock,
             events,
             options,
-            factory,
+            drivers,
+            sessions: OnceLock::new(),
+            factory_override,
             published: Mutex::new(Published {
                 state: CollectorState::Stopped,
                 current: None,
@@ -2516,7 +2581,14 @@ impl CollectorService {
         options: CollectorOptions,
         factory: ClientFactory,
     ) -> Self {
-        Self::build(pool, data_dir, Arc::new(SystemClock), options, factory)
+        Self::build(
+            pool,
+            data_dir,
+            Arc::new(SystemClock),
+            options,
+            crate::test_support::drivers(),
+            Some(factory),
+        )
     }
 
     /// **テスト専用**: [`Lifecycle`] タスクが**居なくなった**状態
@@ -2540,7 +2612,14 @@ impl CollectorService {
         options: CollectorOptions,
         factory: ClientFactory,
     ) -> Self {
-        let svc = Self::build(pool, data_dir, Arc::new(SystemClock), options, factory);
+        let svc = Self::build(
+            pool,
+            data_dir,
+            Arc::new(SystemClock),
+            options,
+            crate::test_support::drivers(),
+            Some(factory),
+        );
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
         let (reads, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
         // **受け手を落とす** = タスクが消えた、と同じ観測になる。
@@ -2572,7 +2651,8 @@ impl CollectorService {
             data_dir,
             Arc::new(SystemClock),
             CollectorOptions::default(),
-            banto_collect::default_client_factory(),
+            crate::test_support::drivers(),
+            None,
         );
         let (commands, command_rx) = mpsc::channel(COMMAND_QUEUE_DEPTH);
         let (reads, read_rx) = mpsc::channel(READ_QUEUE_DEPTH);
@@ -2628,7 +2708,9 @@ impl CollectorService {
             clock: Arc::new(SystemClock),
             events,
             options,
-            factory,
+            drivers: crate::test_support::drivers(),
+            sessions: OnceLock::new(),
+            factory_override: Some(factory),
             published: Mutex::new(Published {
                 state: CollectorState::Stopped,
                 current: None,
@@ -2819,8 +2901,12 @@ impl Lifecycle {
             // hub 接続が無い（どれを渡しても同じ）か、Hub を持たない実行形態。
             None => HubSource::Unavailable,
         };
-        let (config, exclusions) =
-            build_config_lenient_with_thresholds(&snapshot, &thresholds, hub_source);
+        let (mut config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &thresholds,
+            hub_source,
+            &self.ctx.drivers,
+        );
         let exclusions = exclusion_views(&exclusions);
         let external = match (&hub, config.has_external_connections()) {
             (Some(hub), true) => {
@@ -2862,13 +2948,24 @@ impl Lifecycle {
 
         let groups = config.group_count();
         let tags = config.tag_count();
+        // R2b-3a-3（docs/banto-hub-driver-io-design.md §8）: PLC の接続は broker の
+        // セッションを通して読む。計画のどの接続にもセッションを用意し（シミュレーション
+        // の接続はシミュレータのアドレスへ。banto-hub の `BrokerSimRegistry` と同じ形）、
+        // そのハンドルを読む生成口を渡す。
+        let (factory, stale) = match &self.ctx.factory_override {
+            Some(factory) => (factory.clone(), Vec::new()),
+            None => {
+                let sync = self.ctx.sessions().sync(&snapshot, &mut config).await;
+                (sync.factory, sync.stale)
+            }
+        };
         let collector = match Collector::start_with_sources(
             config,
             &self.ctx.data_dir,
             self.ctx.clock.clone(),
             self.ctx.events.clone(),
             self.ctx.options,
-            self.ctx.factory.clone(),
+            factory,
             external,
         )
         .await
@@ -2880,9 +2977,17 @@ impl Lifecycle {
             // の印（[`registry_exclusions`]）で引き続き分かる。
             Err(err) => {
                 self.release_hub_demand().await;
+                // 開いたセッションも閉じる（収集していないのに PLC と繋いだまま
+                // にしない）。
+                self.ctx.stop_sessions().await;
                 return Err(self.fail_start(err));
             }
         };
+        // 前の実行から残ったセッションのうち、もう計画に無いもの（停止で全部
+        // 閉じるので、通常は空）。
+        if let Some(sessions) = self.ctx.sessions.get() {
+            sessions.remove(&stale).await;
+        }
 
         // **成功を確かめてから**状態を上げる（先に Running にして失敗時に
         // 降ろす、という順序にしない - docs/implementation-checklist.md §6
@@ -2928,6 +3033,10 @@ impl Lifecycle {
         let ctx = Arc::clone(&self.ctx);
         let _prune_gate = ctx.writer_gate.lock().await;
         let result = collector.stop().await;
+        // R2b-3a-3: 収集のタスクが止まった後に broker のセッション（とシミュレータ）を
+        // 閉じる。以前は接続タスクが自分のソケットを閉じていた。止めた収集のために
+        // PLC と繋いだままにしない。
+        ctx.stop_sessions().await;
         self.simulated.clear();
         // #383 段階3 P3: 収集が止まったので Hub への需要も取り下げる（Hub は
         // 叩かない。`HubService::release_collect`）。
@@ -3152,7 +3261,8 @@ mod tests {
     use crate::db::init_db_memory;
     use crate::test_support::TempDir;
     use banto_collect::{BackoffConfig, CurrentSample};
-    use banto_plc::{BoxFuture, PlcClient, PlcError, ReadRequest, ReadResult, TagValue};
+    use banto_collect::{CollectClient, ReadBatch};
+    use banto_driver_api::{BoxFuture, FatalError, TagSpec, Value};
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
         TagInput, TagService,
@@ -3249,28 +3359,22 @@ mod tests {
         }
     }
 
-    /// 接続しに行かない偽クライアント。**実 PLC を模さない**（一巡の確認は
+    /// 接続しに行かない偽クライアント（R2b-3a-3: broker のセッションの代わり。
+    /// [`CollectorService::new_for_test`] がこれを渡すと broker を使わない）。
+    /// **実 PLC を模さない**（一巡の確認は
     /// C-4（`tests/collect_roundtrip.rs` と
     /// `e2e/tests/user-simulator-roundtrip.spec.ts`）のハーネスの仕事）が、
     /// 「収集対象があるときに `Collector` が確かに
     /// 立ち上がる」を実ネットワーク無しで押さえるために使う。
     struct OfflineClient;
 
-    impl PlcClient for OfflineClient {
-        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+    impl CollectClient for OfflineClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn read_batch<'a>(
-            &'a mut self,
-            requests: &'a [ReadRequest],
-        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
-            Box::pin(async move {
-                Ok(requests
-                    .iter()
-                    .map(|_| ReadResult::Value(TagValue::F64(1.0)))
-                    .collect())
-            })
+        fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
+            Box::pin(async move { Ok(specs.iter().map(|_| Ok(Value::F64(1.0))).collect()) })
         }
 
         fn disconnect(&mut self) -> BoxFuture<'_, ()> {
@@ -3279,7 +3383,7 @@ mod tests {
     }
 
     fn offline_factory() -> ClientFactory {
-        Arc::new(|_spec| Box::new(OfflineClient) as Box<dyn PlcClient>)
+        Arc::new(|_key: &str| Box::new(OfflineClient) as Box<dyn CollectClient>)
     }
 
     /// 停止の途中で**確実に**止まってくれるゲート。接続タスクの graceful
@@ -3330,21 +3434,13 @@ mod tests {
         gate: Arc<StopGate>,
     }
 
-    impl PlcClient for GatedClient {
-        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+    impl CollectClient for GatedClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn read_batch<'a>(
-            &'a mut self,
-            requests: &'a [ReadRequest],
-        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
-            Box::pin(async move {
-                Ok(requests
-                    .iter()
-                    .map(|_| ReadResult::Value(TagValue::F64(1.0)))
-                    .collect())
-            })
+        fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
+            Box::pin(async move { Ok(specs.iter().map(|_| Ok(Value::F64(1.0))).collect()) })
         }
 
         fn disconnect(&mut self) -> BoxFuture<'_, ()> {
@@ -3355,7 +3451,9 @@ mod tests {
 
     fn gated_factory(gate: &Arc<StopGate>) -> ClientFactory {
         let gate = gate.clone();
-        Arc::new(move |_spec| Box::new(GatedClient { gate: gate.clone() }) as Box<dyn PlcClient>)
+        Arc::new(move |_key: &str| {
+            Box::new(GatedClient { gate: gate.clone() }) as Box<dyn CollectClient>
+        })
     }
 
     /// 「[`COLLECT_OPERATION_TIMEOUT`] に掛からずに終わった」ことを確かめて、
@@ -4070,6 +4168,7 @@ mod tests {
             &PlcConnectionService::new(pool.clone()),
             &CollectionGroupService::new(pool.clone()),
             &TagService::new(pool.clone()),
+            &crate::test_support::drivers(),
         )
         .await
         .expect("registry_exclusions");
@@ -4162,6 +4261,7 @@ mod tests {
             &PlcConnectionService::new(pool.clone()),
             &CollectionGroupService::new(pool.clone()),
             &TagService::new(pool.clone()),
+            &crate::test_support::drivers(),
         )
         .await
         .expect("registry_exclusions");

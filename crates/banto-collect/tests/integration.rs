@@ -20,10 +20,11 @@ use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use banto_collect::{
-    build_config, build_config_lenient_with_thresholds, default_client_factory, BackoffConfig,
+    build_config, build_config_lenient_with_thresholds, ApplyReport, BackoffConfig, BrokerSessions,
     CollectError, Collector, CollectorConfig, CollectorOptions, ConnectionStatus, EventSink,
     HubSource, Quality, RegistrySnapshot, Thresholds,
 };
+use banto_driver_api::DriverRegistry;
 use banto_plc::modbus::simulator::Simulator;
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
@@ -133,6 +134,66 @@ impl Drop for TempEnv {
 
 /// Open the shared registry/event pool and apply both crates' schemas
 /// (the same startup sequence the ChronoGazer app will run).
+/// The built-in drivers (Modbus TCP and SLMP): every plan is read through
+/// them and every PLC read goes through a broker session dialing them
+/// (R2b-3a-3, docs/banto-hub-driver-io-design.md §4.3・§8).
+fn drivers() -> &'static DriverRegistry {
+    &DRIVERS
+}
+
+static DRIVERS: LazyLock<Arc<DriverRegistry>> =
+    LazyLock::new(|| Arc::new(banto_drivers::builtin().registry));
+
+/// The broker sessions one test's collector reads through
+/// ([`BrokerSessions`], what ChronoGazer uses). Dropping it stops every
+/// session (the supervisor's shutdown signal goes away with it), so keeping
+/// it alive until the end of the test is enough.
+struct Broker(BrokerSessions);
+
+/// Start a collector the way a host without a broker of its own does
+/// (R2b-3a-3): sync the broker sessions for `config` from the registry in
+/// `pool`, then start with the factory that reads through them.
+async fn start_collector(
+    pool: &SqlitePool,
+    mut config: CollectorConfig,
+    data_dir: &Path,
+    clock: Arc<dyn banto_tstore::Clock>,
+    events: EventSink,
+    options: CollectorOptions,
+) -> Result<(Collector, Broker), CollectError> {
+    let broker = Broker(BrokerSessions::new(
+        DRIVERS.clone(),
+        options.broker_options(),
+    ));
+    let snapshot = RegistrySnapshot::load(pool).await.unwrap();
+    let sync = broker.0.sync(&snapshot, &mut config).await;
+    let collector = Collector::start_with_client_factory(
+        config,
+        data_dir,
+        clock,
+        events,
+        options,
+        sync.factory,
+    )
+    .await?;
+    Ok((collector, broker))
+}
+
+/// `apply_config` through the same broker sessions: sync for the new config,
+/// apply, then stop the sessions that fell out of it.
+async fn apply_through(
+    collector: &mut Collector,
+    broker: &Broker,
+    pool: &SqlitePool,
+    mut config: CollectorConfig,
+) -> Result<ApplyReport, CollectError> {
+    let snapshot = RegistrySnapshot::load(pool).await.unwrap();
+    let sync = broker.0.sync(&snapshot, &mut config).await;
+    let report = collector.apply_config(config, sync.factory).await?;
+    broker.0.remove(&sync.stale).await;
+    Ok(report)
+}
+
 async fn open_registry(env: &TempEnv) -> SqlitePool {
     let pool = banto_storage::connect_sqlite(env.registry_path())
         .await
@@ -324,8 +385,9 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
     scaled.eng_hi = Some(100.0);
     tag_svc.create(scaled).await.unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -361,6 +423,86 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
     );
 }
 
+/// T9-1 / R2b-3a-3 (docs/banto-hub-driver-io-design.md §8): a
+/// `simulation = true` connection whose real host can never answer
+/// (`203.0.113.1`, TEST-NET-3, RFC 5737) still collects live, changing
+/// values - proof that [`BrokerSessions`] started an in-process simulator,
+/// dialed the broker session at it, and that its ramp generator is running.
+/// Simulated values are shown but never recorded (no row in the store).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_simulated_connection_reads_a_simulator_through_the_broker() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("simulated");
+    let pool = open_registry(&env).await;
+    let mut input = conn_input("PLC1", 502);
+    input.host = "203.0.113.1".to_string();
+    input.simulation = true;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(input)
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, broker) = start_collector(
+        &pool,
+        config,
+        &env.data_dir(),
+        Arc::new(SystemClock),
+        EventSink::new(pool.clone()),
+        fast_options(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(broker.0.connection_count(), 1);
+
+    let current = collector.current_values();
+    let key = format!("tag:{}", tag.id);
+    let first = Arc::new(std::sync::Mutex::new(None::<f64>));
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            let sample = current.get(&key);
+            match sample {
+                Some(s) if s.quality == Quality::Good => {
+                    *first.lock().unwrap() = s.value;
+                    s.value.is_some()
+                }
+                _ => false,
+            }
+        })
+        .await,
+        "no Good reading - the broker session never reached the simulator"
+    );
+    let first_value = first.lock().unwrap().unwrap();
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            current
+                .get(&key)
+                .and_then(|s| s.value)
+                .is_some_and(|v| v != first_value)
+        })
+        .await,
+        "the simulated register never changed - the ramp generator is not running"
+    );
+
+    collector.stop().await.unwrap();
+    broker.0.shutdown().await;
+    assert!(
+        read_all_group_rows(&env.data_dir())
+            .await
+            .iter()
+            .all(|row| row.values.iter().all(Option::is_none)),
+        "a simulated value must never be recorded"
+    );
+}
+
 /// #334 regression: `plc_connections.word_order` was ignored on the
 /// collection-polling path even after #333 wired it into
 /// `banto_collect::config`'s `ModbusTcpConfig`/`SlmpConfig` builders. The
@@ -371,6 +513,9 @@ async fn collects_values_in_tag_order_with_scaling_applied() {
 /// regardless of what the connection was registered with. Read-on-demand
 /// (the `banto_broker` path) reads `ProtocolConfig` directly and was never
 /// affected, so the two paths silently disagreed on the same tag's value.
+/// Since R2b-3a-3 the polling path reads through the broker too, with the
+/// connection's own settings - there is no copy left to drop a field; this
+/// keeps pinning the result end to end.
 ///
 /// This pins the *polling* path end to end, against a real simulator socket:
 /// an f32 tag and an f64 tag (#325, 4 registers) on a `word_order =
@@ -455,8 +600,9 @@ async fn word_order_low_high_is_honored_by_the_polling_path() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -551,8 +697,9 @@ async fn bit_tags_record_zero_or_one() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -598,10 +745,11 @@ async fn lifecycle_events_are_emitted_and_persisted() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let events = EventSink::new(pool.clone());
     let mut rx = events.subscribe();
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -663,9 +811,10 @@ async fn hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let conn_key = format!("conn:{}", conn.id);
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -751,8 +900,9 @@ async fn auto_reconnects_and_values_resume_after_recovery() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -829,8 +979,9 @@ async fn slmp_collects_values_and_writes_to_tstore() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -885,9 +1036,10 @@ async fn slmp_hard_drop_keeps_appending_null_rows_and_marks_reconnecting() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let conn_key = format!("conn:{}", conn.id);
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -973,8 +1125,9 @@ async fn slmp_auto_reconnects_and_values_resume_after_recovery() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1042,6 +1195,7 @@ async fn config_with_thresholds(
         &snapshot,
         &std::collections::HashMap::from([(tag_id, limits)]),
         HubSource::Unavailable,
+        drivers(),
     );
     assert!(exclusions.is_empty(), "{exclusions:?}");
     config
@@ -1087,7 +1241,8 @@ async fn threshold_entered_and_cleared_fire_only_on_edges() {
         },
     )
     .await;
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1221,8 +1376,9 @@ async fn hub_build_raises_no_threshold_event_even_for_pre_0018_threshold_columns
         .await
         .expect("collect migrate");
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1277,7 +1433,7 @@ async fn current_value_quality_transitions_good_bad_stale() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     // ManualClock so staleness can be forced deterministically after stop.
     // (Frozen "now" makes every append share one ptime; `banto-tstore`'s
     // upsert - owner decision 2026-08-08, docs/improvement-plan.md H4 -
@@ -1285,7 +1441,8 @@ async fn current_value_quality_transitions_good_bad_stale() {
     // stored row rather than rejecting it, so this is harmless here - this
     // test only inspects the in-memory cache, not the stored row count.)
     let clock = Arc::new(ManualClock::new(1_760_000_000_000, 0));
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         clock.clone(),
@@ -1367,7 +1524,7 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let base_ms: i64 = 1_780_000_000_000;
     // ManualClock so the regression/recovery can be driven deterministically
     // by the test rather than waiting for real wall-clock drift - scheduling
@@ -1375,7 +1532,8 @@ async fn clock_regression_emits_edge_events_and_overwrites_the_colliding_row() {
     // `task.rs`'s module doc); only the *stamped* `ptime_ms` comes from this
     // clock, which is exactly what H4's detection watches.
     let clock = Arc::new(ManualClock::new(base_ms, 0));
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         clock.clone(),
@@ -1494,7 +1652,7 @@ async fn stop_flushes_buffered_rows_so_none_are_lost() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     // Buffer generously and never flush on interval/row-count: only stop()'s
     // final flush can move rows to disk, so every row a post-stop reader sees
     // proves stop() flushed.
@@ -1505,7 +1663,8 @@ async fn stop_flushes_buffered_rows_so_none_are_lost() {
         },
         ..fast_options()
     };
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1553,9 +1712,10 @@ async fn status_reports_connected_while_running_and_stop_completes_cleanly() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let conn_key = format!("conn:{}", conn.id);
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1614,8 +1774,9 @@ async fn collection_over_several_periods_uses_exactly_one_socket() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1704,7 +1865,7 @@ async fn time_stop_with_unresponsive_plcs(label: &str, n: usize) -> (Duration, u
             .await
             .unwrap();
     }
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     let options = CollectorOptions {
         writer_options: WriterOptions {
             max_buffered_rows: 100_000,
@@ -1712,7 +1873,8 @@ async fn time_stop_with_unresponsive_plcs(label: &str, n: usize) -> (Duration, u
         },
         ..CollectorOptions::default()
     };
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1815,7 +1977,8 @@ async fn collect_events_rows_carry_the_full_shape() {
         },
     )
     .await;
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -1914,9 +2077,10 @@ async fn mini_soak_100ms_three_groups_row_counts_within_tolerance() {
             .unwrap();
     }
 
-    let config = build_config(&pool).await.unwrap();
+    let config = build_config(&pool, drivers()).await.unwrap();
     assert_eq!(config.group_count(), 3);
-    let collector = Collector::start(
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -2002,8 +2166,9 @@ async fn long_soak_sixty_seconds() {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -2056,6 +2221,7 @@ struct OneConnEnv {
     conn_a_key: String,
     tag_a_key: String,
     collector: Collector,
+    broker: Broker,
     // Declared LAST: Rust drops struct fields in declaration order, and
     // `TempEnv::drop`'s `remove_dir_all` retry only has a chance once every
     // `SqlitePool` clone above (in particular `pool`) has actually been
@@ -2084,8 +2250,9 @@ async fn one_conn_setup(label: &str) -> OneConnEnv {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -2113,6 +2280,7 @@ async fn one_conn_setup(label: &str) -> OneConnEnv {
         conn_a_key: format!("conn:{}", conn_a.id),
         tag_a_key,
         collector,
+        broker: _broker,
     }
 }
 
@@ -2132,6 +2300,7 @@ struct TwoConnEnv {
     conn_a_key: String,
     conn_b_key: String,
     collector: Collector,
+    broker: Broker,
     // Declared LAST - see `OneConnEnv`'s `env` field comment.
     env: TempEnv,
 }
@@ -2172,8 +2341,9 @@ async fn two_conn_setup(label: &str) -> TwoConnEnv {
         .await
         .unwrap();
 
-    let config = build_config(&pool).await.unwrap();
-    let collector = Collector::start(
+    let config = build_config(&pool, drivers()).await.unwrap();
+    let (collector, _broker) = start_collector(
+        &pool,
         config,
         &env.data_dir(),
         Arc::new(SystemClock),
@@ -2214,6 +2384,7 @@ async fn two_conn_setup(label: &str) -> TwoConnEnv {
         conn_a_key: format!("conn:{}", conn_a.id),
         conn_b_key: format!("conn:{}", conn_b.id),
         collector,
+        broker: _broker,
     }
 }
 
@@ -2244,10 +2415,8 @@ async fn apply_config_adding_a_tag_to_b_never_restarts_a() {
         .unwrap();
     let tag_b2_key = format!("tag:{}", tag_b2.id);
 
-    let new_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(new_config, default_client_factory())
+    let new_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(&mut setup.collector, &setup.broker, &setup.pool, new_config)
         .await
         .expect("apply_config should succeed");
 
@@ -2329,10 +2498,8 @@ async fn apply_config_adding_a_connection_leaves_the_existing_one_untouched() {
     let tag_b_key = format!("tag:{}", tag_b.id);
     let conn_b_key = format!("conn:{}", conn_b.id);
 
-    let new_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(new_config, default_client_factory())
+    let new_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(&mut setup.collector, &setup.broker, &setup.pool, new_config)
         .await
         .expect("apply_config should succeed");
 
@@ -2394,10 +2561,8 @@ async fn apply_config_removing_a_connection_retains_the_rest() {
         .await
         .unwrap();
 
-    let new_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(new_config, default_client_factory())
+    let new_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(&mut setup.collector, &setup.broker, &setup.pool, new_config)
         .await
         .expect("apply_config should succeed");
 
@@ -2467,10 +2632,8 @@ async fn apply_config_settings_only_change_does_not_rotate_the_writer() {
         .await
         .unwrap();
 
-    let new_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(new_config, default_client_factory())
+    let new_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(&mut setup.collector, &setup.broker, &setup.pool, new_config)
         .await
         .expect("apply_config should succeed");
 
@@ -2561,13 +2724,16 @@ async fn apply_config_failed_rotation_touches_nothing_and_retry_replaces_only_a(
         .await
         .unwrap();
     let tag_a2_key = format!("tag:{}", tag_a2.id);
-    let failing_config = build_config(&setup.pool).await.unwrap();
+    let failing_config = build_config(&setup.pool, drivers()).await.unwrap();
 
-    let err = setup
-        .collector
-        .apply_config(failing_config, default_client_factory())
-        .await
-        .expect_err("opening the rotated writer must fail");
+    let err = apply_through(
+        &mut setup.collector,
+        &setup.broker,
+        &setup.pool,
+        failing_config,
+    )
+    .await
+    .expect_err("opening the rotated writer must fail");
     assert!(
         matches!(err, CollectError::Tstore(_)),
         "expected a Tstore error, got {err:?}"
@@ -2620,12 +2786,15 @@ async fn apply_config_failed_rotation_touches_nothing_and_retry_replaces_only_a(
     // Remove the sabotage and retry with a freshly built config - the
     // collector must still be in a perfectly usable state.
     std::fs::remove_dir(&sabotage_path).expect("remove sabotage directory");
-    let retry_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(retry_config, default_client_factory())
-        .await
-        .expect("retry after removing the sabotage should succeed");
+    let retry_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(
+        &mut setup.collector,
+        &setup.broker,
+        &setup.pool,
+        retry_config,
+    )
+    .await
+    .expect("retry after removing the sabotage should succeed");
     assert!(report.writer_rotated);
     // The retry's config adds t2 to A's group, so A's plan changed and A is
     // (by design) replaced; B's plan did not change.
@@ -2737,10 +2906,8 @@ async fn apply_config_writer_rotation_preserves_old_and_new_data() {
     let group_b_key = format!("grp:{}", group_b.id);
     let tag_b_key = format!("tag:{}", tag_b.id);
 
-    let new_config = build_config(&setup.pool).await.unwrap();
-    let report = setup
-        .collector
-        .apply_config(new_config, default_client_factory())
+    let new_config = build_config(&setup.pool, drivers()).await.unwrap();
+    let report = apply_through(&mut setup.collector, &setup.broker, &setup.pool, new_config)
         .await
         .expect("apply_config should succeed");
     assert!(report.writer_rotated);

@@ -16,7 +16,15 @@ banto-tags = { path = "../banto-tags" }
 # (`build_config_from_with_registry`). A dependency-free crate; banto-tags already
 # depends on it.
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
-# I2: PlcClient trait + Modbus TCP client + address/type parsing.
+# R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3・§8): every PLC connection is
+# read through a broker session - `crate::client::BrokerReadClient` wraps its
+# read-only handle, and `crate::sessions::BrokerSessions` owns a supervisor for
+# a host without a broker of its own (ChronoGazer). banto-broker depends only on
+# banto-tags / banto-driver-api, so there is no cycle.
+banto-broker = { path = "../banto-broker" }
+# I2: address/type parsing (since R2b-3a-3 only for the legacy save-time rule
+# `check_tag_address`; collection reads go through the broker, not a `PlcClient`)
+# and the in-process simulators.
 #
 # T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): the `simulator` feature
 # used to be a *dev*-dependency only ("production collection just uses
@@ -68,3 +76,8 @@ tempfile = { workspace = true }
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite", "migrate"] }
 # R2b-1d: the §4.4 exclusion tests build connections' JSON `settings`.
 serde_json = { workspace = true }
+# R2b-3a-3: the plan is built with a driver registry and read through the
+# broker, so the tests use the built-in drivers (banto-drivers no longer
+# depends on this crate) and the broker's fake handles (#344's tests).
+banto-drivers = { path = "../banto-drivers" }
+banto-broker = { path = "../banto-broker", features = ["test-util"] }

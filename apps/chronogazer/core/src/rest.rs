@@ -1234,6 +1234,8 @@ struct TagRegistryState {
     hub: HubService,
     auth: AuthState,
     audit: AuditLogService,
+    // R2b-3a-3: `/api/config-exclusions` は収集の計画と同じドライバで判定する。
+    drivers: Arc<banto_driver_api::DriverRegistry>,
 }
 
 async fn plc_connections_list(
@@ -1400,6 +1402,7 @@ async fn config_exclusions_list(
             &state.plc_connections,
             &state.collection_groups,
             &state.tags,
+            &state.drivers,
         )
         .await?,
     ))
@@ -1831,6 +1834,7 @@ fn hub_registration_router(state: HubRegistrationState) -> Router {
 /// ("まだ N 件の...から参照されています") live there, shared verbatim with
 /// the Tauri commands (`plc_connections_*`/`collection_groups_*`/`tags_*`
 /// in `src-tauri`) - invariant: both transport paths behave identically.
+#[allow(clippy::too_many_arguments)]
 fn tag_registry_router(
     plc_connections: PlcConnectionService,
     collection_groups: CollectionGroupService,
@@ -1839,6 +1843,7 @@ fn tag_registry_router(
     hub: HubService,
     audit: AuditLogService,
     auth: AuthState,
+    drivers: Arc<banto_driver_api::DriverRegistry>,
 ) -> Router {
     let state = TagRegistryState {
         plc_connections,
@@ -1848,6 +1853,7 @@ fn tag_registry_router(
         hub,
         auth: auth.clone(),
         audit,
+        drivers,
     };
     Router::new()
         .route(
@@ -1989,6 +1995,7 @@ pub fn api_router(
         log_label: host.log_label,
     });
 
+    let collect_drivers = collect.drivers().clone();
     Router::new()
         .merge(audited_auth_routes)
         .merge(extra_auth_router(
@@ -2048,6 +2055,7 @@ pub fn api_router(
             hub,
             audit,
             auth.clone(),
+            collect_drivers,
         ))
         .merge(ui_settings_router(settings, auth))
         .merge(settings_admin)
@@ -2329,7 +2337,11 @@ mod tests {
     /// `crate::collect::CollectorState::NoTargets` で止まるので、この
     /// ディレクトリは一度も触られない。
     fn test_collector_service(pool: sqlx::SqlitePool) -> CollectorService {
-        CollectorService::new(pool, PathBuf::from("unused-in-tests"))
+        CollectorService::new(
+            pool,
+            PathBuf::from("unused-in-tests"),
+            crate::test_support::drivers(),
+        )
     }
 
     async fn body_json(response: axum::response::Response) -> serde_json::Value {
@@ -3177,7 +3189,7 @@ mod tests {
         let backup = unused_backup_service(pool.clone());
         let (plc_connections, collection_groups, tags) = tag_registry_services(pool.clone());
         let display_groups = DisplayGroupService::new(pool.clone());
-        let collect = CollectorService::new(pool.clone(), data_dir);
+        let collect = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
         let audit = match spool_db_path {
             Some(dir) => crate::audit_spool::build_audit_service(Db::Sqlite(pool), dir),
             None => AuditLogService::new(Db::Sqlite(pool)),
@@ -4993,7 +5005,9 @@ mod tests {
             .unwrap()
             .id;
         assert!(
-            banto_collect::build_config(&pool).await.is_err(),
+            banto_collect::build_config(&pool, &crate::test_support::drivers())
+                .await
+                .is_err(),
             "前提が崩れている: 不正タグがあるのに build_config が通る"
         );
         let path = format!("/api/tags/{legacy_id}");
@@ -5012,7 +5026,7 @@ mod tests {
         assert!(!tags.get(legacy_id).await.unwrap().enabled);
 
         // その後の build_config は成功し、正常なタグだけが収集対象に残る。
-        let config = banto_collect::build_config(&pool)
+        let config = banto_collect::build_config(&pool, &crate::test_support::drivers())
             .await
             .expect("不正タグを無効化した後は build_config が通ること");
         assert_eq!(config.tag_count(), 1);

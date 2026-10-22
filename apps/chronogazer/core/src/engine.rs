@@ -260,6 +260,10 @@ pub enum EngineListen {
 pub struct EngineConfig {
     /// 設定 DB のファイル。A1 の排他の単位でもある。
     pub db_path: PathBuf,
+    /// 収集の計画を組み、broker のセッションがダイヤルするドライバ（R2b-3a-3、
+    /// docs/banto-hub-driver-io-design.md §8）。host が `banto_drivers::builtin().registry`
+    /// を詰める（このクレートは組み込みのドライバを名指ししない）。
+    pub drivers: Arc<banto_driver_api::DriverRegistry>,
     /// `data.dir` の相対パスの基準（[`resolve_data_dir`]）。デスクトップは
     /// アプリのデータディレクトリ、`banto-serve` は DB の置き場
     /// （[`EngineConfig::db_dir_of`]）。
@@ -302,6 +306,13 @@ pub struct EngineConfig {
 }
 
 impl EngineConfig {
+    /// The built-in drivers (Modbus TCP and SLMP) every host fills
+    /// [`Self::drivers`] with (R2b-3a-3). One place, so `src-tauri` needs no
+    /// dependency of its own on `banto-drivers`.
+    pub fn builtin_drivers() -> Arc<banto_driver_api::DriverRegistry> {
+        Arc::new(banto_drivers::builtin().registry)
+    }
+
     /// DB ファイルの置き場（`data.dir` の基準などに使う）。ファイル名だけの
     /// パス（`parent()` が空）は作業ディレクトリ（`"."`）。
     pub fn db_dir_of(db_path: &Path) -> PathBuf {
@@ -1027,7 +1038,7 @@ impl OpenedEngine {
                 });
             }
         }
-        let collect = CollectorService::new(pool.clone(), collect_data_dir);
+        let collect = CollectorService::new(pool.clone(), collect_data_dir, cfg.drivers.clone());
         if cfg.attach_hub {
             // 自動開始（下）より前に繋ぐ。
             collect.attach_hub(hub.clone());
@@ -1484,6 +1495,7 @@ mod tests {
     fn config(dir: &Path, listen: EngineListen) -> EngineConfig {
         let db_path = dir.join("chronogazer.sqlite3");
         EngineConfig {
+            drivers: crate::test_support::drivers(),
             data_base: EngineConfig::db_dir_of(&db_path),
             db_path,
             key_store: Arc::new(UnavailableKeyStore),
@@ -1642,6 +1654,7 @@ mod tests {
     async fn unreadable_store_config_stops_only_when_required() {
         let dir = TempDir::new();
         let opened = EngineRuntime::open(EngineConfig {
+            drivers: crate::test_support::drivers(),
             store_config_required: true,
             ..config(dir.path(), EngineListen::Required(loopback_any_port()))
         })
@@ -1765,7 +1778,11 @@ mod tests {
 
         drop(engine);
         let pool = init_db(&db_path).await.expect("開き直す");
-        let reader = CollectorService::new(pool.clone(), dir.path().join("data"));
+        let reader = CollectorService::new(
+            pool.clone(),
+            dir.path().join("data"),
+            crate::test_support::drivers(),
+        );
         let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
             Readout::Ready { data } => data.rows,
             other => panic!("イベントが読めない: {}", other.as_str()),
@@ -2284,7 +2301,11 @@ mod tests {
         // 最終 flush が通った: 別に開き直した DB に `collection_stopped` が残る。
         drop(engine);
         let pool = init_db(&db_path).await.expect("開き直す");
-        let reader = CollectorService::new(pool.clone(), dir.path().join("data"));
+        let reader = CollectorService::new(
+            pool.clone(),
+            dir.path().join("data"),
+            crate::test_support::drivers(),
+        );
         let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
             Readout::Ready { data } => data.rows,
             other => panic!("イベントが読めない: {}", other.as_str()),

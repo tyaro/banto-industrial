@@ -448,7 +448,7 @@ async fn tags_across_groups_are_merged_in_request_order_with_nulls_where_nothing
     }
     writer.close().await.expect("writer を閉じる");
 
-    let svc = CollectorService::new(pool.clone(), data_dir);
+    let svc = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
     let unknown = 999_999;
     let request = validate_history_request(
         &[b1, a_excluded, a1, unknown, s1, a2],
@@ -530,7 +530,11 @@ async fn no_data_files_yet_is_ready_with_nulls_not_unavailable() {
     let conn = connection(&pool, "real", false).await;
     let grp = group(&pool, "A", conn, 1000).await;
     let t = tag(&pool, "t", grp).await;
-    let svc = CollectorService::new(pool.clone(), dir.path().join("never-created"));
+    let svc = CollectorService::new(
+        pool.clone(),
+        dir.path().join("never-created"),
+        crate::test_support::drivers(),
+    );
     assert_eq!(svc.state(), CollectorState::Stopped);
 
     let request = validate_history_request(&[t], BASE_MS, BASE_MS + 9_999, 10).unwrap();
@@ -566,7 +570,7 @@ async fn unreadable_store_or_registry_is_unavailable_without_a_reason() {
     let conn = connection(&pool, "real", false).await;
     let grp = group(&pool, "A", conn, 1000).await;
     let t = tag(&pool, "t", grp).await;
-    let svc = CollectorService::new(pool.clone(), data_dir);
+    let svc = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
     let request = validate_history_request(&[t], BASE_MS, BASE_MS + 9_999, 10).unwrap();
 
     let readout = svc.history(&request).await;
@@ -601,7 +605,7 @@ async fn history_does_not_wait_for_a_stuck_lifecycle_task() {
         pool.clone(),
         dir.path().join("data"),
         CollectorOptions::default(),
-        banto_collect::default_client_factory(),
+        banto_collect::broker_client_factory(Arc::new(Default::default())),
         gate.clone(),
     );
 
@@ -673,7 +677,7 @@ async fn raw_passthrough_is_folded_down_to_bins() {
         .expect("読める");
     assert_eq!(raw.bins.len(), 120, "素通しの前提が崩れている");
 
-    let svc = CollectorService::new(pool.clone(), data_dir);
+    let svc = CollectorService::new(pool.clone(), data_dir, crate::test_support::drivers());
     let request = validate_history_request(&[t], BASE_MS, BASE_MS + 59_999, 60).unwrap();
     let Readout::Ready { data } = svc.history(&request).await else {
         panic!("読めるはず");
@@ -702,7 +706,11 @@ async fn the_gap_only_path_never_exceeds_bins_at_the_budget() {
     for i in 0..4 {
         ids.push(tag(&pool, &format!("t{i}"), grp).await);
     }
-    let svc = CollectorService::new(pool.clone(), dir.path().join("never-created"));
+    let svc = CollectorService::new(
+        pool.clone(),
+        dir.path().join("never-created"),
+        crate::test_support::drivers(),
+    );
     let request = validate_history_request(
         &ids,
         BASE_MS,
