@@ -153,10 +153,13 @@ impl DriverBase for SlmpDriver {
                 text.trim()
             ))
         })?;
-        let (device, _number, bit) = address
+        let (device, number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
         check_kind(text, device, bit, kind)?;
+        if let Some(message) = past_last_number(text.trim(), device, number, bit, kind) {
+            return Err(AddressError::new(message));
+        }
         // SLMP has no read-only device at the protocol level (a CPU's write
         // protection answers with an end code instead): every area is
         // writable as a protocol fact.
@@ -315,6 +318,78 @@ fn check_kind(
         }
     }
     Ok(())
+}
+
+/// What a tag occupies from its address, in its device's own unit (#793 の
+/// レビュー): a word device counts words, a bit device points.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Occupancy {
+    /// How many device numbers, from the tag's own.
+    pub(crate) count: u32,
+    /// Counted in points (a bit device) rather than words.
+    pub(crate) points: bool,
+}
+
+impl Occupancy {
+    /// The unit as the messages say it.
+    pub(crate) fn unit(&self) -> &'static str {
+        if self.points {
+            "点"
+        } else {
+            "語"
+        }
+    }
+}
+
+/// - One bit of a word (`D100.5`): that one word.
+/// - A bit device (`M50`): one point for a `bit` tag. Any other kind would
+///   spread its words over 16 points each (`check_kind` and the planner
+///   refuse those; the range check stays sound for them anyway).
+/// - A word device: the kind's words (at least 1).
+pub(crate) fn occupancy(device: SlmpDevice, bit: Option<u8>, kind: &TagKind) -> Occupancy {
+    let words = u32::from(kind.word_count().max(1));
+    match (bit, device.access()) {
+        (Some(_), _) => Occupancy {
+            count: 1,
+            points: false,
+        },
+        (None, SlmpAccess::Bit) => Occupancy {
+            count: if *kind == TagKind::Numeric(DataType::Bit) {
+                1
+            } else {
+                words * 16
+            },
+            points: true,
+        },
+        (None, SlmpAccess::Word) => Occupancy {
+            count: words,
+            points: false,
+        },
+    }
+}
+
+/// #793 のレビュー: タグの占める最後の番号もデバイス番号の範囲
+/// （`0..=MAX_DEVICE_NUMBER`）に入るか。入らなければその理由の文言
+/// （`D16777215` の U32 は 2 語目が範囲の外）。保存時の `parse_address` と、
+/// 保存を経ない spec への守りとして読み書きの入口（`api_session.rs` の
+/// `past_last_number`、フレーム型の `plan_read` も通る）の両方がこれを使う。
+/// 単位はデバイスの種類で「語」か「点」。
+pub(crate) fn past_last_number(
+    text: &str,
+    device: SlmpDevice,
+    number: u32,
+    bit: Option<u8>,
+    kind: &TagKind,
+) -> Option<String> {
+    let occupied = occupancy(device, bit, kind);
+    if u64::from(number) + u64::from(occupied.count) - 1 <= u64::from(MAX_DEVICE_NUMBER) {
+        return None;
+    }
+    Some(format!(
+        "アドレス {text:?} から {} {}分を占めると、デバイス番号の上限 {MAX_DEVICE_NUMBER}（0x{MAX_DEVICE_NUMBER:X}）を超えます",
+        occupied.count,
+        occupied.unit()
+    ))
 }
 
 fn require_text(settings: &Settings, key: &str, errors: &mut Vec<FieldError>) {
@@ -801,6 +876,82 @@ mod tests {
                 "{text:?}: bridge"
             );
         }
+    }
+
+    /// #793 のレビュー: タグの占める最後の番号が上限 0xFFFFFF を超えるものは
+    /// 保存で断る。上限ちょうどで終わるものは通す。
+    #[test]
+    fn a_tag_running_past_the_last_device_number_is_refused() {
+        let sjis = |words| TagKind::string(words, StringEncoding::ShiftJis);
+        for (text, k) in [
+            ("D16777215", kind(DataType::U32)),
+            ("D16777215", kind(DataType::I32)),
+            ("ZR16777215", kind(DataType::F32)),
+            ("D16777215", sjis(2)),
+            ("ZR16777214", sjis(3)),
+        ] {
+            let err = SlmpDriver.parse_address(text, &k).unwrap_err();
+            assert!(err.to_string().contains("上限"), "{text} {k:?}: {err}");
+        }
+        for (text, k) in [
+            ("D16777215", kind(DataType::U16)),
+            ("D16777214", kind(DataType::U32)),
+            ("ZR16777214", sjis(2)),
+            ("D16777215.F", kind(DataType::Bit)),
+            ("M16777215", kind(DataType::Bit)),
+        ] {
+            assert!(SlmpDriver.parse_address(text, &k).is_ok(), "{text} {k:?}");
+        }
+        assert!(SlmpDriver
+            .parse_address("BFFFFFF", &kind(DataType::Bit))
+            .is_ok());
+    }
+
+    /// #793 の 3 回目: 上限をはみ出す文言の単位はデバイスの種類で決まる。
+    /// ワードデバイスは「語」、ビットデバイスは「点」、ワード内のビットは 1 語。
+    #[test]
+    fn the_overrun_message_counts_words_or_points_by_the_device() {
+        use banto_plc::SlmpDevice;
+        let msg = |device, number, bit, k: TagKind| {
+            past_last_number("x", device, number, bit, &k).expect("runs past the limit")
+        };
+        let max = MAX_DEVICE_NUMBER;
+        let m = msg(SlmpDevice::D, max, None, kind(DataType::U32));
+        assert!(m.contains("2 語分を占めると"), "{m}");
+        let m = msg(
+            SlmpDevice::ZR,
+            max - 1,
+            None,
+            TagKind::string(3, StringEncoding::ShiftJis),
+        );
+        assert!(m.contains("3 語分を占めると"), "{m}");
+        for device in [SlmpDevice::M, SlmpDevice::X, SlmpDevice::Y, SlmpDevice::B] {
+            let m = msg(device, max, None, kind(DataType::U16));
+            assert!(
+                m.contains("16 点分を占めると") && !m.contains("語"),
+                "{device}: {m}"
+            );
+            let m = msg(device, max - 20, None, kind(DataType::U32));
+            assert!(m.contains("32 点分を占めると"), "{device}: {m}");
+        }
+        // What ends at the limit has no message, in either unit.
+        assert!(past_last_number("x", SlmpDevice::M, max, None, &kind(DataType::Bit)).is_none());
+        assert!(
+            past_last_number("x", SlmpDevice::D, max, Some(15), &kind(DataType::Bit)).is_none()
+        );
+        assert!(
+            past_last_number("x", SlmpDevice::D, max - 1, None, &kind(DataType::U32)).is_none()
+        );
+        assert!(
+            past_last_number("x", SlmpDevice::M, max - 15, None, &kind(DataType::U16)).is_none()
+        );
+        // The save path says the same (after `AddressError`'s prefix).
+        let err = SlmpDriver
+            .parse_address("D16777215", &kind(DataType::U32))
+            .unwrap_err();
+        let want =
+            past_last_number("D16777215", SlmpDevice::D, max, None, &kind(DataType::U32)).unwrap();
+        assert!(err.to_string().ends_with(&want), "{err}");
     }
 
     #[test]

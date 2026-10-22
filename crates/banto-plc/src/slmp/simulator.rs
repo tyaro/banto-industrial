@@ -355,6 +355,30 @@ impl Simulator {
         self.state.lock().unwrap().hang = false;
     }
 
+    /// R2b-3d（docs/banto-hub-driver-io-design.md §11.2）: one whole request
+    /// frame in, the response frame out - the socket-free half of the
+    /// connection handler, for the frame-type conformance harness's
+    /// `Responder` (the engine owns the wire there). Same device state, end
+    /// codes and malformed-frame switch as the TCP path; `hang` and chunking
+    /// are the wire's business and do not apply. A request shorter than its
+    /// prefix or than its declared length is answered with "wrong command"
+    /// (route taken from whatever prefix bytes there are).
+    pub fn respond(&self, request: &[u8]) -> Vec<u8> {
+        let mut prefix = [0u8; FRAME_PREFIX_LEN];
+        let head = request.len().min(FRAME_PREFIX_LEN);
+        prefix[..head].copy_from_slice(&request[..head]);
+        let (route, command_len) = parse_prefix(&prefix);
+        match request.get(FRAME_PREFIX_LEN..FRAME_PREFIX_LEN + command_len) {
+            Some(command) if head == FRAME_PREFIX_LEN => {
+                build_response(&self.state, &route, command)
+            }
+            _ => {
+                let malformed = self.state.lock().unwrap().malformed;
+                frame(&route, END_CODE_WRONG_COMMAND, &[], malformed)
+            }
+        }
+    }
+
     /// Stop accepting new connections and sever every connection already open,
     /// simulating a CPU power-cycle or network drop mid-session. Aborting each
     /// handler task drops its `TcpStream`, which closes the socket - the
@@ -396,15 +420,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
         if stream.read_exact(&mut prefix).await.is_err() {
             return; // client closed the connection
         }
-        let serial_id = u16::from_le_bytes([prefix[2], prefix[3]]);
-        let network_id = prefix[6];
-        let pc_id = prefix[7];
-        let io_id = u16::from_le_bytes([prefix[8], prefix[9]]);
-        let area_id = prefix[10];
-        // The request's length field counts from the CPU timer, i.e. the two
-        // CPU-timer bytes (already inside `prefix`) plus the command payload.
-        let declared_len = u16::from_le_bytes([prefix[11], prefix[12]]) as usize;
-        let command_len = declared_len.saturating_sub(2);
+        let (route, command_len) = parse_prefix(&prefix);
 
         let mut command = vec![0u8; command_len];
         if command_len > 0 && stream.read_exact(&mut command).await.is_err() {
@@ -417,13 +433,6 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             std::future::pending::<()>().await;
         }
 
-        let route = Route {
-            serial_id,
-            network_id,
-            pc_id,
-            io_id,
-            area_id,
-        };
         let response = build_response(&state, &route, &command);
         let chunking = state.lock().unwrap().chunking;
         match chunking {
@@ -457,6 +466,22 @@ struct Route {
     pc_id: u8,
     io_id: u16,
     area_id: u8,
+}
+
+/// The access route of a request's 15-byte prefix and the length of the
+/// command that follows it. The request's length field counts from the CPU
+/// timer, i.e. the two CPU-timer bytes (already inside the prefix) plus the
+/// command payload.
+fn parse_prefix(prefix: &[u8; FRAME_PREFIX_LEN]) -> (Route, usize) {
+    let route = Route {
+        serial_id: u16::from_le_bytes([prefix[2], prefix[3]]),
+        network_id: prefix[6],
+        pc_id: prefix[7],
+        io_id: u16::from_le_bytes([prefix[8], prefix[9]]),
+        area_id: prefix[10],
+    };
+    let declared_len = u16::from_le_bytes([prefix[11], prefix[12]]) as usize;
+    (route, declared_len.saturating_sub(2))
 }
 
 fn parse_bulk_request(command: &[u8]) -> Option<BulkRequest> {

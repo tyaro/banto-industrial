@@ -29,6 +29,14 @@
 //!   decision the Hub used to make).
 //! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
 //!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
+//! - R2b-3d (§6.2, Q4), first half: `frame.rs` builds and checks the SLMP 4E
+//!   binary frames itself (bulk read / write, word / bit, Q / R), and
+//!   `frame_conn.rs` is the [`banto_driver_api::FrameDriver`] /
+//!   `FrameConnection` with `plan_read` / `decode_read` over them, run by the
+//!   real engine in `tests/frame_conformance.rs`. `slmp_parity.rs` (tests)
+//!   checks every frame byte for byte against the `slmp` crate. Not yet
+//!   registered: the broker still dials the session above, and
+//!   `write_next` comes with the switch-over.
 //!
 //! ## Dependency direction
 //!
@@ -42,7 +50,11 @@ use banto_plc::SlmpCpu;
 mod api_session;
 mod base;
 mod classify;
+mod frame;
+mod frame_conn;
 mod session;
+#[cfg(test)]
+mod slmp_parity;
 
 pub use base::{driver, SlmpDriver};
 pub use classify::{classify_read, classify_write};
