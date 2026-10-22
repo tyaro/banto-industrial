@@ -591,6 +591,13 @@ interface HttpInit {
 	body?: unknown;
 	expectNoContent?: boolean;
 	/**
+	 * `true` なら変更系のメソッド（POST）でも、タグ削除の取り消し猶予を打ち切らない
+	 * （`deferredDelete.flush()` を呼ばない）。副作用の無い読み取りの POST
+	 * （`POST /api/tags/parse-addresses`）専用 - 入力に追従して何度も呼ぶので、
+	 * 呼ぶたびに猶予を潰すと「元に戻す」が効かなくなる。
+	 */
+	readOnly?: boolean;
+	/**
 	 * T18-1 (docs/banto-hub-desktop-plan.md §9.4 TAG-UX-C 4点目):
 	 * エラーレスポンスの body が共通の `ErrorBody`（`kind` タグ）形状を
 	 * していない呼び出し元固有のエラー（例: `tags_update` の 409
@@ -617,7 +624,7 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 	 * 削除したはずの名前で新規作成すると「名前が既に使われています」で
 	 * 弾かれ、画面上は消えているのに同名では作れない、という状態になる。
 	 */
-	if (init.method !== 'GET') {
+	if (init.method !== 'GET' && !init.readOnly) {
 		await deferredDelete.flush();
 	}
 
@@ -849,6 +856,50 @@ export interface GroupTagCount {
  */
 export async function listTagGroupCounts(): Promise<GroupTagCount[]> {
 	return httpRequest<GroupTagCount[]>('/api/tags/group-counts', { method: 'GET' });
+}
+
+/**
+ * R2b-2d（docs/banto-hub-driver-address-design.md §7.1）: `POST /api/tags/parse-addresses`
+ * の要求の 1 行。**`tagKind` は必須**（保存と同じ種類ごとの規則をサーバーが当てる）。
+ */
+export interface ParseAddressItem {
+	tagKind: TagKind;
+	address: string;
+	dataType: TagDataType;
+	stringLength?: number | null;
+	stringEncoding?: StringEncoding;
+}
+
+/**
+ * 1 行の解析結果。`ok: true` の `canonical` が保存される形（`40001` → `400001`）。
+ * `area`・`writableArea`・`bit`・`wordCount` は `plc` のときだけ値を持ち、それ以外は `null`。
+ */
+export type ParsedAddress =
+	| {
+			ok: true;
+			canonical: string;
+			area: string | null;
+			writableArea: boolean | null;
+			bit: number | null;
+			wordCount: number | null;
+	  }
+	| { ok: false; message: string };
+
+/**
+ * `POST /api/tags/parse-addresses`: 保存と同じ関数でアドレスを解析した結果を、入力と同じ順で返す
+ * （副作用なし・viewer 以上）。文法を TS に写さず、サーバーに一本化するための口。
+ * 通信の失敗は例外（呼び出し側は「判定不能」として扱い、既定を当てない）。
+ */
+export async function parseTagAddresses(
+	connectionId: number,
+	items: ParseAddressItem[]
+): Promise<ParsedAddress[]> {
+	const response = await httpRequest<{ items: ParsedAddress[] }>('/api/tags/parse-addresses', {
+		method: 'POST',
+		body: { connectionId, items },
+		readOnly: true
+	});
+	return response.items;
 }
 
 export async function createTag(input: TagInput): Promise<Tag> {

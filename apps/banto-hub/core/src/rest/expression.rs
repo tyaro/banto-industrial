@@ -324,7 +324,7 @@ pub(crate) fn evaluate_expression_check(
 }
 
 /// `plc_connections_test`と同じ理由で意図的に `#[utoipa::path]` を付けず
-/// `ApiDoc` にも加えない（`tags_address_writable` の doc comment参照 -
+/// `ApiDoc` にも加えない（`tags_parse_addresses` の doc comment参照 -
 /// `/api/v1/*` のみを文書化する既存方針。このエンドポイントも同じ
 /// `tag_registry_router`＝管理系ルーター配下）。
 pub(super) async fn tags_expression_check(

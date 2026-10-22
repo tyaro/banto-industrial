@@ -6,8 +6,31 @@
  * 「`null`(既存)/`undefined`(CSV 未入力)の差だけでは changed 扱いになら
  * ないか」を固定する。
  */
-import { describe, expect, it } from 'vitest';
-import { classifyCsvUpdate } from './tagCsvDiff';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// `tagCsvDiff.ts` は解析の API の HTTP ヘルパー（`tagRegistryAdmin.ts::parseTagAddresses`）を
+// 使うので、`tagRegistryAdmin.test.ts` と同じ理由で `$state` を使うモジュールだけを
+// 軽量なフェイクに差し替える。**解析の API 自体は差し替えない**（本物のヘルパーを通し、
+// `fetch` をネットワークの境界でモックする、設計 §9「画面」）。
+vi.mock('@banto/admin-core', () => ({
+	getAuthProvider: () => ({ getToken: () => 'test-token' }),
+	ProviderError: class ProviderError extends Error {
+		body: unknown;
+		constructor(body: unknown) {
+			super(
+				typeof body === 'object' && body !== null && 'message' in body
+					? String((body as { message: unknown }).message)
+					: 'provider error'
+			);
+			this.name = 'ProviderError';
+			this.body = body;
+		}
+	}
+}));
+vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
+vi.mock('./deferredDelete.svelte', () => ({ deferredDelete: { flush: async () => {} } }));
+
+import { classifyCsvUpdate, resolveCsvCanonicalAddresses } from './tagCsvDiff';
 import { parseTagsCsv, TAG_CSV_COLUMNS, type ParsedCsvTagRow } from './tagCsv';
 import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
 
@@ -28,7 +51,11 @@ const CONN_A: PlcConnection = {
 	username: null,
 	passwordSet: false
 };
-const CONNECTIONS: PlcConnection[] = [CONN_A];
+// R2b-2d: 種類ごとの配置（db は postgres、computed は calc、internal は mem の下）。
+const CONN_PG: PlcConnection = { ...CONN_A, id: 2, name: 'PgConn', protocol: 'postgres' };
+const CONN_CALC: PlcConnection = { ...CONN_A, id: 3, name: 'calc', protocol: 'virtual' };
+const CONN_MEM: PlcConnection = { ...CONN_A, id: 4, name: 'mem', protocol: 'virtual' };
+const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_PG, CONN_CALC, CONN_MEM];
 
 const GROUP_A: CollectionGroup = {
 	id: 10,
@@ -48,7 +75,10 @@ const GROUP_B: CollectionGroup = {
 	defaultWritable: true,
 	querySql: null
 };
-const GROUPS: CollectionGroup[] = [GROUP_A, GROUP_B];
+const GROUP_PG: CollectionGroup = { ...GROUP_A, id: 12, name: 'GroupPg', plcConnectionId: 2 };
+const GROUP_CALC: CollectionGroup = { ...GROUP_A, id: 13, name: 'GroupCalc', plcConnectionId: 3 };
+const GROUP_MEM: CollectionGroup = { ...GROUP_A, id: 14, name: 'GroupMem', plcConnectionId: 4 };
+const GROUPS: CollectionGroup[] = [GROUP_A, GROUP_B, GROUP_PG, GROUP_CALC, GROUP_MEM];
 
 function makeTag(overrides: Partial<Tag> = {}): Tag {
 	return {
@@ -351,5 +381,180 @@ describe('classifyCsvUpdate: lineNumber の保持・複数行混在', () => {
 		expect(result.rows).toHaveLength(5);
 		expect(result.updateRows).toHaveLength(1);
 		expect(result.updateRows[0].name).toBe('ChangedTag');
+	});
+});
+
+// ==============================================================================
+// アドレスの正規形での比較（R2b-2d）。解析の API は本物の HTTP ヘルパーを通し、
+// `fetch` だけをモックする。
+// ==============================================================================
+
+/**
+ * 解析の API の代役のサーバー（`fetch` のモック）。種類ごとの規則を、保存と同じ関数が
+ * 返すはずの形で返す: `plc` は 5 桁の Modbus を 6 桁へ・`zzz` は断る、`db` は前後の空白を
+ * 除く、`computed` / `internal` は空なら `""`・空でなければ断る。呼び出しの記録つき。
+ */
+function mockParseApi() {
+	const calls: { connectionId: number; items: Record<string, unknown>[] }[] = [];
+	globalThis.fetch = vi.fn(async (_url: string, init?: RequestInit) => {
+		const body = JSON.parse(init?.body as string) as {
+			connectionId: number;
+			items: { tagKind: string; address: string }[];
+		};
+		calls.push(body);
+		const items = body.items.map((item) => {
+			const text = item.address.trim();
+			if (item.tagKind === 'plc') {
+				if (text === 'zzz') return { ok: false, message: 'address の形式が不正です' };
+				const canonical = /^\d{5}$/.test(text) ? `${text[0]}0${text.slice(1)}` : text;
+				return {
+					ok: true,
+					canonical,
+					area: 'holding_register',
+					writableArea: true,
+					bit: null,
+					wordCount: 1
+				};
+			}
+			if (item.tagKind === 'db') {
+				return {
+					ok: true,
+					canonical: text,
+					area: null,
+					writableArea: null,
+					bit: null,
+					wordCount: null
+				};
+			}
+			return text === ''
+				? { ok: true, canonical: '', area: null, writableArea: null, bit: null, wordCount: null }
+				: { ok: false, message: `${item.tagKind} タグには address を設定できません` };
+		});
+		return new Response(JSON.stringify({ items }), { status: 200 });
+	}) as never;
+	return calls;
+}
+
+describe('正規形のアドレスでの比較（解析の API を通す）', () => {
+	const originalFetch = globalThis.fetch;
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+	const groupToConnection = (groupId: number) =>
+		GROUPS.find((g) => g.id === groupId)?.plcConnectionId;
+
+	it('変更の無い CSV は plc(40001 vs 400001)・db・computed・internal のすべてが unchanged で error が 0', async () => {
+		const calls = mockParseApi();
+		const rows = parsed([
+			csvRow({ name: 'P', address: '40001' }),
+			csvRow({
+				connection: 'PgConn',
+				group: 'GroupPg',
+				name: 'D',
+				address: 'temperature',
+				tagKind: 'db'
+			}),
+			csvRow({
+				connection: 'calc',
+				group: 'GroupCalc',
+				name: 'C',
+				address: '',
+				tagKind: 'computed',
+				expression: 'a + 1'
+			}),
+			csvRow({ connection: 'mem', group: 'GroupMem', name: 'I', address: '', tagKind: 'internal' })
+		]);
+		const existing = [
+			makeTag({ id: 1, name: 'P', address: '400001' }),
+			makeTag({
+				id: 2,
+				name: 'D',
+				collectionGroupId: GROUP_PG.id,
+				address: 'temperature',
+				tagKind: 'db'
+			}),
+			makeTag({
+				id: 3,
+				name: 'C',
+				collectionGroupId: GROUP_CALC.id,
+				address: '',
+				tagKind: 'computed',
+				expression: 'a + 1'
+			}),
+			makeTag({
+				id: 4,
+				name: 'I',
+				collectionGroupId: GROUP_MEM.id,
+				address: '',
+				tagKind: 'internal'
+			})
+		];
+
+		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const result = classifyCsvUpdate(rows, existing, canonical);
+
+		expect(result.errorCount).toBe(0);
+		expect(result.unchangedCount).toBe(4);
+		expect(result.changedCount).toBe(0);
+		expect(result.updateRows).toHaveLength(0);
+		// 接続ごとに 1 回（4 接続 = 4 回）、全行が tagKind つきで送られる。
+		expect(calls.map((c) => c.connectionId).sort()).toEqual([1, 2, 3, 4]);
+		expect(calls.flatMap((c) => c.items.map((i) => i.tagKind)).sort()).toEqual([
+			'computed',
+			'db',
+			'internal',
+			'plc'
+		]);
+	});
+
+	it('正規形に直さずに比べると 40001 の行は changed になる（解析の効果の対照）', () => {
+		const rows = parsed([csvRow({ name: 'P', address: '40001' })]);
+		const result = classifyCsvUpdate(rows, [makeTag({ id: 1, name: 'P', address: '400001' })]);
+		expect(result.changedCount).toBe(1);
+	});
+
+	it('アドレスが本当に違えば、正規形でも changed で、送る行のアドレスは正規形', async () => {
+		mockParseApi();
+		const rows = parsed([csvRow({ name: 'P', address: '40002' })]);
+		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const result = classifyCsvUpdate(
+			rows,
+			[makeTag({ id: 1, name: 'P', address: '400001' })],
+			canonical
+		);
+		expect(result.changedCount).toBe(1);
+		expect(result.updateRows[0].address).toBe('400002');
+	});
+
+	it('解析に失敗した行はメッセージつきの error になる', async () => {
+		mockParseApi();
+		const rows = parsed([csvRow({ name: 'P', address: 'zzz' })]);
+		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const result = classifyCsvUpdate(
+			rows,
+			[makeTag({ id: 1, name: 'P', address: '400001' })],
+			canonical
+		);
+		expect(result.errorCount).toBe(1);
+		expect(result.rows[0].category).toBe('error');
+		expect(result.rows[0].message).toBe('address の形式が不正です');
+	});
+
+	it('通信が失敗したら、その接続の全行が error（確認できなかったものを問題なしにしない）', async () => {
+		globalThis.fetch = vi.fn(async () => {
+			throw new Error('network down');
+		}) as never;
+		const rows = parsed([
+			csvRow({ name: 'P', address: '40001' }),
+			csvRow({ name: 'Q', address: '40002' })
+		]);
+		const canonical = await resolveCsvCanonicalAddresses(rows, groupToConnection);
+		const result = classifyCsvUpdate(
+			rows,
+			[makeTag({ id: 1, name: 'P', address: '400001' })],
+			canonical
+		);
+		expect(result.errorCount).toBe(2);
+		expect(result.rows[0].message).toContain('確認できませんでした');
 	});
 });

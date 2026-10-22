@@ -87,6 +87,7 @@ function buildCsv(rows: string[][]): Buffer {
 interface TagResponse {
 	id: number;
 	name: string;
+	address: string;
 	unit: string | null;
 	collectionGroupId: number;
 	revision: number;
@@ -229,14 +230,14 @@ test.describe.serial('banto-hub CSV 新規/更新インポート (T18-3d)', () =
 		await drawer.getByTestId('tag-csv-mode-update').click();
 
 		// changed（unit を変更）/ unchanged（既存と完全一致）/ added（既存に無い名前）。
-		// アドレスはサーバーが保存した正規形（Modbus は 6 桁）で書く。差分は
-		// CSV の文字列と保存済みの文字列の比較なので、5 桁（`40102`）だと
-		// unchanged が changed になる。CSV 側のアドレスを差分の前に正規化する
-		// のは R2b-2d（設計 §7.2）で、そのとき 5 桁の行のテストを足す。
+		// アドレスは**5 桁で書く**（既存の行は保存時に正規形の `400101` / `400102` に
+		// なっている）。CSV のアドレスは比べる前に解析の API
+		// （`POST /api/tags/parse-addresses`、R2b-2d・設計 §7.2）で正規形になるので、
+		// `40102` の行は unchanged になる（文字列のまま比べると changed になる）。
 		const csv = buildCsv([
-			csvRow({ name: UPD_CHANGED_TAG, address: '400101', unit: UPDATED_UNIT }),
-			csvRow({ name: UPD_UNCHANGED_TAG, address: '400102' }),
-			csvRow({ name: UPD_ADDED_TAG, address: '400109' })
+			csvRow({ name: UPD_CHANGED_TAG, address: '40101', unit: UPDATED_UNIT }),
+			csvRow({ name: UPD_UNCHANGED_TAG, address: '40102' }),
+			csvRow({ name: UPD_ADDED_TAG, address: '40109' })
 		]);
 		await drawer
 			.locator('input[type="file"]')
@@ -257,6 +258,8 @@ test.describe.serial('banto-hub CSV 新規/更新インポート (T18-3d)', () =
 		const tags = await fetchTags();
 		// changed: unit が更新される。
 		expect(tags.find((t) => t.name === UPD_CHANGED_TAG)?.unit).toBe(UPDATED_UNIT);
+		// 送ったアドレスは正規形（保存後も 6 桁のまま）。
+		expect(tags.find((t) => t.name === UPD_CHANGED_TAG)?.address).toBe('400101');
 		// unchanged: 触れられない（unit は未設定のまま）。
 		expect(tags.find((t) => t.name === UPD_UNCHANGED_TAG)?.unit ?? null).toBeNull();
 		// added: 既存更新モードでは登録されない（暗黙の新規作成なし）。

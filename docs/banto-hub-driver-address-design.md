@@ -1,7 +1,7 @@
 # banto-hub タグのアドレスの不透明化 詳細設計（R2b-2）
 
 作成日: 2026-10-22
-状態: **設計確定（2026-10-22 オーナー決定。§11 の Q1〜Q9 はすべて推奨どおり）・R2b-2a（#781）・R2b-2b（#782）・R2b-2c 実装済み、R2b-2d・2e は未実装**。コード調査（§1）は 2026-10-22 の main（`bbd40a50`、v0.2.0-alpha.34、R2b-1 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提なので移行は考えなくてよい（R2b-7 以降も同じ）」に従い、既存のデータの移行・全件照合・互換は設計しない。
+状態: **設計確定（2026-10-22 オーナー決定。§11 の Q1〜Q9 はすべて推奨どおり）・R2b-2a（#781）・R2b-2b（#782）・R2b-2c（#783）・R2b-2d 実装済み、R2b-2e は未実装**。コード調査（§1）は 2026-10-22 の main（`bbd40a50`、v0.2.0-alpha.34、R2b-1 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提なので移行は考えなくてよい（R2b-7 以降も同じ）」に従い、既存のデータの移行・全件照合・互換は設計しない。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-2「アドレスの不透明化（`DriverAddress`）」を実装できる粒度に落とす。タグのアドレスをドライバの `parse_address` で検証して `canonical` を保存すること、Hub の中の `"modbus-tcp"` によるアドレスの解析の分岐をレジストリに置き換えること、要求の型の切り替えの範囲（R2b-3 との境）、エラーの分類、画面・API・CSV の見え方、PR の分け方。
 関連: [banto-driver-api-design.md](banto-driver-api-design.md)（§0.1 の 5・Q6・Q8、§3.3 のアドレス、§3.4 のエラーの分類、§6.2 の「R2b に残したもの」、§7 の適合テスト C1・C4）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（§3.2・§7.4・§12.2 の 4）、[banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。`with_registry` の注入と grep のテストの前例）、[implementation-checklist.md](implementation-checklist.md)。
 

@@ -16,24 +16,25 @@
  *   決定A）。
  *
  * **2026-09-02 オーナー判断（S1-b0 分離）: 上記2つ目（アドレス領域による
- * 判定）は本モジュールに実装しない。** この規則は現在
- * `banto-plc`（`AddressArea`、プロトコルの正）と `banto-tags`
- * （`crates/banto-tags/src/tag.rs::modbus_read_only_area`、登録時検証用の
- * 狭い複製）の2箇所に既に存在し、UI 側に3つ目の手書きミラーを作ると
- * プロトコルが増えるたびに3箇所を直す羽目になる。方針は「プロトコル層で
- * 定義し、UI はサーバーから受け取ったデータを表示するだけ」に統一し、
- * そのデータ供給は別スライス S1-b0 で行う。
+ * 判定）は本モジュールに実装しない。** UI 側にアドレスの文法を写すと
+ * プロトコルが増えるたびに複数箇所を直す羽目になるため、方針は「プロトコル層
+ * （ドライバ）で定義し、UI はサーバーから受け取ったデータを使うだけ」に統一する。
+ *
+ * **R2b-2d（2026-10-22）で配線した**: そのデータ供給は
+ * `POST /api/tags/parse-addresses`（`tagRegistryAdmin.ts::parseTagAddresses`、
+ * 保存と同じ解析）の `writableArea` で、`tags/+page.svelte` が結果を
+ * 第2引数に渡す。これで以前の `GET /api/tags/address-writable` は消えた。
  *
  * そのため {@link canDefaultWritable}/{@link writableDefaultBlockedReason}
- * は**アドレス文字列を一切受け取らない**。代わりに `writableArea`
- * （`boolean | undefined`）という**外部から渡されるフラグ**を受け取る -
- * これが S1-b0 が用意する「このアドレスは書き込み可能な領域か」という
- * サーバー由来の判定結果の差し込み口になる。**現時点ではこの情報の供給元
- * が無い**ため、呼び出し側（`tags/+page.svelte`）は常に `undefined` を
- * 渡す - つまり今は「PLC タグなら（アドレス領域を問わず）既定 ON」まで
- * しか行わない。`writableArea === false` を渡す経路が S1-b0 で配線されれば、
- * この2関数は変更なしにアドレス領域による絞り込みも行えるようになる
- * （呼び出し側だけが変わる）。
+ * は**アドレス文字列を一切受け取らない**。受け取るのは `writableArea`
+ * （`boolean | undefined`）という**外部から渡されるフラグ**だけ:
+ *
+ * - `true`: ドライバが「書き込める領域」と判定した。
+ * - `false`: 「読み取り専用の領域」と判定した。
+ * - `undefined`: **判定不能**（アドレスが空・入力途中、解析が `ok: false`、
+ *   通信の失敗、グループ未選択）。**既定 ON を当てない**（安全側 -
+ *   誤って読み取り専用領域に既定 ON するより、既定が一時的に効かない方を選ぶ。
+ *   判定不能を「制限なし」に倒さない）。
  *
  * 本モジュールは**登録時の検証を一切変えない** - サーバー側の8段ゲート
  * （API キーのスコープ完全一致・書き込み受付トグル・レート制限・監査を
@@ -52,18 +53,17 @@ import type { TagKind } from './tagRegistryAdmin';
  *   適用条件が明示的に「PLC タグ」に限定しているため、internal タグの
  *   チェックボックスは（禁止されているわけではないが）これまでどおり
  *   既定 OFF のまま - 手動で opt-in する対象という位置づけを変えない。
- * - `writableArea`（モジュール冒頭コメント参照 - S1-b0 が供給する予定の
- *   アドレス領域判定、現時点では常に `undefined`）が明示的に `false`
- *   のときだけ、PLC タグでも既定を適用しない。`undefined`（未配線）・
- *   `true`（書き込み可能と判明）はどちらも「既定を適用してよい」として
- *   扱う - 情報が無い間はブロックしない、という保守的すぎない既定。
+ * - `writableArea`（モジュール冒頭コメント参照 - 解析の API が返すアドレス領域判定）
+ *   が**明示的に `true`** のときだけ既定を適用する。`false`（読み取り専用）も
+ *   `undefined`（判定不能）も適用しない（R2b-2d で以前の「`undefined` は適用してよい」
+ *   から変えた。判定不能を既定 ON に倒すと、読み取り専用領域のタグが保存で断られる）。
  */
 export function canDefaultWritable(
 	tagKind: TagKind,
 	writableArea: boolean | undefined = undefined
 ): boolean {
 	if (tagKind !== 'plc') return false;
-	return writableArea !== false;
+	return writableArea === true;
 }
 
 /**
@@ -77,11 +77,11 @@ export function canDefaultWritable(
  *   「禁止」ではないため、ブロック理由としては返さない（`null`）- 手動で
  *   ON にできることが既存の挙動どおり伝わるよう、否定的な理由表示は
  *   出さない。
- * - `plc` かつ `writableArea === false`: S1-b0 が配線された後にこの分岐が
- *   実際に到達するようになる（現時点では呼び出し側が常に `undefined` を
- *   渡すため到達しない）。文言はプロトコル非依存の汎用表現に留める -
- *   「どのアドレス領域だから」の具体名（`1xxxx` 等）は S1-b0 側のデータが
- *   持つ情報であり、本モジュールはそれを知らない。
+ * - `plc` かつ `writableArea === false`: 解析の API が「読み取り専用の領域」と
+ *   返したときに到達する。文言はプロトコル非依存の汎用表現に留める -
+ *   「どのアドレス領域だから」の具体名（`1xxxx` 等）は API のデータが持つ情報で
+ *   あり、本モジュールはそれを知らない。判定不能（`undefined`）は理由を出さない
+ *   （既定を当てないだけで、手動で ON にはできる）。
  */
 export function writableDefaultBlockedReason(
 	tagKind: TagKind,
@@ -103,4 +103,54 @@ export function writableDefaultBlockedReason(
 		return 'このアドレスの領域は読み取り専用のため、書き込み可（writable）にできません。';
 	}
 	return null;
+}
+
+/**
+ * R2b-2d（オーナーレビュー P2、2026-10-22）: 解析の API が**読み取り専用の領域と
+ * 確定した**とき、保持している `writable` の値を `false` に揃える。
+ *
+ * 既定 ON の適用（{@link canDefaultWritable}）は利用者が手動で触っていない間だけ
+ * 働く。触った後に読み取り専用のアドレス（例: Modbus `40001` → `30001`）へ変えると、
+ * チェックボックスは「無効・未チェック」に見えるのに保持値 `true` が残り、送信で
+ * サーバーに断られる。表示・保持値・送信値を一致させるため、この関数が**確定した
+ * 断り**のときだけ `false` を返す。
+ *
+ * - `tagKind === 'plc'` かつ `writableArea === false` のときだけ `false`。
+ * - `undefined`（判定不能: 入力途中・解析失敗・通信失敗）は**読み取り専用と見なさない**。
+ *   利用者の手動の値をそのまま返す。
+ * - 返すのは `false` か元の値だけ（`true` に戻すことはしない）ので、呼び出し側の
+ *   `$effect` が自分の書き込みで再実行されてもループしない。
+ */
+export function writableAfterAreaVerdict(
+	tagKind: TagKind,
+	writableArea: boolean | undefined,
+	writable: boolean
+): boolean {
+	if (tagKind === 'plc' && writableArea === false) return false;
+	return writable;
+}
+
+/**
+ * R2b-2d（Codex レビュー P2・オーナーレビュー P2、2026-10-22）: 送信の時点の `writable` を
+ * 決める純関数。解析の結果（`area`）が届いてから**その時点のフォームの値**
+ * （`touched`・`writable`・グループの既定）を渡して呼ぶこと。解析を待つ前に値を
+ * 取っておくと、待っている間に利用者が直したチェックボックスを古い値で上書きする。
+ *
+ * - `touched` が `false` の間だけ既定（{@link canDefaultWritable} かつグループの既定）を当てる。
+ *   `true`（手動で触った）なら `writable` をそのまま使う。
+ * - どちらの場合も最後に {@link writableAfterAreaVerdict} で、確定した読み取り専用は `false`。
+ * - `area` が `undefined`（判定不能: 解析の失敗・`ok: false`）は既定 ON を当てず、手動の値を保つ。
+ *   保存は止めない（最終的な判定はサーバー）。
+ */
+export function applyAreaVerdict(args: {
+	tagKind: TagKind;
+	area: boolean | undefined;
+	touched: boolean;
+	writable: boolean;
+	groupDefault: boolean;
+}): boolean {
+	const base = args.touched
+		? args.writable
+		: canDefaultWritable(args.tagKind, args.area) && args.groupDefault;
+	return writableAfterAreaVerdict(args.tagKind, args.area, base);
 }

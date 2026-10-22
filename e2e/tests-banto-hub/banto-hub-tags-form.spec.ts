@@ -9,7 +9,7 @@
  * データ（PLC接続・収集グループ・タグ）は `page.request` で直接 REST を
  * 叩いて作る。
  */
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page, type Route } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, groupNodeByName, injectAuthToken } from './banto-hub-auth';
 
 const CONNECTION_NAME = 'e2e-form-plc';
@@ -124,6 +124,9 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
 		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: CREATE_TAG_NAME, exact: true })).toBeVisible();
+		// R2b-2d: `40010` で作ったタグは、保存時にドライバの正規形（Modbus は 6 桁）になり、
+		// 一覧にも `400010` で出る（保存された値も同じ）。
+		await expect(page.getByRole('gridcell', { name: '400010', exact: true }).first()).toBeVisible();
 	});
 
 	test('1.5. create Drawer: 「登録して次へ」は親設定（収集グループ）と共通値（データ型・単位）を引き継ぎ、名前/アドレスだけ空にする（T18-2c、TAG-UX-2）', async () => {
@@ -231,6 +234,125 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		expect(nameInvalid).toBe(true);
 
 		await page.unroute('**/api/tags');
+	});
+
+	test('2.5. create Drawer: writable を手動 ON にした後で読み取り専用の領域（3xxxx）へ変えると、OFF に揃って保存できる（R2b-2d、オーナーレビュー P2）', async () => {
+		const REGRESSION_TAG_NAME = 'e2e-form-writable-area';
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill(REGRESSION_TAG_NAME);
+		const addressInput = drawer.getByLabel('アドレス');
+		await addressInput.fill('40050');
+
+		// 「書き込み安全設定」は既定で閉じている（`detailOpen.write`）。
+		await drawer.getByText('書き込み安全設定').click();
+		const writable = drawer.locator('#tag-writable');
+		await expect(writable).toBeEnabled();
+		// 手動で ON にする。既定 ON が当たっていても手動の操作（`createWritableTouched`）
+		// の経路を通すため、一度 OFF にしてから ON にする。
+		await writable.uncheck();
+		await writable.check();
+		await expect(writable).toBeChecked();
+
+		// 入力レジスタ（読み取り専用の領域）へ変える。解析の API の結果が届くと
+		// チェックボックスは無効になり、保持値・送信値も false に揃う。
+		await addressInput.fill('30050');
+		await expect(writable).toBeDisabled();
+		await expect(writable).not.toBeChecked();
+
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+		await expect(drawer).toBeHidden();
+
+		const token = await fetchAuthToken(page.request);
+		const tagsRes = await page.request.get('/api/tags', {
+			headers: { ...CSRF_HEADERS, Authorization: `Bearer ${token}` }
+		});
+		expect(tagsRes.ok()).toBe(true);
+		const tags = (await tagsRes.json()) as { name: string; writable: boolean }[];
+		const saved = tags.filter((t) => t.name === REGRESSION_TAG_NAME);
+		expect(saved).toHaveLength(1);
+		expect(saved[0].writable).toBe(false);
+	});
+
+	test('2.6. create Drawer: アドレスを入力して待たずに保存しても、グループの既定（writable ON）が効く（R2b-2d、Codex P2）', async () => {
+		const SUBMIT_RACE_TAG_NAME = 'e2e-form-writable-submit-race';
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill(SUBMIT_RACE_TAG_NAME);
+		await drawer.getByLabel('アドレス').fill('40051');
+		// デバウンス（300ms）の解析を待たずに送る。送信時に解析を待って既定を決める。
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+
+		const token = await fetchAuthToken(page.request);
+		const tagsRes = await page.request.get('/api/tags', {
+			headers: { ...CSRF_HEADERS, Authorization: `Bearer ${token}` }
+		});
+		expect(tagsRes.ok()).toBe(true);
+		const tags = (await tagsRes.json()) as { name: string; writable: boolean }[];
+		const saved = tags.filter((t) => t.name === SUBMIT_RACE_TAG_NAME);
+		expect(saved).toHaveLength(1);
+		expect(saved[0].writable).toBe(true);
+	});
+
+	test('2.7. create Drawer: 解析の応答待ち中に writable を OFF へ直しても、送信は待った後の値（OFF）で保存される（R2b-2d、オーナーレビュー P2）', async () => {
+		const AWAIT_RACE_TAG_NAME = 'e2e-form-writable-await-race';
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		// 解析の API を全部止める（デバウンスの 1 本目と、送信時の 2 本目）。止めた数を数え、
+		// 2 本そろった（＝送信が応答待ちに入った）のを確かめてから OFF に直し、まとめて流す。
+		const held: Route[] = [];
+		await page.route('**/api/tags/parse-addresses', (route) => {
+			held.push(route);
+		});
+
+		await drawer.getByLabel('名前').fill(AWAIT_RACE_TAG_NAME);
+		await drawer.getByLabel('アドレス').fill('40052');
+		await drawer.getByText('書き込み安全設定').click();
+		const writable = drawer.locator('#tag-writable');
+		await expect(writable).toBeEnabled();
+		// 手動の操作の経路（`createWritableTouched`）を通して ON にする。
+		await writable.uncheck();
+		await writable.check();
+		await expect(writable).toBeChecked();
+		// デバウンスの解析が止まっている（応答が未着）ことを確かめてから送る。
+		await expect.poll(() => held.length).toBe(1);
+
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await expect.poll(() => held.length).toBe(2);
+		// 送信が解析を待っている間に、利用者が OFF へ直す。
+		await writable.uncheck();
+		await expect(writable).not.toBeChecked();
+
+		// 保留した要求を先に流してから外す（`unroute` は保留中の要求を自分で処理するので、
+		// 後から `continue()` すると "Route is already handled" になる）。
+		for (const route of held) await route.continue();
+		await page.unroute('**/api/tags/parse-addresses');
+		await expect(page.getByText('作成しました')).toBeVisible();
+		await expect(drawer).toBeHidden();
+
+		const token = await fetchAuthToken(page.request);
+		const tagsRes = await page.request.get('/api/tags', {
+			headers: { ...CSRF_HEADERS, Authorization: `Bearer ${token}` }
+		});
+		expect(tagsRes.ok()).toBe(true);
+		const tags = (await tagsRes.json()) as { name: string; writable: boolean }[];
+		const saved = tags.filter((t) => t.name === AWAIT_RACE_TAG_NAME);
+		expect(saved).toHaveLength(1);
+		expect(saved[0].writable).toBe(false);
 	});
 
 	test('3. edit Drawer: 変更後 Enter で送信され、タグが更新される', async () => {

@@ -59,6 +59,7 @@ import {
 	updateTagsBatch,
 	listTagsPaged,
 	listTagGroupCounts,
+	parseTagAddresses,
 	isQueuedWhileRunningError,
 	QueuedWhileRunningError,
 	type PlcConnection,
@@ -275,6 +276,26 @@ describe('T19 S2-c2（UX-40、docs/banto-hub-t19-design.md §3.10）: httpReques
 		mockFetchOnce({ status: 200, ok: true, body: connectionResource });
 		await updatePlcConnection(1, connectionInput);
 		expect(deferredDeleteFlush).toHaveBeenCalledTimes(1);
+	});
+
+	it('R2b-2d: 副作用の無い読み取りの POST（parseTagAddresses）は flush() を呼ばない', async () => {
+		const items = [{ ok: true, canonical: '400001', area: 'holding_register', writableArea: true }];
+		mockFetchOnce({ status: 200, ok: true, body: { items } });
+
+		const result = await parseTagAddresses(3, [
+			{ tagKind: 'plc', address: '40001', dataType: 'u16' }
+		]);
+
+		expect(result).toEqual(items);
+		expect(deferredDeleteFlush).not.toHaveBeenCalled();
+		const mockedFetch = fetch as unknown as ReturnType<typeof vi.fn>;
+		const [url, init] = mockedFetch.mock.calls[0] as [string, RequestInit];
+		expect(url).toBe('/api/tags/parse-addresses');
+		expect(init.method).toBe('POST');
+		expect(JSON.parse(init.body as string)).toEqual({
+			connectionId: 3,
+			items: [{ tagKind: 'plc', address: '40001', dataType: 'u16' }]
+		});
 	});
 });
 

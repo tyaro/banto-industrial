@@ -558,8 +558,9 @@
 			（`crates/banto-tags/src/collection_group.rs`）に永続化される -
 			`periodMs`/`enabled` と同じ、`form` の通常フィールドの1つ。
 			`writable` の実際の登録可否（computed タグ拒否、および
-			Modbus 読み取り専用領域拒否を含む8段ゲート - 後者は S1-b0 で
-			UI に配線予定、`#lib/banto/writableDefault.ts` 参照）には
+			ドライバが読み取り専用と判定する領域の拒否を含む8段ゲート - 後者は
+			R2b-2d で解析の API の結果として新規タグフォームに配線済み、
+			`#lib/banto/writableDefault.ts` 参照）には
 			一切影響しない - あくまで新規タグフォームを開いた瞬間の
 			チェックボックスの初期値だけを決める。
 		-->
