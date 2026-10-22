@@ -1231,9 +1231,16 @@ fn hub_scaling_is_not_identity(input: &TagInput) -> bool {
 /// `_tag_kind_` name because `tag_kind` is still the bulk of what it decides
 /// and every call site/doc reference in this crate and its consumers points
 /// at that name.
+///
+/// **Legacy rules only (R2b-2b, design §3.2, owner review of #782)**: this
+/// pool twin has no registry parameter. A registry-mode service parses the
+/// address with the driver of the connection's *current* protocol, and that
+/// read must share a write transaction with the INSERT/UPDATE that stores the
+/// result - otherwise another writer can change the protocol in between - so
+/// registry mode only ever goes through [`validate_tag_kind_placement_tx`]
+/// (`create`/`update`/`create_batch` open `BEGIN IMMEDIATE` first).
 async fn validate_tag_kind_placement(
     pool: &SqlitePool,
-    registry: Option<&DriverRegistry>,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
 ) -> Result<Placement, BantoError> {
@@ -1246,7 +1253,7 @@ async fn validate_tag_kind_placement(
     let Some((conn_id, conn_name, protocol)) = row else {
         return Ok(Placement::unchecked(input));
     };
-    let placement = decide_placement(registry, conn_id, &conn_name, &protocol, input)?;
+    let placement = decide_placement(None, conn_id, &conn_name, &protocol, input)?;
     let Some(unique) = &placement.unique else {
         return Ok(placement);
     };
@@ -2165,10 +2172,28 @@ impl TagService {
         .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
     }
 
+    /// With a registry ([`Self::with_registry`]) the whole call is one
+    /// `BEGIN IMMEDIATE` transaction around [`Self::create_tx`]: the
+    /// connection's protocol is read, the address parsed by that driver and
+    /// the row inserted under the same write lock, so another writer cannot
+    /// change the connection's protocol (or the group's connection) in
+    /// between and leave an address canonicalised by the old driver stored
+    /// under the new protocol (design §3.2, owner review of #782). An error
+    /// drops (rolls back) the transaction; nothing is written. The legacy
+    /// ([`Self::new`]) path is unchanged.
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
+        if self.registry.is_some() {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let created = self.create_tx(&mut tx, input).await?;
+            tx.commit().await.map_err(banto_storage::storage_error)?;
+            return Ok(created);
+        }
         let mut validated = validate_tag_input(&input, self.rules())?;
-        let placement =
-            validate_tag_kind_placement(&self.pool, self.registry.as_deref(), &input, None).await?;
+        let placement = validate_tag_kind_placement(&self.pool, &input, None).await?;
         validated.address = placement.address;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
@@ -2248,11 +2273,26 @@ impl TagService {
     /// message rather than the richer [`TagUpdateError::RevisionConflict`]
     /// (which needs a caller that can actually show the current row - the
     /// hub REST layer, via [`Self::update_tx`]).
+    ///
+    /// With a registry ([`Self::with_registry`]) the whole call is one
+    /// `BEGIN IMMEDIATE` transaction around [`Self::update_tx`] (parse and
+    /// write under the same write lock, design §3.2, owner review of #782 -
+    /// see [`Self::create`]); a revision conflict is still folded into
+    /// `BantoError::Other` with the same message, and any error drops (rolls
+    /// back) the transaction. The legacy ([`Self::new`]) path is unchanged.
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
+        if self.registry.is_some() {
+            return match self.update_checked(id, input).await {
+                Ok(tag) => Ok(tag),
+                Err(TagUpdateError::Banto(err)) => Err(err),
+                Err(TagUpdateError::RevisionConflict(_)) => Err(BantoError::Other(
+                    "他のクライアントがこのタグを更新済みです。再読込してから保存してください。"
+                        .to_string(),
+                )),
+            };
+        }
         let mut validated = validate_tag_input(&input, self.rules())?;
-        let placement =
-            validate_tag_kind_placement(&self.pool, self.registry.as_deref(), &input, Some(id))
-                .await?;
+        let placement = validate_tag_kind_placement(&self.pool, &input, Some(id)).await?;
         validated.address = placement.address;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
@@ -3130,11 +3170,46 @@ impl TagService {
     /// duration of a potentially large batch's validation queries - worse in
     /// practice than the rare surprise of a generic error message on an
     /// actual concurrent conflict.
+    ///
+    /// **Registry mode** ([`Self::with_registry`], design §3.2, owner review
+    /// of #782): the validation above cannot be allowed to run outside the
+    /// write transaction, because each row is parsed by the driver of its
+    /// group's connection and another writer could change that protocol
+    /// before the insert. So the whole call - validation, duplicate checks
+    /// and insert - is one `BEGIN IMMEDIATE` transaction around
+    /// [`Self::create_batch_tx`]. An `Invalid` outcome or an error drops
+    /// (rolls back) it; a `dry_run` runs the same pass and rolls back even a
+    /// `Valid` one, returning `tags: None`. This closes the race window
+    /// described above for registry mode (at the price of holding the write
+    /// lock during validation, which is the point); the legacy
+    /// ([`Self::new`]) path is unchanged.
     pub async fn create_batch(
         &self,
         inputs: Vec<TagInput>,
         dry_run: bool,
     ) -> Result<BatchTagOutcome, BantoError> {
+        if self.registry.is_some() {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let outcome = self.create_batch_tx(&mut tx, &inputs).await?;
+            return match outcome {
+                BatchTagOutcome::Valid { count, .. } if dry_run => {
+                    let _ = tx.rollback().await;
+                    Ok(BatchTagOutcome::Valid { count, tags: None })
+                }
+                BatchTagOutcome::Valid { .. } => {
+                    tx.commit().await.map_err(banto_storage::storage_error)?;
+                    Ok(outcome)
+                }
+                invalid @ BatchTagOutcome::Invalid(_) => {
+                    let _ = tx.rollback().await;
+                    Ok(invalid)
+                }
+            };
+        }
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
         // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
@@ -3154,9 +3229,7 @@ impl TagService {
             if rules == AddressRules::Registry && validated[index].is_none() {
                 continue;
             }
-            match validate_tag_kind_placement(&self.pool, self.registry.as_deref(), input, None)
-                .await
-            {
+            match validate_tag_kind_placement(&self.pool, input, None).await {
                 Ok(placement) => {
                     hub_rows[index] = placement.unique;
                     if let Some(value) = validated[index].as_mut() {
@@ -8408,6 +8481,85 @@ mod tests {
             let (legacy, group) = setup().await;
             let reg = TagService::with_registry(legacy.pool.clone(), registry());
             (legacy, reg, group)
+        }
+
+        /// **Parse and write share one `BEGIN IMMEDIATE` transaction** (design §3.2,
+        /// owner review of #782). Another writer holds the write lock and changes the
+        /// connection's protocol modbus-tcp -> slmp; the registry `create` of `Abc`
+        /// (modbus-tcp canonicalises to `ABC`, slmp to `abc`) must neither complete
+        /// while the lock is held nor store the old driver's form under the new
+        /// protocol: it waits at its own `BEGIN IMMEDIATE`, then reads the committed
+        /// protocol and is parsed by the NEW driver. (With the old pool path the
+        /// protocol was read before the INSERT waited for the lock, and `ABC` landed
+        /// under slmp.) The only wait is a bounded "has not completed" check; the
+        /// release is explicit, so the outcome does not depend on timing.
+        #[tokio::test]
+        async fn registry_create_parses_inside_the_write_transaction() {
+            let path = std::env::temp_dir().join(format!(
+                "banto-tags-reg-create-{}-{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let pool_a = banto_storage::connect_sqlite(&path)
+                .await
+                .expect("connect a");
+            let (_legacy, group) = setup_on(pool_a.clone()).await;
+            let svc = TagService::with_registry(pool_a.clone(), registry());
+            let conn_id: i64 =
+                sqlx::query_scalar("SELECT plc_connection_id FROM collection_groups WHERE id = ?")
+                    .bind(group)
+                    .fetch_one(&pool_a)
+                    .await
+                    .unwrap();
+
+            // The "other writer": holds the write lock and changes the protocol.
+            let pool_b = banto_storage::connect_sqlite(&path)
+                .await
+                .expect("connect b");
+            let mut writer = pool_b.acquire().await.expect("acquire b");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE plc_connections SET protocol = 'slmp' WHERE id = ?")
+                .bind(conn_id)
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+
+            let svc_a = svc.clone();
+            let mut create =
+                tokio::spawn(async move { svc_a.create(tag_at("race", group, "Abc")).await });
+            // Still blocked on the write lock (well inside the 5 s busy_timeout).
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(300), &mut create).await;
+            assert!(pending.is_err(), "create must wait for the write lock");
+
+            sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+            drop(writer);
+
+            let created = create
+                .await
+                .expect("join")
+                .expect("create after the commit");
+            assert_eq!(
+                created.address, "abc",
+                "parsed by the committed (slmp) driver, not the old modbus-tcp one"
+            );
+            let stored: String = sqlx::query_scalar("SELECT address FROM tags WHERE name = 'race'")
+                .fetch_one(&pool_a)
+                .await
+                .unwrap();
+            assert_eq!(stored, "abc");
+
+            pool_a.close().await;
+            pool_b.close().await;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
         }
 
         fn conn_input(name: &str, protocol: &str) -> PlcConnectionInput {
