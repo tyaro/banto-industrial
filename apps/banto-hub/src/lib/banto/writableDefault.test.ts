@@ -3,26 +3,22 @@
  * `tagFormLayout.test.ts`/`slmpDeviceTable.test.ts` と同じスタイル
  * （describe/it、依存ゼロの純関数を直接 import）。
  *
- * **2026-09-02 オーナー判断（S1-b0 分離）**: アドレス領域（Modbus
- * `1xxxx`/`3xxxx` 読み取り専用）による判定は本モジュールに実装しない -
- * `writableArea` という外部供給フラグの差し込み口だけを用意する
- * （`writableDefault.ts` の doc comment 参照）。したがってここでは
- * 「`writableArea` を渡さない（＝現状の呼び出し）」経路と「将来 S1-b0 が
- * `writableArea: false`/`true` を渡すようになったときの契約」の両方を
- * 固定する - 後者は今はどこからも実際に呼ばれないが、シグネチャが
- * 壊れていないことをテストで保証しておく。
+ * R2b-2d（2026-10-22）: `writableArea` は解析の API（`POST /api/tags/parse-addresses`）
+ * の結果で、**`undefined`（判定不能）は既定 ON を当てない**契約に変えた
+ * （以前は「未配線の間は当ててよい」だった）。`true` だけが当てる。
  */
 import { describe, expect, it } from 'vitest';
 import { canDefaultWritable, writableDefaultBlockedReason } from './writableDefault';
 
 describe('canDefaultWritable', () => {
-	it('plc タグ + writableArea 未指定（現状の呼び出し、S1-b0 未配線）は true', () => {
-		expect(canDefaultWritable('plc')).toBe(true);
-		expect(canDefaultWritable('plc', undefined)).toBe(true);
+	it('plc タグ + writableArea 未指定（判定不能）は false（既定 ON に倒さない）', () => {
+		expect(canDefaultWritable('plc')).toBe(false);
+		expect(canDefaultWritable('plc', undefined)).toBe(false);
 	});
 
 	it('computed タグは常に false', () => {
 		expect(canDefaultWritable('computed')).toBe(false);
+		expect(canDefaultWritable('computed', true)).toBe(false);
 	});
 
 	it('internal タグは常に false（design の適用条件が plc タグ限定のため）', () => {
@@ -33,11 +29,11 @@ describe('canDefaultWritable', () => {
 		expect(canDefaultWritable('db')).toBe(false);
 	});
 
-	it('S1-b0 契約: plc タグ + writableArea=false は false（将来の配線用、現状はどこからも渡されない）', () => {
+	it('plc タグ + writableArea=false（読み取り専用の領域）は false', () => {
 		expect(canDefaultWritable('plc', false)).toBe(false);
 	});
 
-	it('S1-b0 契約: plc タグ + writableArea=true は true', () => {
+	it('plc タグ + writableArea=true（書き込める領域）だけが true', () => {
 		expect(canDefaultWritable('plc', true)).toBe(true);
 	});
 });
@@ -55,16 +51,16 @@ describe('writableDefaultBlockedReason', () => {
 		expect(writableDefaultBlockedReason('db')).toMatch(/db タグ/);
 	});
 
-	it('plc タグ + writableArea 未指定（現状の呼び出し）は理由なし（null）', () => {
+	it('plc タグ + writableArea 未指定（判定不能）は理由なし（null。既定を当てないだけ）', () => {
 		expect(writableDefaultBlockedReason('plc')).toBeNull();
 		expect(writableDefaultBlockedReason('plc', undefined)).toBeNull();
 	});
 
-	it('S1-b0 契約: plc タグ + writableArea=false は理由を返す（将来の配線用）', () => {
+	it('plc タグ + writableArea=false は理由を返す', () => {
 		expect(writableDefaultBlockedReason('plc', false)).toMatch(/読み取り専用/);
 	});
 
-	it('S1-b0 契約: plc タグ + writableArea=true は理由なし', () => {
+	it('plc タグ + writableArea=true は理由なし', () => {
 		expect(writableDefaultBlockedReason('plc', true)).toBeNull();
 	});
 });

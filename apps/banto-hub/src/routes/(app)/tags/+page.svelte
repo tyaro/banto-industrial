@@ -84,7 +84,8 @@
 		type BatchTagsUpdateResult,
 		type BatchTagsDeleteResult,
 		type BatchTagUpdateRow,
-		type BatchTagFieldError
+		type BatchTagFieldError,
+		parseTagAddresses
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
 		buildBulkEnableRows,
@@ -141,6 +142,8 @@
 	} from '#lib/banto/tagCsv.js';
 	import {
 		classifyCsvUpdate,
+		resolveCsvCanonicalAddresses,
+		type CanonicalAddressByLine,
 		type CsvUpdateClassification,
 		type CsvUpdateRow,
 		type CsvRowCategory
@@ -897,6 +900,56 @@
 	let createGroupLocked = $state(false);
 
 	/**
+	 * R2b-2d: create Drawer の入力（種類・アドレス・データ型・文字列長・文字コード・グループ）を
+	 * `POST /api/tags/parse-addresses` で解析した結果の `writableArea`
+	 * （`plc` のときだけ `boolean`）。**`undefined` = 判定不能**（`ok: false`・通信の失敗・
+	 * グループ未選択・`plc` 以外・アドレス空）で、`canDefaultWritable` は既定 ON を当てない。
+	 * 入力に追従して呼ぶので 300ms 待ってから呼び、古い応答は世代番号で捨てる。
+	 */
+	let createWritableArea = $state<boolean | undefined>(undefined);
+	let createWritableAreaSeq = 0;
+	// 数値の `$derived` にして、3 秒ごとの一覧の再読み込み（`groups`・`connections` の
+	// 付け替え）で effect が再実行されて既定が点滅しないようにする。
+	const createConnectionId = $derived(connectionForGroupId(createForm.collectionGroupId)?.id);
+
+	$effect(() => {
+		const seq = ++createWritableAreaSeq;
+		if (drawerMode !== 'create' || createForm.tagKind !== 'plc') {
+			createWritableArea = undefined;
+			return;
+		}
+		const address = createForm.address.trim();
+		const connectionId = createConnectionId;
+		if (address === '' || connectionId === undefined) {
+			createWritableArea = undefined;
+			return;
+		}
+		const item = {
+			tagKind: createForm.tagKind,
+			address,
+			dataType: createForm.dataType,
+			stringLength:
+				createForm.dataType === 'string' ? parseOptionalNumber(createForm.stringLength) : undefined,
+			stringEncoding: createForm.dataType === 'string' ? createForm.stringEncoding : undefined
+		};
+		const timer = setTimeout(() => {
+			parseTagAddresses(connectionId, [item]).then(
+				(results) => {
+					if (seq !== createWritableAreaSeq) return;
+					const first = results[0];
+					createWritableArea = first?.ok ? (first.writableArea ?? undefined) : undefined;
+				},
+				() => {
+					if (seq === createWritableAreaSeq) createWritableArea = undefined;
+				}
+			);
+		}, 300);
+		// 入力が変わったら、結果が届く前に古い値で既定を決めない。
+		createWritableArea = undefined;
+		return () => clearTimeout(timer);
+	});
+
+	/**
 	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
 	 * を「PLC タグかどうか」（{@link canDefaultWritable}、
 	 * `#lib/banto/writableDefault.ts`）とグループ単位の既定値
@@ -908,26 +961,23 @@
 	 * `true` になった後は何もしない（ユーザーが自分で決めた値を上書き
 	 * しない）。
 	 *
-	 * **2026-09-02 オーナー判断（S1-b0 分離）**: アドレス領域（Modbus
-	 * `1xxxx`/`3xxxx` 読み取り専用）による絞り込みはここでは行わない -
-	 * `canDefaultWritable` の第2引数（`writableArea`）を意図的に省略して
-	 * いる（`undefined` 扱い）。この規則をアドレス文字列から UI 側で
-	 * 判定すると、`banto-plc`（`AddressArea`）・`banto-tags`
-	 * （`modbus_read_only_area`）に続く3つ目の手書き複製になってしまう
-	 * ため、プロトコル層のデータを受け取れるようになる別スライス S1-b0
-	 * まで保留する（`writableDefault.ts` の doc comment 参照）。S1-b0 が
-	 * サーバー由来の判定結果（例: アドレス preflight のレスポンスに
-	 * 判定結果を足す）を用意したら、ここへ第2引数として渡すだけで
-	 * 絞り込みが有効になる - 関数シグネチャは既にその形になっている。
+	 * **アドレス領域（Modbus `1xxxx`/`3xxxx` 読み取り専用など）による絞り込み**
+	 * （R2b-2d、2026-10-22）: 文法を UI に写さず、`createWritableArea`（下の
+	 * `$effect` が `POST /api/tags/parse-addresses` の結果から埋める）を
+	 * `canDefaultWritable` の第2引数に渡す。**`undefined`（判定不能: アドレス空・
+	 * 入力途中・解析失敗・通信失敗・グループ未選択）は既定 ON を当てない**
+	 * （`writableDefault.ts` の契約）。入力が整って `true` が届くと、
+	 * `createWritableTouched` が `false` の間だけ既定が入る。
 	 *
 	 * 依存として読むのは `drawerMode`・`createWritableTouched`・
-	 * `createForm.tagKind`・`createForm.collectionGroupId`・`groups` の5つ -
+	 * `createForm.tagKind`・`createForm.collectionGroupId`・`groups`・
+	 * `createWritableArea` の6つ -
 	 * `createForm.writable` 自身は読まない（読むと自分の書き込みで自分を
 	 * 再トリガーする無限ループのリスクになる）。
 	 */
 	$effect(() => {
 		if (drawerMode !== 'create' || createWritableTouched) return;
-		const eligible = canDefaultWritable(createForm.tagKind);
+		const eligible = canDefaultWritable(createForm.tagKind, createWritableArea);
 		const groupId = Number(createForm.collectionGroupId);
 		const selectedGroup =
 			createForm.collectionGroupId !== '' && Number.isFinite(groupId)
@@ -4031,7 +4081,40 @@
 		if (csvMode !== 'update' || !csvParseResult?.ok || csvParseResult.rows.length === 0) {
 			return null;
 		}
-		return classifyCsvUpdate(csvParseResult.rows, visibleTags);
+		// アドレスの正規形の解析（下の `$effect`）が済むまでは分類しない（綴りのままの
+		// 比較で「変更あり」と見せてから消えることがないように）。
+		if (csvCanonicalByLine === null) return null;
+		return classifyCsvUpdate(csvParseResult.rows, visibleTags, csvCanonicalByLine);
+	});
+
+	/**
+	 * R2b-2d: 既存更新モードの CSV の全行のアドレスを `POST /api/tags/parse-addresses` で
+	 * 正規形にした結果（行番号 → 正規形かエラー）。`null` = 未取得・取得中。
+	 * 同じ接続の行をまとめて 1 回呼び、全行を `tagKind` つきで送る
+	 * （`tagCsvDiff.ts::resolveCsvCanonicalAddresses`）。応答は世代番号で守り、
+	 * CSV を差し替えた後に届いた古い応答は捨てる。接続・グループの一覧の付け替えでは
+	 * 再取得しない（`untrack`）。
+	 */
+	let csvCanonicalByLine = $state<CanonicalAddressByLine | null>(null);
+	let csvCanonicalSeq = 0;
+	$effect(() => {
+		const seq = ++csvCanonicalSeq;
+		csvCanonicalByLine = null;
+		if (csvMode !== 'update' || !csvParseResult?.ok || csvParseResult.rows.length === 0) return;
+		const rows = csvParseResult.rows;
+		const connectionIdForGroup = untrack(() => {
+			const snapshotGroups = groups;
+			const snapshotConnections = connections;
+			return (groupId: number): number | undefined => {
+				const group = snapshotGroups.find((g) => g.id === groupId);
+				return group
+					? snapshotConnections.find((c) => c.id === group.plcConnectionId)?.id
+					: undefined;
+			};
+		});
+		void resolveCsvCanonicalAddresses(rows, connectionIdForGroup).then((resolved) => {
+			if (seq === csvCanonicalSeq) csvCanonicalByLine = resolved;
+		});
 	});
 
 	/** プレビュー表の「行番号 → changed 行」引き当て用（エラー表示の index→行番号変換に使う）。 */
@@ -4709,7 +4792,8 @@
 	groupLocked: boolean,
 	describeState: DescribeState,
 	onDescribeClick: () => void,
-	exprCheck: ExpressionCheckFieldHandlers
+	exprCheck: ExpressionCheckFieldHandlers,
+	writableArea: boolean | undefined
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -5413,26 +5497,17 @@
 			`toInput`/確認パネル側の一貫性のためであり、このセクションは
 			そもそも出ない。
 
-			T19 S1-b（UX-34）: `writableDefaultBlockedReason` の第2引数
-			（アドレス領域がサーバー的に書き込み可能かどうか）は
-			2026-09-02 オーナー判断（S1-b0 分離）によりここでは意図的に
-			省略する（`undefined` 扱い）。Modbus `1xxxx`/`3xxxx` のような
-			規則をアドレス文字列から UI 側で判定すると、`banto-plc`
-			（`AddressArea`）・`banto-tags`（`modbus_read_only_area`）に
-			続く3つ目の手書き複製になってしまうため、プロトコル層の
-			データをサーバーから受け取れるようになる別スライス S1-b0 まで
-			保留する（`#lib/banto/writableDefault.ts` の doc comment
-			参照）。そのため現状 `writableBlockedReason` は `tagKind ===
-			'computed'` のときしか非 `null` にならない（このセクション自体
-			が computed では非表示なので、実質ここには来ない） -
-			チェックボックスは今のところ無効化されない。S1-b0 がアドレス
-			preflight 等でこの判定結果を返すようになったら、その値を
-			第2引数として渡すだけで絞り込みが有効になる。
+			T19 S1-b（UX-34）/ R2b-2d: `writableDefaultBlockedReason` の第2引数
+			（アドレス領域がドライバ的に書き込み可能かどうか）は、create Drawer では
+			解析の API（`POST /api/tags/parse-addresses`）の結果 `createWritableArea` を
+			`writableArea` として受け取る（文法を UI に写さない、2026-09-02 の判断）。
+			`false`（読み取り専用の領域）のときだけ理由を出し、`undefined`（判定不能）は
+			理由なしで既定を当てないだけ（手動で ON にはできる）。編集フォームは `undefined`。
 		-->
 		{@const writableBlockedReason =
 			connectionForGroupId(form.collectionGroupId)?.protocol === 'push'
 				? 'push（取り込み）接続のタグは書き込みできません（送り手が値を送るだけです）。'
-				: writableDefaultBlockedReason(form.tagKind)}
+				: writableDefaultBlockedReason(form.tagKind, writableArea)}
 		<details class="detail-group" bind:open={detailOpen.write}>
 			<summary>書き込み安全設定</summary>
 			<div class="form-grid">
@@ -5453,11 +5528,10 @@
 					<!--
 						T19 S1-b（UX-34「該当しない場合は既定を適用せず、なぜ
 						writable にできないのかが利用者に分かる表示にしてください」、
-						2026-09-02 オーナー決定）: 現状は到達しない分岐
-						（computed タグはこのセクション自体が非表示 - 上の
-						`{#if form.tagKind !== 'computed'}`）。S1-b0 でアドレス
-						領域判定が配線されれば、読み取り専用領域のときにも
-						ここへ来るようになる。
+						2026-09-02 オーナー決定）: computed タグはこのセクション自体が
+						非表示（上の `{#if form.tagKind !== 'computed'}`）なので来ない。
+						R2b-2d で解析の API の `writableArea === false`（読み取り専用の
+						領域）がここへ来る（create Drawer）。
 					-->
 					<p class="hint wide" id="tag-writable-blocked-reason">{writableBlockedReason}</p>
 				{:else if form.writable}
@@ -5842,7 +5916,9 @@
 			false,
 			editDescribeState,
 			() => void runDescribeGroup(editForm.collectionGroupId, 'edit'),
-			editExprFieldHandlers()
+			editExprFieldHandlers(),
+			// R2b-2d: 領域の判定は既定の自動適用（create Drawer 限定）にだけ使う。
+			undefined
 		)}
 		<div class="actions">
 			<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -6900,7 +6976,9 @@
 			createGroupLocked,
 			createDescribeState,
 			() => void runDescribeGroup(createForm.collectionGroupId, 'create'),
-			createExprFieldHandlers()
+			createExprFieldHandlers(),
+			// R2b-2d: 解析の API が返した「書き込める領域か」（`undefined` = 判定不能）。
+			createWritableArea
 		)}
 		<div class="actions">
 			<!--
@@ -7360,6 +7438,8 @@
 						>
 					{/if}
 				</div>
+			{:else if csvParseResult?.ok && csvMode === 'update' && csvCanonicalByLine === null && csvParseResult.rows.length > 0}
+				<p class="note" data-testid="tag-csv-update-resolving">アドレスを確認しています…</p>
 			{:else if csvParseResult?.ok && csvMode === 'update' && csvUpdateClassification}
 				<h4>差分プレビュー（{csvUpdateClassification.rows.length}件）</h4>
 				<p class="note" data-testid="tag-csv-update-summary">

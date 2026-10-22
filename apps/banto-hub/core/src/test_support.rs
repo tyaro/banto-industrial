@@ -229,7 +229,7 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
     fn parse_address(
         &self,
         text: &str,
-        _kind: &banto_driver_api::TagKind,
+        kind: &banto_driver_api::TagKind,
     ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
         let id = &self.descriptor.id;
         let parsed = match id.as_str() {
@@ -242,13 +242,23 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
             }
         }
         .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
-        Ok(banto_driver_api::DriverAddress::new(
+        // R2b-2d: the Modbus stand-in reports the real area and its writability
+        // (what the parse API returns), SLMP stays a generic writable area.
+        let (area, writable, bit) = match parsed.as_modbus_ref() {
+            Some((area, _, bit)) => (area.to_string(), area.is_writable(), bit),
+            None => ("area".to_string(), true, None),
+        };
+        let address = banto_driver_api::DriverAddress::new(
             id.clone(),
             parsed.to_string(),
-            "area",
-            true,
-            1,
-        ))
+            &area,
+            writable,
+            kind.word_count(),
+        );
+        Ok(match bit {
+            Some(bit) => address.with_bit(bit),
+            None => address,
+        })
     }
     fn offset_address(
         &self,

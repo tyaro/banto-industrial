@@ -1612,6 +1612,74 @@ pub fn normalize_tag_address(
     }
 }
 
+/// The columns of a tag that decide its address verdict, as the parse API
+/// ([`parse_tag_address`]) receives them.
+#[derive(Debug, Clone, Copy)]
+pub struct AddressProbe<'a> {
+    pub tag_kind: &'a str,
+    pub address: &'a str,
+    pub data_type: &'a str,
+    pub string_length: Option<i64>,
+    pub string_encoding: &'a str,
+}
+
+/// The parse API's whole verdict (R2b-2d, docs/banto-hub-driver-address-design.md
+/// §7.1): the address-independent field validation of [`validate_tag_input`]
+/// first (`tagKind` / `dataType` / `stringLength` / `stringEncoding`, the same
+/// messages the save path gives), then [`normalize_tag_address`] - the very
+/// function the save path calls. The field validation must come first because
+/// [`normalize_tag_address`] returns the typed spelling *without an error* when
+/// no `kind` can be built (an invalid `dataType` / `stringLength`), which would
+/// wrongly read as "ok". Rules about the other columns (`name`, scaling,
+/// `expression`, `writable`) are not part of an address verdict and are not
+/// run; `writable` is `false` so the verdict never depends on it (the caller
+/// reads `NormalizedAddress::parsed`'s `writable_area` instead).
+pub fn parse_tag_address(
+    conn_name: &str,
+    protocol: &str,
+    probe: &AddressProbe<'_>,
+    registry: &DriverRegistry,
+) -> Result<NormalizedAddress, Vec<FieldError>> {
+    let input = TagInput {
+        // Placeholders that satisfy the rules this function ignores.
+        name: "parse".to_string(),
+        collection_group_id: 0,
+        address: probe.address.to_string(),
+        data_type: probe.data_type.to_string(),
+        string_length: probe.string_length,
+        string_encoding: probe.string_encoding.to_string(),
+        raw_lo: None,
+        raw_hi: None,
+        eng_lo: None,
+        eng_hi: None,
+        unit: None,
+        decimals: default_decimals(),
+        enabled: true,
+        writable: false,
+        tag_kind: probe.tag_kind.to_string(),
+        expression: None,
+        retain: false,
+        expected_revision: None,
+    };
+    if let Err(BantoError::Validation { field_errors }) =
+        validate_tag_input(&input, AddressRules::Registry)
+    {
+        let own: Vec<FieldError> = field_errors
+            .into_iter()
+            .filter(|e| {
+                matches!(
+                    e.field.as_str(),
+                    "tagKind" | "dataType" | "stringLength" | "stringEncoding"
+                )
+            })
+            .collect();
+        if !own.is_empty() {
+            return Err(own);
+        }
+    }
+    normalize_tag_address(conn_name, protocol, &input, registry)
+}
+
 /// The `plc` arm of [`normalize_tag_address`].
 fn normalize_plc_address(
     protocol: &str,
@@ -8473,6 +8541,54 @@ mod tests {
                 ))))
                 .unwrap();
             Arc::new(registry)
+        }
+
+        fn probe<'a>(tag_kind: &'a str, address: &'a str, data_type: &'a str) -> AddressProbe<'a> {
+            AddressProbe {
+                tag_kind,
+                address,
+                data_type,
+                string_length: None,
+                string_encoding: "utf8",
+            }
+        }
+
+        /// `parse_tag_address` runs the field validation first: an invalid `dataType`
+        /// is an error even though `normalize_tag_address` alone would return the
+        /// spelling without one (no `kind` can be built), and the verdict of a valid
+        /// input is exactly `normalize_tag_address`'s.
+        #[test]
+        fn parse_tag_address_validates_fields_before_the_address() {
+            let registry = registry();
+            let bad = parse_tag_address(
+                "PLC1",
+                "modbus-tcp",
+                &probe("plc", "abc", "nope"),
+                &registry,
+            )
+            .unwrap_err();
+            assert!(bad.iter().all(|e| e.field == "dataType"), "{bad:?}");
+            let ok = parse_tag_address(
+                "PLC1",
+                "modbus-tcp",
+                &probe("plc", " abc ", "u16"),
+                &registry,
+            )
+            .unwrap();
+            assert_eq!(ok.canonical, "ABC");
+            assert!(ok.parsed.is_some());
+            // `computed` needs no expression for an address verdict.
+            let computed =
+                parse_tag_address("calc", "virtual", &probe("computed", "", "f64"), &registry)
+                    .unwrap();
+            assert_eq!(computed.canonical, "");
+            assert!(parse_tag_address(
+                "calc",
+                "virtual",
+                &probe("computed", "x", "f64"),
+                &registry
+            )
+            .is_err());
         }
 
         /// (legacy service on the PLC1 / modbus-tcp group of [`setup`], the same pool

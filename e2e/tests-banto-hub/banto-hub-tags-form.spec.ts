@@ -124,6 +124,9 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
 		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: CREATE_TAG_NAME, exact: true })).toBeVisible();
+		// R2b-2d: `40010` で作ったタグは、保存時にドライバの正規形（Modbus は 6 桁）になり、
+		// 一覧にも `400010` で出る（保存された値も同じ）。
+		await expect(page.getByRole('gridcell', { name: '400010', exact: true }).first()).toBeVisible();
 	});
 
 	test('1.5. create Drawer: 「登録して次へ」は親設定（収集グループ）と共通値（データ型・単位）を引き継ぎ、名前/アドレスだけ空にする（T18-2c、TAG-UX-2）', async () => {

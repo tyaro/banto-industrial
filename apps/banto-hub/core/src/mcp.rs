@@ -873,7 +873,7 @@ fn tool_definitions() -> Vec<Value> {
                 "properties": {
                     "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
                     "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
-                    "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。" },
+                    "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
                     "dataType": { "type": "string", "description": "データ型。" },
                     "stringLength": {
                         "type": ["integer", "null"],
@@ -911,7 +911,7 @@ fn tool_definitions() -> Vec<Value> {
                     "id": { "type": "integer", "description": "更新するタグの id。" },
                     "name": { "type": "string", "description": "タグ名(グループ内で一意)。" },
                     "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
-                    "address": { "type": "string", "description": "PLC アドレス。" },
+                    "address": { "type": "string", "description": "PLC アドレス。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
                     "dataType": { "type": "string", "description": "データ型。" },
                     "stringLength": {
                         "type": ["integer", "null"],

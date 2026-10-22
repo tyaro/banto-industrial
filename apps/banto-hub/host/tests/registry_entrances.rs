@@ -62,12 +62,6 @@ const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[
         2,
         "HostBound の接続テストの固定のリテラル（`D0`）。R2b-3 で消える",
     ),
-    (
-        "Address::parse(",
-        "core/src/rest/tags.rs",
-        1,
-        "`GET /api/tags/address-writable`。R2b-2d の解析の API に置き換わる",
-    ),
 ];
 
 /// `file` が `needle` の例外に当たるなら、許す件数。
@@ -265,8 +259,9 @@ fn read_and_write_paths_have_no_protocol_name_match_arm() {
 /// file, or the same needle elsewhere, is still an offence. The allowed count is pinned.
 #[test]
 fn exceptions_are_per_needle_and_per_file() {
+    // `rest/tags.rs` の例外は R2b-2d（`address-writable` の削除）で外した。
     let tags = Path::new("/x/core/src/rest/tags.rs");
-    assert_eq!(allowed_count("Address::parse(", tags), Some(1));
+    assert_eq!(allowed_count("Address::parse(", tags), None);
     assert_eq!(allowed_count("parse_slmp(", tags), None);
     assert_eq!(
         allowed_count("Address::parse(", Path::new("/x/core/src/read_path.rs")),

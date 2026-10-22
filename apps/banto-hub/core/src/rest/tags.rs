@@ -7,6 +7,8 @@
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
 
+use banto_tags::{parse_tag_address, AddressProbe};
+
 use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
     collection_groups_get, collection_groups_list, collection_groups_update,
@@ -19,11 +21,11 @@ use super::{
     broadcast, commit_catalog_and_notify, get, json, middleware, post, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     remove_tag_from_all_sink_groups, require_editor, require_session, storage_api_error,
-    tags_expression_check, tags_expression_functions, Address, ApiError, Arc, AuditLogService,
-    AuthGate, AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome,
+    tags_expression_check, tags_expression_functions, ApiError, Arc, AuditLogService, AuthGate,
+    AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome,
     CollectionController, CollectionGroupService, CollectorManager, CommissioningState,
     Deserialize, FieldError, GroupTagCount, HeaderMap, IntoResponse, Json, ListParams, ListResult,
-    OperationKind, Path, PendingChangesService, PlcConnectionService, Query, RegistryMutationError,
+    OperationKind, Path, PendingChangesService, PlcConnectionService, RegistryMutationError,
     RegistryMutationResult, Response, Router, Serialize, ServerEvent, State, StatusCode, Tag,
     TagInput, TagRegistryState, TagService,
 };
@@ -210,118 +212,128 @@ async fn tags_group_counts(
     Ok(Json(state.tags.count_by_group().await?))
 }
 
+/// `POST /api/tags/parse-addresses` の件数の上限。一括作成（`/api/tags/batch`）には
+/// サーバー側の件数の上限が無く（本文の大きさだけ）、画面の CSV の上限
+/// （`tagCsv.ts` の `MAX_CSV_ROWS` = 10000 行）が実質の上限なので、1 回の呼び出しで
+/// CSV 1 本分の全行（同じ接続の行をまとめて 1 回、設計 §7.2）を受けられる値にする。
+const MAX_PARSE_ADDRESS_ITEMS: usize = 10_000;
+
+/// [`tags_parse_addresses`] の要求の 1 行。`tagKind` は必須（保存と同じ種類ごとの規則を
+/// 当てるため、2026-10-22 オーナーのレビュー P2）。
 #[derive(Debug, Deserialize)]
-struct AddressWritableQuery {
-    /// `banto_tags::plc_connection::ALLOWED_PROTOCOLS`（`"modbus-tcp"` /
-    /// `"slmp"` / `"virtual"`）のいずれかを想定するが、未知の値もエラーには
-    /// せず単に「判定材料が無い」＝`writable: null` として扱う（下記応答の
-    /// フィールド doc 参照）- 将来プロトコルが増えてもこのエンドポイント自体
-    /// の追随を待たずに安全側（既定を適用しない）へ倒れる。
-    protocol: String,
-    /// 生のアドレス文字列（例: `"30001"`）。空文字・不正な形式・入力途中の
-    /// 文字列も許容し、単に `writable: null` を返す（下記参照）。
+#[serde(rename_all = "camelCase")]
+struct ParseAddressItem {
+    tag_kind: String,
     address: String,
+    data_type: String,
+    #[serde(default)]
+    string_length: Option<i64>,
+    #[serde(default = "default_tag_string_encoding")]
+    string_encoding: String,
 }
 
-/// [`tags_address_writable`]の応答。**T19 S1-b0（2026-09-02 オーナー決定）:
-/// `null`(`None`)は「判定不能」だけを意味する** - 領域制限が無いことの
-/// 表明ではない。3値の意味は次のとおり:
-///
-/// - `writable: Some(true)`, `area: None` -
-///   領域による書き込み制限が存在しないプロトコル（`slmp`/`virtual`。SLMP
-///   デバイスに Modbus の 1xxxx/3xxxx に相当する「恒久的に読み取り専用の
-///   エリア」という概念は無い）。書き込み可能領域の観点では既定を適用して
-///   よい。
-/// - `writable: Some(bool)`, `area: Some(_)` - `protocol == "modbus-tcp"`
-///   で `address` が Modbus 参照番号としてパースできた。`area` は
-///   [`AddressArea`]の`Display`文字列（`"coil"`/`"discrete_input"`/
-///   `"input_register"`/`"holding_register"`）、`writable` はその領域の
-///   [`AddressArea::is_writable`]。
-/// - `writable: None`, `area: None` - **判定不能**（`address` が空・入力
-///   途中・不正な形式、または `protocol` がこの3つのいずれでもない）。
-///   `apps/banto-hub/src/lib/banto/writableDefault.ts`の
-///   `writableArea: boolean | undefined`契約と対応させるため、UI は
-///   これを`undefined`として扱い、**チェックボックスの既定 ON を適用しない**
-///   （安全側 - 誤って読み取り専用領域に既定 ON してしまうより、既定が
-///   一時的に効かない方を選ぶ）。
-///
-/// **呼び出し失敗時のフェイルセーフ契約:** このエンドポイント自体が
-/// 4xx/5xx を返した場合、あるいはネットワーク到達不能などで応答が
-/// 得られなかった場合も、呼び出し側は上記の`writable: None`と同じ扱い
-/// （＝既定を適用しない）にすること。判定不能を「安全に倒す」という
-/// この応答の設計方針を、通信失敗時にも一貫させるため。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ParseAddressesRequest {
+    connection_id: i64,
+    items: Vec<ParseAddressItem>,
+}
+
+/// 1 行の結果。`area`・`writableArea`・`bit`・`wordCount` は `plc` のときだけ値を持つ
+/// （それ以外は `null`）。
 #[derive(Debug, Serialize)]
-struct AddressWritableResponse {
-    writable: Option<bool>,
-    area: Option<String>,
+#[serde(untagged)]
+enum ParseAddressResult {
+    Ok(ParseAddressOk),
+    Err(ParseAddressErr),
 }
 
-/// `GET /api/tags/address-writable`（T19 S1-b0、2026-09-02 オーナー判断）:
-/// 「Modbus の 1xxxx（discrete input）/3xxxx（input register）は書き込め
-/// ない」という規則の正は `banto_plc_address::AddressArea::is_writable`
-/// （`banto-plc`が re-export し、`banto-tags`の登録時検証・
-/// `banto-plc-write`の書き込みプランナーも同じ定義を読む）1箇所のみ - この
-/// ハンドラはそれをアドレス文字列に適用して返すだけで、**UI 側に「先頭桁で
-/// エリアを判定する」ロジックを持たせないための唯一の入口**にする
-/// （`crates/banto-tags/src/tag.rs::modbus_read_only_area`のような「桁数＋
-/// 先頭桁」の狭い複製すら UI には作らせない、という 2026-09-02 の設計判断 -
-/// アドレスのパース自体をサーバーに一本化する）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ParseAddressOk {
+    ok: bool,
+    canonical: String,
+    area: Option<String>,
+    writable_area: Option<bool>,
+    bit: Option<u8>,
+    word_count: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct ParseAddressErr {
+    ok: bool,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ParseAddressesResponse {
+    items: Vec<ParseAddressResult>,
+}
+
+/// `POST /api/tags/parse-addresses`（R2b-2d、docs/banto-hub-driver-address-design.md §7.1）:
+/// 保存と**同じ**関数（[`banto_tags::parse_tag_address`] = 項目の検証 →
+/// `normalize_tag_address`）に、保存の入口が使うのと同じドライバのレジストリ
+/// （`CollectorManager::registry()`。`CollectorManager::tags()` が `TagService::with_registry`
+/// に渡すもの）を渡して、接続のプロトコルの下でのアドレスの正規形と領域の情報を返す。
+/// 画面の「書き込み可」の既定（`writableDefault.ts`）と CSV の更新の分類（`tagCsvDiff.ts`）が
+/// 文法を TS に写さずに使う。
 ///
-/// `/api/tags` と同じ読み取り専用・副作用なしのエンドポイントなので
-/// `require_auth`（viewer 以上）のみで`require_editor`は呼ばない。DB
-/// アクセスも無い純粋な計算なので`State<TagRegistryState>`も取らない。
-/// `plc_connections_test`と同じ理由で意図的に`#[utoipa::path]`を付けず
-/// `ApiDoc`にも加えない(`/api/v1/*`のみを文書化する既存方針、このファイル
-/// 冒頭「二系統に分かれたルーター」節参照)。
+/// `/api/tags` の読み取りと同じく副作用が無いので `require_auth`（viewer 以上）だけで
+/// `require_editor` は呼ばない。`plc_connections_test` と同じ理由で意図的に
+/// `#[utoipa::path]` を付けず `ApiDoc` にも加えない（`/api/v1/*` だけを文書化する既存方針）。
 ///
-/// `null`の意味論・呼び出し失敗時の契約は[`AddressWritableResponse`]の
-/// doc comment を参照。
-async fn tags_address_writable(
-    Query(query): Query<AddressWritableQuery>,
-) -> Json<AddressWritableResponse> {
-    match query.protocol.as_str() {
-        "modbus-tcp" => match Address::parse(&query.address) {
-            Ok(addr) => match addr.as_modbus_ref() {
-                Some((area, _offset, _bit)) => Json(AddressWritableResponse {
-                    writable: Some(area.is_writable()),
-                    area: Some(area.to_string()),
-                }),
-                // `Address::parse` only ever produces `ModbusRef` (see
-                // `banto_plc::address`'s own
-                // `parse_still_means_modbus_reference_notation` test), so
-                // this arm is unreachable in practice - kept instead of
-                // `unreachable!()` so a future change to `parse` degrades to
-                // "cannot determine" rather than a panic on this
-                // side-effect-free endpoint.
-                None => Json(AddressWritableResponse {
-                    writable: None,
-                    area: None,
-                }),
-            },
-            // Malformed or still-being-typed address text - cannot determine
-            // yet, not "no restriction" (see this response type's doc
-            // comment on why these two must not collapse into one value).
-            Err(_) => Json(AddressWritableResponse {
-                writable: None,
-                area: None,
-            }),
-        },
-        // SLMP devices have no Modbus-style permanently-read-only area, and
-        // `virtual` (calc/mem) tags have no PLC address at all - neither
-        // protocol has an area-based write restriction to report, so the
-        // default may be applied.
-        "slmp" | "virtual" => Json(AddressWritableResponse {
-            writable: Some(true),
-            area: None,
-        }),
-        // Unknown protocol (e.g. a future addition this handler has not
-        // been taught about yet) - cannot determine, fail safe rather than
-        // guess either way.
-        _ => Json(AddressWritableResponse {
-            writable: None,
-            area: None,
-        }),
+/// 行ごとの失敗は 200 のまま `ok: false` + `message`（複数の項目エラーは `；` でつなぐ）。
+/// 判定不能を「安全」に読ませない: 呼び出し側は `ok: false`・通信の失敗・応答の欠落を
+/// すべて「判定不能」（書き込み可の既定を当てない）として扱う。
+async fn tags_parse_addresses(
+    State(state): State<TagRegistryState>,
+    Json(body): Json<ParseAddressesRequest>,
+) -> Result<Json<ParseAddressesResponse>, ApiError> {
+    if body.items.len() > MAX_PARSE_ADDRESS_ITEMS {
+        return Err(ApiError(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "items".to_string(),
+                message: format!("items は {MAX_PARSE_ADDRESS_ITEMS} 件以下にしてください"),
+            }],
+        }));
     }
+    let connection = state.plc_connections.get(body.connection_id).await?;
+    let registry = state.manager.registry();
+    let items = body
+        .items
+        .iter()
+        .map(|item| {
+            let probe = AddressProbe {
+                tag_kind: &item.tag_kind,
+                address: &item.address,
+                data_type: &item.data_type,
+                string_length: item.string_length,
+                string_encoding: &item.string_encoding,
+            };
+            match parse_tag_address(&connection.name, &connection.protocol, &probe, registry) {
+                Ok(normalized) => {
+                    let parsed = normalized.parsed.as_ref();
+                    ParseAddressResult::Ok(ParseAddressOk {
+                        ok: true,
+                        canonical: normalized.canonical.clone(),
+                        area: parsed.map(|p| p.area.clone()),
+                        writable_area: parsed.map(|p| p.writable_area),
+                        bit: parsed.and_then(|p| p.bit),
+                        word_count: parsed.map(|p| p.word_count),
+                    })
+                }
+                Err(errors) => ParseAddressResult::Err(ParseAddressErr {
+                    ok: false,
+                    message: errors
+                        .iter()
+                        .map(|e| e.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("；"),
+                }),
+            }
+        })
+        .collect();
+    Ok(Json(ParseAddressesResponse { items }))
 }
 
 async fn tags_get(
@@ -1310,10 +1322,9 @@ pub(super) fn tag_registry_router(
         .route("/api/tags/list", post(tags_list_query))
         // 同じく固定セグメント。グループ別タグ件数集計。
         .route("/api/tags/group-counts", get(tags_group_counts))
-        // T19 S1-b0（2026-09-02）: 同じく固定セグメント。指定アドレスが
-        // 書き込み可能な領域かどうかの判定（`tags_address_writable`の doc
-        // comment 参照）。
-        .route("/api/tags/address-writable", get(tags_address_writable))
+        // R2b-2d: 同じく固定セグメント。アドレスの解析（保存と同じ関数、
+        // `tags_parse_addresses` の doc comment 参照）。
+        .route("/api/tags/parse-addresses", post(tags_parse_addresses))
         // #342 段階A: 保存前の式検証（エラー位置・参照タグ解決・循環判定・
         // 現在値によるプレビュー試算）。同じく `/api/tags` 直下の固定セグ
         // メントで `/api/tags/{id}` (i64) とは衝突しない。

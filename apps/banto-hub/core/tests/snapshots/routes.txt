@@ -30,7 +30,6 @@ GET /api/store-settings
 GET /api/tag-catalog
 GET /api/tag-stream
 GET /api/tags
-GET /api/tags/address-writable
 GET /api/tags/expression/functions
 GET /api/tags/group-counts
 GET /api/tags/{id}
@@ -80,6 +79,7 @@ POST /api/tags/batch-delete
 POST /api/tags/batch-update
 POST /api/tags/expression/check
 POST /api/tags/list
+POST /api/tags/parse-addresses
 POST /api/users
 POST /api/users/{id}/reset-password
 POST /api/v1/ingest/{id}/values

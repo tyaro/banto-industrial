@@ -100,10 +100,10 @@ pub use push::{
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use settings_json::{settings_to_api, validate_settings_with_registry};
 pub use tag::{
-    normalize_tag_address, tag_kind, validate_hub_tag_address, BatchTagDeleteError,
-    BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome, BatchTagUpdateError,
-    BatchTagUpdateOutcome, GroupTagCount, NormalizedAddress, Tag, TagInput, TagService,
-    TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
+    normalize_tag_address, parse_tag_address, tag_kind, validate_hub_tag_address, AddressProbe,
+    BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
+    BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, NormalizedAddress, Tag, TagInput,
+    TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
     COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
     MAX_HUB_EXTERNAL_NAME_LEN, MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND,
     STRING_DATA_TYPE,
