@@ -1,12 +1,10 @@
-//! The frame-type harness: [`run_all`] plays the Hub's engine for a
-//! [`FrameDriver`] against a [`Responder`] (docs/banto-driver-api-design.md
-//! §7.1, §7.2).
+//! フレーム型の適合テスト。FrameSession の本番実行系を、記憶上の通信路と
+//! 止めた Tokio の時計で駆動する（設計 §5.6、api-design §7.1・§7.2）。
 //!
-//! The responder answers like a healthy device; the harness itself injects
-//! the faults (split, straddled, late, endless, noisy, broken and cut-off
-//! responses, and peer closes) by re-timing what "arrives" on an in-memory
-//! wire with **virtual time**. Nothing sleeps and nothing depends on the
-//! machine's speed, so a run is deterministic.
+//! Responder は正常な機器として応え、分割・遅延・伸び続ける応答・先頭のごみ・
+//! 壊れた応答・途中の切断は通信路が挟む。実時間の sleep は使わない。
+//! 契約違反は本番の EngineEvents から収集する。C11 の純粋な呼び出しは
+//! ハーネスが直接調べ、RawValue の比較は f64 や文字列への変換前に行う。
 //!
 //! ## What [`run_all`] checks
 //!
@@ -42,7 +40,7 @@
 //! C8 (one socket per connection) is session-type only
 //! ([`session::run_all_against`](crate::session::run_all_against), which
 //! also runs C13-C15 for session-type drivers since R1-5); the frame-type
-//! write state-machine checks C13-C16 arrive with R2b-3 (design §7.3).
+//! C13〜C15 の Frame 実装は後続へ、broker と組み合わせる C16 は 3b-join へ残す。
 
 mod engine;
 
@@ -223,11 +221,9 @@ impl FrameFixtures {
     }
 }
 
-/// Run C1-C7 and C9-C12 against `driver` with `peer` and return every
-/// failure (design §7.2). An empty result means the driver conforms.
-///
-/// `async` so that later checks can involve real transports without an API
-/// change; this version runs entirely in memory.
+/// C1〜C7・C9〜C12 を検証する。空ならすべて適合した（設計 §7.2）。
+/// 本物のエンジンを別スレッドの止めた時計で駆動するため、呼び出し元の
+/// Tokio runtime の種類や時計の状態には依存しない。公開の async API は維持する。
 pub async fn run_all(
     driver: &dyn FrameDriver,
     fixtures: &FrameFixtures,
@@ -708,6 +704,13 @@ impl Cx<'_, '_, '_> {
                                 ),
                             ));
                         }
+                        Ok(Err(e @ (FatalError::Io(_) | FatalError::Timeout))) if !io_reported => {
+                            io_reported = true;
+                            self.failures.push(Failure::new(
+                                "C4",
+                                format!("is_complete が {e:?} を返した（フレーム型は返さない）"),
+                            ));
+                        }
                         Ok(_) => {}
                     }
                 }
@@ -727,15 +730,25 @@ impl Cx<'_, '_, '_> {
                 _ => return, // no handshake (or none to answer): nothing to fuzz
             };
             let bytes = rng.bytes((first.max_len as usize).min(CAP));
-            if catch_unwind(AssertUnwindSafe(|| conn.handshake_next(Some(&bytes)))).is_err() {
-                self.fail(
-                    "C11",
-                    format!(
-                        "handshake_next が {} バイトの入力で panic した",
-                        bytes.len()
-                    ),
-                );
-                return;
+            match catch_unwind(AssertUnwindSafe(|| conn.handshake_next(Some(&bytes)))) {
+                Err(_) => {
+                    self.fail(
+                        "C11",
+                        format!(
+                            "handshake_next が {} バイトの入力で panic した",
+                            bytes.len()
+                        ),
+                    );
+                    return;
+                }
+                Ok(Err(e @ (FatalError::Io(_) | FatalError::Timeout))) if !io_reported => {
+                    io_reported = true;
+                    self.fail(
+                        "C4",
+                        format!("handshake_next が {e:?} を返した（フレーム型は返さない）"),
+                    );
+                }
+                Ok(_) => {}
             }
         }
     }
