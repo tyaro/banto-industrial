@@ -1056,3 +1056,216 @@ async fn mcp_read_tag_now_denies_missing_read_scope() {
 
     sim.stop();
 }
+
+// ---------------------------------------------------------------------------
+// 6. R2b-2c: アドレスは接続のドライバ(レジストリ)で解析する
+//    (docs/banto-hub-driver-address-design.md §4.1・§5・§9)
+//
+// 計画(`build_hub_config`)は厳格版なので、有効な数値タグの不正なアドレスは
+// rebuild ごと断る(カタログに載らない)。カタログの `entry.address` が不正な
+// 綴りになりうるのは、計画が読まない行 = **string タグ**(S1: 計画の前に外れる)
+// と**無効なタグ**だけ。その行を生の SQL で書き換えて検証する。
+// ---------------------------------------------------------------------------
+
+fn modbus_conn_input(name: &str) -> PlcConnectionInput {
+    PlcConnectionInput {
+        protocol: "modbus-tcp".to_string(),
+        ..slmp_conn_input(name, 1)
+    }
+}
+
+async fn raw_set_address(app: &TestApp, tag_id: i64, address: &str) {
+    sqlx::query("UPDATE tags SET address = ? WHERE id = ?")
+        .bind(address)
+        .bind(tag_id)
+        .execute(&app.pool)
+        .await
+        .expect("raw address update");
+}
+
+/// A string tag under `conn_input`, written valid and then edited by raw SQL to
+/// `bad_address`; the rebuild still succeeds (a string tag is never planned).
+async fn make_hand_edited_string_tag(
+    app: &TestApp,
+    conn_input: PlcConnectionInput,
+    valid_address: &str,
+    bad_address: &str,
+) -> (i64, String) {
+    let conn_name = conn_input.name.clone();
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input)
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    let tag = TagService::new(app.pool.clone())
+        .create(string_tag_input(
+            "recipe",
+            group.id,
+            valid_address,
+            5,
+            "utf8",
+        ))
+        .await
+        .unwrap();
+    raw_set_address(app, tag.id, bad_address).await;
+    app.manager.rebuild().await.expect("rebuild");
+    (tag.id, format!("{conn_name}.fast.recipe"))
+}
+
+async fn audit_rows(app: &TestApp, tag_id: i64) -> Vec<(String, String, Option<String>)> {
+    sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT action, result, detail FROM hub_write_audit WHERE tag_id = ? ORDER BY id",
+    )
+    .bind(tag_id)
+    .fetch_all(&app.pool)
+    .await
+    .unwrap()
+}
+
+/// 即時読み取り: Modbus の接続に `D3000`(手で書き換えた行) → 422、broker へは何も渡らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_now_is_422_for_an_address_the_modbus_driver_refuses() {
+    let app = test_app("read-now-bad-modbus").await;
+    let (_id, name) =
+        make_hand_edited_string_tag(&app, modbus_conn_input("m1"), "40001", "D3000").await;
+    let key = issue_key(&app.router, &app.admin_token, "r", &["read:m1.fast.recipe"]).await;
+    let sessions_before = app.sessions.connection_count();
+    let (status, body) = get_json(
+        &app.router,
+        &format!("/api/v1/values/{name}/read-now"),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(app.sessions.connection_count(), sessions_before);
+}
+
+/// SLMP の接続に Modbus 綴り(`400001`)。シミュレータに読み書きの要求が 1 つも届かない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_now_and_write_are_422_and_send_the_broker_nothing_for_a_refused_address() {
+    let app = test_app("bad-address-no-broker").await;
+    let sim = Simulator::start().await;
+    let (tag_id, name) = make_hand_edited_string_tag(
+        &app,
+        slmp_conn_input("line1", sim.addr.port()),
+        "D3000",
+        "400001",
+    )
+    .await;
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.sessions.connection_count() == 1
+        })
+        .await
+    );
+    app.write_control.enable();
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "rw",
+        &["read:line1.fast.recipe", "write:line1.fast.recipe"],
+    )
+    .await;
+    let reads_before = sim.read_command_count();
+    let writes_before = sim.write_command_count();
+
+    let (status, body) = get_json(
+        &app.router,
+        &format!("/api/v1/values/{name}/read-now"),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+
+    let (status, body) = v1_post(
+        &app.router,
+        &format!("/api/v1/values/{name}"),
+        &key,
+        json!({ "v": "abc" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+
+    assert_eq!(
+        sim.read_command_count(),
+        reads_before,
+        "no read reached the PLC"
+    );
+    assert_eq!(
+        sim.write_command_count(),
+        writes_before,
+        "no write reached the PLC"
+    );
+
+    // Where the address is parsed in the write path today: inside gate 8's PLC branch,
+    // i.e. AFTER the log-before-write row is inserted (`execute_write`: `insert_pending`
+    // → `write_plc_string_tag` → `build_plc_string_write_request`). The refusal is
+    // confirmed on that row (`failed` + detail); no `ok` row exists. R2b-2c did not move
+    // the parse - this pins the order as it is.
+    let rows = audit_rows(&app, tag_id).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].1, "failed", "{rows:?}");
+    sim.stop();
+}
+
+/// 5 桁・小文字(R2b-2 より前の綴り)の行も、ドライバが同じアドレスに読むので読める。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_now_reads_a_tag_stored_in_a_pre_canonical_spelling() {
+    let app = test_app("read-now-non-canonical").await;
+    let sim = Simulator::start().await;
+    sim.set_word(SlmpDevice::D, 100, 1234);
+    let (tag_id, name) = make_tag(
+        &app,
+        "line1",
+        sim.addr.port(),
+        "temp01",
+        "D100",
+        "u16",
+        false,
+        true,
+    )
+    .await;
+    raw_set_address(&app, tag_id, "d100").await;
+    app.manager.rebuild().await.expect("rebuild");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            app.sessions.connection_count() == 1
+        })
+        .await
+    );
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "r",
+        &["read:line1.fast.temp01"],
+    )
+    .await;
+    let (status, body) = get_json(
+        &app.router,
+        &format!("/api/v1/values/{name}/read-now"),
+        &key,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["v"], 1234.0, "{body:?}");
+    sim.stop();
+}
+
+/// 厳格な計画: 有効な数値タグの不正な綴り(手で書き換えた行)は rebuild ごと断る。
+/// 寛容版(そのタグだけ `InvalidTag`)の検証は `banto-collect` の
+/// `a_registry_plan_excludes_only_the_tag_its_driver_refuses`。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rebuild_refuses_an_enabled_numeric_tag_whose_driver_refuses_the_address() {
+    let app = test_app("rebuild-bad-numeric").await;
+    let (tag_id, name) = make_tag(&app, "line1", 1, "t1", "D100", "u16", false, true).await;
+    raw_set_address(&app, tag_id, "400001").await;
+    let before = app.manager.revision();
+    assert!(app.manager.rebuild().await.is_err());
+    let message = app.manager.last_error().expect("last error");
+    assert!(message.contains("400001"), "{message}");
+    assert_eq!(app.manager.revision(), before, "the catalog is kept");
+    assert!(app.manager.tag_map().get(&name).is_some());
+}

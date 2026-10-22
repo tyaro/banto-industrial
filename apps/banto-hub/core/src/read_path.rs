@@ -185,7 +185,7 @@ pub async fn execute_read_now(
         .await
         .map_err(map_registry_error)?;
 
-    let request = build_plc_read_request(&conn, &entry, &tag_row)?;
+    let request = build_plc_read_request(manager.registry(), &conn, &entry, &tag_row)?;
 
     // gate 4: non-spawning peek(このモジュールの doc comment参照) - 新規に
     // 実機へダイヤルしない。
@@ -240,10 +240,43 @@ pub async fn execute_read_now(
     })
 }
 
+/// R2b-2c(docs/banto-hub-driver-address-design.md §4.1・§4.2): 読み取り・
+/// 書き込み(数値・文字列)が共有する、PLC タグのアドレス解決。
+/// `conn.protocol` のドライバ(`registry`)の `parse_address` にタグの
+/// [`banto_tags::tag_kind`] を渡して [`banto_driver_api::DriverAddress`] を得て、
+/// HostBound の橋 [`Address::from_driver_address`] で `banto_plc::Address` に戻す
+/// (橋は R2b-3 でホストバウンドのドライバと一緒に消える)。プロトコル名による
+/// 文法の分岐はここには無い。ドライバが無い・kind が作れない・解析/橋の失敗は
+/// すべて `Err(メッセージ)` で、呼び出し元がそれぞれ
+/// `ReadNowRejection::InvalidAddress` / `WriteRejection::InvalidAddress`(422、
+/// broker へは渡さない)にする。**副作用は無い**。
+pub(crate) fn resolve_plc_address(
+    registry: &banto_driver_api::DriverRegistry,
+    conn: &banto_tags::PlcConnection,
+    entry: &crate::hub::TagEntry,
+    tag_row: &banto_tags::Tag,
+) -> Result<Address, String> {
+    let Some(kind) = banto_tags::tag_kind(
+        &tag_row.data_type,
+        tag_row.string_length,
+        &tag_row.string_encoding,
+    ) else {
+        return Err(format!("未対応のデータ型です: {}", tag_row.data_type));
+    };
+    let Some(driver) = registry.get(&conn.protocol) else {
+        return Err(format!("ドライバ {} がありません", conn.protocol));
+    };
+    let driver_address = driver
+        .base()
+        .parse_address(entry.address.trim(), &kind)
+        .map_err(|err| err.message().to_string())?;
+    Address::from_driver_address(&driver_address).map_err(|err| err.to_string())
+}
+
 /// `entry`/`tag_row` から `BatchReadRequest` を組み立てる
 /// (`crate::write_path::build_plc_write_request`/
-/// `build_plc_string_write_request` の読み取り版 - アドレス解決は#131の
-/// プロトコル別分岐をそのまま踏襲する)。**副作用は無い**(broker へは
+/// `build_plc_string_write_request` の読み取り版 - アドレス解決は
+/// [`resolve_plc_address`] を共有する)。**副作用は無い**(broker へは
 /// 渡さない)。
 ///
 /// bit-in-word アドレス(T8、`"D100.5"`)は write と違って特別扱いが要らない。
@@ -253,20 +286,15 @@ pub async fn execute_read_now(
 /// SLMP にビット専用書き込みコマンドが無いためで、読み取りには元々その
 /// 制約が無い)。
 fn build_plc_read_request(
+    registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
 ) -> Result<BatchReadRequest, ReadNowRejection> {
-    // #131 と同じプロトコル別アドレス解決(`crate::write_path::build_plc_write_request`
-    // 参照)。
-    let address = match conn.protocol.as_str() {
-        "modbus-tcp" => Address::parse(&entry.address),
-        _ => Address::parse_slmp(&entry.address),
-    };
-    let address = match address {
-        Ok(address) => address,
-        Err(err) => return Err(ReadNowRejection::InvalidAddress(err.to_string())),
-    };
+    // R2b-2c: アドレスは接続のドライバ(レジストリ)で解析し、橋で
+    // `banto_plc::Address` に戻す([`resolve_plc_address`])。
+    let address = resolve_plc_address(registry, conn, entry, tag_row)
+        .map_err(ReadNowRejection::InvalidAddress)?;
 
     if entry.data_type == STRING_DATA_TYPE {
         let words = tag_row.string_length.unwrap_or(0).clamp(0, u16::MAX as i64) as u16;

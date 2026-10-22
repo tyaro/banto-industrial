@@ -1414,12 +1414,21 @@ pub async fn execute_write_batch(
             let p = &prepared[i];
             let conn = p.conn.as_ref().expect("group is keyed by connection id");
             let request = match &p.value {
-                ConvertedValue::Numeric(data_type, value) => {
-                    build_plc_write_request(conn, &p.entry, *data_type, &tag_row, *value)
-                }
-                ConvertedValue::Str(text) => {
-                    build_plc_string_write_request(conn, &p.entry, &tag_row, text)
-                }
+                ConvertedValue::Numeric(data_type, value) => build_plc_write_request(
+                    deps.manager.registry(),
+                    conn,
+                    &p.entry,
+                    *data_type,
+                    &tag_row,
+                    *value,
+                ),
+                ConvertedValue::Str(text) => build_plc_string_write_request(
+                    deps.manager.registry(),
+                    conn,
+                    &p.entry,
+                    &tag_row,
+                    text,
+                ),
             };
             match request {
                 Ok(request) => {
@@ -1537,8 +1546,8 @@ pub async fn execute_write_batch(
 }
 
 /// gate 8 の PLC タグ分岐: 従来どおり `banto_tags::unscale` → プロトコル別
-/// アドレス解決(#131 以降 SLMP/Modbus TCP の両方 - `banto_collect`の
-/// `build_request`と同じ`conn.protocol`分岐)→ `BrokerHandle::write`。
+/// アドレス解決(R2b-2c 以降はドライバ + 橋、
+/// [`crate::read_path::resolve_plc_address`])→ `BrokerHandle::write`。
 /// `execute_write` から抽出しただけで
 /// 挙動は変えていない(T6-2 前の唯一の書き込み経路そのもの)。
 ///
@@ -1555,7 +1564,14 @@ async fn write_plc_tag(
     tag_row: &banto_tags::Tag,
     requested: f64,
 ) -> Result<(), WriteRejection> {
-    let request = build_plc_write_request(conn, entry, data_type, tag_row, requested)?;
+    let request = build_plc_write_request(
+        deps.manager.registry(),
+        conn,
+        entry,
+        data_type,
+        tag_row,
+        requested,
+    )?;
 
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
@@ -1595,6 +1611,7 @@ async fn write_plc_tag(
 /// を代わりに呼ぶ) - この関数自身が `BatchWriteRequest::String` を組み立てる
 /// ことは無い。
 fn build_plc_write_request(
+    registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     data_type: DataType,
@@ -1626,25 +1643,17 @@ fn build_plc_write_request(
         }
     };
 
-    // #131 (2026-09-01): dispatch on `conn.protocol` exactly like
-    // `crates/banto-collect/src/config.rs`'s `build_request` does for reads -
-    // gate 4 (`resolve_write_target`, above) no longer restricts this
-    // function to SLMP connections alone, so the address notation must be
-    // parsed with the matching protocol's parser.
-    let address = match conn.protocol.as_str() {
-        "modbus-tcp" => Address::parse(&entry.address),
-        // "slmp" and (defensively) anything else the protocol gate above
-        // already restricted to a broker-registered protocol.
-        _ => Address::parse_slmp(&entry.address),
-    };
-    let address = match address {
+    // R2b-2c: the address is parsed by the connection's driver (registry) and
+    // brought back to a `banto_plc::Address` over the HostBound bridge
+    // (`crate::read_path::resolve_plc_address`) - no per-protocol branch here.
+    // The parse stays exactly where it was: inside this builder, i.e. at the
+    // same point of the gate sequence as the `Address::parse` it replaces.
+    let address = match crate::read_path::resolve_plc_address(registry, conn, entry, tag_row) {
         Ok(address) => address,
-        Err(err) => {
+        Err(message) => {
             // catalog のアドレスは登録時に banto-tags で検証済みのはずの
-            // 防御的分岐(gate 4 で broker が対応するプロトコルの接続だけに
-            // 絞られているので、ここに来る時点でアドレスは対応プロトコルの
-            // 表記のはず)。
-            return Err(WriteRejection::InvalidAddress(err.to_string()));
+            // 防御的分岐(手で書き換えた行だけがここに来る)。
+            return Err(WriteRejection::InvalidAddress(message));
         }
     };
 
@@ -1711,7 +1720,8 @@ async fn write_plc_string_tag(
     tag_row: &banto_tags::Tag,
     value: &str,
 ) -> Result<(), WriteRejection> {
-    let request = build_plc_string_write_request(conn, entry, tag_row, value)?;
+    let request =
+        build_plc_string_write_request(deps.manager.registry(), conn, entry, tag_row, value)?;
 
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: 単票の write_plc_tag と同じ fail-closed(このモジュールの
@@ -1769,24 +1779,19 @@ pub(crate) fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncod
 /// 「範囲外の値を write_audit に一切残さず(gate 8 の log-before-write に
 /// 到達する前に)弾ける」という数値側と同じ利点がある。
 fn build_plc_string_write_request(
+    registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
     value: &str,
 ) -> Result<BatchWriteRequest, WriteRejection> {
-    // #131 と同じプロトコル別アドレス解決([`build_plc_write_request`]参照)。
+    // R2b-2c: [`build_plc_write_request`] と同じアドレス解決(ドライバ + 橋)。
     // Modbus には文字列デバイスの対応が無い(`banto_plc_write`の
-    // `modbus::planning`のモジュール doc 参照) - アドレス自体は解決できても、
+    // `modbus::planning`のモジュール doc 参照) - 文法として解決できても、
     // broker 側で `PlcWriteError::UnsupportedRequestKind` として per-request
     // Bad になる(`WriteRejection::WriteFailed`として返る)。
-    let address = match conn.protocol.as_str() {
-        "modbus-tcp" => Address::parse(&entry.address),
-        _ => Address::parse_slmp(&entry.address),
-    };
-    let address = match address {
-        Ok(address) => address,
-        Err(err) => return Err(WriteRejection::InvalidAddress(err.to_string())),
-    };
+    let address = crate::read_path::resolve_plc_address(registry, conn, entry, tag_row)
+        .map_err(WriteRejection::InvalidAddress)?;
 
     let words = tag_row.string_length.unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
     let encoding = string_encoding_from_tag(tag_row);

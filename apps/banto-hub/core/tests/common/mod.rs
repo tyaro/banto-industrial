@@ -240,13 +240,31 @@ pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
         ) -> Vec<banto_driver_api::FieldError> {
             Vec::new()
         }
+        /// R2b-2c: reads an address with `banto_plc`'s grammar of this stand-in's id
+        /// (what the real drivers do; canonical = `Display`), because the Hub's plan and
+        /// its immediate reads / writes now ask the driver. Any other id refuses.
         fn parse_address(
             &self,
-            _text: &str,
+            text: &str,
             _kind: &banto_driver_api::TagKind,
         ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
-            Err(banto_driver_api::AddressError::new(
-                "stand-in: no address rules",
+            let id = &self.0.id;
+            let parsed = match id.as_str() {
+                "modbus-tcp" => banto_plc::Address::parse(text),
+                "slmp" => banto_plc::Address::parse_slmp(text),
+                _ => {
+                    return Err(banto_driver_api::AddressError::new(
+                        "stand-in: no address rules",
+                    ))
+                }
+            }
+            .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
+            Ok(banto_driver_api::DriverAddress::new(
+                id.clone(),
+                parsed.to_string(),
+                "area",
+                true,
+                1,
             ))
         }
         fn offset_address(

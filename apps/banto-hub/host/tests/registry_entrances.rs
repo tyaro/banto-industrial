@@ -1,17 +1,21 @@
 //! R2b-1d（docs/banto-hub-connection-settings-design.md §4.2・§8 の 10）／R2b-2b
 //! （docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が旧規則で書けないことを、
-//! ソースの grep で固定する。見るのは次の 3 つ（`NEEDLES`）:
+//! ソースの grep で固定する。R2b-2c でアドレスの解析の 2 つ（`Address::parse(`・
+//! `parse_slmp(`）を足した。見るのは次の 5 つ（`NEEDLES`）:
 //!
 //! - `PlcConnectionService::new(`（R2b-1d: `ALLOWED_PROTOCOLS` と手書きの検証）
 //! - `TagService::new(`（R2b-2b: アドレスを綴りのまま保存する旧規則）
 //! - `CollectionGroupService::new(`（R2b-2b: グループの移動で配下のタグを解析し直さない旧規則）
+//! - `Address::parse(`・`parse_slmp(`（R2b-2c: アドレスをプロトコルの名前で選んだ文法で解析する
+//!   旧規則。計画・即時の読み書きはレジストリのドライバの `parse_address` + 橋
+//!   `Address::from_driver_address` を使う。`EXCEPTIONS` の固定のリテラルだけが例外）
 //!
 //! Hub は `TagRegistryState`・MCP の状態・`PendingChangesAdminState`・予約接続
 //! （`runtime::ensure_virtual_connection`）・移行の preflight（`upgrade`）・即時の読み書き
 //! （`read_path`・`write_path`）のすべてで `with_registry`（`CollectorManager::registry()`
 //! 経由）を使う。`new` を使ったままの入口が 1 つでも残ると、レジストリに無いプロトコル・
 //! ドライバが断る設定やアドレスを書けてしまう。読むだけの箇所も含めて `new` を禁じる
-//! （読む口と書く口を区別しないと、後で書く口に育ったときに見落とす。例外の一覧も作らない）。
+//! （読む口と書く口を区別しないと、後で書く口に育ったときに見落とす。`new` に例外の一覧は作らない）。
 //!
 //! 見ないもの（テストのコード）: `src/**/tests/` の下・`tests.rs`・`test_support.rs`
 //! という名前のファイル、ファイルの中の `#[cfg(test)]` の直後のインラインの `mod … {`
@@ -31,7 +35,41 @@ const NEEDLES: &[(&str, &str)] = &[
         "CollectionGroupService::new(",
         "`CollectionGroupService::with_registry`",
     ),
+    (
+        "Address::parse(",
+        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+    ),
+    (
+        "parse_slmp(",
+        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+    ),
 ];
+
+/// 例外（needle, ファイルの末尾のパス, 理由）。意図して最小に保つ。
+const EXCEPTIONS: &[(&str, &str, &str)] = &[
+    (
+        "Address::parse(",
+        "core/src/rest/plc_connections.rs",
+        "HostBound の接続テストの固定のリテラル（`40001`）。R2b-3 で消える",
+    ),
+    (
+        "parse_slmp(",
+        "core/src/rest/plc_connections.rs",
+        "HostBound の接続テストの固定のリテラル（`D0`）。R2b-3 で消える",
+    ),
+    (
+        "Address::parse(",
+        "core/src/rest/tags.rs",
+        "`GET /api/tags/address-writable`。R2b-2d の解析の API に置き換わる",
+    ),
+];
+
+fn is_excepted(needle: &str, file: &Path) -> bool {
+    let file = file.to_string_lossy().replace('\\', "/");
+    EXCEPTIONS
+        .iter()
+        .any(|(n, suffix, _)| *n == needle && file.ends_with(suffix))
+}
 
 /// `dir` の下の `.rs` を集める（テストのディレクトリ・ファイルを除く）。
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -124,6 +162,9 @@ fn hub_non_test_code_never_builds_a_registry_free_service() {
     for (needle, remedy) in NEEDLES {
         let mut offenders = Vec::new();
         for (file, text) in &texts {
+            if is_excepted(needle, file) {
+                continue;
+            }
             for line in offending_lines(text, needle) {
                 offenders.push(format!("{}:{line}", file.display()));
             }
@@ -167,7 +208,38 @@ fn the_needles_do_not_overlap() {
                 let c = TagService::new(p);\n";
     let hits: Vec<Vec<usize>> = NEEDLES
         .iter()
+        .take(3)
         .map(|(needle, _)| offending_lines(text, needle))
         .collect();
     assert_eq!(hits, vec![vec![1], vec![3], vec![2]]);
+}
+
+/// R2b-2c: the immediate read / write paths no longer choose an address grammar by
+/// protocol name. (`"modbus-tcp" =>` as a match arm; the protocol gate is
+/// `HubSessions::is_broker_managed`, not a literal.) Comments are not scanned.
+#[test]
+fn read_and_write_paths_have_no_protocol_name_match_arm() {
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src");
+    for name in ["read_path.rs", "write_path.rs"] {
+        let text = std::fs::read_to_string(core.join(name)).expect("read a source file");
+        let offenders = offending_lines(&text, "\"modbus-tcp\" =>");
+        assert!(
+            offenders.is_empty(),
+            "{name} に `\"modbus-tcp\" =>` の分岐があります（行 {offenders:?}）。\
+             アドレスの解析は `resolve_plc_address` へ"
+        );
+    }
+}
+
+/// An exception is exact: same needle and the file's tail; another needle in the same
+/// file, or the same needle elsewhere, is still an offence.
+#[test]
+fn exceptions_are_per_needle_and_per_file() {
+    let tags = Path::new("/x/core/src/rest/tags.rs");
+    assert!(is_excepted("Address::parse(", tags));
+    assert!(!is_excepted("parse_slmp(", tags));
+    assert!(!is_excepted(
+        "Address::parse(",
+        Path::new("/x/core/src/read_path.rs")
+    ));
 }
