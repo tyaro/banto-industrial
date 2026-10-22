@@ -1290,7 +1290,14 @@ fn build_config_lenient_inner(
                     continue;
                 }
                 let scaling = match &resolved {
-                    ResolvedConnection::Plc(protocol, _) => match build_request(tag, *protocol) {
+                    ResolvedConnection::Plc(protocol, _) => match match drivers {
+                        // R2b-2c: banto-hub (registry-carrying) reads the address
+                        // through the driver; the registry-free builders are unchanged.
+                        Some(registry) => {
+                            build_request_with_registry(tag, *protocol, &conn.protocol, registry)
+                        }
+                        None => build_request(tag, *protocol),
+                    } {
                         Ok(request) => {
                             requests.push(request);
                             tag.scaling()
@@ -1746,6 +1753,15 @@ fn parse_read_request(
         protocol,
         reason: err.to_string(),
     })?;
+    finish_request(parsed, data_type)
+}
+
+/// The part of the interpreter that is independent of who parsed the address:
+/// the data type must be in `banto_plc`'s vocabulary and a bit-in-word address
+/// needs a `bit` tag. Shared by [`parse_read_request`] (the registry-free
+/// `Address::parse` path) and [`build_request_with_registry`] (the driver +
+/// bridge path), so the two cannot drift apart.
+fn finish_request(parsed: Address, data_type: &str) -> Result<ReadRequest, TagAddressIssue> {
     let data_type = DataType::parse(data_type).ok_or(TagAddressIssue::UnknownDataType)?;
 
     let is_bit_qualified = match parsed {
@@ -1760,6 +1776,35 @@ fn parse_read_request(
         address: parsed,
         data_type,
     })
+}
+
+/// R2b-2c (docs/banto-hub-driver-address-design.md §4.2): the registry-carrying
+/// builds (banto-hub) read a tag's address through the connection's *driver*
+/// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and bring the
+/// result back to a [`ReadRequest`] over the HostBound bridge
+/// ([`Address::from_driver_address`]). A refusal at either step is the tag's
+/// own [`TagAddressIssue::InvalidAddress`] carrying the driver's message, so
+/// the tag alone is left out. The registry-free builders keep
+/// [`build_request`].
+fn build_request_with_registry(
+    tag: &Tag,
+    protocol: Protocol,
+    conn_protocol: &str,
+    registry: &DriverRegistry,
+) -> Result<ReadRequest, TagAddressIssue> {
+    let invalid = |reason: String| TagAddressIssue::InvalidAddress { protocol, reason };
+    let kind = banto_tags::tag_kind(&tag.data_type, tag.string_length, &tag.string_encoding)
+        .ok_or(TagAddressIssue::UnknownDataType)?;
+    let entry = registry
+        .get(conn_protocol)
+        .ok_or_else(|| invalid(format!("ドライバ {conn_protocol} がありません")))?;
+    let driver_address = entry
+        .base()
+        .parse_address(tag.address.trim(), &kind)
+        .map_err(|err| invalid(err.message().to_string()))?;
+    let parsed =
+        Address::from_driver_address(&driver_address).map_err(|err| invalid(err.to_string()))?;
+    finish_request(parsed, &tag.data_type)
 }
 
 /// Which input field a [`TagAddressIssue`] is about - so a registry editor
@@ -4165,12 +4210,29 @@ mod tests {
         fn secret_keys(&self) -> Vec<String> {
             self.secret_keys.clone()
         }
+        /// R2b-2c: a stand-in that reads an address the way the real drivers do
+        /// (`banto_plc`'s grammar of the driver's own id, canonical = `Display`), so
+        /// the registry-carrying plan has something faithful to ask. Any other id
+        /// refuses everything.
         fn parse_address(
             &self,
-            _text: &str,
+            text: &str,
             _kind: &banto_driver_api::TagKind,
         ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
-            Err(banto_driver_api::AddressError::new("none"))
+            let id = &self.descriptor.id;
+            let parsed = match id.as_str() {
+                "modbus-tcp" => Address::parse(text),
+                "slmp" => Address::parse_slmp(text),
+                _ => return Err(banto_driver_api::AddressError::new("none")),
+            }
+            .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
+            Ok(banto_driver_api::DriverAddress::new(
+                id.clone(),
+                parsed.to_string(),
+                "area",
+                true,
+                1,
+            ))
         }
         fn offset_address(
             &self,
@@ -4215,6 +4277,65 @@ mod tests {
             settings.as_object().unwrap().clone(),
             1,
         )
+    }
+
+    /// R2b-2c (docs/banto-hub-driver-address-design.md §4.2・§9): with a registry the
+    /// plan reads each address through the connection's driver. A hand-edited row
+    /// (`D3000` on a Modbus tag) leaves **that tag alone** out as `InvalidTag` carrying
+    /// the driver's message; the others stay planned. 5-digit (pre-R2b-2) and 6-digit
+    /// (canonical) spellings both plan. The registry-free build is unchanged.
+    #[test]
+    fn a_registry_plan_excludes_only_the_tag_its_driver_refuses() {
+        let registry = fake_registry(&[("modbus-tcp", &[])]);
+        let conn = modbus_conn(1, "c", serde_json::json!({"host": "h", "port": 502}));
+        let snapshot = RegistrySnapshot {
+            connections: vec![conn],
+            groups: vec![group_of(10, 1, 1000)],
+            tags: vec![
+                tag_of(100, 10, "D3000", "u16"),
+                tag_of(101, 10, "40001", "u16"),
+                tag_of(102, 10, "400001", "u16"),
+                tag_of(103, 10, "40001.3", "u16"),
+            ],
+            secrets: Vec::new(),
+        };
+        let (config, exclusions) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            Some(&registry),
+        );
+        let tag_exclusions: Vec<(i64, &str)> = exclusions
+            .iter()
+            .filter(|e| e.unit == ExclusionUnit::Tag)
+            .map(|e| (e.id, e.reason.code()))
+            .collect();
+        // 100: the driver refuses `D3000`; 103: a bit address on a non-bit tag.
+        assert_eq!(
+            tag_exclusions,
+            vec![(100, "invalidAddress"), (103, "bitAddressOnNonBitType")]
+        );
+        let message = exclusions
+            .iter()
+            .find(|e| e.id == 100)
+            .map(|e| e.reason.message())
+            .unwrap();
+        assert!(message.contains("Modbus TCP"), "{message}");
+        let group = &config.connections[0].groups[0];
+        assert_eq!(group.requests.len(), 2, "40001 and 400001 are both planned");
+        // The same snapshot without a registry plans exactly the same tags.
+        let (_, plain) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            HubSource::Unavailable,
+            PushSource::Available,
+            None,
+        );
+        assert_eq!(
+            plain.iter().map(|e| e.id).collect::<Vec<_>>(),
+            vec![100, 103]
+        );
     }
 
     /// Design §4.4・§7: with a registry, a connection whose driver is missing, whose

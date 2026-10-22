@@ -195,7 +195,7 @@ pub(crate) fn test_drivers() -> crate::broker_glue::HubDrivers {
 
 /// R2b-1d: a stand-in for `banto-driver-slmp` / `banto-driver-modbus`'s static half in
 /// [`test_drivers`]'s registry - the id is right, every setting is accepted, no secret
-/// keys, no address rules (the collection plan parses addresses itself).
+/// keys, reads addresses with `banto_plc`'s grammar of its id (R2b-2c).
 pub(crate) struct FakePlcDriver {
     descriptor: banto_driver_api::DriverDescriptor,
 }
@@ -223,13 +223,31 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
     ) -> Vec<banto_driver_api::FieldError> {
         Vec::new()
     }
+    /// R2b-2c: reads an address with `banto_plc`'s grammar of this stand-in's id
+    /// (what the real drivers do; canonical = `Display`), because the Hub's plan and
+    /// its immediate reads / writes now ask the driver. Any other id refuses.
     fn parse_address(
         &self,
-        _text: &str,
+        text: &str,
         _kind: &banto_driver_api::TagKind,
     ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
-        Err(banto_driver_api::AddressError::new(
-            "fake driver: no address rules",
+        let id = &self.descriptor.id;
+        let parsed = match id.as_str() {
+            "modbus-tcp" => banto_plc::Address::parse(text),
+            "slmp" => banto_plc::Address::parse_slmp(text),
+            _ => {
+                return Err(banto_driver_api::AddressError::new(
+                    "fake driver: no address rules",
+                ))
+            }
+        }
+        .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
+        Ok(banto_driver_api::DriverAddress::new(
+            id.clone(),
+            parsed.to_string(),
+            "area",
+            true,
+            1,
         ))
     }
     fn offset_address(

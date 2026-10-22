@@ -1,17 +1,22 @@
 //! R2b-1d（docs/banto-hub-connection-settings-design.md §4.2・§8 の 10）／R2b-2b
 //! （docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が旧規則で書けないことを、
-//! ソースの grep で固定する。見るのは次の 3 つ（`NEEDLES`）:
+//! ソースの grep で固定する。R2b-2c でアドレスの解析の 2 つ（`Address::parse(`・
+//! `parse_slmp(`）を足した。見るのは次の 5 つ（`NEEDLES`）:
 //!
 //! - `PlcConnectionService::new(`（R2b-1d: `ALLOWED_PROTOCOLS` と手書きの検証）
 //! - `TagService::new(`（R2b-2b: アドレスを綴りのまま保存する旧規則）
 //! - `CollectionGroupService::new(`（R2b-2b: グループの移動で配下のタグを解析し直さない旧規則）
+//! - `Address::parse(`・`parse_slmp(`（R2b-2c: アドレスをプロトコルの名前で選んだ文法で解析する
+//!   旧規則。計画・即時の読み書きはレジストリのドライバの `parse_address` + 橋
+//!   `Address::from_driver_address` を使う。`EXCEPTIONS` の固定のリテラルだけが例外で、
+//!   例外は (needle, ファイル) ごとに**件数まで固定**する。増えても減ってもテストが落ちる）
 //!
 //! Hub は `TagRegistryState`・MCP の状態・`PendingChangesAdminState`・予約接続
 //! （`runtime::ensure_virtual_connection`）・移行の preflight（`upgrade`）・即時の読み書き
 //! （`read_path`・`write_path`）のすべてで `with_registry`（`CollectorManager::registry()`
 //! 経由）を使う。`new` を使ったままの入口が 1 つでも残ると、レジストリに無いプロトコル・
 //! ドライバが断る設定やアドレスを書けてしまう。読むだけの箇所も含めて `new` を禁じる
-//! （読む口と書く口を区別しないと、後で書く口に育ったときに見落とす。例外の一覧も作らない）。
+//! （読む口と書く口を区別しないと、後で書く口に育ったときに見落とす。`new` に例外の一覧は作らない）。
 //!
 //! 見ないもの（テストのコード）: `src/**/tests/` の下・`tests.rs`・`test_support.rs`
 //! という名前のファイル、ファイルの中の `#[cfg(test)]` の直後のインラインの `mod … {`
@@ -31,7 +36,66 @@ const NEEDLES: &[(&str, &str)] = &[
         "CollectionGroupService::new(",
         "`CollectionGroupService::with_registry`",
     ),
+    (
+        "Address::parse(",
+        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+    ),
+    (
+        "parse_slmp(",
+        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+    ),
 ];
+
+/// 例外（needle, ファイルの末尾のパス, 許す件数, 理由）。意図して最小に保つ。
+/// 件数は `offending_lines`（コメント・テストのコードを除く）の数とちょうど同じでなければ
+/// ならない。増えたら新しい呼び出しが紛れ込んでおり、減ったら例外を下げる／外す。
+const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[
+    (
+        "Address::parse(",
+        "core/src/rest/plc_connections.rs",
+        2,
+        "HostBound の接続テストの固定のリテラル（`40001`）。R2b-3 で消える",
+    ),
+    (
+        "parse_slmp(",
+        "core/src/rest/plc_connections.rs",
+        2,
+        "HostBound の接続テストの固定のリテラル（`D0`）。R2b-3 で消える",
+    ),
+    (
+        "Address::parse(",
+        "core/src/rest/tags.rs",
+        1,
+        "`GET /api/tags/address-writable`。R2b-2d の解析の API に置き換わる",
+    ),
+];
+
+/// `file` が `needle` の例外に当たるなら、許す件数。
+fn allowed_count(needle: &str, file: &Path) -> Option<usize> {
+    let file = file.to_string_lossy().replace('\\', "/");
+    EXCEPTIONS
+        .iter()
+        .find(|(n, suffix, _, _)| *n == needle && file.ends_with(suffix))
+        .map(|(_, _, count, _)| *count)
+}
+
+/// 例外つきのファイルの見つかった行が、許す件数とちょうど同じか。
+/// 多ければ全行を違反として返し、少なければ例外を下げるよう促す。
+fn check_exception_count(found: &[usize], allowed: usize) -> Result<(), String> {
+    use std::cmp::Ordering;
+    match found.len().cmp(&allowed) {
+        Ordering::Equal => Ok(()),
+        Ordering::Greater => Err(format!(
+            "例外は {allowed} 件までしか許さないのに {} 件あります（行 {found:?}）",
+            found.len()
+        )),
+        Ordering::Less => Err(format!(
+            "例外は {allowed} 件を許していますが {} 件しかありません（行 {found:?}）。\
+             `EXCEPTIONS` の件数を下げるか、例外を外してください",
+            found.len()
+        )),
+    }
+}
 
 /// `dir` の下の `.rs` を集める（テストのディレクトリ・ファイルを除く）。
 fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -124,7 +188,14 @@ fn hub_non_test_code_never_builds_a_registry_free_service() {
     for (needle, remedy) in NEEDLES {
         let mut offenders = Vec::new();
         for (file, text) in &texts {
-            for line in offending_lines(text, needle) {
+            let found = offending_lines(text, needle);
+            if let Some(allowed) = allowed_count(needle, file) {
+                if let Err(message) = check_exception_count(&found, allowed) {
+                    offenders.push(format!("{}: {message}", file.display()));
+                }
+                continue;
+            }
+            for line in found {
                 offenders.push(format!("{}:{line}", file.display()));
             }
         }
@@ -167,7 +238,53 @@ fn the_needles_do_not_overlap() {
                 let c = TagService::new(p);\n";
     let hits: Vec<Vec<usize>> = NEEDLES
         .iter()
+        .take(3)
         .map(|(needle, _)| offending_lines(text, needle))
         .collect();
     assert_eq!(hits, vec![vec![1], vec![3], vec![2]]);
+}
+
+/// R2b-2c: the immediate read / write paths no longer choose an address grammar by
+/// protocol name. (`"modbus-tcp" =>` as a match arm; the protocol gate is
+/// `HubSessions::is_broker_managed`, not a literal.) Comments are not scanned.
+#[test]
+fn read_and_write_paths_have_no_protocol_name_match_arm() {
+    let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src");
+    for name in ["read_path.rs", "write_path.rs"] {
+        let text = std::fs::read_to_string(core.join(name)).expect("read a source file");
+        let offenders = offending_lines(&text, "\"modbus-tcp\" =>");
+        assert!(
+            offenders.is_empty(),
+            "{name} に `\"modbus-tcp\" =>` の分岐があります（行 {offenders:?}）。\
+             アドレスの解析は `resolve_plc_address` へ"
+        );
+    }
+}
+
+/// An exception is exact: same needle and the file's tail; another needle in the same
+/// file, or the same needle elsewhere, is still an offence. The allowed count is pinned.
+#[test]
+fn exceptions_are_per_needle_and_per_file() {
+    let tags = Path::new("/x/core/src/rest/tags.rs");
+    assert_eq!(allowed_count("Address::parse(", tags), Some(1));
+    assert_eq!(allowed_count("parse_slmp(", tags), None);
+    assert_eq!(
+        allowed_count("Address::parse(", Path::new("/x/core/src/read_path.rs")),
+        None
+    );
+    let plc = Path::new("/x/core/src/rest/plc_connections.rs");
+    assert_eq!(allowed_count("Address::parse(", plc), Some(2));
+    assert_eq!(allowed_count("parse_slmp(", plc), Some(2));
+}
+
+/// The exception count is pinned: equal passes, more lists every line, fewer asks to
+/// lower the count so the list stays minimal.
+#[test]
+fn exception_counts_are_pinned_exactly() {
+    assert!(check_exception_count(&[10, 20], 2).is_ok());
+    assert!(check_exception_count(&[], 0).is_ok());
+    let more = check_exception_count(&[10, 20, 30], 2).unwrap_err();
+    assert!(more.contains("2 件までしか許さない") && more.contains("[10, 20, 30]"));
+    let fewer = check_exception_count(&[10], 2).unwrap_err();
+    assert!(fewer.contains("下げる"));
 }
