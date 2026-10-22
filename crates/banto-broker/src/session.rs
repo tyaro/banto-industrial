@@ -109,8 +109,11 @@ impl banto_driver_api::DriverBase for FrameDial {
         settings: &banto_driver_api::Settings,
     ) -> Vec<banto_driver_api::FieldError> {
         let mut errors = self.0.validate_config(settings);
-        if let Err(error) = frame_transport(settings) {
-            errors.push(error);
+        if let Err(error) = frame_transport(settings, self.0.descriptor()) {
+            // Keep the driver's more specific message for a field it already rejected.
+            if !errors.iter().any(|existing| existing.key == error.key) {
+                errors.push(error);
+            }
         }
         errors
     }
@@ -151,7 +154,7 @@ impl banto_driver_api::SessionDriver for FrameDial {
         let mut settings = super::OpenedSettings::new(settings.clone());
         settings.opened = driver.secret_keys();
         Box::pin(async move {
-            let spec = frame_transport(settings.settings())
+            let spec = frame_transport(settings.settings(), driver.descriptor())
                 .map_err(|error| FatalError::InvalidConfig(error.to_string()))?;
             banto_driver_engine::FrameSession::connect(
                 driver.as_ref(),
@@ -170,16 +173,26 @@ impl banto_driver_api::SessionDriver for FrameDial {
 /// resynchronisation are added in 3e; never silently dial TCP for an unknown kind.
 fn frame_transport(
     settings: &banto_driver_api::Settings,
+    descriptor: &banto_driver_api::DriverDescriptor,
 ) -> Result<banto_driver_engine::transport::TransportSpec, banto_driver_api::FieldError> {
     use banto_driver_api::{keys, FieldError};
     match settings.get(keys::TRANSPORT).unwrap_or("tcp") {
-        "tcp" | "serial_over_tcp" => {}
+        "tcp" => {}
         _ => {
             return Err(FieldError::new(
                 keys::TRANSPORT,
                 "このエンジンで未対応の通信方式です",
             ))
         }
+    }
+    if !descriptor
+        .transports
+        .contains(&banto_driver_api::Transport::Tcp)
+    {
+        return Err(FieldError::new(
+            keys::TRANSPORT,
+            "このドライバは TCP 通信に対応していません",
+        ));
     }
     let host = settings
         .get(keys::HOST)

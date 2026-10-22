@@ -24,6 +24,7 @@ struct Driver {
     steps: usize,
     handshake: usize,
     refuse: bool,
+    config_errors: Vec<banto_driver_api::FieldError>,
 }
 impl Driver {
     fn new(stats: Arc<Stats>, steps: usize) -> Self {
@@ -38,6 +39,7 @@ impl Driver {
             steps,
             handshake: 0,
             refuse: false,
+            config_errors: vec![],
         }
     }
 }
@@ -46,7 +48,7 @@ impl DriverBase for Driver {
         &self.descriptor
     }
     fn validate_config(&self, _: &Settings) -> Vec<banto_driver_api::FieldError> {
-        vec![]
+        self.config_errors.clone()
     }
     fn offset_address(&self, text: &str, _: &TagKind, _: i64) -> Result<String, AddressError> {
         Ok(text.into())
@@ -496,5 +498,154 @@ async fn frame_dial_owned_secret_is_guarded_even_before_polling_or_transport_val
             drop(future);
         }
         assert!(zeroized_for_test::contains(&secret));
+    }
+}
+
+/// TCP-only drivers must never turn converter traffic into ordinary TCP.
+/// Descriptor checks are host policy even when the driver's validator accepts all.
+#[tokio::test]
+async fn frame_transport_policy_rejects_before_directory_or_direct_dial_io() {
+    use banto_driver_api::Transport;
+    for (transports, transport, message) in [
+        (vec![Transport::Tcp], Some("serial_over_tcp"), "未対応"),
+        (
+            vec![Transport::SerialOverTcp],
+            Some("serial_over_tcp"),
+            "未対応",
+        ),
+        (vec![Transport::Serial], Some("tcp"), "対応していません"),
+        (vec![Transport::Serial], None, "対応していません"),
+    ] {
+        let stats = Arc::<Stats>::default();
+        let mut driver = Driver::new(stats.clone(), 0);
+        driver.descriptor.transports = transports;
+        let mut registry = DriverRegistry::new();
+        registry
+            .register(DriverEntry::frame(Arc::new(driver)))
+            .unwrap();
+        let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+        let mut pairs = vec![("host", "127.0.0.1"), ("port", "1")];
+        if let Some(transport) = transport {
+            pairs.push(("transport", transport));
+        }
+        let settings = Settings::from_pairs(pairs).unwrap();
+        let errors = resolved.driver().validate_config(&settings);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].key, "transport");
+        assert!(errors[0].message.contains(message), "{errors:?}");
+        // Bypass validate_config: the exposed adapter still refuses before I/O.
+        let result = resolved
+            .driver()
+            .connect(&settings, ConnectContext::new("test", T, T))
+            .await;
+        assert!(
+            matches!(result, Err(FatalError::InvalidConfig(ref reason)) if reason.contains(message))
+        );
+        let supervisor =
+            BrokerSupervisor::spawn(&[], BackoffConfig::default(), Arc::new(registry)).unwrap();
+        let conn = PlcConnection::from_settings(
+            1,
+            "frame".into(),
+            "frame-test".into(),
+            true,
+            false,
+            serde_json::Map::new(),
+            1,
+        );
+        assert!(matches!(
+            supervisor.directory().ensure_connection_with_settings(&conn, settings),
+            Err(BrokerError::InvalidSettings { reason, .. }) if reason.contains(message)
+        ));
+        assert_eq!(stats.connects.load(Ordering::SeqCst), 0);
+        assert_eq!(supervisor.directory().connection_count(), 0);
+        supervisor.shutdown().await;
+    }
+}
+
+#[test]
+fn frame_validation_preserves_driver_field_errors_without_host_duplicates() {
+    use banto_driver_api::FieldError;
+    for (field, pairs) in [
+        ("host", vec![("port", "1")]),
+        ("port", vec![("host", "127.0.0.1"), ("port", "0")]),
+    ] {
+        let mut driver = Driver::new(Arc::default(), 0);
+        driver.config_errors = vec![FieldError::new(field, "driver-specific explanation")];
+        let dial = session::FrameDial(Arc::new(driver));
+        let errors = dial.validate_config(&Settings::from_pairs(pairs).unwrap());
+        assert_eq!(
+            errors,
+            vec![FieldError::new(field, "driver-specific explanation")]
+        );
+    }
+}
+
+#[test]
+fn resolved_dial_limits_include_frame_handshake_and_keep_session_budget() {
+    let mut registry = DriverRegistry::new();
+    registry
+        .register(DriverEntry::frame(Arc::new(Driver::new(Arc::default(), 0))))
+        .unwrap();
+    registry
+        .register(DriverEntry::session(Arc::new(fake::FakeDriver::new(
+            "session-test",
+            fake::FakePlc::new(),
+        ))))
+        .unwrap();
+    let frame = resolve_session_driver(&registry, "frame-test").unwrap();
+    let session = resolve_session_driver(&registry, "session-test").unwrap();
+    let timeouts = SessionTimeouts {
+        connect: Duration::from_millis(250),
+        response: Duration::from_millis(50),
+    };
+    assert_eq!(frame.connect_limit(timeouts), Duration::from_millis(2950));
+    assert_eq!(session.connect_limit(timeouts), Duration::from_millis(1250));
+    // Response time never changes legacy Session's dial budget.
+    assert_eq!(
+        session.connect_limit(SessionTimeouts {
+            response: Duration::MAX,
+            ..timeouts
+        }),
+        Duration::from_millis(1250)
+    );
+    for timeouts in [
+        SessionTimeouts {
+            connect: Duration::MAX,
+            response: Duration::ZERO,
+        },
+        SessionTimeouts {
+            connect: Duration::ZERO,
+            response: Duration::MAX,
+        },
+    ] {
+        assert_eq!(frame.connect_limit(timeouts), Duration::MAX);
+    }
+    assert_eq!(
+        session.connect_limit(SessionTimeouts {
+            connect: Duration::MAX,
+            response: Duration::ZERO
+        }),
+        Duration::MAX
+    );
+    assert_eq!(
+        frame.connect_limit(SessionTimeouts {
+            connect: Duration::ZERO,
+            response: Duration::ZERO
+        }),
+        Duration::from_millis(1100)
+    );
+    assert!(resolve_session_driver(&registry, "unknown").is_none());
+}
+
+#[test]
+fn frame_tcp_descriptor_accepts_explicit_and_default_tcp_settings() {
+    let dial = session::FrameDial(Arc::new(Driver::new(Arc::default(), 0)));
+    for pairs in [
+        vec![("host", "127.0.0.1"), ("port", "1")],
+        vec![("host", "127.0.0.1"), ("port", "1"), ("transport", "tcp")],
+    ] {
+        assert!(dial
+            .validate_config(&Settings::from_pairs(pairs).unwrap())
+            .is_empty());
     }
 }

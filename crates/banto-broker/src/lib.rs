@@ -90,7 +90,7 @@
 //! ## Message shape and how serialization is guaranteed
 //!
 //! Each connection's task ([`BrokerSupervisor::spawn`] / the internal
-//! `spawn_task_with_connector`) owns exactly one `Box<dyn Session>` and a
+//! `spawn_task_with_connector_limit`) owns exactly one `Box<dyn Session>` and a
 //! `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has two variants -
 //! `Read`/`Write` - each carrying its owned request `Vec` and a
 //! `tokio::sync::oneshot::Sender` for the reply. The task's main loop takes
@@ -454,15 +454,56 @@ impl SettingsFingerprint {
 /// [`BrokerError::UnsupportedProtocol`] and banto-hub's
 /// `HubSessions::is_broker_managed`.
 pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
-    session_driver(registry, protocol).is_some()
+    resolve_session_driver(registry, protocol).is_some()
 }
 
-fn session_driver(registry: &DriverRegistry, protocol: &str) -> Option<Arc<dyn SessionDriver>> {
-    match registry.get(protocol).map(|entry| entry.kind()) {
-        Some(DriverKind::Session(driver)) => Some(Arc::clone(driver)),
-        Some(DriverKind::Frame(driver)) => Some(Arc::new(session::FrameDial(Arc::clone(driver)))),
-        _ => None,
+/// A registry driver adapted to the broker's Session interface, together with
+/// the dial budget for its original kind. Hosts performing a direct connection
+/// test must use the same resolver and deadline as the directory.
+pub struct ResolvedSessionDriver {
+    driver: Arc<dyn SessionDriver>,
+    frame: bool,
+}
+
+impl ResolvedSessionDriver {
+    /// The Session driver, or a Frame adapter enforcing the host's transports.
+    pub fn driver(&self) -> &Arc<dyn SessionDriver> {
+        &self.driver
     }
+
+    /// Outer dial budget (design §5.5). Frame includes transport connect,
+    /// 32 handshake exchanges and bounded cleanup; Session keeps its original
+    /// `connect + 1 s`. All arithmetic saturates.
+    pub fn connect_limit(&self, timeouts: SessionTimeouts) -> Duration {
+        let limit = if self.frame {
+            timeouts
+                .connect
+                .saturating_add(
+                    timeouts
+                        .response
+                        .saturating_mul(banto_driver_engine::MAX_HANDSHAKE_STEPS as u32),
+                )
+                .saturating_add(banto_driver_engine::CLOSE_TIMEOUT)
+        } else {
+            timeouts.connect
+        };
+        limit.saturating_add(CONNECT_SLACK)
+    }
+}
+
+/// Resolve the same Session / Frame entries accepted by [`is_broker_managed`].
+/// Frame drivers are wrapped without changing their registry entry. HostProvided
+/// and unknown protocols return `None`.
+pub fn resolve_session_driver(
+    registry: &DriverRegistry,
+    protocol: &str,
+) -> Option<ResolvedSessionDriver> {
+    let (driver, frame): (Arc<dyn SessionDriver>, bool) = match registry.get(protocol)?.kind() {
+        DriverKind::Session(driver) => (Arc::clone(driver), false),
+        DriverKind::Frame(driver) => (Arc::new(session::FrameDial(Arc::clone(driver))), true),
+        _ => return None,
+    };
+    Some(ResolvedSessionDriver { driver, frame })
 }
 
 /// Everything a [`BrokerHandle`]/[`ReadOnlyHandle`] request can fail with.
@@ -854,12 +895,13 @@ impl SessionDirectory {
         conn: &PlcConnection,
         settings: Settings,
     ) -> Result<BrokerHandle, BrokerError> {
-        let driver = session_driver(&self.registry, &conn.protocol).ok_or_else(|| {
+        let resolved = resolve_session_driver(&self.registry, &conn.protocol).ok_or_else(|| {
             BrokerError::UnsupportedProtocol {
                 connection_id: conn.id,
                 protocol: conn.protocol.clone(),
             }
         })?;
+        let driver = resolved.driver();
         let refused = driver.validate_config(&settings);
         if !refused.is_empty() {
             let reason = refused
@@ -883,32 +925,13 @@ impl SessionDirectory {
             SettingsFingerprint::of_connection(&conn.protocol, Some(conn), &settings, &secret_keys);
         let connector = session_connector(
             conn.clone(),
-            driver,
+            Arc::clone(driver),
             settings,
             secret_keys,
             self.options.timeouts,
             Arc::clone(&self.options.secrets),
         );
-        // Frame includes transport dial, all 32 handshake exchanges and bounded
-        // cleanup. The legacy Session dial keeps its original bound.
-        let connect_limit = if matches!(
-            self.registry.get(&conn.protocol).map(|entry| entry.kind()),
-            Some(DriverKind::Frame(_))
-        ) {
-            self.options
-                .timeouts
-                .connect
-                .saturating_add(
-                    self.options
-                        .timeouts
-                        .response
-                        .saturating_mul(banto_driver_engine::MAX_HANDSHAKE_STEPS as u32),
-                )
-                .saturating_add(banto_driver_engine::CLOSE_TIMEOUT)
-                .saturating_add(CONNECT_SLACK)
-        } else {
-            self.options.timeouts.connect.saturating_add(CONNECT_SLACK)
-        };
+        let connect_limit = resolved.connect_limit(self.options.timeouts);
         let (mut handle, task) = spawn_task_with_connector_limit(
             conn.id,
             connector,
@@ -2311,8 +2334,20 @@ mod tests {
         // write: (3n + 8) × 2T + 1 s
         assert_eq!(write_job_limit(1, t), Duration::from_secs(11 + 1));
         assert_eq!(write_job_limit(4, t), Duration::from_secs(20 + 1));
-        // no overflow on absurd sizes
-        assert!(write_job_limit(usize::MAX, t) > Duration::from_secs(1));
+        // Item counts clamp to u32 steps, without wrapping; huge durations saturate.
+        let max_steps = Duration::from_secs(u64::from(u32::MAX) + 1);
+        assert_eq!(read_job_limit(usize::MAX, t), max_steps);
+        assert_eq!(write_job_limit(usize::MAX, t), max_steps);
+        assert_eq!(read_job_limit(1, Duration::MAX), Duration::MAX);
+        assert_eq!(write_job_limit(1, Duration::MAX), Duration::MAX);
+        assert_eq!(
+            read_job_limit(usize::MAX, Duration::ZERO),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            write_job_limit(usize::MAX, Duration::ZERO),
+            Duration::from_secs(1)
+        );
     }
 
     /// A driver that keeps its deadlines - each step `0.95 T` sending and

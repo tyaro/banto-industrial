@@ -325,7 +325,7 @@ impl HubSessions {
     /// crate (session sync in `CollectorManager`, the read-now and write
     /// protocol gates, the connection test, `/api/v1/status`). Since R2b-3a-2
     /// it is [`banto_broker::is_broker_managed`] over the registry the
-    /// supervisor dials through: the protocol has a session-type driver.
+    /// supervisor dials through: the protocol has a Session or Frame driver.
     pub fn is_broker_managed(&self, protocol: &str) -> bool {
         banto_broker::is_broker_managed(&self.drivers.registry, protocol)
     }

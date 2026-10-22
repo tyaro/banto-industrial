@@ -7,7 +7,7 @@
 //! アドレスの関数を `DriverBase` の形で持ち、I/O は Hub の収集の外部ソース・
 //! `db_source`・計算が持ち続ける。`DriverKind::HostProvided`（恒久の種類。R2b-3a-2 で
 //! 消えた `HostBound` とは違う）で載せる。broker は `HostProvided` の接続を管理しない
-//! （管理するのはセッション型のドライバだけ、`banto_broker::is_broker_managed`）。
+//! （管理するのは Session / Frame ドライバ、`banto_broker::is_broker_managed`）。
 //!
 //! 登録するのは**この crate ではなく host**（`banto-hub-host`・`src-tauri`・テストの
 //! `test_drivers`）: core は `banto-drivers` に依存できない（R2b-0）ので、組み込みの

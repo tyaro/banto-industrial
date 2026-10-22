@@ -361,8 +361,10 @@ async fn run(mode: Mode) {
             );
         }
         assert!(
-            wire_rx.try_recv().is_err(),
-            "unknown write is never automatically replayed"
+            tokio::time::timeout(Duration::from_millis(100), wire_rx.recv())
+                .await
+                .is_err(),
+            "unknown write must not be replayed, including after reconnect; peer must stay alive"
         );
         // A fresh read is safe and sees the already applied write, proving
         // that this case really is a result-unknown write, rather than no write.
@@ -373,7 +375,12 @@ async fn run(mode: Mode) {
             vec![Ok(Value::F64(11.))]
         );
         assert_eq!(wire_rx.recv().await.unwrap().0[1], b'R');
-        assert!(wire_rx.try_recv().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), wire_rx.recv())
+                .await
+                .is_err(),
+            "no delayed replay after the explicit read; peer must stay alive"
+        );
     }
     manager.shutdown().await;
     sessions.shutdown().await;
