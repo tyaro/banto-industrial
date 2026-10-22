@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use banto_plc::{
     execute_modbus_reads, plan_batch_requests, BatchReadRequest, BatchReadResult, BoxFuture,
-    ModbusTcpConfig, PlcValue, WordOrder,
+    ModbusTcpConfig, PlcError, PlcValue, WordOrder,
 };
 use banto_plc_write::{
     execute_modbus_writes, plan_modbus_writes, BatchWriteRequest, PlcWriteError, WriteRequest,
@@ -80,38 +80,134 @@ pub(crate) struct ModbusSession {
     next_transaction_id: u16,
 }
 
+impl ModbusSession {
+    /// A session over an already-dialed `stream` (one counter, from 0).
+    pub(crate) fn new(stream: TcpStream, config: &ModbusTcpConfig) -> Self {
+        ModbusSession {
+            stream,
+            unit_id: config.unit_id,
+            response_timeout: config.response_timeout,
+            word_order: config.word_order,
+            next_transaction_id: 0,
+        }
+    }
+
+    /// The read half of [`BrokerSession::read_batch`] with the **typed**
+    /// error (R2b-3a-1): the `banto-driver-api` session maps it with
+    /// `classify_read` instead of recovering a variant from text. The broker's
+    /// `BrokerSession` impl below calls this too, so there is one body.
+    pub(crate) async fn read_typed(
+        &mut self,
+        requests: &[BatchReadRequest],
+    ) -> Result<Vec<BatchReadResult>, PlcError> {
+        // `plan_batch_requests` (not `plan_requests`) already resolves
+        // `BatchReadRequest::String` into `immediate_bad` with indices
+        // remapped to the full batch, so the resulting `PlanOutcome` is
+        // sized to `requests.len()` for free - no manual splitting
+        // needed, unlike `write_typed` below (which has no such
+        // batch-aware helper on the write side).
+        let outcome = plan_batch_requests(requests);
+        let results = execute_modbus_reads(
+            &mut self.stream,
+            self.unit_id,
+            self.response_timeout,
+            &mut self.next_transaction_id,
+            &outcome,
+            requests.len(),
+            self.word_order,
+        )
+        .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|r| match r {
+                banto_plc::ReadResult::Value(v) => BatchReadResult::Value(PlcValue::from(v)),
+                banto_plc::ReadResult::Bad(e) => BatchReadResult::Bad(e),
+            })
+            .collect())
+    }
+
+    /// The write half, typed error (see [`Self::read_typed`]).
+    pub(crate) async fn write_typed(
+        &mut self,
+        requests: &[BatchWriteRequest],
+    ) -> Result<Vec<WriteResult>, PlcWriteError> {
+        // `banto_plc_write` has no `plan_batch`-style helper for writes
+        // (only `plan_modbus_writes(&[WriteRequest], WordOrder)`,
+        // numeric-only by the front-half's explicit design - see
+        // `banto_plc_write::modbus::planning`'s module doc, "What is
+        // deliberately out of scope"), so this driver does the
+        // Numeric/String/BitInWord split by hand.
+        let mut results: Vec<Option<WriteResult>> = vec![None; requests.len()];
+        let mut numeric: Vec<WriteRequest> = Vec::new();
+        let mut numeric_to_original: Vec<usize> = Vec::new();
+
+        for (index, req) in requests.iter().enumerate() {
+            match req {
+                BatchWriteRequest::Numeric(r) => {
+                    numeric.push(*r);
+                    numeric_to_original.push(index);
+                }
+                BatchWriteRequest::String(_) => {
+                    results[index] =
+                        Some(WriteResult::Bad(PlcWriteError::UnsupportedRequestKind {
+                            kind: "文字列書き込み".to_string(),
+                        }));
+                }
+                BatchWriteRequest::BitInWord { .. } => {
+                    results[index] =
+                        Some(WriteResult::Bad(PlcWriteError::UnsupportedRequestKind {
+                            kind: "ビット単体(BitInWord)書き込み".to_string(),
+                        }));
+                }
+            }
+        }
+
+        let outcome = plan_modbus_writes(&numeric, self.word_order);
+        // `execute_modbus_writes` returns a `Vec<WriteResult>` indexed by
+        // `numeric`'s own positions (0..numeric.len()), not remapped to
+        // the mixed batch - scatter each entry back via
+        // `numeric_to_original` rather than remapping `outcome`'s
+        // indices up front, which is simpler to get right here.
+        let numeric_results = execute_modbus_writes(
+            &mut self.stream,
+            self.unit_id,
+            self.response_timeout,
+            &mut self.next_transaction_id,
+            &outcome,
+            numeric.len(),
+        )
+        .await?;
+
+        for (numeric_index, result) in numeric_results.into_iter().enumerate() {
+            let original_index = numeric_to_original[numeric_index];
+            results[original_index] = Some(result);
+        }
+
+        Ok(results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| {
+                r.unwrap_or_else(|| panic!("every index must be accounted for, missing {i}"))
+            })
+            .collect())
+    }
+
+    /// Close the socket (shared by both session types).
+    pub(crate) async fn close(&mut self) {
+        let _ = self.stream.shutdown().await;
+    }
+}
+
 impl BrokerSession for ModbusSession {
     fn read_batch<'a>(
         &'a mut self,
         requests: &'a [BatchReadRequest],
     ) -> BoxFuture<'a, Result<Vec<BatchReadResult>, SessionError>> {
         Box::pin(async move {
-            // `plan_batch_requests` (not `plan_requests`) already resolves
-            // `BatchReadRequest::String` into `immediate_bad` with indices
-            // remapped to the full batch, so the resulting `PlanOutcome` is
-            // sized to `requests.len()` for free - no manual splitting
-            // needed, unlike `write_batch` below (which has no such
-            // batch-aware helper on the write side).
-            let outcome = plan_batch_requests(requests);
-            let results = execute_modbus_reads(
-                &mut self.stream,
-                self.unit_id,
-                self.response_timeout,
-                &mut self.next_transaction_id,
-                &outcome,
-                requests.len(),
-                self.word_order,
-            )
-            .await
-            .map_err(|e| SessionError(e.to_string()))?;
-
-            Ok(results
-                .into_iter()
-                .map(|r| match r {
-                    banto_plc::ReadResult::Value(v) => BatchReadResult::Value(PlcValue::from(v)),
-                    banto_plc::ReadResult::Bad(e) => BatchReadResult::Bad(e),
-                })
-                .collect())
+            self.read_typed(requests)
+                .await
+                .map_err(|e| SessionError(e.to_string()))
         })
     }
 
@@ -120,73 +216,14 @@ impl BrokerSession for ModbusSession {
         requests: &'a [BatchWriteRequest],
     ) -> BoxFuture<'a, Result<Vec<WriteResult>, SessionError>> {
         Box::pin(async move {
-            // `banto_plc_write` has no `plan_batch`-style helper for writes
-            // (only `plan_modbus_writes(&[WriteRequest], WordOrder)`,
-            // numeric-only by the front-half's explicit design - see
-            // `banto_plc_write::modbus::planning`'s module doc, "What is
-            // deliberately out of scope"), so this driver does the
-            // Numeric/String/BitInWord split by hand.
-            let mut results: Vec<Option<WriteResult>> = vec![None; requests.len()];
-            let mut numeric: Vec<WriteRequest> = Vec::new();
-            let mut numeric_to_original: Vec<usize> = Vec::new();
-
-            for (index, req) in requests.iter().enumerate() {
-                match req {
-                    BatchWriteRequest::Numeric(r) => {
-                        numeric.push(*r);
-                        numeric_to_original.push(index);
-                    }
-                    BatchWriteRequest::String(_) => {
-                        results[index] =
-                            Some(WriteResult::Bad(PlcWriteError::UnsupportedRequestKind {
-                                kind: "文字列書き込み".to_string(),
-                            }));
-                    }
-                    BatchWriteRequest::BitInWord { .. } => {
-                        results[index] =
-                            Some(WriteResult::Bad(PlcWriteError::UnsupportedRequestKind {
-                                kind: "ビット単体(BitInWord)書き込み".to_string(),
-                            }));
-                    }
-                }
-            }
-
-            let outcome = plan_modbus_writes(&numeric, self.word_order);
-            // `execute_modbus_writes` returns a `Vec<WriteResult>` indexed by
-            // `numeric`'s own positions (0..numeric.len()), not remapped to
-            // the mixed batch - scatter each entry back via
-            // `numeric_to_original` rather than remapping `outcome`'s
-            // indices up front, which is simpler to get right here.
-            let numeric_results = execute_modbus_writes(
-                &mut self.stream,
-                self.unit_id,
-                self.response_timeout,
-                &mut self.next_transaction_id,
-                &outcome,
-                numeric.len(),
-            )
-            .await
-            .map_err(|e| SessionError(e.to_string()))?;
-
-            for (numeric_index, result) in numeric_results.into_iter().enumerate() {
-                let original_index = numeric_to_original[numeric_index];
-                results[original_index] = Some(result);
-            }
-
-            Ok(results
-                .into_iter()
-                .enumerate()
-                .map(|(i, r)| {
-                    r.unwrap_or_else(|| panic!("every index must be accounted for, missing {i}"))
-                })
-                .collect())
+            self.write_typed(requests)
+                .await
+                .map_err(|e| SessionError(e.to_string()))
         })
     }
 
     fn disconnect(&mut self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            let _ = self.stream.shutdown().await;
-        })
+        Box::pin(self.close())
     }
 }
 
@@ -219,13 +256,7 @@ pub fn connector(config: ModbusTcpConfig) -> Connector {
             let stream = banto_plc::dial_modbus(&config)
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(Box::new(ModbusSession {
-                stream,
-                unit_id: config.unit_id,
-                response_timeout: config.response_timeout,
-                word_order: config.word_order,
-                next_transaction_id: 0,
-            }) as Box<dyn BrokerSession>)
+            Ok(Box::new(ModbusSession::new(stream, &config)) as Box<dyn BrokerSession>)
         })
     })
 }
@@ -278,13 +309,7 @@ mod tests {
         let stream = banto_plc::dial_modbus(&config)
             .await
             .expect("dial simulator");
-        ModbusSession {
-            stream,
-            unit_id: config.unit_id,
-            response_timeout: config.response_timeout,
-            word_order: config.word_order,
-            next_transaction_id: 0,
-        }
+        ModbusSession::new(stream, &config)
     }
 
     /// The load-bearing property this module's doc comment on

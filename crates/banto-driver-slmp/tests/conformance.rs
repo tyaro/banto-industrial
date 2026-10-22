@@ -5,16 +5,14 @@
 //!   `banto-plc/src/slmp/address.rs`'s tests (the grammar) and the
 //!   TypeScript `continuousRegistration.test.ts` / `offsetCopy.test.ts`
 //!   (offsets).
-//! - `session::run_all_against` (C1-C8, C12-C15) through the dev-only
-//!   `LegacySession` (`tests/common`), against `banto-plc`'s SLMP simulator
+//! - `session::run_all_against` (C1-C8, C12-C15) through the production
+//!   `Session` of `SlmpDriver` (R2b-3a-1), against `banto-plc`'s SLMP simulator
 //!   behind a `FaultProxy`. The bit-in-word writes go through the production
 //!   read-modify-write (`execute_one_bit_write`); C14's check-read mismatch
 //!   and C15's refusals are made by the proxy rewriting one response.
 //!
 //! Every simulator and proxy binds 127.0.0.1:0, so these tests need no
 //! nextest test-group.
-
-mod common;
 
 use std::time::Duration;
 
@@ -28,7 +26,6 @@ use banto_driver_conformance::{static_checks, StaticFixtures};
 use banto_driver_slmp::SlmpDriver;
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc::slmp::simulator::Simulator;
-use common::LegacyDriver;
 
 fn n(data_type: DataType) -> TagKind {
     TagKind::numeric(data_type)
@@ -254,18 +251,18 @@ fn fixtures() -> SessionFixtures {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_session_conforms() {
+async fn session_conforms() {
     let sim = Simulator::start().await;
     seed(&sim);
     let proxy = FaultProxy::start(sim.addr).await.unwrap();
-    let failures = session::run_all_against(&LegacyDriver, &fixtures(), &proxy).await;
+    let failures = session::run_all_against(&SlmpDriver, &fixtures(), &proxy).await;
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
     assert!(failures.is_empty(), "{text:#?}");
     sim.stop();
 }
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):
-/// in R1's `LegacySession` an address that does not parse after connect is
+/// in the production `Session` an address that does not parse after connect is
 /// the tag's own `ItemError::Unsupported`, not fatal (R2b-2a, address design
 /// §6 Q5; design §3.4, §7.1 C4).
 #[tokio::test]
@@ -277,9 +274,9 @@ async fn invalid_address_after_connect_is_unsupported_not_fatal() {
     ])
     .unwrap();
     let cx = ConnectContext::new("t", Duration::from_secs(2), Duration::from_secs(1));
-    let mut s = LegacyDriver.connect(&settings, cx).await.unwrap();
+    let mut s = SlmpDriver.connect(&settings, cx).await.unwrap();
     let foreign = DriverAddress::new(
-        LegacyDriver.descriptor().id.clone(),
+        SlmpDriver.descriptor().id.clone(),
         "400001",
         "holding_register",
         true,
