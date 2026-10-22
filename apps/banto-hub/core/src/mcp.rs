@@ -746,7 +746,7 @@ fn tool_definitions() -> Vec<Value> {
                     "cpuType": {
                         "type": "string",
                         "enum": ["Q", "R"],
-                        "description": "SLMP の CPU 種別。省略時は保存済みの接続(connectionId)の CPU を引き継ぎ、保存済みが無ければドライバの既定(iQ-R)。収集中のセッションを再利用するとき、そのセッションの CPU と違えば試さず「保存してからテスト」と返す。",
+                        "description": "SLMP の CPU 種別。省略時は、connectionId の保存済み接続が同じプロトコル(slmp)のときだけその CPU を引き継ぐ。connectionId が無い・保存済みが無い・保存済みのプロトコルが違うときはドライバの既定(iQ-R)。収集中のセッションを再利用するとき、そのセッションの CPU と違えば試さず「保存してからテスト」と返す。",
                     },
                 },
                 "required": ["protocol", "host", "port"],

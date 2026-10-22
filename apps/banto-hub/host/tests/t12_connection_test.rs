@@ -469,6 +469,48 @@ async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
     }
 }
 
+/// #790（Codex のレビュー P3）: 直接ダイヤルで `cpuType` を省くと、`connectionId` の
+/// 保存済み接続が同じプロトコル（slmp）ならその CPU（Q）でフレームを組む。保存済みの
+/// プロトコルが違えば引き継がず、ドライバの既定（iQ-R）で組む。収集していない接続
+/// （共有セッションが無い）なので直接ダイヤルの経路を通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_direct_dial_inherits_the_saved_cpu_only_from_the_same_protocol() {
+    let app = test_app("t12-slmp-cpu-inherit").await;
+    let sim = SlmpSimulator::start().await;
+    let service = PlcConnectionService::new(app.pool.clone());
+    let mut input = slmp_conn_input("lineq", sim.addr.port());
+    input.cpu_type = Some("Q".to_string());
+    let slmp_q = service.create(input).await.unwrap();
+    let modbus = service
+        .create(modbus_conn_input("modbus", sim.addr.port()))
+        .await
+        .unwrap();
+    assert!(
+        app.sessions.handle_for(slmp_q.id).is_none(),
+        "収集していない"
+    );
+
+    for (id, sub, why) in [
+        (slmp_q.id, 0x0000u16, "同じプロトコルの Q を引き継ぐ"),
+        (modbus.id, 0x0002u16, "プロトコルが違えばドライバの既定 R"),
+    ] {
+        let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
+        payload["connectionId"] = json!(id);
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{why} {body:?}");
+        assert_eq!(body["ok"], true, "{why} {body:?}");
+        assert_eq!(sim.last_subcommand(), Some(sub), "{why}");
+    }
+    sim.stop();
+}
+
 /// #605: 未知の CPU 種別はダイヤルせず拒否する（R への黙ったフォールバックではない）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_test_rejects_an_unknown_cpu_type() {

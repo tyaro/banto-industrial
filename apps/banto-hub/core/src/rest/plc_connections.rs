@@ -896,7 +896,7 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 /// があり、同じプロトコル)の値を使う - 「省略は保存済みのまま」(#605 の CPU の
 /// 照合の規則を全部の欄に広げたもの)。保存済みが無ければその欄は置かない
 /// (ドライバの既定)。保存済みの接続も返す(指紋に入る秘密値の参照の出どころ)。
-async fn requested_settings(
+pub(super) async fn requested_settings(
     manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
 ) -> (Settings, Option<PlcConnection>) {
