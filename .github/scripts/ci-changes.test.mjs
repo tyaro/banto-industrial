@@ -938,6 +938,21 @@ test('実グラフ: banto-driver-api は依存ゼロ、engine と conformance �
 	assert.equal(engineChange.jobs.run_driver_api, true);
 	assert.ok(engineChange.jobs.rust_args.includes('-p banto-driver-engine'));
 	assert.ok(engineChange.jobs.rust_args.includes('-p banto-driver-conformance'));
+	assert.ok(engineChange.jobs.rust_args.includes('-p banto-broker'));
+	// 公開 crate の専用ジョブは engine 自身も明示して MSRV/features/semver を確認する。
+	const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+	const driverJob = workflow.slice(
+		workflow.indexOf('  driver-api:'),
+		workflow.indexOf('  driver-api:') + 6000
+	);
+	assert.match(
+		driverJob,
+		/cargo check -p banto-driver-api -p banto-driver-engine -p banto-driver-conformance/
+	);
+	assert.match(
+		driverJob,
+		/for pkg in banto-driver-api banto-driver-engine banto-driver-conformance;/
+	);
 	assert.equal(
 		classify({
 			event: 'pull_request',

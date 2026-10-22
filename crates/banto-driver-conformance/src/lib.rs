@@ -35,8 +35,8 @@
 //!   validation of any [`DriverBase`](banto_driver_api::DriverBase). No I/O, no runtime.
 //! - [`frame::run_all`] (C1-C7, C9-C12): a frame-type driver
 //!   ([`FrameDriver`](banto_driver_api::FrameDriver)) against a
-//!   [`frame::Responder`]. The harness plays the Hub's engine (design §4.2,
-//!   §4.2.1) in memory with virtual time, so it is deterministic and fast;
+//!   [`frame::Responder`]. The harness runs the production FrameSession
+//!   (design §4.2, §4.2.1) in memory with virtual time, so it is deterministic and fast;
 //!   faults (split, late, broken, endless, noisy, closed responses) are
 //!   injected by the harness, not by the responder.
 //! - [`fake`]: drivers to test against or to copy from:

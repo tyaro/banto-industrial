@@ -162,12 +162,12 @@ export const RUST_PACKAGES = {
  * - e2e-hub: `-p banto-hub-host --bin banto-hub`（R1-7a。core の変更は host が
  *   core に依存するので逆依存で拾う）
  * - e2e-chronogazer: `-p chronogazer-core`（banto-serve・dev_plc・chronogazer-server）
- * - driver-api: `-p banto-driver-api -p banto-driver-conformance`（MSRV の check・
+ * - driver-api: `-p banto-driver-api -p banto-driver-engine -p banto-driver-conformance`（MSRV の check・
  *   `--all-features` の clippy / test・cargo-semver-checks。R1-1・R1-2、
  *   docs/banto-driver-api-design.md §9.1）
  */
 export const JOB_PACKAGES = {
-	run_driver_api: ['banto-driver-api', 'banto-driver-conformance'],
+	run_driver_api: ['banto-driver-api', 'banto-driver-engine', 'banto-driver-conformance'],
 	run_rust_db_source: ['banto-db-source', 'banto-hub-core', 'banto-hub-sink'],
 	run_linux_clippy: [
 		'chronogazer-elev',

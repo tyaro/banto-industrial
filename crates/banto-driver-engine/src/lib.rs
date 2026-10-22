@@ -2,7 +2,9 @@
 //!
 //! 接続と手順の途中の状態は 1 個の Core が所有する。操作中は Session から取り出し、
 //! 成功した時だけ戻すため、外側の future のキャンセルでも接続を再利用しない。
-//! broker の配線、シリアルの同期、旧 I/O の削除は後続の PR で行う。
+//! broker は Frame をこの Session で実行する。接続の外側期限は TCP 接続 +
+//! 32 step × response_timeout + CLOSE_TIMEOUT + ゆとりを含む。
+//! シリアルの同期、旧 I/O の削除は後続の PR で行う。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
