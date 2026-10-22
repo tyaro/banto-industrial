@@ -168,7 +168,7 @@
 	import {
 		canDefaultWritable,
 		writableAfterAreaVerdict,
-		resolveWritableAtSubmit,
+		applyAreaVerdict,
 		writableDefaultBlockedReason
 	} from '#lib/banto/writableDefault.js';
 	import {
@@ -1143,28 +1143,36 @@
 		resetCreateExprCheck();
 		try {
 			// 解析の結果が未着のまま送ると既定の `writable` が効かない（`createWritableArea` 宣言の
-			// コメント参照）。ここで待つ。`creating` の間は送信ボタンが無効なので二重送信にならない。
+			// コメント参照）。ここで待つ。`creating` の間は送信ボタンが無効なだけで、待っている間も
+			// アドレスやチェックボックスは触れる（オーナーレビュー P2）ため、`writable` は待つ前に
+			// 取らず、**待った後のフォームの値**で `applyAreaVerdict` に決めさせる。待っている間に
+			// 入力（アドレス・種類・型・接続）が変わったら、その解析結果は今の入力のものではないので
+			// 送らずに止める（`finally` が `creating` を戻し、デバウンスの effect が再評価する）。
 			const request = createParseRequest();
 			if (request !== undefined) {
-				const seq = ++createWritableAreaSeq; // 遅れて届くデバウンスの応答に上書きさせない
-				const resolved = await resolveWritableAtSubmit({
-					tagKind: createForm.tagKind,
-					area: createWritableArea,
-					areaCurrent: createWritableAreaKey === request.key,
-					touched: createWritableTouched,
-					writable: createForm.writable,
-					groupDefault: createGroupWritableDefault(),
-					parse: async () => {
+				let area = createWritableArea;
+				if (createWritableAreaKey !== request.key) {
+					const seq = ++createWritableAreaSeq; // 遅れて届くデバウンスの応答に上書きさせない
+					try {
 						const results = await parseTagAddresses(request.connectionId, [request.item]);
 						const first = results[0];
-						return first?.ok ? (first.writableArea ?? undefined) : undefined;
+						area = first?.ok ? (first.writableArea ?? undefined) : undefined;
+					} catch {
+						area = undefined; // 判定不能。既定 ON を当てず、保存は止めない
 					}
-				});
-				if (seq === createWritableAreaSeq && createParseRequest()?.key === request.key) {
-					createWritableArea = resolved.area;
-					createWritableAreaKey = request.key;
+					if (createParseRequest()?.key !== request.key) return; // 待ち中に入力が変わった: 送らない
+					if (seq === createWritableAreaSeq) {
+						createWritableArea = area;
+						createWritableAreaKey = request.key;
+					}
 				}
-				createForm.writable = resolved.writable;
+				createForm.writable = applyAreaVerdict({
+					tagKind: createForm.tagKind,
+					area,
+					touched: createWritableTouched,
+					writable: createForm.writable,
+					groupDefault: createGroupWritableDefault()
+				});
 			}
 			const created = await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
