@@ -9,18 +9,18 @@
 
 ## 0. 要約
 
-| #   | 提案                                                                                                                                                                                                                                                                                                                                | 根拠の節 |
-| --- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
-| 1   | R2b-3 は 1 本の PR にせず、**3a（要求の型の切り替えと橋の撤去）→ 3b（エンジン）→ 3c（Modbus を Frame へ）→ 3d（SLMP を Frame へ）→ 3e（シリアル）→ 3f（docs・版）** の PR 列にする。3a はさらに 3 本（ドライバ側・broker と Hub・収集と ChronoGazer）に分ける                                                                       | §12      |
-| 2   | **最初に要求の型だけを替える**: Modbus / SLMP を `HostBound` から `DriverKind::Session` に移し、今の I/O（`banto-plc` の計画と実行）をドライバ crate の `Session` の中に閉じ込める。canonical → `banto_plc::Address` の戻しはドライバの中の private な処理になり、broker・`PlcClient`・Hub・`banto-collect` から `Address` が消える | §4       |
-| 3   | broker の要求と応答の型を API の型（`TagSpec` / `WriteItem` → `Result<Value, ItemError>`、致命は `FatalError`）にし、ダイヤルは `DriverRegistry` の `Session` / `Frame` の項目から `Settings` と `ConnectContext` で行う。`DriverTable`・`DialFn`・`DriverDial`・`HostBound` を消す                                                 | §4.2     |
-| 4   | 要求 - 応答の手順（api-design §4.2・§4.2.1）を実装する**エンジンを公開の新しい crate `banto-driver-engine`** に置き、適合テストのハーネスも同じエンジンを記憶上のトランスポートで動かす（手順の実装を 1 つにする）                                                                                                                  | §3, §5   |
-| 5   | Modbus TCP と SLMP を `FrameDriver` にし、`banto-plc` / `banto-plc-write` の I/O（クライアント・実行・ダイヤル）を消す。計画・デコード・フレーム・シミュレータは残す。SLMP は 4E バイナリのフレームを `banto-driver-slmp` が自分で組む（`slmp` crate の `SLMPClient` はフレームと I/O が一体で、フレームだけ取り出す口が無い）      | §6, §1.7 |
-| 6   | トランスポートは `Transport` trait（送る・受ける・受信の残りを捨てる・閉じる）。実装は TCP と COM 直結。変換器向けの TCP（生データ）は TCP の実装をそのまま使い、フレームの規則はドライバが決める。最初のシリアルのドライバは Modbus RTU（Q8）                                                                                      | §7       |
-| 7   | ChronoGazer の収集も同じ broker とエンジンを通す（`default_client_factory`・`ClientSpec`・`ClientProtocol` を消す）。保存時のアドレスの規則は R2b-7 まで旧規則のまま                                                                                                                                                                | §8       |
-| 8   | 書き込みの安全（関門の順・監査の先書き・1 ジョブ = 1 回の論理書き込み・割り込ませない）は変えない。RMW の判断（`Address::Slmp { bit: Some(_) }` を見る Hub の分岐）はドライバの `write_next` に移す                                                                                                                                 | §9       |
-| 9   | `banto-driver-api` は 0.2.0（`DriverKind::HostBound` と `DriverEntry::host_bound` の削除が破壊）。追加（既定つきの `probe`・設定キー）は破壊ではない。CHANGELOG に「何が壊れ、どう直すか」を書く                                                                                                                                    | §10      |
-| 10  | 完了条件: P0-3 の 6 本と Hub の `modbus_collection_uses_exactly_one_socket` を新しい居場所（エンジンの上）に移して通す。適合テストは `session::run_all_against`（実際の TCP・シミュレータ）と `frame::run_all`（記憶上）の両方を Modbus / SLMP で通し、C9〜C11・C16 を足す                                                          | §11      |
+| #   | 提案                                                                                                                                                                                                                                                                                                                                                                                               | 根拠の節 |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| 1   | R2b-3 は 1 本の PR にせず、**3a（要求の型の切り替えと橋の撤去）→ 3b（エンジン）→ 3c（Modbus を Frame へ）→ 3d（SLMP を Frame へ）→ 3e（シリアル）→ 3f（docs・版）** の PR 列にする。3a はさらに 3 本（ドライバ側・broker と Hub・収集と ChronoGazer）に分ける                                                                                                                                      | §12      |
+| 2   | **最初に要求の型だけを替える**: Modbus / SLMP を `HostBound` から `DriverKind::Session` に移し、今の I/O（`banto-plc` の計画と実行）をドライバ crate の `Session` の中に閉じ込める。canonical → `banto_plc::Address` の戻しはドライバの中の private な処理になり、broker・`PlcClient`・Hub・`banto-collect` から `Address` が消える（3a-2 で broker と Hub の即時読み書き、3a-3 で収集と公開の橋） | §4       |
+| 3   | broker の要求と応答の型を API の型（`TagSpec` / `WriteItem` → `Result<Value, ItemError>`、致命は `FatalError`）にし、ダイヤルは `DriverRegistry` の `Session` / `Frame` の項目から `Settings` と `ConnectContext` で行う。`DriverTable`・`DialFn`・`DriverDial`・`HostBound` を消す                                                                                                                | §4.2     |
+| 4   | 要求 - 応答の手順（api-design §4.2・§4.2.1）を実装する**エンジンを公開の新しい crate `banto-driver-engine`** に置き、適合テストのハーネスも同じエンジンを記憶上のトランスポートで動かす（手順の実装を 1 つにする）                                                                                                                                                                                 | §3, §5   |
+| 5   | Modbus TCP と SLMP を `FrameDriver` にし、`banto-plc` / `banto-plc-write` の I/O（クライアント・実行・ダイヤル）を消す。計画・デコード・フレーム・シミュレータは残す。SLMP は 4E バイナリのフレームを `banto-driver-slmp` が自分で組む（`slmp` crate の `SLMPClient` はフレームと I/O が一体で、フレームだけ取り出す口が無い）                                                                     | §6, §1.7 |
+| 6   | トランスポートは `Transport` trait（送る・受ける・受信の残りを捨てる・閉じる）。実装は TCP と COM 直結。変換器向けの TCP（生データ）は TCP の実装をそのまま使い、フレームの規則はドライバが決める。最初のシリアルのドライバは Modbus RTU（Q8）                                                                                                                                                     | §7       |
+| 7   | ChronoGazer の収集も同じ broker とエンジンを通す（`default_client_factory`・`ClientSpec`・`ClientProtocol` を消す）。保存時のアドレスの規則は R2b-7 まで旧規則のまま                                                                                                                                                                                                                               | §8       |
+| 8   | 書き込みの安全（関門の順・監査の先書き・1 ジョブ = 1 回の論理書き込み・割り込ませない）は変えない。RMW の判断（`Address::Slmp { bit: Some(_) }` を見る Hub の分岐）はドライバの `write_next` に移す                                                                                                                                                                                                | §9       |
+| 9   | `banto-driver-api` は 0.2.0（`DriverKind::HostBound` と `DriverEntry::host_bound` の削除が破壊）。追加（既定つきの `probe`・設定キー）は破壊ではない。CHANGELOG に「何が壊れ、どう直すか」を書く                                                                                                                                                                                                   | §10      |
+| 10  | 完了条件: P0-3 の 6 本と Hub の `modbus_collection_uses_exactly_one_socket` を新しい居場所（エンジンの上）に移して通す。適合テストは `session::run_all_against`（実際の TCP・シミュレータ）と `frame::run_all`（記憶上）の両方を Modbus / SLMP で通し、C9〜C11・C16 を足す                                                                                                                         | §11      |
 
 ### 0.1 既存の決定・計画から外れる点
 
@@ -170,7 +170,7 @@ banto-drivers（組み立て役: registry だけを返す）── banto-hub-hos
 ### 4.1 Modbus / SLMP を `Session` へ（3a-1）
 
 - `banto-driver-modbus` / `-slmp` に `SessionDriver` を実装する。`connect(settings, cx)` は `settings`（`host`・`port`・`unit_id`・`word_order`・`cpu_type`）から今の `ModbusTcpConfig` / `SlmpConfig` を組み、今のダイヤル（`dial_modbus` / `dial_slmp`）で接続する。タイムアウトは `cx.connect_timeout` / `cx.response_timeout`。
-- `Session::read_batch(&[TagSpec])` は、各 `TagSpec.address.canonical` をドライバ自身の文法（`Address::parse` / `parse_slmp`）で戻して今の `BatchReadRequest` を組み、今の `ModbusSession` / `SlmpSession` の処理に渡す。結果は `classify_read`（`classify.rs`、R1-4b）で `ItemError` に写す。**戻しはドライバの中の private な関数**で、`banto_plc::Address::from_driver_address`（公開）は消す。
+- `Session::read_batch(&[TagSpec])` は、各 `TagSpec.address.canonical` をドライバ自身の文法（`Address::parse` / `parse_slmp`）で戻して今の `BatchReadRequest` を組み、今の `ModbusSession` / `SlmpSession` の処理に渡す。結果は `classify_read`（`classify.rs`、R1-4b）で `ItemError` に写す。**戻しはドライバの中の private な関数**（公開の `banto_plc::Address::from_driver_address` は使わない）。公開の橋は収集がまだ使うので、消すのは 3a-3（§4.3）。
 - `write_batch(&[WriteItem])` は、`spec.address.bit.is_some()` かつ `TagKind::Numeric(Bit)` なら RMW（SLMP の `BitInWord`）、Modbus はそれを `ItemError::Unsupported`（今の `UnsupportedRequestKind` と同じ意味）にする。今の Hub の `matches!(address, Address::Slmp { bit: Some(_), .. })`（`write_path.rs:1685`）の判断がここへ移る。
 - 致命は `FatalError` の型で返す（`SessionError(String)` の文字列からの復元、`LegacySession` の `plc_error_from` をやめる）。
 - 中身は `LegacySession`（`tests/common/mod.rs`）を本番の型に昇格したもの。適合テストは本番のセッションに掛け替え、`LegacySession` を消す。
@@ -185,6 +185,7 @@ banto-drivers（組み立て役: registry だけを返す）── banto-hub-hos
 - `BrokerHandle::slmp_cpu` を消し、代わりに **設定の指紋** `BrokerHandle::settings_fingerprint()`（ダイヤルに使った `Settings` の秘密を除いた正規形の hash）を出す。接続テストの「収集中の共有セッションを使ってよいか」（`slmp_session_cpu_refusal`）と `BrokerSimRegistry` の同一性（`broker_glue.rs:857`）はこれで比べる（プロトコルに依らない）。
 - Hub の `read_path` / `write_path` は `TagSpec` / `WriteItem` を組んで渡す。`resolve_plc_address` は `DriverAddress` を返す（`Address` へ戻さない）。単位の逆変換・範囲の検査・文字列の長さの検査（`write_path.rs:1624-1645`・`:1799`）は Hub に残す（関門の一部。§9）。
 - 接続テストの汎用化（Q11）もこの PR。
+- **収集は 3a-3 まで今の `ReadRequest` のまま**（2026-10-22 のオーナーのレビュー P2: 3a-2 だけで broker の型を替えると、`banto-collect/src/config.rs:1795-1813` の `build_request_with_registry`（`ReadRequest` を返し、`:1812` で公開の橋を呼ぶ）と `broker_glue.rs:437-449` の `BrokerReadClient`（`BatchReadRequest` を組んで `handle.read`）がビルドできない）。3a-2 では `BrokerReadClient` の中に**一時の変換**を置く: `ReadRequest` → `TagSpec`（`DriverAddress::canonical` = `Address` の `Display`。R2b-2 で保存の正規形と同じと決めた、address 設計 §1.4。`TagKind` は `ReadRequest` のデータ型・符号化から）。公開の橋 `from_driver_address` も 3a-3 まで残す。どちらも `// R2b-3a-3 で消す` の注記と、grep のテストの例外（件数つき）に載せる。
 - core のテストの偽ドライバ（`apps/banto-hub/core/src/test_support.rs:172-309`。今は `DialFn` と `host_bound`）を `SessionDriver` の偽物に替える（`banto_driver_conformance::fake::FakeSessionDriver` を土台にし、今と同じく `banto_plc` の文法を持たせる）。
 - grep のテスト（`apps/banto-hub/host/tests/registry_entrances.rs`）に needle を足す: Hub の core の非テストのコードに `BatchReadRequest`・`BatchWriteRequest`・`from_driver_address`・`banto_plc::Address` が無い。`Address::parse(` / `parse_slmp(` の例外 4 件（`:52-65`）は Q11 で消えるので外す。
 - トリップワイヤ: `banto-drivers` の 2（broker の表 == `HostBound` の id、`lib.rs:265`）と host の `registry_tripwire.rs:62-76` は、「`builtin()` の項目はすべて `Frame` か `Session`」「Hub の registry の `Frame` / `Session` の集合 == broker が管理するプロトコルの集合」に書き換える。
@@ -193,6 +194,7 @@ banto-drivers（組み立て役: registry だけを返す）── banto-hub-hos
 
 - `GroupPlan.requests` を `Vec<TagSpec>` にする。レジストリつきの組み立て（Hub）は今の `build_request_with_registry` から橋を除いたもの（`parse_address` の結果をそのまま `TagSpec`）。ビット指定 + `bit` 以外の断り（`finish_request`、`config.rs:1771` 付近）は R2b-2a でドライバの `parse_address` に移っているので、`TagSpec` の側では持たない。
 - `banto-collect` の差し込み口は Q6。推奨の (a) では `PlcClient` を `TagSpec` の trait（仮称 `CollectClient { connect, read_batch(&[TagSpec]) -> Result<Vec<Result<Value, ItemError>>, FatalError>, disconnect }`）に替え、本番の実装は broker の読み取りハンドルの包み 1 つ（今の Hub の `BrokerReadClient`、#344 の `connect` の意味ごと `banto-collect` へ移す）にする。偽物（ChronoGazer の `OfflineClient`・`GatedClient`、`collector.rs` の 3 つ）はこの trait で書き直す。
+- 3a-2 で置いた一時の変換（`BrokerReadClient` の `ReadRequest` → `TagSpec`）と公開の橋 `Address::from_driver_address` をこの PR で消し、grep のテストの例外を外して needle（`from_driver_address`）を足す。
 - `ClientFactory` は「接続のキー → `CollectClient`」になり、`ClientSpec`・`ClientProtocol`・`client_spec`・`default_client_factory`・`ProtocolConfig::{ModbusTcp, Slmp}` を消す（#334・#605 の「手で保守する写し」が無くなる）。`ProtocolConfig` は「broker が読む」か「外部ソース」（`External`）の 2 つになる。`Protocol` はシミュレーションのためだけに残す（R2b-5）。
 - ChronoGazer は §8。
 
@@ -314,18 +316,36 @@ Hub の即時読み取り（`read_path.rs:198`）と書き込み（`write_path.r
 - **名前**: `COM10` 以上は `\\.\COM10` の形で開く必要がある。**推測**: `serialport` crate は内部でこの接頭辞を付ける。3e で確かめる。
 - **CI**: Windows の CI に仮想の COM ポートは無い。Linux の CI で pty の対（**推測**: `tokio-serial` の `SerialStream::pair()`）を使ってトランスポートの単体を確かめ、Windows の実機は手で確かめる（実機の確かめの表に行を足す）。
 
-### 7.3 時間切れの後のシリアル
+### 7.3 時間切れの後のシリアル: 同期が取れるまでデータを読まない
 
-TCP は時間切れでソケットを閉じれば遅れた応答は届かない。シリアルは線が残るので、閉じて開き直した後にも機器の遅れた応答が届きうる。一方で `Session` の契約は「`Err` を返したら、その接続は使えない（host が捨てて、バックオフの後に作り直す）」（`crates/banto-driver-api/src/session.rs:7-8`）なので、`Err` の後にポートを開いたまま残すことはできない（2026-10-22 の Codex のレビュー P1）。そこで R2b-3 では、**`Err` を返す前に `FrameSession` の中で流しきってから閉じる**。broker と `Session` の契約は変えない:
+**待ち時間と捨てるだけでは安全にならない**（2026-10-22 のオーナーのレビュー P1）。同じ局に FC3 で「レジスタ A を 1 語」→ 時間切れ → 「レジスタ B を 1 語」と読むと、A の遅れた応答も局番・FC・バイト数・CRC がすべて合うので、B の値として A の古い値を採ってしまう。どれだけ待っても「その後に来ない」とは言えない。ポートを閉じて開き直しても機器と線は元のままなので、これも解決にならない。TCP（Modbus TCP・SLMP）はソケットを閉じれば遅れた応答は届かず、Modbus TCP はトランザクション ID でも照合できるので、この問題はシリアル（`Serial`・`SerialOverTcp`）だけのもの。
 
-1. 時間切れなどで致命になったら、`FrameSession` は `Err` を返す前に受信の残りを捨てる（`discard_input`）。
-2. 待つ（`response_timeout` の半分、上限 1 秒）。その間に届いたものも捨てる。この待ちも 1 ジョブの上限（§5.5）の内側に入れる。
-3. トランスポートを閉じてから `Err` を返す。broker は今と同じくセッションを捨て、バックオフの後にダイヤルし直す。
-4. ダイヤルし直してポートを開いたら、ハンドシェイクや最初の要求の前に `discard_input` を 1 回する（閉じている間に OS のバッファに残ったもの・開いた直後に届いたものを捨てる）。それでも残る遅れた応答は、局番・FC・CRC が要求と合わなければ `FatalError::Framing`（下の段落）で落ちる。
+R2b-3 の規則は「**同期が取れたと証明できるまで、その線ではデータの要求を送らない**」:
 
-ポートを開いたまま `FrameConnection` だけ作り直す最適化（開き直しの費用を省く）は、broker と `Session` の契約に「ジョブは失敗させるがトランスポートは残す」種類を足す必要がある。ポートの共有（Q9）と同じ所を触るので、そのときに一緒に決める。
+1. **未同期の状態**: エンジンは線（ポート。`TransportSpec` が鍵、`SerialOverTcp` は `host:port`）ごとに状態を持つ。開いた直後と、致命（時間切れ・`Framing`・CRC の不一致・途中の切断）の後は **未同期**。未同期のとき、エンジンは「応えが返っていない要求」の署名（局番・FC・正常の応答の長さ・例外の応答）の集合を覚えている。
+2. **同期の手順**（ドライバの `FrameConnection` の新しいメソッド `sync_step(&outstanding) -> Option<SyncStep>`、既定は `None`）: ドライバは、正常の応答も例外の応答も、覚えている署名の**どれとも区別できる**要求を 1 つ選ぶ（Modbus RTU なら `probe()` の 1 点を、待っている要求と違う FC か違う語数（応答のバイト数が違う）で読む）。エンジンはそれを送り、届いたフレームを次のように分ける:
+   - 同期の要求の署名に合う → **同期した**。半二重で主局が 1 つの線では、機器は要求を 1 つずつ処理して順に答えるので、古い要求の応答が来るならこれより前に来ている。以後はデータの要求を送ってよい。
+   - 待っている要求の署名に合う → 古い応答として捨て、同期の応答を待ち続ける。
+   - どちらにも合わない・CRC が合わない（衝突で崩れた等）→ 捨てて待ち続ける。
+   - 同期の要求も時間切れ → それも「応えが返っていない要求」に足し、別の署名の要求で 3 回まで試す。区別できる要求をドライバが選べなくなったら、そこで止める。
+3. **止め方**: 同期できなければダイヤルの失敗（`FatalError::Protocol("線の同期が取れない")`）として broker のバックオフに任せ、次のダイヤルでも同期の手順から始める。**未同期の間は値を 1 つも返さず、書き込みも送らない**（収集は今の切断と同じく `Bad` / 読めない）。同期の要求に書き込みは使わない。
+4. **ポートは閉じない**: 致命の後も、線の状態（開いたポート・未同期・待っている署名）は `FrameSession` ではなくエンジンの「線の表」（プロセスの中で 1 つ、`TransportSpec` が鍵）に残す。`Session` の契約（`Err` = そのセッションは使えない、`crates/banto-driver-api/src/session.rs:7-8`）は変えない。broker はセッションを捨てて作り直し、新しいセッションは線の表から同じポートを借りて、ハンドシェイクの前に同期の手順を走らせる（Codex のレビュー P1 の「捨てると線の状態も消える」への答え）。ポートを閉じるのは、broker が接続を止めたとき・設定が変わったときだけ。
+5. **閉じた後・プロセスの再起動の後**: 待っている署名は分からない（空の集合）。同期の要求は「直前に使った要求と違う署名」を選び、手順 2 と同じく同期の応答が届くまでデータを送らない。プロセスをまたいだ古い応答が、たまたま同期の要求と同じ署名で届く場合だけは防げない（残る危険として §14 に書く。前のプロセスが最後に送った要求とは秒単位で離れている）。
+6. **`sync_step` を持たないドライバ**: シリアルの `transports` を名乗るのに `sync_step` が `None` なら、致命の後にその線を使い直さない（ポートを閉じ、接続を `unavailable` にして手で開き直すまで止める）。適合テストに「シリアルを名乗るドライバは `sync_step` を返す」を足す。
 
-フレームの終わりは無音の間隔では判定しない（refactor-plan §7 Q4・api-design §8）。Modbus RTU は `DriverDecides` で FC とバイト数から長さを決め、CRC は検証に使う（api-design §4.2）。局番と FC が要求と合わない応答は `FatalError::Framing`（ほかの局の遅れた応答を採らない）。
+反証のテスト（3e）: 記憶上のシリアルのトランスポートで、A の要求の応答を時間切れの後に、**2 回目の捨てる処理の後**に届ける。B の読み取りが A の値を返さないこと（同期の応答が届くまで B は送られず、A の応答は待っている署名として捨てられる）。同期の要求に A と同じ署名を選ばせると落ちること。
+
+フレームの終わりは無音の間隔では判定しない（refactor-plan §7 Q4・api-design §8）。Modbus RTU は `DriverDecides` で FC とバイト数から長さを決め、CRC は検証に使う（api-design §4.2）。同期した後に局番・FC が要求と合わない応答が来たら `FatalError::Framing`（未同期に戻る）。
+
+### 7.3.1 フレームの間の無音（Modbus RTU の t3.5）
+
+受信の完結を長さと CRC で決めるのとは別に、RTU は**フレームとフレームの間に 3.5 文字分以上の無音**が要る（19200 baud を超えるときは 1.750 ms を推奨。Modbus over Serial Line V1.02 §2.5.1.1）。エンジンの共通のループが応答の完結の直後に次の step を送ると、連続の読み取り・書き込みでこれを割る（2026-10-22 のオーナーのレビュー P2）。担当を次のとおり決める:
+
+- **間隔を決めるのはドライバ**: `FrameConnection` に `inter_frame_gap(&self) -> Duration`（既定は 0。追加なので破壊ではない）。Modbus RTU は `settings` の `baud`・`data_bits`・`parity`・`stop_bits` から 1 文字のビット数を数え、`3.5 × ビット数 / baud`（19200 baud 超は 1.750 ms）を返す。
+- **守るのはエンジンのシリアルのトランスポート**: 送る前に「最後に受けたバイト・最後に送り終えたバイトから `inter_frame_gap` が過ぎたか」を見て、足りなければ待つ（`tokio::time::sleep_until`）。Windows のタイマの粒度（既定で 15.6 ms 程度。**推測**）で長くなるのは構わない（短くならなければよい）。
+- **「送り終えた」の時刻**: `Transport::send` は OS の送信バッファから出きってから返す（シリアルは drain。`serialport` の `flush` が Windows で `FlushFileBuffers`・Linux で `tcdrain` になるかは 3e で確かめる、§14）。返った時刻を「最後に送り終えた」とする。1 つのフレームは 1 回の `send` で送り、フレームの途中に間を空けない（t1.5 を割らない）。
+- **`SerialOverTcp`**: 線の上の間隔は変換器が作る。エンジンは TCP の側でも同じ間隔を空ける（変換器が受けたまとまりをそのまま流す型でも割らないため）が、保証は変換器の設定（Modbus RTU のモード・まとめの間隔）次第。運用ガイドに変換器の条件を書き、実機の確かめの表に行を足す。
+- **テスト**（3e）: 記憶上のトランスポートが送った時刻を止めた時計で記録し、9600 baud・8N1（1 文字 10 ビット → t3.5 ≈ 3.65 ms）と 8E1（11 ビット → ≈ 4.01 ms）と 38400 baud（1.750 ms）で、連続の読み取り・書き込みの RMW の step の間がどれも間隔以上であること。間隔を 0 にすると落ちること（反証）。
 
 ### 7.4 マルチドロップ（Q9）
 
@@ -362,13 +382,14 @@ TCP は時間切れでソケットを閉じれば遅れた応答は届かない�
 
 ## 10. `banto-driver-api` 0.2.0
 
-| 変更                                                                                       | 破壊か                              | 直し方（CHANGELOG に書く）                                                     |
-| ------------------------------------------------------------------------------------------ | ----------------------------------- | ------------------------------------------------------------------------------ |
-| `DriverKind::HostBound`・`DriverEntry::host_bound` を消す                                  | **破壊**（minor を上げる）          | 組み込みのドライバは `DriverEntry::frame` か `DriverEntry::session` で登録する |
-| `DriverBase::probe() -> Option<(String, TagKind)>`（既定は `None`。接続テストで読む 1 点） | 破壊ではない（既定つき）            | -                                                                              |
-| `keys::BAUD`・`DATA_BITS`・`PARITY`・`STOP_BITS` を足す                                    | 破壊ではない                        | -                                                                              |
-| `ConnectContext` に field を足すなら（例: 開封した秘密値の扱い）                           | 破壊ではない（`#[non_exhaustive]`） | -                                                                              |
-| doc の直し（`registry.rs` の `HostBound` の説明、`lib.rs:69-72`、`address.rs:9-15`）       | -                                   | -                                                                              |
+| 変更                                                                                                      | 破壊か                              | 直し方（CHANGELOG に書く）                                                     |
+| --------------------------------------------------------------------------------------------------------- | ----------------------------------- | ------------------------------------------------------------------------------ |
+| `DriverKind::HostBound`・`DriverEntry::host_bound` を消す                                                 | **破壊**（minor を上げる）          | 組み込みのドライバは `DriverEntry::frame` か `DriverEntry::session` で登録する |
+| `DriverBase::probe() -> Option<(String, TagKind)>`（既定は `None`。接続テストで読む 1 点）                | 破壊ではない（既定つき）            | -                                                                              |
+| `FrameConnection::sync_step`（既定 `None`）・`inter_frame_gap`（既定 0）・`SyncStep` の型（§7.3・§7.3.1） | 破壊ではない（既定つき・新しい型）  | シリアルを名乗るドライバは `sync_step` を実装する（適合テストで確かめる）      |
+| `keys::BAUD`・`DATA_BITS`・`PARITY`・`STOP_BITS` を足す                                                   | 破壊ではない                        | -                                                                              |
+| `ConnectContext` に field を足すなら（例: 開封した秘密値の扱い）                                          | 破壊ではない（`#[non_exhaustive]`） | -                                                                              |
+| doc の直し（`registry.rs` の `HostBound` の説明、`lib.rs:69-72`、`address.rs:9-15`）                      | -                                   | -                                                                              |
 
 - `banto-driver-conformance` も 0.2.0（API の minor に合わせる、api-design §9.1）。`frame::run_all` の形は変えないが、中身が本物のエンジンになる。`LegacySession` は crate の外（ドライバのテスト）にあったので conformance の API には出ていない。
 - `banto-driver-engine` は新しく 0.1.0（公開する。§3）。
@@ -417,10 +438,10 @@ TCP は時間切れでソケットを閉じれば遅れた応答は届かない�
 | 3b   | `banto-driver-engine`（`Transport`・TCP・`FrameSession`・文字列の decode・時間の上限）、broker が `Frame` をダイヤル、適合テストのハーネスを本物のエンジンへ、C9〜C11・C16（§5）                                                       | 新 `crates/banto-driver-engine`、`crates/banto-driver-conformance/src/frame*`、`crates/banto-broker`                                                                                                                                                               | すべての `await` に上限があるか。時間切れで受信バッファを捨てて閉じるか。ハーネスの違反の検出を落としていないか | 上位（opus / fable）       |
 | 3c   | Modbus TCP の `FrameDriver`、P0-3 の 1〜5 の移動、Modbus の I/O の削除（§6.1）                                                                                                                                                         | `crates/banto-driver-modbus`、`crates/banto-plc/src/modbus/`、`crates/banto-plc-write/src/modbus/`                                                                                                                                                                 | トランザクション ID の数え手が 1 つ。テストの数が減らないこと                                                   | sonnet ＋ 上位の監査       |
 | 3d   | SLMP の 4E フレーム（Q4）と `FrameDriver`・RMW の `write_next`、P0-3 の 6・C13〜C15、SLMP の I/O の削除、`real_plc_verify` の書き直し（§6.2）                                                                                          | `crates/banto-driver-slmp`、`crates/banto-plc/src/slmp/`、`crates/banto-plc-write/src/slmp/`、`crates/banto-drivers/examples/`、ルート `Cargo.toml`（`slmp`）                                                                                                      | RMW の各段の拒否・確認の不一致（§4.2.1 の契約 4）。Q / R のフレームの違い（#605）                               | 上位（書き込みの安全）     |
-| 3e   | シリアルのトランスポート、設定キー、Modbus RTU（Q8）、1 ポート = 1 接続の検査（Q9）、時間切れの後のシリアルの扱い（§7.3）、REST・MCP・設定パッケージで `settings` を渡す口（§7.5）                                                     | `crates/banto-driver-engine/src/transport/serial.rs`、`crates/banto-driver-modbus`、`crates/banto-tags`、`apps/banto-hub/core/src/rest/plc_connections.rs`・MCP・設定パッケージ、`deny.toml`（要れば）                                                             | 名前の検査（checklist §5）。Linux の CI で余計な system library を要らないか（`libudev`、§14）                  | sonnet ＋ 上位の監査       |
+| 3e   | シリアルのトランスポート、設定キー、Modbus RTU（Q8）、1 ポート = 1 接続の検査（Q9）、時間切れの後のシリアルの同期（§7.3）・フレーム間の無音（§7.3.1）、REST・MCP・設定パッケージで `settings` を渡す口（§7.5）                         | `crates/banto-driver-engine/src/transport/serial.rs`、`crates/banto-driver-modbus`、`crates/banto-tags`、`apps/banto-hub/core/src/rest/plc_connections.rs`・MCP・設定パッケージ、`deny.toml`（要れば）                                                             | 名前の検査（checklist §5）。Linux の CI で余計な system library を要らないか（`libudev`、§14）                  | sonnet ＋ 上位の監査       |
 | 3f   | docs（本書・api-design・refactor-plan・plugin-design・tag-server-design §3.4・運用ガイドの接続の節）、`banto-driver-api` / conformance の CHANGELOG と版 0.2.0、`banto-driver-engine` 0.1.0、banto-hub の版の 4 点（Q13）              | `docs/*`、`crates/*/CHANGELOG.md`、版の 4 点                                                                                                                                                                                                                       | 破壊の書き方                                                                                                    | haiku（docs）＋ 上位の確認 |
 
-- 依存: 3a-1 → 3a-2 → 3a-3。3b は 3a-2 の後（broker が API の型になってから `Frame` を足す。エンジンの crate 自体は 3a と並行に作れる）。3c・3d は 3b の後で互いに独立。3e は 3b・3c の後（Modbus の部品を共有）。3f は最後。どの PR の後も main は緑。
+- 依存: 3a-1 → 3a-2 → 3a-3。橋の寿命: 3a-1 ではドライバの中に private な戻しを足すだけ、3a-2 で Hub の即時読み書きと broker から橋が消え、収集の一時の変換と公開の橋は 3a-3 で消える（どの段でもビルドが通る）。3b は 3a-2 の後（broker が API の型になってから `Frame` を足す。エンジンの crate 自体は 3a と並行に作れる）。3c・3d は 3b の後で互いに独立。3e は 3b・3c の後（Modbus の部品を共有）。3f は最後。どの PR の後も main は緑。
 - 一番大きいのは 3a-2（Hub のテストの期待値の直しを含む）と 3b。期待値の直しはコミットを分ける（R2b-2b と同じ）。
 
 ## 13. オーナー判断
@@ -435,7 +456,7 @@ TCP は時間切れでソケットを閉じれば遅れた応答は届かない�
 | Q6  | `banto-collect` の差し込み口                                     | (a) `PlcClient` を `TagSpec` の trait に替え、本番の実装は broker の読み取りハンドルの包み 1 つ（今の `BrokerReadClient` を移す）/ (b) task が `ReadOnlyHandle` を直接持ち、trait を消す                                                                                     | **(a)**。#344 の `connect` の意味（broker の状態を見る）を 1 か所に保ち、テストの偽物（ChronoGazer の 2 つ・`collector.rs` の 3 つ）の差し込み口を残せる                                                                                                                                |
 | Q7  | `banto-plc` / `banto-plc-write` の行き先                         | (a) I/O を消し、計画・デコード・フレーム・シミュレータを残す / (b) Modbus の中身を `banto-driver-modbus`、SLMP を `banto-driver-slmp` へ移し、`banto-plc` は共通の部品だけ                                                                                                   | **(a)**（R2b-3 では）。差分とレビューを小さくする。(b) は CI の対象を縮める（api-design §2.5）が、R2b-3 の危険（I/O）と無関係な大きな移動になる。公式ドライバを別リポジトリへ出すとき（refactor-plan §7 Q2）にまとめてやる                                                              |
 | Q8  | シリアルの範囲                                                   | (a) トランスポート（COM 直結）+ Modbus RTU のドライバ / (b) トランスポートだけ（ドライバは次の段）/ (c) シリアルを R2b-3 から外す                                                                                                                                            | **(a)**。ドライバが無いとトランスポートを本番の形で確かめられない。Modbus RTU は Modbus TCP の計画・デコードを共有し、同じ実機で比べられる（refactor-plan §7 Q1 の候補）                                                                                                                |
-| Q9  | マルチドロップ（1 つのポートに局番違いの接続が複数）             | (a) R2b-3 でポートごとの直列化まで / (b) R2b-3 は 1 ポート = 1 接続（保存で断る）、共有は形だけ用意して後で                                                                                                                                                                  | **(b)**。1 局の時間切れで同じポートの他局をどうするか（§7.3 の捨て方・作り直しの範囲）を、最初の実機で 1 対 1 を確かめてから決める。`TransportSpec` をポートの鍵にしておけば後から足せる                                                                                                |
+| Q9  | マルチドロップ（1 つのポートに局番違いの接続が複数）             | (a) R2b-3 でポートごとの直列化まで / (b) R2b-3 は 1 ポート = 1 接続（保存で断る）、共有は形だけ用意して後で                                                                                                                                                                  | **(b)**。1 局の時間切れで同じポートの他局をどうするか（§7.3 の未同期は線ごとなので、他局も同期が取れるまで止まる）を、最初の実機で 1 対 1 を確かめてから決める。`TransportSpec` をポートの鍵にしておけば後から足せる                                                                    |
 | Q10 | シリアルの接続を画面から作れるか                                 | (a) R2b-6（汎用フォーム）まで REST・MCP・設定パッケージだけ / (b) 接続のフォームに最小の COM の欄を手で足す                                                                                                                                                                  | **(a)**。R2b-6 で汎用フォームに替わるので、手で足した欄は捨てることになる。実機の確かめは MCP か REST で行う                                                                                                                                                                            |
 | Q11 | 接続テスト                                                       | (a) `DriverBase::probe()`（既定つき）を足し、Hub の接続テストはエンジンの 1 回きりの接続（ハンドシェイク + `probe` の 1 点）で行う。収集中は共有セッションを使い、同一性は設定の指紋で見る / (b) 今のプロトコル別（`ModbusTcpClient` / `SlmpClient` と固定のリテラル）を残す | **(a)**。(b) では `PlcClient` の実装と `Address::parse` の例外が接続テストのためだけに残る。100 種類のドライバに接続テストを書き足す形にならない                                                                                                                                        |
 | Q12 | `banto-driver-api` の版と公開                                    | (a) 0.2.0 に上げ（`HostBound` の削除）、R2b-3 の後に `banto-driver-api` 0.2.0・conformance 0.2.0・engine 0.1.0 を crates.io に初めて公開する / (b) 0.2.0 に上げるが公開はまだしない（W 段や外部の作者が出てきたら）/ (c) 0.1.0 は未公開なので版を上げずに中身を変える        | **(a)**。0.1.0 は未公開（§1.4）なので、一時の `HostBound` を含まない最初の版を公開する方が利用者に優しい（api-design Q3 の (b) の利点）。版を上げるのは CHANGELOG の「何が壊れたか」を R1 の形から追えるようにするため。公開するかどうかは別に決めてもよい（(b)）                       |
@@ -450,6 +471,8 @@ TCP は時間切れでソケットを閉じれば遅れた応答は届かない�
 - **ChronoGazer の出来事の時刻**: broker を通すと `plc_disconnected` / `plc_reconnected` の出方が Hub と同じになる（§8）。ChronoGazer の利用者向けの意味（記録の欠けの表示）が変わらないかは 3a-3 で ChronoGazer のテストを見て確かめる。
 - **適合テストのハーネスの書き直しの量**: 今のハーネス（`frame.rs` 906 行・`frame/engine.rs` 838 行）の障害の起こし方を、記憶上のトランスポートと止めた時計で同じ決定性に保てるかは 3b の最初に小さく試す。保てなければ Q3 の (c)（ハーネスは今のまま）に倒し、その旨を PR に書く。
 - **`Session` の結果の型**: `api::Session::read_batch` は `Value` を返し（`RawValue` ではない、api-design §5）、文字列の decode はセッション型ではドライバの責任のまま。エンジンが decode を揃えるのはフレーム型だけ。3a のセッション型の Modbus / SLMP は今の `banto-plc` の decode を使う。
+- **プロセスをまたぐ古い応答**（§7.3 の 5）: 再起動の直前に前のプロセスが送った要求の応答が、新しいプロセスの同期の要求と同じ署名でたまたま届く場合は防げない。前のプロセスの最後の要求の署名をファイルに残す案は R2b-3 では採らない（危険は再起動の秒単位の間に限られる）。
+- **シリアルの送り終わり**: `serialport` / `tokio-serial` の `flush` が送信の drain（Windows の `FlushFileBuffers`・Linux の `tcdrain`）になるか、USB シリアル変換器で drain が実際の線の送り終わりと合うかは未確認（§7.3.1）。合わなければ、送ったバイト数 × 1 文字の時間を足して「送り終えた」時刻を見積もる。
 - **alpha の番号**: alpha.34 の実機の確かめで直しが要れば alpha.36 を使う決まり。R2b-3 の版の番号はその時点で決まる（Q13）。
 
 ## 15. 既存の文書の直し（3f で）
