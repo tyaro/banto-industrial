@@ -258,6 +258,7 @@ pub(crate) struct FakeDriver {
     descriptor: DriverDescriptor,
     plc: FakePlc,
     secret_keys: Vec<String>,
+    hang_connect: bool,
     seen: Arc<Mutex<Vec<SeenConnect>>>,
 }
 
@@ -272,6 +273,7 @@ impl FakeDriver {
             ),
             plc,
             secret_keys: Vec::new(),
+            hang_connect: false,
             seen: Arc::default(),
         }
     }
@@ -279,6 +281,13 @@ impl FakeDriver {
     /// The same driver declaring `keys` as secret.
     pub(crate) fn with_secret_keys(mut self, keys: &[&str]) -> Self {
         self.secret_keys = keys.iter().map(|k| k.to_string()).collect();
+        self
+    }
+
+    /// The same driver whose `connect` never finishes (after recording
+    /// what it saw).
+    pub(crate) fn with_hanging_connect(mut self) -> Self {
+        self.hang_connect = true;
         self
     }
 
@@ -347,7 +356,11 @@ impl SessionDriver for FakeDriver {
         });
         let refused = settings.get("port") == Some("0");
         let plc = self.plc.clone();
+        let hang = self.hang_connect;
         Box::pin(async move {
+            if hang {
+                return std::future::pending().await;
+            }
             if refused {
                 return Err(FatalError::Io("fake: port 0 refuses".to_string()));
             }

@@ -968,9 +968,11 @@ impl SessionDirectory {
 /// builds for one connection: on every attempt, open the driver's secret
 /// keys that `conn.settings` holds a reference for (only those, design §4.2),
 /// add them to a copy of `settings`, `SessionDriver::connect` with a
-/// `ConnectContext` (`conn:{id}`, the two timeouts), and zeroize the opened
-/// values once the dial is over. The whole attempt is bounded by the task
-/// (`connect_attempt`, design §5.5).
+/// `ConnectContext` (`conn:{id}`, the two timeouts). The copy lives in an
+/// [`OpenedSettings`] from before the first secret is opened, so the opened
+/// values are zeroized however the attempt ends - success, error, or the
+/// future being dropped (the `connect_attempt` bound of design §5.5, or the
+/// task being stopped or aborted while an opener or the dial is pending).
 fn session_connector(
     conn: PlcConnection,
     driver: Arc<dyn SessionDriver>,
@@ -984,8 +986,7 @@ fn session_connector(
         let shared = Arc::clone(&shared);
         Box::pin(async move {
             let (conn, driver, settings, secret_keys, secrets) = &*shared;
-            let mut settings = settings.clone();
-            let mut opened: Vec<&str> = Vec::new();
+            let mut guard = OpenedSettings::new(settings.clone());
             for key in secret_keys {
                 if matches!(
                     conn.secret_ref_lookup(key),
@@ -994,13 +995,9 @@ fn session_connector(
                     continue;
                 }
                 match secrets.open(conn, key).await {
-                    Ok(Some(value)) => {
-                        settings.insert(key.as_str(), value.as_str());
-                        opened.push(key.as_str());
-                    }
+                    Ok(Some(value)) => guard.insert_opened(key, value.as_str()),
                     Ok(None) => {}
                     Err(reason) => {
-                        zeroize_values(settings, &opened);
                         return Err(FatalError::InvalidConfig(format!(
                             "秘密値 {key} を開けません: {reason}"
                         )));
@@ -1012,25 +1009,74 @@ fn session_connector(
                 timeouts.connect,
                 timeouts.response,
             );
-            let result = driver.connect(&settings, cx).await;
-            zeroize_values(settings, &opened);
-            result
+            driver.connect(guard.settings(), cx).await
         })
     })
 }
 
-/// Overwrite the values of `keys` in `settings` (the opened secrets) before
-/// the copy is dropped.
-fn zeroize_values(settings: Settings, keys: &[&str]) {
-    use zeroize::Zeroize;
-    if keys.is_empty() {
-        return;
-    }
-    let items: Vec<banto_driver_api::Setting> = settings.into();
-    for mut item in items {
-        if keys.contains(&item.key.as_str()) {
-            item.value.zeroize();
+/// A connect attempt's copy of the settings with the opened secrets in it.
+/// On drop (however the attempt ends, including the future being
+/// cancelled) the values of the opened keys are overwritten before the
+/// copy is freed.
+struct OpenedSettings {
+    settings: Settings,
+    opened: Vec<String>,
+}
+
+impl OpenedSettings {
+    fn new(settings: Settings) -> Self {
+        OpenedSettings {
+            settings,
+            opened: Vec::new(),
         }
+    }
+
+    /// Put an opened secret under `key` (it is zeroized on drop).
+    fn insert_opened(&mut self, key: &str, value: &str) {
+        // Recorded before the insert: the value is covered from the moment
+        // it is in the copy.
+        self.opened.push(key.to_string());
+        self.settings.insert(key, value);
+    }
+
+    fn settings(&self) -> &Settings {
+        &self.settings
+    }
+}
+
+impl Drop for OpenedSettings {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if self.opened.is_empty() {
+            return;
+        }
+        let items: Vec<banto_driver_api::Setting> = std::mem::take(&mut self.settings).into();
+        for mut item in items {
+            if self.opened.contains(&item.key) {
+                #[cfg(test)]
+                zeroized_for_test::record(&item.value);
+                item.value.zeroize();
+            }
+        }
+    }
+}
+
+/// Test-only record of the secret values [`OpenedSettings`] zeroized, so a
+/// test can see the guard ran on a path where the future was dropped. Tests
+/// use values unique to them, so parallel tests do not see each other.
+#[cfg(test)]
+mod zeroized_for_test {
+    use std::sync::Mutex;
+
+    static ZEROIZED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(value: &str) {
+        ZEROIZED.lock().unwrap().push(value.to_string());
+    }
+
+    /// Whether `value` has been zeroized by a guard.
+    pub(crate) fn contains(value: &str) -> bool {
+        ZEROIZED.lock().unwrap().iter().any(|v| v == value)
     }
 }
 
@@ -2481,5 +2527,140 @@ mod tests {
             .expect("connector should stay alive");
 
         drop(handle);
+    }
+
+    // -----------------------------------------------------------------
+    // Opened secrets are zeroized when the attempt is cancelled (#788 P2)
+    // -----------------------------------------------------------------
+
+    /// Answers `values[key]`, or never answers for a key it has no value for.
+    struct OpenerByKey(Vec<(&'static str, &'static str)>);
+
+    impl SecretOpener for OpenerByKey {
+        fn open(
+            &self,
+            _conn: &PlcConnection,
+            key: &str,
+        ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>>
+        {
+            let value = self.0.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+            Box::pin(async move {
+                match value {
+                    Some(v) => Ok(Some(Zeroizing::new(v.to_string()))),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    fn short_timeouts() -> SessionTimeouts {
+        SessionTimeouts {
+            connect: Duration::from_millis(20),
+            response: Duration::from_millis(20),
+        }
+    }
+
+    /// The secret is opened and handed to a dial that never returns: the
+    /// `connect_attempt` bound drops the future, and the guard zeroizes the
+    /// opened value on that path too.
+    #[tokio::test(start_paused = true)]
+    async fn an_opened_secret_is_zeroized_when_the_dial_times_out() {
+        const VALUE: &str = "pw-zeroize-on-connect-timeout";
+        let driver = FakeDriver::new(ID, FakePlc::new())
+            .with_secret_keys(&["password"])
+            .with_hanging_connect();
+        let seen = driver.seen();
+        let connector = session_connector(
+            conn_with_password_ref(REF),
+            Arc::new(driver),
+            banto_tags::settings_to_api(&conn_with_password_ref(REF).settings),
+            vec!["password".to_string()],
+            short_timeouts(),
+            Arc::new(OpenerByKey(vec![("password", VALUE)])),
+        );
+        let result = connect_attempt(connector, short_timeouts()).await;
+        assert!(matches!(result, Err(FatalError::Timeout)));
+        assert_eq!(
+            seen.lock().unwrap()[0].settings.get("password"),
+            Some(VALUE),
+            "the dial got the opened value"
+        );
+        assert!(
+            zeroized_for_test::contains(VALUE),
+            "the cancelled attempt must zeroize the opened value"
+        );
+    }
+
+    /// The first secret is opened, the second opener never answers: when the
+    /// attempt is given up the first value - already in the copy - is
+    /// zeroized (the guard owns the copy from before the first insert).
+    #[tokio::test(start_paused = true)]
+    async fn an_opened_secret_is_zeroized_when_a_later_opener_never_answers() {
+        const VALUE: &str = "pw-zeroize-on-second-opener-hang";
+        let conn = conn_with(
+            1,
+            ID,
+            json!({
+                "host": "127.0.0.1",
+                "port": 5000,
+                "password": { "$secret": REF },
+                "token": { "$secret": OTHER_REF },
+            }),
+        );
+        let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password", "token"]);
+        let seen = driver.seen();
+        let connector = session_connector(
+            conn.clone(),
+            Arc::new(driver),
+            banto_tags::settings_to_api(&conn.settings),
+            vec!["password".to_string(), "token".to_string()],
+            short_timeouts(),
+            Arc::new(OpenerByKey(vec![("password", VALUE)])),
+        );
+        let result = connect_attempt(connector, short_timeouts()).await;
+        assert!(matches!(result, Err(FatalError::Timeout)));
+        assert!(seen.lock().unwrap().is_empty(), "never dialed");
+        assert!(
+            zeroized_for_test::contains(VALUE),
+            "the value opened before the hang must be zeroized"
+        );
+    }
+
+    /// The task is stopped while the dial (with the opened secret) is
+    /// pending: the aborted attempt's guard zeroizes the value.
+    #[tokio::test]
+    async fn an_opened_secret_is_zeroized_when_the_task_stops_mid_dial() {
+        const VALUE: &str = "pw-zeroize-on-task-stop";
+        let driver = FakeDriver::new(ID, FakePlc::new())
+            .with_secret_keys(&["password"])
+            .with_hanging_connect();
+        let seen = driver.seen();
+        let supervisor = BrokerSupervisor::spawn_with(
+            &[conn_with_password_ref(REF)],
+            fake::registry_of(driver),
+            BrokerOptions {
+                secrets: Arc::new(OpenerByKey(vec![("password", VALUE)])),
+                ..BrokerOptions::default()
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dial should start");
+        assert!(!zeroized_for_test::contains(VALUE), "still dialing");
+        tokio::time::timeout(Duration::from_secs(1), supervisor.shutdown())
+            .await
+            .expect("shutdown must not wait for the dial");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !zeroized_for_test::contains(VALUE) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the aborted attempt must zeroize the opened value");
     }
 }
