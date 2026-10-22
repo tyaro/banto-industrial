@@ -2040,8 +2040,6 @@ impl CollectorManager {
                 && self.sessions.is_broker_managed(&c.protocol)
                 && collectible_connection_ids.contains(&c.id)
         }) {
-            wanted_ids.insert(conn.id);
-
             // T9-2: resolve the effective dial target (simulator address if
             // `conn.simulation`, else the connection's own host/port) BEFORE
             // ensure_connection - see this fn's own doc comment and
@@ -2050,10 +2048,19 @@ impl CollectorManager {
             // R2b-3a-2: `resolve` returns the settings to dial with (the
             // connection's own, or with `host`/`port` replaced by the
             // simulator's) and whether they changed since the last sync.
-            let (dial_settings, changed) = self
+            // R2b-3a-3: `None` is a `simulation = true` connection whose
+            // protocol has no simulator - never dialed (the real device must
+            // not be reached), no session (an old one is dropped now), and the
+            // plan excludes it too (`banto_collect`'s `UnsupportedProtocol`).
+            let Some((dial_settings, changed)) = self
                 .sim_registry
                 .resolve(conn, &self.sessions.drivers().registry)
-                .await;
+                .await
+            else {
+                self.sessions.remove(conn.id);
+                continue;
+            };
+            wanted_ids.insert(conn.id);
             if changed {
                 self.sessions.remove(conn.id);
             }

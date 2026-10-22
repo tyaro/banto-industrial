@@ -101,8 +101,15 @@ impl BrokerSessions {
             if !planned.contains(&key) {
                 continue;
             }
+            // A `simulation = true` connection without a simulator is not
+            // planned (`resolve_connection`), so it never gets here; should it
+            // anyway, `resolve` refuses it and no session is ensured (it is
+            // left out of `wanted`, so an old session goes as stale).
+            let Some((settings, changed)) = self.sims.resolve(conn, &self.registry).await else {
+                self.directory.remove(conn.id);
+                continue;
+            };
             wanted.insert(conn.id);
-            let (settings, changed) = self.sims.resolve(conn, &self.registry).await;
             if changed {
                 self.directory.remove(conn.id);
             }

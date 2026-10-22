@@ -71,7 +71,9 @@ fn tag_key(id: i64) -> String {
 /// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes) for
 /// [`Protocol::Slmp`]. Since R2b-3a-3 the collection plan itself reads every
 /// address through the connection's driver (`parse_address`) and carries no
-/// per-protocol configuration ([`ProtocolConfig`]).
+/// per-protocol configuration ([`ProtocolConfig`]); whether a connection is
+/// collected at all is decided by the driver registry, not by this enum
+/// ([`simulator_protocol`] maps a name to it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     ModbusTcp,
@@ -702,8 +704,11 @@ impl ExclusionUnit {
 /// file path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionReason {
-    /// The connection's driver is in the registry but it is not one of the
-    /// protocols the plan knows (`modbus-tcp` / `slmp`).
+    /// The connection's driver is in the registry but the broker does not
+    /// read it (not a session-type driver - e.g. a host-provided one,
+    /// `banto_broker::is_broker_managed`), or the connection is
+    /// `simulation = true` and this crate has no simulator for its protocol
+    /// ([`simulator_protocol`]; such a connection is never dialed, R2b-3a-3).
     UnsupportedProtocol { protocol: String },
     /// #383 段階3 P3: a `"hub"` connection (banto-hub as a source,
     /// `banto_tags::HUB_PROTOCOL`) in a runtime that cannot subscribe to the
@@ -798,7 +803,9 @@ impl ExclusionReason {
     pub fn message(&self) -> String {
         match self {
             ExclusionReason::UnsupportedProtocol { protocol } => {
-                format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）")
+                format!(
+                    "プロトコル {protocol} は収集に未対応です（broker が読むドライバと hub のみ。シミュレーションは modbus-tcp / slmp のみ）"
+                )
             }
             ExclusionReason::HubSourceUnavailable => {
                 "この実行形態では Hub 経由の接続から収集できません".to_string()
@@ -903,7 +910,7 @@ impl ConfigExclusion {
         let name = &self.name;
         let message = match &self.reason {
             ExclusionReason::UnsupportedProtocol { protocol } => format!(
-                "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）"
+                "接続 {name} のプロトコル {protocol} は収集に未対応です（broker が読むドライバと hub のみ。シミュレーションは modbus-tcp / slmp のみ）"
             ),
             ExclusionReason::HubSourceUnavailable => format!(
                 "接続 {name} は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
@@ -1057,9 +1064,10 @@ pub enum PushSource {
 
 /// How one enabled connection is collected, once its row is understood.
 enum ResolvedConnection<'a> {
-    /// Read through its broker session (the [`Protocol`] names the
-    /// notation in a tag's address error message).
-    Plc(Protocol, ProtocolConfig),
+    /// Read through its broker session. The [`Protocol`] is the simulator
+    /// kind (`None`: the crate has no simulator for this driver), and names
+    /// the notation in a tag's address error message.
+    Plc(Option<Protocol>, ProtocolConfig),
     /// Sampled from an [`crate::external::ExternalSource`] (#383 段階3 P3).
     Hub { catalog: Option<&'a HubCatalog> },
     /// Received from pushed values (R2a-1b): same [`ProtocolConfig::External`]
@@ -1109,7 +1117,7 @@ fn build_config_lenient_inner(
     // as a config error - it never has a socket to open, so silently
     // contributing nothing is the correct behaviour for a connection that by
     // design has no wire protocol at all (unlike an actually-unsupported
-    // protocol string, which `parse_protocol` below still rejects). Any tags
+    // protocol string, which `resolve_connection` still excludes). Any tags
     // registered under it (computed/internal, per banto-tags' own
     // `calc`/`mem` placement rule) are evaluated/stored entirely by
     // `apps/banto-hub/core/src/computed.rs`'s `ComputedEngine`/
@@ -1118,13 +1126,13 @@ fn build_config_lenient_inner(
     // S1 (docs/banto-hub-external-db-design.md §4.1・§7 スライス表「S1」,
     // 2026-09-06): a `"postgres"` connection ([`PlcConnection::is_db_source`])
     // gets the identical exclusion, for the identical reason - it is not a
-    // wire-protocol PLC connection either, and `parse_protocol` below has no
-    // variant for it. This is defense-in-depth as much as anything: S1 also
+    // wire-protocol PLC connection either, and its driver (if any) is not
+    // broker-read. This is defense-in-depth as much as anything: S1 also
     // forbids creating any collection group under a `"postgres"` connection
     // (`banto_tags::collection_group::CollectionGroupService`), so in
     // practice such a connection is always tagless - but without this
     // exclusion, merely *enabling* a `"postgres"` connection (zero groups or
-    // not) would make `parse_protocol` reject the whole config, since the
+    // not) would make the strict build reject the whole config, since the
     // loop below runs over every enabled connection regardless of whether it
     // has any groups yet.
     //
@@ -1402,7 +1410,7 @@ pub fn config_exclusions(
 }
 
 /// Understand one enabled connection row: read through the broker
-/// (`modbus-tcp` / `slmp`), sampled from the Hub (`hub`, when `hub` allows it),
+/// (a session-type driver), sampled from the Hub (`hub`, when `hub` allows it),
 /// received from pushed values (`push`, when `push` allows it), or excluded
 /// with the reason.
 ///
@@ -1419,8 +1427,11 @@ pub fn config_exclusions(
 /// docs/banto-hub-connection-settings-design.md §4.4・§7: a row the registry
 /// does not know - an unknown protocol, a removed plugin -, whose settings the
 /// driver refuses or whose settings shape is newer than the driver is excluded
-/// alone; the row itself is kept), and is then read through the broker (a
-/// protocol the plan knows - `modbus-tcp` / `slmp`).
+/// alone; the row itself is kept), and is then read through the broker when
+/// the broker reads its driver (`banto_broker::is_broker_managed`, the same
+/// predicate as the session sync) - except a `simulation = true` row whose
+/// protocol has no simulator ([`simulator_protocol`]), which is excluded so it
+/// never dials the real device.
 fn resolve_connection<'a>(
     conn: &PlcConnection,
     hub: Option<HubSource<'a>>,
@@ -1447,13 +1458,29 @@ fn resolve_connection<'a>(
         // A registry with a `hub` driver and no hub runtime: still not ours.
         return Err(ExclusionReason::HubSourceUnavailable);
     }
-    // Planned whether or not the broker manages the driver (as before R2b-3a-3:
-    // the plan never asked); a connection without a session reads Bad
-    // (`crate::broker_client_factory`'s client that never connects).
-    let protocol =
-        parse_protocol(&conn.protocol).ok_or_else(|| ExclusionReason::UnsupportedProtocol {
+    // R2b-3a-3 (design §4.3): planned exactly when the broker reads the
+    // driver - the same predicate the session sync filters on
+    // (`banto_broker::is_broker_managed`: a session-type driver; R2b-3b adds
+    // frame type there), so a driver added to the registry is collected
+    // without a name table here, and the plan never holds a connection the
+    // sync would not give a session. Any other kind (a host-provided driver
+    // such as `virtual` / `postgres`) is not read through the broker.
+    if !banto_broker::is_broker_managed(drivers, &conn.protocol) {
+        return Err(ExclusionReason::UnsupportedProtocol {
             protocol: conn.protocol.clone(),
-        })?;
+        });
+    }
+    // The simulator kind, if this crate has one for the protocol (picked by
+    // name until R2b-5). A `simulation = true` connection must never dial the
+    // real device: without a simulator it is not planned at all, and
+    // `BrokerSimRegistry::resolve` refuses it the same way, so no session is
+    // ensured for it.
+    let protocol = simulator_protocol(&conn.protocol);
+    if conn.simulation && protocol.is_none() {
+        return Err(ExclusionReason::UnsupportedProtocol {
+            protocol: conn.protocol.clone(),
+        });
+    }
     Ok(ResolvedConnection::Plc(
         protocol,
         ProtocolConfig::Broker(BrokerPlan {
@@ -1513,9 +1540,13 @@ fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
     Ok(tag.address.trim().to_string())
 }
 
-/// The [`Protocol`] a connection's protocol name stands for, if the plan
-/// knows it (see [`Protocol`]'s doc).
-fn parse_protocol(protocol: &str) -> Option<Protocol> {
+/// The simulator kind ([`Protocol`]) for a connection's protocol name, if this
+/// crate has one (R2b-3a-3: only the simulation and the notation in a tag's
+/// address message use it; whether a connection is collected is the driver
+/// registry's call, `resolve_connection`). `None` for every other driver - a
+/// `simulation = true` connection of such a protocol is neither planned nor
+/// dialed ([`crate::BrokerSimRegistry::resolve`]).
+pub(crate) fn simulator_protocol(protocol: &str) -> Option<Protocol> {
     match protocol {
         "modbus-tcp" => Some(Protocol::ModbusTcp),
         "slmp" => Some(Protocol::Slmp),
@@ -1547,7 +1578,7 @@ fn parse_read_request(
         Protocol::Slmp => Address::parse_slmp(address),
     }
     .map_err(|err| TagAddressIssue::InvalidAddress {
-        protocol,
+        protocol: Some(protocol),
         reason: err.to_string(),
     })?;
     let data_type = DataType::parse(data_type).ok_or(TagAddressIssue::UnknownDataType)?;
@@ -1571,7 +1602,7 @@ fn parse_read_request(
 /// `parse_address`).
 fn build_spec(
     tag: &Tag,
-    protocol: Protocol,
+    protocol: Option<Protocol>,
     conn_protocol: &str,
     registry: &DriverRegistry,
 ) -> Result<TagSpec, TagAddressIssue> {
@@ -1608,7 +1639,13 @@ pub enum TagAddressIssue {
     /// The address text does not parse under the connection protocol's
     /// notation (e.g. MELSEC `D3000` on a Modbus TCP connection). `reason`
     /// is `banto_plc`'s own error text.
-    InvalidAddress { protocol: Protocol, reason: String },
+    ///
+    /// `protocol` is `None` for a driver this crate has no notation (and no
+    /// simulator) for (R2b-3a-3): the message then names no notation.
+    InvalidAddress {
+        protocol: Option<Protocol>,
+        reason: String,
+    },
     /// The data type is outside `banto_plc::DataType`'s vocabulary.
     UnknownDataType,
     /// A bit-in-word address (`40001.3` / `D100.5`) on a tag whose data type
@@ -1637,8 +1674,9 @@ impl TagAddressIssue {
         match self {
             TagAddressIssue::InvalidAddress { protocol, reason } => {
                 let (label, example) = match protocol {
-                    Protocol::ModbusTcp => ("Modbus TCP", "40001"),
-                    Protocol::Slmp => ("SLMP（MELSEC）", "D100"),
+                    Some(Protocol::ModbusTcp) => ("Modbus TCP", "40001"),
+                    Some(Protocol::Slmp) => ("SLMP（MELSEC）", "D100"),
+                    None => return format!("このドライバのアドレスとして解釈できません。{reason}"),
                 };
                 format!("{label} のアドレスとして解釈できません（例: {example}）。{reason}")
             }
@@ -1662,7 +1700,7 @@ impl TagAddressIssue {
 /// - A `protocol` other than `"modbus-tcp"`/`"slmp"` is `Ok` here:
 ///   `"virtual"`/`"postgres"` connections are excluded from collection, and
 ///   an unsupported protocol string is a *connection*-level error
-///   (`parse_protocol`) that no tag address could fix. That includes
+///   (`resolve_connection`) that no tag address could fix. That includes
 ///   `"hub"` (#383 段階3 P2): a hub tag's address is an external name, not a
 ///   device address, and its shape/data type/`writable` rules are enforced
 ///   by `banto_tags::TagService` itself on every save
@@ -4064,7 +4102,7 @@ mod tests {
         /// R2b-2c: a stand-in that reads an address the way the real drivers do
         /// (`banto_plc`'s grammar of the driver's own id, canonical = `Display`), so
         /// the registry-carrying plan has something faithful to ask. Any other id
-        /// refuses everything.
+        /// (a driver the crate has no notation for, R2b-3a-3) takes the text as is.
         fn parse_address(
             &self,
             text: &str,
@@ -4074,7 +4112,15 @@ mod tests {
             let parsed = match id.as_str() {
                 "modbus-tcp" => Address::parse(text),
                 "slmp" => Address::parse_slmp(text),
-                _ => return Err(banto_driver_api::AddressError::new("none")),
+                _ => {
+                    return Ok(banto_driver_api::DriverAddress::new(
+                        id.clone(),
+                        text,
+                        "area",
+                        true,
+                        1,
+                    ))
+                }
             }
             .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
             Ok(banto_driver_api::DriverAddress::new(
@@ -4328,6 +4374,65 @@ mod tests {
         assert!(
             build_config_from_with_registry(&only_good, PushSource::Available, &registry).is_ok()
         );
+    }
+
+    /// R2b-3a-3 (design §4.3): whether a connection is planned is the registry's
+    /// driver kind, not a protocol-name table. A session-type driver under a new id
+    /// is planned (read through the broker); a host-provided one is not
+    /// (`unsupportedProtocol`, as before); and a `simulation = true` connection of
+    /// a protocol without a simulator is excluded, so it is never dialed.
+    #[test]
+    fn the_plan_follows_the_driver_kind_and_never_plans_an_unsimulatable_simulation() {
+        let mut registry = fake_registry(&[("fake-session", &[])]);
+        registry
+            .register(banto_driver_api::DriverEntry::host_provided(
+                std::sync::Arc::new(fake_driver("fake-provided", &[])),
+            ))
+            .unwrap();
+        let mut session = modbus_conn(1, "session", serde_json::json!({}));
+        session.protocol = "fake-session".to_string();
+        let mut provided = modbus_conn(2, "provided", serde_json::json!({}));
+        provided.protocol = "fake-provided".to_string();
+        let mut simulated = session.clone();
+        simulated.id = 3;
+        simulated.name = "simulated".to_string();
+        simulated.simulation = true;
+        let snapshot = RegistrySnapshot {
+            connections: vec![session, provided, simulated],
+            groups: (1..=3).map(|id| group_of(id * 10, id, 1000)).collect(),
+            tags: (1..=3)
+                .map(|id| tag_of(id * 100, id * 10, "X1", "u16"))
+                .collect(),
+            secrets: Vec::new(),
+        };
+
+        let (config, exclusions) = build_config_lenient_inner(
+            &snapshot,
+            ThresholdSource::None,
+            None,
+            PushSource::Unavailable,
+            &registry,
+        );
+        let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(planned, vec!["conn:1"]);
+        assert_eq!(
+            config.broker_connection_keys(),
+            ["conn:1".to_string()].into_iter().collect()
+        );
+        assert_eq!(config.connections[0].groups[0].requests.len(), 1);
+        let own: Vec<(i64, &str)> = exclusions
+            .iter()
+            .filter(|e| e.unit == ExclusionUnit::Connection)
+            .map(|e| (e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            own,
+            vec![(2, "unsupportedProtocol"), (3, "unsupportedProtocol")]
+        );
+        // The built-in drivers' simulators are still picked by name.
+        assert_eq!(simulator_protocol("modbus-tcp"), Some(Protocol::ModbusTcp));
+        assert_eq!(simulator_protocol("slmp"), Some(Protocol::Slmp));
+        assert_eq!(simulator_protocol("fake-session"), None);
     }
 
     /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -

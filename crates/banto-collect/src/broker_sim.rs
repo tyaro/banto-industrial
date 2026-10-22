@@ -28,7 +28,7 @@ use banto_broker::SettingsFingerprint;
 use banto_driver_api::{keys, DriverRegistry, Settings};
 use banto_tags::PlcConnection;
 
-use crate::config::Protocol;
+use crate::config::simulator_protocol;
 use crate::simulation::{self, SimulatorHandle};
 
 /// `protocol` のドライバの秘密のキー（無ければ空）。
@@ -90,18 +90,23 @@ impl BrokerSimRegistry {
     ///
     /// - `conn.simulation == true` の場合: `conn.id`用のシミュレータが
     ///   既に起動中ならそれを再利用し、なければ`conn.protocol`に応じた
-    ///   シミュレータ種別（`conn.protocol == "modbus-tcp"`なら
-    ///   [`Protocol::ModbusTcp`]、それ以外は [`Protocol::Slmp`]）を
-    ///   [`simulation::start`] へ渡して新規に起動・登録し、設定の `host`/`port` を
+    ///   シミュレータ種別（`crate::config::simulator_protocol`: `"modbus-tcp"` /
+    ///   `"slmp"`）を [`simulation::start`] へ渡して新規に起動・登録し、設定の `host`/`port` を
     ///   そのループバックのアドレスに差し替える（#131、2026-09-01: この protocol 分岐が
     ///   無いと、Modbus 接続の simulation=true が SLMP シミュレータへ誤って差し替わって
     ///   しまう。シミュレータの選び方は R2b-5 まで名前で選ぶ）。
+    /// - `conn.simulation == true` でシミュレータの無いプロトコルの場合:
+    ///   **`None` を返す**（R2b-3a-3）。実機の `host`/`port` を返さず、別の種類の
+    ///   シミュレータも立てない。呼び出し側はこの接続のセッションを張らない
+    ///   （既にあれば捨てる）。収集の計画もこの接続を除外している
+    ///   （`resolve_connection` の `UnsupportedProtocol`）。追跡していた
+    ///   シミュレータと `last_target` はここで忘れる。
     /// - `conn.simulation == false` の場合: `conn.id`用のシミュレータが
     ///   まだ追跡されていれば取り除いて停止する(もう不要なので)。設定はそのまま。
     ///
     /// いずれの場合も、返す設定の指紋（[`dial_fingerprint`]）を `last_target` に
     /// 記録されている直前の値(`conn.id`が未記録なら常に「変わった」扱い)と比較して
-    /// `changed`を求め、`last_target`を更新してから`(設定, changed)`を返す。
+    /// `changed`を求め、`last_target`を更新してから`Some((設定, changed))`を返す。
     ///
     /// ## `changed`が重要な理由
     ///
@@ -122,21 +127,26 @@ impl BrokerSimRegistry {
         &self,
         conn: &PlcConnection,
         registry: &DriverRegistry,
-    ) -> (Settings, bool) {
+    ) -> Option<(Settings, bool)> {
         let mut settings = banto_tags::settings_to_api(&conn.settings);
         let mut simulators = self.simulators.lock().await;
         if conn.simulation {
+            // #131 (2026-09-01): select the simulator type from the
+            // connection's own protocol rather than hardcoding SLMP. Kept
+            // until R2b-5. R2b-3a-3: a protocol without a simulator is
+            // refused - never the real host, never another kind's simulator.
+            let Some(protocol) = simulator_protocol(&conn.protocol) else {
+                let stale = simulators.remove(&conn.id);
+                drop(simulators);
+                if let Some(handle) = stale {
+                    handle.stop().await;
+                }
+                self.last_target.lock().await.remove(&conn.id);
+                return None;
+            };
             let addr = match simulators.get(&conn.id) {
                 Some(handle) => handle.addr(),
                 None => {
-                    // #131 (2026-09-01): select the simulator type from the
-                    // connection's own protocol rather than hardcoding SLMP.
-                    // Kept until R2b-5.
-                    let protocol = if conn.protocol == "modbus-tcp" {
-                        Protocol::ModbusTcp
-                    } else {
-                        Protocol::Slmp
-                    };
                     let handle = simulation::start(protocol).await;
                     let addr = handle.addr();
                     simulators.insert(conn.id, handle);
@@ -154,7 +164,7 @@ impl BrokerSimRegistry {
         let mut last_target = self.last_target.lock().await;
         let changed = last_target.get(&conn.id) != Some(&fingerprint);
         last_target.insert(conn.id, fingerprint);
-        (settings, changed)
+        Some((settings, changed))
     }
 
     /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
@@ -182,5 +192,56 @@ impl BrokerSimRegistry {
 impl Default for BrokerSimRegistry {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn(protocol: &str, simulation: bool) -> PlcConnection {
+        PlcConnection::from_settings(
+            7,
+            "c".to_string(),
+            protocol.to_string(),
+            true,
+            simulation,
+            serde_json::json!({"host": "192.0.2.1", "port": 5000})
+                .as_object()
+                .unwrap()
+                .clone(),
+            1,
+        )
+    }
+
+    /// R2b-3a-3: a `simulation = true` connection whose protocol has no
+    /// simulator is refused - no simulator of another kind, and never the real
+    /// host/port to dial.
+    #[tokio::test]
+    async fn a_simulation_without_a_simulator_is_refused_not_dialed() {
+        let registry = banto_drivers::builtin().registry;
+        let sims = BrokerSimRegistry::new();
+        assert!(sims
+            .resolve(&conn("fake-session", true), &registry)
+            .await
+            .is_none());
+        assert!(sims.simulators.lock().await.is_empty());
+        assert!(sims.last_target.lock().await.is_empty());
+
+        // Without simulation the connection's own settings are dialed.
+        let (settings, changed) = sims
+            .resolve(&conn("fake-session", false), &registry)
+            .await
+            .unwrap();
+        assert!(changed);
+        assert_eq!(settings.get(keys::HOST), Some("192.0.2.1"));
+
+        // A built-in protocol still gets its simulator (loopback, not the host).
+        let (settings, _) = sims
+            .resolve(&conn("modbus-tcp", true), &registry)
+            .await
+            .unwrap();
+        assert_ne!(settings.get(keys::HOST), Some("192.0.2.1"));
+        sims.shutdown().await;
     }
 }
