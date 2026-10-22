@@ -88,6 +88,15 @@
 //! 後・工程 2 の前に落ちても、印が同じトランザクションで立っているので次の起動で
 //! `VACUUM` だけやり直す（印は「清掃がまだ」を表す。完了の印ではない、§6.5 の 2）。
 //!
+//! 工程 1 の外で `plain-v1` の秘密の行が消える・書き換わる書き込み（封印し直しに失敗して
+//! 残った行の、操作者によるパスワードの入れ替え・消去、プロトコルの変更、接続の削除・
+//! 一括削除、[`check_secret_integrity`] が消す参照の無い行。#778 のレビュー P2）は、
+//! banto-tags の migration `0026` のトリガが同じトランザクションで
+//! `plc_connection_secrets_cleanup` に数える。工程 2 はこれも印として読み、`VACUUM` の後に
+//! 0 に戻す。トリガは OS を問わないので、非 Windows（全部 `plain-v1`、§5.8）でもパスワードを
+//! 入れ替えた次の起動で `VACUUM` する（古いパスワードを空きページに残さない。入れ替えは
+//! まれなので起動の重さは問題にしない）。
+//!
 //! # しないこと
 //!
 //! - ChronoGazer の DB の起動（§6.7）。掃除・未適用の検出・バックアップの部品は
@@ -992,7 +1001,9 @@ async fn rewrite_secrets_inner(
     Ok(report)
 }
 
-/// 工程 2（§6.5 の 2）: 清掃待ちの印があるときだけ、`PRAGMA wal_checkpoint(TRUNCATE)` →
+/// 工程 2（§6.5 の 2）: 清掃待ちの印（Hub の `secrets.vacuum_pending`、または banto-tags の
+/// `plain-v1` の行の消去・書き換えの記録 `plc_connection_secrets_cleanup`、migration 0026）が
+/// あるときだけ、`PRAGMA wal_checkpoint(TRUNCATE)` →
 /// `VACUUM` → `PRAGMA wal_checkpoint(TRUNCATE)` を 1 本の接続で行い、済んだら印を消す。
 /// 印が無ければ何もせず `Ok(false)`。後ろの checkpoint が終わり切らない（他の接続が読んで
 /// いる）・どれかが失敗したら印を残して `Err`（次の起動でやり直す）。
@@ -1004,7 +1015,13 @@ pub async fn vacuum_if_pending(pool: &SqlitePool) -> Result<bool, BantoError> {
         .fetch_optional(&mut *conn)
         .await
         .map_err(storage)?;
-    if mark.as_deref() != Some("true") {
+    // banto-tags の記録（migration 0026 のトリガ）: `plain-v1` の秘密の行を消した・書き換えた
+    // 書き込みが、同じトランザクションで数えたもの（操作者のパスワードの入れ替え・消去・
+    // プロトコルの変更・接続の削除・整合の確認が消す参照の無い行。#778 のレビュー P2）。
+    let tags_cleanup = banto_tags::connection_secret::plain_secret_cleanup_pending(&mut *conn)
+        .await
+        .map_err(storage)?;
+    if mark.as_deref() != Some("true") && tags_cleanup == 0 {
         return Ok(false);
     }
     // 前の checkpoint: WAL に残った古いフレーム（平文を含みうる）を本体へ移して切り詰める。
@@ -1027,6 +1044,12 @@ pub async fn vacuum_if_pending(pool: &SqlitePool) -> Result<bool, BantoError> {
         .execute(&mut *conn)
         .await
         .map_err(storage)?;
+    // 読んだときの値のままのときだけ 0 に戻す（間に数えた書き込みは次の起動で清掃する）。
+    if tags_cleanup > 0 {
+        banto_tags::connection_secret::clear_plain_secret_cleanup(&mut *conn, tags_cleanup)
+            .await
+            .map_err(storage)?;
+    }
     Ok(true)
 }
 

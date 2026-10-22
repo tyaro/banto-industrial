@@ -27,6 +27,14 @@
 //! なければならない。文字列（平文）やほかの形が来たら、保存の層
 //! （[`check_settings_shape`]）が断る。入口のどれかで封印を忘れても DB には入らない。
 //!
+//! # `plain-v1` の行を消したら清掃を記録する（migration `0026`、設計 §6.5）
+//!
+//! `plain-v1` の blob は平文なので、その行の DELETE と、`blob`・`scheme` を変える UPDATE は
+//! 平文を SQLite の空きページと WAL に残す。入口ごとに記録させる代わりに、表のトリガ
+//! （`0026`）がその書き込みと同じトランザクションで `plc_connection_secrets_cleanup` に
+//! 数え、Hub の起動時の後処理が `VACUUM` して 0 に戻す（[`plain_secret_cleanup_pending`]・
+//! [`clear_plain_secret_cleanup`]）。
+//!
 //! # `Debug` に blob を出さない
 //!
 //! `plain-v1` の blob は平文そのものなので、[`SealedSecretRow`] の `Debug` は参照と方式
@@ -371,6 +379,37 @@ pub(crate) async fn delete_all_secret_rows(
         .execute(&mut *connection)
         .await?;
     Ok(())
+}
+
+/// `plain-v1` の行を消した・書き換えた回数（migration `0026` のトリガが、その書き込みと
+/// 同じトランザクションで数える。0 = 清掃は要らない）。Hub の起動時の後処理
+/// （`apps/banto-hub/core/src/upgrade.rs` の `vacuum_if_pending`、設計 §6.5 の 2）が読み、
+/// `VACUUM` の後に [`clear_plain_secret_cleanup`] で 0 に戻す。記録の行が無ければ 0。
+pub async fn plain_secret_cleanup_pending<'c, E>(executor: E) -> Result<i64, sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
+    let pending: Option<i64> =
+        sqlx::query_scalar("SELECT pending FROM plc_connection_secrets_cleanup WHERE id = 1")
+            .fetch_optional(executor)
+            .await?;
+    Ok(pending.unwrap_or(0))
+}
+
+/// [`plain_secret_cleanup_pending`] を 0 に戻す。ただし読んだときの値 `seen` のままの
+/// ときだけ（清掃の間に別の書き込みが数えたら残し、次の起動でもう一度清掃する）。
+/// 戻したら `true`。
+pub async fn clear_plain_secret_cleanup<'c, E>(executor: E, seen: i64) -> Result<bool, sqlx::Error>
+where
+    E: sqlx::Executor<'c, Database = Sqlite>,
+{
+    let done = sqlx::query(
+        "UPDATE plc_connection_secrets_cleanup SET pending = 0 WHERE id = 1 AND pending = ?",
+    )
+    .bind(seen)
+    .execute(executor)
+    .await?;
+    Ok(done.rows_affected() > 0)
 }
 
 const SECRET_ROWS_SQL: &str = "SELECT ref, connection_id, key, scheme, blob \

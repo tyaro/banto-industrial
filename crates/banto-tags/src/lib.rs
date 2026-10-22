@@ -36,6 +36,9 @@
 //!   `{"$secret": "<ref>"}`, written and deleted in the connection's own transaction.
 //!   This crate never seals or opens a secret (banto-hub's `secrets` module does) and
 //!   refuses a plaintext value under a secret key ([`check_settings_shape`]).
+//!   Since R2b-1e (migration `0026`) a trigger counts every delete / rewrite of a
+//!   `plain-v1` row in the writing transaction, so the Hub's startup upkeep `VACUUM`s the
+//!   plaintext out of free pages and the WAL whichever path removed it (design §6.5).
 //! - [`upgrade`] (R2b-1d, design §6.4・§6.7): the app-independent pieces of the run-up to
 //!   the irreversible migration `0025` - leftover cleanup, "is `0025` pending", and the
 //!   password-free backup (`upgrade::backup_before_0025`) - shared by banto-hub and
@@ -170,6 +173,9 @@ mod tests {
                 // R2b-1d (migration 0025): the sealed secrets a connection's
                 // `settings` refers to.
                 "plc_connection_secrets".to_string(),
+                // Migration 0026: the count of plain-v1 secret rows deleted or
+                // rewritten since the Hub's last VACUUM (design §6.5).
+                "plc_connection_secrets_cleanup".to_string(),
                 "plc_connections".to_string(),
                 "tags".to_string(),
             ]

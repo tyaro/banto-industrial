@@ -6870,4 +6870,144 @@ mod tests {
             }
         }
     }
+
+    // ---- R2b-1e: migration 0026, the plain-v1 cleanup count (design §6.5, #778 P2) ----
+
+    async fn cleanup_count(svc: &PlcConnectionService) -> i64 {
+        crate::connection_secret::plain_secret_cleanup_pending(&svc.pool)
+            .await
+            .unwrap()
+    }
+
+    /// Every path that deletes or rewrites a `plain-v1` secret row counts it in the
+    /// writing transaction (the 0026 triggers): `Set` (the old row goes), `Clear`, a
+    /// protocol change, delete, cascade delete, and raw SQL (the Hub's reseal and its
+    /// integrity check's orphan delete). A rolled-back write leaves no count; deleting a
+    /// `dpapi-machine-v1` row (ciphertext) counts nothing; clearing only clears the value
+    /// it read.
+    #[tokio::test]
+    async fn deleting_or_rewriting_a_plain_secret_row_counts_a_cleanup() {
+        let svc = service().await;
+        assert_eq!(
+            cleanup_count(&svc).await,
+            0,
+            "a fresh database needs no cleanup"
+        );
+        let pg = svc
+            .create(with_password(postgres_input("PG"), REF_A, "pw-a"))
+            .await
+            .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 0, "an insert counts nothing");
+
+        // Set: the old row is deleted.
+        svc.update(pg.id, with_password(postgres_input("PG"), REF_B, "pw-b"))
+            .await
+            .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 1);
+        // Keep: nothing deleted.
+        svc.update(pg.id, postgres_input("PG")).await.unwrap();
+        assert_eq!(cleanup_count(&svc).await, 1);
+        // Clear.
+        svc.update(
+            pg.id,
+            with_secret_change(postgres_input("PG"), SecretChange::Clear),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 2);
+        // Protocol change.
+        svc.update(pg.id, with_password(postgres_input("PG"), REF_A, "pw-a"))
+            .await
+            .unwrap();
+        svc.update(pg.id, sample_input("PG")).await.unwrap();
+        assert_eq!(cleanup_count(&svc).await, 3);
+        // Delete and cascade delete.
+        let d = svc
+            .create(with_password(postgres_input("Del"), REF_B, "pw-b"))
+            .await
+            .unwrap();
+        svc.delete(d.id).await.unwrap();
+        assert_eq!(cleanup_count(&svc).await, 4);
+        let c = svc
+            .create(with_password(postgres_input("Cascade"), REF_C, "pw-c"))
+            .await
+            .unwrap();
+        svc.cascade_delete(c.id).await.unwrap();
+        assert_eq!(cleanup_count(&svc).await, 5);
+
+        // A rolled-back write leaves no count (the trigger runs inside it).
+        let e = svc
+            .create(with_password(postgres_input("Rollback"), REF_A, "pw-r"))
+            .await
+            .unwrap();
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.delete_tx(&mut tx, e.id).await.unwrap();
+        assert_eq!(
+            crate::connection_secret::plain_secret_cleanup_pending(&mut *tx)
+                .await
+                .unwrap(),
+            6
+        );
+        drop(tx);
+        assert_eq!(cleanup_count(&svc).await, 5, "rolled back with the delete");
+
+        // Raw SQL: the reseal to dpapi (a rewrite of a plain-v1 row) counts; deleting the
+        // dpapi row afterwards does not; an UPDATE that changes neither blob nor scheme
+        // does not.
+        sqlx::query(
+            "UPDATE plc_connection_secrets SET connection_id = connection_id WHERE ref = ?",
+        )
+        .bind(REF_A)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE plc_connection_secrets SET blob = blob WHERE ref = ?")
+            .bind(REF_A)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 5);
+        sqlx::query(
+            "UPDATE plc_connection_secrets SET scheme = 'dpapi-machine-v1', blob = X'00' \
+             WHERE ref = ?",
+        )
+        .bind(REF_A)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 6);
+        svc.delete(e.id).await.unwrap();
+        assert_eq!(
+            cleanup_count(&svc).await,
+            6,
+            "a dpapi row's delete counts nothing"
+        );
+
+        // Clearing: only the value read; a count added in between survives.
+        assert!(
+            !crate::connection_secret::clear_plain_secret_cleanup(&svc.pool, 5)
+                .await
+                .unwrap()
+        );
+        assert_eq!(cleanup_count(&svc).await, 6);
+        assert!(
+            crate::connection_secret::clear_plain_secret_cleanup(&svc.pool, 6)
+                .await
+                .unwrap()
+        );
+        assert_eq!(cleanup_count(&svc).await, 0);
+
+        // A database whose record row was removed by hand: the trigger recreates it.
+        sqlx::query("DELETE FROM plc_connection_secrets_cleanup")
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        assert_eq!(cleanup_count(&svc).await, 0);
+        let f = svc
+            .create(with_password(postgres_input("Again"), REF_B, "pw-f"))
+            .await
+            .unwrap();
+        svc.delete(f.id).await.unwrap();
+        assert_eq!(cleanup_count(&svc).await, 1);
+    }
 }

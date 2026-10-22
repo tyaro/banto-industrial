@@ -1201,6 +1201,258 @@ async fn the_upkeep_without_a_protector_only_normalizes_the_queue() {
     );
 }
 
+const REMOVED_PASSWORD: &str = "TOPSECRET-removed-plain-row-c4d9";
+const REPLACING_PASSWORD: &str = "TOPSECRET-replacing-pw-8b20";
+
+/// banto-tags の清掃の記録（migration 0026 のトリガ）。
+async fn tags_cleanup(pool: &SqlitePool) -> i64 {
+    banto_tags::connection_secret::plain_secret_cleanup_pending(pool)
+        .await
+        .unwrap()
+}
+
+/// #778 のレビュー P2 で `plain-v1` の行を消す・書き換える経路。
+#[derive(Debug, Clone, Copy)]
+enum PlainRowRemoval {
+    /// パスワードの入れ替え（`Set`: 古い行は消える）。
+    Replace,
+    /// パスワードの消去（`Clear`）。
+    Clear,
+    /// プロトコルの変更（postgres → modbus-tcp）。
+    ProtocolChange,
+    /// 接続の削除。
+    Delete,
+    /// 接続の一括削除（カスケード）。
+    CascadeDelete,
+    /// 起動時の整合の確認が消す参照の無い行。
+    IntegrityOrphan,
+}
+
+fn postgres_input_with(
+    secrets: banto_tags::SecretChanges,
+    protocol: &str,
+) -> banto_tags::PlcConnectionInput {
+    let postgres = protocol == "postgres";
+    banto_tags::PlcConnectionInput {
+        name: "pg-removal".to_string(),
+        protocol: protocol.to_string(),
+        host: "db".to_string(),
+        port: if postgres { 5432 } else { 502 },
+        unit_id: 1,
+        enabled: true,
+        simulation: false,
+        word_order: if postgres {
+            String::new()
+        } else {
+            "low_high".to_string()
+        },
+        cpu_type: None,
+        database: postgres.then(|| "erp".to_string()),
+        username: postgres.then(|| "reader".to_string()),
+        secrets,
+        settings: None,
+    }
+}
+
+/// `removal` の書き込みを `tx` の中で行う（`IntegrityOrphan` は `check_secret_integrity` が
+/// 自分のトランザクションで行うので、ここでは同じ DELETE を `tx` で流す）。
+async fn remove_plain_row_in(
+    tx: &mut sqlx::SqliteConnection,
+    service: &PlcConnectionService,
+    removal: PlainRowRemoval,
+    id: i64,
+) {
+    use PlainRowRemoval::*;
+    let plain = plain_secrets();
+    match removal {
+        Replace => {
+            let changes =
+                crate::secrets::password_changes(&plain, Some(REPLACING_PASSWORD)).unwrap();
+            service
+                .update_tx(tx, id, postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap();
+        }
+        Clear => {
+            let changes = crate::secrets::password_changes(&plain, Some("")).unwrap();
+            service
+                .update_tx(tx, id, postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap();
+        }
+        ProtocolChange => {
+            service
+                .update_tx(
+                    tx,
+                    id,
+                    postgres_input_with(Default::default(), "modbus-tcp"),
+                )
+                .await
+                .unwrap();
+        }
+        Delete => service.delete_tx(tx, id).await.unwrap(),
+        CascadeDelete => {
+            service.cascade_delete_tx(tx, id).await.unwrap();
+        }
+        IntegrityOrphan => {
+            sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// #778 のレビュー P2（Codex）: 起動時の封印し直しに失敗して `plain-v1` のまま残った秘密の
+/// 行が、その起動の VACUUM で印が消えた**後に**、パスワードの入れ替え・消去・プロトコルの
+/// 変更・接続の削除・一括削除・整合の確認の孤児の削除で消えても、消した書き込みと同じ
+/// トランザクションで清掃が記録される（戻した書き込みは記録も戻る）。次の起動で VACUUM が
+/// 走って記録が 0 に戻り、DB・WAL のバイト列に消したパスワード（と base64）が無い。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_plain_secret_row_after_the_vacuum_is_vacuumed_by_the_next_start() {
+    use PlainRowRemoval::*;
+    for removal in [
+        Replace,
+        Clear,
+        ProtocolChange,
+        Delete,
+        CascadeDelete,
+        IntegrityOrphan,
+    ] {
+        let dir = TempDir::new("upkeep-plain-row-removal");
+        let path = dir.path().join("banto-hub.sqlite3");
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let service = PlcConnectionService::with_registry(pool.clone(), registry());
+        let conn = if matches!(removal, IntegrityOrphan) {
+            // A connection without a password, and a plain-v1 row no setting refers to.
+            let conn = service
+                .create(postgres_input_with(Default::default(), "postgres"))
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO plc_connection_secrets (ref, connection_id, key, scheme, blob) \
+                 VALUES ('0123456789abcdef0123456789abcdef', ?, 'token', 'plain-v1', ?)",
+            )
+            .bind(conn.id)
+            .bind(REMOVED_PASSWORD.as_bytes())
+            .execute(&pool)
+            .await
+            .unwrap();
+            conn
+        } else {
+            let changes =
+                crate::secrets::password_changes(&plain_secrets(), Some(REMOVED_PASSWORD)).unwrap();
+            service
+                .create(postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap()
+        };
+        let failing = crate::secrets::ConnectionSecrets::new(Some(Arc::new(
+            crate::test_support::FailingProtector,
+        )));
+
+        // The reseal fails, the row stays plain-v1; this start's VACUUM (forced by a mark)
+        // clears every mark.
+        set_vacuum_pending(&pool).await.unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert_eq!(report.failures.len(), 1, "{removal:?}: {report:?}");
+        assert!(report.vacuumed, "{removal:?}: {report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{removal:?}");
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}");
+        assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
+
+        // A failed write (rolled back) leaves the row and no record.
+        let mut tx = pool.begin().await.unwrap();
+        remove_plain_row_in(&mut tx, &service, removal, conn.id).await;
+        assert!(
+            tags_cleanup_in(&mut tx).await > 0,
+            "{removal:?}: counted inside"
+        );
+        drop(tx);
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}: rolled back");
+        assert_eq!(secret_rows_of(&pool).await.len(), 1, "{removal:?}");
+
+        // The write commits: the plain-v1 row is gone and the record is set with it.
+        if matches!(removal, IntegrityOrphan) {
+            let report = check_secret_integrity(&pool).await.unwrap();
+            assert_eq!(report.orphans.len(), 1, "{report:?}");
+        } else {
+            let mut tx = pool.begin().await.unwrap();
+            remove_plain_row_in(&mut tx, &service, removal, conn.id).await;
+            tx.commit().await.unwrap();
+        }
+        assert!(
+            secret_rows_of(&pool)
+                .await
+                .iter()
+                .all(|row| !contains(&row.sealed.blob, REMOVED_PASSWORD)),
+            "{removal:?}"
+        );
+        assert_eq!(tags_cleanup(&pool).await, 1, "{removal:?}");
+        // Still counted as live plaintext only while a plain-v1 row is live.
+        let remaining = plaintext_remaining(&pool, &failing).await.unwrap();
+        let live = u64::from(matches!(removal, Replace));
+        assert_eq!(remaining, live, "{removal:?}");
+        pool.close().await;
+
+        // The next start VACUUMs and clears the record.
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert!(!report.rewrote(), "{removal:?}: {report:?}");
+        assert!(report.vacuumed, "{removal:?}: {report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{removal:?}");
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}");
+        // The start after that has nothing to clean.
+        assert!(
+            !secrets_upkeep(&pool, &failing).await.vacuumed,
+            "{removal:?}"
+        );
+        pool.close().await;
+        let leaks = leaked_in_files(&path, &[REMOVED_PASSWORD]);
+        assert!(
+            leaks.is_empty(),
+            "{removal:?}: left in the files: {leaks:?}"
+        );
+    }
+}
+
+async fn tags_cleanup_in(conn: &mut sqlx::SqliteConnection) -> i64 {
+    banto_tags::connection_secret::plain_secret_cleanup_pending(&mut *conn)
+        .await
+        .unwrap()
+}
+
+/// 上の逆: `dpapi-machine-v1` の行（暗号文）を消しても清掃は記録しない（VACUUM しない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_dpapi_secret_row_does_not_mark_the_database() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    let secrets = crate::test_support::protected_secrets();
+    let service = PlcConnectionService::with_registry(pool.clone(), registry());
+    let changes = crate::secrets::password_changes(&secrets, Some(REMOVED_PASSWORD)).unwrap();
+    let conn = service
+        .create(postgres_input_with(changes, "postgres"))
+        .await
+        .unwrap();
+    assert_eq!(
+        secret_rows_of(&pool).await[0].sealed.scheme,
+        "dpapi-machine-v1"
+    );
+    let changes = crate::secrets::password_changes(&secrets, Some(REPLACING_PASSWORD)).unwrap();
+    service
+        .update(conn.id, postgres_input_with(changes, "postgres"))
+        .await
+        .unwrap();
+    service.delete(conn.id).await.unwrap();
+    assert_eq!(tags_cleanup(&pool).await, 0);
+    assert_eq!(vacuum_mark(&pool).await, None);
+    assert!(!secrets_upkeep(&pool, &secrets).await.vacuumed);
+}
+
 /// 本物の DPAPI（machine スコープ）での §9「キューの移設」「平文が残らない」。
 /// windows-latest の CI で走る。
 #[cfg(windows)]
