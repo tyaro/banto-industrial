@@ -522,6 +522,36 @@ async fn covers_counts_and_completion_checks_remain_fatal_violations() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn mismatched_raw_values_are_per_item_unsupported_and_keep_the_connection() {
+    for raw in [
+        RawValue::Bool(true),
+        RawValue::Int(7),
+        RawValue::Uint(7),
+        RawValue::Float(7.0),
+    ] {
+        let stats = Arc::<Stats>::default();
+        let mut conn = Conn::new(stats.clone());
+        conn.raw = raw.clone();
+        let mut bit = spec();
+        bit.kind = TagKind::numeric(DataType::Bit);
+        let mut s = session(conn, Wire::new(stats.clone()), Arc::default());
+        for _ in 0..2 {
+            let values = s.read_batch(&[bit.clone(), spec()]).await.unwrap();
+            if matches!(raw, RawValue::Bool(_)) {
+                assert_eq!(values[0], Ok(Value::Bit(true)));
+                assert!(matches!(&values[1], Err(ItemError::Unsupported(_))));
+            } else {
+                assert!(matches!(&values[0], Err(ItemError::Unsupported(_))));
+                assert_eq!(values[1], Ok(Value::F64(7.0)));
+            }
+            assert!(s.is_connected());
+        }
+        assert_eq!(stats.sends.load(Ordering::SeqCst), 2);
+        assert_eq!(stats.closes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn missing_covers_are_per_item_unsupported_and_keep_the_connection() {
     let stats = Arc::<Stats>::default();
     let mut conn = Conn::new(stats.clone());
@@ -691,6 +721,57 @@ async fn zero_byte_receive_and_overgrown_frames_close_and_drop_state() {
         ));
         assert_eq!(stats.transport_drops.load(Ordering::SeqCst), 1);
         assert_eq!(stats.conn_drops.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn numeric_raw_values_match_bit_and_scalar_tag_kinds() {
+    for data_type in [
+        DataType::Bit,
+        DataType::I16,
+        DataType::U16,
+        DataType::I32,
+        DataType::U32,
+        DataType::F32,
+        DataType::I64,
+        DataType::U64,
+        DataType::F64,
+    ] {
+        for raw in [
+            RawValue::Bool(true),
+            RawValue::Int(-7),
+            RawValue::Uint(7),
+            RawValue::Float(7.5),
+            RawValue::Bytes(vec![7]),
+        ] {
+            let expected = match (&data_type, &raw) {
+                (DataType::Bit, RawValue::Bool(v)) => Some(Value::Bit(*v)),
+                (DataType::Bit, _) | (_, RawValue::Bool(_) | RawValue::Bytes(_)) => None,
+                (_, RawValue::Int(v)) => Some(Value::F64(*v as f64)),
+                (_, RawValue::Uint(v)) => Some(Value::F64(*v as f64)),
+                (_, RawValue::Float(v)) => Some(Value::F64(*v)),
+                _ => unreachable!(),
+            };
+            let result = decode::decode_value(&TagKind::numeric(data_type), raw.clone());
+            match expected {
+                Some(value) => assert_eq!(result, Ok(value), "{data_type:?}: {raw:?}"),
+                None => assert!(
+                    matches!(result, Err(ItemError::Unsupported(_))),
+                    "{data_type:?}: {raw:?}: {result:?}"
+                ),
+            }
+        }
+    }
+    for raw in [
+        RawValue::Bool(true),
+        RawValue::Int(7),
+        RawValue::Uint(7),
+        RawValue::Float(7.0),
+    ] {
+        assert!(matches!(
+            decode::decode_value(&TagKind::string(1, StringEncoding::Utf8), raw),
+            Err(ItemError::Unsupported(_))
+        ));
     }
 }
 
