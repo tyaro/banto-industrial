@@ -64,12 +64,13 @@
 //!
 //! ## Traits: what R1 implements
 //!
-//! In R1 no production driver is a [`FrameDriver`] or [`SessionDriver`]:
-//! Modbus TCP / SLMP implement only [`DriverBase`] and are registered as
-//! [`DriverKind::HostBound`], their I/O still wired by `banto-broker`
-//! (design §4.4). Since R2b-1a a host may also register a protocol whose I/O
-//! it keeps itself as [`DriverKind::HostProvided`] (banto-hub's `push` /
-//! `postgres` / `virtual`; permanent, unlike `HostBound`). The traits are
+//! Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) Modbus TCP /
+//! SLMP are [`SessionDriver`]s registered as [`DriverKind::Session`], and
+//! `banto-broker` dials them through the registry (R1's `HostBound` kind and
+//! its side table are gone; R2b-3c / 3d move them on to [`FrameDriver`]).
+//! Since R2b-1a a host may also register a protocol whose I/O it keeps
+//! itself as [`DriverKind::HostProvided`] (banto-hub's `push` / `postgres` /
+//! `virtual`; permanent). The traits are
 //! exercised by the separate conformance crate
 //! `banto-driver-conformance` (a reference frame driver, a fake session
 //! driver and the harness, design §7), which a third-party driver uses to

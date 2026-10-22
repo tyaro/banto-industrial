@@ -38,11 +38,12 @@
 //!    定義上の拒否)
 //! 3. 実効 enabled == false → [`WriteRejection::TagDisabled`]
 //! 4. 接続のプロトコルに broker ドライバが登録されていない →
-//!    [`WriteRejection::UnsupportedProtocol`](`HubSessions::is_broker_managed`/
-//!    `banto_broker::DriverTable` が唯一の正 - #131（2026-09-01）以降、slmp と
+//!    [`WriteRejection::UnsupportedProtocol`](`HubSessions::is_broker_managed`
+//!    = レジストリにセッション型のドライバがあること（R2b-3a-2、それまでは
+//!    `banto_broker::DriverTable`）が唯一の正 - #131（2026-09-01）以降、slmp と
 //!    modbus-tcp の両方がこのゲートを通過する。Modbus は Numeric（数値/
-//!    ビット、FC5/6/15/16）のみ対応、String は broker 側で per-request Bad
-//!    になる）
+//!    ビット、FC5/6/15/16）のみ対応、String・ビット指定はドライバが per-item の
+//!    `ItemError::Unsupported` にする）
 //! 5. write_enabled(受付)off → [`WriteRejection::WritesDisabled`] +
 //!    write_audit に `suppressed_disabled`
 //! 6. レート制限 would_exceed → [`WriteRejection::RateLimited`] + キー
@@ -54,10 +55,10 @@
 //!    string タグの対称性検査を追加)。一致しなければ
 //!    [`WriteRejection::UnsupportedValueType`]。数値/bit タグが一致すれば
 //!    工学値 → `banto_tags::unscale`(スケーリング設定があれば) →
-//!    data_type に応じた `banto_plc::TagValue`(数値は範囲チェックで
+//!    data_type に応じた値(数値は範囲チェックで
 //!    [`WriteRejection::ValueOutOfRange`])。string タグはスケーリングを
 //!    経由せず(登録時に禁止されている)、`banto_tags::Tag::string_encoding`
-//!    に応じた `banto_plc_write::StringWriteRequest` を組み立てる(T20 ①a、
+//!    に応じた文字列の `WriteItem` を組み立てる(T20 ①a、
 //!    このモジュールの「T20 ①a」節参照)
 //! 8. **log-before-write** → `CollectorManager::write_broker_handle_peek`
 //!    (T15-4、既存セッションの覗き見のみ・新規ダイヤルしない)経由の
@@ -156,11 +157,9 @@ use std::time::Instant;
 
 use banto_collect::Quality;
 use banto_core::BantoError;
-use banto_plc::{Address, DataType, TagValue as PlcTagValue};
-use banto_plc_write::{
-    BatchWriteRequest, StringEncoding, StringWriteRequest, WriteRequest as PlcWriteRequest,
-    WriteResult as PlcWriteResult,
-};
+use banto_driver_api::{ItemError, TagKind, TagSpec, Value, WriteItem};
+use banto_plc::DataType;
+use banto_plc_write::StringEncoding;
 use banto_server::ServerEvent;
 use banto_tags::{unscale, Scaling, PLC_TAG_KIND, STRING_DATA_TYPE};
 use serde_json::json;
@@ -244,7 +243,7 @@ impl RequestedValue {
 
 /// gate 7([`convert_value`])の出力: エンジニアリング値の型。数値/bit タグは
 /// 従来どおり `(DataType, f64)`(スケーリング済みではない、raw への unscale
-/// は [`build_plc_write_request`] が行う)。string タグは
+/// は [`build_plc_write_item`] が行う)。string タグは
 /// `banto_tags::STRING_DATA_TYPE` 以外の `data_type` を持ち得ないため
 /// `DataType` を伴わない(`banto_plc::DataType` に string 相当の variant は
 /// 無い - `banto-tags`の`ALLOWED_DATA_TYPES`のdoc comment参照)。
@@ -645,8 +644,8 @@ async fn resolve_write_target(
     // [`write_target_detail`] が使う。
 
     // gate 4: 接続のプロトコルに broker ドライバが登録されていなければ
-    // 非対応(#131、2026-09-01: `HubSessions::is_broker_managed`/
-    // `banto_broker::DriverTable` が唯一の正 - 現状 slmp と modbus-tcp の両方が
+    // 非対応(#131、2026-09-01: `HubSessions::is_broker_managed`(R2b-3a-2 から
+    // レジストリのセッション型のドライバ)が唯一の正 - 現状 slmp と modbus-tcp の両方が
     // 登録済みなので、このゲートを実際に通過できないのは未登録プロトコル
     // だけになった。banto-tags の `ALLOWED_PROTOCOLS` は `"virtual"` も
     // 許可しているが、`"virtual"` 接続配下には PLC 種別タグを作成できない
@@ -768,7 +767,7 @@ fn convert_value(
 ///
 /// 2026-09-05 実機検証で発覚した不具合の是正: 当初は `convert_value`(型
 /// 対称性のみ・レンジは見ない)しかここに含めておらず、レンジ外の値が
-/// この事前ゲートをすり抜けて commit フェーズ([`build_plc_write_request`]
+/// この事前ゲートをすり抜けて commit フェーズ([`build_plc_write_item`]
 /// 側のレンジ検査)まで届いていた。commit は entry 毎に順次実行するため、
 /// レンジ外の1件だけがそこで拒否され、他の有効なエントリは書き込み済み
 /// という**部分適用**が実機で確認された(i16 タグ3本中1本に範囲外値
@@ -798,7 +797,7 @@ async fn prepare_batch_entry(
     let value = convert_value(&resolved.entry, resolved.requested)?;
     // T20 バッチ事前ゲートで gate 7 のレンジ検査まで完了させる(上の doc
     // comment参照)。単票 execute_write はこれまでどおり
-    // build_plc_write_request 側でレンジ検査する位置を保つ - ③a で確定した
+    // build_plc_write_item 側でレンジ検査する位置を保つ - ③a で確定した
     // 「write_control off の 503 が型/範囲の 422 より優先」という単票の
     // ゲート順を壊さないため、ここには足さない。
     if let ConvertedValue::Numeric(data_type, x) = &value {
@@ -1067,15 +1066,15 @@ pub struct BatchEntryOutcome {
 ///    に、そのエントリの分だけ `record` する(2026-09-05 監査対応: 以前は
 ///    commit フェーズに入る前に全エントリをまとめて record していたが、
 ///    `insert_pending` 失敗や(PLC タグの場合)`tag_row` 読み込み失敗・
-///    [`build_plc_write_request`] の拒否で実際には書き込みを試みない
+///    [`build_plc_write_item`] の拒否で実際には書き込みを試みない
 ///    エントリまで消費してしまう false rate limiting だった -
 ///    `crate::write_rate` の「record は実際に試みた書き込みのみ消費する」
 ///    契約に反していたため是正した)。internal タグは単票と同じ
 ///    `write_internal_tag` を1件ずつ、PLC タグは接続 id ごとにグルーピング
 ///    し、グループ内で `insert_pending` 成功のたびに record したエントリ
-///    だけを集めて [`build_plc_write_request`] で組み立てた
-///    `Vec<BatchWriteRequest>` を `BrokerHandle::write` へ**1回**渡す →
-///    返ってきた `Vec<WriteResult>`(入力順)を各エントリへ割り当てて
+///    だけを集めて [`build_plc_write_item`] で組み立てた
+///    `Vec<WriteItem>` を `BrokerHandle::write` へ**1回**渡す →
+///    返ってきた `Vec<Result<(), ItemError>>`(入力順)を各エントリへ割り当てて
 ///    `set_result` で確定する。broker セッションが無い接続は、そのグループ
 ///    の全エントリを単票と同じ fail-closed(`WriteFailed`)にする(この
 ///    エントリ達はすでに record 済み - 単票が broker 呼び出し失敗時も
@@ -1249,7 +1248,7 @@ pub async fn execute_write_batch(
     // 全件 peek OK。**record はここではまだ行わない**(2026-09-05 監査
     // 対応) - 以前はここで全エントリをまとめて record していたが、commit
     // フェーズで実際には書き込みを試みずに終わるエントリ(`tag_row` 読み
-    // 込み失敗・`insert_pending` 失敗・[`build_plc_write_request`] の拒否)
+    // 込み失敗・`insert_pending` 失敗・[`build_plc_write_item`] の拒否)
     // まで消費してしまう false rate limiting だった。record は単票と同じ
     // タイミング(各エントリの `insert_pending` 成功直後・物理書き込みの
     // 直前)で、commit ループ内から per-entry に呼ぶ(このモジュール doc
@@ -1404,8 +1403,8 @@ pub async fn execute_write_batch(
             }
         }
 
-        // グループの BatchWriteRequest を組み立てる(単票と共有する
-        // build_plc_write_request)。リクエスト自体が組み立てられない
+        // グループの WriteItem を組み立てる(単票と共有する
+        // build_plc_write_item)。リクエスト自体が組み立てられない
         // (範囲外・アドレス不正)エントリは broker には送らず、ここで
         // 結果を確定する。
         let mut requests = Vec::with_capacity(committed.len());
@@ -1414,7 +1413,7 @@ pub async fn execute_write_batch(
             let p = &prepared[i];
             let conn = p.conn.as_ref().expect("group is keyed by connection id");
             let request = match &p.value {
-                ConvertedValue::Numeric(data_type, value) => build_plc_write_request(
+                ConvertedValue::Numeric(data_type, value) => build_plc_write_item(
                     deps.manager.registry(),
                     conn,
                     &p.entry,
@@ -1422,7 +1421,7 @@ pub async fn execute_write_batch(
                     &tag_row,
                     *value,
                 ),
-                ConvertedValue::Str(text) => build_plc_string_write_request(
+                ConvertedValue::Str(text) => build_plc_string_write_item(
                     deps.manager.registry(),
                     conn,
                     &p.entry,
@@ -1486,10 +1485,8 @@ pub async fn execute_write_batch(
             Ok(results) => {
                 for (k, (i, audit_id)) in sent_indices.into_iter().enumerate() {
                     let outcome = match results.get(k) {
-                        Some(PlcWriteResult::Ok) => Ok(()),
-                        Some(PlcWriteResult::Bad(write_err)) => {
-                            Err(WriteRejection::WriteFailed(write_err.to_string()))
-                        }
+                        Some(Ok(())) => Ok(()),
+                        Some(Err(item_err)) => Err(item_rejection(item_err)),
                         None => Err(WriteRejection::WriteFailed(
                             "broker から応答がありませんでした".to_string(),
                         )),
@@ -1564,7 +1561,7 @@ async fn write_plc_tag(
     tag_row: &banto_tags::Tag,
     requested: f64,
 ) -> Result<(), WriteRejection> {
-    let request = build_plc_write_request(
+    let request = build_plc_write_item(
         deps.manager.registry(),
         conn,
         entry,
@@ -1584,10 +1581,8 @@ async fn write_plc_tag(
 
     match handle.write(vec![request]).await {
         Ok(results) => match results.into_iter().next() {
-            Some(PlcWriteResult::Ok) => Ok(()),
-            Some(PlcWriteResult::Bad(write_err)) => {
-                Err(WriteRejection::WriteFailed(write_err.to_string()))
-            }
+            Some(Ok(())) => Ok(()),
+            Some(Err(item_err)) => Err(item_rejection(&item_err)),
             None => Err(WriteRejection::WriteFailed(
                 "broker から応答がありませんでした".to_string(),
             )),
@@ -1596,28 +1591,37 @@ async fn write_plc_tag(
     }
 }
 
-/// gate 8 の PLC タグ分岐(数値/bit)が broker へ渡す `BatchWriteRequest` の
+/// gate 8 の PLC タグ分岐(数値/bit)が broker へ渡す [`WriteItem`] の
 /// 組み立て(単票 [`write_plc_tag`] とバッチ [`execute_write_batch`] の
 /// コミット段が**共有する**唯一の場所 - T20-3a、docs/banto-hub-t20-design.md
 /// §3.3「BatchWriteRequest 構築ロジックを単票と共有する」)。従来どおり
-/// `banto_tags::unscale` → プロトコル別アドレス解決(#131 以降 SLMP/Modbus
-/// TCP の両方 - `banto_collect`の `build_request`と同じ`conn.protocol`分岐)
-/// → `BatchWriteRequest`(`Numeric`/`BitInWord` の作り分け)。**副作用は
-/// 無い**(broker へは渡さない - 呼び出し元が `handle.write` を呼ぶ)。
+/// `banto_tags::unscale` → 範囲の検査(`validate_numeric_range`)→ アドレス
+/// 解決(ドライバの `parse_address`、[`crate::read_path::resolve_plc_address`])
+/// の順。**副作用は無い**(broker へは渡さない - 呼び出し元が `handle.write`
+/// を呼ぶ)。
+///
+/// R2b-3a-2(docs/banto-hub-driver-io-design.md §4.2・§9): 組む先が
+/// `BatchWriteRequest` から [`WriteItem`] になった。**ビット指定のアドレス
+/// (`"D100.5"`)を読み・変えて・書く(RMW)にするかは、ここではなくドライバが
+/// 決める** - Hub は `bit` つきのアドレスと `Numeric(Bit)` の kind と
+/// `Value::Bit` を渡すだけ(以前の `matches!(address, Address::Slmp { bit:
+/// Some(_), .. })` の判断は `banto-driver-slmp` の `write_request` へ移った。
+/// Modbus はそれを `ItemError::Unsupported` にする)。単位の逆変換・範囲の
+/// 検査・アドレスの解析の位置(監査行 `insert_pending` の後、2026-10-22 オーナー
+/// 決定)は変えていない。
 ///
 /// **T20 ①a**: `entry.data_type == STRING_DATA_TYPE` は [`convert_value`]
 /// の gate 7 で `ConvertedValue::Str` に変換されるため、この関数の呼び出し元
-/// は string タグに対してこの関数を呼ばない([`build_plc_string_write_request`]
-/// を代わりに呼ぶ) - この関数自身が `BatchWriteRequest::String` を組み立てる
-/// ことは無い。
-fn build_plc_write_request(
+/// は string タグに対してこの関数を呼ばない([`build_plc_string_write_item`]
+/// を代わりに呼ぶ)。
+fn build_plc_write_item(
     registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     data_type: DataType,
     tag_row: &banto_tags::Tag,
     requested: f64,
-) -> Result<BatchWriteRequest, WriteRejection> {
+) -> Result<WriteItem, WriteRejection> {
     // スケーリング設定があれば工学値→raw に unscale する(無ければ工学値
     // そのものが raw)。`Scaling::from_parts` は永続化済みの行に対しては
     // 到達不能な Err のみを返す - 防御的に no-scaling へフォールバックする。
@@ -1634,22 +1638,21 @@ fn build_plc_write_request(
         None => requested,
     };
 
-    let tag_value = if data_type == DataType::Bit {
-        PlcTagValue::Bit(raw != 0.0)
+    let value = if data_type == DataType::Bit {
+        Value::Bit(raw != 0.0)
     } else {
         match validate_numeric_range(data_type, raw) {
-            Ok(()) => PlcTagValue::F64(raw),
+            Ok(()) => Value::F64(raw),
             Err(detail) => return Err(WriteRejection::ValueOutOfRange(detail)),
         }
     };
 
-    // R2b-2c: the address is parsed by the connection's driver (registry) and
-    // brought back to a `banto_plc::Address` over the HostBound bridge
+    // R2b-2c: the address is parsed by the connection's driver (registry)
     // (`crate::read_path::resolve_plc_address`) - no per-protocol branch here.
     // The parse stays exactly where it was: inside this builder, i.e. at the
-    // same point of the gate sequence as the `Address::parse` it replaces.
-    let address = match crate::read_path::resolve_plc_address(registry, conn, entry, tag_row) {
-        Ok(address) => address,
+    // same point of the gate sequence as the `Address::parse` it replaced.
+    let spec = match crate::read_path::resolve_plc_address(registry, conn, entry, tag_row) {
+        Ok(spec) => spec,
         Err(message) => {
             // catalog のアドレスは登録時に banto-tags で検証済みのはずの
             // 防御的分岐(手で書き換えた行だけがここに来る)。
@@ -1657,53 +1660,20 @@ fn build_plc_write_request(
         }
     };
 
-    // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a bit-in-word
-    // address (`Address::Slmp { bit: Some(_), .. }`, i.e. the catalog
-    // address was registered as `"D100.5"`) goes through the driver's RMW
-    // path (`BatchWriteRequest::BitInWord`) instead of an ordinary word
-    // write - `banto-collect`'s `build_config` (crates/banto-collect/src/
-    // config.rs's `build_request`) already refuses to build a config where a
-    // bit-qualified address is paired with a non-`bit` `data_type`, and that
-    // refusal keeps the whole catalog (including this write path's `entry`)
-    // on its previous state (`CollectorManager::rebuild`'s all-or-nothing
-    // commit, `apps/banto-hub/core/src/hub.rs`'s module doc), so reaching
-    // here with `data_type == DataType::Bit` false and a bit-qualified
-    // address is not reachable in practice - the `matches!` below only ever
-    // fires for `DataType::Bit`, but is written independently of `data_type`
-    // for the same defense-in-depth reason `Address::parse_slmp`'s error
-    // above is handled rather than `unwrap`ped. A genuine bit-*device*
-    // address (`"M50"`, no `.N` suffix) still takes the `Numeric` branch
-    // exactly as before T8 - only a word device's bit-in-word notation does.
-    //
-    // #131 (2026-09-01): this `matches!` is on the `Address::Slmp` variant
-    // specifically, so a Modbus tag's `address` (always `Address::ModbusRef`
-    // - see the protocol dispatch above) can never match it and always takes
-    // the `Numeric` branch below, unconditionally - a Modbus bit-in-word
-    // write is out of scope for this slice (`banto_broker`'s Modbus driver
-    // only ever receives `BatchWriteRequest::Numeric`/`String` from this
-    // function, never `BitInWord`, for a Modbus connection).
-    let is_bit_in_word = matches!(address, Address::Slmp { bit: Some(_), .. });
-    if is_bit_in_word {
-        let PlcTagValue::Bit(value) = tag_value else {
-            // Unreachable: `is_bit_in_word` can only be true when `address`
-            // parsed a `.N` suffix, which `Address::parse_slmp`
-            // (`banto-plc`'s `slmp::address::parse`) only accepts on a word
-            // device - and this write path's `data_type` for a word-device
-            // tag with such an address is `DataType::Bit` by the config-build
-            // guarantee documented just above, which is exactly the branch
-            // that produces `PlcTagValue::Bit` a few lines up.
-            return Err(WriteRejection::WriteFailed(
-                "内部エラー: ビット指定アドレスの値が bool ではありません".to_string(),
-            ));
-        };
-        Ok(BatchWriteRequest::BitInWord { address, value })
-    } else {
-        Ok(BatchWriteRequest::Numeric(PlcWriteRequest {
-            address,
-            data_type,
-            value: tag_value,
-        }))
-    }
+    // The kind is the gate's `data_type` (what this write was converted
+    // for), as the `BatchWriteRequest` carried it before R2b-3a-2.
+    Ok(WriteItem::new(
+        TagSpec::new(spec.address, TagKind::numeric(data_type)),
+        value,
+    ))
+}
+
+/// A per-item refusal from the driver, as the write's rejection (the audit
+/// detail and the response carry its text: the device's code for
+/// `ItemError::Device`, the RMW confirmation mismatch for `Rejected`,
+/// docs/banto-hub-driver-io-design.md §9).
+fn item_rejection(err: &ItemError) -> WriteRejection {
+    WriteRejection::WriteFailed(err.to_string())
 }
 
 /// gate 8 の文字列タグ分岐(T20 ①a、docs/banto-hub-t20-design.md §3.1、
@@ -1721,7 +1691,7 @@ async fn write_plc_string_tag(
     value: &str,
 ) -> Result<(), WriteRejection> {
     let request =
-        build_plc_string_write_request(deps.manager.registry(), conn, entry, tag_row, value)?;
+        build_plc_string_write_item(deps.manager.registry(), conn, entry, tag_row, value)?;
 
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: 単票の write_plc_tag と同じ fail-closed(このモジュールの
@@ -1734,10 +1704,8 @@ async fn write_plc_string_tag(
 
     match handle.write(vec![request]).await {
         Ok(results) => match results.into_iter().next() {
-            Some(PlcWriteResult::Ok) => Ok(()),
-            Some(PlcWriteResult::Bad(write_err)) => {
-                Err(WriteRejection::WriteFailed(write_err.to_string()))
-            }
+            Some(Ok(())) => Ok(()),
+            Some(Err(item_err)) => Err(item_rejection(&item_err)),
             None => Err(WriteRejection::WriteFailed(
                 "broker から応答がありませんでした".to_string(),
             )),
@@ -1762,35 +1730,30 @@ pub(crate) fn string_encoding_from_tag(tag_row: &banto_tags::Tag) -> StringEncod
     }
 }
 
-/// 文字列タグの `BatchWriteRequest` 組み立て(単票 [`write_plc_string_tag`]
-/// とバッチのコミット段が共有する - 数値の [`build_plc_write_request`] と
+/// 文字列タグの [`WriteItem`] 組み立て(単票 [`write_plc_string_tag`]
+/// とバッチのコミット段が共有する - 数値の [`build_plc_write_item`] と
 /// 対になる、同じ「共有する唯一の場所」原則)。`tag_row.string_length` から
-/// ワード数を、`tag_row.string_encoding` からエンコーディングを取り、
-/// `banto_plc_write::StringWriteRequest` を組み立てる。**副作用は無い**
-/// (broker へは渡さない)。
+/// ワード数を、`tag_row.string_encoding` からエンコーディングを取る。
+/// **副作用は無い**(broker へは渡さない)。
 ///
 /// 文字列長チェック(422 相当、実装指示「文字列長は string_length を尊重
 /// （超過は 422 相当の範囲エラー）」): `banto_plc_write::encode_string_value`
-/// を直接呼んで(ここは同一クレート内なので `pub(crate)` ではなく `pub` に
-/// 昇格させた実体そのものを呼ぶ - 数値側の `validate_numeric_range` のように
-/// 独立re-implementationを持たない、ロジックが drift しようがない)、ワイヤに
-/// 渡す前に容量オーバー・表現不能文字を検出する。broker/ドライバ内部でも
-/// 同じ関数がもう一度呼ばれる(二重チェック)が、ここでの事前チェックには
-/// 「範囲外の値を write_audit に一切残さず(gate 8 の log-before-write に
-/// 到達する前に)弾ける」という数値側と同じ利点がある。
-fn build_plc_string_write_request(
+/// を直接呼んで、ワイヤに渡す前に容量オーバー・表現不能文字を検出する
+/// (ドライバの中でも同じ関数がもう一度呼ばれる二重チェック)。R2b-3a-2:
+/// この検査は関門の一部として Hub に残す(docs/banto-hub-driver-io-design.md §9)。
+fn build_plc_string_write_item(
     registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
     value: &str,
-) -> Result<BatchWriteRequest, WriteRejection> {
-    // R2b-2c: [`build_plc_write_request`] と同じアドレス解決(ドライバ + 橋)。
+) -> Result<WriteItem, WriteRejection> {
+    // R2b-2c: [`build_plc_write_item`] と同じアドレス解決(ドライバ)。
     // Modbus には文字列デバイスの対応が無い(`banto_plc_write`の
     // `modbus::planning`のモジュール doc 参照) - 文法として解決できても、
-    // broker 側で `PlcWriteError::UnsupportedRequestKind` として per-request
-    // Bad になる(`WriteRejection::WriteFailed`として返る)。
-    let address = crate::read_path::resolve_plc_address(registry, conn, entry, tag_row)
+    // ドライバが per-item の `ItemError::Unsupported` にする
+    // (`WriteRejection::WriteFailed`として返る)。
+    let spec = crate::read_path::resolve_plc_address(registry, conn, entry, tag_row)
         .map_err(WriteRejection::InvalidAddress)?;
 
     let words = tag_row.string_length.unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
@@ -1800,12 +1763,7 @@ fn build_plc_string_write_request(
         return Err(WriteRejection::ValueOutOfRange(err.to_string()));
     }
 
-    Ok(BatchWriteRequest::String(StringWriteRequest {
-        address,
-        words,
-        value: value.to_string(),
-        encoding,
-    }))
+    Ok(WriteItem::new(spec, Value::Str(value.to_string())))
 }
 
 /// gate 8 の internal タグ分岐(T6-2、docs/tag-server-design.md §4.2「内部

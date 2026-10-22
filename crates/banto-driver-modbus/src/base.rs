@@ -3,14 +3,15 @@
 //!
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid, and the address functions. Its I/O is
-//! still wired by `banto-broker` through [`crate::dial`]. Since R2b-2
+//! the `SessionDriver` in `api_session.rs` (registered as
+//! `DriverEntry::session` since R2b-3a-2). Since R2b-2
 //! (docs/banto-hub-driver-address-design.md) the address functions are on the
 //! production path: the save path of `banto-tags` (built with a registry)
 //! and the Hub's plan, instant read and write paths call `parse_address`;
-//! the broker and `PlcClient` still carry a `banto_plc::Address`, which the
-//! HostBound bridge `Address::from_driver_address` rebuilds from the
-//! canonical text until R2b-3. ChronoGazer keeps the legacy rules until
-//! R2b-7.
+//! since R2b-3a-2 the broker carries the resulting `TagSpec` to this
+//! driver's session as is. Only the collection plan still goes through the
+//! public bridge `Address::from_driver_address` until R2b-3a-3. ChronoGazer
+//! keeps the legacy rules until R2b-7.
 //!
 //! ## Address functions
 //!
@@ -45,10 +46,14 @@ use crate::PROTOCOL;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ModbusDriver;
 
-/// The driver as the registry stores it (`DriverEntry::host_bound`).
-pub fn driver() -> Arc<dyn DriverBase> {
+/// The driver as the registry stores it (`DriverEntry::session`, R2b-3a-2).
+pub fn driver() -> Arc<dyn banto_driver_api::SessionDriver> {
     Arc::new(ModbusDriver)
 }
+
+/// The connection test's one point (R2b-3a-2, [`DriverBase::probe`]): the
+/// literal the Hub's protocol-specific connection test used to read.
+pub(crate) const PROBE: &str = "40001";
 
 fn descriptor() -> &'static DriverDescriptor {
     static DESCRIPTOR: OnceLock<DriverDescriptor> = OnceLock::new();
@@ -234,6 +239,14 @@ impl DriverBase for ModbusDriver {
         help.push_str("\n\n");
         help.push_str(BIT_HINT);
         help
+    }
+
+    /// The connection test reads [`PROBE`] as a `u16` (R2b-3a-2).
+    fn probe(&self) -> Option<(String, TagKind)> {
+        Some((
+            PROBE.to_string(),
+            TagKind::numeric(banto_driver_api::DataType::U16),
+        ))
     }
 }
 
@@ -730,8 +743,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// `(text, kind, canonical)`: spellings of one address share a canonical
-    /// form, parsing the canonical again is a no-op, and the HostBound bridge
-    /// returns the very `Address` `Address::parse(text)` gives.
+    /// form, parsing the canonical again is a no-op, and the bridge
+    /// (`Address::from_driver_address`, kept for the collection plan until
+    /// R2b-3a-3) returns the very `Address` `Address::parse(text)` gives.
     #[test]
     fn canonical_table_is_idempotent_unique_and_bridges_back() {
         let bit = || kind(DataType::Bit);

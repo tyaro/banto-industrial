@@ -7,8 +7,8 @@
 //!   (`host`, `port`, `word_order`, `cpu_type`; absent ones take the column
 //!   defaults `low_high` / `R`, like the stored connection) with the
 //!   [`ConnectContext`]'s two timeouts, dials with `banto_plc::dial_slmp` and
-//!   wraps the client in the same [`SlmpSession`] the broker's
-//!   `BrokerSession` uses.
+//!   wraps the client in a [`SlmpSession`] (one client for reads and
+//!   writes).
 //! - [`SlmpApiSession::read_batch`] turns each `TagSpec`'s canonical address
 //!   back into a `banto_plc::Address` with this driver's own grammar
 //!   (`Address::parse_slmp`; the private [`read_request`] /
@@ -22,7 +22,8 @@
 //!   (`write_path.rs`), moved to the driver. A bit *device* (`M50`) stays an
 //!   ordinary `Numeric` write. A test pins the two decisions to the same set.
 //!
-//! Not registered by `banto-drivers` yet (still `HostBound`; 3a-2 switches).
+//! Registered by `banto-drivers` as `DriverEntry::session` since R2b-3a-2:
+//! the broker dials every connection of this protocol through it.
 
 use banto_driver_api::{
     keys, BoxFuture, ConnectContext, DataType, FatalError, ItemError, Session, SessionDriver,

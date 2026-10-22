@@ -24,37 +24,29 @@
 //!   `banto_collect::default_client_factory()`: re-building the
 //!   `ClientSpec` -> client mapping here would silently drop fields exactly
 //!   like issues #334 / #605 did. Tripwire tests below only assert the
-//!   composition is not swapped out.
-//! - **R1-4a scope**: `broker` is built here from the driver crates' own
-//!   `dial` functions (`banto-driver-slmp`, `banto-driver-modbus`) - the
-//!   broker itself no longer contains any driver, nor the R1-3a bridge
-//!   `DriverTable::builtin()`.
-//! - **R1-4b scope**: `registry` holds the same two drivers as
-//!   `DriverKind::HostBound` entries (their `DriverBase`: identity, settings
-//!   validation, address functions; the I/O stays in `broker`). Nothing on the
-//!   production path reads it yet (design §6.2); the tripwire tests below do
-//!   (§6.3 items 1, 2, 4). The `Settings` the registry's `validate_config`
-//!   takes come from `banto_tags::settings_to_api` over the connection's
-//!   `settings` (R2b-1c replaced the R1 `settings_from_connection`, which
-//!   built them from the fixed columns; connection-settings design §3.5).
-//! - `examples/real_plc_verify.rs` (the real-PLC check, moved here from
-//!   `banto-broker` by R1-4a) spawns its broker with `builtin().broker`, so
-//!   it exercises exactly the table a host injects.
+//!   composition is not swapped out. (It stays until R2b-3a-3 moves the
+//!   collection plan to `TagSpec`, docs/banto-hub-driver-io-design.md §4.3.)
+//! - **R2b-3a-2 scope** (docs/banto-hub-driver-io-design.md §4.2): `registry`
+//!   holds Modbus TCP and SLMP as `DriverKind::Session` entries (their
+//!   `SessionDriver`: identity, settings validation, address functions *and*
+//!   the I/O). The broker dials through this registry - the former side
+//!   table `Builtin::broker` (`banto_broker::DriverTable` of `dial`
+//!   functions) and R1's `DriverKind::HostBound` are gone. The `Settings` a
+//!   driver gets come from `banto_tags::settings_to_api` over the
+//!   connection's `settings` (connection-settings design §3.5).
+//! - `examples/real_plc_verify.rs` (the real-PLC check) spawns its broker
+//!   with `builtin().registry`, so it exercises exactly the drivers a host
+//!   injects.
 
-use banto_broker::{DialFn, DriverTable};
 use banto_collect::ClientFactory;
-use banto_driver_api::{DriverEntry, DriverId, DriverRegistry};
+use banto_driver_api::{DriverEntry, DriverRegistry};
 
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {
     /// The driver registry (design §6.1): `modbus-tcp` and `slmp` as
-    /// `HostBound` entries (R1-4b; empty in R1-3b / R1-4a).
+    /// session-type entries (R2b-3a-2; `HostBound` in R1-4b to R2b-3a-1).
+    /// The broker dials through it.
     pub registry: DriverRegistry,
-    /// The broker's protocol -> dial function table: `"slmp"`
-    /// (`banto_driver_slmp::dial`) and `"modbus-tcp"`
-    /// (`banto_driver_modbus::dial`), in that order (R1-4a; the same entries
-    /// the broker's former built-in table held).
-    pub broker: DriverTable,
     /// The factory for direct (non-broker) collection clients - exactly
     /// `banto_collect::default_client_factory()`.
     pub client_factory: ClientFactory,
@@ -64,7 +56,6 @@ pub struct Builtin {
 pub fn builtin() -> Builtin {
     Builtin {
         registry: registry(),
-        broker: broker_table(),
         client_factory: banto_collect::default_client_factory(),
     }
 }
@@ -74,26 +65,10 @@ fn registry() -> DriverRegistry {
     let mut registry = DriverRegistry::new();
     for driver in [banto_driver_slmp::driver(), banto_driver_modbus::driver()] {
         registry
-            .register(DriverEntry::host_bound(driver))
+            .register(DriverEntry::session(driver))
             .expect("builtin driver ids are distinct");
     }
     registry
-}
-
-/// The broker table of the built-in drivers (see [`Builtin::broker`]).
-fn broker_table() -> DriverTable {
-    let id = |s: &str| DriverId::new(s).expect("builtin driver ids are valid");
-    DriverTable::new(vec![
-        (
-            id(banto_driver_slmp::PROTOCOL),
-            banto_driver_slmp::dial as DialFn,
-        ),
-        (
-            id(banto_driver_modbus::PROTOCOL),
-            banto_driver_modbus::dial as DialFn,
-        ),
-    ])
-    .expect("builtin driver ids are distinct")
 }
 
 #[cfg(test)]
@@ -130,103 +105,35 @@ mod tests {
         }
     }
 
-    /// Tripwire 5 (design §6.3): the broker table is exactly today's two
-    /// drivers.
-    #[test]
-    fn broker_table_ids_are_slmp_and_modbus_tcp() {
-        let ids: BTreeSet<String> = builtin()
-            .broker
-            .ids()
-            .map(|id| id.as_str().to_string())
-            .collect();
-        let want: BTreeSet<String> = ["slmp", "modbus-tcp"].map(String::from).into();
-        assert_eq!(ids, want);
-    }
-
-    /// The table holds exactly the two drivers the broker's former `const
-    /// DRIVERS` (and the R1-3a bridge `DriverTable::builtin()`) held, in the
-    /// same order (moved from `banto-broker` by R1-4a).
-    #[test]
-    fn builtin_table_registers_exactly_slmp_and_modbus_tcp() {
-        let table = builtin().broker;
-        let ids: Vec<&str> = table.ids().map(DriverId::as_str).collect();
-        assert_eq!(ids, ["slmp", "modbus-tcp"]);
-        assert!(table.is_supported("slmp"));
-        assert!(table.is_supported("modbus-tcp"));
-        for other in ["virtual", "bogus-protocol", "", "SLMP", "modbus"] {
-            assert!(
-                !table.is_supported(other),
-                "{other:?} must not be supported"
-            );
-            assert!(table.dial_for(other).is_none());
-        }
-    }
-
-    /// The SLMP entry records the connection's CPU type for
-    /// `BrokerHandle::slmp_cpu` (#605) exactly as the old
-    /// `spawn_slmp_driver` did; the Modbus entry records none (moved from
-    /// `banto-broker` by R1-4a, through the table a host actually injects).
-    #[test]
-    fn builtin_dials_carry_the_slmp_cpu_only_for_slmp() {
-        let table = builtin().broker;
-        let slmp = table.dial_for("slmp").expect("slmp entry");
-        let mut c = conn(1, "slmp", 5000);
-        c.cpu_type = "Q".to_string();
-        assert_eq!(slmp(&c, 5000).slmp_cpu, Some(SlmpCpu::Q));
-        c.cpu_type = "R".to_string();
-        assert_eq!(slmp(&c, 5000).slmp_cpu, Some(SlmpCpu::R));
-        let modbus = table.dial_for("modbus-tcp").expect("modbus-tcp entry");
-        let dial = modbus(&conn(2, "modbus-tcp", 502), 502);
-        assert_eq!(dial.slmp_cpu, None);
-    }
-
-    fn conn(id: i64, protocol: &str, port: u16) -> banto_tags::PlcConnection {
-        banto_tags::PlcConnection {
-            id,
-            name: format!("conn-{id}"),
-            protocol: protocol.to_string(),
-            host: "127.0.0.1".to_string(),
-            port: port as i64,
-            unit_id: 1,
-            enabled: true,
-            simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: None,
-            username: None,
-            settings: Default::default(),
-            settings_version: 1,
-        }
-    }
-
-    use banto_driver_api::DriverKind;
+    use banto_driver_api::{DriverId, DriverKind};
     use banto_tags::ALLOWED_PROTOCOLS;
 
-    fn host_bound_ids(registry: &DriverRegistry) -> BTreeSet<String> {
+    fn session_ids(registry: &DriverRegistry) -> BTreeSet<String> {
         registry
             .ids()
             .filter(|id| {
                 matches!(
                     registry.get(id.as_str()).map(DriverEntry::kind),
-                    Some(DriverKind::HostBound(_))
+                    Some(DriverKind::Session(_))
                 )
             })
             .map(|id| id.as_str().to_string())
             .collect()
     }
 
-    /// The registry holds exactly the two built-ins, both `HostBound`, and
-    /// each entry's descriptor id is the key it is found under.
+    /// The registry holds exactly the two built-ins, both session-type
+    /// (R2b-3a-2), and each entry's descriptor id is the key it is found
+    /// under.
     #[test]
-    fn registry_holds_modbus_tcp_and_slmp_as_host_bound() {
+    fn registry_holds_modbus_tcp_and_slmp_as_session_drivers() {
         let registry = builtin().registry;
         assert_eq!(registry.len(), 2);
         let want: BTreeSet<String> = ["slmp", "modbus-tcp"].map(String::from).into();
-        assert_eq!(host_bound_ids(&registry), want);
+        assert_eq!(session_ids(&registry), want);
         for id in ["slmp", "modbus-tcp"] {
             let entry = registry.get(id).expect("registered");
             assert_eq!(entry.descriptor().id.as_str(), id);
-            assert!(matches!(entry.kind(), DriverKind::HostBound(_)));
+            assert!(matches!(entry.kind(), DriverKind::Session(_)));
         }
         assert_eq!(
             registry.get("modbus-tcp").unwrap().descriptor().id.as_str(),
@@ -258,16 +165,41 @@ mod tests {
         }
     }
 
-    /// Tripwire 2 (design §6.3): the broker table's ids are exactly the
-    /// registry's `HostBound` ids - neither side may hold a driver the other
-    /// lacks.
+    /// Tripwire 2 (design §6.3; rewritten by R2b-3a-2,
+    /// docs/banto-hub-driver-io-design.md §4.2): every entry `builtin()`
+    /// registers is a frame- or session-type driver - one the broker dials
+    /// itself (the broker table and `HostBound` are gone, so "the broker's ids
+    /// == the registry's HostBound ids" became this), and the broker manages
+    /// exactly those ids.
     #[test]
-    fn broker_ids_equal_the_registrys_host_bound_ids() {
-        let Builtin {
-            registry, broker, ..
-        } = builtin();
-        let broker_ids: BTreeSet<String> = broker.ids().map(|id| id.as_str().to_string()).collect();
-        assert_eq!(broker_ids, host_bound_ids(&registry));
+    fn every_builtin_entry_is_a_driver_the_broker_dials() {
+        let registry = builtin().registry;
+        for id in registry.ids() {
+            let entry = registry.get(id.as_str()).expect("registered");
+            assert!(
+                matches!(entry.kind(), DriverKind::Session(_) | DriverKind::Frame(_)),
+                "{id}: {:?}",
+                entry.kind()
+            );
+            assert!(
+                banto_broker::is_broker_managed(&registry, id.as_str()),
+                "{id}"
+            );
+        }
+    }
+
+    /// Each built-in names a connection-test point its own grammar accepts
+    /// (R2b-3a-2, Q11): the Hub's connection test reads it without knowing the
+    /// protocol.
+    #[test]
+    fn every_builtin_names_a_probe_its_grammar_accepts() {
+        let registry = builtin().registry;
+        for id in registry.ids() {
+            let base = registry.get(id.as_str()).unwrap().base();
+            let (text, kind) = base.probe().unwrap_or_else(|| panic!("{id}: no probe"));
+            base.parse_address(&text, &kind)
+                .unwrap_or_else(|e| panic!("{id}: {text}: {e}"));
+        }
     }
 
     /// Tripwire 4 (design §6.3): every descriptor id satisfies the

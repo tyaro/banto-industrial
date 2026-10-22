@@ -166,68 +166,79 @@
 //! ## Value type coverage: numeric/bit only
 //!
 //! [`BrokerReadClient::read_batch`] only ever needs to translate
-//! `banto_plc::TagValue::{Bit, F64}` - `banto_collect::config::build_config`
+//! numeric/bit values - `banto_collect::config::build_config`
 //! (S1, `crates/banto-collect/src/config.rs`) skips every `"string"`-typed
 //! tag before it ever becomes a `ReadRequest`
 //! (`banto_tags::STRING_DATA_TYPE`), so no `ReadRequest` this adapter ever
 //! receives can decode as `banto_plc::PlcValue::Str`. The mapping still
 //! handles that case defensively (folds it into a per-request `Bad` rather
 //! than panicking) in case that invariant is ever broken, but it is not a
-//! path this crate's tests need to exercise as a *product* behavior - S2
-//! string-tag reads are relay-wright's engine, which talks to
-//! [`banto_broker::BrokerHandle::read`] directly with `BatchReadRequest::String`
-//! entries, never through banto-collect/this adapter.
+//! path this crate's tests need to exercise as a *product* behavior - string
+//! reads on demand go through `crate::read_path`, which talks to
+//! [`banto_broker::ReadOnlyHandle::read`] directly with a string `TagSpec`,
+//! never through banto-collect/this adapter.
+//!
+//! ## The temporary `ReadRequest` → `TagSpec` conversion (R2b-3a-2 → 3a-3)
+//!
+//! Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) the broker's
+//! requests are `banto_driver_api::TagSpec`s, but the collection plan still
+//! hands this adapter `banto_plc::ReadRequest`s until R2b-3a-3 moves the plan
+//! to `TagSpec` too. Until then [`BrokerReadClient::read_batch`] converts each
+//! one with `banto_plc::Address::to_driver_address` (canonical = the
+//! address's `Display`, the text R2b-2 stores; the kind from the request's
+//! data type). Both the conversion and that helper are marked
+//! `R2b-3a-3 で消す`, and `host/tests/registry_entrances.rs` pins the one
+//! call here with a counted exception.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use banto_broker::{
-    BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerSupervisor, DriverTable,
-    ReadOnlyHandle, SessionDirectory,
+    BrokerConnectionStatus, BrokerError, BrokerHandle, BrokerOptions, BrokerSupervisor,
+    ReadOnlyHandle, SecretOpener, SessionDirectory, SettingsFingerprint,
 };
-use banto_driver_api::DriverRegistry;
-use banto_plc::{
-    BatchReadRequest, BatchReadResult, BoxFuture, PlcClient, PlcError, PlcValue, ReadRequest,
-    ReadResult, TagValue,
-};
+use banto_driver_api::{keys, DriverRegistry, ItemError, Settings, TagKind, TagSpec, Value};
+use banto_plc::{BoxFuture, PlcClient, PlcError, ReadRequest, ReadResult, TagValue};
 use banto_tags::PlcConnection;
 use tokio::sync::{watch, Mutex as AsyncMutex};
 
 /// The drivers the host injects into the engine (R1-3b,
-/// docs/banto-driver-api-design.md §6.4): the driver registry, the broker's
-/// protocol -> dial table, and the factory for direct collection clients.
+/// docs/banto-driver-api-design.md §6.4): the driver registry (which the
+/// broker dials through since R2b-3a-2) and the factory for direct
+/// collection clients.
 ///
 /// This crate never names a concrete driver: the composition root (the
 /// `banto-hub` bin, the shell, tests) builds this from
 /// `banto_drivers::builtin()` and hands it in through `HubConfig::drivers` /
 /// [`HubSessions::new`]. Cheap to clone.
 ///
-/// `registry` is `builtin().registry` (R1-4b: `modbus-tcp` / `slmp` as
-/// `HostBound` entries, the same ids as `broker`). R1 reads it nowhere on the
-/// production path (design §6.2: `broker.is_supported` stays the gate); only
-/// `banto-drivers`' tripwire tests do.
+/// `registry` is `builtin().registry` (`modbus-tcp` / `slmp` as session-type
+/// drivers since R2b-3a-2) plus the Hub's own host-provided protocols. Its
+/// session-type entries are exactly the broker-managed protocols
+/// ([`HubSessions::is_broker_managed`]); the former side table `broker`
+/// (`banto_broker::DriverTable`) is gone (docs/banto-hub-driver-io-design.md
+/// §4.2).
 #[derive(Clone)]
 pub struct HubDrivers {
     pub registry: Arc<DriverRegistry>,
-    pub broker: DriverTable,
+    /// R2b-3a-3 で消す（収集が broker の読み取りハンドルだけで読むようになったら要らない）。
     pub client_factory: banto_collect::ClientFactory,
 }
 
 impl HubDrivers {
     pub fn new(
         registry: Arc<DriverRegistry>,
-        broker: DriverTable,
         client_factory: banto_collect::ClientFactory,
     ) -> Self {
         Self {
             registry,
-            broker,
             client_factory,
         }
     }
 
-    /// No PLC drivers: an empty broker table (every connection is rejected as
+    /// No PLC drivers: no session-type entry in the registry (every PLC
+    /// connection is rejected by the broker as
     /// [`BrokerError::UnsupportedProtocol`]) and a client factory whose
     /// clients answer every call with [`PlcError::NotConnected`].
     ///
@@ -248,7 +259,6 @@ impl HubDrivers {
             .expect("the host-provided ids are distinct");
         Self {
             registry: Arc::new(registry),
-            broker: DriverTable::new(vec![]).expect("an empty driver table has no duplicates"),
             client_factory,
         }
     }
@@ -259,7 +269,6 @@ impl std::fmt::Debug for HubDrivers {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubDrivers")
             .field("registry", &self.registry)
-            .field("broker", &self.broker)
             .finish_non_exhaustive()
     }
 }
@@ -322,19 +331,30 @@ impl BrokerReadClient {
     }
 }
 
-/// Map one [`BatchReadResult`] (the broker's string-capable superset) back to
-/// the numeric-only [`ReadResult`] banto-collect's `PlcClient` trait speaks -
-/// see this module's doc comment ("Value type coverage") for why the `Str`
-/// arm is unreachable in practice but handled anyway.
-fn to_read_result(result: BatchReadResult) -> ReadResult {
+/// Map one broker result back to the numeric-only [`ReadResult`]
+/// banto-collect's `PlcClient` trait speaks - see this module's doc comment
+/// ("Value type coverage") for why the `Str` arm is unreachable in practice
+/// but handled anyway. A per-item [`ItemError`] becomes a per-request `Bad`
+/// (banto-collect records it as `Bad` quality and does not look inside).
+// R2b-3a-3 で消す（`CollectClient` が `Result<Value, ItemError>` をそのまま受ける）。
+fn to_read_result(result: Result<Value, ItemError>) -> ReadResult {
     match result {
-        BatchReadResult::Value(PlcValue::Bit(b)) => ReadResult::Value(TagValue::Bit(b)),
-        BatchReadResult::Value(PlcValue::F64(v)) => ReadResult::Value(TagValue::F64(v)),
-        BatchReadResult::Value(PlcValue::Str(_)) => ReadResult::Bad(PlcError::Protocol(
+        Ok(Value::Bit(b)) => ReadResult::Value(TagValue::Bit(b)),
+        Ok(Value::F64(v)) => ReadResult::Value(TagValue::F64(v)),
+        Ok(Value::Str(_)) => ReadResult::Bad(PlcError::Protocol(
             "broker から数値タグに対する予期しない文字列応答がありました".to_string(),
         )),
-        BatchReadResult::Bad(err) => ReadResult::Bad(err),
+        Err(err) => ReadResult::Bad(PlcError::Protocol(err.to_string())),
     }
+}
+
+/// The temporary conversion of this module's doc ("`ReadRequest` →
+/// `TagSpec`"): the request's address as the driver reports it, with the
+/// request's data type as the kind.
+// R2b-3a-3 で消す（収集の計画が `TagSpec` を作るようになったら要らない、設計 §4.3）。
+fn tag_spec_of(request: &ReadRequest) -> TagSpec {
+    let kind = TagKind::numeric(request.data_type);
+    TagSpec::new(request.address.to_driver_address(&kind), kind)
 }
 
 impl PlcClient for BrokerReadClient {
@@ -422,10 +442,11 @@ impl PlcClient for BrokerReadClient {
     }
 
     /// Every request in `requests` is numeric/bit (see this module's doc
-    /// comment) - wrapped as `BatchReadRequest::Numeric` and submitted to the
-    /// broker in one call, then unwrapped back to `ReadResult` in the same
-    /// order the broker guarantees (`banto_broker::BrokerHandle::read`'s doc:
-    /// results align 1:1 with the request `Vec`). A [`BrokerError`] of any
+    /// comment) - converted to a `TagSpec` (the temporary conversion, see the
+    /// module doc) and submitted to the broker in one call, then unwrapped
+    /// back to `ReadResult` in the same order the broker guarantees
+    /// (`banto_broker::BrokerHandle::read`'s doc: results align 1:1 with the
+    /// specs). A [`BrokerError`] of any
     /// variant - the session being down
     /// ([`BrokerError::Disconnected`]/[`BrokerError::ConnectionFailed`]) or
     /// the broker task itself having exited
@@ -439,11 +460,7 @@ impl PlcClient for BrokerReadClient {
         requests: &'a [ReadRequest],
     ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
         let handle = self.handle.clone();
-        let batch: Vec<BatchReadRequest> = requests
-            .iter()
-            .copied()
-            .map(BatchReadRequest::Numeric)
-            .collect();
+        let batch: Vec<TagSpec> = requests.iter().map(tag_spec_of).collect();
         Box::pin(async move {
             match handle.read(batch).await {
                 Ok(results) => Ok(results.into_iter().map(to_read_result).collect()),
@@ -524,10 +541,9 @@ impl PlcClient for BrokerReadClient {
 /// transition-lock discipline.
 pub struct HubSessions {
     directory: SessionDirectory,
-    /// The same [`DriverTable`] the supervisor below was spawned with (R1-3a,
-    /// docs/banto-driver-api-design.md §4.4) - kept here so
-    /// [`Self::is_broker_managed`] answers from exactly the table
-    /// [`Self::ensure_connection`] dispatches through.
+    /// The drivers the supervisor below dials through (its registry) - kept
+    /// here so [`Self::is_broker_managed`] answers from exactly the registry
+    /// [`Self::ensure_connection`] dispatches through (R2b-3a-2).
     drivers: HubDrivers,
     /// `Some` until [`Self::shutdown`] consumes it (`BrokerSupervisor::shutdown`
     /// takes `self` by value) - guarded by an async mutex rather than
@@ -548,7 +564,37 @@ impl HubSessions {
     /// R1-3b: the driver table comes from the composition root as part of
     /// `drivers` (docs/banto-driver-api-design.md §6.4), not from this crate.
     pub fn new(backoff: banto_broker::BackoffConfig, drivers: HubDrivers) -> Self {
-        let supervisor = BrokerSupervisor::spawn(&[], backoff, drivers.broker.clone())
+        Self::with_options(
+            drivers,
+            BrokerOptions {
+                backoff,
+                ..BrokerOptions::default()
+            },
+        )
+    }
+
+    /// As [`Self::new`], with the connections' secrets opened by `secrets`
+    /// just before each dial (R2b-3a-2, connection-settings design §3.5; the
+    /// runtime passes [`crate::secrets::ConnectionSecretOpener`]). Without it
+    /// a driver that needs a secret refuses to dial instead of dialing
+    /// without it.
+    pub fn with_secret_opener(
+        backoff: banto_broker::BackoffConfig,
+        drivers: HubDrivers,
+        secrets: Arc<dyn SecretOpener>,
+    ) -> Self {
+        Self::with_options(
+            drivers,
+            BrokerOptions {
+                backoff,
+                secrets,
+                ..BrokerOptions::default()
+            },
+        )
+    }
+
+    fn with_options(drivers: HubDrivers, options: BrokerOptions) -> Self {
+        let supervisor = BrokerSupervisor::spawn_with(&[], drivers.registry.clone(), options)
             .expect("spawning a broker supervisor with zero connections cannot fail");
         let directory = supervisor.directory();
         Self {
@@ -563,11 +609,34 @@ impl HubSessions {
     /// reject it with [`BrokerError::UnsupportedProtocol`]. The single source
     /// of truth for every "is this a broker-managed connection" gate in this
     /// crate (session sync in `CollectorManager`, the read-now and write
-    /// protocol gates, `/api/v1/status`) - R1-3a replaced the former free
-    /// function in `banto_broker` with this, answered from the same
-    /// [`DriverTable`] the supervisor dispatches through.
+    /// protocol gates, the connection test, `/api/v1/status`). Since R2b-3a-2
+    /// it is [`banto_broker::is_broker_managed`] over the registry the
+    /// supervisor dials through: the protocol has a session-type driver.
     pub fn is_broker_managed(&self, protocol: &str) -> bool {
-        self.drivers.broker.is_supported(protocol)
+        banto_broker::is_broker_managed(&self.drivers.registry, protocol)
+    }
+
+    /// The fingerprint a session dialed with `settings` for a `protocol`
+    /// connection carries ([`BrokerHandle::settings_fingerprint`]): the
+    /// settings without the driver's secret keys, plus the secret references
+    /// `saved` (the stored connection, if any) holds for them
+    /// ([`SettingsFingerprint::of_connection`]). `None` for a protocol the
+    /// broker does not manage. The connection test compares it with a live
+    /// session's to decide whether the session's reading answers the form.
+    pub fn dial_fingerprint(
+        &self,
+        protocol: &str,
+        saved: Option<&PlcConnection>,
+        settings: &Settings,
+    ) -> Option<SettingsFingerprint> {
+        if !self.is_broker_managed(protocol) {
+            return None;
+        }
+        Some(SettingsFingerprint::of_connection(
+            saved,
+            settings,
+            &secret_keys_of(&self.drivers.registry, protocol),
+        ))
     }
 
     /// The drivers this directory was built with (R1-3b).
@@ -582,6 +651,18 @@ impl HubSessions {
     /// see this struct's "Session sync policy" doc section.
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
         self.directory.ensure_connection(conn)
+    }
+
+    /// As [`Self::ensure_connection`], dialing with `settings` (what
+    /// [`BrokerSimRegistry::resolve`] returns: the connection's own settings,
+    /// or with `host` / `port` replaced by its simulator's, design §4.4).
+    pub fn ensure_connection_with_settings(
+        &self,
+        conn: &PlcConnection,
+        settings: Settings,
+    ) -> Result<BrokerHandle, BrokerError> {
+        self.directory
+            .ensure_connection_with_settings(conn, settings)
     }
 
     /// `connection_id` の broker セッションが既に生きていれば、その読み取り
@@ -705,15 +786,12 @@ impl HubSessions {
 /// へ改名した。以降のこの struct の doc comment は「SLMP 専用」ではなく
 /// 実際の挙動（任意の broker 管理対象プロトコル）を説明する。
 ///
-/// #605: broker セッションを捨てて作り直すかの比較キー。
-/// host/port が同じでも SLMP の CPU 種別が変わっていれば別セッションにする
-/// （`ensure_connection` は接続 id だけで既存セッションを再利用するため）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DialIdentity {
-    host: String,
-    port: i64,
-    /// `protocol == "slmp"` のとき `cpu_type`。それ以外は空文字。
-    slmp_cpu: String,
+/// `protocol` のドライバの秘密のキー（無ければ空）。
+fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
+    registry
+        .get(protocol)
+        .map(|entry| entry.base().secret_keys())
+        .unwrap_or_default()
 }
 
 /// [`HubSessions`] と対の
@@ -721,7 +799,9 @@ struct DialIdentity {
 /// `rebuild`を跨いで生存させ、プロセス終了時に一度だけ [`Self::shutdown`])
 /// を持つが、責務は独立: `HubSessions`は broker セッション自体を保持し、
 /// `BrokerSimRegistry`は「その broker セッションが実際にダイヤルすべき
-/// (host, port)」を、必要ならシミュレータを起動して差し替える。
+/// 設定（`Settings`）」を、必要ならシミュレータを起動して `host`/`port` を
+/// 差し替えて返す（R2b-3a-2、docs/banto-hub-driver-io-design.md §4.4。それまでは
+/// `(host, port)` を返し、broker のダイヤルに使う `PlcConnection` の列を差し替えていた）。
 ///
 /// ## なぜ`ensure_connection`より前に必要か
 ///
@@ -738,13 +818,14 @@ pub struct BrokerSimRegistry {
     /// 高々1個。[`Self::resolve`]が simulation フラグの on/off に応じて
     /// 起動・停止する。
     simulators: tokio::sync::Mutex<HashMap<i64, banto_collect::simulation::SimulatorHandle>>,
-    /// 各接続 id について直近に「実際にダイヤルした(host, port)」を記録する -
-    /// [`Self::resolve`]が「宛先が変わったか」を判定するための唯一の情報源。
-    /// エントリなし(`None`)は「初回」を意味し、常に "changed" 扱いになる。
-    /// 各接続 id について直近に解決した宛先。host/port に加え、SLMP のときは
-    /// CPU 種別も載せる（#605）。同じ IP・ポートで R→Q に変えても、ここが
-    /// 違えば `changed` になり、呼び出し側が古い broker セッションを捨てる。
-    last_target: tokio::sync::Mutex<HashMap<i64, DialIdentity>>,
+    /// 各接続 id について直近に解決した設定の指紋
+    /// （[`SettingsFingerprint`]、R2b-3a-2。#605 では host/port と SLMP の CPU
+    /// 種別だった）- [`Self::resolve`]が「ダイヤルの設定が変わったか」を判定する
+    /// ための唯一の情報源。エントリなし(`None`)は「初回」を意味し、常に
+    /// "changed" 扱いになる。同じ IP・ポートで CPU を R→Q に変えても、Modbus の
+    /// ユニット ID・ワード順を変えても、ここが違えば `changed` になり、呼び出し側が
+    /// 古い broker セッションを捨てる（プロトコルに依らない）。
+    last_target: tokio::sync::Mutex<HashMap<i64, SettingsFingerprint>>,
 }
 
 impl BrokerSimRegistry {
@@ -760,77 +841,70 @@ impl BrokerSimRegistry {
     }
 
     /// `conn`(broker が管理するプロトコルの接続 - 現状 slmp と
-    /// modbus-tcp)が実際にダイヤルすべき`(host, port)`を解決する。
+    /// modbus-tcp)が実際にダイヤルすべき設定（`Settings`）を解決する
+    /// （R2b-3a-2、docs/banto-hub-driver-io-design.md §4.4）。土台は接続の
+    /// `settings` を `banto_tags::settings_to_api` で直したもの（秘密の参照は
+    /// 入らない - 秘密は broker がダイヤルの直前にだけ開く）。
     ///
     /// - `conn.simulation == true` の場合: `conn.id`用のシミュレータが
-    ///   既に起動中ならそれを再利用し(`addr()`を返す)、なければ
-    ///   `conn.protocol`に応じたシミュレータ種別
-    ///   (`conn.protocol == "modbus-tcp"`なら`banto_collect::Protocol::ModbusTcp`、
-    ///   それ以外は従来どおり`banto_collect::Protocol::Slmp`)を
-    ///   `banto_collect::simulation::start`へ渡して新規に起動・登録する
-    ///   (#131、2026-09-01: この protocol 分岐が無いと、Modbus 接続の
-    ///   simulation=true が SLMP シミュレータへ誤って差し替わってしまう)。
+    ///   既に起動中ならそれを再利用し、なければ`conn.protocol`に応じた
+    ///   シミュレータ種別（`conn.protocol == "modbus-tcp"`なら
+    ///   `banto_collect::Protocol::ModbusTcp`、それ以外は
+    ///   `banto_collect::Protocol::Slmp`）を`banto_collect::simulation::start`
+    ///   へ渡して新規に起動・登録し、設定の `host`/`port` をそのループバックの
+    ///   アドレスに差し替える（#131、2026-09-01: この protocol 分岐が無いと、
+    ///   Modbus 接続の simulation=true が SLMP シミュレータへ誤って差し替わって
+    ///   しまう。シミュレータの選び方は R2b-5 まで名前で選ぶ - grep のテストの
+    ///   件数つきの例外）。
     /// - `conn.simulation == false` の場合: `conn.id`用のシミュレータが
-    ///   まだ追跡されていれば取り除いて停止する(もう不要なので)。
+    ///   まだ追跡されていれば取り除いて停止する(もう不要なので)。設定はそのまま。
     ///
-    /// いずれの場合も、有効な宛先を`crates/banto-collect/src/collector.rs`の
-    /// `plan_for_task`が使うのと同じ規約
-    /// (`cfg.host = addr.ip().to_string(); cfg.port = addr.port();`、ここでは
-    /// `PlcConnection::port`が`i64`であることに合わせてキャストする)で
-    /// 計算し、`last_target`に記録されている直前の値(`conn.id`が未記録なら
-    /// `None` = 常に「変わった」扱い)と比較して`changed`を求め、
-    /// `last_target`をこの新しい値で更新してから`(host, port, changed)`を
-    /// 返す。
+    /// いずれの場合も、返す設定の指紋（[`SettingsFingerprint`]）を
+    /// `last_target`に記録されている直前の値(`conn.id`が未記録なら`None` =
+    /// 常に「変わった」扱い)と比較して`changed`を求め、`last_target`を更新して
+    /// から`(設定, changed)`を返す。
     ///
     /// ## `changed`が重要な理由(ここが本体)
     ///
-    /// `banto_broker::SessionDirectory::ensure_connection`
-    /// (`crates/banto-broker/src/lib.rs`、545行目付近)は接続 id だけで
-    /// 既存セッションを再利用する実装になっている
-    /// (`if let Some(handle) = handles.get(&conn.id) { return Ok(handle.clone()); }`) -
-    /// 既にその id のセッションが生きていれば、host/port が変わっていても
-    /// 再ダイヤルも検知もしない。したがって呼び出し側
-    /// (`CollectorManager::sync_broker_sessions_from`)は、`resolve`が
-    /// `changed == true`を返すたびに、`ensure_connection`を呼ぶ*前*に必ず
-    /// [`HubSessions::remove`]`(conn.id)`を呼ばなければならない - そうしな
-    /// ければ`ensure_connection`は同じ id の古いセッション(シミュレーション
-    /// を切ったあとの実ホスト、あるいは前回のシミュレータインスタンスの
-    /// アドレスなど)へ黙って接続し続けてしまう。
+    /// `banto_broker::SessionDirectory::ensure_connection_with_settings` は
+    /// 接続 id だけで既存セッションを再利用する - 既にその id のセッションが
+    /// 生きていれば、設定が変わっていても再ダイヤルも検知もしない。したがって
+    /// 呼び出し側(`CollectorManager::sync_broker_sessions_from`)は、`resolve`が
+    /// `changed == true`を返すたびに、`ensure_connection_with_settings`を呼ぶ
+    /// *前*に必ず [`HubSessions::remove`]`(conn.id)`を呼ばなければならない -
+    /// そうしなければ古いセッション(シミュレーションを切ったあとの実ホスト、
+    /// 前回のシミュレータ、前の CPU 種別など)へ黙って接続し続けてしまう。
     ///
     /// **これだけでは実は不十分**(`crate::hub`のモジュール doc「SLMP 接続
-    /// 単位のシミュレーションモード」節参照、自前の E2E テストで発覚): broker
-    /// セッションを`HubSessions::remove`+`ensure_connection`で入れ替えても、
-    /// 既に動いている`banto_collect`側の収集タスクはその変化に気づかない
-    /// (タスクが起動時に捕まえた`ClientFactory`はタスクの生存期間を通じて
-    /// 固定 - `crate::hub::CollectorManager`は追加で
+    /// 単位のシミュレーションモード」節参照): broker セッションを入れ替えても、
+    /// 既に動いている`banto_collect`側の収集タスクはその変化に気づかない -
+    /// `crate::hub::CollectorManager`は追加で
     /// `banto_collect::CollectorConfig::set_broker_dial_target`を呼び、
     /// `Collector::apply_config`がこの接続を「replaced」に分類してタスクごと
-    /// 再起動するよう仕向けている。詳細は`set_broker_dial_target`自身の doc
-    /// comment、および`crate::hub`のモジュール doc参照)。
+    /// 再起動するよう仕向けている。
     ///
-    /// この仕組みはシミュレーションに限らない副次効果を持つ: 従来、同じ
-    /// 接続行の host/port を実際に編集しても(接続 id は変わらないので)
-    /// broker セッションは古いアドレスへ接続したまま再ダイヤルされない、
-    /// という既存の潜在的な不具合があった - 「直前のダイヤル先」を接続 id
-    /// ごとに記録・比較するこの仕組みは、その不具合も副次的に(正しく)
-    /// 修正する。これは回帰リスクではない:
-    /// `apps/banto-hub/host/tests/integration.rs`には「同じ接続の別グループ
-    /// へのタグ追加のような無関係な編集ではセッションを再生成しない」ことを
-    /// 保証するテストが既にあり、ダイヤル先が実際に変わっていない限り
-    /// `changed`は`false`のままであることを、この T9-2 のテスト
-    /// (`apps/banto-hub/host/tests/t9_simulation.rs`)でも同様に確認する。
-    pub async fn resolve(&self, conn: &PlcConnection) -> (String, i64, bool) {
+    /// 無関係な編集（同じ接続の別グループへのタグ追加など）では設定が変わらない
+    /// ので `changed` は `false` のまま（`apps/banto-hub/host/tests/integration.rs`・
+    /// `t9_simulation.rs`）。
+    ///
+    /// 指紋は broker のセッションと同じ規則（[`SettingsFingerprint::of_connection`]:
+    /// 秘密値の参照を含め、値は含めない）で、`registry` のドライバの秘密のキーで作る -
+    /// 秘密値を差し替える（新しい参照で封印し直す）と `changed` になり、セッションが
+    /// 張り直される。
+    pub async fn resolve(
+        &self,
+        conn: &PlcConnection,
+        registry: &DriverRegistry,
+    ) -> (Settings, bool) {
+        let mut settings = banto_tags::settings_to_api(&conn.settings);
         let mut simulators = self.simulators.lock().await;
-        let target = if conn.simulation {
+        if conn.simulation {
             let addr = match simulators.get(&conn.id) {
                 Some(handle) => handle.addr(),
                 None => {
                     // #131 (2026-09-01): select the simulator type from the
                     // connection's own protocol rather than hardcoding SLMP -
-                    // see this fn's doc comment. Defaulting anything other
-                    // than "modbus-tcp" to `Protocol::Slmp` preserves the
-                    // exact pre-#131 behavior for every caller that only ever
-                    // passed SLMP connections here.
+                    // see this fn's doc comment. Kept until R2b-5.
                     let protocol = if conn.protocol == "modbus-tcp" {
                         banto_collect::Protocol::ModbusTcp
                     } else {
@@ -842,31 +916,24 @@ impl BrokerSimRegistry {
                     addr
                 }
             };
-            (addr.ip().to_string(), addr.port() as i64)
-        } else {
-            if let Some(handle) = simulators.remove(&conn.id) {
-                handle.stop().await;
-            }
-            (conn.host.clone(), conn.port)
-        };
+            settings.insert(keys::HOST, addr.ip().to_string());
+            settings.insert(keys::PORT, addr.port().to_string());
+        } else if let Some(handle) = simulators.remove(&conn.id) {
+            handle.stop().await;
+        }
         drop(simulators);
 
+        // `settings_to_api` never carries a secret's value; the references
+        // come from the connection (the same rule as the broker's handle).
+        let fingerprint = SettingsFingerprint::of_connection(
+            Some(conn),
+            &settings,
+            &secret_keys_of(registry, &conn.protocol),
+        );
         let mut last_target = self.last_target.lock().await;
-        // #605: SLMP だけ CPU 種別を同一性に含める。Modbus のセッションは
-        // この列を使わないので、列の値が変わっても再接続しない。
-        let slmp_cpu = if conn.protocol == "slmp" {
-            conn.cpu_type.clone()
-        } else {
-            String::new()
-        };
-        let identity = DialIdentity {
-            host: target.0.clone(),
-            port: target.1,
-            slmp_cpu,
-        };
-        let changed = last_target.get(&conn.id) != Some(&identity);
-        last_target.insert(conn.id, identity);
-        (target.0, target.1, changed)
+        let changed = last_target.get(&conn.id) != Some(&fingerprint);
+        last_target.insert(conn.id, fingerprint);
+        (settings, changed)
     }
 
     /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
@@ -937,11 +1004,11 @@ impl Default for BrokerSimRegistry {
 /// through a 1-second reconnect/immediate-disconnect loop (observed with a
 /// TCP proxy). Sharing one session - which is the whole reason the broker
 /// exists ("読み書き単一セッション", §6-5) - is what fixes it, and Modbus
-/// needs no new machinery for it: the broker's `ModbusSession`
-/// implements `BrokerSession::read_batch` with the very same
+/// needs no new machinery for it: the broker's Modbus session
+/// (`crates/banto-driver-modbus/src/session.rs`, behind the driver API
+/// `Session` since R2b-3a-2) reads with the very same
 /// `plan_batch_requests` + `execute_modbus_reads` pair the direct
-/// `ModbusTcpClient` uses (`crates/banto-driver-modbus/src/session.rs`, moved
-/// out of `banto-broker` by R1-4a), so
+/// `ModbusTcpClient` uses, so
 /// coil/discrete-input/word-bit/32bit/64bit reads all decode identically.
 ///
 /// **The tradeoff this accepts**: collection reads and writes for one Modbus
@@ -999,23 +1066,7 @@ mod tests {
     }
 
     fn slmp_conn(id: i64, port: u16) -> PlcConnection {
-        PlcConnection {
-            id,
-            name: format!("conn-{id}"),
-            protocol: "slmp".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: port as i64,
-            unit_id: 1,
-            enabled: true,
-            simulation: false,
-
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: None,
-            username: None,
-            settings: Default::default(),
-            settings_version: 1,
-        }
+        crate::test_support::plc_conn(id, "slmp", port)
     }
 
     /// T15-4 の核心の単体テスト: `stop_and_join` 後、`write_handle_for` は
@@ -1066,10 +1117,7 @@ mod tests {
     }
 
     fn modbus_conn(id: i64, port: u16) -> PlcConnection {
-        PlcConnection {
-            protocol: "modbus-tcp".to_string(),
-            ..slmp_conn(id, port)
-        }
+        crate::test_support::plc_conn(id, "modbus-tcp", port)
     }
 
     // #605 `cpu_only_change_replaces_the_slmp_broker_session` は R2b-0 で

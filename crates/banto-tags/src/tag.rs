@@ -8529,7 +8529,7 @@ mod tests {
             let mut registry = DriverRegistry::new();
             for (id, lower) in [("modbus-tcp", false), ("slmp", true)] {
                 registry
-                    .register(DriverEntry::host_bound(Arc::new(CanonDriver {
+                    .register(DriverEntry::host_provided(Arc::new(CanonDriver {
                         descriptor: descriptor(id),
                         lower,
                     })))

@@ -1,15 +1,28 @@
 //! R2b-1d（docs/banto-hub-connection-settings-design.md §4.2・§8 の 10）／R2b-2b
 //! （docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が旧規則で書けないことを、
 //! ソースの grep で固定する。R2b-2c でアドレスの解析の 2 つ（`Address::parse(`・
-//! `parse_slmp(`）を足した。見るのは次の 5 つ（`NEEDLES`）:
+//! `parse_slmp(`）を、R2b-3a-2（docs/banto-hub-driver-io-design.md §4.2）で broker の
+//! 旧い要求の型と橋（`BatchReadRequest`・`BatchWriteRequest`・`from_driver_address`・
+//! `banto_plc::Address`・`to_driver_address(`）とプロトコルの名前での比較
+//! （`conn.protocol == "slmp"`・`conn.protocol == "modbus-tcp"`）を足した。見るのは
+//! `NEEDLES` の全部:
 //!
 //! - `PlcConnectionService::new(`（R2b-1d: `ALLOWED_PROTOCOLS` と手書きの検証）
 //! - `TagService::new(`（R2b-2b: アドレスを綴りのまま保存する旧規則）
 //! - `CollectionGroupService::new(`（R2b-2b: グループの移動で配下のタグを解析し直さない旧規則）
 //! - `Address::parse(`・`parse_slmp(`（R2b-2c: アドレスをプロトコルの名前で選んだ文法で解析する
-//!   旧規則。計画・即時の読み書きはレジストリのドライバの `parse_address` + 橋
-//!   `Address::from_driver_address` を使う。`EXCEPTIONS` の固定のリテラルだけが例外で、
-//!   例外は (needle, ファイル) ごとに**件数まで固定**する。増えても減ってもテストが落ちる）
+//!   旧規則。計画・即時の読み書き・接続テストはレジストリのドライバの `parse_address`
+//!   を使う。R2b-3a-2 で接続テストの固定のリテラル `40001`・`D0` の例外を外した:
+//!   読む 1 点はドライバの `probe()`）
+//! - `BatchReadRequest`・`BatchWriteRequest`（R2b-3a-2: broker の要求は `TagSpec` /
+//!   `WriteItem`）、`from_driver_address`・`banto_plc::Address`（R2b-3a-2: ドライバへは
+//!   `DriverAddress` をそのまま渡す。`Address` へ戻さない）、`to_driver_address(`
+//!   （R2b-3a-2 の一時の変換。`BrokerReadClient` の 1 か所だけを件数つきで許し、3a-3 で消す）
+//! - `conn.protocol == "slmp"`（#605 の CPU を同一性に入れる分岐。R2b-3a-2 で設定の指紋に
+//!   した）・`conn.protocol == "modbus-tcp"`（シミュレータの種類を名前で選ぶ分岐。R2b-5 まで
+//!   `broker_glue.rs` の 1 か所だけを件数つきで許す）
+//!
+//! 例外は (needle, ファイル) ごとに**件数まで固定**する。増えても減ってもテストが落ちる。
 //!
 //! Hub は `TagRegistryState`・MCP の状態・`PendingChangesAdminState`・予約接続
 //! （`runtime::ensure_virtual_connection`）・移行の preflight（`upgrade`）・即時の読み書き
@@ -38,11 +51,39 @@ const NEEDLES: &[(&str, &str)] = &[
     ),
     (
         "Address::parse(",
-        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+        "レジストリのドライバの `parse_address`（`read_path::resolve_plc_address`）",
     ),
     (
         "parse_slmp(",
-        "レジストリのドライバの `parse_address` + `Address::from_driver_address`（`read_path::resolve_plc_address`）",
+        "レジストリのドライバの `parse_address`（`read_path::resolve_plc_address`）",
+    ),
+    (
+        "BatchReadRequest",
+        "`banto_driver_api::TagSpec`（broker の要求、R2b-3a-2）",
+    ),
+    (
+        "BatchWriteRequest",
+        "`banto_driver_api::WriteItem`（broker の要求、R2b-3a-2）",
+    ),
+    (
+        "from_driver_address",
+        "ドライバの `DriverAddress` をそのまま `TagSpec` に（R2b-3a-2）",
+    ),
+    (
+        "banto_plc::Address",
+        "ドライバの `DriverAddress`（`read_path::resolve_plc_address`、R2b-3a-2）",
+    ),
+    (
+        "to_driver_address(",
+        "`TagSpec`（R2b-3a-2 の一時の変換は `BrokerReadClient` の 1 か所だけ）",
+    ),
+    (
+        "conn.protocol == \"slmp\"",
+        "`banto_broker::SettingsFingerprint`（設定の指紋、R2b-3a-2）",
+    ),
+    (
+        "conn.protocol == \"modbus-tcp\"",
+        "レジストリのドライバ（シミュレータの種類だけ R2b-5 まで例外）",
     ),
 ];
 
@@ -51,16 +92,16 @@ const NEEDLES: &[(&str, &str)] = &[
 /// ならない。増えたら新しい呼び出しが紛れ込んでおり、減ったら例外を下げる／外す。
 const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[
     (
-        "Address::parse(",
-        "core/src/rest/plc_connections.rs",
-        2,
-        "HostBound の接続テストの固定のリテラル（`40001`）。R2b-3 で消える",
+        "to_driver_address(",
+        "core/src/broker_glue.rs",
+        1,
+        "`BrokerReadClient` の一時の変換 `ReadRequest` → `TagSpec`。R2b-3a-3 で消す",
     ),
     (
-        "parse_slmp(",
-        "core/src/rest/plc_connections.rs",
-        2,
-        "HostBound の接続テストの固定のリテラル（`D0`）。R2b-3 で消える",
+        "conn.protocol == \"modbus-tcp\"",
+        "core/src/broker_glue.rs",
+        1,
+        "`BrokerSimRegistry::resolve` のシミュレータの種類の選択。R2b-5 で消す",
     ),
 ];
 
@@ -241,10 +282,12 @@ fn the_needles_do_not_overlap() {
 /// R2b-2c: the immediate read / write paths no longer choose an address grammar by
 /// protocol name. (`"modbus-tcp" =>` as a match arm; the protocol gate is
 /// `HubSessions::is_broker_managed`, not a literal.) Comments are not scanned.
+/// R2b-3a-2: the connection test (`rest/plc_connections.rs`) joined them - it
+/// used to dispatch `"modbus-tcp" =>` / `"slmp" =>` to two protocol-specific tests.
 #[test]
 fn read_and_write_paths_have_no_protocol_name_match_arm() {
     let core = Path::new(env!("CARGO_MANIFEST_DIR")).join("../core/src");
-    for name in ["read_path.rs", "write_path.rs"] {
+    for name in ["read_path.rs", "write_path.rs", "rest/plc_connections.rs"] {
         let text = std::fs::read_to_string(core.join(name)).expect("read a source file");
         let offenders = offending_lines(&text, "\"modbus-tcp\" =>");
         assert!(
@@ -259,17 +302,73 @@ fn read_and_write_paths_have_no_protocol_name_match_arm() {
 /// file, or the same needle elsewhere, is still an offence. The allowed count is pinned.
 #[test]
 fn exceptions_are_per_needle_and_per_file() {
-    // `rest/tags.rs` の例外は R2b-2d（`address-writable` の削除）で外した。
-    let tags = Path::new("/x/core/src/rest/tags.rs");
-    assert_eq!(allowed_count("Address::parse(", tags), None);
-    assert_eq!(allowed_count("parse_slmp(", tags), None);
+    // `rest/tags.rs` の例外は R2b-2d（`address-writable` の削除）で、
+    // `rest/plc_connections.rs` の例外（接続テストの固定のリテラル）は R2b-3a-2 で外した。
+    for file in [
+        "/x/core/src/rest/tags.rs",
+        "/x/core/src/rest/plc_connections.rs",
+    ] {
+        let file = Path::new(file);
+        assert_eq!(allowed_count("Address::parse(", file), None);
+        assert_eq!(allowed_count("parse_slmp(", file), None);
+    }
     assert_eq!(
         allowed_count("Address::parse(", Path::new("/x/core/src/read_path.rs")),
         None
     );
-    let plc = Path::new("/x/core/src/rest/plc_connections.rs");
-    assert_eq!(allowed_count("Address::parse(", plc), Some(2));
-    assert_eq!(allowed_count("parse_slmp(", plc), Some(2));
+    let glue = Path::new("/x/core/src/broker_glue.rs");
+    assert_eq!(allowed_count("to_driver_address(", glue), Some(1));
+    assert_eq!(
+        allowed_count("conn.protocol == \"modbus-tcp\"", glue),
+        Some(1)
+    );
+    assert_eq!(allowed_count("conn.protocol == \"slmp\"", glue), None);
+    assert_eq!(allowed_count("banto_plc::Address", glue), None);
+    assert_eq!(
+        allowed_count("to_driver_address(", Path::new("/x/core/src/read_path.rs")),
+        None
+    );
+}
+
+/// R2b-3a-2: `use banto_plc::{..}` の中の `Address` も旧い要求の型の名前（needle の
+/// `banto_plc::Address` は `{` の中を見ないので、ここで見る）。
+#[test]
+fn hub_non_test_code_does_not_import_banto_plc_address() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    for dir in ["core/src", "host/src", "src-tauri/src"] {
+        let dir = root.join(dir);
+        if dir.is_dir() {
+            sources(&dir, &mut files);
+        }
+    }
+    let mut offenders = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read a source file");
+        for line in offending_lines(&text, "use banto_plc::{") {
+            // The import list runs to the first `}` (rustfmt keeps it on one
+            // statement).
+            let lines: Vec<&str> = text.lines().collect();
+            let mut list = String::new();
+            for l in &lines[line - 1..] {
+                list.push_str(l);
+                if l.contains('}') {
+                    break;
+                }
+            }
+            if list
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .any(|token| token == "Address")
+            {
+                offenders.push(format!("{}:{line}", file.display()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "banto-hub の非テストのコードが `banto_plc::Address` を import しています:\n{}",
+        offenders.join("\n")
+    );
 }
 
 /// The exception count is pinned: equal passes, more lists every line, fewer asks to

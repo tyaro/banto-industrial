@@ -1787,7 +1787,7 @@ fn finish_request(parsed: Address, data_type: &str) -> Result<ReadRequest, TagAd
 /// R2b-2c (docs/banto-hub-driver-address-design.md §4.2): the registry-carrying
 /// builds (banto-hub) read a tag's address through the connection's *driver*
 /// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and bring the
-/// result back to a [`ReadRequest`] over the HostBound bridge
+/// result back to a [`ReadRequest`] over the bridge (kept until R2b-3a-3)
 /// ([`Address::from_driver_address`]). A refusal at either step is the tag's
 /// own [`TagAddressIssue::InvalidAddress`] carrying the driver's message, so
 /// the tag alone is left out. The registry-free builders keep
@@ -1808,6 +1808,8 @@ fn build_request_with_registry(
         .base()
         .parse_address(tag.address.trim(), &kind)
         .map_err(|err| invalid(err.message().to_string()))?;
+    // R2b-3a-3 で消す: 計画が `TagSpec` を作るようになったら橋は要らない
+    // （docs/banto-hub-driver-io-design.md §4.3）。
     let parsed =
         Address::from_driver_address(&driver_address).map_err(|err| invalid(err.to_string()))?;
     finish_request(parsed, &tag.data_type)

@@ -650,12 +650,12 @@ name = "banto-broker"
 version = "0.2.0-alpha.35"
 dependencies = [
  "banto-driver-api",
- "banto-plc",
- "banto-plc-write",
  "banto-tags",
  "futures-util",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]
@@ -731,6 +731,7 @@ dependencies = [
  "banto-plc",
  "banto-plc-write",
  "banto-tags",
+ "serde_json",
  "tokio",
 ]
 
@@ -744,6 +745,7 @@ dependencies = [
  "banto-plc",
  "banto-plc-write",
  "banto-tags",
+ "serde_json",
  "slmp",
  "tokio",
 ]
@@ -762,6 +764,7 @@ dependencies = [
  "banto-plc-write",
  "banto-storage",
  "banto-tags",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

@@ -9,12 +9,14 @@
 use super::{
     commit_catalog_and_notify, default_payload_enabled, json, preflight_transaction,
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
-    reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, Address,
-    ApiError, BantoError, BatchReadRequest, BatchReadResult, BrokerError, CollectorManager,
-    DataType, Deserialize, Duration, FieldError, HeaderMap, IntoResponse, Json, ModbusTcpClient,
-    ModbusTcpConfig, Path, PlcClient, PlcConnection, PlcConnectionInput, PlcError, ReadRequest,
-    ReadResult, RegistryMutationError, RegistryMutationResult, Response, Serialize, SlmpClient,
-    SlmpConfig, State, StatusCode, TagRegistryState,
+    reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, ApiError,
+    BantoError, BrokerConnectionStatus, BrokerError, CollectorManager, Deserialize, Duration,
+    FieldError, HeaderMap, IntoResponse, Json, Path, PlcConnection, PlcConnectionInput,
+    RegistryMutationError, RegistryMutationResult, Response, Serialize, State, StatusCode,
+    TagRegistryState,
+};
+use banto_driver_api::{
+    keys, ConnectContext, DriverKind, FatalError, ItemError, Settings, TagSpec, Value,
 };
 
 fn default_plc_protocol() -> String {
@@ -750,21 +752,25 @@ pub(super) async fn plc_connections_test_saved(
 // 制約が生じる(2026-09-08 オーナー決定)。そのため、保存済み接続
 // (`connectionId`あり)のテストはプロトコルを問わず、既存の broker
 // セッションが生きていればそれを再利用して読み、無い場合のみ直接ダイヤル
-// する([`test_slmp_connection`]/[`test_modbus_connection`]参照)。
+// する([`test_connection`]参照)。
+//
+// R2b-3a-2(docs/banto-hub-driver-io-design.md §4.2・Q11): プロトコル別の
+// `test_modbus_connection`/`test_slmp_connection`(`ModbusTcpClient`/
+// `SlmpClient` を直接ダイヤルし、固定のリテラル `40001`/`D0` を読む)を
+// ドライバに依らない [`test_connection`] にまとめた。読む 1 点はドライバの
+// `DriverBase::probe()`、ダイヤルはレジストリのセッション型のドライバの
+// `connect`、収集中のセッションを使ってよいかは設定の指紋で見る
+// (#605 の CPU 種別の照合を、どの設定にも広げたもの)。
 
 /// 接続テストの疎通確認に使うタイムアウト(接続・応答とも共通)。数秒固定
 /// (ux-plan.md §4「タイムアウトは短め（数秒）に固定」)。
 const PLC_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Modbus 直接ダイヤル失敗時に付けるセッション上限ヒント - 「軽く付けてよい」
-/// 扱い(実機依存が明確でないため断定しない)。
-const MODBUS_SESSION_HINT: &str =
-    " 対象PLCが既に別セッションと接続中の場合、機種によっては同時接続数の上限により失敗することがあります。";
-
-/// SLMP 直接ダイヤル失敗時に付けるセッション上限ヒント - 実機 R08ENCPU で
-/// 「対象ポートが既に別の接続で使用中」だと2本目を受け付けない実測がある
-/// ため必須ヒントとする。
-const SLMP_SESSION_HINT: &str = " 対象ポートが既に別の接続(この hub の収集や他アプリ)で使用中の可能性があります。SLMPは同一ポートへの2本目の接続を受け付けないことがあります(実機R08ENCPUで確認済み)。";
+/// 直接ダイヤル失敗時(`tcp`・`timeout`)に付けるセッション上限ヒント。
+/// R2b-3a-2 でプロトコル別の 2 つ(Modbus・SLMP)を 1 つにまとめた: 実機
+/// R08ENCPU は対象ポートが既に使用中だと 2 本目を受け付けず、KM-D1-ETN のような
+/// 1 対 1 の機器も同じ(このファイルの上の「重要な制約」)。
+const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(この hub の収集や他アプリ)で使用中の可能性があります。機器によっては同じポートへの2本目の接続を受け付けません(SLMP の実機 R08ENCPU・Modbus の KM-D1-ETN で確認済み)。";
 
 /// `POST /api/plc-connections/test` のリクエストボディ - 保存前のフォーム値を
 /// そのまま受け取る(`PlcConnectionPayload`とは別型: 接続 id を持たないのが
@@ -791,11 +797,13 @@ pub struct PlcConnectionTestPayload {
     /// ため)。
     #[serde(default)]
     pub connection_id: Option<i64>,
-    /// #605: 直接ダイヤルの SLMP フレームに使う CPU 種別。省略・`"R"` は
-    /// iQ-R、`"Q"` は Q シリーズ。未知の値はダイヤルせず失敗にする。
-    /// 既存セッションを再利用する経路で、保存済みセッションの CPU と食い違う
-    /// ときは試さずに「保存してからテストしてください」と返す（2 本目の TCP を
-    /// 張らない既存の制約があるため、直接ダイヤルには切り替えない）。
+    /// #605: 直接ダイヤルの SLMP フレームに使う CPU 種別。省略は保存済みの値
+    /// (無ければドライバの既定 = iQ-R)、`"Q"` は Q シリーズ。未知の値は
+    /// ドライバの `validate_config` が断り、ダイヤルしない。既存セッションを
+    /// 再利用する経路で、保存済みセッションの設定と食い違うときは試さずに
+    /// 「保存してからテストしてください」と返す（2 本目の TCP を張らない既存の
+    /// 制約があるため、直接ダイヤルには切り替えない。R2b-3a-2 から CPU に限らず
+    /// 設定の指紋で比べる）。
     #[serde(default)]
     pub cpu_type: Option<String>,
 }
@@ -819,413 +827,314 @@ pub struct PlcConnectionTestError {
     pub message: String,
 }
 
-/// #605: 接続テストの直接ダイヤルが使う CPU。省略・空・`"R"` は iQ-R、
-/// `"Q"` は Q シリーズ。それ以外はダイヤルせずエラーにする
-/// （収集側の「手編集行は R に倒す」とは違い、画面から来た未知の値は拒否する）。
-fn slmp_cpu_from_test_payload(
-    cpu_type: &Option<String>,
-) -> Result<banto_plc::SlmpCpu, PlcConnectionTestError> {
-    match cpu_type.as_deref() {
-        None | Some("") | Some("R") => Ok(banto_plc::SlmpCpu::R),
-        Some("Q") => Ok(banto_plc::SlmpCpu::Q),
-        Some(other) => Err(PlcConnectionTestError {
-            kind: "protocol".to_string(),
-            message: format!("CPU種別が不正です（Q または R を指定してください）: {other}"),
-        }),
+fn test_error(kind: &str, message: impl Into<String>) -> PlcConnectionTestError {
+    PlcConnectionTestError {
+        kind: kind.to_string(),
+        message: message.into(),
     }
 }
 
-/// [`PlcError`]を[`PlcConnectionTestError`]に分類する(Modbus・SLMP直接
-/// ダイヤル共用、`crates/banto-plc/src/error.rs`の各バリアント参照)。
-/// `hint`が`Some`のとき、分類結果の`kind`が`"tcp"`または`"timeout"`のときだけ
-/// 末尾に付加する(それ以外の kind には無関係な文言なので付けない) -
-/// 呼び出し側は「セッション上限ヒントを付けたい経路」でだけ`Some`を渡す。
-/// broker 経由の既存セッション再利用経路(`test_slmp_connection`の前半)は
-/// このヒントが無関係( 「2本目をダイヤルしない」ことそのものが対策なので)
-/// なので常に`None`を渡す。
-fn classify_plc_error(err: &PlcError, hint: Option<&str>) -> PlcConnectionTestError {
-    let (kind, message) = match err {
-        PlcError::ConnectTimeout(_) => (
+/// 接続の段で起きた致命のエラー([`FatalError`])を [`PlcConnectionTestError`] に
+/// 分類する(R2b-3a-2: プロトコル別の `PlcError` の分類から置き換えた)。
+/// `connecting` は接続の段か(時間切れの文言を分ける)。`hint` が `Some` の
+/// とき、`kind` が `"tcp"`・`"timeout"` のときだけ末尾に付ける - 呼び出し側は
+/// 「セッション上限ヒントを付けたい経路」(直接ダイヤル)でだけ `Some` を渡す。
+/// 既存セッションの再利用の経路は「2 本目をダイヤルしない」こと自体が対策
+/// なので常に `None`。
+fn classify_fatal(
+    err: &FatalError,
+    connecting: bool,
+    hint: Option<&str>,
+) -> PlcConnectionTestError {
+    let (kind, mut message) = match err {
+        FatalError::Timeout if connecting => (
             "timeout",
             "接続タイムアウトです(3秒)。ホスト/ポート、ネットワーク到達性を確認してください。"
                 .to_string(),
         ),
-        PlcError::ResponseTimeout => (
+        FatalError::Timeout => (
             "timeout",
             "応答タイムアウトです(3秒)。接続はできましたが応答がありませんでした。".to_string(),
         ),
-        PlcError::Connection(msg) => (
+        FatalError::Io(msg) => (
             "tcp",
             format!("TCP接続に失敗しました(ポートが閉じている、または到達できません): {msg}"),
         ),
-        PlcError::Protocol(msg) => (
+        FatalError::Framing(msg) | FatalError::Protocol(msg) => (
             "protocol",
             format!(
                 "プロトコルエラー: 応答が不正です({msg})。プロトコル選択やポート番号が実機と一致しているか確認してください。"
             ),
         ),
-        PlcError::ModbusException { message, .. } | PlcError::SlmpEndCode { message, .. } => (
-            "device",
-            format!(
-                "デバイス読み出しエラー: 接続はできましたが、指定したデバイス/レジスタを読み出せませんでした({message})。アドレス設定や機種依存の可能性があります(致命的ではありません)。"
-            ),
-        ),
-        // NotConnected / InvalidAddress / AddressProtocolMismatch /
-        // UnsupportedCombination / StringSpanUnsupported - このAPIは固定
-        // アドレス("40001"/"D0")しか使わないので通常発生しない防御的ケース。
-        other => ("device", format!("読み出しに失敗しました: {other}")),
+        FatalError::InvalidConfig(msg) => ("protocol", format!("接続設定が不正です: {msg}")),
+        other => ("protocol", other.to_string()),
     };
-    let mut message = message;
     if matches!(kind, "tcp" | "timeout") {
         if let Some(hint) = hint {
             message.push_str(hint);
         }
     }
-    PlcConnectionTestError {
-        kind: kind.to_string(),
-        message,
+    test_error(kind, message)
+}
+
+/// 読む 1 点のタグごとのエラー([`ItemError`])の分類。接続はできている。
+fn classify_item(err: &ItemError) -> PlcConnectionTestError {
+    match err {
+        ItemError::Device(device) => test_error(
+            "device",
+            format!(
+                "デバイス読み出しエラー: 接続はできましたが、指定したデバイス/レジスタを読み出せませんでした({device})。アドレス設定や機種依存の可能性があります(致命的ではありません)。"
+            ),
+        ),
+        other => test_error("device", format!("読み出しに失敗しました: {other}")),
     }
 }
 
-/// Modbus TCP の接続テスト。`payload.connection_id`があり、その接続の broker
-/// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
-/// [`test_slmp_connection`]と同じ対策)。無ければ直接ダイヤルにフォールバック
-/// する(ポート/ユニットIDの範囲検証 → `ModbusTcpClient::connect` → 保持
-/// レジスタ先頭1点の`read_batch` → 必ず`disconnect`、の順)。
+/// 試す設定(R2b-3a-2): フォームの値を接続の `settings` の形にしたもの
+/// (`settings_from_flat` → `settings_to_api`、保存と同じ写し)。フォームが
+/// 送らない欄(`wordOrder`、省略した `cpuType`)は、保存済みの接続(`connectionId`
+/// があり、同じプロトコル)の値を使う - 「省略は保存済みのまま」(#605 の CPU の
+/// 照合の規則を全部の欄に広げたもの)。保存済みが無ければその欄は置かない
+/// (ドライバの既定)。保存済みの接続も返す(指紋に入る秘密値の参照の出どころ)。
+async fn requested_settings(
+    manager: &CollectorManager,
+    payload: &PlcConnectionTestPayload,
+) -> (Settings, Option<PlcConnection>) {
+    let saved = match payload.connection_id {
+        Some(id) => manager
+            .plc_connections()
+            .get(id)
+            .await
+            .ok()
+            .filter(|conn| conn.protocol == payload.protocol),
+        None => None,
+    };
+    let cpu_type = payload
+        .cpu_type
+        .clone()
+        .filter(|cpu| !cpu.is_empty())
+        .or_else(|| saved.as_ref().map(|conn| conn.cpu_type.clone()));
+    let input = PlcConnectionInput {
+        name: String::new(),
+        protocol: payload.protocol.clone(),
+        host: payload.host.clone(),
+        port: payload.port,
+        unit_id: payload.unit_id,
+        enabled: true,
+        simulation: false,
+        word_order: saved
+            .as_ref()
+            .map(|conn| conn.word_order.clone())
+            .unwrap_or_default(),
+        cpu_type,
+        database: None,
+        username: None,
+        secrets: Default::default(),
+        settings: None,
+    };
+    let mut map = banto_tags::settings_json::legacy::settings_from_flat(&input);
+    if map
+        .get(keys::WORD_ORDER)
+        .and_then(|v| v.as_str())
+        .is_some_and(str::is_empty)
+    {
+        map.remove(keys::WORD_ORDER);
+    }
+    (banto_tags::settings_to_api(&map), saved)
+}
+
+/// ドライバの `validate_config` が断った設定を、ダイヤルせずに返す。接続先の
+/// 欄(`host`・`port`・`unit_id`)は従来の直接ダイヤルの範囲検査と同じ
+/// `"tcp"`、それ以外(CPU 種別など)は `"protocol"`。
+fn refused_settings(errors: &[banto_driver_api::FieldError]) -> PlcConnectionTestError {
+    let kind = if errors
+        .iter()
+        .all(|e| matches!(e.key.as_str(), keys::HOST | keys::PORT | keys::UNIT_ID))
+    {
+        "tcp"
+    } else {
+        "protocol"
+    };
+    let detail = errors
+        .iter()
+        .map(|e| format!("{}: {}", e.key, e.message))
+        .collect::<Vec<_>>()
+        .join("、");
+    test_error(kind, format!("接続設定が不正です({detail})。"))
+}
+
+/// ドライバが名乗る読む 1 点([`banto_driver_api::DriverBase::probe`])を、
+/// そのドライバの文法で [`TagSpec`] にする。`None` は「読まずに接続だけ確かめる」。
+fn probe_spec(
+    base: &dyn banto_driver_api::DriverBase,
+) -> Result<Option<TagSpec>, PlcConnectionTestError> {
+    let Some((text, kind)) = base.probe() else {
+        return Ok(None);
+    };
+    let address = base.parse_address(&text, &kind).map_err(|err| {
+        test_error(
+            "protocol",
+            format!("ドライバの接続テストの読み取り点 {text:?} を解釈できません: {err}"),
+        )
+    })?;
+    Ok(Some(TagSpec::new(address, kind)))
+}
+
+/// 読む 1 点の結果(1 件)を接続テストの結果にする。
+fn probe_outcome(results: Vec<Result<Value, ItemError>>) -> (bool, Option<PlcConnectionTestError>) {
+    match results.into_iter().next() {
+        Some(Ok(_)) => (true, None),
+        Some(Err(err)) => (false, Some(classify_item(&err))),
+        None => (
+            false,
+            Some(test_error("device", "読み出し結果が空でした。")),
+        ),
+    }
+}
+
+/// 接続テストの本体(R2b-3a-2、docs/banto-hub-driver-io-design.md Q11)。
+/// プロトコルに依らない:
 ///
-/// 2026-09-08 オーナー決定: #337 で Modbus TCP の収集読み取りも broker
-/// セッションへ相乗りするようになり、Modbus も1接続=1ソケットになった。
-/// SLMP の R08ENCPU と同様、1対1接続しか受け付けない機器(オムロン
-/// KM-D1-ETN、KANC-718B 12-1、#337 参照)では、収集稼働中に接続テストを
-/// 押すと2本目のダイヤルが拒否され、収集は正常なのに「失敗」と誤診断
-/// されていた。SLMP と同じセッション再利用へ揃えてこれを解消する。
-async fn test_modbus_connection(
+/// 1. 試す設定を作る([`requested_settings`])。
+/// 2. `payload.connection_id` があり、その接続の broker セッションが既に
+///    生きていれば、それを再利用して読む(新規ダイヤルしない - 実機 R08ENCPU・
+///    KM-D1-ETN は対象ポートが既に使用中だと 2 本目を受け付けないため、これを
+///    誤診しないための対策。このファイルの上のコメント参照)。ただし、
+///    セッションの設定の指紋([`banto_broker::BrokerHandle::settings_fingerprint`]、
+///    いま読む handle 自身が作成時に持っていたもの)が試す設定の指紋と違えば、
+///    セッションの読みはフォームの値を試したことにならないので、試さずに
+///    「保存してからテストしてください」と返す(#605 の CPU 種別の照合を
+///    全部の設定に広げたもの)。
+/// 3. 無ければ直接ダイヤルする: レジストリのセッション型のドライバで
+///    `validate_config` → `connect`(接続・応答の時間切れは
+///    [`PLC_TEST_TIMEOUT`]、外側にも上限)→ ドライバの読む 1 点を
+///    `read_batch`(外側の上限は broker と同じ式)→ 必ず `disconnect`。
+async fn test_connection(
     manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {
-    if let Some(connection_id) = payload.connection_id {
-        if let Some(handle) = manager.sessions().handle_for(connection_id) {
-            let requests = vec![BatchReadRequest::Numeric(ReadRequest {
-                address: Address::parse("40001").expect("valid literal"),
-                data_type: DataType::U16,
-            })];
-            // `ReadOnlyHandle::read`自体には外側タイムアウトが無いため、
-            // ここで明示的に包む(`test_slmp_connection`と同じ)。
-            return match tokio::time::timeout(PLC_TEST_TIMEOUT, handle.read(requests)).await {
-                Err(_elapsed) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "timeout".to_string(),
-                        message: "応答タイムアウトです(3秒)。共有セッションが応答しませんでした。"
-                            .to_string(),
-                    }),
-                ),
-                Ok(Err(BrokerError::Disconnected { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。"
-                            .to_string(),
-                    }),
-                ),
-                Ok(Err(BrokerError::ConnectionFailed { reason, .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: format!("共有セッションが接続断で失敗しました: {reason}"),
-                    }),
-                ),
-                Ok(Err(BrokerError::TaskGone { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: "内部エラー: セッションタスクが終了しています。".to_string(),
-                    }),
-                ),
-                // 防御的フォールバック: この経路では通常発生しない
-                // (UnsupportedProtocol/InvalidPortはensure_connection時点で
-                // 弾かれているはず)。
-                Ok(Err(err @ BrokerError::UnsupportedProtocol { .. }))
-                | Ok(Err(err @ BrokerError::InvalidPort { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "protocol".to_string(),
-                        message: err.to_string(),
-                    }),
-                ),
-                // 既存セッション再利用経路: セッション上限ヒントは付けない
-                // (design の意図: 「2本目をダイヤルしない」こと自体が対策)。
-                Ok(Ok(mut results)) => match results.pop() {
-                    Some(BatchReadResult::Value(_)) => (true, None),
-                    Some(BatchReadResult::Bad(err)) => {
-                        (false, Some(classify_plc_error(&err, None)))
-                    }
-                    None => (
-                        false,
-                        Some(PlcConnectionTestError {
-                            kind: "device".to_string(),
-                            message: "読み出し結果が空でした。".to_string(),
-                        }),
-                    ),
-                },
-            };
-        }
-    }
-
-    // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
-    let port = match u16::try_from(payload.port) {
-        Ok(port) => port,
-        Err(_) => {
-            return (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "tcp".to_string(),
-                    message: "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
-                }),
-            );
-        }
-    };
-    let unit_id = match u8::try_from(payload.unit_id) {
-        Ok(unit_id) => unit_id,
-        Err(_) => {
-            return (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "tcp".to_string(),
-                    message: "ユニットID(スレーブID)が不正です(0〜255の範囲で指定してください)。"
-                        .to_string(),
-                }),
-            );
-        }
-    };
-
-    let config = ModbusTcpConfig {
-        host: payload.host.clone(),
-        port,
-        unit_id,
-        connect_timeout: PLC_TEST_TIMEOUT,
-        response_timeout: PLC_TEST_TIMEOUT,
-        ..Default::default()
-    };
-    let mut client = ModbusTcpClient::new(config);
-
-    if let Err(err) = client.connect().await {
+    let registry = manager.registry();
+    let Some(driver) = registry
+        .get(&payload.protocol)
+        .and_then(|entry| match entry.kind() {
+            DriverKind::Session(driver) => Some(driver.clone()),
+            _ => None,
+        })
+    else {
         return (
             false,
-            Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
+            Some(test_error(
+                "unsupported",
+                format!("不明なプロトコルです: {}", payload.protocol),
+            )),
         );
-    }
-
-    // 保持レジスタ先頭を1点読む - テストで固定した文字列リテラルなので parse
-    // は失敗し得ない。
-    let requests = [ReadRequest {
-        address: Address::parse("40001").expect("valid literal"),
-        data_type: DataType::U16,
-    }];
-    let read_result = client.read_batch(&requests).await;
-    client.disconnect().await;
-
-    match read_result {
-        Ok(mut results) => match results.pop() {
-            Some(ReadResult::Value(_)) => (true, None),
-            Some(ReadResult::Bad(err)) => (
-                false,
-                Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
-            ),
-            None => (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "device".to_string(),
-                    message: "読み出し結果が空でした。".to_string(),
-                }),
-            ),
-        },
-        Err(err) => (
-            false,
-            Some(classify_plc_error(&err, Some(MODBUS_SESSION_HINT))),
-        ),
-    }
-}
-
-/// #605: 既存セッションを再利用する前の CPU 照合。`session_cpu` は読む handle が
-/// 作成時に持っていた CPU。フォームの CPU（`requested`、省略・空は「保存済みのまま」
-/// で比べない）と違えば、保存してからテストするよう案内するエラーを返す。
-/// 未知の値は直接ダイヤルと同じく不正として返す。
-pub(super) fn slmp_session_cpu_refusal(
-    session_cpu: Option<banto_plc::SlmpCpu>,
-    requested: &Option<String>,
-) -> Option<PlcConnectionTestError> {
-    if requested.as_deref().is_none_or(str::is_empty) {
-        return None;
-    }
-    let requested_cpu = match slmp_cpu_from_test_payload(requested) {
-        Ok(cpu) => cpu,
-        Err(err) => return Some(err),
     };
-    let session_cpu = session_cpu?;
-    if session_cpu == requested_cpu {
-        return None;
-    }
-    Some(PlcConnectionTestError {
-        kind: "protocol".to_string(),
-        message: format!(
-            "この接続は収集中で、保存済みの CPU 種別（{session_cpu:?}）のセッションを使っています。フォームの CPU 種別（{requested_cpu:?}）は、保存してからテストしてください。"
-        ),
-    })
-}
-
-/// SLMP の接続テスト。`payload.connection_id`があり、その接続の broker
-/// セッションが既に生きていれば、それを再利用して読む(新規ダイヤルしない -
-/// 実機 R08ENCPU は対象ポートが既に使用中だと2本目を受け付けないため、これを
-/// 誤診しないための対策。このモジュール冒頭のコメント参照)。無ければ直接
-/// ダイヤルにフォールバックする。
-async fn test_slmp_connection(
-    manager: &CollectorManager,
-    payload: &PlcConnectionTestPayload,
-) -> (bool, Option<PlcConnectionTestError>) {
-    if let Some(connection_id) = payload.connection_id {
-        if let Some(handle) = manager.sessions().handle_for(connection_id) {
-            // #605: 保存済みセッションの CPU とフォームの CPU が違うとき、
-            // セッションの読みはフォームの値を試したことにならない。かといって
-            // 2 本目をダイヤルすると、1 本しか受けない機器（R08ENCPU など）では
-            // 誤診になる。なのでテストせず、保存してから試すよう案内する。
-            // 比べる CPU は、いま読む handle 自身が持つ（別のレジストリを引き直さない。
-            // 引き直すと、設定の反映と交差して古いセッションを新しい CPU で通してしまう）。
-            if let Some(refusal) = slmp_session_cpu_refusal(handle.slmp_cpu(), &payload.cpu_type) {
-                return (false, Some(refusal));
-            }
-            let requests = vec![BatchReadRequest::Numeric(ReadRequest {
-                address: Address::parse_slmp("D0").expect("valid literal"),
-                data_type: DataType::U16,
-            })];
-            // `ReadOnlyHandle::read`自体には外側タイムアウトが無いため、
-            // ここで明示的に包む(実装指示どおり)。
-            return match tokio::time::timeout(PLC_TEST_TIMEOUT, handle.read(requests)).await {
-                Err(_elapsed) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "timeout".to_string(),
-                        message: "応答タイムアウトです(3秒)。共有セッションが応答しませんでした。"
-                            .to_string(),
-                    }),
-                ),
-                Ok(Err(BrokerError::Disconnected { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。"
-                            .to_string(),
-                    }),
-                ),
-                Ok(Err(BrokerError::ConnectionFailed { reason, .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: format!("共有セッションが接続断で失敗しました: {reason}"),
-                    }),
-                ),
-                Ok(Err(BrokerError::TaskGone { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "tcp".to_string(),
-                        message: "内部エラー: セッションタスクが終了しています。".to_string(),
-                    }),
-                ),
-                // 防御的フォールバック: この経路では通常発生しない
-                // (UnsupportedProtocol/InvalidPortはensure_connection時点で
-                // 弾かれているはず)。
-                Ok(Err(err @ BrokerError::UnsupportedProtocol { .. }))
-                | Ok(Err(err @ BrokerError::InvalidPort { .. })) => (
-                    false,
-                    Some(PlcConnectionTestError {
-                        kind: "protocol".to_string(),
-                        message: err.to_string(),
-                    }),
-                ),
-                // 既存セッション再利用経路: セッション上限ヒントは付けない
-                // (design の意図: 「2本目をダイヤルしない」こと自体が対策)。
-                Ok(Ok(mut results)) => match results.pop() {
-                    Some(BatchReadResult::Value(_)) => (true, None),
-                    Some(BatchReadResult::Bad(err)) => {
-                        (false, Some(classify_plc_error(&err, None)))
-                    }
-                    None => (
-                        false,
-                        Some(PlcConnectionTestError {
-                            kind: "device".to_string(),
-                            message: "読み出し結果が空でした。".to_string(),
-                        }),
-                    ),
-                },
-            };
-        }
-    }
-
-    // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
-    // SLMP は unit_id を使わないので port のみ検証する。
-    // #605: フォームの CPU 種別をフレームに載せる。未知の値はダイヤルしない。
-    let cpu = match slmp_cpu_from_test_payload(&payload.cpu_type) {
-        Ok(cpu) => cpu,
+    // 保存済みの接続（同じプロトコル）は、指紋に入る秘密値の参照の出どころ
+    // （フォームは秘密値を送らない。参照は保存済みのまま、と読む）。
+    let (settings, saved) = requested_settings(manager, payload).await;
+    let probe = match probe_spec(driver.as_ref()) {
+        Ok(probe) => probe,
         Err(err) => return (false, Some(err)),
     };
-    let port = match u16::try_from(payload.port) {
-        Ok(port) => port,
-        Err(_) => {
-            return (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "tcp".to_string(),
-                    message: "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
-                }),
-            );
+
+    if let Some(connection_id) = payload.connection_id {
+        if let Some(handle) = manager.sessions().handle_for(connection_id) {
+            let wanted =
+                manager
+                    .sessions()
+                    .dial_fingerprint(&payload.protocol, saved.as_ref(), &settings);
+            if wanted.is_none() || handle.settings_fingerprint() != wanted {
+                return (
+                    false,
+                    Some(test_error(
+                        "protocol",
+                        "この接続は収集中で、保存済みの設定のセッションを使っています。フォームの設定（接続先・CPU 種別など）は、保存してからテストしてください。",
+                    )),
+                );
+            }
+            let Some(spec) = probe else {
+                // 読む点を持たないドライバ: セッションが張れていれば成功。
+                return match *handle.status_watch().borrow() {
+                    BrokerConnectionStatus::Connected => (true, None),
+                    _ => (false, Some(test_error("tcp", SHARED_SESSION_DOWN))),
+                };
+            };
+            // `ReadOnlyHandle::read` は broker がジョブに上限を掛ける
+            // (design §5.5)が、テストは従来どおり数秒で切る。
+            return match tokio::time::timeout(PLC_TEST_TIMEOUT, handle.read(vec![spec])).await {
+                Err(_elapsed) => (
+                    false,
+                    Some(test_error(
+                        "timeout",
+                        "応答タイムアウトです(3秒)。共有セッションが応答しませんでした。",
+                    )),
+                ),
+                Ok(Err(BrokerError::Disconnected { .. })) => {
+                    (false, Some(test_error("tcp", SHARED_SESSION_DOWN)))
+                }
+                Ok(Err(BrokerError::ConnectionFailed { reason, .. })) => (
+                    false,
+                    Some(test_error(
+                        "tcp",
+                        format!("共有セッションが接続断で失敗しました: {reason}"),
+                    )),
+                ),
+                Ok(Err(BrokerError::TaskGone { .. })) => (
+                    false,
+                    Some(test_error(
+                        "tcp",
+                        "内部エラー: セッションタスクが終了しています。",
+                    )),
+                ),
+                // 防御的フォールバック: この経路では通常発生しない
+                // (UnsupportedProtocol/InvalidSettings は ensure_connection
+                // 時点で弾かれているはず)。
+                Ok(Err(err)) => (false, Some(test_error("protocol", err.to_string()))),
+                // 既存セッション再利用経路: セッション上限ヒントは付けない
+                // (design の意図: 「2本目をダイヤルしない」こと自体が対策)。
+                Ok(Ok(results)) => probe_outcome(results),
+            };
+        }
+    }
+
+    // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
+    let refused = driver.validate_config(&settings);
+    if !refused.is_empty() {
+        return (false, Some(refused_settings(&refused)));
+    }
+    let cx = ConnectContext::new("connection-test", PLC_TEST_TIMEOUT, PLC_TEST_TIMEOUT);
+    let connected = tokio::time::timeout(
+        PLC_TEST_TIMEOUT + banto_broker::CONNECT_SLACK,
+        driver.connect(&settings, cx),
+    )
+    .await
+    .unwrap_or(Err(FatalError::Timeout));
+    let mut session = match connected {
+        Ok(session) => session,
+        Err(err) => return (false, Some(classify_fatal(&err, true, Some(SESSION_HINT)))),
+    };
+    let outcome = match probe {
+        None => (true, None),
+        Some(spec) => {
+            let specs = [spec];
+            let read = tokio::time::timeout(
+                banto_broker::read_job_limit(specs.len(), PLC_TEST_TIMEOUT),
+                session.read_batch(&specs),
+            )
+            .await
+            .unwrap_or(Err(FatalError::Timeout));
+            match read {
+                Ok(results) => probe_outcome(results),
+                Err(err) => (false, Some(classify_fatal(&err, false, Some(SESSION_HINT)))),
+            }
         }
     };
-
-    let config = SlmpConfig {
-        host: payload.host.clone(),
-        port,
-        cpu,
-        connect_timeout: PLC_TEST_TIMEOUT,
-        response_timeout: PLC_TEST_TIMEOUT,
-        ..Default::default()
-    };
-    let mut client = SlmpClient::new(config);
-
-    if let Err(err) = client.connect().await {
-        return (
-            false,
-            Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
-        );
-    }
-
-    let requests = [ReadRequest {
-        address: Address::parse_slmp("D0").expect("valid literal"),
-        data_type: DataType::U16,
-    }];
-    let read_result = client.read_batch(&requests).await;
-    client.disconnect().await;
-
-    match read_result {
-        Ok(mut results) => match results.pop() {
-            Some(ReadResult::Value(_)) => (true, None),
-            Some(ReadResult::Bad(err)) => (
-                false,
-                Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
-            ),
-            None => (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "device".to_string(),
-                    message: "読み出し結果が空でした。".to_string(),
-                }),
-            ),
-        },
-        Err(err) => (
-            false,
-            Some(classify_plc_error(&err, Some(SLMP_SESSION_HINT))),
-        ),
-    }
+    let _ = tokio::time::timeout(banto_broker::DISCONNECT_LIMIT, session.disconnect()).await;
+    outcome
 }
+
+/// 共有セッションが切断中のときの文言。
+const SHARED_SESSION_DOWN: &str = "この接続の共有セッションは現在切断中です(再接続待機中)。PLCの電源やネットワーク、または他アプリとのセッション競合を確認してください。";
 
 /// `POST /api/plc-connections/test` - T12(docs/ux-plan.md §4)。保存前に
 /// host/port/protocol の疎通確認(実プロトコルでの軽い読み出し1回まで)を
@@ -1245,7 +1154,7 @@ async fn test_slmp_connection(
 /// 発生しない読み取り専用の疎通確認なので、監査ログ記録(`record_write`)や
 /// `rebuild_and_notify`は呼ばない。
 ///
-/// 疎通確認そのもの(virtual/simulation の即時拒否・プロトコル別ダイヤル・
+/// 疎通確認そのもの(virtual/simulation の即時拒否・ドライバによるダイヤル・
 /// 所要時間計測)は[`run_plc_connection_test`]へ切り出してある - T21
 /// S1-c（docs/banto-hub-t21-design.md）の MCP `test_connection`ツール
 /// ([`crate::mcp`]の`tool_test_connection`)がこの REST ハンドラと**全く同じ
@@ -1282,7 +1191,8 @@ pub(crate) async fn run_plc_connection_test(
     let started = std::time::Instant::now();
 
     // ガード: virtual / simulation / 未知プロトコルは即座に ok:false, kind:
-    // "unsupported"(実プロトコルの疎通確認より前に判定)。
+    // "unsupported"(実プロトコルの疎通確認より前に判定。未知プロトコルは
+    // `test_connection` の最初)。
     let (ok, error) = if payload.protocol == "virtual" {
         (
             false,
@@ -1301,17 +1211,10 @@ pub(crate) async fn run_plc_connection_test(
             }),
         )
     } else {
-        match payload.protocol.as_str() {
-            "modbus-tcp" => test_modbus_connection(manager, payload).await,
-            "slmp" => test_slmp_connection(manager, payload).await,
-            other => (
-                false,
-                Some(PlcConnectionTestError {
-                    kind: "unsupported".to_string(),
-                    message: format!("不明なプロトコルです: {other}"),
-                }),
-            ),
-        }
+        // R2b-3a-2: プロトコル名で分けない。broker が管理しないプロトコル
+        // (レジストリにセッション型のドライバが無い)は `test_connection` が
+        // "unsupported" で返す。
+        test_connection(manager, payload).await
     };
 
     PlcConnectionTestResponse {

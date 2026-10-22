@@ -29,75 +29,66 @@
 //! left to this crate's own `#[cfg(test)]` suite below and the driver
 //! crates' own tests (`banto-driver-slmp` / `banto-driver-modbus`, R1-4a).
 //!
-//! ## Protocol abstraction (I9 / Issue #130, 2026-09-01) and the drivers
+//! ## Protocol abstraction and the drivers (I9 #130 → R1-3a → R2b-3a-2)
 //!
 //! This crate used to speak MELSEC SLMP exclusively, hardcoded throughout.
-//! Since #130, read/write execution against a live session is behind a small
-//! trait, [`session::BrokerSession`] (see that module's doc for the full
-//! contract) - this file's reconnect state machine ([`ConnState`],
-//! [`ConnEvent`], [`run_broker_task`]) and its job-processing loop only ever
-//! call `BrokerSession::read_batch`/`write_batch`/`disconnect` on a
-//! `Box<dyn BrokerSession>`, never a protocol-specific type or function. The
-//! one place [`banto_tags::PlcConnection::protocol`] is still inspected is
-//! [`SessionDirectory::ensure_connection`], and that is now a small data
-//! table ([`DriverTable`]) mapping a protocol string to a driver's own
-//! "dial this connection" function ([`DialFn`]), in place of the old
-//! `conn.protocol != SLMP_PROTOCOL` equality check.
+//! #130 (I9) put read/write execution behind a small trait and a protocol ->
+//! dial-function table; R1-3a made the table injected; R1-4a moved the two
+//! drivers out into their own crates. **R2b-3a-2
+//! (docs/banto-hub-driver-io-design.md §4.2) removed the table itself**: the
+//! broker now dials through the `banto-driver-api`
+//! [`DriverRegistry`](banto_driver_api::DriverRegistry) it is given. A
+//! connection's protocol is broker-managed exactly when the registry holds a
+//! [`DriverKind::Session`](banto_driver_api::DriverKind::Session) for it (from
+//! R2b-3b also `Frame`) - [`is_broker_managed`] is that one predicate - and
+//! [`SessionDirectory::ensure_connection`] dials it with
+//! `SessionDriver::connect(settings, ConnectContext)`, where `settings` is
+//! `banto_tags::settings_to_api(&conn.settings)` (connection-settings design
+//! §3.5), validated by the driver's own `validate_config` first. A
+//! `HostProvided` entry (the host's own I/O, e.g. banto-hub's `push`) or an
+//! unregistered protocol is [`BrokerError::UnsupportedProtocol`].
 //!
-//! R1-3a (docs/banto-driver-api-design.md §4.4, 2026-10-20): the table used
-//! to be a fixed `const DRIVERS` inside this crate; it is now **injected** -
-//! [`BrokerSupervisor::spawn`] takes a [`DriverTable`], and the caller
-//! (banto-hub's `HubSessions`) keeps the same table to answer "does the
-//! broker manage this protocol" (`HubSessions::is_broker_managed`, which
-//! replaced this crate's former free function for that question). A
-//! table entry only builds the [`Connector`] (plus the SLMP CPU type for
-//! [`BrokerHandle::slmp_cpu`]) - spawning the task, `TaskEntry` and the job
-//! loop stay in this crate, because a driver outside it cannot construct
-//! them.
+//! Requests and results are the driver API's types too: a job carries
+//! `Vec<TagSpec>` / `Vec<WriteItem>` and answers `Vec<Result<Value, ItemError>>`
+//! / `Vec<Result<(), ItemError>>`; a connection-fatal failure is a typed
+//! [`FatalError`]. The session the task owns is a `Box<dyn
+//! banto_driver_api::Session>` (the former `BrokerSession` trait is gone; see
+//! `session.rs`). This crate depends on no driver - not even as a
+//! dev-dependency - and no longer on `banto-plc` / `banto-plc-write`. Its own
+//! unit tests drive the job loop with an in-memory fake session driver
+//! (`#[cfg(test)] mod fake`); the tests that pin down a protocol's behaviour
+//! *through* the broker live in each driver crate's `tests/broker.rs`.
 //!
-//! R1-4a (docs/banto-driver-api-design.md §4.4): the two drivers themselves
-//! no longer live here either. This crate does not depend on any driver -
-//! not even as a dev-dependency - and has no built-in table any more (the
-//! R1-3a bridge `DriverTable::builtin()` is gone). The composition root
-//! (`banto-drivers`' `builtin().broker`) registers `"slmp"`
-//! (`banto-driver-slmp`, wrapping `banto_plc`'s
-//! `plan_slmp_batch`/`execute_slmp_batch_reads` and `banto_plc_write`'s
-//! `plan_slmp_write_batch`/`execute_slmp_writes` behind its `SlmpSession` -
-//! moved out of this file's job loop by #130, then out of this crate by
-//! R1-4a, not changed) and `"modbus-tcp"` (`banto-driver-modbus`, wrapping
-//! `banto_plc`'s `plan_batch_requests`/`execute_modbus_reads` and
-//! `banto_plc_write`'s `plan_modbus_writes`/`execute_modbus_writes` behind
-//! its `ModbusSession` - #131's own addition). This crate's own unit tests
-//! drive the job loop with an in-memory fake session (`#[cfg(test)] mod
-//! fake`); the tests that pin down a protocol's behaviour *through* the
-//! broker live in each driver crate's `tests/broker.rs`. Every `protocol`
-//! value without a table entry is rejected with
-//! [`BrokerError::UnsupportedProtocol`] (see
-//! [`DriverTable::is_supported`] for the single source of truth on which
-//! protocol strings are registered in a given table). This refactor was tracked
-//! since docs/tag-server-design.md §6 item 7 as **I9**, "Modbus 書き込み
-//! （banto-plc-write への FC5/6/15/16 追加 + broker のプロトコル抽象化）は
-//! I9 バックログ" - #130 did the protocol-abstraction half (no Modbus
-//! behavior), and #131 (this PR) adds the `"modbus-tcp"` driver itself, so
-//! I9 is now fully done.
+//! ### One trait with both `read_batch` and `write_batch`
 //!
-//! ### Why a new trait, not `banto_plc::PlcClient` + `banto_plc_write::PlcWriteClient`
+//! Both directions run on the *same* `&mut Box<dyn Session>` held in
+//! [`ConnState::Connected`], never on two separate objects with their own
+//! sockets - that would reopen the "read and write to the same CPU
+//! interleave on the wire, or fight over one PLC session slot" problem this
+//! crate's extraction (I6) was meant to close for good.
 //!
-//! [`session::BrokerSession`] is a **new** trait defined in this crate, not a
-//! reuse of the two existing read/write traits, and that is a deliberate,
-//! load-bearing choice - see `session.rs`'s module doc ("Why one trait with
-//! both `read_batch` and `write_batch`") for the full reasoning: composing
-//! `PlcClient` (reads) with `PlcWriteClient` (writes) would give this broker
-//! two independent trait objects, each wrapping its own private
-//! `Option<slmp::SLMPClient>` socket, which reopens exactly the "read and
-//! write to the same CPU can interleave on the wire, or fight over one PLC
-//! session slot" problem this crate's extraction (I6) was meant to close for
-//! good - see "Message shape and how serialization is guaranteed" below.
+//! ### Bounds on every session future (design §5.5)
+//!
+//! A session-type driver owns its I/O, so if it does not keep
+//! `ConnectContext::response_timeout`, a job (and with it an immediate read
+//! or a write request in the Hub) would never return. The task therefore
+//! bounds every future it awaits on a session: the dial at
+//! `connect_timeout + 1 s` ([`CONNECT_SLACK`]), a read at
+//! [`read_job_limit`] and a write at [`write_job_limit`] (`step limit × 2T +
+//! 1 s`; the step limit is `specs.len() + 8` for a read and
+//! `3 × items.len() + 8` for a write, api-design contract 7), and the
+//! disconnect on stop at
+//! [`DISCONNECT_LIMIT`]. A job that runs out of time fails with
+//! [`FatalError::Timeout`] and the session is dropped and re-dialed, exactly
+//! like a session that reported its own timeout. `2T` per step (not `T`)
+//! because a session-type driver may give its send and its receive one
+//! response timeout each (today's `banto-plc` does for SLMP); the outer
+//! bound is only the insurance for a driver that breaks its own deadline.
 //!
 //! ## Message shape and how serialization is guaranteed
 //!
 //! Each connection's task ([`BrokerSupervisor::spawn`] / the internal
-//! `spawn_task_with_connector`) owns exactly one `Box<dyn session::BrokerSession>` and a
+//! `spawn_task_with_connector`) owns exactly one `Box<dyn Session>` and a
 //! `tokio::sync::mpsc::Receiver<Job>`. [`Job`] has two variants -
 //! `Read`/`Write` - each carrying its owned request `Vec` and a
 //! `tokio::sync::oneshot::Sender` for the reply. The task's main loop takes
@@ -109,9 +100,10 @@
 //! `banto-collect/src/task.rs`'s module doc makes for its
 //! single-task-owns-the-client design), not a lock - a read and a write to
 //! the same CPU cannot interleave on the wire because nothing ever runs two
-//! `BrokerSession` calls concurrently against one session, and (see "Why a
-//! new trait" above) there is only ever one `BrokerSession` per connection to
-//! begin with, never a separate read-side and write-side instance.
+//! `Session` calls concurrently against one session, and (see "One trait
+//! with both `read_batch` and `write_batch`" above) there is only ever one
+//! `Session` per connection to begin with, never a separate read-side and
+//! write-side instance.
 //!
 //! [`BrokerHandle`] is the clonable submission point (holds the mpsc
 //! `Sender`); many callers (a poller and a writer, in either consuming app)
@@ -125,36 +117,20 @@
 //! Structure copied from `banto-collect/src/task.rs`'s `run_connection`
 //! (`ConnState`/`ConnEvent`/spawned-connect-attempt shape), *not* its
 //! `TsWriter`-flavoured content: `ConnState` here is `Backoff { at } |
-//! Connecting(JoinHandle<..>) | Connected(Box<dyn session::BrokerSession>)`,
-//! and the initial state is `Backoff { at: now }` so the first connect
-//! attempt fires immediately. A failed connect attempt reschedules the next
-//! one after [`backoff_delay`] (exponential, parameterized by
-//! [`BackoffConfig`], capped, reset to attempt 0 on any success). A
-//! connection-fatal failure *while processing a request* (see below) drops
-//! the session and re-enters `Backoff` immediately (attempt reset to 0) -
-//! the same "no disconnect event needed, we were already using it a moment
-//! ago" reasoning `run_connection` uses for its own fatal-read branch.
+//! Connecting(JoinHandle<..>) | Connected(Box<dyn Session>)`, and the initial
+//! state is `Backoff { at: now }` so the first connect attempt fires
+//! immediately. A failed connect attempt reschedules the next one after
+//! [`backoff_delay`] (exponential, parameterized by [`BackoffConfig`],
+//! capped, reset to attempt 0 on any success). A connection-fatal failure
+//! *while processing a request* (see below) drops the session and re-enters
+//! `Backoff` immediately (attempt reset to 0) - the same "no disconnect event
+//! needed, we were already using it a moment ago" reasoning `run_connection`
+//! uses for its own fatal-read branch.
 //!
-//! Each driver supplies its own reusable "dial a fresh session" step (a
-//! [`session::Connector`], built once per connection and called again on
-//! every reconnect attempt) rather than this file calling a
-//! protocol-specific connect function directly - see [`connect_attempt`].
-//! For the SLMP driver, `banto-driver-slmp`'s connector dials
-//! through [`banto_plc::dial_slmp`], the one shared implementation of the
-//! connect sequence (build a bare `slmp::SLMPClient` from
-//! `SlmpConfig::to_wire_props()`, wire the two per-crate timeouts, wrap the
-//! connect in `SlmpConfig::connect_timeout`, map the structured
-//! `slmp::SlmpError` (H9, docs/h9-slmp-structured-error-spec.md)) that
-//! `banto_plc::slmp::SlmpClient::connect` and
-//! `banto_plc_write::slmp::SlmpWriteClient::connect` also call - see
-//! `dial_slmp`'s own doc comment (H9 transport 共通化,
-//! docs/improvement-plan.md §H9) - exactly what this file's own
-//! `connect_attempt` did inline before #130 moved the SLMP-specific half of
-//! it into the SLMP driver's connector. What still differs here, and is not
-//! shareable, is what happens to the client *after* the dial - see "Why a new
-//! trait" above for why this broker wraps it in its own session type
-//! (`banto-driver-slmp`'s `SlmpSession`) rather than handing it to `SlmpClient`'s or
-//! `SlmpWriteClient`'s own private `Option<slmp::SLMPClient>`.
+//! The protocol-specific "dial a fresh session" step is a
+//! [`session::Connector`], built once per connection by
+//! [`SessionDirectory::ensure_connection`] from the registry's driver and
+//! called again on every reconnect attempt - see `connect_attempt`.
 //!
 //! ## Queued-request-while-down policy: fail fast, never queue
 //!
@@ -178,30 +154,16 @@
 //! message) **and** the task falls back into `Backoff` - both happen from the
 //! same match arm, so the two can never drift out of sync.
 //!
-//! ## The `Err` contract every `BrokerSession` implementation must uphold
+//! ## The `Err` contract every `Session` must uphold
 //!
-//! (Formerly "Why no explicit call to `is_connection_fatal` appears here" -
-//! renamed for #130 because the contract this section describes now lives on
-//! a trait, not just on two SLMP-specific functions.)
-//!
-//! [`run_broker_task`]'s job loop never calls anything resembling
-//! `is_connection_fatal` - it trusts [`session::BrokerSession::read_batch`]/
-//! [`write_batch`][session::BrokerSession::write_batch] completely: `Err`
-//! means connection-fatal, full stop, and any per-device failure must already
-//! be folded into `Ok(Vec<_>)` by the time it gets here. For
-//! `banto-driver-slmp`'s `SlmpSession` that split is inherited for free: both
-//! `banto_plc::execute_slmp_batch_reads` and
-//! `banto_plc_write::execute_slmp_writes` already enforce it internally (a
-//! device-side SLMP end code becomes a `Bad`/per-target failure folded into
-//! `Ok(Vec<_>)`; only a connection-fatal condition surfaces as `Err`), so
-//! `SlmpSession` just maps their `Err` straight through to its own. A future
-//! driver will not get this for granted the same way - see
-//! [`session::BrokerSession`]'s own doc comment, which now carries this
-//! contract explicitly (rather than it living only in `banto_plc`'s and
-//! `banto_plc_write`'s own doc comments, as it did pre-#130) precisely
-//! because the next implementer (Modbus TCP, #131) has to do that
-//! classification itself and needs to find the rule stated somewhere that
-//! is not SLMP-specific.
+//! `run_broker_task`'s job loop never inspects an error to decide whether
+//! it is fatal - it trusts `Session::read_batch` / `write_batch` completely:
+//! `Err(FatalError)` means connection-fatal, full stop, and any per-item
+//! failure must already be an [`ItemError`] inside `Ok(Vec<_>)`. See
+//! `session.rs`'s module doc. The one check the loop adds is the count: a
+//! session that answers a different number of results than it was asked is
+//! treated as [`FatalError::Protocol`] (the caller must be able to index the
+//! results by request), never trimmed or padded.
 //!
 //! ## Connection status observability (I6 T2-1 addition, 2026-08-05)
 //!
@@ -232,14 +194,17 @@
 //! process lifetime, §6-5/T2-2's original design); it is wired for
 //! banto-hub's T7-2 slice (banto-hub's `CollectorManager::rebuild` diffs
 //! [`SessionDirectory::connection_ids`] against the registry's current
-//! enabled-SLMP-connection set to find what to remove).
+//! enabled broker-managed connection set to find what to remove).
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 use std::time::Duration;
 
-use banto_driver_api::DriverId;
-use banto_plc::{BatchReadRequest, BatchReadResult, SlmpCpu, WordOrder};
-use banto_plc_write::{BatchWriteRequest, WriteResult};
+use banto_driver_api::{
+    ConnectContext, DriverKind, DriverRegistry, FatalError, ItemError, Session, SessionDriver,
+    Settings, TagSpec, Value, WordOrder, WriteItem,
+};
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -249,27 +214,20 @@ use tokio::time::Instant;
 mod fake;
 mod session;
 
-pub use session::{BrokerSession, Connector, SessionError};
+pub use session::{Connector, NoSecretOpener, SecretOpener};
 
-/// Parse [`PlcConnection::word_order`]'s wire string into the
-/// [`WordOrder`] `banto_plc::SlmpConfig::word_order` wants (P3-b, 監査指摘
-/// 2026-08-12: this function replacing the old hardcoded
-/// `..SlmpConfig::default()` is the fix). Falls back to
-/// [`WordOrder::LowHigh`] - `SlmpConfig::default`'s own value, so an
-/// unrecognized string behaves exactly as every connection did before this
-/// column existed - rather than propagating an error, because
-/// `banto_tags::plc_connection::ALLOWED_WORD_ORDERS` plus the SQL `CHECK`
-/// migration `0010` added already make any other value unreachable through
-/// normal CRUD; this is defense in depth for a hand-edited or
-/// pre-migration-0010 database row, not a path this broker expects to take
-/// in practice.
+/// Parse a connection's `word_order` setting (`"high_low"` / `"low_high"`)
+/// into a [`WordOrder`] (P3-b, 監査指摘 2026-08-12). Falls back to
+/// [`WordOrder::LowHigh`] - `banto_plc::SlmpConfig::default`'s own value, so
+/// an unrecognized string behaves exactly as every connection did before the
+/// setting existed - rather than propagating an error: the save path's
+/// validation already makes any other value unreachable through normal CRUD;
+/// this is defense in depth for a hand-edited database row.
 ///
-/// `pub` since R1-4a (docs/banto-driver-api-design.md §4.4): both driver
-/// crates' config builders (`banto-driver-slmp`'s `slmp_config_for` and
-/// `banto-driver-modbus`'s `modbus_config_for`) call this one function, as
-/// they did when they lived in this crate - kept here, not copied into each
-/// driver, so the two protocols' fallback cannot drift apart. The broker
-/// itself no longer calls it.
+/// `pub` since R1-4a: both driver crates' `SessionDriver::connect`
+/// (`banto-driver-slmp` / `banto-driver-modbus`'s `api_session.rs`) call this
+/// one function, so the two protocols' fallback cannot drift apart. The
+/// broker itself does not call it.
 pub fn parse_word_order(value: &str) -> WordOrder {
     match value {
         "high_low" => WordOrder::HighLow,
@@ -321,6 +279,181 @@ fn backoff_delay(attempt: u32, cfg: BackoffConfig) -> Duration {
     Duration::from_millis(ms).min(cfg.cap)
 }
 
+/// How long a session may take beyond `ConnectContext::connect_timeout` to
+/// finish connecting before the broker gives the attempt up as
+/// [`FatalError::Timeout`] (design §5.5).
+pub const CONNECT_SLACK: Duration = Duration::from_secs(1);
+
+/// The slack added to a job's step budget (design §5.5).
+pub const JOB_SLACK: Duration = Duration::from_secs(1);
+
+/// How long stopping a connection waits for `Session::disconnect` before it
+/// drops the future and moves on (design §5.5: stopping must not hang).
+pub const DISCONNECT_LIMIT: Duration = Duration::from_secs(2);
+
+/// The extra steps a job may take beyond its items (api-design contract 7:
+/// `3 × items + 8` for a write; a read is `specs + 8`).
+const EXTRA_STEPS: usize = 8;
+
+/// The outer bound on one read job of `specs` items against a session whose
+/// response timeout is `response` (design §5.5): `(specs + 8) × 2T + 1 s`.
+///
+/// `2T` per step because a session-type driver may spend one `T` sending and
+/// another receiving (today's SLMP session does: the `slmp` crate's send and
+/// receive deadlines are separate); a driver that keeps its own deadlines can
+/// therefore never be cut by this bound - only one that breaks them.
+pub fn read_job_limit(specs: usize, response: Duration) -> Duration {
+    steps_limit(specs.saturating_add(EXTRA_STEPS), response)
+}
+
+/// The outer bound on one write job of `items` items (design §5.5):
+/// `(3 × items + 8) × 2T + 1 s` (api-design contract 7's step limit; an SLMP
+/// bit-in-word write is three requests: read, write, confirm).
+pub fn write_job_limit(items: usize, response: Duration) -> Duration {
+    steps_limit(
+        items.saturating_mul(3).saturating_add(EXTRA_STEPS),
+        response,
+    )
+}
+
+fn steps_limit(steps: usize, response: Duration) -> Duration {
+    let steps = u32::try_from(steps).unwrap_or(u32::MAX);
+    response
+        .saturating_mul(2)
+        .saturating_mul(steps)
+        .saturating_add(JOB_SLACK)
+}
+
+/// The two timeouts the broker hands every driver in its `ConnectContext`
+/// (and sizes its own outer bounds from, design §5.5). The defaults are the
+/// ones `banto_plc::ModbusTcpConfig` / `SlmpConfig` have always used (connect
+/// 3 s, response 1 s), so moving the dial onto the registry (R2b-3a-2)
+/// changed no connection's timing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimeouts {
+    /// `ConnectContext::connect_timeout`.
+    pub connect: Duration,
+    /// `ConnectContext::response_timeout`.
+    pub response: Duration,
+}
+
+impl Default for SessionTimeouts {
+    fn default() -> Self {
+        Self {
+            connect: Duration::from_secs(3),
+            response: Duration::from_secs(1),
+        }
+    }
+}
+
+/// Everything [`BrokerSupervisor::spawn_with`] takes besides the registry.
+#[derive(Clone)]
+pub struct BrokerOptions {
+    /// Reconnect backoff.
+    pub backoff: BackoffConfig,
+    /// The timeouts handed to every driver (and the outer bounds' `T`).
+    pub timeouts: SessionTimeouts,
+    /// How a connection's secrets are opened just before its dial (see
+    /// [`SecretOpener`]). Default: [`NoSecretOpener`].
+    pub secrets: Arc<dyn SecretOpener>,
+}
+
+impl Default for BrokerOptions {
+    fn default() -> Self {
+        Self {
+            backoff: BackoffConfig::default(),
+            timeouts: SessionTimeouts::default(),
+            secrets: Arc::new(NoSecretOpener),
+        }
+    }
+}
+
+impl std::fmt::Debug for BrokerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerOptions")
+            .field("backoff", &self.backoff)
+            .field("timeouts", &self.timeouts)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A protocol-independent identity of the settings a session was dialed with
+/// (R2b-3a-2, design §4.2): a hash of the `Settings` without the driver's
+/// secret keys, in key order, plus - for each secret key the connection holds
+/// a reference for - that **reference** (`{"$secret": "<ref>"}`'s id, never
+/// the value; a new secret is sealed under a new reference, so changing a
+/// password changes the fingerprint and the session is re-dialed). It
+/// replaced `BrokerHandle::slmp_cpu` (#605): banto-hub's connection test asks
+/// "may I read this form through the running session?" and its simulation
+/// registry asks "did the dial target change?" by comparing fingerprints,
+/// whatever the protocol.
+///
+/// Only meaningful within one process (it uses the standard library's
+/// hasher); it is never stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SettingsFingerprint(u64);
+
+impl SettingsFingerprint {
+    /// The fingerprint of `settings` alone, leaving out every key in
+    /// `secret_keys` (the value of a secret never reaches the hash) - for
+    /// settings that belong to no stored connection (no secret references).
+    pub fn of(settings: &Settings, secret_keys: &[String]) -> Self {
+        Self::of_connection(None, settings, secret_keys)
+    }
+
+    /// The fingerprint a session of `conn` dialed with `settings` carries:
+    /// [`Self::of`] plus the secret **references** `conn.settings` holds for
+    /// `secret_keys` (`settings_to_api` drops them, so they come from the
+    /// connection; a malformed one counts as a marker of its own). `None`
+    /// (no stored connection) is the same as a connection without
+    /// references. The opened values are never part of it.
+    pub fn of_connection(
+        conn: Option<&PlcConnection>,
+        settings: &Settings,
+        secret_keys: &[String],
+    ) -> Self {
+        let mut pairs: Vec<(&str, &str)> = settings
+            .iter()
+            .filter(|s| !secret_keys.contains(&s.key))
+            .map(|s| (s.key.as_str(), s.value.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let mut refs: Vec<(&str, &str)> = Vec::new();
+        if let Some(conn) = conn {
+            for key in secret_keys {
+                match conn.secret_ref_lookup(key) {
+                    banto_tags::SecretRefLookup::Absent => {}
+                    banto_tags::SecretRefLookup::Ref(r#ref) => refs.push((key.as_str(), r#ref)),
+                    banto_tags::SecretRefLookup::Malformed => {
+                        refs.push((key.as_str(), "\u{0}malformed"))
+                    }
+                }
+            }
+        }
+        refs.sort_unstable();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        pairs.hash(&mut hasher);
+        refs.hash(&mut hasher);
+        SettingsFingerprint(hasher.finish())
+    }
+}
+
+/// Whether `registry` makes `protocol` a broker-managed protocol: the
+/// registry holds a session-type driver for it (R2b-3a-2; R2b-3b adds frame
+/// type). The single predicate behind [`SessionDirectory::ensure_connection`]'s
+/// [`BrokerError::UnsupportedProtocol`] and banto-hub's
+/// `HubSessions::is_broker_managed`.
+pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
+    session_driver(registry, protocol).is_some()
+}
+
+fn session_driver(registry: &DriverRegistry, protocol: &str) -> Option<Arc<dyn SessionDriver>> {
+    match registry.get(protocol).map(|entry| entry.kind()) {
+        Some(DriverKind::Session(driver)) => Some(Arc::clone(driver)),
+        _ => None,
+    }
+}
+
 /// Everything a [`BrokerHandle`]/[`ReadOnlyHandle`] request can fail with.
 /// Deliberately small and non-exhaustive-friendly: this is infrastructure
 /// (W3-A / I6), not a richer application-level failure vocabulary.
@@ -334,9 +467,10 @@ pub enum BrokerError {
     Disconnected { connection_id: i64 },
 
     /// This request was in flight on a live session when a connection-fatal
-    /// failure occurred; `reason` is the underlying `PlcError`/`PlcWriteError`'s
-    /// message. The broker has already dropped the session and started
-    /// reconnecting by the time this reaches the caller.
+    /// failure occurred (including the job running out of its outer bound,
+    /// design §5.5); `reason` is the [`FatalError`]'s message. The broker has
+    /// already dropped the session and started reconnecting by the time this
+    /// reaches the caller.
     #[error("PLC接続 {connection_id} への要求が接続断で失敗しました: {reason}")]
     ConnectionFailed { connection_id: i64, reason: String },
 
@@ -345,58 +479,54 @@ pub enum BrokerError {
     #[error("PLC接続 {connection_id} のブローカータスクは終了しています")]
     TaskGone { connection_id: i64 },
 
-    /// [`BrokerSupervisor::spawn`] was given a connection whose `protocol`
-    /// has no entry in its [`DriverTable`] - with `banto-drivers`'
-    /// `builtin().broker` (#131, 2026-09-01; R1-4a), that means anything
-    /// other than `"slmp"` or `"modbus-tcp"`. Such a connection is rejected outright rather than
-    /// silently skipped, so a caller relying on `.handle(id)` finds out
-    /// immediately at startup rather than discovering a missing handle later
-    /// as an unexplained `None`.
-    ///
-    /// The "slmp, modbus-tcp" list below is hand-written rather than derived
-    /// from the table at the `#[error(...)]` site (a `thiserror` format
-    /// string cannot call a function), so it must be kept in sync with
-    /// `banto-drivers`' `builtin().broker` by hand if a third driver is ever
-    /// added.
-    #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（対応: slmp, modbus-tcp）")]
+    /// The connection's `protocol` has no session-type driver in the
+    /// registry the broker was given (unregistered, or a host-provided
+    /// protocol whose I/O the host keeps - see [`is_broker_managed`]).
+    /// Rejected outright rather than silently skipped, so a caller relying on
+    /// `.handle(id)` finds out immediately.
+    #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（セッション型のドライバが登録されていません）")]
     UnsupportedProtocol {
         connection_id: i64,
         protocol: String,
     },
 
-    /// `PlcConnection::port` (`i64`, validated 1..=65535 at the service layer)
-    /// did not fit in the wire's `u16` - defensive only, should be
-    /// unreachable for a row that passed `banto_tags`' own validation.
-    #[error("接続 {connection_id} のポート番号が不正です: {port}")]
-    InvalidPort { connection_id: i64, port: i64 },
+    /// The driver's `validate_config` refused the connection's settings
+    /// (R2b-3a-2: replaced the broker's own `InvalidPort` check - the port's
+    /// range is the driver's rule, design §4.2). `reason` lists the refused
+    /// keys and messages.
+    #[error("接続 {connection_id} の設定をドライバが断りました: {reason}")]
+    InvalidSettings { connection_id: i64, reason: String },
 }
 
 /// One thing a broker task can be asked to do, paired with where to send the
 /// result. Exactly two variants - this *is* the read/write safety boundary a
-/// caller like relay-wright's engine relies on: a caller that only ever gets
-/// a [`ReadOnlyHandle`] can never construct a `Write` job.
+/// caller relies on: a caller that only ever gets a [`ReadOnlyHandle`] can
+/// never construct a `Write` job.
 enum Job {
     Read {
-        requests: Vec<BatchReadRequest>,
-        respond_to: oneshot::Sender<Result<Vec<BatchReadResult>, BrokerError>>,
+        specs: Vec<TagSpec>,
+        respond_to: oneshot::Sender<ReadOutcome>,
     },
     Write {
-        requests: Vec<BatchWriteRequest>,
-        respond_to: oneshot::Sender<Result<Vec<WriteResult>, BrokerError>>,
+        items: Vec<WriteItem>,
+        respond_to: oneshot::Sender<WriteOutcome>,
     },
 }
+
+/// What a read job answers: one result per spec, in order.
+pub type ReadOutcome = Result<Vec<Result<Value, ItemError>>, BrokerError>;
+
+/// What a write job answers: one result per item, in order.
+pub type WriteOutcome = Result<Vec<Result<(), ItemError>>, BrokerError>;
 
 /// Observable connection state for one broker task's session (I6 T2-1
 /// addition, 2026-08-05) - see the module doc's "Connection status
 /// observability" section for the full why. Same three-state shape as
 /// `banto_collect::ConnectionStatus` by design (both track the same kind of
 /// connect/backoff/stopped lifecycle) but **independently defined here**:
-/// this crate must not gain a dependency on `banto-collect` (that dependency
-/// would run backwards from every other dependency this crate has, and
-/// banto-collect's own SLMP collection tasks are unrelated to - and unaware
-/// of - this broker's sessions). `attempt` is the connect attempt currently
-/// in flight or scheduled (1-based, matching [`BackoffConfig`]'s own
-/// numbering).
+/// this crate must not gain a dependency on `banto-collect`. `attempt` is the
+/// connect attempt currently in flight or scheduled (1-based, matching
+/// [`BackoffConfig`]'s own numbering).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BrokerConnectionStatus {
     Connected,
@@ -406,44 +536,46 @@ pub enum BrokerConnectionStatus {
 
 /// A clonable submission point for one PLC connection's broker task. Exposes
 /// both [`BrokerHandle::read`] and [`BrokerHandle::write`]; see
-/// [`BrokerHandle::read_only`] for the read-only subset. relay-wright's W3-B
-/// design keeps this held only by its `writer` module, handing its `poller`
-/// module a [`ReadOnlyHandle`] instead - a compile-time guarantee that only
-/// one module can ever submit a write, enforced entirely by which handle type
-/// a function accepts.
+/// [`BrokerHandle::read_only`] for the read-only subset - a compile-time
+/// guarantee that only the holder of a full handle can ever submit a write,
+/// enforced entirely by which handle type a function accepts.
 #[derive(Clone)]
 pub struct BrokerHandle {
     connection_id: i64,
     tx: mpsc::Sender<Job>,
     /// See [`Self::status_watch`].
     status_rx: watch::Receiver<BrokerConnectionStatus>,
-    /// #605: このセッションを作ったときの SLMP の CPU 種別（SLMP 以外は
-    /// `None`）。handle と同じ世代のメタデータで、後から別のレジストリを
-    /// 引き直さない。接続テストが「いま読むセッションの CPU」を比べるために使う。
-    slmp_cpu: Option<SlmpCpu>,
+    /// See [`Self::settings_fingerprint`].
+    fingerprint: Option<SettingsFingerprint>,
+}
+
+impl std::fmt::Debug for BrokerHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrokerHandle")
+            .field("connection_id", &self.connection_id)
+            .field("fingerprint", &self.fingerprint)
+            .finish_non_exhaustive()
+    }
 }
 
 impl BrokerHandle {
-    /// #605: このセッションを作ったときの SLMP の CPU 種別。SLMP 以外は `None`。
-    /// 設定を変えて作り直されたセッションの handle は、新しい値を持つ。
-    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
-        self.slmp_cpu
+    /// The fingerprint of the settings this session dials with (R2b-3a-2,
+    /// replacing #605's `slmp_cpu`): metadata of the same generation as the
+    /// handle, never re-read from a registry later. A session re-created with
+    /// other settings is a new handle with a new fingerprint. `None` only for
+    /// the test-util fakes.
+    pub fn settings_fingerprint(&self) -> Option<SettingsFingerprint> {
+        self.fingerprint
     }
 
-    /// Submit a (possibly mixed numeric + string, S2 文字列タグ) read batch
-    /// and await its result. Fails fast with [`BrokerError::Disconnected`] if
-    /// the session is down - see the module doc's queued-request-while-down
-    /// policy.
-    pub async fn read(
-        &self,
-        requests: Vec<BatchReadRequest>,
-    ) -> Result<Vec<BatchReadResult>, BrokerError> {
+    /// Submit a read batch (numbers, bits and strings mixed) and await its
+    /// result: one `Result<Value, ItemError>` per spec, in order. Fails fast
+    /// with [`BrokerError::Disconnected`] if the session is down - see the
+    /// module doc's queued-request-while-down policy.
+    pub async fn read(&self, specs: Vec<TagSpec>) -> ReadOutcome {
         let (respond_to, rx) = oneshot::channel();
         self.tx
-            .send(Job::Read {
-                requests,
-                respond_to,
-            })
+            .send(Job::Read { specs, respond_to })
             .await
             .map_err(|_| BrokerError::TaskGone {
                 connection_id: self.connection_id,
@@ -453,18 +585,14 @@ impl BrokerHandle {
         })?
     }
 
-    /// Submit a (possibly mixed numeric + string) write batch and await its
-    /// result. Same fail-fast-when-down policy as [`Self::read`].
-    pub async fn write(
-        &self,
-        requests: Vec<BatchWriteRequest>,
-    ) -> Result<Vec<WriteResult>, BrokerError> {
+    /// Submit a write batch and await its result: one `Result<(), ItemError>`
+    /// per item, in order. The whole batch is one job - nothing else runs on
+    /// the session until it is done (one logical write, design §9). Same
+    /// fail-fast-when-down policy as [`Self::read`].
+    pub async fn write(&self, items: Vec<WriteItem>) -> WriteOutcome {
         let (respond_to, rx) = oneshot::channel();
         self.tx
-            .send(Job::Write {
-                requests,
-                respond_to,
-            })
+            .send(Job::Write { items, respond_to })
             .await
             .map_err(|_| BrokerError::TaskGone {
                 connection_id: self.connection_id,
@@ -476,7 +604,7 @@ impl BrokerHandle {
 
     /// A read-only view of this handle - clonable, structurally incapable of
     /// submitting a write (there is no `write` method on [`ReadOnlyHandle`]
-    /// at all). relay-wright's W3-B hands this to its `poller` module.
+    /// at all).
     pub fn read_only(&self) -> ReadOnlyHandle {
         ReadOnlyHandle {
             inner: self.clone(),
@@ -486,9 +614,6 @@ impl BrokerHandle {
     /// A live view of this connection's session state - see
     /// [`BrokerConnectionStatus`] and the module doc's "Connection status
     /// observability" section for why this exists and who consumes it.
-    /// Cloning the returned [`watch::Receiver`] (as this method does
-    /// internally) is cheap and every clone tracks the same underlying value
-    /// independently - standard `tokio::sync::watch` semantics.
     pub fn status_watch(&self) -> watch::Receiver<BrokerConnectionStatus> {
         self.status_rx.clone()
     }
@@ -501,17 +626,14 @@ pub struct ReadOnlyHandle {
 }
 
 impl ReadOnlyHandle {
-    /// Identical to [`BrokerHandle::slmp_cpu`].
-    pub fn slmp_cpu(&self) -> Option<SlmpCpu> {
-        self.inner.slmp_cpu()
+    /// Identical to [`BrokerHandle::settings_fingerprint`].
+    pub fn settings_fingerprint(&self) -> Option<SettingsFingerprint> {
+        self.inner.settings_fingerprint()
     }
 
     /// Identical to [`BrokerHandle::read`].
-    pub async fn read(
-        &self,
-        requests: Vec<BatchReadRequest>,
-    ) -> Result<Vec<BatchReadResult>, BrokerError> {
-        self.inner.read(requests).await
+    pub async fn read(&self, specs: Vec<TagSpec>) -> ReadOutcome {
+        self.inner.read(specs).await
     }
 
     /// Identical to [`BrokerHandle::status_watch`].
@@ -522,17 +644,14 @@ impl ReadOnlyHandle {
 
 /// Test-only fake broker: a [`BrokerHandle`] backed by a task that answers
 /// every job successfully with no network and no clock - reads with an empty
-/// result set, writes with all-[`WriteResult::Ok`]. Lets a caller's own unit
-/// tests (e.g. relay-wright's `writer.rs` rate-limit gate test) drive code
-/// that requires a write-capable handle fully deterministically, without
-/// standing up a real (simulated) PLC session.
+/// result set, writes with an `Ok(())` per item. Lets a caller's own unit
+/// tests drive code that requires a write-capable handle fully
+/// deterministically, without standing up a real (simulated) PLC session.
 ///
-/// `pub` behind the `test-util` feature (rather than `pub(crate)`, as it was
-/// pre-extraction) so a consumer's own test code can reach it too - this is
-/// the whole reason the feature exists (see the crate's `[features]` doc in
-/// `Cargo.toml`). The returned handle's [`BrokerHandle::status_watch`]
-/// reports [`BrokerConnectionStatus::Connected`] once and never changes: this
-/// fake never disconnects, so there is nothing to transition to.
+/// `pub` behind the `test-util` feature so a consumer's own test code can
+/// reach it too (see the crate's `[features]` doc in `Cargo.toml`). The
+/// returned handle's [`BrokerHandle::status_watch`] reports
+/// [`BrokerConnectionStatus::Connected`] once and never changes.
 #[cfg(any(test, feature = "test-util"))]
 pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, JoinHandle<()>) {
     let (handle, _status_tx, task) =
@@ -547,16 +666,12 @@ pub fn spawn_test_handle_answering_ok(connection_id: i64) -> (BrokerHandle, Join
 /// socket and no backoff timing to race against.
 ///
 /// Added for banto-hub #344 (2026-09-15): `broker_glue::BrokerReadClient::connect`
-/// now answers from this very watch channel (it used to return `Ok`
-/// unconditionally, which made banto-collect emit a bogus
-/// `plc_reconnected`/`plc_disconnected` pair on every collection tick while a
-/// PLC was unreachable), and that behavior is only testable if a test can
-/// publish the statuses a real `run_broker_task` would.
+/// answers from this very watch channel, and that behavior is only testable
+/// if a test can publish the statuses a real `run_broker_task` would.
 ///
 /// **Keep the returned sender alive for as long as the test needs the
 /// status.** Dropping it closes the watch channel, which is exactly how a
-/// consumer observes "the broker task has exited" - useful on purpose, but
-/// surprising if it happens by accident.
+/// consumer observes "the broker task has exited".
 #[cfg(any(test, feature = "test-util"))]
 pub fn spawn_test_handle_with_status(
     connection_id: i64,
@@ -574,11 +689,8 @@ pub fn spawn_test_handle_with_status(
                 Job::Read { respond_to, .. } => {
                     let _ = respond_to.send(Ok(Vec::new()));
                 }
-                Job::Write {
-                    requests,
-                    respond_to,
-                } => {
-                    let _ = respond_to.send(Ok(requests.iter().map(|_| WriteResult::Ok).collect()));
+                Job::Write { items, respond_to } => {
+                    let _ = respond_to.send(Ok(items.iter().map(|_| Ok(())).collect()));
                 }
             }
         }
@@ -588,54 +700,46 @@ pub fn spawn_test_handle_with_status(
             connection_id,
             tx,
             status_rx,
-            slmp_cpu: None,
+            fingerprint: None,
         },
         status_tx,
         task,
     )
 }
 
-/// A shared, growable directory of live broker sessions - the seam a caller
-/// like relay-wright's タグモニタ (tag monitor, feature/tag-monitor) uses to
-/// reach the SAME one-session-per-connection broker tasks the engine itself
-/// reads/writes through.
+/// A shared, growable directory of live broker sessions - the seam a
+/// secondary caller uses to reach the SAME one-session-per-connection broker
+/// tasks the engine itself reads/writes through.
 ///
 /// ## Why this exists (hard constraint: one SLMP session per connected port)
 ///
 /// The real R08ENCPU accepts only ONE concurrent SLMP TCP connection **per
 /// port** (verified on hardware 2026-08-07: a second connect to a port that
 /// already has a live session times out, while separate ports opened via the
-/// CPU's own parameters each carry their own simultaneous session fine - the
-/// 2026-08-06 note this doc previously carried, "only ONE concurrent SLMP TCP
-/// connection" with no qualifier, over-read that single-port observation as a
-/// whole-CPU limit). This still means a monitor-style caller must never open
-/// its own `SlmpClient` against a connection this crate already manages -
-/// every such read AND manual write goes through the broker task that already
-/// owns that connection's one session on its one port - because
-/// [`banto_tags::PlcConnection`] fixes one port per connection row; nothing
-/// here changes with the correction, since the broker's value was always
-/// "serialize read/write on the one session a connection actually holds", not
-/// "the CPU can only ever have one session total".
+/// CPU's own parameters each carry their own simultaneous session fine).
+/// This means a monitor-style caller must never open its own client against
+/// a connection this crate already manages - every such read AND manual
+/// write goes through the broker task that already owns that connection's
+/// one session on its one port - because [`banto_tags::PlcConnection`] fixes
+/// one port per connection row. (Some Modbus TCP devices, e.g. the オムロン
+/// KM-D1-ETN, have the same one-client limit, #337.)
 ///
 /// ## On-demand sessions
 ///
 /// [`BrokerSupervisor::spawn`] seeds this directory with one task per
-/// connection the caller's engine manages (e.g. every enabled SLMP connection
-/// at relay-wright's engine start). A secondary caller (relay-wright's
-/// monitor) may legitimately ask for a connection the engine has no task for:
-/// one created/enabled AFTER the engine started, or one on an engine built
-/// with an explicit connection subset. [`SessionDirectory::ensure_connection`]
+/// connection the caller's engine manages. A secondary caller may
+/// legitimately ask for a connection the engine has no task for: one
+/// created/enabled AFTER the engine started. [`SessionDirectory::ensure_connection`]
 /// spawns a broker task for such a connection ON FIRST USE and keeps it (an
 /// idle task is one parked socket + a reconnect loop - cheap), so subsequent
-/// polls reuse the session exactly like the engine's own poller does.
+/// polls reuse the session.
 ///
 /// ## Lifecycle
 ///
 /// All spawned tasks - seeded and on-demand alike - share the supervisor's
 /// one shutdown `watch`, so [`BrokerSupervisor::shutdown`] stops every task
 /// this directory ever created (the tasks map is shared; shutdown drains
-/// and awaits it). Clones of this directory held past shutdown (e.g. by a
-/// caller-defined control handle kept around) simply get
+/// and awaits it). Clones of this directory held past shutdown simply get
 /// [`BrokerError::TaskGone`] / closed-channel errors - never a new session on
 /// a dead engine's watch, because `ensure_connection` on a shut-down
 /// directory spawns a task whose `shutdown_rx` already reads `true`, which
@@ -643,37 +747,28 @@ pub fn spawn_test_handle_with_status(
 ///
 /// ## Removal ([`Self::remove`], T7-2 backlog item, 2026-08-05)
 ///
-/// T2-2 originally left session sync one-directional (`ensure_connection`
-/// only - see banto-hub's `broker_glue` module doc for that history).
-/// [`Self::remove`] completes it: it drops this directory's own
-/// [`BrokerHandle`] clone (and forgets, without `.await`ing, the tracked
-/// [`JoinHandle`]) for one connection id. A broker task exits when *every*
-/// clone of its handle - wherever else a caller may have stashed one, e.g.
-/// captured inside a long-lived `ClientFactory` closure - has been dropped
-/// (see `run_broker_task`'s `rx.recv() == None` branch); this directory's own
+/// [`Self::remove`] drops this directory's own [`BrokerHandle`] clone (and
+/// forgets, without `.await`ing, the tracked [`JoinHandle`]) for one
+/// connection id. A broker task exits when *every* clone of its handle -
+/// wherever else a caller may have stashed one - has been dropped (see
+/// `run_broker_task`'s `rx.recv() == None` branch); this directory's own
 /// clone is necessary but not always sufficient for that, so a caller with
 /// other long-lived handle owners is responsible for releasing those
-/// promptly too if it wants removal to actually free the task's resources in
-/// a timely manner. We deliberately do not await the removed `JoinHandle`
-/// here: by the time a caller like banto-hub's rebuild calls `remove`, its
-/// OWN other references are typically already gone (it orders its collector
-/// reconfiguration - which stops the connection's collect task - before
-/// calling this), but nothing in this crate can prove that generically for
-/// every caller, so blocking on the join here would risk hanging
-/// indefinitely rather than trading away a small, bounded resource leak - a
-/// worse failure mode than a task that simply finishes a little later in the
-/// background.
+/// promptly too. We deliberately do not await the removed `JoinHandle`
+/// here: nothing in this crate can prove generically that every other
+/// reference is gone, so blocking on the join here would risk hanging
+/// indefinitely rather than trading away a small, bounded resource leak.
 #[derive(Clone)]
 pub struct SessionDirectory {
-    handles: std::sync::Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
-    tasks: std::sync::Arc<std::sync::Mutex<HashMap<i64, TaskEntry>>>,
-    backoff: BackoffConfig,
-    /// Which protocols this directory can spawn a task for, and how each one
-    /// dials (R1-3a: injected through [`BrokerSupervisor::spawn`]).
-    drivers: DriverTable,
+    handles: Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
+    tasks: Arc<std::sync::Mutex<HashMap<i64, TaskEntry>>>,
+    /// The drivers this directory dials through (R2b-3a-2: the registry's
+    /// session-type entries; see [`is_broker_managed`]).
+    registry: Arc<DriverRegistry>,
+    options: BrokerOptions,
     /// Shared (via `Arc`) with [`BrokerSupervisor`] so on-demand tasks
     /// subscribe to the SAME shutdown trigger as the seeded ones.
-    shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
+    shutdown_tx: Arc<watch::Sender<bool>>,
 }
 
 /// The task-local stop signal travels with the join handle. The supervisor
@@ -684,109 +779,24 @@ struct TaskEntry {
     join_handle: JoinHandle<()>,
 }
 
-/// What one [`DriverTable`] entry hands back for a connection (R1-3a,
-/// docs/banto-driver-api-design.md §4.4): the reusable "dial a fresh
-/// session" step for its broker task, plus - for SLMP only - the CPU type the
-/// session was configured with, which [`SessionDirectory::ensure_connection`]
-/// copies onto the new [`BrokerHandle`] (#605, [`BrokerHandle::slmp_cpu`]).
-///
-/// Only the connector is a driver's business; spawning the task that owns it
-/// (`TaskEntry`, the job loop, the status watch) stays inside this crate -
-/// that is why the old `DriverSpawn` (which returned the private
-/// `TaskEntry`) could not be made public as is.
-pub struct DriverDial {
-    pub connector: Connector,
-    /// `Some` only for an SLMP session (see [`BrokerHandle::slmp_cpu`]).
-    pub slmp_cpu: Option<SlmpCpu>,
-}
-
-/// One [`DriverTable`] entry's dial function: given a connection already
-/// confirmed to match this entry's protocol string and its already-validated
-/// `u16` port, build that connection's [`DriverDial`]. Must not do I/O - it
-/// is called under [`SessionDirectory`]'s handle lock; the actual dial
-/// happens later, inside the spawned task, each time the [`Connector`] runs.
-pub type DialFn = fn(&PlcConnection, u16) -> DriverDial;
-
-/// [`DriverTable::new`] was given the same [`DriverId`] twice.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DuplicateDriverId(pub DriverId);
-
-impl std::fmt::Display for DuplicateDriverId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "driver id {:?} is registered twice", self.0.as_str())
-    }
-}
-
-impl std::error::Error for DuplicateDriverId {}
-
-/// The protocol -> driver dispatch table [`SessionDirectory::ensure_connection`]
-/// consults (Issue #130 D5; injected since R1-3a, docs/banto-driver-api-design.md
-/// §4.4 - it used to be the fixed `const DRIVERS` of this crate). Whatever
-/// builds the [`BrokerSupervisor`] decides which protocols the broker
-/// manages, and keeps a clone of the same table to answer that question
-/// elsewhere ([`Self::is_supported`]; banto-hub's
-/// `HubSessions::is_broker_managed`). Cheap to clone (`Arc`).
-#[derive(Clone)]
-pub struct DriverTable {
-    entries: std::sync::Arc<[(DriverId, DialFn)]>,
-}
-
-impl DriverTable {
-    /// A table of `entries`, in the given order. Rejects a repeated id: one
-    /// protocol string must map to exactly one driver.
-    pub fn new(entries: Vec<(DriverId, DialFn)>) -> Result<Self, DuplicateDriverId> {
-        for (i, (id, _)) in entries.iter().enumerate() {
-            if entries[..i].iter().any(|(earlier, _)| earlier == id) {
-                return Err(DuplicateDriverId(id.clone()));
-            }
-        }
-        Ok(Self {
-            entries: entries.into(),
-        })
-    }
-
-    /// Whether `protocol` has an entry in this table - the single source of
-    /// truth for "does the broker manage this connection's protocol" (until
-    /// R1-3a a free function of this crate), so a caller outside this crate
-    /// never hardcodes the list of protocol strings. Mirrors
-    /// [`Self::dial_for`], which [`SessionDirectory::ensure_connection`] uses.
-    pub fn is_supported(&self, protocol: &str) -> bool {
-        self.dial_for(protocol).is_some()
-    }
-
-    /// The dial function registered for `protocol`, if any.
-    pub fn dial_for(&self, protocol: &str) -> Option<DialFn> {
-        self.entries
-            .iter()
-            .find(|(id, _)| id.as_str() == protocol)
-            .map(|(_, dial)| *dial)
-    }
-
-    /// Every registered id, in table order.
-    pub fn ids(&self) -> impl Iterator<Item = &DriverId> {
-        self.entries.iter().map(|(id, _)| id)
-    }
-}
-
-impl std::fmt::Debug for DriverTable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_list().entries(self.ids()).finish()
-    }
-}
-
 impl SessionDirectory {
     fn new(
-        backoff: BackoffConfig,
-        drivers: DriverTable,
-        shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
+        registry: Arc<DriverRegistry>,
+        options: BrokerOptions,
+        shutdown_tx: Arc<watch::Sender<bool>>,
     ) -> Self {
         Self {
-            handles: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            tasks: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
-            backoff,
-            drivers,
+            handles: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            registry,
+            options,
             shutdown_tx,
         }
+    }
+
+    /// The registry this directory dials through.
+    pub fn registry(&self) -> &Arc<DriverRegistry> {
+        &self.registry
     }
 
     /// The handle for one connection, if a task is already running for it.
@@ -799,10 +809,7 @@ impl SessionDirectory {
     }
 
     /// The connection-status watch for `connection_id`, if a task is already
-    /// running for it - see [`BrokerHandle::status_watch`]. A convenience
-    /// wrapper (`handle(id).map(BrokerHandle::status_watch)`) for a caller
-    /// (banto-hub's `/api/v1/status`, T2-2) that holds a [`SessionDirectory`]
-    /// rather than an individual [`BrokerHandle`].
+    /// running for it - see [`BrokerHandle::status_watch`].
     pub fn status_watch(
         &self,
         connection_id: i64,
@@ -811,41 +818,73 @@ impl SessionDirectory {
     }
 
     /// The handle for `conn`, spawning its broker task first if none is
-    /// running yet (see the struct doc's on-demand policy). Rejects a
-    /// connection whose `protocol` has no entry in this directory's
-    /// [`DriverTable`] with [`BrokerError::UnsupportedProtocol`] - with
-    /// `banto-drivers`' `builtin().broker`, `"slmp"` and `"modbus-tcp"` are
-    /// the two registered (see the module doc's "Protocol abstraction"
-    /// section), so this still rejects everything else exactly as it did when
-    /// this was a direct `!= SLMP_PROTOCOL` check.
+    /// running yet (see the struct doc's on-demand policy), dialing with the
+    /// connection's own settings (`banto_tags::settings_to_api(&conn.settings)`,
+    /// secrets left out - they are opened only by the dial, see
+    /// [`SecretOpener`]). See [`Self::ensure_connection_with_settings`].
     pub fn ensure_connection(&self, conn: &PlcConnection) -> Result<BrokerHandle, BrokerError> {
-        let dial = self.drivers.dial_for(&conn.protocol).ok_or_else(|| {
+        self.ensure_connection_with_settings(conn, banto_tags::settings_to_api(&conn.settings))
+    }
+
+    /// As [`Self::ensure_connection`], dialing with `settings` instead of the
+    /// connection's own (banto-hub's simulation registry hands the settings
+    /// with `host` / `port` replaced by its simulator's, design §4.4).
+    ///
+    /// Rejects a protocol without a session-type driver in the registry with
+    /// [`BrokerError::UnsupportedProtocol`], and settings the driver's
+    /// `validate_config` refuses with [`BrokerError::InvalidSettings`] - both
+    /// before looking for an existing session, both without any I/O (this
+    /// runs under the directory's lock). An existing session for `conn.id` is
+    /// returned as is: it is the caller's job to [`Self::remove`] a session
+    /// whose settings changed first (compare
+    /// [`BrokerHandle::settings_fingerprint`]).
+    pub fn ensure_connection_with_settings(
+        &self,
+        conn: &PlcConnection,
+        settings: Settings,
+    ) -> Result<BrokerHandle, BrokerError> {
+        let driver = session_driver(&self.registry, &conn.protocol).ok_or_else(|| {
             BrokerError::UnsupportedProtocol {
                 connection_id: conn.id,
                 protocol: conn.protocol.clone(),
             }
         })?;
-        let port = u16::try_from(conn.port).map_err(|_| BrokerError::InvalidPort {
-            connection_id: conn.id,
-            port: conn.port,
-        })?;
+        let refused = driver.validate_config(&settings);
+        if !refused.is_empty() {
+            let reason = refused
+                .iter()
+                .map(|e| format!("{}: {}", e.key, e.message))
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(BrokerError::InvalidSettings {
+                connection_id: conn.id,
+                reason,
+            });
+        }
 
         let mut handles = self.handles.lock().expect("session directory poisoned");
         if let Some(handle) = handles.get(&conn.id) {
             return Ok(handle.clone());
         }
 
-        let DriverDial {
-            connector,
-            slmp_cpu,
-        } = dial(conn, port);
+        let secret_keys = driver.secret_keys();
+        let fingerprint = SettingsFingerprint::of_connection(Some(conn), &settings, &secret_keys);
+        let connector = session_connector(
+            conn.clone(),
+            driver,
+            settings,
+            secret_keys,
+            self.options.timeouts,
+            Arc::clone(&self.options.secrets),
+        );
         let (mut handle, task) = spawn_task_with_connector(
             conn.id,
             connector,
-            self.backoff,
+            self.options.backoff,
+            self.options.timeouts,
             self.shutdown_tx.subscribe(),
         );
-        handle.slmp_cpu = slmp_cpu;
+        handle.fingerprint = Some(fingerprint);
         handles.insert(conn.id, handle.clone());
         self.tasks
             .lock()
@@ -856,8 +895,7 @@ impl SessionDirectory {
 
     /// How many broker sessions are currently tracked (seeded + on-demand,
     /// minus anything [`Self::remove`]d since). Mainly a test/diagnostic
-    /// helper - banto-hub's T7-2 E2E suite uses it to confirm a deleted
-    /// connection's session was actually untracked.
+    /// helper.
     pub fn connection_count(&self) -> usize {
         self.tasks.lock().expect("session directory poisoned").len()
     }
@@ -865,7 +903,8 @@ impl SessionDirectory {
     /// Every connection id currently tracked (seeded + on-demand, minus
     /// anything [`Self::remove`]d since) - the set a caller like banto-hub's
     /// `CollectorManager::rebuild` diffs against the registry's current
-    /// enabled-SLMP-connection set to find sessions to [`Self::remove`].
+    /// enabled broker-managed connection set to find sessions to
+    /// [`Self::remove`].
     pub fn connection_ids(&self) -> Vec<i64> {
         self.handles
             .lock()
@@ -898,8 +937,9 @@ impl SessionDirectory {
     ///
     /// The per-task signal is independent of the shared supervisor shutdown
     /// signal. Outstanding [`BrokerHandle`] clones therefore cannot keep this
-    /// task alive: it observes its own signal, closes its socket, and the
-    /// tracked join handle is awaited here.
+    /// task alive: it observes its own signal, disconnects its session
+    /// (bounded by [`DISCONNECT_LIMIT`]), and the tracked join handle is
+    /// awaited here.
     pub async fn stop_and_join(&self, connection_id: i64) -> bool {
         let entry = self
             .tasks
@@ -924,49 +964,173 @@ impl SessionDirectory {
     }
 }
 
-/// Spawns and owns one broker task per SLMP [`PlcConnection`], and hands out
-/// [`BrokerHandle`]s keyed by connection id. The handle/task bookkeeping
-/// lives in a [`SessionDirectory`] (shared, so a secondary caller like
-/// relay-wright's tag monitor can add on-demand sessions that this supervisor
-/// still shuts down - see that struct's doc).
+/// The [`Connector`] [`SessionDirectory::ensure_connection_with_settings`]
+/// builds for one connection: on every attempt, open the driver's secret
+/// keys that `conn.settings` holds a reference for (only those, design §4.2),
+/// add them to a copy of `settings`, `SessionDriver::connect` with a
+/// `ConnectContext` (`conn:{id}`, the two timeouts). The copy lives in an
+/// [`OpenedSettings`] from before the first secret is opened, so the opened
+/// values are zeroized however the attempt ends - success, error, or the
+/// future being dropped (the `connect_attempt` bound of design §5.5, or the
+/// task being stopped or aborted while an opener or the dial is pending).
+fn session_connector(
+    conn: PlcConnection,
+    driver: Arc<dyn SessionDriver>,
+    settings: Settings,
+    secret_keys: Vec<String>,
+    timeouts: SessionTimeouts,
+    secrets: Arc<dyn SecretOpener>,
+) -> Connector {
+    let shared = Arc::new((conn, driver, settings, secret_keys, secrets));
+    Arc::new(move || {
+        let shared = Arc::clone(&shared);
+        Box::pin(async move {
+            let (conn, driver, settings, secret_keys, secrets) = &*shared;
+            let mut guard = OpenedSettings::new(settings.clone());
+            for key in secret_keys {
+                if matches!(
+                    conn.secret_ref_lookup(key),
+                    banto_tags::SecretRefLookup::Absent
+                ) {
+                    continue;
+                }
+                match secrets.open(conn, key).await {
+                    Ok(Some(value)) => guard.insert_opened(key, value.as_str()),
+                    Ok(None) => {}
+                    Err(reason) => {
+                        return Err(FatalError::InvalidConfig(format!(
+                            "秘密値 {key} を開けません: {reason}"
+                        )));
+                    }
+                }
+            }
+            let cx = ConnectContext::new(
+                format!("conn:{}", conn.id),
+                timeouts.connect,
+                timeouts.response,
+            );
+            driver.connect(guard.settings(), cx).await
+        })
+    })
+}
+
+/// A connect attempt's copy of the settings with the opened secrets in it.
+/// On drop (however the attempt ends, including the future being
+/// cancelled) the values of the opened keys are overwritten before the
+/// copy is freed.
+struct OpenedSettings {
+    settings: Settings,
+    opened: Vec<String>,
+}
+
+impl OpenedSettings {
+    fn new(settings: Settings) -> Self {
+        OpenedSettings {
+            settings,
+            opened: Vec::new(),
+        }
+    }
+
+    /// Put an opened secret under `key` (it is zeroized on drop).
+    fn insert_opened(&mut self, key: &str, value: &str) {
+        // Recorded before the insert: the value is covered from the moment
+        // it is in the copy.
+        self.opened.push(key.to_string());
+        self.settings.insert(key, value);
+    }
+
+    fn settings(&self) -> &Settings {
+        &self.settings
+    }
+}
+
+impl Drop for OpenedSettings {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        if self.opened.is_empty() {
+            return;
+        }
+        let items: Vec<banto_driver_api::Setting> = std::mem::take(&mut self.settings).into();
+        for mut item in items {
+            if self.opened.contains(&item.key) {
+                #[cfg(test)]
+                zeroized_for_test::record(&item.value);
+                item.value.zeroize();
+            }
+        }
+    }
+}
+
+/// Test-only record of the secret values [`OpenedSettings`] zeroized, so a
+/// test can see the guard ran on a path where the future was dropped. Tests
+/// use values unique to them, so parallel tests do not see each other.
+#[cfg(test)]
+mod zeroized_for_test {
+    use std::sync::Mutex;
+
+    static ZEROIZED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    pub(crate) fn record(value: &str) {
+        ZEROIZED.lock().unwrap().push(value.to_string());
+    }
+
+    /// Whether `value` has been zeroized by a guard.
+    pub(crate) fn contains(value: &str) -> bool {
+        ZEROIZED.lock().unwrap().iter().any(|v| v == value)
+    }
+}
+
+/// Spawns and owns one broker task per [`PlcConnection`] it is given, and
+/// hands out [`BrokerHandle`]s keyed by connection id. The handle/task
+/// bookkeeping lives in a [`SessionDirectory`] (shared, so a secondary
+/// caller can add on-demand sessions that this supervisor still shuts down -
+/// see that struct's doc).
 pub struct BrokerSupervisor {
     directory: SessionDirectory,
     /// Out-of-band shutdown trigger shared with every task via a cloned
     /// [`watch::Receiver`] - see [`Self::shutdown`]. Independent of the job
     /// mpsc: a task must stop even while a [`BrokerHandle`] (and therefore a
-    /// live `Sender`) is still held by some caller (a poller/writer that
-    /// outlives the supervisor by design), which the mpsc-closes path alone
-    /// can never signal. `Arc`-shared with the directory so on-demand tasks
-    /// subscribe to the same trigger.
-    shutdown_tx: std::sync::Arc<watch::Sender<bool>>,
+    /// live `Sender`) is still held by some caller. `Arc`-shared with the
+    /// directory so on-demand tasks subscribe to the same trigger.
+    shutdown_tx: Arc<watch::Sender<bool>>,
 }
 
 impl BrokerSupervisor {
-    /// Spawn one broker task per connection in `connections`. Every entry
-    /// must be `protocol == "slmp"` - the first one that is not aborts the
-    /// whole call with [`BrokerError::UnsupportedProtocol`] (see that
-    /// variant's doc for why a reject-the-batch policy beats silently
-    /// skipping). Tasks already spawned for earlier connections in the slice
-    /// are simply dropped in that case: nothing has been handed out yet
-    /// (`Self` is only returned on full success), so the directory's Arcs -
-    /// including the shutdown `Sender` - drop with it, every task's
-    /// `shutdown_rx.changed()` resolves `Err`, and they exit immediately -
-    /// no explicit cleanup needed.
-    ///
-    /// `drivers` (R1-3a, docs/banto-driver-api-design.md §4.4) decides which
-    /// protocols this supervisor - and every [`SessionDirectory`] clone it
-    /// hands out - can spawn a task for, and how each one dials. A host passes
-    /// `banto-drivers`' `builtin().broker` for the `"slmp"` / `"modbus-tcp"`
-    /// pair the broker has always served (R1-4a: this crate no longer has a
-    /// built-in table of its own).
+    /// [`Self::spawn_with`] with `backoff` and the default timeouts and
+    /// secret opener ([`BrokerOptions::default`]).
     pub fn spawn(
         connections: &[PlcConnection],
         backoff: BackoffConfig,
-        drivers: DriverTable,
+        registry: Arc<DriverRegistry>,
+    ) -> Result<Self, BrokerError> {
+        Self::spawn_with(
+            connections,
+            registry,
+            BrokerOptions {
+                backoff,
+                ..BrokerOptions::default()
+            },
+        )
+    }
+
+    /// Spawn one broker task per connection in `connections`, dialing through
+    /// `registry` (R2b-3a-2: its session-type entries; see
+    /// [`is_broker_managed`]). The first connection that cannot be dialed
+    /// ([`BrokerError::UnsupportedProtocol`] /
+    /// [`BrokerError::InvalidSettings`]) aborts the whole call. Tasks already
+    /// spawned for earlier connections in the slice are simply dropped in
+    /// that case: nothing has been handed out yet (`Self` is only returned on
+    /// full success), so the directory's Arcs - including the shutdown
+    /// `Sender` - drop with it, every task's `shutdown_rx.changed()` resolves
+    /// `Err`, and they exit immediately.
+    pub fn spawn_with(
+        connections: &[PlcConnection],
+        registry: Arc<DriverRegistry>,
+        options: BrokerOptions,
     ) -> Result<Self, BrokerError> {
         let (shutdown_tx, _shutdown_rx) = watch::channel(false);
-        let shutdown_tx = std::sync::Arc::new(shutdown_tx);
-        let directory = SessionDirectory::new(backoff, drivers, shutdown_tx.clone());
+        let shutdown_tx = Arc::new(shutdown_tx);
+        let directory = SessionDirectory::new(registry, options, shutdown_tx.clone());
 
         for conn in connections {
             directory.ensure_connection(conn)?;
@@ -984,9 +1148,7 @@ impl BrokerSupervisor {
         self.directory.handle(connection_id)
     }
 
-    /// A clone of the shared session directory - the seam a caller like
-    /// relay-wright's monitor carries alongside its own control handle (see
-    /// [`SessionDirectory`]).
+    /// A clone of the shared session directory (see [`SessionDirectory`]).
     pub fn directory(&self) -> SessionDirectory {
         self.directory.clone()
     }
@@ -1000,24 +1162,15 @@ impl BrokerSupervisor {
     /// Clean shutdown: flip the shared shutdown trigger so every task breaks
     /// out of its job loop on its own, then await each task's graceful exit.
     ///
-    /// This does *not* rely on every [`BrokerHandle`] having been dropped.
-    /// The mpsc `Sender` a `BrokerHandle` holds only closes (`rx.recv() ==
-    /// None`) once *all* clones are gone, but a realistic caller (a
-    /// long-lived poller/writer) holds a handle for the whole app lifetime -
-    /// dropping only the handle map would leave that `Sender` alive and the
-    /// task blocked in `rx.recv()` forever. The `watch` signal is
-    /// out-of-band from that mpsc entirely, so it stops the task regardless
-    /// of how many `BrokerHandle`s are still outstanding elsewhere. The
-    /// directory's handle map is cleared too so `BrokerHandle` clones the
-    /// directory itself owned release their `Sender`s, though the tasks no
-    /// longer depend on that to exit. On-demand tasks the [`SessionDirectory`]
-    /// added after spawn share the same tasks map, so they are awaited here
-    /// exactly like the seeded ones. A connection [`SessionDirectory::remove`]d
-    /// before shutdown is no longer in the map (`remove` forgets its
-    /// `JoinHandle` without awaiting it - see that method's doc) so this loop
-    /// does not wait on it specifically, but the task still receives the same
-    /// `shutdown_tx` signal every other task does (subscribed independently
-    /// of whether this directory still tracks it) and exits on its own.
+    /// This does *not* rely on every [`BrokerHandle`] having been dropped: a
+    /// realistic caller (a long-lived poller/writer) holds a handle for the
+    /// whole app lifetime, and the `watch` signal is out-of-band from the job
+    /// mpsc, so it stops the task regardless. On-demand tasks the
+    /// [`SessionDirectory`] added after spawn share the same tasks map, so
+    /// they are awaited here exactly like the seeded ones. A connection
+    /// [`SessionDirectory::remove`]d before shutdown is no longer in the map,
+    /// but its task still receives the same `shutdown_tx` signal and exits on
+    /// its own.
     pub async fn shutdown(self) {
         let _ = self.shutdown_tx.send(true);
         self.directory
@@ -1041,19 +1194,18 @@ impl BrokerSupervisor {
 
 /// Build one connection's `(handle, task)` pair from an already-built
 /// [`Connector`] - the protocol-agnostic core
-/// [`SessionDirectory::ensure_connection`] calls with whatever connector its
-/// [`DriverTable`] entry dialed (and this crate's unit tests with a
-/// `fake::connector`), factored out (#131, 2026-09-01) so a second driver did not
-/// need its own copy of this bookkeeping. `slmp_cpu` starts `None`; the
-/// caller fills it from [`DriverDial::slmp_cpu`]. `shutdown_rx` is the
-/// task's clone of the supervisor-wide shutdown trigger (see
-/// [`BrokerSupervisor::shutdown`]); a caller that does not need that path
-/// (e.g. a test that only ever drops its lone `BrokerHandle`) can pass a
-/// receiver from a `watch::channel` it never signals.
+/// [`SessionDirectory::ensure_connection_with_settings`] calls with the
+/// connector it built from the registry's driver (and this crate's unit
+/// tests with a `fake` connector). `fingerprint` starts `None`; the caller
+/// fills it. `shutdown_rx` is the task's clone of the supervisor-wide
+/// shutdown trigger (see [`BrokerSupervisor::shutdown`]); a caller that does
+/// not need that path can pass a receiver from a `watch::channel` it never
+/// signals.
 fn spawn_task_with_connector(
     connection_id: i64,
     connector: Connector,
     backoff: BackoffConfig,
+    timeouts: SessionTimeouts,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
     let (tx, rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
@@ -1067,6 +1219,7 @@ fn spawn_task_with_connector(
         connection_id,
         connector,
         backoff,
+        timeouts,
         rx,
         shutdown_rx,
         stop_rx,
@@ -1077,7 +1230,7 @@ fn spawn_task_with_connector(
             connection_id,
             tx,
             status_rx,
-            slmp_cpu: None,
+            fingerprint: None,
         },
         TaskEntry {
             stop_tx,
@@ -1093,22 +1246,16 @@ enum ConnState {
     Backoff { at: Instant },
     /// A connect attempt is running in a spawned sub-task, so a slow
     /// `connect()` cannot stall the job loop.
-    Connecting(JoinHandle<Result<Box<dyn BrokerSession>, String>>),
+    Connecting(JoinHandle<Result<Box<dyn Session>, FatalError>>),
     /// Connected and owning the live session - the only state in which a
-    /// [`Job`] is actually serviced. `Box<dyn BrokerSession>` is required for
-    /// `dyn` dispatch, and incidentally keeps this variant small the same way
-    /// the pre-#130 `Box<slmp::SLMPClient>` did (`slmp::SLMPClient` carries a
-    /// fixed internal receive buffer that would otherwise make this variant
-    /// far larger than `ConnState`'s other variants; that data now simply
-    /// lives on the same heap allocation, inside whichever session type a
-    /// driver's `Connector` produced).
-    Connected(Box<dyn BrokerSession>),
+    /// [`Job`] is actually serviced.
+    Connected(Box<dyn Session>),
 }
 
 /// What woke the connection side of the task's `select!`.
 enum ConnEvent {
     Due,
-    Finished(Result<Box<dyn BrokerSession>, String>),
+    Finished(Result<Box<dyn Session>, FatalError>),
     JoinError,
 }
 
@@ -1127,34 +1274,57 @@ async fn next_conn_event(state: &mut ConnState) -> ConnEvent {
 }
 
 /// Call `connector` once (see the module doc's "Reconnect / backoff policy"
-/// section) - the generic half of what a pre-#130 single `connect_attempt`
-/// did inline for SLMP specifically; the protocol-specific half now lives in
-/// each driver's own `Connector` (e.g. `banto-driver-slmp`'s).
-async fn connect_attempt(connector: Connector) -> Result<Box<dyn BrokerSession>, String> {
-    connector().await
+/// section), bounded at `connect_timeout + CONNECT_SLACK` (design §5.5): a
+/// driver that does not keep its `ConnectContext::connect_timeout` fails the
+/// attempt as [`FatalError::Timeout`] and the backoff retries, instead of
+/// leaving the task in `Connecting` for ever.
+async fn connect_attempt(
+    connector: Connector,
+    timeouts: SessionTimeouts,
+) -> Result<Box<dyn Session>, FatalError> {
+    tokio::time::timeout(timeouts.connect.saturating_add(CONNECT_SLACK), connector())
+        .await
+        .unwrap_or(Err(FatalError::Timeout))
+}
+
+/// Await one job's session future under `limit` (design §5.5) and check the
+/// result count: `expected` results or the job is
+/// [`FatalError::Protocol`]. On [`FatalError::Timeout`] the future has been
+/// dropped by the time this returns, and the caller drops the session.
+async fn bounded_job<T>(
+    limit: Duration,
+    expected: usize,
+    fut: banto_driver_api::BoxFuture<'_, Result<Vec<T>, FatalError>>,
+) -> Result<Vec<T>, FatalError> {
+    let results = tokio::time::timeout(limit, fut)
+        .await
+        .unwrap_or(Err(FatalError::Timeout))?;
+    if results.len() != expected {
+        return Err(FatalError::Protocol(format!(
+            "{expected} 件の要求に {} 件の結果が返りました",
+            results.len()
+        )));
+    }
+    Ok(results)
 }
 
 /// One connection's broker loop: owns this connection's session end-to-end
 /// (connect via `connector`, reconnect-with-backoff, disconnect on shutdown)
-/// and services [`Job`]s serialized through `rx`. Protocol-agnostic by
-/// construction (Issue #130 D4) - every read/write/disconnect call here goes
-/// through [`session::BrokerSession`], never a protocol-specific type or
-/// function; see the module doc's "Protocol abstraction" section. Exits on
-/// either of two independent signals:
+/// and services [`Job`]s serialized through `rx`, one at a time and each to
+/// completion (or to its outer bound, design §5.5). Protocol-agnostic by
+/// construction - every read/write/disconnect call here goes through
+/// `banto_driver_api::Session`. Exits on either of two independent signals:
 /// every [`BrokerHandle`] for this connection has been dropped (`rx.recv()`
-/// returns `None`), or the supervisor-wide shutdown trigger fires
-/// (`shutdown_rx` changes, or its `Sender` is dropped) - see
-/// [`BrokerSupervisor::shutdown`] for why the latter is needed: a `Job`
-/// sender clone can legitimately outlive the supervisor (a poller/writer
-/// holding a [`BrokerHandle`] for the app's lifetime), so the mpsc alone
-/// cannot be relied on to ever close. `status_tx` is sent to at every
-/// `ConnState` transition (see the module doc's "Connection status
-/// observability" section) - purely observational, it influences no control
-/// flow here.
+/// returns `None`), or the supervisor-wide shutdown / the per-connection
+/// stop trigger fires. `status_tx` is sent to at every `ConnState`
+/// transition (see the module doc's "Connection status observability"
+/// section) - purely observational, it influences no control flow here.
+#[allow(clippy::too_many_arguments)]
 async fn run_broker_task(
     connection_id: i64,
     connector: Connector,
     backoff_cfg: BackoffConfig,
+    timeouts: SessionTimeouts,
     mut rx: mpsc::Receiver<Job>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut stop_rx: watch::Receiver<bool>,
@@ -1168,9 +1338,7 @@ async fn run_broker_task(
             // Out-of-band shutdown trigger - see BrokerSupervisor::shutdown.
             // `changed()` resolves either when the value flips to `true`
             // (explicit shutdown) or when the Sender is dropped without ever
-            // sending (Err case): both mean "stop", so either way we break
-            // regardless of how many BrokerHandles/Senders for the job mpsc
-            // are still alive elsewhere.
+            // sending (Err case): both mean "stop".
             _ = shutdown_rx.changed() => {
                 break;
             }
@@ -1186,7 +1354,7 @@ async fn run_broker_task(
                     ConnEvent::Due => {
                         attempt += 1;
                         let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt });
-                        let handle = tokio::spawn(connect_attempt(connector.clone()));
+                        let handle = tokio::spawn(connect_attempt(connector.clone(), timeouts));
                         state = ConnState::Connecting(handle);
                     }
                     ConnEvent::Finished(Ok(session)) => {
@@ -1194,14 +1362,7 @@ async fn run_broker_task(
                         state = ConnState::Connected(session);
                         let _ = status_tx.send(BrokerConnectionStatus::Connected);
                     }
-                    ConnEvent::Finished(Err(_err)) => {
-                        let delay = backoff_delay(attempt, backoff_cfg);
-                        state = ConnState::Backoff {
-                            at: Instant::now() + delay,
-                        };
-                        let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: attempt + 1 });
-                    }
-                    ConnEvent::JoinError => {
+                    ConnEvent::Finished(Err(_)) | ConnEvent::JoinError => {
                         let delay = backoff_delay(attempt, backoff_cfg);
                         state = ConnState::Backoff {
                             at: Instant::now() + delay,
@@ -1218,62 +1379,44 @@ async fn run_broker_task(
                     break;
                 };
 
-                match job {
-                    Job::Read { requests, respond_to } => {
-                        // Two-step match (compute the outcome, then decide
-                        // `state`) mirrors banto-collect's task.rs: it keeps
-                        // the borrow of `state` from ending mid-await from
-                        // ever overlapping with the reassignment below.
-                        let outcome: Option<Result<Vec<BatchReadResult>, SessionError>> = match &mut state {
-                            ConnState::Connected(session) => {
-                                Some(session.read_batch(&requests).await)
-                            }
+                // Two-step match (compute the outcome, then decide `state`)
+                // mirrors banto-collect's task.rs: it keeps the borrow of
+                // `state` from ending mid-await from ever overlapping with the
+                // reassignment below.
+                let fatal = match job {
+                    Job::Read { specs, respond_to } => {
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                bounded_job(
+                                    read_job_limit(specs.len(), timeouts.response),
+                                    specs.len(),
+                                    session.read_batch(&specs),
+                                )
+                                .await,
+                            ),
                             _ => None,
                         };
-                        match outcome {
-                            Some(Ok(results)) => {
-                                let _ = respond_to.send(Ok(results));
-                            }
-                            Some(Err(err)) => {
-                                let _ = respond_to.send(Err(BrokerError::ConnectionFailed {
-                                    connection_id,
-                                    reason: err.to_string(),
-                                }));
-                                state = ConnState::Backoff { at: Instant::now() };
-                                attempt = 0;
-                                let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
-                            }
-                            None => {
-                                let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
-                            }
-                        }
+                        answer(connection_id, respond_to, outcome)
                     }
-                    Job::Write { requests, respond_to } => {
-                        let outcome: Option<Result<Vec<WriteResult>, SessionError>> =
-                            match &mut state {
-                                ConnState::Connected(session) => {
-                                    Some(session.write_batch(&requests).await)
-                                }
-                                _ => None,
-                            };
-                        match outcome {
-                            Some(Ok(results)) => {
-                                let _ = respond_to.send(Ok(results));
-                            }
-                            Some(Err(err)) => {
-                                let _ = respond_to.send(Err(BrokerError::ConnectionFailed {
-                                    connection_id,
-                                    reason: err.to_string(),
-                                }));
-                                state = ConnState::Backoff { at: Instant::now() };
-                                attempt = 0;
-                                let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
-                            }
-                            None => {
-                                let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
-                            }
-                        }
+                    Job::Write { items, respond_to } => {
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                bounded_job(
+                                    write_job_limit(items.len(), timeouts.response),
+                                    items.len(),
+                                    session.write_batch(&items),
+                                )
+                                .await,
+                            ),
+                            _ => None,
+                        };
+                        answer(connection_id, respond_to, outcome)
                     }
+                };
+                if fatal {
+                    state = ConnState::Backoff { at: Instant::now() };
+                    attempt = 0;
+                    let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
                 }
             }
         }
@@ -1291,86 +1434,122 @@ async fn run_broker_task(
             let _ = handle.await;
         }
         ConnState::Connected(mut session) => {
-            session.disconnect().await;
+            // Design §5.5: stopping must not hang on a session that never
+            // finishes its goodbye.
+            if tokio::time::timeout(DISCONNECT_LIMIT, session.disconnect())
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "banto-broker: 接続 {connection_id} の切断が {} 秒で終わらなかったため打ち切りました",
+                    DISCONNECT_LIMIT.as_secs()
+                );
+            }
         }
     }
     let _ = status_tx.send(BrokerConnectionStatus::Stopped);
 }
 
+/// Send a job's `outcome` (`None` = the session was not up) to the caller,
+/// mapping a fatal error to [`BrokerError::ConnectionFailed`]. Returns
+/// whether it was fatal (the caller drops the session).
+fn answer<T>(
+    connection_id: i64,
+    respond_to: oneshot::Sender<Result<Vec<T>, BrokerError>>,
+    outcome: Option<Result<Vec<T>, FatalError>>,
+) -> bool {
+    match outcome {
+        Some(Ok(results)) => {
+            let _ = respond_to.send(Ok(results));
+            false
+        }
+        Some(Err(err)) => {
+            let _ = respond_to.send(Err(BrokerError::ConnectionFailed {
+                connection_id,
+                reason: err.to_string(),
+            }));
+            true
+        }
+        None => {
+            let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    //! R1-4a (docs/banto-driver-api-design.md §4.4): the tests left here are
-    //! the protocol-independent ones, and they run on [`crate::fake`] - an
-    //! in-memory session - instead of the SLMP simulator, because this crate
-    //! no longer contains (or depends on) a real driver. The tests that pin
-    //! down SLMP / Modbus behaviour through the broker moved to
-    //! `banto-driver-slmp/tests/broker.rs` and
+    //! The protocol-independent tests, on [`crate::fake`] - an in-memory
+    //! session driver - because this crate does not contain (or depend on) a
+    //! real driver. The tests that pin down SLMP / Modbus behaviour through
+    //! the broker live in `banto-driver-slmp/tests/broker.rs` and
     //! `banto-driver-modbus/tests/broker.rs`.
 
     use std::time::Duration;
 
-    use banto_plc::{Address, DataType, PlcValue, ReadRequest, TagValue};
-    use banto_plc_write::WriteRequest;
+    use banto_driver_api::{DataType, DriverEntry};
     use futures_util::future::join_all;
+    use serde_json::json;
+    use zeroize::Zeroizing;
 
     use super::*;
-    use crate::fake::{self, FakePlc};
+    use crate::fake::{self, Behaviour, FakeDriver, FakePlc};
 
-    fn conn(id: i64, protocol: &str, host: &str, port: u16) -> PlcConnection {
-        PlcConnection {
+    const ID: &str = "fake";
+
+    fn conn_with(id: i64, protocol: &str, settings: serde_json::Value) -> PlcConnection {
+        let serde_json::Value::Object(settings) = settings else {
+            panic!("settings must be an object");
+        };
+        PlcConnection::from_settings(
             id,
-            name: format!("conn-{id}"),
-            protocol: protocol.to_string(),
-            host: host.to_string(),
-            port: port as i64,
-            unit_id: 1,
-            enabled: true,
-            simulation: false,
-
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: None,
-            username: None,
-            settings: Default::default(),
-            settings_version: 1,
-        }
+            format!("conn-{id}"),
+            protocol.to_string(),
+            true,
+            false,
+            settings,
+            1,
+        )
     }
 
-    /// The table every table-driven test below uses: the fake driver under
-    /// the `"slmp"` id (the old tests' `DriverTable::builtin()` connections
-    /// were all `"slmp"`).
-    fn fake_table() -> DriverTable {
-        DriverTable::new(vec![(driver_id("slmp"), fake::dial as DialFn)]).expect("one entry")
+    fn conn(id: i64, port: u16) -> PlcConnection {
+        conn_with(id, ID, json!({ "host": "127.0.0.1", "port": port }))
     }
 
-    /// A numeric read request wrapped as the `Numeric` case of the mixed batch
-    /// the broker speaks (S2 文字列タグ).
-    fn rreq(raw: &str, data_type: DataType) -> BatchReadRequest {
-        BatchReadRequest::Numeric(ReadRequest {
-            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-            data_type,
-        })
+    /// A registry with a fresh fake driver under [`ID`].
+    fn fake_registry() -> Arc<DriverRegistry> {
+        fake::registry_of(FakeDriver::new(ID, FakePlc::new()))
     }
 
-    fn wreq(raw: &str, data_type: DataType, value: TagValue) -> BatchWriteRequest {
-        BatchWriteRequest::Numeric(WriteRequest {
-            address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-            data_type,
-            value,
-        })
+    fn rspec(canonical: &str, data_type: DataType) -> TagSpec {
+        fake::spec(ID, canonical, data_type)
     }
 
-    /// Poll `handle.read` until the session comes up (real time - the fake
-    /// connects at once, but the connect still runs in a background task) or
-    /// a generous deadline elapses, so tests don't race the connect task that
-    /// starts in the background the instant a broker is spawned.
+    fn witem(canonical: &str, value: f64) -> WriteItem {
+        WriteItem::new(rspec(canonical, DataType::U16), Value::F64(value))
+    }
+
+    fn spawn_task(
+        connector: Connector,
+        backoff: BackoffConfig,
+        timeouts: SessionTimeouts,
+    ) -> (BrokerHandle, TaskEntry, watch::Sender<bool>) {
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (handle, task) =
+            spawn_task_with_connector(1, connector, backoff, timeouts, shutdown_rx);
+        (handle, task, shutdown_tx)
+    }
+
+    /// Poll `handle.read` until the session comes up or a generous deadline
+    /// elapses, so tests don't race the connect task that starts in the
+    /// background the instant a broker is spawned.
     async fn read_once_connected(
         handle: &BrokerHandle,
-        requests: Vec<BatchReadRequest>,
-    ) -> Vec<BatchReadResult> {
+        specs: Vec<TagSpec>,
+    ) -> Vec<Result<Value, ItemError>> {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            match handle.read(requests.clone()).await {
+            match handle.read(specs.clone()).await {
                 Ok(results) => return results,
                 Err(BrokerError::Disconnected { .. }) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1380,9 +1559,16 @@ mod tests {
         }
     }
 
+    async fn wait_connected(handle: &BrokerHandle) {
+        handle
+            .status_watch()
+            .wait_for(|s| *s == BrokerConnectionStatus::Connected)
+            .await
+            .expect("the session should come up");
+    }
+
     // -----------------------------------------------------------------
-    // Backoff ladder (pure, virtual time) - mirrors banto-collect's
-    // backoff_ladder_advances_virtual_time_deterministically exactly.
+    // Backoff ladder (pure, virtual time)
     // -----------------------------------------------------------------
 
     #[test]
@@ -1413,9 +1599,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // P3-b (監査指摘 2026-08-12): word_order wiring. `parse_word_order` is
-    // shared by both driver crates' config builders (their own tests check
-    // the wiring into `SlmpConfig` / `ModbusTcpConfig`).
+    // P3-b: word_order parsing (shared by both driver crates)
     // -----------------------------------------------------------------
 
     #[test]
@@ -1424,10 +1608,6 @@ mod tests {
         assert_eq!(parse_word_order("high_low"), WordOrder::HighLow);
     }
 
-    /// Defense-in-depth path (this fn's own doc comment): a value that could
-    /// only reach here via a hand-edited or pre-migration-0010 database row
-    /// fails open to the historical default rather than panicking or
-    /// erroring.
     #[test]
     fn parse_word_order_falls_back_to_low_high_for_anything_unrecognized() {
         assert_eq!(parse_word_order("middle_endian"), WordOrder::LowHigh);
@@ -1435,23 +1615,24 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Supervisor
+    // The registry gate (R2b-3a-2, design §4.2)
     // -----------------------------------------------------------------
 
-    /// Renamed from `supervisor_rejects_a_modbus_tcp_connection` (#131,
-    /// 2026-09-01): that test's premise is now wrong - `"modbus-tcp"` is a
-    /// registered protocol as of that PR, no longer rejected. The property
-    /// this test guards (an unregistered protocol string is rejected
-    /// outright, not silently skipped) is unchanged, so it is kept with a
-    /// made-up unsupported protocol string instead of dropped.
     #[tokio::test]
     async fn supervisor_rejects_an_unsupported_protocol_connection() {
-        let connections = [conn(1, "bogus-protocol", "127.0.0.1", 502)];
-        let err =
-            match BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table()) {
-                Ok(_) => panic!("an unregistered protocol must be rejected"),
-                Err(e) => e,
-            };
+        let connections = [conn_with(
+            1,
+            "bogus-protocol",
+            json!({ "host": "127.0.0.1", "port": 502 }),
+        )];
+        let err = match BrokerSupervisor::spawn(
+            &connections,
+            BackoffConfig::default(),
+            fake_registry(),
+        ) {
+            Ok(_) => panic!("an unregistered protocol must be rejected"),
+            Err(e) => e,
+        };
         assert_eq!(
             err,
             BrokerError::UnsupportedProtocol {
@@ -1461,70 +1642,377 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // DriverTable (R1-3a, docs/banto-driver-api-design.md §4.4)
-    // -----------------------------------------------------------------
-
-    fn driver_id(s: &str) -> DriverId {
-        DriverId::new(s).expect("valid driver id")
+    /// Only a session-type entry is broker-managed: a host-provided protocol
+    /// (the host keeps its I/O) is refused like an unregistered one, and
+    /// `is_broker_managed` answers the same.
+    #[tokio::test]
+    async fn only_a_session_type_entry_is_broker_managed() {
+        let mut registry = DriverRegistry::new();
+        registry
+            .register(DriverEntry::session(Arc::new(FakeDriver::new(
+                ID,
+                FakePlc::new(),
+            ))))
+            .unwrap();
+        registry
+            .register(DriverEntry::host_provided(Arc::new(FakeDriver::new(
+                "hosted",
+                FakePlc::new(),
+            ))))
+            .unwrap();
+        assert!(is_broker_managed(&registry, ID));
+        for other in ["hosted", "bogus", "", "FAKE"] {
+            assert!(!is_broker_managed(&registry, other), "{other:?}");
+        }
+        let hosted = conn_with(2, "hosted", json!({ "host": "h", "port": 1 }));
+        let err = match BrokerSupervisor::spawn(
+            &[hosted],
+            BackoffConfig::default(),
+            Arc::new(registry),
+        ) {
+            Ok(_) => panic!("a host-provided protocol must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(
+                err,
+                BrokerError::UnsupportedProtocol {
+                    connection_id: 2,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
     }
 
-    /// A table holds exactly the ids it was built with, in order, and
-    /// answers `is_supported` / `dial_for` for nothing else. (R1-4a: the
-    /// broker half of the former `builtin_table_registers_exactly_slmp_and_modbus_tcp`;
-    /// that the built-in table *is* `["slmp", "modbus-tcp"]` is now checked
-    /// where it is built, in `banto-drivers`.)
+    /// The driver's `validate_config` is the gate the broker's own `u16` port
+    /// check used to be: refused settings never spawn a task.
+    #[tokio::test]
+    async fn settings_the_driver_refuses_are_rejected_before_any_task() {
+        let supervisor =
+            BrokerSupervisor::spawn(&[], BackoffConfig::default(), fake_registry()).unwrap();
+        let directory = supervisor.directory();
+        let bad = conn_with(3, ID, json!({ "host": "127.0.0.1", "port": 70000 }));
+        let err = directory.ensure_connection(&bad).unwrap_err();
+        match err {
+            BrokerError::InvalidSettings {
+                connection_id,
+                reason,
+            } => {
+                assert_eq!(connection_id, 3);
+                assert!(reason.contains("port"), "{reason}");
+            }
+            other => panic!("expected InvalidSettings, got {other:?}"),
+        }
+        assert_eq!(directory.connection_count(), 0);
+        supervisor.shutdown().await;
+    }
+
+    /// The dial gets the connection's settings and the broker's timeouts in
+    /// its `ConnectContext` (the defaults are the old `banto_plc` config
+    /// defaults: connect 3 s, response 1 s).
+    #[tokio::test]
+    async fn the_dial_uses_the_connections_settings_and_the_default_timeouts() {
+        let driver = FakeDriver::new(ID, FakePlc::new());
+        let seen = driver.seen();
+        let supervisor = BrokerSupervisor::spawn(
+            &[conn_with(
+                1,
+                ID,
+                json!({ "host": "10.0.0.9", "port": 5007, "word_order": "high_low" }),
+            )],
+            BackoffConfig::default(),
+            fake::registry_of(driver),
+        )
+        .unwrap();
+        wait_connected(&supervisor.handle(1).unwrap()).await;
+        let first = seen.lock().unwrap()[0].clone();
+        assert_eq!(first.settings.get("host"), Some("10.0.0.9"));
+        assert_eq!(first.settings.get("port"), Some("5007"));
+        assert_eq!(first.settings.get("word_order"), Some("high_low"));
+        assert_eq!(first.connect_timeout, Duration::from_secs(3));
+        assert_eq!(first.response_timeout, Duration::from_secs(1));
+        supervisor.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------
+    // Settings fingerprint (replaces #605's `slmp_cpu`, design §4.2)
+    // -----------------------------------------------------------------
+
     #[test]
-    fn driver_table_registers_exactly_the_given_ids() {
-        let table = DriverTable::new(vec![
-            (driver_id("slmp"), fake::dial as DialFn),
-            (driver_id("modbus-tcp"), fake::dial as DialFn),
-        ])
-        .expect("distinct ids");
-        let ids: Vec<&str> = table.ids().map(DriverId::as_str).collect();
-        assert_eq!(ids, ["slmp", "modbus-tcp"]);
-        assert!(table.is_supported("slmp"));
-        assert!(table.is_supported("modbus-tcp"));
-        for other in ["virtual", "bogus-protocol", "", "SLMP", "modbus"] {
-            assert!(
-                !table.is_supported(other),
-                "{other:?} must not be supported"
-            );
-            assert!(table.dial_for(other).is_none());
+    fn the_fingerprint_ignores_order_and_secret_keys_and_sees_every_other_value() {
+        let a = Settings::from_pairs([("host", "h"), ("port", "1"), ("cpu_type", "Q")]).unwrap();
+        let b = Settings::from_pairs([("cpu_type", "Q"), ("port", "1"), ("host", "h")]).unwrap();
+        assert_eq!(
+            SettingsFingerprint::of(&a, &[]),
+            SettingsFingerprint::of(&b, &[])
+        );
+        let r = Settings::from_pairs([("host", "h"), ("port", "1"), ("cpu_type", "R")]).unwrap();
+        assert_ne!(
+            SettingsFingerprint::of(&a, &[]),
+            SettingsFingerprint::of(&r, &[])
+        );
+
+        let secret = vec!["password".to_string()];
+        let with_pw =
+            Settings::from_pairs([("host", "h"), ("port", "1"), ("password", "x")]).unwrap();
+        let other_pw =
+            Settings::from_pairs([("host", "h"), ("port", "1"), ("password", "y")]).unwrap();
+        let without = Settings::from_pairs([("host", "h"), ("port", "1")]).unwrap();
+        assert_eq!(
+            SettingsFingerprint::of(&with_pw, &secret),
+            SettingsFingerprint::of(&other_pw, &secret)
+        );
+        assert_eq!(
+            SettingsFingerprint::of(&with_pw, &secret),
+            SettingsFingerprint::of(&without, &secret)
+        );
+    }
+
+    /// The handle carries the fingerprint of the settings it was dialed
+    /// with; `ensure_connection_with_settings` dials (and fingerprints) the
+    /// given settings, not the connection's own.
+    #[tokio::test]
+    async fn the_handle_carries_the_fingerprint_of_the_settings_it_dials() {
+        let driver = FakeDriver::new(ID, FakePlc::new());
+        let seen = driver.seen();
+        let supervisor =
+            BrokerSupervisor::spawn(&[], BackoffConfig::default(), fake::registry_of(driver))
+                .unwrap();
+        let directory = supervisor.directory();
+        let c = conn(1, 5000);
+        let own = banto_tags::settings_to_api(&c.settings);
+        let handle = directory.ensure_connection(&c).unwrap();
+        assert_eq!(
+            handle.settings_fingerprint(),
+            Some(SettingsFingerprint::of(&own, &[]))
+        );
+        assert_eq!(
+            handle.read_only().settings_fingerprint(),
+            handle.settings_fingerprint()
+        );
+        wait_connected(&handle).await;
+
+        let simulated = Settings::from_pairs([("host", "127.0.0.1"), ("port", "40000")]).unwrap();
+        let other = directory
+            .ensure_connection_with_settings(&conn(2, 5000), simulated.clone())
+            .unwrap();
+        assert_eq!(
+            other.settings_fingerprint(),
+            Some(SettingsFingerprint::of(&simulated, &[]))
+        );
+        assert_ne!(other.settings_fingerprint(), handle.settings_fingerprint());
+        wait_connected(&other).await;
+        let ports: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|s| s.settings.get("port").unwrap().to_string())
+            .collect();
+        assert!(ports.contains(&"40000".to_string()), "{ports:?}");
+        supervisor.shutdown().await;
+    }
+
+    // -----------------------------------------------------------------
+    // Secrets (connection-settings design §3.5, design §4.2)
+    // -----------------------------------------------------------------
+
+    const REF: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Records every key it is asked to open and answers `pw-<key>`.
+    #[derive(Default)]
+    struct RecordingOpener {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SecretOpener for RecordingOpener {
+        fn open(
+            &self,
+            _conn: &PlcConnection,
+            key: &str,
+        ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>>
+        {
+            self.asked.lock().unwrap().push(key.to_string());
+            let value = format!("pw-{key}");
+            Box::pin(async move { Ok(Some(Zeroizing::new(value))) })
         }
     }
 
-    #[test]
-    fn driver_table_rejects_a_repeated_id() {
-        let err = DriverTable::new(vec![
-            (driver_id("slmp"), fake::dial as DialFn),
-            (driver_id("modbus-tcp"), fake::dial as DialFn),
-            (driver_id("slmp"), fake::dial as DialFn),
-        ])
-        .expect_err("a repeated id must be rejected");
-        assert_eq!(err, DuplicateDriverId(driver_id("slmp")));
+    fn secret_conn() -> PlcConnection {
+        conn_with(
+            1,
+            ID,
+            json!({
+                "host": "127.0.0.1",
+                "port": 5000,
+                "password": { "$secret": REF },
+                "token": { "$secret": REF },
+            }),
+        )
     }
 
-    /// The supervisor dispatches through the table it was given, not a
-    /// built-in list: a table without `"slmp"` rejects an SLMP connection
-    /// with the same error an unknown protocol gets.
+    /// Only the driver's `secret_keys()` are opened (not every reference in
+    /// the settings), the plaintext reaches the dial, and the fingerprint
+    /// does not change with it.
     #[tokio::test]
-    async fn supervisor_consults_the_injected_table() {
-        let only_modbus = DriverTable::new(vec![(driver_id("modbus-tcp"), fake::dial as DialFn)])
-            .expect("one entry");
-        let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
-        let err = match BrokerSupervisor::spawn(&connections, BackoffConfig::default(), only_modbus)
-        {
-            Ok(_) => panic!("a protocol missing from the injected table must be rejected"),
-            Err(e) => e,
-        };
+    async fn only_the_drivers_secret_keys_are_opened_and_handed_to_the_dial() {
+        let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password"]);
+        let seen = driver.seen();
+        let opener = Arc::new(RecordingOpener::default());
+        let supervisor = BrokerSupervisor::spawn_with(
+            &[secret_conn()],
+            fake::registry_of(driver),
+            BrokerOptions {
+                secrets: opener.clone(),
+                ..BrokerOptions::default()
+            },
+        )
+        .unwrap();
+        let handle = supervisor.handle(1).unwrap();
+        wait_connected(&handle).await;
+
+        assert_eq!(*opener.asked.lock().unwrap(), vec!["password".to_string()]);
+        let first = seen.lock().unwrap()[0].clone();
+        assert_eq!(first.settings.get("password"), Some("pw-password"));
         assert_eq!(
-            err,
-            BrokerError::UnsupportedProtocol {
-                connection_id: 1,
-                protocol: "slmp".to_string(),
-            }
+            first.settings.get("token"),
+            None,
+            "not a secret key of the driver"
         );
+        let validated = banto_tags::settings_to_api(&secret_conn().settings);
+        assert_eq!(validated.get("password"), None, "validation never sees it");
+        assert_eq!(
+            handle.settings_fingerprint(),
+            Some(SettingsFingerprint::of_connection(
+                Some(&secret_conn()),
+                &validated,
+                &["password".to_string()]
+            ))
+        );
+        supervisor.shutdown().await;
+    }
+
+    const OTHER_REF: &str = "fedcba9876543210fedcba9876543210";
+
+    fn conn_with_password_ref(r#ref: &str) -> PlcConnection {
+        conn_with(
+            1,
+            ID,
+            json!({ "host": "127.0.0.1", "port": 5000, "password": { "$secret": r#ref } }),
+        )
+    }
+
+    /// The fingerprint carries the secret's **reference** (a new secret is
+    /// sealed under a new reference): another reference is another
+    /// fingerprint, the same reference the same one, and a key the driver
+    /// does not list as secret does not count.
+    #[test]
+    fn the_fingerprint_carries_the_secret_reference_not_the_value() {
+        let keys = vec!["password".to_string()];
+        let a = conn_with_password_ref(REF);
+        let b = conn_with_password_ref(OTHER_REF);
+        let settings = banto_tags::settings_to_api(&a.settings);
+        assert_eq!(settings, banto_tags::settings_to_api(&b.settings));
+        let fa = SettingsFingerprint::of_connection(Some(&a), &settings, &keys);
+        let fb = SettingsFingerprint::of_connection(Some(&b), &settings, &keys);
+        assert_ne!(fa, fb, "another reference, another fingerprint");
+        assert_eq!(
+            fa,
+            SettingsFingerprint::of_connection(
+                Some(&conn_with_password_ref(REF)),
+                &settings,
+                &keys
+            )
+        );
+        assert_ne!(
+            fa,
+            SettingsFingerprint::of(&settings, &keys),
+            "the reference counts"
+        );
+        // Not a secret key of the driver: the reference is not looked at.
+        assert_eq!(
+            SettingsFingerprint::of_connection(Some(&a), &settings, &[]),
+            SettingsFingerprint::of_connection(Some(&b), &settings, &[])
+        );
+    }
+
+    /// End to end: a session dialed for reference A and one for reference B
+    /// carry different fingerprints (so the Hub re-dials when the secret is
+    /// replaced), while the opened value - whatever the opener answers - never
+    /// changes the fingerprint.
+    #[tokio::test]
+    async fn a_new_secret_reference_is_a_new_session_identity_the_value_is_not() {
+        struct Fixed(&'static str);
+        impl SecretOpener for Fixed {
+            fn open(
+                &self,
+                _conn: &PlcConnection,
+                _key: &str,
+            ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>>
+            {
+                let value = self.0;
+                Box::pin(async move { Ok(Some(Zeroizing::new(value.to_string()))) })
+            }
+        }
+        let mut seen = Vec::new();
+        for (r#ref, value) in [(REF, "pw-1"), (REF, "pw-2"), (OTHER_REF, "pw-1")] {
+            let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password"]);
+            let opened = driver.seen();
+            let supervisor = BrokerSupervisor::spawn_with(
+                &[conn_with_password_ref(r#ref)],
+                fake::registry_of(driver),
+                BrokerOptions {
+                    secrets: Arc::new(Fixed(value)),
+                    ..BrokerOptions::default()
+                },
+            )
+            .unwrap();
+            let handle = supervisor.handle(1).unwrap();
+            wait_connected(&handle).await;
+            assert_eq!(
+                opened.lock().unwrap()[0].settings.get("password"),
+                Some(value),
+                "the dial got the opened value"
+            );
+            seen.push(handle.settings_fingerprint().unwrap());
+            supervisor.shutdown().await;
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "the opened value is not in the fingerprint"
+        );
+        assert_ne!(seen[0], seen[2], "a new reference is a new identity");
+    }
+
+    /// Without an opener the dial fails (never connects without the secret):
+    /// the driver's `connect` is not even called.
+    #[tokio::test]
+    async fn a_secret_that_cannot_be_opened_fails_the_dial() {
+        let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password"]);
+        let seen = driver.seen();
+        let supervisor = BrokerSupervisor::spawn(
+            &[secret_conn()],
+            BackoffConfig::default(),
+            fake::registry_of(driver),
+        )
+        .unwrap();
+        let handle = supervisor.handle(1).unwrap();
+        handle
+            .status_watch()
+            .wait_for(
+                |s| matches!(s, BrokerConnectionStatus::Reconnecting { attempt } if *attempt >= 2),
+            )
+            .await
+            .unwrap();
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "connect must not be called"
+        );
+        assert_eq!(
+            handle.read(vec![rspec("D0", DataType::U16)]).await,
+            Err(BrokerError::Disconnected { connection_id: 1 })
+        );
+        supervisor.shutdown().await;
     }
 
     // -----------------------------------------------------------------
@@ -1533,22 +2021,15 @@ mod tests {
 
     #[tokio::test]
     async fn remove_untracks_a_connection() {
-        let connections = [conn(7, "slmp", "127.0.0.1", 5000)];
         let supervisor =
-            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
-                .expect("all-slmp connections should spawn");
+            BrokerSupervisor::spawn(&[conn(7, 5000)], BackoffConfig::default(), fake_registry())
+                .expect("spawn");
         let directory = supervisor.directory();
         assert_eq!(directory.connection_ids(), vec![7]);
 
-        assert!(
-            directory.remove(7),
-            "removing a tracked connection should report true"
-        );
+        assert!(directory.remove(7));
         assert_eq!(supervisor.connection_count(), 0);
-        assert!(
-            directory.handle(7).is_none(),
-            "a removed connection's handle should no longer be reachable via the directory"
-        );
+        assert!(directory.handle(7).is_none());
 
         supervisor.shutdown().await;
     }
@@ -1556,9 +2037,9 @@ mod tests {
     #[tokio::test]
     async fn remove_is_false_and_idempotent_for_an_untracked_connection() {
         let directory = SessionDirectory::new(
-            BackoffConfig::default(),
-            fake_table(),
-            std::sync::Arc::new(watch::channel(false).0),
+            fake_registry(),
+            BrokerOptions::default(),
+            Arc::new(watch::channel(false).0),
         );
         assert!(!directory.remove(42), "nothing was ever tracked for id 42");
         assert!(!directory.remove(42), "removing twice is still just false");
@@ -1566,24 +2047,19 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_connection_after_remove_spawns_a_fresh_session() {
-        let connections = [conn(7, "slmp", "127.0.0.1", 5000)];
         let supervisor =
-            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
-                .expect("all-slmp connections should spawn");
+            BrokerSupervisor::spawn(&[conn(7, 5000)], BackoffConfig::default(), fake_registry())
+                .expect("spawn");
         let directory = supervisor.directory();
 
         directory.remove(7);
         assert_eq!(directory.connection_count(), 0);
 
-        // ensure_connection does not remember that id 7 ever existed -
-        // removal is a real forget, not a soft-delete - so this spawns a
-        // brand new session exactly like the very first ensure_connection
-        // did.
         let fresh = directory
-            .ensure_connection(&conn(7, "slmp", "127.0.0.1", 5000))
+            .ensure_connection(&conn(7, 5000))
             .expect("re-ensuring a removed connection should spawn a fresh session");
         assert_eq!(directory.connection_count(), 1);
-        let _ = read_once_connected(&fresh, vec![rreq("D0", DataType::U16)]).await;
+        let _ = read_once_connected(&fresh, vec![rspec("D0", DataType::U16)]).await;
 
         supervisor.shutdown().await;
     }
@@ -1594,54 +2070,44 @@ mod tests {
 
     #[tokio::test]
     async fn serialized_concurrent_requests_do_not_corrupt_each_other() {
-        let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
         let supervisor =
-            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+            BrokerSupervisor::spawn(&[conn(1, 5000)], BackoffConfig::default(), fake_registry())
                 .expect("spawn");
         let handle = supervisor.handle(1).expect("handle");
-
-        // Wait for the session before firing the concurrent burst, so every
-        // task below exercises the same connected session rather than racing
-        // the initial connect.
-        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
 
         const N: u32 = 20;
         let writes = (0..N).map(|i| {
             let handle = handle.clone();
-            let device_number = 300 + i;
-            let value = 1000.0 + i as f64;
             async move {
-                let addr = format!("D{device_number}");
+                let addr = format!("D{}", 300 + i);
                 handle
-                    .write(vec![wreq(&addr, DataType::U16, TagValue::F64(value))])
+                    .write(vec![witem(&addr, 1000.0 + i as f64)])
                     .await
                     .unwrap_or_else(|e| panic!("write {addr} failed: {e}"))
             }
         });
         let write_outcomes = join_all(writes).await;
         assert!(
-            write_outcomes.iter().all(|r| r == &vec![WriteResult::Ok]),
+            write_outcomes.iter().all(|r| r == &vec![Ok(())]),
             "every concurrent write should succeed: {write_outcomes:?}"
         );
 
         let reads = (0..N).map(|i| {
             let handle = handle.clone();
-            let device_number = 300 + i;
             async move {
-                let addr = format!("D{device_number}");
+                let addr = format!("D{}", 300 + i);
                 let result = handle
-                    .read(vec![rreq(&addr, DataType::U16)])
+                    .read(vec![rspec(&addr, DataType::U16)])
                     .await
                     .unwrap_or_else(|e| panic!("read {addr} failed: {e}"));
                 (i, result)
             }
         });
-        let read_outcomes = join_all(reads).await;
-        for (i, result) in read_outcomes {
-            let expected = 1000.0 + i as f64;
+        for (i, result) in join_all(reads).await {
             assert_eq!(
                 result,
-                vec![BatchReadResult::Value(PlcValue::F64(expected))],
+                vec![Ok(Value::F64(1000.0 + i as f64))],
                 "device D{} should hold this task's own value, not another's",
                 300 + i
             );
@@ -1656,19 +2122,17 @@ mod tests {
 
     #[tokio::test]
     async fn a_request_while_disconnected_fails_fast_not_a_hang() {
-        // A device that refuses every connect attempt (the old test's
-        // loopback port nothing listens on): `connect()` gets a prompt
-        // refusal and the task sits in backoff.
         let plc = FakePlc::new();
         plc.refuse_connections(true);
-
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) =
-            spawn_task_with_connector(1, plc.connector(), BackoffConfig::default(), shutdown_rx);
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
 
         let outcome = tokio::time::timeout(
             Duration::from_millis(200),
-            handle.read(vec![rreq("D0", DataType::U16)]),
+            handle.read(vec![rspec("D0", DataType::U16)]),
         )
         .await
         .expect("must fail fast, not hang until the next connect attempt");
@@ -1686,17 +2150,13 @@ mod tests {
             cap: Duration::from_millis(100),
             factor: 2,
         };
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) = spawn_task_with_connector(1, plc.connector(), backoff, shutdown_rx);
+        let (handle, task, _shutdown) =
+            spawn_task(plc.connector(), backoff, SessionTimeouts::default());
 
-        // Establish the session, then make the next request fail
-        // connection-fatally (the old test hung the simulator so the request
-        // timed out): that must fail that request AND drop into
-        // reconnect-backoff.
-        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
         plc.fail_next_call();
 
-        let hung = handle.read(vec![rreq("D0", DataType::U16)]).await;
+        let hung = handle.read(vec![rspec("D0", DataType::U16)]).await;
         assert!(
             matches!(
                 hung,
@@ -1708,14 +2168,237 @@ mod tests {
             "a connection-fatal error mid-request should fail that request as connection-fatal: {hung:?}"
         );
 
-        // Recover: the backoff loop must reconnect on its own with no outside
-        // intervention.
         plc.set_word("D400", 55);
-        let recovered = read_once_connected(&handle, vec![rreq("D400", DataType::U16)]).await;
-        assert_eq!(recovered, vec![BatchReadResult::Value(PlcValue::F64(55.0))]);
+        let recovered = read_once_connected(&handle, vec![rspec("D400", DataType::U16)]).await;
+        assert_eq!(recovered, vec![Ok(Value::F64(55.0))]);
 
         drop(handle);
         let _ = task.join_handle.await;
+    }
+
+    /// A session that answers a different number of results than it was
+    /// asked breaks the contract: the job fails as connection-fatal (never
+    /// trimmed or padded) and the session is re-dialed.
+    #[tokio::test]
+    async fn a_result_count_mismatch_is_connection_fatal() {
+        let plc = FakePlc::new();
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig {
+                base: Duration::from_millis(10),
+                cap: Duration::from_millis(10),
+                factor: 1,
+            },
+            SessionTimeouts::default(),
+        );
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
+        plc.set_behaviour(Behaviour::ShortCount);
+        let got = handle
+            .read(vec![rspec("D0", DataType::U16), rspec("D1", DataType::U16)])
+            .await;
+        match got {
+            Err(BrokerError::ConnectionFailed { reason, .. }) => {
+                assert!(reason.contains("2 件の要求に 1 件"), "{reason}")
+            }
+            other => panic!("expected ConnectionFailed, got {other:?}"),
+        }
+        let got = handle.write(vec![witem("D0", 1.0), witem("D1", 2.0)]).await;
+        assert!(
+            matches!(
+                got,
+                Err(BrokerError::ConnectionFailed { .. }) | Err(BrokerError::Disconnected { .. })
+            ),
+            "{got:?}"
+        );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    // -----------------------------------------------------------------
+    // Bounds on every session future (design §5.5)
+    // -----------------------------------------------------------------
+
+    const T: Duration = Duration::from_millis(1000);
+
+    fn quick_backoff() -> BackoffConfig {
+        BackoffConfig {
+            base: Duration::from_millis(10),
+            cap: Duration::from_millis(10),
+            factor: 1,
+        }
+    }
+
+    #[test]
+    fn the_job_limits_are_the_step_limit_times_two_t_plus_one_second() {
+        let t = Duration::from_millis(500);
+        // read: (n + 8) × 2T + 1 s
+        assert_eq!(read_job_limit(0, t), Duration::from_secs(8 + 1));
+        assert_eq!(read_job_limit(2, t), Duration::from_secs(10 + 1));
+        // write: (3n + 8) × 2T + 1 s
+        assert_eq!(write_job_limit(1, t), Duration::from_secs(11 + 1));
+        assert_eq!(write_job_limit(4, t), Duration::from_secs(20 + 1));
+        // no overflow on absurd sizes
+        assert!(write_job_limit(usize::MAX, t) > Duration::from_secs(1));
+    }
+
+    /// A driver that keeps its deadlines - each step `0.95 T` sending and
+    /// `0.95 T` receiving, for as many steps as contract 7 allows - is never
+    /// cut by the outer bound: the write runs to `Done`. (It takes longer than
+    /// `steps × T`, so a bound of `T` per step would have cut it.)
+    #[tokio::test(start_paused = true)]
+    async fn a_driver_keeping_its_deadlines_is_never_cut_by_the_outer_bound() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+
+        let items = vec![witem("D0", 1.0), witem("D1", 2.0)];
+        let steps = 3 * items.len() + 8;
+        plc.set_behaviour(Behaviour::Steps {
+            steps,
+            phase: T.mul_f64(0.95),
+            deadline: T,
+        });
+        let started = Instant::now();
+        let got = handle.write(items).await;
+        let took = started.elapsed();
+        assert_eq!(got, Ok(vec![Ok(()), Ok(())]));
+        assert!(took > T * steps as u32, "took {took:?}");
+        assert!(took < write_job_limit(2, T), "took {took:?}");
+        assert_eq!(
+            *handle.status_watch().borrow(),
+            BrokerConnectionStatus::Connected
+        );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// The same driver with a step of `1.05 T`: its own deadline fires (the
+    /// inner one, after the first phase), long before the outer bound.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_over_t_is_cut_by_the_drivers_own_deadline_not_the_outer_bound() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+
+        plc.set_behaviour(Behaviour::Steps {
+            steps: 3 + 8,
+            phase: T.mul_f64(1.05),
+            deadline: T,
+        });
+        let started = Instant::now();
+        let got = handle.write(vec![witem("D0", 1.0)]).await;
+        let took = started.elapsed();
+        assert_eq!(
+            got,
+            Err(BrokerError::ConnectionFailed {
+                connection_id: 1,
+                reason: FatalError::Timeout.to_string(),
+            })
+        );
+        assert!(took < T * 2, "the inner deadline cuts it: took {took:?}");
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// A session-type driver that ignores `response_timeout` and never
+    /// answers: the broker's job still returns, at the outer bound, as a
+    /// timeout; the session is dropped and re-dialed (design §5.5 / the
+    /// conformance item of 3a-2).
+    #[tokio::test(start_paused = true)]
+    async fn a_driver_ignoring_its_response_timeout_still_returns_at_the_outer_bound() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+
+        plc.set_behaviour(Behaviour::Hang);
+        let specs = vec![rspec("D0", DataType::U16), rspec("D1", DataType::U16)];
+        let started = Instant::now();
+        let got = handle.read(specs).await;
+        let took = started.elapsed();
+        assert_eq!(
+            got,
+            Err(BrokerError::ConnectionFailed {
+                connection_id: 1,
+                reason: FatalError::Timeout.to_string(),
+            })
+        );
+        assert_eq!(took, read_job_limit(2, T));
+
+        // The same for a write.
+        plc.set_behaviour(Behaviour::Prompt);
+        wait_connected(&handle).await;
+        plc.set_behaviour(Behaviour::Hang);
+        let started = Instant::now();
+        let got = handle.write(vec![witem("D0", 1.0)]).await;
+        assert!(
+            matches!(got, Err(BrokerError::ConnectionFailed { .. })),
+            "{got:?}"
+        );
+        assert_eq!(started.elapsed(), write_job_limit(1, T));
+
+        // The session was dropped and re-dialed: it answers again.
+        plc.set_behaviour(Behaviour::Prompt);
+        wait_connected(&handle).await;
+        assert_eq!(
+            handle.read(vec![rspec("D0", DataType::U16)]).await,
+            Ok(vec![Ok(Value::F64(0.0))])
+        );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// A connect that never finishes is given up at `connect_timeout + 1 s`
+    /// and retried (the task does not sit in `Connecting` for ever).
+    #[tokio::test(start_paused = true)]
+    async fn a_connect_that_never_finishes_is_given_up_and_retried() {
+        let (connector, mut started_rx, mut dropped_rx) = fake::hanging_connector();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(connector, quick_backoff(), timeouts);
+        started_rx.recv().await.expect("first attempt");
+        let started = Instant::now();
+        dropped_rx
+            .recv()
+            .await
+            .expect("the first attempt is given up");
+        assert_eq!(started.elapsed(), Duration::from_secs(3) + CONNECT_SLACK);
+        started_rx.recv().await.expect("and retried");
+        drop(handle);
+        let _ = task.stop_tx.send(true);
+        let _ = task.join_handle.await;
+    }
+
+    /// Stopping a connection whose session never finishes `disconnect` is
+    /// bounded at [`DISCONNECT_LIMIT`].
+    #[tokio::test(start_paused = true)]
+    async fn stopping_does_not_hang_on_a_disconnect_that_never_finishes() {
+        let plc = FakePlc::new();
+        plc.hang_disconnect(true);
+        let (handle, task, _shutdown) =
+            spawn_task(plc.connector(), quick_backoff(), SessionTimeouts::default());
+        wait_connected(&handle).await;
+        let started = Instant::now();
+        let _ = task.stop_tx.send(true);
+        task.join_handle.await.expect("the task ends");
+        assert_eq!(started.elapsed(), DISCONNECT_LIMIT);
+        assert_eq!(
+            *handle.status_watch().borrow(),
+            BrokerConnectionStatus::Stopped
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1725,27 +2408,23 @@ mod tests {
     #[tokio::test]
     async fn status_watch_observes_connected_then_reconnecting_after_stop() {
         let plc = FakePlc::new();
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (handle, task) =
-            spawn_task_with_connector(1, plc.connector(), BackoffConfig::default(), shutdown_rx);
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
         let mut status = handle.status_watch();
 
-        // Wait for the session to come up (via a read, like the other tests)
-        // and confirm the watch agrees.
-        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
         status
             .wait_for(|s| *s == BrokerConnectionStatus::Connected)
             .await
             .expect("status watch should report Connected once the session is up");
 
-        // Take the device away entirely (the old test's `sim.stop()`): the
-        // in-flight read below must fail connection-fatally, dropping the
-        // task into Backoff/Reconnecting, which the watch must reflect - and
-        // reconnecting keeps failing.
         plc.refuse_connections(true);
         plc.fail_next_call();
 
-        let _ = handle.read(vec![rreq("D0", DataType::U16)]).await;
+        let _ = handle.read(vec![rspec("D0", DataType::U16)]).await;
         status
             .wait_for(|s| matches!(s, BrokerConnectionStatus::Reconnecting { .. }))
             .await
@@ -1757,14 +2436,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_watch_observes_stopped_on_shutdown() {
-        let connections = [conn(1, "slmp", "127.0.0.1", 5000)];
         let supervisor =
-            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
+            BrokerSupervisor::spawn(&[conn(1, 5000)], BackoffConfig::default(), fake_registry())
                 .expect("spawn");
         let handle = supervisor.handle(1).expect("handle");
         let mut status = handle.status_watch();
 
-        let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
+        let _ = read_once_connected(&handle, vec![rspec("D0", DataType::U16)]).await;
         status
             .wait_for(|s| *s == BrokerConnectionStatus::Connected)
             .await
@@ -1773,23 +2451,19 @@ mod tests {
         drop(handle);
         supervisor.shutdown().await;
 
-        // `wait_for` returns `Err` once the Sender side has dropped along
-        // with the task exiting, but the last value it ever sent - Stopped -
-        // is still readable via `borrow()`.
         assert_eq!(*status.borrow(), BrokerConnectionStatus::Stopped);
     }
 
     #[tokio::test]
     async fn session_directory_stop_and_join_stops_only_the_requested_task() {
-        // Port 0: the fake refuses to connect (the old test's unconnectable
-        // port), so both tasks sit in backoff.
-        let connections = [
-            conn(1, "slmp", "127.0.0.1", 0),
-            conn(2, "slmp", "127.0.0.1", 0),
-        ];
-        let supervisor =
-            BrokerSupervisor::spawn(&connections, BackoffConfig::default(), fake_table())
-                .expect("spawn");
+        // Port 0: the fake driver refuses to connect, so both tasks sit in
+        // backoff.
+        let supervisor = BrokerSupervisor::spawn(
+            &[conn(1, 0), conn(2, 0)],
+            BackoffConfig::default(),
+            fake_registry(),
+        )
+        .expect("spawn");
         let directory = supervisor.directory();
         // Keep a clone alive to prove that stop-and-join does not depend on
         // every caller dropping its BrokerHandle first.
@@ -1813,18 +2487,21 @@ mod tests {
 
     #[tokio::test]
     async fn stop_and_join_aborts_an_inflight_connect_attempt() {
-        // A connect attempt that never finishes (the old test: a listener
-        // that accepts and then never answers, under a 30s connect timeout).
         let (connector, mut started_rx, mut dropped_rx) = fake::hanging_connector();
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let directory = SessionDirectory::new(
-            BackoffConfig::default(),
-            fake_table(),
-            std::sync::Arc::new(shutdown_tx),
+            fake_registry(),
+            BrokerOptions::default(),
+            Arc::new(shutdown_tx),
         );
-        let (handle, task) =
-            spawn_task_with_connector(9, connector, BackoffConfig::default(), shutdown_rx);
+        let (handle, task) = spawn_task_with_connector(
+            9,
+            connector,
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+            shutdown_rx,
+        );
         directory
             .handles
             .lock()
@@ -1850,5 +2527,140 @@ mod tests {
             .expect("connector should stay alive");
 
         drop(handle);
+    }
+
+    // -----------------------------------------------------------------
+    // Opened secrets are zeroized when the attempt is cancelled (#788 P2)
+    // -----------------------------------------------------------------
+
+    /// Answers `values[key]`, or never answers for a key it has no value for.
+    struct OpenerByKey(Vec<(&'static str, &'static str)>);
+
+    impl SecretOpener for OpenerByKey {
+        fn open(
+            &self,
+            _conn: &PlcConnection,
+            key: &str,
+        ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>>
+        {
+            let value = self.0.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+            Box::pin(async move {
+                match value {
+                    Some(v) => Ok(Some(Zeroizing::new(v.to_string()))),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+    }
+
+    fn short_timeouts() -> SessionTimeouts {
+        SessionTimeouts {
+            connect: Duration::from_millis(20),
+            response: Duration::from_millis(20),
+        }
+    }
+
+    /// The secret is opened and handed to a dial that never returns: the
+    /// `connect_attempt` bound drops the future, and the guard zeroizes the
+    /// opened value on that path too.
+    #[tokio::test(start_paused = true)]
+    async fn an_opened_secret_is_zeroized_when_the_dial_times_out() {
+        const VALUE: &str = "pw-zeroize-on-connect-timeout";
+        let driver = FakeDriver::new(ID, FakePlc::new())
+            .with_secret_keys(&["password"])
+            .with_hanging_connect();
+        let seen = driver.seen();
+        let connector = session_connector(
+            conn_with_password_ref(REF),
+            Arc::new(driver),
+            banto_tags::settings_to_api(&conn_with_password_ref(REF).settings),
+            vec!["password".to_string()],
+            short_timeouts(),
+            Arc::new(OpenerByKey(vec![("password", VALUE)])),
+        );
+        let result = connect_attempt(connector, short_timeouts()).await;
+        assert!(matches!(result, Err(FatalError::Timeout)));
+        assert_eq!(
+            seen.lock().unwrap()[0].settings.get("password"),
+            Some(VALUE),
+            "the dial got the opened value"
+        );
+        assert!(
+            zeroized_for_test::contains(VALUE),
+            "the cancelled attempt must zeroize the opened value"
+        );
+    }
+
+    /// The first secret is opened, the second opener never answers: when the
+    /// attempt is given up the first value - already in the copy - is
+    /// zeroized (the guard owns the copy from before the first insert).
+    #[tokio::test(start_paused = true)]
+    async fn an_opened_secret_is_zeroized_when_a_later_opener_never_answers() {
+        const VALUE: &str = "pw-zeroize-on-second-opener-hang";
+        let conn = conn_with(
+            1,
+            ID,
+            json!({
+                "host": "127.0.0.1",
+                "port": 5000,
+                "password": { "$secret": REF },
+                "token": { "$secret": OTHER_REF },
+            }),
+        );
+        let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password", "token"]);
+        let seen = driver.seen();
+        let connector = session_connector(
+            conn.clone(),
+            Arc::new(driver),
+            banto_tags::settings_to_api(&conn.settings),
+            vec!["password".to_string(), "token".to_string()],
+            short_timeouts(),
+            Arc::new(OpenerByKey(vec![("password", VALUE)])),
+        );
+        let result = connect_attempt(connector, short_timeouts()).await;
+        assert!(matches!(result, Err(FatalError::Timeout)));
+        assert!(seen.lock().unwrap().is_empty(), "never dialed");
+        assert!(
+            zeroized_for_test::contains(VALUE),
+            "the value opened before the hang must be zeroized"
+        );
+    }
+
+    /// The task is stopped while the dial (with the opened secret) is
+    /// pending: the aborted attempt's guard zeroizes the value.
+    #[tokio::test]
+    async fn an_opened_secret_is_zeroized_when_the_task_stops_mid_dial() {
+        const VALUE: &str = "pw-zeroize-on-task-stop";
+        let driver = FakeDriver::new(ID, FakePlc::new())
+            .with_secret_keys(&["password"])
+            .with_hanging_connect();
+        let seen = driver.seen();
+        let supervisor = BrokerSupervisor::spawn_with(
+            &[conn_with_password_ref(REF)],
+            fake::registry_of(driver),
+            BrokerOptions {
+                secrets: Arc::new(OpenerByKey(vec![("password", VALUE)])),
+                ..BrokerOptions::default()
+            },
+        )
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while seen.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the dial should start");
+        assert!(!zeroized_for_test::contains(VALUE), "still dialing");
+        tokio::time::timeout(Duration::from_secs(1), supervisor.shutdown())
+            .await
+            .expect("shutdown must not wait for the dial");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !zeroized_for_test::contains(VALUE) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the aborted attempt must zeroize the opened value");
     }
 }

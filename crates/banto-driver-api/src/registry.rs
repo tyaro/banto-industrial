@@ -1,10 +1,12 @@
 //! [`DriverRegistry`]: driver id → implementation
 //! (docs/banto-driver-api-design.md §6.1).
 //!
-//! A plain `BTreeMap` lookup; no logic. In R1 the host builds it (the
-//! `banto-drivers` assembler) and only the tripwire tests read it; the
-//! production lookups (`DriverTable::is_supported`) move to it in R2b
-//! (design §6.2).
+//! A plain `BTreeMap` lookup; no logic. The host builds it (the
+//! `banto-drivers` assembler plus the host's own [`DriverKind::HostProvided`]
+//! protocols). Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) it is
+//! also what the broker dials through: a [`DriverKind::Session`] (and, from
+//! R2b-3b, a [`DriverKind::Frame`]) entry is a protocol the broker manages;
+//! the former side table `banto_broker::DriverTable` is gone.
 //!
 //! ## Why [`DriverEntry`] keeps a separate `&dyn DriverBase`
 //!
@@ -34,12 +36,6 @@ pub enum DriverKind {
     Frame(Arc<dyn FrameDriver>),
     /// A session-type driver: it owns its I/O.
     Session(Arc<dyn SessionDriver>),
-    /// **R1 only.** A built-in whose identification, settings and address
-    /// functions are in API form, while its I/O is wired by the host through
-    /// a separate table (`banto_broker::DriverTable`). R2b-3 moves the
-    /// built-ins to [`Frame`](Self::Frame) and removes this variant (a 0.x
-    /// minor break, design §9.1).
-    HostBound(Arc<dyn DriverBase>),
     /// **A permanent kind** (R2b-1a, docs/banto-hub-connection-settings-design.md
     /// §4.1). A protocol the *host* implements itself - banto-hub's `push`
     /// (ingest), `postgres` (DB source) and `virtual` (computed) - whose
@@ -50,14 +46,13 @@ pub enum DriverKind {
     /// `create_connection` / `connect` to call, and nothing about it goes
     /// through the engine's frame / session machinery.
     ///
-    /// Unlike [`HostBound`](Self::HostBound), which exists only until R2b-3
-    /// moves the built-ins to [`Frame`](Self::Frame) and then disappears
-    /// (a 0.x minor break), `HostProvided` stays: it is how a host registers
-    /// a protocol that is not a device driver at all, so that settings
-    /// validation and address checks have one registry to ask. The two
-    /// differ in what is missing, too: a `HostBound` driver's I/O is a real
-    /// driver the host reaches through a side table (`DriverTable`); a
-    /// `HostProvided` one has no driver-shaped I/O to reach.
+    /// R1 also had a `HostBound` kind (a built-in whose I/O the host wired
+    /// through the side table `banto_broker::DriverTable`); R2b-3a-2 moved
+    /// the built-ins to [`Session`](Self::Session) and removed it (a 0.x
+    /// minor break, design §9.1, docs/banto-hub-driver-io-design.md §10).
+    /// `HostProvided` stays: it is how a host registers a protocol that is
+    /// not a device driver at all, so that settings validation and address
+    /// checks have one registry to ask.
     HostProvided(Arc<dyn DriverBase>),
 }
 
@@ -66,7 +61,6 @@ impl fmt::Debug for DriverKind {
         let (kind, id) = match self {
             DriverKind::Frame(d) => ("Frame", &d.descriptor().id),
             DriverKind::Session(d) => ("Session", &d.descriptor().id),
-            DriverKind::HostBound(d) => ("HostBound", &d.descriptor().id),
             DriverKind::HostProvided(d) => ("HostProvided", &d.descriptor().id),
         };
         f.debug_tuple(kind).field(id).finish()
@@ -100,17 +94,8 @@ impl DriverEntry {
         }
     }
 
-    /// **R1 only**: a host-bound built-in (see [`DriverKind::HostBound`]).
-    pub fn host_bound(driver: Arc<dyn DriverBase>) -> Self {
-        DriverEntry {
-            base: Arc::clone(&driver),
-            kind: DriverKind::HostBound(driver),
-        }
-    }
-
     /// A protocol whose I/O the host implements itself (see
-    /// [`DriverKind::HostProvided`]; permanent, unlike
-    /// [`host_bound`](Self::host_bound)).
+    /// [`DriverKind::HostProvided`]).
     pub fn host_provided(driver: Arc<dyn DriverBase>) -> Self {
         DriverEntry {
             base: Arc::clone(&driver),
@@ -258,6 +243,9 @@ macro_rules! forward_driver_base {
             fn address_help(&self) -> String {
                 self.0.address_help()
             }
+            fn probe(&self) -> Option<(String, TagKind)> {
+                self.0.probe()
+            }
         }
     };
 }
@@ -326,6 +314,12 @@ mod tests {
         fn address_help(&self) -> String {
             format!("{} help", self.id())
         }
+        fn probe(&self) -> Option<(String, TagKind)> {
+            Some((
+                format!("{}-probe", self.id()),
+                TagKind::numeric(DataType::U16),
+            ))
+        }
     }
 
     impl FrameDriver for Probe {
@@ -362,6 +356,10 @@ mod tests {
         assert_eq!((a.driver.as_str(), a.word_count), (id, 4));
         assert_eq!(base.offset_address("A1", &kind, 2).unwrap(), "A1+2");
         assert_eq!(base.address_help(), format!("{id} help"));
+        assert_eq!(
+            base.probe(),
+            Some((format!("{id}-probe"), TagKind::numeric(DataType::U16)))
+        );
     }
 
     #[test]
@@ -374,10 +372,6 @@ mod tests {
         assert!(matches!(session.kind(), DriverKind::Session(_)));
         assert_forwards(&session, "s");
 
-        let host = DriverEntry::host_bound(Arc::new(Probe::new("h")));
-        assert!(matches!(host.kind(), DriverKind::HostBound(_)));
-        assert_forwards(&host, "h");
-
         let provided = DriverEntry::host_provided(Arc::new(Probe::new("p")));
         assert!(matches!(provided.kind(), DriverKind::HostProvided(_)));
         assert_forwards(&provided, "p");
@@ -387,7 +381,7 @@ mod tests {
     fn register_get_contains_and_refuse_duplicates() {
         let mut reg = DriverRegistry::new();
         assert!(reg.is_empty());
-        reg.register(DriverEntry::host_bound(Arc::new(Probe::new("slmp"))))
+        reg.register(DriverEntry::host_provided(Arc::new(Probe::new("slmp"))))
             .unwrap();
         reg.register(DriverEntry::frame(Arc::new(Probe::new("modbus-tcp"))))
             .unwrap();
@@ -413,7 +407,7 @@ mod tests {
         assert_eq!(err.to_string(), "ドライバ ID slmp はすでに登録されています");
         assert!(matches!(
             reg.get("slmp").unwrap().kind(),
-            DriverKind::HostBound(_)
+            DriverKind::HostProvided(_)
         ));
         assert_eq!(reg.len(), 2);
     }

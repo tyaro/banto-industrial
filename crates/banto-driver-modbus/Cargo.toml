@@ -6,32 +6,36 @@
 # でも依存しない。循環と二重コンパイルを避ける）。内部 crate（`publish = false`）。
 # R1-4b: `DriverBase` の実装（`src/base.rs`）と `classify_read` / `classify_write`
 # （`src/classify.rs`）を足した（`banto-driver-api` は通常の依存）。
+# R2b-3a-2（docs/banto-hub-driver-io-design.md §4.2）: broker の表の行（`dial`）と
+# `BrokerSession` の実装を消し、`banto-drivers` が `DriverEntry::session` で登録する。
 [package]
 name = "banto-driver-modbus"
-description = "R1-4a: Modbus TCP ドライバ（banto-broker の BrokerSession 実装と dial）(docs/banto-driver-api-design.md §4.4)"
+description = "Modbus TCP ドライバ（banto-driver-api の SessionDriver。R2b-3a-2 から broker がレジストリ経由でダイヤルする）(docs/banto-hub-driver-io-design.md §4)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-# R1-4b: `DriverBase` の実装・`ItemError` / `FatalError`（`src/base.rs`・`src/classify.rs`）と、
-# tests/broker.rs の `DriverTable::new` のキー（`DriverId`）。
+# R1-4b: `DriverBase` の実装・`ItemError` / `FatalError`（`src/base.rs`・`src/classify.rs`）。
+# R2b-3a-1/2: `SessionDriver` / `Session` の実装（`src/api_session.rs`）。
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
-# `BrokerSession` / `Connector` / `SessionError` / `DriverDial`（R1-2 / R1-3a で pub）と、
-# SLMP ドライバと共有する `parse_word_order`。
+# R2b-3a-2: broker の表（`DriverDial`）と `BrokerSession` の実装は無くなった。使うのは
+# SLMP ドライバと共有する `parse_word_order` だけ（依存の向きはドライバ → broker のまま）。
 banto-broker = { path = "../banto-broker" }
 # 読み取りの計画・実行（`plan_batch_requests` / `execute_modbus_reads`）と
 # `dial_modbus`・`ModbusTcpConfig`。
 banto-plc = { path = "../banto-plc" }
 # 書き込みの計画・実行（`plan_modbus_writes` / `execute_modbus_writes`）。
 banto-plc-write = { path = "../banto-plc-write" }
-# 接続定義の型（`PlcConnection`）。`dial` の引数。
+# 設定の検証の許可リスト（`ALLOWED_WORD_ORDERS` ほか、`src/base.rs`）。
 banto-tags = { path = "../banto-tags" }
 # セッションが持つ `TcpStream`（`net`）と、切断時の `shutdown`（`io-util`）。
 tokio = { workspace = true, features = ["net", "io-util"] }
 
 [dev-dependencies]
+# tests/broker.rs: 接続の `settings`（JSON のオブジェクト、R2b-3a-2）。
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 # src/session.rs の単体テストと tests/broker.rs: in-process の Modbus TCP シミュレータ
 # （broker の単体テストから移したもの。§4.4 の表）。

@@ -66,7 +66,7 @@ impl AddressArea {
     /// this is a fact about the wire protocol, not a gap any driver could
     /// ever close (contrast a connection's *protocol* not having a write
     /// driver wired up yet at all, which is a temporary capability gap
-    /// tracked elsewhere - `banto_broker::DriverTable::is_supported` /
+    /// tracked elsewhere - `banto_broker::is_broker_managed` /
     /// `apps/banto-hub/core/src/write_path.rs`'s gate 5).
     ///
     /// This is the one fact this crate exists to define exactly once - see

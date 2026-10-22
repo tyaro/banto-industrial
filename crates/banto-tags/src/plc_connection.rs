@@ -91,8 +91,8 @@
 //! same rule as `"modbus-tcp"`/`"slmp"`) - what it never does is join the PLC
 //! collection pipeline: `banto_collect::build_config_from` excludes it from
 //! collection entirely (same treatment as `"virtual"`, see that crate's own
-//! doc comment), and `banto_broker`'s `DriverTable` has no entry for it
-//! either, so nothing ever tries to open a broker session against it.
+//! doc comment), and the registry holds it as a host-provided protocol (not a
+//! session-type driver), so `banto_broker` never opens a session against it.
 //!
 //! Three settings exist only for this protocol: [`PlcConnection::database`]/
 //! [`PlcConnection::username`] and the password. [`validate_plc_connection_input`]

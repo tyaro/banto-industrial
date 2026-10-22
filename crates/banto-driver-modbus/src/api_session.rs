@@ -8,8 +8,8 @@
 //!   `word_order` is the column default `low_high`, like the stored
 //!   connection) with the [`ConnectContext`]'s two timeouts, dials with
 //!   `banto_plc::dial_modbus` and wraps the stream in the same
-//!   [`ModbusSession`] the broker's `BrokerSession` uses - so reads and writes
-//!   still share the **one** transaction-id counter.
+//!   [`ModbusSession`] (one socket) - so reads and writes still share the
+//!   **one** transaction-id counter.
 //! - [`ModbusApiSession::read_batch`] turns each `TagSpec`'s canonical address
 //!   back into a `banto_plc::Address` with this driver's own grammar
 //!   (`Address::parse`; the private [`read_request`] / [`write_request`] - the
@@ -21,7 +21,8 @@
 //!   `ItemError::Unsupported` here: Modbus has no read-modify-write
 //!   (the SLMP twin sends it as `BitInWord`).
 //!
-//! Not registered by `banto-drivers` yet (still `HostBound`; 3a-2 switches).
+//! Registered by `banto-drivers` as `DriverEntry::session` since R2b-3a-2:
+//! the broker dials every connection of this protocol through it.
 
 use banto_driver_api::{
     keys, BoxFuture, ConnectContext, DataType, FatalError, ItemError, Session, SessionDriver,
