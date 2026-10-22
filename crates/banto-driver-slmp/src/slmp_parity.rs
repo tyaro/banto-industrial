@@ -526,7 +526,7 @@ async fn write_answers_are_judged_like_the_crate() {
     c.close().await;
 }
 
-/// The two places this driver is stricter than the crate, pinned so that a
+/// The places this driver is stricter than the crate, pinned so that a
 /// change to either side is seen.
 ///
 /// 1. A refusal whose echoed fields do not match this request: the crate
@@ -536,6 +536,12 @@ async fn write_answers_are_judged_like_the_crate() {
 /// 2. A bit read answered with more bytes than its points need: the crate
 ///    takes the first points and ignores the rest; this driver wants exactly
 ///    `ceil(count / 2)` bytes.
+/// 3. A word read answered with one stray byte after its words: the crate's
+///    `chunks_exact(2)` drops it (the point count still matches, so the
+///    session's check in `execute_one` passes it too); this driver wants
+///    exactly `2 × count` bytes.
+/// 4. A write answered with data after a zero end code: the crate's
+///    `bulk_write` ignores it; this driver's `write_ack` wants none.
 #[tokio::test]
 async fn where_this_driver_is_stricter() {
     let peer = Peer::start();
@@ -572,5 +578,29 @@ async fn where_this_driver_is_stricter() {
     let theirs = crate_verdict(c.bulk_read(start, 2, slmp::DataType::Bool).await, 2);
     assert_eq!(theirs, Verdict::Bits(vec![true, false]));
     assert_eq!(our_verdict(&route, &span, &long), Verdict::Framing);
+
+    let stray = response(&route, 0, &[0x34, 0x12, 0x00]);
+    peer.answer_with(Some(stray.clone()));
+    let span = Span {
+        device: SlmpDevice::D,
+        start: 0,
+        count: 1,
+    };
+    let start = slmp::Device {
+        device_type: slmp::DeviceType::D,
+        address: 0,
+    };
+    let theirs = crate_verdict(c.bulk_read(start, 1, slmp::DataType::U16).await, 1);
+    assert_eq!(theirs, Verdict::Words(vec![0x1234]));
+    assert_eq!(our_verdict(&route, &span, &stray), Verdict::Framing);
+
+    let with_data = response(&route, 0, &[0x00, 0x00]);
+    peer.answer_with(Some(with_data.clone()));
+    let theirs = c.bulk_write(start, &[slmp::TypedData::U16(1)]).await;
+    assert!(theirs.is_ok(), "{theirs:?}");
+    assert!(matches!(
+        frame::write_ack(&route, &with_data),
+        Err(FatalError::Framing(_))
+    ));
     c.close().await;
 }

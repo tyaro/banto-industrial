@@ -141,6 +141,25 @@ fn stitch<R, T>(
         .collect())
 }
 
+/// #793 のレビュー: 保存時の `parse_address` を経ずに来た spec（手で組んだ
+/// `TagSpec` など）でも、占める最後の番号が上限 0xFFFFFF を超えるものは、
+/// そのタグだけの `ItemError::Unsupported` にして要求を組まない。読み取り
+/// （セッションと、フレーム型の `plan_read`）と書き込みの入口で使う。これが
+/// 無いと、セッションの計画は上限をまたぐ要求をそのまま送り、フレーム型の
+/// 計画は同じまとまりの正常なタグまで巻き込んで致命になる。
+fn past_last_number(spec: &TagSpec, address: &Address) -> Option<ItemError> {
+    let (_, number, bit) = address.as_slmp()?;
+    if crate::base::occupied_fits(number, bit, &spec.kind) {
+        return None;
+    }
+    Some(ItemError::Unsupported(format!(
+        "アドレス {} から {} 語分を占めると、デバイス番号の上限 0x{:X} を超えます",
+        spec.address.canonical,
+        crate::base::occupied_words(bit, &spec.kind),
+        banto_plc::slmp::address::MAX_DEVICE_NUMBER
+    )))
+}
+
 /// The read request of `spec`: this driver's grammar on the canonical address.
 pub(crate) fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
     // An address that does not parse is that tag's problem, not the
@@ -149,6 +168,9 @@ pub(crate) fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, Fat
         Ok(address) => address,
         Err(e) => return classify_read(e).map(Prep::Item),
     };
+    if let Some(item) = past_last_number(spec, &address) {
+        return Ok(Prep::Item(item));
+    }
     Ok(match &spec.kind {
         TagKind::Numeric(data_type) => Prep::Request(BatchReadRequest::Numeric(ReadRequest {
             address,
@@ -177,6 +199,9 @@ fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError
         Ok(address) => address,
         Err(e) => return classify_read(e).map(Prep::Item),
     };
+    if let Some(item) = past_last_number(spec, &address) {
+        return Ok(Prep::Item(item));
+    }
     if spec.address.bit.is_some() && spec.kind == TagKind::Numeric(DataType::Bit) {
         return Ok(match &item.value {
             Value::Bit(value) => Prep::Request(BatchWriteRequest::BitInWord {
@@ -355,6 +380,91 @@ mod tests {
             assert_eq!(ours, hub_says_rmw, "{text}");
             assert_eq!(item.spec.address.bit.is_some(), hub_says_rmw, "{text}");
         }
+    }
+
+    /// A spec that skipped the save path's `parse_address` (which refuses
+    /// these since #793).
+    fn unchecked(canonical: &str, kind: TagKind) -> TagSpec {
+        let words = kind.word_count();
+        TagSpec::new(
+            banto_driver_api::DriverAddress::new(
+                SlmpDriver.descriptor().id.clone(),
+                canonical,
+                "D",
+                true,
+                words,
+            ),
+            kind,
+        )
+    }
+
+    /// #793 のレビュー（非ブロッカー）: 上限をはみ出す spec は、読み取りでも
+    /// 書き込みでもそのタグだけの `Unsupported` で、要求を組まない。上限
+    /// ちょうどで終わるものは要求になる。
+    #[test]
+    fn a_spec_running_past_the_last_device_number_is_an_item_error() {
+        let sjis = |w| TagKind::string(w, banto_driver_api::StringEncoding::ShiftJis);
+        for spec in [
+            unchecked("D16777215", n(DataType::U32)),
+            unchecked("ZR16777215", n(DataType::F32)),
+            unchecked("ZR16777214", sjis(3)),
+        ] {
+            assert!(
+                matches!(
+                    read_request(&spec),
+                    Ok(Prep::Item(ItemError::Unsupported(_)))
+                ),
+                "read {spec:?}"
+            );
+            let value = match spec.kind {
+                TagKind::Str { .. } => Value::Str("x".into()),
+                _ => Value::F64(1.0),
+            };
+            let item = WriteItem::new(spec.clone(), value);
+            assert!(
+                matches!(
+                    write_request(&item),
+                    Ok(Prep::Item(ItemError::Unsupported(_)))
+                ),
+                "write {spec:?}"
+            );
+        }
+        for spec in [
+            spec("D16777214", n(DataType::U32)),
+            spec("ZR16777214", sjis(2)),
+            spec("D16777215.F", n(DataType::Bit)),
+        ] {
+            assert!(
+                matches!(read_request(&spec), Ok(Prep::Request(_))),
+                "{spec:?}"
+            );
+        }
+    }
+
+    /// The same through the live session: the healthy tag is read, the one
+    /// past the limit is that tag's error, and nothing is written for it.
+    #[tokio::test]
+    async fn the_session_never_sends_a_request_past_the_last_device_number() {
+        let sim = Simulator::start().await;
+        sim.set_word(banto_plc::SlmpDevice::D, 0, 7);
+        let mut s = connect(&sim, 1000).await;
+        let specs = [
+            spec("D0", n(DataType::U16)),
+            unchecked("D16777215", n(DataType::U32)),
+        ];
+        let r = s.read_batch(&specs).await.unwrap();
+        assert_eq!(r[0], Ok(Value::F64(7.0)));
+        assert!(matches!(r[1], Err(ItemError::Unsupported(_))), "{r:?}");
+        let w = s
+            .write_batch(&[WriteItem::new(specs[1].clone(), Value::F64(1.0))])
+            .await
+            .unwrap();
+        assert!(
+            matches!(w.as_slice(), [Err(ItemError::Unsupported(_))]),
+            "{w:?}"
+        );
+        assert_eq!(sim.write_command_count(), 0);
+        sim.stop();
     }
 
     /// A broken result count is fatal, not trimmed and not a panic.

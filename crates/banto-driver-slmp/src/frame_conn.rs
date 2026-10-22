@@ -10,9 +10,12 @@
 //!   the same private `read_request` (this driver's grammar on the canonical
 //!   address) into `banto_plc::plan_slmp_batch`, and every group becomes one
 //!   bulk read step whose `covers` are the specs it serves. A spec the
-//!   planner refuses (`immediate_bad`) or that does not parse is covered by
-//!   no step, so the engine answers it `ItemError::Unsupported` (design §5.2
-//!   6; `parse_address` already refuses those when the tag is saved).
+//!   planner refuses (`immediate_bad`), that does not parse, or that runs
+//!   past the last device number 0xFFFFFF (`read_request` makes it an item
+//!   error before grouping, #793 のレビュー - grouped, it would take the
+//!   healthy specs of its group down with it) is covered by no step, so the
+//!   engine answers it `ItemError::Unsupported` (design §5.2 6;
+//!   `parse_address` already refuses those when the tag is saved).
 //! - `decode_read` takes the device and span from the step's own request
 //!   bytes (`frame::parse_request`) and each value's place from its spec, so
 //!   it keeps no state between `plan_read` and the responses. A non-zero end
@@ -101,14 +104,6 @@ impl FrameConnection for SlmpConnection {
         let mut spec_of: Vec<u32> = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             if let Prep::Request(request) = read_request(spec)? {
-                // #793 のレビュー: 番号の上限からはみ出す spec はまとめる前に外す
-                // （どの step にも入らず、エンジンがその spec だけを
-                // `Unsupported` にする）。まとめた後の `bulk_read` の範囲検査で
-                // 落とすと、同じまとまりの正常な spec まで巻き込み、計画全体が
-                // 致命になる。
-                if !fits_device_numbers(spec) {
-                    continue;
-                }
                 requests.push(request);
                 spec_of.push(u32::try_from(i).map_err(|_| broken_plan("specs が多すぎる"))?);
             }
@@ -182,16 +177,6 @@ impl FrameConnection for SlmpConnection {
             })
             .collect()
     }
-}
-
-/// Whether the device numbers `spec` occupies stay within the device's
-/// range ([`crate::base::occupied_fits`]). A canonical address that does not
-/// parse never gets here (`read_request` made it an item error).
-fn fits_device_numbers(spec: &TagSpec) -> bool {
-    Address::parse_slmp(&spec.address.canonical)
-        .ok()
-        .and_then(|a| a.as_slmp())
-        .is_some_and(|(_, number, bit)| crate::base::occupied_fits(number, bit, &spec.kind))
 }
 
 /// One spec's value out of its step's window. `Err` is a spec that does not
