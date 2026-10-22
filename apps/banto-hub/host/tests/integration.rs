@@ -703,6 +703,169 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
 }
 
 // ---------------------------------------------------------------------------
+// 1d. 設定の変更で broker のセッションを張り直す（#790、R2b-3a-2 の後追い）:
+//     再構築（`sync_broker_sessions_from`: resolve の changed → remove → ensure）を
+//     通して、作り直したハンドルの指紋が新しい設定のものになり、シミュレータが
+//     新しい接続を受けることを確かめる。
+// ---------------------------------------------------------------------------
+
+/// 保存済みの接続から、新しいセッションが持つはずの指紋を作る。
+async fn expected_fingerprint(app: &TestApp, id: i64) -> Option<banto_broker::SettingsFingerprint> {
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .get(id)
+        .await
+        .unwrap();
+    app.sessions.dial_fingerprint(
+        &conn.protocol,
+        Some(&conn),
+        &banto_tags::settings_to_api(&conn.settings),
+    )
+}
+
+/// 今のハンドルの指紋。
+fn live_fingerprint(app: &TestApp, id: i64) -> Option<banto_broker::SettingsFingerprint> {
+    app.sessions
+        .handle_for(id)
+        .and_then(|h| h.settings_fingerprint())
+}
+
+/// シミュレータが `accepted` 本目の接続を受けるまで待つ（期限つき）。accept の件数は
+/// シミュレータの別タスクが更新するので、クライアント側の Connected の直後に見ると
+/// まだ数えられていないことがある。
+async fn wait_accepted(sim: &Simulator, accepted: usize, why: &str) {
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            sim.connection_count() >= accepted
+        })
+        .await,
+        "{why}: シミュレータが {accepted} 本目の接続を受けた（受けた接続 {}）",
+        sim.connection_count()
+    );
+}
+
+/// 再構築の後、ハンドルの指紋が保存済みの設定のものになり、シミュレータが
+/// `accepted` 本目の接続を受けるまで待つ。前の指紋 `before` とは違うこと。
+async fn assert_redialed(
+    app: &TestApp,
+    sim: &Simulator,
+    id: i64,
+    before: Option<banto_broker::SettingsFingerprint>,
+    accepted: usize,
+    why: &str,
+) -> Option<banto_broker::SettingsFingerprint> {
+    let want = expected_fingerprint(app, id).await;
+    assert!(want.is_some(), "{why}");
+    assert_ne!(want, before, "{why}: 設定が変われば指紋も変わる");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            live_fingerprint(app, id) == want
+        })
+        .await,
+        "{why}: 作り直したハンドルは新しい設定の指紋を持つ"
+    );
+    wait_accepted(sim, accepted, why).await;
+    assert_eq!(
+        app.sessions.connection_count(),
+        1,
+        "{why}: セッションは 1 本"
+    );
+    want
+}
+
+/// 収集するグループ（タグは無くてよい、`connections_with_collected_groups`）を作って
+/// 再構築し、最初のセッションが接続するまで待つ。
+async fn start_session(app: &TestApp, conn_id: i64) {
+    CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("first rebuild");
+    app.sessions
+        .status_watch(conn_id)
+        .expect("a broker session")
+        .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
+        .await
+        .expect("Connected");
+}
+
+/// 設定は同じで protocol だけ変える。保存の入口は protocol ごとに平らな欄から
+/// `settings` を組み直す（modbus は `unit_id` を持ち slmp は持たない）ので、同じ
+/// `settings` のまま protocol だけ違う行は列を直接書いて作る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_only_change_redials_the_broker_session_with_the_new_driver() {
+    let app = test_app("redial-protocol").await;
+    let sim = Simulator::start().await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    let settings = serde_json::json!({ "host": "127.0.0.1", "port": sim.addr.port() }).to_string();
+    let set_row = |protocol: &'static str| {
+        let pool = app.pool.clone();
+        let settings = settings.clone();
+        async move {
+            sqlx::query("UPDATE plc_connections SET protocol = ?, settings = ? WHERE id = ?")
+                .bind(protocol)
+                .bind(settings)
+                .bind(conn.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+    set_row("modbus-tcp").await;
+    start_session(&app, conn.id).await;
+    let first = live_fingerprint(&app, conn.id);
+    assert_eq!(first, expected_fingerprint(&app, conn.id).await);
+    wait_accepted(&sim, 1, "最初のセッション").await;
+    assert_eq!(sim.connection_count(), 1);
+
+    // 同じ設定の再構築は張り直さない。
+    app.manager.rebuild().await.expect("rebuild");
+    assert_eq!(live_fingerprint(&app, conn.id), first);
+
+    set_row("slmp").await;
+    app.manager
+        .rebuild()
+        .await
+        .expect("rebuild after the protocol change");
+    assert_redialed(&app, &sim, conn.id, first, 2, "protocol だけの変更").await;
+    sim.stop();
+}
+
+/// Modbus の `unit_id`、続けて `word_order` を変える（保存の入口を通す）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modbus_unit_id_or_word_order_change_redials_the_broker_session() {
+    let app = test_app("redial-modbus").await;
+    let sim = Simulator::start().await;
+    let service = PlcConnectionService::new(app.pool.clone());
+    let conn = service
+        .create(conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    start_session(&app, conn.id).await;
+    let first = live_fingerprint(&app, conn.id);
+    assert_eq!(first, expected_fingerprint(&app, conn.id).await);
+    wait_accepted(&sim, 1, "最初のセッション").await;
+    assert_eq!(sim.connection_count(), 1);
+
+    let mut input = conn_input("line1", sim.addr.port());
+    input.unit_id = 2;
+    service.update(conn.id, input.clone()).await.unwrap();
+    app.manager.rebuild().await.expect("rebuild after unit_id");
+    let second = assert_redialed(&app, &sim, conn.id, first, 2, "unit_id の変更").await;
+
+    input.word_order = "high_low".to_string();
+    service.update(conn.id, input).await.unwrap();
+    app.manager
+        .rebuild()
+        .await
+        .expect("rebuild after word_order");
+    assert_redialed(&app, &sim, conn.id, second, 3, "word_order の変更").await;
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
 // 2. catalog: 外部名・address・安定ID・revision
 // ---------------------------------------------------------------------------
 

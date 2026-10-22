@@ -469,6 +469,48 @@ async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
     }
 }
 
+/// #790（Codex のレビュー P3）: 直接ダイヤルで `cpuType` を省くと、`connectionId` の
+/// 保存済み接続が同じプロトコル（slmp）ならその CPU（Q）でフレームを組む。保存済みの
+/// プロトコルが違えば引き継がず、ドライバの既定（iQ-R）で組む。収集していない接続
+/// （共有セッションが無い）なので直接ダイヤルの経路を通る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn slmp_test_direct_dial_inherits_the_saved_cpu_only_from_the_same_protocol() {
+    let app = test_app("t12-slmp-cpu-inherit").await;
+    let sim = SlmpSimulator::start().await;
+    let service = PlcConnectionService::new(app.pool.clone());
+    let mut input = slmp_conn_input("lineq", sim.addr.port());
+    input.cpu_type = Some("Q".to_string());
+    let slmp_q = service.create(input).await.unwrap();
+    let modbus = service
+        .create(modbus_conn_input("modbus", sim.addr.port()))
+        .await
+        .unwrap();
+    assert!(
+        app.sessions.handle_for(slmp_q.id).is_none(),
+        "収集していない"
+    );
+
+    for (id, sub, why) in [
+        (slmp_q.id, 0x0000u16, "同じプロトコルの Q を引き継ぐ"),
+        (modbus.id, 0x0002u16, "プロトコルが違えばドライバの既定 R"),
+    ] {
+        let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
+        payload["connectionId"] = json!(id);
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{why} {body:?}");
+        assert_eq!(body["ok"], true, "{why} {body:?}");
+        assert_eq!(sim.last_subcommand(), Some(sub), "{why}");
+    }
+    sim.stop();
+}
+
 /// #605: 未知の CPU 種別はダイヤルせず拒否する（R への黙ったフォールバックではない）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_test_rejects_an_unknown_cpu_type() {
@@ -633,6 +675,112 @@ async fn slmp_test_refuses_a_session_whose_cpu_differs_from_the_form() {
     assert_eq!(app.sessions.connection_count(), 1);
 
     sim.stop();
+}
+
+/// 収集中の共有セッションが張れている状態にして、接続 id を返す（SLMP / Modbus 共通）。
+async fn start_collecting(app: &TestApp, input: PlcConnectionInput) -> i64 {
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(input)
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn.id, 100))
+        .await
+        .unwrap();
+    let (address, data_type) = if conn.protocol == "slmp" {
+        ("D100", "u16")
+    } else {
+        ("40001", "u16")
+    };
+    TagService::new(app.pool.clone())
+        .create(tag_input("t1", group.id, address, data_type))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+    let mut status_watch = app
+        .sessions
+        .status_watch(conn.id)
+        .expect("a broker session should exist");
+    status_watch
+        .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
+        .await
+        .expect("broker session should report Connected");
+    conn.id
+}
+
+/// R2b-3a-2（Codex のレビュー）: 収集中の共有セッションと、フォームの host / port /
+/// unitId が食い違うときは、そのセッションの読みをフォームの結果として返さない。
+/// 2 本目もダイヤルせず「保存してからテスト」と返す。
+async fn assert_form_differing_from_the_session_is_refused(
+    name: &str,
+    protocol: &str,
+    change: impl FnOnce(&mut serde_json::Value),
+) {
+    let app = test_app(name).await;
+    let (port, input, _sim): (u16, PlcConnectionInput, Box<dyn std::any::Any>) =
+        if protocol == "slmp" {
+            let sim = SlmpSimulator::start().await;
+            let port = sim.addr.port();
+            (port, slmp_conn_input("line1", port), Box::new(sim))
+        } else {
+            let sim = ModbusSimulator::start().await;
+            let port = sim.addr.port();
+            (port, modbus_conn_input("line1", port), Box::new(sim))
+        };
+    let id = start_collecting(&app, input).await;
+    let before = app.sessions.connection_count();
+    let mut payload = json!({
+        "protocol": protocol,
+        "host": "127.0.0.1",
+        "port": port,
+        "unitId": 1,
+        "simulation": false,
+        "connectionId": id,
+    });
+    change(&mut payload);
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert_eq!(body["error"]["kind"], "protocol", "{body:?}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("保存してからテスト"), "{message}");
+    assert_eq!(
+        app.sessions.connection_count(),
+        before,
+        "2 本目をダイヤルしない"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_refuses_a_session_whose_host_differs_from_the_form() {
+    assert_form_differing_from_the_session_is_refused("t12-session-host", "slmp", |p| {
+        p["host"] = json!("127.0.0.2");
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_refuses_a_session_whose_port_differs_from_the_form() {
+    assert_form_differing_from_the_session_is_refused("t12-session-port", "slmp", |p| {
+        let port = p["port"].as_u64().unwrap();
+        p["port"] = json!(port + 1);
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn modbus_test_refuses_a_session_whose_unit_id_differs_from_the_form() {
+    assert_form_differing_from_the_session_is_refused("t12-session-unit", "modbus-tcp", |p| {
+        p["unitId"] = json!(2);
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------------------

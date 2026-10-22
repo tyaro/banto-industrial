@@ -74,9 +74,7 @@ impl SessionDriver for SlmpDriver {
         let config = config_from(settings, &cx);
         Box::pin(async move {
             let config = config?;
-            let client = banto_plc::dial_slmp(&config)
-                .await
-                .map_err(|e| fatal(classify_read(e)))?;
+            let client = banto_plc::dial_slmp(&config).await.map_err(connect_error)?;
             Ok(Box::new(SlmpApiSession {
                 inner: SlmpSession::new(client, config.word_order),
             }) as Box<dyn Session>)
@@ -87,6 +85,16 @@ impl SessionDriver for SlmpDriver {
 /// The live session (the type behind `Box<dyn Session>`).
 pub(crate) struct SlmpApiSession {
     inner: SlmpSession,
+}
+
+/// A failed dial. A connect timeout is `FatalError::Timeout` (so the
+/// connection test reports `timeout`, as before #788), not the `Io` that
+/// `classify_read` makes of it for a session already in use.
+fn connect_error(err: banto_plc::PlcError) -> FatalError {
+    match err {
+        banto_plc::PlcError::ConnectTimeout(_) => FatalError::Timeout,
+        other => fatal(classify_read(other)),
+    }
 }
 
 /// The fatal half of a classification. An `ItemError` where the executor
@@ -281,6 +289,18 @@ mod tests {
     use banto_plc::slmp::simulator::Simulator;
 
     use super::*;
+
+    #[test]
+    fn a_connect_timeout_is_a_timeout_and_a_refusal_is_io() {
+        assert_eq!(
+            connect_error(banto_plc::PlcError::ConnectTimeout("h:1".into())),
+            FatalError::Timeout
+        );
+        assert!(matches!(
+            connect_error(banto_plc::PlcError::Connection("refused".into())),
+            FatalError::Io(_)
+        ));
+    }
 
     fn n(data_type: DataType) -> TagKind {
         TagKind::numeric(data_type)

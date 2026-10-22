@@ -80,7 +80,7 @@ impl SessionDriver for ModbusDriver {
             let config = config?;
             let stream = banto_plc::dial_modbus(&config)
                 .await
-                .map_err(|e| fatal(classify_read(e)))?;
+                .map_err(connect_error)?;
             Ok(Box::new(ModbusApiSession {
                 inner: ModbusSession::new(stream, &config),
             }) as Box<dyn Session>)
@@ -91,6 +91,16 @@ impl SessionDriver for ModbusDriver {
 /// The live session (the type behind `Box<dyn Session>`).
 pub(crate) struct ModbusApiSession {
     inner: ModbusSession,
+}
+
+/// A failed dial. A connect timeout is `FatalError::Timeout` (so the
+/// connection test reports `timeout`, as before #788), not the `Io` that
+/// `classify_read` makes of it for a session already in use.
+fn connect_error(err: banto_plc::PlcError) -> FatalError {
+    match err {
+        banto_plc::PlcError::ConnectTimeout(_) => FatalError::Timeout,
+        other => fatal(classify_read(other)),
+    }
 }
 
 /// The fatal half of a classification. An `ItemError` where the executor
@@ -277,6 +287,18 @@ mod tests {
     use banto_plc::modbus::simulator::Simulator;
 
     use super::*;
+
+    #[test]
+    fn a_connect_timeout_is_a_timeout_and_a_refusal_is_io() {
+        assert_eq!(
+            connect_error(banto_plc::PlcError::ConnectTimeout("h:1".into())),
+            FatalError::Timeout
+        );
+        assert!(matches!(
+            connect_error(banto_plc::PlcError::Connection("refused".into())),
+            FatalError::Io(_)
+        ));
+    }
 
     fn n(data_type: DataType) -> TagKind {
         TagKind::numeric(data_type)

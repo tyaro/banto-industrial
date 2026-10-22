@@ -394,11 +394,11 @@ impl std::fmt::Debug for BrokerOptions {
 pub struct SettingsFingerprint(u64);
 
 impl SettingsFingerprint {
-    /// The fingerprint of `settings` alone, leaving out every key in
+    /// The fingerprint of `protocol` + `settings` alone, leaving out every key in
     /// `secret_keys` (the value of a secret never reaches the hash) - for
     /// settings that belong to no stored connection (no secret references).
-    pub fn of(settings: &Settings, secret_keys: &[String]) -> Self {
-        Self::of_connection(None, settings, secret_keys)
+    pub fn of(protocol: &str, settings: &Settings, secret_keys: &[String]) -> Self {
+        Self::of_connection(protocol, None, settings, secret_keys)
     }
 
     /// The fingerprint a session of `conn` dialed with `settings` carries:
@@ -408,6 +408,7 @@ impl SettingsFingerprint {
     /// (no stored connection) is the same as a connection without
     /// references. The opened values are never part of it.
     pub fn of_connection(
+        protocol: &str,
         conn: Option<&PlcConnection>,
         settings: &Settings,
         secret_keys: &[String],
@@ -432,6 +433,9 @@ impl SettingsFingerprint {
         }
         refs.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // The driver kind is part of the identity: the same host/port under
+        // another protocol is another session (Codex review of #788, P2).
+        protocol.hash(&mut hasher);
         pairs.hash(&mut hasher);
         refs.hash(&mut hasher);
         SettingsFingerprint(hasher.finish())
@@ -868,7 +872,8 @@ impl SessionDirectory {
         }
 
         let secret_keys = driver.secret_keys();
-        let fingerprint = SettingsFingerprint::of_connection(Some(conn), &settings, &secret_keys);
+        let fingerprint =
+            SettingsFingerprint::of_connection(&conn.protocol, Some(conn), &settings, &secret_keys);
         let connector = session_connector(
             conn.clone(),
             driver,
@@ -1744,13 +1749,19 @@ mod tests {
         let a = Settings::from_pairs([("host", "h"), ("port", "1"), ("cpu_type", "Q")]).unwrap();
         let b = Settings::from_pairs([("cpu_type", "Q"), ("port", "1"), ("host", "h")]).unwrap();
         assert_eq!(
-            SettingsFingerprint::of(&a, &[]),
-            SettingsFingerprint::of(&b, &[])
+            SettingsFingerprint::of("p", &a, &[]),
+            SettingsFingerprint::of("p", &b, &[])
         );
         let r = Settings::from_pairs([("host", "h"), ("port", "1"), ("cpu_type", "R")]).unwrap();
         assert_ne!(
-            SettingsFingerprint::of(&a, &[]),
-            SettingsFingerprint::of(&r, &[])
+            SettingsFingerprint::of("p", &a, &[]),
+            SettingsFingerprint::of("p", &r, &[])
+        );
+
+        assert_ne!(
+            SettingsFingerprint::of("slmp", &a, &[]),
+            SettingsFingerprint::of("modbus-tcp", &a, &[]),
+            "the same settings under another driver kind is another identity"
         );
 
         let secret = vec!["password".to_string()];
@@ -1760,12 +1771,12 @@ mod tests {
             Settings::from_pairs([("host", "h"), ("port", "1"), ("password", "y")]).unwrap();
         let without = Settings::from_pairs([("host", "h"), ("port", "1")]).unwrap();
         assert_eq!(
-            SettingsFingerprint::of(&with_pw, &secret),
-            SettingsFingerprint::of(&other_pw, &secret)
+            SettingsFingerprint::of("p", &with_pw, &secret),
+            SettingsFingerprint::of("p", &other_pw, &secret)
         );
         assert_eq!(
-            SettingsFingerprint::of(&with_pw, &secret),
-            SettingsFingerprint::of(&without, &secret)
+            SettingsFingerprint::of("p", &with_pw, &secret),
+            SettingsFingerprint::of("p", &without, &secret)
         );
     }
 
@@ -1785,7 +1796,7 @@ mod tests {
         let handle = directory.ensure_connection(&c).unwrap();
         assert_eq!(
             handle.settings_fingerprint(),
-            Some(SettingsFingerprint::of(&own, &[]))
+            Some(SettingsFingerprint::of(&c.protocol, &own, &[]))
         );
         assert_eq!(
             handle.read_only().settings_fingerprint(),
@@ -1799,7 +1810,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             other.settings_fingerprint(),
-            Some(SettingsFingerprint::of(&simulated, &[]))
+            Some(SettingsFingerprint::of(
+                &conn(2, 5000).protocol,
+                &simulated,
+                &[]
+            ))
         );
         assert_ne!(other.settings_fingerprint(), handle.settings_fingerprint());
         wait_connected(&other).await;
@@ -1884,6 +1899,7 @@ mod tests {
         assert_eq!(
             handle.settings_fingerprint(),
             Some(SettingsFingerprint::of_connection(
+                &secret_conn().protocol,
                 Some(&secret_conn()),
                 &validated,
                 &["password".to_string()]
@@ -1913,12 +1929,13 @@ mod tests {
         let b = conn_with_password_ref(OTHER_REF);
         let settings = banto_tags::settings_to_api(&a.settings);
         assert_eq!(settings, banto_tags::settings_to_api(&b.settings));
-        let fa = SettingsFingerprint::of_connection(Some(&a), &settings, &keys);
-        let fb = SettingsFingerprint::of_connection(Some(&b), &settings, &keys);
+        let fa = SettingsFingerprint::of_connection(ID, Some(&a), &settings, &keys);
+        let fb = SettingsFingerprint::of_connection(ID, Some(&b), &settings, &keys);
         assert_ne!(fa, fb, "another reference, another fingerprint");
         assert_eq!(
             fa,
             SettingsFingerprint::of_connection(
+                ID,
                 Some(&conn_with_password_ref(REF)),
                 &settings,
                 &keys
@@ -1926,13 +1943,13 @@ mod tests {
         );
         assert_ne!(
             fa,
-            SettingsFingerprint::of(&settings, &keys),
+            SettingsFingerprint::of(ID, &settings, &keys),
             "the reference counts"
         );
         // Not a secret key of the driver: the reference is not looked at.
         assert_eq!(
-            SettingsFingerprint::of_connection(Some(&a), &settings, &[]),
-            SettingsFingerprint::of_connection(Some(&b), &settings, &[])
+            SettingsFingerprint::of_connection(ID, Some(&a), &settings, &[]),
+            SettingsFingerprint::of_connection(ID, Some(&b), &settings, &[])
         );
     }
 
