@@ -572,9 +572,17 @@ impl HubRuntime {
         // so this binary can call `sessions.shutdown()` after
         // `manager.shutdown()` on the way out - see this module's doc
         // comment ("シャットダウン順序").
-        let sessions = Arc::new(HubSessions::new(
+        //
+        // R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): the broker opens
+        // a connection's secrets (only its driver's `secret_keys()`) just
+        // before each dial, through this opener over the same database.
+        let sessions = Arc::new(HubSessions::with_secret_opener(
             banto_broker::BackoffConfig::default(),
             drivers,
+            Arc::new(crate::secrets::ConnectionSecretOpener::new(
+                pool.clone(),
+                crate::secrets::ConnectionSecrets::platform_default(),
+            )),
         ));
 
         // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE

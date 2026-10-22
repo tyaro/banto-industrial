@@ -32,7 +32,6 @@ pub fn hub_drivers() -> banto_hub_core::broker_glue::HubDrivers {
         .expect("host-provided driver ids are distinct from the built-ins");
     banto_hub_core::broker_glue::HubDrivers::new(
         std::sync::Arc::new(registry),
-        builtin.broker,
         builtin.client_factory,
     )
 }

@@ -3,8 +3,7 @@
 //! docs/banto-driver-api-design.md §4.1).
 //!
 //! Every driver kind - frame ([`FrameDriver`](crate::FrameDriver)), session
-//! ([`SessionDriver`](crate::SessionDriver)), R1's host-bound built-ins
-//! ([`DriverKind::HostBound`](crate::DriverKind::HostBound)) and the
+//! ([`SessionDriver`](crate::SessionDriver)) and the
 //! host-provided protocols whose I/O the host keeps
 //! ([`DriverKind::HostProvided`](crate::DriverKind::HostProvided)) - implements
 //! [`DriverBase`], so REST / MCP / CSV import / configuration packages / the
@@ -202,6 +201,20 @@ pub trait DriverBase: Send + Sync + 'static {
     /// A short explanation of the address grammar for the UI (WIT
     /// `address.help`; Japanese, plugin-design §6.2).
     fn address_help(&self) -> String;
+
+    /// The one point a host's connection test reads (R2b-3a-2,
+    /// docs/banto-hub-driver-io-design.md §4.2 / Q11): an address as a
+    /// person would write it (the host runs it through
+    /// [`parse_address`](Self::parse_address)) and its kind. The host
+    /// connects, reads this point once and disconnects, so every driver gets
+    /// a connection test without the host knowing its grammar.
+    ///
+    /// Default: `None` - the test only connects (and, for a frame-type
+    /// driver, completes the handshake). Adding this with a default is not a
+    /// breaking change (design §9.1).
+    fn probe(&self) -> Option<(String, TagKind)> {
+        None
+    }
 }
 
 /// An address the driver's grammar does not accept, or an offset that
@@ -303,6 +316,17 @@ mod tests {
         fn address_help(&self) -> String {
             String::new()
         }
+    }
+
+    #[test]
+    fn probe_default_is_none() {
+        let d = Minimal(DriverDescriptor::new(
+            DriverId::new("m").unwrap(),
+            "0",
+            "M",
+            Capabilities::READ_ONLY,
+        ));
+        assert_eq!(d.probe(), None);
     }
 
     #[test]

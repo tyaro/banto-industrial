@@ -1,97 +1,81 @@
 //! SLMP through the broker (R1-4a, docs/banto-driver-api-design.md §4.4):
 //! these were `banto-broker`'s own unit tests while the SLMP driver lived
-//! there. They moved here with the driver because the broker no longer has
-//! (or depends on) a real driver; they now go through the public
-//! `BrokerSupervisor::spawn` with a table holding only this crate's `dial`.
-//! The assertions are unchanged.
+//! there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): the broker now
+//! dials through a `DriverRegistry` holding this crate's `driver()` as a
+//! session-type entry, and speaks `TagSpec` / `WriteItem`; the scenarios and
+//! the assertions on the device are unchanged.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use banto_broker::{
-    BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor, DialFn, DriverTable,
+use banto_broker::{BackoffConfig, BrokerError, BrokerHandle, BrokerSupervisor};
+use banto_driver_api::{
+    DataType, DriverBase, DriverEntry, DriverRegistry, ItemError, StringEncoding, TagKind, TagSpec,
+    Value, WriteItem,
 };
-use banto_driver_api::DriverId;
-use banto_plc::{
-    Address, BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, StringReadRequest,
-    TagValue,
-};
+use banto_driver_slmp::SlmpDriver;
 use banto_plc_write::slmp::simulator::Simulator;
-use banto_plc_write::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};
 use banto_tags::PlcConnection;
 
-/// The broker table with just this driver, under `"slmp"` (what the old
-/// tests' `DriverTable::builtin()` dialed an `"slmp"` connection with).
-fn slmp_table() -> DriverTable {
-    DriverTable::new(vec![(
-        DriverId::new(banto_driver_slmp::PROTOCOL).expect("valid driver id"),
-        banto_driver_slmp::dial as DialFn,
-    )])
-    .expect("one entry")
+/// The registry with just this driver, as a session-type entry.
+fn slmp_registry() -> Arc<DriverRegistry> {
+    let mut registry = DriverRegistry::new();
+    registry
+        .register(DriverEntry::session(banto_driver_slmp::driver()))
+        .expect("one entry");
+    Arc::new(registry)
 }
 
-fn conn(id: i64, protocol: &str, host: &str, port: u16) -> PlcConnection {
-    PlcConnection {
+fn conn(id: i64, port: u16, cpu_type: &str) -> PlcConnection {
+    let serde_json::Value::Object(settings) = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": port,
+        "word_order": "low_high",
+        "cpu_type": cpu_type,
+    }) else {
+        unreachable!()
+    };
+    PlcConnection::from_settings(
         id,
-        name: format!("conn-{id}"),
-        protocol: protocol.to_string(),
-        host: host.to_string(),
-        port: port as i64,
-        unit_id: 1,
-        enabled: true,
-        simulation: false,
-
-        word_order: "low_high".to_string(),
-        cpu_type: "R".to_string(),
-        database: None,
-        username: None,
-        settings: Default::default(),
-        settings_version: 1,
-    }
+        format!("conn-{id}"),
+        banto_driver_slmp::PROTOCOL.to_string(),
+        true,
+        false,
+        settings,
+        1,
+    )
 }
 
-/// A numeric read request wrapped as the `Numeric` case of the mixed batch
-/// the broker speaks (S2 文字列タグ).
-fn rreq(raw: &str, data_type: DataType) -> BatchReadRequest {
-    BatchReadRequest::Numeric(ReadRequest {
-        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-        data_type,
-    })
+fn spec(text: &str, kind: TagKind) -> TagSpec {
+    let address = SlmpDriver
+        .parse_address(text, &kind)
+        .unwrap_or_else(|e| panic!("{text}: {e}"));
+    TagSpec::new(address, kind)
 }
 
-/// A string read request, the `String` case of the mixed batch. T20 ①b:
-/// Shift-JIS explicitly (this test simulator seeds strings via
-/// `Simulator::set_string`, which is Shift-JIS-only).
-fn sreq(raw: &str, words: u16) -> BatchReadRequest {
-    BatchReadRequest::String(StringReadRequest {
-        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-        words,
-        encoding: banto_plc::StringEncoding::ShiftJis,
-    })
+/// A numeric read spec.
+fn rreq(raw: &str, data_type: DataType) -> TagSpec {
+    spec(raw, TagKind::numeric(data_type))
 }
 
-fn wreq(raw: &str, data_type: DataType, value: TagValue) -> BatchWriteRequest {
-    BatchWriteRequest::Numeric(WriteRequest {
-        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-        data_type,
-        value,
-    })
+/// A string read spec. T20 ①b: Shift-JIS explicitly (this test simulator
+/// seeds strings via `Simulator::set_string`, which is Shift-JIS-only).
+fn sreq(raw: &str, words: u16) -> TagSpec {
+    spec(raw, TagKind::string(words, StringEncoding::ShiftJis))
 }
 
-fn swreq(raw: &str, words: u16, value: &str) -> BatchWriteRequest {
-    BatchWriteRequest::String(StringWriteRequest {
-        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-        words,
-        value: value.to_string(),
-        encoding: banto_plc_write::StringEncoding::ShiftJis,
-    })
+fn wreq(raw: &str, data_type: DataType, value: Value) -> WriteItem {
+    WriteItem::new(rreq(raw, data_type), value)
 }
 
-/// T8 (docs/tag-server-design.md §6.1) bit-in-word write request.
-fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
-    BatchWriteRequest::BitInWord {
-        address: Address::parse_slmp(raw).unwrap_or_else(|e| panic!("{raw}: {e}")),
-        value,
-    }
+fn swreq(raw: &str, words: u16, value: &str) -> WriteItem {
+    WriteItem::new(sreq(raw, words), Value::Str(value.to_string()))
+}
+
+/// T8 (docs/tag-server-design.md §6.1) bit-in-word write: a `bit` tag at a
+/// `.N` address (the driver chooses the read-modify-write, R2b-3a-1).
+fn bwreq(raw: &str, value: bool) -> WriteItem {
+    WriteItem::new(rreq(raw, DataType::Bit), Value::Bit(value))
 }
 
 /// Poll `handle.read` until the session comes up (real time - connecting
@@ -100,11 +84,11 @@ fn bwreq(raw: &str, value: bool) -> BatchWriteRequest {
 /// starts in the background the instant a broker is spawned.
 async fn read_once_connected(
     handle: &BrokerHandle,
-    requests: Vec<BatchReadRequest>,
-) -> Vec<BatchReadResult> {
+    specs: Vec<TagSpec>,
+) -> Vec<Result<Value, ItemError>> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        match handle.read(requests.clone()).await {
+        match handle.read(specs.clone()).await {
             Ok(results) => return results,
             Err(BrokerError::Disconnected { .. }) if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(Duration::from_millis(5)).await;
@@ -121,10 +105,9 @@ async fn read_once_connected(
 async fn cpu_type_selects_the_slmp_subcommand_for_read_and_write() {
     for (cpu_type, word_sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
         let sim = Simulator::start().await;
-        let mut c = conn(1, "slmp", "127.0.0.1", sim.addr.port());
-        c.cpu_type = cpu_type.to_string();
-        let supervisor =
-            BrokerSupervisor::spawn(&[c], BackoffConfig::default(), slmp_table()).expect("spawn");
+        let c = conn(1, sim.addr.port(), cpu_type);
+        let supervisor = BrokerSupervisor::spawn(&[c], BackoffConfig::default(), slmp_registry())
+            .expect("spawn");
         let handle = supervisor.handle(1).expect("handle");
         let _ = read_once_connected(&handle, vec![rreq("D0", DataType::U16)]).await;
         assert_eq!(
@@ -133,7 +116,7 @@ async fn cpu_type_selects_the_slmp_subcommand_for_read_and_write() {
             "{cpu_type} の読み取りサブコマンド"
         );
         handle
-            .write(vec![wreq("D0", DataType::U16, TagValue::F64(1.0))])
+            .write(vec![wreq("D0", DataType::U16, Value::F64(1.0))])
             .await
             .expect("write");
         assert_eq!(
@@ -149,9 +132,10 @@ async fn cpu_type_selects_the_slmp_subcommand_for_read_and_write() {
 #[tokio::test]
 async fn supervisor_hands_out_a_handle_per_slmp_connection() {
     let sim = Simulator::start().await;
-    let connections = [conn(7, "slmp", "127.0.0.1", sim.addr.port())];
-    let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_table())
-        .expect("all-slmp connections should spawn");
+    let connections = [conn(7, sim.addr.port(), "R")];
+    let supervisor =
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_registry())
+            .expect("all-slmp connections should spawn");
     assert_eq!(supervisor.connection_count(), 1);
     assert!(supervisor.handle(7).is_some());
     assert!(supervisor.handle(999).is_none());
@@ -166,13 +150,14 @@ async fn supervisor_hands_out_a_handle_per_slmp_connection() {
 async fn read_returns_simulated_device_values() {
     let sim = Simulator::start().await;
     sim.set_word(banto_plc::SlmpDevice::D, 100, 4321);
-    let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-    let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_table())
-        .expect("spawn");
+    let connections = [conn(1, sim.addr.port(), "R")];
+    let supervisor =
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_registry())
+            .expect("spawn");
     let handle = supervisor.handle(1).expect("handle");
 
     let results = read_once_connected(&handle, vec![rreq("D100", DataType::U16)]).await;
-    assert_eq!(results, vec![BatchReadResult::Value(PlcValue::F64(4321.0))]);
+    assert_eq!(results, vec![Ok(Value::F64(4321.0))]);
 
     supervisor.shutdown().await;
 }
@@ -180,9 +165,10 @@ async fn read_returns_simulated_device_values() {
 #[tokio::test]
 async fn write_then_read_reflects_the_write_over_the_single_session() {
     let sim = Simulator::start().await;
-    let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-    let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_table())
-        .expect("spawn");
+    let connections = [conn(1, sim.addr.port(), "R")];
+    let supervisor =
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_registry())
+            .expect("spawn");
     let handle = supervisor.handle(1).expect("handle");
 
     // Wait for the session to come up using an innocuous read, then
@@ -197,19 +183,16 @@ async fn write_then_read_reflects_the_write_over_the_single_session() {
     let _ = read_once_connected(&handle, vec![rreq("D200", DataType::U16)]).await;
 
     let write_results = handle
-        .write(vec![wreq("D200", DataType::U16, TagValue::F64(777.0))])
+        .write(vec![wreq("D200", DataType::U16, Value::F64(777.0))])
         .await
         .expect("write should succeed");
-    assert_eq!(write_results, vec![WriteResult::Ok]);
+    assert_eq!(write_results, vec![Ok(())]);
 
     let read_results = handle
         .read(vec![rreq("D200", DataType::U16)])
         .await
         .expect("read should succeed");
-    assert_eq!(
-        read_results,
-        vec![BatchReadResult::Value(PlcValue::F64(777.0))]
-    );
+    assert_eq!(read_results, vec![Ok(Value::F64(777.0))]);
 
     supervisor.shutdown().await;
 }
@@ -219,18 +202,17 @@ async fn write_then_read_reflects_the_write_over_the_single_session() {
 /// `write_then_read_reflects_the_write_over_the_single_session` above
 /// uses for an ordinary write - runs its full read/modify/write/confirm
 /// RMW sequence inside the one `Job::Write` the broker already knows how
-/// to service, and the result is visible to a normal follow-up read. This
-/// is the "broker needs no code changes" claim (§6.1, `banto-broker`'s own
-/// module doc's "Why SLMP-only" section) demonstrated rather than merely
-/// asserted: `banto-broker`'s source has not changed to make this pass -
-/// only `banto-plc-write`'s planner/executor did.
+/// to service, and the result is visible to a normal follow-up read. Since
+/// R2b-3a-2 the caller only says "a `bit` tag at `D300.0`"; choosing the RMW
+/// is the driver's (design §4.1, §9).
 #[tokio::test]
 async fn bit_in_word_write_through_the_broker_lands_and_reads_back() {
     let sim = Simulator::start().await;
     sim.set_word(banto_plc::SlmpDevice::D, 300, 0x1234);
-    let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-    let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_table())
-        .expect("spawn");
+    let connections = [conn(1, sim.addr.port(), "R")];
+    let supervisor =
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_registry())
+            .expect("spawn");
     let handle = supervisor.handle(1).expect("handle");
 
     // Wait for the session to come up, same as the ordinary-write test.
@@ -241,7 +223,7 @@ async fn bit_in_word_write_through_the_broker_lands_and_reads_back() {
         .write(vec![bwreq("D300.0", true)])
         .await
         .expect("bit-in-word write should succeed");
-    assert_eq!(write_results, vec![WriteResult::Ok]);
+    assert_eq!(write_results, vec![Ok(())]);
 
     // The bit landed, and every other bit of the seed word survived -
     // read back both as a whole word and as the individual bit tag.
@@ -254,10 +236,7 @@ async fn bit_in_word_write_through_the_broker_lands_and_reads_back() {
         .expect("read should succeed");
     assert_eq!(
         read_results,
-        vec![
-            BatchReadResult::Value(PlcValue::F64(0x1235 as f64)),
-            BatchReadResult::Value(PlcValue::Bit(true)),
-        ]
+        vec![Ok(Value::F64(0x1235 as f64)), Ok(Value::Bit(true))]
     );
 
     supervisor.shutdown().await;
@@ -269,9 +248,10 @@ async fn string_write_then_read_round_trips_over_the_single_session() {
     // reads back as the same text (NUL-trimmed), proving the broker speaks
     // the string path end to end.
     let sim = Simulator::start().await;
-    let connections = [conn(1, "slmp", "127.0.0.1", sim.addr.port())];
-    let supervisor = BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_table())
-        .expect("spawn");
+    let connections = [conn(1, sim.addr.port(), "R")];
+    let supervisor =
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), slmp_registry())
+            .expect("spawn");
     let handle = supervisor.handle(1).expect("handle");
 
     // Wait for the session, then write a 4-word (8-byte) string to D300.
@@ -281,16 +261,13 @@ async fn string_write_then_read_round_trips_over_the_single_session() {
         .write(vec![swreq("D300", 4, "OK")])
         .await
         .expect("string write should succeed");
-    assert_eq!(write_results, vec![WriteResult::Ok]);
+    assert_eq!(write_results, vec![Ok(())]);
 
     let read_results = handle
         .read(vec![sreq("D300", 4)])
         .await
         .expect("string read should succeed");
-    assert_eq!(
-        read_results,
-        vec![BatchReadResult::Value(PlcValue::Str("OK".to_string()))]
-    );
+    assert_eq!(read_results, vec![Ok(Value::Str("OK".to_string()))]);
 
     supervisor.shutdown().await;
 }

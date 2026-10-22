@@ -861,39 +861,50 @@ async fn phase3_string_roundtrip(ctx: &Ctx) -> Result<(), String> {
 async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
     println!("--- フェーズ4: 同時セッション数上限 ---");
     let probe = ctx.d(0);
-    let connection = PlcConnection {
-        id: 1,
-        name: "t5-5-verify".to_string(),
-        protocol: "slmp".to_string(),
-        host: ctx.target.host.clone(),
-        port: ctx.target.port as i64,
-        unit_id: 1,
-        enabled: true,
-        simulation: false,
-        word_order: "low_high".to_string(),
-        cpu_type: cpu_name(ctx.target.cpu).to_string(),
-        database: None,
-        username: None,
-        settings: Default::default(),
-        settings_version: 1,
+    // R2b-3a-2: the broker dials through the registry with the connection's
+    // `settings` (the flat columns are only a projection of them).
+    let serde_json::Value::Object(settings) = serde_json::json!({
+        "host": ctx.target.host.clone(),
+        "port": ctx.target.port,
+        "word_order": "low_high",
+        "cpu_type": cpu_name(ctx.target.cpu),
+    }) else {
+        unreachable!("a JSON object literal")
     };
+    let connection = PlcConnection::from_settings(
+        1,
+        "t5-5-verify".to_string(),
+        "slmp".to_string(),
+        true,
+        false,
+        settings,
+        1,
+    );
 
-    let supervisor =
-        BrokerSupervisor::spawn(&[connection], BackoffConfig::default(), builtin().broker)
-            .map_err(|e| format!("broker spawn 失敗: {e}"))?;
+    let supervisor = BrokerSupervisor::spawn(
+        &[connection],
+        BackoffConfig::default(),
+        std::sync::Arc::new(builtin().registry),
+    )
+    .map_err(|e| format!("broker spawn 失敗: {e}"))?;
     let handle = supervisor
         .handle(1)
         .ok_or_else(|| "broker handle が見つかりません".to_string())?;
+    let probe_kind = banto_driver_api::TagKind::numeric(DataType::U16);
+    let probe_spec = banto_driver_api::TagSpec::new(
+        banto_driver_api::DriverBase::parse_address(
+            &banto_driver_slmp::SlmpDriver,
+            &ctx.addr(&probe).to_string(),
+            &probe_kind,
+        )
+        .map_err(|e| format!("アドレス {probe}: {e}"))?,
+        probe_kind,
+    );
 
     println!("[4] broker セッション（セッション#1）接続待機中...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let probe_result = handle
-            .read(vec![BatchReadRequest::Numeric(ReadRequest {
-                address: ctx.addr(&probe),
-                data_type: DataType::U16,
-            })])
-            .await;
+        let probe_result = handle.read(vec![probe_spec.clone()]).await;
         match probe_result {
             Ok(_) => {
                 println!("[4] セッション#1（broker）接続成功。");

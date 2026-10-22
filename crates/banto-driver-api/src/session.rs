@@ -3,8 +3,8 @@
 //!
 //! For protocols whose client library does framing and I/O together (OPC UA,
 //! a database, the `push` receiver of external-db-design §9.5), the driver
-//! connects by itself and returns a [`Session`]. A session has the same
-//! shape and contract as `banto_broker::BrokerSession`: **`Err` means the
+//! connects by itself and returns a [`Session`]. Since R2b-3a-2 the broker
+//! (`banto-broker`) runs every connection on one: **`Err` means the
 //! connection is unusable** (the host drops it and reconnects with backoff),
 //! and `Ok` carries exactly one result per request, in request order, with
 //! per-item failures as [`ItemError`].
@@ -67,9 +67,8 @@ pub trait SessionDriver: DriverBase {
     ) -> BoxFuture<'static, Result<Box<dyn Session>, FatalError>>;
 }
 
-/// One live connection (the same shape and contract as
-/// `banto_broker::BrokerSession`). Owned by one host task, which serializes
-/// reads and writes (`&mut self`).
+/// One live connection (what `banto-broker`'s job loop runs since R2b-3a-2).
+/// Owned by one host task, which serializes reads and writes (`&mut self`).
 pub trait Session: Send + 'static {
     /// Read `specs`. `Ok` has `specs.len()` results in `specs` order; `Err`
     /// is connection-fatal.

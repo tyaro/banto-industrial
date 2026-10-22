@@ -15,40 +15,38 @@ use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_plc_write::slmp::simulator::Simulator;
 use banto_tags::PlcConnection;
 
-fn slmp_conn(id: i64, port: u16) -> PlcConnection {
-    PlcConnection {
+fn conn_of(id: i64, protocol: &str, settings: serde_json::Value) -> PlcConnection {
+    let serde_json::Value::Object(settings) = settings else {
+        unreachable!("a JSON object literal")
+    };
+    PlcConnection::from_settings(
         id,
-        name: format!("conn-{id}"),
-        protocol: "slmp".to_string(),
-        host: "127.0.0.1".to_string(),
-        port: port as i64,
-        unit_id: 1,
-        enabled: true,
-        simulation: false,
-
-        word_order: "low_high".to_string(),
-        cpu_type: "R".to_string(),
-        database: None,
-        username: None,
-        settings: Default::default(),
-        settings_version: 1,
-    }
+        format!("conn-{id}"),
+        protocol.to_string(),
+        true,
+        false,
+        settings,
+        1,
+    )
 }
 
-fn modbus_conn(id: i64, port: u16) -> PlcConnection {
-    PlcConnection {
-        protocol: "modbus-tcp".to_string(),
-        ..slmp_conn(id, port)
-    }
+fn slmp_conn(id: i64, port: u16, cpu: &str) -> PlcConnection {
+    conn_of(
+        id,
+        "slmp",
+        serde_json::json!({
+            "host": "127.0.0.1", "port": port, "word_order": "low_high", "cpu_type": cpu,
+        }),
+    )
 }
 
-/// #605: 同じ host/port で CPU だけ R→Q に変えると `resolve` が changed を
-/// 返し、セッションを捨てて作り直すとフレームのサブコマンドが Q になる。
-/// 捨てずに `ensure_connection` だけ呼ぶと id 再利用で R のまま残る。
-/// Modbus は CPU 列をセッションの同一性に含めない。
+/// #605 → R2b-3a-2: 同じ host/port で CPU だけ R→Q に変えると `resolve` が changed を
+/// 返し（設定の指紋が変わる）、セッションを捨てて作り直すとフレームのサブコマンドが
+/// Q になる。Modbus の設定は CPU を持たないので、平らな欄の CPU が変わっても
+/// changed にならない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpu_only_change_replaces_the_slmp_broker_session() {
-    use banto_plc::{Address, BatchReadRequest, DataType, ReadRequest};
+    use banto_driver_api::{DataType, TagKind, TagSpec};
 
     let sim = Simulator::start().await;
     let sessions = HubSessions::new(
@@ -56,22 +54,26 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
         common::hub_drivers(),
     );
     let registry = BrokerSimRegistry::new();
-    let mut conn = slmp_conn(1, sim.addr.port());
+    let conn = slmp_conn(1, sim.addr.port(), "R");
 
-    let (_, _, changed) = registry.resolve(&conn).await;
+    let (settings, changed) = registry.resolve(&conn).await;
     assert!(changed);
-    sessions.ensure_connection(&conn).expect("R session");
+    sessions
+        .ensure_connection_with_settings(&conn, settings)
+        .expect("R session");
     read_until_connected(&sessions, conn.id).await;
     assert_eq!(sim.last_subcommand(), Some(0x0002), "既定 R のワード読み");
 
-    let (_, _, changed) = registry.resolve(&conn).await;
+    let (_, changed) = registry.resolve(&conn).await;
     assert!(!changed, "同じ CPU ではセッションを捨てない");
 
-    conn.cpu_type = "Q".to_string();
-    let (_, _, changed) = registry.resolve(&conn).await;
+    let conn = slmp_conn(1, sim.addr.port(), "Q");
+    let (settings, changed) = registry.resolve(&conn).await;
     assert!(changed, "CPU だけの変更でも changed");
     assert!(sessions.remove(conn.id));
-    sessions.ensure_connection(&conn).expect("Q session");
+    sessions
+        .ensure_connection_with_settings(&conn, settings)
+        .expect("Q session");
     read_until_connected(&sessions, conn.id).await;
     assert_eq!(
         sim.last_subcommand(),
@@ -79,11 +81,15 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
         "作り直したセッションは Q"
     );
 
-    let mut modbus = modbus_conn(2, 502);
-    let (_, _, changed) = registry.resolve(&modbus).await;
+    let mut modbus = conn_of(
+        2,
+        "modbus-tcp",
+        serde_json::json!({ "host": "127.0.0.1", "port": 502, "unit_id": 1 }),
+    );
+    let (_, changed) = registry.resolve(&modbus).await;
     assert!(changed);
     modbus.cpu_type = "Q".to_string();
-    let (_, _, changed) = registry.resolve(&modbus).await;
+    let (_, changed) = registry.resolve(&modbus).await;
     assert!(!changed, "Modbus は CPU 列では再接続しない");
 
     sessions.shutdown().await;
@@ -91,13 +97,20 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
 
     async fn read_until_connected(sessions: &HubSessions, id: i64) {
         let handle = sessions.handle_for(id).expect("handle");
-        let request = BatchReadRequest::Numeric(ReadRequest {
-            address: Address::parse_slmp("D0").expect("addr"),
-            data_type: DataType::U16,
-        });
+        let kind = TagKind::numeric(DataType::U16);
+        let spec = TagSpec::new(
+            common::hub_drivers()
+                .registry
+                .get("slmp")
+                .expect("slmp driver")
+                .base()
+                .parse_address("D0", &kind)
+                .expect("addr"),
+            kind,
+        );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            match handle.read(vec![request]).await {
+            match handle.read(vec![spec.clone()]).await {
                 Ok(_) => return,
                 Err(_) if tokio::time::Instant::now() < deadline => {
                     tokio::time::sleep(std::time::Duration::from_millis(20)).await;

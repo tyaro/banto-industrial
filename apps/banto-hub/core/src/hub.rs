@@ -2046,12 +2046,23 @@ impl CollectorManager {
             // ensure_connection - see this fn's own doc comment and
             // `BrokerSimRegistry::resolve`'s doc comment for why the ordering
             // and the `changed`-triggered `sessions.remove` matter.
-            let (host, port, changed) = self.sim_registry.resolve(conn).await;
+            // R2b-3a-2: `resolve` returns the settings to dial with (the
+            // connection's own, or with `host`/`port` replaced by the
+            // simulator's) and whether they changed since the last sync.
+            let (dial_settings, changed) = self.sim_registry.resolve(conn).await;
             if changed {
                 self.sessions.remove(conn.id);
             }
             let key = format!("conn:{}", conn.id);
-            resolved_targets.insert(key.clone(), (host.clone(), port));
+            let host = dial_settings
+                .get(banto_driver_api::keys::HOST)
+                .unwrap_or_default()
+                .to_string();
+            let port = dial_settings
+                .get(banto_driver_api::keys::PORT)
+                .and_then(|p| p.parse::<i64>().ok())
+                .unwrap_or(0);
+            resolved_targets.insert(key.clone(), (host, port));
 
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
             // "slmp"` filter here, deliberately narrower than the
@@ -2077,20 +2088,17 @@ impl CollectorManager {
             // accumulated here at all; it is derived from `handles` below,
             // which is what actually decides read routing.
 
-            let dial_conn = PlcConnection {
-                host,
-                port,
-                ..conn.clone()
-            };
-
-            match self.sessions.ensure_connection(&dial_conn) {
+            match self
+                .sessions
+                .ensure_connection_with_settings(conn, dial_settings)
+            {
                 Ok(handle) => {
                     handles.insert(key, handle.read_only());
                 }
                 Err(err) => {
                     // Should not happen given the protocol filter above
-                    // (UnsupportedProtocol) and banto-tags' own port
-                    // validation (InvalidPort) - logged and skipped rather
+                    // (UnsupportedProtocol) and the save path's validation
+                    // by the same driver (InvalidSettings) - logged and skipped rather
                     // than failing the rebuild, matching this fn's doc
                     // comment. `hub_client_factory`'s defensive fallback
                     // covers this connection for the current rebuild.

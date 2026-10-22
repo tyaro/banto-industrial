@@ -11,68 +11,67 @@ use tokio::sync::broadcast as tokio_broadcast;
 use tower::ServiceExt;
 
 fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
-    banto_tags::PlcConnection {
+    let serde_json::Value::Object(settings) = serde_json::json!({
+        "host": "127.0.0.1", "port": 5007, "word_order": "low_high", "cpu_type": cpu,
+    }) else {
+        unreachable!("a JSON object literal")
+    };
+    banto_tags::PlcConnection::from_settings(
         id,
-        name: format!("conn-{id}"),
-        protocol: "slmp".to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 5007,
-        unit_id: 1,
-        enabled: true,
-        simulation: false,
-        word_order: "low_high".to_string(),
-        cpu_type: cpu.to_string(),
-        database: None,
-        username: None,
-        settings: Default::default(),
-        settings_version: 1,
-    }
+        format!("conn-{id}"),
+        "slmp".to_string(),
+        true,
+        false,
+        settings,
+        1,
+    )
 }
 
-/// #605 P2: 接続テストが比べる CPU は、いま読む handle 自身が作成時に持っていた
-/// CPU でなければならない。古い R の handle を取ったあと、読む前に設定の反映
-/// （`BrokerSimRegistry::resolve`）が新しい Q を公開する、という交差を
-/// 同期点で再現する。別のレジストリ（resolve が公開した最新の CPU）を引くと
-/// 要求の Q と一致して通ってしまうが、handle の CPU（R）で比べるので断られる。
+/// #605 P2 → R2b-3a-2: 接続テストが比べる設定は、いま読む handle 自身が作成時に
+/// 持っていた設定の指紋（`settings_fingerprint`。#605 では CPU 種別だった）で
+/// なければならない。古い R の handle を取ったあと、読む前に設定の反映
+/// （`BrokerSimRegistry::resolve`）が新しい Q を公開する、という交差を同期点で
+/// 再現する。最新の設定（resolve が公開した Q）と比べると要求の Q と一致して
+/// 通ってしまうが、handle の指紋（R）で比べるので一致しない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_cpu_check_uses_the_handle_generation_not_the_latest_published_cpu() {
+async fn session_settings_check_uses_the_handle_generation_not_the_latest_published_settings() {
     let sessions = crate::broker_glue::HubSessions::new(
         banto_broker::BackoffConfig::default(),
         crate::test_support::test_drivers(),
     );
     let registry = crate::broker_glue::BrokerSimRegistry::new();
     let old = slmp_conn_with_cpu(1, "R");
-    registry.resolve(&old).await;
-    sessions.ensure_connection(&old).unwrap();
+    let (r_settings, changed) = registry.resolve(&old).await;
+    assert!(changed, "初回は changed");
+    sessions
+        .ensure_connection_with_settings(&old, r_settings.clone())
+        .unwrap();
+    let r = sessions.dial_fingerprint("slmp", &r_settings);
+    assert!(r.is_some());
 
     // 1. 古い R の handle を取る。
     let handle = sessions.handle_for(1).expect("live session");
-    assert_eq!(handle.slmp_cpu(), Some(banto_plc::SlmpCpu::R));
+    assert_eq!(handle.settings_fingerprint(), r);
 
     // 2. 読む前に、設定の反映が新しい Q を公開する（古いセッションはまだ生きている）。
-    let (_, _, changed) = registry.resolve(&slmp_conn_with_cpu(1, "Q")).await;
+    let (q_settings, changed) = registry.resolve(&slmp_conn_with_cpu(1, "Q")).await;
     assert!(changed, "Q の公開は resolve で changed になる");
+    let q = sessions.dial_fingerprint("slmp", &q_settings);
+    assert_ne!(q, r);
 
-    // 3. 要求の Q との比較は、古い handle の CPU（R）に対して行われ、断られる。
-    let refusal = slmp_session_cpu_refusal(handle.slmp_cpu(), &Some("Q".to_string()))
-        .expect("R のセッションを Q の要求で通さない");
-    assert_eq!(refusal.kind, "protocol");
-    assert!(
-        refusal.message.contains("保存してからテスト"),
-        "{}",
-        refusal.message
-    );
+    // 3. 要求の Q との比較は、古い handle の指紋（R）に対して行われ、一致しない。
+    assert_ne!(handle.settings_fingerprint(), q);
+    // 同じ設定の再公開は changed にならない。
+    let (_, changed) = registry.resolve(&slmp_conn_with_cpu(1, "Q")).await;
+    assert!(!changed);
 
-    // 世代が同じなら通る。作り直したあとの handle は Q を持つ。
-    assert!(slmp_session_cpu_refusal(handle.slmp_cpu(), &Some("R".to_string())).is_none());
-    assert!(slmp_session_cpu_refusal(handle.slmp_cpu(), &None).is_none());
+    // 作り直したあとの handle は Q の指紋を持つ。
     assert!(sessions.stop_and_join(1).await);
     sessions
-        .ensure_connection(&slmp_conn_with_cpu(1, "Q"))
+        .ensure_connection_with_settings(&slmp_conn_with_cpu(1, "Q"), q_settings)
         .unwrap();
     let fresh = sessions.handle_for(1).expect("rebuilt session");
-    assert_eq!(fresh.slmp_cpu(), Some(banto_plc::SlmpCpu::Q));
-    assert!(slmp_session_cpu_refusal(fresh.slmp_cpu(), &Some("Q".to_string())).is_none());
+    assert_eq!(fresh.settings_fingerprint(), q);
     sessions.shutdown().await;
 }
 

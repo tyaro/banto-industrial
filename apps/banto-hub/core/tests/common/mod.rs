@@ -282,7 +282,7 @@ pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
     let mut registry = banto_driver_api::DriverRegistry::new();
     for protocol in ["modbus-tcp", "slmp"] {
         registry
-            .register(banto_driver_api::DriverEntry::host_bound(
+            .register(banto_driver_api::DriverEntry::host_provided(
                 std::sync::Arc::new(StandIn(banto_driver_api::DriverDescriptor::new(
                     banto_driver_api::DriverId::new(protocol).expect("valid id"),
                     "0.0.0-test",

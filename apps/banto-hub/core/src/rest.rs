@@ -98,16 +98,6 @@ use banto_collect::{
     connections_with_collected_groups, ApplyReport, ConnectionStatus, Quality, RegistrySnapshot,
 };
 use banto_core::{BantoError, ErrorBody, FieldError, ListParams, ListResult};
-use banto_tstore::LocalDate;
-// T12 (docs/ux-plan.md §4): 保存前の接続テスト API 用。Modbus/SLMP 両方の
-// 直接ダイヤル経路が同じ型を使うので、ここで一括 import する
-// (`BatchReadRequest`/`BatchReadResult`は`banto_broker`ではなく`banto_plc`が
-// 定義元 - `banto_broker::BrokerHandle::read`/`ReadOnlyHandle::read`が
-// 引数・戻り値としてそのまま使っている)。
-use banto_plc::{
-    Address, BatchReadRequest, BatchReadResult, DataType, ModbusTcpClient, ModbusTcpConfig,
-    PlcClient, PlcError, ReadRequest, ReadResult, SlmpClient, SlmpConfig,
-};
 use banto_server::routes::{
     actor_identity, audit_log_router, audit_logout_middleware, extra_auth_router, record_write,
     users_router, LogoutAuditState,
@@ -121,6 +111,7 @@ use banto_tags::{
     CollectionGroupInput, CollectionGroupService, GroupTagCount, PlcConnection, PlcConnectionInput,
     PlcConnectionService, Tag, TagInput, TagService, TagUpdateError, COMPUTED_TAG_KIND,
 };
+use banto_tstore::LocalDate;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::str::FromStr;
@@ -223,8 +214,6 @@ use crud::{
     default_payload_enabled, queue_pending_registry_change, redact_pending_change_for_response,
     RegistryMutationError, RegistryMutationResult, TagRegistryState,
 };
-#[cfg(test)]
-use plc_connections::slmp_session_cpu_refusal;
 pub(crate) use plc_connections::{
     connection_response, connection_responses, reject_hub_connection_protocol,
     run_plc_connection_test,

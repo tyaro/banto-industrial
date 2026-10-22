@@ -57,7 +57,7 @@ pub enum PlcError {
     /// [`banto_driver_api::DriverAddress`] parsed by a driver this crate has
     /// no address grammar for (only `modbus-tcp` and `slmp`). A host-side
     /// configuration error resolved before any wire traffic, so it is not
-    /// connection-fatal. Goes away with the HostBound bridge (R2b-3).
+    /// connection-fatal. Goes away with the bridge (R2b-3a-3).
     #[error("ドライバ {0:?} のアドレスは banto-plc では扱えません")]
     UnsupportedDriver(String),
 

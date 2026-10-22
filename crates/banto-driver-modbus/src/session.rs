@@ -1,29 +1,24 @@
-//! The Modbus TCP [`banto_broker::BrokerSession`] implementation (#131,
-//! 2026-09-01; moved here from `banto-broker`'s `src/modbus_driver.rs` by
-//! R1-4a, docs/banto-driver-api-design.md §4.4 - unchanged). See
-//! `banto-broker`'s module doc ("Protocol abstraction (I9 / Issue #130)") for
-//! why the broker is organized as a generic job loop/reconnect state machine
-//! plus a per-protocol driver like this one, and [`banto_broker::BrokerSession`]'s
-//! module doc for the trait contract this module must uphold - especially the
-//! `Err` = connection-fatal rule, which (unlike `banto-driver-slmp`'s `SlmpSession`)
-//! this driver does **not** get for free: `banto_plc::execute_modbus_reads`
-//! and `banto_plc_write::execute_modbus_writes` already fold a Modbus
-//! exception response into a per-request `Bad`, but the manual `String`/
-//! `BitInWord` splitting [`ModbusSession::write_batch`] does below is new
-//! code this driver is responsible for getting right.
+//! [`ModbusSession`]: the one live Modbus TCP socket of a connection and the
+//! per-connection state the `banto-plc` / `banto-plc-write` executors need
+//! between calls (#131, 2026-09-01; moved here from `banto-broker` by R1-4a).
+//! Since R2b-3a-2 the broker no longer calls it directly: the driver API
+//! session in `api_session.rs` owns one and calls [`ModbusSession::read_typed`]
+//! / [`ModbusSession::write_typed`] (the former `banto_broker::BrokerSession`
+//! impl and the `connector` that built it are gone,
+//! docs/banto-hub-driver-io-design.md §4.2). The `Err` = connection-fatal
+//! rule still holds: `banto_plc::execute_modbus_reads` and
+//! `banto_plc_write::execute_modbus_writes` fold a Modbus exception response
+//! into a per-request `Bad`, and the manual `String` / `BitInWord` splitting
+//! [`ModbusSession::write_typed`] does below keeps that split too.
 //!
-//! [`ModbusSession`] mirrors `banto-driver-slmp`'s `SlmpSession` shape: it
-//! owns the one live `TcpStream` the broker's `ConnState::Connected` holds for a
-//! Modbus connection, plus everything `banto_plc::execute_modbus_reads` and
-//! `banto_plc_write::execute_modbus_writes` need between calls. See
-//! [`ModbusSession::next_transaction_id`]'s own doc comment for the single
-//! most safety-critical property in this file.
+//! See [`ModbusSession::next_transaction_id`]'s own doc comment for the
+//! single most safety-critical property in this file.
 
 use std::time::Duration;
 
 use banto_plc::{
-    execute_modbus_reads, plan_batch_requests, BatchReadRequest, BatchReadResult, BoxFuture,
-    ModbusTcpConfig, PlcError, PlcValue, WordOrder,
+    execute_modbus_reads, plan_batch_requests, BatchReadRequest, BatchReadResult, ModbusTcpConfig,
+    PlcError, PlcValue, WordOrder,
 };
 use banto_plc_write::{
     execute_modbus_writes, plan_modbus_writes, BatchWriteRequest, PlcWriteError, WriteRequest,
@@ -32,13 +27,10 @@ use banto_plc_write::{
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use banto_broker::{BrokerSession, Connector, SessionError};
-
 /// One live Modbus TCP session: a bare `TcpStream` plus everything
 /// `banto_plc::execute_modbus_reads`/`banto_plc_write::execute_modbus_writes`
-/// need between calls. Not boxed internally, for the same reason
-/// `banto-driver-slmp`'s `SlmpSession` is not: `Box<dyn BrokerSession>`
-/// already puts this whole struct on the heap.
+/// need between calls. Not boxed internally: `Box<dyn Session>` already puts
+/// the API session around it on the heap.
 pub(crate) struct ModbusSession {
     stream: TcpStream,
     unit_id: u8,
@@ -69,7 +61,7 @@ pub(crate) struct ModbusSession {
     /// [`ModbusSession`] is the single owner of the one physical `TcpStream`
     /// for this connection's whole lifetime (the broker's core invariant -
     /// see `banto-broker`'s "Message shape and how serialization is guaranteed"
-    /// section: one `Box<dyn BrokerSession>` per connection, and read/write
+    /// section: one `Box<dyn Session>` per connection, and read/write
     /// jobs never run concurrently against it), so keeping exactly one
     /// `next_transaction_id` field here - threaded by `&mut` into both
     /// `execute_modbus_reads` and `execute_modbus_writes` on every call - is
@@ -92,10 +84,9 @@ impl ModbusSession {
         }
     }
 
-    /// The read half of [`BrokerSession::read_batch`] with the **typed**
-    /// error (R2b-3a-1): the `banto-driver-api` session maps it with
-    /// `classify_read` instead of recovering a variant from text. The broker's
-    /// `BrokerSession` impl below calls this too, so there is one body.
+    /// Plan and execute one read batch, with the **typed** error (R2b-3a-1):
+    /// the `banto-driver-api` session maps it with `classify_read` instead of
+    /// recovering a variant from text.
     pub(crate) async fn read_typed(
         &mut self,
         requests: &[BatchReadRequest],
@@ -199,68 +190,6 @@ impl ModbusSession {
     }
 }
 
-impl BrokerSession for ModbusSession {
-    fn read_batch<'a>(
-        &'a mut self,
-        requests: &'a [BatchReadRequest],
-    ) -> BoxFuture<'a, Result<Vec<BatchReadResult>, SessionError>> {
-        Box::pin(async move {
-            self.read_typed(requests)
-                .await
-                .map_err(|e| SessionError(e.to_string()))
-        })
-    }
-
-    fn write_batch<'a>(
-        &'a mut self,
-        requests: &'a [BatchWriteRequest],
-    ) -> BoxFuture<'a, Result<Vec<WriteResult>, SessionError>> {
-        Box::pin(async move {
-            self.write_typed(requests)
-                .await
-                .map_err(|e| SessionError(e.to_string()))
-        })
-    }
-
-    fn disconnect(&mut self) -> BoxFuture<'_, ()> {
-        Box::pin(self.close())
-    }
-}
-
-/// Build this connection's [`Connector`] from its [`ModbusTcpConfig`] (see
-/// [`crate::modbus_config_for`]) - what [`crate::dial`] (this driver's
-/// `banto_broker::DriverTable` entry) hands the broker, which then runs it in
-/// the connection's broker task.
-///
-/// Dials through [`banto_plc::dial_modbus`], the one shared implementation of
-/// the Modbus TCP connect sequence (H9 transport 共通化,
-/// docs/improvement-plan.md §H9) that `banto_plc::modbus::ModbusTcpClient::connect`
-/// also calls - see that function's own doc comment. What still differs
-/// here, and is not shareable, is what happens to the stream *after* the
-/// dial: this broker wraps it in [`ModbusSession`] rather than handing it to
-/// `ModbusTcpClient`'s or `ModbusWriteClient`'s own private
-/// `Option<TcpStream>`, so `read_batch` and `write_batch` can borrow the
-/// *same* session and share the *same* transaction-id counter - see
-/// `banto-broker`'s `session.rs` module doc, "Why one trait with both `read_batch` and
-/// `write_batch`", and [`ModbusSession::next_transaction_id`]'s own doc
-/// comment.
-///
-/// `#[doc(hidden)] pub` (R1-5) only so that this crate's `tests/conformance.rs`
-/// can build a session with the conformance harness's timeouts; not part of
-/// the crate's API.
-#[doc(hidden)]
-pub fn connector(config: ModbusTcpConfig) -> Connector {
-    std::sync::Arc::new(move || {
-        let config = config.clone();
-        Box::pin(async move {
-            let stream = banto_plc::dial_modbus(&config)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(Box::new(ModbusSession::new(stream, &config)) as Box<dyn BrokerSession>)
-        })
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use banto_plc::{Address, AddressArea, DataType, ReadRequest, TagValue};
@@ -330,14 +259,14 @@ mod tests {
 
         // One read (one wire request: a single contiguous group).
         session
-            .read_batch(&[rreq(AddressArea::HoldingRegister, 0, DataType::U16)])
+            .read_typed(&[rreq(AddressArea::HoldingRegister, 0, DataType::U16)])
             .await
             .expect("read should succeed");
         assert_eq!(session.next_transaction_id, 1);
 
         // One write (one wire request).
         session
-            .write_batch(&[wreq(
+            .write_typed(&[wreq(
                 AddressArea::HoldingRegister,
                 0,
                 DataType::U16,
@@ -354,7 +283,7 @@ mod tests {
         // direction switches rather than settling into two independent
         // interleaved sequences.
         session
-            .read_batch(&[rreq(AddressArea::HoldingRegister, 0, DataType::U16)])
+            .read_typed(&[rreq(AddressArea::HoldingRegister, 0, DataType::U16)])
             .await
             .expect("read should succeed");
         assert_eq!(session.next_transaction_id, 3);
@@ -372,7 +301,7 @@ mod tests {
         // FC6 (write single register) at offset 5 will return an exception.
         sim.inject_exception(0x06, 5, 0x02); // illegal data address
         let write_results = session
-            .write_batch(&[wreq(
+            .write_typed(&[wreq(
                 AddressArea::HoldingRegister,
                 5,
                 DataType::U16,
@@ -393,7 +322,7 @@ mod tests {
         // FC3 (read holding registers) at offset 9 will return an exception.
         sim.inject_exception(0x03, 9, 0x02);
         let read_results = session
-            .read_batch(&[rreq(AddressArea::HoldingRegister, 9, DataType::U16)])
+            .read_typed(&[rreq(AddressArea::HoldingRegister, 9, DataType::U16)])
             .await
             .expect("a device exception must not surface as Err");
         assert_eq!(read_results.len(), 1);
@@ -408,7 +337,7 @@ mod tests {
 
         // The session must still be usable - proof it was not torn down.
         let after = session
-            .write_batch(&[wreq(
+            .write_typed(&[wreq(
                 AddressArea::HoldingRegister,
                 20,
                 DataType::U16,
@@ -448,7 +377,7 @@ mod tests {
         ];
 
         let results = session
-            .write_batch(&requests)
+            .write_typed(&requests)
             .await
             .expect("batch with unsupported kinds must still return Ok overall");
         assert_eq!(results.len(), 3);

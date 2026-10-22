@@ -625,6 +625,48 @@ pub fn open_connection_secret(
     })
 }
 
+/// broker がダイヤルの直前に接続の秘密値を開く口（R2b-3a-2、
+/// docs/banto-hub-driver-io-design.md §4.2、connection-settings 設計 §3.5）。
+/// broker（`banto-broker`）は Hub の封印と DB に依存できないので、Hub が
+/// [`banto_broker::SecretOpener`] として注入する（`crate::runtime` が
+/// `HubSessions::with_secret_opener` に渡す）。broker はドライバの
+/// `secret_keys()` に載っていて、接続の `settings` が参照を持つキーだけを
+/// 1 回のダイヤルのために開かせ、終わったら平文を消す。読めない
+/// （行が無い・開けない・参照の形が違う）は `Err` で、空の値に潰さない
+/// （[`open_connection_secret`] の「無い」と「読めない」の区別のまま）。
+/// 理由の文言に秘密は入らない。
+pub struct ConnectionSecretOpener {
+    pool: sqlx::SqlitePool,
+    secrets: ConnectionSecrets,
+}
+
+impl ConnectionSecretOpener {
+    /// `pool` の秘密の表を `secrets` で開く口。
+    pub fn new(pool: sqlx::SqlitePool, secrets: ConnectionSecrets) -> Self {
+        Self { pool, secrets }
+    }
+}
+
+impl banto_broker::SecretOpener for ConnectionSecretOpener {
+    fn open(
+        &self,
+        conn: &banto_tags::PlcConnection,
+        key: &str,
+    ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>> {
+        let pool = self.pool.clone();
+        let secrets = self.secrets.clone();
+        let conn = conn.clone();
+        let key = key.to_string();
+        Box::pin(async move {
+            let rows = banto_tags::connection_secret::load_secret_rows_of(&pool, conn.id)
+                .await
+                .map_err(|err| format!("秘密の行を読めません: {err}"))?;
+            open_connection_secret(&secrets, &conn, &key, &rows)
+                .map_err(|reason| format!("秘密値を開けません（{}）", reason.as_str()))
+        })
+    }
+}
+
 /// `conn` の `key` の参照を読み、その参照・接続・キーの行を封印した値として返す（開かない）。
 /// キーが無い → `Ok(None)`、参照の形が違う → `Invalid`、行が無い → `Missing`、行の参照・
 /// 方式の形が違う → `Undecryptable`。
@@ -1272,6 +1314,47 @@ mod r2b1d_tests {
         };
         assert_ne!(row.r#ref, other.r#ref);
         assert!(!format!("{changes:?}").contains("pw-1"));
+    }
+
+    /// R2b-3a-2: the broker's opener reads the connection's own secret rows
+    /// from the database and opens the asked key; an absent key is `None`, a
+    /// key that is not a reference is refused (not handed over).
+    #[tokio::test]
+    async fn the_broker_secret_opener_opens_the_stored_secret() {
+        use banto_broker::SecretOpener;
+        let dir = crate::test_support::TempDir::new("broker-secret-opener");
+        let pool = crate::db::init_db(dir.path().join("hub.db")).await.unwrap();
+        let secrets = ConnectionSecrets::new(None);
+        let input = banto_tags::PlcConnectionInput {
+            name: "pg".to_string(),
+            protocol: "postgres".to_string(),
+            host: "db.local".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: "low_high".to_string(),
+            cpu_type: None,
+            database: Some("plant".to_string()),
+            username: Some("reader".to_string()),
+            secrets: password_changes(&secrets, Some("pw-3")).unwrap(),
+            settings: None,
+        };
+        let conn = banto_tags::PlcConnectionService::new(pool.clone())
+            .create(input)
+            .await
+            .unwrap();
+        let opener = ConnectionSecretOpener::new(pool.clone(), secrets);
+        let opened = opener.open(&conn, "password").await.unwrap();
+        assert_eq!(opened.as_deref().map(String::as_str), Some("pw-3"));
+        // A key the settings do not hold: nothing to open.
+        assert_eq!(opener.open(&conn, "token").await.unwrap(), None);
+        // A key holding a plain value is not a reference: refused, never
+        // handed over as if it were the secret.
+        let refused = opener.open(&conn, "username").await.unwrap_err();
+        assert!(refused.contains("invalid"), "{refused}");
+        assert!(!refused.contains("reader"), "{refused}");
+        pool.close().await;
     }
 
     #[test]

@@ -1,55 +1,101 @@
 //! Modbus TCP through the broker (R1-4a, docs/banto-driver-api-design.md
 //! §4.4): this was one of `banto-broker`'s own unit tests while the Modbus
-//! driver lived there. It moved here with the driver because the broker no
-//! longer has (or depends on) a real driver; it now goes through the public
-//! `BrokerSupervisor::spawn` with a table holding only this crate's `dial`.
-//! The assertions are unchanged.
+//! driver lived there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2):
+//! the broker dials through a `DriverRegistry` holding this crate's
+//! `driver()` as a session-type entry and speaks `TagSpec` / `WriteItem`.
 
-use banto_broker::{BackoffConfig, BrokerSupervisor, DialFn, DriverTable};
-use banto_driver_api::DriverId;
+use std::sync::Arc;
+use std::time::Duration;
+
+use banto_broker::{BackoffConfig, BrokerConnectionStatus, BrokerSupervisor};
+use banto_driver_api::{
+    DataType, DriverBase, DriverEntry, DriverRegistry, TagKind, TagSpec, Value, WriteItem,
+};
+use banto_driver_modbus::ModbusDriver;
 use banto_plc_write::modbus::simulator::Simulator;
 use banto_tags::PlcConnection;
 
-/// The broker table with just this driver, under `"modbus-tcp"` (what the
-/// old test's `DriverTable::builtin()` dialed a `"modbus-tcp"` connection
-/// with).
-fn modbus_table() -> DriverTable {
-    DriverTable::new(vec![(
-        DriverId::new(banto_driver_modbus::PROTOCOL).expect("valid driver id"),
-        banto_driver_modbus::dial as DialFn,
-    )])
-    .expect("one entry")
+/// The registry with just this driver, as a session-type entry.
+fn modbus_registry() -> Arc<DriverRegistry> {
+    let mut registry = DriverRegistry::new();
+    registry
+        .register(DriverEntry::session(banto_driver_modbus::driver()))
+        .expect("one entry");
+    Arc::new(registry)
 }
 
-fn conn(id: i64, protocol: &str, host: &str, port: u16) -> PlcConnection {
-    PlcConnection {
+fn conn(id: i64, port: u16) -> PlcConnection {
+    let serde_json::Value::Object(settings) = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": port,
+        "unit_id": 1,
+        "word_order": "high_low",
+    }) else {
+        unreachable!()
+    };
+    PlcConnection::from_settings(
         id,
-        name: format!("conn-{id}"),
-        protocol: protocol.to_string(),
-        host: host.to_string(),
-        port: port as i64,
-        unit_id: 1,
-        enabled: true,
-        simulation: false,
+        format!("conn-{id}"),
+        banto_driver_modbus::PROTOCOL.to_string(),
+        true,
+        false,
+        settings,
+        1,
+    )
+}
 
-        word_order: "low_high".to_string(),
-        cpu_type: "R".to_string(),
-        database: None,
-        username: None,
-        settings: Default::default(),
-        settings_version: 1,
-    }
+fn spec(text: &str, data_type: DataType) -> TagSpec {
+    let kind = TagKind::numeric(data_type);
+    TagSpec::new(ModbusDriver.parse_address(text, &kind).unwrap(), kind)
 }
 
 #[tokio::test]
 async fn supervisor_hands_out_a_handle_per_modbus_tcp_connection() {
     let sim = Simulator::start().await;
-    let connections = [conn(7, "modbus-tcp", "127.0.0.1", sim.addr.port())];
+    let connections = [conn(7, sim.addr.port())];
     let supervisor =
-        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), modbus_table())
+        BrokerSupervisor::spawn(&connections, BackoffConfig::default(), modbus_registry())
             .expect("a modbus-tcp connection should spawn");
     assert_eq!(supervisor.connection_count(), 1);
     assert!(supervisor.handle(7).is_some());
     assert!(supervisor.handle(999).is_none());
+    supervisor.shutdown().await;
+}
+
+/// R2b-3a-2: a write then a read over the one broker session, through the
+/// registry's session driver (one socket for both directions, #337).
+#[tokio::test]
+async fn write_then_read_over_the_one_session() {
+    let sim = Simulator::start().await;
+    let supervisor = BrokerSupervisor::spawn(
+        &[conn(1, sim.addr.port())],
+        BackoffConfig::default(),
+        modbus_registry(),
+    )
+    .expect("spawn");
+    let handle = supervisor.handle(1).expect("handle");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        handle
+            .status_watch()
+            .wait_for(|s| *s == BrokerConnectionStatus::Connected),
+    )
+    .await
+    .expect("connects in time")
+    .expect("connects");
+
+    let written = handle
+        .write(vec![WriteItem::new(
+            spec("40011", DataType::U16),
+            Value::F64(321.0),
+        )])
+        .await
+        .expect("write");
+    assert_eq!(written, vec![Ok(())]);
+    let read = handle
+        .read(vec![spec("40011", DataType::U16)])
+        .await
+        .expect("read");
+    assert_eq!(read, vec![Ok(Value::F64(321.0))]);
     supervisor.shutdown().await;
 }

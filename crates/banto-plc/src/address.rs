@@ -141,14 +141,46 @@ impl Address {
     /// [`PlcError::UnsupportedDriver`].
     ///
     /// This is the only place outside the drivers that names protocols to
-    /// choose an address grammar. It exists for the HostBound drivers and
-    /// disappears with them in R2b-3, when requests carry `DriverAddress`
-    /// straight to `FrameDriver::plan` / `Session::read_batch`.
+    /// choose an address grammar. Since R2b-3a-2 (docs/banto-hub-driver-io-design.md
+    /// §4.2) the broker and the Hub's instant reads / writes carry
+    /// `DriverAddress` straight to `Session::read_batch`; the one caller left
+    /// is the collection plan (`banto_collect::config::build_request_with_registry`).
+    // R2b-3a-3 で消す（収集の計画が `TagSpec` になったら呼ぶ側が無くなる、設計 §4.3）。
     pub fn from_driver_address(address: &DriverAddress) -> Result<Self, PlcError> {
         match address.driver.as_str() {
             "modbus-tcp" => Address::parse(&address.canonical),
             "slmp" => Address::parse_slmp(&address.canonical),
             other => Err(PlcError::UnsupportedDriver(other.to_string())),
+        }
+    }
+
+    /// The temporary inverse of [`Self::from_driver_address`] (R2b-3a-2,
+    /// docs/banto-hub-driver-io-design.md §4.2): the [`DriverAddress`] the
+    /// driver's own `parse_address` reports for this address and `kind`
+    /// (`canonical = Display`, the same text R2b-2 stores, address design
+    /// §1.4; the driver id, area, writability and bit as the Modbus / SLMP
+    /// drivers set them). banto-hub's `BrokerReadClient` uses it to hand the
+    /// collection's `ReadRequest`s to the broker, whose requests are
+    /// `TagSpec`s since 3a-2, while the collection plan still produces
+    /// `ReadRequest` (until 3a-3).
+    // R2b-3a-3 で消す（収集の計画が `TagSpec` を作るようになったら要らない、設計 §4.3）。
+    pub fn to_driver_address(&self, kind: &banto_driver_api::TagKind) -> DriverAddress {
+        let (driver, area, writable, bit) = match *self {
+            Address::ModbusRef { area, bit, .. } => {
+                ("modbus-tcp", area.to_string(), area.is_writable(), bit)
+            }
+            Address::Slmp { device, bit, .. } => ("slmp", device.mnemonic().to_string(), true, bit),
+        };
+        let address = DriverAddress::new(
+            banto_driver_api::DriverId::new(driver).expect("a built-in driver id"),
+            self.to_string(),
+            area,
+            writable,
+            kind.word_count(),
+        );
+        match bit {
+            Some(bit) => address.with_bit(bit),
+            None => address,
         }
     }
 
@@ -638,6 +670,45 @@ mod tests {
                 Address::parse(&rendered).unwrap()
             };
             assert_eq!(reparsed, addr, "{raw} should survive a round trip");
+        }
+    }
+
+    /// R2b-3a-2: the temporary inverse gives back the canonical text and
+    /// the bit, and the bridge reads it again to the same address.
+    #[test]
+    fn to_driver_address_round_trips_through_the_bridge() {
+        use banto_driver_api::{DataType, TagKind};
+        let kind = TagKind::numeric(DataType::Bit);
+        for (address, driver, area, writable) in [
+            (
+                Address::parse("40001.3").unwrap(),
+                "modbus-tcp",
+                "holding_register",
+                true,
+            ),
+            (
+                Address::parse("30005").unwrap(),
+                "modbus-tcp",
+                "input_register",
+                false,
+            ),
+            (Address::parse_slmp("D100.A").unwrap(), "slmp", "D", true),
+            (Address::parse_slmp("M50").unwrap(), "slmp", "M", true),
+        ] {
+            let da = address.to_driver_address(&kind);
+            assert_eq!(da.driver.as_str(), driver);
+            assert_eq!(da.canonical, address.to_string());
+            assert_eq!(da.area, area);
+            assert_eq!(da.writable_area, writable);
+            assert_eq!(
+                da.bit,
+                address
+                    .as_modbus_ref()
+                    .map(|(_, _, b)| b)
+                    .or(address.as_slmp().map(|(_, _, b)| b))
+                    .flatten()
+            );
+            assert_eq!(Address::from_driver_address(&da).unwrap(), address);
         }
     }
 

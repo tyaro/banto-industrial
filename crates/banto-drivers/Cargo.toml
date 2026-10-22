@@ -5,7 +5,7 @@
 # 今もここだけを見る。
 [package]
 name = "banto-drivers"
-description = "R1-3b: ホストが注入する組み込みドライバ一式（broker の DriverTable・収集の ClientFactory・DriverRegistry）(docs/banto-driver-api-design.md §6)"
+description = "R1-3b: ホストが注入する組み込みドライバ一式（DriverRegistry・収集の ClientFactory）(docs/banto-driver-api-design.md §6)"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
@@ -13,9 +13,8 @@ publish.workspace = true
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
-banto-broker = { path = "../banto-broker" }
 banto-collect = { path = "../banto-collect" }
-# R1-4a: `builtin().broker` の 2 行（`("slmp", ..)`・`("modbus-tcp", ..)`）。
+# `builtin().registry` の 2 つ（R2b-3a-2 から `DriverEntry::session`。broker の表は無くなった）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }
 # R1-4b: トリップワイヤ（`ALLOWED_PROTOCOLS`）。R2b-1c: `settings_to_api(settings_from_flat(..))`
@@ -23,6 +22,10 @@ banto-driver-modbus = { path = "../banto-driver-modbus" }
 banto-tags = { path = "../banto-tags" }
 
 [dev-dependencies]
+# R2b-3a-2: トリップワイヤ（`is_broker_managed`）と examples/real_plc_verify.rs の broker。
+banto-broker = { path = "../banto-broker" }
+# examples/real_plc_verify.rs: broker の接続の `settings`（R2b-3a-2）。
+serde_json = { workspace = true }
 banto-plc = { path = "../banto-plc" }
 # examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール）。
 banto-plc-write = { path = "../banto-plc-write" }

@@ -55,13 +55,11 @@
 //! 参照)スケーリングしない。
 
 use banto_core::BantoError;
-use banto_plc::{
-    Address, BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, StringReadRequest,
-};
-use banto_tags::{scale_raw, Scaling, PLC_TAG_KIND, STRING_DATA_TYPE};
+use banto_driver_api::TagSpec;
+use banto_plc::PlcValue;
+use banto_tags::{scale_raw, Scaling, PLC_TAG_KIND};
 
 use crate::hub::CollectorManager;
-use crate::write_path::string_encoding_from_tag;
 
 /// 拒否理由([`crate::write_path::WriteRejection`]の読み取り版)。監査・
 /// レート制限・writable/実効enabled検査は無い - このモジュールの doc
@@ -185,7 +183,7 @@ pub async fn execute_read_now(
         .await
         .map_err(map_registry_error)?;
 
-    let request = build_plc_read_request(manager.registry(), &conn, &entry, &tag_row)?;
+    let spec = build_plc_read_spec(manager.registry(), &conn, &entry, &tag_row)?;
 
     // gate 4: non-spawning peek(このモジュールの doc comment参照) - 新規に
     // 実機へダイヤルしない。
@@ -193,16 +191,16 @@ pub async fn execute_read_now(
         return Err(ReadNowRejection::NoSession);
     };
 
-    // gate 5: broker への読み取り。
+    // gate 5: broker への読み取り（R2b-3a-2: 要求は `TagSpec`、結果はタグごとの
+    // `Result<Value, ItemError>`。broker はジョブに上限を掛けるので、応答しない
+    // セッションでも時間切れで返る - docs/banto-hub-driver-io-design.md §5.5）。
     let results = handle
-        .read(vec![request])
+        .read(vec![spec])
         .await
         .map_err(|err| ReadNowRejection::ReadFailed(err.to_string()))?;
     let value = match results.into_iter().next() {
-        Some(BatchReadResult::Value(v)) => v,
-        Some(BatchReadResult::Bad(err)) => {
-            return Err(ReadNowRejection::ReadFailed(err.to_string()))
-        }
+        Some(Ok(v)) => v,
+        Some(Err(err)) => return Err(ReadNowRejection::ReadFailed(err.to_string())),
         None => {
             return Err(ReadNowRejection::ReadFailed(
                 "broker から応答がありませんでした".to_string(),
@@ -240,22 +238,24 @@ pub async fn execute_read_now(
     })
 }
 
-/// R2b-2c(docs/banto-hub-driver-address-design.md §4.1・§4.2): 読み取り・
-/// 書き込み(数値・文字列)が共有する、PLC タグのアドレス解決。
-/// `conn.protocol` のドライバ(`registry`)の `parse_address` にタグの
-/// [`banto_tags::tag_kind`] を渡して [`banto_driver_api::DriverAddress`] を得て、
-/// HostBound の橋 [`Address::from_driver_address`] で `banto_plc::Address` に戻す
-/// (橋は R2b-3 でホストバウンドのドライバと一緒に消える)。プロトコル名による
-/// 文法の分岐はここには無い。ドライバが無い・kind が作れない・解析/橋の失敗は
-/// すべて `Err(メッセージ)` で、呼び出し元がそれぞれ
-/// `ReadNowRejection::InvalidAddress` / `WriteRejection::InvalidAddress`(422、
-/// broker へは渡さない)にする。**副作用は無い**。
+/// R2b-2c(docs/banto-hub-driver-address-design.md §4.1・§4.2)/ R2b-3a-2
+/// (docs/banto-hub-driver-io-design.md §4.2): 読み取り・書き込み(数値・文字列)が
+/// 共有する、PLC タグのアドレス解決。`conn.protocol` のドライバ(`registry`)の
+/// `parse_address` にタグの [`banto_tags::tag_kind`] を渡して
+/// [`banto_driver_api::DriverAddress`] を得て、その kind と組にした
+/// [`TagSpec`] を返す。broker はこれをそのままドライバのセッションへ渡す
+/// (R2b-3a-2 で `banto_plc::Address` へ戻す橋をやめた。ビット指定の `bit` を
+/// RMW にするかもドライバが決める)。プロトコル名による文法の分岐はここには無い。
+/// ドライバが無い・kind が作れない・解析の失敗はすべて `Err(メッセージ)` で、
+/// 呼び出し元がそれぞれ `ReadNowRejection::InvalidAddress` /
+/// `WriteRejection::InvalidAddress`(422、broker へは渡さない)にする。
+/// **副作用は無い**。
 pub(crate) fn resolve_plc_address(
     registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
-) -> Result<Address, String> {
+) -> Result<TagSpec, String> {
     let Some(kind) = banto_tags::tag_kind(
         &tag_row.data_type,
         tag_row.string_length,
@@ -270,54 +270,23 @@ pub(crate) fn resolve_plc_address(
         .base()
         .parse_address(entry.address.trim(), &kind)
         .map_err(|err| err.message().to_string())?;
-    Address::from_driver_address(&driver_address).map_err(|err| err.to_string())
+    Ok(TagSpec::new(driver_address, kind))
 }
 
-/// `entry`/`tag_row` から `BatchReadRequest` を組み立てる
-/// (`crate::write_path::build_plc_write_request`/
-/// `build_plc_string_write_request` の読み取り版 - アドレス解決は
+/// `entry`/`tag_row` から読み取りの [`TagSpec`] を組み立てる
+/// (`crate::write_path::build_plc_write_item`/
+/// `build_plc_string_write_item` の読み取り版 - アドレス解決は
 /// [`resolve_plc_address`] を共有する)。**副作用は無い**(broker へは
-/// 渡さない)。
+/// 渡さない)。文字列タグの語数・符号化は [`banto_tags::tag_kind`] が
+/// `string_length`・`string_encoding` から作る。
 ///
-/// bit-in-word アドレス(T8、`"D100.5"`)は write と違って特別扱いが要らない。
-/// `banto_plc::planning`(SLMP)が `ReadRequest{address, data_type: Bit}`
-/// のアドレスにビット修飾があれば自動的に `ReadKind::BitInWord` へ振り分ける
-/// (write 側が専用の RMW `BatchWriteRequest::BitInWord` variant を要るのは
-/// SLMP にビット専用書き込みコマンドが無いためで、読み取りには元々その
-/// 制約が無い)。
-fn build_plc_read_request(
+/// bit-in-word アドレス(T8、`"D100.5"`)は write と違って特別扱いが要らない
+/// (ドライバの計画が `bit` つきのアドレスから語を読んでビットを取り出す)。
+fn build_plc_read_spec(
     registry: &banto_driver_api::DriverRegistry,
     conn: &banto_tags::PlcConnection,
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
-) -> Result<BatchReadRequest, ReadNowRejection> {
-    // R2b-2c: アドレスは接続のドライバ(レジストリ)で解析し、橋で
-    // `banto_plc::Address` に戻す([`resolve_plc_address`])。
-    let address = resolve_plc_address(registry, conn, entry, tag_row)
-        .map_err(ReadNowRejection::InvalidAddress)?;
-
-    if entry.data_type == STRING_DATA_TYPE {
-        let words = tag_row.string_length.unwrap_or(0).clamp(0, u16::MAX as i64) as u16;
-        let encoding = string_encoding_from_tag(tag_row);
-        return Ok(BatchReadRequest::String(StringReadRequest {
-            address,
-            words,
-            encoding,
-        }));
-    }
-
-    let Some(data_type) = DataType::parse(&entry.data_type) else {
-        // catalog の data_type は登録時に banto-tags で検証済みのはずの
-        // 防御的分岐(`crate::write_path::convert_value`の同種の到達不能
-        // ケースと同じ扱い)。
-        return Err(ReadNowRejection::Internal(format!(
-            "未知の data_type です: {}",
-            entry.data_type
-        )));
-    };
-
-    Ok(BatchReadRequest::Numeric(ReadRequest {
-        address,
-        data_type,
-    }))
+) -> Result<TagSpec, ReadNowRejection> {
+    resolve_plc_address(registry, conn, entry, tag_row).map_err(ReadNowRejection::InvalidAddress)
 }
