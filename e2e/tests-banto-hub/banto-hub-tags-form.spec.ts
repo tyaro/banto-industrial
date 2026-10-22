@@ -252,7 +252,9 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await drawer.getByText('書き込み安全設定').click();
 		const writable = drawer.locator('#tag-writable');
 		await expect(writable).toBeEnabled();
-		// 手動で ON（既定 ON が当たっていても check() は冪等）。
+		// 手動で ON にする。既定 ON が当たっていても手動の操作（`createWritableTouched`）
+		// の経路を通すため、一度 OFF にしてから ON にする。
+		await writable.uncheck();
 		await writable.check();
 		await expect(writable).toBeChecked();
 
