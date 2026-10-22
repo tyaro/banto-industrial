@@ -707,8 +707,11 @@ impl HubRuntime {
         // R2b-1d（設計 §4.2）: Hub の入口（REST・MCP・未適用キューの適用・Sink とブリッジの
         // 設定）の接続のサービスはレジストリつき。`manager.plc_connections()` と同じもの。
         let plc_connections = PlcConnectionService::with_registry(pool.clone(), registry.clone());
-        let collection_groups = CollectionGroupService::new(pool.clone());
-        let tags = TagService::new(pool.clone());
+        // R2b-2b（アドレス設計 §3.1）: グループとタグのサービスもレジストリつき
+        // （`manager.collection_groups()` / `manager.tags()` と同じもの）。
+        let collection_groups =
+            CollectionGroupService::with_registry(pool.clone(), registry.clone());
+        let tags = TagService::with_registry(pool.clone(), registry.clone());
         let api_keys = ApiKeysService::new(pool.clone());
 
         // T2-4 (docs/tag-server-design.md §6-6)。2026-09-09 オーナー決定

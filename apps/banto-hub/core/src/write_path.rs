@@ -162,7 +162,7 @@ use banto_plc_write::{
     WriteResult as PlcWriteResult,
 };
 use banto_server::ServerEvent;
-use banto_tags::{unscale, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE};
+use banto_tags::{unscale, Scaling, PLC_TAG_KIND, STRING_DATA_TYPE};
 use serde_json::json;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex as AsyncMutex;
@@ -920,7 +920,9 @@ pub async fn execute_write(
     let converted = convert_value(&resolved.entry, resolved.requested)?;
 
     // tag_row の読み込みも元の位置(gate 7 の後・gate 8 の前)に戻す。
-    let tag_row = TagService::new(deps.manager.pool())
+    let tag_row = deps
+        .manager
+        .tags()
         .get(resolved.tag_id)
         .await
         .map_err(map_registry_error)?;
@@ -1270,7 +1272,7 @@ pub async fn execute_write_batch(
         // 前)- ここで読む。読み込みに失敗した場合は単票と同じく監査行を
         // 一切残さず、このエントリだけ Internal を返す(他のエントリの
         // commit は続行する)。
-        let tag_row = match TagService::new(deps.manager.pool()).get(p.tag_id).await {
+        let tag_row = match deps.manager.tags().get(p.tag_id).await {
             Ok(row) => row,
             Err(err) => {
                 outcomes[i] = Some(BatchEntryOutcome {
@@ -1357,7 +1359,7 @@ pub async fn execute_write_batch(
             Vec::with_capacity(group_indices.len());
         for &i in &group_indices {
             let p = &prepared[i];
-            let tag_row = match TagService::new(deps.manager.pool()).get(p.tag_id).await {
+            let tag_row = match deps.manager.tags().get(p.tag_id).await {
                 Ok(row) => row,
                 Err(err) => {
                     outcomes[i] = Some(BatchEntryOutcome {

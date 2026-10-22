@@ -14,12 +14,11 @@ use super::{
     unauthorized_response, v1_events, v1_write_value, v1_write_values_batch, value_source_for_tag,
     ApiError, ApiKeyContext, ApiKeysService, ApplyReport, Arc, AsyncMutex, AuditEntry,
     AuditLogService, AuthState, BantoError, BrokerConnectionStatus, CollectionController,
-    CollectionGroupService, CollectionState, CollectionStatus, CollectorManager, ComputedEngine,
-    ConnectionStatus, Db, Deserialize, Extension, HubSettingsExt, IntoResponse, Json, ListParams,
-    Method, MqttPublisher, Path, Query, Response, Router, RunMode, Serialize, ServerEvent,
-    SettingsService, SinkStatusSnapshot, SinkStatusStore, State, StatusCode, SystemInfoSampler,
-    SystemInfoSnapshot, TagEntry, TagMap, ToSchema, WriteAuditService, WriteControl,
-    WriteRateLimiter, WriteState,
+    CollectionState, CollectionStatus, CollectorManager, ComputedEngine, ConnectionStatus, Db,
+    Deserialize, Extension, HubSettingsExt, IntoResponse, Json, ListParams, Method, MqttPublisher,
+    Path, Query, Response, Router, RunMode, Serialize, ServerEvent, SettingsService,
+    SinkStatusSnapshot, SinkStatusStore, State, StatusCode, SystemInfoSampler, SystemInfoSnapshot,
+    TagEntry, TagMap, ToSchema, WriteAuditService, WriteControl, WriteRateLimiter, WriteState,
 };
 
 // --- /api/v1/* タグ空間 API（設計 §5.1） ------------------------------------
@@ -1020,7 +1019,9 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
     // from one that is enabled, has tags, and simply isn't connecting
     // ("stopped"/"reconnecting").
     let collectible_connection_ids = connections_with_collected_groups(
-        &CollectionGroupService::new(state.manager.pool())
+        &state
+            .manager
+            .collection_groups()
             .list(ListParams::default())
             .await?
             .rows,

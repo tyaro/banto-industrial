@@ -3024,6 +3024,77 @@ async fn get_tag_returns_all_fields_including_revision() {
     assert_eq!(payload["tag"]["revision"], 1, "{payload:?}");
 }
 
+/// R2b-2b（アドレス設計 §3）: MCP の `create_tag` / `update_tag` もドライバで解析した
+/// 正規形を保存し（SLMP の `d0200` は `D200`）、文法違反は行を増やさずに断る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_update_tag_save_the_canonical_address_and_refuse_a_bad_one() {
+    let app = test_app("r2b2b-canonical").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let conn_id = create_test_connection(&app, "line1", 15022).await;
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp01",
+                "collectionGroupId": group.id,
+                "address": " d0200 ",
+                "dataType": "u16",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["created"]["address"], "D200", "{payload:?}");
+    let id = payload["created"]["id"].as_i64().unwrap();
+
+    let rows_before = tags_row_count(&app).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_tag",
+            json!({
+                "name": "temp02",
+                "collectionGroupId": group.id,
+                "address": "40001",
+                "dataType": "u16",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert_eq!(tags_row_count(&app).await, rows_before);
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_tag",
+            full_tag_update_args(id, group.id, "temp01", "w0a", None),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let stored: String = sqlx::query_scalar("SELECT address FROM tags WHERE id = ?")
+        .bind(id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(stored, "WA");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn create_tag_with_admin_scope_while_stopped_creates_and_audits() {
     let app = test_app("s1d-create-tag").await;

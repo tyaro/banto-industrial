@@ -754,12 +754,15 @@ version = "0.1.0"
 dependencies = [
  "banto-broker",
  "banto-collect",
+ "banto-core",
  "banto-driver-api",
  "banto-driver-modbus",
  "banto-driver-slmp",
  "banto-plc",
  "banto-plc-write",
+ "banto-storage",
  "banto-tags",
+ "sqlx",
  "tokio",
 ]
 

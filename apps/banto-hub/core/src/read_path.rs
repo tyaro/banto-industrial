@@ -58,7 +58,7 @@ use banto_core::BantoError;
 use banto_plc::{
     Address, BatchReadRequest, BatchReadResult, DataType, PlcValue, ReadRequest, StringReadRequest,
 };
-use banto_tags::{scale_raw, Scaling, TagService, PLC_TAG_KIND, STRING_DATA_TYPE};
+use banto_tags::{scale_raw, Scaling, PLC_TAG_KIND, STRING_DATA_TYPE};
 
 use crate::hub::CollectorManager;
 use crate::write_path::string_encoding_from_tag;
@@ -179,7 +179,8 @@ pub async fn execute_read_now(
         return Err(ReadNowRejection::UnsupportedProtocol);
     }
 
-    let tag_row = TagService::new(manager.pool())
+    let tag_row = manager
+        .tags()
         .get(tag_id)
         .await
         .map_err(map_registry_error)?;
