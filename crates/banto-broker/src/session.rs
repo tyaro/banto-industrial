@@ -28,8 +28,8 @@
 //! ## [`Connector`]
 //!
 //! A reusable "dial a fresh session" step. [`crate::SessionDirectory`] builds
-//! one per connection from the registry's [`DriverKind::Session`] entry
-//! (`SessionDriver::connect` with the connection's `Settings` and a
+//! one per connection from the registry's Session or Frame entry
+//! (`SessionDriver::connect` or the Frame adapter below, with `Settings` and a
 //! `ConnectContext`), and the task calls it again on every reconnect attempt.
 //! The broker's own unit tests build connectors directly (`fake.rs`).
 //!
@@ -94,4 +94,117 @@ impl SecretOpener for NoSecretOpener {
             Err("この broker には秘密値を開く口がありません".to_string())
         })
     }
+}
+
+/// Only the dial is adapted: the broker still owns one API Session per task.
+/// No driver registry entry is changed by this wrapper.
+pub(crate) struct FrameDial(pub(crate) std::sync::Arc<dyn banto_driver_api::FrameDriver>);
+
+impl banto_driver_api::DriverBase for FrameDial {
+    fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
+        self.0.descriptor()
+    }
+    fn validate_config(
+        &self,
+        settings: &banto_driver_api::Settings,
+    ) -> Vec<banto_driver_api::FieldError> {
+        let mut errors = self.0.validate_config(settings);
+        if let Err(error) = frame_transport(settings, self.0.descriptor()) {
+            // Keep the driver's more specific message for a field it already rejected.
+            if !errors.iter().any(|existing| existing.key == error.key) {
+                errors.push(error);
+            }
+        }
+        errors
+    }
+    fn secret_keys(&self) -> Vec<String> {
+        self.0.secret_keys()
+    }
+    fn parse_address(
+        &self,
+        text: &str,
+        kind: &banto_driver_api::TagKind,
+    ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
+        self.0.parse_address(text, kind)
+    }
+    fn offset_address(
+        &self,
+        canonical: &str,
+        kind: &banto_driver_api::TagKind,
+        n: i64,
+    ) -> Result<String, banto_driver_api::AddressError> {
+        self.0.offset_address(canonical, kind, n)
+    }
+    fn address_help(&self) -> String {
+        self.0.address_help()
+    }
+    fn probe(&self) -> Option<(String, banto_driver_api::TagKind)> {
+        self.0.probe()
+    }
+}
+
+impl banto_driver_api::SessionDriver for FrameDial {
+    fn connect(
+        &self,
+        settings: &banto_driver_api::Settings,
+        cx: banto_driver_api::ConnectContext,
+    ) -> BoxFuture<'static, Result<Box<dyn Session>, FatalError>> {
+        let driver = self.0.clone();
+        // The owned copy must zeroize too, including when never polled.
+        let mut settings = super::OpenedSettings::new(settings.clone());
+        settings.opened = driver.secret_keys();
+        Box::pin(async move {
+            let spec = frame_transport(settings.settings(), driver.descriptor())
+                .map_err(|error| FatalError::InvalidConfig(error.to_string()))?;
+            banto_driver_engine::FrameSession::connect(
+                driver.as_ref(),
+                settings.settings(),
+                &spec,
+                &cx,
+                None,
+            )
+            .await
+            .map(|session| Box::new(session) as Box<dyn Session>)
+        })
+    }
+}
+
+/// Transport validation belongs to the host that opens it. Serial support and
+/// resynchronisation are added in 3e; never silently dial TCP for an unknown kind.
+fn frame_transport(
+    settings: &banto_driver_api::Settings,
+    descriptor: &banto_driver_api::DriverDescriptor,
+) -> Result<banto_driver_engine::transport::TransportSpec, banto_driver_api::FieldError> {
+    use banto_driver_api::{keys, FieldError};
+    match settings.get(keys::TRANSPORT).unwrap_or("tcp") {
+        "tcp" => {}
+        _ => {
+            return Err(FieldError::new(
+                keys::TRANSPORT,
+                "このエンジンで未対応の通信方式です",
+            ))
+        }
+    }
+    if !descriptor
+        .transports
+        .contains(&banto_driver_api::Transport::Tcp)
+    {
+        return Err(FieldError::new(
+            keys::TRANSPORT,
+            "このドライバは TCP 通信に対応していません",
+        ));
+    }
+    let host = settings
+        .get(keys::HOST)
+        .filter(|host| !host.trim().is_empty())
+        .ok_or_else(|| FieldError::new(keys::HOST, "接続先を指定してください"))?;
+    let port = settings
+        .get(keys::PORT)
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(|| FieldError::new(keys::PORT, "1〜65535 で指定してください"))?;
+    Ok(banto_driver_engine::transport::TransportSpec::Tcp {
+        host: host.to_owned(),
+        port,
+    })
 }

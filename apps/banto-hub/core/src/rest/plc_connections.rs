@@ -15,9 +15,7 @@ use super::{
     RegistryMutationError, RegistryMutationResult, Response, Serialize, State, StatusCode,
     TagRegistryState,
 };
-use banto_driver_api::{
-    keys, ConnectContext, DriverKind, FatalError, ItemError, Settings, TagSpec, Value,
-};
+use banto_driver_api::{keys, ConnectContext, FatalError, ItemError, Settings, TagSpec, Value};
 
 fn default_plc_protocol() -> String {
     "modbus-tcp".to_string()
@@ -758,7 +756,7 @@ pub(super) async fn plc_connections_test_saved(
 // `test_modbus_connection`/`test_slmp_connection`(`ModbusTcpClient`/
 // `SlmpClient` を直接ダイヤルし、固定のリテラル `40001`/`D0` を読む)を
 // ドライバに依らない [`test_connection`] にまとめた。読む 1 点はドライバの
-// `DriverBase::probe()`、ダイヤルはレジストリのセッション型のドライバの
+// `DriverBase::probe()`、ダイヤルはbroker が解決した Session / Frame ドライバの
 // `connect`、収集中のセッションを使ってよいかは設定の指紋で見る
 // (#605 の CPU 種別の照合を、どの設定にも広げたもの)。
 
@@ -849,7 +847,7 @@ fn classify_fatal(
     let (kind, mut message) = match err {
         FatalError::Timeout if connecting => (
             "timeout",
-            "接続タイムアウトです(3秒)。ホスト/ポート、ネットワーク到達性を確認してください。"
+            "接続タイムアウトです。ホスト/ポート、ネットワーク到達性とハンドシェイクを確認してください。"
                 .to_string(),
         ),
         FatalError::Timeout => (
@@ -1005,22 +1003,16 @@ fn probe_outcome(results: Vec<Result<Value, ItemError>>) -> (bool, Option<PlcCon
 ///    セッションの読みはフォームの値を試したことにならないので、試さずに
 ///    「保存してからテストしてください」と返す(#605 の CPU 種別の照合を
 ///    全部の設定に広げたもの)。
-/// 3. 無ければ直接ダイヤルする: レジストリのセッション型のドライバで
-///    `validate_config` → `connect`(接続・応答の時間切れは
-///    [`PLC_TEST_TIMEOUT`]、外側にも上限)→ ドライバの読む 1 点を
+/// 3. 無ければ直接ダイヤルする: broker と共通の Session / Frame ドライバで
+///    `validate_config` → `connect`(接続・各応答の時間切れは
+///    [`PLC_TEST_TIMEOUT`]、外側は broker と同じ種類別の上限)→ ドライバの読む 1 点を
 ///    `read_batch`(外側の上限は broker と同じ式)→ 必ず `disconnect`。
 async fn test_connection(
     manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {
     let registry = manager.registry();
-    let Some(driver) = registry
-        .get(&payload.protocol)
-        .and_then(|entry| match entry.kind() {
-            DriverKind::Session(driver) => Some(driver.clone()),
-            _ => None,
-        })
-    else {
+    let Some(resolved) = banto_broker::resolve_session_driver(registry, &payload.protocol) else {
         return (
             false,
             Some(test_error(
@@ -1029,6 +1021,7 @@ async fn test_connection(
             )),
         );
     };
+    let driver = resolved.driver();
     // 保存済みの接続（同じプロトコル）は、指紋に入る秘密値の参照の出どころ
     // （フォームは秘密値を送らない。参照は保存済みのまま、と読む）。
     let (settings, saved) = requested_settings(manager, payload).await;
@@ -1104,7 +1097,10 @@ async fn test_connection(
     }
     let cx = ConnectContext::new("connection-test", PLC_TEST_TIMEOUT, PLC_TEST_TIMEOUT);
     let connected = tokio::time::timeout(
-        PLC_TEST_TIMEOUT + banto_broker::CONNECT_SLACK,
+        resolved.connect_limit(banto_broker::SessionTimeouts {
+            connect: PLC_TEST_TIMEOUT,
+            response: PLC_TEST_TIMEOUT,
+        }),
         driver.connect(&settings, cx),
     )
     .await
@@ -1212,7 +1208,7 @@ pub(crate) async fn run_plc_connection_test(
         )
     } else {
         // R2b-3a-2: プロトコル名で分けない。broker が管理しないプロトコル
-        // (レジストリにセッション型のドライバが無い)は `test_connection` が
+        // (レジストリに Session / Frame ドライバが無い)は `test_connection` が
         // "unsupported" で返す。
         test_connection(manager, payload).await
     };
@@ -1221,5 +1217,189 @@ pub(crate) async fn run_plc_connection_test(
         ok,
         elapsed_ms: started.elapsed().as_millis() as u64,
         error,
+    }
+}
+
+#[cfg(test)]
+mod frame_connection_tests {
+    use super::*;
+    use crate::{
+        broker_glue::{BrokerSimRegistry, HubDrivers, HubSessions},
+        computed::{ComputedEngine, ServerTagStore},
+    };
+    use banto_driver_api::{
+        AddressError, DataType, DriverAddress, DriverBase, DriverDescriptor, DriverEntry, DriverId,
+        FieldError, FrameConnection, FrameDriver, TagKind,
+    };
+    use banto_driver_conformance::fake::echo::{EchoFrameDriver, EchoResponder};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    // The legacy connection-test payload supplies host/port for modbus-tcp.
+    // Override only the fixture id; production registrations remain unchanged.
+    struct ProbeFrameDriver {
+        descriptor: DriverDescriptor,
+        echo: EchoFrameDriver,
+        creates: Arc<AtomicUsize>,
+    }
+    impl DriverBase for ProbeFrameDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &self.descriptor
+        }
+        fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
+            self.echo.validate_config(settings)
+        }
+        fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
+            let mut address = self.echo.parse_address(text, kind)?;
+            address.driver = self.descriptor.id.clone();
+            Ok(address)
+        }
+        fn offset_address(
+            &self,
+            text: &str,
+            kind: &TagKind,
+            n: i64,
+        ) -> Result<String, AddressError> {
+            self.echo.offset_address(text, kind, n)
+        }
+        fn address_help(&self) -> String {
+            self.echo.address_help()
+        }
+        fn probe(&self) -> Option<(String, TagKind)> {
+            Some(("W10".into(), TagKind::numeric(DataType::U16)))
+        }
+    }
+    impl FrameDriver for ProbeFrameDriver {
+        fn create_connection(
+            &self,
+            settings: &Settings,
+        ) -> Result<Box<dyn FrameConnection>, FatalError> {
+            self.creates.fetch_add(1, Ordering::SeqCst);
+            self.echo.create_connection(settings)
+        }
+    }
+    async fn fixture() -> (
+        CollectorManager,
+        Arc<HubSessions>,
+        sqlx::SqlitePool,
+        Arc<AtomicUsize>,
+    ) {
+        let pool = crate::db::init_db_memory().await.unwrap();
+        let creates = Arc::new(AtomicUsize::new(0));
+        let echo = EchoFrameDriver::new();
+        let mut descriptor = echo.descriptor().clone();
+        descriptor.id = DriverId::new("modbus-tcp").unwrap();
+        let mut drivers = HubDrivers::none();
+        Arc::get_mut(&mut drivers.registry)
+            .unwrap()
+            .register(DriverEntry::frame(Arc::new(ProbeFrameDriver {
+                descriptor,
+                echo,
+                creates: creates.clone(),
+            })))
+            .unwrap();
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            drivers,
+        ));
+        let manager = CollectorManager::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(banto_tstore::SystemClock),
+            banto_collect::CollectorOptions::default(),
+            sessions.clone(),
+            Arc::new(BrokerSimRegistry::new()),
+            Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
+        );
+        (manager, sessions, pool, creates)
+    }
+    fn payload(port: i64) -> PlcConnectionTestPayload {
+        PlcConnectionTestPayload {
+            protocol: "modbus-tcp".into(),
+            host: "127.0.0.1".into(),
+            port,
+            unit_id: 1,
+            simulation: false,
+            connection_id: None,
+            cpu_type: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn frame_connection_test_refuses_invalid_settings_without_io() {
+        let (manager, sessions, pool, creates) = fixture().await;
+        assert!(sessions.is_broker_managed("modbus-tcp"));
+        let response = run_plc_connection_test(&manager, &payload(0)).await;
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(
+            error.kind, "tcp",
+            "Frame must reach validation, not unknown protocol"
+        );
+        assert!(error.message.contains("port"), "{error:?}");
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        manager.shutdown().await;
+        sessions.shutdown().await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn frame_connection_test_completes_handshake_probe_and_disconnect_over_tcp() {
+        use banto_driver_conformance::frame::{Reply, Responder};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut echo = EchoResponder::new();
+            echo.set_word('W', 10, 7);
+            echo.on_connect();
+            let mut codes = vec![];
+            loop {
+                let mut header = [0; 6];
+                match stream.read_exact(&mut header).await {
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                    Err(error) => panic!("read request: {error}"),
+                }
+                let mut request = header.to_vec();
+                request.resize(
+                    6 + usize::from(u16::from_be_bytes([header[4], header[5]])),
+                    0,
+                );
+                stream.read_exact(&mut request[6..]).await.unwrap();
+                codes.push(header[1]);
+                let Reply::Bytes(reply) = echo.reply(&request) else {
+                    panic!("echo reply");
+                };
+                stream.write_all(&reply).await.unwrap();
+            }
+            codes
+        });
+        let (manager, sessions, pool, creates) = fixture().await;
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_plc_connection_test(&manager, &payload(i64::from(port))),
+        )
+        .await
+        .unwrap();
+        assert!(response.ok, "{response:?}");
+        assert_eq!(creates.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"HR"
+        );
+        assert!(
+            sessions.handle_for(1).is_none(),
+            "direct test must not create a broker task"
+        );
+        manager.shutdown().await;
+        sessions.shutdown().await;
+        pool.close().await;
     }
 }
