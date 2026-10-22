@@ -729,6 +729,20 @@ fn live_fingerprint(app: &TestApp, id: i64) -> Option<banto_broker::SettingsFing
         .and_then(|h| h.settings_fingerprint())
 }
 
+/// シミュレータが `accepted` 本目の接続を受けるまで待つ（期限つき）。accept の件数は
+/// シミュレータの別タスクが更新するので、クライアント側の Connected の直後に見ると
+/// まだ数えられていないことがある。
+async fn wait_accepted(sim: &Simulator, accepted: usize, why: &str) {
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            sim.connection_count() >= accepted
+        })
+        .await,
+        "{why}: シミュレータが {accepted} 本目の接続を受けた（受けた接続 {}）",
+        sim.connection_count()
+    );
+}
+
 /// 再構築の後、ハンドルの指紋が保存済みの設定のものになり、シミュレータが
 /// `accepted` 本目の接続を受けるまで待つ。前の指紋 `before` とは違うこと。
 async fn assert_redialed(
@@ -749,14 +763,7 @@ async fn assert_redialed(
         .await,
         "{why}: 作り直したハンドルは新しい設定の指紋を持つ"
     );
-    assert!(
-        wait_until(Duration::from_secs(10), || async {
-            sim.connection_count() >= accepted
-        })
-        .await,
-        "{why}: 新しいセッションがダイヤルした（受けた接続 {}）",
-        sim.connection_count()
-    );
+    wait_accepted(sim, accepted, why).await;
     assert_eq!(
         app.sessions.connection_count(),
         1,
@@ -810,6 +817,7 @@ async fn a_protocol_only_change_redials_the_broker_session_with_the_new_driver()
     start_session(&app, conn.id).await;
     let first = live_fingerprint(&app, conn.id);
     assert_eq!(first, expected_fingerprint(&app, conn.id).await);
+    wait_accepted(&sim, 1, "最初のセッション").await;
     assert_eq!(sim.connection_count(), 1);
 
     // 同じ設定の再構築は張り直さない。
@@ -838,6 +846,7 @@ async fn a_modbus_unit_id_or_word_order_change_redials_the_broker_session() {
     start_session(&app, conn.id).await;
     let first = live_fingerprint(&app, conn.id);
     assert_eq!(first, expected_fingerprint(&app, conn.id).await);
+    wait_accepted(&sim, 1, "最初のセッション").await;
     assert_eq!(sim.connection_count(), 1);
 
     let mut input = conn_input("line1", sim.addr.port());
