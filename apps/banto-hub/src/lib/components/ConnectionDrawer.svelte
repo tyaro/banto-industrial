@@ -97,6 +97,7 @@
 	import { listPendingChanges, type PendingChange } from '#lib/banto/pendingChangesAdmin.js';
 	import { pendingCreateNames } from '#lib/banto/pendingCreateNames.js';
 	import { isFormDirty } from '#lib/banto/formDirty.js';
+	import { passwordStatusView } from '#lib/banto/secretStorageView.js';
 	import {
 		createPlcConnection,
 		deletePlcConnection,
@@ -831,8 +832,14 @@
 							<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
 						</label>
 					{:else}
-						<div class="field password-status">
-							パスワード: {connection?.passwordSet ? '設定済み' : '未設定'}
+						{@const passwordView = passwordStatusView(connection ?? null)}
+						<div
+							class="field password-status"
+							class:unreadable={passwordView.unreadable}
+							role={passwordView.unreadable ? 'alert' : undefined}
+							data-testid="password-status"
+						>
+							{passwordView.text}
 						</div>
 						<label class="field">
 							新しいパスワード（変更する場合のみ入力）
@@ -1391,6 +1398,11 @@
 		font-size: 0.8rem;
 		color: var(--banto-text-muted);
 		align-self: flex-end;
+	}
+
+	.password-status.unreadable {
+		color: var(--banto-warning);
+		font-weight: 600;
 	}
 
 	.err {

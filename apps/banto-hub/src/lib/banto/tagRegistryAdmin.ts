@@ -160,6 +160,12 @@ export interface PlcConnection {
 	 */
 	passwordSet: boolean;
 	/**
+	 * R2b-1e（設計 §5.5）: パスワードの状態。`unreadable` は保存した値をこの PC で
+	 * 読めない（別の PC へ移した等）。古いサーバーは返さないので省略を許し、
+	 * 無いときは `passwordSet` で判断する（`secretStorageView.passwordStatusView`）。
+	 */
+	passwordState?: 'none' | 'set' | 'unreadable';
+	/**
 	 * R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
 	 * （既定のままなら `null`。他プロトコルでは常に `null`）- mirrors
 	 * `banto_hub_core::rest::PlcConnectionResponse::settings`。古いサーバーは

@@ -341,3 +341,90 @@ impl banto_broker::BrokerSession for FakeSession {
         Box::pin(async {})
     }
 }
+
+/// R2b-1e: a stand-in for the DPAPI protector on every OS (the startup upkeep and the
+/// queue relocation tests of `crate::upgrade` and `crate::pending_changes`). Not
+/// encryption: blob = `sha256("tag" + entropy)` + plaintext XOR a keystream derived
+/// from the entropy, so the blob never holds the plaintext bytes and opening under
+/// another reference / key fails (entropy binding), like DPAPI.
+#[derive(Debug, Default)]
+pub(crate) struct XorTestProtector;
+
+fn xor_tag(entropy: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(b"tag");
+    hash.update(entropy);
+    hash.finalize().into()
+}
+
+fn xor_keystream(entropy: &[u8], len: usize) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut out = Vec::with_capacity(len);
+    let mut counter: u64 = 0;
+    while out.len() < len {
+        let mut hash = Sha256::new();
+        hash.update(b"ks");
+        hash.update(entropy);
+        hash.update(counter.to_le_bytes());
+        out.extend_from_slice(&hash.finalize());
+        counter += 1;
+    }
+    out.truncate(len);
+    out
+}
+
+impl banto_secret_store::Protector for XorTestProtector {
+    fn protect(&self, plain: &[u8], entropy: &[u8]) -> banto_secret_store::Result<Vec<u8>> {
+        let mut blob = xor_tag(entropy).to_vec();
+        blob.extend(
+            plain
+                .iter()
+                .zip(xor_keystream(entropy, plain.len()))
+                .map(|(p, k)| p ^ k),
+        );
+        Ok(blob)
+    }
+
+    fn unprotect(
+        &self,
+        blob: &[u8],
+        entropy: &[u8],
+    ) -> banto_secret_store::Result<zeroize::Zeroizing<Vec<u8>>> {
+        if blob.len() < 32 || blob[..32] != xor_tag(entropy) {
+            return Err(banto_secret_store::SecretStoreError::Unprotect { os_error: None });
+        }
+        let body = &blob[32..];
+        Ok(zeroize::Zeroizing::new(
+            body.iter()
+                .zip(xor_keystream(entropy, body.len()))
+                .map(|(c, k)| c ^ k)
+                .collect(),
+        ))
+    }
+}
+
+/// R2b-1e: a protector whose every call fails (a DPAPI failure), for "the upkeep keeps
+/// the row as it is and does not stop the start".
+#[derive(Debug, Default)]
+pub(crate) struct FailingProtector;
+
+impl banto_secret_store::Protector for FailingProtector {
+    fn protect(&self, _plain: &[u8], _entropy: &[u8]) -> banto_secret_store::Result<Vec<u8>> {
+        Err(banto_secret_store::SecretStoreError::Protect { os_error: Some(5) })
+    }
+
+    fn unprotect(
+        &self,
+        _blob: &[u8],
+        _entropy: &[u8],
+    ) -> banto_secret_store::Result<zeroize::Zeroizing<Vec<u8>>> {
+        Err(banto_secret_store::SecretStoreError::Unprotect { os_error: Some(5) })
+    }
+}
+
+/// [`crate::secrets::ConnectionSecrets`] with [`XorTestProtector`] (the DPAPI path's shape
+/// on every OS: `seal_scheme() == DpapiMachineV1`).
+pub(crate) fn protected_secrets() -> crate::secrets::ConnectionSecrets {
+    crate::secrets::ConnectionSecrets::new(Some(std::sync::Arc::new(XorTestProtector)))
+}

@@ -77,6 +77,7 @@
 	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
 	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
 	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
+	import { secretStorageWarnings } from '#lib/banto/secretStorageView.js';
 	import {
 		startCollection,
 		startAllSimulationCollection,
@@ -1051,6 +1052,18 @@
 			{/if}
 		{/if}
 	</section>
+
+	{#if status && secretStorageWarnings(status.secret_storage).length > 0}
+		<section data-testid="secret-storage-warnings">
+			<h2>接続の秘密値</h2>
+			<dl class="summary">
+				{#each secretStorageWarnings(status.secret_storage) as warning (warning)}
+					<dt>保存の注意</dt>
+					<dd class="warn" role="alert">{warning}</dd>
+				{/each}
+			</dl>
+		</section>
+	{/if}
 
 	{#if status && canManageWriteControl}
 		<section>

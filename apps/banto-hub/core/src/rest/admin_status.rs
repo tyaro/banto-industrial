@@ -163,6 +163,13 @@ struct AdminDbSourceStatusEntry {
     restarts: u32,
     last_restart_reason: Option<String>,
     groups: Vec<AdminDbSourceGroupStatusEntry>,
+    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.5）: パスワードを読めないので
+    /// 起こしていない接続だけ `"unreadable"`、それ以外は `null`（`lastError` の文言は
+    /// 「パスワード: 読めません（この PC で再入力してください）（理由: …）」）。
+    password_state: Option<&'static str>,
+    /// R2b-1e: 読めない理由 `"missing"`（秘密の行が無い）/ `"undecryptable"`（この PC で
+    /// 開けない）/ `"invalid"`（参照の形が違う）。読めるなら `null`。
+    password_unreadable_reason: Option<&'static str>,
 }
 
 /// [`DbSourceGroupStatusEntry`]のcamelCase版。
@@ -187,6 +194,8 @@ impl From<DbSourceStatusEntry> for AdminDbSourceStatusEntry {
             consecutive_failures: entry.consecutive_failures,
             restarts: entry.restarts,
             last_restart_reason: entry.last_restart_reason,
+            password_state: entry.password_unreadable.map(|_| "unreadable"),
+            password_unreadable_reason: entry.password_unreadable.map(|reason| reason.as_str()),
             groups: entry
                 .groups
                 .into_iter()
@@ -310,6 +319,47 @@ struct AdminStatusResponse {
     system: AdminSystemInfoEntry,
     /// 外部 DB 連携 S4: [`SinkStatusEntry`]のcamelCase版。
     sink: AdminSinkStatusEntry,
+    /// R2b-1e（docs/banto-hub-connection-settings-design.md §5.8・§6.5）: 接続の秘密値の
+    /// 保存の方式と警告。管理系の `GET /api/status` だけに出す（`/api/v1/status` には無い）。
+    secret_storage: AdminSecretStorageEntry,
+}
+
+/// R2b-1e: [`AdminStatusResponse::secret_storage`]。秘密値・参照・blob は含まない。
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+struct AdminSecretStorageEntry {
+    /// 新しく封印するときの方式: `"dpapi-machine-v1"`（Windows）/ `"plain-v1"`（それ以外）。
+    scheme: &'static str,
+    /// Windows 以外（`plain-v1`）のときだけ「秘密値を平文で保存しています（Windows 以外）」、
+    /// Windows では `null`（設計 §5.8）。
+    plaintext_warning: Option<&'static str>,
+    /// Windows で封印し直せずに平文で残っている件数（`plain-v1` の秘密の行と、未適用キューの
+    /// 平文・`plain-v1` のパスワード。`crate::upgrade::plaintext_remaining`）。Windows 以外は
+    /// 常に 0（平文が既定なので `plaintextWarning` で出す）。
+    plaintext_remaining: u64,
+    /// `plaintextRemaining > 0` のときだけ「移行待ちの秘密値が平文で残っています（n 件）」、
+    /// それ以外は `null`（設計 §6.5）。
+    plaintext_remaining_warning: Option<String>,
+}
+
+impl AdminSecretStorageEntry {
+    async fn load(state: &TagSpaceState) -> Result<Self, ApiError> {
+        use crate::secrets::{
+            ConnectionSecrets, SecretScheme, PLAINTEXT_REMAINING_WARNING, PLAINTEXT_STORAGE_WARNING,
+        };
+        let secrets = ConnectionSecrets::platform_default();
+        let scheme = secrets.seal_scheme();
+        let plaintext_remaining =
+            crate::upgrade::plaintext_remaining(&state.manager.pool(), &secrets).await?;
+        Ok(Self {
+            scheme: scheme.as_str(),
+            plaintext_warning: (scheme == SecretScheme::PlainV1)
+                .then_some(PLAINTEXT_STORAGE_WARNING),
+            plaintext_remaining,
+            plaintext_remaining_warning: (plaintext_remaining > 0)
+                .then(|| format!("{PLAINTEXT_REMAINING_WARNING}（{plaintext_remaining} 件）")),
+        })
+    }
 }
 
 /// [`SinkSidecarStatusEntry`]のcamelCase版。
@@ -363,8 +413,8 @@ impl From<SinkStatusEntry> for AdminSinkStatusEntry {
     }
 }
 
-impl From<StatusResponse> for AdminStatusResponse {
-    fn from(status: StatusResponse) -> Self {
+impl AdminStatusResponse {
+    fn new(status: StatusResponse, secret_storage: AdminSecretStorageEntry) -> Self {
         Self {
             version: status.version,
             revision: status.revision,
@@ -390,17 +440,21 @@ impl From<StatusResponse> for AdminStatusResponse {
             ingest: status.ingest.into_iter().map(Into::into).collect(),
             system: status.system.into(),
             sink: status.sink.into(),
+            secret_storage,
         }
     }
 }
 
 /// `GET /api/status` - 管理 UI 向け（試運転モードのバイパス対象、
 /// このセクション冒頭のdoc comment参照）。[`compute_status`]を
-/// `/api/v1/status`と共有し、camelCaseへ包み直すだけ。
+/// `/api/v1/status`と共有し、camelCaseへ包み直す。R2b-1e: 管理系だけの
+/// `secretStorage`（[`AdminSecretStorageEntry`]）を足す。
 async fn admin_status(
     State(state): State<TagSpaceState>,
 ) -> Result<Json<AdminStatusResponse>, ApiError> {
-    Ok(Json(compute_status(&state).await?.into()))
+    let status = compute_status(&state).await?;
+    let secret_storage = AdminSecretStorageEntry::load(&state).await?;
+    Ok(Json(AdminStatusResponse::new(status, secret_storage)))
 }
 
 /// `GET /api/values`の応答 - [`ValuesResponse`]（`/api/v1/values`）と

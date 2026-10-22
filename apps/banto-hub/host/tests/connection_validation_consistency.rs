@@ -137,7 +137,7 @@ fn base(protocol: &str) -> PlcConnectionInput {
 /// R2b-1d: the REST tri-state of `password`, sealed the way banto-hub's entrances seal it.
 fn sealed_password(password: Option<&str>) -> banto_tags::SecretChanges {
     banto_hub_core::secrets::password_changes(
-        &banto_hub_core::secrets::r2b1d_connection_secrets(),
+        &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
         password,
     )
     .expect("seal")

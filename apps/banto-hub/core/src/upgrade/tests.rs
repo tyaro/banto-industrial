@@ -421,7 +421,7 @@ async fn init_with_a_registry_backs_up_marks_and_migrates() {
     let pg = service.get(1).await.unwrap();
     let rows = service.secret_rows(1).await.unwrap();
     let opened = crate::secrets::open_connection_secret(
-        &crate::secrets::r2b1d_connection_secrets(),
+        &crate::secrets::ConnectionSecrets::platform_default(),
         &pg,
         banto_tags::PASSWORD_KEY,
         &rows,
@@ -517,7 +517,7 @@ async fn init_without_a_registry_refuses_a_database_that_needs_0025() {
 async fn the_integrity_check_reports_missing_rows_and_deletes_orphans() {
     let pool = crate::db::init_db_memory().await.unwrap();
     let service = PlcConnectionService::with_registry(pool.clone(), registry());
-    let secrets = crate::secrets::r2b1d_connection_secrets();
+    let secrets = crate::secrets::ConnectionSecrets::platform_default();
     let mut input = banto_tags::PlcConnectionInput {
         name: "pg".to_string(),
         protocol: "postgres".to_string(),
@@ -608,7 +608,7 @@ async fn the_integrity_check_reports_missing_rows_and_deletes_orphans() {
 async fn the_integrity_check_reports_malformed_references() {
     let pool = crate::db::init_db_memory().await.unwrap();
     let service = PlcConnectionService::with_registry(pool.clone(), registry());
-    let secrets = crate::secrets::r2b1d_connection_secrets();
+    let secrets = crate::secrets::ConnectionSecrets::platform_default();
     let mut ids = Vec::new();
     for (name, password) in [
         ("pg-number", r#"{"$secret":123}"#),
@@ -682,5 +682,840 @@ fn the_refusal_message_lists_rows_problems_and_the_remedy() {
         "秘密値の行の数",
     ] {
         assert!(text.contains(want), "{want}: {text}");
+    }
+}
+
+// ---- R2b-1e: 秘密値の後処理（設計 §6.5・§6.6・§9 の「冪等」「キューの移設」） -----------
+//
+// 「Windows の Hub」は偽の protector（`crate::test_support::XorTestProtector`、全 OS で
+// DPAPI の経路の形）で、「非 Windows で作った DB」は protector 無し（`plain-v1`）で作る。
+// 本物の DPAPI での同じ確かめは `dpapi_upkeep`（`#[cfg(windows)]`、windows-latest の CI）。
+
+const UPKEEP_PG_PASSWORD: &str = "TOPSECRET-upkeep-pg-41ab";
+const UPKEEP_QUEUED_PASSWORD: &str = "TOPSECRET-upkeep-queue-77cd";
+const UPKEEP_LEGACY_PASSWORD: &str = "TOPSECRET-upkeep-legacy-02ef";
+
+/// 封印していない（非 Windows の Hub の）[`crate::secrets::ConnectionSecrets`]。
+fn plain_secrets() -> crate::secrets::ConnectionSecrets {
+    crate::secrets::ConnectionSecrets::new(None)
+}
+
+fn base64_of(text: &str) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::STANDARD.encode(text.as_bytes())
+}
+
+/// `path` の DB と `-wal`（あれば）のバイト列に、`secrets` のどれか（とその base64）が
+/// 含まれていれば、その名前を返す。
+fn leaked_in_files(path: &Path, secrets: &[&str]) -> Vec<String> {
+    let mut leaks = Vec::new();
+    for file in [
+        path.to_path_buf(),
+        PathBuf::from(format!("{}-wal", path.display())),
+    ] {
+        let Ok(bytes) = std::fs::read(&file) else {
+            continue;
+        };
+        for secret in secrets {
+            for needle in [secret.to_string(), base64_of(secret)] {
+                if contains(&bytes, &needle) {
+                    leaks.push(format!("{} in {}", needle, file.display()));
+                }
+            }
+        }
+    }
+    leaks
+}
+
+/// R2b-1d 以降の形の DB（`init_db_with_registry` の新規の DB）に、非 Windows の Hub が
+/// 書いた形の中身を入れる: `plain-v1` の秘密の行を持つ postgres 接続と、5 つの状態
+/// （`pending`・`applying`・`failed`・`applied`・`canceled`）の `plain-v1` の
+/// `sealedPassword` を持つキューの行、R2b-1e より前の平文の `password` を持つキューの行
+/// （`pending` と `applied`）。接続 id と、状態ごとのキューの id を返す。
+async fn seed_non_windows_secrets(pool: &SqlitePool) -> (i64, Vec<(String, i64)>) {
+    let service = PlcConnectionService::with_registry(pool.clone(), registry());
+    let conn = service
+        .create(banto_tags::PlcConnectionInput {
+            name: "pg".to_string(),
+            protocol: "postgres".to_string(),
+            host: "db".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: String::new(),
+            cpu_type: None,
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            secrets: crate::secrets::password_changes(&plain_secrets(), Some(UPKEEP_PG_PASSWORD))
+                .unwrap(),
+            settings: None,
+        })
+        .await
+        .unwrap();
+    let mut queue = Vec::new();
+    for state in ["pending", "applying", "failed", "applied", "canceled"] {
+        let sealed = plain_secrets()
+            .seal(banto_tags::PASSWORD_KEY, UPKEEP_QUEUED_PASSWORD)
+            .unwrap();
+        let payload = serde_json::json!({ "input": {
+            "name": format!("pg-{state}"), "protocol": "postgres", "host": "db", "port": 5432,
+            "database": "erp", "username": "reader",
+            "sealedPassword": crate::secrets::sealed_password_json(&sealed),
+        }});
+        queue.push((
+            state.to_string(),
+            insert_queue_row(pool, state, "plc_connections.create", &payload).await,
+        ));
+    }
+    for state in ["pending", "applied"] {
+        let payload = serde_json::json!({ "id": conn.id, "input": {
+            "name": "pg", "protocol": "postgres", "host": "db", "port": 5432,
+            "password": UPKEEP_LEGACY_PASSWORD,
+        }});
+        queue.push((
+            format!("legacy-{state}"),
+            insert_queue_row(pool, state, "plc_connections.update", &payload).await,
+        ));
+    }
+    (conn.id, queue)
+}
+
+async fn insert_queue_row(
+    pool: &SqlitePool,
+    state: &str,
+    source: &str,
+    payload: &serde_json::Value,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO pending_changes (state, source, payload, base_configured_revision) \
+         VALUES (?, ?, ?, 0) RETURNING id",
+    )
+    .bind(state)
+    .bind(source)
+    .bind(payload.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn queue_payload(pool: &SqlitePool, id: i64) -> serde_json::Value {
+    let text: String = sqlx::query_scalar("SELECT payload FROM pending_changes WHERE id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    serde_json::from_str(&text).unwrap()
+}
+
+async fn vacuum_mark(pool: &SqlitePool) -> Option<String> {
+    sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
+        .bind(VACUUM_PENDING_KEY)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+}
+
+async fn secret_rows_of(pool: &SqlitePool) -> Vec<banto_tags::StoredSecretRow> {
+    banto_tags::connection_secret::load_all_secret_rows(pool)
+        .await
+        .unwrap()
+}
+
+/// 全部の行とペイロードの写し（「何も変わっていない」を比べるため）。
+async fn snapshot_secrets(pool: &SqlitePool) -> (Vec<(String, String, Vec<u8>)>, Vec<String>) {
+    let rows: Vec<(String, String, Vec<u8>)> =
+        sqlx::query_as("SELECT ref, scheme, blob FROM plc_connection_secrets ORDER BY ref")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let payloads: Vec<String> =
+        sqlx::query_scalar("SELECT payload FROM pending_changes ORDER BY id")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    (rows, payloads)
+}
+
+/// §9「キューの移設」と §6.5 の (a)〜(e): 非 Windows で作った DB を「Windows の Hub」（偽の
+/// protector）の後処理にかけると、`plain-v1` の秘密の行は同じ参照のまま封印し直され、
+/// 未適用の 3 つのキューの行は封印し直され（平文の `password` の行も封印され）、履歴の 2 つ
+/// からは `password` も `sealedPassword` も消える。印を立てて VACUUM し、DB・WAL のバイト列に
+/// 既知のパスワード（と base64）が無い。2 回目は何も書かない（冪等）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_upkeep_reseals_rows_and_the_queue_strips_history_and_is_idempotent() {
+    let dir = TempDir::new("upkeep-relocate");
+    let path = dir.path().join("banto-hub.sqlite3");
+    let pool = crate::db::init_db_with_registry(&path, &registry())
+        .await
+        .unwrap();
+    let (conn_id, queue) = seed_non_windows_secrets(&pool).await;
+    let before = secret_rows_of(&pool).await;
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].sealed.scheme, "plain-v1");
+    let sealed_ref_before = |payload: &serde_json::Value| {
+        payload["input"]["sealedPassword"]["ref"]
+            .as_str()
+            .map(str::to_owned)
+    };
+    let mut refs_before = std::collections::HashMap::new();
+    for (label, id) in &queue {
+        refs_before.insert(
+            label.clone(),
+            sealed_ref_before(&queue_payload(&pool, *id).await),
+        );
+    }
+
+    let secrets = crate::test_support::protected_secrets();
+    let report = secrets_upkeep(&pool, &secrets).await;
+    assert_eq!(report.resealed_rows, 1, "{report:?}");
+    assert_eq!(report.sealed_queue, 1, "{report:?}");
+    assert_eq!(report.resealed_queue, 3, "{report:?}");
+    assert_eq!(report.stripped_history, 3, "{report:?}");
+    assert!(report.failures.is_empty(), "{report:?}");
+    assert_eq!(report.rewrite_error, None);
+    assert!(report.vacuumed, "{report:?}");
+    assert_eq!(report.vacuum_error, None);
+    assert_eq!(
+        vacuum_mark(&pool).await,
+        None,
+        "the mark is cleared after VACUUM"
+    );
+
+    // (a) the secret row: same reference, protected, opens to the same value.
+    let after = secret_rows_of(&pool).await;
+    assert_eq!(after.len(), 1);
+    assert_eq!(after[0].sealed.r#ref, before[0].sealed.r#ref);
+    assert_eq!(after[0].sealed.scheme, "dpapi-machine-v1");
+    assert!(!contains(&after[0].sealed.blob, UPKEEP_PG_PASSWORD));
+    let service = PlcConnectionService::with_registry(pool.clone(), registry());
+    let conn = service.get(conn_id).await.unwrap();
+    assert_eq!(
+        crate::secrets::open_connection_secret(&secrets, &conn, "password", &after)
+            .unwrap()
+            .unwrap()
+            .as_str(),
+        UPKEEP_PG_PASSWORD
+    );
+
+    // (b)(c)(d) the queue.
+    for (label, id) in &queue {
+        let payload = queue_payload(&pool, *id).await;
+        let input = &payload["input"];
+        let unapplied =
+            ["pending", "applying", "failed", "legacy-pending"].contains(&label.as_str());
+        assert!(input.get("password").is_none(), "{label}: {payload}");
+        if unapplied {
+            let sealed = crate::secrets::parse_sealed_password(&input["sealedPassword"]).unwrap();
+            assert_eq!(sealed.scheme.as_str(), "dpapi-machine-v1", "{label}");
+            let want = if label.starts_with("legacy") {
+                UPKEEP_LEGACY_PASSWORD
+            } else {
+                // Resealed under the same reference (design §6.5).
+                assert_eq!(
+                    Some(sealed.r#ref.as_str().to_owned()),
+                    refs_before[label],
+                    "{label}"
+                );
+                UPKEEP_QUEUED_PASSWORD
+            };
+            assert_eq!(
+                secrets.open("password", &sealed).unwrap().as_str(),
+                want,
+                "{label}"
+            );
+        } else {
+            assert!(input.get("sealedPassword").is_none(), "{label}: {payload}");
+            assert_eq!(input["passwordSet"], serde_json::json!(true), "{label}");
+        }
+    }
+
+    // The second start: nothing to rewrite, no mark, no VACUUM.
+    let snapshot = snapshot_secrets(&pool).await;
+    let again = secrets_upkeep(&pool, &secrets).await;
+    assert_eq!(
+        again,
+        UpkeepReport::default(),
+        "the second run writes nothing"
+    );
+    assert_eq!(vacuum_mark(&pool).await, None);
+    assert_eq!(snapshot_secrets(&pool).await, snapshot);
+
+    pool.close().await;
+    let leaks = leaked_in_files(
+        &path,
+        &[
+            UPKEEP_PG_PASSWORD,
+            UPKEEP_QUEUED_PASSWORD,
+            UPKEEP_LEGACY_PASSWORD,
+        ],
+    );
+    assert!(
+        leaks.is_empty(),
+        "known passwords left in the files: {leaks:?}"
+    );
+}
+
+/// §6.6「後処理（§6.5）の途中」: 工程 1 の commit の前に落ちると、トランザクションごと戻り
+/// （行もキューも印も変わらない）、次の起動の後処理が最後までやる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failure_inside_the_upkeep_rolls_back_and_the_next_start_completes() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    seed_non_windows_secrets(&pool).await;
+    let snapshot = snapshot_secrets(&pool).await;
+    let secrets = crate::test_support::protected_secrets();
+
+    let err = rewrite_secrets_failing_before_commit(&pool, &secrets)
+        .await
+        .expect_err("the injected failure");
+    assert!(err.to_string().contains("注入"), "{err}");
+    assert_eq!(snapshot_secrets(&pool).await, snapshot, "rolled back");
+    assert_eq!(
+        vacuum_mark(&pool).await,
+        None,
+        "the mark rolled back with it"
+    );
+
+    let report = secrets_upkeep(&pool, &secrets).await;
+    assert!(report.rewrote(), "{report:?}");
+    assert!(report.vacuumed, "{report:?}");
+    assert_eq!(
+        secret_rows_of(&pool).await[0].sealed.scheme,
+        "dpapi-machine-v1"
+    );
+    assert_eq!(
+        secrets_upkeep(&pool, &secrets).await,
+        UpkeepReport::default()
+    );
+}
+
+/// §6.6「1 の commit の後・VACUUM の前」（2026-10-21 再レビュー P2）: 印の無い DB
+/// （前の起動で印を消した後）で再処理を commit した直後に落ちても、印が同じトランザクションで
+/// 立っているので、次の起動で VACUUM だけが走り、DB・WAL のバイト列に既知のパスワードが無い。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_crash_after_the_rewrite_commit_is_vacuumed_by_the_next_start() {
+    let dir = TempDir::new("upkeep-crash-before-vacuum");
+    let path = dir.path().join("banto-hub.sqlite3");
+    let pool = crate::db::init_db_with_registry(&path, &registry())
+        .await
+        .unwrap();
+    seed_non_windows_secrets(&pool).await;
+    assert_eq!(vacuum_mark(&pool).await, None, "no mark before the rewrite");
+    let secrets = crate::test_support::protected_secrets();
+
+    // Step 1 only: committed, then the process "dies" before step 2.
+    let report = rewrite_secrets(&pool, &secrets).await.unwrap();
+    assert!(report.rewrote(), "{report:?}");
+    assert_eq!(vacuum_mark(&pool).await.as_deref(), Some("true"));
+    pool.close().await;
+
+    // The next start: nothing left to rewrite, but the mark makes it VACUUM.
+    let pool = crate::db::init_db_with_registry(&path, &registry())
+        .await
+        .unwrap();
+    let report = secrets_upkeep(&pool, &secrets).await;
+    assert!(!report.rewrote(), "{report:?}");
+    assert!(report.vacuumed, "{report:?}");
+    assert_eq!(vacuum_mark(&pool).await, None);
+    pool.close().await;
+    let leaks = leaked_in_files(
+        &path,
+        &[
+            UPKEEP_PG_PASSWORD,
+            UPKEEP_QUEUED_PASSWORD,
+            UPKEEP_LEGACY_PASSWORD,
+        ],
+    );
+    assert!(
+        leaks.is_empty(),
+        "known passwords left in the files: {leaks:?}"
+    );
+}
+
+/// §6.5 の最後: 封印し直しの失敗（DPAPI の失敗）は起動を止めず、その行は `plain-v1` のまま
+/// 残して結果に数える。状態の画面の件数（`plaintext_remaining`）に出る。履歴の行からの除去は
+/// 封印が要らないので進む。protector の無い（非 Windows の）Hub では平文が既定なので件数は 0。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_reseal_keeps_the_row_and_is_counted_as_remaining_plaintext() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    seed_non_windows_secrets(&pool).await;
+    let failing = crate::secrets::ConnectionSecrets::new(Some(Arc::new(
+        crate::test_support::FailingProtector,
+    )));
+
+    let report = secrets_upkeep(&pool, &failing).await;
+    // 1 secret row + the legacy pending row (seal) + 3 unapplied plain-v1 rows (reseal).
+    assert_eq!(report.failures.len(), 5, "{report:?}");
+    assert!(report.failures.iter().all(
+        |f| !f.error.contains(UPKEEP_PG_PASSWORD) && !f.error.contains(UPKEEP_QUEUED_PASSWORD)
+    ));
+    assert_eq!(
+        report.resealed_rows + report.sealed_queue + report.resealed_queue,
+        0
+    );
+    assert_eq!(report.stripped_history, 3, "{report:?}");
+    assert!(report.vacuumed, "{report:?}");
+    assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
+    assert_eq!(plaintext_remaining(&pool, &failing).await.unwrap(), 5);
+    assert_eq!(
+        plaintext_remaining(&pool, &plain_secrets()).await.unwrap(),
+        0
+    );
+
+    // Once the protector works, the rows are resealed and nothing remains.
+    let secrets = crate::test_support::protected_secrets();
+    let report = secrets_upkeep(&pool, &secrets).await;
+    assert_eq!(report.resealed_rows, 1, "{report:?}");
+    assert!(report.failures.is_empty(), "{report:?}");
+    assert_eq!(plaintext_remaining(&pool, &secrets).await.unwrap(), 0);
+}
+
+const MOVE_PASSWORD: &str = "TOPSECRET-move-to-history-5e1a";
+
+/// 接続の作成の提案を `state` で 1 行積む。パスワードは `secrets` で封印した
+/// `sealedPassword`。
+async fn insert_sealed_queue_row(
+    pool: &SqlitePool,
+    state: &str,
+    secrets: &crate::secrets::ConnectionSecrets,
+) -> i64 {
+    let sealed = secrets
+        .seal(banto_tags::PASSWORD_KEY, MOVE_PASSWORD)
+        .unwrap();
+    let payload = serde_json::json!({ "input": {
+        "name": "pg-move", "protocol": "postgres", "host": "db", "port": 5432,
+        "database": "erp", "username": "reader",
+        "sealedPassword": crate::secrets::sealed_password_json(&sealed),
+    }});
+    insert_queue_row(pool, state, "plc_connections.create", &payload).await
+}
+
+async fn move_to_history(
+    service: &crate::pending_changes::PendingChangesService,
+    via_cancel: bool,
+    id: i64,
+) {
+    if via_cancel {
+        service.cancel_pending(id).await.unwrap();
+    } else {
+        service.mark_applied(id).await.unwrap();
+    }
+}
+
+/// #778 のレビュー P2: 起動時の封印し直しに失敗して未適用キューに平文が残り、その起動の
+/// VACUUM で印が消えた後に、取り消し / 適用で履歴へ移しても、平文を外したので同じ
+/// トランザクションで清掃待ちの印が立つ。次の起動で VACUUM が走り、印が消え、DB・WAL に
+/// 既知のパスワードが残らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_plaintext_row_to_history_marks_the_database_for_vacuum() {
+    for (via_cancel, state) in [(true, "pending"), (false, "applying")] {
+        let dir = TempDir::new("upkeep-move-history");
+        let path = dir.path().join("banto-hub.sqlite3");
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let id = insert_sealed_queue_row(&pool, state, &plain_secrets()).await;
+        let failing = crate::secrets::ConnectionSecrets::new(Some(Arc::new(
+            crate::test_support::FailingProtector,
+        )));
+
+        // The reseal fails, the row keeps the plain-v1 value; the VACUUM of this start
+        // (forced by a mark) clears the mark.
+        set_vacuum_pending(&pool).await.unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert_eq!(report.failures.len(), 1, "{report:?}");
+        assert!(report.vacuumed, "{report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{state}");
+        assert_eq!(
+            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            "plain-v1"
+        );
+
+        // Moving it to history strips the plain value and marks the database.
+        let service = crate::pending_changes::PendingChangesService::new(pool.clone());
+        move_to_history(&service, via_cancel, id).await;
+        assert!(queue_payload(&pool, id).await["input"]
+            .get("sealedPassword")
+            .is_none());
+        assert_eq!(vacuum_mark(&pool).await.as_deref(), Some("true"), "{state}");
+        pool.close().await;
+
+        // The next start: nothing to rewrite, the mark makes it VACUUM.
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert!(!report.rewrote(), "{report:?}");
+        assert!(report.vacuumed, "{report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None);
+        pool.close().await;
+        let leaks = leaked_in_files(&path, &[MOVE_PASSWORD]);
+        assert!(leaks.is_empty(), "{state}: left in the files: {leaks:?}");
+    }
+}
+
+/// 上の逆: DPAPI で封印した `sealedPassword` だけを履歴へ移すときは、空きページに残るのは
+/// 暗号文で平文ではないので、印を立てない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn moving_a_dpapi_sealed_row_to_history_does_not_mark_the_database() {
+    for (via_cancel, state) in [(true, "pending"), (false, "applying")] {
+        let pool = crate::db::init_db_memory().await.unwrap();
+        let id =
+            insert_sealed_queue_row(&pool, state, &crate::test_support::protected_secrets()).await;
+        assert_eq!(
+            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            "dpapi-machine-v1"
+        );
+        let service = crate::pending_changes::PendingChangesService::new(pool.clone());
+        move_to_history(&service, via_cancel, id).await;
+        assert!(queue_payload(&pool, id).await["input"]
+            .get("sealedPassword")
+            .is_none());
+        assert_eq!(vacuum_mark(&pool).await, None, "{state}");
+    }
+}
+
+/// 非 Windows の Hub（protector 無し）の後処理: `plain-v1` の行はそのまま（封印し直さない）、
+/// 古い平文の `password` のキューの行は `plain-v1` の `sealedPassword` に揃え、履歴からは外す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_upkeep_without_a_protector_only_normalizes_the_queue() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    let (_, queue) = seed_non_windows_secrets(&pool).await;
+    let report = secrets_upkeep(&pool, &plain_secrets()).await;
+    assert_eq!(report.resealed_rows, 0, "{report:?}");
+    assert_eq!(report.resealed_queue, 0, "{report:?}");
+    assert_eq!(report.sealed_queue, 1, "{report:?}");
+    assert_eq!(report.stripped_history, 3, "{report:?}");
+    assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
+    let legacy = queue
+        .iter()
+        .find(|(label, _)| label == "legacy-pending")
+        .unwrap()
+        .1;
+    let payload = queue_payload(&pool, legacy).await;
+    assert!(payload["input"].get("password").is_none(), "{payload}");
+    assert_eq!(payload["input"]["sealedPassword"]["scheme"], "plain-v1");
+    assert_eq!(
+        secrets_upkeep(&pool, &plain_secrets()).await,
+        UpkeepReport::default()
+    );
+}
+
+const REMOVED_PASSWORD: &str = "TOPSECRET-removed-plain-row-c4d9";
+const REPLACING_PASSWORD: &str = "TOPSECRET-replacing-pw-8b20";
+
+/// banto-tags の清掃の記録（migration 0026 のトリガ）。
+async fn tags_cleanup(pool: &SqlitePool) -> i64 {
+    banto_tags::connection_secret::plain_secret_cleanup_pending(pool)
+        .await
+        .unwrap()
+}
+
+/// #778 のレビュー P2 で `plain-v1` の行を消す・書き換える経路。
+#[derive(Debug, Clone, Copy)]
+enum PlainRowRemoval {
+    /// パスワードの入れ替え（`Set`: 古い行は消える）。
+    Replace,
+    /// パスワードの消去（`Clear`）。
+    Clear,
+    /// プロトコルの変更（postgres → modbus-tcp）。
+    ProtocolChange,
+    /// 接続の削除。
+    Delete,
+    /// 接続の一括削除（カスケード）。
+    CascadeDelete,
+    /// 起動時の整合の確認が消す参照の無い行。
+    IntegrityOrphan,
+}
+
+fn postgres_input_with(
+    secrets: banto_tags::SecretChanges,
+    protocol: &str,
+) -> banto_tags::PlcConnectionInput {
+    let postgres = protocol == "postgres";
+    banto_tags::PlcConnectionInput {
+        name: "pg-removal".to_string(),
+        protocol: protocol.to_string(),
+        host: "db".to_string(),
+        port: if postgres { 5432 } else { 502 },
+        unit_id: 1,
+        enabled: true,
+        simulation: false,
+        word_order: if postgres {
+            String::new()
+        } else {
+            "low_high".to_string()
+        },
+        cpu_type: None,
+        database: postgres.then(|| "erp".to_string()),
+        username: postgres.then(|| "reader".to_string()),
+        secrets,
+        settings: None,
+    }
+}
+
+/// `removal` の書き込みを `tx` の中で行う（`IntegrityOrphan` は `check_secret_integrity` が
+/// 自分のトランザクションで行うので、ここでは同じ DELETE を `tx` で流す）。
+async fn remove_plain_row_in(
+    tx: &mut sqlx::SqliteConnection,
+    service: &PlcConnectionService,
+    removal: PlainRowRemoval,
+    id: i64,
+) {
+    use PlainRowRemoval::*;
+    let plain = plain_secrets();
+    match removal {
+        Replace => {
+            let changes =
+                crate::secrets::password_changes(&plain, Some(REPLACING_PASSWORD)).unwrap();
+            service
+                .update_tx(tx, id, postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap();
+        }
+        Clear => {
+            let changes = crate::secrets::password_changes(&plain, Some("")).unwrap();
+            service
+                .update_tx(tx, id, postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap();
+        }
+        ProtocolChange => {
+            service
+                .update_tx(
+                    tx,
+                    id,
+                    postgres_input_with(Default::default(), "modbus-tcp"),
+                )
+                .await
+                .unwrap();
+        }
+        Delete => service.delete_tx(tx, id).await.unwrap(),
+        CascadeDelete => {
+            service.cascade_delete_tx(tx, id).await.unwrap();
+        }
+        IntegrityOrphan => {
+            sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+    }
+}
+
+/// #778 のレビュー P2（Codex）: 起動時の封印し直しに失敗して `plain-v1` のまま残った秘密の
+/// 行が、その起動の VACUUM で印が消えた**後に**、パスワードの入れ替え・消去・プロトコルの
+/// 変更・接続の削除・一括削除・整合の確認の孤児の削除で消えても、消した書き込みと同じ
+/// トランザクションで清掃が記録される（戻した書き込みは記録も戻る）。次の起動で VACUUM が
+/// 走って記録が 0 に戻り、DB・WAL のバイト列に消したパスワード（と base64）が無い。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_plain_secret_row_after_the_vacuum_is_vacuumed_by_the_next_start() {
+    use PlainRowRemoval::*;
+    for removal in [
+        Replace,
+        Clear,
+        ProtocolChange,
+        Delete,
+        CascadeDelete,
+        IntegrityOrphan,
+    ] {
+        let dir = TempDir::new("upkeep-plain-row-removal");
+        let path = dir.path().join("banto-hub.sqlite3");
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let service = PlcConnectionService::with_registry(pool.clone(), registry());
+        let conn = if matches!(removal, IntegrityOrphan) {
+            // A connection without a password, and a plain-v1 row no setting refers to.
+            let conn = service
+                .create(postgres_input_with(Default::default(), "postgres"))
+                .await
+                .unwrap();
+            sqlx::query(
+                "INSERT INTO plc_connection_secrets (ref, connection_id, key, scheme, blob) \
+                 VALUES ('0123456789abcdef0123456789abcdef', ?, 'token', 'plain-v1', ?)",
+            )
+            .bind(conn.id)
+            .bind(REMOVED_PASSWORD.as_bytes())
+            .execute(&pool)
+            .await
+            .unwrap();
+            conn
+        } else {
+            let changes =
+                crate::secrets::password_changes(&plain_secrets(), Some(REMOVED_PASSWORD)).unwrap();
+            service
+                .create(postgres_input_with(changes, "postgres"))
+                .await
+                .unwrap()
+        };
+        let failing = crate::secrets::ConnectionSecrets::new(Some(Arc::new(
+            crate::test_support::FailingProtector,
+        )));
+
+        // The reseal fails, the row stays plain-v1; this start's VACUUM (forced by a mark)
+        // clears every mark.
+        set_vacuum_pending(&pool).await.unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert_eq!(report.failures.len(), 1, "{removal:?}: {report:?}");
+        assert!(report.vacuumed, "{removal:?}: {report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{removal:?}");
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}");
+        assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
+
+        // A failed write (rolled back) leaves the row and no record.
+        let mut tx = pool.begin().await.unwrap();
+        remove_plain_row_in(&mut tx, &service, removal, conn.id).await;
+        assert!(
+            tags_cleanup_in(&mut tx).await > 0,
+            "{removal:?}: counted inside"
+        );
+        drop(tx);
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}: rolled back");
+        assert_eq!(secret_rows_of(&pool).await.len(), 1, "{removal:?}");
+
+        // The write commits: the plain-v1 row is gone and the record is set with it.
+        if matches!(removal, IntegrityOrphan) {
+            let report = check_secret_integrity(&pool).await.unwrap();
+            assert_eq!(report.orphans.len(), 1, "{report:?}");
+        } else {
+            let mut tx = pool.begin().await.unwrap();
+            remove_plain_row_in(&mut tx, &service, removal, conn.id).await;
+            tx.commit().await.unwrap();
+        }
+        assert!(
+            secret_rows_of(&pool)
+                .await
+                .iter()
+                .all(|row| !contains(&row.sealed.blob, REMOVED_PASSWORD)),
+            "{removal:?}"
+        );
+        assert_eq!(tags_cleanup(&pool).await, 1, "{removal:?}");
+        // Still counted as live plaintext only while a plain-v1 row is live.
+        let remaining = plaintext_remaining(&pool, &failing).await.unwrap();
+        let live = u64::from(matches!(removal, Replace));
+        assert_eq!(remaining, live, "{removal:?}");
+        pool.close().await;
+
+        // The next start VACUUMs and clears the record.
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let report = secrets_upkeep(&pool, &failing).await;
+        assert!(!report.rewrote(), "{removal:?}: {report:?}");
+        assert!(report.vacuumed, "{removal:?}: {report:?}");
+        assert_eq!(vacuum_mark(&pool).await, None, "{removal:?}");
+        assert_eq!(tags_cleanup(&pool).await, 0, "{removal:?}");
+        // The start after that has nothing to clean.
+        assert!(
+            !secrets_upkeep(&pool, &failing).await.vacuumed,
+            "{removal:?}"
+        );
+        pool.close().await;
+        let leaks = leaked_in_files(&path, &[REMOVED_PASSWORD]);
+        assert!(
+            leaks.is_empty(),
+            "{removal:?}: left in the files: {leaks:?}"
+        );
+    }
+}
+
+async fn tags_cleanup_in(conn: &mut sqlx::SqliteConnection) -> i64 {
+    banto_tags::connection_secret::plain_secret_cleanup_pending(&mut *conn)
+        .await
+        .unwrap()
+}
+
+/// 上の逆: `dpapi-machine-v1` の行（暗号文）を消しても清掃は記録しない（VACUUM しない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_dpapi_secret_row_does_not_mark_the_database() {
+    let pool = crate::db::init_db_memory().await.unwrap();
+    let secrets = crate::test_support::protected_secrets();
+    let service = PlcConnectionService::with_registry(pool.clone(), registry());
+    let changes = crate::secrets::password_changes(&secrets, Some(REMOVED_PASSWORD)).unwrap();
+    let conn = service
+        .create(postgres_input_with(changes, "postgres"))
+        .await
+        .unwrap();
+    assert_eq!(
+        secret_rows_of(&pool).await[0].sealed.scheme,
+        "dpapi-machine-v1"
+    );
+    let changes = crate::secrets::password_changes(&secrets, Some(REPLACING_PASSWORD)).unwrap();
+    service
+        .update(conn.id, postgres_input_with(changes, "postgres"))
+        .await
+        .unwrap();
+    service.delete(conn.id).await.unwrap();
+    assert_eq!(tags_cleanup(&pool).await, 0);
+    assert_eq!(vacuum_mark(&pool).await, None);
+    assert!(!secrets_upkeep(&pool, &secrets).await.vacuumed);
+}
+
+/// 本物の DPAPI（machine スコープ）での §9「キューの移設」「平文が残らない」。
+/// windows-latest の CI で走る。
+#[cfg(windows)]
+mod dpapi_upkeep {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_windows_hub_reseals_a_non_windows_database_with_dpapi() {
+        let dir = TempDir::new("upkeep-dpapi");
+        let path = dir.path().join("banto-hub.sqlite3");
+        let pool = crate::db::init_db_with_registry(&path, &registry())
+            .await
+            .unwrap();
+        let (conn_id, queue) = seed_non_windows_secrets(&pool).await;
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
+        assert_eq!(
+            secrets.seal_scheme(),
+            crate::secrets::SecretScheme::DpapiMachineV1
+        );
+
+        let report = secrets_upkeep(&pool, &secrets).await;
+        assert_eq!(report.resealed_rows, 1, "{report:?}");
+        assert_eq!(report.resealed_queue, 3, "{report:?}");
+        assert_eq!(report.sealed_queue, 1, "{report:?}");
+        assert_eq!(report.stripped_history, 3, "{report:?}");
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert!(report.vacuumed, "{report:?}");
+        assert_eq!(plaintext_remaining(&pool, &secrets).await.unwrap(), 0);
+
+        let rows = secret_rows_of(&pool).await;
+        assert_eq!(rows[0].sealed.scheme, "dpapi-machine-v1");
+        let conn = PlcConnectionService::with_registry(pool.clone(), registry())
+            .get(conn_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            crate::secrets::open_connection_secret(&secrets, &conn, "password", &rows)
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            UPKEEP_PG_PASSWORD
+        );
+        for (label, id) in &queue {
+            let payload = queue_payload(&pool, *id).await;
+            if let Some(value) = payload["input"].get("sealedPassword") {
+                let sealed = crate::secrets::parse_sealed_password(value).unwrap();
+                assert_eq!(sealed.scheme.as_str(), "dpapi-machine-v1", "{label}");
+                assert!(secrets.open("password", &sealed).is_ok(), "{label}");
+            }
+            assert!(payload["input"].get("password").is_none(), "{label}");
+        }
+        pool.close().await;
+        let leaks = leaked_in_files(
+            &path,
+            &[
+                UPKEEP_PG_PASSWORD,
+                UPKEEP_QUEUED_PASSWORD,
+                UPKEEP_LEGACY_PASSWORD,
+            ],
+        );
+        assert!(
+            leaks.is_empty(),
+            "known passwords left in the files: {leaks:?}"
+        );
     }
 }

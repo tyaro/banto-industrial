@@ -12,6 +12,7 @@ mod ingest_status;
 mod ingest_ws;
 mod postgres_connections;
 mod r2b1d_secrets;
+mod r2b1e_secrets;
 mod session_revocation;
 mod sink;
 mod store_retention;

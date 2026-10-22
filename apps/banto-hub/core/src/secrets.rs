@@ -9,14 +9,17 @@
 //! `connection_secret`）に置き、接続の `settings` には値の代わりに参照
 //! `{"$secret": "<ref>"}` を置く（設計 §3.3）。
 //!
-//! R2b-1d（part A）から配線した: REST・MCP・未適用キューの適用の入口が
-//! [`password_changes`] で平文を封印して banto-tags へ渡し、読む側（DB Source の計画・
-//! 接続のテスト・`GET /api/sink/config`・`GET /api/ingest/bridge-config`）が
-//! [`open_connection_secret`] で使う直前に開く。封印は全 OS で `plain-v1`
-//! （[`r2b1d_connection_secrets`]）。R2b-1d（part B）で、読めないものを空に潰さず
-//! `passwordState`（[`secret_state`]）・`unavailableConnections` / `unavailableSources`・
-//! DB Source の「パスワードを読めません」に出すところまで配線した。Windows の DPAPI・
-//! 起動時の封印し直しは R2b-1e。
+//! R2b-1d から配線した: REST・MCP・未適用キューの適用の入口が [`password_changes`] で
+//! 平文を封印して banto-tags へ渡し、読む側（DB Source の接続を張る直前・接続のテスト・
+//! `GET /api/sink/config`・`GET /api/ingest/bridge-config`）が [`open_connection_secret`] で
+//! 使う直前に開く。読めないものは空に潰さず `passwordState`（[`secret_state`]）・
+//! `unavailableConnections` / `unavailableSources`・DB Source の「パスワード: 読めません」に出す。
+//!
+//! R2b-1e から、Hub の本番の経路はすべて [`ConnectionSecrets::platform_default`] で封印する:
+//! **Windows は DPAPI の machine スコープ（`dpapi-machine-v1`）、それ以外は `plain-v1`**
+//! （設計 §5.8）。未適用キューにも積む時点で封印した値（[`sealed_password_json`]）を載せ
+//! （`crate::pending_changes`）、起動時の後処理（`crate::upgrade::secrets_upkeep`、設計 §6.5）が
+//! `plain-v1` の行と古いキューの行を封印し直す。
 //!
 //! # なぜ DB に DPAPI の blob を置くか（設計 §5.1 の Q1 (c)）
 //!
@@ -74,8 +77,9 @@
 //!
 //! - DB への読み書き・参照と行の整合の確認（R2b-1d・設計 §5.3）。行が無い参照の
 //!   [`UnreadableReason::Missing`] は、それを見つけた呼び出し側が作る。
-//! - 起動時の封印し直しの手順・`VACUUM`（R2b-1e・設計 §6.5）。ここは 1 件の
-//!   [`ConnectionSecrets::reseal_plain`] だけを持つ。
+//! - 起動時の封印し直しの手順・`VACUUM`（`crate::upgrade::secrets_upkeep`、設計 §6.5）。
+//!   ここは 1 件の [`ConnectionSecrets::reseal_plain`] と、キューのペイロードの JSON の形
+//!   （[`sealed_password_json`]・[`parse_sealed_password`]）だけを持つ。
 //! - ACL・ファイルの保存先（`FileSecretStore` は使わない）。
 
 use std::fmt;
@@ -97,6 +101,14 @@ pub const SECRET_REF_LEN: usize = REF_BYTES * 2;
 
 /// キーの名前の長さの上限（バイト）。
 pub const MAX_KEY_LEN: usize = 64;
+
+/// 非 Windows（protector が無い）の警告の文言（設計 §5.8。起動時のログと状態の画面の
+/// `secretStorage.plaintextWarning`）。
+pub const PLAINTEXT_STORAGE_WARNING: &str = "秘密値を平文で保存しています（Windows 以外）";
+
+/// Windows で封印し直せずに `plain-v1` のまま残った秘密値の警告の文言（設計 §6.5。状態の
+/// 画面の `secretStorage.plaintextRemainingWarning`）。
+pub const PLAINTEXT_REMAINING_WARNING: &str = "移行待ちの秘密値が平文で残っています";
 
 /// 封印の方式。DB の `plc_connection_secrets.scheme` 列に [`SecretScheme::as_str`] の
 /// 文字列で入る（設計 §3.1 の `CHECK (scheme IN ('plain-v1', 'dpapi-machine-v1'))`）。
@@ -304,6 +316,10 @@ pub enum SecretError {
     /// 壊れている。空のパスワードとして使わない（空に潰さない）。
     #[error("開いた秘密値が空です（保存された値が壊れています）")]
     EmptyStored,
+    /// 未適用キューのペイロードの封印した値（`sealedPassword`）の形が違う（参照・方式・
+    /// base64 の blob のどれか。R2b-1e）。値は載せない。
+    #[error("封印した秘密値の形が違います")]
+    MalformedSealed,
 }
 
 impl SecretError {
@@ -315,7 +331,8 @@ impl SecretError {
             Self::Unprotect(_)
             | Self::ProtectorUnavailable(_)
             | Self::NotUtf8
-            | Self::EmptyStored => Some(UnreadableReason::Undecryptable),
+            | Self::EmptyStored
+            | Self::MalformedSealed => Some(UnreadableReason::Undecryptable),
             Self::InvalidKey(_)
             | Self::InvalidRef
             | Self::UnknownScheme
@@ -517,23 +534,12 @@ impl ConnectionSecrets {
     }
 }
 
-// ---- R2b-1d: banto-tags の秘密の行との橋渡し（設計 §5.3・§5.4） ----------------------------
+// ---- banto-tags の秘密の行との橋渡し（設計 §5.3・§5.4） ----------------------------------
 //
 // banto-tags はこの crate に依存できないので、封印した値を同じ中身の
 // `banto_tags::SealedSecretRow`（`ref`・`scheme`・`blob`）で運ぶ。変換はここに置く。
-//
-// **R2b-1d（part A）の範囲**: 封印は全 OS で `plain-v1`（[`r2b1d_connection_secrets`]。設計 §10 の
-// R2b-1d の行「Windows でもこの PR では `plain-v1`」）。Windows の `dpapi-machine-v1` への
-// 切り替えと起動時の封印し直しは R2b-1e。
-
-/// R2b-1d の封印・開封に使う [`ConnectionSecrets`]: protector 無し（`plain-v1`）。
-///
-/// TODO(R2b-1e): `ConnectionSecrets::platform_default()` に替え、起動時に `plain-v1` の行を
-/// 封印し直す（設計 §6.5）。開封は今も `dpapi-machine-v1` を知っている（protector が無ければ
-/// [`SecretError::ProtectorUnavailable`] = 読めない）。
-pub fn r2b1d_connection_secrets() -> ConnectionSecrets {
-    ConnectionSecrets::new(None)
-}
+// R2b-1d は全 OS で `plain-v1` だった。R2b-1e から本番の経路は
+// [`ConnectionSecrets::platform_default`]（Windows は `dpapi-machine-v1`）。
 
 impl From<SealedSecret> for banto_tags::SealedSecretRow {
     fn from(sealed: SealedSecret) -> Self {
@@ -609,6 +615,24 @@ pub fn open_connection_secret(
     key: &str,
     rows: &[banto_tags::StoredSecretRow],
 ) -> Result<Option<Zeroizing<String>>, UnreadableReason> {
+    let Some(sealed) = find_sealed(conn, key, rows)? else {
+        return Ok(None);
+    };
+    secrets.open(key, &sealed).map(Some).map_err(|error| {
+        error
+            .unreadable_reason()
+            .unwrap_or(UnreadableReason::Undecryptable)
+    })
+}
+
+/// `conn` の `key` の参照を読み、その参照・接続・キーの行を封印した値として返す（開かない）。
+/// キーが無い → `Ok(None)`、参照の形が違う → `Invalid`、行が無い → `Missing`、行の参照・
+/// 方式の形が違う → `Undecryptable`。
+fn find_sealed(
+    conn: &banto_tags::PlcConnection,
+    key: &str,
+    rows: &[banto_tags::StoredSecretRow],
+) -> Result<Option<SealedSecret>, UnreadableReason> {
     let r#ref = match conn.secret_ref_lookup(key) {
         banto_tags::SecretRefLookup::Absent => return Ok(None),
         banto_tags::SecretRefLookup::Malformed => return Err(UnreadableReason::Invalid),
@@ -618,12 +642,78 @@ pub fn open_connection_secret(
         .iter()
         .find(|row| row.sealed.r#ref == r#ref && row.connection_id == conn.id && row.key == key)
         .ok_or(UnreadableReason::Missing)?;
-    let sealed =
-        SealedSecret::from_row(&row.sealed).map_err(|_| UnreadableReason::Undecryptable)?;
-    secrets.open(key, &sealed).map(Some).map_err(|error| {
-        error
+    SealedSecret::from_row(&row.sealed)
+        .map(Some)
+        .map_err(|_| UnreadableReason::Undecryptable)
+}
+
+/// 接続 `conn` の秘密のキー `key` の**封印した行**（R2b-1e、設計 §5.2・§5.4）。
+///
+/// DB Source の計画が平文の代わりに持つもの: 計画を組む時点で一度開けることを確かめ
+/// （平文はすぐ捨てる）、接続を張る直前に [`ConnectionSecrets::open`] で開き直す。
+/// 結果の意味は [`open_connection_secret`] と同じ（キーが無い → `Ok(None)`、読めない →
+/// `Err(理由)`。「無い」と「読めない」を分ける）。
+pub fn sealed_connection_secret(
+    secrets: &ConnectionSecrets,
+    conn: &banto_tags::PlcConnection,
+    key: &str,
+    rows: &[banto_tags::StoredSecretRow],
+) -> Result<Option<SealedSecret>, UnreadableReason> {
+    let Some(sealed) = find_sealed(conn, key, rows)? else {
+        return Ok(None);
+    };
+    match secrets.open(key, &sealed) {
+        Ok(_plain) => Ok(Some(sealed)),
+        Err(error) => Err(error
             .unreadable_reason()
-            .unwrap_or(UnreadableReason::Undecryptable)
+            .unwrap_or(UnreadableReason::Undecryptable)),
+    }
+}
+
+// ---- 未適用キューのペイロードの封印した値（R2b-1e、設計 §5.3） ------------------------------
+
+/// キューのペイロード（`input.sealedPassword`）の封印した値の JSON の形:
+/// `{"ref": "<32 文字の小文字 16 進>", "scheme": "plain-v1" | "dpapi-machine-v1",
+/// "blob": "<base64>"}`（設計 §5.3 の「未適用キューに積む」の行）。
+///
+/// 注意: `plain-v1` の blob は平文そのものの base64 なので、この値も外へ返さない
+/// （応答の写しは `crate::pending_changes::redact_queued_password` が `passwordSet` に替える）。
+pub fn sealed_password_json(sealed: &SealedSecret) -> serde_json::Value {
+    use base64::Engine as _;
+    serde_json::json!({
+        "ref": sealed.r#ref.as_str(),
+        "scheme": sealed.scheme.as_str(),
+        "blob": base64::engine::general_purpose::STANDARD.encode(&*sealed.blob),
+    })
+}
+
+/// [`sealed_password_json`] の形を読む。参照・方式・blob のどれかが違えば
+/// [`SecretError::MalformedSealed`] / [`SecretError::InvalidRef`] /
+/// [`SecretError::UnknownScheme`]（値は載せない）。余計なキーは断る。
+pub fn parse_sealed_password(value: &serde_json::Value) -> Result<SealedSecret, SecretError> {
+    use base64::Engine as _;
+    let object = value.as_object().ok_or(SecretError::MalformedSealed)?;
+    if object.len() != 3 {
+        return Err(SecretError::MalformedSealed);
+    }
+    let field = |name: &str| {
+        object
+            .get(name)
+            .and_then(serde_json::Value::as_str)
+            .ok_or(SecretError::MalformedSealed)
+    };
+    let r#ref = SecretRef::parse(field("ref")?)?;
+    let scheme = SecretScheme::parse(field("scheme")?)?;
+    let blob = base64::engine::general_purpose::STANDARD
+        .decode(field("blob")?)
+        .map_err(|_| SecretError::MalformedSealed)?;
+    if blob.is_empty() {
+        return Err(SecretError::MalformedSealed);
+    }
+    Ok(SealedSecret {
+        r#ref,
+        scheme,
+        blob: Zeroizing::new(blob),
     })
 }
 
@@ -910,6 +1000,7 @@ mod tests {
             SecretError::ProtectorUnavailable(SecretScheme::DpapiMachineV1),
             SecretError::NotUtf8,
             SecretError::EmptyStored,
+            SecretError::MalformedSealed,
         ];
         for err in errors {
             assert_no_leak(&format!("{err} {err:?}"), &sealed);
@@ -1159,7 +1250,7 @@ mod r2b1d_tests {
 
     #[test]
     fn password_changes_maps_the_rest_tri_state() {
-        let secrets = r2b1d_connection_secrets();
+        let secrets = ConnectionSecrets::new(None);
         assert!(password_changes(&secrets, None).unwrap().is_empty());
         assert_eq!(
             password_changes(&secrets, Some("")).unwrap()["password"],
@@ -1185,7 +1276,7 @@ mod r2b1d_tests {
 
     #[test]
     fn open_connection_secret_tells_none_set_and_unreadable_apart() {
-        let secrets = r2b1d_connection_secrets();
+        let secrets = ConnectionSecrets::new(None);
         let sealed = secrets.seal("password", "pw-2").unwrap();
         let r#ref = sealed.r#ref.as_str().to_owned();
         let row = banto_tags::StoredSecretRow {

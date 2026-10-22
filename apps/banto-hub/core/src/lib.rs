@@ -182,9 +182,11 @@
 //! - [`host_provided`]: R2b-1a。`push`・`postgres`・`virtual` を `DriverKind::HostProvided`
 //!   で返す `host_provided_drivers()`（host がレジストリへ足す。R2b-1d から入口・計画・
 //!   移行の preflight が読む）。
-//! - [`upgrade`]: R2b-1d。戻せない移行（`banto-tags` の 0025）の前の残り物の掃除・写しでの
-//!   予行と preflight・パスワードを除いたバックアップと、毎回の起動の秘密値の整合の確認
-//!   （docs/banto-hub-connection-settings-design.md §6.1〜§6.4・§5.3）。
+//! - [`upgrade`]: R2b-1d・R2b-1e。戻せない移行（`banto-tags` の 0025）の前の残り物の掃除・
+//!   写しでの予行と preflight・パスワードを除いたバックアップと、毎回の起動の秘密値の後処理
+//!   （Windows での `plain-v1` の封印し直し・未適用キューの封印・履歴の行からの除去・清掃待ちの
+//!   印を見た `VACUUM`）と整合の確認（docs/banto-hub-connection-settings-design.md §6.1〜§6.5・
+//!   §5.3）。
 //! - [`ingest`]: R2a（docs/banto-hub-ingest-design.md）。取り込み口 `push`
 //!   （外の送り手が Hub へ値を送り込む接続）。静的な部分の
 //!   [`ingest::driver::PushDriver`]（`DriverBase`。R2b-1a から host が `HostProvided` でレジストリに登録する、[`host_provided`]）と、
@@ -198,7 +200,8 @@
 //! - [`secrets`]: R2b-1b（docs/banto-hub-connection-settings-design.md §5）。接続の秘密値の
 //!   封印と開封（[`secrets::ConnectionSecrets`]。Windows は `banto-secret-store` の
 //!   `DpapiMachine` で `dpapi-machine-v1`、それ以外は `plain-v1`）。entropy に参照とキーを
-//!   入れ、`Debug`・エラーに平文と blob を出さない。**まだ配線しない**（DB・REST は R2b-1d・1e）
+//!   入れ、`Debug`・エラーに平文と blob を出さない。R2b-1d で DB・REST・MCP・キュー・読む側へ
+//!   配線し、R2b-1e から本番の経路はすべて `ConnectionSecrets::platform_default`
 //!
 //! T0/T1 のスコープ外（設計冒頭の指示どおり実装しない）: gRPC、管理 UI
 //! フロントエンドの中身の一部、演算タグ、接続単位の部分再構成。書き込み

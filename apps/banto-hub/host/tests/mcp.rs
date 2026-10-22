@@ -2290,7 +2290,7 @@ async fn update_connection_password_tri_state_semantics() {
             database: Some("erp".to_string()),
             username: Some("reader".to_string()),
             secrets: banto_hub_core::secrets::password_changes(
-                &banto_hub_core::secrets::r2b1d_connection_secrets(),
+                &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
                 Some("original-secret"),
             )
             .expect("seal the test password"),
@@ -2414,7 +2414,7 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
             database: options.get_database().map(|s| s.to_string()),
             username: Some(options.get_username().to_string()),
             secrets: banto_hub_core::secrets::password_changes(
-                &banto_hub_core::secrets::r2b1d_connection_secrets(),
+                &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
                 password.as_deref(),
             )
             .expect("seal the test password"),
@@ -5052,7 +5052,7 @@ async fn stored_password(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
     let conn = service.get(id).await.unwrap();
     let rows = service.secret_rows(id).await.unwrap();
     banto_hub_core::secrets::open_connection_secret(
-        &banto_hub_core::secrets::r2b1d_connection_secrets(),
+        &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
         &conn,
         banto_tags::PASSWORD_KEY,
         &rows,
@@ -5075,7 +5075,7 @@ fn postgres_conn_input(name: &str) -> PlcConnectionInput {
         database: Some("erp".to_string()),
         username: Some("reader".to_string()),
         secrets: banto_hub_core::secrets::password_changes(
-            &banto_hub_core::secrets::r2b1d_connection_secrets(),
+            &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
             Some("s3cret"),
         )
         .expect("seal the test password"),
@@ -5859,4 +5859,120 @@ async fn connection_tool_schemas_advertise_push_and_settings() {
         test_protocols.iter().all(|p| p != "push"),
         "{test_protocols:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R2b-1e（docs/banto-hub-connection-settings-design.md §5.3・§6.5・§8 の 1・§9）: MCP の
+// 入口（即時の作成・キューに積む作成と更新）から送ったパスワードは、キューに平文で載らず
+// （積む時点で封印した `sealedPassword` だけ）、Windows では起動時の後処理と VACUUM の後に
+// DB・WAL のバイト列に残らない（本物の DPAPI。偽の protector で全 OS の同じ確かめは core の
+// `rest::tests::r2b1e_secrets`）。
+// ---------------------------------------------------------------------------
+
+const MCP_P_CREATE: &str = "TOPSECRET-mcp-create-71aa";
+const MCP_P_QUEUED_CREATE: &str = "TOPSECRET-mcp-qcreate-72bb";
+const MCP_P_QUEUED_UPDATE: &str = "TOPSECRET-mcp-qupdate-73cc";
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
+    let app = test_app("r2b1e-mcp-secrets").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let pg_args = |name: &str, password: &str| {
+        json!({
+            "name": name, "protocol": "postgres", "host": "127.0.0.1", "port": 5432,
+            "database": "erp", "username": "reader", "password": password
+        })
+    };
+
+    // Direct create (collection stopped): sealed at the entrance.
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("create_connection", pg_args("pg-mcp", MCP_P_CREATE)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!text.contains(MCP_P_CREATE), "{text}");
+    let created: Value = serde_json::from_str(text).unwrap();
+    let id = created["created"]["id"].as_i64().unwrap();
+    assert_eq!(
+        stored_password(&app.pool, id).await.as_deref(),
+        Some(MCP_P_CREATE)
+    );
+
+    // Queued (locked down + running): a create and an update.
+    app.commissioning.lock_down().await.expect("lock_down");
+    start_collection(&app.router, &app.admin_token).await;
+    let mut update = pg_args("pg-mcp", MCP_P_QUEUED_UPDATE);
+    for (key, value) in [
+        ("id", json!(id)),
+        ("unitId", json!(1)),
+        ("enabled", json!(true)),
+        ("simulation", json!(false)),
+        ("wordOrder", json!("low_high")),
+    ] {
+        update[key] = value;
+    }
+    for (tool, arguments, secret) in [
+        (
+            "create_connection",
+            pg_args("pg-mcp-2", MCP_P_QUEUED_CREATE),
+            MCP_P_QUEUED_CREATE,
+        ),
+        ("update_connection", update, MCP_P_QUEUED_UPDATE),
+    ] {
+        let (status, body) =
+            mcp_post(&app.router, Some(&admin_key), tools_call(tool, arguments)).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["result"]["isError"], false, "{tool}: {body:?}");
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains(secret), "{text}");
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["queued"], true, "{payload:?}");
+    }
+    let payloads: Vec<String> =
+        sqlx::query_scalar("SELECT payload FROM pending_changes ORDER BY id")
+            .fetch_all(&app.pool)
+            .await
+            .unwrap();
+    assert_eq!(payloads.len(), 2);
+    for text in &payloads {
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert!(payload["input"].get("password").is_none(), "{payload}");
+        assert!(
+            payload["input"].get("sealedPassword").is_some(),
+            "{payload}"
+        );
+        assert!(!text.contains(MCP_P_QUEUED_CREATE) && !text.contains(MCP_P_QUEUED_UPDATE));
+    }
+
+    #[cfg(windows)]
+    {
+        let secrets = banto_hub_core::secrets::ConnectionSecrets::platform_default();
+        let report = banto_hub_core::upgrade::secrets_upkeep(&app.pool, &secrets).await;
+        assert!(report.failures.is_empty(), "{report:?}");
+        assert_eq!(report.vacuum_error, None, "{report:?}");
+        sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let path = app._env.registry_path();
+        for file in [
+            path.clone(),
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+        ] {
+            let Ok(bytes) = std::fs::read(&file) else {
+                continue;
+            };
+            for secret in [MCP_P_CREATE, MCP_P_QUEUED_CREATE, MCP_P_QUEUED_UPDATE] {
+                assert!(
+                    !bytes.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                    "{secret} left in {}",
+                    file.display()
+                );
+            }
+        }
+    }
 }

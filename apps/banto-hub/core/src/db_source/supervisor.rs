@@ -274,7 +274,7 @@ mod tests {
                     port: 1,
                     database: "d".to_string(),
                     username: "u".to_string(),
-                    password: "p".to_string(),
+                    password: None,
                     groups: Vec::new(),
                 }],
                 disabled: Vec::new(),

@@ -146,7 +146,32 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
     let mut last_delay: Option<Duration> = None;
 
     loop {
-        match connect(&plan).await {
+        // R2b-1e (design §5.2・§5.4): the plan holds the sealed password; it is opened here,
+        // right before dialling, and dropped once the pool is up. If it cannot be opened
+        // (it opened when the plan was built - this is a DPAPI failure in between), the
+        // connection is **not** dialled with an empty password: its tags read Bad, its
+        // status reads「パスワード: 読めません」, and only the opening is retried with the
+        // usual backoff - never a connection attempt.
+        let password = match open_password(&plan) {
+            Ok(password) => password,
+            Err(reason) => {
+                mark_all_bad(&plan, &deps);
+                attempt = attempt.saturating_add(1);
+                let message = super::plan::unreadable_password_message(reason);
+                deps.status.update_connection(plan.connection_id, |status| {
+                    record_password_unreadable(status, attempt, reason, message);
+                });
+                wait_before_retry(&plan, &deps, attempt, &mut last_delay).await;
+                continue;
+            }
+        };
+        // 開封が回復したら「読めません」を外す（#778 のレビュー P3）。続く接続が失敗しても
+        // 「読めない」が残らないように、接続の結果を待たずにここで外す。
+        deps.status
+            .update_connection(plan.connection_id, record_password_opened);
+        let connected = connect(&plan, &password).await;
+        drop(password);
+        match connected {
             Ok(pool) => {
                 if attempt > 0 {
                     deps.log.line(&format!(
@@ -160,6 +185,7 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
                     status.state = DbConnectionState::Connected;
                     status.consecutive_failures = 0;
                     status.last_error = None;
+                    status.password_unreadable = None;
                 });
 
                 let failure = poll_forever(&pool, &plan, &deps).await;
@@ -204,31 +230,58 @@ pub(crate) async fn run_connection(plan: DbConnectionPlan, deps: TaskDeps) {
             }
         }
 
-        let delay = backoff_delay(attempt);
-        // §4.2 末尾: 初回失敗時とバックオフ段階が変わったときだけ warn。
-        if last_delay != Some(delay) {
-            deps.log.err_line(&format!(
-                "banto-hub: [WARN] DB Source: 接続 {} への再接続を {} 秒後に再試行します（{} 回目の失敗）",
-                plan.connection_name,
-                delay.as_secs_f64(),
-                attempt
-            ));
-            last_delay = Some(delay);
-        }
-        tokio::time::sleep(delay).await;
+        wait_before_retry(&plan, &deps, attempt, &mut last_delay).await;
+    }
+}
+
+/// 再接続（またはパスワードの開封）の前のバックオフ。§4.2 末尾: 初回失敗時とバックオフ
+/// 段階が変わったときだけ warn。
+async fn wait_before_retry(
+    plan: &DbConnectionPlan,
+    deps: &TaskDeps,
+    attempt: u32,
+    last_delay: &mut Option<Duration>,
+) {
+    let delay = backoff_delay(attempt);
+    if *last_delay != Some(delay) {
+        deps.log.err_line(&format!(
+            "banto-hub: [WARN] DB Source: 接続 {} への再接続を {} 秒後に再試行します（{} 回目の失敗）",
+            plan.connection_name,
+            delay.as_secs_f64(),
+            attempt
+        ));
+        *last_delay = Some(delay);
+    }
+    tokio::time::sleep(delay).await;
+}
+
+/// 計画の封印したパスワードを開く（R2b-1e、設計 §5.2）。無ければ空（パスワード無しで
+/// 繋ぐ）。開けなければ読めない理由（空に潰さない）。
+fn open_password(
+    plan: &DbConnectionPlan,
+) -> Result<zeroize::Zeroizing<String>, crate::secrets::UnreadableReason> {
+    match &plan.password {
+        None => Ok(zeroize::Zeroizing::new(String::new())),
+        Some(sealed) => crate::secrets::ConnectionSecrets::platform_default()
+            .open(banto_tags::PASSWORD_KEY, sealed)
+            .map_err(|error| {
+                error
+                    .unreadable_reason()
+                    .unwrap_or(crate::secrets::UnreadableReason::Undecryptable)
+            }),
     }
 }
 
 /// プールを張り、各グループの SQL を1回だけ describe して実行形へ解決する
 /// までを行う。describe が**文の失敗**で落ちたグループは
 /// 「SQL を投げない（全タグ Bad）」形で保持し、接続そのものは生かす。
-async fn connect(plan: &DbConnectionPlan) -> Result<PgPool, PgFailure> {
+async fn connect(plan: &DbConnectionPlan, password: &str) -> Result<PgPool, PgFailure> {
     let options = pg_connect_options(
         &plan.host,
         plan.port,
         &plan.database,
         &plan.username,
-        &plan.password,
+        password,
         &plan.connection_name,
     );
     PgPoolOptions::new()
@@ -698,6 +751,23 @@ fn record_connection_failure(
     status.last_error = Some(message);
 }
 
+/// パスワードを開けなかったときの状態（`state` は `error`、`passwordState` 用の理由つき）。
+fn record_password_unreadable(
+    status: &mut DbConnectionStatus,
+    attempt: u32,
+    reason: crate::secrets::UnreadableReason,
+    message: String,
+) {
+    record_connection_failure(status, DbConnectionState::Error, attempt, message);
+    status.password_unreadable = Some(reason);
+}
+
+/// パスワードを開けたときの状態: 「読めません」の印だけを外す。`state`・`last_error` は
+/// 続く接続の結果が上書きする。
+fn record_password_opened(status: &mut DbConnectionStatus) {
+    status.password_unreadable = None;
+}
+
 /// §4.3「接続断（バックオフ中）→ 接続単位で全タグ Bad」。
 fn mark_all_bad(plan: &DbConnectionPlan, deps: &TaskDeps) {
     mark_connection_bad(plan, &deps.store, deps.clock.now_ms());
@@ -754,7 +824,7 @@ mod tests {
             port: 5432,
             database: "erp".to_string(),
             username: "reader".to_string(),
-            password: "pw".to_string(),
+            password: None,
             groups: vec![DbGroupPlan {
                 group_id: 5,
                 group_name: "q1".to_string(),
@@ -914,6 +984,7 @@ mod tests {
             consecutive_failures: 0,
             restarts: 0,
             last_restart_reason: None,
+            password_unreadable: None,
             groups: Vec::new(),
         };
 
@@ -941,6 +1012,49 @@ mod tests {
             "接続できません".to_string(),
         );
         assert_eq!(status.consecutive_failures, 2);
+        assert_eq!(status.last_error.as_deref(), Some("接続できません"));
+    }
+
+    /// #778 のレビュー P3: 開封に失敗 → 開封に成功 → 接続に失敗、の順で状態を更新しても、
+    /// 「パスワードを読めません」は開封に成功した時点で外れ、接続の失敗が残らず上書きする。
+    #[test]
+    fn password_unreadable_is_cleared_once_the_password_opens_again() {
+        use crate::secrets::UnreadableReason;
+        let mut status = DbConnectionStatus {
+            connection_id: 1,
+            connection_name: "erp".to_string(),
+            state: DbConnectionState::Backoff,
+            last_poll_at: None,
+            last_error: None,
+            consecutive_failures: 0,
+            restarts: 0,
+            last_restart_reason: None,
+            password_unreadable: None,
+            groups: Vec::new(),
+        };
+        record_password_unreadable(
+            &mut status,
+            1,
+            UnreadableReason::Undecryptable,
+            "開けません".to_string(),
+        );
+        assert_eq!(
+            status.password_unreadable,
+            Some(UnreadableReason::Undecryptable)
+        );
+        assert_eq!(status.state, DbConnectionState::Error);
+
+        record_password_opened(&mut status);
+        assert_eq!(status.password_unreadable, None);
+
+        // 続く DB 接続の失敗（`Err` 分岐）。
+        record_connection_failure(
+            &mut status,
+            DbConnectionState::Backoff,
+            2,
+            "接続できません".to_string(),
+        );
+        assert_eq!(status.password_unreadable, None);
         assert_eq!(status.last_error.as_deref(), Some("接続できません"));
     }
 

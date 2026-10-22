@@ -164,9 +164,10 @@ fn pg_conn_input(name: &str, target: &PgTarget) -> PlcConnectionInput {
         cpu_type: None,
         database: Some(target.database.clone()),
         username: Some(target.username.clone()),
-        // R2b-1d: sealed at the entrance (`plain-v1`), like the REST/MCP entrances do.
+        // Sealed at the entrance the way the REST/MCP entrances seal
+        // (`platform_default`: DPAPI on Windows, `plain-v1` elsewhere).
         secrets: banto_hub_core::secrets::password_changes(
-            &banto_hub_core::secrets::r2b1d_connection_secrets(),
+            &banto_hub_core::secrets::ConnectionSecrets::platform_default(),
             target.password.as_deref(),
         )
         .expect("seal the test password"),

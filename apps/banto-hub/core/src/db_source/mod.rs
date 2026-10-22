@@ -480,7 +480,7 @@ fn connection_password(
     secret_rows: &[banto_tags::StoredSecretRow],
 ) -> Result<zeroize::Zeroizing<String>, String> {
     match crate::secrets::open_connection_secret(
-        &crate::secrets::r2b1d_connection_secrets(),
+        &crate::secrets::ConnectionSecrets::platform_default(),
         conn,
         banto_tags::PASSWORD_KEY,
         secret_rows,
@@ -788,14 +788,14 @@ mod tests {
         let outcome = test_connection(&conn, &[]).await;
         assert!(!outcome.ok);
         let error = outcome.error.expect("error");
-        assert!(error.contains("パスワードを読めません"), "{error}");
+        assert!(error.contains("パスワード: 読めません"), "{error}");
         assert!(error.contains("missing"), "{error}");
         let outcome = describe_group(&conn, &[], "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome
             .error
             .expect("error")
-            .contains("パスワードを読めません"));
+            .contains("パスワード: 読めません"));
 
         let mut no_password = base_conn();
         no_password.settings.clear();
@@ -1043,7 +1043,7 @@ mod tests {
             port: 1,
             database: "d".to_string(),
             username: "u".to_string(),
-            password: "p".to_string(),
+            password: None,
             groups: vec![plan::DbGroupPlan {
                 group_id: 100 + id,
                 group_name: "q1".to_string(),
@@ -1226,7 +1226,7 @@ mod tests {
 
     /// R2b-1d（docs/banto-hub-connection-settings-design.md §5.4・§5.5）: パスワードを読めない
     /// 接続はタスクを起こさず（＝再試行でも繋ぎに行かない）、その接続だけ状態が `error`
-    /// 「パスワードを読めません」、配下のタグは Bad。読める接続は今どおり起きる。
+    /// 「パスワード: 読めません」、配下のタグは Bad。読める接続は今どおり起きる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_unreadable_connection_is_bad_and_never_started() {
         let store = Arc::new(ServerTagStore::new());
@@ -1275,8 +1275,13 @@ mod tests {
         let entry = status.iter().find(|s| s.connection_id == 2).unwrap();
         assert_eq!(entry.state, DbConnectionState::Error);
         let message = entry.last_error.as_deref().unwrap();
-        assert!(message.contains("パスワードを読めません"), "{message}");
+        assert!(message.contains("パスワード: 読めません"), "{message}");
         assert!(message.contains("undecryptable"), "{message}");
+        assert_eq!(
+            entry.password_unreadable,
+            Some(crate::secrets::UnreadableReason::Undecryptable),
+            "R2b-1e: the reason is kept apart for the status screen"
+        );
         assert_eq!(entry.groups.len(), 1);
         let sample = store.get("tag:3").expect("tag:3 written");
         assert_eq!(sample.quality, banto_collect::Quality::Bad);
@@ -1285,6 +1290,7 @@ mod tests {
         assert_eq!(entry.state, DbConnectionState::Error);
         let message = entry.last_error.as_deref().unwrap();
         assert!(message.contains("版"), "{message}");
+        assert_eq!(entry.password_unreadable, None);
         assert_eq!(entry.groups.len(), 1);
 
         // Stopping keeps it `error` (a configuration fact, not a running state) and Bad.
