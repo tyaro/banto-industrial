@@ -21,6 +21,10 @@ const SOURCE_TAG_NAME = `e2e-dup-src-${RUN_ID}`;
 const DUPLICATE_TAG_NAME = `${SOURCE_TAG_NAME}_copy`;
 const SOURCE_ADDRESS = '40001';
 const DUPLICATE_ADDRESS = '40011';
+// 保存時にドライバの正規形（Modbus は常に 6 桁）へ直る（R2b-2b）。入力は
+// 5 桁のまま、保存される値は 6 桁、を確かめる。
+const SOURCE_ADDRESS_STORED = '400001';
+const DUPLICATE_ADDRESS_STORED = '400011';
 const SOURCE_UNIT = '℃';
 
 interface TagResponse {
@@ -180,13 +184,13 @@ test.describe.serial('banto-hub タグ複製 (T18-3a)', () => {
 		expect(duplicated).toHaveLength(1);
 		expect(duplicated[0].collectionGroupId).toBe(groupId);
 		expect(duplicated[0].unit).toBe(SOURCE_UNIT);
-		expect(duplicated[0].address).toBe(DUPLICATE_ADDRESS);
+		expect(duplicated[0].address).toBe(DUPLICATE_ADDRESS_STORED);
 
 		// 複製元は不変（新規 POST 経路なので上書きされない）。
 		const source = tags.find((t) => t.id === sourceTagId);
 		expect(source).toBeDefined();
 		expect(source?.name).toBe(SOURCE_TAG_NAME);
-		expect(source?.address).toBe(SOURCE_ADDRESS);
+		expect(source?.address).toBe(SOURCE_ADDRESS_STORED);
 		expect(source?.unit).toBe(SOURCE_UNIT);
 		// 複製元と同名のタグは依然1件だけ（複製で名前が衝突していない）。
 		expect(tags.filter((t) => t.name === SOURCE_TAG_NAME)).toHaveLength(1);
