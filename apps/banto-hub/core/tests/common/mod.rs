@@ -225,7 +225,7 @@ pub fn shutdown_test_app(manager: &CollectorManager, pool: &SqlitePool) {
 /// Since R2b-1d the Hub's entrances, plan and preflight read the registry, and `none()`
 /// carries only the host-provided protocols - a test that merely stores a Modbus / SLMP
 /// connection (RBAC, catalog, expression checks) would otherwise be refused as
-/// `driverUnavailable`. The stand-ins accept every setting; the real drivers' rules are
+/// `driverUnavailable`. The stand-ins (session-type, never dialing) accept every setting; the real drivers' rules are
 /// covered in `banto-hub-host` (`tests/connection_validation_consistency.rs`,
 /// `tests/upgrade_0025.rs`). (The host's `hub_drivers()` uses the real ones.)
 pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
@@ -279,17 +279,36 @@ pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
             String::new()
         }
     }
+    /// R2b-3a-3: the plan reads only through session-type (broker-managed)
+    /// drivers, so the stand-ins are that kind; they never dial (a connect is
+    /// a refusal, so a session reads Bad).
+    impl banto_driver_api::SessionDriver for StandIn {
+        fn connect(
+            &self,
+            _settings: &banto_driver_api::Settings,
+            _cx: banto_driver_api::ConnectContext,
+        ) -> banto_driver_api::BoxFuture<
+            'static,
+            Result<Box<dyn banto_driver_api::Session>, banto_driver_api::FatalError>,
+        > {
+            Box::pin(async {
+                Err(banto_driver_api::FatalError::Io(
+                    "stand-in: no PLC I/O".to_string(),
+                ))
+            })
+        }
+    }
     let mut registry = banto_driver_api::DriverRegistry::new();
     for protocol in ["modbus-tcp", "slmp"] {
         registry
-            .register(banto_driver_api::DriverEntry::host_provided(
-                std::sync::Arc::new(StandIn(banto_driver_api::DriverDescriptor::new(
+            .register(banto_driver_api::DriverEntry::session(std::sync::Arc::new(
+                StandIn(banto_driver_api::DriverDescriptor::new(
                     banto_driver_api::DriverId::new(protocol).expect("valid id"),
                     "0.0.0-test",
                     protocol,
                     banto_driver_api::Capabilities::READ_WRITE,
-                ))),
-            ))
+                )),
+            )))
             .expect("distinct stand-in ids");
     }
     banto_hub_core::register_host_provided(&mut registry).expect("distinct host-provided ids");
