@@ -5748,9 +5748,8 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
-        let expected_message = banto_collect::check_tag_address("modbus-tcp", "D3000", "u16")
-            .unwrap_err()
-            .message();
+        // R2b-3a-3: 判定は収集の計画と同じドライバの `parse_address`（文言もドライバの）。
+        let expected_message = "Modbus TCP のアドレスとして解釈できません（例: 40001）。\"D3000\" は Modbus の参照番号（例: 40001, 40001.3）として読めません";
         assert_eq!(
             body,
             json!([{

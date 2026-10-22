@@ -238,7 +238,8 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
             (
                 ExclusionUnitView::Connection,
                 format!("conn:{broken_conn}"),
-                "invalidPort"
+                // R2b-3a-3: 接続の設定はドライバが判定する（以前は `invalidPort`）。
+                "invalidSettings"
             ),
             (
                 ExclusionUnitView::Group,

@@ -2753,14 +2753,20 @@ mod tests {
             assert_eq!(exclusions[0].reason.message(), message);
         }
 
-        // banto-hub's lenient twin is the `Unavailable` one.
+        // banto-hub's builds (strict and its lenient twin): R2b-3a-3 - a `hub`
+        // row is the driver check's there (banto-hub registers no `hub` driver).
         let (_, exclusions) = build_config_lenient_from(&snapshot, drivers());
-        assert_eq!(exclusions[0].reason, ExclusionReason::HubSourceUnavailable);
+        assert_eq!(
+            exclusions[0].reason,
+            ExclusionReason::DriverUnavailable {
+                protocol: "hub".to_string()
+            }
+        );
         match build_config_from(&snapshot, drivers()) {
             Err(CollectError::Config(message)) => {
                 assert_eq!(
                     message,
-                    "接続 Hub は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
+                    "接続 Hub のプロトコル hub のドライバがありません（接続は残しています）"
                 );
             }
             other => panic!("the strict build must refuse a hub connection, got {other:?}"),
@@ -3185,7 +3191,12 @@ mod tests {
     // so the strict path must keep failing on the *same* item with the
     // *same* words after `build_config_from` was rebuilt on top of the
     // lenient builder. These goldens were run against the pre-#414-段階2
-    // implementation first (they passed there unchanged).
+    // implementation first (they passed there unchanged). R2b-3a-3: every
+    // build reads through the drivers, so a connection's settings and a tag's
+    // address are judged by the driver - those cases carry the driver's words
+    // (the strict path banto-hub uses already did since R2b-1d / R2b-2c), and
+    // a broken setting is made in `settings` (what the broker dials with), not
+    // in the flat columns.
 
     /// One valid Modbus connection "PLC1" (port 502) with group "G1"
     /// (1000 ms) and tag "T1" (40001, i16), loaded as a snapshot - each
@@ -3225,26 +3236,26 @@ mod tests {
         (
             "unsupported protocol",
             |s| s.connections[0].protocol = "ethernet-ip".to_string(),
-            "接続 PLC1 のプロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）",
+            "接続 PLC1 のプロトコル ethernet-ip のドライバがありません（接続は残しています）",
         ),
         (
             "modbus port",
-            |s| s.connections[0].port = 70_000,
-            "接続 PLC1 のポート番号が不正です: 70000",
+            |s| set_setting(s, "port", 70_000),
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "modbus unit id",
-            |s| s.connections[0].unit_id = 300,
-            "接続 PLC1 のユニットIDが不正です: 300",
+            |s| set_setting(s, "unit_id", 300),
+            "接続 PLC1 の設定が検証を通りません: unitId: unit_id は 0〜255 の整数で指定してください",
         ),
         (
             "slmp port",
             |s| {
                 s.connections[0].protocol = "slmp".to_string();
                 s.tags[0].address = "D100".to_string();
-                s.connections[0].port = -1;
+                set_setting(s, "port", -1);
             },
-            "接続 PLC1 のポート番号が不正です: -1",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "group period",
@@ -3254,7 +3265,7 @@ mod tests {
         (
             "tag address",
             |s| s.tags[0].address = "99999".to_string(),
-            "タグ T1 のアドレス 99999 が不正です: GOLDEN_ADDRESS_REASON",
+            "タグ T1 のアドレス 99999 が不正です: \"99999\" は Modbus の参照番号（例: 40001, 40001.3）として読めません",
         ),
         (
             "tag data type",
@@ -3264,8 +3275,8 @@ mod tests {
         (
             "bit address on a non-bit tag",
             |s| s.tags[0].address = "40001.3".to_string(),
-            "タグ T1 のアドレス 40001.3 はビット指定アドレスです。ビット指定アドレスは \
-             data_type=bit のタグでのみ使えます（現在のデータ型: i16）",
+            "タグ T1 のアドレス 40001.3 が不正です: ビット指定アドレス \"40001.3\" はデータ型 bit \
+             のタグでのみ使えます（現在のデータ型: i16）",
         ),
         (
             // Within one group the tags are parsed before the period is
@@ -3281,27 +3292,34 @@ mod tests {
             // The connection is checked before any of its groups.
             "bad connection and bad tag under it",
             |s| {
-                s.connections[0].port = 70_000;
+                set_setting(s, "port", 70_000);
                 s.tags[0].data_type = "f128".to_string();
             },
-            "接続 PLC1 のポート番号が不正です: 70000",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             // A broken connection fails the strict build even when it has
             // nothing to collect.
             "bad connection without any group",
             |s| {
-                s.connections[0].port = 70_000;
+                set_setting(s, "port", 70_000);
                 s.groups.clear();
                 s.tags.clear();
             },
-            "接続 PLC1 のポート番号が不正です: 70000",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
     ];
 
+    /// Break the first connection's stored settings (what the broker dials
+    /// with since R2b-3a-3) - the flat columns are no longer read by the plan.
+    fn set_setting(snapshot: &mut RegistrySnapshot, key: &str, value: i64) {
+        snapshot.connections[0]
+            .settings
+            .insert(key.to_string(), value.into());
+    }
+
     fn golden_expected(expected: &str) -> String {
-        let address_reason = Address::parse("99999").unwrap_err().to_string();
-        expected.replace("GOLDEN_ADDRESS_REASON", &address_reason)
+        expected.to_string()
     }
 
     #[tokio::test]
@@ -3324,7 +3342,7 @@ mod tests {
         let base = golden_snapshot().await;
 
         let mut snapshot = base.clone();
-        snapshot.connections[0].port = 70_000;
+        set_setting(&mut snapshot, "port", 70_000);
         snapshot.connections[0].enabled = false;
         assert_eq!(
             build_config_from(&snapshot, drivers()).unwrap().tag_count(),
@@ -3415,7 +3433,9 @@ mod tests {
             .iter()
             .position(|c| c.id == conn_b.id)
             .unwrap();
-        snapshot.connections[i].port = 70_000;
+        snapshot.connections[i]
+            .settings
+            .insert("port".to_string(), 70_000.into());
         let i = snapshot.groups.iter().position(|g| g.id == g3.id).unwrap();
         snapshot.groups[i].period_ms = -5;
         let i = snapshot.tags.iter().position(|t| t.id == t6.id).unwrap();
@@ -3470,7 +3490,7 @@ mod tests {
                 (
                     ExclusionUnit::Connection,
                     format!("conn:{}", conn_b.id),
-                    "invalidPort"
+                    "invalidSettings"
                 ),
                 (
                     ExclusionUnit::Group,
@@ -3506,9 +3526,11 @@ mod tests {
         assert_eq!(config_exclusions(&snapshot, drivers()), exclusions);
     }
 
-    /// A tag's exclusion reason is worded exactly like the save-time
-    /// rejection of the same tag (#414 段階1) - one vocabulary for "this
-    /// address cannot be read".
+    /// A tag the save-time check rejects is also left out of the plan, on
+    /// the same field, worded with the same notation and example (#414
+    /// 段階1). Since R2b-3a-3 the plan's reason after that is the driver's
+    /// own (it reads the address), so only the field and the leading words
+    /// are shared.
     #[tokio::test]
     async fn a_tag_exclusion_uses_the_save_time_wording() {
         for (address, data_type) in [("D3000", "i16"), ("40001", "f128"), ("40001.3", "i16")] {
@@ -3518,7 +3540,22 @@ mod tests {
             let exclusions = config_exclusions(&snapshot, drivers());
             assert_eq!(exclusions.len(), 1, "{address} / {data_type}");
             let saved = check_tag_address("modbus-tcp", address, data_type).unwrap_err();
-            assert_eq!(exclusions[0].reason.message(), saved.message());
+            let ExclusionReason::InvalidTag { issue, .. } = &exclusions[0].reason else {
+                panic!("{address}: {:?}", exclusions[0].reason);
+            };
+            assert_eq!(issue.field(), saved.field(), "{address} / {data_type}");
+            if let TagAddressIssue::InvalidAddress { .. } = issue {
+                assert!(
+                    exclusions[0]
+                        .reason
+                        .message()
+                        .starts_with("Modbus TCP のアドレスとして解釈できません（例: 40001）。"),
+                    "{}",
+                    exclusions[0].reason.message()
+                );
+            } else {
+                assert_eq!(exclusions[0].reason.message(), saved.message());
+            }
             assert_eq!(exclusions[0].unit, ExclusionUnit::Tag);
         }
     }
@@ -3571,10 +3608,10 @@ mod tests {
         assert_eq!(config.tag_count(), 0);
         assert_eq!(exclusions.len(), 1);
         assert_eq!(exclusions[0].unit, ExclusionUnit::Connection);
-        assert_eq!(exclusions[0].reason.code(), "unsupportedProtocol");
+        assert_eq!(exclusions[0].reason.code(), "driverUnavailable");
         assert_eq!(
             exclusions[0].reason.message(),
-            "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）"
+            "プロトコル ethernet-ip のドライバがこの実行形態にありません（接続は残しています）"
         );
     }
 
@@ -3797,7 +3834,7 @@ mod tests {
         );
 
         let config =
-            build_config_from_with_registry(&in_tx, PushSource::Available, drivers()).unwrap();
+            build_config_from_with_registry(&in_tx, PushSource::Available, push_drivers()).unwrap();
         assert_eq!(config.connections[0].config, ProtocolConfig::External);
         assert_eq!(config.external_names(), vec!["line1.temp".to_string()]);
         // ChronoGazer's (and today's Hub's) strict build still refuses it.
@@ -3946,6 +3983,11 @@ mod tests {
             protocol: "modbus-tcp".to_string(),
             host: "127.0.0.1".to_string(),
             port: 502,
+            // R2b-3a-3: the plan reads `settings` (what the broker dials with).
+            settings: serde_json::json!({"host": "127.0.0.1", "port": 502})
+                .as_object()
+                .unwrap()
+                .clone(),
             ..push_conn(8, "plc")
         });
         snapshot.groups.push(group_of(80, 8, 1000));
@@ -3976,7 +4018,8 @@ mod tests {
             .0,
         ];
         configs.push(
-            build_config_from_with_registry(&snapshot, PushSource::Available, drivers()).unwrap(),
+            build_config_from_with_registry(&snapshot, PushSource::Available, push_drivers())
+                .unwrap(),
         );
         let (last, rest) = configs.split_last().unwrap();
         for config in rest {
@@ -4162,10 +4205,11 @@ mod tests {
             .filter(|e| e.unit == ExclusionUnit::Tag)
             .map(|e| (e.id, e.reason.code()))
             .collect();
-        // 100: the driver refuses `D3000`; 103: a bit address on a non-bit tag.
+        // 100: the driver refuses `D3000`; 103: a bit address on a non-bit
+        // tag - the driver's rule since R2b-2a, so its refusal too.
         assert_eq!(
             tag_exclusions,
-            vec![(100, "invalidAddress"), (103, "bitAddressOnNonBitType")]
+            vec![(100, "invalidAddress"), (103, "invalidAddress")]
         );
         let message = exclusions
             .iter()

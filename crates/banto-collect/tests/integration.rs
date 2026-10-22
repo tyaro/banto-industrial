@@ -952,6 +952,12 @@ async fn auto_reconnects_and_values_resume_after_recovery() {
 
     collector.stop().await.unwrap();
     sim.stop();
+    // #344 through the broker (R2b-3a-3, ChronoGazer's path): one outage is
+    // exactly one `plc_disconnected` and one `plc_reconnected` - the reads
+    // that fail while the broker is reconnecting, and the connect attempts
+    // that wait out its grace, report nothing twice.
+    assert_eq!(count_events(&pool, "plc_disconnected").await, 1);
+    assert_eq!(count_events(&pool, "plc_reconnected").await, 1);
 }
 
 // ---------------------------------------------------------------------------

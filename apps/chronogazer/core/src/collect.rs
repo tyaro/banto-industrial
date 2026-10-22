@@ -3809,9 +3809,12 @@ mod tests {
             key: format!("tag:{tag_id}"),
             name: name.to_string(),
             reason: "invalidAddress",
-            message: banto_collect::check_tag_address("modbus-tcp", address, "i16")
-                .expect_err("不正なアドレスのはず")
-                .message(),
+            // R2b-3a-3: 計画はドライバの `parse_address` で読むので、理由はドライバの文言
+            // （保存時の旧い規則 `check_tag_address` と前半の「…として解釈できません
+            // （例: …）。」は同じ）。
+            message: format!(
+                "Modbus TCP のアドレスとして解釈できません（例: 40001）。{address:?} は Modbus の参照番号（例: 40001, 40001.3）として読めません"
+            ),
         }
     }
 
