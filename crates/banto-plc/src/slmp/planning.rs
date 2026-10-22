@@ -90,6 +90,29 @@ fn is_compatible(access: SlmpAccess, data_type: DataType) -> bool {
     }
 }
 
+/// Whether a numeric request of `data_type` at a device of `access` with an
+/// optional bit-in-word position `bit` is something [`plan_slmp_batch`] can
+/// serve: a plain `bit` at a bit device, a plain non-`bit` type at a word
+/// device, or (T8) a `bit` with a bit position at a word device. Everything
+/// else is an `UnsupportedCombination`.
+///
+/// Public so that the SLMP driver's `parse_address` (R2b-2a, design
+/// docs/banto-hub-driver-address-design.md §3.2 Q4) refuses exactly what the
+/// planner would, with no second copy of the table to drift.
+pub fn slmp_accepts_numeric(access: SlmpAccess, bit: Option<u8>, data_type: DataType) -> bool {
+    match (access, data_type, bit) {
+        (SlmpAccess::Word, DataType::Bit, Some(_)) => true,
+        (access, dt, None) => is_compatible(access, dt),
+        _ => false,
+    }
+}
+
+/// Whether a string tag can live at a device of `access` with an optional
+/// bit position: word devices only, never with a bit qualifier.
+pub fn slmp_accepts_string(access: SlmpAccess, bit: Option<u8>) -> bool {
+    access == SlmpAccess::Word && bit.is_none()
+}
+
 /// How to interpret one mapped span of a group's response window: a numeric
 /// value of the given [`DataType`], or a Shift-JIS string occupying `words`
 /// consecutive words (S1 文字列タグ). This is what lets one bulk read serve a
@@ -263,22 +286,15 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
         };
 
         match kind {
-            ReadKind::Numeric(data_type) => match (device.access(), data_type, bit_pos) {
-                // T8: a bit-in-word request at a word device folds into the
-                // ordinary word read (see this function's doc comment).
-                (SlmpAccess::Word, DataType::Bit, Some(bit)) => {
-                    kind = ReadKind::BitInWord { bit };
-                }
-                // Pre-T8 shape: no bit qualifier, ordinary compatibility
-                // check unchanged.
-                (access, dt, None) if is_compatible(access, dt) => {}
-                // Every other combination is a mismatch: `bit` data type at
-                // a word device with no bit position (still ambiguous,
-                // unchanged from pre-T8), a bit-in-word address whose
-                // `data_type` is not `bit`, or a bit qualifier that reached
-                // here on a bit device (defensive only - `super::address::parse`
-                // already refuses to produce that address).
-                _ => {
+            ReadKind::Numeric(data_type) => {
+                if !slmp_accepts_numeric(device.access(), bit_pos, data_type) {
+                    // Every other combination is a mismatch: `bit` data type
+                    // at a word device with no bit position (still
+                    // ambiguous, unchanged from pre-T8), a bit-in-word
+                    // address whose `data_type` is not `bit`, or a bit
+                    // qualifier on a bit device (defensive only -
+                    // `super::address::parse` already refuses to produce
+                    // that address).
                     immediate_bad.push((
                         index,
                         PlcError::UnsupportedCombination {
@@ -288,13 +304,20 @@ pub fn plan_slmp_batch(requests: &[BatchReadRequest]) -> SlmpPlanOutcome {
                     ));
                     continue;
                 }
-            },
+                // T8: a bit-in-word request at a word device folds into the
+                // ordinary word read (see this function's doc comment).
+                if let (SlmpAccess::Word, DataType::Bit, Some(bit)) =
+                    (device.access(), data_type, bit_pos)
+                {
+                    kind = ReadKind::BitInWord { bit };
+                }
+            }
             ReadKind::Str { words, .. } => {
                 // Strings live in word devices only - same v1 rule as every
                 // non-bit numeric type - and never carry a bit qualifier of
                 // their own (a string occupies a whole span of words, not
                 // one bit of one).
-                if device.access() != SlmpAccess::Word || bit_pos.is_some() {
+                if !slmp_accepts_string(device.access(), bit_pos) {
                     immediate_bad.push((
                         index,
                         PlcError::UnsupportedCombination {

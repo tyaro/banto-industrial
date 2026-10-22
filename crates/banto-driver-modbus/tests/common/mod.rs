@@ -210,7 +210,12 @@ fn stitch<R, T>(
 }
 
 fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
-    let address = parse(&spec.address.canonical).map_err(|e| fatal(classify_read(e)))?;
+    // An address that does not parse is that tag's problem, not the
+    // connection's (R2b-2a, address design §6 Q5).
+    let address = match parse(&spec.address.canonical) {
+        Ok(address) => address,
+        Err(e) => return classify_read(e).map(Prep::Item),
+    };
     Ok(match &spec.kind {
         TagKind::Numeric(data_type) => Prep::Request(BatchReadRequest::Numeric(ReadRequest {
             address,
@@ -228,7 +233,12 @@ fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
 }
 
 fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError> {
-    let address = parse(&item.spec.address.canonical).map_err(|e| fatal(classify_read(e)))?;
+    // An address that does not parse is that tag's problem, not the
+    // connection's (R2b-2a, address design §6 Q5).
+    let address = match parse(&item.spec.address.canonical) {
+        Ok(address) => address,
+        Err(e) => return classify_read(e).map(Prep::Item),
+    };
     Ok(match (&item.spec.kind, &item.value) {
         (TagKind::Str { words, encoding }, Value::Str(s)) => {
             Prep::Request(BatchWriteRequest::String(StringWriteRequest {
@@ -333,8 +343,6 @@ pub fn plc_error_from(message: &str) -> PlcError {
         PlcError::ConnectTimeout(rest.to_string())
     } else if let Some(rest) = m.strip_prefix("接続エラー: ") {
         PlcError::Connection(rest.to_string())
-    } else if let Some(rest) = m.strip_prefix("アドレス形式が不正です: ") {
-        PlcError::InvalidAddress(rest.to_string())
     } else {
         PlcError::Connection(m.to_string())
     }
@@ -368,7 +376,6 @@ fn fatal_errors_round_trip_through_their_text() {
         PlcError::Protocol("x".into()),
         PlcError::ConnectTimeout("h:1".into()),
         PlcError::Connection("reset".into()),
-        PlcError::InvalidAddress("??".into()),
     ] {
         assert_eq!(plc_error_from(&e.to_string()), e);
         assert!(e.is_connection_fatal());
@@ -415,10 +422,10 @@ async fn an_extra_inner_result_is_not_hidden() {
     let kind = TagKind::numeric(banto_plc::DataType::U16);
     let spec = TagSpec::new(LegacyDriver.parse_address(WORD, &kind).unwrap(), kind);
     // One request plus one item error that never reaches the inner session.
+    // (`parse_address` now refuses a `bit` tag at a word address, so the
+    // spec is assembled from the word address.)
     let bad = TagSpec::new(
-        LegacyDriver
-            .parse_address(WORD, &TagKind::numeric(banto_plc::DataType::Bit))
-            .unwrap(),
+        spec.address.clone(),
         TagKind::numeric(banto_plc::DataType::Bit),
     );
     let mut s = LegacySession {

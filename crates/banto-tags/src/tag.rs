@@ -106,6 +106,41 @@ const MAX_DECIMALS: i64 = 6;
 const MIN_STRING_LENGTH: i64 = 1;
 const MAX_STRING_LENGTH: i64 = 128;
 
+/// The driver API's [`TagKind`](banto_driver_api::TagKind) of a tag, from its
+/// `data_type` column (and, for `"string"`, `string_length` and
+/// `string_encoding`) - the `kind` a driver's `parse_address` takes
+/// (docs/banto-hub-driver-address-design.md §3.2). A pure function over the
+/// raw fields so the save path (`TagInput`) and the read path (`Tag`) share
+/// it: `tag_kind(&t.data_type, t.string_length, &t.string_encoding)`.
+///
+/// `None` when no valid kind can be built: an unknown `data_type`, or a
+/// `"string"` whose length is missing / outside `1..=128` or whose encoding
+/// is outside [`ALLOWED_STRING_ENCODINGS`]. The caller keeps reporting those
+/// as the existing `dataType` / `stringLength` / `stringEncoding` field
+/// errors and does not parse the address (R2b-1 §4.2: "if (1) refuses, don't
+/// run the rest"). For non-string types the string columns are ignored.
+///
+/// Not called from production code yet (R2b-2b wires it in).
+pub fn tag_kind(
+    data_type: &str,
+    string_length: Option<i64>,
+    string_encoding: &str,
+) -> Option<banto_driver_api::TagKind> {
+    use banto_driver_api::{DataType, StringEncoding, TagKind};
+    if data_type == STRING_DATA_TYPE {
+        let words = u16::try_from(string_length?)
+            .ok()
+            .filter(|w| (MIN_STRING_LENGTH..=MAX_STRING_LENGTH).contains(&i64::from(*w)))?;
+        let encoding = match string_encoding {
+            "utf8" => StringEncoding::Utf8,
+            "shift_jis" => StringEncoding::ShiftJis,
+            _ => return None,
+        };
+        return Some(TagKind::string(words, encoding));
+    }
+    DataType::parse(data_type).map(TagKind::numeric)
+}
+
 fn default_decimals() -> i64 {
     0
 }
@@ -2767,6 +2802,53 @@ impl TagService {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tag_kind_builds_the_driver_api_kind() {
+        use banto_driver_api::{DataType, StringEncoding, TagKind};
+        for name in NUMERIC_DATA_TYPES {
+            assert_eq!(
+                tag_kind(name, None, "utf8"),
+                Some(TagKind::numeric(DataType::parse(name).unwrap())),
+                "{name}"
+            );
+        }
+        // The string columns are ignored for a numeric type.
+        assert_eq!(
+            tag_kind("u16", Some(999), "bogus"),
+            Some(TagKind::numeric(DataType::U16))
+        );
+        assert_eq!(
+            tag_kind("string", Some(16), "utf8"),
+            Some(TagKind::string(16, StringEncoding::Utf8))
+        );
+        assert_eq!(
+            tag_kind("string", Some(128), "shift_jis"),
+            Some(TagKind::string(128, StringEncoding::ShiftJis))
+        );
+        for (data_type, len, enc) in [
+            ("float", None, "utf8"),
+            ("", None, "utf8"),
+            ("U16", None, "utf8"),
+            ("string", None, "utf8"),
+            ("string", Some(0), "utf8"),
+            ("string", Some(129), "utf8"),
+            ("string", Some(-1), "utf8"),
+            ("string", Some(70_000), "utf8"),
+            ("string", Some(8), "ascii"),
+        ] {
+            assert_eq!(
+                tag_kind(data_type, len, enc),
+                None,
+                "{data_type} {len:?} {enc}"
+            );
+        }
+        // Every vocabulary entry is accepted (a new type added to the
+        // vocabulary without a kind would fail here).
+        for name in ALLOWED_DATA_TYPES {
+            assert!(tag_kind(name, Some(1), "utf8").is_some(), "{name}");
+        }
+    }
+
     use super::*;
     use crate::collection_group::{CollectionGroupInput, CollectionGroupService};
     use crate::migrate;

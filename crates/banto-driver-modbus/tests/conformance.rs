@@ -18,8 +18,8 @@ mod common;
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DataType, DriverAddress, DriverBase, FatalError, ItemError, SessionDriver,
-    Settings, StringEncoding, TagKind, TagSpec, Value, WriteItem,
+    ConnectContext, DataType, DriverAddress, DriverBase, ItemError, SessionDriver, Settings,
+    StringEncoding, TagKind, TagSpec, Value, WriteItem,
 };
 use banto_driver_conformance::proxy::FaultProxy;
 use banto_driver_conformance::session::{self, ResponsePatch, SessionFixtures};
@@ -57,9 +57,22 @@ fn statics() -> StaticFixtures {
         ("30001.15", n(Bit), "300001.15"),
         ("40001", n(F32), "400001"),
         ("40001", n(U64), "400001"),
-        ("40001", TagKind::string(16, StringEncoding::Utf8), "400001"),
     ] {
         f = f.valid(text, kind, canonical);
+    }
+    // R2b-2a (address design §3.2 Q4): refused for the tag's kind although
+    // the text itself is a valid reference number.
+    for (text, kind) in [
+        ("40001.3", n(U16)),
+        ("40001.3", n(F32)),
+        ("00001", n(F32)),
+        ("00001", n(U16)),
+        ("10001", n(I32)),
+        ("40001", n(Bit)),
+        ("30001", n(Bit)),
+        ("40001", TagKind::string(16, StringEncoding::Utf8)),
+    ] {
+        f = f.invalid(text, kind);
     }
     for text in [
         "",
@@ -199,10 +212,11 @@ fn cx() -> ConnectContext {
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):
 /// in R1's `LegacySession` an address that does not parse after connect is
-/// `FatalError::InvalidConfig` (design §3.4, §7.1 C4), and a `.N` write is
+/// the tag's own `ItemError::Unsupported`, not fatal (R2b-2a, address design
+/// §6 Q5; design §3.4, §7.1 C4), and a `.N` write is
 /// `ItemError::Unsupported` (design §7.3).
 #[tokio::test]
-async fn invalid_address_is_fatal_and_bit_write_is_unsupported() {
+async fn invalid_address_is_unsupported_and_bit_write_is_unsupported() {
     let sim = Simulator::start().await;
     let settings = Settings::from_pairs([
         ("host", sim.addr.ip().to_string()),
@@ -224,6 +238,9 @@ async fn invalid_address_is_fatal_and_bit_write_is_unsupported() {
     let r = s
         .read_batch(&[TagSpec::new(foreign, n(DataType::U16))])
         .await;
-    assert!(matches!(r, Err(FatalError::InvalidConfig(_))), "{r:?}");
+    assert!(
+        matches!(r.as_deref(), Ok([Err(ItemError::Unsupported(_))])),
+        "{r:?}"
+    );
     sim.stop();
 }

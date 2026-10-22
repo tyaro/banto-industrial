@@ -115,8 +115,9 @@ pub enum FatalError {
     /// The peer broke the protocol in a well-formed frame (a response to a
     /// different request, an impossible state).
     Protocol(String),
-    /// The connection's settings cannot work (R1 also maps
-    /// `PlcError::InvalidAddress` here to keep it fatal, design §3.4).
+    /// The connection's settings cannot work. (A tag's unparsable address is
+    /// not this: since R2b-2a it is the tag's own
+    /// [`ItemError::Unsupported`], never a reason to drop the connection.)
     InvalidConfig(String),
     /// Connecting failed or the connection broke (session-type only).
     Io(String),

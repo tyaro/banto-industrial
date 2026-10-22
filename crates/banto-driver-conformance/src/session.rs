@@ -19,7 +19,7 @@
 //! | --- | --- |
 //! | C1, C2 | [`static_checks`](crate::static_checks) on `fixtures.statics` |
 //! | C3 | one result per spec in spec order - singly, as one batch, reversed, with every spec twice, and **one address read as two kinds giving two different values** (`fixtures.reads` must contain such a pair) |
-//! | C4 | a device refusal (`fixtures.refused`) is `ItemError::Device` and keeps the connection; a mismatched kind (`fixtures.unsupported`, `fixtures.unsupported_writes`) is `ItemError::Unsupported` (or refused by `parse_address`) and keeps the connection; a spec whose canonical address the driver never produced is `FatalError::InvalidConfig` or `ItemError::Unsupported`, never a value; a broken response (`fixtures.broken`) is fatal `Framing` / `Protocol`; a peer closing in the middle of a response is fatal; after each fatal error a new connection reads correctly |
+//! | C4 | a device refusal (`fixtures.refused`) is `ItemError::Device` and keeps the connection; a mismatched kind (`fixtures.unsupported`, `fixtures.unsupported_writes`) is `ItemError::Unsupported` (or refused by `parse_address`) and keeps the connection; a spec whose canonical address the driver never produced is `ItemError::Unsupported`, never a value and never fatal; a broken response (`fixtures.broken`) is fatal `Framing` / `Protocol`; a peer closing in the middle of a response is fatal; after each fatal error a new connection reads correctly |
 //! | C5 | responses delivered in pieces of 1, 2, 3 and 5 bytes decode to the same values |
 //! | C6 | a response held back past the response timeout makes that read connection-fatal (never a value); the late response then arrives on the old connection, and the next read - on a new connection - gets its own value |
 //! | C7 | after the peer drops the connection the next call is fatal (never a value), and a new connection reads correctly - twice |
@@ -753,12 +753,13 @@ impl Cx<'_, '_, '_> {
         );
         let kind = TagKind::numeric(DataType::U16);
         match self.host.read(&[TagSpec::new(foreign, kind)]).await {
-            Err(HostError::Fatal(FatalError::InvalidConfig(_))) => {}
+            // R2b-2a (address design §6 Q5): one tag's address is that tag's
+            // problem, so the connection is kept (the read below checks it).
             Ok(v) if matches!(v.as_slice(), [Err(ItemError::Unsupported(_))]) => {}
             other => self.fail(
                 "C4",
                 format!(
-                    "読めない canonical のアドレスが {other:?}（FatalError::InvalidConfig か ItemError::Unsupported であるべき）"
+                    "読めない canonical のアドレスが {other:?}（ItemError::Unsupported であるべき。接続は切らない）"
                 ),
             ),
         }

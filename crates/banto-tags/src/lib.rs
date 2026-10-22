@@ -92,7 +92,7 @@ pub use push::{
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use settings_json::{settings_to_api, validate_settings_with_registry};
 pub use tag::{
-    validate_hub_tag_address, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
+    tag_kind, validate_hub_tag_address, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
     BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput,
     TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
     COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
