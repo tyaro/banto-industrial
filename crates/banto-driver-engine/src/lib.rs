@@ -38,7 +38,9 @@ pub enum EngineEvent {
     WriteStep(Vec<u32>),
 }
 
-/// 観測の実装は待機せずに返すこと。未指定ならログだけを残す。
+/// 観測の実装は待機せずに返すこと。未指定なら契約違反だけをログに残す。
+/// `StepStarted` の送信バイトにはハンドシェイクの認証情報などの秘密値が含まれうるため、
+/// 観測側は送信バイトやイベント全体の Debug 表示をログに残してはならない。
 pub trait EngineEvents: Send + Sync + 'static {
     fn record(&self, event: EngineEvent);
 }
@@ -111,7 +113,9 @@ impl FrameSession {
         self.core.as_ref().map(|core| core.conn.as_ref())
     }
 
-    /// C11 の純粋な計画を検査する観測口。ここを直接呼ぶ場合の違反処理は呼び出し元が担う。
+    /// C11 の適合テスト専用の観測口。通常の読み書きは Session 経由で行う。
+    /// ここを直接呼ぶ場合の違反処理は適合テスト側が担う。
+    #[doc(hidden)]
     pub fn connection_mut(&mut self) -> Option<&mut (dyn FrameConnection + 'static)> {
         self.core.as_mut().map(|core| core.conn.as_mut())
     }
@@ -371,7 +375,9 @@ impl Core {
                             ));
                         }
                     }
-                    emit(&self.events, EngineEvent::WriteStep(planned.covers.clone()));
+                    if let Some(events) = &self.events {
+                        events.record(EngineEvent::WriteStep(planned.covers.clone()));
+                    }
                     previous = Some(self.exchange(&planned.step).await?);
                 }
                 other => {
@@ -387,7 +393,9 @@ impl Core {
 
     async fn exchange(&mut self, step: &Step) -> Result<Vec<u8>, FatalError> {
         self.validate_step(step)?;
-        emit(&self.events, EngineEvent::StepStarted(step.clone()));
+        if let Some(events) = &self.events {
+            events.record(EngineEvent::StepStarted(step.clone()));
+        }
         let deadline = Instant::now()
             .checked_add(self.response_timeout)
             .ok_or_else(|| {

@@ -368,6 +368,35 @@ async fn write_step_budget_allows_slow_steps_and_rejects_an_extra_step() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn write_covers_can_repeat_across_steps_with_or_without_an_observer() {
+    for observed in [false, true] {
+        let stats = Arc::<Stats>::default();
+        let events = Arc::<Recorder>::default();
+        let mut conn = Conn::new(stats.clone());
+        conn.write_steps = 2;
+        let step = conn.step.clone();
+        let mut s = session(conn, Wire::new(stats.clone()), events.clone());
+        if !observed {
+            s.core.as_mut().unwrap().events = None;
+        }
+        assert_eq!(s.write_batch(&[item()]).await.unwrap(), vec![Ok(())]);
+        assert!(s.is_connected());
+        assert_eq!(stats.sends.load(Ordering::SeqCst), 2);
+        assert!(!events.has("C10"));
+        let recorded = events.0.lock().unwrap();
+        if observed {
+            assert_eq!(recorded.len(), 4);
+            for pair in recorded.chunks_exact(2) {
+                assert!(matches!(&pair[0], EngineEvent::WriteStep(covers) if covers == &[0]));
+                assert!(matches!(&pair[1], EngineEvent::StepStarted(sent) if sent == &step));
+            }
+        } else {
+            assert!(recorded.is_empty());
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn read_step_budget_is_checked_before_sending() {
     for count in [9, 10] {
         let stats = Arc::<Stats>::default();
@@ -518,6 +547,15 @@ async fn covers_counts_and_completion_checks_remain_fatal_violations() {
         assert!(events.has(check), "case {case}: {check}");
         assert!(!s.is_connected());
         assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+        if case == 6 || case == 7 {
+            assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+            assert_eq!(stats.transport_drops.load(Ordering::SeqCst), 1);
+            assert_eq!(stats.conn_drops.load(Ordering::SeqCst), 1);
+            assert!(!events.0.lock().unwrap().iter().any(|event| matches!(
+                event,
+                EngineEvent::WriteStep(_) | EngineEvent::StepStarted(_)
+            )));
+        }
     }
 }
 

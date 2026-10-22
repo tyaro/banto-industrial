@@ -156,6 +156,8 @@ impl Step {
 /// returns one result per entry, in `covers` order. For a write, they are
 /// indices into the `items` given to [`FrameConnection::write_next`], for
 /// logs and audit only.
+/// 書き込みの `covers` は各 step 内で重複してはならない（別 step での同じ添字は可）。
+/// 違反は C10 の致命的な契約違反として [`FatalError::Protocol`] になり、接続は破棄される。
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
