@@ -337,8 +337,10 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await writable.uncheck();
 		await expect(writable).not.toBeChecked();
 
-		await page.unroute('**/api/tags/parse-addresses');
+		// 保留した要求を先に流してから外す（`unroute` は保留中の要求を自分で処理するので、
+		// 後から `continue()` すると "Route is already handled" になる）。
 		for (const route of held) await route.continue();
+		await page.unroute('**/api/tags/parse-addresses');
 		await expect(page.getByText('作成しました')).toBeVisible();
 		await expect(drawer).toBeHidden();
 
