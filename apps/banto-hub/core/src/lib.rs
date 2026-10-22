@@ -39,8 +39,8 @@
 //!   catalog/`Collector` と同じ all-or-nothing で式のコンパイル・DAG 検証
 //!   結果を commit する
 //! - [`broker_glue`]: T2-2（設計 §6-5）。broker 管理対象接続の収集読み取りを
-//!   `banto-broker`（I6）経由にするアダプタ（[`broker_glue::BrokerReadClient`]）
-//!   と、`CollectorManager` の外で生存するブローカーセッション directory
+//!   `banto-broker`（I6）経由にするアダプタ（R2b-3a-3 で
+//!   [`banto_collect::BrokerReadClient`] へ移った）と、`CollectorManager` の外で生存するブローカーセッション directory
 //!   （[`broker_glue::HubSessions`]）。T2-2 当時は SLMP 専用で Modbus 接続は
 //!   直接クライアントのままだったが、#337（2026-09-08）で Modbus TCP の
 //!   収集読み取りも同じ broker セッションへ相乗りした（1接続 = 1ソケット）

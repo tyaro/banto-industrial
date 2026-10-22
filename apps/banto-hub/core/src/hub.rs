@@ -180,9 +180,11 @@
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
 //! ハンドル群を `banto_collect::broker_client_factory` に渡す - broker
 //! 管理対象の接続（SLMP、および #337 以降は Modbus TCP）は
-//! [`crate::broker_glue::BrokerReadClient`] で、その共有セッションを通して
-//! 読む（セッションが張れなかった接続だけが防御的に直接クライアントへ
-//! フォールバックする）。旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
+//! [`banto_collect::BrokerReadClient`] で、その共有セッションを通して
+//! 読む（セッションが張れなかった接続は決してつながらないクライアントを受け取り、
+//! タグは Bad になる。R2b-3a-3 まではそこで防御的に直接クライアントへ
+//! フォールバックしていたが、直接クライアントは R2b-3a-3 で消えた）。
+//! 旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
 //! が同じ PLC へ同時にソケットを張る瞬間」を SLMP について解消する役目も
 //! 兼ねていたが、T7 の部分適用移行後は新旧 `Collector` という概念自体が
 //! 無くなったため、この節の主眼は「broker セッションの追加+削除の完全同期」
@@ -1940,8 +1942,9 @@ impl CollectorManager {
     /// accumulated with a direct `protocol == "slmp"` check, because a Modbus
     /// connection held a broker session for writes/status while its reads
     /// stayed on banto-collect's own direct `ModbusTcpClient`. #337 moved
-    /// Modbus reads onto the broker session too
-    /// (`banto_collect::broker_client_factory`), so "holds a broker
+    /// Modbus reads onto the broker session too (then
+    /// `crate::broker_glue::hub_client_factory`, gone in R2b-3a-3 for
+    /// `banto_collect::broker_client_factory`), so "holds a broker
     /// session" and "reads through the broker" are now the same set, and
     /// this value is **derived from `handles`** at the end of this fn instead
     /// of accumulated alongside it.
@@ -2079,8 +2082,8 @@ impl CollectorManager {
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
             // "slmp"` filter here, deliberately narrower than the
             // `is_broker_managed` filter above, building a separate
-            // `read_routed_keys` set. Its reason: `banto_collect::broker_client_factory`'s
-            // `ModbusTcp` arm read through banto-collect's own direct
+            // `read_routed_keys` set. Its reason: `hub_client_factory`'s (gone
+            // in R2b-3a-3) `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
             // the broker), so putting a Modbus key into the set
             // `Self::rebuild`/`Self::apply_run` feed to

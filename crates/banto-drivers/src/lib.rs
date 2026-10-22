@@ -6,7 +6,8 @@
 //!
 //! `banto-hub-core` used to reach for `DriverTable::builtin()` and
 //! `banto_collect::default_client_factory()` itself, so adding or replacing a
-//! driver meant editing the engine (both are gone since R2b-3a-2 / 3a-3). R1-3b turns that around: the engine
+//! driver meant editing the engine (`DriverTable` is gone since R2b-3a-2,
+//! `default_client_factory` since R2b-3a-3). R1-3b turns that around: the engine
 //! (`HubSessions`, `HubConfig`) receives a `HubDrivers` by injection and
 //! never names a concrete driver; the composition root builds it from
 //! [`builtin`]. This crate is that composition root's only dependency on
@@ -22,8 +23,9 @@
 //!   dev-dependency only (until R2b-0).
 //! - **No copies.** R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3)
 //!   removed the collection client factory this crate used to hand out
-//!   (`banto_collect::default_client_factory`, fed by the hand-maintained
-//!   `ClientSpec` that dropped fields in #334 / #605): collection reads go
+//!   (`Builtin::client_factory`, which was `banto_collect::default_client_factory()`;
+//!   both are gone since then. It was fed by the hand-maintained `ClientSpec`
+//!   that dropped fields in #334 / #605): collection reads go
 //!   through the broker too, which dials through [`Builtin::registry`]. So
 //!   this crate no longer depends on `banto-collect`.
 //! - **R2b-3a-2 scope** (docs/banto-hub-driver-io-design.md §4.2): `registry`
