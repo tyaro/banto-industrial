@@ -40,7 +40,7 @@
 //! [`DriverRegistry`](banto_driver_api::DriverRegistry) it is given. A
 //! connection's protocol is broker-managed exactly when the registry holds a
 //! [`DriverKind::Session`](banto_driver_api::DriverKind::Session) for it (from
-//! R2b-3b also `Frame`) - [`is_broker_managed`] is that one predicate - and
+//! R2b-3b-join also `Frame`) - [`is_broker_managed`] is that one predicate - and
 //! [`SessionDirectory::ensure_connection`] dials it with
 //! `SessionDriver::connect(settings, ConnectContext)`, where `settings` is
 //! `banto_tags::settings_to_api(&conn.settings)` (connection-settings design
@@ -72,8 +72,10 @@
 //! A session-type driver owns its I/O, so if it does not keep
 //! `ConnectContext::response_timeout`, a job (and with it an immediate read
 //! or a write request in the Hub) would never return. The task therefore
-//! bounds every future it awaits on a session: the dial at
-//! `connect_timeout + 1 s` ([`CONNECT_SLACK`]), a read at
+//! bounds every future it awaits on a session. Session dials are bounded at
+//! `connect_timeout + 1 s` ([`CONNECT_SLACK`]); Frame dials additionally
+//! allow 32 handshake steps × response_timeout and 100 ms of engine cleanup.
+//! A read is bounded at
 //! [`read_job_limit`] and a write at [`write_job_limit`] (`step limit × 2T +
 //! 1 s`; the step limit is `specs.len() + 8` for a read and
 //! `3 × items.len() + 8` for a write, api-design contract 7), and the
@@ -212,6 +214,8 @@ use tokio::time::Instant;
 
 #[cfg(test)]
 mod fake;
+#[cfg(test)]
+mod frame_tests;
 mod session;
 
 pub use session::{Connector, NoSecretOpener, SecretOpener};
@@ -301,7 +305,9 @@ const EXTRA_STEPS: usize = 8;
 /// `2T` per step because a session-type driver may spend one `T` sending and
 /// another receiving (today's SLMP session does: the `slmp` crate's send and
 /// receive deadlines are separate); a driver that keeps its own deadlines can
-/// therefore never be cut by this bound - only one that breaks them.
+/// therefore never be cut by this bound - only one that breaks them. Frame
+/// uses one `T` for the whole step and at most 100 ms for fatal cleanup;
+/// the same outer bound also contains that smaller inner budget.
 pub fn read_job_limit(specs: usize, response: Duration) -> Duration {
     steps_limit(specs.saturating_add(EXTRA_STEPS), response)
 }
@@ -443,8 +449,8 @@ impl SettingsFingerprint {
 }
 
 /// Whether `registry` makes `protocol` a broker-managed protocol: the
-/// registry holds a session-type driver for it (R2b-3a-2; R2b-3b adds frame
-/// type). The single predicate behind [`SessionDirectory::ensure_connection`]'s
+/// registry holds a Session or Frame driver for it (R2b-3a-2 / 3b-join).
+/// The single predicate behind [`SessionDirectory::ensure_connection`]'s
 /// [`BrokerError::UnsupportedProtocol`] and banto-hub's
 /// `HubSessions::is_broker_managed`.
 pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
@@ -454,6 +460,7 @@ pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
 fn session_driver(registry: &DriverRegistry, protocol: &str) -> Option<Arc<dyn SessionDriver>> {
     match registry.get(protocol).map(|entry| entry.kind()) {
         Some(DriverKind::Session(driver)) => Some(Arc::clone(driver)),
+        Some(DriverKind::Frame(driver)) => Some(Arc::new(session::FrameDial(Arc::clone(driver)))),
         _ => None,
     }
 }
@@ -483,12 +490,12 @@ pub enum BrokerError {
     #[error("PLC接続 {connection_id} のブローカータスクは終了しています")]
     TaskGone { connection_id: i64 },
 
-    /// The connection's `protocol` has no session-type driver in the
+    /// The connection's `protocol` has no Session or Frame driver in the
     /// registry the broker was given (unregistered, or a host-provided
     /// protocol whose I/O the host keeps - see [`is_broker_managed`]).
     /// Rejected outright rather than silently skipped, so a caller relying on
     /// `.handle(id)` finds out immediately.
-    #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（セッション型のドライバが登録されていません）")]
+    #[error("接続 {connection_id} のプロトコル {protocol} はブローカー未対応です（セッション型・フレーム型のドライバが登録されていません）")]
     UnsupportedProtocol {
         connection_id: i64,
         protocol: String,
@@ -767,7 +774,7 @@ pub struct SessionDirectory {
     handles: Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
     tasks: Arc<std::sync::Mutex<HashMap<i64, TaskEntry>>>,
     /// The drivers this directory dials through (R2b-3a-2: the registry's
-    /// session-type entries; see [`is_broker_managed`]).
+    /// Session / Frame entries; see [`is_broker_managed`]).
     registry: Arc<DriverRegistry>,
     options: BrokerOptions,
     /// Shared (via `Arc`) with [`BrokerSupervisor`] so on-demand tasks
@@ -834,7 +841,7 @@ impl SessionDirectory {
     /// connection's own (banto-hub's simulation registry hands the settings
     /// with `host` / `port` replaced by its simulator's, design §4.4).
     ///
-    /// Rejects a protocol without a session-type driver in the registry with
+    /// Rejects a protocol without a Session or Frame driver in the registry with
     /// [`BrokerError::UnsupportedProtocol`], and settings the driver's
     /// `validate_config` refuses with [`BrokerError::InvalidSettings`] - both
     /// before looking for an existing session, both without any I/O (this
@@ -882,11 +889,32 @@ impl SessionDirectory {
             self.options.timeouts,
             Arc::clone(&self.options.secrets),
         );
-        let (mut handle, task) = spawn_task_with_connector(
+        // Frame includes transport dial, all 32 handshake exchanges and bounded
+        // cleanup. The legacy Session dial keeps its original bound.
+        let connect_limit = if matches!(
+            self.registry.get(&conn.protocol).map(|entry| entry.kind()),
+            Some(DriverKind::Frame(_))
+        ) {
+            self.options
+                .timeouts
+                .connect
+                .saturating_add(
+                    self.options
+                        .timeouts
+                        .response
+                        .saturating_mul(banto_driver_engine::MAX_HANDSHAKE_STEPS as u32),
+                )
+                .saturating_add(banto_driver_engine::CLOSE_TIMEOUT)
+                .saturating_add(CONNECT_SLACK)
+        } else {
+            self.options.timeouts.connect.saturating_add(CONNECT_SLACK)
+        };
+        let (mut handle, task) = spawn_task_with_connector_limit(
             conn.id,
             connector,
             self.options.backoff,
             self.options.timeouts,
+            connect_limit,
             self.shutdown_tx.subscribe(),
         );
         handle.fingerprint = Some(fingerprint);
@@ -1119,7 +1147,7 @@ impl BrokerSupervisor {
     }
 
     /// Spawn one broker task per connection in `connections`, dialing through
-    /// `registry` (R2b-3a-2: its session-type entries; see
+    /// `registry` (R2b-3a-2: its Session / Frame entries; see
     /// [`is_broker_managed`]). The first connection that cannot be dialed
     /// ([`BrokerError::UnsupportedProtocol`] /
     /// [`BrokerError::InvalidSettings`]) aborts the whole call. Tasks already
@@ -1206,11 +1234,30 @@ impl BrokerSupervisor {
 /// shutdown trigger (see [`BrokerSupervisor::shutdown`]); a caller that does
 /// not need that path can pass a receiver from a `watch::channel` it never
 /// signals.
+#[cfg(test)]
 fn spawn_task_with_connector(
     connection_id: i64,
     connector: Connector,
     backoff: BackoffConfig,
     timeouts: SessionTimeouts,
+    shutdown_rx: watch::Receiver<bool>,
+) -> (BrokerHandle, TaskEntry) {
+    spawn_task_with_connector_limit(
+        connection_id,
+        connector,
+        backoff,
+        timeouts,
+        timeouts.connect.saturating_add(CONNECT_SLACK),
+        shutdown_rx,
+    )
+}
+
+fn spawn_task_with_connector_limit(
+    connection_id: i64,
+    connector: Connector,
+    backoff: BackoffConfig,
+    timeouts: SessionTimeouts,
+    connect_limit: Duration,
     shutdown_rx: watch::Receiver<bool>,
 ) -> (BrokerHandle, TaskEntry) {
     let (tx, rx) = mpsc::channel(JOB_CHANNEL_CAPACITY);
@@ -1225,6 +1272,7 @@ fn spawn_task_with_connector(
         connector,
         backoff,
         timeouts,
+        connect_limit,
         rx,
         shutdown_rx,
         stop_rx,
@@ -1283,11 +1331,19 @@ async fn next_conn_event(state: &mut ConnState) -> ConnEvent {
 /// driver that does not keep its `ConnectContext::connect_timeout` fails the
 /// attempt as [`FatalError::Timeout`] and the backoff retries, instead of
 /// leaving the task in `Connecting` for ever.
+#[cfg(test)]
 async fn connect_attempt(
     connector: Connector,
     timeouts: SessionTimeouts,
 ) -> Result<Box<dyn Session>, FatalError> {
-    tokio::time::timeout(timeouts.connect.saturating_add(CONNECT_SLACK), connector())
+    connect_attempt_with_limit(connector, timeouts.connect.saturating_add(CONNECT_SLACK)).await
+}
+
+async fn connect_attempt_with_limit(
+    connector: Connector,
+    limit: Duration,
+) -> Result<Box<dyn Session>, FatalError> {
+    tokio::time::timeout(limit, connector())
         .await
         .unwrap_or(Err(FatalError::Timeout))
 }
@@ -1330,6 +1386,7 @@ async fn run_broker_task(
     connector: Connector,
     backoff_cfg: BackoffConfig,
     timeouts: SessionTimeouts,
+    connect_limit: Duration,
     mut rx: mpsc::Receiver<Job>,
     mut shutdown_rx: watch::Receiver<bool>,
     mut stop_rx: watch::Receiver<bool>,
@@ -1359,7 +1416,7 @@ async fn run_broker_task(
                     ConnEvent::Due => {
                         attempt += 1;
                         let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt });
-                        let handle = tokio::spawn(connect_attempt(connector.clone(), timeouts));
+                        let handle = tokio::spawn(connect_attempt_with_limit(connector.clone(), connect_limit));
                         state = ConnState::Connecting(handle);
                     }
                     ConnEvent::Finished(Ok(session)) => {
@@ -1647,7 +1704,7 @@ mod tests {
         );
     }
 
-    /// Only a session-type entry is broker-managed: a host-provided protocol
+    /// A Session entry is broker-managed: a host-provided protocol
     /// (the host keeps its I/O) is refused like an unregistered one, and
     /// `is_broker_managed` answers the same.
     #[tokio::test]

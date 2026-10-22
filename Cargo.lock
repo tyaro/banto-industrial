@@ -650,6 +650,7 @@ name = "banto-broker"
 version = "0.2.0-alpha.35"
 dependencies = [
  "banto-driver-api",
+ "banto-driver-engine",
  "banto-tags",
  "futures-util",
  "serde_json",
