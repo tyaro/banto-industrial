@@ -12,7 +12,7 @@
 //!   **one** transaction-id counter.
 //! - [`ModbusApiSession::read_batch`] turns each `TagSpec`'s canonical address
 //!   back into a `banto_plc::Address` with this driver's own grammar
-//!   (`Address::parse`; the private [`read_request`] / [`write_request`] - the
+//!   (`Address::parse`; the private [`read_request`] / [`write_request`] - no
 //!   public bridge back to `banto_plc::Address` is used) and runs the existing
 //!   plan + execute (`ModbusSession::read_typed` / `write_typed`). The typed
 //!   `PlcError` / `PlcWriteError` goes through `classify_read` /
