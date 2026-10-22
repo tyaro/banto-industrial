@@ -106,8 +106,9 @@ fn fatal(c: Result<ItemError, FatalError>) -> FatalError {
     }
 }
 
-/// Requests for the ones that can be made, item errors for the rest.
-enum Prep<R> {
+/// Requests for the ones that can be made, item errors for the rest
+/// (also the frame connection's `plan_read`, `frame_conn.rs`).
+pub(crate) enum Prep<R> {
     Request(R),
     Item(ItemError),
 }
@@ -141,7 +142,7 @@ fn stitch<R, T>(
 }
 
 /// The read request of `spec`: this driver's grammar on the canonical address.
-fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
+pub(crate) fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
     // An address that does not parse is that tag's problem, not the
     // connection's (R2b-2a, address design §6 Q5).
     let address = match Address::parse_slmp(&spec.address.canonical) {
