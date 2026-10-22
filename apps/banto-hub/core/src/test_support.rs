@@ -214,10 +214,20 @@ pub(crate) fn plc_conn(id: i64, protocol: &str, port: u16) -> banto_tags::PlcCon
 /// [`test_drivers`]).
 pub(crate) struct FakePlcDriver {
     descriptor: banto_driver_api::DriverDescriptor,
+    /// Whose `banto_plc` address grammar [`Self::parse_address`] reads
+    /// (`"modbus-tcp"` / `"slmp"`; anything else refuses). The id itself for
+    /// [`Self::new`].
+    grammar: String,
 }
 
 impl FakePlcDriver {
     pub(crate) fn new(protocol: &str) -> Self {
+        Self::with_grammar(protocol, protocol)
+    }
+
+    /// A session-type stand-in under an id of its own (e.g. a protocol
+    /// without a simulator, R2b-3a-3) that reads addresses like `grammar`.
+    pub(crate) fn with_grammar(protocol: &str, grammar: &str) -> Self {
         Self {
             descriptor: banto_driver_api::DriverDescriptor::new(
                 banto_driver_api::DriverId::new(protocol).expect("valid driver id"),
@@ -225,6 +235,7 @@ impl FakePlcDriver {
                 protocol,
                 banto_driver_api::Capabilities::READ_WRITE,
             ),
+            grammar: grammar.to_string(),
         }
     }
 }
@@ -241,14 +252,14 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
     }
     /// R2b-2c: reads an address with `banto_plc`'s grammar of this stand-in's id
     /// (what the real drivers do; canonical = `Display`), because the Hub's plan and
-    /// its immediate reads / writes now ask the driver. Any other id refuses.
+    /// its immediate reads / writes now ask the driver. Any other grammar refuses.
     fn parse_address(
         &self,
         text: &str,
         kind: &banto_driver_api::TagKind,
     ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
         let id = &self.descriptor.id;
-        let parsed = match id.as_str() {
+        let parsed = match self.grammar.as_str() {
             "modbus-tcp" => banto_plc::Address::parse(text),
             "slmp" => banto_plc::Address::parse_slmp(text),
             _ => {
@@ -294,7 +305,7 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
     /// R2b-3a-2: the connection test's point (the real drivers name `40001` /
     /// `D0`; any address of the stand-in's grammar reads [`FAKE_WORD`]).
     fn probe(&self) -> Option<(String, banto_driver_api::TagKind)> {
-        let text = match self.descriptor.id.as_str() {
+        let text = match self.grammar.as_str() {
             "modbus-tcp" => "40001",
             _ => "D0",
         };

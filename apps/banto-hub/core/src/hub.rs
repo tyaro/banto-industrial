@@ -1981,7 +1981,11 @@ impl CollectorManager {
     /// forever during development.
     ///
     /// A connection that already falls out of the wanted set here (its only
-    /// group got disabled, or its last group/tag was deleted) is handled by
+    /// group got disabled, its last group/tag was deleted, or - R2b-3a-3 - it
+    /// was switched to `simulation = true` under a protocol without a
+    /// simulator, so `BrokerSimRegistry::resolve` returned `None`; the strict
+    /// plan refuses such a snapshot before this sync runs, so that last case
+    /// is defence in depth) is handled by
     /// the SAME pre-existing mechanism as any other now-unwanted connection:
     /// it lands in the `stale_ids` this fn already computes below and gets
     /// torn down via [`Self::remove_stale_broker_sessions`] after the caller's
@@ -2053,14 +2057,24 @@ impl CollectorManager {
             // simulator's) and whether they changed since the last sync.
             // R2b-3a-3: `None` is a `simulation = true` connection whose
             // protocol has no simulator - never dialed (the real device must
-            // not be reached), no session (an old one is dropped now), and the
-            // plan excludes it too (`banto_collect`'s `UnsupportedProtocol`).
+            // not be reached), no new session, and the plan excludes it too
+            // (`banto_collect`'s `UnsupportedProtocol`; the Hub's strict plan
+            // then refuses the whole snapshot before this sync, so this branch
+            // is defence in depth). It is simply left out
+            // of `wanted_ids`: an old session of it (dialing the real device)
+            // stays in the directory, so it lands in `stale_ids` below and is
+            // stopped and joined by `Self::remove_stale_broker_sessions` once
+            // the caller's commit succeeds (and kept, like every other stale
+            // session, if the commit fails and the old state is restored).
+            // Removing it from the directory here instead would skip that
+            // stop: an unchanged connection's collect task keeps the old
+            // handles map, so the dropped session's broker task would live on
+            // and keep reaching (and redialing) the real device.
             let Some((dial_settings, changed)) = self
                 .sim_registry
                 .resolve(conn, &self.sessions.drivers().registry)
                 .await
             else {
-                self.sessions.remove(conn.id);
                 continue;
             };
             wanted_ids.insert(conn.id);
@@ -3966,6 +3980,233 @@ mod tests {
         );
 
         manager.shutdown().await;
+    }
+
+    /// A fake device for [`switching_a_connection_without_a_simulator_to_simulation_stops_its_old_session`]:
+    /// a listener on a free loopback port that counts the accepts and hands
+    /// every accepted socket to the test (kept open, so the test sees the
+    /// broker session's end as EOF).
+    async fn counting_device() -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if tx.send(stream).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, accepts, rx)
+    }
+
+    /// One connection of `protocol` at `127.0.0.1:port` with an enabled group
+    /// and one enabled tag (`40001`, read with the Modbus grammar).
+    async fn seed_collected_connection(
+        manager: &CollectorManager,
+        name: &str,
+        protocol: &str,
+        port: u16,
+    ) -> i64 {
+        let conn = manager
+            .plc_connections()
+            .create(PlcConnectionInput {
+                name: name.to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: i64::from(port),
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            })
+            .await
+            .unwrap();
+        let group = manager
+            .collection_groups()
+            .create(CollectionGroupInput {
+                name: format!("{name}-g"),
+                plc_connection_id: conn.id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap();
+        manager
+            .tags()
+            .create(TagInput {
+                name: format!("{name}-t"),
+                collection_group_id: group.id,
+                address: "40001".to_string(),
+                data_type: "i16".to_string(),
+                string_length: None,
+                string_encoding: "utf8".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        if protocol != "modbus-tcp" {
+            // The services only take a built-in protocol (step (1) of the
+            // save path's validation), so a driver id of the test's own
+            // registry is stamped on the stored row directly, last; the Modbus
+            // settings stay, and the stand-in reads the Modbus grammar.
+            sqlx::query("UPDATE plc_connections SET protocol = ? WHERE id = ?")
+                .bind(protocol)
+                .bind(conn.id)
+                .execute(&manager.pool())
+                .await
+                .unwrap();
+        }
+        conn.id
+    }
+
+    /// R2b-3a-3 review P2: a connection whose session-type driver has no
+    /// simulator (A), collected next to another connection (B), is switched to
+    /// `simulation = true`. `BrokerSimRegistry::resolve` returns `None`, so A
+    /// is excluded from the plan - and its old session (dialing the real
+    /// device) must be stopped after the commit like any other stale session.
+    /// The Hub's strict plan refuses that snapshot first (`rebuild` fails and
+    /// keeps the old state), so the sync and the cleanup are driven directly,
+    /// in `rebuild`'s order.
+    /// Before the fix the `None` branch removed A from the directory, so A
+    /// never reached `stale_ids` and `remove_stale_broker_sessions` skipped
+    /// it; B's unchanged task kept the old handles map, so A's broker task
+    /// stayed alive and connected to the real device.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn switching_a_connection_without_a_simulator_to_simulation_stops_its_old_session() {
+        let dir = crate::test_support::TempDir::new("manager-env-nosim");
+        let pool = init_db(&dir.path().join("registry.sqlite3"))
+            .await
+            .expect("init_db");
+        let mut registry = banto_driver_api::DriverRegistry::new();
+        for (protocol, grammar) in [
+            ("modbus-tcp", "modbus-tcp"),
+            ("slmp", "slmp"),
+            ("fake-session", "modbus-tcp"),
+        ] {
+            registry
+                .register(banto_driver_api::DriverEntry::session(Arc::new(
+                    crate::test_support::FakePlcDriver::with_grammar(protocol, grammar),
+                )))
+                .unwrap();
+        }
+        crate::host_provided::register_host_provided(&mut registry).unwrap();
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::broker_glue::HubDrivers::new(Arc::new(registry)),
+        ));
+        let manager = CollectorManager::new(
+            pool.clone(),
+            dir.path().join("data"),
+            Arc::new(SystemClock),
+            CollectorOptions {
+                connect_timeout: Duration::from_millis(200),
+                response_timeout: Duration::from_millis(200),
+                ..CollectorOptions::default()
+            },
+            sessions,
+            Arc::new(BrokerSimRegistry::new()),
+            Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
+        );
+
+        let (port_a, accepts_a, mut sockets_a) = counting_device().await;
+        let (port_b, accepts_b, mut sockets_b) = counting_device().await;
+        let a = seed_collected_connection(&manager, "a", "fake-session", port_a).await;
+        let b = seed_collected_connection(&manager, "b", "modbus-tcp", port_b).await;
+
+        manager.rebuild().await.expect("first rebuild");
+        let wait = Duration::from_secs(5);
+        let mut socket_a = tokio::time::timeout(wait, sockets_a.recv())
+            .await
+            .expect("A's broker session dials A's device")
+            .unwrap();
+        let mut socket_b = tokio::time::timeout(wait, sockets_b.recv())
+            .await
+            .expect("B's broker session dials B's device")
+            .unwrap();
+
+        sqlx::query("UPDATE plc_connections SET simulation = 1 WHERE id = ?")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The Hub's strict plan refuses this snapshot as a whole (A is
+        // `UnsupportedProtocol`), so `rebuild` never reaches the sync with it;
+        // the `None` branch is defence in depth. Drive the sync and the
+        // post-commit cleanup directly, in `rebuild`'s order.
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        assert!(
+            manager.rebuild().await.is_err(),
+            "the strict plan refuses an unsimulatable simulation"
+        );
+        let (handles, stale, _targets, _read_routed) =
+            manager.sync_broker_sessions_from(&snapshot).await;
+        assert!(!handles.contains_key(&format!("conn:{a}")));
+        assert!(handles.contains_key(&format!("conn:{b}")));
+        assert_eq!(stale, vec![a], "A's old session must be stale");
+        manager.remove_stale_broker_sessions(&stale).await;
+
+        let ids = manager.sessions().connection_ids();
+        assert!(!ids.contains(&a), "A is no longer wanted: {ids:?}");
+        assert!(ids.contains(&b), "B keeps its session: {ids:?}");
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(wait, socket_a.read(&mut buf))
+            .await
+            .expect("A's old broker session must be stopped (its socket closed)");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "A's device must see the session end, got {read:?}"
+        );
+        // B is not touched (still connected, no redial) and A is not redialed.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), socket_b.read(&mut buf))
+                .await
+                .is_err(),
+            "B's session must stay connected"
+        );
+        assert_eq!(accepts_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(accepts_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sockets_a.recv())
+                .await
+                .is_err(),
+            "A's device must not be dialed again"
+        );
+        assert_eq!(
+            manager.broker_status(b),
+            Some(BrokerConnectionStatus::Connected)
+        );
+
+        manager.shutdown().await;
+        drop(pool);
+        drop(dir);
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
