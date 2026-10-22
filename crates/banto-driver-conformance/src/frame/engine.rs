@@ -1,39 +1,22 @@
-//! The harness's engine: the Hub engine's request/response procedure
-//! (docs/banto-driver-api-design.md §4.2, §4.2.1) over an in-memory wire
-//! with virtual time.
-//!
-//! Faults are the engine's, not the responder's: the responder answers like
-//! a healthy device and the engine re-times, splits, delays, truncates or
-//! replaces what "arrives". Time is virtual (an arrival has an offset from
-//! the send; anything after the response timeout never arrives in time), so
-//! every run is deterministic and takes no wall-clock time.
-//!
-//! Besides producing results, the engine records **contract violations** of
-//! the driver it observes on the way (a `FatalError::Io` from a frame
-//! driver, `covers` out of range, a `Discard(0)`, a `Done` of the wrong
-//! length, ...). They are turned into [`Failure`]s by `run_all`.
+//! 本物のエンジンを、記憶上の通信路と止めた Tokio の時計で駆動する。
+//! Responder の借用と公開 API は保ち、通信だけを scoped worker 上で実行する。
+//! 返答の生成は同期チャネルで行うので、生成待ちに仮想時計だけが進む競合はない。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
+use std::future::Future;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use banto_driver_api::{
-    FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError, Planned,
-    PrefixEncoding, PrefixSpec, RawValue, Settings, Step, TagSpec, WriteItem, WriteProgress,
+    BoxFuture, FatalError, FrameConnection, FrameDriver, FrameRule, ItemError, Planned, RawValue,
+    Session, Settings, TagSpec, WriteItem,
 };
+use banto_driver_engine::{transport::Transport, EngineEvent, EngineEvents, FrameSession};
+use tokio::time::Instant;
 
 use super::{Reply, Responder};
 use crate::Failure;
 
-/// A handshake longer than this is a driver bug (C7).
-pub(crate) const MAX_HANDSHAKE_STEPS: usize = 32;
-
-/// Filler bytes of an endless response arrive this often (virtual time).
-const ENDLESS_INTERVAL: Duration = Duration::from_millis(1);
-/// ... this many at a time.
-const ENDLESS_CHUNK: usize = 16;
-
-/// A connection-fatal outcome, and whether the driver or the engine raised
-/// it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Fatal {
     pub(crate) error: FatalError,
@@ -41,39 +24,57 @@ pub(crate) struct Fatal {
 }
 
 impl Fatal {
+    #[cfg(test)]
     fn engine(error: FatalError) -> Self {
-        Fatal {
+        Self {
             error,
             by_driver: false,
         }
     }
 }
-
-/// How every response is cut into arrivals until reset (C5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Split {
-    /// Pieces of this many bytes.
     Every(usize),
-    /// Pieces of 1, 2, 3, 5, 1, 2, ... bytes, so boundaries fall everywhere.
     Straddle,
 }
 
-/// A fault applied to the next exchange that expects a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Once {
-    /// Use [`Responder::reply_broken`] instead of the healthy reply (C4).
     Broken,
-    /// The response arrives after the timeout (C6).
     Late,
-    /// Filler bytes keep arriving and never form the response (C9).
     Endless,
-    /// These bytes arrive before the response (C9; only for
-    /// `FrameRule::DriverDecides`, the one rule that can skip them).
     Noise(Vec<u8>),
-    /// Half of the response arrives, then the peer closes (C4).
     CloseMidway,
-    /// The peer closes instead of answering (C7).
     Close,
+}
+
+#[derive(Default)]
+struct Control {
+    split: Option<Split>,
+    once: Option<Once>,
+    fired: bool,
+    events: Vec<EngineEvent>,
+    rule: Option<FrameRule>,
+}
+
+struct Observer(Arc<Mutex<Control>>);
+impl EngineEvents for Observer {
+    fn record(&self, event: EngineEvent) {
+        let mut control = self.0.lock().unwrap();
+        if let EngineEvent::StepStarted(step) = &event {
+            control.rule = Some(step.expect.clone());
+        }
+        control.events.push(event);
+    }
+}
+
+enum Request {
+    Reply {
+        bytes: Vec<u8>,
+        broken: bool,
+        answer: mpsc::Sender<Option<Reply>>,
+    },
+    Finished,
 }
 
 pub(crate) struct Engine<'a> {
@@ -81,17 +82,15 @@ pub(crate) struct Engine<'a> {
     settings: Settings,
     peer: &'a mut dyn Responder,
     timeout: Duration,
-    conn: Option<Box<dyn FrameConnection>>,
-    /// Bytes still travelling on the current connection's wire (a late
-    /// response). Dropping the connection drops them: that is C6.
-    pending: Vec<u8>,
-    /// How many connections were created (each runs the handshake).
+    session: Option<FrameSession>,
+    runtime: Option<tokio::runtime::Runtime>,
+    tx: mpsc::Sender<Request>,
+    rx: mpsc::Receiver<Request>,
+    control: Arc<Mutex<Control>>,
     pub(crate) connects: usize,
     pub(crate) split: Option<Split>,
     pub(crate) once: Option<Once>,
-    /// Whether the last `once` was actually applied.
     pub(crate) fired: bool,
-    /// The `covers` of every write step sent, in order (C10).
     pub(crate) write_log: Vec<Vec<u32>>,
     violations: Vec<Failure>,
     seen_violations: BTreeSet<String>,
@@ -104,13 +103,23 @@ impl<'a> Engine<'a> {
         peer: &'a mut dyn Responder,
         timeout: Duration,
     ) -> Self {
-        Engine {
+        let (tx, rx) = mpsc::channel();
+        Self {
             driver,
             settings,
             peer,
             timeout,
-            conn: None,
-            pending: Vec::new(),
+            session: None,
+            runtime: Some(
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .start_paused(true)
+                    .build()
+                    .unwrap(),
+            ),
+            tx,
+            rx,
+            control: Arc::default(),
             connects: 0,
             split: None,
             once: None,
@@ -121,377 +130,324 @@ impl<'a> Engine<'a> {
         }
     }
 
-    pub(crate) fn into_violations(self) -> Vec<Failure> {
-        self.violations
+    pub(crate) fn into_violations(mut self) -> Vec<Failure> {
+        std::mem::take(&mut self.violations)
     }
-
     pub(crate) fn is_connected(&self) -> bool {
-        self.conn.is_some()
+        self.session
+            .as_ref()
+            .is_some_and(FrameSession::is_connected)
     }
-
-    /// Record a driver contract violation (each distinct one once).
+    pub(crate) fn drop_connection(&mut self) {
+        self.session = None;
+    }
     pub(crate) fn violation(&mut self, id: &'static str, detail: String) {
         if self.seen_violations.insert(format!("{id}{detail}")) {
             self.violations.push(Failure::new(id, detail));
         }
     }
 
-    /// The engine's reaction to a fatal outcome: forget the connection and
-    /// whatever is still on its wire.
-    pub(crate) fn drop_connection(&mut self) {
-        self.conn = None;
-        self.pending.clear();
-    }
-
-    /// A fatal error returned by the driver's `method`. Frame drivers must
-    /// not return `Io` / `Timeout` (C4). The connection is dropped.
-    fn driver_fatal(&mut self, method: &str, error: FatalError) -> Fatal {
-        if matches!(error, FatalError::Io(_) | FatalError::Timeout) {
-            self.violation(
-                "C4",
-                format!(
-                    "{method} が {error:?} を返した（フレーム型は Io / Timeout を返してはならない）"
-                ),
-            );
+    fn drive<T: Send>(
+        &mut self,
+        future: impl Future<Output = Result<T, FatalError>> + Send,
+    ) -> Result<T, Fatal> {
+        {
+            let mut control = self.control.lock().unwrap();
+            control.split = self.split;
+            control.once = self.once.take();
+            control.fired = self.fired;
         }
-        self.drop_connection();
-        Fatal {
-            error,
-            by_driver: true,
-        }
-    }
-
-    /// A contract violation that the engine answers with
-    /// `FatalError::Protocol`, like the Hub's engine would (never a panic).
-    fn violation_fatal(&mut self, id: &'static str, detail: String) -> Fatal {
-        self.violation(id, detail.clone());
-        self.drop_connection();
-        Fatal::engine(FatalError::Protocol(detail))
-    }
-
-    /// Create a connection and run its handshake, unless one is up.
-    pub(crate) fn ensure_connected(&mut self) -> Result<(), Fatal> {
-        if self.conn.is_some() {
-            return Ok(());
-        }
-        self.pending.clear();
-        let conn = match self.driver.create_connection(&self.settings) {
-            Ok(c) => c,
-            Err(e) => return Err(self.driver_fatal("create_connection", e)),
+        let runtime = self.runtime.as_ref().unwrap();
+        let peer = &mut self.peer;
+        let rx = &self.rx;
+        let tx = self.tx.clone();
+        let result = std::thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                // panic でも通知し、ハーネスの呼び出し元を待ち続けさせない。
+                struct Finished(mpsc::Sender<Request>);
+                impl Drop for Finished {
+                    fn drop(&mut self) {
+                        let _ = self.0.send(Request::Finished);
+                    }
+                }
+                let _finished = Finished(tx);
+                runtime.block_on(future)
+            });
+            while let Ok(request) = rx.recv() {
+                match request {
+                    Request::Finished => break,
+                    Request::Reply {
+                        bytes,
+                        broken,
+                        answer,
+                    } => {
+                        let reply = if broken {
+                            peer.reply_broken(&bytes)
+                        } else {
+                            Some(peer.reply(&bytes))
+                        };
+                        let _ = answer.send(reply);
+                    }
+                }
+            }
+            worker
+                .join()
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        let (events, once, fired) = {
+            let mut control = self.control.lock().unwrap();
+            (
+                std::mem::take(&mut control.events),
+                control.once.take(),
+                control.fired,
+            )
         };
-        self.connects += 1;
-        self.peer.on_connect();
-        self.conn = Some(conn);
-        let mut prev: Option<Vec<u8>> = None;
-        for _ in 0..MAX_HANDSHAKE_STEPS {
-            let next = self.conn_mut().handshake_next(prev.as_deref());
-            match next {
-                Err(e) => return Err(self.driver_fatal("handshake_next", e)),
-                Ok(None) => return Ok(()),
-                Ok(Some(step)) => prev = Some(self.exchange(&step)?.unwrap_or_default()),
+        self.once = once;
+        self.fired = fired;
+        let mut driver_error = None;
+        for event in events {
+            match event {
+                EngineEvent::Violation { check, detail } => self.violation(check, detail),
+                EngineEvent::DriverFatal { error, .. } => driver_error = Some(error),
+                EngineEvent::WriteStep(covers) => self.write_log.push(covers),
+                _ => {}
             }
         }
-        Err(self.violation_fatal(
-            "C7",
-            format!("ハンドシェイクが {MAX_HANDSHAKE_STEPS} step で終わらない"),
-        ))
+        result.map_err(|error| Fatal {
+            by_driver: driver_error.as_ref() == Some(&error),
+            error,
+        })
     }
 
-    fn conn_mut(&mut self) -> &mut dyn FrameConnection {
-        self.conn.as_deref_mut().expect("connected")
+    pub(crate) fn ensure_connected(&mut self) -> Result<(), Fatal> {
+        if self.is_connected() {
+            return Ok(());
+        }
+        self.peer.on_connect();
+        self.connects += 1;
+        let transport = Wire {
+            tx: self.tx.clone(),
+            control: self.control.clone(),
+            timeout: self.timeout,
+            arrivals: VecDeque::new(),
+            closed: false,
+        };
+        let driver = self.driver;
+        let settings = self.settings.clone();
+        let timeout = self.timeout;
+        let observer = Arc::new(Observer(self.control.clone()));
+        self.session = Some(self.drive(async move {
+            FrameSession::with_transport(
+                driver,
+                &settings,
+                Box::new(transport),
+                timeout,
+                Some(observer),
+            )
+            .await
+        })?);
+        Ok(())
     }
 
-    fn conn_ref(&self) -> &dyn FrameConnection {
-        self.conn.as_deref().expect("connected")
-    }
-
-    /// Plan, send, receive and decode one read (design §4.2 steps 1-5).
     pub(crate) fn read(
         &mut self,
         specs: &[TagSpec],
     ) -> Result<Vec<Result<RawValue, ItemError>>, Fatal> {
         self.ensure_connected()?;
-        let planned = match self.conn_mut().plan_read(specs) {
-            Ok(p) => p,
-            Err(e) => return Err(self.driver_fatal("plan_read", e)),
-        };
-        let mut seen = vec![false; specs.len()];
-        for p in &planned {
-            for &c in &p.covers {
-                let Some(slot) = seen.get_mut(c as usize) else {
-                    return Err(self.violation_fatal(
-                        "C3",
-                        format!(
-                            "plan_read の covers に範囲外の添字 {c}（specs は {} 件）",
-                            specs.len()
-                        ),
-                    ));
-                };
-                if *slot {
-                    return Err(self.violation_fatal(
-                        "C3",
-                        format!("plan_read の covers で添字 {c} が 2 回出た"),
-                    ));
-                }
-                *slot = true;
-            }
+        let mut session = self.session.take().unwrap();
+        let result = self.drive(session.read_raw_batch(specs));
+        if session.is_connected() {
+            self.session = Some(session);
         }
-        let mut out: Vec<Option<Result<RawValue, ItemError>>> = vec![None; specs.len()];
-        for p in &planned {
-            let response = self.exchange(&p.step)?.unwrap_or_default();
-            debug_assert!(response.len() <= p.step.max_len as usize);
-            let decoded = match self.conn_ref().decode_read(p, specs, &response) {
-                Ok(d) => d,
-                Err(e) => return Err(self.driver_fatal("decode_read", e)),
-            };
-            if decoded.len() != p.covers.len() {
-                return Err(self.violation_fatal(
-                    "C3",
-                    format!(
-                        "decode_read が {} 件を返した（covers は {} 件）",
-                        decoded.len(),
-                        p.covers.len()
-                    ),
-                ));
-            }
-            for (&c, v) in p.covers.iter().zip(decoded) {
-                out[c as usize] = Some(v);
-            }
-        }
-        Ok(out
-            .into_iter()
-            .map(|o| o.unwrap_or_else(|| Err(ItemError::Unsupported("計画に含まれない".into()))))
-            .collect())
+        result
     }
 
-    /// One logical write through the `write_next` state machine (design
-    /// §4.2.1).
     pub(crate) fn write(
         &mut self,
         items: &[WriteItem],
     ) -> Result<Vec<Result<(), ItemError>>, Fatal> {
         self.ensure_connected()?;
-        let max_steps = 3 * items.len() + 8;
-        let mut steps = 0usize;
-        let mut prev: Option<Vec<u8>> = None;
-        loop {
-            let progress = match self.conn_mut().write_next(items, prev.as_deref()) {
-                Ok(p) => p,
-                Err(e) => return Err(self.driver_fatal("write_next", e)),
-            };
-            match progress {
-                WriteProgress::Send(planned) => {
-                    steps += 1;
-                    if steps > max_steps {
-                        return Err(self.violation_fatal(
-                            "C16",
-                            format!("書き込みの手順が上限 {max_steps} step を超えた"),
-                        ));
-                    }
-                    if let Some(&c) = planned.covers.iter().find(|&&c| c as usize >= items.len()) {
-                        return Err(self.violation_fatal(
-                            "C10",
-                            format!(
-                                "write_next の covers に範囲外の添字 {c}（items は {} 件）",
-                                items.len()
-                            ),
-                        ));
-                    }
-                    self.write_log.push(planned.covers.clone());
-                    prev = Some(self.exchange(&planned.step)?.unwrap_or_default());
-                }
-                WriteProgress::Done(results) => {
-                    if results.len() != items.len() {
-                        return Err(self.violation_fatal(
-                            "C3",
-                            format!(
-                                "書き込みの結果の件数が要求と合わない（Done が {} 件、items は {} 件）",
-                                results.len(),
-                                items.len()
-                            ),
-                        ));
-                    }
-                    return Ok(results);
-                }
-                other => {
-                    return Err(self.violation_fatal(
-                        "C10",
-                        format!("write_next が未知の WriteProgress を返した: {other:?}"),
-                    ))
-                }
-            }
+        let mut session = self.session.take().unwrap();
+        let result = self.drive(session.write_batch(items));
+        if session.is_connected() {
+            self.session = Some(session);
         }
+        result
     }
 
-    /// Plan a read without sending it (C11).
     pub(crate) fn plan_only(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, Fatal> {
         self.ensure_connected()?;
-        match self.conn_mut().plan_read(specs) {
-            Ok(p) => Ok(p),
-            Err(e) => Err(self.driver_fatal("plan_read", e)),
-        }
+        let result = self
+            .session
+            .as_mut()
+            .unwrap()
+            .connection_mut()
+            .unwrap()
+            .plan_read(specs);
+        result.map_err(|error| {
+            if matches!(error, FatalError::Io(_) | FatalError::Timeout) {
+                self.violation(
+                    "C4",
+                    format!("plan_read が {error:?} を返した（フレーム型は返さない）"),
+                );
+            }
+            self.drop_connection();
+            Fatal {
+                error,
+                by_driver: true,
+            }
+        })
     }
 
-    /// The live connection, for C11's direct calls.
     pub(crate) fn connection(&self) -> Option<&dyn FrameConnection> {
-        self.conn.as_deref()
+        self.session.as_ref().and_then(FrameSession::connection)
     }
+}
 
-    /// A step's static sanity (the engine could not receive it otherwise).
-    fn validate_step(&mut self, step: &Step) -> Result<(), Fatal> {
-        let problem = match &step.expect {
-            FrameRule::None => None,
-            _ if step.max_len == 0 => Some("max_len が 0".to_owned()),
-            FrameRule::Fixed(n) if *n == 0 || *n > step.max_len => {
-                Some(format!("Fixed({n}) が 1..=max_len（{}）の外", step.max_len))
-            }
-            FrameRule::Terminator(t) if t.is_empty() => Some("Terminator が空".to_owned()),
-            FrameRule::LengthPrefixed(p)
-                if p.width == 0 || (p.encoding == PrefixEncoding::Binary && p.width > 8) =>
-            {
-                Some(format!("LengthPrefixed の width {} は読めない", p.width))
-            }
-            _ => None,
-        };
-        match problem {
-            Some(p) => Err(self.violation_fatal("C9", format!("step が受信できない: {p}"))),
-            None => Ok(()),
+impl Drop for Engine<'_> {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
+}
 
-    /// Send `step` and receive its response by `step.expect` (design §4.2
-    /// steps 2-3). `Ok(None)` for `FrameRule::None`.
-    fn exchange(&mut self, step: &Step) -> Result<Option<Vec<u8>>, Fatal> {
-        self.validate_step(step)?;
-        let expects_response = !matches!(step.expect, FrameRule::None);
-        let mut once = if expects_response {
-            self.once.take()
-        } else {
-            None
-        };
-        if matches!(once, Some(Once::Noise(_))) && step.expect != FrameRule::DriverDecides {
-            // Noise can only be skipped under DriverDecides; keep it for a
-            // step that can.
-            self.once = once.take();
-        }
-        let reply = match &once {
-            Some(Once::Broken) => match self.peer.reply_broken(&step.send) {
-                Some(r) => r,
-                None => {
-                    once = None;
-                    self.peer.reply(&step.send)
-                }
-            },
-            Some(Once::Close) => {
-                let _ = self.peer.reply(&step.send);
+struct Wire {
+    tx: mpsc::Sender<Request>,
+    control: Arc<Mutex<Control>>,
+    timeout: Duration,
+    arrivals: VecDeque<(Instant, Vec<u8>)>,
+    closed: bool,
+}
+
+impl Transport for Wire {
+    fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
+        Box::pin(async move {
+            let (rule, mut once, split) = {
+                let mut control = self.control.lock().unwrap();
+                let rule = control.rule.clone().unwrap_or(FrameRule::None);
+                let once = if rule == FrameRule::None {
+                    None
+                } else {
+                    control.once.take()
+                };
+                (rule, once, control.split)
+            };
+            if matches!(once, Some(Once::Noise(_))) && rule != FrameRule::DriverDecides {
+                self.control.lock().unwrap().once = once.take();
+            }
+            let mut reply = self.request(bytes, matches!(once, Some(Once::Broken)));
+            if reply.is_none() {
+                once = None;
+                reply = self.request(bytes, false);
+            }
+            let reply = if matches!(once, Some(Once::Close)) {
                 Reply::Close
+            } else {
+                reply.unwrap()
+            };
+            if once.is_some() {
+                self.control.lock().unwrap().fired = true;
             }
-            _ => self.peer.reply(&step.send),
-        };
-        if once.is_some() {
-            self.fired = true;
-        }
-
-        if !expects_response {
-            if matches!(reply, Reply::Close) {
-                self.drop_connection();
-                return Err(Fatal::engine(FatalError::Io("相手が接続を閉じた".into())));
+            self.arrivals.clear();
+            self.closed = false;
+            if rule == FrameRule::None {
+                return if reply == Reply::Close {
+                    Err(FatalError::Io("相手が接続を閉じた".into()))
+                } else {
+                    Ok(())
+                };
             }
-            return Ok(None);
-        }
-
-        // What arrives, and when (relative to the send).
-        let mut arrivals: Vec<(Duration, Vec<u8>)> = Vec::new();
-        if !self.pending.is_empty() {
-            arrivals.push((Duration::ZERO, std::mem::take(&mut self.pending)));
-        }
-        let mut reply_arrivals: Vec<(Duration, Vec<u8>)> = Vec::new();
-        let mut closed = false;
-        match reply {
-            Reply::Bytes(b) => reply_arrivals.push((Duration::ZERO, b)),
-            Reply::Chunks(chunks, gap) => {
-                for (i, c) in chunks.into_iter().enumerate() {
-                    reply_arrivals.push((gap * i as u32, c));
+            let mut arrivals = match reply {
+                Reply::Bytes(bytes) => vec![(Duration::ZERO, bytes)],
+                Reply::Chunks(chunks, gap) => chunks
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, c)| (gap.saturating_mul(i as u32), c))
+                    .collect(),
+                Reply::Silence => Vec::new(),
+                Reply::Close => {
+                    self.closed = true;
+                    Vec::new()
                 }
-            }
-            Reply::Silence => {}
-            Reply::Close => closed = true,
-        }
-        match &once {
-            Some(Once::Late) => {
-                for a in &mut reply_arrivals {
-                    a.0 += self.timeout + Duration::from_millis(1);
+            };
+            match once {
+                Some(Once::Late) => {
+                    for arrival in &mut arrivals {
+                        arrival.0 += self.timeout + Duration::from_millis(1);
+                    }
                 }
-            }
-            Some(Once::Noise(noise)) => arrivals.push((Duration::ZERO, noise.clone())),
-            Some(Once::CloseMidway) => {
-                let total: usize = reply_arrivals.iter().map(|a| a.1.len()).sum();
-                let mut keep = total / 2;
-                for a in &mut reply_arrivals {
-                    let n = a.1.len().min(keep);
-                    a.1.truncate(n);
-                    keep -= n;
+                Some(Once::Noise(bytes)) => arrivals.insert(0, (Duration::ZERO, bytes)),
+                Some(Once::CloseMidway) => {
+                    let mut keep = arrivals.iter().map(|a| a.1.len()).sum::<usize>() / 2;
+                    for arrival in &mut arrivals {
+                        let n = keep.min(arrival.1.len());
+                        arrival.1.truncate(n);
+                        keep -= n;
+                    }
+                    self.closed = true;
                 }
-                closed = true;
-            }
-            Some(Once::Endless) => {
-                let filler = filler_byte(&step.expect);
-                let count = (self.timeout.as_millis() as usize) + 2;
-                reply_arrivals = (0..count)
-                    .map(|i| (ENDLESS_INTERVAL * i as u32, vec![filler; ENDLESS_CHUNK]))
-                    .collect();
-            }
-            _ => {}
-        }
-        arrivals.extend(reply_arrivals);
-        let arrivals = self.cut(arrivals);
-
-        let mut buf: Vec<u8> = Vec::new();
-        let mut iter = arrivals.into_iter();
-        let mut arrived_late = Vec::new();
-        for (at, bytes) in iter.by_ref() {
-            if at > self.timeout {
-                arrived_late.extend(bytes);
-                break;
-            }
-            buf.extend_from_slice(&bytes);
-            if let Some(len) = self.check_complete(step, &mut buf)? {
-                if len > step.max_len as usize {
-                    self.drop_connection();
-                    return Err(Fatal::engine(FatalError::Framing(format!(
-                        "応答（{len} バイト）が max_len（{}）を超えた",
-                        step.max_len
-                    ))));
+                Some(Once::Endless) => {
+                    let count = (self.timeout.as_millis() as usize).saturating_add(2);
+                    arrivals = (0..count)
+                        .map(|i| {
+                            (
+                                Duration::from_millis(i as u64),
+                                vec![filler_byte(&rule); 16],
+                            )
+                        })
+                        .collect();
                 }
-                // The rest of `buf` is discarded, never carried over.
-                return Ok(Some(buf[..len].to_vec()));
+                _ => {}
             }
-            if buf.len() > step.max_len as usize {
-                self.drop_connection();
-                return Err(Fatal::engine(FatalError::Framing(format!(
-                    "応答が max_len（{}）を超えても完結しない",
-                    step.max_len
-                ))));
-            }
-        }
-        for (_, bytes) in iter {
-            arrived_late.extend(bytes);
-        }
-        // Timed out (or closed). Whatever is still coming belongs to this
-        // connection's wire - and is dropped with it (C6).
-        self.pending = arrived_late;
-        let timed_out = !self.pending.is_empty() || !closed;
-        self.drop_connection();
-        if timed_out {
-            Err(Fatal::engine(FatalError::Timeout))
-        } else {
-            Err(Fatal::engine(FatalError::Io("相手が接続を閉じた".into())))
-        }
+            let now = Instant::now();
+            self.arrivals = Self::cut(split, arrivals)
+                .into_iter()
+                .filter(|(_, b)| !b.is_empty())
+                .map(|(at, bytes)| (now + at, bytes))
+                .collect();
+            Ok(())
+        })
     }
 
-    /// Apply the persistent [`Split`].
-    fn cut(&self, arrivals: Vec<(Duration, Vec<u8>)>) -> Vec<(Duration, Vec<u8>)> {
-        let Some(split) = self.split else {
+    fn recv<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> BoxFuture<'a, Result<usize, FatalError>> {
+        Box::pin(async move {
+            if let Some((at, bytes)) = self.arrivals.pop_front() {
+                tokio::time::sleep_until(at).await;
+                let n = bytes.len();
+                buf.extend(bytes);
+                Ok(n)
+            } else if self.closed {
+                Err(FatalError::Io("相手が接続を閉じた".into()))
+            } else {
+                std::future::pending().await
+            }
+        })
+    }
+    fn discard_input(&mut self) -> BoxFuture<'_, ()> {
+        self.arrivals.clear();
+        Box::pin(async {})
+    }
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        self.arrivals.clear();
+        Box::pin(async {})
+    }
+}
+
+impl Wire {
+    fn request(&self, bytes: &[u8], broken: bool) -> Option<Reply> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Request::Reply {
+                bytes: bytes.to_vec(),
+                broken,
+                answer: tx,
+            })
+            .unwrap();
+        rx.recv().unwrap()
+    }
+    fn cut(split: Option<Split>, arrivals: Vec<(Duration, Vec<u8>)>) -> Vec<(Duration, Vec<u8>)> {
+        let Some(split) = split else {
             return arrivals;
         };
         let mut out = Vec::new();
@@ -514,123 +470,8 @@ impl<'a> Engine<'a> {
         }
         out
     }
-
-    /// `Some(len)` when `buf` starts with a complete response.
-    fn check_complete(&mut self, step: &Step, buf: &mut Vec<u8>) -> Result<Option<usize>, Fatal> {
-        match &step.expect {
-            FrameRule::Fixed(n) => Ok((buf.len() >= *n as usize).then_some(*n as usize)),
-            FrameRule::LengthPrefixed(p) => self.prefixed_len(p, step.max_len, buf),
-            FrameRule::Terminator(t) => Ok(buf
-                .windows(t.len())
-                .position(|w| w == &t[..])
-                .map(|i| i + t.len())),
-            FrameRule::DriverDecides => loop {
-                if buf.is_empty() {
-                    return Ok(None);
-                }
-                let check = self.conn_ref().is_complete(step, buf);
-                match check {
-                    Err(e) => return Err(self.driver_fatal("is_complete", e)),
-                    Ok(FrameCheck::Incomplete) => return Ok(None),
-                    Ok(FrameCheck::Complete { len }) => {
-                        if len == 0 || len as usize > buf.len() {
-                            return Err(self.violation_fatal(
-                                "C9",
-                                format!(
-                                    "is_complete が Complete {{ len: {len} }}（受信は {} バイト）",
-                                    buf.len()
-                                ),
-                            ));
-                        }
-                        return Ok(Some(len as usize));
-                    }
-                    Ok(FrameCheck::Discard(n)) => {
-                        if n == 0 || n as usize > buf.len() {
-                            return Err(self.violation_fatal(
-                                "C9",
-                                format!(
-                                    "is_complete が Discard({n})（受信は {} バイト。1 以上・受信以下）",
-                                    buf.len()
-                                ),
-                            ));
-                        }
-                        buf.drain(..n as usize);
-                    }
-                    Ok(other) => {
-                        return Err(self.violation_fatal(
-                            "C9",
-                            format!("is_complete が未知の FrameCheck を返した: {other:?}"),
-                        ))
-                    }
-                }
-            },
-            // `None` is handled before receiving; an unknown future rule
-            // cannot be received by this harness version.
-            other => {
-                Err(self
-                    .violation_fatal("C9", format!("このハーネスが知らない FrameRule: {other:?}")))
-            }
-        }
-    }
-
-    fn prefixed_len(
-        &mut self,
-        p: &PrefixSpec,
-        max_len: u32,
-        buf: &[u8],
-    ) -> Result<Option<usize>, Fatal> {
-        let start = p.offset as usize;
-        let need = start + p.width as usize;
-        if buf.len() < need {
-            return Ok(None);
-        }
-        let field = &buf[start..need];
-        let value: Option<u64> = match p.encoding {
-            PrefixEncoding::Binary => {
-                let mut v = 0u64;
-                if p.big_endian {
-                    for &b in field {
-                        v = (v << 8) | u64::from(b);
-                    }
-                } else {
-                    for &b in field.iter().rev() {
-                        v = (v << 8) | u64::from(b);
-                    }
-                }
-                Some(v)
-            }
-            PrefixEncoding::AsciiHex => std::str::from_utf8(field)
-                .ok()
-                .and_then(|s| u64::from_str_radix(s, 16).ok()),
-            PrefixEncoding::AsciiDec => std::str::from_utf8(field)
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok()),
-            other => {
-                return Err(self.violation_fatal(
-                    "C9",
-                    format!("このハーネスが知らない PrefixEncoding: {other:?}"),
-                ))
-            }
-        };
-        let Some(value) = value else {
-            self.drop_connection();
-            return Err(Fatal::engine(FatalError::Framing(format!(
-                "長さ欄 {field:02X?} が読めない"
-            ))));
-        };
-        let total = value as i128 + i128::from(p.adjust);
-        if total < need as i128 || total > i128::from(max_len) {
-            self.drop_connection();
-            return Err(Fatal::engine(FatalError::Framing(format!(
-                "長さ欄が総長 {total} を示す（{need}..={max_len} の外）"
-            ))));
-        }
-        let total = total as usize;
-        Ok((buf.len() >= total).then_some(total))
-    }
 }
 
-/// A filler byte that cannot end a response under `rule` by itself.
 fn filler_byte(rule: &FrameRule) -> u8 {
     match rule {
         FrameRule::Terminator(t) => (0u8..=255).find(|b| !t.contains(b)).unwrap_or(0),
@@ -643,11 +484,10 @@ mod tests {
     use super::*;
     use banto_driver_api::{
         AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
-        FieldError, TagKind,
+        FieldError, FrameCheck, PrefixEncoding, PrefixSpec, Step, TagKind,
     };
 
-    /// A driver whose only step is a fixed request under a configurable
-    /// rule; decode returns the response's length.
+    /// 規則を切り替えられる 1 step のドライバ。応答をそのまま返す。
     struct OneStep(DriverDescriptor, FrameRule);
 
     impl DriverBase for OneStep {
@@ -681,7 +521,7 @@ mod tests {
             Ok(None)
         }
         fn is_complete(&self, _s: &Step, buf: &[u8]) -> Result<FrameCheck, FatalError> {
-            // Skip leading 0xFF, complete at the first 0x0A (inclusive).
+            // 先頭の 0xFF を捨て、最初の 0x0A までを応答とする。
             if buf[0] == 0xFF {
                 let n = buf.iter().take_while(|&&b| b == 0xFF).count();
                 return Ok(FrameCheck::Discard(n as u32));

@@ -43,10 +43,15 @@ const G = {
 		},
 		// R1-1: 公開するドライバ API（依存ゼロ）と、その型を再輸出する banto-plc。
 		{ name: 'banto-driver-api', dir: 'crates/banto-driver-api', deps: [] },
-		// R1-2: 公開する適合テスト一式（API にだけ依存）。
+		// R2b-3b-core: 公開する適合テストは API と本物のエンジンに依存。
 		{
 			name: 'banto-driver-conformance',
 			dir: 'crates/banto-driver-conformance',
+			deps: ['banto-driver-api', 'banto-driver-engine']
+		},
+		{
+			name: 'banto-driver-engine',
+			dir: 'crates/banto-driver-engine',
 			deps: ['banto-driver-api']
 		},
 		// R1-3b: ホストが注入する組み込みドライバ一式。bin（R1-7a から banto-hub-host）・shell・
@@ -418,7 +423,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -904,7 +909,7 @@ test('実グラフ: 主な crate の逆依存が期待のパッケージを含�
 	}
 });
 
-test('実グラフ: banto-driver-api は依存ゼロ、conformance は API だけに依存し、変更すると driver-api ジョブが走る', () => {
+test('実グラフ: banto-driver-api は依存ゼロ、engine と conformance は公開 crate だけに依存し、変更すると driver-api ジョブが走る', () => {
 	const g = real();
 	const api = g.packages.find((p) => p.name === 'banto-driver-api');
 	assert.ok(api, 'banto-driver-api が workspace に無い');
@@ -914,14 +919,25 @@ test('実グラフ: banto-driver-api は依存ゼロ、conformance は API だ�
 		'banto-driver-api に workspace の依存ができた（公開できなくなる）'
 	);
 	assert.ok(reverseDeps(g, ['banto-driver-api']).has('banto-plc'));
-	// R1-2: 適合テスト一式も公開するので、workspace の依存は API だけ。
+	// R2b-3b-core: 適合テストも本物の実行系を使い、公開する crate だけに依存する。
 	const conformance = g.packages.find((p) => p.name === 'banto-driver-conformance');
 	assert.ok(conformance, 'banto-driver-conformance が workspace に無い');
 	assert.deepEqual(
 		conformance.deps,
-		['banto-driver-api'],
-		'banto-driver-conformance に API 以外の workspace の依存ができた（公開できなくなる）'
+		['banto-driver-api', 'banto-driver-engine'],
+		'banto-driver-conformance に公開対象以外の workspace の依存ができた'
 	);
+	const engine = g.packages.find((p) => p.name === 'banto-driver-engine');
+	assert.ok(engine, 'banto-driver-engine が workspace に無い');
+	assert.deepEqual(engine.deps, ['banto-driver-api']);
+	const engineChange = classify({
+		event: 'pull_request',
+		files: ['crates/banto-driver-engine/src/lib.rs'],
+		graph: g
+	});
+	assert.equal(engineChange.jobs.run_driver_api, true);
+	assert.ok(engineChange.jobs.rust_args.includes('-p banto-driver-engine'));
+	assert.ok(engineChange.jobs.rust_args.includes('-p banto-driver-conformance'));
 	assert.equal(
 		classify({
 			event: 'pull_request',

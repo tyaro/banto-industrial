@@ -156,6 +156,9 @@ impl Step {
 /// returns one result per entry, in `covers` order. For a write, they are
 /// indices into the `items` given to [`FrameConnection::write_next`], for
 /// logs and audit only.
+/// Write `covers` must not contain duplicate indices within a step (the same
+/// index may appear in different steps). A violation is a fatal C10 contract
+/// violation: the engine returns [`FatalError::Protocol`] and drops the connection.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

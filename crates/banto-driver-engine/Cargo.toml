@@ -1,0 +1,21 @@
+# R2b-3b-core: 公開するフレーム型ドライバの実行系。API 以外の内部 crate に依存しない。
+[package]
+name = "banto-driver-engine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+publish = true
+description = "banto-driver-api のフレーム型ドライバを実行する、期限つきの通信エンジン"
+repository = "https://github.com/tyaro/banto-industrial"
+readme = false
+
+[dependencies]
+banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+# MSRV 1.85 の検証では Cargo.lock の 0.8.35 を使う（0.8.42 は Rust 1.88 を要求する）。
+encoding_rs = "0.8.35"
+tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "test-util"] }
