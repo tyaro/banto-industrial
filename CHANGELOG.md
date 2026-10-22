@@ -2,6 +2,33 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.34 — 2026-10-22（アルファ）
+
+### 上げる方への注意: 戻せない DB の切り替え（必ず読んでください）
+
+- **この版は DB を戻せない形に作り直します。** banto-tags の DB マイグレーション 0025（`plc_connections` の固定列を `settings`（JSON）へ移し、パスワードを別の表 `plc_connection_secrets` へ退避する）と 0026（平文の清掃を数えるトリガ）が当たります。**一度起動した DB は alpha.33 以前の banto-hub では開けません。** ChronoGazer の DB にも同じマイグレーションが当たります（ChronoGazer の行は `modbus-tcp`・`slmp`・`hub` だけでパスワードは無く、挙動は変わりません）。
+- **自動のバックアップ**: 移行の直前に、DB の隣へ `<DB>.before-0025-<UTC の日時>.bak`（例: `banto-hub.sqlite3.before-0025-20261022T031500Z.bak`）を作ります。移行が要らないとき（新規・移行済み・空の DB）は作りません。**それでも、更新前に自分でも DB をバックアップしてください。**
+- **バックアップにはパスワードが入りません。** `.bak` は postgres 接続のパスワードと、未適用キュー（承認待ちの変更）の中のパスワードを取り除き、空きページに残らないよう `VACUUM` してから完成させます（作りかけの `.bak.partial` は平文を含みうるので、次の起動で必ず消します）。**`.bak` に戻したら、postgres 接続のパスワードを入れ直してください。** 動作を確かめたら `.bak` は消してかまいません（自動では消しません）。
+- **戻し方**: banto-hub を止める → alpha.33 を入れ直す → DB を `.bak` に差し替える（元の `-wal`・`-shm` は消す）→ 起動 → postgres 接続のパスワードを入れ直す。移行の後に Hub で行った変更（接続・タグ・API キー・監査ログなど）は戻りません。手順の詳細は [運用ガイド](docs/banto-hub-operations.md) の「alpha.34 への更新と、移行・戻し方」。
+- **起動前の確認（preflight）**: 移行の前に DB の写しで予行をし、新しい検証を通らない接続や、ドライバの無い接続が 1 件でもあれば、**DB を一切変えずに起動を断ります**。メッセージに行の一覧（接続 id・名前・プロトコル・理由）が出ます。alpha.33 の banto-hub で該当の接続を直すか削除してから、この版で起動し直してください。alpha.32 以前の DB でも同じ確認が走ります。
+- 設定パッケージは版 2 のままです（読み書きの形は変えていません）。パスワードは持ち運べないので、取り込んだ後に postgres 接続で入れ直します。
+
+### パスワードの保管
+
+- **Windows**: postgres 接続のパスワードを DPAPI（マシンスコープ）で封印して DB の `plc_connection_secrets` に置きます。サービス・デスクトップ・昇格ヘルパーのどれからでも開けます。**DB を別の PC に移す・OS を入れ直すと開けなくなります。** その接続は `passwordState: "unreadable"`（`none` / `set` / `unreadable`）になり、接続のドロワーに「パスワード: 読めません（この PC で再入力してください）」と出ます。**空のパスワードで繋ぎに行くことはありません**（`trust` 認証の DB でも繋がない）。接続を編集してパスワードを入れ直すと直ります。
+- **Windows 以外**: 今までどおり平文（`plain-v1`）で置きます。起動ログと状態の画面に「秘密値を平文で保存しています（Windows 以外）」の警告を出します。非 Windows の DB を Windows の Hub で開くと、起動時に DPAPI に封印し直します。
+- 未適用キューのペイロードのパスワードも、積む時点で封印します。適用済み・取り消した行（履歴）にはパスワードも封印した値も残しません。
+- 平文を取り除いた後は、起動時に `VACUUM` と WAL の切り詰めで空きページと WAL からも消します（途中で落ちても「清掃待ち」の印が残り、次の起動でやり直します）。DPAPI の失敗は起動を止めず、状態の画面（管理者向け `GET /api/status` の `secretStorage`）に「移行待ちの秘密値が平文で残っています（n 件）」と出します。
+- DB Sink サイドカー・DB ブリッジの設定（`GET /api/sink/config`・`GET /api/ingest/bridge-config`）は、読めない接続を載せず `unavailableConnections` / `unavailableSources` に理由付きで出します（`password: null` で返すことはしません）。古いサイドカーはその接続に繋ぎません。
+
+### 変更
+
+- **REST・MCP の形**は変えていません。足したのは接続の応答の `passwordState` と、状態・サイドカー設定の上の欄だけです。
+- **MCP の接続ツール**（`create_connection` / `update_connection`）が `push` と `settings` を扱えるようにした（#768。取り込み口 `push` の `stale_timeout_ms` と DB ブリッジの設定）。
+- **PostgreSQL 接続にサーバー側の `statement_timeout`（30 秒）を課した**（#769。Hub 内の Source と DB ブリッジの両方）。クライアントが future を捨てた後も DB 側で走り続ける文に上限を付けます。**PgBouncer などのプーラー経由では、`ignore_startup_parameters = options` を設定しないと接続を断られます。その設定で通しても `options` が捨てられるのでサーバー側の上限は掛かりません**（プーラー経由では `SHOW statement_timeout` で確かめてください）。
+- **内部**: 接続の検証をドライバのレジストリから引くようにした（`push`・`postgres`・`virtual` は `DriverKind::HostProvided` として登録）。接続の設定は `settings` の JSON に保存します。`ALLOWED_PROTOCOLS` は ChronoGazer と旧い平らな検証のための旧規則として残します（R2b-7 まで）。
+- **修正（テスト）**: ingest の送り手のタイムアウトのテストのフレークを直した（#770）。
+
 ## v0.2.0-alpha.33 — 2026-10-21（アルファ）
 
 ### 上げる方への注意: DB のバックアップ
