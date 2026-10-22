@@ -85,6 +85,7 @@
 		type BatchTagsDeleteResult,
 		type BatchTagUpdateRow,
 		type BatchTagFieldError,
+		type ParseAddressItem,
 		parseTagAddresses
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
@@ -167,6 +168,7 @@
 	import {
 		canDefaultWritable,
 		writableAfterAreaVerdict,
+		resolveWritableAtSubmit,
 		writableDefaultBlockedReason
 	} from '#lib/banto/writableDefault.js';
 	import {
@@ -916,18 +918,13 @@
 	// 付け替え）で effect が再実行されて既定が点滅しないようにする。
 	const createConnectionId = $derived(connectionForGroupId(createForm.collectionGroupId)?.id);
 
-	$effect(() => {
-		const seq = ++createWritableAreaSeq;
-		if (drawerMode !== 'create' || createForm.tagKind !== 'plc') {
-			createWritableArea = undefined;
-			return;
-		}
+	/** 解析に渡す 1 件と、その結果が「どの入力に対するものか」を表すキー。対象外は `undefined`。 */
+	function createParseRequest():
+		{ connectionId: number; item: ParseAddressItem; key: string } | undefined {
 		const address = createForm.address.trim();
 		const connectionId = createConnectionId;
-		if (address === '' || connectionId === undefined) {
-			createWritableArea = undefined;
-			return;
-		}
+		if (drawerMode !== 'create' || createForm.tagKind !== 'plc') return undefined;
+		if (address === '' || connectionId === undefined) return undefined;
 		const item = {
 			tagKind: createForm.tagKind,
 			address,
@@ -936,12 +933,28 @@
 				createForm.dataType === 'string' ? parseOptionalNumber(createForm.stringLength) : undefined,
 			stringEncoding: createForm.dataType === 'string' ? createForm.stringEncoding : undefined
 		};
+		return { connectionId, item, key: JSON.stringify([connectionId, item]) };
+	}
+
+	/** `createWritableArea` を埋めた入力のキー（送信時に「結果が届いているか」を判定する）。 */
+	let createWritableAreaKey: string | undefined = undefined;
+
+	$effect(() => {
+		const seq = ++createWritableAreaSeq;
+		createWritableAreaKey = undefined;
+		const request = createParseRequest();
+		if (request === undefined) {
+			createWritableArea = undefined;
+			return;
+		}
+		const { connectionId, item, key } = request;
 		const timer = setTimeout(() => {
 			parseTagAddresses(connectionId, [item]).then(
 				(results) => {
 					if (seq !== createWritableAreaSeq) return;
 					const first = results[0];
 					createWritableArea = first?.ok ? (first.writableArea ?? undefined) : undefined;
+					createWritableAreaKey = key;
 				},
 				() => {
 					if (seq === createWritableAreaSeq) createWritableArea = undefined;
@@ -952,6 +965,16 @@
 		createWritableArea = undefined;
 		return () => clearTimeout(timer);
 	});
+
+	/** 選択中のグループの `defaultWritable`（未選択・見つからない間は全体既定の `true`）。 */
+	function createGroupWritableDefault(): boolean {
+		const groupId = Number(createForm.collectionGroupId);
+		const selectedGroup =
+			createForm.collectionGroupId !== '' && Number.isFinite(groupId)
+				? groups.find((g) => g.id === groupId)
+				: undefined;
+		return selectedGroup?.defaultWritable ?? true;
+	}
 
 	/**
 	 * T19 S1-b（UX-34）: create Drawer が開いている間、`createForm.writable`
@@ -986,16 +1009,8 @@
 	 */
 	$effect(() => {
 		if (drawerMode !== 'create' || createWritableTouched) return;
-		const eligible = canDefaultWritable(createForm.tagKind, createWritableArea);
-		const groupId = Number(createForm.collectionGroupId);
-		const selectedGroup =
-			createForm.collectionGroupId !== '' && Number.isFinite(groupId)
-				? groups.find((g) => g.id === groupId)
-				: undefined;
-		// 未選択・グループが見つからない間は全体既定の `true` にフォール
-		// バックする（`groupWritableDefault.ts` の旧実装と同じ既定値）。
-		const groupDefault = selectedGroup?.defaultWritable ?? true;
-		createForm.writable = eligible && groupDefault;
+		createForm.writable =
+			canDefaultWritable(createForm.tagKind, createWritableArea) && createGroupWritableDefault();
 	});
 
 	/**
@@ -1127,6 +1142,30 @@
 		createErrors = {};
 		resetCreateExprCheck();
 		try {
+			// 解析の結果が未着のまま送ると既定の `writable` が効かない（`createWritableArea` 宣言の
+			// コメント参照）。ここで待つ。`creating` の間は送信ボタンが無効なので二重送信にならない。
+			const request = createParseRequest();
+			if (request !== undefined) {
+				const seq = ++createWritableAreaSeq; // 遅れて届くデバウンスの応答に上書きさせない
+				const resolved = await resolveWritableAtSubmit({
+					tagKind: createForm.tagKind,
+					area: createWritableArea,
+					areaCurrent: createWritableAreaKey === request.key,
+					touched: createWritableTouched,
+					writable: createForm.writable,
+					groupDefault: createGroupWritableDefault(),
+					parse: async () => {
+						const results = await parseTagAddresses(request.connectionId, [request.item]);
+						const first = results[0];
+						return first?.ok ? (first.writableArea ?? undefined) : undefined;
+					}
+				});
+				if (seq === createWritableAreaSeq && createParseRequest()?.key === request.key) {
+					createWritableArea = resolved.area;
+					createWritableAreaKey = request.key;
+				}
+				createForm.writable = resolved.writable;
+			}
 			const created = await createTag(toInput(createForm));
 			toastStore.push('success', '作成しました');
 			monitorCtaHref = monitorHref({

@@ -279,6 +279,31 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		expect(saved[0].writable).toBe(false);
 	});
 
+	test('2.6. create Drawer: アドレスを入力して待たずに保存しても、グループの既定（writable ON）が効く（R2b-2d、Codex P2）', async () => {
+		const SUBMIT_RACE_TAG_NAME = 'e2e-form-writable-submit-race';
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill(SUBMIT_RACE_TAG_NAME);
+		await drawer.getByLabel('アドレス').fill('40051');
+		// デバウンス（300ms）の解析を待たずに送る。送信時に解析を待って既定を決める。
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+
+		const token = await fetchAuthToken(page.request);
+		const tagsRes = await page.request.get('/api/tags', {
+			headers: { ...CSRF_HEADERS, Authorization: `Bearer ${token}` }
+		});
+		expect(tagsRes.ok()).toBe(true);
+		const tags = (await tagsRes.json()) as { name: string; writable: boolean }[];
+		const saved = tags.filter((t) => t.name === SUBMIT_RACE_TAG_NAME);
+		expect(saved).toHaveLength(1);
+		expect(saved[0].writable).toBe(true);
+	});
+
 	test('3. edit Drawer: 変更後 Enter で送信され、タグが更新される', async () => {
 		await page.goto('/tags');
 		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が

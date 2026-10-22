@@ -10,6 +10,7 @@
 import { describe, expect, it } from 'vitest';
 import {
 	canDefaultWritable,
+	resolveWritableAtSubmit,
 	writableAfterAreaVerdict,
 	writableDefaultBlockedReason
 } from './writableDefault';
@@ -88,5 +89,80 @@ describe('writableAfterAreaVerdict', () => {
 	it('plc 以外は writableArea に関わらず値を変えない', () => {
 		expect(writableAfterAreaVerdict('internal', false, true)).toBe(true);
 		expect(writableAfterAreaVerdict('computed', false, true)).toBe(true);
+	});
+});
+
+describe('resolveWritableAtSubmit（送信時に解析が未着でも既定が効く: Codex P2）', () => {
+	const base = {
+		tagKind: 'plc' as const,
+		area: undefined,
+		areaCurrent: false,
+		touched: false,
+		writable: false,
+		groupDefault: true
+	};
+
+	it('未着 + 書き込める領域 + グループ既定 ON: 解析を待って true', async () => {
+		let calls = 0;
+		const r = await resolveWritableAtSubmit({
+			...base,
+			parse: async () => {
+				calls += 1;
+				return true;
+			}
+		});
+		expect(calls).toBe(1);
+		expect(r).toEqual({ area: true, writable: true });
+	});
+
+	it('未着 + 読み取り専用の領域: false（手動 ON でも揃える）', async () => {
+		const r = await resolveWritableAtSubmit({
+			...base,
+			touched: true,
+			writable: true,
+			parse: async () => false
+		});
+		expect(r).toEqual({ area: false, writable: false });
+	});
+
+	it('グループ既定 OFF なら書き込める領域でも false', async () => {
+		const r = await resolveWritableAtSubmit({
+			...base,
+			groupDefault: false,
+			parse: async () => true
+		});
+		expect(r.writable).toBe(false);
+	});
+
+	it('解析の失敗・判定不能: 既定 ON を当てず、手動の値を保つ（保存は止めない）', async () => {
+		const failed = await resolveWritableAtSubmit({
+			...base,
+			touched: true,
+			writable: true,
+			parse: async () => {
+				throw new Error('network');
+			}
+		});
+		expect(failed).toEqual({ area: undefined, writable: true });
+		const unknown = await resolveWritableAtSubmit({ ...base, parse: async () => undefined });
+		expect(unknown.writable).toBe(false);
+	});
+
+	it('結果が届いている（areaCurrent）・対象外（parse なし）は解析を呼ばない', async () => {
+		let calls = 0;
+		const parse = async () => {
+			calls += 1;
+			return false;
+		};
+		const current = await resolveWritableAtSubmit({
+			...base,
+			area: true,
+			areaCurrent: true,
+			parse
+		});
+		expect(current).toEqual({ area: true, writable: true });
+		const none = await resolveWritableAtSubmit({ ...base, parse: undefined });
+		expect(none.writable).toBe(false);
+		expect(calls).toBe(0);
 	});
 });

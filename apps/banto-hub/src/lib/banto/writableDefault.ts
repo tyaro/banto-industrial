@@ -129,3 +129,39 @@ export function writableAfterAreaVerdict(
 	if (tagKind === 'plc' && writableArea === false) return false;
 	return writable;
 }
+
+/**
+ * R2b-2d（Codex レビュー P2、2026-10-22）: 送信の時点で解析の結果（`writableArea`）が
+ * まだ届いていない（300ms のデバウンス中・応答待ち）とき、その場で解析を待ってから
+ * `writable` を決める。待たないと `area` が `undefined` のまま保存され、グループの
+ * `defaultWritable` が黙って効かなくなる。
+ *
+ * - `areaCurrent` が `true`（フォームの入力に対する結果が届いている）なら `parse` は呼ばない。
+ * - `parse` が `undefined`（解析の対象外: `plc` 以外・アドレス空・接続未解決）なら呼ばない。
+ * - `parse` の失敗・`ok: false`（呼び出し側が `undefined` を返す）は判定不能で、既定 ON を
+ *   当てず手動の値を保つ。**保存は止めない**（最終的な判定はサーバー）。
+ * - `touched` が `false` の間だけ既定（{@link canDefaultWritable} かつグループの既定）を当てる。
+ *   どちらの場合も最後に {@link writableAfterAreaVerdict} で、確定した読み取り専用は `false`。
+ */
+export async function resolveWritableAtSubmit(args: {
+	tagKind: TagKind;
+	area: boolean | undefined;
+	areaCurrent: boolean;
+	touched: boolean;
+	writable: boolean;
+	groupDefault: boolean;
+	parse: (() => Promise<boolean | undefined>) | undefined;
+}): Promise<{ area: boolean | undefined; writable: boolean }> {
+	let area = args.area;
+	if (!args.areaCurrent && args.parse) {
+		try {
+			area = await args.parse();
+		} catch {
+			area = undefined;
+		}
+	}
+	let writable = args.writable;
+	if (!args.touched) writable = canDefaultWritable(args.tagKind, area) && args.groupDefault;
+	writable = writableAfterAreaVerdict(args.tagKind, area, writable);
+	return { area, writable };
+}
