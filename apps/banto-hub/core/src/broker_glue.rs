@@ -633,6 +633,7 @@ impl HubSessions {
             return None;
         }
         Some(SettingsFingerprint::of_connection(
+            protocol,
             saved,
             settings,
             &secret_keys_of(&self.drivers.registry, protocol),
@@ -926,6 +927,7 @@ impl BrokerSimRegistry {
         // `settings_to_api` never carries a secret's value; the references
         // come from the connection (the same rule as the broker's handle).
         let fingerprint = SettingsFingerprint::of_connection(
+            &conn.protocol,
             Some(conn),
             &settings,
             &secret_keys_of(registry, &conn.protocol),

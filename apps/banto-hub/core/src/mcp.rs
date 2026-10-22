@@ -741,12 +741,12 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "connectionId": {
                         "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。SLMP で既存の broker セッションがあればそれを再利用し、2本目をダイヤルしない。",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。収集中の broker セッションがあれば(プロトコルによらず)それを再利用し、2本目をダイヤルしない。フォームの接続先・unitId・CPU 種別などがそのセッションの設定と違えば試さず「保存してからテスト」と返す。",
                     },
                     "cpuType": {
                         "type": "string",
                         "enum": ["Q", "R"],
-                        "description": "SLMP の直接ダイヤルに使う CPU 種別。省略時は R。connectionId の既存セッションを再利用するとき、保存済みの CPU と違えば試さず「保存してからテスト」と返す。",
+                        "description": "SLMP の CPU 種別。省略時は保存済みの接続(connectionId)の CPU を引き継ぎ、保存済みが無ければドライバの既定(iQ-R)。収集中のセッションを再利用するとき、そのセッションの CPU と違えば試さず「保存してからテスト」と返す。",
                     },
                 },
                 "required": ["protocol", "host", "port"],

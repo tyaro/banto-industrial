@@ -80,6 +80,66 @@ async fn session_settings_check_uses_the_handle_generation_not_the_latest_publis
     sessions.shutdown().await;
 }
 
+fn conn_with_settings(protocol: &str, settings: serde_json::Value) -> banto_tags::PlcConnection {
+    let serde_json::Value::Object(settings) = settings else {
+        unreachable!("a JSON object literal")
+    };
+    banto_tags::PlcConnection::from_settings(
+        3,
+        "c".to_string(),
+        protocol.to_string(),
+        true,
+        false,
+        settings,
+        1,
+    )
+}
+
+/// R2b-3a-2（Codex のレビュー P2）: 設定が同じでもドライバの種類（protocol）が
+/// 違えば別のセッション。`resolve` は `changed` にし、Hub はセッションを張り直す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_protocol_with_the_same_settings_changes_the_resolved_dial_identity() {
+    let drivers = crate::test_support::test_drivers().registry;
+    let registry = crate::broker_glue::BrokerSimRegistry::new();
+    let settings = || serde_json::json!({ "host": "10.0.0.1", "port": 502 });
+    let (_, changed) = registry
+        .resolve(&conn_with_settings("modbus-tcp", settings()), &drivers)
+        .await;
+    assert!(changed);
+    let (_, changed) = registry
+        .resolve(&conn_with_settings("modbus-tcp", settings()), &drivers)
+        .await;
+    assert!(!changed, "同じ protocol・設定は同じ同一性");
+    let (_, changed) = registry
+        .resolve(&conn_with_settings("slmp", settings()), &drivers)
+        .await;
+    assert!(changed, "protocol だけ変えたらセッションの張り直し");
+}
+
+/// R2b-3a-2（Codex のレビュー）: Modbus の unit_id・word_order を変えると指紋が
+/// 変わり、セッションが張り直される。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identity() {
+    let drivers = crate::test_support::test_drivers().registry;
+    let registry = crate::broker_glue::BrokerSimRegistry::new();
+    let modbus = |unit: i64, order: &str| {
+        conn_with_settings(
+            "modbus-tcp",
+            serde_json::json!({
+                "host": "10.0.0.1", "port": 502, "unit_id": unit, "word_order": order,
+            }),
+        )
+    };
+    let (_, changed) = registry.resolve(&modbus(1, "low_high"), &drivers).await;
+    assert!(changed);
+    let (_, changed) = registry.resolve(&modbus(1, "low_high"), &drivers).await;
+    assert!(!changed);
+    let (_, changed) = registry.resolve(&modbus(2, "low_high"), &drivers).await;
+    assert!(changed, "unit_id の変更");
+    let (_, changed) = registry.resolve(&modbus(2, "high_low"), &drivers).await;
+    assert!(changed, "word_order の変更");
+}
+
 /// R2b-3a-2（コーディネータのレビュー）: `BrokerSimRegistry::resolve` の指紋は秘密値の
 /// **参照**を含む（値は含まない）。秘密値を差し替える（新しい参照で封印し直す）と
 /// `changed` になり、呼び出し側（`sync_broker_sessions_from`）がセッションを張り直す。
