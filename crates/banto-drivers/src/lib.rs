@@ -238,11 +238,16 @@ mod tests {
         );
     }
 
-    /// Tripwire 1 (design §6.3): every registered id is a value
-    /// `plc_connections.protocol` accepts (a `HostBound` id that is not in
-    /// `ALLOWED_PROTOCOLS` could never be looked up from a connection row).
+    /// Tripwire 1 (design §6.3; re-read by R2b-1f, connection-settings
+    /// design §4.1): every id `builtin()` registers is in the *legacy* rule
+    /// list `ALLOWED_PROTOCOLS`. `builtin()` is the registry ChronoGazer
+    /// shares (`modbus-tcp`, `slmp`), and ChronoGazer still validates with
+    /// that legacy list until R2b-7, so an id outside it could never be
+    /// looked up from a ChronoGazer connection row. It is not the Hub's rule:
+    /// the Hub's source of truth is its registry (`push`/`postgres`/`virtual`
+    /// are registered by the host; see `host/tests/registry_tripwire.rs`).
     #[test]
-    fn registry_ids_are_allowed_protocols() {
+    fn builtin_registry_ids_are_in_the_legacy_protocol_list() {
         let registry = builtin().registry;
         assert!(!registry.is_empty());
         for id in registry.ids() {

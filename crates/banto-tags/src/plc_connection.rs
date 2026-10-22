@@ -281,13 +281,24 @@ use crate::support::{
     map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
 };
 
-/// Protocols accepted in `plc_connections.protocol` today. Mirrors the SQL
-/// `CHECK` - as widened by `migrations/0004_plc_connections_allow_slmp.sql`,
-/// not `0001`'s original - and is kept in Rust too so
-/// [`validate_plc_connection_input`] produces a friendly `FieldError` instead
-/// of surfacing the raw SQLite CHECK constraint violation. The two must be
-/// changed together; `every_allowed_protocol_is_accepted_by_the_sql_check` is
-/// the tripwire if they drift.
+/// The **legacy** protocol rule list (R2b-1f, 2026-10-22). It is no longer the
+/// Hub's source of truth: since migration `0025` the SQL `CHECK` on
+/// `plc_connections.protocol` is only the `DriverId` grammar, and the Hub's
+/// vocabulary is its driver registry
+/// ([`PlcConnectionService::with_registry`], design
+/// `banto-hub-connection-settings-design.md` §4). This list stays, unchanged,
+/// as the rule of a service built without a registry
+/// ([`PlcConnectionService::new`]: ChronoGazer and tests) and of the old flat
+/// validation step (1) that [`validate_plc_connection_input`] still runs
+/// first, until R2b-7 retires both (refactor-plan; Q6). Until then, adding a
+/// protocol to the Hub means registering a driver **and** widening this list:
+/// step (1) runs first on every service, registry or not, and refuses any
+/// protocol missing here before the registry's validation is reached (so a
+/// registry-only protocol would fail every REST/MCP create and update). After
+/// R2b-7 registering the driver alone is enough. It originally mirrored the SQL
+/// `CHECK` (as widened by `migrations/0004_plc_connections_allow_slmp.sql`
+/// and later ones); `every_allowed_protocol_is_accepted_by_the_sql_check`
+/// still inserts every entry through the service.
 ///
 /// The six entries are, in order, [`MODBUS_PROTOCOL`], `"slmp"`,
 /// [`VIRTUAL_PROTOCOL`], [`POSTGRES_PROTOCOL`], [`HUB_PROTOCOL`] (widened by
