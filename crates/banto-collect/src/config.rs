@@ -37,8 +37,9 @@
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-use banto_driver_api::DriverRegistry;
-use banto_plc::{Address, DataType, ModbusTcpConfig, ReadRequest, SlmpConfig, SlmpCpu, WordOrder};
+use banto_broker::SettingsFingerprint;
+use banto_driver_api::{DriverRegistry, Settings, TagSpec};
+use banto_plc::{Address, DataType};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, PlcConnection, StoredSecretRow, Tag, PUSH_PROTOCOL,
 };
@@ -62,55 +63,60 @@ fn tag_key(id: i64) -> String {
     format!("tag:{id}")
 }
 
-/// The wire protocol a connection speaks. An enum (not the raw string) so
-/// protocol dispatch is a single exhaustive `match` in the client factory
-/// (`task.rs`) - the design's "プロトコル分岐は factory 関数に隔離". Also
-/// decides which address notation a tag's `address` column is parsed under
-/// ([`build_request`]) - `Address::parse` (Modbus reference numbers) for
-/// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes, e.g.
-/// `D100`) for [`Protocol::Slmp`] (I8, 2026-08-05: `banto-plc`'s SLMP client
-/// wired into collection).
-///
-/// T9-2 (apps/banto-hub/core's broker-routed simulation path): also `pub`
-/// (not `pub(crate)`) because `banto_hub_core::broker_glue::BrokerSimRegistry`
-/// needs to pass a `Protocol` value to `crate::simulation::start` when it
-/// starts an in-process simulator ahead of establishing a broker session -
-/// `BrokerSimRegistry::resolve` (`broker_glue.rs`) picks `Protocol::ModbusTcp`
-/// or `Protocol::Slmp` depending on the connection's own protocol (see
-/// `crate::simulation`'s module doc, "SLMP + banto-hub の broker 経路
-/// について").
+/// The two device protocols the plan knows by name: the simulator kind
+/// ([`crate::simulation::start`], picked by [`crate::BrokerSimRegistry`] until
+/// R2b-5) and the notation the save-time check [`check_tag_address`] (the
+/// legacy rule ChronoGazer saves with, address design Q7) parses a tag's
+/// address under - `Address::parse` (Modbus reference numbers) for
+/// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes) for
+/// [`Protocol::Slmp`]. Since R2b-3a-3 the collection plan itself reads every
+/// address through the connection's driver (`parse_address`) and carries no
+/// per-protocol configuration ([`ProtocolConfig`]); whether a connection is
+/// collected at all is decided by the driver registry, not by this enum
+/// ([`simulator_protocol`] maps a name to it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     ModbusTcp,
     Slmp,
 }
 
-/// The protocol-specific client configuration for one connection - exactly
-/// one variant per [`Protocol`], carrying the config [`crate::task::build_client`]
-/// hands to the matching `PlcClient` constructor. An enum (rather than two
-/// separate `Option` fields on [`ConnectionPlan`]) so a connection can never
-/// end up with a config for the wrong protocol, or none at all, and
-/// [`crate::collector::Collector::start`]'s per-option-timeout override
-/// (`connect_timeout`/`response_timeout`) has one `match` to update instead
-/// of two independently-fallible `Option` unwraps.
-/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): built from
-/// [`ModbusTcpConfig`]/[`SlmpConfig`]'s own derives, so two connections'
-/// protocol configs compare structurally - the building block
-/// [`crate::collector::Collector::apply_config`] uses to tell "this
-/// connection's settings changed" from "byte-for-byte identical, leave its
-/// task alone".
+/// How one connection is collected (R2b-3a-3, docs/banto-hub-driver-io-design.md
+/// §4.3): read through its broker session ([`Self::Broker`]), or sampled from an
+/// [`crate::external::ExternalSource`] ([`Self::External`]).
 ///
-/// #383 段階3 P3: [`Self::External`] is a `"hub"` connection - nothing to
-/// dial; its task samples a [`crate::external::ExternalSource`] instead
-/// (`crate::task::run_external_connection`). Deliberately **not** a
-/// [`Protocol`] / [`crate::ClientProtocol`] variant: those are public and
-/// banto-hub matches them exhaustively, while an external connection never
-/// gets a client or a simulator.
+/// Until R2b-3a-3 this had one variant per protocol carrying that protocol's
+/// client configuration (`ModbusTcpConfig` / `SlmpConfig`), projected by hand
+/// into a public `ClientSpec` and back into a client - the copy that dropped
+/// `word_order` (#334) and the SLMP CPU (#605). The broker now dials through
+/// the driver registry with the connection's `Settings`, so the plan only has
+/// to carry what makes two plans differ.
+///
+/// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): the building block
+/// [`crate::collector::Collector::apply_config`] uses to tell "this
+/// connection's settings changed" from "identical, leave its task alone".
+///
+/// #383 段階3 P3: [`Self::External`] is a `"hub"` (or R2a-1b `"push"`)
+/// connection - nothing to dial; its task samples a
+/// [`crate::external::ExternalSource`] instead
+/// (`crate::task::run_external_connection`).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ProtocolConfig {
-    ModbusTcp(ModbusTcpConfig),
-    Slmp(SlmpConfig),
+    Broker(BrokerPlan),
     External,
+}
+
+/// A broker-read connection's part of the plan (see [`ProtocolConfig`]).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct BrokerPlan {
+    /// The connection's settings as the registry stores them
+    /// (`banto_tags::settings_to_api`, no secret values) - an edit to any of
+    /// them makes the plan compare unequal, so the connection's task is
+    /// replaced.
+    pub settings: Settings,
+    /// The fingerprint of the session the task reads through, stamped by the
+    /// host after it ensured the session ([`CollectorConfig::set_broker_dial_target`]);
+    /// `None` until then.
+    pub dial: Option<SettingsFingerprint>,
 }
 
 /// A tag's fixed H/HH/L/LL limits (any subset may be set), compared against
@@ -186,8 +192,8 @@ impl ThresholdSource<'_> {
 pub(crate) struct TagPlan {
     pub key: String,
     /// `None` = no scaling (raw passes through); applied via
-    /// `banto_tags::scale_raw`. Never applied to a bit tag: those decode as
-    /// `banto_plc::TagValue::Bit` and map straight to 0.0/1.0 (there is no
+    /// `banto_tags::scale_raw`. Never applied to a bit tag: those read as
+    /// `banto_driver_api::Value::Bit` and map straight to 0.0/1.0 (there is no
     /// meaningful "scaled bit"). The tag's wire read lives positionally in
     /// [`GroupPlan::requests`] (aligned 1:1 with `tags`), not duplicated here.
     pub scaling: Option<Scaling>,
@@ -199,7 +205,7 @@ pub(crate) struct TagPlan {
 /// One collection group: a shared-period batch read against its connection.
 ///
 /// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): compares `requests`
-/// (already `PartialEq`/`Eq` on [`ReadRequest`]) and `tags` positionally, so
+/// (`PartialEq` on [`TagSpec`]) and `tags` positionally, so
 /// two `GroupPlan`s are equal iff every wire read and every resolved tag
 /// (scaling, thresholds) is identical - any address/type/scaling/threshold
 /// edit inside a group makes its owning [`ConnectionPlan`] compare unequal,
@@ -210,10 +216,12 @@ pub(crate) struct GroupPlan {
     pub key: String,
     pub period: Duration,
     pub period_ms: u32,
-    /// Wire reads in tag order (`requests[i]` <-> `tags[i]` <-> tstore column
-    /// `c{i+1}`). Passed straight to `PlcClient::read_batch`. Empty for an
-    /// external (`"hub"`) group.
-    pub requests: Vec<ReadRequest>,
+    /// Reads in tag order (`requests[i]` <-> `tags[i]` <-> tstore column
+    /// `c{i+1}`), each the connection driver's own `parse_address` result
+    /// with the tag's kind (R2b-3a-3). Passed straight to
+    /// `crate::CollectClient::read_batch`. Empty for an external (`"hub"`)
+    /// group.
+    pub requests: Vec<TagSpec>,
     /// #383 段階3 P3: for an external (`"hub"`) group, the external name of
     /// each tag in tag order (`external_names[i]` <-> `tags[i]`) - what the
     /// task looks up in the source's snapshot. Empty for a PLC group.
@@ -239,26 +247,19 @@ pub(crate) struct ConnectionPlan {
     pub config: ProtocolConfig,
     pub groups: Vec<GroupPlan>,
     /// T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): mirrors
-    /// `banto_tags::PlcConnection::simulation`. Carried on the plan (not just
-    /// consulted once during `build_config`) for two reasons: (1) it must
-    /// participate in this struct's `PartialEq` so toggling simulation on/off
-    /// with every other setting unchanged still makes `apply_config` (T7-1)
-    /// classify the connection "replaced" - the ordinary "this connection's
-    /// task gets stopped and respawned" path is exactly what starting/
-    /// stopping the in-process simulator needs to piggyback on (see
-    /// `crate::collector`'s module doc, T9-1 addendum); (2)
-    /// `crate::collector::Collector` reads it at task-spawn time to decide
-    /// whether to start a simulator and substitute its loopback address for
-    /// `config`'s real host/port before the task ever sees the plan - see
-    /// `crate::simulation`'s module doc for why that substitution happens
-    /// there and not here (this function keeps producing the DB-truth plan;
-    /// `Collector` is what needs a stable address across repeated
-    /// `apply_config` calls to diff against).
+    /// `banto_tags::PlcConnection::simulation`. Decides whether a tick of
+    /// this connection is appended to the store: a simulated value is shown
+    /// (current values, thresholds, events) but never recorded as a fact of
+    /// the physical PLC (`task.rs::record_ticks`). Part of this struct's
+    /// `PartialEq`, so toggling it replaces the connection's task. The
+    /// simulator itself is no longer started here: since R2b-3a-3 the host
+    /// substitutes its address before the broker session is ensured
+    /// ([`crate::BrokerSimRegistry`]).
     pub simulation: bool,
 }
 
-/// The immutable configuration snapshot [`crate::Collector::start`] consumes.
-/// Opaque by design: build it with [`build_config`] and hand it to `start`;
+/// The immutable configuration snapshot [`crate::Collector::start_with_client_factory`]
+/// consumes. Opaque by design: build it with [`build_config`] and hand it to the collector;
 /// its internals (the per-connection plans and the derived tstore
 /// [`StoreConfig`]) are this crate's concern.
 /// `PartialEq` (T7-1, docs/tag-server-design.md §4.3): a convenience derive
@@ -294,19 +295,13 @@ impl CollectorConfig {
             .sum()
     }
 
-    /// T9-2 (docs/ux-plan.md §1 / apps/banto-hub/core/src/broker_glue.rs's
-    /// "T9-1/T9-2 note", option (a)): force `ConnectionPlan::simulation =
-    /// false` for every connection whose key is in `connection_keys` -
-    /// banto-hub's `CollectorManager` calls this after `build_config` to
-    /// stop `Collector` from starting a second, unused in-process simulator
-    /// for a broker-managed connection (SLMP or, since #337, Modbus TCP)
-    /// whose dial address `CollectorManager`'s own `BrokerSimRegistry` has
-    /// already substituted
-    /// before the broker session was established (`Collector`'s own
-    /// simulator substitution happens too late in that path - see
-    /// `crate::simulation`'s module doc). A key not present in
-    /// `self.connections` is silently ignored (e.g. a connection with zero
-    /// collectible groups was already dropped by `build_config`).
+    /// T9-2 (apps/banto-hub/core/src/hub.rs): force `ConnectionPlan::simulation
+    /// = false` for every connection whose key is in `connection_keys`, so
+    /// those connections' ticks are recorded even while simulated. banto-hub
+    /// calls this for every broker-read connection (its simulated values are
+    /// recorded like any Good value); ChronoGazer does not (simulated values
+    /// are never recorded there). A key not present in `self.connections` is
+    /// silently ignored.
     pub fn suppress_simulation_for(&mut self, connection_keys: &std::collections::HashSet<String>) {
         for conn in &mut self.connections {
             if connection_keys.contains(&conn.key) {
@@ -315,87 +310,41 @@ impl CollectorConfig {
         }
     }
 
-    /// T9-2 (found necessary by this crate's own E2E coverage of the T9-2
-    /// simulation-toggle path, `apps/banto-hub/core/tests/t9_simulation.rs`):
-    /// overwrite the `host`/`port` of the broker-routed connection plan keyed
-    /// by `key` (no-op if `key` is absent).
+    /// Stamp the broker-read plan keyed by `key` with the fingerprint of the
+    /// session its task will read through (no-op for an absent key or an
+    /// external plan). R2b-3a-3: the fingerprint replaced the `(host, port)`
+    /// this used to stamp (T9-2), so a change of any dial setting - the
+    /// simulator's address, a SLMP CPU type, a re-sealed secret reference -
+    /// counts, not just the endpoint.
     ///
-    /// **#337 (2026-09-08)**: this used to touch `ProtocolConfig::Slmp` plans
-    /// only, deliberately - a Modbus plan's `simulation` flag was never
-    /// suppressed back then (its collection reads were not broker-routed), so
-    /// `apply_config`'s diff already noticed a simulation toggle on its own
-    /// and no synthetic diff signal was needed. Once #337 made Modbus reads
-    /// broker-routed, `CollectorManager` started calling
-    /// [`Self::suppress_simulation_for`] for Modbus plans too, which flattens
-    /// that natural signal away - so a Modbus plan now needs exactly the same
-    /// stamping as an SLMP one, for exactly the reasons below.
-    ///
-    /// This is purely a *diffing* signal for [`crate::Collector::apply_config`],
-    /// not a real dial instruction - a broker-routed connection is never
-    /// actually dialed from this `ProtocolConfig` (its `banto_collect::PlcClient`
-    /// is always the injected `BrokerReadClient`, wrapping a
-    /// `banto_broker::ReadOnlyHandle` banto-hub already resolved - see
-    /// `crate::task::ClientFactory`/`apps/banto-hub/core/src/broker_glue.rs`'s
-    /// `hub_client_factory`). But `apply_config`'s diff is *only*
-    /// `ConnectionPlan == ConnectionPlan` (see that struct's own `PartialEq`
-    /// doc comment) - a connection whose plan compares equal to its previous
-    /// one is classified "unchanged" and its already-running task is left
-    /// completely untouched, **including the `ClientFactory` closure it
-    /// captured at spawn time** (`crate::task::run_connection`'s `ctx.factory`
-    /// is fixed for the task's whole lifetime; a factory rebuilt on a later
-    /// rebuild is simply never seen by an "unchanged" task).
-    ///
-    /// For a broker-routed connection, `ConnectionPlan::simulation` is
-    /// unconditionally forced `false` by [`Self::suppress_simulation_for`]
-    /// (both before and after any simulation toggle), and this plan's
-    /// `host`/`port` otherwise mirror the registry row verbatim
-    /// (`crate::config::slmp_config_for`/`modbus_config_for`) - neither field reflects
-    /// the *actual resolved dial target* a broker-routed connection uses,
-    /// which lives entirely outside this plan (`apps/banto-hub/core/src/broker_glue.rs`'s
-    /// `BrokerSimRegistry`). So toggling `simulation` on/off (or editing the
-    /// connection's real host/port while it stays broker-routed) can leave
-    /// this plan comparing byte-for-byte equal across rebuilds even though
-    /// the broker session actually moved underneath it - "unchanged" would
-    /// then leave the running task's `ClientFactory` wired to a
-    /// `ReadOnlyHandle` for a broker session `HubSessions::remove` +
-    /// `ensure_connection` has already superseded, silently reading a stale
-    /// or dead session forever.
-    ///
-    /// banto-hub's `CollectorManager` calls this with the SAME resolved
-    /// `(host, port)` `BrokerSimRegistry::resolve` just computed for every
-    /// broker-routed connection (regardless of whether `resolve`
-    /// reported `changed` - applying it unconditionally is harmless: for an
-    /// unchanged target the value written back is identical to what was
-    /// already there, so the plan still compares equal and the connection
-    /// stays correctly classified "unchanged"). When the resolved target DID
-    /// change, this now makes the plan compare unequal, so `apply_config`
-    /// classifies the connection "replaced" - stopping the stale task and
-    /// spawning a fresh one with the freshly-built `ClientFactory`
-    /// (`CollectorManager::rebuild` builds it from this same rebuild's
-    /// `broker_handles`, i.e. the NEW broker session) - exactly the "this
-    /// connection's task gets stopped and respawned" path `BrokerSimRegistry::resolve`'s
-    /// own doc comment relies on to make the swap actually observable.
-    pub fn set_broker_dial_target(&mut self, key: &str, host: String, port: i64) {
+    /// **Why it is needed**: [`crate::Collector::apply_config`]'s diff is
+    /// only `ConnectionPlan == ConnectionPlan`. A connection whose plan
+    /// compares equal keeps its running task untouched, **including the
+    /// `crate::ClientFactory` closure (and so the broker handle) it captured
+    /// at spawn time**. When the host replaced the connection's broker
+    /// session (the dial settings changed: simulation toggled, simulator
+    /// restarted), the registry row - and so the rest of the plan - can be
+    /// identical; without the stamp the old task would keep reading a
+    /// superseded session forever. With it the plan compares unequal, the
+    /// connection is classified "replaced", and the new task gets the new
+    /// handle. Stamping an unchanged session again writes the same value, so
+    /// the connection stays "unchanged".
+    pub fn set_broker_dial_target(&mut self, key: &str, fingerprint: SettingsFingerprint) {
         if let Some(conn) = self.connections.iter_mut().find(|c| c.key == key) {
-            let port = u16::try_from(port).ok();
-            match &mut conn.config {
-                ProtocolConfig::Slmp(cfg) => {
-                    cfg.host = host;
-                    if let Some(port) = port {
-                        cfg.port = port;
-                    }
-                }
-                ProtocolConfig::ModbusTcp(cfg) => {
-                    cfg.host = host;
-                    if let Some(port) = port {
-                        cfg.port = port;
-                    }
-                }
-                // Never broker-routed (external plans - hub or push - have
-                // no endpoint to rewrite).
-                ProtocolConfig::External => {}
+            if let ProtocolConfig::Broker(plan) = &mut conn.config {
+                plan.dial = Some(fingerprint);
             }
         }
+    }
+
+    /// The keys of the connections this config reads through the broker -
+    /// the ones a host must ensure a session for.
+    pub fn broker_connection_keys(&self) -> HashSet<String> {
+        self.connections
+            .iter()
+            .filter(|conn| matches!(conn.config, ProtocolConfig::Broker(_)))
+            .map(|conn| conn.key.clone())
+            .collect()
     }
 
     /// #383 段階3 P3: does this config collect any external (`"hub"` or,
@@ -606,19 +555,21 @@ pub fn connections_with_collected_groups(groups: &[CollectionGroup]) -> HashSet<
 /// shared database). Reads via `banto-tags`' services and keeps only enabled,
 /// reachable rows (see this module's doc comment).
 ///
-/// Fails with [`CollectError::Config`] if any *included* tag's stored address
-/// does not parse under the PLC addressing rules or its `data_type` is
-/// outside the known vocabulary. This is the legacy-rules path (the plain
-/// `TagService::new`, ChronoGazer): there `banto-tags` does not validate the
-/// address format, so this is where a misconfigured tag is caught, before any
-/// socket is opened. On the registry path (`TagService::with_registry`, the
-/// Hub since R2b-2) the save layer already validated every tag with the
-/// connection's driver, and the Hub plans through
-/// `build_request_with_registry` instead. Registry read
-/// failures surface as [`CollectError::Registry`].
-pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectError> {
+/// Fails with [`CollectError::Config`] if any *included* connection's driver
+/// is missing or refuses its settings, or any included tag's stored address
+/// is refused by that driver's `parse_address` or its `data_type` is outside
+/// the known vocabulary. Every tag is read through `drivers` (R2b-3a-3,
+/// docs/banto-hub-driver-io-design.md §4.3): the plan carries the driver's own
+/// `TagSpec`s. On the legacy save path (the plain `TagService::new`,
+/// ChronoGazer) `banto-tags` does not validate the address with the driver, so
+/// this is where such a tag is caught, before any session is opened. Registry
+/// read failures surface as [`CollectError::Registry`].
+pub async fn build_config(
+    pool: &SqlitePool,
+    drivers: &DriverRegistry,
+) -> Result<CollectorConfig, CollectError> {
     let snapshot = RegistrySnapshot::load(pool).await?;
-    build_config_from(&snapshot)
+    build_config_from(&snapshot, drivers)
 }
 
 /// Build a collector configuration from an already-loaded registry snapshot.
@@ -637,34 +588,17 @@ pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectE
 /// [`CollectError::Config`] text - banto-hub's `last_config_error` does not
 /// change by a character (the goldens in this module's tests were run
 /// against the pre-段階2 implementation first).
-pub fn build_config_from(snapshot: &RegistrySnapshot) -> Result<CollectorConfig, CollectError> {
-    build_config_from_with(snapshot, PushSource::Unavailable)
-}
-
-/// [`build_config_from`] for a runtime that can (or cannot) collect `"push"`
-/// connections (docs/banto-hub-ingest-design.md §4.1, R2a-1b). Identical to
-/// the strict build in every other respect; [`PushSource::Unavailable`] is
-/// exactly [`build_config_from`]. banto-hub switches to
-/// [`PushSource::Available`] in R2a-1c.
-pub fn build_config_from_with(
+pub fn build_config_from(
     snapshot: &RegistrySnapshot,
-    push: PushSource,
+    drivers: &DriverRegistry,
 ) -> Result<CollectorConfig, CollectError> {
-    let (config, exclusions) = build_config_lenient_inner(
-        snapshot,
-        ThresholdSource::None,
-        HubSource::Unavailable,
-        push,
-        None,
-    );
-    match exclusions.iter().find_map(ConfigExclusion::strict_error) {
-        Some(err) => Err(err),
-        None => Ok(config),
-    }
+    build_config_from_with_registry(snapshot, PushSource::Unavailable, drivers)
 }
 
-/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): [`build_config_from_with`]
-/// that also checks every collected connection against `registry` first
+/// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): the strict build for
+/// a runtime that can (or cannot) collect `"push"` connections
+/// (docs/banto-hub-ingest-design.md §4.1, R2a-1b; [`PushSource::Unavailable`] is
+/// exactly [`build_config_from`]). It checks every collected connection against `registry` first
 /// ([`driver_exclusion`]): a connection whose driver is missing, whose stored
 /// `settings` the driver refuses, or whose settings shape is newer than the driver is
 /// an exclusion ([`ExclusionReason::DriverUnavailable`] /
@@ -672,20 +606,15 @@ pub fn build_config_from_with(
 /// This being the strict build, it then fails the build with that item's wording, the
 /// same way an unusable port does (banto-hub's plan and its save-time preflight; the
 /// lenient builders keep the rest running). banto-hub's plan goes through this
-/// (`banto_hub_core::ingest::build_hub_config`); ChronoGazer has no registry (Q6) and
-/// keeps the registry-free builders.
+/// (`banto_hub_core::ingest::build_hub_config`). Since R2b-3a-3 every builder takes the
+/// host's registry (ChronoGazer's is `banto_drivers::builtin().registry`).
 pub fn build_config_from_with_registry(
     snapshot: &RegistrySnapshot,
     push: PushSource,
     registry: &DriverRegistry,
 ) -> Result<CollectorConfig, CollectError> {
-    let (config, exclusions) = build_config_lenient_inner(
-        snapshot,
-        ThresholdSource::None,
-        HubSource::Unavailable,
-        push,
-        Some(registry),
-    );
+    let (config, exclusions) =
+        build_config_lenient_inner(snapshot, ThresholdSource::None, None, push, registry);
     match exclusions.iter().find_map(ConfigExclusion::strict_error) {
         Some(err) => Err(err),
         None => Ok(config),
@@ -769,13 +698,17 @@ impl ExclusionUnit {
 /// names its parent so the list can be followed back to the item that needs
 /// fixing.
 ///
-/// Every value in here (protocol string, port, unit id, period, address,
-/// data type, `banto_plc`'s parse error for the address, parent names) is
+/// Every value in here (protocol string, period, address, data type, the
+/// driver's refusal of the address or the settings, parent names) is
 /// registry data the row already carries - never a host name, credential or
 /// file path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionReason {
-    /// `plc_connections.protocol` is not `modbus-tcp` / `slmp`.
+    /// The connection's driver is in the registry but the broker does not
+    /// read it (not a session-type driver - e.g. a host-provided one,
+    /// `banto_broker::is_broker_managed`), or the connection is
+    /// `simulation = true` and this crate has no simulator for its protocol
+    /// ([`simulator_protocol`]; such a connection is never dialed, R2b-3a-3).
     UnsupportedProtocol { protocol: String },
     /// #383 段階3 P3: a `"hub"` connection (banto-hub as a source,
     /// `banto_tags::HUB_PROTOCOL`) in a runtime that cannot subscribe to the
@@ -807,10 +740,6 @@ pub enum ExclusionReason {
         registered: String,
         catalog: String,
     },
-    /// `plc_connections.port` does not fit a TCP port (`u16`).
-    InvalidPort { port: i64 },
-    /// `plc_connections.unit_id` does not fit a Modbus unit id (`u8`).
-    InvalidUnitId { unit_id: i64 },
     /// `collection_groups.period_ms` does not fit `u32`.
     InvalidPeriod { period_ms: i64 },
     /// The tag's address/data type cannot be read under its connection's
@@ -853,8 +782,6 @@ impl ExclusionReason {
             ExclusionReason::HubNotConfigured => "hubNotConfigured",
             ExclusionReason::HubTagNotFound { .. } => "hubTagNotFound",
             ExclusionReason::HubTagTypeChanged { .. } => "hubTagTypeChanged",
-            ExclusionReason::InvalidPort { .. } => "invalidPort",
-            ExclusionReason::InvalidUnitId { .. } => "invalidUnitId",
             ExclusionReason::InvalidPeriod { .. } => "invalidPeriod",
             ExclusionReason::InvalidTag { issue, .. } => match issue {
                 TagAddressIssue::InvalidAddress { .. } => "invalidAddress",
@@ -876,7 +803,9 @@ impl ExclusionReason {
     pub fn message(&self) -> String {
         match self {
             ExclusionReason::UnsupportedProtocol { protocol } => {
-                format!("プロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）")
+                format!(
+                    "プロトコル {protocol} は収集に未対応です（broker が読むドライバと hub のみ。シミュレーションは modbus-tcp / slmp のみ）"
+                )
             }
             ExclusionReason::HubSourceUnavailable => {
                 "この実行形態では Hub 経由の接続から収集できません".to_string()
@@ -898,10 +827,6 @@ impl ExclusionReason {
             } => format!(
                 "Hub のタグ {external_name} のデータ型が変わったため収集しません（登録: {registered} / Hub: {catalog}）"
             ),
-            ExclusionReason::InvalidPort { port } => format!("ポート番号が不正です: {port}"),
-            ExclusionReason::InvalidUnitId { unit_id } => {
-                format!("ユニットIDが不正です: {unit_id}")
-            }
             ExclusionReason::InvalidPeriod { period_ms } => {
                 format!("収集周期（period_ms）が不正です: {period_ms}")
             }
@@ -985,7 +910,7 @@ impl ConfigExclusion {
         let name = &self.name;
         let message = match &self.reason {
             ExclusionReason::UnsupportedProtocol { protocol } => format!(
-                "接続 {name} のプロトコル {protocol} は未対応です（modbus-tcp / slmp / hub のみ対応）"
+                "接続 {name} のプロトコル {protocol} は収集に未対応です（broker が読むドライバと hub のみ。シミュレーションは modbus-tcp / slmp のみ）"
             ),
             ExclusionReason::HubSourceUnavailable => format!(
                 "接続 {name} は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
@@ -1006,12 +931,6 @@ impl ConfigExclusion {
             } => format!(
                 "タグ {name} の Hub のタグ {external_name} のデータ型が変わりました（登録: {registered} / Hub: {catalog}）"
             ),
-            ExclusionReason::InvalidPort { port } => {
-                format!("接続 {name} のポート番号が不正です: {port}")
-            }
-            ExclusionReason::InvalidUnitId { unit_id } => {
-                format!("接続 {name} のユニットIDが不正です: {unit_id}")
-            }
             ExclusionReason::InvalidPeriod { period_ms } => {
                 format!("グループ {name} の period_ms が不正です: {period_ms}")
             }
@@ -1076,19 +995,24 @@ impl ConfigExclusion {
 /// columns any more), so a collector built from this raises no
 /// `threshold_*` event.
 ///
-/// #383 段階3 P3: a `"hub"` connection is excluded as
-/// [`ExclusionReason::HubSourceUnavailable`] ([`HubSource::Unavailable`]) -
-/// this is the builder banto-hub's strict path shares, and banto-hub never
-/// subscribes to a Hub.
+/// #383 段階3 P3: a `"hub"` connection is excluded - this is the builder
+/// banto-hub's strict path shares, and banto-hub never subscribes to a Hub.
+/// Since R2b-3a-3 the reason is the driver check's
+/// [`ExclusionReason::DriverUnavailable`] (banto-hub registers no `hub`
+/// driver), as in the strict build; ChronoGazer's builders say
+/// [`ExclusionReason::HubSourceUnavailable`] ([`HubSource::Unavailable`]).
 pub fn build_config_lenient_from(
     snapshot: &RegistrySnapshot,
+    drivers: &DriverRegistry,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     build_config_lenient_inner(
         snapshot,
         ThresholdSource::None,
-        HubSource::Unavailable,
-        PushSource::Unavailable,
+        // The strict build's twin (banto-hub): a `hub` row is the driver
+        // check's, like the strict build's (`resolve_connection`'s doc).
         None,
+        PushSource::Unavailable,
+        drivers,
     )
 }
 
@@ -1113,13 +1037,14 @@ pub fn build_config_lenient_with_thresholds(
     snapshot: &RegistrySnapshot,
     thresholds: &HashMap<i64, Thresholds>,
     hub: HubSource<'_>,
+    drivers: &DriverRegistry,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     build_config_lenient_inner(
         snapshot,
         ThresholdSource::Supplied(thresholds),
-        hub,
+        Some(hub),
         PushSource::Unavailable,
-        None,
+        drivers,
     )
 }
 
@@ -1139,8 +1064,10 @@ pub enum PushSource {
 
 /// How one enabled connection is collected, once its row is understood.
 enum ResolvedConnection<'a> {
-    /// Dialed by this crate.
-    Plc(Protocol, ProtocolConfig),
+    /// Read through its broker session. The [`Protocol`] is the simulator
+    /// kind (`None`: the crate has no simulator for this driver), and names
+    /// the notation in a tag's address error message.
+    Plc(Option<Protocol>, ProtocolConfig),
     /// Sampled from an [`crate::external::ExternalSource`] (#383 段階3 P3).
     Hub { catalog: Option<&'a HubCatalog> },
     /// Received from pushed values (R2a-1b): same [`ProtocolConfig::External`]
@@ -1152,9 +1079,9 @@ enum ResolvedConnection<'a> {
 fn build_config_lenient_inner(
     snapshot: &RegistrySnapshot,
     threshold_source: ThresholdSource<'_>,
-    hub: HubSource<'_>,
+    hub: Option<HubSource<'_>>,
     push: PushSource,
-    drivers: Option<&DriverRegistry>,
+    drivers: &DriverRegistry,
 ) -> (CollectorConfig, Vec<ConfigExclusion>) {
     let connections = &snapshot.connections;
     let groups = &snapshot.groups;
@@ -1190,7 +1117,7 @@ fn build_config_lenient_inner(
     // as a config error - it never has a socket to open, so silently
     // contributing nothing is the correct behaviour for a connection that by
     // design has no wire protocol at all (unlike an actually-unsupported
-    // protocol string, which `parse_protocol` below still rejects). Any tags
+    // protocol string, which `resolve_connection` still excludes). Any tags
     // registered under it (computed/internal, per banto-tags' own
     // `calc`/`mem` placement rule) are evaluated/stored entirely by
     // `apps/banto-hub/core/src/computed.rs`'s `ComputedEngine`/
@@ -1199,13 +1126,13 @@ fn build_config_lenient_inner(
     // S1 (docs/banto-hub-external-db-design.md §4.1・§7 スライス表「S1」,
     // 2026-09-06): a `"postgres"` connection ([`PlcConnection::is_db_source`])
     // gets the identical exclusion, for the identical reason - it is not a
-    // wire-protocol PLC connection either, and `parse_protocol` below has no
-    // variant for it. This is defense-in-depth as much as anything: S1 also
+    // wire-protocol PLC connection either, and its driver (if any) is not
+    // broker-read. This is defense-in-depth as much as anything: S1 also
     // forbids creating any collection group under a `"postgres"` connection
     // (`banto_tags::collection_group::CollectionGroupService`), so in
     // practice such a connection is always tagless - but without this
     // exclusion, merely *enabling* a `"postgres"` connection (zero groups or
-    // not) would make `parse_protocol` reject the whole config, since the
+    // not) would make the strict build reject the whole config, since the
     // loop below runs over every enabled connection regardless of whether it
     // has any groups yet.
     //
@@ -1286,42 +1213,38 @@ fn build_config_lenient_inner(
                 // meaningful sample for a string anyway. Skip such tags
                 // entirely, exactly like a disabled tag: never read, never a
                 // store column, and the rest of the group still collects.
-                // This must happen *before* build_request, whose
-                // DataType::parse would otherwise fail the whole config build
+                // This must happen *before* build_spec, whose
+                // tag_kind would otherwise exclude the tag
                 // over a tag that belongs to a different app (relay-wright's
                 // S2 engine is the consumer of string tags).
                 if tag.data_type == banto_tags::STRING_DATA_TYPE {
                     continue;
                 }
                 let scaling = match &resolved {
-                    ResolvedConnection::Plc(protocol, _) => match match drivers {
-                        // R2b-2c: banto-hub (registry-carrying) reads the address
-                        // through the driver; the registry-free builders are unchanged.
-                        Some(registry) => {
-                            build_request_with_registry(tag, *protocol, &conn.protocol, registry)
+                    // R2b-2c / R2b-3a-3: every tag is read through the driver.
+                    ResolvedConnection::Plc(protocol, _) => {
+                        match build_spec(tag, *protocol, &conn.protocol, drivers) {
+                            Ok(request) => {
+                                requests.push(request);
+                                tag.scaling()
+                            }
+                            Err(issue) => {
+                                // #414 段階2: this tag alone is left out - no
+                                // read, no store column (its history reads as
+                                // null), and the rest of the group still
+                                // collects.
+                                exclusions.push(ConfigExclusion::tag(
+                                    tag,
+                                    ExclusionReason::InvalidTag {
+                                        address: tag.address.clone(),
+                                        data_type: tag.data_type.clone(),
+                                        issue,
+                                    },
+                                ));
+                                continue;
+                            }
                         }
-                        None => build_request(tag, *protocol),
-                    } {
-                        Ok(request) => {
-                            requests.push(request);
-                            tag.scaling()
-                        }
-                        Err(issue) => {
-                            // #414 段階2: this tag alone is left out - no
-                            // read, no store column (its history reads as
-                            // null), and the rest of the group still
-                            // collects.
-                            exclusions.push(ConfigExclusion::tag(
-                                tag,
-                                ExclusionReason::InvalidTag {
-                                    address: tag.address.clone(),
-                                    data_type: tag.data_type.clone(),
-                                    issue,
-                                },
-                            ));
-                            continue;
-                        }
-                    },
+                    }
                     ResolvedConnection::Push => match push_external_key(tag) {
                         Ok(key) => {
                             external_names.push(key);
@@ -1472,55 +1395,99 @@ fn build_config_lenient_inner(
 /// reach a Hub, and whether a hub tag still exists on the Hub, are facts of
 /// a running collection, not of the registry - they show up in the running
 /// collector's own exclusion list (the build at collection start), not here.
-pub fn config_exclusions(snapshot: &RegistrySnapshot) -> Vec<ConfigExclusion> {
+pub fn config_exclusions(
+    snapshot: &RegistrySnapshot,
+    drivers: &DriverRegistry,
+) -> Vec<ConfigExclusion> {
     build_config_lenient_inner(
         snapshot,
         ThresholdSource::None,
-        HubSource::Available { catalog: None },
+        Some(HubSource::Available { catalog: None }),
         PushSource::Unavailable,
-        None,
+        drivers,
     )
     .1
 }
 
-/// Understand one enabled connection row: dialed (`modbus-tcp` / `slmp`),
-/// sampled from the Hub (`hub`, when `hub` allows it), or excluded with the
-/// reason.
+/// Understand one enabled connection row: read through the broker
+/// (a session-type driver), sampled from the Hub (`hub`, when `hub` allows it),
+/// received from pushed values (`push`, when `push` allows it), or excluded
+/// with the reason.
+///
+/// Order (R2b-3a-3): a `push` row in a runtime without a push source, and a
+/// `hub` row in a build that says how this runtime samples the Hub
+/// (`hub = Some(..)`: ChronoGazer's builders and the registry-editor marks),
+/// are decided by the runtime ([`PushSource`] / [`HubSource`]) before the
+/// driver check - neither is a driver of ChronoGazer's registry, and neither
+/// has a session to dial. The strict builds (`hub = None`, banto-hub's) keep
+/// the R2b-1d order: a hand-written `hub` row is the driver check's
+/// [`ExclusionReason::DriverUnavailable`] (banto-hub registers no `hub`
+/// driver; its migration report says so).
+/// Every other row is checked against the registry first (R2b-1d,
+/// docs/banto-hub-connection-settings-design.md §4.4・§7: a row the registry
+/// does not know - an unknown protocol, a removed plugin -, whose settings the
+/// driver refuses or whose settings shape is newer than the driver is excluded
+/// alone; the row itself is kept), and is then read through the broker when
+/// the broker reads its driver (`banto_broker::is_broker_managed`, the same
+/// predicate as the session sync) - except a `simulation = true` row whose
+/// protocol has no simulator ([`simulator_protocol`]), which is excluded so it
+/// never dials the real device.
 fn resolve_connection<'a>(
     conn: &PlcConnection,
-    hub: HubSource<'a>,
+    hub: Option<HubSource<'a>>,
     push: PushSource,
-    drivers: Option<&DriverRegistry>,
+    drivers: &DriverRegistry,
 ) -> Result<ResolvedConnection<'a>, ExclusionReason> {
-    // R2b-1d (docs/banto-hub-connection-settings-design.md §4.4・§7): with a registry,
-    // the connection's driver and settings are checked first - a row the registry does
-    // not know (a hand-written `hub` row in banto-hub, a removed plugin), whose settings
-    // the driver refuses (hand-edited) or whose settings shape is newer than the driver
-    // is excluded alone; the row itself is kept.
-    if let Some(registry) = drivers {
-        if let Some(reason) = driver_exclusion(conn, registry) {
-            return Err(reason);
-        }
+    if conn.protocol == PUSH_PROTOCOL && push == PushSource::Unavailable {
+        return Err(ExclusionReason::PushSourceUnavailable);
     }
-    if conn.protocol == PUSH_PROTOCOL {
-        return match push {
-            PushSource::Unavailable => Err(ExclusionReason::PushSourceUnavailable),
-            PushSource::Available => Ok(ResolvedConnection::Push),
-        };
-    }
-    if conn.is_hub_source() {
+    if let (true, Some(hub)) = (conn.is_hub_source(), hub) {
         return match hub {
             HubSource::Unavailable => Err(ExclusionReason::HubSourceUnavailable),
             HubSource::NotConfigured => Err(ExclusionReason::HubNotConfigured),
             HubSource::Available { catalog } => Ok(ResolvedConnection::Hub { catalog }),
         };
     }
-    let protocol = parse_protocol(&conn.protocol)?;
-    let client_config = match protocol {
-        Protocol::ModbusTcp => ProtocolConfig::ModbusTcp(modbus_config_for(conn)?),
-        Protocol::Slmp => ProtocolConfig::Slmp(slmp_config_for(conn)?),
-    };
-    Ok(ResolvedConnection::Plc(protocol, client_config))
+    if let Some(reason) = driver_exclusion(conn, drivers) {
+        return Err(reason);
+    }
+    if conn.protocol == PUSH_PROTOCOL {
+        return Ok(ResolvedConnection::Push);
+    }
+    if conn.is_hub_source() {
+        // A registry with a `hub` driver and no hub runtime: still not ours.
+        return Err(ExclusionReason::HubSourceUnavailable);
+    }
+    // R2b-3a-3 (design §4.3): planned exactly when the broker reads the
+    // driver - the same predicate the session sync filters on
+    // (`banto_broker::is_broker_managed`: a session-type driver; R2b-3b adds
+    // frame type there), so a driver added to the registry is collected
+    // without a name table here, and the plan never holds a connection the
+    // sync would not give a session. Any other kind (a host-provided driver
+    // such as `virtual` / `postgres`) is not read through the broker.
+    if !banto_broker::is_broker_managed(drivers, &conn.protocol) {
+        return Err(ExclusionReason::UnsupportedProtocol {
+            protocol: conn.protocol.clone(),
+        });
+    }
+    // The simulator kind, if this crate has one for the protocol (picked by
+    // name until R2b-5). A `simulation = true` connection must never dial the
+    // real device: without a simulator it is not planned at all, and
+    // `BrokerSimRegistry::resolve` refuses it the same way, so no session is
+    // ensured for it.
+    let protocol = simulator_protocol(&conn.protocol);
+    if conn.simulation && protocol.is_none() {
+        return Err(ExclusionReason::UnsupportedProtocol {
+            protocol: conn.protocol.clone(),
+        });
+    }
+    Ok(ResolvedConnection::Plc(
+        protocol,
+        ProtocolConfig::Broker(BrokerPlan {
+            settings: banto_tags::settings_to_api(&conn.settings),
+            dial: None,
+        }),
+    ))
 }
 
 /// #383 段階3 P3: a hub tag's external name, if the tag can be collected -
@@ -1573,203 +1540,48 @@ fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
     Ok(tag.address.trim().to_string())
 }
 
-fn parse_protocol(protocol: &str) -> Result<Protocol, ExclusionReason> {
+/// The simulator kind ([`Protocol`]) for a connection's protocol name, if this
+/// crate has one (R2b-3a-3: only the simulation and the notation in a tag's
+/// address message use it; whether a connection is collected is the driver
+/// registry's call, `resolve_connection`). `None` for every other driver - a
+/// `simulation = true` connection of such a protocol is neither planned nor
+/// dialed ([`crate::BrokerSimRegistry::resolve`]).
+pub(crate) fn simulator_protocol(protocol: &str) -> Option<Protocol> {
     match protocol {
-        "modbus-tcp" => Ok(Protocol::ModbusTcp),
-        "slmp" => Ok(Protocol::Slmp),
-        other => Err(ExclusionReason::UnsupportedProtocol {
-            protocol: other.to_string(),
-        }),
+        "modbus-tcp" => Some(Protocol::ModbusTcp),
+        "slmp" => Some(Protocol::Slmp),
+        _ => None,
     }
 }
 
-/// Build a [`ModbusTcpConfig`] from a `"modbus-tcp"`-protocol
-/// [`PlcConnection`] row. `host`/`port`/`unit_id`/`word_order` all come from
-/// the registry - `word_order` from the same `word_order` column
-/// [`slmp_config_for`] reads (migration `0010_plc_connections_add_word_order.sql`,
-/// P3-b, 2026-08-12); it is a registry field for Modbus exactly as much as
-/// it is for SLMP.
+/// The legacy save-time rule [`check_tag_address`] applies (#414 段階1):
+/// `protocol` selects the address notation - `Address::parse` (Modbus
+/// reference numbers, e.g. `40001`) for [`Protocol::ModbusTcp`],
+/// `Address::parse_slmp` (MELSEC device codes, e.g. `D100`) for
+/// [`Protocol::Slmp`] - the data type must be in `banto_plc`'s vocabulary,
+/// and a bit-in-word address (T8-2, `"D100.5"` / `"40001.3"`) needs a `bit`
+/// tag.
 ///
-/// **Bug fixed 2026-09-08**: until this change, this fn ignored that column
-/// and hardcoded `word_order: WordOrder::default()`
-/// (`ModbusTcpConfig::default()`'s `WordOrder::HighLow`) with a comment
-/// claiming the column did not exist - stale ever since P3-b actually added
-/// it. Meanwhile `banto_broker::modbus_config_for` (the read-on-demand and
-/// write path) already called `parse_word_order(&conn.word_order)` for
-/// Modbus. So a Modbus connection left at the column's then-default
-/// (`'low_high'`) got `WordOrder::LowHigh` for on-demand reads/writes but
-/// `WordOrder::HighLow` for collection polling - the same u32/f32 tag
-/// decoded with its two registers swapped depending on which path touched
-/// it. The mismatch surfaced while adding the 64bit types (`i64`/`u64`/
-/// `f64`, 4 registers) for issue #325.
-///
-/// Owner decision (2026-09-08): Modbus is standardized on `'high_low'`.
-/// Existing `modbus-tcp` rows are backfilled to `'high_low'` and new Modbus
-/// connections now default to `'high_low'` too, both by a `banto-tags`-side
-/// migration (out of scope here) - this fn's job is only to stop ignoring
-/// the column, which is what the `parse_word_order` call below now does.
-///
-/// The 64bit types added for #325 apply this same `word_order` across their
-/// two register pairs exactly like the existing 32bit types do - there is no
-/// separate word-order concept for them. A real device that needs
-/// `'low_high'` here: the OMRON KM-D1-ETN power meter.
-fn modbus_config_for(conn: &PlcConnection) -> Result<ModbusTcpConfig, ExclusionReason> {
-    let port =
-        u16::try_from(conn.port).map_err(|_| ExclusionReason::InvalidPort { port: conn.port })?;
-    let unit_id = u8::try_from(conn.unit_id).map_err(|_| ExclusionReason::InvalidUnitId {
-        unit_id: conn.unit_id,
-    })?;
-    Ok(ModbusTcpConfig {
-        host: conn.host.clone(),
-        port,
-        unit_id,
-        // `parse_word_order`'s fallback to `WordOrder::LowHigh` for an
-        // unrecognized string is unconditional regardless of protocol, so a
-        // hand-edited/pre-migration-0010 Modbus row fails open to
-        // `WordOrder::LowHigh` here too - not to `ModbusTcpConfig::default()`'s
-        // `WordOrder::HighLow`. This matches `banto_broker::modbus_config_for`,
-        // which reaches the same fallback through its own copy of
-        // `parse_word_order`.
-        word_order: parse_word_order(&conn.word_order),
-        ..ModbusTcpConfig::default()
-    })
-}
-
-/// I8 (2026-08-05): build an [`SlmpConfig`] from a `"slmp"`-protocol
-/// [`PlcConnection`] row. `host`/`port`/`word_order` come from the registry -
-/// `word_order` since P3-b（監査指摘 2026-08-12, migration
-/// `0010_plc_connections_add_word_order.sql`); before that this fn always
-/// fell back to [`SlmpConfig::default`]'s `WordOrder::LowHigh` regardless of
-/// what the device actually needed, silently byte-swapping any u32/f32 tag
-/// read through a connection that required `WordOrder::HighLow`.
-/// #605: `cpu` comes from `plc_connections.cpu_type` (migration `0021`,
-/// `"Q"` / `"R"`, default `"R"` = the historical [`SlmpConfig::default`]).
-/// An unrecognized string fails open to [`SlmpCpu::R`] - the same posture as
-/// [`parse_word_order`] - because the SQL `CHECK` already rejects anything
-/// else; this is defense in depth for a hand-edited row, not a path normal
-/// CRUD can take. The access route (network/PC/IO/area id) still has no
-/// columns and falls back to [`SlmpConfig::default`] (the CPU on the other
-/// end of this socket). **Known limitation**: a routed
-/// (not-directly-connected) access route cannot be configured through the
-/// registry today.
-/// `connect_timeout`/`response_timeout` are overridden uniformly by
-/// [`crate::collector::Collector::start`] from [`crate::collector::CollectorOptions`],
-/// exactly like [`modbus_config_for`]'s.
-fn slmp_config_for(conn: &PlcConnection) -> Result<SlmpConfig, ExclusionReason> {
-    let port =
-        u16::try_from(conn.port).map_err(|_| ExclusionReason::InvalidPort { port: conn.port })?;
-    Ok(SlmpConfig {
-        host: conn.host.clone(),
-        port,
-        // P3-b: `parse_word_order` mirrors `banto_broker`'s private fn of the
-        // same name/behavior (fails open to `WordOrder::LowHigh` for
-        // anything unrecognized - see its own doc comment) - not shared
-        // because the two crates have no dependency relationship to hang a
-        // shared helper off of, and it is three lines.
-        word_order: parse_word_order(&conn.word_order),
-        cpu: parse_cpu_type(&conn.cpu_type),
-        ..SlmpConfig::default()
-    })
-}
-
-/// #605: `"Q"` → [`SlmpCpu::Q`]. `"R"` と、CHECK を通らない手編集の値は
-/// [`SlmpCpu::R`]（この列を足す前のフレーム形式）。
-fn parse_cpu_type(value: &str) -> SlmpCpu {
-    match value {
-        "Q" => SlmpCpu::Q,
-        _ => SlmpCpu::R,
-    }
-}
-
-/// Shared by both [`slmp_config_for`] and [`modbus_config_for`] - originally
-/// written for SLMP only (see [`slmp_config_for`]'s doc comment for why this
-/// is a copy of `banto_broker`'s identical fn rather than a shared helper),
-/// extended to Modbus by the 2026-09-08 fix documented on
-/// [`modbus_config_for`].
-fn parse_word_order(value: &str) -> WordOrder {
-    match value {
-        "high_low" => WordOrder::HighLow,
-        _ => WordOrder::LowHigh,
-    }
-}
-
-/// Parse a tag's address + data type into a wire [`ReadRequest`]. `protocol`
-/// selects the address notation - `Address::parse` (Modbus reference
-/// numbers, e.g. `40001`) for [`Protocol::ModbusTcp`], `Address::parse_slmp`
-/// (MELSEC device codes, e.g. `D100`) for [`Protocol::Slmp`] - so a tag's
-/// stored text is validated under the rules its own connection's protocol
-/// actually speaks, never guessed at (mirrors `banto_plc::address`'s own
-/// module doc: "never inferred from the address text"). A malformed address
-/// or unknown data type is a `CollectError::Config` - caught here, not
-/// folded into a runtime `Bad`, because it is a configuration mistake the
-/// operator must fix, not a transient PLC condition. (An address that parses
-/// but whose area/type combination the wire cannot serve - e.g. a bit at a
-/// register address - is *not* rejected here: `banto-plc`'s planner turns
-/// that into a per-tick `ReadResult::Bad`, which the loop already records as
-/// Bad quality.)
-///
-/// T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): a T8 bit-in-word
-/// address (`"D100.5"` / `"40001.3"`, parsed into `Address::{Slmp,
-/// ModbusRef}`'s `bit: Some(_)`) only ever decodes/encodes to a single
-/// `bool` (`decode_register_bit`/`banto-plc-write`'s RMW both work in terms
-/// of one bit), so it is meaningless on any tag whose `data_type` is not
-/// `"bit"` - a `data_type = "i16"` tag at `"D100.5"` would otherwise silently
-/// collect nothing but a truncated 1-bit reading of the word. This is
-/// rejected here as a `CollectError::Config`, not left for `banto-plc`'s
-/// planner to fail per-tick, so the mistake surfaces at config-build time
-/// exactly like every other address/data-type mismatch this function already
-/// catches (a malformed address, an unknown data type). On the legacy path
-/// (`TagService::new`, ChronoGazer) `banto-tags` (I1) does not validate this
-/// at registration time (see this function's own doc comment above), so this
-/// is the one place it is caught; on the registry path (`with_registry`, the
-/// Hub since R2b-2) the save layer rejects it through the driver's
-/// `parse_address` first. Either way, `CollectorManager::rebuild`
-/// (`apps/banto-hub/core/src/hub.rs`) already treats any `CollectError::Config`
-/// from `build_config` as an all-or-nothing failure that keeps the previous
-/// catalog/`Collector` running (`last_config_error`), so a tag registered
-/// this way simply never reaches the live catalog until fixed.
-///
-/// **The single interpreter** behind the config build
-/// ([`build_config_lenient_from`], and so [`build_config_from`]) and the
-/// save-time check [`check_tag_address`] (#414 段階1). Keeping one function
-/// means "what a registry editor accepts on save" and "what the config build
-/// accepts" cannot drift apart. Only the *wording* differs per caller: the
-/// strict build names the tag ([`ConfigExclusion::strict_error`] - the
-/// pre-段階2 text, so banto-hub's `last_config_error` is unchanged), a form
-/// or an exclusion list does not ([`TagAddressIssue::message`]). #414 段階2:
-/// a failure here no longer fails the lenient build - the tag alone is left
-/// out ([`ExclusionReason::InvalidTag`]).
-fn build_request(tag: &Tag, protocol: Protocol) -> Result<ReadRequest, TagAddressIssue> {
-    parse_read_request(protocol, &tag.address, &tag.data_type)
-}
-
-/// The interpreter itself (see [`build_request`] for the rules), on raw
-/// strings so [`check_tag_address`] can call it for a tag that is not saved
-/// yet.
+/// R2b-3a-3: the collection plan no longer uses this - it reads every address
+/// through the connection's driver ([`build_spec`]), whose `parse_address`
+/// carries the same bit-in-word rule since R2b-2a. This stays only as the rule
+/// ChronoGazer's registry editor saves with (address design Q7: the legacy save
+/// rule is kept until R2b-7); the driver reads the address the editor accepted
+/// (R2b-2 §5).
 fn parse_read_request(
     protocol: Protocol,
     address: &str,
     data_type: &str,
-) -> Result<ReadRequest, TagAddressIssue> {
+) -> Result<(), TagAddressIssue> {
     let parsed = match protocol {
         Protocol::ModbusTcp => Address::parse(address),
         Protocol::Slmp => Address::parse_slmp(address),
     }
     .map_err(|err| TagAddressIssue::InvalidAddress {
-        protocol,
+        protocol: Some(protocol),
         reason: err.to_string(),
     })?;
-    finish_request(parsed, data_type)
-}
-
-/// The part of the interpreter that is independent of who parsed the address:
-/// the data type must be in `banto_plc`'s vocabulary and a bit-in-word address
-/// needs a `bit` tag. Shared by [`parse_read_request`] (the registry-free
-/// `Address::parse` path) and [`build_request_with_registry`] (the driver +
-/// bridge path), so the two cannot drift apart.
-fn finish_request(parsed: Address, data_type: &str) -> Result<ReadRequest, TagAddressIssue> {
     let data_type = DataType::parse(data_type).ok_or(TagAddressIssue::UnknownDataType)?;
-
     let is_bit_qualified = match parsed {
         Address::ModbusRef { bit, .. } => bit.is_some(),
         Address::Slmp { bit, .. } => bit.is_some(),
@@ -1777,42 +1589,34 @@ fn finish_request(parsed: Address, data_type: &str) -> Result<ReadRequest, TagAd
     if is_bit_qualified && data_type != DataType::Bit {
         return Err(TagAddressIssue::BitAddressOnNonBitType);
     }
-
-    Ok(ReadRequest {
-        address: parsed,
-        data_type,
-    })
+    Ok(())
 }
 
-/// R2b-2c (docs/banto-hub-driver-address-design.md §4.2): the registry-carrying
-/// builds (banto-hub) read a tag's address through the connection's *driver*
-/// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and bring the
-/// result back to a [`ReadRequest`] over the bridge (kept until R2b-3a-3)
-/// ([`Address::from_driver_address`]). A refusal at either step is the tag's
-/// own [`TagAddressIssue::InvalidAddress`] carrying the driver's message, so
-/// the tag alone is left out. The registry-free builders keep
-/// [`build_request`].
-fn build_request_with_registry(
+/// R2b-2c / R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3): a tag's read as
+/// the plan carries it - the connection's *driver* parses the address
+/// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and the result is
+/// the [`TagSpec`] itself (the bridge back to `banto_plc::Address` is gone). A
+/// refusal is the tag's own [`TagAddressIssue::InvalidAddress`] carrying the
+/// driver's message, so the tag alone is left out. A bit-in-word address on a
+/// non-`bit` tag is the driver's refusal too (R2b-2a moved that rule into
+/// `parse_address`).
+fn build_spec(
     tag: &Tag,
-    protocol: Protocol,
+    protocol: Option<Protocol>,
     conn_protocol: &str,
     registry: &DriverRegistry,
-) -> Result<ReadRequest, TagAddressIssue> {
+) -> Result<TagSpec, TagAddressIssue> {
     let invalid = |reason: String| TagAddressIssue::InvalidAddress { protocol, reason };
     let kind = banto_tags::tag_kind(&tag.data_type, tag.string_length, &tag.string_encoding)
         .ok_or(TagAddressIssue::UnknownDataType)?;
     let entry = registry
         .get(conn_protocol)
         .ok_or_else(|| invalid(format!("ドライバ {conn_protocol} がありません")))?;
-    let driver_address = entry
+    let address = entry
         .base()
         .parse_address(tag.address.trim(), &kind)
         .map_err(|err| invalid(err.message().to_string()))?;
-    // R2b-3a-3 で消す: 計画が `TagSpec` を作るようになったら橋は要らない
-    // （docs/banto-hub-driver-io-design.md §4.3）。
-    let parsed =
-        Address::from_driver_address(&driver_address).map_err(|err| invalid(err.to_string()))?;
-    finish_request(parsed, &tag.data_type)
+    Ok(TagSpec::new(address, kind))
 }
 
 /// Which input field a [`TagAddressIssue`] is about - so a registry editor
@@ -1824,17 +1628,24 @@ pub enum TagAddressField {
     DataType,
 }
 
-/// Why [`check_tag_address`] rejected a tag (#414 段階1). Each variant is
-/// exactly one of the `CollectError::Config` cases the strict
-/// [`build_config_from`] raises for a tag (via [`build_request`]), so
-/// "rejected on save" and "would fail [`build_config_from`]" are the same
-/// predicate. #414 段階2: also carried by [`ExclusionReason::InvalidTag`].
+/// Why [`check_tag_address`] rejected a tag (#414 段階1), or why the plan
+/// left a tag out ([`ExclusionReason::InvalidTag`], #414 段階2). Since
+/// R2b-3a-3 the save check is the legacy rule and the plan reads through the
+/// driver ([`build_spec`]); the driver reads what the legacy rule accepts
+/// (R2b-2 §5), and its refusal is an [`Self::InvalidAddress`] with the
+/// driver's message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagAddressIssue {
     /// The address text does not parse under the connection protocol's
     /// notation (e.g. MELSEC `D3000` on a Modbus TCP connection). `reason`
     /// is `banto_plc`'s own error text.
-    InvalidAddress { protocol: Protocol, reason: String },
+    ///
+    /// `protocol` is `None` for a driver this crate has no notation (and no
+    /// simulator) for (R2b-3a-3): the message then names no notation.
+    InvalidAddress {
+        protocol: Option<Protocol>,
+        reason: String,
+    },
     /// The data type is outside `banto_plc::DataType`'s vocabulary.
     UnknownDataType,
     /// A bit-in-word address (`40001.3` / `D100.5`) on a tag whose data type
@@ -1863,8 +1674,9 @@ impl TagAddressIssue {
         match self {
             TagAddressIssue::InvalidAddress { protocol, reason } => {
                 let (label, example) = match protocol {
-                    Protocol::ModbusTcp => ("Modbus TCP", "40001"),
-                    Protocol::Slmp => ("SLMP（MELSEC）", "D100"),
+                    Some(Protocol::ModbusTcp) => ("Modbus TCP", "40001"),
+                    Some(Protocol::Slmp) => ("SLMP（MELSEC）", "D100"),
+                    None => return format!("このドライバのアドレスとして解釈できません。{reason}"),
                 };
                 format!("{label} のアドレスとして解釈できません（例: {example}）。{reason}")
             }
@@ -1888,7 +1700,7 @@ impl TagAddressIssue {
 /// - A `protocol` other than `"modbus-tcp"`/`"slmp"` is `Ok` here:
 ///   `"virtual"`/`"postgres"` connections are excluded from collection, and
 ///   an unsupported protocol string is a *connection*-level error
-///   (`parse_protocol`) that no tag address could fix. That includes
+///   (`resolve_connection`) that no tag address could fix. That includes
 ///   `"hub"` (#383 段階3 P2): a hub tag's address is an external name, not a
 ///   device address, and its shape/data type/`writable` rules are enforced
 ///   by `banto_tags::TagService` itself on every save
@@ -1912,12 +1724,28 @@ pub fn check_tag_address(
         "slmp" => Protocol::Slmp,
         _ => return Ok(()),
     };
-    parse_read_request(protocol, address, data_type).map(|_| ())
+    parse_read_request(protocol, address, data_type)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The built-in drivers (Modbus TCP and SLMP) every plan is read through
+    /// since R2b-3a-3.
+    fn drivers() -> &'static DriverRegistry {
+        static DRIVERS: std::sync::LazyLock<DriverRegistry> =
+            std::sync::LazyLock::new(|| banto_drivers::builtin().registry);
+        &DRIVERS
+    }
+
+    /// The settings a broker-read plan carries (panics on an external plan).
+    fn broker_settings(plan: &ConnectionPlan) -> &Settings {
+        match &plan.config {
+            ProtocolConfig::Broker(broker) => &broker.settings,
+            ProtocolConfig::External => panic!("expected a broker-read plan"),
+        }
+    }
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
         TagInput, TagService,
@@ -1985,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn empty_registry_builds_an_empty_config() {
         let pool = registry().await;
-        let config = build_config(&pool).await.unwrap();
+        let config = build_config(&pool, drivers()).await.unwrap();
         assert_eq!(config.group_count(), 0);
         assert_eq!(config.tag_count(), 0);
         assert!(config.store_config.groups.is_empty());
@@ -2009,8 +1837,8 @@ mod tests {
 
         let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
         assert_eq!(
-            build_config(&pool).await.unwrap(),
-            build_config_from(&snapshot).unwrap()
+            build_config(&pool, drivers()).await.unwrap(),
+            build_config_from(&snapshot, drivers()).unwrap()
         );
     }
 
@@ -2035,7 +1863,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.unwrap();
+        let config = build_config(&pool, drivers()).await.unwrap();
         assert_eq!(config.connections.len(), 1);
         assert_eq!(config.group_count(), 1);
         assert_eq!(config.tag_count(), 2);
@@ -2043,13 +1871,12 @@ mod tests {
         let c = &config.connections[0];
         assert_eq!(c.key, format!("conn:{}", conn.id));
         assert!(!c.simulation, "conn_input defaults to simulation: false");
-        match &c.config {
-            ProtocolConfig::ModbusTcp(modbus) => {
-                assert_eq!(modbus.host, "127.0.0.1");
-                assert_eq!(modbus.port, 502);
-            }
-            _ => panic!("expected ModbusTcp config"),
-        }
+        let settings = broker_settings(c);
+        assert_eq!(
+            settings.get(banto_driver_api::keys::HOST),
+            Some("127.0.0.1")
+        );
+        assert_eq!(settings.get(banto_driver_api::keys::PORT), Some("502"));
         assert_eq!(c.groups[0].requests.len(), 2);
 
         // Derived store config mirrors the group/tag shape.
@@ -2125,7 +1952,7 @@ mod tests {
         assert!(!collectible.contains(&conn_tagless.id));
         assert!(collectible.contains(&conn_tagged.id));
 
-        let config = build_config_from(&snapshot).unwrap();
+        let config = build_config_from(&snapshot, drivers()).unwrap();
         let plan_ids: HashSet<i64> = config
             .connections
             .iter()
@@ -2172,7 +1999,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.unwrap();
+        let config = build_config(&pool, drivers()).await.unwrap();
         assert_eq!(config.connections.len(), 1, "disabled connection excluded");
         assert_eq!(config.group_count(), 1, "disabled group excluded");
         assert_eq!(config.tag_count(), 1, "disabled tag excluded");
@@ -2202,13 +2029,19 @@ mod tests {
         bit.data_type = "bit".to_string();
         tag_svc.create(bit).await.unwrap();
 
-        let config = build_config(&pool).await.unwrap();
+        let config = build_config(&pool, drivers()).await.unwrap();
         let group = &config.connections[0].groups[0];
         assert_eq!(group.tags.len(), 2);
         assert!(group.tags[0].scaling.is_some());
-        assert_eq!(group.requests[0].data_type, DataType::I16);
+        assert_eq!(
+            group.requests[0].kind,
+            banto_driver_api::TagKind::numeric(DataType::I16)
+        );
         assert!(group.tags[1].scaling.is_none());
-        assert_eq!(group.requests[1].data_type, DataType::Bit);
+        assert_eq!(
+            group.requests[1].kind,
+            banto_driver_api::TagKind::numeric(DataType::Bit)
+        );
     }
 
     /// #532 / #533: the builders without limits (banto-hub's
@@ -2245,12 +2078,12 @@ mod tests {
         let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
 
         // Without limits (banto-hub): no tag has any.
-        let (classic, _) = build_config_lenient_from(&snapshot);
+        let (classic, _) = build_config_lenient_from(&snapshot, drivers());
         assert!(classic.connections[0].groups[0]
             .tags
             .iter()
             .all(|tag| tag.thresholds.is_empty()));
-        let strict = build_config_from(&snapshot).unwrap();
+        let strict = build_config_from(&snapshot, drivers()).unwrap();
         assert!(strict.connections[0].groups[0]
             .tags
             .iter()
@@ -2266,8 +2099,12 @@ mod tests {
                 ll: Some(5.0),
             },
         )]);
-        let (config, exclusions) =
-            build_config_lenient_with_thresholds(&snapshot, &supplied, HubSource::Unavailable);
+        let (config, exclusions) = build_config_lenient_with_thresholds(
+            &snapshot,
+            &supplied,
+            HubSource::Unavailable,
+            drivers(),
+        );
         assert!(exclusions.is_empty());
         let tags = &config.connections[0].groups[0].tags;
         assert_eq!(tags[0].key, format!("tag:{}", unlisted.id));
@@ -2327,7 +2164,7 @@ mod tests {
         string_tag.string_length = Some(16);
         tag_svc.create(string_tag).await.unwrap();
 
-        let config = build_config(&pool)
+        let config = build_config(&pool, drivers())
             .await
             .expect("a string tag must not fail the recorder's config build");
 
@@ -2364,7 +2201,7 @@ mod tests {
             .create(tag_input("Bad", group.id, "99999"))
             .await
             .unwrap();
-        let err = build_config(&pool).await.unwrap_err();
+        let err = build_config(&pool, drivers()).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
     }
 
@@ -2388,7 +2225,7 @@ mod tests {
             .create(tag_input("Bad", group.id, "40001.3"))
             .await
             .unwrap();
-        let err = build_config(&pool).await.unwrap_err();
+        let err = build_config(&pool, drivers()).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
     }
 
@@ -2408,7 +2245,7 @@ mod tests {
             .create(tag_input("Bad", group.id, "D100.5"))
             .await
             .unwrap();
-        let err = build_config(&pool).await.unwrap_err();
+        let err = build_config(&pool, drivers()).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
     }
 
@@ -2429,13 +2266,13 @@ mod tests {
         let mut bit_tag = tag_input("Ok", group.id, "D100.5");
         bit_tag.data_type = "bit".to_string();
         TagService::new(pool.clone()).create(bit_tag).await.unwrap();
-        let config = build_config(&pool)
+        let config = build_config(&pool, drivers())
             .await
             .expect("a bit-in-word address on a bit tag must build");
         assert_eq!(config.tag_count(), 1);
         assert_eq!(
-            config.connections[0].groups[0].requests[0].data_type,
-            DataType::Bit
+            config.connections[0].groups[0].requests[0].kind,
+            banto_driver_api::TagKind::numeric(DataType::Bit)
         );
     }
 
@@ -2465,23 +2302,23 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.expect("slmp config should build");
+        let config = build_config(&pool, drivers())
+            .await
+            .expect("slmp config should build");
         assert_eq!(config.connections.len(), 1);
         let c = &config.connections[0];
-        match &c.config {
-            ProtocolConfig::Slmp(slmp) => {
-                assert_eq!(slmp.host, "127.0.0.1");
-                assert_eq!(slmp.port, 5007);
-            }
-            _ => panic!("expected Slmp config"),
-        }
+        let settings = broker_settings(c);
+        assert_eq!(
+            settings.get(banto_driver_api::keys::HOST),
+            Some("127.0.0.1")
+        );
+        assert_eq!(settings.get(banto_driver_api::keys::PORT), Some("5007"));
         assert_eq!(c.groups[0].requests.len(), 1);
     }
 
-    /// P3-b (監査指摘 2026-08-12): `slmp_config_for` must carry the
-    /// connection's own `word_order` into the built `SlmpConfig`, not
-    /// silently fix every connection to `SlmpConfig::default()`'s
-    /// `WordOrder::LowHigh` - the regression test for the audit finding.
+    /// P3-b (監査指摘 2026-08-12) / #334: the plan must carry the
+    /// connection's own `word_order` (R2b-3a-3: in the settings the broker
+    /// hands the driver), not silently fall back to a default.
     #[tokio::test]
     async fn slmp_config_reflects_the_connections_own_word_order() {
         let pool = registry().await;
@@ -2499,23 +2336,20 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.expect("slmp config should build");
-        match &config.connections[0].config {
-            ProtocolConfig::Slmp(slmp) => {
-                assert_eq!(
-                    slmp.word_order,
-                    WordOrder::HighLow,
-                    "a connection asking for high_low must not silently get the default"
-                );
-            }
-            _ => panic!("expected Slmp config"),
-        }
+        let config = build_config(&pool, drivers())
+            .await
+            .expect("slmp config should build");
+        assert_eq!(
+            broker_settings(&config.connections[0]).get(banto_driver_api::keys::WORD_ORDER),
+            Some("high_low"),
+            "a connection asking for high_low must not silently get the default"
+        );
     }
 
     /// The default-omitted counterpart: a `"slmp"` connection that never sets
     /// `word_order` (this file's `conn_input_slmp`, unchanged) still gets
-    /// `WordOrder::LowHigh` - the same value every SLMP connection got before
-    /// this column existed, so existing databases are unaffected.
+    /// `low_high` - the same value every SLMP connection got before this
+    /// column existed.
     #[tokio::test]
     async fn slmp_config_defaults_to_low_high_word_order() {
         let pool = registry().await;
@@ -2532,51 +2366,50 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.expect("slmp config should build");
-        match &config.connections[0].config {
-            ProtocolConfig::Slmp(slmp) => assert_eq!(slmp.word_order, WordOrder::LowHigh),
-            _ => panic!("expected Slmp config"),
-        }
+        let config = build_config(&pool, drivers())
+            .await
+            .expect("slmp config should build");
+        assert_eq!(
+            broker_settings(&config.connections[0]).get(banto_driver_api::keys::WORD_ORDER),
+            Some("low_high")
+        );
     }
 
-    /// #605: 省略した `cpu_type` は R（移行前と同じ）。明示した Q は
-    /// `SlmpConfig.cpu` まで届く。
+    /// #605: an explicit Q CPU reaches the plan's settings (the SLMP driver
+    /// reads `cpu_type` from them; an omitted one is the driver's default R).
     #[tokio::test]
-    async fn slmp_config_carries_cpu_type_and_defaults_to_r() {
+    async fn slmp_plan_carries_cpu_type() {
         let pool = registry().await;
-        let plc_svc = PlcConnectionService::new(pool.clone());
-
-        let omitted = plc_svc
-            .create(conn_input_slmp("DefaultR", 5007))
-            .await
-            .unwrap();
-        assert_eq!(omitted.cpu_type, "R");
-
         let mut q_input = conn_input_slmp("QSeries", 5008);
         q_input.cpu_type = Some("Q".to_string());
-        let q = plc_svc.create(q_input).await.unwrap();
+        let q = PlcConnectionService::new(pool.clone())
+            .create(q_input)
+            .await
+            .unwrap();
         assert_eq!(q.cpu_type, "Q");
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input("G1", q.id, 1_000))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input("T1", group.id, "D100"))
+            .await
+            .unwrap();
 
-        let built = slmp_config_for(&q).expect("port");
-        assert_eq!(built.cpu, SlmpCpu::Q);
-
-        let mut hand_edited = q.clone();
-        hand_edited.cpu_type = "nope".to_string();
-        assert_eq!(slmp_config_for(&hand_edited).expect("port").cpu, SlmpCpu::R);
+        let config = build_config(&pool, drivers())
+            .await
+            .expect("slmp config should build");
+        assert_eq!(
+            broker_settings(&config.connections[0]).get(banto_driver_api::keys::CPU_TYPE),
+            Some("Q")
+        );
     }
 
-    /// Regression test for the bug fixed 2026-09-08 (see [`modbus_config_for`]'s
-    /// doc comment for the full history): `modbus_config_for` must carry the
-    /// connection's own `word_order` column into the built `ModbusTcpConfig`,
-    /// not silently fix every connection to
-    /// `ModbusTcpConfig::default()`'s `WordOrder::HighLow` regardless of what
-    /// the registry says - which is exactly what it did before this fix,
-    /// even though the column had existed since P3-b and
-    /// `banto_broker::modbus_config_for` already read it correctly for its
-    /// read-on-demand/write path. Mirrors
-    /// `slmp_config_reflects_the_connections_own_word_order` above, checking
-    /// both directions (not just the non-default one) because Modbus's own
-    /// default word order disagreed with SLMP's before the fix.
+    /// Regression test for the bug fixed 2026-09-08: the plan must carry a
+    /// Modbus connection's own `word_order` (both directions), not a default
+    /// - before the fix collection polling decoded with the default while
+    /// the read-on-demand path honoured the column. Since R2b-3a-3 both read
+    /// through the same driver with the same settings.
     #[tokio::test]
     async fn modbus_config_reflects_the_connections_own_word_order() {
         let pool = registry().await;
@@ -2606,7 +2439,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool)
+        let config = build_config(&pool, drivers())
             .await
             .expect("modbus config should build");
 
@@ -2615,55 +2448,30 @@ mod tests {
             .iter()
             .find(|c| c.key == format!("conn:{}", high_low_conn.id))
             .unwrap();
-        match &high_low_plan.config {
-            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(
-                modbus.word_order,
-                WordOrder::HighLow,
-                "a connection asking for high_low must not silently get low_high"
-            ),
-            _ => panic!("expected ModbusTcp config"),
-        }
+        assert_eq!(
+            broker_settings(high_low_plan).get(banto_driver_api::keys::WORD_ORDER),
+            Some("high_low"),
+            "a connection asking for high_low must not silently get low_high"
+        );
 
         let low_high_plan = config
             .connections
             .iter()
             .find(|c| c.key == format!("conn:{}", low_high_conn.id))
             .unwrap();
-        match &low_high_plan.config {
-            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(
-                modbus.word_order,
-                WordOrder::LowHigh,
-                "a connection asking for low_high must not silently get \
-                 ModbusTcpConfig::default()'s high_low"
-            ),
-            _ => panic!("expected ModbusTcp config"),
-        }
-    }
-
-    /// `parse_word_order`'s fallback for an unrecognized string is
-    /// `WordOrder::LowHigh`, and this must hold for Modbus exactly as it
-    /// does for SLMP (see this file's `parse_word_order` doc comment and
-    /// `banto_broker`'s identical fn) - not `ModbusTcpConfig::default()`'s
-    /// `WordOrder::HighLow`. Calls `parse_word_order` directly rather than
-    /// going through `build_config`/the registry because
-    /// `banto_tags::plc_connection::ALLOWED_WORD_ORDERS` plus the SQL
-    /// `CHECK` added by migration `0010` make an unrecognized `word_order`
-    /// value unreachable through normal CRUD (see
-    /// `PlcConnectionService::create`'s own `create_rejects_unknown_word_order`
-    /// test) - this is pinning down defense-in-depth behavior, not a
-    /// reachable-through-the-registry scenario.
-    #[test]
-    fn parse_word_order_falls_back_to_low_high_for_an_unrecognized_value() {
-        assert_eq!(parse_word_order("sideways"), WordOrder::LowHigh);
-        assert_eq!(parse_word_order(""), WordOrder::LowHigh);
+        assert_eq!(
+            broker_settings(low_high_plan).get(banto_driver_api::keys::WORD_ORDER),
+            Some("low_high"),
+            "a connection asking for low_high must not silently get high_low"
+        );
     }
 
     /// T9-1 (docs/ux-plan.md §1): `PlcConnection::simulation` carries through
     /// unchanged into `ConnectionPlan::simulation` - `build_config` itself
-    /// never starts a simulator or touches host/port (`ConnectionPlan`'s own
-    /// doc comment: that substitution is `crate::collector::Collector`'s job,
-    /// done at task-spawn time, not here) - this just pins down that the flag
-    /// is not dropped along the way.
+    /// never starts a simulator or touches host/port (since R2b-3a-3 the
+    /// host's `BrokerSimRegistry` substitutes the address before the broker
+    /// session is ensured) - this just pins down that the flag is not
+    /// dropped along the way.
     #[tokio::test]
     async fn simulation_flag_is_carried_into_the_connection_plan() {
         let pool = registry().await;
@@ -2690,7 +2498,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool).await.unwrap();
+        let config = build_config(&pool, drivers()).await.unwrap();
         assert_eq!(config.connections.len(), 2);
         let sim_plan = config
             .connections
@@ -2699,11 +2507,11 @@ mod tests {
             .expect("simulated connection should be in the config");
         assert!(sim_plan.simulation);
         // build_config never rewrites host/port for a simulated connection -
-        // that is Collector's job (see ConnectionPlan's doc comment).
-        match &sim_plan.config {
-            ProtocolConfig::ModbusTcp(modbus) => assert_eq!(modbus.port, 502),
-            _ => panic!("expected ModbusTcp config"),
-        }
+        // that is the host's BrokerSimRegistry's job (ConnectionPlan's doc).
+        assert_eq!(
+            broker_settings(sim_plan).get(banto_driver_api::keys::PORT),
+            Some("502")
+        );
         let real_plan = config
             .connections
             .iter()
@@ -2731,7 +2539,7 @@ mod tests {
             .create(tag_input("Bad", group.id, "40001"))
             .await
             .unwrap();
-        let err = build_config(&pool).await.unwrap_err();
+        let err = build_config(&pool, drivers()).await.unwrap_err();
         assert!(matches!(err, CollectError::Config(_)));
     }
 
@@ -2788,7 +2596,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool)
+        let config = build_config(&pool, drivers())
             .await
             .expect("a virtual connection must not fail config build");
         assert_eq!(
@@ -2840,7 +2648,7 @@ mod tests {
             .await
             .unwrap();
 
-        let config = build_config(&pool)
+        let config = build_config(&pool, drivers())
             .await
             .expect("an enabled postgres connection must not fail config build");
         assert_eq!(
@@ -2921,6 +2729,7 @@ mod tests {
             HubSource::Available {
                 catalog: Some(&catalog),
             },
+            drivers(),
         );
         assert!(!config.has_external_connections());
         assert!(config.external_names().is_empty());
@@ -2956,7 +2765,7 @@ mod tests {
             ),
         ] {
             let (config, exclusions) =
-                build_config_lenient_with_thresholds(&snapshot, &HashMap::new(), source);
+                build_config_lenient_with_thresholds(&snapshot, &HashMap::new(), source, drivers());
             assert_eq!(config.connections.len(), 1);
             assert_eq!(config.connections[0].key, format!("conn:{plc_id}"));
             assert!(!config.has_external_connections());
@@ -2982,14 +2791,20 @@ mod tests {
             assert_eq!(exclusions[0].reason.message(), message);
         }
 
-        // banto-hub's lenient twin is the `Unavailable` one.
-        let (_, exclusions) = build_config_lenient_from(&snapshot);
-        assert_eq!(exclusions[0].reason, ExclusionReason::HubSourceUnavailable);
-        match build_config_from(&snapshot) {
+        // banto-hub's builds (strict and its lenient twin): R2b-3a-3 - a `hub`
+        // row is the driver check's there (banto-hub registers no `hub` driver).
+        let (_, exclusions) = build_config_lenient_from(&snapshot, drivers());
+        assert_eq!(
+            exclusions[0].reason,
+            ExclusionReason::DriverUnavailable {
+                protocol: "hub".to_string()
+            }
+        );
+        match build_config_from(&snapshot, drivers()) {
             Err(CollectError::Config(message)) => {
                 assert_eq!(
                     message,
-                    "接続 Hub は Hub 経由の接続です。この実行形態では Hub 経由の接続から収集できません"
+                    "接続 Hub のプロトコル hub のドライバがありません（接続は残しています）"
                 );
             }
             other => panic!("the strict build must refuse a hub connection, got {other:?}"),
@@ -3028,6 +2843,7 @@ mod tests {
             HubSource::Available {
                 catalog: Some(&catalog),
             },
+            drivers(),
         );
         assert!(config.has_external_connections());
         // P4: the post-reconciliation set - the vanished and retyped tags are
@@ -3097,13 +2913,14 @@ mod tests {
             &snapshot,
             &HashMap::new(),
             HubSource::Available { catalog: None },
+            drivers(),
         );
         assert!(exclusions.is_empty(), "{exclusions:?}");
         assert_eq!(
             config.connections[1].groups[0].external_names,
             vec!["PLC9.G.Temp", "PLC9.G.Gone", "PLC9.G.Retyped"]
         );
-        assert!(config_exclusions(&snapshot).is_empty());
+        assert!(config_exclusions(&snapshot, drivers()).is_empty());
 
         // PR #578 review: when **every** hub tag is excluded, the hub group and
         // connection are not planned at all (nothing to collect through
@@ -3119,6 +2936,7 @@ mod tests {
             HubSource::Available {
                 catalog: Some(&retyped_everything),
             },
+            drivers(),
         );
         assert!(!config.has_external_connections());
         assert!(config.external_names().is_empty());
@@ -3161,8 +2979,8 @@ mod tests {
             .await
             .unwrap();
 
-        let a = build_config(&pool).await.unwrap();
-        let b = build_config(&pool).await.unwrap();
+        let a = build_config(&pool, drivers()).await.unwrap();
+        let b = build_config(&pool, drivers()).await.unwrap();
         assert_eq!(a.store_config, b.store_config);
     }
 
@@ -3201,7 +3019,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = build_config(&pool).await.unwrap();
+        let mut config = build_config(&pool, drivers()).await.unwrap();
         let mut keys = std::collections::HashSet::new();
         keys.insert(format!("conn:{}", suppressed_conn.id));
         // A key with no matching connection must be silently ignored.
@@ -3229,18 +3047,13 @@ mod tests {
         );
     }
 
-    /// T9-2: `set_broker_dial_target` overwrites a broker-routed plan's
-    /// `host`/`port` (used purely so `Collector::apply_config`'s `PartialEq`
-    /// diff notices a resolved-target change and respawns the connection's
-    /// task with a fresh `ClientFactory` - see the method's own doc comment
-    /// for the full derivation), leaves a non-matching key untouched, and is
-    /// a silent no-op for an absent key.
-    ///
-    /// #337 (2026-09-08): the Modbus plan is now stamped too - it used to be
-    /// asserted here as an explicit no-op, which stopped being correct once
-    /// Modbus collection reads became broker-routed (and therefore
-    /// `suppress_simulation_for`-suppressed, flattening away the natural
-    /// `simulation`-toggle diff signal the Modbus plan used to carry).
+    /// T9-2: `set_broker_dial_target` stamps a broker-read plan with the
+    /// session's fingerprint (used purely so `Collector::apply_config`'s
+    /// `PartialEq` diff notices a moved session and respawns the
+    /// connection's task with a fresh `ClientFactory` - see the method's own
+    /// doc comment), makes the plan differ from an unstamped one and from one
+    /// stamped differently, leaves a non-matching key untouched, and is a
+    /// silent no-op for an absent key. #337: SLMP and Modbus alike.
     #[tokio::test]
     async fn set_broker_dial_target_overwrites_the_matching_broker_routed_plan() {
         let pool = registry().await;
@@ -3266,37 +3079,47 @@ mod tests {
             .await
             .unwrap();
 
-        let mut config = build_config(&pool).await.unwrap();
+        let unstamped = build_config(&pool, drivers()).await.unwrap();
         let slmp_key = format!("conn:{}", slmp_conn.id);
         let modbus_key = format!("conn:{}", modbus_conn.id);
+        assert_eq!(
+            unstamped.broker_connection_keys(),
+            HashSet::from([slmp_key.clone(), modbus_key.clone()])
+        );
+        let fingerprint = |port: &str| {
+            let mut settings = Settings::new();
+            settings.insert(banto_driver_api::keys::PORT, port);
+            SettingsFingerprint::of("slmp", &settings, &[])
+        };
+        let plan = |config: &CollectorConfig, key: &str| {
+            config
+                .connections
+                .iter()
+                .find(|c| c.key == key)
+                .unwrap()
+                .clone()
+        };
 
-        config.set_broker_dial_target(&slmp_key, "127.0.0.1".to_string(), 19999);
-        config.set_broker_dial_target(&modbus_key, "127.0.0.1".to_string(), 19998);
+        let mut config = unstamped.clone();
+        config.set_broker_dial_target(&slmp_key, fingerprint("19999"));
+        config.set_broker_dial_target(&modbus_key, fingerprint("19998"));
         // An absent key must still be a silent no-op.
-        config.set_broker_dial_target("conn:999999", "127.0.0.1".to_string(), 1);
+        config.set_broker_dial_target("conn:999999", fingerprint("1"));
 
-        let slmp_plan = config
-            .connections
-            .iter()
-            .find(|c| c.key == slmp_key)
-            .unwrap();
-        match &slmp_plan.config {
-            ProtocolConfig::Slmp(cfg) => assert_eq!(cfg.port, 19999),
-            _ => panic!("expected Slmp config"),
-        }
+        assert_ne!(plan(&config, &slmp_key), plan(&unstamped, &slmp_key));
+        assert_ne!(
+            plan(&config, &modbus_key),
+            plan(&unstamped, &modbus_key),
+            "#337: a broker-read Modbus plan is stamped just like an SLMP one"
+        );
 
-        let modbus_plan = config
-            .connections
-            .iter()
-            .find(|c| c.key == modbus_key)
-            .unwrap();
-        match &modbus_plan.config {
-            ProtocolConfig::ModbusTcp(cfg) => assert_eq!(
-                cfg.port, 19998,
-                "#337: a broker-routed Modbus plan is stamped just like an SLMP one"
-            ),
-            _ => panic!("expected ModbusTcp config"),
-        }
+        // The same stamp again: unchanged. Another one: changed.
+        let mut again = config.clone();
+        again.set_broker_dial_target(&slmp_key, fingerprint("19999"));
+        assert_eq!(plan(&again, &slmp_key), plan(&config, &slmp_key));
+        again.set_broker_dial_target(&slmp_key, fingerprint("20000"));
+        assert_ne!(plan(&again, &slmp_key), plan(&config, &slmp_key));
+        assert_eq!(plan(&again, &modbus_key), plan(&config, &modbus_key));
     }
 
     /// #414 段階1: the save-time check's accept/reject table.
@@ -3390,7 +3213,7 @@ mod tests {
             }
             TagService::new(pool.clone()).create(tag).await.unwrap();
 
-            let built = build_config(&pool).await;
+            let built = build_config(&pool, drivers()).await;
             let checked = check_tag_address(protocol, address, data_type);
             assert_eq!(
                 built.is_ok(),
@@ -3406,7 +3229,12 @@ mod tests {
     // so the strict path must keep failing on the *same* item with the
     // *same* words after `build_config_from` was rebuilt on top of the
     // lenient builder. These goldens were run against the pre-#414-段階2
-    // implementation first (they passed there unchanged).
+    // implementation first (they passed there unchanged). R2b-3a-3: every
+    // build reads through the drivers, so a connection's settings and a tag's
+    // address are judged by the driver - those cases carry the driver's words
+    // (the strict path banto-hub uses already did since R2b-1d / R2b-2c), and
+    // a broken setting is made in `settings` (what the broker dials with), not
+    // in the flat columns.
 
     /// One valid Modbus connection "PLC1" (port 502) with group "G1"
     /// (1000 ms) and tag "T1" (40001, i16), loaded as a snapshot - each
@@ -3431,7 +3259,7 @@ mod tests {
     }
 
     fn strict_message(snapshot: &RegistrySnapshot) -> String {
-        match build_config_from(snapshot) {
+        match build_config_from(snapshot, drivers()) {
             Err(CollectError::Config(message)) => message,
             other => panic!("expected CollectError::Config, got {other:?}"),
         }
@@ -3446,26 +3274,26 @@ mod tests {
         (
             "unsupported protocol",
             |s| s.connections[0].protocol = "ethernet-ip".to_string(),
-            "接続 PLC1 のプロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）",
+            "接続 PLC1 のプロトコル ethernet-ip のドライバがありません（接続は残しています）",
         ),
         (
             "modbus port",
-            |s| s.connections[0].port = 70_000,
-            "接続 PLC1 のポート番号が不正です: 70000",
+            |s| set_setting(s, "port", 70_000),
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "modbus unit id",
-            |s| s.connections[0].unit_id = 300,
-            "接続 PLC1 のユニットIDが不正です: 300",
+            |s| set_setting(s, "unit_id", 300),
+            "接続 PLC1 の設定が検証を通りません: unitId: unit_id は 0〜255 の整数で指定してください",
         ),
         (
             "slmp port",
             |s| {
                 s.connections[0].protocol = "slmp".to_string();
                 s.tags[0].address = "D100".to_string();
-                s.connections[0].port = -1;
+                set_setting(s, "port", -1);
             },
-            "接続 PLC1 のポート番号が不正です: -1",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "group period",
@@ -3475,7 +3303,7 @@ mod tests {
         (
             "tag address",
             |s| s.tags[0].address = "99999".to_string(),
-            "タグ T1 のアドレス 99999 が不正です: GOLDEN_ADDRESS_REASON",
+            "タグ T1 のアドレス 99999 が不正です: \"99999\" は Modbus の参照番号（例: 40001, 40001.3）として読めません",
         ),
         (
             "tag data type",
@@ -3485,8 +3313,8 @@ mod tests {
         (
             "bit address on a non-bit tag",
             |s| s.tags[0].address = "40001.3".to_string(),
-            "タグ T1 のアドレス 40001.3 はビット指定アドレスです。ビット指定アドレスは \
-             data_type=bit のタグでのみ使えます（現在のデータ型: i16）",
+            "タグ T1 のアドレス 40001.3 が不正です: ビット指定アドレス \"40001.3\" はデータ型 bit \
+             のタグでのみ使えます（現在のデータ型: i16）",
         ),
         (
             // Within one group the tags are parsed before the period is
@@ -3502,27 +3330,34 @@ mod tests {
             // The connection is checked before any of its groups.
             "bad connection and bad tag under it",
             |s| {
-                s.connections[0].port = 70_000;
+                set_setting(s, "port", 70_000);
                 s.tags[0].data_type = "f128".to_string();
             },
-            "接続 PLC1 のポート番号が不正です: 70000",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
         (
             // A broken connection fails the strict build even when it has
             // nothing to collect.
             "bad connection without any group",
             |s| {
-                s.connections[0].port = 70_000;
+                set_setting(s, "port", 70_000);
                 s.groups.clear();
                 s.tags.clear();
             },
-            "接続 PLC1 のポート番号が不正です: 70000",
+            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
         ),
     ];
 
+    /// Break the first connection's stored settings (what the broker dials
+    /// with since R2b-3a-3) - the flat columns are no longer read by the plan.
+    fn set_setting(snapshot: &mut RegistrySnapshot, key: &str, value: i64) {
+        snapshot.connections[0]
+            .settings
+            .insert(key.to_string(), value.into());
+    }
+
     fn golden_expected(expected: &str) -> String {
-        let address_reason = Address::parse("99999").unwrap_err().to_string();
-        expected.replace("GOLDEN_ADDRESS_REASON", &address_reason)
+        expected.to_string()
     }
 
     #[tokio::test]
@@ -3545,20 +3380,29 @@ mod tests {
         let base = golden_snapshot().await;
 
         let mut snapshot = base.clone();
-        snapshot.connections[0].port = 70_000;
+        set_setting(&mut snapshot, "port", 70_000);
         snapshot.connections[0].enabled = false;
-        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
+        assert_eq!(
+            build_config_from(&snapshot, drivers()).unwrap().tag_count(),
+            0
+        );
 
         let mut snapshot = base.clone();
         snapshot.groups[0].period_ms = -5;
         snapshot.groups[0].enabled = false;
-        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
+        assert_eq!(
+            build_config_from(&snapshot, drivers()).unwrap().tag_count(),
+            0
+        );
 
         let mut snapshot = base;
         snapshot.tags[0].address = "99999".to_string();
         snapshot.tags[0].enabled = false;
-        assert_eq!(build_config_from(&snapshot).unwrap().tag_count(), 0);
-        assert!(config_exclusions(&snapshot).is_empty());
+        assert_eq!(
+            build_config_from(&snapshot, drivers()).unwrap().tag_count(),
+            0
+        );
+        assert!(config_exclusions(&snapshot, drivers()).is_empty());
     }
 
     // --- #414 段階2: the lenient builder ---------------------------------
@@ -3569,14 +3413,14 @@ mod tests {
     #[tokio::test]
     async fn the_first_exclusion_is_the_item_the_strict_build_fails_on() {
         let base = golden_snapshot().await;
-        let (config, exclusions) = build_config_lenient_from(&base);
+        let (config, exclusions) = build_config_lenient_from(&base, drivers());
         assert!(exclusions.is_empty());
-        assert_eq!(config, build_config_from(&base).unwrap());
+        assert_eq!(config, build_config_from(&base, drivers()).unwrap());
 
         for (label, break_it, expected) in GOLDEN_CASES {
             let mut snapshot = base.clone();
             break_it(&mut snapshot);
-            let (_, exclusions) = build_config_lenient_from(&snapshot);
+            let (_, exclusions) = build_config_lenient_from(&snapshot, drivers());
             let first = exclusions.first().expect(label);
             match first.strict_error() {
                 Some(CollectError::Config(message)) => {
@@ -3627,13 +3471,15 @@ mod tests {
             .iter()
             .position(|c| c.id == conn_b.id)
             .unwrap();
-        snapshot.connections[i].port = 70_000;
+        snapshot.connections[i]
+            .settings
+            .insert("port".to_string(), 70_000.into());
         let i = snapshot.groups.iter().position(|g| g.id == g3.id).unwrap();
         snapshot.groups[i].period_ms = -5;
         let i = snapshot.tags.iter().position(|t| t.id == t6.id).unwrap();
         snapshot.tags[i].data_type = "f128".to_string();
 
-        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        let (config, exclusions) = build_config_lenient_from(&snapshot, drivers());
 
         // What is left: PLC-A / G1 / T1 only (T2 out, the string tag
         // skipped as always).
@@ -3682,7 +3528,7 @@ mod tests {
                 (
                     ExclusionUnit::Connection,
                     format!("conn:{}", conn_b.id),
-                    "invalidPort"
+                    "invalidSettings"
                 ),
                 (
                     ExclusionUnit::Group,
@@ -3709,28 +3555,45 @@ mod tests {
         assert!(exclusions[5].strict_error().is_none());
 
         // The strict build fails on the first one, with the pre-段階2 text.
-        match build_config_from(&snapshot) {
+        match build_config_from(&snapshot, drivers()) {
             Err(CollectError::Config(message)) => {
                 assert!(message.starts_with("タグ T2 のアドレス D3000 が不正です: "))
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(config_exclusions(&snapshot), exclusions);
+        assert_eq!(config_exclusions(&snapshot, drivers()), exclusions);
     }
 
-    /// A tag's exclusion reason is worded exactly like the save-time
-    /// rejection of the same tag (#414 段階1) - one vocabulary for "this
-    /// address cannot be read".
+    /// A tag the save-time check rejects is also left out of the plan, on
+    /// the same field, worded with the same notation and example (#414
+    /// 段階1). Since R2b-3a-3 the plan's reason after that is the driver's
+    /// own (it reads the address), so only the field and the leading words
+    /// are shared.
     #[tokio::test]
     async fn a_tag_exclusion_uses_the_save_time_wording() {
         for (address, data_type) in [("D3000", "i16"), ("40001", "f128"), ("40001.3", "i16")] {
             let mut snapshot = golden_snapshot().await;
             snapshot.tags[0].address = address.to_string();
             snapshot.tags[0].data_type = data_type.to_string();
-            let exclusions = config_exclusions(&snapshot);
+            let exclusions = config_exclusions(&snapshot, drivers());
             assert_eq!(exclusions.len(), 1, "{address} / {data_type}");
             let saved = check_tag_address("modbus-tcp", address, data_type).unwrap_err();
-            assert_eq!(exclusions[0].reason.message(), saved.message());
+            let ExclusionReason::InvalidTag { issue, .. } = &exclusions[0].reason else {
+                panic!("{address}: {:?}", exclusions[0].reason);
+            };
+            assert_eq!(issue.field(), saved.field(), "{address} / {data_type}");
+            if let TagAddressIssue::InvalidAddress { .. } = issue {
+                assert!(
+                    exclusions[0]
+                        .reason
+                        .message()
+                        .starts_with("Modbus TCP のアドレスとして解釈できません（例: 40001）。"),
+                    "{}",
+                    exclusions[0].reason.message()
+                );
+            } else {
+                assert_eq!(exclusions[0].reason.message(), saved.message());
+            }
             assert_eq!(exclusions[0].unit, ExclusionUnit::Tag);
         }
     }
@@ -3766,9 +3629,9 @@ mod tests {
         let mut without_bad = with_bad.clone();
         without_bad.tags.retain(|t| t.id != bad.id);
 
-        let (lenient, exclusions) = build_config_lenient_from(&with_bad);
+        let (lenient, exclusions) = build_config_lenient_from(&with_bad, drivers());
         assert_eq!(exclusions.len(), 1);
-        assert_eq!(lenient, build_config_from(&without_bad).unwrap());
+        assert_eq!(lenient, build_config_from(&without_bad, drivers()).unwrap());
     }
 
     /// A broken connection with no groups is still listed (the strict build
@@ -3779,14 +3642,14 @@ mod tests {
         snapshot.connections[0].protocol = "ethernet-ip".to_string();
         snapshot.groups.clear();
         snapshot.tags.clear();
-        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        let (config, exclusions) = build_config_lenient_from(&snapshot, drivers());
         assert_eq!(config.tag_count(), 0);
         assert_eq!(exclusions.len(), 1);
         assert_eq!(exclusions[0].unit, ExclusionUnit::Connection);
-        assert_eq!(exclusions[0].reason.code(), "unsupportedProtocol");
+        assert_eq!(exclusions[0].reason.code(), "driverUnavailable");
         assert_eq!(
             exclusions[0].reason.message(),
-            "プロトコル ethernet-ip は未対応です（modbus-tcp / slmp / hub のみ対応）"
+            "プロトコル ethernet-ip のドライバがこの実行形態にありません（接続は残しています）"
         );
     }
 
@@ -4008,17 +3871,20 @@ mod tests {
             Some(&2000.into())
         );
 
-        let config = build_config_from_with(&in_tx, PushSource::Available).unwrap();
+        let config =
+            build_config_from_with_registry(&in_tx, PushSource::Available, push_drivers()).unwrap();
         assert_eq!(config.connections[0].config, ProtocolConfig::External);
         assert_eq!(config.external_names(), vec!["line1.temp".to_string()]);
         // ChronoGazer's (and today's Hub's) strict build still refuses it.
-        assert!(build_config_from(&in_tx).is_err());
+        assert!(build_config_from(&in_tx, drivers()).is_err());
     }
 
     #[test]
     fn push_available_plans_an_external_connection_with_trimmed_keys() {
         let snapshot = push_snapshot();
-        let config = build_config_from_with(&snapshot, PushSource::Available).unwrap();
+        let config =
+            build_config_from_with_registry(&snapshot, PushSource::Available, push_drivers())
+                .unwrap();
         assert_eq!(config.connections.len(), 1);
         let conn = &config.connections[0];
         assert_eq!(conn.key, "conn:7");
@@ -4050,7 +3916,9 @@ mod tests {
         snapshot.tags[0].raw_hi = Some(100.0);
         snapshot.tags[0].eng_lo = Some(0.0);
         snapshot.tags[0].eng_hi = Some(1000.0);
-        let config = build_config_from_with(&snapshot, PushSource::Available).unwrap();
+        let config =
+            build_config_from_with_registry(&snapshot, PushSource::Available, push_drivers())
+                .unwrap();
         assert!(config.connections[0].groups[0].tags[0].scaling.is_none());
     }
 
@@ -4061,9 +3929,9 @@ mod tests {
         let (config, exclusions) = build_config_lenient_inner(
             &snapshot,
             ThresholdSource::None,
-            HubSource::Unavailable,
-            PushSource::Available,
             None,
+            PushSource::Available,
+            push_drivers(),
         );
         let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
             .iter()
@@ -4072,7 +3940,8 @@ mod tests {
         assert_eq!(listed, vec![(ExclusionUnit::Tag, 705, "unknownDataType")]);
         assert_eq!(config.connections[0].groups[0].external_names.len(), 3);
         // The strict build fails with the tag's wording.
-        let err = build_config_from_with(&snapshot, PushSource::Available).unwrap_err();
+        let err = build_config_from_with_registry(&snapshot, PushSource::Available, push_drivers())
+            .unwrap_err();
         assert!(err.to_string().contains("complex128"), "{err}");
     }
 
@@ -4092,9 +3961,9 @@ mod tests {
             let (config, _) = build_config_lenient_inner(
                 &snapshot,
                 ThresholdSource::None,
-                HubSource::Unavailable,
-                PushSource::Available,
                 None,
+                PushSource::Available,
+                push_drivers(),
             );
             assert!(config.connections.is_empty());
             assert!(config.store_config.groups.is_empty());
@@ -4105,7 +3974,7 @@ mod tests {
     #[test]
     fn push_unavailable_excludes_the_connection_with_cascades() {
         let snapshot = push_snapshot();
-        let (config, exclusions) = build_config_lenient_from(&snapshot);
+        let (config, exclusions) = build_config_lenient_from(&snapshot, push_drivers());
         assert!(config.connections.is_empty());
         assert!(config.store_config.groups.is_empty());
         let listed: Vec<(ExclusionUnit, i64, &str)> = exclusions
@@ -4129,8 +3998,9 @@ mod tests {
         // Strict wording, and `build_config_from` == `..._with(Unavailable)`.
         let expected = "接続 mes は push 接続です。この実行形態では push 接続から収集できません";
         for err in [
-            build_config_from(&snapshot).unwrap_err(),
-            build_config_from_with(&snapshot, PushSource::Unavailable).unwrap_err(),
+            build_config_from(&snapshot, push_drivers()).unwrap_err(),
+            build_config_from_with_registry(&snapshot, PushSource::Unavailable, push_drivers())
+                .unwrap_err(),
         ] {
             assert!(
                 matches!(&err, CollectError::Config(m) if m == expected),
@@ -4151,33 +4021,44 @@ mod tests {
             protocol: "modbus-tcp".to_string(),
             host: "127.0.0.1".to_string(),
             port: 502,
+            // R2b-3a-3: the plan reads `settings` (what the broker dials with).
+            settings: serde_json::json!({"host": "127.0.0.1", "port": 502})
+                .as_object()
+                .unwrap()
+                .clone(),
             ..push_conn(8, "plc")
         });
         snapshot.groups.push(group_of(80, 8, 1000));
         snapshot.tags.push(tag_of(801, 80, "40001", "u16"));
 
         let mut configs = vec![
-            build_config_lenient_from(&snapshot).0,
+            build_config_lenient_from(&snapshot, drivers()).0,
             build_config_lenient_with_thresholds(
                 &snapshot,
                 &HashMap::new(),
                 HubSource::Unavailable,
+                drivers(),
             )
             .0,
             build_config_lenient_with_thresholds(
                 &snapshot,
                 &HashMap::new(),
                 HubSource::Available { catalog: None },
+                drivers(),
             )
             .0,
             build_config_lenient_with_thresholds(
                 &snapshot,
                 &HashMap::new(),
                 HubSource::NotConfigured,
+                drivers(),
             )
             .0,
         ];
-        configs.push(build_config_from_with(&snapshot, PushSource::Available).unwrap());
+        configs.push(
+            build_config_from_with_registry(&snapshot, PushSource::Available, push_drivers())
+                .unwrap(),
+        );
         let (last, rest) = configs.split_last().unwrap();
         for config in rest {
             let keys: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
@@ -4188,7 +4069,7 @@ mod tests {
         // ... whereas the explicit opt-in does (so the assertions above bite).
         assert!(last.has_external_connections());
         // The editor marks flag the push connection too (never silently drop).
-        assert!(config_exclusions(&snapshot)
+        assert!(config_exclusions(&snapshot, drivers())
             .iter()
             .any(|e| e.reason.code() == "pushSourceUnavailable"));
     }
@@ -4221,7 +4102,7 @@ mod tests {
         /// R2b-2c: a stand-in that reads an address the way the real drivers do
         /// (`banto_plc`'s grammar of the driver's own id, canonical = `Display`), so
         /// the registry-carrying plan has something faithful to ask. Any other id
-        /// refuses everything.
+        /// (a driver the crate has no notation for, R2b-3a-3) takes the text as is.
         fn parse_address(
             &self,
             text: &str,
@@ -4231,7 +4112,15 @@ mod tests {
             let parsed = match id.as_str() {
                 "modbus-tcp" => Address::parse(text),
                 "slmp" => Address::parse_slmp(text),
-                _ => return Err(banto_driver_api::AddressError::new("none")),
+                _ => {
+                    return Ok(banto_driver_api::DriverAddress::new(
+                        id.clone(),
+                        text,
+                        "area",
+                        true,
+                        1,
+                    ))
+                }
             }
             .map_err(|err| banto_driver_api::AddressError::new(err.to_string()))?;
             Ok(banto_driver_api::DriverAddress::new(
@@ -4255,24 +4144,67 @@ mod tests {
         }
     }
 
+    /// R2b-3a-3: the plan reads only through session-type (broker-managed)
+    /// drivers, so the fake is one too. The plan never dials; a connect is a
+    /// refusal.
+    impl banto_driver_api::SessionDriver for FakeDriver {
+        fn connect(
+            &self,
+            _settings: &Settings,
+            _cx: banto_driver_api::ConnectContext,
+        ) -> banto_driver_api::BoxFuture<
+            'static,
+            Result<Box<dyn banto_driver_api::Session>, banto_driver_api::FatalError>,
+        > {
+            Box::pin(async {
+                Err(banto_driver_api::FatalError::Io(
+                    "the fake driver never dials".to_string(),
+                ))
+            })
+        }
+    }
+
+    fn fake_driver(id: &str, secret_keys: &[&str]) -> FakeDriver {
+        FakeDriver {
+            descriptor: banto_driver_api::DriverDescriptor::new(
+                banto_driver_api::DriverId::new(id).unwrap(),
+                "0.0.0",
+                id,
+                banto_driver_api::Capabilities::READ_ONLY,
+            ),
+            secret_keys: secret_keys.iter().map(|k| k.to_string()).collect(),
+        }
+    }
+
+    /// A session-type fake per id, except `push` (host-provided, as in
+    /// banto-hub's registry).
     fn fake_registry(drivers: &[(&str, &[&str])]) -> DriverRegistry {
         let mut registry = DriverRegistry::new();
         for (id, secret_keys) in drivers {
-            registry
-                .register(banto_driver_api::DriverEntry::host_provided(
-                    std::sync::Arc::new(FakeDriver {
-                        descriptor: banto_driver_api::DriverDescriptor::new(
-                            banto_driver_api::DriverId::new(id).unwrap(),
-                            "0.0.0",
-                            *id,
-                            banto_driver_api::Capabilities::READ_ONLY,
-                        ),
-                        secret_keys: secret_keys.iter().map(|k| k.to_string()).collect(),
-                    }),
-                ))
-                .unwrap();
+            let driver = std::sync::Arc::new(fake_driver(id, secret_keys));
+            let entry = if *id == PUSH_PROTOCOL {
+                banto_driver_api::DriverEntry::host_provided(driver)
+            } else {
+                banto_driver_api::DriverEntry::session(driver)
+            };
+            registry.register(entry).unwrap();
         }
         registry
+    }
+
+    /// The built-in drivers plus a host-provided `push` (banto-hub's
+    /// registry has one; the built-ins do not), for the push plans.
+    fn push_drivers() -> &'static DriverRegistry {
+        static DRIVERS: std::sync::LazyLock<DriverRegistry> = std::sync::LazyLock::new(|| {
+            let mut registry = banto_drivers::builtin().registry;
+            registry
+                .register(banto_driver_api::DriverEntry::host_provided(
+                    std::sync::Arc::new(fake_driver(PUSH_PROTOCOL, &[])),
+                ))
+                .unwrap();
+            registry
+        });
+        &DRIVERS
     }
 
     fn modbus_conn(id: i64, name: &str, settings: serde_json::Value) -> PlcConnection {
@@ -4294,7 +4226,7 @@ mod tests {
     /// (canonical) spellings both plan. The registry-free build is unchanged.
     #[test]
     fn a_registry_plan_excludes_only_the_tag_its_driver_refuses() {
-        let registry = fake_registry(&[("modbus-tcp", &[])]);
+        let registry = banto_drivers::builtin().registry;
         let conn = modbus_conn(1, "c", serde_json::json!({"host": "h", "port": 502}));
         let snapshot = RegistrySnapshot {
             connections: vec![conn],
@@ -4310,19 +4242,20 @@ mod tests {
         let (config, exclusions) = build_config_lenient_inner(
             &snapshot,
             ThresholdSource::None,
-            HubSource::Unavailable,
+            None,
             PushSource::Available,
-            Some(&registry),
+            &registry,
         );
         let tag_exclusions: Vec<(i64, &str)> = exclusions
             .iter()
             .filter(|e| e.unit == ExclusionUnit::Tag)
             .map(|e| (e.id, e.reason.code()))
             .collect();
-        // 100: the driver refuses `D3000`; 103: a bit address on a non-bit tag.
+        // 100: the driver refuses `D3000`; 103: a bit address on a non-bit
+        // tag - the driver's rule since R2b-2a, so its refusal too.
         assert_eq!(
             tag_exclusions,
-            vec![(100, "invalidAddress"), (103, "bitAddressOnNonBitType")]
+            vec![(100, "invalidAddress"), (103, "invalidAddress")]
         );
         let message = exclusions
             .iter()
@@ -4332,18 +4265,6 @@ mod tests {
         assert!(message.contains("Modbus TCP"), "{message}");
         let group = &config.connections[0].groups[0];
         assert_eq!(group.requests.len(), 2, "40001 and 400001 are both planned");
-        // The same snapshot without a registry plans exactly the same tags.
-        let (_, plain) = build_config_lenient_inner(
-            &snapshot,
-            ThresholdSource::None,
-            HubSource::Unavailable,
-            PushSource::Available,
-            None,
-        );
-        assert_eq!(
-            plain.iter().map(|e| e.id).collect::<Vec<_>>(),
-            vec![100, 103]
-        );
     }
 
     /// Design §4.4・§7: with a registry, a connection whose driver is missing, whose
@@ -4383,9 +4304,9 @@ mod tests {
         let (config, exclusions) = build_config_lenient_inner(
             &snapshot,
             ThresholdSource::None,
-            HubSource::Unavailable,
+            None,
             PushSource::Available,
-            Some(&registry),
+            &registry,
         );
         let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(planned, vec!["conn:1"]);
@@ -4453,20 +4374,65 @@ mod tests {
         assert!(
             build_config_from_with_registry(&only_good, PushSource::Available, &registry).is_ok()
         );
-        // Without a registry the old rules decide (no driver checks at all).
-        let (_, without) = build_config_lenient_inner(
+    }
+
+    /// R2b-3a-3 (design §4.3): whether a connection is planned is the registry's
+    /// driver kind, not a protocol-name table. A session-type driver under a new id
+    /// is planned (read through the broker); a host-provided one is not
+    /// (`unsupportedProtocol`, as before); and a `simulation = true` connection of
+    /// a protocol without a simulator is excluded, so it is never dialed.
+    #[test]
+    fn the_plan_follows_the_driver_kind_and_never_plans_an_unsimulatable_simulation() {
+        let mut registry = fake_registry(&[("fake-session", &[])]);
+        registry
+            .register(banto_driver_api::DriverEntry::host_provided(
+                std::sync::Arc::new(fake_driver("fake-provided", &[])),
+            ))
+            .unwrap();
+        let mut session = modbus_conn(1, "session", serde_json::json!({}));
+        session.protocol = "fake-session".to_string();
+        let mut provided = modbus_conn(2, "provided", serde_json::json!({}));
+        provided.protocol = "fake-provided".to_string();
+        let mut simulated = session.clone();
+        simulated.id = 3;
+        simulated.name = "simulated".to_string();
+        simulated.simulation = true;
+        let snapshot = RegistrySnapshot {
+            connections: vec![session, provided, simulated],
+            groups: (1..=3).map(|id| group_of(id * 10, id, 1000)).collect(),
+            tags: (1..=3)
+                .map(|id| tag_of(id * 100, id * 10, "X1", "u16"))
+                .collect(),
+            secrets: Vec::new(),
+        };
+
+        let (config, exclusions) = build_config_lenient_inner(
             &snapshot,
             ThresholdSource::None,
-            HubSource::Unavailable,
-            PushSource::Available,
             None,
+            PushSource::Unavailable,
+            &registry,
         );
-        assert!(without.iter().all(|e| !matches!(
-            e.reason,
-            ExclusionReason::DriverUnavailable { .. }
-                | ExclusionReason::InvalidSettings { .. }
-                | ExclusionReason::SettingsVersionTooNew { .. }
-        )));
+        let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
+        assert_eq!(planned, vec!["conn:1"]);
+        assert_eq!(
+            config.broker_connection_keys(),
+            ["conn:1".to_string()].into_iter().collect()
+        );
+        assert_eq!(config.connections[0].groups[0].requests.len(), 1);
+        let own: Vec<(i64, &str)> = exclusions
+            .iter()
+            .filter(|e| e.unit == ExclusionUnit::Connection)
+            .map(|e| (e.id, e.reason.code()))
+            .collect();
+        assert_eq!(
+            own,
+            vec![(2, "unsupportedProtocol"), (3, "unsupportedProtocol")]
+        );
+        // The built-in drivers' simulators are still picked by name.
+        assert_eq!(simulator_protocol("modbus-tcp"), Some(Protocol::ModbusTcp));
+        assert_eq!(simulator_protocol("slmp"), Some(Protocol::Slmp));
+        assert_eq!(simulator_protocol("fake-session"), None);
     }
 
     /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -

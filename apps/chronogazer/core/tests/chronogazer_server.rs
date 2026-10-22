@@ -352,7 +352,11 @@ async fn register(
 async fn latest_event(sandbox: &Sandbox) -> Option<String> {
     let layout = sandbox.layout();
     let pool = init_db(layout.db_path()).await.expect("開き直す");
-    let reader = CollectorService::new(pool.clone(), layout.data_dir());
+    let reader = CollectorService::new(
+        pool.clone(),
+        layout.data_dir(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
         Readout::Ready { data } => data.rows,
         other => panic!("イベントが読めない: {}", other.as_str()),
@@ -728,7 +732,11 @@ async fn spawn_paused_before_open(sandbox: &Sandbox) -> Server {
 async fn event_kinds(sandbox: &Sandbox) -> Vec<String> {
     let layout = sandbox.layout();
     let pool = init_db(layout.db_path()).await.expect("開き直す");
-    let reader = CollectorService::new(pool.clone(), layout.data_dir());
+    let reader = CollectorService::new(
+        pool.clone(),
+        layout.data_dir(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     let rows: Vec<CollectEventRow> = match reader.events(EventPage::default()).await {
         Readout::Ready { data } => data.rows,
         other => panic!("イベントが読めない: {}", other.as_str()),

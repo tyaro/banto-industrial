@@ -38,10 +38,17 @@
 //! - `task` (private): the per-connection collection loop - the crate's core
 //!   concurrency design (one task per connection, in-task min-deadline
 //!   scheduler, non-blocking reconnect). [`BackoffConfig`] and
-//!   [`ConnectionStatus`] are its public surface, plus (T2-2,
-//!   docs/tag-server-design.md §6-5) the [`ClientFactory`]/[`ClientSpec`]/
-//!   [`ClientProtocol`] client-construction injection seam and its
-//!   [`default_client_factory`].
+//!   [`ConnectionStatus`] are its public surface.
+//! - [`client`] (R2b-3a-3, docs/banto-hub-driver-io-design.md §4.3): the
+//!   [`CollectClient`] a task reads through, the [`ClientFactory`] seam
+//!   (connection key -> client), and the one production client,
+//!   [`BrokerReadClient`] (#344's `connect` semantics), with
+//!   [`broker_client_factory`]. The plan carries the drivers' own `TagSpec`s;
+//!   nothing per-protocol is copied into a client any more.
+//! - [`broker_sim`] / [`sessions`] (R2b-3a-3, design §8): the simulation mode
+//!   of a broker-read connection ([`BrokerSimRegistry`], shared with
+//!   banto-hub) and the broker sessions of a host without a broker of its own
+//!   ([`BrokerSessions`], ChronoGazer).
 //! - [`external`] (#383 段階3 P3, 2026-10-10 オーナー決定 H2/H4): the
 //!   [`ExternalSource`] seam for a `"hub"` connection - values banto-hub
 //!   already collected, sampled-and-held into the **same** daily tstore file,
@@ -72,6 +79,8 @@
 //! migrate yet, and keeping it out of any bookkeeping table means it never
 //! participates in the apps' "is this an old-format database?" check.
 
+pub mod broker_sim;
+pub mod client;
 pub mod collector;
 pub mod config;
 pub mod current;
@@ -88,16 +97,22 @@ pub mod external;
 // itself, so `start`/`SimulatorHandle` are now public. Everything else in
 // this module (the ramp/toggle generation tasks, the Modbus/SLMP-specific
 // startup helpers) stays crate-private.
+pub mod sessions;
 pub mod simulation;
 mod task;
 
+pub use broker_sim::{dial_fingerprint, BrokerSimRegistry};
+pub use client::{
+    broker_client_factory, BrokerReadClient, ClientFactory, CollectClient, ReadBatch,
+    BROKER_RECONNECT_GRACE,
+};
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{
-    build_config, build_config_from, build_config_from_with, build_config_from_with_registry,
-    build_config_lenient_from, build_config_lenient_with_thresholds, check_tag_address,
-    config_exclusions, connections_with_collected_groups, driver_exclusion, CollectorConfig,
-    ConfigExclusion, ExclusionReason, ExclusionUnit, HubCatalog, HubSource, Protocol, PushSource,
-    RegistrySnapshot, TagAddressField, TagAddressIssue, Thresholds,
+    build_config, build_config_from, build_config_from_with_registry, build_config_lenient_from,
+    build_config_lenient_with_thresholds, check_tag_address, config_exclusions,
+    connections_with_collected_groups, driver_exclusion, CollectorConfig, ConfigExclusion,
+    ExclusionReason, ExclusionUnit, HubCatalog, HubSource, Protocol, PushSource, RegistrySnapshot,
+    TagAddressField, TagAddressIssue, Thresholds,
 };
 pub use current::{
     CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,
@@ -109,10 +124,8 @@ pub use event::{
 pub use external::{
     ExternalLink, ExternalQuality, ExternalReading, ExternalSnapshot, ExternalSource,
 };
-pub use task::{
-    default_client_factory, BackoffConfig, ClientFactory, ClientProtocol, ClientSpec,
-    ConnectionStatus, EXTERNAL_RECONNECT_ATTEMPT,
-};
+pub use sessions::{BrokerSessions, SessionSync};
+pub use task::{BackoffConfig, ConnectionStatus, EXTERNAL_RECONNECT_ATTEMPT};
 
 use sqlx::SqlitePool;
 

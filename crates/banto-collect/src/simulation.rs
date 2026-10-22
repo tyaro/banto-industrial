@@ -5,20 +5,17 @@
 //! `banto-plc/src/{modbus,slmp}/simulator.rs`)へ接続する - ux-plan.md §1の
 //! 決定どおり、収集エンジン・クライアントのコードパス自体(`crate::task`)は
 //! 一切変更しない。シミュレータは実ソケットを持つ本物の TCP サーバーなので、
-//! `crate::task::default_client_factory`が組み立てる`ModbusTcpClient`/
-//! `SlmpClient`は、相手が実機かシミュレータか区別できない(区別する必要も
-//! ない)。
+//! broker のセッション(R2b-3a-3 からは収集もこれを通して読む)のドライバは、
+//! 相手が実機かシミュレータか区別できない(区別する必要もない)。
 //!
-//! ## ライフサイクルは接続タスクと同じ(オーナー決定)
+//! ## ライフサイクルは broker のセッションと同じ(R2b-3a-3)
 //!
-//! シミュレータは `crate::collector::Collector` が `tasks`(接続毎の収集
-//! タスク)と同じ寿命で管理する - 接続タスクを spawn する直前に起動し、
-//! 停止/入れ替え(`apply_config` の removed/replaced 分類、または
-//! `Collector::stop`)の際にタスクと一緒に止める。`crate::config::ConnectionPlan::simulation`
-//! を診断対象の `PartialEq` に含めたことで、simulation フラグの on/off
-//! 切り替え自体が「この接続は変わった」という T7-1 の通常の再構成経路に
-//! そのまま乗る(`crate::collector`に専用の分岐は不要 - 通常の
-//! stop-then-spawn の中でシミュレータの stop/start が一緒に起こるだけ)。
+//! シミュレータは [`crate::BrokerSimRegistry`] が、それをダイヤルする broker の
+//! セッションと対で管理する - セッションを用意する前に起動してアドレスを
+//! 設定の `host`/`port` に差し替え、接続がシミュレーションから外れたら止める。
+//! R2b-3a-3 までは `crate::collector::Collector` が接続タスクと同じ寿命で
+//! 起動・停止していた(収集が自分でソケットを張っていた頃の形。収集も broker を
+//! 通すようになり、セッションより前にアドレスが要るので移った)。
 //!
 //! ## 値生成: ランプ波(ux-plan.md §1)
 //!
@@ -61,22 +58,14 @@
 //!
 //! ## SLMP + banto-hub の broker 経路について(T9-2 で実装済み)
 //!
-//! T9-1 の時点でこのモジュールがカバーしていたのは(1)Modbus 接続
-//! (当時は常に直接クライアントで broker を経由しなかった - banto-hub では
-//! #337、2026-09-08 で Modbus の収集読み取りも broker 経由になったため、
-//! 現在この(1)に該当するのは非 hub コンシューマだけである)と(2)banto-hub の
-//! broker を経由しない SLMP 接続(このクレート単体・将来の非 hub
-//! コンシューマ)のみで、
-//! hub の broker 経由 SLMP 接続(`HubSessions::ensure_connection`)は
-//! `CollectorManager::rebuild`の中で`Collector::apply_config`より*前*に
-//! セッションを確立するため、この`Collector`が起動するシミュレータの
-//! アドレスをまだ知りえない、という申し送りが残っていた。
-//!
-//! T9-2 で解消済み: `apps/banto-hub/core/src/broker_glue.rs`の
-//! `BrokerSimRegistry`が、この`start`/[`SimulatorHandle`]をそのまま再利用して
-//! `ensure_connection`より前にシミュレータを起動・アドレス解決する - 詳細は
-//! `BrokerSimRegistry`自身の doc comment（および同ファイルの module doc
-//! 「T9-1/T9-2 note」節）を参照。
+//! T9-1 の時点では、broker のセッション(`HubSessions::ensure_connection`)は
+//! `CollectorManager::rebuild`の中で`Collector::apply_config`より*前*に確立
+//! されるため、`Collector` が起動するシミュレータのアドレスをまだ知りえない、
+//! という申し送りが残っていた。T9-2 で `BrokerSimRegistry`(R2b-3a-3 から
+//! [`crate::broker_sim`]、banto-hub は `broker_glue` から再公開)が、この
+//! `start`/[`SimulatorHandle`]を再利用して `ensure_connection` より前に
+//! シミュレータを起動・アドレス解決するようにした - 詳細は `BrokerSimRegistry`
+//! 自身の doc comment を参照。
 //!
 //! ## T15-2: all-simulation 開始前のカバレッジプリフライト(docs/banto-hub-desktop-plan.md §9.7)
 //!
@@ -117,11 +106,9 @@ pub(crate) const RAMP_PERIOD_MS: u64 = 100;
 pub const RAMP_ADDRESS_COUNT: u16 = 16;
 
 /// 起動中の1シミュレータインスタンス - 対応するランプ波生成タスクとその
-/// 停止チャネルを束ねる。`crate::collector::Collector` が接続キー
-/// (`"conn:{id}"`)ごとに1個保持する。T9-2: `apps/banto-hub/core/src/broker_glue.rs`
-/// の`BrokerSimRegistry`も、broker 経由の接続1本ごとに1個保持する
-/// (`Collector`とは別の、独立したライフサイクル - このモジュールの
-/// 「SLMP + banto-hub の broker 経路について」参照)ため`pub`。
+/// 停止チャネルを束ねる。[`crate::BrokerSimRegistry`] が broker 経由の接続
+/// 1本ごとに1個保持する(R2b-3a-3 までは `crate::collector::Collector` も
+/// 接続キーごとに持っていた)ため`pub`。
 pub struct SimulatorHandle {
     addr: SocketAddr,
     ramp_stop: watch::Sender<bool>,
@@ -135,10 +122,8 @@ enum SimulatorInner {
 }
 
 impl SimulatorHandle {
-    /// 接続タスクが実際に宛先とする loopback アドレス -
-    /// `crate::collector::Collector`はこれで`ConnectionPlan`(のタスク用
-    /// コピー)の host/port を上書きする。T9-2: `BrokerSimRegistry`も同様に、
-    /// broker セッションの実際の宛先としてこれを使う。
+    /// broker セッションが実際に宛先とする loopback アドレス -
+    /// [`crate::BrokerSimRegistry`] がこれで設定の `host`/`port` を差し替える。
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
@@ -167,9 +152,8 @@ impl SimulatorHandle {
 
 /// `protocol` に応じたシミュレータを loopback の空きポートで起動し、ランプ波/
 /// トグル生成タスクを spawn する。呼び出し元は返った [`SimulatorHandle::addr`]
-/// を接続先として使う。`pub`: `crate::collector::Collector`自身に加え、T9-2の
-/// `apps/banto-hub/core/src/broker_glue.rs`の`BrokerSimRegistry`もこれを直接
-/// 呼ぶ(このモジュールの「SLMP + banto-hub の broker 経路について」参照)。
+/// を接続先として使う。[`crate::BrokerSimRegistry`] が呼ぶ。`pub` なのは
+/// ChronoGazer のテストなど、シミュレータを直接立てる呼び出し元のため。
 ///
 /// 中身は [`start_on`] を `127.0.0.1:0` で呼ぶだけ(R1-C C-4 でのリファクタ。
 /// 挙動は変えていない)。OS 割り当てのポートで bind が失敗するのは資源枯渇

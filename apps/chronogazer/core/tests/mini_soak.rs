@@ -466,7 +466,11 @@ async fn mini_soak_collect_with_monitor_polling() {
     // トレンドの 1 グループの上限（8 ペン）に合わせて、先頭の 8 タグの履歴を読む。
     let history_tag_ids: Vec<i64> = all_tag_ids.iter().copied().take(8).collect();
 
-    let svc = CollectorService::new(pool.clone(), data_dir.clone());
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir.clone(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     let outcome = svc.start().await.expect("収集を開始できる");
     assert!(
         !outcome.pending,

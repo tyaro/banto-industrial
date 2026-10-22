@@ -100,13 +100,16 @@ export type ExclusionUnit = 'connection' | 'group' | 'tag';
  * だけ**で、画面は表示するだけ（ここに判定を書き写さない）。
  *
  * - `reason`: 機械可読な分類（`invalidAddress` / `unknownDataType` /
- *   `bitAddressOnNonBitType` / `invalidPort` / `invalidUnitId` /
- *   `unsupportedProtocol` / `invalidPeriod` / `connectionExcluded` /
+ *   `bitAddressOnNonBitType` / `unsupportedProtocol` / `driverUnavailable` /
+ *   `invalidSettings` / `settingsVersionTooNew`（R2b-3a-3 から接続の設定は
+ *   ドライバが判定する。`invalidPort` / `invalidUnitId` は無くなった）/
+ *   `invalidPeriod` / `connectionExcluded` /
  *   `groupExcluded`、#383 段階3 P3 の Hub 経由の接続の `hubSourceUnavailable`
  *   （Hub を持たない実行形態）/ `hubNotConfigured`（Hub に未接続）/
  *   `hubTagNotFound`（Hub のタグ一覧に無い）/ `hubTagTypeChanged`（データ型が
  *   変わった））。
- * - `message`: 人間向けの文言。タグは保存時の拒否理由（#418）と同じ文言。
+ * - `message`: 人間向けの文言。タグは保存時の拒否理由（#418）と同じ書き出しで、
+ *   理由の部分はドライバの文言（R2b-3a-3 から計画はドライバでアドレスを読む）。
  *
  * 接続先ホスト・資格情報・ファイルパスは載っていない（Rust 側の doc と
  * テストが固定）。

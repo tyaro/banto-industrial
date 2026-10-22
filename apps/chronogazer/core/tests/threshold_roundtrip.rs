@@ -186,7 +186,11 @@ async fn collection_judges_by_the_recorder_side_thresholds_and_records_the_limit
         .await
         .expect("記録計の側のしきい値を保存できる");
 
-    let svc = CollectorService::new(pool.clone(), data_dir);
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir,
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     svc.start().await.expect("収集を開始できる");
     wait_for_good_value(&svc, &tag_key).await;
 

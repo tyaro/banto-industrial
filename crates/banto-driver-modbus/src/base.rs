@@ -9,9 +9,10 @@
 //! production path: the save path of `banto-tags` (built with a registry)
 //! and the Hub's plan, instant read and write paths call `parse_address`;
 //! since R2b-3a-2 the broker carries the resulting `TagSpec` to this
-//! driver's session as is. Only the collection plan still goes through the
-//! public bridge `Address::from_driver_address` until R2b-3a-3. ChronoGazer
-//! keeps the legacy rules until R2b-7.
+//! driver's session as is. Since R2b-3a-3 the collection plan (banto-hub and
+//! ChronoGazer) carries it as is too; the public bridge back
+//! to `banto_plc::Address` is gone. ChronoGazer keeps the legacy
+//! rules for saving until R2b-7.
 //!
 //! ## Address functions
 //!
@@ -743,9 +744,9 @@ mod tests {
     // ------------------------------------------------------------------
 
     /// `(text, kind, canonical)`: spellings of one address share a canonical
-    /// form, parsing the canonical again is a no-op, and the bridge
-    /// (`Address::from_driver_address`, kept for the collection plan until
-    /// R2b-3a-3) returns the very `Address` `Address::parse(text)` gives.
+    /// form, parsing the canonical again is a no-op, and the canonical read
+    /// back with this driver's grammar (what its session does privately)
+    /// is the very `Address` the text gives.
     #[test]
     fn canonical_table_is_idempotent_unique_and_bridges_back() {
         let bit = || kind(DataType::Bit);
@@ -769,27 +770,11 @@ mod tests {
             let again = ModbusDriver.parse_address(&a.canonical, &k).unwrap();
             assert_eq!(again, a, "{text:?}: parse(canonical) == parse(text)");
             assert_eq!(
-                Address::from_driver_address(&a).unwrap(),
+                Address::parse(&a.canonical).unwrap(),
                 Address::parse(text).unwrap(),
                 "{text:?}: bridge"
             );
         }
-    }
-
-    #[test]
-    fn a_driver_address_from_another_driver_is_refused_by_the_bridge() {
-        let a = ModbusDriver.parse_address("40001", &one_word()).unwrap();
-        let foreign = DriverAddress::new(
-            DriverId::new("opc-ua").unwrap(),
-            a.canonical.clone(),
-            a.area.clone(),
-            a.writable_area,
-            a.word_count,
-        );
-        assert!(matches!(
-            Address::from_driver_address(&foreign),
-            Err(banto_plc::PlcError::UnsupportedDriver(d)) if d == "opc-ua"
-        ));
     }
 
     #[test]

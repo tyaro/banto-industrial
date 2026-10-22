@@ -288,7 +288,7 @@ fn hub_drivers() -> HubDrivers {
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");
-    HubDrivers::new(std::sync::Arc::new(registry), builtin.client_factory)
+    HubDrivers::new(std::sync::Arc::new(registry))
 }
 
 /// メインウィンドウのラベル - `tauri.conf.json` の `app.windows[0].label` と

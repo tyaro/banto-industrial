@@ -1304,7 +1304,11 @@ async fn main() {
     let mut outage_window: Option<(i64, i64, i64)> = None;
     if let Some((pool, _settings, hub, direct, hub_side)) = &ctx {
         println!("\n[3] 収集の開始（attach_hub 済み = デスクトップと同じ形）");
-        let svc = CollectorService::new(pool.clone(), data_dir.clone());
+        let svc = CollectorService::new(
+            pool.clone(),
+            data_dir.clone(),
+            chronogazer_core::engine::EngineConfig::builtin_drivers(),
+        );
         let attached = svc.attach_hub(hub.clone());
         match svc.start().await {
             Ok(outcome) => {

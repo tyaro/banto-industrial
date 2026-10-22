@@ -2447,6 +2447,7 @@ async fn config_exclusions_list_body(state: &AppState) -> Result<Vec<ExclusionVi
         &state.services.plc_connections,
         &state.services.collection_groups,
         &state.services.tags,
+        state.services.collect.drivers(),
     )
     .await
 }
@@ -4280,6 +4281,7 @@ async fn record_autologin_failed(audit: &AuditLogService, username: &str) {
 /// デスクトップのエンジンの設定（#392 B1-2）。
 fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
     EngineConfig {
+        drivers: EngineConfig::builtin_drivers(),
         db_path: paths.db_path.clone(),
         // `data.dir` の相対パスは**データのルート基準**（#392 B2-4b。既定 `"./data"` を
         // プロセスの作業ディレクトリに作らない。`chronogazer-server` と同じ）。
@@ -5215,7 +5217,7 @@ mod tests {
             collection_groups: CollectionGroupService::new(pool.clone()),
             tags: TagService::new(pool.clone()),
             display_groups: DisplayGroupService::new(pool.clone()),
-            collect: CollectorService::new(pool.clone(), data_dir),
+            collect: CollectorService::new(pool.clone(), data_dir, EngineConfig::builtin_drivers()),
             // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
             // Tauri のセッションが同じアカウントの変更で終わることを、
             // 両経路をまたいで確かめるテストが使う。
@@ -5279,6 +5281,7 @@ mod tests {
     /// with `UnavailableKeyStore` instead of the OS keyring.
     fn desktop_engine_config(dir: &std::path::Path) -> EngineConfig {
         EngineConfig {
+            drivers: EngineConfig::builtin_drivers(),
             db_path: dir.join("chronogazer.sqlite3"),
             data_base: dir.to_path_buf(),
             key_store: Arc::new(chronogazer_core::hub::UnavailableKeyStore),
@@ -6106,8 +6109,11 @@ mod tests {
         let blocked_data_dir = dir.path().join(MARKER);
         std::fs::write(&blocked_data_dir, b"not a directory").expect("block data dir");
         let mut state = app_state().await;
-        state.services.collect =
-            CollectorService::new(state.services.pool.clone(), blocked_data_dir);
+        state.services.collect = CollectorService::new(
+            state.services.pool.clone(),
+            blocked_data_dir,
+            EngineConfig::builtin_drivers(),
+        );
 
         // 収集対象を 1 件だけ作る（`data.dir` がファイル = 起動が失敗する）。
         let conn = state
@@ -7012,7 +7018,7 @@ mod tests {
             .await
             .expect("create legacy tag");
         assert!(
-            banto_collect::build_config(&state.services.pool)
+            banto_collect::build_config(&state.services.pool, &EngineConfig::builtin_drivers())
                 .await
                 .is_err(),
             "前提が崩れている: 不正タグがあるのに build_config が通る"
@@ -7027,9 +7033,10 @@ mod tests {
         assert!(!state.services.tags.get(legacy.id).await.unwrap().enabled);
 
         // その後の build_config は成功し、正常なタグだけが収集対象に残る。
-        let config = banto_collect::build_config(&state.services.pool)
-            .await
-            .expect("不正タグを無効化した後は build_config が通ること");
+        let config =
+            banto_collect::build_config(&state.services.pool, &EngineConfig::builtin_drivers())
+                .await
+                .expect("不正タグを無効化した後は build_config が通ること");
         assert_eq!(config.tag_count(), 1);
 
         // アドレスを直さずに再有効化すると、引き続き拒否される。

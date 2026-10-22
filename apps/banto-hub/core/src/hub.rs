@@ -64,7 +64,7 @@
 //! だけを意味し、Modbus の**収集読み取り**は broker 経由ではなかったが、
 //! #337（2026-09-08）でその収集読み取りも broker セッションへ相乗りした
 //! ため、現在は SLMP と Modbus TCP で扱いが完全に同一である
-//! （`crate::broker_glue::hub_client_factory`の doc comment 参照）。
+//! （`banto_collect::broker_client_factory`の doc comment 参照）。
 //!
 //! ## 接続単位のシミュレーションモード（T9-2、2026-08-06/07。#337 で
 //! Modbus TCP にも同じ扱いが及ぶ）
@@ -105,7 +105,7 @@
 //! 「unchanged」と分類してその接続の収集タスクに一切手を触れない -
 //! ところがタスクが起動時に捕まえた`ClientFactory`（そのクロージャが閉じる
 //! `ReadOnlyHandle`）はタスクの生存期間を通じて固定なので、rebuild の度に
-//! 新しく組み立てる`hub_client_factory`はタスクへ届かない。結果、broker
+//! 新しく組み立てる`banto_collect::broker_client_factory`はタスクへ届かない。結果、broker
 //! セッションが`BrokerSimRegistry::resolve`の`changed`検出で実際には
 //! 入れ替わっていても、動き続けている収集タスクは古い（既に directory
 //! から外れた）セッションを黙って読み続けてしまう。そこで`Self::rebuild`は
@@ -178,11 +178,13 @@
 //! 切れない。`rebuild` は毎回 [`CollectorManager::sync_broker_sessions_from`] で
 //! レジストリの現在の broker 管理対象接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
-//! ハンドル群を `crate::broker_glue::hub_client_factory` に渡す - broker
+//! ハンドル群を `banto_collect::broker_client_factory` に渡す - broker
 //! 管理対象の接続（SLMP、および #337 以降は Modbus TCP）は
-//! [`crate::broker_glue::BrokerReadClient`] で、その共有セッションを通して
-//! 読む（セッションが張れなかった接続だけが防御的に直接クライアントへ
-//! フォールバックする）。旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
+//! [`banto_collect::BrokerReadClient`] で、その共有セッションを通して
+//! 読む（セッションが張れなかった接続は決してつながらないクライアントを受け取り、
+//! タグは Bad になる。R2b-3a-3 まではそこで防御的に直接クライアントへ
+//! フォールバックしていたが、直接クライアントは R2b-3a-3 で消えた）。
+//! 旧 T0〜T6 の全体再構築方式では「新旧 `Collector`
 //! が同じ PLC へ同時にソケットを張る瞬間」を SLMP について解消する役目も
 //! 兼ねていたが、T7 の部分適用移行後は新旧 `Collector` という概念自体が
 //! 無くなったため、この節の主眼は「broker セッションの追加+削除の完全同期」
@@ -209,7 +211,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
-use crate::broker_glue::{hub_client_factory, BrokerSimRegistry, HubSessions};
+use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::db_source::{self, DbConnectionStatus, DbSourceEngine};
 use crate::diag_log::DiagLog;
@@ -1560,8 +1562,8 @@ impl CollectorManager {
         // task wired to a now-superseded broker session forever. See
         // `CollectorConfig::set_broker_dial_target`'s doc comment
         // (`crates/banto-collect/src/config.rs`) for the full derivation.
-        for (key, (host, port)) in &resolved_broker_targets {
-            config.set_broker_dial_target(key, host.clone(), *port);
+        for (key, fingerprint) in &resolved_broker_targets {
+            config.set_broker_dial_target(key, *fingerprint);
         }
 
         // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
@@ -1622,10 +1624,10 @@ impl CollectorManager {
         // effect on failure" contract themselves now. T2-2/#337: the client
         // factory routes every broker-managed connection (SLMP since T2-2,
         // Modbus TCP since #337) through the broker sessions just synced
-        // above, falling back to a direct client only when a connection is
-        // defensively missing from the handle map
-        // (`crate::broker_glue::hub_client_factory`'s doc comment).
-        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
+        // above; a connection defensively missing from the handle map gets a
+        // client that never connects (R2b-3a-3: there is no direct client to
+        // fall back to any more - `banto_collect::broker_client_factory`).
+        let factory = banto_collect::broker_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(collector) = collector_guard.as_mut() {
@@ -1847,7 +1849,7 @@ impl CollectorManager {
     /// enabled-and-broker-managed-protocol connection set (`#131`,
     /// 2026-09-01: `HubSessions::is_broker_managed` - `"slmp"` and
     /// `"modbus-tcp"` today), returning the `"conn:{id}"`-keyed handle map
-    /// [`crate::broker_glue::hub_client_factory`] needs, the connection ids
+    /// [`banto_collect::broker_client_factory`] needs, the connection ids
     /// `self.sessions` still tracks that are NOT in that set (deleted from
     /// the registry, disabled, or changed to a protocol the broker no longer
     /// manages), resolved dial targets, and (see the fourth return value's
@@ -1856,7 +1858,7 @@ impl CollectorManager {
     /// (`crate::write_path`) and *status* (`Self::broker_status`)
     /// broker-routed under #131; **#337 (2026-09-08)** then moved a Modbus
     /// connection's *collection reads* onto the same session too
-    /// (`crate::broker_glue::hub_client_factory`'s doc comment), so the
+    /// (`banto_collect::broker_client_factory`'s doc comment), so the
     /// read-routed subset is no longer narrower than the handle map - see the
     /// fourth return value's own doc paragraph. See
     /// `crate::broker_glue::HubSessions`'s doc comment
@@ -1890,9 +1892,9 @@ impl CollectorManager {
     ///
     /// A registry read failure here is logged and treated as "no
     /// broker-managed connections this rebuild, nothing stale either" (empty
-    /// on both counts: every broker-managed connection falls back to
-    /// `banto_collect::default_client_factory` for this one rebuild, per
-    /// `hub_client_factory`'s defensive fallback, and no session is removed
+    /// on both counts: every broker-managed connection reads Bad for this one
+    /// rebuild (`banto_collect::broker_client_factory` hands a client that
+    /// never connects for a missing handle), and no session is removed
     /// on a registry hiccup) rather than failing the whole `rebuild` - this
     /// sync step is additive/best-effort infrastructure wiring, not a
     /// correctness precondition for the collector build that follows it
@@ -1901,8 +1903,9 @@ impl CollectorManager {
     /// avoids tearing down a session that is still wanted just because the
     /// registry could not be read this one time.
     ///
-    /// **T9-2 third return value**: `resolved_targets` (`"conn:{id}"` ->
-    /// `(host, port)`) carries the SAME resolved dial target `resolve` just
+    /// **T9-2 third return value**: `resolved_targets` (`"conn:{id}"` -> the
+    /// session's settings fingerprint since R2b-3a-3, `(host, port)` before)
+    /// carries the SAME resolved dial target `resolve` just
     /// computed for every broker-routed connection, regardless of
     /// whether it changed. [`Self::rebuild`] feeds every entry into
     /// `banto_collect::CollectorConfig::set_broker_dial_target` - necessary
@@ -1939,8 +1942,9 @@ impl CollectorManager {
     /// accumulated with a direct `protocol == "slmp"` check, because a Modbus
     /// connection held a broker session for writes/status while its reads
     /// stayed on banto-collect's own direct `ModbusTcpClient`. #337 moved
-    /// Modbus reads onto the broker session too
-    /// (`crate::broker_glue::hub_client_factory`), so "holds a broker
+    /// Modbus reads onto the broker session too (then
+    /// `crate::broker_glue::hub_client_factory`, gone in R2b-3a-3 for
+    /// `banto_collect::broker_client_factory`), so "holds a broker
     /// session" and "reads through the broker" are now the same set, and
     /// this value is **derived from `handles`** at the end of this fn instead
     /// of accumulated alongside it.
@@ -1956,12 +1960,12 @@ impl CollectorManager {
     /// Deriving it from `handles` also closes a latent hole in the accumulate
     /// version: a key was inserted *before* `ensure_connection` ran, so a
     /// connection whose session failed to spawn was still reported
-    /// read-routed even though `hub_client_factory` would fall back to a
-    /// direct client for it - a `simulation = true` connection in that state
-    /// had `Collector`'s own simulator suppressed and dialed its real
-    /// host/port. `handles` only contains connections whose
+    /// read-routed even though the client factory then had no broker session
+    /// for it (before R2b-3a-3 it fell back to a direct client, and a
+    /// `simulation = true` connection in that state had `Collector`'s own
+    /// simulator suppressed and dialed its real host/port). `handles` only contains connections whose
     /// `ensure_connection` actually succeeded, which is exactly the condition
-    /// `hub_client_factory` routes on.
+    /// `banto_collect::broker_client_factory` routes on.
     ///
     /// **T19 S2-a (UX-48, docs/banto-hub-t19-design.md §3.8)**: a connection
     /// with nothing to collect - no *enabled* [`banto_tags::CollectionGroup`]
@@ -1977,7 +1981,11 @@ impl CollectorManager {
     /// forever during development.
     ///
     /// A connection that already falls out of the wanted set here (its only
-    /// group got disabled, or its last group/tag was deleted) is handled by
+    /// group got disabled, its last group/tag was deleted, or - R2b-3a-3 - it
+    /// was switched to `simulation = true` under a protocol without a
+    /// simulator, so `BrokerSimRegistry::resolve` returned `None`; the strict
+    /// plan refuses such a snapshot before this sync runs, so that last case
+    /// is defence in depth) is handled by
     /// the SAME pre-existing mechanism as any other now-unwanted connection:
     /// it lands in the `stale_ids` this fn already computes below and gets
     /// torn down via [`Self::remove_stale_broker_sessions`] after the caller's
@@ -2014,7 +2022,7 @@ impl CollectorManager {
     ) -> (
         HashMap<String, ReadOnlyHandle>,
         Vec<i64>,
-        HashMap<String, (String, i64)>,
+        HashMap<String, banto_broker::SettingsFingerprint>,
         HashSet<String>,
     ) {
         let mut handles = HashMap::new();
@@ -2033,14 +2041,12 @@ impl CollectorManager {
         // too, so "the broker manages this protocol" and "this connection's
         // reads are broker-routed" have become one and the same question -
         // see this fn's `read_routed_keys` doc paragraph and
-        // `crate::broker_glue::hub_client_factory`'s doc comment.
+        // `banto_collect::broker_client_factory`'s doc comment.
         for conn in snapshot.connections.iter().filter(|c| {
             c.enabled
                 && self.sessions.is_broker_managed(&c.protocol)
                 && collectible_connection_ids.contains(&c.id)
         }) {
-            wanted_ids.insert(conn.id);
-
             // T9-2: resolve the effective dial target (simulator address if
             // `conn.simulation`, else the connection's own host/port) BEFORE
             // ensure_connection - see this fn's own doc comment and
@@ -2049,29 +2055,49 @@ impl CollectorManager {
             // R2b-3a-2: `resolve` returns the settings to dial with (the
             // connection's own, or with `host`/`port` replaced by the
             // simulator's) and whether they changed since the last sync.
-            let (dial_settings, changed) = self
+            // R2b-3a-3: `None` is a `simulation = true` connection whose
+            // protocol has no simulator - never dialed (the real device must
+            // not be reached), no new session, and the plan excludes it too
+            // (`banto_collect`'s `UnsupportedProtocol`; the Hub's strict plan
+            // then refuses the whole snapshot before this sync, so this branch
+            // is defence in depth). It is simply left out
+            // of `wanted_ids`: an old session of it (dialing the real device)
+            // stays in the directory, so it lands in `stale_ids` below and is
+            // stopped and joined by `Self::remove_stale_broker_sessions` once
+            // the caller's commit succeeds (and kept, like every other stale
+            // session, if the commit fails and the old state is restored).
+            // Removing it from the directory here instead would skip that
+            // stop: an unchanged connection's collect task keeps the old
+            // handles map, so the dropped session's broker task would live on
+            // and keep reaching (and redialing) the real device.
+            let Some((dial_settings, changed)) = self
                 .sim_registry
                 .resolve(conn, &self.sessions.drivers().registry)
-                .await;
+                .await
+            else {
+                continue;
+            };
+            wanted_ids.insert(conn.id);
             if changed {
                 self.sessions.remove(conn.id);
             }
             let key = format!("conn:{}", conn.id);
-            let host = dial_settings
-                .get(banto_driver_api::keys::HOST)
-                .unwrap_or_default()
-                .to_string();
-            let port = dial_settings
-                .get(banto_driver_api::keys::PORT)
-                .and_then(|p| p.parse::<i64>().ok())
-                .unwrap_or(0);
-            resolved_targets.insert(key.clone(), (host, port));
+            // R2b-3a-3: the fingerprint of the session (not just its
+            // endpoint), stamped on the plan (`set_broker_dial_target`).
+            resolved_targets.insert(
+                key.clone(),
+                banto_collect::dial_fingerprint(
+                    conn,
+                    &dial_settings,
+                    &self.sessions.drivers().registry,
+                ),
+            );
 
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
             // "slmp"` filter here, deliberately narrower than the
             // `is_broker_managed` filter above, building a separate
-            // `read_routed_keys` set. Its reason: `hub_client_factory`'s
-            // `ModbusTcp` arm read through banto-collect's own direct
+            // `read_routed_keys` set. Its reason: `hub_client_factory`'s (gone
+            // in R2b-3a-3) `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
             // the broker), so putting a Modbus key into the set
             // `Self::rebuild`/`Self::apply_run` feed to
@@ -2103,8 +2129,8 @@ impl CollectorManager {
                     // (UnsupportedProtocol) and the save path's validation
                     // by the same driver (InvalidSettings) - logged and skipped rather
                     // than failing the rebuild, matching this fn's doc
-                    // comment. `hub_client_factory`'s defensive fallback
-                    // covers this connection for the current rebuild.
+                    // comment. The connection reads Bad for the current
+                    // rebuild (no handle: `banto_collect::broker_client_factory`).
                     self.diag_log.err_line(&format!(
                         "banto-hub: ブローカーセッションの起動に失敗しました (接続 {}): {err}",
                         conn.id
@@ -2243,7 +2269,7 @@ impl CollectorManager {
     /// 統合方針の核心 - 設計 §6 item 5。Modbus TCP は #131 で書き込みが、
     /// #337（2026-09-08）で収集読み取りもこの同じセッションを通るように
     /// なり、現在は SLMP と完全に同じ扱いである -
-    /// `crate::broker_glue::hub_client_factory`の doc comment 参照）。
+    /// `banto_collect::broker_client_factory`の doc comment 参照）。
     ///
     /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
     /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
@@ -2482,8 +2508,8 @@ impl CollectorManager {
         // and why it is `sync_broker_sessions_from`'s job to derive it (#131's
         // narrowing, reworked by #337).
         config.suppress_simulation_for(&read_routed_keys);
-        for (key, (host, port)) in &resolved_broker_targets {
-            config.set_broker_dial_target(key, host.clone(), *port);
+        for (key, fingerprint) in &resolved_broker_targets {
+            config.set_broker_dial_target(key, *fingerprint);
         }
 
         if config.group_count() == 0 {
@@ -2509,7 +2535,7 @@ impl CollectorManager {
             return Ok(());
         }
 
-        let factory = hub_client_factory(Arc::new(broker_handles), &self.sessions);
+        let factory = banto_collect::broker_client_factory(Arc::new(broker_handles));
         let mut collector_guard = self.collector.lock().await;
         let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
             if let Some(message) = self.take_injected_apply_failure() {
@@ -3954,6 +3980,233 @@ mod tests {
         );
 
         manager.shutdown().await;
+    }
+
+    /// A fake device for [`switching_a_connection_without_a_simulator_to_simulation_stops_its_old_session`]:
+    /// a listener on a free loopback port that counts the accepts and hands
+    /// every accepted socket to the test (kept open, so the test sees the
+    /// broker session's end as EOF).
+    async fn counting_device() -> (
+        u16,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::sync::mpsc::UnboundedReceiver<tokio::net::TcpStream>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let counter = accepts.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if tx.send(stream).is_err() {
+                    break;
+                }
+            }
+        });
+        (port, accepts, rx)
+    }
+
+    /// One connection of `protocol` at `127.0.0.1:port` with an enabled group
+    /// and one enabled tag (`40001`, read with the Modbus grammar).
+    async fn seed_collected_connection(
+        manager: &CollectorManager,
+        name: &str,
+        protocol: &str,
+        port: u16,
+    ) -> i64 {
+        let conn = manager
+            .plc_connections()
+            .create(PlcConnectionInput {
+                name: name.to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: i64::from(port),
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            })
+            .await
+            .unwrap();
+        let group = manager
+            .collection_groups()
+            .create(CollectionGroupInput {
+                name: format!("{name}-g"),
+                plc_connection_id: conn.id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap();
+        manager
+            .tags()
+            .create(TagInput {
+                name: format!("{name}-t"),
+                collection_group_id: group.id,
+                address: "40001".to_string(),
+                data_type: "i16".to_string(),
+                string_length: None,
+                string_encoding: "utf8".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 0,
+                enabled: true,
+                writable: false,
+                tag_kind: "plc".to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .unwrap();
+        if protocol != "modbus-tcp" {
+            // The services only take a built-in protocol (step (1) of the
+            // save path's validation), so a driver id of the test's own
+            // registry is stamped on the stored row directly, last; the Modbus
+            // settings stay, and the stand-in reads the Modbus grammar.
+            sqlx::query("UPDATE plc_connections SET protocol = ? WHERE id = ?")
+                .bind(protocol)
+                .bind(conn.id)
+                .execute(&manager.pool())
+                .await
+                .unwrap();
+        }
+        conn.id
+    }
+
+    /// R2b-3a-3 review P2: a connection whose session-type driver has no
+    /// simulator (A), collected next to another connection (B), is switched to
+    /// `simulation = true`. `BrokerSimRegistry::resolve` returns `None`, so A
+    /// is excluded from the plan - and its old session (dialing the real
+    /// device) must be stopped after the commit like any other stale session.
+    /// The Hub's strict plan refuses that snapshot first (`rebuild` fails and
+    /// keeps the old state), so the sync and the cleanup are driven directly,
+    /// in `rebuild`'s order.
+    /// Before the fix the `None` branch removed A from the directory, so A
+    /// never reached `stale_ids` and `remove_stale_broker_sessions` skipped
+    /// it; B's unchanged task kept the old handles map, so A's broker task
+    /// stayed alive and connected to the real device.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn switching_a_connection_without_a_simulator_to_simulation_stops_its_old_session() {
+        let dir = crate::test_support::TempDir::new("manager-env-nosim");
+        let pool = init_db(&dir.path().join("registry.sqlite3"))
+            .await
+            .expect("init_db");
+        let mut registry = banto_driver_api::DriverRegistry::new();
+        for (protocol, grammar) in [
+            ("modbus-tcp", "modbus-tcp"),
+            ("slmp", "slmp"),
+            ("fake-session", "modbus-tcp"),
+        ] {
+            registry
+                .register(banto_driver_api::DriverEntry::session(Arc::new(
+                    crate::test_support::FakePlcDriver::with_grammar(protocol, grammar),
+                )))
+                .unwrap();
+        }
+        crate::host_provided::register_host_provided(&mut registry).unwrap();
+        let sessions = Arc::new(HubSessions::new(
+            banto_broker::BackoffConfig::default(),
+            crate::broker_glue::HubDrivers::new(Arc::new(registry)),
+        ));
+        let manager = CollectorManager::new(
+            pool.clone(),
+            dir.path().join("data"),
+            Arc::new(SystemClock),
+            CollectorOptions {
+                connect_timeout: Duration::from_millis(200),
+                response_timeout: Duration::from_millis(200),
+                ..CollectorOptions::default()
+            },
+            sessions,
+            Arc::new(BrokerSimRegistry::new()),
+            Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
+        );
+
+        let (port_a, accepts_a, mut sockets_a) = counting_device().await;
+        let (port_b, accepts_b, mut sockets_b) = counting_device().await;
+        let a = seed_collected_connection(&manager, "a", "fake-session", port_a).await;
+        let b = seed_collected_connection(&manager, "b", "modbus-tcp", port_b).await;
+
+        manager.rebuild().await.expect("first rebuild");
+        let wait = Duration::from_secs(5);
+        let mut socket_a = tokio::time::timeout(wait, sockets_a.recv())
+            .await
+            .expect("A's broker session dials A's device")
+            .unwrap();
+        let mut socket_b = tokio::time::timeout(wait, sockets_b.recv())
+            .await
+            .expect("B's broker session dials B's device")
+            .unwrap();
+
+        sqlx::query("UPDATE plc_connections SET simulation = 1 WHERE id = ?")
+            .bind(a)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // The Hub's strict plan refuses this snapshot as a whole (A is
+        // `UnsupportedProtocol`), so `rebuild` never reaches the sync with it;
+        // the `None` branch is defence in depth. Drive the sync and the
+        // post-commit cleanup directly, in `rebuild`'s order.
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        assert!(
+            manager.rebuild().await.is_err(),
+            "the strict plan refuses an unsimulatable simulation"
+        );
+        let (handles, stale, _targets, _read_routed) =
+            manager.sync_broker_sessions_from(&snapshot).await;
+        assert!(!handles.contains_key(&format!("conn:{a}")));
+        assert!(handles.contains_key(&format!("conn:{b}")));
+        assert_eq!(stale, vec![a], "A's old session must be stale");
+        manager.remove_stale_broker_sessions(&stale).await;
+
+        let ids = manager.sessions().connection_ids();
+        assert!(!ids.contains(&a), "A is no longer wanted: {ids:?}");
+        assert!(ids.contains(&b), "B keeps its session: {ids:?}");
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(wait, socket_a.read(&mut buf))
+            .await
+            .expect("A's old broker session must be stopped (its socket closed)");
+        assert!(
+            matches!(read, Ok(0) | Err(_)),
+            "A's device must see the session end, got {read:?}"
+        );
+        // B is not touched (still connected, no redial) and A is not redialed.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), socket_b.read(&mut buf))
+                .await
+                .is_err(),
+            "B's session must stay connected"
+        );
+        assert_eq!(accepts_a.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(accepts_b.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), sockets_a.recv())
+                .await
+                .is_err(),
+            "A's device must not be dialed again"
+        );
+        assert_eq!(
+            manager.broker_status(b),
+            Some(BrokerConnectionStatus::Connected)
+        );
+
+        manager.shutdown().await;
+        drop(pool);
+        drop(dir);
     }
 
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a

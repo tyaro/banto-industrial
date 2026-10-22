@@ -558,8 +558,9 @@ async fn e2e_write_then_collection_reads_the_value_back_through_the_same_broker_
 //    item 5 accepted at the time). **#337 (2026-09-08) reversed that**: reads
 //    and writes now share the one broker session, exactly like the SLMP test
 //    above, so this test is now a genuine "読み書き単一セッション" round trip
-//    for Modbus too (see `banto_hub_core::broker_glue::hub_client_factory`'s
-//    doc comment, and `tests/integration.rs`'s
+//    for Modbus too (see `banto_collect::broker_client_factory`'s doc comment -
+//    then `banto_hub_core::broker_glue::hub_client_factory`, gone in
+//    R2b-3a-3 -, and `tests/integration.rs`'s
 //    `modbus_collection_uses_exactly_one_socket` for the socket-count
 //    assertion itself).
 // ---------------------------------------------------------------------------

@@ -17,10 +17,11 @@
 //! - `BatchReadRequest`・`BatchWriteRequest`（R2b-3a-2: broker の要求は `TagSpec` /
 //!   `WriteItem`）、`from_driver_address`・`banto_plc::Address`（R2b-3a-2: ドライバへは
 //!   `DriverAddress` をそのまま渡す。`Address` へ戻さない）、`to_driver_address(`
-//!   （R2b-3a-2 の一時の変換。`BrokerReadClient` の 1 か所だけを件数つきで許し、3a-3 で消す）
+//!   （R2b-3a-2 の一時の変換。R2b-3a-3 で収集の計画が `TagSpec` になり、橋ごと消した。
+//!   例外はもう無い）
 //! - `conn.protocol == "slmp"`（#605 の CPU を同一性に入れる分岐。R2b-3a-2 で設定の指紋に
-//!   した）・`conn.protocol == "modbus-tcp"`（シミュレータの種類を名前で選ぶ分岐。R2b-5 まで
-//!   `broker_glue.rs` の 1 か所だけを件数つきで許す）
+//!   した）・`conn.protocol == "modbus-tcp"`（シミュレータの種類を名前で選ぶ分岐。R2b-3a-3 で
+//!   `BrokerSimRegistry` ごと `banto-collect` へ移したので、Hub には例外が無い。R2b-5 で消す）
 //!
 //! 例外は (needle, ファイル) ごとに**件数まで固定**する。増えても減ってもテストが落ちる。
 //!
@@ -75,7 +76,7 @@ const NEEDLES: &[(&str, &str)] = &[
     ),
     (
         "to_driver_address(",
-        "`TagSpec`（R2b-3a-2 の一時の変換は `BrokerReadClient` の 1 か所だけ）",
+        "ドライバの `DriverAddress` をそのまま `TagSpec` に（R2b-3a-3 で一時の変換も消した）",
     ),
     (
         "conn.protocol == \"slmp\"",
@@ -83,27 +84,17 @@ const NEEDLES: &[(&str, &str)] = &[
     ),
     (
         "conn.protocol == \"modbus-tcp\"",
-        "レジストリのドライバ（シミュレータの種類だけ R2b-5 まで例外）",
+        "レジストリのドライバ（シミュレータの種類の選択は `banto_collect::BrokerSimRegistry`）",
     ),
 ];
 
 /// 例外（needle, ファイルの末尾のパス, 許す件数, 理由）。意図して最小に保つ。
 /// 件数は `offending_lines`（コメント・テストのコードを除く）の数とちょうど同じでなければ
 /// ならない。増えたら新しい呼び出しが紛れ込んでおり、減ったら例外を下げる／外す。
-const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[
-    (
-        "to_driver_address(",
-        "core/src/broker_glue.rs",
-        1,
-        "`BrokerReadClient` の一時の変換 `ReadRequest` → `TagSpec`。R2b-3a-3 で消す",
-    ),
-    (
-        "conn.protocol == \"modbus-tcp\"",
-        "core/src/broker_glue.rs",
-        1,
-        "`BrokerSimRegistry::resolve` のシミュレータの種類の選択。R2b-5 で消す",
-    ),
-];
+// R2b-3a-3: `to_driver_address(`（`BrokerReadClient` の一時の変換）と
+// `conn.protocol == "modbus-tcp"`（`BrokerSimRegistry::resolve`、`banto-collect` へ移した）の
+// 例外を外した。今は例外が無い。
+const EXCEPTIONS: &[(&str, &str, usize, &str)] = &[];
 
 /// `file` が `needle` の例外に当たるなら、許す件数。
 fn allowed_count(needle: &str, file: &Path) -> Option<usize> {
@@ -316,12 +307,11 @@ fn exceptions_are_per_needle_and_per_file() {
         allowed_count("Address::parse(", Path::new("/x/core/src/read_path.rs")),
         None
     );
+    // R2b-3a-3: `broker_glue.rs` の 2 つの例外（`to_driver_address(`・
+    // `conn.protocol == "modbus-tcp"`）を外した。
     let glue = Path::new("/x/core/src/broker_glue.rs");
-    assert_eq!(allowed_count("to_driver_address(", glue), Some(1));
-    assert_eq!(
-        allowed_count("conn.protocol == \"modbus-tcp\"", glue),
-        Some(1)
-    );
+    assert_eq!(allowed_count("to_driver_address(", glue), None);
+    assert_eq!(allowed_count("conn.protocol == \"modbus-tcp\"", glue), None);
     assert_eq!(allowed_count("conn.protocol == \"slmp\"", glue), None);
     assert_eq!(allowed_count("banto_plc::Address", glue), None);
     assert_eq!(

@@ -662,8 +662,10 @@ dependencies = [
 name = "banto-collect"
 version = "0.2.0-alpha.35"
 dependencies = [
+ "banto-broker",
  "banto-core",
  "banto-driver-api",
+ "banto-drivers",
  "banto-plc",
  "banto-storage",
  "banto-tags",
@@ -766,7 +768,6 @@ name = "banto-drivers"
 version = "0.1.0"
 dependencies = [
  "banto-broker",
- "banto-collect",
  "banto-core",
  "banto-driver-api",
  "banto-driver-modbus",
@@ -1477,6 +1478,8 @@ dependencies = [
  "banto-admin-services",
  "banto-collect",
  "banto-core",
+ "banto-driver-api",
+ "banto-drivers",
  "banto-exit-once",
  "banto-hub-bootstrap",
  "banto-instance-lock",

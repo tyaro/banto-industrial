@@ -32,6 +32,13 @@ banto-tags = { path = "../../../crates/banto-tags" }
 banto-plc = { path = "../../../crates/banto-plc" }
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }
+# R2b-3a-3（docs/banto-hub-driver-io-design.md §8）: 収集も broker を通す。計画と
+# セッションのダイヤルに使うドライバの登録簿（`EngineConfig::drivers`）の型と、
+# それを詰める組み込みドライバ。`banto-drivers` を normal で持つのは bin
+# （`banto-serve`）がこの package の中にあるため（Hub の R1-3b の一時の形と同じ、
+# api-design §6.4）。`chronogazer-host` の分離は R2b-3 に含めない。
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.1.0" }
+banto-drivers = { path = "../../../crates/banto-drivers" }
 banto-tsquery = { path = "../../../crates/banto-tsquery" }
 # #332 (Hub 接続): 自己発行 bootstrap 本体と、その接続確認に使う catalog
 # クライアント。keyring は `KeyStore` trait 経由で外から渡す（デスクトップ

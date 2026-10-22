@@ -55,10 +55,9 @@
 //!
 //! That indirection exists because a successful `connect()` is a claim about
 //! the transport, and for a client whose transport is a *shared session* it
-//! can be a stale one. banto-hub's `BrokerReadClient`
-//! (`apps/banto-hub/core/src/broker_glue.rs`) reads through a session owned
-//! by a separate `banto-broker` task; its `connect()` answers from that
-//! task's status watch, which can legitimately still say `Connected` for the
+//! can be a stale one. [`crate::BrokerReadClient`] (the one production client
+//! since R2b-3a-3) reads through a session owned by a separate `banto-broker`
+//! task; its `connect()` answers from that task's status watch, which can legitimately still say `Connected` for the
 //! brief moment between a session failing and the broker task noticing. Under
 //! the previous rule ("emit `plc_reconnected` the moment `connect()`
 //! succeeds") that window produced a `plc_reconnected`/`plc_disconnected`
@@ -69,10 +68,17 @@
 //! the table through a multi-hour outage.
 //!
 //! Anchoring the edge to an actual successful read closes that window for
-//! every client, shared-session or not, and costs a direct
-//! `ModbusTcpClient`/`SlmpClient` nothing: its next tick reads immediately
+//! every client, shared-session or not: the next tick reads immediately
 //! after a successful connect anyway, so the event simply lands one tick
 //! later with a `ptime_ms` that is now provably backed by data.
+//!
+//! **R2b-3a-3 (ChronoGazer on the broker)**: until then ChronoGazer read
+//! through direct `ModbusTcpClient`/`SlmpClient`s whose `connect()` dialed a
+//! socket of their own. Through the broker the same rule holds, with two
+//! shifts in timing: a reconnect is noticed when the broker's session is back
+//! (its own backoff, 1 s → 30 s) plus up to one collection period, and a
+//! session that blips and recovers within [`crate::BROKER_RECONNECT_GRACE`]
+//! between two reads is not an outage at all (no event pair).
 //!
 //! ## H4 (owner decision 2026-08-08): clock regression and append failure are
 //! ## recorded anomalies, not silence
@@ -128,16 +134,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_plc::{
-    ModbusTcpClient, PlcClient, PlcError, ReadResult, SlmpClient, SlmpCpu, TagValue, WordOrder,
-};
+use banto_driver_api::{FatalError, ItemError, Value};
 use banto_tags::scale_raw;
 use banto_tstore::{Clock, TsWriter};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::config::{ConnectionPlan, GroupPlan, ProtocolConfig};
+use crate::client::{ClientFactory, CollectClient, ReadBatch};
+use crate::config::{ConnectionPlan, GroupPlan};
 use crate::current::{CurrentValuesHandle, Quality};
 use crate::event::{CollectEvent, EventKind, EventSink, ThresholdLevel};
 use crate::external::{
@@ -240,178 +245,10 @@ pub(crate) struct TaskContext {
     pub factory: ClientFactory,
 }
 
-/// The wire protocol one [`ClientSpec`] describes - the public twin of
-/// `crate::config::Protocol` (that one is `pub(crate)`, tied to the registry
-/// parsing step; this one is the minimal vocabulary a factory outside this
-/// crate needs to dispatch on).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClientProtocol {
-    ModbusTcp,
-    Slmp,
-}
-
-/// A connection's client-construction parameters, exposed as a thin `pub`
-/// projection of the crate-private [`ConnectionPlan`]/[`ProtocolConfig`] (T2-2,
-/// docs/tag-server-design.md §6-5) - a [`ClientFactory`] outside this crate
-/// (banto-hub's broker adapter) cannot see those `pub(crate)` types, so this
-/// carries everything [`default_client_factory`] needs to reproduce the exact
-/// client the old hardcoded `build_client` built: not just "host/port" but
-/// every field that actually varies a constructed client's behavior
-/// (`unit_id` for Modbus, `word_order` for both, and the
-/// per-[`crate::collector::CollectorOptions`] timeout overrides
-/// [`crate::collector::Collector::start_with_client_factory`] already folded
-/// into `plan.config` before this is derived). `unit_id` is meaningless for
-/// SLMP and always `0` there (SLMP has no such concept - see
-/// `crate::config::slmp_config_for`'s doc comment).
-///
-/// This list is maintained **by hand**, not enforced by the compiler - see
-/// [`ClientFactory`]'s doc comment ("issue #334") for how that bit us the
-/// first time and what to do when `ProtocolConfig` grows again.
-#[derive(Debug, Clone)]
-pub struct ClientSpec {
-    /// `"conn:{id}"` - matches [`ConnectionPlan::key`] and every other
-    /// `conn:`-keyed surface this crate exposes (status map, events).
-    pub connection_key: String,
-    pub protocol: ClientProtocol,
-    pub host: String,
-    pub port: u16,
-    pub unit_id: u8,
-    pub connect_timeout: Duration,
-    pub response_timeout: Duration,
-    /// Register-group word order for multi-register (32/64-bit) values.
-    ///
-    /// Meaningful for **both** protocols, and a fixed default for neither:
-    /// `crate::config`'s `modbus_config_for` and `slmp_config_for` each
-    /// resolve it from that connection's own `plc_connections.word_order`
-    /// column (migration `0010`, P3-b) before building the `ProtocolConfig`
-    /// this is derived from. The registry's per-protocol *defaults* differ
-    /// (`high_low` for `modbus-tcp` since 2026-09-08, `low_high` for SLMP),
-    /// but either protocol can be configured with either value, so
-    /// [`default_client_factory`] must read this field rather than lean on
-    /// `ModbusTcpConfig::default()`/`SlmpConfig::default()`.
-    ///
-    /// See issue #334: this field's addition is the fix for `ClientSpec`
-    /// having silently dropped `word_order`, which made every polled client
-    /// decode with `WordOrder::default()` no matter what the connection was
-    /// registered with.
-    pub word_order: WordOrder,
-    /// #605: SLMP の CPU 種別。Modbus では読まれない（`SlmpCpu::R` を入れておく）。
-    /// `slmp_config_for` が `plc_connections.cpu_type` から埋めた値を、
-    /// [`default_client_factory`] が `..Default::default()` に頼らず読む。
-    /// ここを落とすと収集の直接クライアントだけが常に R フレームになる
-    /// （#334 の `word_order` と同じ落ち方）。
-    pub cpu: SlmpCpu,
-}
-
-/// A caller-supplied seam for building the `PlcClient` a connection task
-/// reconnects with (T2-2, docs/tag-server-design.md §6-5 「broker の読み取り
-/// ハンドルを PlcClient trait のアダプタで包んでクライアント生成の差し替え口
-/// (新設)から注入する」). [`crate::collector::Collector::start`] delegates to
-/// [`crate::collector::Collector::start_with_client_factory`] with
-/// [`default_client_factory`] - the same `ModbusTcpClient`/`SlmpClient`
-/// construction the old hardcoded `build_client` did, reproduced field by
-/// field from what [`ClientSpec`] carries. banto-hub's own factory calls
-/// this crate's default for Modbus connections and swaps in a
-/// `banto_broker`-backed adapter for SLMP ones - see
-/// `apps/banto-hub/core/src/broker_glue.rs`'s module doc.
-///
-/// Called once per connect attempt (same call site `build_client` used to
-/// occupy, inside `run_connection`'s `ConnEvent::Due` arm) - a factory may
-/// freely return a fresh client every time, or close over shared state (e.g.
-/// a `banto_broker::BrokerHandle` clone) to hand back an adapter around a
-/// session that outlives any single attempt.
-///
-/// **Trap that caused issue #334, do not repeat it**: [`ClientSpec`] is a
-/// *hand-picked subset* of `ProtocolConfig`'s fields, not a structural
-/// mirror of it - there is no compiler check tying the two together. When
-/// `ModbusTcpConfig`/`SlmpConfig` gains a new field that actually affects
-/// decoding/behavior (as `word_order` did, T2-2 predating it), it is not
-/// enough to thread it through `crate::config`'s `modbus_config_for`/
-/// `slmp_config_for`; [`ClientSpec`] and [`client_spec`] must also grow a
-/// matching field, and [`default_client_factory`] must read it from `spec`
-/// explicitly rather than leaning on `..Default::default()`. Miss any one of
-/// those three spots and the new field silently reverts to its `Default`
-/// value on every poll - exactly what happened here: `word_order` reached
-/// `ProtocolConfig` correctly, but `ClientSpec` had no field to carry it, so
-/// `default_client_factory` rebuilt the client with `WordOrder::default()`
-/// regardless of what the connection was configured with, while the
-/// read-on-demand (broker) path - which reads `ProtocolConfig` directly,
-/// never through `ClientSpec` - decoded correctly. The two paths silently
-/// disagreed on the same tag's value until this comment's fix.
-pub type ClientFactory = Arc<dyn Fn(&ClientSpec) -> Box<dyn PlcClient> + Send + Sync>;
-
-/// Project a [`ConnectionPlan`]'s protocol config down to the public
-/// [`ClientSpec`] a [`ClientFactory`] receives. Computed once per task start
-/// (the plan is immutable for the task's lifetime), not per connect attempt.
-fn client_spec(plan: &ConnectionPlan) -> ClientSpec {
-    match &plan.config {
-        ProtocolConfig::ModbusTcp(cfg) => ClientSpec {
-            connection_key: plan.key.clone(),
-            protocol: ClientProtocol::ModbusTcp,
-            host: cfg.host.clone(),
-            port: cfg.port,
-            unit_id: cfg.unit_id,
-            connect_timeout: cfg.connect_timeout,
-            response_timeout: cfg.response_timeout,
-            word_order: cfg.word_order,
-            cpu: SlmpCpu::R,
-        },
-        ProtocolConfig::Slmp(cfg) => ClientSpec {
-            connection_key: plan.key.clone(),
-            protocol: ClientProtocol::Slmp,
-            host: cfg.host.clone(),
-            port: cfg.port,
-            unit_id: 0,
-            connect_timeout: cfg.connect_timeout,
-            response_timeout: cfg.response_timeout,
-            word_order: cfg.word_order,
-            cpu: cfg.cpu,
-        },
-        // `crate::collector` spawns `run_external_connection` for these, never
-        // `run_connection` (the only caller of this function).
-        ProtocolConfig::External => {
-            unreachable!("an external connection has no client to build")
-        }
-    }
-}
-
-/// The [`ClientFactory`] [`crate::collector::Collector::start`] uses -
-/// reproduces the pre-T2-2 hardcoded `build_client` dispatch (design:
-/// "プロトコル分岐は factory 関数に隔離") exactly, just re-homed behind the
-/// public seam so `start` stays behaviorally unchanged for every existing
-/// caller (T2-2 instructions: "既存呼び出し互換維持"). A new protocol is
-/// still one new match arm here plus one `Protocol`/`ProtocolConfig`/
-/// `ClientProtocol` variant.
-pub fn default_client_factory() -> ClientFactory {
-    Arc::new(|spec: &ClientSpec| -> Box<dyn PlcClient> {
-        match spec.protocol {
-            ClientProtocol::ModbusTcp => {
-                Box::new(ModbusTcpClient::new(banto_plc::ModbusTcpConfig {
-                    host: spec.host.clone(),
-                    port: spec.port,
-                    unit_id: spec.unit_id,
-                    connect_timeout: spec.connect_timeout,
-                    response_timeout: spec.response_timeout,
-                    word_order: spec.word_order,
-                }))
-            }
-            ClientProtocol::Slmp => Box::new(SlmpClient::new(banto_plc::SlmpConfig {
-                host: spec.host.clone(),
-                port: spec.port,
-                connect_timeout: spec.connect_timeout,
-                response_timeout: spec.response_timeout,
-                word_order: spec.word_order,
-                cpu: spec.cpu,
-                ..banto_plc::SlmpConfig::default()
-            })),
-        }
-    })
-}
-
 /// `(client, connect result)` handed back from a spawned connect attempt -
 /// the client is returned either way so a failed attempt's socket is dropped
 /// by us (uniform ownership), not left dangling in the sub-task.
-type ConnectOutcome = (Box<dyn PlcClient>, Result<(), PlcError>);
+type ConnectOutcome = (Box<dyn CollectClient>, Result<(), FatalError>);
 
 /// Connection lifecycle state within one task.
 enum ConnState {
@@ -420,7 +257,7 @@ enum ConnState {
     /// A connect attempt is running in a spawned sub-task.
     Connecting(JoinHandle<ConnectOutcome>),
     /// Connected and owning the live client.
-    Connected(Box<dyn PlcClient>),
+    Connected(Box<dyn CollectClient>),
 }
 
 /// What woke the connection side of the `select!`.
@@ -584,9 +421,6 @@ pub(crate) async fn run_connection(
 ) {
     let conn_key = plan.key.clone();
     let group_count = plan.groups.len();
-    // Computed once - the plan (and therefore the spec derived from it) is
-    // immutable for the task's lifetime; see `ClientSpec`'s doc comment.
-    let spec = client_spec(&plan);
 
     // Per-group next-fire deadlines (all "now" => every group fires
     // immediately on entry) and per-group per-tag active threshold levels.
@@ -650,7 +484,7 @@ pub(crate) async fn run_connection(
                             &conn_key,
                             ConnectionStatus::Reconnecting { attempt },
                         );
-                        let mut client = (ctx.factory)(&spec);
+                        let mut client = (ctx.factory)(&conn_key);
                         let handle = tokio::spawn(async move {
                             let result = client.connect().await;
                             (client, result)
@@ -728,7 +562,7 @@ pub(crate) async fn run_connection(
                     // Read this group iff currently connected. The match's
                     // borrow of `state` is released at the end of the
                     // statement, before we may reassign `state` below.
-                    let read_outcome: Option<Result<Vec<ReadResult>, PlcError>> =
+                    let read_outcome: Option<ReadBatch> =
                         match &mut state {
                             ConnState::Connected(client) => {
                                 Some(client.read_batch(&plan.groups[i].requests).await)
@@ -848,7 +682,7 @@ struct TagTick {
 /// active level untouched (a comms loss must not spuriously "clear" an alarm).
 async fn record_group(
     group: &GroupPlan,
-    results: Option<&[ReadResult]>,
+    results: Option<&[Result<Value, ItemError>]>,
     ptime_ms: i64,
     ctx: &TaskContext,
     conn_key: &str,
@@ -861,19 +695,18 @@ async fn record_group(
         .enumerate()
         .map(|(idx, tag)| {
             let (value, quality) = match results.map(|r| &r[idx]) {
-                Some(ReadResult::Value(TagValue::Bit(b))) => {
-                    (Some(if *b { 1.0 } else { 0.0 }), Quality::Good)
-                }
-                Some(ReadResult::Value(TagValue::F64(raw))) => {
+                Some(Ok(Value::Bit(b))) => (Some(if *b { 1.0 } else { 0.0 }), Quality::Good),
+                Some(Ok(Value::F64(raw))) => {
                     let scaled = match &tag.scaling {
                         Some(s) => scale_raw(*raw, s),
                         None => *raw,
                     };
                     (Some(scaled), Quality::Good)
                 }
-                // Per-tag Bad within an otherwise-good batch, or the whole
-                // tick absent (results = None).
-                Some(ReadResult::Bad(_)) | None => (None, Quality::Bad),
+                // Per-tag Bad within an otherwise-good batch (an item error,
+                // or a string where the plan never asks for one - the build
+                // skips string tags), or the whole tick absent (None).
+                Some(Ok(Value::Str(_))) | Some(Err(_)) | None => (None, Quality::Bad),
             };
             TagTick {
                 shown: value,
@@ -1532,7 +1365,7 @@ mod tests {
             status: Arc::new(RwLock::new(HashMap::new())),
             backoff: BackoffConfig::default(),
             simulation: false,
-            factory: default_client_factory(),
+            factory: crate::client::broker_client_factory(Arc::new(HashMap::new())),
         };
         let group = GroupPlan {
             key: "g".to_string(),
@@ -1551,7 +1384,7 @@ mod tests {
         let mut append_health = AppendHealth::default();
 
         for (offset, value) in [(100, 50.0), (200, 85.0), (300, 105.0), (400, 50.0)] {
-            let reading = [ReadResult::Value(TagValue::F64(value))];
+            let reading = [Ok(Value::F64(value))];
             record_group(
                 &group,
                 Some(&reading),
@@ -1671,7 +1504,7 @@ mod tests {
             status: Arc::new(RwLock::new(HashMap::new())),
             backoff: BackoffConfig::default(),
             simulation: false,
-            factory: default_client_factory(),
+            factory: crate::client::broker_client_factory(Arc::new(HashMap::new())),
         };
 
         let group = GroupPlan {
@@ -1688,7 +1521,7 @@ mod tests {
         };
         let mut threshold_state = vec![None];
         let mut append_health = AppendHealth::default();
-        let good = [ReadResult::Value(TagValue::F64(1.0))];
+        let good = [Ok(Value::F64(1.0))];
 
         // A simulation tick updates the in-memory path above but must not call
         // append. The writer intentionally does not know target-group, so an
@@ -1860,7 +1693,7 @@ mod tests {
             status: Arc::new(RwLock::new(HashMap::new())),
             backoff: BackoffConfig::default(),
             simulation: false,
-            factory: default_client_factory(),
+            factory: crate::client::broker_client_factory(Arc::new(HashMap::new())),
         };
         let group = GroupPlan {
             key: "g".to_string(),
@@ -1876,7 +1709,7 @@ mod tests {
         };
         let mut threshold_state = vec![None];
         let mut append_health = AppendHealth::default();
-        let value = |v: f64| [ReadResult::Value(TagValue::F64(v))];
+        let value = |v: f64| [Ok(Value::F64(v))];
 
         // Tick 1: normal.
         record_group(
@@ -1976,106 +1809,5 @@ mod tests {
                 (fresh_ptime + 100, Some(4.0)),
             ]
         );
-    }
-
-    // --- #334: `client_spec` must carry `word_order` through, for both
-    // protocols and both values - the regression this issue was filed
-    // against was `ClientSpec` silently dropping the field, so
-    // `default_client_factory` always rebuilt the client with
-    // `WordOrder::default()` no matter what the connection was configured
-    // with. See [`ClientFactory`]'s doc comment for the full story. ---
-
-    fn modbus_plan(word_order: WordOrder) -> ConnectionPlan {
-        ConnectionPlan {
-            key: "conn:1".to_string(),
-            config: ProtocolConfig::ModbusTcp(banto_plc::ModbusTcpConfig {
-                word_order,
-                ..banto_plc::ModbusTcpConfig::default()
-            }),
-            groups: Vec::new(),
-            simulation: false,
-        }
-    }
-
-    fn slmp_plan(word_order: WordOrder) -> ConnectionPlan {
-        ConnectionPlan {
-            key: "conn:2".to_string(),
-            config: ProtocolConfig::Slmp(banto_plc::SlmpConfig {
-                word_order,
-                ..banto_plc::SlmpConfig::default()
-            }),
-            groups: Vec::new(),
-            simulation: false,
-        }
-    }
-
-    #[test]
-    fn client_spec_carries_modbus_word_order_high_low() {
-        let spec = client_spec(&modbus_plan(WordOrder::HighLow));
-        assert_eq!(spec.word_order, WordOrder::HighLow);
-    }
-
-    #[test]
-    fn client_spec_carries_modbus_word_order_low_high() {
-        let spec = client_spec(&modbus_plan(WordOrder::LowHigh));
-        assert_eq!(spec.word_order, WordOrder::LowHigh);
-    }
-
-    #[test]
-    fn client_spec_carries_slmp_word_order_high_low() {
-        let spec = client_spec(&slmp_plan(WordOrder::HighLow));
-        assert_eq!(spec.word_order, WordOrder::HighLow);
-    }
-
-    #[test]
-    fn client_spec_carries_slmp_word_order_low_high() {
-        let spec = client_spec(&slmp_plan(WordOrder::LowHigh));
-        assert_eq!(spec.word_order, WordOrder::LowHigh);
-    }
-
-    /// #605: `ClientSpec` が SLMP の CPU を落とすと、直接クライアントは常に R
-    /// になる（#334 の word_order と同じ穴）。
-    #[test]
-    fn client_spec_carries_slmp_cpu() {
-        let mut plan = slmp_plan(WordOrder::LowHigh);
-        match &mut plan.config {
-            ProtocolConfig::Slmp(cfg) => cfg.cpu = SlmpCpu::Q,
-            _ => panic!("slmp plan"),
-        }
-        assert_eq!(client_spec(&plan).cpu, SlmpCpu::Q);
-    }
-
-    /// #605: factory が `spec.cpu` をフレームに載せる。Q のワード読みは
-    /// サブコマンド `0x0000`、R は `0x0002`。
-    #[tokio::test]
-    async fn default_client_factory_sends_the_configured_cpu_subcommand() {
-        use banto_plc::slmp::simulator::Simulator;
-        use banto_plc::{Address, DataType, ReadRequest};
-
-        for (cpu, sub) in [(SlmpCpu::R, 0x0002u16), (SlmpCpu::Q, 0x0000u16)] {
-            let sim = Simulator::start().await;
-            let spec = ClientSpec {
-                connection_key: "conn:1".to_string(),
-                protocol: ClientProtocol::Slmp,
-                host: sim.addr.ip().to_string(),
-                port: sim.addr.port(),
-                unit_id: 0,
-                connect_timeout: Duration::from_millis(500),
-                response_timeout: Duration::from_millis(500),
-                word_order: WordOrder::LowHigh,
-                cpu,
-            };
-            let mut client = default_client_factory()(&spec);
-            client.connect().await.expect("connect");
-            client
-                .read_batch(&[ReadRequest {
-                    address: Address::parse_slmp("D0").expect("addr"),
-                    data_type: DataType::U16,
-                }])
-                .await
-                .expect("read");
-            assert_eq!(sim.last_subcommand(), Some(sub), "{cpu:?}");
-            sim.stop();
-        }
     }
 }

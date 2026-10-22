@@ -210,7 +210,11 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
     let group_key = format!("grp:{grp}");
     let broken_group_key = format!("grp:{broken_grp}");
 
-    let svc = CollectorService::new(pool.clone(), data_dir.clone());
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir.clone(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     let outcome = svc.start().await.expect("不正な設定があっても開始できる");
     assert!(!outcome.pending, "開始が打ち切られた: {:?}", outcome.status);
 
@@ -234,7 +238,8 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
             (
                 ExclusionUnitView::Connection,
                 format!("conn:{broken_conn}"),
-                "invalidPort"
+                // R2b-3a-3: 接続の設定はドライバが判定する（以前は `invalidPort`）。
+                "invalidSettings"
             ),
             (
                 ExclusionUnitView::Group,

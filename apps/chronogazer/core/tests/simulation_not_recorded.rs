@@ -211,7 +211,11 @@ async fn simulation_connection_values_are_live_but_never_recorded() {
     let sim_group_key = format!("grp:{sim_group}");
     let sim_tag_key = format!("tag:{sim_tag}");
 
-    let svc = CollectorService::new(pool.clone(), data_dir.clone());
+    let svc = CollectorService::new(
+        pool.clone(),
+        data_dir.clone(),
+        chronogazer_core::engine::EngineConfig::builtin_drivers(),
+    );
     let outcome = svc.start().await.expect("収集を開始できる");
     assert!(!outcome.pending, "開始が打ち切られた: {:?}", outcome.status);
     assert_eq!(

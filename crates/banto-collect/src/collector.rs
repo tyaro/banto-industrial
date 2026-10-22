@@ -37,13 +37,10 @@
 //!    new file on its very next tick.
 //! 3. **`Collector` retains the [`CollectorConfig`] it is currently running**,
 //!    so a later `apply_config` call has something to diff the caller's new
-//!    snapshot against. The stored config is the *pristine* one the caller
-//!    passed in - never the per-run [`CollectorOptions`] timeout overrides
-//!    `plan_for_task` bakes into the plan a task actually runs with. Baking
-//!    those in before storing would make an otherwise-untouched connection
-//!    compare unequal on the next call (a freshly rebuilt `CollectorConfig`
-//!    never carries them), spuriously reclassifying it as "changed" and
-//!    defeating the entire point of the diff.
+//!    snapshot against - exactly as the caller passed it in (R2b-3a-3: the
+//!    collector no longer bakes timeout overrides or a simulator's address
+//!    into the plan a task runs with; the broker owns both, see the "T9-1
+//!    addendum" below).
 //!
 //! ### Why the steps inside `apply_config` run in this exact order
 //!
@@ -109,20 +106,16 @@
 //!
 //! ### T9-1 addendum: simulated connections (docs/ux-plan.md §1)
 //!
-//! A connection whose [`crate::config::ConnectionPlan::simulation`] is `true`
-//! gets an in-process simulator ([`crate::simulation`]) instead of dialing
-//! its real host/port - started/stopped in exact lockstep with that
-//! connection's task, at every point this module already stops or spawns
-//! one: step 3 above (stop removed/replaced) also stops that connection's
-//! simulator if it has one, and step 5 (spawn added/replaced) also starts
-//! one before spawning if the *new* plan wants simulation. Because
-//! `simulation` participates in `ConnectionPlan`'s `PartialEq`, flipping it
-//! on or off with nothing else changed already makes the diff in step 1
-//! classify the connection "replaced" - no separate branch was needed
-//! anywhere in this method for "did simulation just turn on/off", the
-//! ordinary stop-then-spawn path *is* the simulator's stop-then-start. See
-//! `crate::simulation`'s module doc for why the address substitution itself
-//! happens here (at task-spawn time) rather than in `crate::config::build_config`.
+//! Until R2b-3a-3 a connection whose [`crate::config::ConnectionPlan::simulation`]
+//! was `true` got an in-process simulator started here, in lockstep with its
+//! task, and the task dialed the simulator instead of the real host. Since
+//! R2b-3a-3 every PLC connection is read through a broker session the host
+//! ensured before calling this collector, so the simulator's address has to
+//! be known before that - the host's [`crate::BrokerSimRegistry`] starts the
+//! simulator and substitutes its address in the session's settings
+//! (docs/banto-hub-driver-io-design.md §8; [`crate::BrokerSessions`] does it for
+//! ChronoGazer). `simulation` still participates in the plan's `PartialEq` and
+//! still decides whether the connection's ticks are recorded.
 //!
 //! ### #383 段階3 P3 addendum: external connections
 //!
@@ -161,14 +154,13 @@
 //! - **The ordering promises.** The final flush (the single writer) and
 //!   `collection_stopped` still happen once, after *every* task has been
 //!   joined - i.e. after every task has released its `writer_rx`, which is
-//!   what lets `close_or_flush_writer` take sole ownership. A simulator
-//!   (T9-1) is still stopped only after its task has been joined.
+//!   what lets `close_or_flush_writer` take sole ownership.
 //! - **A failed task does not block the rest.** A task that panicked yields
 //!   a `JoinError` that is ignored exactly as before; every other task has
 //!   already been signalled and is still joined, and the flush still runs.
 //! - **No per-task timeout or `abort`.** Aborting a task mid-append would
 //!   weaken the "no buffered row is lost" guarantee; the wait is bounded by
-//!   the protocol's own response timeout instead.
+//!   the broker's own bound on a read instead (design §5.5).
 //!
 //! ### Why no `collection_started`/`collection_stopped` event
 //!
@@ -196,7 +188,6 @@
 //! once no task remains to trigger a flush on its own.
 
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -205,29 +196,32 @@ use banto_tstore::{Clock, TsWriter, WriterOptions};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
-use crate::config::{CollectorConfig, ConnectionPlan, Protocol, ProtocolConfig};
+use crate::client::ClientFactory;
+use crate::config::{CollectorConfig, ConnectionPlan, ProtocolConfig};
 use crate::current::CurrentValuesHandle;
 use crate::error::CollectError;
 use crate::event::{CollectEvent, EventKind, EventSink};
 use crate::external::ExternalSource;
-use crate::simulation::{self, SimulatorHandle};
 use crate::task::{
-    default_client_factory, retain_status, run_connection, run_external_connection, BackoffConfig,
-    ClientFactory, ConnectionStatus, StatusMap, TaskContext,
+    retain_status, run_connection, run_external_connection, BackoffConfig, ConnectionStatus,
+    StatusMap, TaskContext,
 };
 
-/// Tunables for [`Collector::start`]. `Default` matches the product defaults
-/// (recorder-requirements.md / plan.md I2 §2): 1s/30s backoff, 3s connect /
-/// 1s response timeouts, and `banto-tstore`'s default buffering. Tests shrink
-/// these for fast, deterministic runs.
+/// Tunables for [`Collector::start_with_client_factory`]. `Default` matches
+/// the product defaults (recorder-requirements.md / plan.md I2 §2): 1s/30s
+/// backoff, 3s connect / 1s response timeouts, and `banto-tstore`'s default
+/// buffering. Tests shrink these for fast, deterministic runs.
 #[derive(Debug, Clone, Copy)]
 pub struct CollectorOptions {
+    /// The connection tasks' own retry interval (how often to try reading
+    /// again while the broker session is down).
     pub backoff: BackoffConfig,
-    /// Applied to every connection's client, overriding the build-time
-    /// default - lets tests use sub-second connect timeouts.
+    /// The broker sessions' connect timeout. Since R2b-3a-3 the collector
+    /// itself never dials: [`crate::BrokerSessions::new`] hands this and
+    /// [`Self::response_timeout`] to the drivers (`BrokerOptions::timeouts`,
+    /// see [`Self::broker_options`]); banto-hub's broker has its own.
     pub connect_timeout: Duration,
-    /// Applied to every connection's client, overriding the build-time
-    /// default.
+    /// The broker sessions' response timeout (see [`Self::connect_timeout`]).
     pub response_timeout: Duration,
     pub writer_options: WriterOptions,
 }
@@ -239,6 +233,25 @@ impl Default for CollectorOptions {
             connect_timeout: Duration::from_secs(3),
             response_timeout: Duration::from_secs(1),
             writer_options: WriterOptions::default(),
+        }
+    }
+}
+
+impl CollectorOptions {
+    /// The broker options for [`crate::BrokerSessions::new`] that match these
+    /// tunables: the same backoff ladder and the two timeouts.
+    pub fn broker_options(&self) -> banto_broker::BrokerOptions {
+        banto_broker::BrokerOptions {
+            backoff: banto_broker::BackoffConfig {
+                base: self.backoff.base,
+                cap: self.backoff.max,
+                ..banto_broker::BackoffConfig::default()
+            },
+            timeouts: banto_broker::SessionTimeouts {
+                connect: self.connect_timeout,
+                response: self.response_timeout,
+            },
+            ..banto_broker::BrokerOptions::default()
         }
     }
 }
@@ -280,7 +293,7 @@ pub struct ApplyReport {
     pub writer_rotated: bool,
 }
 
-/// A running collection engine. Self-driving after [`Collector::start`]
+/// A running collection engine. Self-driving after [`Collector::start_with_client_factory`]
 /// (recorder-requirements.md §4: runs independently of the UI); hold it for
 /// the process lifetime and call [`Collector::stop`] to shut down cleanly.
 pub struct Collector {
@@ -296,20 +309,13 @@ pub struct Collector {
     /// the same location `start_with_client_factory` originally used.
     data_dir: PathBuf,
     /// Retained so `apply_config` can spawn added/replaced connections with
-    /// the exact same backoff/timeout/buffering tuning `start` was called
+    /// the exact same backoff/buffering tuning the collector was started
     /// with, without the caller having to pass it again on every call.
     options: CollectorOptions,
     /// The pristine [`CollectorConfig`] currently applied - `apply_config`'s
     /// diff base. "Pristine" matters: see this module's doc comment point 3.
     config: CollectorConfig,
     tasks: HashMap<String, ConnectionTask>,
-    /// T9-1 (this module's doc comment, "T9-1 addendum"): one entry per
-    /// connection key currently running with `simulation = true`, owning that
-    /// connection's in-process simulator + ramp-wave generator task. Kept in
-    /// lockstep with `tasks` - never touched for a connection classified
-    /// "unchanged" by `apply_config`'s diff, added/removed/replaced exactly
-    /// when the corresponding task is.
-    simulators: HashMap<String, SimulatorHandle>,
     /// #383 段階3 P3: the source external (`"hub"`) connections sample, if
     /// the caller supplied one (this module's doc, "external connections").
     external: Option<Arc<dyn ExternalSource>>,
@@ -326,40 +332,11 @@ impl Collector {
     /// has no connections (nothing to collect) or [`CollectError::Tstore`] if
     /// the store cannot be opened.
     ///
-    /// Delegates to [`Self::start_with_client_factory`] with
-    /// [`default_client_factory`] - every existing caller keeps building the
-    /// same `ModbusTcpClient`/`SlmpClient` it always has (T2-2,
-    /// docs/tag-server-design.md §6-5: "既存呼び出し互換維持").
-    pub async fn start(
-        config: CollectorConfig,
-        data_dir: &Path,
-        clock: Arc<dyn Clock>,
-        events: EventSink,
-        options: CollectorOptions,
-    ) -> Result<Self, CollectError> {
-        Self::start_with_client_factory(
-            config,
-            data_dir,
-            clock,
-            events,
-            options,
-            default_client_factory(),
-        )
-        .await
-    }
-
-    /// Identical to [`Self::start`], but the `PlcClient` each connection task
-    /// reconnects with comes from `factory` instead of the hardcoded
-    /// Modbus/SLMP construction (T2-2, docs/tag-server-design.md §6-5: "hub
-    /// が SLMP 接続の読み取りを broker アダプタへ差し替えるための注入口。既定は
-    /// 従来どおりの直接クライアント"). banto-hub's `CollectorManager` calls this
-    /// directly with a factory that routes broker-managed connections through
-    /// `banto_broker` (see `apps/banto-hub/core/src/broker_glue.rs`) - SLMP
-    /// since T2-2, and Modbus TCP too since #337 (2026-09-08), leaving only
-    /// connections without a broker session on the default client - see
-    /// [`crate::task::ClientFactory`]'s doc comment for the seam's exact
-    /// contract (called once per connect attempt, receives a [`crate::task::ClientSpec`]
-    /// with every field the pre-T2-2 hardcoded dispatch used).
+    /// Every PLC connection task reads through the client `factory` hands out
+    /// for its key (R2b-3a-3: a broker read client,
+    /// [`crate::broker_client_factory`]; banto-hub builds the handles from its
+    /// own sessions, ChronoGazer from [`crate::BrokerSessions::sync`]). See
+    /// [`crate::ClientFactory`]'s doc comment for the seam's contract.
     pub async fn start_with_client_factory(
         config: CollectorConfig,
         data_dir: &Path,
@@ -416,17 +393,7 @@ impl Collector {
             .await;
 
         let mut tasks = HashMap::with_capacity(config.connections.len());
-        let mut simulators: HashMap<String, SimulatorHandle> = HashMap::new();
         for plan in &config.connections {
-            let sim_addr = match protocol_of(plan) {
-                Some(protocol) if plan.simulation => {
-                    let sim = simulation::start(protocol).await;
-                    let addr = sim.addr();
-                    simulators.insert(plan.key.clone(), sim);
-                    Some(addr)
-                }
-                _ => None,
-            };
             let ctx = TaskContext {
                 writer_rx: writer_tx.subscribe(),
                 clock: clock.clone(),
@@ -437,11 +404,7 @@ impl Collector {
                 simulation: plan.simulation,
                 factory: factory.clone(),
             };
-            let task = spawn_task(
-                plan_for_task(plan, &options, sim_addr),
-                ctx,
-                external.as_ref(),
-            );
+            let task = spawn_task(plan.clone(), ctx, external.as_ref());
             tasks.insert(plan.key.clone(), task);
         }
 
@@ -455,7 +418,6 @@ impl Collector {
             options,
             config,
             tasks,
-            simulators,
             external,
         })
     }
@@ -494,7 +456,7 @@ impl Collector {
     /// 悪い不整合が残るため（モジュール doc のステップ 5b 参照）。
     ///
     /// **もう 1 つの `Err`（#383 段階3 P3、PR #578 レビュー）**: 外部ソース無しで
-    /// 起動した collector（[`Self::start`] / [`Self::start_with_client_factory`]）に、
+    /// 起動した collector（[`Self::start_with_client_factory`]）に、
     /// 外部（`"hub"`）接続を含む構成を渡すと [`CollectError::Config`] を返す。
     /// 判定は**何よりも先に**行う（差分も writer も触る前）ので、この `Err` の
     /// ときも collector は呼び出し前のまま（`self.config`・全タスク・writer とも
@@ -574,21 +536,12 @@ impl Collector {
         // --- 3. Stop + join removed/replaced connections' tasks only -------
         // #588: every task is signalled before the first join (`stop_tasks`,
         // this module's doc comment "Stopping several tasks at once").
-        // T9-1: a removed/replaced connection's simulator (if any) is stopped
-        // right alongside its task - see this module's doc comment, "T9-1
-        // addendum". Stopped after the task itself (the task may still be
-        // mid-`read_batch` against it up to the moment it joins).
         let stopping: Vec<ConnectionTask> = removed
             .iter()
             .chain(replaced.iter())
             .filter_map(|key| self.tasks.remove(key))
             .collect();
         stop_tasks(stopping).await;
-        for key in removed.iter().chain(replaced.iter()) {
-            if let Some(sim) = self.simulators.remove(key) {
-                sim.stop().await;
-            }
-        }
 
         // --- 4. Distribute the new writer (retired in 5b, below) -----------
         //
@@ -622,20 +575,8 @@ impl Collector {
         });
 
         // --- 5. Spawn tasks for added/replaced connections ------------------
-        // T9-1: start a fresh simulator first (if the new plan wants one) so
-        // its address is ready before the task that will read from it spawns
-        // - see this module's doc comment, "T9-1 addendum".
         for key in added.iter().chain(replaced.iter()) {
             let plan = new_map[key.as_str()];
-            let sim_addr = match protocol_of(plan) {
-                Some(protocol) if plan.simulation => {
-                    let sim = simulation::start(protocol).await;
-                    let addr = sim.addr();
-                    self.simulators.insert(key.clone(), sim);
-                    Some(addr)
-                }
-                _ => None,
-            };
             let ctx = TaskContext {
                 writer_rx: self.writer_tx.subscribe(),
                 clock: self.clock.clone(),
@@ -646,11 +587,7 @@ impl Collector {
                 simulation: plan.simulation,
                 factory: factory.clone(),
             };
-            let task = spawn_task(
-                plan_for_task(plan, &self.options, sim_addr),
-                ctx,
-                self.external.as_ref(),
-            );
+            let task = spawn_task(plan.clone(), ctx, self.external.as_ref());
             self.tasks.insert(key.clone(), task);
         }
 
@@ -748,14 +685,6 @@ impl Collector {
         // transient per-append writer clone) with it.
         stop_tasks(self.tasks.drain().map(|(_key, task)| task)).await;
 
-        // T9-1: every remaining simulator goes down after its task (this
-        // module's doc comment, "T9-1 addendum") - by construction there is
-        // one entry here only for a connection that was still running with
-        // simulation=true.
-        for (_key, sim) in self.simulators.drain() {
-            sim.stop().await;
-        }
-
         // Every task has now dropped its writer handle. Grab our own clone of
         // the current writer, then drop the `Sender` itself (the last
         // remaining holder of the channel's internal copy) so `writer` below
@@ -791,53 +720,6 @@ async fn stop_tasks(tasks: impl IntoIterator<Item = ConnectionTask>) {
     for task in tasks {
         let _ = task.handle.await;
     }
-}
-
-/// Clone `plan` and apply this run's uniform connect/response-timeout
-/// overrides (`options`) to its protocol config - the same per-protocol
-/// `match` [`Collector::start_with_client_factory`] always applied inline,
-/// extracted so [`Collector::apply_config`] can build an identical
-/// "task-ready" plan for a newly added/replaced connection without mutating
-/// the pristine plan [`Collector::config`] stores for future diffing (see
-/// this module's doc comment, point 3, for why that distinction matters).
-///
-/// T9-1: `sim_addr` is `Some` exactly when `plan.simulation` is true (the
-/// caller already started the simulator to get this address) - when present,
-/// it overrides `host`/`port` in the returned plan's protocol config, same as
-/// the timeout override above. The pristine `plan` passed in is never
-/// mutated, for the same reason the timeout override isn't baked into it
-/// either (this module's doc comment, point 3): a freshly rebuilt
-/// `CollectorConfig` always carries the registry's real host/port, so if the
-/// substituted address leaked into `self.config`, an otherwise-untouched
-/// simulated connection would spuriously compare unequal on the next
-/// `apply_config` call.
-fn plan_for_task(
-    plan: &ConnectionPlan,
-    options: &CollectorOptions,
-    sim_addr: Option<SocketAddr>,
-) -> ConnectionPlan {
-    let mut plan = plan.clone();
-    match &mut plan.config {
-        ProtocolConfig::ModbusTcp(cfg) => {
-            cfg.connect_timeout = options.connect_timeout;
-            cfg.response_timeout = options.response_timeout;
-            if let Some(addr) = sim_addr {
-                cfg.host = addr.ip().to_string();
-                cfg.port = addr.port();
-            }
-        }
-        ProtocolConfig::Slmp(cfg) => {
-            cfg.connect_timeout = options.connect_timeout;
-            cfg.response_timeout = options.response_timeout;
-            if let Some(addr) = sim_addr {
-                cfg.host = addr.ip().to_string();
-                cfg.port = addr.port();
-            }
-        }
-        // Nothing to dial, so nothing to override.
-        ProtocolConfig::External => {}
-    }
-    plan
 }
 
 /// The [`CollectError::Config`] text for a config with external (`"hub"`)
@@ -887,20 +769,6 @@ impl ExternalSource for MissingSource {
     }
 }
 
-/// Project a [`ConnectionPlan`]'s protocol config down to the
-/// [`crate::config::Protocol`] [`crate::simulation::start`] dispatches on -
-/// the two are always in lockstep (`ProtocolConfig::ModbusTcp` iff
-/// `Protocol::ModbusTcp`, built from the same `build_config` match arm), so
-/// this is a plain projection, never a guess. `None` for an external
-/// connection, which has no wire protocol and never a simulator.
-fn protocol_of(plan: &ConnectionPlan) -> Option<Protocol> {
-    match &plan.config {
-        ProtocolConfig::ModbusTcp(_) => Some(Protocol::ModbusTcp),
-        ProtocolConfig::Slmp(_) => Some(Protocol::Slmp),
-        ProtocolConfig::External => None,
-    }
-}
-
 /// Retire one writer `Arc`: close (final flush + pool shutdown) if we hold
 /// the sole reference, otherwise fall back to a bare flush - the same
 /// `Arc::try_unwrap`-or-flush fallback [`Collector::stop`] has always used
@@ -922,10 +790,10 @@ async fn close_or_flush_writer(writer: Arc<TsWriter>) -> Result<(), CollectError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ConnectionPlan, GroupPlan, TagPlan, Thresholds};
-    use banto_plc::{
-        Address, BoxFuture, DataType, ModbusTcpConfig, PlcClient, PlcError, ReadRequest,
-        ReadResult, TagValue,
+    use crate::client::{CollectClient, ReadBatch};
+    use crate::config::{BrokerPlan, ConnectionPlan, GroupPlan, TagPlan, Thresholds};
+    use banto_driver_api::{
+        BoxFuture, DataType, DriverAddress, DriverId, FatalError, Settings, TagKind, TagSpec, Value,
     };
     use banto_tstore::{GroupConfig, StoreConfig, SystemClock, TagColumn};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -982,35 +850,23 @@ mod tests {
         }
     }
 
-    /// A fake `PlcClient` that connects instantly (no socket) and answers
-    /// every request with a fixed sentinel, counting how many times
+    /// A fake [`CollectClient`] that connects instantly (no socket) and
+    /// answers every spec with a fixed sentinel, counting how many times
     /// `read_batch` ran - proof a test can drive the collection loop
     /// end-to-end through [`Collector::start_with_client_factory`] without a
-    /// real PLC. `host`/`port` in the test's [`CollectorConfig`] point at an
-    /// address nothing listens on, so a run that used the *default* factory
-    /// (`ModbusTcpClient`) would never connect and this test would time out -
-    /// that is exactly what pins down "the factory was actually used", not
-    /// merely accepted and ignored.
+    /// real PLC or broker session.
     struct FakeClient {
         reads: Arc<AtomicUsize>,
     }
 
-    impl PlcClient for FakeClient {
-        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+    impl CollectClient for FakeClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn read_batch<'a>(
-            &'a mut self,
-            requests: &'a [ReadRequest],
-        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+        fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
             self.reads.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                Ok(requests
-                    .iter()
-                    .map(|_| ReadResult::Value(TagValue::F64(42.0)))
-                    .collect())
-            })
+            Box::pin(async move { Ok(specs.iter().map(|_| Ok(Value::F64(42.0))).collect()) })
         }
 
         fn disconnect(&mut self) -> BoxFuture<'_, ()> {
@@ -1018,16 +874,21 @@ mod tests {
         }
     }
 
+    /// One `i16` read at Modbus `40001`, as the Modbus driver would report it
+    /// (the fake clients never look inside).
+    fn one_spec() -> TagSpec {
+        let driver = DriverId::new("modbus-tcp").expect("driver id");
+        TagSpec::new(
+            DriverAddress::new(driver, "400001", "4x", true, 1),
+            TagKind::numeric(DataType::I16),
+        )
+    }
+
     /// One connection, one group, one tag - just enough for
     /// `Collector::start_with_client_factory` to spawn a single task and open
-    /// a store. `config`'s `host`/`port` are a throwaway loopback address
-    /// nothing listens on (see [`FakeClient`]'s doc comment for why that
-    /// matters to the test).
+    /// a store. Read through whatever client the test's factory hands out.
     fn one_tag_config() -> CollectorConfig {
-        let requests = vec![ReadRequest {
-            address: Address::parse("40001").expect("valid modbus address"),
-            data_type: DataType::I16,
-        }];
+        let requests = vec![one_spec()];
         let tags = vec![TagPlan {
             key: "tag:1".to_string(),
             scaling: None,
@@ -1043,10 +904,9 @@ mod tests {
         };
         let conn = ConnectionPlan {
             key: "conn:1".to_string(),
-            config: ProtocolConfig::ModbusTcp(ModbusTcpConfig {
-                host: "127.0.0.1".to_string(),
-                port: 1, // reserved, nothing binds here - see FakeClient's doc comment
-                ..ModbusTcpConfig::default()
+            config: ProtocolConfig::Broker(BrokerPlan {
+                settings: Settings::new(),
+                dial: None,
             }),
             groups: vec![group],
             simulation: false,
@@ -1071,20 +931,18 @@ mod tests {
     }
 
     /// T2-2 (docs/tag-server-design.md §6-5): a caller-supplied
-    /// [`crate::task::ClientFactory`] is what the connection task actually
-    /// reconnects with, not the built-in `ModbusTcpClient`/`SlmpClient`
-    /// dispatch - proven by pointing `CollectorConfig` at an address nothing
-    /// listens on and observing the cache fill anyway (only possible if the
-    /// injected [`FakeClient`] served the reads).
+    /// [`crate::ClientFactory`] is what the connection task actually
+    /// reconnects with - proven by the cache filling with the injected
+    /// [`FakeClient`]'s sentinel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_with_client_factory_uses_the_injected_client() {
         let dir = TempDir::new();
         let reads = Arc::new(AtomicUsize::new(0));
         let reads_for_factory = reads.clone();
-        let factory: ClientFactory = Arc::new(move |_spec| {
+        let factory: ClientFactory = Arc::new(move |_key: &str| {
             Box::new(FakeClient {
                 reads: reads_for_factory.clone(),
-            }) as Box<dyn PlcClient>
+            }) as Box<dyn CollectClient>
         });
 
         let pool = banto_storage::connect_sqlite_memory()
@@ -1113,8 +971,7 @@ mod tests {
             }
             assert!(
                 tokio::time::Instant::now() < deadline,
-                "the injected FakeClient's sentinel value never showed up in the cache - \
-                 the default (unreachable) ModbusTcpClient must have been used instead"
+                "the injected FakeClient's sentinel value never showed up in the cache"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
@@ -1126,26 +983,16 @@ mod tests {
         collector.stop().await.expect("stop should succeed");
     }
 
-    /// Same shape as [`one_tag_config`], but `simulation: true` and pointed at
-    /// a host/port nothing could ever answer on (`203.0.113.1` is a
-    /// TEST-NET-3 address, RFC 5737 - guaranteed unroutable, not merely
-    /// "nothing listens here"). If `Collector` did not substitute the
-    /// simulator's loopback address for this before spawning the task, the
-    /// connect attempt would simply never succeed within the test's
-    /// deadline - the same proof-by-unreachable-address technique
-    /// `start_with_client_factory_uses_the_injected_client` uses for the
-    /// `ClientFactory` seam, applied here to the T9-1 substitution instead.
+    /// A factory whose clients never connect (no broker session for any
+    /// key) - for tests where no PLC read is supposed to happen.
+    fn no_session_factory() -> ClientFactory {
+        crate::client::broker_client_factory(Arc::new(HashMap::new()))
+    }
+
+    /// Same shape as [`one_tag_config`], but `simulation: true`.
     fn one_tag_config_simulated() -> CollectorConfig {
         let mut config = one_tag_config();
-        let conn = &mut config.connections[0];
-        conn.simulation = true;
-        match &mut conn.config {
-            ProtocolConfig::ModbusTcp(cfg) => {
-                cfg.host = "203.0.113.1".to_string();
-                cfg.port = 502;
-            }
-            _ => unreachable!("one_tag_config always builds ModbusTcp"),
-        }
+        config.connections[0].simulation = true;
         config
     }
 
@@ -1158,7 +1005,7 @@ mod tests {
     // down. See `crate::task`'s module doc ("What `plc_reconnected` means")
     // for the rule these pin down.
 
-    /// A fake `PlcClient` whose `connect()` always succeeds instantly (no
+    /// A fake [`CollectClient`] whose `connect()` always succeeds instantly (no
     /// socket) and whose `read_batch` fails for the first `fail_reads` calls
     /// and succeeds afterwards. The call counter is shared across every
     /// instance the factory hands out, so it keeps counting across the
@@ -1168,29 +1015,23 @@ mod tests {
         fail_reads: usize,
     }
 
-    impl PlcClient for FlappingClient {
-        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+    impl CollectClient for FlappingClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn read_batch<'a>(
-            &'a mut self,
-            requests: &'a [ReadRequest],
-        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+        fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
             let nth = self.reads.fetch_add(1, Ordering::SeqCst) + 1;
             let fail = nth <= self.fail_reads;
             Box::pin(async move {
                 if fail {
-                    // The exact shape banto-hub's broker adapter produces
-                    // for a session that is down.
-                    Err(PlcError::Connection(
+                    // The exact shape `BrokerReadClient` produces for a
+                    // session that is down.
+                    Err(FatalError::Io(
                         "PLC接続 1 は現在未接続です（再接続待機中…）".to_string(),
                     ))
                 } else {
-                    Ok(requests
-                        .iter()
-                        .map(|_| ReadResult::Value(TagValue::F64(7.0)))
-                        .collect())
+                    Ok(specs.iter().map(|_| Ok(Value::F64(7.0))).collect())
                 }
             })
         }
@@ -1201,11 +1042,11 @@ mod tests {
     }
 
     fn flapping_factory(reads: Arc<AtomicUsize>, fail_reads: usize) -> ClientFactory {
-        Arc::new(move |_spec| {
+        Arc::new(move |_key: &str| {
             Box::new(FlappingClient {
                 reads: reads.clone(),
                 fail_reads,
-            }) as Box<dyn PlcClient>
+            }) as Box<dyn CollectClient>
         })
     }
 
@@ -1368,71 +1209,6 @@ mod tests {
             ],
             "{events:?}"
         );
-    }
-
-    /// T9-1 (docs/ux-plan.md §1) end to end: a `simulation: true` connection,
-    /// started through the *default* client factory (real `ModbusTcpClient`,
-    /// no injected fake - unlike the test above), still collects live,
-    /// changing values - proof that `Collector` actually started an
-    /// in-process simulator and pointed the task at it, and that the
-    /// ramp-wave generator (`crate::simulation`) is really mutating its
-    /// registers over time, not just seeding a fixed value once.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_simulated_connection_collects_live_changing_values() {
-        let dir = TempDir::new();
-        let pool = banto_storage::connect_sqlite_memory()
-            .await
-            .expect("connect sqlite memory");
-        let collector = Collector::start(
-            one_tag_config_simulated(),
-            dir.path(),
-            Arc::new(SystemClock),
-            EventSink::new(pool),
-            CollectorOptions {
-                connect_timeout: Duration::from_millis(300),
-                response_timeout: Duration::from_millis(300),
-                ..CollectorOptions::default()
-            },
-        )
-        .await
-        .expect("start should succeed against the substituted simulator address");
-
-        let current = collector.current_values();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let first_value = loop {
-            if let Some(sample) = current.get("tag:1") {
-                if sample.quality == crate::current::Quality::Good {
-                    if let Some(v) = sample.value {
-                        break v;
-                    }
-                }
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "no Good reading ever showed up - the connection never reached the \
-                 simulator, so the host/port substitution must not have happened"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        };
-
-        // The ramp-wave generator (100ms period) must move the value on -
-        // proof this is a live simulator, not a static seeded register.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(sample) = current.get("tag:1") {
-                if sample.value.is_some_and(|v| v != first_value) {
-                    break;
-                }
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the simulated register never changed - the ramp-wave generator task \
-                 must not be running"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-
-        collector.stop().await.expect("stop should succeed");
     }
 
     // --- #383 段階3 P3: external (`"hub"`) connections -----------------------
@@ -1633,6 +1409,7 @@ mod tests {
                 &snapshot,
                 &HashMap::new(),
                 HubSource::Available { catalog: None },
+                &banto_drivers::builtin().registry,
             );
             assert!(exclusions.is_empty(), "{exclusions:?}");
 
@@ -1640,10 +1417,10 @@ mod tests {
             let events = EventSink::new(events_pool);
             let rx = events.subscribe();
             let reads = Arc::new(AtomicUsize::new(0));
-            let factory: ClientFactory = Arc::new(move |_spec| {
+            let factory: ClientFactory = Arc::new(move |_key: &str| {
                 Box::new(FakeClient {
                     reads: reads.clone(),
-                }) as Box<dyn PlcClient>
+                }) as Box<dyn CollectClient>
             });
             let collector = Collector::start_with_sources(
                 config,
@@ -1906,10 +1683,10 @@ mod tests {
             let reads = Arc::new(AtomicUsize::new(0));
             let factory = {
                 let reads = reads.clone();
-                Arc::new(move |_spec: &crate::task::ClientSpec| {
+                Arc::new(move |_key: &str| {
                     Box::new(FakeClient {
                         reads: reads.clone(),
-                    }) as Box<dyn PlcClient>
+                    }) as Box<dyn CollectClient>
                 }) as ClientFactory
             };
             let pool = banto_storage::connect_sqlite_memory().await.unwrap();
@@ -1965,7 +1742,7 @@ mod tests {
                 Arc::new(SystemClock),
                 EventSink::new(pool),
                 CollectorOptions::default(),
-                default_client_factory(),
+                no_session_factory(),
             )
             .await;
             assert!(
@@ -2058,7 +1835,7 @@ mod tests {
                 Arc::new(SystemClock),
                 events,
                 CollectorOptions::default(),
-                default_client_factory(),
+                no_session_factory(),
                 Some(source.clone() as Arc<dyn ExternalSource>),
             )
             .await
@@ -2141,10 +1918,8 @@ mod tests {
 
     /// T9-1: toggling only `simulation` (everything else on the connection
     /// unchanged) must still make `apply_config`'s diff classify the
-    /// connection "replaced", not "unchanged" - the mechanism this module's
-    /// doc comment ("T9-1 addendum") relies on to piggyback the simulator's
-    /// stop/start onto the ordinary stop-then-spawn path, with no dedicated
-    /// branch of its own.
+    /// connection "replaced", not "unchanged" - the new task decides from
+    /// the flag whether its ticks are recorded.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn toggling_simulation_alone_is_classified_as_replaced() {
         let dir = TempDir::new();
@@ -2157,19 +1932,20 @@ mod tests {
             ..CollectorOptions::default()
         };
 
-        let mut collector = Collector::start(
+        let mut collector = Collector::start_with_client_factory(
             one_tag_config(),
             dir.path(),
             Arc::new(SystemClock),
             EventSink::new(pool),
             options,
+            no_session_factory(),
         )
         .await
         .expect("start should succeed");
 
         let simulated = one_tag_config_simulated();
         let report = collector
-            .apply_config(simulated, default_client_factory())
+            .apply_config(simulated, no_session_factory())
             .await
             .expect("apply_config should succeed");
         assert_eq!(report.added, Vec::<String>::new());
@@ -2210,7 +1986,7 @@ mod tests {
         count_rx
     }
 
-    /// A fake `PlcClient` for the #588 tests - a **barrier on the stop
+    /// A fake [`CollectClient`] for the #588 tests - a **barrier on the stop
     /// signals**. Its first `read_batch` blocks until `notified` (from
     /// [`watch_stop_signals`]) reaches `all`, i.e. until **every** task
     /// being stopped has been sent its stop signal, and then succeeds; every
@@ -2233,15 +2009,12 @@ mod tests {
         panic_on_read: bool,
     }
 
-    impl PlcClient for GatedClient {
-        fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
+    impl CollectClient for GatedClient {
+        fn connect(&mut self) -> BoxFuture<'_, Result<(), FatalError>> {
             Box::pin(async { Ok(()) })
         }
 
-        fn read_batch<'a>(
-            &'a mut self,
-            requests: &'a [ReadRequest],
-        ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
+        fn read_batch<'a>(&'a mut self, specs: &'a [TagSpec]) -> BoxFuture<'a, ReadBatch> {
             assert!(
                 !self.panic_on_read,
                 "GatedClient: deliberate panic for the #588 JoinError test"
@@ -2265,10 +2038,7 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 };
                 let _ = count_rx.wait_for(|count| *count >= all).await;
-                Ok(requests
-                    .iter()
-                    .map(|_| ReadResult::Value(TagValue::F64(5.0)))
-                    .collect())
+                Ok(specs.iter().map(|_| Ok(Value::F64(5.0))).collect())
             })
         }
 
@@ -2293,18 +2063,18 @@ mod tests {
         let barrier = barrier.clone();
         let panicking: HashSet<String> = panicking.iter().map(|k| (*k).to_string()).collect();
         let ungated: HashSet<String> = ungated.iter().map(|k| (*k).to_string()).collect();
-        Arc::new(move |spec| {
-            if ungated.contains(&spec.connection_key) {
+        Arc::new(move |key: &str| {
+            if ungated.contains(key) {
                 return Box::new(FakeClient {
                     reads: Arc::new(AtomicUsize::new(0)),
-                }) as Box<dyn PlcClient>;
+                }) as Box<dyn CollectClient>;
             }
             Box::new(GatedClient {
                 nth_read: 0,
                 in_first_read: in_first_read.clone(),
                 notified: barrier.clone(),
-                panic_on_read: panicking.contains(&spec.connection_key),
-            }) as Box<dyn PlcClient>
+                panic_on_read: panicking.contains(key),
+            }) as Box<dyn CollectClient>
         })
     }
 

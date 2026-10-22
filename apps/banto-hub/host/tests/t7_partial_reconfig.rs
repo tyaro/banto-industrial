@@ -862,7 +862,8 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     // "for B" assertion) was written, so this count is now 2, not 1. A's
     // session started out (#131) as write/status routing only; since #337
     // (2026-09-08) its collection reads share that same session too - see
-    // `banto_hub_core::broker_glue::hub_client_factory`'s doc comment.
+    // `banto_collect::broker_client_factory`'s doc comment (then
+    // `banto_hub_core::broker_glue::hub_client_factory`, gone in R2b-3a-3).
     assert_eq!(
         app.sessions.connection_count(),
         2,
