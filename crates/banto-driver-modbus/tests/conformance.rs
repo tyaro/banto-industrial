@@ -4,16 +4,14 @@
 //! - `static_checks` (C1, C2) on [`ModbusDriver`], with fixtures copied from
 //!   `banto-plc/src/address.rs`'s tests (the grammar) and the TypeScript
 //!   `continuousRegistration.test.ts` / `offsetCopy.test.ts` (offsets).
-//! - `session::run_all_against` (C1-C8, C12) through the dev-only
-//!   `LegacySession` (`tests/common`), against `banto-plc`'s Modbus TCP
+//! - `session::run_all_against` (C1-C8, C12) through the production
+//!   `Session` of `ModbusDriver` (R2b-3a-1), against `banto-plc`'s Modbus TCP
 //!   simulator behind a `FaultProxy`. C13-C15 have no fixtures: Modbus has
 //!   no bit-in-word writes (`banto-plc-write/src/modbus/planning.rs`), so a
 //!   `.N` write is pinned as `ItemError::Unsupported` instead.
 //!
 //! Every simulator and proxy binds 127.0.0.1:0, so these tests need no
 //! nextest test-group.
-
-mod common;
 
 use std::time::Duration;
 
@@ -26,7 +24,6 @@ use banto_driver_conformance::session::{self, ResponsePatch, SessionFixtures};
 use banto_driver_conformance::{static_checks, StaticFixtures};
 use banto_driver_modbus::ModbusDriver;
 use banto_plc::modbus::simulator::Simulator;
-use common::LegacyDriver;
 
 fn n(data_type: DataType) -> TagKind {
     TagKind::numeric(data_type)
@@ -196,11 +193,11 @@ fn fixtures() -> SessionFixtures {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn legacy_session_conforms() {
+async fn session_conforms() {
     let sim = Simulator::start().await;
     seed(&sim);
     let proxy = FaultProxy::start(sim.addr).await.unwrap();
-    let failures = session::run_all_against(&LegacyDriver, &fixtures(), &proxy).await;
+    let failures = session::run_all_against(&ModbusDriver, &fixtures(), &proxy).await;
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
     assert!(failures.is_empty(), "{text:#?}");
     sim.stop();
@@ -211,7 +208,7 @@ fn cx() -> ConnectContext {
 }
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):
-/// in R1's `LegacySession` an address that does not parse after connect is
+/// in the production `Session` an address that does not parse after connect is
 /// the tag's own `ItemError::Unsupported`, not fatal (R2b-2a, address design
 /// §6 Q5; design §3.4, §7.1 C4), and a `.N` write is
 /// `ItemError::Unsupported` (design §7.3).
@@ -223,9 +220,9 @@ async fn invalid_address_is_unsupported_and_bit_write_is_unsupported() {
         ("port", sim.addr.port().to_string()),
     ])
     .unwrap();
-    let mut s = LegacyDriver.connect(&settings, cx()).await.unwrap();
+    let mut s = ModbusDriver.connect(&settings, cx()).await.unwrap();
     let bit = n(DataType::Bit);
-    let spec = TagSpec::new(LegacyDriver.parse_address("40051.3", &bit).unwrap(), bit);
+    let spec = TagSpec::new(ModbusDriver.parse_address("40051.3", &bit).unwrap(), bit);
     let r = s
         .write_batch(&[WriteItem::new(spec, Value::Bit(true))])
         .await
@@ -234,7 +231,7 @@ async fn invalid_address_is_unsupported_and_bit_write_is_unsupported() {
         matches!(r.as_slice(), [Err(ItemError::Unsupported(_))]),
         "{r:?}"
     );
-    let foreign = DriverAddress::new(LegacyDriver.descriptor().id.clone(), "D100", "D", true, 1);
+    let foreign = DriverAddress::new(ModbusDriver.descriptor().id.clone(), "D100", "D", true, 1);
     let r = s
         .read_batch(&[TagSpec::new(foreign, n(DataType::U16))])
         .await;

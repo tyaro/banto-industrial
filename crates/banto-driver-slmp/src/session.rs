@@ -17,9 +17,11 @@
 
 use banto_plc::{
     dial_slmp, execute_slmp_batch_reads, plan_slmp_batch, BatchReadRequest, BatchReadResult,
-    BoxFuture, SlmpConfig, WordOrder,
+    BoxFuture, PlcError, SlmpConfig, WordOrder,
 };
-use banto_plc_write::{execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, WriteResult};
+use banto_plc_write::{
+    execute_slmp_writes, plan_slmp_write_batch, BatchWriteRequest, PlcWriteError, WriteResult,
+};
 
 use banto_broker::{BrokerSession, Connector, SessionError};
 
@@ -36,14 +38,45 @@ pub(crate) struct SlmpSession {
     word_order: WordOrder,
 }
 
+impl SlmpSession {
+    /// A session over an already-dialed `client`.
+    pub(crate) fn new(client: slmp::SLMPClient, word_order: WordOrder) -> Self {
+        SlmpSession { client, word_order }
+    }
+
+    /// The read half of [`BrokerSession::read_batch`] with the **typed**
+    /// error (R2b-3a-1): the `banto-driver-api` session maps it with
+    /// `classify_read` instead of recovering a variant from text. The broker's
+    /// `BrokerSession` impl below calls this too, so there is one body.
+    pub(crate) async fn read_typed(
+        &mut self,
+        requests: &[BatchReadRequest],
+    ) -> Result<Vec<BatchReadResult>, PlcError> {
+        let plan = plan_slmp_batch(requests);
+        execute_slmp_batch_reads(&mut self.client, &plan, requests.len(), self.word_order).await
+    }
+
+    /// The write half, typed error (see [`Self::read_typed`]).
+    pub(crate) async fn write_typed(
+        &mut self,
+        requests: &[BatchWriteRequest],
+    ) -> Result<Vec<WriteResult>, PlcWriteError> {
+        let plan = plan_slmp_write_batch(requests, self.word_order);
+        execute_slmp_writes(&mut self.client, &plan, requests.len()).await
+    }
+
+    pub(crate) async fn close(&mut self) {
+        self.client.close().await
+    }
+}
+
 impl BrokerSession for SlmpSession {
     fn read_batch<'a>(
         &'a mut self,
         requests: &'a [BatchReadRequest],
     ) -> BoxFuture<'a, Result<Vec<BatchReadResult>, SessionError>> {
         Box::pin(async move {
-            let plan = plan_slmp_batch(requests);
-            execute_slmp_batch_reads(&mut self.client, &plan, requests.len(), self.word_order)
+            self.read_typed(requests)
                 .await
                 .map_err(|e| SessionError(e.to_string()))
         })
@@ -54,15 +87,14 @@ impl BrokerSession for SlmpSession {
         requests: &'a [BatchWriteRequest],
     ) -> BoxFuture<'a, Result<Vec<WriteResult>, SessionError>> {
         Box::pin(async move {
-            let plan = plan_slmp_write_batch(requests, self.word_order);
-            execute_slmp_writes(&mut self.client, &plan, requests.len())
+            self.write_typed(requests)
                 .await
                 .map_err(|e| SessionError(e.to_string()))
         })
     }
 
     fn disconnect(&mut self) -> BoxFuture<'_, ()> {
-        Box::pin(async move { self.client.close().await })
+        Box::pin(self.close())
     }
 }
 
@@ -101,7 +133,7 @@ pub fn connector(config: SlmpConfig) -> Connector {
         Box::pin(async move {
             let word_order = config.word_order;
             let client = dial_slmp(&config).await.map_err(|e| e.to_string())?;
-            Ok(Box::new(SlmpSession { client, word_order }) as Box<dyn BrokerSession>)
+            Ok(Box::new(SlmpSession::new(client, word_order)) as Box<dyn BrokerSession>)
         })
     })
 }

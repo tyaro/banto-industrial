@@ -41,13 +41,27 @@
 //! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
 //!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
 //!
-//! Neither is on the production path in R1 (design §3.3, §6.2): only the
+//! ## The production `Session` (R2b-3a-1)
+//!
+//! `api_session.rs` implements [`banto_driver_api::SessionDriver`] for
+//! [`SlmpDriver`] (docs/banto-hub-driver-io-design.md §4.1): `connect` builds
+//! the config from `Settings` + `ConnectContext` and dials as before, and the
+//! `Session` reads/writes on the same `SlmpSession` with the typed
+//! `PlcError` -> `FatalError` / `ItemError` mapping (no more text round trip).
+//! The canonical address is turned back into a `banto_plc::Address` privately
+//! inside this crate, and a `bit`-addressed `bit` write (`D100.5`) is the
+//! read-modify-write `BitInWord` here (the Hub's decision, moved in). This is
+//! step 3a-1: the registration is unchanged (`HostBound`, broker + [`dial`] as
+//! above); 3a-2 switches the broker and the registry to this `Session`.
+//!
+//! Neither of the two above is on the production path in R1 (design §3.3, §6.2): only the
 //! tripwire and conformance tests read them.
 
 use banto_broker::{parse_word_order, DriverDial};
 use banto_plc::{SlmpConfig, SlmpCpu};
 use banto_tags::PlcConnection;
 
+mod api_session;
 mod base;
 mod classify;
 mod session;
