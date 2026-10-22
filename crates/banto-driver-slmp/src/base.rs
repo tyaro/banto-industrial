@@ -4,9 +4,13 @@
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid (including the CPU type, #605), and the
 //! address functions. Its I/O is still wired by `banto-broker` through
-//! [`crate::dial`]; the production read / write paths do not pass through
-//! anything here in R1 (design §3.3, §6.2) - the only readers are the
-//! tripwire tests in `banto-drivers` and the conformance tests.
+//! [`crate::dial`]. Since R2b-2 (docs/banto-hub-driver-address-design.md)
+//! the address functions are on the production path: the save path of
+//! `banto-tags` (built with a registry) and the Hub's plan, instant read and
+//! write paths call `parse_address`; the broker and `PlcClient` still carry
+//! a `banto_plc::Address`, which the HostBound bridge
+//! `Address::from_driver_address` rebuilds from the canonical text until
+//! R2b-3. ChronoGazer keeps the legacy rules until R2b-7.
 //!
 //! ## Address functions
 //!

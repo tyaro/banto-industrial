@@ -608,9 +608,13 @@ pub fn connections_with_collected_groups(groups: &[CollectionGroup]) -> HashSet<
 ///
 /// Fails with [`CollectError::Config`] if any *included* tag's stored address
 /// does not parse under the PLC addressing rules or its `data_type` is
-/// outside the known vocabulary - `banto-tags` deliberately does not validate
-/// those (address format is I2/I3b's concern), so this is where a
-/// misconfigured tag is caught, before any socket is opened. Registry read
+/// outside the known vocabulary. This is the legacy-rules path (the plain
+/// `TagService::new`, ChronoGazer): there `banto-tags` does not validate the
+/// address format, so this is where a misconfigured tag is caught, before any
+/// socket is opened. On the registry path (`TagService::with_registry`, the
+/// Hub since R2b-2) the save layer already validated every tag with the
+/// connection's driver, and the Hub plans through
+/// `build_request_with_registry` instead. Registry read
 /// failures surface as [`CollectError::Registry`].
 pub async fn build_config(pool: &SqlitePool) -> Result<CollectorConfig, CollectError> {
     let snapshot = RegistrySnapshot::load(pool).await?;
@@ -1714,10 +1718,12 @@ fn parse_word_order(value: &str) -> WordOrder {
 /// rejected here as a `CollectError::Config`, not left for `banto-plc`'s
 /// planner to fail per-tick, so the mistake surfaces at config-build time
 /// exactly like every other address/data-type mismatch this function already
-/// catches (a malformed address, an unknown data type). `banto-tags` (I1)
-/// deliberately does not validate this at registration time (address format
-/// is I2/I3b's concern, per this function's own doc comment above) - this is
-/// the one place it is caught, and `CollectorManager::rebuild`
+/// catches (a malformed address, an unknown data type). On the legacy path
+/// (`TagService::new`, ChronoGazer) `banto-tags` (I1) does not validate this
+/// at registration time (see this function's own doc comment above), so this
+/// is the one place it is caught; on the registry path (`with_registry`, the
+/// Hub since R2b-2) the save layer rejects it through the driver's
+/// `parse_address` first. Either way, `CollectorManager::rebuild`
 /// (`apps/banto-hub/core/src/hub.rs`) already treats any `CollectError::Config`
 /// from `build_config` as an all-or-nothing failure that keeps the previous
 /// catalog/`Collector` running (`last_config_error`), so a tag registered
