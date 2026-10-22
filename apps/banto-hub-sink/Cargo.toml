@@ -14,11 +14,16 @@ banto-tagclient = { path = "../../crates/banto-tagclient" }
 # 設計 §5.3 の long スキーマへの multi-row INSERT と `SELECT ... LIMIT 0` の
 # テーブル検査。feature の選定理由（`tls-rustls-ring-native-roots`）は
 # `apps/banto-hub/core/Cargo.toml` の同じ依存のコメント（S0 の実測）参照 -
-# sqlite/macros/migrate はサイドカーには不要なので付けない。
+# sqlite/migrate はサイドカーには不要なので付けない。`macros` は DB ブリッジ
+# （`source/poll.rs`）の `Executor::describe` のために付ける - `describe` は
+# `sqlx-core/offline` の下にだけあり、`macros` がそれを連れてくる（Hub・
+# `banto-db-source` の dev と同じ）。ワークスペースでは他の crate の feature と
+# 合わさって通ってしまうので、`-p banto-hub-sink` 単体のビルドで確かめる。
 sqlx = { workspace = true, features = [
     "runtime-tokio",
     "postgres",
     "tls-rustls-ring-native-roots",
+    "macros",
 ] }
 # `GET /api/sink/config` / `PUT /api/sink/status`（設計 §5.2）。SDK が既に
 # 同じ版を持っているので新規ノードは増えない。`json` feature は使わない

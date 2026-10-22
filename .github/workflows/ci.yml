@@ -524,6 +524,12 @@ jobs:
       # §10.4 の 11 場面 1〜9・7b・7c。9 は 60 秒の上限ちょうどの 3 クエリ）も同じ。
       - name: test (banto-hub-sink)
         run: cargo test -p banto-hub-sink
+      # 配布物と同じく sink を単体で（dev-dependency の feature を混ぜずに）確かめる。
+      # `cargo test` は dev 側（banto-hub-core など）の sqlx の feature と合わさって
+      # 通ってしまい、#764 から `cargo build --release -p banto-hub-sink` が
+      # `Executor::describe` の未定義で落ちるのを見逃していた（alpha.35 のリリースビルドで発覚）。
+      - name: check (banto-hub-sink 単体)
+        run: cargo check -p banto-hub-sink
 
   # #392 B3-3b の監査 Nit 1: メインの Rust ジョブは windows-latest なので、Windows 以外
   # だけで出る `dead_code` など（例: `banto-hub-core` の `resolve_service_acl_target`、
