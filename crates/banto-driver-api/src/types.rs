@@ -259,6 +259,13 @@ pub enum WordOrder {
 /// `variant value { bool, int(s64), uint(u64), float(f64), bytes(list<u8>) }`).
 /// The host maps it to [`Value`]: integers widen to `f64`, and bytes become
 /// text with the [`TagKind::Str`] encoding.
+///
+/// Frame drivers must match the raw value to the requested tag kind:
+/// [`TagKind::Numeric`] with [`DataType::Bit`] requires [`RawValue::Bool`];
+/// all other numeric kinds require [`RawValue::Int`], [`RawValue::Uint`], or
+/// [`RawValue::Float`]; and [`TagKind::Str`] requires [`RawValue::Bytes`].
+/// A mismatch yields a per-item [`ItemError::Unsupported`](crate::ItemError::Unsupported),
+/// not a fatal error.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(
