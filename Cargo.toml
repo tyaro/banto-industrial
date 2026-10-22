@@ -64,6 +64,7 @@ members = [
     "crates/banto-plc-address",
     "crates/banto-driver-api",
     "crates/banto-driver-conformance",
+    "crates/banto-driver-engine",
     "crates/banto-drivers",
     "crates/banto-driver-slmp",
     "crates/banto-driver-modbus",
