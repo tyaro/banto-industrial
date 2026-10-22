@@ -197,7 +197,7 @@ fn decode_one(
             "{canonical:?} は SLMP のアドレスではない"
         )));
     };
-    let width = crate::base::occupied_words(bit, &spec.kind);
+    let width = crate::base::occupancy(device, bit, &spec.kind).count;
     let offset = number.checked_sub(span.start);
     let fits = device == span.device
         && offset.is_some_and(|o| u64::from(o) + u64::from(width) <= u64::from(span.count));

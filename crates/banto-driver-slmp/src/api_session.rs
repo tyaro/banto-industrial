@@ -147,17 +147,11 @@ fn stitch<R, T>(
 /// （セッションと、フレーム型の `plan_read`）と書き込みの入口で使う。これが
 /// 無いと、セッションの計画は上限をまたぐ要求をそのまま送り、フレーム型の
 /// 計画は同じまとまりの正常なタグまで巻き込んで致命になる。
+/// 判定と文言は保存時と同じ `base::past_last_number`。
 fn past_last_number(spec: &TagSpec, address: &Address) -> Option<ItemError> {
-    let (_, number, bit) = address.as_slmp()?;
-    if crate::base::occupied_fits(number, bit, &spec.kind) {
-        return None;
-    }
-    Some(ItemError::Unsupported(format!(
-        "アドレス {} から {} 語分を占めると、デバイス番号の上限 0x{:X} を超えます",
-        spec.address.canonical,
-        crate::base::occupied_words(bit, &spec.kind),
-        banto_plc::slmp::address::MAX_DEVICE_NUMBER
-    )))
+    let (device, number, bit) = address.as_slmp()?;
+    crate::base::past_last_number(&spec.address.canonical, device, number, bit, &spec.kind)
+        .map(ItemError::Unsupported)
 }
 
 /// The read request of `spec`: this driver's grammar on the canonical address.
@@ -465,6 +459,89 @@ mod tests {
         );
         assert_eq!(sim.write_command_count(), 0);
         sim.stop();
+    }
+
+    /// #793 の 3 回目: 最後に占める番号がちょうど上限 0xFFFFFF で終わる書き込み
+    /// は受け付け、シミュレータに実際に書かれる（語・2 語・ビットデバイス）。
+    #[tokio::test]
+    async fn a_write_ending_exactly_at_the_last_device_number_is_sent() {
+        use banto_plc::SlmpDevice;
+        let sim = Simulator::start().await;
+        let mut s = connect(&sim, 1000).await;
+        let items = [
+            // 70000 = 0x0001_1170, low word first.
+            WriteItem::new(spec("ZR16777214", n(DataType::U32)), Value::F64(70000.0)),
+            WriteItem::new(spec("D16777215", n(DataType::U16)), Value::F64(4660.0)),
+            WriteItem::new(spec("M16777215", n(DataType::Bit)), Value::Bit(true)),
+        ];
+        let w = s.write_batch(&items).await.unwrap();
+        assert_eq!(w, vec![Ok(()), Ok(()), Ok(())]);
+        assert_eq!(sim.get_word(SlmpDevice::ZR, 16_777_214), 0x1170);
+        assert_eq!(sim.get_word(SlmpDevice::ZR, 16_777_215), 0x0001);
+        assert_eq!(sim.get_word(SlmpDevice::D, 16_777_215), 0x1234);
+        assert!(sim.get_bit(SlmpDevice::M, 16_777_215));
+        assert_eq!(sim.write_command_count(), 3);
+        sim.stop();
+    }
+
+    /// #793 の 3 回目: 正常なタグと上限をはみ出すタグを 1 回の書き込みに混ぜる
+    /// と、正常なタグだけが書かれ、はみ出すタグはそのタグだけの項目エラー。
+    /// シミュレータは書かれた番号をすべて held の集合に記録するので、その数で
+    /// 上限を越える番号への書き込みが 1 件も届いていないことを確かめる。
+    #[tokio::test]
+    async fn a_write_mixing_healthy_and_overrunning_tags_writes_only_the_healthy() {
+        use banto_plc::SlmpDevice;
+        let sjis = |w| TagKind::string(w, banto_driver_api::StringEncoding::ShiftJis);
+        let sim = Simulator::start().await;
+        let mut s = connect(&sim, 1000).await;
+        let items = [
+            WriteItem::new(spec("D0", n(DataType::U16)), Value::F64(5.0)),
+            WriteItem::new(unchecked("D16777215", n(DataType::U32)), Value::F64(1.0)),
+            WriteItem::new(spec("M10", n(DataType::Bit)), Value::Bit(true)),
+            WriteItem::new(unchecked("ZR16777214", sjis(3)), Value::Str("abc".into())),
+        ];
+        let w = s.write_batch(&items).await.unwrap();
+        assert_eq!(w[0], Ok(()));
+        assert!(
+            matches!(&w[1], Err(ItemError::Unsupported(m)) if m.contains("2 語分")),
+            "{w:?}"
+        );
+        assert_eq!(w[2], Ok(()));
+        assert!(
+            matches!(&w[3], Err(ItemError::Unsupported(m)) if m.contains("3 語分")),
+            "{w:?}"
+        );
+        assert_eq!(sim.get_word(SlmpDevice::D, 0), 5);
+        assert!(sim.get_bit(SlmpDevice::M, 10));
+        // Two write commands, two devices written: D0 and M10, nothing else.
+        assert_eq!(sim.write_command_count(), 2);
+        assert_eq!(sim.held_count(), 2);
+        assert_eq!(sim.get_word(SlmpDevice::D, 16_777_215), 0);
+        assert_eq!(sim.get_word(SlmpDevice::ZR, 16_777_214), 0);
+        sim.stop();
+    }
+
+    /// #793 の 3 回目: 入口の文言は保存時と同じで、ビットデバイスは「点」。
+    #[test]
+    fn the_entry_says_words_or_points_like_the_save_path() {
+        let word = unchecked("D16777215", n(DataType::U32));
+        let Ok(Prep::Item(ItemError::Unsupported(m))) = read_request(&word) else {
+            panic!("D16777215 U32 should be an item error");
+        };
+        let saved = SlmpDriver
+            .parse_address("D16777215", &n(DataType::U32))
+            .unwrap_err();
+        // `AddressError` shows itself with a 「アドレスが不正です: 」 prefix.
+        assert!(saved.to_string().ends_with(&m), "{saved} / {m}");
+        assert!(m.contains("2 語分を占めると"), "{m}");
+        // A bit device holding a 32-bit value (only by hand: check_kind
+        // refuses it when saved) spreads over 32 points.
+        let bits = unchecked("M16777200", n(DataType::U32));
+        let Ok(Prep::Item(ItemError::Unsupported(m))) = read_request(&bits) else {
+            panic!("M16777200 U32 should be an item error");
+        };
+        assert!(m.contains("32 点分を占めると"), "{m}");
+        assert!(!m.contains("語"), "{m}");
     }
 
     /// A broken result count is fatal, not trimmed and not a panic.
