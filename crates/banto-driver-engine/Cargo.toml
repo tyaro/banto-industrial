@@ -12,8 +12,8 @@ readme = false
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
-# MSRV 1.85 を保つ（0.8.42 は Rust 1.88 を要求する）。
-encoding_rs = "=0.8.35"
+# MSRV 1.85 の検証では Cargo.lock の 0.8.35 を使う（0.8.42 は Rust 1.88 を要求する）。
+encoding_rs = "0.8.35"
 tokio = { version = "1", features = ["rt", "time", "net", "io-util"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
