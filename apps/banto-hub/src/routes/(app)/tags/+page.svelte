@@ -164,7 +164,11 @@
 	import { carryFormForNext } from '#lib/banto/tagFormCarry.js';
 	import { buildDuplicateFormValues } from '#lib/banto/tagDuplicate.js';
 	import { nextTagNameOnAddressChange } from '#lib/banto/tagNamePrefill.js';
-	import { canDefaultWritable, writableDefaultBlockedReason } from '#lib/banto/writableDefault.js';
+	import {
+		canDefaultWritable,
+		writableAfterAreaVerdict,
+		writableDefaultBlockedReason
+	} from '#lib/banto/writableDefault.js';
 	import {
 		monitorHref,
 		resolvePresetGroupId,
@@ -974,6 +978,11 @@
 	 * `createWritableArea` の6つ -
 	 * `createForm.writable` 自身は読まない（読むと自分の書き込みで自分を
 	 * 再トリガーする無限ループのリスクになる）。
+	 *
+	 * **既定の適用と、確定した断りへの追従は別の `$effect` に分ける**（オーナー
+	 * レビュー P2）: この effect は `createWritableTouched` の間は何もしない
+	 * 「既定」だけを担う。手動で ON にした後に読み取り専用のアドレスへ変えた場合の
+	 * 追従は、直下の effect が `createWritableTouched` に関係なく行う。
 	 */
 	$effect(() => {
 		if (drawerMode !== 'create' || createWritableTouched) return;
@@ -987,6 +996,27 @@
 		// バックする（`groupWritableDefault.ts` の旧実装と同じ既定値）。
 		const groupDefault = selectedGroup?.defaultWritable ?? true;
 		createForm.writable = eligible && groupDefault;
+	});
+
+	/**
+	 * 確定した断りへの追従（オーナーレビュー P2、2026-10-22）: 解析の API が読み取り専用の
+	 * 領域と確定（`createWritableArea === false`）したら、手動で ON にした後でも
+	 * `createForm.writable` を `false` に揃える。チェックボックスの表示（無効・未チェック）・
+	 * 保持値・送信値（`toInput`）を一致させ、サーバーに断られる送信を防ぐ。
+	 * `undefined`（判定不能）は読み取り専用と見なさず手動の値を保つ。`false` にしか
+	 * 書かない（`writableAfterAreaVerdict`）ので再実行してもループしない。アドレスが
+	 * 後で書き込める領域に戻っても自動では ON に戻さない（利用者が付け直す）。
+	 */
+	$effect(() => {
+		if (drawerMode !== 'create') return;
+		const next = writableAfterAreaVerdict(
+			createForm.tagKind,
+			createWritableArea,
+			createForm.writable
+		);
+		// `writable` も依存に入れる（複製などで true が後から入っても追従するため）。
+		// 書くのは `false` だけなので自分の書き込みで再実行されても 1 回で収束する。
+		if (createForm.writable && !next) createForm.writable = false;
 	});
 
 	/**

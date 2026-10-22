@@ -236,6 +236,47 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await page.unroute('**/api/tags');
 	});
 
+	test('2.5. create Drawer: writable を手動 ON にした後で読み取り専用の領域（3xxxx）へ変えると、OFF に揃って保存できる（R2b-2d、オーナーレビュー P2）', async () => {
+		const REGRESSION_TAG_NAME = 'e2e-form-writable-area';
+		await page.goto('/tags');
+		await groupNodeByName(page, GROUP_NAME).click();
+		await page.getByRole('button', { name: '新規登録' }).click();
+		const drawer = page.getByRole('complementary', { name: '新規作成' });
+		await expect(drawer).toBeVisible();
+
+		await drawer.getByLabel('名前').fill(REGRESSION_TAG_NAME);
+		const addressInput = drawer.getByLabel('アドレス');
+		await addressInput.fill('40050');
+
+		// 「書き込み安全設定」は既定で閉じている（`detailOpen.write`）。
+		await drawer.getByText('書き込み安全設定').click();
+		const writable = drawer.locator('#tag-writable');
+		await expect(writable).toBeEnabled();
+		// 手動で ON（既定 ON が当たっていても check() は冪等）。
+		await writable.check();
+		await expect(writable).toBeChecked();
+
+		// 入力レジスタ（読み取り専用の領域）へ変える。解析の API の結果が届くと
+		// チェックボックスは無効になり、保持値・送信値も false に揃う。
+		await addressInput.fill('30050');
+		await expect(writable).toBeDisabled();
+		await expect(writable).not.toBeChecked();
+
+		await drawer.getByRole('button', { name: '登録して閉じる' }).click();
+		await expect(page.getByText('作成しました')).toBeVisible();
+		await expect(drawer).toBeHidden();
+
+		const token = await fetchAuthToken(page.request);
+		const tagsRes = await page.request.get('/api/tags', {
+			headers: { ...CSRF_HEADERS, Authorization: `Bearer ${token}` }
+		});
+		expect(tagsRes.ok()).toBe(true);
+		const tags = (await tagsRes.json()) as { name: string; writable: boolean }[];
+		const saved = tags.filter((t) => t.name === REGRESSION_TAG_NAME);
+		expect(saved).toHaveLength(1);
+		expect(saved[0].writable).toBe(false);
+	});
+
 	test('3. edit Drawer: 変更後 Enter で送信され、タグが更新される', async () => {
 		await page.goto('/tags');
 		// #379 CI 対応: BantoGrid は行を仮想化しており、スイート全体のタグ件数が

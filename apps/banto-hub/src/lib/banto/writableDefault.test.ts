@@ -8,7 +8,11 @@
  * （以前は「未配線の間は当ててよい」だった）。`true` だけが当てる。
  */
 import { describe, expect, it } from 'vitest';
-import { canDefaultWritable, writableDefaultBlockedReason } from './writableDefault';
+import {
+	canDefaultWritable,
+	writableAfterAreaVerdict,
+	writableDefaultBlockedReason
+} from './writableDefault';
 
 describe('canDefaultWritable', () => {
 	it('plc タグ + writableArea 未指定（判定不能）は false（既定 ON に倒さない）', () => {
@@ -62,5 +66,27 @@ describe('writableDefaultBlockedReason', () => {
 
 	it('plc タグ + writableArea=true は理由なし', () => {
 		expect(writableDefaultBlockedReason('plc', true)).toBeNull();
+	});
+});
+
+describe('writableAfterAreaVerdict', () => {
+	it('plc + writableArea=false（確定した断り）は writable を false に揃える', () => {
+		expect(writableAfterAreaVerdict('plc', false, true)).toBe(false);
+		expect(writableAfterAreaVerdict('plc', false, false)).toBe(false);
+	});
+
+	it('plc + writableArea=undefined（判定不能）は手動の値を変えない', () => {
+		expect(writableAfterAreaVerdict('plc', undefined, true)).toBe(true);
+		expect(writableAfterAreaVerdict('plc', undefined, false)).toBe(false);
+	});
+
+	it('plc + writableArea=true は値を変えない（true に戻さない）', () => {
+		expect(writableAfterAreaVerdict('plc', true, true)).toBe(true);
+		expect(writableAfterAreaVerdict('plc', true, false)).toBe(false);
+	});
+
+	it('plc 以外は writableArea に関わらず値を変えない', () => {
+		expect(writableAfterAreaVerdict('internal', false, true)).toBe(true);
+		expect(writableAfterAreaVerdict('computed', false, true)).toBe(true);
 	});
 });

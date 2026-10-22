@@ -104,3 +104,28 @@ export function writableDefaultBlockedReason(
 	}
 	return null;
 }
+
+/**
+ * R2b-2d（オーナーレビュー P2、2026-10-22）: 解析の API が**読み取り専用の領域と
+ * 確定した**とき、保持している `writable` の値を `false` に揃える。
+ *
+ * 既定 ON の適用（{@link canDefaultWritable}）は利用者が手動で触っていない間だけ
+ * 働く。触った後に読み取り専用のアドレス（例: Modbus `40001` → `30001`）へ変えると、
+ * チェックボックスは「無効・未チェック」に見えるのに保持値 `true` が残り、送信で
+ * サーバーに断られる。表示・保持値・送信値を一致させるため、この関数が**確定した
+ * 断り**のときだけ `false` を返す。
+ *
+ * - `tagKind === 'plc'` かつ `writableArea === false` のときだけ `false`。
+ * - `undefined`（判定不能: 入力途中・解析失敗・通信失敗）は**読み取り専用と見なさない**。
+ *   利用者の手動の値をそのまま返す。
+ * - 返すのは `false` か元の値だけ（`true` に戻すことはしない）ので、呼び出し側の
+ *   `$effect` が自分の書き込みで再実行されてもループしない。
+ */
+export function writableAfterAreaVerdict(
+	tagKind: TagKind,
+	writableArea: boolean | undefined,
+	writable: boolean
+): boolean {
+	if (tagKind === 'plc' && writableArea === false) return false;
+	return writable;
+}
