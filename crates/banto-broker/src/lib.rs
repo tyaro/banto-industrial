@@ -379,10 +379,14 @@ impl std::fmt::Debug for BrokerOptions {
 
 /// A protocol-independent identity of the settings a session was dialed with
 /// (R2b-3a-2, design §4.2): a hash of the `Settings` without the driver's
-/// secret keys, in key order. It replaced `BrokerHandle::slmp_cpu` (#605):
-/// banto-hub's connection test asks "may I read this form through the
-/// running session?" and its simulation registry asks "did the dial target
-/// change?" by comparing fingerprints, whatever the protocol.
+/// secret keys, in key order, plus - for each secret key the connection holds
+/// a reference for - that **reference** (`{"$secret": "<ref>"}`'s id, never
+/// the value; a new secret is sealed under a new reference, so changing a
+/// password changes the fingerprint and the session is re-dialed). It
+/// replaced `BrokerHandle::slmp_cpu` (#605): banto-hub's connection test asks
+/// "may I read this form through the running session?" and its simulation
+/// registry asks "did the dial target change?" by comparing fingerprints,
+/// whatever the protocol.
 ///
 /// Only meaningful within one process (it uses the standard library's
 /// hasher); it is never stored.
@@ -390,17 +394,46 @@ impl std::fmt::Debug for BrokerOptions {
 pub struct SettingsFingerprint(u64);
 
 impl SettingsFingerprint {
-    /// The fingerprint of `settings`, leaving out every key in `secret_keys`
-    /// (the value of a secret never reaches the hash).
+    /// The fingerprint of `settings` alone, leaving out every key in
+    /// `secret_keys` (the value of a secret never reaches the hash) - for
+    /// settings that belong to no stored connection (no secret references).
     pub fn of(settings: &Settings, secret_keys: &[String]) -> Self {
+        Self::of_connection(None, settings, secret_keys)
+    }
+
+    /// The fingerprint a session of `conn` dialed with `settings` carries:
+    /// [`Self::of`] plus the secret **references** `conn.settings` holds for
+    /// `secret_keys` (`settings_to_api` drops them, so they come from the
+    /// connection; a malformed one counts as a marker of its own). `None`
+    /// (no stored connection) is the same as a connection without
+    /// references. The opened values are never part of it.
+    pub fn of_connection(
+        conn: Option<&PlcConnection>,
+        settings: &Settings,
+        secret_keys: &[String],
+    ) -> Self {
         let mut pairs: Vec<(&str, &str)> = settings
             .iter()
             .filter(|s| !secret_keys.contains(&s.key))
             .map(|s| (s.key.as_str(), s.value.as_str()))
             .collect();
         pairs.sort_unstable();
+        let mut refs: Vec<(&str, &str)> = Vec::new();
+        if let Some(conn) = conn {
+            for key in secret_keys {
+                match conn.secret_ref_lookup(key) {
+                    banto_tags::SecretRefLookup::Absent => {}
+                    banto_tags::SecretRefLookup::Ref(r#ref) => refs.push((key.as_str(), r#ref)),
+                    banto_tags::SecretRefLookup::Malformed => {
+                        refs.push((key.as_str(), "\u{0}malformed"))
+                    }
+                }
+            }
+        }
+        refs.sort_unstable();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         pairs.hash(&mut hasher);
+        refs.hash(&mut hasher);
         SettingsFingerprint(hasher.finish())
     }
 }
@@ -835,7 +868,7 @@ impl SessionDirectory {
         }
 
         let secret_keys = driver.secret_keys();
-        let fingerprint = SettingsFingerprint::of(&settings, &secret_keys);
+        let fingerprint = SettingsFingerprint::of_connection(Some(conn), &settings, &secret_keys);
         let connector = session_connector(
             conn.clone(),
             driver,
@@ -1804,12 +1837,105 @@ mod tests {
         assert_eq!(validated.get("password"), None, "validation never sees it");
         assert_eq!(
             handle.settings_fingerprint(),
-            Some(SettingsFingerprint::of(
+            Some(SettingsFingerprint::of_connection(
+                Some(&secret_conn()),
                 &validated,
                 &["password".to_string()]
             ))
         );
         supervisor.shutdown().await;
+    }
+
+    const OTHER_REF: &str = "fedcba9876543210fedcba9876543210";
+
+    fn conn_with_password_ref(r#ref: &str) -> PlcConnection {
+        conn_with(
+            1,
+            ID,
+            json!({ "host": "127.0.0.1", "port": 5000, "password": { "$secret": r#ref } }),
+        )
+    }
+
+    /// The fingerprint carries the secret's **reference** (a new secret is
+    /// sealed under a new reference): another reference is another
+    /// fingerprint, the same reference the same one, and a key the driver
+    /// does not list as secret does not count.
+    #[test]
+    fn the_fingerprint_carries_the_secret_reference_not_the_value() {
+        let keys = vec!["password".to_string()];
+        let a = conn_with_password_ref(REF);
+        let b = conn_with_password_ref(OTHER_REF);
+        let settings = banto_tags::settings_to_api(&a.settings);
+        assert_eq!(settings, banto_tags::settings_to_api(&b.settings));
+        let fa = SettingsFingerprint::of_connection(Some(&a), &settings, &keys);
+        let fb = SettingsFingerprint::of_connection(Some(&b), &settings, &keys);
+        assert_ne!(fa, fb, "another reference, another fingerprint");
+        assert_eq!(
+            fa,
+            SettingsFingerprint::of_connection(
+                Some(&conn_with_password_ref(REF)),
+                &settings,
+                &keys
+            )
+        );
+        assert_ne!(
+            fa,
+            SettingsFingerprint::of(&settings, &keys),
+            "the reference counts"
+        );
+        // Not a secret key of the driver: the reference is not looked at.
+        assert_eq!(
+            SettingsFingerprint::of_connection(Some(&a), &settings, &[]),
+            SettingsFingerprint::of_connection(Some(&b), &settings, &[])
+        );
+    }
+
+    /// End to end: a session dialed for reference A and one for reference B
+    /// carry different fingerprints (so the Hub re-dials when the secret is
+    /// replaced), while the opened value - whatever the opener answers - never
+    /// changes the fingerprint.
+    #[tokio::test]
+    async fn a_new_secret_reference_is_a_new_session_identity_the_value_is_not() {
+        struct Fixed(&'static str);
+        impl SecretOpener for Fixed {
+            fn open(
+                &self,
+                _conn: &PlcConnection,
+                _key: &str,
+            ) -> banto_driver_api::BoxFuture<'static, Result<Option<Zeroizing<String>>, String>>
+            {
+                let value = self.0;
+                Box::pin(async move { Ok(Some(Zeroizing::new(value.to_string()))) })
+            }
+        }
+        let mut seen = Vec::new();
+        for (r#ref, value) in [(REF, "pw-1"), (REF, "pw-2"), (OTHER_REF, "pw-1")] {
+            let driver = FakeDriver::new(ID, FakePlc::new()).with_secret_keys(&["password"]);
+            let opened = driver.seen();
+            let supervisor = BrokerSupervisor::spawn_with(
+                &[conn_with_password_ref(r#ref)],
+                fake::registry_of(driver),
+                BrokerOptions {
+                    secrets: Arc::new(Fixed(value)),
+                    ..BrokerOptions::default()
+                },
+            )
+            .unwrap();
+            let handle = supervisor.handle(1).unwrap();
+            wait_connected(&handle).await;
+            assert_eq!(
+                opened.lock().unwrap()[0].settings.get("password"),
+                Some(value),
+                "the dial got the opened value"
+            );
+            seen.push(handle.settings_fingerprint().unwrap());
+            supervisor.shutdown().await;
+        }
+        assert_eq!(
+            seen[0], seen[1],
+            "the opened value is not in the fingerprint"
+        );
+        assert_ne!(seen[0], seen[2], "a new reference is a new identity");
     }
 
     /// Without an opener the dial fails (never connects without the secret):

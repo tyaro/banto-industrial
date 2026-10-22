@@ -618,24 +618,25 @@ impl HubSessions {
 
     /// The fingerprint a session dialed with `settings` for a `protocol`
     /// connection carries ([`BrokerHandle::settings_fingerprint`]): the
-    /// settings without the driver's secret keys. `None` for a protocol the
+    /// settings without the driver's secret keys, plus the secret references
+    /// `saved` (the stored connection, if any) holds for them
+    /// ([`SettingsFingerprint::of_connection`]). `None` for a protocol the
     /// broker does not manage. The connection test compares it with a live
     /// session's to decide whether the session's reading answers the form.
     pub fn dial_fingerprint(
         &self,
         protocol: &str,
+        saved: Option<&PlcConnection>,
         settings: &Settings,
     ) -> Option<SettingsFingerprint> {
         if !self.is_broker_managed(protocol) {
             return None;
         }
-        let secret_keys = self
-            .drivers
-            .registry
-            .get(protocol)
-            .map(|entry| entry.base().secret_keys())
-            .unwrap_or_default();
-        Some(SettingsFingerprint::of(settings, &secret_keys))
+        Some(SettingsFingerprint::of_connection(
+            saved,
+            settings,
+            &secret_keys_of(&self.drivers.registry, protocol),
+        ))
     }
 
     /// The drivers this directory was built with (R1-3b).
@@ -785,6 +786,14 @@ impl HubSessions {
 /// へ改名した。以降のこの struct の doc comment は「SLMP 専用」ではなく
 /// 実際の挙動（任意の broker 管理対象プロトコル）を説明する。
 ///
+/// `protocol` のドライバの秘密のキー（無ければ空）。
+fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
+    registry
+        .get(protocol)
+        .map(|entry| entry.base().secret_keys())
+        .unwrap_or_default()
+}
+
 /// [`HubSessions`] と対の
 /// ライフサイクル(`bin/banto_hub`が構築し、`CollectorManager`の外で
 /// `rebuild`を跨いで生存させ、プロセス終了時に一度だけ [`Self::shutdown`])
@@ -877,7 +886,16 @@ impl BrokerSimRegistry {
     /// 無関係な編集（同じ接続の別グループへのタグ追加など）では設定が変わらない
     /// ので `changed` は `false` のまま（`apps/banto-hub/host/tests/integration.rs`・
     /// `t9_simulation.rs`）。
-    pub async fn resolve(&self, conn: &PlcConnection) -> (Settings, bool) {
+    ///
+    /// 指紋は broker のセッションと同じ規則（[`SettingsFingerprint::of_connection`]:
+    /// 秘密値の参照を含め、値は含めない）で、`registry` のドライバの秘密のキーで作る -
+    /// 秘密値を差し替える（新しい参照で封印し直す）と `changed` になり、セッションが
+    /// 張り直される。
+    pub async fn resolve(
+        &self,
+        conn: &PlcConnection,
+        registry: &DriverRegistry,
+    ) -> (Settings, bool) {
         let mut settings = banto_tags::settings_to_api(&conn.settings);
         let mut simulators = self.simulators.lock().await;
         if conn.simulation {
@@ -905,9 +923,13 @@ impl BrokerSimRegistry {
         }
         drop(simulators);
 
-        // `settings_to_api` never carries a secret's value (the reference is
-        // left out), so there is nothing to leave out of the fingerprint here.
-        let fingerprint = SettingsFingerprint::of(&settings, &[]);
+        // `settings_to_api` never carries a secret's value; the references
+        // come from the connection (the same rule as the broker's handle).
+        let fingerprint = SettingsFingerprint::of_connection(
+            Some(conn),
+            &settings,
+            &secret_keys_of(registry, &conn.protocol),
+        );
         let mut last_target = self.last_target.lock().await;
         let changed = last_target.get(&conn.id) != Some(&fingerprint);
         last_target.insert(conn.id, fingerprint);

@@ -2049,7 +2049,10 @@ impl CollectorManager {
             // R2b-3a-2: `resolve` returns the settings to dial with (the
             // connection's own, or with `host`/`port` replaced by the
             // simulator's) and whether they changed since the last sync.
-            let (dial_settings, changed) = self.sim_registry.resolve(conn).await;
+            let (dial_settings, changed) = self
+                .sim_registry
+                .resolve(conn, &self.sessions.drivers().registry)
+                .await;
             if changed {
                 self.sessions.remove(conn.id);
             }

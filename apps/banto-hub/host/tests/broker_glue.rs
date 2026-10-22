@@ -54,9 +54,10 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
         common::hub_drivers(),
     );
     let registry = BrokerSimRegistry::new();
+    let drivers = sessions.drivers().registry.clone();
     let conn = slmp_conn(1, sim.addr.port(), "R");
 
-    let (settings, changed) = registry.resolve(&conn).await;
+    let (settings, changed) = registry.resolve(&conn, &drivers).await;
     assert!(changed);
     sessions
         .ensure_connection_with_settings(&conn, settings)
@@ -64,11 +65,11 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
     read_until_connected(&sessions, conn.id).await;
     assert_eq!(sim.last_subcommand(), Some(0x0002), "既定 R のワード読み");
 
-    let (_, changed) = registry.resolve(&conn).await;
+    let (_, changed) = registry.resolve(&conn, &drivers).await;
     assert!(!changed, "同じ CPU ではセッションを捨てない");
 
     let conn = slmp_conn(1, sim.addr.port(), "Q");
-    let (settings, changed) = registry.resolve(&conn).await;
+    let (settings, changed) = registry.resolve(&conn, &drivers).await;
     assert!(changed, "CPU だけの変更でも changed");
     assert!(sessions.remove(conn.id));
     sessions
@@ -86,10 +87,10 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
         "modbus-tcp",
         serde_json::json!({ "host": "127.0.0.1", "port": 502, "unit_id": 1 }),
     );
-    let (_, changed) = registry.resolve(&modbus).await;
+    let (_, changed) = registry.resolve(&modbus, &drivers).await;
     assert!(changed);
     modbus.cpu_type = "Q".to_string();
-    let (_, changed) = registry.resolve(&modbus).await;
+    let (_, changed) = registry.resolve(&modbus, &drivers).await;
     assert!(!changed, "Modbus は CPU 列では再接続しない");
 
     sessions.shutdown().await;

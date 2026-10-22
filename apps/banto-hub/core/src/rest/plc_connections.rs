@@ -895,11 +895,11 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 /// 送らない欄(`wordOrder`、省略した `cpuType`)は、保存済みの接続(`connectionId`
 /// があり、同じプロトコル)の値を使う - 「省略は保存済みのまま」(#605 の CPU の
 /// 照合の規則を全部の欄に広げたもの)。保存済みが無ければその欄は置かない
-/// (ドライバの既定)。
+/// (ドライバの既定)。保存済みの接続も返す(指紋に入る秘密値の参照の出どころ)。
 async fn requested_settings(
     manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
-) -> Settings {
+) -> (Settings, Option<PlcConnection>) {
     let saved = match payload.connection_id {
         Some(id) => manager
             .plc_connections()
@@ -940,7 +940,7 @@ async fn requested_settings(
     {
         map.remove(keys::WORD_ORDER);
     }
-    banto_tags::settings_to_api(&map)
+    (banto_tags::settings_to_api(&map), saved)
 }
 
 /// ドライバの `validate_config` が断った設定を、ダイヤルせずに返す。接続先の
@@ -1029,7 +1029,9 @@ async fn test_connection(
             )),
         );
     };
-    let settings = requested_settings(manager, payload).await;
+    // 保存済みの接続（同じプロトコル）は、指紋に入る秘密値の参照の出どころ
+    // （フォームは秘密値を送らない。参照は保存済みのまま、と読む）。
+    let (settings, saved) = requested_settings(manager, payload).await;
     let probe = match probe_spec(driver.as_ref()) {
         Ok(probe) => probe,
         Err(err) => return (false, Some(err)),
@@ -1037,9 +1039,10 @@ async fn test_connection(
 
     if let Some(connection_id) = payload.connection_id {
         if let Some(handle) = manager.sessions().handle_for(connection_id) {
-            let wanted = manager
-                .sessions()
-                .dial_fingerprint(&payload.protocol, &settings);
+            let wanted =
+                manager
+                    .sessions()
+                    .dial_fingerprint(&payload.protocol, saved.as_ref(), &settings);
             if wanted.is_none() || handle.settings_fingerprint() != wanted {
                 return (
                     false,
