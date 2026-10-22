@@ -24,6 +24,14 @@
 //!   (#533, 2026-10-08 owner decision: しきい値は使う側（記録計・SCADA）の
 //!   設定) - migration 0018 dropped the `threshold_*` columns
 //!
+//! - The tag `address` (R2b-2b, docs/banto-hub-driver-address-design.md §3): a service
+//!   built with a driver registry ([`TagService::with_registry`],
+//!   [`CollectionGroupService::with_registry`]) validates **every** tag's address with its
+//!   connection's driver and stores the driver's canonical form ([`normalize_tag_address`]
+//!   is the one pure function behind it), and re-parses a connection's / group's tags when
+//!   a protocol change or a move changes their driver. The services built with `new`
+//!   (ChronoGazer, this crate's tests) keep the old rules: the address is any non-empty
+//!   text, saved as typed.
 //! - [`settings_json`] (R2b-1c, docs/banto-hub-connection-settings-design.md
 //!   §3.5・§4.2・§4.3): a connection's JSON `settings` -> the driver API's
 //!   `Settings` ([`settings_to_api`]), the flat-columns <-> `settings` adapter
@@ -92,9 +100,10 @@ pub use push::{
 pub use scaling::{scale_raw, unscale, Scaling};
 pub use settings_json::{settings_to_api, validate_settings_with_registry};
 pub use tag::{
-    tag_kind, validate_hub_tag_address, BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError,
-    BatchTagOutcome, BatchTagUpdateError, BatchTagUpdateOutcome, GroupTagCount, Tag, TagInput,
-    TagService, TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
+    normalize_tag_address, tag_kind, validate_hub_tag_address, BatchTagDeleteError,
+    BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome, BatchTagUpdateError,
+    BatchTagUpdateOutcome, GroupTagCount, NormalizedAddress, Tag, TagInput, TagService,
+    TagUpdateError, ALLOWED_DATA_TYPES, ALLOWED_STRING_ENCODINGS, ALLOWED_TAG_KINDS,
     COMPUTED_TAG_KIND, DB_TAG_KIND, INTERNAL_TAG_KIND, MAX_DB_COLUMN_NAME_LEN,
     MAX_HUB_EXTERNAL_NAME_LEN, MODBUS_ONLY_DATA_TYPES, NUMERIC_DATA_TYPES, PLC_TAG_KIND,
     STRING_DATA_TYPE,

@@ -27,3 +27,9 @@ banto-plc = { path = "../banto-plc" }
 # examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール）。
 banto-plc-write = { path = "../banto-plc-write" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# tests/tag_canonical.rs（R2b-2b）: 本物の Modbus / SLMP のドライバで `TagService::with_registry` が
+# 正規形を保存することの確認。banto-tags はドライバ crate に依存されている側なので、
+# ドライバを使うテストはここ（両方に依存できる crate）に置く。
+banto-core = { workspace = true }
+banto-storage = { workspace = true, features = ["sqlite"] }
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }

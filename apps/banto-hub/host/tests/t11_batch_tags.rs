@@ -214,9 +214,11 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
-        CollectionGroupService::new(pool.clone()),
-        banto_tags::TagService::new(pool.clone()),
+        // R2b-2b: このハーネスの REST はレジストリつき（本番の `runtime.rs` と同じ。実物の
+        // Modbus / SLMP のドライバ）。一括の作成・更新は正規形を保存する。
+        manager.plc_connections(),
+        manager.collection_groups(),
+        manager.tags(),
         api_keys,
         manager.clone(),
         auth,
@@ -1513,4 +1515,154 @@ async fn tag_routes_reject_thresholds_with_values() {
     let (_, reread) = get_json(&app.router, &format!("/api/tags/{id}"), &app.token).await;
     assert_eq!(reread["name"], json!("th1"));
     assert_eq!(reread["revision"], json!(revision));
+}
+
+// ---------------------------------------------------------------------------
+// R2b-2b: 保存は接続のドライバで解析した正規形（アドレス設計 §3）
+// ---------------------------------------------------------------------------
+
+/// 一括作成・一括更新・単発の作成・更新はどれも Modbus の `40001` を `400001` で保存して返す。
+/// 文法違反（SLMP のアドレス）の行は行ごとの `address` のエラーで、全体が書かれない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_saves_the_canonical_address_on_every_write_path() {
+    let app = test_app("canonical").await;
+    let group_id = seed_group(&app, "canon").await;
+
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch",
+        &app.token,
+        json!({
+            "tags": [
+                tag_payload("c1", group_id, " 40001 "),
+                tag_payload("c2", group_id, "40002"),
+            ],
+            "dryRun": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["tags"][0]["address"], json!("400001"), "{body:?}");
+    assert_eq!(body["tags"][1]["address"], json!("400002"), "{body:?}");
+
+    // 行 1 が SLMP のアドレス: 行ごとのエラーで、行 0 も書かれない。
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch",
+        &app.token,
+        json!({
+            "tags": [
+                tag_payload("c3", group_id, "40003"),
+                tag_payload("c4", group_id, "D100"),
+            ],
+            "dryRun": false,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(false), "{body:?}");
+    assert_eq!(body["errors"].as_array().unwrap().len(), 1, "{body:?}");
+    assert_eq!(body["errors"][0]["index"], json!(1));
+    assert_eq!(
+        body["errors"][0]["fieldErrors"][0]["field"],
+        json!("address")
+    );
+    assert_eq!(tag_count(&app).await, 2);
+
+    // 単発の作成・更新。
+    let (status, created) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        tag_payload("c5", group_id, "40005"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    assert_eq!(created["address"], json!("400005"));
+    let id = created["id"].as_i64().unwrap();
+    let (status, updated) = write_json(
+        &app.router,
+        "PUT",
+        &format!("/api/tags/{id}"),
+        &app.token,
+        tag_payload("c5", group_id, "40006"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{updated:?}");
+    assert_eq!(updated["address"], json!("400006"));
+
+    // 一括更新。
+    let (status, body) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags/batch-update",
+        &app.token,
+        json!({
+            "dryRun": false,
+            "tags": [tag_batch_update_payload(id, "c5", group_id, "40007", true, None)],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], json!(true), "{body:?}");
+    assert_eq!(body["tags"][0]["address"], json!("400007"), "{body:?}");
+}
+
+/// 接続のプロトコルを、配下のタグが読めない別のドライバに変える更新は `protocol` の 422 で断る。
+/// 接続のプロトコルもタグの行も変わらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_refuses_a_protocol_change_that_leaves_a_tag_unreadable() {
+    let app = test_app("protocol-change").await;
+    let group_id = seed_group(&app, "pc").await;
+    let (status, created) = write_json(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.token,
+        tag_payload("pc1", group_id, "40001"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let connection_id: i64 =
+        sqlx::query_scalar("SELECT plc_connection_id FROM collection_groups WHERE id = ?")
+            .bind(group_id)
+            .fetch_one(&app.pool)
+            .await
+            .unwrap();
+    let (_, connection) = get_json(
+        &app.router,
+        &format!("/api/plc-connections/{connection_id}"),
+        &app.token,
+    )
+    .await;
+    let mut body = connection.clone();
+    body["protocol"] = json!("slmp");
+    let (status, refused) = write_json(
+        &app.router,
+        "PUT",
+        &format!("/api/plc-connections/{connection_id}"),
+        &app.token,
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused:?}");
+    assert!(refused.to_string().contains("protocol"), "{refused:?}");
+    let (_, reread) = get_json(
+        &app.router,
+        &format!("/api/plc-connections/{connection_id}"),
+        &app.token,
+    )
+    .await;
+    assert_eq!(reread["protocol"], json!("modbus-tcp"));
+    let (_, tag) = get_json(
+        &app.router,
+        &format!("/api/tags/{}", created["id"]),
+        &app.token,
+    )
+    .await;
+    assert_eq!(tag["address"], json!("400001"));
+    assert_eq!(tag["revision"], created["revision"]);
 }

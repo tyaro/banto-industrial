@@ -203,7 +203,7 @@ use banto_collect::{
     ExternalSource, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
-use banto_tags::{PlcConnection, PlcConnectionService, Tag};
+use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -1296,6 +1296,21 @@ impl CollectorManager {
     /// `tests/registry_entrances.rs` が grep で固定する。
     pub fn plc_connections(&self) -> PlcConnectionService {
         PlcConnectionService::with_registry(self.pool.clone(), self.registry().clone())
+    }
+
+    /// R2b-2b（docs/banto-hub-driver-address-design.md §3.1）: Hub の入口が使う収集グループの
+    /// サービス。必ずレジストリつき（グループを別のドライバの接続へ移すと配下のタグを
+    /// 新しいドライバで解析し直す）。旧規則の `CollectionGroupService::new` を Hub の
+    /// 非テストのコードで使わないことは `tests/registry_entrances.rs` が grep で固定する。
+    pub fn collection_groups(&self) -> CollectionGroupService {
+        CollectionGroupService::with_registry(self.pool.clone(), self.registry().clone())
+    }
+
+    /// R2b-2b（設計 §3.1）: Hub の入口が使うタグのサービス。必ずレジストリつき（保存は
+    /// ドライバで解析した正規形、読むだけの `get` も同じ口を使う）。`new` を使わないことは
+    /// [`Self::collection_groups`] と同じ grep が固定する。
+    pub fn tags(&self) -> TagService {
+        TagService::with_registry(self.pool.clone(), self.registry().clone())
     }
 
     /// The shared clock (design: 値のタイムスタンプはサンプル取得時刻 - `rest.rs`

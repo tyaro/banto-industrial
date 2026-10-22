@@ -304,9 +304,9 @@ pub(crate) fn mcp_router(
     // `Arc`-backed なので REST 側のサービスと同じ DB を指す別ハンドルに
     // なるだけで、状態は分裂しない。
     let plc_connections = manager.plc_connections();
-    let collection_groups = CollectionGroupService::new(manager.pool());
+    let collection_groups = manager.collection_groups();
     // T21 S1-d: REST の `tag_registry_router`と同じ生成方法。
-    let tags = TagService::new(manager.pool());
+    let tags = manager.tags();
     let pending_changes = PendingChangesService::new(manager.pool());
     // T21 S2-b: REST の各設定ハンドラ（`crate::rest::mqtt_settings_get`等）
     // と同じ生成方法（`SettingsService::new(manager.pool())`）。

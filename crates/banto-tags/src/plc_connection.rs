@@ -280,6 +280,7 @@ use crate::settings_json::validate_settings_with_registry;
 use crate::support::{
     map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
 };
+use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
 /// The **legacy** protocol rule list (R2b-1f, 2026-10-22). It is no longer the
 /// Hub's source of truth: since migration `0025` the SQL `CHECK` on
@@ -1827,6 +1828,35 @@ impl PlcConnectionService {
                 return Err(err);
             }
         }
+        // R2b-2b (docs/banto-hub-driver-address-design.md §3.3, Q2): with a registry a
+        // protocol change hands every tag of this connection (disabled and `string`
+        // ones too) to the new driver in this same transaction. One that does not pass
+        // refuses the change - nothing written - and the others are rewritten to the new
+        // driver's canonical form after the UPDATE below.
+        let mut address_rewrites = Vec::new();
+        if let (Some(registry), Some(old_protocol)) = (&self.registry, existing_protocol) {
+            if old_protocol != input.protocol {
+                let new_protocol = &input.protocol;
+                address_rewrites = reparse_tags(
+                    &mut *connection,
+                    registry,
+                    ReparseScope::Connection(id),
+                    input.name.trim(),
+                    new_protocol,
+                    (
+                        "protocol",
+                        &format!("プロトコルを {new_protocol} に変更すると、この接続の下の"),
+                        &format!(
+                            "これらのタグが残っている間は、この接続のままプロトコルを変えることは\
+                             できません。{new_protocol} の PLC接続と収集グループを別に作り、各タグの\
+                             「収集グループ」と「デバイスアドレス」を同時に変えて移してください\
+                             （不要なタグは削除してもかまいません）"
+                        ),
+                    ),
+                )
+                .await?;
+            }
+        }
         let existing_settings: Map<String, Value> = match &existing {
             Some((_, text)) => serde_json::from_str(text).map_err(|err| {
                 BantoError::Storage(format!(
@@ -1912,6 +1942,7 @@ impl PlcConnectionService {
         insert_secret_rows(&mut *connection, id, &new_rows)
             .await
             .map_err(banto_storage::storage_error)?;
+        apply_address_rewrites(&mut *connection, &address_rewrites).await?;
         Ok(updated)
     }
 

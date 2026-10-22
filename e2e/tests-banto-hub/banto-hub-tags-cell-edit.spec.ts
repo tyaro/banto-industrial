@@ -138,7 +138,9 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 		await expect(page.getByTestId('tag-grid-edit-mode-toggle')).toHaveText('表編集を終了');
 
 		// 単一クリック（アドレス列 - 編集不可列）では Drawer が開かない。
-		await page.getByRole('gridcell', { name: '40001', exact: true }).click();
+		// 保存時にドライバの正規形（Modbus は常に 6 桁）へ直るので、`40001` で
+		// 作ったタグのセルは `400001` と表示される（R2b-2b）。
+		await page.getByRole('gridcell', { name: '400001', exact: true }).click();
 		// #375: 編集・連続登録は非モーダルの右ペイン（`<aside aria-label>` =
 		// role `complementary`）になったため `role="dialog"` では取れない。
 		// アクセシブル名（`… を編集`/`連続登録`）は Drawer 時代と同じ。

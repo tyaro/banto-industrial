@@ -20,14 +20,29 @@
 //! その予告どおり解禁し、代わりに [`validate_query_sql`] が「postgres 配下
 //! では `query_sql` 必須・それ以外では指定不可」という2方向のルールを
 //! 強制する。
+//!
+//! ## レジストリつきの移動（R2b-2b、docs/banto-hub-driver-address-design.md §3.3）
+//!
+//! [`CollectionGroupService::with_registry`]（banto-hub）のサービスは、グループの
+//! `plc_connection_id` を**別のドライバ（`protocol`）の接続**へ変えるとき、同じ
+//! トランザクションの中で配下の全タグ（無効・`string` を含む）を新しいドライバで
+//! 解析し直す（[`crate::tag::normalize_tag_address`]）。1 件でも通らなければ最大 5 件の
+//! 一覧つきで断り（`plcConnectionId`）、通れば `address` を新しい正規形に書き直す。
+//! 同じドライバの接続どうしの移動は正規形が変わらないので解析し直さない
+//! （既存の `hub` / `push` の移動の規則が先に走る）。[`CollectionGroupService::new`] は
+//! 旧規則のまま（ChronoGazer）で、アドレスに触れない。
+
+use std::sync::Arc;
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
+use banto_driver_api::DriverRegistry;
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL, PUSH_PROTOCOL};
 use crate::support::{map_write_error, max_length_message, required_message};
+use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
 /// §3.1: "標準 1s / 選択肢 100ms・200ms・500ms・2s・5s・10s・1min") - mirrors
@@ -341,11 +356,32 @@ const NAME_ALREADY_USED_IN_CONNECTION: &str = "この接続内では既に使用
 #[derive(Clone)]
 pub struct CollectionGroupService {
     pool: SqlitePool,
+    /// [`Self::with_registry`]'s registry; `None` = the old rules (no re-parse on a move).
+    registry: Option<Arc<DriverRegistry>>,
 }
 
 impl CollectionGroupService {
+    /// The old rules (no driver registry): ChronoGazer and `banto-tags`' tests.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            registry: None,
+        }
+    }
+
+    /// The registry-authoritative service (banto-hub, R2b-2b): a move to a connection of
+    /// another driver re-parses the group's tags (module doc). Same shape as
+    /// [`crate::PlcConnectionService::with_registry`] and [`crate::TagService::with_registry`].
+    pub fn with_registry(pool: SqlitePool, registry: Arc<DriverRegistry>) -> Self {
+        Self {
+            pool,
+            registry: Some(registry),
+        }
+    }
+
+    /// The registry passed to [`Self::with_registry`]; `None` for [`Self::new`].
+    pub fn registry(&self) -> Option<&Arc<DriverRegistry>> {
+        self.registry.as_ref()
     }
 
     pub async fn list(
@@ -474,6 +510,19 @@ impl CollectionGroupService {
         id: i64,
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
+        if self.registry.is_some() {
+            // R2b-2b: a move can re-parse and rewrite the group's tags, which reads
+            // before it writes - one `BEGIN IMMEDIATE` transaction around
+            // [`Self::update_tx`] (checklist §5; same as `TagService::update_checked`).
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let updated = self.update_tx(&mut tx, id, input).await?;
+            tx.commit().await.map_err(banto_storage::storage_error)?;
+            return Ok(updated);
+        }
         validate_collection_group_input(&input)?;
         let existing_protocol: Option<String> =
             sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
@@ -529,7 +578,9 @@ impl CollectionGroupService {
         })
     }
 
-    /// Transaction-compatible counterpart of [`Self::update`].
+    /// Transaction-compatible counterpart of [`Self::update`]. With a registry
+    /// (module doc), a move to a connection of another driver re-parses the
+    /// group's tags first and rewrites their `address` after the `UPDATE`.
     pub async fn update_tx(
         &self,
         connection: &mut SqliteConnection,
@@ -567,9 +618,46 @@ impl CollectionGroupService {
         ) {
             return Err(err);
         }
+        // R2b-2b (Q2): a move to a connection of another driver hands every tag of the
+        // group to the new driver; one that does not pass refuses the move.
+        let mut address_rewrites = Vec::new();
+        if let (Some(registry), Some((old_protocol, _, old_connection_id)), Some(new_protocol)) = (
+            &self.registry,
+            current.as_ref(),
+            existing_protocol.as_deref(),
+        ) {
+            if *old_connection_id != input.plc_connection_id && old_protocol != new_protocol {
+                let new_connection_name: String =
+                    sqlx::query_scalar("SELECT name FROM plc_connections WHERE id = ?")
+                        .bind(input.plc_connection_id)
+                        .fetch_one(&mut *connection)
+                        .await
+                        .map_err(banto_storage::storage_error)?;
+                address_rewrites = reparse_tags(
+                    &mut *connection,
+                    registry,
+                    ReparseScope::Group(id),
+                    &new_connection_name,
+                    new_protocol,
+                    (
+                        "plcConnectionId",
+                        &format!(
+                            "PLC接続を {new_connection_name}（{new_protocol}）に変更すると、このグループの"
+                        ),
+                        &format!(
+                            "これらのタグが残っている間は、このグループのまま接続を付け替えることは\
+                             できません。{new_connection_name} の下に収集グループを別に作り、各タグの\
+                             「収集グループ」と「デバイスアドレス」を同時に変えて移してください\
+                             （不要なタグは削除してもかまいません）"
+                        ),
+                    ),
+                )
+                .await?;
+            }
+        }
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
+        let updated = sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
             "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ?, query_sql = ? \
              WHERE id = ? RETURNING {COLUMNS}"
         )))
@@ -588,7 +676,9 @@ impl CollectionGroupService {
                 id: id.to_string(),
             },
             other => map_write_error(other, "name", NAME_ALREADY_USED_IN_CONNECTION, "plcConnectionId", FK_MESSAGE),
-        })
+        })?;
+        apply_address_rewrites(&mut *connection, &address_rewrites).await?;
+        Ok(updated)
     }
 
     /// Delete, refusing when any [`crate::tag::Tag`] still references this

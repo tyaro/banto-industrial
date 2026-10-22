@@ -2,10 +2,25 @@
 //! 名前 + PLC アドレス + データ型 + スケーリング + 単位 + 小数桁"). Every tag
 //! belongs to exactly one [`crate::collection_group::CollectionGroup`],
 //! which is what actually drives *when* it gets read from the PLC (§3.1).
+//!
+//! ## The `address` (R2b-2b)
+//!
+//! Without a driver registry ([`TagService::new`]) the format of a `plc` tag's
+//! address is deliberately left to I2 (`banto-plc`): this layer only checks it
+//! is non-empty and saves the typed text. With one ([`TagService::with_registry`],
+//! banto-hub) the save layer itself validates **every** tag's address - disabled
+//! and `string` tags included - with the driver of the tag's connection and
+//! stores the driver's `canonical` form (`40001` -> `400001`); see
+//! [`normalize_tag_address`] (the single pure function the save path and the parse
+//! API share) and docs/banto-hub-driver-address-design.md §3. A protocol change
+//! or a group move to another driver re-parses the affected tags in the same
+//! transaction (`reparse_tags`).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use banto_core::{BantoError, FieldError, ListParams, ListResult};
+use banto_driver_api::{DriverAddress, DriverRegistry};
 use banto_storage::ColumnMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
@@ -120,7 +135,8 @@ const MAX_STRING_LENGTH: i64 = 128;
 /// errors and does not parse the address (R2b-1 §4.2: "if (1) refuses, don't
 /// run the rest"). For non-string types the string columns are ignored.
 ///
-/// Not called from production code yet (R2b-2b wires it in).
+/// Called by [`normalize_tag_address`] (R2b-2b), so the save path and the
+/// parse API (R2b-2d) build the same `kind` the driver is asked about.
 pub fn tag_kind(
     data_type: &str,
     string_length: Option<i64>,
@@ -518,6 +534,30 @@ fn modbus_read_only_area(address: &str) -> Option<&'static str> {
     }
 }
 
+/// Which address rules a save runs (R2b-2b, docs/banto-hub-driver-address-design.md
+/// §3): the registry-less services ([`TagService::new`]) keep the old rules -
+/// the address is only checked for being non-empty and a `writable` tag on a
+/// Modbus read-only reference number is refused by [`modbus_read_only_area`]'s
+/// narrow copy of the grammar - while a service built with a registry
+/// ([`TagService::with_registry`]) hands the whole address verdict (grammar,
+/// canonical form, `writable_area`) to [`normalize_tag_address`] and so must
+/// not apply that copy a second time.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AddressRules {
+    Legacy,
+    Registry,
+}
+
+impl AddressRules {
+    fn of(registry: Option<&Arc<DriverRegistry>>) -> Self {
+        if registry.is_some() {
+            Self::Registry
+        } else {
+            Self::Legacy
+        }
+    }
+}
+
 /// Validate a [`TagInput`], collecting every violation (mirrors
 /// `items::validate_item_input`'s "report everything, not just the first"
 /// convention in the banto template repo). On success, returns the trimmed
@@ -563,7 +603,11 @@ fn modbus_read_only_area(address: &str) -> Option<&'static str> {
 /// create/update *inputs* are checked (see [`TagService::create`]/
 /// [`TagService::update`]) - there is no backfill migration scrubbing
 /// existing `tags` rows.
-fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
+///
+/// `rules` ([`AddressRules`]): with a registry the `writable`-on-read-only-area
+/// check above is skipped - [`normalize_tag_address`] decides it from the
+/// driver's `writable_area` instead.
+fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<ValidatedTag, BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
     let trimmed_name = input.name.trim();
@@ -579,9 +623,12 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
         });
     }
 
-    // Address format is protocol-dependent and deliberately left to I2 -
-    // only non-empty is enforced here (see this module's doc comment and
-    // migrations/0003_tags.sql). This applies to `plc` tags only (T6-2):
+    // Address format is protocol-dependent. Without a registry (the legacy
+    // service) it is deliberately left to I2 - only non-empty is enforced here
+    // (see this module's doc comment and migrations/0003_tags.sql). With a
+    // registry, [`normalize_tag_address`] (run right after this function by the
+    // save path) parses it with the connection's driver and stores the
+    // canonical form. This applies to `plc` tags only (T6-2):
     // `computed`/`internal` tags have no PLC address at all (design §4.2's
     // table - "address なし") and must instead leave it blank, checked in the
     // `tag_kind`-specific block below.
@@ -640,7 +687,9 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
             // writable との組み合わせを登録時に拒否する。エラーは
             // `writable` 側に付ける（`computed` タグの場合と同じ流儀 - 問題は
             // address ではなく、その address に対して writable を立てたこと）。
-            if input.writable {
+            // Legacy rules only: with a registry the driver's `writable_area`
+            // decides ([`normalize_tag_address`]).
+            if input.writable && rules == AddressRules::Legacy {
                 if let Some(area) = modbus_read_only_area(trimmed_address) {
                     errors.push(FieldError {
                         field: "writable".to_string(),
@@ -654,10 +703,7 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
         }
         COMPUTED_TAG_KIND => {
             if !trimmed_address.is_empty() {
-                errors.push(FieldError {
-                    field: "address".to_string(),
-                    message: "computed タグには address を設定できません".to_string(),
-                });
+                errors.push(forbidden_address_error(COMPUTED_TAG_KIND));
             }
             match input.expression.as_deref().map(str::trim) {
                 None | Some("") => errors.push(FieldError {
@@ -689,10 +735,7 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
         }
         INTERNAL_TAG_KIND => {
             if !trimmed_address.is_empty() {
-                errors.push(FieldError {
-                    field: "address".to_string(),
-                    message: "internal タグには address を設定できません".to_string(),
-                });
+                errors.push(forbidden_address_error(INTERNAL_TAG_KIND));
             }
             if input.expression.is_some() {
                 errors.push(FieldError {
@@ -714,24 +757,7 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
             // 63 文字上限）、大文字小文字はそのまま保存する - DB Source
             // エンジンは `describe` が返した列名とこの文字列を**そのまま**
             // 比較する（[`DB_TAG_KIND`] の doc comment 参照）。
-            if trimmed_address.is_empty() {
-                errors.push(FieldError {
-                    field: "address".to_string(),
-                    message: required_message(),
-                });
-            } else if trimmed_address.chars().count() > MAX_DB_COLUMN_NAME_LEN {
-                errors.push(FieldError {
-                    field: "address".to_string(),
-                    message: max_length_message(MAX_DB_COLUMN_NAME_LEN),
-                });
-            } else if !is_db_column_identifier(trimmed_address) {
-                errors.push(FieldError {
-                    field: "address".to_string(),
-                    message: "db タグの address は結果列名（英字またはアンダースコアで始まる \
-                              英数字/アンダースコア）で指定してください"
-                        .to_string(),
-                });
-            }
+            errors.extend(db_column_address_error(trimmed_address));
             if input.expression.is_some() {
                 errors.push(FieldError {
                     field: "expression".to_string(),
@@ -870,6 +896,38 @@ fn validate_tag_input(input: &TagInput) -> Result<ValidatedTag, BantoError> {
     })
 }
 
+/// The `address` error of a `computed` / `internal` tag that carries one
+/// (they have no PLC address - design §4.2's table). Shared by
+/// [`validate_tag_input`] and [`normalize_tag_address`] so the message lives
+/// once.
+fn forbidden_address_error(tag_kind: &str) -> FieldError {
+    FieldError {
+        field: "address".to_string(),
+        message: format!("{tag_kind} タグには address を設定できません"),
+    }
+}
+
+/// The `address` error of a `db` tag whose (trimmed) address is not a valid
+/// result column name, `None` when it is. Shared by [`validate_tag_input`] and
+/// [`normalize_tag_address`].
+fn db_column_address_error(trimmed_address: &str) -> Option<FieldError> {
+    let message = if trimmed_address.is_empty() {
+        required_message()
+    } else if trimmed_address.chars().count() > MAX_DB_COLUMN_NAME_LEN {
+        max_length_message(MAX_DB_COLUMN_NAME_LEN)
+    } else if !is_db_column_identifier(trimmed_address) {
+        "db タグの address は結果列名（英字またはアンダースコアで始まる \
+         英数字/アンダースコア）で指定してください"
+            .to_string()
+    } else {
+        return None;
+    };
+    Some(FieldError {
+        field: "address".to_string(),
+        message,
+    })
+}
+
 /// A bare PostgreSQL column identifier: an ASCII letter or `_` followed by
 /// ASCII letters/digits/`_` (外部 DB 連携 S2, §4.1). Deliberately narrower
 /// than PostgreSQL's own quoted-identifier grammar - a `db` tag's `address`
@@ -895,6 +953,45 @@ const PLACEMENT_CONNECTION_SQL: &str =
     "SELECT pc.id, pc.name, pc.protocol FROM collection_groups cg \
      JOIN plc_connections pc ON pc.id = cg.plc_connection_id \
      WHERE cg.id = ?";
+
+/// The `tag_kind` family of the placement rules (T6-2 / DB Source S2), reported
+/// on `"tagKind"`: which species of tag may live under which connection. `None`
+/// when `tag_kind` fits `protocol` (or is unknown, which [`validate_tag_input`]
+/// reports). Shared by the legacy [`placement_verdict`] and the registry-mode
+/// [`normalize_tag_address`] so the messages live once.
+fn tag_kind_placement_error(conn_name: &str, protocol: &str, tag_kind: &str) -> Option<FieldError> {
+    let is_virtual = protocol == VIRTUAL_PROTOCOL;
+    let is_postgres = protocol == POSTGRES_PROTOCOL;
+    let message = match tag_kind {
+        PLC_TAG_KIND if is_virtual => {
+            "plc タグは予約接続（calc/mem）配下に作成できません".to_string()
+        }
+        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
+        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
+        // (`banto_collect::build_config_from` が除外する) ので、その配下の
+        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
+        // 拒否するのと全く同じ理由で登録時に拒否する。
+        PLC_TAG_KIND if is_postgres => {
+            "plc タグは DB 接続（postgres）配下に作成できません".to_string()
+        }
+        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => {
+            format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます")
+        }
+        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => {
+            format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます")
+        }
+        DB_TAG_KIND if !is_postgres => {
+            format!("db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます")
+        }
+        // Unknown tag_kind is already rejected by validate_tag_input; no
+        // placement rule to apply.
+        _ => return None,
+    };
+    Some(FieldError {
+        field: "tagKind".to_string(),
+        message,
+    })
+}
 
 /// Every placement rule, decided once against an already-fetched connection
 /// row - the shared body of [`validate_tag_kind_placement`] and
@@ -933,8 +1030,6 @@ const PLACEMENT_CONNECTION_SQL: &str =
 fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Result<(), BantoError> {
     let tag_kind = input.tag_kind.as_str();
     let data_type = input.data_type.as_str();
-    let is_virtual = protocol == VIRTUAL_PROTOCOL;
-    let is_postgres = protocol == POSTGRES_PROTOCOL;
     let is_hub = protocol == HUB_PROTOCOL;
     let is_push = protocol == PUSH_PROTOCOL;
 
@@ -947,45 +1042,10 @@ fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Resul
         })
     };
 
-    match tag_kind {
-        PLC_TAG_KIND if is_virtual => {
-            return placement_error(
-                "tagKind",
-                "plc タグは予約接続（calc/mem）配下に作成できません".to_string(),
-            )
-        }
-        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.1「配置
-        // 制約」): `postgres` 接続は PLC 収集パイプラインに一切参加しない
-        // (`banto_collect::build_config_from` が除外する) ので、その配下の
-        // `plc` タグは永久に収集されない - `"virtual"` 配下の `plc` タグを
-        // 拒否するのと全く同じ理由で登録時に拒否する。
-        PLC_TAG_KIND if is_postgres => {
-            return placement_error(
-                "tagKind",
-                "plc タグは DB 接続（postgres）配下に作成できません".to_string(),
-            )
-        }
-        COMPUTED_TAG_KIND if !is_virtual || conn_name != CALC_CONNECTION_NAME => {
-            return placement_error(
-                "tagKind",
-                format!("computed タグは予約接続 {CALC_CONNECTION_NAME} 配下にのみ作成できます"),
-            )
-        }
-        INTERNAL_TAG_KIND if !is_virtual || conn_name != MEM_CONNECTION_NAME => {
-            return placement_error(
-                "tagKind",
-                format!("internal タグは予約接続 {MEM_CONNECTION_NAME} 配下にのみ作成できます"),
-            )
-        }
-        DB_TAG_KIND if !is_postgres => {
-            return placement_error(
-                "tagKind",
-                format!("db タグは {POSTGRES_PROTOCOL} 接続配下にのみ作成できます"),
-            )
-        }
-        // Unknown tag_kind is already rejected by validate_tag_input; no
-        // placement rule to apply.
-        _ => {}
+    if let Some(error) = tag_kind_placement_error(conn_name, protocol, tag_kind) {
+        return Err(BantoError::Validation {
+            field_errors: vec![error],
+        });
     }
 
     // #383 段階3 P2: Hub 経由のタグ（`hub` 接続配下の `plc` タグ）の規則。
@@ -1093,6 +1153,16 @@ fn push_tag_errors(input: &TagInput) -> Vec<FieldError> {
             message,
         });
     }
+    errors.extend(push_tag_rest_errors(input));
+    errors
+}
+
+/// [`push_tag_errors`] without the key itself: `string`, `writable` and
+/// scaling. Registry mode ([`normalize_tag_address`]) takes the key verdict
+/// from the `push` driver's `parse_address` (which wraps `validate_push_key`)
+/// and adds these, so a bad key is reported once.
+fn push_tag_rest_errors(input: &TagInput) -> Vec<FieldError> {
+    let mut errors = Vec::new();
     if input.data_type == STRING_DATA_TYPE {
         errors.push(FieldError {
             field: "dataType".to_string(),
@@ -1161,11 +1231,19 @@ fn hub_scaling_is_not_identity(input: &TagInput) -> bool {
 /// `_tag_kind_` name because `tag_kind` is still the bulk of what it decides
 /// and every call site/doc reference in this crate and its consumers points
 /// at that name.
+///
+/// **Legacy rules only (R2b-2b, design §3.2, owner review of #782)**: this
+/// pool twin has no registry parameter. A registry-mode service parses the
+/// address with the driver of the connection's *current* protocol, and that
+/// read must share a write transaction with the INSERT/UPDATE that stores the
+/// result - otherwise another writer can change the protocol in between - so
+/// registry mode only ever goes through [`validate_tag_kind_placement_tx`]
+/// (`create`/`update`/`create_batch` open `BEGIN IMMEDIATE` first).
 async fn validate_tag_kind_placement(
     pool: &SqlitePool,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
-) -> Result<Option<UniqueAddress>, BantoError> {
+) -> Result<Placement, BantoError> {
     let row: Option<(i64, String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(pool)
@@ -1173,11 +1251,11 @@ async fn validate_tag_kind_placement(
         .map_err(banto_storage::storage_error)?;
 
     let Some((conn_id, conn_name, protocol)) = row else {
-        return Ok(None);
+        return Ok(Placement::unchecked(input));
     };
-    placement_verdict(&conn_name, &protocol, input)?;
-    let Some(unique) = unique_address(conn_id, &protocol, input) else {
-        return Ok(None);
+    let placement = decide_placement(None, conn_id, &conn_name, &protocol, input)?;
+    let Some(unique) = &placement.unique else {
+        return Ok(placement);
     };
     let taken: Option<i64> = unique
         .taken_query(exclude_tag_id)
@@ -1185,7 +1263,7 @@ async fn validate_tag_kind_placement(
         .await
         .map_err(banto_storage::storage_error)?;
     unique.verdict(taken)?;
-    Ok(Some(unique))
+    Ok(placement)
 }
 
 /// #383 段階3 P4（2026-10-11、Codex の指摘）: Hub 経由のタグの外部名は
@@ -1255,12 +1333,18 @@ enum UniqueAddress {
     Push { connection_id: i64, key: String },
 }
 
-/// タグの `address` が一意性の対象なら、その範囲と値（前後の空白を除いた形）。
-fn unique_address(conn_id: i64, protocol: &str, input: &TagInput) -> Option<UniqueAddress> {
+/// タグの `address` が一意性の対象なら、その範囲と値。`address` は保存する形
+/// （レジストリなしでは前後の空白を除いた綴り、あれば正規形 - [`Placement`]）。
+fn unique_address(
+    conn_id: i64,
+    protocol: &str,
+    input: &TagInput,
+    address: &str,
+) -> Option<UniqueAddress> {
     if input.tag_kind != PLC_TAG_KIND {
         return None;
     }
-    let address = input.address.trim().to_string();
+    let address = address.to_string();
     match protocol {
         HUB_PROTOCOL => Some(UniqueAddress::Hub(address)),
         PUSH_PROTOCOL => Some(UniqueAddress::Push {
@@ -1378,20 +1462,21 @@ const DUPLICATE_HUB_ADDRESS_IN_BATCH: &str =
 /// transaction's uncommitted writes.
 async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
+    registry: Option<&DriverRegistry>,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
-) -> Result<Option<UniqueAddress>, BantoError> {
+) -> Result<Placement, BantoError> {
     let row: Option<(i64, String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
         .bind(input.collection_group_id)
         .fetch_optional(&mut *connection)
         .await
         .map_err(banto_storage::storage_error)?;
     let Some((conn_id, conn_name, protocol)) = row else {
-        return Ok(None);
+        return Ok(Placement::unchecked(input));
     };
-    placement_verdict(&conn_name, &protocol, input)?;
-    let Some(unique) = unique_address(conn_id, &protocol, input) else {
-        return Ok(None);
+    let placement = decide_placement(registry, conn_id, &conn_name, &protocol, input)?;
+    let Some(unique) = &placement.unique else {
+        return Ok(placement);
     };
     let taken: Option<i64> = unique
         .taken_query(exclude_tag_id)
@@ -1399,7 +1484,193 @@ async fn validate_tag_kind_placement_tx(
         .await
         .map_err(banto_storage::storage_error)?;
     unique.verdict(taken)?;
-    Ok(Some(unique))
+    Ok(placement)
+}
+
+/// What the cross-table placement step decides for one tag (R2b-2b): the
+/// uniqueness scope of its `address` (if any) and **the `address` to store**.
+/// Without a registry the stored address is the trimmed text, exactly as
+/// before; with one it is the driver's `canonical` form
+/// ([`normalize_tag_address`]). Every INSERT / UPDATE binds `address` from
+/// here, never from the raw input, so a write path cannot forget it.
+struct Placement {
+    unique: Option<UniqueAddress>,
+    address: String,
+}
+
+impl Placement {
+    /// No connection row was found for the tag's group: nothing to check here
+    /// (the FOREIGN KEY failure at write time reports it), the address stays
+    /// the trimmed text.
+    fn unchecked(input: &TagInput) -> Self {
+        Self {
+            unique: None,
+            address: input.address.trim().to_string(),
+        }
+    }
+}
+
+/// The synchronous half of both placement twins, against an already-fetched
+/// connection row: the legacy rules ([`placement_verdict`], address = trimmed
+/// text) without a registry, [`normalize_tag_address`] with one.
+fn decide_placement(
+    registry: Option<&DriverRegistry>,
+    conn_id: i64,
+    conn_name: &str,
+    protocol: &str,
+    input: &TagInput,
+) -> Result<Placement, BantoError> {
+    let address = match registry {
+        None => {
+            placement_verdict(conn_name, protocol, input)?;
+            input.address.trim().to_string()
+        }
+        Some(registry) => {
+            normalize_tag_address(conn_name, protocol, input, registry)
+                .map_err(|field_errors| BantoError::Validation { field_errors })?
+                .canonical
+        }
+    };
+    let unique = unique_address(conn_id, protocol, input, &address);
+    Ok(Placement { unique, address })
+}
+
+/// The verdict on a tag's `address` that does not need a database: the
+/// canonical form to store and, for a `plc` tag under a driver, the parsed
+/// address (R2b-2b, docs/banto-hub-driver-address-design.md §3.2・§7.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedAddress {
+    /// The text to store in `tags.address`: the driver's `canonical` for a
+    /// `plc` tag, the trimmed result column name for `db`, `""` for
+    /// `computed` / `internal`.
+    pub canonical: String,
+    /// The driver's parse of a `plc` tag's address (its `area`,
+    /// `writable_area`, `bit`, `word_count`); `None` for every other kind and
+    /// when no `kind` could be built (an invalid `dataType` /
+    /// `stringLength`, which [`TagService`]'s field validation reports).
+    pub parsed: Option<DriverAddress>,
+}
+
+/// The registry-mode replacement of [`placement_verdict`] **and** the address
+/// rules (R2b-2b): one pure function, shared by the save path
+/// ([`TagService::with_registry`]) and the parse API (R2b-2d), so both give the
+/// same verdict. `conn_name` / `protocol` are those of the connection the tag's
+/// group sits under; `input` is only read.
+///
+/// 1. The `tagKind` placement family ([`tag_kind_placement_error`]): `plc`
+///    under `virtual` / `postgres`, `computed` outside `calc`, `internal`
+///    outside `mem`, `db` outside `postgres` - a single `tagKind` error,
+///    returned alone.
+/// 2. Per kind:
+///    - `plc`: the connection's driver (`registry.get(protocol)`; a protocol
+///      without one - `hub` is not in the Hub's registry - is an `address`
+///      error) parses the address with [`tag_kind`] as the `kind`; its
+///      `canonical` is the result, its message the `address` error, and a
+///      `writable` tag on a `!writable_area` is a `writable` error. The driver
+///      owns every kind-dependent refusal (bit suffix, area / type mismatch,
+///      64-bit, `string`), so [`MODBUS_ONLY_DATA_TYPES`] and
+///      [`modbus_read_only_area`] are not consulted. Under `push` the driver is
+///      the key grammar and the `push` rules for `string` / `writable` /
+///      scaling are added without a second `address` error.
+///    - `db`: the result-column-name rules; canonical = the trimmed name; the
+///      driver is not called.
+///    - `computed` / `internal`: a non-empty address is refused; canonical `""`.
+///
+/// Field validation that has nothing to do with the address (`name`,
+/// `dataType`, `stringLength`, scaling, ...) is [`TagService`]'s
+/// `validate_tag_input` and runs first on the save path; when no `kind` can be
+/// built this returns the trimmed text without an error rather than repeat it.
+pub fn normalize_tag_address(
+    conn_name: &str,
+    protocol: &str,
+    input: &TagInput,
+    registry: &DriverRegistry,
+) -> Result<NormalizedAddress, Vec<FieldError>> {
+    if let Some(error) = tag_kind_placement_error(conn_name, protocol, &input.tag_kind) {
+        return Err(vec![error]);
+    }
+    let trimmed = input.address.trim();
+    let plain = |canonical: &str| NormalizedAddress {
+        canonical: canonical.to_string(),
+        parsed: None,
+    };
+    match input.tag_kind.as_str() {
+        PLC_TAG_KIND => normalize_plc_address(protocol, input, trimmed, registry),
+        DB_TAG_KIND => match db_column_address_error(trimmed) {
+            Some(error) => Err(vec![error]),
+            None => Ok(plain(trimmed)),
+        },
+        kind @ (COMPUTED_TAG_KIND | INTERNAL_TAG_KIND) => {
+            if trimmed.is_empty() {
+                Ok(plain(""))
+            } else {
+                Err(vec![forbidden_address_error(kind)])
+            }
+        }
+        // Unknown tag_kind: reported by validate_tag_input; nothing to parse.
+        _ => Ok(plain(trimmed)),
+    }
+}
+
+/// The `plc` arm of [`normalize_tag_address`].
+fn normalize_plc_address(
+    protocol: &str,
+    input: &TagInput,
+    trimmed: &str,
+    registry: &DriverRegistry,
+) -> Result<NormalizedAddress, Vec<FieldError>> {
+    let is_push = protocol == PUSH_PROTOCOL;
+    let address_error = |message: String| FieldError {
+        field: "address".to_string(),
+        message,
+    };
+    let mut errors: Vec<FieldError> = Vec::new();
+    let mut normalized = NormalizedAddress {
+        canonical: trimmed.to_string(),
+        parsed: None,
+    };
+    if trimmed.is_empty() {
+        errors.push(address_error(required_message()));
+    } else if let Some(entry) = registry.get(protocol) {
+        // `None`: the `dataType` / `stringLength` / `stringEncoding` errors
+        // belong to validate_tag_input - do not parse without a kind.
+        if let Some(kind) = tag_kind(
+            &input.data_type,
+            input.string_length,
+            &input.string_encoding,
+        ) {
+            match entry.base().parse_address(trimmed, &kind) {
+                Ok(parsed) => {
+                    normalized.canonical = parsed.canonical.clone();
+                    // `push` has its own, differently worded `writable` rule
+                    // below (a key is never writable), so it is not reported twice.
+                    if input.writable && !parsed.writable_area && !is_push {
+                        errors.push(FieldError {
+                            field: "writable".to_string(),
+                            message: format!(
+                                "{} はプロトコル上の読み取り専用領域のため writable にできません",
+                                parsed.area
+                            ),
+                        });
+                    }
+                    normalized.parsed = Some(parsed);
+                }
+                Err(error) => errors.push(address_error(error.message().to_string())),
+            }
+        }
+    } else {
+        errors.push(address_error(format!(
+            "この接続のドライバ {protocol} が見つかりません"
+        )));
+    }
+    if is_push {
+        errors.extend(push_tag_rest_errors(input));
+    }
+    if errors.is_empty() {
+        Ok(normalized)
+    } else {
+        Err(errors)
+    }
 }
 
 fn column_map() -> ColumnMap {
@@ -1500,6 +1771,157 @@ async fn fetch_tag_row(
     .bind(id)
     .fetch_optional(&mut *connection)
     .await
+}
+
+impl Tag {
+    /// The [`TagInput`] that would save this row as it is (no
+    /// `expected_revision`) - what [`reparse_tags`] feeds to
+    /// [`normalize_tag_address`].
+    pub(crate) fn to_input(&self) -> TagInput {
+        TagInput {
+            name: self.name.clone(),
+            collection_group_id: self.collection_group_id,
+            address: self.address.clone(),
+            data_type: self.data_type.clone(),
+            string_length: self.string_length,
+            string_encoding: self.string_encoding.clone(),
+            raw_lo: self.raw_lo,
+            raw_hi: self.raw_hi,
+            eng_lo: self.eng_lo,
+            eng_hi: self.eng_hi,
+            unit: self.unit.clone(),
+            decimals: self.decimals,
+            enabled: self.enabled,
+            writable: self.writable,
+            tag_kind: self.tag_kind.clone(),
+            expression: self.expression.clone(),
+            retain: self.retain,
+            expected_revision: None,
+        }
+    }
+}
+
+/// The most tags a re-parse refusal names (the rest are "ほか N 件");
+/// ChronoGazer's `ensure_protocol_change_keeps_tags_readable` uses the same 5.
+const LISTED_TAGS_LIMIT: usize = 5;
+
+/// Which tags a driver change touches: every tag under a connection (a
+/// protocol change) or in one group (a group move).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ReparseScope {
+    Connection(i64),
+    Group(i64),
+}
+
+/// One tag whose stored `address` differs from the canonical form the new
+/// driver gives it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AddressRewrite {
+    id: i64,
+    address: String,
+}
+
+/// R2b-2b (docs/banto-hub-driver-address-design.md §3.3, Q2), shared by
+/// [`crate::PlcConnectionService`]'s protocol change and
+/// [`crate::CollectionGroupService`]'s move to a connection of another driver:
+/// loads **every** tag in `scope` (disabled and `string` ones included, on the
+/// caller's connection so it sees the caller's transaction) and runs
+/// [`normalize_tag_address`] for the *new* `(conn_name, protocol)`.
+///
+/// If any tag does not pass, nothing is returned but a validation error on
+/// `field` naming at most [`LISTED_TAGS_LIMIT`] of them (tag name, stored
+/// address, the verdict's message) and "ほか N 件" for the rest, in the shape of
+/// ChronoGazer's refusal: `{lead}タグ N 件が読めなくなります: …。{remedy}`. If all
+/// pass, returns the tags whose canonical form differs from what is stored, for
+/// [`apply_address_rewrites`] to write in the same transaction.
+pub(crate) async fn reparse_tags(
+    connection: &mut SqliteConnection,
+    registry: &DriverRegistry,
+    scope: ReparseScope,
+    conn_name: &str,
+    protocol: &str,
+    refusal: (&str, &str, &str),
+) -> Result<Vec<AddressRewrite>, BantoError> {
+    let (field, lead, remedy) = refusal;
+    let (filter, id) = match scope {
+        ReparseScope::Connection(id) => (
+            "collection_group_id IN \
+             (SELECT id FROM collection_groups WHERE plc_connection_id = ?)",
+            id,
+        ),
+        ReparseScope::Group(id) => ("collection_group_id = ?", id),
+    };
+    // AssertSqlSafe: COLUMNS と固定の WHERE 句（上の 2 択）だけを埋め込む。id は
+    // プレースホルダでバインドする。
+    let tags: Vec<Tag> = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COLUMNS} FROM tags WHERE {filter} ORDER BY id"
+    )))
+    .bind(id)
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(banto_storage::storage_error)?;
+
+    let mut failures: Vec<(&Tag, String)> = Vec::new();
+    let mut rewrites = Vec::new();
+    for tag in &tags {
+        match normalize_tag_address(conn_name, protocol, &tag.to_input(), registry) {
+            Ok(normalized) => {
+                if normalized.canonical != tag.address {
+                    rewrites.push(AddressRewrite {
+                        id: tag.id,
+                        address: normalized.canonical,
+                    });
+                }
+            }
+            Err(errors) => {
+                let message = errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("／");
+                failures.push((tag, message));
+            }
+        }
+    }
+    if failures.is_empty() {
+        return Ok(rewrites);
+    }
+    let mut listed: Vec<String> = failures
+        .iter()
+        .take(LISTED_TAGS_LIMIT)
+        .map(|(tag, message)| format!("「{}」（{}: {}）", tag.name, tag.address, message))
+        .collect();
+    if failures.len() > LISTED_TAGS_LIMIT {
+        listed.push(format!("ほか {} 件", failures.len() - LISTED_TAGS_LIMIT));
+    }
+    Err(BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: field.to_string(),
+            message: format!(
+                "{lead}タグ {} 件が読めなくなります: {}。{remedy}",
+                failures.len(),
+                listed.join("、")
+            ),
+        }],
+    })
+}
+
+/// Writes the canonical forms [`reparse_tags`] found, on the same connection
+/// (the caller's transaction): `address` and `revision + 1` (the optimistic
+/// lock must notice the change, as for any tag update).
+pub(crate) async fn apply_address_rewrites(
+    connection: &mut SqliteConnection,
+    rewrites: &[AddressRewrite],
+) -> Result<(), BantoError> {
+    for rewrite in rewrites {
+        sqlx::query("UPDATE tags SET address = ?, revision = revision + 1 WHERE id = ?")
+            .bind(&rewrite.address)
+            .bind(rewrite.id)
+            .execute(&mut *connection)
+            .await
+            .map_err(map_tag_write_error)?;
+    }
+    Ok(())
 }
 
 /// A single row's worth of field errors within a [`TagService::create_batch`]
@@ -1639,14 +2061,56 @@ impl From<BantoError> for TagUpdateError {
 /// (unlike [`crate::plc_connection::PlcConnectionService::delete`] /
 /// [`crate::collection_group::CollectionGroupService::delete`]): nothing in
 /// this crate references a `tags` row by id.
+///
+/// ## Registry mode (R2b-2b, docs/banto-hub-driver-address-design.md §3)
+///
+/// [`Self::new`] keeps the old rules (the address is any non-empty text, saved
+/// as typed; [`placement_verdict`], [`MODBUS_ONLY_DATA_TYPES`] and
+/// [`modbus_read_only_area`] decide the rest) - ChronoGazer and this crate's
+/// own tests. [`Self::with_registry`] (banto-hub) makes the driver registry the
+/// authority: **every** write (create / update, single / batch / `*_tx`)
+/// validates the tag's address with the driver of its connection and stores the
+/// driver's `canonical` form (`40001` is saved as `400001`) - for disabled and
+/// `string` tags too (Q1), through the one pure function
+/// [`normalize_tag_address`] that the parse API shares. The same registry
+/// re-parses a connection's / group's tags when a protocol change or a group
+/// move changes their driver ([`crate::PlcConnectionService`],
+/// [`crate::CollectionGroupService`], Q2). A service without a registry never
+/// rewrites an address.
 #[derive(Clone)]
 pub struct TagService {
     pool: SqlitePool,
+    /// [`Self::with_registry`]'s registry; `None` = the old rules.
+    registry: Option<Arc<DriverRegistry>>,
 }
 
 impl TagService {
+    /// The old rules (no driver registry): ChronoGazer and `banto-tags`' own
+    /// tests. See the type's "Registry mode" section.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            registry: None,
+        }
+    }
+
+    /// The registry-authoritative service (banto-hub, R2b-2b): addresses are
+    /// parsed by the connection's driver and stored in canonical form. Same
+    /// shape as [`crate::PlcConnectionService::with_registry`].
+    pub fn with_registry(pool: SqlitePool, registry: Arc<DriverRegistry>) -> Self {
+        Self {
+            pool,
+            registry: Some(registry),
+        }
+    }
+
+    /// The registry passed to [`Self::with_registry`]; `None` for [`Self::new`].
+    pub fn registry(&self) -> Option<&Arc<DriverRegistry>> {
+        self.registry.as_ref()
+    }
+
+    fn rules(&self) -> AddressRules {
+        AddressRules::of(self.registry.as_ref())
     }
 
     pub async fn list(&self, params: ListParams) -> Result<ListResult<Tag>, BantoError> {
@@ -1708,9 +2172,29 @@ impl TagService {
         .map_err(|err| banto_storage::not_found(err, RESOURCE, id.to_string()))
     }
 
+    /// With a registry ([`Self::with_registry`]) the whole call is one
+    /// `BEGIN IMMEDIATE` transaction around [`Self::create_tx`]: the
+    /// connection's protocol is read, the address parsed by that driver and
+    /// the row inserted under the same write lock, so another writer cannot
+    /// change the connection's protocol (or the group's connection) in
+    /// between and leave an address canonicalised by the old driver stored
+    /// under the new protocol (design §3.2, owner review of #782). An error
+    /// drops (rolls back) the transaction; nothing is written. The legacy
+    /// ([`Self::new`]) path is unchanged.
     pub async fn create(&self, input: TagInput) -> Result<Tag, BantoError> {
-        let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, &input, None).await?;
+        if self.registry.is_some() {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let created = self.create_tx(&mut tx, input).await?;
+            tx.commit().await.map_err(banto_storage::storage_error)?;
+            return Ok(created);
+        }
+        let mut validated = validate_tag_input(&input, self.rules())?;
+        let placement = validate_tag_kind_placement(&self.pool, &input, None).await?;
+        validated.address = placement.address;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1742,8 +2226,11 @@ impl TagService {
         connection: &mut SqliteConnection,
         input: TagInput,
     ) -> Result<Tag, BantoError> {
-        let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, &input, None).await?;
+        let mut validated = validate_tag_input(&input, self.rules())?;
+        let placement =
+            validate_tag_kind_placement_tx(connection, self.registry.as_deref(), &input, None)
+                .await?;
+        validated.address = placement.address;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
@@ -1786,9 +2273,27 @@ impl TagService {
     /// message rather than the richer [`TagUpdateError::RevisionConflict`]
     /// (which needs a caller that can actually show the current row - the
     /// hub REST layer, via [`Self::update_tx`]).
+    ///
+    /// With a registry ([`Self::with_registry`]) the whole call is one
+    /// `BEGIN IMMEDIATE` transaction around [`Self::update_tx`] (parse and
+    /// write under the same write lock, design §3.2, owner review of #782 -
+    /// see [`Self::create`]); a revision conflict is still folded into
+    /// `BantoError::Other` with the same message, and any error drops (rolls
+    /// back) the transaction. The legacy ([`Self::new`]) path is unchanged.
     pub async fn update(&self, id: i64, input: TagInput) -> Result<Tag, BantoError> {
-        let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement(&self.pool, &input, Some(id)).await?;
+        if self.registry.is_some() {
+            return match self.update_checked(id, input).await {
+                Ok(tag) => Ok(tag),
+                Err(TagUpdateError::Banto(err)) => Err(err),
+                Err(TagUpdateError::RevisionConflict(_)) => Err(BantoError::Other(
+                    "他のクライアントがこのタグを更新済みです。再読込してから保存してください。"
+                        .to_string(),
+                )),
+            };
+        }
+        let mut validated = validate_tag_input(&input, self.rules())?;
+        let placement = validate_tag_kind_placement(&self.pool, &input, Some(id)).await?;
+        validated.address = placement.address;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update_tag_sql() は expected_revision の有無で固定の
@@ -1869,8 +2374,11 @@ impl TagService {
         id: i64,
         input: TagInput,
     ) -> Result<Tag, TagUpdateError> {
-        let validated = validate_tag_input(&input)?;
-        validate_tag_kind_placement_tx(connection, &input, Some(id)).await?;
+        let mut validated = validate_tag_input(&input, self.rules())?;
+        let placement =
+            validate_tag_kind_placement_tx(connection, self.registry.as_deref(), &input, Some(id))
+                .await?;
+        validated.address = placement.address;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
         // AssertSqlSafe: update() と同じ理由 - update_tag_sql() は固定の
@@ -2031,8 +2539,9 @@ impl TagService {
 
         // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
         let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; updates.len()];
+        let rules = self.rules();
         for (index, (id, input)) in updates.iter().enumerate() {
-            match validate_tag_input(input) {
+            match validate_tag_input(input, rules) {
                 Ok(value) => validated.push(Some(value)),
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors);
@@ -2040,8 +2549,26 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(connection, input, Some(*id)).await {
-                Ok(unique) => hub_rows[index] = unique,
+            // With a registry the placement step (which parses the address)
+            // runs only on a row whose fields already validated, so a bad
+            // field is not reported twice; the legacy rules run on every row.
+            if rules == AddressRules::Registry && validated[index].is_none() {
+                continue;
+            }
+            match validate_tag_kind_placement_tx(
+                connection,
+                self.registry.as_deref(),
+                input,
+                Some(*id),
+            )
+            .await
+            {
+                Ok(placement) => {
+                    hub_rows[index] = placement.unique;
+                    if let Some(value) = validated[index].as_mut() {
+                        value.address = placement.address;
+                    }
+                }
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -2439,8 +2966,9 @@ impl TagService {
         // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
         let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; inputs.len()];
 
+        let rules = self.rules();
         for (index, input) in inputs.iter().enumerate() {
-            match validate_tag_input(input) {
+            match validate_tag_input(input, rules) {
                 Ok(value) => validated.push(Some(value)),
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors);
@@ -2448,8 +2976,19 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
-            match validate_tag_kind_placement_tx(connection, input, None).await {
-                Ok(unique) => hub_rows[index] = unique,
+            // See update_batch_tx: with a registry, placement only for valid rows.
+            if rules == AddressRules::Registry && validated[index].is_none() {
+                continue;
+            }
+            match validate_tag_kind_placement_tx(connection, self.registry.as_deref(), input, None)
+                .await
+            {
+                Ok(placement) => {
+                    hub_rows[index] = placement.unique;
+                    if let Some(value) = validated[index].as_mut() {
+                        value.address = placement.address;
+                    }
+                }
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -2631,18 +3170,54 @@ impl TagService {
     /// duration of a potentially large batch's validation queries - worse in
     /// practice than the rare surprise of a generic error message on an
     /// actual concurrent conflict.
+    ///
+    /// **Registry mode** ([`Self::with_registry`], design §3.2, owner review
+    /// of #782): the validation above cannot be allowed to run outside the
+    /// write transaction, because each row is parsed by the driver of its
+    /// group's connection and another writer could change that protocol
+    /// before the insert. So the whole call - validation, duplicate checks
+    /// and insert - is one `BEGIN IMMEDIATE` transaction around
+    /// [`Self::create_batch_tx`]. An `Invalid` outcome or an error drops
+    /// (rolls back) it; a `dry_run` runs the same pass and rolls back even a
+    /// `Valid` one, returning `tags: None`. This closes the race window
+    /// described above for registry mode (at the price of holding the write
+    /// lock during validation, which is the point); the legacy
+    /// ([`Self::new`]) path is unchanged.
     pub async fn create_batch(
         &self,
         inputs: Vec<TagInput>,
         dry_run: bool,
     ) -> Result<BatchTagOutcome, BantoError> {
+        if self.registry.is_some() {
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(banto_storage::storage_error)?;
+            let outcome = self.create_batch_tx(&mut tx, &inputs).await?;
+            return match outcome {
+                BatchTagOutcome::Valid { count, .. } if dry_run => {
+                    let _ = tx.rollback().await;
+                    Ok(BatchTagOutcome::Valid { count, tags: None })
+                }
+                BatchTagOutcome::Valid { .. } => {
+                    tx.commit().await.map_err(banto_storage::storage_error)?;
+                    Ok(outcome)
+                }
+                invalid @ BatchTagOutcome::Invalid(_) => {
+                    let _ = tx.rollback().await;
+                    Ok(invalid)
+                }
+            };
+        }
         let mut row_errors: Vec<Vec<FieldError>> = vec![Vec::new(); inputs.len()];
         let mut validated: Vec<Option<ValidatedTag>> = Vec::with_capacity(inputs.len());
         // #383 段階3 P4 / R2a-2a: Hub の外部名・push のキー（行ごと。バッチ内の重複を下で調べる）。
         let mut hub_rows: Vec<Option<UniqueAddress>> = vec![None; inputs.len()];
 
+        let rules = self.rules();
         for (index, input) in inputs.iter().enumerate() {
-            match validate_tag_input(input) {
+            match validate_tag_input(input, rules) {
                 Ok(v) => validated.push(Some(v)),
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors);
@@ -2650,8 +3225,17 @@ impl TagService {
                 }
                 Err(other) => return Err(other),
             }
+            // See update_batch_tx: with a registry, placement only for valid rows.
+            if rules == AddressRules::Registry && validated[index].is_none() {
+                continue;
+            }
             match validate_tag_kind_placement(&self.pool, input, None).await {
-                Ok(unique) => hub_rows[index] = unique,
+                Ok(placement) => {
+                    hub_rows[index] = placement.unique;
+                    if let Some(value) = validated[index].as_mut() {
+                        value.address = placement.address;
+                    }
+                }
                 Err(BantoError::Validation { field_errors }) => {
                     row_errors[index].extend(field_errors)
                 }
@@ -7753,5 +8337,806 @@ mod tests {
             .update(empty, input("empty", plc_conn))
             .await
             .expect("empty push -> modbus");
+    }
+
+    // ---- R2b-2b: registry mode (docs/banto-hub-driver-address-design.md §3) ----------
+    //
+    // The real Modbus / SLMP drivers live in crates that depend on this one, so these
+    // tests use fakes with the same *shape* of behavior: `modbus-tcp` canonicalizes to
+    // UPPER case, `slmp` to lower case (so a move between them rewrites every address),
+    // both refuse `!` (a grammar error), `slmp` additionally refuses `string` and the
+    // 64-bit types, and an address starting with `r` is a read-only area. The same
+    // cases against the real drivers (`40001` -> `400001`, `d100` -> `D100`) are in
+    // `crates/banto-drivers/tests/tag_canonical.rs`.
+    mod registry_mode {
+        use super::*;
+        use banto_driver_api::{
+            AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverEntry,
+            DriverId, Settings, TagKind,
+        };
+
+        struct CanonDriver {
+            descriptor: DriverDescriptor,
+            lower: bool,
+        }
+
+        impl DriverBase for CanonDriver {
+            fn descriptor(&self) -> &DriverDescriptor {
+                &self.descriptor
+            }
+            fn validate_config(&self, _: &Settings) -> Vec<banto_driver_api::FieldError> {
+                Vec::new()
+            }
+            fn parse_address(
+                &self,
+                text: &str,
+                kind: &TagKind,
+            ) -> Result<DriverAddress, AddressError> {
+                let id = self.descriptor.id.clone();
+                let text = text.trim();
+                if text.is_empty() || text.contains('!') {
+                    return Err(AddressError::new(format!(
+                        "{text:?} は {id} のアドレスとして読めません"
+                    )));
+                }
+                if self.lower {
+                    if matches!(kind, TagKind::Str { .. }) {
+                        return Err(AddressError::new(format!("{id} は string を読めません")));
+                    }
+                    if kind.word_count() == 4 {
+                        return Err(AddressError::new(format!("{id} は 64 bit を読めません")));
+                    }
+                }
+                let canonical = if self.lower {
+                    text.to_lowercase()
+                } else {
+                    text.to_uppercase()
+                };
+                let read_only = canonical.to_lowercase().starts_with('r');
+                Ok(DriverAddress::new(
+                    id,
+                    canonical,
+                    if read_only { "read area" } else { "area" },
+                    !read_only,
+                    kind.word_count(),
+                ))
+            }
+            fn offset_address(
+                &self,
+                canonical: &str,
+                _: &TagKind,
+                _: i64,
+            ) -> Result<String, AddressError> {
+                Ok(canonical.to_string())
+            }
+            fn address_help(&self) -> String {
+                String::new()
+            }
+        }
+
+        /// `modbus-tcp` (UPPER), `slmp` (lower) and the real `push` key grammar.
+        fn registry() -> Arc<DriverRegistry> {
+            struct PushDriver(DriverDescriptor);
+            impl DriverBase for PushDriver {
+                fn descriptor(&self) -> &DriverDescriptor {
+                    &self.0
+                }
+                fn validate_config(&self, _: &Settings) -> Vec<banto_driver_api::FieldError> {
+                    Vec::new()
+                }
+                fn parse_address(
+                    &self,
+                    text: &str,
+                    kind: &TagKind,
+                ) -> Result<DriverAddress, AddressError> {
+                    let key = validate_push_key(text).map_err(AddressError::new)?;
+                    Ok(DriverAddress::new(
+                        self.0.id.clone(),
+                        key,
+                        "key",
+                        false,
+                        kind.word_count(),
+                    ))
+                }
+                fn offset_address(
+                    &self,
+                    c: &str,
+                    _: &TagKind,
+                    _: i64,
+                ) -> Result<String, AddressError> {
+                    Ok(c.to_string())
+                }
+                fn address_help(&self) -> String {
+                    String::new()
+                }
+            }
+            let descriptor = |id: &str| {
+                DriverDescriptor::new(
+                    DriverId::new(id).unwrap(),
+                    "0.0.0",
+                    id,
+                    Capabilities::READ_ONLY,
+                )
+            };
+            let mut registry = DriverRegistry::new();
+            for (id, lower) in [("modbus-tcp", false), ("slmp", true)] {
+                registry
+                    .register(DriverEntry::host_bound(Arc::new(CanonDriver {
+                        descriptor: descriptor(id),
+                        lower,
+                    })))
+                    .unwrap();
+            }
+            registry
+                .register(DriverEntry::host_provided(Arc::new(PushDriver(
+                    descriptor("push"),
+                ))))
+                .unwrap();
+            Arc::new(registry)
+        }
+
+        /// (legacy service on the PLC1 / modbus-tcp group of [`setup`], the same pool
+        /// with a registry, the group id).
+        async fn reg_setup() -> (TagService, TagService, i64) {
+            let (legacy, group) = setup().await;
+            let reg = TagService::with_registry(legacy.pool.clone(), registry());
+            (legacy, reg, group)
+        }
+
+        /// **Parse and write share one `BEGIN IMMEDIATE` transaction** (design §3.2,
+        /// owner review of #782). Another writer holds the write lock and changes the
+        /// connection's protocol modbus-tcp -> slmp; the registry `create` of `Abc`
+        /// (modbus-tcp canonicalises to `ABC`, slmp to `abc`) must neither complete
+        /// while the lock is held nor store the old driver's form under the new
+        /// protocol: it waits at its own `BEGIN IMMEDIATE`, then reads the committed
+        /// protocol and is parsed by the NEW driver. (With the old pool path the
+        /// protocol was read before the INSERT waited for the lock, and `ABC` landed
+        /// under slmp.) The only wait is a bounded "has not completed" check; the
+        /// release is explicit, so the outcome does not depend on timing.
+        #[tokio::test]
+        async fn registry_create_parses_inside_the_write_transaction() {
+            let path = std::env::temp_dir().join(format!(
+                "banto-tags-reg-create-{}-{}.db",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let pool_a = banto_storage::connect_sqlite(&path)
+                .await
+                .expect("connect a");
+            let (_legacy, group) = setup_on(pool_a.clone()).await;
+            let svc = TagService::with_registry(pool_a.clone(), registry());
+            let conn_id: i64 =
+                sqlx::query_scalar("SELECT plc_connection_id FROM collection_groups WHERE id = ?")
+                    .bind(group)
+                    .fetch_one(&pool_a)
+                    .await
+                    .unwrap();
+
+            // The "other writer": holds the write lock and changes the protocol.
+            let pool_b = banto_storage::connect_sqlite(&path)
+                .await
+                .expect("connect b");
+            let mut writer = pool_b.acquire().await.expect("acquire b");
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE plc_connections SET protocol = 'slmp' WHERE id = ?")
+                .bind(conn_id)
+                .execute(&mut *writer)
+                .await
+                .unwrap();
+
+            let svc_a = svc.clone();
+            let mut create =
+                tokio::spawn(async move { svc_a.create(tag_at("race", group, "Abc")).await });
+            // Still blocked on the write lock (well inside the 5 s busy_timeout).
+            let pending =
+                tokio::time::timeout(std::time::Duration::from_millis(300), &mut create).await;
+            assert!(pending.is_err(), "create must wait for the write lock");
+
+            sqlx::query("COMMIT").execute(&mut *writer).await.unwrap();
+            drop(writer);
+
+            let created = create
+                .await
+                .expect("join")
+                .expect("create after the commit");
+            assert_eq!(
+                created.address, "abc",
+                "parsed by the committed (slmp) driver, not the old modbus-tcp one"
+            );
+            let stored: String = sqlx::query_scalar("SELECT address FROM tags WHERE name = 'race'")
+                .fetch_one(&pool_a)
+                .await
+                .unwrap();
+            assert_eq!(stored, "abc");
+
+            pool_a.close().await;
+            pool_b.close().await;
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+            }
+        }
+
+        fn conn_input(name: &str, protocol: &str) -> PlcConnectionInput {
+            PlcConnectionInput {
+                name: name.to_string(),
+                protocol: protocol.to_string(),
+                host: "10.0.0.9".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            }
+        }
+
+        /// A connection of `protocol` with one group under it: (connection id, group id).
+        async fn conn_and_group(pool: &SqlitePool, name: &str, protocol: &str) -> (i64, i64) {
+            let conn = PlcConnectionService::new(pool.clone())
+                .create(conn_input(name, protocol))
+                .await
+                .unwrap();
+            let group = CollectionGroupService::new(pool.clone())
+                .create(CollectionGroupInput {
+                    name: format!("{name}-g"),
+                    plc_connection_id: conn.id,
+                    period_ms: 1_000,
+                    enabled: true,
+                    default_writable: true,
+                    query_sql: None,
+                })
+                .await
+                .unwrap();
+            (conn.id, group.id)
+        }
+
+        fn tag_at(name: &str, group: i64, address: &str) -> TagInput {
+            let mut input = sample_input(name, group);
+            input.address = address.to_string();
+            input
+        }
+
+        fn string_tag(name: &str, group: i64, address: &str) -> TagInput {
+            let mut input = tag_at(name, group, address);
+            input.data_type = "string".to_string();
+            input.string_length = Some(4);
+            input
+        }
+
+        fn fields(errors: &[FieldError]) -> Vec<(&str, &str)> {
+            errors
+                .iter()
+                .map(|e| (e.field.as_str(), e.message.as_str()))
+                .collect()
+        }
+
+        async fn count_tags(pool: &SqlitePool) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM tags")
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        async fn stored(pool: &SqlitePool) -> Vec<(String, String, i64)> {
+            sqlx::query_as("SELECT name, address, revision FROM tags ORDER BY id")
+                .fetch_all(pool)
+                .await
+                .unwrap()
+        }
+
+        // -- the save layer stores the canonical form, on every write path --
+
+        #[tokio::test]
+        async fn every_write_path_stores_the_canonical_address() {
+            let (legacy, svc, group) = reg_setup().await;
+
+            // Legacy `new` keeps the typed text.
+            let old = legacy.create(tag_at("old", group, " abc ")).await.unwrap();
+            assert_eq!(old.address, "abc");
+
+            let created = svc.create(tag_at("a", group, " abc ")).await.unwrap();
+            assert_eq!(created.address, "ABC");
+            let updated = svc
+                .update(created.id, tag_at("a", group, "def"))
+                .await
+                .unwrap();
+            assert_eq!(updated.address, "DEF");
+            let checked = svc
+                .update_checked(created.id, tag_at("a", group, "ghi"))
+                .await
+                .unwrap();
+            assert_eq!(checked.address, "GHI");
+
+            let mut conn = svc.pool.acquire().await.unwrap();
+            let tx_created = svc
+                .create_tx(&mut conn, tag_at("b", group, "jkl"))
+                .await
+                .unwrap();
+            assert_eq!(tx_created.address, "JKL");
+            let tx_updated = svc
+                .update_tx(&mut conn, tx_created.id, tag_at("b", group, "mno"))
+                .await
+                .unwrap();
+            assert_eq!(tx_updated.address, "MNO");
+
+            let outcome = svc
+                .create_batch_tx(
+                    &mut conn,
+                    &[tag_at("c1", group, "p1"), tag_at("c2", group, "p2")],
+                )
+                .await
+                .unwrap();
+            let BatchTagOutcome::Valid {
+                tags: Some(tags), ..
+            } = outcome
+            else {
+                panic!("expected Valid");
+            };
+            assert_eq!(
+                tags.iter().map(|t| t.address.as_str()).collect::<Vec<_>>(),
+                ["P1", "P2"]
+            );
+            let outcome = svc
+                .update_batch_tx(
+                    &mut conn,
+                    &[
+                        (tags[0].id, tag_at("c1", group, "q1")),
+                        (tags[1].id, tag_at("c2", group, "q2")),
+                    ],
+                )
+                .await
+                .unwrap();
+            let BatchTagUpdateOutcome::Valid {
+                tags: Some(tags), ..
+            } = outcome
+            else {
+                panic!("expected Valid");
+            };
+            assert_eq!(
+                tags.iter().map(|t| t.address.as_str()).collect::<Vec<_>>(),
+                ["Q1", "Q2"]
+            );
+            drop(conn);
+
+            let outcome = svc
+                .create_batch(vec![tag_at("d1", group, "r1")], false)
+                .await
+                .unwrap();
+            let BatchTagOutcome::Valid {
+                tags: Some(tags), ..
+            } = outcome
+            else {
+                panic!("expected Valid");
+            };
+            assert_eq!(tags[0].address, "R1");
+        }
+
+        #[tokio::test]
+        async fn a_grammar_error_is_an_address_error_and_writes_nothing() {
+            let (_, svc, group) = reg_setup().await;
+            let err = svc.create(tag_at("bad", group, "a!b")).await.unwrap_err();
+            let errors = field_errors_of(err);
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].field, "address");
+            assert!(
+                errors[0].message.contains("読めません"),
+                "{}",
+                errors[0].message
+            );
+            assert_eq!(count_tags(&svc.pool).await, 0);
+
+            // update: the stored row is untouched.
+            let ok = svc.create(tag_at("ok", group, "abc")).await.unwrap();
+            let err = svc
+                .update(ok.id, tag_at("ok", group, "a!b"))
+                .await
+                .unwrap_err();
+            assert_eq!(field_errors_of(err)[0].field, "address");
+            assert_eq!(svc.get(ok.id).await.unwrap(), ok);
+
+            // Batch: per-row errors by index, nothing written.
+            let outcome = svc
+                .create_batch(
+                    vec![
+                        tag_at("g1", group, "fine"),
+                        tag_at("g2", group, "x!"),
+                        tag_at("g3", group, "y!"),
+                    ],
+                    false,
+                )
+                .await
+                .unwrap();
+            let BatchTagOutcome::Invalid(rows) = outcome else {
+                panic!("expected Invalid");
+            };
+            assert_eq!(rows.iter().map(|r| r.index).collect::<Vec<_>>(), [1, 2]);
+            assert_eq!(count_tags(&svc.pool).await, 1);
+        }
+
+        /// Q1: a disabled tag and a `string` tag are validated like any other.
+        #[tokio::test]
+        async fn disabled_and_string_tags_are_refused_too() {
+            let (_, svc, group) = reg_setup().await;
+            let mut disabled = tag_at("off", group, "a!b");
+            disabled.enabled = false;
+            let errors = field_errors_of(svc.create(disabled).await.unwrap_err());
+            assert_eq!(errors[0].field, "address");
+
+            let slmp_group = slmp_group(&svc.pool).await;
+            let errors = field_errors_of(
+                svc.create(string_tag("s", slmp_group, "d100"))
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].field, "address");
+            assert!(
+                errors[0].message.contains("string"),
+                "{}",
+                errors[0].message
+            );
+            // Under the driver that accepts `string` it is saved (and canonical).
+            let ok = svc.create(string_tag("s", group, "d100")).await.unwrap();
+            assert_eq!(ok.address, "D100");
+            assert_eq!(count_tags(&svc.pool).await, 1);
+        }
+
+        #[tokio::test]
+        async fn writable_follows_the_drivers_writable_area_not_the_legacy_modbus_copy() {
+            let (legacy, svc, group) = reg_setup().await;
+            let mut input = tag_at("w", group, "r100");
+            input.writable = true;
+            let errors = field_errors_of(svc.create(input.clone()).await.unwrap_err());
+            assert_eq!(
+                fields(&errors),
+                [(
+                    "writable",
+                    "read area はプロトコル上の読み取り専用領域のため writable にできません"
+                )]
+            );
+            // `30001` is a Modbus input register: the legacy copy refuses it, but with a
+            // registry only the driver's `writable_area` counts (the fake says writable).
+            let mut input = tag_at("w", group, "30001");
+            input.writable = true;
+            assert!(legacy.create(input.clone()).await.is_err());
+            assert_eq!(svc.create(input).await.unwrap().address, "30001");
+        }
+
+        #[tokio::test]
+        async fn the_64_bit_rule_is_the_drivers_in_registry_mode() {
+            let (legacy, svc, group) = reg_setup().await;
+            let slmp = slmp_group(&svc.pool).await;
+            let mut input = tag_at("big", slmp, "d100");
+            input.data_type = "i64".to_string();
+            // Legacy: the old dataType rule.
+            let errors = field_errors_of(legacy.create(input.clone()).await.unwrap_err());
+            assert_eq!(errors[0].field, "dataType");
+            // Registry: the driver's address error instead.
+            let errors = field_errors_of(svc.create(input.clone()).await.unwrap_err());
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].field, "address");
+            assert!(
+                errors[0].message.contains("64 bit"),
+                "{}",
+                errors[0].message
+            );
+            // Under modbus it is fine.
+            input.collection_group_id = group;
+            assert_eq!(svc.create(input).await.unwrap().address, "D100");
+        }
+
+        #[tokio::test]
+        async fn push_keys_are_trimmed_unique_and_reported_once() {
+            let (_, svc, _) = reg_setup().await;
+            let group = push_group(&svc.pool, "Bridge1").await;
+            let created = svc.create(hub_tag("k1", group, " a.b ")).await.unwrap();
+            assert_eq!(created.address, "a.b");
+            // Uniqueness is on the canonical form.
+            let err = svc.create(hub_tag("k2", group, "a.b  ")).await.unwrap_err();
+            expect_key_taken(err);
+            // A bad key: exactly one `address` error (no duplicate from the key + rules).
+            let errors = field_errors_of(svc.create(hub_tag("k3", group, "  ")).await.unwrap_err());
+            assert_eq!(
+                errors.iter().filter(|e| e.field == "address").count(),
+                1,
+                "{errors:?}"
+            );
+            // `writable` is refused once, with the push wording, and so are string / scaling.
+            let mut bad = hub_tag("k4", group, "k4");
+            bad.writable = true;
+            bad.data_type = "string".to_string();
+            bad.string_length = Some(2);
+            let errors = field_errors_of(svc.create(bad).await.unwrap_err());
+            assert_eq!(
+                errors.iter().filter(|e| e.field == "writable").count(),
+                1,
+                "{errors:?}"
+            );
+            assert!(errors.iter().any(|e| e.field == "dataType"), "{errors:?}");
+            assert!(errors.iter().all(|e| e.field != "address"), "{errors:?}");
+            // In a batch, two rows with the same canonical key collide.
+            let outcome = svc
+                .create_batch(
+                    vec![hub_tag("b1", group, "x"), hub_tag("b2", group, " x ")],
+                    true,
+                )
+                .await
+                .unwrap();
+            let BatchTagOutcome::Invalid(rows) = outcome else {
+                panic!("expected Invalid");
+            };
+            assert_eq!(rows.len(), 2);
+        }
+
+        #[tokio::test]
+        async fn db_computed_and_internal_keep_their_rules_under_a_registry() {
+            let (_, svc, _) = reg_setup().await;
+            let pg = postgres_group(&svc.pool).await;
+            let db = svc
+                .create(db_tag_input("col", pg, " value "))
+                .await
+                .unwrap();
+            assert_eq!(db.address, "value");
+            let errors = field_errors_of(
+                svc.create(db_tag_input("bad", pg, "1 bad"))
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(errors[0].field, "address");
+            // `plc` under postgres / virtual: the placement error, not a driver lookup.
+            let errors = field_errors_of(svc.create(tag_at("p", pg, "abc")).await.unwrap_err());
+            assert_eq!(
+                fields(&errors),
+                [(
+                    "tagKind",
+                    "plc タグは DB 接続（postgres）配下に作成できません"
+                )]
+            );
+            let calc = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+            let mut computed = tag_at("c", calc, "");
+            computed.tag_kind = COMPUTED_TAG_KIND.to_string();
+            computed.expression = Some("1 + 1".to_string());
+            computed.writable = false;
+            assert_eq!(svc.create(computed.clone()).await.unwrap().address, "");
+            computed.address = "x".to_string();
+            computed.name = "c2".to_string();
+            let errors = field_errors_of(svc.create(computed).await.unwrap_err());
+            assert_eq!(errors[0].field, "address");
+            let mem = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+            let mut internal = tag_at("i", mem, "");
+            internal.tag_kind = INTERNAL_TAG_KIND.to_string();
+            assert_eq!(svc.create(internal).await.unwrap().address, "");
+        }
+
+        #[test]
+        fn normalize_tag_address_is_one_verdict_for_every_kind() {
+            let registry = registry();
+            let n = |protocol: &str, input: &TagInput| {
+                normalize_tag_address("PLC1", protocol, input, &registry)
+            };
+            let ok = n("modbus-tcp", &tag_at("t", 1, " abc ")).unwrap();
+            assert_eq!(ok.canonical, "ABC");
+            let parsed = ok.parsed.unwrap();
+            assert_eq!((parsed.area.as_str(), parsed.writable_area), ("area", true));
+            // A protocol without a driver (`hub` is not in the Hub's registry).
+            let errors = n("hub", &tag_at("t", 1, "a.b.c")).unwrap_err();
+            assert_eq!(
+                fields(&errors),
+                [("address", "この接続のドライバ hub が見つかりません")]
+            );
+            // No kind to parse with: the dataType error is validate_tag_input's.
+            let mut input = tag_at("t", 1, "abc");
+            input.data_type = "bogus".to_string();
+            let ok = n("modbus-tcp", &input).unwrap();
+            assert_eq!((ok.canonical.as_str(), ok.parsed), ("abc", None));
+            // Empty plc address.
+            assert_eq!(
+                n("modbus-tcp", &tag_at("t", 1, "  ")).unwrap_err()[0].field,
+                "address"
+            );
+            // Unknown tag kind: nothing to parse.
+            let mut input = tag_at("t", 1, " z ");
+            input.tag_kind = "weird".to_string();
+            assert_eq!(n("modbus-tcp", &input).unwrap().canonical, "z");
+        }
+
+        // -- Q2: protocol change and group move re-parse the tags -----------------
+
+        async fn conn_svc(pool: &SqlitePool) -> PlcConnectionService {
+            PlcConnectionService::with_registry(pool.clone(), registry())
+        }
+
+        #[tokio::test]
+        async fn a_protocol_change_that_leaves_a_tag_unreadable_is_refused_with_a_list() {
+            let (_, svc, group) = reg_setup().await;
+            // 7 tags the slmp fake cannot read: a disabled 64-bit one and strings.
+            let mut disabled = tag_at("t-off", group, "abc");
+            disabled.data_type = "i64".to_string();
+            disabled.enabled = false;
+            svc.create(disabled).await.unwrap();
+            for i in 0..6 {
+                svc.create(string_tag(&format!("t-str{i}"), group, &format!("d{i}")))
+                    .await
+                    .unwrap();
+            }
+            svc.create(tag_at("t-ok", group, "fine")).await.unwrap();
+            let before = stored(&svc.pool).await;
+            let conn_id: i64 =
+                sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = 'PLC1'")
+                    .fetch_one(&svc.pool)
+                    .await
+                    .unwrap();
+
+            let err = conn_svc(&svc.pool)
+                .await
+                .update(conn_id, conn_input("PLC1", "slmp"))
+                .await
+                .unwrap_err();
+            let errors = field_errors_of(err);
+            assert_eq!(errors.len(), 1);
+            assert_eq!(errors[0].field, "protocol");
+            let message = &errors[0].message;
+            assert!(message.contains("タグ 7 件が読めなくなります"), "{message}");
+            assert!(message.contains("「t-off」"), "{message}");
+            assert!(message.contains("ほか 2 件"), "{message}");
+            // Five names listed (the remedy's own 「…」 quotes come after the first 。).
+            let listed = message.split('。').next().unwrap();
+            assert_eq!(listed.matches('「').count(), 5, "{message}");
+            // Nothing changed: the protocol, the rows, their revisions.
+            let protocol: String =
+                sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
+                    .bind(conn_id)
+                    .fetch_one(&svc.pool)
+                    .await
+                    .unwrap();
+            assert_eq!(protocol, "modbus-tcp");
+            assert_eq!(stored(&svc.pool).await, before);
+        }
+
+        #[tokio::test]
+        async fn a_protocol_change_rewrites_every_tag_to_the_new_canonical_form() {
+            let (_, svc, group) = reg_setup().await;
+            svc.create(tag_at("a", group, "abc")).await.unwrap();
+            let mut off = tag_at("b", group, "Def");
+            off.enabled = false;
+            svc.create(off).await.unwrap();
+            assert_eq!(stored(&svc.pool).await[0].1, "ABC");
+            let conn_id: i64 =
+                sqlx::query_scalar("SELECT id FROM plc_connections WHERE name = 'PLC1'")
+                    .fetch_one(&svc.pool)
+                    .await
+                    .unwrap();
+            conn_svc(&svc.pool)
+                .await
+                .update(conn_id, conn_input("PLC1", "slmp"))
+                .await
+                .unwrap();
+            assert_eq!(
+                stored(&svc.pool).await,
+                [
+                    ("a".to_string(), "abc".to_string(), 2),
+                    ("b".to_string(), "def".to_string(), 2),
+                ]
+            );
+            // The same protocol again re-parses nothing.
+            conn_svc(&svc.pool)
+                .await
+                .update(conn_id, conn_input("PLC1", "slmp"))
+                .await
+                .unwrap();
+            assert_eq!(stored(&svc.pool).await[0].2, 2);
+        }
+
+        #[tokio::test]
+        async fn a_connection_without_tags_changes_protocol_freely() {
+            let (_, svc, _) = reg_setup().await;
+            let (conn, _) = conn_and_group(&svc.pool, "Empty", "modbus-tcp").await;
+            conn_svc(&svc.pool)
+                .await
+                .update(conn, conn_input("Empty", "slmp"))
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_group_move_to_another_driver_reparses_and_a_same_driver_move_does_not() {
+            let (_, svc, group) = reg_setup().await;
+            let groups = CollectionGroupService::with_registry(svc.pool.clone(), registry());
+            let group_input = |name: &str, conn: i64| CollectionGroupInput {
+                name: name.to_string(),
+                plc_connection_id: conn,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            };
+            let (slmp_conn, _) = conn_and_group(&svc.pool, "S1", "slmp").await;
+            let (modbus2, _) = conn_and_group(&svc.pool, "M2", "modbus-tcp").await;
+            svc.create(tag_at("a", group, "abc")).await.unwrap();
+            // A non-canonical row (as if saved before R2b-2b), inserted raw.
+            sqlx::query("UPDATE tags SET address = 'XyZ'")
+                .execute(&svc.pool)
+                .await
+                .unwrap();
+
+            // Same driver: no re-parse, no rewrite, no revision bump.
+            groups
+                .update(group, group_input("Group1", modbus2))
+                .await
+                .unwrap();
+            assert_eq!(stored(&svc.pool).await, [("a".into(), "XyZ".into(), 1)]);
+
+            // Another driver, a tag it cannot read: refused, with the list, nothing changes.
+            svc.create(string_tag("s", group, "d1")).await.unwrap();
+            let before = stored(&svc.pool).await;
+            let errors = field_errors_of(
+                groups
+                    .update(group, group_input("Group1", slmp_conn))
+                    .await
+                    .unwrap_err(),
+            );
+            assert_eq!(errors[0].field, "plcConnectionId");
+            assert!(
+                errors[0].message.contains("タグ 1 件が読めなくなります"),
+                "{}",
+                errors[0].message
+            );
+            assert!(errors[0].message.contains("「s」"), "{}", errors[0].message);
+            assert_eq!(stored(&svc.pool).await, before);
+            assert_eq!(groups.get(group).await.unwrap().plc_connection_id, modbus2);
+
+            // Another driver, everything readable: moved, and rewritten (same transaction).
+            sqlx::query("DELETE FROM tags WHERE name = 's'")
+                .execute(&svc.pool)
+                .await
+                .unwrap();
+            groups
+                .update(group, group_input("Group1", slmp_conn))
+                .await
+                .unwrap();
+            assert_eq!(stored(&svc.pool).await, [("a".into(), "xyz".into(), 2)]);
+            sqlx::query("UPDATE tags SET address = 'xYz'")
+                .execute(&svc.pool)
+                .await
+                .unwrap();
+            groups
+                .update(group, group_input("Group1", modbus2))
+                .await
+                .unwrap();
+            assert_eq!(stored(&svc.pool).await, [("a".into(), "XYZ".into(), 3)]);
+        }
+
+        /// The legacy group service never touches an address on a move.
+        #[tokio::test]
+        async fn the_legacy_group_service_does_not_rewrite_on_a_move() {
+            let (_, svc, group) = reg_setup().await;
+            let (slmp_conn, _) = conn_and_group(&svc.pool, "S1", "slmp").await;
+            svc.create(tag_at("a", group, "abc")).await.unwrap();
+            CollectionGroupService::new(svc.pool.clone())
+                .update(
+                    group,
+                    CollectionGroupInput {
+                        name: "Group1".to_string(),
+                        plc_connection_id: slmp_conn,
+                        period_ms: 1_000,
+                        enabled: true,
+                        default_writable: true,
+                        query_sql: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(stored(&svc.pool).await, [("a".into(), "ABC".into(), 1)]);
+        }
     }
 }
