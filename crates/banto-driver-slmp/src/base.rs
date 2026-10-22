@@ -31,7 +31,7 @@ use banto_driver_api::{
     DriverId, FieldError, Settings, TagKind,
 };
 use banto_plc::slmp::address::MAX_DEVICE_NUMBER;
-use banto_plc::Address;
+use banto_plc::{Address, SlmpAccess, SlmpDevice};
 use banto_tags::{ALLOWED_CPU_TYPES, ALLOWED_WORD_ORDERS};
 
 use crate::PROTOCOL;
@@ -146,6 +146,7 @@ impl DriverBase for SlmpDriver {
         let (device, _number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
+        check_kind(text, device, bit, kind)?;
         // SLMP has no read-only device at the protocol level (a CPU's write
         // protection answers with an end code instead): every area is
         // writable as a protocol fact.
@@ -238,6 +239,64 @@ impl DriverBase for SlmpDriver {
         help.push_str(BIT_HINT);
         help
     }
+}
+
+/// The kind-dependent refusals (address design §3.2, Q4): what is wrong with
+/// this address *for this tag*, found at registration instead of as a Bad
+/// reading every cycle. The access / bit-position tests are
+/// `banto_plc::slmp_accepts_numeric` / `slmp_accepts_string`, the predicates
+/// `plan_slmp_batch` itself uses, so the two cannot drift; the planner keeps
+/// them as a safety net. The 64-bit refusal is `banto-tags`'
+/// `MODBUS_ONLY_DATA_TYPES` rule, which the host no longer applies by
+/// protocol name.
+fn check_kind(
+    text: &str,
+    device: SlmpDevice,
+    bit: Option<u8>,
+    kind: &TagKind,
+) -> Result<(), AddressError> {
+    let text = text.trim();
+    let access = device.access();
+    let access_label = if access == SlmpAccess::Bit {
+        "ビットデバイス"
+    } else {
+        "ワードデバイス"
+    };
+    match kind {
+        TagKind::Numeric(data_type) => {
+            let data_type = *data_type;
+            if matches!(data_type, DataType::I64 | DataType::U64 | DataType::F64) {
+                return Err(AddressError::new(format!(
+                    "SLMP は 64bit 型（i64/u64/f64）を扱えません（アドレス {text:?}、データ型: {data_type}）"
+                )));
+            }
+            if bit.is_some() && data_type != DataType::Bit {
+                return Err(AddressError::new(format!(
+                    "ビット指定アドレス {text:?} はデータ型 bit のタグでのみ使えます（現在のデータ型: {data_type}）"
+                )));
+            }
+            if !banto_plc::slmp_accepts_numeric(access, bit, data_type) {
+                return Err(AddressError::new(format!(
+                    "アドレス {text:?}（{device} は{access_label}）にデータ型 {data_type} のタグは置けません"
+                )));
+            }
+        }
+        TagKind::Str { .. } => {
+            if !banto_plc::slmp_accepts_string(access, bit) {
+                return Err(AddressError::new(format!(
+                    "string 型のタグはワードデバイスのビット指定なしのアドレスにだけ置けます（アドレス {text:?}）"
+                )));
+            }
+        }
+        // `TagKind` is `#[non_exhaustive]`: a kind added later is refused
+        // until this driver learns it.
+        _ => {
+            return Err(AddressError::new(format!(
+                "SLMP はこの種類のタグを扱えません（アドレス {text:?}）"
+            )))
+        }
+    }
+    Ok(())
 }
 
 fn require_text(settings: &Settings, key: &str, errors: &mut Vec<FieldError>) {
@@ -411,8 +470,15 @@ mod tests {
             (" SD10 ", "SD10", "SD", None),
         ];
         for (text, canonical, area, bit) in cases {
+            // Bit devices and bit-in-word suffixes take `bit`, word devices
+            // any other type (R2b-2a kind checks).
+            let k = if bit.is_some() || matches!(area, "M" | "X") {
+                kind(DataType::Bit)
+            } else {
+                kind(DataType::I16)
+            };
             let a = SlmpDriver
-                .parse_address(text, &kind(DataType::I16))
+                .parse_address(text, &k)
                 .unwrap_or_else(|e| panic!("{text}: {e}"));
             assert_eq!(a.driver.as_str(), "slmp");
             assert_eq!(a.canonical, canonical, "{text}");
@@ -420,24 +486,21 @@ mod tests {
             assert!(a.writable_area);
             assert_eq!(a.bit, bit, "{text}");
             assert_eq!(a.canonical, Address::parse_slmp(text).unwrap().to_string());
-            let again = SlmpDriver
-                .parse_address(&a.canonical, &kind(DataType::I16))
-                .unwrap();
+            let again = SlmpDriver.parse_address(&a.canonical, &k).unwrap();
             assert_eq!(again.canonical, a.canonical, "idempotent: {text}");
         }
     }
 
     #[test]
     fn parse_address_word_count_follows_the_kind() {
-        for (data_type, words) in [
-            (DataType::Bit, 1),
-            (DataType::I16, 1),
-            (DataType::F32, 2),
-            (DataType::F64, 4),
+        for (data_type, text, words) in [
+            (DataType::Bit, "M100", 1),
+            (DataType::I16, "D100", 1),
+            (DataType::F32, "D100", 2),
         ] {
             assert_eq!(
                 SlmpDriver
-                    .parse_address("D100", &kind(data_type))
+                    .parse_address(text, &kind(data_type))
                     .unwrap()
                     .word_count,
                 words
@@ -588,11 +651,13 @@ mod tests {
     #[test]
     fn offset_zero_is_the_canonical_form() {
         for text in ["D100", "d100", "X1A", "D100.5", "ZR0", "W1FF"] {
-            let canonical = SlmpDriver
-                .parse_address(text, &one_word())
-                .unwrap()
-                .canonical;
-            assert_eq!(offset(&canonical, &one_word(), 0).unwrap(), canonical);
+            let k = if text.starts_with('X') || text.contains('.') {
+                kind(DataType::Bit)
+            } else {
+                one_word()
+            };
+            let canonical = SlmpDriver.parse_address(text, &k).unwrap().canonical;
+            assert_eq!(offset(&canonical, &k, 0).unwrap(), canonical);
         }
     }
 
@@ -683,5 +748,136 @@ mod tests {
             hint(kind(DataType::Bit)),
             "bit 型はビットデバイスのアドレスをそのまま1点指定します（例: M50）。"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // R2b-2a: canonical table, kind-dependent refusals, the bridge
+    // (docs/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn canonical_table_is_idempotent_unique_and_bridges_back() {
+        let bit = || kind(DataType::Bit);
+        let word = || kind(DataType::U16);
+        let rows: [(&str, TagKind, &str); 9] = [
+            ("d100", word(), "D100"),
+            ("D0100", word(), "D100"),
+            ("D100", word(), "D100"),
+            (" D100 ", word(), "D100"),
+            ("X0010", bit(), "X10"),
+            ("x1a", bit(), "X1A"),
+            ("d100.a", bit(), "D100.A"),
+            ("D100.A", bit(), "D100.A"),
+            ("ZR5", kind(DataType::F32), "ZR5"),
+        ];
+        for (text, k, canonical) in rows {
+            let a = SlmpDriver
+                .parse_address(text, &k)
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(a.canonical, canonical, "{text:?}");
+            let again = SlmpDriver.parse_address(&a.canonical, &k).unwrap();
+            assert_eq!(again, a, "{text:?}: parse(canonical) == parse(text)");
+            assert_eq!(
+                Address::from_driver_address(&a).unwrap(),
+                Address::parse_slmp(text).unwrap(),
+                "{text:?}: bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_driver_address_from_another_driver_is_refused_by_the_bridge() {
+        let a = SlmpDriver.parse_address("D100", &one_word()).unwrap();
+        let foreign = DriverAddress::new(
+            DriverId::new("opc-ua").unwrap(),
+            a.canonical.clone(),
+            a.area.clone(),
+            a.writable_area,
+            a.word_count,
+        );
+        assert!(matches!(
+            Address::from_driver_address(&foreign),
+            Err(banto_plc::PlcError::UnsupportedDriver(d)) if d == "opc-ua"
+        ));
+    }
+
+    #[test]
+    fn sixty_four_bit_types_are_refused() {
+        for dt in [DataType::I64, DataType::U64, DataType::F64] {
+            let e = SlmpDriver
+                .parse_address("D100", &kind(dt))
+                .expect_err("64-bit on SLMP");
+            assert!(e.message().contains("64bit"), "{dt}: {}", e.message());
+        }
+        assert!(SlmpDriver
+            .parse_address("D100", &kind(DataType::F32))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_bit_suffix_needs_the_bit_data_type() {
+        for dt in [DataType::I16, DataType::U16, DataType::F32] {
+            let e = SlmpDriver
+                .parse_address("D100.5", &kind(dt))
+                .expect_err("bit suffix + non-bit");
+            assert!(e.message().contains("ビット指定"), "{dt}: {}", e.message());
+        }
+        assert!(SlmpDriver
+            .parse_address("D100.5", &kind(DataType::Bit))
+            .is_ok());
+    }
+
+    #[test]
+    fn strings_live_in_word_devices_without_a_bit_suffix() {
+        let s = TagKind::string(8, StringEncoding::ShiftJis);
+        assert!(SlmpDriver.parse_address("D100", &s).is_ok());
+        assert!(SlmpDriver.parse_address("M10", &s).is_err());
+        assert!(SlmpDriver.parse_address("D100.5", &s).is_err());
+    }
+
+    /// The refusal set is exactly the planner's: for every device with each
+    /// access, with and without a bit suffix, and every data type
+    /// (including `string`), `parse_address` agrees with `plan_slmp_batch`
+    /// (apart from the 64-bit rule, which is SLMP-only and checked above).
+    #[test]
+    fn refusals_match_the_planner_for_every_access_and_data_type() {
+        use banto_plc::{
+            plan_slmp_batch, BatchReadRequest, ReadRequest, StringEncoding as PlcEncoding,
+            StringReadRequest,
+        };
+        let types = [
+            DataType::Bit,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::F32,
+        ];
+        for text in ["D100", "M10", "D100.5", "W1F", "X1A"] {
+            let address = Address::parse_slmp(text).unwrap();
+            for dt in types {
+                let parsed = SlmpDriver.parse_address(text, &kind(dt));
+                let outcome = plan_slmp_batch(&[BatchReadRequest::Numeric(ReadRequest {
+                    address,
+                    data_type: dt,
+                })]);
+                assert_eq!(
+                    parsed.is_ok(),
+                    outcome.immediate_bad.is_empty(),
+                    "{text} + {dt}: {parsed:?}"
+                );
+            }
+            let parsed = SlmpDriver.parse_address(text, &TagKind::string(4, StringEncoding::Utf8));
+            let outcome = plan_slmp_batch(&[BatchReadRequest::String(StringReadRequest {
+                address,
+                words: 4,
+                encoding: PlcEncoding::Utf8,
+            })]);
+            assert_eq!(
+                parsed.is_ok(),
+                outcome.immediate_bad.is_empty(),
+                "{text} + string: {parsed:?}"
+            );
+        }
     }
 }

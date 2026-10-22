@@ -74,11 +74,13 @@ pub use client::{BoxFuture, PlcClient};
 pub use decode::WordOrder;
 pub use error::PlcError;
 pub use modbus::{dial_modbus, execute_modbus_reads, ModbusTcpClient, ModbusTcpConfig};
-pub use planning::{plan_batch_requests, plan_requests, MappedRequest, PlanOutcome, PlannedRead};
+pub use planning::{
+    modbus_accepts, plan_batch_requests, plan_requests, MappedRequest, PlanOutcome, PlannedRead,
+};
 pub use slmp::address::{SlmpAccess, SlmpDevice};
 pub use slmp::planning::{
-    plan_slmp_batch, plan_slmp_requests, ReadKind, SlmpMappedRequest, SlmpPlanOutcome,
-    SlmpPlannedRead,
+    plan_slmp_batch, plan_slmp_requests, slmp_accepts_numeric, slmp_accepts_string, ReadKind,
+    SlmpMappedRequest, SlmpPlanOutcome, SlmpPlannedRead,
 };
 pub use slmp::{
     classify_slmp, dial_slmp, execute_slmp_batch_reads, execute_slmp_reads, SlmpClient, SlmpConfig,

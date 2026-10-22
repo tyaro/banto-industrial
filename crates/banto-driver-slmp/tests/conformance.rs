@@ -19,7 +19,7 @@ mod common;
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DataType, DriverAddress, DriverBase, FatalError, SessionDriver, Settings,
+    ConnectContext, DataType, DriverAddress, DriverBase, ItemError, SessionDriver, Settings,
     StringEncoding, TagKind, TagSpec, Value,
 };
 use banto_driver_conformance::proxy::FaultProxy;
@@ -75,7 +75,6 @@ fn statics() -> StaticFixtures {
         ("D100.a", n(Bit), "D100.A"),
         ("d100.f", n(Bit), "D100.F"),
         ("D100", n(F32), "D100"),
-        ("D100", n(F64), "D100"),
         (
             "D100",
             TagKind::string(16, StringEncoding::ShiftJis),
@@ -83,6 +82,21 @@ fn statics() -> StaticFixtures {
         ),
     ] {
         f = f.valid(text, kind, canonical);
+    }
+    // R2b-2a (address design §3.2 Q4): refused for the tag's kind although
+    // the text itself is a valid device.
+    for (text, kind) in [
+        ("D100", n(I64)),
+        ("D100", n(U64)),
+        ("D100", n(F64)),
+        ("D100.5", n(U16)),
+        ("D100", n(Bit)),
+        ("M10", n(U16)),
+        ("M10", n(F32)),
+        ("M10", TagKind::string(4, StringEncoding::ShiftJis)),
+        ("D100.5", TagKind::string(4, StringEncoding::ShiftJis)),
+    ] {
+        f = f.invalid(text, kind);
     }
     for text in [
         "",
@@ -252,9 +266,10 @@ async fn legacy_session_conforms() {
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):
 /// in R1's `LegacySession` an address that does not parse after connect is
-/// `FatalError::InvalidConfig` (design §3.4, §7.1 C4).
+/// the tag's own `ItemError::Unsupported`, not fatal (R2b-2a, address design
+/// §6 Q5; design §3.4, §7.1 C4).
 #[tokio::test]
-async fn invalid_address_after_connect_is_fatal_invalid_config() {
+async fn invalid_address_after_connect_is_unsupported_not_fatal() {
     let sim = Simulator::start().await;
     let settings = Settings::from_pairs([
         ("host", sim.addr.ip().to_string()),
@@ -273,6 +288,9 @@ async fn invalid_address_after_connect_is_fatal_invalid_config() {
     let r = s
         .read_batch(&[TagSpec::new(foreign, n(DataType::U16))])
         .await;
-    assert!(matches!(r, Err(FatalError::InvalidConfig(_))), "{r:?}");
+    assert!(
+        matches!(r.as_deref(), Ok([Err(ItemError::Unsupported(_))])),
+        "{r:?}"
+    );
     sim.stop();
 }

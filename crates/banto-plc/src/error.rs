@@ -53,6 +53,14 @@ pub enum PlcError {
     #[error("アドレス形式が不正です: {0}")]
     InvalidAddress(String),
 
+    /// [`crate::address::Address::from_driver_address`] was handed a
+    /// [`banto_driver_api::DriverAddress`] parsed by a driver this crate has
+    /// no address grammar for (only `modbus-tcp` and `slmp`). A host-side
+    /// configuration error resolved before any wire traffic, so it is not
+    /// connection-fatal. Goes away with the HostBound bridge (R2b-3).
+    #[error("ドライバ {0:?} のアドレスは banto-plc では扱えません")]
+    UnsupportedDriver(String),
+
     /// A [`crate::types::ReadRequest`] carries an address written in a
     /// different protocol's notation than the client it was handed to speaks -
     /// e.g. an [`crate::address::Address::Slmp`] address in a batch given to
@@ -135,7 +143,10 @@ impl PlcError {
     /// [`Self::SlmpEndCode`] (the device refused one specific read but
     /// answered in full), plus [`Self::UnsupportedCombination`] and
     /// [`Self::AddressProtocolMismatch`] (configuration errors resolved before
-    /// any wire traffic).
+    /// any wire traffic), [`Self::InvalidAddress`] and
+    /// [`Self::UnsupportedDriver`] (one tag's address cannot be understood -
+    /// since R2b-2a that is a per-tag verdict, never a reason to drop the
+    /// socket; design docs/banto-hub-driver-address-design.md §6, Q5).
     ///
     /// Note the default is *fatal*: a variant added later is treated as
     /// "stop using this socket" until someone deliberately lists it here,
@@ -149,6 +160,8 @@ impl PlcError {
                 | PlcError::SlmpEndCode { .. }
                 | PlcError::UnsupportedCombination { .. }
                 | PlcError::AddressProtocolMismatch { .. }
+                | PlcError::InvalidAddress(_)
+                | PlcError::UnsupportedDriver(_)
                 | PlcError::StringSpanUnsupported { .. }
         )
     }
@@ -182,6 +195,8 @@ mod tests {
                 expected: "modbus-tcp".to_string(),
                 actual: "slmp".to_string(),
             },
+            PlcError::InvalidAddress("bogus".to_string()),
+            PlcError::UnsupportedDriver("opc-ua".to_string()),
             PlcError::StringSpanUnsupported {
                 words: 481,
                 max: 480,
@@ -203,7 +218,6 @@ mod tests {
             PlcError::NotConnected,
             PlcError::ResponseTimeout,
             PlcError::Protocol("truncated frame".to_string()),
-            PlcError::InvalidAddress("bogus".to_string()),
         ];
         for err in fatal {
             assert!(err.is_connection_fatal(), "{err:?} should be fatal");

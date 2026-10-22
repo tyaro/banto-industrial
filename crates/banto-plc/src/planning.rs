@@ -80,6 +80,28 @@ fn is_compatible(area: AddressArea, data_type: DataType) -> bool {
     }
 }
 
+/// Whether a request at `area` with an optional T8 bit-in-word position
+/// `bit` and `data_type` is something this planner can serve - the one
+/// predicate behind [`plan_requests`]'s `UnsupportedCombination` verdict.
+///
+/// Public so that the Modbus driver's `parse_address` (R2b-2a, design
+/// docs/banto-hub-driver-address-design.md §3.2 Q4) refuses at registration
+/// time exactly the combinations the planner would turn into a per-cycle
+/// Bad, with no second copy of the table to drift.
+pub fn modbus_accepts(area: AddressArea, bit: Option<u8>, data_type: DataType) -> bool {
+    match bit {
+        // T8 bit-in-word: only a register area, only a `bit` tag.
+        Some(_) => {
+            matches!(
+                area,
+                AddressArea::InputRegister | AddressArea::HoldingRegister
+            ) && data_type == DataType::Bit
+        }
+        // Pre-T8 shape, unchanged.
+        None => is_compatible(area, data_type),
+    }
+}
+
 /// Where one original [`ReadRequest`] (by its index in the slice passed to
 /// [`plan_requests`]) lands within a [`PlannedRead`]'s response window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,17 +220,7 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
             continue;
         };
 
-        let accepted = match bit {
-            // T8 bit-in-word: only a register area, only a `bit` tag.
-            Some(_) => {
-                matches!(
-                    area,
-                    AddressArea::InputRegister | AddressArea::HoldingRegister
-                ) && req.data_type == DataType::Bit
-            }
-            // Pre-T8 shape, unchanged.
-            None => is_compatible(area, req.data_type),
-        };
+        let accepted = modbus_accepts(area, bit, req.data_type);
 
         if accepted {
             by_area

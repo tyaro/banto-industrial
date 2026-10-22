@@ -145,6 +145,7 @@ impl DriverBase for ModbusDriver {
         let (area, _offset, bit) = address
             .as_modbus_ref()
             .expect("Address::parse always yields a ModbusRef");
+        check_kind(text, area, bit, kind)?;
         let driver_address = DriverAddress::new(
             descriptor().id.clone(),
             address.to_string(),
@@ -230,6 +231,46 @@ impl DriverBase for ModbusDriver {
         help.push_str(BIT_HINT);
         help
     }
+}
+
+/// The kind-dependent refusals (address design §3.2, Q4): what is wrong with
+/// this address *for this tag*, found at registration instead of as a Bad
+/// reading every cycle. The combination test is `banto_plc::modbus_accepts`,
+/// the very predicate `plan_requests` uses, so the two cannot drift; the
+/// planner keeps it as a safety net.
+fn check_kind(
+    text: &str,
+    area: banto_plc::AddressArea,
+    bit: Option<u8>,
+    kind: &TagKind,
+) -> Result<(), AddressError> {
+    let text = text.trim();
+    let data_type = match kind {
+        TagKind::Numeric(data_type) => *data_type,
+        TagKind::Str { .. } => {
+            return Err(AddressError::new(format!(
+                "Modbus TCP は string 型のタグを扱えません（アドレス {text:?}）"
+            )))
+        }
+        // `TagKind` is `#[non_exhaustive]`: a kind added later is refused
+        // until this driver learns it.
+        _ => {
+            return Err(AddressError::new(format!(
+                "Modbus TCP はこの種類のタグを扱えません（アドレス {text:?}）"
+            )))
+        }
+    };
+    if bit.is_some() && data_type != DataType::Bit {
+        return Err(AddressError::new(format!(
+            "ビット指定アドレス {text:?} はデータ型 bit のタグでのみ使えます（現在のデータ型: {data_type}）"
+        )));
+    }
+    if !banto_plc::modbus_accepts(area, bit, data_type) {
+        return Err(AddressError::new(format!(
+            "アドレス {text:?}（{area}）にデータ型 {data_type} のタグは置けません"
+        )));
+    }
+    Ok(())
 }
 
 fn require_text(settings: &Settings, key: &str, errors: &mut Vec<FieldError>) {
@@ -399,8 +440,14 @@ mod tests {
             (" 40001 ", "400001", "holding_register", true),
         ];
         for (text, canonical, area, writable) in cases {
+            // Coils / discrete inputs hold `bit`, registers any other type.
+            let k = if area == "coil" || area == "discrete_input" {
+                kind(DataType::Bit)
+            } else {
+                kind(DataType::I16)
+            };
             let a = ModbusDriver
-                .parse_address(text, &kind(DataType::I16))
+                .parse_address(text, &k)
                 .unwrap_or_else(|e| panic!("{text}: {e}"));
             assert_eq!(a.driver.as_str(), "modbus-tcp");
             assert_eq!(a.canonical, canonical, "{text}");
@@ -409,9 +456,7 @@ mod tests {
             assert_eq!(a.bit, None);
             assert_eq!(a.canonical, Address::parse(text).unwrap().to_string());
             // Idempotent.
-            let again = ModbusDriver
-                .parse_address(&a.canonical, &kind(DataType::I16))
-                .unwrap();
+            let again = ModbusDriver.parse_address(&a.canonical, &k).unwrap();
             assert_eq!(again.canonical, a.canonical);
         }
     }
@@ -440,11 +485,6 @@ mod tests {
                 words
             );
         }
-        let s = TagKind::string(16, StringEncoding::Utf8);
-        assert_eq!(
-            ModbusDriver.parse_address("40001", &s).unwrap().word_count,
-            16
-        );
     }
 
     #[test]
@@ -678,5 +718,132 @@ mod tests {
             hint(kind(DataType::Bit)),
             "bit 型はコイル（0xxxx）またはディスクリート入力（1xxxx）を1点指定します。"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // R2b-2a: canonical table, kind-dependent refusals, the bridge
+    // (docs/banto-hub-driver-address-design.md §1.4, §3.2 Q4, §4.2)
+    // ------------------------------------------------------------------
+
+    /// `(text, kind, canonical)`: spellings of one address share a canonical
+    /// form, parsing the canonical again is a no-op, and the HostBound bridge
+    /// returns the very `Address` `Address::parse(text)` gives.
+    #[test]
+    fn canonical_table_is_idempotent_unique_and_bridges_back() {
+        let bit = || kind(DataType::Bit);
+        let word = || kind(DataType::U16);
+        let rows: [(&str, TagKind, &str); 9] = [
+            ("40001", word(), "400001"),
+            ("400001", word(), "400001"),
+            (" 40001 ", word(), "400001"),
+            ("40001.03", bit(), "400001.3"),
+            ("40001.3", bit(), "400001.3"),
+            ("065536", bit(), "065536"),
+            ("00001", bit(), "000001"),
+            ("30001", kind(DataType::F32), "300001"),
+            ("465536", kind(DataType::I32), "465536"),
+        ];
+        for (text, k, canonical) in rows {
+            let a = ModbusDriver
+                .parse_address(text, &k)
+                .unwrap_or_else(|e| panic!("{text:?}: {e}"));
+            assert_eq!(a.canonical, canonical, "{text:?}");
+            let again = ModbusDriver.parse_address(&a.canonical, &k).unwrap();
+            assert_eq!(again, a, "{text:?}: parse(canonical) == parse(text)");
+            assert_eq!(
+                Address::from_driver_address(&a).unwrap(),
+                Address::parse(text).unwrap(),
+                "{text:?}: bridge"
+            );
+        }
+    }
+
+    #[test]
+    fn a_driver_address_from_another_driver_is_refused_by_the_bridge() {
+        let a = ModbusDriver.parse_address("40001", &one_word()).unwrap();
+        let foreign = DriverAddress::new(
+            DriverId::new("opc-ua").unwrap(),
+            a.canonical.clone(),
+            a.area.clone(),
+            a.writable_area,
+            a.word_count,
+        );
+        assert!(matches!(
+            Address::from_driver_address(&foreign),
+            Err(banto_plc::PlcError::UnsupportedDriver(d)) if d == "opc-ua"
+        ));
+    }
+
+    #[test]
+    fn a_bit_suffix_needs_the_bit_data_type() {
+        for dt in [DataType::I16, DataType::U16, DataType::F32, DataType::U64] {
+            let e = ModbusDriver
+                .parse_address("40001.3", &kind(dt))
+                .expect_err("bit suffix + non-bit");
+            assert!(e.message().contains("ビット指定"), "{dt}: {}", e.message());
+        }
+        assert!(ModbusDriver
+            .parse_address("40001.3", &kind(DataType::Bit))
+            .is_ok());
+        assert!(ModbusDriver
+            .parse_address("30001.15", &kind(DataType::Bit))
+            .is_ok());
+    }
+
+    /// The refusal set is exactly the planner's: for every (area, bit
+    /// suffix, data type) `parse_address` agrees with `plan_requests`, which
+    /// is the safety net behind it (the shared predicate
+    /// `banto_plc::modbus_accepts` is the single table).
+    #[test]
+    fn refusals_match_the_planner_for_every_area_and_data_type() {
+        use banto_plc::{plan_requests, ReadRequest};
+        let types = [
+            DataType::Bit,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::F32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F64,
+        ];
+        for text in ["00001", "10001", "30001", "40001", "30001.3", "40001.3"] {
+            for dt in types {
+                let parsed = ModbusDriver.parse_address(text, &kind(dt));
+                let outcome = plan_requests(&[ReadRequest {
+                    address: Address::parse(text).unwrap(),
+                    data_type: dt,
+                }]);
+                let planner_ok = outcome.immediate_bad.is_empty();
+                assert_eq!(parsed.is_ok(), planner_ok, "{text} + {dt}: {parsed:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn coil_with_f32_and_register_with_bit_are_refused() {
+        assert!(ModbusDriver
+            .parse_address("00001", &kind(DataType::F32))
+            .is_err());
+        assert!(ModbusDriver
+            .parse_address("10001", &kind(DataType::U16))
+            .is_err());
+        assert!(ModbusDriver
+            .parse_address("40001", &kind(DataType::Bit))
+            .is_err());
+        assert!(ModbusDriver
+            .parse_address("00001", &kind(DataType::Bit))
+            .is_ok());
+        assert!(ModbusDriver
+            .parse_address("40001", &kind(DataType::F64))
+            .is_ok());
+    }
+
+    #[test]
+    fn a_string_kind_is_refused() {
+        let s = TagKind::string(16, StringEncoding::Utf8);
+        let e = ModbusDriver.parse_address("40001", &s).unwrap_err();
+        assert!(e.message().contains("string"), "{}", e.message());
     }
 }

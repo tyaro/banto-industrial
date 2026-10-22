@@ -35,15 +35,17 @@ pub fn classify_read(err: PlcError) -> Result<ItemError, FatalError> {
         ))),
         PlcError::UnsupportedCombination { .. }
         | PlcError::AddressProtocolMismatch { .. }
-        | PlcError::StringSpanUnsupported { .. } => Ok(ItemError::Unsupported(err.to_string())),
+        | PlcError::StringSpanUnsupported { .. }
+        // One tag's address cannot be understood: that tag's problem, not the
+        // socket's (R2b-2a, address design §6 Q5; `is_connection_fatal` agrees).
+        | PlcError::InvalidAddress(_)
+        | PlcError::UnsupportedDriver(_) => Ok(ItemError::Unsupported(err.to_string())),
         PlcError::ConnectTimeout(message) | PlcError::Connection(message) => {
             Err(FatalError::Io(message))
         }
         PlcError::NotConnected => Err(FatalError::Io(err.to_string())),
         PlcError::ResponseTimeout => Err(FatalError::Timeout),
         PlcError::Protocol(message) => Err(FatalError::Framing(message)),
-        // Still fatal, as `is_connection_fatal` has it (R1 compatibility).
-        PlcError::InvalidAddress(message) => Err(FatalError::InvalidConfig(message)),
     }
 }
 
@@ -107,13 +109,14 @@ mod tests {
             PlcError::ModbusException { .. } | PlcError::SlmpEndCode { .. } => Want::Device,
             PlcError::UnsupportedCombination { .. }
             | PlcError::AddressProtocolMismatch { .. }
-            | PlcError::StringSpanUnsupported { .. } => Want::Unsupported,
+            | PlcError::StringSpanUnsupported { .. }
+            | PlcError::InvalidAddress(_)
+            | PlcError::UnsupportedDriver(_) => Want::Unsupported,
             PlcError::ConnectTimeout(_) | PlcError::Connection(_) | PlcError::NotConnected => {
                 Want::Io
             }
             PlcError::ResponseTimeout => Want::Timeout,
             PlcError::Protocol(_) => Want::Framing,
-            PlcError::InvalidAddress(_) => Want::InvalidConfig,
         }
     }
 
@@ -153,7 +156,7 @@ mod tests {
         }
     }
 
-    /// One value of every `PlcError` variant (11 - the match in `want_read`
+    /// One value of every `PlcError` variant (12 - the match in `want_read`
     /// is what keeps this list complete).
     fn every_read_error() -> Vec<PlcError> {
         vec![
@@ -162,6 +165,7 @@ mod tests {
             PlcError::NotConnected,
             PlcError::ResponseTimeout,
             PlcError::InvalidAddress("D100".into()),
+            PlcError::UnsupportedDriver("opc-ua".into()),
             PlcError::AddressProtocolMismatch {
                 expected: "modbus-ref".into(),
                 actual: "slmp".into(),
@@ -248,7 +252,7 @@ mod tests {
             .map(std::mem::discriminant)
             .collect();
         assert_eq!(reads.len(), every_read_error().len());
-        assert_eq!(reads.len(), 11);
+        assert_eq!(reads.len(), 12);
         let writes: HashSet<_> = every_write_error()
             .iter()
             .map(std::mem::discriminant)
@@ -346,9 +350,11 @@ mod tests {
             classify_read(PlcError::Protocol("bad mbap".into())),
             Err(FatalError::Framing("bad mbap".into()))
         );
+        // R2b-2a (Q5): an unparsable address is one tag's problem, not fatal.
+        let e = PlcError::InvalidAddress("zzz".into());
         assert_eq!(
-            classify_read(PlcError::InvalidAddress("zzz".into())),
-            Err(FatalError::InvalidConfig("zzz".into()))
+            classify_read(e.clone()),
+            Ok(ItemError::Unsupported(e.to_string()))
         );
         assert_eq!(
             classify_write(PlcWriteError::ResponseTimeout),
