@@ -1,7 +1,7 @@
 # banto-hub MCP リファレンス（MES / ゲートウェイ実装者向け）
 
 作成日: 2026-09-05
-状態: **現行**。2026-10-21（[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §3.1）: `create_connection` / `update_connection` の `protocol` に `push`（取り込み口）を足し、`settings`（push 専用、`stale_timeout_ms` と DB ブリッジの `bridge`）を受け渡せるようにした（§6。REST の `PlcConnectionPayload` と同じ規則で、`update_connection` の省略・`null` は保存済みを保ち、`{}` でブリッジを外す。`list_connections` の各行にも `settings`）。2026-10-21（R2a-2b、[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5）: §2 にスコープ `ingest:#{接続 id}`（`push` 接続へ値を送る。read / write / admin と直交）を足し、`create_api_key` で発行でき、`list_api_keys` の各行に `ingestTargets`（今の接続名・削除済み）を足した（§6）。送信口は R2a-2c / R2a-2d で、まだ無い。2026-10-19: §2 の「グループ名は全体で一意」を「接続内で一意」に直した（banto-tags migration 0022、オーナー決定。`create_group`/`update_group` の重複は `name` の項目エラー「この接続内では既に使用されています」）。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
+状態: **現行**。2026-10-22（R2b-2e、v0.2.0-alpha.35、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)）: §6 に「タグのアドレスの正規形と保存時の検証」を足した（`create_tag` / `update_tag` の応答の `address` は正規形、全タグを接続のドライバで検証、プロトコルの変更・グループの移動での解析し直し）。2026-10-21（[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §3.1）: `create_connection` / `update_connection` の `protocol` に `push`（取り込み口）を足し、`settings`（push 専用、`stale_timeout_ms` と DB ブリッジの `bridge`）を受け渡せるようにした（§6。REST の `PlcConnectionPayload` と同じ規則で、`update_connection` の省略・`null` は保存済みを保ち、`{}` でブリッジを外す。`list_connections` の各行にも `settings`）。2026-10-21（R2a-2b、[banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5）: §2 にスコープ `ingest:#{接続 id}`（`push` 接続へ値を送る。read / write / admin と直交）を足し、`create_api_key` で発行でき、`list_api_keys` の各行に `ingestTargets`（今の接続名・削除済み）を足した（§6）。送信口は R2a-2c / R2a-2d で、まだ無い。2026-10-19: §2 の「グループ名は全体で一意」を「接続内で一意」に直した（banto-tags migration 0022、オーナー決定。`create_group`/`update_group` の重複は `name` の項目エラー「この接続内では既に使用されています」）。2026-10-14（#605）: 接続ツールに `cpuType`（`Q` / `R`、省略時の作成は R、`update_connection` の省略は既存を保つ）。T19 S5（UX-41）で実装、T20 で `read_tag_now` / `write_recipe` を追加。
 2026-10-09 に #533 で `create_tag` / `update_tag` からしきい値（`thresholdH`〜`thresholdLl`）を外した（§6。値付きで送ると入力エラー、`update_tag` の必須項目からも外した）。
 2026-09-05 に実機 R08ENCPU（SLMP）でデータ面 6 ツールを検証済み、2026-09-06 に T21
 管理面を含む 31 ツール全数を実機で end-to-end 検証済み（結果は §9）。2026-09-06 に外部 DB 連携（[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5.2）で `test_saved_connection`（32 ツール目）・接続の `database`/`username`/`password`・グループの `querySql`・`db` tag_kind を同期。S4 で Sink グループ管理の 5 ツール追加で 37 ツール、2026-09-15 の `check_expression`（#342 段階A）で **38 ツール**となる。構成補助（管理面）ツールは §6。
@@ -261,6 +261,27 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 `present`（今の名前。「取り込み: Bridge1（#12）」）・`deleted`（接続が無い。「取り込み: （削除済み #12）」で、
 そのキーは二度と送れない）・`notPush`（接続が `push` でない）・`unknown`（接続の一覧を読めなかった。
 削除済みとは言わない）。`ingest:` を持たないキーは空の配列。
+
+**タグのアドレスの正規形と保存時の検証**（R2b-2、v0.2.0-alpha.35〜。
+[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)）:
+
+- `create_tag` / `update_tag`（と REST・CSV・設定パッケージの取り込み）は、`plc` タグの
+  `address` を**接続のドライバで解析し、正規形で保存する**。応答の `address` も正規形。
+  Modbus は 6 桁（`40001` → `400001`、ビットは `400001.3`）、SLMP は大文字・先頭ゼロなし
+  （`d100` → `D100`）。送った綴りは残らない。
+- 検証は**すべてのタグ**にかかる（無効のタグ・`string` のタグも）。データ型との組み合わせ
+  （ビット指定は `bit` だけ、領域とデータ型の不整合、SLMP の 64 bit、Modbus の `string` など）も
+  保存の時点で入力エラーになる。収集を始めてから Bad になるのを待たない。
+- `update_connection` で `protocol` を変えたとき、`update_group` でグループを別のドライバの
+  接続へ移したときは、配下の**全タグを新しいドライバで解析し直す**。1 件でも通らなければ
+  全体を断り、メッセージに最大 5 件（名前・保存済みのアドレス・理由）と「ほか N 件」を載せる。
+  全部通れば `address` を新しい正規形に書き直す（`revision` が 1 上がる）。同じドライバの
+  接続への移動では解析し直さない。
+- **既存の行は書き換えない**。alpha.35 より前に保存した行は、保存し直す（`update_tag` や
+  上の再解析）までは入力した綴りのまま。読み出し・収集は綴りのままでも動く。
+- 画面と CSV の取り込みは、アドレスの正規形・領域の情報を `POST /api/tags/parse-addresses`
+  （REST、viewer 以上、MCP のツールではない）で得る。`GET /api/tags/address-writable` は
+  無くなった。
 
 **セキュリティ姿勢（設計 §3・§8）**: `admin` スコープのキー1本が構成全権（任意 host への
 接続作成・別 admin キー発行・設定変更・lock_down）を持つ。ガードは **admin スコープ・

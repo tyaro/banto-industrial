@@ -1,13 +1,18 @@
 //! The driver-neutral address ([`DriverAddress`], WIT `parsed`) and the
 //! driver identifier ([`DriverId`]) it is qualified by.
 //!
-//! R1 keeps `banto_plc::Address` as the request type: a closed two-protocol
-//! enum cannot be API without breaking on every new protocol
-//! (docs/banto-driver-api-design.md §3.3). [`DriverAddress`] runs *alongside*
-//! it: in R1 it is only produced by a driver's address parser
-//! ([`DriverBase::parse_address`](crate::DriverBase::parse_address)) for the conformance tests and the R2b-2
-//! migration check; the production read/write paths do not pass through it
-//! until R2b-2.
+//! `banto_plc::Address` stays the request type of the broker and `PlcClient`:
+//! a closed two-protocol enum cannot be API without breaking on every new
+//! protocol (docs/banto-driver-api-design.md §3.3). [`DriverAddress`] is
+//! produced by a driver's address parser
+//! ([`DriverBase::parse_address`](crate::DriverBase::parse_address)), and
+//! since R2b-2 (docs/banto-hub-driver-address-design.md) the production paths
+//! go through it: the save path of `banto-tags` (when built with a registry)
+//! stores its `canonical`, and the Hub's plan, instant read and write paths
+//! parse with it. Below that, the HostBound drivers turn it back into a
+//! `banto_plc::Address` with `Address::from_driver_address` until R2b-3 moves
+//! requests to `DriverAddress` end to end. ChronoGazer has no registry and
+//! keeps the legacy rules until R2b-7.
 //!
 //! [`DriverId`] is defined here (rather than with
 //! [`DriverDescriptor`](crate::DriverDescriptor) in [`crate::driver`])
