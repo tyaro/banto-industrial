@@ -153,10 +153,17 @@ impl DriverBase for SlmpDriver {
                 text.trim()
             ))
         })?;
-        let (device, _number, bit) = address
+        let (device, number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
         check_kind(text, device, bit, kind)?;
+        if !occupied_fits(number, bit, kind) {
+            return Err(AddressError::new(format!(
+                "アドレス {:?} から {} 語分を占めると、デバイス番号の上限 {MAX_DEVICE_NUMBER}（0x{MAX_DEVICE_NUMBER:X}）を超えます",
+                text.trim(),
+                occupied_words(bit, kind)
+            )));
+        }
         // SLMP has no read-only device at the protocol level (a CPU's write
         // protection answers with an end code instead): every area is
         // writable as a protocol fact.
@@ -315,6 +322,25 @@ fn check_kind(
         }
     }
     Ok(())
+}
+
+/// How many device numbers a tag occupies from its address: 1 for a bit
+/// (a bit device, or one bit of a word), otherwise the kind's words (at
+/// least 1).
+pub(crate) fn occupied_words(bit: Option<u8>, kind: &TagKind) -> u32 {
+    if bit.is_some() {
+        1
+    } else {
+        u32::from(kind.word_count().max(1))
+    }
+}
+
+/// #793 のレビュー: タグの占める最後の番号もデバイス番号の範囲
+/// （`0..=MAX_DEVICE_NUMBER`）に入るか。`D16777215` の U32 は 2 語目が範囲の
+/// 外。保存時の `parse_address` と、フレーム型の `plan_read`（保存を経ない spec
+/// への守り）の両方がこれで断る。
+pub(crate) fn occupied_fits(number: u32, bit: Option<u8>, kind: &TagKind) -> bool {
+    u64::from(number) + u64::from(occupied_words(bit, kind)) - 1 <= u64::from(MAX_DEVICE_NUMBER)
 }
 
 fn require_text(settings: &Settings, key: &str, errors: &mut Vec<FieldError>) {
@@ -801,6 +827,35 @@ mod tests {
                 "{text:?}: bridge"
             );
         }
+    }
+
+    /// #793 のレビュー: タグの占める最後の番号が上限 0xFFFFFF を超えるものは
+    /// 保存で断る。上限ちょうどで終わるものは通す。
+    #[test]
+    fn a_tag_running_past_the_last_device_number_is_refused() {
+        let sjis = |words| TagKind::string(words, StringEncoding::ShiftJis);
+        for (text, k) in [
+            ("D16777215", kind(DataType::U32)),
+            ("D16777215", kind(DataType::I32)),
+            ("ZR16777215", kind(DataType::F32)),
+            ("D16777215", sjis(2)),
+            ("ZR16777214", sjis(3)),
+        ] {
+            let err = SlmpDriver.parse_address(text, &k).unwrap_err();
+            assert!(err.to_string().contains("上限"), "{text} {k:?}: {err}");
+        }
+        for (text, k) in [
+            ("D16777215", kind(DataType::U16)),
+            ("D16777214", kind(DataType::U32)),
+            ("ZR16777214", sjis(2)),
+            ("D16777215.F", kind(DataType::Bit)),
+            ("M16777215", kind(DataType::Bit)),
+        ] {
+            assert!(SlmpDriver.parse_address(text, &k).is_ok(), "{text} {k:?}");
+        }
+        assert!(SlmpDriver
+            .parse_address("BFFFFFF", &kind(DataType::Bit))
+            .is_ok());
     }
 
     #[test]

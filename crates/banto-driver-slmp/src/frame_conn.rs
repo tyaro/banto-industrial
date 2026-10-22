@@ -101,6 +101,14 @@ impl FrameConnection for SlmpConnection {
         let mut spec_of: Vec<u32> = Vec::new();
         for (i, spec) in specs.iter().enumerate() {
             if let Prep::Request(request) = read_request(spec)? {
+                // #793 のレビュー: 番号の上限からはみ出す spec はまとめる前に外す
+                // （どの step にも入らず、エンジンがその spec だけを
+                // `Unsupported` にする）。まとめた後の `bulk_read` の範囲検査で
+                // 落とすと、同じまとまりの正常な spec まで巻き込み、計画全体が
+                // 致命になる。
+                if !fits_device_numbers(spec) {
+                    continue;
+                }
                 requests.push(request);
                 spec_of.push(u32::try_from(i).map_err(|_| broken_plan("specs が多すぎる"))?);
             }
@@ -176,6 +184,16 @@ impl FrameConnection for SlmpConnection {
     }
 }
 
+/// Whether the device numbers `spec` occupies stay within the device's
+/// range ([`crate::base::occupied_fits`]). A canonical address that does not
+/// parse never gets here (`read_request` made it an item error).
+fn fits_device_numbers(spec: &TagSpec) -> bool {
+    Address::parse_slmp(&spec.address.canonical)
+        .ok()
+        .and_then(|a| a.as_slmp())
+        .is_some_and(|(_, number, bit)| crate::base::occupied_fits(number, bit, &spec.kind))
+}
+
 /// One spec's value out of its step's window. `Err` is a spec that does not
 /// fit the step (a broken plan); `Ok(Err(_))` a kind this driver cannot
 /// read.
@@ -194,11 +212,7 @@ fn decode_one(
             "{canonical:?} は SLMP のアドレスではない"
         )));
     };
-    let width = if bit.is_some() {
-        1
-    } else {
-        spec.kind.word_count().max(1)
-    };
+    let width = crate::base::occupied_words(bit, &spec.kind);
     let offset = number.checked_sub(span.start);
     let fits = device == span.device
         && offset.is_some_and(|o| u64::from(o) + u64::from(width) <= u64::from(span.count));
@@ -429,6 +443,50 @@ mod tests {
             c.decode_read(&p[0], &[], &data),
             Err(FatalError::Protocol(_))
         ));
+    }
+
+    /// A spec as the frame API may hand it over without going through the
+    /// save path (`parse_address` refuses these now).
+    fn unchecked(canonical: &str, kind: TagKind) -> TagSpec {
+        let words = kind.word_count();
+        TagSpec::new(
+            banto_driver_api::DriverAddress::new(
+                SlmpDriver.descriptor().id.clone(),
+                canonical,
+                "D",
+                true,
+                words,
+            ),
+            kind,
+        )
+    }
+
+    /// #793 のレビュー: 番号の上限をはみ出す spec が混ざっても、計画は致命に
+    /// ならず、はみ出す spec だけがどの step にも入らない。同じまとまりに
+    /// なるはずだった正常な spec（上限ちょうどの ZR16777215 の U16）も読める。
+    #[test]
+    fn a_spec_running_past_the_last_device_number_is_left_out_alone() {
+        let mut c = conn("R", "low_high");
+        let specs = [
+            spec("D0", n(DataType::U16)),
+            unchecked("ZR16777215", n(DataType::U32)),
+            spec("ZR16777215", n(DataType::U16)),
+            unchecked("ZR16777214", TagKind::string(4, StringEncoding::ShiftJis)),
+            spec("ZR16777213", n(DataType::U16)),
+        ];
+        let planned = c.plan_read(&specs).unwrap();
+        let mut covered: Vec<u32> = planned.iter().flat_map(|p| p.covers.clone()).collect();
+        covered.sort();
+        assert_eq!(covered, vec![0, 2, 4]);
+        for p in &planned {
+            let req = frame::parse_request(&p.step.send).unwrap();
+            let data = vec![0x07; req.span.read_data_len()];
+            let values = c.decode_read(p, &specs, &ok(&data)).unwrap();
+            assert!(
+                values.iter().all(|v| v == &Ok(RawValue::Uint(0x0707))),
+                "{values:?}"
+            );
+        }
     }
 
     #[test]
