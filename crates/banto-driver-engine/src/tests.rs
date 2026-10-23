@@ -996,8 +996,8 @@ async fn without_a_gap_the_same_measurement_sees_a_short_spacing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_gap_wait_is_capped_and_outside_the_response_deadline() {
-    // 応答の期限 T = 100 ms は待ちを含まない（待ちは MAX_INTER_FRAME_GAP 以下）。
+async fn the_gap_wait_is_capped_and_inside_the_response_deadline() {
+    // 待ちは応答の期限 T の中（T = 1 秒）。待ちは MAX_INTER_FRAME_GAP 以下に頭打ち。
     let stats = Arc::<Stats>::default();
     let mut wire = Wire::new(stats.clone());
     wire.recv_delay = Duration::from_millis(90);
@@ -1007,6 +1007,7 @@ async fn the_gap_wait_is_capped_and_outside_the_response_deadline() {
         wire,
         Arc::default(),
     );
+    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(1);
     s.read_batch(&three_specs()).await.unwrap();
     let spacing = min_spacing(&log).unwrap();
     assert!(spacing >= MAX_INTER_FRAME_GAP, "{spacing:?}");
@@ -1014,6 +1015,23 @@ async fn the_gap_wait_is_capped_and_outside_the_response_deadline() {
         spacing < MAX_INTER_FRAME_GAP + Duration::from_millis(5),
         "{spacing:?}"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_gap_wait_counts_against_a_shorter_response_deadline() {
+    // gap 4 ms > T 2 ms: 前のフレームの直後の次の step は、待ちの途中で期限が来て Timeout になる。
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = Duration::from_millis(1);
+    let mut s = session(
+        three_step_conn(stats.clone(), Duration::from_millis(4)),
+        wire,
+        Arc::default(),
+    );
+    s.core.as_mut().unwrap().response_timeout = Duration::from_millis(2);
+    let err = s.read_batch(&three_specs()).await.unwrap_err();
+    assert!(format!("{err:?}").contains("Timeout"), "{err:?}");
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test(start_paused = true)]

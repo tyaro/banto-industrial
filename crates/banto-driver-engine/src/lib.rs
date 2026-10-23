@@ -28,7 +28,7 @@ pub const MAX_HANDSHAKE_STEPS: usize = 32;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 /// `inter_frame_gap` の待ちの上限。ドライバの返す値がこれを超えても、待ちは必ずこの長さまでに収める
-/// （待ちは応答の期限の外だが、broker の外側の上限 `2T × step 上限 + 1 秒` に収まる長さに限る）。
+/// （待ちは step の応答の期限 T の中に入る。T がこれより短ければ、待ちの途中で期限が来て `Timeout` になる）。
 /// 300 baud 8N1 の t3.5 でも約 117 ms。
 pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
 
@@ -419,14 +419,21 @@ impl Core {
         if let Some(events) = &self.events {
             events.record(EngineEvent::StepStarted(step.clone()));
         }
-        // フレーム間の無音（設計 §7.3.1）。待ちは応答の期限の外（長さは MAX_INTER_FRAME_GAP 以下）。
-        wait_quiet(self.last_quiet_from, self.conn.inter_frame_gap()).await;
-        let send_start = Instant::now();
-        let deadline = send_start
+        // 期限は待ちの前に決める。フレーム間の無音（設計 §7.3.1）の待ちも step の応答の期限 T の中
+        // （長さは MAX_INTER_FRAME_GAP 以下）。broker の外側の上限 `2T × step 上限 + 1 秒` の前提を保つ。
+        let deadline = Instant::now()
             .checked_add(self.response_timeout)
             .ok_or_else(|| {
                 FatalError::InvalidConfig("応答の期限が時刻の範囲を超えました".into())
             })?;
+        timeout_at(
+            deadline,
+            wait_quiet(self.last_quiet_from, self.conn.inter_frame_gap()),
+        )
+        .await
+        .map_err(|_| FatalError::Timeout)?;
+        // tx_time の見積もりの起点は、待ちの後の時刻。
+        let send_start = Instant::now();
         timeout_at(deadline, self.transport.send(&step.send))
             .await
             .map_err(|_| FatalError::Timeout)??;

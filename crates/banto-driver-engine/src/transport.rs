@@ -47,7 +47,7 @@ pub enum TransportSpec {
 }
 
 impl TransportSpec {
-    /// 名前解決と接続（ポートを開く処理）を合わせて `connect_timeout` に制限する。
+    /// TCP の名前解決と接続を合わせて `connect_timeout` に制限する（シリアルのポートを開く処理には効かない）。
     pub async fn connect(
         &self,
         connect_timeout: Duration,
@@ -65,14 +65,9 @@ impl TransportSpec {
                 Ok(Box::new(TcpTransport::new(stream)))
             }
             Self::Serial { port, line } => {
-                // ポートを開くのは同期の呼び出しで短い。`timeout` で await に上限を掛ける
-                // （ハングする仮想ポートは実機の確かめの対象）。
-                tokio::time::timeout(connect_timeout, async {
-                    SerialTransport::open(port, *line)
-                })
-                .await
-                .map_err(|_| FatalError::Timeout)?
-                .map(|t| Box::new(t) as Box<dyn Transport>)
+                // ポートを開くのは同期の呼び出しで、`connect_timeout` は効かない（Windows の
+                // CreateFileW / Linux の open は通常すぐ返る。ハングする仮想ポートは実機の確かめの対象）。
+                SerialTransport::open(port, *line).map(|t| Box::new(t) as Box<dyn Transport>)
             }
         }
     }
