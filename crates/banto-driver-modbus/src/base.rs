@@ -3,13 +3,14 @@
 //!
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid, and the address functions. Its I/O is
-//! the `SessionDriver` in `api_session.rs` (registered as
-//! `DriverEntry::session` since R2b-3a-2). Since R2b-2
+//! the `FrameDriver` in `frame_conn.rs` (registered as
+//! `DriverEntry::frame` since R2b-3c; R2b-3a-2 to R2b-3b it was a
+//! `SessionDriver`). Since R2b-2
 //! (docs/banto-hub-driver-address-design.md) the address functions are on the
 //! production path: the save path of `banto-tags` (built with a registry)
 //! and the Hub's plan, instant read and write paths call `parse_address`;
 //! since R2b-3a-2 the broker carries the resulting `TagSpec` to this
-//! driver's session as is. Since R2b-3a-3 the collection plan (banto-hub and
+//! driver as is. Since R2b-3a-3 the collection plan (banto-hub and
 //! ChronoGazer) carries it as is too; the public bridge back
 //! to `banto_plc::Address` is gone. ChronoGazer keeps the legacy
 //! rules for saving until R2b-7.
@@ -47,8 +48,8 @@ use crate::PROTOCOL;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ModbusDriver;
 
-/// The driver as the registry stores it (`DriverEntry::session`, R2b-3a-2).
-pub fn driver() -> Arc<dyn banto_driver_api::SessionDriver> {
+/// The driver as the registry stores it (`DriverEntry::frame`, R2b-3c).
+pub fn driver() -> Arc<dyn banto_driver_api::FrameDriver> {
     Arc::new(ModbusDriver)
 }
 

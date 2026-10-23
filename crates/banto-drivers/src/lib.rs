@@ -28,10 +28,12 @@
 //!   that dropped fields in #334 / #605): collection reads go
 //!   through the broker too, which dials through [`Builtin::registry`]. So
 //!   this crate no longer depends on `banto-collect`.
-//! - **R2b-3a-2 scope** (docs/banto-hub-driver-io-design.md §4.2): `registry`
-//!   holds Modbus TCP and SLMP as `DriverKind::Session` entries (their
-//!   `SessionDriver`: identity, settings validation, address functions *and*
-//!   the I/O). The broker dials through this registry - the former side
+//! - **R2b-3c scope** (docs/banto-hub-driver-io-design.md §6.1): `registry`
+//!   holds Modbus TCP as a `DriverKind::Frame` entry (its `FrameDriver`:
+//!   identity, settings validation, address functions and the frames; the
+//!   engine owns the socket) and SLMP, until 3d, as a `DriverKind::Session`
+//!   entry (its `SessionDriver`, with the I/O). The broker dials through
+//!   this registry - the former side
 //!   table `Builtin::broker` (`banto_broker::DriverTable` of `dial`
 //!   functions) and R1's `DriverKind::HostBound` are gone. The `Settings` a
 //!   driver gets come from `banto_tags::settings_to_api` over the
@@ -44,8 +46,9 @@ use banto_driver_api::{DriverEntry, DriverRegistry};
 
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {
-    /// The driver registry (design §6.1): `modbus-tcp` and `slmp` as
-    /// session-type entries (R2b-3a-2; `HostBound` in R1-4b to R2b-3a-1).
+    /// The driver registry (design §6.1): `modbus-tcp` as a frame-type entry
+    /// (R2b-3c) and `slmp` as a session-type entry (R2b-3a-2, until 3d;
+    /// `HostBound` in R1-4b to R2b-3a-1).
     /// The broker dials through it (collection, read-now, write and the
     /// connection test alike since R2b-3a-3).
     pub registry: DriverRegistry,
@@ -61,11 +64,12 @@ pub fn builtin() -> Builtin {
 /// The registry of the built-in drivers (see [`Builtin::registry`]).
 fn registry() -> DriverRegistry {
     let mut registry = DriverRegistry::new();
-    for driver in [banto_driver_slmp::driver(), banto_driver_modbus::driver()] {
-        registry
-            .register(DriverEntry::session(driver))
-            .expect("builtin driver ids are distinct");
-    }
+    registry
+        .register(DriverEntry::session(banto_driver_slmp::driver()))
+        .expect("builtin driver ids are distinct");
+    registry
+        .register(DriverEntry::frame(banto_driver_modbus::driver()))
+        .expect("builtin driver ids are distinct");
     registry
 }
 
@@ -77,32 +81,38 @@ mod tests {
     use banto_driver_api::{DriverId, DriverKind};
     use banto_tags::ALLOWED_PROTOCOLS;
 
-    fn session_ids(registry: &DriverRegistry) -> BTreeSet<String> {
+    fn ids_of_kind(registry: &DriverRegistry, frame: bool) -> BTreeSet<String> {
         registry
             .ids()
-            .filter(|id| {
-                matches!(
-                    registry.get(id.as_str()).map(DriverEntry::kind),
-                    Some(DriverKind::Session(_))
-                )
-            })
+            .filter(
+                |id| match registry.get(id.as_str()).map(DriverEntry::kind) {
+                    Some(DriverKind::Frame(_)) => frame,
+                    Some(DriverKind::Session(_)) => !frame,
+                    _ => false,
+                },
+            )
             .map(|id| id.as_str().to_string())
             .collect()
     }
 
-    /// The registry holds exactly the two built-ins, both session-type
-    /// (R2b-3a-2), and each entry's descriptor id is the key it is found
-    /// under.
+    /// The registry holds exactly the two built-ins - `modbus-tcp` frame-type
+    /// (R2b-3c), `slmp` session-type (until 3d) - and each entry's descriptor
+    /// id is the key it is found under.
     #[test]
-    fn registry_holds_modbus_tcp_and_slmp_as_session_drivers() {
+    fn registry_holds_modbus_tcp_as_a_frame_driver_and_slmp_as_a_session_driver() {
         let registry = builtin().registry;
         assert_eq!(registry.len(), 2);
-        let want: BTreeSet<String> = ["slmp", "modbus-tcp"].map(String::from).into();
-        assert_eq!(session_ids(&registry), want);
+        assert_eq!(
+            ids_of_kind(&registry, true),
+            BTreeSet::from(["modbus-tcp".to_string()])
+        );
+        assert_eq!(
+            ids_of_kind(&registry, false),
+            BTreeSet::from(["slmp".to_string()])
+        );
         for id in ["slmp", "modbus-tcp"] {
             let entry = registry.get(id).expect("registered");
             assert_eq!(entry.descriptor().id.as_str(), id);
-            assert!(matches!(entry.kind(), DriverKind::Session(_)));
         }
         assert_eq!(
             registry.get("modbus-tcp").unwrap().descriptor().id.as_str(),

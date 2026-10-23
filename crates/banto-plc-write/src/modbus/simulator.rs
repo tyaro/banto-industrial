@@ -1,6 +1,6 @@
 //! In-process Modbus TCP simulator that accepts write commands (FC5/6/15/16)
 //! **and** read commands (FC1/3), so a test can write through
-//! [`super::ModbusWriteClient`] and then read the value back - proving the
+//! the frame-type driver and then read the value back - proving the
 //! write actually landed, and with the right bytes and word order.
 //!
 //! ## Why this is self-contained rather than reusing banto-plc's simulator

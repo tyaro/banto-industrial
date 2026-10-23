@@ -4,34 +4,28 @@
 //! ## What this crate is
 //!
 //! Until R1-4a the Modbus TCP driver (#131) lived inside `banto-broker`;
-//! R1-4a moved it here. R2b-3a-1 added the production
-//! [`banto_driver_api::SessionDriver`], and **R2b-3a-2 made it the only way
-//! in**: the composition root (`banto-drivers`) registers [`driver`] as
-//! `DriverEntry::session`, and the broker dials it through the registry with
-//! the connection's `Settings` and a `ConnectContext`. The former broker
-//! table entry (`dial`) and the `banto_broker::BrokerSession` impl are gone.
+//! R1-4a moved it here. R2b-3a-1 added a production
+//! [`banto_driver_api::SessionDriver`] (that owned a socket), and
+//! **R2b-3c replaced it with the frame-type driver**: the composition root
+//! (`banto-drivers`) registers [`driver`] as `DriverEntry::frame`, and the
+//! broker wraps it in `banto-driver-engine`'s `FrameSession`, which owns the
+//! socket, the response timeout and the "a timeout is fatal" rule. The
+//! session-type I/O (`api_session.rs`, `session.rs`, `banto_plc::dial_modbus`
+//! and `execute_modbus_reads`, `banto_plc_write::execute_modbus_writes`) is
+//! gone.
 //!
 //! - [`ModbusDriver`] / [`driver`] (`base.rs`): the [`banto_driver_api::DriverBase`]
 //!   implementation - identity, `validate_config`, `parse_address` over
 //!   `Address::parse`, `offset_address` / `address_help` ported from the
 //!   TypeScript, and the connection test's `probe` point (`40001`, R2b-3a-2 /
 //!   Q11).
-//! - `api_session.rs`: the [`banto_driver_api::SessionDriver`] / `Session`
-//!   (design §4.1). `connect` builds the config from `Settings` +
-//!   `ConnectContext` and dials with `banto_plc::dial_modbus`; reads and
-//!   writes run on `session::ModbusSession` - **one** socket and **one**
-//!   transaction-id counter shared by reads and writes (see that type's doc,
-//!   the most safety-critical property of this driver) - with the typed
-//!   `PlcError` -> `FatalError` / `ItemError` mapping. The canonical address
-//!   is turned back into a `banto_plc::Address` privately inside this crate.
-//! - `frame_conn.rs` (R2b-3c, design §6.1): the [`banto_driver_api::FrameDriver`] /
-//!   `FrameConnection` of the same driver, for `banto-driver-engine`: MBAP
-//!   frames out (`plan_read` / `write_next`), responses in (`decode_read` and
-//!   the write echo check), **one** `next_transaction_id` per connection for
-//!   reads and writes. It reuses the session's planners and gates
-//!   (`plan_batch_requests`, `plan_modbus_writes`, `read_request` /
-//!   `write_request`), so what is read, written and refused is the same. Not
-//!   registered yet: the broker still dials `api_session.rs` until 3c-join.
+//! - `frame_conn.rs` (design §6.1): the [`banto_driver_api::FrameDriver`] /
+//!   `FrameConnection`: MBAP frames out (`plan_read` / `write_next`),
+//!   responses in (`decode_read` and the write echo check), **one**
+//!   `next_transaction_id` per connection for reads and writes (the most
+//!   safety-critical property of this driver). The canonical address is turned
+//!   back into a `banto_plc::Address` privately inside this crate
+//!   (`request.rs`, which also holds the read / write request gates).
 //! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
 //!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
 //!
@@ -42,11 +36,10 @@
 //! even as a dev-dependency. The test that pins down Modbus through the
 //! broker lives in this crate's `tests/broker.rs`.
 
-mod api_session;
 mod base;
 mod classify;
 mod frame_conn;
-mod session;
+mod request;
 
 pub use base::{driver, ModbusDriver};
 pub use classify::{classify_read, classify_write};

@@ -697,8 +697,8 @@ impl PlcClient for SlmpClient {
         Box::pin(async move {
             // Drop any previous session first, so a redundant `connect()`
             // replaces it rather than leaking a socket - same
-            // implementation-defined-but-reconnects behaviour as
-            // `ModbusTcpClient` (see `client.rs`'s note on this).
+            // implementation-defined-but-reconnects behaviour
+            // (see `client.rs`'s note on this).
             if let Some(previous) = self.inner.take() {
                 previous.close().await;
             }

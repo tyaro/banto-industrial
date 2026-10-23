@@ -55,7 +55,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// until the caller calls [`PlcClient::connect`] again.
 pub trait PlcClient: Send {
     /// Establish the connection. Calling this again while already connected
-    /// is implementation-defined (the [`crate::modbus::ModbusTcpClient`]
+    /// is implementation-defined (the SLMP client
     /// simply reconnects, replacing the old socket) - callers that care
     /// should track their own connected/disconnected state rather than rely
     /// on `connect` to reject a redundant call.
