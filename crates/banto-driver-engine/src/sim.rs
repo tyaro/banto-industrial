@@ -169,7 +169,7 @@ fn generate(spec: &TagSpec, index: u32, tick: u64) -> Value {
     }
 }
 
-/// 書き込みの検査。通れば held にする値（整数は丸め済み）を返す。
+/// 書き込みの検査。通れば held にする値を返す。
 fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
     let reject = |m: &str| Err(ItemError::Rejected(m.to_owned()));
     if !item.spec.address.writable_area {
@@ -179,7 +179,8 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
         (TagKind::Numeric(DataType::Bit), Value::Bit(b)) => Ok(Value::Bit(*b)),
         (TagKind::Numeric(DataType::Bit), _) => reject("ビットには真偽値だけを書けます"),
         (TagKind::Numeric(dt), Value::F64(v)) => {
-            // 整数: 四捨五入（0.5 は 0 から遠い側）してから範囲 [lo, hi) を検査する。
+            // 整数: Hub の値の検査（apps/banto-hub/core/src/write_path.rs の `fract() != 0.0` で断る）と同じく、小数は断る。
+            // 丸めず、範囲 [lo, hi) を検査してから、受けた値そのものを held にする。
             let (lo, hi) = match dt {
                 DataType::I16 => (-32768.0, 32768.0),
                 DataType::U16 => (0.0, 65536.0),
@@ -195,11 +196,13 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
                 }
                 _ => return Ok(Value::F64(*v)),
             };
-            let r = v.round();
-            if !r.is_finite() || r < lo || r >= hi {
+            if !v.is_finite() || v.fract() != 0.0 {
+                return reject("整数ではありません");
+            }
+            if *v < lo || *v >= hi {
                 return reject("値が型の範囲外です");
             }
-            Ok(Value::F64(r))
+            Ok(Value::F64(*v))
         }
         (TagKind::Numeric(_), _) => reject("数値には数値だけを書けます"),
         (TagKind::Str { words, .. }, Value::Str(s)) => {
@@ -417,16 +420,17 @@ mod tests {
             wr(&u16s, Value::F64(f64::NAN)),     // 5 非有限
             wr(&s4, Value::Str("abcde".into())), // 6 長すぎ
             wr(&s4, Value::F64(1.0)),            // 7 種類違い
-            wr(&u16s, Value::F64(65535.4)),      // 8 通る（丸め）
-            wr(&i16s, Value::F64(-32768.0)),     // 9 通る
-            wr(&s4, Value::Str("abcd".into())),  // 10 通る
-            wr(&bit, Value::Bit(true)),          // 11 通る
+            wr(&u16s, Value::F64(1.5)),          // 8 小数
+            wr(&u16s, Value::F64(65535.0)),      // 9 通る
+            wr(&i16s, Value::F64(-32768.0)),     // 10 通る
+            wr(&s4, Value::Str("abcd".into())),  // 11 通る
+            wr(&bit, Value::Bit(true)),          // 12 通る
         ];
         let r = s.write_batch(&items).await.unwrap();
-        for (i, x) in r.iter().enumerate().take(8) {
+        for (i, x) in r.iter().enumerate().take(9) {
             assert!(rejected(x), "{i}: {x:?}");
         }
-        for (i, x) in r.iter().enumerate().skip(8) {
+        for (i, x) in r.iter().enumerate().skip(9) {
             assert_eq!(x, &Ok(()), "{i}");
         }
         assert_eq!(dev.write_count(), 4);
