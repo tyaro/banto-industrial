@@ -649,18 +649,33 @@ const BAD: Reading = Reading {
 
 /// 外部名 `external` のタグを、Hub の全 IF が通る `read_current` で読む。
 fn read_tag(manager: &CollectorManager, external: &str) -> Reading {
+    read_tag_aged(manager, external).0
+}
+
+/// [`read_tag`] と、その値の試行の時刻からの経過（ms）。
+fn read_tag_aged(manager: &CollectorManager, external: &str) -> (Reading, i64) {
     let map = manager.tag_map();
     let entry = map
         .get(external)
         .unwrap_or_else(|| panic!("tag {external} is not in the catalog"));
     let current = manager.current_values();
     let store = manager.server_store();
-    let (value, quality, _) = read_current(entry, current.as_ref(), &store, now_ms());
-    Reading {
-        value,
-        quality: quality_str(quality),
-    }
+    let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now_ms());
+    // 経過は導出の後に測る（導出の時計は `read_current` の中で別に読まれる。前に測ると、
+    // 間で止まったときに導かれた Stale が新しく見える）。
+    let now = now_ms();
+    (
+        Reading {
+            value,
+            quality: quality_str(quality),
+        },
+        now - ptime_ms,
+    )
 }
+
+/// `push` のグループ（200 ms）の現在値が、読むときに Stale を導く経過（周期 × 2.5。
+/// `banto_collect` の `STALE_PERIOD_FACTOR`）。
+const DERIVED_STALE_AFTER_MS: i64 = 500;
 
 /// タグの状態の並び（変わったときだけ控える）を 10 ms ごとに読んで集める。
 struct Recorder {
@@ -669,14 +684,30 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn start(manager: Arc<CollectorManager>, externals: Vec<String>) -> Self {
+    /// `skip_derived_stale` が `Some(i)` なら、`externals[i]` だけは、経過が
+    /// [`DERIVED_STALE_AFTER_MS`] を超えた Stale（tick の遅れで読むときに導かれたもの）を
+    /// 控えない（他のタグは厳密なまま。止まり続けても見逃さない）。ブリッジや Source が送った
+    /// `stale` は送るたびに時刻が新しいので、控えられる。
+    fn start(
+        manager: Arc<CollectorManager>,
+        externals: Vec<String>,
+        skip_derived_stale: Option<usize>,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let task = tokio::spawn(async move {
             let mut sequences: Vec<Vec<Reading>> = vec![Vec::new(); externals.len()];
             loop {
-                for (sequence, external) in sequences.iter_mut().zip(&externals) {
-                    let reading = read_tag(&manager, external);
+                for (index, (sequence, external)) in
+                    sequences.iter_mut().zip(&externals).enumerate()
+                {
+                    let (reading, age_ms) = read_tag_aged(&manager, external);
+                    if skip_derived_stale == Some(index)
+                        && reading.quality == "stale"
+                        && age_ms > DERIVED_STALE_AFTER_MS
+                    {
+                        continue;
+                    }
                     if sequence.last() != Some(&reading) {
                         sequence.push(reading);
                     }
@@ -890,6 +921,17 @@ impl Fixture {
         Recorder::start(
             self.app.manager.clone(),
             vec![Self::db_external(column), self.push_external(column)],
+            None,
+        )
+    }
+
+    /// [`Self::record`] で、ブリッジのタグだけ、読むときに導かれた Stale（tick の遅れ）を
+    /// 控えない。
+    fn record_ignoring_derived_stale(&self, column: &str) -> Recorder {
+        Recorder::start(
+            self.app.manager.clone(),
+            vec![Self::db_external(column), self.push_external(column)],
+            Some(1),
         )
     }
 
@@ -1434,7 +1476,9 @@ async fn parity_8_a_stopped_bridge_goes_bad_after_the_timeout() {
     )
     .await;
     fixture.settle(&[("a", good(41.5))]).await;
-    let recorder = fixture.record("a");
+    // ブリッジを止めた直後に負荷で tick が遅れると、収集の現在値が読むときに Stale を
+    // 導く（周期 × 2.5）。ブリッジが送ったものではないので控えない。
+    let recorder = fixture.record_ignoring_derived_stale("a");
     let stopped_at = tokio::time::Instant::now();
     let bridge = fixture.bridge.take().unwrap();
     assert_eq!(
