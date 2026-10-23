@@ -2,6 +2,18 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.38 — 2026-10-24（アルファ）
+
+R2b-5（シミュレーションを値の層へ。#805〜#808 と docs・版）。詳細設計は [docs/banto-hub-driver-sim-design.md](docs/banto-hub-driver-sim-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.37 の DB をそのまま開けます）。MCP・設定パッケージの形も変えていません。REST は下の「変更」の削除 2 点だけです。タグ・リリースの扱いは alpha.37 と同じです。
+
+### 変更
+
+- **`simulation = true` の接続は、ワイヤのシミュレータ（ソケット）を使わず、値の層で値を返します。** 接続ごとに値の表（`SimDevice`）を持ち、broker の共有セッションがそこから読み書きします。ポートを待ち受けないので、ポートの競合や起動の待ちがありません。
+- **文字列タグと、先頭 16 番地の外のタグも、シミュレーションで動く値を返します。** 従来は 16 番地の窓の外や文字列タグは動きませんでした。ビットは反転、整数と浮動小数はランプ、文字列は時間で変わる文字列です。
+- **シミュレーションの書き込みは、書いた値を読み戻します（held）。** 実機と同じく、型の範囲外・NaN・長すぎる文字列などは、その項目だけ拒否されます。書き込みの関門・監査は実機の接続と同じ順です。
+- **「値が動かないタグ」のカバレッジのプリフライトを削除しました。** 全タグが動くので判定が要らなくなりました。Hub の `GET /api/collection/simulation-coverage` と、ChronoGazer の `GET /api/simulation-coverage`・Tauri コマンド `simulation_coverage_list`・タグ画面の「値が動かないタグ」の一覧（#413）がなくなります。`simulation: true` のバッジと「値は記録されません」は残ります。
+- **内部**: `banto-collect` のワイヤのシミュレータ起動（`simulation.rs`）を削除し、ランプ波つきのシミュレータは `banto_plc::ramp`（テスト・`dev_plc` 用）に移しました。broker の接続の指紋にシミュレーションの印を含めます。`banto-driver-engine` は 0.2.0（`sim` の追加。crates.io へは未公開）。
+
 ## v0.2.0-alpha.37 — 2026-10-23（アルファ）
 
 R2b-3（I/O の一本化。#787〜#800 と docs・版）。詳細設計は [docs/banto-hub-driver-io-design.md](docs/banto-hub-driver-io-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.35 の DB をそのまま開けます）。REST・MCP・設定パッケージの形も変えていません。版の番号 alpha.36 は、alpha.34 の実機の確かめで直しが要る場合のために空けてあります（タグ・リリースは alpha.34 の実機の確かめの後）。
