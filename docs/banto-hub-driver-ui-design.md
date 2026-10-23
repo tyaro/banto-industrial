@@ -1,7 +1,7 @@
 # banto-hub 接続設定とアドレス補助をドライバから組み立てる 詳細設計（R2b-6）
 
 作成日: 2026-10-24
-最終更新: 2026-10-24（PR #810 のレビューの指摘を反映: オフセットの点数とワード数を分ける §4.3・文字列を含む種類の語彙 §3.4・保存前の接続テストの形 §5）
+最終更新: 2026-10-24（PR #810 のレビューの指摘を反映: オフセットの点数とワード数を分ける §4.3・文字列を含む種類の語彙 §3.4・保存前の接続テストの形 §5。2 回目: ワード内ビットのワード単位のオフセット `offset_words` §3.4・§4.3、ホストの接続のデータ型の選択肢 §7）
 状態: **設計案（オーナー確認待ち。§11 の Q1〜Q10）**。コード調査（§1）は 2026-10-24 の main（`9626f09c`、v0.2.0-alpha.38、R2b-5 完了の後）に対して行った。前提のオーナー指示（2026-10-24）: **最初に対応するドライバは MELSEC（SLMP）と Modbus（TCP）**。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-6「UI をドライバのスキーマから組み立てる汎用フォームに替え、iframe の枠を用意する」と、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §12.2 の 7「UI はドライバから組み立てる。プロトコル別の Svelte の分岐と TS の写しを消す」。
 関連: [banto-driver-api-design.md](banto-driver-api-design.md)（§4.1 `DriverBase`、§9 WIT との対応）、[banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。§2 の R2b-6 / R2b-7 の境、§3.2 型つきの `settings`、§4.3 平らな形のアダプタ）、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)（R2b-2。§7.1 `POST /api/tags/parse-addresses`）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §8（同梱 UI と iframe）。
@@ -135,6 +135,14 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 ```
 
 - Modbus は 64bit を含む数値と bit で、**文字列は含まない**（今の Modbus の `check_kind` が string を断るのと同じ）。SLMP は 64bit を除く数値と bit と **`String`**。`banto-tags` の `MODBUS_ONLY_DATA_TYPES`（#325）の判定を、接続のドライバの `supported_kinds` に替える。`push` は今の `push_tag_errors` のまま（ホストの接続）。
+- **ワード単位のオフセット**（§4.3 の `"words"` が使う。WIT `address.offset-words`、仮名）:
+
+```rust
+/// `canonical` を n ワードぶん物理的に動かした正規形。ワード内ビットはビットを保ち、ビットデバイスは n 点。
+fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> { /* 既定: 非対応のエラー */ }
+```
+
+- 適合テスト **C21**: `offset_words(c, 0) == c`。ワード内ビットのアドレスでビットが保たれる。`offset_words` の後のアドレスを元の型で `parse_address` できる（範囲内のとき）。
 - 適合テスト **C20**: `supported_kinds` に含む各種類で、ドライバの例のアドレス（`probe` の点か fixture）を `parse_address` できる。含まない種類（Modbus の `String`・SLMP の 64bit）は `parse_address` が断る（一覧と実際の受け入れが食い違わないこと）。
 
 ### 3.5 Modbus / SLMP のスキーマ（connection-settings-design §3.2 と同じキー・型）
@@ -165,7 +173,11 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 - 入力: `{ connectionId, items: [{ address, dataType, stringWords?, n, unit }] }`。出力: 入力と同じ順で `{ ok: { canonical } } | { err: { message } }`。`parse-addresses`（R2b-2d）と同じ形・同じ件数の上限。
 - **`unit` で「点数」と「ワード数」を分ける**（ドライバの `offset_address` は `kind.word_count() × n` で進むため。Modbus・SLMP の `base.rs` の `offset_address`）:
   - `"points"`（連続登録）: `n` 点ぶん。元の型のまま `offset_address(canonical, kind, n)`（f32 の `D100` を `n = 1` で `D102`）。
-  - `"words"`（オフセットコピー・構造体登録の累積オフセット）: `n` ワードぶんの物理的な変位。まず**元の型で `parse_address`**（アドレスと型の検証は保つ）し、次に 1 ワードの種類（`u16`）で `offset_address(canonical, u16, n)` を呼ぶ（f32 の `D100` を `n = 1` で `D101`）。今の `offsetCopy.ts` の `incrementAddress(source.address, 1, offset)` と同じ意味。bit の型のタグ（ビットデバイス・ワード内ビット）の扱いは 6d の着手時に今の `incrementAddress` の振る舞いと突き合わせて決め、食い違えば止めて報告する。
+  - `"words"`（オフセットコピー・構造体登録の累積オフセット）: `n` ワードぶんの物理的な変位。まず**元の型で `parse_address`**（アドレスと型の検証は保つ）し、次にドライバの新しいメソッド **`offset_words(canonical, n)`**（§3.4）で進める。`offset_address` に `u16` を渡す形は採らない: SLMP の `offset_address` は軸をアドレスの末尾（`.5`）だけで選ぶので `D100.5` が `D100.6` になり、Modbus は末尾つきのアドレスを 0 以外で進めると断るため。`offset_words` の約束:
+    - ワードのアドレス: `n` ワード進める（f32 の `D100` を `n = 1` で `D101`。`400001` は `400002`）。
+    - **ワード内ビット（`D100.5`・`400001.3`）: ワードの部分だけ進め、ビットは保つ**（`D100.5` を `n = 1` で `D101.5`、`400001.3` は `400002.3`）。物理的なワードの変位なので、構造体やブロックをまとめて写したとき、ビットの位置関係が崩れない。**今の `offsetCopy.ts` はビットの軸で進める（`D100.5` + 1 → `D100.6`）ので、ここは振る舞いを変える**（使用者無しの前提で、正しい形に直す。§12）。
+    - ビットデバイス（SLMP の `M`・`X`・`Y`、Modbus のコイル・入力）: ワードの単位が無いので `n` 点進める（今の `incrementAddress` と同じ）。
+    - 既定の実装は「このドライバはワード単位のオフセットに対応しません」のエラーを返す（既定つきの追加で API を壊さない）。
   - 進めた後のアドレスを元の型で `parse_address` し直し、範囲外（例えば 64bit が末尾をはみ出す）はエラーで返す。
 
 ## 5. REST の形（6b、Q2）
@@ -200,7 +212,8 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 - `tagAddressHelp.ts`: アドレスの文法の説明は `GET /api/drivers` の `addressHelp` に替える。**占有の注意**（ワード数・ビットの扱い）はデータ型と `parse-addresses` の `wordCount` から汎用に作る（`slmpOccupancyHint`・`modbusOccupancyHint` を 1 つにする）。`push` の注意は残す。
 - `slmpDeviceTable.ts` を消す。`continuousRegistration.ts`・`offsetCopy.ts`・`structRegistration.ts` の番号の計算を `POST /api/tags/offset-addresses` に替える（一覧を作る前に 1 回まとめて呼ぶ。入力に追従して呼ぶ箇所は `parse-addresses` と同じ間引き）。
 - ドライバが解釈できないアドレス（今の「SLMP として読めなければ末尾の数字を進める」のフォールバック）は、API のエラーをそのまま行に出す（フォールバックの推測をやめる）。Modbus の `40001` 形式もドライバの `offset_address` で進む。
-- `dataTypeOptionsFor` を `supportedKinds` に替える（§3.4）。SLMP では string を選べ、Modbus では選べない（今と同じ）。
+- `dataTypeOptionsFor` のうち、**ドライバの接続（Modbus・SLMP）の分だけ** `supportedKinds` に替える（§3.4）。SLMP では string を選べ、Modbus では選べない（今と同じ）。
+- **ホストの接続（`push`・`postgres`・`virtual`）と、接続の無いグループ（`computed`・`internal`・`db`・未選択）は今の対応を残す**（`/api/drivers` に載らないため。§4.1）: `push` は string を除く全部（64bit を含む）、それ以外は 64bit を除く安全側（今の `+page.svelte:239-245` と同じ）。`dataTypeOptionsFor` を「ドライバの `supportedKinds` があればそれ、無ければホストの表」の形にし、ホストの表の各場合を vitest で固定する。
 
 ## 8. iframe の枠（Q6）
 
@@ -212,7 +225,7 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 
 | PR  | 内容                                                                                                                                                                                                                                        | モデルの目安                       |
 | --- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
-| 6a  | `banto-driver-api` の `schema`・`settings_schema`・`supported_kinds`、Modbus / SLMP の実装、適合テスト C17〜C20、WIT（plugin-design §6.2）と api-design の対応表                                                                            | sonnet                             |
+| 6a  | `banto-driver-api` の `schema`・`settings_schema`・`supported_kinds`・`offset_words`、Modbus / SLMP の実装、適合テスト C17〜C21、WIT（plugin-design §6.2）と api-design の対応表                                                            | sonnet                             |
 | 6b  | `banto-tags` の `settings_from_schema` と `supported_kinds` による型の判定、Hub の `GET /api/drivers`、`/api/plc-connections` と保存前の接続テスト `/api/plc-connections/test` の形の変更（MCP 用の平らな形のアダプタは残す）、未適用キュー | opus（保存・秘密値・キューに触る） |
 | 6c  | `DriverSettingsForm.svelte` と `ConnectionDrawer.svelte` の置き換え（接続テストのボタンを含む）、`plcConnectionForm.ts` の整理、vitest                                                                                                      | sonnet                             |
 | 6d  | `POST /api/tags/offset-addresses`、`slmpDeviceTable.ts`・プロトコル別の説明の削除、タグの画面の置き換え                                                                                                                                     | sonnet                             |
@@ -223,10 +236,10 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 
 ## 10. テスト
 
-- 6a: 適合テスト C17〜C20 を Modbus / SLMP で通す。偽ドライバ（スキーマ空）で既定のメソッドを確かめる。 C20 は SLMP の string が通り、Modbus の string・SLMP の 64bit が断られることを含む。
+- 6a: 適合テスト C17〜C21 を Modbus / SLMP で通す。偽ドライバ（スキーマ空）で既定のメソッドを確かめる。 C20 は SLMP の string が通り、Modbus の string・SLMP の 64bit が断られることを含む。
 - 6b: `settings_from_schema` の単体（種類の違い・必須の欠け・範囲外・未知のキー・既定値の補完・秘密のキーの tri-state）。REST の統合テストを新しい形に書き換える（`banto-hub-host` 側。実ドライバが要る）。64bit 型の判定が Modbus で通り SLMP で断られる（#325 の約束が保たれる）。 接続テストは、保存前（`connectionId` 無し）と編集中（保存済みの秘密値を補う・設定を変えた値で張る）の両方を新しい形で確かめ、MCP の平らな形の接続テストが今のまま通ることも確かめる。
 - 6c: `DriverSettingsForm` の vitest（種類ごとの描画・Advanced の畳み・エラーの表示・ドライバを替えたときの引き継ぎ）。
-- 6d: `offset-addresses` の REST の統合テスト（SLMP の 16 進のデバイス・ビットの `.F` の繰り上がり・Modbus の `400001`・範囲外のエラー）。連続登録・オフセットコピーの vitest は API を偽で差し替える。`unit` の違い: f32 / 64bit / string のタグを `"words"` で 1 ワード進めると 1 ワードだけ動き、`"points"` では型のワード数ぶん動く。u16 の直後に f32 を置く混在型の構造体登録の累積オフセット。UI 側は連続登録の行数と型ごとの選択肢（SLMP の string を選べ Modbus では選べない）の vitest。
+- 6d: `offset-addresses` の REST の統合テスト（SLMP の 16 進のデバイス・ビットの `.F` の繰り上がり・Modbus の `400001`・範囲外のエラー）。連続登録・オフセットコピーの vitest は API を偽で差し替える。`unit` の違い: f32 / 64bit / string のタグを `"words"` で 1 ワード進めると 1 ワードだけ動き、`"points"` では型のワード数ぶん動く。u16 の直後に f32 を置く混在型の構造体登録の累積オフセット。ワード内ビットの `"words"`（`D100.5` + 1 → `D101.5`、`400001.3` + 1 → `400002.3`）とビットデバイス（`M100` + 1 → `M101`）。ホストの接続（`push`・`postgres`）と接続の無いグループのデータ型の選択肢が今と同じこと。UI 側は連続登録の行数と型ごとの選択肢（SLMP の string を選べ Modbus では選べない）の vitest。
 - 実機: 6e の前に、MELSEC（R08 試験機）と Modbus で、接続の作成・編集・接続テスト・連続登録を UI から 1 回ずつ（STATUS の実機の確かめの欄に入れる）。
 
 ## 11. オーナー判断（未決）
@@ -248,5 +261,6 @@ fn supported_kinds(&self) -> Vec<KindName> { ... }
 
 - `DEFAULT_PORTS`・`defaultWordOrderFor`（UI）と `banto-tags` の正規化・ドライバの既定が同じか（§3.5）。6a の着手時に突き合わせる。
 - 連続登録・オフセットコピーのフォールバック（SLMP として読めないアドレスの末尾の数字を進める）に依存した使い方が無いか。使用者無しの前提で、エラーを出す形に変えてよいと見ている（§7）。
+- オフセットコピーでワード内ビットのアドレスの動き方が変わる（§4.3。今はビットの軸、案はワードの軸）。ブロックを写す用途では案のほうが正しいが、「ビットを 1 つずらして写す」使い方をしていたなら変わる。
 - 6b と 6c の間で main の UI が接続を保存できない窓（§9）。
 - 構造体登録（`structRegistration.ts`）がニーモニックを読む用途は、offset だけで置き換えられるか。6d の着手時に確かめ、無理なら `parse-addresses` の応答に `area` を足す（R2b-2d の形に既定つきで追加）。
