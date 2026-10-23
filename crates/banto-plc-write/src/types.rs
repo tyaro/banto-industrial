@@ -1,4 +1,4 @@
-//! The shapes that cross [`crate::client::PlcWriteClient`]'s boundary: what to
+//! The shapes that cross the write boundary (the former `PlcWriteClient`, removed in R2b-3d-join): what to
 //! write ([`WriteRequest`]) and what came back ([`WriteResult`]).
 //!
 //! ## Why the value is a reused `banto_plc::TagValue`, not a new `WriteValue`
@@ -36,7 +36,7 @@ pub struct WriteRequest {
 }
 
 /// The outcome for one [`WriteRequest`] within a
-/// [`crate::client::PlcWriteClient::write_batch`] call. The write twin of
+/// `PlcWriteClient::write_batch` (removed) call. The write twin of
 /// `banto_plc::ReadResult`: a bare [`WriteResult::Ok`] (there is no value to
 /// hand back on a successful write) or a [`WriteResult::Bad`] carrying the
 /// per-request reason. See `banto-plc/src/error.rs` and
@@ -107,7 +107,7 @@ pub struct StringWriteRequest {
 /// One entry of a mixed write batch: an ordinary numeric/bit write (the
 /// existing [`WriteRequest`], unchanged), a string write, or a T8 bit-in-word
 /// RMW write (docs/tag-server-design.md §6.1). The request type for
-/// `plan_slmp_write_batch` / `SlmpWriteClient::write_batch_mixed` - and, via
+/// `plan_slmp_write_batch` - and, via
 /// `banto-broker`'s `Job::Write`, the type every broker-mediated write
 /// speaks, unchanged since T2 (adding this variant required no broker code
 /// change - see `slmp::planning`'s and `slmp::mod`'s module docs for why).

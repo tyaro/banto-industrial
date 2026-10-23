@@ -31,7 +31,7 @@
 //! whichever parser matches the `PlcConnection`'s protocol once (e.g. when I3
 //! loads a collection group's tags) and turn a parse failure into their own
 //! `ReadResult::Bad` for that one tag without ever handing it to
-//! [`crate::client::PlcClient::read_batch`]. This is what docs/plan.md I2 §3's
+//! `PlcClient::read_batch` (removed in R2b-3d-join). This is what docs/plan.md I2 §3's
 //! "パース失敗は個別 ReadResult::Bad（バッチは続行）" means in practice:
 //! `read_batch`'s hot path only ever sees already-valid addresses, so parsing
 //! never has to happen per poll cycle, only once when tag definitions are
@@ -41,9 +41,8 @@
 //!
 //! [`Address`] became an enum in I2a rather than staying Modbus-only, and the
 //! alternative - a generic parameter or an associated `Addr` type on
-//! [`crate::client::PlcClient`] - was rejected for the same reason the trait
-//! is hand-boxed to be `dyn`-compatible (see `client.rs`): I3 holds a
-//! `Vec<Box<dyn PlcClient>>` of mixed protocols, and a per-protocol address
+//! `PlcClient` (removed in R2b-3d-join) - was rejected because the one collection
+//! engine holds connections of mixed protocols, and a per-protocol address
 //! type would make that impossible without re-introducing an enum somewhere
 //! less convenient. Keeping the enum here means [`crate::types::ReadRequest`]
 //! stays one `Copy` struct, and each protocol implementation resolves the

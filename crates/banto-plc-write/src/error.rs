@@ -1,5 +1,6 @@
-//! [`PlcWriteError`]: every failure mode a [`crate::client::PlcWriteClient`]
-//! can report. The write-side twin of `banto_plc::PlcError` (which this crate
+//! [`PlcWriteError`]: every failure mode a write over a PLC connection can
+//! report (the former `PlcWriteClient` trait, removed in R2b-3d-join, was its
+//! original boundary). The write-side twin of `banto_plc::PlcError` (which this crate
 //! deliberately does not reuse: a write has failure modes a read does not - a
 //! value that will not fit its target register - and reusing the read type
 //! would either force those into an ill-fitting variant or grow the read type

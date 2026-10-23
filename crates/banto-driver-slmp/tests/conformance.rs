@@ -5,20 +5,18 @@
 //!   `banto-plc/src/slmp/address.rs`'s tests (the grammar) and the
 //!   TypeScript `continuousRegistration.test.ts` / `offsetCopy.test.ts`
 //!   (offsets).
-//! - `session::run_all_against` (C1-C8, C12-C15) through the production
-//!   `Session` of `SlmpDriver` (R2b-3a-1), against `banto-plc`'s SLMP simulator
-//!   behind a `FaultProxy`. The bit-in-word writes go through the production
-//!   read-modify-write (`execute_one_bit_write`); C14's check-read mismatch
-//!   and C15's refusals are made by the proxy rewriting one response.
-//! - The same `session::run_all_against` (C1-C8, C12-C15) through the
-//!   frame-type `SlmpDriver` wrapped by the real engine (`FrameSession`,
-//!   R2b-3d-2, docs/banto-hub-driver-io-design.md §11.2), on the R and the
-//!   Q series. The wrapper is the one `banto-broker` puts around a
+//! - `session::run_all_against` (C1-C8, C12-C15) through the frame-type
+//!   `SlmpDriver` wrapped by the real engine (`FrameSession`, R2b-3d-2,
+//!   docs/banto-hub-driver-io-design.md §11.2), on the R and the Q series,
+//!   against `banto-plc`'s SLMP simulator behind a `FaultProxy`. C14's
+//!   check-read mismatch and C15's refusals are made by the proxy rewriting
+//!   one response. Until R2b-3d-join the same checks also ran through the
+//!   session-type driver (`session_conforms`); that driver is gone. The
+//!   wrapper is the one `banto-broker` puts around a
 //!   frame-type entry (`FrameDial`, crate-private there), as in
 //!   `banto-driver-modbus`'s `tests/conformance.rs`. The bit-in-word writes
 //!   go through `write_next`'s three steps, so the same response patches
-//!   (read, write-back, check read) apply. The session-type run above stays
-//!   until the broker's registration moves to the frame type (3d-join).
+//!   (read, write-back, check read) apply.
 //!
 //! Every simulator and proxy binds 127.0.0.1:0, so these tests need no
 //! nextest test-group.
@@ -313,17 +311,6 @@ fn fixtures() -> SessionFixtures {
         )
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn session_conforms() {
-    let sim = Simulator::start().await;
-    seed(&sim);
-    let proxy = FaultProxy::start(sim.addr).await.unwrap();
-    let failures = session::run_all_against(&SlmpDriver, &fixtures(), &proxy).await;
-    let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
-    assert!(failures.is_empty(), "{text:#?}");
-    sim.stop();
-}
-
 /// The frame-type driver in the engine, on `cpu` (module doc).
 async fn frame_session_conforms(cpu: &str) {
     let sim = Simulator::start().await;
@@ -365,7 +352,7 @@ async fn invalid_address_after_connect_is_unsupported_not_fatal() {
     ])
     .unwrap();
     let cx = ConnectContext::new("t", Duration::from_secs(2), Duration::from_secs(1));
-    let mut s = SlmpDriver.connect(&settings, cx).await.unwrap();
+    let mut s = EngineSession.connect(&settings, cx).await.unwrap();
     let foreign = DriverAddress::new(
         SlmpDriver.descriptor().id.clone(),
         "400001",

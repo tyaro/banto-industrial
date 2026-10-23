@@ -1,4 +1,4 @@
-//! The shapes that cross [`crate::client::PlcClient`]'s boundary: what to
+//! The shapes that cross the read boundary (the former `PlcClient`, removed in R2b-3d-join): what to
 //! read ([`ReadRequest`]) and what came back ([`ReadResult`]/[`TagValue`]).
 
 use crate::address::Address;
@@ -27,7 +27,7 @@ pub struct ReadRequest {
     pub data_type: DataType,
 }
 
-/// The outcome for one [`ReadRequest`] within a [`crate::client::PlcClient::read_batch`]
+/// The outcome for one [`ReadRequest`] within a `PlcClient::read_batch` (removed)
 /// call. `Bad` carries the [`crate::error::PlcError`] that explains *why*
 /// this one request failed while its batch-mates may well have succeeded -
 /// see `error.rs`'s module doc for the connection-level-vs-per-request split

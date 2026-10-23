@@ -229,7 +229,7 @@ pub use session::{Connector, NoSecretOpener, SecretOpener};
 /// this is defense in depth for a hand-edited database row.
 ///
 /// `pub` since R1-4a: both driver crates' connection set-up
-/// (`banto-driver-slmp`'s `api_session.rs`, `banto-driver-modbus`'s `frame_conn.rs`) call this
+/// (`banto-driver-slmp`'s `frame_conn.rs`, `banto-driver-modbus`'s `frame_conn.rs`) call this
 /// one function, so the two protocols' fallback cannot drift apart. The
 /// broker itself does not call it.
 pub fn parse_word_order(value: &str) -> WordOrder {

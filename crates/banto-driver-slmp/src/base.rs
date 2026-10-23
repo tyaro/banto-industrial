@@ -3,8 +3,8 @@
 //!
 //! The stateless half of the driver ([`DriverBase`]): who it is, whether a
 //! connection's settings are valid (including the CPU type, #605), and the
-//! address functions. Its I/O is the `SessionDriver` in `api_session.rs`
-//! (registered as `DriverEntry::session` since R2b-3a-2). Since R2b-2
+//! address functions. Its I/O is the `FrameDriver` in `frame_conn.rs`
+//! (registered as `DriverEntry::frame` since R2b-3d-join). Since R2b-2
 //! (docs/banto-hub-driver-address-design.md) the address functions are on
 //! the production path: the save path of `banto-tags` (built with a
 //! registry) and the Hub's plan, instant read and write paths call
@@ -47,8 +47,8 @@ use crate::PROTOCOL;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SlmpDriver;
 
-/// The driver as the registry stores it (`DriverEntry::session`, R2b-3a-2).
-pub fn driver() -> Arc<dyn banto_driver_api::SessionDriver> {
+/// The driver as the registry stores it (`DriverEntry::frame`, R2b-3d-join).
+pub fn driver() -> Arc<dyn banto_driver_api::FrameDriver> {
     Arc::new(SlmpDriver)
 }
 
@@ -371,7 +371,7 @@ pub(crate) fn occupancy(device: SlmpDevice, bit: Option<u8>, kind: &TagKind) -> 
 /// #793 のレビュー: タグの占める最後の番号もデバイス番号の範囲
 /// （`0..=MAX_DEVICE_NUMBER`）に入るか。入らなければその理由の文言
 /// （`D16777215` の U32 は 2 語目が範囲の外）。保存時の `parse_address` と、
-/// 保存を経ない spec への守りとして読み書きの入口（`api_session.rs` の
+/// 保存を経ない spec への守りとして読み書きの入口（`request.rs` の
 /// `past_last_number`、フレーム型の `plan_read` も通る）の両方がこれを使う。
 /// 単位はデバイスの種類で「語」か「点」。
 pub(crate) fn past_last_number(

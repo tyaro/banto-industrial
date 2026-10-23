@@ -1,4 +1,5 @@
-//! [`PlcError`]: every failure mode a [`crate::client::PlcClient`] can report.
+//! [`PlcError`]: every failure mode a read over a PLC connection can report (the
+//! former `PlcClient` trait, removed in R2b-3d-join, was its original boundary).
 //!
 //! Two very different call sites share this one type (docs/plan.md I2
 //! design decision, 2026-07-12): a whole-call failure returned as

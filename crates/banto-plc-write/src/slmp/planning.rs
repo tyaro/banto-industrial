@@ -34,7 +34,7 @@
 //! **plan**, not a payload: [`SlmpPlannedBitWrite`] carries a `set_mask`/
 //! `clear_mask` pair (which bits to force to 1, which to force to 0 - always
 //! disjoint by construction) and a `mapping` of which request wants which
-//! bit at which value, for `slmp/mod.rs`'s [`crate::execute_slmp_writes`] to
+//! bit at which value, for `slmp/mod.rs`'s `banto-driver-slmp`'s `write_next` to
 //! turn into an actual read/modify/write/verify sequence against a live
 //! session. This is exactly the same plan/execute split the rest of this
 //! crate already has (pure planner vs I/O executor) - T8 only adds a case

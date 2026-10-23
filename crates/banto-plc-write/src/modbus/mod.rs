@@ -4,7 +4,7 @@
 //! and the write-capable [`simulator`].
 //!
 //! Until R2b-3c this module also held `ModbusWriteClient` (the
-//! [`crate::client::PlcWriteClient`] for Modbus TCP) and
+//! `PlcWriteClient` for Modbus TCP) and
 //! `execute_modbus_writes` (a planned batch on a borrowed `TcpStream`). The
 //! broker now reaches Modbus through the frame-type driver
 //! (`banto-driver-modbus` over `banto-driver-engine`, docs/banto-hub-driver-io-design.md
