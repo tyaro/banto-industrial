@@ -294,12 +294,20 @@ impl std::fmt::Display for SerialPortName {
 /// `SerialTransport` が包むストリーム。試験で偽のストリームに差し替えるための crate 内の境界。
 trait SerialIo: AsyncRead + AsyncWrite + Unpin + Send + 'static {
     fn clear_input(&mut self) -> std::io::Result<()>;
+    /// 未送信の出力を捨てる（ブロックしない）。閉じる前に呼ぶ。
+    fn clear_output(&mut self) -> std::io::Result<()>;
 }
 
 impl SerialIo for tokio_serial::SerialStream {
     fn clear_input(&mut self) -> std::io::Result<()> {
         use tokio_serial::SerialPort;
         self.clear(tokio_serial::ClearBuffer::Input)
+            .map_err(std::io::Error::from)
+    }
+
+    fn clear_output(&mut self) -> std::io::Result<()> {
+        use tokio_serial::SerialPort;
+        self.clear(tokio_serial::ClearBuffer::Output)
             .map_err(std::io::Error::from)
     }
 }
@@ -311,6 +319,7 @@ impl SerialIo for tokio_serial::SerialStream {
 /// Windows の `flush` は drain にならない。送り終えはエンジンが `tx_time` の見積もりと
 /// 非同期の `sleep_until` で扱う。`write_all` は Unix では `AsyncFd` の非ブロッキングの書き込みで、
 /// カーネルのバッファが一杯なら非同期に待つだけなので期限で打ち切れる。
+/// drop では送信待ちを先に捨てる（Linux の `close` は送信待ちを最大 `closing_wait` 同期で待つため）。
 pub struct SerialTransport {
     stream: Box<dyn SerialIo>,
     char_time: Duration,
@@ -358,6 +367,19 @@ impl SerialTransport {
     }
 }
 
+impl Drop for SerialTransport {
+    fn drop(&mut self) {
+        // Linux の tty の `close` は、送信待ちのデータが残っていると送り出すまで（`closing_wait`、
+        // 既定で最大 30 秒）同期でブロックする。drop は runtime のスレッドで起きるので、時間切れ・
+        // 取り消しで送信の途中のまま捨てると runtime が止まる。先に残りを捨てる。エンジンは
+        // farewell の後は送り終えの見積もりまで待ってから閉じるので、正常の別れは切れない。
+        // 致命の後は捨ててよい。
+        if let Err(error) = self.stream.clear_output() {
+            tracing::debug!(%error, "シリアルの送信バッファを捨てられなかった");
+        }
+    }
+}
+
 impl Transport for SerialTransport {
     fn tx_time(&self, len: usize) -> Duration {
         self.char_time
@@ -392,7 +414,7 @@ impl Transport for SerialTransport {
     }
 
     fn close(&mut self) -> BoxFuture<'_, ()> {
-        // ストリームを drop するとポートが閉じる。ここで待つものはない。
+        // ストリームの drop（`Drop for SerialTransport`）でポートが閉じる。ここで待つものはない。
         Box::pin(async {})
     }
 }
@@ -704,6 +726,7 @@ mod tests {
         flush_panics: bool,
         write_pending: bool,
         written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+        cleared_output: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl AsyncRead for FakeIo {
@@ -750,6 +773,27 @@ mod tests {
         fn clear_input(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+        fn clear_output(&mut self) -> std::io::Result<()> {
+            self.cleared_output
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// drop すると、閉じる前に未送信の出力を 1 回だけ捨てる（Linux の close の同期待ちを避ける）。
+    #[test]
+    fn serial_drop_clears_output_once() {
+        let cleared = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let io = FakeIo {
+            flush_panics: false,
+            write_pending: false,
+            written: Default::default(),
+            cleared_output: cleared.clone(),
+        };
+        let transport = SerialTransport::from_io(Box::new(io), SerialLine::default());
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(transport);
+        assert_eq!(cleared.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -759,6 +803,7 @@ mod tests {
             flush_panics: true,
             write_pending: false,
             written: written.clone(),
+            cleared_output: Default::default(),
         };
         let mut transport = SerialTransport::from_io(Box::new(io), SerialLine::default());
         transport.send(&[1, 2, 3]).await.unwrap();
@@ -776,6 +821,7 @@ mod tests {
             flush_panics: true,
             write_pending: true,
             written: Default::default(),
+            cleared_output: Default::default(),
         };
         let mut transport = SerialTransport::from_io(Box::new(io), SerialLine::default());
         let other = tokio::spawn(async {
