@@ -336,7 +336,7 @@
 	const connectionRows = $derived(listRows(connectionsState));
 	const connectionsView = $derived(listSectionView(connectionsState));
 	const connectionsRetry = $derived(showsRetry(connectionsState));
-	/** #413: レジストリ上にシミュレーション接続が 1 本でもあるか（注記と「値が動かないタグ」の出し分け）。 */
+	/** #413: レジストリ上にシミュレーション接続が 1 本でもあるか（注記の出し分け）。 */
 	const hasSimulationConnection = $derived(connectionRows.some((c) => c.simulation));
 
 	/**
@@ -1313,7 +1313,7 @@
 	//
 	// 判定は Rust（収集の開始と同じ `build_config_lenient_from`）の結果を読む
 	// だけ（`listConfigExclusions`）。収集が走っていなくても出す。再取得の
-	// 作法は上の「値が動かないタグ」と同じ: 前回の結果を持ち越さず、読めて
+	// 作法: 前回の結果を持ち越さず、読めて
 	// いないのに「不正な設定はありません」と言わない。
 
 	let exclusionMarks: ExclusionView[] | null = $state(null);
