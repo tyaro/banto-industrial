@@ -142,6 +142,9 @@ pub struct PlanOutcome {
     pub immediate_bad: Vec<(usize, PlcError)>,
 }
 
+/// One past the highest Modbus register/coil offset (`0xFFFF`).
+const ADDRESS_SPACE_END: u32 = 65_536;
+
 /// A group under construction, tracked with `u32` bounds so a 32-bit value
 /// at the very top of the address space (`offset = 65_535`, `end =
 /// 65_537`) cannot overflow `u16` mid-computation; only the finished
@@ -221,6 +224,23 @@ pub fn plan_requests(requests: &[ReadRequest]) -> PlanOutcome {
         };
 
         let accepted = modbus_accepts(area, bit, req.data_type);
+
+        // The register span must stay inside the 16-bit address space
+        // (`offset + span <= 65_536`). A tag that runs off the end would
+        // otherwise join its neighbour's group and make the whole FC3/FC4
+        // request cross the edge, so a device's illegal-address exception
+        // would fail the neighbour too. Reject just this tag instead.
+        let span_end = offset as u32 + req.data_type.register_span() as u32;
+        if accepted && span_end > ADDRESS_SPACE_END {
+            immediate_bad.push((
+                index,
+                PlcError::InvalidAddress(format!(
+                    "{area} のオフセット {offset} から {} 語はアドレス上限 65535 を超えます",
+                    req.data_type.register_span()
+                )),
+            ));
+            continue;
+        }
 
         if accepted {
             by_area
@@ -555,6 +575,40 @@ mod tests {
             outcome.immediate_bad[0].1,
             PlcError::UnsupportedCombination { .. }
         ));
+    }
+
+    /// 0xFFFF を越えるスパンはそのタグだけが Bad になり、となりの正しいタグは
+    /// 計画に残る。ちょうど 0xFFFF で終わるものは通す。
+    #[test]
+    fn a_span_past_the_address_space_is_bad_alone_and_the_neighbour_is_planned() {
+        let requests = [
+            req(AddressArea::HoldingRegister, 65534, DataType::U16),
+            req(AddressArea::HoldingRegister, 65535, DataType::U32),
+        ];
+        let outcome = plan_requests(&requests);
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert_eq!(outcome.immediate_bad[0].0, 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcError::InvalidAddress(_)
+        ));
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].start_offset, 65534);
+        assert_eq!(outcome.reads[0].count, 1);
+        assert_eq!(outcome.reads[0].mapping.len(), 1);
+    }
+
+    #[test]
+    fn a_span_ending_exactly_at_the_top_of_the_address_space_is_planned() {
+        let requests = [
+            req(AddressArea::HoldingRegister, 65535, DataType::U16),
+            req(AddressArea::HoldingRegister, 65534, DataType::U32),
+        ];
+        let outcome = plan_requests(&requests);
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.reads.len(), 1);
+        assert_eq!(outcome.reads[0].start_offset, 65534);
+        assert_eq!(outcome.reads[0].count, 2);
     }
 
     #[test]

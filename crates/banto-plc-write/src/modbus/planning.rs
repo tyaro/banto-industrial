@@ -317,6 +317,25 @@ pub fn plan_modbus_writes(
             ),
         };
 
+        // The written span must stay inside the 16-bit address space; a
+        // target that runs off the end is that request's own `Bad` and never
+        // joins (or widens) a neighbour's FC15/FC16 group.
+        let words = match &item {
+            ItemPayload::Bit(_) => 1u32,
+            ItemPayload::Words(w) => w.len() as u32,
+        };
+        if offset as u32 + words > 65_536 {
+            immediate_bad.push((
+                index,
+                PlcWriteError::AddressSpanOutOfRange {
+                    area: area.to_string(),
+                    offset,
+                    words: words as u16,
+                },
+            ));
+            continue;
+        }
+
         by_area.entry(area).or_default().push((index, offset, item));
     }
 
@@ -481,6 +500,48 @@ mod tests {
             WritePayload::Words(vec![1, 2, 3])
         );
         assert_eq!(outcome.writes[0].request_indices, vec![0, 1, 2]);
+    }
+
+    /// 0xFFFF を越えるスパンはその要求だけが Bad になり、となりの正しい要求は
+    /// 同じまとまりのまま通る。ちょうど 0xFFFF で終わるものは通す。
+    #[test]
+    fn a_span_past_the_address_space_is_bad_alone_and_the_neighbour_is_planned() {
+        let outcome = plan_modbus_writes(
+            &[
+                word("465535", DataType::U16, 1.0),
+                word("465536", DataType::U32, 2.0),
+            ],
+            LH,
+        );
+        assert_eq!(outcome.immediate_bad.len(), 1);
+        assert_eq!(outcome.immediate_bad[0].0, 1);
+        assert!(matches!(
+            outcome.immediate_bad[0].1,
+            PlcWriteError::AddressSpanOutOfRange {
+                offset: 65535,
+                words: 2,
+                ..
+            }
+        ));
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].start_offset, 65534);
+        assert_eq!(outcome.writes[0].payload, WritePayload::Words(vec![1]));
+        assert_eq!(outcome.writes[0].request_indices, vec![0]);
+    }
+
+    #[test]
+    fn a_span_ending_exactly_at_the_top_of_the_address_space_is_planned() {
+        let outcome = plan_modbus_writes(
+            &[
+                word("465536", DataType::U16, 3.0),
+                word("465535", DataType::U32, 4.0),
+            ],
+            LH,
+        );
+        assert!(outcome.immediate_bad.is_empty());
+        assert_eq!(outcome.writes.len(), 1);
+        assert_eq!(outcome.writes[0].start_offset, 65534);
+        assert_eq!(outcome.writes[0].payload.len(), 2);
     }
 
     /// The load-bearing safety property (this module's doc comment, and #131's

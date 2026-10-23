@@ -47,7 +47,7 @@ fn combine_u64(regs: [u16; 4], order: WordOrder) -> u64 {
 /// in `modbus/mod.rs`, never here) - included in the match for exhaustiveness
 /// and returns [`PlcError::Protocol`] rather than panicking if that
 /// invariant is ever violated by a future change.
-pub(crate) fn decode_register_value(
+pub fn decode_register_value(
     regs: &[u16],
     start: usize,
     data_type: DataType,
@@ -97,11 +97,7 @@ pub(crate) fn decode_register_value(
 /// an out-of-bounds `start` is a planning bug (never seen in practice, since
 /// the planner always sizes the response window to cover every mapped
 /// request), reported as [`PlcError::Protocol`] rather than a panic.
-pub(crate) fn decode_register_bit(
-    regs: &[u16],
-    start: usize,
-    bit: u8,
-) -> Result<TagValue, PlcError> {
+pub fn decode_register_bit(regs: &[u16], start: usize, bit: u8) -> Result<TagValue, PlcError> {
     let word = *regs.get(start).ok_or_else(|| {
         PlcError::Protocol(format!(
             "register window out of bounds: start={start} span=1 len={}",

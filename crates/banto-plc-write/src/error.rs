@@ -201,6 +201,19 @@ pub enum PlcWriteError {
     /// `Numeric` half.
     #[error("{kind} は Modbus 接続では未対応です（この Issue のスコープ外）。Numeric（数値/ビット）書き込みのみ対応しています")]
     UnsupportedRequestKind { kind: String },
+
+    /// A Modbus write whose register span runs past the 16-bit address space
+    /// (`offset + words > 65536`, e.g. a `u32` at offset 65535). Resolved
+    /// before any wire traffic as that request's own `Bad`, so it can neither
+    /// fail its neighbours' group nor be sent as an out-of-range FC15/FC16.
+    #[error(
+        "{area} のオフセット {offset} から {words} 語の書き込みはアドレス上限 65535 を超えます"
+    )]
+    AddressSpanOutOfRange {
+        area: String,
+        offset: u16,
+        words: u16,
+    },
 }
 
 impl PlcWriteError {
@@ -251,6 +264,7 @@ impl PlcWriteError {
                 | PlcWriteError::ModbusReadOnlyArea { .. }
                 | PlcWriteError::ModbusException { .. }
                 | PlcWriteError::UnsupportedRequestKind { .. }
+                | PlcWriteError::AddressSpanOutOfRange { .. }
         )
     }
 }

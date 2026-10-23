@@ -119,7 +119,11 @@ fn mbap_error_to_write(err: PlcError) -> PlcWriteError {
 /// (single) or FC15/FC16 (multiple) by its payload length (see this module's
 /// doc comment). Returns the function code used (for the response parser)
 /// alongside the frame.
-fn build_write_frame(transaction_id: u16, unit_id: u8, plan: &ModbusPlannedWrite) -> (u8, Vec<u8>) {
+pub fn build_write_frame(
+    transaction_id: u16,
+    unit_id: u8,
+    plan: &ModbusPlannedWrite,
+) -> (u8, Vec<u8>) {
     match &plan.payload {
         WritePayload::Bits(bits) if bits.len() == 1 => {
             // Modbus coil value convention: 0xFF00 = ON, 0x0000 = OFF (spec
@@ -186,7 +190,7 @@ fn build_write_frame(transaction_id: u16, unit_id: u8, plan: &ModbusPlannedWrite
 /// back verbatim (spec §6.5/6.6/6.11/6.12), so comparing byte-for-byte
 /// catches a desynchronized/misbehaving device the same way a transaction id
 /// mismatch does, rather than trusting "function code matched" alone.
-fn parse_write_response_pdu(pdu: &[u8], expected_echo: &[u8; 5]) -> Result<(), PlcWriteError> {
+pub fn parse_write_response_pdu(pdu: &[u8], expected_echo: &[u8; 5]) -> Result<(), PlcWriteError> {
     let expected_function = expected_echo[0];
     let function = *pdu
         .first()
