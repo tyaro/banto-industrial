@@ -116,6 +116,13 @@ struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た�
 2. 値の種類が `kind` と合わない（`Bit` に `F64` など）→ `ItemError::Rejected`。整数型は範囲の検査（api-design §9.2 のドライバの仕事を値の層で代行。範囲外は `Rejected`）。有限でない数（NaN・±inf）はどの型でも、整数型への小数も `Rejected`（Hub の値の検査 `write_path.rs` と同じ）。文字列は**タグのエンコーディング（UTF-8 / Shift-JIS）で符号化したバイト数**が `words * 2` を超えるもの、そのエンコーディングで表せない文字を含むものを `Rejected`（Hub の関門と `encode_string_value` と同じ。2026-10-23 オーナーのレビュー #806 の P2 3）。
 3. 通れば held に置き、`writes += 1`。`Ok(())`。
 
+**held は「実機で書いて読み戻したときの値」にする**（2026-10-23、Codex の P2 が同じ形で続いたので、実機の経路とのずれを総点検した。#806）:
+
+- 数値: f32 は f32 に丸めた値（f32 で無限大になる有限の値は `Rejected`）。整数型は整数への変換を通した値（`-0.0` → `0`）。
+- 文字列: タグのエンコーディングで符号化し（容量は途中・末尾の NUL も含めて数える）、`decode_string` で戻した値。途中に NUL があれば最初の NUL まで（`"A\0B"` → `"A"`）、Shift-JIS で往復すると変わる文字（`¥` → `\`）も戻した側。空文字列・容量ちょうど・末尾の空白はそのまま。
+- `bit: Some(_)` のアドレスで種類が `Bit` でないもの（ドライバの `parse_address` が登録時に断り、計画では `Unsupported`）は、読みも書きもその項目だけ `ItemError::Unsupported`。
+- 直さないもの: 断りの変種（実機のドライバは種類違い・範囲外を `Unsupported` にするが、Hub の関門が先に止めるので経路に現れない。シミュレータは `Rejected` にそろえる）。canonical の解釈が要るもの（ビットデバイスとワードデバイスの区別・番号の上限・ドライバごとの型の対応・語の重なり / RMW）は `parse_address` と適合テストの仕事で、値の層は解釈しない。
+
 RMW（SLMP の bit-in-word、`crates/banto-driver-slmp/src/frame_conn.rs:32-45`）は値の層に無い: `D100.5` は `D100` と別のセル（Q3）。多語の重なりも再現しない。これらの再現はドライバ crate の P0-3・C13〜C15 で足りている（§1.5）。Hub の関門（`writable`・スコープ・レート・値検査・監査の先書き・`write_enabled`）は broker の手前なので変わらない。
 
 ### 3.4 セッションの約束
