@@ -152,12 +152,12 @@ fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> 
 | `modbus-tcp` | `host`（Host・必須）・`port`（Integer 1〜65535・既定 502）・`unit_id`（Integer 0〜255・既定 1）・`word_order`（Choice `high_low` / `low_high`・既定 `high_low`・Advanced） |
 | `slmp`       | `host`（Host・必須）・`port`（Integer 1〜65535・既定 5007）・`cpu_type`（Choice `Q` / `R`・既定 `R`）・`word_order`（Choice・既定 `low_high`・Advanced）                   |
 
-既定の値は今の `DEFAULT_PORTS`・`defaultWordOrderFor`・`banto-tags` の正規化と同じにする（6a の着手時に 3 か所を突き合わせ、食い違いがあれば止めて報告）。
+`port` は既定値つきの**必須**（6a の実装。`validate_config` が `port` を必須にしているため。フォームは既定値を入れて出す）。既定の値は今の `DEFAULT_PORTS`・`defaultWordOrderFor`・`banto-tags` の正規化と同じにする（6a の着手時に 3 か所を突き合わせ、食い違いがあれば止めて報告）。
 
 ### 3.6 アドレスの位置（構造体登録の衝突判定のため）
 
 - 構造体登録（`structRegistration.ts:189-205`）は、欄どうし・既存のタグとのアドレスの重なりを、`slmpDeviceTable.ts` で読んだ**デバイスの番号**（基数を考えた数値）と軸（デバイス名）の範囲で判定している。`parse-addresses` の `area` は軸しか返さず、`offset-addresses` は文字列しか返さないので、このままでは重なりを判定できず、PLC の範囲が重なるタグを登録できてしまう。
-- **`DriverAddress` に `index: u64`（`area` の中の位置）を足す**: ワードのアドレスはワードの番号（SLMP の 16 進のデバイスも数値に直す）、ビットデバイスはビットの番号。ワード内ビットはそのワードの番号（`bit` は今のまま別の欄）。範囲は `[index, index + word_count - 1]`（ビットデバイスは点）。`DriverAddress` は `#[non_exhaustive]` でないので、欄の追加は API の版を上げる変更（6a の 0.3.0 に含める。Q8）。
+- **`DriverAddress` に `index`（`area` の中の位置）を足す**（2026-10-24、6a の実装で `Option<u64>` にした。`with_index(u64)` で付け、数値の位置を持たないアドレス空間のドライバは `None`。`None` の範囲は UI の衝突判定で `canonical` の一致だけを見る）: ワードのアドレスはワードの番号（SLMP の 16 進のデバイスも数値に直す）、ビットデバイスはビットの番号。ワード内ビットはそのワードの番号（`bit` は今のまま別の欄）。範囲は `[index, index + word_count - 1]`（ビットデバイスは点）。`DriverAddress` は `#[non_exhaustive]` でないので、欄の追加は API の版を上げる変更（6a の 0.3.0 に含める。Q8）。
 - `parse-addresses` の応答に `area`・`index`・`bit`・`wordCount` を返し、UI の衝突判定はこれで汎用に行う（**既存のタグは対象の収集グループ（`collectionGroupId`）で先に絞る**。今の `structRegistration.ts:234-236,252` と同じく、同じ PLC でも別のグループの重なりは許す。そのうえで同じ `area`・範囲が重なる。**ワード内ビットは `bit` を見ずにそのワードを占めるものとして扱い、同じワードの別のビットどうしも「重なる」と判定する**。今の `structRegistration.ts:173-181` と同じ安全側: 重なりの見落としを避ける）。適合テスト **C22**: `offset_words(c, n)` の `index` が `c` の `index + n`（ワードのアドレス）になる。
 - 判定を UI に残すのは、構造体登録が保存前のプレビューで重なりを示すため。保存の層で重なりを断るかは今と同じ（断らない）。
 
