@@ -322,6 +322,9 @@ pub trait FrameConnection: Send + 'static {
     /// response from the response itself: [`FrameRule::LengthPrefixed`],
     /// [`FrameRule::Terminator`] or [`FrameRule::DriverDecides`].
     /// [`FrameRule::Fixed`] cannot be used (C17; the engine refuses it). With
+    /// Called right after `create_connection`, **before** the handshake (the
+    /// engine decides whether the line has a sync procedure by `sync_step(&[])`
+    /// there), so it must not depend on state the handshake builds (C17).
     /// `DriverDecides`, [`FrameConnection::is_complete`] called with the sync
     /// step must delimit the first frame of its input at the right length
     /// for the response (normal or exception) to **any** request that can be
