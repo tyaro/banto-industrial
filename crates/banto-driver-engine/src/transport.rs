@@ -12,8 +12,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 /// FrameSession は送受信を共通の期限で包み、close にも有限の上限を掛ける。
 pub trait Transport: Send + 'static {
     /// `len` バイトを線に出しきるのにかかる時間の見積もり（既定は 0）。
-    /// 送信の drain が実際の送り終わりを表さない通信路（Windows の `tokio-serial` は
-    /// `flush` が `FlushFileBuffers` にならない）で、エンジンが「送り終えた」時刻を
+    /// シリアルの `send` は drain（送り終えの待ち）をしない（Unix の `flush` は poll の中で
+    /// 同期の `tcdrain` を呼び runtime ごと止める。Windows の `flush` は drain にならない）。
+    /// そこでエンジンが「送り終えた」時刻を
     /// `max(send が返った時刻, send を始めた時刻 + tx_time)` と見積もるのに使う（設計 §7.3.1・§14）。
     fn tx_time(&self, _len: usize) -> Duration {
         Duration::ZERO
@@ -290,9 +291,28 @@ impl std::fmt::Display for SerialPortName {
     }
 }
 
-/// ローカルのシリアルポートの通信路。1 フレームは 1 回の `write_all` + `flush` で出しきる。
+/// `SerialTransport` が包むストリーム。試験で偽のストリームに差し替えるための crate 内の境界。
+trait SerialIo: AsyncRead + AsyncWrite + Unpin + Send + 'static {
+    fn clear_input(&mut self) -> std::io::Result<()>;
+}
+
+impl SerialIo for tokio_serial::SerialStream {
+    fn clear_input(&mut self) -> std::io::Result<()> {
+        use tokio_serial::SerialPort;
+        self.clear(tokio_serial::ClearBuffer::Input)
+            .map_err(std::io::Error::from)
+    }
+}
+
+/// ローカルのシリアルポートの通信路。1 フレームは 1 回の `write_all` で出しきる。
+///
+/// `flush` は呼ばない。Unix の `tokio-serial` の `poll_flush` は poll の中で同期の `tcdrain` を
+/// 呼び、物理的な送信の完了まで戻らないので、外側の期限で打ち切れず runtime も止まる。
+/// Windows の `flush` は drain にならない。送り終えはエンジンが `tx_time` の見積もりと
+/// 非同期の `sleep_until` で扱う。`write_all` は Unix では `AsyncFd` の非ブロッキングの書き込みで、
+/// カーネルのバッファが一杯なら非同期に待つだけなので期限で打ち切れる。
 pub struct SerialTransport {
-    stream: tokio_serial::SerialStream,
+    stream: Box<dyn SerialIo>,
     char_time: Duration,
 }
 
@@ -327,6 +347,10 @@ impl SerialTransport {
 
     /// 開いたストリーム（試験では pty の対の片側）を包む。
     pub fn new(stream: tokio_serial::SerialStream, line: SerialLine) -> Self {
+        Self::from_io(Box::new(stream), line)
+    }
+
+    fn from_io(stream: Box<dyn SerialIo>, line: SerialLine) -> Self {
         Self {
             stream,
             char_time: line.char_time(),
@@ -342,8 +366,8 @@ impl Transport for SerialTransport {
 
     fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
         Box::pin(async move {
-            self.stream.write_all(bytes).await.map_err(io_error)?;
-            self.stream.flush().await.map_err(io_error)
+            // flush（= Unix では同期の tcdrain）は呼ばない。型の doc を参照。
+            self.stream.write_all(bytes).await.map_err(io_error)
         })
     }
 
@@ -361,8 +385,7 @@ impl Transport for SerialTransport {
 
     fn discard_input(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
-            use tokio_serial::SerialPort;
-            if let Err(error) = self.stream.clear(tokio_serial::ClearBuffer::Input) {
+            if let Err(error) = self.stream.clear_input() {
                 tracing::debug!(%error, "シリアルの受信バッファを捨てられなかった");
             }
         })
@@ -673,5 +696,98 @@ mod tests {
         }
         assert_eq!(buf, b"new");
         timeout(T, transport.close()).await.unwrap();
+    }
+
+    /// 偽のストリーム。`flush_panics` なら `poll_flush` で panic、`write_pending` なら書き込みが
+    /// 永遠に `Pending`（送信バッファが一杯の状態）。
+    struct FakeIo {
+        flush_panics: bool,
+        write_pending: bool,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for FakeIo {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FakeIo {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.write_pending {
+                return std::task::Poll::Pending;
+            }
+            self.written.lock().unwrap().extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            assert!(
+                !self.flush_panics,
+                "send が flush を呼んだ（同期 tcdrain の再発）"
+            );
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl SerialIo for FakeIo {
+        fn clear_input(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn serial_send_writes_without_calling_flush() {
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let io = FakeIo {
+            flush_panics: true,
+            write_pending: false,
+            written: written.clone(),
+        };
+        let mut transport = SerialTransport::from_io(Box::new(io), SerialLine::default());
+        transport.send(&[1, 2, 3]).await.unwrap();
+        assert_eq!(*written.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    /// 送信バッファが一杯（書き込みが `Pending`）でも、send は期限で打ち切れ、
+    /// current_thread の runtime の他のタイマーも進む。直す前の実装（`flush` が同期の
+    /// `tcdrain` でブロックする）では、この期限の `timeout_at` が働かず runtime ごと止まる
+    /// （そのため落ちる試験は current_thread を止めてしまうので置かない）。
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn serial_send_is_cancellable_by_deadline_while_runtime_keeps_running() {
+        use tokio::time::{sleep, timeout_at, Instant};
+        let io = FakeIo {
+            flush_panics: true,
+            write_pending: true,
+            written: Default::default(),
+        };
+        let mut transport = SerialTransport::from_io(Box::new(io), SerialLine::default());
+        let other = tokio::spawn(async {
+            sleep(Duration::from_millis(100)).await;
+            Instant::now()
+        });
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(1);
+        let result = timeout_at(deadline, transport.send(&[0; 256])).await;
+        assert!(result.is_err(), "期限で打ち切れること");
+        assert_eq!(Instant::now(), deadline);
+        let other_done = other.await.unwrap();
+        assert_eq!(other_done, start + Duration::from_millis(100));
     }
 }

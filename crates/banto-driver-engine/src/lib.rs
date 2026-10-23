@@ -7,7 +7,8 @@
 //! シリアルの同期（設計 §7.3）は後続の PR で行う。
 //! 各 step の送信の前に、ドライバの `inter_frame_gap`（Modbus RTU の t3.5）だけ、
 //! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
-//! 送り終えた時刻は `Transport::tx_time` で見積もる（drain が当てにならない通信路のため）。
+//! シリアルの send は flush（Unix では同期の tcdrain で runtime を止める）を呼ばないので、
+//! 送り終えた時刻は `Transport::tx_time` で見積もる。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
@@ -254,7 +255,7 @@ impl Session for FrameSession {
                         wait_quiet(from, gap).await;
                         let send_start = Instant::now();
                         if core.transport.send(&step.send).await.is_ok() {
-                            // flush が drain にならない通信路（Windows のシリアル）では、閉じると
+                            // シリアルの send は drain しないので、閉じると
                             // 送信待ちのフレームが切れるので、送り終えの見積もりまで待ってから閉じる。
                             sleep_until(send_start + core.transport.tx_time(step.send.len())).await;
                         }
