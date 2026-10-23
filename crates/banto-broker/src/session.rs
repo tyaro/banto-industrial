@@ -108,11 +108,21 @@ pub(crate) struct FrameDial {
 }
 
 impl FrameDial {
+    #[cfg(test)]
     pub(crate) fn new(driver: std::sync::Arc<dyn banto_driver_api::FrameDriver>) -> Self {
         Self {
             driver,
             owner: banto_driver_engine::line::LineOwner::new(),
         }
+    }
+
+    /// A dial with the given owner mark (a one-shot mark for a one-off dial
+    /// outside a broker task, [`crate::resolve_one_shot_driver`]).
+    pub(crate) fn with_owner(
+        driver: std::sync::Arc<dyn banto_driver_api::FrameDriver>,
+        owner: banto_driver_engine::line::LineOwner,
+    ) -> Self {
+        Self { driver, owner }
     }
 }
 

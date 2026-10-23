@@ -970,6 +970,57 @@ async fn close_by_closes_only_the_line_its_owner_leased_last() {
     assert!(bench.table.line(&key).is_none());
 }
 
+/// #801: 1 回きりのダイヤル（Hub の接続テスト）は、broker の task が致命の後のバックオフの間に
+/// 表へ返した線（貸し出し中でない・印は task・`Unsynced` で待っている署名あり）を借りずに
+/// 「使用中」で断る。線の印・状態・署名は変わらず表に残り、1 回きりの解放はそれを閉じない。
+#[tokio::test(start_paused = true)]
+async fn a_one_shot_dial_never_takes_over_a_line_another_owner_returned() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    let key = LineKey::of(&bench.spec).unwrap();
+    let task = LineOwner::new();
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // task の同期
+        Reaction::Silence,                                  // A は時間切れ → 線は Unsynced
+    ]);
+    let mut session = bench.connect_as(Some(task)).await.unwrap();
+    let _ = read_one(&mut session, ADDR_A).await;
+    drop(session); // 致命の後、線は開いたまま表へ戻る（task はバックオフ中）。
+    let line = bench.line();
+    assert_eq!(line.state(), SyncState::Unsynced);
+    let outstanding = line.outstanding();
+    assert!(!outstanding.is_empty(), "待っている署名がある");
+    let sent = bench.wire.lock().sent.len();
+
+    let one_shot = LineOwner::one_shot();
+    let Err(err) = bench.connect_as(Some(one_shot)).await else {
+        panic!("1 回きりのダイヤルは別の持ち主の線を借りない");
+    };
+    assert!(
+        matches!(&err, FatalError::Protocol(m) if m.contains("使用中")),
+        "{err:?}"
+    );
+    assert_eq!(bench.wire.lock().sent.len(), sent, "何も送らない");
+    assert!(
+        !bench.table.close_by(&key, one_shot),
+        "1 回きりの解放は task の線を閉じない"
+    );
+    assert!(
+        bench
+            .table
+            .line(&key)
+            .is_some_and(|l| Arc::ptr_eq(&l, &line)),
+        "task の線は表に残る"
+    );
+    assert!(line.is_open());
+    assert_eq!(line.state(), SyncState::Unsynced);
+    assert_eq!(line.outstanding(), outstanding, "署名は変わらない");
+    assert_eq!(bench.wire.lock().closes, 0);
+
+    // 印は task のまま: task の解放が閉じる。
+    assert!(bench.table.close_by(&key, task));
+    assert!(bench.table.line(&key).is_none());
+}
+
 /// オーナーのレビュー P2（`lease` と `close_by` の競合）: 旧 task が線を返した後、新 task の
 /// `lease` が表のロックを取る直前に旧 task の `close_by` を挟む。取り出しと予約は表のロックの
 /// 中で一体なので、新 task は表から外れた線を借りない（新しい線が作られ、表に入る）。その

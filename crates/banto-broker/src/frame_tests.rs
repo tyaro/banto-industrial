@@ -1118,7 +1118,7 @@ async fn a_one_shot_dial_failing_mid_handshake_releases_its_line() {
     let (heard, _heard_rx) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(silent_on_handshake(listener, heard));
     let registry = serial_registry(1);
-    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let resolved = resolve_one_shot_driver(&registry, "frame-test").unwrap();
     let settings = serial_settings(port);
     let key = LineKey::SerialOverTcp {
         host: "127.0.0.1".into(),
@@ -1157,7 +1157,7 @@ async fn a_cancelled_one_shot_dial_releases_its_line() {
     let (heard, mut heard_rx) = tokio::sync::mpsc::unbounded_channel();
     let server = tokio::spawn(silent_on_handshake(listener, heard));
     let registry = serial_registry(1);
-    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let resolved = resolve_one_shot_driver(&registry, "frame-test").unwrap();
     let settings = serial_settings(port);
     let key = LineKey::SerialOverTcp {
         host: "127.0.0.1".into(),
@@ -1226,7 +1226,7 @@ async fn a_one_shot_release_leaves_a_broker_tasks_line_open() {
     };
     let line = LineTable::global().line(&key).unwrap();
 
-    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let resolved = resolve_one_shot_driver(&registry, "frame-test").unwrap();
     let guard = resolved.one_shot_line(&settings);
     let refused = resolved
         .driver()

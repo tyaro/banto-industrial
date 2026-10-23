@@ -1012,7 +1012,7 @@ async fn test_connection(
     payload: &PlcConnectionTestPayload,
 ) -> (bool, Option<PlcConnectionTestError>) {
     let registry = manager.registry();
-    let Some(resolved) = banto_broker::resolve_session_driver(registry, &payload.protocol) else {
+    let Some(resolved) = banto_broker::resolve_one_shot_driver(registry, &payload.protocol) else {
         return (
             false,
             Some(test_error(
@@ -1099,6 +1099,8 @@ async fn test_connection(
     // task の外の 1 回きりのダイヤルなので、失敗・時間切れ・要求の取り消し（future の drop）の
     // どの道でも、この番人の drop で自分が借りた線を閉じる。`session` より先に作るので、
     // 貸し出しが表へ戻った後に閉じる。成功の道の `disconnect` の後に閉じても害はない。
+    // `resolve_one_shot_driver` で解決したので、broker の task が印を付けた線（バックオフ中で
+    // 貸し出し中でないものも）は借りずに「使用中」で断り、その線の待っている署名を消さない。
     let _line = resolved.one_shot_line(&settings);
     let cx = ConnectContext::new("connection-test", PLC_TEST_TIMEOUT, PLC_TEST_TIMEOUT);
     let connected = tokio::time::timeout(

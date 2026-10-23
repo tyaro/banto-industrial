@@ -501,7 +501,11 @@ impl ResolvedSessionDriver {
     /// `settings` dial in the engine's table, but only if this resolver's dial
     /// leased it last (its owner mark, io-design §7.3), so a line a broker
     /// task is using - the one-off dial is refused as "in use" and leaves the
-    /// mark alone - stays open. Without it a failed, timed-out or cancelled
+    /// mark alone - stays open. Resolve the driver with
+    /// [`resolve_one_shot_driver`]: its dial refuses a line another owner
+    /// marked even while that owner's task is not leasing it (a broker task
+    /// backing off after a fatal error, with signatures outstanding), instead
+    /// of taking the line over and closing it here. Without it a failed, timed-out or cancelled
     /// one-off dial leaves its line open in the table (a driver without a sync
     /// procedure even leaves it quarantined with no owner to release it).
     /// Create it before `connect` and keep it until after `disconnect`, so
@@ -543,11 +547,42 @@ pub fn resolve_session_driver(
     registry: &DriverRegistry,
     protocol: &str,
 ) -> Option<ResolvedSessionDriver> {
+    resolve_with_owner(
+        registry,
+        protocol,
+        banto_driver_engine::line::LineOwner::new,
+    )
+}
+
+/// [`resolve_session_driver`] for a one-off dial outside a broker task (the
+/// Hub's connection test, with [`ResolvedSessionDriver::one_shot_line`]). Its
+/// Frame dial carries a one-shot owner mark
+/// ([`banto_driver_engine::line::LineOwner::one_shot`]): it never leases a
+/// serial line another owner marked, so a broker task's line - returned to the
+/// table during the backoff after a fatal error, `Unsynced` with signatures
+/// outstanding - keeps its mark, state and signatures (io-design §7.3), and the
+/// dial fails as "in use" instead.
+pub fn resolve_one_shot_driver(
+    registry: &DriverRegistry,
+    protocol: &str,
+) -> Option<ResolvedSessionDriver> {
+    resolve_with_owner(
+        registry,
+        protocol,
+        banto_driver_engine::line::LineOwner::one_shot,
+    )
+}
+
+fn resolve_with_owner(
+    registry: &DriverRegistry,
+    protocol: &str,
+    owner: fn() -> banto_driver_engine::line::LineOwner,
+) -> Option<ResolvedSessionDriver> {
     let (driver, frame): (Arc<dyn SessionDriver>, Option<Arc<session::FrameDial>>) =
         match registry.get(protocol)?.kind() {
             DriverKind::Session(driver) => (Arc::clone(driver), None),
             DriverKind::Frame(driver) => {
-                let dial = Arc::new(session::FrameDial::new(Arc::clone(driver)));
+                let dial = Arc::new(session::FrameDial::with_owner(Arc::clone(driver), owner()));
                 (Arc::clone(&dial) as Arc<dyn SessionDriver>, Some(dial))
             }
             _ => return None,

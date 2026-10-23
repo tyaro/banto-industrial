@@ -23,6 +23,11 @@
 //! task の終わりの解放（[`LineTable::close_by`]）は印が合うときだけ閉じる: Hub は設定が変わると
 //! 古い task の終わりを待たずに新しい task を作るので、古い task の解放が新しい task の借りた
 //! 線（待っている署名）を消してはならない。
+//!
+//! 1 回きりのダイヤル（Hub の接続テスト。[`LineOwner::one_shot`]）は、別の持ち主の印の線を
+//! 貸し出し中でなくても借りない（「使用中」で断る）。broker の task が致命の後のバックオフの
+//! 間に表へ返した線（`Unsynced`・待っている署名あり）を借りて印を書き換え、終わりに閉じると、
+//! task の待っている署名が消えて次のダイヤルが `Fresh` から始まる（§7.3 の保証が崩れる）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,13 +72,38 @@ impl std::fmt::Display for LineKey {
 /// 線の持ち主の印。broker は接続の task ごとに 1 つ作り、借りるときに線に記録し、task の
 /// 終わりに [`LineTable::close_by`] で「自分が最後に借りた線」だけを閉じる。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct LineOwner(u64);
+pub struct LineOwner {
+    id: u64,
+    /// 1 回きりのダイヤル（broker の task の外）の印か。
+    one_shot: bool,
+}
 
 impl LineOwner {
-    /// 新しい印（プロセスの中で一意）。
+    /// 新しい印（プロセスの中で一意）。broker の接続の task が使う。
     pub fn new() -> Self {
+        Self {
+            id: Self::next_id(),
+            one_shot: false,
+        }
+    }
+
+    /// 1 回きりのダイヤル（Hub の接続テストなど、broker の task の外）の新しい印。この印で
+    /// 借りるときは、別の持ち主の印の線を貸し出し中でなくても借りない（[`LineTable`] の冒頭）。
+    pub fn one_shot() -> Self {
+        Self {
+            id: Self::next_id(),
+            one_shot: true,
+        }
+    }
+
+    /// [`one_shot`](Self::one_shot) で作った印か。
+    pub fn is_one_shot(&self) -> bool {
+        self.one_shot
+    }
+
+    fn next_id() -> u64 {
         static NEXT: AtomicU64 = AtomicU64::new(1);
-        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -349,7 +379,9 @@ impl LineTable {
     /// 線を借りる。閉じていれば `open` で開く（表のロックの外で待つ。その間は予約して
     /// 2 つ目の貸し出しを断る）。開いたまま残っていれば（致命の後）そのポートを渡す。
     /// 線の設定が変わっていれば古いポートを閉じて開き直す。`owner` は予約と同時に線に記録する
-    /// （[`Self::close_by`] が見る）。
+    /// （[`Self::close_by`] が見る）。`owner` が 1 回きりの印（[`LineOwner::one_shot`]）なら、
+    /// 別の持ち主の印の線は貸し出し中でなくても借りずに「使用中」で断る（線の印・状態・待っている
+    /// 署名は変えない）。
     pub(crate) async fn lease<F>(
         &self,
         spec: &TransportSpec,
@@ -399,6 +431,14 @@ impl LineTable {
                 if inner.leased {
                     return Err(FatalError::Protocol(format!(
                         "シリアルの線 {key} は別のセッションが使用中です"
+                    )));
+                }
+                if owner.is_some_and(|o| o.is_one_shot())
+                    && inner.owner.is_some_and(|current| Some(current) != owner)
+                {
+                    // 1 回きりのダイヤルは、broker の task が返した線（待っている署名）を奪わない。
+                    return Err(FatalError::Protocol(format!(
+                        "シリアルの線 {key} は別の接続が使用中です"
                     )));
                 }
                 if inner.quarantined {
