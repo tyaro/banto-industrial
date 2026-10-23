@@ -106,6 +106,8 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# R2b-5c: ランプ波つきのワイヤのシミュレータ（`banto_plc::ramp`。`dev_plc` とテストの「対照の実機」）。
+banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
 # `test-util` (#394 レビュー P1-1): `HUB_OPERATION_TIMEOUT` のテストを
 # `tokio::time::pause()`（`#[tokio::test(start_paused = true)]`）で
 # **実時間を待たずに**決定的に回すため。tokio 自身の feature なので
@@ -153,8 +155,8 @@ path = "src/bin/chronogazer-server.rs"
 # `pnpm dev:plc` が起動する）。`test = true` は、この example の引数解釈の
 # 単体テストを `cargo test -p chronogazer-core` で回すため（example の
 # `#[test]` は既定では実行されない）。依存は本体の通常依存
-# （`banto-collect`・`tokio` の `signal`）だけで足りるので、
-# `[dev-dependencies]` は増やしていない。
+# （`banto-collect`・`tokio` の `signal`）と、R2b-5c で足した dev-dependency の
+# `banto-plc`（`simulator`、`banto_plc::ramp`）で足りる。
 [[example]]
 name = "dev_plc"
 test = true

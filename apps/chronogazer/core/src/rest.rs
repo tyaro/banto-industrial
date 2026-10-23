@@ -49,7 +49,6 @@
 //! | GET    | `/api/tags/{id}` | -                        | `Tag` (viewer+)         |
 //! | PUT    | `/api/tags/{id}` | `TagPayload`             | `Tag` (editor+)         |
 //! | DELETE | `/api/tags/{id}` | -                        | 204 (editor+)           |
-//! | GET    | `/api/simulation-coverage` | -              | `SimulationCoverageEntry[]` (viewer+, #413) |
 //! | GET    | `/api/config-exclusions` | -                | `ExclusionView[]` (viewer+, #414 段階2) |
 //! | *      | `/api/display-groups[/order\|/{id}]` | `DisplayGroupPayload` | 表示グループ（viewer+ 読み取り / editor+ 書き込み、#393。表は `rest::display_groups` の doc） |
 //! | *      | `/api/tag-thresholds[/{tagId}]` | `TagThresholdsPayload` | 記録計の側のしきい値（viewer+ 読み取り / editor+ 書き込み、#532。表は `rest::tag_thresholds` の doc） |
@@ -258,7 +257,6 @@ use crate::collect::{
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::SettingsService;
-use crate::simulation::SimulationCoverageEntry;
 use crate::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
     ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, is_revision_conflict,
@@ -1372,23 +1370,6 @@ async fn plc_connections_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// `GET /api/simulation-coverage`（**`viewer` 以上**・監査しない、#413）:
-/// シミュレーション接続の配下のタグごとに、シミュレータが値を動かす番地か
-/// どうか。判定と「なぜ専用の読み取りにしたか」は [`crate::simulation`] の
-/// モジュール doc。Tauri の `simulation_coverage_list` と同じ関数を呼ぶ。
-async fn simulation_coverage_list(
-    State(state): State<TagRegistryState>,
-) -> Result<Json<Vec<SimulationCoverageEntry>>, ApiError> {
-    Ok(Json(
-        crate::simulation::simulation_coverage(
-            &state.plc_connections,
-            &state.collection_groups,
-            &state.tags,
-        )
-        .await?,
-    ))
-}
-
 /// `GET /api/config-exclusions`（**`viewer` 以上**・監査しない、#414 段階2）:
 /// 今のレジストリで収集を開始したら外される接続・グループ・タグ（`/tags`
 /// の印）。判定は収集の開始と同じ `banto_collect::build_config_lenient_from`
@@ -1881,7 +1862,6 @@ fn tag_registry_router(
             "/api/tags/{id}",
             get(tags_get).put(tags_update).delete(tags_delete),
         )
-        .route("/api/simulation-coverage", get(simulation_coverage_list))
         .route("/api/config-exclusions", get(config_exclusions_list))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
@@ -5594,74 +5574,6 @@ mod tests {
             simulations_of("update"),
             vec![json!(false), json!(false), json!(true)]
         );
-    }
-
-    /// `GET /api/simulation-coverage` は viewer が読める（レジストリの読み取りと
-    /// 同じ床）。シミュレーション接続の配下のタグだけが、範囲内/範囲外に
-    /// 分かれて返る（判定の表は `crate::simulation` のテスト）。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn simulation_coverage_is_viewer_readable() {
-        let (router, _admin, editor, viewer) = router_with_role_tokens().await;
-
-        let mut body = plc_connection_payload("sim-plc");
-        body["simulation"] = json!(true);
-        let conn = body_json(
-            router
-                .clone()
-                .oneshot(post_json_auth("/api/plc-connections", &editor, body))
-                .await
-                .unwrap(),
-        )
-        .await;
-        let group = body_json(
-            router
-                .clone()
-                .oneshot(post_json_auth(
-                    "/api/collection-groups",
-                    &editor,
-                    json!({
-                        "name": "g",
-                        "plcConnectionId": conn["id"],
-                        "periodMs": 1000,
-                        "enabled": true
-                    }),
-                ))
-                .await
-                .unwrap(),
-        )
-        .await;
-        for (name, address) in [("in", "40001"), ("out", "40100")] {
-            let response = router
-                .clone()
-                .oneshot(post_json_auth(
-                    "/api/tags",
-                    &editor,
-                    json!({
-                        "name": name,
-                        "collectionGroupId": group["id"],
-                        "address": address,
-                        "dataType": "u16",
-                        "decimals": 0,
-                        "enabled": true
-                    }),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-        }
-
-        let response = router
-            .oneshot(get_auth("/api/simulation-coverage", &viewer))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let entries = body_json(response).await;
-        let entries = entries.as_array().expect("array");
-        assert_eq!(entries.len(), 2, "{entries:?}");
-        assert_eq!(entries[0]["supported"], true);
-        assert!(entries[0]["reason"].is_null());
-        assert_eq!(entries[1]["supported"], false);
-        assert!(entries[1]["reason"].as_str().is_some_and(|r| !r.is_empty()));
     }
 
     /// #414 段階2: `GET /api/config-exclusions` は viewer が読め、今の

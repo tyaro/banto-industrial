@@ -417,10 +417,19 @@ fn cached_value(app: &TestApp, tag_id: i64) -> Option<f64> {
         .and_then(|s| s.value)
 }
 
-/// ランプ周期（`banto_collect::simulation::RAMP_PERIOD_MS` = 100ms）の
-/// 数倍。「書いた値が保持されている」ことを主張する前に、ランプ波タスクが
-/// 何周も回ったことを保証するための待ち時間。
-const SEVERAL_RAMP_PERIODS: Duration = Duration::from_millis(800);
+/// 生成値が動いていることを待つ（R2b-5c）。値の層の生成は 100 ms ごとに
+/// 変わるので、いまの値を読んでから、違う値が現れるまでポーリングする
+/// （固定の sleep ではなく条件）。これが成り立てば、書いた後に生成が少なくとも
+/// 1 周したことが分かり、「書いた番地が保持されている」の主張が意味を持つ。
+async fn wait_until_value_moves(app: &TestApp, tag_id: i64) -> bool {
+    let Some(first) = cached_value(app, tag_id) else {
+        return false;
+    };
+    wait_until(Duration::from_secs(10), || async {
+        cached_value(app, tag_id).is_some_and(|now| now != first)
+    })
+    .await
+}
 
 // ---------------------------------------------------------------------------
 // 1/2. 接続単位 simulation=true への書き込み（SLMP / Modbus）。
@@ -494,7 +503,7 @@ async fn simulated_connection_write_is_applied_and_held(
     )
     .await;
 
-    // ランプ波が回り始めるまで待つ（値が読めない状態で書いても意味が無い）。
+    // 生成値が読めるまで待つ（値が読めない状態で書いても意味が無い）。
     assert!(
         wait_until(Duration::from_secs(10), || async {
             cached_value(&app, neighbour_tag.id).is_some()
@@ -552,13 +561,16 @@ async fn simulated_connection_write_is_applied_and_held(
         "collection should read back the value the write endpoint just wrote"
     );
 
-    // ランプ周期の数倍待っても保持されている = held が効いている。
-    let before = cached_value(&app, neighbour_tag.id).expect("neighbour has a value");
-    tokio::time::sleep(SEVERAL_RAMP_PERIODS).await;
+    // 隣の番地は held ではないので、生成値が動き続ける。それが見えるまで待つ
+    // ＝生成が書いた後に回った。その上でも保持されている = held が効いている。
+    assert!(
+        wait_until_value_moves(&app, neighbour_tag.id).await,
+        "the neighbouring address must keep moving - holding is per-address"
+    );
     assert_eq!(
         cached_value(&app, word_tag.id),
         Some(4242.0),
-        "the written address must stay held against the 100ms ramp task"
+        "the written address must stay held against the generated value"
     );
     assert_eq!(
         read_now(&app.router, "simline.fast.held", &key).await,
@@ -571,15 +583,6 @@ async fn simulated_connection_write_is_applied_and_held(
         "a written bit is held the same way"
     );
 
-    // 隣の番地は held ではないので、生成値が動き続けている（固定 sleep
-    // ではなく、違う値が現れるまでポーリングする）。
-    assert!(
-        wait_until(Duration::from_secs(10), || async {
-            cached_value(&app, neighbour_tag.id) != Some(before)
-        })
-        .await,
-        "the neighbouring address must keep moving - holding is per-address"
-    );
     assert_eq!(
         device.get(neighbour_canonical, &TagKind::Numeric(DataType::U16)),
         None,
@@ -598,9 +601,9 @@ async fn simulated_connection_write_is_applied_and_held(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_slmp_connection_write_is_applied_and_held_against_the_ramp() {
-    // D5/D6/M3 はいずれも `banto_collect::simulation::RAMP_ADDRESS_COUNT`
-    // (16) の範囲内 - ランプ波が毎周期上書きしにくる番地をわざと選んでいる
-    // （held が効いていなければこのテストは落ちる）。
+    // D5/D6/M3: 生成値が毎周期動く番地（値の層の `SimDevice` は、書かれた番地
+    // だけ held して生成値に戻さない）。held が効いていなければこのテストは
+    // 落ちる。
     simulated_connection_write_is_applied_and_held(
         "363-slmp",
         "slmp",
@@ -615,7 +618,7 @@ async fn simulated_slmp_connection_write_is_applied_and_held_against_the_ramp() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn simulated_modbus_connection_write_is_applied_and_held_against_the_ramp() {
     // 40006/40007 -> holding register offset 5/6、00004 -> coil offset 3。
-    // いずれもランプ波のウィンドウ内（上の SLMP 版と同じ意図）。
+    // いずれも生成値が動く番地（上の SLMP 版と同じ意図）。
     simulated_connection_write_is_applied_and_held(
         "363-modbus",
         "modbus-tcp",
@@ -648,6 +651,11 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
         .unwrap();
     let tag = TagService::new(app.pool.clone())
         .create(tag_input("held", group.id, "D7", "u16", true))
+        .await
+        .unwrap();
+    // 書かない隣の番地。生成値が動き続けること（= 生成が書いた後に回ったこと）を見る。
+    let mover = TagService::new(app.pool.clone())
+        .create(tag_input("mover", group.id, "D8", "u16", true))
         .await
         .unwrap();
 
@@ -708,7 +716,10 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
         .await,
         "collection should read the written value back off the all-simulation simulator"
     );
-    tokio::time::sleep(SEVERAL_RAMP_PERIODS).await;
+    assert!(
+        wait_until_value_moves(&app, mover.id).await,
+        "the unwritten neighbour must keep moving under all-simulation"
+    );
     assert_eq!(
         read_now(&app.router, "realline.fast.held", &key).await,
         json!(1234.0),

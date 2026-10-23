@@ -89,16 +89,7 @@ pub mod event;
 // #383 段階3 P3: the external value source (banto-hub as a data source) -
 // the trait the app implements and the pure mapping the task uses.
 pub mod external;
-// T9-1/T9-2 (docs/ux-plan.md §1): in-process simulator lifecycle for
-// `simulation = true` connections. Started life as a pure implementation
-// detail of `crate::collector::Collector`; T9-2 (apps/banto-hub/core's
-// broker-routed SLMP path - see this module's own doc comment, "SLMP +
-// banto-hub の broker 経路について") needs to start/reuse/stop a simulator
-// itself, so `start`/`SimulatorHandle` are now public. Everything else in
-// this module (the ramp/toggle generation tasks, the Modbus/SLMP-specific
-// startup helpers) stays crate-private.
 pub mod sessions;
-pub mod simulation;
 mod task;
 
 pub use broker_sim::{dial_fingerprint, BrokerSimRegistry, DialTarget};

@@ -62,9 +62,11 @@
 //! `protocol = "simulation"` alternative because the whole point is
 //! "開発→実機の切り替えがチェックボックス1つ" (flip one checkbox, keep every
 //! other setting - name, groups, tags - untouched). When set,
-//! `banto_collect` (not this crate) substitutes an in-process simulator's
-//! loopback address for the connection's real `host`/`port` at collection
-//! time; this crate only stores and validates the flag.
+//! `banto_collect` (not this crate) runs the connection against the value
+//! layer's simulated device (`banto_driver_engine::sim`, no socket; until
+//! R2b-5 an in-process wire simulator's loopback address replaced the real
+//! `host`/`port`) at collection time; this crate only stores and validates
+//! the flag.
 //!
 //! **Interaction with `"virtual"` (this module's doc comment above)**:
 //! [`validate_plc_connection_input`] rejects `simulation = true` combined

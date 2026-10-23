@@ -330,7 +330,7 @@ async fn seed_and_start_all_simulation(app: &TestApp) -> (i64, u64) {
     assert_eq!(status, StatusCode::OK, "{group:?}");
     let group_id = group["id"].as_i64().expect("group id");
 
-    // D5/D6 は hub 内蔵 SLMP シミュレータの RAMP_ADDRESS_COUNT(16) の範囲内
+    // D5/D6: 値の層の生成値が 100ms ごとに変わる番地
     // （`tests/t9_simulation.rs`と同じ根拠）。
     let (status, tag) = admin_write(
         &app.router,

@@ -21,7 +21,7 @@
 //! `sessions.stop_and_join(conn.id)` を呼ぶことで、外側ゲートでは
 //! 検知できないこのレースそのものを再現する。
 //!
-//! `tests/write.rs`/`tests/grpc.rs`/`tests/t15_simulation_coverage.rs` と
+//! `tests/write.rs`/`tests/grpc.rs` と
 //! 同じ理由（各 `tests/*.rs` は独立クレートとしてコンパイルされ、private
 //! helper を共有できない）で `fast_options`/`wait_until`/`issue_key`/
 //! `make_tag` をこのファイル内に複製している。`TestApp` は`tests/grpc.rs`/

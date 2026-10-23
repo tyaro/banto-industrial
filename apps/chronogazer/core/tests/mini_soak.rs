@@ -5,7 +5,7 @@
 //! ## 何を回すか
 //!
 //! * **収集**: `CollectorService::new`（本番と同じクライアント生成・既定の
-//!   タイムアウト・既定の書き手の設定）で、`banto_collect::simulation` の
+//!   タイムアウト・既定の書き手の設定）で、`banto_plc::ramp` の
 //!   Modbus TCP シミュレータ（`examples/dev_plc.rs` が別プロセスで立てるものと
 //!   同じランプ波）を**普通の接続**として収集する。収集グループは 2 つ:
 //!   周期 1 秒 × 16 タグ（保持レジスタ 40001-40016）と、周期 200ms × 4 タグ
@@ -57,8 +57,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use banto_collect::simulation;
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -460,7 +459,7 @@ async fn mini_soak_collect_with_monitor_polling() {
         .await
         .expect("設定 DB を初期化できる");
     let data_dir = resolve_data_dir(&dir.0, "./data");
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     let groups = register(&pool, sim.addr().port()).await;
     let all_tag_ids: Vec<i64> = groups.iter().flat_map(|g| g.tag_ids.clone()).collect();
     // トレンドの 1 グループの上限（8 ペン）に合わせて、先頭の 8 タグの履歴を読む。

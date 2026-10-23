@@ -13,7 +13,7 @@ use super::*;
 use std::ffi::OsString;
 use std::sync::atomic::AtomicUsize;
 
-use banto_collect::{simulation, Protocol};
+use banto_plc::ramp::{self, RampProtocol};
 use banto_safe_root::mode::TreeProblem;
 use banto_service_control::{
     run_program_with_args, ControlHandler, ControlReply, ErrorLog, ScmControlKind, ServicePhase,
@@ -597,7 +597,7 @@ fn close_log_drains_the_redirect_before_closing_the_log() {
 async fn runs_as_a_service_tightens_first_and_relaxes_last_on_scm_stop() {
     let dir = tempfile::tempdir().unwrap();
     let layout = DataLayout::new(dir.path().join("root"));
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     prepare_root_db(&layout, Some(sim.addr().port())).await;
     let trace: Trace = Arc::default();
     let acl = FakeAcl::new(trace.clone());

@@ -87,13 +87,11 @@
 //!   シミュレーション書き込みにもそのまま適用される。変わったのは
 //!   「シミュレーション中は拒否」の1段だけ。
 //! - **実際に書ける理由**: シミュレーション接続の broker セッションは
-//!   `crate::broker_glue::BrokerSimRegistry` がダイヤル先を in-process
-//!   シミュレータへ差し替えて張ってあるので、gate 8 の
-//!   `write_broker_handle_peek` → `BrokerHandle::write` がそのまま
-//!   シミュレータに届く。`banto_plc::{modbus,slmp}::simulator::Simulator`
-//!   は #363 で書き込みコマンド(Modbus FC5/6/15/16・SLMP `0x1401`)に対応し、
-//!   書かれた番地を held としてランプ波の更新対象から外すので、次の
-//!   ポーリング/`read-now` で書いた値がそのまま読み戻せる。
+//!   `banto_collect::BrokerSimRegistry` が値の層のシミュレート済みデバイス
+//!   (`banto_driver_engine::sim` の `SimDevice`)へ張ってあるので、gate 8 の
+//!   `write_broker_handle_peek` → `BrokerHandle::write` がそのまま `SimSession`
+//!   に届く。`SimDevice` は書かれた番地を held として生成値に戻さないので、
+//!   次のポーリング/`read-now` で書いた値がそのまま読み戻せる(R2b-5)。
 //! - **監査**: log-before-write の `detail` に `{"target":"simulator"}` /
 //!   `{"target":"plc"}` を記録する([`write_target_detail`])。判定は旧
 //!   ゲート4と同じ条件(`entry.simulation || collection_mode ==

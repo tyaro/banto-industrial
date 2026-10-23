@@ -2,7 +2,7 @@
 //! 外し、残りを動かす。DB は null でよい」）を、**実際のワイヤ経路と実際の
 //! データファイル**で固定する。
 //!
-//! `collect_roundtrip.rs` と同じく、`banto_collect::simulation` の Modbus
+//! `collect_roundtrip.rs` と同じく、`banto_plc::ramp` の Modbus
 //! シミュレータを**そこに居る PLC** として立て、普通の Modbus TCP 接続として
 //! 登録する。その下に、
 //!
@@ -35,8 +35,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_collect::simulation;
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -183,7 +182,7 @@ async fn broken_items_are_left_out_their_values_are_invalid_and_their_history_is
         .await
         .expect("設定 DB を初期化できる");
     let data_dir = resolve_data_dir(dir.path(), "./data");
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
 
     let conn = connection(&pool, "dev-plc", sim.addr().port()).await;
     let grp = group(&pool, "一巡", conn).await;

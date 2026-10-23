@@ -19,7 +19,7 @@
 //! データファイルに入ったのを確かめてから (c) を見る（同じ writer・同じ
 //! flush なので、対照が書けていればシミュレーション側も書ける時間は経って
 //! いる）。停止（最終 flush）の後にもう一度見る。対照の相手は
-//! `banto_collect::simulation` のシミュレータを「そこに居る PLC」として
+//! `banto_plc::ramp` のシミュレータを「そこに居る PLC」として
 //! 外に立てたもの（`tests/collect_roundtrip.rs`（#412）と同じ作法）。
 //!
 //! 待ちはすべて「条件をポーリング + 上限時間」。固定 sleep で緑にしない。
@@ -28,8 +28,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_collect::simulation;
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -193,7 +192,7 @@ async fn simulation_connection_values_are_live_but_never_recorded() {
     let data_dir = resolve_data_dir(dir.path(), "./data");
 
     // 対照: 外に立てたシミュレータを「そこに居る PLC」として普通に登録する。
-    let control_plc = simulation::start(Protocol::ModbusTcp).await;
+    let control_plc = ramp::start(RampProtocol::ModbusTcp).await;
     let (real_conn, real_group, _) = register(
         &pool,
         "control",

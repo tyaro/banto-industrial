@@ -1096,7 +1096,7 @@
             "type": "boolean"
           },
           "simulation": {
-            "description": "T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):\nmirrors the tag's *owning connection's* `simulation` flag\n(`banto_tags::PlcConnection::simulation`), not the tag's own row -\ntags have no such column of their own. External clients (and the\nfuture T10 tag monitor) need this to tell that a tag's live value is\nsynthetic (produced by an in-process simulator,\n`banto_collect::simulation`/`crate::broker_glue::BrokerSimRegistry`),\nnot read from a real PLC.",
+            "description": "T9-2 (docs/ux-plan.md §1, accident-prevention requirement (b)):\nmirrors the tag's *owning connection's* `simulation` flag\n(`banto_tags::PlcConnection::simulation`), not the tag's own row -\ntags have no such column of their own. External clients (and the\nfuture T10 tag monitor) need this to tell that a tag's live value is\nsynthetic (produced by the value layer's simulated device,\n`banto_driver_engine::sim`/`banto_collect::BrokerSimRegistry`),\nnot read from a real PLC.",
             "type": "boolean"
           },
           "tag_key": {

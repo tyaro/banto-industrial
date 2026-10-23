@@ -71,9 +71,6 @@ pub mod shell_launch;
 // 選択」の判断（純関数）と対処（作り直す・バックアップから戻す・保存先を
 // 選び直す）。窓は各シェル（今はデスクトップの `src-tauri`）が出す。
 pub mod startup_recovery;
-// #413: 接続単位シミュレーションで値が動かないタグの判定（判定そのものは
-// `banto_collect::simulation::classify_plc_tag`）。REST と Tauri の両方が使う。
-pub mod simulation;
 // #414 段階1: タグのアドレスが接続のプロトコルで読めるかを保存時に確かめる
 // （判定は banto-collect の `check_tag_address`。REST と Tauri の両方から呼ぶ）。
 pub mod tag_address;

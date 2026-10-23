@@ -130,7 +130,7 @@ use crate::controller::{
     CollectionController, CollectionState, CollectionStatus, QuitInProgress, RunMode,
 };
 use crate::db::Db;
-use crate::hub::{CollectorManager, SimulationCoverageReport, TagEntry, TagMap};
+use crate::hub::{CollectorManager, TagEntry, TagMap};
 use crate::mqtt::MqttPublisher;
 use crate::pending_changes::{PendingChange, PendingChangesService};
 use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
@@ -891,7 +891,6 @@ fn api_router_with_controller_mode(
         ))
         .merge(collection_control_router(
             controller.clone(),
-            manager.clone(),
             audit.clone(),
             auth.clone(),
             events.clone(),

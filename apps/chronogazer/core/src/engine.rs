@@ -1487,8 +1487,7 @@ mod tests {
     use crate::collect::{CollectEventRow, CollectorState, EventPage, Readout};
     use crate::hub::UnavailableKeyStore;
     use crate::test_support::TempDir;
-    use banto_collect::simulation;
-    use banto_collect::Protocol;
+    use banto_plc::ramp::{self, RampProtocol};
     use banto_tags::{CollectionGroupInput, PlcConnectionInput, TagInput};
     use std::time::Instant;
 
@@ -1736,7 +1735,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_held_server_slot_lock_does_not_skip_the_final_flush() {
         let dir = TempDir::new();
-        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let sim = ramp::start(RampProtocol::ModbusTcp).await;
         let cfg = config(dir.path(), EngineListen::Required(loopback_any_port()));
         let db_path = cfg.db_path.clone();
         let opened = EngineRuntime::open(cfg).await.expect("open");
@@ -2017,7 +2016,7 @@ mod tests {
     async fn a_long_retention_sweep_does_not_skip_the_final_flush() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let dir = TempDir::new();
-        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let sim = ramp::start(RampProtocol::ModbusTcp).await;
         let opened = EngineRuntime::open(config(dir.path(), EngineListen::Disabled))
             .await
             .expect("open");
@@ -2197,7 +2196,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shutdown_runs_in_order_against_a_collecting_engine() {
         let dir = TempDir::new();
-        let sim = simulation::start(Protocol::ModbusTcp).await;
+        let sim = ramp::start(RampProtocol::ModbusTcp).await;
         let cfg = config(dir.path(), EngineListen::Required(loopback_any_port()));
         let db_path = cfg.db_path.clone();
 

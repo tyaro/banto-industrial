@@ -69,9 +69,9 @@ pub struct PlcConnectionPayload {
     /// T9-2 (docs/ux-plan.md §1, 「接続単位のシミュレーションモード」): opts
     /// this connection into an in-process simulator instead of a real PLC -
     /// see `banto_tags::PlcConnection::simulation`'s doc comment for what
-    /// this actually does at collection time
-    /// (`crates/banto-collect/src/simulation.rs`) and, for broker-routed
-    /// connections specifically, `crate::broker_glue::BrokerSimRegistry`.
+    /// this actually does at collection time (the value layer's simulated
+    /// device, `banto_driver_engine::sim`, dialled through
+    /// `banto_collect::BrokerSimRegistry`).
     #[serde(default = "default_plc_simulation")]
     pub simulation: bool,
     /// P3-b（監査指摘 2026-08-12）: ワード順（32bit値 u32/f32 等、および
