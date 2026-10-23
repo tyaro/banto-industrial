@@ -831,15 +831,14 @@ async fn stream_values_keeps_streaming_when_all_simulation_starts() {
 /// 開始した stream は通常どおり成功し、配信を続ける。
 ///
 /// **アドレスは `D0`（#344 作業中に判明した潜り込み、2026-09-15）**:
-/// AllSimulation 中は in-process シミュレータが `banto_collect::simulation`
-/// のランプ波タスクに駆動されるが、そのタスクが値を書くのは先頭
-/// `RAMP_ADDRESS_COUNT`（= 16）番地だけで、**ウィンドウ外の番地は常に
-/// Good/0 のまま変化しない**（`crates/banto-collect/src/simulation.rs` の
-/// module doc「T15-2」節）。この購読は `SubscribeMode::OnChange` なので、
+/// AllSimulation 中は値の層の `SimDevice`(`banto_driver_engine::sim`)が
+/// 100ms ごとに変わる値を返す。（R2b-5 より前はワイヤのランプ波が先頭 16
+/// 番地だけを動かし、**ウィンドウ外の番地は常に Good/0 のまま**だったため、
+/// `D0` を選んだ。）この購読は `SubscribeMode::OnChange` なので、
 /// 従来の `D100` では「初回スナップショットのあと値が一度も変わらない」
 /// のが正しい挙動で、2 通目が来るかどうかは収集が落ち着くまでの偶発的な
 /// Bad↔Good のちらつき次第という不安定なテストだった（#344 で接続が
-/// 安定した結果、ちらつきが消えて顕在化した）。`D0` はランプ窓の内側なので
+/// 安定した結果、ちらつきが消えて顕在化した）。`D0` は
 /// 100ms ごとに必ず値が変わり、「配信が続く」ことを本当に検証できる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stream_values_succeeds_and_continues_during_all_simulation() {

@@ -2,7 +2,7 @@
 //! タグごとの設定**（`chronogazer_core::tag_thresholds`）から作り、banto-tags の
 //! `tags` にしきい値の列は無い（#533 で外した）。判定に使ったしきい値はイベントに残る。
 //!
-//! 実際のワイヤ経路（`banto_collect::simulation` のシミュレータを普通の
+//! 実際のワイヤ経路（`banto_plc::ramp` のシミュレータを普通の
 //! Modbus TCP 接続として登録 - `collect_roundtrip.rs` と同じ）で、次を固定する:
 //!
 //! * 記録計の側の設定に `H = 0` を入れる（u16 は必ず 0 以上なので、最初の読みで
@@ -18,8 +18,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_collect::simulation;
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -169,7 +168,7 @@ async fn collection_judges_by_the_recorder_side_thresholds_and_records_the_limit
         .await
         .expect("設定 DB を初期化できる");
     let data_dir = resolve_data_dir(dir.path(), "./data");
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     let tag_id = register(&pool, sim.addr().port()).await;
     let tag_key = format!("tag:{tag_id}");
 

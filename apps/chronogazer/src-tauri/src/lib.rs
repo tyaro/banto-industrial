@@ -123,7 +123,6 @@ use chronogazer_core::rest::{
 use chronogazer_core::settings::{
     lan_autostart_allowed, AuditSettings, AuthSettings, ServerSettings, SettingsService,
 };
-use chronogazer_core::simulation::{simulation_coverage, SimulationCoverageEntry};
 use chronogazer_core::tag_address::{
     ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
     ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, update_tag_checked,
@@ -2413,31 +2412,6 @@ async fn plc_connections_update(
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
     plc_connections_update_body(&state, id, input).await
-}
-
-/// Body of [`simulation_coverage_list`]（#413）。
-async fn simulation_coverage_list_body(
-    state: &AppState,
-) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
-    require_role(state, Role::Viewer, "tags").await?;
-    simulation_coverage(
-        &state.services.plc_connections,
-        &state.services.collection_groups,
-        &state.services.tags,
-    )
-    .await
-}
-
-/// `viewer`+（#413）: シミュレーション接続の配下のタグごとに、シミュレータが
-/// 値を動かす番地かどうか。REST の `GET /api/simulation-coverage` と同じ
-/// `chronogazer_core::simulation::simulation_coverage` を呼ぶ（判定は
-/// `banto_collect::simulation::classify_plc_tag` の 1 か所）。読み取りなので
-/// 監査しない。
-#[tauri::command]
-async fn simulation_coverage_list(
-    state: State<'_, AppState>,
-) -> Result<Vec<SimulationCoverageEntry>, BantoError> {
-    simulation_coverage_list_body(&state).await
 }
 
 /// Body of [`config_exclusions_list`]（#414 段階2）。
@@ -4813,7 +4787,6 @@ pub fn run() {
             tag_thresholds_list,
             tag_thresholds_get,
             tag_thresholds_update,
-            simulation_coverage_list,
             config_exclusions_list,
             collect_status,
             collect_start,
@@ -6618,9 +6591,6 @@ mod tests {
                 .simulation,
             "拒否された切替は保存されない"
         );
-        simulation_coverage_list_body(&state)
-            .await
-            .expect("viewer は範囲外の判定を読める");
     }
 
     /// #414 段階2: `config_exclusions_list` は viewer 以上で読め（REST の

@@ -20,8 +20,7 @@
 //! 2026-09-15 makes an external write to a PC-side simulated device *land on
 //! the simulator* rather than be refused (banto-hub's old write gate 4,
 //! `WriteRejection::SimulationWriteRejected`, is gone), so this simulator
-//! needs to accept `0x1401`; and because `banto-collect`'s
-//! `simulation::slmp_ramp_task` rewrites `D0..D15`/`M0..M15` every 100 ms, a
+//! needs to accept `0x1401`; and because `banto_plc::ramp::slmp_ramp_task` rewrites `D0..D15`/`M0..M15` every 100 ms, a
 //! device written over the wire is recorded in a held set and the seeding
 //! setters ([`Simulator::set_word`], [`Simulator::set_words`],
 //! [`Simulator::set_string`], [`Simulator::set_bit`]) become no-ops for it.
@@ -58,7 +57,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use super::address::SlmpDevice;
+use super::address::{SlmpAccess, SlmpDevice};
 
 /// Bytes before the payload in both directions: subheader (2), serial id (2),
 /// blank (2), network id (1), PC id (1), I/O id (2), area id (1), data length
@@ -199,12 +198,12 @@ impl Simulator {
     ///
     /// **No-op if the device is held** (it was written over the wire, #363) -
     /// see this module's "Write support and the held set" section: this is
-    /// what stops `banto-collect`'s ramp task from erasing a value an
+    /// what stops `banto_plc::ramp`'s ramp task from erasing a value an
     /// external client just wrote.
     pub fn set_word(&self, device: SlmpDevice, number: u32, value: u16) {
         assert_eq!(
             device.access(),
-            super::SlmpAccess::Word,
+            SlmpAccess::Word,
             "{device} is a bit device - use set_bit"
         );
         let mut state = self.state.lock().unwrap();
@@ -250,7 +249,7 @@ impl Simulator {
     pub fn set_bit(&self, device: SlmpDevice, number: u32, value: bool) {
         assert_eq!(
             device.access(),
-            super::SlmpAccess::Bit,
+            SlmpAccess::Bit,
             "{device} is a word device - use set_word"
         );
         let mut state = self.state.lock().unwrap();
@@ -384,6 +383,12 @@ impl Simulator {
     /// handler task drops its `TcpStream`, which closes the socket - the
     /// connected client observes this on its next read or write.
     pub fn stop(self) {
+        self.abort_tasks();
+    }
+
+    /// [`Simulator::stop`] の `&self` 版。待受タスクと接続タスクを abort する
+    /// (共有参照しか持てない `RampHandle` の drop から呼ぶ)。何度呼んでもよい。
+    pub fn abort_tasks(&self) {
         self.accept_task.abort();
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();
@@ -549,7 +554,7 @@ fn build_read_response(state: &State, route: &Route, command: &[u8]) -> Vec<u8> 
     // real CPU rejects, and something this crate's planner should never emit -
     // answering with an end code makes a planner regression visible as a
     // failed assertion instead of as silently plausible zeros.
-    let expects_bit = request.device.access() == super::SlmpAccess::Bit;
+    let expects_bit = request.device.access() == SlmpAccess::Bit;
     if expects_bit != request.bit_access {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
     }
@@ -596,7 +601,7 @@ fn build_read_response(state: &State, route: &Route, command: &[u8]) -> Vec<u8> 
 /// A successful write answers end code `0` with no payload.
 ///
 /// Every device this commits is recorded as **held**, which is what takes it
-/// out of `banto-collect`'s ramp updates - see this module's "Write support
+/// out of `banto_plc::ramp`'s updates - see this module's "Write support
 /// and the held set" section.
 fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec<u8> {
     let Some(request) = parse_bulk_request(command) else {
@@ -609,7 +614,7 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
 
     // Same access-unit symmetry check the read path makes, and for the same
     // reason: a real CPU refuses a bit-unit write to a word device.
-    let expects_bit = request.device.access() == super::SlmpAccess::Bit;
+    let expects_bit = request.device.access() == SlmpAccess::Bit;
     if expects_bit != request.bit_access {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
     }
@@ -886,7 +891,7 @@ mod write_tests {
         .await;
         assert_eq!(sim.held_count(), 2);
 
-        // `banto-collect`'s ramp task drives exactly these setters.
+        // `banto_plc::ramp`'s ramp task drives exactly these setters.
         sim.set_word(SlmpDevice::D, 5, 1);
         sim.set_words(SlmpDevice::D, 4, &[7, 7, 7]);
         sim.set_bit(SlmpDevice::M, 3, false);

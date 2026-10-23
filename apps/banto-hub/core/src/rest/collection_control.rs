@@ -6,12 +6,11 @@
 //! 保つ。
 
 use super::{
-    actor_identity, broadcast, get, json, middleware, post, record_write, require_session,
+    actor_identity, broadcast, json, middleware, post, record_write, require_session,
     require_session_role, ApiError, Arc, AuditEntry, AuditLogService, AuthGate, AuthState,
-    BantoError, CollectionController, CollectionStatus, CollectorManager, Deserialize, ErrorBody,
-    FieldError, HeaderMap, IntoResponse, Json, OperationKind, QuitInProgress, Response, Role,
-    Router, RunMode, Serialize, ServerEvent, SessionRoleGuard, SimulationCoverageReport, State,
-    StatusCode,
+    BantoError, CollectionController, CollectionStatus, Deserialize, ErrorBody, FieldError,
+    HeaderMap, IntoResponse, Json, OperationKind, QuitInProgress, Response, Role, Router, RunMode,
+    Serialize, ServerEvent, SessionRoleGuard, State, StatusCode,
 };
 
 // --- collection lifecycle control (T14-4): admin + CSRF --------------------
@@ -48,11 +47,6 @@ struct CollectionModeRequest {
 #[derive(Clone)]
 struct CollectionAdminState {
     controller: Arc<CollectionController>,
-    /// T15-2: `GET /api/collection/simulation-coverage`が
-    /// `CollectorManager::simulation_coverage_report`を呼ぶために必要
-    /// (`CollectionController`自身はレジストリを読まない、ライフサイクル
-    /// 状態機械のみ - `crate::controller`のモジュール doc comment参照)。
-    manager: Arc<CollectorManager>,
     auth: AuthState,
     audit: AuditLogService,
     events: broadcast::Sender<ServerEvent>,
@@ -229,34 +223,14 @@ async fn collection_set_mode(
     }
 }
 
-/// T15-2 (docs/banto-hub-desktop-plan.md §9.7): all-simulation 開始前の
-/// プリフライト - `CollectorManager::simulation_coverage_report`をそのまま
-/// 返す。`start(AllSimulation)`をブロックしないので副作用は一切無く、
-/// `record_write`/`ServerEvent::ResourceChanged`も送らない(表示専用の
-/// 読み取り API - 他の`collection_*`ハンドラのような「状態が変わる操作」
-/// ではない)。
-async fn collection_simulation_coverage(
-    State(state): State<CollectionAdminState>,
-) -> Result<Json<SimulationCoverageReport>, ApiError> {
-    let report = state
-        .manager
-        .simulation_coverage_report()
-        .await
-        .map_err(BantoError::Storage)
-        .map_err(ApiError)?;
-    Ok(Json(report))
-}
-
 pub(super) fn collection_control_router(
     controller: Arc<CollectionController>,
-    manager: Arc<CollectorManager>,
     audit: AuditLogService,
     auth: AuthState,
     events: broadcast::Sender<ServerEvent>,
 ) -> Router {
     let state = CollectionAdminState {
         controller,
-        manager,
         auth: auth.clone(),
         audit: audit.clone(),
         events,
@@ -275,10 +249,6 @@ pub(super) fn collection_control_router(
         .route(
             "/api/collection/mode",
             post(collection_set_mode).put(collection_set_mode),
-        )
-        .route(
-            "/api/collection/simulation-coverage",
-            get(collection_simulation_coverage),
         )
         .with_state(state)
         .layer(middleware::from_fn_with_state(

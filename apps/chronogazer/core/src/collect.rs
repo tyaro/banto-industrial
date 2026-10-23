@@ -901,13 +901,13 @@ fn exclusion_views(exclusions: &[ConfigExclusion]) -> Vec<ExclusionView> {
 ///
 /// 判定は `banto_collect::config_exclusions` - **収集の開始
 /// （[`Lifecycle::start`]）が使う `build_config_lenient_from` そのもの**で、
-/// 画面（TS）には書き写さない（#413 の `simulation_coverage` と同じ流儀）。
+/// 画面（TS）には書き写さない（`collect_events` と同じ流儀）。
 /// 走っている収集の状態ではなく**レジストリの今の値**で判定する（収集が
 /// 止まっていても、編集中に分かるように）。走っている収集が実際に何を外して
 /// いるかは [`CollectorStateView`] の `exclusions`。
 ///
 /// 3 つの一覧は別々の読み取りで、同じトランザクションではない
-/// （`RegistrySnapshot::load` や `simulation_coverage` と同じ）。間に編集が
+/// （`RegistrySnapshot::load` と同じ）。間に編集が
 /// 挟まっても、画面は編集のたびに取り直す（`/tags` の再取得）ので次で
 /// 追いつく。
 pub async fn registry_exclusions(

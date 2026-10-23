@@ -2,7 +2,7 @@
 //! （docs/chronogazer-service-design.md §4 の B1-5 の受入条件）。
 //!
 //! - 一時ルート（`CHRONOGAZER_ROOT`）で起動 → シミュレータの PLC（Modbus TCP、
-//!   `banto_collect::simulation`。開発用 PLC の `dev_plc` example と同じもの）から
+//!   `banto_plc::ramp`。開発用 PLC の `dev_plc` example と同じもの）から
 //!   収集 → Ctrl-C と同じ経路で停止: `collection_stopped` と行が残り、
 //!   `run\endpoint.json` が消え、（Windows）ログに終了の行が残る。
 //! - （Windows）コンソールのウィンドウを閉じたとき（`CTRL_CLOSE_EVENT`）の
@@ -28,8 +28,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use banto_collect::simulation;
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -450,7 +449,7 @@ async fn collect_then_stop_with(
     stop_line: &str,
     hold_slow: bool,
 ) -> (ExitStatus, Duration) {
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     prepare_root(sandbox, Some(sim.addr().port()), false).await;
     let mut server = Server::spawn(sandbox, sandbox.root.to_str().unwrap());
     let port = wait_ready(sandbox, &server).await;
@@ -773,7 +772,7 @@ async fn a_start_failure_while_closing_is_still_written_to_the_daily_log() {
 /// #598 監査 F3: 起動の途中（DB を開いている最中）に止める合図が来たら、待ち受け・
 /// 収集の開始・`endpoint.json` まで進めずに起動を中止する（終了コード 3）。
 async fn a_stop_during_the_start_aborts_it(stop_line: &str) {
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     let sandbox = Sandbox::new();
     prepare_root(&sandbox, Some(sim.addr().port()), false).await;
     let mut server = spawn_paused_before_open(&sandbox).await;
@@ -819,7 +818,7 @@ async fn closing_during_the_start_aborts_it() {
 /// 諦め（`StartAbandoned`）、後始末を飛ばしていた。削除はその間に終わらないので、
 /// 古いファイルは残る（途中で終わってもログは壊れない）。
 async fn a_stop_during_the_log_prune_still_flushes(stop_line: &str, expected_lines: &[&str]) {
-    let sim = simulation::start(Protocol::ModbusTcp).await;
+    let sim = ramp::start(RampProtocol::ModbusTcp).await;
     let sandbox = Sandbox::new();
     prepare_root(&sandbox, Some(sim.addr().port()), false).await;
     let logs = sandbox.layout().logs_dir();

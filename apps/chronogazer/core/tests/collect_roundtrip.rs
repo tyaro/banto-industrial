@@ -4,7 +4,7 @@
 //!
 //! `src/collect.rs` の単体テストは偽クライアント（`OfflineClient`）で状態遷移
 //! だけを見ていて、PLC と話す経路は一度も通っていない。ここでは
-//! `banto_collect::simulation` のランプ波シミュレータ（`banto-plc` の実 TCP
+//! `banto_plc::ramp` のランプ波シミュレータ（`banto-plc` の実 TCP
 //! シミュレータ）を**そこに居る PLC** として立て、ChronoGazer には**普通の
 //! Modbus TCP / SLMP 接続**（`simulation = false`・ホスト 127.0.0.1・
 //! ポート = シミュレータの待ち受け）として登録する - 接続単位の
@@ -40,8 +40,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use banto_collect::simulation::{self, SimulatorHandle};
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampHandle, RampProtocol};
 use banto_tags::{
     CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
     TagInput, TagService,
@@ -233,14 +232,14 @@ async fn count_samples_with_value(data_dir: &Path, group_key: &str) -> Result<us
     Ok(count)
 }
 
-async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
+async fn roundtrip(protocol: RampProtocol, protocol_name: &str, address: &str) {
     let dir = TempDir::new();
     let db_path = dir.path().join("chronogazer.sqlite3");
     let pool = init_db(&db_path).await.expect("設定 DB を初期化できる");
     // banto-serve と同じく、既定の `./data` を DB の置き場基準で解決する。
     let data_dir = resolve_data_dir(dir.path(), "./data");
 
-    let sim: SimulatorHandle = simulation::start(protocol).await;
+    let sim: RampHandle = ramp::start(protocol).await;
     let (conn_id, group_id, tag_id) =
         register(&pool, protocol_name, sim.addr().port(), address).await;
     let conn_key = format!("conn:{conn_id}");
@@ -410,11 +409,11 @@ async fn roundtrip(protocol: Protocol, protocol_name: &str, address: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn modbus_tcp_roundtrip_against_the_simulator() {
     // 保持レジスタ 40001 = オフセット 0（ランプ波の対象）。
-    roundtrip(Protocol::ModbusTcp, "modbus-tcp", "40001").await;
+    roundtrip(RampProtocol::ModbusTcp, "modbus-tcp", "40001").await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn slmp_roundtrip_against_the_simulator() {
     // D0（ランプ波の対象）。
-    roundtrip(Protocol::Slmp, "slmp", "D0").await;
+    roundtrip(RampProtocol::Slmp, "slmp", "D0").await;
 }

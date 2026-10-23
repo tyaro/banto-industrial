@@ -1,6 +1,6 @@
 //! 開発用 PLC（ChronoGazer R1-C の C-4、2026-09-23）。
 //!
-//! `banto_collect::simulation` のランプ波シミュレータ（`banto-plc` の Modbus
+//! `banto_plc::ramp` のランプ波シミュレータ（`banto-plc` の Modbus
 //! TCP / SLMP シミュレータ = 実 TCP・実バイト列）を**別プロセス**として固定
 //! ポートで起動し、止められるまで値を流し続ける。ChronoGazer 側からは
 //! **普通の Modbus TCP / SLMP 接続**（ホスト `127.0.0.1`・ポート = ここで
@@ -40,8 +40,8 @@
 //!
 //! ## 動く番地
 //!
-//! `banto_collect::simulation` の「値生成」節どおり、100ms ごとに先頭
-//! [`banto_collect::simulation::RAMP_ADDRESS_COUNT`] 個の番地を書き換える:
+//! `banto_plc::ramp` のどおり、100ms ごとに先頭
+//! [`banto_plc::ramp::RAMP_ADDRESS_COUNT`] 個の番地を書き換える:
 //!
 //! * Modbus: 保持レジスタ `40001..` と入力レジスタ `30001..` にランプ波、
 //!   コイル `00001..` と入力ステータス `10001..` にトグル。
@@ -55,14 +55,13 @@
 //!   プロセスごと殺された場合（Playwright の `webServer` の後始末など）も、
 //!   ソケットは OS が閉じるので残るものは無い。
 //! * **ポートが使用中なら panic せず**、その旨を 1 行出して終了コード 1 で
-//!   終わる（`banto_collect::simulation::start_on` が bind の失敗を
+//!   終わる（`banto_plc::ramp::start_on` が bind の失敗を
 //!   `io::Error` で返す）。引数の誤りは使い方を出して終了コード 2。
 
 use std::net::{Ipv4Addr, SocketAddr};
 use std::process::ExitCode;
 
-use banto_collect::simulation::{self, RAMP_ADDRESS_COUNT};
-use banto_collect::Protocol;
+use banto_plc::ramp::{self, RampProtocol, RAMP_ADDRESS_COUNT};
 
 const DEFAULT_MODBUS_PORT: u16 = 15020;
 const DEFAULT_SLMP_PORT: u16 = 15000;
@@ -75,14 +74,14 @@ const USAGE: &str = "使い方: dev_plc [--protocol modbus|slmp] [--port <N>]
 
 #[derive(Debug)]
 struct Args {
-    protocol: Protocol,
+    protocol: RampProtocol,
     port: u16,
 }
 
-fn parse_protocol(value: &str) -> Result<Protocol, String> {
+fn parse_protocol(value: &str) -> Result<RampProtocol, String> {
     match value {
-        "modbus" | "modbus-tcp" => Ok(Protocol::ModbusTcp),
-        "slmp" => Ok(Protocol::Slmp),
+        "modbus" | "modbus-tcp" => Ok(RampProtocol::ModbusTcp),
+        "slmp" => Ok(RampProtocol::Slmp),
         other => Err(format!(
             "--protocol に {other:?} は指定できません（modbus / slmp）"
         )),
@@ -103,7 +102,7 @@ fn parse_args(
     mut argv: impl Iterator<Item = String>,
     env_port: Option<String>,
 ) -> Result<Args, String> {
-    let mut protocol = Protocol::ModbusTcp;
+    let mut protocol = RampProtocol::ModbusTcp;
     let mut port: Option<u16> = None;
     while let Some(arg) = argv.next() {
         match arg.as_str() {
@@ -127,25 +126,25 @@ fn parse_args(
         (Some(port), _) => port,
         (None, Some(value)) => parse_port(&value, PORT_ENV)?,
         (None, None) => match protocol {
-            Protocol::ModbusTcp => DEFAULT_MODBUS_PORT,
-            Protocol::Slmp => DEFAULT_SLMP_PORT,
+            RampProtocol::ModbusTcp => DEFAULT_MODBUS_PORT,
+            RampProtocol::Slmp => DEFAULT_SLMP_PORT,
         },
     };
     Ok(Args { protocol, port })
 }
 
 /// 起動時の 1 行: どこで待っているか・どの番地が動くか。
-fn banner(protocol: Protocol, addr: SocketAddr) -> String {
+fn banner(protocol: RampProtocol, addr: SocketAddr) -> String {
     let last = RAMP_ADDRESS_COUNT;
     match protocol {
-        Protocol::ModbusTcp => format!(
+        RampProtocol::ModbusTcp => format!(
             "dev_plc: Modbus TCP で {addr} を待ち受けています（ユニットID 任意。100ms ごとにランプ波: 保持レジスタ 40001-{} / 入力レジスタ 30001-{}、トグル: コイル 00001-{:05} / 入力ステータス 10001-{}）。Ctrl+C で終了",
             40000 + u32::from(last),
             30000 + u32::from(last),
             last,
             10000 + u32::from(last),
         ),
-        Protocol::Slmp => format!(
+        RampProtocol::Slmp => format!(
             "dev_plc: SLMP で {addr} を待ち受けています（100ms ごとにランプ波: D0-D{}、トグル: M0-M{}）。Ctrl+C で終了",
             last - 1,
             last - 1,
@@ -171,7 +170,7 @@ async fn main() -> ExitCode {
     };
 
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, args.port));
-    let handle = match simulation::start_on(args.protocol, addr).await {
+    let handle = match ramp::start_on(args.protocol, addr).await {
         Ok(handle) => handle,
         Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
             eprintln!(
@@ -216,14 +215,14 @@ mod tests {
     #[test]
     fn defaults_to_modbus_on_its_default_port() {
         let parsed = parse_args(args(&[]), None).unwrap();
-        assert_eq!(parsed.protocol, Protocol::ModbusTcp);
+        assert_eq!(parsed.protocol, RampProtocol::ModbusTcp);
         assert_eq!(parsed.port, DEFAULT_MODBUS_PORT);
     }
 
     #[test]
     fn slmp_has_its_own_default_port() {
         let parsed = parse_args(args(&["--protocol", "slmp"]), None).unwrap();
-        assert_eq!(parsed.protocol, Protocol::Slmp);
+        assert_eq!(parsed.protocol, RampProtocol::Slmp);
         assert_eq!(parsed.port, DEFAULT_SLMP_PORT);
     }
 

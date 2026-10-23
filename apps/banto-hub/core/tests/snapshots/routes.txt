@@ -10,7 +10,6 @@ GET /api/auth/identity
 GET /api/auth/status
 GET /api/collection-groups
 GET /api/collection-groups/{id}
-GET /api/collection/simulation-coverage
 GET /api/commissioning/status
 GET /api/events
 GET /api/grpc-settings

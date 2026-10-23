@@ -385,7 +385,7 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
         .create(group_input("fast", conn_id, 100))
         .await
         .unwrap();
-    // D5 は hub 内蔵シミュレータの RAMP_ADDRESS_COUNT(16) の範囲内。
+    // D5: 値の層の生成値が 100ms ごとに変わる番地。
     TagService::new(app.pool.clone())
         .create(tag_input("t1", group.id, "D5", "u16"))
         .await

@@ -688,7 +688,7 @@ async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and
         .await
         .unwrap();
     // Offset 16 ("40017") is deliberately outside
-    // `banto_collect::simulation::RAMP_ADDRESS_COUNT` (16) so this test says
+    // the value layer's generated window so this test says
     // nothing about the held set either way - that is
     // `tests/t9_simulation_write.rs`'s subject. Here the point is only that
     // the substituted simulator speaks Modbus writes at all.

@@ -49,7 +49,7 @@ use std::time::Duration;
 use crate::decode::WordOrder;
 use crate::error::PlcError;
 
-use address::{SlmpAccess, SlmpDevice};
+use address::SlmpDevice;
 
 /// MELSEC CPU series, which SLMP frames differ by: Q and L serialize a device
 /// address in 4 bytes and use subcommand `0x0000`/`0x0001`, R uses 6 bytes and

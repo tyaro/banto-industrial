@@ -30,8 +30,7 @@
 //! `crates/banto-plc-write/src/modbus/simulator.rs` (the dev-only write
 //! double this was ported from) already used.
 //!
-//! The other half is **holding**: `banto-collect`'s
-//! `simulation::modbus_ramp_task` overwrites the first
+//! The other half is **holding**: `banto_plc::ramp::modbus_ramp_task` overwrites the first
 //! `RAMP_ADDRESS_COUNT` addresses of every table every 100 ms, so a value
 //! written over the wire would be erased before the next poll could read it
 //! back. Any coil or holding register written *over the wire* is therefore
@@ -217,7 +216,7 @@ impl Simulator {
 
     /// Seed one coil. **No-op if the coil is held** (it was written over the
     /// wire) - see this module's "Write support and the held set" section:
-    /// this is what stops `banto-collect`'s ramp task from erasing a value an
+    /// this is what stops `banto_plc::ramp`'s ramp task from erasing a value an
     /// external client just wrote.
     pub fn set_coil(&self, offset: u16, value: bool) {
         let mut state = self.state.lock().unwrap();
@@ -426,6 +425,12 @@ impl Simulator {
     /// socket - the connected client observes this as an I/O error/EOF on
     /// its next read or write.
     pub fn stop(self) {
+        self.abort_tasks();
+    }
+
+    /// [`Simulator::stop`] の `&self` 版。待受タスクと接続タスクを abort する
+    /// (共有参照しか持てない `RampHandle` の drop から呼ぶ)。何度呼んでもよい。
+    pub fn abort_tasks(&self) {
         self.accept_task.abort();
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();
@@ -711,7 +716,7 @@ fn range_exception(start: u16, quantity: u16, max_quantity: u16) -> Option<u8> {
 }
 
 /// Commit a wire write to a coil and mark the address held, so the seeding
-/// setters (and therefore `banto-collect`'s ramp task) stop overwriting it -
+/// setters (and therefore `banto_plc::ramp`'s ramp task) stop overwriting it -
 /// see this module's "Write support and the held set" section.
 fn hold_coil(state: &mut State, address: u16, value: bool) {
     state.coils.insert(address, value);
@@ -919,7 +924,7 @@ mod write_tests {
         roundtrip(&mut stream, &write_single(FC_WRITE_SINGLE_COIL, 2, 0xFF00)).await;
         assert_eq!(sim.held_count(), 2);
 
-        // `banto-collect`'s ramp task drives exactly these setters.
+        // `banto_plc::ramp`'s ramp task drives exactly these setters.
         sim.set_holding_register(2, 1);
         sim.set_holding_registers(1, &[7, 7, 7]);
         sim.set_coil(2, false);

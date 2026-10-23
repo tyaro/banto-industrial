@@ -57,9 +57,8 @@
 	 *
 	 * **接続単位シミュレーション（#413、2026-09-23 オーナー決定）**: 接続の
 	 * フォームに切替、一覧に「動作」列（シミュレーション接続は「値は記録され
-	 * ません」）、タグの節に「シミュレーションで値が動かないタグ」を出す。
-	 * 範囲の判定は画面では行わない（`listSimulationCoverage` = Rust の
-	 * `classify_plc_tag` の結果を表示するだけ）。一覧・フォームはレジストリの
+	 * ません」）を出す（R2b-5c: 「値が動かないタグ」の一覧は、シミュレーション
+	 * が値の層に移って全タグが動くので無くなった）。一覧・フォームはレジストリの
 	 * 値で、**走っている収集への反映は「収集を再起動」**（保存時のトーストで
 	 * 案内する）。走っている収集が実際にシミュレータ相手かは
 	 * `/settings/collect` の接続ごとの状態に出る。
@@ -94,7 +93,6 @@
 		createTag,
 		updateTag,
 		deleteTag,
-		listSimulationCoverage,
 		listConfigExclusions,
 		isTagRegistryAvailable,
 		DEMO_MODE_MESSAGE,
@@ -106,7 +104,6 @@
 		type CollectionGroup,
 		type CollectionGroupInput,
 		type Tag,
-		type SimulationCoverageEntry,
 		type ExclusionView
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { exclusionUnitLabel } from '#lib/banto/collectAdmin.js';
@@ -140,8 +137,6 @@
 		connectionSavedMessage,
 		hubConnectionInput,
 		hubConnectionSavedMessage,
-		unmovingSimulationTags,
-		simulationCoverageView,
 		configExclusionsView,
 		coverageReloadStarted,
 		coverageReloadSettled,
@@ -341,7 +336,7 @@
 	const connectionRows = $derived(listRows(connectionsState));
 	const connectionsView = $derived(listSectionView(connectionsState));
 	const connectionsRetry = $derived(showsRetry(connectionsState));
-	/** #413: レジストリ上にシミュレーション接続が 1 本でもあるか（注記と「値が動かないタグ」の出し分け）。 */
+	/** #413: レジストリ上にシミュレーション接続が 1 本でもあるか（注記の出し分け）。 */
 	const hasSimulationConnection = $derived(connectionRows.some((c) => c.simulation));
 
 	/**
@@ -367,8 +362,6 @@
 		switch (outcome.kind) {
 			case 'applied':
 				connections = outcome.items;
-				// #413: 接続の simulation が変わると判定の対象が変わる。
-				void reloadSimulationCoverage();
 				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
 				void reloadConfigExclusions();
 				break;
@@ -758,7 +751,6 @@
 		switch (outcome.kind) {
 			case 'applied':
 				groups = outcome.items;
-				void reloadSimulationCoverage();
 				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
 				void reloadConfigExclusions();
 				break;
@@ -1001,7 +993,6 @@
 		switch (outcome.kind) {
 			case 'applied':
 				tags = outcome.items;
-				void reloadSimulationCoverage();
 				// #414 段階2: どの一覧が変わっても「開始時に外される設定」の判定は変わる。
 				void reloadConfigExclusions();
 				break;
@@ -1290,17 +1281,6 @@
 		}
 	}
 
-	// --- #413: シミュレーションで値が動かないタグ ------------------------------
-	//
-	// 判定は Rust（`classify_plc_tag`）の結果を読むだけ。一覧と同じ
-	// 「未読込 / 失敗 / 読めた」の区別と世代照合（`runGuardedListLoad`）を使う -
-	// 読めていないのに「全部動きます」と言わないため。
-	//
-	// #417 オーナーレビュー P2: 一覧と違い、**再取得のたびに前回の結果を捨てる**
-	// （`coverageReloadStarted`）。再取得は接続・グループ・タグの変更で起きるので、
-	// 前回の結果は「前の設定の判定」でしかない（例: 実機接続だった頃の空配列で
-	// 「すべて値が動く」と断定してしまう）。
-
 	// 未保存の入力の確認（banto #214 の流儀、ChronoGazer #508）: 6 つのフォーム
 	// （接続・グループ・タグの新規作成と編集）のどれかに、読み込み/保存時の値と
 	// 違う入力があれば未保存。編集フォームは行を選んでいる間だけ数える（削除や
@@ -1329,57 +1309,11 @@
 			savingThresholds
 	});
 
-	let coverage: SimulationCoverageEntry[] | null = $state(null);
-	let coverageError: string | null = $state(null);
-	let coverageLoading = $state(false);
-	let coverageGeneration = 0;
-	const coverageState: ListLoadState<SimulationCoverageEntry> = $derived({
-		items: coverage,
-		error: coverageError
-	});
-	const coverageView = $derived(simulationCoverageView(hasSimulationConnection, coverageState));
-	const unmovingTags = $derived(
-		unmovingSimulationTags(listRows(coverageState), tagRows, connectionRows)
-	);
-
-	async function reloadSimulationCoverage(): Promise<void> {
-		if (!available) return;
-		coverageGeneration += 1;
-		const generation = coverageGeneration;
-		coverageLoading = true;
-		const started = coverageReloadStarted<SimulationCoverageEntry>();
-		coverage = started.items;
-		coverageError = started.error;
-		const outcome = await runGuardedListLoad(
-			generation,
-			listSimulationCoverage(),
-			() => coverageGeneration
-		);
-		let settled: ListLoadState<SimulationCoverageEntry>;
-		switch (outcome.kind) {
-			case 'applied':
-				settled = coverageReloadSettled(started, { kind: 'applied', items: outcome.items });
-				break;
-			case 'error':
-				// トーストは出さない（補助の情報で、画面の行に失敗と再試行を残す）。
-				settled = coverageReloadSettled(started, {
-					kind: 'error',
-					message: errorMessage(outcome.err)
-				});
-				break;
-			case 'stale':
-				return;
-		}
-		coverage = settled.items;
-		coverageError = settled.error;
-		coverageLoading = false;
-	}
-
 	// --- #414 段階2: 収集の開始時に外される設定 --------------------------------
 	//
 	// 判定は Rust（収集の開始と同じ `build_config_lenient_from`）の結果を読む
 	// だけ（`listConfigExclusions`）。収集が走っていなくても出す。再取得の
-	// 作法は上の「値が動かないタグ」と同じ: 前回の結果を持ち越さず、読めて
+	// 作法: 前回の結果を持ち越さず、読めて
 	// いないのに「不正な設定はありません」と言わない。
 
 	let exclusionMarks: ExclusionView[] | null = $state(null);
@@ -1786,50 +1720,6 @@
 				{/if}
 			</div>
 
-			<!--
-				#413: シミュレーション接続の配下で値が動かないタグ。判定は Rust
-				（`classify_plc_tag`）の結果をそのまま出す。`div.list` の外に置くのは、
-				一覧の行（タグ名）と同じ文字列がこちらにも出るため。
-			-->
-			{#if coverageView !== 'hidden'}
-				<div class="simulation-coverage">
-					<h4>シミュレーションで値が動かないタグ</h4>
-					{#if coverageView === 'loading'}
-						<p class="loading">判定を読み込み中…</p>
-					{:else if coverageView === 'failed'}
-						<p class="load-error" role="alert">
-							判定を読み込めませんでした（{coverageError}）。値が動かないタグが無いという意味ではありません。
-							<button
-								type="button"
-								onclick={() => void reloadSimulationCoverage()}
-								disabled={coverageLoading}
-							>
-								再試行
-							</button>
-						</p>
-					{:else}
-						{#if coverageView === 'all-moving'}
-							<p class="note">
-								シミュレーション接続の配下のタグは、すべてシミュレータが値を動かす番地です。
-							</p>
-						{:else}
-							<p class="note">
-								内蔵シミュレータが値を動かすのは先頭の一部の番地だけです。次のタグは収集されても値が変化しません。
-							</p>
-							<ul class="unmoving-tags">
-								{#each unmovingTags as row (row.tagId)}
-									<li>
-										<strong>{row.tagName}</strong>
-										{#if row.address}（{row.address}）{/if}
-										- 接続 {row.connectionName}: {row.reason}
-									</li>
-								{/each}
-							</ul>
-						{/if}
-					{/if}
-				</div>
-			{/if}
-
 			{#if selectedTag && canWrite}
 				<div class="detail">
 					<h4>{selectedTag.name} を編集</h4>
@@ -2008,11 +1898,6 @@
 		color: var(--banto-text);
 	}
 
-	.simulation-coverage {
-		border-top: 1px solid var(--banto-border);
-		padding-top: 0.75rem;
-	}
-
 	/* #414 段階2: 不正な設定は収集から外れる（黙って欠測する）ので、エラー
 	ほど強くはないが見落とさない色・枠で出す。 */
 	.config-exclusions {
@@ -2036,12 +1921,6 @@
 		display: inline-block;
 		min-width: 6.5em;
 		color: var(--banto-text-muted);
-	}
-
-	.unmoving-tags {
-		margin: 0;
-		padding-left: 1.25rem;
-		font-size: 0.8rem;
 	}
 
 	.create,

@@ -91,19 +91,6 @@ export interface PlcConnectionInput {
 	simulation: boolean;
 }
 
-/**
- * Mirrors `chronogazer_core::simulation::SimulationCoverageEntry`（#413）:
- * シミュレーション接続の配下のタグ 1 本について、シミュレータが値を動かす
- * 番地か。**判定は Rust の `banto_collect::simulation::classify_plc_tag`
- * だけ**が行い、画面は結果を表示するだけ（範囲をここに書き写さない）。
- */
-export interface SimulationCoverageEntry {
-	tagId: number;
-	plcConnectionId: number;
-	supported: boolean;
-	reason: string | null;
-}
-
 /** Mirrors `banto_tags::CollectionGroup`. */
 export interface CollectionGroup {
 	id: number;
@@ -316,27 +303,13 @@ export async function deletePlcConnection(id: number): Promise<void> {
 	});
 }
 
-// --- simulation coverage (#413) ----------------------------------------------
-
-/**
- * シミュレーション接続の配下のタグの判定（`viewer` 以上）。シミュレーション
- * 接続が無ければ空配列。
- */
-export async function listSimulationCoverage(): Promise<SimulationCoverageEntry[]> {
-	if (!isTagRegistryAvailable()) throw demoModeError();
-	if (getBantoMode() === 'tauri') {
-		return invokeCommand<SimulationCoverageEntry[]>('simulation_coverage_list');
-	}
-	return httpRequest<SimulationCoverageEntry[]>('/api/simulation-coverage', { method: 'GET' });
-}
-
 // --- config exclusions (#414 段階2) -------------------------------------------
 
 /**
  * 今のレジストリで収集を開始したら外される接続・グループ・タグ（`viewer`
  * 以上）。`/tags` の印に使う。**判定は Rust（収集の開始と同じ
- * `banto_collect::build_config_lenient_from`）だけ**で、画面は表示するだけ
- * （`listSimulationCoverage` と同じ流儀）。収集が走っていなくても返る。
+ * `banto_collect::build_config_lenient_from`）だけ**で、画面は表示するだけ。
+ * 収集が走っていなくても返る。
  */
 export async function listConfigExclusions(): Promise<ExclusionView[]> {
 	if (!isTagRegistryAvailable()) throw demoModeError();

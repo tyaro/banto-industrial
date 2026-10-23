@@ -22,21 +22,12 @@ banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
 # a host without a broker of its own (ChronoGazer). banto-broker depends only on
 # banto-tags / banto-driver-api, so there is no cycle.
 banto-broker = { path = "../banto-broker" }
-# I2: address/type parsing (since R2b-3a-3 only for the legacy save-time rule
-# `check_tag_address`; collection reads go through the broker, not a `PlcClient`)
-# and the in-process simulators.
-#
-# T9-1 (docs/ux-plan.md §1, 2026-08-06 オーナー決定): the `simulator` feature
-# used to be a *dev*-dependency only ("production collection just uses
-# ModbusTcpClient against a real device"). That stopped being true with
-# 「接続単位のシミュレーションモード」: a `plc_connections.simulation = true`
-# row now makes `crate::simulation` spin up an in-process Modbus/SLMP
-# simulator at *runtime*, in every build, not just under `cfg(test)` - so the
-# feature moved here, to the non-dev dependency. This does cost every
-# consumer of this crate a real (loopback-only) TCP listener capability they
-# didn't previously link in, but that is exactly the point: simulation mode
-# is now a shipped product feature (ux-plan.md §1), not test infrastructure.
-banto-plc = { path = "../banto-plc", features = ["simulator"] }
+# I2: address/type parsing for the legacy save-time rule `check_tag_address`
+# (collection reads go through the broker, not a `PlcClient`). R2b-5c: the
+# in-process wire simulators are no longer started by this crate (simulation
+# connections run in the value layer, `banto_driver_engine::sim`), so the
+# `simulator` feature is a dev-dependency only again.
+banto-plc = { path = "../banto-plc" }
 # I3a: the time-series sink (TsWriter) + its Clock seam + StoreConfig shapes.
 banto-tstore = { path = "../banto-tstore" }
 # build_config surfaces registry read failures as BantoError (the type
@@ -60,6 +51,8 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
 
 [dev-dependencies]
+# Wire simulators for the integration tests (R2b-5c: dev only).
+banto-plc = { path = "../banto-plc", features = ["simulator"] }
 # `test-util` enables tokio::time::pause for the virtual-time backoff tests;
 # `rt-multi-thread`/`macros` for #[tokio::test]; `net` for #588's unresponsive
 # PLC listener (`tests/integration.rs`).

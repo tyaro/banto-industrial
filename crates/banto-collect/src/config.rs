@@ -63,17 +63,16 @@ fn tag_key(id: i64) -> String {
     format!("tag:{id}")
 }
 
-/// The two device protocols the plan knows by name: the simulator kind
-/// ([`crate::simulation::start`], picked by [`crate::BrokerSimRegistry`] until
-/// R2b-5) and the notation the save-time check [`check_tag_address`] (the
+/// The two address notations the save-time check [`check_tag_address`] (the
 /// legacy rule ChronoGazer saves with, address design Q7) parses a tag's
-/// address under - `Address::parse` (Modbus reference numbers) for
+/// address under (R2b-5c: it was also the wire simulator's kind until the
+/// simulation moved to the value layer) - `Address::parse` (Modbus reference numbers) for
 /// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes) for
 /// [`Protocol::Slmp`]. Since R2b-3a-3 the collection plan itself reads every
 /// address through the connection's driver (`parse_address`) and carries no
 /// per-protocol configuration ([`ProtocolConfig`]); whether a connection is
 /// collected at all is decided by the driver registry, not by this enum
-/// ([`simulator_protocol`] maps a name to it, for the address notation only).
+/// ([`address_notation`] maps a name to it, for the address notation only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     ModbusTcp,
@@ -1473,7 +1472,7 @@ fn resolve_connection<'a>(
     // Simulation needs no per-protocol support since R2b-5b: a
     // `simulation = true` connection is planned like any other broker-managed
     // one and its session is the value layer's `SimDevice`.
-    let protocol = simulator_protocol(&conn.protocol);
+    let protocol = address_notation(&conn.protocol);
     Ok(ResolvedConnection::Plc(
         protocol,
         ProtocolConfig::Broker(BrokerPlan {
@@ -1538,7 +1537,7 @@ fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
 /// message uses it since R2b-5b; whether a connection is collected - or
 /// simulated - is the driver registry's call, `resolve_connection`). `None`
 /// for every other driver.
-pub(crate) fn simulator_protocol(protocol: &str) -> Option<Protocol> {
+pub(crate) fn address_notation(protocol: &str) -> Option<Protocol> {
     match protocol {
         "modbus-tcp" => Some(Protocol::ModbusTcp),
         "slmp" => Some(Protocol::Slmp),
@@ -4422,9 +4421,9 @@ mod tests {
             .collect();
         assert_eq!(own, vec![(2, "unsupportedProtocol")]);
         // The legacy save-time notation is still picked by name.
-        assert_eq!(simulator_protocol("modbus-tcp"), Some(Protocol::ModbusTcp));
-        assert_eq!(simulator_protocol("slmp"), Some(Protocol::Slmp));
-        assert_eq!(simulator_protocol("fake-session"), None);
+        assert_eq!(address_notation("modbus-tcp"), Some(Protocol::ModbusTcp));
+        assert_eq!(address_notation("slmp"), Some(Protocol::Slmp));
+        assert_eq!(address_notation("fake-session"), None);
     }
 
     /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -

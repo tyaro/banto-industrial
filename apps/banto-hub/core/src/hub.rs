@@ -69,6 +69,9 @@
 //! ## 接続単位のシミュレーションモード（T9-2、2026-08-06/07。#337 で
 //! Modbus TCP にも同じ扱いが及ぶ）
 //!
+//! （R2b-5c 注: 以下の `Collector` 側のシミュレータやワイヤのシミュレータの
+//! 話は R2b-5 より前の履歴。いまのシミュレーションは値の層
+//! `banto_driver_engine::sim` の `SimDevice` で、ソケットは開かない。）
 //! `crate::broker_glue::BrokerSimRegistry`（`sim_registry` フィールド）は
 //! `sessions`（`HubSessions`）と対の、`CollectorManager` の外で構築・生存する
 //! `Arc` - broker 経由接続の `simulation = true` を実際に有効化する
@@ -205,7 +208,7 @@ use banto_collect::{
     ExternalSource, Quality, RegistrySnapshot,
 };
 use banto_core::ListParams;
-use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService};
+use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, TagService};
 use banto_tstore::Clock;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -476,8 +479,8 @@ pub struct TagEntry {
     /// (`banto_tags::PlcConnection::simulation`), not the tag's own row -
     /// tags have no such column of their own. External clients (and the
     /// future T10 tag monitor) need this to tell that a tag's live value is
-    /// synthetic (produced by an in-process simulator,
-    /// `banto_collect::simulation`/`crate::broker_glue::BrokerSimRegistry`),
+    /// synthetic (produced by the value layer's simulated device,
+    /// `banto_driver_engine::sim`/`banto_collect::BrokerSimRegistry`),
     /// not read from a real PLC.
     pub simulation: bool,
     /// R2a-1c（docs/banto-hub-ingest-design.md §3.3・§12 Q14）: 持ち主の接続が
@@ -1058,105 +1061,6 @@ pub fn sim_warning_due(last: Option<&(String, i64)>, text: &str, now_ms: i64) ->
                 || now_ms < *at_ms
                 || now_ms.saturating_sub(*at_ms) >= SIM_WARNING_REPEAT_MS
         }
-    }
-}
-
-/// T15-2 (docs/banto-hub-desktop-plan.md §9.7): 1タグがシミュレータの値生成
-/// ウィンドウから外れている理由 - [`CollectorManager::simulation_coverage_report`]
-/// の`unsupported`リスト1件分。`reason`は
-/// `banto_collect::simulation::classify_plc_tag`の日本語メッセージそのもの。
-///
-/// JSON は camelCase(この manager が組み立てる他の admin-UI 向けレスポンスと
-/// 同じ流儀 - `crate::rest`の`CollectionStatusResponse`/`MqttSettingsResponse`
-/// 等参照。`/api/v1/*`の snake_case とは別系統)。
-#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulationCoverageEntry {
-    pub name: String,
-    pub connection: String,
-    pub group: String,
-    pub address: String,
-    pub data_type: String,
-    pub reason: String,
-}
-
-/// T15-2: all-simulation 開始前のプリフライト結果 - プラン §9.7 のモックアップ
-/// 「対応: N タグ / 未対応: M タグ」をそのまま裏付ける集計。
-/// [`CollectorManager::simulation_coverage_report`]が構築する。
-#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct SimulationCoverageReport {
-    pub supported_count: usize,
-    pub unsupported_count: usize,
-    /// カタログ順(connection, group, tag の名前順 - [`TagMap`]と同じ安定順)。
-    pub unsupported: Vec<SimulationCoverageEntry>,
-}
-
-/// [`CollectorManager::simulation_coverage_report`]の純粋な計算本体 - レジス
-/// トリの読み取りとロジックを分けておくと(`build_catalog`/`build_catalog_from`
-/// と同じ分割方針)、`apps/banto-hub/core/tests/t15_simulation_coverage.rs`が
-/// 実 DB 無しの`RegistrySnapshot`だけでロジックを直接テストできる。
-///
-/// all-simulation は「現在 `simulation` フラグが立っている接続」だけでなく
-/// **有効な物理接続(protocol が `modbus-tcp`/`slmp`)全て**を強制的に
-/// シミュレーション対象にする([`runtime_snapshot_for_mode`]参照) - この
-/// プリフライトも同じ集合(有効な接続・有効なグループ・有効なタグ、かつ
-/// `tag_kind == "plc"`)を対象にする。computed/internal タグは PLC を読まない
-/// ので対象外(このモジュールの`TagEntry::tag_kind`の doc comment参照)。
-fn simulation_coverage_report_from(snapshot: &RegistrySnapshot) -> SimulationCoverageReport {
-    let conn_by_id: HashMap<i64, &PlcConnection> =
-        snapshot.connections.iter().map(|c| (c.id, c)).collect();
-    let group_by_id: HashMap<i64, &banto_tags::CollectionGroup> =
-        snapshot.groups.iter().map(|g| (g.id, g)).collect();
-
-    let mut rows: Vec<(&str, &str, &Tag, &str)> = Vec::new();
-    for tag in &snapshot.tags {
-        if !tag.enabled || tag.tag_kind != banto_tags::PLC_TAG_KIND {
-            continue;
-        }
-        let Some(group) = group_by_id.get(&tag.collection_group_id) else {
-            continue;
-        };
-        if !group.enabled {
-            continue;
-        }
-        let Some(conn) = conn_by_id.get(&group.plc_connection_id) else {
-            continue;
-        };
-        if !conn.enabled || !matches!(conn.protocol.as_str(), "modbus-tcp" | "slmp") {
-            continue;
-        }
-        rows.push((
-            conn.name.as_str(),
-            group.name.as_str(),
-            tag,
-            conn.protocol.as_str(),
-        ));
-    }
-    rows.sort_by(|a, b| (a.0, a.1, &a.2.name).cmp(&(b.0, b.1, &b.2.name)));
-
-    let mut supported_count = 0usize;
-    let mut unsupported = Vec::new();
-    for (connection, group, tag, protocol) in rows {
-        match banto_collect::simulation::classify_plc_tag(protocol, &tag.address, &tag.data_type) {
-            banto_collect::simulation::SimulationCoverage::Supported => supported_count += 1,
-            banto_collect::simulation::SimulationCoverage::Unsupported { reason } => {
-                unsupported.push(SimulationCoverageEntry {
-                    name: tag.name.clone(),
-                    connection: connection.to_string(),
-                    group: group.to_string(),
-                    address: tag.address.clone(),
-                    data_type: tag.data_type.clone(),
-                    reason,
-                });
-            }
-        }
-    }
-
-    SimulationCoverageReport {
-        supported_count,
-        unsupported_count: unsupported.len(),
-        unsupported,
     }
 }
 
@@ -2292,25 +2196,6 @@ impl CollectorManager {
             .clone()
     }
 
-    /// T15-2 (docs/banto-hub-desktop-plan.md §9.7): all-simulation 開始前の
-    /// カバレッジプリフライト - レジストリを新鮮に読み直し（`Self::rebuild`/
-    /// `Self::apply_run`と同じ`RegistrySnapshot::load`）、有効な物理 PLC タグ
-    /// 全件を[`banto_collect::simulation::classify_plc_tag`]で分類する。
-    /// **`start(AllSimulation)`自体はブロックしない** - このメソッドは表示専用
-    /// の集計を返すだけで、呼び出し元(`crate::rest`)は結果を無視しても
-    /// all-simulation を開始できる(プラン §9.7 の決定どおり)。
-    ///
-    /// 現在コミット済みの[`TagMap`]ではなく、その場でレジストリを読み直す -
-    /// [`Self::apply_run`]の`AllSimulation`分岐(`runtime_snapshot_for_mode`)が
-    /// 見るのと同じ「レジストリの今の状態」であるべきで、直前の rebuild 以降に
-    /// 未反映の登録変更を古いカタログ越しに見せないため。
-    pub async fn simulation_coverage_report(&self) -> Result<SimulationCoverageReport, String> {
-        let snapshot = RegistrySnapshot::load(&self.pool)
-            .await
-            .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
-        Ok(simulation_coverage_report_from(&snapshot))
-    }
-
     pub fn revision(&self) -> u64 {
         self.inner.lock().expect("hub state lock poisoned").revision
     }
@@ -2721,6 +2606,7 @@ mod tests {
     use super::*;
     use crate::db::init_db;
     use banto_collect::CollectorOptions;
+    use banto_tags::Tag;
     use banto_tags::{
         CollectionGroupInput, CollectionGroupService, PlcConnection, PlcConnectionInput, TagInput,
         TagService,
