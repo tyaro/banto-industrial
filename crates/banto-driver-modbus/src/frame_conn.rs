@@ -4,16 +4,17 @@
 //! specs into MBAP frames and responses back into values.
 //!
 //! - `create_connection` reads `unit_id` and `word_order` (absent ones are the
-//!   column defaults `1` / `low_high`, like the session in `api_session.rs`).
+//!   column defaults `1` / `low_high`, like the stored connection).
 //!   Modbus TCP has no handshake and no farewell. The connection keeps **one**
 //!   transaction-id counter, `next_transaction_id`, for every request it
 //!   builds - reads and writes alike. `plan_read` and `write_next` both take
-//!   `&mut self`, so the single-counter property that `session.rs` documents
-//!   at length (a late response to a timed-out read must not be taken for the
-//!   answer to the next write that reused its id) stays true by construction.
+//!   `&mut self`, so the single-counter property that the former session
+//!   (`session.rs`, removed in R2b-3c) documented at length (a late response to a
+//!   timed-out read must not be taken for the answer to the next write that
+//!   reused its id) stays true by construction.
 //!   The counter is taken when a step is built, in the order the engine sends
 //!   them, and wraps (`u16`).
-//! - `plan_read` is the session's planner unchanged: each spec goes through
+//! - `plan_read` is the former session's planner unchanged: each spec goes through
 //!   the same private `read_request` into `banto_plc::plan_batch_requests`,
 //!   and every group becomes one FC1/2/3/4 step (`expect` is the MBAP length
 //!   field: the response is `6 + length` bytes) whose `covers` are the specs
@@ -43,8 +44,8 @@
 //!   fatal. A string never reaches the wire (`Unsupported`, as in
 //!   `write_typed`).
 //!
-//! **Not yet** (3c-join): registering this as `DriverEntry::frame`. Until then
-//! the broker keeps dialing the session in `api_session.rs`.
+//! Registered by `banto-drivers` as `DriverEntry::frame` since R2b-3c; the
+//! broker wraps it in the engine's `FrameSession`.
 
 use banto_driver_api::{
     keys, DataType, FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError,
@@ -63,7 +64,7 @@ use banto_plc::{
 use banto_plc_write::modbus::{build_write_frame, parse_write_response_pdu};
 use banto_plc_write::{plan_modbus_writes, BatchWriteRequest, ModbusPlannedWrite, PlcWriteError};
 
-use crate::api_session::{fatal, read_request, unit_id_of, write_request, Prep};
+use crate::request::{fatal, read_request, unit_id_of, write_request, Prep};
 use crate::{classify_read, classify_write, ModbusDriver};
 
 /// The longest Modbus TCP frame (MBAP header + the 253-byte PDU).
@@ -790,7 +791,7 @@ mod tests {
         assert_eq!(covered, vec![0]);
     }
 
-    /// The most safety-critical property (`session.rs`): reads and writes
+    /// The most safety-critical property (the former `session.rs`): reads and writes
     /// number their requests from the same counter, and it wraps.
     #[test]
     fn reads_and_writes_share_one_transaction_counter() {

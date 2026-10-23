@@ -24,12 +24,12 @@
 //!   per-device word-order switch for 32-bit types. Shared by both protocol
 //!   implementations, which is why SLMP word groups are fetched as raw `u16`
 //!   windows rather than pre-typed by the wrapped crate.
-//! - [`modbus`]: the first protocol implementation
-//!   ([`modbus::ModbusTcpClient`]), chosen to go first for debuggability
-//!   (recorder-requirements.md §1); its connect ([`dial_modbus`]) and
-//!   borrowed-stream read execution ([`execute_modbus_reads`]) are shared
-//!   with `banto-broker`'s Modbus driver (#131), mirroring `slmp`'s
-//!   `dial_slmp`/`execute_slmp_batch_reads` split
+//! - [`modbus`]: the Modbus TCP wire format ([`modbus::frame`]), the
+//!   in-process simulator and [`ModbusTcpConfig`], chosen to go first for
+//!   debuggability (recorder-requirements.md §1). Since R2b-3c the I/O is
+//!   `banto-driver-modbus`'s frame-type driver over `banto-driver-engine`
+//!   (docs/banto-hub-driver-io-design.md §6.1); the former `ModbusTcpClient`,
+//!   `dial_modbus` and `execute_modbus_reads` are gone
 //! - [`slmp`]: the MELSEC MC/SLMP implementation ([`slmp::SlmpClient`], I2a) -
 //!   the eventual primary target, a sibling behind the same trait. Unlike
 //!   `modbus`, it wraps an external crate for the wire framing rather than
@@ -73,7 +73,7 @@ pub use address::{Address, AddressArea};
 pub use client::{BoxFuture, PlcClient};
 pub use decode::WordOrder;
 pub use error::PlcError;
-pub use modbus::{dial_modbus, execute_modbus_reads, ModbusTcpClient, ModbusTcpConfig};
+pub use modbus::ModbusTcpConfig;
 pub use planning::{
     modbus_accepts, plan_batch_requests, plan_requests, MappedRequest, PlanOutcome, PlannedRead,
 };

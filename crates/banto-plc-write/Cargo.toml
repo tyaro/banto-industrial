@@ -33,9 +33,9 @@ encoding_rs = { workspace = true }
 # `io-util`: the SLMP side's frame I/O happens inside the wrapped `slmp`
 # crate, but Modbus has no such wrapped crate (same reason banto-plc
 # hand-rolls Modbus framing itself - see `banto-plc/src/modbus/frame.rs`), so
-# `modbus::ModbusWriteClient` owns a raw `tokio::net::TcpStream` and drives it
-# with `AsyncReadExt`/`AsyncWriteExt` exactly like `banto_plc::ModbusTcpClient`
-# does for reads. No "rt"/"macros" - this crate never spawns tasks or defines
+# the Modbus write simulator drives a raw `tokio::net::TcpStream` with
+# `AsyncReadExt`/`AsyncWriteExt` (R2b-3c: the client side is the engine's, in
+# `banto-driver-engine`). No "rt"/"macros" - this crate never spawns tasks or defines
 # its own runtime; that is the consuming app's (or the tests') job. (Cargo
 # feature-unification still hands this crate full tokio via `slmp`'s own
 # `features = ["full"]`, same as banto-plc - the narrow list is a statement of

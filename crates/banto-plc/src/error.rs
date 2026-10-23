@@ -66,7 +66,7 @@ pub enum PlcError {
     /// A [`crate::types::ReadRequest`] carries an address written in a
     /// different protocol's notation than the client it was handed to speaks -
     /// e.g. an [`crate::address::Address::Slmp`] address in a batch given to
-    /// [`crate::modbus::ModbusTcpClient`]. Means the `PlcConnection`'s
+    /// a Modbus TCP driver. Means the `PlcConnection`'s
     /// `protocol` column and the tag's `address` column disagree, so it is a
     /// configuration error, resolved before any wire traffic and reported as a
     /// per-request `ReadResult::Bad` exactly like

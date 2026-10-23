@@ -4,9 +4,13 @@
 //! - `static_checks` (C1, C2) on [`ModbusDriver`], with fixtures copied from
 //!   `banto-plc/src/address.rs`'s tests (the grammar) and the TypeScript
 //!   `continuousRegistration.test.ts` / `offsetCopy.test.ts` (offsets).
-//! - `session::run_all_against` (C1-C8, C12) through the production
-//!   `Session` of `ModbusDriver` (R2b-3a-1), against `banto-plc`'s Modbus TCP
-//!   simulator behind a `FaultProxy`. C13-C15 have no fixtures: Modbus has
+//! - `session::run_all_against` (C1-C8, C12) through the frame-type
+//!   `ModbusDriver` wrapped by the real engine (`FrameSession`, R2b-3c,
+//!   docs/banto-hub-driver-io-design.md §11.2; R2b-3a-1 to 3b it was the
+//!   production session-type `Session`), against `banto-plc`'s Modbus TCP
+//!   simulator behind a `FaultProxy`. The wrapper is the one `banto-broker`
+//!   puts around a frame-type entry (`FrameDial`, crate-private there), kept
+//!   here as a few lines of test code. C13-C15 have no fixtures: Modbus has
 //!   no bit-in-word writes (`banto-plc-write/src/modbus/planning.rs`), so a
 //!   `.N` write is pinned as `ItemError::Unsupported` instead.
 //!
@@ -16,14 +20,68 @@
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DataType, DriverAddress, DriverBase, ItemError, SessionDriver, Settings,
-    StringEncoding, TagKind, TagSpec, Value, WriteItem,
+    AddressError, BoxFuture, ConnectContext, DataType, DriverAddress, DriverBase, DriverDescriptor,
+    FatalError, FieldError, ItemError, Session, SessionDriver, Settings, StringEncoding, TagKind,
+    TagSpec, Value, WriteItem,
 };
 use banto_driver_conformance::proxy::FaultProxy;
 use banto_driver_conformance::session::{self, ResponsePatch, SessionFixtures};
 use banto_driver_conformance::{static_checks, StaticFixtures};
+use banto_driver_engine::transport::TransportSpec;
+use banto_driver_engine::FrameSession;
 use banto_driver_modbus::ModbusDriver;
 use banto_plc::modbus::simulator::Simulator;
+
+/// The frame-type driver as a `SessionDriver`: connect = the engine's
+/// `FrameSession` over TCP to the settings' host and port.
+struct EngineSession;
+
+impl DriverBase for EngineSession {
+    fn descriptor(&self) -> &DriverDescriptor {
+        ModbusDriver.descriptor()
+    }
+    fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
+        ModbusDriver.validate_config(settings)
+    }
+    fn secret_keys(&self) -> Vec<String> {
+        ModbusDriver.secret_keys()
+    }
+    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
+        ModbusDriver.parse_address(text, kind)
+    }
+    fn offset_address(
+        &self,
+        canonical: &str,
+        kind: &TagKind,
+        n: i64,
+    ) -> Result<String, AddressError> {
+        ModbusDriver.offset_address(canonical, kind, n)
+    }
+    fn address_help(&self) -> String {
+        ModbusDriver.address_help()
+    }
+    fn probe(&self) -> Option<(String, TagKind)> {
+        ModbusDriver.probe()
+    }
+}
+
+impl SessionDriver for EngineSession {
+    fn connect(
+        &self,
+        settings: &Settings,
+        cx: ConnectContext,
+    ) -> BoxFuture<'static, Result<Box<dyn Session>, FatalError>> {
+        let settings = settings.clone();
+        Box::pin(async move {
+            let spec = TransportSpec::Tcp {
+                host: settings.get("host").expect("host").to_string(),
+                port: settings.get("port").expect("port").parse().expect("port"),
+            };
+            let session = FrameSession::connect(&ModbusDriver, &settings, &spec, &cx, None).await?;
+            Ok(Box::new(session) as Box<dyn Session>)
+        })
+    }
+}
 
 fn n(data_type: DataType) -> TagKind {
     TagKind::numeric(data_type)
@@ -197,7 +255,7 @@ async fn session_conforms() {
     let sim = Simulator::start().await;
     seed(&sim);
     let proxy = FaultProxy::start(sim.addr).await.unwrap();
-    let failures = session::run_all_against(&ModbusDriver, &fixtures(), &proxy).await;
+    let failures = session::run_all_against(&EngineSession, &fixtures(), &proxy).await;
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
     assert!(failures.is_empty(), "{text:#?}");
     sim.stop();
@@ -208,7 +266,7 @@ fn cx() -> ConnectContext {
 }
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):
-/// in the production `Session` an address that does not parse after connect is
+/// through the engine an address that does not parse after connect is
 /// the tag's own `ItemError::Unsupported`, not fatal (R2b-2a, address design
 /// §6 Q5; design §3.4, §7.1 C4), and a `.N` write is
 /// `ItemError::Unsupported` (design §7.3).
@@ -220,7 +278,7 @@ async fn invalid_address_is_unsupported_and_bit_write_is_unsupported() {
         ("port", sim.addr.port().to_string()),
     ])
     .unwrap();
-    let mut s = ModbusDriver.connect(&settings, cx()).await.unwrap();
+    let mut s = EngineSession.connect(&settings, cx()).await.unwrap();
     let bit = n(DataType::Bit);
     let spec = TagSpec::new(ModbusDriver.parse_address("40051.3", &bit).unwrap(), bit);
     let r = s

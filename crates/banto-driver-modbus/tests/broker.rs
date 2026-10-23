@@ -3,6 +3,8 @@
 //! driver lived there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2):
 //! the broker dials through a `DriverRegistry` holding this crate's
 //! `driver()` as a session-type entry and speaks `TagSpec` / `WriteItem`.
+//! R2b-3c: the entry is frame-type now (`DriverEntry::frame`), wrapped by the
+//! broker in the engine's `FrameSession`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,11 +17,11 @@ use banto_driver_modbus::ModbusDriver;
 use banto_plc_write::modbus::simulator::Simulator;
 use banto_tags::PlcConnection;
 
-/// The registry with just this driver, as a session-type entry.
+/// The registry with just this driver, as a frame-type entry.
 fn modbus_registry() -> Arc<DriverRegistry> {
     let mut registry = DriverRegistry::new();
     registry
-        .register(DriverEntry::session(banto_driver_modbus::driver()))
+        .register(DriverEntry::frame(banto_driver_modbus::driver()))
         .expect("one entry");
     Arc::new(registry)
 }
@@ -62,8 +64,8 @@ async fn supervisor_hands_out_a_handle_per_modbus_tcp_connection() {
     supervisor.shutdown().await;
 }
 
-/// R2b-3a-2: a write then a read over the one broker session, through the
-/// registry's session driver (one socket for both directions, #337).
+/// A write then a read over the one broker connection, through the
+/// registry's frame driver (one socket for both directions, #337).
 #[tokio::test]
 async fn write_then_read_over_the_one_session() {
     let sim = Simulator::start().await;

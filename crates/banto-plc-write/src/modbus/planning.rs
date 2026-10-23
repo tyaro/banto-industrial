@@ -55,7 +55,7 @@
 //!
 //! This module's plans do not name a function code - a [`ModbusPlannedWrite`]
 //! is just "this area, this contiguous range, this payload, these request
-//! indices". `super::execute_modbus_writes` picks FC5/FC6 when a plan's
+//! indices". `super::build_write_frame` picks FC5/FC6 when a plan's
 //! payload has exactly one element and FC15/FC16 otherwise (the module doc
 //! at `crates/banto-plc-write/src/modbus/mod.rs` explains why single-element
 //! groups deliberately prefer the single-write function codes over a
@@ -162,7 +162,7 @@ pub enum WritePayload {
 impl WritePayload {
     /// Element count: registers for a word write, coils for a bit write -
     /// what decides FC5/FC6 (single, `len() == 1`) vs. FC15/FC16 (multiple)
-    /// in `super::execute_modbus_writes`.
+    /// in `super::build_write_frame`.
     pub fn len(&self) -> usize {
         match self {
             WritePayload::Words(w) => w.len(),
@@ -175,7 +175,7 @@ impl WritePayload {
     }
 }
 
-/// One physical Modbus write: `super::execute_modbus_writes` issues exactly
+/// One physical Modbus write: the driver (via `super::build_write_frame`) issues exactly
 /// one wire request per [`ModbusPlannedWrite`] (FC5/FC6 if `payload.len() ==
 /// 1`, FC15/FC16 otherwise). `request_indices` lists every input request
 /// this group fulfils, in ascending offset order, mirroring
