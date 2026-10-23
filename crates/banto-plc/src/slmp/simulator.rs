@@ -20,8 +20,7 @@
 //! 2026-09-15 makes an external write to a PC-side simulated device *land on
 //! the simulator* rather than be refused (banto-hub's old write gate 4,
 //! `WriteRejection::SimulationWriteRejected`, is gone), so this simulator
-//! needs to accept `0x1401`; and because `banto-collect`'s
-//! `simulation::slmp_ramp_task` rewrites `D0..D15`/`M0..M15` every 100 ms, a
+//! needs to accept `0x1401`; and because `banto_plc::ramp::slmp_ramp_task` rewrites `D0..D15`/`M0..M15` every 100 ms, a
 //! device written over the wire is recorded in a held set and the seeding
 //! setters ([`Simulator::set_word`], [`Simulator::set_words`],
 //! [`Simulator::set_string`], [`Simulator::set_bit`]) become no-ops for it.
@@ -199,7 +198,7 @@ impl Simulator {
     ///
     /// **No-op if the device is held** (it was written over the wire, #363) -
     /// see this module's "Write support and the held set" section: this is
-    /// what stops `banto-collect`'s ramp task from erasing a value an
+    /// what stops `banto_plc::ramp`'s ramp task from erasing a value an
     /// external client just wrote.
     pub fn set_word(&self, device: SlmpDevice, number: u32, value: u16) {
         assert_eq!(
@@ -596,7 +595,7 @@ fn build_read_response(state: &State, route: &Route, command: &[u8]) -> Vec<u8> 
 /// A successful write answers end code `0` with no payload.
 ///
 /// Every device this commits is recorded as **held**, which is what takes it
-/// out of `banto-collect`'s ramp updates - see this module's "Write support
+/// out of `banto_plc::ramp`'s updates - see this module's "Write support
 /// and the held set" section.
 fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec<u8> {
     let Some(request) = parse_bulk_request(command) else {
@@ -886,7 +885,7 @@ mod write_tests {
         .await;
         assert_eq!(sim.held_count(), 2);
 
-        // `banto-collect`'s ramp task drives exactly these setters.
+        // `banto_plc::ramp`'s ramp task drives exactly these setters.
         sim.set_word(SlmpDevice::D, 5, 1);
         sim.set_words(SlmpDevice::D, 4, &[7, 7, 7]);
         sim.set_bit(SlmpDevice::M, 3, false);

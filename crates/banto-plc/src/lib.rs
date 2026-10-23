@@ -28,6 +28,9 @@
 //!   debuggability (recorder-requirements.md §1).
 //! - [`slmp`]: the MELSEC MC/SLMP device table, planner, simulator, [`SlmpConfig`]
 //!   and the classification of the `slmp` crate's errors.
+//! - `ramp` (`simulator` feature): the wire simulators with a ramp/toggle
+//!   generator task (R2b-5c; `dev_plc` and the "real PLC" counterpart of
+//!   tests that need values moving on the wire).
 //! - [`error`]: [`error::PlcError`], the one error type spanning both
 //!   whole-call (`Err`) and per-request (`ReadResult::Bad`) failures
 //!
@@ -46,6 +49,8 @@ pub mod decode;
 pub mod error;
 pub mod modbus;
 pub mod planning;
+#[cfg(any(test, feature = "simulator"))]
+pub mod ramp;
 pub mod slmp;
 pub mod types;
 
