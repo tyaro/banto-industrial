@@ -887,3 +887,123 @@ async fn close_by_closes_only_the_line_its_owner_leased_last() {
     assert!(bench.table.close_by(&key, old));
     assert!(bench.table.line(&key).is_none());
 }
+
+/// Codex P1: 古い応答と同期の応答が 1 回の recv でまとめて届く（`SerialOverTcp` でよくある）。
+/// 古い応答を捨てた後に `buf` に残った同期の応答を、次の recv を待つ前に調べ、1 回目の試行で同期する。
+#[tokio::test(start_paused = true)]
+async fn a_sync_response_received_together_with_a_stale_one_syncs_on_the_first_attempt() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Silence,                                  // 2: A は時間切れ
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert!(matches!(
+        read_one(&mut session, ADDR_A).await,
+        Err(FatalError::Timeout)
+    ));
+    drop(session);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)]);
+
+    // 3: 同期の要求。A の古い応答と同期の応答を 1 つのまとまりで届け、その後は何も来ない。
+    let mut joined = response(FC_READ, &[0xAA]);
+    joined.extend(response(FC_PROBE, &[0x55]));
+    bench.wire.react([Reaction::Reply(vec![joined])]);
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(
+        bench.outstanding().is_empty(),
+        "同期した: 待っている署名は空"
+    );
+    assert_eq!(bench.wire.sent().len(), 3, "同期の要求は 1 回だけ");
+}
+
+fn serial_spec(baud: u32) -> TransportSpec {
+    TransportSpec::Serial {
+        port: crate::transport::SerialPortName::parse("COM7").unwrap(),
+        line: crate::transport::SerialLine {
+            baud,
+            ..Default::default()
+        },
+    }
+}
+
+/// Codex P1: 線の設定（baud）が変わって開き直したポートは `Synced` を引き継がず、同期から始める。
+#[tokio::test(start_paused = true)]
+async fn a_synced_line_reopened_with_a_new_baud_starts_fresh_and_syncs_again() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.spec = serial_spec(9600);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Reply(vec![response(FC_READ, &[0x11])]),  // 2: A
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(
+        read_one(&mut session, ADDR_A).await.unwrap(),
+        RawValue::Uint(0x11)
+    );
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Synced);
+
+    bench.spec = serial_spec(19200);
+    let wire = bench.wire.clone();
+    let (lease, start) = bench
+        .table
+        .lease(&bench.spec, None, move || async move { wire.open() })
+        .await
+        .unwrap();
+    assert!(
+        matches!(start, LeaseStart::Fresh),
+        "開き直したポートは Fresh"
+    );
+    drop(lease);
+
+    bench.spec = serial_spec(9600);
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]); // 3: 同期
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert_eq!(bench.wire.lock().opens, 3, "設定が変わるたびに開き直す");
+    assert_eq!(
+        bench.wire.sent(),
+        vec![
+            request(FC_PROBE, 0x00).send,
+            request(FC_READ, ADDR_A).send,
+            request(FC_PROBE, 0x00).send,
+        ],
+        "開き直した後は同期の要求から送る"
+    );
+}
+
+/// 線の設定が変わって開き直しても、未同期と待っている署名は残す（機器と線は同じなので、
+/// 古い要求の応答がまだ届きうる）。
+#[tokio::test(start_paused = true)]
+async fn an_unsynced_line_reopened_with_a_new_baud_keeps_its_outstanding_signatures() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.spec = serial_spec(9600);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Silence,                                  // 2: A は時間切れ
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert!(matches!(
+        read_one(&mut session, ADDR_A).await,
+        Err(FatalError::Timeout)
+    ));
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Unsynced);
+
+    bench.spec = serial_spec(19200);
+    let wire = bench.wire.clone();
+    let (lease, start) = bench
+        .table
+        .lease(&bench.spec, None, move || async move { wire.open() })
+        .await
+        .unwrap();
+    assert!(matches!(start, LeaseStart::Unsynced), "未同期のまま");
+    drop(lease);
+    assert_eq!(bench.wire.lock().opens, 2, "設定が変わったので開き直した");
+    assert_eq!(bench.state(), SyncState::Unsynced);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)], "署名は残る");
+}

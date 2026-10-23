@@ -731,7 +731,7 @@ impl Core {
     }
 
     /// `buf` に完結した応答が 1 つ入るまで受け、その長さを返す（`buf` の先頭の `len` バイト。
-    /// 残りは呼び手が捨てる）。
+    /// 残りは呼び手が捨てる）。`buf` に前の受信の残りがあれば、recv の前にそれを調べる。
     async fn recv_frame(
         &mut self,
         step: &Step,
@@ -739,6 +739,22 @@ impl Core {
         deadline: Instant,
     ) -> Result<usize, FatalError> {
         loop {
+            // 先に `buf` に残っているバイトを調べる。同期の手順では、古い応答と同期の応答が
+            // 1 回の受信でまとめて届き、古い応答を捨てた後に同期の応答がもう `buf` にある（§7.3）。
+            // それ以上は届かないので、recv を先に待つと時間切れになる。
+            if !buf.is_empty() {
+                if let Some(len) = self.check_complete(step, buf)? {
+                    if len > step.max_len as usize {
+                        return Err(FatalError::Framing("応答が max_len を超えた".into()));
+                    }
+                    return Ok(len);
+                }
+                if buf.len() >= step.max_len as usize {
+                    return Err(FatalError::Framing(
+                        "応答が max_len までに完結しない".into(),
+                    ));
+                }
+            }
             // recv も先頭ノイズの破棄も、同じ期限を延長しない。
             if Instant::now() >= deadline {
                 return Err(FatalError::Timeout);
@@ -760,17 +776,7 @@ impl Core {
                     "Transport::recv の件数と受信が合いません".into(),
                 ));
             }
-            if let Some(len) = self.check_complete(step, buf)? {
-                if len > step.max_len as usize {
-                    return Err(FatalError::Framing("応答が max_len を超えた".into()));
-                }
-                return Ok(len);
-            }
-            if buf.len() >= step.max_len as usize {
-                return Err(FatalError::Framing(
-                    "応答が max_len までに完結しない".into(),
-                ));
-            }
+            // 受けたバイトはループの頭で調べる。
         }
     }
     fn validate_step(&mut self, step: &Step) -> Result<(), FatalError> {

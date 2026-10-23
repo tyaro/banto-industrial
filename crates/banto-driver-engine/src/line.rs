@@ -376,6 +376,12 @@ impl LineTable {
             if inner.spec.as_ref() != Some(spec) {
                 // 線の設定が変わった。開いたままのポートは閉じる（表に戻さない）。
                 drop(inner.transport.take());
+                // 開き直したポートは同期済みを引き継がない（同期の手順を持つドライバは同期から）。
+                // 未同期と待っている署名は残す: 機器と線は同じなので古い要求の応答がまだ届きうる。
+                // 溜まった署名は、同期が通れば空にする。
+                if inner.state == SyncState::Synced {
+                    inner.state = SyncState::Fresh;
+                }
             }
             inner.leased = true; // 予約。開く間に 2 つ目を断る。
             if owner.is_some() {
