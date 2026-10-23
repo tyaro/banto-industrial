@@ -39,6 +39,17 @@ use banto_plc_write::{
 use crate::session::ModbusSession;
 use crate::{classify_read, classify_write, ModbusDriver};
 
+/// The `unit_id` setting (absent: the default, 1). Shared with the frame-type
+/// connection (`frame_conn.rs`).
+pub(crate) fn unit_id_of(settings: &Settings) -> Result<u8, FatalError> {
+    match settings.get(keys::UNIT_ID) {
+        None => Ok(ModbusTcpConfig::default().unit_id),
+        Some(u) => u.trim().parse::<u8>().map_err(|_| {
+            FatalError::InvalidConfig(format!("unit_id {u:?} は 0〜255 の数でありません"))
+        }),
+    }
+}
+
 /// [`ModbusTcpConfig`] from the settings and the context's timeouts.
 fn config_from(settings: &Settings, cx: &ConnectContext) -> Result<ModbusTcpConfig, FatalError> {
     let host = settings
@@ -51,12 +62,7 @@ fn config_from(settings: &Settings, cx: &ConnectContext) -> Result<ModbusTcpConf
         .ok_or_else(|| {
             FatalError::InvalidConfig("port が無いか 0〜65535 の数でありません".into())
         })?;
-    let unit_id = match settings.get(keys::UNIT_ID) {
-        None => ModbusTcpConfig::default().unit_id,
-        Some(u) => u.trim().parse::<u8>().map_err(|_| {
-            FatalError::InvalidConfig(format!("unit_id {u:?} は 0〜255 の数でありません"))
-        })?,
-    };
+    let unit_id = unit_id_of(settings)?;
     Ok(ModbusTcpConfig {
         host: host.to_string(),
         port,
@@ -105,7 +111,7 @@ fn connect_error(err: banto_plc::PlcError) -> FatalError {
 
 /// The fatal half of a classification. An `ItemError` where the executor
 /// reported a connection-fatal error is a broken table: fall to `Io`.
-fn fatal(c: Result<ItemError, FatalError>) -> FatalError {
+pub(crate) fn fatal(c: Result<ItemError, FatalError>) -> FatalError {
     match c {
         Err(f) => f,
         Ok(item) => FatalError::Io(format!("致命として報告された非致命のエラー: {item:?}")),
@@ -113,7 +119,7 @@ fn fatal(c: Result<ItemError, FatalError>) -> FatalError {
 }
 
 /// Requests for the ones that can be made, item errors for the rest.
-enum Prep<R> {
+pub(crate) enum Prep<R> {
     Request(R),
     Item(ItemError),
 }
@@ -147,7 +153,7 @@ fn stitch<R, T>(
 }
 
 /// The read request of `spec`: this driver's grammar on the canonical address.
-fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
+pub(crate) fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
     // An address that does not parse is that tag's problem, not the
     // connection's (R2b-2a, address design §6 Q5).
     let address = match Address::parse(&spec.address.canonical) {
@@ -173,7 +179,7 @@ fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, FatalError> {
 /// The write request of `item`. Modbus never reads-modifies-writes a bit of a
 /// register: a `bit`-addressed `bit` tag is `Unsupported` (the SLMP twin
 /// makes it `BitInWord`).
-fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError> {
+pub(crate) fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError> {
     let spec = &item.spec;
     if spec.address.bit.is_some() && spec.kind == TagKind::Numeric(DataType::Bit) {
         return Ok(Prep::Item(ItemError::Unsupported(

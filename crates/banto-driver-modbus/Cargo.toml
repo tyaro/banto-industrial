@@ -43,4 +43,6 @@ banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }
 # R1-5（§7.3）: tests/conformance.rs。適合テスト一式と、そのピアになる banto-plc の
 # Modbus TCP シミュレータ（`modbus/simulator.rs`）。
 banto-driver-conformance = { path = "../banto-driver-conformance" }
+# R2b-3c: tests/p0_3.rs drives the frame-type driver through the real engine.
+banto-driver-engine = { path = "../banto-driver-engine" }
 banto-plc = { path = "../banto-plc", features = ["simulator"] }

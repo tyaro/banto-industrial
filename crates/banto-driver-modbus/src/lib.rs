@@ -24,6 +24,14 @@
 //!   the most safety-critical property of this driver) - with the typed
 //!   `PlcError` -> `FatalError` / `ItemError` mapping. The canonical address
 //!   is turned back into a `banto_plc::Address` privately inside this crate.
+//! - `frame_conn.rs` (R2b-3c, design §6.1): the [`banto_driver_api::FrameDriver`] /
+//!   `FrameConnection` of the same driver, for `banto-driver-engine`: MBAP
+//!   frames out (`plan_read` / `write_next`), responses in (`decode_read` and
+//!   the write echo check), **one** `next_transaction_id` per connection for
+//!   reads and writes. It reuses the session's planners and gates
+//!   (`plan_batch_requests`, `plan_modbus_writes`, `read_request` /
+//!   `write_request`), so what is read, written and refused is the same. Not
+//!   registered yet: the broker still dials `api_session.rs` until 3c-join.
 //! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
 //!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
 //!
@@ -37,6 +45,7 @@
 mod api_session;
 mod base;
 mod classify;
+mod frame_conn;
 mod session;
 
 pub use base::{driver, ModbusDriver};

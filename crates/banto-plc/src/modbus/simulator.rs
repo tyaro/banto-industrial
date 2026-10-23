@@ -382,6 +382,44 @@ impl Simulator {
         self.connections.lock().unwrap().len()
     }
 
+    /// The response to one whole request frame (MBAP header + PDU), with no
+    /// socket: the same device state, exceptions, write support and
+    /// wrong-transaction-id switch as the TCP path (`handle_connection`),
+    /// for a harness that owns the wire (`banto-driver-conformance`'s frame
+    /// `Responder`, R2b-3c). `hang`, chunking and `hold_next_response` are the
+    /// wire's business and do not apply. A request with no PDU (shorter than
+    /// its header or than its declared length) is answered with "illegal
+    /// function" for function code 0, since a real device would not answer it
+    /// at all and the harness needs bytes.
+    pub fn respond(&self, request: &[u8]) -> Vec<u8> {
+        let transaction_id = match request.get(..2) {
+            Some(b) => u16::from_be_bytes([b[0], b[1]]),
+            None => 0,
+        };
+        let unit_id = request.get(6).copied().unwrap_or(0);
+        let length = match request.get(4..6) {
+            Some(b) => u16::from_be_bytes([b[0], b[1]]),
+            None => 0,
+        };
+        let pdu_len = usize::from(length).saturating_sub(1);
+        let pdu = request
+            .get(MBAP_HEADER_LEN..MBAP_HEADER_LEN + pdu_len)
+            .filter(|pdu| !pdu.is_empty());
+        let mut response = match pdu {
+            Some(pdu) => build_response(&self.state, transaction_id, unit_id, pdu),
+            None => build_exception_response_frame(
+                transaction_id,
+                unit_id,
+                0,
+                EXCEPTION_ILLEGAL_FUNCTION,
+            ),
+        };
+        if self.state.lock().unwrap().wrong_transaction_id {
+            apply_wrong_transaction_id(&mut response, transaction_id);
+        }
+        response
+    }
+
     /// Stop accepting new connections and sever every connection already
     /// open, simulating a PLC power-cycle/network drop mid-session.
     /// Aborting each handler task drops its `TcpStream`, which closes the
@@ -393,6 +431,13 @@ impl Simulator {
             handle.abort();
         }
     }
+}
+
+/// Stamp `request id + 1` (wrapping) into the response's transaction id.
+fn apply_wrong_transaction_id(response: &mut [u8], transaction_id: u16) {
+    let wrong = transaction_id.wrapping_add(1).to_be_bytes();
+    response[0] = wrong[0];
+    response[1] = wrong[1];
 }
 
 async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
@@ -427,9 +472,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<Mutex<State>>) {
             (st.hold_next.take(), st.chunking, st.wrong_transaction_id)
         };
         if wrong_tid {
-            let wrong = transaction_id.wrapping_add(1).to_be_bytes();
-            response[0] = wrong[0];
-            response[1] = wrong[1];
+            apply_wrong_transaction_id(&mut response, transaction_id);
         }
         if let Some(gate) = hold {
             while !gate.load(Ordering::SeqCst) {
@@ -929,5 +972,37 @@ mod write_tests {
         .await;
         let response = roundtrip(&mut stream, &read_request(FC_READ_HOLDING_REGISTERS, 4, 1)).await;
         assert_eq!(response, vec![FC_READ_HOLDING_REGISTERS, 2, 0x12, 0x34]);
+    }
+
+    /// R2b-3c: `respond` is the socket-less twin of the TCP path - the same
+    /// state, the same wrong-transaction-id switch - and never panics on a
+    /// request that is too short.
+    #[tokio::test]
+    async fn respond_answers_a_whole_frame_without_a_socket() {
+        let sim = Simulator::start().await;
+        sim.set_holding_register(4, 0x1234);
+        let request = |tid: u16, pdu: &[u8]| crate::modbus::frame::wrap_mbap(tid, 1, pdu);
+        let read = [FC_READ_HOLDING_REGISTERS, 0, 4, 0, 1];
+        assert_eq!(
+            sim.respond(&request(7, &read)),
+            crate::modbus::frame::wrap_mbap(7, 1, &[FC_READ_HOLDING_REGISTERS, 2, 0x12, 0x34])
+        );
+        // A write over the same path reads back.
+        let write = [FC_WRITE_SINGLE_REGISTER, 0, 5, 0xAB, 0xCD];
+        assert_eq!(
+            sim.respond(&request(8, &write)),
+            crate::modbus::frame::wrap_mbap(8, 1, &write)
+        );
+        assert_eq!(sim.get_holding_register(5), 0xABCD);
+        sim.set_wrong_transaction_id(true);
+        let response = sim.respond(&request(9, &read));
+        assert_eq!(&response[..2], &10u16.to_be_bytes());
+        sim.set_wrong_transaction_id(false);
+        // Too short to hold a PDU: an exception, not a panic.
+        for short in [&[][..], &[0, 1][..], &request(3, &read)[..8]] {
+            let response = sim.respond(short);
+            assert_eq!(response[7], 0x80, "{short:?}");
+            assert_eq!(response[8], EXCEPTION_ILLEGAL_FUNCTION);
+        }
     }
 }

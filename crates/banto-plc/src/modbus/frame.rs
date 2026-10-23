@@ -32,8 +32,8 @@
 //! This is deliberately a **narrower** set than "make the whole module
 //! `pub`": [`FC_READ_*`] stay `pub(crate)` (a write client defines its own
 //! FC5/6/15/16 constants - reusing this module's read-only FC list for a
-//! write would be actively confusing), and [`ParsedResponse`]/
-//! [`parse_response_pdu`] stay `pub(crate)` too - their PDU shape assumes a
+//! write would be actively confusing). [`ParsedResponse`]/
+//! [`parse_response_pdu`] (and [`function_code_for`]) became `pub` in R2b-3c for the Modbus frame-type driver, but their PDU shape still assumes a
 //! **read** response (`byte_count` + data), which does not describe a write
 //! response at all (FC5/6/15/16 always echo back `function + 2 words`, no
 //! byte-count field - see the Modbus Application Protocol spec §6.5-6.8,
@@ -69,7 +69,9 @@ pub const EXCEPTION_FLAG: u8 = 0x80;
 /// comment.
 pub const MBAP_HEADER_LEN: usize = 7;
 
-pub(crate) fn function_code_for(area: AddressArea) -> u8 {
+/// The read function code (FC1-4) of `area`. `pub` (R2b-3c): the Modbus
+/// frame-type driver builds and checks its own read steps with it.
+pub fn function_code_for(area: AddressArea) -> u8 {
     match area {
         AddressArea::Coil => FC_READ_COILS,
         AddressArea::DiscreteInput => FC_READ_DISCRETE_INPUTS,
@@ -230,9 +232,12 @@ pub fn parse_mbap_header(buf: &[u8; MBAP_HEADER_LEN]) -> Result<MbapHeader, PlcE
 }
 
 /// A decoded response PDU, one variant per shape this crate needs to
-/// interpret.
+/// interpret. `pub` since R2b-3c with [`parse_response_pdu`] and
+/// [`function_code_for`]: the frame-type driver (`banto-driver-modbus`)
+/// decodes read responses through them. Read shape only; a write response is
+/// an echo that `banto-plc-write` parses itself.
 #[derive(Debug)]
-pub(crate) enum ParsedResponse {
+pub enum ParsedResponse {
     Bits(Vec<bool>),
     Registers(Vec<u16>),
     Exception { code: u8 },
@@ -243,7 +248,7 @@ pub(crate) enum ParsedResponse {
 /// called). `expected_quantity` is the element count from the *request* -
 /// used both to know how many bits to unpack from the trailing padding and
 /// to sanity-check the register response's declared byte count.
-pub(crate) fn parse_response_pdu(
+pub fn parse_response_pdu(
     pdu: &[u8],
     expected_function: u8,
     expected_quantity: u16,
