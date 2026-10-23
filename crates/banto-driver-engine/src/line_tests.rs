@@ -134,6 +134,8 @@ enum SyncPolicy {
     Distinct,
     /// 反証: 待っている署名と同じ（FC3 の 1 語）を選ぶ。
     Colliding,
+    /// 契約違反: 同期の step を `Fixed` で区切る（FC4 の 1 語、4 バイト）。
+    Fixed,
 }
 
 #[derive(Clone)]
@@ -165,6 +167,13 @@ impl FrameConnection for Conn {
             SyncPolicy::Distinct => &[(FC_PROBE, 0x00), (FC_PROBE, 0xF0), (FC_READ, 0xF0)],
             // 反証: 待っている署名を見ずに、A と同じ署名の要求を選ぶ。
             SyncPolicy::Colliding => return Some(request(FC_READ, 0x00)),
+            SyncPolicy::Fixed => {
+                return Some(Step::new(
+                    request(FC_PROBE, 0x00).send,
+                    FrameRule::Fixed(4),
+                    16,
+                ))
+            }
         };
         candidates
             .iter()
@@ -423,6 +432,64 @@ async fn a_sync_step_with_an_outstanding_signature_is_refused() {
     );
     assert_eq!(bench.wire.sent().len(), 2, "同期の要求は送られない");
     assert_eq!(bench.state(), SyncState::Unsynced);
+}
+
+/// 同期の step を `Fixed` で区切るドライバは契約違反（C17）で断られる。同期の途中に届く古い
+/// 応答も同期の step の形で区切るので、応答の長さが違うと区切りを誤る（Codex P2、2026-10-23）。
+#[tokio::test(start_paused = true)]
+async fn a_sync_step_delimited_by_a_fixed_length_is_refused() {
+    let bench = Bench::new(SyncPolicy::Fixed);
+    let result = bench.connect().await;
+    assert!(
+        matches!(&result, Err(FatalError::Protocol(m)) if m.contains("Fixed")),
+        "{:?}",
+        result.as_ref().err()
+    );
+    assert!(bench.wire.sent().is_empty(), "同期の要求は送られない");
+}
+
+/// 長さの違う古い応答（2 語・5 バイト）と同期の応答（1 語・4 バイト）が 1 回の recv で連結して
+/// 届いても、同期の step（`DriverDecides`）が先頭の古い応答をその長さで区切り、1 回目の同期の
+/// 要求で同期する。
+#[tokio::test(start_paused = true)]
+async fn a_stale_response_of_another_length_joined_with_the_sync_response_syncs_at_once() {
+    const ADDR_WIDE: u8 = 0xF1; // 2 語の読み取り（署名 FC3・2 語）
+    let bench = Bench::new(SyncPolicy::Distinct);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Silence,                                  // 2: 2 語の A は時間切れ
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert!(matches!(
+        read_one(&mut session, ADDR_WIDE).await,
+        Err(FatalError::Timeout)
+    ));
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 2)]);
+    drop(session);
+
+    let mut joined = response(FC_READ, &[0xAA, 0xAB]);
+    joined.extend_from_slice(&response(FC_PROBE, &[0x55]));
+    bench.wire.react([
+        Reaction::Reply(vec![joined]), // 3: 同期の要求（1 回の recv）
+        Reaction::Reply(vec![response(FC_READ, &[0xBB])]), // 4: B
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+    assert_eq!(
+        bench.wire.sent(),
+        vec![
+            request(FC_PROBE, 0x00).send,
+            request(FC_READ, ADDR_WIDE).send,
+            request(FC_PROBE, 0x00).send,
+            request(FC_READ, ADDR_B).send,
+        ],
+        "同期の要求は 1 回で済む"
+    );
 }
 
 /// §7.3 の取り消しの版: A を送った後、応答の前に外側の上限で future を drop し、セッションを

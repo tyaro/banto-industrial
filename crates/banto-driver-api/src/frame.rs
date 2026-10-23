@@ -315,6 +315,17 @@ pub trait FrameConnection: Send + 'static {
     /// (§7.3 step 6). The engine decides "has a procedure" by calling this
     /// with an empty slice, so the choice must not depend on earlier calls
     /// and must not change the connection's state when it returns `None`.
+    ///
+    /// The engine splits **every** frame that arrives during the sync,
+    /// including late responses to outstanding requests, with this step's
+    /// `expect`. So the sync step's `expect` must be a rule that delimits a
+    /// response from the response itself: [`FrameRule::LengthPrefixed`],
+    /// [`FrameRule::Terminator`] or [`FrameRule::DriverDecides`].
+    /// [`FrameRule::Fixed`] cannot be used (C17; the engine refuses it). With
+    /// `DriverDecides`, [`FrameConnection::is_complete`] called with the sync
+    /// step must delimit the first frame of its input at the right length
+    /// for the response (normal or exception) to **any** request that can be
+    /// sent on that line, not only for the sync request's own response.
     fn sync_step(&mut self, _outstanding: &[Signature]) -> Option<Step> {
         None
     }

@@ -20,7 +20,7 @@
 //! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
-//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; every planned read step has a `signature` |
+//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a planned read step's response followed by the sync response is delimited by the sync step at the read response's length; every planned read step has a `signature` |
 //!
 //! ## Comparing a value with its expected one
 //!
@@ -49,8 +49,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::time::Duration;
 
 use banto_driver_api::{
-    DataType, FatalError, FrameCheck, FrameDriver, FrameRule, ItemError, RawValue, StringEncoding,
-    TagKind, TagSpec, Value, WriteItem,
+    DataType, FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError,
+    PrefixEncoding, RawValue, Step, StringEncoding, TagKind, TagSpec, Value, WriteItem,
 };
 
 use crate::{Failure, StaticFixtures};
@@ -294,6 +294,8 @@ fn c17_serial_sync(
     };
     peer.on_connect();
     let mut outstanding = Vec::new();
+    // 最初の同期の要求とその応答（古い応答との連結の区切りを確かめるのに使う）。
+    let mut first_sync: Option<(Step, Vec<u8>)> = None;
     for attempt in 1..=2 {
         let Some(step) = conn.sync_step(&outstanding) else {
             fail(format!(
@@ -303,6 +305,10 @@ fn c17_serial_sync(
         };
         if matches!(step.expect, FrameRule::None) {
             fail("sync_step が応答を待たない step を返した".into());
+            return;
+        }
+        if matches!(step.expect, FrameRule::Fixed(_)) {
+            fail("sync_step の step の expect が Fixed（応答そのものから区切れる形にする）".into());
             return;
         }
         let Some(signature) = conn.signature(&step) else {
@@ -332,6 +338,9 @@ fn c17_serial_sync(
                 step.send
             ));
         }
+        if first_sync.is_none() {
+            first_sync = Some((step, response));
+        }
         outstanding.push(signature);
     }
     for prepared in reads {
@@ -345,7 +354,91 @@ fn c17_serial_sync(
                     prepared.case.text
                 ));
             }
+            // 同期の途中に届く古い応答も同期の step の形で区切られる（エンジンの契約）。
+            // 古い応答の直後に同期の応答が続いた受信で、先頭が古い応答の長さで区切れること。
+            let Some((sync, sync_response)) = &first_sync else {
+                continue;
+            };
+            if matches!(p.step.expect, FrameRule::None) {
+                continue;
+            }
+            let stale = match peer.reply(&p.step.send) {
+                Reply::Bytes(bytes) => bytes,
+                Reply::Chunks(pieces, _) => pieces.concat(),
+                _ => continue,
+            };
+            let mut joined = stale.clone();
+            joined.extend_from_slice(sync_response);
+            match first_frame_len(conn.as_ref(), sync, &joined) {
+                Ok(Some(len)) if len == stale.len() => {}
+                got => fail(format!(
+                    "{:?} の読み取りの応答 {stale:02X?} の後に同期の応答が続いた受信を、同期の step が {} バイトで区切れない（結果 {got:?}）",
+                    prepared.case.text,
+                    stale.len()
+                )),
+            }
         }
+    }
+}
+
+/// `step` の `expect` で `buf` の先頭のフレームの長さを求める（エンジンの区切りと同じ規則）。
+/// `DriverDecides` の `Discard` は先頭の応答を区切れていないので誤りとして返す。
+fn first_frame_len(
+    conn: &dyn FrameConnection,
+    step: &Step,
+    buf: &[u8],
+) -> Result<Option<usize>, String> {
+    match &step.expect {
+        FrameRule::Fixed(n) => Ok((buf.len() >= *n as usize).then_some(*n as usize)),
+        FrameRule::Terminator(t) if !t.is_empty() => Ok(buf
+            .windows(t.len())
+            .position(|w| w == &t[..])
+            .map(|i| i + t.len())),
+        FrameRule::LengthPrefixed(p) => {
+            let start = p.offset as usize;
+            let need = start + usize::from(p.width);
+            if buf.len() < need {
+                return Ok(None);
+            }
+            let field = &buf[start..need];
+            let value = match p.encoding {
+                PrefixEncoding::Binary => {
+                    let fold = |v: u64, b: &u8| (v << 8) | u64::from(*b);
+                    Some(if p.big_endian {
+                        field.iter().fold(0, fold)
+                    } else {
+                        field.iter().rev().fold(0, fold)
+                    })
+                }
+                PrefixEncoding::AsciiHex | PrefixEncoding::AsciiDec => {
+                    let radix = if p.encoding == PrefixEncoding::AsciiHex {
+                        16
+                    } else {
+                        10
+                    };
+                    std::str::from_utf8(field)
+                        .ok()
+                        .and_then(|t| u64::from_str_radix(t, radix).ok())
+                }
+                other => return Err(format!("知らない PrefixEncoding: {other:?}")),
+            };
+            let Some(value) = value else {
+                return Err(format!("長さ欄 {field:02X?} が読めない"));
+            };
+            let total = value as i128 + i128::from(p.adjust);
+            if total < need as i128 {
+                return Err(format!("長さ欄が総長 {total} を示す"));
+            }
+            let total = total as usize;
+            Ok((buf.len() >= total).then_some(total))
+        }
+        FrameRule::DriverDecides => match conn.is_complete(step, buf) {
+            Ok(FrameCheck::Complete { len }) => Ok(Some(len as usize)),
+            Ok(FrameCheck::Incomplete) => Ok(None),
+            Ok(other) => Err(format!("is_complete が {other:?}")),
+            Err(e) => Err(format!("is_complete が {e:?}")),
+        },
+        other => Err(format!("区切れない FrameRule: {other:?}")),
     }
 }
 
@@ -926,15 +1019,31 @@ mod tests {
     use super::*;
     use banto_driver_api::{
         AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
-        FieldError, FrameConnection, Planned, Settings, Signature, Step, Transport,
+        FieldError, Planned, Settings, Signature, Transport,
     };
 
+    /// 同期の step の区切り方。
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum SyncRule {
+        /// `Terminator(b"\n")`（正しい）。
+        Terminator,
+        /// `Fixed(2)`（C17 の違反）。
+        Fixed,
+        /// `DriverDecides` で、`is_complete` が改行で区切る（正しい）。
+        Decides,
+        /// `DriverDecides` で、`is_complete` が同期の応答の長さ（2 バイト）だけを見る
+        /// （長さの違う古い応答を区切れない。C17 の違反）。
+        DecidesSyncOnly,
+    }
+
     /// シリアルを名乗る最小のドライバ。`sync` で同期の手順の有無、`collide` で待っている署名を
-    /// 見ずに同じ要求を選ぶ（C17 が落ちるべき形）。
+    /// 見ずに同じ要求を選ぶ（C17 が落ちるべき形）、`rule` で同期の step の区切り方。
+    /// フレームは改行で終わる。読み取りの要求は `[9, 9, b'\n']`、同期の要求は `[c, b'\n']`。
     struct SerialDriver {
         descriptor: DriverDescriptor,
         sync: bool,
         collide: bool,
+        rule: SyncRule,
     }
     impl SerialDriver {
         fn new(sync: bool, collide: bool) -> Self {
@@ -949,6 +1058,7 @@ mod tests {
                 descriptor,
                 sync,
                 collide,
+                rule: SyncRule::Terminator,
             }
         }
     }
@@ -980,12 +1090,14 @@ mod tests {
             Ok(Box::new(SerialConn {
                 sync: self.sync,
                 collide: self.collide,
+                rule: self.rule,
             }))
         }
     }
     struct SerialConn {
         sync: bool,
         collide: bool,
+        rule: SyncRule,
     }
     impl FrameConnection for SerialConn {
         fn handshake_next(&mut self, _: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
@@ -1002,16 +1114,34 @@ mod tests {
             codes
                 .iter()
                 .find(|c| self.collide || !outstanding.contains(&Signature::new(vec![**c])))
-                .map(|c| Step::new(vec![*c], FrameRule::Fixed(1), 1))
+                .map(|c| {
+                    let expect = match self.rule {
+                        SyncRule::Terminator => FrameRule::Terminator(b"\n".to_vec()),
+                        SyncRule::Fixed => FrameRule::Fixed(2),
+                        SyncRule::Decides | SyncRule::DecidesSyncOnly => FrameRule::DriverDecides,
+                    };
+                    Step::new(vec![*c, b'\n'], expect, 16)
+                })
         }
         fn response_matches(&self, signature: &Signature, response: &[u8]) -> bool {
-            response == signature.as_bytes()
+            response.first() == signature.as_bytes().first()
         }
-        fn is_complete(&self, _: &Step, _: &[u8]) -> Result<FrameCheck, FatalError> {
-            unreachable!()
+        fn is_complete(&self, _: &Step, buf: &[u8]) -> Result<FrameCheck, FatalError> {
+            let end = match self.rule {
+                SyncRule::DecidesSyncOnly => (buf.len() >= 2).then_some(2),
+                _ => buf.iter().position(|b| *b == b'\n').map(|i| i + 1),
+            };
+            Ok(
+                end.map_or(FrameCheck::Incomplete, |len| FrameCheck::Complete {
+                    len: len as u32,
+                }),
+            )
         }
         fn plan_read(&mut self, _: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
-            Ok(vec![])
+            Ok(vec![Planned::new(
+                Step::new(vec![9, 9, b'\n'], FrameRule::Terminator(b"\n".to_vec()), 16),
+                vec![0],
+            )])
         }
         fn decode_read(
             &self,
@@ -1060,6 +1190,45 @@ mod tests {
         assert!(
             run(&tcp).is_empty(),
             "C17 is only for drivers naming serial"
+        );
+    }
+
+    #[test]
+    fn c17_requires_a_sync_step_that_delimits_any_response_on_the_line() {
+        let fixtures = FrameFixtures::new(StaticFixtures::new(Settings::new()));
+        let case = ReadCase::new("D0", TagKind::numeric(DataType::U16), RawValue::Uint(0));
+        let run = |rule: SyncRule| {
+            let mut driver = SerialDriver::new(true, false);
+            driver.rule = rule;
+            let reads = vec![Prepared {
+                case: &case,
+                spec: TagSpec::new(
+                    driver.parse_address(&case.text, &case.kind).unwrap(),
+                    case.kind.clone(),
+                ),
+            }];
+            let mut failures = Vec::new();
+            c17_serial_sync(&driver, &fixtures, &reads, &mut Echo, &mut failures);
+            failures
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.detail))
+                .collect::<Vec<_>>()
+        };
+        assert!(run(SyncRule::Terminator).is_empty());
+        assert!(run(SyncRule::Decides).is_empty());
+        let fixed = run(SyncRule::Fixed);
+        assert!(
+            fixed
+                .iter()
+                .any(|f| f.starts_with("C17") && f.contains("Fixed")),
+            "{fixed:?}"
+        );
+        let sync_only = run(SyncRule::DecidesSyncOnly);
+        assert!(
+            sync_only
+                .iter()
+                .any(|f| f.starts_with("C17") && f.contains("区切れない")),
+            "{sync_only:?}"
         );
     }
 

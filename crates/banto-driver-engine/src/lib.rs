@@ -437,6 +437,16 @@ impl Core {
                     self.violation_fatal("C17", "sync_step が応答を待たない step を返した".into())
                 );
             }
+            // 同期の途中に届くフレームは、古い要求への応答も含めてすべて同期の step の形で
+            // 区切る。`Fixed` は応答そのものから長さが分からず、形の違う古い応答を誤って
+            // 区切るので断る（`LengthPrefixed`・`Terminator`・`DriverDecides` だけを受ける）。
+            if matches!(step.expect, FrameRule::Fixed(_)) {
+                return Err(self.violation_fatal(
+                    "C17",
+                    "sync_step の step の expect が Fixed（応答そのものから区切れる形にする）"
+                        .into(),
+                ));
+            }
             let signature = self.signature_of(&step)?;
             if outstanding.contains(&signature) {
                 return Err(self.violation_fatal(

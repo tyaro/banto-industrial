@@ -112,8 +112,13 @@ impl FrameConnection for Connection {
             Ok(Some(step(b'H')))
         }
     }
-    fn is_complete(&self, _: &Step, _: &[u8]) -> Result<FrameCheck, FatalError> {
-        unreachable!()
+    fn is_complete(&self, _: &Step, buf: &[u8]) -> Result<FrameCheck, FatalError> {
+        // 同期の step（`DriverDecides`）だけが呼ぶ。この試験の応答はどれも 1 バイト。
+        Ok(if buf.is_empty() {
+            FrameCheck::Incomplete
+        } else {
+            FrameCheck::Complete { len: 1 }
+        })
     }
     fn signature(&self, step: &Step) -> Option<Signature> {
         self.sync.then(|| Signature::new(vec![step.send[0]]))
@@ -126,7 +131,8 @@ impl FrameConnection for Connection {
             .iter()
             .copied()
             .find(|code| !outstanding.contains(&Signature::new(vec![*code])))
-            .map(step)
+            // 同期の step は応答そのものから区切れる形にする（`Fixed` は C17 で断られる）。
+            .map(|code| Step::new(vec![code], FrameRule::DriverDecides, 1))
     }
     fn response_matches(&self, signature: &Signature, response: &[u8]) -> bool {
         // 試験の機器は要求の 1 バイト目をそのまま返す。
