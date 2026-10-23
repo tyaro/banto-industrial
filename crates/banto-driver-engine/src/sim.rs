@@ -15,7 +15,16 @@
 //! - RMW（語の中のビット）と多語の重なりは再現しない（ドライバ crate の適合テストの仕事）。
 //! - held は同じ種類のセルにだけ効く（種類が違えば別のセルで、変換も流用もしない）。
 //! - 文字列の長さはタグの符号化で数える（Hub の `encode_string_value` と同じ規則。表せない
-//!   文字と容量超過は断る）。
+//!   文字と容量超過は断る。NUL も容量に数える）。
+//! - held は「実機ならその書き込みの後の読み取りが返す値」: 文字列は符号化したバイト列を
+//!   `decode_string` で戻した値（最初の NUL で切れる。Shift-JIS の往復で変わる文字も戻した側）、
+//!   F32 は f32 に丸めた値、整数は -0.0 でなく 0。
+//! - ビット指定のアドレス（`bit: Some`）は bit 型のタグでだけ読み書きでき、それ以外の種類は
+//!   その項目だけ `Unsupported`（両ドライバの `parse_address` が登録時に断る規則）。
+//! - 断りの変種は `Rejected` に統一している（実機のドライバは値の種類違い・範囲外を
+//!   `Unsupported` にするが、Hub の関門が先に 422 で止めるので経路には現れない。設計 §3）。
+//! - 知らないこと（ビットデバイスとワードデバイスの区別・番号の上限・SLMP の 64bit 型・
+//!   Modbus の文字列と RMW の非対応）はドライバの `parse_address` と適合テストの仕事。
 //!
 //! `SessionDriver`（`DriverBase`）は実装しない: 設定の schema やアドレスの解析はシミュ
 //! レータに意味が無いので、接続は [`SimDevice::connect`] で直接作る。
@@ -24,7 +33,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use crate::decode::encoding_table;
+use crate::decode::{decode_string, encoding_table};
 use banto_driver_api::{
     BoxFuture, DataType, FatalError, ItemError, Session, TagKind, TagSpec, Value, WriteItem,
 };
@@ -175,7 +184,8 @@ fn generate(spec: &TagSpec, index: u32, tick: u64) -> Value {
             Value::Str(s[s.len() - keep..].to_owned())
         }
         TagKind::Numeric(dt) => {
-            if *dt == DataType::Bit || spec.address.bit.is_some() {
+            // ビット指定のアドレスは bit 型でだけ来る（`check_spec`）。
+            if *dt == DataType::Bit {
                 Value::Bit((tick + index as u64) % 2 == 1)
             } else {
                 Value::F64((phase % ramp_range(*dt)) as f64)
@@ -187,9 +197,22 @@ fn generate(spec: &TagSpec, index: u32, tick: u64) -> Value {
     }
 }
 
-/// 書き込みの検査。通れば held にする値を返す。
+/// 読み書きに共通の spec の検査。ビット指定のアドレス（`D100.5`）は bit 型のタグでだけ
+/// 使える（両ドライバの `parse_address` が登録時に断る規則。手で組んだ spec が来たら
+/// 実機の経路は計画で `Unsupported` にする）。
+fn check_spec(spec: &TagSpec) -> Result<(), ItemError> {
+    if spec.address.bit.is_some() && spec.kind != TagKind::Numeric(DataType::Bit) {
+        return Err(ItemError::Unsupported(
+            "ビット指定のアドレスはデータ型 bit のタグでのみ使えます".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 書き込みの検査。通れば held にする値（= 実機ならその書き込みの後の読み取りが返す値）を返す。
 fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
     let reject = |m: &str| Err(ItemError::Rejected(m.to_owned()));
+    check_spec(&item.spec)?;
     if !item.spec.address.writable_area {
         return reject("この領域は書き込めません");
     }
@@ -204,7 +227,8 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
         (TagKind::Numeric(DataType::Bit), _) => reject("ビットには真偽値だけを書けます"),
         (TagKind::Numeric(dt), Value::F64(v)) => {
             // 整数: Hub の値の検査（apps/banto-hub/core/src/write_path.rs の `fract() != 0.0` で断る）と同じく、小数は断る。
-            // 丸めず、範囲 [lo, hi) を検査してから、受けた値そのものを held にする。
+            // 丸めず、範囲 [lo, hi) を検査する。held はエンコーダの `x as u16` などを経た整数
+            // （-0.0 は 0 になる。それ以外は受けた値のまま）。
             let (lo, hi) = match dt {
                 DataType::I16 => (-32768.0, 32768.0),
                 DataType::U16 => (0.0, 65536.0),
@@ -226,18 +250,26 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
             if *v < lo || *v >= hi {
                 return reject("値が型の範囲外です");
             }
-            Ok(Value::F64(*v))
+            let held = if lo < 0.0 {
+                (*v as i64) as f64
+            } else {
+                (*v as u64) as f64
+            };
+            Ok(Value::F64(held))
         }
         (TagKind::Numeric(_), _) => reject("数値には数値だけを書けます"),
         (TagKind::Str { words, encoding }, Value::Str(s)) => {
-            // Hub の `encode_string_value` と同じ規則: 表せない文字は断り、容量超過も断る。
+            // Hub の `encode_string_value` と同じ規則: 表せない文字は断り、容量超過も断る
+            // （容量は NUL を含む符号化後の全バイトで数える）。held は実機の読み取りと同じく、
+            // 符号化したバイト列を `decode_string` で戻した値（最初の NUL で切れる。Shift-JIS の
+            // `¥`→`\` のような往復で変わる文字も戻した側になる）。
             let (bytes, _, had_errors) = encoding_table(*encoding).encode(s);
             if had_errors {
                 reject("このエンコーディングで表せない文字があります")
             } else if bytes.len() > *words as usize * 2 {
                 reject("文字列が長すぎます")
             } else {
-                Ok(Value::Str(s.clone()))
+                decode_string(&bytes, *encoding).map(Value::Str)
             }
         }
         (TagKind::Str { .. }, _) => reject("文字列タグには文字列だけを書けます"),
@@ -260,6 +292,7 @@ impl Session for SimSession {
             Ok(specs
                 .iter()
                 .map(|spec| {
+                    check_spec(spec)?;
                     let cell = st.cell(&spec.address.canonical, &spec.kind);
                     Ok(match &cell.held {
                         Some(v) => v.clone(),
@@ -338,12 +371,154 @@ mod tests {
         assert_eq!(generate(&b, 0, 1), Value::Bit(true));
         assert_eq!(generate(&b, 0, 2), Value::Bit(false));
         assert_eq!(generate(&b, 1, 2), Value::Bit(true));
-        // bit: Some のアドレスは種類に関わらずビット。
+        // bit: Some のアドレスの bit 型もビット。
         let bit_in_word = TagSpec::new(
+            addr("D1.3", true, 1).with_bit(3),
+            TagKind::numeric(DataType::Bit),
+        );
+        assert_eq!(generate(&bit_in_word, 0, 1), Value::Bit(true));
+    }
+
+    /// 実機の経路: ビット指定のアドレスは bit 型でだけ登録できる（手で組んだ spec は計画で
+    /// `Unsupported`）。読みも書きもその項目だけ `Unsupported` で、他の項目は進む。
+    #[tokio::test]
+    async fn a_bit_suffixed_address_of_a_non_bit_kind_is_unsupported() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let bad = TagSpec::new(
             addr("D1.3", true, 1).with_bit(3),
             TagKind::numeric(DataType::U16),
         );
-        assert_eq!(generate(&bit_in_word, 0, 1), Value::Bit(true));
+        let bad_str = TagSpec::new(
+            addr("D2.0", true, 2).with_bit(0),
+            TagKind::string(2, StringEncoding::Utf8),
+        );
+        let good = TagSpec::new(
+            addr("D1.4", true, 1).with_bit(4),
+            TagKind::numeric(DataType::Bit),
+        );
+        let r = s
+            .read_batch(&[bad.clone(), good.clone(), bad_str.clone()])
+            .await
+            .unwrap();
+        assert!(matches!(r[0], Err(ItemError::Unsupported(_))), "{:?}", r[0]);
+        assert!(matches!(r[1], Ok(Value::Bit(_))), "{:?}", r[1]);
+        assert!(matches!(r[2], Err(ItemError::Unsupported(_))), "{:?}", r[2]);
+        let w = s
+            .write_batch(&[
+                wr(&bad, Value::F64(1.0)),
+                wr(&bad, Value::Bit(true)),
+                wr(&bad_str, Value::Str("ab".into())),
+                wr(&good, Value::Bit(true)),
+            ])
+            .await
+            .unwrap();
+        for x in &w[..3] {
+            assert!(matches!(x, Err(ItemError::Unsupported(_))), "{x:?}");
+        }
+        assert_eq!(w[3], Ok(()));
+        assert_eq!(dev.write_count(), 1);
+        assert_eq!(dev.held_count(), 1);
+    }
+
+    /// 実機の経路: エンコーダは NUL も容量に数えて書き、読み取りは最初の NUL で切る
+    /// （`Value::Str` の契約）。held は読み取りが返す値。
+    #[tokio::test]
+    async fn a_string_with_an_embedded_nul_is_held_up_to_the_nul() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let s2 = spec("D1", TagKind::string(2, StringEncoding::Utf8));
+        // 3 バイト、収まる → "A"
+        let r = s
+            .write_batch(&[wr(&s2, Value::Str("A\u{0}B".into()))])
+            .await
+            .unwrap();
+        assert_eq!(r[0], Ok(()));
+        assert_eq!(dev.get("D1", &s2.kind), Some(Value::Str("A".into())));
+        // 4 バイト、ちょうど → "ABC"
+        let r = s
+            .write_batch(&[wr(&s2, Value::Str("ABC\u{0}".into()))])
+            .await
+            .unwrap();
+        assert_eq!(r[0], Ok(()));
+        assert_eq!(read1(&mut s, &s2).await, Ok(Value::Str("ABC".into())));
+        // NUL も容量に数える: "ABCD" + NUL は 5 バイトで 2 語に収まらない。
+        let r = s
+            .write_batch(&[
+                wr(&s2, Value::Str("ABCD\u{0}".into())),
+                wr(&s2, Value::Str("\u{0}".into())), // 先頭が NUL → 空文字列
+            ])
+            .await
+            .unwrap();
+        assert!(matches!(r[0], Err(ItemError::Rejected(_))), "{:?}", r[0]);
+        assert_eq!(r[1], Ok(()));
+        assert_eq!(read1(&mut s, &s2).await, Ok(Value::Str(String::new())));
+    }
+
+    /// 空文字列・容量ちょうど・末尾の空白は、実機の往復と同じくそのまま残る。
+    #[tokio::test]
+    async fn empty_full_and_space_padded_strings_round_trip_unchanged() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let s2 = spec("D1", TagKind::string(2, StringEncoding::Utf8));
+        for text in ["", "ABCD", "A  ", "  "] {
+            let r = s
+                .write_batch(&[wr(&s2, Value::Str(text.into()))])
+                .await
+                .unwrap();
+            assert_eq!(r[0], Ok(()), "{text:?}");
+            assert_eq!(
+                read1(&mut s, &s2).await,
+                Ok(Value::Str(text.into())),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// Shift-JIS の往復で変わる文字（WHATWG の表は `¥` U+00A5 を 0x5C に符号化し、0x5C は
+    /// `\` に復号する）は、実機の読み取りと同じく復号した側を held にする。
+    #[tokio::test]
+    async fn shift_jis_strings_are_held_as_the_decoded_round_trip() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let sj = spec("D1", TagKind::string(2, StringEncoding::ShiftJis));
+        let r = s
+            .write_batch(&[wr(&sj, Value::Str("¥1".into()))])
+            .await
+            .unwrap();
+        assert_eq!(r[0], Ok(()));
+        assert_eq!(read1(&mut s, &sj).await, Ok(Value::Str("\\1".into())));
+    }
+
+    /// 実機の読み取りが返す数: F32 は f32 に丸めた値、整数は -0.0 でなく 0。
+    #[tokio::test]
+    async fn held_numbers_are_what_a_real_read_would_return() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let f32s = num("D1", DataType::F32);
+        let f64s = num("D3", DataType::F64);
+        let i16s = num("D5", DataType::I16);
+        let u16s = num("D6", DataType::U16);
+        let r = s
+            .write_batch(&[
+                wr(&f32s, Value::F64(0.1)),
+                wr(&f64s, Value::F64(0.1)),
+                wr(&i16s, Value::F64(-0.0)),
+                wr(&u16s, Value::F64(-0.0)),
+                wr(&f32s, Value::F64(1e39)), // f32 の範囲外
+            ])
+            .await
+            .unwrap();
+        assert_eq!(&r[..4], &[Ok(()), Ok(()), Ok(()), Ok(())]);
+        assert!(matches!(r[4], Err(ItemError::Rejected(_))), "{:?}", r[4]);
+        assert_eq!(read1(&mut s, &f32s).await, Ok(Value::F64(0.1f32 as f64)));
+        assert_eq!(read1(&mut s, &f64s).await, Ok(Value::F64(0.1)));
+        for sp in [&i16s, &u16s] {
+            let Ok(Value::F64(v)) = read1(&mut s, sp).await else {
+                panic!()
+            };
+            assert!(v == 0.0 && v.is_sign_positive(), "{v:?}");
+        }
     }
 
     #[tokio::test]

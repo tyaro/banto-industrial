@@ -10,7 +10,7 @@
 
 R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（アプリの振る舞いは変わらない）。
 
-- `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` と `TagKind` の組を鍵にした共有の表で、種類が違えば別のセル。`get(canonical, &kind)` / `set(canonical, kind, value)` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{phase}`（phase は数値と同じ tick + index × 16）の末尾を語数 × 2 バイト残す）。書き込みは書けない領域・種類違い・NaN や ±inf（どの数値型も）・整数型への小数・型の範囲外・文字列の長すぎ（タグの符号化でバイト数を数え、表せない文字も断る）を `ItemError::Rejected` にし、通れば held にする。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
+- `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` と `TagKind` の組を鍵にした共有の表で、種類が違えば別のセル。`get(canonical, &kind)` / `set(canonical, kind, value)` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{phase}`（phase は数値と同じ tick + index × 16）の末尾を語数 × 2 バイト残す）。書き込みは書けない領域・種類違い・NaN や ±inf（どの数値型も）・整数型への小数・型の範囲外・文字列の長すぎ（タグの符号化でバイト数を数え、表せない文字も断る。NUL も容量に数える）を `ItemError::Rejected` にし、通れば held にする。held は実機ならその書き込みの後の読み取りが返す値（文字列は符号化して `decode_string` で戻した値 = 最初の NUL で切れる、F32 は f32 に丸めた値、整数は -0.0 でなく 0）。ビット指定のアドレス（`bit: Some`）は bit 型のタグでだけ読み書きでき、それ以外の種類はその項目だけ `Unsupported`。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
 
 ## 0.1.0 — 未公開
 
