@@ -48,9 +48,11 @@ CRUD/一覧サービス + スケーリング純関数（`scale_raw`/`unscale`）
 手書き - I3 が `Box<dyn PlcClient>` で複数 PLC を並行保持する前提）。
 同 trait の実装が2本ある:
 
-- **Modbus TCP**（[`ModbusTcpClient`](crates/banto-plc/src/modbus/mod.rs)、I2）:
-  外部 `modbus` クレート不使用の自前実装、FC1-4 のみ。デバッグ容易性を
-  優先して先行実装（docs/plan.md I2）
+- **Modbus TCP**（MBAP の組み立て・解釈は
+  [`modbus`](crates/banto-plc/src/modbus/mod.rs)、I2。R2b-3c から通信は
+  `banto-driver-modbus` の Frame 型ドライバ + `banto-driver-engine`）:
+  外部 `modbus` クレート不使用の自前実装。デバッグ容易性を優先して先行実装
+  （docs/plan.md I2）
 - **MELSEC MC/SLMP**（[`SlmpClient`](crates/banto-plc/src/slmp/mod.rs)、I2a）:
   本命ターゲット。フレーミングは承認済み外部クレート `slmp`（MIT）を
   ラップし、この crate 側は「何を読むか」（プランニング）と「どう失敗した

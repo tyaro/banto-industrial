@@ -646,7 +646,7 @@ async fn e2e_modbus_write_then_collection_reads_the_value_back() {
 //    MODBUS-speaking simulator `BrokerSimRegistry` substitutes, NOT the
 //    connection's configured (real, unreachable in this test) host/port, and
 //    NOT (the bug that fix closed) an SLMP-speaking simulator mismatched
-//    against the Modbus wire protocol the broker's `ModbusSession` actually
+//    against the Modbus wire protocol the broker's Modbus connection actually
 //    speaks.
 //
 //    #363 (2026-09-15 オーナー決定) rewrote what "success" means here. The
