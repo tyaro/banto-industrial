@@ -7,6 +7,19 @@
 - **適合テストの追加**: 新しい確認（C 番号）を足して、今まで通っていたドライバが落ちるようになるのは、この crate の minor を上げる変更として扱い、ここに書く。
 - **MSRV**: `Cargo.toml` の `rust-version`（API と同じ）。CI がその版で `cargo check` する。
 
+## 0.3.0 — 未公開
+
+R2b-6a（docs/banto-hub-driver-ui-design.md §3.3・§3.4・§3.6）。`banto-driver-api` 0.3.0 に合わせる。
+
+### 追加
+
+- 静的な確認 C17〜C22（`static_checks`）: 設定のスキーマの形（C17）、`secret_keys` との一致（C18）、既定値 + 最小の設定が通ること（C19）、`supported_kinds` と `parse_address` の一致（C20）、`offset_words`（C21）、アドレスの `index`（C22）。
+- `StaticFixtures::kind_example(kind, text)` と `word_offset(canonical, n, expected)`（欄は `kind_examples` / `word_offsets`）。
+
+### 壊れること
+
+- 新しい確認で、既存のドライバが落ちうる。**スキーマが空で、`kind_examples` / `word_offsets` を渡さないドライバは今までどおり通る**（C20 は `probe` の種類が `supported_kinds` に入っていることだけを見る。既定の一覧は 64bit を除く数値と bit なので、`probe` が 64bit や string のドライバは `supported_kinds` を足す）。スキーマを書いたドライバは C17〜C19 を満たすこと。
+
 ## 0.2.0 — 未公開
 
 R2b-3（docs/banto-hub-driver-io-design.md §5.6・§11.2。2026-10-23、banto-hub v0.2.0-alpha.37）。`banto-driver-api` 0.2.0 に合わせる。**`0.1.0` は公開していない**ので、公開する最初の版はこの `0.2.0`。次の `0.1.0` 節は R1 の形の記録として残す。

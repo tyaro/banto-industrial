@@ -250,11 +250,16 @@ interface address {
     writable-area: bool,      // プロトコルの事実（D5）。書き込み許可の判断には使わない
     bit: option<u8>,          // 記法はプラグインの文法に従う（SLMP なら .0〜.F の16進、T20-④）
     word-count: u32,
+    index: option<u64>,       // area の中の位置（ワードの番号。SLMP の16進も数値に直す。ワード内ビットはそのワードの番号）。重なりの判定用（R2b-6、ui-design §3.6）
   }
   // string-words は data-type が "string" のときの語数（word-count を決めるために要る）
   parse: func(text: string, data-type: string, string-words: option<u32>) -> result<parsed, string>;
   // 連続登録・オフセットコピー用: n 個先のアドレス
   offset: func(canonical: string, data-type: string, string-words: option<u32>, n: s64) -> result<string, string>;
+  // このドライバが読める・書けるタグの種類（"bit"・"u16"…"f64"・"string"）。UI の選択肢と型の検査に使う（R2b-6）
+  supported-kinds: func() -> list<string>;
+  // canonical を n ワード物理的に動かした正規形。ワード内ビットはビットを保ち、ビットデバイスは n 点（既定は非対応のエラー。R2b-6）
+  offset-words: func(canonical: string, n: s64) -> result<string, string>;
   help: func() -> string;
 }
 
@@ -264,6 +269,24 @@ interface config {
   validate: func(settings: list<setting>) -> list<field-error>;
   // 秘密として扱う設定キー（パスワード等）。§5 の保存先へ
   secret-keys: func() -> list<string>;
+
+  // 接続の設定の欄（Hub の汎用フォームの元。R2b-6、ui-design §3）。条件つきの表示は v1 に無い
+  record choice-option { value: string, label: string }
+  record text-spec { max-len: option<u32>, placeholder: option<string> }
+  record integer-spec { min: option<s64>, max: option<s64> }
+  variant field-kind { text(text-spec), host, integer(integer-spec), choice(list<choice-option>), %bool, secret }
+  variant setting-value { text(string), integer(s64), boolean(bool) }
+  enum field-group { basic, advanced }
+  record setting-field {
+    key: string,
+    label: string,
+    help: option<string>,
+    kind: field-kind,
+    required: bool,
+    default: option<setting-value>,
+    group: field-group,
+  }
+  schema: func() -> list<setting-field>;
 }
 
 // WIT の export は必須なので、書き込みの有無で world を分ける

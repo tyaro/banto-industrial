@@ -92,7 +92,7 @@ banto-collect = { path = "../../../crates/banto-collect" }
 # directory outside CollectorManager.
 banto-broker = { path = "../../../crates/banto-broker" }
 # R1-3b: `HubDrivers`（`broker_glue.rs`）が `DriverRegistry` を持つ。
-banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0" }
 # I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
 # POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
 # submits it through banto_broker::BrokerHandle::write (which itself depends
@@ -199,7 +199,7 @@ tokio-tungstenite = { workspace = true }
 # `banto-driver-api` にだけ依存する公開 crate なので、下の「`banto-drivers` には dev でも
 # 依存しない」は崩れない（CI では conformance の変更で core も走るようになる。
 # `.github/scripts/ci-changes.test.mjs` の G に辺を足した）。
-banto-driver-conformance = { path = "../../../crates/banto-driver-conformance", version = "0.2.0" }
+banto-driver-conformance = { path = "../../../crates/banto-driver-conformance", version = "0.3.0" }
 # R2b-0（docs/banto-driver-api-design.md §2.4）: `banto-drivers`（実ドライバ）は dev でも
 # 持たない。ドライバだけの変更で core が CI に選ばれないようにするため。`src` の単体
 # テストは `src/test_support.rs::test_drivers`（偽のドライバ表）、`tests/` に残った統合

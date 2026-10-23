@@ -21,8 +21,8 @@ use std::time::Duration;
 
 use banto_driver_api::{
     AddressError, BoxFuture, ConnectContext, DataType, DriverAddress, DriverBase, DriverDescriptor,
-    FatalError, FieldError, ItemError, Session, SessionDriver, Settings, StringEncoding, TagKind,
-    TagSpec, Value, WriteItem,
+    FatalError, FieldError, ItemError, KindName, Session, SessionDriver, Settings, SettingsSchema,
+    StringEncoding, TagKind, TagSpec, Value, WriteItem,
 };
 use banto_driver_conformance::proxy::FaultProxy;
 use banto_driver_conformance::session::{self, ResponsePatch, SessionFixtures};
@@ -62,6 +62,15 @@ impl DriverBase for EngineSession {
     }
     fn probe(&self) -> Option<(String, TagKind)> {
         ModbusDriver.probe()
+    }
+    fn settings_schema(&self) -> SettingsSchema {
+        ModbusDriver.settings_schema()
+    }
+    fn supported_kinds(&self) -> Vec<KindName> {
+        ModbusDriver.supported_kinds()
+    }
+    fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+        ModbusDriver.offset_words(canonical, n)
     }
 }
 
@@ -194,6 +203,29 @@ fn statics() -> StaticFixtures {
         ("400001.3", n(Bit), 1, None),
     ] {
         f = f.offset(canonical, kind, step, expected);
+    }
+    // R2b-6a (ui design §3.4 / §4.3): C20 kinds, C21 word offsets (the
+    // f32 / bit-in-word cases are where `offset_address` differs).
+    for kind in [Bit, I16, U16, I32, U32, F32, I64, U64, F64] {
+        f = f.kind_example(kind, if kind == Bit { "00001" } else { "40001" });
+    }
+    f = f.kind_example(KindName::String, "40001");
+    for (canonical, step, expected) in [
+        ("400001", 1, Some("400002")),
+        ("400001", 0, Some("400001")),
+        ("400001", -1, None),
+        ("400001.3", 1, Some("400002.3")),
+        ("400010.15", 5, Some("400015.15")),
+        ("300010", 5, Some("300015")),
+        ("000010", 5, Some("000015")),
+        ("100010", -9, Some("100001")),
+        ("465535", 1, Some("465536")),
+        ("465536", 1, None),
+        ("400001", i64::MAX, None),
+        ("ZZZ", 1, None),
+        ("D100", 1, None),
+    ] {
+        f = f.word_offset(canonical, step, expected);
     }
     f
 }

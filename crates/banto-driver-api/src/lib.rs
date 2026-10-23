@@ -57,6 +57,10 @@
 //!   host's engine owns the transport ([`FrameDriver`] /
 //!   [`FrameConnection`], [`Step`] / [`FrameRule`] / [`Planned`], the write
 //!   state machine [`WriteProgress`]; R1-2, design §4.2, §4.2.1)
+//! - [`schema`]: the description of a driver's connection settings
+//!   ([`SettingsSchema`]) and the names of the tag kinds it reads
+//!   ([`KindName`]), from which the Hub builds its generic forms (R2b-6a,
+//!   docs/banto-hub-driver-ui-design.md §3)
 //! - [`session`]: session-type drivers, which own their I/O
 //!   ([`SessionDriver`] / [`Session`], [`BoxFuture`]; R1-2, design §5)
 //! - [`registry`]: [`DriverRegistry`], driver id → [`DriverEntry`] of a
@@ -98,6 +102,7 @@ pub mod driver;
 pub mod error;
 pub mod frame;
 pub mod registry;
+pub mod schema;
 pub mod session;
 pub mod settings;
 pub mod types;
@@ -112,6 +117,10 @@ pub use frame::{
     WriteProgress,
 };
 pub use registry::{DriverEntry, DriverKind, DriverRegistry, RegistryError};
+pub use schema::{
+    ChoiceOption, FieldGroup, FieldKind, InvalidKindName, KindName, SettingField, SettingValue,
+    SettingsSchema,
+};
 pub use session::{BoxFuture, ConnectContext, Session, SessionDriver};
 pub use settings::{keys, DuplicateKey, FieldError, Setting, Settings};
 pub use types::{

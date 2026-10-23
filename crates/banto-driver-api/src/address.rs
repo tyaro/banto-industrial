@@ -123,7 +123,7 @@ impl fmt::Display for InvalidDriverId {
 impl std::error::Error for InvalidDriverId {}
 
 /// A parsed address, as a driver understands it (WIT
-/// `record parsed { canonical, area, writable-area, bit, word-count }`).
+/// `record parsed { canonical, area, writable-area, bit, word-count, index }`).
 ///
 /// There is deliberately no station / unit number: a multi-drop station is
 /// a connection setting ([`keys::UNIT_ID`](crate::settings::keys::UNIT_ID) /
@@ -154,6 +154,14 @@ pub struct DriverAddress {
     /// unit as [`TagKind::word_count`](crate::TagKind::word_count). Widened
     /// to WIT's `u32` at the boundary.
     pub word_count: u16,
+    /// The position inside [`area`](Self::area), for telling whether two
+    /// addresses overlap (R2b-6a, docs/banto-hub-driver-ui-design.md §3.6):
+    /// the word number of a word address (SLMP hexadecimal device numbers
+    /// are converted to a plain number; a bit inside a word is the *word's*
+    /// number, [`bit`](Self::bit) stays a separate field), the bit number of
+    /// a bit device. The occupied range is `index ..= index + word_count -
+    /// 1`. `None` for a driver whose address space has no numeric position.
+    pub index: Option<u64>,
 }
 
 impl DriverAddress {
@@ -173,6 +181,7 @@ impl DriverAddress {
             writable_area,
             bit: None,
             word_count,
+            index: None,
         }
     }
 
@@ -181,6 +190,15 @@ impl DriverAddress {
     pub fn with_bit(self, bit: u8) -> Self {
         DriverAddress {
             bit: Some(bit),
+            ..self
+        }
+    }
+
+    /// The same address with its position `index` inside the area
+    /// ([`index`](Self::index)).
+    pub fn with_index(self, index: u64) -> Self {
+        DriverAddress {
+            index: Some(index),
             ..self
         }
     }
@@ -255,6 +273,16 @@ mod tests {
         let b = DriverAddress::new(driver, "D100.F", "D", true, 1).with_bit(15);
         assert_eq!(b.bit, Some(15));
         assert_eq!(b.canonical, "D100.F");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn with_index_sets_the_position() {
+        let driver = DriverId::new("slmp").unwrap();
+        let a = DriverAddress::new(driver, "X1F", "X", true, 1);
+        assert_eq!(a.index, None);
+        let b = a.clone().with_index(31);
+        assert_eq!(b.index, Some(31));
         assert_ne!(a, b);
     }
 }

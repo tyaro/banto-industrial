@@ -35,8 +35,9 @@ use std::ops::RangeInclusive;
 use std::sync::{Arc, OnceLock};
 
 use banto_driver_api::{
-    keys, AddressError, Capabilities, DataType, DriverAddress, DriverBase, DriverDescriptor,
-    DriverId, FieldError, Settings, TagKind,
+    keys, AddressError, Capabilities, ChoiceOption, DataType, DriverAddress, DriverBase,
+    DriverDescriptor, DriverId, FieldError, FieldKind, KindName, SettingField, Settings,
+    SettingsSchema, TagKind,
 };
 use banto_plc::Address;
 use banto_tags::ALLOWED_WORD_ORDERS;
@@ -76,6 +77,9 @@ pub(crate) const EXAMPLES: [(&str, &str); 4] = [
     ("00001", "コイル（ビット・書き込み可）"),
     ("10001", "ディスクリート入力（ビット・読み取り専用）"),
 ];
+
+/// The word-order field's help (`ConnectionDrawer.svelte`'s hint, R2b-6a).
+pub(crate) const WORD_ORDER_HELP: &str = "32bit値（u32/f32等）および64bit値（i64/u64/f64、4レジスタ）の上位/下位ワードの並び。既定は Modbus が high_low（Modbus/IEEE慣習）、MELSEC/SLMP が low_high。機種のマニュアルで確認してください — 例: オムロン KM-D1-ETN（電力量モニタ）は low_high が必要です。間違えると値が化けます（上位/下位が入れ替わります）。";
 
 /// `tagAddressHelp.ts` `addressHelpFor('modbus-tcp', ..).placeholder`.
 pub(crate) const PLACEHOLDER: &str = "40001（ビット指定: 40001.3）";
@@ -153,7 +157,7 @@ impl DriverBase for ModbusDriver {
                 text.trim()
             ))
         })?;
-        let (area, _offset, bit) = address
+        let (area, offset, bit) = address
             .as_modbus_ref()
             .expect("Address::parse always yields a ModbusRef");
         check_kind(text, area, bit, kind)?;
@@ -163,7 +167,8 @@ impl DriverBase for ModbusDriver {
             area.to_string(),
             area.is_writable(),
             kind.word_count(),
-        );
+        )
+        .with_index(u64::from(offset));
         Ok(match bit {
             Some(bit) => driver_address.with_bit(bit),
             None => driver_address,
@@ -249,6 +254,78 @@ impl DriverBase for ModbusDriver {
             PROBE.to_string(),
             TagKind::numeric(banto_driver_api::DataType::U16),
         ))
+    }
+
+    /// The connection form's fields (R2b-6a, docs/banto-hub-driver-ui-design.md
+    /// §3.5): the same keys, ranges and defaults as `validate_config` and
+    /// `banto-tags`' normalization (port 502, unit 1, `high_low`).
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema::new(vec![
+            SettingField::new(keys::HOST, "ホスト", FieldKind::host()).required(),
+            // `validate_config` requires the key; the form fills the default.
+            SettingField::new(keys::PORT, "ポート", FieldKind::integer(1, 65_535))
+                .required()
+                .default(502),
+            SettingField::new(keys::UNIT_ID, "ユニットID", FieldKind::integer(0, 255))
+                .default(1)
+                .help("Modbus 用のスレーブID（0〜255）。"),
+            SettingField::new(
+                keys::WORD_ORDER,
+                "ワード順",
+                FieldKind::choice(vec![
+                    ChoiceOption::new("low_high", "low_high（MELSEC標準）"),
+                    ChoiceOption::new("high_low", "high_low（Modbus/IEEE慣習）"),
+                ]),
+            )
+            .default("high_low")
+            .help(WORD_ORDER_HELP)
+            .advanced(),
+        ])
+    }
+
+    /// Bits and numbers, 64-bit ones included; no strings (`check_kind`
+    /// refuses them).
+    fn supported_kinds(&self) -> Vec<KindName> {
+        [
+            DataType::Bit,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::F32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F64,
+        ]
+        .into_iter()
+        .map(KindName::Numeric)
+        .collect()
+    }
+
+    /// `n` registers for the register areas, `n` points for coils and
+    /// discrete inputs; a bit inside a register keeps its bit
+    /// (`400001.3` + 1 = `400002.3`). The result must stay inside `0..=65535`.
+    fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+        let address = Address::parse(canonical).map_err(|_| {
+            AddressError::new(format!(
+                "{:?} は Modbus の参照番号（例: 40001）として読めません",
+                canonical.trim()
+            ))
+        })?;
+        let (area, offset, bit) = address
+            .as_modbus_ref()
+            .expect("Address::parse always yields a ModbusRef");
+        let next = u16::try_from(i128::from(offset) + i128::from(n)).map_err(|_| {
+            AddressError::new(format!(
+                "アドレス {canonical:?} から {n} ワード先のアドレスを算出できません（範囲外です）"
+            ))
+        })?;
+        Ok(Address::ModbusRef {
+            area,
+            offset: next,
+            bit,
+        }
+        .to_string())
     }
 }
 
@@ -351,7 +428,7 @@ fn check_transport(settings: &Settings, errors: &mut Vec<FieldError>) {
 
 #[cfg(test)]
 mod tests {
-    use banto_driver_api::{StringEncoding, Transport};
+    use banto_driver_api::{KindName, StringEncoding, Transport};
 
     use super::*;
 
@@ -365,6 +442,67 @@ mod tests {
 
     fn offset(canonical: &str, kind: &TagKind, n: i64) -> Result<String, AddressError> {
         ModbusDriver.offset_address(canonical, kind, n)
+    }
+
+    // ------------------------------------------------------------------
+    // R2b-6a: schema, kinds, word offsets, index
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn schema_matches_the_settings_the_driver_reads() {
+        let schema = ModbusDriver.settings_schema();
+        let keys: Vec<&str> = schema.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["host", "port", "unit_id", "word_order"]);
+        assert_eq!(
+            schema.field("port").and_then(|f| f.default.clone()),
+            Some(banto_driver_api::SettingValue::Integer(502))
+        );
+        assert_eq!(
+            schema.field("word_order").map(|f| f.group),
+            Some(banto_driver_api::FieldGroup::Advanced)
+        );
+        // Every `Choice` value is one `validate_config` accepts.
+        let mut settings = minimal();
+        for field in &schema.fields {
+            if let banto_driver_api::FieldKind::Choice { options } = &field.kind {
+                for option in options {
+                    settings.insert(field.key.clone(), option.value.clone());
+                    assert_eq!(ModbusDriver.validate_config(&settings), vec![]);
+                }
+            }
+        }
+        assert!(ModbusDriver.secret_keys().is_empty());
+    }
+
+    #[test]
+    fn supported_kinds_has_64_bit_and_no_string() {
+        let kinds = ModbusDriver.supported_kinds();
+        assert!(kinds.contains(&KindName::Numeric(DataType::F64)));
+        assert!(kinds.contains(&KindName::Numeric(DataType::Bit)));
+        assert!(!kinds.contains(&KindName::String));
+    }
+
+    #[test]
+    fn offset_words_moves_words_and_keeps_the_bit() {
+        let w = |c: &str, n: i64| ModbusDriver.offset_words(c, n);
+        assert_eq!(w("400001", 1).unwrap(), "400002");
+        assert_eq!(w("400001.3", 1).unwrap(), "400002.3");
+        assert_eq!(w("400002.3", -1).unwrap(), "400001.3");
+        assert_eq!(w("000010", 5).unwrap(), "000015");
+        assert_eq!(w("400001", 0).unwrap(), "400001");
+        assert!(w("400001", -1).is_err());
+        assert!(w("465536", 1).is_err());
+        assert!(w("D100", 1).is_err());
+    }
+
+    #[test]
+    fn parse_address_reports_the_zero_based_index() {
+        let index = |text: &str, k: TagKind| ModbusDriver.parse_address(text, &k).unwrap().index;
+        assert_eq!(index("40001", one_word()), Some(0));
+        assert_eq!(index("400010", one_word()), Some(9));
+        assert_eq!(index("40001.3", kind(DataType::Bit)), Some(0));
+        assert_eq!(index("00005", kind(DataType::Bit)), Some(4));
+        assert_eq!(index("465536", kind(DataType::F32)), Some(65_535));
     }
 
     // ------------------------------------------------------------------

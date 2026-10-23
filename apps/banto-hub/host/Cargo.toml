@@ -70,7 +70,7 @@ banto-core = { workspace = true }
 banto-server = { workspace = true }
 banto-tags = { path = "../../../crates/banto-tags" }
 # R2b-1a: `tests/registry_tripwire.rs`（Hub のレジストリの `DriverKind` を見る）。
-banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0" }
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }
 banto-broker = { path = "../../../crates/banto-broker" }

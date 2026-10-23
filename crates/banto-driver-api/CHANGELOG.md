@@ -5,6 +5,21 @@ banto-hub / ChronoGazer のドライバの境界（型と trait）の crate の�
 - **タグの名前**: 公開した版ごとに `banto-driver-api-v<版>`（例 `banto-driver-api-v0.1.0`）を付ける。ワークスペースのリリースのタグ（`v0.2.0-alpha.32` 等）とは別。CI の `cargo-semver-checks` は、この形の最も新しいタグを基準（baseline）にする。タグが 1 つも無い間は飛ばす。
 - **MSRV**: `Cargo.toml` の `rust-version`。CI がその版で `cargo check` する。上げるときは minor を上げ、ここに書く。
 
+## 0.3.0 — 未公開
+
+R2b-6a（docs/banto-hub-driver-ui-design.md §3。2026-10-24）。UI をドライバのスキーマから組み立てるための追加。`0.2.0` も未公開なので、公開する最初の版は `0.3.0` になりうる。
+
+### 追加（既定つき。既存のドライバは何も直さずに動く）
+
+- 新しいモジュール `schema`: `SettingsSchema` / `SettingField`（`new` + `required` / `default` / `help` / `advanced`）/ `FieldKind`（`Text` / `Host` / `Integer` / `Choice` / `Bool` / `Secret`）/ `ChoiceOption` / `SettingValue` / `FieldGroup`。どれも `#[non_exhaustive]`、`serde` feature で UI にそのまま渡せる JSON になる。
+- `KindName`（`Numeric(DataType)` / `String`。JSON では `"bit"`・`"u16"`…`"f64"`・`"string"`）。
+- `DriverBase::settings_schema`（既定: 空）、`DriverBase::supported_kinds`（既定: 64bit を除く数値と bit。string なし）、`DriverBase::offset_words`（既定: 「ワード単位のオフセットに対応しません」のエラー）。
+- `DriverAddress::index: Option<u64>` と `with_index`（アドレスの area の中の位置。`new` は `None`）。`DriverAddress` は `#[non_exhaustive]` なので、`new` / `with_*` で作っているコードは直さなくてよい。
+
+### 壊れること
+
+- なし（0.x の minor は設計 §3.6 の方針で上げる）。`DriverAddress` を `Hash` / `Eq` で比べるコードは、`index` も比べられることに注意。
+
 ## 0.2.0 — 未公開
 
 R2b-3（docs/banto-hub-driver-io-design.md §10。2026-10-23、banto-hub v0.2.0-alpha.37）。**`0.1.0` はどこにも公開していない**（`banto-driver-api-v0.1.0` のタグも無い）ので、公開する最初の版はこの `0.2.0` になる。次の `0.1.0` 節は R1 の形の記録として残す（この版から見ると、`HostBound` を含む形）。R1 の形に合わせて書いたドライバがあれば、下の「壊れること」で直す。

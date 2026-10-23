@@ -33,8 +33,9 @@ use std::ops::RangeInclusive;
 use std::sync::{Arc, OnceLock};
 
 use banto_driver_api::{
-    keys, AddressError, Capabilities, DataType, DriverAddress, DriverBase, DriverDescriptor,
-    DriverId, FieldError, Settings, TagKind,
+    keys, AddressError, Capabilities, ChoiceOption, DataType, DriverAddress, DriverBase,
+    DriverDescriptor, DriverId, FieldError, FieldKind, KindName, SettingField, Settings,
+    SettingsSchema, TagKind,
 };
 use banto_plc::slmp::address::MAX_DEVICE_NUMBER;
 use banto_plc::{Address, SlmpAccess, SlmpDevice};
@@ -75,6 +76,12 @@ pub(crate) const EXAMPLES: [(&str, &str); 4] = [
     ("X1A", "入力リレー（ビット・16進）"),
     ("D100.5", "D100 の 5 ビット目（ビット指定・16進で0〜F）"),
 ];
+
+/// The CPU-type field's help (`ConnectionDrawer.svelte`'s hint, R2b-6a).
+pub(crate) const CPU_TYPE_HELP: &str = "MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R、L シリーズは Q を選んでください。違うと接続できてもタグが Bad になります。既定は R です。";
+
+/// The word-order field's help (`ConnectionDrawer.svelte`'s hint, R2b-6a).
+pub(crate) const WORD_ORDER_HELP: &str = "32bit値（u32/f32等）の上位/下位ワードの並び。既定は MELSEC/SLMP が low_high（MELSEC標準）、Modbus が high_low（Modbus/IEEE慣習）。機種のマニュアルで確認してください。間違えると値が化けます（上位/下位が入れ替わります）。";
 
 /// `tagAddressHelp.ts` `addressHelpFor('slmp', ..).placeholder`.
 pub(crate) const PLACEHOLDER: &str = "D100（ビット指定: D100.5）";
@@ -169,7 +176,8 @@ impl DriverBase for SlmpDriver {
             device.mnemonic(),
             true,
             kind.word_count(),
-        );
+        )
+        .with_index(u64::from(number));
         Ok(match bit {
             Some(bit) => driver_address.with_bit(bit),
             None => driver_address,
@@ -259,6 +267,86 @@ impl DriverBase for SlmpDriver {
             PROBE.to_string(),
             TagKind::numeric(banto_driver_api::DataType::U16),
         ))
+    }
+
+    /// The connection form's fields (R2b-6a, docs/banto-hub-driver-ui-design.md
+    /// §3.5): the same keys, ranges and defaults as `validate_config` and
+    /// `banto-tags`' normalization (port 5007, CPU `R`, `low_high`).
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema::new(vec![
+            SettingField::new(keys::HOST, "ホスト", FieldKind::host()).required(),
+            // `validate_config` requires the key; the form fills the default.
+            SettingField::new(keys::PORT, "ポート", FieldKind::integer(1, 65_535))
+                .required()
+                .default(5007),
+            SettingField::new(
+                keys::CPU_TYPE,
+                "CPU種別",
+                FieldKind::choice(vec![
+                    ChoiceOption::new("R", "iQ-R（R）"),
+                    ChoiceOption::new("Q", "Qシリーズ（Q）"),
+                ]),
+            )
+            .default("R")
+            .help(CPU_TYPE_HELP),
+            SettingField::new(
+                keys::WORD_ORDER,
+                "ワード順",
+                FieldKind::choice(vec![
+                    ChoiceOption::new("low_high", "low_high（MELSEC標準）"),
+                    ChoiceOption::new("high_low", "high_low（Modbus/IEEE慣習）"),
+                ]),
+            )
+            .default("low_high")
+            .help(WORD_ORDER_HELP)
+            .advanced(),
+        ])
+    }
+
+    /// Bits, numbers up to 32 bits and strings; no 64-bit types
+    /// (`check_kind` refuses them).
+    fn supported_kinds(&self) -> Vec<KindName> {
+        let mut kinds: Vec<KindName> = [
+            DataType::Bit,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::F32,
+        ]
+        .into_iter()
+        .map(KindName::Numeric)
+        .collect();
+        kinds.push(KindName::String);
+        kinds
+    }
+
+    /// A word device moves `n` device numbers and keeps a bit suffix
+    /// (`D100.5` + 1 = `D101.5`); a bit device moves `n` points; the number
+    /// stays inside `0..=0xFFFFFF`, in the device's own radix
+    /// (`W1FF` + 1 = `W200`).
+    fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+        let address = Address::parse_slmp(canonical).map_err(|_| {
+            AddressError::new(format!(
+                "{:?} は MELSEC のデバイス表記（例: D100, X1A, D100.5）として読めません",
+                canonical.trim()
+            ))
+        })?;
+        let (device, number, bit) = address
+            .as_slmp()
+            .expect("Address::parse_slmp always yields an Slmp address");
+        let next = i128::from(number) + i128::from(n);
+        if next < 0 || next > i128::from(MAX_DEVICE_NUMBER) {
+            return Err(AddressError::new(format!(
+                "アドレス {canonical:?} から {n} ワード先のアドレスを算出できません（デバイス番号の範囲外です）"
+            )));
+        }
+        Ok(Address::Slmp {
+            device,
+            number: next as u32,
+            bit,
+        }
+        .to_string())
     }
 }
 
@@ -469,6 +557,69 @@ mod tests {
     // ------------------------------------------------------------------
     // identity
     // ------------------------------------------------------------------
+
+    #[test]
+    fn schema_matches_the_settings_the_driver_reads() {
+        let schema = SlmpDriver.settings_schema();
+        let keys: Vec<&str> = schema.fields.iter().map(|f| f.key.as_str()).collect();
+        assert_eq!(keys, ["host", "port", "cpu_type", "word_order"]);
+        assert_eq!(
+            schema.field("port").and_then(|f| f.default.clone()),
+            Some(banto_driver_api::SettingValue::Integer(5007))
+        );
+        assert_eq!(
+            schema.field("cpu_type").and_then(|f| f.default.clone()),
+            Some(banto_driver_api::SettingValue::Text("R".into()))
+        );
+        assert_eq!(
+            schema.field("word_order").and_then(|f| f.default.clone()),
+            Some(banto_driver_api::SettingValue::Text("low_high".into()))
+        );
+        let mut settings = minimal();
+        for field in &schema.fields {
+            if let banto_driver_api::FieldKind::Choice { options } = &field.kind {
+                for option in options {
+                    settings.insert(field.key.clone(), option.value.clone());
+                    assert_eq!(SlmpDriver.validate_config(&settings), vec![]);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn supported_kinds_has_string_and_no_64_bit() {
+        let kinds = SlmpDriver.supported_kinds();
+        assert!(kinds.contains(&KindName::String));
+        assert!(kinds.contains(&KindName::Numeric(DataType::Bit)));
+        assert!(!kinds.contains(&KindName::Numeric(DataType::I64)));
+        assert!(!kinds.contains(&KindName::Numeric(DataType::F64)));
+    }
+
+    #[test]
+    fn offset_words_moves_words_and_keeps_the_bit() {
+        let w = |c: &str, n: i64| SlmpDriver.offset_words(c, n);
+        assert_eq!(w("D100", 1).unwrap(), "D101");
+        assert_eq!(w("D100.5", 1).unwrap(), "D101.5");
+        assert_eq!(w("D100.F", 2).unwrap(), "D102.F");
+        assert_eq!(w("W1FF.A", 1).unwrap(), "W200.A");
+        assert_eq!(w("X1F", 1).unwrap(), "X20");
+        assert_eq!(w("M100", -1).unwrap(), "M99");
+        assert_eq!(w("D100", 0).unwrap(), "D100");
+        assert!(w("D0", -1).is_err());
+        assert!(w("D16777215", 1).is_err());
+        assert!(w("40001", 1).is_err());
+    }
+
+    #[test]
+    fn parse_address_reports_the_device_number_as_the_index() {
+        let index = |text: &str, k: TagKind| SlmpDriver.parse_address(text, &k).unwrap().index;
+        assert_eq!(index("D100", one_word()), Some(100));
+        assert_eq!(index("D100.5", kind(DataType::Bit)), Some(100));
+        assert_eq!(index("X1F", kind(DataType::Bit)), Some(31));
+        assert_eq!(index("X20", kind(DataType::Bit)), Some(32));
+        assert_eq!(index("W1FF", one_word()), Some(511));
+        assert_eq!(index("M50", kind(DataType::Bit)), Some(50));
+    }
 
     #[test]
     fn descriptor_is_slmp() {
