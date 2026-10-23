@@ -228,6 +228,8 @@ pub use plc_connections::{
 // （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
 // ここで re-export して保つ（`crate::mcp` が使う）。
 mod collection_groups;
+// R2b-6b: `GET /api/drivers`（ドライバの一覧。`tag_registry_router` に載る）。
+mod drivers;
 mod tags;
 pub use collection_groups::CollectionGroupPayload;
 use tags::tag_registry_router;

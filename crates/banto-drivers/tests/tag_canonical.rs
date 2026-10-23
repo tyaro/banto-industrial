@@ -223,12 +223,17 @@ async fn grammar_errors_disabled_and_string_tags_are_refused_with_the_drivers_me
         field_errors(f.tags.create(disabled).await.unwrap_err())[0].0,
         "address"
     );
-    // A Modbus `string` is refused by the driver, an SLMP word `string` is fine.
+    // A Modbus `string` is refused (the driver does not list it in `supported_kinds`,
+    // R2b-6b: a `dataType` error), an SLMP word `string` is fine.
     let mut modbus_string = tag("z", f.modbus_group, "40001", "string");
     modbus_string.string_length = Some(4);
-    assert_eq!(
-        field_errors(f.tags.create(modbus_string).await.unwrap_err())[0].0,
-        "address"
+    let errors = field_errors(f.tags.create(modbus_string).await.unwrap_err());
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert_eq!(errors[0].0, "dataType");
+    assert!(
+        errors[0].1.contains("string 型を使えません"),
+        "{}",
+        errors[0].1
     );
     let mut slmp_string = tag("z", f.slmp_group, "d100", "string");
     slmp_string.string_length = Some(4);
@@ -261,8 +266,36 @@ async fn writable_area_and_64_bit_follow_the_drivers() {
         f.tags.create(input_register).await.unwrap().address,
         "300001"
     );
-    // 64-bit: fine under Modbus, the SLMP driver's message under SLMP (an `address`
-    // error, no longer the old `dataType` one).
+    // #325 kept by the drivers' `supported_kinds` (R2b-6b): every 64-bit type is fine
+    // under Modbus and a `dataType` error under SLMP (the protocol-name rule
+    // `MODBUS_ONLY_DATA_TYPES` is not consulted with a registry).
+    for (i, data_type) in ["i64", "u64"].into_iter().enumerate() {
+        let address = format!("4020{i}");
+        f.tags
+            .create(tag(
+                &format!("big-{data_type}"),
+                f.modbus_group,
+                &address,
+                data_type,
+            ))
+            .await
+            .unwrap_or_else(|e| panic!("{data_type} under Modbus: {e:?}"));
+    }
+    for data_type in ["u64", "f64"] {
+        let errors = field_errors(
+            f.tags
+                .create(tag("big", f.slmp_group, "d200", data_type))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert_eq!(errors[0].0, "dataType");
+        assert!(
+            errors[0].1.contains(&format!("{data_type} 型を使えません")),
+            "{}",
+            errors[0].1
+        );
+    }
     assert_eq!(
         f.tags
             .create(tag("big", f.modbus_group, "40100", "f64"))
@@ -278,7 +311,7 @@ async fn writable_area_and_64_bit_follow_the_drivers() {
             .unwrap_err(),
     );
     assert_eq!(errors.len(), 1);
-    assert_eq!(errors[0].0, "address");
+    assert_eq!(errors[0].0, "dataType");
 }
 
 /// Modbus and SLMP grammars do not overlap, so a protocol change with tags is refused

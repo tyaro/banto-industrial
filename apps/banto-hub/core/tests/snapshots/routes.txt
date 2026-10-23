@@ -11,6 +11,7 @@ GET /api/auth/status
 GET /api/collection-groups
 GET /api/collection-groups/{id}
 GET /api/commissioning/status
+GET /api/drivers
 GET /api/events
 GET /api/grpc-settings
 GET /api/ingest/bridge-config

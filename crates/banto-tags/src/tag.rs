@@ -90,6 +90,11 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &[
 ///    as `f64` (`banto_plc::TagValue::F64`), so an `i64`/`u64` beyond 2^53
 ///    loses low-order bits. The owner accepted this rather than widening the
 ///    whole value pipeline to a 64-bit integer variant.
+///
+/// **Registry-less services only** ([`TagService::new`], ChronoGazer until
+/// R2b-7). With a registry (the Hub) the connection's driver decides through
+/// `supported_kinds` instead (R2b-6b, docs/banto-hub-driver-ui-design.md §3.4) -
+/// the same verdict for Modbus / SLMP, without the protocol name.
 pub const MODBUS_ONLY_DATA_TYPES: &[&str] = &["i64", "u64", "f64"];
 
 /// The one data type with a mandatory companion column (`string_length`) and
@@ -1566,9 +1571,11 @@ pub struct NormalizedAddress {
 ///      without one - `hub` is not in the Hub's registry - is an `address`
 ///      error) parses the address with [`tag_kind`] as the `kind`; its
 ///      `canonical` is the result, its message the `address` error, and a
-///      `writable` tag on a `!writable_area` is a `writable` error. The driver
-///      owns every kind-dependent refusal (bit suffix, area / type mismatch,
-///      64-bit, `string`), so [`MODBUS_ONLY_DATA_TYPES`] and
+///      `writable` tag on a `!writable_area` is a `writable` error. A kind the
+///      driver's `supported_kinds` does not list (SLMP's 64-bit, Modbus's
+///      `string`) is a `dataType` error before any parse (R2b-6b,
+///      [`unsupported_kind_error`]); the driver owns every other kind-dependent
+///      refusal (bit suffix, area / type mismatch), so [`MODBUS_ONLY_DATA_TYPES`] and
 ///      [`modbus_read_only_area`] are not consulted. Under `push` the driver is
 ///      the key grammar and the `push` rules for `string` / `writable` /
 ///      scaling are added without a second `address` error.
@@ -1707,23 +1714,34 @@ fn normalize_plc_address(
             input.string_length,
             &input.string_encoding,
         ) {
-            match entry.base().parse_address(trimmed, &kind) {
-                Ok(parsed) => {
-                    normalized.canonical = parsed.canonical.clone();
-                    // `push` has its own, differently worded `writable` rule
-                    // below (a key is never writable), so it is not reported twice.
-                    if input.writable && !parsed.writable_area && !is_push {
-                        errors.push(FieldError {
-                            field: "writable".to_string(),
-                            message: format!(
+            // R2b-6b: the driver's `supported_kinds` decides the data type (the
+            // registry-mode successor of `MODBUS_ONLY_DATA_TYPES`); a kind it does not
+            // list is a `dataType` error and the address is not parsed. `push` keeps
+            // its own rules (`push_tag_rest_errors`, the host's connection).
+            if let Some(error) = (!is_push)
+                .then(|| unsupported_kind_error(entry.base(), &kind))
+                .flatten()
+            {
+                errors.push(error);
+            } else {
+                match entry.base().parse_address(trimmed, &kind) {
+                    Ok(parsed) => {
+                        normalized.canonical = parsed.canonical.clone();
+                        // `push` has its own, differently worded `writable` rule
+                        // below (a key is never writable), so it is not reported twice.
+                        if input.writable && !parsed.writable_area && !is_push {
+                            errors.push(FieldError {
+                                field: "writable".to_string(),
+                                message: format!(
                                 "{} はプロトコル上の読み取り専用領域のため writable にできません",
                                 parsed.area
                             ),
-                        });
+                            });
+                        }
+                        normalized.parsed = Some(parsed);
                     }
-                    normalized.parsed = Some(parsed);
+                    Err(error) => errors.push(address_error(error.message().to_string())),
                 }
-                Err(error) => errors.push(address_error(error.message().to_string())),
             }
         }
     } else {
@@ -1739,6 +1757,35 @@ fn normalize_plc_address(
     } else {
         Err(errors)
     }
+}
+
+/// The `dataType` error of a `plc` tag whose kind `driver` does not list in
+/// [`DriverBase::supported_kinds`](banto_driver_api::DriverBase::supported_kinds)
+/// (R2b-6b, docs/banto-hub-driver-ui-design.md §3.4): with a registry this replaces
+/// the protocol-name rule [`MODBUS_ONLY_DATA_TYPES`] (#325: the Modbus driver lists
+/// the 64-bit types, the SLMP driver does not; the SLMP driver lists `string`, the
+/// Modbus driver does not). Conformance C20 keeps the list and `parse_address` in
+/// step, so this only words the refusal for the data-type field instead of the
+/// address. `None` when the kind is listed, or has no [`KindName`] (a `TagKind`
+/// added after this crate - left to `parse_address`).
+fn unsupported_kind_error(
+    driver: &dyn banto_driver_api::DriverBase,
+    kind: &banto_driver_api::TagKind,
+) -> Option<FieldError> {
+    let name = banto_driver_api::KindName::of(kind)?;
+    let supported = driver.supported_kinds();
+    if supported.contains(&name) {
+        return None;
+    }
+    let listed: Vec<String> = supported.iter().map(ToString::to_string).collect();
+    Some(FieldError {
+        field: "dataType".to_string(),
+        message: format!(
+            "{} の接続では {name} 型を使えません（使える型: {}）",
+            driver.descriptor().display_name,
+            listed.join(", ")
+        ),
+    })
 }
 
 fn column_map() -> ColumnMap {
@@ -8413,7 +8460,8 @@ mod tests {
     // tests use fakes with the same *shape* of behavior: `modbus-tcp` canonicalizes to
     // UPPER case, `slmp` to lower case (so a move between them rewrites every address),
     // both refuse `!` (a grammar error), `slmp` additionally refuses `string` and the
-    // 64-bit types, and an address starting with `r` is a read-only area. The same
+    // 64-bit types (and leaves them out of `supported_kinds`, so the refusal is the
+    // R2b-6b `dataType` error), and an address starting with `r` is a read-only area. The same
     // cases against the real drivers (`40001` -> `400001`, `d100` -> `D100`) are in
     // `crates/banto-drivers/tests/tag_canonical.rs`.
     mod registry_mode {
@@ -8479,6 +8527,39 @@ mod tests {
             }
             fn address_help(&self) -> String {
                 String::new()
+            }
+            /// In step with `parse_address` (C20): the UPPER fake reads every kind, the
+            /// lower one keeps the default (no 64-bit, no `string`).
+            fn supported_kinds(&self) -> Vec<banto_driver_api::KindName> {
+                use banto_driver_api::{DataType, KindName};
+                if self.lower {
+                    return [
+                        DataType::Bit,
+                        DataType::I16,
+                        DataType::U16,
+                        DataType::I32,
+                        DataType::U32,
+                        DataType::F32,
+                    ]
+                    .into_iter()
+                    .map(KindName::Numeric)
+                    .collect();
+                }
+                [
+                    DataType::Bit,
+                    DataType::I16,
+                    DataType::U16,
+                    DataType::I32,
+                    DataType::U32,
+                    DataType::F32,
+                    DataType::I64,
+                    DataType::U64,
+                    DataType::F64,
+                ]
+                .into_iter()
+                .map(KindName::Numeric)
+                .chain([KindName::String])
+                .collect()
             }
         }
 
@@ -8894,12 +8975,14 @@ mod tests {
                     .await
                     .unwrap_err(),
             );
-            assert_eq!(errors.len(), 1, "{errors:?}");
-            assert_eq!(errors[0].field, "address");
-            assert!(
-                errors[0].message.contains("string"),
-                "{}",
-                errors[0].message
+            // R2b-6b: the slmp fake does not list `string` in `supported_kinds`, so
+            // the refusal is on `dataType` (not the driver's `address` message).
+            assert_eq!(
+                fields(&errors),
+                [(
+                    "dataType",
+                    "slmp の接続では string 型を使えません（使える型: bit, i16, u16, i32, u32, f32）"
+                )]
             );
             // Under the driver that accepts `string` it is saved (and canonical).
             let ok = svc.create(string_tag("s", group, "d100")).await.unwrap();
@@ -8937,15 +9020,30 @@ mod tests {
             // Legacy: the old dataType rule.
             let errors = field_errors_of(legacy.create(input.clone()).await.unwrap_err());
             assert_eq!(errors[0].field, "dataType");
-            // Registry: the driver's address error instead.
+            // Registry (R2b-6b): the driver's `supported_kinds` decides, on `dataType`.
             let errors = field_errors_of(svc.create(input.clone()).await.unwrap_err());
             assert_eq!(errors.len(), 1, "{errors:?}");
-            assert_eq!(errors[0].field, "address");
+            assert_eq!(errors[0].field, "dataType");
             assert!(
-                errors[0].message.contains("64 bit"),
+                errors[0].message.contains("i64 型を使えません"),
                 "{}",
                 errors[0].message
             );
+            // The same verdict through the parse API (the same function).
+            let errors = parse_tag_address(
+                "S",
+                "slmp",
+                &AddressProbe {
+                    tag_kind: "plc",
+                    address: "d100",
+                    data_type: "f64",
+                    string_length: None,
+                    string_encoding: "utf8",
+                },
+                &registry(),
+            )
+            .unwrap_err();
+            assert_eq!(errors[0].field, "dataType", "{errors:?}");
             // Under modbus it is fine.
             input.collection_group_id = group;
             assert_eq!(svc.create(input).await.unwrap().address, "D100");
