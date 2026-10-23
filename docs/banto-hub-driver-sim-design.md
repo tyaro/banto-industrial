@@ -128,6 +128,9 @@ RMW（SLMP の bit-in-word、`crates/banto-driver-slmp/src/frame_conn.rs:32-45`�
 ### 3.4 セッションの約束
 
 - `SimDriver`（`SessionDriver`、engine の中だけ。レジストリには**登録しない**）: `connect` は即 `Ok(Box<SimSession>)`。`disconnect` は no-op。致命は返さない（再接続の経路に入らない）。`FatalError` を返す鉤はテスト用に `SimDevice::fail_next(FatalError)` を `#[doc(hidden)]` で置く（broker の再接続のテストが `FakeDriver` ではなく本番の経路で書けるように）。
+
+  > 2026-10-24、R2b-5a の実装: `SimDriver` は作らなかった。broker は `SimDevice::connect()`（`Box<dyn Session>` を返す）で直接セッションを得る。`fail_next` は `SimDevice` にある。§3.5・§9 の `SimDriver` は `SimDevice::connect()` で作ったセッションと読み替える（適合の項目は conformance の `tests/sim.rs`）。
+
 - `read_batch` は `specs.len()` 個を順に返す（契約どおり）。空の `specs` は空。
 - 時間の上限（io-design §5.5）は broker の job loop がそのまま掛ける。`SimSession` は待たないので影響しない。
 
