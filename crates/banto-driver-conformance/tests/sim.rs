@@ -55,6 +55,7 @@ async fn c3_one_result_per_spec_in_order() {
     for (i, sp) in specs.iter().enumerate() {
         dev.set(
             &sp.address.canonical,
+            sp.kind.clone(),
             match sp.kind {
                 TagKind::Numeric(DataType::Bit) => Value::Bit(true),
                 TagKind::Numeric(_) => Value::F64(i as f64),

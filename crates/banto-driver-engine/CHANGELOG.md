@@ -10,7 +10,7 @@
 
 R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（アプリの振る舞いは変わらない）。
 
-- `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` を鍵にした共有の表。`get` / `set` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{tick}` を語数 × 2 バイトに切る）。書き込みは書けない領域・種類違い・整数型への小数・型の範囲外・文字列の長すぎを `ItemError::Rejected` にし、通れば held にする。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
+- `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` と `TagKind` の組を鍵にした共有の表で、種類が違えば別のセル。`get(canonical, &kind)` / `set(canonical, kind, value)` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{tick}` の末尾を語数 × 2 バイト残す）。書き込みは書けない領域・種類違い・整数型への小数・型の範囲外・文字列の長すぎ（タグの符号化でバイト数を数え、表せない文字も断る）を `ItemError::Rejected` にし、通れば held にする。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
 
 ## 0.1.0 — 未公開
 

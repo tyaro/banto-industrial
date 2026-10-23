@@ -1,18 +1,20 @@
 //! 値の層のシミュレータ（docs/banto-hub-driver-sim-design.md §3、R2b-5a）。
 //!
 //! ワイヤ（Modbus / SLMP のフレーム）を作らず、`Session` の契約だけを守る。値は
-//! [`SimDevice`] が持つ表（鍵は `DriverAddress::canonical` そのまま。`D100.5` と `D100` は
-//! 別のセル）で決まる。読み取りは、書かれた値（held）があればそれを返し、無ければ経過時間
+//! [`SimDevice`] が持つ表（鍵は `DriverAddress::canonical` と `TagKind` の組。`D100.5` と
+//! `D100`、同じ `D100` でも種類（型・文字列の語数・符号化）が違えば別のセル）で決まる。読み取りは、書かれた値（held）があればそれを返し、無ければ経過時間
 //! と「初めて見た順」の index だけから決定的に生成する（背景タスクは無い）。書き込みは
 //! 領域・値の種類・範囲・文字列長を検査し、通れば held にする。
 //!
 //! - 表は `Clone`（`Arc` の共有）で、[`SimDevice::connect`] で何度でもセッションを作れる。
 //!   セッションを張り直しても held は残る。
 //! - 生成は 100 ms ごとに変わる（ビットは反転、整数・浮動小数はランプ、文字列は
-//!   `SIM-{index}-{tick}`）。index が隣のセルと違うので、隣は同じ値にならない。
+//!   `SIM-{index}-{tick}` の末尾を語数 × 2 バイト分だけ残す。短い文字列でも変わる）。index が隣のセルと違うので、隣は同じ値にならない。
 //! - 待たない。致命は返さない（テストの鉤 `fail_next` だけが返す）。
 //! - RMW（語の中のビット）と多語の重なりは再現しない（ドライバ crate の適合テストの仕事）。
-//! - held は書かれた値のまま返す（読み取りの種類が書いたときと違っても変換しない）。
+//! - held は同じ種類のセルにだけ効く（種類が違えば別のセルで、変換も流用もしない）。
+//! - 文字列の長さはタグの符号化で数える（Hub の `encode_string_value` と同じ規則。表せない
+//!   文字と容量超過は断る）。
 //!
 //! `SessionDriver`（`DriverBase`）は実装しない: 設定の schema やアドレスの解析はシミュ
 //! レータに意味が無いので、接続は [`SimDevice::connect`] で直接作る。
@@ -21,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use crate::decode::encoding_table;
 use banto_driver_api::{
     BoxFuture, DataType, FatalError, ItemError, Session, TagKind, TagSpec, Value, WriteItem,
 };
@@ -31,6 +34,8 @@ pub const SIM_TICK: Duration = Duration::from_millis(100);
 /// 浮動小数のランプの周期（0 以上この値未満）。
 const FLOAT_RANGE: u128 = 1 << 16;
 
+type Cells = HashMap<String, Vec<(TagKind, SimCell)>>;
+
 struct SimCell {
     held: Option<Value>,
     /// 初めて見た順（位相に使う）。
@@ -39,18 +44,26 @@ struct SimCell {
 
 #[derive(Default)]
 struct SimState {
-    cells: HashMap<String, SimCell>,
+    cells: Cells,
+    /// 初めて見た順の次の番号（全セル通し）。
+    next_index: u32,
     writes: u64,
     fail_next: Option<FatalError>,
 }
 
 impl SimState {
-    fn cell(&mut self, canonical: &str) -> &mut SimCell {
-        let next = self.cells.len() as u32;
-        self.cells.entry(canonical.to_owned()).or_insert(SimCell {
-            held: None,
-            index: next,
-        })
+    fn cell(&mut self, canonical: &str, kind: &TagKind) -> &mut SimCell {
+        let list = self.cells.entry(canonical.to_owned()).or_default();
+        let pos = match list.iter().position(|(k, _)| k == kind) {
+            Some(pos) => pos,
+            None => {
+                let index = self.next_index;
+                self.next_index += 1;
+                list.push((kind.clone(), SimCell { held: None, index }));
+                list.len() - 1
+            }
+        };
+        &mut list[pos].1
     }
 }
 
@@ -85,16 +98,17 @@ impl SimDevice {
     }
 
     /// 書かれた値（held）。生成値は返さない。
-    pub fn get(&self, canonical: &str) -> Option<Value> {
+    pub fn get(&self, canonical: &str, kind: &TagKind) -> Option<Value> {
         self.state()
             .cells
             .get(canonical)
-            .and_then(|c| c.held.clone())
+            .and_then(|l| l.iter().find(|(k, _)| k == kind))
+            .and_then(|(_, c)| c.held.clone())
     }
 
     /// 値を held にする（書き込みの検査は通さない）。
-    pub fn set(&self, canonical: &str, value: Value) {
-        self.state().cell(canonical).held = Some(value);
+    pub fn set(&self, canonical: &str, kind: TagKind, value: Value) {
+        self.state().cell(canonical, &kind).held = Some(value);
     }
 
     /// 書き込みが通った回数。
@@ -107,7 +121,8 @@ impl SimDevice {
         self.state()
             .cells
             .values()
-            .filter(|c| c.held.is_some())
+            .flatten()
+            .filter(|(_, c)| c.held.is_some())
             .count()
     }
 
@@ -152,9 +167,10 @@ fn generate(spec: &TagSpec, index: u32, tick: u64) -> Value {
     let phase = tick as u128 + index as u128 * 16;
     match &spec.kind {
         TagKind::Str { words, .. } => {
-            let mut s = format!("SIM-{index}-{tick}");
-            s.truncate(*words as usize * 2);
-            Value::Str(s)
+            // ASCII なのでバイト位置で切ってよい。短い語数でも変わるよう末尾を残す。
+            let s = format!("SIM-{index}-{tick}");
+            let keep = (*words as usize * 2).min(s.len());
+            Value::Str(s[s.len() - keep..].to_owned())
         }
         TagKind::Numeric(dt) => {
             if *dt == DataType::Bit || spec.address.bit.is_some() {
@@ -205,8 +221,12 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
             Ok(Value::F64(*v))
         }
         (TagKind::Numeric(_), _) => reject("数値には数値だけを書けます"),
-        (TagKind::Str { words, .. }, Value::Str(s)) => {
-            if s.len() > *words as usize * 2 {
+        (TagKind::Str { words, encoding }, Value::Str(s)) => {
+            // Hub の `encode_string_value` と同じ規則: 表せない文字は断り、容量超過も断る。
+            let (bytes, _, had_errors) = encoding_table(*encoding).encode(s);
+            if had_errors {
+                reject("このエンコーディングで表せない文字があります")
+            } else if bytes.len() > *words as usize * 2 {
                 reject("文字列が長すぎます")
             } else {
                 Ok(Value::Str(s.clone()))
@@ -232,7 +252,7 @@ impl Session for SimSession {
             Ok(specs
                 .iter()
                 .map(|spec| {
-                    let cell = st.cell(&spec.address.canonical);
+                    let cell = st.cell(&spec.address.canonical, &spec.kind);
                     Ok(match &cell.held {
                         Some(v) => v.clone(),
                         None => generate(spec, cell.index, tick),
@@ -255,7 +275,7 @@ impl Session for SimSession {
                 .iter()
                 .map(|item| {
                     let v = check_write(item)?;
-                    st.cell(&item.spec.address.canonical).held = Some(v);
+                    st.cell(&item.spec.address.canonical, &item.spec.kind).held = Some(v);
                     st.writes += 1;
                     Ok(())
                 })
@@ -372,7 +392,7 @@ mod tests {
         assert!(s.write_batch(&[]).await.unwrap().is_empty());
         let a = num("D1", DataType::U16);
         let b = num("D2", DataType::U16);
-        dev.set("D2", Value::F64(7.0));
+        dev.set("D2", TagKind::numeric(DataType::U16), Value::F64(7.0));
         let r = s.read_batch(&[b.clone(), a.clone(), b]).await.unwrap();
         assert_eq!(r.len(), 3);
         assert_eq!(r[0], Ok(Value::F64(7.0)));
@@ -384,7 +404,8 @@ mod tests {
         let dev = SimDevice::new();
         let sp = num("D10", DataType::I16);
         let mut s1 = dev.connect();
-        assert_eq!(dev.get("D10"), None);
+        let k = TagKind::numeric(DataType::I16);
+        assert_eq!(dev.get("D10", &k), None);
         s1.write_batch(&[wr(&sp, Value::F64(42.0))]).await.unwrap()[0]
             .clone()
             .unwrap();
@@ -392,13 +413,13 @@ mod tests {
         drop(s1);
         let mut s2 = dev.connect();
         assert_eq!(read1(&mut s2, &sp).await, Ok(Value::F64(42.0)));
-        assert_eq!(dev.get("D10"), Some(Value::F64(42.0)));
+        assert_eq!(dev.get("D10", &k), Some(Value::F64(42.0)));
         assert_eq!(dev.write_count(), 1);
         assert_eq!(dev.held_count(), 1);
         // 別の SimDevice とは共有しない。
-        assert_eq!(SimDevice::new().get("D10"), None);
+        assert_eq!(SimDevice::new().get("D10", &k), None);
         // D10.5 は別のセル。
-        assert_eq!(dev.get("D10.5"), None);
+        assert_eq!(dev.get("D10.5", &k), None);
     }
 
     #[tokio::test]
@@ -434,8 +455,11 @@ mod tests {
             assert_eq!(x, &Ok(()), "{i}");
         }
         assert_eq!(dev.write_count(), 4);
-        assert_eq!(dev.get("D1"), Some(Value::F64(65535.0)));
-        assert_eq!(dev.get("X1"), None);
+        assert_eq!(
+            dev.get("D1", &TagKind::numeric(DataType::U16)),
+            Some(Value::F64(65535.0))
+        );
+        assert_eq!(dev.get("X1", &TagKind::numeric(DataType::U16)), None);
     }
 
     #[tokio::test]
@@ -452,8 +476,70 @@ mod tests {
             panic!("{r:?}")
         };
         assert!(a.starts_with("SIM-0-"), "{a}");
+        // 末尾を残す: 2 語目は最初の読み取りの tick の末尾 2 バイト。
         assert_eq!(b.len(), 2);
-        assert_eq!(b, "SI");
+        assert!(b.chars().all(|c| c.is_ascii_digit() || c == '-'), "{b}");
+    }
+
+    #[test]
+    fn short_strings_keep_the_tail_and_change_across_ticks() {
+        for words in 1..=3u16 {
+            let sp = spec("D1", TagKind::string(words, StringEncoding::Utf8));
+            let a = generate(&sp, 0, 10);
+            let b = generate(&sp, 0, 11);
+            assert_ne!(a, b, "words={words}");
+            let Value::Str(s) = &a else { panic!() };
+            assert_eq!(s.len(), words as usize * 2);
+            assert!("SIM-0-10".ends_with(s.as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn cells_are_typed_by_kind() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let s4 = spec("D100", TagKind::string(4, StringEncoding::Utf8));
+        s.write_batch(&[wr(&s4, Value::Str("abcdefgh".into()))])
+            .await
+            .unwrap()[0]
+            .clone()
+            .unwrap();
+        assert_eq!(read1(&mut s, &s4).await, Ok(Value::Str("abcdefgh".into())));
+        // 種類が違えば held は効かず、生成値になる。
+        let u = num("D100", DataType::U16);
+        assert!(matches!(read1(&mut s, &u).await, Ok(Value::F64(_))));
+        let s2 = spec("D100", TagKind::string(2, StringEncoding::Utf8));
+        let Ok(Value::Str(g)) = read1(&mut s, &s2).await else {
+            panic!()
+        };
+        assert!(g.len() <= 4 && g != "abcdefgh");
+        let s4sj = spec("D100", TagKind::string(4, StringEncoding::ShiftJis));
+        assert_ne!(
+            read1(&mut s, &s4sj).await,
+            Ok(Value::Str("abcdefgh".into()))
+        );
+        assert_eq!(dev.held_count(), 1);
+        assert_eq!(dev.get("D100", &u.kind), None);
+    }
+
+    #[tokio::test]
+    async fn string_length_is_counted_in_the_tag_encoding() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let sj = spec("D1", TagKind::string(1, StringEncoding::ShiftJis));
+        let u8t = spec("D2", TagKind::string(1, StringEncoding::Utf8));
+        let sj2 = spec("D3", TagKind::string(4, StringEncoding::ShiftJis));
+        let r = s
+            .write_batch(&[
+                wr(&sj, Value::Str("あ".into())),
+                wr(&u8t, Value::Str("あ".into())),
+                wr(&sj2, Value::Str("😀".into())),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(r[0], Ok(()));
+        assert!(matches!(r[1], Err(ItemError::Rejected(_))), "{:?}", r[1]);
+        assert!(matches!(r[2], Err(ItemError::Rejected(_))), "{:?}", r[2]);
     }
 
     #[tokio::test]

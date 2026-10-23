@@ -2,13 +2,18 @@
 
 use banto_driver_api::{DataType, ItemError, RawValue, StringEncoding, TagKind, Value};
 
+/// `StringEncoding` に対応する `encoding_rs` の表。
+pub(crate) fn encoding_table(encoding: StringEncoding) -> &'static encoding_rs::Encoding {
+    match encoding {
+        StringEncoding::Utf8 => encoding_rs::UTF_8,
+        StringEncoding::ShiftJis => encoding_rs::SHIFT_JIS,
+    }
+}
+
 /// 最初の NUL で切り、置換文字を許さずに decode する。
 pub fn decode_string(bytes: &[u8], encoding: StringEncoding) -> Result<String, ItemError> {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
-    let table = match encoding {
-        StringEncoding::Utf8 => encoding_rs::UTF_8,
-        StringEncoding::ShiftJis => encoding_rs::SHIFT_JIS,
-    };
+    let table = encoding_table(encoding);
     let (text, _, errors) = table.decode(&bytes[..end]);
     if errors {
         Err(ItemError::Unsupported("文字列の符号化が不正です".into()))
