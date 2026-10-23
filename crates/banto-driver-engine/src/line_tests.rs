@@ -148,9 +148,22 @@ enum SyncPolicy {
     ShortMaxLen,
 }
 
+/// 応答は区切れて署名に合ったが、ドライバが受け入れの段で断る（1 回だけ。§7.3 の 1）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Refusal {
+    /// `decode_read` が `Framing` で断る。
+    Decode,
+    /// 書き込みの次の `write_next` が前の応答を見て断る。
+    Write,
+    /// ハンドシェイクを 1 step（FC4 の 1 語）にし、次の `handshake_next` が前の応答を見て断る。
+    Handshake,
+}
+
 #[derive(Clone)]
 struct Conn {
     policy: SyncPolicy,
+    /// 受け入れの段で断る（1 回だけ。断ったら `None` に戻る）。
+    refusal: Arc<Mutex<Option<Refusal>>>,
     /// 書き込みを応答を待たない step（`FrameRule::None`）で送る。
     no_reply_write: bool,
     /// フレーム間の無音（§7.3.1）。
@@ -165,7 +178,14 @@ impl Drop for Conn {
 }
 
 impl FrameConnection for Conn {
-    fn handshake_next(&mut self, _: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
+    fn handshake_next(&mut self, previous: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
+        if *self.refusal.lock().unwrap() != Some(Refusal::Handshake) {
+            return Ok(None);
+        }
+        if previous.is_none() {
+            return Ok(Some(request(FC_PROBE, 0x00)));
+        }
+        self.refuse(Refusal::Handshake)?;
         Ok(None)
     }
     fn inter_frame_gap(&self) -> Duration {
@@ -234,6 +254,7 @@ impl FrameConnection for Conn {
         _: &[TagSpec],
         response: &[u8],
     ) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {
+        self.refuse(Refusal::Decode)?;
         Ok(vec![Ok(RawValue::Uint(u64::from(response[3])))])
     }
     fn write_next(
@@ -241,6 +262,9 @@ impl FrameConnection for Conn {
         items: &[WriteItem],
         previous: Option<&[u8]>,
     ) -> Result<WriteProgress, FatalError> {
+        if previous.is_some() {
+            self.refuse(Refusal::Write)?;
+        }
         Ok(if previous.is_some() {
             WriteProgress::Done(vec![Ok(()); items.len()])
         } else if self.no_reply_write {
@@ -249,6 +273,20 @@ impl FrameConnection for Conn {
         } else {
             WriteProgress::Send(Planned::new(request(0x06, ADDR_A), vec![0]))
         })
+    }
+}
+
+impl Conn {
+    /// `stage` で断ると決めてあれば、1 回だけ `Framing` を返す。
+    fn refuse(&self, stage: Refusal) -> Result<(), FatalError> {
+        let mut refusal = self.refusal.lock().unwrap();
+        if *refusal == Some(stage) {
+            *refusal = None;
+            return Err(FatalError::Framing(format!(
+                "{stage:?} が応答を受け入れない"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -270,6 +308,7 @@ impl Driver {
             descriptor,
             conn: Conn {
                 policy,
+                refusal: Arc::default(),
                 no_reply_write: false,
                 gap: Duration::ZERO,
                 drops: Arc::default(),
@@ -1381,4 +1420,145 @@ async fn the_first_send_after_a_send_cancelled_midway_waits_for_its_estimated_en
         "取り消した送信の送り終えの見積もりから {:?} しか空いていない",
         times[2].saturating_duration_since(stalled_at + tx)
     );
+}
+
+/// 設計 §7.3 の 1（Codex P1）: 応答が区切れて署名に合っても、ドライバが受け入れの段で断ったら
+/// 致命の後なので線は `Unsynced`、その step の署名は待っている集合に残る。次のセッションは
+/// 同期の手順から始め、残った署名と違う同期の要求を選ぶ。`exchange` が署名に合った時点で
+/// `complete` すると、線は `Synced`・署名なしで返り、次のセッションが同期を飛ばすので落ちる。
+async fn assert_refused_response_leaves_the_line_unsynced(
+    bench: &Bench,
+    refused: Signature,
+    sync_after: Step,
+    sync_reply: Vec<u8>,
+) {
+    assert_eq!(bench.state(), SyncState::Unsynced, "受け入れの前の致命");
+    assert_eq!(
+        bench.outstanding(),
+        vec![refused],
+        "受け入れていない step の署名が残る"
+    );
+    let before = bench.wire.sent().len();
+    bench.wire.react([Reaction::Reply(vec![sync_reply])]);
+    let session = bench.connect().await.unwrap();
+    assert!(session.is_connected());
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    assert_eq!(
+        bench.wire.sent()[before..],
+        [sync_after.send],
+        "次のセッションは同期の手順から始め、残った署名と違う同期の要求を選ぶ"
+    );
+}
+
+/// (a) 読み取り: `decode_read` が `Framing` で断る。
+#[tokio::test(start_paused = true)]
+async fn a_read_response_refused_by_decode_read_leaves_the_line_unsynced_with_its_signature() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    *bench.driver.conn.refusal.lock().unwrap() = Some(Refusal::Decode);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Reply(vec![response(FC_READ, &[0xAA])]),  // 2: A（署名に合う）
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    let result = read_one(&mut session, ADDR_A).await;
+    assert!(matches!(result, Err(FatalError::Framing(_))), "{result:?}");
+    assert!(!session.is_connected());
+    drop(session);
+    assert_refused_response_leaves_the_line_unsynced(
+        &bench,
+        sig(FC_READ, 1),
+        request(FC_PROBE, 0x00),
+        response(FC_PROBE, &[0x55]),
+    )
+    .await;
+}
+
+/// (b) 書き込み: 次の `write_next` が前の応答を見て断る。
+#[tokio::test(start_paused = true)]
+async fn a_write_response_refused_by_write_next_leaves_the_line_unsynced_with_its_signature() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    *bench.driver.conn.refusal.lock().unwrap() = Some(Refusal::Write);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Reply(vec![response(0x06, &[0])]),        // 2: 書き込み（署名に合う）
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    let result = session.write_batch(&write_a()).await;
+    assert!(matches!(result, Err(FatalError::Framing(_))), "{result:?}");
+    assert!(!session.is_connected());
+    drop(session);
+    assert_refused_response_leaves_the_line_unsynced(
+        &bench,
+        sig(0x06, 1),
+        request(FC_PROBE, 0x00),
+        response(FC_PROBE, &[0x55]),
+    )
+    .await;
+}
+
+/// (c) ハンドシェイク: 次の `handshake_next` が前の応答を見て断る。断られた step（FC4 の 1 語）は
+/// 同期の最初の候補と同じ署名なので、次のセッションは 2 番目の候補（FC4 の 2 語）を選ぶ。
+#[tokio::test(start_paused = true)]
+async fn a_handshake_response_refused_by_handshake_next_leaves_the_line_unsynced_with_its_signature(
+) {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    *bench.driver.conn.refusal.lock().unwrap() = Some(Refusal::Handshake);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Reply(vec![response(FC_PROBE, &[0x66])]), // 2: ハンドシェイク（署名に合う）
+    ]);
+    let result = bench.connect().await;
+    assert!(
+        matches!(&result, Err(FatalError::Framing(_))),
+        "{:?}",
+        result.as_ref().err()
+    );
+    drop(result);
+    assert_refused_response_leaves_the_line_unsynced(
+        &bench,
+        sig(FC_PROBE, 1),
+        request(FC_PROBE, 0xF0),
+        response(FC_PROBE, &[1, 2]),
+    )
+    .await;
+}
+
+/// (d) 回帰: ドライバが応答を受け入れる普通の道では、線は `Synced`・署名なしのまま。
+/// 次のセッションは同期の要求を送らない。
+#[tokio::test(start_paused = true)]
+async fn an_accepted_response_leaves_the_line_synced_without_signatures() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Reply(vec![response(FC_READ, &[0xAA])]),  // 2: A
+        Reaction::Reply(vec![response(0x06, &[0])]),        // 3: 書き込み
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(
+        read_one(&mut session, ADDR_A).await.unwrap(),
+        RawValue::Uint(0xAA)
+    );
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    assert_eq!(session.write_batch(&write_a()).await.unwrap(), vec![Ok(())]);
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    drop(session);
+
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_READ, &[0xBB])])]); // 4: B
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+    assert_eq!(
+        bench.wire.sent().len(),
+        4,
+        "同期したままの線は同期の要求を送らない"
+    );
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
 }

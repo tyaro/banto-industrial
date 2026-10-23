@@ -7,7 +7,8 @@
 //! シリアル（`Serial`・`SerialOverTcp`）は線の表（[`line`]、設計 §7.3）を通す: ポートは
 //! セッションではなく表が持ち、致命の後も閉じない。新しいセッションは同じポートを借りて、
 //! ハンドシェイクの前に同期の手順（`sync_line`）を走らせる。step は送る前に署名を線に記録し、
-//! 完結して検証の通った応答でだけ外す（[`line::InFlightGuard`]）。TCP は表を通らず、
+//! 完結して検証の通った応答を、ドライバが受け入れたときにだけ外す（[`line::InFlightGuard`]。
+//! 受け入れの前の致命では署名を残して未同期にする）。TCP は表を通らず、
 //! 振る舞いは変わらない。
 //! 各 step の送信の前に、ドライバの `inter_frame_gap`（Modbus RTU の t3.5）だけ、
 //! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
@@ -27,7 +28,7 @@ use banto_driver_api::{
     ItemError, PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Signature, Step, TagSpec,
     Value, WriteItem, WriteProgress,
 };
-use line::{LeaseStart, Line, LineKey, LineLease, LineOwner, LineTable};
+use line::{InFlightGuard, LeaseStart, Line, LineKey, LineLease, LineOwner, LineTable};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
 
@@ -94,6 +95,12 @@ impl Wire {
 }
 
 struct Core {
+    /// シリアルの線で、応答が区切れて署名に合ったが、ドライバがまだ受け入れていない step の
+    /// 番人（設計 §7.3 の 1）。ドライバの受け入れ（`decode_read`・次の `write_next`・次の
+    /// `handshake_next` が `Ok`）で [`Core::accept`] が確定し、署名を外して `Synced` にする。
+    /// 受け入れの前に致命で終わると、番人の drop が線を `Unsynced` にし、署名は待っている集合に
+    /// 残る。線の貸し出し（`wire`）より先に drop するよう、`wire` より前に置く。
+    unaccepted: Option<InFlightGuard>,
     conn: Box<dyn FrameConnection>,
     wire: Wire,
     /// シリアルの線で、ドライバが同期の手順（`sync_step`）を持つ。step の署名を求める。
@@ -230,6 +237,7 @@ impl FrameSession {
         // 借りた線は、前のセッションが最後に送り終えた（見積もり）・受けた時刻から無音を測る（§7.3.1）。
         let last_quiet_from = wire.line().and_then(|line| line.quiet_from());
         let mut core = Core {
+            unaccepted: None,
             conn,
             wire,
             line_sync: false,
@@ -405,6 +413,9 @@ impl Core {
     /// 致命の後始末。TCP は閉じる。シリアルはポートを表に戻す（`Io` なら通信路が壊れているので
     /// 閉じる。線の状態と署名は残り、次のセッションが開き直して同期する）。
     async fn fail(&mut self, error: FatalError) -> FatalError {
+        // ドライバがまだ受け入れていない応答があれば、線を表へ返す前に `Unsynced` にする
+        // （署名は待っている集合に残る。§7.3 の 1）。
+        drop(self.unaccepted.take());
         if let (Wire::Leased(lease), FatalError::Io(_)) = (&mut self.wire, &error) {
             lease.close_on_drop();
         }
@@ -559,11 +570,13 @@ impl Core {
     async fn handshake(&mut self) -> Result<(), FatalError> {
         let mut previous = None;
         for steps in 0..=MAX_HANDSHAKE_STEPS {
-            match self
+            let next = self
                 .conn
                 .handshake_next(previous.as_deref())
-                .map_err(|e| self.driver_fatal("handshake_next", e))?
-            {
+                .map_err(|e| self.driver_fatal("handshake_next", e))?;
+            // ドライバが前の応答を受け入れた。
+            self.accept();
+            match next {
                 None => return Ok(()),
                 Some(_) if steps == MAX_HANDSHAKE_STEPS => {
                     return Err(self.violation_fatal(
@@ -617,6 +630,8 @@ impl Core {
                 .conn
                 .decode_read(p, specs, &response)
                 .map_err(|e| self.driver_fatal("decode_read", e))?;
+            // ドライバが応答を受け入れた。
+            self.accept();
             if decoded.len() != p.covers.len() {
                 return Err(self.violation_fatal(
                     "C3",
@@ -649,11 +664,13 @@ impl Core {
         let max_steps = items.len().saturating_mul(3).saturating_add(8);
         let mut previous = None;
         for steps in 0..=max_steps {
-            match self
+            let progress = self
                 .conn
                 .write_next(items, previous.as_deref())
-                .map_err(|e| self.driver_fatal("write_next", e))?
-            {
+                .map_err(|e| self.driver_fatal("write_next", e))?;
+            // ドライバが前の応答を受け入れた。
+            self.accept();
+            match progress {
                 WriteProgress::Done(results) => {
                     if results.len() != items.len() {
                         return Err(self.violation_fatal("C3", format!("書き込みの結果の件数が要求と合わない（Done が {} 件、items は {} 件）", results.len(), items.len())));
@@ -698,7 +715,7 @@ impl Core {
             events.record(EngineEvent::StepStarted(step.clone()));
         }
         // シリアルの線（設計 §7.3 の 7）: 送る前に署名を記録し「応答待ち」にする。番人は
-        // 検証の通った完結でだけ外す。それ以外の終わり方（致命・取り消し）では drop が未同期にする。
+        // 検証の通った完結の後、ドライバが応答を受け入れたときにだけ外す（[`Core::accept`]）。それ以外の終わり方（致命・取り消し）では drop が未同期にする。
         // 応答を待たない step にも署名なしの番人を付ける: 送信が時間切れ・`Io`・取り消し（一部の
         // バイトだけ出た後の drop を含む）で終わると、機器は崩れたフレームを受けたかもしれない。
         let awaits_response = !matches!(step.expect, FrameRule::None);
@@ -736,9 +753,23 @@ impl Core {
                     ));
                 }
             }
-            guard.complete();
+            // ドライバが受け入れるまで確定しない（§7.3 の 1。受け入れの前の致命では署名を残し
+            // `Unsynced` にする）。確定は [`Core::accept`]。
+            debug_assert!(
+                self.unaccepted.is_none(),
+                "前の応答の受け入れが確定していない"
+            );
+            self.unaccepted = Some(guard);
         }
         Ok(buf)
+    }
+
+    /// ドライバが直前の応答を受け入れた: 署名を外して線を `Synced` にする（§7.3 の 1）。
+    /// 確定を待つ応答が無ければ何もしない（TCP・応答を受ける前）。
+    fn accept(&mut self) {
+        if let Some(guard) = self.unaccepted.take() {
+            guard.complete();
+        }
     }
 
     /// 無音を待って `step` を送る。返る期限は、受信にもそのまま使う。

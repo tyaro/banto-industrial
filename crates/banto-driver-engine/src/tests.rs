@@ -305,6 +305,7 @@ fn item() -> WriteItem {
 fn session(conn: Conn, wire: Wire, events: Arc<Recorder>) -> FrameSession {
     FrameSession {
         core: Some(Core {
+            unaccepted: None,
             conn: Box::new(conn),
             wire: super::Wire::Direct(Box::new(wire)),
             line_sync: false,
