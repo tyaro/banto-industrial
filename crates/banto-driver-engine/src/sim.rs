@@ -9,7 +9,8 @@
 //! - 表は `Clone`（`Arc` の共有）で、[`SimDevice::connect`] で何度でもセッションを作れる。
 //!   セッションを張り直しても held は残る。
 //! - 生成は 100 ms ごとに変わる（ビットは反転、整数・浮動小数はランプ、文字列は
-//!   `SIM-{index}-{tick}` の末尾を語数 × 2 バイト分だけ残す。短い文字列でも変わる）。index が隣のセルと違うので、隣は同じ値にならない。
+//!   `SIM-{index}-{phase}`（phase は数値と同じ `tick + index * 16`）の末尾を語数 × 2 バイト分だけ残す。
+//!   短い文字列でも変わり、index で位相がずれるので隣のセルは同じ tick でも同じ値にならない）。
 //! - 待たない。致命は返さない（テストの鉤 `fail_next` だけが返す）。
 //! - RMW（語の中のビット）と多語の重なりは再現しない（ドライバ crate の適合テストの仕事）。
 //! - held は同じ種類のセルにだけ効く（種類が違えば別のセルで、変換も流用もしない）。
@@ -168,7 +169,8 @@ fn generate(spec: &TagSpec, index: u32, tick: u64) -> Value {
     match &spec.kind {
         TagKind::Str { words, .. } => {
             // ASCII なのでバイト位置で切ってよい。短い語数でも変わるよう末尾を残す。
-            let s = format!("SIM-{index}-{tick}");
+            // 数値と同じ位相を使う: 語数 1 だと末尾 2 バイトしか残らず、同じ tick の隣とそろうため。
+            let s = format!("SIM-{index}-{phase}");
             let keep = (*words as usize * 2).min(s.len());
             Value::Str(s[s.len() - keep..].to_owned())
         }
@@ -191,6 +193,12 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
     if !item.spec.address.writable_area {
         return reject("この領域は書き込めません");
     }
+    // 有限でない数（NaN・±inf）は、どの数値の型でも断る（F32/F64 は受けてしまうので先に見る）。
+    if let Value::F64(v) = &item.value {
+        if !v.is_finite() {
+            return reject("有限の数ではありません");
+        }
+    }
     match (&item.spec.kind, &item.value) {
         (TagKind::Numeric(DataType::Bit), Value::Bit(b)) => Ok(Value::Bit(*b)),
         (TagKind::Numeric(DataType::Bit), _) => reject("ビットには真偽値だけを書けます"),
@@ -205,14 +213,14 @@ fn check_write(item: &WriteItem) -> Result<Value, ItemError> {
                 DataType::I64 => (-9223372036854775808.0, 9223372036854775808.0),
                 DataType::U64 => (0.0, 18446744073709551616.0),
                 DataType::F32 => {
-                    if v.is_finite() && !(*v as f32).is_finite() {
+                    if !(*v as f32).is_finite() {
                         return reject("f32 の範囲外です");
                     }
                     return Ok(Value::F64(*v as f32 as f64));
                 }
                 _ => return Ok(Value::F64(*v)),
             };
-            if !v.is_finite() || v.fract() != 0.0 {
+            if v.fract() != 0.0 {
                 return reject("整数ではありません");
             }
             if *v < lo || *v >= hi {
@@ -463,6 +471,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn non_finite_numbers_are_rejected_for_every_numeric_type() {
+        let dev = SimDevice::new();
+        let mut s = dev.connect();
+        let f64s = num("D10", DataType::F64);
+        let f32s = num("D12", DataType::F32);
+        let u16s = num("D1", DataType::U16);
+        let r = s
+            .write_batch(&[
+                wr(&f64s, Value::F64(f64::NAN)),
+                wr(&f64s, Value::F64(f64::INFINITY)),
+                wr(&f32s, Value::F64(f64::NEG_INFINITY)),
+                wr(&u16s, Value::F64(f64::INFINITY)),
+                wr(&f64s, Value::F64(1.5)),
+            ])
+            .await
+            .unwrap();
+        for (i, x) in r.iter().enumerate().take(4) {
+            assert!(matches!(x, Err(ItemError::Rejected(_))), "{i}: {x:?}");
+        }
+        assert_eq!(r[4], Ok(()));
+        assert_eq!(dev.write_count(), 1);
+    }
+
+    #[tokio::test]
     async fn strings_are_truncated_to_the_word_span() {
         let dev = SimDevice::new();
         let mut s = dev.connect();
@@ -491,6 +523,18 @@ mod tests {
             let Value::Str(s) = &a else { panic!() };
             assert_eq!(s.len(), words as usize * 2);
             assert!("SIM-0-10".ends_with(s.as_str()));
+        }
+    }
+
+    #[test]
+    fn neighbouring_short_strings_differ_at_the_same_tick() {
+        let sp = spec("D1", TagKind::string(1, StringEncoding::Utf8));
+        for tick in [0u64, 10, 99] {
+            assert_ne!(
+                generate(&sp, 0, tick),
+                generate(&sp, 1, tick),
+                "tick={tick}"
+            );
         }
     }
 
