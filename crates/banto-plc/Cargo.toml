@@ -13,7 +13,7 @@ thiserror = { workspace = true }
 # published driver API crate and re-exported from `types.rs` / `decode.rs` under
 # their old names, so every caller of `banto_plc::*` is unchanged. `path` and
 # `version` both, the form a published crate's path dependency takes.
-banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # T19 S1-b0: `AddressArea`'s definition (including `is_writable()`) now lives
 # in this dependency-free sibling crate, shared with `banto-tags`/
 # `banto-plc-write` - see its module doc. `src/address.rs` re-exports it so

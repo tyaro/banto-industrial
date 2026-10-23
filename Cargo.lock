@@ -710,7 +710,7 @@ dependencies = [
 
 [[package]]
 name = "banto-driver-api"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -718,7 +718,7 @@ dependencies = [
 
 [[package]]
 name = "banto-driver-conformance"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "banto-driver-api",
  "banto-driver-engine",

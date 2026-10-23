@@ -15,7 +15,7 @@ banto-tags = { path = "../banto-tags" }
 # check each connection against the host's `DriverRegistry`
 # (`build_config_from_with_registry`). A dependency-free crate; banto-tags already
 # depends on it.
-banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3・§8): every PLC connection is
 # read through a broker session - `crate::client::BrokerReadClient` wraps its
 # read-only handle, and `crate::sessions::BrokerSessions` owns a supervisor for

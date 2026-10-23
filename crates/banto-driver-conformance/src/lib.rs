@@ -7,7 +7,8 @@
 //! errors, one result per request in request order, split and late
 //! responses, reconnecting without carrying old state, bounded receives,
 //! non-coalesced writes, and no panics on arbitrary bytes. Each contract has
-//! a number (C1-C16, design §7.1); a run returns every [`Failure`] it found
+//! a number (C1-C16, design §7.1; C17-C22 are the static checks of the
+//! settings schema, the kind list and the address position, R2b-6a); a run returns every [`Failure`] it found
 //! rather than stopping at the first, so one test run shows them all.
 //!
 //! ## How a third party uses it
@@ -84,7 +85,7 @@
 
 use std::fmt;
 
-use banto_driver_api::{Settings, TagKind};
+use banto_driver_api::{KindName, Settings, TagKind};
 
 pub mod fake;
 pub mod frame;
@@ -94,7 +95,7 @@ mod statics;
 
 pub use statics::static_checks;
 
-/// One broken contract: which check ([`id`](Self::id), `"C1"`-`"C16"`) and
+/// One broken contract: which check ([`id`](Self::id), `"C1"`-`"C22"`) and
 /// what was observed.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +139,15 @@ pub struct StaticFixtures {
     /// `(canonical, kind, n, expected)`: `offset_address(canonical, kind, n)`
     /// must give `Some(expected)`, or fail when `expected` is `None`.
     pub offsets: Vec<(String, TagKind, i64, Option<String>)>,
+    /// `(kind name, address text)`: C20 parses the text as that kind. It must
+    /// succeed exactly when the kind is in
+    /// [`supported_kinds`](banto_driver_api::DriverBase::supported_kinds). When
+    /// this list is not empty, every supported kind needs an entry.
+    pub kind_examples: Vec<(KindName, String)>,
+    /// `(canonical, n, expected)`: `offset_words(canonical, n)` must give
+    /// `Some(expected)`, or fail when `expected` is `None` (C21). Empty for a
+    /// driver without word-wise offsets.
+    pub word_offsets: Vec<(String, i64, Option<String>)>,
 }
 
 impl StaticFixtures {
@@ -172,6 +182,20 @@ impl StaticFixtures {
     ) -> Self {
         self.offsets
             .push((canonical.to_owned(), kind, n, expected.map(str::to_owned)));
+        self
+    }
+
+    /// Add a C20 case: `text` is an address to try `kind` on.
+    pub fn kind_example(mut self, kind: impl Into<KindName>, text: &str) -> Self {
+        self.kind_examples.push((kind.into(), text.to_owned()));
+        self
+    }
+
+    /// Add a C21 case: `offset_words(canonical, n)` gives `expected` (`None`:
+    /// it must fail).
+    pub fn word_offset(mut self, canonical: &str, n: i64, expected: Option<&str>) -> Self {
+        self.word_offsets
+            .push((canonical.to_owned(), n, expected.map(str::to_owned)));
         self
     }
 }

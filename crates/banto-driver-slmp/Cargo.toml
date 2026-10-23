@@ -19,7 +19,7 @@ publish.workspace = true
 [dependencies]
 # R1-4b: `DriverBase` の実装・`ItemError` / `FatalError`（`src/base.rs`・`src/classify.rs`）。
 # R2b-3d: `FrameDriver` / `FrameConnection` の実装（`src/frame_conn.rs`）。
-banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # R2b-3a-2: broker の表（`DriverDial`）と `BrokerSession` の実装は無くなった。使うのは
 # 両ドライバで共有する `parse_word_order` だけ（依存の向きはドライバ → broker のまま）。
 banto-broker = { path = "../banto-broker" }

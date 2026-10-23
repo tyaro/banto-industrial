@@ -18,8 +18,9 @@
 use std::fmt;
 
 use crate::address::{DriverAddress, DriverId};
+use crate::schema::{KindName, SettingsSchema};
 use crate::settings::{FieldError, Settings};
-use crate::types::TagKind;
+use crate::types::{DataType, TagKind};
 
 /// The API's version: the major of WIT's `manifest.hubApi`.
 ///
@@ -215,6 +216,60 @@ pub trait DriverBase: Send + Sync + 'static {
     fn probe(&self) -> Option<(String, TagKind)> {
         None
     }
+
+    /// The fields of a connection's settings, for the host's generic form
+    /// (WIT `config.schema`; R2b-6a, docs/banto-hub-driver-ui-design.md §3).
+    ///
+    /// Default: empty - the generic form shows no fields for this driver.
+    /// A non-empty schema must agree with the driver (C17-C19): unique keys,
+    /// defaults that fit the field, `Secret` fields exactly
+    /// [`secret_keys`](Self::secret_keys), and defaults plus the minimal
+    /// settings passing [`validate_config`](Self::validate_config).
+    fn settings_schema(&self) -> SettingsSchema {
+        SettingsSchema::default()
+    }
+
+    /// The tag kinds this driver can read and write (WIT
+    /// `address.supported-kinds`), for the host's data-type choices and its
+    /// kind check. Each kind listed here must be accepted by
+    /// [`parse_address`](Self::parse_address) at some address, and a kind
+    /// left out must be refused (C20).
+    ///
+    /// Default: every number and bit except the 64-bit ones (no string).
+    fn supported_kinds(&self) -> Vec<KindName> {
+        [
+            DataType::Bit,
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::F32,
+        ]
+        .into_iter()
+        .map(KindName::Numeric)
+        .collect()
+    }
+
+    /// The canonical address `n` *words* away from `canonical`, whatever the
+    /// tag's kind (WIT `address.offset-words`;
+    /// docs/banto-hub-driver-ui-design.md §3.4, §4.3), for offset copy and
+    /// struct registration (where [`offset_address`](Self::offset_address)
+    /// would step by the kind's width). The contract:
+    ///
+    /// - a word address moves `n` words;
+    /// - a bit inside a word keeps its bit and moves the word
+    ///   (`D100.5` + 1 = `D101.5`, `400001.3` + 1 = `400002.3`);
+    /// - a bit device (no word unit) moves `n` points;
+    /// - leaving the address space is an error. `n` may be negative.
+    ///
+    /// Default: an error saying this driver has no word-wise offset (adding
+    /// it with a default is not a breaking change).
+    fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+        let _ = (canonical, n);
+        Err(AddressError::new(
+            "このドライバはワード単位のオフセットに対応しません",
+        ))
+    }
 }
 
 /// An address the driver's grammar does not accept, or an offset that
@@ -327,6 +382,26 @@ mod tests {
             Capabilities::READ_ONLY,
         ));
         assert_eq!(d.probe(), None);
+    }
+
+    #[test]
+    fn schema_kinds_and_word_offset_defaults() {
+        let d = Minimal(DriverDescriptor::new(
+            DriverId::new("m").unwrap(),
+            "0",
+            "M",
+            Capabilities::READ_ONLY,
+        ));
+        assert!(d.settings_schema().is_empty());
+        let kinds = d.supported_kinds();
+        assert!(kinds.contains(&KindName::Numeric(DataType::Bit)));
+        assert!(kinds.contains(&KindName::Numeric(DataType::F32)));
+        assert!(!kinds.contains(&KindName::Numeric(DataType::F64)));
+        assert!(!kinds.contains(&KindName::Numeric(DataType::I64)));
+        assert!(!kinds.contains(&KindName::Numeric(DataType::U64)));
+        assert!(!kinds.contains(&KindName::String));
+        let err = d.offset_words("A1", 1).unwrap_err();
+        assert!(err.message().contains("ワード単位のオフセット"));
     }
 
     #[test]

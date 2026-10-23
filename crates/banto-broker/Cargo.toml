@@ -33,7 +33,7 @@ banto-tags = { path = "../banto-tags" }
 # セッションの trait (`Session` / `SessionDriver`)、ダイヤルに使うレジストリ
 # (`DriverRegistry` の `DriverKind::Session`)。broker の要求の型が API の型に
 # なったので、`banto-plc` / `banto-plc-write` への依存は無くなった。
-banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 banto-driver-engine = { path = "../banto-driver-engine", version = "0.2.0" }
 # 秘密値の平文は 1 回のダイヤルの間だけ持ち、終わったら消す（設計 §4.2）。
 zeroize = { workspace = true }
