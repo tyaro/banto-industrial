@@ -12,6 +12,7 @@
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
+pub mod sim;
 pub mod transport;
 
 use std::sync::Arc;

@@ -6,6 +6,12 @@
 - **公開の順**: `banto-driver-api` → `banto-driver-engine` → `banto-driver-conformance`。公開前の確認は 3 つ同時の `cargo publish --dry-run -p banto-driver-api -p banto-driver-engine -p banto-driver-conformance`（API が crates.io に無い間は単独では失敗する）。
 - **MSRV**: `Cargo.toml` の `rust-version`（API と同じ）。
 
+## 未リリース
+
+R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（アプリの振る舞いは変わらない）。
+
+- `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` を鍵にした共有の表。`get` / `set` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{tick}` を語数 × 2 バイトに切る）。書き込みは書けない領域・種類違い・型の範囲外（四捨五入の後）・文字列の長すぎを `ItemError::Rejected` にし、通れば held にする。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
+
 ## 0.1.0 — 未公開
 
 R2b-3b-core（docs/banto-hub-driver-io-design.md §5）・R2b-3e-1（同 §7）。最初の版。MSRV は Rust 1.85。依存は `banto-driver-api`・`tokio`（`rt` / `time` / `net` / `io-util`）・`tokio-serial`（`default-features = false`。Linux でも libudev は要らない）・`tracing` だけ。banto-hub の `banto-broker` が `Frame` の接続をこのエンジンで動かし、適合テスト `banto-driver-conformance` も同じエンジンを記憶上の通信路で動かす（手順の実装は 1 つ）。
