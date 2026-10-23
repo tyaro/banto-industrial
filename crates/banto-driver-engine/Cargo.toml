@@ -1,7 +1,7 @@
 # R2b-3b-core: 公開するフレーム型ドライバの実行系。API 以外の内部 crate に依存しない。
 [package]
 name = "banto-driver-engine"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"

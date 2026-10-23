@@ -23,7 +23,7 @@ readme = false
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
-banto-driver-engine = { path = "../banto-driver-engine", version = "0.1.0" }
+banto-driver-engine = { path = "../banto-driver-engine", version = "0.2.0" }
 # 本物のエンジンを止めた時計で駆動する（R2b-3b-core）。
 # FaultProxy と例の実行に加え、時計を止める試験用に test-util を使う。
 tokio = { version = "1", features = ["rt", "time", "net", "io-util", "macros", "test-util"] }
