@@ -2,6 +2,26 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.37 — 2026-10-23（アルファ）
+
+R2b-3（I/O の一本化。#787〜#800 と docs・版）。詳細設計は [docs/banto-hub-driver-io-design.md](docs/banto-hub-driver-io-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.35 の DB をそのまま開けます）。REST・MCP・設定パッケージの形も変えていません。版の番号 alpha.36 は、alpha.34 の実機の確かめで直しが要る場合のために空けてあります（タグ・リリースは alpha.34 の実機の確かめの後）。
+
+### 変更
+
+- **Modbus TCP と SLMP の通信を、共通の通信エンジン（新しい公開 crate `banto-driver-engine`）の上に一本化しました。** Hub の読み書き・収集・接続テストも、ChronoGazer の収集も、同じエンジンを通ります。ドライバはバイト列を組んで解析するだけで、送受信・分割して届く応答の組み立て・時間の上限はエンジンが持ちます。応答が時間内に返らないときは、受信バッファを捨てて接続を閉じ、次の要求は新しい接続で行います（遅れて届いた応答を次の要求の答えと取り違えません）。
+- **ChronoGazer の収集も Hub と同じ broker の共有セッションで読みます。** PLC との接続・切断・復帰の出来事（`plc_disconnected` / `plc_reconnected`）の出方が Hub と同じになります。保存時のアドレスの規則は R2b-7 まで従来のままです。
+- **SLMP の 4E フレームを `banto-driver-slmp` が自前で組みます**（`tyaro/slmp` の通信は使いません）。Q 系・R 系のフレームの違い、ワード内ビットの書き込み（読んでから書き戻す）の各段の拒否・確認の不一致の扱いは、従来と同じ振る舞いをテストで固定しています。
+- **アドレスの上限をまたぐタグは、そのタグだけが Bad になります。** Modbus の 0xFFFF をまたぐ複数レジスタのタグ、SLMP の番号の上限をはみ出すタグが、読み取りの計画全体や接続を壊しません。
+- **接続テスト**はエンジンの 1 回きりの接続（ハンドシェイクとドライバの 1 点の読み取り）で行います。接続の時間切れは `timeout` として返します。
+- **シリアル（COM ポート）接続はまだ使えません。** エンジンにシリアルの通信路（線の設定・ポート名の許可リスト・フレーム間の無音）は入りましたが、時間切れの後の線の同期・Modbus RTU のドライバ・接続の保存での受け口が未実装で、broker はシリアルの接続を断ります。続きは Issue #803 です（2026-10-23 のオーナー判断で後回し）。
+- **内部**: `HostBound`・`DriverTable`・`DialFn`・`PlcClient` / `PlcWriteClient`・`ModbusTcpClient` / `SlmpClient`・`default_client_factory`・`ClientProtocol` と、`banto_plc::Address` への橋を削除しました。broker の要求の型は `TagSpec` / `WriteItem`、ダイヤルは `DriverRegistry` の `Frame` の項目から行います。`banto-driver-api` は 0.2.0、`banto-driver-conformance` は 0.2.0、`banto-driver-engine` は 0.1.0（いずれも crates.io へは未公開。「何が壊れ、どう直すか」は各 crate の CHANGELOG）。
+- 書き込みの安全（関門の順・監査の先書き・1 回の論理書き込み = 1 ジョブ・書き込みの間に他の要求を割り込ませない）は変えていません。
+
+### 修正
+
+- `banto-hub-sink` を単体でリリースビルドすると落ちるのを直しました（#794。sqlx の `macros`）。
+- 依存の `ctutils` を 0.4.5 に上げ、RUSTSEC-2026-0385 を解消しました（#802）。
+
 ## v0.2.0-alpha.35 — 2026-10-22（アルファ）
 
 R2b-2（タグのアドレスの不透明化、#781〜#784 と docs・版）。詳細設計は [docs/banto-hub-driver-address-design.md](docs/banto-hub-driver-address-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.34 の DB をそのまま開けます）。

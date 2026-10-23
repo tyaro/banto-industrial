@@ -20,7 +20,7 @@ banto-plc-address = { path = "../banto-plc-address" }
 # connection's JSON `settings` into `banto_driver_api::Settings` and validates it through a
 # `DriverRegistry` (`PlcConnectionService::with_registry`). Dependency-free, and it does not
 # depend on this crate, so there is no cycle.
-banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
 serde = { workspace = true }
 # `upgrade.rs`: the error type of the pre-0025 backup (shared by banto-hub and ChronoGazer).
 thiserror = { workspace = true }

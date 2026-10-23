@@ -37,7 +37,7 @@ banto-collect = { path = "../../../crates/banto-collect" }
 # それを詰める組み込みドライバ。`banto-drivers` を normal で持つのは bin
 # （`banto-serve`）がこの package の中にあるため（Hub の R1-3b の一時の形と同じ、
 # api-design §6.4）。`chronogazer-host` の分離は R2b-3 に含めない。
-banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.1.0" }
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.2.0" }
 banto-drivers = { path = "../../../crates/banto-drivers" }
 banto-tsquery = { path = "../../../crates/banto-tsquery" }
 # #332 (Hub 接続): 自己発行 bootstrap 本体と、その接続確認に使う catalog

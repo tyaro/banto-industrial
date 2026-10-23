@@ -7,7 +7,23 @@
 - **適合テストの追加**: 新しい確認（C 番号）を足して、今まで通っていたドライバが落ちるようになるのは、この crate の minor を上げる変更として扱い、ここに書く。
 - **MSRV**: `Cargo.toml` の `rust-version`（API と同じ）。CI がその版で `cargo check` する。
 
-## 0.1.0 — 未公開
+## 0.2.0 — 未公開
+
+R2b-3（docs/banto-hub-driver-io-design.md §5.6・§11.2。2026-10-23、banto-hub v0.2.0-alpha.37）。`banto-driver-api` 0.2.0 に合わせる。**`0.1.0` は公開していない**ので、公開する最初の版はこの `0.2.0`。次の `0.1.0` 節は R1 の形の記録として残す。
+
+### 壊れること
+
+- **`frame::run_all` は、ハーネスが手順を再現するのをやめ、本番の `banto-driver-engine`（`FrameSession`）を記憶上の通信路と止めた Tokio の時計で動かす**。入力（`FrameFixtures`・`Responder`）と戻り値（`Vec<Failure>`）の形は変わらないが、次の点が変わる。
+  - 契約違反（`covers` の範囲外・`Discard(0)`・`Done` の長さの誤り・`inter_frame_gap` の超過など）は、エンジンが観測口（`EngineEvents`）に出したものを `Failure` にする。ドライバの実装がエンジンの契約に触れると、今まで通っていた適合テストが落ちることがある（直し方は `Failure` の `detail` に出るエンジンの理由に従う。`banto-driver-api` の契約の明確化は API の CHANGELOG）。
+  - 実時間は使わない（tokio の `test-util` の止めた時計）。`tokio` の依存の feature に `test-util` が増えた。
+- `banto-driver-engine` 0.1.0 に依存する（API 0.2.0 に合わせる）。第三者は、同じ本番のエンジンで自分のドライバを確かめられる。
+
+### 追加
+
+- 書き込みの状態機械 C13〜C15 は、ドライバ crate の `tests/` が `FrameSession`（エンジン）で包んで SLMP に掛ける（Modbus はワード内ビットの書き込みが無いので fixtures なし）。C16（割り込ませない・step の上限・途中の切断）は Hub を通して確かめる（R2b-3b-join・3d）。
+- 適合テストが載せる Modbus / SLMP は `FrameDriver` になった（R2b-3c・3d）。R1 で使った dev 専用の `LegacySession`（`BrokerSession` を `Session` に包む写し）は、ドライバ crate の `tests/` からも消えた（crate の公開の形には出ていなかった）。
+
+## 0.1.0 — 未公開（公開せず 0.2.0 に置き換えた）
 
 R1-2（docs/banto-driver-api-design.md §7・§10）。骨格。MSRV は Rust 1.85。依存は `banto-driver-api` と tokio（`rt` / `time` / `net` / `io-util` / `macros`）だけ。
 
