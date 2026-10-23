@@ -903,6 +903,52 @@ async fn close_by_closes_only_the_line_its_owner_leased_last() {
     assert!(bench.table.line(&key).is_none());
 }
 
+/// オーナーのレビュー P2（`lease` と `close_by` の競合）: 旧 task が線を返した後、新 task の
+/// `lease` が表のロックを取る直前に旧 task の `close_by` を挟む。取り出しと予約は表のロックの
+/// 中で一体なので、新 task は表から外れた線を借りない（新しい線が作られ、表に入る）。その
+/// セッションが時間切れになると、署名は表の線に残り、セッションを捨てても次のダイヤルに届く。
+#[tokio::test(start_paused = true)]
+async fn a_close_by_racing_a_lease_never_leaves_the_new_session_on_a_line_outside_the_table() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    let key = LineKey::of(&bench.spec).unwrap();
+    let (old, new) = (LineOwner::new(), LineOwner::new());
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 旧 task の同期
+    ]);
+    // 1. 旧セッションが線を返す（`leased = false`、印は旧 task）。
+    drop(bench.connect_as(Some(old)).await.unwrap());
+    let old_line = bench.line();
+
+    // 2〜3. 新 task の `lease` が表のロックを取る直前に、旧 task の `close_by` が線を外す。
+    let hook_key = key.clone();
+    *bench.table.before_lease_lock.lock().unwrap() = Some(Box::new(move |table| {
+        assert!(table.close_by(&hook_key, old), "旧 task の解放が線を外す");
+    }));
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 新 task の同期（開き直したので Fresh）
+        Reaction::Silence,                                  // A は時間切れ
+    ]);
+    let mut session = bench.connect_as(Some(new)).await.unwrap();
+    assert!(
+        bench.table.before_lease_lock.lock().unwrap().is_none(),
+        "差し込み口が呼ばれた"
+    );
+    let line = bench
+        .table
+        .line(&key)
+        .expect("新 task が借りた線は表に入っている");
+    assert!(!Arc::ptr_eq(&line, &old_line), "外れた古い線ではない");
+    assert!(line.is_open());
+
+    // 4. 時間切れ。署名は表の線に残り、セッションを捨てても失われない。
+    assert!(read_one(&mut session, ADDR_A).await.is_err());
+    drop(session);
+    let after = bench.table.line(&key).expect("線は表に残る");
+    assert!(Arc::ptr_eq(&after, &line), "借りた線と表の線は同じ");
+    assert_eq!(after.state(), SyncState::Unsynced);
+    assert_eq!(after.outstanding(), vec![sig(FC_READ, 1)]);
+}
+
 /// Codex P1: 古い応答と同期の応答が 1 回の recv でまとめて届く（`SerialOverTcp` でよくある）。
 /// 古い応答を捨てた後に `buf` に残った同期の応答を、次の recv を待つ前に調べ、1 回目の試行で同期する。
 #[tokio::test(start_paused = true)]

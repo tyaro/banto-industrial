@@ -304,7 +304,15 @@ impl Transport for LineLease {
 #[derive(Default)]
 pub struct LineTable {
     lines: Mutex<HashMap<LineKey, Arc<Line>>>,
+    /// 試験だけの差し込み口: [`LineTable::lease`] が表のロックを取る直前に 1 回だけ呼ぶ
+    /// （その瞬間に旧 task の `close_by` を挟む回帰テスト用）。
+    #[cfg(test)]
+    pub(crate) before_lease_lock: Mutex<Option<LeaseHook>>,
 }
+
+/// [`LineTable`] の試験だけの差し込み口の型。
+#[cfg(test)]
+pub(crate) type LeaseHook = Box<dyn FnOnce(&LineTable) + Send>;
 
 static GLOBAL: LazyLock<LineTable> = LazyLock::new(LineTable::default);
 
@@ -353,9 +361,26 @@ impl LineTable {
     {
         let key = LineKey::of(spec)
             .ok_or_else(|| FatalError::InvalidConfig("TCP の接続は線の表を通りません".into()))?;
-        let line = {
+        #[cfg(test)]
+        {
+            let hook = self
+                .before_lease_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(self);
+            }
+        }
+        // 表からの取り出し（無ければ作る）と予約（使用中・隔離・設定変更の判定、`leased` と
+        // 持ち主の印の記録）は、表のロックを持ったまま線のロックを取って一体で行う。ロックの順は
+        // `close` / `close_by` と同じ「表 → 線」。表のロックを先に放すと、その隙に旧 task の
+        // `close_by` が（まだ貸し出し中でない）線を表から外し、隔離の印も立てないので、この
+        // セッションが表から外れた線を予約して使い、時間切れの署名がセッションを捨てると失われる
+        // （オーナーのレビュー P2、2026-10-23）。どちらのロックも `await` をまたがない。
+        let (line, reused) = {
             let mut lines = self.lock();
-            Arc::clone(lines.entry(key.clone()).or_insert_with(|| {
+            let line = Arc::clone(lines.entry(key.clone()).or_insert_with(|| {
                 Arc::new(Line {
                     key: key.clone(),
                     inner: Mutex::new(LineInner {
@@ -368,34 +393,38 @@ impl LineTable {
                         quarantined: false,
                     }),
                 })
-            }))
-        };
-        let reused = {
-            let mut inner = line.lock();
-            if inner.leased {
-                return Err(FatalError::Protocol(format!(
-                    "シリアルの線 {key} は別のセッションが使用中です"
-                )));
-            }
-            if inner.quarantined {
-                return Err(quarantine_error(&key));
-            }
-            if inner.spec.as_ref() != Some(spec) {
-                // 線の設定が変わった。開いたままのポートは閉じる（表に戻さない）。
-                drop(inner.transport.take());
-                // 開き直したポートは同期済みを引き継がない（同期の手順を持つドライバは同期から）。
-                // 未同期と待っている署名は残す: 機器と線は同じなので古い要求の応答がまだ届きうる。
-                // 溜まった署名は、同期が通れば空にする。
-                if inner.state == SyncState::Synced {
-                    inner.state = SyncState::Fresh;
+            }));
+            let reused = {
+                let mut inner = line.lock();
+                if inner.leased {
+                    return Err(FatalError::Protocol(format!(
+                        "シリアルの線 {key} は別のセッションが使用中です"
+                    )));
                 }
-            }
-            inner.leased = true; // 予約。開く間に 2 つ目を断る。
-            if owner.is_some() {
-                inner.owner = owner;
-            }
-            inner.transport.take()
+                if inner.quarantined {
+                    return Err(quarantine_error(&key));
+                }
+                if inner.spec.as_ref() != Some(spec) {
+                    // 線の設定が変わった。開いたままのポートは閉じる（表に戻さない）。
+                    drop(inner.transport.take());
+                    // 開き直したポートは同期済みを引き継がない（同期の手順を持つドライバは同期から）。
+                    // 未同期と待っている署名は残す: 機器と線は同じなので古い要求の応答がまだ届きうる。
+                    // 溜まった署名は、同期が通れば空にする。
+                    if inner.state == SyncState::Synced {
+                        inner.state = SyncState::Fresh;
+                    }
+                }
+                inner.leased = true; // 予約。開く間に 2 つ目を断る。
+                if owner.is_some() {
+                    inner.owner = owner;
+                }
+                inner.transport.take()
+            };
+            drop(lines);
+            (line, reused)
         };
+        // ここから先、`open().await` の最中に `close` / `close_by` が来ても、線は貸し出し中
+        // （予約済み）なので `close_line` が隔離の印を立て、貸し出しの drop でポートを閉じる。
         // 予約の番人: `open` が `Err` を返したとき、または `open` の待ちの最中に future が
         // drop された（broker の connect の上限での abort など）とき、予約を戻す。
         let reservation = Reservation { line: &line };
