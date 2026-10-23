@@ -34,9 +34,11 @@
 //!   `frame_conn.rs` is the [`banto_driver_api::FrameDriver`] /
 //!   `FrameConnection` with `plan_read` / `decode_read` over them, run by the
 //!   real engine in `tests/frame_conformance.rs`. `slmp_parity.rs` (tests)
-//!   checks every frame byte for byte against the `slmp` crate. Not yet
-//!   registered: the broker still dials the session above, and
-//!   `write_next` comes with the switch-over.
+//!   checks every frame byte for byte against the `slmp` crate. R2b-3d-2
+//!   added `write_next` (word writes, and the bit-in-word read-modify-write
+//!   as three steps), checked through the engine by `tests/conformance.rs`
+//!   (C13-C15) and `tests/p0_3.rs`. Not yet registered: the broker still
+//!   dials the session above until 3d-join.
 //!
 //! ## Dependency direction
 //!

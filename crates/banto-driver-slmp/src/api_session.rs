@@ -184,8 +184,9 @@ pub(crate) fn read_request(spec: &TagSpec) -> Result<Prep<BatchReadRequest>, Fat
 /// The write request of `item`. A `bit`-addressed `bit` tag (`D100.5`) is
 /// the read-modify-write `BitInWord`; its value must be a `Bit`. Everything
 /// else is an ordinary numeric / string write (a bit *device* `M50` has no
-/// `bit`, so it is `Numeric`).
-fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError> {
+/// `bit`, so it is `Numeric`). Also the frame connection's `write_next`
+/// (`frame_conn.rs`), so the two make the same decision by construction.
+pub(crate) fn write_request(item: &WriteItem) -> Result<Prep<BatchWriteRequest>, FatalError> {
     let spec = &item.spec;
     // An address that does not parse is that tag's problem, not the
     // connection's (R2b-2a, address design §6 Q5).

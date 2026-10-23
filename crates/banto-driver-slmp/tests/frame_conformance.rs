@@ -1,66 +1,25 @@
 //! R2b-3d（docs/banto-hub-driver-io-design.md §11.2）: the frame-type
 //! `SlmpDriver` through `banto-driver-conformance`'s `frame::run_all`, which
 //! runs the real `banto-driver-engine` over an in-memory wire on a paused
-//! clock (C3-C7, C9, C11, C12: kinds and order, refusals, broken and split
+//! clock (C3-C7, C9-C12: kinds and order, refusals, broken and split
 //! responses, a late response, reconnects, a response that never ends,
-//! random bytes, string spans). The device on the other end is `banto-plc`'s
-//! SLMP simulator, answering request bytes with response bytes
+//! random bytes, string spans) and, since R2b-3d-2 the driver writes, C10
+//! (writes that are not adjacent are not coalesced, and read back - a word,
+//! a 32-bit float, a bit device, a string and a bit in a word through the
+//! read-modify-write). The device on the other end is `banto-plc`'s SLMP
+//! simulator, answering request bytes with response bytes
 //! (`Simulator::respond`), for the R and the Q series.
 //!
-//! `write_next` is the next PR, so the driver runs here as read-only
-//! ([`ReadOnly`]); C10 and the frame-type C13-C15 come with it.
+//! C13-C15 (the read-modify-write's other bits, refusals at each step and
+//! the check read's mismatch) run over real TCP through the engine in
+//! `tests/conformance.rs`, and on the driver alone in `src/frame_conn.rs`.
 
-use banto_driver_api::{
-    AddressError, Capabilities, DataType, DriverAddress, DriverBase, DriverDescriptor, FatalError,
-    FieldError, FrameConnection, FrameDriver, RawValue, Settings, StringEncoding, TagKind,
-};
+use banto_driver_api::{DataType, RawValue, Settings, StringEncoding, TagKind, Value};
 use banto_driver_conformance::frame::{self, FrameFixtures, Reply, Responder};
 use banto_driver_conformance::StaticFixtures;
 use banto_driver_slmp::SlmpDriver;
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc::slmp::simulator::Simulator;
-
-/// [`SlmpDriver`] with a read-only descriptor (module doc).
-struct ReadOnly(SlmpDriver);
-
-impl DriverBase for ReadOnly {
-    fn descriptor(&self) -> &DriverDescriptor {
-        static D: std::sync::OnceLock<DriverDescriptor> = std::sync::OnceLock::new();
-        D.get_or_init(|| {
-            let full = self.0.descriptor();
-            DriverDescriptor::new(
-                full.id.clone(),
-                full.version.clone(),
-                full.display_name.clone(),
-                Capabilities::READ_ONLY,
-            )
-        })
-    }
-    fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
-        self.0.validate_config(settings)
-    }
-    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
-        self.0.parse_address(text, kind)
-    }
-    fn offset_address(&self, c: &str, kind: &TagKind, n: i64) -> Result<String, AddressError> {
-        self.0.offset_address(c, kind, n)
-    }
-    fn address_help(&self) -> String {
-        self.0.address_help()
-    }
-    fn probe(&self) -> Option<(String, TagKind)> {
-        self.0.probe()
-    }
-}
-
-impl FrameDriver for ReadOnly {
-    fn create_connection(
-        &self,
-        settings: &Settings,
-    ) -> Result<Box<dyn FrameConnection>, FatalError> {
-        self.0.create_connection(settings)
-    }
-}
 
 /// The simulator as the harness's device. A broken reply is the good one with
 /// its subheader corrupted (`D4 FF`), as `Simulator::emit_malformed_frames`.
@@ -127,7 +86,19 @@ fn fixtures(cpu: &str) -> FrameFixtures {
         )
         .refused("D500", n(U16))
         .unsupported("D100", n(Bit))
-        .unsupported("M10", sjis(4));
+        .unsupported("M10", sjis(4))
+        .write("D300", n(U16), Value::F64(321.0), RawValue::Uint(321))
+        .write("D310", n(F32), Value::F64(2.25), RawValue::Float(2.25))
+        .write("M20", n(Bit), Value::Bit(true), RawValue::Bool(true))
+        // "AB" padded with NUL to the 2 words, low byte first.
+        .write(
+            "D330",
+            sjis(2),
+            Value::Str("AB".into()),
+            RawValue::Bytes(vec![0x41, 0x42, 0x00, 0x00]),
+        )
+        // D140 holds 0x0008: the RMW sets bit 0 and keeps bit 3.
+        .write("D140.0", n(Bit), Value::Bit(true), RawValue::Bool(true));
     // One bulk read serves up to 480 words (`plan_slmp_batch`).
     f.max_string_words = 480;
     f
@@ -137,7 +108,7 @@ async fn conforms(cpu: &str) {
     let sim = Simulator::start().await;
     seed(&sim);
     let mut device = Device(sim);
-    let failures = frame::run_all(&ReadOnly(SlmpDriver), &fixtures(cpu), &mut device).await;
+    let failures = frame::run_all(&SlmpDriver, &fixtures(cpu), &mut device).await;
     let last = device.0.last_subcommand();
     device.0.stop();
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();

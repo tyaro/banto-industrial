@@ -44,7 +44,8 @@
 //! Every request is range-checked before a byte is built: the device has to
 //! be accessed in its own unit (a word-unit write to a bit device would write
 //! 16 bits at once), the point count is at least 1 and at most
-//! [`MAX_WORD_POINTS`] / [`MAX_BIT_POINTS`], the whole span stays inside the
+//! [`MAX_WORD_POINTS`] / [`MAX_BIT_POINTS`] ([`MAX_WRITE_BIT_POINTS`] for a
+//! bit write), the whole span stays inside the
 //! device numbers `0..=0xFFFFFF`, and a write carries exactly as many points
 //! as it says. A request that fails a check is not built at all.
 //!
@@ -84,6 +85,12 @@ pub(crate) const MAX_WORD_POINTS: u16 = 960;
 /// 960 bytes of a word read; `plan_slmp_batch`'s own limit), below the
 /// specification's bit-unit limit (7168 by memory, not checked on hardware).
 pub(crate) const MAX_BIT_POINTS: u16 = 1920;
+/// The most bits one bulk **write** carries: the write planner's own cap
+/// (`banto-plc-write`'s `MAX_WRITE_BITS`, 3584), which the `slmp` crate has
+/// put on the wire in one frame until now (R2b-3d-2). A write's answer has
+/// no data, so the read's receive-side reason for 1920 does not apply; one
+/// planned write stays one frame, as before.
+pub(crate) const MAX_WRITE_BIT_POINTS: u16 = 3584;
 
 /// The 4E header fields a connection sends and expects back (the
 /// "access route", the serial id and the CPU timer). The defaults are
@@ -154,12 +161,14 @@ impl Span {
         }
     }
 
-    /// The range checks every request goes through (module doc).
-    fn check(&self) -> Result<(), RequestError> {
-        let max = if self.is_bits() {
-            MAX_BIT_POINTS
-        } else {
-            MAX_WORD_POINTS
+    /// The range checks every request goes through (module doc), for the
+    /// `command` it is a span of (a bit write may carry more points than a
+    /// bit read, [`MAX_WRITE_BIT_POINTS`]).
+    fn check(&self, command: u16) -> Result<(), RequestError> {
+        let max = match (self.is_bits(), command) {
+            (true, COMMAND_BULK_WRITE) => MAX_WRITE_BIT_POINTS,
+            (true, _) => MAX_BIT_POINTS,
+            (false, _) => MAX_WORD_POINTS,
         };
         if self.count == 0 || self.count > max {
             return Err(RequestError(format!(
@@ -278,22 +287,19 @@ pub(crate) fn bulk_read(
     series: Series,
     span: &Span,
 ) -> Result<Vec<u8>, RequestError> {
-    span.check()?;
+    span.check(COMMAND_BULK_READ)?;
     Ok(request(route, series, COMMAND_BULK_READ, span, &[]))
 }
 
 /// A word-unit bulk write (`0x1401`): `words` to the word device `span`
 /// starts at. `span.count` must be `words.len()`.
-// The write state machine (`write_next`) is the next PR; its frames are
-// built and checked against the `slmp` crate already.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bulk_write_words(
     route: &Route,
     series: Series,
     span: &Span,
     words: &[u16],
 ) -> Result<Vec<u8>, RequestError> {
-    span.check()?;
+    span.check(COMMAND_BULK_WRITE)?;
     if span.is_bits() {
         return Err(RequestError(format!(
             "ビットデバイス {} にワード単位で書き込もうとしました",
@@ -314,16 +320,13 @@ pub(crate) fn bulk_write_words(
 /// A bit-unit bulk write (`0x1401`): `bits` to the bit device `span` starts
 /// at, two points per byte (the earlier in the high nibble, an odd count
 /// padded with a zero nibble). `span.count` must be `bits.len()`.
-// The write state machine (`write_next`) is the next PR; its frames are
-// built and checked against the `slmp` crate already.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn bulk_write_bits(
     route: &Route,
     series: Series,
     span: &Span,
     bits: &[bool],
 ) -> Result<Vec<u8>, RequestError> {
-    span.check()?;
+    span.check(COMMAND_BULK_WRITE)?;
     if !span.is_bits() {
         return Err(RequestError(format!(
             "ワードデバイス {} にビット単位で書き込もうとしました",
@@ -412,7 +415,7 @@ pub(crate) fn parse_request(bytes: &[u8]) -> Option<ParsedRequest> {
         start: number,
         count,
     };
-    if span.is_bits() != bits || span.check().is_err() {
+    if span.is_bits() != bits || span.check(command).is_err() {
         return None;
     }
     if command == COMMAND_BULK_READ && field.len() != count_at + 2 {
@@ -541,9 +544,6 @@ pub(crate) fn bits(data: &[u8], count: u16) -> Result<Vec<bool>, FatalError> {
 }
 
 /// A write's answer: no data on success.
-// The write state machine (`write_next`) is the next PR; its frames are
-// built and checked against the `slmp` crate already.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write_ack(route: &Route, response: &[u8]) -> Result<Answer<'static>, FatalError> {
     match check_response(route, response)? {
         Answer::Data([]) => Ok(Answer::Data(&[])),
@@ -658,8 +658,8 @@ mod tests {
             (span(SlmpDevice::D, 0, 0), "0 点"),
             (span(SlmpDevice::D, 0, MAX_WORD_POINTS + 1), "語の上限 + 1"),
             (
-                span(SlmpDevice::M, 0, MAX_BIT_POINTS + 1),
-                "ビットの上限 + 1",
+                span(SlmpDevice::M, 0, MAX_WRITE_BIT_POINTS + 1),
+                "ビットの書き込みの上限 + 1",
             ),
             (span(SlmpDevice::D, max, 2), "番号の上限をまたぐ"),
             (span(SlmpDevice::D, max + 1, 1), "番号の上限 + 1"),
@@ -681,6 +681,21 @@ mod tests {
                     );
                 }
             }
+        }
+        // A bit read stops at 1920 points; a bit write goes on to 3584 (one
+        // planned write is one frame, as with the `slmp` crate).
+        for series in [Series::Q, Series::R] {
+            let over = span(SlmpDevice::M, 0, MAX_BIT_POINTS + 1);
+            assert!(bulk_read(&r, series, &over).is_err());
+            let bits = vec![true; usize::from(over.count)];
+            assert!(bulk_write_bits(&r, series, &over, &bits).is_ok());
+            let edge = span(SlmpDevice::M, 0, MAX_WRITE_BIT_POINTS);
+            let bits = vec![true; usize::from(edge.count)];
+            let sent = bulk_write_bits(&r, series, &edge, &bits).unwrap();
+            assert_eq!(
+                parse_request(&sent).map(|p| (p.command, p.span)),
+                Some((COMMAND_BULK_WRITE, edge))
+            );
         }
         // The edges themselves are fine.
         assert!(bulk_read(&r, Series::R, &span(SlmpDevice::D, max, 1)).is_ok());
