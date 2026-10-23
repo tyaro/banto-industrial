@@ -357,9 +357,15 @@ pub struct LineTable {
     /// （その瞬間に旧 task の `close_by` を挟む回帰テスト用）。
     #[cfg(test)]
     pub(crate) before_lease_lock: Mutex<Option<LeaseHook>>,
+    /// 試験だけの差し込み口: `close` / `close_by` が表と線のロックを放した直後（取り出したポートを
+    /// drop する前）に 1 回だけ呼ぶ。この時点で古い線のポートが取り出し済みであることを確かめる。
+    #[cfg(test)]
+    pub(crate) after_close_unlock: Mutex<Option<CloseHook>>,
 }
 
 /// [`LineTable`] の試験だけの差し込み口の型。
+#[cfg(test)]
+pub(crate) type CloseHook = Box<dyn FnOnce(&Line) + Send>;
 #[cfg(test)]
 pub(crate) type LeaseHook = Box<dyn FnOnce(&LineTable) + Send>;
 
@@ -526,35 +532,54 @@ impl LineTable {
     /// 閉じる。貸し出し中なら、その貸し出しの drop で閉じる）。待っている署名は消える
     /// （§7.3 の 5。次に開くときは `Fresh` で、同期の手順を持つドライバは同期から始める）。
     pub fn close(&self, key: &LineKey) -> bool {
-        let mut lines = self.lock();
-        let Some(line) = lines.get(key) else {
-            return false;
-        };
-        let line = Arc::clone(line);
-        lines.remove(key);
-        drop(lines);
-        close_line(&line);
-        true
+        self.close_where(key, None)
     }
 
     /// broker の接続の task の終わり: 最後に借りたのが `owner` の線（または、まだ誰も印を
     /// 付けていない線）だけを [`close`](Self::close) する。別の（新しい）task が借りた・開いた
     /// 線は閉じない（`false`）。
     pub fn close_by(&self, key: &LineKey, owner: LineOwner) -> bool {
-        let mut lines = self.lock();
-        let Some(line) = lines.get(key) else {
-            return false;
-        };
-        let line = Arc::clone(line);
-        {
-            let inner = line.lock();
-            if inner.owner.is_some_and(|current| current != owner) {
+        self.close_where(key, Some(owner))
+    }
+
+    /// 表から外すことと、線の中のポートの取り出し・隔離の印は、表 → 線のロックを持ったまま
+    /// 一体で行う（`lease` と同じ順）。分けると、その隙に同じ鍵で `lease` した task が新しい線で
+    /// 同じポートを開きにいき、古いポートがまだ開いているので COM は「使用中」で失敗し、
+    /// `SerialOverTcp` は変換器へ一瞬 2 本つながる（Codex P2）。取り出したポートの drop（同期の
+    /// close）は、両方のロックを放した後で行う。
+    fn close_where(&self, key: &LineKey, owner: Option<LineOwner>) -> bool {
+        let (_closed_line, taken) = {
+            let mut lines = self.lock();
+            let Some(line) = lines.get(key) else {
                 return false;
+            };
+            let line = Arc::clone(line);
+            let mut inner = line.lock();
+            if let Some(owner) = owner {
+                if inner.owner.is_some_and(|current| current != owner) {
+                    return false;
+                }
+            }
+            lines.remove(key);
+            let transport = inner.transport.take();
+            if inner.leased {
+                inner.quarantined = true;
+            }
+            drop(inner);
+            (line, transport)
+        };
+        #[cfg(test)]
+        {
+            let hook = self
+                .after_close_unlock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            if let Some(hook) = hook {
+                hook(&_closed_line);
             }
         }
-        lines.remove(key);
-        drop(lines);
-        close_line(&line);
+        drop(taken);
         true
     }
 
@@ -581,16 +606,6 @@ impl Reservation<'_> {
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
         self.line.lock().leased = false;
-    }
-}
-
-/// 表から外した線を閉じる（貸し出し中でなければポートも閉じる。貸し出し中なら、戻す先が
-/// 無いので、その貸し出しの drop で閉じる）。
-fn close_line(line: &Line) {
-    let mut inner = line.lock();
-    drop(inner.transport.take());
-    if inner.leased {
-        inner.quarantined = true;
     }
 }
 

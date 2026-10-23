@@ -1174,6 +1174,36 @@ async fn a_close_by_racing_a_lease_never_leaves_the_new_session_on_a_line_outsid
     assert_eq!(after.outstanding(), vec![sig(FC_READ, 1)]);
 }
 
+/// Codex P2（`close_by` の取り外しの一体化）: 表から外すことと、線の中のポートの取り出しは
+/// 一体で行う。表と線のロックを放した時点（ポートを drop する前）で、古い線のポートがもう
+/// 取り出されている。分けていると、その隙に同じ鍵で `lease` した task が同じポートを開きに
+/// いくのに、古いポートがまだ開いている。
+#[tokio::test(start_paused = true)]
+async fn close_by_takes_the_old_port_in_the_same_critical_section_as_the_table_removal() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    let key = LineKey::of(&bench.spec).unwrap();
+    let old = LineOwner::new();
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]);
+    drop(bench.connect_as(Some(old)).await.unwrap());
+    let old_line = bench.line();
+    assert!(old_line.is_open());
+
+    let seen = Arc::new(Mutex::new(None));
+    let seen_in_hook = Arc::clone(&seen);
+    *bench.table.after_close_unlock.lock().unwrap() = Some(Box::new(move |line| {
+        *seen_in_hook.lock().unwrap() = Some(line.is_open());
+    }));
+    assert!(bench.table.close_by(&key, old));
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(false),
+        "ロックを放した時点で古いポートは取り出し済み"
+    );
+    assert!(bench.table.line(&key).is_none());
+}
+
 /// Codex P1: 古い応答と同期の応答が 1 回の recv でまとめて届く（`SerialOverTcp` でよくある）。
 /// 古い応答を捨てた後に `buf` に残った同期の応答を、次の recv を待つ前に調べ、1 回目の試行で同期する。
 #[tokio::test(start_paused = true)]
