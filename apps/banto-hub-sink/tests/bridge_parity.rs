@@ -660,8 +660,10 @@ fn read_tag_aged(manager: &CollectorManager, external: &str) -> (Reading, i64) {
         .unwrap_or_else(|| panic!("tag {external} is not in the catalog"));
     let current = manager.current_values();
     let store = manager.server_store();
+    let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now_ms());
+    // 経過は導出の後に測る（導出の時計は `read_current` の中で別に読まれる。前に測ると、
+    // 間で止まったときに導かれた Stale が新しく見える）。
     let now = now_ms();
-    let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now);
     (
         Reading {
             value,
@@ -682,22 +684,25 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// `skip_derived_stale` が真なら、経過が [`DERIVED_STALE_AFTER_MS`] を超えた Stale
-    /// （tick の遅れで読むときに導かれたもの）を控えない。ブリッジや Source が送った
+    /// `skip_derived_stale` が `Some(i)` なら、`externals[i]` だけは、経過が
+    /// [`DERIVED_STALE_AFTER_MS`] を超えた Stale（tick の遅れで読むときに導かれたもの）を
+    /// 控えない（他のタグは厳密なまま。止まり続けても見逃さない）。ブリッジや Source が送った
     /// `stale` は送るたびに時刻が新しいので、控えられる。
     fn start(
         manager: Arc<CollectorManager>,
         externals: Vec<String>,
-        skip_derived_stale: bool,
+        skip_derived_stale: Option<usize>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
         let task = tokio::spawn(async move {
             let mut sequences: Vec<Vec<Reading>> = vec![Vec::new(); externals.len()];
             loop {
-                for (sequence, external) in sequences.iter_mut().zip(&externals) {
+                for (index, (sequence, external)) in
+                    sequences.iter_mut().zip(&externals).enumerate()
+                {
                     let (reading, age_ms) = read_tag_aged(&manager, external);
-                    if skip_derived_stale
+                    if skip_derived_stale == Some(index)
                         && reading.quality == "stale"
                         && age_ms > DERIVED_STALE_AFTER_MS
                     {
@@ -916,16 +921,17 @@ impl Fixture {
         Recorder::start(
             self.app.manager.clone(),
             vec![Self::db_external(column), self.push_external(column)],
-            false,
+            None,
         )
     }
 
-    /// [`Self::record`] で、読むときに導かれた Stale（tick の遅れ）を控えない。
+    /// [`Self::record`] で、ブリッジのタグだけ、読むときに導かれた Stale（tick の遅れ）を
+    /// 控えない。
     fn record_ignoring_derived_stale(&self, column: &str) -> Recorder {
         Recorder::start(
             self.app.manager.clone(),
             vec![Self::db_external(column), self.push_external(column)],
-            true,
+            Some(1),
         )
     }
 
