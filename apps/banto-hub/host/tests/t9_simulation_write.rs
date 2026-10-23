@@ -40,6 +40,7 @@ use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
+use banto_driver_api::{DataType, TagKind, Value as PlcValue};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
@@ -169,6 +170,9 @@ struct TestApp {
     admin_token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
+    /// R2b-5b: the simulated connections' value tables (`device(conn_id)`),
+    /// where the tests observe what a write reached.
+    sim_registry: Arc<BrokerSimRegistry>,
     write_control: Arc<WriteControl>,
     controller: Arc<CollectionController>,
     _env: TempEnv,
@@ -231,7 +235,7 @@ async fn test_app(label: &str) -> TestApp {
         Arc::new(SystemClock),
         fast_options(),
         sessions,
-        sim_registry,
+        sim_registry.clone(),
         computed,
     ));
     manager.rebuild().await.expect("initial rebuild");
@@ -293,6 +297,7 @@ async fn test_app(label: &str) -> TestApp {
         admin_token,
         pool,
         manager,
+        sim_registry,
         write_control,
         controller,
         _env: env,
@@ -431,12 +436,15 @@ async fn simulated_connection_write_is_applied_and_held(
     word_address: &str,
     neighbour_address: &str,
     bit_address: &str,
+    // `SimDevice` の正規形（word, neighbour, bit の順）。
+    canonical: [&str; 3],
 ) {
+    let [word_canonical, neighbour_canonical, bit_canonical] = canonical;
     let app = test_app(label).await;
 
-    // host/port はダミー - `BrokerSimRegistry` が実際のダイヤル先を in-process
-    // シミュレータへ差し替える（port 1 は誰も listen していない特権ポート
-    // なので、差し替えが壊れたら即座に接続拒否で落ちる）。
+    // host/port はダミー - シミュレーションの接続はワイヤに出ず、値の層の
+    // `SimDevice` を読み書きする（R2b-5b。port 1 は誰も listen していない
+    // 特権ポートなので、ソケットを開いたら即座に接続拒否で落ちる）。
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("simline", protocol, 1, true))
         .await
@@ -518,8 +526,24 @@ async fn simulated_connection_write_is_applied_and_held(
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
 
-    // 収集が書いた値を読み戻すまで待つ（ここで初めて「シミュレータに実際に
-    // 届いた」ことが証明される）。
+    // 書いた値が `SimDevice` に届いている（held の表を直接見る）。
+    let device = app
+        .sim_registry
+        .device(conn.id)
+        .await
+        .expect("the simulated connection has a device");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            device.get(word_canonical, &TagKind::Numeric(DataType::U16))
+                == Some(PlcValue::F64(4242.0))
+                && device.get(bit_canonical, &TagKind::Numeric(DataType::Bit))
+                    == Some(PlcValue::Bit(true))
+        })
+        .await,
+        "the written values must reach the SimDevice"
+    );
+
+    // 収集が書いた値を読み戻すまで待つ。
     assert!(
         wait_until(Duration::from_secs(10), || async {
             cached_value(&app, word_tag.id) == Some(4242.0)
@@ -547,13 +571,19 @@ async fn simulated_connection_write_is_applied_and_held(
         "a written bit is held the same way"
     );
 
-    // 隣の番地は held ではないので、ランプ波で動き続けている。
+    // 隣の番地は held ではないので、生成値が動き続けている（固定 sleep
+    // ではなく、違う値が現れるまでポーリングする）。
     assert!(
         wait_until(Duration::from_secs(10), || async {
             cached_value(&app, neighbour_tag.id) != Some(before)
         })
         .await,
-        "the neighbouring address must keep ramping - holding is per-address"
+        "the neighbouring address must keep moving - holding is per-address"
+    );
+    assert_eq!(
+        device.get(neighbour_canonical, &TagKind::Numeric(DataType::U16)),
+        None,
+        "a neighbour nobody wrote is never held"
     );
 
     assert!(
@@ -571,7 +601,15 @@ async fn simulated_slmp_connection_write_is_applied_and_held_against_the_ramp() 
     // D5/D6/M3 はいずれも `banto_collect::simulation::RAMP_ADDRESS_COUNT`
     // (16) の範囲内 - ランプ波が毎周期上書きしにくる番地をわざと選んでいる
     // （held が効いていなければこのテストは落ちる）。
-    simulated_connection_write_is_applied_and_held("363-slmp", "slmp", "D5", "D6", "M3").await;
+    simulated_connection_write_is_applied_and_held(
+        "363-slmp",
+        "slmp",
+        "D5",
+        "D6",
+        "M3",
+        ["D5", "D6", "M3"],
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -584,6 +622,7 @@ async fn simulated_modbus_connection_write_is_applied_and_held_against_the_ramp(
         "40006",
         "40007",
         "00004",
+        ["400006", "400007", "000004"],
     )
     .await;
 }
@@ -650,6 +689,18 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
         "#363: all-simulation writes are applied, not rejected: {body:?}"
     );
 
+    let device = app
+        .sim_registry
+        .device(conn.id)
+        .await
+        .expect("all-simulation gives the connection a device");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            device.get("D7", &TagKind::Numeric(DataType::U16)) == Some(PlcValue::F64(1234.0))
+        })
+        .await,
+        "the written value must reach the SimDevice"
+    );
     assert!(
         wait_until(Duration::from_secs(10), || async {
             cached_value(&app, tag.id) == Some(1234.0)

@@ -101,7 +101,7 @@ pub mod sessions;
 pub mod simulation;
 mod task;
 
-pub use broker_sim::{dial_fingerprint, BrokerSimRegistry};
+pub use broker_sim::{dial_fingerprint, BrokerSimRegistry, DialTarget};
 pub use client::{
     broker_client_factory, BrokerReadClient, ClientFactory, CollectClient, ReadBatch,
     BROKER_RECONNECT_GRACE,

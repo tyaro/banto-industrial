@@ -33,7 +33,7 @@ use std::sync::Arc;
 use banto_broker::{BrokerOptions, BrokerSupervisor, ReadOnlyHandle, SessionDirectory};
 use banto_driver_api::DriverRegistry;
 
-use crate::broker_sim::{dial_fingerprint, BrokerSimRegistry};
+use crate::broker_sim::{dial_fingerprint, BrokerSimRegistry, DialTarget};
 use crate::client::{broker_client_factory, ClientFactory};
 use crate::config::{CollectorConfig, RegistrySnapshot};
 
@@ -101,23 +101,21 @@ impl BrokerSessions {
             if !planned.contains(&key) {
                 continue;
             }
-            // A `simulation = true` connection without a simulator is not
-            // planned (`resolve_connection`), so it never gets here; should it
-            // anyway, `resolve` refuses it and no session is ensured (it is
-            // left out of `wanted`, so an old session goes as stale).
-            let Some((settings, changed)) = self.sims.resolve(conn, &self.registry).await else {
-                self.directory.remove(conn.id);
-                continue;
-            };
+            let (target, changed) = self.sims.resolve(conn, &self.registry).await;
             wanted.insert(conn.id);
             if changed {
                 self.directory.remove(conn.id);
             }
-            config.set_broker_dial_target(&key, dial_fingerprint(conn, &settings, &self.registry));
-            match self
-                .directory
-                .ensure_connection_with_settings(conn, settings)
-            {
+            config.set_broker_dial_target(&key, dial_fingerprint(conn, &target, &self.registry));
+            let ensured = match target {
+                DialTarget::Real(settings) => self
+                    .directory
+                    .ensure_connection_with_settings(conn, settings),
+                DialTarget::Sim(settings, device) => self
+                    .directory
+                    .ensure_simulated_connection(conn, settings, device),
+            };
+            match ensured {
                 Ok(handle) => {
                     handles.insert(key, handle.read_only());
                 }

@@ -42,7 +42,8 @@ async fn session_settings_check_uses_the_handle_generation_not_the_latest_publis
     let registry = crate::broker_glue::BrokerSimRegistry::new();
     let drivers = sessions.drivers().registry.clone();
     let old = slmp_conn_with_cpu(1, "R");
-    let (r_settings, changed) = registry.resolve(&old, &drivers).await.unwrap();
+    let (r_settings, changed) = registry.resolve(&old, &drivers).await;
+    let r_settings = r_settings.settings().clone();
     assert!(changed, "初回は changed");
     sessions
         .ensure_connection_with_settings(&old, r_settings.clone())
@@ -57,8 +58,8 @@ async fn session_settings_check_uses_the_handle_generation_not_the_latest_publis
     // 2. 読む前に、設定の反映が新しい Q を公開する（古いセッションはまだ生きている）。
     let (q_settings, changed) = registry
         .resolve(&slmp_conn_with_cpu(1, "Q"), &drivers)
-        .await
-        .unwrap();
+        .await;
+    let q_settings = q_settings.settings().clone();
     assert!(changed, "Q の公開は resolve で changed になる");
     let q = sessions.dial_fingerprint("slmp", Some(&slmp_conn_with_cpu(1, "Q")), &q_settings);
     assert_ne!(q, r);
@@ -68,8 +69,7 @@ async fn session_settings_check_uses_the_handle_generation_not_the_latest_publis
     // 同じ設定の再公開は changed にならない。
     let (_, changed) = registry
         .resolve(&slmp_conn_with_cpu(1, "Q"), &drivers)
-        .await
-        .unwrap();
+        .await;
     assert!(!changed);
 
     // 作り直したあとの handle は Q の指紋を持つ。
@@ -106,18 +106,15 @@ async fn a_changed_protocol_with_the_same_settings_changes_the_resolved_dial_ide
     let settings = || serde_json::json!({ "host": "10.0.0.1", "port": 502 });
     let (_, changed) = registry
         .resolve(&conn_with_settings("modbus-tcp", settings()), &drivers)
-        .await
-        .unwrap();
+        .await;
     assert!(changed);
     let (_, changed) = registry
         .resolve(&conn_with_settings("modbus-tcp", settings()), &drivers)
-        .await
-        .unwrap();
+        .await;
     assert!(!changed, "同じ protocol・設定は同じ同一性");
     let (_, changed) = registry
         .resolve(&conn_with_settings("slmp", settings()), &drivers)
-        .await
-        .unwrap();
+        .await;
     assert!(changed, "protocol だけ変えたらセッションの張り直し");
 }
 
@@ -135,25 +132,13 @@ async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identi
             }),
         )
     };
-    let (_, changed) = registry
-        .resolve(&modbus(1, "low_high"), &drivers)
-        .await
-        .unwrap();
+    let (_, changed) = registry.resolve(&modbus(1, "low_high"), &drivers).await;
     assert!(changed);
-    let (_, changed) = registry
-        .resolve(&modbus(1, "low_high"), &drivers)
-        .await
-        .unwrap();
+    let (_, changed) = registry.resolve(&modbus(1, "low_high"), &drivers).await;
     assert!(!changed);
-    let (_, changed) = registry
-        .resolve(&modbus(2, "low_high"), &drivers)
-        .await
-        .unwrap();
+    let (_, changed) = registry.resolve(&modbus(2, "low_high"), &drivers).await;
     assert!(changed, "unit_id の変更");
-    let (_, changed) = registry
-        .resolve(&modbus(2, "high_low"), &drivers)
-        .await
-        .unwrap();
+    let (_, changed) = registry.resolve(&modbus(2, "high_low"), &drivers).await;
     assert!(changed, "word_order の変更");
 }
 
@@ -261,16 +246,18 @@ async fn a_new_secret_reference_changes_the_resolved_dial_identity() {
     };
     let a = "0123456789abcdef0123456789abcdef";
     let b = "fedcba9876543210fedcba9876543210";
-    let (settings_a, changed) = registry.resolve(&pg(a), &drivers).await.unwrap();
+    let (settings_a, changed) = registry.resolve(&pg(a), &drivers).await;
+    let settings_a = settings_a.settings().clone();
     assert!(changed);
     assert_eq!(
         settings_a.get("password"),
         None,
         "値も参照も設定には入らない"
     );
-    let (_, changed) = registry.resolve(&pg(a), &drivers).await.unwrap();
+    let (_, changed) = registry.resolve(&pg(a), &drivers).await;
     assert!(!changed, "同じ参照は同じ同一性");
-    let (settings_b, changed) = registry.resolve(&pg(b), &drivers).await.unwrap();
+    let (settings_b, changed) = registry.resolve(&pg(b), &drivers).await;
+    let settings_b = settings_b.settings().clone();
     assert!(changed, "新しい参照はセッションの張り直し");
     assert_eq!(settings_a, settings_b, "違うのは参照だけ");
 }

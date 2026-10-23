@@ -80,6 +80,7 @@ impl SimState {
 /// シミュレーションの値の表。複製は同じ表を共有する。
 #[derive(Clone)]
 pub struct SimDevice {
+    id: u64,
     inner: Arc<Mutex<SimState>>,
     epoch: Instant,
 }
@@ -92,10 +93,18 @@ impl Default for SimDevice {
 
 impl SimDevice {
     pub fn new() -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         SimDevice {
+            id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             inner: Arc::new(Mutex::new(SimState::default())),
             epoch: Instant::now(),
         }
+    }
+
+    /// 生成ごとに一意の id（複製は同じ id を共有）。指紋の世代に使う
+    /// （#807 の P2）: 表が作り直されたことを、設定が同じでも見分ける。
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     fn state(&self) -> MutexGuard<'_, SimState> {

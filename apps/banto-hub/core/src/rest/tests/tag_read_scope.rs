@@ -308,12 +308,14 @@ fn rest_catalog_dto_separates_configured_and_effective_simulation() {
         true,
         true,
         &configured,
+        &crate::test_support::test_drivers().registry,
     ));
     assert!(!effective_simulation_for_connection(
         "modbus-tcp",
         true,
         true,
         &stopped,
+        &crate::test_support::test_drivers().registry,
     ));
     assert!(
         !CatalogTagEntry::from_runtime(&saved_simulation, &stopped, &map, &computed)
@@ -370,24 +372,28 @@ fn rest_connection_effective_simulation_returns_to_configured_value() {
         true,
         false,
         &all_simulation,
+        &crate::test_support::test_drivers().registry,
     ));
     assert!(!effective_simulation_for_connection(
         "modbus-tcp",
         true,
         false,
         &configured,
+        &crate::test_support::test_drivers().registry,
     ));
     assert!(!effective_simulation_for_connection(
         "modbus-tcp",
         true,
         false,
         &stopped,
+        &crate::test_support::test_drivers().registry,
     ));
     assert!(!effective_simulation_for_connection(
         "virtual",
         true,
         false,
         &all_simulation,
+        &crate::test_support::test_drivers().registry,
     ));
 }
 

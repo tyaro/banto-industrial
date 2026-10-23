@@ -73,7 +73,7 @@ fn tag_key(id: i64) -> String {
 /// address through the connection's driver (`parse_address`) and carries no
 /// per-protocol configuration ([`ProtocolConfig`]); whether a connection is
 /// collected at all is decided by the driver registry, not by this enum
-/// ([`simulator_protocol`] maps a name to it).
+/// ([`simulator_protocol`] maps a name to it, for the address notation only).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protocol {
     ModbusTcp,
@@ -706,9 +706,9 @@ impl ExclusionUnit {
 pub enum ExclusionReason {
     /// The connection's driver is in the registry but the broker does not
     /// read it (not a session-type driver - e.g. a host-provided one,
-    /// `banto_broker::is_broker_managed`), or the connection is
-    /// `simulation = true` and this crate has no simulator for its protocol
-    /// ([`simulator_protocol`]; such a connection is never dialed, R2b-3a-3).
+    /// `banto_broker::is_broker_managed`). A `simulation = true` connection
+    /// is no reason to exclude (R2b-5b: its session is the value layer's
+    /// `SimDevice`, for any broker-managed protocol).
     UnsupportedProtocol { protocol: String },
     /// #383 段階3 P3: a `"hub"` connection (banto-hub as a source,
     /// `banto_tags::HUB_PROTOCOL`) in a runtime that cannot subscribe to the
@@ -1429,9 +1429,8 @@ pub fn config_exclusions(
 /// driver refuses or whose settings shape is newer than the driver is excluded
 /// alone; the row itself is kept), and is then read through the broker when
 /// the broker reads its driver (`banto_broker::is_broker_managed`, the same
-/// predicate as the session sync) - except a `simulation = true` row whose
-/// protocol has no simulator ([`simulator_protocol`]), which is excluded so it
-/// never dials the real device.
+/// predicate as the session sync), `simulation = true` rows included (R2b-5b:
+/// a simulated session is the value layer's `SimDevice`, never the wire).
 fn resolve_connection<'a>(
     conn: &PlcConnection,
     hub: Option<HubSource<'a>>,
@@ -1470,17 +1469,11 @@ fn resolve_connection<'a>(
             protocol: conn.protocol.clone(),
         });
     }
-    // The simulator kind, if this crate has one for the protocol (picked by
-    // name until R2b-5). A `simulation = true` connection must never dial the
-    // real device: without a simulator it is not planned at all, and
-    // `BrokerSimRegistry::resolve` refuses it the same way, so no session is
-    // ensured for it.
+    // The address notation of the legacy save-time rule (R2b-7 removes it).
+    // Simulation needs no per-protocol support since R2b-5b: a
+    // `simulation = true` connection is planned like any other broker-managed
+    // one and its session is the value layer's `SimDevice`.
     let protocol = simulator_protocol(&conn.protocol);
-    if conn.simulation && protocol.is_none() {
-        return Err(ExclusionReason::UnsupportedProtocol {
-            protocol: conn.protocol.clone(),
-        });
-    }
     Ok(ResolvedConnection::Plc(
         protocol,
         ProtocolConfig::Broker(BrokerPlan {
@@ -1540,12 +1533,11 @@ fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
     Ok(tag.address.trim().to_string())
 }
 
-/// The simulator kind ([`Protocol`]) for a connection's protocol name, if this
-/// crate has one (R2b-3a-3: only the simulation and the notation in a tag's
-/// address message use it; whether a connection is collected is the driver
-/// registry's call, `resolve_connection`). `None` for every other driver - a
-/// `simulation = true` connection of such a protocol is neither planned nor
-/// dialed ([`crate::BrokerSimRegistry::resolve`]).
+/// The address notation ([`Protocol`]) for a connection's protocol name, if
+/// the legacy save-time rule has one (only the notation in a tag's address
+/// message uses it since R2b-5b; whether a connection is collected - or
+/// simulated - is the driver registry's call, `resolve_connection`). `None`
+/// for every other driver.
 pub(crate) fn simulator_protocol(protocol: &str) -> Option<Protocol> {
     match protocol {
         "modbus-tcp" => Some(Protocol::ModbusTcp),
@@ -4380,9 +4372,10 @@ mod tests {
     /// driver kind, not a protocol-name table. A session-type driver under a new id
     /// is planned (read through the broker); a host-provided one is not
     /// (`unsupportedProtocol`, as before); and a `simulation = true` connection of
-    /// a protocol without a simulator is excluded, so it is never dialed.
+    /// a session-type driver is planned like any other (R2b-5b: the session is
+    /// the value layer's `SimDevice`, so no protocol needs its own simulator).
     #[test]
-    fn the_plan_follows_the_driver_kind_and_never_plans_an_unsimulatable_simulation() {
+    fn the_plan_follows_the_driver_kind_and_plans_a_simulation_of_any_session_driver() {
         let mut registry = fake_registry(&[("fake-session", &[])]);
         registry
             .register(banto_driver_api::DriverEntry::host_provided(
@@ -4414,10 +4407,12 @@ mod tests {
             &registry,
         );
         let planned: Vec<&str> = config.connections.iter().map(|c| c.key.as_str()).collect();
-        assert_eq!(planned, vec!["conn:1"]);
+        assert_eq!(planned, vec!["conn:1", "conn:3"]);
         assert_eq!(
             config.broker_connection_keys(),
-            ["conn:1".to_string()].into_iter().collect()
+            ["conn:1".to_string(), "conn:3".to_string()]
+                .into_iter()
+                .collect()
         );
         assert_eq!(config.connections[0].groups[0].requests.len(), 1);
         let own: Vec<(i64, &str)> = exclusions
@@ -4425,11 +4420,8 @@ mod tests {
             .filter(|e| e.unit == ExclusionUnit::Connection)
             .map(|e| (e.id, e.reason.code()))
             .collect();
-        assert_eq!(
-            own,
-            vec![(2, "unsupportedProtocol"), (3, "unsupportedProtocol")]
-        );
-        // The built-in drivers' simulators are still picked by name.
+        assert_eq!(own, vec![(2, "unsupportedProtocol")]);
+        // The legacy save-time notation is still picked by name.
         assert_eq!(simulator_protocol("modbus-tcp"), Some(Protocol::ModbusTcp));
         assert_eq!(simulator_protocol("slmp"), Some(Protocol::Slmp));
         assert_eq!(simulator_protocol("fake-session"), None);

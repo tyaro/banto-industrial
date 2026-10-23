@@ -1,35 +1,40 @@
 //! [`BrokerSimRegistry`]: the simulation mode of a broker-read connection
-//! (T9-2, docs/ux-plan.md §1, 2026-08-06 オーナー決定) - the settings its
-//! broker session should actually dial, with `host`/`port` replaced by an
-//! in-process simulator's when `simulation = true`.
+//! (T9-2, docs/ux-plan.md §1, 2026-08-06 オーナー決定) - what its broker
+//! session should actually be: the real driver dialing the connection's own
+//! settings, or (`simulation = true`) the value layer's in-process
+//! [`SimDevice`] (R2b-5b, docs/banto-hub-driver-sim-design.md §4).
 //!
 //! Moved here from banto-hub's `broker_glue.rs` in R2b-3a-3
 //! (docs/banto-hub-driver-io-design.md §8): ChronoGazer reads through the
 //! broker too since then, and the registry has no banto-hub-specific
-//! dependency (it needs the connection row, the driver registry's secret keys
-//! for the fingerprint, and [`crate::simulation`]), so both apps share this
-//! one implementation. banto-hub re-exports it from `broker_glue`.
+//! dependency (it needs the connection row and the driver registry's secret
+//! keys for the fingerprint), so both apps share this one implementation.
+//! banto-hub re-exports it from `broker_glue`.
+//!
+//! Until R2b-5b this started a wire-protocol simulator on the loopback and
+//! swapped `host` / `port`; the session now reads and writes a table of values
+//! and no socket exists, so every broker-managed protocol (a Session or Frame
+//! driver in the registry) can be simulated, strings and addresses past the
+//! old simulator's 16 included.
 //!
 //! ## Why it runs before `ensure_connection`
 //!
 //! `banto_broker::SessionDirectory::ensure_connection_with_settings` reuses a
-//! session by connection id alone - it does not look at the settings again.
-//! So the simulator's address has to be known *before* the session is
-//! ensured: the caller calls [`BrokerSimRegistry::resolve`] for every
-//! broker-read connection first, and when it answers `changed`, removes the
-//! old session before ensuring a new one with the returned settings.
+//! session by connection id alone - it does not look at the settings (or at
+//! simulation on / off) again. So the target has to be known *before* the
+//! session is ensured: the caller calls [`BrokerSimRegistry::resolve`] for
+//! every broker-read connection first, and when it answers `changed`, removes
+//! the old session before ensuring a new one for the returned
+//! [`DialTarget`].
 //!
 //! This type was once called `SlmpSimRegistry` (SLMP-only at T9-2; renamed
 //! in #339 once it served every broker-managed protocol).
 
 use std::collections::HashMap;
 
-use banto_broker::SettingsFingerprint;
-use banto_driver_api::{keys, DriverRegistry, Settings};
+use banto_broker::{SettingsFingerprint, SimDevice};
+use banto_driver_api::{DriverRegistry, Settings};
 use banto_tags::PlcConnection;
-
-use crate::config::simulator_protocol;
-use crate::simulation::{self, SimulatorHandle};
 
 /// `protocol` のドライバの秘密のキー（無ければ空）。
 pub(crate) fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
@@ -39,38 +44,77 @@ pub(crate) fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-/// The settings fingerprint of a session of `conn` dialed with `settings`
-/// ([`SettingsFingerprint::of_connection`] with the driver's secret keys):
-/// the same rule as the broker's own handle, so a stamped plan
-/// (`CollectorConfig::set_broker_dial_target`) and a session agree.
+/// What a connection's broker session is made of (design §4.2): the real
+/// driver dialing `Settings`, or the value layer's [`SimDevice`] (the
+/// `Settings` are still the connection's own - `validate_config` runs on them
+/// either way, so a simulation that the real device would refuse is refused).
+#[derive(Clone)]
+pub enum DialTarget {
+    Real(Settings),
+    Sim(Settings, SimDevice),
+}
+
+impl DialTarget {
+    /// The connection's settings (never altered by the simulation).
+    pub fn settings(&self) -> &Settings {
+        match self {
+            DialTarget::Real(s) | DialTarget::Sim(s, _) => s,
+        }
+    }
+
+    /// Whether this is the simulator.
+    pub fn is_simulated(&self) -> bool {
+        matches!(self, DialTarget::Sim(..))
+    }
+}
+
+/// The settings fingerprint of a session of `conn` made for `target`
+/// ([`SettingsFingerprint::of_connection`], or its simulated form, with the
+/// driver's secret keys): the same rule as the broker's own handle, so a
+/// stamped plan (`CollectorConfig::set_broker_dial_target`) and a session
+/// agree - including the simulation mark.
 pub fn dial_fingerprint(
     conn: &PlcConnection,
-    settings: &Settings,
+    target: &DialTarget,
     registry: &DriverRegistry,
 ) -> SettingsFingerprint {
-    SettingsFingerprint::of_connection(
-        &conn.protocol,
-        Some(conn),
-        settings,
-        &secret_keys_of(registry, &conn.protocol),
-    )
+    let secret_keys = secret_keys_of(registry, &conn.protocol);
+    match target {
+        DialTarget::Sim(settings, device) => SettingsFingerprint::of_connection_simulated(
+            &conn.protocol,
+            Some(conn),
+            settings,
+            &secret_keys,
+            device.id(),
+        ),
+        DialTarget::Real(settings) => {
+            SettingsFingerprint::of_connection(&conn.protocol, Some(conn), settings, &secret_keys)
+        }
+    }
+}
+
+/// A connection's [`SimDevice`] and the protocol it was made for: a device is
+/// reused only by the same protocol (design §4.2).
+struct SimEntry {
+    protocol: String,
+    device: SimDevice,
 }
 
 /// See this module's doc. Built empty and grown by [`Self::resolve`]; held
 /// across reconfigurations next to the broker sessions it feeds, and shut
 /// down once, *after* those sessions ([`Self::shutdown`]).
 pub struct BrokerSimRegistry {
-    /// `simulation = true` として現在起動中のシミュレータ - 接続 id ごとに
-    /// 高々1個。[`Self::resolve`]が simulation フラグの on/off に応じて
-    /// 起動・停止する。
-    simulators: tokio::sync::Mutex<HashMap<i64, SimulatorHandle>>,
-    /// 各接続 id について直近に解決した設定の指紋
+    /// `simulation = true` の接続 id ごとの値の表（高々1個）。
+    /// [`Self::resolve`] が simulation フラグの on/off に応じて作る・捨てる。
+    devices: tokio::sync::Mutex<HashMap<i64, SimEntry>>,
+    /// 各接続 id について直近に解決した対象の指紋
     /// （[`SettingsFingerprint`]、R2b-3a-2。#605 では host/port と SLMP の CPU
-    /// 種別だった）- [`Self::resolve`]が「ダイヤルの設定が変わったか」を判定する
+    /// 種別だった）- [`Self::resolve`]が「対象が変わったか」を判定する
     /// ための唯一の情報源。エントリなし(`None`)は「初回」を意味し、常に
     /// "changed" 扱いになる。同じ IP・ポートで CPU を R→Q に変えても、Modbus の
-    /// ユニット ID・ワード順を変えても、ここが違えば `changed` になり、呼び出し側が
-    /// 古い broker セッションを捨てる（プロトコルに依らない）。
+    /// ユニット ID・ワード順を変えても、シミュレーションを切り替えても、ここが
+    /// 違えば `changed` になり、呼び出し側が古い broker セッションを捨てる
+    /// （プロトコルに依らない）。
     last_target: tokio::sync::Mutex<HashMap<i64, SettingsFingerprint>>,
 }
 
@@ -78,116 +122,103 @@ impl BrokerSimRegistry {
     /// 空のレジストリで開始する。
     pub fn new() -> Self {
         Self {
-            simulators: tokio::sync::Mutex::new(HashMap::new()),
+            devices: tokio::sync::Mutex::new(HashMap::new()),
             last_target: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// `conn`(broker が読む接続)が実際にダイヤルすべき設定（`Settings`）を解決する
-    /// （R2b-3a-2、docs/banto-hub-driver-io-design.md §4.4）。土台は接続の
-    /// `settings` を `banto_tags::settings_to_api` で直したもの（秘密の参照は
-    /// 入らない - 秘密は broker がダイヤルの直前にだけ開く）。
+    /// `conn`(broker が読む接続)の broker セッションの対象（[`DialTarget`]）を
+    /// 解決する（R2b-3a-2、docs/banto-hub-driver-io-design.md §4.4。R2b-5b で
+    /// 値の層へ）。土台は接続の `settings` を `banto_tags::settings_to_api` で
+    /// 直したもの（秘密の参照は入らない - 秘密は broker がダイヤルの直前に
+    /// だけ開く）。
     ///
-    /// - `conn.simulation == true` の場合: `conn.id`用のシミュレータが
-    ///   既に起動中ならそれを再利用し、なければ`conn.protocol`に応じた
-    ///   シミュレータ種別（`crate::config::simulator_protocol`: `"modbus-tcp"` /
-    ///   `"slmp"`）を [`simulation::start`] へ渡して新規に起動・登録し、設定の `host`/`port` を
-    ///   そのループバックのアドレスに差し替える（#131、2026-09-01: この protocol 分岐が
-    ///   無いと、Modbus 接続の simulation=true が SLMP シミュレータへ誤って差し替わって
-    ///   しまう。シミュレータの選び方は R2b-5 まで名前で選ぶ）。
-    /// - `conn.simulation == true` でシミュレータの無いプロトコルの場合:
-    ///   **`None` を返す**（R2b-3a-3）。実機の `host`/`port` を返さず、別の種類の
-    ///   シミュレータも立てない。呼び出し側はこの接続のセッションを張らない
-    ///   （既にあれば、ほかの不要になった接続と同じく、収集側のコミットが成功した
-    ///   後の後始末で止める。ここで directory から外すと、その停止が飛ばされ、
-    ///   古いセッションが実機へ繋がり続ける）。収集の計画もこの接続を除外している
-    ///   （`resolve_connection` の `UnsupportedProtocol`）。追跡していた
-    ///   シミュレータと `last_target` はここで忘れる。
-    /// - `conn.simulation == false` の場合: `conn.id`用のシミュレータが
-    ///   まだ追跡されていれば取り除いて停止する(もう不要なので)。設定はそのまま。
+    /// - `conn.simulation == true`: `conn.id` 用の [`SimDevice`] を作る（無ければ）
+    ///   か再利用して `Sim(settings, device)`。**再利用は同じ `protocol` のとき
+    ///   だけ**: `protocol` が変わっていれば古い表（held）を捨てて作り直す
+    ///   （前のドライバの held が、正規形の重なる新しいドライバのタグへ漏れない
+    ///   ように）。ホストもポートも差し替えない（ソケットは開かない）。
+    /// - `conn.simulation == false`: 持っていた [`SimDevice`] を捨てて
+    ///   `Real(settings)`。
     ///
-    /// いずれの場合も、返す設定の指紋（[`dial_fingerprint`]）を `last_target` に
-    /// 記録されている直前の値(`conn.id`が未記録なら常に「変わった」扱い)と比較して
-    /// `changed`を求め、`last_target`を更新してから`Some((設定, changed))`を返す。
+    /// いずれの場合も、対象の指紋（[`dial_fingerprint`]、シミュレーションの印つき）を
+    /// `last_target` に記録されている直前の値(`conn.id`が未記録なら常に「変わった」扱い)
+    /// と比較して`changed`を求め、`last_target`を更新してから返す。
     ///
     /// ## `changed`が重要な理由
     ///
     /// broker の `ensure_connection_with_settings` は接続 id だけで既存セッションを
     /// 再利用するので、呼び出し側は `changed == true` のたびに、ensure の*前*に
     /// その接続のセッションを取り除かなければならない - そうしなければ古い
-    /// セッション(シミュレーションを切ったあとの実ホスト、前回のシミュレータ、
-    /// 前の CPU 種別など)へ黙って接続し続けてしまう。さらに、動いている収集
-    /// タスクは古いハンドルを握っているので、呼び出し側は
-    /// `CollectorConfig::set_broker_dial_target` に同じ指紋を渡し、
-    /// `Collector::apply_config` がその接続を「replaced」に分類してタスクごと
-    /// 作り直すように仕向ける。
+    /// セッション(シミュレーションを切ったあとの表、前の CPU 種別など)へ黙って
+    /// 接続し続けてしまう。さらに、動いている収集タスクは古いハンドルを握って
+    /// いるので、呼び出し側は `CollectorConfig::set_broker_dial_target` に同じ
+    /// 指紋を渡し、`Collector::apply_config` がその接続を「replaced」に分類して
+    /// タスクごと作り直すように仕向ける。
     ///
-    /// 無関係な編集（同じ接続の別グループへのタグ追加など）では設定が変わらない
+    /// 無関係な編集（同じ接続の別グループへのタグ追加など）では対象が変わらない
     /// ので `changed` は `false` のまま。秘密値を差し替える（新しい参照で封印し直す）と
     /// 指紋が変わり `changed` になる。
     pub async fn resolve(
         &self,
         conn: &PlcConnection,
         registry: &DriverRegistry,
-    ) -> Option<(Settings, bool)> {
-        let mut settings = banto_tags::settings_to_api(&conn.settings);
-        let mut simulators = self.simulators.lock().await;
-        if conn.simulation {
-            // #131 (2026-09-01): select the simulator type from the
-            // connection's own protocol rather than hardcoding SLMP. Kept
-            // until R2b-5. R2b-3a-3: a protocol without a simulator is
-            // refused - never the real host, never another kind's simulator.
-            let Some(protocol) = simulator_protocol(&conn.protocol) else {
-                let stale = simulators.remove(&conn.id);
-                drop(simulators);
-                if let Some(handle) = stale {
-                    handle.stop().await;
+    ) -> (DialTarget, bool) {
+        let settings = banto_tags::settings_to_api(&conn.settings);
+        let target = {
+            let mut devices = self.devices.lock().await;
+            if conn.simulation {
+                let reusable = devices
+                    .get(&conn.id)
+                    .is_some_and(|e| e.protocol == conn.protocol);
+                if !reusable {
+                    devices.insert(
+                        conn.id,
+                        SimEntry {
+                            protocol: conn.protocol.clone(),
+                            device: SimDevice::new(),
+                        },
+                    );
                 }
-                self.last_target.lock().await.remove(&conn.id);
-                return None;
-            };
-            let addr = match simulators.get(&conn.id) {
-                Some(handle) => handle.addr(),
-                None => {
-                    let handle = simulation::start(protocol).await;
-                    let addr = handle.addr();
-                    simulators.insert(conn.id, handle);
-                    addr
-                }
-            };
-            settings.insert(keys::HOST, addr.ip().to_string());
-            settings.insert(keys::PORT, addr.port().to_string());
-        } else if let Some(handle) = simulators.remove(&conn.id) {
-            handle.stop().await;
-        }
-        drop(simulators);
+                let device = devices[&conn.id].device.clone();
+                DialTarget::Sim(settings, device)
+            } else {
+                devices.remove(&conn.id);
+                DialTarget::Real(settings)
+            }
+        };
 
-        let fingerprint = dial_fingerprint(conn, &settings, registry);
+        let fingerprint = dial_fingerprint(conn, &target, registry);
         let mut last_target = self.last_target.lock().await;
         let changed = last_target.get(&conn.id) != Some(&fingerprint);
         last_target.insert(conn.id, fingerprint);
-        Some((settings, changed))
+        (target, changed)
     }
 
-    /// `connection_id`用に追跡しているシミュレータ(あれば)を停止・忘却し、
+    /// `connection_id` の値の表(あれば)を返す - テストと診断の覗き窓
+    /// （[`SimDevice::get`] で書いた値を読み戻せる）。
+    pub async fn device(&self, connection_id: i64) -> Option<SimDevice> {
+        self.devices
+            .lock()
+            .await
+            .get(&connection_id)
+            .map(|e| e.device.clone())
+    }
+
+    /// `connection_id`用に追跡している値の表(あれば)を忘れ、
     /// `last_target`のエントリも忘れる。broker が読む接続の集合から外れた接続
     /// (削除・無効化・プロトコル変更)の掃除から呼ばれる - **対応する収集タスクが
-    /// 既に停止した後にのみ**呼び出すこと。
+    /// 既に停止し、セッションを止めた後にのみ**呼び出すこと。
     pub async fn remove(&self, connection_id: i64) {
-        if let Some(handle) = self.simulators.lock().await.remove(&connection_id) {
-            handle.stop().await;
-        }
+        self.devices.lock().await.remove(&connection_id);
         self.last_target.lock().await.remove(&connection_id);
     }
 
-    /// 追跡中の全シミュレータを停止する。broker セッションを止めた*後*に
-    /// 一度だけ呼ぶこと(シミュレータは、それをダイヤルする broker セッション
-    /// より長生きしなければならない)。
+    /// 追跡中の全ての値の表を忘れる。broker セッションを止めた*後*に
+    /// 一度だけ呼ぶこと(表は、それを読み書きする broker セッションより
+    /// 長生きしなければならない)。
     pub async fn shutdown(&self) {
-        let mut simulators = self.simulators.lock().await;
-        for (_, handle) in simulators.drain() {
-            handle.stop().await;
-        }
+        self.devices.lock().await.clear();
     }
 }
 
@@ -200,6 +231,8 @@ impl Default for BrokerSimRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_driver_api::{keys, DataType, TagKind, Value};
+    use std::sync::Arc;
 
     fn conn(protocol: &str, simulation: bool) -> PlcConnection {
         PlcConnection::from_settings(
@@ -216,34 +249,188 @@ mod tests {
         )
     }
 
-    /// R2b-3a-3: a `simulation = true` connection whose protocol has no
-    /// simulator is refused - no simulator of another kind, and never the real
-    /// host/port to dial.
+    /// R2b-5b: a simulated connection is a value table, never a socket - the
+    /// settings keep the connection's own host/port, and any broker-managed
+    /// protocol is simulated (no per-protocol simulator list any more).
     #[tokio::test]
-    async fn a_simulation_without_a_simulator_is_refused_not_dialed() {
+    async fn a_simulation_keeps_the_settings_and_makes_a_device() {
         let registry = banto_drivers::builtin().registry;
         let sims = BrokerSimRegistry::new();
-        assert!(sims
-            .resolve(&conn("fake-session", true), &registry)
-            .await
-            .is_none());
-        assert!(sims.simulators.lock().await.is_empty());
-        assert!(sims.last_target.lock().await.is_empty());
-
-        // Without simulation the connection's own settings are dialed.
-        let (settings, changed) = sims
-            .resolve(&conn("fake-session", false), &registry)
-            .await
-            .unwrap();
+        for protocol in ["modbus-tcp", "slmp", "fake-session"] {
+            let (target, _) = sims.resolve(&conn(protocol, true), &registry).await;
+            assert!(target.is_simulated());
+            assert_eq!(target.settings().get(keys::HOST), Some("192.0.2.1"));
+            assert!(sims.device(7).await.is_some());
+        }
+        let (target, changed) = sims.resolve(&conn("fake-session", false), &registry).await;
         assert!(changed);
-        assert_eq!(settings.get(keys::HOST), Some("192.0.2.1"));
-
-        // A built-in protocol still gets its simulator (loopback, not the host).
-        let (settings, _) = sims
-            .resolve(&conn("modbus-tcp", true), &registry)
-            .await
-            .unwrap();
-        assert_ne!(settings.get(keys::HOST), Some("192.0.2.1"));
+        assert!(!target.is_simulated());
+        assert!(sims.device(7).await.is_none());
         sims.shutdown().await;
+    }
+
+    /// The simulation mark is part of the fingerprint: on -> off -> on is a
+    /// change every time, and the registry's value equals the broker handle's
+    /// formula for the same target (design §12).
+    #[tokio::test]
+    async fn the_simulation_mark_changes_the_fingerprint() {
+        let registry = banto_drivers::builtin().registry;
+        let sims = BrokerSimRegistry::new();
+        let (_, c1) = sims.resolve(&conn("modbus-tcp", false), &registry).await;
+        let (_, c2) = sims.resolve(&conn("modbus-tcp", false), &registry).await;
+        let (_, c3) = sims.resolve(&conn("modbus-tcp", true), &registry).await;
+        let (_, c4) = sims.resolve(&conn("modbus-tcp", true), &registry).await;
+        let (_, c5) = sims.resolve(&conn("modbus-tcp", false), &registry).await;
+        assert_eq!((c1, c2, c3, c4, c5), (true, false, true, false, true));
+
+        let c = conn("modbus-tcp", true);
+        let (target, _) = sims.resolve(&c, &registry).await;
+        let keys = secret_keys_of(&registry, "modbus-tcp");
+        assert_eq!(
+            dial_fingerprint(&c, &target, &registry),
+            SettingsFingerprint::of_connection_simulated(
+                "modbus-tcp",
+                Some(&c),
+                target.settings(),
+                &keys,
+                match &target {
+                    DialTarget::Sim(_, d) => d.id(),
+                    _ => unreachable!(),
+                }
+            )
+        );
+        assert_ne!(
+            dial_fingerprint(&c, &target, &registry),
+            dial_fingerprint(&c, &DialTarget::Real(target.settings().clone()), &registry)
+        );
+    }
+
+    /// #807 P2: the fingerprint carries the table's generation. Reusing the
+    /// table keeps it; a rebuilt table (off -> on, or after `remove`) differs
+    /// even with identical settings.
+    #[tokio::test]
+    async fn a_rebuilt_table_has_another_fingerprint() {
+        let registry = banto_drivers::builtin().registry;
+        let sims = BrokerSimRegistry::new();
+        let c = conn("modbus-tcp", true);
+        let (t1, _) = sims.resolve(&c, &registry).await;
+        let f1 = dial_fingerprint(&c, &t1, &registry);
+        let (t2, changed) = sims.resolve(&c, &registry).await;
+        assert!(!changed);
+        assert_eq!(f1, dial_fingerprint(&c, &t2, &registry));
+
+        sims.resolve(&conn("modbus-tcp", false), &registry).await;
+        let (t3, _) = sims.resolve(&c, &registry).await;
+        assert_ne!(f1, dial_fingerprint(&c, &t3, &registry));
+
+        sims.remove(c.id).await;
+        let (t4, changed) = sims.resolve(&c, &registry).await;
+        assert!(changed);
+        assert_ne!(
+            dial_fingerprint(&c, &t3, &registry),
+            dial_fingerprint(&c, &t4, &registry)
+        );
+    }
+
+    /// Design §4.2: a device is reused by the same protocol only - a protocol
+    /// change drops its held values (they must not leak into the new
+    /// driver's tags).
+    #[tokio::test]
+    async fn changing_the_protocol_drops_the_held_values() {
+        let registry = banto_drivers::builtin().registry;
+        let sims = BrokerSimRegistry::new();
+        let (target, _) = sims.resolve(&conn("modbus-tcp", true), &registry).await;
+        let DialTarget::Sim(_, first) = target else {
+            panic!("simulated")
+        };
+        first.set("D100", TagKind::Numeric(DataType::I16), Value::F64(5.0));
+        assert_eq!(first.held_count(), 1);
+
+        // Same protocol again: the same table.
+        let (again, changed) = sims.resolve(&conn("modbus-tcp", true), &registry).await;
+        assert!(!changed);
+        let DialTarget::Sim(_, same) = again else {
+            panic!("simulated")
+        };
+        assert_eq!(same.held_count(), 1);
+
+        // Another protocol: a fresh table.
+        let (other, changed) = sims.resolve(&conn("slmp", true), &registry).await;
+        assert!(changed);
+        let DialTarget::Sim(_, fresh) = other else {
+            panic!("simulated")
+        };
+        assert_eq!(fresh.held_count(), 0);
+        assert_eq!(sims.device(7).await.unwrap().held_count(), 0);
+    }
+
+    /// Design §12: the fingerprint the registry stamps on a plan
+    /// (`dial_fingerprint`) is the one the broker's handle carries, for the
+    /// real and the simulated session alike - a mismatch would keep a
+    /// collection task on a stale handle ("replaced" never fires). The
+    /// simulated session also takes the registry check and `validate_config`
+    /// of the real one.
+    #[tokio::test]
+    async fn the_stamped_fingerprint_is_the_handles_own() {
+        let registry = Arc::new(banto_drivers::builtin().registry);
+        let supervisor = banto_broker::BrokerSupervisor::spawn_with(
+            &[],
+            registry.clone(),
+            banto_broker::BrokerOptions::default(),
+        )
+        .unwrap();
+        let directory = supervisor.directory();
+        let sims = BrokerSimRegistry::new();
+
+        let sim_conn = conn("modbus-tcp", true);
+        let (target, _) = sims.resolve(&sim_conn, &registry).await;
+        let DialTarget::Sim(settings, device) = target.clone() else {
+            panic!("simulated")
+        };
+        let handle = directory
+            .ensure_simulated_connection(&sim_conn, settings, device)
+            .unwrap();
+        assert_eq!(
+            handle.settings_fingerprint(),
+            Some(dial_fingerprint(&sim_conn, &target, &registry))
+        );
+        directory.remove(sim_conn.id);
+
+        let real_conn = conn("modbus-tcp", false);
+        let (target, _) = sims.resolve(&real_conn, &registry).await;
+        let DialTarget::Real(settings) = target.clone() else {
+            panic!("real")
+        };
+        let handle = directory
+            .ensure_connection_with_settings(&real_conn, settings)
+            .unwrap();
+        assert_eq!(
+            handle.settings_fingerprint(),
+            Some(dial_fingerprint(&real_conn, &target, &registry))
+        );
+        directory.remove(real_conn.id);
+
+        // The same checks as the real session's.
+        let unknown = conn("no-such-protocol", true);
+        assert!(matches!(
+            directory.ensure_simulated_connection(
+                &unknown,
+                banto_tags::settings_to_api(&unknown.settings),
+                SimDevice::new()
+            ),
+            Err(banto_broker::BrokerError::UnsupportedProtocol { .. })
+        ));
+        let mut bad = conn("modbus-tcp", true);
+        bad.settings
+            .insert("host".to_string(), serde_json::json!(""));
+        assert!(matches!(
+            directory.ensure_simulated_connection(
+                &bad,
+                banto_tags::settings_to_api(&bad.settings),
+                SimDevice::new()
+            ),
+            Err(banto_broker::BrokerError::InvalidSettings { .. })
+        ));
+        supervisor.shutdown().await;
     }
 }

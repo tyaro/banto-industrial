@@ -207,6 +207,7 @@ use banto_driver_api::{
     ConnectContext, DriverKind, DriverRegistry, FatalError, ItemError, Session, SessionDriver,
     Settings, TagSpec, Value, WordOrder, WriteItem,
 };
+pub use banto_driver_engine::sim::SimDevice;
 use banto_tags::PlcConnection;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -419,6 +420,33 @@ impl SettingsFingerprint {
         settings: &Settings,
         secret_keys: &[String],
     ) -> Self {
+        Self::of_connection_marked(protocol, conn, settings, secret_keys, None)
+    }
+
+    /// [`Self::of_connection`] for a session of the value layer's simulator
+    /// (R2b-5b, design §4.1): the same inputs plus a simulation mark, so the
+    /// fingerprint differs from the real session's even with identical
+    /// settings (the simulator ignores `host` / `port`, so nothing else would
+    /// tell the two apart). `device_id` ([`SimDevice::id`]) is its
+    /// generation: a rebuilt table is another session even with the same
+    /// settings (#807 P2 - the loopback port that used to differ is gone).
+    pub fn of_connection_simulated(
+        protocol: &str,
+        conn: Option<&PlcConnection>,
+        settings: &Settings,
+        secret_keys: &[String],
+        device_id: u64,
+    ) -> Self {
+        Self::of_connection_marked(protocol, conn, settings, secret_keys, Some(device_id))
+    }
+
+    fn of_connection_marked(
+        protocol: &str,
+        conn: Option<&PlcConnection>,
+        settings: &Settings,
+        secret_keys: &[String],
+        simulated: Option<u64>,
+    ) -> Self {
         let mut pairs: Vec<(&str, &str)> = settings
             .iter()
             .filter(|s| !secret_keys.contains(&s.key))
@@ -444,6 +472,10 @@ impl SettingsFingerprint {
         protocol.hash(&mut hasher);
         pairs.hash(&mut hasher);
         refs.hash(&mut hasher);
+        if let Some(device_id) = simulated {
+            "\u{0}sim".hash(&mut hasher);
+            device_id.hash(&mut hasher);
+        }
         SettingsFingerprint(hasher.finish())
     }
 }
@@ -895,6 +927,51 @@ impl SessionDirectory {
         conn: &PlcConnection,
         settings: Settings,
     ) -> Result<BrokerHandle, BrokerError> {
+        self.ensure_with(conn, settings, None, |driver, settings, secret_keys| {
+            session_connector(
+                conn.clone(),
+                Arc::clone(driver),
+                settings,
+                secret_keys,
+                self.options.timeouts,
+                Arc::clone(&self.options.secrets),
+            )
+        })
+    }
+
+    /// As [`Self::ensure_connection_with_settings`], but the session is the
+    /// value layer's [`SimDevice`] instead of the wire (R2b-5b,
+    /// docs/banto-hub-driver-sim-design.md §4.1): no dial, no secrets opened.
+    /// The registry check and `validate_config` are the same - a simulation
+    /// that would not work against the real device is refused too. The
+    /// handle's fingerprint carries the simulation mark
+    /// ([`SettingsFingerprint::of_connection_simulated`]), so switching a
+    /// connection's simulation on or off is always a "changed" one.
+    pub fn ensure_simulated_connection(
+        &self,
+        conn: &PlcConnection,
+        settings: Settings,
+        device: SimDevice,
+    ) -> Result<BrokerHandle, BrokerError> {
+        let sim_id = Some(device.id());
+        self.ensure_with(conn, settings, sim_id, |_, _, _| {
+            Arc::new(move || {
+                let session = device.connect();
+                Box::pin(async move { Ok(session) })
+            })
+        })
+    }
+
+    /// The shared body of the two `ensure_*` entry points: the registry
+    /// check, `validate_config`, the existing-session reuse and the task
+    /// spawn; `make_connector` builds the only part that differs.
+    fn ensure_with(
+        &self,
+        conn: &PlcConnection,
+        settings: Settings,
+        simulated: Option<u64>,
+        make_connector: impl FnOnce(&Arc<dyn SessionDriver>, Settings, Vec<String>) -> Connector,
+    ) -> Result<BrokerHandle, BrokerError> {
         let resolved = resolve_session_driver(&self.registry, &conn.protocol).ok_or_else(|| {
             BrokerError::UnsupportedProtocol {
                 connection_id: conn.id,
@@ -921,16 +998,14 @@ impl SessionDirectory {
         }
 
         let secret_keys = driver.secret_keys();
-        let fingerprint =
-            SettingsFingerprint::of_connection(&conn.protocol, Some(conn), &settings, &secret_keys);
-        let connector = session_connector(
-            conn.clone(),
-            Arc::clone(driver),
-            settings,
-            secret_keys,
-            self.options.timeouts,
-            Arc::clone(&self.options.secrets),
+        let fingerprint = SettingsFingerprint::of_connection_marked(
+            &conn.protocol,
+            Some(conn),
+            &settings,
+            &secret_keys,
+            simulated,
         );
+        let connector = make_connector(driver, settings, secret_keys);
         let connect_limit = resolved.connect_limit(self.options.timeouts);
         let (mut handle, task) = spawn_task_with_connector_limit(
             conn.id,
