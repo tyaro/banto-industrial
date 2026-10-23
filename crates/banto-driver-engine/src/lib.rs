@@ -4,7 +4,11 @@
 //! 成功した時だけ戻すため、外側の future のキャンセルでも接続を再利用しない。
 //! broker は Frame をこの Session で実行する。接続の外側期限は TCP 接続 +
 //! 32 step × response_timeout + CLOSE_TIMEOUT + ゆとりを含む。
-//! シリアルの同期、旧 I/O の削除は後続の PR で行う。
+//! シリアルの同期（設計 §7.3）は後続の PR で行う。
+//! 各 step の送信の前に、ドライバの `inter_frame_gap`（Modbus RTU の t3.5）だけ、
+//! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
+//! シリアルの send は flush（Unix では同期の tcdrain で runtime を止める）を呼ばないので、
+//! 送り終えた時刻は `Transport::tx_time` で見積もる。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
@@ -18,12 +22,17 @@ use banto_driver_api::{
     ItemError, PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value,
     WriteItem, WriteProgress,
 };
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
 
 pub const MAX_HANDSHAKE_STEPS: usize = 32;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+/// `inter_frame_gap` の上限。これを超える値はドライバの契約違反として、送信の前に
+/// `FatalError::Protocol` で断る（縮めない。API は「エンジンが守る最小の無音」と定めている）。
+/// 待ちは step の応答の期限 T の中に入る（T がこれより短ければ、待ちの途中で期限が来て `Timeout` になる）。
+/// 300 baud 8N1 の t3.5 でも約 117 ms。
+pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
 
 /// 適合テストとホストの診断で観測する出来事。通信の結果は変えない。
 #[derive(Debug, Clone)]
@@ -53,6 +62,16 @@ struct Core {
     response_timeout: Duration,
     can_write: bool,
     events: Option<Arc<dyn EngineEvents>>,
+    /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。
+    last_quiet_from: Option<Instant>,
+}
+
+/// 前のフレームの最後のバイトの時刻 `from` から `gap` が過ぎるまで待つ（`gap` は呼び手が
+/// `MAX_INTER_FRAME_GAP` 以下を確かめ済み）。`gap` が 0 か `from` が無いなら待たない。
+async fn wait_quiet(from: Option<Instant>, gap: Duration) {
+    if let (Some(from), false) = (from, gap.is_zero()) {
+        tokio::time::sleep_until(from + gap).await;
+    }
 }
 
 /// 1 接続につき 1 個だけを作り、読み書きを直列に呼ぶ。
@@ -95,6 +114,7 @@ impl FrameSession {
             response_timeout,
             can_write: driver.descriptor().capabilities.write,
             events,
+            last_quiet_from: None,
         };
         let result = core.handshake().await;
         match result {
@@ -222,11 +242,24 @@ impl Session for FrameSession {
         Box::pin(async move {
             if let Some(mut core) = self.core.take() {
                 if let Some(step) = core.conn.farewell() {
-                    // 別れの応答は待たず、送信にも期限を掛ける。
-                    let _ = timeout(
-                        core.response_timeout.min(Duration::from_secs(1)),
-                        core.transport.send(&step.send),
-                    )
+                    // 別れの応答は待たず、送信（と手前の無音の待ち）にも期限を掛ける。
+                    let gap = core.conn.inter_frame_gap();
+                    if gap > MAX_INTER_FRAME_GAP {
+                        // 応答を待たない後始末なので、送らずに閉じる（違反の記録は残す）。
+                        let _ = core.gap_violation(gap);
+                        core.close().await;
+                        return;
+                    }
+                    let from = core.last_quiet_from;
+                    let _ = timeout(core.response_timeout.min(Duration::from_secs(1)), async {
+                        wait_quiet(from, gap).await;
+                        let send_start = Instant::now();
+                        if core.transport.send(&step.send).await.is_ok() {
+                            // シリアルの send は drain しないので、閉じると
+                            // 送信待ちのフレームが切れるので、送り終えの見積もりまで待ってから閉じる。
+                            sleep_until(send_start + core.transport.tx_time(step.send.len())).await;
+                        }
+                    })
                     .await;
                 }
                 core.close().await;
@@ -251,6 +284,13 @@ impl Core {
             },
         );
         FatalError::Protocol(detail)
+    }
+
+    fn gap_violation(&self, gap: Duration) -> FatalError {
+        self.violation_fatal(
+            "C9",
+            format!("inter_frame_gap {gap:?} が上限 {MAX_INTER_FRAME_GAP:?} を超えている"),
+        )
     }
 
     async fn close(&mut self) {
@@ -398,14 +438,28 @@ impl Core {
         if let Some(events) = &self.events {
             events.record(EngineEvent::StepStarted(step.clone()));
         }
+        // 期限は待ちの前に決める。フレーム間の無音（設計 §7.3.1）の待ちも step の応答の期限 T の中
+        // （長さは MAX_INTER_FRAME_GAP 以下）。broker の外側の上限 `2T × step 上限 + 1 秒` の前提を保つ。
         let deadline = Instant::now()
             .checked_add(self.response_timeout)
             .ok_or_else(|| {
                 FatalError::InvalidConfig("応答の期限が時刻の範囲を超えました".into())
             })?;
+        let gap = self.conn.inter_frame_gap();
+        if gap > MAX_INTER_FRAME_GAP {
+            return Err(self.gap_violation(gap));
+        }
+        timeout_at(deadline, wait_quiet(self.last_quiet_from, gap))
+            .await
+            .map_err(|_| FatalError::Timeout)?;
+        // tx_time の見積もりの起点は、待ちの後の時刻。
+        let send_start = Instant::now();
         timeout_at(deadline, self.transport.send(&step.send))
             .await
             .map_err(|_| FatalError::Timeout)??;
+        // 送り終えた時刻の見積もり: send が返った時刻と、開始 + バイト数 × 1 文字の時間の遅い方。
+        let sent_at = Instant::now().max(send_start + self.transport.tx_time(step.send.len()));
+        self.last_quiet_from = Some(sent_at);
         if matches!(step.expect, FrameRule::None) {
             return Ok(Vec::new());
         }
@@ -419,6 +473,11 @@ impl Core {
             let n = timeout_at(deadline, self.transport.recv(&mut buf))
                 .await
                 .map_err(|_| FatalError::Timeout)??;
+            let received_at = Instant::now();
+            self.last_quiet_from = Some(
+                self.last_quiet_from
+                    .map_or(received_at, |t| t.max(received_at)),
+            );
             if n == 0 {
                 return Err(FatalError::Io("相手が接続を閉じた".into()));
             }

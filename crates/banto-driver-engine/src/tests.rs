@@ -47,6 +47,16 @@ struct Wire {
     pending_send: bool,
     pending_close: bool,
     zero_recv: bool,
+    /// 送信を始めた時刻・返った時刻と受信が返った時刻（止めた時計の Instant）。
+    log: Log,
+    tx_time: Duration,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Kind {
+    SendStart,
+    SendReturned,
+    Recv,
+    Close,
 }
 impl Wire {
     fn new(stats: Arc<Stats>) -> Self {
@@ -58,6 +68,8 @@ impl Wire {
             pending_send: false,
             pending_close: false,
             zero_recv: false,
+            log: Arc::default(),
+            tx_time: Duration::ZERO,
         }
     }
 }
@@ -67,13 +79,24 @@ impl Drop for Wire {
     }
 }
 impl Transport for Wire {
+    fn tx_time(&self, len: usize) -> Duration {
+        self.tx_time * len as u32
+    }
     fn send<'a>(&'a mut self, _bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
         Box::pin(async move {
             self.stats.sends.fetch_add(1, Ordering::SeqCst);
+            self.log
+                .lock()
+                .unwrap()
+                .push((Kind::SendStart, Instant::now()));
             if self.pending_send {
                 std::future::pending::<()>().await;
             }
             tokio::time::sleep(self.send_delay).await;
+            self.log
+                .lock()
+                .unwrap()
+                .push((Kind::SendReturned, Instant::now()));
             Ok(())
         })
     }
@@ -86,6 +109,7 @@ impl Transport for Wire {
             let bytes = self.chunks.pop_front().unwrap_or_else(|| vec![7]);
             let n = bytes.len();
             buf.extend(bytes);
+            self.log.lock().unwrap().push((Kind::Recv, Instant::now()));
             Ok(n)
         })
     }
@@ -97,6 +121,7 @@ impl Transport for Wire {
     fn close(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.stats.closes.fetch_add(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push((Kind::Close, Instant::now()));
             if self.pending_close {
                 std::future::pending::<()>().await;
             }
@@ -120,6 +145,7 @@ struct Conn {
     check: Option<FrameCheck>,
     error: Option<(&'static str, FatalError)>,
     farewell: bool,
+    gap: Duration,
 }
 impl Conn {
     fn new(stats: Arc<Stats>) -> Self {
@@ -138,6 +164,7 @@ impl Conn {
             check: None,
             error: None,
             farewell: false,
+            gap: Duration::ZERO,
         }
     }
     fn fail(&self, method: &str) -> Result<(), FatalError> {
@@ -163,6 +190,9 @@ impl FrameConnection for Conn {
     }
     fn farewell(&mut self) -> Option<Step> {
         self.farewell.then(|| self.step.clone())
+    }
+    fn inter_frame_gap(&self) -> Duration {
+        self.gap
     }
     fn is_complete(&self, _step: &Step, _buf: &[u8]) -> Result<FrameCheck, FatalError> {
         self.fail("is_complete")?;
@@ -280,6 +310,7 @@ fn session(conn: Conn, wire: Wire, events: Arc<Recorder>) -> FrameSession {
             response_timeout: T,
             can_write: true,
             events: Some(events),
+            last_quiet_from: None,
         }),
     }
 }
@@ -888,4 +919,235 @@ async fn tcp_transport_receives_split_data_and_closes_on_eof() {
     ));
     timeout(T, transport.close()).await.unwrap();
     timeout(T, peer).await.unwrap().unwrap();
+}
+
+// ---- フレーム間の無音（設計 §7.3.1）----
+
+type Log = Arc<Mutex<Vec<(Kind, Instant)>>>;
+
+/// 各送信の開始と、その直前に最後に起きた「送信が返った・受信が返った」時刻との間隔の最小値。
+fn min_spacing(log: &Log) -> Option<Duration> {
+    let log = log.lock().unwrap();
+    let mut quiet_from: Option<Instant> = None;
+    let mut min: Option<Duration> = None;
+    for &(kind, at) in log.iter() {
+        match kind {
+            Kind::SendStart => {
+                if let Some(from) = quiet_from {
+                    let d = at.duration_since(from);
+                    min = Some(min.map_or(d, |m| m.min(d)));
+                }
+            }
+            Kind::SendReturned | Kind::Recv => quiet_from = Some(at),
+            Kind::Close => {}
+        }
+    }
+    min
+}
+
+fn three_specs() -> Vec<TagSpec> {
+    vec![spec(), spec(), spec()]
+}
+
+fn three_step_conn(stats: Arc<Stats>, gap: Duration) -> Conn {
+    let mut conn = Conn::new(stats);
+    conn.gap = gap;
+    conn.plan = Some(
+        (0..3)
+            .map(|i| Planned::new(conn.step.clone(), vec![i]))
+            .collect(),
+    );
+    conn.write_steps = 3;
+    conn.write_covers = vec![0];
+    conn
+}
+
+async fn run_read_and_write(gap: Duration) -> Log {
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.send_delay = Duration::from_micros(300);
+    wire.recv_delay = Duration::from_millis(2);
+    let log = wire.log.clone();
+    let mut s = session(three_step_conn(stats.clone(), gap), wire, Arc::default());
+    s.read_batch(&three_specs()).await.unwrap();
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 3);
+    s.write_batch(&[item()]).await.unwrap();
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 6);
+    log
+}
+
+#[tokio::test(start_paused = true)]
+async fn consecutive_steps_keep_the_inter_frame_gap() {
+    // 9600 8N1 の t3.5、8E1 の t3.5、19200 baud 超の固定 1.75 ms。
+    for gap in [
+        Duration::from_micros(3650),
+        Duration::from_micros(4010),
+        Duration::from_micros(1750),
+    ] {
+        let log = run_read_and_write(gap).await;
+        let spacing = min_spacing(&log).unwrap();
+        assert!(spacing >= gap, "gap {gap:?}: 最小の間隔は {spacing:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn without_a_gap_the_same_measurement_sees_a_short_spacing() {
+    // 反証: 間隔が 0 なら、同じ測り方で t3.5 未満の間隔が検出される。
+    let log = run_read_and_write(Duration::ZERO).await;
+    let spacing = min_spacing(&log).unwrap();
+    assert!(spacing < Duration::from_micros(1750), "{spacing:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gap_over_the_cap_is_refused_before_any_send() {
+    let stats = Arc::<Stats>::default();
+    let wire = Wire::new(stats.clone());
+    let events = Arc::<Recorder>::default();
+    let over = MAX_INTER_FRAME_GAP + Duration::from_millis(1);
+    let mut s = session(three_step_conn(stats.clone(), over), wire, events.clone());
+    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(10);
+    let err = s.read_batch(&three_specs()).await.unwrap_err();
+    assert!(matches!(err, FatalError::Protocol(_)), "{err:?}");
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert!(events.has("C9"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gap_of_exactly_the_cap_is_accepted_and_kept() {
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = Duration::from_millis(90);
+    let log = wire.log.clone();
+    let mut s = session(
+        three_step_conn(stats, MAX_INTER_FRAME_GAP),
+        wire,
+        Arc::default(),
+    );
+    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(10);
+    s.read_batch(&three_specs()).await.unwrap();
+    let spacing = min_spacing(&log).unwrap();
+    assert!(spacing >= MAX_INTER_FRAME_GAP, "{spacing:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_farewell_is_not_sent_when_the_gap_is_over_the_cap() {
+    let stats = Arc::<Stats>::default();
+    let wire = Wire::new(stats.clone());
+    let events = Arc::<Recorder>::default();
+    let mut conn = three_step_conn(
+        stats.clone(),
+        MAX_INTER_FRAME_GAP + Duration::from_millis(1),
+    );
+    conn.farewell = true;
+    let mut s = session(conn, wire, events.clone());
+    s.disconnect().await;
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+    assert!(events.has("C9"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_gap_wait_counts_against_a_shorter_response_deadline() {
+    // gap 4 ms > T 2 ms: 前のフレームの直後の次の step は、待ちの途中で期限が来て Timeout になる。
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = Duration::from_millis(1);
+    let mut s = session(
+        three_step_conn(stats.clone(), Duration::from_millis(4)),
+        wire,
+        Arc::default(),
+    );
+    s.core.as_mut().unwrap().response_timeout = Duration::from_millis(2);
+    let err = s.read_batch(&three_specs()).await.unwrap_err();
+    assert!(format!("{err:?}").contains("Timeout"), "{err:?}");
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_next_send_waits_for_the_estimated_end_of_transmission() {
+    // FrameRule::None の step（応答なし）の後は、送り終えた時刻の見積もりから gap を空ける。
+    let gap = Duration::from_millis(2);
+    for (send_delay, tx_per_byte, busy) in [
+        // drain が速い（send がすぐ返る）: 見積もりの 5 ms が効く。
+        (
+            Duration::ZERO,
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        ),
+        // drain が遅い: send が返った時刻が効く。
+        (
+            Duration::from_millis(10),
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        ),
+    ] {
+        let stats = Arc::<Stats>::default();
+        let mut wire = Wire::new(stats.clone());
+        wire.send_delay = send_delay;
+        wire.tx_time = tx_per_byte; // step.send は 1 バイト
+        let log = wire.log.clone();
+        let mut conn = three_step_conn(stats, gap);
+        let none = Step::new(vec![1], FrameRule::None, 32);
+        conn.plan = Some(
+            (0..2)
+                .map(|i| Planned::new(none.clone(), vec![i]))
+                .collect(),
+        );
+        let mut s = session(conn, wire, Arc::default());
+        s.read_batch(&[spec(), spec()]).await.unwrap();
+        let starts: Vec<Instant> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(k, _)| *k == Kind::SendStart)
+            .map(|(_, t)| *t)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        let between = starts[1] - starts[0];
+        assert!(between >= busy + gap, "{between:?} < {busy:?} + {gap:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_farewell_keeps_the_gap_too() {
+    let gap = Duration::from_millis(3);
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = Duration::from_millis(1);
+    let log = wire.log.clone();
+    let mut conn = three_step_conn(stats, gap);
+    conn.farewell = true;
+    let mut s = session(conn, wire, Arc::default());
+    s.read_batch(&three_specs()).await.unwrap();
+    s.disconnect().await;
+    let sends = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| *k == Kind::SendStart)
+        .count();
+    assert_eq!(sends, 4);
+    let spacing = min_spacing(&log).unwrap();
+    assert!(spacing >= gap, "{spacing:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_farewell_waits_for_the_tx_estimate_before_closing() {
+    // tx_time が farewell の期限（1 秒）より短いときは、見積もりまで待ってから閉じる。
+    // 長いときは、期限の時点で閉じる（close が期限を超えて遅れない）。
+    for (tx_ms, expected_ms) in [(300u64, 300u64), (5000, 1000)] {
+        let stats = Arc::<Stats>::default();
+        let mut wire = Wire::new(stats.clone());
+        wire.tx_time = Duration::from_millis(tx_ms); // step.send は 1 バイト
+        let log = wire.log.clone();
+        let mut conn = Conn::new(stats);
+        conn.farewell = true;
+        let mut s = session(conn, wire, Arc::default());
+        s.core.as_mut().unwrap().response_timeout = Duration::from_secs(30);
+        s.disconnect().await;
+        let log = log.lock().unwrap();
+        let at = |kind| log.iter().find(|(k, _)| *k == kind).unwrap().1;
+        let elapsed = at(Kind::Close) - at(Kind::SendStart);
+        assert_eq!(elapsed, Duration::from_millis(expected_ms), "tx={tx_ms}");
+    }
 }
