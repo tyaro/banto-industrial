@@ -495,6 +495,45 @@ impl ResolvedSessionDriver {
         };
         limit.saturating_add(CONNECT_SLACK)
     }
+
+    /// The release of a one-off dial outside a broker task (the Hub's
+    /// connection test): dropping the returned guard closes the serial line
+    /// `settings` dial in the engine's table, but only if this resolver's dial
+    /// leased it last (its owner mark, io-design §7.3), so a line a broker
+    /// task is using - the one-off dial is refused as "in use" and leaves the
+    /// mark alone - stays open. Without it a failed, timed-out or cancelled
+    /// one-off dial leaves its line open in the table (a driver without a sync
+    /// procedure even leaves it quarantined with no owner to release it).
+    /// Create it before `connect` and keep it until after `disconnect`, so
+    /// every exit (error, timeout, the future dropped) runs it; closing again
+    /// after a successful `disconnect` is harmless. No-op for TCP and Session
+    /// drivers.
+    pub fn one_shot_line(&self, settings: &Settings) -> OneShotLine {
+        OneShotLine {
+            line: self
+                .frame
+                .as_ref()
+                .and_then(|dial| Some((dial.line_key(settings)?, dial.owner))),
+        }
+    }
+}
+
+/// Closes a one-off dial's serial line when dropped (see
+/// [`ResolvedSessionDriver::one_shot_line`]).
+#[must_use = "dropping the guard releases the line at once"]
+pub struct OneShotLine {
+    line: Option<(
+        banto_driver_engine::line::LineKey,
+        banto_driver_engine::line::LineOwner,
+    )>,
+}
+
+impl Drop for OneShotLine {
+    fn drop(&mut self) {
+        if let Some((key, owner)) = self.line.take() {
+            banto_driver_engine::line::LineTable::global().close_by(&key, owner);
+        }
+    }
 }
 
 /// Resolve the same Session / Frame entries accepted by [`is_broker_managed`].

@@ -1066,3 +1066,191 @@ async fn an_old_task_ending_after_a_replacement_leased_the_line_leaves_that_line
     supervisor.shutdown().await;
     server.abort();
 }
+
+/// A registry with the test Frame driver on `serial_over_tcp`, with the sync
+/// procedure and `handshake` handshake steps.
+fn serial_registry(handshake: usize) -> Arc<DriverRegistry> {
+    let mut driver = Driver::new(Arc::<Stats>::default(), 0);
+    driver.descriptor.transports = vec![banto_driver_api::Transport::SerialOverTcp];
+    driver.sync = true;
+    driver.handshake = handshake;
+    let mut registry = DriverRegistry::new();
+    registry
+        .register(DriverEntry::frame(Arc::new(driver)))
+        .unwrap();
+    Arc::new(registry)
+}
+
+fn serial_settings(port: u16) -> Settings {
+    Settings::from_pairs([
+        ("host", "127.0.0.1"),
+        ("port", port.to_string().as_str()),
+        ("transport", "serial_over_tcp"),
+    ])
+    .unwrap()
+}
+
+/// A converter that echoes the request's first byte except the handshake's
+/// `H` (silence), signals each `H` on `heard`, and ends when the socket closes.
+async fn silent_on_handshake(
+    listener: tokio::net::TcpListener,
+    heard: tokio::sync::mpsc::UnboundedSender<()>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (mut stream, _) = listener.accept().await.unwrap();
+    let mut b = [0];
+    while stream.read(&mut b).await.unwrap_or(0) == 1 {
+        if b[0] == b'H' {
+            let _ = heard.send(());
+            continue;
+        }
+        stream.write_all(&b).await.unwrap();
+    }
+}
+
+/// Codex P2 on #801: a one-off dial outside a broker task (the Hub's connection
+/// test) that fails mid-handshake returns its line, open, to the table; only
+/// the one-off release closes it. Fails when the guard does nothing.
+#[tokio::test]
+async fn a_one_shot_dial_failing_mid_handshake_releases_its_line() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (heard, _heard_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(silent_on_handshake(listener, heard));
+    let registry = serial_registry(1);
+    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let settings = serial_settings(port);
+    let key = LineKey::SerialOverTcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+
+    let guard = resolved.one_shot_line(&settings);
+    let failed = resolved
+        .driver()
+        .connect(&settings, ConnectContext::new("test", T, T))
+        .await;
+    assert!(failed.is_err(), "the handshake times out");
+    let line = LineTable::global()
+        .line(&key)
+        .expect("the fatal returns the line to the table");
+    assert!(line.is_open(), "the fatal keeps the port open");
+
+    drop(guard);
+    assert!(
+        LineTable::global().line(&key).is_none(),
+        "the one-off release takes the line out of the table"
+    );
+    assert!(!line.is_open());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the socket is closed by the release")
+        .unwrap();
+}
+
+/// The same when the one-off dial is cancelled (the HTTP request dropped)
+/// while it waits for the handshake's answer.
+#[tokio::test]
+async fn a_cancelled_one_shot_dial_releases_its_line() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (heard, mut heard_rx) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(silent_on_handshake(listener, heard));
+    let registry = serial_registry(1);
+    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let settings = serial_settings(port);
+    let key = LineKey::SerialOverTcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+
+    let guard = resolved.one_shot_line(&settings);
+    let dial = resolved.driver().connect(
+        &settings,
+        ConnectContext::new("test", Duration::from_secs(30), Duration::from_secs(30)),
+    );
+    tokio::select! {
+        _ = dial => panic!("the handshake is never answered"),
+        _ = heard_rx.recv() => {}
+    }
+    // `dial` is dropped here: the cancelled dial returns its lease.
+    let line = LineTable::global()
+        .line(&key)
+        .expect("the cancelled dial leaves the line in the table");
+    assert!(line.is_open());
+
+    drop(guard);
+    assert!(LineTable::global().line(&key).is_none());
+    assert!(!line.is_open());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the socket is closed by the release")
+        .unwrap();
+}
+
+/// A one-off dial of a line a broker task is using is refused as "in use"
+/// without taking the owner mark, so its release leaves the task's line open.
+#[tokio::test]
+async fn a_one_shot_release_leaves_a_broker_tasks_line_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut b = [0];
+        while stream.read(&mut b).await.unwrap_or(0) == 1 {
+            stream.write_all(&b).await.unwrap();
+        }
+    });
+    let registry = serial_registry(0);
+    let settings = serial_settings(port);
+    let supervisor =
+        BrokerSupervisor::spawn(&[], BackoffConfig::default(), Arc::clone(&registry)).unwrap();
+    let conn = PlcConnection::from_settings(
+        1,
+        "frame".into(),
+        "frame-test".into(),
+        true,
+        false,
+        serde_json::Map::new(),
+        1,
+    );
+    let handle = supervisor
+        .directory()
+        .ensure_connection_with_settings(&conn, settings.clone())
+        .unwrap();
+    connected(&handle).await;
+    let key = LineKey::SerialOverTcp {
+        host: "127.0.0.1".into(),
+        port,
+    };
+    let line = LineTable::global().line(&key).unwrap();
+
+    let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+    let guard = resolved.one_shot_line(&settings);
+    let refused = resolved
+        .driver()
+        .connect(&settings, ConnectContext::new("test", T, T))
+        .await;
+    let Err(err) = refused else {
+        panic!("the one-off dial must be refused");
+    };
+    assert!(err.to_string().contains("使用中"), "{err}");
+    drop(guard);
+    assert!(
+        LineTable::global()
+            .line(&key)
+            .is_some_and(|l| Arc::ptr_eq(&l, &line)),
+        "the task's line stays in the table"
+    );
+    assert!(line.is_open());
+    assert_eq!(
+        handle.read(vec![spec()]).await,
+        Ok(vec![Ok(Value::F64(7.))])
+    );
+
+    assert!(supervisor.directory().stop_and_join(1).await);
+    assert!(LineTable::global().line(&key).is_none());
+    supervisor.shutdown().await;
+    server.abort();
+}

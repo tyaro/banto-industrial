@@ -1095,6 +1095,11 @@ async fn test_connection(
     if !refused.is_empty() {
         return (false, Some(refused_settings(&refused)));
     }
+    // シリアルの線は、致命の後もポートを開いたまま線の表へ戻る（io-design §7.3）。broker の
+    // task の外の 1 回きりのダイヤルなので、失敗・時間切れ・要求の取り消し（future の drop）の
+    // どの道でも、この番人の drop で自分が借りた線を閉じる。`session` より先に作るので、
+    // 貸し出しが表へ戻った後に閉じる。成功の道の `disconnect` の後に閉じても害はない。
+    let _line = resolved.one_shot_line(&settings);
     let cx = ConnectContext::new("connection-test", PLC_TEST_TIMEOUT, PLC_TEST_TIMEOUT);
     let connected = tokio::time::timeout(
         resolved.connect_limit(banto_broker::SessionTimeouts {
