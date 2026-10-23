@@ -902,7 +902,7 @@ async fn a_lease_cancelled_while_opening_releases_the_reservation() {
         std::time::Duration::from_millis(100),
         bench
             .table
-            .lease(&bench.spec, None, &bench.driver_id(), T, || {
+            .lease(&bench.spec, None, &bench.user(), T, || {
                 std::future::pending::<Result<Box<dyn Transport>, FatalError>>()
             }),
     )
@@ -913,7 +913,7 @@ async fn a_lease_cancelled_while_opening_releases_the_reservation() {
     let wire = bench.wire.clone();
     let leased = bench
         .table
-        .lease(&bench.spec, None, &bench.driver_id(), T, || async move {
+        .lease(&bench.spec, None, &bench.user(), T, || async move {
             wire.open()
         })
         .await;
@@ -1283,7 +1283,7 @@ async fn a_synced_line_reopened_with_a_new_baud_starts_fresh_and_syncs_again() {
         .lease(
             &bench.spec,
             None,
-            &bench.driver_id(),
+            &bench.user(),
             T,
             move || async move { wire.open() },
         )
@@ -1338,7 +1338,7 @@ async fn an_unsynced_line_reopened_with_a_new_baud_keeps_its_outstanding_signatu
         .lease(
             &bench.spec,
             None,
-            &bench.driver_id(),
+            &bench.user(),
             T,
             move || async move { wire.open() },
         )
@@ -1936,7 +1936,7 @@ async fn a_different_driver_leases_a_fresh_line_once_the_previous_signatures_hav
         .lease(
             &bench.spec,
             Some(LineOwner::new()),
-            &bench.driver_id(),
+            &bench.user(),
             T,
             move || async move { wire.open() },
         )
@@ -1989,7 +1989,7 @@ async fn a_synced_line_is_leased_synced_to_the_same_driver_and_fresh_to_a_differ
         .lease(
             &bench.spec,
             None,
-            &bench.driver_id(),
+            &bench.user(),
             T,
             move || async move { wire.open() },
         )
@@ -2007,7 +2007,7 @@ async fn a_synced_line_is_leased_synced_to_the_same_driver_and_fresh_to_a_differ
         .lease(
             &bench.spec,
             None,
-            &bench.driver_id(),
+            &bench.user(),
             T,
             move || async move { wire.open() },
         )

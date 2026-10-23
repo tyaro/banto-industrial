@@ -45,13 +45,20 @@
 //! （broker のバックオフで後から借り直す。寿命が過ぎれば借りられる）、残っていなければ線を開いた
 //! 直後の状態（`Fresh`。`Synced` も `Fresh` に）に戻して貸す。ポートは閉じない: 線の設定は同じで、
 //! 閉じて開き直しても機器と線は元のまま（§7.3）なので何も解決せず、変換器の送信待ちを失うだけ。
+//!
+//! 覚える同一性はドライバの id だけでなく、ドライバの設定の同一性も含む（[`LineUser`]。Codex P2、
+//! 2026-10-23）。同じプロトコルのまま線以外の設定（局番・語順・区切りに効く設定など）を変えると、
+//! `create_connection(settings)` は同じドライバの id でも別の形の `FrameConnection` を作りうるので、
+//! 古い設定の `Unsynced` と署名を新しい接続が引き継ぐと、古い形の遅れた応答を新しい区切り・照合で
+//! 読みうる。設定の同一性が変わったときも、ドライバが替わったときと同じ「守った引き継ぎ」を当てる。
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
-use banto_driver_api::{BoxFuture, DriverId, FatalError, Signature};
+use banto_driver_api::{BoxFuture, DriverBase, DriverId, FatalError, Settings, Signature};
 use tokio::time::Instant;
 
 use crate::transport::{SerialPortName, Transport, TransportSpec};
@@ -131,6 +138,49 @@ impl Default for LineOwner {
     }
 }
 
+/// 線を借りる者の同一性（モジュールの doc）: ドライバの id と、ドライバの設定の同一性。
+///
+/// 設定の同一性は、`Settings` の全キーと値（秘密値のキー `DriverBase::secret_keys` は除く）を
+/// キーの順に並べてハッシュしたプロセス内の値。秘密値の**値そのもの**を線に持たないために、
+/// ハッシュに混ぜるのではなく除く: 秘密値（パスワードなど）は認証にだけ効き、変えても応答の
+/// 区切り・照合は変わらないのが普通なので、除く方が素直（混ぜると、秘密値の更新のたびに同期済みの
+/// 線を `Fresh` に戻すだけ）。線の設定（`TransportSpec` に入る `transport`・`serial_port`・`baud`
+/// など）は含めたままにする: 線の設定の変更は `lease` の「開き直す」検査が別に扱うので、重複しても
+/// 害は無い（`Synced` → `Fresh` はどちらの道でも同じ）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineUser {
+    driver: DriverId,
+    config: u64,
+}
+
+impl LineUser {
+    /// `driver` がその `settings` で借りるときの同一性。
+    pub fn of<D: DriverBase + ?Sized>(driver: &D, settings: &Settings) -> Self {
+        let secret_keys = driver.secret_keys();
+        let mut pairs: Vec<(&str, &str)> = settings
+            .iter()
+            .filter(|s| !secret_keys.iter().any(|k| *k == s.key))
+            .map(|s| (s.key.as_str(), s.value.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        let mut hasher = std::hash::DefaultHasher::new();
+        pairs.len().hash(&mut hasher);
+        for (key, value) in pairs {
+            key.hash(&mut hasher);
+            value.hash(&mut hasher);
+        }
+        Self {
+            driver: driver.descriptor().id.clone(),
+            config: hasher.finish(),
+        }
+    }
+
+    /// ドライバの id。
+    pub fn driver(&self) -> &DriverId {
+        &self.driver
+    }
+}
+
 /// 線の同期の状態。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncState {
@@ -158,8 +208,9 @@ struct LineInner {
     leased: bool,
     /// 最後に借りた（予約した）持ち主の印。印を持たない貸し出し（試験）は `None` のまま。
     owner: Option<LineOwner>,
-    /// 最後に借りた（予約した）ドライバの id（モジュールの doc）。まだ誰も借りていなければ `None`。
-    driver: Option<DriverId>,
+    /// 最後に借りた（予約した）者の同一性（ドライバの id と設定。モジュールの doc）。
+    /// まだ誰も借りていなければ `None`。
+    user: Option<LineUser>,
     state: SyncState,
     outstanding: Vec<Pending>,
     /// 線から最後にバイトを受けた時刻（`quiet_from` と違い、送り終えの見積もりは含まない）。
@@ -251,7 +302,12 @@ impl Line {
 
     /// 最後に借りたドライバの id（まだ誰も借りていなければ `None`）。
     pub fn driver(&self) -> Option<DriverId> {
-        self.lock().driver.clone()
+        self.lock().user.as_ref().map(|u| u.driver.clone())
+    }
+
+    /// 最後に借りた者の同一性（ドライバの id と設定。まだ誰も借りていなければ `None`）。
+    pub fn user(&self) -> Option<LineUser> {
+        self.lock().user.clone()
     }
 
     /// ポートが開いているか（貸し出し中も含む）。
@@ -486,14 +542,14 @@ impl LineTable {
     /// 線の設定が変わっていれば古いポートを閉じて開き直す。`owner` は予約と同時に線に記録する
     /// （[`Self::close_by`] が見る）。`owner` が 1 回きりの印（[`LineOwner::one_shot`]）なら、
     /// 別の持ち主の印の線は貸し出し中でなくても借りずに「使用中」で断る（線の印・状態・待っている
-    /// 署名は変えない）。`driver` は借りるドライバの id: 線に最後に記録されたドライバと違えば、
-    /// 寿命（`response_timeout` から [`crate::stale_signature_ttl`]）の切れていない署名が残る線は
-    /// 借りずに断り、残っていなければ `Fresh` に戻して貸す（モジュールの doc）。
+    /// 署名は変えない）。`user` は借りる者の同一性（ドライバの id と設定）: 線に最後に記録された
+    /// ものと違えば、寿命（`response_timeout` から [`crate::stale_signature_ttl`]）の切れていない
+    /// 署名が残る線は借りずに断り、残っていなければ `Fresh` に戻して貸す（モジュールの doc）。
     pub(crate) async fn lease<F>(
         &self,
         spec: &TransportSpec,
         owner: Option<LineOwner>,
-        driver: &DriverId,
+        user: &LineUser,
         response_timeout: Duration,
         open: impl FnOnce() -> F,
     ) -> Result<(LineLease, LeaseStart), FatalError>
@@ -529,7 +585,7 @@ impl LineTable {
                         spec: None,
                         leased: false,
                         owner: None,
-                        driver: None,
+                        user: None,
                         state: SyncState::Fresh,
                         outstanding: Vec::new(),
                         last_rx: None,
@@ -556,18 +612,23 @@ impl LineTable {
                 if inner.quarantined {
                     return Err(quarantine_error(&key));
                 }
-                if let Some(previous) = inner.driver.clone().filter(|d| d != driver) {
-                    // ドライバが替わった（モジュールの doc）。古いドライバの署名を新しいドライバは
+                if let Some(previous) = inner.user.clone().filter(|u| u != user) {
+                    // ドライバか設定が替わった（モジュールの doc）。古い接続の署名を新しい接続は
                     // 区切れも見分けもできないので、寿命の切れていない署名が残る間は借りない。
                     let ttl = crate::stale_signature_ttl(response_timeout);
                     inner.forget_stale(Instant::now(), ttl);
                     if !inner.outstanding.is_empty() {
+                        let what = if previous.driver == user.driver {
+                            format!("前の設定（ドライバ {}）", previous.driver)
+                        } else {
+                            format!("前のドライバ {}", previous.driver)
+                        };
                         return Err(FatalError::Protocol(format!(
-                            "シリアルの線 {key} は前のドライバ {previous} の応答待ちが残っています。しばらく待ってから張り直してください"
+                            "シリアルの線 {key} は{what}の応答待ちが残っています。しばらく待ってから張り直してください"
                         )));
                     }
-                    // 古いドライバの応答はもう来ない（寿命）。線を開いた直後の状態に戻し、新しい
-                    // ドライバは同期から始める（`Synced` も引き継がない）。ポートは開いたまま。
+                    // 古い接続の応答はもう来ない（寿命）。線を開いた直後の状態に戻し、新しい
+                    // 接続は同期から始める（`Synced` も引き継がない）。ポートは開いたまま。
                     inner.state = SyncState::Fresh;
                 }
                 if inner.spec.as_ref() != Some(spec) {
@@ -584,7 +645,7 @@ impl LineTable {
                 if owner.is_some() {
                     inner.owner = owner;
                 }
-                inner.driver = Some(driver.clone());
+                inner.user = Some(user.clone());
                 inner.transport.take()
             };
             drop(lines);

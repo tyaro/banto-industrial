@@ -32,7 +32,9 @@ use banto_driver_api::{
     ItemError, PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Signature, Step, TagSpec,
     Value, WriteItem, WriteProgress,
 };
-use line::{InFlightGuard, LeaseStart, Line, LineKey, LineLease, LineOwner, LineTable};
+use line::{
+    InFlightGuard, LeaseStart, Line, LineKey, LineLease, LineOwner, LineTable, LineUser,
+};
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
 
@@ -206,7 +208,13 @@ impl FrameSession {
         F: std::future::Future<Output = Result<Box<dyn Transport>, FatalError>>,
     {
         let (lease, start) = table
-            .lease(spec, owner, &driver.descriptor().id, response_timeout, open)
+            .lease(
+                spec,
+                owner,
+                &LineUser::of(driver, settings),
+                response_timeout,
+                open,
+            )
             .await?;
         Self::start(
             driver,
