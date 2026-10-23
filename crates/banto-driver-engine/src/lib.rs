@@ -14,6 +14,10 @@
 //! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
 //! シリアルの send は flush（Unix では同期の tcdrain で runtime を止める）を呼ばないので、
 //! 送り終えた時刻は `Transport::tx_time` で見積もる。
+//! 待っている署名には寿命がある（[`stale_signature_ttl`]、2026-10-23 オーナー決定）: 送った後、
+//! 線から何も届かない時間が寿命に達した署名は、同期の手順が集合を読むときに忘れる。機器が長く
+//! 落ちている間に張り直しのたびに同期の試行の署名が溜まり、機器が戻っても区別できる要求を
+//! 選べず二度と同期できなくなるのを防ぐ（[`line`] の doc）。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
@@ -49,6 +53,20 @@ pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
 /// 64 KiB は、シリアルの線に流れるどの応答（Modbus RTU の ADU は 256 バイト、SLMP も数 KiB）
 /// よりも十分に大きく、受信の溜めとしては小さい。エンジンに既存の上限は無いので明示の値を置く。
 pub const MAX_SYNC_FRAME_LEN: u32 = 64 * 1024;
+/// 待っている署名の寿命の係数: `response_timeout` の何倍を「送った後、線から何も届かない時間」
+/// の上限とみなすか。機器の処理の遅れも変換器の溜めも、応答の上限の数倍を超えて届くことは
+/// 考えにくい。一方で短すぎると、遅い変換器で本当に遅れた応答を取り違える（寿命を超えて遅れた
+/// 応答は、忘れた署名と同じ署名の同期の要求に取り違えうる。設計 §14）。
+pub const STALE_SIGNATURE_TTL_FACTOR: u32 = 10;
+/// 待っている署名の寿命の下限。`response_timeout` を短くした設定でも余裕を持たせる。
+pub const STALE_SIGNATURE_TTL_MIN: Duration = Duration::from_secs(10);
+
+/// 待っている署名の寿命 = `max(STALE_SIGNATURE_TTL_FACTOR × response_timeout, STALE_SIGNATURE_TTL_MIN)`。
+pub fn stale_signature_ttl(response_timeout: Duration) -> Duration {
+    response_timeout
+        .saturating_mul(STALE_SIGNATURE_TTL_FACTOR)
+        .max(STALE_SIGNATURE_TTL_MIN)
+}
 
 /// 適合テストとホストの診断で観測する出来事。通信の結果は変えない。
 #[derive(Debug, Clone)]
@@ -452,7 +470,18 @@ impl Core {
             };
         }
         let line = Arc::clone(lease.line());
+        let ttl = stale_signature_ttl(self.response_timeout);
         for _attempt in 0..MAX_SYNC_ATTEMPTS {
+            // 寿命（送った後、線から何も届かない時間）の過ぎた署名は忘れる（`line` の doc）。
+            let forgotten = line.forget_stale(Instant::now(), ttl);
+            if forgotten > 0 {
+                tracing::debug!(
+                    line = %line.key(),
+                    forgotten,
+                    ttl_ms = ttl.as_millis() as u64,
+                    "寿命の過ぎた待っている署名を忘れた"
+                );
+            }
             let outstanding = line.outstanding();
             let Some(step) = self.conn.sync_step(&outstanding) else {
                 break;
@@ -861,9 +890,14 @@ impl Core {
             let n = timeout_at(deadline, self.wire.transport().recv(buf))
                 .await
                 .map_err(|_| FatalError::Timeout)??;
-            self.note_quiet(Instant::now());
+            let received_at = Instant::now();
+            self.note_quiet(received_at);
             if n == 0 {
                 return Err(FatalError::Io("相手が接続を閉じた".into()));
+            }
+            // 線からバイトを受けた（待っている署名の寿命の起点）。
+            if let Some(line) = self.wire.line() {
+                line.note_rx(received_at);
             }
             if buf.len().checked_sub(before) != Some(n) {
                 return Err(FatalError::Protocol(

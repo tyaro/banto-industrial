@@ -15,6 +15,14 @@
 //! 同期の手順（`FrameSession` の `sync_line`）の 2 つだけ。それ以外の終わり方
 //! （致命・取り消し・panic）では番人の `Drop` が線を `Unsynced` にし、署名は残る。
 //!
+//! 待っている署名には寿命がある（2026-10-23 オーナー決定）: 署名は送る直前の時刻を持ち、線は
+//! 最後にバイトを受けた時刻（`last_rx`）を持つ。「その要求を送った後、線から何も届かない時間」
+//! （`now - max(送った時刻, last_rx)`）が寿命（`crate::stale_signature_ttl`）に達した署名は、
+//! 同期の手順が集合を読むときに忘れる（[`Line::forget_stale`]）。機器が長く落ちている（電源断）
+//! と、broker が張り直すたびに同期の試行の署名が足され、やがてドライバが区別できる要求を選べず、
+//! 機器が戻っても二度と同期できなくなるため。機器が何かを送り続けている（ごみでも）間は忘れない。
+//! 状態は `Unsynced` のまま（同期の手順は必ず走る）。
+//!
 //! 線の貸し出し（[`LineLease`]）は 1 度に 1 つ。貸し出しが drop されると（セッションの破棄・
 //! future の取り消し）、ポートは表に戻る。`close_on_drop` が立っていれば戻さずに閉じる
 //! （切断・`Io` の致命・§7.3 の 6 の隔離）。
@@ -125,6 +133,14 @@ pub enum SyncState {
     Unsynced,
 }
 
+/// 応えの返っていない要求。
+#[derive(Debug, Clone)]
+struct Pending {
+    signature: Signature,
+    /// 送る直前に記録した時刻（[`Line::begin`]）。寿命の起点。
+    since: Instant,
+}
+
 struct LineInner {
     /// 開いているポート。貸し出し中と閉じた後は `None`。
     transport: Option<Box<dyn Transport>>,
@@ -134,7 +150,10 @@ struct LineInner {
     /// 最後に借りた（予約した）持ち主の印。印を持たない貸し出し（試験）は `None` のまま。
     owner: Option<LineOwner>,
     state: SyncState,
-    outstanding: Vec<Signature>,
+    outstanding: Vec<Pending>,
+    /// 線から最後にバイトを受けた時刻（`quiet_from` と違い、送り終えの見積もりは含まない）。
+    /// 待っている署名の寿命の起点の 1 つ（モジュールの doc）。
+    last_rx: Option<Instant>,
     /// §7.3 の 6: 同期の手順を持たないドライバが致命の後に借りようとした。
     /// 閉じる（[`LineTable::close`]）まで、この線は開かない。
     quarantined: bool,
@@ -179,9 +198,38 @@ impl Line {
         inner.quiet_from = Some(inner.quiet_from.map_or(at, |t| t.max(at)));
     }
 
+    /// 線からバイトを受けた（`at` 以降に寄せる。早めない）。
+    pub(crate) fn note_rx(&self, at: Instant) {
+        let mut inner = self.lock();
+        inner.last_rx = Some(inner.last_rx.map_or(at, |t| t.max(at)));
+    }
+
+    /// 線から最後にバイトを受けた時刻。
+    pub fn last_rx(&self) -> Option<Instant> {
+        self.lock().last_rx
+    }
+
     /// 応えの返っていない要求の署名の写し。
     pub fn outstanding(&self) -> Vec<Signature> {
-        self.lock().outstanding.clone()
+        self.lock()
+            .outstanding
+            .iter()
+            .map(|p| p.signature.clone())
+            .collect()
+    }
+
+    /// 寿命（モジュールの doc）の過ぎた署名を忘れ、その数を返す。「送った後、線から何も届かない
+    /// 時間」が `ttl` に達した署名が対象（`now - max(送った時刻, last_rx) >= ttl`）。
+    /// 状態は変えない（`Unsynced` のまま。同期の手順は必ず走る）。
+    pub(crate) fn forget_stale(&self, now: Instant, ttl: Duration) -> usize {
+        let mut inner = self.lock();
+        let last_rx = inner.last_rx;
+        let before = inner.outstanding.len();
+        inner.outstanding.retain(|p| {
+            let from = last_rx.map_or(p.since, |rx| rx.max(p.since));
+            now.saturating_duration_since(from) < ttl
+        });
+        before - inner.outstanding.len()
     }
 
     /// ポートが開いているか（貸し出し中も含む）。
@@ -195,7 +243,10 @@ impl Line {
     /// 返る番人を [`InFlightGuard::complete`] しないまま drop すると線は `Unsynced` になる。
     pub(crate) fn begin(self: &Arc<Self>, signature: Option<Signature>) -> InFlightGuard {
         if let Some(signature) = &signature {
-            self.lock().outstanding.push(signature.clone());
+            self.lock().outstanding.push(Pending {
+                signature: signature.clone(),
+                since: Instant::now(),
+            });
         }
         InFlightGuard {
             line: Arc::clone(self),
@@ -207,9 +258,12 @@ impl Line {
     /// 応答が完結し検証が通った（同期の要求なら、同期の手順が通った）。
     fn mark_synced(&self, signature: Option<&Signature>) {
         let mut inner = self.lock();
-        if let Some(i) =
-            signature.and_then(|signature| inner.outstanding.iter().position(|s| s == signature))
-        {
+        if let Some(i) = signature.and_then(|signature| {
+            inner
+                .outstanding
+                .iter()
+                .position(|p| &p.signature == signature)
+        }) {
             inner.outstanding.remove(i);
         }
         inner.state = SyncState::Synced;
@@ -231,7 +285,11 @@ impl Line {
     /// 同期の手順の途中で、待っている要求への古い応答が届いて捨てた: その要求はもう待っていない。
     pub(crate) fn forget_outstanding(&self, signature: &Signature) {
         let mut inner = self.lock();
-        if let Some(i) = inner.outstanding.iter().position(|s| s == signature) {
+        if let Some(i) = inner
+            .outstanding
+            .iter()
+            .position(|p| &p.signature == signature)
+        {
             inner.outstanding.remove(i);
         }
     }
@@ -447,6 +505,7 @@ impl LineTable {
                         owner: None,
                         state: SyncState::Fresh,
                         outstanding: Vec::new(),
+                        last_rx: None,
                         quarantined: false,
                         quiet_from: None,
                     }),

@@ -140,6 +140,9 @@ enum SyncPolicy {
     None,
     /// FC4 の 1 語 → FC4 の 2 語 → FC3 の 2 語の順に、待っている署名と違うものを選ぶ。
     Distinct,
+    /// FC3 の 1 語（A と同じ署名）→ FC4 の 1 語 → FC4 の 2 語の順に、待っている署名と違うものを
+    /// 選ぶ。A の署名を忘れたかどうかが、選ぶ要求の違いとして見える。
+    ReadFirst,
     /// 反証: 待っている署名と同じ（FC3 の 1 語）を選ぶ。
     Colliding,
     /// 契約違反: 同期の step を `Fixed` で区切る（FC4 の 1 語、4 バイト）。
@@ -200,6 +203,7 @@ impl FrameConnection for Conn {
         let candidates: &[(u8, u8)] = match self.policy {
             SyncPolicy::None => return None,
             SyncPolicy::Distinct => &[(FC_PROBE, 0x00), (FC_PROBE, 0xF0), (FC_READ, 0xF0)],
+            SyncPolicy::ReadFirst => &[(FC_READ, 0x00), (FC_PROBE, 0x00), (FC_PROBE, 0xF0)],
             // 反証: 待っている署名を見ずに、A と同じ署名の要求を選ぶ。
             SyncPolicy::Colliding => return Some(request(FC_READ, 0x00)),
             SyncPolicy::Fixed => {
@@ -1654,4 +1658,195 @@ async fn an_accepted_response_leaves_the_line_synced_without_signatures() {
     );
     assert_eq!(bench.state(), SyncState::Synced);
     assert!(bench.outstanding().is_empty());
+}
+
+/// A を時間切れにして `Unsynced`・待っている署名 `[A]` の線を作る（`ReadFirst` は開いた直後の
+/// 同期に FC3 の 1 語を使う）。返るのは A を送った時刻（止めた時計）。
+async fn time_out_a(bench: &Bench, first_sync: Vec<u8>) -> Instant {
+    bench
+        .wire
+        .react([Reaction::Reply(vec![first_sync]), Reaction::Silence]);
+    let mut session = bench.connect().await.unwrap();
+    let sent_at = Instant::now();
+    assert!(matches!(
+        read_one(&mut session, ADDR_A).await,
+        Err(FatalError::Timeout)
+    ));
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Unsynced);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)]);
+    sent_at
+}
+
+/// 待っている署名の寿命（2026-10-23 オーナー決定）(a): 機器が落ちていて何も届かないまま
+/// 張り直しを繰り返すと、同期の試行の署名が溜まってドライバが区別できる要求を選べなくなる。
+/// 寿命（送った後、線から何も届かない時間）が過ぎた後のダイヤルでは古い署名を忘れ、機器が
+/// 戻れば同期できる。忘れる処理を外すと、機器が戻っても永久に同期できない（反証）。
+#[tokio::test(start_paused = true)]
+async fn signatures_left_by_a_dead_device_are_forgotten_after_the_ttl_and_the_line_syncs_again() {
+    let bench = Bench::new(SyncPolicy::Distinct);
+    time_out_a(&bench, response(FC_PROBE, &[0x55])).await;
+
+    // 機器は落ちたまま: 張り直しの同期の試行がすべて時間切れになり、署名が溜まる。
+    let result = bench.connect().await;
+    assert!(matches!(&result, Err(FatalError::Protocol(m)) if m == "線の同期が取れない"));
+    assert_eq!(bench.outstanding().len(), 4);
+    assert_eq!(bench.wire.sent().len(), 5);
+    // 寿命の前の張り直しは、区別できる要求が残っていないので送らずに止まる（直す前の症状）。
+    let result = bench.connect().await;
+    assert!(matches!(&result, Err(FatalError::Protocol(m)) if m == "線の同期が取れない"));
+    assert_eq!(bench.wire.sent().len(), 5, "送らずに止まる");
+    assert_eq!(bench.outstanding().len(), 4);
+
+    // 何も届かないまま寿命が過ぎ、機器が戻る。
+    tokio::time::sleep(stale_signature_ttl(T)).await;
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]),
+        Reaction::Reply(vec![response(FC_READ, &[0xBB])]),
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    let sent = bench.wire.sent();
+    assert_eq!(sent.len(), 6);
+    assert_eq!(
+        sent[5],
+        request(FC_PROBE, 0x00).send,
+        "古い署名を忘れたので、最初の候補から選び直す"
+    );
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+    assert_eq!(bench.wire.lock().opens, 1, "ポートは 1 度しか開かない");
+}
+
+/// 待っている署名の寿命 (b): 寿命の手前では A の署名はまだ待っていて、同期の要求に A と同じ
+/// 署名は選ばれず、届いた A の古い応答は古い応答として捨てられる（取り違えない）。寿命に達した
+/// ダイヤルでは A を忘れ、同じ署名の要求を選べる（境界は `>=`）。
+#[tokio::test(start_paused = true)]
+async fn a_signature_is_kept_until_the_ttl_and_forgotten_at_it() {
+    let bench = Bench::new(SyncPolicy::ReadFirst);
+    let ttl = stale_signature_ttl(T);
+    let sent_at = time_out_a(&bench, response(FC_READ, &[0x11])).await;
+
+    // 寿命の 1 ms 手前: A はまだ待っている。同期の要求は A と違う署名（FC4）で、A の古い応答は
+    // 捨てられ、B は B の値を返す。
+    tokio::time::sleep_until(sent_at + ttl - Duration::from_millis(1)).await;
+    bench.wire.react([
+        Reaction::Reply(vec![
+            response(FC_READ, &[0xAA]),
+            response(FC_PROBE, &[0x55]),
+        ]),
+        Reaction::Reply(vec![response(FC_READ, &[0xBB])]),
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    assert_eq!(
+        bench.wire.sent()[2],
+        request(FC_PROBE, 0x00).send,
+        "A の署名はまだ待っているので、同じ署名の FC3 は選ばれない"
+    );
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+    assert_eq!(bench.wire.sent().len(), 4);
+
+    // もう 1 度 A を時間切れにし、ちょうど寿命が過ぎたダイヤル: A を忘れ、FC3 の 1 語を選ぶ。
+    bench.wire.react([Reaction::Silence]);
+    let sent_at = Instant::now();
+    assert!(matches!(
+        read_one(&mut session, ADDR_A).await,
+        Err(FatalError::Timeout)
+    ));
+    drop(session);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)]);
+    tokio::time::sleep_until(sent_at + ttl).await;
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_READ, &[0x11])])]);
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert_eq!(
+        bench.wire.sent()[5],
+        request(FC_READ, 0x00).send,
+        "寿命に達した A は忘れられ、同じ署名の要求を選べる"
+    );
+}
+
+/// 待っている署名の寿命 (c): 線に何かが届き続けている間（`last_rx` が新しい）は、送ってから
+/// 寿命を過ぎても署名を忘れない。忘れるのは、最後に受けてから寿命が過ぎた後。
+/// `last_rx` を見ず送った時刻だけで忘れると落ちる（反証）。
+#[tokio::test(start_paused = true)]
+async fn a_signature_is_kept_while_bytes_keep_arriving_on_the_line() {
+    let bench = Bench::new(SyncPolicy::ReadFirst);
+    let ttl = stale_signature_ttl(T);
+    let sent_at = time_out_a(&bench, response(FC_READ, &[0x11])).await;
+
+    // 寿命の少し手前に張り直す: 同期の要求（A と違う FC4）に知らない局のごみが届き、時間切れ。
+    // 次の候補も時間切れ。3 つ目は A がまだ待っているので選べず、ダイヤルは失敗する。
+    tokio::time::sleep_until(sent_at + ttl - T / 2).await;
+    let garbage_at = Instant::now();
+    bench.wire.react([
+        Reaction::Reply(vec![vec![2, FC_READ, 1, 0x00]]),
+        Reaction::Silence,
+    ]);
+    let result = bench.connect().await;
+    assert!(matches!(&result, Err(FatalError::Protocol(m)) if m == "線の同期が取れない"));
+    assert_eq!(bench.line().last_rx(), Some(garbage_at));
+    assert_eq!(
+        bench.outstanding(),
+        vec![sig(FC_READ, 1), sig(FC_PROBE, 1), sig(FC_PROBE, 2)]
+    );
+    assert_eq!(bench.wire.sent().len(), 4);
+    assert!(
+        Instant::now() >= sent_at + ttl,
+        "A を送ってからは寿命を過ぎている"
+    );
+
+    // 送ってから寿命を過ぎていても、ごみを受けてからは過ぎていないので A を忘れない:
+    // 区別できる要求が無く、送らずに止まる。
+    let result = bench.connect().await;
+    assert!(matches!(&result, Err(FatalError::Protocol(m)) if m == "線の同期が取れない"));
+    assert_eq!(
+        bench.wire.sent().len(),
+        4,
+        "A を忘れていないので FC3 は送らない"
+    );
+    assert_eq!(bench.outstanding().len(), 3);
+
+    // 最後に受けてから寿命が過ぎると、すべて忘れて同期できる。
+    tokio::time::sleep_until(garbage_at + ttl).await;
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_READ, &[0x11])]),
+        Reaction::Reply(vec![response(FC_READ, &[0xBB])]),
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    assert_eq!(bench.wire.sent()[4], request(FC_READ, 0x00).send);
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+}
+
+/// 待っている署名の寿命 (d): `response_timeout` が短ければ下限の 10 秒、長ければ 10 倍。
+#[test]
+fn the_stale_signature_ttl_is_ten_timeouts_but_at_least_ten_seconds() {
+    assert_eq!(
+        stale_signature_ttl(Duration::from_millis(100)),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        stale_signature_ttl(Duration::from_secs(1)),
+        Duration::from_secs(10)
+    );
+    assert_eq!(
+        stale_signature_ttl(Duration::from_secs(2)),
+        Duration::from_secs(20)
+    );
+    assert_eq!(stale_signature_ttl(Duration::MAX), Duration::MAX);
 }
