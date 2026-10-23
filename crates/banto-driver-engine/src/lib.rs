@@ -481,8 +481,10 @@ impl Core {
                 ));
             }
             emit(&self.events, EngineEvent::StepStarted(step.clone()));
-            let guard = line.begin(Some(signature.clone()));
-            let deadline = self.send_step(&step).await?;
+            // 番人は無音の待ちの後、送る直前に張る（待ちの時間切れ・取り消しで線を汚さない）。
+            let (deadline, guard) = self
+                .send_step(&step, || line.begin(Some(signature.clone())))
+                .await?;
             let mut buf = Vec::new();
             // 古い応答は同期の step の `max_len` より長いことがあるので、区切りは大きい上限で
             // 行い、同期の応答として受けるのは `max_len` 以下のときだけにする。
@@ -719,7 +721,9 @@ impl Core {
         // 応答を待たない step にも署名なしの番人を付ける: 送信が時間切れ・`Io`・取り消し（一部の
         // バイトだけ出た後の drop を含む）で終わると、機器は崩れたフレームを受けたかもしれない。
         let awaits_response = !matches!(step.expect, FrameRule::None);
-        let tracked = match self.wire.line() {
+        // 番人は無音の待ちの後、送る直前に張る（まだ 1 バイトも送っていない時間切れ・取り消しで
+        // 線を `Unsynced` にしない。Codex P2）。
+        let pending = match self.wire.line() {
             Some(line) => {
                 let line = Arc::clone(line);
                 let signature = if awaits_response && self.line_sync {
@@ -727,11 +731,15 @@ impl Core {
                 } else {
                     None
                 };
-                Some((line.begin(signature.clone()), signature))
+                Some((line, signature))
             }
             None => None,
         };
-        let deadline = self.send_step(step).await?;
+        let (deadline, tracked) = self
+            .send_step(step, || {
+                pending.map(|(line, signature)| (line.begin(signature.clone()), signature))
+            })
+            .await?;
         if !awaits_response {
             // 送り終えた。応答の検証は無いので `Synced` にはせず、線の状態を変えずに外す。
             if let Some((guard, _)) = tracked {
@@ -773,7 +781,12 @@ impl Core {
     }
 
     /// 無音を待って `step` を送る。返る期限は、受信にもそのまま使う。
-    async fn send_step(&mut self, step: &Step) -> Result<Instant, FatalError> {
+    /// `arm` は無音の待ちが終わった後、`Transport::send` を呼ぶ直前に呼ぶ（線の番人を張る）。
+    async fn send_step<G>(
+        &mut self,
+        step: &Step,
+        arm: impl FnOnce() -> G,
+    ) -> Result<(Instant, G), FatalError> {
         // 期限は待ちの前に決める。フレーム間の無音（設計 §7.3.1）の待ちも step の応答の期限 T の中
         // （長さは MAX_INTER_FRAME_GAP 以下）。broker の外側の上限 `2T × step 上限 + 1 秒` の前提を保つ。
         let deadline = Instant::now()
@@ -791,6 +804,7 @@ impl Core {
         // tx_time の見積もりの起点は、待ちの後の時刻。
         let send_start = Instant::now();
         let estimate = send_start + self.wire.transport().tx_time(step.send.len());
+        let armed = arm();
         // 送る前に送り終えの見積もりを線に残す。送信の途中で取り消されても（future の drop）、
         // 次のセッションは送信待ちに残った途中のバイトの後から無音を測る（§7.3.1、Codex P2）。
         self.note_quiet(estimate);
@@ -799,7 +813,7 @@ impl Core {
             .map_err(|_| FatalError::Timeout)??;
         // 送り終えた時刻の見積もり: send が返った時刻と、開始 + バイト数 × 1 文字の時間の遅い方。
         self.note_quiet(Instant::now().max(estimate));
-        Ok(deadline)
+        Ok((deadline, armed))
     }
 
     /// フレーム間の無音の起点を `at` 以降に寄せる（早めない）。借りた線にも記録し、次に借りる

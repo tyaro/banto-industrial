@@ -1422,6 +1422,69 @@ async fn the_first_send_after_a_send_cancelled_midway_waits_for_its_estimated_en
     );
 }
 
+/// 無音の待ちが応答の期限を超える（`inter_frame_gap` > `response_timeout`）。
+const LONG_GAP: Duration = Duration::from_millis(300);
+
+/// Codex P2: 無音の待ちで時間切れになったときは 1 バイトも送っていないので、番人を張らず、線は
+/// 送る前の状態（`Synced`）・待っている署名は増えない。
+#[tokio::test(start_paused = true)]
+async fn a_quiet_wait_that_times_out_sends_nothing_and_leaves_the_line_state_untouched() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.driver.conn.gap = LONG_GAP;
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]); // 1: 同期
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    let result = read_one(&mut session, ADDR_A).await;
+    assert!(matches!(result, Err(FatalError::Timeout)), "{result:?}");
+    assert_eq!(bench.wire.sent().len(), 1, "A は送られていない");
+    assert_eq!(bench.state(), SyncState::Synced, "送る前の状態のまま");
+    assert!(bench.outstanding().is_empty(), "{:?}", bench.outstanding());
+}
+
+/// Codex P2: 無音の待ちの最中に future を drop しても同じ（何も送らず、状態も署名も変えない）。
+#[tokio::test(start_paused = true)]
+async fn a_step_cancelled_during_the_quiet_wait_leaves_the_line_state_untouched() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.driver.conn.gap = LONG_GAP;
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]); // 1: 同期
+    let mut session = bench.connect().await.unwrap();
+    let cancelled = tokio::time::timeout(T / 2, session.read_raw_batch(&[spec_of(ADDR_A)])).await;
+    assert!(cancelled.is_err(), "無音の待ちの最中に drop した");
+    assert_eq!(bench.wire.sent().len(), 1, "A は送られていない");
+    assert_eq!(bench.state(), SyncState::Synced, "送る前の状態のまま");
+    assert!(bench.outstanding().is_empty(), "{:?}", bench.outstanding());
+}
+
+/// Codex P2: 同期の要求も、無音の待ちで時間切れになったなら送っていないので、署名を増やさない。
+#[tokio::test(start_paused = true)]
+async fn a_sync_request_whose_quiet_wait_times_out_adds_no_signature() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Silence,                                  // 2: A（途中で取り消す）
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    let cancelled = tokio::time::timeout(T / 2, session.read_raw_batch(&[spec_of(ADDR_A)])).await;
+    assert!(cancelled.is_err());
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Unsynced);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)]);
+
+    bench.driver.conn.gap = LONG_GAP;
+    let result = bench.connect().await;
+    assert!(result.is_err(), "無音の待ちが期限を超えて同期できない");
+    assert_eq!(bench.wire.sent().len(), 2, "同期の要求は送られていない");
+    assert_eq!(
+        bench.outstanding(),
+        vec![sig(FC_READ, 1)],
+        "送っていない同期の要求の署名は増えない"
+    );
+}
+
 /// 設計 §7.3 の 1（Codex P1）: 応答が区切れて署名に合っても、ドライバが受け入れの段で断ったら
 /// 致命の後なので線は `Unsynced`、その step の署名は待っている集合に残る。次のセッションは
 /// 同期の手順から始め、残った署名と違う同期の要求を選ぶ。`exchange` が署名に合った時点で
