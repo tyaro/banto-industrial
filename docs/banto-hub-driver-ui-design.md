@@ -1,0 +1,242 @@
+# banto-hub 接続設定とアドレス補助をドライバから組み立てる 詳細設計（R2b-6）
+
+作成日: 2026-10-24
+状態: **設計案（オーナー確認待ち。§11 の Q1〜Q10）**。コード調査（§1）は 2026-10-24 の main（`9626f09c`、v0.2.0-alpha.38、R2b-5 完了の後）に対して行った。前提のオーナー指示（2026-10-24）: **最初に対応するドライバは MELSEC（SLMP）と Modbus（TCP）**。
+対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-6「UI をドライバのスキーマから組み立てる汎用フォームに替え、iframe の枠を用意する」と、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §12.2 の 7「UI はドライバから組み立てる。プロトコル別の Svelte の分岐と TS の写しを消す」。
+関連: [banto-driver-api-design.md](banto-driver-api-design.md)（§4.1 `DriverBase`、§9 WIT との対応）、[banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。§2 の R2b-6 / R2b-7 の境、§3.2 型つきの `settings`、§4.3 平らな形のアダプタ）、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)（R2b-2。§7.1 `POST /api/tags/parse-addresses`）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §8（同梱 UI と iframe）。
+
+---
+
+## 0. 要約
+
+| #   | 提案                                                                                                                                                                                                            | 根拠の節 |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------- |
+| 1   | `banto-driver-api` に**設定のスキーマ**（`SettingsSchema` = 欄の並び。欄は キー・表示名・説明・種類・必須・既定値・区分）と `DriverBase::settings_schema()`（既定は空）を足す。WIT は `config.schema` を足す    | §3       |
+| 2   | ドライバの**データ型の対応**（`supported_kinds`）も同じく `DriverBase` に足す。UI のデータ型の選択肢と `banto-tags` の `MODBUS_ONLY_DATA_TYPES` をこれに替える                                                  | §3.4     |
+| 3   | Hub に **`GET /api/drivers`**（認証付き）を足す: 記述子・スキーマ・データ型・`address_help`。UI のプロトコルの選択肢・既定ポート・既定のワード順はすべてここから取る                                            | §4       |
+| 4   | **ホストがスキーマで型・必須・範囲を確かめ、型つきの JSON で保存する**（`settings_from_flat` のプロトコル別の写しを、スキーマに従う 1 つの関数に替える）。意味の検証は今までどおり `validate_config`            | §4.2     |
+| 5   | Hub の REST `/api/plc-connections` の形を R2b-6 で `{name, protocol, enabled, simulation, settings}` に替える（R2b-7 から前倒し。MCP・設定パッケージ・ChronoGazer は R2b-7 のまま）                             | §5, Q2   |
+| 6   | `ConnectionDrawer.svelte` の SLMP / Modbus の分岐を、スキーマから組み立てる**汎用フォーム**（`DriverSettingsForm.svelte`）に替える。`postgres`・`push` は今の専用の欄を残す（ホストの接続で、ドライバではない） | §6, Q3   |
+| 7   | タグの画面の **TS の写し（`slmpDeviceTable.ts`）を消す**。連続登録・オフセットコピー・構造体登録のアドレスの計算を、ドライバの `offset_address` を呼ぶ **`POST /api/tags/offset-addresses`** に替える           | §7, Q5   |
+| 8   | **iframe の枠は W 段へ送る**（R2b-4 と同じ理由: 中身を出せるドライバが W 段まで無い）。R2b-6 では記述子に UI の入口を持てる場所を決めるだけにする                                                               | §8, Q6   |
+| 9   | PR は **6a（API とスキーマ・適合テスト）→ 6b（Hub の `/api/drivers`・スキーマでの保存・REST の形）→ 6c（汎用フォーム）→ 6d（アドレス補助の API 化と TS の写しの削除）→ 6e（docs・CHANGELOG・版）**              | §9       |
+
+### 0.1 既存の決定・計画から外れる点
+
+| 既存の決定・計画                                                                   | 本書の提案                                                 | 理由                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| connection-settings-design §2「REST `/api/plc-connections` は R2b-7 で形を変える」 | Hub の REST だけ R2b-6 で変える（Q2）                      | 汎用フォームは `settings` をそのまま送る。平らな形のまま作ると、フォームの欄 ↔ 平らな欄の写しをプロトコルごとに TS で書くことになり、R2b-6 の目的（分岐を消す）に反する |
+| refactor-plan §3「ドライバ同梱 UI を載せる iframe の枠」を R2 の中で作る           | W 段へ送る（Q6）                                           | 中身を配れるのは W 段のプラグインだけ。枠だけ作ると、使われない sandbox・CSP・ブリッジを W 段まで保守することになる（R2b-4 を W 段へ送った 2026-10-23 の判断と同じ形）  |
+| plugin-design §6.2 の WIT（`config` は `validate` と `secret-keys` だけ）          | `config.schema` と `address.supported-kinds`（仮名）を足す | 汎用フォームとデータ型の選択肢の材料。WIT と trait は同じ PR で直す約束（plugin-design §6.2 の補足）                                                                    |
+
+## 1. 前提（コードの現状、2026-10-24 の main `9626f09c` に照合）
+
+行番号は目安。着手時に `rg -n "protocol === '(slmp|modbus-tcp)'|slmpDeviceTable|MODBUS_ONLY_DATA_TYPES|DEFAULT_PORTS|PROTOCOL_OPTIONS" apps crates` で再確認する。
+
+### 1.1 ドライバ API
+
+- `crates/banto-driver-api/src/driver.rs` の `DriverBase`: `descriptor`・`validate_config`・`secret_keys`・`parse_address`・`offset_address`・`address_help`・`probe`。**設定の欄の形（スキーマ）を返す口は無い**。`validate_config` は文字列の対の `Settings` を受けて、キーごとの `FieldError` を返す。
+- `DriverDescriptor`（`#[non_exhaustive]`）: `id`・`version`・`display_name`・`vendor`・`transports`・`capabilities`・`api_version`・`settings_version`。
+- 既定つきのメソッドの追加は API を壊さない（api-design §9.1。R2b-3a-2 の `probe` が前例）。
+
+### 1.2 接続の UI
+
+- `apps/banto-hub/src/lib/banto/plcConnectionForm.ts`（758 行）: `PROTOCOL_OPTIONS`（84 行、`modbus-tcp`・`slmp`・`postgres`・`push` の固定の表）、`DEFAULT_PORTS`（99 行）、既定のワード順、`protocol === 'modbus-tcp' || 'slmp'` の分岐（106・143 行）、フォーム ↔ 平らな REST の写し。
+- `apps/banto-hub/src/lib/components/ConnectionDrawer.svelte`（1,653 行）: 編集（774〜1,000 行付近）と表示（1,213〜1,340 行付近）の両方で、`slmp` の CPU 種別・`postgres` のデータベース・`push` の送り手の欄をプロトコル名で出し分ける。既定ポート・ワード順の「触ったか」の追跡（372・425 行）。
+
+### 1.3 タグの UI
+
+- `apps/banto-hub/src/lib/banto/slmpDeviceTable.ts`（184 行）: `crates/banto-plc` の SLMP のデバイス表の**手書きの写し**（plugin-design §12.1 の 5）。使い手は `continuousRegistration.ts`・`offsetCopy.ts`・`structRegistration.ts`（アドレスの番号を進める・ニーモニックを読む）。
+- `apps/banto-hub/src/lib/banto/tagAddressHelp.ts`（228 行）: プロトコル別のアドレスの説明と占有の注意（`slmpOccupancyHint`・`modbusOccupancyHint`・`pushOccupancyHint`）。
+- `routes/(app)/tags/+page.svelte:239` `dataTypeOptionsFor`: `modbus-tcp` だけ 64bit 型を出す（#325）。サーバー側は `crates/banto-tags/src/tag.rs:93` の `MODBUS_ONLY_DATA_TYPES`。
+- 書き込み可の既定（`writableDefault.ts`）と保存前の解析は、既に `POST /api/tags/parse-addresses`（`apps/banto-hub/core/src/rest/tags.rs:1327`、R2b-2d）でドライバに聞いている。**番号を進める（offset）口は REST に無い**。
+
+### 1.4 REST と保存
+
+- `crates/banto-tags/src/plc_connection.rs:999` `PlcConnectionInput` は平らな形（`host`・`port`・`unit_id`・`word_order`・`cpu_type`・`database`・`username`・`password`・push の `settings`）。`legacy::settings_from_flat` がプロトコルごとに型つきの JSON へ写す（connection-settings-design §4.3）。
+- MCP・設定パッケージ・ChronoGazer も同じ平らな形（R2b-7 で変える約束）。
+
+## 2. 範囲: R2b-6 で変えるもの・残すもの
+
+| 面                                        | R2b-6                                                                                     | 後の段                     |
+| ----------------------------------------- | ----------------------------------------------------------------------------------------- | -------------------------- |
+| `banto-driver-api`（公開 crate）          | 足す: `SettingsSchema`・`settings_schema()`・`supported_kinds()`。版は 0.3.0（Q8）        | -                          |
+| Modbus / SLMP のドライバ                  | スキーマとデータ型を実装。適合テストを足す                                                | -                          |
+| Hub の REST                               | 足す: `GET /api/drivers`・`POST /api/tags/offset-addresses`。変える: 接続の入出力の形     | -                          |
+| `banto-tags`                              | スキーマに従う保存。`MODBUS_ONLY_DATA_TYPES` を `supported_kinds` に替える                | 平らな欄の撤去（R2b-7）    |
+| Hub の UI（接続・タグ）                   | 汎用フォーム。TS の写しとプロトコル名の分岐を消す（`postgres`・`push`・`virtual` は残す） | `postgres` の撤去（R2b-8） |
+| MCP・設定パッケージ                       | 変えない（平らな形のアダプタを残す）                                                      | R2b-7                      |
+| ChronoGazer（REST・Tauri・UI）            | 変えない                                                                                  | R2b-7（Q7）                |
+| ドライバ同梱 UI（iframe・配信・ブリッジ） | 作らない                                                                                  | W 段（Q6）                 |
+
+## 3. 設定のスキーマ（6a）
+
+### 3.1 型（`banto-driver-api`、新しいモジュール `schema`）
+
+```rust
+/// 接続の設定の欄の並び（表示順）。キーは重複しない。
+#[non_exhaustive]
+pub struct SettingsSchema { pub fields: Vec<SettingField> }
+
+#[non_exhaustive]
+pub struct SettingField {
+    pub key: String,              // settings の JSON のキー（"host"・"port"・"cpu_type"）
+    pub label: String,            // 表示名（日本語固定、plugin-design §6.2 の補足）
+    pub help: Option<String>,     // 欄の下の説明
+    pub kind: FieldKind,
+    pub required: bool,
+    pub default: Option<SettingValue>,
+    pub group: FieldGroup,        // Basic（常に見せる）/ Advanced（「詳細」に畳む）
+}
+
+#[non_exhaustive]
+pub enum FieldKind {
+    Text { max_len: Option<u32>, placeholder: Option<String> },
+    Host,                                   // IPv4 / ホスト名（IPv6 は対象外、2026-09-29 オーナー決定）
+    Integer { min: Option<i64>, max: Option<i64> },
+    Choice { options: Vec<ChoiceOption> },  // { value, label }。値は文字列
+    Bool,
+    Secret,                                 // secret_keys() と一致させる（§3.3）
+}
+
+pub enum SettingValue { Text(String), Integer(i64), Bool(bool) }
+```
+
+- `serde` の feature で JSON にする（`DriverDescriptor` と同じ）。UI へはこの JSON をそのまま渡す。
+- **条件つきの表示（ある欄の値で別の欄を出す・隠す）は v1 に入れない**。Modbus / SLMP には要らず、要るドライバは W 段の同梱 UI で扱う（Q4）。欄どうしの整合は今までどおり `validate_config` が見る。
+- 「ポート」は `Integer { min: 1, max: 65535 }` で表す（専用の種類を作らない）。
+
+### 3.2 `DriverBase` に足すメソッド
+
+```rust
+/// 接続の設定の欄（WIT `config.schema`）。既定は空 = 汎用フォームは欄を出さない。
+fn settings_schema(&self) -> SettingsSchema { SettingsSchema::default() }
+```
+
+- 空のスキーマのドライバ（今の偽ドライバ・将来スキーマを書かないドライバ）は、汎用フォームが「このドライバには設定の欄がありません」と出す。JSON を手で書く欄は作らない（Q4）。
+
+### 3.3 適合テスト（`banto-driver-conformance` に足す。C17〜C19 の仮番）
+
+- **C17**: キーが重複しない。`Choice` の値が重複しない。既定値が種類と合う（`Integer` の範囲・`Choice` の値の中）。
+- **C18**: `secret_keys()` と、`kind = Secret` の欄のキーが**一致する**。
+- **C19**: スキーマの既定値だけで埋めた設定に、ドライバの適合テスト用の有効な設定（既にある fixture）を重ねたものが `validate_config` を通る。fixture の各キーはスキーマにある（スキーマに無いキーをドライバが読んでいないことの近似。`validate_config` の中身は覗けないため）。
+
+### 3.4 データ型の対応
+
+```rust
+/// このドライバが読めるタグのデータ型（WIT `address.supported-kinds`、仮名）。既定は 64bit を除く全部。
+fn supported_kinds(&self) -> Vec<DataType> { ... }
+```
+
+- Modbus は 64bit を含む全部、SLMP は今の既定（64bit を除く）。`banto-tags` の `MODBUS_ONLY_DATA_TYPES`（#325）の判定を、接続のドライバの `supported_kinds` に替える。`push` は今の `push_tag_errors` のまま（ホストの接続）。
+- 適合テスト **C20**: `supported_kinds` の各型で、ドライバの例のアドレス（`probe` の点か fixture）を `parse_address` できる。
+
+### 3.5 Modbus / SLMP のスキーマ（connection-settings-design §3.2 と同じキー・型）
+
+| ドライバ     | 欄（表示順）                                                                                                                                                               |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `modbus-tcp` | `host`（Host・必須）・`port`（Integer 1〜65535・既定 502）・`unit_id`（Integer 0〜255・既定 1）・`word_order`（Choice `high_low` / `low_high`・既定 `high_low`・Advanced） |
+| `slmp`       | `host`（Host・必須）・`port`（Integer 1〜65535・既定 5007）・`cpu_type`（Choice `Q` / `R`・既定 `R`）・`word_order`（Choice・既定 `low_high`・Advanced）                   |
+
+既定の値は今の `DEFAULT_PORTS`・`defaultWordOrderFor`・`banto-tags` の正規化と同じにする（6a の着手時に 3 か所を突き合わせ、食い違いがあれば止めて報告）。
+
+## 4. Hub の API と保存（6b）
+
+### 4.1 `GET /api/drivers`
+
+- 認証付き（読み取りの権限。plugin-design §8 の「一覧 API は認証付き」と同じ）。
+- 応答: `[{ id, displayName, vendor, version, capabilities, transports, settingsSchema, supportedKinds, addressHelp, kind: "frame" | "session" | "host" }]`。レジストリの登録順。
+- `postgres`・`push`・`virtual` は**載せない**（ホストの接続で、フォームは専用。§6.2）。UI は「ドライバの一覧 + ホストの接続」をまとめて選択肢にする。
+
+### 4.2 スキーマでの保存
+
+- `banto-tags` に純関数 `settings_from_schema(schema, input_json) -> Result<Map, Vec<FieldError>>` を置く: キーごとに種類を確かめ（`Integer` に `"502"` が来たら断る。文字列から数への読み替えはしない）、必須の欠けを報告し、既定値を埋め、スキーマに無いキーは**断る**（ドライバの `validate_config` は未知のキーを断らない約束なので、入口で止める。Q9）。
+- その後に今までどおり `settings_to_api` → `validate_config`。エラーは同じ `FieldError` の形で REST に返す（キーは JSON のキーのまま。UI は欄の下に出す）。
+- `legacy::settings_from_flat` の Modbus / SLMP の写しは、MCP・設定パッケージのために R2b-7 まで残す（平らな形 → `settings` の JSON を作り、上の関数を通す）。
+
+### 4.3 `POST /api/tags/offset-addresses`（6d）
+
+- 入力: `{ connectionId, items: [{ address, dataType, stringWords?, n }] }`。出力: 入力と同じ順で `{ ok: { canonical } } | { err: { message } }`。`parse-addresses`（R2b-2d）と同じ形・同じ件数の上限。
+- 中身はドライバの `offset_address`（`parse_address` で正規形にしてから）。
+
+## 5. REST の形（6b、Q2）
+
+- `/api/plc-connections` の作成・更新・応答を `{ name, protocol, enabled, simulation, settings }` に替える。`settings` の秘密のキーは応答で `{ "$secret": "set" | "unreadable" }`（今の `passwordState` の代わり）（値・参照は返さない）。更新で秘密のキーを省略すると保つ、`null` で消す、文字列で置き換える（今のパスワードの tri-state と同じ意味。connection-settings-design §4.3）。
+- `postgres`・`push` も同じ形にする（`settings` の中身は §3.2 の表のとおり）。push の `settings` は今も JSON なので、平らな欄が無くなるだけ。
+- **未適用キュー**: 中身の形（内部）が変わる。使用者無しの前提（2026-10-22 オーナー）なので、古い形のキューの項目は読めなければ捨てて起動ログに出す（Q10）。
+- MCP の接続のツール・設定パッケージ・`GET /api/sink/config` 等は変えない（R2b-7）。
+
+## 6. 汎用フォーム（6c）
+
+### 6.1 部品
+
+- `apps/banto-hub/src/lib/components/DriverSettingsForm.svelte`: `schema` と `value`（`settings` の JSON）を受け、欄を種類ごとの入力に描く（Text / Host → `input`、Integer → `input type=number`、Choice → `select`、Bool → チェックボックス、Secret → 「設定済み・変える・消す」の 3 択と入力）。Advanced の欄は「詳細」に畳む。
+- 欄の下のエラーは `FieldError.key` で引く（サーバーの応答と、保存前の UI の検査の両方）。UI の検査は種類・必須・範囲だけ（サーバーと同じ規則。意味の検証はサーバーだけ）。
+- 表示（読み取り専用）も同じ部品で描く（今の 1,213〜1,340 行の分岐を消す）。
+
+### 6.2 `ConnectionDrawer.svelte`
+
+- プロトコルの選択肢: `GET /api/drivers` の一覧 + ホストの接続（`postgres`・`push`）。`PROTOCOL_OPTIONS`・`DEFAULT_PORTS`・既定のワード順の表を消す。
+- ドライバを替えたとき: 新しいドライバのスキーマの既定値で埋め直す。**同じキーで、利用者が触った欄の値だけ引き継ぐ**（今の `portTouched`・`wordOrderTouched` の約束を一般化）。
+- `postgres`・`push` の専用の欄は残す（Q3）。`postgres` は R2b-8 で消えるので作り直さない。
+
+### 6.3 消すもの
+
+- `plcConnectionForm.ts` のプロトコル別の表と平らな形の写し（ファイルは汎用の部分だけ残すか、`driverSettingsForm.ts` に寄せる。着手時に決める）。
+- `ConnectionDrawer.svelte` の `form.protocol === 'slmp'` 等の分岐。
+
+## 7. アドレスの補助（6d、Q5）
+
+- `tagAddressHelp.ts`: アドレスの文法の説明は `GET /api/drivers` の `addressHelp` に替える。**占有の注意**（ワード数・ビットの扱い）はデータ型と `parse-addresses` の `wordCount` から汎用に作る（`slmpOccupancyHint`・`modbusOccupancyHint` を 1 つにする）。`push` の注意は残す。
+- `slmpDeviceTable.ts` を消す。`continuousRegistration.ts`・`offsetCopy.ts`・`structRegistration.ts` の番号の計算を `POST /api/tags/offset-addresses` に替える（一覧を作る前に 1 回まとめて呼ぶ。入力に追従して呼ぶ箇所は `parse-addresses` と同じ間引き）。
+- ドライバが解釈できないアドレス（今の「SLMP として読めなければ末尾の数字を進める」のフォールバック）は、API のエラーをそのまま行に出す（フォールバックの推測をやめる）。Modbus の `40001` 形式もドライバの `offset_address` で進む。
+- `dataTypeOptionsFor` を `supportedKinds` に替える（§3.4）。
+
+## 8. iframe の枠（Q6）
+
+- **推奨: W 段へ送る**。R2b-6 では作らない。理由は §0.1。
+- 決めておくこと（W 段で API を壊さないため）: 記述子への UI の入口の追加は `DriverDescriptor` が `#[non_exhaustive]` なので既定つきで足せる。汎用フォームと同梱 UI の関係は「同梱 UI があっても汎用フォームを残し、iframe は『補助』のタブとして並べる。保存は Hub 側のフォームで確定」（plugin-design §8 のブリッジの約束と同じ）。この 2 点を plugin-design §8 に注記する。
+- 代案（Q6 の b）: 6f として `DriverUiFrame.svelte`（`sandbox="allow-scripts"`・`event.source` の確認・ブリッジの型）と、Hub 本体の CSP の `frame-src 'self'` だけを入れる。中身は開発用のテストページだけ。
+
+## 9. PR の分け方
+
+| PR  | 内容                                                                                                                                                             | モデルの目安                       |
+| --- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------- |
+| 6a  | `banto-driver-api` の `schema`・`settings_schema`・`supported_kinds`、Modbus / SLMP の実装、適合テスト C17〜C20、WIT（plugin-design §6.2）と api-design の対応表 | sonnet                             |
+| 6b  | `banto-tags` の `settings_from_schema` と `supported_kinds` による型の判定、Hub の `GET /api/drivers`、`/api/plc-connections` の形の変更、未適用キュー           | opus（保存・秘密値・キューに触る） |
+| 6c  | `DriverSettingsForm.svelte` と `ConnectionDrawer.svelte` の置き換え、`plcConnectionForm.ts` の整理、vitest                                                       | sonnet                             |
+| 6d  | `POST /api/tags/offset-addresses`、`slmpDeviceTable.ts`・プロトコル別の説明の削除、タグの画面の置き換え                                                          | sonnet                             |
+| 6e  | docs（本書・refactor-plan・operations・mcp-reference の注記）・CHANGELOG・版（banto-hub alpha.39）                                                               | haiku                              |
+
+- 6c と 6d は 6b の後なら並べられる（触るファイルが分かれる）。
+- 6b で REST の形を変えた時点で、6c が入るまで今の UI は接続を保存できない。**6b と 6c は同じ版の中で続けて入れ、版は 6e で上げる**（途中の main は UI が壊れた状態になる。避けるなら 6b に今の UI の最小の追従を入れる。Q2 の判断と一緒に決める）。
+
+## 10. テスト
+
+- 6a: 適合テスト C17〜C20 を Modbus / SLMP で通す。偽ドライバ（スキーマ空）で既定のメソッドを確かめる。
+- 6b: `settings_from_schema` の単体（種類の違い・必須の欠け・範囲外・未知のキー・既定値の補完・秘密のキーの tri-state）。REST の統合テストを新しい形に書き換える（`banto-hub-host` 側。実ドライバが要る）。64bit 型の判定が Modbus で通り SLMP で断られる（#325 の約束が保たれる）。
+- 6c: `DriverSettingsForm` の vitest（種類ごとの描画・Advanced の畳み・エラーの表示・ドライバを替えたときの引き継ぎ）。
+- 6d: `offset-addresses` の REST の統合テスト（SLMP の 16 進のデバイス・ビットの `.F` の繰り上がり・Modbus の `400001`・範囲外のエラー）。連続登録・オフセットコピーの vitest は API を偽で差し替える。
+- 実機: 6e の前に、MELSEC（R08 試験機）と Modbus で、接続の作成・編集・接続テスト・連続登録を UI から 1 回ずつ（STATUS の実機の確かめの欄に入れる）。
+
+## 11. オーナー判断（未決）
+
+| Q   | 問い                                                        | 選択肢                                                                                                                                          | 推奨 |
+| --- | ----------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| Q1  | スキーマの表し方                                            | (a) 本書の小さな欄の型（WIT で表せる）/ (b) JSON Schema（汎用だが WIT で表しにくく、UI の描き方も広すぎる）                                     | (a)  |
+| Q2  | REST の形をいつ変えるか                                     | (a) Hub の REST だけ R2b-6（6b）で変え、MCP・設定パッケージ・ChronoGazer は R2b-7 / (b) R2b-7 を先にやる / (c) R2b-6 は平らな形のまま TS で写す | (a)  |
+| Q3  | 汎用フォームの対象                                          | (a) ドライバ（Modbus・SLMP）だけ。`postgres`・`push` は専用の欄を残す / (b) `postgres`・`push` もスキーマで書く                                 | (a)  |
+| Q4  | 条件つきの表示・スキーマが空のときの JSON の手書き欄        | (a) どちらも v1 に入れない / (b) 入れる                                                                                                         | (a)  |
+| Q5  | アドレス補助の API 化（TS の写しの削除）を R2b-6 に含めるか | (a) 含める（6d）/ (b) 別の段にする                                                                                                              | (a)  |
+| Q6  | iframe の枠                                                 | (a) W 段へ送る（記述子の入口と汎用フォームとの関係だけ注記）/ (b) 6f で枠とブリッジの型だけ入れる                                               | (a)  |
+| Q7  | ChronoGazer の接続の UI                                     | (a) R2b-7 で REST と一緒に追従 / (b) R2b-6 で汎用フォームを共有                                                                                 | (a)  |
+| Q8  | 版                                                          | (a) `banto-driver-api` 0.3.0（6a）、banto-hub は 6e で alpha.39 / (b) PR ごと                                                                   | (a)  |
+| Q9  | スキーマに無いキーを入口で                                  | (a) 断る / (b) 黙って捨てる / (c) 通す（今の `validate_config` の約束のまま）                                                                   | (a)  |
+| Q10 | 古い形の未適用キューの項目                                  | (a) 読めなければ捨てて起動ログに出す / (b) 平らな形のアダプタで読み替える                                                                       | (a)  |
+
+## 12. 確かめきれなかったこと・危険
+
+- `DEFAULT_PORTS`・`defaultWordOrderFor`（UI）と `banto-tags` の正規化・ドライバの既定が同じか（§3.5）。6a の着手時に突き合わせる。
+- 連続登録・オフセットコピーのフォールバック（SLMP として読めないアドレスの末尾の数字を進める）に依存した使い方が無いか。使用者無しの前提で、エラーを出す形に変えてよいと見ている（§7）。
+- 6b と 6c の間で main の UI が接続を保存できない窓（§9）。
+- 構造体登録（`structRegistration.ts`）がニーモニックを読む用途は、offset だけで置き換えられるか。6d の着手時に確かめ、無理なら `parse-addresses` の応答に `area` を足す（R2b-2d の形に既定つきで追加）。
