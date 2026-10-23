@@ -316,24 +316,40 @@ pub trait FrameConnection: Send + 'static {
     /// with an empty slice, so the choice must not depend on earlier calls
     /// and must not change the connection's state when it returns `None`.
     ///
-    /// The engine splits **every** frame that arrives during the sync,
-    /// including late responses to outstanding requests, with this step's
-    /// `expect`. So the sync step's `expect` must be a rule that delimits a
-    /// response from the response itself: [`FrameRule::LengthPrefixed`],
-    /// [`FrameRule::Terminator`] or [`FrameRule::DriverDecides`].
-    /// [`FrameRule::Fixed`] cannot be used (C17; the engine refuses it). With
     /// Called right after `create_connection`, **before** the handshake (the
     /// engine decides whether the line has a sync procedure by `sync_step(&[])`
     /// there), so it must not depend on state the handshake builds (C17).
-    /// `DriverDecides`, [`FrameConnection::is_complete`] called with the sync
-    /// step must delimit the first frame of its input at the right length
-    /// for the response (normal or exception) to **any** request that can be
-    /// sent on that line, not only for the sync request's own response.
-    /// The sync step's `max_len` must be no shorter than **any** response
-    /// that can flow on that line (handshake, read and write responses; C17,
-    /// 2026-10-23): a late response longer than it is still delimited and
-    /// skipped by its own length (up to the engine's cap), but it is never
-    /// accepted as the sync response.
+    ///
+    /// The engine tries up to `MAX_SYNC_ATTEMPTS` (3) times: when an attempt
+    /// times out, its signature joins `outstanding` (the device may still
+    /// answer it late) and the engine calls this again. `outstanding` is
+    /// therefore empty, or one normal request's signature (the request that
+    /// timed out or was cancelled; a successful sync clears them all), plus
+    /// the signatures of the earlier attempts. The first two attempts of
+    /// every such sequence must return `Some`; the third may return `None`.
+    /// **Every** step returned must satisfy, on its own (C17 checks each
+    /// attempt, not only the first):
+    ///
+    /// - it is receivable (C9), awaits a response, and its `expect` is not
+    ///   [`FrameRule::Fixed`]: the engine splits **every** frame that arrives
+    ///   during the sync, including late responses to outstanding requests,
+    ///   with this step's `expect`, so the rule must delimit a response from
+    ///   the response itself ([`FrameRule::LengthPrefixed`],
+    ///   [`FrameRule::Terminator`] or [`FrameRule::DriverDecides`]; with
+    ///   `DriverDecides`, [`FrameConnection::is_complete`] called with the sync
+    ///   step must delimit the first frame of its input at the right length
+    ///   for the response, normal or exception, to **any** request that can
+    ///   be sent on that line, alone or followed by more bytes);
+    /// - it has a [`signature`](Self::signature) that differs from every
+    ///   outstanding one, and [`response_matches`](Self::response_matches)
+    ///   tells its response from a late response to any outstanding request
+    ///   both ways (neither is accepted under the other's signature);
+    /// - its own response is no longer than its `max_len` (the engine never
+    ///   accepts a longer frame as the sync response), and its `max_len` is
+    ///   no shorter than **any** response that can flow on that line
+    ///   (handshake, read and write responses, earlier sync responses): a
+    ///   late response longer than it is still delimited and skipped by its
+    ///   own length (up to the engine's cap), but the line never syncs on it.
     fn sync_step(&mut self, _outstanding: &[Signature]) -> Option<Step> {
         None
     }
