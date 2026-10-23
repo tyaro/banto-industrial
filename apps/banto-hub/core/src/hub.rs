@@ -4184,6 +4184,64 @@ mod tests {
         drop(dir);
     }
 
+    /// #807 P2: a connection collected with `simulation = true` is switched
+    /// to `false` and the collector's commit fails, so the broker sessions are
+    /// rolled back (a *new* `SimDevice` and session). Applying the original
+    /// `true` configuration again must replace the collector's dead handle:
+    /// the plan's fingerprint carries the table's generation, so it differs
+    /// from the first plan's even though the settings are the same. (Without
+    /// the generation the plan reads "unchanged" and the values stall.)
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rolled_back_simulation_resumes_updating_after_the_same_config_is_reapplied() {
+        use crate::controller::RunMode;
+        let (_dir, manager, pool) = manager_env().await;
+        seed_running_simulation(&pool).await; // connection 1, simulation = true
+        manager.apply_run(RunMode::Configured).await.expect("first");
+        let collect = manager.current_values().unwrap();
+
+        // Waits until the tag's sample is Good and newer than `after_ms`.
+        async fn newer_than(collect: &CurrentValuesHandle, after_ms: i64) -> i64 {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    if let Some(sample) = collect.get("tag:1") {
+                        if sample.quality == Quality::Good && sample.ptime_ms > after_ms {
+                            return sample.ptime_ms;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the simulated tag keeps updating")
+        }
+        let first = newer_than(&collect, i64::MIN).await;
+
+        sqlx::query("UPDATE plc_connections SET simulation = 0 WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager.fail_next_apply_for_test();
+        manager
+            .apply_run(RunMode::Configured)
+            .await
+            .expect_err("the injected commit failure");
+
+        sqlx::query("UPDATE plc_connections SET simulation = 1 WHERE id = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager
+            .apply_run(RunMode::Configured)
+            .await
+            .expect("the original configuration applies again");
+        let collect = manager.current_values().unwrap();
+        // Two further updates, well after the re-apply.
+        let second = newer_than(&collect, first).await;
+        newer_than(&collect, second + 300).await;
+
+        manager.shutdown().await;
+    }
+
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -420,21 +420,24 @@ impl SettingsFingerprint {
         settings: &Settings,
         secret_keys: &[String],
     ) -> Self {
-        Self::of_connection_marked(protocol, conn, settings, secret_keys, false)
+        Self::of_connection_marked(protocol, conn, settings, secret_keys, None)
     }
 
     /// [`Self::of_connection`] for a session of the value layer's simulator
     /// (R2b-5b, design §4.1): the same inputs plus a simulation mark, so the
     /// fingerprint differs from the real session's even with identical
     /// settings (the simulator ignores `host` / `port`, so nothing else would
-    /// tell the two apart).
+    /// tell the two apart). `device_id` ([`SimDevice::id`]) is its
+    /// generation: a rebuilt table is another session even with the same
+    /// settings (#807 P2 - the loopback port that used to differ is gone).
     pub fn of_connection_simulated(
         protocol: &str,
         conn: Option<&PlcConnection>,
         settings: &Settings,
         secret_keys: &[String],
+        device_id: u64,
     ) -> Self {
-        Self::of_connection_marked(protocol, conn, settings, secret_keys, true)
+        Self::of_connection_marked(protocol, conn, settings, secret_keys, Some(device_id))
     }
 
     fn of_connection_marked(
@@ -442,7 +445,7 @@ impl SettingsFingerprint {
         conn: Option<&PlcConnection>,
         settings: &Settings,
         secret_keys: &[String],
-        simulated: bool,
+        simulated: Option<u64>,
     ) -> Self {
         let mut pairs: Vec<(&str, &str)> = settings
             .iter()
@@ -469,8 +472,9 @@ impl SettingsFingerprint {
         protocol.hash(&mut hasher);
         pairs.hash(&mut hasher);
         refs.hash(&mut hasher);
-        if simulated {
+        if let Some(device_id) = simulated {
             "\u{0}sim".hash(&mut hasher);
+            device_id.hash(&mut hasher);
         }
         SettingsFingerprint(hasher.finish())
     }
@@ -923,7 +927,7 @@ impl SessionDirectory {
         conn: &PlcConnection,
         settings: Settings,
     ) -> Result<BrokerHandle, BrokerError> {
-        self.ensure_with(conn, settings, false, |driver, settings, secret_keys| {
+        self.ensure_with(conn, settings, None, |driver, settings, secret_keys| {
             session_connector(
                 conn.clone(),
                 Arc::clone(driver),
@@ -949,7 +953,8 @@ impl SessionDirectory {
         settings: Settings,
         device: SimDevice,
     ) -> Result<BrokerHandle, BrokerError> {
-        self.ensure_with(conn, settings, true, |_, _, _| {
+        let sim_id = Some(device.id());
+        self.ensure_with(conn, settings, sim_id, |_, _, _| {
             Arc::new(move || {
                 let session = device.connect();
                 Box::pin(async move { Ok(session) })
@@ -964,7 +969,7 @@ impl SessionDirectory {
         &self,
         conn: &PlcConnection,
         settings: Settings,
-        simulated: bool,
+        simulated: Option<u64>,
         make_connector: impl FnOnce(&Arc<dyn SessionDriver>, Settings, Vec<String>) -> Connector,
     ) -> Result<BrokerHandle, BrokerError> {
         let resolved = resolve_session_driver(&self.registry, &conn.protocol).ok_or_else(|| {

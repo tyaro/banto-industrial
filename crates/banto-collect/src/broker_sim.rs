@@ -79,20 +79,17 @@ pub fn dial_fingerprint(
     registry: &DriverRegistry,
 ) -> SettingsFingerprint {
     let secret_keys = secret_keys_of(registry, &conn.protocol);
-    if target.is_simulated() {
-        SettingsFingerprint::of_connection_simulated(
+    match target {
+        DialTarget::Sim(settings, device) => SettingsFingerprint::of_connection_simulated(
             &conn.protocol,
             Some(conn),
-            target.settings(),
+            settings,
             &secret_keys,
-        )
-    } else {
-        SettingsFingerprint::of_connection(
-            &conn.protocol,
-            Some(conn),
-            target.settings(),
-            &secret_keys,
-        )
+            device.id(),
+        ),
+        DialTarget::Real(settings) => {
+            SettingsFingerprint::of_connection(&conn.protocol, Some(conn), settings, &secret_keys)
+        }
     }
 }
 
@@ -295,12 +292,43 @@ mod tests {
                 "modbus-tcp",
                 Some(&c),
                 target.settings(),
-                &keys
+                &keys,
+                match &target {
+                    DialTarget::Sim(_, d) => d.id(),
+                    _ => unreachable!(),
+                }
             )
         );
         assert_ne!(
             dial_fingerprint(&c, &target, &registry),
             dial_fingerprint(&c, &DialTarget::Real(target.settings().clone()), &registry)
+        );
+    }
+
+    /// #807 P2: the fingerprint carries the table's generation. Reusing the
+    /// table keeps it; a rebuilt table (off -> on, or after `remove`) differs
+    /// even with identical settings.
+    #[tokio::test]
+    async fn a_rebuilt_table_has_another_fingerprint() {
+        let registry = banto_drivers::builtin().registry;
+        let sims = BrokerSimRegistry::new();
+        let c = conn("modbus-tcp", true);
+        let (t1, _) = sims.resolve(&c, &registry).await;
+        let f1 = dial_fingerprint(&c, &t1, &registry);
+        let (t2, changed) = sims.resolve(&c, &registry).await;
+        assert!(!changed);
+        assert_eq!(f1, dial_fingerprint(&c, &t2, &registry));
+
+        sims.resolve(&conn("modbus-tcp", false), &registry).await;
+        let (t3, _) = sims.resolve(&c, &registry).await;
+        assert_ne!(f1, dial_fingerprint(&c, &t3, &registry));
+
+        sims.remove(c.id).await;
+        let (t4, changed) = sims.resolve(&c, &registry).await;
+        assert!(changed);
+        assert_ne!(
+            dial_fingerprint(&c, &t3, &registry),
+            dial_fingerprint(&c, &t4, &registry)
         );
     }
 
