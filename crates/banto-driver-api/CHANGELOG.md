@@ -5,7 +5,31 @@ banto-hub / ChronoGazer のドライバの境界（型と trait）の crate の�
 - **タグの名前**: 公開した版ごとに `banto-driver-api-v<版>`（例 `banto-driver-api-v0.1.0`）を付ける。ワークスペースのリリースのタグ（`v0.2.0-alpha.32` 等）とは別。CI の `cargo-semver-checks` は、この形の最も新しいタグを基準（baseline）にする。タグが 1 つも無い間は飛ばす。
 - **MSRV**: `Cargo.toml` の `rust-version`。CI がその版で `cargo check` する。上げるときは minor を上げ、ここに書く。
 
-## 0.1.0 — 未公開
+## 0.2.0 — 未公開
+
+R2b-3（docs/banto-hub-driver-io-design.md §10。2026-10-23、banto-hub v0.2.0-alpha.37）。**`0.1.0` はどこにも公開していない**（`banto-driver-api-v0.1.0` のタグも無い）ので、公開する最初の版はこの `0.2.0` になる。次の `0.1.0` 節は R1 の形の記録として残す（この版から見ると、`HostBound` を含む形）。R1 の形に合わせて書いたドライバがあれば、下の「壊れること」で直す。
+
+### 壊れること（0.1.0 の R1 の形から）
+
+- **`DriverKind::HostBound` と `DriverEntry::host_bound` を消した**（R2b-1a で `DriverKind::HostProvided` / `DriverEntry::host_provided` に名前と意味を替えた。R2b-3a-2 で組み込みの Modbus / SLMP が使っていた `HostBound` を消した）。
+  - 直し方: 識別・設定の検証・アドレスの関数だけを持ち I/O はホストが持つプロトコルは `DriverEntry::host_provided(driver)`。I/O もドライバに任せるなら、フレーム型は `DriverEntry::frame(driver)`、セッション型は `DriverEntry::session(driver)`。`DriverKind` は `#[non_exhaustive]` なので、`match` に `_` を書いていれば他は変わらない。
+  - 背景: R1 の `HostBound` は、`banto-broker` の側表（`DriverTable`）と、`banto_plc::Address` への戻し（橋）を前提にした一時の種類だった。broker はレジストリだけを見て接続をダイヤルし、要求の型は `TagSpec` / `WriteItem` になった（`DriverTable`・`DialFn`・`DriverDial` は `banto-broker` から消えた）。
+- Modbus TCP・SLMP の組み込みドライバは `FrameDriver` として登録される（R2b-3c・3d）。API の型・trait は変わらない。API を使う側（ホスト）が「`HostBound` の id」を数えていたなら、`DriverKind::Frame` / `Session` の id を数える。
+
+### 追加（破壊ではない）
+
+- `DriverBase::probe`（既定は `None`）: 接続テストが読む 1 点（アドレスの文字列と `TagKind`）。ホストの接続テストは、保存済みの接続の broker のセッションが使えればそのセッションで `probe` の 1 点を読み、無ければエンジンの 1 回きりの接続（ハンドシェイク + `probe` の 1 点）で行う（R2b-3a-2）。
+- `DriverDescriptor::settings_version`（`new` は 1。`with_settings_version`。serde は欠けていれば 1）（R2b-1a）。
+- `DriverKind::HostProvided` と `DriverEntry::host_provided`（R2b-1a）。
+- 共通のキー `keys::BAUD` / `DATA_BITS` / `PARITY` / `STOP_BITS`（シリアルの線の設定）と、`FrameConnection::inter_frame_gap`（既定は 0。エンジンが守る前のフレームからの最小の無音。Modbus RTU の t3.5 用。エンジンの上限 500 ms を超える値は契約違反として送信の前に断られる）（R2b-3e-1）。`keys::SERIAL_PORT` / `STATION` は予約でなく実際に使うキーになった。
+- 契約の明確化（型は変わらない）: フレーム型の `decode_read` は要求の `TagKind` に合う `RawValue` を返す（ビットは `Bool`、他の数値は `Int` / `Uint` / `Float`、文字列は `Bytes`。合わなければ項目ごとの `ItemError::Unsupported`）。書き込みの 1 つの step の `covers` に同じ添字を重ねない（違反は致命の `FatalError::Protocol`）。`FatalError::InvalidConfig` は設定の誤りだけで、タグのアドレスの誤りは `ItemError::Unsupported`（R2b-2a。接続は落とさない）。
+- 要求 - 応答の手順（`FrameDriver` の契約）を実装する本番の実行系は、新しい公開 crate **`banto-driver-engine`**（0.1.0）にある。ホストは API だけでなくこの crate も使う。
+
+### まだ入っていないこと
+
+- シリアル接続（Modbus RTU、時間切れ後の線の同期）は #803 で後回しにした（2026-10-23）。API 側の形（`Transport::Serial` / `SerialOverTcp`、線の設定キー、`inter_frame_gap`）は入っている。
+
+## 0.1.0 — 未公開（公開せず 0.2.0 に置き換えた）
 
 R1-1・R1-2（docs/banto-driver-api-design.md §10）。最初の版。R1-1 で型を、R1-2 で trait と `DriverRegistry` を入れた。MSRV は Rust 1.85。必須の依存はなし（`serde` は feature で任意）。
 

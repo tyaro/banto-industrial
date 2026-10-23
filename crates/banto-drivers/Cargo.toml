@@ -12,7 +12,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
 # `builtin().registry` の 2 つ（R2b-3c / 3d から `DriverEntry::frame`。broker の表は無くなった）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }

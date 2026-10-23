@@ -12,7 +12,7 @@
 # `rust-version` は API と同じ MSRV。CI の `driver-api` ジョブがこの版で check する。
 [package]
 name = "banto-driver-conformance"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -22,7 +22,7 @@ repository = "https://github.com/tyaro/banto-industrial"
 readme = false
 
 [dependencies]
-banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
+banto-driver-api = { path = "../banto-driver-api", version = "0.2.0" }
 banto-driver-engine = { path = "../banto-driver-engine", version = "0.1.0" }
 # 本物のエンジンを止めた時計で駆動する（R2b-3b-core）。
 # FaultProxy と例の実行に加え、時計を止める試験用に test-util を使う。

@@ -9,8 +9,9 @@
 //! parse with it. Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2)
 //! the broker's requests are [`TagSpec`](crate::TagSpec) /
 //! [`WriteItem`](crate::WriteItem), which carry it to the driver as is; the
-//! Modbus / SLMP session drivers turn `canonical` back into their own
-//! `banto_plc::Address` privately. Since R2b-3a-3 the collection plan (Hub
+//! Modbus / SLMP drivers (session drivers in R2b-3a, frame drivers since
+//! R2b-3c / 3d) turn `canonical` back into their own address type
+//! privately. Since R2b-3a-3 the collection plan (Hub
 //! and ChronoGazer) carries the driver's `TagSpec` as is too; ChronoGazer
 //! keeps the legacy rules for saving until R2b-7.
 //!

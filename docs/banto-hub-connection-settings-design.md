@@ -191,14 +191,14 @@ CREATE TABLE plc_connection_secrets (
 
 `Settings` は文字列の対しか持たない（§1.4）。入れ子をどう渡すかは ingest-design §13 の 5 が R2b-1 に残した問い。**API は変えず、ホストの純関数 1 つで変換する**（Q11）:
 
-| JSON の値          | `Settings` の値                                                                                        |
-| ------------------ | ------------------------------------------------------------------------------------------------------ |
-| 文字列             | そのまま                                                                                               |
-| 整数・小数         | 10 進の文字列（`serde_json` の表記）                                                                   |
-| `true` / `false`   | `"true"` / `"false"`                                                                                   |
-| オブジェクト・配列 | 詰めた JSON の文字列（R2a の `push` の `bridge` と同じ、ingest-design §3.2）                           |
-| `{"$secret": ...}` | 検証（`validate_config`）には**渡さない**。接続（R2b-3 の `SessionDriver::connect`）にだけ開封して渡す |
-| `null`             | キーを渡さない                                                                                         |
+| JSON の値          | `Settings` の値                                                                                                                                                                                                                           |
+| ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 文字列             | そのまま                                                                                                                                                                                                                                  |
+| 整数・小数         | 10 進の文字列（`serde_json` の表記）                                                                                                                                                                                                      |
+| `true` / `false`   | `"true"` / `"false"`                                                                                                                                                                                                                      |
+| オブジェクト・配列 | 詰めた JSON の文字列（R2a の `push` の `bridge` と同じ、ingest-design §3.2）                                                                                                                                                              |
+| `{"$secret": ...}` | 検証（`validate_config`）には**渡さない**。接続（R2b-3 で実装済み: `banto-broker` の `SecretOpener` が、ダイヤルの直前に `SessionDriver::connect` / `FrameDriver::create_connection` へ渡す `Settings` にだけ開封する）にだけ開封して渡す |
+| `null`             | キーを渡さない                                                                                                                                                                                                                            |
 
 - 置き場は `banto-tags`（`serde_json` を既に持つ）の純関数 `settings_to_api(&Map) -> Settings`。R1 の `banto_drivers::settings_from_connection`（固定列から作る）はこれに置き換えて消す。
 - 秘密のキーを検証に渡さないので、ドライバの `validate_config` は秘密値の形を見られない（`password` に形の規則は今も無い）。秘密のキーの「必須」は、ドライバが必須にするなら別の口が要る（R2b-1 では無い。`postgres` のパスワードは任意、`plc_connection.rs:1062-1066`）。
@@ -427,7 +427,7 @@ plugin-design §7.4（有効化の前に保存済みの設定を新しい版で�
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `RegistrySnapshot::load_connection`（`config.rs:497-510`）       | SELECT を新しい列に（checklist §5 の #605: `COLUMNS` と同時に直す）。`secrets: Vec<SealedSecretRow>` を足し、同じ接続（トランザクション）で `plc_connection_secrets` を読む     |
 | 計画（`modbus_config_for`・`slmp_config_for`）                   | 変えない（平らな欄の読み取りの写しを読む）。`settings` が検証に通らない・ドライバが無い・版が新しすぎる接続は §4.4 の除外。厳格版（Hub の preflight）は今どおり除外があれば断る |
-| broker・ドライバの `dial`                                        | 変えない（R2b-3 で `Settings` を直接使う）                                                                                                                                      |
+| broker・ドライバの `dial`                                        | 変えない（R2b-3 で `Settings` を直接使う）。**実装済み（2026-10-23）: broker はレジストリのドライバを `Settings` でダイヤルし、秘密値はダイヤルの直前に開封する**               |
 | `banto_drivers::settings_from_connection`                        | `banto_tags::settings_to_api` に置き換えて消す（R2b-1c）                                                                                                                        |
 | `PushSource`・`IngestHub`                                        | 変えない（`push` の `settings` の中身と形は R2a のまま）。`push` がレジストリに載るだけ                                                                                         |
 | `banto-db-source`・ブリッジ                                      | 共有 crate は変えない。ブリッジは `unavailableSources` を読む（§5.4）                                                                                                           |
