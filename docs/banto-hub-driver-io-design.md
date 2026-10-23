@@ -202,6 +202,8 @@ banto-drivers（組み立て役: registry だけを返す）── banto-hub-hos
 
 ### 4.4 シミュレーション（変えないが、ダイヤルの材料が変わる）
 
+> **2026-10-24、R2b-5 の注記**: 本節の「`Settings` の `host` / `port` を差し替えてワイヤのシミュレータへ張る」形は、R2b-5b で**やめた**。`BrokerSimRegistry::resolve` は `DialTarget` を返し、`simulation = true` の接続は値の層の `SimSession` で張る（ソケットは使わない）。詳細は [banto-hub-driver-sim-design.md](banto-hub-driver-sim-design.md)。以下は R2b-3 当時の設計。
+
 - Hub の `BrokerSimRegistry::resolve`（`broker_glue.rs:822`）は今「`(host, port, 同一性)`」を返し、broker のダイヤルに使う列を差し替えている。3a-2 では「`Settings` の `host` / `port` を差し替えた `Settings`」を返す形にする。シミュレータの種類を `"modbus-tcp"` で選ぶ分岐（`:835`）は R2b-5 まで残す（grep の例外に件数つきで載せる）。
 - ChronoGazer のシミュレーションも同じ形にする（§8）。
 
