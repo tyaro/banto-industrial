@@ -104,7 +104,7 @@ struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た�
 - `Numeric(Bit)` と `bit: Some(_)` のアドレス: `((t / 100 ms) + index) % 2 == 1` のトグル。
 - `Numeric(整数)`: ランプ波 `((t / 100 ms) + index * 16) % 範囲` を型の範囲に収めた `Value::F64`。u16 なら今と同じラップ。符号付きは 0 から正の側だけ（今の u16 のランプと見た目を揃える）。
 - `Numeric(f32 / f64)`: 同じランプを `f64` に。
-- `Str { words, .. }`: `format!("SIM-{index}-{tick}")` の**末尾** `words * 2` バイトを残す（ASCII だけなので encoding は問わない）。末尾は tick の下の桁なので、最短の 1 語（`"23"` のような 2 桁）でも tick ごとに変わる（2026-10-23 オーナーのレビュー #805 の P2 1: 先頭から切ると 1〜2 語で値が固定される）。今まで対象外だった文字列が動く。
+- `Str { words, .. }`: `format!("SIM-{index}-{phase}")`（`phase` は数値と同じ `tick + index * 16`。1 語でも同じ tick の隣のセルと値が違う。2026-10-23 Codex の P2）の**末尾** `words * 2` バイトを残す（ASCII だけなので encoding は問わない）。末尾は tick の下の桁なので、最短の 1 語（`"23"` のような 2 桁）でも tick ごとに変わる（2026-10-23 オーナーのレビュー #805 の P2 1: 先頭から切ると 1〜2 語で値が固定される）。今まで対象外だった文字列が動く。
 
 生成は決定的（時刻と index だけ）なので、同じ 100 ms の間に 2 度読めば同じ値、`on_change` の購読は 100 ms ごとに発火する（ux-plan §1 の「固定値では購読が発火しない」に応える）。背景タスクは無い（Q4）。
 
@@ -113,7 +113,7 @@ struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た�
 `write_batch(items)` は item ごとに:
 
 1. `spec.address.writable_area == false` → `ItemError::Rejected("この領域は書き込めません")`（実機なら `Device` の例外。入力レジスタ・接点入力・SLMP の `X` など）。
-2. 値の種類が `kind` と合わない（`Bit` に `F64` など）→ `ItemError::Rejected`。整数型は範囲の検査（api-design §9.2 のドライバの仕事を値の層で代行。範囲外は `Rejected`）。整数型への小数は `Rejected`（Hub の値の検査 `write_path.rs` と同じ）。文字列は**タグのエンコーディング（UTF-8 / Shift-JIS）で符号化したバイト数**が `words * 2` を超えるもの、そのエンコーディングで表せない文字を含むものを `Rejected`（Hub の関門と `encode_string_value` と同じ。2026-10-23 オーナーのレビュー #806 の P2 3）。
+2. 値の種類が `kind` と合わない（`Bit` に `F64` など）→ `ItemError::Rejected`。整数型は範囲の検査（api-design §9.2 のドライバの仕事を値の層で代行。範囲外は `Rejected`）。有限でない数（NaN・±inf）はどの型でも、整数型への小数も `Rejected`（Hub の値の検査 `write_path.rs` と同じ）。文字列は**タグのエンコーディング（UTF-8 / Shift-JIS）で符号化したバイト数**が `words * 2` を超えるもの、そのエンコーディングで表せない文字を含むものを `Rejected`（Hub の関門と `encode_string_value` と同じ。2026-10-23 オーナーのレビュー #806 の P2 3）。
 3. 通れば held に置き、`writes += 1`。`Ok(())`。
 
 RMW（SLMP の bit-in-word、`crates/banto-driver-slmp/src/frame_conn.rs:32-45`）は値の層に無い: `D100.5` は `D100` と別のセル（Q3）。多語の重なりも再現しない。これらの再現はドライバ crate の P0-3・C13〜C15 で足りている（§1.5）。Hub の関門（`writable`・スコープ・レート・値検査・監査の先書き・`write_enabled`）は broker の手前なので変わらない。
