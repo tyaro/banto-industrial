@@ -79,7 +79,6 @@ import {
 	listTags,
 	createTag,
 	deleteTag,
-	listSimulationCoverage,
 	listConfigExclusions,
 	isTagRegistryAvailable,
 	DEMO_MODE_MESSAGE,
@@ -156,7 +155,6 @@ describe('デモモード（バックエンドが無い）', () => {
 		await expect(createCollectionGroup(groupInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(listTags()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(createTag(tagInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
-		await expect(listSimulationCoverage()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(listConfigExclusions()).rejects.toThrow(DEMO_MODE_MESSAGE);
 
 		expect(invoke).not.toHaveBeenCalled();
@@ -220,13 +218,6 @@ describe('Tauri モード', () => {
 		expect(created.simulation).toBe(true);
 	});
 
-	it('#413: listSimulationCoverage は invoke("simulation_coverage_list") を引数なしで呼ぶ', async () => {
-		testState.bantoMode = 'tauri';
-		vi.mocked(invoke).mockResolvedValueOnce([]);
-		await listSimulationCoverage();
-		expect(invoke).toHaveBeenCalledWith('simulation_coverage_list', undefined);
-	});
-
 	it('#414 段階2: listConfigExclusions は invoke("config_exclusions_list") を引数なしで呼ぶ', async () => {
 		testState.bantoMode = 'tauri';
 		vi.mocked(invoke).mockResolvedValueOnce([]);
@@ -280,7 +271,7 @@ describe('サーバーモード（REST）', () => {
 		);
 	});
 
-	it('#413: simulation は PUT の JSON body に載り、listSimulationCoverage は GET /api/simulation-coverage', async () => {
+	it('#413: simulation は PUT の JSON body に載る', async () => {
 		testState.bantoMode = 'server';
 		const input = { ...connectionInput, simulation: true };
 		mockFetchOnce({ status: 200, ok: true, body: { id: 4, ...input } });
@@ -288,13 +279,6 @@ describe('サーバーモード（REST）', () => {
 		expect(fetch).toHaveBeenCalledWith(
 			'/api/plc-connections/4',
 			expect.objectContaining({ method: 'PUT', body: JSON.stringify(input) })
-		);
-
-		mockFetchOnce({ status: 200, ok: true, body: [] });
-		await listSimulationCoverage();
-		expect(fetch).toHaveBeenCalledWith(
-			'/api/simulation-coverage',
-			expect.objectContaining({ method: 'GET' })
 		);
 
 		mockFetchOnce({ status: 200, ok: true, body: [] });

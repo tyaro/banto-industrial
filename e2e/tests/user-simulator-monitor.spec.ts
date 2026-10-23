@@ -304,7 +304,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			engHi: 65535
 		});
 		// D-2: 工学値レンジが無く LL..HH = 0..1 がレンジになる。ランプ波は開発用 PLC の
-		// 起動から 100ms ごとに増える（`banto_collect::simulation`）ので、ここに来る
+		// 起動から 100ms ごとに増える（`banto_plc::ramp`）ので、ここに来る
 		// ころには 1 を超えている（HH 以上・レンジ上限超え。u16 で一周するのは
 		// 約 109 分後）。
 		const over = await postJson<NamedRow>(page.request, headers, '/api/tags', {
