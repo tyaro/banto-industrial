@@ -151,7 +151,7 @@ pub async fn resolve(&self, conn, registry) -> (DialTarget, bool /* changed */)
 ```
 
 - `Option` を外す: シミュレータの無いプロトコルという概念が無くなるので、`None` の枝（`broker_sim.rs:140-150`、`sessions.rs:108-110`、`hub.rs:2072-2078`）を消す。
-- `conn.simulation` のとき、接続 id の `SimDevice` を作る（無ければ）か再利用し、`Sim(settings, device)`。`false` なら持っていた `SimDevice` を捨てて `Real(settings)`。
+- `conn.simulation` のとき、接続 id の `SimDevice` を作る（無ければ）か再利用し、`Sim(settings, device)`。**再利用は同じ `protocol` のときだけ**: 登録簿は `SimDevice` と一緒に作ったときの `protocol` を持ち、接続の `protocol` が変わっていれば古い `SimDevice` を捨てて作り直す（前のドライバの held が、正規形の重なる新しいドライバのタグへ漏れないように。2026-10-23 Codex の P2）。5b のテストで「プロトコルを変えると held が消える」を確かめる。`false` なら持っていた `SimDevice` を捨てて `Real(settings)`。
 - `changed` の意味はそのまま: 指紋（§4.1 の印つき）が前回と違う。シミュレーションの on / off・設定の変更・秘密の参照の差し替えで `true`。
 - 呼び手（`sessions.rs:91-150`・`hub.rs:2072-2082`）は `match target { Real(s) => ensure_connection_with_settings, Sim(s, d) => ensure_simulated_connection }`。`remove` / `shutdown` の順（セッションを止めてから）はそのまま。
 - `banto_collect::simulation` への依存が `broker_sim.rs` から消える。名前 `BrokerSimRegistry` は残す（#339 で付けた名、呼び手が多い）。
