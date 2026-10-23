@@ -141,6 +141,19 @@ impl banto_driver_api::DriverBase for FrameDial {
     fn probe(&self) -> Option<(String, banto_driver_api::TagKind)> {
         self.0.probe()
     }
+    fn settings_schema(&self) -> banto_driver_api::SettingsSchema {
+        self.0.settings_schema()
+    }
+    fn supported_kinds(&self) -> Vec<banto_driver_api::KindName> {
+        self.0.supported_kinds()
+    }
+    fn offset_words(
+        &self,
+        canonical: &str,
+        n: i64,
+    ) -> Result<String, banto_driver_api::AddressError> {
+        self.0.offset_words(canonical, n)
+    }
 }
 
 impl banto_driver_api::SessionDriver for FrameDial {

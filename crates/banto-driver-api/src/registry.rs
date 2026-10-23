@@ -25,6 +25,7 @@ use std::sync::Arc;
 use crate::address::{DriverAddress, DriverId};
 use crate::driver::{AddressError, DriverBase, DriverDescriptor};
 use crate::frame::FrameDriver;
+use crate::schema::{KindName, SettingsSchema};
 use crate::session::SessionDriver;
 use crate::settings::{FieldError, Settings};
 use crate::types::TagKind;
@@ -248,6 +249,15 @@ macro_rules! forward_driver_base {
             fn probe(&self) -> Option<(String, TagKind)> {
                 self.0.probe()
             }
+            fn settings_schema(&self) -> SettingsSchema {
+                self.0.settings_schema()
+            }
+            fn supported_kinds(&self) -> Vec<KindName> {
+                self.0.supported_kinds()
+            }
+            fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+                self.0.offset_words(canonical, n)
+            }
         }
     };
 }
@@ -322,6 +332,19 @@ mod tests {
                 TagKind::numeric(DataType::U16),
             ))
         }
+        fn settings_schema(&self) -> SettingsSchema {
+            SettingsSchema::new(vec![crate::schema::SettingField::new(
+                format!("{}-field", self.id()),
+                "label",
+                crate::schema::FieldKind::integer(1, 10),
+            )])
+        }
+        fn supported_kinds(&self) -> Vec<KindName> {
+            vec![KindName::String]
+        }
+        fn offset_words(&self, canonical: &str, n: i64) -> Result<String, AddressError> {
+            Ok(format!("{canonical}@{n}w"))
+        }
     }
 
     impl FrameDriver for Probe {
@@ -362,6 +385,16 @@ mod tests {
             base.probe(),
             Some((format!("{id}-probe"), TagKind::numeric(DataType::U16)))
         );
+        assert_eq!(
+            base.settings_schema(),
+            SettingsSchema::new(vec![crate::schema::SettingField::new(
+                format!("{id}-field"),
+                "label",
+                crate::schema::FieldKind::integer(1, 10),
+            )])
+        );
+        assert_eq!(base.supported_kinds(), vec![KindName::String]);
+        assert_eq!(base.offset_words("A1", 3).unwrap(), "A1@3w");
     }
 
     #[test]

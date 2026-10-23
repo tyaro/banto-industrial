@@ -274,7 +274,7 @@ interface config {
   record choice-option { value: string, label: string }
   record text-spec { max-len: option<u32>, placeholder: option<string> }
   record integer-spec { min: option<s64>, max: option<s64> }
-  variant field-kind { text(text-spec), host, integer(integer-spec), choice(list<choice-option>), bool, secret }
+  variant field-kind { text(text-spec), host, integer(integer-spec), choice(list<choice-option>), %bool, secret }
   variant setting-value { text(string), integer(s64), boolean(bool) }
   enum field-group { basic, advanced }
   record setting-field {

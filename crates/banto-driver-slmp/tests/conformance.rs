@@ -135,6 +135,8 @@ fn statics() -> StaticFixtures {
         ("X0010", n(Bit), "X10"),
         ("D0000", one(), "D0"),
         ("D16777215", one(), "D16777215"),
+        // C21: one word on is only a valid start for a one-word kind.
+        ("D16777214", n(F32), "D16777214"),
         ("D100.5", n(Bit), "D100.5"),
         ("W10.0", n(Bit), "W10.0"),
         ("ZR5.F", n(Bit), "ZR5.F"),

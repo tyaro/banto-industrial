@@ -4,8 +4,8 @@
 //! runtime.
 
 use banto_driver_api::{
-    DriverBase, FieldKind, KindName, SettingValue, Settings, SettingsSchema, StringEncoding,
-    TagKind,
+    DataType, DriverBase, FieldKind, KindName, SettingValue, Settings, SettingsSchema,
+    StringEncoding, TagKind,
 };
 
 use crate::{Failure, StaticFixtures};
@@ -280,7 +280,19 @@ fn c21_c22_word_offsets<D: DriverBase + ?Sized>(
             let Ok(next) = driver.offset_words(canonical, n) else {
                 continue;
             };
-            let moved = match driver.parse_address(&next, kind) {
+            // `offset_words` takes no kind, so the moved address may overrun
+            // the address space as the original (wide) kind while being a
+            // valid start for a one-word kind (`D16777214` f32 + 1). Retry
+            // with a one-word kind before calling it a failure.
+            let one_word = if matches!(kind, TagKind::Numeric(DataType::Bit)) {
+                TagKind::numeric(DataType::Bit)
+            } else {
+                TagKind::numeric(DataType::U16)
+            };
+            let parsed = driver
+                .parse_address(&next, kind)
+                .or_else(|first| driver.parse_address(&next, &one_word).map_err(|_| first));
+            let moved = match parsed {
                 Ok(a) => a,
                 Err(e) => {
                     failures.push(Failure::new(
