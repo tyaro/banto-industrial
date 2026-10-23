@@ -263,3 +263,34 @@ async fn a_mixed_batch_reads_numerics_and_keeps_strings_unsupported() {
     session.disconnect().await;
     sim.stop();
 }
+
+/// 0xFFFF をまたぐ複数レジスタのタグは、そのタグだけが `Unsupported` になる。
+/// となりの正しいタグは同じ要求に混ざらず、値が読める。ちょうど 0xFFFF で
+/// 終わるものは通る。
+#[tokio::test]
+async fn a_span_past_the_address_space_is_unsupported_alone() {
+    let sim = Simulator::start().await;
+    sim.set_holding_register(65534, 11);
+    sim.set_holding_register(65535, 22);
+    sim.set_holding_registers(65534, &[0x0003, 0x0004]);
+
+    let mut session = connect(&sim, Duration::from_secs(5)).await.unwrap();
+    let specs = [
+        spec("465535", n(DataType::U16)),
+        // offset 65535 の U32 は 65537 で終わる。
+        spec("465536", n(DataType::U32)),
+        // offset 65534 の U32 は 65536 ちょうどで終わる。
+        spec("465535", n(DataType::U32)),
+    ];
+    let values = session.read_batch(&specs).await.expect("the call is Ok");
+    assert_eq!(values.len(), 3);
+    assert_eq!(values[0], Ok(Value::F64(3.0)));
+    assert!(
+        matches!(values[1], Err(ItemError::Unsupported(_))),
+        "{:?}",
+        values[1]
+    );
+    assert_eq!(values[2], Ok(Value::F64(f64::from(0x0004_0003_u32))));
+    session.disconnect().await;
+    sim.stop();
+}

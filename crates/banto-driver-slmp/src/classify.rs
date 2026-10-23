@@ -70,7 +70,8 @@ pub fn classify_write(err: PlcWriteError) -> Result<ItemError, FatalError> {
         | PlcWriteError::ValueTypeMismatch { .. }
         | PlcWriteError::ValueOutOfRange { .. }
         | PlcWriteError::ModbusReadOnlyArea { .. }
-        | PlcWriteError::UnsupportedRequestKind { .. } => {
+        | PlcWriteError::UnsupportedRequestKind { .. }
+        | PlcWriteError::AddressSpanOutOfRange { .. } => {
             Ok(ItemError::Unsupported(err.to_string()))
         }
         PlcWriteError::ConflictingBitWrite { .. }
@@ -131,7 +132,8 @@ mod tests {
             | PlcWriteError::ValueTypeMismatch { .. }
             | PlcWriteError::ValueOutOfRange { .. }
             | PlcWriteError::ModbusReadOnlyArea { .. }
-            | PlcWriteError::UnsupportedRequestKind { .. } => Want::Unsupported,
+            | PlcWriteError::UnsupportedRequestKind { .. }
+            | PlcWriteError::AddressSpanOutOfRange { .. } => Want::Unsupported,
             PlcWriteError::ConflictingBitWrite { .. }
             | PlcWriteError::BitWriteVerificationFailed { .. } => Want::Rejected,
             PlcWriteError::ConnectTimeout(_)
@@ -239,6 +241,11 @@ mod tests {
             PlcWriteError::UnsupportedRequestKind {
                 kind: "String".into(),
             },
+            PlcWriteError::AddressSpanOutOfRange {
+                area: "holding-register".into(),
+                offset: 65535,
+                words: 2,
+            },
         ]
     }
 
@@ -258,7 +265,7 @@ mod tests {
             .map(std::mem::discriminant)
             .collect();
         assert_eq!(writes.len(), every_write_error().len());
-        assert_eq!(writes.len(), 16);
+        assert_eq!(writes.len(), 17);
     }
 
     #[test]
