@@ -44,4 +44,7 @@ banto-plc-write = { path = "../banto-plc-write", features = ["simulator"] }
 # R1-5（§7.3）: tests/conformance.rs。適合テスト一式と、そのピアになる banto-plc の
 # SLMP シミュレータ（`slmp/simulator.rs`）。
 banto-driver-conformance = { path = "../banto-driver-conformance" }
+# R2b-3d-2: tests/conformance.rs と tests/p0_3.rs が、フレーム型のドライバを本物の
+# エンジン（`FrameSession`）で包んで走らせる。
+banto-driver-engine = { path = "../banto-driver-engine" }
 banto-plc = { path = "../banto-plc", features = ["simulator"] }

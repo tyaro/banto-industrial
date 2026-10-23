@@ -10,6 +10,15 @@
 //!   behind a `FaultProxy`. The bit-in-word writes go through the production
 //!   read-modify-write (`execute_one_bit_write`); C14's check-read mismatch
 //!   and C15's refusals are made by the proxy rewriting one response.
+//! - The same `session::run_all_against` (C1-C8, C12-C15) through the
+//!   frame-type `SlmpDriver` wrapped by the real engine (`FrameSession`,
+//!   R2b-3d-2, docs/banto-hub-driver-io-design.md §11.2), on the R and the
+//!   Q series. The wrapper is the one `banto-broker` puts around a
+//!   frame-type entry (`FrameDial`, crate-private there), as in
+//!   `banto-driver-modbus`'s `tests/conformance.rs`. The bit-in-word writes
+//!   go through `write_next`'s three steps, so the same response patches
+//!   (read, write-back, check read) apply. The session-type run above stays
+//!   until the broker's registration moves to the frame type (3d-join).
 //!
 //! Every simulator and proxy binds 127.0.0.1:0, so these tests need no
 //! nextest test-group.
@@ -17,18 +26,72 @@
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DataType, DriverAddress, DriverBase, ItemError, SessionDriver, Settings,
-    StringEncoding, TagKind, TagSpec, Value,
+    AddressError, BoxFuture, ConnectContext, DataType, DriverAddress, DriverBase, DriverDescriptor,
+    FatalError, FieldError, ItemError, Session, SessionDriver, Settings, StringEncoding, TagKind,
+    TagSpec, Value,
 };
 use banto_driver_conformance::proxy::FaultProxy;
 use banto_driver_conformance::session::{self, BitWriteCase, ResponsePatch, SessionFixtures};
 use banto_driver_conformance::{static_checks, StaticFixtures};
+use banto_driver_engine::transport::TransportSpec;
+use banto_driver_engine::FrameSession;
 use banto_driver_slmp::SlmpDriver;
 use banto_plc::slmp::address::SlmpDevice;
 use banto_plc::slmp::simulator::Simulator;
 
 fn n(data_type: DataType) -> TagKind {
     TagKind::numeric(data_type)
+}
+
+/// The frame-type driver as a `SessionDriver`: connect = the engine's
+/// `FrameSession` over TCP to the settings' host and port.
+struct EngineSession;
+
+impl DriverBase for EngineSession {
+    fn descriptor(&self) -> &DriverDescriptor {
+        SlmpDriver.descriptor()
+    }
+    fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
+        SlmpDriver.validate_config(settings)
+    }
+    fn secret_keys(&self) -> Vec<String> {
+        SlmpDriver.secret_keys()
+    }
+    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
+        SlmpDriver.parse_address(text, kind)
+    }
+    fn offset_address(
+        &self,
+        canonical: &str,
+        kind: &TagKind,
+        n: i64,
+    ) -> Result<String, AddressError> {
+        SlmpDriver.offset_address(canonical, kind, n)
+    }
+    fn address_help(&self) -> String {
+        SlmpDriver.address_help()
+    }
+    fn probe(&self) -> Option<(String, TagKind)> {
+        SlmpDriver.probe()
+    }
+}
+
+impl SessionDriver for EngineSession {
+    fn connect(
+        &self,
+        settings: &Settings,
+        cx: ConnectContext,
+    ) -> BoxFuture<'static, Result<Box<dyn Session>, FatalError>> {
+        let settings = settings.clone();
+        Box::pin(async move {
+            let spec = TransportSpec::Tcp {
+                host: settings.get("host").expect("host").to_string(),
+                port: settings.get("port").expect("port").parse().expect("port"),
+            };
+            let session = FrameSession::connect(&SlmpDriver, &settings, &spec, &cx, None).await?;
+            Ok(Box::new(session) as Box<dyn Session>)
+        })
+    }
 }
 
 fn statics() -> StaticFixtures {
@@ -259,6 +322,34 @@ async fn session_conforms() {
     let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
     assert!(failures.is_empty(), "{text:#?}");
     sim.stop();
+}
+
+/// The frame-type driver in the engine, on `cpu` (module doc).
+async fn frame_session_conforms(cpu: &str) {
+    let sim = Simulator::start().await;
+    seed(&sim);
+    let proxy = FaultProxy::start(sim.addr).await.unwrap();
+    let mut f = fixtures();
+    f.statics.settings.insert("cpu_type", cpu);
+    let failures = session::run_all_against(&EngineSession, &f, &proxy).await;
+    let last = sim.last_subcommand();
+    let text: Vec<String> = failures.iter().map(ToString::to_string).collect();
+    assert!(failures.is_empty(), "{cpu}: {text:#?}");
+    // The requests really were the series' (bit 1 of the subcommand is set
+    // on R - `0002` / `0003` - and clear on Q - `0000` / `0001`).
+    let want = if cpu == "Q" { 0x0000 } else { 0x0002 };
+    assert_eq!(last.map(|s| s & 0x0002), Some(want), "{cpu}");
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frame_session_conforms_on_r() {
+    frame_session_conforms("R").await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn frame_session_conforms_on_q() {
+    frame_session_conforms("Q").await;
 }
 
 /// Pinned outside the harness (which also accepts an item `Unsupported`):

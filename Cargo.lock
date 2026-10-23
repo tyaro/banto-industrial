@@ -757,6 +757,7 @@ dependencies = [
  "banto-broker",
  "banto-driver-api",
  "banto-driver-conformance",
+ "banto-driver-engine",
  "banto-plc",
  "banto-plc-write",
  "banto-tags",
