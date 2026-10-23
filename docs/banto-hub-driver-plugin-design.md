@@ -457,6 +457,8 @@ R1 は WASM と無関係に 12.1 の 1（散らばったプロトコルの分岐
 
 ### 12.6 R1 の CI 上の利点: ドライバ API で依存を逆転する（2026-10-19 検討）
 
+> **R2b-3 の後の現状（2026-10-23）**: Modbus TCP・SLMP は `banto-driver-api` の `FrameDriver` になり、通信は公開 crate `banto-driver-engine` が担う（`banto-broker` が API とエンジンに依存し、`banto-plc` / `banto-plc-write` の I/O は消えた。計画・デコード・フレーム・シミュレータの部品は残る。io-design Q7）。CI の `driver-api` ジョブと判定（`ci-changes.mjs` の `run_driver_api`）は `banto-driver-api`・`banto-driver-engine`・`banto-driver-conformance` の 3 つを対象にしている（MSRV・features・semver。semver の基準は crate ごとの `<crate 名>-v*` のタグで、最初の公開まで飛ばす）。`banto-plc` の実装本体の変更が core・ChronoGazer に届く点は、部品が残るので完全には外れていない。下の「今の依存」は 2026-10-19 の時点の記録。
+
 R1 は WASM と無関係に、**ドライバだけの変更で CI を短くする**利点がある。
 
 **今の依存（2026-10-19 に `cargo metadata` で確認）**:

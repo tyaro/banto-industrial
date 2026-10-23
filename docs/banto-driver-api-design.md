@@ -1,7 +1,7 @@
 # banto-driver-api 詳細設計（R1: ドライバ API とレジストリ）
 
 作成日: 2026-10-19
-状態: **設計確定（2026-10-19 オーナー決定。§12 の Q1〜Q8 と §0.1 の再確認（P0-3 の 6 本目を含む）を決定済み）・R1 の全 PR 完了（2026-10-21。R1-7a の `build-release.ps1` の dry run も同日 Windows の手元で通過）・R2b-0（core のテストを実ドライバから切り離す）完了（2026-10-21）・R2b-2（アドレスの不透明化、#781〜#784 と R2b-2e）完了（2026-10-22、§3.3・§3.4・§6.2・§7.1 に追記）**。2026-10-19 レビュー指摘で書き込みの手順を状態機械に修正（§4.2.1。`encode_write` / `check_write` を `write_next` に置き換え、適合テストに C13〜C16 を追加）。同日、§3.3・§7.3・§12・§13 に残っていた「再確認待ち」「推奨」の記述を決定済みに揃えた。[banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R1 を実装できる粒度に落としたもの。R1 の各 PR は本書を指示書として使う。 2026-10-20 #739 のオーナーレビュー P2 で §7.2 の `WriteCase` に読み戻しの期待値を足し、C3・C10 の値の照合を `TagKind` に沿う 1 つの規則にした。同日 R1-3b 着手時のオーナー決定で、bin が core 内にある R1-7a までは core が `banto-drivers` を一時的に normal で持つことにした（§6.4）。
+状態: **設計確定（2026-10-19 オーナー決定。§12 の Q1〜Q8 と §0.1 の再確認（P0-3 の 6 本目を含む）を決定済み）・R1 の全 PR 完了（2026-10-21。R1-7a の `build-release.ps1` の dry run も同日 Windows の手元で通過）・R2b-0（core のテストを実ドライバから切り離す）完了（2026-10-21）・R2b-2（アドレスの不透明化、#781〜#784 と R2b-2e）完了（2026-10-22、§3.3・§3.4・§6.2・§7.1 に追記）・R2b-3（I/O の一本化）完了（2026-10-23、v0.2.0-alpha.37。シリアル接続は #803 へ後回し。§0・§4.2・§4.4・§6.2・§7.3・§8・§9.1・§13 に注記）**。2026-10-19 レビュー指摘で書き込みの手順を状態機械に修正（§4.2.1。`encode_write` / `check_write` を `write_next` に置き換え、適合テストに C13〜C16 を追加）。同日、§3.3・§7.3・§12・§13 に残っていた「再確認待ち」「推奨」の記述を決定済みに揃えた。[banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R1 を実装できる粒度に落としたもの。R1 の各 PR は本書を指示書として使う。 2026-10-20 #739 のオーナーレビュー P2 で §7.2 の `WriteCase` に読み戻しの期待値を足し、C3・C10 の値の照合を `TagKind` に沿う 1 つの規則にした。同日 R1-3b 着手時のオーナー決定で、bin が core 内にある R1-7a までは core が `banto-drivers` を一時的に normal で持つことにした（§6.4）。
 対象: `banto-driver-api`（公開する型と trait）・適合テスト一式・組み立て役 `banto-drivers`・既存の Modbus TCP / SLMP の載せ替え・banto-hub のバイナリの package 分離・CI の判定。R2a（取り込み口 `push`）・R2b（I/O の一本化・アドレスの不透明化・SQL の `CHECK` の撤去）・W（WASM 本体）が **API を壊さずに** 載ることを設計の条件にする。
 関連: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md)（段の順番・決定事項）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（§2・§3.1・§3.2・§6 の WIT・§12、監査 B2 / M5 / M6。**§6.2 の WIT は本書 §9.2 と同じ PR で直す**）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §9.5（`push` はセッション型）、[tag-server-design.md](tag-server-design.md) §3.4 / §3.4.1 / §6（書き込みの安全）、[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（構造化エラー）、[implementation-checklist.md](implementation-checklist.md)（PR の手順）。
 
@@ -20,6 +20,8 @@
 | 7   | banto-hub のバイナリは `apps/banto-hub/host`（package `banto-hub-host`）へ分ける（R1-7a）。**統合テストの移動（旧 R1-7b）は R1 に含めず R2b の冒頭（R2b-0）にする**（core の `src` 内の単体テストも実ドライバを使うため、R1 の「振る舞いを変えない」範囲に収まらない）。ChronoGazer の host 分離と `EngineConfig` への注入も R2b                                                                                                                                                                                        | §2.4, §10      |
 | 8   | R1 の CI の短縮は **ドライバの薄い crate と組み立て役の変更に限る**。`banto-plc` の中身（SLMP / Modbus の実装）は R2b-3 までホストの core が直接使うので、その変更は今までどおり core に届く。core 自身が対象から外れるのも R2b-0 の後                                                                                                                                                                                                                                                                                  | §2.5           |
 | 9   | 版は `0.1.0` → `0.2.0` → …（0.x の minor = 破壊）。alpha は使わない。CI に `cargo-semver-checks` を足す                                                                                                                                                                                                                                                                                                                                                                                                                 | §9             |
+
+> **R2b-3 の後の注記（2026-10-23）**: 上の 4 の `HostBound`・`DriverTable` は R2b-3a-2 で消え、Modbus TCP・SLMP は R2b-3c・3d で `FrameDriver`（`DriverKind::Frame`）になった。要求 - 応答の手順を実装するエンジンは公開 crate `banto-driver-engine`（R2b-3b）にある。詳細は [banto-hub-driver-io-design.md](banto-hub-driver-io-design.md)。以下の R1 の記述は、その当時の設計の記録として残す。
 
 ### 0.1 監査で推奨を変更・オーナー再確認（2026-10-19 オーナーがすべて「監査後の推奨」で承認）
 
@@ -495,7 +497,7 @@ pub trait FrameConnection: Send + 'static {
 
 - **decode に文脈を渡す理由**（レビュー 1）: `Planned` は `Step` と `covers` しか持たないので、`decode_read` が「どの型で読むか」を知るには元の `specs` が要る。今の `banto-plc` も `planning.rs:85-114` の `MappedRequest` が `offset_in_read`・`data_type`・`bit` を持ち、`decode.rs:66-100` が `data_type` で分岐している。同じ Modbus のアドレスを U32 と F32 で読むとフレームも `covers` も同じになるので、`specs` を渡さない契約では区別できない。エンジンの不変条件: **`decode_read` に渡す `specs` は直前の `plan_read` に渡したスライスと同一**（ハーネスがこれを守る。C3 の「同じアドレス・別の型」のケースで確かめる）。
 - **状態を変える呼び出し**: `handshake_next`・`farewell`（接続の状態）、`plan_read`（採番）、`write_next`（採番と書き込みの途中の状態）。`decode_read`・`is_complete` は `&self`。WIT の `borrow<connection>` は可変性を区別しないが、WASM ホストでも接続は 1 タスクが専有するので同じ契約になる。
-- **要求 - 応答の手順（エンジンが R2b-3 で実装する契約。R1 では適合テストのハーネスが同じ手順を持つ）**: (1) `plan_read` で `Vec<Planned>` を得る → (2) 各 `Planned` について `step.send` を送り、`expect` に従って受信（`None` なら受信しない。`DriverDecides` なら受信のたびに `is_complete`。`Discard(n)` なら先頭 n バイトを捨てて続ける）→ (3) `max_len` 超過・`response_timeout` 超過は致命で、**受信バッファを捨てて接続を切る**（遅れて届いた応答を次の step に流用しない。`banto-plc/src/error.rs:39-47` の `ResponseTimeout` の理由と同じ）→ (4) `decode_read(planned, specs, response)` → (5) `covers` の添字で結果を `specs` の順に並べる。`covers` に出てこない添字は `ItemError::Unsupported("計画に含まれない")`。
+- **要求 - 応答の手順（エンジンが R2b-3 で実装する契約。R1 では適合テストのハーネスが同じ手順を持つ。R2b-3b で実装済み: 置き場所は公開 crate `banto-driver-engine` の `FrameSession`、適合テストのハーネスも同じエンジンを記憶上の通信路で動かす）**: (1) `plan_read` で `Vec<Planned>` を得る → (2) 各 `Planned` について `step.send` を送り、`expect` に従って受信（`None` なら受信しない。`DriverDecides` なら受信のたびに `is_complete`。`Discard(n)` なら先頭 n バイトを捨てて続ける）→ (3) `max_len` 超過・`response_timeout` 超過は致命で、**受信バッファを捨てて接続を切る**（遅れて届いた応答を次の step に流用しない。`banto-plc/src/error.rs:39-47` の `ResponseTimeout` の理由と同じ）→ (4) `decode_read(planned, specs, response)` → (5) `covers` の添字で結果を `specs` の順に並べる。`covers` に出てこない添字は `ItemError::Unsupported("計画に含まれない")`。
 - **Modbus RTU の終端の決め方**（監査 M5。R2b-3 の実装者向けに R1 で固定する規則）: `DriverDecides` で、長さは **FC とバイト数の欄から**決める（例外応答は FC の最上位ビットで判定し 5 バイト固定）。CRC は**検証**に使い、合えば `Complete`、合わなければ `FatalError::Framing`。「CRC が合った時点を完結とする」規則は採らない（途中のバイト列で偶然 CRC が合う誤判定があるため）。
 - **ワード順**は `Settings` の `word_order` から `create_connection` が読む（監査 B2）。文字列は `RawValue::Bytes` で返し、エンジンが `TagKind::Str.encoding` で decode する（`banto-plc/src/decode.rs` の `decode_string_value` と同じ規則: 語の下位バイトが先、最初の NUL で切る）。
 
@@ -539,13 +541,15 @@ loop {
 
 **読み取りは 1 回で決まる形のまま**: `plan_read` → 各 `Planned` を送る → `decode_read` のまま変えない。今の Modbus / SLMP の読み取りは、応答を見て次の要求を変える手順を持たない。応答に応じて追いかけて読むプロトコル（ページ送りなど）が出てきたら、既定の実装つきの `read_next` を足す（trait に既定つきのメソッドを足すのは破壊にならない。§9）。
 
-**R1 と R2b-3**: R1 では Modbus / SLMP は `HostBound` のままで、RMW は今の `banto-plc-write` のコードが行う（`write_next` を実装するドライバは R1 には無い。適合テストの C13〜C15 は `LegacySession` 経由で今の実装に掛ける、§7.3）。`write_next` は、R2b-3 で Modbus / SLMP をフレーム型に移すときの契約。
+**R1 と R2b-3**: R1 では Modbus / SLMP は `HostBound` のままで、RMW は今の `banto-plc-write` のコードが行う（`write_next` を実装するドライバは R1 には無い。適合テストの C13〜C15 は `LegacySession` 経由で今の実装に掛ける、§7.3）。`write_next` は、R2b-3 で Modbus / SLMP をフレーム型に移すときの契約。**R2b-3d で SLMP が `write_next`（ワード内ビットの RMW）を実装した**（Modbus はワード内ビットの書き込みが無い）。
 
 ### 4.3 R1 での使われ方
 
 **R1 では `FrameDriver` / `FrameConnection` を実装するドライバは無い**（Modbus / SLMP は §4.4）。R1-2 で trait と、適合テストのための**参照実装**（`banto-driver-conformance` の `fake::echo::EchoFrameDriver`: 固定長フレームで echo する最小のフレーム型ドライバ。plugin-design §10 P1 の「組み込みにないアドレス文法を持つテスト用プラグイン」の前身）を入れ、trait が実装可能であることとハーネスの手順を固める。§7.4 の偽ドライバと同じものなので、本体は crate の `fake::echo` に置き、`examples/echo_driver.rs` はそれに `frame::run_all` を掛ける実行例にした（R1-2）。設定 `framing` で `Fixed` / `LengthPrefixed` / `DriverDecides` を選べ、ハンドシェイク・ワード内ビットの RMW（`write_next`）も持つ。
 
 ### 4.4 R1 のアダプター: Modbus / SLMP をどう載せるか
+
+> **R2b-3 で役目を終えた（2026-10-23）**: 本節の `HostBound`・`DriverTable`・`DialFn` は、R2b-3a-2 で `Session` へ載せ替えて消え（`DriverEntry::host_bound` も無い）、R2b-3c・3d で Modbus TCP・SLMP は `Frame`（案 A）になった。`banto-broker` はレジストリの `Frame` / `Session` の項目から `Settings` でダイヤルする。以下は R1 の判断の記録。
 
 | 選択肢                                                                                             | I/O に触るか                                                                                                                                                                                                                                          | 振る舞いの危険                                                                                                  | 判定         |
 | -------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | ------------ |
@@ -684,6 +688,8 @@ impl std::fmt::Debug for DriverRegistry {}   // id の一覧だけ出す（Arc<d
 
 ### 6.2 R1 で「レジストリが正」になるもの・ならないもの
 
+> **R2b の後の注記（2026-10-23）**: 下の表の「R1」の列は当時の設計。R2b-3 で次のとおり実態が変わった。broker の `DRIVERS` / `DriverTable` は消え、ダイヤルはレジストリの `Frame` / `Session` の項目（R2b-3a-2・3b）。`is_broker_managed` はレジストリの種類で決まる。`banto-collect` の `ClientFactory`・`default_client_factory`・`ClientProtocol` は消え（R2b-3a-3）、収集も broker の共有セッションを通る。`BrokerSimRegistry` は `banto-collect` にあり（Hub は再輸出）、`resolve` は計画がドライバの種類で決まるのに合わせて `Option` を返す（R2b-3a-3）。アドレスの解析を `"modbus-tcp"` で選ぶ分岐は R2b-2c で消えた。
+
 | 今の正                                                                      | R1                                                                                                                                                                                                                                                                                                                                                            | R2b                                                              |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
 | broker の `DRIVERS`（`lib.rs:750-753`）                                     | **`DriverTable` を注入**（§4.4）。中身は組み立て役が `builtin()` で同じ 2 つを渡す。振る舞い不変                                                                                                                                                                                                                                                              | `FrameDriver` / `SessionDriver` をエンジンが直接使い、表は消える |
@@ -784,6 +790,8 @@ async fn conforms() {
 
 ### 7.3 Modbus / SLMP での走らせ方（CI）
 
+> **R2b-3 の後の注記（2026-10-23）**: C9〜C11・C16 は乗った（C9〜C12 はフレーム型のハーネス `frame::run_all`、C16 は Hub を通して）。`LegacySession`（dev 専用のアダプター）は R2b-3 で消えた。Modbus TCP・SLMP は `FrameDriver` になり、適合テストはドライバ crate の `tests/` が `FrameSession`（エンジン）で包んで走らせる（C1〜C8・C12 は両方、C13〜C15 は SLMP だけ）。以下は R1 の手順の記録。
+
 R1 の Modbus / SLMP は `HostBound` なので、`frame::run_all` は走らせられない。R1-5 でやること:
 
 1. `static_checks` を `banto-driver-modbus` / `-slmp` の `tests/conformance.rs` で走らせる（C1・C2。fixtures は `banto-plc/src/address.rs` と `slmp/address.rs` の既存テストの入力から写す。`offsets` は TS の `continuousRegistration.test.ts` / `offsetCopy.test.ts` から写す）。
@@ -796,6 +804,8 @@ R1 の Modbus / SLMP は `HostBound` なので、`frame::run_all` は走らせ�
 `banto_driver_conformance::fake`: `FakeSessionDriver`（`HashMap<canonical, Value>` を返す。`fail_next: Option<FatalError>` で致命を起こせる）と `EchoFrameDriver`（§4.3）。R2b-0 の後に core に残るテストと、R2a の `push` の実装前のテストが使う。
 
 ## 8. シリアルを見込んで R1 で押さえる形（R2b-3 で API を壊さないため）
+
+> **R2b-3 の後の注記（2026-10-23）**: シリアルは **3e-1（#800）まで**入った: 線の設定キー（`keys::BAUD` / `DATA_BITS` / `PARITY` / `STOP_BITS`・`SERIAL_PORT`・`STATION`）、`FrameConnection::inter_frame_gap`、エンジンのシリアルのトランスポート（COM 直結・`serial_over_tcp`）、ポート名の許可リスト。**時間切れ後の線の同期・broker の配線・Modbus RTU・1 ポート = 1 接続の検査・`settings` を渡す口は #803 へ後回し**（2026-10-23 オーナー判断）。マルチドロップは R2b-3 では 1 ポート = 1 接続（io-design §13 Q9）。API を壊さずに足せる、という本節の前提は 3e-1 で確かめられた（追加だけで済んだ）。
 
 | 論点                                     | R1 の型での扱い                                                                                                                                                                                                                                                                                                                                                                                                  |
 | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -811,7 +821,7 @@ R1 の Modbus / SLMP は `HostBound` なので、`frame::run_all` は走らせ�
 
 ### 9.1 semver
 
-- R1 で **`0.1.0`**（`HostBound` を含む）を公開（Q3、§0.1）。R2b-3 で `HostBound` を消して **`0.2.0`**。以降も 0.x の間は **minor で破壊**し、patch は互換のみ。WIT が確定する W 段で `1.0.0`。alpha / beta は使わない（`^0.1.0-alpha.1` の利用者が alpha 同士の破壊を自動で踏むため）。**変更履歴（`crates/banto-driver-api/CHANGELOG.md`）に「何が壊れ、どう直すか」を必ず書く**（plan §5）。
+- R1 で **`0.1.0`**（`HostBound` を含む）を公開（Q3、§0.1）。R2b-3 で `HostBound` を消して **`0.2.0`**。**（2026-10-23: `0.1.0` は結局どこにも公開せず、R2b-3 の後の `banto-driver-api` 0.2.0・`banto-driver-conformance` 0.2.0・`banto-driver-engine` 0.1.0 を最初の公開にする（io-design Q12）。各 crate の `CHANGELOG.md` に「何が壊れ、どう直すか」を書いた。公開はまだしていない。）**以降も 0.x の間は **minor で破壊**し、patch は互換のみ。WIT が確定する W 段で `1.0.0`。alpha / beta は使わない（`^0.1.0-alpha.1` の利用者が alpha 同士の破壊を自動で踏むため）。**変更履歴（`crates/banto-driver-api/CHANGELOG.md`）に「何が壊れ、どう直すか」を必ず書く**（plan §5）。
 - **`cargo-semver-checks` を CI に足す**（R1-1）: `ci.yml` の `driver-api` ジョブ（R1-1 で rust ジョブではなく、MSRV の check と同じ ubuntu の軽いジョブに置いた。対象に `banto-driver-api` が入るときだけ走る）に `cargo semver-checks check-release -p banto-driver-api`（`cargo install cargo-semver-checks --locked`）。baseline は直前のタグ（初回は `0.1.0` のタグができるまでスキップ）。**タグの名前は `banto-driver-api-v<版>`**（例 `banto-driver-api-v0.1.0`。ワークスペースのリリースのタグとは別。R1-1 で決めた。`crates/banto-driver-api/CHANGELOG.md` の冒頭にも書いた）。minor を上げる PR では `--baseline-rev` を書いて期待どおりの破壊だけであることを確かめる。
 - 破壊になるもの: trait への既定実装の無いメソッドの追加 / 型の変更 / enum の variant の削除・改名 / struct の field の削除・改名 / `DriverId` の文法の縮小 / **§3.1 の移す型（`#[non_exhaustive]` なし）への variant の追加**。
 - 破壊にならないもの（新しい型の `#[non_exhaustive]` のおかげ）: enum の variant の追加 / struct の field の追加 / 既定実装つきのメソッドの追加 / 設定キーの追加。利用側は `..` を使った match と `Step::new` 等のコンストラクタを使う（適合テストの `examples` がその書き方の手本）。
@@ -899,7 +909,7 @@ R1 の完了条件（plan §4）: 既存テストが全部通り、Modbus / SLMP
 2. plan §4 R1-7「bin を分ければ core のテストが対象から外れる」→ dev-dependency も辺になるので、統合テストと core の単体テストの書き換え（R2b-0）が要る（§2.4）。R1 では bin の分離（R1-7a）だけ。
 3. plugin-design §12.6「ドライバを変えたときの CI の対象はドライバ・組み立て役・バイナリだけ」→ R1 では成り立たない（core が dev-dependency で残る）。実装本体（`banto-plc` の `slmp/` / `modbus/`）は R2b-2 / R2b-3 で移るまで core に届く（§2.5、Q2）。同節の「`banto-collect` / `banto-broker` ── `banto-hub-core` ← API にだけ依存」も R2b の姿であり R1 ではない。
 4. plan §4 R1-4「Modbus / SLMP を trait の実装に載せ替える（I/O は今のまま）」→ フレーム型にもセッション型にもできず（§4.4 の A・B）、R1 は `DriverBase` + `HostBound` の載せ替えになる。「I/O は今のまま」の意図どおりだが、plan の文言は「静的な部分だけ API の形にする」に直す（直した）。
-5. plugin-design §6.2 の WIT で `tag-spec` に文字列の `encoding` が無いのは意図どおり（Hub が decode）だが、ネイティブの `TagKind::Str` は R1 のアダプターが `banto-plc` で decode するため `encoding` を持つ（§3.2）。WIT 側に合わせて「エンジンが decode する」形に揃えるのは R2b-3。
+5. plugin-design §6.2 の WIT で `tag-spec` に文字列の `encoding` が無いのは意図どおり（Hub が decode）だが、ネイティブの `TagKind::Str` は R1 のアダプターが `banto-plc` で decode するため `encoding` を持つ（§3.2）。WIT 側に合わせて「エンジンが decode する」形に揃えるのは R2b-3。**R2b-3b で揃えた（2026-10-23）: フレーム型は `decode_read` が `RawValue` を返し、文字列などの `Value` への decode は `banto-driver-engine` の `decode` が行う（セッション型はドライバの責任のまま）。**
 6. plan §4 の R1 の完了条件「Modbus / SLMP が適合テストを通る」は、R1 では §7.3 の範囲（C1〜C8・C12、SLMP は C13〜C15 も。`LegacySession` 経由）に限ると明記する。C9〜C11・C16 は R2b-3。
 7. plan §4 R1-1「読み取り要求を `banto-plc` から移す」（plugin-design §12.6 の条件 5 の「読み取り要求」）→ **R1 では移さない**。`ReadRequest` / `BatchReadRequest` は `Address` を含み、`Address` を API に出さない（§3.3）ので、要求の型が API に移るのは R2b-2（`TagSpec`）。R1-1 で移すのは `DataType`・`TagValue`・`Value`・`StringEncoding`・`WordOrder` の 5 つ。
 8. plugin-design §6.2 の WIT は本書 §9.2 の変更（`string-words`・`specs` / `items`・`rejected`・`prefix-encoding`・`frame-check`・`farewell`・データ型名の綴り）を反映して直した。P0（plugin-design §10）の「WIT 確定」はこの版を起点にする。

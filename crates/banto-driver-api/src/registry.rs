@@ -4,8 +4,9 @@
 //! A plain `BTreeMap` lookup; no logic. The host builds it (the
 //! `banto-drivers` assembler plus the host's own [`DriverKind::HostProvided`]
 //! protocols). Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) it is
-//! also what the broker dials through: a [`DriverKind::Session`] (and, from
-//! R2b-3b, a [`DriverKind::Frame`]) entry is a protocol the broker manages;
+//! also what the broker dials through: a [`DriverKind::Frame`] (run on the
+//! `banto-driver-engine` engine; Modbus TCP and SLMP since R2b-3c / 3d) or
+//! [`DriverKind::Session`] entry is a protocol the broker manages;
 //! the former side table `banto_broker::DriverTable` is gone.
 //!
 //! ## Why [`DriverEntry`] keeps a separate `&dyn DriverBase`
@@ -49,7 +50,8 @@ pub enum DriverKind {
     /// R1 also had a `HostBound` kind (a built-in whose I/O the host wired
     /// through the side table `banto_broker::DriverTable`); R2b-3a-2 moved
     /// the built-ins to [`Session`](Self::Session) and removed it (a 0.x
-    /// minor break, design §9.1, docs/banto-hub-driver-io-design.md §10).
+    /// minor break, design §9.1, docs/banto-hub-driver-io-design.md §10),
+    /// and R2b-3c / 3d then moved them on to [`Frame`](Self::Frame).
     /// `HostProvided` stays: it is how a host registers a protocol that is
     /// not a device driver at all, so that settings validation and address
     /// checks have one registry to ask.

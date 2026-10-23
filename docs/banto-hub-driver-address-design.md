@@ -1,7 +1,7 @@
 # banto-hub タグのアドレスの不透明化 詳細設計（R2b-2）
 
 作成日: 2026-10-22
-状態: **設計確定（2026-10-22 オーナー決定。§11 の Q1〜Q9 はすべて推奨どおり）・R2b-2a（#781）・R2b-2b（#782）・R2b-2c（#783）・R2b-2d（#784）・R2b-2e（本 PR）まで全部実装済み（R2b-2 完了、v0.2.0-alpha.35）**。コード調査（§1）は 2026-10-22 の main（`bbd40a50`、v0.2.0-alpha.34、R2b-1 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提なので移行は考えなくてよい（R2b-7 以降も同じ）」に従い、既存のデータの移行・全件照合・互換は設計しない。
+状態: **設計確定（2026-10-22 オーナー決定。§11 の Q1〜Q9 はすべて推奨どおり）・R2b-2a（#781）・R2b-2b（#782）・R2b-2c（#783）・R2b-2d（#784）・R2b-2e（本 PR）まで全部実装済み（R2b-2 完了、v0.2.0-alpha.35）**。コード調査（§1）は 2026-10-22 の main（`bbd40a50`、v0.2.0-alpha.34、R2b-1 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提なので移行は考えなくてよい（R2b-7 以降も同じ）」に従い、既存のデータの移行・全件照合・互換は設計しない。2026-10-23: R2b-3 で §4.2 の橋と `HostBound` は実装のうえ消えた（io-design 参照。本書の橋の記述は R2b-2 の時点の設計の記録）。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-2「アドレスの不透明化（`DriverAddress`）」を実装できる粒度に落とす。タグのアドレスをドライバの `parse_address` で検証して `canonical` を保存すること、Hub の中の `"modbus-tcp"` によるアドレスの解析の分岐をレジストリに置き換えること、要求の型の切り替えの範囲（R2b-3 との境）、エラーの分類、画面・API・CSV の見え方、PR の分け方。
 関連: [banto-driver-api-design.md](banto-driver-api-design.md)（§0.1 の 5・Q6・Q8、§3.3 のアドレス、§3.4 のエラーの分類、§6.2 の「R2b に残したもの」、§7 の適合テスト C1・C4）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（§3.2・§7.4・§12.2 の 4）、[banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。`with_registry` の注入と grep のテストの前例）、[implementation-checklist.md](implementation-checklist.md)。
 
@@ -102,21 +102,21 @@ Hub の書き込み（REST・MCP・未適用キューの適用・一括・CSV・
 
 ## 2. 範囲: R2b-2 で変えるもの・残すもの
 
-| 面                                                                    | R2b-2                                                       | 後の段                              |
-| --------------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------- |
-| タグの `address` に入る値（Hub）                                      | **`canonical`**（§3）                                       | -                                   |
-| DB のスキーマ                                                         | 変えない（§5）                                              | -                                   |
-| 保存時の検証（Hub）                                                   | レジストリの `parse_address` を全タグに（§3）               | -                                   |
-| Hub の core の `"modbus-tcp"` によるアドレスの分岐                    | 消す（§4.1）                                                | -                                   |
-| 収集の計画・即時読み取り・書き込みの入口                              | `TagSpec` で考え、`banto_plc::Address` へは橋で戻す（§4.2） | R2b-3 で橋ごと消える                |
-| broker・`PlcClient`・`banto-plc` / `banto-plc-write` の計画と要求の型 | 変えない                                                    | R2b-3（Frame / Session のエンジン） |
-| `InvalidAddress` の分類                                               | 非致命へ（§6）                                              | -                                   |
-| 解析の REST（画面・CSV が使う）                                       | 足す（§7.1、Q6）                                            | -                                   |
-| 連続登録・オフセットコピー・アドレスの説明の TS                       | 変えない（保存すれば正規形になる）                          | R2b-6（ドライバに聞く）             |
-| シミュレータ（`simulation.rs`・`BrokerSimRegistry`）                  | 変えない（正規形も今の文法で読める）                        | R2b-5                               |
-| ChronoGazer                                                           | 変えない（Q7）                                              | R2b-7                               |
-| `db` タグ（`postgres` の結果列名）                                    | 変えない（`banto-tags` の規則のまま）                       | R2b-8 で撤去                        |
-| REST・MCP・設定パッケージのペイロードの形                             | 変えない（`address` は文字列のまま。値が正規形になるだけ）  | R2b-7                               |
+| 面                                                                    | R2b-2                                                       | 後の段                                          |
+| --------------------------------------------------------------------- | ----------------------------------------------------------- | ----------------------------------------------- |
+| タグの `address` に入る値（Hub）                                      | **`canonical`**（§3）                                       | -                                               |
+| DB のスキーマ                                                         | 変えない（§5）                                              | -                                               |
+| 保存時の検証（Hub）                                                   | レジストリの `parse_address` を全タグに（§3）               | -                                               |
+| Hub の core の `"modbus-tcp"` によるアドレスの分岐                    | 消す（§4.1）                                                | -                                               |
+| 収集の計画・即時読み取り・書き込みの入口                              | `TagSpec` で考え、`banto_plc::Address` へは橋で戻す（§4.2） | R2b-3 で橋ごと消えた（実装済み）                |
+| broker・`PlcClient`・`banto-plc` / `banto-plc-write` の計画と要求の型 | 変えない                                                    | R2b-3 で `TagSpec` / `WriteItem` に（実装済み） |
+| `InvalidAddress` の分類                                               | 非致命へ（§6）                                              | -                                               |
+| 解析の REST（画面・CSV が使う）                                       | 足す（§7.1、Q6）                                            | -                                               |
+| 連続登録・オフセットコピー・アドレスの説明の TS                       | 変えない（保存すれば正規形になる）                          | R2b-6（ドライバに聞く）                         |
+| シミュレータ（`simulation.rs`・`BrokerSimRegistry`）                  | 変えない（正規形も今の文法で読める）                        | R2b-5                                           |
+| ChronoGazer                                                           | 変えない（Q7）                                              | R2b-7                                           |
+| `db` タグ（`postgres` の結果列名）                                    | 変えない（`banto-tags` の規則のまま）                       | R2b-8 で撤去                                    |
+| REST・MCP・設定パッケージのペイロードの形                             | 変えない（`address` は文字列のまま。値が正規形になるだけ）  | R2b-7                                           |
 
 ## 3. 保存: レジストリで解析して `canonical` を書く
 
@@ -174,15 +174,17 @@ REST の作成・更新・一括作成・一括更新、MCP の `create_tag` / `
 | `write_path.rs:1595`・`:1769`                       | 同じ。失敗は `WriteRejection::InvalidAddress`（422）。書き込みの関門の順（`writable`・スコープ・受付・頻度・監査）は変えない。解析の位置も今のまま（関門 8 の監査行 `insert_pending` の後・broker へ渡す前。単発・一括とも）で、解析に失敗した書き込みは 422 で broker へ届かず、監査には `failed` の行が 1 つ残る（2026-10-22 オーナー決定、§11）                                                    |
 | `rest/tags.rs:279` `GET /api/tags/address-writable` | §7.1 の解析の API に置き換える（Q6）。置き換えない場合も中身は `parse_address` → `writable_area` / `area`。今の `virtual` の `Some(true)` の枝は引き継がない: `writableDefault.ts` は `tagKind !== 'plc'` のとき API を呼ばずに既定を決め（`internal` の既定は画面の側、`writableDefault.ts:49-101`）、`plc` タグは `virtual` の下に置けない（`tag.rs:916-935`）ので、この枝に届く `plc` の要求は無い |
 
-- R2b-2 の後、Hub の core の非テストのコードに `Address::parse(`・`parse_slmp(`・アドレスの解析を選ぶ `"modbus-tcp"` が無いことを grep のテストで固定する（接続テスト `rest/plc_connections.rs:909` ほかの固定のリテラルは HostBound の接続テストで、R2b-3 まで例外の一覧に載せる）。
+- R2b-2 の後、Hub の core の非テストのコードに `Address::parse(`・`parse_slmp(`・アドレスの解析を選ぶ `"modbus-tcp"` が無いことを grep のテストで固定する（接続テスト `rest/plc_connections.rs:909` ほかの固定のリテラルは HostBound の接続テストで、R2b-3 まで例外の一覧に載せる）。**（R2b-3a-2 で接続テストの固定のリテラルの例外は外した。読む 1 点はドライバの `probe()`。`registry_entrances.rs` は `from_driver_address`・`banto_plc::Address` などの旧い要求の型と橋も禁じ、例外は無い。）**
 
 ### 4.2 要求の型と HostBound の橋（Q3）
+
+> **実装済み（R2b-3、2026-10-23）**: 下の橋（`Address::from_driver_address`）と `HostBound` は R2b-3a-2・3a-3 で消えた。broker・収集・Hub の即時読み書きは `TagSpec` / `WriteItem` をそのまま Frame / Session のドライバへ渡し、Modbus TCP・SLMP は R2b-3c・3d で `FrameDriver` になった（`plan_read` がドライバの内側で領域・語数による束ねを行う）。以下は R2b-2 の時点の設計。
 
 ```text
 保存: text ──parse_address(kind)──▶ canonical（DB）
 計画・即時読み書き: canonical ──parse_address(kind)──▶ TagSpec { DriverAddress, TagKind }
   HostBound（modbus-tcp・slmp、R2b-3 まで）: TagSpec ──橋──▶ banto_plc::Address → ReadRequest / BatchReadRequest / BatchWriteRequest
-  R2b-3 の後: TagSpec をそのまま FrameDriver::plan / Session::read_batch へ
+  R2b-3 の後（実装済み）: TagSpec をそのまま FrameDriver::plan_read / Session::read_batch へ
 ```
 
 - **橋**は `banto-plc` の 1 つの関数 `Address::from_driver_address(&DriverAddress) -> Result<Address, PlcError>`（`driver` が `modbus-tcp` なら `parse`、`slmp` なら `parse_slmp`、それ以外は `UnsupportedDriver`）。プロトコル名を知る場所はここだけになり、HostBound と一緒に R2b-3 で消える（Q3）。`DriverAddress` を作ったドライバと同じ文法で戻すので、冪等（C1）により失敗しない。失敗するのは手で書き換えた行だけ。

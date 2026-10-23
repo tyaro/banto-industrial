@@ -28,12 +28,12 @@
 //!   driver, which in turn means code outside this crate cannot build them
 //!   with a struct literal - use `new` and the `with_*` builders, and match
 //!   with a trailing `_` / `..`.
-//! - **The R1 request types stay in `banto-plc`.** `ReadRequest` /
-//!   `BatchReadRequest` carry `banto_plc::Address`, a closed two-protocol
-//!   enum that must not become API (every new protocol would break it). This
-//!   crate instead has the opaque [`DriverAddress`] (WIT `parsed`), which R1
-//!   only computes alongside the real path; R2b-2 switches requests to
-//!   [`TagSpec`] (design §3.3, §13 item 7).
+//! - **Requests are [`TagSpec`] / [`WriteItem`], not a protocol enum.** The
+//!   opaque [`DriverAddress`] (WIT `parsed`) is what a request carries since
+//!   R2b-2 / R2b-3a (the closed two-protocol `banto_plc::Address` enum never
+//!   became API, and the request types that carried it are gone); each driver
+//!   turns `canonical` back into its own representation privately (design
+//!   §3.3, §13 item 7).
 //! - **Connection-fatal vs per-item is a type, not a predicate.**
 //!   [`ItemError`] (that tag is Bad, the connection lives) and [`FatalError`]
 //!   (drop and reconnect) replace `PlcError::is_connection_fatal`; anything a
@@ -62,12 +62,15 @@
 //! - [`registry`]: [`DriverRegistry`], driver id → [`DriverEntry`] of a
 //!   [`DriverKind`] (R1-2, design §6.1)
 //!
-//! ## Traits: what R1 implements
+//! ## Traits: what the built-in drivers implement
 //!
-//! Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) Modbus TCP /
-//! SLMP are [`SessionDriver`]s registered as [`DriverKind::Session`], and
-//! `banto-broker` dials them through the registry (R1's `HostBound` kind and
-//! its side table are gone; R2b-3c / 3d move them on to [`FrameDriver`]).
+//! Modbus TCP and SLMP are [`FrameDriver`]s registered as
+//! [`DriverKind::Frame`] (R2b-3c / 3d, docs/banto-hub-driver-io-design.md
+//! §6): the driver only builds and parses bytes, and the engine
+//! (`banto-driver-engine`, R2b-3b) owns the transport, the time limits and
+//! the request-response procedure, in `banto-broker`'s tasks. R1's
+//! `HostBound` kind and its side table are gone (R2b-3a-2). [`SessionDriver`]
+//! stays for drivers that must own their I/O.
 //! Since R2b-1a a host may also register a protocol whose I/O it keeps
 //! itself as [`DriverKind::HostProvided`] (banto-hub's `push` / `postgres` /
 //! `virtual`; permanent). The traits are
