@@ -21,7 +21,7 @@ use banto_driver_api::{
     ItemError, PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value,
     WriteItem, WriteProgress,
 };
-use tokio::time::{timeout, timeout_at, Instant};
+use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
 
 pub const MAX_HANDSHAKE_STEPS: usize = 32;
@@ -252,7 +252,12 @@ impl Session for FrameSession {
                     let from = core.last_quiet_from;
                     let _ = timeout(core.response_timeout.min(Duration::from_secs(1)), async {
                         wait_quiet(from, gap).await;
-                        core.transport.send(&step.send).await
+                        let send_start = Instant::now();
+                        if core.transport.send(&step.send).await.is_ok() {
+                            // flush が drain にならない通信路（Windows のシリアル）では、閉じると
+                            // 送信待ちのフレームが切れるので、送り終えの見積もりまで待ってから閉じる。
+                            sleep_until(send_start + core.transport.tx_time(step.send.len())).await;
+                        }
                     })
                     .await;
                 }

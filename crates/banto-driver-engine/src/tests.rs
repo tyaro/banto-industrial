@@ -56,6 +56,7 @@ enum Kind {
     SendStart,
     SendReturned,
     Recv,
+    Close,
 }
 impl Wire {
     fn new(stats: Arc<Stats>) -> Self {
@@ -120,6 +121,7 @@ impl Transport for Wire {
     fn close(&mut self) -> BoxFuture<'_, ()> {
         Box::pin(async move {
             self.stats.closes.fetch_add(1, Ordering::SeqCst);
+            self.log.lock().unwrap().push((Kind::Close, Instant::now()));
             if self.pending_close {
                 std::future::pending::<()>().await;
             }
@@ -937,6 +939,7 @@ fn min_spacing(log: &Log) -> Option<Duration> {
                 }
             }
             Kind::SendReturned | Kind::Recv => quiet_from = Some(at),
+            Kind::Close => {}
         }
     }
     min
@@ -1126,4 +1129,25 @@ async fn the_farewell_keeps_the_gap_too() {
     assert_eq!(sends, 4);
     let spacing = min_spacing(&log).unwrap();
     assert!(spacing >= gap, "{spacing:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_farewell_waits_for_the_tx_estimate_before_closing() {
+    // tx_time が farewell の期限（1 秒）より短いときは、見積もりまで待ってから閉じる。
+    // 長いときは、期限の時点で閉じる（close が期限を超えて遅れない）。
+    for (tx_ms, expected_ms) in [(300u64, 300u64), (5000, 1000)] {
+        let stats = Arc::<Stats>::default();
+        let mut wire = Wire::new(stats.clone());
+        wire.tx_time = Duration::from_millis(tx_ms); // step.send は 1 バイト
+        let log = wire.log.clone();
+        let mut conn = Conn::new(stats);
+        conn.farewell = true;
+        let mut s = session(conn, wire, Arc::default());
+        s.core.as_mut().unwrap().response_timeout = Duration::from_secs(30);
+        s.disconnect().await;
+        let log = log.lock().unwrap();
+        let at = |kind| log.iter().find(|(k, _)| *k == kind).unwrap().1;
+        let elapsed = at(Kind::Close) - at(Kind::SendStart);
+        assert_eq!(elapsed, Duration::from_millis(expected_ms), "tx={tx_ms}");
+    }
 }
