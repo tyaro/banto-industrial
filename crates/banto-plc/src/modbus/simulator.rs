@@ -425,6 +425,12 @@ impl Simulator {
     /// socket - the connected client observes this as an I/O error/EOF on
     /// its next read or write.
     pub fn stop(self) {
+        self.abort_tasks();
+    }
+
+    /// [`Simulator::stop`] の `&self` 版。待受タスクと接続タスクを abort する
+    /// (共有参照しか持てない `RampHandle` の drop から呼ぶ)。何度呼んでもよい。
+    pub fn abort_tasks(&self) {
         self.accept_task.abort();
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();

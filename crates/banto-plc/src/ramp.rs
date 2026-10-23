@@ -16,8 +16,9 @@
 //! held 判定で `set_*` が no-op になるので、ランプは書かれた番地だけ止まり
 //! 隣は動き続ける(各シミュレータの module doc「held set」)。
 //!
-//! ハンドルを [`RampHandle::stop`] するか drop すると、ランプのタスクが止まる
-//! (drop ではシミュレータの待受タスクも `Simulator` の drop に従って止まる)。
+//! ハンドルを [`RampHandle::stop`] するか drop すると、ランプのタスクが止まる。
+//! drop ではランプのタスクを abort し、シミュレータの待受・接続タスクも
+//! `abort_tasks` で止める(`stop` はランプを join してから止める)。
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -82,8 +83,17 @@ impl RampHandle {
 
 impl Drop for RampHandle {
     fn drop(&mut self) {
-        // `stop` を通らない drop でも、ランプのタスクは止める。
+        // `stop` を通らない drop でも、ランプのタスクと待受を止める
+        // (`stop` で `inner` を取った後の drop は何もしない)。
         let _ = self.ramp_stop.send(true);
+        if let Some(task) = &self.ramp_task {
+            task.abort();
+        }
+        match &self.inner {
+            Some(Inner::Modbus(sim)) => sim.abort_tasks(),
+            Some(Inner::Slmp(sim)) => sim.abort_tasks(),
+            None => {}
+        }
     }
 }
 
@@ -207,7 +217,7 @@ mod tests {
     async fn a_dropped_handle_stops_the_ramp_task() {
         let handle = start(RampProtocol::Slmp).await;
         let task = {
-            // `Drop` only signals; the task must observe it and finish.
+            // `Drop` aborts the task; it must finish.
             let mut handle = handle;
             let task = handle.ramp_task.take().expect("task");
             drop(handle);
@@ -217,5 +227,25 @@ mod tests {
             .await
             .expect("ramp task ends after the handle is dropped")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dropped_handle_stops_the_listener() {
+        let handle = start(RampProtocol::ModbusTcp).await;
+        let addr = handle.addr();
+        assert!(tokio::net::TcpStream::connect(addr).await.is_ok());
+        drop(handle);
+        let mut refused = false;
+        for _ in 0..100 {
+            if tokio::net::TcpStream::connect(addr).await.is_err() {
+                refused = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            refused,
+            "the listener must stop after the handle is dropped"
+        );
     }
 }

@@ -57,7 +57,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
-use super::address::SlmpDevice;
+use super::address::{SlmpAccess, SlmpDevice};
 
 /// Bytes before the payload in both directions: subheader (2), serial id (2),
 /// blank (2), network id (1), PC id (1), I/O id (2), area id (1), data length
@@ -203,7 +203,7 @@ impl Simulator {
     pub fn set_word(&self, device: SlmpDevice, number: u32, value: u16) {
         assert_eq!(
             device.access(),
-            super::SlmpAccess::Word,
+            SlmpAccess::Word,
             "{device} is a bit device - use set_bit"
         );
         let mut state = self.state.lock().unwrap();
@@ -249,7 +249,7 @@ impl Simulator {
     pub fn set_bit(&self, device: SlmpDevice, number: u32, value: bool) {
         assert_eq!(
             device.access(),
-            super::SlmpAccess::Bit,
+            SlmpAccess::Bit,
             "{device} is a word device - use set_word"
         );
         let mut state = self.state.lock().unwrap();
@@ -383,6 +383,12 @@ impl Simulator {
     /// handler task drops its `TcpStream`, which closes the socket - the
     /// connected client observes this on its next read or write.
     pub fn stop(self) {
+        self.abort_tasks();
+    }
+
+    /// [`Simulator::stop`] の `&self` 版。待受タスクと接続タスクを abort する
+    /// (共有参照しか持てない `RampHandle` の drop から呼ぶ)。何度呼んでもよい。
+    pub fn abort_tasks(&self) {
         self.accept_task.abort();
         for handle in self.connections.lock().unwrap().drain(..) {
             handle.abort();
@@ -548,7 +554,7 @@ fn build_read_response(state: &State, route: &Route, command: &[u8]) -> Vec<u8> 
     // real CPU rejects, and something this crate's planner should never emit -
     // answering with an end code makes a planner regression visible as a
     // failed assertion instead of as silently plausible zeros.
-    let expects_bit = request.device.access() == super::SlmpAccess::Bit;
+    let expects_bit = request.device.access() == SlmpAccess::Bit;
     if expects_bit != request.bit_access {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
     }
@@ -608,7 +614,7 @@ fn build_write_response(state: &mut State, route: &Route, command: &[u8]) -> Vec
 
     // Same access-unit symmetry check the read path makes, and for the same
     // reason: a real CPU refuses a bit-unit write to a word device.
-    let expects_bit = request.device.access() == super::SlmpAccess::Bit;
+    let expects_bit = request.device.access() == SlmpAccess::Bit;
     if expects_bit != request.bit_access {
         return frame(route, END_CODE_WRONG_COMMAND, &[], state.malformed);
     }
