@@ -34,13 +34,23 @@ pub mod keys {
     pub const RESPONSE_TIMEOUT_MS: &str = "response_timeout_ms";
     /// SLMP CPU type (#605): `"R"` | `"Q"`.
     pub const CPU_TYPE: &str = "cpu_type";
-    /// Transport (design §8). Always `"tcp"` in R1.
+    /// Transport: `"tcp"` (default) | `"serial"` | `"serial_over_tcp"`. The
+    /// driver must list it in its descriptor's `transports`.
     pub const TRANSPORT: &str = "transport";
-    /// Serial port name (reserved for R2b-3, design §8).
+    /// Serial port name for `transport = "serial"`: `COM1`..`COM256` on
+    /// Windows, `/dev/tty*` on Unix (checked against an allow-list grammar).
     pub const SERIAL_PORT: &str = "serial_port";
-    /// RS-485 multi-drop station (reserved, design §8). R1's Modbus uses
-    /// [`UNIT_ID`] for this.
+    /// RS-485 multi-drop station. For Modbus RTU it means the same as
+    /// [`UNIT_ID`].
     pub const STATION: &str = "station";
+    /// Serial baud rate (default 9600).
+    pub const BAUD: &str = "baud";
+    /// Serial data bits: `"7"` | `"8"` (default 8).
+    pub const DATA_BITS: &str = "data_bits";
+    /// Serial parity: `"none"` (default) | `"even"` | `"odd"`.
+    pub const PARITY: &str = "parity";
+    /// Serial stop bits: `"1"` (default) | `"2"`.
+    pub const STOP_BITS: &str = "stop_bits";
 }
 
 /// Ordered connection settings with unique keys.
@@ -271,6 +281,10 @@ mod tests {
                 keys::TRANSPORT,
                 keys::SERIAL_PORT,
                 keys::STATION,
+                keys::BAUD,
+                keys::DATA_BITS,
+                keys::PARITY,
+                keys::STOP_BITS,
             ],
             [
                 "host",
@@ -283,6 +297,10 @@ mod tests {
                 "transport",
                 "serial_port",
                 "station",
+                "baud",
+                "data_bits",
+                "parity",
+                "stop_bits",
             ]
         );
     }
