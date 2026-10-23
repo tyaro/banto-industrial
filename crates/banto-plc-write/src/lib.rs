@@ -1,11 +1,8 @@
 //! banto-plc-write: I5 PLC *write* client (docs/plan.md I5, the relay-wright
 //! plan `luminous-discovering-goblet.md`).
 //!
-//! The write counterpart to `banto-plc`, kept a **separate crate with a
-//! separate trait** on purpose. `banto_plc::PlcClient`'s module doc reserves
-//! writes for exactly this: "a deliberately separate trait/crate rather than a
-//! footgun sitting unused on every read-only consumer". So the read-only
-//! consumers (ChronoGazer, banto-collect) link `banto-plc` and never see a
+//! The write counterpart to `banto-plc`, kept a **separate crate** on purpose: the
+//! read-only consumers (ChronoGazer, banto-collect) link `banto-plc` and never see a
 //! write method; relay-wright (W1-W5) additionally links this crate. The
 //! dependency runs one way only - this crate depends on `banto-plc` to reuse
 //! its shared vocabulary; `banto-plc` never depends back.
@@ -23,25 +20,20 @@
 //!   parser - not re-implemented; a target's device notation is parsed by
 //!   `banto_plc::Address::parse_slmp`.
 //! - [`banto_plc::SlmpConfig`] / [`banto_plc::SlmpCpu`] - one config type for
-//!   the connection, so the W3 broker's shared session and this crate's
-//!   standalone client are configured the same way.
-//! - [`banto_plc::BoxFuture`] - the same hand-boxed future the read trait uses
-//!   for `dyn`-compatibility.
+//!   the connection (R2b-3d-join: both the driver and the simulators use it).
 //!
 //! ## Module map
 //!
-//! - [`types`]: [`WriteRequest`] / [`WriteResult`], the shapes crossing the
-//!   [`PlcWriteClient`] boundary.
-//! - [`client`]: the [`PlcWriteClient`] trait, and why it is a separate trait.
+//! - [`types`]: [`WriteRequest`] / [`WriteResult`], the shapes of a write.
 //! - [`error`]: [`PlcWriteError`], the one error type spanning whole-call
 //!   (`Err`) and per-request (`WriteResult::Bad`) failures, with the write-only
 //!   value-range cases the read side has no equivalent for.
 //! - [`encode`]: `TagValue` -> raw register/bit payload, the inverse of
 //!   `banto-plc`'s `decode`.
-//! - [`slmp`]: the MELSEC MC / SLMP implementation - [`SlmpWriteClient`] (the
-//!   standalone, owns-its-socket form) plus [`slmp::plan_slmp_writes`] and
-//!   [`slmp::execute_slmp_writes`], the pure-planner / borrowed-client pair the
-//!   W3 broker calls to write over its *shared* single-session-per-CPU socket.
+//! - [`slmp`]: the MELSEC MC / SLMP write planner ([`slmp::plan_slmp_writes`],
+//!   [`slmp::plan_slmp_write_batch`]) and the in-process simulator. Since
+//!   R2b-3d-join the I/O (`SlmpWriteClient`, `execute_slmp_writes`) is
+//!   `banto-driver-slmp`'s frame-type driver over `banto-driver-engine`.
 //! - [`modbus`]: Modbus TCP write framing (FC5/6/15/16: `build_write_frame`,
 //!   `parse_write_response_pdu`) and [`modbus::planning::plan_modbus_writes`]
 //!   (what is written, what is refused). Since R2b-3c the I/O is
@@ -56,21 +48,17 @@
 //! only writes whole words. `slmp::planning` plans this as a
 //! [`SlmpPlannedBitWrite`] (a mask-composed *recipe*, not a ready payload,
 //! since the word's other 15 bits are unknown until read), and
-//! [`slmp::execute_slmp_writes`] carries it out as a
-//! read-modify-write-**confirm** sequence on the broker's single shared
-//! session - see that function's and `slmp::planning`'s module docs for the
-//! full RMW design (mask composition, the gap-tolerance-zero rule extended to
-//! "different words never merge", and why this needed zero `banto-broker`
-//! changes).
+//! `banto-driver-slmp`'s `write_next` carries it out as a
+//! read-modify-write-**confirm** sequence - see `slmp::planning`'s module docs
+//! for the RMW design (mask composition, the gap-tolerance-zero rule extended
+//! to "different words never merge").
 
-pub mod client;
 pub mod encode;
 pub mod error;
 pub mod modbus;
 pub mod slmp;
 pub mod types;
 
-pub use client::PlcWriteClient;
 pub use encode::encode_string_value;
 pub use error::PlcWriteError;
 pub use modbus::planning::{plan_modbus_writes, ModbusPlannedWrite, ModbusWritePlanOutcome};
@@ -78,7 +66,6 @@ pub use slmp::planning::{
     plan_slmp_write_batch, plan_slmp_writes, BitWriteMapping, SlmpPlannedBitWrite,
     SlmpPlannedWrite, SlmpWritePlanOutcome, WritePayload,
 };
-pub use slmp::{execute_slmp_writes, SlmpWriteClient};
 pub use types::{BatchWriteRequest, StringWriteRequest, WriteRequest, WriteResult};
 
 // Re-exported for callers building requests, so they need only depend on this

@@ -13,7 +13,7 @@ publish.workspace = true
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.1.0" }
-# `builtin().registry` の 2 つ（R2b-3a-2 から `DriverEntry::session`。broker の表は無くなった）。
+# `builtin().registry` の 2 つ（R2b-3c / 3d から `DriverEntry::frame`。broker の表は無くなった）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }
 # R1-4b: トリップワイヤ（`ALLOWED_PROTOCOLS`）。R2b-1c: `settings_to_api(settings_from_flat(..))`
@@ -26,8 +26,8 @@ banto-broker = { path = "../banto-broker" }
 # examples/real_plc_verify.rs: broker の接続の `settings`（R2b-3a-2）。
 serde_json = { workspace = true }
 banto-plc = { path = "../banto-plc" }
-# examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール）。
-banto-plc-write = { path = "../banto-plc-write" }
+# examples/real_plc_verify.rs（R1-4a で banto-broker から移した実機検証ツール。R2b-3d-join でエンジン経由に書き直し）。
+banto-driver-engine = { path = "../banto-driver-engine" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 # tests/tag_canonical.rs（R2b-2b）: 本物の Modbus / SLMP のドライバで `TagService::with_registry` が
 # 正規形を保存することの確認。banto-tags はドライバ crate に依存されている側なので、

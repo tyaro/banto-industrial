@@ -1,7 +1,7 @@
 # I5 (docs/plan.md / the relay-wright plan `luminous-discovering-goblet.md`):
 # the *write* primitive for MELSEC SLMP, deliberately a separate crate from the
 # read-only `banto-plc` rather than a method on its `PlcClient` trait - see
-# `banto-plc/src/client.rs`'s module doc for why a write must never sit unused
+# `banto-plc`'s module doc for why a write must never sit unused
 # on every read-only consumer (ChronoGazer, banto-collect). This crate DEPENDS
 # ON `banto-plc` to reuse its shared vocabulary (`Address`, `DataType`,
 # `TagValue`, `WordOrder`, `SlmpDevice`, `SlmpConfig`, ...) rather than
@@ -17,7 +17,7 @@ publish.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 # Shared read-side vocabulary this crate builds on (Address/DataType/TagValue/
-# WordOrder/SlmpDevice/SlmpAccess/SlmpConfig/SlmpCpu/BoxFuture). The whole point
+# WordOrder/SlmpDevice/SlmpAccess/SlmpConfig/SlmpCpu). The whole point
 # of I5 being a separate crate is that this dependency runs one way only: the
 # read crate never depends on the write crate.
 banto-plc = { path = "../banto-plc" }

@@ -4,9 +4,9 @@
 //! specs into the 4E frames of `frame.rs` and responses back into values.
 //!
 //! - `create_connection` reads `word_order` and `cpu_type` (absent ones are
-//!   the column defaults `low_high` / `R`, like the session in
-//!   `api_session.rs`). SLMP has no handshake and no farewell.
-//! - `plan_read` is the session's planner unchanged: each spec goes through
+//!   the column defaults `low_high` / `R`, like the stored connection).
+//!   SLMP has no handshake and no farewell.
+//! - `plan_read`: each spec goes through
 //!   the same private `read_request` (this driver's grammar on the canonical
 //!   address) into `banto_plc::plan_slmp_batch`, and every group becomes one
 //!   bulk read step whose `covers` are the specs it serves. A spec the
@@ -26,9 +26,9 @@
 //!   raw `RawValue::Bytes` of their words (low byte first); the engine
 //!   decodes them.
 //!
-//! - `write_next` (R2b-3d-2, design §6.2) is the session's write path,
-//!   `banto_plc_write::execute_slmp_writes`, as a state machine. Each item
-//!   goes through the session's own `write_request` (`api_session.rs`: a
+//! - `write_next` (R2b-3d-2, design §6.2) is the former write path,
+//!   `banto_plc_write::execute_slmp_writes` (removed), as a state machine. Each item
+//!   goes through `write_request` (`request.rs`: a
 //!   `bit`-addressed `bit` tag is the read-modify-write `BitInWord`, the
 //!   decision the Hub used to make) and the whole batch through the same
 //!   `plan_slmp_write_batch` (the integer rounding and range check of
@@ -46,8 +46,8 @@
 //!   fields do not match is `FatalError::Framing` and drops the write in
 //!   progress. `write_next(None)` always starts afresh.
 //!
-//! **Not yet**: registering this as `DriverEntry::frame` (3d-join). Until
-//! then the broker keeps dialing the session in `api_session.rs`.
+//! Since R2b-3d-join `banto-drivers` registers this as `DriverEntry::frame`;
+//! the session-type I/O (`api_session.rs`, `session.rs`) is gone.
 
 use banto_driver_api::{
     keys, DataType, DeviceError, FatalError, FrameCheck, FrameConnection, FrameDriver, ItemError,
@@ -56,8 +56,8 @@ use banto_driver_api::{
 use banto_plc::{plan_slmp_batch, Address, BatchReadRequest};
 use banto_plc_write::{plan_slmp_write_batch, BatchWriteRequest, PlcWriteError, WritePayload};
 
-use crate::api_session::{read_request, write_request, Prep};
 use crate::frame::{self, Answer, Route, Series, Span};
+use crate::request::{read_request, write_request, Prep};
 use crate::{classify_write, SlmpDriver};
 
 impl FrameDriver for SlmpDriver {
@@ -633,6 +633,23 @@ mod tests {
         let mut c = SlmpDriver.create_connection(&s).unwrap();
         let planned = c.plan_read(&[spec("D0", n(DataType::U16))]).unwrap();
         assert_eq!(&planned[0].step.send[17..19], &[0x00, 0x00]);
+        // `word_order` reaches the decode: the same two words read as a U32
+        // are swapped by `high_low` (absent is `low_high`).
+        let specs = [spec("D0", n(DataType::U32))];
+        let data = [0x0001u16, 0x8000]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<u8>>();
+        for (extra, want) in [(None, 0x8000_0001u64), (Some("high_low"), 0x0001_8000)] {
+            let mut pairs = vec![("host", "h"), ("port", "1")];
+            pairs.extend(extra.map(|o| ("word_order", o)));
+            let mut c = SlmpDriver
+                .create_connection(&Settings::from_pairs(pairs).unwrap())
+                .unwrap();
+            let p = c.plan_read(&specs).unwrap();
+            let v = c.decode_read(&p[0], &specs, &ok(&data)).unwrap();
+            assert_eq!(v, vec![Ok(RawValue::Uint(want))], "{extra:?}");
+        }
     }
 
     #[test]

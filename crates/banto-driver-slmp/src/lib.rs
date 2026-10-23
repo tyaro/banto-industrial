@@ -4,41 +4,33 @@
 //! ## What this crate is
 //!
 //! Until R1-4a the SLMP driver lived inside `banto-broker`; R1-4a moved it
-//! here. R2b-3a-1 added the production [`banto_driver_api::SessionDriver`],
-//! and **R2b-3a-2 made it the only way in**: the composition root
-//! (`banto-drivers`) registers [`driver`] as `DriverEntry::session`, and the
-//! broker dials it through the registry with the connection's `Settings`
-//! and a `ConnectContext`. The former broker table entry (`dial`,
-//! `DriverDial` with the SLMP CPU type for `BrokerHandle::slmp_cpu`) and the
-//! `banto_broker::BrokerSession` impl are gone; the broker now compares a
-//! protocol-independent settings fingerprint instead of the CPU (#605).
+//! here. R2b-3a-1 added a production [`banto_driver_api::SessionDriver`] (that
+//! owned a socket), and **R2b-3d replaced it with the frame-type driver**:
+//! the composition root (`banto-drivers`) registers [`driver`] as
+//! `DriverEntry::frame`, and the broker wraps it in `banto-driver-engine`'s
+//! `FrameSession`, which owns the socket, the response timeout and the
+//! "a timeout is fatal" rule. The session-type I/O (`api_session.rs`,
+//! `session.rs`, `banto_plc::dial_slmp` / `SlmpClient` /
+//! `execute_slmp_batch_reads`, `banto_plc_write::SlmpWriteClient` /
+//! `execute_slmp_writes`) is gone.
 //!
 //! - [`SlmpDriver`] / [`driver`] (`base.rs`): the [`banto_driver_api::DriverBase`]
 //!   implementation - identity, `validate_config`, the `cpu_type` setting
 //!   (#605), `parse_address` over `Address::parse_slmp`, `offset_address` /
 //!   `address_help` ported from the TypeScript, and the connection test's
 //!   `probe` point (`D0`, R2b-3a-2 / Q11).
-//! - `api_session.rs`: the [`banto_driver_api::SessionDriver`] / `Session`
-//!   (design §4.1). `connect` builds the `SlmpConfig` from `Settings` +
-//!   `ConnectContext` and dials with `banto_plc::dial_slmp`; reads and writes
-//!   run on `session::SlmpSession` (the `banto_plc` / `banto_plc_write` SLMP
-//!   planner/executor pair) with the typed `PlcError` -> `FatalError` /
-//!   `ItemError` mapping. The canonical address is turned back into a
-//!   `banto_plc::Address` privately inside this crate, and a `bit`-addressed
-//!   `bit` write (`D100.5`) is the read-modify-write `BitInWord` here (the
-//!   decision the Hub used to make).
+//! - `frame.rs` builds and checks the SLMP 4E binary frames (bulk read /
+//!   write, word / bit, Q / R); `slmp_parity.rs` (tests) checks every frame
+//!   byte for byte against the `slmp` crate.
+//! - `frame_conn.rs` (design §6.2): the [`banto_driver_api::FrameDriver`] /
+//!   `FrameConnection`: `plan_read` / `decode_read`, and `write_next` (word
+//!   writes, and the bit-in-word read-modify-write as three steps). The
+//!   canonical address is turned back into a `banto_plc::Address` privately
+//!   inside this crate (`request.rs`, which also holds the read / write
+//!   request gates and the last-device-number limit).
 //! - [`classify_read`] / [`classify_write`] (`classify.rs`): the §3.4 table
-//!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`.
-//! - R2b-3d (§6.2, Q4), first half: `frame.rs` builds and checks the SLMP 4E
-//!   binary frames itself (bulk read / write, word / bit, Q / R), and
-//!   `frame_conn.rs` is the [`banto_driver_api::FrameDriver`] /
-//!   `FrameConnection` with `plan_read` / `decode_read` over them, run by the
-//!   real engine in `tests/frame_conformance.rs`. `slmp_parity.rs` (tests)
-//!   checks every frame byte for byte against the `slmp` crate. R2b-3d-2
-//!   added `write_next` (word writes, and the bit-in-word read-modify-write
-//!   as three steps), checked through the engine by `tests/conformance.rs`
-//!   (C13-C15) and `tests/p0_3.rs`. Not yet registered: the broker still
-//!   dials the session above until 3d-join.
+//!   from `PlcError` / `PlcWriteError` to `ItemError` / `FatalError`
+//!   (`frame_conn.rs` maps the write errors it makes through it).
 //!
 //! ## Dependency direction
 //!
@@ -49,12 +41,11 @@
 
 use banto_plc::SlmpCpu;
 
-mod api_session;
 mod base;
 mod classify;
 mod frame;
 mod frame_conn;
-mod session;
+mod request;
 #[cfg(test)]
 mod slmp_parity;
 

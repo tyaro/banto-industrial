@@ -2,7 +2,7 @@
 //! ([`simulator`], test / `simulator` feature only) and [`ModbusTcpConfig`].
 //!
 //! Until R2b-3c this module also held `ModbusTcpClient` (the
-//! [`crate::client::PlcClient`] for Modbus TCP), `dial_modbus` and
+//! `PlcClient` for Modbus TCP), `dial_modbus` and
 //! `execute_modbus_reads`. The broker now reaches Modbus through the
 //! frame-type driver (`banto-driver-modbus`'s `FrameDriver` over
 //! `banto-driver-engine`, docs/banto-hub-driver-io-design.md §6.1), which

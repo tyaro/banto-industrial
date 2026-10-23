@@ -5,7 +5,9 @@
 //! arrays so the decoding math is proven independent of any socket.
 
 use crate::error::PlcError;
-use crate::types::{DataType, StringEncoding, TagValue};
+#[cfg(test)]
+use crate::types::StringEncoding;
+use crate::types::{DataType, TagValue};
 
 /// Which register holds the high 16 bits of a 32-bit value (or the highest
 /// 16 bits of a 4-register 64-bit value) - `banto_driver_api::WordOrder`,
@@ -130,6 +132,11 @@ pub fn decode_register_bit(regs: &[u16], start: usize, bit: u8) -> Result<TagVal
 /// are a per-request decode error (delivered as `Bad` by the executor, like
 /// any other decode failure) rather than silently replaced text - a mangled
 /// recipe string that still "reads fine" is worse than a Bad quality.
+/// R2b-3d-join: nothing in production calls this any more (the SLMP executor was
+/// its only caller; `banto-driver-engine` decodes strings itself in its own
+/// `decode.rs`). It is kept, compiled for tests only, with its tests, as the
+/// reference those docs name; 3f may delete it.
+#[cfg(test)]
 pub(crate) fn decode_string_value(
     regs: &[u16],
     start: usize,

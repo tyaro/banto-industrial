@@ -2,7 +2,7 @@
 //! these were `banto-broker`'s own unit tests while the SLMP driver lived
 //! there. R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2): the broker now
 //! dials through a `DriverRegistry` holding this crate's `driver()` as a
-//! session-type entry, and speaks `TagSpec` / `WriteItem`; the scenarios and
+//! frame-type entry (R2b-3d-join), and speaks `TagSpec` / `WriteItem`; the scenarios and
 //! the assertions on the device are unchanged.
 
 use std::sync::Arc;
@@ -17,11 +17,11 @@ use banto_driver_slmp::SlmpDriver;
 use banto_plc_write::slmp::simulator::Simulator;
 use banto_tags::PlcConnection;
 
-/// The registry with just this driver, as a session-type entry.
+/// The registry with just this driver, as a frame-type entry.
 fn slmp_registry() -> Arc<DriverRegistry> {
     let mut registry = DriverRegistry::new();
     registry
-        .register(DriverEntry::session(banto_driver_slmp::driver()))
+        .register(DriverEntry::frame(banto_driver_slmp::driver()))
         .expect("one entry");
     Arc::new(registry)
 }

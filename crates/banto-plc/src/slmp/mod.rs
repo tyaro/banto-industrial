@@ -1,103 +1,55 @@
-//! [`SlmpClient`]: the [`crate::client::PlcClient`] implementation for MELSEC
-//! MC protocol / SLMP (I2a), the sibling implementation `modbus/mod.rs`'s
-//! module doc and README.md:42 have been reserving space for since I2. MELSEC
-//! is the eventual primary target of this product line
-//! (docs/recorder-requirements.md §1); Modbus TCP only went first because it
-//! is easier to debug against free simulators.
+//! The MELSEC MC protocol / SLMP side of this crate (I2a): the device table
+//! ([`address`]), the read planner ([`planning`]), the in-process
+//! [`simulator`], and the small pieces shared with the SLMP driver
+//! (`banto-driver-slmp`): [`SlmpCpu`], [`SlmpConfig`] (its defaults and the
+//! wire properties the `slmp` crate wants), [`SlmpDevice::to_wire`] and
+//! [`classify_slmp`] / [`SlmpErrorClass`].
+//!
+//! R2b-3d-join (docs/banto-hub-driver-io-design.md §6.2): the I/O that used to
+//! live here - `SlmpClient`, `dial_slmp`, `execute_slmp_reads` and
+//! `execute_slmp_batch_reads` - is gone. The SLMP driver now builds the 4E
+//! frames itself (`banto-driver-slmp`'s `frame.rs`, checked byte for byte
+//! against the `slmp` crate by its `slmp_parity.rs`) and `banto-driver-engine`
+//! owns the socket. What remains of the `slmp` crate in this one is the wire
+//! device code and the connection properties, which that parity test uses as
+//! its reference.
 //!
 //! ## Why this one wraps a crate when `modbus/` is hand-written
 //!
-//! Modbus TCP's wire format is a 7-byte header and a 5-byte PDU, and
-//! `modbus/frame.rs` implements it in under 200 lines. SLMP is not that: the
-//! 4E binary frame carries a 15-byte subheader with a network/PC/IO/area
-//! access route, device addressing that is 3 bytes on Q/L and 4 (one of them a
-//! fixed pad) on the R series, and bit-unit responses packed two points to a
-//! byte, one per nibble. Re-deriving that from the specification would be
-//! effort spent reproducing something already written and MIT-licensed, so
-//! this module wraps the `slmp` crate (chosen and approved before I2a - see the
-//! plan's Context section, where `slmp_client` was rejected for its BSD-3
-//! licence and unclear async story) and confines itself to the two things the
-//! crate does not do: deciding *what* to read ([`planning`]) and translating
-//! *how it failed* into this crate's vocabulary.
+//! Modbus TCP's wire format is a 7-byte header and a 5-byte PDU. SLMP's 4E
+//! binary frame carries a 15-byte subheader with a network/PC/IO/area access
+//! route, device addressing that is 3 bytes on Q/L and 4 (one of them a fixed
+//! pad) on the R series, and bit-unit responses packed two points to a byte.
+//! The wrapped crate (`slmp`, chosen and approved before I2a) is the audited
+//! reference for those details.
 //!
 //! ## Where the connection-level/per-request line falls for this protocol
 //!
-//! [`SlmpClient::read_batch`] issues one bulk read per
-//! [`planning::SlmpPlannedRead`] group and classifies every failure via
-//! [`classify_slmp_error`], which is the whole reason this module needs a
-//! translation layer at all: the wrapped crate's `slmp::SlmpError` and this
-//! crate's [`PlcError`] are deliberately separate vocabularies (I2a's own,
-//! versus I2's - see this crate's `error.rs`), so a MELSEC CPU politely
-//! refusing one read and a truncated frame need to land in different
-//! [`PlcError`] variants even though both start life as an `Err` from the
-//! same `bulk_read` call.
+//! [`classify_slmp`] decides it for a structured [`slmp::SlmpError`]:
 //!
 //! - **Non-zero SLMP end code** (`0xC059` wrong command, `0xCEE1` request too
 //!   long, ...), `slmp::SlmpError::Device { end_code }` - not fatal, and the
-//!   direct analogue of a Modbus exception response. The crate validates the
-//!   response frame's declared data length against what actually arrived
-//!   *before* it inspects the end code, so reaching `Device` proves a
-//!   complete, length-consistent frame was received and nothing is left
-//!   unread: the byte stream is still aligned to a request boundary. This
-//!   becomes `ReadResult::Bad` for only the requests mapped to that one
-//!   group, and the loop moves on.
+//!   direct analogue of a Modbus exception response: a complete,
+//!   length-consistent frame was received, so the byte stream is still aligned
+//!   to a request boundary.
 //! - **Anything else** (`Framing`, `Timeout`, `NotConnected`, `Io`) - fatal.
-//!   `read_batch` stops issuing groups, drops the session (`self.inner =
-//!   None`), and returns `Err`; the caller must `connect()` again. Per
-//!   docs/plan.md I2 §2 this crate does not retry or reconnect on its own -
-//!   that loop is I3's.
 //!
-//! Telling the first case from the second used to mean reading the wrapped
-//! crate's error *message text* (crates.io `slmp` 0.1.x reported everything as
-//! `std::io::Error`, exposing the end code no other way). H9
-//! (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced that with the
-//! git dependency on the owner's fork (`slmp` 0.2.1, see the workspace
-//! `Cargo.toml`), which exposes `SlmpError::Device { end_code }` as its own
-//! enum variant - [`classify_slmp_error`] is now a plain structural `match`,
-//! no string parsing anywhere in this module. The coupling to the wrapped
-//! crate's behavior is still real (it still has to actually validate length
-//! before end code, and actually distinguish `Device` from `Framing`), so it
-//! is still guarded by a test that drives a real end-code response through
-//! the real crate rather than by a unit test over hand-built `SlmpError`
-//! values - see `slmp_end_code_is_bad_not_fatal` in `integration_tests.rs`.
-//!
-//! ## Two deliberate differences from `modbus/mod.rs`
-//!
-//! 1. **No `tokio::time::timeout` around each group.** The Modbus client wraps
-//!    every request in one and treats a fire as connection-fatal precisely
-//!    because cancelling `read_exact` mid-frame desynchronizes the stream. Here
-//!    the wrapped crate applies its own send/receive deadlines internally
-//!    (`set_send_timeout`/`set_recv_timeout`, both wired to
-//!    [`SlmpConfig::response_timeout`]), so the timeout fires *inside* the
-//!    crate and surfaces as an ordinary error return. Adding a second,
-//!    outer timeout would reintroduce exactly the mid-read cancellation the
-//!    inner one exists to avoid.
-//! 2. **No `TCP_NODELAY`.** The wrapped crate owns its `TcpStream` and neither
-//!    exposes it nor disables Nagle's algorithm. Since this client also waits
-//!    for each reply before sending the next request, Nagle can only add
-//!    latency here, never save a packet - the same argument that makes
-//!    `modbus/mod.rs` set it. It is simply not reachable through this crate's
-//!    API, and it is a real (if small) headwind against the 100ms-cycle target
-//!    in recorder-requirements.md §3.1. Worth measuring on real hardware
-//!    (docs/plan.md W5's 実機検証) before deciding whether it justifies a
-//!    patch upstream.
+//! H9 (docs/h9-slmp-structured-error-spec.md, 2026-08-12) replaced the old
+//! text parsing of the wrapped crate's errors with the git dependency on the
+//! owner's fork (`slmp` 0.2.1), which exposes `SlmpError::Device { end_code }`
+//! as its own enum variant.
 
 pub mod address;
-#[cfg(test)]
-mod integration_tests;
 pub mod planning;
 #[cfg(any(test, feature = "simulator"))]
 pub mod simulator;
 
 use std::time::Duration;
 
-use crate::client::{BoxFuture, PlcClient};
-use crate::decode::{decode_register_bit, decode_register_value, decode_string_value, WordOrder};
+use crate::decode::WordOrder;
 use crate::error::PlcError;
-use crate::types::{BatchReadRequest, BatchReadResult, PlcValue, ReadRequest, ReadResult};
 
 use address::{SlmpAccess, SlmpDevice};
-use planning::{plan_slmp_batch, plan_slmp_requests, ReadKind, SlmpPlanOutcome, SlmpPlannedRead};
 
 /// MELSEC CPU series, which SLMP frames differ by: Q and L serialize a device
 /// address in 4 bytes and use subcommand `0x0000`/`0x0001`, R uses 6 bytes and
@@ -146,7 +98,7 @@ impl SlmpDevice {
     /// `pub` (was `pub(crate)`) alongside [`SlmpCpu::to_wire`] and
     /// [`SlmpConfig::to_wire_props`] so a later cleanup can drop
     /// `banto-plc-write`'s duplicated copy of this table. Not used by the W3
-    /// broker itself (device mapping happens inside [`execute_slmp_reads`] /
+    /// broker itself (device mapping happens inside `execute_slmp_reads` (removed) /
     /// `banto_plc_write::execute_slmp_writes`), only exposed for that cleanup.
     pub fn to_wire(self) -> slmp::DeviceType {
         use slmp::DeviceType as W;
@@ -274,7 +226,7 @@ impl SlmpConfig {
     /// Build the wrapped crate's connection props. `pub` (was private) because
     /// the W3 broker (relay-wright) owns a bare `slmp::SLMPClient` per CPU and
     /// needs to construct it from an [`SlmpConfig`] to drive both
-    /// [`execute_slmp_reads`] and `banto_plc_write::execute_slmp_writes` over the
+    /// `execute_slmp_reads` (removed) and `banto_plc_write::execute_slmp_writes` over the
     /// one shared session - the whole point of the broker. Exposing the assembly
     /// here (rather than each caller re-deriving it, as `banto-plc-write` still
     /// does internally) keeps the single source of truth in this crate.
@@ -354,412 +306,9 @@ impl From<SlmpErrorClass> for PlcError {
     }
 }
 
-/// Translate the wrapped crate's structured [`slmp::SlmpError`] into this
-/// crate's [`PlcError`], which is what decides connection-fatal vs per-request
-/// `Bad` (see [`PlcError::is_connection_fatal`] and this module's doc
-/// comment). The classification decision itself now lives in
-/// [`classify_slmp`]/[`SlmpErrorClass`] (H9, shared with
-/// `banto_plc_write::PlcWriteError`'s own `classify_slmp_error`); this
-/// function is just that shared decision folded into this crate's error type.
-fn classify_slmp_error(err: slmp::SlmpError) -> PlcError {
-    classify_slmp(err).into()
-}
-
-/// Dial a fresh SLMP session against `config`: build the wrapped crate's
-/// client, wire [`SlmpConfig::response_timeout`] into its send/receive
-/// deadlines, then race `connect()` against [`SlmpConfig::connect_timeout`]
-/// and map a failure onto [`PlcError`].
-///
-/// The single shared implementation of the SLMP connect sequence (H9
-/// transport 共通化, docs/improvement-plan.md §H9): this crate's
-/// [`SlmpClient::connect`], `banto_plc_write::slmp::SlmpWriteClient::connect`,
-/// and `banto_broker`'s `connect_attempt` used to hand-roll the identical
-/// four steps independently (build the wire client, wire both timeouts, race
-/// `connect()` against the outer deadline, map `slmp::SlmpError` to this
-/// crate's error type) - this is now the one place that sequence is written,
-/// and the three callers each fold its result into their own shape (owned
-/// `Option<inner>` for the two client wrappers, a bare returned client for
-/// the broker). `classify_slmp_error` above is deliberately not reused here:
-/// it maps *request*-time failures where a non-zero end code is a per-request
-/// `Bad`, but a `connect()` failure is always connection-fatal, so this
-/// function keeps its own two-arm mapping (`Timeout` → [`PlcError::ConnectTimeout`],
-/// everything else → [`PlcError::Connection`]) exactly as all three call
-/// sites already agreed on.
-pub async fn dial_slmp(config: &SlmpConfig) -> Result<slmp::SLMPClient, PlcError> {
-    let addr = format!("{}:{}", config.host, config.port);
-    let mut client = slmp::SLMPClient::new(config.to_wire_props());
-    client.set_send_timeout(config.response_timeout);
-    client.set_recv_timeout(config.response_timeout);
-
-    tokio::time::timeout(config.connect_timeout, client.connect())
-        .await
-        .map_err(|_| PlcError::ConnectTimeout(addr.clone()))?
-        .map_err(|e| match e {
-            // The crate's own hardcoded 1s connect ceiling (see
-            // `SlmpConfig::connect_timeout`) surfaces here rather than as our
-            // outer timeout elapsing, so it has to be mapped to the same
-            // error - otherwise the same failure would be reported two
-            // different ways depending on which deadline happened to be
-            // shorter.
-            slmp::SlmpError::Timeout => PlcError::ConnectTimeout(addr.clone()),
-            other => PlcError::Connection(other.to_string()),
-        })?;
-
-    Ok(client)
-}
-
-/// The [`crate::client::PlcClient`] implementation for MELSEC MC/SLMP. One
-/// instance per PLC connection - not `Clone`, not internally reconnecting (see
-/// this module's doc comment and docs/plan.md I2 §2).
-pub struct SlmpClient {
-    config: SlmpConfig,
-    /// `Some` exactly while connected. The wrapped crate keeps its own
-    /// `Option<TcpStream>` but does *not* clear it when a read fails, so this
-    /// is what actually enforces "after a connection-level failure, every call
-    /// returns `NotConnected` until `connect()`" - the same contract
-    /// `modbus/mod.rs` gets from `Option<TcpStream>`.
-    inner: Option<slmp::SLMPClient>,
-}
-
-impl SlmpClient {
-    pub fn new(config: SlmpConfig) -> Self {
-        Self {
-            config,
-            inner: None,
-        }
-    }
-
-    /// Read a mixed numeric + string batch in one call (S1 文字列タグ) - the
-    /// owned-socket form of [`plan_slmp_batch`] + [`execute_slmp_batch_reads`],
-    /// with exactly [`PlcClient::read_batch`]'s connection semantics: `Err`
-    /// only for connection-fatal failures (which drop the session, so the next
-    /// call is `NotConnected`), per-request `Bad` for everything else. An
-    /// inherent method rather than part of the [`PlcClient`] trait: the trait's
-    /// consumers (banto-collect) are numeric-only by design and must stay
-    /// unable to request a string read.
-    pub async fn read_batch_mixed(
-        &mut self,
-        requests: &[BatchReadRequest],
-    ) -> Result<Vec<BatchReadResult>, PlcError> {
-        if self.inner.is_none() {
-            return Err(PlcError::NotConnected);
-        }
-
-        let outcome = plan_slmp_batch(requests);
-        let word_order = self.config.word_order;
-        let client = self
-            .inner
-            .as_mut()
-            .expect("checked Some above, only cleared on the fatal branch below");
-
-        match execute_slmp_batch_reads(client, &outcome, requests.len(), word_order).await {
-            Ok(results) => Ok(results),
-            Err(err) => {
-                self.inner = None;
-                Err(err)
-            }
-        }
-    }
-}
-
-/// Issue one bulk read for `group` and return its decoded window.
-///
-/// `Err(PlcError::SlmpEndCode { .. })` is the only non-fatal outcome (see
-/// this module's doc comment); every other `Err` means the session is no
-/// longer trustworthy. A free function (rather than a `SlmpClient` method) so
-/// both the owned-socket [`SlmpClient::read_batch`] and the borrowed-socket
-/// [`execute_slmp_reads`] share the one per-group read implementation and
-/// cannot drift.
-async fn execute_one(
-    client: &mut slmp::SLMPClient,
-    group: &SlmpPlannedRead,
-) -> Result<GroupValues, PlcError> {
-    let start = slmp::Device {
-        device_type: group.device.to_wire(),
-        address: group.start as usize,
-    };
-    let expected = group.count as usize;
-
-    // Bit devices take a bit-unit bulk read (SLMP subcommand
-    // `0x0001`/`0x0003`, two points per response byte), word devices a
-    // word-unit one. `slmp::DataType::U16` is used for *every* word group
-    // regardless of the tags' own types on purpose: it makes the crate hand
-    // back the raw register window, which `decode.rs::decode_register_value`
-    // then interprets - so the 32-bit word-order handling is shared with
-    // Modbus rather than reimplemented, and one group can serve a mix of
-    // i16/u32/f32 tags in a single round trip. Letting the crate do the
-    // typing would need one request per data type.
-    let data = match group.device.access() {
-        SlmpAccess::Bit => {
-            client
-                .bulk_read(start, expected, slmp::DataType::Bool)
-                .await
-        }
-        SlmpAccess::Word => client.bulk_read(start, expected, slmp::DataType::U16).await,
-    }
-    .map_err(classify_slmp_error)?;
-
-    // A response carrying fewer (or more) points than were asked for means
-    // the crate's frame accounting and ours disagree - the stream is not
-    // where we think it is, so this is fatal, not a per-tag problem.
-    if data.len() != expected {
-        return Err(PlcError::Protocol(format!(
-            "SLMP bulk read of {}{} returned {} point(s), expected {expected}",
-            group.device,
-            group.start,
-            data.len()
-        )));
-    }
-
-    match group.device.access() {
-        SlmpAccess::Bit => {
-            let mut bits = Vec::with_capacity(expected);
-            for d in &data {
-                match d.data {
-                    slmp::TypedData::Bool(b) => bits.push(b),
-                    other => {
-                        return Err(PlcError::Protocol(format!(
-                            "SLMP bit read returned a non-bool point: {other:?}"
-                        )))
-                    }
-                }
-            }
-            Ok(GroupValues::Bits(bits))
-        }
-        SlmpAccess::Word => {
-            let mut words = Vec::with_capacity(expected);
-            for d in &data {
-                match d.data {
-                    slmp::TypedData::U16(w) => words.push(w),
-                    other => {
-                        return Err(PlcError::Protocol(format!(
-                            "SLMP word read returned a non-u16 point: {other:?}"
-                        )))
-                    }
-                }
-            }
-            Ok(GroupValues::Words(words))
-        }
-    }
-}
-
-/// Execute a planned batch of reads on a **borrowed** `slmp::SLMPClient`, the
-/// reusable core the W3 broker calls directly on its shared per-CPU session -
-/// the read twin of `banto_plc_write::execute_slmp_writes`. Fills
-/// `outcome.immediate_bad` in by index, issues one bulk read per group in
-/// `outcome.reads`, and returns a `Vec<ReadResult>` of length `total_requests`
-/// in original request order.
-///
-/// `word_order` is the one shape difference from the write twin: a write bakes
-/// the 32-bit word order into its payload at plan time
-/// (`plan_slmp_writes(requests, word_order)`), so `execute_slmp_writes` needs no
-/// such argument; a read *decodes* the fetched register window here, after the
-/// wire round trip, so the order has to arrive with the call. `plan_slmp_requests`
-/// (unlike its write sibling) is therefore pure of it.
-///
-/// `Err` is reserved for a connection-fatal failure (the caller must drop the
-/// session and reconnect); a device-side end code becomes a per-request `Bad`
-/// for that group's requests and the loop continues. Does not own or reconnect
-/// the socket - lifecycle is the caller's ([`SlmpClient`] for the standalone
-/// form, the broker for the shared one).
-pub async fn execute_slmp_reads(
-    client: &mut slmp::SLMPClient,
-    outcome: &SlmpPlanOutcome,
-    total_requests: usize,
-    word_order: WordOrder,
-) -> Result<Vec<ReadResult>, PlcError> {
-    // Delegate to the string-capable executor and narrow the results back to
-    // the numeric-only shape. A `Str` value cannot occur for an outcome built
-    // by `plan_slmp_requests` (its input type cannot express a string); if a
-    // caller hands this legacy entry point a *batch*-planned outcome anyway,
-    // the string becomes a per-request `Bad` rather than a panic - the value
-    // simply does not fit this function's return type.
-    let results = execute_slmp_batch_reads(client, outcome, total_requests, word_order).await?;
-    Ok(results
-        .into_iter()
-        .map(|r| match r {
-            BatchReadResult::Value(value) => match value.as_tag_value() {
-                Some(v) => ReadResult::Value(v),
-                None => ReadResult::Bad(PlcError::Protocol(
-                    "文字列読み出しは execute_slmp_batch_reads を使ってください".to_string(),
-                )),
-            },
-            BatchReadResult::Bad(e) => ReadResult::Bad(e),
-        })
-        .collect())
-}
-
-/// The string-capable twin of [`execute_slmp_reads`], executing an outcome of
-/// [`plan_slmp_batch`] (numeric and string spans mixed in the same groups) on
-/// a **borrowed** `slmp::SLMPClient` - the entry point the S2 broker uses for
-/// mixed batches. Identical contract: `Err` is connection-fatal only, a
-/// device-side end code becomes a per-request `Bad` for its group, and every
-/// input index is answered exactly once, in original request order.
-///
-/// String spans are fetched exactly like numeric ones - the group is one raw
-/// `u16` window on the wire - and only the scatter step differs: a
-/// [`ReadKind::Str`] span goes through `decode.rs::decode_string_value`
-/// (low-byte-first per word, NUL-trimmed, decoded per its `encoding` field -
-/// T20 ①b, docs/banto-hub-t20-design.md §3.1; pre-①b this was
-/// unconditionally Shift-JIS) into [`PlcValue::Str`]. `word_order` applies to
-/// 32-bit *numeric* decoding only; a string's byte order is fixed by
-/// MELSEC's storage convention, not
-/// configurable per device family.
-pub async fn execute_slmp_batch_reads(
-    client: &mut slmp::SLMPClient,
-    outcome: &SlmpPlanOutcome,
-    total_requests: usize,
-    word_order: WordOrder,
-) -> Result<Vec<BatchReadResult>, PlcError> {
-    let mut results: Vec<Option<BatchReadResult>> = vec![None; total_requests];
-    for (index, reason) in &outcome.immediate_bad {
-        results[*index] = Some(BatchReadResult::Bad(reason.clone()));
-    }
-
-    for group in &outcome.reads {
-        match execute_one(client, group).await {
-            Ok(values) => {
-                for m in &group.mapping {
-                    let value = match &values {
-                        GroupValues::Bits(bits) => PlcValue::Bit(bits[m.offset_in_read as usize]),
-                        GroupValues::Words(words) => {
-                            let decoded = match m.kind {
-                                ReadKind::Numeric(data_type) => decode_register_value(
-                                    words,
-                                    m.offset_in_read as usize,
-                                    data_type,
-                                    word_order,
-                                )
-                                .map(PlcValue::from),
-                                ReadKind::Str {
-                                    words: span,
-                                    encoding,
-                                } => decode_string_value(
-                                    words,
-                                    m.offset_in_read as usize,
-                                    span as usize,
-                                    encoding,
-                                )
-                                .map(PlcValue::Str),
-                                // T8 (docs/tag-server-design.md §6.1): one
-                                // bit out of the fetched word, not the whole
-                                // word as a number.
-                                ReadKind::BitInWord { bit } => {
-                                    decode_register_bit(words, m.offset_in_read as usize, bit)
-                                        .map(PlcValue::from)
-                                }
-                            };
-                            match decoded {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    results[m.request_index] = Some(BatchReadResult::Bad(e));
-                                    continue;
-                                }
-                            }
-                        }
-                    };
-                    results[m.request_index] = Some(BatchReadResult::Value(value));
-                }
-            }
-            Err(err) if !err.is_connection_fatal() => {
-                // SLMP end code: the CPU refused this one group but answered in
-                // full, so only these requests are bad.
-                for m in &group.mapping {
-                    results[m.request_index] = Some(BatchReadResult::Bad(err.clone()));
-                }
-            }
-            Err(err) => {
-                // Connection-fatal: hand the error up. Dropping/reconnecting the
-                // session is the caller's job.
-                return Err(err);
-            }
-        }
-    }
-
-    Ok(results
-        .into_iter()
-        .enumerate()
-        .map(|(i, r)| {
-            r.unwrap_or_else(|| {
-                panic!("plan_slmp_batch must account for every input index, missing {i}")
-            })
-        })
-        .collect())
-}
-
-enum GroupValues {
-    Bits(Vec<bool>),
-    Words(Vec<u16>),
-}
-
-impl PlcClient for SlmpClient {
-    fn connect(&mut self) -> BoxFuture<'_, Result<(), PlcError>> {
-        Box::pin(async move {
-            // Drop any previous session first, so a redundant `connect()`
-            // replaces it rather than leaking a socket - same
-            // implementation-defined-but-reconnects behaviour
-            // (see `client.rs`'s note on this).
-            if let Some(previous) = self.inner.take() {
-                previous.close().await;
-            }
-
-            self.inner = Some(dial_slmp(&self.config).await?);
-            Ok(())
-        })
-    }
-
-    fn read_batch<'a>(
-        &'a mut self,
-        requests: &'a [ReadRequest],
-    ) -> BoxFuture<'a, Result<Vec<ReadResult>, PlcError>> {
-        Box::pin(async move {
-            if self.inner.is_none() {
-                return Err(PlcError::NotConnected);
-            }
-
-            let outcome = plan_slmp_requests(requests);
-            let word_order = self.config.word_order;
-
-            // Thin wrapper over the shared execute function (the read twin of
-            // `SlmpWriteClient::write_batch`): run it on our own socket, and on
-            // a fatal error drop the session so the next call is `NotConnected`.
-            // The broker does the equivalent for its own borrowed socket, so the
-            // owned and borrowed paths cannot drift.
-            let client = self
-                .inner
-                .as_mut()
-                .expect("checked Some above, only cleared on the fatal branch below");
-
-            match execute_slmp_reads(client, &outcome, requests.len(), word_order).await {
-                Ok(results) => Ok(results),
-                Err(err) => {
-                    self.inner = None;
-                    Err(err)
-                }
-            }
-        })
-    }
-
-    fn disconnect(&mut self) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            if let Some(client) = self.inner.take() {
-                // Unlike `modbus/mod.rs`, which just drops its `TcpStream`,
-                // the wrapped crate offers a real shutdown - worth using, since
-                // a CPU has a finite number of SLMP sessions and a
-                // half-open one ties up a slot until it times out. That session
-                // ceiling is also an open question for I5 (read and write
-                // clients were planned as separate sessions), which is one more
-                // reason not to leak them here.
-                client.close().await;
-            }
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::address::Address;
 
     /// The tripwire for [`SlmpDevice::to_wire`]: this crate's device table and
     /// the wrapped crate's must agree on every device's *actual wire code*, not
@@ -889,7 +438,8 @@ mod tests {
     /// correctly).
     #[test]
     fn classify_slmp_error_splits_fatal_from_per_request() {
-        let classified = classify_slmp_error(slmp::SlmpError::Device { end_code: 0xC059 });
+        let classify_for_test = |err| PlcError::from(classify_slmp(err));
+        let classified = classify_for_test(slmp::SlmpError::Device { end_code: 0xC059 });
         assert_eq!(
             classified,
             PlcError::SlmpEndCode {
@@ -906,7 +456,7 @@ mod tests {
         // could once confuse it with a `Device` response sharing the same
         // `io::ErrorKind` - this is the pair H9's structured enum exists to
         // separate unambiguously.
-        let framing = classify_slmp_error(slmp::SlmpError::Framing(
+        let framing = classify_for_test(slmp::SlmpError::Framing(
             slmp::FramingError::LengthMismatch {
                 declared: 4,
                 actual: 2,
@@ -916,48 +466,22 @@ mod tests {
         assert!(framing.is_connection_fatal());
 
         assert_eq!(
-            classify_slmp_error(slmp::SlmpError::Timeout),
+            classify_for_test(slmp::SlmpError::Timeout),
             PlcError::ResponseTimeout
         );
-        assert!(classify_slmp_error(slmp::SlmpError::Timeout).is_connection_fatal());
+        assert!(classify_for_test(slmp::SlmpError::Timeout).is_connection_fatal());
 
         assert_eq!(
-            classify_slmp_error(slmp::SlmpError::NotConnected),
+            classify_for_test(slmp::SlmpError::NotConnected),
             PlcError::NotConnected
         );
-        assert!(classify_slmp_error(slmp::SlmpError::NotConnected).is_connection_fatal());
+        assert!(classify_for_test(slmp::SlmpError::NotConnected).is_connection_fatal());
 
-        let io = classify_slmp_error(slmp::SlmpError::Io(std::io::Error::new(
+        let io = classify_for_test(slmp::SlmpError::Io(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
             "boom",
         )));
         assert!(matches!(io, PlcError::Connection(_)));
         assert!(io.is_connection_fatal());
-    }
-
-    #[tokio::test]
-    async fn read_batch_before_connect_is_not_connected() {
-        let mut client = SlmpClient::new(SlmpConfig {
-            host: "127.0.0.1".to_string(),
-            ..Default::default()
-        });
-        let requests = [ReadRequest {
-            address: Address::parse_slmp("D0").unwrap(),
-            data_type: crate::types::DataType::U16,
-        }];
-        assert!(matches!(
-            client.read_batch(&requests).await,
-            Err(PlcError::NotConnected)
-        ));
-    }
-
-    /// Even with nothing connected, a batch of *only* unservable requests must
-    /// still fail with `NotConnected` rather than quietly returning all-`Bad` -
-    /// `read_batch`'s connection check comes first, matching Modbus.
-    #[tokio::test]
-    async fn disconnect_on_a_never_connected_client_is_a_no_op() {
-        let mut client = SlmpClient::new(SlmpConfig::default());
-        client.disconnect().await; // must not panic
-        assert!(client.inner.is_none());
     }
 }

@@ -1,5 +1,5 @@
 //! In-process SLMP simulator that accepts **both** bulk write (`0x1401`) and
-//! bulk read (`0x0401`), so a test can write through [`super::SlmpWriteClient`]
+//! bulk read (`0x0401`), so a test can write through the engine (`banto-driver-slmp`)
 //! and then read the value back - proving the write actually landed, and with
 //! the right bytes and word order - either through the same simulator's read
 //! path or through `banto_plc::SlmpClient` pointed at it.

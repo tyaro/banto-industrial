@@ -1,6 +1,12 @@
 //! T5-5 実機検証ツール（docs/t5-handoff.md §3 T5-5、docs/tag-server-design.md
 //! §9 T5 行、docs/plan.md W5 の残項目「実機検証」に対応）。
 //!
+//! R2b-3d-join で、旧 `SlmpClient` / `SlmpWriteClient` の I/O から
+//! **エンジン経由**（`FrameSession::connect` + フレーム型の `SlmpDriver`、
+//! `Session` の `read_batch` / `write_batch`）に書き直した
+//! （docs/banto-hub-driver-io-design.md §6.2）。ワード内ビットの書き込みは
+//! ドライバの `write_next` が RMW で行う（`D<n>.<b>` への Bit 書き込み）。
+//!
 //! 既定の対象は三菱 R08ENCPU（iQ-R、`192.168.11.200:5200`、CPU 種別 R）。
 //! #605 で接続先の IP・ポート・CPU 種別（Q / R）を引数で変えられる。
 //! 乾燥炉の MELSEC-Q（QJ71E71-100）を見るときは、その PLC 用の許可アドレスを
@@ -15,12 +21,13 @@
 //! ## 安全策
 //!
 //! - 書き込みを伴うフェーズ2・3は `REAL_PLC_CONFIRM_WRITE=1` のときだけ。
-//! - アドレスは安全範囲の中だけ。範囲の入口は [`Ctx::addr`]。
+//! - アドレスは安全範囲の中だけ。範囲の入口は [`Ctx::spec`]。
 //! - 試験の後は 0 や false で埋めず、書き込む前に読んだ元の値を戻す
 //!   （`[restore]`）。試験中の true/false 書き込み（`[trial]`）とは別。
-//!   SLMP は PLC の拒否を呼び出しの `Err` ではなく個別の `WriteResult::Bad`
-//!   で返す。復元は全件の成功と件数を見てから読み戻し、元の値と違うときは
-//!   アドレスと元の値を出して失敗する（成功の表示には進まない）。
+//!   PLC の拒否は呼び出しの `Err` ではなく、項目ごとの `ItemError`
+//!   （`Session::write_batch` の結果の各要素）で返る。復元は全件の成功と件数を
+//!   見てから読み戻し、元の値と違うときはアドレスと元の値を出して失敗する
+//!   （成功の表示には進まない）。
 //! - 各フェーズは前段が失敗したら止まる。タイムアウトは数秒。
 //!
 //! ## 実行方法
@@ -39,15 +46,15 @@
 use std::time::Duration;
 
 use banto_broker::{BackoffConfig, BrokerError, BrokerSupervisor};
+use banto_driver_api::{
+    ConnectContext, DataType, DriverBase, ItemError, Session, Settings, StringEncoding, TagKind,
+    TagSpec, Value, WriteItem,
+};
+use banto_driver_engine::transport::TransportSpec;
+use banto_driver_engine::FrameSession;
+use banto_driver_slmp::SlmpDriver;
 use banto_drivers::builtin;
-use banto_plc::{
-    Address, BatchReadRequest, BatchReadResult, DataType, PlcClient, PlcValue, ReadRequest,
-    ReadResult, SlmpClient, SlmpConfig, SlmpCpu, StringReadRequest, TagValue,
-};
-use banto_plc_write::{
-    BatchWriteRequest, PlcWriteClient, SlmpWriteClient, StringWriteRequest, WriteRequest,
-    WriteResult,
-};
+use banto_plc::SlmpCpu;
 use banto_tags::PlcConnection;
 
 /// オーナーが R08ENCPU に指定した接続先。これ以外へ D3000 帯を流用しない。
@@ -106,15 +113,29 @@ struct Ctx {
 }
 
 impl Ctx {
-    fn config(&self) -> SlmpConfig {
-        SlmpConfig {
+    fn settings(&self) -> Result<Settings, String> {
+        Settings::from_pairs([
+            ("host", self.target.host.clone()),
+            ("port", self.target.port.to_string()),
+            ("cpu_type", cpu_name(self.target.cpu).to_string()),
+        ])
+        .map_err(|e| format!("接続設定が不正です: {e:?}"))
+    }
+
+    /// 独立した 1 本のセッションを張る（エンジン経由、`SlmpDriver`）。
+    async fn connect(&self) -> Result<FrameSession, String> {
+        let spec = TransportSpec::Tcp {
             host: self.target.host.clone(),
             port: self.target.port,
-            cpu: self.target.cpu,
-            connect_timeout: Duration::from_secs(3),
-            response_timeout: Duration::from_secs(3),
-            ..Default::default()
-        }
+        };
+        let cx = ConnectContext::new(
+            "t5-5-verify",
+            Duration::from_secs(3),
+            Duration::from_secs(3),
+        );
+        FrameSession::connect(&SlmpDriver, &self.settings()?, &spec, &cx, None)
+            .await
+            .map_err(|e| format!("{e}"))
     }
 
     fn d(&self, offset: u32) -> String {
@@ -126,9 +147,20 @@ impl Ctx {
     }
 
     /// 安全範囲の外は panic する。試験アドレスはすべてここを通る。
-    fn addr(&self, raw: &str) -> Address {
+    fn spec(&self, raw: &str, kind: TagKind) -> TagSpec {
         assert_in_range(raw, &self.range);
-        Address::parse_slmp(raw).unwrap_or_else(|e| panic!("address {raw} should parse: {e}"))
+        let address = SlmpDriver
+            .parse_address(raw, &kind)
+            .unwrap_or_else(|e| panic!("address {raw} should parse: {e}"));
+        TagSpec::new(address, kind)
+    }
+
+    fn u16_spec(&self, raw: &str) -> TagSpec {
+        self.spec(raw, TagKind::numeric(DataType::U16))
+    }
+
+    fn bit_spec(&self, raw: &str) -> TagSpec {
+        self.spec(raw, TagKind::numeric(DataType::Bit))
     }
 }
 
@@ -281,9 +313,12 @@ fn cpu_name(cpu: SlmpCpu) -> &'static str {
     }
 }
 
-fn fmt_word_result(r: &ReadResult) -> String {
+type ReadOutcome = Result<Value, ItemError>;
+type WriteOutcome = Result<(), ItemError>;
+
+fn fmt_word_result(r: &ReadOutcome) -> String {
     match r {
-        ReadResult::Value(TagValue::F64(v)) => {
+        Ok(Value::F64(v)) => {
             let w = *v as i64 as u16;
             format!("{v} (0x{w:04X}, 0b{w:016b})")
         }
@@ -291,102 +326,71 @@ fn fmt_word_result(r: &ReadResult) -> String {
     }
 }
 
-fn word_number(r: &ReadResult) -> Result<f64, String> {
+fn word_number(r: &ReadOutcome) -> Result<f64, String> {
     match r {
-        ReadResult::Value(TagValue::F64(v)) => Ok(*v),
+        Ok(Value::F64(v)) => Ok(*v),
         other => Err(format!("元のワードを読めませんでした: {other:?}")),
     }
 }
 
-fn bit_number(r: &ReadResult) -> Result<bool, String> {
+fn bit_number(r: &ReadOutcome) -> Result<bool, String> {
     match r {
-        ReadResult::Value(TagValue::Bit(v)) => Ok(*v),
+        Ok(Value::Bit(v)) => Ok(*v),
         other => Err(format!("元のビットを読めませんでした: {other:?}")),
     }
 }
 
-async fn write_once(ctx: &Ctx, requests: &[BatchWriteRequest]) -> Result<Vec<WriteResult>, String> {
-    let mut client = SlmpWriteClient::new(ctx.config());
-    client
+/// 1 回の書き込みのために独立したセッションを張り、書いて閉じる。
+async fn write_once(ctx: &Ctx, items: &[WriteItem]) -> Result<Vec<WriteOutcome>, String> {
+    let mut session = ctx
         .connect()
         .await
-        .map_err(|e| format!("書込クライアント接続失敗: {e}"))?;
-    let result = client
-        .write_batch_mixed(requests)
+        .map_err(|e| format!("書込セッション接続失敗: {e}"))?;
+    let result = session
+        .write_batch(items)
         .await
         .map_err(|e| format!("書込失敗: {e}"));
-    client.disconnect().await;
+    session.disconnect().await;
     result
 }
 
-async fn read_once(ctx: &Ctx, requests: &[ReadRequest]) -> Result<Vec<ReadResult>, String> {
-    let mut client = SlmpClient::new(ctx.config());
-    client
+/// 1 回の読み取りのために独立したセッションを張り、読んで閉じる。
+async fn read_once(ctx: &Ctx, specs: &[TagSpec]) -> Result<Vec<ReadOutcome>, String> {
+    let mut session = ctx
         .connect()
         .await
-        .map_err(|e| format!("読取クライアント接続失敗: {e}"))?;
-    let result = client
-        .read_batch(requests)
+        .map_err(|e| format!("読取セッション接続失敗: {e}"))?;
+    let result = session
+        .read_batch(specs)
         .await
         .map_err(|e| format!("読取失敗: {e}"));
-    client.disconnect().await;
+    session.disconnect().await;
     result
-}
-
-async fn read_mixed_once(
-    ctx: &Ctx,
-    requests: &[BatchReadRequest],
-) -> Result<Vec<BatchReadResult>, String> {
-    let mut client = SlmpClient::new(ctx.config());
-    client
-        .connect()
-        .await
-        .map_err(|e| format!("読取クライアント接続失敗: {e}"))?;
-    let result = client
-        .read_batch_mixed(requests)
-        .await
-        .map_err(|e| format!("読取失敗: {e}"));
-    client.disconnect().await;
-    result
-}
-
-fn u16_read(ctx: &Ctx, raw: &str) -> ReadRequest {
-    ReadRequest {
-        address: ctx.addr(raw),
-        data_type: DataType::U16,
-    }
 }
 
 async fn phase1_read_only(ctx: &Ctx) -> Result<(), String> {
     println!("--- フェーズ1: 基本接続・読み取り（SLMP互換性） ---");
-    let mut client = SlmpClient::new(ctx.config());
     println!(
         "接続中: {}:{} (SLMP, CPU {}) ...",
         ctx.target.host,
         ctx.target.port,
         cpu_name(ctx.target.cpu)
     );
-    client
-        .connect()
-        .await
-        .map_err(|e| format!("接続失敗: {e}"))?;
+    let mut session = ctx.connect().await.map_err(|e| format!("接続失敗: {e}"))?;
     println!("接続成功。");
 
-    let mut requests: Vec<ReadRequest> = Vec::new();
+    let mut specs: Vec<TagSpec> = Vec::new();
     for offset in 0..10u32 {
         let raw = ctx.d(offset);
-        requests.push(u16_read(ctx, &raw));
+        specs.push(ctx.u16_spec(&raw));
     }
     for offset in 0..16u32 {
         let raw = ctx.m(offset);
-        requests.push(ReadRequest {
-            address: ctx.addr(&raw),
-            data_type: DataType::Bit,
-        });
+        specs.push(ctx.bit_spec(&raw));
     }
 
-    let results = client
-        .read_batch(&requests)
+    let results = session
+        .read_batch(&specs)
         .await
         .map_err(|e| format!("read_batch 失敗: {e}"))?;
 
@@ -399,7 +403,7 @@ async fn phase1_read_only(ctx: &Ctx) -> Result<(), String> {
         println!("  {} = {:?}", ctx.m(i as u32), r);
     }
 
-    client.disconnect().await;
+    session.disconnect().await;
     println!("切断しました。");
     Ok(())
 }
@@ -434,14 +438,13 @@ fn restore_needed(items: &[RestoreItem]) -> String {
 
 /// 復元書き込みが PLC に届いたかを検査する。
 ///
-/// `write_once` の外側が `Ok` でも、SLMP のデバイス拒否は
-/// [`WriteResult::Bad`] になる（`banto-plc-write` の `execute_slmp_writes`）。
-/// 件数不足も、個別の `Bad` も復元失敗にする。成功の表示はこの関数が
-/// `Ok` を返したあとだけ。
+/// `write_once` の外側が `Ok` でも、PLC のデバイス拒否などは項目ごとの
+/// `ItemError`（結果の各要素の `Err`）になる。件数不足も、個別の `Err` も
+/// 復元失敗にする。成功の表示はこの関数が `Ok` を返したあとだけ。
 fn require_restore_accepted(
     kind: &str,
     items: &[RestoreItem],
-    results: &[WriteResult],
+    results: &[WriteOutcome],
 ) -> Result<(), String> {
     if results.len() != items.len() {
         return Err(format!(
@@ -454,7 +457,7 @@ fn require_restore_accepted(
     let rejected: Vec<String> = results
         .iter()
         .zip(items)
-        .filter(|(result, _)| !result.is_ok())
+        .filter(|(result, _)| result.is_err())
         .map(|(result, item)| {
             format!(
                 "{}（元の値 {}、結果 {result:?}）",
@@ -464,7 +467,7 @@ fn require_restore_accepted(
         .collect();
     if !rejected.is_empty() {
         return Err(format!(
-            "{kind}の復元: PLC が書き込みを拒否しました（呼び出しは成功、個別結果は Bad）。{}",
+            "{kind}の復元: PLC が書き込みを拒否しました（呼び出しは成功、個別結果は ItemError）。{}",
             rejected.join("、")
         ));
     }
@@ -521,25 +524,21 @@ async fn restore_words(ctx: &Ctx, offsets: &[u32], values: &[f64]) -> Result<(),
             original: format_word(value),
         })
         .collect();
-    let writes: Vec<BatchWriteRequest> = offsets
+    let writes: Vec<WriteItem> = offsets
         .iter()
         .zip(values)
         .map(|(&offset, &value)| {
             let raw = ctx.d(offset);
-            BatchWriteRequest::Numeric(WriteRequest {
-                address: ctx.addr(&raw),
-                data_type: DataType::U16,
-                value: TagValue::F64(value),
-            })
+            WriteItem::new(ctx.u16_spec(&raw), Value::F64(value))
         })
         .collect();
     let result = write_once(ctx, &writes)
         .await
         .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
     require_restore_accepted("ワード", &items, &result)?;
-    let reads: Vec<ReadRequest> = items
+    let reads: Vec<TagSpec> = items
         .iter()
-        .map(|item| u16_read(ctx, &item.address))
+        .map(|item| ctx.u16_spec(&item.address))
         .collect();
     let read_back = read_once(ctx, &reads)
         .await
@@ -565,26 +564,13 @@ async fn restore_bit(ctx: &Ctx, raw: &str, saved: bool) -> Result<(), String> {
         address: raw.to_string(),
         original: format_bit(saved),
     }];
-    let result = write_once(
-        ctx,
-        &[BatchWriteRequest::Numeric(WriteRequest {
-            address: ctx.addr(raw),
-            data_type: DataType::Bit,
-            value: TagValue::Bit(saved),
-        })],
-    )
-    .await
-    .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    let result = write_once(ctx, &[WriteItem::new(ctx.bit_spec(raw), Value::Bit(saved))])
+        .await
+        .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
     require_restore_accepted("ビット", &items, &result)?;
-    let read_back = read_once(
-        ctx,
-        &[ReadRequest {
-            address: ctx.addr(raw),
-            data_type: DataType::Bit,
-        }],
-    )
-    .await
-    .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
+    let read_back = read_once(ctx, &[ctx.bit_spec(raw)])
+        .await
+        .map_err(|err| format!("{err}。{}", restore_needed(&items)))?;
     let actual = match read_back.first().map(bit_number) {
         Some(Ok(value)) => format_bit(value),
         Some(Err(err)) => format!("読めない: {err}"),
@@ -599,11 +585,11 @@ async fn phase2_write_and_bit_rmw(ctx: &Ctx) -> Result<(), String> {
     println!("--- フェーズ2: 書き込み + Bit RMW ---");
     let pattern: [u16; 5] = [0x1111, 0x2222, 0x3333, 0x4444, 0x5555];
     let pattern_offsets: Vec<u32> = (0..5).collect();
-    let pattern_reads: Vec<ReadRequest> = pattern_offsets
+    let pattern_reads: Vec<TagSpec> = pattern_offsets
         .iter()
         .map(|offset| {
             let raw = ctx.d(*offset);
-            u16_read(ctx, &raw)
+            ctx.u16_spec(&raw)
         })
         .collect();
     let saved_pattern = read_once(ctx, &pattern_reads).await?;
@@ -612,18 +598,9 @@ async fn phase2_write_and_bit_rmw(ctx: &Ctx) -> Result<(), String> {
         .map(word_number)
         .collect::<Result<Vec<_>, _>>()?;
     let bit_raw = ctx.d(D_BIT_OFFSET);
-    let saved_bit_word = word_number(&read_once(ctx, &[u16_read(ctx, &bit_raw)]).await?[0])?;
+    let saved_bit_word = word_number(&read_once(ctx, &[ctx.u16_spec(&bit_raw)]).await?[0])?;
     let m_raw = ctx.m(0);
-    let saved_m = bit_number(
-        &read_once(
-            ctx,
-            &[ReadRequest {
-                address: ctx.addr(&m_raw),
-                data_type: DataType::Bit,
-            }],
-        )
-        .await?[0],
-    )?;
+    let saved_m = bit_number(&read_once(ctx, &[ctx.bit_spec(&m_raw)]).await?[0])?;
     println!(
         "[snapshot] 試験前の値を記録しました（復元はこの値です。0/false へのクリアではありません）"
     );
@@ -650,31 +627,32 @@ async fn phase2_write_and_bit_rmw(ctx: &Ctx) -> Result<(), String> {
 }
 
 async fn phase2_trial(ctx: &Ctx, pattern: &[u16; 5]) -> Result<(), String> {
-    let writes: Vec<BatchWriteRequest> = pattern
+    let writes: Vec<WriteItem> = pattern
         .iter()
         .enumerate()
         .map(|(i, &v)| {
             let raw = ctx.d(i as u32);
-            BatchWriteRequest::Numeric(WriteRequest {
-                address: ctx.addr(&raw),
-                data_type: DataType::U16,
-                value: TagValue::F64(v as f64),
-            })
+            WriteItem::new(ctx.u16_spec(&raw), Value::F64(f64::from(v)))
         })
         .collect();
     let write_results = write_once(ctx, &writes).await?;
     println!("[trial] パターン書込結果: {write_results:?}");
+    if write_results.len() != pattern.len() || write_results.iter().any(|r| r.is_err()) {
+        return Err(format!(
+            "パターン書込が全件 Ok ではありませんでした: {write_results:?}"
+        ));
+    }
 
-    let reads: Vec<ReadRequest> = (0..5)
+    let reads: Vec<TagSpec> = (0..5)
         .map(|i| {
             let raw = ctx.d(i);
-            u16_read(ctx, &raw)
+            ctx.u16_spec(&raw)
         })
         .collect();
     let read_back = read_once(ctx, &reads).await?;
     let mut all_matched = true;
     for (i, (expected, got)) in pattern.iter().zip(read_back.iter()).enumerate() {
-        let matched = matches!(got, ReadResult::Value(TagValue::F64(v)) if *v == *expected as f64);
+        let matched = matches!(got, Ok(Value::F64(v)) if *v == f64::from(*expected));
         all_matched &= matched;
         println!(
             "  [trial] {}: 期待値=0x{:04X} 実測={} 一致={}",
@@ -688,19 +666,17 @@ async fn phase2_trial(ctx: &Ctx, pattern: &[u16; 5]) -> Result<(), String> {
         return Err("パターン書込/読戻が一致しませんでした".to_string());
     }
 
+    // ワード内ビットの書き込み: ドライバの `write_next` が RMW（読み→ビット差し替え→書き）で行う。
     let bit_word = ctx.d(D_BIT_OFFSET);
     for bit in 0..3u8 {
         let bit_text = format!("{bit_word}.{bit}");
         let w = write_once(
             ctx,
-            &[BatchWriteRequest::BitInWord {
-                address: ctx.addr(&bit_text),
-                value: true,
-            }],
+            &[WriteItem::new(ctx.bit_spec(&bit_text), Value::Bit(true))],
         )
         .await?;
         println!("  [trial] {bit_text}=true 書込結果={w:?}");
-        if !matches!(w.first(), Some(WriteResult::Ok)) {
+        if !matches!(w.first(), Some(Ok(()))) {
             return Err(format!(
                 "{bit_text} への RMW 書込が Ok を返しませんでした: {w:?}"
             ));
@@ -711,10 +687,7 @@ async fn phase2_trial(ctx: &Ctx, pattern: &[u16; 5]) -> Result<(), String> {
         let bit_text = format!("{bit_word}.{bit}");
         let w = write_once(
             ctx,
-            &[BatchWriteRequest::BitInWord {
-                address: ctx.addr(&bit_text),
-                value: false,
-            }],
+            &[WriteItem::new(ctx.bit_spec(&bit_text), Value::Bit(false))],
         )
         .await?;
         println!("  [trial] {bit_text}=false 試験結果={w:?}");
@@ -724,23 +697,12 @@ async fn phase2_trial(ctx: &Ctx, pattern: &[u16; 5]) -> Result<(), String> {
     for value in [true, false] {
         let w = write_once(
             ctx,
-            &[BatchWriteRequest::Numeric(WriteRequest {
-                address: ctx.addr(&m_text),
-                data_type: DataType::Bit,
-                value: TagValue::Bit(value),
-            })],
+            &[WriteItem::new(ctx.bit_spec(&m_text), Value::Bit(value))],
         )
         .await?;
-        let r = read_once(
-            ctx,
-            &[ReadRequest {
-                address: ctx.addr(&m_text),
-                data_type: DataType::Bit,
-            }],
-        )
-        .await?;
+        let r = read_once(ctx, &[ctx.bit_spec(&m_text)]).await?;
         println!("[trial] {m_text}={value} 書込結果={w:?} 読戻={r:?}");
-        if !matches!(r.first(), Some(ReadResult::Value(TagValue::Bit(b))) if *b == value) {
+        if !matches!(r.first(), Some(Ok(Value::Bit(b))) if *b == value) {
             return Err(format!(
                 "{m_text}={value} の書込/読戻が一致しませんでした: {r:?}"
             ));
@@ -796,11 +758,11 @@ async fn phase3_string_roundtrip(ctx: &Ctx) -> Result<(), String> {
     let test_string = "テスト123";
     let words = D_STRING_WORDS;
     let offsets: Vec<u32> = (0..words as u32).map(|i| D_STRING_OFFSET + i).collect();
-    let reads: Vec<ReadRequest> = offsets
+    let reads: Vec<TagSpec> = offsets
         .iter()
         .map(|offset| {
             let raw = ctx.d(*offset);
-            u16_read(ctx, &raw)
+            ctx.u16_spec(&raw)
         })
         .collect();
     let saved = read_once(ctx, &reads).await?;
@@ -811,31 +773,27 @@ async fn phase3_string_roundtrip(ctx: &Ctx) -> Result<(), String> {
     println!("[snapshot] 文字列領域の元のワードを記録しました");
 
     let raw = ctx.d(D_STRING_OFFSET);
+    let string_kind = || TagKind::string(words, StringEncoding::ShiftJis);
     let trial = async {
         let write_result = write_once(
             ctx,
-            &[BatchWriteRequest::String(StringWriteRequest {
-                address: ctx.addr(&raw),
-                words,
-                value: test_string.to_string(),
-                encoding: banto_plc_write::StringEncoding::ShiftJis,
-            })],
+            &[WriteItem::new(
+                ctx.spec(&raw, string_kind()),
+                Value::Str(test_string.to_string()),
+            )],
         )
         .await?;
         println!("[trial] 文字列書込結果: {write_result:?}");
-        let read_result = read_mixed_once(
-            ctx,
-            &[BatchReadRequest::String(StringReadRequest {
-                address: ctx.addr(&raw),
-                words,
-                encoding: banto_plc::StringEncoding::ShiftJis,
-            })],
-        )
-        .await?;
+        if !matches!(write_result.first(), Some(Ok(()))) {
+            return Err(format!(
+                "文字列書込が Ok を返しませんでした: {write_result:?}"
+            ));
+        }
+        let read_result = read_once(ctx, &[ctx.spec(&raw, string_kind())]).await?;
         println!("[trial] 文字列読戻結果: {read_result:?}");
         let matched = matches!(
             &read_result[..],
-            [BatchReadResult::Value(PlcValue::Str(s))] if s == test_string
+            [Ok(Value::Str(s))] if s == test_string
         );
         if !matched {
             return Err(format!(
@@ -890,16 +848,7 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
     let handle = supervisor
         .handle(1)
         .ok_or_else(|| "broker handle が見つかりません".to_string())?;
-    let probe_kind = banto_driver_api::TagKind::numeric(DataType::U16);
-    let probe_spec = banto_driver_api::TagSpec::new(
-        banto_driver_api::DriverBase::parse_address(
-            &banto_driver_slmp::SlmpDriver,
-            &ctx.addr(&probe).to_string(),
-            &probe_kind,
-        )
-        .map_err(|e| format!("アドレス {probe}: {e}"))?,
-        probe_kind,
-    );
+    let probe_spec = ctx.u16_spec(&probe);
 
     println!("[4] broker セッション（セッション#1）接続待機中...");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
@@ -920,38 +869,27 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         }
     }
 
-    let mut second = SlmpClient::new(ctx.config());
-    println!("[4] セッション#2（独立した SlmpClient）接続試行中...");
-    let second_ok = match second.connect().await {
-        Ok(()) => {
+    println!("[4] セッション#2（独立した FrameSession）接続試行中...");
+    let mut second = match ctx.connect().await {
+        Ok(mut session) => {
             println!("[4] セッション#2 接続成功。");
-            let r = second
-                .read_batch(&[ReadRequest {
-                    address: ctx.addr(&probe),
-                    data_type: DataType::U16,
-                }])
-                .await;
+            let r = session.read_batch(std::slice::from_ref(&probe_spec)).await;
             println!("[4] セッション#2 read 結果: {r:?}");
-            true
+            Some(session)
         }
         Err(e) => {
             println!("[4] セッション#2 接続失敗: {e}");
-            false
+            None
         }
     };
+    let second_ok = second.is_some();
 
     let third_ok = if second_ok {
-        let mut third = SlmpClient::new(ctx.config());
-        println!("[4] セッション#3（独立した SlmpClient）接続試行中...");
-        match third.connect().await {
-            Ok(()) => {
+        println!("[4] セッション#3（独立した FrameSession）接続試行中...");
+        match ctx.connect().await {
+            Ok(mut third) => {
                 println!("[4] セッション#3 接続成功。");
-                let r = third
-                    .read_batch(&[ReadRequest {
-                        address: ctx.addr(&probe),
-                        data_type: DataType::U16,
-                    }])
-                    .await;
+                let r = third.read_batch(std::slice::from_ref(&probe_spec)).await;
                 println!("[4] セッション#3 read 結果: {r:?}");
                 third.disconnect().await;
                 true
@@ -966,7 +904,9 @@ async fn phase4_session_limit(ctx: &Ctx) -> Result<(), String> {
         false
     };
 
-    second.disconnect().await;
+    if let Some(session) = second.as_mut() {
+        session.disconnect().await;
+    }
     let concurrent_sessions = 1 + u32::from(second_ok) + u32::from(third_ok);
     println!(
         "[4] 実測: 少なくとも{concurrent_sessions}本の同時セッションを確認（#2={second_ok}, #3={third_ok}）"
@@ -1172,22 +1112,22 @@ mod tests {
         }
     }
 
-    /// `write_once` が `Ok(vec![Bad])` を返したときと同じ。外側の成功だけで
-    /// 復元成功にしない。失敗の文言にアドレスと元の値がある。
+    /// `write_once` が `Ok(vec![.., Err(ItemError)])` を返したときと同じ。外側の
+    /// 成功だけで復元成功にしない。失敗の文言にアドレスと元の値がある。
     #[test]
-    fn restore_treats_an_inner_bad_as_failure() {
+    fn restore_treats_an_inner_item_error_as_failure() {
         let items = vec![word_item("D3000", 0x1111), word_item("D3001", 0x2222)];
         let results = vec![
-            WriteResult::Ok,
-            WriteResult::Bad(banto_plc_write::PlcWriteError::SlmpEndCode {
-                code: 0xC059,
-                message: "wrong command".to_string(),
-            }),
+            Ok(()),
+            Err(ItemError::Device(banto_driver_api::DeviceError::new(
+                0xC059,
+                "wrong command",
+            ))),
         ];
         let err = require_restore_accepted("ワード", &items, &results).unwrap_err();
         assert!(err.contains("D3001"), "{err}");
         assert!(err.contains("0x2222"), "{err}");
-        assert!(err.contains("Bad"), "{err}");
+        assert!(err.contains("ItemError"), "{err}");
         assert!(!err.contains("戻し、読み戻しで一致"), "{err}");
     }
 
@@ -1214,7 +1154,7 @@ mod tests {
     #[test]
     fn restore_accepts_matching_results_and_readback() {
         let items = vec![word_item("D3000", 0x1111)];
-        require_restore_accepted("ワード", &items, &[WriteResult::Ok]).unwrap();
+        require_restore_accepted("ワード", &items, &[Ok(())]).unwrap();
         require_restore_readback("ワード", &items, &[format_word(f64::from(0x1111u16))]).unwrap();
     }
 
@@ -1233,7 +1173,7 @@ mod tests {
         };
         let err = run_restore_steps(vec![
             step(Err(
-                "ワードの復元: D3000（元の値 4369 (0x1111)、結果 Bad）".to_string()
+                "ワードの復元: D3000（元の値 4369 (0x1111)、結果 Err）".to_string()
             )),
             step(Ok(())),
             step(Ok(())),
