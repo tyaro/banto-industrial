@@ -31,6 +31,10 @@ enum Reaction {
     Silence,
     /// これらのまとまりを順に届ける（1 回の recv に 1 つ）。
     Reply(Vec<Vec<u8>>),
+    /// send が `Io` で失敗する。
+    SendFails,
+    /// send が返らない（送信の途中。呼び手の取り消しで future が drop される）。
+    SendStalls,
 }
 
 #[derive(Default)]
@@ -73,11 +77,16 @@ impl Drop for SerialWire {
 impl Transport for SerialWire {
     fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
         Box::pin(async move {
-            let mut state = self.0.lock();
-            state.sent.push(bytes.to_vec());
-            match state.script.pop_front().unwrap_or(Reaction::Silence) {
+            let reaction = {
+                let mut state = self.0.lock();
+                state.sent.push(bytes.to_vec());
+                state.script.pop_front().unwrap_or(Reaction::Silence)
+            };
+            match reaction {
                 Reaction::Silence => {}
-                Reaction::Reply(chunks) => state.inbox.extend(chunks),
+                Reaction::Reply(chunks) => self.0.lock().inbox.extend(chunks),
+                Reaction::SendFails => return Err(FatalError::Io("送信の失敗".into())),
+                Reaction::SendStalls => std::future::pending::<()>().await,
             }
             Ok(())
         })
@@ -130,6 +139,8 @@ enum SyncPolicy {
 #[derive(Clone)]
 struct Conn {
     policy: SyncPolicy,
+    /// 書き込みを応答を待たない step（`FrameRule::None`）で送る。
+    no_reply_write: bool,
     drops: Arc<AtomicUsize>,
 }
 
@@ -201,6 +212,9 @@ impl FrameConnection for Conn {
     ) -> Result<WriteProgress, FatalError> {
         Ok(if previous.is_some() {
             WriteProgress::Done(vec![Ok(()); items.len()])
+        } else if self.no_reply_write {
+            let step = Step::new(request(0x06, ADDR_A).send, FrameRule::None, 16);
+            WriteProgress::Send(Planned::new(step, vec![0]))
         } else {
             WriteProgress::Send(Planned::new(request(0x06, ADDR_A), vec![0]))
         })
@@ -225,6 +239,7 @@ impl Driver {
             descriptor,
             conn: Conn {
                 policy,
+                no_reply_write: false,
                 drops: Arc::default(),
             },
         }
@@ -1006,4 +1021,59 @@ async fn an_unsynced_line_reopened_with_a_new_baud_keeps_its_outstanding_signatu
     assert_eq!(bench.wire.lock().opens, 2, "設定が変わったので開き直した");
     assert_eq!(bench.state(), SyncState::Unsynced);
     assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)], "署名は残る");
+}
+
+/// 応答を待たない書き込みだけを送るベンチ（同期の手順を持たないドライバ。線は `Fresh` で始まる）。
+async fn no_reply_bench() -> (Bench, FrameSession) {
+    let mut bench = Bench::new(SyncPolicy::None);
+    bench.driver.conn.no_reply_write = true;
+    let session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Fresh);
+    (bench, session)
+}
+
+fn write_a() -> Vec<WriteItem> {
+    vec![WriteItem::new(spec_of(ADDR_A), Value::F64(1.0))]
+}
+
+/// §7.3 の 7（Codex P1）: 応答を待たない step でも、送信が `Io` で失敗したら線は未同期になる。
+/// 機器は崩れたフレームを受けたかもしれないので、次のセッションが線をそのまま使い直さない。
+#[tokio::test(start_paused = true)]
+async fn a_failed_send_of_a_step_without_response_leaves_the_line_unsynced() {
+    let (bench, mut session) = no_reply_bench().await;
+    bench.wire.react([Reaction::SendFails]);
+    let result = session.write_batch(&write_a()).await;
+    assert!(matches!(result, Err(FatalError::Io(_))), "{result:?}");
+    assert_eq!(bench.state(), SyncState::Unsynced);
+    assert!(
+        bench.outstanding().is_empty(),
+        "応答を待たない step は署名を残さない"
+    );
+}
+
+/// §7.3 の 7（Codex P1）: 応答を待たない step の送信の途中で future が drop されても、線は未同期になる。
+#[tokio::test(start_paused = true)]
+async fn a_send_of_a_step_without_response_cancelled_midway_leaves_the_line_unsynced() {
+    let (bench, mut session) = no_reply_bench().await;
+    bench.wire.react([Reaction::SendStalls]);
+    let cancelled = tokio::time::timeout(T / 2, session.write_batch(&write_a())).await;
+    assert!(cancelled.is_err(), "外側の上限で future を drop した");
+    assert_eq!(bench.wire.sent().len(), 1, "送信は始まっていた");
+    assert_eq!(
+        bench.state(),
+        SyncState::Unsynced,
+        "番人の drop が未同期にする"
+    );
+    assert!(bench.outstanding().is_empty());
+}
+
+/// 応答を待たない step を送り終えても、線の状態は変えない（応答の検証が無いので `Synced` にしない）。
+#[tokio::test(start_paused = true)]
+async fn a_completed_send_of_a_step_without_response_keeps_the_line_state() {
+    let (bench, mut session) = no_reply_bench().await;
+    let results = session.write_batch(&write_a()).await.unwrap();
+    assert_eq!(results, vec![Ok(())]);
+    assert_eq!(bench.wire.sent(), vec![request(0x06, ADDR_A).send]);
+    assert_eq!(bench.state(), SyncState::Fresh, "送る前と同じ");
+    assert!(bench.outstanding().is_empty());
 }

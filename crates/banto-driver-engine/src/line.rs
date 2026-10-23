@@ -204,6 +204,13 @@ impl InFlightGuard {
         self.line.mark_synced(self.signature.as_ref());
     }
 
+    /// 応答を待たない step を送り終えた。線の状態は変えずに外す（応答の検証が無いので
+    /// `Synced` にはしない）。番人は署名なしで作ったものに限る。
+    pub(crate) fn disarm(mut self) {
+        debug_assert!(self.signature.is_none(), "署名つきの番人は disarm しない");
+        self.armed = false;
+    }
+
     /// 同期の要求の応答が届いた。待っている署名をすべて外して `Synced` に戻す。
     pub(crate) fn complete_sync(mut self) {
         self.armed = false;

@@ -668,21 +668,27 @@ impl Core {
         }
         // シリアルの線（設計 §7.3 の 7）: 送る前に署名を記録し「応答待ち」にする。番人は
         // 検証の通った完結でだけ外す。それ以外の終わり方（致命・取り消し）では drop が未同期にする。
+        // 応答を待たない step にも署名なしの番人を付ける: 送信が時間切れ・`Io`・取り消し（一部の
+        // バイトだけ出た後の drop を含む）で終わると、機器は崩れたフレームを受けたかもしれない。
         let awaits_response = !matches!(step.expect, FrameRule::None);
         let tracked = match self.wire.line() {
-            Some(line) if awaits_response => {
+            Some(line) => {
                 let line = Arc::clone(line);
-                let signature = if self.line_sync {
+                let signature = if awaits_response && self.line_sync {
                     Some(self.signature_of(step)?)
                 } else {
                     None
                 };
                 Some((line.begin(signature.clone()), signature))
             }
-            _ => None,
+            None => None,
         };
         let deadline = self.send_step(step).await?;
         if !awaits_response {
+            // 送り終えた。応答の検証は無いので `Synced` にはせず、線の状態を変えずに外す。
+            if let Some((guard, _)) = tracked {
+                guard.disarm();
+            }
             return Ok(Vec::new());
         }
         let mut buf = Vec::new();
