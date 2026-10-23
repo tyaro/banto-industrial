@@ -4,7 +4,10 @@
 //! 成功した時だけ戻すため、外側の future のキャンセルでも接続を再利用しない。
 //! broker は Frame をこの Session で実行する。接続の外側期限は TCP 接続 +
 //! 32 step × response_timeout + CLOSE_TIMEOUT + ゆとりを含む。
-//! シリアルの同期、旧 I/O の削除は後続の PR で行う。
+//! シリアルの同期（設計 §7.3）は後続の PR で行う。
+//! 各 step の送信の前に、ドライバの `inter_frame_gap`（Modbus RTU の t3.5）だけ、
+//! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
+//! 送り終えた時刻は `Transport::tx_time` で見積もる（drain が当てにならない通信路のため）。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
@@ -24,6 +27,10 @@ use transport::{Transport, TransportSpec};
 pub const MAX_HANDSHAKE_STEPS: usize = 32;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+/// `inter_frame_gap` の待ちの上限。ドライバの返す値がこれを超えても、待ちは必ずこの長さまでに収める
+/// （待ちは応答の期限の外だが、broker の外側の上限 `2T × step 上限 + 1 秒` に収まる長さに限る）。
+/// 300 baud 8N1 の t3.5 でも約 117 ms。
+pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
 
 /// 適合テストとホストの診断で観測する出来事。通信の結果は変えない。
 #[derive(Debug, Clone)]
@@ -53,6 +60,17 @@ struct Core {
     response_timeout: Duration,
     can_write: bool,
     events: Option<Arc<dyn EngineEvents>>,
+    /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。
+    last_quiet_from: Option<Instant>,
+}
+
+/// 前のフレームの最後のバイトの時刻 `from` から `gap`（`MAX_INTER_FRAME_GAP` で頭打ち）が
+/// 過ぎるまで待つ。`gap` が 0 か `from` が無いなら待たない。
+async fn wait_quiet(from: Option<Instant>, gap: Duration) {
+    let gap = gap.min(MAX_INTER_FRAME_GAP);
+    if let (Some(from), false) = (from, gap.is_zero()) {
+        tokio::time::sleep_until(from + gap).await;
+    }
 }
 
 /// 1 接続につき 1 個だけを作り、読み書きを直列に呼ぶ。
@@ -95,6 +113,7 @@ impl FrameSession {
             response_timeout,
             can_write: driver.descriptor().capabilities.write,
             events,
+            last_quiet_from: None,
         };
         let result = core.handshake().await;
         match result {
@@ -222,11 +241,13 @@ impl Session for FrameSession {
         Box::pin(async move {
             if let Some(mut core) = self.core.take() {
                 if let Some(step) = core.conn.farewell() {
-                    // 別れの応答は待たず、送信にも期限を掛ける。
-                    let _ = timeout(
-                        core.response_timeout.min(Duration::from_secs(1)),
-                        core.transport.send(&step.send),
-                    )
+                    // 別れの応答は待たず、送信（と手前の無音の待ち）にも期限を掛ける。
+                    let gap = core.conn.inter_frame_gap();
+                    let from = core.last_quiet_from;
+                    let _ = timeout(core.response_timeout.min(Duration::from_secs(1)), async {
+                        wait_quiet(from, gap).await;
+                        core.transport.send(&step.send).await
+                    })
                     .await;
                 }
                 core.close().await;
@@ -398,7 +419,10 @@ impl Core {
         if let Some(events) = &self.events {
             events.record(EngineEvent::StepStarted(step.clone()));
         }
-        let deadline = Instant::now()
+        // フレーム間の無音（設計 §7.3.1）。待ちは応答の期限の外（長さは MAX_INTER_FRAME_GAP 以下）。
+        wait_quiet(self.last_quiet_from, self.conn.inter_frame_gap()).await;
+        let send_start = Instant::now();
+        let deadline = send_start
             .checked_add(self.response_timeout)
             .ok_or_else(|| {
                 FatalError::InvalidConfig("応答の期限が時刻の範囲を超えました".into())
@@ -406,6 +430,9 @@ impl Core {
         timeout_at(deadline, self.transport.send(&step.send))
             .await
             .map_err(|_| FatalError::Timeout)??;
+        // 送り終えた時刻の見積もり: send が返った時刻と、開始 + バイト数 × 1 文字の時間の遅い方。
+        let sent_at = Instant::now().max(send_start + self.transport.tx_time(step.send.len()));
+        self.last_quiet_from = Some(sent_at);
         if matches!(step.expect, FrameRule::None) {
             return Ok(Vec::new());
         }
@@ -419,6 +446,11 @@ impl Core {
             let n = timeout_at(deadline, self.transport.recv(&mut buf))
                 .await
                 .map_err(|_| FatalError::Timeout)??;
+            let received_at = Instant::now();
+            self.last_quiet_from = Some(
+                self.last_quiet_from
+                    .map_or(received_at, |t| t.max(received_at)),
+            );
             if n == 0 {
                 return Err(FatalError::Io("相手が接続を閉じた".into()));
             }
