@@ -1,7 +1,7 @@
 # banto-hub シミュレーションを値の層へ 詳細設計（R2b-5）
 
 作成日: 2026-10-23
-最終更新: 2026-10-23
+最終更新: 2026-10-23（オーナーのレビューの P2 を反映: 型ごとのセル・文字列の末尾を残す・エンコーディングでの長さ）
 状態: **設計確定（2026-10-23 オーナー決定。§11 の Q1〜Q11 は推奨どおり）。実装は未着手**。コード調査（§1）は 2026-10-23 の main（`b7234a51`、v0.2.0-alpha.37、R2b-3 完了の後）に対して行った。前提の決定: R2b-4（接続ごとの実装の選択）は W 段へ後回し（2026-10-23 オーナー判断）、シリアル接続は #803 で凍結（本書はシリアルに依存しない）、使用者はまだいない（既存データの移行・REST / MCP / 設定パッケージの旧い形との互換は考えない。2026-10-22 オーナー決定）。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-5「シミュレーションを値の層へ移す（[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md) §12.2 の 6）」: プロトコル別のシミュレータの代わりに「正規化アドレス → 値」を持つ汎用の `SimSession` を 1 つ置き、WASM を含むすべてのドライバをそのままシミュレーションでき、#363（書き込みはシミュレータへ反映）も成り立たせる。シミュレーションはワイヤの処理を通らなくなるので、ワイヤのテストはドライバ側の CI で行う。
 関連: [banto-hub-driver-io-design.md](banto-hub-driver-io-design.md)（R2b-3。§4.4「シミュレーション（変えないが、ダイヤルの材料が変わる）」、§8 ChronoGazer）、[banto-driver-api-design.md](banto-driver-api-design.md)（§5 セッション型、§6.2 の「R2b の後の注記」、§7.4 の `FakeSessionDriver`）、[ux-plan.md](ux-plan.md) §1（T9 接続単位のシミュレーション: ランプ波・トグル・事故防止の 3 点）、[implementation-checklist.md](implementation-checklist.md)。
@@ -88,13 +88,14 @@
 
 ```rust
 pub struct SimDevice { inner: Arc<Mutex<SimState>>, epoch: Instant }
-struct SimState { cells: HashMap<String, SimCell>, writes: u64 }
+struct SimState { cells: HashMap<String, Vec<(TagKind, SimCell)>>, writes: u64 }   // canonical → 種類ごとのセル
 struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た順（位相に使う）
 ```
 
 - 鍵は **`DriverAddress::canonical` そのまま**（Q3）。ドライバが 1 アドレスに 1 つの正規形を約束している（api-design §3.3）ので、同じタグをどのセッション・どの再接続から見ても同じセル。`driver` は 1 接続 = 1 ドライバなので鍵に入れない。
+- **セルは `(canonical, TagKind)` で分ける**（2026-10-23 オーナーのレビュー #805 の P2 2）: 同じ `D100` を `I16`・`F32`・文字列で登録できる（SLMP の型別アドレス検査、PLC タグに番地の一意の制約は無い）。canonical だけで共有すると、文字列で書いた `D100` を数値で読んで `Value::Str` が返る。種類（データ型・文字列の語数・エンコーディング）が違えば別のセルにし、要求と違う種類の held を正常な応答として返さない。タグの型や文字列長を変えた後は新しいセル（生成値）になり、前の種類の held は見えなくなる（語の重なりの再現はしない、Q3）。
 - `SimDevice` は `Clone`（`Arc` の共有）。寿命は `BrokerSimRegistry` が持つ（§4.2）: セッションが切れて張り直されても表は残る（今のシミュレータのインスタンスと held の寿命と同じ）。接続の `simulation` を切る・接続を消す・all-simulation を止めると捨てる（held も消える。`simulation.rs:55-60` の約束のまま）。
-- 観測の口（テストと将来の UI）: `get(canonical) -> Option<Value>`（held だけ。生成値は返さない）、`set(canonical, Value)`（held にする）、`write_count()`、`held_count()`。
+- 観測の口（テストと将来の UI）: `get(canonical, &TagKind) -> Option<Value>`（held だけ。生成値は返さない）、`set(canonical, TagKind, Value)`（held にする）、`write_count()`、`held_count()`。
 
 ### 3.2 読み取り: 読まれたときに生成
 
@@ -103,7 +104,7 @@ struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た�
 - `Numeric(Bit)` と `bit: Some(_)` のアドレス: `((t / 100 ms) + index) % 2 == 1` のトグル。
 - `Numeric(整数)`: ランプ波 `((t / 100 ms) + index * 16) % 範囲` を型の範囲に収めた `Value::F64`。u16 なら今と同じラップ。符号付きは 0 から正の側だけ（今の u16 のランプと見た目を揃える）。
 - `Numeric(f32 / f64)`: 同じランプを `f64` に。
-- `Str { words, .. }`: `format!("SIM-{index}-{tick}")` を `words * 2` バイトに切る（ASCII だけなので encoding は問わない）。今まで対象外だった文字列が動く。
+- `Str { words, .. }`: `format!("SIM-{index}-{tick}")` の**末尾** `words * 2` バイトを残す（ASCII だけなので encoding は問わない）。末尾は tick の下の桁なので、最短の 1 語（`"23"` のような 2 桁）でも tick ごとに変わる（2026-10-23 オーナーのレビュー #805 の P2 1: 先頭から切ると 1〜2 語で値が固定される）。今まで対象外だった文字列が動く。
 
 生成は決定的（時刻と index だけ）なので、同じ 100 ms の間に 2 度読めば同じ値、`on_change` の購読は 100 ms ごとに発火する（ux-plan §1 の「固定値では購読が発火しない」に応える）。背景タスクは無い（Q4）。
 
@@ -112,7 +113,7 @@ struct SimCell { held: Option<Value>, index: u32 }   // index: 初めて見た�
 `write_batch(items)` は item ごとに:
 
 1. `spec.address.writable_area == false` → `ItemError::Rejected("この領域は書き込めません")`（実機なら `Device` の例外。入力レジスタ・接点入力・SLMP の `X` など）。
-2. 値の種類が `kind` と合わない（`Bit` に `F64` など）→ `ItemError::Rejected`。整数型は丸めと範囲の検査（api-design §9.2 のドライバの仕事を値の層で代行。範囲外は `Rejected`）。文字列は `words * 2` バイト超を `Rejected`。
+2. 値の種類が `kind` と合わない（`Bit` に `F64` など）→ `ItemError::Rejected`。整数型は範囲の検査（api-design §9.2 のドライバの仕事を値の層で代行。範囲外は `Rejected`）。整数型への小数は `Rejected`（Hub の値の検査 `write_path.rs` と同じ）。文字列は**タグのエンコーディング（UTF-8 / Shift-JIS）で符号化したバイト数**が `words * 2` を超えるもの、そのエンコーディングで表せない文字を含むものを `Rejected`（Hub の関門と `encode_string_value` と同じ。2026-10-23 オーナーのレビュー #806 の P2 3）。
 3. 通れば held に置き、`writes += 1`。`Ok(())`。
 
 RMW（SLMP の bit-in-word、`crates/banto-driver-slmp/src/frame_conn.rs:32-45`）は値の層に無い: `D100.5` は `D100` と別のセル（Q3）。多語の重なりも再現しない。これらの再現はドライバ crate の P0-3・C13〜C15 で足りている（§1.5）。Hub の関門（`writable`・スコープ・レート・値検査・監査の先書き・`write_enabled`）は broker の手前なので変わらない。
@@ -209,6 +210,7 @@ pub async fn resolve(&self, conn, registry) -> (DialTarget, bool /* changed */)
 
 - Hub: `t9_simulation.rs`・`t9_simulation_write.rs`・`computed.rs`・`write.rs`・`connection_validation_consistency.rs` が `SimDevice` の観測で通る。`simulation = true` の Modbus / SLMP の接続で **ワイヤのソケットが開かない**こと（`SessionDirectory` に TCP の相手が無い。`modbus_collection_uses_exactly_one_socket` と同じ数え方で 0 本）。
 - 文字列タグ・先頭 16 番地の外のタグが `simulation = true` で動く値を返す（新しいテスト 1 本。今まで「未対応」だったもの）。
+- 5a の単体テスト: 1・2・3 語の文字列が隣の tick で変わる。同じ canonical の文字列に書いた後で数値として読むと held でなく生成値、held の文字列より短い語数で読むと held を返さない。1 語の Shift-JIS の `"あ"` は通り、1 語の UTF-8 の `"あ"` は長すぎ、Shift-JIS で表せない文字は `Rejected`。
 - ChronoGazer: `simulation_not_recorded.rs` の (a)(b)(c) がそのまま通る。
 - ドライバ crate の P0-3・適合テストは触らず全部通る。
 - 全部の `tests/` で `banto_collect::simulation` の参照が 0。
