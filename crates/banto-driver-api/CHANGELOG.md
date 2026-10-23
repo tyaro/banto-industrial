@@ -18,7 +18,7 @@ R2b-3（docs/banto-hub-driver-io-design.md §10。2026-10-23、banto-hub v0.2.0-
 
 ### 追加（破壊ではない）
 
-- `DriverBase::probe`（既定は `None`）: 接続テストが読む 1 点（アドレスの文字列と `TagKind`）。ホストの接続テストはエンジンの 1 回きりの接続（ハンドシェイク + `probe` の 1 点）で行う（R2b-3a-2）。
+- `DriverBase::probe`（既定は `None`）: 接続テストが読む 1 点（アドレスの文字列と `TagKind`）。ホストの接続テストは、保存済みの接続の broker のセッションが使えればそのセッションで `probe` の 1 点を読み、無ければエンジンの 1 回きりの接続（ハンドシェイク + `probe` の 1 点）で行う（R2b-3a-2）。
 - `DriverDescriptor::settings_version`（`new` は 1。`with_settings_version`。serde は欠けていれば 1）（R2b-1a）。
 - `DriverKind::HostProvided` と `DriverEntry::host_provided`（R2b-1a）。
 - 共通のキー `keys::BAUD` / `DATA_BITS` / `PARITY` / `STOP_BITS`（シリアルの線の設定）と、`FrameConnection::inter_frame_gap`（既定は 0。エンジンが守る前のフレームからの最小の無音。Modbus RTU の t3.5 用。エンジンの上限 500 ms を超える値は契約違反として送信の前に断られる）（R2b-3e-1）。`keys::SERIAL_PORT` / `STATION` は予約でなく実際に使うキーになった。
