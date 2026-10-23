@@ -996,25 +996,51 @@ async fn without_a_gap_the_same_measurement_sees_a_short_spacing() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn the_gap_wait_is_capped_and_inside_the_response_deadline() {
-    // 待ちは応答の期限 T の中（T = 1 秒）。待ちは MAX_INTER_FRAME_GAP 以下に頭打ち。
+async fn a_gap_over_the_cap_is_refused_before_any_send() {
+    let stats = Arc::<Stats>::default();
+    let wire = Wire::new(stats.clone());
+    let events = Arc::<Recorder>::default();
+    let over = MAX_INTER_FRAME_GAP + Duration::from_millis(1);
+    let mut s = session(three_step_conn(stats.clone(), over), wire, events.clone());
+    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(10);
+    let err = s.read_batch(&three_specs()).await.unwrap_err();
+    assert!(matches!(err, FatalError::Protocol(_)), "{err:?}");
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert!(events.has("C17"));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_gap_of_exactly_the_cap_is_accepted_and_kept() {
     let stats = Arc::<Stats>::default();
     let mut wire = Wire::new(stats.clone());
     wire.recv_delay = Duration::from_millis(90);
     let log = wire.log.clone();
     let mut s = session(
-        three_step_conn(stats, Duration::from_secs(60)),
+        three_step_conn(stats, MAX_INTER_FRAME_GAP),
         wire,
         Arc::default(),
     );
-    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(1);
+    s.core.as_mut().unwrap().response_timeout = Duration::from_secs(10);
     s.read_batch(&three_specs()).await.unwrap();
     let spacing = min_spacing(&log).unwrap();
     assert!(spacing >= MAX_INTER_FRAME_GAP, "{spacing:?}");
-    assert!(
-        spacing < MAX_INTER_FRAME_GAP + Duration::from_millis(5),
-        "{spacing:?}"
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_farewell_is_not_sent_when_the_gap_is_over_the_cap() {
+    let stats = Arc::<Stats>::default();
+    let wire = Wire::new(stats.clone());
+    let events = Arc::<Recorder>::default();
+    let mut conn = three_step_conn(
+        stats.clone(),
+        MAX_INTER_FRAME_GAP + Duration::from_millis(1),
     );
+    conn.farewell = true;
+    let mut s = session(conn, wire, events.clone());
+    s.disconnect().await;
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+    assert!(events.has("C17"));
 }
 
 #[tokio::test(start_paused = true)]

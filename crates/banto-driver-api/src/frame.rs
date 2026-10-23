@@ -253,7 +253,8 @@ pub trait FrameConnection: Send + 'static {
     /// (design §7.3.1). Measured from the last byte of the previous frame,
     /// sent or received, whichever is later, to the first byte of the next
     /// send. Modbus RTU returns 3.5 character times (1.750 ms above 19200
-    /// baud). Default: zero (no gap, as for TCP).
+    /// baud). Default: zero (no gap, as for TCP). A value above the engine's
+    /// cap (500 ms) is a contract violation and is refused before any send.
     fn inter_frame_gap(&self) -> std::time::Duration {
         std::time::Duration::ZERO
     }

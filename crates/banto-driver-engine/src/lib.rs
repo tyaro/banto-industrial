@@ -27,8 +27,9 @@ use transport::{Transport, TransportSpec};
 pub const MAX_HANDSHAKE_STEPS: usize = 32;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
-/// `inter_frame_gap` の待ちの上限。ドライバの返す値がこれを超えても、待ちは必ずこの長さまでに収める
-/// （待ちは step の応答の期限 T の中に入る。T がこれより短ければ、待ちの途中で期限が来て `Timeout` になる）。
+/// `inter_frame_gap` の上限。これを超える値はドライバの契約違反として、送信の前に
+/// `FatalError::Protocol` で断る（縮めない。API は「エンジンが守る最小の無音」と定めている）。
+/// 待ちは step の応答の期限 T の中に入る（T がこれより短ければ、待ちの途中で期限が来て `Timeout` になる）。
 /// 300 baud 8N1 の t3.5 でも約 117 ms。
 pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
 
@@ -64,10 +65,9 @@ struct Core {
     last_quiet_from: Option<Instant>,
 }
 
-/// 前のフレームの最後のバイトの時刻 `from` から `gap`（`MAX_INTER_FRAME_GAP` で頭打ち）が
-/// 過ぎるまで待つ。`gap` が 0 か `from` が無いなら待たない。
+/// 前のフレームの最後のバイトの時刻 `from` から `gap` が過ぎるまで待つ（`gap` は呼び手が
+/// `MAX_INTER_FRAME_GAP` 以下を確かめ済み）。`gap` が 0 か `from` が無いなら待たない。
 async fn wait_quiet(from: Option<Instant>, gap: Duration) {
-    let gap = gap.min(MAX_INTER_FRAME_GAP);
     if let (Some(from), false) = (from, gap.is_zero()) {
         tokio::time::sleep_until(from + gap).await;
     }
@@ -243,6 +243,12 @@ impl Session for FrameSession {
                 if let Some(step) = core.conn.farewell() {
                     // 別れの応答は待たず、送信（と手前の無音の待ち）にも期限を掛ける。
                     let gap = core.conn.inter_frame_gap();
+                    if gap > MAX_INTER_FRAME_GAP {
+                        // 応答を待たない後始末なので、送らずに閉じる（違反の記録は残す）。
+                        let _ = core.gap_violation(gap);
+                        core.close().await;
+                        return;
+                    }
                     let from = core.last_quiet_from;
                     let _ = timeout(core.response_timeout.min(Duration::from_secs(1)), async {
                         wait_quiet(from, gap).await;
@@ -272,6 +278,13 @@ impl Core {
             },
         );
         FatalError::Protocol(detail)
+    }
+
+    fn gap_violation(&self, gap: Duration) -> FatalError {
+        self.violation_fatal(
+            "C17",
+            format!("inter_frame_gap {gap:?} が上限 {MAX_INTER_FRAME_GAP:?} を超えている"),
+        )
     }
 
     async fn close(&mut self) {
@@ -426,12 +439,13 @@ impl Core {
             .ok_or_else(|| {
                 FatalError::InvalidConfig("応答の期限が時刻の範囲を超えました".into())
             })?;
-        timeout_at(
-            deadline,
-            wait_quiet(self.last_quiet_from, self.conn.inter_frame_gap()),
-        )
-        .await
-        .map_err(|_| FatalError::Timeout)?;
+        let gap = self.conn.inter_frame_gap();
+        if gap > MAX_INTER_FRAME_GAP {
+            return Err(self.gap_violation(gap));
+        }
+        timeout_at(deadline, wait_quiet(self.last_quiet_from, gap))
+            .await
+            .map_err(|_| FatalError::Timeout)?;
         // tx_time の見積もりの起点は、待ちの後の時刻。
         let send_start = Instant::now();
         timeout_at(deadline, self.transport.send(&step.send))
