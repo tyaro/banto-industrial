@@ -20,7 +20,7 @@
 //! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
-//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection, **before the handshake** (the engine decides on the sync procedure right after `create_connection`, 2026-10-23), has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a response to any step it sends with a response (handshake, planned read, `write_next`) followed by the sync response is delimited by the sync step at that response's length; every step it sends with a response - the handshake's, each planned read's and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature, and none of those responses is longer than the sync step's `max_len` (2026-10-23) |
+//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection, **before the handshake** (the engine decides on the sync procedure right after `create_connection`, 2026-10-23), has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a response to any step it sends with a response (handshake, planned read, `write_next`) followed by the sync response is delimited by the sync step at that response's length; every step it sends with a response - the handshake's, each planned read's (per tag, and for all fixture tags batched into one plan, so batched-read steps too) and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature, and none of those responses is longer than the sync step's `max_len` (2026-10-23) |
 //!
 //! ## Comparing a value with its expected one
 //!
@@ -382,19 +382,35 @@ fn c17_serial_sync(
         };
         previous = Some(response);
     }
-    for prepared in reads {
-        let Ok(planned) = conn.plan_read(std::slice::from_ref(&prepared.spec)) else {
+    // タグ 1 つずつの計画に加えて、全タグをまとめた一括の読み取り（C3 が使うのと同じ slice）の
+    // step にも同じ確かめを当てる（署名なし・応答の形違いの一括の step を通さない、#801 の Codex P2）。
+    let mut groups: Vec<(String, Vec<TagSpec>)> = reads
+        .iter()
+        .map(|p| {
+            (
+                format!("{:?} の読み取り", p.case.text),
+                vec![p.spec.clone()],
+            )
+        })
+        .collect();
+    if reads.len() > 1 {
+        groups.push((
+            "一括の読み取り".to_string(),
+            reads.iter().map(|p| p.spec.clone()).collect(),
+        ));
+    }
+    for (what, specs) in &groups {
+        let Ok(planned) = conn.plan_read(specs) else {
             continue;
         };
         for p in planned {
             if matches!(p.step.expect, FrameRule::None) {
                 continue;
             }
-            let what = format!("{:?} の読み取り", prepared.case.text);
             let _ = c17_answered(
                 conn.as_ref(),
                 peer,
-                &what,
+                what,
                 &p.step,
                 first_sync.as_ref(),
                 &mut fail,
@@ -1198,6 +1214,8 @@ mod tests {
         sync_after_handshake: bool,
         /// この先頭バイトの step（ハンドシェイクは 7、書き込みは 5）は 4 バイトの要求（= 応答）を送る。
         long_step: Option<u8>,
+        /// 複数のタグをまとめた読み取りの step（先頭 8）には署名が無い（C17 が落ちるべき形）。
+        batch_unsigned: bool,
     }
     impl SerialDriver {
         fn new(sync: bool, collide: bool) -> Self {
@@ -1218,6 +1236,7 @@ mod tests {
                 sync_max_len: 16,
                 sync_after_handshake: false,
                 long_step: None,
+                batch_unsigned: false,
             }
         }
     }
@@ -1255,6 +1274,7 @@ mod tests {
                 sync_max_len: self.sync_max_len,
                 sync_after_handshake: self.sync_after_handshake,
                 long_step: self.long_step,
+                batch_unsigned: self.batch_unsigned,
                 handshake_done: false,
             }))
         }
@@ -1268,6 +1288,7 @@ mod tests {
         sync_max_len: u32,
         sync_after_handshake: bool,
         long_step: Option<u8>,
+        batch_unsigned: bool,
         handshake_done: bool,
     }
     impl SerialConn {
@@ -1288,6 +1309,9 @@ mod tests {
             Ok(step)
         }
         fn signature(&self, step: &Step) -> Option<Signature> {
+            if self.batch_unsigned && step.send[0] == 8 {
+                return None;
+            }
             Some(Signature::new(vec![step.send[0]]))
         }
         fn sync_step(&mut self, outstanding: &[Signature]) -> Option<Step> {
@@ -1324,9 +1348,14 @@ mod tests {
                 }),
             )
         }
-        fn plan_read(&mut self, _: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
+        fn plan_read(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
+            let code = if specs.len() > 1 { 8 } else { 9 };
             Ok(vec![Planned::new(
-                Step::new(vec![9, 9, b'\n'], FrameRule::Terminator(b"\n".to_vec()), 16),
+                Step::new(
+                    vec![code, 9, b'\n'],
+                    FrameRule::Terminator(b"\n".to_vec()),
+                    16,
+                ),
                 vec![0],
             )])
         }
@@ -1520,6 +1549,44 @@ mod tests {
                 "{what}: {sync_only:?}"
             );
         }
+    }
+
+    /// Codex P2: 一括の読み取り（複数のタグをまとめた step）にも署名が要る。
+    #[test]
+    fn c17_checks_the_batched_read_step_too() {
+        let fixtures = FrameFixtures::new(StaticFixtures::new(Settings::new()));
+        let cases = [
+            ReadCase::new("D0", TagKind::numeric(DataType::U16), RawValue::Uint(0)),
+            ReadCase::new("D1", TagKind::numeric(DataType::U16), RawValue::Uint(0)),
+        ];
+        let run = |batch_unsigned: bool| {
+            let mut driver = SerialDriver::new(true, false);
+            driver.batch_unsigned = batch_unsigned;
+            let reads: Vec<Prepared<'_>> = cases
+                .iter()
+                .map(|case| Prepared {
+                    case,
+                    spec: TagSpec::new(
+                        driver.parse_address(&case.text, &case.kind).unwrap(),
+                        case.kind.clone(),
+                    ),
+                })
+                .collect();
+            let mut failures = Vec::new();
+            c17_serial_sync(&driver, &fixtures, &reads, &mut Echo, &mut failures);
+            failures
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.detail))
+                .collect::<Vec<_>>()
+        };
+        assert!(run(false).is_empty(), "{:?}", run(false));
+        let bad = run(true);
+        assert!(
+            bad.iter().any(|f| f.starts_with("C17")
+                && f.contains("一括の読み取り")
+                && f.contains("署名")),
+            "{bad:?}"
+        );
     }
 
     /// Codex P2: 連結の区切りの確かめは、読み取りだけでなくハンドシェイク・書き込みの応答にも当たる。
