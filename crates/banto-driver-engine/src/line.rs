@@ -35,6 +35,7 @@ use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
 use banto_driver_api::{BoxFuture, FatalError, Signature};
+use tokio::time::Instant;
 
 use crate::transport::{SerialPortName, Transport, TransportSpec};
 
@@ -137,6 +138,13 @@ struct LineInner {
     /// §7.3 の 6: 同期の手順を持たないドライバが致命の後に借りようとした。
     /// 閉じる（[`LineTable::close`]）まで、この線は開かない。
     quarantined: bool,
+    /// 線が最後に静かになり始める時刻（送り終えの見積もり・受けたバイトの時刻の遅い方。
+    /// フレーム間の無音 §7.3.1 の起点）。セッションをまたいで引き継ぎ、借りた直後のセッションは
+    /// ここから無音を測る（致命の直後に張り直しても、前のフレームや送信待ちに残った途中の
+    /// バイトの直後に同期の要求を続けない。Codex P2、2026-10-23）。値は遅い方にだけ動かす。
+    /// ポートを閉じて開き直しても消さない: `SerialOverTcp` は変換器の側に送信待ちが残りうるし、
+    /// 機器の応答が線の上にまだありうる。残しても遅れは高々 `inter_frame_gap`（≤ 500 ms）。
+    quiet_from: Option<Instant>,
 }
 
 /// 1 本の線。
@@ -158,6 +166,17 @@ impl Line {
     /// 今の同期の状態。
     pub fn state(&self) -> SyncState {
         self.lock().state
+    }
+
+    /// 線が最後に静かになり始める時刻（§7.3.1。[`LineInner`] の `quiet_from`）。
+    pub(crate) fn quiet_from(&self) -> Option<Instant> {
+        self.lock().quiet_from
+    }
+
+    /// 線が静かになり始める時刻を `at` 以降に寄せる（早めない）。
+    pub(crate) fn note_quiet(&self, at: Instant) {
+        let mut inner = self.lock();
+        inner.quiet_from = Some(inner.quiet_from.map_or(at, |t| t.max(at)));
     }
 
     /// 応えの返っていない要求の署名の写し。
@@ -423,6 +442,7 @@ impl LineTable {
                         state: SyncState::Fresh,
                         outstanding: Vec::new(),
                         quarantined: false,
+                        quiet_from: None,
                     }),
                 })
             }));

@@ -40,6 +40,10 @@ enum Reaction {
 #[derive(Default)]
 struct WireState {
     sent: Vec<Vec<u8>>,
+    /// 各 send を呼んだ時刻（止めた時計）。
+    sent_times: Vec<Instant>,
+    /// 1 バイトの送信の時間（`Transport::tx_time` の見積もり）。
+    tx_per_byte: Duration,
     script: VecDeque<Reaction>,
     inbox: VecDeque<Vec<u8>>,
     opens: usize,
@@ -75,11 +79,15 @@ impl Drop for SerialWire {
 }
 
 impl Transport for SerialWire {
+    fn tx_time(&self, len: usize) -> Duration {
+        self.0.lock().tx_per_byte * len as u32
+    }
     fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
         Box::pin(async move {
             let reaction = {
                 let mut state = self.0.lock();
                 state.sent.push(bytes.to_vec());
+                state.sent_times.push(Instant::now());
                 state.script.pop_front().unwrap_or(Reaction::Silence)
             };
             match reaction {
@@ -143,6 +151,8 @@ struct Conn {
     policy: SyncPolicy,
     /// 書き込みを応答を待たない step（`FrameRule::None`）で送る。
     no_reply_write: bool,
+    /// フレーム間の無音（§7.3.1）。
+    gap: Duration,
     drops: Arc<AtomicUsize>,
 }
 
@@ -155,6 +165,9 @@ impl Drop for Conn {
 impl FrameConnection for Conn {
     fn handshake_next(&mut self, _: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
         Ok(None)
+    }
+    fn inter_frame_gap(&self) -> Duration {
+        self.gap
     }
     fn signature(&self, step: &Step) -> Option<Signature> {
         // 応答の語数は、この試験のプロトコルでは FC の下位ビットで表す（1 語か 2 語）。
@@ -249,6 +262,7 @@ impl Driver {
             conn: Conn {
                 policy,
                 no_reply_write: false,
+                gap: Duration::ZERO,
                 drops: Arc::default(),
             },
         }
@@ -1240,4 +1254,77 @@ async fn a_completed_send_of_a_step_without_response_keeps_the_line_state() {
     assert_eq!(bench.wire.sent(), vec![request(0x06, ADDR_A).send]);
     assert_eq!(bench.state(), SyncState::Fresh, "送る前と同じ");
     assert!(bench.outstanding().is_empty());
+}
+
+const GAP: Duration = Duration::from_millis(10);
+
+/// §7.3.1（Codex P2）: 致命（`Framing`）の直後に、時計を進めずに次のセッションが同じ線を借りても、
+/// 最初の同期の要求は前のセッションの最後の受信から `inter_frame_gap` 以上空けて送る
+/// （借りた直後のセッションが無音の起点を線の記録から始める）。
+#[tokio::test(start_paused = true)]
+async fn the_first_sync_request_after_a_fatal_error_keeps_the_inter_frame_gap_of_the_line() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.driver.conn.gap = GAP;
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 2: A への応答が FC4（Framing）
+        Reaction::Reply(vec![response(FC_PROBE, &[0x66])]), // 3: 次のセッションの同期
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    let result = read_one(&mut session, ADDR_A).await;
+    assert!(matches!(result, Err(FatalError::Framing(_))), "{result:?}");
+    // 記憶上の線は send の中で応答を積み、recv はすぐ返す: 最後の受信は A を送った時刻。
+    let last_received = Instant::now();
+    drop(session);
+
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    let times = bench.wire.lock().sent_times.clone();
+    assert_eq!(times.len(), 3);
+    assert!(
+        times[2] >= last_received + GAP,
+        "同期の要求が前の受信から {:?} しか空いていない",
+        times[2] - last_received
+    );
+}
+
+/// §7.3.1（Codex P2）: 送信の途中で取り消したときも、次のセッションの最初の送信は、取り消した
+/// 送信の送り終えの見積もり（送信の開始 + `tx_time`）+ `inter_frame_gap` 以上空ける。
+#[tokio::test(start_paused = true)]
+async fn the_first_send_after_a_send_cancelled_midway_waits_for_its_estimated_end_and_the_gap() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.driver.conn.gap = GAP;
+    // 3 バイトで 60 ms。A の送信は同期の送り終え（60 ms）+ GAP の 70 ms に始まり、130 ms に送り終える。
+    bench.wire.lock().tx_per_byte = Duration::from_millis(20);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 同期
+        Reaction::SendStalls,                               // 2: A（送信の途中で取り消す）
+        Reaction::Reply(vec![response(FC_PROBE, &[0x66])]), // 3: 次のセッションの同期
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(80),
+        session.read_raw_batch(&[spec_of(ADDR_A)]),
+    )
+    .await;
+    assert!(cancelled.is_err(), "外側の上限で future を drop した");
+    drop(session);
+    let (stalled_at, tx) = {
+        let wire = bench.wire.lock();
+        assert_eq!(wire.sent.len(), 2, "A の送信は始まっていた");
+        (wire.sent_times[1], wire.tx_per_byte * 3)
+    };
+    assert!(
+        Instant::now() < stalled_at + tx,
+        "送り終えの見積もりの前に取り消した"
+    );
+
+    let _session = bench.connect().await.unwrap();
+    let times = bench.wire.lock().sent_times.clone();
+    assert_eq!(times.len(), 3);
+    assert!(
+        times[2] >= stalled_at + tx + GAP,
+        "取り消した送信の送り終えの見積もりから {:?} しか空いていない",
+        times[2].saturating_duration_since(stalled_at + tx)
+    );
 }

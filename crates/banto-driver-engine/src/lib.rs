@@ -94,7 +94,10 @@ struct Core {
     response_timeout: Duration,
     can_write: bool,
     events: Option<Arc<dyn EngineEvents>>,
-    /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。
+    /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。シリアルの線を
+    /// 借りたセッションは線の記録（`Line::quiet_from`）から始め、[`Core::note_quiet`] で
+    /// 両方を同じに保つ（貸し出し中は線をこのセッションだけが使うので、二重でも食い違わない。
+    /// TCP は線が無いのでこちらだけ）。
     last_quiet_from: Option<Instant>,
 }
 
@@ -217,6 +220,8 @@ impl FrameSession {
                 return Err(error);
             }
         };
+        // 借りた線は、前のセッションが最後に送り終えた（見積もり）・受けた時刻から無音を測る（§7.3.1）。
+        let last_quiet_from = wire.line().and_then(|line| line.quiet_from());
         let mut core = Core {
             conn,
             wire,
@@ -224,7 +229,7 @@ impl FrameSession {
             response_timeout,
             can_write: driver.descriptor().capabilities.write,
             events,
-            last_quiet_from: None,
+            last_quiet_from,
         };
         let result = async {
             if let Some((table, start)) = line {
@@ -371,6 +376,9 @@ impl Session for FrameSession {
                     let _ = timeout(core.response_timeout.min(Duration::from_secs(1)), async {
                         wait_quiet(from, gap).await;
                         let send_start = Instant::now();
+                        // 線に送り終えの見積もりを残す（変換器の側の送信待ち。§7.3.1）。
+                        let tx = core.wire.transport().tx_time(step.send.len());
+                        core.note_quiet(send_start + tx);
                         let transport = core.wire.transport();
                         if transport.send(&step.send).await.is_ok() {
                             // シリアルの send は drain しないので、閉じると
@@ -736,14 +744,25 @@ impl Core {
             .map_err(|_| FatalError::Timeout)?;
         // tx_time の見積もりの起点は、待ちの後の時刻。
         let send_start = Instant::now();
-        let transport = self.wire.transport();
-        timeout_at(deadline, transport.send(&step.send))
+        let estimate = send_start + self.wire.transport().tx_time(step.send.len());
+        // 送る前に送り終えの見積もりを線に残す。送信の途中で取り消されても（future の drop）、
+        // 次のセッションは送信待ちに残った途中のバイトの後から無音を測る（§7.3.1、Codex P2）。
+        self.note_quiet(estimate);
+        timeout_at(deadline, self.wire.transport().send(&step.send))
             .await
             .map_err(|_| FatalError::Timeout)??;
         // 送り終えた時刻の見積もり: send が返った時刻と、開始 + バイト数 × 1 文字の時間の遅い方。
-        let sent_at = Instant::now().max(send_start + transport.tx_time(step.send.len()));
-        self.last_quiet_from = Some(sent_at);
+        self.note_quiet(Instant::now().max(estimate));
         Ok(deadline)
+    }
+
+    /// フレーム間の無音の起点を `at` 以降に寄せる（早めない）。借りた線にも記録し、次に借りる
+    /// セッションへ引き継ぐ（§7.3.1）。
+    fn note_quiet(&mut self, at: Instant) {
+        self.last_quiet_from = Some(self.last_quiet_from.map_or(at, |t| t.max(at)));
+        if let Some(line) = self.wire.line() {
+            line.note_quiet(at);
+        }
     }
 
     /// `buf` に完結した応答が 1 つ入るまで受け、その長さを返す（`buf` の先頭の `len` バイト。
@@ -779,11 +798,7 @@ impl Core {
             let n = timeout_at(deadline, self.wire.transport().recv(buf))
                 .await
                 .map_err(|_| FatalError::Timeout)??;
-            let received_at = Instant::now();
-            self.last_quiet_from = Some(
-                self.last_quiet_from
-                    .map_or(received_at, |t| t.max(received_at)),
-            );
+            self.note_quiet(Instant::now());
             if n == 0 {
                 return Err(FatalError::Io("相手が接続を閉じた".into()));
             }
