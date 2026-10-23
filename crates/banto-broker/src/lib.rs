@@ -462,8 +462,14 @@ pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
 /// test must use the same resolver and deadline as the directory.
 pub struct ResolvedSessionDriver {
     driver: Arc<dyn SessionDriver>,
-    frame: bool,
+    /// The Frame adapter itself, when `driver` is one (for the serial line's
+    /// release on stop).
+    frame: Option<Arc<session::FrameDial>>,
 }
+
+/// Runs when a broker task has ended, in every state (stopped, shut down, every
+/// handle dropped): the Frame adapter releases the connection's serial line.
+pub(crate) type Releaser = Arc<dyn Fn() + Send + Sync>;
 
 impl ResolvedSessionDriver {
     /// The Session driver, or a Frame adapter enforcing the host's transports.
@@ -472,17 +478,17 @@ impl ResolvedSessionDriver {
     }
 
     /// Outer dial budget (design §5.5). Frame includes transport connect,
-    /// 32 handshake exchanges and bounded cleanup; Session keeps its original
+    /// the serial line's sync attempts (io-design §7.3), 32 handshake
+    /// exchanges and bounded cleanup; Session keeps its original
     /// `connect + 1 s`. All arithmetic saturates.
     pub fn connect_limit(&self, timeouts: SessionTimeouts) -> Duration {
-        let limit = if self.frame {
+        let limit = if self.frame.is_some() {
             timeouts
                 .connect
-                .saturating_add(
-                    timeouts
-                        .response
-                        .saturating_mul(banto_driver_engine::MAX_HANDSHAKE_STEPS as u32),
-                )
+                .saturating_add(timeouts.response.saturating_mul(
+                    (banto_driver_engine::MAX_HANDSHAKE_STEPS
+                        + banto_driver_engine::MAX_SYNC_ATTEMPTS) as u32,
+                ))
                 .saturating_add(banto_driver_engine::CLOSE_TIMEOUT)
         } else {
             timeouts.connect
@@ -498,11 +504,15 @@ pub fn resolve_session_driver(
     registry: &DriverRegistry,
     protocol: &str,
 ) -> Option<ResolvedSessionDriver> {
-    let (driver, frame): (Arc<dyn SessionDriver>, bool) = match registry.get(protocol)?.kind() {
-        DriverKind::Session(driver) => (Arc::clone(driver), false),
-        DriverKind::Frame(driver) => (Arc::new(session::FrameDial(Arc::clone(driver))), true),
-        _ => return None,
-    };
+    let (driver, frame): (Arc<dyn SessionDriver>, Option<Arc<session::FrameDial>>) =
+        match registry.get(protocol)?.kind() {
+            DriverKind::Session(driver) => (Arc::clone(driver), None),
+            DriverKind::Frame(driver) => {
+                let dial = Arc::new(session::FrameDial::new(Arc::clone(driver)));
+                (Arc::clone(&dial) as Arc<dyn SessionDriver>, Some(dial))
+            }
+            _ => return None,
+        };
     Some(ResolvedSessionDriver { driver, frame })
 }
 
@@ -923,6 +933,18 @@ impl SessionDirectory {
         let secret_keys = driver.secret_keys();
         let fingerprint =
             SettingsFingerprint::of_connection(&conn.protocol, Some(conn), &settings, &secret_keys);
+        // A serial line is closed when this connection's task ends (stop,
+        // settings change, shutdown): io-design §7.3 step 4. Only the line this
+        // task leased last (its dial's owner mark): the Hub replaces a
+        // re-configured connection's task without joining the old one, and the
+        // old task's release must not close the line the new task has leased.
+        let releaser: Option<Releaser> = resolved.frame.as_ref().and_then(|dial| {
+            let key = dial.line_key(&settings)?;
+            let owner = dial.owner;
+            Some(Arc::new(move || {
+                banto_driver_engine::line::LineTable::global().close_by(&key, owner);
+            }) as Releaser)
+        });
         let connector = session_connector(
             conn.clone(),
             Arc::clone(driver),
@@ -935,6 +957,7 @@ impl SessionDirectory {
         let (mut handle, task) = spawn_task_with_connector_limit(
             conn.id,
             connector,
+            releaser,
             self.options.backoff,
             self.options.timeouts,
             connect_limit,
@@ -1268,6 +1291,7 @@ fn spawn_task_with_connector(
     spawn_task_with_connector_limit(
         connection_id,
         connector,
+        None,
         backoff,
         timeouts,
         timeouts.connect.saturating_add(CONNECT_SLACK),
@@ -1278,6 +1302,7 @@ fn spawn_task_with_connector(
 fn spawn_task_with_connector_limit(
     connection_id: i64,
     connector: Connector,
+    releaser: Option<Releaser>,
     backoff: BackoffConfig,
     timeouts: SessionTimeouts,
     connect_limit: Duration,
@@ -1293,6 +1318,7 @@ fn spawn_task_with_connector_limit(
     let task = tokio::spawn(run_broker_task(
         connection_id,
         connector,
+        releaser,
         backoff,
         timeouts,
         connect_limit,
@@ -1407,6 +1433,7 @@ async fn bounded_job<T>(
 async fn run_broker_task(
     connection_id: i64,
     connector: Connector,
+    releaser: Option<Releaser>,
     backoff_cfg: BackoffConfig,
     timeouts: SessionTimeouts,
     connect_limit: Duration,
@@ -1531,6 +1558,13 @@ async fn run_broker_task(
                 );
             }
         }
+    }
+    // After the session is gone (or the dial aborted): release the serial line
+    // so a later start opens a fresh one, even when the dial never succeeded
+    // (io-design §7.3 step 6: a line quarantined for a driver without a sync
+    // procedure is reopened only by stopping and starting the connection).
+    if let Some(release) = releaser {
+        release();
     }
     let _ = status_tx.send(BrokerConnectionStatus::Stopped);
 }

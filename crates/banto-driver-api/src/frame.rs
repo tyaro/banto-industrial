@@ -216,6 +216,39 @@ pub enum WriteProgress {
     Done(Vec<Result<(), ItemError>>),
 }
 
+/// A request's signature on a serial line (io-design §7.3, 2026-10-23): the
+/// driver's own encoding of "what a response to this request looks like"
+/// (Modbus RTU: unit id, function code, the normal response's byte count;
+/// an exception response is implied by unit id + function code). The engine
+/// never reads the bytes: it remembers signatures of requests whose
+/// response has not arrived, compares them for equality, hands them back to
+/// [`FrameConnection::sync_step`] and asks
+/// [`FrameConnection::response_matches`] which request a received frame
+/// answers. Two requests that could be answered by the same bytes must have
+/// the same signature; the engine refuses a sync step whose signature equals
+/// an outstanding one (C17).
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct Signature(Vec<u8>);
+
+impl Signature {
+    /// A signature from the driver's own bytes.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Signature(bytes.into())
+    }
+
+    /// The driver's bytes, as given.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Signature {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Signature({:02X?})", self.0)
+    }
+}
+
 /// A frame-type driver (design §4.2). Makes one [`FrameConnection`] per
 /// connection.
 pub trait FrameDriver: DriverBase {
@@ -257,6 +290,43 @@ pub trait FrameConnection: Send + 'static {
     /// cap (500 ms) is a contract violation and is refused before any send.
     fn inter_frame_gap(&self) -> std::time::Duration {
         std::time::Duration::ZERO
+    }
+
+    /// The [`Signature`] of `step`'s request (io-design §7.3, 2026-10-23).
+    /// On a serial line (`transports` with `Serial` / `SerialOverTcp`) the
+    /// engine records it before sending and keeps it while the response is
+    /// outstanding; a driver that names a serial transport must return
+    /// `Some` for every step it sends with a response (`None` is a C17
+    /// contract violation there). Default: `None` (TCP drivers need none).
+    fn signature(&self, _step: &Step) -> Option<Signature> {
+        None
+    }
+
+    /// The request the engine sends to resynchronise a serial line (io-design
+    /// §7.3 step 2) after a timeout, a framing error or a cancelled step,
+    /// and once when the line is first opened. `outstanding` are the
+    /// signatures of requests whose response never arrived (may be empty).
+    /// Return a **read** (never a write) whose normal and exception responses
+    /// can be told apart from a response to any of them (Modbus RTU: the
+    /// `probe()` point with a different function code or a different word
+    /// count than any outstanding request), or `None` when no such request is
+    /// left. A driver without a sync procedure keeps the default (`None`):
+    /// then the engine never reuses a serial line after a fatal error
+    /// (§7.3 step 6). The engine decides "has a procedure" by calling this
+    /// with an empty slice, so the choice must not depend on earlier calls
+    /// and must not change the connection's state when it returns `None`.
+    fn sync_step(&mut self, _outstanding: &[Signature]) -> Option<Step> {
+        None
+    }
+
+    /// Whether the complete frame `response` answers the request with
+    /// `signature` (a normal or an exception response to it). The engine
+    /// uses it to tell the sync step's response from a late response to an
+    /// outstanding request, and after synchronisation to refuse a response
+    /// that answers a different request (`FatalError::Framing`). Default:
+    /// `false`.
+    fn response_matches(&self, _signature: &Signature, _response: &[u8]) -> bool {
+        false
     }
 
     /// Whether `buf` holds a complete response to `step` (WIT
@@ -355,6 +425,15 @@ mod tests {
     fn defaults_refuse_writes_and_have_no_farewell() {
         let mut c: Box<dyn FrameConnection> = Box::new(ReadOnly);
         assert_eq!(c.farewell(), None);
+        let step = Step::new(vec![1], FrameRule::Fixed(1), 1);
+        assert_eq!(c.signature(&step), None);
+        assert_eq!(c.sync_step(&[]), None);
+        assert!(!c.response_matches(&Signature::new([1u8]), &[1]));
+        assert_eq!(
+            format!("{:?}", Signature::new(vec![1, 0xAB])),
+            "Signature([01, AB])"
+        );
+        assert_eq!(Signature::new([7u8]).as_bytes(), &[7]);
         assert!(matches!(
             c.write_next(&[], None),
             Err(FatalError::Protocol(_))

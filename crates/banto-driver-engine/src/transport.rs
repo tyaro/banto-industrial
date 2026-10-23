@@ -25,7 +25,7 @@ pub trait Transport: Send + 'static {
     fn close(&mut self) -> BoxFuture<'_, ()>;
 }
 
-/// 通信路の接続先。broker はシリアルの同期の手順（設計 §7.3）が入るまで `Serial` を開かない。
+/// 通信路の接続先。`Serial`・`SerialOverTcp` は線の表（[`crate::line`]、設計 §7.3）を通して開く。
 /// 変種が増えても外の `match` を壊さないよう `#[non_exhaustive]` にした
 /// （変種の作成は従来どおり。外に `match` は無い）。
 #[non_exhaustive]

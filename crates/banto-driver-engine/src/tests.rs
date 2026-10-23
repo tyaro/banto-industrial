@@ -306,7 +306,8 @@ fn session(conn: Conn, wire: Wire, events: Arc<Recorder>) -> FrameSession {
     FrameSession {
         core: Some(Core {
             conn: Box::new(conn),
-            transport: Box::new(wire),
+            wire: super::Wire::Direct(Box::new(wire)),
+            line_sync: false,
             response_timeout: T,
             can_write: true,
             events: Some(events),

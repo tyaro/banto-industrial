@@ -105,8 +105,8 @@ pub use driver::{
 };
 pub use error::{DeviceError, FatalError, ItemError};
 pub use frame::{
-    FrameCheck, FrameConnection, FrameDriver, FrameRule, Planned, PrefixEncoding, PrefixSpec, Step,
-    WriteProgress,
+    FrameCheck, FrameConnection, FrameDriver, FrameRule, Planned, PrefixEncoding, PrefixSpec,
+    Signature, Step, WriteProgress,
 };
 pub use registry::{DriverEntry, DriverKind, DriverRegistry, RegistryError};
 pub use session::{BoxFuture, ConnectContext, Session, SessionDriver};

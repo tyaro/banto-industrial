@@ -33,7 +33,7 @@
 //!
 //! - [`static_checks`] (C1, C2): address parsing / offsets / settings
 //!   validation of any [`DriverBase`](banto_driver_api::DriverBase). No I/O, no runtime.
-//! - [`frame::run_all`] (C1-C7, C9-C12): a frame-type driver
+//! - [`frame::run_all`] (C1-C7, C9-C12, and C17 for a driver naming a serial transport): a frame-type driver
 //!   ([`FrameDriver`](banto_driver_api::FrameDriver)) against a
 //!   [`frame::Responder`]. The harness runs the production FrameSession
 //!   (design §4.2, §4.2.1) in memory with virtual time, so it is deterministic and fast;
@@ -94,7 +94,7 @@ mod statics;
 
 pub use statics::static_checks;
 
-/// One broken contract: which check ([`id`](Self::id), `"C1"`-`"C16"`) and
+/// One broken contract: which check ([`id`](Self::id), `"C1"`-`"C17"`) and
 /// what was observed.
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]

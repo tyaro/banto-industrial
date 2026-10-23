@@ -20,6 +20,7 @@
 //! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
+//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; every planned read step has a `signature` |
 //!
 //! ## Comparing a value with its expected one
 //!
@@ -221,7 +222,7 @@ impl FrameFixtures {
     }
 }
 
-/// C1〜C7・C9〜C12 を検証する。空ならすべて適合した（設計 §7.2）。
+/// C1〜C7・C9〜C12（シリアルを名乗るドライバは C17 も）を検証する。空ならすべて適合した（設計 §7.2）。
 /// 本物のエンジンを別スレッドの止めた時計で駆動するため、呼び出し元の
 /// Tokio runtime の種類や時計の状態には依存しない。公開の async API は維持する。
 pub async fn run_all(
@@ -261,7 +262,91 @@ pub async fn run_all(
         cx.c12_string_span();
     }
     failures.extend(engine.into_violations());
+    c17_serial_sync(driver, fixtures, &reads, peer, &mut failures);
     failures
+}
+
+/// C17（io-design §7.3 の 6）: シリアルの通信方式を名乗るドライバは、時間切れの後の同期の
+/// 手順を持つ。エンジンを通さず、接続の純粋な呼び出しと機器の応答で確かめる。
+fn c17_serial_sync(
+    driver: &dyn FrameDriver,
+    fixtures: &FrameFixtures,
+    reads: &[Prepared<'_>],
+    peer: &mut dyn Responder,
+    failures: &mut Vec<Failure>,
+) {
+    use banto_driver_api::Transport;
+    let names_serial = driver
+        .descriptor()
+        .transports
+        .iter()
+        .any(|t| matches!(t, Transport::Serial | Transport::SerialOverTcp));
+    if !names_serial {
+        return;
+    }
+    let mut fail = |detail: String| failures.push(Failure::new("C17", detail));
+    let mut conn = match driver.create_connection(&fixtures.statics.settings) {
+        Ok(conn) => conn,
+        Err(error) => {
+            fail(format!("create_connection が失敗した: {error}"));
+            return;
+        }
+    };
+    peer.on_connect();
+    let mut outstanding = Vec::new();
+    for attempt in 1..=2 {
+        let Some(step) = conn.sync_step(&outstanding) else {
+            fail(format!(
+                "sync_step が {attempt} 回目（待っている署名 {outstanding:?}）で None（シリアルを名乗るドライバは同期の要求を返す）"
+            ));
+            return;
+        };
+        if matches!(step.expect, FrameRule::None) {
+            fail("sync_step が応答を待たない step を返した".into());
+            return;
+        }
+        let Some(signature) = conn.signature(&step) else {
+            fail("sync_step の step に signature が無い".into());
+            return;
+        };
+        if outstanding.contains(&signature) {
+            fail(format!(
+                "sync_step が待っている署名と同じ署名 {signature:?} の要求を選んだ"
+            ));
+            return;
+        }
+        let response = match peer.reply(&step.send) {
+            Reply::Bytes(bytes) => bytes,
+            Reply::Chunks(pieces, _) => pieces.concat(),
+            other => {
+                fail(format!(
+                    "機器が同期の要求 {:02X?} に応えない: {other:?}",
+                    step.send
+                ));
+                return;
+            }
+        };
+        if !conn.response_matches(&signature, &response) {
+            fail(format!(
+                "同期の要求 {:02X?} への機器の応答 {response:02X?} を response_matches が認めない",
+                step.send
+            ));
+        }
+        outstanding.push(signature);
+    }
+    for prepared in reads {
+        let Ok(planned) = conn.plan_read(std::slice::from_ref(&prepared.spec)) else {
+            continue;
+        };
+        for p in planned {
+            if !matches!(p.step.expect, FrameRule::None) && conn.signature(&p.step).is_none() {
+                fail(format!(
+                    "{:?} の読み取りの step に signature が無い（シリアルの線で送る step は署名を持つ）",
+                    prepared.case.text
+                ));
+            }
+        }
+    }
 }
 
 /// A read case with its parsed spec.
@@ -839,6 +924,144 @@ impl XorShift {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_driver_api::{
+        AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
+        FieldError, FrameConnection, Planned, Settings, Signature, Step, Transport,
+    };
+
+    /// シリアルを名乗る最小のドライバ。`sync` で同期の手順の有無、`collide` で待っている署名を
+    /// 見ずに同じ要求を選ぶ（C17 が落ちるべき形）。
+    struct SerialDriver {
+        descriptor: DriverDescriptor,
+        sync: bool,
+        collide: bool,
+    }
+    impl SerialDriver {
+        fn new(sync: bool, collide: bool) -> Self {
+            let mut descriptor = DriverDescriptor::new(
+                DriverId::new("serial-fake").unwrap(),
+                "0",
+                "serial",
+                Capabilities::READ_ONLY,
+            );
+            descriptor.transports = vec![Transport::Serial];
+            Self {
+                descriptor,
+                sync,
+                collide,
+            }
+        }
+    }
+    impl DriverBase for SerialDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &self.descriptor
+        }
+        fn validate_config(&self, _: &Settings) -> Vec<FieldError> {
+            vec![]
+        }
+        fn parse_address(&self, t: &str, k: &TagKind) -> Result<DriverAddress, AddressError> {
+            Ok(DriverAddress::new(
+                self.descriptor.id.clone(),
+                t,
+                "a",
+                true,
+                k.word_count(),
+            ))
+        }
+        fn offset_address(&self, t: &str, _: &TagKind, _: i64) -> Result<String, AddressError> {
+            Ok(t.into())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+    impl FrameDriver for SerialDriver {
+        fn create_connection(&self, _: &Settings) -> Result<Box<dyn FrameConnection>, FatalError> {
+            Ok(Box::new(SerialConn {
+                sync: self.sync,
+                collide: self.collide,
+            }))
+        }
+    }
+    struct SerialConn {
+        sync: bool,
+        collide: bool,
+    }
+    impl FrameConnection for SerialConn {
+        fn handshake_next(&mut self, _: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
+            Ok(None)
+        }
+        fn signature(&self, step: &Step) -> Option<Signature> {
+            Some(Signature::new(vec![step.send[0]]))
+        }
+        fn sync_step(&mut self, outstanding: &[Signature]) -> Option<Step> {
+            if !self.sync {
+                return None;
+            }
+            let codes: &[u8] = if self.collide { &[1] } else { &[1, 2] };
+            codes
+                .iter()
+                .find(|c| self.collide || !outstanding.contains(&Signature::new(vec![**c])))
+                .map(|c| Step::new(vec![*c], FrameRule::Fixed(1), 1))
+        }
+        fn response_matches(&self, signature: &Signature, response: &[u8]) -> bool {
+            response == signature.as_bytes()
+        }
+        fn is_complete(&self, _: &Step, _: &[u8]) -> Result<FrameCheck, FatalError> {
+            unreachable!()
+        }
+        fn plan_read(&mut self, _: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
+            Ok(vec![])
+        }
+        fn decode_read(
+            &self,
+            _: &Planned,
+            _: &[TagSpec],
+            _: &[u8],
+        ) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {
+            Ok(vec![])
+        }
+    }
+    struct Echo;
+    impl Responder for Echo {
+        fn reply(&mut self, request: &[u8]) -> Reply {
+            Reply::Bytes(request.to_vec())
+        }
+    }
+
+    #[test]
+    fn c17_requires_a_sync_procedure_from_drivers_naming_a_serial_transport() {
+        let fixtures = FrameFixtures::new(StaticFixtures::new(Settings::new()));
+        let run = |driver: &SerialDriver| {
+            let mut failures = Vec::new();
+            c17_serial_sync(driver, &fixtures, &[], &mut Echo, &mut failures);
+            failures
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.detail))
+                .collect::<Vec<_>>()
+        };
+        assert!(run(&SerialDriver::new(true, false)).is_empty());
+        let without = run(&SerialDriver::new(false, false));
+        assert!(
+            without
+                .iter()
+                .any(|f| f.starts_with("C17") && f.contains("None")),
+            "{without:?}"
+        );
+        let colliding = run(&SerialDriver::new(true, true));
+        assert!(
+            colliding
+                .iter()
+                .any(|f| f.starts_with("C17") && f.contains("同じ署名")),
+            "{colliding:?}"
+        );
+        let mut tcp = SerialDriver::new(false, false);
+        tcp.descriptor.transports = vec![Transport::Tcp];
+        assert!(
+            run(&tcp).is_empty(),
+            "C17 is only for drivers naming serial"
+        );
+    }
 
     #[test]
     fn raw_matches_follows_the_kind() {

@@ -98,18 +98,34 @@ impl SecretOpener for NoSecretOpener {
 
 /// Only the dial is adapted: the broker still owns one API Session per task.
 /// No driver registry entry is changed by this wrapper.
-pub(crate) struct FrameDial(pub(crate) std::sync::Arc<dyn banto_driver_api::FrameDriver>);
+pub(crate) struct FrameDial {
+    pub(crate) driver: std::sync::Arc<dyn banto_driver_api::FrameDriver>,
+    /// The owner mark this dial records on the serial line it leases
+    /// (io-design §7.3): one per broker task, so the task's release closes only
+    /// the line it leased last, never one a newer task for the same
+    /// connection has since leased or opened.
+    pub(crate) owner: banto_driver_engine::line::LineOwner,
+}
+
+impl FrameDial {
+    pub(crate) fn new(driver: std::sync::Arc<dyn banto_driver_api::FrameDriver>) -> Self {
+        Self {
+            driver,
+            owner: banto_driver_engine::line::LineOwner::new(),
+        }
+    }
+}
 
 impl banto_driver_api::DriverBase for FrameDial {
     fn descriptor(&self) -> &banto_driver_api::DriverDescriptor {
-        self.0.descriptor()
+        self.driver.descriptor()
     }
     fn validate_config(
         &self,
         settings: &banto_driver_api::Settings,
     ) -> Vec<banto_driver_api::FieldError> {
-        let mut errors = self.0.validate_config(settings);
-        if let Err(error) = frame_transport(settings, self.0.descriptor()) {
+        let mut errors = self.driver.validate_config(settings);
+        if let Err(error) = frame_transport(settings, self.driver.descriptor()) {
             // Keep the driver's more specific message for a field it already rejected.
             if !errors.iter().any(|existing| existing.key == error.key) {
                 errors.push(error);
@@ -118,14 +134,14 @@ impl banto_driver_api::DriverBase for FrameDial {
         errors
     }
     fn secret_keys(&self) -> Vec<String> {
-        self.0.secret_keys()
+        self.driver.secret_keys()
     }
     fn parse_address(
         &self,
         text: &str,
         kind: &banto_driver_api::TagKind,
     ) -> Result<banto_driver_api::DriverAddress, banto_driver_api::AddressError> {
-        self.0.parse_address(text, kind)
+        self.driver.parse_address(text, kind)
     }
     fn offset_address(
         &self,
@@ -133,13 +149,13 @@ impl banto_driver_api::DriverBase for FrameDial {
         kind: &banto_driver_api::TagKind,
         n: i64,
     ) -> Result<String, banto_driver_api::AddressError> {
-        self.0.offset_address(canonical, kind, n)
+        self.driver.offset_address(canonical, kind, n)
     }
     fn address_help(&self) -> String {
-        self.0.address_help()
+        self.driver.address_help()
     }
     fn probe(&self) -> Option<(String, banto_driver_api::TagKind)> {
-        self.0.probe()
+        self.driver.probe()
     }
 }
 
@@ -149,19 +165,21 @@ impl banto_driver_api::SessionDriver for FrameDial {
         settings: &banto_driver_api::Settings,
         cx: banto_driver_api::ConnectContext,
     ) -> BoxFuture<'static, Result<Box<dyn Session>, FatalError>> {
-        let driver = self.0.clone();
+        let driver = self.driver.clone();
+        let owner = self.owner;
         // The owned copy must zeroize too, including when never polled.
         let mut settings = super::OpenedSettings::new(settings.clone());
         settings.opened = driver.secret_keys();
         Box::pin(async move {
             let spec = frame_transport(settings.settings(), driver.descriptor())
                 .map_err(|error| FatalError::InvalidConfig(error.to_string()))?;
-            banto_driver_engine::FrameSession::connect(
+            banto_driver_engine::FrameSession::connect_as(
                 driver.as_ref(),
                 settings.settings(),
                 &spec,
                 &cx,
                 None,
+                Some(owner),
             )
             .await
             .map(|session| Box::new(session) as Box<dyn Session>)
@@ -169,42 +187,29 @@ impl banto_driver_api::SessionDriver for FrameDial {
     }
 }
 
-/// Transport validation belongs to the host that opens it. Serial support and
-/// resynchronisation are added in 3e; never silently dial TCP for an unknown kind.
+/// Transport validation belongs to the host that opens it (R2b-3e-2: serial
+/// and the converter's TCP are accepted when the driver's descriptor names
+/// them; the engine's line table then owns the port and resynchronises it,
+/// io-design §7.3). Never silently dial TCP for an unknown kind.
 fn frame_transport(
     settings: &banto_driver_api::Settings,
     descriptor: &banto_driver_api::DriverDescriptor,
 ) -> Result<banto_driver_engine::transport::TransportSpec, banto_driver_api::FieldError> {
-    use banto_driver_api::{keys, FieldError};
-    match settings.get(keys::TRANSPORT).unwrap_or("tcp") {
-        "tcp" => {}
-        _ => {
-            return Err(FieldError::new(
-                keys::TRANSPORT,
-                "このエンジンで未対応の通信方式です",
-            ))
-        }
+    banto_driver_engine::transport::TransportSpec::from_settings(settings, &descriptor.transports)
+}
+
+impl FrameDial {
+    /// The serial line `settings` dial (io-design §7.3), or `None` for TCP and
+    /// for settings the transport validation refuses. The broker closes this
+    /// line in the engine's table when it stops the connection, so a stopped or
+    /// re-configured connection releases the port and a later start begins
+    /// with a fresh line (§7.3 steps 4 and 6).
+    pub(crate) fn line_key(
+        &self,
+        settings: &banto_driver_api::Settings,
+    ) -> Option<banto_driver_engine::line::LineKey> {
+        frame_transport(settings, self.driver.descriptor())
+            .ok()
+            .and_then(|spec| banto_driver_engine::line::LineKey::of(&spec))
     }
-    if !descriptor
-        .transports
-        .contains(&banto_driver_api::Transport::Tcp)
-    {
-        return Err(FieldError::new(
-            keys::TRANSPORT,
-            "このドライバは TCP 通信に対応していません",
-        ));
-    }
-    let host = settings
-        .get(keys::HOST)
-        .filter(|host| !host.trim().is_empty())
-        .ok_or_else(|| FieldError::new(keys::HOST, "接続先を指定してください"))?;
-    let port = settings
-        .get(keys::PORT)
-        .and_then(|port| port.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .ok_or_else(|| FieldError::new(keys::PORT, "1〜65535 で指定してください"))?;
-    Ok(banto_driver_engine::transport::TransportSpec::Tcp {
-        host: host.to_owned(),
-        port,
-    })
 }
