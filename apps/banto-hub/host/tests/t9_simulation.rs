@@ -14,9 +14,8 @@
 //! 1. `POST /api/plc-connections`（`simulation: true`）で broker 経由 SLMP
 //!    接続を作り、グループ・タグを足して rebuild すると、このテスト自身は
 //!    SLMP シミュレータを一切起動していないのに `/api/v1/values/{tag}` が
-//!    changing な good 品質の値を返す - `BrokerSimRegistry`が
-//!    `ensure_connection`より前にシミュレータを起動・アドレス差し替えして
-//!    いることの証明。`GET /api/v1/status`/`GET /api/v1/tags`が
+//!    changing な good 品質の値を返す - 接続のセッションが値の層の
+//!    `SimDevice`（R2b-5b。ワイヤのシミュレータではない）であることの証明。`GET /api/v1/status`/`GET /api/v1/tags`が
 //!    `simulation: true`/`false`を正しく報告することも合わせて確認する。
 //! 2. 実際の SLMP シミュレータ(`banto_plc::slmp::simulator::Simulator`、
 //!    テスト自身が起動)を使う`simulation: false`接続から始め、
@@ -32,6 +31,12 @@
 //!    `changed`判定がダイヤル先が実際には変わっていない限り安定して
 //!    `false`であること）も確認する - `tests/integration.rs`の
 //!    `e2e_slmp_session_survives_a_rebuild_via_broker`と同型の回帰確認。
+//!    最後に`simulation: false`へ戻すと、値がテスト所有のシミュレータの
+//!    111 に戻り、`SimDevice`が捨てられる（R2b-5b: 指紋のシミュレーションの
+//!    印が無いと、古い`SimSession`を読み続けて落ちる）。
+//! 3. `simulation: true`の接続はワイヤのソケットを開かない（Modbus の
+//!    シミュレータの受理した接続が 0 本のまま）。文字列タグと、先頭 16 番地の
+//!    外のタグも動く値を返す（R2b-5b。ワイヤのシミュレータでは未対応だった）。
 
 use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
@@ -57,6 +62,7 @@ use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
+use banto_plc::modbus::simulator::Simulator as ModbusSimulator;
 use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
 use banto_server::{AuthState, Identity};
 use banto_tags::{
@@ -154,6 +160,8 @@ struct TestApp {
     /// does - here to prove a simulation toggle re-points the existing
     /// session rather than leaking a second one.
     sessions: Arc<HubSessions>,
+    /// R2b-5b: the simulated connections' value tables.
+    sim_registry: Arc<BrokerSimRegistry>,
     _env: TempEnv,
 }
 
@@ -211,7 +219,7 @@ async fn test_app(label: &str) -> TestApp {
         Arc::new(SystemClock),
         fast_options(),
         sessions.clone(),
-        sim_registry,
+        sim_registry.clone(),
         computed,
     ));
     manager.rebuild().await.expect("initial rebuild");
@@ -270,6 +278,7 @@ async fn test_app(label: &str) -> TestApp {
         pool,
         manager,
         sessions,
+        sim_registry,
         _env: env,
     }
 }
@@ -608,5 +617,130 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
         "the newly-added tag should also read from the still-simulated connection"
     );
 
+    // Phase 5 (R2b-5b): back to simulation=false - the session is replaced
+    // (the fingerprint carries the simulation mark), the device is dropped and
+    // the value is the external simulator's 111 again.
+    assert!(app.sim_registry.device(conn_id).await.is_some());
+    let (status, _updated) = admin_write(
+        &app.router,
+        "PUT",
+        &format!("/api/plc-connections/{conn_id}"),
+        &app.admin_token,
+        plc_connection_payload_json("line1", sim.addr.port(), false),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    app.manager.rebuild().await.expect("rebuild after revert");
+    assert!(
+        wait_until(Duration::from_secs(10), || async {
+            let (status, json) = get_json(
+                &app.router,
+                "/api/v1/values/line1.fast.t1",
+                &app.admin_token,
+            )
+            .await;
+            status == StatusCode::OK && json["v"] == 111.0 && json["q"] == "good"
+        })
+        .await,
+        "after switching simulation off the value must come from the external simulator again"
+    );
+    assert!(app.sim_registry.device(conn_id).await.is_none());
+    assert_eq!(app.sessions.connection_count(), 1);
+
+    sim.stop();
+}
+
+// ---------------------------------------------------------------------------
+// 3. simulation=true の接続はソケットを開かず、文字列・先頭 16 番地の外の
+//    タグも動く値を返す（R2b-5b）。
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_simulated_connection_opens_no_socket_and_serves_strings_and_far_addresses() {
+    let app = test_app("t9-no-socket").await;
+    // The nominal host/port point at a live Modbus simulator: if the session
+    // were a wire one, its accept counter would move.
+    let sim = ModbusSimulator::start().await;
+
+    let (status, created) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({
+            "name": "mline",
+            "protocol": "modbus-tcp",
+            "host": "127.0.0.1",
+            "port": sim.addr.port(),
+            "unitId": 1,
+            "enabled": true,
+            "simulation": true,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let conn_id = created["id"].as_i64().expect("connection id");
+
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", conn_id, 100))
+        .await
+        .unwrap();
+    let tags = TagService::new(app.pool.clone());
+    // Far past the old simulator's first 16 addresses.
+    tags.create(tag_input("far", group.id, "41000", "u16"))
+        .await
+        .unwrap();
+    // A string needs an SLMP connection (the Modbus driver has no strings).
+    let (status, created) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        plc_connection_payload_json("sline", 1, true),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let sgroup = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", created["id"].as_i64().unwrap(), 100))
+        .await
+        .unwrap();
+    let mut text = tag_input("text", sgroup.id, "D100", "string");
+    text.string_length = Some(4);
+    tags.create(text).await.unwrap();
+    app.manager.rebuild().await.expect("rebuild after seeding");
+
+    // The collection never reads a string tag (the plan skips them), so the
+    // string goes through the on-demand read; the number through collection.
+    for (name, suffix) in [("mline.fast.far", ""), ("sline.fast.text", "/read-now")] {
+        let path = format!("/api/v1/values/{name}{suffix}");
+        let seen = std::sync::Mutex::new(Value::Null);
+        assert!(
+            wait_until(Duration::from_secs(10), || async {
+                let (status, json) = get_json(&app.router, &path, &app.admin_token).await;
+                let good = status == StatusCode::OK && !json["v"].is_null() && json["q"] != "bad";
+                if good {
+                    *seen.lock().unwrap() = json["v"].clone();
+                }
+                good
+            })
+            .await,
+            "{name}: a simulated value should be served"
+        );
+        let first = seen.lock().unwrap().clone();
+        assert!(
+            wait_until(Duration::from_secs(10), || async {
+                let (status, json) = get_json(&app.router, &path, &app.admin_token).await;
+                status == StatusCode::OK && !json["v"].is_null() && json["v"] != first
+            })
+            .await,
+            "{name}: the simulated value should keep changing"
+        );
+    }
+
+    assert_eq!(
+        sim.connection_count(),
+        0,
+        "a simulated connection must not open a wire socket"
+    );
     sim.stop();
 }

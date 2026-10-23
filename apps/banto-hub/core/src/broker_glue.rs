@@ -380,6 +380,20 @@ impl HubSessions {
             .ensure_connection_with_settings(conn, settings)
     }
 
+    /// As [`Self::ensure_connection_with_settings`], for a `simulation = true`
+    /// connection: the session reads and writes `device` (what
+    /// `BrokerSimRegistry::resolve` returns as `DialTarget::Sim`, R2b-5b)
+    /// instead of dialing.
+    pub fn ensure_simulated_connection(
+        &self,
+        conn: &PlcConnection,
+        settings: Settings,
+        device: banto_broker::SimDevice,
+    ) -> Result<BrokerHandle, BrokerError> {
+        self.directory
+            .ensure_simulated_connection(conn, settings, device)
+    }
+
     /// `connection_id` の broker セッションが既に生きていれば、その読み取り
     /// 専用ハンドルを返す(新規に起動はしない) - T12(docs/ux-plan.md §4)の
     /// 接続テストが、収集稼働中の SLMP 接続に対して2本目をダイヤルしてしまう

@@ -226,6 +226,7 @@ use crate::ingest::{build_hub_config, IngestHub};
 fn runtime_snapshot_for_mode(
     snapshot: &RegistrySnapshot,
     mode: crate::controller::RunMode,
+    registry: &banto_driver_api::DriverRegistry,
 ) -> RegistrySnapshot {
     if mode != crate::controller::RunMode::AllSimulation {
         return snapshot.clone();
@@ -233,7 +234,7 @@ fn runtime_snapshot_for_mode(
 
     let mut runtime = snapshot.clone();
     for connection in &mut runtime.connections {
-        if connection.enabled && matches!(connection.protocol.as_str(), "modbus-tcp" | "slmp") {
+        if connection.enabled && banto_broker::is_broker_managed(registry, &connection.protocol) {
             connection.simulation = true;
         }
     }
@@ -2047,36 +2048,18 @@ impl CollectorManager {
                 && self.sessions.is_broker_managed(&c.protocol)
                 && collectible_connection_ids.contains(&c.id)
         }) {
-            // T9-2: resolve the effective dial target (simulator address if
-            // `conn.simulation`, else the connection's own host/port) BEFORE
-            // ensure_connection - see this fn's own doc comment and
+            // T9-2: resolve the session's target (the real driver, or the
+            // value layer's `SimDevice` when `conn.simulation`, R2b-5b)
+            // BEFORE ensure_connection - see this fn's own doc comment and
             // `BrokerSimRegistry::resolve`'s doc comment for why the ordering
-            // and the `changed`-triggered `sessions.remove` matter.
-            // R2b-3a-2: `resolve` returns the settings to dial with (the
-            // connection's own, or with `host`/`port` replaced by the
-            // simulator's) and whether they changed since the last sync.
-            // R2b-3a-3: `None` is a `simulation = true` connection whose
-            // protocol has no simulator - never dialed (the real device must
-            // not be reached), no new session, and the plan excludes it too
-            // (`banto_collect`'s `UnsupportedProtocol`; the Hub's strict plan
-            // then refuses the whole snapshot before this sync, so this branch
-            // is defence in depth). It is simply left out
-            // of `wanted_ids`: an old session of it (dialing the real device)
-            // stays in the directory, so it lands in `stale_ids` below and is
-            // stopped and joined by `Self::remove_stale_broker_sessions` once
-            // the caller's commit succeeds (and kept, like every other stale
-            // session, if the commit fails and the old state is restored).
-            // Removing it from the directory here instead would skip that
-            // stop: an unchanged connection's collect task keeps the old
-            // handles map, so the dropped session's broker task would live on
-            // and keep reaching (and redialing) the real device.
-            let Some((dial_settings, changed)) = self
+            // and the `changed`-triggered `sessions.remove` matter. There is
+            // no "protocol without a simulator" any more: every
+            // broker-managed protocol can be simulated, so `resolve` always
+            // answers (the `None` branch of R2b-3a-3 is gone).
+            let (target, changed) = self
                 .sim_registry
                 .resolve(conn, &self.sessions.drivers().registry)
-                .await
-            else {
-                continue;
-            };
+                .await;
             wanted_ids.insert(conn.id);
             if changed {
                 self.sessions.remove(conn.id);
@@ -2086,11 +2069,7 @@ impl CollectorManager {
             // endpoint), stamped on the plan (`set_broker_dial_target`).
             resolved_targets.insert(
                 key.clone(),
-                banto_collect::dial_fingerprint(
-                    conn,
-                    &dial_settings,
-                    &self.sessions.drivers().registry,
-                ),
+                banto_collect::dial_fingerprint(conn, &target, &self.sessions.drivers().registry),
             );
 
             // #337 (2026-09-08): there used to be a `if conn.protocol ==
@@ -2117,10 +2096,15 @@ impl CollectorManager {
             // accumulated here at all; it is derived from `handles` below,
             // which is what actually decides read routing.
 
-            match self
-                .sessions
-                .ensure_connection_with_settings(conn, dial_settings)
-            {
+            let ensured = match target {
+                banto_collect::DialTarget::Real(settings) => self
+                    .sessions
+                    .ensure_connection_with_settings(conn, settings),
+                banto_collect::DialTarget::Sim(settings, device) => self
+                    .sessions
+                    .ensure_simulated_connection(conn, settings, device),
+            };
+            match ensured {
                 Ok(handle) => {
                     handles.insert(key, handle.read_only());
                 }
@@ -2491,7 +2475,7 @@ impl CollectorManager {
             self.set_last_error(message.clone());
             message
         })?;
-        let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode);
+        let runtime_snapshot = runtime_snapshot_for_mode(&snapshot, mode, self.registry());
         let mut config = build_hub_config(&runtime_snapshot, self.registry()).map_err(|err| {
             let message = err.to_string();
             self.set_last_error(message.clone());
@@ -3291,12 +3275,16 @@ mod tests {
             secrets: Vec::new(),
         };
 
+        let registry = crate::test_support::test_drivers().registry;
         let configured =
-            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::Configured);
+            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::Configured, &registry);
         assert_eq!(configured, snapshot);
 
-        let all_simulation =
-            runtime_snapshot_for_mode(&snapshot, crate::controller::RunMode::AllSimulation);
+        let all_simulation = runtime_snapshot_for_mode(
+            &snapshot,
+            crate::controller::RunMode::AllSimulation,
+            &registry,
+        );
         assert!(!snapshot.connections[0].simulation);
         assert!(!snapshot.connections[1].simulation);
         assert!(all_simulation.connections[0].simulation);
@@ -4085,20 +4073,15 @@ mod tests {
         conn.id
     }
 
-    /// R2b-3a-3 review P2: a connection whose session-type driver has no
-    /// simulator (A), collected next to another connection (B), is switched to
-    /// `simulation = true`. `BrokerSimRegistry::resolve` returns `None`, so A
-    /// is excluded from the plan - and its old session (dialing the real
-    /// device) must be stopped after the commit like any other stale session.
-    /// The Hub's strict plan refuses that snapshot first (`rebuild` fails and
-    /// keeps the old state), so the sync and the cleanup are driven directly,
-    /// in `rebuild`'s order.
-    /// Before the fix the `None` branch removed A from the directory, so A
-    /// never reached `stale_ids` and `remove_stale_broker_sessions` skipped
-    /// it; B's unchanged task kept the old handles map, so A's broker task
-    /// stayed alive and connected to the real device.
+    /// R2b-5b (was R2b-3a-3 review P2, "a protocol without a simulator"): a
+    /// connection of any session-type driver (A, here an id the built-ins do
+    /// not know), collected next to another connection (B), is switched to
+    /// `simulation = true`. It is planned like any other (the session is the
+    /// value layer's `SimDevice`, no per-protocol simulator is needed), the
+    /// old session (dialing the real device) is replaced - its socket closes,
+    /// the device is never dialed again - and B is not touched.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn switching_a_connection_without_a_simulator_to_simulation_stops_its_old_session() {
+    async fn switching_any_session_connection_to_simulation_replaces_its_real_session() {
         let dir = crate::test_support::TempDir::new("manager-env-nosim");
         let pool = init_db(&dir.path().join("registry.sqlite3"))
             .await
@@ -4120,6 +4103,7 @@ mod tests {
             banto_broker::BackoffConfig::default(),
             crate::broker_glue::HubDrivers::new(Arc::new(registry)),
         ));
+        let sims = Arc::new(BrokerSimRegistry::new());
         let manager = CollectorManager::new(
             pool.clone(),
             dir.path().join("data"),
@@ -4130,7 +4114,7 @@ mod tests {
                 ..CollectorOptions::default()
             },
             sessions,
-            Arc::new(BrokerSimRegistry::new()),
+            sims.clone(),
             Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new()))),
         );
 
@@ -4155,31 +4139,22 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        // The Hub's strict plan refuses this snapshot as a whole (A is
-        // `UnsupportedProtocol`), so `rebuild` never reaches the sync with it;
-        // the `None` branch is defence in depth. Drive the sync and the
-        // post-commit cleanup directly, in `rebuild`'s order.
-        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
-        assert!(
-            manager.rebuild().await.is_err(),
-            "the strict plan refuses an unsimulatable simulation"
-        );
-        let (handles, stale, _targets, _read_routed) =
-            manager.sync_broker_sessions_from(&snapshot).await;
-        assert!(!handles.contains_key(&format!("conn:{a}")));
-        assert!(handles.contains_key(&format!("conn:{b}")));
-        assert_eq!(stale, vec![a], "A's old session must be stale");
-        manager.remove_stale_broker_sessions(&stale).await;
+        manager
+            .rebuild()
+            .await
+            .expect("a simulation of any session-type driver is planned");
 
         let ids = manager.sessions().connection_ids();
-        assert!(!ids.contains(&a), "A is no longer wanted: {ids:?}");
+        assert!(ids.contains(&a), "A keeps a (simulated) session: {ids:?}");
         assert!(ids.contains(&b), "B keeps its session: {ids:?}");
+        assert!(sims.device(a).await.is_some(), "A has a value table now");
+        assert!(sims.device(b).await.is_none());
 
         use tokio::io::AsyncReadExt;
         let mut buf = [0u8; 16];
         let read = tokio::time::timeout(wait, socket_a.read(&mut buf))
             .await
-            .expect("A's old broker session must be stopped (its socket closed)");
+            .expect("A's old (real) broker session must be stopped (its socket closed)");
         assert!(
             matches!(read, Ok(0) | Err(_)),
             "A's device must see the session end, got {read:?}"

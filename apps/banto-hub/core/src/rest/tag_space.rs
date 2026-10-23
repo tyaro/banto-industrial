@@ -123,10 +123,11 @@ pub(super) fn effective_simulation_for_connection(
     enabled: bool,
     configured_simulation: bool,
     runtime: &CollectionStatus,
+    registry: &banto_driver_api::DriverRegistry,
 ) -> bool {
     enabled
         && runtime.state == CollectionState::Running
-        && matches!(protocol, "modbus-tcp" | "slmp")
+        && banto_broker::is_broker_managed(registry, protocol)
         && (configured_simulation || runtime.mode == RunMode::AllSimulation)
 }
 
@@ -1090,6 +1091,7 @@ pub(crate) async fn compute_status(state: &TagSpaceState) -> Result<StatusRespon
                     conn.enabled,
                     conn.simulation,
                     &runtime,
+                    &sessions.drivers().registry,
                 ),
             }
         })
