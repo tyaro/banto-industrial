@@ -20,7 +20,7 @@
 //! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
-//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection, **before the handshake** (the engine decides on the sync procedure right after `create_connection`, 2026-10-23), has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a planned read step's response followed by the sync response is delimited by the sync step at the read response's length; every step it sends with a response - the handshake's, each planned read's and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature, and none of those responses is longer than the sync step's `max_len` (2026-10-23) |
+//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection, **before the handshake** (the engine decides on the sync procedure right after `create_connection`, 2026-10-23), has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a response to any step it sends with a response (handshake, planned read, `write_next`) followed by the sync response is delimited by the sync step at that response's length; every step it sends with a response - the handshake's, each planned read's and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature, and none of those responses is longer than the sync step's `max_len` (2026-10-23) |
 //!
 //! ## Comparing a value with its expected one
 //!
@@ -374,6 +374,7 @@ fn c17_serial_sync(
             peer,
             "ハンドシェイク",
             &step,
+            first_sync.as_ref(),
             &mut fail,
             &mut answered,
         ) else {
@@ -390,31 +391,15 @@ fn c17_serial_sync(
                 continue;
             }
             let what = format!("{:?} の読み取り", prepared.case.text);
-            let Some(stale) = c17_answered(
+            let _ = c17_answered(
                 conn.as_ref(),
                 peer,
                 &what,
                 &p.step,
+                first_sync.as_ref(),
                 &mut fail,
                 &mut answered,
-            ) else {
-                continue;
-            };
-            // 同期の途中に届く古い応答も同期の step の形で区切られる（エンジンの契約）。
-            // 古い応答の直後に同期の応答が続いた受信で、先頭が古い応答の長さで区切れること。
-            let Some((sync, sync_response)) = &first_sync else {
-                continue;
-            };
-            let mut joined = stale.clone();
-            joined.extend_from_slice(sync_response);
-            match first_frame_len(conn.as_ref(), sync, &joined) {
-                Ok(Some(len)) if len == stale.len() => {}
-                got => fail(format!(
-                    "{:?} の読み取りの応答 {stale:02X?} の後に同期の応答が続いた受信を、同期の step が {} バイトで区切れない（結果 {got:?}）",
-                    prepared.case.text,
-                    stale.len()
-                )),
-            }
+            );
         }
     }
     c17_writes(
@@ -422,6 +407,7 @@ fn c17_serial_sync(
         fixtures,
         conn.as_mut(),
         peer,
+        first_sync.as_ref(),
         &mut fail,
         &mut answered,
     );
@@ -444,6 +430,7 @@ fn c17_writes(
     fixtures: &FrameFixtures,
     conn: &mut dyn FrameConnection,
     peer: &mut dyn Responder,
+    first_sync: Option<&(Step, Vec<u8>)>,
     fail: &mut dyn FnMut(String),
     answered: &mut Vec<(String, usize)>,
 ) {
@@ -475,8 +462,15 @@ fn c17_writes(
             previous = Some(Vec::new());
             continue;
         }
-        let Some(response) = c17_answered(conn, peer, "書き込み", &planned.step, fail, answered)
-        else {
+        let Some(response) = c17_answered(
+            conn,
+            peer,
+            "書き込み",
+            &planned.step,
+            first_sync,
+            fail,
+            answered,
+        ) else {
             return;
         };
         previous = Some(response);
@@ -487,11 +481,14 @@ fn c17_writes(
 /// シリアルの線のエンジンは、認めない応答を別の要求への応答として `Framing` で断る。
 /// 機器の応答（認めなくても）を返し、署名が無いか機器が応えないときは `None`。
 /// 応答の長さを `answered` に足す（同期の step の `max_len` の検査に使う）。
+/// また、同期の途中に届く古い応答も同期の step の形で区切られる（エンジンの契約）ので、この応答の
+/// 直後に最初の同期の応答（`first_sync`）が続いた受信の先頭が、この応答の長さで区切れることも確かめる。
 fn c17_answered(
     conn: &dyn FrameConnection,
     peer: &mut dyn Responder,
     what: &str,
     step: &Step,
+    first_sync: Option<&(Step, Vec<u8>)>,
     fail: &mut dyn FnMut(String),
     answered: &mut Vec<(String, usize)>,
 ) -> Option<Vec<u8>> {
@@ -512,6 +509,17 @@ fn c17_answered(
             "{what}の要求 {:02X?} への機器の応答 {response:02X?} を response_matches が署名 {signature:?} で認めない",
             step.send
         ));
+    }
+    if let Some((sync, sync_response)) = first_sync {
+        let mut joined = response.clone();
+        joined.extend_from_slice(sync_response);
+        match first_frame_len(conn, sync, &joined) {
+            Ok(Some(len)) if len == response.len() => {}
+            got => fail(format!(
+                "{what}の応答 {response:02X?} の後に同期の応答が続いた受信を、同期の step が {} バイトで区切れない（結果 {got:?}）",
+                response.len()
+            )),
+        }
     }
     answered.push((what.to_owned(), response.len()));
     Some(response)
@@ -1188,6 +1196,8 @@ mod tests {
         sync_max_len: u32,
         /// ハンドシェイクを済ませるまで `sync_step` が `None` を返す（C17 が落ちるべき形）。
         sync_after_handshake: bool,
+        /// この先頭バイトの step（ハンドシェイクは 7、書き込みは 5）は 4 バイトの要求（= 応答）を送る。
+        long_step: Option<u8>,
     }
     impl SerialDriver {
         fn new(sync: bool, collide: bool) -> Self {
@@ -1207,6 +1217,7 @@ mod tests {
                 matches_sync_only: false,
                 sync_max_len: 16,
                 sync_after_handshake: false,
+                long_step: None,
             }
         }
     }
@@ -1243,6 +1254,7 @@ mod tests {
                 matches_sync_only: self.matches_sync_only,
                 sync_max_len: self.sync_max_len,
                 sync_after_handshake: self.sync_after_handshake,
+                long_step: self.long_step,
                 handshake_done: false,
             }))
         }
@@ -1255,12 +1267,23 @@ mod tests {
         matches_sync_only: bool,
         sync_max_len: u32,
         sync_after_handshake: bool,
+        long_step: Option<u8>,
         handshake_done: bool,
+    }
+    impl SerialConn {
+        /// 先頭が `code` の要求。`long_step` が `code` なら 4 バイト、そうでなければ 2 バイト。
+        fn request(&self, code: u8) -> Vec<u8> {
+            if self.long_step == Some(code) {
+                vec![code, code, code, 0x0A]
+            } else {
+                vec![code, 0x0A]
+            }
+        }
     }
     impl FrameConnection for SerialConn {
         fn handshake_next(&mut self, prev: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
             let step = (self.handshake && prev.is_none())
-                .then(|| Step::new(vec![7, b'\n'], FrameRule::Terminator(b"\n".to_vec()), 16));
+                .then(|| Step::new(self.request(7), FrameRule::Terminator(b"\n".to_vec()), 16));
             self.handshake_done = step.is_none();
             Ok(step)
         }
@@ -1322,7 +1345,7 @@ mod tests {
         ) -> Result<WriteProgress, FatalError> {
             Ok(match prev {
                 None => WriteProgress::Send(Planned::new(
-                    Step::new(vec![5, b'\n'], FrameRule::Terminator(b"\n".to_vec()), 16),
+                    Step::new(self.request(5), FrameRule::Terminator(b"\n".to_vec()), 16),
                     vec![0],
                 )),
                 Some(_) => WriteProgress::Done(vec![Ok(()); items.len()]),
@@ -1495,6 +1518,42 @@ mod tests {
                     .iter()
                     .any(|f| f.starts_with("C17") && f.contains(what) && f.contains("認めない")),
                 "{what}: {sync_only:?}"
+            );
+        }
+    }
+
+    /// Codex P2: 連結の区切りの確かめは、読み取りだけでなくハンドシェイク・書き込みの応答にも当たる。
+    #[test]
+    fn c17_delimits_handshake_and_write_responses_followed_by_the_sync_response() {
+        let fixtures = FrameFixtures::new(StaticFixtures::new(Settings::new())).write(
+            "D1",
+            TagKind::numeric(DataType::U16),
+            Value::F64(1.0),
+            RawValue::Uint(1),
+        );
+        let run = |rule: SyncRule, long_step: Option<u8>| {
+            let mut driver = SerialDriver::new(true, false);
+            driver.descriptor.capabilities = Capabilities::READ_WRITE;
+            driver.handshake = true;
+            driver.rule = rule;
+            driver.long_step = long_step;
+            let mut failures = Vec::new();
+            c17_serial_sync(&driver, &fixtures, &[], &mut Echo, &mut failures);
+            failures
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.detail))
+                .collect::<Vec<_>>()
+        };
+        assert!(run(SyncRule::DecidesSyncOnly, None).is_empty());
+        assert!(run(SyncRule::Decides, Some(7)).is_empty());
+        assert!(run(SyncRule::Decides, Some(5)).is_empty());
+        for (code, what) in [(7, "ハンドシェイク"), (5, "書き込み")] {
+            let failed = run(SyncRule::DecidesSyncOnly, Some(code));
+            assert!(
+                failed
+                    .iter()
+                    .any(|f| f.starts_with("C17") && f.contains(what) && f.contains("区切れない")),
+                "{what}: {failed:?}"
             );
         }
     }
