@@ -282,7 +282,7 @@ impl Core {
 
     fn gap_violation(&self, gap: Duration) -> FatalError {
         self.violation_fatal(
-            "C17",
+            "C9",
             format!("inter_frame_gap {gap:?} が上限 {MAX_INTER_FRAME_GAP:?} を超えている"),
         )
     }

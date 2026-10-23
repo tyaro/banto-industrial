@@ -1006,7 +1006,7 @@ async fn a_gap_over_the_cap_is_refused_before_any_send() {
     let err = s.read_batch(&three_specs()).await.unwrap_err();
     assert!(matches!(err, FatalError::Protocol(_)), "{err:?}");
     assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
-    assert!(events.has("C17"));
+    assert!(events.has("C9"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1040,7 +1040,7 @@ async fn the_farewell_is_not_sent_when_the_gap_is_over_the_cap() {
     s.disconnect().await;
     assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
     assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
-    assert!(events.has("C17"));
+    assert!(events.has("C9"));
 }
 
 #[tokio::test(start_paused = true)]
