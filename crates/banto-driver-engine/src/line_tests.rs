@@ -406,6 +406,13 @@ impl Bench {
         )
         .await
     }
+    fn driver_id(&self) -> DriverId {
+        self.driver.descriptor.id.clone()
+    }
+    /// ドライバを別の id のもの（別のプロトコル）に替える。
+    fn switch_driver(&mut self, id: &str) {
+        self.driver.descriptor.id = DriverId::new(id).unwrap();
+    }
     fn line(&self) -> Arc<Line> {
         self.table.line(&LineKey::of(&self.spec).unwrap()).unwrap()
     }
@@ -893,9 +900,11 @@ async fn a_lease_cancelled_while_opening_releases_the_reservation() {
     let bench = Bench::new(SyncPolicy::Distinct);
     let stuck = tokio::time::timeout(
         std::time::Duration::from_millis(100),
-        bench.table.lease(&bench.spec, None, || {
-            std::future::pending::<Result<Box<dyn Transport>, FatalError>>()
-        }),
+        bench
+            .table
+            .lease(&bench.spec, None, &bench.driver_id(), T, || {
+                std::future::pending::<Result<Box<dyn Transport>, FatalError>>()
+            }),
     )
     .await;
     assert!(stuck.is_err(), "開く待ちは終わらないので時間切れになる");
@@ -904,7 +913,9 @@ async fn a_lease_cancelled_while_opening_releases_the_reservation() {
     let wire = bench.wire.clone();
     let leased = bench
         .table
-        .lease(&bench.spec, None, || async move { wire.open() })
+        .lease(&bench.spec, None, &bench.driver_id(), T, || async move {
+            wire.open()
+        })
         .await;
     assert!(
         leased.is_ok(),
@@ -1269,7 +1280,13 @@ async fn a_synced_line_reopened_with_a_new_baud_starts_fresh_and_syncs_again() {
     let wire = bench.wire.clone();
     let (lease, start) = bench
         .table
-        .lease(&bench.spec, None, move || async move { wire.open() })
+        .lease(
+            &bench.spec,
+            None,
+            &bench.driver_id(),
+            T,
+            move || async move { wire.open() },
+        )
         .await
         .unwrap();
     assert!(
@@ -1318,7 +1335,13 @@ async fn an_unsynced_line_reopened_with_a_new_baud_keeps_its_outstanding_signatu
     let wire = bench.wire.clone();
     let (lease, start) = bench
         .table
-        .lease(&bench.spec, None, move || async move { wire.open() })
+        .lease(
+            &bench.spec,
+            None,
+            &bench.driver_id(),
+            T,
+            move || async move { wire.open() },
+        )
         .await
         .unwrap();
     assert!(matches!(start, LeaseStart::Unsynced), "未同期のまま");
@@ -1834,6 +1857,177 @@ async fn a_signature_is_kept_while_bytes_keep_arriving_on_the_line() {
 }
 
 /// 待っている署名の寿命 (d): `response_timeout` が短ければ下限の 10 秒、長ければ 10 倍。
+/// ドライバの切り替え（Codex P2、2026-10-23）の下ごしらえ: 持ち主 `task` のドライバ `serial-test`
+/// で A を時間切れにし、`Unsynced`・待っている署名 `[A]` の線を表へ返す（task はバックオフ中）。
+async fn time_out_a_as(bench: &Bench, task: LineOwner) {
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]),
+        Reaction::Silence,
+    ]);
+    let mut session = bench.connect_as(Some(task)).await.unwrap();
+    assert!(matches!(
+        read_one(&mut session, ADDR_A).await,
+        Err(FatalError::Timeout)
+    ));
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Unsynced);
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 1)]);
+}
+
+/// ドライバの切り替え (a): 接続のプロトコルを別の Frame ドライバに替えると（Hub は
+/// `remove → ensure_connection`。同じ `TransportSpec` なので同じ線）、新しいドライバは古い
+/// ドライバの署名を区切れも見分けもできない。寿命の切れていない署名が残る線は借りずに断り、
+/// 線の状態・署名・持ち主の印・ドライバの id は変えない（broker のバックオフで借り直す）。
+/// ドライバの判定を外すと、新しいドライバが古い署名を引き継いで同期を始めてしまう（反証）。
+#[tokio::test(start_paused = true)]
+async fn a_different_driver_is_refused_while_the_previous_drivers_signatures_are_outstanding() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    let key = LineKey::of(&bench.spec).unwrap();
+    let task = LineOwner::new();
+    time_out_a_as(&bench, task).await;
+    let line = bench.line();
+    assert_eq!(line.driver().unwrap().as_str(), "serial-test");
+    let sent = bench.wire.sent().len();
+
+    bench.switch_driver("other-protocol");
+    let new_task = LineOwner::new();
+    let Err(err) = bench.connect_as(Some(new_task)).await else {
+        panic!("別のドライバは、前のドライバの署名が残る線を借りない");
+    };
+    assert!(
+        matches!(&err, FatalError::Protocol(m) if m == "シリアルの線 mem:1 は前のドライバ serial-test の応答待ちが残っています。しばらく待ってから張り直してください"),
+        "{err:?}"
+    );
+    assert_eq!(bench.wire.sent().len(), sent, "何も送らない");
+    assert!(line.is_open(), "ポートは開いたまま表に残る");
+    assert_eq!(bench.wire.lock().opens, 1);
+    assert_eq!(bench.wire.lock().closes, 0);
+    assert_eq!(line.state(), SyncState::Unsynced, "状態は変わらない");
+    assert_eq!(
+        line.outstanding(),
+        vec![sig(FC_READ, 1)],
+        "署名は変わらない"
+    );
+    assert_eq!(
+        line.driver().unwrap().as_str(),
+        "serial-test",
+        "ドライバの id は変わらない"
+    );
+    assert!(
+        !bench.table.close_by(&key, new_task),
+        "持ち主の印は変わらない: 新しい task の解放は閉じない"
+    );
+    assert!(bench.table.close_by(&key, task), "古い task の解放が閉じる");
+}
+
+/// ドライバの切り替え (b): 寿命（送った後、線から何も届かない時間）が過ぎれば、別のドライバは
+/// 古い署名の無い `Fresh` の線を借り、同期から始める。ポートは開き直さない。
+#[tokio::test(start_paused = true)]
+async fn a_different_driver_leases_a_fresh_line_once_the_previous_signatures_have_expired() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    let task = LineOwner::new();
+    time_out_a_as(&bench, task).await;
+
+    tokio::time::sleep(stale_signature_ttl(T)).await;
+    bench.switch_driver("other-protocol");
+    let wire = bench.wire.clone();
+    let (lease, start) = bench
+        .table
+        .lease(
+            &bench.spec,
+            Some(LineOwner::new()),
+            &bench.driver_id(),
+            T,
+            move || async move { wire.open() },
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(start, LeaseStart::Fresh),
+        "{start:?}: 開いた直後の状態で貸す"
+    );
+    assert!(bench.outstanding().is_empty(), "寿命の過ぎた署名は忘れる");
+    assert_eq!(bench.line().driver().unwrap().as_str(), "other-protocol");
+    drop(lease);
+    assert_eq!(bench.state(), SyncState::Fresh);
+
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]); // 新しいドライバの同期
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty());
+    let sent = bench.wire.sent();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2], request(FC_PROBE, 0x00).send, "同期から始める");
+    assert_eq!(bench.wire.lock().opens, 1, "ポートは開き直さない");
+    assert_eq!(bench.wire.lock().closes, 0);
+}
+
+/// ドライバの切り替え (c)(d): 同期済みの線は、同じドライバには `Synced` のまま貸し（今どおり）、
+/// 別のドライバには `Fresh` で貸す（同期から始める）。ドライバの判定を外すと別のドライバが
+/// `Synced` を引き継ぎ、同期なしにデータの要求を送る（反証）。
+#[tokio::test(start_paused = true)]
+async fn a_synced_line_is_leased_synced_to_the_same_driver_and_fresh_to_a_different_one() {
+    let mut bench = Bench::new(SyncPolicy::Distinct);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Reply(vec![response(FC_READ, &[0x11])]),  // 2: A
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(
+        read_one(&mut session, ADDR_A).await.unwrap(),
+        RawValue::Uint(0x11)
+    );
+    drop(session);
+    assert_eq!(bench.state(), SyncState::Synced);
+
+    // (d) 同じドライバ: 同期済みのまま。
+    let wire = bench.wire.clone();
+    let (lease, start) = bench
+        .table
+        .lease(
+            &bench.spec,
+            None,
+            &bench.driver_id(),
+            T,
+            move || async move { wire.open() },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(start, LeaseStart::Synced), "{start:?}");
+    drop(lease);
+    assert_eq!(bench.state(), SyncState::Synced);
+
+    // (c) 別のドライバ: 開いた直後の状態で貸す。
+    bench.switch_driver("other-protocol");
+    let wire = bench.wire.clone();
+    let (lease, start) = bench
+        .table
+        .lease(
+            &bench.spec,
+            None,
+            &bench.driver_id(),
+            T,
+            move || async move { wire.open() },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(start, LeaseStart::Fresh), "{start:?}");
+    assert_eq!(bench.state(), SyncState::Fresh);
+    drop(lease);
+
+    bench
+        .wire
+        .react([Reaction::Reply(vec![response(FC_PROBE, &[0x55])])]); // 3: 新しいドライバの同期
+    let _session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    let sent = bench.wire.sent();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2], request(FC_PROBE, 0x00).send, "同期から始める");
+    assert_eq!(bench.wire.lock().opens, 1, "ポートは開き直さない");
+}
+
 #[test]
 fn the_stale_signature_ttl_is_ten_timeouts_but_at_least_ten_seconds() {
     assert_eq!(

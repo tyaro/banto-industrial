@@ -36,13 +36,22 @@
 //! 貸し出し中でなくても借りない（「使用中」で断る）。broker の task が致命の後のバックオフの
 //! 間に表へ返した線（`Unsynced`・待っている署名あり）を借りて印を書き換え、終わりに閉じると、
 //! task の待っている署名が消えて次のダイヤルが `Fresh` から始まる（§7.3 の保証が崩れる）。
+//!
+//! 線は最後に借りたドライバの id（[`DriverId`]）も覚える（Codex P2、2026-10-23）。署名はドライバに
+//! 不透明なバイト列で、`sync_step`・区切りの約束も自分のプロトコルの応答しか覆わないので、接続の
+//! プロトコルを別の Frame ドライバに替えたとき（Hub は `remove → ensure_connection`。同じ
+//! `TransportSpec` なら同じ線）、新しいドライバは古いドライバの `Unsynced` と署名を引き継がない:
+//! 寿命の切れていない署名が残っていれば（古いドライバの遅れた応答がまだ届きうる）借りずに断り
+//! （broker のバックオフで後から借り直す。寿命が過ぎれば借りられる）、残っていなければ線を開いた
+//! 直後の状態（`Fresh`。`Synced` も `Fresh` に）に戻して貸す。ポートは閉じない: 線の設定は同じで、
+//! 閉じて開き直しても機器と線は元のまま（§7.3）なので何も解決せず、変換器の送信待ちを失うだけ。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Duration;
 
-use banto_driver_api::{BoxFuture, FatalError, Signature};
+use banto_driver_api::{BoxFuture, DriverId, FatalError, Signature};
 use tokio::time::Instant;
 
 use crate::transport::{SerialPortName, Transport, TransportSpec};
@@ -149,6 +158,8 @@ struct LineInner {
     leased: bool,
     /// 最後に借りた（予約した）持ち主の印。印を持たない貸し出し（試験）は `None` のまま。
     owner: Option<LineOwner>,
+    /// 最後に借りた（予約した）ドライバの id（モジュールの doc）。まだ誰も借りていなければ `None`。
+    driver: Option<DriverId>,
     state: SyncState,
     outstanding: Vec<Pending>,
     /// 線から最後にバイトを受けた時刻（`quiet_from` と違い、送り終えの見積もりは含まない）。
@@ -164,6 +175,19 @@ struct LineInner {
     /// ポートを閉じて開き直しても消さない: `SerialOverTcp` は変換器の側に送信待ちが残りうるし、
     /// 機器の応答が線の上にまだありうる。残しても遅れは高々 `inter_frame_gap`（≤ 500 ms）。
     quiet_from: Option<Instant>,
+}
+
+impl LineInner {
+    /// [`Line::forget_stale`] の本体（線のロックを持つ呼び手のため）。
+    fn forget_stale(&mut self, now: Instant, ttl: Duration) -> usize {
+        let last_rx = self.last_rx;
+        let before = self.outstanding.len();
+        self.outstanding.retain(|p| {
+            let from = last_rx.map_or(p.since, |rx| rx.max(p.since));
+            now.saturating_duration_since(from) < ttl
+        });
+        before - self.outstanding.len()
+    }
 }
 
 /// 1 本の線。
@@ -222,14 +246,12 @@ impl Line {
     /// 時間」が `ttl` に達した署名が対象（`now - max(送った時刻, last_rx) >= ttl`）。
     /// 状態は変えない（`Unsynced` のまま。同期の手順は必ず走る）。
     pub(crate) fn forget_stale(&self, now: Instant, ttl: Duration) -> usize {
-        let mut inner = self.lock();
-        let last_rx = inner.last_rx;
-        let before = inner.outstanding.len();
-        inner.outstanding.retain(|p| {
-            let from = last_rx.map_or(p.since, |rx| rx.max(p.since));
-            now.saturating_duration_since(from) < ttl
-        });
-        before - inner.outstanding.len()
+        self.lock().forget_stale(now, ttl)
+    }
+
+    /// 最後に借りたドライバの id（まだ誰も借りていなければ `None`）。
+    pub fn driver(&self) -> Option<DriverId> {
+        self.lock().driver.clone()
     }
 
     /// ポートが開いているか（貸し出し中も含む）。
@@ -464,11 +486,15 @@ impl LineTable {
     /// 線の設定が変わっていれば古いポートを閉じて開き直す。`owner` は予約と同時に線に記録する
     /// （[`Self::close_by`] が見る）。`owner` が 1 回きりの印（[`LineOwner::one_shot`]）なら、
     /// 別の持ち主の印の線は貸し出し中でなくても借りずに「使用中」で断る（線の印・状態・待っている
-    /// 署名は変えない）。
+    /// 署名は変えない）。`driver` は借りるドライバの id: 線に最後に記録されたドライバと違えば、
+    /// 寿命（`response_timeout` から [`crate::stale_signature_ttl`]）の切れていない署名が残る線は
+    /// 借りずに断り、残っていなければ `Fresh` に戻して貸す（モジュールの doc）。
     pub(crate) async fn lease<F>(
         &self,
         spec: &TransportSpec,
         owner: Option<LineOwner>,
+        driver: &DriverId,
+        response_timeout: Duration,
         open: impl FnOnce() -> F,
     ) -> Result<(LineLease, LeaseStart), FatalError>
     where
@@ -503,6 +529,7 @@ impl LineTable {
                         spec: None,
                         leased: false,
                         owner: None,
+                        driver: None,
                         state: SyncState::Fresh,
                         outstanding: Vec::new(),
                         last_rx: None,
@@ -529,6 +556,20 @@ impl LineTable {
                 if inner.quarantined {
                     return Err(quarantine_error(&key));
                 }
+                if let Some(previous) = inner.driver.clone().filter(|d| d != driver) {
+                    // ドライバが替わった（モジュールの doc）。古いドライバの署名を新しいドライバは
+                    // 区切れも見分けもできないので、寿命の切れていない署名が残る間は借りない。
+                    let ttl = crate::stale_signature_ttl(response_timeout);
+                    inner.forget_stale(Instant::now(), ttl);
+                    if !inner.outstanding.is_empty() {
+                        return Err(FatalError::Protocol(format!(
+                            "シリアルの線 {key} は前のドライバ {previous} の応答待ちが残っています。しばらく待ってから張り直してください"
+                        )));
+                    }
+                    // 古いドライバの応答はもう来ない（寿命）。線を開いた直後の状態に戻し、新しい
+                    // ドライバは同期から始める（`Synced` も引き継がない）。ポートは開いたまま。
+                    inner.state = SyncState::Fresh;
+                }
                 if inner.spec.as_ref() != Some(spec) {
                     // 線の設定が変わった。開いたままのポートは閉じる（表に戻さない）。
                     drop(inner.transport.take());
@@ -543,6 +584,7 @@ impl LineTable {
                 if owner.is_some() {
                     inner.owner = owner;
                 }
+                inner.driver = Some(driver.clone());
                 inner.transport.take()
             };
             drop(lines);

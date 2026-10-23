@@ -205,7 +205,9 @@ impl FrameSession {
     where
         F: std::future::Future<Output = Result<Box<dyn Transport>, FatalError>>,
     {
-        let (lease, start) = table.lease(spec, owner, open).await?;
+        let (lease, start) = table
+            .lease(spec, owner, &driver.descriptor().id, response_timeout, open)
+            .await?;
         Self::start(
             driver,
             settings,
