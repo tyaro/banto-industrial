@@ -261,8 +261,9 @@ impl SerialPortName {
         let all_digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
         if text.len() >= 3 && text.is_char_boundary(3) && text[..3].eq_ignore_ascii_case("COM") {
             let digits = &text[3..];
+            // 1〜256 を明示する（`COM0` は無い。先頭の 0 の検査だけに頼らない。Codex P2）。
             let number = if all_digits(digits) && !digits.starts_with('0') {
-                digits.parse::<u16>().ok().filter(|n| *n <= 256)
+                digits.parse::<u16>().ok().filter(|n| (1..=256).contains(n))
             } else {
                 None
             };
@@ -561,7 +562,8 @@ mod tests {
         for text in [
             "",
             "COM",
-            "COM0",
+            "COM0", // 1 未満（先頭の 0 でも、範囲でも断る）
+            "COM00",
             "COM257",
             "COM01",
             "COM1:",
