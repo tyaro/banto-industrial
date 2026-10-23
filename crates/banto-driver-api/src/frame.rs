@@ -326,6 +326,11 @@ pub trait FrameConnection: Send + 'static {
     /// step must delimit the first frame of its input at the right length
     /// for the response (normal or exception) to **any** request that can be
     /// sent on that line, not only for the sync request's own response.
+    /// The sync step's `max_len` must be no shorter than **any** response
+    /// that can flow on that line (handshake, read and write responses; C17,
+    /// 2026-10-23): a late response longer than it is still delimited and
+    /// skipped by its own length (up to the engine's cap), but it is never
+    /// accepted as the sync response.
     fn sync_step(&mut self, _outstanding: &[Signature]) -> Option<Step> {
         None
     }

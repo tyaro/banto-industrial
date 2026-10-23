@@ -144,6 +144,8 @@ enum SyncPolicy {
     Colliding,
     /// 契約違反: 同期の step を `Fixed` で区切る（FC4 の 1 語、4 バイト）。
     Fixed,
+    /// FC4 の 1 語を、`max_len` を同期の応答の長さ（4 バイト）ちょうどにして選ぶ。
+    ShortMaxLen,
 }
 
 #[derive(Clone)]
@@ -185,6 +187,13 @@ impl FrameConnection for Conn {
                     request(FC_PROBE, 0x00).send,
                     FrameRule::Fixed(4),
                     16,
+                ))
+            }
+            SyncPolicy::ShortMaxLen => {
+                return Some(Step::new(
+                    request(FC_PROBE, 0x00).send,
+                    FrameRule::DriverDecides,
+                    4,
                 ))
             }
         };
@@ -490,6 +499,51 @@ async fn a_stale_response_of_another_length_joined_with_the_sync_response_syncs_
     let mut session = bench.connect().await.unwrap();
     assert_eq!(bench.state(), SyncState::Synced);
     assert!(bench.outstanding().is_empty());
+    assert_eq!(
+        read_one(&mut session, ADDR_B).await.unwrap(),
+        RawValue::Uint(0xBB)
+    );
+    assert_eq!(
+        bench.wire.sent(),
+        vec![
+            request(FC_PROBE, 0x00).send,
+            request(FC_READ, ADDR_WIDE).send,
+            request(FC_PROBE, 0x00).send,
+            request(FC_READ, ADDR_B).send,
+        ],
+        "同期の要求は 1 回で済む"
+    );
+}
+
+/// オーナーの P2（#801）: 同期の step の `max_len` が同期の応答の長さ（4 バイト）ちょうどで、
+/// それより長い古い応答（2 語・5 バイト）と同期の応答が 1 回の recv で連結して届く。古い応答は
+/// 同期の step の形で区切れるので、`max_len` を超えても区切れた長さだけ捨て、後ろの同期の応答を
+/// 残す（`buf` を丸ごと捨てない）。1 回目の同期の要求で同期し、古い署名が消える。
+#[tokio::test(start_paused = true)]
+async fn a_stale_response_longer_than_the_sync_max_len_is_skipped_by_its_own_length() {
+    const ADDR_WIDE: u8 = 0xF1; // 2 語の読み取り（署名 FC3・2 語）
+    let bench = Bench::new(SyncPolicy::ShortMaxLen);
+    bench.wire.react([
+        Reaction::Reply(vec![response(FC_PROBE, &[0x55])]), // 1: 開いた直後の同期
+        Reaction::Silence,                                  // 2: 2 語の A は時間切れ
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert!(matches!(
+        read_one(&mut session, ADDR_WIDE).await,
+        Err(FatalError::Timeout)
+    ));
+    assert_eq!(bench.outstanding(), vec![sig(FC_READ, 2)]);
+    drop(session);
+
+    let mut joined = response(FC_READ, &[0xAA, 0xAB]);
+    joined.extend_from_slice(&response(FC_PROBE, &[0x55]));
+    bench.wire.react([
+        Reaction::Reply(vec![joined]), // 3: 同期の要求（1 回の recv）
+        Reaction::Reply(vec![response(FC_READ, &[0xBB])]), // 4: B
+    ]);
+    let mut session = bench.connect().await.unwrap();
+    assert_eq!(bench.state(), SyncState::Synced);
+    assert!(bench.outstanding().is_empty(), "古い署名は消える");
     assert_eq!(
         read_one(&mut session, ADDR_B).await.unwrap(),
         RawValue::Uint(0xBB)

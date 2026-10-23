@@ -41,6 +41,13 @@ pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 /// 待ちは step の応答の期限 T の中に入る（T がこれより短ければ、待ちの途中で期限が来て `Timeout` になる）。
 /// 300 baud 8N1 の t3.5 でも約 117 ms。
 pub const MAX_INTER_FRAME_GAP: Duration = Duration::from_millis(500);
+/// 同期の手順（設計 §7.3 の 2）の途中で、1 つのフレームを区切るときの長さの上限（バイト）。
+/// 同期の途中に届く古い応答は同期の step の形で区切るが、その長さは同期の step の `max_len`
+/// に縛らない（古い応答が同期の応答より長くても、区切れた長さで捨てて後ろのバイトを残す）。
+/// バッファが際限なく育たないよう、`max(同期の step の max_len, これ)` で止め、超えたら捨てる。
+/// 64 KiB は、シリアルの線に流れるどの応答（Modbus RTU の ADU は 256 バイト、SLMP も数 KiB）
+/// よりも十分に大きく、受信の溜めとしては小さい。エンジンに既存の上限は無いので明示の値を置く。
+pub const MAX_SYNC_FRAME_LEN: u32 = 64 * 1024;
 
 /// 適合テストとホストの診断で観測する出来事。通信の結果は変えない。
 #[derive(Debug, Clone)]
@@ -466,11 +473,15 @@ impl Core {
             let guard = line.begin(Some(signature.clone()));
             let deadline = self.send_step(&step).await?;
             let mut buf = Vec::new();
+            // 古い応答は同期の step の `max_len` より長いことがあるので、区切りは大きい上限で
+            // 行い、同期の応答として受けるのは `max_len` 以下のときだけにする。
+            let limit = step.max_len.max(MAX_SYNC_FRAME_LEN) as usize;
             let synced = loop {
-                match self.recv_frame(&step, &mut buf, deadline).await {
+                match self.recv_frame(&step, &mut buf, deadline, limit).await {
                     Ok(len) => {
                         let frame = &buf[..len];
-                        if self.conn.response_matches(&signature, frame) {
+                        let fits = len <= step.max_len as usize;
+                        if fits && self.conn.response_matches(&signature, frame) {
                             break true;
                         }
                         // 待っている要求への古い応答なら、その要求はもう待っていない。
@@ -484,13 +495,15 @@ impl Core {
                             line = %line.key(),
                             stale = stale.is_some(),
                             len,
+                            fits,
                             "同期の手順の途中で届いたフレームを捨てた"
                         );
                         buf.drain(..len);
                     }
                     Err(FatalError::Timeout) => break false,
                     Err(FatalError::Framing(detail)) => {
-                        // 崩れた・長すぎる受信は捨てて待ち続ける（期限は延びない）。
+                        // 崩れた受信・`limit` までに区切れない受信は捨てて待ち続ける（期限は延びない）。
+                        // 区切れたフレームは `max_len` を超えても上の `Ok` で区切れた長さだけ捨てる。
                         tracing::debug!(line = %line.key(), %detail, "同期の手順の受信を捨てた");
                         buf.clear();
                     }
@@ -710,7 +723,9 @@ impl Core {
             return Ok(Vec::new());
         }
         let mut buf = Vec::new();
-        let len = self.recv_frame(step, &mut buf, deadline).await?;
+        let len = self
+            .recv_frame(step, &mut buf, deadline, step.max_len as usize)
+            .await?;
         buf.truncate(len);
         if let Some((guard, signature)) = tracked {
             // 同期した後に別の要求への応答が来たら Framing（未同期に戻る。§7.3 の末尾）。
@@ -767,24 +782,27 @@ impl Core {
 
     /// `buf` に完結した応答が 1 つ入るまで受け、その長さを返す（`buf` の先頭の `len` バイト。
     /// 残りは呼び手が捨てる）。`buf` に前の受信の残りがあれば、recv の前にそれを調べる。
+    /// `limit` は 1 つのフレームの長さの上限で、超えたら（区切れても区切れなくても）`Framing`。
+    /// 普通の step は `max_len`（超えたら致命）、同期の手順は [`MAX_SYNC_FRAME_LEN`] を渡す。
     async fn recv_frame(
         &mut self,
         step: &Step,
         buf: &mut Vec<u8>,
         deadline: Instant,
+        limit: usize,
     ) -> Result<usize, FatalError> {
         loop {
             // 先に `buf` に残っているバイトを調べる。同期の手順では、古い応答と同期の応答が
             // 1 回の受信でまとめて届き、古い応答を捨てた後に同期の応答がもう `buf` にある（§7.3）。
             // それ以上は届かないので、recv を先に待つと時間切れになる。
             if !buf.is_empty() {
-                if let Some(len) = self.check_complete(step, buf)? {
-                    if len > step.max_len as usize {
+                if let Some(len) = self.check_complete(step, buf, limit)? {
+                    if len > limit {
                         return Err(FatalError::Framing("応答が max_len を超えた".into()));
                     }
                     return Ok(len);
                 }
-                if buf.len() >= step.max_len as usize {
+                if buf.len() >= limit {
                     return Err(FatalError::Framing(
                         "応答が max_len までに完結しない".into(),
                     ));
@@ -856,10 +874,11 @@ impl Core {
         &mut self,
         step: &Step,
         buf: &mut Vec<u8>,
+        limit: usize,
     ) -> Result<Option<usize>, FatalError> {
         match &step.expect {
             FrameRule::Fixed(n) => Ok((buf.len() >= *n as usize).then_some(*n as usize)),
-            FrameRule::LengthPrefixed(p) => self.prefixed_len(p, step.max_len, buf),
+            FrameRule::LengthPrefixed(p) => self.prefixed_len(p, limit, buf),
             FrameRule::Terminator(t) => Ok(buf
                 .windows(t.len())
                 .position(|w| w == &t[..])
@@ -914,7 +933,7 @@ impl Core {
     fn prefixed_len(
         &mut self,
         p: &PrefixSpec,
-        max_len: u32,
+        max_len: usize,
         buf: &[u8],
     ) -> Result<Option<usize>, FatalError> {
         let start = p.offset as usize;
@@ -968,7 +987,7 @@ impl Core {
             )));
         };
         let total = value as i128 + i128::from(p.adjust);
-        if total < need as i128 || total > i128::from(max_len) {
+        if total < need as i128 || total > max_len as i128 {
             return Err(FatalError::Framing(format!(
                 "長さ欄が総長 {total} を示す（{need}..={max_len} の外）"
             )));

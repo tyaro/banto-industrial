@@ -20,7 +20,7 @@
 //! | C10 | (`capabilities.write` only) all of `fixtures.writes` - pairwise non-adjacent addresses - written as one batch succeed, no write step covers two of them, and each reads back as its `expected` value; the step count stays within `3 × items + 8` (C16) |
 //! | C11 | 1,000 random byte strings (fixed seed, up to `max_len`, at most 4 KiB) into `decode_read`, `is_complete` (for `DriverDecides` steps) and `handshake_next` never panic |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
-//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a planned read step's response followed by the sync response is delimited by the sync step at the read response's length; every step it sends with a response - the handshake's, each planned read's and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature (2026-10-23) |
+//! | C17 | (drivers whose `transports` name `Serial` / `SerialOverTcp` only) the connection has a resynchronisation procedure (io-design §7.3): `sync_step` returns a step with nothing outstanding and again with that step's signature outstanding, each with a `signature`, pairwise different, answered by the responder so that `response_matches` accepts it; the sync step's `expect` is not `Fixed` (2026-10-23), and a planned read step's response followed by the sync response is delimited by the sync step at the read response's length; every step it sends with a response - the handshake's, each planned read's and (`capabilities.write` only) each `write_next` step for `fixtures.writes` - has a `signature`, and `response_matches` accepts the responder's response to it under that signature, and none of those responses is longer than the sync step's `max_len` (2026-10-23) |
 //!
 //! ## Comparing a value with its expected one
 //!
@@ -294,6 +294,9 @@ fn c17_serial_sync(
         }
     };
     peer.on_connect();
+    // 応答を待つ step（ハンドシェイク・読み取り・書き込み）への機器の応答の長さ。同期の step の
+    // `max_len` がどれ以上かを最後に確かめる（同期の途中には、これらの古い応答も届く）。
+    let mut answered: Vec<(String, usize)> = Vec::new();
     // ハンドシェイクの応答を待つ step も、署名を持ち、機器の応答をその署名で認める
     // （シリアルの線ではエンジンが `response_matches` で照合し、認めなければ `Framing` で断る）。
     let mut previous: Option<Vec<u8>> = None;
@@ -310,8 +313,14 @@ fn c17_serial_sync(
             previous = Some(Vec::new());
             continue;
         }
-        let Some(response) = c17_answered(conn.as_ref(), peer, "ハンドシェイク", &step, &mut fail)
-        else {
+        let Some(response) = c17_answered(
+            conn.as_ref(),
+            peer,
+            "ハンドシェイク",
+            &step,
+            &mut fail,
+            &mut answered,
+        ) else {
             return;
         };
         previous = Some(response);
@@ -319,6 +328,8 @@ fn c17_serial_sync(
     let mut outstanding = Vec::new();
     // 最初の同期の要求とその応答（古い応答との連結の区切りを確かめるのに使う）。
     let mut first_sync: Option<(Step, Vec<u8>)> = None;
+    // 同期の step の `max_len` のうち最も小さいもの。
+    let mut sync_max_len = u32::MAX;
     for attempt in 1..=2 {
         let Some(step) = conn.sync_step(&outstanding) else {
             fail(format!(
@@ -361,6 +372,7 @@ fn c17_serial_sync(
                 step.send
             ));
         }
+        sync_max_len = sync_max_len.min(step.max_len);
         if first_sync.is_none() {
             first_sync = Some((step, response));
         }
@@ -375,7 +387,14 @@ fn c17_serial_sync(
                 continue;
             }
             let what = format!("{:?} の読み取り", prepared.case.text);
-            let Some(stale) = c17_answered(conn.as_ref(), peer, &what, &p.step, &mut fail) else {
+            let Some(stale) = c17_answered(
+                conn.as_ref(),
+                peer,
+                &what,
+                &p.step,
+                &mut fail,
+                &mut answered,
+            ) else {
                 continue;
             };
             // 同期の途中に届く古い応答も同期の step の形で区切られる（エンジンの契約）。
@@ -395,7 +414,24 @@ fn c17_serial_sync(
             }
         }
     }
-    c17_writes(driver, fixtures, conn.as_mut(), peer, &mut fail);
+    c17_writes(
+        driver,
+        fixtures,
+        conn.as_mut(),
+        peer,
+        &mut fail,
+        &mut answered,
+    );
+    // 同期の step の `max_len` は、その線に流れるどの応答の長さ以上にする（2026-10-23、#801 の
+    // オーナー P2）。短いと、同期の途中に届いた古い応答を正しく区切れても同期の応答として受けられず、
+    // エンジンは区切れた長さで捨てるだけになる（契約としては、どの応答も `max_len` に収める）。
+    for (what, len) in answered {
+        if len > sync_max_len as usize {
+            fail(format!(
+                "{what}の応答（{len} バイト）が同期の step の max_len（{sync_max_len}）を超える（同期の step の max_len は線に流れるどの応答の長さ以上にする）"
+            ));
+        }
+    }
 }
 
 /// C17: 書けるドライバの書き込みの step（`write_next` が返す、応答を待つもの）も、署名を持ち、
@@ -406,6 +442,7 @@ fn c17_writes(
     conn: &mut dyn FrameConnection,
     peer: &mut dyn Responder,
     fail: &mut dyn FnMut(String),
+    answered: &mut Vec<(String, usize)>,
 ) {
     if !driver.descriptor().capabilities.write {
         return;
@@ -435,7 +472,8 @@ fn c17_writes(
             previous = Some(Vec::new());
             continue;
         }
-        let Some(response) = c17_answered(conn, peer, "書き込み", &planned.step, fail) else {
+        let Some(response) = c17_answered(conn, peer, "書き込み", &planned.step, fail, answered)
+        else {
             return;
         };
         previous = Some(response);
@@ -445,12 +483,14 @@ fn c17_writes(
 /// C17: 応答を待つ `step` が署名を持ち、機器の応答を `response_matches` がその署名で認めるか。
 /// シリアルの線のエンジンは、認めない応答を別の要求への応答として `Framing` で断る。
 /// 機器の応答（認めなくても）を返し、署名が無いか機器が応えないときは `None`。
+/// 応答の長さを `answered` に足す（同期の step の `max_len` の検査に使う）。
 fn c17_answered(
     conn: &dyn FrameConnection,
     peer: &mut dyn Responder,
     what: &str,
     step: &Step,
     fail: &mut dyn FnMut(String),
+    answered: &mut Vec<(String, usize)>,
 ) -> Option<Vec<u8>> {
     let Some(signature) = conn.signature(step) else {
         fail(format!(
@@ -470,6 +510,7 @@ fn c17_answered(
             step.send
         ));
     }
+    answered.push((what.to_owned(), response.len()));
     Some(response)
 }
 
@@ -1140,6 +1181,8 @@ mod tests {
         handshake: bool,
         /// `response_matches` が同期の要求（`1`・`2`）への応答だけを認める（C17 が落ちるべき形）。
         matches_sync_only: bool,
+        /// 同期の step の `max_len`（既定 16。読み取りの応答 3 バイトより短いと C17 が落ちる）。
+        sync_max_len: u32,
     }
     impl SerialDriver {
         fn new(sync: bool, collide: bool) -> Self {
@@ -1157,6 +1200,7 @@ mod tests {
                 rule: SyncRule::Terminator,
                 handshake: false,
                 matches_sync_only: false,
+                sync_max_len: 16,
             }
         }
     }
@@ -1191,6 +1235,7 @@ mod tests {
                 rule: self.rule,
                 handshake: self.handshake,
                 matches_sync_only: self.matches_sync_only,
+                sync_max_len: self.sync_max_len,
             }))
         }
     }
@@ -1200,6 +1245,7 @@ mod tests {
         rule: SyncRule,
         handshake: bool,
         matches_sync_only: bool,
+        sync_max_len: u32,
     }
     impl FrameConnection for SerialConn {
         fn handshake_next(&mut self, prev: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
@@ -1223,7 +1269,7 @@ mod tests {
                         SyncRule::Fixed => FrameRule::Fixed(2),
                         SyncRule::Decides | SyncRule::DecidesSyncOnly => FrameRule::DriverDecides,
                     };
-                    Step::new(vec![*c, b'\n'], expect, 16)
+                    Step::new(vec![*c, b'\n'], expect, self.sync_max_len)
                 })
         }
         fn response_matches(&self, signature: &Signature, response: &[u8]) -> bool {
@@ -1348,6 +1394,39 @@ mod tests {
                 .iter()
                 .any(|f| f.starts_with("C17") && f.contains("区切れない")),
             "{sync_only:?}"
+        );
+    }
+
+    #[test]
+    fn c17_requires_a_sync_max_len_no_shorter_than_any_response_on_the_line() {
+        let fixtures = FrameFixtures::new(StaticFixtures::new(Settings::new()));
+        let case = ReadCase::new("D0", TagKind::numeric(DataType::U16), RawValue::Uint(0));
+        let run = |sync_max_len: u32| {
+            let mut driver = SerialDriver::new(true, false);
+            driver.sync_max_len = sync_max_len;
+            let reads = vec![Prepared {
+                case: &case,
+                spec: TagSpec::new(
+                    driver.parse_address(&case.text, &case.kind).unwrap(),
+                    case.kind.clone(),
+                ),
+            }];
+            let mut failures = Vec::new();
+            c17_serial_sync(&driver, &fixtures, &reads, &mut Echo, &mut failures);
+            failures
+                .iter()
+                .map(|f| format!("{}: {}", f.id, f.detail))
+                .collect::<Vec<_>>()
+        };
+        // 読み取りの応答（Echo で 3 バイト）は、同期の応答（2 バイト）より長い。
+        let fits = run(3);
+        assert!(fits.is_empty(), "{fits:?}");
+        let short = run(2);
+        assert!(
+            short
+                .iter()
+                .any(|f| f.starts_with("C17") && f.contains("max_len（2）を超える")),
+            "{short:?}"
         );
     }
 
