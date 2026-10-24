@@ -53,6 +53,7 @@
 		deleteTag,
 		listCollectionGroups,
 		listPlcConnections,
+		listDrivers,
 		createTagsBatch,
 		updateTagsBatch,
 		deleteTagsBatch,
@@ -79,6 +80,7 @@
 		type CollectionGroup,
 		type PlcConnection,
 		type PlcProtocol,
+		type DriverInfo,
 		type DescribeColumn,
 		type BatchTagsResult,
 		type BatchTagsUpdateResult,
@@ -164,6 +166,10 @@
 		fieldErrorsFromList
 	} from '#lib/banto/tagFormLayout.js';
 	import { addressHelpFor } from '#lib/banto/tagAddressHelp.js';
+	import {
+		dataTypeOptionsFor as dataTypeOptionsForConnection,
+		type DataTypeOption
+	} from '#lib/banto/tagDataTypeOptions.js';
 	import { carryFormForNext } from '#lib/banto/tagFormCarry.js';
 	import { buildDuplicateFormValues } from '#lib/banto/tagDuplicate.js';
 	import { nextTagNameOnAddressChange } from '#lib/banto/tagNamePrefill.js';
@@ -217,33 +223,32 @@
 		completionOptionId
 	} from '#lib/components/CompletionPopup.svelte';
 
-	const dataTypeOptions: { value: TagDataType; label: string }[] = [
-		{ value: 'bit', label: 'bit（真偽値1点）' },
-		{ value: 'i16', label: 'i16（符号あり16bit）' },
-		{ value: 'u16', label: 'u16（符号なし16bit）' },
-		{ value: 'i32', label: 'i32（符号あり32bit）' },
-		{ value: 'u32', label: 'u32（符号なし32bit）' },
-		{ value: 'f32', label: 'f32（浮動小数点32bit）' },
-		{ value: 'i64', label: 'i64（符号あり64bit）' },
-		{ value: 'u64', label: 'u64（符号なし64bit）' },
-		{ value: 'f64', label: 'f64（浮動小数点64bit・倍精度）' },
-		{ value: 'string', label: 'string（文字列）' }
-	];
+	/**
+	 * R2b-6d-2b: タグ画面で `GET /api/drivers` を 1 回読んで id で引けるようにする。読めなくても
+	 * 画面は動く（失敗時は空のままで、ホストの表と未選択の説明に落ちる）。
+	 */
+	let drivers: DriverInfo[] = $state.raw([]);
+
+	async function loadDrivers(): Promise<void> {
+		try {
+			drivers = await listDrivers();
+		} catch {
+			drivers = [];
+		}
+	}
+
+	/** 接続のプロトコル（= ドライバの id）に対応する記述子。ホストの接続・未選択・未着は `undefined`。 */
+	function driverFor(protocol: PlcProtocol | undefined): DriverInfo | undefined {
+		return protocol === undefined ? undefined : drivers.find((d) => d.id === protocol);
+	}
 
 	/**
-	 * #325（2026-09-08 オーナー決定）: 64bit 型（`MODBUS_ONLY_DATA_TYPES`）は
-	 * `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる
-	 * （サーバー側 `banto-tags` が最終防衛線として拒否する）。UI 側でも
-	 * データ型プルダウンの選択肢自体をここで絞る - `protocol` が未確定
-	 * （収集グループ未選択、または `computed`/`internal`/`db` タグのように
-	 * そもそも PLC 接続配下にないグループ）のときは安全側で64bit型を出さない。
+	 * データ型プルダウンの選択肢。ドライバの接続は `supportedKinds`、それ以外はホストの表
+	 * （`#lib/banto/tagDataTypeOptions`）。#325（2026-09-08 オーナー決定）: 64bit 型は
+	 * ホストの表では `push` だけが出す（サーバー側 `banto-tags` が最終防衛線として拒否する）。
 	 */
-	function dataTypeOptionsFor(protocol: PlcProtocol | undefined): typeof dataTypeOptions {
-		if (protocol === 'modbus-tcp') return dataTypeOptions;
-		// R2a-2e（docs/banto-hub-ingest-design.md §3.3）: push のタグは数値（64bit を
-		// 含む）と bit だけ。string は送れない（サーバーの `push_tag_errors` が断る）。
-		if (protocol === 'push') return dataTypeOptions.filter((opt) => opt.value !== 'string');
-		return dataTypeOptions.filter((opt) => !MODBUS_ONLY_DATA_TYPES.includes(opt.value));
+	function dataTypeOptionsFor(protocol: PlcProtocol | undefined): DataTypeOption[] {
+		return dataTypeOptionsForConnection(protocol, driverFor(protocol));
 	}
 
 	/**
@@ -731,6 +736,7 @@
 	$effect(() => {
 		void reload();
 		void loadHubStatus();
+		void loadDrivers();
 	});
 
 	/**
@@ -5226,7 +5232,7 @@
 				安全。
 			-->
 			{@const protocol = connectionForGroupId(form.collectionGroupId)?.protocol}
-			{@const addressHelp = addressHelpFor(protocol, form.dataType)}
+			{@const addressHelp = addressHelpFor(protocol, form.dataType, driverFor(protocol))}
 			{@const preflightFieldErrors = addressPreflight.result
 				? fieldErrorsFromList(addressPreflight.result.errors[0]?.fieldErrors ?? [])
 				: {}}
@@ -5246,13 +5252,18 @@
 					placeholder={addressHelp.placeholder}
 					aria-invalid={errors.address ? 'true' : undefined}
 					aria-describedby={describedBy(
+						addressHelp.driverHelp !== '' && 'tag-address-driver-help',
 						'tag-address-hint',
 						addressHelp.examples.length > 0 && 'tag-address-examples',
-						'tag-address-bit-hint',
+						addressHelp.bitHint !== '' && 'tag-address-bit-hint',
 						preflightMessage !== null && 'tag-address-preflight',
 						errors.address && 'tag-address-err'
 					)}
 				/>
+				{#if addressHelp.driverHelp !== ''}
+					<span class="hint driver-help" id="tag-address-driver-help">{addressHelp.driverHelp}</span
+					>
+				{/if}
 				<span class="hint" id="tag-address-hint"
 					>{addressHelp.deviceHint}{#if addressHelp.occupancyHint !== ''}
 						{addressHelp.occupancyHint}{/if}</span
@@ -5264,7 +5275,9 @@
 							.join('、')}</span
 					>
 				{/if}
-				<span class="hint" id="tag-address-bit-hint">{addressHelp.bitHint}</span>
+				{#if addressHelp.bitHint !== ''}
+					<span class="hint" id="tag-address-bit-hint">{addressHelp.bitHint}</span>
+				{/if}
 				{#if preflightMessage !== null}
 					<span
 						class="hint address-preflight"
@@ -8283,6 +8296,11 @@
 	.hint {
 		font-size: 0.7rem;
 		color: var(--banto-text-muted);
+	}
+
+	/* R2b-6d-2b: ドライバの addressHelp は複数行。改行を保って表示する。 */
+	.hint.driver-help {
+		white-space: pre-line;
 	}
 
 	/*

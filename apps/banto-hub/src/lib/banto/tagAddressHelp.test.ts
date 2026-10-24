@@ -1,114 +1,83 @@
 /**
- * `tagAddressHelp.ts`（T18-2b、docs/banto-hub-desktop-plan.md §9.4 TAG-UX-6 /
- * TAG-UX-B）に対するユニットテスト。`tagFormLayout.test.ts` と同じスタイル
- * （describe/it、依存ゼロの純関数を直接 import）。
+ * `tagAddressHelp.ts`（T18-2b、R2b-6d-2b、docs/banto-hub-driver-ui-design.md §7）に対する
+ * ユニットテスト。`tagFormLayout.test.ts` と同じスタイル（describe/it、依存ゼロの純関数を
+ * 直接 import）。ドライバは `configPackageTestDrivers.ts` の偽の記述子に `addressHelp` を足す。
  */
 import { describe, expect, it } from 'vitest';
 import { addressHelpFor } from './tagAddressHelp';
+import { MODBUS_DRIVER, SLMP_DRIVER } from './configPackageTestDrivers';
+import type { DriverInfo, TagDataType } from './tagRegistryAdmin';
 
-describe('addressHelpFor: slmp', () => {
-	it('SLMP デバイス表記の例を返す（D100 を含む）', () => {
-		const help = addressHelpFor('slmp', 'f32');
-		expect(help.examples.some((e) => e.address === 'D100')).toBe(true);
-		expect(help.examples.length).toBeGreaterThan(0);
-	});
+const SLMP_WITH_HELP: DriverInfo = {
+	...SLMP_DRIVER,
+	addressHelp: 'MELSEC のデバイス記法です。\n例: D100 / M50 / D100.F'
+};
+const MODBUS_WITH_HELP: DriverInfo = {
+	...MODBUS_DRIVER,
+	addressHelp: '5 桁の参照番号です。\n例: 40001'
+};
 
-	it('プレースホルダは D100 系のビット指定込み', () => {
-		expect(addressHelpFor('slmp', 'f32').placeholder).toContain('D100');
-	});
-
-	it('bit 型: ビットデバイス1点指定のヒント', () => {
-		expect(addressHelpFor('slmp', 'bit').occupancyHint).toContain('ビットデバイス');
-	});
-
-	it('i16/u16: ワード1点分のヒント', () => {
-		expect(addressHelpFor('slmp', 'i16').occupancyHint).toContain('1点');
-		expect(addressHelpFor('slmp', 'u16').occupancyHint).toContain('1点');
-	});
-
-	it('i32/u32/f32: ワード2点連続のヒント', () => {
-		for (const dt of ['i32', 'u32', 'f32'] as const) {
-			expect(addressHelpFor('slmp', dt).occupancyHint).toContain('2点');
+describe('addressHelpFor: ドライバの接続', () => {
+	it('文法の説明はドライバの addressHelp をそのまま（改行も保って）返す', () => {
+		for (const d of [SLMP_WITH_HELP, MODBUS_WITH_HELP]) {
+			const help = addressHelpFor(d.id, 'f32', d);
+			expect(help.driverHelp).toBe(d.addressHelp);
 		}
 	});
 
-	it('#325: i64/u64/f64: ワード4点連続のヒント', () => {
-		for (const dt of ['i64', 'u64', 'f64'] as const) {
-			expect(addressHelpFor('slmp', dt).occupancyHint).toContain('4点');
+	it('ホストの表（例・デバイス・bit の説明・placeholder）は混ぜない', () => {
+		const help = addressHelpFor('slmp', 'u16', SLMP_WITH_HELP);
+		expect(help.examples).toEqual([]);
+		expect(help.deviceHint).toBe('');
+		expect(help.bitHint).toBe('');
+		expect(help.placeholder).toBe('');
+	});
+
+	it('ドライバがあればプロトコルが何でもドライバを優先する', () => {
+		expect(addressHelpFor('push', 'u16', SLMP_WITH_HELP).driverHelp).toBe(
+			SLMP_WITH_HELP.addressHelp
+		);
+	});
+
+	it('占有の注意はデータ型だけから作り、ドライバに依らない', () => {
+		const expectations: [TagDataType, string][] = [
+			['bit', '1 点'],
+			['i16', '1 点'],
+			['u16', '1 点'],
+			['i32', '2 点'],
+			['u32', '2 点'],
+			['f32', '2 点'],
+			['i64', '4 点'],
+			['u64', '4 点'],
+			['f64', '4 点'],
+			['string', '文字列長']
+		];
+		for (const [dt, word] of expectations) {
+			const a = addressHelpFor('slmp', dt, SLMP_WITH_HELP).occupancyHint;
+			const b = addressHelpFor('modbus-tcp', dt, MODBUS_WITH_HELP).occupancyHint;
+			expect(a).toContain(word);
+			expect(a).toBe(b);
 		}
 	});
 
-	it('string: 文字列長に応じた占有のヒント', () => {
-		expect(addressHelpFor('slmp', 'string').occupancyHint).toContain('文字列長');
-	});
-
-	it('bit 指定（.N）の書式ヒントを含む（16進 0〜F）', () => {
-		expect(addressHelpFor('slmp', 'f32').bitHint).toContain('.');
-		expect(addressHelpFor('slmp', 'f32').bitHint).toContain('0〜F');
-	});
-
-	it('対応デバイスのヒントに主要なビット/ワードデバイスを含む', () => {
-		const hint = addressHelpFor('slmp', 'f32').deviceHint;
-		expect(hint).toContain('D');
-		expect(hint).toContain('M');
-		expect(hint).toContain('X');
+	it('bit 型は 1 点（ビットデバイスかワード内ビット）と言う', () => {
+		const hint = addressHelpFor('slmp', 'bit', SLMP_WITH_HELP).occupancyHint;
+		expect(hint).toContain('ワード内の 1 ビット');
 	});
 });
 
-describe('addressHelpFor: modbus-tcp（TAG-UX-B 受け入れ条件）', () => {
-	it('D100 を推奨例として表示しない', () => {
-		const help = addressHelpFor('modbus-tcp', 'f32');
-		expect(help.examples.some((e) => e.address.includes('D100'))).toBe(false);
-		expect(help.placeholder).not.toContain('D100');
-	});
-
-	it('Modbus 参照番号の例を返す', () => {
-		const help = addressHelpFor('modbus-tcp', 'f32');
-		expect(help.examples.some((e) => e.address === '40001')).toBe(true);
-		expect(help.examples.some((e) => e.address === '30001')).toBe(true);
-		expect(help.examples.some((e) => e.address === '00001')).toBe(true);
-	});
-
-	it('bit 型: コイル/ディスクリート入力1点指定のヒント', () => {
-		expect(addressHelpFor('modbus-tcp', 'bit').occupancyHint).toContain('コイル');
-	});
-
-	it('i16/u16: レジスタ1点分のヒント', () => {
-		expect(addressHelpFor('modbus-tcp', 'i16').occupancyHint).toContain('1点');
-	});
-
-	it('i32/u32/f32: レジスタ2点連続のヒント', () => {
-		for (const dt of ['i32', 'u32', 'f32'] as const) {
-			expect(addressHelpFor('modbus-tcp', dt).occupancyHint).toContain('2点');
+describe('addressHelpFor: ドライバの id なのに記述子が無い（一覧が未着・一覧に無い）', () => {
+	it('未選択と同じ説明にする', () => {
+		for (const protocol of ['slmp', 'modbus-tcp', 'unknown-driver']) {
+			expect(addressHelpFor(protocol, 'f32')).toEqual(addressHelpFor(undefined, 'f32'));
 		}
-	});
-
-	it('#325: i64/u64/f64: レジスタ4点連続のヒント', () => {
-		for (const dt of ['i64', 'u64', 'f64'] as const) {
-			expect(addressHelpFor('modbus-tcp', dt).occupancyHint).toContain('4点');
-		}
-	});
-
-	it('string: 文字列長に応じた占有のヒント', () => {
-		expect(addressHelpFor('modbus-tcp', 'string').occupancyHint).toContain('文字列長');
-	});
-
-	it('bit 指定（.N）はレジスタのみ・コイル系は不可という書式ヒントを含む', () => {
-		const hint = addressHelpFor('modbus-tcp', 'f32').bitHint;
-		expect(hint).toContain('.');
-		expect(hint).toContain('コイル');
-	});
-
-	it('対応エリア（0xxxx/1xxxx/3xxxx/4xxxx）のヒントを含む', () => {
-		const hint = addressHelpFor('modbus-tcp', 'f32').deviceHint;
-		expect(hint).toContain('0xxxx');
-		expect(hint).toContain('4xxxx');
 	});
 });
 
 describe('addressHelpFor: virtual（calc/mem）', () => {
 	it('例は空、PLC アドレスを持たない旨のヒントを返す', () => {
 		const help = addressHelpFor('virtual', 'f32');
+		expect(help.driverHelp).toBe('');
 		expect(help.examples).toEqual([]);
 		expect(help.deviceHint).toContain('内部');
 		expect(help.deviceHint).toContain('演算');
@@ -122,12 +91,9 @@ describe('addressHelpFor: virtual（calc/mem）', () => {
 describe('addressHelpFor: protocol 未選択（グループ未選択）', () => {
 	it('例は空で、接続選択を促すヒントを返す', () => {
 		const help = addressHelpFor(undefined, 'f32');
+		expect(help.driverHelp).toBe('');
 		expect(help.examples).toEqual([]);
 		expect(help.deviceHint).toContain('選択');
-	});
-
-	it('D100 を断定的な推奨例として examples には含めない', () => {
-		expect(addressHelpFor(undefined, 'f32').examples).toEqual([]);
 	});
 });
 
