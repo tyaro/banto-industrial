@@ -244,7 +244,7 @@ async fn push_settings_round_trip_through_rest() {
     // R2b-6b: the defaults read back as `{}` (the stored object).
     assert_eq!(cleared["settings"], json!({}));
 
-    // ドライバのスキーマに無い欄（push の欄を modbus-tcp に）は 422（項目は JSON のキー）。
+    // ドライバのスキーマに無い欄（push の欄を modbus-tcp に）は 422（settings のパス）。
     let (status, refused) = admin_post(
         &env.router,
         "/api/plc-connections",
@@ -255,7 +255,7 @@ async fn push_settings_round_trip_through_rest() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused:?}");
     assert_eq!(
-        refused["field_errors"][0]["field"], "stale_timeout_ms",
+        refused["field_errors"][0]["field"], "settings.stale_timeout_ms",
         "{refused:?}"
     );
     // 見積もりを超えるブリッジは 422（`settings.bridge`、§7.1 の文言）。

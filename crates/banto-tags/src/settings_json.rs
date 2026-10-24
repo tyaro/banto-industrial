@@ -42,9 +42,8 @@
 //! ## [`validate_settings_with_registry`]（設計 §4.2 の (3)(4)）
 //!
 //! `registry.get(protocol)` が無ければ `protocol` の項目エラー、あれば
-//! [`settings_to_api`] → `validate_config` → `FieldError.key` を REST の綴り
-//! （`unit_id` → `unitId`、`word_order` → `wordOrder`、`cpu_type` → `cpuType`、`push` は
-//! 今の `settings.*`）に写して返す。旧い平らな形の検証（(1)）は呼ばない
+//! [`settings_to_api`] → `validate_config` → `FieldError.key` を
+//! `settings.<key>` に写して返す。旧い平らな形の検証（(1)）は呼ばない
 //! （`plc_connection.rs` の `validate_plc_connection_input`）。
 
 use banto_core::FieldError;
@@ -88,10 +87,7 @@ pub fn settings_to_api(map: &Map<String, Value>) -> Settings {
     settings
 }
 
-/// `FieldError.key`（`Settings` のキー）を REST の項目名（`validate_plc_connection_input` の
-/// `field`）に写す。`push` は今の `settings.*`、ほかは `unit_id` / `word_order` /
-/// `cpu_type` だけ camelCase にして、残り（`host`・`port`・`database`・`username` ほか）は
-/// そのまま。
+/// `FieldError.key`（`Settings` のキー）を接続の `settings.<key>` に写す。
 ///
 /// `push` の入れ子（`bridge.queries[0].sql: ...` のように文言の先頭へ残された位置、
 /// `ingest/driver.rs` の `to_driver_field_error`）は、`settings.bridge.queries[0].sql` の
@@ -113,14 +109,8 @@ fn rest_field_error(protocol: &str, key: &str, message: String) -> FieldError {
             message,
         };
     }
-    let field = match key {
-        "unit_id" => "unitId",
-        "word_order" => "wordOrder",
-        "cpu_type" => "cpuType",
-        other => other,
-    };
     FieldError {
-        field: field.to_string(),
+        field: format!("settings.{key}"),
         message,
     }
 }
@@ -169,7 +159,7 @@ pub fn validate_settings_with_registry(
 ///   既定値は埋めない。必須の秘密の欄に `null` は欠けとして断る（省略は今の値を保つので、
 ///   作成で値が要るかは呼び手が今の行と合わせて見る）。
 ///
-/// エラーは `banto_driver_api::FieldError`（キーは JSON のキーのまま）で、スキーマの欄の順、
+/// エラーは `banto_driver_api::FieldError`（キーは `settings.<key>`）で、スキーマの欄の順、
 /// その後に未知のキーを並べる。`schema` が空なら、空でない入力は全部未知のキー。
 pub fn settings_from_schema(
     schema: &SettingsSchema,
@@ -184,7 +174,10 @@ pub fn settings_from_schema(
             match value {
                 None => {}
                 Some(Value::Null) if field.required => {
-                    errors.push(DriverFieldError::new(key, REQUIRED_MESSAGE));
+                    errors.push(DriverFieldError::new(
+                        format!("settings.{key}"),
+                        REQUIRED_MESSAGE,
+                    ));
                 }
                 Some(Value::Null) => {
                     settings.insert(key.to_string(), Value::Null);
@@ -193,7 +186,7 @@ pub fn settings_from_schema(
                     settings.insert(key.to_string(), Value::String(text.clone()));
                 }
                 Some(_) => errors.push(DriverFieldError::new(
-                    key,
+                    format!("settings.{key}"),
                     "文字列か null で指定してください",
                 )),
             }
@@ -206,7 +199,10 @@ pub fn settings_from_schema(
                         settings.insert(key.to_string(), setting_value_json(default));
                     }
                     None if field.required => {
-                        errors.push(DriverFieldError::new(key, REQUIRED_MESSAGE));
+                        errors.push(DriverFieldError::new(
+                            format!("settings.{key}"),
+                            REQUIRED_MESSAGE,
+                        ));
                     }
                     None => {}
                 }
@@ -225,13 +221,13 @@ pub fn settings_from_schema(
                 };
                 settings.insert(key.to_string(), value);
             }
-            Err(message) => errors.push(DriverFieldError::new(key, message)),
+            Err(message) => errors.push(DriverFieldError::new(format!("settings.{key}"), message)),
         }
     }
     for key in input.keys() {
         if schema.field(key).is_none() {
             errors.push(DriverFieldError::new(
-                key.as_str(),
+                format!("settings.{key}"),
                 "このドライバの設定に無い欄です",
             ));
         }
@@ -826,13 +822,13 @@ mod tests {
     #[test]
     fn field_keys_are_written_in_the_rest_spelling() {
         let cases = [
-            ("modbus-tcp", "unit_id", "unitId"),
-            ("modbus-tcp", "word_order", "wordOrder"),
-            ("slmp", "cpu_type", "cpuType"),
-            ("slmp", "host", "host"),
-            ("postgres", "port", "port"),
-            ("postgres", "database", "database"),
-            ("postgres", "username", "username"),
+            ("modbus-tcp", "unit_id", "settings.unit_id"),
+            ("modbus-tcp", "word_order", "settings.word_order"),
+            ("slmp", "cpu_type", "settings.cpu_type"),
+            ("slmp", "host", "settings.host"),
+            ("postgres", "port", "settings.port"),
+            ("postgres", "database", "settings.database"),
+            ("postgres", "username", "settings.username"),
             ("push", "stale_timeout_ms", "settings.stale_timeout_ms"),
             ("push", "bridge", "settings.bridge"),
         ];
@@ -1109,7 +1105,8 @@ mod tests {
                     (Ok(map), Ok(want)) => assert_eq!(Value::Object(map), want, "{name}"),
                     (Err(errors), Err(want)) => {
                         let keys: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
-                        let want_keys: Vec<&str> = want.iter().map(|(k, _)| *k).collect();
+                        let want_keys: Vec<String> =
+                            want.iter().map(|(k, _)| format!("settings.{k}")).collect();
                         assert_eq!(keys, want_keys, "{name}: {errors:?}");
                         for (error, (_, part)) in errors.iter().zip(&want) {
                             assert!(error.message.contains(part), "{name}: {errors:?}");
@@ -1130,7 +1127,7 @@ mod tests {
             let errors =
                 settings_from_schema(&empty, &object(json!({ "a": 1, "b": 2 }))).unwrap_err();
             let keys: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
-            assert_eq!(keys, ["a", "b"]);
+            assert_eq!(keys, ["settings.a", "settings.b"]);
         }
 
         #[test]

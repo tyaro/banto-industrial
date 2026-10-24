@@ -1,9 +1,10 @@
-//! 平らな形の旧い検証とレジストリの検証の一致の表（R2b-1c、
+//! ホスト接続（postgres・push）の平らな形の旧い検証とレジストリの検証の一致の表（R2b-1c、
 //! docs/banto-hub-connection-settings-design.md §4.2・§9「平らな形とレジストリの一致」）。
 //!
 //! R2b-1d で検証の正がレジストリになるとき、「今の画面とテストが見るエラーの文言は
 //! 変わらない」ために、組み込みのプロトコルについて次の 2 つが**同じ入力を断る**ことを、
-//! 境界値の表で固定する:
+//! 境界値の表で固定する。機器ドライバの接続は `settings` の入口を使い、別の統合テストで
+//! `settings.<key>` の項目名を固定する:
 //!
 //! - 旧: `PlcConnectionService::create` の入口の `validate_plc_connection_input`
 //!   （非公開なので、実際の書き込みの入口を通す。DB は `banto_tags::migrate` を流した
@@ -38,9 +39,6 @@ use sqlx::sqlite::SqlitePoolOptions;
 enum Verdict {
     /// 旧と新が、拒否の有無も項目名の集合も同じ。
     Agree,
-    /// 旧だけが断る。プロトコルが読まない欄（`settings_from_flat` が捨てる）の検証で、
-    /// 設計 §4.2 の順序（(1) 旧い平らな検証が先）が断るので、書き込みの結果は同じ。
-    DroppedFieldOldOnly(&'static str),
     /// 旧と新の食い違い（書き込みの結果が変わる）。理由は報告に載せる。
     Discrepancy(&'static str),
 }
@@ -49,7 +47,7 @@ impl Verdict {
     fn reason(&self) -> &'static str {
         match self {
             Verdict::Agree => "agree",
-            Verdict::DroppedFieldOldOnly(reason) | Verdict::Discrepancy(reason) => reason,
+            Verdict::Discrepancy(reason) => reason,
         }
     }
 }
@@ -85,15 +83,6 @@ fn agree_if(bad: bool, field: &'static str) -> Expect {
         agree_on(&[field])
     } else {
         ok()
-    }
-}
-
-/// 旧だけが `old` を断り、新は何も断らない（読まない欄）。
-fn dropped(reason: &'static str, old: &[&'static str]) -> Expect {
-    Expect {
-        verdict: Verdict::DroppedFieldOldOnly(reason),
-        old: set(old),
-        new: BTreeSet::new(),
     }
 }
 
@@ -193,7 +182,19 @@ async fn old_errors(
 fn new_errors(registry: &DriverRegistry, input: &PlcConnectionInput) -> Vec<(String, String)> {
     validate_flat_with_registry(registry, input.clone())
         .into_iter()
-        .map(|e| (e.field, e.message))
+        // postgres の公開入口は旧い項目名のまま。レジストリの診断だけが
+        // `settings.<key>` に揃うので、この比較では旧い項目名へ戻す。
+        .map(|e| {
+            let field = if input.protocol == "postgres" {
+                e.field
+                    .strip_prefix("settings.")
+                    .unwrap_or(&e.field)
+                    .to_string()
+            } else {
+                e.field
+            };
+            (field, e.message)
+        })
         .collect()
 }
 
@@ -230,8 +231,8 @@ fn rows() -> Vec<Row> {
         });
     };
 
-    // ---- modbus-tcp / slmp / postgres 共通の host・port ----
-    for protocol in ["modbus-tcp", "slmp", "postgres"] {
+    // ---- postgres の host・port ----
+    for protocol in ["postgres"] {
         add(format!("{protocol}: valid"), base(protocol), ok());
         for port in [0, 1, 65535, 65536, -1] {
             add(
@@ -247,86 +248,6 @@ fn rows() -> Vec<Row> {
                 agree_if(host.trim().is_empty(), "host"),
             );
         }
-    }
-
-    // ---- unit_id（modbus-tcp だけが読む）----
-    for unit_id in [-1, 0, 255, 256] {
-        add(
-            format!("modbus-tcp: unit_id {unit_id}"),
-            with("modbus-tcp", |i| i.unit_id = unit_id),
-            agree_if(!(0..=255).contains(&unit_id), "unitId"),
-        );
-        add(
-            format!("slmp: unit_id {unit_id} (dropped)"),
-            with("slmp", |i| i.unit_id = unit_id),
-            if (0..=255).contains(&unit_id) {
-                ok()
-            } else {
-                dropped(
-                    "slmp は unit_id を読まない: 旧は範囲を検証する（設計 §3.2 で捨てる欄）",
-                    &["unitId"],
-                )
-            },
-        );
-        // postgres は正規化が unit_id を既定に揃えるので、旧も新も断らない。
-        add(
-            format!("postgres: unit_id {unit_id} (normalized)"),
-            with("postgres", |i| i.unit_id = unit_id),
-            ok(),
-        );
-    }
-
-    // ---- word_order（modbus-tcp・slmp が読む）----
-    for protocol in ["modbus-tcp", "slmp"] {
-        for word_order in [
-            "",
-            "low_high",
-            "high_low",
-            "LOW_HIGH",
-            "low-high",
-            " low_high",
-            "lowhigh",
-        ] {
-            add(
-                format!("{protocol}: word_order {word_order:?}"),
-                with(protocol, |i| i.word_order = word_order.to_string()),
-                agree_if(
-                    !matches!(word_order, "" | "low_high" | "high_low"),
-                    "wordOrder",
-                ),
-            );
-        }
-    }
-
-    // ---- cpu_type（slmp が読む。None・"" は未指定）----
-    for cpu_type in [
-        None,
-        Some(""),
-        Some("Q"),
-        Some("R"),
-        Some("q"),
-        Some("L"),
-        Some("QQ"),
-        Some(" Q"),
-    ] {
-        let valid = matches!(cpu_type, None | Some("" | "Q" | "R"));
-        add(
-            format!("slmp: cpu_type {cpu_type:?}"),
-            with("slmp", |i| i.cpu_type = cpu_type.map(str::to_string)),
-            agree_if(!valid, "cpuType"),
-        );
-        add(
-            format!("modbus-tcp: cpu_type {cpu_type:?} (dropped)"),
-            with("modbus-tcp", |i| i.cpu_type = cpu_type.map(str::to_string)),
-            if valid {
-                ok()
-            } else {
-                dropped(
-                    "modbus-tcp は cpu_type を読まない: 旧は全プロトコルで検証する",
-                    &["cpuType"],
-                )
-            },
-        );
     }
 
     // ---- postgres の database・username（128 文字まで、前後の空白は除く）----
@@ -369,77 +290,6 @@ fn rows() -> Vec<Row> {
             ok(),
         );
     }
-
-    // ---- postgres 以外に database・username・password を付ける（旧は断る。読まない欄）----
-    for protocol in ["modbus-tcp", "slmp", "virtual", "push"] {
-        add(
-            format!("{protocol}: database set (dropped)"),
-            with(protocol, |i| i.database = Some("d".to_string())),
-            dropped(
-                "postgres 以外の database / username / password は旧い検証が断る（設計 §4.2 (1)）",
-                &["database"],
-            ),
-        );
-        add(
-            format!("{protocol}: password set (dropped)"),
-            with(protocol, |i| i.secrets = sealed_password(Some("pw"))),
-            dropped(
-                "postgres 以外の database / username / password は旧い検証が断る（設計 §4.2 (1)）",
-                &["password"],
-            ),
-        );
-    }
-
-    // ---- virtual: host・port は検証されない。unit_id・word_order は旧が検証する ----
-    add(
-        "virtual: valid".into(),
-        with("virtual", |i| {
-            i.host = String::new();
-            i.port = 0;
-        }),
-        ok(),
-    );
-    add(
-        "virtual: host/port junk".into(),
-        with("virtual", |i| {
-            i.host = " x ".into();
-            i.port = -5;
-        }),
-        ok(),
-    );
-    add(
-        "virtual: unit_id 256 (dropped)".into(),
-        with("virtual", |i| i.unit_id = 256),
-        dropped(
-            "virtual は unit_id を読まない（正規化もしない）: 旧は範囲を検証する",
-            &["unitId"],
-        ),
-    );
-    add(
-        "virtual: word_order junk (dropped)".into(),
-        with("virtual", |i| i.word_order = "x".into()),
-        dropped(
-            "virtual は word_order を読まない（正規化もしない）: 旧は検証する",
-            &["wordOrder"],
-        ),
-    );
-    add(
-        "virtual: settings set (dropped)".into(),
-        with("virtual", |i| i.settings = Some(json!({"a": 1}))),
-        dropped(
-            "settings は push 以外には指定できない: 旧い検証が断る。virtual のドライバは何も断らない",
-            &["settings"],
-        ),
-    );
-    // simulation + virtual は旧い検証の規則で、settings に写らない。
-    add(
-        "virtual: simulation (not a setting)".into(),
-        with("virtual", |i| i.simulation = true),
-        dropped(
-            "simulation は settings の外（列）。旧い検証だけが見る",
-            &["simulation"],
-        ),
-    );
 
     // ---- push の settings ----
     add("push: settings none".into(), base("push"), ok());
@@ -541,19 +391,6 @@ fn rows() -> Vec<Row> {
         ok(),
     );
 
-    // ---- hub / 未知 / 綴り ----
-    add(
-        "hub".into(),
-        base("hub"),
-        discrepancy("hub: 旧の許可リストに含まれて受かる。Hub のレジストリには hub が無い（設計 §4.1）ので protocol の項目エラー。Hub の REST は reject_hub_connection_protocol で元から断る", &[], &["protocol"]),
-    );
-    for protocol in ["bogus", "", "SLMP", "Modbus-TCP", "modbus", "slmp "] {
-        add(
-            format!("protocol {protocol:?}"),
-            base(protocol),
-            agree_on(&["protocol"]),
-        );
-    }
     rows
 }
 
@@ -580,13 +417,6 @@ async fn the_old_flat_validation_and_the_registry_reject_the_same_inputs() {
             expect.old,
             expect.new
         );
-        if matches!(expect.verdict, Verdict::DroppedFieldOldOnly(_)) {
-            assert!(
-                !expect.old.is_empty() && expect.new.is_empty(),
-                "{}: DroppedFieldOldOnly means old rejects and new rejects nothing",
-                row.label
-            );
-        }
         // 旧と新、それぞれの項目名の集合が期待と**完全に**一致すること。
         let want_old: BTreeSet<String> = expect.old.iter().map(|f| (*f).to_string()).collect();
         let want_new: BTreeSet<String> = expect.new.iter().map(|f| (*f).to_string()).collect();
@@ -628,13 +458,7 @@ async fn message_differences_are_exactly_the_known_ones() {
         }
     }
     let want: BTreeSet<String> = [
-        "host | 必須項目です | host を指定してください",
-        "port | 1〜65535の範囲で入力してください | port は 1〜65535 の整数で指定してください",
-        "unitId | 0〜255の範囲で入力してください | unit_id は 0〜255 の整数で指定してください",
-        "wordOrder | ワード順は low_high, high_low のいずれかです | word_order は low_high / high_low のどちらかで指定してください",
-        "cpuType | CPU種別は Q, R のいずれかです | cpu_type は Q / R のどちらかで指定してください",
         "settings.stale_timeout_ms | 1000〜3600000の範囲で入力してください | stale_timeout_ms は整数（ミリ秒）で指定してください",
-        "protocol | 対応プロトコルは modbus-tcp, slmp, virtual, postgres, hub, push のいずれかです | 対応プロトコルは slmp, modbus-tcp, push, postgres, virtual のいずれかです",
     ]
     .into_iter()
     .map(str::to_string)

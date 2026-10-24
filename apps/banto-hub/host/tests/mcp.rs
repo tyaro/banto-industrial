@@ -2943,7 +2943,7 @@ async fn update_connection_replaces_settings_wholesale_and_refuses_the_flat_keys
         let (_, body) = mcp_post(&app.router, Some(&admin_key), tools_call(tool, args)).await;
         assert!(body.get("error").is_some(), "{tool}: {body:?}");
     }
-    // A field error names the `settings` key (the REST spelling, `unit_id`).
+    // A field error names the `settings` key with its path.
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
@@ -2957,7 +2957,72 @@ async fn update_connection_replaces_settings_wholesale_and_refuses_the_flat_keys
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], true, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("unit_id"), "{text}");
+    assert!(text.contains("settings.unit_id"), "{text}");
+    assert!(!text.contains("unitId"), "{text}");
+}
+
+/// R2b-7b: MCP の作成・更新・接続テストは同じ `settings.<key>` を返し、
+/// 平らな旧い欄名を返さない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_tools_report_only_settings_field_paths() {
+    let app = test_app("r2b7b-mcp-fields").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "valid", "protocol": "modbus-tcp",
+                    "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 1 } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let created: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = created["created"]["id"].as_i64().unwrap();
+
+    for (tool, args) in [
+        (
+            "create_connection",
+            json!({ "name": "bad", "protocol": "modbus-tcp",
+            "settings": { "host": "127.0.0.1", "port": "502", "unit_id": 1 } }),
+        ),
+        (
+            "update_connection",
+            json!({ "id": id, "name": "valid", "protocol": "modbus-tcp",
+            "enabled": true, "simulation": false,
+            "settings": { "host": "127.0.0.1", "port": 70000, "unit_id": 1 } }),
+        ),
+        (
+            "test_connection",
+            json!({ "protocol": "modbus-tcp", "simulation": false,
+            "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 300 } }),
+        ),
+    ] {
+        let (status, body) = mcp_post(&app.router, Some(&admin_key), tools_call(tool, args)).await;
+        assert_eq!(status, StatusCode::OK, "{tool}: {body:?}");
+        assert_eq!(
+            body["result"]["isError"],
+            tool != "test_connection",
+            "{tool}: {body:?}"
+        );
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        if tool == "test_connection" {
+            let payload: Value = serde_json::from_str(text).unwrap();
+            assert_eq!(payload["ok"], false, "{tool}: {payload:?}");
+        }
+        let field = if tool == "test_connection" {
+            "settings.unit_id"
+        } else {
+            "settings.port"
+        };
+        assert!(text.contains(field), "{tool}: {text}");
+        for old in ["unitId", "wordOrder", "cpuType"] {
+            assert!(!text.contains(old), "{tool}: {text}");
+        }
+    }
 }
 
 /// R2b-7a: `list_drivers` は `GET /api/drivers` と同じ中身（SLMP が先頭）。admin スコープ必須。

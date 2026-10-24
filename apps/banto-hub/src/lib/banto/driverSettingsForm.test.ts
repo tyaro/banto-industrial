@@ -205,25 +205,25 @@ describe('buildDriverSettings', () => {
 
 describe('mapSettingsFieldErrors', () => {
 	const keys = ['host', 'port', 'unit_id', 'word_order'];
-	it('settings.<key>・camelCase・そのままの key を欄へ、他は other へ', () => {
+	it('settings.<key> だけを欄へ、旧い平らなキーは other へ', () => {
 		expect(
 			mapSettingsFieldErrors(keys, {
 				'settings.host': 'a',
 				unitId: 'b',
-				wordOrder: 'c',
+				'settings.word_order': 'c',
 				port: 'd',
 				name: 'e',
 				protocol: 'f'
 			})
 		).toEqual({
-			fields: { host: 'a', unit_id: 'b', word_order: 'c', port: 'd' },
-			other: { name: 'e', protocol: 'f' }
+			fields: { host: 'a', word_order: 'c' },
+			other: { unitId: 'b', port: 'd', name: 'e', protocol: 'f' }
 		});
 	});
-	it('同じ欄の複数のエラーは連ねる', () => {
-		expect(mapSettingsFieldErrors(keys, { 'settings.port': 'a', port: 'b' }).fields.port).toBe(
-			'a / b'
-		);
+	it('postgres の旧い欄名を明示して受ける', () => {
+		expect(
+			mapSettingsFieldErrors(keys, { 'settings.port': 'a', port: 'b' }, true).fields.port
+		).toBe('a / b');
 	});
 });
 

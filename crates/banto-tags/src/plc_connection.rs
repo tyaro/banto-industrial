@@ -1497,8 +1497,8 @@ impl PlcConnectionService {
 
     /// [`Self::validate_settings`] for a write's final `settings`. With `typed`
     /// ([`ConnectionSettingsInput`], R2b-6b) a required secret field that ends up with no
-    /// reference is refused first, and every field error is named by its JSON key
-    /// (`unit_id`, not the flat form's `unitId`; docs/banto-hub-driver-ui-design.md §4.2).
+    /// reference is refused first, and every field error is named `settings.<key>`
+    /// (`settings.unit_id`, not the flat form's `unitId`; driver-r2b7-design.md §4).
     fn validate_final_settings(
         &self,
         protocol: &str,
@@ -1514,7 +1514,7 @@ impl PlcConnectionService {
             &typed.required_secrets,
         ))?;
         self.validate_settings(protocol, settings, secret_keys)
-            .map_err(settings_input::with_json_keys)
+            .map_err(settings_input::with_settings_keys)
     }
 
     pub async fn list(&self, params: ListParams) -> Result<ListResult<PlcConnection>, BantoError> {
@@ -6860,7 +6860,7 @@ mod tests {
 
     /// Design §4.2 with a registry: (1) first - when it refuses, only its errors come
     /// back (the driver is not consulted); when it passes, the driver's errors on the
-    /// final `settings` come back in the REST spelling; an unregistered protocol is a
+    /// final `settings` come back as `settings.<key>`; an unregistered protocol is a
     /// `protocol` error. Secret keys and `settings_version` come from the driver.
     #[tokio::test]
     async fn with_a_registry_the_old_rules_run_first_then_the_driver() {
@@ -6887,7 +6887,7 @@ mod tests {
                 field_errors[0].field.as_str(),
                 field_errors[0].message.as_str()
             ),
-            ("port", "driver says no")
+            ("settings.port", "driver says no")
         );
 
         // An unregistered protocol (slmp is in ALLOWED_PROTOCOLS, not in this registry).

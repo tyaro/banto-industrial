@@ -289,7 +289,7 @@
 			errors = mapped.other;
 			driverErrors = mapped.fields;
 		} else {
-			const mapped = mapSettingsFieldErrors(POSTGRES_SETTING_KEYS, map);
+			const mapped = mapSettingsFieldErrors(POSTGRES_SETTING_KEYS, map, true);
 			errors = { ...mapped.other, ...mapped.fields };
 			driverErrors = {};
 		}

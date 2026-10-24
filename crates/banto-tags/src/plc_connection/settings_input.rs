@@ -7,8 +7,8 @@
 //! - **機器のドライバ**（レジストリの `Frame` / `Session`。今は `modbus-tcp`・`slmp`）:
 //!   [`crate::settings_from_schema`]（種類・制約・必須・既定値・未知のキーの断り）→ 書き込みの
 //!   トランザクションの中で秘密の参照を合わせる → [`crate::settings_to_api`] →
-//!   `validate_config`。平らな形の旧い検証 (1) は通らない。項目エラーの名前は JSON のキー
-//!   のまま（`unit_id`。平らな形の `unitId` ではない）。
+//!   `validate_config`。平らな形の旧い検証 (1) は通らない。項目エラーの名前は
+//!   `settings.<key>`（`settings.unit_id`。平らな形の `unitId` ではない）。
 //! - **ホストの接続**（`postgres`・`push`・`virtual`・`hub`。スキーマは空）: `settings` を
 //!   今の平らな入力（[`PlcConnectionInput`]）に写して、今の書き込み（専用の検証と
 //!   「省略は保つ」）をそのまま通す。`postgres` は `host`・`port`・`database`・`username`
@@ -176,7 +176,14 @@ fn driver_route(
     secret_keys: &[String],
 ) -> Result<Route, BantoError> {
     let mut errors = name_errors(&input.name);
-    errors.extend(secret_key_errors(&input, secret_keys));
+    errors.extend(
+        secret_key_errors(&input, secret_keys)
+            .into_iter()
+            .map(|mut error| {
+                error.field = format!("settings.{}", error.field);
+                error
+            }),
+    );
     let mut typed_settings = Map::new();
     match crate::settings_from_schema(schema, &input.settings) {
         Ok(settings) => typed_settings = settings,
@@ -348,25 +355,27 @@ pub(super) fn missing_required_secrets(
         .iter()
         .filter(|key| !settings.contains_key(key.as_str()))
         .map(|key| FieldError {
-            field: key.clone(),
+            field: format!("settings.{key}"),
             // `settings_from_schema` の必須の欠けと同じ文言。
             message: "必須です".to_string(),
         })
         .collect()
 }
 
-/// 平らな形の項目名（`unitId`・`wordOrder`・`cpuType`）を JSON のキーに戻す。
-pub(super) fn with_json_keys(error: BantoError) -> BantoError {
+/// 最終検証の項目名を、ドライバの接続が公開する `settings.<key>` に揃える。
+pub(super) fn with_settings_keys(error: BantoError) -> BantoError {
     match error {
         BantoError::Validation { field_errors } => BantoError::Validation {
             field_errors: field_errors
                 .into_iter()
                 .map(|error| FieldError {
                     field: match error.field.as_str() {
-                        "unitId" => "unit_id".to_string(),
-                        "wordOrder" => "word_order".to_string(),
-                        "cpuType" => "cpu_type".to_string(),
-                        _ => error.field,
+                        "unitId" => "settings.unit_id".to_string(),
+                        "wordOrder" => "settings.word_order".to_string(),
+                        "cpuType" => "settings.cpu_type".to_string(),
+                        "protocol" | "settings" => error.field,
+                        field if field.starts_with("settings.") => error.field,
+                        _ => format!("settings.{}", error.field),
                     },
                     message: error.message,
                 })

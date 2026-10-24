@@ -219,7 +219,8 @@ pub fn is_valid_secret_ref(r#ref: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// REST の項目名（`validate_plc_connection_input` の `field` と同じ綴り）。
+/// 平らな形の旧入口の項目名。登録簿の接続では最終検証時に
+/// `settings.<key>` へ写す（`settings_input::with_settings_keys`）。
 fn rest_field(key: &str) -> String {
     match key {
         "unit_id" => "unitId".to_string(),

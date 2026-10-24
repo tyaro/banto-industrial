@@ -210,7 +210,7 @@ async fn a_driver_connection_is_built_from_its_schema() {
 /// out-of-range values and a missing required field are refused by their JSON key,
 /// together with the name error; nothing is written.
 #[tokio::test]
-async fn unknown_keys_and_wrong_types_are_refused_by_json_key() {
+async fn unknown_keys_and_wrong_types_are_refused_by_settings_path() {
     let svc = service().await;
     let err = svc
         .create_settings(input(
@@ -220,7 +220,16 @@ async fn unknown_keys_and_wrong_types_are_refused_by_json_key() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(fields(err), ["name", "host", "port", "unit_id", "extra"]);
+    assert_eq!(
+        fields(err),
+        [
+            "name",
+            "settings.host",
+            "settings.port",
+            "settings.unit_id",
+            "settings.extra"
+        ]
+    );
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM plc_connections")
         .fetch_one(&svc.pool)
         .await
@@ -230,13 +239,13 @@ async fn unknown_keys_and_wrong_types_are_refused_by_json_key() {
 
 /// The driver's own `validate_config` runs after the schema, named by the JSON key.
 #[tokio::test]
-async fn the_drivers_errors_come_back_by_json_key() {
+async fn the_drivers_errors_come_back_by_settings_path() {
     let svc = service().await;
     let err = svc
         .create_settings(input("A", "plain", json!({"host": "h", "unit_id": 99})))
         .await
         .unwrap_err();
-    assert_eq!(fields(err), ["unit_id"]);
+    assert_eq!(fields(err), ["settings.unit_id"]);
 }
 
 /// Owner decision 2026-10-24: on create a required secret field must be set; omission,
@@ -250,7 +259,10 @@ async fn a_required_secret_must_be_set_on_create() {
             missing.secrets.insert("token".into(), change);
         }
         let err = svc.create_settings(missing).await.unwrap_err();
-        assert_eq!(errors(err), [("token".to_string(), "必須です".to_string())]);
+        assert_eq!(
+            errors(err),
+            [("settings.token".to_string(), "必須です".to_string())]
+        );
     }
     let mut ok = input("A", "needs-token", json!({"host": "h"}));
     ok.secrets.insert("token".into(), set(REF_A));
@@ -276,7 +288,7 @@ async fn a_required_secret_on_update_keeps_or_is_refused() {
     let mut cleared = input("A", "needs-token", json!({"host": "h2"}));
     cleared.secrets.insert("token".into(), SecretChange::Clear);
     let err = svc.update_settings(created.id, cleared).await.unwrap_err();
-    assert_eq!(fields(err), ["token"]);
+    assert_eq!(fields(err), ["settings.token"]);
     assert_eq!(
         svc.get(created.id).await.unwrap().secret_ref("token"),
         Some(REF_A)
@@ -290,7 +302,7 @@ async fn a_required_secret_on_update_keeps_or_is_refused() {
         .update_settings(plain.id, input("B", "needs-token", json!({"host": "h"})))
         .await
         .unwrap_err();
-    assert_eq!(fields(err), ["token"]);
+    assert_eq!(fields(err), ["settings.token"]);
 
     let mut replaced = input("A", "needs-token", json!({"host": "h"}));
     replaced.secrets.insert("token".into(), set(REF_B));
@@ -330,11 +342,11 @@ async fn a_plaintext_secret_or_a_foreign_secret_key_is_refused() {
         ))
         .await
         .unwrap_err();
-    assert_eq!(fields(err), ["token"]);
+    assert_eq!(fields(err), ["settings.token"]);
     let mut foreign = input("A", "plain", json!({"host": "h"}));
     foreign.secrets.insert("token".into(), set(REF_A));
     let err = svc.create_settings(foreign).await.unwrap_err();
-    assert_eq!(fields(err), ["token"]);
+    assert_eq!(fields(err), ["settings.token"]);
 }
 
 /// postgres goes through today's rules: the four keys with their JSON types and the

@@ -167,7 +167,10 @@ async fn create_non_postgres_with_database_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert_eq!(body["kind"], "validation");
-    assert_eq!(body["field_errors"][0]["field"], "database", "{body:?}");
+    assert_eq!(
+        body["field_errors"][0]["field"], "settings.database",
+        "{body:?}"
+    );
 }
 
 /// S1（この段階では postgres 接続配下にグループを作れない）: REST 経由の
