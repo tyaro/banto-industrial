@@ -142,11 +142,17 @@ async fn the_startup_is_refused_for_rows_the_real_drivers_reject_and_the_db_is_u
             let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
             assert_eq!(ids, vec![3, 4], "{rows:?}");
             assert!(
-                rows[0].errors.iter().any(|e| e.starts_with("port")),
+                rows[0]
+                    .errors
+                    .iter()
+                    .any(|e| e.starts_with("settings.port")),
                 "{rows:?}"
             );
             assert!(
-                rows[1].errors.iter().any(|e| e.starts_with("host")),
+                rows[1]
+                    .errors
+                    .iter()
+                    .any(|e| e.starts_with("settings.host")),
                 "{rows:?}"
             );
             assert!(problems.is_empty(), "{problems:?}");

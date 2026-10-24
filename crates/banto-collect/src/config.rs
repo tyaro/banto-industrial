@@ -3270,12 +3270,12 @@ mod tests {
         (
             "modbus port",
             |s| set_setting(s, "port", 70_000),
-            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
+            "接続 PLC1 の設定が検証を通りません: settings.port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "modbus unit id",
             |s| set_setting(s, "unit_id", 300),
-            "接続 PLC1 の設定が検証を通りません: unitId: unit_id は 0〜255 の整数で指定してください",
+            "接続 PLC1 の設定が検証を通りません: settings.unit_id: unit_id は 0〜255 の整数で指定してください",
         ),
         (
             "slmp port",
@@ -3284,7 +3284,7 @@ mod tests {
                 s.tags[0].address = "D100".to_string();
                 set_setting(s, "port", -1);
             },
-            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
+            "接続 PLC1 の設定が検証を通りません: settings.port: port は 1〜65535 の整数で指定してください",
         ),
         (
             "group period",
@@ -3324,7 +3324,7 @@ mod tests {
                 set_setting(s, "port", 70_000);
                 s.tags[0].data_type = "f128".to_string();
             },
-            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
+            "接続 PLC1 の設定が検証を通りません: settings.port: port は 1〜65535 の整数で指定してください",
         ),
         (
             // A broken connection fails the strict build even when it has
@@ -3335,7 +3335,7 @@ mod tests {
                 s.groups.clear();
                 s.tags.clear();
             },
-            "接続 PLC1 の設定が検証を通りません: port: port は 1〜65535 の整数で指定してください",
+            "接続 PLC1 の設定が検証を通りません: settings.port: port は 1〜65535 の整数で指定してください",
         ),
     ];
 
@@ -4335,7 +4335,7 @@ mod tests {
         assert_eq!(
             reason_of(2),
             ExclusionReason::InvalidSettings {
-                errors: vec!["port: driver says no".to_string()]
+                errors: vec!["settings.port: driver says no".to_string()]
             }
         );
         assert!(matches!(
