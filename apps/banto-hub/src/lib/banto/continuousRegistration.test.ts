@@ -1,7 +1,7 @@
 /**
- * `continuousRegistration.ts` の `buildContinuousParams`/`generateContinuousTags`
- * に対するユニットテスト（`tagFormNumeric.test.ts` と同じ describe/it スタイル、
- * 依存ゼロの純関数を直接 import）。
+ * `continuousRegistration.ts` の `buildContinuousParams`/`generateContinuousTags` ほかに
+ * 対するユニットテスト（`tagFormNumeric.test.ts` と同じ describe/it スタイル）。
+ * R2b-6d-2a 以降、アドレスの計算は REST の結果を受け取る純関数になったので、REST の結果は偽で与える。
  *
  * 回帰本体（TAG-P0-1、docs/banto-hub-desktop-plan.md §9）: Svelte 5 の
  * `<input type="number" bind:value>` は `continuousForm.count` へ
@@ -10,19 +10,49 @@
  * function` でクラッシュしていた。`buildContinuousParams` はこれを
  * `parseOptionalNumber` 経由のパースに置き換えて修正している。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// 純関数の外側の `addressSpan.ts` は REST のヘルパー（`tagRegistryAdmin.ts`）を既定の呼び口として
+// import する。`$state` を使うモジュールの読み込みで通信が始まらないよう、`tagCsvDiff.test.ts` と
+// 同じ軽量なフェイクに差し替える（このテストは REST を偽の `api` で差し替えて呼ぶ）。
+vi.mock('@banto/admin-core', () => ({
+	getAuthProvider: () => ({ getToken: () => 'test-token' }),
+	ProviderError: class ProviderError extends Error {}
+}));
+vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
+vi.mock('./deferredDelete.svelte', () => ({ deferredDelete: { flush: async () => {} } }));
 import {
-	addressIncrement,
+	buildContinuousOffsetItems,
 	buildContinuousParams,
-	defaultNamePatternFromAddress,
-	defaultStartNumberFromAddress,
+	computeContinuousTags,
 	generateContinuousTags,
-	incrementAddress,
 	MAX_CONTINUOUS_COUNT,
-	nextNamePatternOnAddressChange,
-	nextStartNumberOnAddressChange,
+	namePatternFromParsed,
+	nextNamePatternOnParsed,
+	nextStartNumberOnParsed,
+	startNumberFromParsed,
 	type ContinuousFormState
 } from './continuousRegistration';
+import type { OffsetAddressItem, ParsedAddress } from './tagRegistryAdmin';
+import { fakeAddressApi } from './addressFake';
+
+/** REST の結果（`ok: true`）の偽。 */
+function okParsed(
+	canonical: string,
+	area: string | null,
+	index: number | null,
+	wordCount = 1,
+	bit: number | null = null
+): ParsedAddress {
+	return { ok: true, canonical, area, writableArea: true, index, bit, wordCount };
+}
+
+/** `D100` から 1 点ずつの偽のアドレス列。 */
+function addressesFor(count: number): ParsedAddress[] {
+	return Array.from({ length: Math.max(0, Math.ceil(count)) }, (_, i) =>
+		okParsed(`D${100 + i}`, 'D', 100 + i)
+	);
+}
 
 /** 実フォーム（`+page.svelte` の `blankContinuousForm()`）の初期値に、
  * 生成に必要な最低限の入力（対象グループ・開始アドレス）を埋めたもの。
@@ -106,7 +136,7 @@ describe('buildContinuousParams -> generateContinuousTags（点数と行数の�
 	it.each([1, 2, 1000])('count=%i で対応件数(%i件)の行が生成される', (count) => {
 		const params = buildContinuousParams(baseForm({ count }));
 		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+		const result = generateContinuousTags(params!, addressesFor(params!.count));
 		expect(result.ok).toBe(true);
 		if (result.ok) {
 			expect(result.rows).toHaveLength(count);
@@ -123,7 +153,7 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 	it('0 はエラーになる', () => {
 		const params = buildContinuousParams(baseForm({ count: 0 }));
 		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+		const result = generateContinuousTags(params!, addressesFor(params!.count));
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(/1以上/);
@@ -133,7 +163,7 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 	it('負数はエラーになる', () => {
 		const params = buildContinuousParams(baseForm({ count: -1 }));
 		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+		const result = generateContinuousTags(params!, addressesFor(params!.count));
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(/1以上/);
@@ -143,7 +173,7 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 	it('小数（1.5）はエラーになる', () => {
 		const params = buildContinuousParams(baseForm({ count: 1.5 }));
 		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+		const result = generateContinuousTags(params!, addressesFor(params!.count));
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(/整数/);
@@ -153,7 +183,7 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 	it(`上限超え（${MAX_CONTINUOUS_COUNT + 1}）はエラーになる`, () => {
 		const params = buildContinuousParams(baseForm({ count: MAX_CONTINUOUS_COUNT + 1 }));
 		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+		const result = generateContinuousTags(params!, addressesFor(params!.count));
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
 			expect(result.error).toMatch(new RegExp(`${MAX_CONTINUOUS_COUNT}以下`));
@@ -161,242 +191,228 @@ describe('generateContinuousTags: 不正な点数は ok:false + 人間可読メ�
 	});
 });
 
-// --- T18-3c（docs/banto-hub-t18-design.md「T18-3c 連続登録の基数/bit
-// 連番」）: SLMP の16進デバイス繰り上げとワード内 bit 連番 -------------
+// --- R2b-6d-2a: アドレスの計算は REST（offset-addresses / parse-addresses）の結果を使う --------
 
-describe('incrementAddress: 16進デバイスの桁上がり（受け入れケース）', () => {
-	it('X1E → X1F → X20（16進の桁境界を正しく繰り上げる）', () => {
-		expect(incrementAddress('X1E', 1, 0)).toBe('X1E');
-		expect(incrementAddress('X1E', 1, 1)).toBe('X1F');
-		expect(incrementAddress('X1E', 1, 2)).toBe('X20');
-	});
-
-	it('W1FF → W200', () => {
-		expect(incrementAddress('W1FF', 1, 0)).toBe('W1FF');
-		expect(incrementAddress('W1FF', 1, 1)).toBe('W200');
-	});
-});
-
-describe('incrementAddress: ワード内 bit 連番（受け入れケース）', () => {
-	// T20-④（2026-09-04）: bit サフィックスの表記が16進になったため、
-	// bit 14/15 は D100.E / D100.F と書く（旧テストの D100.14/D100.15 は
-	// 10進表記で、今は2桁として拒否される）。
-	it('D100.E → D100.F → D101.0（bit15 の次はワード+1・bit0）', () => {
-		expect(incrementAddress('D100.E', 1, 0)).toBe('D100.E');
-		expect(incrementAddress('D100.E', 1, 1)).toBe('D100.F');
-		expect(incrementAddress('D100.E', 1, 2)).toBe('D101.0');
-	});
-});
-
-describe('incrementAddress: 既存の10進連番は不変', () => {
-	it('D100(i16 相当・step1) → D101', () => {
-		expect(incrementAddress('D100', 1, 1)).toBe('D101');
-	});
-
-	it('D100(i32 相当・step2) → D102', () => {
-		expect(incrementAddress('D100', 2, 1)).toBe('D102');
-	});
-
-	it('Modbus 参照番号（デバイスニーモニックなし）は素朴な10進増分のまま', () => {
-		expect(incrementAddress('40001', 1, 1)).toBe('40002');
-	});
-});
-
-describe('incrementAddress: 範囲外・不正な形式はエラー（null）', () => {
-	it('デバイス番号の上限を超えるとエラー', () => {
-		const atMax = 'D16777215'; // MAX_DEVICE_NUMBER = 0x00FFFFFF
-		expect(incrementAddress(atMax, 1, 0)).toBe(atMax);
-		expect(incrementAddress(atMax, 1, 1)).toBeNull();
-	});
-
-	it('bit 軸の上限（number が MAX_DEVICE_NUMBER を超える）を超えるとエラー', () => {
-		const nearMax = 'D16777215.0';
-		expect(incrementAddress(nearMax, 1, 15)).toBe('D16777215.F');
-		expect(incrementAddress(nearMax, 1, 16)).toBeNull();
-	});
-
-	it('16進デバイスに10進のみの数字でも不正な文字が混ざると解釈できずエラー', () => {
-		expect(incrementAddress('M1A', 1, 0)).toBeNull();
-	});
-
-	it('デバイスにも数字にも解釈できない文字列はエラー', () => {
-		expect(incrementAddress('ZZZ', 1, 0)).toBeNull();
-	});
-});
-
-describe('generateContinuousTags: 16進デバイス・bit 連番がプレビューまで通る', () => {
-	it('X1E を開始アドレスに、bit 型3点で X1E/X1F/X20 が生成される', () => {
-		const params = buildContinuousParams(
-			baseForm({ startAddress: 'X1E', dataType: 'bit', count: 3 })
-		);
-		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+describe('generateContinuousTags: REST の結果をそのまま行にする', () => {
+	it('結果の canonical を、名前の連番と対にして行・タグにする', () => {
+		const params = buildContinuousParams(baseForm({ count: 3, startNumber: '10' }));
+		const result = generateContinuousTags(params!, [
+			okParsed('X1E', 'X', 30),
+			okParsed('X1F', 'X', 31),
+			okParsed('X20', 'X', 32)
+		]);
 		expect(result.ok).toBe(true);
 		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['X1E', 'X1F', 'X20']);
+			expect(result.rows).toEqual([
+				{ name: 'temp10', address: 'X1E' },
+				{ name: 'temp11', address: 'X1F' },
+				{ name: 'temp12', address: 'X20' }
+			]);
+			expect(result.tags.map((t) => t.address)).toEqual(['X1E', 'X1F', 'X20']);
 		}
 	});
 
-	it('D100.E を開始アドレスに、bit 型3点で D100.E/D100.F/D101.0 が生成される', () => {
-		const params = buildContinuousParams(
-			baseForm({ startAddress: 'D100.E', dataType: 'bit', count: 3 })
-		);
-		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['D100.E', 'D100.F', 'D101.0']);
-		}
+	it('Modbus の 40001 形式は正規形（400001）がそのまま保存の形になる', () => {
+		const params = buildContinuousParams(baseForm({ count: 2, startAddress: '40001' }));
+		const result = generateContinuousTags(params!, [
+			okParsed('400001', 'holding_register', 0),
+			okParsed('400002', 'holding_register', 1)
+		]);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['400001', '400002']);
 	});
 
-	it('bit サフィックス付きアドレスは data_type が bit 以外だとエラーになる', () => {
-		const params = buildContinuousParams(
-			baseForm({ startAddress: 'D100.E', dataType: 'i16', count: 3 })
-		);
-		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
+	it('算出できなかった件は、API のメッセージつきでその件目のエラーにする（末尾の数字を進めて推測しない）', () => {
+		const params = buildContinuousParams(baseForm({ count: 3 }));
+		const result = generateContinuousTags(params!, [
+			okParsed('D100', 'D', 100),
+			{ ok: false, message: 'アドレスが範囲外です' },
+			okParsed('D102', 'D', 102)
+		]);
 		expect(result.ok).toBe(false);
 		if (!result.ok) {
-			expect(result.error).toMatch(/bit/);
+			expect(result.error).toContain('2件目');
+			expect(result.error).toContain('アドレスが範囲外です');
 		}
 	});
-});
 
-// #325（2026-09-08 オーナー決定）: 64bit 型（i64/u64/f64、Modbus の4レジスタ
-// 値）はアドレス増分 +4 になる - addressIncrement 本体と、
-// generateContinuousTags 経由（プレビューまで通す）の両方で固定する。
-
-describe('addressIncrement: 64bit 型（i64/u64/f64）は+4', () => {
-	it.each(['i64', 'u64', 'f64'] as const)('%s は addressIncrement で 4 を返す', (dataType) => {
-		expect(addressIncrement(dataType)).toBe(4);
+	it('結果が足りない件（応答の欠落）もエラーにする', () => {
+		const params = buildContinuousParams(baseForm({ count: 2 }));
+		const result = generateContinuousTags(params!, [okParsed('D100', 'D', 100)]);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('2件目');
 	});
 
-	it('既存の32bit型（i32/u32/f32）は引き続き+2のまま（回帰防止）', () => {
-		expect(addressIncrement('i32')).toBe(2);
-		expect(addressIncrement('u32')).toBe(2);
-		expect(addressIncrement('f32')).toBe(2);
+	it('string 型は文字列長の指定が必要（API を呼ぶ前の検証）', () => {
+		const params = buildContinuousParams(baseForm({ dataType: 'string', stringLength: '' }));
+		const result = generateContinuousTags(params!, addressesFor(1));
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toMatch(/文字列長/);
 	});
 
-	it('既存の16bit/bit型は引き続き+1のまま（回帰防止）', () => {
-		expect(addressIncrement('bit')).toBe(1);
-		expect(addressIncrement('i16')).toBe(1);
-		expect(addressIncrement('u16')).toBe(1);
-	});
-});
-
-describe('generateContinuousTags: 64bit 型（i64/u64/f64）はアドレスが4ずつ増える', () => {
-	it('D100 を開始アドレスに、f64 型3点で D100/D104/D108 が生成される', () => {
+	it('string 型は stringLength・stringEncoding をタグへ引き継ぐ', () => {
 		const params = buildContinuousParams(
-			baseForm({ startAddress: 'D100', dataType: 'f64', count: 3 })
+			baseForm({ dataType: 'string', stringLength: '4', stringEncoding: 'shift_jis', count: 1 })
 		);
-		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['D100', 'D104', 'D108']);
-		}
-	});
-
-	it('Modbus 参照番号（40001）を開始アドレスに、i64 型3点で 40001/40005/40009 が生成される', () => {
-		const params = buildContinuousParams(
-			baseForm({ startAddress: '40001', dataType: 'i64', count: 3 })
-		);
-		expect(params).not.toBeNull();
-		const result = generateContinuousTags(params!);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['40001', '40005', '40009']);
-		}
+		const result = generateContinuousTags(params!, addressesFor(1));
+		expect(result.ok && result.tags[0]).toMatchObject({
+			stringLength: 4,
+			stringEncoding: 'shift_jis'
+		});
 	});
 });
 
-// T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「連続登録の名前パターン
-// — デバイス名を既定とし、開始番号はアドレスから導出（入力不要）」）:
-// `defaultNamePatternFromAddress`/`defaultStartNumberFromAddress` と、
-// それらを touched 追跡でラップする `nextNamePatternOnAddressChange`/
-// `nextStartNumberOnAddressChange` のユニットテスト。
-
-describe('defaultNamePatternFromAddress', () => {
-	it('SLMP デバイス記法（ワード）はニーモニックをそのまま使う - D3000 → D{n}', () => {
-		expect(defaultNamePatternFromAddress('D3000')).toBe('D{n}');
+describe('buildContinuousOffsetItems / computeContinuousTags（REST を呼ぶ薄い層）', () => {
+	it('i 件目は n = i・unit = points で、接続と型をそのまま渡す', () => {
+		const params = buildContinuousParams(baseForm({ count: 3, dataType: 'f32' }));
+		const items = buildContinuousOffsetItems(params!, 7);
+		expect(items).toEqual([
+			expect.objectContaining({
+				connectionId: 7,
+				address: 'D100',
+				dataType: 'f32',
+				n: 0,
+				unit: 'points'
+			}),
+			expect.objectContaining({ n: 1, unit: 'points' }),
+			expect.objectContaining({ n: 2, unit: 'points' })
+		]);
+		expect(items.every((i) => i.tagKind === 'plc')).toBe(true);
 	});
 
-	it('SLMP デバイス記法（ビット）も同様 - M100 → M{n}', () => {
-		expect(defaultNamePatternFromAddress('M100')).toBe('M{n}');
+	it('全件を 1 回の offset-addresses で求めて行にする', async () => {
+		const calls: OffsetAddressItem[][] = [];
+		const params = buildContinuousParams(baseForm({ count: 2 }));
+		const result = await computeContinuousTags(params!, 3, {
+			offset: async (items) => {
+				calls.push(items);
+				return addressesFor(items.length);
+			}
+		});
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toHaveLength(2);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D100', 'D101']);
 	});
 
-	it('16進デバイスもニーモニックだけを使う - W1FF → W{n}', () => {
-		expect(defaultNamePatternFromAddress('W1FF')).toBe('W{n}');
+	it('入力が不正なら API を呼ばない', async () => {
+		let called = false;
+		const params = buildContinuousParams(baseForm({ count: 0 }));
+		const result = await computeContinuousTags(params!, 3, {
+			offset: async () => {
+				called = true;
+				return [];
+			}
+		});
+		expect(called).toBe(false);
+		expect(result.ok).toBe(false);
 	});
 
-	it('bit サフィックス付きアドレスはワード側のニーモニックのみ使う - D100.5 → D{n}', () => {
-		expect(defaultNamePatternFromAddress('D100.5')).toBe('D{n}');
-	});
-
-	it('小文字入力も大文字ニーモニックへ正規化する - d3000 → D{n}', () => {
-		expect(defaultNamePatternFromAddress('d3000')).toBe('D{n}');
-	});
-
-	it('デバイスニーモニックを持つ非SLMP形式は先頭の非数字列を使う - AI40001 → AI{n}', () => {
-		expect(defaultNamePatternFromAddress('AI40001')).toBe('AI{n}');
-	});
-
-	it('Modbus 参照番号のようにデバイス名を持たないアドレスは既定 tag{n} - 40001', () => {
-		expect(defaultNamePatternFromAddress('40001')).toBe('tag{n}');
-	});
-
-	it('開始アドレスが空文字列なら空文字列を返す（導出しない合図）', () => {
-		expect(defaultNamePatternFromAddress('')).toBe('');
-		expect(defaultNamePatternFromAddress('   ')).toBe('');
-	});
-});
-
-describe('defaultStartNumberFromAddress', () => {
-	it('SLMP デバイス記法はデバイス番号を返す - D3000 → 3000（設計の例そのまま）', () => {
-		expect(defaultStartNumberFromAddress('D3000')).toBe(3000);
-	});
-
-	it('16進デバイスも10進のデバイス番号を返す - W1FF → 511', () => {
-		expect(defaultStartNumberFromAddress('W1FF')).toBe(0x1ff);
-	});
-
-	it('bit サフィックス付きアドレスは bit 位置ではなくデバイス番号を返す - D100.5 → 100', () => {
-		expect(defaultStartNumberFromAddress('D100.5')).toBe(100);
-	});
-
-	it('デバイス名を持たない Modbus 参照番号は数字列そのものを返す - 40001', () => {
-		expect(defaultStartNumberFromAddress('40001')).toBe(40001);
-	});
-
-	it('数字を含まないアドレスは null（導出できない合図）', () => {
-		expect(defaultStartNumberFromAddress('AI')).toBeNull();
-	});
-
-	it('開始アドレスが空文字列なら null', () => {
-		expect(defaultStartNumberFromAddress('')).toBeNull();
+	it('通信の失敗はエラーにする（推測で埋めない）', async () => {
+		const params = buildContinuousParams(baseForm({ count: 2 }));
+		const result = await computeContinuousTags(params!, 3, {
+			offset: async () => {
+				throw new Error('network down');
+			}
+		});
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('network down');
 	});
 });
 
-describe('nextNamePatternOnAddressChange', () => {
-	it('touched が false なら新アドレスから導出した値を返す', () => {
-		expect(nextNamePatternOnAddressChange('D3000', false)).toBe('D{n}');
+describe('namePatternFromParsed（§7.1: canonical が area で始まれば {area}{n}、そうでなければ tag{n}）', () => {
+	it('D3000 → D{n}', () => {
+		expect(namePatternFromParsed(okParsed('D3000', 'D', 3000))).toBe('D{n}');
 	});
 
-	it('touched が true なら null（呼び出し側は名前パターン欄に触れない）', () => {
-		expect(nextNamePatternOnAddressChange('D3000', true)).toBeNull();
+	it('ワード内ビット D100.5 → D{n}', () => {
+		expect(namePatternFromParsed(okParsed('D100.5', 'D', 100, 1, 5))).toBe('D{n}');
+	});
+
+	it('canonical と area の大文字小文字は無視する（area が小文字でも一致）', () => {
+		expect(namePatternFromParsed(okParsed('W1FF', 'w', 511))).toBe('w{n}');
+	});
+
+	it('Modbus の 400001 は領域名が現れないので tag{n}', () => {
+		expect(namePatternFromParsed(okParsed('400001', 'holding_register', 0))).toBe('tag{n}');
+	});
+
+	it('area が無い（plc 以外・位置を持たないドライバ）なら tag{n}', () => {
+		expect(namePatternFromParsed(okParsed('ABC1', null, null))).toBe('tag{n}');
+	});
+
+	it('解析に失敗した・結果が無いときは null', () => {
+		expect(namePatternFromParsed({ ok: false, message: 'x' })).toBeNull();
+		expect(namePatternFromParsed(undefined)).toBeNull();
 	});
 });
 
-describe('nextStartNumberOnAddressChange', () => {
-	it('touched が false なら新アドレスから導出した値を文字列で返す', () => {
-		expect(nextStartNumberOnAddressChange('D3000', false)).toBe('3000');
+describe('startNumberFromParsed（§7.1: canonical が area で始まれば index、そうでなければ canonical の数字）', () => {
+	it('D3000 → 3000', () => {
+		expect(startNumberFromParsed(okParsed('D3000', 'D', 3000))).toBe(3000);
 	});
 
-	it('touched が false でも導出できないアドレスなら空文字列を返す', () => {
-		expect(nextStartNumberOnAddressChange('', false)).toBe('');
+	it('16 進のデバイスは 10 進の index（W1FF → 511）', () => {
+		expect(startNumberFromParsed(okParsed('W1FF', 'W', 511))).toBe(511);
 	});
 
-	it('touched が true なら null（呼び出し側は開始番号欄に触れない）', () => {
-		expect(nextStartNumberOnAddressChange('D3000', true)).toBeNull();
+	it('ワード内ビットはワードの番号（D100.5 → 100）', () => {
+		expect(startNumberFromParsed(okParsed('D100.5', 'D', 100, 1, 5))).toBe(100);
+	});
+
+	it('Modbus の 40001 は正規形 400001 の数字を 10 進で読む', () => {
+		expect(startNumberFromParsed(okParsed('400001', 'holding_register', 0))).toBe(400001);
+	});
+
+	it('area で始まるのに index が無ければ null', () => {
+		expect(startNumberFromParsed(okParsed('D3000', 'D', null))).toBeNull();
+	});
+
+	it('数字で終わらない canonical は null / 解析失敗も null', () => {
+		expect(startNumberFromParsed(okParsed('ABC', null, null))).toBeNull();
+		expect(startNumberFromParsed({ ok: false, message: 'x' })).toBeNull();
+		expect(startNumberFromParsed(undefined)).toBeNull();
+	});
+});
+
+describe('nextNamePatternOnParsed / nextStartNumberOnParsed（touched 追跡）', () => {
+	const d3000 = okParsed('D3000', 'D', 3000);
+
+	it('touched が false なら導出した値を返す（開始番号は文字列）', () => {
+		expect(nextNamePatternOnParsed('D3000', d3000, false)).toBe('D{n}');
+		expect(nextStartNumberOnParsed('D3000', d3000, false)).toBe('3000');
+	});
+
+	it('touched が true なら null（呼び出し側は欄に触れない）', () => {
+		expect(nextNamePatternOnParsed('D3000', d3000, true)).toBeNull();
+		expect(nextStartNumberOnParsed('D3000', d3000, true)).toBeNull();
+	});
+
+	it('アドレスが空・解析できない間は空文字列（欄を空に戻す）', () => {
+		expect(nextNamePatternOnParsed('', undefined, false)).toBe('');
+		expect(nextStartNumberOnParsed('', undefined, false)).toBe('');
+		expect(nextNamePatternOnParsed('Q?', { ok: false, message: 'x' }, false)).toBe('');
+		expect(nextStartNumberOnParsed('Q?', { ok: false, message: 'x' }, false)).toBe('');
+	});
+});
+
+describe('computeContinuousTags + 偽のドライバ: unit = points は型のワード数ぶん動く', () => {
+	it('f32 の 3 点は D100 / D102 / D104（words ではなく points で呼ぶ）', async () => {
+		const api = fakeAddressApi();
+		const params = buildContinuousParams(baseForm({ count: 3, dataType: 'f32' }));
+		const result = await computeContinuousTags(params!, 1, api);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D100', 'D102', 'D104']);
+		expect(api.offsetCalls[0].every((i) => i.unit === 'points')).toBe(true);
+	});
+
+	it('f64 の 3 点は 4 ワードずつ（D100 / D104 / D108）', async () => {
+		const params = buildContinuousParams(baseForm({ count: 3, dataType: 'f64' }));
+		const result = await computeContinuousTags(params!, 1, fakeAddressApi());
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D100', 'D104', 'D108']);
+	});
+
+	it('ドライバが解釈できない開始アドレスは、フォールバックせずエラーにする', async () => {
+		const params = buildContinuousParams(baseForm({ count: 2, startAddress: 'oops' }));
+		const result = await computeContinuousTags(params!, 1, fakeAddressApi());
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('解釈できません');
 	});
 });

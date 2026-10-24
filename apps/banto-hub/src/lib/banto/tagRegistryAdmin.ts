@@ -833,6 +833,8 @@ export type ParsedAddress =
 			canonical: string;
 			area: string | null;
 			writableArea: boolean | null;
+			/** R2b-6d-1: `area` の中の位置（`bit` を含まない。数値の位置を持たないドライバは `null`）。 */
+			index: number | null;
 			bit: number | null;
 			wordCount: number | null;
 	  }
@@ -850,6 +852,39 @@ export async function parseTagAddresses(
 	const response = await httpRequest<{ items: ParsedAddress[] }>('/api/tags/parse-addresses', {
 		method: 'POST',
 		body: { connectionId, items },
+		readOnly: true
+	});
+	return response.items;
+}
+
+/**
+ * R2b-6d: `POST /api/tags/offset-addresses` の要求の 1 行。**接続は項目ごと**（絞り込み「すべて」で
+ * 複数の接続のタグが混ざる）。`unit`: `"points"` = `n` 点ぶん（連続登録。型のワード数ぶん動く）、
+ * `"words"` = `n` ワードぶんの物理的な変位（オフセットコピー・構造体登録。ワード内ビットはビットを保つ）。
+ */
+export interface OffsetAddressItem {
+	connectionId: number;
+	tagKind?: TagKind;
+	address: string;
+	dataType: TagDataType;
+	stringLength?: number | null;
+	stringEncoding?: StringEncoding;
+	n: number;
+	unit: 'points' | 'words';
+}
+
+/** 1 回の要求の項目の上限（`rest/tags.rs::MAX_PARSE_ADDRESS_ITEMS`）。 */
+export const MAX_ADDRESS_ITEMS_PER_REQUEST = 10_000;
+
+/**
+ * `POST /api/tags/offset-addresses`: 各項目の接続のドライバでアドレスを動かした結果を、
+ * `parse-addresses` と同じ形・同じ順で返す（副作用なし・viewer 以上）。通信の失敗は例外
+ * （呼び出し側は「算出できない」として扱い、推測で埋めない）。
+ */
+export async function offsetTagAddresses(items: OffsetAddressItem[]): Promise<ParsedAddress[]> {
+	const response = await httpRequest<{ items: ParsedAddress[] }>('/api/tags/offset-addresses', {
+		method: 'POST',
+		body: { items },
 		readOnly: true
 	});
 	return response.items;

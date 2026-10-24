@@ -1,305 +1,395 @@
 /**
- * `structRegistration.ts` の `allocateStructFields`/`manualStructRows`/
- * `detectStructAddressCollisions`/`structRowsToTagInputs` に対するユニット
- * テスト（`continuousRegistration.test.ts` と同じ describe/it スタイル）。
+ * `structRegistration.ts` のユニットテスト（R2b-6d-2a）。アドレスの計算は REST
+ * （`parse-addresses` / `offset-addresses`）の結果を受け取る純関数と、REST を呼ぶ薄い層に分かれたので、
+ * REST は SLMP の `D` 系（10 進のワード・`.N` のビット）を真似た偽の `api`（`addressFake.ts`）で差し替える。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+
+// `addressSpan.ts` は REST のヘルパー（`tagRegistryAdmin.ts`）を既定の呼び口として import する。
+// `$state` を使うモジュールの読み込みで通信が始まらないよう、`tagCsvDiff.test.ts` と同じ軽量な
+// フェイクに差し替える（このテストは REST を偽の `api` で差し替えて呼ぶ）。
+vi.mock('@banto/admin-core', () => ({
+	getAuthProvider: () => ({ getToken: () => 'test-token' }),
+	ProviderError: class ProviderError extends Error {}
+}));
+vi.mock('./setup', () => ({ CSRF_HEADER: { 'X-Banto-Client': 'banto' } }));
+vi.mock('./deferredDelete.svelte', () => ({ deferredDelete: { flush: async () => {} } }));
+
 import {
 	allocateStructFields,
+	assembleAutoStructRows,
+	checkStructBase,
+	cumulativeWordOffsets,
 	detectStructAddressCollisions,
 	manualStructRows,
+	structFieldWordCounts,
 	structRowsToTagInputs,
+	STRUCT_BASE_BIT_ERROR,
 	type ExistingTagForCollision,
+	type StructAllocatedRow,
 	type StructField
 } from './structRegistration';
+import { fakeAddressApi, fakeParse } from './addressFake';
+import type { ParsedAddress } from './tagRegistryAdmin';
 
-describe('allocateStructFields: ワード累積の自動割付', () => {
-	it('i16 3フィールドは +1 ワードずつ連続する', () => {
-		const fields: StructField[] = [
-			{ name: 'a', dataType: 'i16' },
-			{ name: 'b', dataType: 'i16' },
-			{ name: 'c', dataType: 'i16' }
-		];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['D3000', 'D3001', 'D3002']);
-			expect(result.rows.map((r) => r.words)).toEqual([1, 1, 1]);
+const f = (name: string, dataType: StructField['dataType'], extra: Partial<StructField> = {}) => ({
+	name,
+	dataType,
+	...extra
+});
+
+describe('allocateStructFields: ワード累積の自動割付（REST は偽）', () => {
+	it('i16 3 フィールドは +1 ワードずつ連続する', async () => {
+		const api = fakeAddressApi();
+		const result = await allocateStructFields(
+			1,
+			'D3000',
+			[f('a', 'i16'), f('b', 'i16'), f('c', 'i16')],
+			api
+		);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D3000', 'D3001', 'D3002']);
+	});
+
+	it('u16 の直後に f32 を置く混在型: 累積オフセットは前のフィールドまでのワード数の和', async () => {
+		const api = fakeAddressApi();
+		const result = await allocateStructFields(
+			1,
+			'D100',
+			[f('a', 'u16'), f('b', 'f32'), f('c', 'u16'), f('d', 'f64'), f('e', 'i16')],
+			api
+		);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual([
+			'D100',
+			'D101',
+			'D103',
+			'D104',
+			'D108'
+		]);
+	});
+
+	it('累積のオフセットは unit = words で offset-addresses に渡し、接続を項目ごとに付ける', async () => {
+		const api = fakeAddressApi();
+		await allocateStructFields(7, 'D100', [f('a', 'f32'), f('b', 'u16'), f('c', 'i16')], api);
+		expect(api.offsetCalls).toHaveLength(1);
+		expect(api.offsetCalls[0].map((i) => [i.connectionId, i.n, i.unit])).toEqual([
+			[7, 0, 'words'],
+			[7, 2, 'words'],
+			[7, 3, 'words']
+		]);
+	});
+
+	it('string 型は文字列長ぶんのワードを占有し、stringEncoding を引き継ぐ', async () => {
+		const api = fakeAddressApi();
+		const result = await allocateStructFields(
+			1,
+			'D100',
+			[f('s', 'string', { stringLength: 4, stringEncoding: 'shift_jis' }), f('n', 'i16')],
+			api
+		);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D100', 'D104']);
+		expect(result.ok && result.rows[0]).toMatchObject({
+			stringLength: 4,
+			stringEncoding: 'shift_jis'
+		});
+	});
+
+	it('bit フィールドは 1 ワード占有として割り付ける（ビット位置のパッキングはしない）', async () => {
+		const api = fakeAddressApi();
+		const result = await allocateStructFields(1, 'D100', [f('x', 'bit'), f('y', 'bit')], api);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D100', 'D101']);
+	});
+
+	it('ベースアドレスがワード内ビット（D100.5）なら断る（bit が null でない）', async () => {
+		const result = await allocateStructFields(1, 'D100.5', [f('a', 'i16')], fakeAddressApi());
+		expect(result).toEqual({ ok: false, error: STRUCT_BASE_BIT_ERROR });
+	});
+
+	it('ドライバが解釈できないベースは、API のメッセージつきで断る（推測しない）', async () => {
+		const result = await allocateStructFields(1, '???', [f('a', 'i16')], fakeAddressApi());
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('解釈できません');
+	});
+
+	it('累積の途中で範囲外になった行は、その行のエラー（API のメッセージつき）', async () => {
+		const api = fakeAddressApi();
+		api.offset = async (items) =>
+			items.map((item, i) =>
+				i === 1
+					? { ok: false as const, message: 'アドレスが範囲外です' }
+					: fakeParse({ tagKind: 'plc', address: item.address, dataType: item.dataType })
+			);
+		const result = await allocateStructFields(1, 'D100', [f('a', 'i16'), f('b', 'i16')], api);
+		expect(result.ok).toBe(false);
+		if (!result.ok) {
+			expect(result.error).toContain('2行目（b）');
+			expect(result.error).toContain('アドレスが範囲外です');
 		}
 	});
 
-	it('i32/u32/f32 は2ワード占有し、後続フィールドは2ワード分ずれる', () => {
-		const fields: StructField[] = [
-			{ name: 'temp', dataType: 'f32' },
-			{ name: 'count', dataType: 'i32' },
-			{ name: 'flag', dataType: 'bit' }
-		];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			// temp: D3000-D3001 (2word), count: D3002-D3003 (2word), flag: D3004 (1word)
-			expect(result.rows.map((r) => r.address)).toEqual(['D3000', 'D3002', 'D3004']);
-			expect(result.rows.map((r) => r.words)).toEqual([2, 2, 1]);
-		}
+	it('ベースアドレスが空・フィールド 0 件・名前が空・string の長さ不正は API を呼ばずにエラー', async () => {
+		const api = fakeAddressApi();
+		expect((await allocateStructFields(1, '  ', [f('a', 'i16')], api)).ok).toBe(false);
+		expect((await allocateStructFields(1, 'D100', [], api)).ok).toBe(false);
+		expect((await allocateStructFields(1, 'D100', [f('', 'i16')], api)).ok).toBe(false);
+		expect((await allocateStructFields(1, 'D100', [f('s', 'string')], api)).ok).toBe(false);
+		const fractional = await allocateStructFields(
+			1,
+			'D100',
+			[f('s', 'string', { stringLength: 1.5 })],
+			api
+		);
+		expect(fractional.ok).toBe(false);
+		expect(api.parseCalls).toHaveLength(0);
+		expect(api.offsetCalls).toHaveLength(0);
 	});
 
-	it('#325: i64/u64/f64 は4ワード占有し、後続フィールドは4ワード分ずれる', () => {
-		const fields: StructField[] = [
-			{ name: 'temp', dataType: 'f64' },
-			{ name: 'count', dataType: 'i64' },
-			{ name: 'flag', dataType: 'bit' }
-		];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			// temp: D3000-D3003 (4word), count: D3004-D3007 (4word), flag: D3008 (1word)
-			expect(result.rows.map((r) => r.address)).toEqual(['D3000', 'D3004', 'D3008']);
-			expect(result.rows.map((r) => r.words)).toEqual([4, 4, 1]);
-		}
-	});
-
-	it('string 型は文字列長ぶんのワードを占有する', () => {
-		const fields: StructField[] = [
-			{ name: 'name', dataType: 'string', stringLength: 8 },
-			{ name: 'next', dataType: 'i16' }
-		];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows[0]).toMatchObject({ address: 'D3000', words: 8, stringLength: 8 });
-			expect(result.rows[1]).toMatchObject({ address: 'D3008', words: 1 });
-		}
-	});
-
-	it('string 型の stringEncoding をそのまま引き継ぐ（既定 utf8 以外も可）', () => {
-		const fields: StructField[] = [
-			{ name: 'name', dataType: 'string', stringLength: 8, stringEncoding: 'shift_jis' }
-		];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows[0]).toMatchObject({ stringEncoding: 'shift_jis' });
-		}
-	});
-
-	it('string 型で文字列長未指定はエラー', () => {
-		const fields: StructField[] = [{ name: 'name', dataType: 'string' }];
-		const result = allocateStructFields('D3000', fields);
+	it('通信の失敗はエラーにする（推測で埋めない）', async () => {
+		const api = fakeAddressApi();
+		api.parse = async () => {
+			throw new Error('network down');
+		};
+		const result = await allocateStructFields(1, 'D100', [f('a', 'i16')], api);
 		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/文字列長/);
-	});
-
-	it('string 型で文字列長が小数（1.5）はエラー', () => {
-		const fields: StructField[] = [{ name: 'name', dataType: 'string', stringLength: 1.5 }];
-		const result = allocateStructFields('D3000', fields);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/文字列長/);
-	});
-
-	it('bit フィールドは1ワード占有として素直に割り付けられる（重ならない）', () => {
-		const fields: StructField[] = [
-			{ name: 'flag1', dataType: 'bit' },
-			{ name: 'flag2', dataType: 'bit' },
-			{ name: 'value', dataType: 'i16' }
-		];
-		const result = allocateStructFields('M100', fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['M100', 'M101', 'M102']);
-		}
-	});
-
-	it('デバイス番号の上限（MAX_DEVICE_NUMBER=0x00FFFFFF）を超えるとエラー', () => {
-		const fields: StructField[] = [
-			{ name: 'a', dataType: 'i32' },
-			{ name: 'b', dataType: 'i16' }
-		];
-		// D16777215 = MAX_DEVICE_NUMBER。1フィールド目がi32(2word)を占有するため
-		// 2フィールド目の開始アドレスが上限を超える。
-		const result = allocateStructFields('D16777214', fields);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/上限/);
-	});
-
-	it('ベースアドレスが空ならエラー', () => {
-		const result = allocateStructFields('', [{ name: 'a', dataType: 'i16' }]);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/ベースアドレス/);
-	});
-
-	it('ベースアドレスにビットサフィックスがあるとエラー', () => {
-		const result = allocateStructFields('D100.5', [{ name: 'a', dataType: 'i16' }]);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/ビット指定/);
-	});
-
-	it('フィールドが0件ならエラー', () => {
-		const result = allocateStructFields('D3000', []);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/1つ以上/);
-	});
-
-	it('フィールド名が空ならエラー', () => {
-		const result = allocateStructFields('D3000', [{ name: '  ', dataType: 'i16' }]);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/フィールド名/);
+		if (!result.ok) expect(result.error).toContain('network down');
 	});
 });
 
 describe('manualStructRows: 手動割付', () => {
-	it('各フィールドの明示アドレスをそのまま使う', () => {
-		const fields: StructField[] = [
-			{ name: 'a', dataType: 'i16', address: 'D3000' },
-			{ name: 'b', dataType: 'f32', address: 'D3100' },
-			{ name: 'c', dataType: 'string', stringLength: 4, address: 'W200' }
-		];
-		const result = manualStructRows(fields);
-		expect(result.ok).toBe(true);
-		if (result.ok) {
-			expect(result.rows.map((r) => r.address)).toEqual(['D3000', 'D3100', 'W200']);
-			expect(result.rows.map((r) => r.words)).toEqual([1, 2, 4]);
-		}
-	});
-
-	it('アドレス未入力の行があればエラー', () => {
-		const result = manualStructRows([{ name: 'a', dataType: 'i16', address: '' }]);
-		expect(result.ok).toBe(false);
-		if (!result.ok) expect(result.error).toMatch(/アドレス/);
-	});
-
-	it('フィールドが0件ならエラー', () => {
-		const result = manualStructRows([]);
-		expect(result.ok).toBe(false);
-	});
-});
-
-describe('detectStructAddressCollisions: フィールド間衝突', () => {
-	it('自動割付の正常系では衝突なし', () => {
-		const alloc = allocateStructFields('D3000', [
-			{ name: 'a', dataType: 'f32' },
-			{ name: 'b', dataType: 'i16' }
-		]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const collisions = detectStructAddressCollisions(alloc.rows, [], 1);
-		expect(collisions).toEqual([]);
-	});
-
-	it('手動割付で2フィールドのワード範囲が重なると field-address-overlap を返す', () => {
-		const manual = manualStructRows([
-			{ name: 'a', dataType: 'f32', address: 'D3000' }, // D3000-D3001
-			{ name: 'b', dataType: 'i16', address: 'D3001' } // D3001 と重なる
-		]);
-		expect(manual.ok).toBe(true);
-		if (!manual.ok) return;
-		const collisions = detectStructAddressCollisions(manual.rows, [], 1);
-		expect(collisions.some((c) => c.kind === 'field-address-overlap' && c.index === 1)).toBe(true);
-	});
-
-	it('構造体内でフィールド名が重複すると field-name-duplicate を返す', () => {
-		const manual = manualStructRows([
-			{ name: 'dup', dataType: 'i16', address: 'D3000' },
-			{ name: 'dup', dataType: 'i16', address: 'D3001' }
-		]);
-		expect(manual.ok).toBe(true);
-		if (!manual.ok) return;
-		const collisions = detectStructAddressCollisions(manual.rows, [], 1);
-		expect(collisions.some((c) => c.kind === 'field-name-duplicate' && c.index === 1)).toBe(true);
-	});
-});
-
-describe('detectStructAddressCollisions: 既存タグとの衝突', () => {
-	const existing: ExistingTagForCollision[] = [
-		{ name: 'existingTag', collectionGroupId: 1, address: 'D3001', dataType: 'i16' }
-	];
-
-	it('既存タグとアドレス範囲が重なると existing-address-overlap を返す', () => {
-		const alloc = allocateStructFields('D3000', [
-			{ name: 'a', dataType: 'f32' }, // D3000-D3001, D3001 で既存と重なる
-			{ name: 'b', dataType: 'i16' }
-		]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const collisions = detectStructAddressCollisions(alloc.rows, existing, 1);
-		expect(collisions.some((c) => c.kind === 'existing-address-overlap' && c.index === 0)).toBe(
-			true
+	it('各フィールドの明示アドレスを解析して正規形にする', async () => {
+		const result = await manualStructRows(
+			1,
+			[f('a', 'i16', { address: 'd200' }), f('b', 'f32', { address: 'D300' })],
+			fakeAddressApi()
 		);
+		expect(result.ok && result.rows.map((r) => r.address)).toEqual(['D200', 'D300']);
+		expect(result.ok && result.rows[1].span).toMatchObject({ area: 'D', index: 300, wordCount: 2 });
 	});
 
-	it('既存タグと同名のフィールドは existing-name-duplicate を返す', () => {
-		const alloc = allocateStructFields('D4000', [{ name: 'existingTag', dataType: 'i16' }]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const collisions = detectStructAddressCollisions(alloc.rows, existing, 1);
-		expect(collisions.some((c) => c.kind === 'existing-name-duplicate')).toBe(true);
+	it('解釈できない行は、その行のエラー（API のメッセージつき）', async () => {
+		const result = await manualStructRows(
+			1,
+			[f('a', 'i16', { address: 'D200' }), f('b', 'i16', { address: 'oops' })],
+			fakeAddressApi()
+		);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('2行目（b）');
 	});
 
-	it('別の収集グループの既存タグとは衝突しない（グループ内一意の設計）', () => {
-		const alloc = allocateStructFields('D3000', [{ name: 'a', dataType: 'f32' }]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		// existing は collectionGroupId=1、ここでは別グループ(2)に対して検査する。
-		const collisions = detectStructAddressCollisions(alloc.rows, existing, 2);
-		expect(collisions).toEqual([]);
+	it('アドレス未入力の行・フィールド 0 件はエラー', async () => {
+		expect((await manualStructRows(1, [f('a', 'i16', { address: '' })], fakeAddressApi())).ok).toBe(
+			false
+		);
+		expect((await manualStructRows(1, [], fakeAddressApi())).ok).toBe(false);
+	});
+});
+
+describe('純関数: checkStructBase / structFieldWordCounts / cumulativeWordOffsets / assembleAutoStructRows', () => {
+	const ok = (canonical: string, bit: number | null = null, wordCount = 1): ParsedAddress => ({
+		ok: true,
+		canonical,
+		area: 'D',
+		writableArea: true,
+		index: 100,
+		bit,
+		wordCount
 	});
 
-	it('アドレス・名前とも衝突がなければ空配列', () => {
-		const alloc = allocateStructFields('D5000', [{ name: 'freshTag', dataType: 'i16' }]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const collisions = detectStructAddressCollisions(alloc.rows, existing, 1);
-		expect(collisions).toEqual([]);
+	it('checkStructBase: どちらかの型で通れば良く、bit が付いていれば断る', () => {
+		expect(checkStructBase([ok('D100'), { ok: false, message: 'x' }])).toEqual({ ok: true });
+		expect(checkStructBase([{ ok: false, message: 'x' }, ok('D100')])).toEqual({ ok: true });
+		expect(checkStructBase([ok('D100.5', 5), ok('D100.5', 5)])).toEqual({
+			ok: false,
+			error: STRUCT_BASE_BIT_ERROR
+		});
+		const both = checkStructBase([
+			{ ok: false, message: '範囲外' },
+			{ ok: false, message: '範囲外' }
+		]);
+		expect(both.ok).toBe(false);
+	});
+
+	it('structFieldWordCounts: bit 型は 1、それ以外は解析結果の wordCount、失敗は行のエラー', () => {
+		const fields = [f('a', 'bit'), f('b', 'f32'), f('c', 'i64')];
+		expect(
+			structFieldWordCounts(fields, [undefined, ok('D100', null, 2), ok('D100', null, 4)])
+		).toEqual({ ok: true, counts: [1, 2, 4] });
+		const failed = structFieldWordCounts(fields, [
+			undefined,
+			ok('D100', null, 2),
+			{ ok: false, message: 'この型は使えません' }
+		]);
+		expect(failed.ok).toBe(false);
+		if (!failed.ok) expect(failed.error).toContain('3行目（c）');
+	});
+
+	it('cumulativeWordOffsets: 先頭は 0、以降は前までの和', () => {
+		expect(cumulativeWordOffsets([1, 2, 4, 1])).toEqual([0, 1, 3, 7]);
+		expect(cumulativeWordOffsets([])).toEqual([]);
+	});
+
+	it('assembleAutoStructRows: 結果の欠落は行のエラー', () => {
+		const result = assembleAutoStructRows([f('a', 'i16'), f('b', 'i16')], [ok('D100')]);
+		expect(result.ok).toBe(false);
+		if (!result.ok) expect(result.error).toContain('2行目（b）');
+	});
+});
+
+// --- 衝突検出 ---------------------------------------------------------------------------------
+
+type SpanLike = { area: string | null; index: number | null; wordCount: number };
+
+function row(name: string, address: string, span: SpanLike): StructAllocatedRow {
+	return { name, address, dataType: 'i16', span: { canonical: address, ...span } };
+}
+
+function existing(
+	name: string,
+	groupId: number,
+	canonical: string,
+	span: SpanLike | null
+): ExistingTagForCollision {
+	return { name, collectionGroupId: groupId, span: span && { canonical, ...span } };
+}
+
+describe('detectStructAddressCollisions: フィールド間・名前', () => {
+	it('同じ area で [index, index+wordCount-1] が重なると field-address-overlap', () => {
+		const rows = [
+			row('a', 'D100', { area: 'D', index: 100, wordCount: 2 }),
+			row('b', 'D101', { area: 'D', index: 101, wordCount: 1 })
+		];
+		const collisions = detectStructAddressCollisions(rows, [], 1);
+		expect(collisions.map((c) => [c.index, c.kind])).toEqual([
+			[0, 'field-address-overlap'],
+			[1, 'field-address-overlap']
+		]);
+	});
+
+	it('隣り合うだけ（D100 の 2 ワードと D102）は重ならない', () => {
+		const rows = [
+			row('a', 'D100', { area: 'D', index: 100, wordCount: 2 }),
+			row('b', 'D102', { area: 'D', index: 102, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(rows, [], 1)).toEqual([]);
+	});
+
+	it('別の area は index が同じでも重ならない', () => {
+		const rows = [
+			row('a', 'D100', { area: 'D', index: 100, wordCount: 1 }),
+			row('b', 'W100', { area: 'W', index: 100, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(rows, [], 1)).toEqual([]);
+	});
+
+	it('ワード内ビットは bit を見ずにワードを占める（同じワードの別のビットも重なる）', () => {
+		const rows = [
+			row('a', 'D100.1', { area: 'D', index: 100, wordCount: 1 }),
+			row('b', 'D100.2', { area: 'D', index: 100, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(rows, [], 1).map((c) => c.kind)).toEqual([
+			'field-address-overlap',
+			'field-address-overlap'
+		]);
+	});
+
+	it('index が無い（位置を持たないドライバ）ものは canonical の一致だけを見る', () => {
+		const same = [
+			row('a', 'FOO.1', { area: 'FOO', index: null, wordCount: 1 }),
+			row('b', 'FOO.1', { area: 'FOO', index: null, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(same, [], 1)).toHaveLength(2);
+		const different = [
+			row('a', 'FOO.1', { area: 'FOO', index: null, wordCount: 1 }),
+			row('b', 'FOO.2', { area: 'FOO', index: null, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(different, [], 1)).toEqual([]);
+	});
+
+	it('構造体内でフィールド名が重複すると field-name-duplicate', () => {
+		const rows = [
+			row('a', 'D100', { area: 'D', index: 100, wordCount: 1 }),
+			row('a', 'D101', { area: 'D', index: 101, wordCount: 1 })
+		];
+		expect(detectStructAddressCollisions(rows, [], 1).map((c) => c.kind)).toEqual([
+			'field-name-duplicate'
+		]);
+	});
+});
+
+describe('detectStructAddressCollisions: 既存タグとの衝突（収集グループで絞る）', () => {
+	const r = [row('x', 'D100', { area: 'D', index: 100, wordCount: 2 })];
+
+	it('同じグループの既存タグと占有が重なると existing-address-overlap', () => {
+		const found = detectStructAddressCollisions(
+			r,
+			[existing('old', 1, 'D101', { area: 'D', index: 101, wordCount: 1 })],
+			1
+		);
+		expect(found.map((c) => c.kind)).toEqual(['existing-address-overlap']);
+		expect(found[0].message).toContain('既存タグ「old」');
+	});
+
+	it('別の収集グループの既存タグとは、同じ PLC でも衝突しない', () => {
+		expect(
+			detectStructAddressCollisions(
+				r,
+				[existing('old', 2, 'D101', { area: 'D', index: 101, wordCount: 1 })],
+				1
+			)
+		).toEqual([]);
+	});
+
+	it('同名の既存タグは existing-name-duplicate（占有が分からない既存タグでも名前は見る）', () => {
+		const found = detectStructAddressCollisions(r, [existing('x', 1, 'x', null)], 1);
+		expect(found.map((c) => c.kind)).toEqual(['existing-name-duplicate']);
+	});
+
+	it('占有が分からない既存タグはアドレスでは衝突しない', () => {
+		expect(detectStructAddressCollisions(r, [existing('old', 1, 'D100', null)], 1)).toEqual([]);
+	});
+
+	it('衝突がなければ空配列', () => {
+		expect(
+			detectStructAddressCollisions(
+				r,
+				[existing('old', 1, 'D200', { area: 'D', index: 200, wordCount: 1 })],
+				1
+			)
+		).toEqual([]);
 	});
 });
 
 describe('structRowsToTagInputs', () => {
-	it('割付結果を TagInput 配列へ変換する', () => {
-		const alloc = allocateStructFields('D3000', [
-			{ name: 'a', dataType: 'i16' },
-			{ name: 'b', dataType: 'string', stringLength: 4 }
-		]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const inputs = structRowsToTagInputs(alloc.rows, {
-			collectionGroupId: 7,
-			enabled: true,
-			writable: false
-		});
-		expect(inputs).toEqual([
+	it('割付結果を TagInput 配列へ変換する（アドレスは正規形）', () => {
+		const rows: StructAllocatedRow[] = [
 			{
 				name: 'a',
-				collectionGroupId: 7,
-				address: 'D3000',
+				address: 'D100',
 				dataType: 'i16',
-				stringLength: undefined,
-				decimals: 0,
-				enabled: true,
-				writable: false
+				span: { canonical: 'D100', area: 'D', index: 100, wordCount: 1 }
 			},
 			{
-				name: 'b',
-				collectionGroupId: 7,
-				address: 'D3001',
+				name: 's',
+				address: 'D101',
 				dataType: 'string',
 				stringLength: 4,
-				decimals: 0,
-				enabled: true,
-				writable: false
+				stringEncoding: 'shift_jis',
+				span: { canonical: 'D101', area: 'D', index: 101, wordCount: 4 }
 			}
-		]);
-	});
-
-	it('string フィールドの stringEncoding を TagInput へ引き継ぐ', () => {
-		const alloc = allocateStructFields('D3000', [
-			{ name: 'name', dataType: 'string', stringLength: 8, stringEncoding: 'shift_jis' }
-		]);
-		expect(alloc.ok).toBe(true);
-		if (!alloc.ok) return;
-		const inputs = structRowsToTagInputs(alloc.rows, {
-			collectionGroupId: 7,
+		];
+		const inputs = structRowsToTagInputs(rows, {
+			collectionGroupId: 3,
 			enabled: true,
 			writable: false
 		});
-		expect(inputs[0].stringEncoding).toBe('shift_jis');
+		expect(inputs[0]).toMatchObject({
+			name: 'a',
+			collectionGroupId: 3,
+			address: 'D100',
+			dataType: 'i16',
+			decimals: 0,
+			enabled: true,
+			writable: false
+		});
+		expect(inputs[1]).toMatchObject({ stringLength: 4, stringEncoding: 'shift_jis' });
 	});
 });

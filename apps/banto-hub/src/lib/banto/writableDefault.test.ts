@@ -1,6 +1,6 @@
 /**
  * `writableDefault.ts`（T19 S1-b UX-34）に対するユニットテスト。
- * `tagFormLayout.test.ts`/`slmpDeviceTable.test.ts` と同じスタイル
+ * `tagFormLayout.test.ts` と同じスタイル
  * （describe/it、依存ゼロの純関数を直接 import）。
  *
  * R2b-2d（2026-10-22）: `writableArea` は解析の API（`POST /api/tags/parse-addresses`）

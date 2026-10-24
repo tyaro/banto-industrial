@@ -32,6 +32,10 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 		await injectAuthToken(page, token);
 		const authedHeaders = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
 
+		// R2b-6d-2a: アドレスの計算はドライバに任せる（`POST /api/tags/offset-addresses`）ので、
+		// `D100` のような SLMP のデバイス記法を使うこの spec の接続は `slmp` にする
+		// （modbus-tcp の接続では `D100` をドライバが断る）。
+		//
 		// 前提データ: シミュレーションモードの PLC接続 + その配下の収集
 		// グループを1件ずつ作る（実 PLC/実ネットワークへは繋がない - タグ
 		// 連続登録フォームが必要とするのは「選択できる収集グループが1件
@@ -40,10 +44,10 @@ test.describe.serial('banto-hub タグ連続登録 DOM (TAG-P0-1)', () => {
 			headers: authedHeaders,
 			data: {
 				name: CONNECTION_NAME,
-				protocol: 'modbus-tcp',
+				protocol: 'slmp',
 				enabled: true,
 				simulation: true,
-				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
+				settings: { host: '127.0.0.1', port: 5010 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);
