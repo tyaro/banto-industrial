@@ -54,18 +54,17 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 
 		await cleanupExistingFixtures(page.request, authedHeaders);
 
-		// プレビュー生成（`generateContinuousTags`）は接続プロトコルに依存せず
-		// フォームの開始アドレス文字列を `parseSlmpAddress` で解釈するだけなので、
-		// 他 spec と同じ modbus-tcp のシミュレーション接続で足りる（X/D 等の
-		// デバイス記法のプレビューはこの DOM テストの範囲では protocol 非依存）。
+		// R2b-6d-2a: プレビューのアドレスは `POST /api/tags/offset-addresses` がドライバで
+		// 計算する（16 進デバイスの桁上がり・ワード内ビットの繰り上がり）ので、X/D 等の
+		// SLMP のデバイス記法を使うこの spec の接続は `slmp` のシミュレーション接続にする。
 		const connectionRes = await page.request.post('/api/plc-connections', {
 			headers: authedHeaders,
 			data: {
 				name: CONNECTION_NAME,
-				protocol: 'modbus-tcp',
+				protocol: 'slmp',
 				enabled: true,
 				simulation: true,
-				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
+				settings: { host: '127.0.0.1', port: 5010 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

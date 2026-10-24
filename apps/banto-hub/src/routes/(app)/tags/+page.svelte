@@ -86,6 +86,7 @@
 		type BatchTagUpdateRow,
 		type BatchTagFieldError,
 		type ParseAddressItem,
+		type ParsedAddress,
 		parseTagAddresses
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import {
@@ -107,10 +108,10 @@
 	import { getCommissioningStatus, type CommissioningStatus } from '#lib/banto/commissioning.js';
 	import {
 		buildContinuousParams,
-		generateContinuousTags,
+		computeContinuousTags,
 		MAX_CONTINUOUS_COUNT,
-		nextNamePatternOnAddressChange,
-		nextStartNumberOnAddressChange,
+		nextNamePatternOnParsed,
+		nextStartNumberOnParsed,
 		type ContinuousFormState,
 		type ContinuousRegistrationResult
 	} from '#lib/banto/continuousRegistration.js';
@@ -123,8 +124,9 @@
 		type StructCollision,
 		type StructField
 	} from '#lib/banto/structRegistration.js';
+	import { fetchExistingSpans } from '#lib/banto/addressSpan.js';
 	import {
-		buildOffsetCopyRows,
+		computeOffsetCopy,
 		offsetCopyRowsToTagInputs,
 		type OffsetCopyResult
 	} from '#lib/banto/offsetCopy.js';
@@ -3683,7 +3685,7 @@
 	// --- T11-1: 連続登録 (docs/ux-plan.md §3) ------------------------------
 	//
 	// 名前パターン・開始番号・開始アドレス・点数・共通設定から
-	// `generateContinuousTags`（純関数、#lib/banto/continuousRegistration.ts）
+	// `computeContinuousTags`（#lib/banto/continuousRegistration.ts。アドレスは REST で計算）
 	// でプレビュー行を組み立て、確認後に一括 API を叩く。連続登録は PLC
 	// アドレスを前提とする機能のため tagKind は常に 'plc'（TagInput 側の
 	// 既定と同じ、フォーム自体に種別選択は出さない）。
@@ -3692,7 +3694,7 @@
 	// デバイス名から導出・開始番号は入力不要」、2026-09-02 オーナー決定）:
 	// `namePattern`/`startNumber` はもう固定の初期値（旧 `temp{n}`/`1`）を
 	// 持たず空で始め、開始アドレス欄の入力に追従して
-	// `nextNamePatternOnAddressChange`/`nextStartNumberOnAddressChange`
+	// `nextNamePatternOnParsed`/`nextStartNumberOnParsed`
 	// （touched 追跡方式、`#lib/banto/tagNamePrefill.ts::
 	// nextTagNameOnAddressChange` と同じ設計）でプリフィルする。
 
@@ -3756,9 +3758,86 @@
 	 * パラメータ組み立て自体（`form.count` 等の number|null 混入への対応、
 	 * TAG-P0-1）は `#lib/banto/continuousRegistration.ts` の
 	 * {@link buildContinuousParams} に切り出してある。 */
-	let continuousPreview: ContinuousRegistrationResult | null = $derived.by(() => {
+	let continuousPreview = $state<ContinuousRegistrationResult | null>(null);
+	let continuousPreviewSeq = 0;
+	/** 対象グループの接続（数値の `$derived` にして、一覧の再読み込みで effect が再実行されないようにする）。 */
+	const continuousConnectionId = $derived(
+		connectionForGroupId(continuousForm.collectionGroupId)?.id
+	);
+	/** 入力の中身が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	const continuousParamsKey = $derived.by(() => {
 		const params = buildContinuousParams(continuousForm);
-		return params ? generateContinuousTags(params) : null;
+		return params ? JSON.stringify(params) : null;
+	});
+
+	/**
+	 * R2b-6d-2a: アドレスの計算は `POST /api/tags/offset-addresses`（`unit: "points"`、全件を 1 回）。
+	 * 入力に追従して呼ぶので 300ms 待ってから呼び、古い応答は世代番号で捨てる。結果が届くまで
+	 * プレビューは空（古い入力のプレビューから登録させない）。
+	 */
+	$effect(() => {
+		const seq = ++continuousPreviewSeq;
+		const key = continuousParamsKey;
+		const connectionId = continuousConnectionId;
+		continuousPreview = null;
+		if (key === null) return;
+		const params = untrack(() => buildContinuousParams(continuousForm));
+		if (params === null) return;
+		if (connectionId === undefined) {
+			continuousPreview = { ok: false, error: '収集グループの接続が見つかりません。' };
+			return;
+		}
+		const timer = setTimeout(() => {
+			void computeContinuousTags(params, connectionId).then((result) => {
+				if (seq === continuousPreviewSeq) continuousPreview = result;
+			});
+		}, 300);
+		return () => clearTimeout(timer);
+	});
+
+	let continuousPrefillSeq = 0;
+	/**
+	 * R2b-6d-2a（設計 §7.1）: 開始アドレスから名前パターン・開始番号の既定を導出する。導出は
+	 * `parse-addresses` の結果（`canonical`・`area`・`index`）から（`continuousRegistration.ts`）。
+	 * 欄をユーザーが直接編集したら追従しない（touched 追跡）。通信の失敗では欄に触れない。
+	 */
+	$effect(() => {
+		const seq = ++continuousPrefillSeq;
+		const address = continuousForm.startAddress.trim();
+		const connectionId = continuousConnectionId;
+		const dataType = continuousForm.dataType;
+		const stringLength =
+			dataType === 'string'
+				? Math.max(1, parseOptionalNumber(continuousForm.stringLength) ?? 1)
+				: undefined;
+		const apply = (parsed: ParsedAddress | undefined) => {
+			if (seq !== continuousPrefillSeq) return;
+			untrack(() => {
+				const nextPattern = nextNamePatternOnParsed(address, parsed, continuousNamePatternTouched);
+				if (nextPattern !== null) continuousForm.namePattern = nextPattern;
+				const nextStart = nextStartNumberOnParsed(address, parsed, continuousStartNumberTouched);
+				if (nextStart !== null) continuousForm.startNumber = nextStart;
+			});
+		};
+		if (address === '' || connectionId === undefined) {
+			apply(undefined);
+			return;
+		}
+		const timer = setTimeout(() => {
+			// 型によって通る形が違う（ビット型は `D100` を断ることがある）ので、選択中の型で通らなければ u16 でも試す。
+			const probe = (type: TagDataType): ParseAddressItem => ({
+				tagKind: 'plc',
+				address,
+				dataType: type,
+				stringLength: type === 'string' ? stringLength : undefined
+			});
+			const items = dataType === 'u16' ? [probe(dataType)] : [probe(dataType), probe('u16')];
+			parseTagAddresses(connectionId, items).then(
+				(results) => apply(results.find((r) => r.ok) ?? results[0]),
+				() => {}
+			);
+		}, 300);
+		return () => clearTimeout(timer);
 	});
 
 	const continuousTagsJson = $derived(
@@ -3932,32 +4011,90 @@
 		return true;
 	}
 
-	/** 入力が変わるたびに再計算される、割付前プレビュー本体。 */
-	const structAllocation: StructAllocationResult | null = $derived.by(() => {
-		if (structForm.collectionGroupId === '') return null;
-		const fields: StructField[] = structForm.fields.map((f) => ({
+	/** 入力に追従して再計算される、割付前プレビュー本体（下の effect が埋める）。 */
+	let structAllocation = $state<StructAllocationResult | null>(null);
+	/** フィールド間・既存タグとのアドレス／名前衝突（クライアント側の先取り
+	 * チェック - 最終判定はサーバー側 dry-run/実登録）。`structAllocation` と同時に更新する。 */
+	let structCollisions = $state<StructCollision[]>([]);
+	let structComputeSeq = 0;
+	/** 対象グループの接続（数値の `$derived`。一覧の再読み込みで effect が再実行されないようにする）。 */
+	const structConnectionId = $derived(connectionForGroupId(structForm.collectionGroupId)?.id);
+
+	function structFieldsFromForm(): StructField[] {
+		return structForm.fields.map((f) => ({
 			name: f.name,
 			dataType: f.dataType,
 			stringLength: f.dataType === 'string' ? (parseOptionalNumber(f.stringLength) ?? null) : null,
 			stringEncoding: f.dataType === 'string' ? f.stringEncoding : null,
 			address: structForm.mode === 'manual' ? f.address : undefined
 		}));
-		return structForm.mode === 'auto'
-			? allocateStructFields(structForm.baseAddress, fields)
-			: manualStructRows(fields);
-	});
+	}
 
-	/** フィールド間・既存タグとのアドレス／名前衝突（クライアント側の先取り
-	 * チェック - 最終判定はサーバー側 dry-run/実登録）。 */
-	const structCollisions: StructCollision[] = $derived(
-		structAllocation?.ok
-			? detectStructAddressCollisions(
-					structAllocation.rows,
-					tags,
-					Number(structForm.collectionGroupId)
-				)
-			: []
+	/** 入力の中身が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	const structInputKey = $derived(
+		structForm.collectionGroupId === ''
+			? null
+			: JSON.stringify([structForm.mode, structForm.baseAddress, structFieldsFromForm()])
 	);
+
+	/**
+	 * R2b-6d-2a: 割付・衝突検出の計算はドライバに任せる（`structRegistration.ts`。ベースの検証と
+	 * ワード数は `parse-addresses`、フィールドのアドレスは `offset-addresses`（`unit: "words"`）、
+	 * 既存タグの占有は `parse-addresses`）。入力に追従して呼ぶので 300ms 待ってから呼び、古い応答は
+	 * 世代番号で捨てる。結果が届くまでプレビューは空（古い入力のプレビューから登録させない）。
+	 */
+	$effect(() => {
+		const seq = ++structComputeSeq;
+		const key = structInputKey;
+		const connectionId = structConnectionId;
+		structAllocation = null;
+		structCollisions = [];
+		if (key === null) return;
+		if (connectionId === undefined) {
+			structAllocation = { ok: false, error: '収集グループの接続が見つかりません。' };
+			return;
+		}
+		const mode = untrack(() => structForm.mode);
+		const baseAddress = untrack(() => structForm.baseAddress);
+		const groupId = untrack(() => Number(structForm.collectionGroupId));
+		const fields = untrack(() => structFieldsFromForm());
+		const timer = setTimeout(() => {
+			void (async () => {
+				const allocation =
+					mode === 'auto'
+						? await allocateStructFields(connectionId, baseAddress, fields)
+						: await manualStructRows(connectionId, fields);
+				if (seq !== structComputeSeq) return;
+				if (!allocation.ok) {
+					structAllocation = allocation;
+					return;
+				}
+				try {
+					const existingTags = untrack(() => tags).filter((t) => t.collectionGroupId === groupId);
+					const spans = await fetchExistingSpans(existingTags, () => connectionId);
+					if (seq !== structComputeSeq) return;
+					structCollisions = detectStructAddressCollisions(
+						allocation.rows,
+						existingTags.map((t) => ({
+							name: t.name,
+							collectionGroupId: t.collectionGroupId,
+							span: spans.get(t.id) ?? null
+						})),
+						groupId
+					);
+					structAllocation = allocation;
+				} catch (err) {
+					// 既存タグの占有を確認できないまま「衝突なし」にしない。
+					if (seq !== structComputeSeq) return;
+					structAllocation = {
+						ok: false,
+						error: `既存タグのアドレスを確認できませんでした（${errorMessage(err)}）。`
+					};
+				}
+			})();
+		}, 300);
+		return () => clearTimeout(timer);
+	});
 
 	const structTagInputs: TagInput[] | null = $derived(
 		structAllocation?.ok
@@ -4655,21 +4792,56 @@
 	 * number input 由来のため `string | number | null`。 */
 	let bulkOffsetWords: string | number | null = $state('');
 
-	/** 入力が変わるたびに再計算される割付＋衝突検出結果（`selectedTags` を
-	 * source、`tags`（全件）を既存タグ一覧として渡す）。オフセット未入力の
-	 * 間は `null`（プレビューを出さない - 連続登録/構造体登録と同じ
-	 * 「静かに空のまま」方針）。 */
-	const bulkOffsetCopyResult = $derived.by((): OffsetCopyResult | null => {
+	/** 入力に追従して再計算される割付＋衝突検出結果（下の effect が埋める。`selectedTags` を
+	 * source、`tags`（全件）を既存タグ一覧として渡す）。オフセット未入力の間は `null`
+	 * （プレビューを出さない - 連続登録/構造体登録と同じ「静かに空のまま」方針）。 */
+	let bulkOffsetCopyResult = $state<OffsetCopyResult | null>(null);
+	let bulkOffsetCopySeq = 0;
+	/** 入力の中身（選択タグとオフセット）が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	const bulkOffsetCopyKey = $derived.by((): string | null => {
 		if (bulkAction !== 'offset-copy') return null;
 		const offset = parseOptionalNumber(bulkOffsetWords);
 		if (offset === undefined) return null;
-		return buildOffsetCopyRows(selectedTags, offset, tags);
+		return JSON.stringify([offset, selectedTags]);
+	});
+
+	/**
+	 * R2b-6d-2a: コピー先のアドレスの計算はドライバに任せる（`offsetCopy.ts`。全件を 1 回の
+	 * `offset-addresses`（`unit: "words"`）、既存タグの占有は `parse-addresses`）。入力に追従して
+	 * 呼ぶので 300ms 待ってから呼び、古い応答は世代番号で捨てる。結果が届くまでプレビューは空
+	 * （古い入力のプレビューから登録させない）。
+	 */
+	$effect(() => {
+		const seq = ++bulkOffsetCopySeq;
+		const key = bulkOffsetCopyKey;
+		bulkOffsetCopyResult = null;
+		if (key === null) return;
+		const offset = untrack(() => parseOptionalNumber(bulkOffsetWords));
+		if (offset === undefined) return;
+		const sources = untrack(() => selectedTags);
+		const existingTags = untrack(() => tags);
+		const connectionIdForGroup = untrack(() => {
+			const snapshotGroups = groups;
+			const snapshotConnections = connections;
+			return (groupId: number): number | undefined => {
+				const group = snapshotGroups.find((g) => g.id === groupId);
+				return group
+					? snapshotConnections.find((c) => c.id === group.plcConnectionId)?.id
+					: undefined;
+			};
+		});
+		const timer = setTimeout(() => {
+			void computeOffsetCopy(sources, offset, existingTags, connectionIdForGroup).then((result) => {
+				if (seq === bulkOffsetCopySeq) bulkOffsetCopyResult = result;
+			});
+		}, 300);
+		return () => clearTimeout(timer);
 	});
 
 	/**
 	 * コードレビュー指摘対応（2026-09-05）: 仕様は「正の整数のみ」
 	 * （`<input min="1">` は表示上のヒントに過ぎず、JS 実行時の入力を
-	 * 弾かない - `offsetCopy.ts::buildOffsetCopyRows` が同じ条件で入口
+	 * 弾かない - `offsetCopy.ts::assembleOffsetCopy` が同じ条件で入口
 	 * 検証を行い `bulkOffsetCopyResult.errors` を返すが、UI 側でも同じ
 	 * 条件を持たせて検証/実行ボタンを無効化し、`title` で理由を示す
 	 * - 「無反応のまま」にしない）。
@@ -6085,28 +6257,7 @@
 			</label>
 			<label class="field">
 				開始アドレス
-				<input
-					type="text"
-					bind:value={continuousForm.startAddress}
-					placeholder="D3000"
-					oninput={() => {
-						// T19 S1-b（UX-35「名前パターンの既定をデバイス名から導出・
-						// 開始番号は入力不要」）: 名前パターン・開始番号のどちらも
-						// ユーザーがまだ直接編集していなければ、開始アドレスから
-						// 導出した値へ追従させる（`tagNamePrefill.ts` の
-						// `nextTagNameOnAddressChange` と同じ touched 追跡方式）。
-						const nextPattern = nextNamePatternOnAddressChange(
-							continuousForm.startAddress,
-							continuousNamePatternTouched
-						);
-						if (nextPattern !== null) continuousForm.namePattern = nextPattern;
-						const nextStart = nextStartNumberOnAddressChange(
-							continuousForm.startAddress,
-							continuousStartNumberTouched
-						);
-						if (nextStart !== null) continuousForm.startNumber = nextStart;
-					}}
-				/>
+				<input type="text" bind:value={continuousForm.startAddress} placeholder="D3000" />
 			</label>
 			<label class="field">
 				点数
@@ -7323,7 +7474,7 @@
 									<td>{i + 1}</td>
 									<td>{row.name}</td>
 									<td>{row.address}</td>
-									<td>{row.words}</td>
+									<td>{row.span.wordCount}</td>
 								</tr>
 							{/each}
 						</tbody>

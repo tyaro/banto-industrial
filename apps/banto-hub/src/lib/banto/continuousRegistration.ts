@@ -11,112 +11,30 @@
  *   受け取るだけの汎用エンドポイントのまま保てる（T11-2 の CSV インポート
  *   も同じ API を、別の展開ロジック — CSV パース — から呼ぶだけで済む）。
  *
- * 依存なしの純関数群 — フォーム（`+page.svelte`）から状態を持ち込まず
- * テスト可能にしてある。単体テストは `continuousRegistration.test.ts`
- * （vitest、`tagFormNumeric.test.ts` と同じ describe/it スタイル。
- * TAG-P0-1、2026-08-09 に追加）。
+ * **R2b-6d-2a（docs/banto-hub-driver-ui-design.md §4.3・§7・§7.1、2026-10-24）: アドレスの
+ * 計算はドライバに任せる**。以前はここ（と `slmpDeviceTable.ts`）が SLMP のデバイス表記・
+ * 基数・ビットの軸を読んで番号を進めていた。いまは `POST /api/tags/offset-addresses`
+ * （`unit: "points"`。1 点ごとに型のワード数ぶん動く）が返したアドレスをそのまま使い、
+ * 名前パターン・開始番号の既定も `parse-addresses` の結果（`canonical`・`area`・`index`）から
+ * 作る。ドライバが解釈できないアドレス（以前の「末尾の数字を進める」フォールバック）は
+ * 推測せず、API のエラーをその行（件目）に出す。
+ *
+ * 計算を「REST の結果を受け取って行を組み立てる純関数（{@link generateContinuousTags}）」と
+ * 「REST を呼ぶ薄い層（{@link computeContinuousTags}）」に分けてある。単体テストは
+ * `continuousRegistration.test.ts`（vitest、REST の結果を偽で与える）。
  */
-import type { StringEncoding, TagDataType, TagInput } from './tagRegistryAdmin';
+import type {
+	OffsetAddressItem,
+	ParsedAddress,
+	StringEncoding,
+	TagDataType,
+	TagInput
+} from './tagRegistryAdmin';
 import { parseOptionalNumber, toOptionalNumberOrNull } from './tagFormNumeric';
-import { formatSlmpAddress, MAX_DEVICE_NUMBER, parseSlmpAddress } from './slmpDeviceTable';
+import { realAddressApi, type AddressApi } from './addressSpan';
 
 /** 1回のプレビュー/バッチで生成できる点数の上限（暴走防止の安全弁）。 */
 export const MAX_CONTINUOUS_COUNT = 1000;
-
-const TWO_WORD_DATA_TYPES: ReadonlySet<TagDataType> = new Set(['i32', 'u32', 'f32']);
-
-/**
- * #325（2026-09-08 オーナー決定）: `i64`/`u64`/`f64`（Modbus の4レジスタ=64bit
- * 値、`modbus-tcp` 接続配下のタグのみ登録可 -
- * `tagRegistryAdmin.ts::MODBUS_ONLY_DATA_TYPES` 参照）は4ワード占有する。
- */
-const FOUR_WORD_DATA_TYPES: ReadonlySet<TagDataType> = new Set(['i64', 'u64', 'f64']);
-
-/**
- * データ型からアドレス増分を決める（docs/ux-plan.md §3）: ワード系
- * （bit/i16/u16）は+1、2ワード型（i32/u32/f32）は+2、4ワード型
- * （i64/u64/f64、#325）は+4、string は+string_length。
- * `crates/banto-tags/src/tag.rs::ALLOWED_DATA_TYPES` に存在するデータ型は
- * この4分岐で尽くされる（bit タグがビットデバイス（M100 等）に置かれるか
- * ワードのビット位置（D100.5）に置かれるかはアドレス書式の話であって
- * data_type の話ではないので、増分自体は bit/i16/u16 のどれでも同じ「+1」
- * でよい — 実際にどちらの形かは {@link incrementAddress} がアドレス自体の
- * 形（`.N` 付きかどうか）から判別する）。
- */
-export function addressIncrement(dataType: TagDataType, stringLength?: number | null): number {
-	if (dataType === 'string') return Math.max(1, stringLength ?? 1);
-	if (FOUR_WORD_DATA_TYPES.has(dataType)) return 4;
-	if (TWO_WORD_DATA_TYPES.has(dataType)) return 2;
-	return 1;
-}
-
-/**
- * アドレスを1件分進める。`step` は {@link addressIncrement} が返すワード
- * 増分、`index` は連番中の何件目か（0始まり）。
- *
- * **T18-3c（docs/banto-hub-t18-design.md「T18-3c 連続登録の基数/bit
- * 連番」、2026-08-13）: SLMP デバイス記法（`slmpDeviceTable.ts` 経由で
- * `crates/banto-plc/src/slmp/address.rs` の規則を参照）を認識できるときは
- * その軸に沿って増分する**。ワード内 bit 連番（`.N` 付き）とデバイス番号の
- * 連番（16進デバイスの桁上がりを含む）を自動判別する — 以前はどちらも
- * 「非対応」としてエラーにしていたが、軸をアドレス自体の形から一意に
- * 決められる（`.N` があれば bit 軸、無ければデバイス番号軸）ため、判断を
- * 保留する理由がなくなった。
- *
- * - **bit 軸**（{@link parseSlmpAddress} が `bit` を返す場合）: `number` と
- *   `bit` を「1ワード=16bit」の1本の数直線上の値
- *   （`number * 16 + bit`）とみなし、そこへ `index` を足してから
- *   16で割った商・余りに戻す。`step` は使わない（bit 連番は常に1行=1bit
- *   進む — ワード型の `step` を混ぜると「2bit飛ばし」のような意味の
- *   薄い増分になってしまうため）。例: `D100.E` → (i=1) `D100.F` →
- *   (i=2) `D101.0`（bit15 の次はワード+1・bit0。bit 表記は T20-④で16進化
- *   済み、`.E`/`.F` はそれぞれ bit 14/15）。
- * - **デバイス番号軸**（bit サフィックスが無い場合）: `number + step *
- *   index` をそのデバイスの基数で整形し直す。16進デバイス
- *   （X/Y/B/W/SB/SW/DX/DY）は16進の桁上がりが自然に起こる
- *   （`Number.parseInt`/`toString(16)` が基数変換そのものを担うため、
- *   10進の下2桁だけを見て繰り上げるような特別扱いは不要）。例: `X1E` →
- *   (i=1) `X1F` → (i=2) `X20`、`W1FF` → (i=1) `W200`。
- *
- * どちらの軸でも、結果のデバイス番号が {@link MAX_DEVICE_NUMBER} を
- * 超える場合は `null`（呼び出し元 `generateContinuousTags` がその行を
- * エラーにする）。
- *
- * **SLMP デバイス記法として解釈できないアドレスへのフォールバック**:
- * Modbus 参照番号（`"40001"` 等、デバイスニーモニックを持たない）や
- * その他 {@link parseSlmpAddress} が `null` を返す形式は、T18-3c 以前と
- * 同じ「先頭の非数字列 + 末尾の10進数字列」を `base + step * index` で
- * 増分する素朴なロジックにフォールバックする（既存の10進連番の挙動は
- * 不変にする、という受け入れ条件のための後方互換パス）。
- */
-export function incrementAddress(address: string, step: number, index: number): string | null {
-	const trimmed = address.trim();
-
-	const parsed = parseSlmpAddress(trimmed);
-	if (parsed) {
-		if (parsed.bit !== undefined) {
-			const total = parsed.number * 16 + parsed.bit + index;
-			const number = Math.floor(total / 16);
-			const bit = total % 16;
-			if (number > MAX_DEVICE_NUMBER) return null;
-			return formatSlmpAddress(parsed.mnemonic, number, bit);
-		}
-		const number = parsed.number + step * index;
-		if (!Number.isFinite(number) || number < 0 || number > MAX_DEVICE_NUMBER) return null;
-		return formatSlmpAddress(parsed.mnemonic, number);
-	}
-
-	// フォールバック: SLMP デバイス記法として解釈できないアドレス
-	// （Modbus 参照番号など）向けの、T18-3c 以前と同じ素朴な10進増分。
-	const match = /^(\D*)(\d+)$/.exec(trimmed);
-	if (!match) return null;
-	const [, prefix, digits] = match;
-	const base = Number.parseInt(digits, 10);
-	const next = base + step * index;
-	if (!Number.isFinite(next) || next < 0) return null;
-	const nextDigits = String(next).padStart(digits.length, '0');
-	return `${prefix}${nextDigits}`;
-}
 
 /**
  * 名前パターンを展開する。`{n}` を `n`（開始番号からの連番）で置換する。
@@ -154,7 +72,7 @@ export interface ContinuousRegistrationParams extends ContinuousRegistrationComm
 	namePattern: string;
 	/** 連番の開始値（`{n}` に入る最初の数）。 */
 	startNumber: number;
-	/** 1件目のアドレス。2件目以降は {@link addressIncrement} 分ずつ増える。 */
+	/** 1件目のアドレス。2件目以降はドライバが 1 点ずつ（型のワード数ぶん）動かす。 */
 	startAddress: string;
 	/** 生成する点数（1以上、{@link MAX_CONTINUOUS_COUNT} 以下）。 */
 	count: number;
@@ -204,99 +122,76 @@ export interface ContinuousFormState {
 /**
  * T19 S1-b（UX-35、docs/banto-hub-t19-design.md §2「連続登録の名前パターン
  * — デバイス名（M/D/W/B 等）を既定とし、開始番号はアドレスから導出（入力
- * 不要）」、2026-09-02 オーナー決定）: 開始アドレスから連続登録フォームの
+ * 不要）」、2026-09-02 オーナー決定）: 開始アドレスの解析結果から連続登録フォームの
  * 名前パターンの既定値を導出する。
  *
- * - **SLMP デバイス記法として解釈できるアドレス**（`parseSlmpAddress` が
- *   非 `null`）: デバイスのニーモニック（`M`/`D`/`W`/`B` 等）をそのまま
- *   使い `"{mnemonic}{n}"` を返す（例: `D3000` → `D{n}`、`M100` → `M{n}`）。
- *   `.N` bit サフィックス付きアドレス（例 `D100.5`）でもワード側の
- *   ニーモニックだけを使う（bit 位置は名前に含めない — 命名の既定値は
- *   「どのデバイス系列か」だけ示せば十分で、`.5` まで名前に埋め込むと
- *   連番展開後の名前が冗長になるため）。
- * - **Modbus 参照番号等、デバイスニーモニックを持たないアドレス**
- *   （`incrementAddress` と同じフォールバック正規表現「先頭の非数字列 +
- *   末尾の10進数字列」を使う）: 非数字の先頭部分が有れば
- *   それをニーモニック相当として使う（例 `AI40001` → `AI{n}`）。**先頭に
- *   非数字部分が無い場合**（`"40001"` のような素の参照番号 — Modbus の
- *   典型形）は、デバイス名を名乗れる情報が無いため既定 `"tag{n}"` を返す
- *   （実装判断: 「タグ」という汎用語を使い、既存の `blankContinuousForm`
- *   の旧既定 `temp{n}` とは意図的に区別する — `temp` は「一時的な値」を
- *   連想させ、実際の連続登録の用途（恒久タグの一括登録）とずれるため）。
- * - **開始アドレスが空**: 導出できないので空文字列を返す（呼び出し側は
- *   これを「まだプリフィルしない」の合図として扱ってよい — 空の名前
- *   パターンは {@link generateContinuousTags} が
- *   「名前パターンを入力してください」で弾く）。
+ * R2b-6d-2a（§7.1）: `canonical` が `area` で始まる（大小文字を無視）なら `{area}{n}`
+ * （`D3000` → `D{n}`）、そうでなければ `tag{n}`（Modbus の `400001` は領域名が
+ * アドレスに現れない）。解析に失敗したとき（`ok: false`・`undefined`）は `null`
+ * （導出できない。呼び出し側は欄を空に戻す）。
  */
-export function defaultNamePatternFromAddress(address: string): string {
-	const trimmed = address.trim();
-	if (trimmed === '') return '';
+export function namePatternFromParsed(parsed: ParsedAddress | undefined): string | null {
+	if (!parsed?.ok) return null;
+	return startsWithArea(parsed) ? `${parsed.area}{n}` : 'tag{n}';
+}
 
-	const parsed = parseSlmpAddress(trimmed);
-	if (parsed) return `${parsed.mnemonic}{n}`;
-
-	const match = /^(\D*)\d+$/.exec(trimmed);
-	const prefix = match?.[1]?.trim();
-	return prefix ? `${prefix}{n}` : 'tag{n}';
+/** `canonical` が `area` で始まる（大小文字を無視）か。 */
+function startsWithArea(parsed: ParsedAddress & { ok: true }): boolean {
+	return (
+		parsed.area !== null &&
+		parsed.area !== '' &&
+		parsed.canonical.toLowerCase().startsWith(parsed.area.toLowerCase())
+	);
 }
 
 /**
- * T19 S1-b（UX-35、同design「開始番号はアドレスから導出（入力不要）」）:
- * 開始アドレスから連続登録フォームの開始番号の既定値を導出する。
- * `D3000` なら `3000`（設計の例そのまま）。
+ * T19 S1-b（UX-35、同design「開始番号はアドレスから導出（入力不要）」）: 開始アドレスの
+ * 解析結果から連続登録フォームの開始番号の既定値を導出する。
  *
- * - SLMP デバイス記法として解釈できれば `parsed.number`（デバイス番号 -
- *   `.N` bit サフィックスは無視する。ビット位置ではなくワード/ビット
- *   デバイスの番号そのものを名前の連番に使う方が「アドレスと名前が対応
- *   している」という直感に合う）。
- * - 解釈できなければ {@link incrementAddress} と同じフォールバック正規表現
- *   で末尾の10進数字列を取り出し、その数値を返す（例 `"40001"` → `40001`）。
- * - どちらの形にも合わない、またはアドレスが空なら `null`
- *   （呼び出し側は「導出できない」の合図として扱う - 使う際は
- *   `generateContinuousTags` の `startNumber` 既定 `0` にフォールバック
- *   する）。
+ * R2b-6d-2a（§7.1）: `canonical` が `area` で始まるなら `index`（ワード内ビット `D100.5` は
+ * ワードの番号 100。`index` が無ければ `null`）、そうでなければ `canonical` の末尾の数字を
+ * 10 進で読む（Modbus は正規形が 6 桁なので `40001` は 400001 になる。決めるのは名前の番号で
+ * アドレスではない）。導出できなければ `null`（`buildContinuousParams` が空欄を 0 として扱う）。
  */
-export function defaultStartNumberFromAddress(address: string): number | null {
-	const trimmed = address.trim();
-	if (trimmed === '') return null;
-
-	const parsed = parseSlmpAddress(trimmed);
-	if (parsed) return parsed.number;
-
-	const match = /^\D*(\d+)$/.exec(trimmed);
-	if (!match) return null;
-	return Number.parseInt(match[1], 10);
+export function startNumberFromParsed(parsed: ParsedAddress | undefined): number | null {
+	if (!parsed?.ok) return null;
+	if (startsWithArea(parsed)) return parsed.index;
+	const match = /^\D*(\d+)$/.exec(parsed.canonical);
+	return match ? Number.parseInt(match[1], 10) : null;
 }
 
 /**
- * T19 S1-b（UX-35）: 開始アドレス欄の `oninput` から呼ぶ、名前パターン欄の
+ * T19 S1-b（UX-35）: 開始アドレスの解析結果が届いたときの、名前パターン欄の
  * プリフィル判定。`#lib/banto/tagNamePrefill.ts::nextTagNameOnAddressChange`
  * と同じ「touched 追跡」方式 - ユーザーが名前パターン欄を一度でも直接編集
  * したら `namePatternTouched` を立て、以後はアドレス入力に追従させない。
- * `null` を返せば呼び出し側は名前パターン欄に触れない。
+ * `null` を返せば呼び出し側は名前パターン欄に触れない。アドレスが空・解析できない間は
+ * 空文字列（欄を空に戻す）。
  */
-export function nextNamePatternOnAddressChange(
-	newAddress: string,
+export function nextNamePatternOnParsed(
+	address: string,
+	parsed: ParsedAddress | undefined,
 	namePatternTouched: boolean
 ): string | null {
 	if (namePatternTouched) return null;
-	return defaultNamePatternFromAddress(newAddress);
+	if (address.trim() === '') return '';
+	return namePatternFromParsed(parsed) ?? '';
 }
 
 /**
- * T19 S1-b（UX-35）: 開始アドレス欄の `oninput` から呼ぶ、開始番号欄の
- * プリフィル判定。{@link nextNamePatternOnAddressChange} と同じ
- * 「touched 追跡」方式。導出できない間（{@link defaultStartNumberFromAddress}
- * が `null`）は空文字列を返す - 開始番号欄を空のまま保つ
- * （`buildContinuousParams` が空欄を `startNumber: 0` 既定として扱う、
- * 既存の `parseOptionalNumber` の挙動どおり）。
+ * T19 S1-b（UX-35）: 開始番号欄のプリフィル判定。{@link nextNamePatternOnParsed} と同じ
+ * 「touched 追跡」方式。導出できない間は空文字列を返す - 開始番号欄を空のまま保つ
+ * （`buildContinuousParams` が空欄を `startNumber: 0` 既定として扱う、既存の
+ * `parseOptionalNumber` の挙動どおり）。
  */
-export function nextStartNumberOnAddressChange(
-	newAddress: string,
+export function nextStartNumberOnParsed(
+	address: string,
+	parsed: ParsedAddress | undefined,
 	startNumberTouched: boolean
 ): string | null {
 	if (startNumberTouched) return null;
-	const derived = defaultStartNumberFromAddress(newAddress);
+	if (address.trim() === '') return '';
+	const derived = startNumberFromParsed(parsed);
 	return derived === null ? '' : String(derived);
 }
 
@@ -309,44 +204,55 @@ export type ContinuousRegistrationResult =
 	{ ok: true; rows: ContinuousRegistrationRow[]; tags: TagInput[] } | { ok: false; error: string };
 
 /**
- * 連続登録のパターン展開本体。エラーは例外を投げず判別共用体で返す —
- * 呼び出し元（連続登録フォーム）はプレビュー欄にそのまま表示するだけで
- * よい。
+ * API を呼ぶ前の入力の検証。誤りがあれば最初の 1 件の文言、なければ `null`。
+ * アドレスの文法の検証はしない（ドライバが決める）。
  */
-export function generateContinuousTags(
-	params: ContinuousRegistrationParams
-): ContinuousRegistrationResult {
+export function validateContinuousParams(params: ContinuousRegistrationParams): string | null {
 	if (!Number.isInteger(params.count) || params.count < 1) {
-		return { ok: false, error: '点数は1以上の整数で指定してください。' };
+		return '点数は1以上の整数で指定してください。';
 	}
 	if (params.count > MAX_CONTINUOUS_COUNT) {
-		return { ok: false, error: `点数は${MAX_CONTINUOUS_COUNT}以下で指定してください。` };
+		return `点数は${MAX_CONTINUOUS_COUNT}以下で指定してください。`;
 	}
-
-	const trimmedAddress = params.startAddress.trim();
-	if (trimmedAddress === '') {
-		return { ok: false, error: '開始アドレスを入力してください。' };
-	}
-	// T18-3c: bit 軸（`.N` 付きアドレス）は data_type が bit のタグでしか
-	// 意味を持たない（16bit 値の1ワードをビット単位でずらして書き込む、
-	// という操作が成立しないため）。ここで弾かないと
-	// `generateContinuousTags` はワード連番のつもりで `.N` を生成してしまう。
-	const parsedStartAddress = parseSlmpAddress(trimmedAddress);
-	if (parsedStartAddress?.bit !== undefined && params.dataType !== 'bit') {
-		return {
-			ok: false,
-			error:
-				'ビット指定アドレス（例: D100.5）のワード内 bit 連番は、データ型が bit のタグでのみ使用できます。'
-		};
-	}
+	if (params.startAddress.trim() === '') return '開始アドレスを入力してください。';
 	if (params.dataType === 'string' && (!params.stringLength || params.stringLength < 1)) {
-		return { ok: false, error: 'string 型では文字列長の指定が必要です。' };
+		return 'string 型では文字列長の指定が必要です。';
 	}
-	if (params.namePattern.trim() === '') {
-		return { ok: false, error: '名前パターンを入力してください。' };
-	}
+	if (params.namePattern.trim() === '') return '名前パターンを入力してください。';
+	return null;
+}
 
-	const step = addressIncrement(params.dataType, params.stringLength);
+/** `offset-addresses` に渡す項目（`i` 番目 = 開始アドレスから `i` 点ぶん）。 */
+export function buildContinuousOffsetItems(
+	params: ContinuousRegistrationParams,
+	connectionId: number
+): OffsetAddressItem[] {
+	const address = params.startAddress.trim();
+	return Array.from({ length: params.count }, (_, i) => ({
+		connectionId,
+		tagKind: 'plc' as const,
+		address,
+		dataType: params.dataType,
+		stringLength: params.dataType === 'string' ? params.stringLength : undefined,
+		stringEncoding: params.dataType === 'string' ? (params.stringEncoding ?? 'utf8') : undefined,
+		n: i,
+		unit: 'points' as const
+	}));
+}
+
+/**
+ * 連続登録のパターン展開本体（純関数）。`addresses[i]` は `i` 件目のアドレス
+ * （{@link buildContinuousOffsetItems} を `offset-addresses` に渡した結果）。エラーは例外を
+ * 投げず判別共用体で返す — 呼び出し元（連続登録フォーム）はプレビュー欄にそのまま表示するだけで
+ * よい。算出できなかった件は、その件目のエラー（API のメッセージつき）。
+ */
+export function generateContinuousTags(
+	params: ContinuousRegistrationParams,
+	addresses: (ParsedAddress | undefined)[]
+): ContinuousRegistrationResult {
+	const invalid = validateContinuousParams(params);
+	if (invalid) return { ok: false, error: invalid };
+
 	const rows: ContinuousRegistrationRow[] = [];
 	const seenNames = new Set<string>();
 
@@ -367,14 +273,14 @@ export function generateContinuousTags(
 		}
 		seenNames.add(name);
 
-		const address = incrementAddress(trimmedAddress, step, i);
-		if (address === null) {
+		const result = addresses[i];
+		if (!result?.ok) {
 			return {
 				ok: false,
-				error: `${i + 1}件目（連番${n}）のアドレスを算出できません（開始アドレス "${trimmedAddress}" の形式が未対応か、デバイス番号の上限（0x00FFFFFF）を超えています）。`
+				error: `${i + 1}件目（連番${n}）のアドレスを算出できません: ${result && !result.ok ? result.message : '算出結果が返りませんでした'}`
 			};
 		}
-		rows.push({ name, address });
+		rows.push({ name, address: result.canonical });
 	}
 
 	const tags: TagInput[] = rows.map((row) => ({
@@ -395,6 +301,26 @@ export function generateContinuousTags(
 	}));
 
 	return { ok: true, rows, tags };
+}
+
+/**
+ * {@link generateContinuousTags} の前に REST を呼ぶ薄い層。入力を検証してから、全件を 1 回の
+ * `offset-addresses`（`unit: "points"`）で求める。通信の失敗は、推測で埋めずエラーにする。
+ */
+export async function computeContinuousTags(
+	params: ContinuousRegistrationParams,
+	connectionId: number,
+	api: Pick<AddressApi, 'offset'> = realAddressApi
+): Promise<ContinuousRegistrationResult> {
+	const invalid = validateContinuousParams(params);
+	if (invalid) return { ok: false, error: invalid };
+	try {
+		const addresses = await api.offset(buildContinuousOffsetItems(params, connectionId));
+		return generateContinuousTags(params, addresses);
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		return { ok: false, error: `アドレスの算出に失敗しました（${message}）。` };
+	}
 }
 
 /**

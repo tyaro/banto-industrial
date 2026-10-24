@@ -5,19 +5,30 @@
  *
  * 連続登録（`continuousRegistration.ts`）が「1タグをN連番」で複製するのに
  * 対し、構造体登録は「複数の異なるフィールド」を1つのベースアドレスから
- * 連続したワード領域へ割り付ける。アドレス算術そのもの（{@link
- * addressIncrement}/{@link incrementAddress}）は連続登録の実装を再利用し、
- * このファイルは「フィールドごとの累積ワードオフセット」「手動割付」
- * 「衝突検出（フィールド間・既存タグ・名前）」だけを新規に足す。
+ * 連続したワード領域へ割り付ける。
  *
- * 依存なしの純関数群 — `continuousRegistration.ts`/`tagRegistryAdmin.ts` と
- * 同じ流儀で、フォーム（`+page.svelte`）から状態を持ち込まずテスト可能に
- * してある。単体テストは `structRegistration.test.ts`
- * （vitest、`continuousRegistration.test.ts` と同じ describe/it スタイル）。
+ * **R2b-6d-2a（docs/banto-hub-driver-ui-design.md §3.6・§4.3・§7.1、2026-10-24）: アドレスの
+ * 計算はドライバに任せる**。以前はここ（と `slmpDeviceTable.ts`）が SLMP のデバイス表記を
+ * 読んで番号を進め、占有ワードの範囲で重なりを判定していた。いまは
+ * - ベースアドレスの検証と各フィールドのワード数は `POST /api/tags/parse-addresses` の結果
+ *   （`bit`・`wordCount`）、
+ * - フィールドごとのアドレスは `POST /api/tags/offset-addresses`（`unit: "words"`、累積の
+ *   ワード数ぶん動かす。ワード内ビットのベースは断る）、
+ * - 重なりの判定は `area`・`index`・`wordCount`（`addressSpan.ts`）
+ * を使う。ドライバが解釈できないアドレスは、推測せずその行に API のエラーを出す。
+ *
+ * 計算を「REST の結果を受け取って行を組み立てる純関数」と「REST を呼ぶ薄い層
+ * （{@link allocateStructFields}・{@link manualStructRows}）」に分けてある。純関数のテストは
+ * `structRegistration.test.ts`（vitest。REST の結果を偽で与える）。
  */
-import type { StringEncoding, TagDataType, TagInput } from './tagRegistryAdmin';
-import { addressIncrement, incrementAddress } from './continuousRegistration';
-import { parseSlmpAddress } from './slmpDeviceTable';
+import {
+	spanOfParsed,
+	spansOverlap,
+	realAddressApi,
+	type AddressApi,
+	type AddressSpan
+} from './addressSpan';
+import type { ParsedAddress, StringEncoding, TagDataType, TagInput } from './tagRegistryAdmin';
 
 /** 構造体の1フィールド定義。`address` は手動割付モードでのみ使う。 */
 export interface StructField {
@@ -32,10 +43,9 @@ export interface StructField {
 
 /**
  * 割付結果の1行。プレビュー表示にも {@link createTagsBatch} 相当への変換
- * （{@link structRowsToTagInputs}）にも使う共通の中間表現。`words` は
- * このフィールドが占有するワード数（{@link addressIncrement} の値そのもの）
- * で、衝突検出（{@link detectStructAddressCollisions}）が占有範囲の算出に
- * 使う。
+ * （{@link structRowsToTagInputs}）にも使う共通の中間表現。`address` はドライバが返した
+ * 正規形（保存される形）、`span` は衝突検出（{@link detectStructAddressCollisions}）が
+ * 使う占有（ドライバが返した `area`・`index`・`wordCount`）。
  */
 export interface StructAllocatedRow {
 	name: string;
@@ -43,175 +53,254 @@ export interface StructAllocatedRow {
 	dataType: TagDataType;
 	stringLength?: number | null;
 	stringEncoding?: StringEncoding | null;
-	words: number;
+	span: AddressSpan;
 }
 
 export type StructAllocationResult =
 	{ ok: true; rows: StructAllocatedRow[] } | { ok: false; error: string };
 
-function validateCommonFieldShape(fields: StructField[], index: number): string | null {
-	const field = fields[index];
-	if (field.name.trim() === '') {
-		return `${index + 1}行目のフィールド名を入力してください。`;
-	}
-	if (
-		field.dataType === 'string' &&
-		(!field.stringLength || field.stringLength < 1 || !Number.isInteger(field.stringLength))
-	) {
-		return `${index + 1}行目（${field.name}）: string 型では文字列長を1以上の整数で指定してください。`;
+/** ワード内ビットのベースアドレスを断る文言（以前の `allocateStructFields` と同じ）。 */
+export const STRUCT_BASE_BIT_ERROR =
+	'ベースアドレスにビット指定（例: D100.5）は使えません。ワードアドレス（例: D100）を指定してください。';
+
+/** 1 つのフィールドを引く要求の素（アドレスだけ差し替える）。 */
+function fieldItemBase(field: StructField) {
+	return {
+		tagKind: 'plc' as const,
+		dataType: field.dataType,
+		stringLength: field.dataType === 'string' ? (field.stringLength ?? null) : undefined,
+		stringEncoding: field.dataType === 'string' ? (field.stringEncoding ?? 'utf8') : undefined
+	};
+}
+
+/** 名前・文字列長の形の検証（API を呼ぶ前）。誤りがあれば最初の 1 件の文言。 */
+export function validateStructFields(fields: StructField[]): string | null {
+	if (fields.length === 0) return 'フィールドを1つ以上追加してください。';
+	for (let index = 0; index < fields.length; index++) {
+		const field = fields[index];
+		if (field.name.trim() === '') {
+			return `${index + 1}行目のフィールド名を入力してください。`;
+		}
+		if (
+			field.dataType === 'string' &&
+			(!field.stringLength || field.stringLength < 1 || !Number.isInteger(field.stringLength))
+		) {
+			return `${index + 1}行目（${field.name}）: string 型では文字列長を1以上の整数で指定してください。`;
+		}
 	}
 	return null;
 }
 
 /**
- * 自動割付: `baseAddress` から、フィールドを順にワードサイズ考慮の連続
- * アドレスへ割り付ける。フィールド i のアドレスは `incrementAddress(base,
- * 1, cumulativeWords_i)` — `cumulativeWords_0 = 0`、`cumulativeWords_i =
- * cumulativeWords_{i-1} + addressIncrement(field_{i-1}.dataType,
- * field_{i-1}.stringLength)`。つまり各フィールドが占有するワード数だけ
- * 次をずらす（docs/banto-hub-t20-design.md §3.2 実装指示のとおり）。
- *
- * - `baseAddress` はビットサフィックスを持たないワードアドレス
- *   （例 `D3000`）が前提 — `.N` 付きが渡されたらエラーを返す（bit
- *   フィールドの自動割付を本スライスでは扱わないため）。
- * - bit フィールドは `addressIncrement('bit')` が返す1ワードをそのまま
- *   占有する（他の型と同じ「+1ワード」の分岐 — ビット位置のパッキングは
- *   行わない。設計「bit フィールドは1ワード占有として素直に割り付ける」）。
- * - `incrementAddress` が `null`（{@link MAX_DEVICE_NUMBER} 超過、または
- *   `baseAddress` の形式が未対応）を返したらエラー行として打ち切る。
+ * ベースアドレスの検証。`probes` は同じアドレスを別のデータ型（`u16`・`bit`）で解析した結果
+ * （型によって通る形が違うため、どちらかが通ればよい）。どちらも通らなければ最初のエラー、
+ * 通ったものの `bit` が null でなければ（ワード内ビット `D100.5`）断る。
  */
-export function allocateStructFields(
-	baseAddress: string,
-	fields: StructField[]
-): StructAllocationResult {
-	const trimmedBase = baseAddress.trim();
-	if (trimmedBase === '') {
-		return { ok: false, error: 'ベースアドレスを入力してください。' };
-	}
-	const parsedBase = parseSlmpAddress(trimmedBase);
-	if (parsedBase?.bit !== undefined) {
+export function checkStructBase(
+	probes: (ParsedAddress | undefined)[]
+): { ok: true } | { ok: false; error: string } {
+	const passed = probes.find((p) => p?.ok);
+	if (!passed?.ok) {
+		const failed = probes.find((p) => p && !p.ok);
 		return {
 			ok: false,
-			error:
-				'ベースアドレスにビット指定（例: D100.5）は使えません。ワードアドレス（例: D100）を指定してください。'
+			error: `ベースアドレスを解釈できません: ${failed && !failed.ok ? failed.message : '解析結果が返りませんでした'}`
 		};
 	}
-	if (fields.length === 0) {
-		return { ok: false, error: 'フィールドを1つ以上追加してください。' };
-	}
+	if (passed.bit !== null) return { ok: false, error: STRUCT_BASE_BIT_ERROR };
+	return { ok: true };
+}
 
-	const rows: StructAllocatedRow[] = [];
-	let cumulativeWords = 0;
+/**
+ * 各フィールドのワード数。`bit` 型は他の型と同じく 1 ワードを占める（ビット位置の
+ * パッキングはしない）。それ以外は `parsed`（ベースアドレスをそのフィールドの型で解析した
+ * 結果。`bit` 型の位置には `undefined`）の `wordCount`。解析に失敗したフィールドは行のエラー。
+ */
+export function structFieldWordCounts(
+	fields: StructField[],
+	parsed: (ParsedAddress | undefined)[]
+): { ok: true; counts: number[] } | { ok: false; error: string } {
+	const counts: number[] = [];
 	for (let i = 0; i < fields.length; i++) {
 		const field = fields[i];
-		const shapeError = validateCommonFieldShape(fields, i);
-		if (shapeError) return { ok: false, error: shapeError };
-
-		const words = addressIncrement(field.dataType, field.stringLength);
-		const address = incrementAddress(trimmedBase, 1, cumulativeWords);
-		if (address === null) {
+		if (field.dataType === 'bit') {
+			counts.push(1);
+			continue;
+		}
+		const result = parsed[i];
+		if (!result?.ok || result.wordCount === null) {
 			return {
 				ok: false,
-				error: `${i + 1}行目（${field.name}）のアドレスを算出できません（ベースアドレス "${trimmedBase}" の形式が未対応か、デバイス番号の上限（0x00FFFFFF）を超えています）。`
+				error: `${i + 1}行目（${field.name}）: ${result && !result.ok ? result.message : 'ワード数を確認できませんでした'}`
 			};
 		}
-		rows.push({
-			name: field.name,
-			address,
-			dataType: field.dataType,
-			stringLength: field.dataType === 'string' ? field.stringLength : undefined,
-			stringEncoding: field.dataType === 'string' ? field.stringEncoding : undefined,
-			words
-		});
-		cumulativeWords += words;
+		counts.push(result.wordCount);
 	}
+	return { ok: true, counts };
+}
 
-	return { ok: true, rows };
+/** 累積のワード数: 先頭は 0、以降は前のフィールドまでのワード数の和。 */
+export function cumulativeWordOffsets(counts: number[]): number[] {
+	const offsets: number[] = [];
+	let sum = 0;
+	for (const count of counts) {
+		offsets.push(sum);
+		sum += count;
+	}
+	return offsets;
+}
+
+function rowOf(field: StructField, parsed: ParsedAddress & { ok: true }): StructAllocatedRow {
+	return {
+		name: field.name,
+		address: parsed.canonical,
+		dataType: field.dataType,
+		stringLength: field.dataType === 'string' ? field.stringLength : undefined,
+		stringEncoding: field.dataType === 'string' ? field.stringEncoding : undefined,
+		span: spanOfParsed(parsed)!
+	};
 }
 
 /**
- * 手動割付: 各フィールドが明示的に持つ `address` をそのまま使う
- * （自動割付のようなアドレス算術は行わない）。
+ * 自動割付の行を組み立てる。`moved[i]` はフィールド i のアドレスを累積ワード数ぶん動かした
+ * 結果（`offset-addresses`、`unit: "words"`）。失敗した行は割付エラー（最初の 1 件）。
  */
-export function manualStructRows(fields: StructField[]): StructAllocationResult {
-	if (fields.length === 0) {
-		return { ok: false, error: 'フィールドを1つ以上追加してください。' };
-	}
-
+export function assembleAutoStructRows(
+	fields: StructField[],
+	moved: (ParsedAddress | undefined)[]
+): StructAllocationResult {
 	const rows: StructAllocatedRow[] = [];
 	for (let i = 0; i < fields.length; i++) {
-		const field = fields[i];
-		const shapeError = validateCommonFieldShape(fields, i);
-		if (shapeError) return { ok: false, error: shapeError };
-
-		const address = field.address?.trim();
-		if (!address) {
-			return { ok: false, error: `${i + 1}行目（${field.name}）のアドレスを入力してください。` };
+		const result = moved[i];
+		if (!result?.ok) {
+			return {
+				ok: false,
+				error: `${i + 1}行目（${fields[i].name}）のアドレスを算出できません: ${result && !result.ok ? result.message : '算出結果が返りませんでした'}`
+			};
 		}
-		rows.push({
-			name: field.name,
-			address,
-			dataType: field.dataType,
-			stringLength: field.dataType === 'string' ? field.stringLength : undefined,
-			stringEncoding: field.dataType === 'string' ? field.stringEncoding : undefined,
-			words: addressIncrement(field.dataType, field.stringLength)
-		});
+		rows.push(rowOf(fields[i], result));
 	}
-
 	return { ok: true, rows };
 }
 
-/** アドレスが占有するワード範囲。衝突検出のためだけの内部表現。 */
-interface AddressWordRange {
-	/** SLMP デバイスニーモニック、または非SLMP形式の先頭非数字プレフィックス（大文字化）。 */
-	readonly axis: string;
-	readonly start: number;
-	/** 含む（inclusive）。 */
-	readonly end: number;
+/** 手動割付の行を組み立てる。`parsed[i]` はフィールド i の入力アドレスの解析結果。 */
+export function assembleManualStructRows(
+	fields: StructField[],
+	parsed: (ParsedAddress | undefined)[]
+): StructAllocationResult {
+	const rows: StructAllocatedRow[] = [];
+	for (let i = 0; i < fields.length; i++) {
+		const result = parsed[i];
+		if (!result?.ok) {
+			return {
+				ok: false,
+				error: `${i + 1}行目（${fields[i].name}）のアドレスを解釈できません: ${result && !result.ok ? result.message : '解析結果が返りませんでした'}`
+			};
+		}
+		rows.push(rowOf(fields[i], result));
+	}
+	return { ok: true, rows };
+}
+
+function failedCall(what: string, error: unknown): StructAllocationResult {
+	const message = error instanceof Error ? error.message : String(error);
+	return { ok: false, error: `${what}に失敗しました（${message}）。` };
 }
 
 /**
- * アドレス文字列と占有ワード数から比較用の範囲を組み立てる。
- *
- * - SLMP デバイス記法として解釈できれば、デバイスニーモニックを軸に
- *   `[number, number + words - 1]`。bit サフィックス（`.N`）が付いていても
- *   ビット位置は無視し、そのワード自体を1ワード占有として扱う（構造体の
- *   衝突検出はワード単位まで — 同一ワード内の異なるビット位置同士は
- *   本実装では「重なる」と判定する。設計が要求する粒度を超える誤検出を
- *   避けるより、見落とし（誤って重複を許す）を避ける方を優先した）。
- * - 解釈できない形式（Modbus 参照番号等）は `incrementAddress` と同じ
- *   フォールバック正規表現（先頭の非数字列 + 末尾の10進数字列）で軸と
- *   開始番号を取り出す。
- * - どちらの形にも合わなければ `null`（衝突判定の対象外 — 呼び出し側は
- *   その行を「範囲比較はできないが単純一致は見る」等の追加処理をしない。
- *   本実装では単に衝突なし扱いにする）。
+ * 自動割付: `baseAddress` から、フィールドを順にワード数を考慮した連続アドレスへ割り付ける
+ * （REST を呼ぶ薄い層）。フィールド i のアドレスは、ベースを累積ワード数
+ * （前のフィールドまでのワード数の和）だけ `unit: "words"` で動かしたもの。
+ * ベースがワード内ビット（`D100.5`）なら断る。`connectionId` は対象グループの接続。
  */
-function addressWordRange(address: string, words: number): AddressWordRange | null {
-	const trimmed = address.trim();
-	const span = Math.max(1, words);
-	const parsed = parseSlmpAddress(trimmed);
-	if (parsed) {
-		return { axis: parsed.mnemonic, start: parsed.number, end: parsed.number + span - 1 };
+export async function allocateStructFields(
+	connectionId: number,
+	baseAddress: string,
+	fields: StructField[],
+	api: AddressApi = realAddressApi
+): Promise<StructAllocationResult> {
+	const base = baseAddress.trim();
+	if (base === '') return { ok: false, error: 'ベースアドレスを入力してください。' };
+	const shapeError = validateStructFields(fields);
+	if (shapeError) return { ok: false, error: shapeError };
+
+	let parsed: ParsedAddress[];
+	try {
+		// 先頭 2 件がベースの検証、続く fields.length 件が各フィールドのワード数（bit 型は不要）。
+		parsed = await api.parse(connectionId, [
+			{ tagKind: 'plc', address: base, dataType: 'u16' },
+			{ tagKind: 'plc', address: base, dataType: 'bit' },
+			...fields.map((f) =>
+				f.dataType === 'bit'
+					? { tagKind: 'plc' as const, address: base, dataType: 'u16' as const }
+					: { ...fieldItemBase(f), address: base }
+			)
+		]);
+	} catch (error) {
+		return failedCall('ベースアドレスの確認', error);
 	}
-	const match = /^(\D*)(\d+)$/.exec(trimmed);
-	if (!match) return null;
-	const [, prefix, digits] = match;
-	const start = Number.parseInt(digits, 10);
-	if (!Number.isFinite(start)) return null;
-	return { axis: prefix.toUpperCase(), start, end: start + span - 1 };
+	const baseCheck = checkStructBase(parsed.slice(0, 2));
+	if (!baseCheck.ok) return baseCheck;
+	const counts = structFieldWordCounts(
+		fields,
+		fields.map((f, i) => (f.dataType === 'bit' ? undefined : parsed[2 + i]))
+	);
+	if (!counts.ok) return counts;
+
+	const offsets = cumulativeWordOffsets(counts.counts);
+	let moved: ParsedAddress[];
+	try {
+		moved = await api.offset(
+			fields.map((f, i) => ({
+				...fieldItemBase(f),
+				connectionId,
+				address: base,
+				n: offsets[i],
+				unit: 'words' as const
+			}))
+		);
+	} catch (error) {
+		return failedCall('アドレスの算出', error);
+	}
+	return assembleAutoStructRows(fields, moved);
 }
 
-function rangesOverlap(a: AddressWordRange, b: AddressWordRange): boolean {
-	return a.axis === b.axis && a.start <= b.end && b.start <= a.end;
+/** 手動割付: 各フィールドが明示的に持つ `address` をドライバで解析して正規形にする（薄い層）。 */
+export async function manualStructRows(
+	connectionId: number,
+	fields: StructField[],
+	api: AddressApi = realAddressApi
+): Promise<StructAllocationResult> {
+	const shapeError = validateStructFields(fields);
+	if (shapeError) return { ok: false, error: shapeError };
+	for (let i = 0; i < fields.length; i++) {
+		if (!fields[i].address?.trim()) {
+			return {
+				ok: false,
+				error: `${i + 1}行目（${fields[i].name}）のアドレスを入力してください。`
+			};
+		}
+	}
+	try {
+		const parsed = await api.parse(
+			connectionId,
+			fields.map((f) => ({ ...fieldItemBase(f), address: f.address!.trim() }))
+		);
+		return assembleManualStructRows(fields, parsed);
+	} catch (error) {
+		return failedCall('アドレスの確認', error);
+	}
 }
 
 /** {@link detectStructAddressCollisions} が既存タグ側に要求する最小限の形。 */
 export interface ExistingTagForCollision {
 	name: string;
 	collectionGroupId: number;
-	address: string;
-	dataType: TagDataType;
-	stringLength?: number | null;
+	/**
+	 * 保存済みのアドレスの占有（`addressSpan.ts::fetchExistingSpans`）。`plc` 以外のタグ・
+	 * 占有が分からないタグは `null`（名前の衝突だけ見る）。
+	 */
+	span: AddressSpan | null;
 }
 
 export interface StructCollision {
@@ -229,18 +318,20 @@ export interface StructCollision {
  * 生成済みの割付行に対する衝突検出。
  *
  * - **フィールド間のアドレス重なり**（`field-address-overlap`）: 同一構造体
- *   内で2フィールドの占有ワード範囲が重なる場合（手動割付での入力ミス、
- *   または自動割付ロジック自体のバグを検出する安全網）。
- * - **既存タグとの重なり**（`existing-address-overlap`）: 同じ収集グループ
- *   内の既存タグと占有ワード範囲が重なる場合。グループを跨いだ重なりは
- *   検出しない（タグ名の一意性がグループ内で閉じているのと同じ設計、
+ *   内で2フィールドの占有が重なる場合（手動割付での入力ミス、または自動割付
+ *   ロジック自体のバグを検出する安全網）。
+ * - **既存タグとの重なり**（`existing-address-overlap`）: **同じ収集グループ**
+ *   内の既存タグと占有が重なる場合。グループを跨いだ重なり（同じ PLC でも別の
+ *   グループ）は検出しない（タグ名の一意性がグループ内で閉じているのと同じ設計、
  *   `tagDuplicate.ts` の既存判断を踏襲）。
  * - **名前の衝突**: 構造体内でのフィールド名重複（`field-name-duplicate`）
  *   と、同じ収集グループ内の既存タグ名との重複（`existing-name-duplicate`）
  *   の両方を検出する（タグ名はグループ内一意 — サーバー側検証と同じ前提）。
  *
- * 戻り値は行ごとの衝突一覧（空配列 = 衝突なし）。1行に複数種類の衝突が
- * あれば複数エントリを返す。
+ * 占有の重なりの規則は `addressSpan.ts::spansOverlap`（同じ `area` の
+ * `[index, index + wordCount - 1]`。ワード内ビットはワードを占める。`index` が無ければ
+ * `canonical` の一致だけ）。戻り値は行ごとの衝突一覧（空配列 = 衝突なし）。1行に複数種類の
+ * 衝突があれば複数エントリを返す。
  */
 export function detectStructAddressCollisions(
 	rows: StructAllocatedRow[],
@@ -251,10 +342,6 @@ export function detectStructAddressCollisions(
 
 	const groupExisting = existingTags.filter((t) => t.collectionGroupId === collectionGroupId);
 	const existingByName = new Map(groupExisting.map((t) => [t.name, t]));
-	const existingRanges = groupExisting.map((t) => ({
-		name: t.name,
-		range: addressWordRange(t.address, addressIncrement(t.dataType, t.stringLength))
-	}));
 
 	const firstSeenAt = new Map<string, number>();
 
@@ -277,29 +364,25 @@ export function detectStructAddressCollisions(
 			});
 		}
 
-		const range = addressWordRange(row.address, row.words);
-		if (!range) return;
-
 		for (let other = 0; other < rows.length; other++) {
 			if (other === index) continue;
 			const otherRow = rows[other];
-			const otherRange = addressWordRange(otherRow.address, otherRow.words);
-			if (otherRange && rangesOverlap(range, otherRange)) {
+			if (spansOverlap(row.span, otherRow.span)) {
 				collisions.push({
 					index,
 					kind: 'field-address-overlap',
-					message: `アドレス ${row.address}（${row.words}word占有）が ${other + 1}行目「${otherRow.name}」（${otherRow.address}、${otherRow.words}word占有）と重なっています。`
+					message: `アドレス ${row.address}（${row.span.wordCount}word占有）が ${other + 1}行目「${otherRow.name}」（${otherRow.address}、${otherRow.span.wordCount}word占有）と重なっています。`
 				});
 				break;
 			}
 		}
 
-		for (const existing of existingRanges) {
-			if (existing.range && rangesOverlap(range, existing.range)) {
+		for (const existing of groupExisting) {
+			if (existing.span && spansOverlap(row.span, existing.span)) {
 				collisions.push({
 					index,
 					kind: 'existing-address-overlap',
-					message: `アドレス ${row.address}（${row.words}word占有）が既存タグ「${existing.name}」と重なっています。`
+					message: `アドレス ${row.address}（${row.span.wordCount}word占有）が既存タグ「${existing.name}」と重なっています。`
 				});
 				break;
 			}
