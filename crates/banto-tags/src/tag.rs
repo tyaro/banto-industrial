@@ -1522,6 +1522,11 @@ async fn placement_for_update_tx(
                 && before.collection_group_id == input.collection_group_id
                 && before.address == input.address
                 && before.data_type == input.data_type
+                // A string's length and encoding determine the read span and
+                // interpretation, even when its first device is unchanged.
+                && before.string_length == input.string_length
+                && (before.data_type != STRING_DATA_TYPE
+                    || before.string_encoding == input.string_encoding)
                 // With an unparseable address the driver cannot tell whether
                 // this is a writable area. Do not newly enable writing here.
                 && (!input.writable || before.writable)
@@ -8687,6 +8692,11 @@ mod tests {
                         "{text:?} は {id} のアドレスとして読めません"
                     )));
                 }
+                // Model the SLMP last-device occupancy boundary: one word
+                // fits at D16777215, but a wider string runs past it.
+                if text.eq_ignore_ascii_case("D16777215") && kind.word_count() > 1 {
+                    return Err(AddressError::new("read extends beyond the final device"));
+                }
                 if self.lower {
                     if matches!(kind, TagKind::Str { .. }) {
                         return Err(AddressError::new(format!("{id} は string を読めません")));
@@ -8870,6 +8880,28 @@ mod tests {
             let (legacy, group) = setup().await;
             let reg = TagService::with_registry(legacy.pool.clone(), registry());
             (legacy, reg, group)
+        }
+
+        /// This test registry admits strings under SLMP and models the real
+        /// driver's final-device occupancy rule without a crate dependency
+        /// cycle (the real SLMP driver already depends on banto-tags).
+        async fn slmp_string_boundary_setup() -> (TagService, TagService, i64) {
+            let (legacy, _) = setup().await;
+            let group = slmp_group(&legacy.pool).await;
+            let mut registry = DriverRegistry::new();
+            registry
+                .register(DriverEntry::host_provided(Arc::new(CanonDriver {
+                    descriptor: DriverDescriptor::new(
+                        DriverId::new("slmp").unwrap(),
+                        "0.0.0",
+                        "slmp",
+                        Capabilities::READ_ONLY,
+                    ),
+                    lower: false,
+                })))
+                .unwrap();
+            let tags = TagService::with_registry(legacy.pool.clone(), Arc::new(registry));
+            (legacy, tags, group)
         }
 
         /// **Parse and write share one `BEGIN IMMEDIATE` transaction** (design §3.2,
@@ -9607,6 +9639,87 @@ mod tests {
             let old = tags.get(old.id).await.unwrap();
             assert!(!old.enabled);
             assert_eq!(old.address, "bad!");
+        }
+
+        #[tokio::test]
+        async fn disabled_string_update_rechecks_changed_length_and_encoding() {
+            let (legacy, tags, group) = slmp_string_boundary_setup().await;
+            let mut boundary = string_tag("Boundary", group, "D16777215");
+            boundary.string_length = Some(1);
+            let created = tags.create(boundary.clone()).await.unwrap();
+            let mut widened = boundary;
+            widened.enabled = false;
+            widened.string_length = Some(2);
+            assert_eq!(
+                field_errors_of(tags.update(created.id, widened).await.unwrap_err())[0].field,
+                "address"
+            );
+            assert!(tags.get(created.id).await.unwrap().enabled);
+
+            let mut old = string_tag("OldString", group, "bad!");
+            old.string_length = Some(1);
+            old.string_encoding = "shift_jis".to_string();
+            let created = legacy.create(old.clone()).await.unwrap();
+            let mut disabled = old;
+            disabled.enabled = false;
+            let mut changed_encoding = disabled.clone();
+            changed_encoding.string_encoding = "utf8".to_string();
+            assert_eq!(
+                field_errors_of(tags.update(created.id, changed_encoding).await.unwrap_err())[0]
+                    .field,
+                "address"
+            );
+            let saved = tags.update(created.id, disabled).await.unwrap();
+            assert!(!saved.enabled);
+            assert_eq!(saved.address, "bad!");
+        }
+
+        #[tokio::test]
+        async fn disabled_string_batch_rechecks_width_and_keeps_old_invalid_address() {
+            let (legacy, tags, group) = slmp_string_boundary_setup().await;
+            let mut boundary = string_tag("Boundary", group, "D16777215");
+            boundary.string_length = Some(1);
+            let boundary_row = tags.create(boundary.clone()).await.unwrap();
+            let mut widened = boundary;
+            widened.enabled = false;
+            widened.string_length = Some(2);
+
+            let mut old = string_tag("OldString", group, "bad!");
+            old.string_length = Some(1);
+            old.string_encoding = "shift_jis".to_string();
+            let old_row = legacy.create(old.clone()).await.unwrap();
+            let mut disabled = old;
+            disabled.enabled = false;
+
+            let mut tx = tags.pool.begin().await.unwrap();
+            let outcome = tags
+                .update_batch_tx(
+                    &mut tx,
+                    &[(old_row.id, disabled.clone()), (boundary_row.id, widened)],
+                )
+                .await
+                .unwrap();
+            let BatchTagUpdateOutcome::Invalid(errors) = outcome else {
+                panic!("expected invalid string width");
+            };
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(errors[0].index, 1);
+            assert_eq!(errors[0].field_errors[0].field, "address");
+            tx.rollback().await.unwrap();
+            assert!(tags.get(old_row.id).await.unwrap().enabled);
+            assert!(tags.get(boundary_row.id).await.unwrap().enabled);
+
+            let mut tx = tags.pool.begin().await.unwrap();
+            let outcome = tags
+                .update_batch_tx(&mut tx, &[(old_row.id, disabled)])
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                BatchTagUpdateOutcome::Valid { count: 1, .. }
+            ));
+            tx.commit().await.unwrap();
+            assert!(!tags.get(old_row.id).await.unwrap().enabled);
         }
 
         // -- Q2: protocol change and group move re-parse the tags -----------------
