@@ -1795,8 +1795,9 @@ impl CollectorManager {
     /// does not wait - and the old task must have closed its socket before
     /// the new session dials: a PLC that refuses a second connection on the
     /// same port (R08: 10061) would otherwise refuse the new one. The wait is
-    /// bounded (a running job finishes within its job limit, queued jobs are
-    /// answered with `TaskGone`, a pending dial is aborted, the goodbye is
+    /// bounded (a running job finishes within its job limit, a queued job
+    /// either runs before the task sees the stop or is answered with
+    /// `TaskGone` - never a false success, a pending dial is aborted, the goodbye is
     /// bounded by `banto_broker::DISCONNECT_LIMIT`); until the collector
     /// commit replaces the changed connection's collect task, that task reads
     /// through the stopped handle and reads Bad. [`Self::rollback_broker_sessions`]
@@ -4194,6 +4195,10 @@ mod tests {
             Some(BrokerConnectionStatus::Connected)
         );
         manager.shutdown().await;
+        // On Windows the SQLite file is released asynchronously, and on this
+        // current-thread runtime the TempDir's synchronous drop cannot drive
+        // the pool's close (`test_support.rs`) - close it before the drop.
+        pool.close().await;
     }
 
     /// #807 P2: a connection collected with `simulation = true` is switched

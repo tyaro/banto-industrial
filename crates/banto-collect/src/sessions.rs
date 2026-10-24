@@ -34,14 +34,15 @@
 //! for it (`SessionDirectory::stop_and_join`) before ensuring the new one,
 //! rather than only dropping the directory's entry (2026-10-24 owner
 //! decision). Dropping the entry also signals the old task to stop (its
-//! per-task stop sender goes with it, even though other clones of the handle
-//! - the previous factory, which a sibling connection's collect task still
-//! holds - live on), but does not wait: the old task's teardown (a running
-//! job, the goodbye) could still hold its socket while the new session
-//! dials, and a PLC that refuses a second connection on the same port (R08:
-//! 10061) would refuse that first dial. The
-//! wait is bounded: a job already running finishes within its own job limit,
-//! queued jobs are answered with `TaskGone` (never success), a pending dial is
+//! per-task stop sender goes with it, even though other clones of the handle,
+//! held through the previous factory by a sibling connection's collect task,
+//! live on), but does not wait: the old task's teardown (a running job, the
+//! goodbye) could still hold its socket while the new session dials, and a
+//! PLC that refuses a second connection on the same port (R08: 10061) would
+//! refuse that first dial. The wait is bounded: a job already running
+//! finishes within its own job limit, a queued job either runs before the
+//! task sees the stop (the stop is not prioritized over the queue) or is
+//! answered with `TaskGone` (never a false success), a pending dial is
 //! aborted, and the goodbye is bounded by `banto_broker::DISCONNECT_LIMIT`.
 //! Until step 2 replaces the changed connection's collect task, that task
 //! reads through the stopped handle and its reads fail (Bad).
