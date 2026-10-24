@@ -132,6 +132,8 @@ impl PlcConnectionPayload {
             simulation: self.simulation,
             settings: self.settings,
             secrets: changes,
+            // REST の `settings` は丸ごと置き換え（保存済みから補う印は MCP のアダプタだけ）。
+            keep_stored: banto_tags::KeepStored::default(),
         })
     }
 
@@ -1332,6 +1334,25 @@ mod frame_connection_tests {
                 .unwrap(),
             connection_id: None,
         }
+    }
+
+    /// 接続テストも保存と同じく `Host` の前後の空白を落としてから張る（`" 127.0.0.1 "`
+    /// のままだと名前解決に失敗する）。
+    #[tokio::test]
+    async fn requested_settings_trims_the_host_like_the_save_path() {
+        let (manager, sessions, pool, _creates) = fixture().await;
+        let resolved = banto_broker::resolve_session_driver(manager.registry(), "modbus-tcp")
+            .expect("modbus-tcp is registered");
+        let mut test = payload(502);
+        test.settings
+            .insert("host".into(), serde_json::json!(" 127.0.0.1 "));
+        let requested = requested_settings(&manager, resolved.driver().as_ref(), &test)
+            .await
+            .unwrap_or_else(|err| panic!("{err:?}"));
+        assert_eq!(requested.settings.get("host"), Some("127.0.0.1"));
+        manager.shutdown().await;
+        sessions.shutdown().await;
+        pool.close().await;
     }
 
     #[tokio::test]

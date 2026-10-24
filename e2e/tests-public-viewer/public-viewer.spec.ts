@@ -238,12 +238,9 @@ test.describe.serial('ChronoGazer viewer-public mode', () => {
 			name: PV_CONNECTION,
 			protocol: 'modbus-tcp',
 			// 到達しない TEST-NET（RFC 5737）。シミュレーションなので接続しに行かない。
-			host: '192.0.2.1',
-			port: 502,
-			unitId: 1,
 			enabled: true,
-			wordOrder: '',
-			simulation: true
+			simulation: true,
+			settings: { host: '192.0.2.1', port: 502, unit_id: 1 }
 		});
 		const cg = await postJson<NamedRow>(page.request, headers, '/api/collection-groups', {
 			name: PV_COLLECTION_GROUP,

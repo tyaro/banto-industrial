@@ -66,8 +66,8 @@ test.describe.serial('banto-hub pending apply/cancel', () => {
 			headers: authedHeaders,
 			data: {
 				name: CONNECTION_NAME,
-				host: '127.0.0.1',
-				port: 15022
+				protocol: 'modbus-tcp',
+				settings: { host: '127.0.0.1', port: 15022, unit_id: 1 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

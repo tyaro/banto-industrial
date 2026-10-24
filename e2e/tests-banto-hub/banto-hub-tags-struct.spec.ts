@@ -53,11 +53,9 @@ test.describe.serial('banto-hub 構造体タグ登録 DOM (T20 ②a)', () => {
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'slmp',
-				host: '127.0.0.1',
-				port: 5010,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 5010 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

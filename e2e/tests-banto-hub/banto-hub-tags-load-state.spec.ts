@@ -42,11 +42,9 @@ test.describe.serial('banto-hub タグ一覧の初期読込状態の区別 (TAG-
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

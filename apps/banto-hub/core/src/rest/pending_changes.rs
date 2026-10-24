@@ -74,10 +74,15 @@ struct QueuedPlcConnectionPayload {
     settings: serde_json::Map<String, serde_json::Value>,
     #[serde(default)]
     sealed_secrets: std::collections::BTreeMap<String, serde_json::Value>,
+    /// 省いた欄を保存済みの行から補う印（`crate::pending_changes::KEEP_STORED_FIELD`。MCP の
+    /// 平らな形のアダプタの更新だけが積む。適用時のトランザクションの中で補う）。
+    #[serde(default)]
+    keep_stored: banto_tags::KeepStored,
 }
 
 impl QueuedPlcConnectionPayload {
-    /// 入力と封印した値に分ける。封印した値の形が違えばそのキーの項目エラー（値は載せない）。
+    /// 入力と封印した値と補う印に分ける。封印した値の形が違えばそのキーの項目エラー
+    /// （値は載せない）。
     #[allow(clippy::type_complexity)]
     fn into_parts(
         self,
@@ -85,6 +90,7 @@ impl QueuedPlcConnectionPayload {
         (
             PlcConnectionPayload,
             std::collections::BTreeMap<String, crate::secrets::SealedSecret>,
+            banto_tags::KeepStored,
         ),
         PendingApplyError,
     > {
@@ -109,6 +115,7 @@ impl QueuedPlcConnectionPayload {
                 settings: self.settings,
             },
             sealed,
+            self.keep_stored,
         ))
     }
 }
@@ -334,7 +341,8 @@ async fn execute_pending_apply(
         "plc_connections.create" => {
             let body: PendingChangeWithInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
-            let (input, sealed) = body.input.into_parts()?;
+            // 作成に補う印があれば `create_settings_tx` が断る。
+            let (input, sealed, keep_stored) = body.input.into_parts()?;
             reject_hub_connection_protocol(&input.protocol)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -345,10 +353,13 @@ async fn execute_pending_apply(
                 .plc_connections
                 .create_settings_tx(
                     &mut tx,
-                    input
-                        .into_input_with_sealed(&secret_keys, sealed)
-                        .map_err(ApiError)
-                        .map_err(PendingApplyError::Api)?,
+                    banto_tags::ConnectionSettingsInput {
+                        keep_stored,
+                        ..input
+                            .into_input_with_sealed(&secret_keys, sealed)
+                            .map_err(ApiError)
+                            .map_err(PendingApplyError::Api)?
+                    },
                 )
                 .await
                 .map_err(ApiError)
@@ -358,7 +369,7 @@ async fn execute_pending_apply(
         "plc_connections.update" => {
             let body: PendingChangeWithIdAndInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
-            let (input, sealed) = body.input.into_parts()?;
+            let (input, sealed, keep_stored) = body.input.into_parts()?;
             reject_hub_connection_protocol(&input.protocol)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
@@ -392,10 +403,14 @@ async fn execute_pending_apply(
                 .update_settings_tx(
                     &mut tx,
                     body.id,
-                    input
-                        .into_input_with_sealed(&secret_keys, sealed)
-                        .map_err(ApiError)
-                        .map_err(PendingApplyError::Api)?,
+                    // 補う印（MCP）は、ここ（`tx` の中）で読んだ保存済みの行から補う。
+                    banto_tags::ConnectionSettingsInput {
+                        keep_stored,
+                        ..input
+                            .into_input_with_sealed(&secret_keys, sealed)
+                            .map_err(ApiError)
+                            .map_err(PendingApplyError::Api)?
+                    },
                 )
                 .await
                 .map_err(ApiError)

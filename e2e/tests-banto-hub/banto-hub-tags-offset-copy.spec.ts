@@ -53,11 +53,9 @@ test.describe.serial('banto-hub オフセットコピー DOM (T20 ②b)', () => 
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'slmp',
-				host: '127.0.0.1',
-				port: 5011,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 5011 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

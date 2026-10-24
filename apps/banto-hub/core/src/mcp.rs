@@ -1912,7 +1912,7 @@ async fn tool_create_connection(
     if let Err(err) = flat.check(&state.plc_connections) {
         return Ok(banto_error_tool_error(&err));
     }
-    let input = flat.into_settings_payload(None);
+    let (input, _no_keep) = flat.into_settings_payload(false);
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
@@ -2304,21 +2304,32 @@ async fn tool_update_connection(
         return Ok(banto_error_tool_error(&err));
     }
     // R2b-6b: 平らな形の旧い検証 (1) を今の項目名で掛けてから `settings` の形に写す。今の
-    // 「省略は保つ」（slmp の cpuType・push の settings）は保存済みの行から補う。
+    // 「省略は保つ」（slmp の cpuType・push の settings）は値を補わず `keep` の印で運び、
+    // 書き込みのトランザクションの中で読んだ保存済みの行から banto-tags が補う
+    // （#813 のレビュー P2。ここで読んで補うと、間にコミットされた更新を巻き戻す）。
     if let Err(err) = flat.check(&state.plc_connections) {
         return Ok(banto_error_tool_error(&err));
     }
-    let stored = state.plc_connections.get(id).await.ok();
-    let input = flat.into_settings_payload(stored.as_ref());
+    let (input, keep) = flat.into_settings_payload(true);
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        let form = match input.clone().queue_form(&secret_keys) {
+        let mut form = match input.clone().queue_form(&secret_keys) {
             Ok(form) => form,
             Err(err) => return Ok(banto_error_tool_error(&err)),
         };
+        // 補う印もそのまま積む（適用時のトランザクションの中で補う。積む時点の指紋と
+        // 補う値の出どころを別の読みにしない）。REST から積む行には付かない。
+        if !keep.is_empty() {
+            if let Some(object) = form.as_object_mut() {
+                object.insert(
+                    crate::pending_changes::KEEP_STORED_FIELD.to_string(),
+                    json!(keep),
+                );
+            }
+        }
         let payload = json!({ "id": id, "input": form });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2365,7 +2376,10 @@ async fn tool_update_connection(
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
     let input = match input.into_input(&secret_keys) {
-        Ok(input) => input,
+        Ok(input) => banto_tags::ConnectionSettingsInput {
+            keep_stored: keep,
+            ..input
+        },
         Err(err) => return Ok(banto_error_tool_error(&err)),
     };
     let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {

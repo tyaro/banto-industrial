@@ -46,6 +46,40 @@ pub struct ConnectionSettingsInput {
     pub settings: Map<String, Value>,
     /// 秘密のキーごとの変更（**封印済み**。無いキーは `Keep`）。
     pub secrets: SecretChanges,
+    /// 更新で省いた欄を保存済みの行から補う印（[`KeepStored`]。既定は空 = 補わない）。
+    pub keep_stored: KeepStored,
+}
+
+/// 更新で省いた欄を、**書き込みのトランザクションの中で読んだ**保存済みの行から補う印
+/// （R2b-6b。MCP の平らな形のアダプタの「省略は保つ」のためだけにある。**R2b-7 で消える**）。
+///
+/// REST の `settings` の形は丸ごと置き換えの約束なので、REST の入力からは作らない
+/// （Hub の `PlcConnectionPayload` はこの欄を受けない）。補う値をトランザクションの外で
+/// 読んで明示的な置き換えとして渡すと、間にコミットされた別の更新を古い値で巻き戻す
+/// （#813 のレビュー P2）ので、印のまま運んで `update_in` が補う。
+///
+/// - `keys`: 機器のドライバの `settings` のキー（秘密でないスキーマの欄）。入力の
+///   `settings` には置かない（置いたら断る）。保存済みの行が**同じプロトコル**でその
+///   キーに値があればそれを保ち、無ければスキーマの既定値のまま（`slmp` の `cpu_type` は
+///   既定の `R`）。
+/// - `push_settings`: `push` の `settings` を丸ごと保つ（入力の `settings` は空であること）。
+///   保存済みの行が `push` でなければ既定（`{}`）。
+///
+/// 作成では使えない（空でなければ断る）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct KeepStored {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keys: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub push_settings: bool,
+}
+
+impl KeepStored {
+    /// 何も補わないか。
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty() && !self.push_settings
+    }
 }
 
 /// 機器のドライバの `settings`（[`crate::settings_from_schema`] を通ったもの）と、スキーマで
@@ -54,6 +88,8 @@ pub struct ConnectionSettingsInput {
 pub(super) struct TypedSettings {
     pub(super) settings: Map<String, Value>,
     pub(super) required_secrets: Vec<String>,
+    /// 保存済みの行（同じプロトコル）から補うキー（[`KeepStored::keys`]）。
+    pub(super) keep_keys: Vec<String>,
 }
 
 enum Route {
@@ -70,6 +106,12 @@ impl PlcConnectionService {
         connection: &mut SqliteConnection,
         input: ConnectionSettingsInput,
     ) -> Result<PlcConnection, BantoError> {
+        if !input.keep_stored.is_empty() {
+            return Err(validation_error(vec![FieldError {
+                field: "settings".to_string(),
+                message: "作成では保存済みの設定を保てません".to_string(),
+            }]));
+        }
         match self.route(input)? {
             Route::Host(flat) => self.create_tx(connection, flat).await,
             Route::Driver(flat, typed) => self.create_in(connection, flat, Some(typed)).await,
@@ -170,6 +212,7 @@ fn driver_route(
 ) -> Result<Route, BantoError> {
     let mut errors = name_errors(&input.name);
     errors.extend(secret_key_errors(&input, secret_keys));
+    errors.extend(keep_key_errors(&input, schema));
     let mut typed_settings = Map::new();
     match crate::settings_from_schema(schema, &input.settings) {
         Ok(settings) => typed_settings = settings,
@@ -207,6 +250,7 @@ fn driver_route(
         TypedSettings {
             settings: typed_settings,
             required_secrets,
+            keep_keys: input.keep_stored.keys,
         },
     ))
 }
@@ -215,6 +259,19 @@ fn driver_route(
 fn host_route(input: ConnectionSettingsInput) -> Result<PlcConnectionInput, BantoError> {
     let protocol = input.protocol.as_str();
     let mut errors = Vec::new();
+    if let Some(key) = input.keep_stored.keys.first() {
+        errors.push(FieldError {
+            field: key.clone(),
+            message: format!("{protocol} 接続では保存済みの {key} を保てません"),
+        });
+    }
+    if input.keep_stored.push_settings && (protocol != PUSH_PROTOCOL || !input.settings.is_empty())
+    {
+        errors.push(FieldError {
+            field: "settings".to_string(),
+            message: "保存済みの push の設定を保つときは settings を空にしてください".to_string(),
+        });
+    }
     let mut flat = PlcConnectionInput {
         name: input.name.clone(),
         protocol: input.protocol.clone(),
@@ -260,7 +317,11 @@ fn host_route(input: ConnectionSettingsInput) -> Result<PlcConnectionInput, Bant
             }
         }
     } else if protocol == PUSH_PROTOCOL {
-        flat.settings = Some(Value::Object(input.settings.clone()));
+        // 印があれば `None`（今の書き込みの「省略は保つ」: トランザクションの中で読んだ
+        // 保存済みの push の行の `settings`、push でなければ既定）。
+        if !input.keep_stored.push_settings {
+            flat.settings = Some(Value::Object(input.settings.clone()));
+        }
     } else if (protocol == VIRTUAL_PROTOCOL || protocol == HUB_PROTOCOL)
         && !input.settings.is_empty()
     {
@@ -309,6 +370,35 @@ fn secret_key_errors(input: &ConnectionSettingsInput, secret_keys: &[String]) ->
     for key in secret_keys {
         if input.settings.contains_key(key) {
             errors.push(plaintext_secret_error(key));
+        }
+    }
+    errors
+}
+
+/// [`KeepStored`] の取り違え（機器のドライバ）: push の印、秘密でないスキーマの欄でない
+/// キー、入力の `settings` にも値があるキー。
+fn keep_key_errors(
+    input: &ConnectionSettingsInput,
+    schema: &banto_driver_api::SettingsSchema,
+) -> Vec<FieldError> {
+    let mut errors = Vec::new();
+    if input.keep_stored.push_settings {
+        errors.push(FieldError {
+            field: "settings".to_string(),
+            message: format!("{} 接続では push の設定を保てません", input.protocol),
+        });
+    }
+    for key in &input.keep_stored.keys {
+        let is_plain_field = schema
+            .field(key)
+            .is_some_and(|field| !matches!(field.kind, FieldKind::Secret));
+        if !is_plain_field {
+            errors.push(unknown_key_error(key));
+        } else if input.settings.contains_key(key) {
+            errors.push(FieldError {
+                field: key.clone(),
+                message: "保存済みの値を保つ欄に値も指定されています".to_string(),
+            });
         }
     }
     errors

@@ -389,7 +389,8 @@ async fn test_app() -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        // R2b-6b: like production, the REST service carries the driver registry.
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,

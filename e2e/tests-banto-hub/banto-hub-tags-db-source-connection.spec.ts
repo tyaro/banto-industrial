@@ -74,6 +74,9 @@ async function cleanupFixtures(
 
 test.describe
 	.serial('banto-hub postgres（DB Source）接続の作成・ツリー表示・グループ作成（S1/S3）', () => {
+	// R2b-6b（#813、2026-10-24 オーナー決定）: REST が settings の形になり、今の接続の画面は 6c まで
+	// 接続を保存できない。6c（DriverSettingsForm への置き換え）の PR で必ず外す。
+	test.fixme(true, 'R2b-6c で接続の画面が settings の形に追従するまで止める');
 	let adminPage: Page;
 	let adminHeaders: Record<string, string>;
 

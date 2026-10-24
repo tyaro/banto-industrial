@@ -10,8 +10,10 @@
 //! - 入力: まず平らな形の旧い検証 (1)（`PlcConnectionService::validate_flat_input`。項目名と
 //!   文言は今のまま、例えば `unitId`）を通し、`banto_tags::settings_json::legacy::settings_from_flat`
 //!   で `settings` に写して REST と同じ入口（封印・未適用キュー・`create_settings_tx`）に渡す。
-//!   今の「省略は保つ」は、更新のときに保存済みの行から補う: `slmp` の `cpuType`、`push` の
-//!   `settings`。`wordOrder` の省略（空文字）はスキーマの既定（プロトコルの既定と同じ）。
+//!   今の「省略は保つ」（`slmp` の `cpuType`、`push` の `settings`）は、値を補わずに
+//!   `banto_tags::KeepStored` の印として渡し、書き込みのトランザクションの中で読んだ保存済みの
+//!   行から banto-tags が補う（#813 のレビュー P2: 外で読んだ値を置き換えとして渡すと、間に
+//!   コミットされた別の更新を巻き戻す）。未適用キューにも印のまま積み、適用時に補う。`wordOrder` の省略（空文字）はスキーマの既定（プロトコルの既定と同じ）。
 //!   `password` はそのまま `settings.password` に載り、REST と同じ tri-state で封印される
 //!   （`null`・省略は保つ、空文字は消す、値は置き換え）。
 //! - 応答: 今の平らな応答（`passwordSet`・`passwordState`）を組み立てる。
@@ -108,11 +110,13 @@ impl FlatPlcConnectionPayload {
         service.validate_flat_input(self.flat_input())
     }
 
-    /// `settings` の形に写す（モジュールの doc）。`stored` は更新の対象の保存済みの行。
+    /// `settings` の形に写す（モジュールの doc）。`updating` なら、省いた `slmp` の `cpuType`・
+    /// `push` の `settings` を保存済みから補う印（[`banto_tags::KeepStored`]）も返す（作成では
+    /// 常に空。省いた `cpuType` は既定の `R`、`push` は既定）。
     pub(super) fn into_settings_payload(
         self,
-        stored: Option<&PlcConnection>,
-    ) -> PlcConnectionPayload {
+        updating: bool,
+    ) -> (PlcConnectionPayload, banto_tags::KeepStored) {
         let mut settings =
             banto_tags::settings_json::legacy::settings_from_flat(&self.flat_input());
         if settings
@@ -122,18 +126,16 @@ impl FlatPlcConnectionPayload {
         {
             settings.remove("word_order");
         }
-        let stored_same = stored.filter(|conn| conn.protocol == self.protocol);
-        if self.protocol == "slmp" && !settings.contains_key("cpu_type") {
-            if let Some(cpu) = stored_same.and_then(|conn| conn.settings.get("cpu_type")) {
-                settings.insert("cpu_type".to_string(), cpu.clone());
-            }
+        let mut keep = banto_tags::KeepStored::default();
+        if updating && self.protocol == "slmp" && !settings.contains_key("cpu_type") {
+            keep.keys.push("cpu_type".to_string());
         }
-        if self.protocol == banto_tags::PUSH_PROTOCOL
+        if updating
+            && self.protocol == banto_tags::PUSH_PROTOCOL
             && !matches!(self.settings, Some(Value::Object(_)))
         {
-            if let Some(conn) = stored_same {
-                settings = conn.settings.clone();
-            }
+            settings.clear();
+            keep.push_settings = true;
         }
         if self.protocol == banto_tags::POSTGRES_PROTOCOL {
             if let Some(password) = self.password {
@@ -143,13 +145,14 @@ impl FlatPlcConnectionPayload {
                 );
             }
         }
-        PlcConnectionPayload {
+        let payload = PlcConnectionPayload {
             name: self.name,
             protocol: self.protocol,
             enabled: self.enabled,
             simulation: self.simulation,
             settings,
-        }
+        };
+        (payload, keep)
     }
 }
 
@@ -294,5 +297,79 @@ impl FlatPlcConnectionTestPayload {
             settings,
             connection_id: self.connection_id,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn flat(value: Value) -> FlatPlcConnectionPayload {
+        serde_json::from_value(value).unwrap()
+    }
+
+    /// #813 review P2: the omitted `cpuType` / push `settings` are not filled here from a
+    /// read made before the write transaction; they travel as [`banto_tags::KeepStored`] and
+    /// banto-tags fills them inside it. Create never marks; a given value is not marked.
+    #[test]
+    fn omitted_kept_fields_travel_as_a_mark_not_as_values() {
+        let slmp = json!({ "name": "a", "protocol": "slmp", "host": " h ", "port": 5007 });
+        let (payload, keep) = flat(slmp.clone()).into_settings_payload(true);
+        assert_eq!(
+            Value::Object(payload.settings),
+            json!({ "host": "h", "port": 5007 })
+        );
+        assert_eq!(keep.keys, ["cpu_type"]);
+        assert!(!keep.push_settings);
+        let (payload, keep) = flat(slmp).into_settings_payload(false);
+        assert!(!payload.settings.contains_key("cpu_type"));
+        assert!(keep.is_empty());
+        let (payload, keep) = flat(json!({ "name": "a", "protocol": "slmp", "host": "h",
+                                           "port": 5007, "cpuType": "Q" }))
+        .into_settings_payload(true);
+        assert_eq!(payload.settings.get("cpu_type"), Some(&json!("Q")));
+        assert!(keep.is_empty());
+
+        for settings in [None, Some(Value::Null)] {
+            let mut push = json!({ "name": "p", "protocol": "push", "host": "", "port": 0 });
+            if let Some(settings) = settings {
+                push["settings"] = settings;
+            }
+            let (payload, keep) = flat(push.clone()).into_settings_payload(true);
+            assert!(payload.settings.is_empty(), "{push}");
+            assert!(keep.push_settings && keep.keys.is_empty(), "{push}");
+            let (_, keep) = flat(push).into_settings_payload(false);
+            assert!(keep.is_empty());
+        }
+        let (payload, keep) = flat(json!({ "name": "p", "protocol": "push", "host": "",
+                                           "port": 0, "settings": { "stale_timeout_ms": 1 } }))
+        .into_settings_payload(true);
+        assert_eq!(
+            Value::Object(payload.settings),
+            json!({ "stale_timeout_ms": 1 })
+        );
+        assert!(keep.is_empty());
+    }
+
+    /// REST's payload cannot carry the mark (its `settings` replace the whole object), and
+    /// REST's queue form never writes it.
+    #[test]
+    fn rest_neither_accepts_nor_queues_the_mark() {
+        let err = serde_json::from_value::<PlcConnectionPayload>(json!({
+            "name": "a", "protocol": "slmp", "settings": {},
+            "keepStored": { "keys": ["cpu_type"] }
+        }))
+        .unwrap_err();
+        assert!(err.to_string().contains("keepStored"), "{err}");
+        let (payload, _) = flat(json!({ "name": "a", "protocol": "slmp", "host": "h",
+                                        "port": 5007 }))
+        .into_settings_payload(true);
+        let form = payload.queue_form(&[]).unwrap();
+        assert!(
+            form.get(crate::pending_changes::KEEP_STORED_FIELD)
+                .is_none(),
+            "{form}"
+        );
     }
 }

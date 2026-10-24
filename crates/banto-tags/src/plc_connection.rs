@@ -285,8 +285,8 @@ use crate::support::{
 use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
 mod settings_input;
-pub use settings_input::ConnectionSettingsInput;
 use settings_input::TypedSettings;
+pub use settings_input::{ConnectionSettingsInput, KeepStored};
 
 /// The **legacy** protocol rule list (R2b-1f, 2026-10-22). It is no longer the
 /// Hub's source of truth: since migration `0025` the SQL `CHECK` on
@@ -1823,7 +1823,10 @@ impl PlcConnectionService {
     ///
     /// `typed` as in [`Self::create_in`]: `Some` replaces the flat rules and the flat
     /// "omitted keeps" merges (`cpu_type`, push `settings`) with the driver's `settings`
-    /// as given (only a secret key's [`SecretChange::Keep`] still keeps).
+    /// as given (only a secret key's [`SecretChange::Keep`] still keeps), except the keys
+    /// the caller marked with [`KeepStored::keys`] (the MCP flat adapter): those take the
+    /// stored row's value read here, inside this transaction, when the row has the same
+    /// protocol (else the schema default stays).
     async fn update_in(
         &self,
         connection: &mut SqliteConnection,
@@ -1925,7 +1928,21 @@ impl PlcConnectionService {
             .unwrap_or_default();
 
         let mut settings = match &typed {
-            Some(typed) => typed.settings.clone(),
+            Some(typed) => {
+                let mut settings = typed.settings.clone();
+                // #813 review P2: merged from the row read in this transaction, never from
+                // a read made before it (that would roll back an update committed between).
+                if existing_protocol == Some(input.protocol.as_str()) {
+                    for key in &typed.keep_keys {
+                        if let Some(value) =
+                            existing_settings.get(key).filter(|value| !value.is_null())
+                        {
+                            settings.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                settings
+            }
             None => {
                 let mut settings = settings_from_flat(&input);
                 // #605: an omitted cpu_type keeps the stored one (an slmp row's), else R.

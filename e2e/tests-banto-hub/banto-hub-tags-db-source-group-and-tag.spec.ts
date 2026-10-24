@@ -123,15 +123,15 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 			data: {
 				name: PG_CONN,
 				protocol: 'postgres',
-				host: '10.0.0.9',
-				port: 5432,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				database: 'appdb',
-				username: 'appuser',
-				password: 'hunter2'
+				settings: {
+					host: '10.0.0.9',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: 'hunter2'
+				}
 			}
 		});
 		expect(connRes.ok()).toBeTruthy();
