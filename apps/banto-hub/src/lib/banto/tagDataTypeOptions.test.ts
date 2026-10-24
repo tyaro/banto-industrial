@@ -59,3 +59,27 @@ describe('dataTypeOptionsFor: ホストの表', () => {
 		}
 	});
 });
+
+describe('dataTypeOptionsFor: ドライバの一覧が未着', () => {
+	it('ドライバの id は全部の型を出す（既存タグの i64 などが消えない）', () => {
+		for (const protocol of ['slmp', 'modbus-tcp', 'unknown-driver']) {
+			expect(values(dataTypeOptionsFor(protocol, undefined, false))).toEqual(ALL);
+		}
+	});
+
+	it('届いたが載っていないドライバは 64bit 抜き', () => {
+		expect(values(dataTypeOptionsFor('unknown-driver', undefined, true))).toEqual(NO_64);
+	});
+
+	it('ホストの接続・未選択は未着でも変わらない', () => {
+		for (const protocol of ['push', 'postgres', 'virtual', undefined]) {
+			expect(values(dataTypeOptionsFor(protocol, undefined, false))).toEqual(
+				values(dataTypeOptionsFor(protocol, undefined, true))
+			);
+		}
+	});
+
+	it('記述子があれば未着フラグに関わらず supportedKinds', () => {
+		expect(values(dataTypeOptionsFor('slmp', SLMP_LIKE, false))).toEqual(NO_64);
+	});
+});

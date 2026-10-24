@@ -4,7 +4,7 @@
  * 直接 import）。ドライバは `configPackageTestDrivers.ts` の偽の記述子に `addressHelp` を足す。
  */
 import { describe, expect, it } from 'vitest';
-import { addressHelpFor } from './tagAddressHelp';
+import { DRIVER_ADDRESS_PLACEHOLDER, addressHelpFor } from './tagAddressHelp';
 import { MODBUS_DRIVER, SLMP_DRIVER } from './configPackageTestDrivers';
 import type { DriverInfo, TagDataType } from './tagRegistryAdmin';
 
@@ -25,12 +25,19 @@ describe('addressHelpFor: ドライバの接続', () => {
 		}
 	});
 
-	it('ホストの表（例・デバイス・bit の説明・placeholder）は混ぜない', () => {
+	it('ホストの表（例・デバイス・bit の説明）は混ぜない', () => {
 		const help = addressHelpFor('slmp', 'u16', SLMP_WITH_HELP);
 		expect(help.examples).toEqual([]);
 		expect(help.deviceHint).toBe('');
 		expect(help.bitHint).toBe('');
-		expect(help.placeholder).toBe('');
+	});
+
+	it('placeholder はプロトコル固有の例を含まない汎用の文言', () => {
+		for (const d of [SLMP_WITH_HELP, MODBUS_WITH_HELP]) {
+			const p = addressHelpFor(d.id, 'u16', d).placeholder;
+			expect(p).toBe(DRIVER_ADDRESS_PLACEHOLDER);
+			expect(p).not.toMatch(/D100|40001/);
+		}
 	});
 
 	it('ドライバがあればプロトコルが何でもドライバを優先する', () => {
@@ -63,14 +70,40 @@ describe('addressHelpFor: ドライバの接続', () => {
 	it('bit 型は 1 点（ビットデバイスかワード内ビット）と言う', () => {
 		const hint = addressHelpFor('slmp', 'bit', SLMP_WITH_HELP).occupancyHint;
 		expect(hint).toContain('ワード内の 1 ビット');
+		expect(hint).not.toContain('コイル');
 	});
 });
 
-describe('addressHelpFor: ドライバの id なのに記述子が無い（一覧が未着・一覧に無い）', () => {
-	it('未選択と同じ説明にする', () => {
+describe('addressHelpFor: ドライバの id なのに記述子が無い', () => {
+	it('一覧は届いたが載っていない: 未選択と同じ説明にする', () => {
 		for (const protocol of ['slmp', 'modbus-tcp', 'unknown-driver']) {
-			expect(addressHelpFor(protocol, 'f32')).toEqual(addressHelpFor(undefined, 'f32'));
+			expect(addressHelpFor(protocol, 'f32', undefined, true)).toEqual(
+				addressHelpFor(undefined, 'f32')
+			);
 		}
+	});
+
+	it('一覧が未着: 読み込み中の説明と汎用の placeholder', () => {
+		for (const protocol of ['slmp', 'modbus-tcp', 'unknown-driver']) {
+			const help = addressHelpFor(protocol, 'i32', undefined, false);
+			expect(help.driverHelp).toBe('ドライバの情報を読み込み中です。');
+			expect(help.placeholder).toBe(DRIVER_ADDRESS_PLACEHOLDER);
+			expect(help.occupancyHint).toContain('2 点');
+		}
+	});
+
+	it('一覧が未着でも、ホストの接続と未選択は振る舞いを変えない', () => {
+		for (const protocol of ['push', 'virtual', 'postgres', undefined]) {
+			expect(addressHelpFor(protocol, 'f32', undefined, false)).toEqual(
+				addressHelpFor(protocol, 'f32', undefined, true)
+			);
+		}
+	});
+
+	it('一覧が未着でも、記述子があればそれを使う', () => {
+		expect(addressHelpFor('slmp', 'u16', SLMP_WITH_HELP, false).driverHelp).toBe(
+			SLMP_WITH_HELP.addressHelp
+		);
 	});
 });
 
