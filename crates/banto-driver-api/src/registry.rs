@@ -1,7 +1,8 @@
 //! [`DriverRegistry`]: driver id → implementation
 //! (docs/banto-driver-api-design.md §6.1).
 //!
-//! A plain `BTreeMap` lookup; no logic. The host builds it (the
+//! A plain `BTreeMap` lookup plus the registration order (`ids()` follows it,
+//! not the id order; R2b-6, docs/banto-hub-driver-ui-design.md §4.1); no logic. The host builds it (the
 //! `banto-drivers` assembler plus the host's own [`DriverKind::HostProvided`]
 //! protocols). Since R2b-3a-2 (docs/banto-hub-driver-io-design.md §4.2) it is
 //! also what the broker dials through: a [`DriverKind::Frame`] (run on the
@@ -130,12 +131,14 @@ impl fmt::Debug for DriverEntry {
     }
 }
 
-/// The registered drivers, by id (design §6.1). One implementation per id
-/// in R1; R2b-4 may add per-connection alternates with a new, defaulted
-/// method.
+/// The registered drivers, by id (design §6.1), listed in registration
+/// order. One implementation per id in R1; R2b-4 may add per-connection
+/// alternates with a new, defaulted method.
 #[derive(Default)]
 pub struct DriverRegistry {
     entries: BTreeMap<DriverId, DriverEntry>,
+    /// Ids in the order they were registered.
+    order: Vec<DriverId>,
 }
 
 impl DriverRegistry {
@@ -151,6 +154,7 @@ impl DriverRegistry {
         if self.entries.contains_key(&id) {
             return Err(RegistryError::DuplicateId(id));
         }
+        self.order.push(id.clone());
         self.entries.insert(id, entry);
         Ok(())
     }
@@ -165,9 +169,9 @@ impl DriverRegistry {
         self.entries.contains_key(id)
     }
 
-    /// The registered ids, in order.
+    /// The registered ids, in registration order (not id order).
     pub fn ids(&self) -> impl Iterator<Item = &DriverId> {
-        self.entries.keys()
+        self.order.iter()
     }
 
     /// How many drivers are registered.
@@ -182,10 +186,10 @@ impl DriverRegistry {
 }
 
 impl fmt::Debug for DriverRegistry {
-    /// Only the ids: the drivers themselves are `Arc<dyn ..>`.
+    /// Only the ids, in registration order: the drivers themselves are `Arc<dyn ..>`.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("DriverRegistry")
-            .field("ids", &self.entries.keys().collect::<Vec<_>>())
+            .field("ids", &self.order)
             .finish()
     }
 }
@@ -413,6 +417,24 @@ mod tests {
     }
 
     #[test]
+    fn ids_follow_registration_order_not_id_order() {
+        let mut reg = DriverRegistry::new();
+        for id in ["zeta", "alpha", "mid"] {
+            reg.register(DriverEntry::frame(Arc::new(Probe::new(id))))
+                .unwrap();
+        }
+        // A refused duplicate does not disturb the order.
+        reg.register(DriverEntry::frame(Arc::new(Probe::new("alpha"))))
+            .unwrap_err();
+        let ids: Vec<&str> = reg.ids().map(DriverId::as_str).collect();
+        assert_eq!(ids, ["zeta", "alpha", "mid"]);
+        assert_eq!(
+            format!("{reg:?}"),
+            r#"DriverRegistry { ids: [DriverId("zeta"), DriverId("alpha"), DriverId("mid")] }"#
+        );
+    }
+
+    #[test]
     fn register_get_contains_and_refuse_duplicates() {
         let mut reg = DriverRegistry::new();
         assert!(reg.is_empty());
@@ -429,7 +451,7 @@ mod tests {
         );
         assert!(reg.get("kv").is_none());
         let ids: Vec<&str> = reg.ids().map(DriverId::as_str).collect();
-        assert_eq!(ids, ["modbus-tcp", "slmp"]);
+        assert_eq!(ids, ["slmp", "modbus-tcp"]);
 
         // A duplicate is refused whatever its kind, and the first stays.
         let err = reg

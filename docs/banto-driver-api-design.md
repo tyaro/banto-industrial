@@ -671,7 +671,7 @@ impl DriverEntry {
 }
 
 #[derive(Default)]
-pub struct DriverRegistry { entries: BTreeMap<DriverId, DriverEntry> }
+pub struct DriverRegistry { entries: BTreeMap<DriverId, DriverEntry>, order: Vec<DriverId> }  // ids() は登録順（R2b-6、2026-10-24）
 impl DriverRegistry {
     pub fn register(&mut self, entry: DriverEntry) -> Result<(), RegistryError>;  // 同じ id は拒否（plugin-design §4.2「組み込みの ID は上書きできない」の前身）
     pub fn get(&self, id: &str) -> Option<&DriverEntry>;        // DriverId: Borrow<str> で &str 引き

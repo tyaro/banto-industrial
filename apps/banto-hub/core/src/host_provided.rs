@@ -54,7 +54,8 @@ mod tests {
         let mut registry = DriverRegistry::new();
         register_host_provided(&mut registry).unwrap();
         let ids: Vec<&str> = registry.ids().map(|id| id.as_str()).collect();
-        assert_eq!(ids, ["postgres", "push", "virtual"]);
+        // 登録順（`DriverRegistry::ids()` は登録順）。
+        assert_eq!(ids, ["push", "postgres", "virtual"]);
         for id in ids {
             assert!(matches!(
                 registry.get(id).unwrap().kind(),

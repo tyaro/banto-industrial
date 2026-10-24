@@ -6,8 +6,8 @@
 //!
 //! - **ホストの接続（`DriverKind::HostProvided`: `postgres`・`push`・`virtual`）は載せない**。
 //!   フォームは専用で（設計 §6.2）、UI は「この一覧 + ホストの接続」をまとめて選択肢にする。
-//! - 並びはレジストリの順（`DriverRegistry::ids()`。レジストリは id の順で持ち、登録の順は
-//!   持たない）。
+//! - 並びはレジストリの**登録順**（`DriverRegistry::ids()`。2026-10-24 オーナー決定: 組み込みは
+//!   SLMP → Modbus の順で登録するので SLMP が先頭。並べ替えはドライバが増えたら UI 側でする）。
 //! - 形: 外側は camelCase。`settingsSchema` と `supportedKinds` は `banto-driver-api` の
 //!   `serde` の形そのまま（`kind` は `{"type": "integer", "min", "max"}` のようなタグつき、
 //!   `group` は `"basic"` / `"advanced"`、`supportedKinds` は `"u16"`・`"string"` の文字列）。

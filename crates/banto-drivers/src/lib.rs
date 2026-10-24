@@ -128,6 +128,15 @@ mod tests {
     /// looked up from a ChronoGazer connection row. It is not the Hub's rule:
     /// the Hub's source of truth is its registry (`push`/`postgres`/`virtual`
     /// are registered by the host; see `host/tests/registry_tripwire.rs`).
+    /// 登録順（`/api/drivers` の並び）: SLMP が先頭、Modbus TCP が次
+    /// （2026-10-24 オーナー決定。docs/banto-hub-driver-ui-design.md §4.1）。
+    #[test]
+    fn builtin_registry_lists_slmp_first() {
+        let registry = builtin().registry;
+        let ids: Vec<&str> = registry.ids().map(DriverId::as_str).collect();
+        assert_eq!(ids, ["slmp", "modbus-tcp"]);
+    }
+
     #[test]
     fn builtin_registry_ids_are_in_the_legacy_protocol_list() {
         let registry = builtin().registry;
