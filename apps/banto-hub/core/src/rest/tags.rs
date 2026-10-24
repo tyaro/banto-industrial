@@ -7,7 +7,7 @@
 //! 親の `rest.rs` にある。どちらも `use super::{...}` で使う。外から使われるパス
 //! （`crate::rest::X`）は親の re-export で保つ。
 
-use banto_tags::{parse_tag_address, AddressProbe};
+use banto_tags::{offset_tag_address, parse_tag_address, AddressProbe, OffsetUnit};
 
 use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
@@ -240,7 +240,7 @@ struct ParseAddressesRequest {
     items: Vec<ParseAddressItem>,
 }
 
-/// 1 行の結果。`area`・`writableArea`・`bit`・`wordCount` は `plc` のときだけ値を持つ
+/// 1 行の結果。`area`・`writableArea`・`index`・`bit`・`wordCount` は `plc` のときだけ値を持つ
 /// （それ以外は `null`）。
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
@@ -256,6 +256,7 @@ struct ParseAddressOk {
     canonical: String,
     area: Option<String>,
     writable_area: Option<bool>,
+    index: Option<u64>,
     bit: Option<u8>,
     word_count: Option<u16>,
 }
@@ -319,21 +320,141 @@ async fn tags_parse_addresses(
                         canonical: normalized.canonical.clone(),
                         area: parsed.map(|p| p.area.clone()),
                         writable_area: parsed.map(|p| p.writable_area),
+                        index: parsed.and_then(|p| p.index),
                         bit: parsed.and_then(|p| p.bit),
                         word_count: parsed.map(|p| p.word_count),
                     })
                 }
-                Err(errors) => ParseAddressResult::Err(ParseAddressErr {
-                    ok: false,
-                    message: errors
-                        .iter()
-                        .map(|e| e.message.as_str())
-                        .collect::<Vec<_>>()
-                        .join("；"),
-                }),
+                Err(errors) => address_err(&errors),
             }
         })
         .collect();
+    Ok(Json(ParseAddressesResponse { items }))
+}
+
+fn address_err(errors: &[FieldError]) -> ParseAddressResult {
+    ParseAddressResult::Err(ParseAddressErr {
+        ok: false,
+        message: errors
+            .iter()
+            .map(|e| e.message.as_str())
+            .collect::<Vec<_>>()
+            .join("；"),
+    })
+}
+
+fn default_tag_kind_plc() -> String {
+    "plc".to_string()
+}
+
+/// [`tags_offset_addresses`] の要求の 1 行。接続は項目ごと（設計 §4.3: 絞り込み「すべて」で
+/// SLMP と Modbus のタグが 1 回の要求に混ざる）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OffsetAddressItem {
+    connection_id: i64,
+    #[serde(default = "default_tag_kind_plc")]
+    tag_kind: String,
+    address: String,
+    data_type: String,
+    #[serde(default)]
+    string_length: Option<i64>,
+    #[serde(default = "default_tag_string_encoding")]
+    string_encoding: String,
+    n: i64,
+    unit: OffsetAddressUnit,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum OffsetAddressUnit {
+    Points,
+    Words,
+}
+
+#[derive(Debug, Deserialize)]
+struct OffsetAddressesRequest {
+    items: Vec<OffsetAddressItem>,
+}
+
+/// `POST /api/tags/offset-addresses`（R2b-6d-1、docs/banto-hub-driver-ui-design.md §4.3）:
+/// 各項目の接続のドライバでアドレスを `n` 点（`points`、連続登録）または `n` ワード
+/// （`words`、オフセットコピー・構造体登録）動かす。検証と動かした後の再検証は保存と同じ
+/// 関数（[`banto_tags::offset_tag_address`] → [`banto_tags::parse_tag_address`]）で、応答は
+/// [`tags_parse_addresses`] と同じ形・同じ順（動かした後のアドレスの解析結果）。接続が無い・
+/// ドライバの接続でない（postgres / push / virtual）・範囲外は、その項目だけ `ok: false`。
+/// 権限と文書化の扱いも [`tags_parse_addresses`] と同じ。
+async fn tags_offset_addresses(
+    State(state): State<TagRegistryState>,
+    Json(body): Json<OffsetAddressesRequest>,
+) -> Result<Json<ParseAddressesResponse>, ApiError> {
+    if body.items.len() > MAX_PARSE_ADDRESS_ITEMS {
+        return Err(ApiError(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "items".to_string(),
+                message: format!("items は {MAX_PARSE_ADDRESS_ITEMS} 件以下にしてください"),
+            }],
+        }));
+    }
+    let registry = state.manager.registry();
+    // 接続は要求の中で重複するので id ごとに 1 回だけ引く（無い接続は None）。
+    let mut connections: std::collections::HashMap<i64, Option<banto_tags::PlcConnection>> =
+        std::collections::HashMap::new();
+    let mut items = Vec::with_capacity(body.items.len());
+    for item in &body.items {
+        if let std::collections::hash_map::Entry::Vacant(slot) =
+            connections.entry(item.connection_id)
+        {
+            let found = match state.plc_connections.get(item.connection_id).await {
+                Ok(connection) => Some(connection),
+                Err(BantoError::NotFound { .. }) => None,
+                Err(error) => return Err(ApiError(error)),
+            };
+            slot.insert(found);
+        }
+        let Some(Some(connection)) = connections.get(&item.connection_id) else {
+            items.push(ParseAddressResult::Err(ParseAddressErr {
+                ok: false,
+                message: format!("接続 {} が見つかりません", item.connection_id),
+            }));
+            continue;
+        };
+        let probe = AddressProbe {
+            tag_kind: &item.tag_kind,
+            address: &item.address,
+            data_type: &item.data_type,
+            string_length: item.string_length,
+            string_encoding: &item.string_encoding,
+        };
+        let unit = match item.unit {
+            OffsetAddressUnit::Points => OffsetUnit::Points,
+            OffsetAddressUnit::Words => OffsetUnit::Words,
+        };
+        items.push(
+            match offset_tag_address(
+                &connection.name,
+                &connection.protocol,
+                &probe,
+                registry,
+                item.n,
+                unit,
+            ) {
+                Ok(normalized) => {
+                    let parsed = normalized.parsed.as_ref();
+                    ParseAddressResult::Ok(ParseAddressOk {
+                        ok: true,
+                        canonical: normalized.canonical.clone(),
+                        area: parsed.map(|p| p.area.clone()),
+                        writable_area: parsed.map(|p| p.writable_area),
+                        index: parsed.and_then(|p| p.index),
+                        bit: parsed.and_then(|p| p.bit),
+                        word_count: parsed.map(|p| p.word_count),
+                    })
+                }
+                Err(errors) => address_err(&errors),
+            },
+        );
+    }
     Ok(Json(ParseAddressesResponse { items }))
 }
 
@@ -1326,6 +1447,7 @@ pub(super) fn tag_registry_router(
         // R2b-2d: 同じく固定セグメント。アドレスの解析（保存と同じ関数、
         // `tags_parse_addresses` の doc comment 参照）。
         .route("/api/tags/parse-addresses", post(tags_parse_addresses))
+        .route("/api/tags/offset-addresses", post(tags_offset_addresses))
         // R2b-6b（docs/banto-hub-driver-ui-design.md §4.1）: ドライバの一覧。読み取りなので
         // `require_session` だけ（`rest/drivers.rs` の doc）。
         .route("/api/drivers", get(drivers_list))
