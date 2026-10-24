@@ -859,17 +859,16 @@ pub fn spawn_test_handle_with_status(
 ///
 /// ## Removal ([`Self::remove`], T7-2 backlog item, 2026-08-05)
 ///
-/// [`Self::remove`] drops this directory's own [`BrokerHandle`] clone (and
-/// forgets, without `.await`ing, the tracked [`JoinHandle`]) for one
-/// connection id. A broker task exits when *every* clone of its handle -
-/// wherever else a caller may have stashed one - has been dropped (see
-/// `run_broker_task`'s `rx.recv() == None` branch); this directory's own
-/// clone is necessary but not always sufficient for that, so a caller with
-/// other long-lived handle owners is responsible for releasing those
-/// promptly too. We deliberately do not await the removed `JoinHandle`
-/// here: nothing in this crate can prove generically that every other
-/// reference is gone, so blocking on the join here would risk hanging
-/// indefinitely rather than trading away a small, bounded resource leak.
+/// [`Self::remove`] drops this directory's own [`BrokerHandle`] clone and
+/// the tracked task entry for one connection id, without `.await`ing the
+/// [`JoinHandle`]. Since T14-2 the entry carries the task's own stop signal,
+/// so dropping it also ends the task (its `stop_rx.changed()` resolves when
+/// the sender goes away) even while other clones of the handle are still
+/// held - but asynchronously: the task may still be finishing a job or
+/// saying goodbye on its socket when `remove` returns. A caller that must
+/// know the old task is gone before going on (re-creating the session with
+/// changed settings, so the two never hold the device at once) uses
+/// [`Self::stop_and_join`] instead.
 #[derive(Clone)]
 pub struct SessionDirectory {
     handles: Arc<std::sync::Mutex<HashMap<i64, BrokerHandle>>>,
@@ -947,9 +946,12 @@ impl SessionDirectory {
     /// `validate_config` refuses with [`BrokerError::InvalidSettings`] - both
     /// before looking for an existing session, both without any I/O (this
     /// runs under the directory's lock). An existing session for `conn.id` is
-    /// returned as is: it is the caller's job to [`Self::remove`] a session
-    /// whose settings changed first (compare
-    /// [`BrokerHandle::settings_fingerprint`]).
+    /// returned as is: it is the caller's job to [`Self::stop_and_join`] a
+    /// session whose settings changed first (compare
+    /// [`BrokerHandle::settings_fingerprint`]) - not merely [`Self::remove`] it,
+    /// which signals the old task without waiting for it, so the new session
+    /// could dial while the old one still holds its socket (a PLC refusing a
+    /// second connection on the same port would refuse the new one).
     pub fn ensure_connection_with_settings(
         &self,
         conn: &PlcConnection,
