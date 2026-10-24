@@ -3,10 +3,11 @@
  * `GET /api/drivers` のスキーマから組み立てた欄で作る受け入れテスト。
  *
  * 固定する内容:
- * 1. 作成ウィザードの既定のプロトコルはドライバ一覧の先頭（Modbus）で、欄の既定は
- *    スキーマの `default`（ポート 502）。必須のホストが空のうちは「次へ」に進めない。
- * 2. SLMP へ替えると、触っていないポートは SLMP の既定 5007 に追従し、触って入れたホストは
- *    引き継がれる。ヘルプ（CPU 種別）はスキーマの `help` で出る。ワード順は「詳細」に畳まれる。
+ * 1. 作成ウィザードの既定のプロトコルはドライバ一覧の先頭（登録順で SLMP）で、欄の既定は
+ *    スキーマの `default`（ポート 5007）。必須のホストが空のうちは「次へ」に進めない。
+ * 2. Modbus へ替えると、触っていないポートは Modbus の既定 502 に追従し、触って入れたホストは
+ *    引き継がれる。SLMP へ戻すと既定 5007 に追従する。ヘルプ（CPU 種別）はスキーマの `help` で出る。
+ *    ワード順は「詳細」に畳まれる。
  * 3. 範囲外のポートは保存前に欄の下で断られる（サーバーと同じ文言）。
  * 4. 作成すると `settings` は snake_case のまま保存され（REST で確かめる）、再設定の
  *    ドロワーが同じ値を読み戻す。
@@ -56,7 +57,7 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await page.close();
 	});
 
-	test('1〜3. 既定はドライバの先頭。SLMP へ替えると既定が追従し、範囲外は保存前に断られる', async () => {
+	test('1〜3. 既定はドライバの先頭（SLMP）。Modbus へ替えると既定が追従し、範囲外は保存前に断られる', async () => {
 		await page.goto('/tags');
 		await page.getByRole('button', { name: 'PLC接続を追加', exact: true }).click();
 		const wizard = page.getByRole('dialog', { name: '新規作成', exact: true });
@@ -64,13 +65,18 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await wizard.locator('#connection-name').fill(CONN);
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
 
-		// 既定のプロトコルは drivers の先頭（id の順で modbus-tcp）、ポートはスキーマの既定。
-		await expect(wizard.getByLabel('プロトコル')).toHaveValue('modbus-tcp');
-		await expect(wizard.getByLabel('ポート')).toHaveValue('502');
+		// 既定のプロトコルは drivers の先頭（登録順で slmp）、ポートはスキーマの既定。
+		await expect(wizard.getByLabel('プロトコル')).toHaveValue('slmp');
+		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
 		await expect(wizard.getByRole('button', { name: '次へ', exact: true })).toBeDisabled();
 
-		// ホストを入れる（触った欄）→ SLMP へ替える。ホストは引き継がれ、ポートは SLMP の既定。
+		// ホストを入れる（触った欄）→ Modbus へ替える。ホストは引き継がれ、ポートは Modbus の既定。
 		await wizard.getByLabel('ホスト').fill('10.0.0.7');
+		await wizard.getByLabel('プロトコル').selectOption({ value: 'modbus-tcp' });
+		await expect(wizard.getByLabel('ホスト')).toHaveValue('10.0.0.7');
+		await expect(wizard.getByLabel('ポート')).toHaveValue('502');
+
+		// SLMP へ戻す。ホストは引き継がれ、触っていないポートは SLMP の既定に追従する。
 		await wizard.getByLabel('プロトコル').selectOption({ value: 'slmp' });
 		await expect(wizard.getByLabel('ホスト')).toHaveValue('10.0.0.7');
 		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');

@@ -102,7 +102,7 @@ test.describe
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
 
 		// プロトコルを postgres へ切り替える - ポートは postgres の既定 5432
-		// （ドライバの既定 502 とは別。ホストの接続の欄はスキーマに載らない）。
+		// （先頭のドライバ SLMP の既定 5007 とは別。ホストの接続の欄はスキーマに載らない）。
 		await wizard.getByLabel('プロトコル').selectOption({ value: 'postgres' });
 		await expect(wizard.getByLabel('ポート')).toHaveValue('5432');
 
