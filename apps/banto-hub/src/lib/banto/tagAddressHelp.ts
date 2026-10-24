@@ -1,27 +1,23 @@
 /**
  * T18-2b（docs/banto-hub-t18-design.md「T18-2b プロトコル別アドレス補助」、
- * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-6 / TAG-UX-B）: `tags/+page.svelte`
- * の単票 create/edit フォーム（`tagFields` スニペット）のアドレス欄が、
- * 選択中の接続プロトコル（`slmp` / `modbus-tcp` / `virtual`、R2a-2e で `push`）に応じて
- * 「アドレス例」「対応デバイス／占有範囲」「bit 指定可否」を切り替えるための
- * 依存ゼロの純関数・定数モジュール。`tagFormLayout.ts` と同じ方針 -
- * Svelte 側は `connectionForGroupId(form.collectionGroupId)?.protocol` と
- * `form.dataType` を渡すだけの薄いラッパーに留め、実際のマッピングは
- * ここでテストする。
+ * docs/banto-hub-desktop-plan.md §9.4 TAG-UX-6 / TAG-UX-B）、R2b-6d-2b
+ * （docs/banto-hub-driver-ui-design.md §7）: `tags/+page.svelte` の単票 create/edit
+ * フォーム（`tagFields` スニペット）のアドレス欄の補助を作る、依存ゼロの純関数モジュール。
+ * `tagFormLayout.ts` と同じ方針 - Svelte 側は選択中の接続のプロトコルと、
+ * `GET /api/drivers` の該当ドライバ（{@link DriverInfo}）と `form.dataType` を渡すだけの
+ * 薄いラッパーに留め、マッピングはここでテストする。
  *
- * アドレス記法そのものの正は `crates/banto-plc/src/address.rs`
- * （Modbus 参照番号 `Address::parse`）と `crates/banto-plc/src/slmp/address.rs`
- * （MELSEC デバイス記法・`SlmpDevice::access`/`radix`）。本モジュールは
- * その2つのパーサが実際に受理する規則を UI 向けの日本語ヒントへ要約した
- * ものであり、検証そのものはしない（実際の検証はサーバー側 preflight /
- * `createTagsBatch(..., dryRun=true)` に委ねる - このモジュールは
- * 「何を書けばよいか」を示すだけ）。
+ * - **ドライバの接続**（`slmp`・`modbus-tcp` など `/api/drivers` に載るもの）: アドレスの
+ *   文法の説明は `driver.addressHelp` をそのまま使う（中身は解析しない。TS にプロトコルの
+ *   知識を持たない）。占有の注意だけは、プロトコルに依らずデータ型から作る汎用の 1 関数。
+ * - **ホストの接続**（`push`・`virtual`）と未選択: `/api/drivers` に載らないので、この
+ *   モジュールの表を残す。ドライバの id なのに一覧がまだ届いていない・一覧に無いときは
+ *   未選択と同じ説明にする。
  *
- * 受け入れ条件（TAG-UX-B）「Modbus 選択時に `D100` を推奨例として表示
- * しない」を満たすため、`examples` はプロトコルごとに完全に独立したリスト
- * を持つ（共有・フォールバックしない）。
+ * 検証そのものはしない（実際の検証はサーバー側 preflight / `createTagsBatch(..., dryRun=true)`
+ * に委ねる - このモジュールは「何を書けばよいか」を示すだけ）。
  */
-import type { PlcProtocol, TagDataType } from './tagRegistryAdmin';
+import type { DriverInfo, PlcProtocol, TagDataType } from './tagRegistryAdmin';
 
 /** アドレス例1件。`address` は入力欄にそのまま書ける値、`description` は短い注記。 */
 export interface AddressExample {
@@ -31,6 +27,12 @@ export interface AddressExample {
 
 /** プロトコル別のアドレス入力補助一式。`tagFields` のアドレス欄がそのまま表示に使う。 */
 export interface AddressHelp {
+	/**
+	 * ドライバの `addressHelp`（日本語・複数行。例・デバイス・ビット指定を含む）。ドライバの
+	 * 接続のときだけ非空で、画面は改行を保って表示する。このとき `examples`・`deviceHint`・
+	 * `bitHint` は空。
+	 */
+	driverHelp: string;
 	/** `<input>` の `placeholder`。 */
 	placeholder: string;
 	/** 「アドレス例」として列挙する候補。 */
@@ -62,76 +64,28 @@ function occupancyKindOf(dataType: TagDataType): OccupancyKind {
 	return 'single-word';
 }
 
-const SLMP_EXAMPLES: AddressExample[] = [
-	{ address: 'D100', description: 'データレジスタ（ワード）' },
-	{ address: 'M50', description: '内部リレー（ビット）' },
-	{ address: 'X1A', description: '入力リレー（ビット・16進）' },
-	{ address: 'D100.5', description: 'D100 の 5 ビット目（ビット指定・16進で0〜F）' }
-];
-
-const MODBUS_EXAMPLES: AddressExample[] = [
-	{ address: '40001', description: '保持レジスタ（ワード・書き込み可）' },
-	{ address: '30001', description: '入力レジスタ（ワード・読み取り専用）' },
-	{ address: '00001', description: 'コイル（ビット・書き込み可）' },
-	{ address: '10001', description: 'ディスクリート入力（ビット・読み取り専用）' }
-];
-
-const SLMP_DEVICE_HINT =
-	'ビットデバイス（X/Y/M/L/F/V/B/S/TS/TC/SS/SC/CS/CC/SB/SM/DX/DY）とワードデバイス（D/W/Z/R/ZR/TN/SN/CN/SD/SW）があります。' +
-	'X/Y/B/W/SB/SW/DX/DY は16進数、それ以外のデバイス番号は10進数で書きます。';
-
-const MODBUS_DEVICE_HINT =
-	'先頭の桁がエリアを表します: 0xxxx=コイル（ビット）、1xxxx=ディスクリート入力（ビット・読み取り専用）、' +
-	'3xxxx=入力レジスタ（ワード・読み取り専用）、4xxxx=保持レジスタ（ワード）。通常は5桁、9999を超える番号は' +
-	'6桁表記（400001〜）を使います。';
-
 const VIRTUAL_DEVICE_HINT = '内部（mem）／演算（calc）タグは PLC アドレスを持ちません。';
 
-function slmpOccupancyHint(kind: OccupancyKind): string {
+/**
+ * ドライバの接続の占有の注意。プロトコルに依らず、データ型だけから作る
+ * （bit = 1 点、16bit = 1 ワード、32bit = 2 ワード連続、64bit = 4 ワード連続、
+ * string = 文字列長と文字コードで決まるワード数を先頭から連続）。
+ */
+function driverOccupancyHint(kind: OccupancyKind): string {
 	switch (kind) {
 		case 'bit':
-			return 'bit 型はビットデバイスのアドレスをそのまま1点指定します（例: M50）。';
+			return 'bit 型はビットデバイス（コイル等）の 1 点、またはワード内の 1 ビットを指定します。';
 		case 'double-word':
-			return '32bit 型（i32/u32/f32）はワードデバイス2点分を連続して占有します（例: D100 なら D100・D101）。';
+			return '32bit 型（i32/u32/f32）はワード 2 点分を連続して占有します（先頭アドレスの次のワードまで）。';
 		case 'quad-word':
-			// #325: 64bit 型は modbus-tcp 接続配下でしか選択できないため実際に
-			// SLMP でこの分岐が表示されることは無い想定だが、`OccupancyKind`
-			// の網羅性チェックのため防御的に用意する。
-			return '64bit 型（i64/u64/f64）はワードデバイス4点分を連続して占有します（例: D100 なら D100〜D103）。';
+			return '64bit 型（i64/u64/f64）はワード 4 点分を連続して占有します（先頭アドレスから 4 ワード）。';
 		case 'string':
-			return 'string 型は「文字列長（word数）」で指定した word 数を先頭アドレスから連続して占有します。';
+			return 'string 型は「文字列長」と文字コードで決まる word 数を先頭アドレスから連続して占有します。';
 		case 'single-word':
 		default:
-			return '16bit 型（i16/u16）はワードデバイス1点分を占有します。';
+			return '16bit 型（i16/u16）はワード 1 点分を占有します。';
 	}
 }
-
-function modbusOccupancyHint(kind: OccupancyKind): string {
-	switch (kind) {
-		case 'bit':
-			return 'bit 型はコイル（0xxxx）またはディスクリート入力（1xxxx）を1点指定します。';
-		case 'double-word':
-			return '32bit 型（i32/u32/f32）は入力レジスタ／保持レジスタ2点分を連続して占有します（例: 40001 なら 40001・40002）。';
-		case 'quad-word':
-			// #325（2026-09-08 オーナー決定）: 64bit 型は modbus-tcp 接続配下の
-			// タグでのみ登録できる。
-			return '64bit 型（i64/u64/f64）は入力レジスタ／保持レジスタ4点分を連続して占有します（例: 40001 なら 40001〜40004）。';
-		case 'string':
-			return 'string 型は「文字列長（word数）」で指定した word 数（入力／保持レジスタ）を先頭アドレスから連続して占有します。';
-		case 'single-word':
-		default:
-			return '16bit 型（i16/u16）は入力レジスタ／保持レジスタ1点分を占有します。';
-	}
-}
-
-const SLMP_BIT_HINT =
-	'ワードデバイスの特定ビットだけを読み書きするときは「D100.F」のように「.」+ビット位置（0〜F、16進。' +
-	'D100.F は bit 15）を付けます（data_type = bit のタグでのみ使えます）。ビットデバイス自体には' +
-	'「.」指定はできません。';
-
-const MODBUS_BIT_HINT =
-	'保持レジスタ／入力レジスタの特定ビットだけを読み書きするときは「40001.3」のように「.」+ビット位置（0〜15）を付けます' +
-	'（data_type = bit のタグでのみ使えます）。コイル／ディスクリート入力は既にビット単位なので「.」指定はできません。';
 
 const VIRTUAL_BIT_HINT = '該当なし（PLC アドレスを使わないため）。';
 
@@ -170,6 +124,7 @@ const PUSH_BIT_HINT =
  */
 function unknownProtocolHelp(_dataType: TagDataType): AddressHelp {
 	return {
+		driverHelp: '',
 		placeholder: '例: D100 / 40001',
 		examples: [],
 		deviceHint:
@@ -180,34 +135,31 @@ function unknownProtocolHelp(_dataType: TagDataType): AddressHelp {
 }
 
 /**
- * 選択中のプロトコルと `data_type` から、アドレス欄に出すヒント一式を
- * 組み立てる。`protocol` は `connectionForGroupId(form.collectionGroupId)
- * ?.protocol`（グループ未選択なら `undefined`）をそのまま渡す想定。
+ * 選択中のプロトコル・そのドライバ・`data_type` から、アドレス欄に出すヒント一式を組み立てる。
+ * `protocol` は `connectionForGroupId(form.collectionGroupId)?.protocol`（グループ未選択なら
+ * `undefined`）、`driver` は `/api/drivers` の一覧から `id === protocol` で引いたもの
+ * （無ければ `undefined`）をそのまま渡す想定。`driver` があればホストの表より優先する。
  */
 export function addressHelpFor(
 	protocol: PlcProtocol | undefined,
-	dataType: TagDataType
+	dataType: TagDataType,
+	driver?: DriverInfo
 ): AddressHelp {
 	const kind = occupancyKindOf(dataType);
+	if (driver) {
+		return {
+			driverHelp: driver.addressHelp,
+			placeholder: '',
+			examples: [],
+			deviceHint: '',
+			occupancyHint: driverOccupancyHint(kind),
+			bitHint: ''
+		};
+	}
 	switch (protocol) {
-		case 'slmp':
-			return {
-				placeholder: 'D100（ビット指定: D100.5）',
-				examples: SLMP_EXAMPLES,
-				deviceHint: SLMP_DEVICE_HINT,
-				occupancyHint: slmpOccupancyHint(kind),
-				bitHint: SLMP_BIT_HINT
-			};
-		case 'modbus-tcp':
-			return {
-				placeholder: '40001（ビット指定: 40001.3）',
-				examples: MODBUS_EXAMPLES,
-				deviceHint: MODBUS_DEVICE_HINT,
-				occupancyHint: modbusOccupancyHint(kind),
-				bitHint: MODBUS_BIT_HINT
-			};
 		case 'push':
 			return {
+				driverHelp: '',
 				placeholder: 'line1.temp（送り手が付けるキー）',
 				examples: PUSH_EXAMPLES,
 				deviceHint: PUSH_DEVICE_HINT,
@@ -216,6 +168,7 @@ export function addressHelpFor(
 			};
 		case 'virtual':
 			return {
+				driverHelp: '',
 				placeholder: '',
 				examples: [],
 				deviceHint: VIRTUAL_DEVICE_HINT,

@@ -291,11 +291,14 @@ export type TagDataType =
 
 /**
  * #325（2026-09-08 オーナー決定）: `i64`/`u64`/`f64`（Modbus の4レジスタ=64bit
- * 値）は `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる -
+ * 値）は `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる（R2b-6d-2b 以降、
+ * ドライバの接続は `GET /api/drivers` の `supportedKinds` が決める。この定数はサーバー側の
+ * 定数の写しで、ホストの表（`tagDataTypeOptions.ts`）が 64bit を除く安全側の判定と、
+ * 64bit の注記の要否判定に使う） -
  * mirrors `banto_tags::plc_connection::MODBUS_PROTOCOL`/
  * `banto_tags::tag::MODBUS_ONLY_DATA_TYPES`（サーバー側が最終防衛線として
  * 拒否する）。UI 側はこの定数でデータ型プルダウンの選択肢自体を絞る
- * （`+page.svelte` の `dataTypeOptionsFor` 参照）ほか、`i64`/`u64`
+ * （`tagDataTypeOptions.ts` の `dataTypeOptionsFor` 参照）ほか、`i64`/`u64`
  * の精度注記の要否判定にも使う。
  */
 export const MODBUS_ONLY_DATA_TYPES: readonly TagDataType[] = ['i64', 'u64', 'f64'];
