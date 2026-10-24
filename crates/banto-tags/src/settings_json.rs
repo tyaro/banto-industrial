@@ -271,7 +271,8 @@ fn check_field_value(field: &SettingField, value: &Value) -> Result<(), String> 
             }
         }
         FieldKind::Host => {
-            if field.required && text()?.trim().is_empty() {
+            let text = text()?;
+            if field.required && text.trim().is_empty() {
                 return Err(REQUIRED_MESSAGE.to_string());
             }
             Ok(())
@@ -895,6 +896,7 @@ mod tests {
                         placeholder: None,
                     },
                 ),
+                SettingField::new("backup_host", "予備ホスト", FieldKind::host()),
                 SettingField::new("tls", "TLS", FieldKind::bool()).default(false),
                 SettingField::new("retries", "再試行", FieldKind::integer_unbounded()),
                 SettingField::new("password", "パスワード", FieldKind::secret()),
@@ -948,6 +950,16 @@ mod tests {
                     "Host に数は断る",
                     json!({ "host": 10 }),
                     Err(vec![("host", "文字列で")]),
+                ),
+                (
+                    "必須でない Host に数は断る",
+                    json!({ "host": "h", "backup_host": 5 }),
+                    Err(vec![("backup_host", "文字列で")]),
+                ),
+                (
+                    "必須でない Host に真偽値は断る",
+                    json!({ "host": "h", "backup_host": true }),
+                    Err(vec![("backup_host", "文字列で")]),
                 ),
                 (
                     "Choice に数は断る",
