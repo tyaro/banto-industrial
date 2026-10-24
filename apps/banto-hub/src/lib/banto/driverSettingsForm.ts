@@ -154,7 +154,7 @@ const INTEGER_RE = /^[+-]?\d+$/;
 
 /**
  * 保存前の検査（種類・必須・min/max・max_len だけ。サーバーと同じ規則と文言）。
- * 返すのは欄の key → 文言。空なら通った。`isCreate` は新規作成（「保つ」が無い）か。
+ * 返すのは欄の key → 文言。空なら通った。
  */
 export function validateDriverValues(
 	fields: readonly DriverSettingField[],

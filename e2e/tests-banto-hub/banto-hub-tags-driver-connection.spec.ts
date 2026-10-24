@@ -136,4 +136,48 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await expect(wizard.getByLabel('ホスト')).toHaveValue('');
 		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
 	});
+
+	test('6. 一覧の取得に失敗したまま名前だけ変えて保存しても settings は変わらない', async () => {
+		const res = await page.request.get('/api/plc-connections', { headers });
+		const before = ((await res.json()) as ConnectionRow[]).find((c) => c.name === CONN);
+		expect(before).toBeTruthy();
+
+		await page.route('**/api/drivers', (route) => route.fulfill({ status: 500, body: 'x' }));
+		try {
+			await page.goto('/tags');
+			await page
+				.getByRole('tree')
+				.getByRole('button', { name: new RegExp(`^${CONN}`) })
+				.click({ button: 'right' });
+			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+			const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
+			await expect(drawer).toBeVisible();
+			await drawer.locator('#connection-name').fill(`${CONN}-r`);
+			const saved = page.waitForResponse(
+				(r) => r.url().includes('/api/plc-connections/') && r.request().method() === 'PUT'
+			);
+			await drawer.getByRole('button', { name: '保存', exact: true }).click();
+			expect((await saved).status()).toBe(200);
+		} finally {
+			await page.unroute('**/api/drivers');
+		}
+
+		const after = (
+			(await (
+				await page.request.get('/api/plc-connections', { headers })
+			).json()) as ConnectionRow[]
+		).find((c) => c.id === before!.id);
+		expect(after?.name).toBe(`${CONN}-r`);
+		expect(after?.settings).toMatchObject({ host: '10.0.0.7', port: 5200 });
+		await page.request.put(`/api/plc-connections/${before!.id}`, {
+			headers,
+			data: {
+				name: CONN,
+				protocol: before!.protocol,
+				enabled: true,
+				simulation: false,
+				settings: before!.settings
+			}
+		});
+	});
 });

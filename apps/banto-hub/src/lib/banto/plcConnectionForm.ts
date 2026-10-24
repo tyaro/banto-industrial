@@ -164,6 +164,11 @@ export interface PlcConnectionFormState {
 	simulation: boolean;
 	/** 機器のドライバの欄（`protocol` がドライバのときだけ意味を持つ）。 */
 	driver: DriverFormState;
+	/**
+	 * 編集を始めたときの保存済みの `settings`（応答のまま。新規作成は `null`）。ドライバのスキーマが
+	 * 分からないまま保存しても `settings`（丸ごと置き換え）が空にならないよう、そのまま送り返すのに使う。
+	 */
+	savedSettings: Record<string, unknown> | null;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB 名。 */
 	database: string;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB ユーザー名。 */
@@ -269,7 +274,8 @@ export function blankConnectionForm(drivers: readonly DriverInfo[]): PlcConnecti
 		staleTimeoutMs: '',
 		bridgeEnabled: false,
 		bridgeDbConnectionId: '',
-		bridgeQueries: []
+		bridgeQueries: [],
+		savedSettings: null
 	};
 }
 
@@ -297,6 +303,7 @@ export function connectionToForm(
 		enabled: c.enabled,
 		simulation: c.simulation,
 		driver: driverStateFromSettings(driver?.settingsSchema.fields ?? [], driver ? settings : {}),
+		savedSettings: { ...settings },
 		database: isPostgres && typeof settings.database === 'string' ? settings.database : '',
 		username: isPostgres && typeof settings.username === 'string' ? settings.username : '',
 		password: '',
@@ -403,14 +410,51 @@ export function formToConnectionInput(
 			settings
 		};
 	}
-	const driver = driverFor(drivers, form.protocol);
 	return {
 		name: form.name,
 		protocol: form.protocol,
 		enabled: form.enabled,
 		simulation: form.simulation,
-		settings: buildDriverSettings(driver?.settingsSchema.fields ?? [], form.driver.values)
+		settings: driverSettingsForSubmit(form, drivers)
 	};
+}
+
+/**
+ * ドライバの接続の `settings` の決め方。スキーマがあれば欄から組む。スキーマが分からない
+ * （一覧の取得に失敗した・一覧に無いプロトコル）ときは、`settings` が丸ごと置き換えなので
+ * 保存済みをそのまま送り返す（秘密 `{"$secret": …}` のキーは落とす = 省略 = 保存済みを保つ）。
+ * 保存済みも無ければ `{}`。
+ */
+export function driverSettingsForSubmit(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	drivers: readonly DriverInfo[]
+): Record<string, unknown> {
+	const driver = driverFor(drivers, form.protocol);
+	if (driver) return buildDriverSettings(driver.settingsSchema.fields, form.driver.values);
+	const settings: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(form.savedSettings ?? {})) {
+		const isSecret = typeof value === 'object' && value !== null && '$secret' in value;
+		if (!isSecret) settings[key] = value;
+	}
+	return settings;
+}
+
+/**
+ * 一覧の再取得に成功したとき、スキーマが無いまま開いた編集フォームのドライバの欄を、保存済みの
+ * `settings` から作り直す。対象でなければ `null`（編集対象の保存済みのプロトコルと同じで、欄が
+ * まだスキーマから作られていない（values が空）ときだけ）。
+ */
+export function rebuiltDriverState(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	savedProtocol: string | null,
+	drivers: readonly DriverInfo[]
+): DriverFormState | null {
+	if (savedProtocol === null || form.savedSettings === null) return null;
+	if (form.protocol !== savedProtocol) return null;
+	if (Object.keys(form.driver.values).length > 0) return null;
+	const driver = driverFor(drivers, form.protocol);
+	if (!driver) return null;
+	return driverStateFromSettings(driver.settingsSchema.fields, form.savedSettings);
 }
 
 // --- R2a-2e: 取り込み口 `push` の設定（docs/banto-hub-ingest-design.md §3.2・§7.1） ---

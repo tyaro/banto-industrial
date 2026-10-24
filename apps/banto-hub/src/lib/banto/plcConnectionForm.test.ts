@@ -8,7 +8,9 @@ import {
 	blankConnectionForm,
 	connectionToForm,
 	driverFor,
+	driverSettingsForSubmit,
 	driverStateAfterProtocolChange,
+	rebuiltDriverState,
 	formToConnectionInput,
 	nextConnectionName,
 	passwordForSubmit,
@@ -165,7 +167,8 @@ describe('blankConnectionForm / connectionToForm / formToConnectionInput', () =>
 			staleTimeoutMs: '',
 			bridgeEnabled: false,
 			bridgeDbConnectionId: '',
-			bridgeQueries: []
+			bridgeQueries: [],
+			savedSettings: null
 		});
 		expect(DEFAULT_POSTGRES_PORT).toBe(5432);
 	});
@@ -736,5 +739,62 @@ describe('resolveSavedConnection / isSavedPushConnection（P2: 保存後のプ�
 		expect(resolveSavedConnection(newProp, record)).toBe(newProp);
 		expect(isSavedPushConnection(newProp, record)).toBe(false);
 		expect(isSavedPushConnection(null, record)).toBe(false);
+	});
+});
+
+describe('driverSettingsForSubmit / rebuiltDriverState（スキーマが分からない保存）', () => {
+	const saved: PlcConnection = {
+		id: 1,
+		name: 'X',
+		protocol: 'modbus-tcp',
+		enabled: true,
+		simulation: false,
+		settings: { host: 'h', port: 1502, token: { $secret: 'set' } }
+	};
+	const none: readonly never[] = [];
+
+	it.each([
+		[
+			'スキーマ無し + 保存済み: そのまま（$secret は落とす）',
+			saved,
+			none,
+			{ host: 'h', port: 1502 }
+		],
+		[
+			'スキーマ無し + 一覧に無いプロトコル',
+			{ ...saved, protocol: 'virtual', settings: { a: 1 } },
+			DRIVERS,
+			{ a: 1 }
+		],
+		['スキーマ無し + 新規: {}', null, none, {}],
+		['スキーマあり: buildDriverSettings', saved, DRIVERS, { host: 'h', port: 1502 }]
+	])('%s', (_name, conn, drivers, expected) => {
+		const form = conn ? connectionToForm(conn, drivers) : { ...blank(), protocol: 'modbus-tcp' };
+		const out = driverSettingsForSubmit(form, drivers);
+		if (drivers === DRIVERS) expect(out).toMatchObject(expected);
+		else expect(out).toEqual(expected);
+	});
+
+	it('postgres・push は今どおり（formToConnectionInput が欄から組む）', () => {
+		const pg = connectionToForm(
+			{
+				...saved,
+				protocol: 'postgres',
+				settings: { host: 'p', port: 5432, database: 'd', username: 'u' }
+			},
+			none
+		);
+		expect(formToConnectionInput(pg, none).settings).toMatchObject({ host: 'p', database: 'd' });
+		const push = connectionToForm({ ...saved, protocol: 'push', settings: {} }, none);
+		expect(formToConnectionInput(push, none).settings).not.toHaveProperty('token');
+	});
+
+	it('rebuiltDriverState: 同じプロトコルで欄が空のときだけ保存済みから作り直す', () => {
+		const form = connectionToForm(saved, none);
+		const rebuilt = rebuiltDriverState(form, 'modbus-tcp', DRIVERS);
+		expect(rebuilt?.values.host).toBe('h');
+		expect(rebuiltDriverState({ ...form, protocol: 'slmp' }, 'modbus-tcp', DRIVERS)).toBeNull();
+		expect(rebuiltDriverState(blank(), 'modbus-tcp', DRIVERS)).toBeNull();
+		expect(rebuiltDriverState(connectionToForm(saved, DRIVERS), 'modbus-tcp', DRIVERS)).toBeNull();
 	});
 });

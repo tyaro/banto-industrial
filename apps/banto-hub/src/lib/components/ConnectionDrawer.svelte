@@ -143,6 +143,7 @@
 		validatePushFields,
 		connectionToForm,
 		formToConnectionInput,
+		rebuiltDriverState,
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
@@ -363,6 +364,7 @@
 			drivers = await listDrivers();
 			driversStatus = 'ready';
 			applyDriversToBlankForm();
+			applyDriversToEditForm();
 		} catch (err) {
 			driversError = errorMessage(err);
 			driversStatus = 'error';
@@ -380,6 +382,18 @@
 		form.driver = defaultDriverState(first.settingsSchema.fields);
 		lastProtocol = first.id;
 		baseline = { ...baseline, protocol: first.id, driver: $state.snapshot(form.driver) };
+	}
+
+	/**
+	 * スキーマが無いまま開いた編集フォームは、再取得に成功したら保存済みの settings から欄を作り直す
+	 * （システム側の更新なので baseline も揃えて dirty にしない）。
+	 */
+	function applyDriversToEditForm(): void {
+		if (!connection) return;
+		const rebuilt = rebuiltDriverState(form, connection.protocol, drivers);
+		if (!rebuilt) return;
+		form.driver = rebuilt;
+		baseline = { ...baseline, driver: $state.snapshot(form.driver) };
 	}
 
 	$effect(() => {
