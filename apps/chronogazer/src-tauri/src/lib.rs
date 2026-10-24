@@ -4363,12 +4363,23 @@ async fn launch_desktop(
     prelude: startup::Prelude,
 ) -> Result<(), startup::LaunchError> {
     let result = launch_desktop_inner(app, paths, prelude).await;
-    if result.is_err() {
-        // 2026-10-24 オーナー決定「案 A」: 起動に失敗したら診断のログの向け直しを外す
-        // （[`diag_log`]。同じプロセスのやり直しでまた始める）。
-        diag_log::global().stop(diag_log::FLUSH_WAIT);
+    if let Err(err) = &result {
+        if stops_diag_log_on_launch_error(err) {
+            // 2026-10-24 オーナー決定「案 A」: 起動に失敗したら診断のログの向け直しを外す
+            // （[`diag_log`]。同じプロセスのやり直しでまた始める）。
+            diag_log::global().stop(diag_log::FLUSH_WAIT);
+        }
     }
     result
+}
+
+/// 起動の失敗で診断のログの向け直しを外すか。`Exiting` は外さない（#825 のレビュー P2）:
+/// 終了の後始末がもう始まっていて、エンジンを登録した後でもこれが返る（登録後の初期化を
+/// 待つ間にトレイの「終了」）。ここで外すと、その後に後始末が止めるエンジンの停止・最終の
+/// 書き出しの失敗・後始末の結果の行がログに残らない。封じるのは後始末（[`exit_cleanup`] の
+/// `diag_log::run_then_seal`）に任せる。
+fn stops_diag_log_on_launch_error(err: &startup::LaunchError) -> bool {
+    !matches!(err, startup::LaunchError::Exiting)
 }
 
 /// [`launch_desktop`] の本体（失敗したときの診断のログの片付けは呼び出し側）。
@@ -4896,6 +4907,18 @@ pub fn run() {
 mod tests {
     use super::*;
     use banto_server::AuthState;
+
+    /// #825 のレビュー P2: 終了が始まった（`Exiting`）起動の失敗では診断のログを外さず、
+    /// 後始末の封じに任せる。それ以外の起動の失敗では外す（同じプロセスのやり直しのため）。
+    #[test]
+    fn a_launch_cut_short_by_exit_leaves_the_diag_log_to_exit_cleanup() {
+        assert!(!stops_diag_log_on_launch_error(
+            &startup::LaunchError::Exiting
+        ));
+        assert!(stops_diag_log_on_launch_error(
+            &startup::LaunchError::Settings(BantoError::Unauthorized)
+        ));
+    }
     use chronogazer_core::backup::BackupService;
     use chronogazer_core::collect::CollectorService;
     use chronogazer_core::db::Db;
