@@ -16,6 +16,7 @@ vi.mock('./deferredDelete.svelte', () => ({ deferredDelete: { flush: async () =>
 
 import {
 	chunked,
+	existingTagsKey,
 	fetchExistingSpans,
 	spanOfParsed,
 	spansOverlap,
@@ -132,5 +133,39 @@ describe('fetchExistingSpans', () => {
 			throw new Error('down');
 		};
 		await expect(fetchExistingSpans([t(1, 'D100')], () => 10, api)).rejects.toThrow('down');
+	});
+});
+
+describe('existingTagsKey', () => {
+	const tag = (id: number, over: Partial<Parameters<typeof existingTagsKey>[0][number]> = {}) => ({
+		id,
+		name: `T${id}`,
+		collectionGroupId: 1,
+		address: `D${id}`,
+		dataType: 'i16' as const,
+		stringLength: null,
+		stringEncoding: 'utf8' as const,
+		tagKind: 'plc' as const,
+		...over
+	});
+	const groups = new Set([1]);
+	const base = [tag(1), tag(2)];
+	const key = (tags: Parameters<typeof existingTagsKey>[0]) => existingTagsKey(tags, groups);
+
+	it('同じ内容なら配列の順・対象外のグループ・関係ない欄が違っても同じキー', () => {
+		const k = key(base);
+		expect(key([tag(2), tag(1)])).toBe(k);
+		expect(key([...base, tag(9, { collectionGroupId: 2 })])).toBe(k);
+		expect(key([{ ...tag(1), extra: 'x' } as ReturnType<typeof tag>, tag(2)])).toBe(k);
+	});
+
+	it('対象グループのタグの追加・削除・アドレス・型・名前の変化でキーが変わる', () => {
+		const k = key(base);
+		expect(key([...base, tag(3)])).not.toBe(k);
+		expect(key([tag(1)])).not.toBe(k);
+		expect(key([tag(1, { address: 'D100' }), tag(2)])).not.toBe(k);
+		expect(key([tag(1, { dataType: 'i32' }), tag(2)])).not.toBe(k);
+		expect(key([tag(1, { name: 'other' }), tag(2)])).not.toBe(k);
+		expect(key([tag(1, { collectionGroupId: 2 }), tag(2)])).not.toBe(k);
 	});
 });

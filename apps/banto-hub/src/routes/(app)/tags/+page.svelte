@@ -124,7 +124,7 @@
 		type StructCollision,
 		type StructField
 	} from '#lib/banto/structRegistration.js';
-	import { fetchExistingSpans } from '#lib/banto/addressSpan.js';
+	import { existingTagsKey, fetchExistingSpans } from '#lib/banto/addressSpan.js';
 	import {
 		computeOffsetCopy,
 		offsetCopyRowsToTagInputs,
@@ -4042,6 +4042,13 @@
 				])
 	);
 
+	/** 対象グループの既存タグの内容（別のクライアントの追加・移動・削除・書き換えで変わる）。 */
+	const structExistingKey = $derived(
+		structForm.collectionGroupId === ''
+			? null
+			: existingTagsKey(tags, new Set([Number(structForm.collectionGroupId)]))
+	);
+
 	/**
 	 * R2b-6d-2a: 割付・衝突検出の計算はドライバに任せる（`structRegistration.ts`。ベースの検証と
 	 * ワード数は `parse-addresses`、フィールドのアドレスは `offset-addresses`（`unit: "words"`）、
@@ -4051,6 +4058,7 @@
 	$effect(() => {
 		const seq = ++structComputeSeq;
 		const key = structInputKey;
+		void structExistingKey;
 		const connectionId = structConnectionId;
 		structAllocation = null;
 		structCollisions = [];
@@ -4810,6 +4818,13 @@
 		return JSON.stringify([offset, selectedTags]);
 	});
 
+	/** 選択タグのグループの既存タグの内容（別のクライアントの変更で変わる）。 */
+	const bulkOffsetCopyExistingKey = $derived(
+		bulkAction === 'offset-copy'
+			? existingTagsKey(tags, new Set(selectedTags.map((t) => t.collectionGroupId)))
+			: null
+	);
+
 	/**
 	 * R2b-6d-2a: コピー先のアドレスの計算はドライバに任せる（`offsetCopy.ts`。全件を 1 回の
 	 * `offset-addresses`（`unit: "words"`）、既存タグの占有は `parse-addresses`）。入力に追従して
@@ -4819,6 +4834,7 @@
 	$effect(() => {
 		const seq = ++bulkOffsetCopySeq;
 		const key = bulkOffsetCopyKey;
+		void bulkOffsetCopyExistingKey;
 		bulkOffsetCopyResult = null;
 		if (key === null) return;
 		const offset = untrack(() => parseOptionalNumber(bulkOffsetWords));

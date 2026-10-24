@@ -80,6 +80,39 @@ export interface ExistingTagForSpan {
 	tagKind: TagKind;
 }
 
+/** {@link existingTagsKey} が見る既存タグの形（衝突判定に効く欄だけ）。 */
+export interface ExistingTagForKey extends ExistingTagForSpan {
+	name: string;
+}
+
+/**
+ * 構造体登録・オフセットコピーの衝突判定が頼る既存タグの内容のキー（R2b-6d-2a、レビュー P2）。
+ * 対象の収集グループのタグだけを、衝突判定に効く欄（`id`・`name`・`collectionGroupId`・`address`・
+ * `dataType`・`stringLength`・`stringEncoding`・`tagKind`）に絞って id の順に並べた文字列を返す。
+ * 一覧を読み直しても内容が同じなら同じ文字列（再計算しない）、別のクライアントがタグを足す・動かす・
+ * 消す・書き換えると変わる（判定をやり直す）。
+ */
+export function existingTagsKey(
+	tags: readonly ExistingTagForKey[],
+	groupIds: ReadonlySet<number>
+): string {
+	return JSON.stringify(
+		tags
+			.filter((t) => groupIds.has(t.collectionGroupId))
+			.sort((a, b) => a.id - b.id)
+			.map((t) => [
+				t.id,
+				t.name,
+				t.collectionGroupId,
+				t.address,
+				t.dataType,
+				t.stringLength,
+				t.stringEncoding,
+				t.tagKind
+			])
+	);
+}
+
 /**
  * 既存タグ全件の占有を、`parse-addresses` で求める（接続ごとにまとめ、上限
  * {@link MAX_ADDRESS_ITEMS_PER_REQUEST} 件を超えるときは分けて呼ぶ）。`plc` 以外のタグと、
