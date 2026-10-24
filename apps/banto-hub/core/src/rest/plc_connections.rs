@@ -19,8 +19,8 @@ use banto_driver_api::{keys, ConnectContext, FatalError, ItemError, Settings, Ta
 /// R2b-6b（docs/banto-hub-driver-ui-design.md §5、Q2）: `/api/plc-connections` の作成・更新の
 /// 形 `{ name, protocol, enabled, simulation, settings }`。平らな欄（`host`・`port`・`unitId`・
 /// `password` …）は受けない（`deny_unknown_fields`。使用者無しの前提で古い形は断る、
-/// 2026-10-22 オーナー）。MCP は R2b-7 まで平らな形のまま（`crate::mcp` の
-/// `flat_connection` が写す）。
+/// 2026-10-22 オーナー）。MCP の `create_connection` / `update_connection` も同じ形を直接
+/// 受ける（R2b-7a）。
 ///
 /// - 機器のドライバ（`modbus-tcp`・`slmp`）の `settings` はドライバのスキーマ
 ///   （`GET /api/drivers` の `settingsSchema`）に従い、`banto_tags::settings_from_schema` →
@@ -132,9 +132,19 @@ impl PlcConnectionPayload {
             simulation: self.simulation,
             settings: self.settings,
             secrets: changes,
-            // REST の `settings` は丸ごと置き換え（保存済みから補う印は MCP のアダプタだけ）。
-            keep_stored: banto_tags::KeepStored::default(),
         })
+    }
+
+    /// 未適用キューに積む前の検査: 適用時と同じ規則（`protocol` の登録・`settings` のキー）で
+    /// 断る。これが無いと、未登録の `protocol` や余計な `password` の平文が封印されずにキューに
+    /// 残る（#827 のレビュー）。積む前（`queue_form` の前）に呼ぶ。
+    pub(crate) fn check_before_queue(
+        &self,
+        service: &banto_tags::PlcConnectionService,
+        secret_keys: &[String],
+    ) -> Result<(), BantoError> {
+        let input = self.clone().into_input(secret_keys)?;
+        service.check_settings_input(&input)
     }
 
     /// 未適用キューに積む形（R2b-6b、`crate::pending_changes` の doc）: 秘密のキーの文字列の
@@ -372,6 +382,9 @@ pub(super) async fn plc_connections_create(
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
+        input
+            .check_before_queue(&state.plc_connections, &secret_keys)
+            .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,
@@ -463,6 +476,9 @@ pub(super) async fn plc_connections_update(
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
+        input
+            .check_before_queue(&state.plc_connections, &secret_keys)
+            .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,
@@ -727,7 +743,7 @@ const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(こ�
 /// フォーム値を `{ protocol, simulation, settings, connectionId? }` で受け取る
 /// （[`PlcConnectionPayload`] と同じ `settings` の形。保存済み接続の編集中のみ
 /// `connectionId` を添える）。平らな欄は受けない（`deny_unknown_fields`）。MCP の
-/// `test_connection` は R2b-7 まで平らな形のまま（`crate::mcp` の `flat_connection` が写す）。
+/// `test_connection` も同じ形を直接受ける（R2b-7a）。
 ///
 /// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
 ///   ダイヤルする。省いた欄はスキーマの既定値。

@@ -2580,7 +2580,7 @@ T11-2（[ux-plan.md](ux-plan.md) §3）・T18-3d（[banto-hub-t18-design.md](ban
   （期待値: 3）。古い版の構成パッケージは読み込めません。今の banto-hub で書き出し直してください」と
   出たら、取り込み元の banto-hub を更新してから書き出し直してください。接続の
   `/api/plc-connections` と `/api/plc-connections/test` も同じ `{ protocol, settings }` の
-  形になりました（MCP の接続の API は平らな形・camelCase のキーのままです）。
+  形になりましたMCP の接続のツール（`create_connection` / `update_connection` / `test_connection` / `list_connections`）も R2b-7a から同じ形です（直下の `host`・`unitId` などは受けません。[banto-hub-mcp-reference.md](banto-hub-mcp-reference.md) §5）。
 - **取り込み口 `push` 接続と設定パッケージ（R2a-2e、2026-10-21、
   [banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5.1）**: `push` 接続は
   `settings`（受信のタイムアウト `stale_timeout_ms` と DB ブリッジの区画）ごと

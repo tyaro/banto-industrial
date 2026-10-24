@@ -538,10 +538,6 @@ pub const CONNECTION_PASSWORD_SOURCES: [&str; 2] =
 /// ペイロードの `input` の封印した秘密値のキー（キー → `crate::secrets::sealed_password_json`
 /// の形。`crate::rest::PlcConnectionPayload::queue_form` が積む前に作る）。
 pub const SEALED_SECRETS_FIELD: &str = "sealedSecrets";
-/// ペイロードの `input` の「省いた欄を保存済みの行から補う印」（`banto_tags::KeepStored` の
-/// 形）。MCP の平らな形のアダプタの更新だけが積む（REST の `queue_form` は積まない）。適用時の
-/// 書き込みのトランザクションの中で補う（#813 のレビュー P2）。**R2b-7 で消える**。
-pub const KEEP_STORED_FIELD: &str = "keepStored";
 /// 履歴の行・応答の写しで `sealedSecrets` の代わりに置く、封印した値があったキーの一覧。
 pub const SECRETS_SET_FIELD: &str = "secretsSet";
 /// R2b-6b より前の形の欄（起動時に捨てる古い行にだけある。外す対象として残す）。
@@ -554,14 +550,13 @@ pub fn is_connection_password_source(source: &str) -> bool {
 }
 
 /// R2b-6b の `input` の欄（`crate::rest` の `QueuedPlcConnectionPayload` と同じ）。
-const CURRENT_INPUT_FIELDS: [&str; 7] = [
+const CURRENT_INPUT_FIELDS: [&str; 6] = [
     "name",
     "protocol",
     "enabled",
     "simulation",
     "settings",
     SEALED_SECRETS_FIELD,
-    KEEP_STORED_FIELD,
 ];
 
 /// 接続の作成・更新のキューの `input` が R2b-6b の形か（Q10: 読めない古い形は起動時に捨てる、
@@ -1108,13 +1103,11 @@ mod tests {
             source,
             &serde_json::json!({ "id": 1, "input": { "name": "a", "protocol": "slmp" } })
         ));
-        // The MCP flat adapter's "keep the stored value" mark (#813 review P2).
-        assert!(is_current_connection_input(
-            source,
-            &serde_json::json!({ "id": 1, "input": { "name": "a", "protocol": "slmp",
-                                 "keepStored": { "keys": ["cpu_type"] } } })
-        ));
         for old in [
+            // The MCP flat adapter's "keep the stored value" mark (gone in R2b-7a): an
+            // old queue row is discarded at startup.
+            serde_json::json!({ "id": 1, "input": { "name": "a", "protocol": "slmp",
+                                 "keepStored": { "keys": ["cpu_type"] } } }),
             serde_json::json!({ "input": { "name": "a", "protocol": "slmp", "host": "h", "port": 1 } }),
             serde_json::json!({ "input": { "name": "a", "protocol": "slmp", "settings": [] } }),
             serde_json::json!({ "input": { "protocol": "slmp" } }),
