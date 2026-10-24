@@ -126,11 +126,7 @@ use chronogazer_core::rest::{
 use chronogazer_core::settings::{
     lan_autostart_allowed, AuditSettings, AuthSettings, ServerSettings, SettingsService,
 };
-use chronogazer_core::tag_address::{
-    ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
-    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, update_tag_checked,
-    TagPlacement,
-};
+use chronogazer_core::tag_address::update_tag_checked;
 use chronogazer_core::tag_thresholds::{
     audit_detail as tag_thresholds_audit_detail, TagThresholdService, TagThresholds,
     TagThresholdsPayload, AUDIT_RESOURCE as TAG_THRESHOLDS_RESOURCE,
@@ -2375,16 +2371,6 @@ async fn plc_connections_update_body(
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    // #414 段階1: REST の `plc_connections_update` と同じ検査（両経路対称）。
-    // 共通の更新（`update_plc_connection`）の**前に**呼ぶ。
-    ensure_protocol_change_keeps_tags_readable(
-        &state.services.plc_connections,
-        &state.services.collection_groups,
-        &state.services.tags,
-        id,
-        &input.protocol,
-    )
-    .await?;
     // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
     let updated = update_plc_connection(&state.services.plc_connections, id, input).await?;
     state
@@ -2540,15 +2526,6 @@ async fn collection_groups_update_body(
     input: CollectionGroupPayload,
 ) -> Result<CollectionGroup, BantoError> {
     let actor = require_role(state, Role::Editor, "collection_groups").await?;
-    // #414 段階1: REST の `collection_groups_update` と同じ検査（両経路対称）。
-    ensure_group_move_keeps_tags_readable(
-        &state.services.plc_connections,
-        &state.services.collection_groups,
-        &state.services.tags,
-        id,
-        input.plc_connection_id,
-    )
-    .await?;
     let updated = state
         .services
         .collection_groups
@@ -2625,15 +2602,6 @@ async fn tags_create_body(state: &AppState, input: TagPayload) -> Result<Tag, Ba
     let actor = require_role(state, Role::Editor, "tags").await?;
     // #532: しきい値は記録計の側の設定。値付きで送られたら断る（REST と同じ）。
     input.reject_thresholds()?;
-    // #414 段階1: REST の `tags_create` と同じ検査（両経路対称）。
-    ensure_tag_fits_its_connection(
-        &state.services.plc_connections,
-        &state.services.collection_groups,
-        input.collection_group_id,
-        &input.address,
-        &input.data_type,
-    )
-    .await?;
     let created = state.services.tags.create(input.into()).await?;
     state
         .services
@@ -2670,22 +2638,6 @@ async fn tags_update_body(state: &AppState, id: i64, input: TagPayload) -> Resul
     let actor = require_role(state, Role::Editor, "tags").await?;
     // #532: しきい値は記録計の側の設定。値付きで送られたら断る（REST と同じ）。
     input.reject_thresholds()?;
-    // #414 段階1: REST の `tags_update` と同じ検査（両経路対称）。所属
-    // グループを変える更新も、入力のグループから接続を辿るので同じ検査で拾う。
-    // 読む場所を変えずに無効化するだけの更新は検査しない（#418 P2）。
-    ensure_tag_update_fits_its_connection(
-        &state.services.plc_connections,
-        &state.services.collection_groups,
-        &state.services.tags,
-        id,
-        TagPlacement {
-            collection_group_id: input.collection_group_id,
-            address: &input.address,
-            data_type: &input.data_type,
-            enabled: input.enabled,
-        },
-    )
-    .await?;
     let updated = update_tag_checked(&state.services.tags, id, input.into()).await?;
     state
         .services
@@ -5249,17 +5201,20 @@ mod tests {
         if attach_registry {
             hub.attach_registry(pool.clone());
         }
+        let drivers = EngineConfig::builtin_drivers();
         EngineServices {
             users: UsersService::new(Db::Sqlite(pool.clone())),
             settings,
             audit: AuditLogService::new(Db::Sqlite(pool.clone())),
             backup: BackupService::new(db_path, Db::Sqlite(pool.clone())),
             hub,
-            plc_connections: PlcConnectionService::new(pool.clone()),
-            collection_groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool.clone()),
+            plc_connections: PlcConnectionService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            collection_groups: CollectionGroupService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            tags: TagService::with_registry(pool.clone(), drivers.clone()).accept_hub_connections(),
             display_groups: DisplayGroupService::new(pool.clone()),
-            collect: CollectorService::new(pool.clone(), data_dir, EngineConfig::builtin_drivers()),
+            collect: CollectorService::new(pool.clone(), data_dir, drivers),
             // banto v1.7.0 #204: 本番と同じ照合付き（同じ `users`）。REST と
             // Tauri のセッションが同じアカウントの変更で終わることを、
             // 両経路をまたいで確かめるテストが使う。
@@ -6904,7 +6859,7 @@ mod tests {
         let field_error = only_field_error(err);
         assert_eq!(field_error.field, "protocol");
         assert!(
-            field_error.message.contains("「modbus」（D100）"),
+            field_error.message.contains("「modbus」（D100:"),
             "どのタグが妨げているかが分からない: {}",
             field_error.message
         );
@@ -6920,9 +6875,7 @@ mod tests {
     /// `CollectionGroupService` 自身のエラー（「指定されたPLC接続が見つかり
     /// ません」）になる。
     ///
-    /// 反証: `collection_groups_update_body` から
-    /// `ensure_group_move_keeps_tags_readable` の呼び出しを消すと、最初の
-    /// `expect_err` が落ちる。
+    /// 登録簿モードの `CollectionGroupService` が移動先のドライバで再検査する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_update_refuses_a_move_that_leaves_tags_unreadable() {
         let state = app_state().await;
@@ -6975,7 +6928,7 @@ mod tests {
         let field_error = only_field_error(err);
         assert_eq!(field_error.field, "plcConnectionId");
         assert!(
-            field_error.message.contains("「modbus-tag」（40001）")
+            field_error.message.contains("「modbus-tag」（400001")
                 && field_error.message.contains("slmp"),
             "どのタグが妨げているかが分からない: {}",
             field_error.message
@@ -7009,9 +6962,7 @@ mod tests {
     /// 保存され、その後の `build_config` が成功して正常なタグだけが残る。
     /// アドレスを直さずに再有効化すると、引き続き拒否される。
     ///
-    /// 反証: `tags_update_body` の `ensure_tag_update_fits_its_connection` を
-    /// 無条件の `ensure_tag_fits_its_connection` に戻すと、無効化の
-    /// `expect` が落ちる。
+    /// 登録簿モードの `TagService` は、読む場所を変えない無効化では再検査しない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disabling_a_legacy_bad_tag_is_allowed_and_reenabling_is_refused() {
         let state = app_state().await;
@@ -7050,9 +7001,7 @@ mod tests {
             .create(tag_payload("good", group.id, "40001").into())
             .await
             .expect("create good tag");
-        let legacy = state
-            .services
-            .tags
+        let legacy = TagService::new(state.services.pool.clone())
             .create(tag_payload("legacy", group.id, "D3000").into())
             .await
             .expect("create legacy tag");

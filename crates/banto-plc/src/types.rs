@@ -59,7 +59,7 @@ pub enum ReadResult {
 /// doc comment for why every pre-①b call site now passes
 /// `StringEncoding::ShiftJis` explicitly rather than getting a default).
 /// Byte order is fixed regardless of encoding - low byte of each word first,
-/// trimmed at the first NUL - see `decode.rs::decode_string_value`.
+/// trimmed at the first NUL by the driver engine's string decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StringReadRequest {
     pub address: Address,

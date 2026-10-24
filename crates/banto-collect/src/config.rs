@@ -39,7 +39,6 @@ use std::time::Duration;
 
 use banto_broker::SettingsFingerprint;
 use banto_driver_api::{DriverRegistry, Settings, TagSpec};
-use banto_plc::{Address, DataType};
 use banto_tags::{
     scaling::Scaling, CollectionGroup, PlcConnection, StoredSecretRow, Tag, PUSH_PROTOCOL,
 };
@@ -61,22 +60,6 @@ fn group_key(id: i64) -> String {
 }
 fn tag_key(id: i64) -> String {
     format!("tag:{id}")
-}
-
-/// The two address notations the save-time check [`check_tag_address`] (the
-/// legacy rule ChronoGazer saves with, address design Q7) parses a tag's
-/// address under (R2b-5c: it was also the wire simulator's kind until the
-/// simulation moved to the value layer) - `Address::parse` (Modbus reference numbers) for
-/// [`Protocol::ModbusTcp`], `Address::parse_slmp` (MELSEC device codes) for
-/// [`Protocol::Slmp`]. Since R2b-3a-3 the collection plan itself reads every
-/// address through the connection's driver (`parse_address`) and carries no
-/// per-protocol configuration ([`ProtocolConfig`]); whether a connection is
-/// collected at all is decided by the driver registry, not by this enum
-/// ([`address_notation`] maps a name to it, for the address notation only).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Protocol {
-    ModbusTcp,
-    Slmp,
 }
 
 /// How one connection is collected (R2b-3a-3, docs/banto-hub-driver-io-design.md
@@ -688,19 +671,38 @@ impl ExclusionUnit {
     }
 }
 
+/// Why a stored tag was excluded from a collection plan. Save-time validation
+/// lives in banto-tags; this describes rows encountered when building a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagExclusionCause {
+    InvalidAddress { reason: String },
+    UnknownDataType,
+}
+
+impl TagExclusionCause {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::InvalidAddress { .. } => "invalidAddress",
+            Self::UnknownDataType => "unknownDataType",
+        }
+    }
+
+    fn message(&self) -> String {
+        match self {
+            Self::InvalidAddress { reason } => {
+                format!("このドライバのアドレスとして解釈できません。{reason}")
+            }
+            Self::UnknownDataType => "未対応のデータ型です".to_string(),
+        }
+    }
+}
+
 /// Why [`build_config_lenient_from`] left an item out (#414 段階2).
 ///
-/// The first six variants are the item's *own* fault - each one is exactly
-/// one of the `CollectError::Config` cases [`build_config_from`] raises. The
-/// last two are cascades: the item itself may be fine, but its connection or
-/// group was excluded, so there is nothing to collect it through. A cascade
-/// names its parent so the list can be followed back to the item that needs
-/// fixing.
-///
-/// Every value in here (protocol string, period, address, data type, the
-/// driver's refusal of the address or the settings, parent names) is
-/// registry data the row already carries - never a host name, credential or
-/// file path.
+/// The own-fault variants correspond to `CollectError::Config` cases from
+/// [`build_config_from`]. The final two variants are cascades from an excluded
+/// connection or group. Values come from registry rows and driver errors,
+/// never host credentials or file paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionReason {
     /// The connection's driver is in the registry but the broker does not
@@ -741,12 +743,11 @@ pub enum ExclusionReason {
     },
     /// `collection_groups.period_ms` does not fit `u32`.
     InvalidPeriod { period_ms: i64 },
-    /// The tag's address/data type cannot be read under its connection's
-    /// protocol (the same [`TagAddressIssue`] the save-time check returns).
+    /// The stored tag's address/data type cannot be read by its driver.
     InvalidTag {
         address: String,
         data_type: String,
-        issue: TagAddressIssue,
+        issue: TagExclusionCause,
     },
     /// R2b-1d (docs/banto-hub-connection-settings-design.md §4.4): the connection's
     /// `protocol` is not in the caller's driver registry - a `"hub"` row in banto-hub
@@ -782,11 +783,7 @@ impl ExclusionReason {
             ExclusionReason::HubTagNotFound { .. } => "hubTagNotFound",
             ExclusionReason::HubTagTypeChanged { .. } => "hubTagTypeChanged",
             ExclusionReason::InvalidPeriod { .. } => "invalidPeriod",
-            ExclusionReason::InvalidTag { issue, .. } => match issue {
-                TagAddressIssue::InvalidAddress { .. } => "invalidAddress",
-                TagAddressIssue::UnknownDataType => "unknownDataType",
-                TagAddressIssue::BitAddressOnNonBitType => "bitAddressOnNonBitType",
-            },
+            ExclusionReason::InvalidTag { issue, .. } => issue.code(),
             ExclusionReason::DriverUnavailable { .. } => "driverUnavailable",
             ExclusionReason::InvalidSettings { .. } => "invalidSettings",
             ExclusionReason::SettingsVersionTooNew { .. } => "settingsVersionTooNew",
@@ -797,8 +794,7 @@ impl ExclusionReason {
 
     /// A human-readable reason, for a list that shows the item's unit and
     /// name next to it (so, unlike the strict error text, it does not repeat
-    /// the name). For a tag it is **exactly** [`TagAddressIssue::message`] -
-    /// the wording the save-time check (#414 段階1) rejects the same tag with.
+    /// the name). Stored invalid tags carry the driver's refusal.
     pub fn message(&self) -> String {
         match self {
             ExclusionReason::UnsupportedProtocol { protocol } => {
@@ -938,16 +934,12 @@ impl ConfigExclusion {
                 data_type,
                 issue,
             } => match issue {
-                TagAddressIssue::InvalidAddress { reason, .. } => {
+                TagExclusionCause::InvalidAddress { reason } => {
                     format!("タグ {name} のアドレス {address} が不正です: {reason}")
                 }
-                TagAddressIssue::UnknownDataType => {
+                TagExclusionCause::UnknownDataType => {
                     format!("タグ {name} のデータ型 {data_type} は未対応です")
                 }
-                TagAddressIssue::BitAddressOnNonBitType => format!(
-                    "タグ {name} のアドレス {address} はビット指定アドレスです。ビット指定アドレスは \
-                     data_type=bit のタグでのみ使えます（現在のデータ型: {data_type}）"
-                ),
             },
             ExclusionReason::DriverUnavailable { protocol } => format!(
                 "接続 {name} のプロトコル {protocol} のドライバがありません（接続は残しています）"
@@ -1063,10 +1055,8 @@ pub enum PushSource {
 
 /// How one enabled connection is collected, once its row is understood.
 enum ResolvedConnection<'a> {
-    /// Read through its broker session. The [`Protocol`] is the simulator
-    /// kind (`None`: the crate has no simulator for this driver), and names
-    /// the notation in a tag's address error message.
-    Plc(Option<Protocol>, ProtocolConfig),
+    /// Read through its broker session.
+    Plc(ProtocolConfig),
     /// Sampled from an [`crate::external::ExternalSource`] (#383 段階3 P3).
     Hub { catalog: Option<&'a HubCatalog> },
     /// Received from pushed values (R2a-1b): same [`ProtocolConfig::External`]
@@ -1221,8 +1211,8 @@ fn build_config_lenient_inner(
                 }
                 let scaling = match &resolved {
                     // R2b-2c / R2b-3a-3: every tag is read through the driver.
-                    ResolvedConnection::Plc(protocol, _) => {
-                        match build_spec(tag, *protocol, &conn.protocol, drivers) {
+                    ResolvedConnection::Plc(_) => {
+                        match build_spec(tag, &conn.protocol, drivers) {
                             Ok(request) => {
                                 requests.push(request);
                                 tag.scaling()
@@ -1356,7 +1346,7 @@ fn build_config_lenient_inner(
 
         store_groups.extend(conn_store_groups);
         let (config, simulation) = match resolved {
-            ResolvedConnection::Plc(_, client_config) => (client_config, conn.simulation),
+            ResolvedConnection::Plc(client_config) => (client_config, conn.simulation),
             // Connection-level simulation does not apply to a Hub connection
             // (banto-tags stores it as `false`; the Hub labels its own
             // simulated values, `crate::external`).
@@ -1468,18 +1458,15 @@ fn resolve_connection<'a>(
             protocol: conn.protocol.clone(),
         });
     }
-    // The address notation of the legacy save-time rule (R2b-7 removes it).
     // Simulation needs no per-protocol support since R2b-5b: a
     // `simulation = true` connection is planned like any other broker-managed
     // one and its session is the value layer's `SimDevice`.
-    let protocol = address_notation(&conn.protocol);
-    Ok(ResolvedConnection::Plc(
-        protocol,
-        ProtocolConfig::Broker(BrokerPlan {
+    Ok(ResolvedConnection::Plc(ProtocolConfig::Broker(
+        BrokerPlan {
             settings: banto_tags::settings_to_api(&conn.settings),
             dial: None,
-        }),
-    ))
+        },
+    )))
 }
 
 /// #383 段階3 P3: a hub tag's external name, if the tag can be collected -
@@ -1489,11 +1476,11 @@ fn resolve_connection<'a>(
 /// shape and "not string, not writable" on save
 /// (`banto_tags::validate_hub_tag_address`).
 fn hub_external_name(tag: &Tag, catalog: Option<&HubCatalog>) -> Result<String, ExclusionReason> {
-    if DataType::parse(&tag.data_type).is_none() {
+    if banto_tags::tag_kind(&tag.data_type, tag.string_length, &tag.string_encoding).is_none() {
         return Err(ExclusionReason::InvalidTag {
             address: tag.address.clone(),
             data_type: tag.data_type.clone(),
-            issue: TagAddressIssue::UnknownDataType,
+            issue: TagExclusionCause::UnknownDataType,
         });
     }
     let name = tag.address.trim().to_string();
@@ -1522,84 +1509,31 @@ fn hub_external_name(tag: &Tag, catalog: Option<&HubCatalog>) -> Result<String, 
 /// the store knows. `string` tags never get here (skipped before the
 /// per-protocol match, like every other protocol).
 fn push_external_key(tag: &Tag) -> Result<String, ExclusionReason> {
-    if DataType::parse(&tag.data_type).is_none() {
+    if banto_tags::tag_kind(&tag.data_type, tag.string_length, &tag.string_encoding).is_none() {
         return Err(ExclusionReason::InvalidTag {
             address: tag.address.clone(),
             data_type: tag.data_type.clone(),
-            issue: TagAddressIssue::UnknownDataType,
+            issue: TagExclusionCause::UnknownDataType,
         });
     }
     Ok(tag.address.trim().to_string())
-}
-
-/// The address notation ([`Protocol`]) for a connection's protocol name, if
-/// the legacy save-time rule has one (only the notation in a tag's address
-/// message uses it since R2b-5b; whether a connection is collected - or
-/// simulated - is the driver registry's call, `resolve_connection`). `None`
-/// for every other driver.
-pub(crate) fn address_notation(protocol: &str) -> Option<Protocol> {
-    match protocol {
-        "modbus-tcp" => Some(Protocol::ModbusTcp),
-        "slmp" => Some(Protocol::Slmp),
-        _ => None,
-    }
-}
-
-/// The legacy save-time rule [`check_tag_address`] applies (#414 段階1):
-/// `protocol` selects the address notation - `Address::parse` (Modbus
-/// reference numbers, e.g. `40001`) for [`Protocol::ModbusTcp`],
-/// `Address::parse_slmp` (MELSEC device codes, e.g. `D100`) for
-/// [`Protocol::Slmp`] - the data type must be in `banto_plc`'s vocabulary,
-/// and a bit-in-word address (T8-2, `"D100.5"` / `"40001.3"`) needs a `bit`
-/// tag.
-///
-/// R2b-3a-3: the collection plan no longer uses this - it reads every address
-/// through the connection's driver ([`build_spec`]), whose `parse_address`
-/// carries the same bit-in-word rule since R2b-2a. This stays only as the rule
-/// ChronoGazer's registry editor saves with (address design Q7: the legacy save
-/// rule is kept until R2b-7); the driver reads the address the editor accepted
-/// (R2b-2 §5).
-fn parse_read_request(
-    protocol: Protocol,
-    address: &str,
-    data_type: &str,
-) -> Result<(), TagAddressIssue> {
-    let parsed = match protocol {
-        Protocol::ModbusTcp => Address::parse(address),
-        Protocol::Slmp => Address::parse_slmp(address),
-    }
-    .map_err(|err| TagAddressIssue::InvalidAddress {
-        protocol: Some(protocol),
-        reason: err.to_string(),
-    })?;
-    let data_type = DataType::parse(data_type).ok_or(TagAddressIssue::UnknownDataType)?;
-    let is_bit_qualified = match parsed {
-        Address::ModbusRef { bit, .. } => bit.is_some(),
-        Address::Slmp { bit, .. } => bit.is_some(),
-    };
-    if is_bit_qualified && data_type != DataType::Bit {
-        return Err(TagAddressIssue::BitAddressOnNonBitType);
-    }
-    Ok(())
 }
 
 /// R2b-2c / R2b-3a-3 (docs/banto-hub-driver-io-design.md §4.3): a tag's read as
 /// the plan carries it - the connection's *driver* parses the address
 /// (`parse_address` with the tag's [`banto_tags::tag_kind`]) and the result is
 /// the [`TagSpec`] itself (the bridge back to `banto_plc::Address` is gone). A
-/// refusal is the tag's own [`TagAddressIssue::InvalidAddress`] carrying the
-/// driver's message, so the tag alone is left out. A bit-in-word address on a
+/// refusal carries the driver's message and leaves only that tag out. A bit-in-word address on a
 /// non-`bit` tag is the driver's refusal too (R2b-2a moved that rule into
 /// `parse_address`).
 fn build_spec(
     tag: &Tag,
-    protocol: Option<Protocol>,
     conn_protocol: &str,
     registry: &DriverRegistry,
-) -> Result<TagSpec, TagAddressIssue> {
-    let invalid = |reason: String| TagAddressIssue::InvalidAddress { protocol, reason };
+) -> Result<TagSpec, TagExclusionCause> {
+    let invalid = |reason: String| TagExclusionCause::InvalidAddress { reason };
     let kind = banto_tags::tag_kind(&tag.data_type, tag.string_length, &tag.string_encoding)
-        .ok_or(TagAddressIssue::UnknownDataType)?;
+        .ok_or(TagExclusionCause::UnknownDataType)?;
     let entry = registry
         .get(conn_protocol)
         .ok_or_else(|| invalid(format!("ドライバ {conn_protocol} がありません")))?;
@@ -1610,117 +1544,11 @@ fn build_spec(
     Ok(TagSpec::new(address, kind))
 }
 
-/// Which input field a [`TagAddressIssue`] is about - so a registry editor
-/// (chronogazer's REST/Tauri tag handlers) can attach it to the right form
-/// field without this crate knowing any wire/field naming.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TagAddressField {
-    Address,
-    DataType,
-}
-
-/// Why [`check_tag_address`] rejected a tag (#414 段階1), or why the plan
-/// left a tag out ([`ExclusionReason::InvalidTag`], #414 段階2). Since
-/// R2b-3a-3 the save check is the legacy rule and the plan reads through the
-/// driver ([`build_spec`]); the driver reads what the legacy rule accepts
-/// (R2b-2 §5), and its refusal is an [`Self::InvalidAddress`] with the
-/// driver's message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TagAddressIssue {
-    /// The address text does not parse under the connection protocol's
-    /// notation (e.g. MELSEC `D3000` on a Modbus TCP connection). `reason`
-    /// is `banto_plc`'s own error text.
-    ///
-    /// `protocol` is `None` for a driver this crate has no notation (and no
-    /// simulator) for (R2b-3a-3): the message then names no notation.
-    InvalidAddress {
-        protocol: Option<Protocol>,
-        reason: String,
-    },
-    /// The data type is outside `banto_plc::DataType`'s vocabulary.
-    UnknownDataType,
-    /// A bit-in-word address (`40001.3` / `D100.5`) on a tag whose data type
-    /// is not `bit` (T8-2).
-    BitAddressOnNonBitType,
-}
-
-impl TagAddressIssue {
-    /// The input field this issue belongs to.
-    pub fn field(&self) -> TagAddressField {
-        match self {
-            TagAddressIssue::InvalidAddress { .. } | TagAddressIssue::BitAddressOnNonBitType => {
-                TagAddressField::Address
-            }
-            TagAddressIssue::UnknownDataType => TagAddressField::DataType,
-        }
-    }
-
-    /// A human-readable reason for a form field (and, #414 段階2, for an
-    /// exclusion list - [`ExclusionReason::message`]). Unlike the strict
-    /// build's messages ([`ConfigExclusion::strict_error`]) it does not name
-    /// the tag (the operator is looking at that tag's own form, or at a list
-    /// row that already shows its name), but it does name the notation the
-    /// connection expects, with an example.
-    pub fn message(&self) -> String {
-        match self {
-            TagAddressIssue::InvalidAddress { protocol, reason } => {
-                let (label, example) = match protocol {
-                    Some(Protocol::ModbusTcp) => ("Modbus TCP", "40001"),
-                    Some(Protocol::Slmp) => ("SLMP（MELSEC）", "D100"),
-                    None => return format!("このドライバのアドレスとして解釈できません。{reason}"),
-                };
-                format!("{label} のアドレスとして解釈できません（例: {example}）。{reason}")
-            }
-            TagAddressIssue::UnknownDataType => "未対応のデータ型です".to_string(),
-            TagAddressIssue::BitAddressOnNonBitType => {
-                "ビット指定アドレス（例: 40001.3 / D100.5）はデータ型 bit のタグでのみ使えます"
-                    .to_string()
-            }
-        }
-    }
-}
-
-/// #414 段階1: would a tag with this `address`/`data_type`, placed under a
-/// connection whose `plc_connections.protocol` is `protocol`, be accepted by
-/// [`build_config_from`]? `Ok(())` exactly when the tag cannot be the reason
-/// `build_config_from` fails - the same interpreter ([`parse_read_request`])
-/// and the same skips:
-///
-/// - `data_type == "string"` is skipped by `build_config_from` before any
-///   address parsing, so it is always `Ok` here.
-/// - A `protocol` other than `"modbus-tcp"`/`"slmp"` is `Ok` here:
-///   `"virtual"`/`"postgres"` connections are excluded from collection, and
-///   an unsupported protocol string is a *connection*-level error
-///   (`resolve_connection`) that no tag address could fix. That includes
-///   `"hub"` (#383 段階3 P2): a hub tag's address is an external name, not a
-///   device address, and its shape/data type/`writable` rules are enforced
-///   by `banto_tags::TagService` itself on every save
-///   (`banto_tags::validate_hub_tag_address`), so there is nothing left for
-///   this collector-side interpreter to check.
-///
-/// Whether the tag/group/connection is `enabled` is deliberately not an
-/// input - a disabled tag with an unreadable address still breaks
-/// collection the moment it is enabled, so a registry editor checks it on
-/// save regardless.
-pub fn check_tag_address(
-    protocol: &str,
-    address: &str,
-    data_type: &str,
-) -> Result<(), TagAddressIssue> {
-    if data_type == banto_tags::STRING_DATA_TYPE {
-        return Ok(());
-    }
-    let protocol = match protocol {
-        "modbus-tcp" => Protocol::ModbusTcp,
-        "slmp" => Protocol::Slmp,
-        _ => return Ok(()),
-    };
-    parse_read_request(protocol, address, data_type)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_driver_api::DataType;
+    use banto_plc::Address;
 
     /// The built-in drivers (Modbus TCP and SLMP) every plan is read through
     /// since R2b-3a-3.
@@ -2800,13 +2628,6 @@ mod tests {
             }
             other => panic!("the strict build must refuse a hub connection, got {other:?}"),
         }
-
-        // The save-time check has nothing to add for a hub tag: its address
-        // is an external name, validated by banto-tags itself.
-        assert_eq!(
-            check_tag_address(banto_tags::HUB_PROTOCOL, "PLC9.G.Temp", "f64"),
-            Ok(())
-        );
     }
 
     /// #383 段階3 P3: where the runtime can collect it, a `"hub"` connection
@@ -3111,107 +2932,6 @@ mod tests {
         again.set_broker_dial_target(&slmp_key, fingerprint("20000"));
         assert_ne!(plan(&again, &slmp_key), plan(&config, &slmp_key));
         assert_eq!(plan(&again, &modbus_key), plan(&config, &modbus_key));
-    }
-
-    /// #414 段階1: the save-time check's accept/reject table.
-    /// `None` = accepted; `Some(field)` = rejected on that field.
-    const TAG_ADDRESS_TABLE: &[(&str, &str, &str, Option<TagAddressField>)] = &[
-        // Modbus TCP: reference numbers only.
-        ("modbus-tcp", "40001", "i16", None),
-        ("modbus-tcp", "00001", "bit", None),
-        ("modbus-tcp", "30010", "f32", None),
-        ("modbus-tcp", "40001.3", "bit", None),
-        ("modbus-tcp", "D3000", "i16", Some(TagAddressField::Address)),
-        (
-            "modbus-tcp",
-            "D100.5",
-            "bit",
-            Some(TagAddressField::Address),
-        ),
-        ("modbus-tcp", "99999", "i16", Some(TagAddressField::Address)),
-        (
-            "modbus-tcp",
-            "40001.3",
-            "i16",
-            Some(TagAddressField::Address),
-        ),
-        (
-            "modbus-tcp",
-            "40001",
-            "i128",
-            Some(TagAddressField::DataType),
-        ),
-        // SLMP: MELSEC device codes only.
-        ("slmp", "D100", "i16", None),
-        ("slmp", "M100", "bit", None),
-        ("slmp", "D100.5", "bit", None),
-        ("slmp", "40001", "i16", Some(TagAddressField::Address)),
-        ("slmp", "D100.5", "i16", Some(TagAddressField::Address)),
-        // `build_config_from` skips string tags before parsing anything.
-        ("modbus-tcp", "D3000", "string", None),
-        // Not collected / connection-level error: never the tag's fault.
-        ("virtual", "anything", "f64", None),
-        ("postgres", "anything", "f64", None),
-    ];
-
-    #[test]
-    fn check_tag_address_accepts_and_rejects_per_protocol() {
-        for &(protocol, address, data_type, expected) in TAG_ADDRESS_TABLE {
-            let got = check_tag_address(protocol, address, data_type)
-                .err()
-                .map(|issue| issue.field());
-            assert_eq!(got, expected, "{protocol} / {address} / {data_type}");
-        }
-    }
-
-    #[test]
-    fn an_address_issue_names_the_expected_notation() {
-        let issue = check_tag_address("modbus-tcp", "D3000", "i16").unwrap_err();
-        let message = issue.message();
-        assert!(message.contains("Modbus TCP"), "{message}");
-        assert!(message.contains("40001"), "{message}");
-        let issue = check_tag_address("slmp", "40001", "i16").unwrap_err();
-        assert!(issue.message().contains("D100"), "{}", issue.message());
-    }
-
-    /// The whole point of `check_tag_address`: it rejects exactly what
-    /// `build_config` rejects. Every table row whose protocol is a wire
-    /// protocol and whose data type the registry accepts is written to a
-    /// real registry and built - the two verdicts must agree.
-    #[tokio::test]
-    async fn check_tag_address_agrees_with_build_config() {
-        for &(protocol, address, data_type, _) in TAG_ADDRESS_TABLE {
-            if !["modbus-tcp", "slmp"].contains(&protocol)
-                || !banto_tags::ALLOWED_DATA_TYPES.contains(&data_type)
-            {
-                continue;
-            }
-            let pool = registry().await;
-            let mut conn = conn_input("PLC1", 502);
-            conn.protocol = protocol.to_string();
-            let conn = PlcConnectionService::new(pool.clone())
-                .create(conn)
-                .await
-                .unwrap();
-            let group = CollectionGroupService::new(pool.clone())
-                .create(group_input("G1", conn.id, 1_000))
-                .await
-                .unwrap();
-            let mut tag = tag_input("T", group.id, address);
-            tag.data_type = data_type.to_string();
-            if data_type == banto_tags::STRING_DATA_TYPE {
-                tag.string_length = Some(4);
-            }
-            TagService::new(pool.clone()).create(tag).await.unwrap();
-
-            let built = build_config(&pool, drivers()).await;
-            let checked = check_tag_address(protocol, address, data_type);
-            assert_eq!(
-                built.is_ok(),
-                checked.is_ok(),
-                "{protocol} / {address} / {data_type}: build={built:?} check={checked:?}"
-            );
-        }
     }
 
     // --- #414 段階2: the strict builder's wording is frozen ----------------
@@ -3553,40 +3273,6 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert_eq!(config_exclusions(&snapshot, drivers()), exclusions);
-    }
-
-    /// A tag the save-time check rejects is also left out of the plan, on
-    /// the same field, worded with the same notation and example (#414
-    /// 段階1). Since R2b-3a-3 the plan's reason after that is the driver's
-    /// own (it reads the address), so only the field and the leading words
-    /// are shared.
-    #[tokio::test]
-    async fn a_tag_exclusion_uses_the_save_time_wording() {
-        for (address, data_type) in [("D3000", "i16"), ("40001", "f128"), ("40001.3", "i16")] {
-            let mut snapshot = golden_snapshot().await;
-            snapshot.tags[0].address = address.to_string();
-            snapshot.tags[0].data_type = data_type.to_string();
-            let exclusions = config_exclusions(&snapshot, drivers());
-            assert_eq!(exclusions.len(), 1, "{address} / {data_type}");
-            let saved = check_tag_address("modbus-tcp", address, data_type).unwrap_err();
-            let ExclusionReason::InvalidTag { issue, .. } = &exclusions[0].reason else {
-                panic!("{address}: {:?}", exclusions[0].reason);
-            };
-            assert_eq!(issue.field(), saved.field(), "{address} / {data_type}");
-            if let TagAddressIssue::InvalidAddress { .. } = issue {
-                assert!(
-                    exclusions[0]
-                        .reason
-                        .message()
-                        .starts_with("Modbus TCP のアドレスとして解釈できません（例: 40001）。"),
-                    "{}",
-                    exclusions[0].reason.message()
-                );
-            } else {
-                assert_eq!(exclusions[0].reason.message(), saved.message());
-            }
-            assert_eq!(exclusions[0].unit, ExclusionUnit::Tag);
-        }
     }
 
     /// Leaving a tag out is exactly "the same config without that tag": the
@@ -4253,7 +3939,7 @@ mod tests {
             .find(|e| e.id == 100)
             .map(|e| e.reason.message())
             .unwrap();
-        assert!(message.contains("Modbus TCP"), "{message}");
+        assert!(message.contains("Modbus"), "{message}");
         let group = &config.connections[0].groups[0];
         assert_eq!(group.requests.len(), 2, "40001 and 400001 are both planned");
     }
@@ -4420,10 +4106,6 @@ mod tests {
             .map(|e| (e.id, e.reason.code()))
             .collect();
         assert_eq!(own, vec![(2, "unsupportedProtocol")]);
-        // The legacy save-time notation is still picked by name.
-        assert_eq!(address_notation("modbus-tcp"), Some(Protocol::ModbusTcp));
-        assert_eq!(address_notation("slmp"), Some(Protocol::Slmp));
-        assert_eq!(address_notation("fake-session"), None);
     }
 
     /// A secret key holding a plaintext (a hand-edited row) is an invalid setting -

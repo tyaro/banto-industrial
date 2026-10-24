@@ -100,10 +100,9 @@ pub use client::{
 pub use collector::{ApplyReport, Collector, CollectorOptions};
 pub use config::{
     build_config, build_config_from, build_config_from_with_registry, build_config_lenient_from,
-    build_config_lenient_with_thresholds, check_tag_address, config_exclusions,
-    connections_with_collected_groups, driver_exclusion, CollectorConfig, ConfigExclusion,
-    ExclusionReason, ExclusionUnit, HubCatalog, HubSource, Protocol, PushSource, RegistrySnapshot,
-    TagAddressField, TagAddressIssue, Thresholds,
+    build_config_lenient_with_thresholds, config_exclusions, connections_with_collected_groups,
+    driver_exclusion, CollectorConfig, ConfigExclusion, ExclusionReason, ExclusionUnit, HubCatalog,
+    HubSource, PushSource, RegistrySnapshot, TagExclusionCause, Thresholds,
 };
 pub use current::{
     CurrentReading, CurrentSample, CurrentValuesHandle, Quality, STALE_PERIOD_FACTOR,

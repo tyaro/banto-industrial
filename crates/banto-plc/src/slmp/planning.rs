@@ -124,7 +124,7 @@ pub enum ReadKind {
     Str {
         words: u16,
         /// T20 ①b (docs/banto-hub-t20-design.md §3.1): which table
-        /// `decode.rs::decode_string_value` uses to decode the span -
+        /// the driver engine uses to decode the span -
         /// threaded straight through from [`crate::types::StringReadRequest::encoding`].
         encoding: StringEncoding,
     },

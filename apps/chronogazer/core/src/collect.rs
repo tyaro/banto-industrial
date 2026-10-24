@@ -47,8 +47,8 @@
 //! docs/banto-hub-driver-io-design.md §8（Q5）: SLMP / Modbus TCP の接続は、
 //! 接続タスクが自分でソケットを張るのではなく、banto-hub と同じ
 //! `banto-broker` のセッション（[`banto_collect::BrokerSessions`]）を通して読む。
-//! 計画もドライバの `parse_address` で組む（`EngineConfig::drivers`）。保存時の
-//! 規則は変えていない（`crate::tag_address`、R2b-7 まで旧い規則）。
+//! 計画もドライバの `parse_address` で組む（`EngineConfig::drivers`）。保存時も
+//! `banto-tags` の登録簿モードが同じドライバの規則を使う。
 //!
 //! * 開始で計画のどの接続にもセッションを用意し、停止で全部閉じる
 //!   （[`Lifecycle::stop`]。止めた収集のために PLC と繋いだままにしない）。
@@ -844,7 +844,7 @@ impl From<ExclusionUnit> for ExclusionUnitView {
 /// `banto_collect::ConfigExclusion` から作る）。
 ///
 /// JSON は `{"unit":"tag","id":7,"key":"tag:7","name":"温度",
-/// "reason":"invalidAddress","message":"Modbus TCP のアドレスとして…"}`。
+/// "reason":"invalidAddress","message":"このドライバのアドレスとして…"}`。
 ///
 /// **viewer に見せてよいか（確かめた範囲）**: 載せるのはレジストリの行 id・
 /// キー（`conn:<id>` 等。現在値・接続状態の地図と同じ鍵）・行の名前・理由の
@@ -3814,11 +3814,9 @@ mod tests {
             key: format!("tag:{tag_id}"),
             name: name.to_string(),
             reason: "invalidAddress",
-            // R2b-3a-3: 計画はドライバの `parse_address` で読むので、理由はドライバの文言
-            // （保存時の旧い規則 `check_tag_address` と前半の「…として解釈できません
-            // （例: …）。」は同じ）。
+            // 計画はドライバの `parse_address` で読むので、理由はドライバの文言。
             message: format!(
-                "Modbus TCP のアドレスとして解釈できません（例: 40001）。{address:?} は Modbus の参照番号（例: 40001, 40001.3）として読めません"
+                "このドライバのアドレスとして解釈できません。{address:?} は Modbus の参照番号（例: 40001, 40001.3）として読めません"
             ),
         }
     }

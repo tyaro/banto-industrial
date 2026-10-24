@@ -39,7 +39,7 @@ tokio = { workspace = true, features = ["net", "time", "io-util"] }
 # makes it reviewable - it is no longer a build-level guarantee.
 slmp = { workspace = true }
 # S1 (relay-wright plan, 文字列タグ): Shift-JIS decode for MELSEC string-device
-# reads (`decode.rs::decode_string_value`) and SJIS seeding in the SLMP
+# reads (`decode.rs`) and SJIS seeding in the SLMP
 # simulator's `set_string`. Same version the `slmp` crate uses - see the
 # workspace Cargo.toml note on why its PLCString type is not reused.
 encoding_rs = { workspace = true }
