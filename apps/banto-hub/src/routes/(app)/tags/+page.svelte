@@ -4034,7 +4034,12 @@
 	const structInputKey = $derived(
 		structForm.collectionGroupId === ''
 			? null
-			: JSON.stringify([structForm.mode, structForm.baseAddress, structFieldsFromForm()])
+			: JSON.stringify([
+					structForm.collectionGroupId,
+					structForm.mode,
+					structForm.baseAddress,
+					structFieldsFromForm()
+				])
 	);
 
 	/**

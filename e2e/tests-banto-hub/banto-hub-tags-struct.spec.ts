@@ -30,6 +30,7 @@ test.describe.serial('banto-hub 構造体タグ登録 DOM (T20 ②a)', () => {
 	let page: Page;
 	let authedHeaders: Record<string, string>;
 	let groupId: number;
+	let connectionId: number;
 
 	test.beforeAll(async ({ browser }) => {
 		page = await browser.newPage();
@@ -60,6 +61,7 @@ test.describe.serial('banto-hub 構造体タグ登録 DOM (T20 ②a)', () => {
 		});
 		expect(connectionRes.ok()).toBe(true);
 		const connection = (await connectionRes.json()) as { id: number };
+		connectionId = connection.id;
 
 		const groupRes = await page.request.post('/api/collection-groups', {
 			headers: authedHeaders,
@@ -176,5 +178,66 @@ test.describe.serial('banto-hub 構造体タグ登録 DOM (T20 ②a)', () => {
 
 		const tagsBefore = await fetchTags();
 		expect(tagsBefore.some((t) => t.name === 'e2e-struct-collide-a')).toBe(false);
+	});
+
+	test('3. 同じ接続の別グループへ切り替えて開き直すと、衝突の判定も新しいグループに追従する（6d-2a レビュー P2）', async () => {
+		const createGroup = async (name: string): Promise<number> => {
+			const res = await page.request.post('/api/collection-groups', {
+				headers: authedHeaders,
+				data: { name, plcConnectionId: connectionId, periodMs: 1000, enabled: true }
+			});
+			expect(res.ok()).toBe(true);
+			return ((await res.json()) as { id: number }).id;
+		};
+		const groupAName = 'e2e-struct-switch-a';
+		const groupBName = 'e2e-struct-switch-b';
+		const groupAId = await createGroup(groupAName);
+		await createGroup(groupBName);
+		// D100 の既存タグはグループ A にだけ置く。
+		const tagRes = await page.request.post('/api/tags', {
+			headers: authedHeaders,
+			data: {
+				name: 'e2e-struct-switch-existing',
+				collectionGroupId: groupAId,
+				address: 'D100',
+				dataType: 'i16',
+				decimals: 0,
+				enabled: true,
+				writable: false,
+				tagKind: 'plc'
+			}
+		});
+		expect(tagRes.ok()).toBe(true);
+
+		const drawer = page.getByRole('dialog', { name: '構造体登録' });
+		await page.goto('/tags');
+
+		// グループ A: D100 が既存タグと衝突する。
+		await groupNodeByName(page, groupAName).click();
+		await page.getByTestId('struct-reg-open').click();
+		await expect(drawer).toBeVisible();
+		await page.getByTestId('struct-reg-base-address').fill('D100');
+		await page.getByTestId('struct-reg-field-name-0').fill('e2e-struct-switch-new');
+		await expect(page.getByTestId('struct-reg-collisions')).toContainText(
+			'e2e-struct-switch-existing'
+		);
+		await expect(page.getByTestId('struct-reg-apply')).toBeDisabled();
+
+		// 未保存の入力があるので、閉じるときの確認を受け入れる（フォームは残る）。
+		page.once('dialog', (dialog) => {
+			void dialog.accept();
+		});
+		await drawer.getByRole('button', { name: '閉じる' }).click();
+		await expect(drawer).toBeHidden();
+
+		// 同じ接続のグループ B を選んで開き直す: 入力は同じだが対象が変わるので衝突は消える。
+		await groupNodeByName(page, groupBName).click();
+		await page.getByTestId('struct-reg-open').click();
+		await expect(drawer).toBeVisible();
+		await expect(page.getByTestId('struct-reg-base-address')).toHaveValue('D100');
+		await expect(page.getByTestId('struct-reg-preview-table')).toBeVisible();
+		await expect(page.getByTestId('struct-reg-collisions')).toHaveCount(0);
+		await page.getByTestId('struct-reg-validate').click();
+		await expect(page.getByText('構造体タグの検証OK: 1件登録できます')).toBeVisible();
 	});
 });
