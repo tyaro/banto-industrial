@@ -2569,16 +2569,18 @@ T11-2（[ux-plan.md](ux-plan.md) §3）・T18-3d（[banto-hub-t18-design.md](ban
 - **設定パッケージの版 3（2026-10-24、R2b-6、v0.2.0-alpha.39、
   [banto-hub-driver-ui-design.md](banto-hub-driver-ui-design.md) §5）**: 接続の欄を
   ドライバのスキーマに合わせて持つため、版を `schemaVersion: 3` に上げました。接続は
-  `{ name, protocol, enabled, simulation, settings }` で持ち、`host`・`port`・`unitId`・
-  `wordOrder`・`cpuType` などは `settings` の中に入ります（上の版 2 の「接続の
-  `wordOrder`・`cpuType` は必須」は、`settings` の中の欄がスキーマの必須・既定の規則に
+  `{ name, protocol, enabled, simulation, settings }` で持ち、接続の欄は `settings` の中に
+  ドライバのスキーマのキー（snake_case）で入ります。`host`・`port` は名前のまま、
+  `unitId` は `settings.unit_id`、`wordOrder` は `settings.word_order`、`cpuType` は
+  `settings.cpu_type` になります（旧い camelCase のキーは「このドライバの設定に無い欄です」で
+  断ります）。上の版 2 の「接続の `wordOrder`・`cpuType` は必須」は、`settings` の中の欄がスキーマの必須・既定の規則に
   従う形に替わりました）。**秘密（PostgreSQL 接続のパスワードなど）は書き出しません**。
   取り込んだ後に、接続の画面で秘密を設定し直してください。**版 2 以前のパッケージは
   読み込めません**（互換性は持たない、オーナー決定）。「schemaVersion 2 は未対応です
   （期待値: 3）。古い版の構成パッケージは読み込めません。今の banto-hub で書き出し直してください」と
   出たら、取り込み元の banto-hub を更新してから書き出し直してください。接続の
   `/api/plc-connections` と `/api/plc-connections/test` も同じ `{ protocol, settings }` の
-  形になりました（MCP の接続の API は平らな形のままです）。
+  形になりました（MCP の接続の API は平らな形・camelCase のキーのままです）。
 - **取り込み口 `push` 接続と設定パッケージ（R2a-2e、2026-10-21、
   [banto-hub-ingest-design.md](banto-hub-ingest-design.md) §5.1）**: `push` 接続は
   `settings`（受信のタイムアウト `stale_timeout_ms` と DB ブリッジの区画）ごと
