@@ -219,7 +219,7 @@ impl HubDrivers {
 /// call - `ensure_connection` for every currently-enabled connection whose
 /// protocol the broker manages (unchanged, additive - as of #131,
 /// 2026-09-01, this is [`HubSessions::is_broker_managed`], i.e. `"slmp"`
-/// and `"modbus-tcp"`, not just SLMP), THEN [`HubSessions::remove`] for every
+/// and `"modbus-tcp"`, not just SLMP), THEN [`HubSessions::stop_and_join`] for every
 /// connection id this directory still tracks (via
 /// [`banto_broker::SessionDirectory::connection_ids`]) that is no longer in
 /// that wanted set (deleted from the registry, disabled, or changed away
@@ -231,9 +231,23 @@ impl HubDrivers {
 /// (which would re-open every SLMP session on every rebuild, defeating the
 /// whole point of session continuity across registry writes) and over a full
 /// `SessionDirectory` rebuild-from-scratch (same problem) - a targeted
-/// per-connection `remove` for exactly the ids that fell out of the wanted
+/// per-connection stop for exactly the ids that fell out of the wanted
 /// set is the minimal change that actually reclaims resources without ever
 /// touching a session nothing asked to remove.
+///
+/// **Changed settings (2026-10-24, owner decision)**: a connection that stays
+/// in the wanted set but whose settings fingerprint changed
+/// (`BrokerSimRegistry::resolve`'s `changed`) has its old task stopped AND
+/// joined with [`HubSessions::stop_and_join`] *before* the new session is
+/// ensured - during the sync itself, not after the collector commit. Only
+/// [`HubSessions::remove`]-ing it let the new session dial while the old task
+/// might still hold its socket (other clones of the old handle outlive the
+/// sync: the collector hands every task of a generation the same factory, so
+/// a sibling connection's collect task still holds it), and a PLC that refuses
+/// a second connection on the same port (R08: 10061) refuses the new one. The
+/// changed connection's own collect task reads Bad through the stopped handle
+/// until the commit replaces it; no sibling session is touched. See
+/// `CollectorManager::sync_broker_sessions_from`'s doc comment.
 ///
 /// **T19 S2-a addendum (UX-48, docs/banto-hub-t19-design.md §3.8,
 /// 2026-09-03)**: "every currently-enabled connection whose protocol the
@@ -465,11 +479,10 @@ impl HubSessions {
     }
 
     /// Untrack the session for `connection_id`, if one is tracked - proxies
-    /// [`SessionDirectory::remove`] (see that method's doc comment for the
-    /// exact mechanism and its explicit non-guarantee: this drops OUR clone
-    /// of the `BrokerHandle`, but the broker task only exits once every
-    /// clone anywhere is gone). Returns `true` if a session was tracked and
-    /// is now untracked.
+    /// [`SessionDirectory::remove`] (see that type's "Removal" doc section for
+    /// the exact mechanism: the task is signalled to stop but not waited for -
+    /// use [`Self::stop_and_join`] when the old task must be gone before going
+    /// on). Returns `true` if a session was tracked and is now untracked.
     ///
     /// **Caller must call this only after the corresponding collect task (if
     /// any) has already stopped** - see this struct's "Session sync policy"

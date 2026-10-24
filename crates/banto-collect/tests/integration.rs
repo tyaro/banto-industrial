@@ -3003,3 +3003,93 @@ async fn a_session_that_cannot_start_is_reported_in_failures() {
     assert_eq!(sessions.connection_count(), 0);
     sessions.shutdown().await;
 }
+
+/// Wait until the broker session behind `handle` reads `Connected`.
+async fn connected_within(handle: &banto_broker::ReadOnlyHandle, limit: Duration) -> bool {
+    let mut rx = handle.status_watch();
+    tokio::time::timeout(
+        limit,
+        rx.wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok())
+}
+
+/// A connection whose dial settings changed has its old broker task stopped
+/// and joined by [`BrokerSessions::sync`] before the new session is ensured
+/// (`SessionDirectory::stop_and_join`, 2026-10-24 owner decision), even while
+/// someone still holds the old handle - a sibling connection's collect task
+/// holds the whole factory, so the old handle outlives the sync. Only
+/// dropping the directory's entry (`remove`) signals the old task but does not
+/// wait for it: the new session dials while the old one may still hold its
+/// socket, and a PLC that refuses a second connection on the same port (R08:
+/// 10061) refuses the new one. The connection that did not change keeps its
+/// session.
+///
+/// A current-thread runtime makes the check deterministic: the old task can
+/// only run its teardown while `sync` itself awaits it, so "Stopped" right
+/// after `sync` returns (no await in between) proves the join.
+#[tokio::test(flavor = "current_thread")]
+async fn a_changed_connection_has_its_old_session_joined_before_the_new_one() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("changed-joins-old");
+    let pool = open_registry(&env).await;
+    let connections = PlcConnectionService::new(pool.clone());
+    let mut input_a = conn_input("PLC-A", 502);
+    input_a.simulation = true;
+    let a = connections.create(input_a.clone()).await.unwrap();
+    let mut input_b = conn_input("PLC-B", 503);
+    input_b.simulation = true;
+    let b = connections.create(input_b).await.unwrap();
+    for (name, conn_id) in [("GA", a.id), ("GB", b.id)] {
+        let group = CollectionGroupService::new(pool.clone())
+            .create(group_input(name, conn_id, 100))
+            .await
+            .unwrap();
+        TagService::new(pool.clone())
+            .create(tag_input(&format!("t-{name}"), group.id, "40001", "i16"))
+            .await
+            .unwrap();
+    }
+
+    let sessions = BrokerSessions::new(DRIVERS.clone(), fast_options().broker_options());
+    let mut config = build_config(&pool, drivers()).await.unwrap();
+    let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+    let first = sessions.sync(&snapshot, &mut config).await;
+    assert!(first.failures.is_empty(), "{:?}", first.failures);
+    let old_a = sessions.handle(a.id).expect("A has a session");
+    let old_b = sessions.handle(b.id).expect("B has a session");
+    assert!(connected_within(&old_a, Duration::from_secs(5)).await);
+    assert!(connected_within(&old_b, Duration::from_secs(5)).await);
+
+    // Only A's settings change.
+    input_a.port = 1502;
+    connections.update(a.id, input_a).await.unwrap();
+    let mut config = build_config(&pool, drivers()).await.unwrap();
+    let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+    let second = sessions.sync(&snapshot, &mut config).await;
+
+    // `first.factory` (what B's collect task would hold) and `old_a` are
+    // still alive here; the old task must already be stopped and joined.
+    assert_eq!(
+        *old_a.status_watch().borrow(),
+        banto_broker::BrokerConnectionStatus::Stopped,
+        "the old session of the changed connection must be joined by sync"
+    );
+    assert!(second.failures.is_empty(), "{:?}", second.failures);
+    assert!(second.stale.is_empty());
+    let new_a = sessions.handle(a.id).expect("A has a new session");
+    assert_ne!(new_a.settings_fingerprint(), old_a.settings_fingerprint());
+    assert!(connected_within(&new_a, Duration::from_secs(5)).await);
+    assert_eq!(
+        *old_b.status_watch().borrow(),
+        banto_broker::BrokerConnectionStatus::Connected,
+        "the unchanged connection keeps its session"
+    );
+    assert_eq!(
+        sessions.handle(b.id).unwrap().settings_fingerprint(),
+        old_b.settings_fingerprint()
+    );
+    drop(first);
+    sessions.shutdown().await;
+}

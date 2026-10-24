@@ -8,7 +8,7 @@
 //! banto-hub keeps its own directory (`HubSessions`, shared with its read-now /
 //! write paths and its status surface); its sync (`CollectorManager::
 //! sync_broker_sessions_from`) follows the same steps as [`BrokerSessions::sync`]:
-//! resolve the dial settings, drop the session when they changed, ensure, stamp
+//! resolve the dial settings, stop and join the session when they changed, ensure, stamp
 //! the plan with the fingerprint, and hand the handles to
 //! [`crate::broker_client_factory`].
 //!
@@ -26,6 +26,25 @@
 //!    (the direct clients this replaced closed their sockets with the task).
 //! 5. [`BrokerSessions::shutdown`] once, at the end of the process: the
 //!    sessions first, then the simulators they dial.
+//!
+//! ## Changed settings
+//!
+//! When a planned connection's dial settings changed (its fingerprint, see
+//! [`BrokerSimRegistry::resolve`]), step 1 stops its old broker task and waits
+//! for it (`SessionDirectory::stop_and_join`) before ensuring the new one,
+//! rather than only dropping the directory's entry (2026-10-24 owner
+//! decision). Dropping the entry also signals the old task to stop (its
+//! per-task stop sender goes with it, even though other clones of the handle
+//! - the previous factory, which a sibling connection's collect task still
+//! holds - live on), but does not wait: the old task's teardown (a running
+//! job, the goodbye) could still hold its socket while the new session
+//! dials, and a PLC that refuses a second connection on the same port (R08:
+//! 10061) would refuse that first dial. The
+//! wait is bounded: a job already running finishes within its own job limit,
+//! queued jobs are answered with `TaskGone` (never success), a pending dial is
+//! aborted, and the goodbye is bounded by `banto_broker::DISCONNECT_LIMIT`.
+//! Until step 2 replaces the changed connection's collect task, that task
+//! reads through the stopped handle and its reads fail (Bad).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -87,9 +106,16 @@ impl BrokerSessions {
         self.directory.connection_count()
     }
 
+    /// The read-only handle of the session tracked for `connection_id`, if
+    /// any (diagnostics and tests: watch one session's status across a sync).
+    pub fn handle(&self, connection_id: i64) -> Option<ReadOnlyHandle> {
+        self.directory.handle(connection_id).map(|h| h.read_only())
+    }
+
     /// Step 1 of this module's doc: a session for every broker-read
     /// connection `config` plans, its dial settings resolved by the
-    /// simulation registry (a changed target drops the old session first),
+    /// simulation registry (a changed target stops and joins the old session
+    /// first - see this module's doc, "Changed settings"),
     /// and the plan stamped with the session's fingerprint. A connection
     /// whose session cannot be started is reported in
     /// [`SessionSync::failures`] and gets a client that never connects (its
@@ -111,7 +137,12 @@ impl BrokerSessions {
             let (target, changed) = self.sims.resolve(conn, &self.registry).await;
             wanted.insert(conn.id);
             if changed {
-                self.directory.remove(conn.id);
+                // Stop and join the old task before the new one dials: its
+                // teardown must not still hold the old socket while the new
+                // session connects - a PLC that refuses a second connection on
+                // the same port would refuse the new one (this module's doc,
+                // "Changed settings").
+                self.directory.stop_and_join(conn.id).await;
             }
             config.set_broker_dial_target(&key, dial_fingerprint(conn, &target, &self.registry));
             let ensured = match target {

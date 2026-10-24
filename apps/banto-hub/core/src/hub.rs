@@ -56,7 +56,7 @@
 //! `ensure_connection`（従来どおり）した後、**Collector 側のコミットが
 //! 成功した後で**（= 削除対象接続の collect タスクが既に停止済みである
 //! ことが保証された後で）、`HubSessions` が保持している接続 ID のうち
-//! この集合に無いものを `HubSessions::remove` する。この順序
+//! この集合に無いものを `HubSessions::stop_and_join` する。この順序
 //! （collect タスク停止 → broker セッション削除）が逆転すると、まだ
 //! `read_batch` を呼んでいる `BrokerReadClient` の下でセッションが消える
 //! 危険がある - 詳細は `crate::broker_glue` のモジュール doc参照。#131 当時
@@ -80,8 +80,9 @@
 //! [`CollectorManager::sync_broker_sessions_from`] は `ensure_connection` を
 //! 呼ぶ前に接続ごとに `BrokerSimRegistry::resolve` を呼び、シミュレーション中
 //! なら実際のダイヤル先をシミュレータの loopback アドレスへ差し替え、宛先が
-//! 変わっていれば（`changed == true`）`HubSessions::remove` してから
-//! `ensure_connection` して古いセッションの使い回しを防ぐ（#131、
+//! 変わっていれば（`changed == true`）`HubSessions::stop_and_join` で古い
+//! タスクを止めて待ってから（2026-10-24 オーナー決定。以前は `remove` だけで、
+//! 待たなかった）`ensure_connection` して古いセッションの使い回しを防ぐ（#131、
 //! 2026-09-01 以降この resolve/ensure_connection 自体は Modbus TCP 接続にも
 //! 及ぶ - `sync_broker_sessions_from`のモジュール doc参照）。[`Self::rebuild`]
 //! はさらに、`sync_broker_sessions_from`の第4戻り値（`read_routed_keys` =
@@ -1782,11 +1783,24 @@ impl CollectorManager {
     /// reuses a session purely by connection id, so if `resolve` reports the
     /// dial target *changed* since the last rebuild (simulation toggled,
     /// simulator restarted, or - incidentally - a real connection's host/port
-    /// was edited in place), `self.sessions.remove(conn.id)` is called FIRST
-    /// so `ensure_connection` is forced to spawn a fresh session against the
-    /// new target instead of silently keeping the stale one alive forever -
-    /// see `BrokerSimRegistry::resolve`'s doc comment for the full derivation
-    /// of why this matters.
+    /// was edited in place), `self.sessions.stop_and_join(conn.id)` is
+    /// awaited FIRST so `ensure_connection` is forced to spawn a fresh session
+    /// against the new target instead of silently keeping the stale one alive
+    /// forever - see `BrokerSimRegistry::resolve`'s doc comment for the full
+    /// derivation of why this matters. **Stop and join, not `remove`
+    /// (2026-10-24, owner decision)**: `remove` also signals the old task to
+    /// stop (its per-task stop sender is dropped with the entry, even though
+    /// the collect task of a sibling connection whose settings did not change
+    /// still holds a clone of the old handle through the shared factory), but
+    /// does not wait - and the old task must have closed its socket before
+    /// the new session dials: a PLC that refuses a second connection on the
+    /// same port (R08: 10061) would otherwise refuse the new one. The wait is
+    /// bounded (a running job finishes within its job limit, queued jobs are
+    /// answered with `TaskGone`, a pending dial is aborted, the goodbye is
+    /// bounded by `banto_broker::DISCONNECT_LIMIT`); until the collector
+    /// commit replaces the changed connection's collect task, that task reads
+    /// through the stopped handle and reads Bad. [`Self::rollback_broker_sessions`]
+    /// runs this same fn, so a rollback stops and joins the same way.
     ///
     /// The stale ids are returned, not removed here - [`Self::rebuild`]
     /// only calls [`Self::remove_stale_broker_sessions`] with them AFTER the
@@ -1815,7 +1829,7 @@ impl CollectorManager {
     /// whether it changed. [`Self::rebuild`] feeds every entry into
     /// `banto_collect::CollectorConfig::set_broker_dial_target` - necessary
     /// because `BrokerSimRegistry::resolve`'s `changed`-triggered
-    /// `sessions.remove` + re-`ensure_connection` swaps the broker session
+    /// `sessions.stop_and_join` + re-`ensure_connection` swaps the broker session
     /// underneath a connection, but does NOT by itself make the running
     /// collect task notice: `Collector::apply_config` only rebuilds a
     /// connection's task (and therefore its captured `ClientFactory`/handle)
@@ -1956,7 +1970,7 @@ impl CollectorManager {
             // value layer's `SimDevice` when `conn.simulation`, R2b-5b)
             // BEFORE ensure_connection - see this fn's own doc comment and
             // `BrokerSimRegistry::resolve`'s doc comment for why the ordering
-            // and the `changed`-triggered `sessions.remove` matter. There is
+            // and the `changed`-triggered `sessions.stop_and_join` matter. There is
             // no "protocol without a simulator" any more: every
             // broker-managed protocol can be simulated, so `resolve` always
             // answers (the `None` branch of R2b-3a-3 is gone).
@@ -1966,7 +1980,9 @@ impl CollectorManager {
                 .await;
             wanted_ids.insert(conn.id);
             if changed {
-                self.sessions.remove(conn.id);
+                // 2026-10-24 (owner decision): stop AND join the old task, not
+                // just `remove` it - see this fn's doc comment.
+                self.sessions.stop_and_join(conn.id).await;
             }
             let key = format!("conn:{}", conn.id);
             // R2b-3a-3: the fingerprint of the session (not just its
@@ -4068,6 +4084,116 @@ mod tests {
         manager.shutdown().await;
         drop(pool);
         drop(dir);
+    }
+
+    /// 2026-10-24 (owner decision): when a connection's settings fingerprint
+    /// changes, the session sync stops AND joins the old broker task before
+    /// ensuring the new one (`HubSessions::stop_and_join`, not `remove`).
+    /// Other clones of the old handle outlive the sync - the collector hands
+    /// every task of a generation the same factory, so the collect task of B
+    /// (whose settings did not change) still holds A's old handle. Dropping
+    /// the entry signals the old task to stop but does not wait, and the old
+    /// task must not still hold its socket while A's new session dials: a
+    /// PLC that refuses a second connection on the same port (R08: 10061)
+    /// would refuse the new one. B's session is not touched.
+    ///
+    /// A current-thread runtime makes the check deterministic: the old task can
+    /// only run its teardown while the sync itself awaits it, so "Stopped"
+    /// right after the sync returns (no await in between) proves the join.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_changed_connection_has_its_old_session_joined_before_the_new_one() {
+        let (_dir, manager, pool) = manager_env().await;
+        let a = seed_collected_connection(&manager, "a", "modbus-tcp", 15101).await;
+        let b = seed_collected_connection(&manager, "b", "modbus-tcp", 15102).await;
+        sqlx::query("UPDATE plc_connections SET simulation = 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager.rebuild().await.expect("first rebuild");
+
+        let old_a = manager.sessions().handle_for(a).expect("A has a session");
+        let old_b = manager.sessions().handle_for(b).expect("B has a session");
+        let wait = Duration::from_secs(5);
+        for handle in [&old_a, &old_b] {
+            let mut rx = handle.status_watch();
+            tokio::time::timeout(
+                wait,
+                rx.wait_for(|s| *s == BrokerConnectionStatus::Connected),
+            )
+            .await
+            .expect("connected")
+            .unwrap();
+        }
+
+        // Only A's settings change (its port).
+        manager
+            .plc_connections()
+            .update(
+                a,
+                PlcConnectionInput {
+                    name: "a".to_string(),
+                    protocol: "modbus-tcp".to_string(),
+                    host: "127.0.0.1".to_string(),
+                    port: 15103,
+                    unit_id: 1,
+                    enabled: true,
+                    simulation: true,
+                    word_order: "low_high".to_string(),
+                    cpu_type: None,
+                    database: None,
+                    username: None,
+                    secrets: Default::default(),
+                    settings: None,
+                },
+            )
+            .await
+            .unwrap();
+        let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+        let (handles, stale, _targets, _routed) =
+            manager.sync_broker_sessions_from(&snapshot).await;
+
+        // `old_a` (like B's collect task) still holds the old handle here.
+        assert_eq!(
+            *old_a.status_watch().borrow(),
+            BrokerConnectionStatus::Stopped,
+            "the old session of the changed connection must be joined by the sync"
+        );
+        assert!(stale.is_empty(), "{stale:?}");
+        assert!(handles.contains_key(&format!("conn:{a}")));
+        let new_a = manager
+            .sessions()
+            .handle_for(a)
+            .expect("A has a new session");
+        assert_ne!(new_a.settings_fingerprint(), old_a.settings_fingerprint());
+        assert_eq!(
+            *old_b.status_watch().borrow(),
+            BrokerConnectionStatus::Connected,
+            "the unchanged connection keeps its session"
+        );
+        assert_eq!(
+            manager
+                .sessions()
+                .handle_for(b)
+                .unwrap()
+                .settings_fingerprint(),
+            old_b.settings_fingerprint()
+        );
+
+        // The whole rebuild converges: A's new session comes up, B's stays.
+        manager.rebuild().await.expect("second rebuild");
+        let mut rx = new_a.status_watch();
+        tokio::time::timeout(
+            wait,
+            rx.wait_for(|s| *s == BrokerConnectionStatus::Connected),
+        )
+        .await
+        .expect("A's new session connects")
+        .unwrap();
+        assert_eq!(
+            manager.broker_status(b),
+            Some(BrokerConnectionStatus::Connected)
+        );
+        manager.shutdown().await;
     }
 
     /// #807 P2: a connection collected with `simulation = true` is switched
