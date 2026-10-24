@@ -280,25 +280,21 @@ export function buildDriverSettings(
 	return settings;
 }
 
-function camelToSnake(name: string): string {
-	return name.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`);
-}
-
 /**
- * サーバーの項目エラーを欄の key へ写す。`settings.<key>` と、サーバーが camelCase で返す
- * `unitId`・`wordOrder`・`cpuType`（→ `unit_id` など）と、そのままの `<key>` を欄に当てる。
+ * サーバーの `settings.<key>` を欄の key へ写す。postgres の旧入口だけは
+ * `allowBareKeys` を使って `<key>` も受ける。
  * 当たらないもの（`name`・`protocol` など）は `other` に残す。
  */
 export function mapSettingsFieldErrors(
 	keys: readonly string[],
-	fieldErrors: Record<string, string>
+	fieldErrors: Record<string, string>,
+	allowBareKeys = false
 ): { fields: Record<string, string>; other: Record<string, string> } {
 	const fields: Record<string, string> = {};
 	const other: Record<string, string> = {};
 	for (const [field, message] of Object.entries(fieldErrors)) {
-		const stripped = field.startsWith('settings.') ? field.slice('settings.'.length) : field;
-		const key = [stripped, camelToSnake(stripped)].find((k) => keys.includes(k));
-		if (key !== undefined) {
+		const key = field.startsWith('settings.') ? field.slice('settings.'.length) : field;
+		if (keys.includes(key) && (field.startsWith('settings.') || allowBareKeys)) {
 			fields[key] = fields[key] ? `${fields[key]} / ${message}` : message;
 		} else {
 			other[field] = message;

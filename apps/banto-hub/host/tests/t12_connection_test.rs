@@ -35,6 +35,11 @@ use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
 use banto_collect::{BackoffConfig, CollectorOptions};
+use banto_driver_api::{
+    AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverEntry, DriverId,
+    FatalError, FieldError, FieldKind, FrameConnection, FrameDriver, SettingField, Settings,
+    SettingsSchema, TagKind,
+};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
@@ -69,6 +74,49 @@ const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
 /// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
 const TEMP_ENV_PREFIX: &str = "banto-hub-t12-it";
+
+/// 組み込み Modbus の文法・設定を使い、必須の秘密の欄だけを足すテスト専用ドライバ。
+struct RequiredSecretDriver {
+    descriptor: DriverDescriptor,
+    delegate: DriverEntry,
+}
+
+impl DriverBase for RequiredSecretDriver {
+    fn descriptor(&self) -> &DriverDescriptor {
+        &self.descriptor
+    }
+    fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
+        self.delegate.base().validate_config(settings)
+    }
+    fn secret_keys(&self) -> Vec<String> {
+        vec!["token".into()]
+    }
+    fn settings_schema(&self) -> SettingsSchema {
+        let mut schema = self.delegate.base().settings_schema();
+        schema
+            .fields
+            .push(SettingField::new("token", "トークン", FieldKind::secret()).required());
+        schema
+    }
+    fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
+        self.delegate.base().parse_address(text, kind)
+    }
+    fn offset_address(&self, text: &str, kind: &TagKind, n: i64) -> Result<String, AddressError> {
+        self.delegate.base().offset_address(text, kind, n)
+    }
+    fn address_help(&self) -> String {
+        self.delegate.base().address_help()
+    }
+}
+
+impl FrameDriver for RequiredSecretDriver {
+    fn create_connection(
+        &self,
+        _settings: &Settings,
+    ) -> Result<Box<dyn FrameConnection>, FatalError> {
+        panic!("必須 Secret の保存テストは接続しない")
+    }
+}
 
 fn fast_options() -> CollectorOptions {
     CollectorOptions {
@@ -187,6 +235,10 @@ impl Drop for TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
+    test_app_with_secret_driver(label, false).await
+}
+
+async fn test_app_with_secret_driver(label: &str, with_secret_driver: bool) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -221,9 +273,25 @@ async fn test_app(label: &str) -> TestApp {
         .expect("admin login");
     let auth_for_test = auth.clone();
 
+    let mut drivers = common::hub_drivers();
+    if with_secret_driver {
+        let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
+        Arc::get_mut(&mut drivers.registry)
+            .unwrap()
+            .register(DriverEntry::frame(Arc::new(RequiredSecretDriver {
+                descriptor: DriverDescriptor::new(
+                    DriverId::new("secret-test").unwrap(),
+                    "0.0.0-test",
+                    "必須 Secret のテスト",
+                    Capabilities::READ_WRITE,
+                ),
+                delegate,
+            })))
+            .unwrap();
+    }
     let sessions = Arc::new(HubSessions::new(
         banto_broker::BackoffConfig::default(),
-        common::hub_drivers(),
+        drivers,
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
@@ -269,7 +337,7 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users.clone(),
         audit,
-        PlcConnectionService::new(pool.clone()),
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -985,7 +1053,7 @@ async fn the_connection_test_refuses_unknown_keys_wrong_types_and_the_flat_shape
     assert_eq!(body["ok"], false, "{body:?}");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(
-        message.contains("port") && message.contains("cpu_type"),
+        message.contains("settings.port: ") && message.contains("settings.cpu_type: "),
         "{message}"
     );
     assert_eq!(sim.connection_count(), 0, "no dial");
@@ -1000,6 +1068,114 @@ async fn the_connection_test_refuses_unknown_keys_wrong_types_and_the_flat_shape
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     sim.stop();
+}
+
+/// R2b-7b: 公開 REST の作成・更新・接続テストは機器ドライバの欄を
+/// `settings.<key>`（スキーマの snake_case）で返す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn driver_connection_field_errors_use_settings_keys() {
+    let app = test_app("t12-settings-field-errors").await;
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({
+            "name": "bad-driver",
+            "protocol": "modbus-tcp",
+            "enabled": false,
+            "settings": { "port": "502", "unit_id": 256, "unexpected": true }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    let fields: Vec<&str> = body["field_errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|error| error["field"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        fields,
+        [
+            "settings.host",
+            "settings.port",
+            "settings.unit_id",
+            "settings.unexpected"
+        ]
+    );
+
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({
+            "name": "driver-for-update",
+            "protocol": "modbus-tcp",
+            "enabled": false,
+            "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 1 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let id = body["id"].as_i64().unwrap();
+    let (status, body) = admin_write(
+        &app.router,
+        "PUT",
+        &format!("/api/plc-connections/{id}"),
+        &app.admin_token,
+        json!({
+            "name": "driver-for-update",
+            "protocol": "modbus-tcp",
+            "enabled": false,
+            "settings": { "host": "127.0.0.1", "port": 70000, "unit_id": 1 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["field_errors"][0]["field"], "settings.port");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_required_driver_secret_is_reported_as_a_settings_field() {
+    let app = test_app_with_secret_driver("t12-required-secret", true).await;
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({
+            "name": "needs-token",
+            "protocol": "secret-test",
+            "enabled": false,
+            "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 1 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(
+        body["field_errors"][0]["field"], "settings.token",
+        "{body:?}"
+    );
+    assert_eq!(body["field_errors"][0]["message"], "必須です", "{body:?}");
+
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({
+            "protocol": "secret-test",
+            "simulation": false,
+            "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 1 }
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("settings.token: 必須です"), "{message}");
 }
 
 // ---------------------------------------------------------------------------

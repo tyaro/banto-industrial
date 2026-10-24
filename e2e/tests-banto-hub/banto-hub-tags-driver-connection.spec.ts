@@ -150,6 +150,56 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
 	});
 
+	test('サーバーの settings.<key> のエラーを再設定の欄の下に出す', async () => {
+		const connections = await page.request.get('/api/plc-connections', { headers });
+		const saved = ((await connections.json()) as ConnectionRow[]).some((c) => c.name === CONN);
+		if (!saved) {
+			const created = await page.request.post('/api/plc-connections', {
+				headers,
+				data: {
+					name: CONN,
+					protocol: 'slmp',
+					enabled: false,
+					simulation: false,
+					settings: { host: '10.0.0.7', port: 5200, cpu_type: 'Q' }
+				}
+			});
+			expect(created.status()).toBe(200);
+		}
+		await page.goto('/tags');
+		await page
+			.getByRole('tree')
+			.getByRole('button', { name: new RegExp(`^${CONN}`) })
+			.click({ button: 'right' });
+		await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+		const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
+		await expect(drawer).toBeVisible();
+		await drawer.getByLabel('ホスト').fill('10.0.0.8');
+		await page.route('**/api/plc-connections/*', async (route) => {
+			if (route.request().method() !== 'PUT') return route.continue();
+			await route.fulfill({
+				status: 422,
+				contentType: 'application/json',
+				body: JSON.stringify({
+					kind: 'validation',
+					message: '接続設定が不正です',
+					field_errors: [{ field: 'settings.cpu_type', message: 'サーバーで断りました' }]
+				})
+			});
+		});
+		try {
+			const rejected = page.waitForResponse(
+				(response) =>
+					response.url().includes('/api/plc-connections/') && response.request().method() === 'PUT'
+			);
+			await drawer.getByRole('button', { name: '保存', exact: true }).click();
+			expect((await rejected).status()).toBe(422);
+			await expect(drawer.getByText('サーバーで断りました')).toBeVisible();
+		} finally {
+			await page.unroute('**/api/plc-connections/*');
+		}
+	});
+
 	test('6. 一覧の取得に失敗したまま名前だけ変えて保存しても settings は変わらない', async () => {
 		const res = await page.request.get('/api/plc-connections', { headers });
 		const before = ((await res.json()) as ConnectionRow[]).find((c) => c.name === CONN);

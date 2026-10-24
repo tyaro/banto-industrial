@@ -49,10 +49,14 @@ pub struct PlcConnectionPayload {
 }
 
 /// 秘密のキーの値の項目エラー（値は載せない）。
-fn secret_field_error(key: &str, message: impl Into<String>) -> BantoError {
+fn secret_field_error(protocol: &str, key: &str, message: impl Into<String>) -> BantoError {
     BantoError::Validation {
         field_errors: vec![FieldError {
-            field: key.to_string(),
+            field: if protocol == banto_tags::POSTGRES_PROTOCOL {
+                key.to_string()
+            } else {
+                format!("settings.{key}")
+            },
             message: message.into(),
         }],
     }
@@ -86,12 +90,14 @@ impl PlcConnectionPayload {
             if let Some(sealed) = sealed.remove(key) {
                 if value.is_some() {
                     return Err(secret_field_error(
+                        &self.protocol,
                         key,
                         "未適用キューの提案に平文と封印した値の両方があります",
                     ));
                 }
                 if secrets.open(key, &sealed).is_err() {
                     return Err(secret_field_error(
+                        &self.protocol,
                         key,
                         "未適用キューの提案の秘密値をこの PC で読めません（提案を破棄して、\
                          値を入れ直して作り直してください）",
@@ -109,18 +115,23 @@ impl PlcConnectionPayload {
                     changes.insert(key.clone(), banto_tags::SecretChange::Clear);
                 }
                 Some(serde_json::Value::String(plain)) => {
-                    let sealed = secrets
-                        .seal(key, &plain)
-                        .map_err(|error| secret_field_error(key, error.to_string()))?;
+                    let sealed = secrets.seal(key, &plain).map_err(|error| {
+                        secret_field_error(&self.protocol, key, error.to_string())
+                    })?;
                     changes.insert(key.clone(), banto_tags::SecretChange::Set(sealed.into()));
                 }
                 Some(_) => {
-                    return Err(secret_field_error(key, "文字列か null で指定してください"));
+                    return Err(secret_field_error(
+                        &self.protocol,
+                        key,
+                        "文字列か null で指定してください",
+                    ));
                 }
             }
         }
         if let Some(key) = sealed.keys().next() {
             return Err(secret_field_error(
+                &self.protocol,
                 key,
                 format!("{} 接続では {key} を指定できません", self.protocol),
             ));
@@ -164,14 +175,18 @@ impl PlcConnectionPayload {
                     self.settings.insert(key.clone(), serde_json::Value::Null);
                 }
                 Some(serde_json::Value::String(plain)) => {
-                    let value = secrets
-                        .seal(key, plain)
-                        .map_err(|error| secret_field_error(key, error.to_string()))?;
+                    let value = secrets.seal(key, plain).map_err(|error| {
+                        secret_field_error(&self.protocol, key, error.to_string())
+                    })?;
                     self.settings.remove(key);
                     sealed.insert(key.clone(), crate::secrets::sealed_password_json(&value));
                 }
                 Some(_) => {
-                    return Err(secret_field_error(key, "文字列か null で指定してください"));
+                    return Err(secret_field_error(
+                        &self.protocol,
+                        key,
+                        "文字列か null で指定してください",
+                    ));
                 }
             }
         }
@@ -935,7 +950,9 @@ pub(super) async fn requested_settings(
                 && matches!(field.kind, banto_driver_api::FieldKind::Secret)
                 && settings.get(field.key.as_str()).is_none()
         })
-        .map(|field| banto_driver_api::FieldError::new(field.key.as_str(), "必須です"))
+        .map(|field| {
+            banto_driver_api::FieldError::new(format!("settings.{}", field.key), "必須です")
+        })
         .collect();
     if !missing.is_empty() {
         return Err(refused_settings(&missing));
@@ -951,17 +968,26 @@ pub(super) async fn requested_settings(
 /// 欄(`host`・`port`・`unit_id`)は従来の直接ダイヤルの範囲検査と同じ
 /// `"tcp"`、それ以外(CPU 種別など)は `"protocol"`。
 fn refused_settings(errors: &[banto_driver_api::FieldError]) -> PlcConnectionTestError {
-    let kind = if errors
-        .iter()
-        .all(|e| matches!(e.key.as_str(), keys::HOST | keys::PORT | keys::UNIT_ID))
-    {
+    let kind = if errors.iter().all(|e| {
+        matches!(
+            e.key.strip_prefix("settings.").unwrap_or(&e.key),
+            keys::HOST | keys::PORT | keys::UNIT_ID
+        )
+    }) {
         "tcp"
     } else {
         "protocol"
     };
     let detail = errors
         .iter()
-        .map(|e| format!("{}: {}", e.key, e.message))
+        .map(|e| {
+            let field = if e.key.starts_with("settings.") {
+                e.key.clone()
+            } else {
+                format!("settings.{}", e.key)
+            };
+            format!("{field}: {}", e.message)
+        })
         .collect::<Vec<_>>()
         .join("、");
     test_error(kind, format!("接続設定が不正です({detail})。"))
@@ -1258,6 +1284,7 @@ mod frame_connection_tests {
         descriptor: DriverDescriptor,
         echo: EchoFrameDriver,
         creates: Arc<AtomicUsize>,
+        required_token: bool,
     }
     impl DriverBase for ProbeFrameDriver {
         fn descriptor(&self) -> &DriverDescriptor {
@@ -1270,11 +1297,22 @@ mod frame_connection_tests {
         /// unit_id, like `banto-driver-modbus`).
         fn settings_schema(&self) -> banto_driver_api::SettingsSchema {
             use banto_driver_api::{FieldKind, SettingField, SettingsSchema};
-            SettingsSchema::new(vec![
+            let mut fields = vec![
                 SettingField::new("host", "ホスト", FieldKind::host()).required(),
                 SettingField::new("port", "ポート", FieldKind::integer(1, 65_535)).required(),
                 SettingField::new("unit_id", "ユニットID", FieldKind::integer(0, 255)).default(1),
-            ])
+            ];
+            if self.required_token {
+                fields.push(SettingField::new("token", "トークン", FieldKind::secret()).required());
+            }
+            SettingsSchema::new(fields)
+        }
+        fn secret_keys(&self) -> Vec<String> {
+            if self.required_token {
+                vec!["token".into()]
+            } else {
+                Vec::new()
+            }
         }
         fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
             let mut address = self.echo.parse_address(text, kind)?;
@@ -1311,6 +1349,16 @@ mod frame_connection_tests {
         sqlx::SqlitePool,
         Arc<AtomicUsize>,
     ) {
+        fixture_with_secret(false).await
+    }
+    async fn fixture_with_secret(
+        required_token: bool,
+    ) -> (
+        CollectorManager,
+        Arc<HubSessions>,
+        sqlx::SqlitePool,
+        Arc<AtomicUsize>,
+    ) {
         let pool = crate::db::init_db_memory().await.unwrap();
         let creates = Arc::new(AtomicUsize::new(0));
         let echo = EchoFrameDriver::new();
@@ -1323,6 +1371,7 @@ mod frame_connection_tests {
                 descriptor,
                 echo,
                 creates: creates.clone(),
+                required_token,
             })))
             .unwrap();
         let sessions = Arc::new(HubSessions::new(
@@ -1383,6 +1432,22 @@ mod frame_connection_tests {
             "Frame must reach validation, not unknown protocol"
         );
         assert!(error.message.contains("port"), "{error:?}");
+        assert_eq!(creates.load(Ordering::SeqCst), 0);
+        manager.shutdown().await;
+        sessions.shutdown().await;
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn connection_test_names_a_missing_required_secret_under_settings() {
+        let (manager, sessions, pool, creates) = fixture_with_secret(true).await;
+        let response = run_plc_connection_test(&manager, &payload(502)).await;
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert!(
+            error.message.contains("settings.token: 必須です"),
+            "{error:?}"
+        );
         assert_eq!(creates.load(Ordering::SeqCst), 0);
         manager.shutdown().await;
         sessions.shutdown().await;
