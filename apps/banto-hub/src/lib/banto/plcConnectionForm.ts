@@ -14,26 +14,13 @@
  * 2. **新規作成時の連番名プリフィル**（TAG-UX-8「空欄で出さず
  *    `connection1` のように、既存の接続名と衝突しない最小の連番を初期値に
  *    入れる」）: {@link nextConnectionName}。
- * 3. **プロトコルに応じた既定ポートの追従**（実装指示「プロトコルを
- *    切り替えたときポートが未編集（既定値のまま）なら追従させ、ユーザーが
- *    明示的に編集した後は勝手に上書きしないこと」）: {@link DEFAULT_PORTS}・
- *    {@link defaultPortFor}・{@link isDefaultPortForProtocol}。
- *
- *    既定値の根拠: `modbus-tcp` = 502 は本ページの旧実装が使っていた値
- *    （デバッグしやすさを優先した既存の選定、docs/plan.md I2 の判断を踏襲）。
- *    `slmp` = 5007 は `crates/banto-plc/src/slmp/mod.rs`
- *    `SlmpConfig::default()` が使う値（同ファイルのコメント曰く
- *    「SLMPのポートに普遍的な既定は無いが、5007はラップ元クレートの
- *    サンプル値でありバイナリ4Eフレームでよく使われる」）。テスト環境の
- *    実機 R08ENCPU は `192.168.11.200:5200` だが、これは実機固有の値であり
- *    既定値には採用しない（実装指示のとおり）。
- * 4. **プロトコルに応じた既定ワード順の追従**（2026-09-08 オーナー決定、
- *    issue #325 の修正 - ポートの追従（上記3）と同じ「未編集なら追従、
- *    明示的に編集した後は上書きしない」方式）: {@link DEFAULT_WORD_ORDERS}・
- *    {@link defaultWordOrderFor}・{@link isDefaultWordOrderForProtocol}。
- *    `modbus-tcp` = `high_low`（Modbus/IEEE慣習に統一 - 収集ポーリング経路と
- *    read-on-demand/書き込み経路とでワード順の解釈が食い違っていた実バグの
- *    是正）、`slmp` = `low_high`（MELSEC標準、従来どおり変更無し）。
+ * 3. **ドライバの接続設定**（R2b-6c、docs/banto-hub-driver-ui-design.md §6）: 機器の
+ *    ドライバ（`GET /api/drivers`）の欄はスキーマから組み立てる。既定値・検査・送る
+ *    `settings`・ドライバを替えたときの引き継ぎは `driverSettingsForm.ts`（このモジュールは
+ *    それを `driver` の欄として持つだけ）。プロトコルごとの既定ポート・既定のワード順の表は
+ *    持たない（スキーマの `default` が正）。
+ * 4. **ホストの接続 `postgres` の設定**: `settings` の `host`・`port`・`database`・
+ *    `username` と秘密の `password`（tri-state: {@link passwordForSubmit}）。
  * 5. **取り込み口 `push` の設定**（R2a-2e、docs/banto-hub-ingest-design.md
  *    §3.2・§7.1）: `stale_timeout_ms` とブリッジの区画（読む `postgres` 接続・
  *    クエリ・列とキーの対応）のフォーム状態と `settings` の JSON の往復
@@ -45,14 +32,21 @@
  *    シミュレーションを持たない（サーバーが正規化する、§3.1）。
  */
 import type {
-	CpuType,
+	DriverInfo,
 	PlcConnection,
 	PlcConnectionInput,
 	PlcProtocol,
 	PushBridgeColumnWire,
-	PushSettingsWire,
-	WordOrder
+	PushSettingsWire
 } from './tagRegistryAdmin';
+import {
+	buildDriverSettings,
+	defaultDriverState,
+	driverStateFromSettings,
+	switchDriverState,
+	type DriverFormState,
+	type SecretStateName
+} from './driverSettingsForm';
 import { nextSequentialName } from './sequentialName';
 import { bridgeLoad, type BridgeLoad } from './bridgeLoad';
 
@@ -73,113 +67,51 @@ const POSTGRES_PROTOCOL: PlcProtocol = 'postgres';
 /** R2a-2e: `tagRegistryAdmin.ts::PUSH_PROTOCOL` と同じ値（上の `POSTGRES_PROTOCOL` と同じ理由で複製）。 */
 const PUSH_PROTOCOL: PlcProtocol = 'push';
 
-// "virtual" is intentionally NOT offered here — the two virtual connections
-// (calc/mem) are auto-provisioned by the backend, not created through this
-// form (plc-connections/+page.svelte の元コメントを踏襲)。
-//
-// S1（docs/banto-hub-external-db-design.md §4.1・§6-4）: 'postgres'
-// （PostgreSQL への DB Source 接続）はここに追加する - PLC ではないが、
-// 案A（既存3階層の流用、design §3.1）どおり同じ plc_connections
-// テーブル・同じ作成 Drawer から作る。
-export const PROTOCOL_OPTIONS: { value: PlcProtocol; label: string }[] = [
-	{ value: 'modbus-tcp', label: 'Modbus TCP' },
-	{ value: 'slmp', label: 'SLMP（MELSEC）' },
-	{ value: 'postgres', label: 'PostgreSQL（DB Source）' },
-	// R2a-2e（docs/banto-hub-ingest-design.md §3.1）: 取り込み口。送り手（DB
-	// ブリッジ・スクリプト）が Hub へ値を送る接続で、接続先を持たない。
-	{ value: 'push', label: '取り込み（push・送り手が値を送る）' }
-];
+/** `postgres` の既定ポート（`GET /api/drivers` に載らないホストの接続なので、ここで持つ）。 */
+export const DEFAULT_POSTGRES_PORT = 5432;
 
 /**
- * プロトコルごとの既定ポート。上のモジュール doc comment に根拠を記載。
- * `virtual` はここに含めない（新規作成の選択肢に出さないプロトコルであり、
- * ポートの意味を持たない接続のため）。`postgres` = 5432 は PostgreSQL の
- * 標準ポート（design §4.2）。
+ * プロトコルの選択肢: `GET /api/drivers` のドライバ（`displayName`）に、ホストの接続
+ * （`postgres`・`push`）を足す。"virtual"（calc/mem）はバックエンドが自動で作るので出さない。
  */
-export const DEFAULT_PORTS: Record<'modbus-tcp' | 'slmp' | 'postgres', number> = {
-	'modbus-tcp': 502,
-	slmp: 5007,
-	postgres: 5432
-};
-
-function hasDefaultPort(protocol: PlcProtocol): protocol is keyof typeof DEFAULT_PORTS {
-	return protocol === 'modbus-tcp' || protocol === 'slmp' || protocol === POSTGRES_PROTOCOL;
+export function protocolOptions(
+	drivers: readonly Pick<DriverInfo, 'id' | 'displayName'>[]
+): { value: PlcProtocol; label: string }[] {
+	return [
+		...drivers.map((d) => ({ value: d.id, label: d.displayName })),
+		{ value: POSTGRES_PROTOCOL, label: 'PostgreSQL（DB Source）' },
+		// R2a-2e（docs/banto-hub-ingest-design.md §3.1）: 取り込み口。送り手（DB
+		// ブリッジ・スクリプト）が Hub へ値を送る接続で、接続先を持たない。
+		{ value: PUSH_PROTOCOL, label: '取り込み（push・送り手が値を送る）' }
+	];
 }
 
-/** `protocol` の既定ポート。`virtual` など既定を持たないプロトコルは `undefined`。 */
-export function defaultPortFor(protocol: PlcProtocol): number | undefined {
-	return hasDefaultPort(protocol) ? DEFAULT_PORTS[protocol] : undefined;
-}
-
-/**
- * `port`（フォームの文字列値）が `protocol` の既定ポートと一致しているか。
- * 「まだユーザーが明示的に編集していない（＝既定値のまま）」の判定に使う —
- * `ConnectionDrawer.svelte` はこれを使って、フォームを開いた時点や
- * プロトコル切り替え時に「ポート追従」を続けてよいかどうかの初期値
- * （`portTouched`）を決める。
- */
-export function isDefaultPortForProtocol(port: string, protocol: PlcProtocol): boolean {
-	const def = defaultPortFor(protocol);
-	return def !== undefined && port === String(def);
-}
-
-/**
- * プロトコルごとの既定ワード順（2026-09-08 オーナー決定、issue #325 の修正）。
- * `modbus-tcp` = `high_low`（Modbus/IEEE 慣習に統一 - 収集ポーリング経路が
- * 常に HighLow 固定で読んでいたのに read-on-demand/書き込み経路は列の値
- * （旧既定 `low_high`）を読んでいたため、同じ u32/f32 タグが経路によって
- * ワード反転して食い違う実バグがあった。migration で既存 modbus-tcp 行も
- * `high_low` へ backfill 済み）。`slmp` = `low_high`（MELSEC標準、従来どおり
- * 変更無し）。`virtual`/`postgres` はワード順を持たない
- * （{@link hasDefaultPort}と同じ形の判定 - `tagRegistryAdmin.ts::hasWordOrder`
- * 参照）。
- */
-export const DEFAULT_WORD_ORDERS: Record<'modbus-tcp' | 'slmp', WordOrder> = {
-	'modbus-tcp': 'high_low',
-	slmp: 'low_high'
-};
-
-function hasDefaultWordOrder(protocol: PlcProtocol): protocol is keyof typeof DEFAULT_WORD_ORDERS {
-	return protocol === 'modbus-tcp' || protocol === 'slmp';
-}
-
-/** `protocol` の既定ワード順。既定を持たないプロトコル（virtual/postgres）は `undefined`。 */
-export function defaultWordOrderFor(protocol: PlcProtocol): WordOrder | undefined {
-	return hasDefaultWordOrder(protocol) ? DEFAULT_WORD_ORDERS[protocol] : undefined;
-}
-
-/**
- * `wordOrder`（フォームの現在値）が `protocol` の既定ワード順と一致しているか。
- * `isDefaultPortForProtocol` と同じ役割 - `ConnectionDrawer.svelte` はこれを
- * 使って、フォームを開いた時点やプロトコル切り替え時に「ワード順追従」を
- * 続けてよいかどうかの初期値（`wordOrderTouched`）を決める。
- */
-export function isDefaultWordOrderForProtocol(
-	wordOrder: WordOrder,
+/** `protocol` のドライバ（ホストの接続・未知のプロトコルは `undefined`）。 */
+export function driverFor(
+	drivers: readonly DriverInfo[],
 	protocol: PlcProtocol
-): boolean {
-	const def = defaultWordOrderFor(protocol);
-	return def !== undefined && wordOrder === def;
+): DriverInfo | undefined {
+	return drivers.find((d) => d.id === protocol);
 }
 
 /**
- * フォームを開いた時点で「ユーザーがワード順を明示的に選んだ状態」とみなすか
- * （`ConnectionDrawer.svelte` の `wordOrderTouched` の初期値）。`true` を返すと
- * 以後プロトコルを切り替えてもワード順は追従しなくなる。
- *
- * `virtual`/`postgres` は**ワード順の欄がそもそもフォームに出ない**
- * （`hasWordOrder` 参照）ので、保存されている値が何であれ「ユーザーは触って
- * いない」= `false` とする。ここを
- * `!isDefaultWordOrderForProtocol(...)` だけで決めると、既定を持たない
- * プロトコルでは常に `true` になり、そこから `modbus-tcp` へ切り替えたときに
- * 既定ワード順の追従が効かない - 例えば既存の postgres 接続（DB 上は
- * `word_order='low_high'` 固定）を Modbus に変更すると、ユーザーがワード順を
- * 触らない限り `low_high` のまま保存され、Modbus の既定 `high_low`
- * （2026-09-08 オーナー決定）と食い違う。
+ * プロトコルを替えたときのドライバの欄。ドライバ → ドライバは「同じキーで利用者が触った欄の
+ * 値だけ引き継ぎ、他は新しいスキーマの既定で埋め直す」、ホストの接続 → ドライバは既定で埋める。
+ * ドライバでない行き先なら今の状態をそのまま返す（戻ったときのため）。
  */
-export function initialWordOrderTouched(wordOrder: WordOrder, protocol: PlcProtocol): boolean {
-	if (defaultWordOrderFor(protocol) === undefined) return false;
-	return !isDefaultWordOrderForProtocol(wordOrder, protocol);
+export function driverStateAfterProtocolChange(
+	drivers: readonly DriverInfo[],
+	from: PlcProtocol,
+	to: PlcProtocol,
+	state: DriverFormState
+): DriverFormState {
+	const next = driverFor(drivers, to);
+	if (!next) return state;
+	const prev = driverFor(drivers, from);
+	return switchDriverState(
+		prev ? { fields: prev.settingsSchema.fields, state } : null,
+		next.settingsSchema.fields
+	);
 }
 
 /**
@@ -225,14 +157,18 @@ export const MAX_USERNAME_LEN = 128;
 export interface PlcConnectionFormState {
 	name: string;
 	protocol: PlcProtocol;
+	/** `postgres` の `host`・`port`（ドライバの欄は {@link driver} が持つ）。 */
 	host: string;
 	port: string;
-	unitId: string;
 	enabled: boolean;
 	simulation: boolean;
-	wordOrder: WordOrder;
-	/** #605: SLMP の CPU 種別。プロトコルを切り替えても値は残す。 */
-	cpuType: CpuType;
+	/** 機器のドライバの欄（`protocol` がドライバのときだけ意味を持つ）。 */
+	driver: DriverFormState;
+	/**
+	 * 編集を始めたときの保存済みの `settings`（応答のまま。新規作成は `null`）。ドライバのスキーマが
+	 * 分からないまま保存しても `settings`（丸ごと置き換え）が空にならないよう、そのまま送り返すのに使う。
+	 */
+	savedSettings: Record<string, unknown> | null;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB 名。 */
 	database: string;
 	/** S1: `protocol === 'postgres'` のときだけ意味を持つ。DB ユーザー名。 */
@@ -250,9 +186,11 @@ export interface PlcConnectionFormState {
 	/**
 	 * S1: 「パスワードを消去する」チェックボックス（編集フォームのみ表示）。
 	 * `true` のとき `passwordForSubmit` は `password` 欄の中身を無視して
-	 * 常に空文字列（=消去）を送る。
+	 * `null`（=消去）を送る。
 	 */
 	clearPassword: boolean;
+	/** 保存済みのパスワードの状態（応答の `settings.password` の `$secret`。値は持たない）。 */
+	passwordState: SecretStateName;
 	/**
 	 * R2a-2e: `protocol === 'push'` のときだけ意味を持つ。送り手が黙ってから
 	 * Down とみなすまで（ms、§4.3）。空欄は既定（{@link DEFAULT_STALE_TIMEOUT_MS}）。
@@ -316,30 +254,28 @@ export function blankBridgeQuery(existing: readonly BridgeQueryFormState[]): Bri
  * 副作用なく完結させたいので）呼び出し側（`ConnectionDrawer.svelte`）が
  * `blankForm()` の直後に `nextConnectionName()` の結果を代入する。
  */
-export function blankConnectionForm(): PlcConnectionFormState {
+export function blankConnectionForm(drivers: readonly DriverInfo[]): PlcConnectionFormState {
+	// 新規作成の既定のプロトコルは `GET /api/drivers` の先頭（読めなければ空 - 呼び出し側が
+	// 一覧の失敗をエラーとして出す）。
+	const first = drivers[0];
 	return {
 		name: '',
-		// バックエンドの既定（PlcConnectionPayload の default_plc_protocol）
-		// と一致させる。
-		protocol: 'modbus-tcp',
+		protocol: first?.id ?? '',
 		host: '',
-		port: String(DEFAULT_PORTS['modbus-tcp']),
-		unitId: '1',
+		port: String(DEFAULT_POSTGRES_PORT),
 		enabled: true,
 		simulation: false,
-		// 2026-09-08 オーナー決定（issue #325 の修正）: プロトコルごとの既定
-		// ワード順（{@link DEFAULT_WORD_ORDERS}）に一致させる - ここでの既定
-		// protocol は 'modbus-tcp' なので、その既定 'high_low' を使う。
-		wordOrder: DEFAULT_WORD_ORDERS['modbus-tcp'],
-		cpuType: 'R',
+		driver: defaultDriverState(first?.settingsSchema.fields ?? []),
 		database: '',
 		username: '',
 		password: '',
 		clearPassword: false,
+		passwordState: 'none',
 		staleTimeoutMs: '',
 		bridgeEnabled: false,
 		bridgeDbConnectionId: '',
-		bridgeQueries: []
+		bridgeQueries: [],
+		savedSettings: null
 	};
 }
 
@@ -347,43 +283,56 @@ export function blankConnectionForm(): PlcConnectionFormState {
  * 保存済み接続をフォーム状態へ変換する（編集フォームの初期値）。
  * S1: `password`は常に空文字列で返す（上の`PlcConnectionFormState::password`
  * の doc comment参照 - 保存済みのパスワードを画面に出さない）。
+ * ドライバの欄は、`settings` に無い欄がスキーマの既定になる（`settings` は丸ごと置き換え）。
  */
-export function connectionToForm(c: PlcConnection): PlcConnectionFormState {
+export function connectionToForm(
+	c: PlcConnection,
+	drivers: readonly DriverInfo[]
+): PlcConnectionFormState {
+	const driver = driverFor(drivers, c.protocol);
+	const settings = c.settings ?? {};
+	const isPostgres = c.protocol === POSTGRES_PROTOCOL;
 	return {
 		name: c.name,
 		protocol: c.protocol,
-		host: c.host,
-		port: String(c.port),
-		unitId: String(c.unitId),
+		host: isPostgres && typeof settings.host === 'string' ? settings.host : '',
+		port:
+			isPostgres && settings.port !== undefined
+				? String(settings.port)
+				: String(DEFAULT_POSTGRES_PORT),
 		enabled: c.enabled,
 		simulation: c.simulation,
-		wordOrder: c.wordOrder,
-		cpuType: c.cpuType,
-		database: c.database ?? '',
-		username: c.username ?? '',
+		driver: driverStateFromSettings(driver?.settingsSchema.fields ?? [], driver ? settings : {}),
+		savedSettings: { ...settings },
+		database: isPostgres && typeof settings.database === 'string' ? settings.database : '',
+		username: isPostgres && typeof settings.username === 'string' ? settings.username : '',
 		password: '',
 		clearPassword: false,
-		...pushFormFromSettings(c.protocol === PUSH_PROTOCOL ? c.settings : null)
+		passwordState: isPostgres ? secretStateOf(settings.password) : 'none',
+		...pushFormFromSettings(c.protocol === PUSH_PROTOCOL ? (settings as PushSettingsWire) : null)
 	};
 }
 
+/** 応答の `{"$secret": …}` を状態に（無ければ `none`）。 */
+function secretStateOf(value: unknown): SecretStateName {
+	if (typeof value !== 'object' || value === null) return 'none';
+	const state = (value as { $secret?: unknown }).$secret;
+	return state === 'unreadable' ? 'unreadable' : state === 'set' ? 'set' : 'none';
+}
+
 /**
- * S1: `form.password`/`form.clearPassword` から`PlcConnectionInput::password`
- * の tri-state を組み立てる - mirrors
- * `banto_tags::PlcConnectionInput::password`のdoc comment（create/updateで
- * 意味が違う点も含め）。
+ * S1: `form.password`/`form.clearPassword` から `settings.password` の tri-state を組み立てる
+ * （設計 §5。秘密のキーの規則）。
  *
- * - `clearPassword` が `true`: 常に `""`（消去。update専用の意味だが、
- *   create側は`""`も「パスワード無し」として扱うので同じ値で安全）。
- * - `password` が空文字列（未入力）: `undefined` を返す - update では
- *   「現在のパスワードを変更しない」、create では「パスワード無し」と、
- *   どちらの意味でも安全な既定値になる。
+ * - `clearPassword` が `true`: `null`（消す）。
+ * - `password` が空文字列（未入力）: `undefined` = キーを送らない（更新では保存済みを保つ、
+ *   作成では「パスワード無し」）。
  * - それ以外（非空文字列を入力）: その値をそのまま返す（置き換え/新規設定）。
  */
 export function passwordForSubmit(
 	form: Pick<PlcConnectionFormState, 'password' | 'clearPassword'>
-): string | undefined {
-	if (form.clearPassword) return '';
+): string | null | undefined {
+	if (form.clearPassword) return null;
 	return form.password === '' ? undefined : form.password;
 }
 
@@ -429,42 +378,113 @@ export function validatePostgresFields(
  * 指定を拒否するため、そもそも送らないのが最も安全 -
  * `validatePostgresFields`のdoc comment参照）。
  */
-export function formToConnectionInput(form: PlcConnectionFormState): PlcConnectionInput {
+export function formToConnectionInput(
+	form: PlcConnectionFormState,
+	drivers: readonly DriverInfo[]
+): PlcConnectionInput {
 	if (form.protocol === PUSH_PROTOCOL) {
-		// R2a-2e: push は接続先を持たない（サーバーが host "" / port 0 / 既定へ
-		// 正規化する、§3.1）。`settings` は常に送る（update の省略は「保存済みの
-		// 値を保つ」なので、フォームでブリッジを外したことが伝わるように）。
+		// R2a-2e: push は接続先を持たない。`settings` は丸ごと置き換えなので、フォームで
+		// ブリッジを外したことが伝わる。
 		return {
 			name: form.name,
 			protocol: form.protocol,
-			host: '',
-			port: 0,
-			unitId: 1,
 			enabled: form.enabled,
 			simulation: false,
-			wordOrder: form.wordOrder,
-			cpuType: form.cpuType,
-			settings: pushSettingsFromForm(form)
+			settings: { ...pushSettingsFromForm(form) }
 		};
 	}
-	const base: PlcConnectionInput = {
+	if (form.protocol === POSTGRES_PROTOCOL) {
+		const settings: Record<string, unknown> = {
+			host: form.host.trim(),
+			port: Number(form.port),
+			database: form.database,
+			username: form.username
+		};
+		const password = passwordForSubmit(form);
+		if (password !== undefined) settings.password = password;
+		return {
+			name: form.name,
+			protocol: form.protocol,
+			enabled: form.enabled,
+			simulation: false,
+			settings
+		};
+	}
+	return {
 		name: form.name,
 		protocol: form.protocol,
-		host: form.host,
-		port: Number(form.port),
-		unitId: Number(form.unitId),
 		enabled: form.enabled,
 		simulation: form.simulation,
-		wordOrder: form.wordOrder,
-		cpuType: form.cpuType
+		settings: driverSettingsForSubmit(form, drivers)
 	};
-	if (form.protocol !== POSTGRES_PROTOCOL) return base;
-	return {
-		...base,
-		database: form.database,
-		username: form.username,
-		password: passwordForSubmit(form)
-	};
+}
+
+/**
+ * ドライバの接続の `settings` の決め方。スキーマがあれば欄から組む。スキーマが分からない
+ * （一覧の取得に失敗した・一覧に無いプロトコル）ときは、`settings` が丸ごと置き換えなので
+ * 保存済みをそのまま送り返す（秘密 `{"$secret": …}` のキーは落とす = 省略 = 保存済みを保つ）。
+ * 保存済みも無ければ `{}`。
+ */
+export function driverSettingsForSubmit(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	drivers: readonly DriverInfo[]
+): Record<string, unknown> {
+	const driver = driverFor(drivers, form.protocol);
+	if (driver) return buildDriverSettings(driver.settingsSchema.fields, form.driver.values);
+	const settings: Record<string, unknown> = {};
+	for (const [key, value] of Object.entries(form.savedSettings ?? {})) {
+		const isSecret = typeof value === 'object' && value !== null && '$secret' in value;
+		if (!isSecret) settings[key] = value;
+	}
+	return settings;
+}
+
+/**
+ * 一覧の再取得に成功したとき、スキーマが無いまま開いた編集フォームのドライバの欄を、保存済みの
+ * `settings` から作り直す。対象でなければ `null`（編集対象の保存済みのプロトコルと同じで、欄が
+ * まだスキーマから作られていない（values が空）ときだけ）。
+ */
+export function rebuiltDriverState(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	savedProtocol: string | null,
+	drivers: readonly DriverInfo[]
+): DriverFormState | null {
+	if (savedProtocol === null || form.savedSettings === null) return null;
+	if (form.protocol !== savedProtocol) return null;
+	if (Object.keys(form.driver.values).length > 0) return null;
+	const driver = driverFor(drivers, form.protocol);
+	if (!driver) return null;
+	return driverStateFromSettings(driver.settingsSchema.fields, form.savedSettings);
+}
+
+/** {@link driverFieldsOnLoad} の結果。差し替えるのはドライバの欄（と空だったプロトコル）だけ。 */
+export interface DriverFieldsPatch {
+	/** 空だったプロトコルを先頭のドライバで埋めるときだけ入る。 */
+	protocol?: PlcProtocol;
+	driver: DriverFormState;
+}
+
+/**
+ * ドライバの一覧の読み込みが成功したとき、フォームのどこを差し替えるか（利用者が触った他の欄は
+ * 触らない。開いた時点で一覧が無くても初期化は済んでいる）。
+ *
+ * - 新規作成（`savedProtocol` が `null`）: プロトコルがまだ空なら先頭のドライバを入れて既定で
+ *   埋める。既に何か（postgres・push を含む）選んでいれば `null`。
+ * - 編集: {@link rebuiltDriverState} と同じ（保存済みと同じプロトコルで欄が空のとき、保存済みの
+ *   settings から作る）。
+ */
+export function driverFieldsOnLoad(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	savedProtocol: string | null,
+	drivers: readonly DriverInfo[]
+): DriverFieldsPatch | null {
+	if (savedProtocol === null) {
+		const first = drivers[0];
+		if (form.protocol !== '' || !first) return null;
+		return { protocol: first.id, driver: defaultDriverState(first.settingsSchema.fields) };
+	}
+	const rebuilt = rebuiltDriverState(form, savedProtocol, drivers);
+	return rebuilt ? { driver: rebuilt } : null;
 }
 
 // --- R2a-2e: 取り込み口 `push` の設定（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
@@ -744,7 +764,9 @@ export function pushBridgesReferencing(
 ): string[] {
 	return connections
 		.filter(
-			(c) => c.protocol === PUSH_PROTOCOL && c.settings?.bridge?.db_connection_id === connectionId
+			(c) =>
+				c.protocol === PUSH_PROTOCOL &&
+				(c.settings as PushSettingsWire | undefined)?.bridge?.db_connection_id === connectionId
 		)
 		.map((c) => c.name);
 }

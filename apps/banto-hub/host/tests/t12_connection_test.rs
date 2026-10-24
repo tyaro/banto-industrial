@@ -1092,7 +1092,8 @@ async fn drivers_list_has_the_device_drivers_in_registry_order_and_no_host_conne
         .collect();
     // The registry's order (`DriverRegistry::ids()`); `postgres`・`push`・`virtual`
     // (`HostProvided`) are registered by `hub_drivers()` but not listed.
-    assert_eq!(ids, ["modbus-tcp", "slmp"]);
+    // SLMP first (2026-10-24 owner decision): `banto_drivers::builtin()` registers it first.
+    assert_eq!(ids, ["slmp", "modbus-tcp"]);
     let registry_ids: Vec<String> = app
         .manager
         .registry()
@@ -1107,7 +1108,7 @@ async fn drivers_list_has_the_device_drivers_in_registry_order_and_no_host_conne
     }
 
     // The shape, fixed for the generic form (6c).
-    let modbus = &body[0];
+    let modbus = &body[1];
     let keys: Vec<&str> = modbus
         .as_object()
         .unwrap()
@@ -1171,7 +1172,7 @@ async fn drivers_list_has_the_device_drivers_in_registry_order_and_no_host_conne
     assert_eq!(fields[3]["default"], json!("high_low"));
     assert_eq!(fields[3]["group"], json!("advanced"));
 
-    let slmp = &body[1];
+    let slmp = &body[0];
     assert_eq!(slmp["kind"], json!("frame"));
     assert_eq!(
         slmp["supportedKinds"],

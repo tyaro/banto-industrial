@@ -39,7 +39,7 @@ import { deferredDelete } from './deferredDelete.svelte';
  * `banto_tags::PUSH_PROTOCOL`）。R2a-2b のキーの画面（`apiKeyScopes.ts`）は
  * 文字列で比べていたので、ここで型に足す。
  */
-export type PlcProtocol = 'modbus-tcp' | 'slmp' | 'virtual' | 'postgres' | 'push';
+export type PlcProtocol = string;
 
 /**
  * S1: mirrors `banto_tags::plc_connection::POSTGRES_PROTOCOL`。この文字列を
@@ -88,101 +88,6 @@ export interface PushSettingsWire {
 }
 
 /**
- * P3-b（監査指摘 2026-08-12）: PLC接続のワード順（32bit値/64bit値の上位/下位
- * ワードの並び）— mirrors `banto_plc::decode::WordOrder`（`banto_tags::PlcConnection`
- * では検証済みの文字列として保存される。`ALLOWED_WORD_ORDERS` 参照）。
- * `"modbus-tcp"`/`"slmp"` 接続でのみ意味を持つ（virtual/postgres では
- * 無意味 — `unitId` と同じ扱い）。
- *
- * 2026-09-08 オーナー決定（issue #325 の修正に伴う整理）:
- * 当初 `SlmpWordOrder` という名前だったが、SLMP専用ではなく modbus-tcp
- * 接続にも同じ意味で存在する（従来は UI が modbus-tcp では出さず常に既定値
- * `low_high` のまま保存していたが、Rust側の収集ポーリング経路は modbus-tcp
- * を常に `high_low` 固定で読んでいたため、read-on-demand/書き込み経路との
- * ワード順不一致で u32/f32 タグが化ける実バグがあった）。型名を `WordOrder`
- * に改名し、UI 側も modbus-tcp で編集可能にした。#325 で追加された
- * `i64`/`u64`/`f64`（4レジスタ=64bit値、modbus-tcp専用）にも同じワード順が
- * 適用される。
- */
-export type WordOrder = 'low_high' | 'high_low';
-
-/**
- * ワード順のセレクト肢 — mirrors `banto_tags::plc_connection::ALLOWED_WORD_ORDERS`。
- * 既定はプロトコルにより異なる（2026-09-08 オーナー決定）: `slmp` は
- * `low_high`（MELSEC標準、D0=下位/D1=上位、従来どおり）、`modbus-tcp` は
- * `high_low`（Modbus/IEEE慣習に統一 - 上のモジュール doc comment 参照）。
- * `#lib/banto/plcConnectionForm.ts::DEFAULT_WORD_ORDERS` 参照。
- */
-export const WORD_ORDER_OPTIONS: { value: WordOrder; label: string }[] = [
-	{ value: 'low_high', label: 'low_high（MELSEC標準）' },
-	{ value: 'high_low', label: 'high_low（Modbus/IEEE慣習）' }
-];
-
-/** #605: SLMP の CPU 種別。既定は `R`（iQ-R）。Q シリーズは `Q`。 */
-export type CpuType = 'Q' | 'R';
-
-export const CPU_TYPE_OPTIONS: { value: CpuType; label: string }[] = [
-	{ value: 'R', label: 'iQ-R（R）' },
-	{ value: 'Q', label: 'Qシリーズ（Q）' }
-];
-
-/**
- * Mirrors `banto_tags::PlcConnection`.
- *
- * **R2b-6b-2（#813）の後、今の REST の形とは合っていない**（REST は
- * {@link PlcConnectionWire} の `{ id, name, protocol, enabled, simulation, settings }`）。
- * 接続のフォーム（`ConnectionDrawer.svelte`・`plcConnectionForm.ts`）がまだこの平らな形を
- * 使うので **6c で {@link PlcConnectionWire} に置き換える**まで残す
- * （docs/banto-hub-driver-ui-design.md §5・§6）。設定パッケージは 6b-3 で新しい形に移った。
- */
-export interface PlcConnection {
-	id: number;
-	name: string;
-	protocol: PlcProtocol;
-	host: string;
-	port: number;
-	unitId: number;
-	enabled: boolean;
-	/**
-	 * T9-2 (docs/ux-plan.md §1): 接続単位のシミュレーションモード。true の間、
-	 * 実PLCの代わりに内蔵シミュレータへ接続する（開発・検証用、本番非推奨）。
-	 */
-	simulation: boolean;
-	/** P3-b（監査指摘 2026-08-12）。{@link WordOrder}参照。 */
-	wordOrder: WordOrder;
-	/** #605: SLMP の CPU 種別。SLMP 以外の行も列は持つ（既定 `R`）。 */
-	cpuType: CpuType;
-	/**
-	 * S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: `protocol ===
-	 * 'postgres'` 接続が対象とする DB 名。他プロトコルでは常に `null` -
-	 * mirrors `banto_hub_core::rest::PlcConnectionResponse::database`。
-	 */
-	database: string | null;
-	/** S1: `protocol === 'postgres'` 接続が使う DB ユーザー名。他プロトコルでは常に `null`。 */
-	username: string | null;
-	/**
-	 * S1: `true` なら非空のパスワードが保存されている（値そのものは
-	 * サーバーが決して返さない - `PlcConnectionResponse::password_set`の
-	 * doc comment参照）。`ConnectionDrawer.svelte`の「パスワード: 設定済み/
-	 * 未設定」表示に使う。
-	 */
-	passwordSet: boolean;
-	/**
-	 * R2b-1e（設計 §5.5）: パスワードの状態。`unreadable` は保存した値をこの PC で
-	 * 読めない（別の PC へ移した等）。古いサーバーは返さないので省略を許し、
-	 * 無いときは `passwordSet` で判断する（`secretStorageView.passwordStatusView`）。
-	 */
-	passwordState?: 'none' | 'set' | 'unreadable';
-	/**
-	 * R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`
-	 * （既定のままなら `null`。他プロトコルでは常に `null`）- mirrors
-	 * `banto_hub_core::rest::PlcConnectionResponse::settings`。古いサーバーは
-	 * 項目を返さないので省略も許す。
-	 */
-	settings?: PushSettingsWire | null;
-}
-
-/**
  * T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): the two reserved
  * `protocol: "virtual"` connections `banto-hub` auto-provisions at startup
  * (`bin/banto-hub.rs::ensure_virtual_connection`) — `calc` hosts every
@@ -217,72 +122,6 @@ export function isPushConnection(conn: Pick<PlcConnection, 'protocol'>): boolean
 }
 
 /**
- * 2026-09-08 オーナー決定: `wordOrder` が意味を持つプロトコル判定
- * （`modbus-tcp`/`slmp` のみ - `virtual`/`postgres` では `unitId` と同じく
- * 無意味）。`ConnectionDrawer.svelte` のフィールド出し分けが使う - 以前は
- * `slmp` のみだったが、issue #325 の修正で `modbus-tcp` にも UI から
- * ワード順を設定できるようにした。
- */
-export function hasWordOrder(conn: Pick<PlcConnection, 'protocol'>): boolean {
-	return conn.protocol === 'modbus-tcp' || conn.protocol === 'slmp';
-}
-
-/**
- * 平らな作成・更新の形（R2b-6b-2 より前の `PlcConnectionPayload`）。**今の REST は受けない**
- * （{@link PlcConnectionWireInput} の形だけ）。フォームが使うので 6c で置き換えるまで残す
- * （{@link PlcConnection} の doc）。
- */
-export interface PlcConnectionInput {
-	name: string;
-	protocol: PlcProtocol;
-	host: string;
-	port: number;
-	unitId: number;
-	enabled: boolean;
-	/** T9-2 (docs/ux-plan.md §1). See {@link PlcConnection.simulation}. */
-	simulation: boolean;
-	/** P3-b（監査指摘 2026-08-12）. See {@link PlcConnection.wordOrder}. */
-	wordOrder: WordOrder;
-	/**
-	 * #605: SLMP の CPU 種別。省略時、作成は `R`、更新は既存の値を保つ
-	 * （この項目を知らないクライアントが Q を R に戻さない）。
-	 * フォームは常に送る。
-	 */
-	cpuType?: CpuType;
-	/**
-	 * S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: 'postgres'`
-	 * 接続の DB 名 - mirrors `banto_hub_core::rest::PlcConnectionPayload
-	 * ::database`。他プロトコルでは省略する（サーバーは非 postgres での指定を
-	 * 拒否する）。
-	 */
-	database?: string;
-	/** S1: `protocol: 'postgres'` 接続の DB ユーザー名。{@link database}と同じ省略時ルール。 */
-	username?: string;
-	/**
-	 * S1: `protocol: 'postgres'` 接続のパスワード（平文送信、TLS 越しの
-	 * HTTPS 前提は既存の CSRF/認証と同じ）。**create と update で意味が
-	 * 異なる tri-state** - mirrors `banto_hub_core::rest::PlcConnectionPayload
-	 * ::password`のdoc comment:
-	 * - create: 省略/空文字列はいずれも「パスワード無し」。
-	 * - update: 省略（キー自体を送らない = `undefined`）は「現在のパスワードを
-	 *   変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」。
-	 *
-	 * `#lib/banto/plcConnectionForm.ts::passwordForSubmit`がフォーム状態
-	 * からこの3値を組み立てる - 呼び出し側は生の `form.password`/
-	 * `form.clearPassword` をここへ直接詰めない。
-	 */
-	password?: string;
-	/**
-	 * R2a-2e: `protocol: 'push'` 接続の `settings`（§3.2）。他プロトコルでは
-	 * 省略する（サーバーは push 以外での指定を拒否する）。**create と update で
-	 * 意味が異なる**（`cpuType` と同じ）: 省略は create で既定、update で
-	 * 「保存済みの値を保つ」。オブジェクトは置き換え（`{}` でブリッジを外せる）。
-	 * フォーム（`plcConnectionForm.ts::formToConnectionInput`）は push では常に送る。
-	 */
-	settings?: PushSettingsWire;
-}
-
-/**
  * R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 応答の `settings` の秘密のキーの値
  * （`{"$secret": "set" | "unreadable"}`）。値・参照は返らない。値が無い秘密のキーは
  * `settings` に載らない - mirrors `banto_hub_core::rest::PlcConnectionResponse`。
@@ -303,9 +142,8 @@ export function isSecretStateWire(value: unknown): value is SecretStateWire {
  * `postgres` は `host`・`port`・`database`・`username` と秘密の `password`、`push` は
  * R2a の `settings`）。外側の camelCase と一律に変換しない。
  *
- * 6c で {@link PlcConnection} を置き換える（それまでは別名で並べる）。
  */
-export interface PlcConnectionWire {
+export interface PlcConnection {
 	id: number;
 	name: string;
 	/** ドライバの id（`GET /api/drivers` の `id`）またはホストの接続（`postgres`・`push`・`virtual`）。 */
@@ -321,7 +159,7 @@ export interface PlcConnectionWire {
  * 既定値）。秘密のキーだけ tri-state: 省略 = 保存済みを保つ、`null`・空文字 = 消す、
  * それ以外の文字列 = 置き換え。
  */
-export interface PlcConnectionWireInput {
+export interface PlcConnectionInput {
 	name: string;
 	protocol: string;
 	enabled: boolean;
@@ -838,45 +676,25 @@ function isQueuedWhileRunningBody(
 
 // --- PLC connections --------------------------------------------------------
 
-/** 平らな形の一覧（{@link PlcConnection} の doc。6c で {@link listPlcConnectionsWire} に置き換える）。 */
+/** R2b-6b: 一覧（{@link PlcConnection}）。 */
 export async function listPlcConnections(): Promise<PlcConnection[]> {
 	return httpRequest<PlcConnection[]>('/api/plc-connections', { method: 'GET' });
 }
 
-/** 平らな形の作成（今の REST は受けない。6c で {@link createPlcConnectionWire} に置き換える）。 */
+/** R2b-6b: 作成（{@link PlcConnectionInput}）。 */
 export async function createPlcConnection(input: PlcConnectionInput): Promise<PlcConnection> {
 	return httpRequest<PlcConnection>('/api/plc-connections', { method: 'POST', body: input });
 }
 
-/** 平らな形の更新（今の REST は受けない。6c で {@link updatePlcConnectionWire} に置き換える）。 */
+/**
+ * R2b-6b: 新しい形の更新。`settings` は丸ごと置き換え、秘密のキーを送らなければ保存済みを
+ * 保つ（{@link PlcConnectionInput}）。
+ */
 export async function updatePlcConnection(
 	id: number,
 	input: PlcConnectionInput
 ): Promise<PlcConnection> {
-	return httpRequest<PlcConnection>(`/api/plc-connections/${id}`, { method: 'PUT', body: input });
-}
-
-/** R2b-6b: 新しい形の一覧（{@link PlcConnectionWire}）。 */
-export async function listPlcConnectionsWire(): Promise<PlcConnectionWire[]> {
-	return httpRequest<PlcConnectionWire[]>('/api/plc-connections', { method: 'GET' });
-}
-
-/** R2b-6b: 新しい形の作成（{@link PlcConnectionWireInput}）。 */
-export async function createPlcConnectionWire(
-	input: PlcConnectionWireInput
-): Promise<PlcConnectionWire> {
-	return httpRequest<PlcConnectionWire>('/api/plc-connections', { method: 'POST', body: input });
-}
-
-/**
- * R2b-6b: 新しい形の更新。`settings` は丸ごと置き換え、秘密のキーを送らなければ保存済みを
- * 保つ（{@link PlcConnectionWireInput}）。
- */
-export async function updatePlcConnectionWire(
-	id: number,
-	input: PlcConnectionWireInput
-): Promise<PlcConnectionWire> {
-	return httpRequest<PlcConnectionWire>(`/api/plc-connections/${id}`, {
+	return httpRequest<PlcConnection>(`/api/plc-connections/${id}`, {
 		method: 'PUT',
 		body: input
 	});
@@ -1248,13 +1066,10 @@ export async function deleteTagsBatch(ids: number[]): Promise<BatchTagsDeleteRes
  */
 export interface PlcConnectionTestRequest {
 	protocol: PlcProtocol;
-	host: string;
-	port: number;
-	unitId: number;
 	simulation: boolean;
+	/** ドライバの `settings`（snake_case の JSON。秘密の欄は省略 = 保存済みから補う）。 */
+	settings: Record<string, unknown>;
 	connectionId?: number;
-	/** #605: 直接ダイヤル時の SLMP CPU 種別。省略は R。 */
-	cpuType?: CpuType;
 }
 
 /**

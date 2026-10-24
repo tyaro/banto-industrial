@@ -634,7 +634,7 @@ async fn message_differences_are_exactly_the_known_ones() {
         "wordOrder | ワード順は low_high, high_low のいずれかです | word_order は low_high / high_low のどちらかで指定してください",
         "cpuType | CPU種別は Q, R のいずれかです | cpu_type は Q / R のどちらかで指定してください",
         "settings.stale_timeout_ms | 1000〜3600000の範囲で入力してください | stale_timeout_ms は整数（ミリ秒）で指定してください",
-        "protocol | 対応プロトコルは modbus-tcp, slmp, virtual, postgres, hub, push のいずれかです | 対応プロトコルは modbus-tcp, postgres, push, slmp, virtual のいずれかです",
+        "protocol | 対応プロトコルは modbus-tcp, slmp, virtual, postgres, hub, push のいずれかです | 対応プロトコルは slmp, modbus-tcp, push, postgres, virtual のいずれかです",
     ]
     .into_iter()
     .map(str::to_string)

@@ -37,31 +37,17 @@ const CONN_A: PlcConnection = {
 	id: 1,
 	name: 'ConnA',
 	protocol: 'modbus-tcp',
-	host: '127.0.0.1',
-	port: 502,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	settings: {}
 };
 const CONN_B: PlcConnection = {
 	id: 2,
 	name: 'ConnB',
 	protocol: 'slmp',
-	host: '127.0.0.2',
-	port: 5000,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	settings: {}
 };
 // S3（docs/banto-hub-external-db-design.md §7 row S3）: postgres（DB
 // Source）接続のフィクスチャ - `tagKind=db` の配置規則テストに使う。
@@ -69,16 +55,9 @@ const CONN_PG: PlcConnection = {
 	id: 3,
 	name: 'ConnPg',
 	protocol: 'postgres',
-	host: '10.0.0.5',
-	port: 5432,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: 'appdb',
-	username: 'appuser',
-	passwordSet: true
+	settings: {}
 };
 const CONNECTIONS: PlcConnection[] = [CONN_A, CONN_B, CONN_PG];
 

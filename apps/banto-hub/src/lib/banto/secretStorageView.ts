@@ -3,18 +3,15 @@
  * 接続の秘密値（パスワード）まわりの表示文言の純関数。依存ゼロ
  * （`auditSpoolWarning.ts` と同じく vitest の最小構成で読めるようにしている）。
  *
- * サーバーの欄はどれも新しく足したもので、古いサーバーは返さない。欠けていても
- * 壊れないよう、すべて任意の欄として扱う。
+ * R2b-6c: 状態は応答の `settings.password` の `$secret`（平らな `passwordSet`・`passwordState` は
+ * 無くなった）。
  */
 
-/** 接続の `passwordState: "unreadable"` のときの文言（サーバーの `lastError` の頭と同じ）。 */
+/** 接続の秘密のキー（postgres の `password`）が `{"$secret": "unreadable"}` のときの文言（サーバーの `lastError` の頭と同じ）。 */
 export const PASSWORD_UNREADABLE_MESSAGE = 'パスワード: 読めません（この PC で再入力してください）';
 
-/** [`passwordStatusView`] が読む最小の形（`PlcConnection` は構造的に満たす）。 */
-export interface PasswordStatusSource {
-	passwordSet: boolean;
-	passwordState?: 'none' | 'set' | 'unreadable' | string;
-}
+/** 応答の `settings.password` の `$secret` の状態（値が載らなければ `none`）。 */
+export type PasswordState = 'none' | 'set' | 'unreadable';
 
 export interface PasswordStatusView {
 	/** ドロワーに出す 1 行。 */
@@ -24,17 +21,15 @@ export interface PasswordStatusView {
 }
 
 /**
- * ドロワーの「パスワード: …」行。`passwordState` があればそれを優先し、
- * 無い古い応答は `passwordSet` で今までどおり「設定済み/未設定」。
+ * ドロワーの「パスワード: …」行。応答の `settings.password` の `$secret` の状態
+ * （`plcConnectionForm.ts::connectionToForm` が `passwordState` に写す）から作る。
+ * 状態が無い（新規・保存前）は「未設定」。
  */
-export function passwordStatusView(connection: PasswordStatusSource | null): PasswordStatusView {
-	if (connection?.passwordState === 'unreadable') {
+export function passwordStatusView(state: PasswordState | null | undefined): PasswordStatusView {
+	if (state === 'unreadable') {
 		return { text: PASSWORD_UNREADABLE_MESSAGE, unreadable: true };
 	}
-	const set =
-		connection?.passwordState === 'set' ||
-		(connection?.passwordState !== 'none' && connection?.passwordSet === true);
-	return { text: `パスワード: ${set ? '設定済み' : '未設定'}`, unreadable: false };
+	return { text: `パスワード: ${state === 'set' ? '設定済み' : '未設定'}`, unreadable: false };
 }
 
 /** `GET /api/status` の `secretStorage`（管理系だけ）。 */
