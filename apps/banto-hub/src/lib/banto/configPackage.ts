@@ -7,13 +7,10 @@
 import type {
 	CollectionGroup,
 	CollectionGroupInput,
-	CpuType,
-	PlcConnection,
-	PlcConnectionInput,
-	PlcProtocol,
+	DriverInfo,
+	PlcConnectionWire,
 	PushBridgeQueryWire,
 	PushSettingsWire,
-	WordOrder,
 	StringEncoding,
 	Tag,
 	TagInput
@@ -23,6 +20,25 @@ import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
 
 /**
+ * 版 3（R2b-6b-3、docs/banto-hub-driver-ui-design.md §5・§7.1、Q11 (a)）: 接続を REST と
+ * 同じ `{ name, protocol, enabled, simulation, settings }` で持つ（版 2 の平らな `host`・
+ * `port`・`unitId`・`wordOrder`・`cpuType`・`database`・`username` は無くなった）。
+ * `settings` の中はドライバ・ホストの接続の JSON のまま（snake_case のキー）。
+ *
+ * - **秘密のキーは載せない**: 書き出しは応答の `{"$secret": …}` の値を落とす。読み込みは
+ *   `$secret` の形の値と、スキーマで `Secret` の欄（`postgres` の `password`）を断る。
+ * - **push のブリッジの読む DB は接続名で持ち運ぶ**（版 2 と同じ。`settings.bridge.
+ *   dbConnectionName`）。`settings` をそのまま写すと、接続 id の違う別の Hub で関係のない
+ *   PostgreSQL の接続を読むため（設計 §5）。
+ * - **欠けた欄は既定で埋めずに断る**（版 2 の `wordOrder`・`cpuType` と同じ考え方、§7.1 の
+ *   表の最後の行）: 書き出しが必ず書く欄（`Secret` 以外で、既定値を持つ欄と必須の欄）が
+ *   欠けた接続は断る。欄はドライバのスキーマ（`GET /api/drivers`）とホストの接続の表
+ *   （{@link HOST_CONNECTION_FIELDS}）から決めるので、読み込み（`parseConfigPackage`）の後に
+ *   {@link checkConfigPackageConnectionFields} で確かめる（`configPackageAdmin.ts` が呼ぶ）。
+ * - 版 1・2 のパッケージは読まない（使用者無しの前提、2026-10-22 オーナー）。
+ *
+ * 以下は版 2 の記録（グループ・タグの参照の形は版 3 でも同じ）。
+ *
  * 版 2（2026-10-19 オーナー決定）: 収集グループ名が「接続内で一意」になった
  * （banto-tags の migration 0022）ので、名前だけの参照では同じ名前のグループ・
  * タグを区別できない。グループは `(plcConnectionName, name)`、タグは
@@ -46,7 +62,7 @@ import type { SinkGroup, SinkGroupMode } from './sinkGroupsAdmin';
  * 項目なし・`null` を通し、値付きは拒否する（`rejectTagThresholds`）- 版 2 でも
  * 同じ。）
  */
-export const CONFIG_PACKAGE_SCHEMA_VERSION = 2 as const;
+export const CONFIG_PACKAGE_SCHEMA_VERSION = 3 as const;
 export const CONFIG_PACKAGE_PRODUCT = 'banto-hub' as const;
 
 export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
@@ -57,38 +73,27 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
 	'sessions',
 	'audit_logs',
 	'history',
-	// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: postgres 接続の
-	// パスワードは平文保存される秘密情報 - `mqtt.password`と同じ理由で
-	// export に含めない（`sanitizeConnection`が実際に落とす。ここでの
-	// 列挙は「除外した」ことを export 自体の中に明記するための一覧で、
-	// 実際の除外動作を担うわけではない - `mqtt.password`も同じ関係）。
-	'plc_connections.password'
+	// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: 接続の秘密のキー（`postgres` の
+	// パスワードなど、版 3 では `settings` の `{"$secret": …}` の値）- `mqtt.password`と同じ
+	// 理由で export に含めない（`sanitizeConnection`が実際に落とす。ここでの列挙は
+	// 「除外した」ことを export 自体の中に明記するための一覧で、実際の除外動作を担うわけでは
+	// ない - `mqtt.password`も同じ関係）。
+	'plc_connections.settings.$secret'
 ] as const;
 
 /**
- * S1: `PlcConnectionInput`から`password`を除いた形 - **export には絶対に
- * パスワードを乗せない**（`CONFIG_PACKAGE_EXCLUDED_SECRETS`の
- * `'plc_connections.password'`参照）。`sanitizeConnection`がこの型に
- * 詰め替える際、`password`フィールド自体を持たないこの型を使うことで
- * 「うっかり詰め忘れる」ではなく「そもそも代入できない」という形で
- * コンパイル時に保証する。
+ * 版 3: パッケージの接続 1 つ（REST の `PlcConnectionWireInput` と同じ形。id は持たない）。
+ * `settings` は秘密のキーを持たない（{@link CONFIG_PACKAGE_SCHEMA_VERSION} の doc）。
+ * `push` の `settings` は {@link ConfigPackagePushSettings}（ブリッジの読む DB は接続名）。
  */
-export type ConfigPackagePlcConnection = Omit<
-	PlcConnectionInput,
-	'password' | 'cpuType' | 'settings'
-> & {
-	/** 版 2 では必須（REST の作成・更新と違い「省略は既存を保つ」を持たない）。 */
-	cpuType: CpuType;
-	/**
-	 * R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: `push` 接続の
-	 * `settings`。export は push 接続で常に書き（既定のままなら `{}`）、他の
-	 * プロトコルでは書かない。ブリッジの読む DB は**接続名**
-	 * （`bridge.dbConnectionName`）で持ち運ぶ（sink group の `dbConnectionName` と
-	 * 同じ。id は環境をまたぐと変わる）。取り込みはパッケージの中の名前を、
-	 * 取り込み先で作成・更新した `postgres` 接続の id に付け直す。
-	 */
-	settings?: ConfigPackagePushSettings;
-};
+export interface ConfigPackagePlcConnection {
+	name: string;
+	/** ドライバの id（`modbus-tcp`・`slmp` …）またはホストの接続（`postgres`・`push`）。 */
+	protocol: string;
+	enabled: boolean;
+	simulation: boolean;
+	settings: Record<string, unknown>;
+}
 
 /** R2a-2e: パッケージの中の `settings.bridge`（`db_connection_id` の代わりに接続名）。 */
 export interface ConfigPackagePushBridge {
@@ -97,10 +102,22 @@ export interface ConfigPackagePushBridge {
 	queries: PushBridgeQueryWire[];
 }
 
-/** R2a-2e: パッケージの中の push 接続の `settings`（§3.2 の形。ブリッジは名前で参照）。 */
-export interface ConfigPackagePushSettings {
+/**
+ * R2a-2e: パッケージの中の push 接続の `settings`（§3.2 の形。ブリッジは名前で参照）。
+ * `ConfigPackagePlcConnection.settings` に入れるので `type` で書く（`interface` は
+ * `Record<string, unknown>` に代入できない）。
+ */
+export type ConfigPackagePushSettings = {
 	stale_timeout_ms?: number;
 	bridge?: ConfigPackagePushBridge;
+};
+
+/** 版 3: push 接続ならパッケージの `settings` のブリッジ（無ければ `undefined`）。 */
+export function configPackagePushBridge(
+	connection: Pick<ConfigPackagePlcConnection, 'protocol' | 'settings'>
+): ConfigPackagePushBridge | undefined {
+	if (connection.protocol !== 'push') return undefined;
+	return (connection.settings as ConfigPackagePushSettings).bridge;
 }
 
 export interface ConfigPackageCollectionGroup extends Omit<
@@ -264,7 +281,7 @@ export class ConfigPackageParseError extends Error {
 	}
 }
 
-function isVirtualConnection(connection: Pick<PlcConnection, 'protocol'>): boolean {
+function isVirtualConnection(connection: { protocol: string }): boolean {
 	return connection.protocol === 'virtual';
 }
 
@@ -352,32 +369,6 @@ function expectNullableNumber(value: unknown, path: string): number | null {
 }
 
 /**
- * `cpuType`（#605）は版 2 では必須で、`Q` / `R` のいずれか。省略・`null` は
- * 断る（REST の作成・更新は省略を許し「更新は既存の値を保つ」が、パッケージは
- * 常に export が全項目を書くので、ここで既定の `R` を入れると既存の Q 接続を
- * R に戻してしまう）。
- */
-function expectCpuType(value: unknown, path: string): CpuType {
-	if (value === 'Q' || value === 'R') return value;
-	throw new ConfigPackageParseError(`${path} は Q / R のいずれかである必要があります`);
-}
-
-/**
- * P3-b（監査指摘 2026-08-12）: `wordOrder` は版 2 では必須で、`low_high` /
- * `high_low` のいずれか。省略は断る（版 1 の間は省略時にプロトコル依存の既定
- * 値を入れていたが、2026-10-20 のオーナー決定で外した。export は常に書く）。
- *
- * この関数が返す型名は元 `SlmpWordOrder` から `WordOrder` に改名した
- * （SLMP専用ではなくなったため）。
- */
-function expectWordOrder(value: unknown, path: string): WordOrder {
-	if (value === 'low_high' || value === 'high_low') return value;
-	throw new ConfigPackageParseError(
-		`${path} は low_high / high_low のいずれかである必要があります`
-	);
-}
-
-/**
  * `stringEncoding` は版 2 では必須で、`utf8` / `shift_jis` のいずれか
  * （省略・`null` は断る。export は常に書く）。
  */
@@ -404,51 +395,41 @@ function ensureUniqueNames<T extends { name: string }>(items: readonly T[], path
 	}
 }
 
-function filterVirtualConnections(connections: readonly PlcConnection[]): PlcConnection[] {
+function filterVirtualConnections(connections: readonly PlcConnectionWire[]): PlcConnectionWire[] {
 	return connections.filter((connection) => !isVirtualConnection(connection));
 }
 
+/** 応答・パッケージの秘密のキーの値の形（`{"$secret": …}`。中身は問わない）。 */
+function isSecretShaped(value: unknown): boolean {
+	return isRecord(value) && !Array.isArray(value) && Object.hasOwn(value, '$secret');
+}
+
 /**
- * S1: `PlcConnection`（GET応答、`password`列を持たない - `passwordSet`の
- * みを持つ）から export 用の形へ詰め替える。`database`/`username`は
- * postgres 以外では常に`null`（`PlcConnectionResponse::from`参照）なので、
- * そのまま`undefined`に変換して非 postgres 接続の export 形を変えない
- * （`database`/`username`は postgres 接続でだけ意味を持つ項目で、
- * 省略を許す - `expectOptionalString`参照）。`password`はそもそも入力に存在しない（`PlcConnection`型に
- * フィールド自体が無い）ため、詰め忘れようがない。
+ * 版 3: 応答（`PlcConnectionWire`）から export の形へ。秘密のキーの値
+ * （`{"$secret": "set" | "unreadable"}`）は落とす - 値そのものはサーバーが返さないので、
+ * 載るのは状態だけだが、それも持ち運ばない（取り込み先では意味が無い）。push の
+ * `settings` はブリッジの `db_connection_id` を接続名に写す（{@link sanitizePushSettings}）。
  */
 function sanitizeConnection(
-	input: PlcConnection,
+	input: PlcConnectionWire,
 	connectionNameById: ReadonlyMap<number, string>
 ): ConfigPackagePlcConnection {
-	const {
-		name,
-		protocol,
-		host,
-		port,
-		unitId,
-		enabled,
-		simulation,
-		wordOrder,
-		cpuType,
-		database,
-		username
-	} = input;
+	const settings =
+		input.protocol === 'push'
+			? sanitizePushSettings(
+					input.name,
+					(input.settings ?? {}) as PushSettingsWire,
+					connectionNameById
+				)
+			: Object.fromEntries(
+					Object.entries(input.settings ?? {}).filter(([, value]) => !isSecretShaped(value))
+				);
 	return {
-		name,
-		protocol,
-		host,
-		port,
-		unitId,
-		enabled,
-		simulation,
-		wordOrder,
-		cpuType,
-		database: database ?? undefined,
-		username: username ?? undefined,
-		...(protocol === 'push'
-			? { settings: sanitizePushSettings(name, input.settings ?? null, connectionNameById) }
-			: {})
+		name: input.name,
+		protocol: input.protocol,
+		enabled: input.enabled,
+		simulation: input.simulation,
+		settings
 	};
 }
 
@@ -584,7 +565,7 @@ function sanitizeSinkGroup(
 }
 
 export function buildConfigPackage(input: {
-	plcConnections: readonly PlcConnection[];
+	plcConnections: readonly PlcConnectionWire[];
 	collectionGroups: readonly CollectionGroup[];
 	tags: readonly Tag[];
 	mqtt: MqttSettings;
@@ -679,70 +660,160 @@ export function serializeConfigPackage(pkg: ConfigPackage): string {
 }
 
 /**
- * S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`と
- * （S3）`querySql`は postgres 接続（配下のグループ）でだけ意味を持ち、サーバーは
- * 他のプロトコルでの指定を拒否する。このため版 2 でも省略／`null` を通し、
- * `undefined`にする（版 1 の互換とは無関係の、項目の性質）。値が存在する場合は
- * 文字列であることを検証する（postgres での必須チェックは`plcConnectionForm.ts
- * ::validatePostgresFields`と同じ内容をここでは行わない - configPackage の
- * パースは「形として妥当か」だけを見て、実際の作成/更新時のサーバー側
- * バリデーションに委ねる。他の`ConfigPackage*`パーサーも同じ方針
- * （例: `parseTags`が`tagKind`の placement ルールをサーバーに委ねるのと
- * 同じ）。
+ * S3（docs/banto-hub-external-db-design.md §4.2）: グループの `querySql` は postgres 接続の
+ * 配下でだけ意味を持ち、サーバーは他のプロトコルでの指定を拒否する。このため省略／`null` を
+ * 通し、`undefined`にする（項目の性質）。値が存在する場合は文字列であることを検証する
+ * （必須の判定はサーバー側のバリデーションに委ねる - configPackage のパースは「形として
+ * 妥当か」だけを見る。他の`ConfigPackage*`パーサーも同じ方針）。版 2 まで接続の
+ * `database`/`username` にも使っていたが、版 3 で接続の `settings` に移った。
  */
 function expectOptionalString(value: unknown, path: string): string | undefined {
 	if (value === undefined || value === null) return undefined;
 	return expectString(value, path);
 }
 
+/**
+ * 版 3: 接続の形だけを確かめる（`name`・`protocol`・`enabled`・`simulation` と、オブジェクトの
+ * `settings` は必須）。欄の有無はスキーマで決まるので、ここでは見ない
+ * （{@link checkConfigPackageConnectionFields}）。値の規則（範囲・選択肢）は取り込みの作成・
+ * 更新でサーバーが確かめる（他のパーサーと同じ「形として妥当か」だけの方針）。
+ *
+ * 秘密の値は断る: `$secret` の形の値は、書き出しが落とすので手で書いたパッケージだけに
+ * 現れる（黙って捨てると、取り込んだ側は秘密値が移ったと思い込む）。
+ */
 function parsePlcConnections(raw: unknown): ConfigPackagePlcConnection[] {
 	if (!Array.isArray(raw)) {
 		throw new ConfigPackageParseError('plcConnections は配列である必要があります');
 	}
 	return raw.map((entry, index) => {
-		const item = expectRecord(entry, `plcConnections[${index}]`);
-		const protocol = expectString(
-			item.protocol,
-			`plcConnections[${index}].protocol`
-		) as PlcProtocol;
-		if (
-			protocol !== 'modbus-tcp' &&
-			protocol !== 'slmp' &&
-			protocol !== 'virtual' &&
-			protocol !== 'postgres' &&
-			protocol !== 'push'
-		) {
-			throw new ConfigPackageParseError(
-				`plcConnections[${index}].protocol は modbus-tcp / slmp / virtual / postgres / push のいずれかである必要があります`
-			);
+		const path = `plcConnections[${index}]`;
+		const item = expectRecord(entry, path);
+		const protocol = expectString(item.protocol, `${path}.protocol`);
+		if (protocol === '') {
+			throw new ConfigPackageParseError(`${path}.protocol は空にできません`);
 		}
-		// R2a-2e: `settings` は push 接続でだけ意味を持つ（省略は既定）。他の
-		// プロトコルで値があれば断る（サーバーも断る。黙って捨てない）。
-		let settings: ConfigPackagePushSettings | undefined;
-		if (item.settings !== undefined && item.settings !== null) {
-			if (protocol !== 'push') {
-				throw new ConfigPackageParseError(
-					`plcConnections[${index}].settings は push 接続でだけ指定できます`
-				);
+		const rawSettings = item.settings;
+		if (!isRecord(rawSettings) || Array.isArray(rawSettings)) {
+			throw new ConfigPackageParseError(`${path}.settings はオブジェクトである必要があります`);
+		}
+		let settings: Record<string, unknown>;
+		if (protocol === 'push') {
+			settings = parsePushSettings(rawSettings, `${path}.settings`);
+		} else {
+			for (const [key, value] of Object.entries(rawSettings)) {
+				if (isSecretShaped(value)) {
+					throw new ConfigPackageParseError(
+						`${path}.settings.${key} は秘密の値です。構成パッケージは秘密の値を持ちません（取り込んだ後に画面で設定してください）`
+					);
+				}
 			}
-			settings = parsePushSettings(item.settings, `plcConnections[${index}].settings`);
-		} else if (protocol === 'push') {
-			settings = {};
+			settings = { ...rawSettings };
 		}
 		return {
-			name: expectString(item.name, `plcConnections[${index}].name`),
+			name: expectString(item.name, `${path}.name`),
 			protocol,
-			host: expectString(item.host, `plcConnections[${index}].host`),
-			port: expectInteger(item.port, `plcConnections[${index}].port`),
-			unitId: expectInteger(item.unitId, `plcConnections[${index}].unitId`),
-			enabled: expectBoolean(item.enabled, `plcConnections[${index}].enabled`),
-			simulation: expectBoolean(item.simulation, `plcConnections[${index}].simulation`),
-			wordOrder: expectWordOrder(item.wordOrder, `plcConnections[${index}].wordOrder`),
-			cpuType: expectCpuType(item.cpuType, `plcConnections[${index}].cpuType`),
-			database: expectOptionalString(item.database, `plcConnections[${index}].database`),
-			username: expectOptionalString(item.username, `plcConnections[${index}].username`),
-			...(settings !== undefined ? { settings } : {})
+			enabled: expectBoolean(item.enabled, `${path}.enabled`),
+			simulation: expectBoolean(item.simulation, `${path}.simulation`),
+			settings
 		};
+	});
+}
+
+/**
+ * 版 3: パッケージの欄の規則 1 つ（{@link checkConfigPackageConnectionFields}）。
+ * `mustWrite` = 書き出しが必ず書く欄（`Secret` 以外で、既定値を持つ欄と必須の欄）。
+ */
+export interface ConfigPackageFieldRule {
+	key: string;
+	mustWrite: boolean;
+	secret: boolean;
+}
+
+/**
+ * 版 3: ホストの接続（`GET /api/drivers` に載らない）の `settings` の欄 - mirrors
+ * `banto_tags::plc_connection::settings_input`（`postgres` は `host`・`port`・`database`・
+ * `username` を受け、`legacy::settings_from_flat` が `host`・`port` を必ず書き、検証が
+ * `database`・`username` を必須にする。`password` は秘密のキー）と
+ * `banto_tags::push::validate_push_settings`（`stale_timeout_ms`・`bridge` はどちらも任意で
+ * 既定の値を書かない。push の既定は `{}`）。`virtual` は書き出さないので表に無い。
+ */
+export const HOST_CONNECTION_FIELDS: Readonly<Record<string, readonly ConfigPackageFieldRule[]>> = {
+	postgres: [
+		{ key: 'host', mustWrite: true, secret: false },
+		{ key: 'port', mustWrite: true, secret: false },
+		{ key: 'database', mustWrite: true, secret: false },
+		{ key: 'username', mustWrite: true, secret: false },
+		{ key: 'password', mustWrite: false, secret: true }
+	],
+	push: [
+		{ key: 'stale_timeout_ms', mustWrite: false, secret: false },
+		{ key: 'bridge', mustWrite: false, secret: false }
+	]
+};
+
+function driverFieldRules(driver: DriverInfo): ConfigPackageFieldRule[] {
+	return driver.settingsSchema.fields.map((field) => {
+		const secret = field.kind.type === 'secret';
+		return {
+			key: field.key,
+			secret,
+			mustWrite: !secret && (field.required || (field.default ?? null) !== null)
+		};
+	});
+}
+
+/**
+ * 版 3（設計 §7.1 の表の最後の行）: パッケージの接続の `settings` を、取り込み先の
+ * ドライバのスキーマ（`drivers` = `GET /api/drivers`）とホストの接続の表
+ * （{@link HOST_CONNECTION_FIELDS}）で確かめる。**既定で埋めない**（サーバーの
+ * `settings_from_schema` の既定の補完を当てにすると、書き出した側の値と食い違っても
+ * 気づけない）。
+ *
+ * - 書き出しが必ず書く欄（`mustWrite`）が無い・`null` なら断る（欠けは手で書き換えた
+ *   パッケージだけ）。
+ * - `Secret` の欄があれば断る（パッケージは秘密値を持たない）。
+ * - `Secret` の欄と既定値の無い任意の欄は欠けてよい。表に無いキーはサーバーに任せる
+ *   （未知のキーはサーバーが断る）。
+ * - `virtual` は見ない（書き出さない。取り込みは警告を積んで飛ばす）。ドライバにも表にも
+ *   無いプロトコルは断る。
+ */
+export function checkConfigPackageConnectionFields(
+	pkg: Pick<ConfigPackage, 'plcConnections'>,
+	drivers: readonly DriverInfo[]
+): void {
+	const driverById = new Map(drivers.map((driver) => [driver.id, driver]));
+	pkg.plcConnections.forEach((connection, index) => {
+		const path = `plcConnections[${index}]`;
+		if (isVirtualConnection(connection)) return;
+		const driver = driverById.get(connection.protocol);
+		const rules = driver
+			? driverFieldRules(driver)
+			: Object.hasOwn(HOST_CONNECTION_FIELDS, connection.protocol)
+				? HOST_CONNECTION_FIELDS[connection.protocol]
+				: undefined;
+		if (!rules) {
+			const known = [...driverById.keys(), ...Object.keys(HOST_CONNECTION_FIELDS)].join(' / ');
+			throw new ConfigPackageParseError(
+				`${path}.protocol '${connection.protocol}' はこの banto-hub にありません（${known} のいずれかである必要があります）`
+			);
+		}
+		for (const rule of rules) {
+			const value = connection.settings[rule.key];
+			const present = value !== undefined && value !== null;
+			if (rule.secret) {
+				if (present) {
+					throw new ConfigPackageParseError(
+						`${path}.settings.${rule.key} は秘密の欄です。構成パッケージは秘密の値を持ちません（取り込んだ後に画面で設定してください）`
+					);
+				}
+				continue;
+			}
+			if (rule.mustWrite && !present) {
+				throw new ConfigPackageParseError(
+					`${path}.settings.${rule.key} がありません（接続 '${connection.name}'。既定値では埋めません。今の banto-hub で書き出し直してください）`
+				);
+			}
+		}
 	});
 }
 
@@ -1016,7 +1087,7 @@ function validateReferences(pkg: ConfigPackage): void {
 	// あること（名前で持ち運ぶので、ここで引けないと取り込み先で付け直せない）。
 	const protocolByName = new Map(pkg.plcConnections.map((c) => [c.name, c.protocol]));
 	pkg.plcConnections.forEach((connection, index) => {
-		const bridge = connection.settings?.bridge;
+		const bridge = configPackagePushBridge(connection);
 		if (!bridge) return;
 		const protocol = protocolByName.get(bridge.dbConnectionName);
 		if (protocol === undefined) {
@@ -1060,7 +1131,7 @@ function validateReferences(pkg: ConfigPackage): void {
 export function parseConfigPackage(text: string): ConfigPackage {
 	const root = expectRecord(JSON.parse(stripBom(text)), 'root');
 	if (root.schemaVersion !== CONFIG_PACKAGE_SCHEMA_VERSION) {
-		// 版 1（2026-10-19 より前の export）は読まない - 互換性は持たない
+		// 版 1・2（2026-10-24 より前の export）は読まない - 互換性は持たない
 		// （オーナー決定、`CONFIG_PACKAGE_SCHEMA_VERSION` の doc）。
 		throw new ConfigPackageParseError(
 			`schemaVersion ${String(root.schemaVersion)} は未対応です（期待値: ${CONFIG_PACKAGE_SCHEMA_VERSION}）。古い版の構成パッケージは読み込めません。今の banto-hub で書き出し直してください`

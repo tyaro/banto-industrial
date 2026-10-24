@@ -21,7 +21,8 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { ConfigPackage } from './configPackage';
 import { buildConfigPackage, parseConfigPackage, serializeConfigPackage } from './configPackage';
-import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
+import type { CollectionGroup, PlcConnectionWire, Tag } from './tagRegistryAdmin';
+import { FAKE_SECRET_DRIVER, TEST_DRIVERS } from './configPackageTestDrivers';
 
 // `vi.mock` ファクトリはファイル先頭に hoist されるため、参照するクラスは
 // `vi.hoisted` で一緒に巻き上げる必要がある（通常の top-level const/class
@@ -43,9 +44,16 @@ vi.mock('./tagRegistryAdmin', () => ({
 	QueuedWhileRunningError: MockQueuedWhileRunningError,
 	isQueuedWhileRunningError: isMockQueuedWhileRunningError,
 	isVirtualConnection: (c: { protocol: string }) => c.protocol === 'virtual',
-	listPlcConnections: vi.fn(),
-	createPlcConnection: vi.fn(),
-	updatePlcConnection: vi.fn(),
+	// 版 3: 本物と同じ判定（`configPackageAdmin.ts` がパスワードの状態を見るのに使う）。
+	isSecretStateWire: (value: unknown) =>
+		typeof value === 'object' &&
+		value !== null &&
+		Object.keys(value).length === 1 &&
+		Object.hasOwn(value, '$secret'),
+	listDrivers: vi.fn(),
+	listPlcConnectionsWire: vi.fn(),
+	createPlcConnectionWire: vi.fn(),
+	updatePlcConnectionWire: vi.fn(),
 	listCollectionGroups: vi.fn(),
 	createCollectionGroup: vi.fn(),
 	updateCollectionGroup: vi.fn(),
@@ -75,9 +83,10 @@ vi.mock('./sinkGroupsAdmin', () => ({
 }));
 
 import {
-	listPlcConnections,
-	createPlcConnection,
-	updatePlcConnection,
+	listDrivers,
+	listPlcConnectionsWire,
+	createPlcConnectionWire,
+	updatePlcConnectionWire,
 	listCollectionGroups,
 	createCollectionGroup,
 	updateCollectionGroup,
@@ -98,7 +107,7 @@ import {
 } from './configPackageAdmin';
 
 const pkg: ConfigPackage = {
-	schemaVersion: 2,
+	schemaVersion: 3,
 	product: 'banto-hub',
 	exportedAt: '2026-08-12T00:00:00.000Z',
 	excludedSecrets: [],
@@ -106,13 +115,9 @@ const pkg: ConfigPackage = {
 		{
 			name: 'plc1',
 			protocol: 'modbus-tcp',
-			host: '192.168.11.200',
-			port: 502,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R'
+			settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 		}
 	],
 	collectionGroups: [
@@ -170,21 +175,14 @@ const currentMqtt = {
 	minIntervalMs: 1000
 };
 
-function plcConnection(id: number, name: string): PlcConnection {
+function plcConnection(id: number, name: string): PlcConnectionWire {
 	return {
 		id,
 		name,
 		protocol: 'modbus-tcp',
-		host: '192.168.11.200',
-		port: 502,
-		unitId: 1,
 		enabled: true,
 		simulation: false,
-		wordOrder: 'low_high',
-		cpuType: 'R',
-		database: null,
-		username: null,
-		passwordSet: false
+		settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 	};
 }
 
@@ -225,9 +223,10 @@ function registryTag(id: number, name: string, collectionGroupId: number): Tag {
 }
 
 beforeEach(() => {
-	vi.mocked(listPlcConnections).mockReset().mockResolvedValue([]);
-	vi.mocked(createPlcConnection).mockReset();
-	vi.mocked(updatePlcConnection).mockReset();
+	vi.mocked(listDrivers).mockReset().mockResolvedValue(TEST_DRIVERS);
+	vi.mocked(listPlcConnectionsWire).mockReset().mockResolvedValue([]);
+	vi.mocked(createPlcConnectionWire).mockReset();
+	vi.mocked(updatePlcConnectionWire).mockReset();
 	vi.mocked(listCollectionGroups).mockReset().mockResolvedValue([]);
 	vi.mocked(createCollectionGroup).mockReset();
 	vi.mocked(updateCollectionGroup).mockReset();
@@ -250,8 +249,8 @@ beforeEach(() => {
 });
 
 describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検知した場合', () => {
-	it('createPlcConnection が QueuedWhileRunningError を投げたら ConfigPackageImportAbortedError で reject する（summary を resolve しない）', async () => {
-		vi.mocked(createPlcConnection).mockRejectedValue(
+	it('createPlcConnectionWire が QueuedWhileRunningError を投げたら ConfigPackageImportAbortedError で reject する（summary を resolve しない）', async () => {
+		vi.mocked(createPlcConnectionWire).mockRejectedValue(
 			new MockQueuedWhileRunningError('収集稼働中のためキュー投入されました')
 		);
 
@@ -266,37 +265,23 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 	});
 
 	it('updateCollectionGroup が QueuedWhileRunningError を投げても同様に中断する（ループ中どこで起きても検知する）', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			{
 				id: 1,
 				name: 'plc1',
 				protocol: 'modbus-tcp',
-				host: '192.168.11.200',
-				port: 502,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R',
-				database: null,
-				username: null,
-				passwordSet: false
+				settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 			}
 		]);
-		vi.mocked(updatePlcConnection).mockResolvedValue({
+		vi.mocked(updatePlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'plc1',
 			protocol: 'modbus-tcp',
-			host: '192.168.11.200',
-			port: 502,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 		});
 		vi.mocked(listCollectionGroups).mockResolvedValue([
 			{
@@ -321,7 +306,7 @@ describe('applyConfigPackage: 収集稼働中の QueuedWhileRunningError を検�
 
 	it('QueuedWhileRunningError 以外のエラーはそのまま素通しする（無関係なエラーを誤って ConfigPackageImportAbortedError に変換しない）', async () => {
 		const boom = new Error('boom');
-		vi.mocked(createPlcConnection).mockRejectedValue(boom);
+		vi.mocked(createPlcConnectionWire).mockRejectedValue(boom);
 
 		await expect(applyConfigPackage(pkg)).rejects.toBe(boom);
 	});
@@ -349,20 +334,13 @@ describe('configPackageExportFilename（T19 S4、UX-42: settings/+page.svelte �
 
 describe('applyConfigPackage: 全件成功する通常の import（回帰ガード）', () => {
 	it('summary（ConfigPackageImportSummary）を resolve する', async () => {
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'plc1',
 			protocol: 'modbus-tcp',
-			host: '192.168.11.200',
-			port: 502,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,
@@ -409,20 +387,13 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 	// 回帰ガード（2026-09-05）: pkg.tags[].stringEncoding が createTag に渡す
 	// TagInput までそのまま伝播することを固定する。
 	it('tag の stringEncoding が createTag に渡す TagInput にそのまま伝播する（shift_jis が utf8 に落ちない）', async () => {
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'plc1',
 			protocol: 'modbus-tcp',
-			host: '192.168.11.200',
-			port: 502,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,
@@ -475,22 +446,16 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 // なることをここで固定する。
 
 describe('applyConfigPackage: postgres（DB Source）接続の import はパスワード無しで作成する', () => {
-	it('createPlcConnection にはパッケージが持つ database/username だけを渡し、password キー自体を渡さない', async () => {
+	it('createPlcConnectionWire にはパッケージの settings（host・port・database・username）だけを渡し、password キー自体を渡さない', async () => {
 		const pkgWithDbConnection: ConfigPackage = {
 			...pkg,
 			plcConnections: [
 				{
 					name: 'pg1',
 					protocol: 'postgres',
-					host: '10.0.0.5',
-					port: 5432,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R',
-					database: 'appdb',
-					username: 'appuser'
+					settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 				}
 			],
 			// このパッケージの postgres 接続にグループを繋げると
@@ -499,40 +464,70 @@ describe('applyConfigPackage: postgres（DB Source）接続の import はパス�
 			collectionGroups: [],
 			tags: []
 		};
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'pg1',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser',
-			passwordSet: false
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 		});
 
 		await applyConfigPackage(pkgWithDbConnection);
 
-		expect(createPlcConnection).toHaveBeenCalledTimes(1);
-		const calledWith = vi.mocked(createPlcConnection).mock.calls[0][0];
+		expect(createPlcConnectionWire).toHaveBeenCalledTimes(1);
+		const calledWith = vi.mocked(createPlcConnectionWire).mock.calls[0][0];
 		expect(calledWith).toEqual({
 			name: 'pg1',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
+		});
+		expect(calledWith).not.toHaveProperty('password');
+		expect(calledWith.settings).not.toHaveProperty('password');
+	});
+
+	it('既存の postgres 接続の更新も password を送らない（REST の「秘密のキーの省略は保つ」で保存済みを保つ）', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
+			{
+				id: 4,
+				name: 'pg1',
+				protocol: 'postgres',
+				enabled: true,
+				simulation: false,
+				settings: {
+					host: 'old',
+					port: 5432,
+					database: 'd',
+					username: 'u',
+					password: { $secret: 'set' }
+				}
+			}
+		]);
+		vi.mocked(updatePlcConnectionWire).mockImplementation(async (id, input) => ({ id, ...input }));
+		await applyConfigPackage({
+			...pkg,
+			plcConnections: [
+				{
+					name: 'pg1',
+					protocol: 'postgres',
+					enabled: true,
+					simulation: false,
+					settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
+				}
+			],
+			collectionGroups: [],
+			tags: []
+		});
+		const [id, sent] = vi.mocked(updatePlcConnectionWire).mock.calls[0];
+		expect(id).toBe(4);
+		expect(sent.settings).toEqual({
+			host: '10.0.0.5',
+			port: 5432,
 			database: 'appdb',
 			username: 'appuser'
 		});
-		expect(calledWith).not.toHaveProperty('password');
 	});
 });
 
@@ -549,15 +544,9 @@ describe('applyConfigPackage: postgres（DB Source）グループの querySql �
 				{
 					name: 'pg1',
 					protocol: 'postgres',
-					host: '10.0.0.5',
-					port: 5432,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R',
-					database: 'appdb',
-					username: 'appuser'
+					settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 				}
 			],
 			collectionGroups: [
@@ -572,20 +561,13 @@ describe('applyConfigPackage: postgres（DB Source）グループの querySql �
 			],
 			tags: []
 		};
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'pg1',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser',
-			passwordSet: false
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 		});
 		vi.mocked(createCollectionGroup).mockResolvedValue({
 			id: 1,
@@ -624,42 +606,52 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 
 	const pgConnection = {
 		name: 'pg1',
-		protocol: 'postgres' as const,
-		host: '10.0.0.5',
-		port: 5432,
-		unitId: 1,
+		protocol: 'postgres',
 		enabled: true,
 		simulation: false,
-		wordOrder: 'low_high' as const,
-		cpuType: 'R' as const,
-		database: 'appdb',
-		username: 'appuser'
+		settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 	};
 
+	function existingPg(password?: unknown): PlcConnectionWire {
+		return {
+			id: 1,
+			name: 'pg1',
+			protocol: 'postgres',
+			enabled: true,
+			simulation: false,
+			settings: {
+				host: '10.0.0.5',
+				port: 5432,
+				database: 'appdb',
+				username: 'appuser',
+				...(password === undefined ? {} : { password })
+			}
+		};
+	}
+
 	it('新規作成される postgres 接続（既存に同名が無い）は列挙される', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([]);
 
 		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
 
 		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
 	});
 
-	it('既存 postgres 接続を更新するだけで、現在 passwordSet: true なら列挙されない', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+	it('既存 postgres 接続を更新するだけで、今の password が $secret: set なら列挙されない', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			{
 				id: 1,
 				name: 'pg1',
 				protocol: 'postgres',
-				host: '10.0.0.5',
-				port: 5432,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R',
-				database: 'appdb',
-				username: 'appuser',
-				passwordSet: true
+				settings: {
+					host: '10.0.0.5',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: { $secret: 'set' }
+				}
 			}
 		]);
 
@@ -668,22 +660,15 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 		expect(inspection.dbConnectionsPasswordRequired).toEqual([]);
 	});
 
-	it('既存 postgres 接続を更新するだけでも、現在 passwordSet: false なら列挙される', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+	it('既存 postgres 接続を更新するだけでも、今の password が無ければ列挙される', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			{
 				id: 1,
 				name: 'pg1',
 				protocol: 'postgres',
-				host: '10.0.0.5',
-				port: 5432,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R',
-				database: 'appdb',
-				username: 'appuser',
-				passwordSet: false
+				settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 			}
 		]);
 
@@ -692,22 +677,29 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
 	});
 
+	it('今の password が unreadable（この PC で読めない）なら列挙される', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([existingPg({ $secret: 'unreadable' })]);
+		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
+		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
+	});
+
+	it('同名の既存接続が postgres 以外なら（切り替え）列挙される', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
+			{ ...existingPg(), protocol: 'modbus-tcp', settings: { host: 'h', port: 502 } }
+		]);
+		const inspection = await inspectConfigPackage(pkgWithConnections([pgConnection]));
+		expect(inspection.dbConnectionsPasswordRequired).toEqual(['pg1']);
+	});
+
 	it('postgres 以外の接続は create/update いずれでも列挙されない', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			{
 				id: 1,
 				name: 'plc1',
 				protocol: 'modbus-tcp',
-				host: '192.168.11.200',
-				port: 502,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R',
-				database: null,
-				username: null,
-				passwordSet: false
+				settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 			}
 		]);
 
@@ -716,24 +708,16 @@ describe('inspectConfigPackage: dbConnectionsPasswordRequired は再設定が必
 				{
 					name: 'plc1',
 					protocol: 'modbus-tcp',
-					host: '192.168.11.200',
-					port: 502,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R'
+					settings: { host: '192.168.11.200', port: 502, unit_id: 1, word_order: 'low_high' }
 				},
 				{
 					name: 'plc2',
 					protocol: 'modbus-tcp',
-					host: '192.168.11.201',
-					port: 502,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R'
+					settings: { host: '192.168.11.201', port: 502, unit_id: 1, word_order: 'low_high' }
 				}
 			])
 		);
@@ -753,15 +737,9 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 			{
 				name: 'pg1',
 				protocol: 'postgres',
-				host: '10.0.0.5',
-				port: 5432,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R',
-				database: 'appdb',
-				username: 'appuser'
+				settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 			}
 		],
 		collectionGroups: [],
@@ -783,22 +761,15 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	// 版 2: sink のタグ参照は (接続名, グループ名, タグ名) で引くので、既存の
 	// タグの所属グループ・接続も現在の環境に置く。
 	function seedPgConnectionAndTag(): void {
-		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(2, 'plc1')]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([plcConnection(2, 'plc1')]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(1, 'group1', 2)]);
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'pg1',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser',
-			passwordSet: false
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 		});
 		vi.mocked(listTags).mockResolvedValue([
 			{
@@ -899,22 +870,15 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 
 	it('接続を解決できない sink group は warning を積んで CRUD を呼ばない', async () => {
 		vi.mocked(listSinkGroups).mockResolvedValue([]);
-		// `createPlcConnection`をモックしないため接続は解決されない
+		// `createPlcConnectionWire`をモックしないため接続は解決されない
 		// （pg1接続自体の作成は素通りするが `connectionByName` には乗らない）。
-		vi.mocked(createPlcConnection).mockResolvedValue({
+		vi.mocked(createPlcConnectionWire).mockResolvedValue({
 			id: 1,
 			name: 'different-name',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser',
-			passwordSet: false
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 		});
 
 		const summary = await applyConfigPackage(pkgWithSinkGroup);
@@ -925,7 +889,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	});
 
 	it('inspectConfigPackage は sinkGroups の create/update 件数を数える', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([]);
 		vi.mocked(listTags).mockResolvedValue([]);
 		vi.mocked(listSinkGroups).mockResolvedValue([]);
@@ -936,7 +900,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	});
 
 	it('inspectConfigPackage は未解決の接続・タグを warning に積む', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([]);
 		vi.mocked(listTags).mockResolvedValue([]);
 		vi.mocked(listSinkGroups).mockResolvedValue([]);
@@ -962,62 +926,98 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 	});
 });
 
-describe('applyConfigPackage: cpuType は必須（#605、版 2）', () => {
-	const slmpConn = {
+// 版 3（R2b-6b-3、設計 §7.1）: 欄はドライバのスキーマ（`GET /api/drivers`）で確かめ、
+// 欠けた欄を既定で埋めずに断る。確認の画面（inspect）と書き込み（apply）の両方で断る。
+describe('applyConfigPackage / inspectConfigPackage: 版 3 の settings（欠けた欄・秘密の欄の断り）', () => {
+	const slmpConn: PlcConnectionWire = {
 		id: 7,
 		name: 'plcq',
-		protocol: 'slmp' as const,
-		host: '10.0.0.8',
-		port: 5007,
-		unitId: 0,
+		protocol: 'slmp',
 		enabled: true,
 		simulation: false,
-		wordOrder: 'low_high' as const,
-		cpuType: 'Q' as const,
-		database: null,
-		username: null,
-		passwordSet: false
+		settings: { host: '10.0.0.8', port: 5007, cpu_type: 'Q', word_order: 'low_high' }
 	};
 
-	function slmpPackage(name: string, cpuType?: string): string {
-		const connection: Record<string, unknown> = {
-			name,
-			protocol: 'slmp',
-			host: '10.0.0.8',
-			port: 5007,
-			unitId: 0,
-			enabled: true,
-			simulation: false,
-			wordOrder: 'low_high'
-		};
-		if (cpuType !== undefined) connection.cpuType = cpuType;
-		return JSON.stringify({ ...pkg, plcConnections: [connection], collectionGroups: [], tags: [] });
+	function slmpPackage(name: string, settings: Record<string, unknown>): ConfigPackage {
+		return parseConfigPackage(
+			JSON.stringify({
+				...pkg,
+				plcConnections: [{ name, protocol: 'slmp', enabled: true, simulation: false, settings }],
+				collectionGroups: [],
+				tags: []
+			})
+		);
 	}
 
-	it('cpuType を持たない接続のパッケージは、取り込む前の読み込みで項目の場所を示して拒否する', () => {
-		expect(() => parseConfigPackage(slmpPackage('plcq'))).toThrow(
-			/plcConnections\[0\]\.cpuType は Q \/ R/
+	it('cpu_type を持たない SLMP 接続は、確認の画面でも書き込みでも断り、何も送らない', async () => {
+		const missing = slmpPackage('plcq', { host: '10.0.0.8', port: 5007, word_order: 'low_high' });
+		await expect(inspectConfigPackage(missing)).rejects.toThrow(
+			/plcConnections\[0\]\.settings\.cpu_type がありません/
 		);
+		await expect(applyConfigPackage(missing)).rejects.toThrow(/settings\.cpu_type がありません/);
+		expect(createPlcConnectionWire).not.toHaveBeenCalled();
+		expect(updatePlcConnectionWire).not.toHaveBeenCalled();
+		expect(saveMqttSettings).not.toHaveBeenCalled();
 	});
 
-	it('パッケージの cpuType をそのまま更新に載せる（既存の Q 接続を R に戻さない）', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([slmpConn]);
-		vi.mocked(updatePlcConnection).mockResolvedValue(slmpConn);
-		await applyConfigPackage(parseConfigPackage(slmpPackage('plcq', 'Q')));
-		const sent = vi.mocked(updatePlcConnection).mock.calls[0][1];
-		expect(sent.cpuType).toBe('Q');
-	});
-
-	it('新しい接続の作成にもパッケージの cpuType を載せる', async () => {
-		vi.mocked(createPlcConnection).mockResolvedValue({
-			...slmpConn,
-			id: 8,
-			name: 'plcnew',
-			cpuType: 'R'
+	it('パッケージの cpu_type（Q）を settings ごと更新に載せる（既存の Q 接続を R に戻さない）', async () => {
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([slmpConn]);
+		vi.mocked(updatePlcConnectionWire).mockResolvedValue(slmpConn);
+		await applyConfigPackage(slmpPackage('plcq', { ...slmpConn.settings }));
+		const [id, sent] = vi.mocked(updatePlcConnectionWire).mock.calls[0];
+		expect(id).toBe(7);
+		expect(sent).toEqual({
+			name: 'plcq',
+			protocol: 'slmp',
+			enabled: true,
+			simulation: false,
+			settings: { host: '10.0.0.8', port: 5007, cpu_type: 'Q', word_order: 'low_high' }
 		});
-		await applyConfigPackage(parseConfigPackage(slmpPackage('plcnew', 'R')));
-		const sent = vi.mocked(createPlcConnection).mock.calls[0][0];
-		expect(sent.cpuType).toBe('R');
+	});
+
+	it('新しい接続の作成にもパッケージの settings をそのまま載せる', async () => {
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) => ({ id: 8, ...input }));
+		await applyConfigPackage(
+			slmpPackage('plcnew', { host: '10.0.0.9', port: 5007, cpu_type: 'R', word_order: 'high_low' })
+		);
+		const sent = vi.mocked(createPlcConnectionWire).mock.calls[0][0];
+		expect(sent.settings).toEqual({
+			host: '10.0.0.9',
+			port: 5007,
+			cpu_type: 'R',
+			word_order: 'high_low'
+		});
+	});
+
+	it('Secret の欄と既定の無い任意の欄が欠けた接続は通り、Secret の欄を送らない（保存済みを保つ）', async () => {
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) => ({ id: 9, ...input }));
+		const fake = parseConfigPackage(
+			JSON.stringify({
+				...pkg,
+				plcConnections: [
+					{
+						name: 'fake',
+						protocol: FAKE_SECRET_DRIVER.id,
+						enabled: true,
+						simulation: false,
+						settings: { host: 'h' }
+					}
+				],
+				collectionGroups: [],
+				tags: []
+			})
+		);
+		await expect(inspectConfigPackage(fake)).resolves.toBeDefined();
+		await applyConfigPackage(fake);
+		expect(vi.mocked(createPlcConnectionWire).mock.calls[0][0].settings).toEqual({ host: 'h' });
+	});
+
+	it('取り込み先の Hub に無いドライバの接続は断る', async () => {
+		vi.mocked(listDrivers).mockResolvedValue([]);
+		const modbusOnly = { ...pkg, collectionGroups: [], tags: [] };
+		await expect(inspectConfigPackage(modbusOnly)).rejects.toThrow(
+			/protocol 'modbus-tcp' はこの banto-hub にありません/
+		);
 	});
 });
 
@@ -1030,13 +1030,13 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 	const tagTemplate = pkg.tags[0];
 
 	it('2 つの接続の同名グループ・同名タグを別々に扱う（既存は更新、もう一方は作成）', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			plcConnection(1, 'plc1'),
 			plcConnection(2, 'plc2')
 		]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(10, 'group1', 1)]);
 		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'tag1', 10)]);
-		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+		vi.mocked(updatePlcConnectionWire).mockImplementation(async (id, input) =>
 			plcConnection(id, input.name)
 		);
 		vi.mocked(updateCollectionGroup).mockImplementation(async (id, input) =>
@@ -1103,13 +1103,13 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 	});
 
 	it('1 つの接続の 2 つのグループに同名タグがあれば、グループごとに突き合わせる', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(1, 'plc1')]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([plcConnection(1, 'plc1')]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([
 			collectionGroup(10, 'group1', 1),
 			collectionGroup(11, 'group2', 1)
 		]);
 		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'tag1', 10)]);
-		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+		vi.mocked(updatePlcConnectionWire).mockImplementation(async (id, input) =>
 			plcConnection(id, input.name)
 		);
 		vi.mocked(updateCollectionGroup).mockImplementation(async (id, input) =>
@@ -1143,10 +1143,14 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 	});
 
 	it('sink group のタグ参照は、同名タグのうち接続・グループが一致するものへ解決する', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			plcConnection(1, 'plc1'),
 			plcConnection(2, 'plc2'),
-			{ ...plcConnection(3, 'pg1'), protocol: 'postgres', passwordSet: true }
+			{
+				...plcConnection(3, 'pg1'),
+				protocol: 'postgres',
+				settings: { host: 'h', port: 5432, password: { $secret: 'set' } }
+			}
 		]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([
 			collectionGroup(10, 'group1', 1),
@@ -1187,7 +1191,7 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 	});
 
 	it('参照先のタグが現在の環境に無ければ、接続・グループ・タグの組で warning を出す', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(1, 'plc1')]);
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([plcConnection(1, 'plc1')]);
 		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(10, 'group1', 1)]);
 		vi.mocked(listTags).mockResolvedValue([registryTag(100, 'temp01', 10)]);
 
@@ -1221,6 +1225,8 @@ describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合
 // 作成・更新し、パッケージの名前（`dbConnectionName`）を取り込み先の id に付け
 // 直す。API キーは移らないので、結果に push 接続の新しい id を返す。
 describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionName の付け直し）', () => {
+	const PG_SETTINGS = { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' };
+
 	function pushPackage(): ConfigPackage {
 		return {
 			...pkg,
@@ -1229,13 +1235,8 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 				{
 					name: 'Bridge1',
 					protocol: 'push',
-					host: '',
-					port: 0,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R',
 					settings: {
 						stale_timeout_ms: 5000,
 						bridge: {
@@ -1255,15 +1256,9 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 				{
 					name: 'pg-a',
 					protocol: 'postgres',
-					host: '10.0.0.5',
-					port: 5432,
-					unitId: 1,
 					enabled: true,
 					simulation: false,
-					wordOrder: 'low_high',
-					cpuType: 'R',
-					database: 'appdb',
-					username: 'appuser'
+					settings: { ...PG_SETTINGS }
 				}
 			],
 			collectionGroups: [],
@@ -1272,26 +1267,29 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 	}
 
 	function savedConnection(
-		input: { name: string; protocol: string; settings?: unknown },
+		input: { name: string; protocol: string; settings?: Record<string, unknown> },
 		id: number
-	): PlcConnection {
+	): PlcConnectionWire {
 		return {
-			...plcConnection(id, input.name),
-			protocol: input.protocol as PlcConnection['protocol'],
-			settings: (input.settings ?? null) as PlcConnection['settings']
+			id,
+			name: input.name,
+			protocol: input.protocol,
+			enabled: true,
+			simulation: false,
+			settings: input.settings ?? {}
 		};
 	}
 
 	it('postgres 接続を先に作り、push のブリッジをその新しい id で作る。結果に push 接続の id を返す', async () => {
 		let nextId = 40;
-		vi.mocked(createPlcConnection).mockImplementation(async (input) =>
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) =>
 			savedConnection(input, nextId++)
 		);
 		const summary = await applyConfigPackage(pushPackage());
 
-		const calls = vi.mocked(createPlcConnection).mock.calls.map(([input]) => input);
+		const calls = vi.mocked(createPlcConnectionWire).mock.calls.map(([input]) => input);
 		expect(calls.map((c) => c.name)).toEqual(['pg-a', 'Bridge1']);
-		expect(calls[0].settings).toBeUndefined();
+		expect(calls[0].settings).toEqual(PG_SETTINGS);
 		expect(calls[1].settings).toEqual({
 			stale_timeout_ms: 5000,
 			bridge: {
@@ -1313,58 +1311,76 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 	});
 
 	it('既存の postgres・push 接続を更新するときは、取り込み先の既存の id に付け直す', async () => {
-		vi.mocked(listPlcConnections).mockResolvedValue([
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
 			savedConnection({ name: 'pg-a', protocol: 'postgres' }, 7),
 			savedConnection({ name: 'Bridge1', protocol: 'push' }, 9)
 		]);
-		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+		vi.mocked(updatePlcConnectionWire).mockImplementation(async (id, input) =>
 			savedConnection(input, id)
 		);
 		const summary = await applyConfigPackage(pushPackage());
-		const calls = vi.mocked(updatePlcConnection).mock.calls;
+		const calls = vi.mocked(updatePlcConnectionWire).mock.calls;
 		expect(calls.map(([id]) => id)).toEqual([7, 9]);
-		expect(calls[1][1].settings?.bridge?.db_connection_id).toBe(7);
+		expect(
+			(calls[1][1].settings.bridge as { db_connection_id: number } | undefined)?.db_connection_id
+		).toBe(7);
 		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 9 }]);
 	});
 
 	it('ブリッジの読む接続を引けなければ、壊れた参照で作らず警告を積んで飛ばす', async () => {
-		vi.mocked(createPlcConnection).mockImplementation(async (input) => savedConnection(input, 50));
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) =>
+			savedConnection(input, 50)
+		);
 		const broken = pushPackage();
 		broken.plcConnections = broken.plcConnections.filter((c) => c.name !== 'pg-a');
 		const summary = await applyConfigPackage(broken);
-		expect(vi.mocked(createPlcConnection)).not.toHaveBeenCalled();
+		expect(vi.mocked(createPlcConnectionWire)).not.toHaveBeenCalled();
 		expect(summary.warnings).toEqual([
 			"push 接続 'Bridge1' のブリッジが読む接続 'pg-a' を解決できませんでした"
 		]);
 		expect(summary.ingestConnections).toEqual([]);
 	});
 
-	it('往復: 書き出した Hub の id（12 → 3）が、取り込み先の新しい id（81 → 80）に付け直される', async () => {
-		const exported = serializeConfigPackage(
+	/** 書き出し元の Hub: pg-a は id 3、Bridge1（id 12）のブリッジは id 3 を読む。 */
+	function exportedFromSourceHub(): string {
+		return serializeConfigPackage(
 			buildConfigPackage({
 				plcConnections: [
-					{
-						...savedConnection({ name: 'Bridge1', protocol: 'push' }, 12),
-						settings: {
-							bridge: {
-								kind: 'db',
-								db_connection_id: 3,
-								queries: [
-									{
-										name: 'q',
-										period_ms: 500,
-										sql: 'SELECT 1 AS v',
-										columns: [{ column: 'v', key: 'k' }]
-									}
-								]
+					savedConnection(
+						{
+							name: 'Bridge1',
+							protocol: 'push',
+							settings: {
+								bridge: {
+									kind: 'db',
+									db_connection_id: 3,
+									queries: [
+										{
+											name: 'q',
+											period_ms: 500,
+											sql: 'SELECT 1 AS v',
+											columns: [{ column: 'v', key: 'k' }]
+										}
+									]
+								}
 							}
-						}
-					},
-					{
-						...savedConnection({ name: 'pg-a', protocol: 'postgres' }, 3),
-						database: 'd',
-						username: 'u'
-					}
+						},
+						12
+					),
+					savedConnection(
+						{
+							name: 'pg-a',
+							protocol: 'postgres',
+							settings: {
+								host: 'db',
+								port: 5432,
+								database: 'd',
+								username: 'u',
+								password: { $secret: 'set' }
+							}
+						},
+						3
+					)
 				],
 				collectionGroups: [],
 				tags: [],
@@ -1372,16 +1388,25 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 				grpc: { enabled: false, bind: '127.0.0.1', port: 50051 }
 			})
 		);
+	}
+
+	it('往復: 書き出した Hub の id（12 → 3）が、取り込み先の新しい id（81 → 80）に付け直される', async () => {
+		const exported = exportedFromSourceHub();
+		expect(exported).not.toContain('db_connection_id');
+		expect(JSON.stringify(JSON.parse(exported).plcConnections)).not.toContain('$secret');
 		let nextId = 80;
-		vi.mocked(createPlcConnection).mockImplementation(async (input) =>
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) =>
 			savedConnection(input, nextId++)
 		);
 		const summary = await applyConfigPackage(parseConfigPackage(exported));
-		const bridgeCall = vi
-			.mocked(createPlcConnection)
-			.mock.calls.map(([input]) => input)
-			.find((input) => input.name === 'Bridge1');
-		expect(bridgeCall?.settings).toEqual({
+		const calls = vi.mocked(createPlcConnectionWire).mock.calls.map(([input]) => input);
+		expect(calls.find((input) => input.name === 'pg-a')?.settings).toEqual({
+			host: 'db',
+			port: 5432,
+			database: 'd',
+			username: 'u'
+		});
+		expect(calls.find((input) => input.name === 'Bridge1')?.settings).toEqual({
 			bridge: {
 				kind: 'db',
 				db_connection_id: 80,
@@ -1391,6 +1416,33 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 			}
 		});
 		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 81 }]);
+	});
+
+	it('往復: 取り込み先で書き出し元の id（3）が関係のない postgres 接続のものでも、ブリッジは名前で引いた pg-a を読む', async () => {
+		// 取り込み先の Hub: id 3 は別の PostgreSQL（pg-other）。pg-a は id 21 で既にある。
+		vi.mocked(listPlcConnectionsWire).mockResolvedValue([
+			savedConnection(
+				{
+					name: 'pg-other',
+					protocol: 'postgres',
+					settings: { host: 'other', port: 5432, database: 'x', username: 'y' }
+				},
+				3
+			),
+			savedConnection({ name: 'pg-a', protocol: 'postgres' }, 21)
+		]);
+		vi.mocked(updatePlcConnectionWire).mockImplementation(async (id, input) =>
+			savedConnection(input, id)
+		);
+		vi.mocked(createPlcConnectionWire).mockImplementation(async (input) =>
+			savedConnection(input, 30)
+		);
+		const summary = await applyConfigPackage(parseConfigPackage(exportedFromSourceHub()));
+		expect(vi.mocked(updatePlcConnectionWire).mock.calls.map(([id]) => id)).toEqual([21]);
+		const bridgeCall = vi.mocked(createPlcConnectionWire).mock.calls[0][0];
+		expect(bridgeCall.name).toBe('Bridge1');
+		expect((bridgeCall.settings.bridge as { db_connection_id: number }).db_connection_id).toBe(21);
+		expect(summary.ingestConnections).toEqual([{ name: 'Bridge1', id: 30 }]);
 	});
 
 	it('connectionImportOrder はブリッジを持つ push 接続だけを後ろへ回す（他は元の順）', () => {
