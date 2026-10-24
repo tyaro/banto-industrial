@@ -316,7 +316,7 @@ pub enum SecretError {
     /// 壊れている。空のパスワードとして使わない（空に潰さない）。
     #[error("開いた秘密値が空です（保存された値が壊れています）")]
     EmptyStored,
-    /// 未適用キューのペイロードの封印した値（`sealedPassword`）の形が違う（参照・方式・
+    /// 未適用キューのペイロードの封印した値（`sealedSecrets` の値）の形が違う（参照・方式・
     /// base64 の blob のどれか。R2b-1e）。値は載せない。
     #[error("封印した秘密値の形が違います")]
     MalformedSealed,
@@ -514,7 +514,7 @@ impl ConnectionSecrets {
     }
 
     /// `plain-v1` の値を、**同じ参照のまま** protector で封印し直す（設計 §6.5 の起動時の
-    /// 後処理と、非 Windows で積んだキューの `sealedPassword`）。
+    /// 後処理と、非 Windows で積んだキューの `sealedSecrets`）。
     ///
     /// 封印し直したら `Some`。`plain-v1` でない・protector が無い（非 Windows）なら何もせず
     /// `None`。`plain-v1` の blob が UTF-8 でなければ [`SecretError::NotUtf8`]。
@@ -714,12 +714,12 @@ pub fn sealed_connection_secret(
 
 // ---- 未適用キューのペイロードの封印した値（R2b-1e、設計 §5.3） ------------------------------
 
-/// キューのペイロード（`input.sealedPassword`）の封印した値の JSON の形:
+/// キューのペイロード（`input.sealedSecrets` のキーごとの値）の封印した値の JSON の形:
 /// `{"ref": "<32 文字の小文字 16 進>", "scheme": "plain-v1" | "dpapi-machine-v1",
 /// "blob": "<base64>"}`（設計 §5.3 の「未適用キューに積む」の行）。
 ///
 /// 注意: `plain-v1` の blob は平文そのものの base64 なので、この値も外へ返さない
-/// （応答の写しは `crate::pending_changes::redact_queued_password` が `passwordSet` に替える）。
+/// （応答の写しは `crate::pending_changes::redact_queued_password` が `secretsSet` に替える）。
 pub fn sealed_password_json(sealed: &SealedSecret) -> serde_json::Value {
     use base64::Engine as _;
     serde_json::json!({

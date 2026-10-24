@@ -68,10 +68,11 @@
 //!    - (a) protector があるとき（Windows の DPAPI）、`plc_connection_secrets` の `plain-v1`
 //!      の行を開いて**同じ参照のまま**封印し直す（entropy は参照とキー）。
 //!    - (b) 未適用（`pending`・`applying`・`failed`）の `plc_connections.create` / `.update` の
-//!      ペイロードの平文の `password` を封印した `sealedPassword` に替える。
-//!    - (c) 同じ 3 つの状態の `plain-v1` の `sealedPassword` を、protector があれば封印し直す。
-//!    - (d) 履歴（`applied`・`canceled`）のペイロードから `password` と `sealedPassword` の
-//!      両方を外して `passwordSet` に替える。
+//!      ペイロードが R2b-6b より前の平らな形なら捨てる（Q10、docs/banto-hub-driver-ui-design.md
+//!      §5。起動ログに出す）。
+//!    - (c) 同じ 3 つの状態の `plain-v1` の `sealedSecrets` を、protector があれば封印し直す。
+//!    - (d) 履歴（`applied`・`canceled`）のペイロードから `sealedSecrets`（と古い形の
+//!      `password`・`sealedPassword`）を外して `secretsSet` に替える。
 //!    - (e) 1 つでも書き換えたら、**同じトランザクションで**清掃待ちの印を立てる。何も
 //!      書き換えなければ何も書かない（印も立てない）。
 //!
@@ -806,11 +807,11 @@ pub struct UpkeepFailure {
 pub struct UpkeepReport {
     /// (a) `plain-v1` から封印し直した秘密の行の数。
     pub resealed_rows: usize,
-    /// (b) 平文の `password` を封印したキューの行の数。
-    pub sealed_queue: usize,
-    /// (c) `plain-v1` の `sealedPassword` を封印し直したキューの行の数。
+    /// (b) 捨てた古い形（R2b-6b より前の平らな形）の未適用の接続の提案の id（Q10）。
+    pub discarded_queue: Vec<i64>,
+    /// (c) `plain-v1` の `sealedSecrets` を封印し直したキューの行の数。
     pub resealed_queue: usize,
-    /// (d) `password` / `sealedPassword` を外した履歴の行の数。
+    /// (d) `sealedSecrets`（と古い形の `password` / `sealedPassword`）を外した履歴の行の数。
     pub stripped_history: usize,
     /// 封印し直し・封印に失敗して、そのまま残した行（起動は止めない）。
     pub failures: Vec<UpkeepFailure>,
@@ -825,7 +826,11 @@ pub struct UpkeepReport {
 impl UpkeepReport {
     /// 工程 1 で何か書き換えたか（= 同じトランザクションで清掃待ちの印を立てたか）。
     pub fn rewrote(&self) -> bool {
-        self.resealed_rows + self.sealed_queue + self.resealed_queue + self.stripped_history > 0
+        self.resealed_rows
+            + self.discarded_queue.len()
+            + self.resealed_queue
+            + self.stripped_history
+            > 0
     }
 }
 
@@ -877,7 +882,7 @@ async fn rewrite_secrets_inner(
     fail_before_commit: bool,
 ) -> Result<UpkeepReport, BantoError> {
     use crate::pending_changes::{
-        reseal_queued_password, seal_queued_password, strip_queued_password,
+        is_current_connection_input, reseal_queued_password, strip_queued_password,
     };
     use crate::secrets::{SealedSecret, SecretScheme};
 
@@ -942,20 +947,19 @@ async fn rewrite_secrets_inner(
         };
         let mut changed = false;
         if UNAPPLIED_STATES.contains(&state.as_str()) {
-            // (b) 平文の password → sealedPassword（Windows は DPAPI、他は plain-v1）。
-            match seal_queued_password(secrets, &source, &mut payload) {
-                Ok(true) => {
-                    report.sealed_queue += 1;
-                    changed = true;
-                }
-                Ok(false) => {}
-                Err(err) => report.failures.push(UpkeepFailure {
-                    table: "pending_changes",
-                    id,
-                    error: err.to_string(),
-                }),
+            // (b) R2b-6b（Q10、docs/banto-hub-driver-ui-design.md §5）: 平らな形の古い提案は
+            // 読めないので捨てる（使用者無しの前提、2026-10-22 オーナー）。平文の `password`
+            // を持ちうるので、清掃待ちの印も立てる（下の (e)）。
+            if !is_current_connection_input(&source, &payload) {
+                sqlx::query("DELETE FROM pending_changes WHERE id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(storage)?;
+                report.discarded_queue.push(id);
+                continue;
             }
-            // (c) plain-v1 の sealedPassword を封印し直す（protector があるときだけ）。
+            // (c) plain-v1 の sealedSecrets を封印し直す（protector があるときだけ）。
             match reseal_queued_password(secrets, &source, &mut payload) {
                 Ok(true) => {
                     report.resealed_queue += 1;
@@ -971,7 +975,7 @@ async fn rewrite_secrets_inner(
         } else if HISTORY_STATES.contains(&state.as_str())
             && strip_queued_password(&source, &mut payload)
         {
-            // (d) 履歴から password と sealedPassword の両方を外す。
+            // (d) 履歴から封印した値（と古い形の password・sealedPassword）を外す。
             report.stripped_history += 1;
             changed = true;
         }
@@ -1088,9 +1092,8 @@ pub async fn plaintext_remaining(
         "SELECT COUNT(*) FROM pending_changes \
          WHERE source IN (?, ?) AND state IN ('pending', 'applying', 'failed') \
          AND json_valid(payload) \
-         AND ((json_type(payload, '$.input.password') = 'text' \
-               AND json_extract(payload, '$.input.password') <> '') \
-              OR json_extract(payload, '$.input.sealedPassword.scheme') = ?)",
+         AND EXISTS (SELECT 1 FROM json_each(payload, '$.input.sealedSecrets') \
+                     WHERE json_extract(value, '$.scheme') = ?)",
     )
     .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[0])
     .bind(crate::pending_changes::CONNECTION_PASSWORD_SOURCES[1])
@@ -1105,12 +1108,25 @@ pub async fn plaintext_remaining(
 pub fn log_upkeep(report: &UpkeepReport) {
     if report.rewrote() {
         log_line(&format!(
-            "banto-hub: 秘密値の後処理: 封印し直した秘密の行 {} 件、未適用キューの封印 {} 件・\
-             封印し直し {} 件、履歴の行から外した値 {} 件",
+            "banto-hub: 秘密値の後処理: 封印し直した秘密の行 {} 件、捨てた古い形の未適用の接続の\
+             提案 {} 件、未適用キューの封印し直し {} 件、履歴の行から外した値 {} 件",
             report.resealed_rows,
-            report.sealed_queue,
+            report.discarded_queue.len(),
             report.resealed_queue,
             report.stripped_history
+        ));
+    }
+    // Q10（docs/banto-hub-driver-ui-design.md §5）: 捨てた提案を 1 件ずつ分かるように出す。
+    if !report.discarded_queue.is_empty() {
+        let ids: Vec<String> = report
+            .discarded_queue
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect();
+        log_err_line(&format!(
+            "banto-hub: [WARN] 未適用キューの接続の提案 {} は R2b-6b より前の形で読めないため\
+             捨てました（必要なら接続の画面で作り直してください）",
+            ids.join("・")
         ));
     }
     for failure in &report.failures {

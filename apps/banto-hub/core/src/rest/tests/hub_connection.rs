@@ -17,7 +17,7 @@ async fn plc_connections_create_and_update_reject_the_hub_protocol() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+        json!({ "name": "hub", "protocol": "hub" }),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
@@ -40,7 +40,7 @@ async fn plc_connections_create_and_update_reject_the_hub_protocol() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-hub-switch", "host": "127.0.0.1", "port": 15071 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-hub-switch", "settings": { "host": "127.0.0.1", "port": 15071 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -49,7 +49,7 @@ async fn plc_connections_create_and_update_reject_the_hub_protocol() {
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "line-hub-switch", "protocol": "hub", "host": "", "port": 0 }),
+        json!({ "name": "line-hub-switch", "protocol": "hub" }),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
@@ -69,7 +69,7 @@ async fn plc_connections_create_and_update_reject_the_hub_protocol() {
 async fn pending_apply_rejects_a_queued_hub_connection() {
     let env = test_env().await;
     let payload = json!({
-        "input": { "name": "hub", "protocol": "hub", "host": "", "port": 0 }
+        "input": { "name": "hub", "protocol": "hub", "settings": {} }
     });
     let pending = PendingChangesService::new(env.pool.clone())
         .create_pending(
@@ -133,7 +133,7 @@ async fn push_connections_are_accepted_by_preflight_now_that_the_receiver_exists
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "bridge-0", "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": "bridge-0", "protocol": "push" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -169,14 +169,12 @@ async fn push_connections_are_accepted_by_preflight_now_that_the_receiver_exists
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "bridge-1", "protocol": "push", "host": "x", "port": 9,
-                "enabled": false }),
+        json!({ "name": "bridge-1", "protocol": "push", "enabled": false }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
     assert_eq!(conn["protocol"], "push");
-    assert_eq!(conn["host"], "");
-    assert_eq!(conn["port"], 0);
+    assert_eq!(conn["settings"], json!({}));
     let id = conn["id"].as_i64().unwrap();
 
     sqlx::query("UPDATE plc_connections SET settings = '{\"stale_timeout_ms\":2000}' WHERE id = ?")
@@ -188,8 +186,9 @@ async fn push_connections_are_accepted_by_preflight_now_that_the_receiver_exists
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "bridge-1-renamed", "protocol": "push", "host": "", "port": 0,
-                "enabled": false }),
+        // R2b-6b: the update replaces `settings`, so it carries the stored object.
+        json!({ "name": "bridge-1-renamed", "protocol": "push", "enabled": false,
+                "settings": { "stale_timeout_ms": 2000 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -205,8 +204,8 @@ async fn push_connections_are_accepted_by_preflight_now_that_the_receiver_exists
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "bridge-1-renamed", "protocol": "push", "host": "", "port": 0,
-                "enabled": true }),
+        json!({ "name": "bridge-1-renamed", "protocol": "push", "enabled": true,
+                "settings": { "stale_timeout_ms": 2000 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");

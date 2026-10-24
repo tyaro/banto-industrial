@@ -12,17 +12,19 @@ use tower::ServiceExt;
 // テストの環境のレジストリは `test_support::test_drivers()` の代役のドライバ
 // （`banto_plc` の文法を持つ）。
 
-/// 接続を作って id を返す（`extra` は `name`・`protocol` 以外の項目）。
+/// 接続を作って id を返す（`extra` は `settings` に足す欄）。
 async fn create_connection(
     env: &TestEnv,
     name: &str,
     protocol: &str,
     extra: serde_json::Value,
 ) -> i64 {
-    let mut body =
-        json!({ "name": name, "protocol": protocol, "host": "127.0.0.1", "port": 15300 });
+    let mut body = json!({ "name": name, "protocol": protocol, "settings": {} });
+    if protocol != "virtual" {
+        body["settings"] = json!({ "host": "127.0.0.1", "port": 15300 });
+    }
     for (key, value) in extra.as_object().into_iter().flatten() {
-        body[key] = value.clone();
+        body["settings"][key] = value.clone();
     }
     let (status, conn) =
         admin_post(&env.router, "/api/plc-connections", &env.admin_token, body).await;

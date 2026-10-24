@@ -267,7 +267,7 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -960,7 +960,7 @@ async fn creating_a_tag_via_rest_bumps_revision_and_appears_in_catalog() {
         "POST",
         "/api/plc-connections",
         &app.token,
-        serde_json::json!({ "name": "line1", "host": "127.0.0.1", "port": sim.addr.port() }),
+        serde_json::json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": sim.addr.port() } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn_json:?}");
@@ -1032,7 +1032,7 @@ async fn creating_a_tag_with_writable_true_appears_writable_in_catalog() {
         "POST",
         "/api/plc-connections",
         &app.token,
-        serde_json::json!({ "name": "line1", "host": "127.0.0.1", "port": sim.addr.port() }),
+        serde_json::json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": sim.addr.port() } }),
     )
     .await;
     let conn_id = conn_json["id"].as_i64().unwrap();
@@ -1092,7 +1092,7 @@ async fn creating_a_tag_with_a_pre_t2_payload_still_works_and_defaults_writable_
         "POST",
         "/api/plc-connections",
         &app.token,
-        serde_json::json!({ "name": "line1", "host": "127.0.0.1", "port": sim.addr.port() }),
+        serde_json::json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": sim.addr.port() } }),
     )
     .await;
     let conn_id = conn_json["id"].as_i64().unwrap();

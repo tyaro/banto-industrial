@@ -250,6 +250,51 @@ impl banto_driver_api::DriverBase for FakePlcDriver {
     ) -> Vec<banto_driver_api::FieldError> {
         Vec::new()
     }
+    /// R2b-6b: the real driver's form (keys, ranges, defaults) for this stand-in's
+    /// grammar, so the REST `settings` shape goes through `settings_from_schema` as in
+    /// production (`banto-driver-modbus` / `banto-driver-slmp`'s `settings_schema`).
+    fn settings_schema(&self) -> banto_driver_api::SettingsSchema {
+        use banto_driver_api::{ChoiceOption, FieldKind, SettingField, SettingsSchema};
+        let word_order = |default: &str| {
+            SettingField::new(
+                "word_order",
+                "ワード順",
+                FieldKind::choice(vec![
+                    ChoiceOption::new("low_high", "low_high"),
+                    ChoiceOption::new("high_low", "high_low"),
+                ]),
+            )
+            .default(default)
+        };
+        let host = SettingField::new("host", "ホスト", FieldKind::host()).required();
+        let port = |default: i64| {
+            SettingField::new("port", "ポート", FieldKind::integer(1, 65_535))
+                .required()
+                .default(default)
+        };
+        match self.grammar.as_str() {
+            "modbus-tcp" => SettingsSchema::new(vec![
+                host,
+                port(502),
+                SettingField::new("unit_id", "ユニットID", FieldKind::integer(0, 255)).default(1),
+                word_order("high_low"),
+            ]),
+            _ => SettingsSchema::new(vec![
+                host,
+                port(5007),
+                SettingField::new(
+                    "cpu_type",
+                    "CPU種別",
+                    FieldKind::choice(vec![
+                        ChoiceOption::new("R", "R"),
+                        ChoiceOption::new("Q", "Q"),
+                    ]),
+                )
+                .default("R"),
+                word_order("low_high"),
+            ]),
+        }
+    }
     /// R2b-2c: reads an address with `banto_plc`'s grammar of this stand-in's id
     /// (what the real drivers do; canonical = `Display`), because the Hub's plan and
     /// its immediate reads / writes now ask the driver. Any other grammar refuses.

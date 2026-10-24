@@ -7,17 +7,18 @@
 //! で使う。外から使われるパス（`crate::rest::X`）は親の re-export で保つ。
 
 use super::{
-    actor_identity, broadcast, commit_catalog_and_notify, get, json, middleware, post,
-    preflight_api_error, preflight_transaction, record_write, redact_pending_change_for_response,
-    registry_before, reject_delete_if_referenced_by_sink_group, reject_hub_connection_protocol,
-    remove_tag_from_all_sink_groups, require_session, require_session_role, storage_api_error,
-    ApiError, Arc, AsyncMutex, AuditEntry, AuditLogService, AuthGate, AuthState, BantoError,
-    BatchTagDeleteOutcome, BatchTagOutcome, BatchTagUpdateOutcome, CollectionController,
-    CollectionGroupPayload, CollectionGroupService, CollectorManager, Deserialize, FieldError,
-    HeaderMap, IntoResponse, Json, OperationKind, Path, PendingChange, PendingChangesService,
-    PlcConnectionPayload, PlcConnectionResponse, PlcConnectionService, Query, Response, Role,
-    Router, Serialize, ServerEvent, SessionRoleGuard, State, StatusCode, TagBatchUpdatePayload,
-    TagInput, TagPayload, TagService, TagUpdateError, LIVE_APPLY_RECOVERY_HINT,
+    actor_identity, broadcast, commit_catalog_and_notify, default_payload_enabled, get, json,
+    middleware, post, preflight_api_error, preflight_transaction, record_write,
+    redact_pending_change_for_response, registry_before, reject_delete_if_referenced_by_sink_group,
+    reject_hub_connection_protocol, remove_tag_from_all_sink_groups, require_session,
+    require_session_role, storage_api_error, ApiError, Arc, AsyncMutex, AuditEntry,
+    AuditLogService, AuthGate, AuthState, BantoError, BatchTagDeleteOutcome, BatchTagOutcome,
+    BatchTagUpdateOutcome, CollectionController, CollectionGroupPayload, CollectionGroupService,
+    CollectorManager, Deserialize, FieldError, HeaderMap, IntoResponse, Json, OperationKind, Path,
+    PendingChange, PendingChangesService, PlcConnectionPayload, PlcConnectionResponse,
+    PlcConnectionService, Query, Response, Role, Router, Serialize, ServerEvent, SessionRoleGuard,
+    State, StatusCode, TagBatchUpdatePayload, TagInput, TagPayload, TagService, TagUpdateError,
+    LIVE_APPLY_RECOVERY_HINT,
 };
 
 #[derive(Clone)]
@@ -49,40 +50,66 @@ struct PendingChangeWithId {
     id: i64,
 }
 
-/// R2b-1e（docs/banto-hub-connection-settings-design.md §5.3）: `plc_connections.create` /
-/// `.update` のキューのペイロードの `input`。REST・MCP の入力の形（[`PlcConnectionPayload`]）に、
-/// 積む時点で封印したパスワード（`sealedPassword`、`crate::secrets::sealed_password_json`）が
-/// 加わる。`sealedPassword` は**キューの中だけ**の欄で、REST・MCP の入力の型
-/// （[`PlcConnectionPayload`]）は受けない（外から封印した値を差し込ませない）。
+/// R2b-1e・R2b-6b（docs/banto-hub-connection-settings-design.md §5.3、
+/// docs/banto-hub-driver-ui-design.md §5）: `plc_connections.create` / `.update` のキューの
+/// ペイロードの `input`。REST の入力の形（[`PlcConnectionPayload`]、`settings` の形）に、
+/// 積む時点で封印した秘密値（`sealedSecrets`: キー → `crate::secrets::sealed_password_json`
+/// の形、`PlcConnectionPayload::queue_form`）が加わる。`sealedSecrets` は**キューの中だけ**の
+/// 欄で、REST・MCP の入力の型（[`PlcConnectionPayload`]）は受けない（外から封印した値を
+/// 差し込ませない）。
+///
+/// R2b-6b より前の平らな形（`host`・`port`・`password`・`sealedPassword` …）は読めない
+/// （`deny_unknown_fields`）。適用は失敗し、起動時の後処理が捨てる（Q10、
+/// `crate::upgrade::discard_old_connection_queue`）。
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct QueuedPlcConnectionPayload {
-    #[serde(flatten)]
-    payload: PlcConnectionPayload,
-    #[serde(default, rename = "sealedPassword")]
-    sealed_password: Option<serde_json::Value>,
+    name: String,
+    protocol: String,
+    #[serde(default = "default_payload_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    simulation: bool,
+    #[serde(default)]
+    settings: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    sealed_secrets: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
 impl QueuedPlcConnectionPayload {
-    /// 入力と封印した値に分ける。封印した値の形が違えば `password` の項目エラー（値は
-    /// 載せない）。
+    /// 入力と封印した値に分ける。封印した値の形が違えばそのキーの項目エラー（値は載せない）。
+    #[allow(clippy::type_complexity)]
     fn into_parts(
         self,
-    ) -> Result<(PlcConnectionPayload, Option<crate::secrets::SealedSecret>), PendingApplyError>
-    {
-        let sealed = match self.sealed_password {
-            None | Some(serde_json::Value::Null) => None,
-            Some(value) => Some(
-                crate::secrets::parse_sealed_password(&value).map_err(|err| {
-                    PendingApplyError::Api(ApiError(BantoError::Validation {
-                        field_errors: vec![FieldError {
-                            field: "password".to_string(),
-                            message: format!("未適用キューの封印したパスワードを読めません: {err}"),
-                        }],
-                    }))
-                })?,
-            ),
-        };
-        Ok((self.payload, sealed))
+    ) -> Result<
+        (
+            PlcConnectionPayload,
+            std::collections::BTreeMap<String, crate::secrets::SealedSecret>,
+        ),
+        PendingApplyError,
+    > {
+        let mut sealed = std::collections::BTreeMap::new();
+        for (key, value) in self.sealed_secrets {
+            let parsed = crate::secrets::parse_sealed_password(&value).map_err(|err| {
+                PendingApplyError::Api(ApiError(BantoError::Validation {
+                    field_errors: vec![FieldError {
+                        field: key.clone(),
+                        message: format!("未適用キューの封印した秘密値を読めません: {err}"),
+                    }],
+                }))
+            })?;
+            sealed.insert(key, parsed);
+        }
+        Ok((
+            PlcConnectionPayload {
+                name: self.name,
+                protocol: self.protocol,
+                enabled: self.enabled,
+                simulation: self.simulation,
+                settings: self.settings,
+            },
+            sealed,
+        ))
     }
 }
 
@@ -308,17 +335,18 @@ async fn execute_pending_apply(
             let body: PendingChangeWithInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
             let (input, sealed) = body.input.into_parts()?;
-            reject_hub_connection_protocol(&input)
+            reject_hub_connection_protocol(&input.protocol)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
+            let secret_keys = state.plc_connections.secret_keys(&input.protocol);
             // R2b-1e: the password sealed at enqueue time is passed on sealed (never
             // opened back to plaintext here); an old row's plaintext is sealed now.
             state
                 .plc_connections
-                .create_tx(
+                .create_settings_tx(
                     &mut tx,
                     input
-                        .into_input_with_sealed(sealed)
+                        .into_input_with_sealed(&secret_keys, sealed)
                         .map_err(ApiError)
                         .map_err(PendingApplyError::Api)?,
                 )
@@ -331,9 +359,10 @@ async fn execute_pending_apply(
             let body: PendingChangeWithIdAndInput<QueuedPlcConnectionPayload> =
                 decode_pending_payload(pending)?;
             let (input, sealed) = body.input.into_parts()?;
-            reject_hub_connection_protocol(&input)
+            reject_hub_connection_protocol(&input.protocol)
                 .map_err(ApiError)
                 .map_err(PendingApplyError::Api)?;
+            let secret_keys = state.plc_connections.secret_keys(&input.protocol);
             if let Some(expected) = &pending.base_fingerprint {
                 // Plain pool read (not part of `tx` above) — same source as
                 // `compute_pending_base_fingerprint` used at enqueue time.
@@ -360,11 +389,11 @@ async fn execute_pending_apply(
             }
             state
                 .plc_connections
-                .update_tx(
+                .update_settings_tx(
                     &mut tx,
                     body.id,
                     input
-                        .into_input_with_sealed(sealed)
+                        .into_input_with_sealed(&secret_keys, sealed)
                         .map_err(ApiError)
                         .map_err(PendingApplyError::Api)?,
                 )

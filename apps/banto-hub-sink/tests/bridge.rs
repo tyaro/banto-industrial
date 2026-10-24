@@ -800,9 +800,7 @@ async fn bridge_delivers_values_and_follows_collection_ws_and_db_outages() {
         &format!("/api/plc-connections/{}", push.id),
         &app.token,
         Some(
-            json!({ "name": source_name, "protocol": "push", "host": "", "port": 0,
-            "enabled": true,
-            "settings": bridge_settings(pg.id, 3_000,
+            json!({ "name": source_name, "protocol": "push", "enabled": true, "settings": bridge_settings(pg.id, 3_000,
                 &[query("SELECT 43.5::float8 AS a, false AS b, 7::int4 AS n")]) }),
         ),
     )

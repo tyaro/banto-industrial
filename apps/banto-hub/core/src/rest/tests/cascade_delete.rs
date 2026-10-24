@@ -17,7 +17,7 @@ async fn plc_connections_delete_cascades_when_it_has_groups_and_tags() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-cascade", "host": "127.0.0.1", "port": 15060 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-cascade", "settings": { "host": "127.0.0.1", "port": 15060 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -90,7 +90,7 @@ async fn collection_groups_delete_cascades_when_it_has_tags() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-cascade-2", "host": "127.0.0.1", "port": 15061 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-cascade-2", "settings": { "host": "127.0.0.1", "port": 15061 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");

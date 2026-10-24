@@ -352,16 +352,16 @@ async fn write_without_csrf_header(
     response.status()
 }
 
-/// `POST /api/plc-connections/test`のペイロード(`PlcConnectionTestPayload`の
-/// JSON表現、camelCase)。
+/// `POST /api/plc-connections/test`のペイロード(R2b-6b の `PlcConnectionTestPayload`:
+/// `{ protocol, simulation, settings, connectionId? }`。`settings` はドライバのスキーマの
+/// 欄で、`unit_id` は Modbus だけ)。
 fn test_payload(protocol: &str, host: &str, port: u16, simulation: bool) -> Value {
-    json!({
-        "protocol": protocol,
-        "host": host,
-        "port": port,
-        "unitId": 1,
-        "simulation": simulation,
-    })
+    let settings = if protocol == "modbus-tcp" {
+        json!({ "host": host, "port": port, "unit_id": 1 })
+    } else {
+        json!({ "host": host, "port": port })
+    };
+    json!({ "protocol": protocol, "simulation": simulation, "settings": settings })
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +455,7 @@ async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
     for (cpu, sub) in [("R", 0x0002u16), ("Q", 0x0000u16)] {
         let sim = SlmpSimulator::start().await;
         let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
-        payload["cpuType"] = json!(cpu);
+        payload["settings"]["cpu_type"] = json!(cpu);
         let (status, body) = admin_write(
             &app.router,
             "POST",
@@ -471,12 +471,12 @@ async fn slmp_test_direct_dial_uses_the_requested_cpu_type() {
     }
 }
 
-/// #790（Codex のレビュー P3）: 直接ダイヤルで `cpuType` を省くと、`connectionId` の
-/// 保存済み接続が同じプロトコル（slmp）ならその CPU（Q）でフレームを組む。保存済みの
-/// プロトコルが違えば引き継がず、ドライバの既定（iQ-R）で組む。収集していない接続
-/// （共有セッションが無い）なので直接ダイヤルの経路を通る。
+/// R2b-6b（設計 §5）: 接続テストの `settings` はフォームの値だけで組む。`cpu_type` を省くと、
+/// `connectionId` の保存済み接続が Q でも、スキーマの既定（iQ-R）でフレームを組む（#790 の
+/// 「保存済みの CPU を引き継ぐ」は MCP の平らな形のアダプタだけに残した）。収集していない
+/// 接続（共有セッションが無い）なので直接ダイヤルの経路を通る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn slmp_test_direct_dial_inherits_the_saved_cpu_only_from_the_same_protocol() {
+async fn slmp_test_direct_dial_takes_the_omitted_cpu_from_the_schema_default() {
     let app = test_app("t12-slmp-cpu-inherit").await;
     let sim = SlmpSimulator::start().await;
     let service = PlcConnectionService::new(app.pool.clone());
@@ -493,8 +493,8 @@ async fn slmp_test_direct_dial_inherits_the_saved_cpu_only_from_the_same_protoco
     );
 
     for (id, sub, why) in [
-        (slmp_q.id, 0x0000u16, "同じプロトコルの Q を引き継ぐ"),
-        (modbus.id, 0x0002u16, "プロトコルが違えばドライバの既定 R"),
+        (slmp_q.id, 0x0002u16, "保存済みが Q でもスキーマの既定 R"),
+        (modbus.id, 0x0002u16, "プロトコルが違ってもスキーマの既定 R"),
     ] {
         let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
         payload["connectionId"] = json!(id);
@@ -518,7 +518,7 @@ async fn slmp_test_direct_dial_inherits_the_saved_cpu_only_from_the_same_protoco
 async fn slmp_test_rejects_an_unknown_cpu_type() {
     let app = test_app("t12-slmp-cpu-unknown").await;
     let mut payload = test_payload("slmp", "127.0.0.1", 1, false);
-    payload["cpuType"] = json!("L");
+    payload["settings"]["cpu_type"] = json!("L");
     let (status, body) = admin_write(
         &app.router,
         "POST",
@@ -578,14 +578,7 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
         "POST",
         "/api/plc-connections/test",
         &app.admin_token,
-        json!({
-            "protocol": "slmp",
-            "host": "127.0.0.1",
-            "port": sim.addr.port(),
-            "unitId": 1,
-            "simulation": false,
-            "connectionId": conn.id,
-        }),
+        json!({ "protocol": "slmp", "simulation": false, "connectionId": conn.id, "settings": { "host": "127.0.0.1", "port": sim.addr.port() } }),
     )
     .await;
 
@@ -648,15 +641,7 @@ async fn slmp_test_refuses_a_session_whose_cpu_differs_from_the_form() {
                 "POST",
                 "/api/plc-connections/test",
                 &token,
-                json!({
-                    "protocol": "slmp",
-                    "host": "127.0.0.1",
-                    "port": port,
-                    "unitId": 1,
-                    "simulation": false,
-                    "connectionId": id,
-                    "cpuType": cpu,
-                }),
+                json!({ "protocol": "slmp", "simulation": false, "connectionId": id, "settings": { "host": "127.0.0.1", "port": port, "cpu_type": cpu } }),
             )
             .await
         }
@@ -711,7 +696,7 @@ async fn start_collecting(app: &TestApp, input: PlcConnectionInput) -> i64 {
 }
 
 /// R2b-3a-2（Codex のレビュー）: 収集中の共有セッションと、フォームの host / port /
-/// unitId が食い違うときは、そのセッションの読みをフォームの結果として返さない。
+/// unit_id が食い違うときは、そのセッションの読みをフォームの結果として返さない。
 /// 2 本目もダイヤルせず「保存してからテスト」と返す。
 async fn assert_form_differing_from_the_session_is_refused(
     name: &str,
@@ -731,14 +716,15 @@ async fn assert_form_differing_from_the_session_is_refused(
         };
     let id = start_collecting(&app, input).await;
     let before = app.sessions.connection_count();
-    let mut payload = json!({
-        "protocol": protocol,
-        "host": "127.0.0.1",
-        "port": port,
-        "unitId": 1,
-        "simulation": false,
-        "connectionId": id,
-    });
+    // The form matches the saved row (Modbus: the saved `low_high`, not the schema default).
+    let mut payload = if protocol == "slmp" {
+        json!({ "protocol": protocol, "simulation": false, "connectionId": id,
+                "settings": { "host": "127.0.0.1", "port": port } })
+    } else {
+        json!({ "protocol": protocol, "simulation": false, "connectionId": id,
+                "settings": { "host": "127.0.0.1", "port": port, "unit_id": 1,
+                              "word_order": "low_high" } })
+    };
     change(&mut payload);
     let (status, body) = admin_write(
         &app.router,
@@ -763,7 +749,7 @@ async fn assert_form_differing_from_the_session_is_refused(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_refuses_a_session_whose_host_differs_from_the_form() {
     assert_form_differing_from_the_session_is_refused("t12-session-host", "slmp", |p| {
-        p["host"] = json!("127.0.0.2");
+        p["settings"]["host"] = json!("127.0.0.2");
     })
     .await;
 }
@@ -771,8 +757,8 @@ async fn test_refuses_a_session_whose_host_differs_from_the_form() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_refuses_a_session_whose_port_differs_from_the_form() {
     assert_form_differing_from_the_session_is_refused("t12-session-port", "slmp", |p| {
-        let port = p["port"].as_u64().unwrap();
-        p["port"] = json!(port + 1);
+        let port = p["settings"]["port"].as_u64().unwrap();
+        p["settings"]["port"] = json!(port + 1);
     })
     .await;
 }
@@ -780,7 +766,7 @@ async fn test_refuses_a_session_whose_port_differs_from_the_form() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn modbus_test_refuses_a_session_whose_unit_id_differs_from_the_form() {
     assert_form_differing_from_the_session_is_refused("t12-session-unit", "modbus-tcp", |p| {
-        p["unitId"] = json!(2);
+        p["settings"]["unit_id"] = json!(2);
     })
     .await;
 }
@@ -847,14 +833,9 @@ async fn modbus_test_reuses_existing_broker_session_without_dialing_a_second_soc
         "POST",
         "/api/plc-connections/test",
         &app.admin_token,
-        json!({
-            "protocol": "modbus-tcp",
-            "host": "127.0.0.1",
-            "port": sim.addr.port(),
-            "unitId": 1,
-            "simulation": false,
-            "connectionId": conn.id,
-        }),
+        json!({ "protocol": "modbus-tcp", "simulation": false, "connectionId": conn.id,
+                "settings": { "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1,
+                              "word_order": "low_high" } }),
     )
     .await;
 
@@ -916,6 +897,109 @@ async fn simulation_flag_is_rejected_as_unsupported() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["ok"], false, "{body:?}");
     assert_eq!(body["error"]["kind"], "unsupported", "{body:?}");
+}
+
+/// R2b-6b（設計 §5・§10）: `simulation: true` は新規（`connectionId` 無し）でも編集中
+/// （保存済みの接続の id つき）でも、ダイヤルの前に断る。実機の代わりのシミュレータは
+/// 1 本も受けず（ダイヤル 0 回・読み取り 0 回）。保存済みの行は実機（`simulation: false`）の
+/// まま、フォームの今の値だけが SIM。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulation_true_never_dials_for_a_new_or_an_edited_connection() {
+    let app = test_app("t12-simulation-edit").await;
+    let sim = ModbusSimulator::start().await;
+    let saved = PlcConnectionService::new(app.pool.clone())
+        .create(modbus_conn_input("line1", sim.addr.port()))
+        .await
+        .unwrap();
+    assert!(!saved.simulation);
+    for connection_id in [None, Some(saved.id)] {
+        let mut payload = test_payload("modbus-tcp", "127.0.0.1", sim.addr.port(), true);
+        if let Some(id) = connection_id {
+            payload["connectionId"] = json!(id);
+        }
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["ok"], false, "{body:?}");
+        assert_eq!(body["error"]["kind"], "unsupported", "{body:?}");
+    }
+    assert_eq!(sim.connection_count(), 0, "no dial, no read");
+    sim.stop();
+}
+
+/// R2b-6b（設計 §5・§10）: 編集中の接続テストは、保存済みの値ではなくフォームの値（変えた
+/// ポート）で張る。保存済みの行は閉じたポートを指しているが、フォームはシミュレータの
+/// ポートなので通る。収集していない接続なので直接ダイヤルの経路。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edited_connection_is_tested_with_the_form_values() {
+    let app = test_app("t12-edit-values").await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let closed_port = closed.local_addr().unwrap().port();
+    drop(closed);
+    let saved = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("line1", closed_port))
+        .await
+        .unwrap();
+    let sim = SlmpSimulator::start().await;
+    let mut payload = test_payload("slmp", "127.0.0.1", sim.addr.port(), false);
+    payload["connectionId"] = json!(saved.id);
+    payload["settings"]["cpu_type"] = json!("Q");
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert_eq!(sim.last_subcommand(), Some(0x0000), "the form's Q frame");
+    sim.stop();
+}
+
+/// R2b-6b: 接続テストの `settings` はスキーマに通す。未知のキー・型違い（文字列の
+/// ポート）はダイヤルせずに断り、平らな形の古い本文は 422。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_connection_test_refuses_unknown_keys_wrong_types_and_the_flat_shape() {
+    let app = test_app("t12-test-schema").await;
+    let sim = ModbusSimulator::start().await;
+    let mut payload = test_payload("modbus-tcp", "127.0.0.1", sim.addr.port(), false);
+    payload["settings"]["port"] = json!(sim.addr.port().to_string());
+    payload["settings"]["cpu_type"] = json!("R");
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("port") && message.contains("cpu_type"),
+        "{message}"
+    );
+    assert_eq!(sim.connection_count(), 0, "no dial");
+
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({ "protocol": "modbus-tcp", "host": "127.0.0.1", "port": sim.addr.port() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    sim.stop();
 }
 
 // ---------------------------------------------------------------------------

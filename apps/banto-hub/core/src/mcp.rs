@@ -97,10 +97,16 @@ use crate::rest::{
     registry_before, run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
     validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
     CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
-    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionTestPayload, StoreSettingsRequest,
-    StoreSettingsResponse, TagPayload, TagSpaceState,
+    MqttSettingsResponse, StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
+
+// R2b-6b: MCP の接続ツールの平らな形のアダプタ（R2b-7 で消える）。
+mod flat_connection;
+use flat_connection::{
+    flat_connection_response, flat_connection_responses, FlatPlcConnectionPayload,
+    FlatPlcConnectionTestPayload,
+};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
 use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
@@ -1873,7 +1879,7 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
     // へ変換してから返す（`crate::rest::PlcConnectionResponse`の doc comment参照、
     // REST の `plc_connections_list`と同じ変換）。
     // PR #777 review P2: the rows and their sealed rows in one read transaction.
-    match crate::rest::connection_responses(&state.plc_connections).await {
+    match flat_connection_responses(&state.plc_connections).await {
         Ok(connections) => tool_ok(json!({ "connections": connections })),
         Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
     }
@@ -1897,18 +1903,26 @@ async fn tool_create_connection(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
-    let input: PlcConnectionPayload = serde_json::from_value(arguments)
+    let flat: FlatPlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
-    // #383 段階3 P2: banto-hub は `hub` 接続を作らない - キューへ積む前に拒否
-    // （`crate::rest::reject_hub_connection_protocol`）。
-    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input) {
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&flat.protocol) {
         return Ok(banto_error_tool_error(&err));
     }
+    // R2b-6b: 平らな形の旧い検証 (1) を今の項目名で掛けてから `settings` の形に写す。
+    if let Err(err) = flat.check(&state.plc_connections) {
+        return Ok(banto_error_tool_error(&err));
+    }
+    let input = flat.into_settings_payload(None);
+    let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        let payload = json!({ "input": input });
+        let form = match input.clone().queue_form(&secret_keys) {
+            Ok(form) => form,
+            Err(err) => return Ok(banto_error_tool_error(&err)),
+        };
+        let payload = json!({ "input": form });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
             &state.collection_groups,
@@ -1952,8 +1966,8 @@ async fn tool_create_connection(
     }
 
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
-    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
-    let input = match input.into_input() {
+    // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
+    let input = match input.into_input(&secret_keys) {
         Ok(input) => input,
         Err(err) => return Ok(banto_error_tool_error(&err)),
     };
@@ -1973,7 +1987,11 @@ async fn tool_create_connection(
             return Ok(banto_error_tool_error(&err.0));
         }
     };
-    let created = match state.plc_connections.create_tx(&mut tx, input).await {
+    let created = match state
+        .plc_connections
+        .create_settings_tx(&mut tx, input)
+        .await
+    {
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2008,7 +2026,7 @@ async fn tool_create_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    match crate::rest::connection_response(&state.plc_connections, created).await {
+    match flat_connection_response(&state.plc_connections, created).await {
         Ok(created) => Ok(tool_ok(json!({ "created": created }))),
         Err(err) => Ok(tool_error(format!(
             "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
@@ -2280,18 +2298,28 @@ async fn tool_update_connection(
         .get("id")
         .and_then(Value::as_i64)
         .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
-    let input: PlcConnectionPayload = serde_json::from_value(arguments)
+    let flat: FlatPlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
-    // #383 段階3 P2: banto-hub は `hub` 接続を作らない - キューへ積む前に拒否
-    // （`crate::rest::reject_hub_connection_protocol`）。
-    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input) {
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&flat.protocol) {
         return Ok(banto_error_tool_error(&err));
     }
+    // R2b-6b: 平らな形の旧い検証 (1) を今の項目名で掛けてから `settings` の形に写す。今の
+    // 「省略は保つ」（slmp の cpuType・push の settings）は保存済みの行から補う。
+    if let Err(err) = flat.check(&state.plc_connections) {
+        return Ok(banto_error_tool_error(&err));
+    }
+    let stored = state.plc_connections.get(id).await.ok();
+    let input = flat.into_settings_payload(stored.as_ref());
+    let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        let payload = json!({ "id": id, "input": input });
+        let form = match input.clone().queue_form(&secret_keys) {
+            Ok(form) => form,
+            Err(err) => return Ok(banto_error_tool_error(&err)),
+        };
+        let payload = json!({ "id": id, "input": form });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
             &state.collection_groups,
@@ -2335,8 +2363,8 @@ async fn tool_update_connection(
     }
 
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
-    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
-    let input = match input.into_input() {
+    // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
+    let input = match input.into_input(&secret_keys) {
         Ok(input) => input,
         Err(err) => return Ok(banto_error_tool_error(&err)),
     };
@@ -2356,7 +2384,11 @@ async fn tool_update_connection(
             return Ok(banto_error_tool_error(&err.0));
         }
     };
-    let updated = match state.plc_connections.update_tx(&mut tx, id, input).await {
+    let updated = match state
+        .plc_connections
+        .update_settings_tx(&mut tx, id, input)
+        .await
+    {
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -2391,7 +2423,7 @@ async fn tool_update_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    match crate::rest::connection_response(&state.plc_connections, updated).await {
+    match flat_connection_response(&state.plc_connections, updated).await {
         Ok(updated) => Ok(tool_ok(json!({ "updated": updated }))),
         Err(err) => Ok(tool_error(format!(
             "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
@@ -2416,8 +2448,14 @@ async fn tool_test_connection(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
-    let payload: PlcConnectionTestPayload = serde_json::from_value(arguments)
+    let flat: FlatPlcConnectionTestPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続テストの入力が不正です: {err}")))?;
+    // R2b-6b: 平らな値を `settings` の形に写す（省いた wordOrder・cpuType は保存済みから）。
+    let saved = match flat.connection_id {
+        Some(id) => state.plc_connections.get(id).await.ok(),
+        None => None,
+    };
+    let payload = flat.into_test_payload(saved.as_ref());
 
     let result = run_plc_connection_test(&state.manager, &payload).await;
     Ok(tool_ok(

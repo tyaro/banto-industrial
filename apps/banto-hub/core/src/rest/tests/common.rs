@@ -132,11 +132,12 @@ async fn test_env_on_pool(
     let (tx, _rx) = tokio_broadcast::channel(16);
     let users = UsersService::new(Db::Sqlite(pool.clone()));
     let audit = AuditLogService::new(Db::Sqlite(pool.clone()));
-    let plc_connections = PlcConnectionService::new(pool.clone());
     let collection_groups = CollectionGroupService::new(pool.clone());
     let tags = TagService::new(pool.clone());
     let api_keys = ApiKeysService::new(pool.clone());
     let (manager, dir) = test_manager_with_clock(pool.clone(), clock);
+    // R2b-6b: like production (`crate::runtime`), the REST service carries the registry.
+    let plc_connections = manager.plc_connections();
 
     users
         .setup_first_user("admin", "password123", "管理者")
@@ -461,7 +462,7 @@ pub(super) async fn seed_scope_fixture(router: &Router, admin_token: &str) {
         router,
         "/api/plc-connections",
         admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15101 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15101 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn1:?}");
@@ -493,7 +494,7 @@ pub(super) async fn seed_scope_fixture(router: &Router, admin_token: &str) {
         router,
         "/api/plc-connections",
         admin_token,
-        json!({ "name": "line2", "host": "127.0.0.1", "port": 15102 }),
+        json!({ "protocol": "modbus-tcp", "name": "line2", "settings": { "host": "127.0.0.1", "port": 15102 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn2:?}");

@@ -48,8 +48,7 @@ async fn create(env: &TestEnv, body: Value) -> Value {
 async fn postgres(env: &TestEnv, name: &str) -> i64 {
     create(
         env,
-        json!({ "name": name, "protocol": "postgres", "host": "10.0.0.5", "port": 5432,
-                "database": "mes", "username": "reader", "password": "s3cret" }),
+        json!({ "name": name, "protocol": "postgres", "settings": { "host": "10.0.0.5", "port": 5432, "database": "mes", "username": "reader", "password": "s3cret" } }),
     )
     .await["id"]
         .as_i64()
@@ -73,8 +72,7 @@ async fn the_status_ingest_section_reports_the_sender_without_secrets_or_values(
     let env = test_env_with_clock(clock.clone()).await;
     let conn = create(
         &env,
-        json!({ "name": "Script1", "protocol": "push", "host": "", "port": 0,
-                "settings": { "stale_timeout_ms": 2000 } }),
+        json!({ "name": "Script1", "protocol": "push", "settings": { "stale_timeout_ms": 2000 } }),
     )
     .await;
     let id = conn["id"].as_i64().unwrap();
@@ -188,16 +186,15 @@ async fn the_status_ingest_section_is_empty_without_push_connections() {
     assert_eq!(admin["ingest"], json!([]));
 }
 
-/// §3.2: `settings` の REST の往復。省略した更新は保ち、`{}` でブリッジを外す。push
-/// 以外の `settings` は 422。
+/// §3.2: `settings` の REST の往復。R2b-6b から更新は `settings` を丸ごと置き換える（省略は
+/// 既定の `{}`）、`{}` でブリッジを外す。ドライバのスキーマに無い欄は 422。
 #[tokio::test]
 async fn push_settings_round_trip_through_rest() {
     let env = test_env().await;
     let db = postgres(&env, "pg-a").await;
     let created = create(
         &env,
-        json!({ "name": "Bridge1", "protocol": "push", "host": "", "port": 0,
-                "settings": bridge(db) }),
+        json!({ "name": "Bridge1", "protocol": "push", "settings": bridge(db) }),
     )
     .await;
     let id = created["id"].as_i64().unwrap();
@@ -210,50 +207,57 @@ async fn push_settings_round_trip_through_rest() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(got["settings"], bridge(db));
-    // postgres 接続の応答は settings を null で返す（パスワードは返さない）。
+    // R2b-6b: postgres 接続の応答の settings は秘密のキーを `{"$secret": ...}` で返す
+    // （値は返さない）。
     let (_, pg) = admin_get(
         &env.router,
         &format!("/api/plc-connections/{db}"),
         &env.admin_token,
     )
     .await;
-    assert_eq!(pg["settings"], Value::Null);
+    assert!(pg["settings"]["host"].is_string(), "{pg}");
+    assert!(
+        pg["settings"].get("password").is_none_or(Value::is_object),
+        "{pg}"
+    );
     assert!(pg.get("password").is_none());
 
-    // 省略した更新（この項目を知らないクライアント）は保つ。
-    let (status, kept) = admin_put(
+    // R2b-6b: 更新は丸ごと置き換え（`settings` の省略は既定）。
+    let (status, replaced) = admin_put(
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "Bridge1 renamed", "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": "Bridge1 renamed", "protocol": "push" }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{kept:?}");
-    assert_eq!(kept["settings"], bridge(db));
+    assert_eq!(status, StatusCode::OK, "{replaced:?}");
+    assert_eq!(replaced["settings"], json!({}));
     // `{}` でブリッジを外す。
     let (status, cleared) = admin_put(
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "Bridge1", "protocol": "push", "host": "", "port": 0, "settings": {} }),
+        json!({ "name": "Bridge1", "protocol": "push", "settings": {} }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{cleared:?}");
-    // R2b-1d: the defaults read back as `null` (the column is `{}`, alpha.33 answered `null`
-    // for a push row on its defaults - design §2 keeps the REST shape).
-    assert_eq!(cleared["settings"], Value::Null);
+    // R2b-6b: the defaults read back as `{}` (the stored object).
+    assert_eq!(cleared["settings"], json!({}));
 
-    // push 以外で settings は 422（項目は settings）。
+    // ドライバのスキーマに無い欄（push の欄を modbus-tcp に）は 422（項目は JSON のキー）。
     let (status, refused) = admin_post(
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "plc", "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 502,
-                "settings": {} }),
+        json!({ "name": "plc", "protocol": "modbus-tcp",
+                "settings": { "host": "127.0.0.1", "port": 502, "stale_timeout_ms": 2000 } }),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused:?}");
-    assert!(refused.to_string().contains("settings"), "{refused:?}");
+    assert_eq!(
+        refused["field_errors"][0]["field"], "stale_timeout_ms",
+        "{refused:?}"
+    );
     // 見積もりを超えるブリッジは 422（`settings.bridge`、§7.1 の文言）。
     let queries: Vec<Value> = ["a", "b", "c"]
         .iter()
@@ -267,7 +271,7 @@ async fn push_settings_round_trip_through_rest() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "Fast", "protocol": "push", "host": "", "port": 0, "settings": fast }),
+        json!({ "name": "Fast", "protocol": "push", "settings": fast }),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused:?}");
@@ -286,8 +290,7 @@ async fn deleting_a_postgres_connection_a_bridge_reads_is_refused() {
     let unused = postgres(&env, "pg-b").await;
     let bridge_id = create(
         &env,
-        json!({ "name": "Bridge1", "protocol": "push", "host": "", "port": 0,
-                "settings": bridge(db) }),
+        json!({ "name": "Bridge1", "protocol": "push", "settings": bridge(db) }),
     )
     .await["id"]
         .as_i64()
@@ -323,8 +326,7 @@ async fn deleting_a_postgres_connection_a_bridge_reads_is_refused() {
         &env.router,
         &format!("/api/plc-connections/{bridge_id}"),
         &env.admin_token,
-        json!({ "name": "Bridge1", "protocol": "push", "host": "", "port": 0,
-                "settings": { "stale_timeout_ms": 5000 } }),
+        json!({ "name": "Bridge1", "protocol": "push", "settings": { "stale_timeout_ms": 5000 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK);

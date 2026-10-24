@@ -30,16 +30,9 @@ const ALL: [&str; 6] = [
 ];
 
 fn pg_body(name: &str, password: Option<&str>) -> serde_json::Value {
-    let mut body = json!({
-        "name": name,
-        "protocol": "postgres",
-        "host": "127.0.0.1",
-        "port": 1,
-        "database": "erp",
-        "username": "reader",
-    });
+    let mut body = json!({ "name": name, "protocol": "postgres", "settings": { "host": "127.0.0.1", "port": 1, "database": "erp", "username": "reader" } });
     if let Some(password) = password {
-        body["password"] = json!(password);
+        body["settings"]["password"] = json!(password);
     }
     body
 }
@@ -165,10 +158,10 @@ async fn every_rest_entrance_leaves_no_known_password_after_the_upkeep() {
         assert_eq!(status, StatusCode::ACCEPTED, "{response:?}");
         let text = response.to_string();
         assert_no_secret(&text, "the queued response");
-        assert!(!text.contains("sealedPassword"), "{text}");
+        assert!(!text.contains("sealedSecrets"), "{text}");
         assert_eq!(
-            response["pending"]["payload"]["input"]["passwordSet"],
-            json!(true)
+            response["pending"]["payload"]["input"]["secretsSet"],
+            json!(["password"])
         );
         queued.push(response["pending"]["id"].as_i64().unwrap());
     }
@@ -206,14 +199,18 @@ async fn every_rest_entrance_leaves_no_known_password_after_the_upkeep() {
     for (id, state, payload) in raw_queue(&env.pool).await {
         let input = &payload["input"];
         assert!(input.get("password").is_none(), "#{id} {state}: {payload}");
+        assert!(
+            input["settings"].get("password").is_none(),
+            "#{id} {state}: {payload}"
+        );
         if cfg!(windows) {
             assert_no_secret(&payload.to_string(), "a DPAPI-sealed queue row");
         }
         match state.as_str() {
-            "pending" => assert!(input.get("sealedPassword").is_some(), "#{id}: {payload}"),
+            "pending" => assert!(input.get("sealedSecrets").is_some(), "#{id}: {payload}"),
             "applied" | "canceled" => {
-                assert!(input.get("sealedPassword").is_none(), "#{id}: {payload}");
-                assert_eq!(input["passwordSet"], json!(true), "#{id}");
+                assert!(input.get("sealedSecrets").is_none(), "#{id}: {payload}");
+                assert_eq!(input["secretsSet"], json!(["password"]), "#{id}");
             }
             other => panic!("unexpected state {other}"),
         }
@@ -222,7 +219,7 @@ async fn every_rest_entrance_leaves_no_known_password_after_the_upkeep() {
     assert_eq!(status, StatusCode::OK);
     let text = listed.to_string();
     assert_no_secret(&text, "GET /api/pending-changes");
-    assert!(!text.contains("sealedPassword"), "{text}");
+    assert!(!text.contains("sealedSecrets"), "{text}");
 
     // The startup upkeep of a Windows Hub (a fake protector here) and its VACUUM.
     let report =

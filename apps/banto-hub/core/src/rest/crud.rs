@@ -142,16 +142,11 @@ pub(super) struct QueuedPendingChangeResponse {
 /// （`crate::pending_changes` のモジュール doc）。この関数は外部へ返す直前の写しにだけ掛け、
 /// **DB の行は変えない**。
 ///
-/// `payload.input.password` と `payload.input.sealedPassword` を取り除き、代わりに
-/// `passwordSet` を入れる（`crate::pending_changes::redact_queued_password`）:
-/// - `"plc_connections.create"`: 封印した値があるか `password` が非空なら `true`、
-///   省略/`null`/空文字列なら `false`。
-/// - `"plc_connections.update"`: **tri-state** - 封印した値（置き換え）なら `true`、
-///   空文字列（消去）なら `false`、省略/`null`（現在のパスワードを維持）なら `null`
-///   （この pending change 自体は「今の保存状態」を持たないので、`true`/`false` の
-///   どちらでもなく `null` とする。現在値は `GET /api/plc-connections/{id}` の
-///   `passwordSet` で別途確認できる）。
-/// - 履歴へ移すときに替えた `passwordSet` はそのまま。
+/// R2b-6b: `payload.input.sealedSecrets`（積む時点で封印した秘密値）を取り除き、代わりに
+/// 封印した値があったキーの一覧 `secretsSet` を入れる
+/// （`crate::pending_changes::redact_queued_password`）。`settings` の秘密のキーの `null`
+/// （消す）は秘密ではないのでそのまま、省略（保つ）は何も足さない。履歴へ移すときに替えた
+/// `secretsSet` はそのまま。
 ///
 /// それ以外の`source`（`"plc_connections.delete"`、`collection_groups.*`、
 /// `tags.*`）は無変更でそのまま返す - password を持ちうるのは
@@ -212,7 +207,7 @@ pub(crate) async fn compute_pending_base_fingerprint(
         // 文字列であり、`pending_changes.base_fingerprint`列（DB に平文で
         // 残る・将来 GET で読めても構わない設計ではない）に平文パスワードを
         // 書き込まないよう、生の`PlcConnection`ではなく`PlcConnectionResponse`
-        // （`passwordSet`のみ）をシリアライズする。パスワードだけを変える
+        // （秘密のキーは `{"$secret": "set"}` だけ、R2b-6b）をシリアライズする。パスワードだけを変える
         // 編集は fingerprint 上「変化なし」に見えうるが、既存の
         // `check_fingerprint_unchanged`はそもそも「同一エディタでの連続編集を
         // 弾く」ための粗い比較であり、この程度の取りこぼしは平文永続化を

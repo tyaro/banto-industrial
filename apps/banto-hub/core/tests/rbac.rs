@@ -48,7 +48,7 @@ use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_server::SessionValidation;
 use banto_server::{AuthState, Identity};
-use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+use banto_tags::{CollectionGroupService, TagService};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -188,7 +188,8 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users.clone(),
         audit,
-        PlcConnectionService::new(pool.clone()),
+        // R2b-6b: like production, the REST service carries the driver registry.
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -278,11 +279,11 @@ async fn role_tokens(app: &TestApp) -> RoleTokens {
     RoleTokens { viewer, editor }
 }
 
-/// 有効な PLC 接続 payload(camelCase, `PlcConnectionPayload`)- 実機/
+/// 有効な PLC 接続 payload(R2b-6b の `settings` の形、`PlcConnectionPayload`)- 実機/
 /// シミュレータへの疎通なしで通る(`plc_connections_create`は persist のみ、
 /// PLC には繋がない)。
 fn valid_connection_payload(name: &str) -> Value {
-    json!({ "name": name, "host": "127.0.0.1", "port": 502 })
+    json!({ "protocol": "modbus-tcp", "name": name, "settings": { "host": "127.0.0.1", "port": 502 } })
 }
 
 fn valid_group_payload(name: &str, conn_id: i64) -> Value {
@@ -338,7 +339,7 @@ async fn viewer_is_forbidden_by_require_editor_on_every_gated_write_endpoint() {
         (
             "POST",
             "/api/plc-connections/test",
-            json!({ "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 502 }),
+            json!({ "protocol": "modbus-tcp", "settings": { "host": "127.0.0.1", "port": 502 } }),
         ),
         (
             "POST",

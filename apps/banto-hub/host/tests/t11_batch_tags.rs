@@ -1640,6 +1640,10 @@ async fn rest_refuses_a_protocol_change_that_leaves_a_tag_unreadable() {
     .await;
     let mut body = connection.clone();
     body["protocol"] = json!("slmp");
+    // R2b-6b: the PUT takes `{ name, protocol, enabled, simulation, settings }` (no `id`),
+    // and `unit_id` is not an SLMP setting.
+    body.as_object_mut().unwrap().remove("id");
+    body["settings"].as_object_mut().unwrap().remove("unit_id");
     let (status, refused) = write_json(
         &app.router,
         "PUT",

@@ -1395,8 +1395,7 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         &format!("/api/plc-connections/{}", fixture.push_id),
         &fixture.app.token,
         Some(
-            json!({ "name": fixture.push_name, "protocol": "push", "host": "", "port": 0,
-            "enabled": true, "settings": settings }),
+            json!({ "name": fixture.push_name, "protocol": "push", "enabled": true, "settings": settings }),
         ),
     )
     .await;

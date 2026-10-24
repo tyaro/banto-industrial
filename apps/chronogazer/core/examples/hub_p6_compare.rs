@@ -611,13 +611,11 @@ async fn configure_hub(
             Some(&json!({
                 "name": HUB_CONN_NAME,
                 "protocol": "slmp",
-                "host": plc_host,
-                "port": plc_port,
-                "unitId": 1,
+                // R2b-6b: the Hub's REST takes the driver's `settings`.
+                "settings": { "host": plc_host, "port": plc_port, "word_order": WORD_ORDER },
                 "enabled": true,
                 // 既定に頼らない（実機を読む）。
                 "simulation": false,
-                "wordOrder": WORD_ORDER,
             })),
         )
         .await?;

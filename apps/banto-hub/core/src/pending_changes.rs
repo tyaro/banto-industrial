@@ -5,18 +5,19 @@
 //! 限定する。実行構成への適用（preflight + apply_run）や controller 連携は
 //! `crate::rest`/`crate::controller` 側が後続スライスで担う。
 //!
-//! # 接続のパスワードを平文で持たない（R2b-1e、docs/banto-hub-connection-settings-design.md §5.3）
+//! # 接続の秘密値を平文で持たない（R2b-1e・R2b-6b、docs/banto-hub-connection-settings-design.md §5.3、docs/banto-hub-driver-ui-design.md §5）
 //!
-//! `plc_connections.create` / `.update` のペイロード（`{"input": PlcConnectionPayload}`）は
-//! パスワードを持ちうる。R2b-1d までは平文の `input.password` のまま保存していた。R2b-1e から:
+//! `plc_connections.create` / `.update` のペイロード（`{"input": ...}`）は秘密値を持ちうる。
+//! R2b-6b から `input` は `settings` の形（`crate::rest::PlcConnectionPayload`）で、秘密の
+//! キー（ドライバの `secret_keys()`）の値は入口が**積む前に**封印して `sealedSecrets` に移す:
 //!
 //! | 場面 | ペイロードの `input` |
 //! | ---- | -------------------- |
-//! | 積む（[`PendingChangesService::create_pending`]、REST・MCP の全入口がここを通る） | 非空の `password` を封印して `sealedPassword`（`crate::secrets::sealed_password_json`）に替える。空文字（消す）と省略・`null`（保つ）はそのまま（秘密ではない） |
+//! | 積む（REST・MCP の入口の `PlcConnectionPayload::queue_form` → [`PendingChangesService::create_pending`]） | 秘密のキーの文字列を封印して `sealedSecrets`（キー → `crate::secrets::sealed_password_json` の形）に移し、`settings` から外す。空文字（消す）は `null`、`null`（消す）と省略（保つ）はそのまま（秘密ではない）。`create_pending` は R2b-6b の形でない接続の提案（平文の `password` を持ちうる古い形）を断る |
 //! | 取り消し・失敗・再投入 | ペイロードごと動く（封印した値のまま。孤児にならない） |
-//! | `applied` / `canceled` へ移す（[`PendingChangesService::mark_applied`]・[`PendingChangesService::cancel_pending`]） | **同じトランザクションで** `password` と `sealedPassword` を外して `passwordSet` に替える（履歴の行に平文も blob も残さない。`plain-v1` の blob は平文そのもの） |
-//! | 応答の写し（`crate::rest` の `redact_pending_change_for_response`） | [`redact_queued_password`]: `password` / `sealedPassword` を外して `passwordSet` |
-//! | 起動時の後処理（`crate::upgrade::secrets_upkeep`） | 未適用（`pending`・`applying`・`failed`）の平文の `password` を封印、`plain-v1` の `sealedPassword` を（protector があれば）封印し直す、履歴から両方を外す |
+//! | `applied` / `canceled` へ移す（[`PendingChangesService::mark_applied`]・[`PendingChangesService::cancel_pending`]） | **同じトランザクションで** `sealedSecrets` を外して `secretsSet`（キーの一覧）に替える（履歴の行に blob を残さない。`plain-v1` の blob は平文そのもの） |
+//! | 応答の写し（`crate::rest` の `redact_pending_change_for_response`） | [`redact_queued_password`]: `sealedSecrets` を外して `secretsSet` |
+//! | 起動時の後処理（`crate::upgrade::secrets_upkeep`） | 未適用（`pending`・`applying`・`failed`）の**古い形の行は捨てる**（Q10、[`is_current_connection_input`]）。`plain-v1` の `sealedSecrets` を（protector があれば）封印し直す、履歴から外す |
 //!
 //! 封印は [`crate::secrets::ConnectionSecrets::platform_default`]（Windows は DPAPI）。
 
@@ -149,15 +150,17 @@ impl PendingChangesService {
         requested_by_username: Option<&str>,
         requested_by_role: Option<&str>,
     ) -> Result<PendingChange, BantoError> {
-        // R2b-1e（設計 §5.3）: 接続のパスワードは積む時点で封印する（平文をキューに置かない）。
-        let mut payload = payload.clone();
-        seal_queued_password(&ConnectionSecrets::platform_default(), source, &mut payload)
-            .map_err(|error| BantoError::Validation {
+        // R2b-6b: 接続の秘密値は入口（`PlcConnectionPayload::queue_form`）が積む前に封印して
+        // `sealedSecrets` に移す。古い平らな形（平文の `password` を持ちうる）は積まない。
+        if !is_current_connection_input(source, payload) {
+            return Err(BantoError::Validation {
                 field_errors: vec![FieldError {
-                    field: "password".to_string(),
-                    message: error.to_string(),
+                    field: "input".to_string(),
+                    message: "接続の提案の形が違います（R2b-6b の settings の形だけを積みます）"
+                        .to_string(),
                 }],
-            })?;
+            });
+        }
         let payload_json = serde_json::to_string(&payload).map_err(|err| {
             BantoError::Other(format!("payload のシリアライズに失敗しました: {err}"))
         })?;
@@ -250,7 +253,7 @@ impl PendingChangesService {
     /// キャンセルは引き続き不可。
     ///
     /// R2b-1e: `canceled` へ移すのと同じトランザクションで、接続のペイロードから
-    /// `password` と `sealedPassword` を外して `passwordSet` に替える（このモジュールの doc）。
+    /// `sealedSecrets` を外して `secretsSet` に替える（このモジュールの doc）。
     pub async fn cancel_pending(&self, id: i64) -> Result<PendingChange, BantoError> {
         let mut tx = self
             .pool
@@ -388,7 +391,7 @@ impl PendingChangesService {
     }
 
     /// R2b-1e: `applied` へ移すのと同じトランザクションで、接続のペイロードから
-    /// `password` と `sealedPassword` を外して `passwordSet` に替える（このモジュールの doc）。
+    /// `sealedSecrets` を外して `secretsSet` に替える（このモジュールの doc）。
     pub async fn mark_applied(&self, id: i64) -> Result<PendingChange, BantoError> {
         let mut tx = self
             .pool
@@ -526,20 +529,52 @@ pub(crate) async fn set_vacuum_pending_in(
     Ok(())
 }
 
-// ---- 接続のパスワードのペイロードの扱い（R2b-1e、このモジュールの doc） ---------------------
+// ---- 接続の秘密値のペイロードの扱い（R2b-1e・R2b-6b、このモジュールの doc） ----------------
 
-/// パスワードを持ちうる source（`plc_connections.create` / `.update`）。
+/// 秘密値を持ちうる source（`plc_connections.create` / `.update`）。
 pub const CONNECTION_PASSWORD_SOURCES: [&str; 2] =
     ["plc_connections.create", "plc_connections.update"];
 
-/// ペイロードの `input` の封印したパスワードのキー（`crate::secrets::sealed_password_json`）。
-pub const SEALED_PASSWORD_FIELD: &str = "sealedPassword";
-const PASSWORD_FIELD: &str = "password";
-const PASSWORD_SET_FIELD: &str = "passwordSet";
+/// ペイロードの `input` の封印した秘密値のキー（キー → `crate::secrets::sealed_password_json`
+/// の形。`crate::rest::PlcConnectionPayload::queue_form` が積む前に作る）。
+pub const SEALED_SECRETS_FIELD: &str = "sealedSecrets";
+/// 履歴の行・応答の写しで `sealedSecrets` の代わりに置く、封印した値があったキーの一覧。
+pub const SECRETS_SET_FIELD: &str = "secretsSet";
+/// R2b-6b より前の形の欄（起動時に捨てる古い行にだけある。外す対象として残す）。
+const LEGACY_PASSWORD_FIELD: &str = "password";
+const LEGACY_SEALED_PASSWORD_FIELD: &str = "sealedPassword";
 
-/// `source` がパスワードを持ちうる接続の作成・更新か。
+/// `source` が秘密値を持ちうる接続の作成・更新か。
 pub fn is_connection_password_source(source: &str) -> bool {
     CONNECTION_PASSWORD_SOURCES.contains(&source)
+}
+
+/// R2b-6b の `input` の欄（`crate::rest` の `QueuedPlcConnectionPayload` と同じ）。
+const CURRENT_INPUT_FIELDS: [&str; 6] = [
+    "name",
+    "protocol",
+    "enabled",
+    "simulation",
+    "settings",
+    SEALED_SECRETS_FIELD,
+];
+
+/// 接続の作成・更新のキューの `input` が R2b-6b の形か（Q10: 読めない古い形は起動時に捨てる、
+/// `crate::upgrade`）。`name`・`protocol` が文字列、`settings` があればオブジェクト、
+/// それ以外の欄が無いこと。接続以外の source は `true`。
+pub fn is_current_connection_input(source: &str, payload: &Value) -> bool {
+    if !is_connection_password_source(source) {
+        return true;
+    }
+    let Some(input) = payload.get("input").and_then(Value::as_object) else {
+        return false;
+    };
+    input
+        .keys()
+        .all(|key| CURRENT_INPUT_FIELDS.contains(&key.as_str()))
+        && input.get("name").is_some_and(Value::is_string)
+        && input.get("protocol").is_some_and(Value::is_string)
+        && input.get("settings").is_none_or(Value::is_object)
 }
 
 fn connection_input_mut<'a>(
@@ -552,38 +587,10 @@ fn connection_input_mut<'a>(
     payload.get_mut("input").and_then(Value::as_object_mut)
 }
 
-/// 積む時点・起動時の後処理（設計 §5.3・§6.5）: `input.password` が非空の文字列なら、
-/// `secrets` で封印して `input.sealedPassword` に替え、`password` を外す。書き換えたら
-/// `true`。空文字（消す）・`null`・省略（保つ）は秘密ではないのでそのまま。
-///
-/// 封印に失敗したら（大きすぎる・乱数源・DPAPI の失敗）ペイロードは変えずに `Err`（値は
-/// 載せない）。
-pub fn seal_queued_password(
-    secrets: &ConnectionSecrets,
-    source: &str,
-    payload: &mut Value,
-) -> Result<bool, SecretError> {
-    let Some(input) = connection_input_mut(source, payload) else {
-        return Ok(false);
-    };
-    let sealed = match input.get(PASSWORD_FIELD) {
-        Some(Value::String(plain)) if !plain.is_empty() => {
-            secrets.seal(banto_tags::PASSWORD_KEY, plain)?
-        }
-        _ => return Ok(false),
-    };
-    input.remove(PASSWORD_FIELD);
-    input.insert(
-        SEALED_PASSWORD_FIELD.to_string(),
-        crate::secrets::sealed_password_json(&sealed),
-    );
-    Ok(true)
-}
-
-/// 起動時の後処理（設計 §6.5、2026-10-21 レビュー P2-3）: `input.sealedPassword` が
-/// `plain-v1` で、`secrets` に protector があれば、**同じ参照のまま**封印し直す。書き換えたら
-/// `true`。protector が無い・`plain-v1` でない・`sealedPassword` が無いなら `false`。
-/// 形が違う・開けないなら `Err`（ペイロードは変えない）。
+/// 起動時の後処理（設計 §6.5、2026-10-21 レビュー P2-3）: `input.sealedSecrets` の
+/// `plain-v1` の値を、`secrets` に protector があれば**同じ参照のまま**封印し直す。書き換えたら
+/// `true`。protector が無い・`plain-v1` が無いなら `false`。形が違う・開けないなら `Err`
+/// （ペイロードは変えない）。
 pub fn reseal_queued_password(
     secrets: &ConnectionSecrets,
     source: &str,
@@ -592,64 +599,70 @@ pub fn reseal_queued_password(
     let Some(input) = connection_input_mut(source, payload) else {
         return Ok(false);
     };
-    let Some(value) = input.get(SEALED_PASSWORD_FIELD) else {
+    let Some(Value::Object(sealed)) = input.get(SEALED_SECRETS_FIELD) else {
         return Ok(false);
     };
-    let sealed = crate::secrets::parse_sealed_password(value)?;
-    let Some(resealed) = secrets.reseal_plain(banto_tags::PASSWORD_KEY, &sealed)? else {
-        return Ok(false);
-    };
-    input.insert(
-        SEALED_PASSWORD_FIELD.to_string(),
-        crate::secrets::sealed_password_json(&resealed),
-    );
-    Ok(true)
+    let mut resealed = sealed.clone();
+    let mut changed = false;
+    for (key, value) in sealed {
+        let parsed = crate::secrets::parse_sealed_password(value)?;
+        if let Some(again) = secrets.reseal_plain(key, &parsed)? {
+            resealed.insert(key.clone(), crate::secrets::sealed_password_json(&again));
+            changed = true;
+        }
+    }
+    if changed {
+        input.insert(SEALED_SECRETS_FIELD.to_string(), Value::Object(resealed));
+    }
+    Ok(changed)
 }
 
-/// `input` に `password` か `sealedPassword` があれば外して `passwordSet` に替える。
-/// `passwordSet` は、封印した値があれば `true`、`password` が文字列なら非空かどうか、
-/// `null` なら作成は `false`・更新は `null`（「保つ」）、それ以外の値は `false`。
-///
-/// 何も外さなければ `None`。外したら `Some(平文を外したか)`: 非空の文字列の `password`、
-/// または `dpapi-machine-v1` と読めない `sealedPassword`（`plain-v1`・形が違うもの。blob が
-/// 平文の base64 でありうるので安全側）。DPAPI の blob だけなら `false`。
-fn strip_input(source: &str, input: &mut Map<String, Value>) -> Option<bool> {
-    let password = input.remove(PASSWORD_FIELD);
-    let sealed = input.remove(SEALED_PASSWORD_FIELD);
-    if password.is_none() && sealed.is_none() {
+/// `input` に `sealedSecrets`（と、古い形の `password`・`sealedPassword`）があれば外して、
+/// 封印した値があったキーの一覧 `secretsSet` に替える。何も外さなければ `None`。外したら
+/// `Some(平文を外したか)`: `dpapi-machine-v1` と読めない封印した値（`plain-v1`・形が違うもの。
+/// blob が平文の base64 でありうるので安全側）、または古い形の非空の `password`。
+fn strip_input(input: &mut Map<String, Value>) -> Option<bool> {
+    let sealed = input.remove(SEALED_SECRETS_FIELD);
+    let legacy_password = input.remove(LEGACY_PASSWORD_FIELD);
+    let legacy_sealed = input.remove(LEGACY_SEALED_PASSWORD_FIELD);
+    if sealed.is_none() && legacy_password.is_none() && legacy_sealed.is_none() {
         return None;
     }
-    let plaintext_password = matches!(&password, Some(Value::String(plain)) if !plain.is_empty());
-    let plaintext_sealed = sealed.as_ref().is_some_and(|value| {
+    let not_dpapi = |value: &Value| {
         value.get("scheme").and_then(Value::as_str)
             != Some(crate::secrets::SecretScheme::DpapiMachineV1.as_str())
-    });
-    let password_set = if sealed.is_some() {
-        Value::Bool(true)
-    } else {
-        match password {
-            Some(Value::String(plain)) => Value::Bool(!plain.is_empty()),
-            None | Some(Value::Null) => absent_password_set(source),
-            // 文字列でない不正な値（本来は起こらない）も、値そのものは外へ出さない。
-            Some(_) => Value::Bool(false),
-        }
     };
-    input.insert(PASSWORD_SET_FIELD.to_string(), password_set);
-    Some(plaintext_password || plaintext_sealed)
-}
-
-/// パスワードの指定が無いときの `passwordSet`: 作成は `false`（無し）、更新は `null`
-/// （「今のパスワードを保つ」。この提案は今の保存状態を持たないので true/false にしない）。
-fn absent_password_set(source: &str) -> Value {
-    if source == "plc_connections.create" {
-        Value::Bool(false)
-    } else {
-        Value::Null
+    let mut keys: Vec<String> = Vec::new();
+    let mut plaintext = false;
+    match &sealed {
+        Some(Value::Object(sealed)) => {
+            for (key, value) in sealed {
+                keys.push(key.clone());
+                plaintext |= not_dpapi(value);
+            }
+        }
+        // 形の違う値も外す（中身は外へ出さない）。
+        Some(_) => plaintext = true,
+        None => {}
     }
+    plaintext |= matches!(&legacy_password, Some(Value::String(plain)) if !plain.is_empty());
+    plaintext |= legacy_sealed.as_ref().is_some_and(not_dpapi);
+    keys.sort();
+    let mut set: Vec<Value> = match input.remove(SECRETS_SET_FIELD) {
+        Some(Value::Array(existing)) => existing,
+        _ => Vec::new(),
+    };
+    for key in keys {
+        if !set.iter().any(|v| v.as_str() == Some(key.as_str())) {
+            set.push(Value::String(key));
+        }
+    }
+    input.insert(SECRETS_SET_FIELD.to_string(), Value::Array(set));
+    Some(plaintext)
 }
 
-/// 履歴へ移すとき・起動時の後処理（設計 §5.3・§6.5）: `input` から `password` と
-/// `sealedPassword` の**両方**を外して `passwordSet` に替える。書き換えたら `true`。
+/// 履歴へ移すとき・起動時の後処理（設計 §5.3・§6.5）: `input` から封印した値を外して
+/// `secretsSet` に替える。書き換えたら `true`。
 pub fn strip_queued_password(source: &str, payload: &mut Value) -> bool {
     strip_queued_password_detail(source, payload).is_some()
 }
@@ -657,19 +670,16 @@ pub fn strip_queued_password(source: &str, payload: &mut Value) -> bool {
 /// [`strip_queued_password`] に、外したのが平文だったか（[`strip_input`] の戻り値）を足した形。
 /// 平文を外したら呼び出し側は清掃待ちの印を立てる（設計 §6.5 の 2）。
 pub fn strip_queued_password_detail(source: &str, payload: &mut Value) -> Option<bool> {
-    connection_input_mut(source, payload).and_then(|input| strip_input(source, input))
+    connection_input_mut(source, payload).and_then(strip_input)
 }
 
-/// 応答の写し（S1a レビュー対応、R2b-1e で封印した値にも広げた）: `password` と
-/// `sealedPassword` を外して `passwordSet` を出す。どちらも無ければ、`passwordSet` が
-/// 既にある（履歴へ移すときに替えた）ならそのまま、無ければ作成は `false`・更新は `null`。
-/// DB の行は変えない（写しにだけ掛ける）。それ以外の source はそのまま返す。
+/// 応答の写し（S1a レビュー対応、R2b-1e・R2b-6b）: 封印した値を外して `secretsSet` を出す。
+/// 何も無ければそのまま（秘密のキーの `null` は「消す」で、秘密ではない）。DB の行は変えない
+/// （写しにだけ掛ける）。それ以外の source はそのまま返す。
 pub fn redact_queued_password(source: &str, payload: &Value) -> Value {
     let mut payload = payload.clone();
     if let Some(input) = connection_input_mut(source, &mut payload) {
-        if strip_input(source, input).is_none() && !input.contains_key(PASSWORD_SET_FIELD) {
-            input.insert(PASSWORD_SET_FIELD.to_string(), absent_password_set(source));
-        }
+        strip_input(input);
     }
     payload
 }
@@ -929,11 +939,24 @@ mod tests {
 
     const QUEUED_SECRET: &str = "TOPSECRET-queue-pw-5d1e";
 
-    fn create_payload(password: serde_json::Value) -> serde_json::Value {
-        serde_json::json!({ "input": {
-            "name": "pg", "protocol": "postgres", "host": "db", "port": 5432,
-            "database": "erp", "username": "reader", "password": password
-        }})
+    /// R2b-6b の形の作成の提案（入口の `queue_form` が封印した後の形）。
+    fn create_payload(sealed: Option<serde_json::Value>) -> serde_json::Value {
+        let mut input = serde_json::json!({
+            "name": "pg", "protocol": "postgres",
+            "settings": { "host": "db", "port": 5432, "database": "erp", "username": "reader" },
+        });
+        if let Some(sealed) = sealed {
+            input["sealedSecrets"] = serde_json::json!({ "password": sealed });
+        }
+        serde_json::json!({ "input": input })
+    }
+
+    fn sealed_json(secrets: &crate::secrets::ConnectionSecrets) -> serde_json::Value {
+        crate::secrets::sealed_password_json(
+            &secrets
+                .seal(banto_tags::PASSWORD_KEY, QUEUED_SECRET)
+                .unwrap(),
+        )
     }
 
     async fn raw_payload(svc: &PendingChangesService, id: i64) -> String {
@@ -944,85 +967,53 @@ mod tests {
             .unwrap()
     }
 
-    /// 積む時点で封印する: 非空の `password` は `sealedPassword` に替わり、DB の行にも
-    /// 平文が無い。空文字（消す）・`null`（保つ）・接続以外の source はそのまま。
+    /// R2b-6b: `create_pending` は封印済みの R2b-6b の形をそのまま積み、古い平らな形
+    /// （平文の `password` を持ちうる）の接続の提案は断る。接続以外の source はそのまま。
     #[tokio::test]
-    async fn create_pending_seals_a_connection_password_before_storing_it() {
+    async fn create_pending_keeps_the_sealed_form_and_refuses_the_old_flat_shape() {
         let svc = service().await;
+        let payload = create_payload(Some(sealed_json(
+            &crate::secrets::ConnectionSecrets::platform_default(),
+        )));
         let created = svc
-            .create_pending(
-                "plc_connections.create",
-                &create_payload(serde_json::json!(QUEUED_SECRET)),
-                1,
-                None,
-                None,
-                None,
-            )
+            .create_pending("plc_connections.create", &payload, 1, None, None, None)
             .await
             .unwrap();
-        let input = &created.payload["input"];
-        assert!(input.get("password").is_none(), "{input}");
-        let sealed = crate::secrets::parse_sealed_password(&input["sealedPassword"]).unwrap();
-        assert_eq!(
-            sealed.scheme,
-            crate::secrets::ConnectionSecrets::platform_default().seal_scheme()
-        );
-        assert_eq!(
-            crate::secrets::ConnectionSecrets::platform_default()
-                .open(banto_tags::PASSWORD_KEY, &sealed)
-                .unwrap()
-                .as_str(),
-            QUEUED_SECRET
-        );
-        if cfg!(windows) {
-            assert!(!raw_payload(&svc, created.id).await.contains(QUEUED_SECRET));
-        }
-        // The plaintext itself never sits under `password` in the stored row.
-        let raw: serde_json::Value =
-            serde_json::from_str(&raw_payload(&svc, created.id).await).unwrap();
-        assert!(raw["input"].get("password").is_none());
+        assert_eq!(created.payload, payload);
 
-        for (source, payload) in [
-            (
-                "plc_connections.update",
-                create_payload(serde_json::json!("")),
-            ),
-            (
-                "plc_connections.update",
-                create_payload(serde_json::Value::Null),
-            ),
-            (
-                "tags.create",
-                serde_json::json!({ "input": { "password": QUEUED_SECRET } }),
-            ),
-        ] {
-            let created = svc
-                .create_pending(source, &payload, 1, None, None, None)
+        let old = serde_json::json!({ "input": {
+            "name": "pg", "protocol": "postgres", "host": "db", "port": 5432,
+            "password": QUEUED_SECRET,
+        }});
+        for source in ["plc_connections.create", "plc_connections.update"] {
+            let err = svc
+                .create_pending(source, &old, 1, None, None, None)
                 .await
-                .unwrap();
-            assert_eq!(created.payload, payload, "{source}");
+                .unwrap_err();
+            assert!(!format!("{err:?}").contains(QUEUED_SECRET));
         }
+        let other = serde_json::json!({ "input": { "password": QUEUED_SECRET } });
+        let created = svc
+            .create_pending("tags.create", &other, 1, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(created.payload, other);
     }
 
-    /// 履歴（`applied`・`canceled`）へ移すと、同じトランザクションで `sealedPassword` と
-    /// `password` が外れて `passwordSet` に替わる（DB の行に平文も blob も残らない）。
-    /// `failed` は未適用なので封印した値のまま。
+    /// 履歴（`applied`・`canceled`）へ移すと、同じトランザクションで `sealedSecrets` が
+    /// 外れて `secretsSet` に替わる（DB の行に blob が残らない）。`failed` は未適用なので
+    /// 封印した値のまま。
     #[tokio::test]
-    async fn moving_to_applied_or_canceled_strips_the_sealed_password() {
+    async fn moving_to_applied_or_canceled_strips_the_sealed_secrets() {
         let svc = service().await;
+        let plain = crate::secrets::ConnectionSecrets::new(None);
         let queue = |svc: &PendingChangesService| {
             let svc = svc.clone();
+            let payload = create_payload(Some(sealed_json(&plain)));
             async move {
-                svc.create_pending(
-                    "plc_connections.create",
-                    &create_payload(serde_json::json!(QUEUED_SECRET)),
-                    1,
-                    None,
-                    None,
-                    None,
-                )
-                .await
-                .unwrap()
+                svc.create_pending("plc_connections.create", &payload, 1, None, None, None)
+                    .await
+                    .unwrap()
             }
         };
 
@@ -1033,11 +1024,10 @@ mod tests {
         let gone = svc.cancel_pending(canceled.id).await.unwrap();
         for row in [&done, &gone] {
             let input = &row.payload["input"];
-            assert!(input.get("sealedPassword").is_none(), "{input}");
-            assert!(input.get("password").is_none(), "{input}");
-            assert_eq!(input["passwordSet"], serde_json::json!(true));
+            assert!(input.get("sealedSecrets").is_none(), "{input}");
+            assert_eq!(input["secretsSet"], serde_json::json!(["password"]));
             let raw = raw_payload(&svc, row.id).await;
-            assert!(!raw.contains("sealedPassword"), "{raw}");
+            assert!(!raw.contains("sealedSecrets"), "{raw}");
             assert!(!raw.contains(QUEUED_SECRET), "{raw}");
             assert_eq!(svc.get(row.id).await.unwrap().payload, row.payload);
         }
@@ -1045,82 +1035,85 @@ mod tests {
         let failed = queue(&svc).await;
         svc.start_applying(failed.id).await.unwrap();
         let failed = svc.mark_failed(failed.id, "boom").await.unwrap();
-        assert!(failed.payload["input"].get("sealedPassword").is_some());
+        assert!(failed.payload["input"].get("sealedSecrets").is_some());
         // failed -> canceled strips it too.
         let canceled = svc.cancel_pending(failed.id).await.unwrap();
-        assert!(canceled.payload["input"].get("sealedPassword").is_none());
+        assert!(canceled.payload["input"].get("sealedSecrets").is_none());
         assert_eq!(
-            canceled.payload["input"]["passwordSet"],
-            serde_json::json!(true)
+            canceled.payload["input"]["secretsSet"],
+            serde_json::json!(["password"])
         );
     }
 
-    /// 応答の写し: `password` も `sealedPassword` も外し、`passwordSet` を出す（作成・更新の
-    /// tri-state）。履歴へ移すときに入れた `passwordSet` はそのまま（もう一度掛けても同じ）。
+    /// 応答の写し: `sealedSecrets`（と古い形の `password`・`sealedPassword`）を外して
+    /// `secretsSet` を出す。何も無ければそのまま（`null` は「消す」で秘密ではない）。もう一度
+    /// 掛けても同じ。
     #[test]
-    fn redact_queued_password_hides_plaintext_and_sealed_values() {
-        let sealed = crate::secrets::sealed_password_json(
-            &crate::secrets::ConnectionSecrets::new(None)
-                .seal(banto_tags::PASSWORD_KEY, QUEUED_SECRET)
-                .unwrap(),
-        );
+    fn redact_queued_password_hides_sealed_values() {
+        let sealed = sealed_json(&crate::secrets::ConnectionSecrets::new(None));
         let cases = [
             (
-                "plc_connections.create",
-                serde_json::json!({ "sealedPassword": sealed.clone() }),
-                serde_json::json!(true),
+                serde_json::json!({ "sealedSecrets": { "password": sealed.clone() } }),
+                Some(serde_json::json!(["password"])),
             ),
             (
-                "plc_connections.update",
-                serde_json::json!({ "sealedPassword": sealed.clone() }),
-                serde_json::json!(true),
+                serde_json::json!({ "settings": { "password": null } }),
+                None,
             ),
             (
-                "plc_connections.create",
                 serde_json::json!({ "password": QUEUED_SECRET }),
-                serde_json::json!(true),
+                Some(serde_json::json!([])),
             ),
+            (serde_json::json!({}), None),
             (
-                "plc_connections.update",
-                serde_json::json!({ "password": "" }),
-                serde_json::json!(false),
-            ),
-            (
-                "plc_connections.update",
-                serde_json::json!({ "password": null }),
-                serde_json::Value::Null,
-            ),
-            (
-                "plc_connections.update",
-                serde_json::json!({}),
-                serde_json::Value::Null,
-            ),
-            (
-                "plc_connections.create",
-                serde_json::json!({}),
-                serde_json::json!(false),
-            ),
-            (
-                "plc_connections.update",
-                serde_json::json!({ "passwordSet": true }),
-                serde_json::json!(true),
+                serde_json::json!({ "secretsSet": ["password"] }),
+                Some(serde_json::json!(["password"])),
             ),
         ];
-        for (source, input, want) in cases {
-            let payload = serde_json::json!({ "input": input });
-            let redacted = redact_queued_password(source, &payload);
-            let text = redacted.to_string();
-            assert!(!text.contains(QUEUED_SECRET), "{text}");
-            assert!(!text.contains("sealedPassword"), "{text}");
-            assert_eq!(redacted["input"]["passwordSet"], want, "{source} {payload}");
-            assert_eq!(
-                redact_queued_password(source, &redacted),
-                redacted,
-                "idempotent"
-            );
+        for source in ["plc_connections.create", "plc_connections.update"] {
+            for (input, want) in &cases {
+                let payload = serde_json::json!({ "input": input });
+                let redacted = redact_queued_password(source, &payload);
+                let text = redacted.to_string();
+                assert!(!text.contains(QUEUED_SECRET), "{text}");
+                assert!(!text.contains("sealedSecrets"), "{text}");
+                assert_eq!(
+                    redacted["input"].get("secretsSet").cloned(),
+                    want.clone(),
+                    "{source} {payload}"
+                );
+                assert_eq!(
+                    redact_queued_password(source, &redacted),
+                    redacted,
+                    "idempotent"
+                );
+            }
         }
         // Other sources are returned as they are.
         let other = serde_json::json!({ "input": { "password": "x" } });
         assert_eq!(redact_queued_password("tags.create", &other), other);
+    }
+
+    /// Q10: R2b-6b の形かどうか（起動時に捨てる古い形の見分け）。
+    #[test]
+    fn the_current_connection_input_shape_is_recognised() {
+        let source = "plc_connections.update";
+        assert!(is_current_connection_input(source, &create_payload(None)));
+        assert!(is_current_connection_input(
+            source,
+            &serde_json::json!({ "id": 1, "input": { "name": "a", "protocol": "slmp" } })
+        ));
+        for old in [
+            serde_json::json!({ "input": { "name": "a", "protocol": "slmp", "host": "h", "port": 1 } }),
+            serde_json::json!({ "input": { "name": "a", "protocol": "slmp", "settings": [] } }),
+            serde_json::json!({ "input": { "protocol": "slmp" } }),
+            serde_json::json!({ "id": 1 }),
+        ] {
+            assert!(!is_current_connection_input(source, &old), "{old}");
+        }
+        assert!(is_current_connection_input(
+            "tags.create",
+            &serde_json::json!({})
+        ));
     }
 }
