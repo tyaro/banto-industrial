@@ -19,8 +19,8 @@ use banto_driver_api::{keys, ConnectContext, FatalError, ItemError, Settings, Ta
 /// R2b-6b（docs/banto-hub-driver-ui-design.md §5、Q2）: `/api/plc-connections` の作成・更新の
 /// 形 `{ name, protocol, enabled, simulation, settings }`。平らな欄（`host`・`port`・`unitId`・
 /// `password` …）は受けない（`deny_unknown_fields`。使用者無しの前提で古い形は断る、
-/// 2026-10-22 オーナー）。MCP は R2b-7 まで平らな形のまま（`crate::mcp` の
-/// `flat_connection` が写す）。
+/// 2026-10-22 オーナー）。MCP の `create_connection` / `update_connection` も同じ形を直接
+/// 受ける（R2b-7a）。
 ///
 /// - 機器のドライバ（`modbus-tcp`・`slmp`）の `settings` はドライバのスキーマ
 ///   （`GET /api/drivers` の `settingsSchema`）に従い、`banto_tags::settings_from_schema` →
@@ -132,8 +132,6 @@ impl PlcConnectionPayload {
             simulation: self.simulation,
             settings: self.settings,
             secrets: changes,
-            // REST の `settings` は丸ごと置き換え（保存済みから補う印は MCP のアダプタだけ）。
-            keep_stored: banto_tags::KeepStored::default(),
         })
     }
 
@@ -727,7 +725,7 @@ const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(こ�
 /// フォーム値を `{ protocol, simulation, settings, connectionId? }` で受け取る
 /// （[`PlcConnectionPayload`] と同じ `settings` の形。保存済み接続の編集中のみ
 /// `connectionId` を添える）。平らな欄は受けない（`deny_unknown_fields`）。MCP の
-/// `test_connection` は R2b-7 まで平らな形のまま（`crate::mcp` の `flat_connection` が写す）。
+/// `test_connection` も同じ形を直接受ける（R2b-7a）。
 ///
 /// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
 ///   ダイヤルする。省いた欄はスキーマの既定値。

@@ -214,7 +214,11 @@ use crud::{
     default_payload_enabled, queue_pending_registry_change, redact_pending_change_for_response,
     RegistryMutationError, RegistryMutationResult, TagRegistryState,
 };
-pub(crate) use plc_connections::{reject_hub_connection_protocol, run_plc_connection_test};
+pub(crate) use drivers::driver_list;
+pub(crate) use plc_connections::{
+    connection_response, connection_responses, reject_hub_connection_protocol,
+    run_plc_connection_test,
+};
 pub use plc_connections::{
     PlcConnectionPayload, PlcConnectionResponse, PlcConnectionTestError, PlcConnectionTestPayload,
     PlcConnectionTestResponse,

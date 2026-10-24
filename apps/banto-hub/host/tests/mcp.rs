@@ -467,6 +467,7 @@ async fn tools_list_returns_the_thirty_eight_tools() {
             "get_tag",
             "list_api_keys",
             "list_connections",
+            "list_drivers",
             "list_groups",
             "list_sink_groups",
             "list_tags",
@@ -1496,7 +1497,8 @@ async fn config_tools_without_admin_scope_are_rejected_and_change_nothing() {
         Some(&key),
         tools_call(
             "create_connection",
-            json!({ "name": "line1", "host": "127.0.0.1", "port": 15022 }),
+            json!({ "name": "line1", "protocol": "modbus-tcp",
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
         ),
     )
     .await;
@@ -1577,7 +1579,8 @@ async fn create_connection_with_admin_scope_while_stopped_creates_and_audits() {
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line1", "host": "127.0.0.1", "port": 15022, "protocol": "slmp" }),
+            json!({ "name": "line1", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
         ),
     )
     .await;
@@ -1637,7 +1640,8 @@ async fn create_connection_validation_error_includes_field_detail() {
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line1", "host": "127.0.0.1", "port": 70000, "protocol": "slmp" }),
+            json!({ "name": "line1", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 70000 } }),
         ),
     )
     .await;
@@ -1764,7 +1768,8 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line-running", "host": "127.0.0.1", "port": 15022 }),
+            json!({ "name": "line-running", "protocol": "modbus-tcp",
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
         ),
     )
     .await;
@@ -1855,7 +1860,9 @@ async fn group_and_update_connection_tools_without_admin_scope_are_rejected_and_
     for (name, arguments) in [
         (
             "update_connection",
-            json!({ "id": conn_id, "name": "renamed", "host": "127.0.0.1", "port": 15022 }),
+            json!({ "id": conn_id, "name": "renamed", "protocol": "slmp", "enabled": true,
+                    "simulation": false,
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
         ),
         (
             "create_group",
@@ -2055,15 +2062,9 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
                 "id": conn_id,
                 "name": "line1-renamed",
                 "protocol": "slmp",
-                "host": "127.0.0.1",
-                "port": 15099,
-                "unitId": 1,
                 "enabled": true,
                 "simulation": false,
-                "wordOrder": "low_high",
-                "database": null,
-                "username": null,
-                "password": null,
+                "settings": { "host": "127.0.0.1", "port": 15099 },
             }),
         ),
     )
@@ -2073,14 +2074,12 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["updated"]["name"], "line1-renamed");
-    assert_eq!(payload["updated"]["port"], 15099);
-    assert_eq!(
-        payload["updated"]["passwordSet"], false,
-        "a non-postgres connection carries no password"
-    );
+    assert_eq!(payload["updated"]["settings"]["port"], 15099);
     assert!(
-        payload["updated"].get("password").is_none(),
-        "the response must never contain a raw password field: {payload:?}"
+        payload["updated"].get("passwordSet").is_none()
+            && payload["updated"].get("passwordState").is_none()
+            && payload["updated"].get("port").is_none(),
+        "the response is REST's settings shape, not the old flat one: {payload:?}"
     );
 
     let stored = PlcConnectionService::new(app.pool.clone())
@@ -2138,15 +2137,9 @@ async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
                 "id": conn_id,
                 "name": "line1-renamed",
                 "protocol": "slmp",
-                "host": "127.0.0.1",
-                "port": 15099,
-                "unitId": 1,
                 // "enabled" を意図的に省略。
                 "simulation": false,
-                "wordOrder": "low_high",
-                "database": null,
-                "username": null,
-                "password": null,
+                "settings": { "host": "127.0.0.1", "port": 15099 },
             }),
         ),
     )
@@ -2194,11 +2187,13 @@ async fn create_connection_postgres_returns_password_set_without_password_field(
             json!({
                 "name": "erp-db",
                 "protocol": "postgres",
-                "host": "10.0.0.50",
-                "port": 5432,
-                "database": "erp",
-                "username": "reader",
-                "password": "s3cret",
+                "settings": {
+                    "host": "10.0.0.50",
+                    "port": 5432,
+                    "database": "erp",
+                    "username": "reader",
+                    "password": "s3cret",
+                },
             }),
         ),
     )
@@ -2207,12 +2202,16 @@ async fn create_connection_postgres_returns_password_set_without_password_field(
     assert_eq!(body["result"]["isError"], false, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(payload["created"]["passwordSet"], true);
+    assert_eq!(
+        payload["created"]["settings"]["password"],
+        json!({ "$secret": "set" }),
+        "{payload:?}"
+    );
     assert!(
-        payload["created"].get("password").is_none(),
+        !text.contains("s3cret"),
         "the response must never contain the raw password: {payload:?}"
     );
-    assert_eq!(payload["created"]["database"], "erp");
+    assert_eq!(payload["created"]["settings"]["database"], "erp");
 }
 
 /// S1a レビュー対応（`banto_tags::PlcConnection::password`の doc comment
@@ -2236,11 +2235,13 @@ async fn create_connection_postgres_audit_log_never_stores_the_password() {
             json!({
                 "name": "erp-db-audit",
                 "protocol": "postgres",
-                "host": "10.0.0.51",
-                "port": 5432,
-                "database": "erp",
-                "username": "reader",
-                "password": SECRET,
+                "settings": {
+                    "host": "10.0.0.51",
+                    "port": 5432,
+                    "database": "erp",
+                    "username": "reader",
+                    "password": SECRET,
+                },
             }),
         ),
     )
@@ -2269,9 +2270,8 @@ async fn create_connection_postgres_audit_log_never_stores_the_password() {
     }
 }
 
-/// `update_connection`で`password: null`を送ると既存のパスワードが保持され、
-/// `""`を送ると消去される(`banto_tags::PlcConnectionInput::password`の
-/// tri-state PATCH 意味論の MCP 経由の確認)。
+/// `update_connection`で`settings.password`を省略すると既存のパスワードが保持され、
+/// `""`を送ると消去される(REST と同じ秘密のキーの tri-state。R2b-7a)。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_connection_password_tri_state_semantics() {
     let app = test_app("s1-mcp-update-pg-password").await;
@@ -2309,15 +2309,14 @@ async fn update_connection_password_tri_state_semantics() {
                 "id": created.id,
                 "name": "erp-db-renamed",
                 "protocol": "postgres",
-                "host": "10.0.0.50",
-                "port": 5432,
-                "unitId": 1,
                 "enabled": true,
                 "simulation": false,
-                "wordOrder": "low_high",
-                "database": "erp",
-                "username": "reader",
-                "password": null,
+                "settings": {
+                    "host": "10.0.0.50",
+                    "port": 5432,
+                    "database": "erp",
+                    "username": "reader",
+                },
             }),
         ),
     )
@@ -2325,7 +2324,11 @@ async fn update_connection_password_tri_state_semantics() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(payload["updated"]["passwordSet"], true);
+    assert_eq!(
+        payload["updated"]["settings"]["password"],
+        json!({ "$secret": "set" }),
+        "{payload:?}"
+    );
     assert_eq!(
         stored_password(&app.pool, created.id).await.as_deref(),
         Some("original-secret")
@@ -2341,15 +2344,15 @@ async fn update_connection_password_tri_state_semantics() {
                 "id": created.id,
                 "name": "erp-db-renamed",
                 "protocol": "postgres",
-                "host": "10.0.0.50",
-                "port": 5432,
-                "unitId": 1,
                 "enabled": true,
                 "simulation": false,
-                "wordOrder": "low_high",
-                "database": "erp",
-                "username": "reader",
-                "password": "",
+                "settings": {
+                    "host": "10.0.0.50",
+                    "port": 5432,
+                    "database": "erp",
+                    "username": "reader",
+                    "password": "",
+                },
             }),
         ),
     )
@@ -2357,7 +2360,10 @@ async fn update_connection_password_tri_state_semantics() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     let payload: Value = serde_json::from_str(text).unwrap();
-    assert_eq!(payload["updated"]["passwordSet"], false);
+    assert!(
+        payload["updated"]["settings"].get("password").is_none(),
+        "{payload:?}"
+    );
     assert_eq!(stored_password(&app.pool, created.id).await, None);
 }
 
@@ -2816,8 +2822,7 @@ async fn test_connection_reports_ok_for_a_reachable_modbus_simulator() {
             "test_connection",
             json!({
                 "protocol": "modbus-tcp",
-                "host": "127.0.0.1",
-                "port": sim.addr.port(),
+                "settings": { "host": "127.0.0.1", "port": sim.addr.port() },
             }),
         ),
     )
@@ -2830,11 +2835,11 @@ async fn test_connection_reports_ok_for_a_reachable_modbus_simulator() {
     assert!(payload["error"].is_null(), "{payload:?}");
 }
 
-/// R2b-6b（設計 §5）: MCP の `test_connection` は R2b-7 まで平らな形のまま。平らな形 →
-/// `settings` のアダプタは `simulation` も引き継ぐので、`simulation: true` はダイヤルの前に
-/// 断る（シミュレータは 1 本も受けない）。
+/// R2b-7a: MCP の `test_connection` は REST と同じ `settings` の形。`simulation: true` は
+/// ダイヤルの前に断る（シミュレータは 1 本も受けない）。旧い平らなキー（直下の `host`）は
+/// 断る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_connection_keeps_the_flat_shape_and_refuses_simulation_without_dialing() {
+async fn test_connection_takes_the_settings_shape_and_refuses_simulation_without_dialing() {
     let app = test_app("r2b6b-mcp-test-sim").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     let sim = ModbusSimulator::start().await;
@@ -2845,10 +2850,8 @@ async fn test_connection_keeps_the_flat_shape_and_refuses_simulation_without_dia
             "test_connection",
             json!({
                 "protocol": "modbus-tcp",
-                "host": "127.0.0.1",
-                "port": sim.addr.port(),
-                "unitId": 1,
                 "simulation": true,
+                "settings": { "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1 },
             }),
         ),
     )
@@ -2859,22 +2862,35 @@ async fn test_connection_keeps_the_flat_shape_and_refuses_simulation_without_dia
     assert_eq!(payload["ok"], false, "{payload:?}");
     assert_eq!(payload["error"]["kind"], "unsupported", "{payload:?}");
     assert_eq!(sim.connection_count(), 0, "no dial");
+
+    // The old flat keys are refused (the input has no `host` at the top level any more).
+    let (_, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "test_connection",
+            json!({ "protocol": "modbus-tcp", "host": "127.0.0.1", "port": sim.addr.port() }),
+        ),
+    )
+    .await;
+    assert!(body.get("error").is_some(), "{body:?}");
+    assert_eq!(sim.connection_count(), 0, "no dial");
 }
 
-/// R2b-6b: MCP の `update_connection` は平らな形のままで、今の「省略は保つ」（SLMP の
-/// `cpuType`）もアダプタが保存済みの行から補う。応答・一覧も平らな形（`cpuType`・
-/// `passwordState`）のまま。
+/// R2b-7a: MCP の `update_connection` は REST と同じ丸ごと置き換え。`settings` で省いた
+/// `cpu_type` は保たれず、スキーマの既定値（`R`）に戻る。応答・一覧は REST と同じ
+/// `settings` の形。直下に旧い平らなキー（`unitId` など）を置いた入力は断る。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn update_connection_keeps_the_flat_shape_and_an_omitted_cpu_type() {
-    let app = test_app("r2b6b-mcp-cpu-keep").await;
+async fn update_connection_replaces_settings_wholesale_and_refuses_the_flat_keys() {
+    let app = test_app("r2b7a-mcp-replace").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line-q", "protocol": "slmp", "host": "127.0.0.1",
-                    "port": 5007, "cpuType": "Q" }),
+            json!({ "name": "line-q", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 5007, "cpu_type": "Q" } }),
         ),
     )
     .await;
@@ -2882,8 +2898,11 @@ async fn update_connection_keeps_the_flat_shape_and_an_omitted_cpu_type() {
     assert_eq!(body["result"]["isError"], false, "{body:?}");
     let created: Value =
         serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(created["created"]["cpuType"], "Q", "{created:?}");
-    assert_eq!(created["created"]["passwordState"], "none", "{created:?}");
+    assert_eq!(
+        created["created"]["settings"]["cpu_type"], "Q",
+        "{created:?}"
+    );
+    assert_eq!(created["created"]["enabled"], true, "{created:?}");
     let id = created["created"]["id"].as_i64().unwrap();
 
     let (status, body) = mcp_post(
@@ -2891,10 +2910,9 @@ async fn update_connection_keeps_the_flat_shape_and_an_omitted_cpu_type() {
         Some(&admin_key),
         tools_call(
             "update_connection",
-            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "host": "127.0.0.1",
-                    "port": 5008, "unitId": 1, "enabled": true, "simulation": false,
-                    "wordOrder": "low_high", "database": null, "username": null,
-                    "password": null }),
+            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "enabled": true,
+                    "simulation": false,
+                    "settings": { "host": "127.0.0.1", "port": 5008 } }),
         ),
     )
     .await;
@@ -2902,24 +2920,90 @@ async fn update_connection_keeps_the_flat_shape_and_an_omitted_cpu_type() {
     assert_eq!(body["result"]["isError"], false, "{body:?}");
     let updated: Value =
         serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(updated["updated"]["cpuType"], "Q", "{updated:?}");
-    assert_eq!(updated["updated"]["port"], 5008, "{updated:?}");
+    assert_eq!(
+        updated["updated"]["settings"]["cpu_type"], "R",
+        "{updated:?}"
+    );
+    assert_eq!(updated["updated"]["settings"]["port"], 5008, "{updated:?}");
 
-    // The old flat validation (field names included) still answers first.
+    // The old flat keys at the top level are refused, create and update alike.
+    for (tool, args) in [
+        (
+            "create_connection",
+            json!({ "name": "bad", "protocol": "modbus-tcp", "host": "127.0.0.1",
+                    "port": 502, "unitId": 1 }),
+        ),
+        (
+            "update_connection",
+            json!({ "id": id, "name": "bad", "protocol": "slmp", "enabled": true,
+                    "simulation": false, "settings": { "host": "127.0.0.1", "port": 5008 },
+                    "host": "127.0.0.1", "port": 5008, "unitId": 1 }),
+        ),
+    ] {
+        let (_, body) = mcp_post(&app.router, Some(&admin_key), tools_call(tool, args)).await;
+        assert!(body.get("error").is_some(), "{tool}: {body:?}");
+    }
+    // A field error names the `settings` key (the REST spelling, `unit_id`).
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "bad", "protocol": "modbus-tcp", "host": "127.0.0.1",
-                    "port": 502, "unitId": 300 }),
+            json!({ "name": "bad", "protocol": "modbus-tcp",
+                    "settings": { "host": "127.0.0.1", "port": 502, "unit_id": 300 } }),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body["result"]["isError"], true, "{body:?}");
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("unitId"), "{text}");
+    assert!(text.contains("unit_id"), "{text}");
+}
+
+/// R2b-7a: `list_drivers` は `GET /api/drivers` と同じ中身（SLMP が先頭）。admin スコープ必須。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn list_drivers_matches_the_rest_drivers_endpoint() {
+    let app = test_app("r2b7a-mcp-list-drivers").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_drivers", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let mcp: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+
+    let response = app
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::get("/api/drivers")
+                .header("Authorization", format!("Bearer {}", app.admin_token))
+                .header("X-Banto-Client", "banto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let rest: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(mcp["drivers"], rest, "{mcp:?}");
+    assert_eq!(rest[0]["id"], "slmp", "{rest:?}");
+
+    let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("list_drivers", json!({})),
+    )
+    .await;
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
 }
 
 /// `POST` with an empty body as the admin session (collection start/stop, pending apply).
@@ -2938,21 +3022,19 @@ async fn admin_post_empty(router: &Router, admin_token: &str, path: &str) -> Sta
         .status()
 }
 
-/// #813 review P2: a queued MCP `update_connection` that omits `cpuType` does not queue a
-/// value read before the write (it could be from another snapshot than the queue's
-/// fingerprint); it queues the `keepStored` mark, and the apply fills it from the row read
-/// inside its own write transaction.
+/// R2b-7a: a queued MCP `update_connection` carries the `settings` as given (no keep mark;
+/// REST's queue form), and the apply replaces the row's settings wholesale.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_queued_update_connection_carries_the_keep_mark_and_fills_it_on_apply() {
-    let app = test_app("r2b6b-mcp-cpu-keep-queued").await;
+async fn a_queued_update_connection_carries_the_settings_and_replaces_on_apply() {
+    let app = test_app("r2b7a-mcp-queued-update").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line-q", "protocol": "slmp", "host": "127.0.0.1",
-                    "port": 5007, "cpuType": "Q" }),
+            json!({ "name": "line-q", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 5007, "cpu_type": "Q" } }),
         ),
     )
     .await;
@@ -2968,10 +3050,9 @@ async fn a_queued_update_connection_carries_the_keep_mark_and_fills_it_on_apply(
         Some(&admin_key),
         tools_call(
             "update_connection",
-            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "host": "127.0.0.1",
-                    "port": 5008, "unitId": 1, "enabled": true, "simulation": false,
-                    "wordOrder": "", "database": null, "username": null,
-                    "password": null }),
+            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "enabled": true,
+                    "simulation": false,
+                    "settings": { "host": "127.0.0.1", "port": 5008, "cpu_type": "Q" } }),
         ),
     )
     .await;
@@ -2986,14 +3067,11 @@ async fn a_queued_update_connection_carries_the_keep_mark_and_fills_it_on_apply(
         .await
         .unwrap();
     let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert!(payload["input"].get("keepStored").is_none(), "{payload}");
     assert_eq!(
-        payload["input"]["keepStored"],
-        json!({ "keys": ["cpu_type"] }),
+        payload["input"]["settings"],
+        json!({ "host": "127.0.0.1", "port": 5008, "cpu_type": "Q" }),
         "{payload}"
-    );
-    assert!(
-        payload["input"]["settings"].get("cpu_type").is_none(),
-        "no value read before the write is queued: {payload}"
     );
 
     assert_eq!(
@@ -3023,8 +3101,8 @@ async fn a_queued_update_connection_carries_the_keep_mark_and_fills_it_on_apply(
         .and_then(|rows| rows.iter().find(|row| row["id"] == id))
         .unwrap_or_else(|| panic!("{listed:?}"));
     assert_eq!(row["name"], "line-q2", "{row:?}");
-    assert_eq!(row["port"], 5008, "{row:?}");
-    assert_eq!(row["cpuType"], "Q", "{row:?}");
+    assert_eq!(row["settings"]["port"], 5008, "{row:?}");
+    assert_eq!(row["settings"]["cpu_type"], "Q", "{row:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3043,8 +3121,7 @@ async fn test_connection_reports_failure_for_an_unreachable_port() {
             "test_connection",
             json!({
                 "protocol": "modbus-tcp",
-                "host": "127.0.0.1",
-                "port": closed_port,
+                "settings": { "host": "127.0.0.1", "port": closed_port },
             }),
         ),
     )
@@ -3077,7 +3154,7 @@ async fn test_connection_without_admin_scope_is_rejected() {
         Some(&key),
         tools_call(
             "test_connection",
-            json!({ "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 1 }),
+            json!({ "protocol": "modbus-tcp", "settings": { "host": "127.0.0.1", "port": 1 } }),
         ),
     )
     .await;
@@ -3763,7 +3840,8 @@ async fn create_connection_while_running_and_commissioning_is_applied_immediatel
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "line-commissioning", "host": "127.0.0.1", "port": 15022 }),
+            json!({ "name": "line-commissioning", "protocol": "modbus-tcp",
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
         ),
     )
     .await;
@@ -5596,7 +5674,7 @@ async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() 
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+            json!({ "name": "hub", "protocol": "hub", "settings": {} }),
         ),
     )
     .await;
@@ -5615,7 +5693,7 @@ async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() 
         Some(&admin_key),
         tools_call(
             "create_connection",
-            json!({ "name": "hub", "protocol": "hub", "host": "", "port": 0 }),
+            json!({ "name": "hub", "protocol": "hub", "settings": {} }),
         ),
     )
     .await;
@@ -5632,15 +5710,9 @@ async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() 
                 "id": existing.id,
                 "name": "line1",
                 "protocol": "hub",
-                "host": "",
-                "port": 0,
-                "unitId": 1,
                 "enabled": true,
                 "simulation": false,
-                "wordOrder": "low_high",
-                "database": null,
-                "username": null,
-                "password": null,
+                "settings": {},
             }),
         ),
     )
@@ -5759,15 +5831,8 @@ fn push_update_args(id: i64, name: &str) -> Value {
         "id": id,
         "name": name,
         "protocol": "push",
-        "host": "",
-        "port": 0,
-        "unitId": 1,
         "enabled": true,
         "simulation": false,
-        "wordOrder": "low_high",
-        "database": null,
-        "username": null,
-        "password": null,
     })
 }
 
@@ -5797,7 +5862,7 @@ async fn listed_settings(app: &TestApp, key: &str, id: i64) -> Value {
 }
 
 /// push 接続を `settings`（stale_timeout_ms + DB ブリッジ）付きで作ると、応答にも
-/// `list_connections` にも同じ `settings` が出て、host/port は正規化される。
+/// `list_connections` にも同じ `settings` が出る。
 ///
 /// 反証（2026-10-21 実施）: `PlcConnectionPayload` → `PlcConnectionInput` の
 /// `settings: payload.settings` を `settings: None` にすると、応答の `settings` が
@@ -5817,8 +5882,6 @@ async fn create_connection_push_with_settings_round_trips_through_list() {
             json!({
                 "name": "sender",
                 "protocol": "push",
-                "host": "",
-                "port": 0,
                 "settings": settings,
             }),
         ),
@@ -5826,15 +5889,15 @@ async fn create_connection_push_with_settings_round_trips_through_list() {
     .await;
     let payload = tool_ok_payload(status, &body);
     assert_eq!(payload["created"]["protocol"], "push", "{payload:?}");
-    assert_eq!(payload["created"]["host"], "", "{payload:?}");
-    assert_eq!(payload["created"]["port"], 0, "{payload:?}");
+    assert!(payload["created"].get("host").is_none(), "{payload:?}");
     assert_eq!(payload["created"]["settings"], settings, "{payload:?}");
     let id = payload["created"]["id"].as_i64().unwrap();
 
     assert_eq!(listed_settings(&app, &admin_key, id).await, settings);
 }
 
-/// `update_connection` の `settings`: 省略・`null` は保存済みを保つ、オブジェクトは
+/// `update_connection` の `settings`（R2b-7a）: REST と同じ丸ごと置き換え。省略は
+/// `missing_fields`、`null` は入力不正で断り（保存済みを保つ意味は無い）、オブジェクトは
 /// 置き換え、`{}` でブリッジが外れる（既定に戻る）。
 ///
 /// 反証（2026-10-21 実施）: 同じく `settings: payload.settings` を `settings: None`
@@ -5865,29 +5928,32 @@ async fn update_connection_push_settings_omitted_null_object_and_empty() {
         .unwrap();
     let id = created.id;
 
-    // 省略 -> 保つ（名前だけ変わる）。
+    // 省略 -> missing_fields（何も変わらない）。
     let (status, body) = mcp_post(
         &app.router,
         Some(&admin_key),
         tools_call("update_connection", push_update_args(id, "sender-2")),
     )
     .await;
-    let payload = tool_ok_payload(status, &body);
-    assert_eq!(payload["updated"]["name"], "sender-2", "{payload:?}");
-    assert_eq!(payload["updated"]["settings"], original, "{payload:?}");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("missing_fields") && text.contains("settings"),
+        "{text}"
+    );
     assert_eq!(listed_settings(&app, &admin_key, id).await, original);
 
-    // null -> 保つ。
+    // null -> 入力不正（JSON-RPC のエラー。何も変わらない）。
     let mut args = push_update_args(id, "sender-2");
     args["settings"] = Value::Null;
-    let (status, body) = mcp_post(
+    let (_, body) = mcp_post(
         &app.router,
         Some(&admin_key),
         tools_call("update_connection", args),
     )
     .await;
-    let payload = tool_ok_payload(status, &body);
-    assert_eq!(payload["updated"]["settings"], original, "{payload:?}");
+    assert!(body.get("error").is_some(), "{body:?}");
     assert_eq!(listed_settings(&app, &admin_key, id).await, original);
 
     // 別のオブジェクト -> 置き換え。
@@ -5923,10 +5989,10 @@ async fn update_connection_push_settings_omitted_null_object_and_empty() {
     )
     .await;
     let payload = tool_ok_payload(status, &body);
-    // R2b-1d: a push row on its defaults reads back as `null` (alpha.33's shape, design §2).
-    assert_eq!(payload["updated"]["settings"], Value::Null, "{payload:?}");
+    // A push row on its defaults reads back as `{}` (REST's shape).
+    assert_eq!(payload["updated"]["settings"], json!({}), "{payload:?}");
     let listed = listed_settings(&app, &admin_key, id).await;
-    assert_eq!(listed, Value::Null);
+    assert_eq!(listed, json!({}));
 }
 
 /// 不正な `settings` は tool error（項目名つき）で断り、レジストリは変わらない。
@@ -5952,12 +6018,10 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
             json!({ "stale_timeout_ms": 3_600_001 }),
             "settings.stale_timeout_ms",
         ),
-        ("push", json!("text"), "settings"),
-        ("push", json!([1]), "settings"),
         (
             "modbus-tcp",
-            json!({ "stale_timeout_ms": 5_000 }),
-            "settings",
+            json!({ "host": "127.0.0.1", "stale_timeout_ms": 5_000 }),
+            "stale_timeout_ms",
         ),
         (
             "push",
@@ -5971,11 +6035,6 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
         ),
     ];
     for (protocol, settings, field) in cases {
-        let (host, port) = if protocol == "push" {
-            ("", 0)
-        } else {
-            ("127.0.0.1", 502)
-        };
         let (status, body) = mcp_post(
             &app.router,
             Some(&admin_key),
@@ -5984,8 +6043,6 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
                 json!({
                     "name": "bad",
                     "protocol": protocol,
-                    "host": host,
-                    "port": port,
                     "settings": settings.clone(),
                 }),
             ),
@@ -6011,8 +6068,6 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
             json!({
                 "name": "ok-bridge",
                 "protocol": "push",
-                "host": "",
-                "port": 0,
                 "settings": push_bridge_settings(pg_id, 10_000),
             }),
         ),
@@ -6046,7 +6101,6 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
             "settings.stale_timeout_ms",
         ),
         (json!({ "bogus": true }), "settings"),
-        (json!("text"), "settings"),
         (
             push_bridge_settings(missing_id, 10_000),
             "settings.bridge.db_connection_id",
@@ -6078,11 +6132,12 @@ async fn push_connection_invalid_settings_are_rejected_and_registry_unchanged() 
     }
 }
 
-/// tools/list: `create_connection`/`update_connection` の inputSchema に `push` と
-/// `settings` があり、`update_connection.required` に `settings` は無い。
-/// `test_connection` の protocol は変わらず push を含まない。
+/// tools/list（R2b-7a）: `create_connection`/`update_connection`/`test_connection` の
+/// inputSchema は REST と同じ `settings` の形で、`protocol` の `enum` は固定せず
+/// （`list_drivers` で得る）、平らなキーは無い。`update_connection.required` は
+/// `id`・`name`・`protocol`・`enabled`・`simulation`・`settings`。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn connection_tool_schemas_advertise_push_and_settings() {
+async fn connection_tool_schemas_advertise_the_settings_shape() {
     let app = test_app("tools-list-push-settings").await;
     let key = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
 
@@ -6095,38 +6150,43 @@ async fn connection_tool_schemas_advertise_push_and_settings() {
             .find(|t| t["name"] == name)
             .unwrap_or_else(|| panic!("{name} is listed"))
     };
-    for name in ["create_connection", "update_connection"] {
+    for name in ["create_connection", "update_connection", "test_connection"] {
         let schema = &find(name)["inputSchema"];
-        let protocols = schema["properties"]["protocol"]["enum"].as_array().unwrap();
-        assert!(
-            protocols.iter().any(|p| p == "push"),
-            "{name}: {protocols:?}"
-        );
-        let settings = &schema["properties"]["settings"];
-        assert_eq!(
-            settings["type"],
-            json!(["object", "null"]),
-            "{name}: {settings:?}"
-        );
-        assert!(settings["description"]
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties["protocol"].get("enum").is_none(), "{name}");
+        assert!(properties["protocol"]["description"]
             .as_str()
             .unwrap()
-            .contains("stale_timeout_ms"));
-        let required = schema["required"].as_array().unwrap();
-        assert!(
-            required.iter().all(|k| k != "settings"),
-            "{name}: {required:?}"
-        );
-        assert!(required.iter().any(|k| k == "host"), "{name}: {required:?}");
-        assert!(required.iter().any(|k| k == "port"), "{name}: {required:?}");
+            .contains("list_drivers"));
+        assert_eq!(properties["settings"]["type"], "object", "{name}");
+        for flat in ["host", "port", "unitId", "wordOrder", "cpuType", "password"] {
+            assert!(!properties.contains_key(flat), "{name}: {flat}");
+        }
     }
-    let test_protocols = find("test_connection")["inputSchema"]["properties"]["protocol"]["enum"]
-        .as_array()
-        .unwrap();
-    assert!(
-        test_protocols.iter().all(|p| p != "push"),
-        "{test_protocols:?}"
+    let required = |name: &str| -> Vec<String> {
+        find(name)["inputSchema"]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect()
+    };
+    assert_eq!(
+        required("create_connection"),
+        ["name", "protocol", "settings"]
     );
+    assert_eq!(
+        required("update_connection"),
+        [
+            "id",
+            "name",
+            "protocol",
+            "enabled",
+            "simulation",
+            "settings"
+        ]
+    );
+    assert_eq!(required("test_connection"), ["protocol", "settings"]);
 }
 
 // ---------------------------------------------------------------------------
@@ -6147,8 +6207,11 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
     let pg_args = |name: &str, password: &str| {
         json!({
-            "name": name, "protocol": "postgres", "host": "127.0.0.1", "port": 5432,
-            "database": "erp", "username": "reader", "password": password
+            "name": name, "protocol": "postgres",
+            "settings": {
+                "host": "127.0.0.1", "port": 5432,
+                "database": "erp", "username": "reader", "password": password
+            }
         })
     };
 
@@ -6176,10 +6239,8 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
     let mut update = pg_args("pg-mcp", MCP_P_QUEUED_UPDATE);
     for (key, value) in [
         ("id", json!(id)),
-        ("unitId", json!(1)),
         ("enabled", json!(true)),
         ("simulation", json!(false)),
-        ("wordOrder", json!("low_high")),
     ] {
         update[key] = value;
     }
@@ -6208,7 +6269,10 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
     assert_eq!(payloads.len(), 2);
     for text in &payloads {
         let payload: Value = serde_json::from_str(text).unwrap();
-        assert!(payload["input"].get("password").is_none(), "{payload}");
+        assert!(
+            payload["input"]["settings"].get("password").is_none(),
+            "{payload}"
+        );
         assert!(
             payload["input"]["sealedSecrets"].get("password").is_some(),
             "{payload}"

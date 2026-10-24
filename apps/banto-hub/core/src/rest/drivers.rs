@@ -26,7 +26,7 @@ use super::{Json, Serialize, State, TagRegistryState};
 /// 一覧の 1 行。
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) struct DriverListItem {
+pub(crate) struct DriverListItem {
     id: String,
     display_name: String,
     vendor: Option<String>,
@@ -66,7 +66,7 @@ fn list_item(entry: &DriverEntry) -> Option<DriverListItem> {
 }
 
 /// レジストリの順に、機器のドライバだけ。
-pub(super) fn driver_list(registry: &DriverRegistry) -> Vec<DriverListItem> {
+pub(crate) fn driver_list(registry: &DriverRegistry) -> Vec<DriverListItem> {
     registry
         .ids()
         .filter_map(|id| registry.get(id.as_str()))

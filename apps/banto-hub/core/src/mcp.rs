@@ -97,16 +97,11 @@ use crate::rest::{
     registry_before, run_plc_connection_test, unauthorized_response, validate_grpc_settings_body,
     validate_mqtt_settings_request, validate_store_settings_request, CollectionGroupPayload,
     CreateApiKeyRequest, GrpcSettingsBody, IssuedApiKeyResponse, MqttSettingsRequest,
-    MqttSettingsResponse, StoreSettingsRequest, StoreSettingsResponse, TagPayload, TagSpaceState,
+    MqttSettingsResponse, PlcConnectionPayload, PlcConnectionTestPayload, StoreSettingsRequest,
+    StoreSettingsResponse, TagPayload, TagSpaceState,
 };
 use crate::sink::{SinkGroupInput, SinkGroupService, SinkStatusStore};
 
-// R2b-6b: MCP の接続ツールの平らな形のアダプタ（R2b-7 で消える）。
-mod flat_connection;
-use flat_connection::{
-    flat_connection_response, flat_connection_responses, FlatPlcConnectionPayload,
-    FlatPlcConnectionTestPayload,
-};
 // T21 S2-b: 設定 get/set ツール用（REST の各設定ハンドラと同じ型を再利用する
 // - このモジュールの doc comment「§3.7」節と同じ「二重実装しない」規律）。
 use crate::settings::{HubSettingsExt, MqttSettings, SettingsService, StoreSettings};
@@ -585,7 +580,16 @@ fn tool_definitions() -> Vec<Value> {
         // ダウンの前後を問わず常時可（設計 §3.2「有効化ガードは不採用」）。
         json!({
             "name": "list_connections",
-            "description": "PLC 接続の一覧を返す(admin スコープ必須)。パスワードの値は返さず、passwordSet と passwordState(none: 無い / set: ある / unreadable: 参照はあるが Hub が読めない - 別の PC へ DB を移した等。update_connection で入れ直す)を返す。",
+            "description": "PLC 接続の一覧を返す(admin スコープ必須)。各接続は { id, name, protocol, enabled, simulation, settings }(REST の /api/plc-connections と同じ形)。秘密の値は返さず、秘密のキー(postgres の password)は {\"$secret\": \"set\" | \"unreadable\"}(unreadable: 参照はあるが Hub が読めない - 別の PC へ DB を移した等。update_connection で入れ直す)、値が無いキーは載らない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            },
+        }),
+        json!({
+            "name": "list_drivers",
+            "description": "機器のドライバの一覧を返す(admin スコープ必須。REST の GET /api/drivers と同じ中身)。各ドライバの id(create_connection の protocol)、settingsSchema(settings のキー・型・既定値・選択肢)、supportedKinds、addressHelp など。postgres・push・virtual のホストの接続は載らない。",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -594,52 +598,26 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "create_connection",
-            "description": "PLC 接続を新規作成する(admin スコープ必須)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "PLC 接続を新規作成する(admin スコープ必須)。入力は { name, protocol, enabled, simulation, settings }(REST の POST /api/plc-connections と同じ形。平らな host・port・unitId などは受けない)。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp", "postgres", "push"],
-                        "description": "既定値 modbus-tcp。postgres は外部 DB 連携 S1 (database/username 必須)。push は外部の送り手が値を送り込む取り込み口（docs/banto-hub-ingest-design.md §3）で、host/port/unitId/wordOrder/simulation は無視され正規化される（host は空文字列、port は 0 などの固定値になる）。",
+                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
                     },
-                    "host": { "type": "string", "description": "接続先ホスト名/IP。必須（push でも省略できない。push では無視されるので空文字列を送る）。" },
-                    "port": { "type": "integer", "description": "接続先ポート番号。必須（push でも省略できない。push では無視されるので 0 を送る）。" },
-                    "unitId": { "type": "integer", "description": "既定値 1。postgres では無視される(既定値で固定)。" },
-                    "enabled": { "type": "boolean", "description": "既定値 true。" },
+                    "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
                     "simulation": {
                         "type": "boolean",
-                        "description": "true でシミュレータ接続にする。既定値 false。postgres では無視される(常に false)。",
-                    },
-                    "wordOrder": {
-                        "type": "string",
-                        "enum": ["low_high", "high_low"],
-                        "description": "SLMP のワード順。既定値 low_high。postgres では無視される(既定値で固定)。",
-                    },
-                    "cpuType": {
-                        "type": "string",
-                        "enum": ["Q", "R"],
-                        "description": "SLMP の CPU 種別。省略時は R（iQ-R。Q シリーズは Q）。未知の値は拒否する。SLMP 以外では保存されるが使われない。",
-                    },
-                    "database": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続の DB 名(必須)。他プロトコルでは null。",
-                    },
-                    "username": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続の DB ユーザー名(必須)。他プロトコルでは null。",
-                    },
-                    "password": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続のパスワード。Hub が封印して保存する(平文の列には置かない。Windows は DPAPI(machine スコープ)で封印、Windows 以外は plain-v1(平文)。未適用キューにも封印した値だけを置く)。応答には値を返さず passwordSet / passwordState だけを返す。省略/null は「パスワード無し」。他プロトコルでは null。",
+                        "description": "true でシミュレータ接続にする。省略は false。",
                     },
                     "settings": {
-                        "type": ["object", "null"],
-                        "description": "protocol: push 専用の設定（他プロトコルでは省略/null。指定すると検証エラー）。キーは stale_timeout_ms（送り手が黙ってから Down とみなすまでのミリ秒、1000〜3600000、既定 10000）と bridge（DB ブリッジ: kind は \"db\" 固定、db_connection_id は読み先の postgres 接続の id、queries は name/period_ms/sql/columns[column,key] の配列）。未知のキーはどの階層でも拒否する。banto_tags::push::validate_push_settings で検証され、不正な項目は settings.* の項目名つきで返る。省略は既定（stale_timeout_ms 10000・ブリッジ無し）。",
+                        "type": "object",
+                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。機器のドライバ(modbus-tcp・slmp など)は list_drivers の settingsSchema のキー(snake_case。host・port・unit_id・cpu_type など。省いたキーはスキーマの既定値)。postgres は host・port・database・username・password。push は stale_timeout_ms と bridge(DB ブリッジ。未知のキーはどの階層でも拒否)。virtual は空。秘密のキー(postgres の password)は平文で入れると Hub が封印して保存する(Windows は DPAPI(machine スコープ)、Windows 以外は plain-v1。未適用キューにも封印した値だけを置く)。応答には値を返さず {\"$secret\": \"set\" | \"unreadable\"} だけを返す。",
                     },
                 },
-                "required": ["name", "host", "port"],
+                "required": ["name", "protocol", "settings"],
                 "additionalProperties": false,
             },
         }),
@@ -664,7 +642,7 @@ fn tool_definitions() -> Vec<Value> {
         // (admin スコープ必須・有効化ガードなし)。
         json!({
             "name": "update_connection",
-            "description": "既存の PLC 接続を更新する(admin スコープ必須)。更新は全項目指定が必須(PUT 置換。省略項目は既定値で上書きされるため許可しない)。cpuType と settings は省略でき、省略すると既存の値を保つ（settings は push 接続専用。null も同じく保つ）。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
+            "description": "既存の PLC 接続を更新する(admin スコープ必須)。入力は { id, name, protocol, enabled, simulation, settings }(REST の PUT /api/plc-connections/{id} と同じ形)で全項目指定が必須(PUT 置換)。settings は丸ごと置き換え(省いたキーはスキーマの既定値)で、省略が「保つ」になるのは秘密のキーだけ。ロックダウン済みで収集中のときだけ直接反映せず、未適用キュー(pending queue)に保存する(試運転中は収集中でも即時・無停止で反映する)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -672,90 +650,46 @@ fn tool_definitions() -> Vec<Value> {
                     "name": { "type": "string", "description": "接続名(一意)。" },
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp", "postgres", "push"],
-                        "description": "modbus-tcp、slmp、postgres、または push（外部の送り手が値を送り込む取り込み口、docs/banto-hub-ingest-design.md §3。host/port/unitId/wordOrder/simulation は無視され正規化される）。",
+                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres / push。",
                     },
-                    "host": { "type": "string", "description": "接続先ホスト名/IP。必須（push でも省略できない。push では無視されるので空文字列を送る）。" },
-                    "port": { "type": "integer", "description": "接続先ポート番号。必須（push でも省略できない。push では無視されるので 0 を送る）。" },
-                    "unitId": { "type": "integer", "description": "Modbus のユニット ID。postgres では無視される。" },
-                    "enabled": { "type": "boolean", "description": "接続を有効にするか。" },
+                    "enabled": { "type": "boolean", "description": "接続を有効にするか。省略は true。" },
                     "simulation": {
                         "type": "boolean",
-                        "description": "true でシミュレータ接続にする。postgres では無視される。",
-                    },
-                    "wordOrder": {
-                        "type": "string",
-                        "enum": ["low_high", "high_low"],
-                        "description": "SLMP のワード順。postgres では無視される。",
-                    },
-                    "cpuType": {
-                        "type": "string",
-                        "enum": ["Q", "R"],
-                        "description": "SLMP の CPU 種別（Q または R）。省略すると既存の値を保つ（この項目を知らないクライアントが Q を R に戻さない）。未知の値は拒否する。必須キーには含めない。",
-                    },
-                    "database": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続の DB 名(必須)。他プロトコルでは null。",
-                    },
-                    "username": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続の DB ユーザー名(必須)。他プロトコルでは null。",
-                    },
-                    "password": {
-                        "type": ["string", "null"],
-                        "description": "protocol: postgres 接続のパスワード(Hub が封印して保存する)。null は「現在のパスワードを変更しない」、空文字列は「消去」、それ以外の文字列は「置き換え」(tri-state PATCH意味論。banto_tags::PlcConnectionInput::secrets の Keep / Clear / Set)。passwordState が unreadable(この PC で読めない)の接続は、ここで入れ直すと直る。他プロトコルでは null。",
+                        "description": "true でシミュレータ接続にする。省略は false。",
                     },
                     "settings": {
-                        "type": ["object", "null"],
-                        "description": "protocol: push 専用の設定（他プロトコルでは省略/null。指定すると検証エラー）。キーは stale_timeout_ms（1000〜3600000、既定 10000）と bridge（DB ブリッジ: kind は \"db\" 固定、db_connection_id は読み先の postgres 接続の id、queries は name/period_ms/sql/columns[column,key] の配列）。未知のキーはどの階層でも拒否する。banto_tags::push::validate_push_settings で検証され、不正な項目は settings.* の項目名つきで返る。省略または null は「保存済みの設定を保つ」（この項目を知らないクライアントが push の設定を消さない）、オブジェクトは置き換え、{} は既定に戻してブリッジを外す。必須キーには含めない。",
+                        "type": "object",
+                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
                     },
                 },
-                "required": [
-                    "id",
-                    "name",
-                    "protocol",
-                    "host",
-                    "port",
-                    "unitId",
-                    "enabled",
-                    "simulation",
-                    "wordOrder",
-                    "database",
-                    "username",
-                    "password",
-                ],
+                "required": ["id", "name", "protocol", "enabled", "simulation", "settings"],
                 "additionalProperties": false,
             },
         }),
         json!({
             "name": "test_connection",
-            "description": "保存前に PLC 接続の疎通を確認する(admin スコープ必須)。TCP 接続だけでなく実プロトコルで軽い読み出しを1回試みる。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
+            "description": "保存前に PLC 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。TCP 接続だけでなく実プロトコルで軽い読み出しを1回試みる。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "protocol": {
                         "type": "string",
-                        "enum": ["modbus-tcp", "slmp", "virtual"],
-                        "description": "virtual は常に ok:false(テスト対象外)。",
+                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)。virtual は常に ok:false(テスト対象外)。",
                     },
-                    "host": { "type": "string", "description": "接続先ホスト名/IP。" },
-                    "port": { "type": "integer", "description": "接続先ポート番号。" },
-                    "unitId": { "type": "integer", "description": "既定値 1(Modbus のみ使用)。" },
                     "simulation": {
                         "type": "boolean",
                         "description": "true の場合は常に ok:false(内蔵シミュレータは常に成功するためテスト不要)。既定値 false。",
                     },
+                    "settings": {
+                        "type": "object",
+                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは、省略 = connectionId の保存済みの値を使う、null・空文字列 = 値無し、文字列 = その値で試す(保存しない)。",
+                    },
                     "connectionId": {
                         "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。収集中の broker セッションがあれば(プロトコルによらず)それを再利用し、2本目をダイヤルしない。フォームの接続先・unitId・CPU 種別などがそのセッションの設定と違えば試さず「保存してからテスト」と返す。",
-                    },
-                    "cpuType": {
-                        "type": "string",
-                        "enum": ["Q", "R"],
-                        "description": "SLMP の CPU 種別。省略時は、connectionId の保存済み接続が同じプロトコル(slmp)のときだけその CPU を引き継ぐ。connectionId が無い・保存済みが無い・保存済みのプロトコルが違うときはドライバの既定(iQ-R)。収集中のセッションを再利用するとき、そのセッションの CPU と違えば試さず「保存してからテスト」と返す。",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。収集中の broker セッションがあれば(プロトコルによらず)それを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。省いた秘密値の補いにも使う。",
                     },
                 },
-                "required": ["protocol", "host", "port"],
+                "required": ["protocol", "settings"],
                 "additionalProperties": false,
             },
         }),
@@ -1358,6 +1292,7 @@ async fn handle_tools_call(
         "write_tag_value" => tool_write_tag_value(state, ctx, arguments).await?,
         "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
         "list_connections" => tool_list_connections(state, ctx).await,
+        "list_drivers" => tool_list_drivers(state, ctx),
         "create_connection" => tool_create_connection(state, ctx, arguments).await?,
         "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
         "update_connection" => tool_update_connection(state, ctx, arguments).await?,
@@ -1875,14 +1810,24 @@ async fn tool_list_connections(state: &McpState, ctx: &ApiKeyContext) -> Value {
         return err;
     }
     // S1（docs/banto-hub-external-db-design.md §2.2）: 生の`PlcConnection`
-    // を返さない - `PlcConnectionResponse`（`passwordSet`・R2b-1d の `passwordState`）
-    // へ変換してから返す（`crate::rest::PlcConnectionResponse`の doc comment参照、
-    // REST の `plc_connections_list`と同じ変換）。
+    // を返さない - `PlcConnectionResponse`（秘密のキーは `{"$secret": ...}`）へ変換して
+    // から返す（`crate::rest::PlcConnectionResponse`の doc comment参照、REST の
+    // `plc_connections_list`と同じ変換）。
     // PR #777 review P2: the rows and their sealed rows in one read transaction.
-    match flat_connection_responses(&state.plc_connections).await {
+    match crate::rest::connection_responses(&state.plc_connections).await {
         Ok(connections) => tool_ok(json!({ "connections": connections })),
         Err(err) => tool_error(format!("接続一覧の取得に失敗しました: {err}")),
     }
+}
+
+// --- 7b. list_drivers (R2b-7a) -----------------------------------------------
+
+/// `GET /api/drivers`（`crate::rest::driver_list`）と同じ中身。副作用が無いので監査もしない。
+fn tool_list_drivers(state: &McpState, ctx: &ApiKeyContext) -> Value {
+    if let Err(err) = require_admin_scope(ctx) {
+        return err;
+    }
+    tool_ok(json!({ "drivers": crate::rest::driver_list(state.manager.registry()) }))
 }
 
 // --- 8. create_connection ----------------------------------------------------
@@ -1903,16 +1848,12 @@ async fn tool_create_connection(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
-    let flat: FlatPlcConnectionPayload = serde_json::from_value(arguments)
+    // R2b-7a: REST と同じ `settings` の形（平らな欄は `deny_unknown_fields` で断る）。
+    let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
-    if let Err(err) = crate::rest::reject_hub_connection_protocol(&flat.protocol) {
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input.protocol) {
         return Ok(banto_error_tool_error(&err));
     }
-    // R2b-6b: 平らな形の旧い検証 (1) を今の項目名で掛けてから `settings` の形に写す。
-    if let Err(err) = flat.check(&state.plc_connections) {
-        return Ok(banto_error_tool_error(&err));
-    }
-    let (input, _no_keep) = flat.into_settings_payload(false);
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
@@ -2026,7 +1967,7 @@ async fn tool_create_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    match flat_connection_response(&state.plc_connections, created).await {
+    match crate::rest::connection_response(&state.plc_connections, created).await {
         Ok(created) => Ok(tool_ok(json!({ "created": created }))),
         Err(err) => Ok(tool_error(format!(
             "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
@@ -2207,30 +2148,17 @@ fn require_all_fields(arguments: &Value, required: &[&str]) -> Option<Value> {
     }
 }
 
-/// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の
-/// wire フィールド（camelCase）全部 + `id`。inputSchema の
-/// `update_connection.required`と同期させること。`cpuType`と`settings`は
-/// 「省略で既存の値を保つ」任意項目なので含めない（知らないクライアントが消さない）。
-///
-/// S1（docs/banto-hub-external-db-design.md §4.1）: `database`/`username`/
-/// `password`を追加。`password`はキーの**存在**だけを要求する
-/// （`require_all_fields`は`contains_key`で見るので値が`null`でも通る) -
-/// `null`が「変更しない」を意味する tri-state PATCH 意味論
-/// （`banto_tags::PlcConnectionInput::password`の doc comment）はここでは
-/// 崩さない。
-const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 12] = [
+/// [`tool_update_connection`]の必須キー一覧 - `PlcConnectionPayload`の wire フィールド
+/// （camelCase）全部 + `id`。inputSchema の `update_connection.required` と同期させること。
+/// R2b-7a: REST と同じ丸ごと置き換え（`settings` も必須。省略が「保つ」になるのは `settings`
+/// の中の秘密のキーだけ）。
+const UPDATE_CONNECTION_REQUIRED_FIELDS: [&str; 6] = [
     "id",
     "name",
     "protocol",
-    "host",
-    "port",
-    "unitId",
     "enabled",
     "simulation",
-    "wordOrder",
-    "database",
-    "username",
-    "password",
+    "settings",
 ];
 
 /// [`tool_update_group`]の必須キー一覧 - `CollectionGroupPayload`の
@@ -2280,8 +2208,7 @@ const UPDATE_TAG_REQUIRED_FIELDS: [&str; 18] = [
 /// フロー - [`tool_create_connection`]と同型（`update_tx`を使う点と`id`引数
 /// を取る点だけが違う）。`arguments`には`id`と`PlcConnectionPayload`の各
 /// フィールドを同じオブジェクトに混在させる（`PlcConnectionPayload`は
-/// `deny_unknown_fields`ではないので、`id`が混ざっていても
-/// `serde_json::from_value`は無視して問題なくデシリアライズできる）。
+/// `deny_unknown_fields`なので、`id`はデシリアライズの前に外す）。
 async fn tool_update_connection(
     state: &McpState,
     ctx: &ApiKeyContext,
@@ -2298,38 +2225,26 @@ async fn tool_update_connection(
         .get("id")
         .and_then(Value::as_i64)
         .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
-    let flat: FlatPlcConnectionPayload = serde_json::from_value(arguments)
+    // R2b-7a: REST と同じ `settings` の形。`id` は `PlcConnectionPayload`
+    // （`deny_unknown_fields`）に渡す前に外す。`settings` は丸ごと置き換え。
+    let mut arguments = arguments;
+    if let Some(object) = arguments.as_object_mut() {
+        object.remove("id");
+    }
+    let input: PlcConnectionPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続の入力が不正です: {err}")))?;
-    if let Err(err) = crate::rest::reject_hub_connection_protocol(&flat.protocol) {
+    if let Err(err) = crate::rest::reject_hub_connection_protocol(&input.protocol) {
         return Ok(banto_error_tool_error(&err));
     }
-    // R2b-6b: 平らな形の旧い検証 (1) を今の項目名で掛けてから `settings` の形に写す。今の
-    // 「省略は保つ」（slmp の cpuType・push の settings）は値を補わず `keep` の印で運び、
-    // 書き込みのトランザクションの中で読んだ保存済みの行から banto-tags が補う
-    // （#813 のレビュー P2。ここで読んで補うと、間にコミットされた更新を巻き戻す）。
-    if let Err(err) = flat.check(&state.plc_connections) {
-        return Ok(banto_error_tool_error(&err));
-    }
-    let (input, keep) = flat.into_settings_payload(true);
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
 
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        let mut form = match input.clone().queue_form(&secret_keys) {
+        let form = match input.clone().queue_form(&secret_keys) {
             Ok(form) => form,
             Err(err) => return Ok(banto_error_tool_error(&err)),
         };
-        // 補う印もそのまま積む（適用時のトランザクションの中で補う。積む時点の指紋と
-        // 補う値の出どころを別の読みにしない）。REST から積む行には付かない。
-        if !keep.is_empty() {
-            if let Some(object) = form.as_object_mut() {
-                object.insert(
-                    crate::pending_changes::KEEP_STORED_FIELD.to_string(),
-                    json!(keep),
-                );
-            }
-        }
         let payload = json!({ "id": id, "input": form });
         let base_fingerprint = compute_pending_base_fingerprint(
             &state.plc_connections,
@@ -2376,10 +2291,7 @@ async fn tool_update_connection(
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
     let input = match input.into_input(&secret_keys) {
-        Ok(input) => banto_tags::ConnectionSettingsInput {
-            keep_stored: keep,
-            ..input
-        },
+        Ok(input) => input,
         Err(err) => return Ok(banto_error_tool_error(&err)),
     };
     let mut tx = match state.manager.pool().begin_with("BEGIN IMMEDIATE").await {
@@ -2437,7 +2349,7 @@ async fn tool_update_connection(
         )));
     }
     // S1: 生の`PlcConnection`を返さない - `tool_list_connections`と同じ変換。
-    match flat_connection_response(&state.plc_connections, updated).await {
+    match crate::rest::connection_response(&state.plc_connections, updated).await {
         Ok(updated) => Ok(tool_ok(json!({ "updated": updated }))),
         Err(err) => Ok(tool_error(format!(
             "変更は保存しましたが、応答の組み立てに失敗しました: {err}"
@@ -2462,14 +2374,9 @@ async fn tool_test_connection(
         return Ok(err);
     }
     let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
-    let flat: FlatPlcConnectionTestPayload = serde_json::from_value(arguments)
+    // R2b-7a: REST と同じ `settings` の形（フォームが送る値がそのまま）。
+    let payload: PlcConnectionTestPayload = serde_json::from_value(arguments)
         .map_err(|err| RpcError::invalid_params(format!("接続テストの入力が不正です: {err}")))?;
-    // R2b-6b: 平らな値を `settings` の形に写す（省いた wordOrder・cpuType は保存済みから）。
-    let saved = match flat.connection_id {
-        Some(id) => state.plc_connections.get(id).await.ok(),
-        None => None,
-    };
-    let payload = flat.into_test_payload(saved.as_ref());
 
     let result = run_plc_connection_test(&state.manager, &payload).await;
     Ok(tool_ok(
