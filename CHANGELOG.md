@@ -2,6 +2,22 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.2.0-alpha.39 — 2026-10-24（アルファ）
+
+R2b-6（接続設定とアドレス補助をドライバのスキーマ・記述子から組み立てる。#810〜#819 と docs・版）。詳細設計は [docs/banto-hub-driver-ui-design.md](docs/banto-hub-driver-ui-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.38 の DB をそのまま開けます）。**REST（接続の API）と設定パッケージの形は変わります**（下の「変更」。使用者がまだいない前提で、旧い形は受けません）。MCP の形は変えていません（平らな形のまま。R2b-7 で見直します）。タグ・リリースの扱いは alpha.37 と同じです。
+
+### 変更
+
+- **接続の画面を、ドライバのスキーマから組み立てるようにしました。** プロトコルを選ぶと、そのドライバが宣言した欄（ホスト・ポート・局番・ワード順・CPU 種別など）が出ます。欄の確かめ（範囲・必須・選択肢）もスキーマに従います。プロトコルごとの Svelte の分岐と TS の写しは消えました。新規作成の既定は一覧の先頭（SLMP）です。
+- **`/api/plc-connections` と `/api/plc-connections/test` が `{ protocol, settings }` の形になりました。** 接続の欄は `settings` の中に入り、キーはドライバのスキーマの snake_case になります（`host`・`port` は名前のまま、`unitId` → `settings.unit_id`、`wordOrder` → `settings.word_order`、`cpuType` → `settings.cpu_type`。旧い camelCase のキーは「このドライバの設定に無い欄です」で断ります。破壊的変更）。`settings` は丸ごと置き換えです（省略した欄は既定に戻ります）。秘密の欄は、省略 = 保つ、空文字 = 消す、文字列 = 置き換え、です。作成時に必須の秘密の欄が欠けていると「必須です」で断ります。
+- **`GET /api/drivers` を追加しました。** 機器のドライバごとの設定スキーマ・対応するデータ型・アドレスの説明を返します（viewer 以上）。
+- **データ型の可否をドライバの宣言に従わせました。** 宣言に無い型は、アドレスの解析の前に `dataType` の欄のエラーで断ります。Modbus では 64bit 型が使え、SLMP では断られます（string は SLMP だけ）。タグ画面のデータ型の選択肢も同じ宣言から出ます。
+- **`POST /api/tags/offset-addresses` を追加し、`parse-addresses` の応答に `index` を足しました。** 連続登録・オフセットコピー・構造体登録のアドレスの計算は、この API で行います。オフセットコピーでワード内ビット（`D100.5`・`400001.3`）を進めると、ワードだけが進み、ビットの位置は保たれます（`D100.5` + 1 は `D101.5`）。
+- **Modbus は、占有の末尾が 65535 を超えるアドレスを断ります**（`offset + ワード数 - 1 > 65535`。保存の経路も同じです。SLMP は alpha.37 までに対応済みです）。
+- **設定パッケージを `schemaVersion: 3` にしました。** 接続は `{ name, protocol, enabled, simulation, settings }` で持ち、秘密は書き出しません（取り込んだ後に秘密を設定し直します）。`schemaVersion: 2` 以下は読み込めません。今の banto-hub で書き出し直してください。
+- **連続登録とアドレスの説明を改善しました。** アドレスの説明・placeholder はドライバの記述から出ます（Modbus のグループに MELSEC の説明が出なくなりました）。Modbus の連続登録の開始番号の既定は `400001` 形式になります。連続登録の「書き込み可」は、グループの既定（`defaultWritable`）に従います。
+- **内部**: `slmpDeviceTable.ts` と、プロトコル別のアドレス・データ型の TS の表を削除しました。`banto-driver-api` と `banto-driver-conformance` は 0.3.0（設定スキーマ・対応する型・ワード単位のオフセットの追加と適合テスト C17〜C22。crates.io へは未公開）。
+
 ## v0.2.0-alpha.38 — 2026-10-24（アルファ）
 
 R2b-5（シミュレーションを値の層へ。#805〜#808 と docs・版）。詳細設計は [docs/banto-hub-driver-sim-design.md](docs/banto-hub-driver-sim-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.37 の DB をそのまま開けます）。MCP・設定パッケージの形も変えていません。REST は下の「変更」の削除 2 点だけです。タグ・リリースの扱いは alpha.37 と同じです。
