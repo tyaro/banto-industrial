@@ -2267,26 +2267,21 @@ async fn users_delete_body(state: &AppState, id: i64) -> Result<(), BantoError> 
 // （R0 §3.6: viewer-read / editor-write）・同じ監査内容（`origin: "tauri"`
 // のみ異なる）。手本は relay-wright の `src-tauri/src/lib.rs` 同名セクション。
 
-/// #383 段階2a: chronogazer は `"modbus-tcp"`/`"slmp"` と（#383 段階3 P4 から）
-/// `"hub"` だけを受け付ける。
-/// `chronogazer_core::rest::reject_disallowed_connection_protocol`の doc
-/// comment と同じ理由。REST 側と Tauri 側の両方から呼ぶ - 片方だけに書くと
-/// もう片方の経路から `"virtual"`/`"postgres"` 接続を作れてしまう
-/// （invariant: 両経路対称）。
-fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
-    const ALLOWED: [&str; 3] = ["modbus-tcp", "slmp", "hub"];
-    if ALLOWED.contains(&protocol) {
-        return Ok(());
-    }
-    Err(BantoError::Validation {
-        field_errors: vec![FieldError {
-            field: "protocol".to_string(),
-            message: format!(
-                "chronogazer が対応するプロトコルは {} のいずれかです",
-                ALLOWED.join(", ")
-            ),
-        }],
-    })
+/// Viewer-readable catalog, using the same registry and shape as REST and Hub.
+async fn drivers_list_body(
+    state: &AppState,
+) -> Result<Vec<chronogazer_core::driver_catalog::DriverListItem>, BantoError> {
+    require_role(state, Role::Viewer, "tags").await?;
+    Ok(chronogazer_core::driver_catalog::driver_list(
+        state.services.collect.drivers(),
+    ))
+}
+
+#[tauri::command]
+async fn drivers_list(
+    state: State<'_, AppState>,
+) -> Result<Vec<chronogazer_core::driver_catalog::DriverListItem>, BantoError> {
+    drivers_list_body(&state).await
 }
 
 /// `viewer`+ (R0 §3.6): list PLC connections.
@@ -2325,11 +2320,14 @@ async fn plc_connections_create_body(
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
-    reject_disallowed_connection_protocol(&input.protocol)?;
+    chronogazer_core::rest::reject_disallowed_connection_protocol(
+        state.services.collect.drivers(),
+        &input.protocol,
+    )?;
     let created = state
         .services
         .plc_connections
-        .create(input.into_create_input())
+        .create_settings(input.into_create_input())
         .await?;
     state
         .services
@@ -2370,7 +2368,10 @@ async fn plc_connections_update_body(
     input: PlcConnectionPayload,
 ) -> Result<PlcConnectionResponse, BantoError> {
     let actor = require_role(state, Role::Editor, "plc_connections").await?;
-    reject_disallowed_connection_protocol(&input.protocol)?;
+    chronogazer_core::rest::reject_disallowed_connection_protocol(
+        state.services.collect.drivers(),
+        &input.protocol,
+    )?;
     // #417 監査 P2: `simulation` の省略は既存行の値を保つ（REST と同じ関数）。
     let updated = update_plc_connection(&state.services.plc_connections, id, input).await?;
     state
@@ -4772,6 +4773,7 @@ pub fn run() {
             tags_register_from_hub,
             hub_adopt_manual_key,
             hub_disconnect,
+            drivers_list,
             plc_connections_list,
             plc_connections_get,
             plc_connections_create,
@@ -6116,16 +6118,16 @@ mod tests {
         let conn = state
             .services
             .plc_connections
-            .create(
+            .create_settings(
                 PlcConnectionPayload {
                     name: "plc1".to_string(),
                     protocol: "modbus-tcp".to_string(),
-                    host: "192.168.11.200".to_string(),
-                    port: 502,
-                    unit_id: 1,
                     enabled: true,
-                    word_order: String::new(),
                     simulation: None,
+                    settings: serde_json::from_value(serde_json::json!({
+                        "host": "192.168.11.200", "port": 502
+                    }))
+                    .unwrap(),
                 }
                 .into_create_input(),
             )
@@ -6342,12 +6344,12 @@ mod tests {
         PlcConnectionPayload {
             name: name.to_string(),
             protocol: "modbus-tcp".to_string(),
-            host: "192.168.11.200".to_string(),
-            port: 502,
-            unit_id: 1,
             enabled: true,
-            word_order: String::new(),
             simulation,
+            settings: serde_json::from_value(serde_json::json!({
+                "host": "192.168.11.200", "port": 502
+            }))
+            .unwrap(),
         }
     }
 
@@ -6400,8 +6402,7 @@ mod tests {
         // 2 つ目の hub 接続は banto-tags の規則で断る（許可リストは開いている）。
         let mut second = sim_payload("Hub 2", None);
         second.protocol = "hub".to_owned();
-        second.host = String::new();
-        second.port = 0;
+        second.settings.clear();
         match plc_connections_create_body(&state, second).await {
             Err(BantoError::Validation { field_errors }) => {
                 assert_eq!(field_errors[0].field, "protocol");
@@ -6455,8 +6456,7 @@ mod tests {
         // 無効にしても「登録済み」は変わらない（ダイアログで 2 本目を作らせない）。
         let mut toggle = sim_payload("Hub", None);
         toggle.protocol = "hub".to_owned();
-        toggle.host = String::new();
-        toggle.port = 0;
+        toggle.settings.clear();
         toggle.enabled = false;
         let updated = plc_connections_update_body(
             &state,
@@ -6617,6 +6617,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn drivers_list_is_viewer_readable_over_tauri() {
+        let state = app_state().await;
+        assert!(drivers_list_body(&state).await.is_err());
+        let viewer = state
+            .services
+            .users
+            .create_user("driver-viewer", "password123", "閲覧者", Role::Viewer)
+            .await
+            .unwrap();
+        state.set_session_for_test(Some(DesktopSession::Account(viewer)));
+        let catalog = serde_json::to_value(drivers_list_body(&state).await.unwrap()).unwrap();
+        assert_eq!(catalog[0]["id"], "slmp");
+        assert_eq!(catalog[1]["id"], "modbus-tcp");
+        assert!(catalog[0]["settingsSchema"]["fields"].is_array());
+    }
+
     /// #414 段階2: `config_exclusions_list` は viewer 以上で読め（REST の
     /// `GET /api/config-exclusions` と同じ床）、未ログインは拒否する。
     /// 中身（不正なタグが載ること・JSON の形）は同じ関数
@@ -6674,13 +6691,13 @@ mod tests {
         PlcConnectionPayload {
             name: name.to_string(),
             protocol: protocol.to_string(),
-            host: "192.168.11.200".to_string(),
-            port: 502,
-            unit_id: 1,
             enabled: true,
-            word_order: String::new(),
             // #417: 省略 = 作成では false、更新では既存の値を保つ。
             simulation: None,
+            settings: serde_json::from_value(serde_json::json!({
+                "host": "192.168.11.200", "port": 502
+            }))
+            .unwrap(),
         }
     }
 
@@ -6714,7 +6731,7 @@ mod tests {
         let conn = state
             .services
             .plc_connections
-            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .create_settings(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
@@ -6803,13 +6820,13 @@ mod tests {
         let modbus = state
             .services
             .plc_connections
-            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .create_settings(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create modbus connection");
         let slmp = state
             .services
             .plc_connections
-            .create(connection_payload("slmp", "slmp").into_create_input())
+            .create_settings(connection_payload("slmp", "slmp").into_create_input())
             .await
             .expect("create slmp connection");
         let mut group_ids = Vec::new();
@@ -6896,7 +6913,7 @@ mod tests {
             let conn = state
                 .services
                 .plc_connections
-                .create(connection_payload(name, protocol).into_create_input())
+                .create_settings(connection_payload(name, protocol).into_create_input())
                 .await
                 .expect("create connection");
             ids.push(conn.id);
@@ -6977,7 +6994,7 @@ mod tests {
         let conn = state
             .services
             .plc_connections
-            .create(connection_payload("modbus", "modbus-tcp").into_create_input())
+            .create_settings(connection_payload("modbus", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
@@ -10133,7 +10150,7 @@ mod tests {
         let conn = state
             .services
             .plc_connections
-            .create(connection_payload("plc", "modbus-tcp").into_create_input())
+            .create_settings(connection_payload("plc", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
@@ -10280,7 +10297,7 @@ mod tests {
         let conn = state
             .services
             .plc_connections
-            .create(connection_payload("plc", "modbus-tcp").into_create_input())
+            .create_settings(connection_payload("plc", "modbus-tcp").into_create_input())
             .await
             .expect("create connection");
         let group = state
