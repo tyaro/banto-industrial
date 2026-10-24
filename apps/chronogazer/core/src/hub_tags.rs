@@ -47,8 +47,8 @@ use std::collections::{HashMap, HashSet};
 use banto_core::{BantoError, FieldError};
 use banto_tags::{
     BatchTagOutcome, CollectionGroup, CollectionGroupInput, CollectionGroupService,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, HUB_PROTOCOL,
-    NUMERIC_DATA_TYPES, PLC_TAG_KIND,
+    PlcConnectionService, Tag, TagInput, TagService, HUB_PROTOCOL, NUMERIC_DATA_TYPES,
+    PLC_TAG_KIND,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{SqliteConnection, SqlitePool};
@@ -447,22 +447,15 @@ async fn register_in_tx(
                 None => {
                     let name = free_hub_connection_name(connection).await?;
                     let created = plc_connections
-                        .create_tx(
+                        .create_settings_tx(
                             connection,
-                            PlcConnectionInput {
+                            banto_tags::ConnectionSettingsInput {
                                 name,
                                 protocol: HUB_PROTOCOL.to_owned(),
-                                host: String::new(),
-                                port: 0,
-                                unit_id: 1,
                                 enabled: true,
                                 simulation: false,
-                                word_order: String::new(),
-                                cpu_type: None,
-                                database: None,
-                                username: None,
+                                settings: Default::default(),
                                 secrets: Default::default(),
-                                settings: None,
                             },
                         )
                         .await?;
@@ -594,6 +587,7 @@ pub fn registration_audit_detail(result: &HubRegistrationResult) -> serde_json::
 mod tests {
     use super::*;
     use crate::db::init_db_memory;
+    use banto_tags::PlcConnectionInput;
 
     struct Registry {
         pool: SqlitePool,
@@ -604,10 +598,13 @@ mod tests {
 
     async fn new_registry() -> Registry {
         let pool = init_db_memory().await.expect("init_db_memory");
+        let drivers = crate::test_support::drivers();
         Registry {
-            connections: PlcConnectionService::new(pool.clone()),
-            groups: CollectionGroupService::new(pool.clone()),
-            tags: TagService::new(pool.clone()),
+            connections: PlcConnectionService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            groups: CollectionGroupService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            tags: TagService::with_registry(pool.clone(), drivers).accept_hub_connections(),
             pool,
         }
     }

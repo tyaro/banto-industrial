@@ -118,6 +118,7 @@ pub use banto_admin_services::{audit, backup, users};
 // payload は `rest` 側（`rest::PlcConnectionPayload` 等）が持つ -
 // banto-tags 自身の `*Input` は snake_case で deserialize し、ワイヤを
 // 一切またがない。
+pub use banto_tags::driver_catalog;
 pub use banto_tags::{
     CollectionGroup, CollectionGroupService, PlcConnection, PlcConnectionService, Tag, TagService,
 };

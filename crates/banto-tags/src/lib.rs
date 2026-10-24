@@ -66,6 +66,7 @@
 
 pub mod collection_group;
 pub mod connection_secret;
+pub mod driver_catalog;
 pub mod plc_connection;
 pub mod push;
 pub mod scaling;

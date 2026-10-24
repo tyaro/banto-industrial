@@ -4762,9 +4762,12 @@ mod tests {
         assert!(!hub.refresh_registered().await, "登録 0 件のまま");
 
         let (connections, groups, tags) = (
-            PlcConnectionService::new(pool.clone()),
-            CollectionGroupService::new(pool.clone()),
-            TagService::new(pool.clone()),
+            PlcConnectionService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections(),
+            CollectionGroupService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections(),
+            TagService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections(),
         );
         let row = |external_name: &str, name: &str| crate::hub_tags::HubTagRow {
             external_name: external_name.to_owned(),
@@ -4876,12 +4879,16 @@ mod tests {
             .await
             .expect("HubService::new");
         hub.attach_registry(pool.clone());
-        let connections = PlcConnectionService::new(pool.clone());
+        let connections =
+            PlcConnectionService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections();
         let registered = crate::hub_tags::register_from_hub(
             &pool,
             &connections,
-            &CollectionGroupService::new(pool.clone()),
-            &TagService::new(pool.clone()),
+            &CollectionGroupService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections(),
+            &TagService::with_registry(pool.clone(), crate::test_support::drivers())
+                .accept_hub_connections(),
             crate::hub_tags::HubTagRegistration {
                 collection_group_id: None,
                 new_group: Some(crate::hub_tags::NewHubGroup {

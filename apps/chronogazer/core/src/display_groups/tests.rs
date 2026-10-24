@@ -3,25 +3,27 @@
 //! `rest::display_groups` のテスト、Tauri の経路は `src-tauri` のテスト。
 
 use super::*;
-use crate::rest::{CollectionGroupPayload, PlcConnectionPayload, TagPayload};
+use crate::rest::{CollectionGroupPayload, TagPayload};
 use banto_tags::{CollectionGroupService, PlcConnectionService};
 
 /// `pool` に Modbus 接続 1 つ・収集グループ 1 つを作り、その下にタグ `n` 本。
 pub(crate) async fn seed_tags(pool: &SqlitePool, n: usize) -> (TagService, Vec<i64>) {
     let conn = PlcConnectionService::new(pool.clone())
-        .create(
-            PlcConnectionPayload {
-                name: "plc".to_string(),
-                protocol: "modbus-tcp".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 502,
-                unit_id: 1,
-                enabled: true,
-                word_order: String::new(),
-                simulation: None,
-            }
-            .into_create_input(),
-        )
+        .create(banto_tags::PlcConnectionInput {
+            name: "plc".to_string(),
+            protocol: "modbus-tcp".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 502,
+            unit_id: 1,
+            enabled: true,
+            word_order: String::new(),
+            simulation: false,
+            cpu_type: None,
+            database: None,
+            username: None,
+            secrets: Default::default(),
+            settings: None,
+        })
         .await
         .expect("create connection");
     let group = CollectionGroupService::new(pool.clone())
