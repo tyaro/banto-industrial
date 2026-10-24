@@ -48,7 +48,10 @@
 //! （`plc_connection.rs` の `validate_plc_connection_input`）。
 
 use banto_core::FieldError;
-use banto_driver_api::{DriverRegistry, Settings};
+use banto_driver_api::{
+    DriverRegistry, FieldError as DriverFieldError, FieldKind, SettingField, SettingValue,
+    Settings, SettingsSchema,
+};
 use serde_json::{Map, Value};
 
 /// 秘密の参照のキー（設計 §3.3 `{"$secret": "<ref>"}`）。
@@ -146,6 +149,170 @@ pub fn validate_settings_with_registry(
         .into_iter()
         .map(|error| rest_field_error(protocol, &error.key, error.message))
         .collect()
+}
+
+/// スキーマに従って、汎用フォームの入力（JSON のオブジェクト）から接続の `settings` を作る
+/// （R2b-6b、docs/banto-hub-driver-ui-design.md §4.2）。純関数。この後に今までどおり
+/// [`settings_to_api`] → `validate_config` を通す（欄どうしの整合はドライバが見る）。
+///
+/// - **種類**: キーごとに [`FieldKind`] と JSON の型を合わせる。`Integer` は JSON の整数だけ
+///   （`"502"`・`502.5` は断る。文字列から数への読み替えはしない）、`Text`・`Host`・`Choice`
+///   は文字列、`Bool` は真偽値。
+/// - **制約**: `Integer` の `min`・`max`、`Text` の `max_len`（文字数）、`Choice` の選択肢。
+/// - **必須**: 無い（または `null`）欄は既定値を埋める。既定値が無い必須の欄は欠けとして
+///   報告する。`Text`・`Host` の必須の欄は空白だけの文字列も欠けとみなす。
+/// - **スキーマに無いキーは断る**（ドライバの `validate_config` は未知のキーを断らない約束なので、
+///   入口で止める。Q9）。
+/// - **秘密のキー**（`Secret`）は tri-state をそのまま出力に残す: **省略 = 保つ**（出力にも
+///   キーが無い）、**`null` = 消す**（出力は `null`）、**文字列 = 置き換え**（出力はその文字列。
+///   平文なので、呼び手が保存の前に封印して `SecretChange` に写し、`settings` からは外す）。
+///   既定値は埋めない。必須の秘密の欄に `null` は欠けとして断る（省略は今の値を保つので、
+///   作成で値が要るかは呼び手が今の行と合わせて見る）。
+///
+/// エラーは `banto_driver_api::FieldError`（キーは JSON のキーのまま）で、スキーマの欄の順、
+/// その後に未知のキーを並べる。`schema` が空なら、空でない入力は全部未知のキー。
+pub fn settings_from_schema(
+    schema: &SettingsSchema,
+    input: &Map<String, Value>,
+) -> Result<Map<String, Value>, Vec<DriverFieldError>> {
+    let mut settings = Map::new();
+    let mut errors = Vec::new();
+    for field in &schema.fields {
+        let key = field.key.as_str();
+        let value = input.get(key);
+        if matches!(field.kind, FieldKind::Secret) {
+            match value {
+                None => {}
+                Some(Value::Null) if field.required => {
+                    errors.push(DriverFieldError::new(key, REQUIRED_MESSAGE));
+                }
+                Some(Value::Null) => {
+                    settings.insert(key.to_string(), Value::Null);
+                }
+                Some(Value::String(text)) => {
+                    settings.insert(key.to_string(), Value::String(text.clone()));
+                }
+                Some(_) => errors.push(DriverFieldError::new(
+                    key,
+                    "文字列か null で指定してください",
+                )),
+            }
+            continue;
+        }
+        let value = match value {
+            None | Some(Value::Null) => {
+                match &field.default {
+                    Some(default) => {
+                        settings.insert(key.to_string(), setting_value_json(default));
+                    }
+                    None if field.required => {
+                        errors.push(DriverFieldError::new(key, REQUIRED_MESSAGE));
+                    }
+                    None => {}
+                }
+                continue;
+            }
+            Some(value) => value,
+        };
+        match check_field_value(field, value) {
+            Ok(()) => {
+                settings.insert(key.to_string(), value.clone());
+            }
+            Err(message) => errors.push(DriverFieldError::new(key, message)),
+        }
+    }
+    for key in input.keys() {
+        if schema.field(key).is_none() {
+            errors.push(DriverFieldError::new(
+                key.as_str(),
+                "このドライバの設定に無い欄です",
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(settings)
+    } else {
+        Err(errors)
+    }
+}
+
+/// [`settings_from_schema`] の必須の欠けの文言。
+const REQUIRED_MESSAGE: &str = "必須です";
+
+/// スキーマの既定値を `settings` の JSON の値にする（`Integer` は数、`Bool` は真偽値）。
+fn setting_value_json(value: &SettingValue) -> Value {
+    match value {
+        SettingValue::Text(text) => Value::String(text.clone()),
+        SettingValue::Integer(n) => Value::from(*n),
+        SettingValue::Bool(flag) => Value::Bool(*flag),
+        // `SettingValue` は `#[non_exhaustive]`。後の版で増えた種類はその文字の形で持つ。
+        #[allow(unreachable_patterns)]
+        other => Value::String(other.to_text()),
+    }
+}
+
+/// `value`（`null` でない）が `field` の種類と制約に合うか。合わなければその文言。
+fn check_field_value(field: &SettingField, value: &Value) -> Result<(), String> {
+    let text = || match value {
+        Value::String(text) => Ok(text.as_str()),
+        _ => Err("文字列で指定してください".to_string()),
+    };
+    match &field.kind {
+        FieldKind::Text { max_len, .. } => {
+            let text = text()?;
+            if field.required && text.trim().is_empty() {
+                return Err(REQUIRED_MESSAGE.to_string());
+            }
+            match max_len {
+                Some(max) if text.chars().count() > *max as usize => {
+                    Err(format!("{max} 文字以下にしてください"))
+                }
+                _ => Ok(()),
+            }
+        }
+        FieldKind::Host => {
+            let text = text()?;
+            if field.required && text.trim().is_empty() {
+                return Err(REQUIRED_MESSAGE.to_string());
+            }
+            Ok(())
+        }
+        FieldKind::Integer { min, max } => {
+            let Some(n) = value.as_i64() else {
+                return Err("整数で指定してください".to_string());
+            };
+            match (min, max) {
+                (Some(min), Some(max)) if n < *min || n > *max => {
+                    Err(format!("{min}〜{max} で指定してください"))
+                }
+                (Some(min), None) if n < *min => Err(format!("{min} 以上で指定してください")),
+                (None, Some(max)) if n > *max => Err(format!("{max} 以下で指定してください")),
+                _ => Ok(()),
+            }
+        }
+        FieldKind::Choice { options } => {
+            let text = text()?;
+            if options.iter().any(|option| option.value == text) {
+                Ok(())
+            } else {
+                let values: Vec<&str> = options.iter().map(|o| o.value.as_str()).collect();
+                Err(format!(
+                    "{} のいずれかを指定してください",
+                    values.join(", ")
+                ))
+            }
+        }
+        FieldKind::Bool => match value {
+            Value::Bool(_) => Ok(()),
+            _ => Err("true か false で指定してください".to_string()),
+        },
+        // 呼び手（settings_from_schema）が先に扱う。
+        FieldKind::Secret => Ok(()),
+        // `FieldKind` は `#[non_exhaustive]`。このホストが知らない種類の欄は確かめられないので
+        // 断る（素通しにすると、スキーマが約束した制約を見ないまま保存する）。
+        #[allow(unreachable_patterns)]
+        _ => Err("このホストが扱えない種類の欄です".to_string()),
+    }
 }
 
 /// 平らな形 ⇔ `settings` のアダプタ（設計 §4.3、R2b-7 で消える）。
@@ -693,5 +860,288 @@ mod tests {
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].field, "protocol");
         assert!(errors[0].message.starts_with("対応プロトコルは "));
+    }
+
+    // ---- settings_from_schema（R2b-6b、設計 §4.2・§10）----
+
+    mod from_schema {
+        use super::super::settings_from_schema;
+        use super::object;
+        use banto_driver_api::{ChoiceOption, FieldKind, SettingField, SettingsSchema};
+        use serde_json::{json, Value};
+
+        /// Modbus / SLMP の形（必須の host、既定つきの必須の port、既定つきの choice）に、
+        /// 表のための text・bool・secret と既定の無い任意の integer を足したもの。
+        fn schema() -> SettingsSchema {
+            SettingsSchema::new(vec![
+                SettingField::new("host", "ホスト", FieldKind::host()).required(),
+                SettingField::new("port", "ポート", FieldKind::integer(1, 65535))
+                    .required()
+                    .default(502),
+                SettingField::new(
+                    "word_order",
+                    "ワード順",
+                    FieldKind::choice(vec![
+                        ChoiceOption::new("high_low", "上位が先"),
+                        ChoiceOption::new("low_high", "下位が先"),
+                    ]),
+                )
+                .default("high_low")
+                .advanced(),
+                SettingField::new(
+                    "note",
+                    "メモ",
+                    FieldKind::Text {
+                        max_len: Some(4),
+                        placeholder: None,
+                    },
+                ),
+                SettingField::new("backup_host", "予備ホスト", FieldKind::host()),
+                SettingField::new("tls", "TLS", FieldKind::bool()).default(false),
+                SettingField::new("retries", "再試行", FieldKind::integer_unbounded()),
+                SettingField::new("password", "パスワード", FieldKind::secret()),
+                SettingField::new("token", "トークン", FieldKind::secret()).required(),
+            ])
+        }
+
+        /// 1 行 = (名前, 入力, 期待)。期待は `Ok(出力)` か `Err([(キー, 文言の一部)])`。
+        type Expect = Result<Value, Vec<(&'static str, &'static str)>>;
+
+        fn cases() -> Vec<(&'static str, Value, Expect)> {
+            let defaults = json!({ "port": 502, "word_order": "high_low", "tls": false });
+            let with = |extra: Value| {
+                let mut out = object(defaults.clone());
+                out.extend(object(extra));
+                Ok(Value::Object(out))
+            };
+            vec![
+                // 既定値の補完（省略と null のどちらも）
+                (
+                    "最小の入力に既定値を埋める",
+                    json!({ "host": "10.0.0.1" }),
+                    with(json!({ "host": "10.0.0.1" })),
+                ),
+                (
+                    "null も既定値で埋める",
+                    json!({ "host": "h", "port": null, "word_order": null, "tls": null }),
+                    with(json!({ "host": "h" })),
+                ),
+                (
+                    "与えた値は既定値より優先する",
+                    json!({ "host": "h", "port": 5007, "word_order": "low_high", "tls": true,
+                            "note": "abcd", "retries": -3 }),
+                    Ok(
+                        json!({ "host": "h", "port": 5007, "word_order": "low_high", "tls": true,
+                               "note": "abcd", "retries": -3 }),
+                    ),
+                ),
+                // 種類の違い（読み替えをしない）
+                (
+                    "Integer に文字列の数は断る",
+                    json!({ "host": "h", "port": "502" }),
+                    Err(vec![("port", "整数で")]),
+                ),
+                (
+                    "Integer に小数は断る",
+                    json!({ "host": "h", "port": 502.5 }),
+                    Err(vec![("port", "整数で")]),
+                ),
+                (
+                    "Host に数は断る",
+                    json!({ "host": 10 }),
+                    Err(vec![("host", "文字列で")]),
+                ),
+                (
+                    "必須でない Host に数は断る",
+                    json!({ "host": "h", "backup_host": 5 }),
+                    Err(vec![("backup_host", "文字列で")]),
+                ),
+                (
+                    "必須でない Host に真偽値は断る",
+                    json!({ "host": "h", "backup_host": true }),
+                    Err(vec![("backup_host", "文字列で")]),
+                ),
+                (
+                    "Choice に数は断る",
+                    json!({ "host": "h", "word_order": 1 }),
+                    Err(vec![("word_order", "文字列で")]),
+                ),
+                (
+                    "Bool に文字列は断る",
+                    json!({ "host": "h", "tls": "true" }),
+                    Err(vec![("tls", "true か false")]),
+                ),
+                (
+                    "Text にオブジェクトは断る",
+                    json!({ "host": "h", "note": {} }),
+                    Err(vec![("note", "文字列で")]),
+                ),
+                // 必須の欠け
+                (
+                    "必須の host が無い",
+                    json!({}),
+                    Err(vec![("host", "必須です")]),
+                ),
+                (
+                    "必須の host が null",
+                    json!({ "host": null }),
+                    Err(vec![("host", "必須です")]),
+                ),
+                (
+                    "必須の host が空白だけ",
+                    json!({ "host": "  " }),
+                    Err(vec![("host", "必須です")]),
+                ),
+                // 範囲外・選択肢の外・長さ
+                (
+                    "port が 0",
+                    json!({ "host": "h", "port": 0 }),
+                    Err(vec![("port", "1〜65535")]),
+                ),
+                (
+                    "port が 65536",
+                    json!({ "host": "h", "port": 65536 }),
+                    Err(vec![("port", "1〜65535")]),
+                ),
+                (
+                    "port の端は通る",
+                    json!({ "host": "h", "port": 65535 }),
+                    with(json!({ "host": "h", "port": 65535 })),
+                ),
+                (
+                    "選択肢に無い値",
+                    json!({ "host": "h", "word_order": "big" }),
+                    Err(vec![("word_order", "high_low, low_high")]),
+                ),
+                (
+                    "max_len を超える（文字数で数える）",
+                    json!({ "host": "h", "note": "あいうえお" }),
+                    Err(vec![("note", "4 文字以下")]),
+                ),
+                (
+                    "max_len ちょうどは通る（文字数で数える）",
+                    json!({ "host": "h", "note": "あいうえ" }),
+                    with(json!({ "host": "h", "note": "あいうえ" })),
+                ),
+                // 未知のキー
+                (
+                    "スキーマに無いキーは断る",
+                    json!({ "host": "h", "unit_id": 1 }),
+                    Err(vec![("unit_id", "無い欄")]),
+                ),
+                (
+                    "$secret の参照もスキーマに無いキーなら断る",
+                    json!({ "host": "h", "extra": { "$secret": "r" } }),
+                    Err(vec![("extra", "無い欄")]),
+                ),
+                // 秘密のキーの tri-state
+                (
+                    "秘密の省略は保つ（出力にキーが無い）",
+                    json!({ "host": "h" }),
+                    with(json!({ "host": "h" })),
+                ),
+                (
+                    "秘密の null は消す",
+                    json!({ "host": "h", "password": null }),
+                    with(json!({ "host": "h", "password": null })),
+                ),
+                (
+                    "秘密の文字列は置き換え",
+                    json!({ "host": "h", "password": "pw", "token": "t" }),
+                    with(json!({ "host": "h", "password": "pw", "token": "t" })),
+                ),
+                (
+                    "秘密の空文字も置き換え（文字列）",
+                    json!({ "host": "h", "password": "" }),
+                    with(json!({ "host": "h", "password": "" })),
+                ),
+                (
+                    "秘密に数は断る",
+                    json!({ "host": "h", "password": 1 }),
+                    Err(vec![("password", "文字列か null")]),
+                ),
+                (
+                    "秘密に参照のオブジェクトは断る",
+                    json!({ "host": "h", "password": { "$secret": "r" } }),
+                    Err(vec![("password", "文字列か null")]),
+                ),
+                (
+                    "必須の秘密の null は欠け",
+                    json!({ "host": "h", "token": null }),
+                    Err(vec![("token", "必須です")]),
+                ),
+                // 複数のエラーはスキーマの順、その後に未知のキー
+                (
+                    "エラーはスキーマの順に全部",
+                    json!({ "zzz": 1, "tls": 1, "port": "x" }),
+                    Err(vec![
+                        ("host", "必須です"),
+                        ("port", "整数で"),
+                        ("tls", "true か false"),
+                        ("zzz", "無い欄"),
+                    ]),
+                ),
+            ]
+        }
+
+        #[test]
+        fn the_table() {
+            for (name, input, expect) in cases() {
+                let got = settings_from_schema(&schema(), &object(input));
+                match (got, expect) {
+                    (Ok(map), Ok(want)) => assert_eq!(Value::Object(map), want, "{name}"),
+                    (Err(errors), Err(want)) => {
+                        let keys: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
+                        let want_keys: Vec<&str> = want.iter().map(|(k, _)| *k).collect();
+                        assert_eq!(keys, want_keys, "{name}: {errors:?}");
+                        for (error, (_, part)) in errors.iter().zip(&want) {
+                            assert!(error.message.contains(part), "{name}: {errors:?}");
+                        }
+                    }
+                    (got, want) => panic!("{name}: got {got:?}, want {want:?}"),
+                }
+            }
+        }
+
+        #[test]
+        fn an_empty_schema_refuses_every_key_and_accepts_nothing() {
+            let empty = SettingsSchema::default();
+            assert_eq!(
+                settings_from_schema(&empty, &object(json!({}))).unwrap(),
+                object(json!({}))
+            );
+            let errors =
+                settings_from_schema(&empty, &object(json!({ "a": 1, "b": 2 }))).unwrap_err();
+            let keys: Vec<&str> = errors.iter().map(|e| e.key.as_str()).collect();
+            assert_eq!(keys, ["a", "b"]);
+        }
+
+        #[test]
+        fn bounds_on_one_side_only() {
+            let schema = SettingsSchema::new(vec![
+                SettingField::new(
+                    "lo",
+                    "lo",
+                    FieldKind::Integer {
+                        min: Some(0),
+                        max: None,
+                    },
+                ),
+                SettingField::new(
+                    "hi",
+                    "hi",
+                    FieldKind::Integer {
+                        min: None,
+                        max: Some(9),
+                    },
+                ),
+            ]);
+            let ok = settings_from_schema(&schema, &object(json!({ "lo": 1_000_000, "hi": -5 })));
+            assert!(ok.is_ok(), "{ok:?}");
+            let errors =
+                settings_from_schema(&schema, &object(json!({ "lo": -1, "hi": 10 }))).unwrap_err();
+            assert!(errors[0].message.contains("0 以上"), "{errors:?}");
+            assert!(errors[1].message.contains("9 以下"), "{errors:?}");
+        }
     }
 }

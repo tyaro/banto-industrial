@@ -22,6 +22,8 @@
 //! 6. virtual 拒否
 //! 7. simulation 拒否
 //! 8. 権限(viewer は 403、CSRF ヘッダ無しは拒否)
+//! 9. R2b-6b: `GET /api/drivers`(機器のドライバだけがレジストリの順に載る・JSON の形・
+//!    未認証は 401・viewer は読める)
 
 use banto_hub_core::db::Db;
 use banto_hub_core::rest::user_session_lookup;
@@ -961,4 +963,164 @@ async fn viewer_role_is_forbidden_and_missing_csrf_header_is_rejected() {
         StatusCode::OK,
         "a request without the X-Banto-Client CSRF header must be rejected"
     );
+}
+
+// ---------------------------------------------------------------------------
+// R2b-6b（docs/banto-hub-driver-ui-design.md §4.1）: `GET /api/drivers`。実ドライバの
+// レジストリ（`common::hub_drivers()` = 組み込み + ホストの接続）で、機器のドライバだけが
+// レジストリの順に載り、JSON の形（6c の UI がそのまま読む）が固定されていること。
+// ---------------------------------------------------------------------------
+
+/// `GET /api/drivers`。`token` が `None` なら Authorization を付けない。
+async fn get_drivers(router: &Router, token: Option<&str>) -> (StatusCode, Value) {
+    let mut request = HttpRequest::builder()
+        .method("GET")
+        .uri("/api/drivers")
+        .header(CLIENT_HEADER.0, CLIENT_HEADER.1);
+    if let Some(token) = token {
+        request = request.header("Authorization", format!("Bearer {token}"));
+    }
+    let response = router
+        .clone()
+        .oneshot(request.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drivers_list_has_the_device_drivers_in_registry_order_and_no_host_connections() {
+    let app = test_app("r2b6b-drivers").await;
+    let (status, body) = get_drivers(&app.router, Some(&app.admin_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let ids: Vec<&str> = body
+        .as_array()
+        .expect("an array")
+        .iter()
+        .map(|d| d["id"].as_str().unwrap())
+        .collect();
+    // The registry's order (`DriverRegistry::ids()`); `postgres`・`push`・`virtual`
+    // (`HostProvided`) are registered by `hub_drivers()` but not listed.
+    assert_eq!(ids, ["modbus-tcp", "slmp"]);
+    let registry_ids: Vec<String> = app
+        .manager
+        .registry()
+        .ids()
+        .map(|id| id.to_string())
+        .collect();
+    for host in ["postgres", "push", "virtual"] {
+        assert!(
+            registry_ids.iter().any(|id| id == host),
+            "{host} should be in the registry for this test to mean anything: {registry_ids:?}"
+        );
+    }
+
+    // The shape, fixed for the generic form (6c).
+    let modbus = &body[0];
+    let keys: Vec<&str> = modbus
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let mut keys_sorted = keys.clone();
+    keys_sorted.sort_unstable();
+    assert_eq!(
+        keys_sorted,
+        [
+            "addressHelp",
+            "capabilities",
+            "displayName",
+            "id",
+            "kind",
+            "settingsSchema",
+            "supportedKinds",
+            "transports",
+            "vendor",
+            "version",
+        ]
+    );
+    assert_eq!(modbus["displayName"], json!("Modbus TCP"));
+    assert_eq!(modbus["vendor"], Value::Null);
+    assert!(!modbus["version"].as_str().unwrap().is_empty());
+    assert_eq!(
+        modbus["capabilities"],
+        json!({ "read": true, "write": true })
+    );
+    assert_eq!(modbus["transports"], json!(["tcp"]));
+    assert_eq!(modbus["kind"], json!("frame"));
+    assert!(!modbus["addressHelp"].as_str().unwrap().is_empty());
+    assert_eq!(
+        modbus["supportedKinds"],
+        json!(["bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64"])
+    );
+    let fields = modbus["settingsSchema"]["fields"].as_array().unwrap();
+    let field_keys: Vec<&str> = fields.iter().map(|f| f["key"].as_str().unwrap()).collect();
+    assert_eq!(field_keys, ["host", "port", "unit_id", "word_order"]);
+    assert_eq!(
+        fields[0],
+        json!({
+            "key": "host", "label": "ホスト", "help": null, "kind": { "type": "host" },
+            "required": true, "default": null, "group": "basic",
+        })
+    );
+    assert_eq!(
+        fields[1],
+        json!({
+            "key": "port", "label": "ポート", "help": null,
+            "kind": { "type": "integer", "min": 1, "max": 65535 },
+            "required": true, "default": 502, "group": "basic",
+        })
+    );
+    assert_eq!(fields[3]["kind"]["type"], json!("choice"));
+    assert_eq!(
+        fields[3]["kind"]["options"][0],
+        json!({ "value": "low_high", "label": "low_high（MELSEC標準）" })
+    );
+    assert_eq!(fields[3]["default"], json!("high_low"));
+    assert_eq!(fields[3]["group"], json!("advanced"));
+
+    let slmp = &body[1];
+    assert_eq!(slmp["kind"], json!("frame"));
+    assert_eq!(
+        slmp["supportedKinds"],
+        json!(["bit", "i16", "u16", "i32", "u32", "f32", "string"])
+    );
+    let slmp_keys: Vec<&str> = slmp["settingsSchema"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(slmp_keys, ["host", "port", "cpu_type", "word_order"]);
+    assert_eq!(slmp["settingsSchema"]["fields"][1]["default"], json!(5007));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drivers_list_needs_a_session_and_a_viewer_may_read_it() {
+    let app = test_app("r2b6b-drivers-auth").await;
+    let (status, _) = get_drivers(&app.router, None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, _) = get_drivers(&app.router, Some("not-a-token")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    app.users
+        .create_user("viewer-d", "password123", "閲覧者", Role::Viewer)
+        .await
+        .expect("create viewer user");
+    let viewer_token = app
+        .auth
+        .login("viewer-d", "password123")
+        .await
+        .expect("viewer login");
+    let (status, body) = get_drivers(&app.router, Some(&viewer_token)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body.as_array().map(Vec::len), Some(2), "{body:?}");
 }

@@ -13,6 +13,7 @@ use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
     collection_groups_get, collection_groups_list, collection_groups_update,
 };
+use super::drivers::drivers_list;
 use super::plc_connections::{
     plc_connections_create, plc_connections_delete, plc_connections_get, plc_connections_list,
     plc_connections_test, plc_connections_test_saved, plc_connections_update,
@@ -1325,6 +1326,9 @@ pub(super) fn tag_registry_router(
         // R2b-2d: 同じく固定セグメント。アドレスの解析（保存と同じ関数、
         // `tags_parse_addresses` の doc comment 参照）。
         .route("/api/tags/parse-addresses", post(tags_parse_addresses))
+        // R2b-6b（docs/banto-hub-driver-ui-design.md §4.1）: ドライバの一覧。読み取りなので
+        // `require_session` だけ（`rest/drivers.rs` の doc）。
+        .route("/api/drivers", get(drivers_list))
         // #342 段階A: 保存前の式検証（エラー位置・参照タグ解決・循環判定・
         // 現在値によるプレビュー試算）。同じく `/api/tags` 直下の固定セグ
         // メントで `/api/tags/{id}` (i64) とは衝突しない。

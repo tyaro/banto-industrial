@@ -92,7 +92,9 @@ banto-collect = { path = "../../../crates/banto-collect" }
 # directory outside CollectorManager.
 banto-broker = { path = "../../../crates/banto-broker" }
 # R1-3b: `HubDrivers`（`broker_glue.rs`）が `DriverRegistry` を持つ。
-banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0" }
+# R2b-6b: `serde` は `GET /api/drivers`（`rest/drivers.rs`）が設定のスキーマとデータ型の
+# 一覧をそのままの JSON で返すため。
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0", features = ["serde"] }
 # I5 (T2-4, docs/tag-server-design.md §6): the write primitive - rest.rs's
 # POST /api/v1/values/{tag} builds a banto_plc_write::BatchWriteRequest and
 # submits it through banto_broker::BrokerHandle::write (which itself depends

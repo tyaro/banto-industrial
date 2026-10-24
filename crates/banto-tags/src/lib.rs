@@ -98,7 +98,7 @@ pub use push::{
     MAX_PUSH_KEY_LEN, MAX_STALE_TIMEOUT_MS, MIN_STALE_TIMEOUT_MS, PUSH_LIMITS,
 };
 pub use scaling::{scale_raw, unscale, Scaling};
-pub use settings_json::{settings_to_api, validate_settings_with_registry};
+pub use settings_json::{settings_from_schema, settings_to_api, validate_settings_with_registry};
 pub use tag::{
     normalize_tag_address, parse_tag_address, tag_kind, validate_hub_tag_address, AddressProbe,
     BatchTagDeleteError, BatchTagDeleteOutcome, BatchTagError, BatchTagOutcome,
