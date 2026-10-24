@@ -528,10 +528,13 @@
 		)
 			return;
 		const previous = driverFor(editDriverId);
-		editDriverState = switchDriverState(
-			previous ? { fields: previous.settingsSchema.fields, state: editDriverState } : null,
-			driver.settingsSchema.fields
-		);
+		editDriverState =
+			!previous && protocol === selectedConnection.protocol
+				? driverStateFromSettings(driver.settingsSchema.fields, selectedConnection.settings)
+				: switchDriverState(
+						previous ? { fields: previous.settingsSchema.fields, state: editDriverState } : null,
+						driver.settingsSchema.fields
+					);
 		editDriverId = protocol;
 		editDriverErrors = {};
 	});
@@ -1519,6 +1522,7 @@
 									schema={driver.settingsSchema.fields}
 									bind:value={createDriverState}
 									errors={createDriverErrors}
+									readOnly={creatingConnection}
 									idPrefix="plc-create-driver"
 								/>
 							{/if}
@@ -1636,6 +1640,7 @@
 								schema={driver.settingsSchema.fields}
 								bind:value={editDriverState}
 								errors={editDriverErrors}
+								readOnly={savingConnection || deletingConnection}
 								idPrefix="plc-edit-driver"
 							/>
 						{/if}
