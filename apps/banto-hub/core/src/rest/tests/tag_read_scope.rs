@@ -553,7 +553,7 @@ async fn tags_create_while_running_is_accepted_and_queued() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15022 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15022 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -648,7 +648,7 @@ async fn plc_connections_create_while_running_is_accepted_and_queued() {
                 .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({ "name": "line-running", "host": "127.0.0.1", "port": 15022 })
+                    json!({ "protocol": "modbus-tcp", "name": "line-running", "settings": { "host": "127.0.0.1", "port": 15022 } })
                         .to_string(),
                 ))
                 .unwrap(),
@@ -678,7 +678,7 @@ async fn tags_batch_non_dry_run_while_running_is_accepted_and_queued() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15022 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15022 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -758,7 +758,7 @@ async fn tags_create_while_running_and_commissioning_is_applied_immediately() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15122 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15122 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -845,7 +845,7 @@ async fn plc_connections_create_while_running_and_commissioning_is_applied_immed
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-commissioning", "host": "127.0.0.1", "port": 15123 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-commissioning", "settings": { "host": "127.0.0.1", "port": 15123 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created:?}");
@@ -867,7 +867,7 @@ async fn tags_batch_non_dry_run_while_running_and_commissioning_is_applied_immed
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15124 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15124 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -968,7 +968,7 @@ async fn pending_changes_apply_endpoint_applies_queued_tags_create() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-apply", "host": "127.0.0.1", "port": 15023 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-apply", "settings": { "host": "127.0.0.1", "port": 15023 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1071,7 +1071,7 @@ async fn pending_changes_apply_endpoint_applies_queued_tags_create() {
 /// パスワード付きの`plc_connections.create`をキューへ入れると、
 /// (a) `202 Accepted`の応答、(b) `GET /api/pending-changes`、
 /// (c) `GET /api/pending-changes/{id}` のいずれの JSON にも平文
-/// パスワードが一切現れず（`passwordSet: true`だけが出る）、それでいて
+/// パスワードが一切現れず（`secretsSet: ["password"]`だけが出る）、それでいて
 /// (d) 適用（apply）後は`PlcConnectionService::get`で見える実際の
 /// 保存済み行にはパスワードがちゃんと入っている（＝DB へ保存された
 /// `pending_changes.payload`自体は redact していない）ことを確認する。
@@ -1088,7 +1088,7 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-pw-redact-seed", "host": "127.0.0.1", "port": 15040 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-pw-redact-seed", "settings": { "host": "127.0.0.1", "port": 15040 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1120,15 +1120,7 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "pgdb-pw-redact",
-            "protocol": "postgres",
-            "host": "10.0.0.9",
-            "port": 5432,
-            "database": "appdb",
-            "username": "appuser",
-            "password": SECRET
-        }),
+        json!({ "name": "pgdb-pw-redact", "protocol": "postgres", "settings": { "host": "10.0.0.9", "port": 5432, "database": "appdb", "username": "appuser", "password": SECRET } }),
     )
     .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{queued_body:?}");
@@ -1137,7 +1129,8 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         "202 body must never contain the plaintext password: {queued_body:?}"
     );
     assert_eq!(
-        queued_body["pending"]["payload"]["input"]["passwordSet"], true,
+        queued_body["pending"]["payload"]["input"]["secretsSet"],
+        json!(["password"]),
         "{queued_body:?}"
     );
     assert!(
@@ -1180,7 +1173,10 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         .iter()
         .find(|row| row["id"] == pending_id)
         .expect("queued pending change should be listed");
-    assert_eq!(listed["payload"]["input"]["passwordSet"], true);
+    assert_eq!(
+        listed["payload"]["input"]["secretsSet"],
+        json!(["password"])
+    );
     assert!(listed["payload"]["input"].get("password").is_none());
 
     // GET /api/pending-changes/{id}: same guarantee.
@@ -1206,7 +1202,10 @@ async fn pending_changes_endpoints_never_leak_a_queued_plc_connection_password()
         "GET /api/pending-changes/{{id}} must never contain the plaintext password: {get_text}"
     );
     let get_body: serde_json::Value = serde_json::from_str(&get_text).unwrap();
-    assert_eq!(get_body["payload"]["input"]["passwordSet"], true);
+    assert_eq!(
+        get_body["payload"]["input"]["secretsSet"],
+        json!(["password"])
+    );
     assert!(get_body["payload"]["input"].get("password").is_none());
 
     // Stop and apply: the queued create must actually go through with
@@ -1281,7 +1280,7 @@ async fn pending_changes_apply_while_running_applies_without_stopping() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-apply-running", "host": "127.0.0.1", "port": 15024 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-apply-running", "settings": { "host": "127.0.0.1", "port": 15024 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1391,7 +1390,7 @@ async fn pending_changes_requeue_endpoint_returns_pending_state() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-requeue-basic", "host": "127.0.0.1", "port": 15034 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-requeue-basic", "settings": { "host": "127.0.0.1", "port": 15034 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1551,7 +1550,7 @@ async fn pending_apply_live_reconfigure_failure_is_500_and_marks_applied() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-live-fail", "host": "127.0.0.1", "port": 15026 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-live-fail", "settings": { "host": "127.0.0.1", "port": 15026 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1720,7 +1719,7 @@ async fn collection_reapply_reapplies_the_latest_registry_without_stopping() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-reapply", "host": "127.0.0.1", "port": 15027 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-reapply", "settings": { "host": "127.0.0.1", "port": 15027 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1787,7 +1786,7 @@ async fn pending_changes_requeue_then_apply_succeeds_after_transient_failure_cle
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-requeue-transient", "host": "127.0.0.1", "port": 15035 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-requeue-transient", "settings": { "host": "127.0.0.1", "port": 15035 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1967,7 +1966,7 @@ async fn pending_apply_plc_connection_update_succeeds_when_row_unchanged() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-fp-ok", "host": "127.0.0.1", "port": 15030 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-fp-ok", "settings": { "host": "127.0.0.1", "port": 15030 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1996,7 +1995,7 @@ async fn pending_apply_plc_connection_update_succeeds_when_row_unchanged() {
                 .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({ "name": "line-fp-ok-renamed", "host": "127.0.0.1", "port": 15030 })
+                    json!({ "protocol": "modbus-tcp", "name": "line-fp-ok-renamed", "settings": { "host": "127.0.0.1", "port": 15030 } })
                         .to_string(),
                 ))
                 .unwrap(),

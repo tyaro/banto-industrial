@@ -77,11 +77,9 @@ test.describe.serial('banto-hub タグ表編集 (T18-3e)', () => {
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

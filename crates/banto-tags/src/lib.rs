@@ -87,10 +87,11 @@ pub use connection_secret::{
     SECRET_REF_LEN,
 };
 pub use plc_connection::{
-    PlcConnection, PlcConnectionCascadeOutcome, PlcConnectionInput, PlcConnectionService,
-    ALLOWED_CPU_TYPES, ALLOWED_PROTOCOLS, ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, CPU_TYPE_Q,
-    CPU_TYPE_R, HUB_PROTOCOL, MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL,
-    PUSH_PROTOCOL, VIRTUAL_PROTOCOL, WORD_ORDER_HIGH_LOW, WORD_ORDER_LOW_HIGH,
+    ConnectionSettingsInput, KeepStored, PlcConnection, PlcConnectionCascadeOutcome,
+    PlcConnectionInput, PlcConnectionService, ALLOWED_CPU_TYPES, ALLOWED_PROTOCOLS,
+    ALLOWED_WORD_ORDERS, CALC_CONNECTION_NAME, CPU_TYPE_Q, CPU_TYPE_R, HUB_PROTOCOL,
+    MEM_CONNECTION_NAME, MODBUS_PROTOCOL, POSTGRES_PROTOCOL, PUSH_PROTOCOL, VIRTUAL_PROTOCOL,
+    WORD_ORDER_HIGH_LOW, WORD_ORDER_LOW_HIGH,
 };
 pub use push::{
     bridge_load, validate_push_key, validate_push_settings, BridgeColumn, BridgeLoad, BridgeQuery,

@@ -10,26 +10,14 @@
 //! （`{"$secret": 123}`）に書き換える（`invalid`）。
 
 use super::super::*;
-use super::common::{
-    admin_get, admin_post, admin_put, issue_api_key, test_env, v1_get, CLIENT_HEADER,
-};
-use axum::body::Body;
-use axum::http::Request as HttpRequest;
-use tower::ServiceExt;
+use super::common::{admin_get, admin_post, admin_put, issue_api_key, test_env, v1_get};
 
 const PASSWORD: &str = "s3cret-r2b1d";
 
 async fn create_pg(env: &super::common::TestEnv, name: &str, password: Option<&str>) -> i64 {
-    let mut body = json!({
-        "name": name,
-        "protocol": "postgres",
-        "host": "127.0.0.1",
-        "port": 1,
-        "database": "erp",
-        "username": "reader",
-    });
+    let mut body = json!({ "name": name, "protocol": "postgres", "settings": { "host": "127.0.0.1", "port": 1, "database": "erp", "username": "reader" } });
     if let Some(password) = password {
-        body["password"] = json!(password);
+        body["settings"]["password"] = json!(password);
     }
     let (status, created) =
         admin_post(&env.router, "/api/plc-connections", &env.admin_token, body).await;
@@ -92,15 +80,24 @@ async fn password_state_tells_none_set_and_unreadable_apart() {
     ];
     let (status, listed) = admin_get(&env.router, "/api/plc-connections", &env.admin_token).await;
     assert_eq!(status, StatusCode::OK, "{listed:?}");
-    for (id, state, password_set) in expect {
+    for (id, state, _password_set) in expect {
         let entry = listed
             .as_array()
             .unwrap()
             .iter()
             .find(|c| c["id"] == json!(id))
             .unwrap();
-        assert_eq!(entry["passwordState"], json!(state), "{entry:?}");
-        assert_eq!(entry["passwordSet"], json!(password_set), "{entry:?}");
+        // R2b-6b: `settings.password` is `{"$secret": state}`, absent for "none".
+        let want = if state == "none" {
+            None
+        } else {
+            Some(json!({ "$secret": state }))
+        };
+        assert_eq!(
+            entry["settings"].get("password").cloned(),
+            want,
+            "{entry:?}"
+        );
         let (status, one) = admin_get(
             &env.router,
             &format!("/api/plc-connections/{id}"),
@@ -108,7 +105,7 @@ async fn password_state_tells_none_set_and_unreadable_apart() {
         )
         .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(one["passwordState"], json!(state), "{one:?}");
+        assert_eq!(one["settings"].get("password").cloned(), want, "{one:?}");
         assert!(one.get("password").is_none());
     }
     assert!(!listed.to_string().contains(PASSWORD));
@@ -118,13 +115,11 @@ async fn password_state_tells_none_set_and_unreadable_apart() {
         &env.router,
         &format!("/api/plc-connections/{missing}"),
         &env.admin_token,
-        json!({ "name": "pg-missing", "protocol": "postgres", "host": "127.0.0.1", "port": 1,
-                "database": "erp", "username": "reader", "password": "new-pw" }),
+        json!({ "name": "pg-missing", "protocol": "postgres", "settings": { "host": "127.0.0.1", "port": 1, "database": "erp", "username": "reader", "password": "new-pw" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{fixed:?}");
-    assert_eq!(fixed["passwordState"], json!("set"));
-    assert_eq!(fixed["passwordSet"], json!(true));
+    assert_eq!(fixed["settings"]["password"], json!({ "$secret": "set" }));
 }
 
 /// §5.4: 保存済みの接続のテストは、読めないパスワードで繋ぎに行かず `ok: false` と理由。
@@ -165,7 +160,7 @@ async fn sink_config_lists_unreadable_connections_apart() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15201 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15201 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{plc:?}");
@@ -247,8 +242,7 @@ async fn bridge_config_lists_a_source_apart(reason: &str) {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "Bridge1", "protocol": "push", "host": "", "port": 0,
-                "settings": bridge }),
+        json!({ "name": "Bridge1", "protocol": "push", "settings": bridge }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{push:?}");
@@ -284,134 +278,43 @@ async fn bridge_config_lists_a_source_apart(reason: &str) {
     assert_eq!(body["unavailableSources"], json!([]));
 }
 
-/// The fingerprint string alpha.33 stored for a `push` connection on its defaults
-/// (`PlcConnectionResponse` of v0.2.0-alpha.33: no `passwordState`, `settings: null`).
-fn alpha33_push_fingerprint(id: i64, name: &str) -> String {
-    format!(
-        r#"{{"id":{id},"name":"{name}","protocol":"push","host":"","port":0,"unitId":1,"enabled":true,"simulation":false,"wordOrder":"low_high","cpuType":"R","database":null,"username":null,"passwordSet":false,"settings":null}}"#
-    )
-}
-
-/// The same for a `postgres` connection with a password.
-fn alpha33_pg_fingerprint(id: i64, name: &str) -> String {
-    format!(
-        r#"{{"id":{id},"name":"{name}","protocol":"postgres","host":"127.0.0.1","port":1,"unitId":1,"enabled":true,"simulation":false,"wordOrder":"low_high","cpuType":"R","database":"erp","username":"reader","passwordSet":true,"settings":null}}"#
-    )
-}
-
-/// §2（REST の形は R2b-7 まで保つ）: 既定のままの `push` 接続の `settings` は `null`
-/// （0025 で列は `{}`）。未適用キューの指紋は alpha.33 の応答と同じ文字列になる
-/// （`passwordState` を含まない。読めない PC へ移しても変わらない）。
+/// R2b-6b（設計 §5）: 既定のままの `push` 接続の `settings` は `{}`。未適用キューの指紋は
+/// 応答の形（秘密のキーは `{"$secret": "set"}`）で、パスワードが読めるかどうかでは変わらない
+/// （読めない PC へ移しても、積んだ提案が衝突にならない）。値も参照も入らない。
 #[tokio::test]
-async fn push_defaults_read_as_null_and_fingerprints_keep_the_alpha33_shape() {
+async fn push_defaults_read_as_empty_and_fingerprints_ignore_readability() {
     let env = test_env().await;
     let (status, push) = admin_post(
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "P1", "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": "P1", "protocol": "push" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{push:?}");
-    assert_eq!(push["settings"], serde_json::Value::Null, "{push:?}");
-    let push_id = push["id"].as_i64().unwrap();
+    assert_eq!(push["settings"], json!({}), "{push:?}");
     let pg = create_pg(&env, "pg", Some(PASSWORD)).await;
 
     let services = (
         PlcConnectionService::new(env.pool.clone()),
         CollectionGroupService::new(env.pool.clone()),
     );
-    for (id, want) in [
-        (push_id, alpha33_push_fingerprint(push_id, "P1")),
-        (pg, alpha33_pg_fingerprint(pg, "pg")),
-    ] {
-        let got = compute_pending_base_fingerprint(
-            &services.0,
-            &services.1,
-            "plc_connections.update",
-            &json!({ "id": id }),
-        )
-        .await;
-        assert_eq!(got.as_deref(), Some(want.as_str()));
-    }
-    // An unreadable password does not change the fingerprint (it is not in it).
+    let fingerprint = |id: i64| {
+        let services = &services;
+        async move {
+            compute_pending_base_fingerprint(
+                &services.0,
+                &services.1,
+                "plc_connections.update",
+                &json!({ "id": id }),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let before = fingerprint(pg).await;
+    assert!(before.contains("\"$secret\":\"set\""), "{before}");
+    assert!(!before.contains(PASSWORD), "{before}");
     drop_secret_row(&env.pool, pg).await;
-    let got = compute_pending_base_fingerprint(
-        &services.0,
-        &services.1,
-        "plc_connections.update",
-        &json!({ "id": pg }),
-    )
-    .await;
-    assert_eq!(got, Some(alpha33_pg_fingerprint(pg, "pg")));
-}
-
-async fn post_empty(router: &Router, path: &str, token: &str) -> StatusCode {
-    router
-        .clone()
-        .oneshot(
-            HttpRequest::post(path)
-                .header("Authorization", format!("Bearer {token}"))
-                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap()
-        .status()
-}
-
-/// A pending update queued before the upgrade carries alpha.33's fingerprint string.
-/// After R2b-1d it still matches, so the update applies (no spurious conflict).
-#[tokio::test]
-async fn a_pending_update_queued_with_the_alpha33_fingerprint_still_applies() {
-    let env = test_env().await;
-    let (status, push) = admin_post(
-        &env.router,
-        "/api/plc-connections",
-        &env.admin_token,
-        json!({ "name": "P1", "protocol": "push", "host": "", "port": 0 }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{push:?}");
-    let push_id = push["id"].as_i64().unwrap();
-
-    assert_eq!(
-        post_empty(&env.router, "/api/collection/start", &env.admin_token).await,
-        StatusCode::OK
-    );
-    let (status, queued) = admin_put(
-        &env.router,
-        &format!("/api/plc-connections/{push_id}"),
-        &env.admin_token,
-        json!({ "name": "P1-renamed", "protocol": "push", "host": "", "port": 0 }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{queued:?}");
-    let pending_id = queued["pending"]["id"].as_i64().unwrap();
-    // What alpha.33 would have stored at enqueue time.
-    sqlx::query("UPDATE pending_changes SET base_fingerprint = ? WHERE id = ?")
-        .bind(alpha33_push_fingerprint(push_id, "P1"))
-        .bind(pending_id)
-        .execute(&env.pool)
-        .await
-        .unwrap();
-    assert_eq!(
-        post_empty(&env.router, "/api/collection/stop", &env.admin_token).await,
-        StatusCode::OK
-    );
-    assert_eq!(
-        post_empty(
-            &env.router,
-            &format!("/api/pending-changes/{pending_id}/apply"),
-            &env.admin_token
-        )
-        .await,
-        StatusCode::OK
-    );
-    let renamed = PlcConnectionService::new(env.pool.clone())
-        .get(push_id)
-        .await
-        .unwrap();
-    assert_eq!(renamed.name, "P1-renamed");
+    assert_eq!(fingerprint(pg).await, before);
 }

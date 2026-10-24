@@ -142,11 +142,9 @@ test.describe.serial('banto-hub CSV 新規/更新インポート (T18-3d)', () =
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

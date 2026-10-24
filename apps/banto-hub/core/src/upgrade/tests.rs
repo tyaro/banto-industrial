@@ -730,8 +730,8 @@ fn leaked_in_files(path: &Path, secrets: &[&str]) -> Vec<String> {
 /// R2b-1d 以降の形の DB（`init_db_with_registry` の新規の DB）に、非 Windows の Hub が
 /// 書いた形の中身を入れる: `plain-v1` の秘密の行を持つ postgres 接続と、5 つの状態
 /// （`pending`・`applying`・`failed`・`applied`・`canceled`）の `plain-v1` の
-/// `sealedPassword` を持つキューの行、R2b-1e より前の平文の `password` を持つキューの行
-/// （`pending` と `applied`）。接続 id と、状態ごとのキューの id を返す。
+/// `sealedSecrets.password` を持つ R2b-6b の形のキューの行、R2b-6b より前の平らな形で平文の
+/// `password` を持つキューの行（`pending` と `applied`。未適用のほうは後処理が捨てる、Q10）。接続 id と、状態ごとのキューの id を返す。
 async fn seed_non_windows_secrets(pool: &SqlitePool) -> (i64, Vec<(String, i64)>) {
     let service = PlcConnectionService::with_registry(pool.clone(), registry());
     let conn = service
@@ -759,9 +759,9 @@ async fn seed_non_windows_secrets(pool: &SqlitePool) -> (i64, Vec<(String, i64)>
             .seal(banto_tags::PASSWORD_KEY, UPKEEP_QUEUED_PASSWORD)
             .unwrap();
         let payload = serde_json::json!({ "input": {
-            "name": format!("pg-{state}"), "protocol": "postgres", "host": "db", "port": 5432,
-            "database": "erp", "username": "reader",
-            "sealedPassword": crate::secrets::sealed_password_json(&sealed),
+            "name": format!("pg-{state}"), "protocol": "postgres",
+            "settings": { "host": "db", "port": 5432, "database": "erp", "username": "reader" },
+            "sealedSecrets": { "password": crate::secrets::sealed_password_json(&sealed) },
         }});
         queue.push((
             state.to_string(),
@@ -840,7 +840,7 @@ async fn snapshot_secrets(pool: &SqlitePool) -> (Vec<(String, String, Vec<u8>)>,
 /// §9「キューの移設」と §6.5 の (a)〜(e): 非 Windows で作った DB を「Windows の Hub」（偽の
 /// protector）の後処理にかけると、`plain-v1` の秘密の行は同じ参照のまま封印し直され、
 /// 未適用の 3 つのキューの行は封印し直され（平文の `password` の行も封印され）、履歴の 2 つ
-/// からは `password` も `sealedPassword` も消える。印を立てて VACUUM し、DB・WAL のバイト列に
+/// からは 封印した値が外れて `secretsSet` に替わる。古い平らな形の未適用の行は捨てる。印を立てて VACUUM し、DB・WAL のバイト列に
 /// 既知のパスワード（と base64）が無い。2 回目は何も書かない（冪等）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upkeep_reseals_rows_and_the_queue_strips_history_and_is_idempotent() {
@@ -854,7 +854,7 @@ async fn the_upkeep_reseals_rows_and_the_queue_strips_history_and_is_idempotent(
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].sealed.scheme, "plain-v1");
     let sealed_ref_before = |payload: &serde_json::Value| {
-        payload["input"]["sealedPassword"]["ref"]
+        payload["input"]["sealedSecrets"]["password"]["ref"]
             .as_str()
             .map(str::to_owned)
     };
@@ -869,7 +869,12 @@ async fn the_upkeep_reseals_rows_and_the_queue_strips_history_and_is_idempotent(
     let secrets = crate::test_support::protected_secrets();
     let report = secrets_upkeep(&pool, &secrets).await;
     assert_eq!(report.resealed_rows, 1, "{report:?}");
-    assert_eq!(report.sealed_queue, 1, "{report:?}");
+    let legacy_pending = queue
+        .iter()
+        .find(|(label, _)| label == "legacy-pending")
+        .unwrap()
+        .1;
+    assert_eq!(report.discarded_queue, [legacy_pending], "{report:?}");
     assert_eq!(report.resealed_queue, 3, "{report:?}");
     assert_eq!(report.stripped_history, 3, "{report:?}");
     assert!(report.failures.is_empty(), "{report:?}");
@@ -899,34 +904,43 @@ async fn the_upkeep_reseals_rows_and_the_queue_strips_history_and_is_idempotent(
     );
 
     // (b)(c)(d) the queue.
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pending_changes WHERE id = ?")
+        .bind(legacy_pending)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0, "(b) the old-shape unapplied row is discarded");
     for (label, id) in &queue {
+        if label == "legacy-pending" {
+            continue;
+        }
         let payload = queue_payload(&pool, *id).await;
         let input = &payload["input"];
-        let unapplied =
-            ["pending", "applying", "failed", "legacy-pending"].contains(&label.as_str());
+        let unapplied = ["pending", "applying", "failed"].contains(&label.as_str());
         assert!(input.get("password").is_none(), "{label}: {payload}");
         if unapplied {
-            let sealed = crate::secrets::parse_sealed_password(&input["sealedPassword"]).unwrap();
+            let sealed =
+                crate::secrets::parse_sealed_password(&input["sealedSecrets"]["password"]).unwrap();
             assert_eq!(sealed.scheme.as_str(), "dpapi-machine-v1", "{label}");
-            let want = if label.starts_with("legacy") {
-                UPKEEP_LEGACY_PASSWORD
-            } else {
-                // Resealed under the same reference (design §6.5).
-                assert_eq!(
-                    Some(sealed.r#ref.as_str().to_owned()),
-                    refs_before[label],
-                    "{label}"
-                );
-                UPKEEP_QUEUED_PASSWORD
-            };
+            // Resealed under the same reference (design §6.5).
+            assert_eq!(
+                Some(sealed.r#ref.as_str().to_owned()),
+                refs_before[label],
+                "{label}"
+            );
             assert_eq!(
                 secrets.open("password", &sealed).unwrap().as_str(),
-                want,
+                UPKEEP_QUEUED_PASSWORD,
                 "{label}"
             );
         } else {
-            assert!(input.get("sealedPassword").is_none(), "{label}: {payload}");
-            assert_eq!(input["passwordSet"], serde_json::json!(true), "{label}");
+            assert!(input.get("sealedSecrets").is_none(), "{label}: {payload}");
+            let want = if label.starts_with("legacy") {
+                serde_json::json!([])
+            } else {
+                serde_json::json!(["password"])
+            };
+            assert_eq!(input["secretsSet"], want, "{label}");
         }
     }
 
@@ -1044,19 +1058,18 @@ async fn a_failed_reseal_keeps_the_row_and_is_counted_as_remaining_plaintext() {
     )));
 
     let report = secrets_upkeep(&pool, &failing).await;
-    // 1 secret row + the legacy pending row (seal) + 3 unapplied plain-v1 rows (reseal).
-    assert_eq!(report.failures.len(), 5, "{report:?}");
+    // 1 secret row + 3 unapplied plain-v1 rows (reseal). The legacy pending row is
+    // discarded (Q10), not a failure.
+    assert_eq!(report.failures.len(), 4, "{report:?}");
     assert!(report.failures.iter().all(
         |f| !f.error.contains(UPKEEP_PG_PASSWORD) && !f.error.contains(UPKEEP_QUEUED_PASSWORD)
     ));
-    assert_eq!(
-        report.resealed_rows + report.sealed_queue + report.resealed_queue,
-        0
-    );
+    assert_eq!(report.resealed_rows + report.resealed_queue, 0);
+    assert_eq!(report.discarded_queue.len(), 1, "{report:?}");
     assert_eq!(report.stripped_history, 3, "{report:?}");
     assert!(report.vacuumed, "{report:?}");
     assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
-    assert_eq!(plaintext_remaining(&pool, &failing).await.unwrap(), 5);
+    assert_eq!(plaintext_remaining(&pool, &failing).await.unwrap(), 4);
     assert_eq!(
         plaintext_remaining(&pool, &plain_secrets()).await.unwrap(),
         0
@@ -1073,7 +1086,7 @@ async fn a_failed_reseal_keeps_the_row_and_is_counted_as_remaining_plaintext() {
 const MOVE_PASSWORD: &str = "TOPSECRET-move-to-history-5e1a";
 
 /// 接続の作成の提案を `state` で 1 行積む。パスワードは `secrets` で封印した
-/// `sealedPassword`。
+/// `sealedSecrets.password`。
 async fn insert_sealed_queue_row(
     pool: &SqlitePool,
     state: &str,
@@ -1083,9 +1096,9 @@ async fn insert_sealed_queue_row(
         .seal(banto_tags::PASSWORD_KEY, MOVE_PASSWORD)
         .unwrap();
     let payload = serde_json::json!({ "input": {
-        "name": "pg-move", "protocol": "postgres", "host": "db", "port": 5432,
-        "database": "erp", "username": "reader",
-        "sealedPassword": crate::secrets::sealed_password_json(&sealed),
+        "name": "pg-move", "protocol": "postgres",
+        "settings": { "host": "db", "port": 5432, "database": "erp", "username": "reader" },
+        "sealedSecrets": { "password": crate::secrets::sealed_password_json(&sealed) },
     }});
     insert_queue_row(pool, state, "plc_connections.create", &payload).await
 }
@@ -1127,7 +1140,7 @@ async fn moving_a_plaintext_row_to_history_marks_the_database_for_vacuum() {
         assert!(report.vacuumed, "{report:?}");
         assert_eq!(vacuum_mark(&pool).await, None, "{state}");
         assert_eq!(
-            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            queue_payload(&pool, id).await["input"]["sealedSecrets"]["password"]["scheme"],
             "plain-v1"
         );
 
@@ -1135,7 +1148,7 @@ async fn moving_a_plaintext_row_to_history_marks_the_database_for_vacuum() {
         let service = crate::pending_changes::PendingChangesService::new(pool.clone());
         move_to_history(&service, via_cancel, id).await;
         assert!(queue_payload(&pool, id).await["input"]
-            .get("sealedPassword")
+            .get("sealedSecrets")
             .is_none());
         assert_eq!(vacuum_mark(&pool).await.as_deref(), Some("true"), "{state}");
         pool.close().await;
@@ -1154,7 +1167,7 @@ async fn moving_a_plaintext_row_to_history_marks_the_database_for_vacuum() {
     }
 }
 
-/// 上の逆: DPAPI で封印した `sealedPassword` だけを履歴へ移すときは、空きページに残るのは
+/// 上の逆: DPAPI で封印した `sealedSecrets` だけを履歴へ移すときは、空きページに残るのは
 /// 暗号文で平文ではないので、印を立てない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn moving_a_dpapi_sealed_row_to_history_does_not_mark_the_database() {
@@ -1163,20 +1176,20 @@ async fn moving_a_dpapi_sealed_row_to_history_does_not_mark_the_database() {
         let id =
             insert_sealed_queue_row(&pool, state, &crate::test_support::protected_secrets()).await;
         assert_eq!(
-            queue_payload(&pool, id).await["input"]["sealedPassword"]["scheme"],
+            queue_payload(&pool, id).await["input"]["sealedSecrets"]["password"]["scheme"],
             "dpapi-machine-v1"
         );
         let service = crate::pending_changes::PendingChangesService::new(pool.clone());
         move_to_history(&service, via_cancel, id).await;
         assert!(queue_payload(&pool, id).await["input"]
-            .get("sealedPassword")
+            .get("sealedSecrets")
             .is_none());
         assert_eq!(vacuum_mark(&pool).await, None, "{state}");
     }
 }
 
 /// 非 Windows の Hub（protector 無し）の後処理: `plain-v1` の行はそのまま（封印し直さない）、
-/// 古い平文の `password` のキューの行は `plain-v1` の `sealedPassword` に揃え、履歴からは外す。
+/// 古い平らな形の未適用のキューの行は捨て（Q10）、履歴からは外す。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_upkeep_without_a_protector_only_normalizes_the_queue() {
     let pool = crate::db::init_db_memory().await.unwrap();
@@ -1184,17 +1197,14 @@ async fn the_upkeep_without_a_protector_only_normalizes_the_queue() {
     let report = secrets_upkeep(&pool, &plain_secrets()).await;
     assert_eq!(report.resealed_rows, 0, "{report:?}");
     assert_eq!(report.resealed_queue, 0, "{report:?}");
-    assert_eq!(report.sealed_queue, 1, "{report:?}");
-    assert_eq!(report.stripped_history, 3, "{report:?}");
-    assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
     let legacy = queue
         .iter()
         .find(|(label, _)| label == "legacy-pending")
         .unwrap()
         .1;
-    let payload = queue_payload(&pool, legacy).await;
-    assert!(payload["input"].get("password").is_none(), "{payload}");
-    assert_eq!(payload["input"]["sealedPassword"]["scheme"], "plain-v1");
+    assert_eq!(report.discarded_queue, [legacy], "{report:?}");
+    assert_eq!(report.stripped_history, 3, "{report:?}");
+    assert_eq!(secret_rows_of(&pool).await[0].sealed.scheme, "plain-v1");
     assert_eq!(
         secrets_upkeep(&pool, &plain_secrets()).await,
         UpkeepReport::default()
@@ -1476,7 +1486,7 @@ mod dpapi_upkeep {
         let report = secrets_upkeep(&pool, &secrets).await;
         assert_eq!(report.resealed_rows, 1, "{report:?}");
         assert_eq!(report.resealed_queue, 3, "{report:?}");
-        assert_eq!(report.sealed_queue, 1, "{report:?}");
+        assert_eq!(report.discarded_queue.len(), 1, "{report:?}");
         assert_eq!(report.stripped_history, 3, "{report:?}");
         assert!(report.failures.is_empty(), "{report:?}");
         assert!(report.vacuumed, "{report:?}");
@@ -1495,9 +1505,9 @@ mod dpapi_upkeep {
                 .as_str(),
             UPKEEP_PG_PASSWORD
         );
-        for (label, id) in &queue {
+        for (label, id) in queue.iter().filter(|(label, _)| label != "legacy-pending") {
             let payload = queue_payload(&pool, *id).await;
-            if let Some(value) = payload["input"].get("sealedPassword") {
+            if let Some(value) = payload["input"]["sealedSecrets"].get("password") {
                 let sealed = crate::secrets::parse_sealed_password(value).unwrap();
                 assert_eq!(sealed.scheme.as_str(), "dpapi-machine-v1", "{label}");
                 assert!(secrets.open("password", &sealed).is_ok(), "{label}");

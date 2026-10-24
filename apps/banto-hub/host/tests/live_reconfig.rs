@@ -54,7 +54,7 @@ use banto_hub_core::write_audit::WriteAuditService;
 use banto_hub_core::write_control::WriteControl;
 use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_server::{AuthState, Identity};
-use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
+use banto_tags::{CollectionGroupService, TagService};
 use banto_tstore::SystemClock;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -206,7 +206,7 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -301,9 +301,7 @@ async fn seed_and_start_all_simulation(app: &TestApp) -> (i64, u64) {
         Some(json!({
             "name": "line1",
             "protocol": "slmp",
-            "host": "127.0.0.1",
-            "port": UNREACHABLE_PORT,
-            "unitId": 1,
+            "settings": { "host": "127.0.0.1", "port": UNREACHABLE_PORT },
             "enabled": true,
             // わざと「実機」のまま - `AllSimulation` の非永続オーバーライド
             // だけが値の出所をシミュレータへ差し替える（そこが肝）。

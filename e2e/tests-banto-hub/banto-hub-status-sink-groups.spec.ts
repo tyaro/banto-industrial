@@ -86,12 +86,9 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 			data: {
 				name: PLC_CONN,
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
 				simulation: true,
-				wordOrder: 'low_high'
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1, word_order: 'low_high' }
 			}
 		});
 		expect(plcRes.ok()).toBe(true);
@@ -130,15 +127,15 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 			data: {
 				name: PG_CONN,
 				protocol: 'postgres',
-				host: '10.0.0.9',
-				port: 5432,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				database: 'appdb',
-				username: 'appuser',
-				password: 'hunter2'
+				settings: {
+					host: '10.0.0.9',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: 'hunter2'
+				}
 			}
 		});
 		expect(pgRes.ok()).toBe(true);

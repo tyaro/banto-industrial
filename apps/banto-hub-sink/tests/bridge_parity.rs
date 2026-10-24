@@ -389,7 +389,8 @@ async fn test_app() -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        // R2b-6b: like production, the REST service carries the driver registry.
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -1395,8 +1396,7 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         &format!("/api/plc-connections/{}", fixture.push_id),
         &fixture.app.token,
         Some(
-            json!({ "name": fixture.push_name, "protocol": "push", "host": "", "port": 0,
-            "enabled": true, "settings": settings }),
+            json!({ "name": fixture.push_name, "protocol": "push", "enabled": true, "settings": settings }),
         ),
     )
     .await;

@@ -216,7 +216,14 @@ pub fn settings_from_schema(
         };
         match check_field_value(field, value) {
             Ok(()) => {
-                settings.insert(key.to_string(), value.clone());
+                // `Host` は前後の空白を落として持つ（エンジンの TCP 接続は名前解決に
+                // そのまま渡すので、`" 127.0.0.1 "` は繋がらない。旧い平らな形も trim
+                // していた）。`Text`・`Secret` は値そのものなので触らない。
+                let value = match (&field.kind, value) {
+                    (FieldKind::Host, Value::String(text)) => Value::String(text.trim().into()),
+                    _ => value.clone(),
+                };
+                settings.insert(key.to_string(), value);
             }
             Err(message) => errors.push(DriverFieldError::new(key, message)),
         }
@@ -920,6 +927,16 @@ mod tests {
                     "最小の入力に既定値を埋める",
                     json!({ "host": "10.0.0.1" }),
                     with(json!({ "host": "10.0.0.1" })),
+                ),
+                (
+                    "Host は前後の空白を落とし、Text は落とさない",
+                    json!({ "host": " 127.0.0.1 ", "backup_host": "\tb \n", "note": " a " }),
+                    with(json!({ "host": "127.0.0.1", "backup_host": "b", "note": " a " })),
+                ),
+                (
+                    "Secret は前後の空白を落とさない",
+                    json!({ "host": "h", "password": " p ", "token": " t " }),
+                    with(json!({ "host": "h", "password": " p ", "token": " t " })),
                 ),
                 (
                     "null も既定値で埋める",

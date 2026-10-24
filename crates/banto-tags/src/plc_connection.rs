@@ -284,6 +284,10 @@ use crate::support::{
 };
 use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
+mod settings_input;
+use settings_input::TypedSettings;
+pub use settings_input::{ConnectionSettingsInput, KeepStored};
+
 /// The **legacy** protocol rule list (R2b-1f, 2026-10-22). It is no longer the
 /// Hub's source of truth: since migration `0025` the SQL `CHECK` on
 /// `plc_connections.protocol` is only the `DriverId` grammar, and the Hub's
@@ -1491,6 +1495,28 @@ impl PlcConnectionService {
         validation(check_settings_shape(protocol, settings, secret_keys))
     }
 
+    /// [`Self::validate_settings`] for a write's final `settings`. With `typed`
+    /// ([`ConnectionSettingsInput`], R2b-6b) a required secret field that ends up with no
+    /// reference is refused first, and every field error is named by its JSON key
+    /// (`unit_id`, not the flat form's `unitId`; docs/banto-hub-driver-ui-design.md §4.2).
+    fn validate_final_settings(
+        &self,
+        protocol: &str,
+        settings: &Map<String, Value>,
+        secret_keys: &[String],
+        typed: Option<&TypedSettings>,
+    ) -> Result<(), BantoError> {
+        let Some(typed) = typed else {
+            return self.validate_settings(protocol, settings, secret_keys);
+        };
+        validation(settings_input::missing_required_secrets(
+            settings,
+            &typed.required_secrets,
+        ))?;
+        self.validate_settings(protocol, settings, secret_keys)
+            .map_err(settings_input::with_json_keys)
+    }
+
     pub async fn list(&self, params: ListParams) -> Result<ListResult<PlcConnection>, BantoError> {
         let columns = column_map();
 
@@ -1658,17 +1684,37 @@ impl PlcConnectionService {
         connection: &mut SqliteConnection,
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
+        self.create_in(connection, input, None).await
+    }
+
+    /// Shared body of every create. `typed` is `None` for the flat input (the old rules
+    /// (1), then `settings` built from the flat fields) and `Some` for a driver's
+    /// `settings` already built by [`crate::settings_from_schema`] (R2b-6b,
+    /// [`ConnectionSettingsInput`]: the flat fields of `input` are placeholders and its
+    /// common fields were checked by the caller).
+    async fn create_in(
+        &self,
+        connection: &mut SqliteConnection,
+        input: PlcConnectionInput,
+        typed: Option<TypedSettings>,
+    ) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
         let secret_keys = self.secret_keys(&input.protocol);
-        // (1) the old flat rules; with a registry, (2)-(4) only when they pass.
-        validate_plc_connection_input(&input, &secret_keys)?;
-        check_bridge_db_connection(&mut *connection, &input, None).await?;
-
-        let mut settings = settings_from_flat(&input);
-        // #605: an omitted cpu_type creates as R (stored explicitly, like migration 0025).
-        if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
-            settings.insert("cpu_type".into(), CPU_TYPE_R.into());
-        }
+        let mut settings = match &typed {
+            Some(typed) => typed.settings.clone(),
+            None => {
+                // (1) the old flat rules; with a registry, (2)-(4) only when they pass.
+                validate_plc_connection_input(&input, &secret_keys)?;
+                check_bridge_db_connection(&mut *connection, &input, None).await?;
+                let mut settings = settings_from_flat(&input);
+                // #605: an omitted cpu_type creates as R (stored explicitly, like
+                // migration 0025).
+                if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
+                    settings.insert("cpu_type".into(), CPU_TYPE_R.into());
+                }
+                settings
+            }
+        };
         let mut new_rows = Vec::new();
         for key in &secret_keys {
             if let Some(SecretChange::Set(row)) = input.secrets.get(key) {
@@ -1676,7 +1722,7 @@ impl PlcConnectionService {
                 new_rows.push((key.clone(), row.clone()));
             }
         }
-        self.validate_settings(&input.protocol, &settings, &secret_keys)?;
+        self.validate_final_settings(&input.protocol, &settings, &secret_keys, typed.as_ref())?;
 
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。
@@ -1748,7 +1794,7 @@ impl PlcConnectionService {
             .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
-        let updated = self.update_in(&mut tx, id, input, simulation).await?;
+        let updated = self.update_in(&mut tx, id, input, simulation, None).await?;
         tx.commit().await.map_err(banto_storage::storage_error)?;
         Ok(updated)
     }
@@ -1761,7 +1807,7 @@ impl PlcConnectionService {
         input: PlcConnectionInput,
     ) -> Result<PlcConnection, BantoError> {
         let simulation = input.simulation;
-        self.update_in(connection, id, input, Some(simulation))
+        self.update_in(connection, id, input, Some(simulation), None)
             .await
     }
 
@@ -1774,12 +1820,20 @@ impl PlcConnectionService {
     /// when the input omits it) and each secret key's [`SecretChange::Keep`]. The secret
     /// rows are then brought in line with the new `settings` (design §5.3): rows whose
     /// reference is not kept are deleted, `Set` rows inserted.
+    ///
+    /// `typed` as in [`Self::create_in`]: `Some` replaces the flat rules and the flat
+    /// "omitted keeps" merges (`cpu_type`, push `settings`) with the driver's `settings`
+    /// as given (only a secret key's [`SecretChange::Keep`] still keeps), except the keys
+    /// the caller marked with [`KeepStored::keys`] (the MCP flat adapter): those take the
+    /// stored row's value read here, inside this transaction, when the row has the same
+    /// protocol (else the schema default stays).
     async fn update_in(
         &self,
         connection: &mut SqliteConnection,
         id: i64,
         mut input: PlcConnectionInput,
         simulation: Option<bool>,
+        typed: Option<TypedSettings>,
     ) -> Result<PlcConnection, BantoError> {
         // Validation/normalization see `false` when the caller keeps the
         // stored value - `false` is valid for every protocol, and the kept
@@ -1787,8 +1841,10 @@ impl PlcConnectionService {
         input.simulation = simulation.unwrap_or(false);
         let input = normalize_plc_connection_input(input);
         let secret_keys = self.secret_keys(&input.protocol);
-        validate_plc_connection_input(&input, &secret_keys)?;
-        check_bridge_db_connection(&mut *connection, &input, Some(id)).await?;
+        if typed.is_none() {
+            validate_plc_connection_input(&input, &secret_keys)?;
+            check_bridge_db_connection(&mut *connection, &input, Some(id)).await?;
+        }
         // `None` binds SQL NULL -> `COALESCE(NULL, simulation)` keeps the
         // column. Protocols without a meaningful simulation always store the
         // normalized value, same as a plain `update`.
@@ -1871,24 +1927,44 @@ impl PlcConnectionService {
             .map(|protocol| self.secret_keys(protocol))
             .unwrap_or_default();
 
-        let mut settings = settings_from_flat(&input);
-        // #605: an omitted cpu_type keeps the stored one (an slmp row's), else R.
-        if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
-            let kept = (existing_protocol == Some(SLMP_PROTOCOL))
-                .then(|| existing_settings.get("cpu_type"))
-                .flatten()
-                .filter(|value| value.is_string())
-                .cloned();
-            settings.insert("cpu_type".into(), kept.unwrap_or_else(|| CPU_TYPE_R.into()));
-        }
-        // R2a-2a: an omitted push `settings` keeps the stored object (only when the row
-        // already is push - another protocol's settings are not push settings).
-        if input.protocol == PUSH_PROTOCOL
-            && input.settings.is_none()
-            && existing_protocol == Some(PUSH_PROTOCOL)
-        {
-            settings = existing_settings.clone();
-        }
+        let mut settings = match &typed {
+            Some(typed) => {
+                let mut settings = typed.settings.clone();
+                // #813 review P2: merged from the row read in this transaction, never from
+                // a read made before it (that would roll back an update committed between).
+                if existing_protocol == Some(input.protocol.as_str()) {
+                    for key in &typed.keep_keys {
+                        if let Some(value) =
+                            existing_settings.get(key).filter(|value| !value.is_null())
+                        {
+                            settings.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+                settings
+            }
+            None => {
+                let mut settings = settings_from_flat(&input);
+                // #605: an omitted cpu_type keeps the stored one (an slmp row's), else R.
+                if input.protocol == SLMP_PROTOCOL && !settings.contains_key("cpu_type") {
+                    let kept = (existing_protocol == Some(SLMP_PROTOCOL))
+                        .then(|| existing_settings.get("cpu_type"))
+                        .flatten()
+                        .filter(|value| value.is_string())
+                        .cloned();
+                    settings.insert("cpu_type".into(), kept.unwrap_or_else(|| CPU_TYPE_R.into()));
+                }
+                // R2a-2a: an omitted push `settings` keeps the stored object (only when the
+                // row already is push - another protocol's settings are not push settings).
+                if input.protocol == PUSH_PROTOCOL
+                    && input.settings.is_none()
+                    && existing_protocol == Some(PUSH_PROTOCOL)
+                {
+                    settings = existing_settings.clone();
+                }
+                settings
+            }
+        };
 
         let mut kept_refs = Vec::new();
         let mut new_rows = Vec::new();
@@ -1911,7 +1987,7 @@ impl PlcConnectionService {
                 }
             }
         }
-        self.validate_settings(&input.protocol, &settings, &secret_keys)?;
+        self.validate_final_settings(&input.protocol, &settings, &secret_keys, typed.as_ref())?;
 
         // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
         // 文字列。値はすべてプレースホルダでバインドする。

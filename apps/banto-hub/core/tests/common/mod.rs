@@ -240,6 +240,27 @@ pub fn no_io_drivers() -> banto_hub_core::broker_glue::HubDrivers {
         ) -> Vec<banto_driver_api::FieldError> {
             Vec::new()
         }
+        /// R2b-6b: the REST `settings` go through the driver's schema; the stand-in
+        /// takes the endpoint keys of the real drivers (host / port, Modbus `unit_id`,
+        /// SLMP `cpu_type`, `word_order`), all optional.
+        fn settings_schema(&self) -> banto_driver_api::SettingsSchema {
+            use banto_driver_api::{FieldKind, SettingField, SettingsSchema};
+            let mut fields = vec![
+                SettingField::new("host", "ホスト", FieldKind::host()),
+                SettingField::new("port", "ポート", FieldKind::integer(1, 65_535)),
+                SettingField::new("word_order", "ワード順", FieldKind::text()),
+            ];
+            if self.0.id.as_str() == "modbus-tcp" {
+                fields.push(SettingField::new(
+                    "unit_id",
+                    "ユニットID",
+                    FieldKind::integer(0, 255),
+                ));
+            } else {
+                fields.push(SettingField::new("cpu_type", "CPU種別", FieldKind::text()));
+            }
+            SettingsSchema::new(fields)
+        }
         /// R2b-2c: reads an address with `banto_plc`'s grammar of this stand-in's id
         /// (what the real drivers do; canonical = `Display`), because the Hub's plan and
         /// its immediate reads / writes now ask the driver. Any other id refuses.

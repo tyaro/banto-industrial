@@ -19,7 +19,7 @@ async fn seed_sink_fixture(router: &Router, admin_token: &str) -> (i64, i64) {
         router,
         "/api/plc-connections",
         admin_token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15201 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15201 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -49,15 +49,7 @@ async fn seed_sink_fixture(router: &Router, admin_token: &str) -> (i64, i64) {
         router,
         "/api/plc-connections",
         admin_token,
-        json!({
-            "name": "erp-db",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "database": "erp",
-            "username": "reader",
-            "password": "s3cret",
-        }),
+        json!({ "name": "erp-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "s3cret" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{pg:?}");
@@ -425,8 +417,7 @@ async fn bridge_config_requires_admin_and_returns_the_password_only_with_the_ing
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "erp-db", "protocol": "postgres", "host": "10.0.0.50", "port": 5432,
-                "database": "erp", "username": "reader", "password": "s3cret" }),
+        json!({ "name": "erp-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "s3cret" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{pg:?}");
@@ -439,8 +430,7 @@ async fn bridge_config_requires_admin_and_returns_the_password_only_with_the_ing
             &env.router,
             "/api/plc-connections",
             &env.admin_token,
-            json!({ "name": name, "protocol": "push", "host": "", "port": 0, "enabled": enabled,
-                    "settings": bridge_settings }),
+            json!({ "name": name, "protocol": "push", "enabled": enabled, "settings": bridge_settings }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{push:?}");

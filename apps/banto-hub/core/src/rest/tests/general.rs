@@ -142,12 +142,12 @@ async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identi
     assert!(changed, "word_order の変更");
 }
 
-/// #790（Codex のレビュー P3）: 接続テストで `cpuType` を省いたとき、保存済みの CPU を
-/// 引き継ぐのは `connectionId` の保存済み接続が**同じプロトコル**のときだけ。
-/// `connectionId` が無い・プロトコルが違うときは `cpu_type` を置かない（ドライバの既定 =
-/// iQ-R）。プロトコルが違う保存済み接続からは `word_order` も引き継がない。
+/// R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 接続テストの `settings` はフォームの値だけを
+/// スキーマに通す（省いた `cpu_type`・`word_order` はスキーマの既定。保存済みからは引き継がない。
+/// #790 の「保存済みの CPU を引き継ぐ」は MCP の平らな形のアダプタに移した）。保存済みの接続は
+/// `connectionId` が**同じプロトコル**のときだけ返る（指紋と秘密値の補いの出どころ）。
 #[tokio::test]
-async fn an_omitted_cpu_type_inherits_the_saved_cpu_only_from_the_same_protocol() {
+async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_same_protocol() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
 
     let env = test_env().await;
@@ -170,53 +170,211 @@ async fn an_omitted_cpu_type_inherits_the_saved_cpu_only_from_the_same_protocol(
         }
     };
     let slmp_q = service
-        .create(input("slmp-q", "slmp", "low_high", Some("Q")))
+        .create(input("slmp-q", "slmp", "high_low", Some("Q")))
         .await
         .unwrap();
     let modbus = service
         .create(input("modbus", "modbus-tcp", "high_low", None))
         .await
         .unwrap();
-    let payload = |connection_id: Option<i64>| PlcConnectionTestPayload {
-        protocol: "slmp".to_string(),
-        host: "127.0.0.1".to_string(),
-        port: 5007,
-        unit_id: 1,
-        simulation: false,
-        connection_id,
-        cpu_type: None,
+    let payload =
+        |connection_id: Option<i64>, settings: serde_json::Value| PlcConnectionTestPayload {
+            protocol: "slmp".to_string(),
+            simulation: false,
+            settings: settings.as_object().cloned().unwrap(),
+            connection_id,
+        };
+    let registry = env.manager.registry().clone();
+    let slmp = registry.get("slmp").unwrap();
+    let driver = slmp.base();
+
+    let requested = requested_settings(
+        &env.manager,
+        driver,
+        &payload(Some(slmp_q.id), json!({"host": "127.0.0.1"})),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{}", err.message));
+    assert_eq!(
+        requested.settings.get("cpu_type"),
+        Some("R"),
+        "スキーマの既定"
+    );
+    assert_eq!(requested.settings.get("word_order"), Some("low_high"));
+    assert_eq!(requested.settings.get("port"), Some("5007"));
+    assert_eq!(requested.saved.map(|c| c.id), Some(slmp_q.id));
+    assert!(!requested.secrets_changed);
+
+    let requested = requested_settings(
+        &env.manager,
+        driver,
+        &payload(None, json!({"host": "127.0.0.1", "cpu_type": "Q"})),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{}", err.message));
+    assert_eq!(
+        requested.settings.get("cpu_type"),
+        Some("Q"),
+        "フォームの値"
+    );
+    assert!(requested.saved.is_none());
+
+    let requested = requested_settings(
+        &env.manager,
+        driver,
+        &payload(Some(modbus.id), json!({"host": "127.0.0.1"})),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{}", err.message));
+    assert!(
+        requested.saved.is_none(),
+        "プロトコルが違う保存済み接続は使わない"
+    );
+
+    // スキーマに合わない値はダイヤルの前に断る（未知のキー・型違い）。
+    let refused = requested_settings(
+        &env.manager,
+        driver,
+        &payload(
+            None,
+            json!({"host": "127.0.0.1", "port": "5007", "unit_id": 1}),
+        ),
+    )
+    .await
+    .err()
+    .expect("refused");
+    assert!(refused.message.contains("port"), "{}", refused.message);
+    assert!(refused.message.contains("unit_id"), "{}", refused.message);
+}
+
+/// R2b-6b（設計 §5・§10）: 接続テストの秘密のキー。編集中（`connectionId`）にフォームが秘密の
+/// キーを省けば保存済みの値を開いて補い、文字列ならその値で試す（`secrets_changed`）。`null`・
+/// 空文字は値無しで、スキーマで必須ならダイヤルの前に断る。保存前（`connectionId` 無し）で
+/// 省いたときも必須の欠け。非秘密の欄はフォームの値（変えた host）。今の Modbus / SLMP には
+/// 秘密の欄が無いので、`postgres` の id を名乗る偽のドライバ（`password` を必須の秘密に持つ）で
+/// 確かめる（保存済みの行は Hub の `postgres` 接続として封印して作る）。
+#[tokio::test]
+async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
+    use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
+    use banto_driver_api::{
+        AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
+        FieldError as DFE, FieldKind, SettingField, Settings, SettingsSchema, TagKind,
     };
 
-    let (settings, saved) = requested_settings(&env.manager, &payload(Some(slmp_q.id))).await;
-    assert_eq!(
-        settings.get("cpu_type"),
-        Some("Q"),
-        "同じプロトコルの Q を引き継ぐ"
-    );
-    assert_eq!(saved.map(|c| c.id), Some(slmp_q.id));
+    struct SecretDriver(DriverDescriptor);
+    impl DriverBase for SecretDriver {
+        fn descriptor(&self) -> &DriverDescriptor {
+            &self.0
+        }
+        fn validate_config(&self, _: &Settings) -> Vec<DFE> {
+            Vec::new()
+        }
+        fn settings_schema(&self) -> SettingsSchema {
+            SettingsSchema::new(vec![
+                SettingField::new("host", "ホスト", FieldKind::host()).required(),
+                SettingField::new("port", "ポート", FieldKind::integer(1, 65_535)).required(),
+                SettingField::new("database", "DB", FieldKind::text()),
+                SettingField::new("username", "ユーザー", FieldKind::text()),
+                SettingField::new("password", "パスワード", FieldKind::Secret).required(),
+            ])
+        }
+        fn secret_keys(&self) -> Vec<String> {
+            vec!["password".to_string()]
+        }
+        fn parse_address(&self, _: &str, _: &TagKind) -> Result<DriverAddress, AddressError> {
+            Err(AddressError::new("none"))
+        }
+        fn offset_address(&self, c: &str, _: &TagKind, _: i64) -> Result<String, AddressError> {
+            Ok(c.to_owned())
+        }
+        fn address_help(&self) -> String {
+            String::new()
+        }
+    }
+    let driver = SecretDriver(DriverDescriptor::new(
+        DriverId::new("postgres").unwrap(),
+        "0.0.0",
+        "postgres",
+        Capabilities::READ_ONLY,
+    ));
 
-    let (settings, saved) = requested_settings(&env.manager, &payload(None)).await;
-    assert_eq!(
-        settings.get("cpu_type"),
-        None,
-        "保存済みが無ければドライバの既定"
-    );
-    assert!(saved.is_none());
+    let env = test_env().await;
+    let saved = env
+        .manager
+        .plc_connections()
+        .create(banto_tags::PlcConnectionInput {
+            name: "pg".to_string(),
+            protocol: "postgres".to_string(),
+            host: "db".to_string(),
+            port: 5432,
+            unit_id: 1,
+            enabled: true,
+            simulation: false,
+            word_order: String::new(),
+            cpu_type: None,
+            database: Some("erp".to_string()),
+            username: Some("reader".to_string()),
+            secrets: crate::secrets::password_changes(
+                &crate::secrets::ConnectionSecrets::platform_default(),
+                Some("saved-pw"),
+            )
+            .unwrap(),
+            settings: None,
+        })
+        .await
+        .unwrap();
+    let payload =
+        |connection_id: Option<i64>, settings: serde_json::Value| PlcConnectionTestPayload {
+            protocol: "postgres".to_string(),
+            simulation: false,
+            settings: settings.as_object().cloned().unwrap(),
+            connection_id,
+        };
+    let base = json!({ "host": "db2", "port": 5432, "database": "erp", "username": "reader" });
+    let with = |password: serde_json::Value| {
+        let mut settings = base.clone();
+        settings["password"] = password;
+        settings
+    };
 
-    let (settings, saved) = requested_settings(&env.manager, &payload(Some(modbus.id))).await;
-    assert_eq!(
-        settings.get("cpu_type"),
-        None,
-        "プロトコルが違う保存済み接続からは引き継がない"
-    );
-    assert_eq!(
-        settings.get("word_order"),
-        None,
-        "word_order も引き継がない"
-    );
-    assert!(saved.is_none());
-    // 省略したときの既定は iQ-R（`banto-driver-slmp` の `config_from`）。フレームでの
-    // 確かめは host の `t12_connection_test.rs`。
+    // Editing, omitted: the saved value is opened; the changed host is the form's.
+    let requested = requested_settings(
+        &env.manager,
+        &driver,
+        &payload(Some(saved.id), base.clone()),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{}", err.message));
+    assert_eq!(requested.settings.get("password"), Some("saved-pw"));
+    assert_eq!(requested.settings.get("host"), Some("db2"));
+    assert!(!requested.secrets_changed);
+    assert_eq!(requested.saved.map(|c| c.id), Some(saved.id));
+
+    // Editing, a new value: that value, and the secret counts as changed.
+    let requested = requested_settings(
+        &env.manager,
+        &driver,
+        &payload(Some(saved.id), with(json!("typed-pw"))),
+    )
+    .await
+    .unwrap_or_else(|err| panic!("{}", err.message));
+    assert_eq!(requested.settings.get("password"), Some("typed-pw"));
+    assert!(requested.secrets_changed);
+
+    // `null` / `""` (no value) and a new connection without one: the required secret is
+    // missing - refused before any dial, the message names the key and no value.
+    for (connection_id, settings) in [
+        (Some(saved.id), with(json!(null))),
+        (Some(saved.id), with(json!(""))),
+        (None, base.clone()),
+    ] {
+        let refused = requested_settings(&env.manager, &driver, &payload(connection_id, settings))
+            .await
+            .err()
+            .expect("refused");
+        assert!(refused.message.contains("password"), "{}", refused.message);
+        assert!(!refused.message.contains("saved-pw"), "{}", refused.message);
+    }
 }
 
 /// R2b-3a-2（コーディネータのレビュー）: `BrokerSimRegistry::resolve` の指紋は秘密値の
@@ -427,7 +585,7 @@ async fn tags_create_via_admin_router_rebuilds_the_catalog() {
         .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
         .header("content-type", "application/json")
         .body(Body::from(
-            r#"{"name":"line1","host":"127.0.0.1","port":15022}"#,
+            r#"{"name":"line1","protocol":"modbus-tcp","settings":{"host":"127.0.0.1","port":15022}}"#,
         ))
         .unwrap();
     let response = router.clone().oneshot(create_conn).await.unwrap();
@@ -477,7 +635,7 @@ async fn a_connection_with_a_tag_is_never_reported_unused() {
         &router,
         "/api/plc-connections",
         &token,
-        json!({ "name": "line1", "host": "127.0.0.1", "port": 15023 }),
+        json!({ "protocol": "modbus-tcp", "name": "line1", "settings": { "host": "127.0.0.1", "port": 15023 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -523,7 +681,7 @@ async fn collection_group_names_are_unique_per_connection_over_rest() {
             router,
             "/api/plc-connections",
             token,
-            json!({ "name": name, "host": "127.0.0.1", "port": port }),
+            json!({ "protocol": "modbus-tcp", "name": name, "settings": { "host": "127.0.0.1", "port": port } }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -626,7 +784,7 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/plc-connections",
-        json!({ "name": "a.b", "host": "127.0.0.1", "port": 15081 }),
+        json!({ "protocol": "modbus-tcp", "name": "a.b", "settings": { "host": "127.0.0.1", "port": 15081 } }),
     )
     .await;
     let c = post_ok(
@@ -651,7 +809,7 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/plc-connections",
-        json!({ "name": "a", "host": "127.0.0.1", "port": 15082 }),
+        json!({ "protocol": "modbus-tcp", "name": "a", "settings": { "host": "127.0.0.1", "port": 15082 } }),
     )
     .await;
     let bc = post_ok(
@@ -715,7 +873,7 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/plc-connections",
-        json!({ "name": "m", "host": "127.0.0.1", "port": 15083 }),
+        json!({ "protocol": "modbus-tcp", "name": "m", "settings": { "host": "127.0.0.1", "port": 15083 } }),
     )
     .await;
     let bc2 = post_ok(
@@ -730,7 +888,7 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         &format!("/api/plc-connections/{}", m["id"]),
         token,
-        json!({ "name": "a", "host": "127.0.0.1", "port": 15083 }),
+        json!({ "protocol": "modbus-tcp", "name": "a", "settings": { "host": "127.0.0.1", "port": 15083 } }),
     )
     .await;
     assert_collision(status, &body, "接続「a.b」/ グループ「c2」/ タグ「d」");
@@ -742,6 +900,26 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         .unwrap();
     assert!(names.contains(&"m".to_owned()) && !names.contains(&"a".to_owned()));
     assert!(env.manager.tag_map().collisions().is_empty());
+}
+
+/// A plain `modbus-tcp` connection input at `127.0.0.1:port` for the services without a
+/// registry (R2b-6b: the REST payload no longer has the flat fields).
+fn modbus_flat_input(name: &str, port: i64) -> banto_tags::PlcConnectionInput {
+    banto_tags::PlcConnectionInput {
+        name: name.to_string(),
+        protocol: "modbus-tcp".to_string(),
+        host: "127.0.0.1".to_string(),
+        port,
+        unit_id: 1,
+        enabled: true,
+        simulation: false,
+        word_order: String::new(),
+        cpu_type: None,
+        database: None,
+        username: None,
+        secrets: Default::default(),
+        settings: None,
+    }
 }
 
 /// T19 S2-a 案B (UX-48, docs/banto-hub-t19-design.md §3.8, 2026-09-03)
@@ -787,16 +965,7 @@ async fn commit_catalog_and_notify_does_not_dial_a_session_while_collection_is_s
     assert_eq!(controller.status().state, CollectionState::Stopped);
 
     let conn = PlcConnectionService::new(pool.clone())
-        .create(
-            serde_json::from_value::<PlcConnectionPayload>(json!({
-                "name": "line-resync-stopped",
-                "host": "127.0.0.1",
-                "port": 15041,
-            }))
-            .unwrap()
-            .into_input()
-            .unwrap(),
-        )
+        .create(modbus_flat_input("line-resync-stopped", 15041))
         .await
         .unwrap();
     let group = CollectionGroupService::new(pool.clone())
@@ -848,16 +1017,7 @@ async fn commit_catalog_and_notify_syncs_a_session_for_a_newly_tagged_connection
     let (manager, controller, events, pool, _dir) = catalog_resync_test_env().await;
 
     let conn = PlcConnectionService::new(pool.clone())
-        .create(
-            serde_json::from_value::<PlcConnectionPayload>(json!({
-                "name": "line-resync-add",
-                "host": "127.0.0.1",
-                "port": 15042,
-            }))
-            .unwrap()
-            .into_input()
-            .unwrap(),
-        )
+        .create(modbus_flat_input("line-resync-add", 15042))
         .await
         .unwrap();
 
@@ -923,16 +1083,7 @@ async fn commit_catalog_and_notify_removes_a_session_once_the_last_group_is_disa
     let (manager, controller, events, pool, _dir) = catalog_resync_test_env().await;
 
     let conn = PlcConnectionService::new(pool.clone())
-        .create(
-            serde_json::from_value::<PlcConnectionPayload>(json!({
-                "name": "line-resync-remove",
-                "host": "127.0.0.1",
-                "port": 15043,
-            }))
-            .unwrap()
-            .into_input()
-            .unwrap(),
-        )
+        .create(modbus_flat_input("line-resync-remove", 15043))
         .await
         .unwrap();
     let groups = CollectionGroupService::new(pool.clone());

@@ -9,7 +9,7 @@ use tower::ServiceExt;
 // PostgreSQL 接続エンティティ・接続テスト API ------------------------
 
 /// `POST /api/plc-connections` で `protocol: "postgres"` を作成すると、
-/// 応答に `passwordSet: true` が入り、`password` フィールド自体は
+/// 応答の `settings.password` は `{"$secret": "set"}`（R2b-6b）で、値そのものは
 /// 出ない（`PlcConnectionResponse`が生の`password`を決して外部へ
 /// 出さないことの回帰テスト）。
 #[tokio::test]
@@ -19,25 +19,21 @@ async fn create_postgres_connection_returns_password_set_without_password_field(
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "erp-db",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "database": "erp",
-            "username": "reader",
-            "password": "s3cret",
-        }),
+        json!({ "name": "erp-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "s3cret" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    assert_eq!(body["passwordSet"], true);
+    assert_eq!(body["settings"]["password"], json!({ "$secret": "set" }));
     assert!(
         body.get("password").is_none(),
         "the response must never contain the raw password: {body:?}"
     );
-    assert_eq!(body["database"], "erp");
-    assert_eq!(body["username"], "reader");
+    assert!(
+        !body.to_string().contains("s3cret"),
+        "the response must never contain the raw password: {body:?}"
+    );
+    assert_eq!(body["settings"]["database"], "erp");
+    assert_eq!(body["settings"]["username"], "reader");
 }
 
 /// `PUT`で`password`を省略（`null`/未指定）すると、既存のパスワードは
@@ -50,43 +46,25 @@ async fn update_omitting_password_keeps_the_existing_password() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "erp-db-keep",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "database": "erp",
-            "username": "reader",
-            "password": "original-secret",
-        }),
+        json!({ "name": "erp-db-keep", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created:?}");
     let conn_id = created["id"].as_i64().unwrap();
-    assert_eq!(created["passwordSet"], true);
+    assert_eq!(created["settings"]["password"], json!({ "$secret": "set" }));
 
     // password フィールドを省略した PUT（他は全項目必須）。
     let (status, updated) = admin_put(
         &env.router,
         &format!("/api/plc-connections/{conn_id}"),
         &env.admin_token,
-        json!({
-            "name": "erp-db-keep-renamed",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "unitId": 1,
-            "enabled": true,
-            "simulation": false,
-            "wordOrder": "low_high",
-            "database": "erp",
-            "username": "reader",
-        }),
+        json!({ "name": "erp-db-keep-renamed", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{updated:?}");
     assert_eq!(
-        updated["passwordSet"], true,
+        updated["settings"]["password"],
+        json!({ "$secret": "set" }),
         "omitting password must keep it set"
     );
 
@@ -104,15 +82,7 @@ async fn update_with_empty_password_clears_it() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "erp-db-clear",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "database": "erp",
-            "username": "reader",
-            "password": "original-secret",
-        }),
+        json!({ "name": "erp-db-clear", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created:?}");
@@ -122,30 +92,69 @@ async fn update_with_empty_password_clears_it() {
         &env.router,
         &format!("/api/plc-connections/{conn_id}"),
         &env.admin_token,
-        json!({
-            "name": "erp-db-clear",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "unitId": 1,
-            "enabled": true,
-            "simulation": false,
-            "wordOrder": "low_high",
-            "database": "erp",
-            "username": "reader",
-            "password": "",
-        }),
+        json!({ "name": "erp-db-clear", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{updated:?}");
-    assert_eq!(updated["passwordSet"], false);
+    assert!(updated["settings"].get("password").is_none(), "{updated:?}");
 
     assert_eq!(stored_password(&env.pool, conn_id).await, None);
 }
 
-/// 非 postgres 接続に`database`を付けると`422 Validation`で拒否される
-/// (`banto_tags::plc_connection::validate_plc_connection_input`の
-/// postgres-only ルール、REST 経由の確認)。
+/// R2b-6b（オーナー決定 2026-10-24）: 秘密のキーの tri-state は、省略 = 保つ、`null` = 消す、
+/// 空文字 = 消す（上のテスト）、文字列 = 置き換え。`null` で消えること、置き換えで新しい値に
+/// なることを REST で確かめる。型違い（文字列のポート）は 422 で、項目は JSON のキー。
+#[tokio::test]
+async fn update_with_null_password_clears_it_and_a_string_replaces_it() {
+    let env = test_env().await;
+    let body = |password: serde_json::Value| {
+        json!({ "name": "erp-db-null", "protocol": "postgres", "settings": {
+            "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader",
+            "password": password } })
+    };
+    let (status, created) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        body(json!("original-secret")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let conn_id = created["id"].as_i64().unwrap();
+    let path = format!("/api/plc-connections/{conn_id}");
+
+    let (status, replaced) = admin_put(
+        &env.router,
+        &path,
+        &env.admin_token,
+        body(json!("next-secret")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replaced:?}");
+    assert_eq!(
+        stored_password(&env.pool, conn_id).await.as_deref(),
+        Some("next-secret")
+    );
+    assert!(
+        !replaced.to_string().contains("next-secret"),
+        "{replaced:?}"
+    );
+
+    let (status, cleared) =
+        admin_put(&env.router, &path, &env.admin_token, body(json!(null))).await;
+    assert_eq!(status, StatusCode::OK, "{cleared:?}");
+    assert!(cleared["settings"].get("password").is_none(), "{cleared:?}");
+    assert_eq!(stored_password(&env.pool, conn_id).await, None);
+
+    let mut wrong = body(json!(null));
+    wrong["settings"]["port"] = json!("5432");
+    let (status, refused) = admin_put(&env.router, &path, &env.admin_token, wrong).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{refused:?}");
+    assert_eq!(refused["field_errors"][0]["field"], "port", "{refused:?}");
+}
+
+/// 非 postgres 接続の `settings` に `database` を付けると `422 Validation` で拒否される
+/// （R2b-6b: ドライバのスキーマに無い欄、Q9。REST 経由の確認）。
 #[tokio::test]
 async fn create_non_postgres_with_database_is_rejected() {
     let env = test_env().await;
@@ -153,17 +162,12 @@ async fn create_non_postgres_with_database_is_rejected() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "not-pg",
-            "protocol": "modbus-tcp",
-            "host": "127.0.0.1",
-            "port": 15070,
-            "database": "somedb",
-        }),
+        json!({ "name": "not-pg", "protocol": "modbus-tcp", "settings": { "host": "127.0.0.1", "port": 15070, "database": "somedb" } }),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert_eq!(body["kind"], "validation");
+    assert_eq!(body["field_errors"][0]["field"], "database", "{body:?}");
 }
 
 /// S1（この段階では postgres 接続配下にグループを作れない）: REST 経由の
@@ -175,14 +179,7 @@ async fn create_group_under_a_postgres_connection_is_rejected() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "erp-db-group-guard",
-            "protocol": "postgres",
-            "host": "10.0.0.50",
-            "port": 5432,
-            "database": "erp",
-            "username": "reader",
-        }),
+        json!({ "name": "erp-db-group-guard", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -209,7 +206,7 @@ async fn test_saved_connection_rejects_non_postgres_with_400() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "not-pg-test", "host": "127.0.0.1", "port": 15071 }),
+        json!({ "protocol": "modbus-tcp", "name": "not-pg-test", "settings": { "host": "127.0.0.1", "port": 15071 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -248,15 +245,7 @@ async fn test_saved_connection_against_a_real_postgresql_returns_the_server_vers
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "real-pg-test",
-            "protocol": "postgres",
-            "host": options.get_host(),
-            "port": options.get_port(),
-            "database": options.get_database(),
-            "username": options.get_username(),
-            "password": password,
-        }),
+        json!({ "name": "real-pg-test", "protocol": "postgres", "settings": { "host": options.get_host(), "port": options.get_port(), "database": options.get_database(), "username": options.get_username(), "password": password } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -285,15 +274,7 @@ async fn test_saved_connection_against_a_closed_port_reports_failure_without_the
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({
-            "name": "closed-port-pg",
-            "protocol": "postgres",
-            "host": "127.0.0.1",
-            "port": 1,
-            "database": "erp",
-            "username": "reader",
-            "password": "s3cret-password",
-        }),
+        json!({ "name": "closed-port-pg", "protocol": "postgres", "settings": { "host": "127.0.0.1", "port": 1, "database": "erp", "username": "reader", "password": "s3cret-password" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -329,7 +310,7 @@ async fn pending_apply_plc_connection_delete_cascades_when_it_has_groups_and_tag
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-cascade-pending", "host": "127.0.0.1", "port": 15062 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-cascade-pending", "settings": { "host": "127.0.0.1", "port": 15062 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -468,7 +449,7 @@ async fn pending_apply_collection_group_create_failure_reason_includes_field_det
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-dup-name-detail", "host": "127.0.0.1", "port": 15042 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-dup-name-detail", "settings": { "host": "127.0.0.1", "port": 15042 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -586,7 +567,7 @@ async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_b
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-fp-conflict", "host": "127.0.0.1", "port": 15031 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-fp-conflict", "settings": { "host": "127.0.0.1", "port": 15031 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -615,7 +596,7 @@ async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_b
                 .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({ "name": "line-fp-conflict-queued", "host": "127.0.0.1", "port": 15031 })
+                    json!({ "protocol": "modbus-tcp", "name": "line-fp-conflict-queued", "settings": { "host": "127.0.0.1", "port": 15031 } })
                         .to_string(),
                 ))
                 .unwrap(),
@@ -635,7 +616,7 @@ async fn pending_apply_plc_connection_update_conflicts_when_row_changed_out_of_b
     PlcConnectionService::new(env.pool.clone())
         .update(
             conn_id,
-            PlcConnectionInput {
+            banto_tags::PlcConnectionInput {
                 name: "line-fp-conflict-hijacked".to_string(),
                 protocol: "modbus-tcp".to_string(),
                 host: "127.0.0.1".to_string(),
@@ -747,7 +728,7 @@ async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprin
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-fp-conflict-requeue", "host": "127.0.0.1", "port": 15033 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-fp-conflict-requeue", "settings": { "host": "127.0.0.1", "port": 15033 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -776,7 +757,7 @@ async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprin
                 .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                 .header("content-type", "application/json")
                 .body(Body::from(
-                    json!({ "name": "line-fp-conflict-requeue-queued", "host": "127.0.0.1", "port": 15033 })
+                    json!({ "protocol": "modbus-tcp", "name": "line-fp-conflict-requeue-queued", "settings": { "host": "127.0.0.1", "port": 15033 } })
                         .to_string(),
                 ))
                 .unwrap(),
@@ -795,7 +776,7 @@ async fn pending_changes_requeue_conflict_still_fails_on_reapply_with_fingerprin
     PlcConnectionService::new(env.pool.clone())
         .update(
             conn_id,
-            PlcConnectionInput {
+            banto_tags::PlcConnectionInput {
                 name: "line-fp-conflict-requeue-hijacked".to_string(),
                 protocol: "modbus-tcp".to_string(),
                 host: "127.0.0.1".to_string(),
@@ -917,7 +898,7 @@ async fn pending_apply_collection_group_update_conflicts_when_row_changed_out_of
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-group-fp", "host": "127.0.0.1", "port": 15032 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-group-fp", "settings": { "host": "127.0.0.1", "port": 15032 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -1047,7 +1028,7 @@ async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-a", "host": "127.0.0.1", "port": 15040 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-a", "settings": { "host": "127.0.0.1", "port": 15040 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn_a:?}");
@@ -1057,7 +1038,7 @@ async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "line-b", "host": "127.0.0.1", "port": 15041 }),
+        json!({ "protocol": "modbus-tcp", "name": "line-b", "settings": { "host": "127.0.0.1", "port": 15041 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn_b:?}");
@@ -1089,7 +1070,7 @@ async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
                         .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
                         .header("content-type", "application/json")
                         .body(Body::from(
-                            json!({ "name": name, "host": "127.0.0.1", "port": port }).to_string(),
+                            json!({ "protocol": "modbus-tcp", "name": name, "settings": { "host": "127.0.0.1", "port": port } }).to_string(),
                         ))
                         .unwrap(),
                 )

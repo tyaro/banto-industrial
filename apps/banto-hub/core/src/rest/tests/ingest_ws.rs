@@ -181,7 +181,7 @@ async fn push_connection(env: &TestEnv, name: &str) -> (i64, i64) {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": name, "protocol": "push", "host": "", "port": 0, "enabled": true }),
+        json!({ "name": name, "protocol": "push", "enabled": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -218,7 +218,7 @@ async fn bare_push_connection(env: &TestEnv, name: &str) -> i64 {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": name, "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": name, "protocol": "push" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -315,7 +315,7 @@ async fn the_upgrade_happens_only_after_auth() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "Off", "protocol": "push", "host": "", "port": 0, "enabled": false }),
+        json!({ "name": "Off", "protocol": "push", "enabled": false }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{off:?}");
@@ -595,7 +595,8 @@ async fn rename_keeps_the_socket_while_disable_and_delete_close_it() {
     let env = &ws.env;
     let (a, _) = push_connection(env, "Bridge1").await;
     let (_, key_a) = ingest_key(env, "a", a).await;
-    let put = |name: &str, enabled: bool| json!({ "name": name, "protocol": "push", "host": "", "port": 0, "enabled": enabled });
+    let put =
+        |name: &str, enabled: bool| json!({ "name": name, "protocol": "push", "enabled": enabled });
 
     let (mut client, _) = ws.open(a, &key_a).await;
     let (status, body) = admin_put(
@@ -640,8 +641,7 @@ async fn rename_keeps_the_socket_while_disable_and_delete_close_it() {
         &env.router,
         &format!("/api/plc-connections/{b}"),
         &env.admin_token,
-        json!({ "name": "Bare", "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 502,
-                "enabled": false }),
+        json!({ "name": "Bare", "protocol": "modbus-tcp", "enabled": false, "settings": { "host": "127.0.0.1", "port": 502 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
@@ -722,8 +722,7 @@ async fn state_follows_start_stop_and_bridge_config_changes() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "pg", "protocol": "postgres", "host": "127.0.0.1", "port": 5432,
-                "database": "plant", "username": "reader", "password": "x" }),
+        json!({ "name": "pg", "protocol": "postgres", "settings": { "host": "127.0.0.1", "port": 5432, "database": "plant", "username": "reader", "password": "x" } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{pg:?}");
@@ -738,10 +737,9 @@ async fn state_follows_start_stop_and_bridge_config_changes() {
             { "name": "q1", "period_ms": 1000, "sql": "SELECT 1", "columns": columns } ] } })
     };
     // REST の要求は `settings` をまだ運ばない（R2a-2e）ので、サービスで作る。
-    let input: PlcConnectionInput = serde_json::from_value(json!({
-        "name": "Bridge", "protocol": "push", "host": "", "port": 0,
-        "settings": bridge_settings(&["k1"]),
-    }))
+    let input: PlcConnectionInput = serde_json::from_value(
+        json!({ "name": "Bridge", "protocol": "push", "host": "", "port": 0, "settings": bridge_settings(&["k1"]) }),
+    )
     .unwrap();
     let bridge = PlcConnectionService::new(env.pool.clone())
         .create(input)
@@ -793,8 +791,7 @@ async fn state_follows_start_stop_and_bridge_config_changes() {
         &env.router,
         &format!("/api/plc-connections/{bridge}"),
         &env.admin_token,
-        json!({ "name": "Bridge-renamed", "protocol": "push", "host": "", "port": 0,
-                "enabled": true }),
+        json!({ "name": "Bridge-renamed", "protocol": "push", "enabled": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");

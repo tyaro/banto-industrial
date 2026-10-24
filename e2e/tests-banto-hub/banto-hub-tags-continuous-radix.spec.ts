@@ -63,11 +63,9 @@ test.describe.serial('banto-hub 連続登録の基数/bit 連番 (T18-3c)', () =
 			data: {
 				name: CONNECTION_NAME,
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
-				simulation: true
+				simulation: true,
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
 			}
 		});
 		expect(connectionRes.ok()).toBe(true);

@@ -255,7 +255,7 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -2828,6 +2828,203 @@ async fn test_connection_reports_ok_for_a_reachable_modbus_simulator() {
     let payload: Value = serde_json::from_str(text).unwrap();
     assert_eq!(payload["ok"], true, "{payload:?}");
     assert!(payload["error"].is_null(), "{payload:?}");
+}
+
+/// R2b-6b（設計 §5）: MCP の `test_connection` は R2b-7 まで平らな形のまま。平らな形 →
+/// `settings` のアダプタは `simulation` も引き継ぐので、`simulation: true` はダイヤルの前に
+/// 断る（シミュレータは 1 本も受けない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_connection_keeps_the_flat_shape_and_refuses_simulation_without_dialing() {
+    let app = test_app("r2b6b-mcp-test-sim").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let sim = ModbusSimulator::start().await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "test_connection",
+            json!({
+                "protocol": "modbus-tcp",
+                "host": "127.0.0.1",
+                "port": sim.addr.port(),
+                "unitId": 1,
+                "simulation": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    let payload: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(payload["ok"], false, "{payload:?}");
+    assert_eq!(payload["error"]["kind"], "unsupported", "{payload:?}");
+    assert_eq!(sim.connection_count(), 0, "no dial");
+}
+
+/// R2b-6b: MCP の `update_connection` は平らな形のままで、今の「省略は保つ」（SLMP の
+/// `cpuType`）もアダプタが保存済みの行から補う。応答・一覧も平らな形（`cpuType`・
+/// `passwordState`）のまま。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_connection_keeps_the_flat_shape_and_an_omitted_cpu_type() {
+    let app = test_app("r2b6b-mcp-cpu-keep").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-q", "protocol": "slmp", "host": "127.0.0.1",
+                    "port": 5007, "cpuType": "Q" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let created: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(created["created"]["cpuType"], "Q", "{created:?}");
+    assert_eq!(created["created"]["passwordState"], "none", "{created:?}");
+    let id = created["created"]["id"].as_i64().unwrap();
+
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "host": "127.0.0.1",
+                    "port": 5008, "unitId": 1, "enabled": true, "simulation": false,
+                    "wordOrder": "low_high", "database": null, "username": null,
+                    "password": null }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let updated: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(updated["updated"]["cpuType"], "Q", "{updated:?}");
+    assert_eq!(updated["updated"]["port"], 5008, "{updated:?}");
+
+    // The old flat validation (field names included) still answers first.
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "bad", "protocol": "modbus-tcp", "host": "127.0.0.1",
+                    "port": 502, "unitId": 300 }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unitId"), "{text}");
+}
+
+/// `POST` with an empty body as the admin session (collection start/stop, pending apply).
+async fn admin_post_empty(router: &Router, admin_token: &str, path: &str) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            HttpRequest::post(path)
+                .header("Authorization", format!("Bearer {admin_token}"))
+                .header("X-Banto-Client", "banto")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// #813 review P2: a queued MCP `update_connection` that omits `cpuType` does not queue a
+/// value read before the write (it could be from another snapshot than the queue's
+/// fingerprint); it queues the `keepStored` mark, and the apply fills it from the row read
+/// inside its own write transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_update_connection_carries_the_keep_mark_and_fills_it_on_apply() {
+    let app = test_app("r2b6b-mcp-cpu-keep-queued").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-q", "protocol": "slmp", "host": "127.0.0.1",
+                    "port": 5007, "cpuType": "Q" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let created: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = created["created"]["id"].as_i64().unwrap();
+
+    app.commissioning.lock_down().await.expect("lock_down");
+    start_collection(&app.router, &app.admin_token).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "update_connection",
+            json!({ "id": id, "name": "line-q2", "protocol": "slmp", "host": "127.0.0.1",
+                    "port": 5008, "unitId": 1, "enabled": true, "simulation": false,
+                    "wordOrder": "", "database": null, "username": null,
+                    "password": null }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let queued: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(queued["queued"], true, "{queued:?}");
+    let pending_id = queued["pendingId"].as_i64().unwrap();
+    let payload: String = sqlx::query_scalar("SELECT payload FROM pending_changes WHERE id = ?")
+        .bind(pending_id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    let payload: Value = serde_json::from_str(&payload).unwrap();
+    assert_eq!(
+        payload["input"]["keepStored"],
+        json!({ "keys": ["cpu_type"] }),
+        "{payload}"
+    );
+    assert!(
+        payload["input"]["settings"].get("cpu_type").is_none(),
+        "no value read before the write is queued: {payload}"
+    );
+
+    assert_eq!(
+        admin_post_empty(&app.router, &app.admin_token, "/api/collection/stop").await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        admin_post_empty(
+            &app.router,
+            &app.admin_token,
+            &format!("/api/pending-changes/{pending_id}/apply"),
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("list_connections", json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let listed: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let row = listed["connections"]
+        .as_array()
+        .and_then(|rows| rows.iter().find(|row| row["id"] == id))
+        .unwrap_or_else(|| panic!("{listed:?}"));
+    assert_eq!(row["name"], "line-q2", "{row:?}");
+    assert_eq!(row["port"], 5008, "{row:?}");
+    assert_eq!(row["cpuType"], "Q", "{row:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -6013,7 +6210,7 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
         let payload: Value = serde_json::from_str(text).unwrap();
         assert!(payload["input"].get("password").is_none(), "{payload}");
         assert!(
-            payload["input"].get("sealedPassword").is_some(),
+            payload["input"]["sealedSecrets"].get("password").is_some(),
             "{payload}"
         );
         assert!(!text.contains(MCP_P_QUEUED_CREATE) && !text.contains(MCP_P_QUEUED_UPDATE));

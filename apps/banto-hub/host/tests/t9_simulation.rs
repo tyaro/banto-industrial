@@ -65,9 +65,7 @@ use banto_hub_core::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 use banto_plc::modbus::simulator::Simulator as ModbusSimulator;
 use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
 use banto_server::{AuthState, Identity};
-use banto_tags::{
-    CollectionGroupInput, CollectionGroupService, PlcConnectionService, TagInput, TagService,
-};
+use banto_tags::{CollectionGroupInput, CollectionGroupService, TagInput, TagService};
 use banto_tstore::SystemClock;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -255,7 +253,7 @@ async fn test_app(label: &str) -> TestApp {
     let router = api_router(
         users,
         audit,
-        PlcConnectionService::new(pool.clone()),
+        manager.plc_connections(),
         CollectionGroupService::new(pool.clone()),
         TagService::new(pool.clone()),
         api_keys,
@@ -334,15 +332,7 @@ async fn admin_write(
 
 /// `PlcConnectionPayload`（`rest.rs`）の JSON 表現 - camelCase。
 fn plc_connection_payload_json(name: &str, port: u16, simulation: bool) -> Value {
-    json!({
-        "name": name,
-        "protocol": "slmp",
-        "host": "127.0.0.1",
-        "port": port,
-        "unitId": 1,
-        "enabled": true,
-        "simulation": simulation,
-    })
+    json!({ "name": name, "protocol": "slmp", "enabled": true, "simulation": simulation, "settings": { "host": "127.0.0.1", "port": port } })
 }
 
 // ---------------------------------------------------------------------------
@@ -667,15 +657,7 @@ async fn a_simulated_connection_opens_no_socket_and_serves_strings_and_far_addre
         "POST",
         "/api/plc-connections",
         &app.admin_token,
-        json!({
-            "name": "mline",
-            "protocol": "modbus-tcp",
-            "host": "127.0.0.1",
-            "port": sim.addr.port(),
-            "unitId": 1,
-            "enabled": true,
-            "simulation": true,
-        }),
+        json!({ "name": "mline", "protocol": "modbus-tcp", "enabled": true, "simulation": true, "settings": { "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{created:?}");

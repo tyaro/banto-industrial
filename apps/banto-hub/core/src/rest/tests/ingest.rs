@@ -71,7 +71,7 @@ async fn push_connection(env: &TestEnv, name: &str, enabled: bool) -> i64 {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": name, "protocol": "push", "host": "", "port": 0, "enabled": enabled }),
+        json!({ "name": name, "protocol": "push", "enabled": enabled }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -104,7 +104,7 @@ async fn bare_push_connection(env: &TestEnv, name: &str) -> i64 {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": name, "protocol": "push", "host": "", "port": 0 }),
+        json!({ "name": name, "protocol": "push" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{conn:?}");
@@ -153,7 +153,7 @@ async fn the_ingest_response_table() {
         &env.router,
         "/api/plc-connections",
         &env.admin_token,
-        json!({ "name": "plc", "protocol": "modbus-tcp", "host": "127.0.0.1", "port": 502 }),
+        json!({ "name": "plc", "protocol": "modbus-tcp", "settings": { "host": "127.0.0.1", "port": 502 } }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{plc:?}");
@@ -522,8 +522,7 @@ async fn rename_keeps_the_key_and_url_but_recreation_does_not() {
         &env.router,
         &format!("/api/plc-connections/{a}"),
         &env.admin_token,
-        json!({ "name": "Bridge1-renamed", "protocol": "push", "host": "", "port": 0,
-                "enabled": true }),
+        json!({ "name": "Bridge1-renamed", "protocol": "push", "enabled": true }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");

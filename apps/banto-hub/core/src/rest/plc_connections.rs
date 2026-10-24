@@ -11,224 +11,171 @@ use super::{
     queue_pending_registry_change, record_write, registry_before, registry_change_should_queue,
     reject_delete_if_referenced_by_sink_group, require_editor, storage_api_error, ApiError,
     BantoError, BrokerConnectionStatus, BrokerError, CollectorManager, Deserialize, Duration,
-    FieldError, HeaderMap, IntoResponse, Json, Path, PlcConnection, PlcConnectionInput,
-    RegistryMutationError, RegistryMutationResult, Response, Serialize, State, StatusCode,
-    TagRegistryState,
+    FieldError, HeaderMap, IntoResponse, Json, Path, PlcConnection, RegistryMutationError,
+    RegistryMutationResult, Response, Serialize, State, StatusCode, TagRegistryState,
 };
 use banto_driver_api::{keys, ConnectContext, FatalError, ItemError, Settings, TagSpec, Value};
 
-fn default_plc_protocol() -> String {
-    "modbus-tcp".to_string()
-}
-
-fn default_plc_unit_id() -> i64 {
-    1
-}
-
-/// T9-2 (docs/ux-plan.md §1): a `PlcConnectionPayload` missing `simulation`
-/// (an old client, or a create/update that never mentions it) keeps the
-/// existing safe default - a connection is never accidentally simulated by
-/// omission.
-fn default_plc_simulation() -> bool {
-    false
-}
-
-/// P3-b（監査指摘 2026-08-12）/ 2026-09-08 オーナー決定: a
-/// `PlcConnectionPayload` missing `wordOrder` (an old client, or a
-/// create/update that never mentions it) defers to
-/// `banto_tags::plc_connection`'s **protocol-aware** default - `"high_low"`
-/// for `modbus-tcp`, `"low_high"` for everything else - by handing it the
-/// empty-string "unspecified" sentinel rather than a concrete order.
+/// R2b-6b（docs/banto-hub-driver-ui-design.md §5、Q2）: `/api/plc-connections` の作成・更新の
+/// 形 `{ name, protocol, enabled, simulation, settings }`。平らな欄（`host`・`port`・`unitId`・
+/// `password` …）は受けない（`deny_unknown_fields`。使用者無しの前提で古い形は断る、
+/// 2026-10-22 オーナー）。MCP は R2b-7 まで平らな形のまま（`crate::mcp` の
+/// `flat_connection` が写す）。
 ///
-/// Returning `"low_high"` here (as this fn did until 2026-09-08) would mask
-/// that default entirely: the payload would arrive at
-/// `PlcConnectionInput` already filled in, so an omitted `wordOrder` on a
-/// Modbus connection could never reach the `"high_low"` default the owner
-/// decision requires. `""` is a safe sentinel because it is not in
-/// `ALLOWED_WORD_ORDERS` and migration `0010`'s SQL `CHECK` rejects it, so
-/// it was never a storable value.
-fn default_plc_word_order() -> String {
-    String::new()
-}
-
-/// Wire-shaped (camelCase) create/update payload for `plc_connections` -
-/// copied from relay-wright's `PlcConnectionPayload` (invariant across every
-/// app that exposes I1 over REST: one payload shape).
+/// - 機器のドライバ（`modbus-tcp`・`slmp`）の `settings` はドライバのスキーマ
+///   （`GET /api/drivers` の `settingsSchema`）に従い、`banto_tags::settings_from_schema` →
+///   `settings_to_api` → `validate_config` を通る（`banto_tags::ConnectionSettingsInput`）。
+///   項目エラーの名前は JSON のキー（`unit_id`）。
+/// - `postgres`・`push` の `settings` は今の中身（`postgres` は `host`・`port`・`database`・
+///   `username`・`password`、`push` は R2a の `settings`）で、専用の検証は今のまま。
+/// - **秘密のキー**（ドライバの `secret_keys()`。今は `postgres` の `password`）は
+///   [`Self::into_input`] がここで外して封印する。tri-state（オーナー決定 2026-10-24）:
+///   省略 = 保つ、`null` = 消す、**空文字 = 消す**、それ以外の文字列 = 置き換え。応答には
+///   値を返さない（[`PlcConnectionResponse`]）。
+/// - `settings` は丸ごと置き換え（更新で省いた欄はスキーマの既定値。秘密のキーだけ省略が
+///   「保つ」）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlcConnectionPayload {
     pub name: String,
-    #[serde(default = "default_plc_protocol")]
     pub protocol: String,
-    pub host: String,
-    pub port: i64,
-    #[serde(default = "default_plc_unit_id")]
-    pub unit_id: i64,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
-    /// T9-2 (docs/ux-plan.md §1, 「接続単位のシミュレーションモード」): opts
-    /// this connection into an in-process simulator instead of a real PLC -
-    /// see `banto_tags::PlcConnection::simulation`'s doc comment for what
-    /// this actually does at collection time (the value layer's simulated
-    /// device, `banto_driver_engine::sim`, dialled through
-    /// `banto_collect::BrokerSimRegistry`).
-    #[serde(default = "default_plc_simulation")]
+    /// T9-2: 省略は `false`（省略で誤ってシミュレーションにしない）。
+    #[serde(default)]
     pub simulation: bool,
-    /// P3-b（監査指摘 2026-08-12）: ワード順（32bit値 u32/f32 等、および
-    /// issue #325 で追加された 64bit 値 i64/u64/f64（4レジスタ）の上位/下位
-    /// ワードの並び）。`"low_high"` / `"high_low"` のいずれか - 検証は
-    /// `banto_tags::plc_connection::validate_plc_connection_input` 側
-    /// （`ALLOWED_WORD_ORDERS`）に委ねる。
-    ///
-    /// 2026-09-08 オーナー決定: **modbus-tcp でも有効な設定**（既定は
-    /// `"high_low"` = Modbus/IEEE 慣習、SLMP は `"low_high"` = MELSEC 標準）。
-    /// それ以前は収集経路が Modbus のこの列を無視して `HighLow` 固定で動く
-    /// 一方 read-on-demand/書き込み経路は列を読んでおり、同じタグの値が経路
-    /// ごとにワード反転して食い違っていた。フォームも "slmp" 選択時しか
-    /// 表示していなかったが、現在は modbus-tcp でも表示する。virtual/postgres
-    /// 接続では引き続き無意味（`unit_id` と同じ扱い）。
-    ///
-    /// 省略時は [`default_plc_word_order`] の "unspecified" 番兵を経由して
-    /// プロトコル依存の既定が適用される。
-    #[serde(default = "default_plc_word_order")]
-    pub word_order: String,
-    /// #605: SLMP の CPU 種別（`"Q"` / `"R"`）。省略と空文字は
-    /// `banto_tags::PlcConnectionInput::cpu_type` と同じ意味
-    /// （作成は `"R"`、更新は既存の値を保つ）。未知の値は検証エラー。
     #[serde(default)]
-    pub cpu_type: Option<String>,
-    /// S1（docs/banto-hub-external-db-design.md §4.1）: `protocol: "postgres"`
-    /// 接続の DB 名。他プロトコルでは省略（`None`）のままにする -
-    /// `banto_tags::plc_connection::validate_plc_connection_input`が
-    /// postgres 以外での指定を拒否する。
-    #[serde(default)]
-    pub database: Option<String>,
-    /// S1: `protocol: "postgres"` 接続の DB ユーザー名。[`Self::database`]と
-    /// 同じ省略時ルール。
-    #[serde(default)]
-    pub username: Option<String>,
-    /// S1: `protocol: "postgres"` 接続のパスワード。R2b-1d から入口で封印して秘密の表に
-    /// 置く（R2b-1e: Windows は DPAPI、それ以外は `plain-v1`。平文の列は無い）。
-    /// **create と update で意味が異なる** -
-    /// `banto_tags::PlcConnectionInput::password`の doc comment 参照:
-    /// - create: 省略/`null`/空文字列はいずれも「パスワード無し」。
-    /// - update: 省略/`null`は「現在のパスワードを変更しない」、空文字列は
-    ///   「消去」、それ以外の文字列は「置き換え」。
-    ///
-    /// GET/list のレスポンスにはこのフィールドは無く、代わりに
-    /// [`PlcConnectionResponse::password_set`]（bool）を返す - 平文
-    /// パスワードを一度保存した接続を読み返すだけで露出させないため。
-    #[serde(default)]
-    pub password: Option<String>,
-    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `protocol: "push"` 接続の
-    /// `settings`（`stale_timeout_ms` とブリッジの区画、JSON のオブジェクト）。
-    /// 他プロトコルでは省略する（`banto_tags::PlcConnectionInput::settings` が
-    /// push 以外での指定を拒否する）。**create と update で意味が異なる**
-    /// （`cpuType` と同じ）: create の省略は既定（SQL の `NULL`）、update の省略・
-    /// `null` は「保存済みの値を保つ」、オブジェクトは置き換え（`{}` でブリッジを
-    /// 外せる）。秘密値は持たない（ブリッジの DB のパスワードは参照先の `postgres`
-    /// 接続の列のまま、§10.2）。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub settings: Option<serde_json::Value>,
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+
+/// 秘密のキーの値の項目エラー（値は載せない）。
+fn secret_field_error(key: &str, message: impl Into<String>) -> BantoError {
+    BantoError::Validation {
+        field_errors: vec![FieldError {
+            field: key.to_string(),
+            message: message.into(),
+        }],
+    }
 }
 
 impl PlcConnectionPayload {
-    /// banto-tags の入力に写す。R2b-1d（docs/banto-hub-connection-settings-design.md §5.3）
-    /// から、`password` の平文は**ここで封印**して `PlcConnectionInput::secrets` に載せる
-    /// （banto-tags は平文を受けない）。tri-state は [`crate::secrets::password_changes`]:
-    /// 省略・`null` は `Keep`、空文字は `Clear`、値は `Set(封印した値)`。封印は
-    /// [`crate::secrets::ConnectionSecrets::platform_default`]（R2b-1e: Windows は DPAPI の
-    /// `dpapi-machine-v1`、それ以外は `plain-v1`）。封印に失敗したとき（大きすぎる値・乱数源・
-    /// DPAPI の失敗）は `password` の項目エラーで、値は載せない。
-    ///
-    /// 未適用キューは R2b-1e から積む時点で封印した値（`sealedPassword`）を持ち、適用は
-    /// [`Self::into_input_with_sealed`] を通る。
-    pub(crate) fn into_input(self) -> Result<PlcConnectionInput, BantoError> {
-        let secrets = crate::secrets::password_changes(
-            &crate::secrets::ConnectionSecrets::platform_default(),
-            self.password.as_deref(),
-        )
-        .map_err(|error| BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "password".to_string(),
-                message: error.to_string(),
-            }],
-        })?;
-        self.into_input_with(secrets)
+    /// banto-tags の入力に写す。`secret_keys`（`PlcConnectionService::secret_keys(protocol)`）の
+    /// 値を `settings` から外し、tri-state（型の doc）で `SecretChange` にする。値は
+    /// [`crate::secrets::ConnectionSecrets::platform_default`] で**ここで封印**する
+    /// （banto-tags は平文を受けない）。文字列でも `null` でもない値・封印の失敗はそのキーの
+    /// 項目エラー。
+    pub(crate) fn into_input(
+        self,
+        secret_keys: &[String],
+    ) -> Result<banto_tags::ConnectionSettingsInput, BantoError> {
+        self.into_input_with_sealed(secret_keys, std::collections::BTreeMap::new())
     }
 
-    /// 未適用キューの適用（R2b-1e、設計 §5.3）: 積む時点で封印した `sealed` があれば、それを
-    /// **平文に戻さず** `SecretChange::Set` として渡す（参照は封印したときのもの。新しい行を
-    /// 足すので、同じ参照の行が既にあれば DB の主キーが断り、適用は失敗する）。無ければ
-    /// [`Self::into_input`]（空文字の「消す」・省略の「保つ」と、R2b-1e の前に積んだ平文の
-    /// `password` の行）。
-    ///
-    /// `sealed` と非空の `password` が両方ある・`sealed` がこの PC で開けない（別の PC で
-    /// 積んだ・壊れた）なら `password` の項目エラー（読めない値で接続を書き換えない）。
+    /// 未適用キューの適用（R2b-1e・R2b-6b）: 積む時点で封印した値 `sealed`（キーごと）を
+    /// **平文に戻さず** `SecretChange::Set` として渡す。封印した値がこの PC で開けない・
+    /// 秘密のキーでない・同じキーに `settings` の値もある、はそのキーの項目エラー。
     pub(crate) fn into_input_with_sealed(
-        self,
-        sealed: Option<crate::secrets::SealedSecret>,
-    ) -> Result<PlcConnectionInput, BantoError> {
-        let Some(sealed) = sealed else {
-            return self.into_input();
-        };
-        let password_error = |message: &str| BantoError::Validation {
-            field_errors: vec![FieldError {
-                field: "password".to_string(),
-                message: message.to_string(),
-            }],
-        };
-        if self.password.is_some() {
-            return Err(password_error(
-                "未適用キューの提案に平文と封印したパスワードの両方があります",
+        mut self,
+        secret_keys: &[String],
+        mut sealed: std::collections::BTreeMap<String, crate::secrets::SealedSecret>,
+    ) -> Result<banto_tags::ConnectionSettingsInput, BantoError> {
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
+        let mut changes = banto_tags::SecretChanges::new();
+        for key in secret_keys {
+            let value = self.settings.remove(key);
+            if let Some(sealed) = sealed.remove(key) {
+                if value.is_some() {
+                    return Err(secret_field_error(
+                        key,
+                        "未適用キューの提案に平文と封印した値の両方があります",
+                    ));
+                }
+                if secrets.open(key, &sealed).is_err() {
+                    return Err(secret_field_error(
+                        key,
+                        "未適用キューの提案の秘密値をこの PC で読めません（提案を破棄して、\
+                         値を入れ直して作り直してください）",
+                    ));
+                }
+                changes.insert(key.clone(), banto_tags::SecretChange::Set(sealed.into()));
+                continue;
+            }
+            match value {
+                None => {}
+                Some(serde_json::Value::Null) => {
+                    changes.insert(key.clone(), banto_tags::SecretChange::Clear);
+                }
+                Some(serde_json::Value::String(plain)) if plain.is_empty() => {
+                    changes.insert(key.clone(), banto_tags::SecretChange::Clear);
+                }
+                Some(serde_json::Value::String(plain)) => {
+                    let sealed = secrets
+                        .seal(key, &plain)
+                        .map_err(|error| secret_field_error(key, error.to_string()))?;
+                    changes.insert(key.clone(), banto_tags::SecretChange::Set(sealed.into()));
+                }
+                Some(_) => {
+                    return Err(secret_field_error(key, "文字列か null で指定してください"));
+                }
+            }
+        }
+        if let Some(key) = sealed.keys().next() {
+            return Err(secret_field_error(
+                key,
+                format!("{} 接続では {key} を指定できません", self.protocol),
             ));
         }
-        if crate::secrets::ConnectionSecrets::platform_default()
-            .open(banto_tags::PASSWORD_KEY, &sealed)
-            .is_err()
-        {
-            return Err(password_error(
-                "未適用キューの提案のパスワードをこの PC で読めません（提案を破棄して、\
-                 パスワードを入れ直して作り直してください）",
-            ));
-        }
-        let mut secrets = banto_tags::SecretChanges::new();
-        secrets.insert(
-            banto_tags::PASSWORD_KEY.to_owned(),
-            banto_tags::SecretChange::Set(sealed.into()),
-        );
-        self.into_input_with(secrets)
-    }
-
-    fn into_input_with(
-        self,
-        secrets: banto_tags::SecretChanges,
-    ) -> Result<PlcConnectionInput, BantoError> {
-        Ok(PlcConnectionInput {
+        Ok(banto_tags::ConnectionSettingsInput {
             name: self.name,
             protocol: self.protocol,
-            host: self.host,
-            port: self.port,
-            unit_id: self.unit_id,
             enabled: self.enabled,
-            // T9-2: wired through - see `PlcConnectionPayload::simulation`'s
-            // doc comment.
             simulation: self.simulation,
-            // P3-b: wired through - see `PlcConnectionPayload::word_order`'s
-            // doc comment.
-            word_order: self.word_order,
-            // #605: 省略は None のままサービスへ渡す（作成は R、更新は既存を保つ）。
-            cpu_type: self.cpu_type,
-            // S1: wired through verbatim.
-            database: self.database,
-            username: self.username,
-            secrets,
-            // R2a-2e: wired through - `None`（省略）は create では既定、update では
-            // 「保存済みの値を保つ」（`banto_tags::PlcConnectionInput::settings`）
-            // ので、この項目を知らないクライアントの更新が push 接続の設定を
-            // 消すことは無い。
             settings: self.settings,
+            secrets: changes,
+            // REST の `settings` は丸ごと置き換え（保存済みから補う印は MCP のアダプタだけ）。
+            keep_stored: banto_tags::KeepStored::default(),
         })
+    }
+
+    /// 未適用キューに積む形（R2b-6b、`crate::pending_changes` の doc）: 秘密のキーの文字列の
+    /// 値は**積む前に封印して** `sealedSecrets`（キー → `crate::secrets::sealed_password_json`
+    /// の形）へ移し、`settings` から外す。空文字（消す）は `null` にする。省略（保つ）・`null`
+    /// （消す）はそのまま。平文はキューに置かない。
+    pub(crate) fn queue_form(
+        mut self,
+        secret_keys: &[String],
+    ) -> Result<serde_json::Value, BantoError> {
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
+        let mut sealed = serde_json::Map::new();
+        for key in secret_keys {
+            match self.settings.get(key) {
+                None | Some(serde_json::Value::Null) => {}
+                Some(serde_json::Value::String(plain)) if plain.is_empty() => {
+                    self.settings.insert(key.clone(), serde_json::Value::Null);
+                }
+                Some(serde_json::Value::String(plain)) => {
+                    let value = secrets
+                        .seal(key, plain)
+                        .map_err(|error| secret_field_error(key, error.to_string()))?;
+                    self.settings.remove(key);
+                    sealed.insert(key.clone(), crate::secrets::sealed_password_json(&value));
+                }
+                Some(_) => {
+                    return Err(secret_field_error(key, "文字列か null で指定してください"));
+                }
+            }
+        }
+        let mut form = serde_json::to_value(&self)
+            .map_err(|err| BantoError::Other(format!("入力のシリアライズに失敗しました: {err}")))?;
+        if !sealed.is_empty() {
+            if let Some(object) = form.as_object_mut() {
+                object.insert(
+                    crate::pending_changes::SEALED_SECRETS_FIELD.to_string(),
+                    serde_json::Value::Object(sealed),
+                );
+            }
+        }
+        Ok(form)
     }
 }
 
@@ -239,15 +186,11 @@ impl PlcConnectionPayload {
 /// の厳格版）も `hub` 接続を「未対応」として全体を止める。接続を作る・変える
 /// すべての入口 - REST の作成/更新（[`plc_connections_create`]/
 /// [`plc_connections_update`]）、MCP の `create_connection`/`update_connection`、
-/// 未適用キューの適用（[`execute_pending_apply`] の `plc_connections.*`）- が
+/// 未適用キューの適用（`execute_pending_apply` の `plc_connections.*`）- が
 /// キューへ積む**前に**これを呼び、`protocol` の項目エラーとして拒否する
 /// （キューに積んでから適用時に落ちるのでは、どの変更が悪いかが遅れて分かる）。
-/// 設定パッケージの取り込み（`configPackage.ts`）は REST の作成/更新を呼ぶので、
-/// ここで同じく拒否される。
-pub(crate) fn reject_hub_connection_protocol(
-    payload: &PlcConnectionPayload,
-) -> Result<(), BantoError> {
-    if payload.protocol != banto_tags::HUB_PROTOCOL {
+pub(crate) fn reject_hub_connection_protocol(protocol: &str) -> Result<(), BantoError> {
+    if protocol != banto_tags::HUB_PROTOCOL {
         return Ok(());
     }
     Err(BantoError::Validation {
@@ -260,108 +203,93 @@ pub(crate) fn reject_hub_connection_protocol(
     })
 }
 
-/// S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: GET/list が返す
-/// `plc_connections` の読み取り DTO。パスワードは決して外部へ出さず、
-/// [`Self::password_set`]（設定されているかの bool）と [`Self::password_state`]
-/// （R2b-1d、読めるか）だけを返す。
+/// R2b-6b（設計 §5）: `/api/plc-connections` の読み取りの形
+/// `{ id, name, protocol, enabled, simulation, settings }`。`settings` は保存した JSON の
+/// まま（`push` の既定は `{}`）で、**秘密のキーの値は `{"$secret": "set" | "unreadable"}`**
+/// に替える（値・参照は返さない。今までの `passwordSet`・`passwordState` の代わり）。
+/// 値が無い秘密のキーは載らない。
 ///
-/// ## 2 つの組み立て方（R2b-1d）
+/// ## 2 つの組み立て方
 ///
-/// - 応答（REST・MCP）は [`PlcConnectionResponse::with_secret_rows`]。`passwordState`
-///   （`none` / `set` / `unreadable`、設計 §5.5）を秘密の行を開いて決める。
+/// - 応答（REST）は [`PlcConnectionResponse::with_secret_rows`]: 秘密の行を開いて
+///   `set` / `unreadable` を決める（設計 §5.5）。
 /// - `From<PlcConnection>` は未適用キューの指紋（`crate::rest::compute_pending_base_fingerprint`
-///   と適用時の照合）。**alpha.33 の応答と同じ形**（`passwordState` を持たない）にして、
-///   版を上げる前に積んだ更新・削除の指紋が上げた後も一致するようにする（設計 §2・§5.3、
-///   R2b-7 まで REST の形を保つ）。読めるかどうか（PC を移した）で指紋を変えない。
+///   と適用時の照合）: 秘密の参照があれば `set`（読めるかどうかで指紋を変えない）。
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionResponse {
     pub id: i64,
     pub name: String,
     pub protocol: String,
-    pub host: String,
-    pub port: i64,
-    pub unit_id: i64,
     pub enabled: bool,
     pub simulation: bool,
-    pub word_order: String,
-    /// #605: `"Q"` または `"R"`。SLMP 以外の行も列は持つ（既定 `"R"`）。
-    pub cpu_type: String,
-    pub database: Option<String>,
-    pub username: Option<String>,
-    /// S1: true のとき、この接続にはパスワードが保存されている（値そのものは返さない）。
-    /// R2b-1d から「`passwordState == "set"`」（読めないものは `false`）。
-    pub password_set: bool,
-    /// R2a-2e（docs/banto-hub-ingest-design.md §3.2）: `push` 接続の `settings`。
-    /// **既定のままなら `null`**（R2b-1d: 0025 から列は `NOT NULL` で既定は `{}` だが、
-    /// alpha.33 の応答は既定のままの push 接続に `null` を返していた。`{}` と `null` は同じ
-    /// 意味（既定）なので、REST の形と指紋を保つために `null` に戻す。設計 §2）。他の
-    /// プロトコルでは常に `null`。`push` の `settings` は秘密値を持たないのでそのまま返す。
-    pub settings: Option<serde_json::Value>,
-    /// R2b-1d（設計 §5.5）: `"none"`（無い）/ `"set"`（ある・読める）/ `"unreadable"`
-    /// （参照はあるが行が無い・この PC で開けない）。応答だけに付く（指紋の形には
-    /// 無い: `From<PlcConnection>` は `None` で、そのときは項目ごと出さない）。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub password_state: Option<&'static str>,
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+
+/// `{"$secret": state}`（応答の秘密のキーの値）。
+fn secret_state_value(state: &str) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        banto_tags::settings_json::SECRET_REF_KEY.to_string(),
+        serde_json::Value::String(state.to_string()),
+    );
+    serde_json::Value::Object(object)
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
-    /// 指紋の形（`passwordState` なし、`passwordSet` は参照の有無）。応答には
-    /// [`PlcConnectionResponse::with_secret_rows`] を使う。
+    /// 指紋の形: 秘密の参照（`{"$secret": ref}`）は `{"$secret": "set"}`。
     fn from(conn: PlcConnection) -> Self {
-        // R2b-1d: a password is "set" when `settings.password` holds a secret reference
-        // (design §3.3) - the same bool alpha.33 derived from its plaintext column.
-        let password_set = conn.secret_ref(banto_tags::PASSWORD_KEY).is_some();
-        Self::build(conn, password_set, None)
-    }
-}
-
-impl PlcConnectionResponse {
-    /// 応答の形: `passwordState` を `rows`（その接続の秘密の行）を開いて決め、
-    /// `passwordSet` を `passwordState == "set"` にする（設計 §5.5）。
-    pub fn with_secret_rows(conn: PlcConnection, rows: &[banto_tags::StoredSecretRow]) -> Self {
-        let state = crate::secrets::secret_state(
-            &crate::secrets::ConnectionSecrets::platform_default(),
-            &conn,
-            banto_tags::PASSWORD_KEY,
-            rows,
-        );
-        Self::build(
-            conn,
-            state == crate::secrets::SecretState::Set,
-            Some(state.as_str()),
-        )
-    }
-
-    fn build(
-        conn: PlcConnection,
-        password_set: bool,
-        password_state: Option<&'static str>,
-    ) -> Self {
-        // The wire keeps R2a's / alpha.33's shape (design §2, Q4): `settings` is a push
-        // row's settings object, `null` while it is still the defaults (`{}` since
-        // migration 0025 made the column NOT NULL - semantically identical to alpha.33's
-        // `NULL`), and `null` for every other protocol - never another protocol's
-        // settings object (a postgres one holds the secret reference; the flat fields
-        // above are its wire form until R2b-7).
-        let settings = (conn.protocol == banto_tags::PUSH_PROTOCOL && !conn.settings.is_empty())
-            .then(|| serde_json::Value::Object(conn.settings.clone()));
+        let mut settings = conn.settings;
+        for value in settings.values_mut() {
+            if banto_tags::settings_json::is_secret_ref(value) {
+                *value = secret_state_value("set");
+            }
+        }
         Self {
             id: conn.id,
             name: conn.name,
             protocol: conn.protocol,
-            host: conn.host,
-            port: conn.port,
-            unit_id: conn.unit_id,
             enabled: conn.enabled,
             simulation: conn.simulation,
-            word_order: conn.word_order,
-            cpu_type: conn.cpu_type.clone(),
-            database: conn.database,
-            username: conn.username,
-            password_set,
             settings,
-            password_state,
+        }
+    }
+}
+
+impl PlcConnectionResponse {
+    /// 応答の形: 秘密のキー（`secret_keys` と、秘密の参照の形の値）を `rows`（その接続の秘密の
+    /// 行）で開いて `{"$secret": "set" | "unreadable"}` にする（設計 §5.5）。
+    pub fn with_secret_rows(
+        conn: PlcConnection,
+        rows: &[banto_tags::StoredSecretRow],
+        secret_keys: &[String],
+    ) -> Self {
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
+        let mut settings = serde_json::Map::new();
+        for (key, value) in &conn.settings {
+            let is_secret = secret_keys.iter().any(|k| k == key)
+                || banto_tags::settings_json::is_secret_ref(value);
+            if !is_secret {
+                settings.insert(key.clone(), value.clone());
+                continue;
+            }
+            match crate::secrets::secret_state(&secrets, &conn, key, rows) {
+                crate::secrets::SecretState::None => {}
+                crate::secrets::SecretState::Set => {
+                    settings.insert(key.clone(), secret_state_value("set"));
+                }
+                crate::secrets::SecretState::Unreadable { .. } => {
+                    settings.insert(key.clone(), secret_state_value("unreadable"));
+                }
+            }
+        }
+        Self {
+            id: conn.id,
+            name: conn.name,
+            protocol: conn.protocol,
+            enabled: conn.enabled,
+            simulation: conn.simulation,
+            settings,
         }
     }
 }
@@ -373,7 +301,12 @@ pub(crate) async fn connection_response(
     conn: PlcConnection,
 ) -> Result<PlcConnectionResponse, BantoError> {
     let rows = service.secret_rows(conn.id).await?;
-    Ok(PlcConnectionResponse::with_secret_rows(conn, &rows))
+    let secret_keys = service.secret_keys(&conn.protocol);
+    Ok(PlcConnectionResponse::with_secret_rows(
+        conn,
+        &rows,
+        &secret_keys,
+    ))
 }
 
 /// [`PlcConnectionResponse::with_secret_rows`] for every connection. The connections
@@ -392,7 +325,8 @@ pub(crate) async fn connection_responses(
                 .filter(|row| row.connection_id == conn.id)
                 .cloned()
                 .collect();
-            PlcConnectionResponse::with_secret_rows(conn, &own)
+            let secret_keys = service.secret_keys(&conn.protocol);
+            PlcConnectionResponse::with_secret_rows(conn, &own, &secret_keys)
         })
         .collect())
 }
@@ -409,7 +343,12 @@ pub(super) async fn plc_connections_get(
 ) -> Result<Json<PlcConnectionResponse>, ApiError> {
     // One read transaction for the row and its sealed rows (PR #777 review P2).
     let (conn, rows) = state.plc_connections.get_with_secret_rows(id).await?;
-    Ok(Json(PlcConnectionResponse::with_secret_rows(conn, &rows)))
+    let secret_keys = state.plc_connections.secret_keys(&conn.protocol);
+    Ok(Json(PlcConnectionResponse::with_secret_rows(
+        conn,
+        &rows,
+        &secret_keys,
+    )))
 }
 
 pub(super) async fn plc_connections_create(
@@ -427,21 +366,24 @@ pub(super) async fn plc_connections_create(
     )
     .await?;
     // #383 段階3 P2: キューへ積む前に拒否する（`reject_hub_connection_protocol`）。
-    if let Err(err) = reject_hub_connection_protocol(&input) {
+    if let Err(err) = reject_hub_connection_protocol(&input.protocol) {
         return Err(ApiError(err).into());
     }
+    let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
+        // R2b-6b: secret values are sealed before they reach the queue.
+        let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,
             &headers,
             "plc_connections.create",
-            json!({ "input": input }),
+            json!({ "input": form }),
             status,
         )
         .await;
     }
-    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
-    let input = input.into_input().map_err(ApiError)?;
+    // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input(&secret_keys).map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -457,7 +399,11 @@ pub(super) async fn plc_connections_create(
             return Err(err.into());
         }
     };
-    let created = match state.plc_connections.create_tx(&mut tx, input).await {
+    let created = match state
+        .plc_connections
+        .create_settings_tx(&mut tx, input)
+        .await
+    {
         Ok(created) => created,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -511,21 +457,24 @@ pub(super) async fn plc_connections_update(
     )
     .await?;
     // #383 段階3 P2: キューへ積む前に拒否する（`reject_hub_connection_protocol`）。
-    if let Err(err) = reject_hub_connection_protocol(&input) {
+    if let Err(err) = reject_hub_connection_protocol(&input.protocol) {
         return Err(ApiError(err).into());
     }
+    let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
+        // R2b-6b: secret values are sealed before they reach the queue.
+        let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,
             &headers,
             "plc_connections.update",
-            json!({ "id": id, "input": input }),
+            json!({ "id": id, "input": form }),
             status,
         )
         .await;
     }
-    // R2b-1d: the password is sealed here (`PlcConnectionPayload::into_input`).
-    let input = input.into_input().map_err(ApiError)?;
+    // R2b-1d / R2b-6b: secret values are sealed here (`PlcConnectionPayload::into_input`).
+    let input = input.into_input(&secret_keys).map_err(ApiError)?;
     // 読み取りを挟む書き込みなので BEGIN IMMEDIATE（checklist §5 / sink/service.rs の doc）。
     let mut tx = state
         .manager
@@ -541,7 +490,11 @@ pub(super) async fn plc_connections_update(
             return Err(err.into());
         }
     };
-    let updated = match state.plc_connections.update_tx(&mut tx, id, input).await {
+    let updated = match state
+        .plc_connections
+        .update_settings_tx(&mut tx, id, input)
+        .await
+    {
         Ok(updated) => updated,
         Err(err) => {
             let _ = tx.rollback().await;
@@ -770,42 +723,30 @@ const PLC_TEST_TIMEOUT: Duration = Duration::from_secs(3);
 /// 1 対 1 の機器も同じ(このファイルの上の「重要な制約」)。
 const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(この hub の収集や他アプリ)で使用中の可能性があります。機器によっては同じポートへの2本目の接続を受け付けません(SLMP の実機 R08ENCPU・Modbus の KM-D1-ETN で確認済み)。";
 
-/// `POST /api/plc-connections/test` のリクエストボディ - 保存前のフォーム値を
-/// そのまま受け取る(`PlcConnectionPayload`とは別型: 接続 id を持たないのが
-/// 通常で、保存済み接続の編集中のみ`connectionId`を添える)。
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+/// `POST /api/plc-connections/test` のリクエストボディ（R2b-6b、設計 §5）- 保存前の
+/// フォーム値を `{ protocol, simulation, settings, connectionId? }` で受け取る
+/// （[`PlcConnectionPayload`] と同じ `settings` の形。保存済み接続の編集中のみ
+/// `connectionId` を添える）。平らな欄は受けない（`deny_unknown_fields`）。MCP の
+/// `test_connection` は R2b-7 まで平らな形のまま（`crate::mcp` の `flat_connection` が写す）。
+///
+/// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
+///   ダイヤルする。省いた欄はスキーマの既定値。
+/// - 秘密のキー: 省略は保存済み（`connectionId` の同じプロトコルの接続）の値を補う、
+///   `null`・空文字は値無し、文字列はその値で試す（保存しない・封印しない）。
+/// - `simulation: true` はダイヤルの前に断る（未保存のフォームの今の値。新規・編集中とも）。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlcConnectionTestPayload {
     pub protocol: String,
-    pub host: String,
-    pub port: i64,
-    #[serde(default = "default_plc_unit_id")]
-    pub unit_id: i64,
-    /// フォームの「シミュレーションモード」チェックボックスの現在値。
-    /// シミュレーション接続のテストは常に内蔵シミュレータへ繋がり無意味なので
-    /// 拒否する(ux-plan.md §4「protocol: virtual と simulation: true 相当の
-    /// テストは明示エラー」)。保存済み行の simulation フラグではなく、
-    /// フォームの現在値をそのまま送らせる設計(未保存の編集中でも即座に弾ける
-    /// ようにするため)。
     #[serde(default)]
     pub simulation: bool,
-    /// 保存済み接続を編集中にテストする場合のみ送る。broker 経由の既存
-    /// セッション判定にのみ使う(接続情報自体は上記 host/port/protocol/unitId
-    /// を毎回使う - フォームの現在入力値をテストするのがこの API の目的の
-    /// ため)。
+    #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
+    /// 編集中の保存済み接続の id。broker のセッションの再利用（指紋が合うときだけ）と、
+    /// 省いた秘密値の補いに使う。
     #[serde(default)]
     pub connection_id: Option<i64>,
-    /// #605: 直接ダイヤルの SLMP フレームに使う CPU 種別。省略は保存済みの値
-    /// (無ければドライバの既定 = iQ-R)、`"Q"` は Q シリーズ。未知の値は
-    /// ドライバの `validate_config` が断り、ダイヤルしない。既存セッションを
-    /// 再利用する経路で、保存済みセッションの設定と食い違うときは試さずに
-    /// 「保存してからテストしてください」と返す（2 本目の TCP を張らない既存の
-    /// 制約があるため、直接ダイヤルには切り替えない。R2b-3a-2 から CPU に限らず
-    /// 設定の指紋で比べる）。
-    #[serde(default)]
-    pub cpu_type: Option<String>,
 }
-
 /// `POST /api/plc-connections/test` の応答。`ToSchema` は付けない - 下記
 /// `plc_connections_test`のdoc comment参照。
 #[derive(Debug, Clone, Serialize)]
@@ -888,16 +829,24 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
     }
 }
 
-/// 試す設定(R2b-3a-2): フォームの値を接続の `settings` の形にしたもの
-/// (`settings_from_flat` → `settings_to_api`、保存と同じ写し)。フォームが
-/// 送らない欄(`wordOrder`、省略した `cpuType`)は、保存済みの接続(`connectionId`
-/// があり、同じプロトコル)の値を使う - 「省略は保存済みのまま」(#605 の CPU の
-/// 照合の規則を全部の欄に広げたもの)。保存済みが無ければその欄は置かない
-/// (ドライバの既定)。保存済みの接続も返す(指紋に入る秘密値の参照の出どころ)。
+/// 試す設定（R2b-6b）: フォームの `settings` をドライバのスキーマに通し
+/// （`banto_tags::settings_from_schema` → `settings_to_api`、保存と同じ組み立て）、秘密のキーを
+/// 足したもの。秘密のキーは、フォームの文字列があればそれ、省略なら保存済み（`connectionId`
+/// があり、同じプロトコル）の値を開いて補う。`null`・空文字は値無し。スキーマで必須の秘密の
+/// 欄が埋まらなければ断る。
+pub(super) struct RequestedSettings {
+    pub(super) settings: Settings,
+    /// 保存済みの接続（指紋に入る秘密値の参照の出どころ）。
+    pub(super) saved: Option<PlcConnection>,
+    /// フォームが秘密のキーを替えた・消したか（保存済みのセッションの読みは答えにならない）。
+    pub(super) secrets_changed: bool,
+}
+
 pub(super) async fn requested_settings(
     manager: &CollectorManager,
+    driver: &dyn banto_driver_api::DriverBase,
     payload: &PlcConnectionTestPayload,
-) -> (Settings, Option<PlcConnection>) {
+) -> Result<RequestedSettings, PlcConnectionTestError> {
     let saved = match payload.connection_id {
         Some(id) => manager
             .plc_connections()
@@ -907,38 +856,79 @@ pub(super) async fn requested_settings(
             .filter(|conn| conn.protocol == payload.protocol),
         None => None,
     };
-    let cpu_type = payload
-        .cpu_type
-        .clone()
-        .filter(|cpu| !cpu.is_empty())
-        .or_else(|| saved.as_ref().map(|conn| conn.cpu_type.clone()));
-    let input = PlcConnectionInput {
-        name: String::new(),
-        protocol: payload.protocol.clone(),
-        host: payload.host.clone(),
-        port: payload.port,
-        unit_id: payload.unit_id,
-        enabled: true,
-        simulation: false,
-        word_order: saved
-            .as_ref()
-            .map(|conn| conn.word_order.clone())
-            .unwrap_or_default(),
-        cpu_type,
-        database: None,
-        username: None,
-        secrets: Default::default(),
-        settings: None,
-    };
-    let mut map = banto_tags::settings_json::legacy::settings_from_flat(&input);
-    if map
-        .get(keys::WORD_ORDER)
-        .and_then(|v| v.as_str())
-        .is_some_and(str::is_empty)
-    {
-        map.remove(keys::WORD_ORDER);
+    let secret_keys = driver.secret_keys();
+    let mut input = payload.settings.clone();
+    let mut given: Vec<(String, String)> = Vec::new();
+    let mut omitted: Vec<String> = Vec::new();
+    let mut secrets_changed = false;
+    for key in &secret_keys {
+        match input.remove(key) {
+            None => omitted.push(key.clone()),
+            Some(serde_json::Value::Null) => secrets_changed = true,
+            Some(serde_json::Value::String(plain)) => {
+                secrets_changed = true;
+                if !plain.is_empty() {
+                    given.push((key.clone(), plain));
+                }
+            }
+            Some(_) => {
+                return Err(refused_settings(&[banto_driver_api::FieldError::new(
+                    key.as_str(),
+                    "文字列か null で指定してください",
+                )]))
+            }
+        }
     }
-    (banto_tags::settings_to_api(&map), saved)
+    let map = banto_tags::settings_from_schema(&driver.settings_schema(), &input)
+        .map_err(|errors| refused_settings(&errors))?;
+    let mut settings = banto_tags::settings_to_api(&map);
+    for (key, plain) in given {
+        settings.insert(key.as_str(), plain);
+    }
+    if let (Some(conn), false) = (&saved, omitted.is_empty()) {
+        let rows = manager
+            .plc_connections()
+            .secret_rows(conn.id)
+            .await
+            .map_err(|err| {
+                test_error("protocol", format!("保存済みの秘密値を読めません: {err}"))
+            })?;
+        let secrets = crate::secrets::ConnectionSecrets::platform_default();
+        for key in &omitted {
+            match crate::secrets::open_connection_secret(&secrets, conn, key, &rows) {
+                Ok(Some(plain)) => settings.insert(key.as_str(), plain.as_str()),
+                Ok(None) => {}
+                Err(reason) => {
+                    return Err(test_error(
+                        "protocol",
+                        format!(
+                        "保存済みの {key} を読めません（{}）。入れ直してからテストしてください。",
+                        reason.as_str()
+                    ),
+                    ))
+                }
+            }
+        }
+    }
+    let missing: Vec<banto_driver_api::FieldError> = driver
+        .settings_schema()
+        .fields
+        .iter()
+        .filter(|field| {
+            field.required
+                && matches!(field.kind, banto_driver_api::FieldKind::Secret)
+                && settings.get(field.key.as_str()).is_none()
+        })
+        .map(|field| banto_driver_api::FieldError::new(field.key.as_str(), "必須です"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(refused_settings(&missing));
+    }
+    Ok(RequestedSettings {
+        settings,
+        saved,
+        secrets_changed,
+    })
 }
 
 /// ドライバの `validate_config` が断った設定を、ダイヤルせずに返す。接続先の
@@ -1023,8 +1013,15 @@ async fn test_connection(
     };
     let driver = resolved.driver();
     // 保存済みの接続（同じプロトコル）は、指紋に入る秘密値の参照の出どころ
-    // （フォームは秘密値を送らない。参照は保存済みのまま、と読む）。
-    let (settings, saved) = requested_settings(manager, payload).await;
+    // （フォームが秘密のキーを省いたら、参照は保存済みのまま、と読む）。
+    let RequestedSettings {
+        settings,
+        saved,
+        secrets_changed,
+    } = match requested_settings(manager, driver.as_ref(), payload).await {
+        Ok(requested) => requested,
+        Err(err) => return (false, Some(err)),
+    };
     let probe = match probe_spec(driver.as_ref()) {
         Ok(probe) => probe,
         Err(err) => return (false, Some(err)),
@@ -1036,12 +1033,14 @@ async fn test_connection(
                 manager
                     .sessions()
                     .dial_fingerprint(&payload.protocol, saved.as_ref(), &settings);
-            if wanted.is_none() || handle.settings_fingerprint() != wanted {
+            // R2b-6b: フォームが秘密値を替えた・消したなら、指紋（参照だけを持つ）は
+            // 合っても、セッションの読みはフォームの値を試したことにならない。
+            if secrets_changed || wanted.is_none() || handle.settings_fingerprint() != wanted {
                 return (
                     false,
                     Some(test_error(
                         "protocol",
-                        "この接続は収集中で、保存済みの設定のセッションを使っています。フォームの設定（接続先・CPU 種別など）は、保存してからテストしてください。",
+                        "この接続は収集中で、保存済みの設定のセッションを使っています。フォームの設定（接続先・CPU 種別・秘密値など）は、保存してからテストしてください。",
                     )),
                 );
             }
@@ -1237,7 +1236,7 @@ mod frame_connection_tests {
         Arc,
     };
 
-    // The legacy connection-test payload supplies host/port for modbus-tcp.
+    // The connection-test payload supplies host/port for modbus-tcp.
     // Override only the fixture id; production registrations remain unchanged.
     struct ProbeFrameDriver {
         descriptor: DriverDescriptor,
@@ -1250,6 +1249,16 @@ mod frame_connection_tests {
         }
         fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
             self.echo.validate_config(settings)
+        }
+        /// R2b-6b: the test payload's `settings` go through this schema (host / port /
+        /// unit_id, like `banto-driver-modbus`).
+        fn settings_schema(&self) -> banto_driver_api::SettingsSchema {
+            use banto_driver_api::{FieldKind, SettingField, SettingsSchema};
+            SettingsSchema::new(vec![
+                SettingField::new("host", "ホスト", FieldKind::host()).required(),
+                SettingField::new("port", "ポート", FieldKind::integer(1, 65_535)).required(),
+                SettingField::new("unit_id", "ユニットID", FieldKind::integer(0, 255)).default(1),
+            ])
         }
         fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
             let mut address = self.echo.parse_address(text, kind)?;
@@ -1318,13 +1327,32 @@ mod frame_connection_tests {
     fn payload(port: i64) -> PlcConnectionTestPayload {
         PlcConnectionTestPayload {
             protocol: "modbus-tcp".into(),
-            host: "127.0.0.1".into(),
-            port,
-            unit_id: 1,
             simulation: false,
+            settings: serde_json::json!({"host": "127.0.0.1", "port": port, "unit_id": 1})
+                .as_object()
+                .cloned()
+                .unwrap(),
             connection_id: None,
-            cpu_type: None,
         }
+    }
+
+    /// 接続テストも保存と同じく `Host` の前後の空白を落としてから張る（`" 127.0.0.1 "`
+    /// のままだと名前解決に失敗する）。
+    #[tokio::test]
+    async fn requested_settings_trims_the_host_like_the_save_path() {
+        let (manager, sessions, pool, _creates) = fixture().await;
+        let resolved = banto_broker::resolve_session_driver(manager.registry(), "modbus-tcp")
+            .expect("modbus-tcp is registered");
+        let mut test = payload(502);
+        test.settings
+            .insert("host".into(), serde_json::json!(" 127.0.0.1 "));
+        let requested = requested_settings(&manager, resolved.driver().as_ref(), &test)
+            .await
+            .unwrap_or_else(|err| panic!("{err:?}"));
+        assert_eq!(requested.settings.get("host"), Some("127.0.0.1"));
+        manager.shutdown().await;
+        sessions.shutdown().await;
+        pool.close().await;
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ async fn create_tag_via_admin(
                 router,
                 "/api/plc-connections",
                 token,
-                json!({ "name": format!("conn-{suffix}"), "host": "127.0.0.1", "port": 15300 }),
+                json!({ "protocol": "modbus-tcp", "name": format!("conn-{suffix}"), "settings": { "host": "127.0.0.1", "port": 15300 } }),
             )
             .await;
             assert_eq!(status, StatusCode::OK, "{conn:?}");
