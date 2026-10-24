@@ -489,6 +489,34 @@ pub fn is_broker_managed(registry: &DriverRegistry, protocol: &str) -> bool {
     resolve_session_driver(registry, protocol).is_some()
 }
 
+/// `protocol` のドライバの秘密のキー（ドライバが無ければ空）。
+/// 指紋（[`SettingsFingerprint`]）に秘密の値を入れないために、Hub と
+/// banto-collect が同じキーの一覧を引く唯一の入口。
+pub fn driver_secret_keys(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
+    registry
+        .get(protocol)
+        .map(|entry| entry.base().secret_keys())
+        .unwrap_or_default()
+}
+
+/// The fingerprint of a real (non-simulated) session of a `protocol`
+/// connection dialed with `settings`: [`SettingsFingerprint::of_connection`]
+/// with the driver's secret keys ([`driver_secret_keys`]). `conn` is the
+/// stored connection, if any (it supplies the secret references).
+pub fn real_dial_fingerprint(
+    registry: &DriverRegistry,
+    protocol: &str,
+    conn: Option<&PlcConnection>,
+    settings: &Settings,
+) -> SettingsFingerprint {
+    SettingsFingerprint::of_connection(
+        protocol,
+        conn,
+        settings,
+        &driver_secret_keys(registry, protocol),
+    )
+}
+
 /// A registry driver adapted to the broker's Session interface, together with
 /// the dial budget for its original kind. Hosts performing a direct connection
 /// test must use the same resolver and deadline as the directory.

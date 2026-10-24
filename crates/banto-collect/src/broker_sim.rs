@@ -32,17 +32,9 @@
 
 use std::collections::HashMap;
 
-use banto_broker::{SettingsFingerprint, SimDevice};
+use banto_broker::{driver_secret_keys, real_dial_fingerprint, SettingsFingerprint, SimDevice};
 use banto_driver_api::{DriverRegistry, Settings};
 use banto_tags::PlcConnection;
-
-/// `protocol` のドライバの秘密のキー（無ければ空）。
-pub(crate) fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
-    registry
-        .get(protocol)
-        .map(|entry| entry.base().secret_keys())
-        .unwrap_or_default()
-}
 
 /// What a connection's broker session is made of (design §4.2): the real
 /// driver dialing `Settings`, or the value layer's [`SimDevice`] (the
@@ -78,17 +70,16 @@ pub fn dial_fingerprint(
     target: &DialTarget,
     registry: &DriverRegistry,
 ) -> SettingsFingerprint {
-    let secret_keys = secret_keys_of(registry, &conn.protocol);
     match target {
         DialTarget::Sim(settings, device) => SettingsFingerprint::of_connection_simulated(
             &conn.protocol,
             Some(conn),
             settings,
-            &secret_keys,
+            &driver_secret_keys(registry, &conn.protocol),
             device.id(),
         ),
         DialTarget::Real(settings) => {
-            SettingsFingerprint::of_connection(&conn.protocol, Some(conn), settings, &secret_keys)
+            real_dial_fingerprint(registry, &conn.protocol, Some(conn), settings)
         }
     }
 }
@@ -285,7 +276,7 @@ mod tests {
 
         let c = conn("modbus-tcp", true);
         let (target, _) = sims.resolve(&c, &registry).await;
-        let keys = secret_keys_of(&registry, "modbus-tcp");
+        let keys = driver_secret_keys(&registry, "modbus-tcp");
         assert_eq!(
             dial_fingerprint(&c, &target, &registry),
             SettingsFingerprint::of_connection_simulated(

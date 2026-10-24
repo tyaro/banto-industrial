@@ -346,11 +346,11 @@ impl HubSessions {
         if !self.is_broker_managed(protocol) {
             return None;
         }
-        Some(SettingsFingerprint::of_connection(
+        Some(banto_broker::real_dial_fingerprint(
+            &self.drivers.registry,
             protocol,
             saved,
             settings,
-            &secret_keys_of(&self.drivers.registry, protocol),
         ))
     }
 
@@ -498,14 +498,6 @@ impl HubSessions {
             supervisor.shutdown().await;
         }
     }
-}
-
-/// `protocol` のドライバの秘密のキー（無ければ空）。
-fn secret_keys_of(registry: &DriverRegistry, protocol: &str) -> Vec<String> {
-    registry
-        .get(protocol)
-        .map(|entry| entry.base().secret_keys())
-        .unwrap_or_default()
 }
 
 #[cfg(test)]
