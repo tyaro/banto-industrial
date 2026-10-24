@@ -21,16 +21,9 @@ function makeConnection(overrides: Partial<PlcConnection>): PlcConnection {
 		id: 1,
 		name: 'line1',
 		protocol: 'modbus-tcp',
-		host: '127.0.0.1',
-		port: 502,
-		unitId: 1,
 		enabled: true,
 		simulation: true,
-		wordOrder: 'low_high',
-		cpuType: 'R',
-		database: null,
-		username: null,
-		passwordSet: false,
+		settings: {},
 		...overrides
 	};
 }

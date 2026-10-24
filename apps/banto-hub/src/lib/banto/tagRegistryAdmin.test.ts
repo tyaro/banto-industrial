@@ -72,22 +72,14 @@ import {
 const connectionInput: PlcConnectionInput = {
 	name: 'plc1',
 	protocol: 'modbus-tcp',
-	host: '192.168.11.200',
-	port: 502,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R'
+	settings: {}
 };
 
 const connectionResource: PlcConnection = {
 	id: 1,
-	...connectionInput,
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	...connectionInput
 };
 
 const tagInput: TagInput = {

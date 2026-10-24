@@ -8,7 +8,7 @@ import type {
 	CollectionGroup,
 	CollectionGroupInput,
 	DriverInfo,
-	PlcConnectionWire,
+	PlcConnection,
 	PushBridgeQueryWire,
 	PushSettingsWire,
 	StringEncoding,
@@ -82,7 +82,7 @@ export const CONFIG_PACKAGE_EXCLUDED_SECRETS = [
 ] as const;
 
 /**
- * 版 3: パッケージの接続 1 つ（REST の `PlcConnectionWireInput` と同じ形。id は持たない）。
+ * 版 3: パッケージの接続 1 つ（REST の `PlcConnectionInput` と同じ形。id は持たない）。
  * `settings` は秘密のキーを持たない（{@link CONFIG_PACKAGE_SCHEMA_VERSION} の doc）。
  * `push` の `settings` は {@link ConfigPackagePushSettings}（ブリッジの読む DB は接続名）。
  */
@@ -395,7 +395,7 @@ function ensureUniqueNames<T extends { name: string }>(items: readonly T[], path
 	}
 }
 
-function filterVirtualConnections(connections: readonly PlcConnectionWire[]): PlcConnectionWire[] {
+function filterVirtualConnections(connections: readonly PlcConnection[]): PlcConnection[] {
 	return connections.filter((connection) => !isVirtualConnection(connection));
 }
 
@@ -405,13 +405,13 @@ function isSecretShaped(value: unknown): boolean {
 }
 
 /**
- * 版 3: 応答（`PlcConnectionWire`）から export の形へ。秘密のキーの値
+ * 版 3: 応答（`PlcConnection`）から export の形へ。秘密のキーの値
  * （`{"$secret": "set" | "unreadable"}`）は落とす - 値そのものはサーバーが返さないので、
  * 載るのは状態だけだが、それも持ち運ばない（取り込み先では意味が無い）。push の
  * `settings` はブリッジの `db_connection_id` を接続名に写す（{@link sanitizePushSettings}）。
  */
 function sanitizeConnection(
-	input: PlcConnectionWire,
+	input: PlcConnection,
 	connectionNameById: ReadonlyMap<number, string>
 ): ConfigPackagePlcConnection {
 	const settings =
@@ -565,7 +565,7 @@ function sanitizeSinkGroup(
 }
 
 export function buildConfigPackage(input: {
-	plcConnections: readonly PlcConnectionWire[];
+	plcConnections: readonly PlcConnection[];
 	collectionGroups: readonly CollectionGroup[];
 	tags: readonly Tag[];
 	mqtt: MqttSettings;

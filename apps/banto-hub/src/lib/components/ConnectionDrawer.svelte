@@ -16,9 +16,10 @@
 	 * 旧 `plc-connections/+page.svelte` のページ内実装（BantoGrid一覧+
 	 * 編集パネル構成、T9/T12/P3-bの成果）から1つも落としていない。
 	 * 1. 識別: 名前（TAG-UX-8 の連番プリフィル対象）
-	 * 2. プロトコルと接続先: プロトコル/ホスト/ポート/ユニットID/
-	 *    （modbus-tcp/slmpのみ、2026-09-08 オーナー決定で modbus-tcp にも
-	 *    拡大 - issue #325 の修正）ワード順/有効/シミュレーション
+	 * 2. プロトコルと接続先: プロトコル（`GET /api/drivers` のドライバ + ホストの
+	 *    接続 postgres/push）と、そのドライバのスキーマから組み立てた欄
+	 *    （R2b-6c、`DriverSettingsForm.svelte`。ホスト/ポート/ユニットID/ワード順/
+	 *    CPU 種別などはスキーマが決める）/有効/シミュレーション
 	 * 3. 接続テスト・確認: 入力内容の確認表示 + 接続テスト + 「作成」
 	 *
 	 * **T19 S1-b（UX-31、2026-09-02 オーナー決定「作成＝中央モーダル、
@@ -103,19 +104,29 @@
 		deletePlcConnection,
 		PUSH_PROTOCOL,
 		isQueuedWhileRunningError,
+		listDrivers,
 		testPlcConnection,
 		testSavedPlcConnection,
 		updatePlcConnection,
 		POSTGRES_PROTOCOL,
-		CPU_TYPE_OPTIONS,
-		WORD_ORDER_OPTIONS,
-		hasWordOrder,
 		type DbConnectionTestOutcome,
+		type DriverInfo,
 		type PlcConnection,
 		type PlcConnectionTestResult
 	} from '#lib/banto/tagRegistryAdmin.js';
+	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
 	import {
-		PROTOCOL_OPTIONS,
+		REQUIRED_MESSAGE,
+		defaultDriverState,
+		mapSettingsFieldErrors,
+		summarizeDriverValues,
+		validateDriverValues
+	} from '#lib/banto/driverSettingsForm.js';
+	import {
+		protocolOptions,
+		driverFor,
+		driverStateAfterProtocolChange,
+		DEFAULT_POSTGRES_PORT,
 		BRIDGE_PERIOD_OPTIONS,
 		DEFAULT_STALE_TIMEOUT_MS,
 		blankBridgeQuery,
@@ -131,11 +142,7 @@
 		pushBridgesReferencing,
 		validatePushFields,
 		connectionToForm,
-		defaultPortFor,
-		defaultWordOrderFor,
 		formToConnectionInput,
-		isDefaultPortForProtocol,
-		initialWordOrderTouched,
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
@@ -250,14 +257,43 @@
 		return isProviderError(err) ? err.message : String(err);
 	}
 
-	function applyFieldErrors(err: unknown): Record<string, string> | null {
+	/** 422 の項目エラー（`field` → 文言）。検証エラーでなければ `null`。 */
+	function fieldErrorMap(err: unknown): Record<string, string> | null {
 		if (isProviderError(err) && err.body.kind === 'validation') {
 			const map: Record<string, string> = {};
 			for (const fe of err.body.field_errors) map[fe.field] = fe.message;
-			// R2a-2e: サーバーの `settings.*` の項目エラーを push の欄へ写す。
-			return mapPushFieldErrors(map);
+			return map;
 		}
 		return null;
+	}
+
+	/** ホストの接続 postgres の `settings` の欄（サーバーの項目エラーを同名のフォームの欄へ写す）。 */
+	const POSTGRES_SETTING_KEYS = ['host', 'port', 'database', 'username', 'password'];
+
+	/**
+	 * サーバーの項目エラーを画面へ写す: push は `settings.*` を push の欄へ、ドライバは
+	 * スキーマの欄の key へ（`driverErrors`）、postgres は同名の欄へ。写せないもの（`name` 等）は
+	 * そのまま `errors`。項目エラーだったら `true`。
+	 */
+	function applyFieldErrors(err: unknown): boolean {
+		const map = fieldErrorMap(err);
+		if (!map) return false;
+		if (form.protocol === PUSH_PROTOCOL) {
+			errors = mapPushFieldErrors(map);
+			driverErrors = {};
+		} else if (driver) {
+			const mapped = mapSettingsFieldErrors(
+				driver.settingsSchema.fields.map((f) => f.key),
+				map
+			);
+			errors = mapped.other;
+			driverErrors = mapped.fields;
+		} else {
+			const mapped = mapSettingsFieldErrors(POSTGRES_SETTING_KEYS, map);
+			errors = { ...mapped.other, ...mapped.fields };
+			driverErrors = {};
+		}
+		return true;
 	}
 
 	/**
@@ -286,7 +322,20 @@
 		return { testing: false, result: null };
 	}
 
-	let form: PlcConnectionFormState = $state(blankConnectionForm());
+	/**
+	 * R2b-6c: `GET /api/drivers`（機器のドライバとそのスキーマ）。開いたときに一度だけ読む。
+	 * 読めなかったときは空の一覧に潰さず、エラーを出して再取得できるようにする
+	 * （ホストの接続 postgres/push は一覧が無くても編集できる）。
+	 */
+	let drivers: DriverInfo[] = $state.raw([]);
+	let driversStatus: 'idle' | 'loading' | 'ready' | 'error' = $state('idle');
+	let driversError: string | null = $state(null);
+	/** ドライバの欄のエラー（欄の key → 文言）。 */
+	let driverErrors: Record<string, string> = $state({});
+
+	let form: PlcConnectionFormState = $state(blankConnectionForm([]));
+	const driver = $derived(driverFor(drivers, form.protocol));
+	const protocolChoices = $derived(protocolOptions(drivers));
 	/**
 	 * 2026-09-15 追補: Drawer/Modal を開いた（または保存が成功した）時点の
 	 * `form` スナップショット。`tags/+page.svelte::createBaseline` と同じ
@@ -294,7 +343,7 @@
 	 * `form`（`$state`）の変化で再評価されるため、`baseline` は毎回その
 	 * 時点の最新値を読めれば十分。
 	 */
-	let baseline: PlcConnectionFormState = blankConnectionForm();
+	let baseline: PlcConnectionFormState = blankConnectionForm([]);
 	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte`/`Modal.svelte` の `dirty` prop）。 */
 	const dirty = $derived(isFormDirty(baseline, form));
 	let errors: Record<string, string> = $state({});
@@ -303,24 +352,39 @@
 	let testState: TestState = $state(blankTestState());
 	let dbTestState: DbTestState = $state(blankDbTestState());
 	let step: 1 | 2 | 3 = $state(1);
-	/**
-	 * 現在のポートがまだ「プロトコルの既定値のまま（未編集）」かどうか。
-	 * 実装指示「プロトコルを切り替えたときポートが未編集（既定値のまま）
-	 * なら追従させ、ユーザーが明示的に編集した後は勝手に上書きしないこと」
-	 * を満たすための追跡フラグ - `false` の間だけ `onProtocolChange` が
-	 * ポートを新プロトコルの既定値へ書き換える。ユーザーがポート欄を直接
-	 * 編集した時点で `true` に固定する。
-	 */
-	let portTouched = $state(false);
+	/** 直前のプロトコル（ドライバを替えたときの引き継ぎの元を引く）。 */
+	let lastProtocol = '';
+
+	async function loadDrivers(): Promise<void> {
+		if (driversStatus === 'loading') return;
+		driversStatus = 'loading';
+		driversError = null;
+		try {
+			drivers = await listDrivers();
+			driversStatus = 'ready';
+			applyDriversToBlankForm();
+		} catch (err) {
+			driversError = errorMessage(err);
+			driversStatus = 'error';
+		}
+	}
 
 	/**
-	 * 現在のワード順がまだ「プロトコルの既定値のまま（未編集）」かどうか。
-	 * `portTouched` と同じ設計（2026-09-08 オーナー決定、issue #325 の修正）:
-	 * `false` の間だけ `onProtocolChange` がワード順を新プロトコルの既定値へ
-	 * 書き換える。ユーザーがワード順セレクトを直接操作した時点で `true` に
-	 * 固定する。
+	 * 一覧の読み込みに失敗した後の再取得で成功したとき、まだプロトコルが空の新規作成フォームへ
+	 * 先頭のドライバを入れる（システム側の更新なので baseline も揃えて dirty にしない）。
 	 */
-	let wordOrderTouched = $state(false);
+	function applyDriversToBlankForm(): void {
+		const first = drivers[0];
+		if (form.protocol !== '' || !first) return;
+		form.protocol = first.id;
+		form.driver = defaultDriverState(first.settingsSchema.fields);
+		lastProtocol = first.id;
+		baseline = { ...baseline, protocol: first.id, driver: $state.snapshot(form.driver) };
+	}
+
+	$effect(() => {
+		if (open && driversStatus === 'idle') void loadDrivers();
+	});
 
 	/**
 	 * Drawer を開いた対象（新規作成 or どの接続の再設定か）を表すキー。
@@ -349,15 +413,17 @@
 			lastOpenKey = null;
 			return;
 		}
+		// ドライバの一覧が決着してから初期化する（読めなくても、ホストの接続は編集できる）。
+		if (driversStatus === 'idle' || driversStatus === 'loading') return;
 		const key = connection ? `edit:${connection.id}` : 'create';
 		if (key === lastOpenKey) return;
 		lastOpenKey = key;
 
 		if (connection) {
-			form = connectionToForm(connection);
+			form = connectionToForm(connection, drivers);
 			provisionalName = null;
 		} else {
-			const blank = blankConnectionForm();
+			const blank = blankConnectionForm(drivers);
 			const initialName = nextConnectionName(existingNames);
 			blank.name = initialName;
 			provisionalName = initialName;
@@ -366,11 +432,11 @@
 		}
 		baseline = $state.snapshot(form);
 		errors = {};
+		driverErrors = {};
 		testState = blankTestState();
 		dbTestState = blankDbTestState();
 		step = 1;
-		portTouched = !isDefaultPortForProtocol(form.port, form.protocol);
-		wordOrderTouched = initialWordOrderTouched(form.wordOrder, form.protocol);
+		lastProtocol = form.protocol;
 
 		// T18-6d: 「接続を削除」からの起動 - フォーム初期化直後に既存の
 		// handleDelete を1回だけ呼ぶ（上の Props.requestDelete 参照）。
@@ -420,23 +486,17 @@
 		provisionalName = refined;
 	}
 
+	/**
+	 * プロトコルを替えたとき: ドライバ → ドライバは「同じキーで利用者が触った欄の値だけ引き継ぎ、
+	 * 他は新しいスキーマの既定で埋め直す」、ホストの接続 → ドライバは既定で埋める
+	 * （`driverStateAfterProtocolChange`）。
+	 */
 	function onProtocolChange(): void {
-		if (!portTouched) {
-			const def = defaultPortFor(form.protocol);
-			if (def !== undefined) form.port = String(def);
-		}
-		if (!wordOrderTouched) {
-			const def = defaultWordOrderFor(form.protocol);
-			if (def !== undefined) form.wordOrder = def;
-		}
-	}
-
-	function onPortInput(): void {
-		portTouched = true;
-	}
-
-	function onWordOrderInput(): void {
-		wordOrderTouched = true;
+		form.driver = driverStateAfterProtocolChange(drivers, lastProtocol, form.protocol, form.driver);
+		lastProtocol = form.protocol;
+		driverErrors = {};
+		errors = {};
+		testState = blankTestState();
 	}
 
 	/** 送信前のフィールド → 該当ウィザードステップの対応（作成時のエラー誘導用）。 */
@@ -445,8 +505,6 @@
 		protocol: 2,
 		host: 2,
 		port: 2,
-		unitId: 2,
-		wordOrder: 2,
 		// S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続の
 		// 追加フィールドも「2. プロトコルと接続先」ステップに置く
 		// （destinationFields スニペット内、下記マークアップ参照）。
@@ -481,10 +539,15 @@
 		// R2a-2e: push は接続先を持たない（ホスト不要）。push の欄の誤りは送信時の
 		// `validatePushFields` が出し、見積もりの超過は欄の下にその場で赤く出る。
 		(form.protocol === PUSH_PROTOCOL && (pushBridgeLoad(form)?.withinLimit ?? true)) ||
-			(form.protocol !== PUSH_PROTOCOL &&
+			// R2b-6c: ドライバは必須の欄が埋まっていれば進める（範囲などの誤りは送信時に出す）。
+			(driver !== undefined &&
+				!Object.values(
+					validateDriverValues(driver.settingsSchema.fields, form.driver.values)
+				).includes(REQUIRED_MESSAGE)) ||
+			(form.protocol === POSTGRES_PROTOCOL &&
 				form.host.trim() !== '' &&
-				(form.protocol !== POSTGRES_PROTOCOL ||
-					(form.database.trim() !== '' && form.username.trim() !== '')))
+				form.database.trim() !== '' &&
+				form.username.trim() !== '')
 	);
 
 	/** R2a-2e: ブリッジの送る量の見積もり（§7.1）。push でブリッジを持つときだけ。 */
@@ -576,17 +639,23 @@
 	 */
 	async function runConnectionTest(): Promise<void> {
 		if (testState.testing) return; // 多重クリック防止
+		if (driver) {
+			// 範囲などの誤りは送る前に欄の下へ出す（サーバーと同じ規則）。
+			const found = validateDriverValues(driver.settingsSchema.fields, form.driver.values);
+			driverErrors = found;
+			if (Object.keys(found).length > 0) return;
+		}
 		testState.testing = true;
 		testState.result = null;
 		try {
+			// フォームの現在値（未保存でもよい）をそのまま送る。秘密の欄の「変えない」はキーを
+			// 送らず、`connectionId` の保存済みから補われる。
+			const input = formToConnectionInput(form, drivers);
 			testState.result = await testPlcConnection({
-				protocol: form.protocol,
-				host: form.host,
-				port: Number(form.port),
-				unitId: Number(form.unitId),
-				simulation: form.simulation,
-				connectionId: connection?.id,
-				cpuType: form.protocol === 'slmp' ? form.cpuType : undefined
+				protocol: input.protocol,
+				simulation: input.simulation,
+				settings: input.settings,
+				connectionId: connection?.id
 			});
 		} catch (err) {
 			// 401/403・CSRF拒否・ネットワークエラーなど（`ok: false` はここに来ない
@@ -634,10 +703,15 @@
 	function validateBeforeSubmit(): boolean {
 		// R2a-2e: push の欄（範囲・ブリッジの形・§7.1 の見積もり）も送る前に確かめる。
 		const fieldErrors = { ...validatePostgresFields(form), ...validatePushFields(form) };
-		if (Object.keys(fieldErrors).length === 0) return true;
+		const driverFound = driver
+			? validateDriverValues(driver.settingsSchema.fields, form.driver.values)
+			: {};
+		driverErrors = driverFound;
+		if (Object.keys(fieldErrors).length === 0 && Object.keys(driverFound).length === 0) return true;
 		errors = fieldErrors;
 		const target = stepForFieldErrors(fieldErrors);
 		if (target !== null) step = target;
+		else if (Object.keys(driverFound).length > 0) step = 2;
 		return false;
 	}
 
@@ -645,8 +719,9 @@
 		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
+		driverErrors = {};
 		try {
-			const created = await createPlcConnection(formToConnectionInput(form));
+			const created = await createPlcConnection(formToConnectionInput(form, drivers));
 			toastStore.push('success', '作成しました');
 			onSaved(created);
 			onClose();
@@ -656,11 +731,10 @@
 				toastStore.push('info', err.message);
 				return;
 			}
-			const fieldErrors = applyFieldErrors(err);
-			if (fieldErrors) {
-				errors = fieldErrors;
-				const target = stepForFieldErrors(fieldErrors);
+			if (applyFieldErrors(err)) {
+				const target = stepForFieldErrors(errors);
 				if (target !== null) step = target;
+				else if (Object.keys(driverErrors).length > 0) step = 2;
 			} else {
 				toastStore.push('error', errorMessage(err));
 			}
@@ -674,13 +748,18 @@
 		if (!validateBeforeSubmit()) return;
 		saving = true;
 		errors = {};
+		driverErrors = {};
 		try {
-			const updated = await updatePlcConnection(connection.id, formToConnectionInput(form));
+			const updated = await updatePlcConnection(
+				connection.id,
+				formToConnectionInput(form, drivers)
+			);
 			toastStore.push('success', '更新しました');
 			// 保存成功後はサーバーの正規化値を基準に取り直す（tags/+page.svelte
 			// の saveEdit と同じ方針）。Drawer は閉じない。baseline も同じ値へ
 			// 揃えることで、保存直後は dirty ではない状態に戻す。
-			form = connectionToForm(updated);
+			form = connectionToForm(updated, drivers);
+			lastProtocol = form.protocol;
 			baseline = $state.snapshot(form);
 			savedRecord = { base: connection, saved: updated };
 			onSaved(updated);
@@ -689,9 +768,7 @@
 				toastStore.push('info', err.message);
 				return;
 			}
-			const fieldErrors = applyFieldErrors(err);
-			if (fieldErrors) errors = fieldErrors;
-			else toastStore.push('error', errorMessage(err));
+			if (!applyFieldErrors(err)) toastStore.push('error', errorMessage(err));
 		} finally {
 			saving = false;
 		}
@@ -731,7 +808,7 @@
 			// 収集グループ・sink group・push のブリッジ（R2a-2e）が参照している
 			// 場合はサービス層の分かりやすい Validation エラー（件数・名前入り）が
 			// ここに来る。項目の文言があればそれを出す。
-			toastStore.push('error', applyFieldErrors(err)?.id ?? errorMessage(err));
+			toastStore.push('error', fieldErrorMap(err)?.id ?? errorMessage(err));
 		} finally {
 			deleting = false;
 		}
@@ -772,15 +849,28 @@
 		<label class="field">
 			プロトコル
 			<select bind:value={form.protocol} onchange={onProtocolChange} disabled={readOnly}>
-				{#each PROTOCOL_OPTIONS as opt (opt.value)}
+				{#each protocolChoices as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
+				{#if form.protocol !== '' && !protocolChoices.some((o) => o.value === form.protocol)}
+					<!-- 一覧に無いプロトコル（virtual など）は、そのまま見える形で残す。 -->
+					<option value={form.protocol}>{form.protocol}</option>
+				{/if}
 			</select>
 			{#if errors.protocol}<span class="err">{errors.protocol}</span>{/if}
 		</label>
+		{#if driversStatus === 'loading'}
+			<p class="hint wide" data-testid="drivers-loading">ドライバの一覧を読み込み中…</p>
+		{:else if driversStatus === 'error'}
+			<!-- 一覧が読めないことを「ドライバ 0 件」に潰さず、理由と再取得を出す。 -->
+			<div class="wide drivers-error" role="alert" data-testid="drivers-error">
+				<span class="err">ドライバの一覧を読めませんでした: {driversError}</span>
+				<button type="button" class="secondary" onclick={() => void loadDrivers()}>再取得</button>
+			</div>
+		{/if}
 		{#if form.protocol === PUSH_PROTOCOL}
 			{@render pushFields()}
-		{:else}
+		{:else if form.protocol === POSTGRES_PROTOCOL}
 			<label class="field">
 				ホスト
 				<input type="text" bind:value={form.host} placeholder="192.168.1.10" disabled={readOnly} />
@@ -793,119 +883,83 @@
 					min="1"
 					max="65535"
 					bind:value={form.port}
-					oninput={onPortInput}
+					placeholder={String(DEFAULT_POSTGRES_PORT)}
 					disabled={readOnly}
 				/>
-				{#if form.protocol === POSTGRES_PROTOCOL}
-					<span class="hint">PostgreSQL の待受ポート（既定 5432）。</span>
-				{/if}
+				<span class="hint">PostgreSQL の待受ポート（既定 5432）。</span>
 				{#if errors.port}<span class="err">{errors.port}</span>{/if}
 			</label>
-			{#if form.protocol === POSTGRES_PROTOCOL}
-				<!--
+			<!--
 				S1（docs/banto-hub-external-db-design.md §4.1）: postgres 接続
-				専用フィールド。unitId/wordOrder/simulation は modbus-tcp/slmp
-				固有の意味しか持たないため（後述の {:else} 分岐）ここでは
-				出さない。
+				専用フィールド（`settings` の database / username / 秘密の password）。
 			-->
-				<label class="field">
-					データベース
-					<input type="text" bind:value={form.database} placeholder="appdb" disabled={readOnly} />
-					{#if errors.database}<span class="err">{errors.database}</span>{/if}
-				</label>
-				<label class="field">
-					ユーザー名
-					<input
-						type="text"
-						bind:value={form.username}
-						placeholder="appuser"
-						disabled={readOnly}
-						autocomplete="off"
-					/>
-					{#if errors.username}<span class="err">{errors.username}</span>{/if}
-				</label>
-				{#if !readOnly}
-					{#if isCreate}
-						<label class="field">
-							パスワード
-							<input type="password" bind:value={form.password} autocomplete="new-password" />
-							<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
-						</label>
-					{:else}
-						{@const passwordView = passwordStatusView(connection ?? null)}
-						<div
-							class="field password-status"
-							class:unreadable={passwordView.unreadable}
-							role={passwordView.unreadable ? 'alert' : undefined}
-							data-testid="password-status"
-						>
-							{passwordView.text}
-						</div>
-						<label class="field">
-							新しいパスワード（変更する場合のみ入力）
-							<input
-								type="password"
-								bind:value={form.password}
-								placeholder="変更しない"
-								autocomplete="new-password"
-								disabled={form.clearPassword}
-							/>
-						</label>
-						<label class="field checkbox">
-							<input type="checkbox" bind:checked={form.clearPassword} />
-							パスワードを消去する
-						</label>
-					{/if}
-					{#if errors.password}<span class="err">{errors.password}</span>{/if}
-				{/if}
-			{:else}
-				<label class="field">
-					ユニットID
-					<input type="number" min="0" max="255" bind:value={form.unitId} disabled={readOnly} />
-					<span class="hint"
-						>Modbus 用のスレーブID（0〜255）。SLMP では未使用（既定 1 のまま）。</span
+			<label class="field">
+				データベース
+				<input type="text" bind:value={form.database} placeholder="appdb" disabled={readOnly} />
+				{#if errors.database}<span class="err">{errors.database}</span>{/if}
+			</label>
+			<label class="field">
+				ユーザー名
+				<input
+					type="text"
+					bind:value={form.username}
+					placeholder="appuser"
+					disabled={readOnly}
+					autocomplete="off"
+				/>
+				{#if errors.username}<span class="err">{errors.username}</span>{/if}
+			</label>
+			{#if !readOnly}
+				{#if isCreate}
+					<label class="field">
+						パスワード
+						<input type="password" bind:value={form.password} autocomplete="new-password" />
+						<span class="hint">空欄のままでも作成できます（後から設定できます）。</span>
+					</label>
+				{:else}
+					{@const passwordView = passwordStatusView(form.passwordState)}
+					<div
+						class="field password-status"
+						class:unreadable={passwordView.unreadable}
+						role={passwordView.unreadable ? 'alert' : undefined}
+						data-testid="password-status"
 					>
-					{#if errors.unitId}<span class="err">{errors.unitId}</span>{/if}
-				</label>
-				{#if hasWordOrder(form)}
+						{passwordView.text}
+					</div>
 					<label class="field">
-						ワード順
-						<select bind:value={form.wordOrder} onchange={onWordOrderInput} disabled={readOnly}>
-							{#each WORD_ORDER_OPTIONS as opt (opt.value)}
-								<option value={opt.value}>{opt.label}</option>
-							{/each}
-						</select>
-						<span class="hint">
-							32bit値（u32/f32等）および64bit値（i64/u64/f64、4レジスタ）の上位/下位ワードの並び。既定は
-							Modbus が high_low（Modbus/IEEE慣習）、MELSEC/SLMPが
-							low_high。機種のマニュアルで確認してください — 例: オムロン
-							KM-D1-ETN（電力量モニタ）は low_high
-							が必要です。間違えると値が化けます（上位/下位が入れ替わります）。
-						</span>
-						{#if errors.wordOrder}<span class="err">{errors.wordOrder}</span>{/if}
+						新しいパスワード（変更する場合のみ入力）
+						<input
+							type="password"
+							bind:value={form.password}
+							placeholder="変更しない"
+							autocomplete="new-password"
+							disabled={form.clearPassword}
+						/>
+					</label>
+					<label class="field checkbox">
+						<input type="checkbox" bind:checked={form.clearPassword} />
+						パスワードを消去する
 					</label>
 				{/if}
-				{#if form.protocol === 'slmp'}
-					<label class="field">
-						CPU種別
-						<select bind:value={form.cpuType} disabled={readOnly}>
-							{#each CPU_TYPE_OPTIONS as opt (opt.value)}
-								<option value={opt.value}>{opt.label}</option>
-							{/each}
-						</select>
-						<span class="hint">
-							MELSEC のフレーム形式です。QJ71E71 などの Q シリーズは Q、iQ-R は R、L シリーズは Q
-							を選んでください。違うと接続できてもタグが Bad になります。既定は R です。
-						</span>
-					</label>
-				{/if}
+				{#if errors.password}<span class="err">{errors.password}</span>{/if}
 			{/if}
+		{:else if driver}
+			<!-- 機器のドライバの欄はスキーマから描く（R2b-6c、設計 §6.1）。 -->
+			<DriverSettingsForm
+				schema={driver.settingsSchema.fields}
+				bind:value={form.driver}
+				errors={driverErrors}
+				{readOnly}
+				idPrefix="conn-driver"
+			/>
+		{:else if driversStatus === 'ready' && form.protocol !== ''}
+			<p class="hint wide">このプロトコルの設定欄はありません（{form.protocol}）。</p>
 		{/if}
 		<label class="field checkbox">
 			<input type="checkbox" bind:checked={form.enabled} disabled={readOnly} />
 			有効
 		</label>
-		{#if form.protocol !== POSTGRES_PROTOCOL && form.protocol !== PUSH_PROTOCOL}
+		{#if driver}
 			<label class="field checkbox">
 				<input type="checkbox" bind:checked={form.simulation} disabled={readOnly} />
 				シミュレーションモード
@@ -1210,7 +1264,7 @@
 		<dt>名前</dt>
 		<dd>{form.name || '（未入力）'}</dd>
 		<dt>プロトコル</dt>
-		<dd>{PROTOCOL_OPTIONS.find((o) => o.value === form.protocol)?.label ?? form.protocol}</dd>
+		<dd>{protocolChoices.find((o) => o.value === form.protocol)?.label ?? form.protocol}</dd>
 		{#if form.protocol === PUSH_PROTOCOL}
 			<dt>受信のタイムアウト</dt>
 			<dd>
@@ -1229,38 +1283,24 @@
 					なし（スクリプトなどの送り手が送る）
 				{/if}
 			</dd>
-		{:else}
+		{:else if form.protocol === POSTGRES_PROTOCOL}
 			<dt>ホスト</dt>
 			<dd>{form.host || '（未入力）'}:{form.port}</dd>
-		{/if}
-		{#if form.protocol === PUSH_PROTOCOL}
-			<!-- R2a-2e: push は接続先・PLC の項目を持たない。 -->
-		{:else if form.protocol === POSTGRES_PROTOCOL}
 			<dt>データベース</dt>
 			<dd>{form.database || '（未入力）'}</dd>
 			<dt>ユーザー名</dt>
 			<dd>{form.username || '（未入力）'}</dd>
 			<dt>パスワード</dt>
 			<dd>{form.password ? '入力あり' : '（未入力・後で設定できます）'}</dd>
-		{:else}
-			<dt>ユニットID</dt>
-			<dd>{form.unitId}</dd>
-			{#if hasWordOrder(form)}
-				<dt>ワード順</dt>
-				<dd>
-					{WORD_ORDER_OPTIONS.find((o) => o.value === form.wordOrder)?.label ?? form.wordOrder}
-				</dd>
-			{/if}
-			{#if form.protocol === 'slmp'}
-				<dt>CPU種別</dt>
-				<dd>
-					{CPU_TYPE_OPTIONS.find((o) => o.value === form.cpuType)?.label ?? form.cpuType}
-				</dd>
-			{/if}
+		{:else if driver}
+			{#each summarizeDriverValues(driver.settingsSchema.fields, form.driver.values) as row (row.label)}
+				<dt>{row.label}</dt>
+				<dd>{row.text}</dd>
+			{/each}
 		{/if}
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
-		{#if form.protocol !== POSTGRES_PROTOCOL && form.protocol !== PUSH_PROTOCOL}
+		{#if driver}
 			<dt>シミュレーション</dt>
 			<dd>{form.simulation ? '⚠ シミュレーション中' : 'いいえ'}</dd>
 		{/if}
@@ -1294,7 +1334,7 @@
 				{@render ingestInfoBlock()}
 			{:else if form.protocol === POSTGRES_PROTOCOL}
 				{@render dbTestConnectionBlock()}
-			{:else}
+			{:else if driver}
 				{@render testConnectionBlock()}
 			{/if}
 		{/if}
@@ -1334,7 +1374,7 @@
 				<!-- R2a-2e: push は接続テストを持たない（受信の状態を上に出す）。 -->
 			{:else if form.protocol === POSTGRES_PROTOCOL}
 				{@render dbTestConnectionBlock()}
-			{:else}
+			{:else if driver}
 				{@render testConnectionBlock()}
 			{/if}
 			<div class="actions">
@@ -1392,6 +1432,12 @@
 		grid-column: 1 / -1;
 		margin-top: -0.4rem;
 		color: var(--banto-warning);
+	}
+
+	.drivers-error {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
 	}
 
 	.password-status {

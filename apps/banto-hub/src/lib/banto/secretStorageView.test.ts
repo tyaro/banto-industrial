@@ -10,32 +10,21 @@ import {
 
 describe('passwordStatusView', () => {
 	it('warns when the password cannot be read', () => {
-		expect(passwordStatusView({ passwordSet: true, passwordState: 'unreadable' })).toEqual({
+		expect(passwordStatusView('unreadable')).toEqual({
 			text: 'パスワード: 読めません（この PC で再入力してください）',
 			unreadable: true
 		});
 		expect(PASSWORD_UNREADABLE_MESSAGE).toContain('読めません');
 	});
 
-	it('uses passwordState when present', () => {
-		expect(passwordStatusView({ passwordSet: true, passwordState: 'set' }).text).toBe(
-			'パスワード: 設定済み'
-		);
-		expect(passwordStatusView({ passwordSet: false, passwordState: 'none' }).text).toBe(
-			'パスワード: 未設定'
-		);
+	it('reads the $secret state: set / none', () => {
+		expect(passwordStatusView('set')).toEqual({ text: 'パスワード: 設定済み', unreadable: false });
+		expect(passwordStatusView('none').text).toBe('パスワード: 未設定');
 	});
 
-	it('falls back to passwordSet for old responses without passwordState', () => {
-		expect(passwordStatusView({ passwordSet: true })).toEqual({
-			text: 'パスワード: 設定済み',
-			unreadable: false
-		});
-		expect(passwordStatusView({ passwordSet: false }).text).toBe('パスワード: 未設定');
-	});
-
-	it('is 未設定 and not a warning without a connection', () => {
+	it('is 未設定 and not a warning without a state', () => {
 		expect(passwordStatusView(null)).toEqual({ text: 'パスワード: 未設定', unreadable: false });
+		expect(passwordStatusView(undefined).unreadable).toBe(false);
 	});
 });
 

@@ -4,19 +4,15 @@
  */
 import { describe, expect, it } from 'vitest';
 import {
-	DEFAULT_PORTS,
-	DEFAULT_WORD_ORDERS,
-	PROTOCOL_OPTIONS,
+	DEFAULT_POSTGRES_PORT,
 	blankConnectionForm,
 	connectionToForm,
-	defaultPortFor,
-	defaultWordOrderFor,
+	driverFor,
+	driverStateAfterProtocolChange,
 	formToConnectionInput,
-	isDefaultPortForProtocol,
-	initialWordOrderTouched,
-	isDefaultWordOrderForProtocol,
 	nextConnectionName,
 	passwordForSubmit,
+	protocolOptions,
 	validatePostgresFields,
 	blankBridgeQuery,
 	formatBridgeReferenceDeleteRefusal,
@@ -32,8 +28,12 @@ import {
 	validatePushFields,
 	type PlcConnectionFormState
 } from './plcConnectionForm';
+import { TEST_DRIVERS } from './configPackageTestDrivers';
 import { isFormDirty } from './formDirty';
-import type { PlcConnection } from './tagRegistryAdmin';
+import type { PlcConnection, PushSettingsWire } from './tagRegistryAdmin';
+
+const DRIVERS = TEST_DRIVERS;
+const blank = () => blankConnectionForm(DRIVERS);
 
 describe('nextConnectionName', () => {
 	it('既存名が無ければ connection1 を返す', () => {
@@ -81,257 +81,257 @@ describe('nextConnectionName（修正1: pendingNames — 実機で再現した�
 	});
 });
 
-describe('defaultPortFor / isDefaultPortForProtocol', () => {
-	it('modbus-tcp の既定ポートは 502', () => {
-		expect(defaultPortFor('modbus-tcp')).toBe(502);
-		expect(DEFAULT_PORTS['modbus-tcp']).toBe(502);
+describe('protocolOptions / driverFor（6c: 選択肢は GET /api/drivers + ホストの接続）', () => {
+	it('ドライバ（displayName）の後に postgres・push が並ぶ。virtual は出ない', () => {
+		const options = protocolOptions([
+			{ id: 'modbus-tcp', displayName: 'Modbus TCP' },
+			{ id: 'slmp', displayName: 'SLMP（MELSEC）' }
+		]);
+		expect(options).toEqual([
+			{ value: 'modbus-tcp', label: 'Modbus TCP' },
+			{ value: 'slmp', label: 'SLMP（MELSEC）' },
+			{ value: 'postgres', label: 'PostgreSQL（DB Source）' },
+			{ value: 'push', label: '取り込み（push・送り手が値を送る）' }
+		]);
 	});
 
-	it('slmp の既定ポートは 5007（crates/banto-plc の SlmpConfig::default() と一致）', () => {
-		expect(defaultPortFor('slmp')).toBe(5007);
-		expect(DEFAULT_PORTS.slmp).toBe(5007);
+	it('ドライバが 0 件でもホストの接続は残る', () => {
+		expect(protocolOptions([]).map((o) => o.value)).toEqual(['postgres', 'push']);
 	});
 
-	it('virtual は既定ポートを持たない', () => {
-		expect(defaultPortFor('virtual')).toBeUndefined();
-	});
-
-	it('S1: postgres の既定ポートは 5432（PostgreSQL の標準ポート）', () => {
-		expect(defaultPortFor('postgres')).toBe(5432);
-		expect(DEFAULT_PORTS.postgres).toBe(5432);
-	});
-
-	it('isDefaultPortForProtocol: 既定値と一致すれば true', () => {
-		expect(isDefaultPortForProtocol('502', 'modbus-tcp')).toBe(true);
-		expect(isDefaultPortForProtocol('5007', 'slmp')).toBe(true);
-	});
-
-	it('isDefaultPortForProtocol: 既定値と異なれば false', () => {
-		expect(isDefaultPortForProtocol('1502', 'modbus-tcp')).toBe(false);
-	});
-
-	it('isDefaultPortForProtocol: 既定を持たないプロトコルは常に false', () => {
-		expect(isDefaultPortForProtocol('0', 'virtual')).toBe(false);
+	it('driverFor: ドライバは引け、ホストの接続・未知は undefined', () => {
+		expect(driverFor(DRIVERS, 'slmp')?.id).toBe('slmp');
+		expect(driverFor(DRIVERS, 'postgres')).toBeUndefined();
+		expect(driverFor(DRIVERS, 'virtual')).toBeUndefined();
 	});
 });
 
-describe('initialWordOrderTouched（Copilot レビュー指摘: プロトコル切替時の追従漏れ）', () => {
-	it('既定と一致していれば「未編集」= false（切替時に追従する）', () => {
-		expect(initialWordOrderTouched('high_low', 'modbus-tcp')).toBe(false);
-		expect(initialWordOrderTouched('low_high', 'slmp')).toBe(false);
+describe('driverStateAfterProtocolChange（6c: プロトコルを替えたときの引き継ぎ）', () => {
+	it('modbus → slmp: 触ったホストだけ引き継ぎ、触っていないポート・ワード順は新しい既定', () => {
+		const form = blank();
+		form.driver.values.host = '10.0.0.9';
+		form.driver.touched.host = true;
+		const next = driverStateAfterProtocolChange(DRIVERS, 'modbus-tcp', 'slmp', form.driver);
+		expect(next.values).toEqual({
+			host: '10.0.0.9',
+			port: '5007',
+			cpu_type: 'R',
+			word_order: 'low_high'
+		});
 	});
 
-	it('既定と異なれば「ユーザーが選んだ」= true（切替時に上書きしない）', () => {
-		expect(initialWordOrderTouched('low_high', 'modbus-tcp')).toBe(true);
-		expect(initialWordOrderTouched('high_low', 'slmp')).toBe(true);
+	it('触ったポートは引き継ぐ', () => {
+		const form = blank();
+		form.driver.values.port = '1502';
+		form.driver.touched.port = true;
+		const next = driverStateAfterProtocolChange(DRIVERS, 'modbus-tcp', 'slmp', form.driver);
+		expect(next.values.port).toBe('1502');
 	});
 
-	// 回帰防止: ワード順の欄が出ないプロトコル（virtual/postgres）で true に
-	// なると、そこから modbus-tcp へ切り替えたときに既定 high_low への追従が
-	// 効かず、postgres 由来の low_high がそのまま Modbus 接続として保存される。
-	it('既定を持たないプロトコル（virtual/postgres）は保存値によらず false', () => {
-		for (const wordOrder of ['low_high', 'high_low'] as const) {
-			expect(initialWordOrderTouched(wordOrder, 'virtual')).toBe(false);
-			expect(initialWordOrderTouched(wordOrder, 'postgres')).toBe(false);
-		}
-	});
-});
-
-describe('defaultWordOrderFor / isDefaultWordOrderForProtocol（2026-09-08 オーナー決定、issue #325 で発見した既存バグの修正）', () => {
-	it('modbus-tcp の既定ワード順は high_low（Modbus/IEEE慣習に統一）', () => {
-		expect(defaultWordOrderFor('modbus-tcp')).toBe('high_low');
-		expect(DEFAULT_WORD_ORDERS['modbus-tcp']).toBe('high_low');
+	it('ホストの接続 → ドライバは既定で埋める（古いドライバの欄は持ち越さない）', () => {
+		const stale = blank().driver;
+		stale.values.host = 'leftover';
+		stale.touched.host = true;
+		const next = driverStateAfterProtocolChange(DRIVERS, 'postgres', 'slmp', stale);
+		expect(next.values.host).toBe('');
+		expect(next.values.port).toBe('5007');
+		expect(next.touched).toEqual({});
 	});
 
-	it('slmp の既定ワード順は low_high（MELSEC標準、従来どおり）', () => {
-		expect(defaultWordOrderFor('slmp')).toBe('low_high');
-		expect(DEFAULT_WORD_ORDERS.slmp).toBe('low_high');
-	});
-
-	it('virtual/postgres は既定ワード順を持たない', () => {
-		expect(defaultWordOrderFor('virtual')).toBeUndefined();
-		expect(defaultWordOrderFor('postgres')).toBeUndefined();
-	});
-
-	it('isDefaultWordOrderForProtocol: 既定値と一致すれば true', () => {
-		expect(isDefaultWordOrderForProtocol('high_low', 'modbus-tcp')).toBe(true);
-		expect(isDefaultWordOrderForProtocol('low_high', 'slmp')).toBe(true);
-	});
-
-	it('isDefaultWordOrderForProtocol: 既定値と異なれば false', () => {
-		expect(isDefaultWordOrderForProtocol('low_high', 'modbus-tcp')).toBe(false);
-		expect(isDefaultWordOrderForProtocol('high_low', 'slmp')).toBe(false);
-	});
-
-	it('isDefaultWordOrderForProtocol: 既定を持たないプロトコルは常に false', () => {
-		expect(isDefaultWordOrderForProtocol('low_high', 'virtual')).toBe(false);
+	it('ドライバ → ホストの接続は状態をそのまま返す', () => {
+		const state = blank().driver;
+		expect(driverStateAfterProtocolChange(DRIVERS, 'modbus-tcp', 'postgres', state)).toBe(state);
 	});
 });
 
 describe('blankConnectionForm / connectionToForm / formToConnectionInput', () => {
-	it('blankConnectionForm は既定プロトコル（modbus-tcp）の既定ワード順 high_low で初期化する（2026-09-08 オーナー決定、issue #325 の修正）', () => {
-		expect(blankConnectionForm()).toEqual({
+	it('blankConnectionForm の既定プロトコルは drivers の先頭で、欄はそのスキーマの既定', () => {
+		expect(blank()).toEqual({
 			name: '',
 			protocol: 'modbus-tcp',
 			host: '',
-			port: '502',
-			unitId: '1',
+			port: '5432',
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
+			driver: {
+				values: { host: '', port: '502', unit_id: '1', word_order: 'high_low' },
+				touched: {}
+			},
 			database: '',
 			username: '',
 			password: '',
 			clearPassword: false,
+			passwordState: 'none',
 			staleTimeoutMs: '',
 			bridgeEnabled: false,
 			bridgeDbConnectionId: '',
 			bridgeQueries: []
 		});
+		expect(DEFAULT_POSTGRES_PORT).toBe(5432);
 	});
 
-	it('connectionToForm は保存済み接続を文字列化したフォーム状態へ変換する', () => {
+	it('drivers が空でも壊れない（プロトコルは空）', () => {
+		const form = blankConnectionForm([]);
+		expect(form.protocol).toBe('');
+		expect(form.driver.values).toEqual({});
+	});
+
+	it('connectionToForm はドライバの settings を文字列化し、無い欄は既定にする', () => {
 		const conn: PlcConnection = {
 			id: 7,
 			name: 'Line1',
 			protocol: 'slmp',
-			host: '192.168.1.10',
-			port: 5007,
-			unitId: 3,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.1.10', port: 5007, cpu_type: 'Q' }
 		};
-		expect(connectionToForm(conn)).toEqual({
-			name: 'Line1',
-			protocol: 'slmp',
+		const form = connectionToForm(conn, DRIVERS);
+		expect(form.protocol).toBe('slmp');
+		expect(form.driver.values).toEqual({
 			host: '192.168.1.10',
 			port: '5007',
-			unitId: '3',
-			enabled: true,
-			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: '',
-			username: '',
-			password: '',
-			clearPassword: false,
-			staleTimeoutMs: '',
-			bridgeEnabled: false,
-			bridgeDbConnectionId: '',
-			bridgeQueries: []
+			cpu_type: 'Q',
+			word_order: 'low_high'
 		});
+		expect(form.database).toBe('');
 	});
 
-	it('formToConnectionInput は数値フィールドを number へ戻す（往復変換）', () => {
+	it('formToConnectionInput はドライバの settings を snake_case のまま・数値は number で送る（往復）', () => {
 		const conn: PlcConnection = {
 			id: 1,
 			name: 'X',
 			protocol: 'modbus-tcp',
-			host: 'h',
-			port: 502,
-			unitId: 1,
 			enabled: true,
-			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			simulation: true,
+			settings: { host: 'h', port: 1502, unit_id: 3, word_order: 'low_high' }
 		};
-		expect(formToConnectionInput(connectionToForm(conn))).toEqual({
+		expect(formToConnectionInput(connectionToForm(conn, DRIVERS), DRIVERS)).toEqual({
 			name: 'X',
 			protocol: 'modbus-tcp',
-			host: 'h',
-			port: 502,
-			unitId: 1,
 			enabled: true,
-			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R'
+			simulation: true,
+			settings: { host: 'h', port: 1502, unit_id: 3, word_order: 'low_high' }
 		});
 	});
 
-	it('S1: connectionToForm は保存済みパスワードを絶対にプリフィルしない（passwordSet: true でも password は常に空文字列）', () => {
-		const conn: PlcConnection = {
-			id: 9,
-			name: 'pg1',
-			protocol: 'postgres',
+	const PG: PlcConnection = {
+		id: 9,
+		name: 'pg1',
+		protocol: 'postgres',
+		enabled: true,
+		simulation: false,
+		settings: {
 			host: '127.0.0.1',
 			port: 5432,
-			unitId: 1,
-			enabled: true,
-			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
 			database: 'appdb',
 			username: 'appuser',
-			passwordSet: true
-		};
-		const form = connectionToForm(conn);
+			password: { $secret: 'set' }
+		}
+	};
+
+	it('S1: connectionToForm は postgres の settings を読み、パスワードは決してプリフィルしない（$secret は状態だけ）', () => {
+		const form = connectionToForm(PG, DRIVERS);
 		expect(form.password).toBe('');
 		expect(form.clearPassword).toBe(false);
+		expect(form.passwordState).toBe('set');
+		expect(form.host).toBe('127.0.0.1');
+		expect(form.port).toBe('5432');
 		expect(form.database).toBe('appdb');
 		expect(form.username).toBe('appuser');
 	});
 
-	it('S1: formToConnectionInput は postgres のときだけ database/username/password を含む', () => {
+	it.each([
+		['set', 'set'],
+		['unreadable', 'unreadable']
+	] as const)('postgres の password $secret=%s は passwordState=%s', (wire, state) => {
+		const form = connectionToForm(
+			{ ...PG, settings: { ...PG.settings, password: { $secret: wire } } },
+			DRIVERS
+		);
+		expect(form.passwordState).toBe(state);
+	});
+
+	it('postgres の password が載っていなければ passwordState は none', () => {
+		const rest = { ...PG.settings };
+		delete rest.password;
+		expect(connectionToForm({ ...PG, settings: rest }, DRIVERS).passwordState).toBe('none');
+	});
+
+	it('S1: formToConnectionInput の postgres は settings に host・port・database・username（と入力したパスワード）を入れる', () => {
 		const form: PlcConnectionFormState = {
-			...blankConnectionForm(),
+			...blank(),
 			protocol: 'postgres',
-			host: '127.0.0.1',
+			host: ' 127.0.0.1 ',
 			port: '5432',
 			database: 'appdb',
 			username: 'appuser',
-			password: 'hunter2'
+			password: 'hunter2',
+			// ドライバの欄が残っていても送らない。
+			simulation: true
 		};
-		expect(formToConnectionInput(form)).toEqual({
+		expect(formToConnectionInput(form, DRIVERS)).toEqual({
 			name: '',
 			protocol: 'postgres',
-			host: '127.0.0.1',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			// blankConnectionForm() の既定プロトコル modbus-tcp のワード順
-			// （high_low）を protocol 切り替え後もそのまま引き継ぐ - この
-			// フォーム自体は onProtocolChange を経由しない素の状態遷移
-			// （spread による直接上書き）なので、追従ロジックの対象外。
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser',
-			password: 'hunter2'
+			settings: {
+				host: '127.0.0.1',
+				port: 5432,
+				database: 'appdb',
+				username: 'appuser',
+				password: 'hunter2'
+			}
 		});
 	});
 
-	it('S1: formToConnectionInput は非 postgres では database/username/password を一切送らない', () => {
+	it('postgres のパスワード: 未入力は password キーを送らない、消去は null', () => {
+		const base: PlcConnectionFormState = { ...connectionToForm(PG, DRIVERS) };
+		expect(formToConnectionInput(base, DRIVERS).settings).not.toHaveProperty('password');
+		expect(
+			formToConnectionInput({ ...base, clearPassword: true }, DRIVERS).settings.password
+		).toBeNull();
+	});
+
+	it('S1: ドライバの接続は postgres の項目（database/username/password）を一切送らない', () => {
 		const form: PlcConnectionFormState = {
-			...blankConnectionForm(),
+			...blank(),
 			protocol: 'modbus-tcp',
-			host: '127.0.0.1',
-			// これらが仮に埋まっていても（フォームを postgres→modbus と
-			// 切り替えた直後の残留値等）非postgresでは送らない。
+			// postgres → modbus と切り替えた直後の残留値。
 			database: 'leftover-db',
 			username: 'leftover-user',
 			password: 'leftover-pw'
 		};
-		const input = formToConnectionInput(form);
-		expect(input).not.toHaveProperty('database');
-		expect(input).not.toHaveProperty('username');
-		expect(input).not.toHaveProperty('password');
+		const input = formToConnectionInput(form, DRIVERS);
+		expect(input.settings).not.toHaveProperty('database');
+		expect(input.settings).not.toHaveProperty('username');
+		expect(input.settings).not.toHaveProperty('password');
+	});
+
+	it('秘密の欄を持つドライバ: 保つ=キー無し、消す=null', () => {
+		const conn: PlcConnection = {
+			id: 2,
+			name: 's',
+			protocol: 'fake-secret',
+			enabled: true,
+			simulation: false,
+			settings: { host: 'h', token: { $secret: 'set' } }
+		};
+		const form = connectionToForm(conn, DRIVERS);
+		expect(formToConnectionInput(form, DRIVERS).settings).toEqual({ host: 'h', note: '' });
+		const cleared = structuredClone(form);
+		(cleared.driver.values.token as { mode: string }).mode = 'clear';
+		expect(formToConnectionInput(cleared, DRIVERS).settings).toEqual({
+			host: 'h',
+			token: null,
+			note: ''
+		});
 	});
 });
 
 describe('S1: passwordForSubmit（パスワード tri-state の組み立て）', () => {
-	it('clearPassword が true なら password の中身に関わらず "" を返す（消去）', () => {
-		expect(passwordForSubmit({ password: 'ignored', clearPassword: true })).toBe('');
-		expect(passwordForSubmit({ password: '', clearPassword: true })).toBe('');
+	it('clearPassword が true なら password の中身に関わらず null を返す（消去）', () => {
+		expect(passwordForSubmit({ password: 'ignored', clearPassword: true })).toBeNull();
+		expect(passwordForSubmit({ password: '', clearPassword: true })).toBeNull();
 	});
 
 	it('password が空文字列（未入力）なら undefined を返す（create: パスワード無し / update: 現在のパスワードを維持）', () => {
@@ -383,14 +383,6 @@ describe('S1: validatePostgresFields（サーバー側必須ルールのクラ�
 	});
 });
 
-describe('S1: PROTOCOL_OPTIONS に postgres（DB Source）が含まれる', () => {
-	it('postgres オプションを日本語ラベル付きで持つ', () => {
-		const postgresOption = PROTOCOL_OPTIONS.find((opt) => opt.value === 'postgres');
-		expect(postgresOption).toBeDefined();
-		expect(postgresOption?.label).toBe('PostgreSQL（DB Source）');
-	});
-});
-
 /**
  * 2026-09-15 追補（誤爆防止、`ConnectionDrawer.svelte::baseline`/`dirty`）:
  * `ConnectionDrawer.svelte` 自体は Svelte コンポーネントでユニットテスト
@@ -402,13 +394,13 @@ describe('S1: PROTOCOL_OPTIONS に postgres（DB Source）が含まれる', () =
  */
 describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフォームスナップショット）', () => {
 	it('新規作成: 開いた直後（baseline = blankConnectionForm 相当）は dirty ではない', () => {
-		const baseline = blankConnectionForm();
+		const baseline = blank();
 		const form = { ...baseline };
 		expect(isFormDirty(baseline, form)).toBe(false);
 	});
 
 	it('新規作成: 名前を1文字変えると dirty になる', () => {
-		const baseline = blankConnectionForm();
+		const baseline = blank();
 		const form = { ...baseline, name: 'a' };
 		expect(isFormDirty(baseline, form)).toBe(true);
 	});
@@ -418,18 +410,11 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			id: 7,
 			name: 'Line1',
 			protocol: 'slmp',
-			host: '192.168.1.10',
-			port: 5007,
-			unitId: 3,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.1.10', port: 5007 }
 		};
-		const baseline = connectionToForm(conn);
+		const baseline = connectionToForm(conn, DRIVERS);
 		const form = { ...baseline };
 		expect(isFormDirty(baseline, form)).toBe(false);
 	});
@@ -439,19 +424,13 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			id: 7,
 			name: 'Line1',
 			protocol: 'slmp',
-			host: '192.168.1.10',
-			port: 5007,
-			unitId: 3,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '192.168.1.10', port: 5007 }
 		};
-		const baseline = connectionToForm(conn);
-		const form = { ...baseline, host: '192.168.1.11' };
+		const baseline = connectionToForm(conn, DRIVERS);
+		const form = structuredClone(baseline);
+		form.driver.values.host = '192.168.1.11';
 		expect(isFormDirty(baseline, form)).toBe(true);
 	});
 
@@ -460,18 +439,11 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 			id: 9,
 			name: 'ViewOnly',
 			protocol: 'modbus-tcp',
-			host: '10.0.0.1',
-			port: 502,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'high_low',
-			cpuType: 'R',
-			database: null,
-			username: null,
-			passwordSet: false
+			settings: { host: '10.0.0.1', port: 502 }
 		};
-		const baseline = connectionToForm(conn);
+		const baseline = connectionToForm(conn, DRIVERS);
 		// readOnly では <input disabled> によりユーザーは form を変更できない
 		// - つまり form は常に baseline と同一のまま。
 		const form = baseline;
@@ -483,58 +455,44 @@ describe('ConnectionDrawer の dirty 判定（baseline は開いた時点のフ�
 
 function pushForm(overrides: Partial<PlcConnectionFormState> = {}): PlcConnectionFormState {
 	return {
-		...blankConnectionForm(),
+		...blank(),
 		name: 'Bridge1',
 		protocol: 'push',
 		...overrides
 	};
 }
 
+const PUSH_SETTINGS: PushSettingsWire = {
+	stale_timeout_ms: 5000,
+	bridge: {
+		kind: 'db',
+		db_connection_id: 3,
+		queries: [
+			{
+				name: 'line1',
+				period_ms: 1000,
+				sql: 'SELECT temp, run FROM line1_now',
+				columns: [
+					{ column: 'temp', key: 'line1.temp' },
+					{ column: 'run', key: 'line1.run' }
+				]
+			}
+		]
+	}
+};
+
 const PUSH_CONNECTION: PlcConnection = {
 	id: 12,
 	name: 'Bridge1',
 	protocol: 'push',
-	host: '',
-	port: 0,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false,
-	settings: {
-		stale_timeout_ms: 5000,
-		bridge: {
-			kind: 'db',
-			db_connection_id: 3,
-			queries: [
-				{
-					name: 'line1',
-					period_ms: 1000,
-					sql: 'SELECT temp, run FROM line1_now',
-					columns: [
-						{ column: 'temp', key: 'line1.temp' },
-						{ column: 'run', key: 'line1.run' }
-					]
-				}
-			]
-		}
-	}
+	settings: PUSH_SETTINGS as unknown as Record<string, unknown>
 };
-
-describe('R2a-2e: PROTOCOL_OPTIONS に push（取り込み）が含まれる', () => {
-	it('push を日本語ラベル付きで持つ', () => {
-		expect(PROTOCOL_OPTIONS.find((opt) => opt.value === 'push')?.label).toBe(
-			'取り込み（push・送り手が値を送る）'
-		);
-	});
-});
 
 describe('R2a-2e: push の settings とフォームの往復', () => {
 	it('connectionToForm → formToConnectionInput で settings がそのまま戻る', () => {
-		const form = connectionToForm(PUSH_CONNECTION);
+		const form = connectionToForm(PUSH_CONNECTION, DRIVERS);
 		expect(form.staleTimeoutMs).toBe('5000');
 		expect(form.bridgeEnabled).toBe(true);
 		expect(form.bridgeDbConnectionId).toBe('3');
@@ -546,30 +504,30 @@ describe('R2a-2e: push の settings とフォームの往復', () => {
 				columnsText: 'temp=line1.temp\nrun=line1.run'
 			}
 		]);
-		const input = formToConnectionInput(form);
-		expect(input.settings).toEqual(PUSH_CONNECTION.settings);
-		// push は接続先を持たない（サーバーが正規化する）。postgres の項目も送らない。
-		expect(input.host).toBe('');
-		expect(input.port).toBe(0);
+		const input = formToConnectionInput(form, DRIVERS);
+		expect(input.settings).toEqual(PUSH_SETTINGS);
+		// push は接続先を持たない。postgres の項目も送らない。
 		expect(input.simulation).toBe(false);
-		expect(input).not.toHaveProperty('database');
-		expect(input).not.toHaveProperty('password');
+		expect(input.settings).not.toHaveProperty('host');
+		expect(input.settings).not.toHaveProperty('password');
 	});
 
 	it('既定のまま（settings: null）の push は空の settings を送る（update で保存済みの値を消せるように）', () => {
-		const form = connectionToForm({ ...PUSH_CONNECTION, settings: null });
+		const form = connectionToForm({ ...PUSH_CONNECTION, settings: {} }, DRIVERS);
 		expect(form.staleTimeoutMs).toBe('');
 		expect(form.bridgeEnabled).toBe(false);
-		expect(formToConnectionInput(form).settings).toEqual({});
+		expect(formToConnectionInput(form, DRIVERS).settings).toEqual({});
 	});
 
 	it('ブリッジを外すと settings から bridge が消える', () => {
-		const form = { ...connectionToForm(PUSH_CONNECTION), bridgeEnabled: false };
+		const form = { ...connectionToForm(PUSH_CONNECTION, DRIVERS), bridgeEnabled: false };
 		expect(pushSettingsFromForm(form)).toEqual({ stale_timeout_ms: 5000 });
 	});
 
-	it('push 以外の接続は settings を送らない', () => {
-		expect(formToConnectionInput(blankConnectionForm())).not.toHaveProperty('settings');
+	it('push 以外の接続に push の settings は混ざらない', () => {
+		const settings = formToConnectionInput(blank(), DRIVERS).settings;
+		expect(settings).not.toHaveProperty('stale_timeout_ms');
+		expect(settings).not.toHaveProperty('bridge');
 		expect(pushFormFromSettings(undefined).bridgeQueries).toEqual([]);
 	});
 
@@ -605,7 +563,7 @@ describe('R2a-2e: parseBridgeColumns（1 行に 1 つの「列名=キー」）',
 
 describe('R2a-2e: validatePushFields（保存前の検証）', () => {
 	it('push 以外・ブリッジなしで既定のままなら何も出さない', () => {
-		expect(validatePushFields(blankConnectionForm())).toEqual({});
+		expect(validatePushFields(blank())).toEqual({});
 		expect(validatePushFields(pushForm())).toEqual({});
 	});
 
@@ -669,9 +627,9 @@ describe('R2a-2e: validatePushFields（保存前の検証）', () => {
 	});
 
 	it('pushBridgeLoad はブリッジを持つ push だけ', () => {
-		expect(pushBridgeLoad(blankConnectionForm())).toBeNull();
+		expect(pushBridgeLoad(blank())).toBeNull();
 		expect(pushBridgeLoad(pushForm())).toBeNull();
-		expect(pushBridgeLoad(connectionToForm(PUSH_CONNECTION))?.queries).toEqual([
+		expect(pushBridgeLoad(connectionToForm(PUSH_CONNECTION, DRIVERS))?.queries).toEqual([
 			{ items: 2, itemBytes: 10 + 96 + 9 + 96, messagesPerCycle: 1 }
 		]);
 	});
@@ -722,9 +680,9 @@ describe('R2a-2e: pushBridgesReferencing（postgres 接続の削除の拒否）'
 			...PUSH_CONNECTION,
 			id: 13,
 			name: 'Bridge2',
-			settings: { bridge: { ...PUSH_CONNECTION.settings!.bridge!, db_connection_id: 4 } }
+			settings: { bridge: { ...PUSH_SETTINGS.bridge!, db_connection_id: 4 } }
 		};
-		const plain = { ...PUSH_CONNECTION, id: 14, name: 'Script', settings: null };
+		const plain = { ...PUSH_CONNECTION, id: 14, name: 'Script', settings: {} };
 		const connections = [PUSH_CONNECTION, other, plain];
 		expect(pushBridgesReferencing(connections, 3)).toEqual(['Bridge1']);
 		expect(pushBridgesReferencing(connections, 4)).toEqual(['Bridge2']);
@@ -736,8 +694,14 @@ describe('R2a-2e: pushBridgesReferencing（postgres 接続の削除の拒否）'
 });
 
 describe('resolveSavedConnection / isSavedPushConnection（P2: 保存後のプロトコル変更）', () => {
-	const conn = (protocol: string): PlcConnection =>
-		({ id: 7, name: 'c', protocol }) as unknown as PlcConnection;
+	const conn = (protocol: string): PlcConnection => ({
+		id: 7,
+		name: 'c',
+		protocol,
+		enabled: true,
+		simulation: false,
+		settings: {}
+	});
 
 	it('保存前は prop のプロトコルが基準（push 以外 → 表示・ポーリングなし）', () => {
 		const prop = conn('slmp');

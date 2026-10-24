@@ -1,0 +1,139 @@
+/**
+ * R2b-6c（docs/banto-hub-driver-ui-design.md §6・§7.1）: 機器のドライバの接続を
+ * `GET /api/drivers` のスキーマから組み立てた欄で作る受け入れテスト。
+ *
+ * 固定する内容:
+ * 1. 作成ウィザードの既定のプロトコルはドライバ一覧の先頭（Modbus）で、欄の既定は
+ *    スキーマの `default`（ポート 502）。必須のホストが空のうちは「次へ」に進めない。
+ * 2. SLMP へ替えると、触っていないポートは SLMP の既定 5007 に追従し、触って入れたホストは
+ *    引き継がれる。ヘルプ（CPU 種別）はスキーマの `help` で出る。ワード順は「詳細」に畳まれる。
+ * 3. 範囲外のポートは保存前に欄の下で断られる（サーバーと同じ文言）。
+ * 4. 作成すると `settings` は snake_case のまま保存され（REST で確かめる）、再設定の
+ *    ドロワーが同じ値を読み戻す。
+ * 5. ホストの接続（postgres）から替えたドライバは既定で埋まる（持ち越さない）。
+ *
+ * 前提データは REST で作る/消す。同期点は `waitForResponse`（クリックより前に張る）。
+ */
+import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
+
+const RUN_ID = Date.now();
+const CONN = `e2e-driver-conn-${RUN_ID}`;
+
+interface ConnectionRow {
+	id: number;
+	name: string;
+	protocol: string;
+	settings: Record<string, unknown>;
+}
+
+async function cleanupFixtures(
+	request: APIRequestContext,
+	headers: Record<string, string>
+): Promise<void> {
+	const res = await request.get('/api/plc-connections', { headers });
+	if (!res.ok()) return;
+	for (const c of ((await res.json()) as ConnectionRow[]).filter((c) => c.name === CONN)) {
+		await request.delete(`/api/plc-connections/${c.id}`, { headers });
+	}
+}
+
+test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b-6c）', () => {
+	let page: Page;
+	let headers: Record<string, string>;
+
+	test.beforeAll(async ({ browser }) => {
+		page = await browser.newPage();
+		await page.goto('/login');
+		const token = await fetchAuthToken(page.request);
+		await injectAuthToken(page, token);
+		headers = { ...CSRF_HEADERS, Authorization: `Bearer ${token}` };
+		await cleanupFixtures(page.request, headers);
+	});
+
+	test.afterAll(async () => {
+		await cleanupFixtures(page.request, headers);
+		await page.close();
+	});
+
+	test('1〜3. 既定はドライバの先頭。SLMP へ替えると既定が追従し、範囲外は保存前に断られる', async () => {
+		await page.goto('/tags');
+		await page.getByRole('button', { name: 'PLC接続を追加', exact: true }).click();
+		const wizard = page.getByRole('dialog', { name: '新規作成', exact: true });
+		await expect(wizard).toBeVisible();
+		await wizard.locator('#connection-name').fill(CONN);
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+
+		// 既定のプロトコルは drivers の先頭（id の順で modbus-tcp）、ポートはスキーマの既定。
+		await expect(wizard.getByLabel('プロトコル')).toHaveValue('modbus-tcp');
+		await expect(wizard.getByLabel('ポート')).toHaveValue('502');
+		await expect(wizard.getByRole('button', { name: '次へ', exact: true })).toBeDisabled();
+
+		// ホストを入れる（触った欄）→ SLMP へ替える。ホストは引き継がれ、ポートは SLMP の既定。
+		await wizard.getByLabel('ホスト').fill('10.0.0.7');
+		await wizard.getByLabel('プロトコル').selectOption({ value: 'slmp' });
+		await expect(wizard.getByLabel('ホスト')).toHaveValue('10.0.0.7');
+		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
+		await expect(wizard.getByLabel('CPU種別')).toHaveValue('R');
+		// help はスキーマから（欄の下）。ワード順は「詳細」に畳まれている。
+		await expect(wizard.getByText('MELSEC のフレーム形式です')).toBeVisible();
+		await expect(wizard.getByTestId('driver-advanced')).not.toHaveAttribute('open', '');
+
+		// 範囲外のポートは送る前に欄の下で断る（サーバーと同じ文言）。
+		await wizard.getByLabel('ポート').fill('70000');
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+		await wizard.getByRole('button', { name: '作成', exact: true }).click();
+		await expect(wizard.getByText('1〜65535 で指定してください')).toBeVisible();
+
+		// 直して作成する。
+		await wizard.getByLabel('ポート').fill('5200');
+		await wizard.getByLabel('CPU種別').selectOption({ value: 'Q' });
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+		await expect(wizard.getByText('Qシリーズ（Q）')).toBeVisible();
+		const created = page.waitForResponse(
+			(r) => r.url().includes('/api/plc-connections') && r.request().method() === 'POST'
+		);
+		await wizard.getByRole('button', { name: '作成', exact: true }).click();
+		expect((await created).status()).toBe(200);
+		await expect(page.getByText('作成しました')).toBeVisible();
+	});
+
+	test('4. settings は snake_case のまま保存され、再設定のドロワーが読み戻す', async () => {
+		const res = await page.request.get('/api/plc-connections', { headers });
+		const saved = ((await res.json()) as ConnectionRow[]).find((c) => c.name === CONN);
+		expect(saved?.protocol).toBe('slmp');
+		expect(saved?.settings).toMatchObject({
+			host: '10.0.0.7',
+			port: 5200,
+			cpu_type: 'Q',
+			word_order: 'low_high'
+		});
+
+		await page.goto('/tags');
+		await page
+			.getByRole('tree')
+			.getByRole('button', { name: new RegExp(`^${CONN}`) })
+			.click({ button: 'right' });
+		await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+		const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
+		await expect(drawer).toBeVisible();
+		await expect(drawer.getByLabel('ホスト')).toHaveValue('10.0.0.7');
+		await expect(drawer.getByLabel('ポート')).toHaveValue('5200');
+		await expect(drawer.getByLabel('CPU種別')).toHaveValue('Q');
+		await drawer.getByText('詳細').click();
+		await expect(drawer.getByLabel('ワード順')).toHaveValue('low_high');
+	});
+
+	test('5. ホストの接続（postgres）から替えたドライバは既定で埋まる', async () => {
+		await page.goto('/tags');
+		await page.getByRole('button', { name: 'PLC接続を追加', exact: true }).click();
+		const wizard = page.getByRole('dialog', { name: '新規作成', exact: true });
+		await wizard.locator('#connection-name').fill(`${CONN}-x`);
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+		await wizard.getByLabel('ホスト').fill('leftover');
+		await wizard.getByLabel('プロトコル').selectOption({ value: 'postgres' });
+		await wizard.getByLabel('プロトコル').selectOption({ value: 'slmp' });
+		await expect(wizard.getByLabel('ホスト')).toHaveValue('');
+		await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
+	});
+});

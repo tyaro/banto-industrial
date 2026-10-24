@@ -1,20 +1,20 @@
 import {
 	createCollectionGroup,
-	createPlcConnectionWire,
+	createPlcConnection,
 	createTag,
 	listCollectionGroups,
 	listDrivers,
-	listPlcConnectionsWire,
+	listPlcConnections,
 	listTags,
 	updateCollectionGroup,
-	updatePlcConnectionWire,
+	updatePlcConnection,
 	updateTag,
 	isQueuedWhileRunningError,
 	isSecretStateWire,
 	type CollectionGroup,
 	type CollectionGroupInput,
-	type PlcConnectionWire,
-	type PlcConnectionWireInput,
+	type PlcConnection,
+	type PlcConnectionInput,
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
@@ -72,9 +72,7 @@ function uniqueWarnings(items: readonly string[]): string[] {
 	return [...new Set(items)];
 }
 
-function buildConnectionMap(
-	connections: readonly PlcConnectionWire[]
-): Map<string, PlcConnectionWire> {
+function buildConnectionMap(connections: readonly PlcConnection[]): Map<string, PlcConnection> {
 	return new Map(connections.map((connection) => [connection.name, connection]));
 }
 
@@ -88,7 +86,7 @@ function isVirtualConnection(connection: { protocol: string }): boolean {
  * `settings.password` が `{"$secret": "set"}`）。`unreadable`（保存した値をこの PC で
  * 読めない）と、値が無い（キーが載らない）は使えない。
  */
-function hasUsablePassword(connection: PlcConnectionWire): boolean {
+function hasUsablePassword(connection: PlcConnection): boolean {
 	const value = connection.settings?.password;
 	return isSecretStateWire(value) && value.$secret === 'set';
 }
@@ -105,7 +103,7 @@ interface RegistryKeys {
 }
 
 function registryKeys(
-	connections: readonly Pick<PlcConnectionWire, 'id' | 'name'>[],
+	connections: readonly Pick<PlcConnection, 'id' | 'name'>[],
 	groups: readonly CollectionGroup[]
 ): RegistryKeys {
 	const connectionNameById = new Map(connections.map((c) => [c.id, c.name]));
@@ -147,7 +145,7 @@ function buildSinkGroupMap(groups: readonly SinkGroup[]): Map<string, SinkGroup>
 }
 
 function collectConnectionNames(
-	current: readonly PlcConnectionWire[],
+	current: readonly PlcConnection[],
 	pkg: ConfigPackage
 ): Set<string> {
 	const names = new Set(current.map((connection) => connection.name));
@@ -203,7 +201,7 @@ function resolveMqttCredentials(
 
 export async function loadConfigPackage(): Promise<ConfigPackage> {
 	const [plcConnections, collectionGroups, tags, sinkGroups, mqtt, grpc] = await Promise.all([
-		listPlcConnectionsWire(),
+		listPlcConnections(),
 		listCollectionGroups(),
 		listTags(),
 		listSinkGroups(),
@@ -262,7 +260,7 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		grpcSettings,
 		drivers
 	] = await Promise.all([
-		listPlcConnectionsWire(),
+		listPlcConnections(),
 		listCollectionGroups(),
 		listTags(),
 		listSinkGroups(),
@@ -415,7 +413,7 @@ async function applyConfigPackageInner(
 ): Promise<ConfigPackageImportSummary> {
 	const [currentConnections, currentGroups, currentTags, currentSinkGroups, currentMqtt, drivers] =
 		await Promise.all([
-			listPlcConnectionsWire(),
+			listPlcConnections(),
 			listCollectionGroups(),
 			listTags(),
 			listSinkGroups(),
@@ -455,7 +453,7 @@ async function applyConfigPackageInner(
 		// （`checkConfigPackageConnectionFields` が値に関わらずキーの存在で断る。REST は
 		// null・空文字を「消す」と読むので、ここに秘密のキーが来ると保存済みの秘密が消える）ので、既存の接続の更新では
 		// 秘密のキーの省略 =「保存済みを保つ」になる（postgres のパスワードを消さない）。
-		const connection: PlcConnectionWireInput = {
+		const connection: PlcConnectionInput = {
 			name: pkgConnection.name,
 			protocol: pkgConnection.protocol,
 			enabled: pkgConnection.enabled,
@@ -464,8 +462,8 @@ async function applyConfigPackageInner(
 		};
 		const existing = connectionByName.get(connection.name);
 		const saved = existing
-			? await updatePlcConnectionWire(existing.id, connection)
-			: await createPlcConnectionWire(connection);
+			? await updatePlcConnection(existing.id, connection)
+			: await createPlcConnection(connection);
 		connectionByName.set(saved.name, saved);
 		if (saved.protocol === 'push') ingestConnections.push({ name: saved.name, id: saved.id });
 	}

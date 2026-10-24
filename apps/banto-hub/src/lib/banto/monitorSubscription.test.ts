@@ -11,12 +11,10 @@ function connection(id: number, name: string): PlcConnection {
 		id,
 		name,
 		protocol: 'modbus-tcp',
-		host: '127.0.0.1',
-		port: 502,
-		unitId: 1,
 		enabled: true,
-		simulation: false
-	} as PlcConnection;
+		simulation: false,
+		settings: {}
+	};
 }
 
 function group(id: number, name: string, plcConnectionId: number): CollectionGroup {

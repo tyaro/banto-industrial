@@ -40,16 +40,9 @@ const CONN_A: PlcConnection = {
 	id: 1,
 	name: 'ConnA',
 	protocol: 'modbus-tcp',
-	host: '127.0.0.1',
-	port: 502,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	settings: {}
 };
 // R2b-2d: 種類ごとの配置（db は postgres、computed は calc、internal は mem の下）。
 const CONN_PG: PlcConnection = { ...CONN_A, id: 2, name: 'PgConn', protocol: 'postgres' };

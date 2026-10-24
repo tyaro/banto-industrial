@@ -14,15 +14,15 @@ import {
 	type ConfigPackage,
 	type ConfigPackagePushSettings
 } from './configPackage';
-import type { CollectionGroup, PlcConnectionWire, Tag } from './tagRegistryAdmin';
+import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
 import { TEST_DRIVERS } from './configPackageTestDrivers';
 import type { GrpcSettings } from './grpcSettingsAdmin';
 import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup } from './sinkGroupsAdmin';
 
-// 版 3（R2b-6b-3）: 接続は REST の新しい形（`PlcConnectionWire`）。`settings` の中は
+// 版 3（R2b-6b-3）: 接続は REST の新しい形（`PlcConnection`）。`settings` の中は
 // ドライバの JSON のまま（snake_case）。
-const BASE_CONNECTION: PlcConnectionWire = {
+const BASE_CONNECTION: PlcConnection = {
 	id: 1,
 	name: 'line-a',
 	protocol: 'modbus-tcp',
@@ -31,7 +31,7 @@ const BASE_CONNECTION: PlcConnectionWire = {
 	settings: { host: '127.0.0.1', port: 502, unit_id: 1, word_order: 'low_high' }
 };
 
-const VIRTUAL_CONNECTION: PlcConnectionWire = {
+const VIRTUAL_CONNECTION: PlcConnection = {
 	id: 2,
 	name: 'calc',
 	protocol: 'virtual',
@@ -43,7 +43,7 @@ const VIRTUAL_CONNECTION: PlcConnectionWire = {
 // S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: postgres（DB
 // Source）接続のフィクスチャ - 保存済みパスワードあり（`{"$secret": "set"}`）
 // でも export には一切パスワードが乗らないことを確認する用。
-const DB_CONNECTION: PlcConnectionWire = {
+const DB_CONNECTION: PlcConnection = {
 	id: 3,
 	name: 'pg-a',
 	protocol: 'postgres',
@@ -59,7 +59,7 @@ const DB_CONNECTION: PlcConnectionWire = {
 };
 
 // SLMP（Q シリーズ）の接続。
-const SLMP_CONNECTION: PlcConnectionWire = {
+const SLMP_CONNECTION: PlcConnection = {
 	id: 5,
 	name: 'line-q',
 	protocol: 'slmp',
@@ -373,7 +373,7 @@ describe('configPackage', () => {
 	});
 
 	it('版 3: Modbus 接続の unit_id・word_order（high_low）を往復する', () => {
-		const modbus: PlcConnectionWire = {
+		const modbus: PlcConnection = {
 			...BASE_CONNECTION,
 			settings: { host: '10.0.0.9', port: 1502, unit_id: 7, word_order: 'high_low' }
 		};
@@ -551,7 +551,7 @@ describe('configPackage', () => {
 	});
 
 	it('S1: 読めない秘密値（unreadable）も書き出さない', () => {
-		const unreadable: PlcConnectionWire = {
+		const unreadable: PlcConnection = {
 			...DB_CONNECTION,
 			settings: { ...DB_CONNECTION.settings, password: { $secret: 'unreadable' } }
 		};
@@ -788,7 +788,7 @@ describe('configPackage', () => {
 
 	// --- 版 2（2026-10-19 オーナー決定: グループ名は接続内で一意）----------------
 
-	const LINE_B: PlcConnectionWire = {
+	const LINE_B: PlcConnection = {
 		...BASE_CONNECTION,
 		id: 4,
 		name: 'line-b',
@@ -907,7 +907,7 @@ describe('configPackage', () => {
 
 // R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: push 接続の `settings`
 // の往復。ブリッジの読む DB は id ではなく接続名（`dbConnectionName`）で持ち運ぶ。
-const PUSH_BRIDGE_CONNECTION: PlcConnectionWire = {
+const PUSH_BRIDGE_CONNECTION: PlcConnection = {
 	id: 12,
 	name: 'Bridge1',
 	protocol: 'push',
@@ -934,7 +934,7 @@ const PUSH_BRIDGE_CONNECTION: PlcConnectionWire = {
 };
 
 // 版 3: 既定のままの push 接続の settings は `{}`（REST の応答）。
-const PUSH_PLAIN_CONNECTION: PlcConnectionWire = {
+const PUSH_PLAIN_CONNECTION: PlcConnection = {
 	id: 13,
 	name: 'Script1',
 	protocol: 'push',
