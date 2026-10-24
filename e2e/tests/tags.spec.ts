@@ -117,6 +117,13 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(page.getByRole('heading', { level: 3, name: '接続' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '収集グループ' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: 'タグ' })).toBeVisible();
+		const connectionForm = page.locator('section.registry-section').nth(0).locator('div.create');
+		await connectionForm.getByLabel('プロトコル').selectOption('slmp');
+		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(1);
+		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(0);
+		await connectionForm.getByLabel('プロトコル').selectOption('modbus-tcp');
+		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(1);
+		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(0);
 	});
 
 	test('2. PLC接続を作成すると一覧に出る', async () => {

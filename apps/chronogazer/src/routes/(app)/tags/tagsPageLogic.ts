@@ -476,19 +476,15 @@ export function connectionSavedMessage(
 //
 // Hub 接続（`protocol: 'hub'`）の行は読み取り専用の欄に「有効」だけを出す。保存は
 // PLC 接続と同じ更新（`PUT /api/plc-connections/{id}`・`plc_connections_update`、全項目
-// 置換）なので、変えない項目は**今の行の値をそのまま**送る（host/port はサーバーが
-// ""/0 に揃える。`simulation` は省略 = 保存されている値を保つ）。
+// 置換）なので、変えない設定は今の行の `settings` をそのまま送る。
 
 /** Hub 接続の「有効」だけを変える更新の入力（純関数）。 */
 export function hubConnectionInput(conn: PlcConnection, enabled: boolean): PlcConnectionInput {
 	return {
 		name: conn.name,
 		protocol: 'hub',
-		host: '',
-		port: 0,
-		unitId: conn.unitId,
 		enabled,
-		wordOrder: conn.wordOrder,
+		settings: conn.settings,
 		simulation: conn.simulation
 	};
 }

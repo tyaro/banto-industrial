@@ -768,23 +768,17 @@ describe('hubConnectionInput / hubConnectionSavedMessage', () => {
 		id: 7,
 		name: 'Hub',
 		protocol: 'hub',
-		host: '',
-		port: 0,
-		unitId: 1,
 		enabled: true,
-		wordOrder: '',
+		settings: {},
 		simulation: false
 	};
 
-	it('「有効」だけを変え、ほかは今の行の値のまま（host/port は持たない）で送る', () => {
+	it('「有効」だけを変え、今の設定を保って送る', () => {
 		expect(hubConnectionInput(hub, false)).toEqual({
 			name: 'Hub',
 			protocol: 'hub',
-			host: '',
-			port: 0,
-			unitId: 1,
 			enabled: false,
-			wordOrder: '',
+			settings: {},
 			simulation: false
 		});
 		expect(hubConnectionInput({ ...hub, enabled: false }, true).enabled).toBe(true);

@@ -64,11 +64,8 @@ interface NamedRow {
 }
 interface ConnectionRow extends NamedRow {
 	protocol: string;
-	host: string;
-	port: number;
-	unitId: number;
+	settings: Record<string, unknown>;
 	enabled: boolean;
-	wordOrder: string;
 }
 
 async function fetchApiHeaders(request: APIRequestContext): Promise<ApiHeaders> {
@@ -115,11 +112,8 @@ async function setConnectionEnabled(
 		data: {
 			name: conn.name,
 			protocol: conn.protocol,
-			host: conn.host,
-			port: conn.port,
-			unitId: conn.unitId,
 			enabled,
-			wordOrder: conn.wordOrder
+			settings: conn.settings
 		}
 	});
 	if (!res.ok()) {

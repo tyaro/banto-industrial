@@ -71,6 +71,7 @@ import { invoke } from '@tauri-apps/api/core';
 
 import {
 	listPlcConnections,
+	listDrivers,
 	createPlcConnection,
 	updatePlcConnection,
 	deletePlcConnection,
@@ -91,11 +92,8 @@ import {
 const connectionInput: PlcConnectionInput = {
 	name: 'plc1',
 	protocol: 'modbus-tcp',
-	host: '192.168.11.200',
-	port: 502,
-	unitId: 1,
 	enabled: true,
-	wordOrder: '',
+	settings: { host: '192.168.11.200', port: 502, unit_id: 1 },
 	simulation: false
 };
 
@@ -150,6 +148,7 @@ describe('デモモード（バックエンドが無い）', () => {
 		vi.stubGlobal('fetch', fetchSpy);
 
 		await expect(listPlcConnections()).rejects.toThrow(DEMO_MODE_MESSAGE);
+		await expect(listDrivers()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(createPlcConnection(connectionInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(listCollectionGroups()).rejects.toThrow(DEMO_MODE_MESSAGE);
 		await expect(createCollectionGroup(groupInput)).rejects.toThrow(DEMO_MODE_MESSAGE);
@@ -163,6 +162,12 @@ describe('デモモード（バックエンドが無い）', () => {
 });
 
 describe('Tauri モード', () => {
+	it('listDrivers は drivers_list を呼ぶ', async () => {
+		testState.bantoMode = 'tauri';
+		vi.mocked(invoke).mockResolvedValueOnce([]);
+		await expect(listDrivers()).resolves.toEqual([]);
+		expect(invoke).toHaveBeenCalledWith('drivers_list', undefined);
+	});
 	it('listPlcConnections は invoke("plc_connections_list") を引数なしで呼ぶ', async () => {
 		testState.bantoMode = 'tauri';
 		vi.mocked(invoke).mockResolvedValueOnce([]);
@@ -241,6 +246,12 @@ describe('Tauri モード', () => {
 });
 
 describe('サーバーモード（REST）', () => {
+	it('listDrivers は GET /api/drivers を呼ぶ', async () => {
+		testState.bantoMode = 'server';
+		mockFetchOnce({ status: 200, ok: true, body: [] });
+		await expect(listDrivers()).resolves.toEqual([]);
+		expect(fetch).toHaveBeenCalledWith('/api/drivers', expect.objectContaining({ method: 'GET' }));
+	});
 	it('listPlcConnections は GET /api/plc-connections を CSRF/Authorization ヘッダー付きで叩く', async () => {
 		testState.bantoMode = 'server';
 		mockFetchOnce({ status: 200, ok: true, body: [] });

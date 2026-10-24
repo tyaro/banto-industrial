@@ -86,11 +86,8 @@ interface NamedRow {
 }
 interface ConnectionRow extends NamedRow {
 	protocol: string;
-	host: string;
-	port: number;
-	unitId: number;
+	settings: Record<string, unknown>;
 	enabled: boolean;
-	wordOrder: string;
 }
 
 // --- 開発用 PLC の子プロセス ------------------------------------------------
@@ -204,11 +201,8 @@ async function setConnectionEnabled(
 		data: {
 			name: conn.name,
 			protocol: conn.protocol,
-			host: conn.host,
-			port: conn.port,
-			unitId: conn.unitId,
 			enabled,
-			wordOrder: conn.wordOrder
+			settings: conn.settings
 		}
 	});
 	if (!res.ok()) {
@@ -278,11 +272,8 @@ test.describe.serial('chronogazer 監視画面の断線 → Bad → 復旧（R1-
 		const conn = await postJson<NamedRow>(page.request, headers, '/api/plc-connections', {
 			name: CONNECTION_NAME,
 			protocol: 'modbus-tcp',
-			host: '127.0.0.1',
-			port: OWN_DEV_PLC_PORT,
-			unitId: 1,
 			enabled: true,
-			wordOrder: ''
+			settings: { host: '127.0.0.1', port: OWN_DEV_PLC_PORT, unit_id: 1 }
 		});
 		const cg = await postJson<NamedRow>(page.request, headers, '/api/collection-groups', {
 			name: COLLECTION_GROUP_NAME,
