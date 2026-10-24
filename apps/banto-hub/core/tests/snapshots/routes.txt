@@ -79,6 +79,7 @@ POST /api/tags/batch-delete
 POST /api/tags/batch-update
 POST /api/tags/expression/check
 POST /api/tags/list
+POST /api/tags/offset-addresses
 POST /api/tags/parse-addresses
 POST /api/users
 POST /api/users/{id}/reset-password

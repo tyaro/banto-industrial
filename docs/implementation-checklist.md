@@ -51,6 +51,7 @@
 - [ ] **やらないこと**を列挙する（スコープ外の改善を勝手にやらせない）。
 - [ ] **「指示に答えが無い分岐は、変更せずに選択肢と推奨を報告して止まる」**と明記。
 - [ ] 報告してほしい項目（PR 番号・判断表・迷った点）を列挙する。
+- [ ] **Hub の REST のルートを足す・消すときは `apps/banto-hub/core/tests/snapshots/routes.txt` も直させる**（`rest::tests::api_keys::routes_snapshot_matches`。名前で絞ったテストでは落ちず CI で落ちた、#816）。
 - [ ] 難易度でモデルを選ぶ（機械的 = haiku / 標準 = sonnet / 並行・安全・横断 = opus・fable）。CLAUDE.md の分担に従う。
 
 ## 2. 検証の順序（この順番で、全部）
