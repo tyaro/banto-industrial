@@ -50,7 +50,7 @@
  *    `listSectionView`/`createFormGate`）を同じ形で通しており、その総当たりは
  *    vitest 側で固定してある。
  * 8.（#414 段階1 の回帰固定）接続のプロトコルで読めないアドレスのタグは
- *    保存できず、理由（「Modbus TCP のアドレスとして解釈できません」）が
+ *    保存できず、理由（Modbus の参照番号として読めないこと）が
  *    デバイスアドレス欄に出ること。修正前は Modbus 接続の下に MELSEC 表記の
  *    `D3000` を保存でき、収集開始が全体ごと失敗していた。このため 5・6 で
  *    作るタグのアドレスも Modbus の参照番号（`40001`/`40011`）にしてある
@@ -283,8 +283,8 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		// 6 の部分スケーリングが残っていると、そちらの理由と混ざる。
 		await form.getByLabel('スケーリング: 生値 下限').fill('');
 		await form.getByRole('button', { name: '作成' }).click();
-		// `banto_collect::TagAddressIssue::message` の文言。
-		await expect(form.getByText('Modbus TCP のアドレスとして解釈できません')).toBeVisible();
+		// 登録簿モードが返すドライバの検査理由。
+		await expect(form.getByText(/Modbus の参照番号/)).toBeVisible();
 		// 保存は成立していない。
 		await expect(section.locator('div.list').getByText(MELSEC_TAG_NAME)).toHaveCount(0);
 	});

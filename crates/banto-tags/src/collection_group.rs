@@ -358,6 +358,7 @@ pub struct CollectionGroupService {
     pool: SqlitePool,
     /// [`Self::with_registry`]'s registry; `None` = the old rules (no re-parse on a move).
     registry: Option<Arc<DriverRegistry>>,
+    accept_hub_connections: bool,
 }
 
 impl CollectionGroupService {
@@ -366,6 +367,7 @@ impl CollectionGroupService {
         Self {
             pool,
             registry: None,
+            accept_hub_connections: false,
         }
     }
 
@@ -376,7 +378,14 @@ impl CollectionGroupService {
         Self {
             pool,
             registry: Some(registry),
+            accept_hub_connections: false,
         }
+    }
+
+    /// Allow ChronoGazer's Hub external-name tags when moving a group.
+    pub fn accept_hub_connections(mut self) -> Self {
+        self.accept_hub_connections = true;
+        self
     }
 
     /// The registry passed to [`Self::with_registry`]; `None` for [`Self::new`].
@@ -636,6 +645,7 @@ impl CollectionGroupService {
                 address_rewrites = reparse_tags(
                     &mut *connection,
                     registry,
+                    self.accept_hub_connections,
                     ReparseScope::Group(id),
                     &new_connection_name,
                     new_protocol,

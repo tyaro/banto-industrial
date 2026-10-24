@@ -1258,7 +1258,7 @@ async fn validate_tag_kind_placement(
     let Some((conn_id, conn_name, protocol)) = row else {
         return Ok(Placement::unchecked(input));
     };
-    let placement = decide_placement(None, conn_id, &conn_name, &protocol, input)?;
+    let placement = decide_placement(None, false, conn_id, &conn_name, &protocol, input)?;
     let Some(unique) = &placement.unique else {
         return Ok(placement);
     };
@@ -1468,6 +1468,7 @@ const DUPLICATE_HUB_ADDRESS_IN_BATCH: &str =
 async fn validate_tag_kind_placement_tx(
     connection: &mut SqliteConnection,
     registry: Option<&DriverRegistry>,
+    accept_hub_connections: bool,
     input: &TagInput,
     exclude_tag_id: Option<i64>,
 ) -> Result<Placement, BantoError> {
@@ -1479,7 +1480,14 @@ async fn validate_tag_kind_placement_tx(
     let Some((conn_id, conn_name, protocol)) = row else {
         return Ok(Placement::unchecked(input));
     };
-    let placement = decide_placement(registry, conn_id, &conn_name, &protocol, input)?;
+    let placement = decide_placement(
+        registry,
+        accept_hub_connections,
+        conn_id,
+        &conn_name,
+        &protocol,
+        input,
+    )?;
     let Some(unique) = &placement.unique else {
         return Ok(placement);
     };
@@ -1490,6 +1498,42 @@ async fn validate_tag_kind_placement_tx(
         .map_err(banto_storage::storage_error)?;
     unique.verdict(taken)?;
     Ok(placement)
+}
+
+/// A disabled update at the same read location may repair an old invalid tag.
+/// Read the old row through the caller's transaction so this decision cannot
+/// race a concurrent change of its placement.
+async fn placement_for_update_tx(
+    connection: &mut SqliteConnection,
+    registry: Option<&DriverRegistry>,
+    accept_hub_connections: bool,
+    id: i64,
+    input: &TagInput,
+) -> Result<Placement, BantoError> {
+    if registry.is_some() && !input.enabled {
+        if let Some(before) = fetch_tag_row(connection, id)
+            .await
+            .map_err(banto_storage::storage_error)?
+        {
+            if before.collection_group_id == input.collection_group_id
+                && before.address == input.address
+                && before.data_type == input.data_type
+            {
+                return Ok(Placement {
+                    unique: None,
+                    address: before.address,
+                });
+            }
+        }
+    }
+    validate_tag_kind_placement_tx(
+        connection,
+        registry,
+        accept_hub_connections,
+        input,
+        Some(id),
+    )
+    .await
 }
 
 /// What the cross-table placement step decides for one tag (R2b-2b): the
@@ -1520,6 +1564,7 @@ impl Placement {
 /// text) without a registry, [`normalize_tag_address`] with one.
 fn decide_placement(
     registry: Option<&DriverRegistry>,
+    accept_hub_connections: bool,
     conn_id: i64,
     conn_name: &str,
     protocol: &str,
@@ -1531,9 +1576,15 @@ fn decide_placement(
             input.address.trim().to_string()
         }
         Some(registry) => {
-            normalize_tag_address(conn_name, protocol, input, registry)
-                .map_err(|field_errors| BantoError::Validation { field_errors })?
-                .canonical
+            normalize_tag_address_with_hub(
+                conn_name,
+                protocol,
+                input,
+                registry,
+                accept_hub_connections,
+            )
+            .map_err(|field_errors| BantoError::Validation { field_errors })?
+            .canonical
         }
     };
     let unique = unique_address(conn_id, protocol, input, &address);
@@ -1593,6 +1644,16 @@ pub fn normalize_tag_address(
     input: &TagInput,
     registry: &DriverRegistry,
 ) -> Result<NormalizedAddress, Vec<FieldError>> {
+    normalize_tag_address_with_hub(conn_name, protocol, input, registry, false)
+}
+
+fn normalize_tag_address_with_hub(
+    conn_name: &str,
+    protocol: &str,
+    input: &TagInput,
+    registry: &DriverRegistry,
+    accept_hub_connections: bool,
+) -> Result<NormalizedAddress, Vec<FieldError>> {
     if let Some(error) = tag_kind_placement_error(conn_name, protocol, &input.tag_kind) {
         return Err(vec![error]);
     }
@@ -1602,6 +1663,14 @@ pub fn normalize_tag_address(
         parsed: None,
     };
     match input.tag_kind.as_str() {
+        PLC_TAG_KIND if accept_hub_connections && protocol == HUB_PROTOCOL => {
+            let errors = hub_tag_errors(input);
+            if errors.is_empty() {
+                Ok(plain(trimmed))
+            } else {
+                Err(errors)
+            }
+        }
         PLC_TAG_KIND => normalize_plc_address(protocol, input, trimmed, registry),
         DB_TAG_KIND => match db_column_address_error(trimmed) {
             Some(error) => Err(vec![error]),
@@ -2015,6 +2084,7 @@ pub(crate) struct AddressRewrite {
 pub(crate) async fn reparse_tags(
     connection: &mut SqliteConnection,
     registry: &DriverRegistry,
+    accept_hub_connections: bool,
     scope: ReparseScope,
     conn_name: &str,
     protocol: &str,
@@ -2042,7 +2112,13 @@ pub(crate) async fn reparse_tags(
     let mut failures: Vec<(&Tag, String)> = Vec::new();
     let mut rewrites = Vec::new();
     for tag in &tags {
-        match normalize_tag_address(conn_name, protocol, &tag.to_input(), registry) {
+        match normalize_tag_address_with_hub(
+            conn_name,
+            protocol,
+            &tag.to_input(),
+            registry,
+            accept_hub_connections,
+        ) {
             Ok(normalized) => {
                 if normalized.canonical != tag.address {
                     rewrites.push(AddressRewrite {
@@ -2260,6 +2336,7 @@ pub struct TagService {
     pool: SqlitePool,
     /// [`Self::with_registry`]'s registry; `None` = the old rules.
     registry: Option<Arc<DriverRegistry>>,
+    accept_hub_connections: bool,
 }
 
 impl TagService {
@@ -2269,6 +2346,7 @@ impl TagService {
         Self {
             pool,
             registry: None,
+            accept_hub_connections: false,
         }
     }
 
@@ -2279,7 +2357,14 @@ impl TagService {
         Self {
             pool,
             registry: Some(registry),
+            accept_hub_connections: false,
         }
+    }
+
+    /// Allow ChronoGazer's Hub external-name tags in registry mode.
+    pub fn accept_hub_connections(mut self) -> Self {
+        self.accept_hub_connections = true;
+        self
     }
 
     /// The registry passed to [`Self::with_registry`]; `None` for [`Self::new`].
@@ -2405,9 +2490,14 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, BantoError> {
         let mut validated = validate_tag_input(&input, self.rules())?;
-        let placement =
-            validate_tag_kind_placement_tx(connection, self.registry.as_deref(), &input, None)
-                .await?;
+        let placement = validate_tag_kind_placement_tx(
+            connection,
+            self.registry.as_deref(),
+            self.accept_hub_connections,
+            &input,
+            None,
+        )
+        .await?;
         validated.address = placement.address;
         // AssertSqlSafe: insert_tag_sql() は固定の列名・プレースホルダのみで
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
@@ -2553,9 +2643,14 @@ impl TagService {
         input: TagInput,
     ) -> Result<Tag, TagUpdateError> {
         let mut validated = validate_tag_input(&input, self.rules())?;
-        let placement =
-            validate_tag_kind_placement_tx(connection, self.registry.as_deref(), &input, Some(id))
-                .await?;
+        let placement = placement_for_update_tx(
+            connection,
+            self.registry.as_deref(),
+            self.accept_hub_connections,
+            id,
+            &input,
+        )
+        .await?;
         validated.address = placement.address;
         let expected_revision = input.expected_revision;
         let sql = update_tag_sql(expected_revision.is_some());
@@ -2733,11 +2828,12 @@ impl TagService {
             if rules == AddressRules::Registry && validated[index].is_none() {
                 continue;
             }
-            match validate_tag_kind_placement_tx(
+            match placement_for_update_tx(
                 connection,
                 self.registry.as_deref(),
+                self.accept_hub_connections,
+                *id,
                 input,
-                Some(*id),
             )
             .await
             {
@@ -3158,8 +3254,14 @@ impl TagService {
             if rules == AddressRules::Registry && validated[index].is_none() {
                 continue;
             }
-            match validate_tag_kind_placement_tx(connection, self.registry.as_deref(), input, None)
-                .await
+            match validate_tag_kind_placement_tx(
+                connection,
+                self.registry.as_deref(),
+                self.accept_hub_connections,
+                input,
+                None,
+            )
+            .await
             {
                 Ok(placement) => {
                     hub_rows[index] = placement.unique;
@@ -9225,6 +9327,118 @@ mod tests {
             let mut input = tag_at("t", 1, " z ");
             input.tag_kind = "weird".to_string();
             assert_eq!(n("modbus-tcp", &input).unwrap().canonical, "z");
+        }
+
+        #[tokio::test]
+        async fn only_an_explicit_host_can_save_hub_connections_and_external_names() {
+            let (legacy, _, _) = reg_setup().await;
+            let pool = legacy.pool.clone();
+            let drivers = registry();
+            let ordinary = PlcConnectionService::with_registry(pool.clone(), drivers.clone());
+            assert_eq!(
+                field_errors_of(ordinary.create(conn_input("Hub", "hub")).await.unwrap_err())[0]
+                    .field,
+                "protocol"
+            );
+            let connections = ordinary.accept_hub_connections();
+            let hub = connections.create(conn_input("Hub", "hub")).await.unwrap();
+            let mut changed = conn_input("Hub", "hub");
+            changed.enabled = false;
+            assert!(!connections.update(hub.id, changed).await.unwrap().enabled);
+            assert!(
+                connections
+                    .update(hub.id, conn_input("Hub", "hub"))
+                    .await
+                    .unwrap()
+                    .enabled
+            );
+            let mut with_settings = conn_input("Bad Hub", "hub");
+            with_settings.settings = Some(serde_json::json!({ "unexpected": 1 }));
+            assert_eq!(
+                field_errors_of(connections.create(with_settings).await.unwrap_err())[0].field,
+                "settings"
+            );
+            assert_eq!(
+                field_errors_of(
+                    connections
+                        .create(conn_input("Other", "foo"))
+                        .await
+                        .unwrap_err()
+                )[0]
+                .field,
+                "protocol"
+            );
+            let group = CollectionGroupService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections()
+                .create(CollectionGroupInput {
+                    name: "Hub group".to_string(),
+                    plc_connection_id: hub.id,
+                    period_ms: 1_000,
+                    enabled: true,
+                    default_writable: false,
+                    query_sql: None,
+                })
+                .await
+                .unwrap();
+            let ordinary_tags = TagService::with_registry(pool.clone(), drivers.clone());
+            let input = tag_at("Temperature", group.id, " PLC.G.T ");
+            assert_eq!(
+                field_errors_of(ordinary_tags.create(input.clone()).await.unwrap_err())[0].field,
+                "address"
+            );
+            let tags = ordinary_tags.accept_hub_connections();
+            let created = tags.create(input).await.unwrap();
+            assert_eq!(created.address, "PLC.G.T");
+            let updated = tags
+                .update(created.id, tag_at("Temperature", group.id, " PLC.G.U "))
+                .await
+                .unwrap();
+            assert_eq!(updated.address, "PLC.G.U");
+            assert_eq!(
+                field_errors_of(
+                    tags.create(tag_at("Empty", group.id, "  "))
+                        .await
+                        .unwrap_err()
+                )[0]
+                .field,
+                "address"
+            );
+        }
+
+        #[tokio::test]
+        async fn registry_update_can_disable_an_old_invalid_tag_without_reparsing() {
+            let (legacy, registry_tags, group) = reg_setup().await;
+            let created = legacy.create(tag_at("Old", group, "bad!")).await.unwrap();
+            let mut disabled = tag_at("Old", group, "bad!");
+            disabled.enabled = false;
+            assert!(
+                !registry_tags
+                    .update_checked(created.id, disabled.clone())
+                    .await
+                    .unwrap()
+                    .enabled
+            );
+            assert_eq!(
+                field_errors_of(
+                    registry_tags
+                        .update(created.id, tag_at("Old", group, "bad!"))
+                        .await
+                        .unwrap_err()
+                )[0]
+                .field,
+                "address"
+            );
+            disabled.address = "other!".to_string();
+            assert_eq!(
+                field_errors_of(
+                    registry_tags
+                        .update(created.id, disabled)
+                        .await
+                        .unwrap_err()
+                )[0]
+                .field,
+                "address"
+            );
         }
 
         // -- Q2: protocol change and group move re-parse the tags -----------------

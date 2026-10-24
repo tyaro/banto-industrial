@@ -257,11 +257,7 @@ use crate::collect::{
 };
 use crate::hub::{HubService, HubSubscriptionView, HubView};
 use crate::settings::SettingsService;
-use crate::tag_address::{
-    ensure_group_move_keeps_tags_readable, ensure_protocol_change_keeps_tags_readable,
-    ensure_tag_fits_its_connection, ensure_tag_update_fits_its_connection, is_revision_conflict,
-    update_tag_checked, TagPlacement,
-};
+use crate::tag_address::{is_revision_conflict, update_tag_checked};
 use crate::users::{Role, UsersService};
 
 // I2a（2026-10-04）: 領域に依らない REST の口（`/api/auth/{status,setup,
@@ -1311,17 +1307,6 @@ async fn plc_connections_update(
     )
     .await?;
     reject_disallowed_connection_protocol(&input.protocol)?;
-    // #414 段階1: 共通の更新（`update_plc_connection`、#417 の simulation
-    // 保持を含む）の**前に**、プロトコル変更で配下のタグが読めなくならないかを
-    // 確かめる。Tauri の `plc_connections_update_body` も同じ順序。
-    ensure_protocol_change_keeps_tags_readable(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
-        id,
-        &input.protocol,
-    )
-    .await?;
     let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     record_write(
         &state.audit,
@@ -1454,14 +1439,6 @@ async fn collection_groups_update(
         "/api/collection-groups/{id}",
     )
     .await?;
-    ensure_group_move_keeps_tags_readable(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
-        id,
-        input.plc_connection_id,
-    )
-    .await?;
     let updated = state.collection_groups.update(id, input.into()).await?;
     record_write(
         &state.audit,
@@ -1536,14 +1513,6 @@ async fn tags_create(
     )
     .await?;
     input.reject_thresholds()?;
-    ensure_tag_fits_its_connection(
-        &state.plc_connections,
-        &state.collection_groups,
-        input.collection_group_id,
-        &input.address,
-        &input.data_type,
-    )
-    .await?;
     let created = state.tags.create(input.into()).await?;
     record_write(
         &state.audit,
@@ -1615,19 +1584,6 @@ async fn tags_update(
     )
     .await?;
     input.reject_thresholds()?;
-    ensure_tag_update_fits_its_connection(
-        &state.plc_connections,
-        &state.collection_groups,
-        &state.tags,
-        id,
-        TagPlacement {
-            collection_group_id: input.collection_group_id,
-            address: &input.address,
-            data_type: &input.data_type,
-            enabled: input.enabled,
-        },
-    )
-    .await?;
     let updated = update_tag_checked(&state.tags, id, input.into()).await?;
     record_write(
         &state.audit,
@@ -2300,10 +2256,13 @@ mod tests {
     fn tag_registry_services(
         pool: sqlx::SqlitePool,
     ) -> (PlcConnectionService, CollectionGroupService, TagService) {
+        let drivers = crate::engine::EngineConfig::builtin_drivers();
         (
-            PlcConnectionService::new(pool.clone()),
-            CollectionGroupService::new(pool.clone()),
-            TagService::new(pool),
+            PlcConnectionService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            CollectionGroupService::with_registry(pool.clone(), drivers.clone())
+                .accept_hub_connections(),
+            TagService::with_registry(pool, drivers).accept_hub_connections(),
         )
     }
 
@@ -4739,7 +4698,7 @@ mod tests {
             .await,
             "address",
         );
-        assert!(message.contains("Modbus TCP"), "{message}");
+        assert!(message.contains("Modbus"), "{message}");
         let (status, created) = send(
             &router,
             post_json_auth("/api/tags", &editor, tag(modbus_group, "40001")),
@@ -4788,7 +4747,7 @@ mod tests {
             .await,
             "protocol",
         );
-        assert!(message.contains("「tag1」（D100）"), "{message}");
+        assert!(message.contains("「tag1」（D100:"), "{message}");
         // 拒否された変更は保存されていない。
         let (_, conn) = send(
             &router,
@@ -4803,9 +4762,7 @@ mod tests {
     /// 同じプロトコルの接続への移動は通り、存在しない接続は従来どおり
     /// `CollectionGroupService` 自身のエラーになる。
     ///
-    /// 反証: `collection_groups_update` から
-    /// `ensure_group_move_keeps_tags_readable` の呼び出しを消すと、最初の
-    /// 拒否の確認が落ちる。
+    /// 登録簿モードの `CollectionGroupService` が移動先のドライバで再検査する。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn group_update_route_refuses_a_move_that_leaves_tags_unreadable() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
@@ -4884,7 +4841,7 @@ mod tests {
         );
         let message = body["field_errors"][0]["message"].as_str().unwrap();
         assert!(
-            message.contains("「modbus-tag」（40001）") && message.contains("slmp"),
+            message.contains("「modbus-tag」（400001:") && message.contains("slmp"),
             "{message}"
         );
         let (_, current) = send(&router, get_auth(&path, &editor)).await;
@@ -4914,9 +4871,7 @@ mod tests {
     /// 通り、保存され、その後の `build_config` が成功して正常なタグだけが
     /// 収集対象に残る。アドレスを直さずに再有効化すると、引き続き拒否される。
     ///
-    /// 反証: `tags_update` の `ensure_tag_update_fits_its_connection` を
-    /// 無条件の `ensure_tag_fits_its_connection` に戻すと、無効化の更新が
-    /// 拒否されて最初の `assert_eq!` が落ちる。
+    /// 登録簿モードの `TagService` は、読む場所を変えない無効化では再検査しない。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn disabling_a_legacy_bad_tag_is_allowed_and_reenabling_is_refused() {
         let (router, _audit, pool, _admin, editor, _viewer) =
@@ -5124,7 +5079,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "案内した手順が通らない: {moved}");
         assert_eq!(moved["collectionGroupId"], modbus_group, "{moved}");
-        assert_eq!(moved["address"], "40001", "{moved}");
+        assert_eq!(moved["address"], "400001", "{moved}");
 
         // タグを移し終えれば、元の接続のプロトコル変更も通る。
         let (status, body) = send(&router, put_json_auth(&conn_path, &editor, to_modbus)).await;
@@ -5661,7 +5616,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         // R2b-3a-3: 判定は収集の計画と同じドライバの `parse_address`（文言もドライバの）。
-        let expected_message = "Modbus TCP のアドレスとして解釈できません（例: 40001）。\"D3000\" は Modbus の参照番号（例: 40001, 40001.3）として読めません";
+        let expected_message = "このドライバのアドレスとして解釈できません。\"D3000\" は Modbus の参照番号（例: 40001, 40001.3）として読めません";
         assert_eq!(
             body,
             json!([{

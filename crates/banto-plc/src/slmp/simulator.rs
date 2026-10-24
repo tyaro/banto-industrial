@@ -223,7 +223,7 @@ impl Simulator {
     /// Seed a MELSEC string (S1 文字列タグ): Shift-JIS-encode `s`, pad with
     /// 0x00 to exactly `words` word devices (2 bytes each), and lay the bytes
     /// in low-byte-first per word - the storage convention
-    /// `decode.rs::decode_string_value` documents. Panics if `s` cannot be
+    /// used by the driver engine's string decoder. Panics if `s` cannot be
     /// SJIS-encoded or exceeds `2 * words` bytes: that is a mistake in the
     /// *test*, not a condition worth simulating (same stance as
     /// [`Simulator::set_word`] on a bit device).

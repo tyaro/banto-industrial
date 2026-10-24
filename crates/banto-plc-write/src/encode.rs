@@ -273,7 +273,7 @@ pub(crate) fn encode_bit_value(value: TagValue) -> Result<bool, PlcWriteError> {
 /// 文字列タグ): `encoding`-chosen bytes (UTF-8 or Shift-JIS,
 /// [`StringEncoding`]), 0x00-padded to exactly `2 * words` bytes, packed **low
 /// byte first** into each word - the exact inverse of
-/// `banto-plc/src/decode.rs::decode_string_value` (see there for the wire
+/// the string read path in `banto-plc/src/decode.rs` (see there for the wire
 /// evidence from the wrapped `slmp` crate), so a write→read round trip is
 /// byte-for-byte **when the reader decodes with the same encoding** (T20 ①a
 /// keeps the recorder's read path Shift-JIS-only by design -

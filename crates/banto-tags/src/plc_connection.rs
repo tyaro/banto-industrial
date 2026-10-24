@@ -317,8 +317,8 @@ use settings_input::TypedSettings;
 /// tripwire that keeps the two spellings from drifting.
 ///
 /// This is the *registry's* vocabulary, not "what every app accepts": an app
-/// narrows it at its own boundary (ChronoGazer accepts `"modbus-tcp"`/`"slmp"`
-/// only, banto-hub refuses `"hub"`).
+/// narrows it at its own boundary (ChronoGazer accepts registered drivers and
+/// `"hub"`; banto-hub refuses `"hub"`).
 pub const ALLOWED_PROTOCOLS: &[&str] =
     &["modbus-tcp", "slmp", "virtual", "postgres", "hub", "push"];
 
@@ -1416,6 +1416,7 @@ pub struct PlcConnectionService {
     /// `settings` → `registry.get` → `validate_config`）を走らせ、秘密のキーと
     /// `settings_version` をドライバから引く。
     registry: Option<Arc<DriverRegistry>>,
+    accept_hub_connections: bool,
 }
 
 impl PlcConnectionService {
@@ -1426,6 +1427,7 @@ impl PlcConnectionService {
         Self {
             pool,
             registry: None,
+            accept_hub_connections: false,
         }
     }
 
@@ -1438,7 +1440,15 @@ impl PlcConnectionService {
         Self {
             pool,
             registry: Some(registry),
+            accept_hub_connections: false,
         }
+    }
+
+    /// Allow ChronoGazer's built-in Hub connection alongside registered drivers.
+    /// Other unregistered protocols remain rejected.
+    pub fn accept_hub_connections(mut self) -> Self {
+        self.accept_hub_connections = true;
+        self
     }
 
     /// [`Self::with_registry`] で渡されたレジストリ。[`Self::new`] では `None`。
@@ -1488,9 +1498,11 @@ impl PlcConnectionService {
         secret_keys: &[String],
     ) -> Result<(), BantoError> {
         if let Some(registry) = &self.registry {
-            validation(validate_settings_with_registry(
-                registry, protocol, settings,
-            ))?;
+            if !(self.accept_hub_connections && protocol == HUB_PROTOCOL) {
+                validation(validate_settings_with_registry(
+                    registry, protocol, settings,
+                ))?;
+            }
         }
         validation(check_settings_shape(protocol, settings, secret_keys))
     }
@@ -1895,6 +1907,7 @@ impl PlcConnectionService {
                 address_rewrites = reparse_tags(
                     &mut *connection,
                     registry,
+                    self.accept_hub_connections,
                     ReparseScope::Connection(id),
                     input.name.trim(),
                     new_protocol,

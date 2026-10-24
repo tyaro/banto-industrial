@@ -22,12 +22,6 @@ banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # a host without a broker of its own (ChronoGazer). banto-broker depends only on
 # banto-tags / banto-driver-api, so there is no cycle.
 banto-broker = { path = "../banto-broker" }
-# I2: address/type parsing for the legacy save-time rule `check_tag_address`
-# (collection reads go through the broker, not a `PlcClient`). R2b-5c: the
-# in-process wire simulators are no longer started by this crate (simulation
-# connections run in the value layer, `banto_driver_engine::sim`), so the
-# `simulator` feature is a dev-dependency only again.
-banto-plc = { path = "../banto-plc" }
 # I3a: the time-series sink (TsWriter) + its Clock seam + StoreConfig shapes.
 banto-tstore = { path = "../banto-tstore" }
 # build_config surfaces registry read failures as BantoError (the type

@@ -638,7 +638,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await expect(exclusions.getByRole('heading', { name: '除外あり（1 件）' })).toBeVisible();
 		const row = exclusions.getByRole('row').filter({ hasText: LEGACY_TAG_NAME });
 		await expect(row).toContainText('タグ');
-		await expect(row).toContainText('Modbus TCP のアドレスとして解釈できません');
+		await expect(row).toContainText('このドライバのアドレスとして解釈できません');
 		await expect(exclusions.getByRole('link', { name: 'タグ設定' })).toHaveAttribute(
 			'href',
 			'/tags'
@@ -680,7 +680,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 		await expect(marks).toBeVisible();
 		const mark = marks.getByRole('listitem').filter({ hasText: LEGACY_TAG_NAME });
 		await expect(mark).toContainText('タグ');
-		await expect(mark).toContainText('Modbus TCP のアドレスとして解釈できません');
+		await expect(mark).toContainText('このドライバのアドレスとして解釈できません');
 
 		await page.goto('/settings/collect');
 		await expect(statusLine(page)).toHaveText(/^状態: 収集中/);

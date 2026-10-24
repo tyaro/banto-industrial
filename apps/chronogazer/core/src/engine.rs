@@ -894,9 +894,14 @@ impl OpenedEngine {
         let backup = BackupService::new(cfg.db_path.clone(), db.clone());
         // #383 段階2a / R1-B: レジストリ 3 サービス（テーブルは `init_db` が呼ぶ
         // `banto_tags::migrate` で作成済み）。#393: 表示グループ。
-        let plc_connections = PlcConnectionService::new(pool.clone());
-        let collection_groups = CollectionGroupService::new(pool.clone());
-        let tags = TagService::new(pool.clone());
+        let plc_connections =
+            PlcConnectionService::with_registry(pool.clone(), cfg.drivers.clone())
+                .accept_hub_connections();
+        let collection_groups =
+            CollectionGroupService::with_registry(pool.clone(), cfg.drivers.clone())
+                .accept_hub_connections();
+        let tags =
+            TagService::with_registry(pool.clone(), cfg.drivers.clone()).accept_hub_connections();
         let display_groups = DisplayGroupService::new(pool.clone());
 
         // #437（banto ADR-0019）: 監査は保留つき（DB に書けない監査は DB の隣の
