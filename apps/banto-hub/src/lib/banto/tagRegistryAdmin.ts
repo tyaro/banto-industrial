@@ -126,7 +126,15 @@ export const CPU_TYPE_OPTIONS: { value: CpuType; label: string }[] = [
 	{ value: 'Q', label: 'Qシリーズ（Q）' }
 ];
 
-/** Mirrors `banto_tags::PlcConnection`. */
+/**
+ * Mirrors `banto_tags::PlcConnection`.
+ *
+ * **R2b-6b-2（#813）の後、今の REST の形とは合っていない**（REST は
+ * {@link PlcConnectionWire} の `{ id, name, protocol, enabled, simulation, settings }`）。
+ * 接続のフォーム（`ConnectionDrawer.svelte`・`plcConnectionForm.ts`）がまだこの平らな形を
+ * 使うので **6c で {@link PlcConnectionWire} に置き換える**まで残す
+ * （docs/banto-hub-driver-ui-design.md §5・§6）。設定パッケージは 6b-3 で新しい形に移った。
+ */
 export interface PlcConnection {
 	id: number;
 	name: string;
@@ -219,7 +227,11 @@ export function hasWordOrder(conn: Pick<PlcConnection, 'protocol'>): boolean {
 	return conn.protocol === 'modbus-tcp' || conn.protocol === 'slmp';
 }
 
-/** Mirrors `banto_hub_core::rest::PlcConnectionPayload`. */
+/**
+ * 平らな作成・更新の形（R2b-6b-2 より前の `PlcConnectionPayload`）。**今の REST は受けない**
+ * （{@link PlcConnectionWireInput} の形だけ）。フォームが使うので 6c で置き換えるまで残す
+ * （{@link PlcConnection} の doc）。
+ */
 export interface PlcConnectionInput {
 	name: string;
 	protocol: PlcProtocol;
@@ -268,6 +280,95 @@ export interface PlcConnectionInput {
 	 * フォーム（`plcConnectionForm.ts::formToConnectionInput`）は push では常に送る。
 	 */
 	settings?: PushSettingsWire;
+}
+
+/**
+ * R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 応答の `settings` の秘密のキーの値
+ * （`{"$secret": "set" | "unreadable"}`）。値・参照は返らない。値が無い秘密のキーは
+ * `settings` に載らない - mirrors `banto_hub_core::rest::PlcConnectionResponse`。
+ */
+export type SecretStateWire = { $secret: 'set' | 'unreadable' };
+
+/** `value` が応答の秘密のキーの値（{@link SecretStateWire}）か。 */
+export function isSecretStateWire(value: unknown): value is SecretStateWire {
+	if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+	const keys = Object.keys(value);
+	return keys.length === 1 && keys[0] === '$secret';
+}
+
+/**
+ * R2b-6b: `/api/plc-connections` の読み取りの形 - mirrors
+ * `banto_hub_core::rest::PlcConnectionResponse`。`settings` の中はドライバ・ホストの接続の
+ * JSON のまま（snake_case のキー。`modbus-tcp` は `host`・`port`・`unit_id`・`word_order`、
+ * `postgres` は `host`・`port`・`database`・`username` と秘密の `password`、`push` は
+ * R2a の `settings`）。外側の camelCase と一律に変換しない。
+ *
+ * 6c で {@link PlcConnection} を置き換える（それまでは別名で並べる）。
+ */
+export interface PlcConnectionWire {
+	id: number;
+	name: string;
+	/** ドライバの id（`GET /api/drivers` の `id`）またはホストの接続（`postgres`・`push`・`virtual`）。 */
+	protocol: string;
+	enabled: boolean;
+	simulation: boolean;
+	settings: Record<string, unknown>;
+}
+
+/**
+ * R2b-6b: 作成・更新の形 - mirrors `banto_hub_core::rest::PlcConnectionPayload`
+ * （`deny_unknown_fields`）。**`settings` は丸ごと置き換え**（更新で省いた欄はスキーマの
+ * 既定値）。秘密のキーだけ tri-state: 省略 = 保存済みを保つ、`null`・空文字 = 消す、
+ * それ以外の文字列 = 置き換え。
+ */
+export interface PlcConnectionWireInput {
+	name: string;
+	protocol: string;
+	enabled: boolean;
+	simulation: boolean;
+	settings: Record<string, unknown>;
+}
+
+/**
+ * R2b-6b（設計 §4.1）: `GET /api/drivers` の `settingsSchema.fields` の 1 つ。**中は
+ * `banto-driver-api` の serde の形のまま**（`kind` は `{"type": "integer", "min", "max"}` の
+ * ようなタグつきで、`max_len` などは snake_case）- mirrors `banto_driver_api::SettingField`。
+ */
+export interface DriverSettingField {
+	key: string;
+	label: string;
+	help: string | null;
+	kind: DriverFieldKind;
+	required: boolean;
+	default: string | number | boolean | null;
+	group: 'basic' | 'advanced';
+}
+
+/** mirrors `banto_driver_api::FieldKind`（`serde(tag = "type", rename_all = "snake_case")`）。 */
+export type DriverFieldKind =
+	| { type: 'text'; max_len: number | null; placeholder: string | null }
+	| { type: 'host' }
+	| { type: 'integer'; min: number | null; max: number | null }
+	| { type: 'choice'; options: { value: string; label: string }[] }
+	| { type: 'bool' }
+	| { type: 'secret' };
+
+/**
+ * R2b-6b: `GET /api/drivers` の 1 行（機器のドライバだけ。ホストの接続は載らない）-
+ * mirrors `banto_hub_core::rest::drivers::DriverListItem`。外側は camelCase。
+ */
+export interface DriverInfo {
+	id: string;
+	displayName: string;
+	vendor: string | null;
+	version: string;
+	capabilities: { read: boolean; write: boolean };
+	transports: string[];
+	settingsSchema: { fields: DriverSettingField[] };
+	/** `"u16"`・`"string"` などの文字列（`banto_driver_api::KindName`）。 */
+	supportedKinds: string[];
+	addressHelp: string;
+	kind: 'frame' | 'session';
 }
 
 /**
@@ -737,19 +838,53 @@ function isQueuedWhileRunningBody(
 
 // --- PLC connections --------------------------------------------------------
 
+/** 平らな形の一覧（{@link PlcConnection} の doc。6c で {@link listPlcConnectionsWire} に置き換える）。 */
 export async function listPlcConnections(): Promise<PlcConnection[]> {
 	return httpRequest<PlcConnection[]>('/api/plc-connections', { method: 'GET' });
 }
 
+/** 平らな形の作成（今の REST は受けない。6c で {@link createPlcConnectionWire} に置き換える）。 */
 export async function createPlcConnection(input: PlcConnectionInput): Promise<PlcConnection> {
 	return httpRequest<PlcConnection>('/api/plc-connections', { method: 'POST', body: input });
 }
 
+/** 平らな形の更新（今の REST は受けない。6c で {@link updatePlcConnectionWire} に置き換える）。 */
 export async function updatePlcConnection(
 	id: number,
 	input: PlcConnectionInput
 ): Promise<PlcConnection> {
 	return httpRequest<PlcConnection>(`/api/plc-connections/${id}`, { method: 'PUT', body: input });
+}
+
+/** R2b-6b: 新しい形の一覧（{@link PlcConnectionWire}）。 */
+export async function listPlcConnectionsWire(): Promise<PlcConnectionWire[]> {
+	return httpRequest<PlcConnectionWire[]>('/api/plc-connections', { method: 'GET' });
+}
+
+/** R2b-6b: 新しい形の作成（{@link PlcConnectionWireInput}）。 */
+export async function createPlcConnectionWire(
+	input: PlcConnectionWireInput
+): Promise<PlcConnectionWire> {
+	return httpRequest<PlcConnectionWire>('/api/plc-connections', { method: 'POST', body: input });
+}
+
+/**
+ * R2b-6b: 新しい形の更新。`settings` は丸ごと置き換え、秘密のキーを送らなければ保存済みを
+ * 保つ（{@link PlcConnectionWireInput}）。
+ */
+export async function updatePlcConnectionWire(
+	id: number,
+	input: PlcConnectionWireInput
+): Promise<PlcConnectionWire> {
+	return httpRequest<PlcConnectionWire>(`/api/plc-connections/${id}`, {
+		method: 'PUT',
+		body: input
+	});
+}
+
+/** R2b-6b（設計 §4.1）: `GET /api/drivers`（{@link DriverInfo}）。 */
+export async function listDrivers(): Promise<DriverInfo[]> {
+	return httpRequest<DriverInfo[]>('/api/drivers', { method: 'GET' });
 }
 
 export async function deletePlcConnection(id: number): Promise<void> {

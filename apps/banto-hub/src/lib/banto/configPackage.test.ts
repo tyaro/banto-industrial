@@ -5,67 +5,67 @@ import {
 	CONFIG_PACKAGE_SCHEMA_VERSION,
 	INGEST_KEYS_NOT_MIGRATED_MESSAGE,
 	buildConfigPackage,
+	checkConfigPackageConnectionFields,
 	parseConfigPackage,
 	planByKey,
 	planByName,
 	resolvePushSettings,
 	serializeConfigPackage,
-	type ConfigPackage
+	type ConfigPackage,
+	type ConfigPackagePushSettings
 } from './configPackage';
-import type { CollectionGroup, PlcConnection, Tag } from './tagRegistryAdmin';
+import type { CollectionGroup, PlcConnectionWire, Tag } from './tagRegistryAdmin';
+import { TEST_DRIVERS } from './configPackageTestDrivers';
 import type { GrpcSettings } from './grpcSettingsAdmin';
 import type { MqttSettings } from './mqttSettingsAdmin';
 import type { SinkGroup } from './sinkGroupsAdmin';
 
-const BASE_CONNECTION: PlcConnection = {
+// 版 3（R2b-6b-3）: 接続は REST の新しい形（`PlcConnectionWire`）。`settings` の中は
+// ドライバの JSON のまま（snake_case）。
+const BASE_CONNECTION: PlcConnectionWire = {
 	id: 1,
 	name: 'line-a',
 	protocol: 'modbus-tcp',
-	host: '127.0.0.1',
-	port: 502,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	settings: { host: '127.0.0.1', port: 502, unit_id: 1, word_order: 'low_high' }
 };
 
-const VIRTUAL_CONNECTION: PlcConnection = {
+const VIRTUAL_CONNECTION: PlcConnectionWire = {
 	id: 2,
 	name: 'calc',
 	protocol: 'virtual',
-	host: '',
-	port: 0,
-	unitId: 0,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: null,
-	username: null,
-	passwordSet: false
+	settings: {}
 };
 
 // S1（docs/banto-hub-external-db-design.md §4.1・§2.2）: postgres（DB
-// Source）接続のフィクスチャ - `passwordSet: true`（保存済みパスワードあり）
+// Source）接続のフィクスチャ - 保存済みパスワードあり（`{"$secret": "set"}`）
 // でも export には一切パスワードが乗らないことを確認する用。
-const DB_CONNECTION: PlcConnection = {
+const DB_CONNECTION: PlcConnectionWire = {
 	id: 3,
 	name: 'pg-a',
 	protocol: 'postgres',
-	host: '10.0.0.5',
-	port: 5432,
-	unitId: 1,
 	enabled: true,
 	simulation: false,
-	wordOrder: 'low_high',
-	cpuType: 'R',
-	database: 'appdb',
-	username: 'appuser',
-	passwordSet: true
+	settings: {
+		host: '10.0.0.5',
+		port: 5432,
+		database: 'appdb',
+		username: 'appuser',
+		password: { $secret: 'set' }
+	}
+};
+
+// SLMP（Q シリーズ）の接続。
+const SLMP_CONNECTION: PlcConnectionWire = {
+	id: 5,
+	name: 'line-q',
+	protocol: 'slmp',
+	enabled: true,
+	simulation: true,
+	settings: { host: '192.168.11.10', port: 3100, cpu_type: 'Q', word_order: 'high_low' }
 };
 
 const BASE_GROUP: CollectionGroup = {
@@ -199,13 +199,9 @@ describe('configPackage', () => {
 			{
 				name: 'line-a',
 				protocol: 'modbus-tcp',
-				host: '127.0.0.1',
-				port: 502,
-				unitId: 1,
 				enabled: true,
 				simulation: false,
-				wordOrder: 'low_high',
-				cpuType: 'R'
+				settings: { host: '127.0.0.1', port: 502, unit_id: 1, word_order: 'low_high' }
 			}
 		]);
 		expect(pkg.collectionGroups).toEqual([
@@ -308,7 +304,7 @@ describe('configPackage', () => {
 	});
 
 	it('parseConfigPackage は不正な schemaVersion を拒否する', () => {
-		const text = JSON.stringify({ ...makePackage(), schemaVersion: 3 }, null, 2);
+		const text = JSON.stringify({ ...makePackage(), schemaVersion: 4 }, null, 2);
 		expect(() => parseConfigPackage(text)).toThrow(/schemaVersion/);
 	});
 
@@ -323,102 +319,98 @@ describe('configPackage', () => {
 			tags: pkg.tags.map(({ plcConnectionName: _c, ...rest }) => rest)
 		};
 		expect(() => parseConfigPackage(JSON.stringify(v1))).toThrow(
-			/schemaVersion 1 は未対応です（期待値: 2）。古い版の構成パッケージは読み込めません/
+			/schemaVersion 1 は未対応です（期待値: 3）。古い版の構成パッケージは読み込めません/
 		);
 	});
 
-	// --- 版 2（2026-10-20 オーナー決定）: 版 1 の間に足した項目（wordOrder・cpuType・
-	// defaultWritable・stringEncoding・sinkGroups）は必須。欠けたパッケージは
-	// 項目の場所を示して断り、既定値で黙って埋めない。
-
-	it('parseConfigPackage は wordOrder を持たない接続を、項目の場所を示して拒否する', () => {
-		const pkg = makePackage();
-		const withoutWordOrder = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map(({ wordOrder: _wordOrder, ...rest }) => rest)
+	// 版 3（R2b-6b-3、2026-10-24）: 版 2（接続が平らな形）も読まない。
+	it('parseConfigPackage は版 2 のパッケージ（平らな接続）を未対応の版として拒否する', () => {
+		const v2 = {
+			...makePackage(),
+			schemaVersion: 2,
+			plcConnections: [
+				{
+					name: 'line-a',
+					protocol: 'modbus-tcp',
+					host: '127.0.0.1',
+					port: 502,
+					unitId: 1,
+					enabled: true,
+					simulation: false,
+					wordOrder: 'low_high',
+					cpuType: 'R'
+				}
+			]
 		};
-		expect(() => parseConfigPackage(JSON.stringify(withoutWordOrder))).toThrow(
-			/plcConnections\[0\]\.wordOrder は low_high \/ high_low/
+		expect(() => parseConfigPackage(JSON.stringify(v2))).toThrow(
+			/schemaVersion 2 は未対応です（期待値: 3）。古い版の構成パッケージは読み込めません。今の banto-hub で書き出し直してください/
 		);
 	});
 
-	it('parseConfigPackage は不正な wordOrder を拒否する', () => {
-		const pkg = makePackage();
-		const withBadWordOrder = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map((c) => ({ ...c, wordOrder: 'middle_endian' }))
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withBadWordOrder))).toThrow(/wordOrder/);
+	// --- 版 3: 接続は `{ name, protocol, enabled, simulation, settings }`。
+
+	it('版 3: SLMP 接続の cpu_type（Q）・word_order・simulation を settings のまま往復する', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [SLMP_CONNECTION],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-24T00:00:00.000Z'
+		});
+		expect(pkg.plcConnections).toEqual([
+			{
+				name: 'line-q',
+				protocol: 'slmp',
+				enabled: true,
+				simulation: true,
+				settings: { host: '192.168.11.10', port: 3100, cpu_type: 'Q', word_order: 'high_low' }
+			}
+		]);
+		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
+		expect(parsed).toEqual(pkg);
+		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 
-	// #605 + 版 2: cpuType は必須（省略・null は拒否。R を入れて既存の Q 接続を
-	// 戻してしまうことがない）。明示した Q は往復する。未知の値も拒否する。
-	it('parseConfigPackage は cpuType を持たない接続を、項目の場所を示して拒否する', () => {
-		const pkg = makePackage();
-		const withoutCpu = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map(({ cpuType: _cpuType, ...rest }) => rest)
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withoutCpu))).toThrow(
-			/plcConnections\[0\]\.cpuType は Q \/ R/
-		);
-		const withNullCpu = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map((c) => ({ ...c, cpuType: null }))
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withNullCpu))).toThrow(/cpuType/);
-	});
-
-	it('buildConfigPackage/parseConfigPackage は SLMP 接続の cpuType Q を往復する', () => {
-		const qSeries: PlcConnection = {
+	it('版 3: Modbus 接続の unit_id・word_order（high_low）を往復する', () => {
+		const modbus: PlcConnectionWire = {
 			...BASE_CONNECTION,
-			protocol: 'slmp',
-			port: 5007,
-			cpuType: 'Q'
+			settings: { host: '10.0.0.9', port: 1502, unit_id: 7, word_order: 'high_low' }
 		};
 		const pkg = buildConfigPackage({
-			plcConnections: [qSeries],
+			plcConnections: [modbus],
 			collectionGroups: [],
 			tags: [],
 			mqtt: MQTT,
 			grpc: GRPC,
-			exportedAt: '2026-10-14T00:00:00.000Z'
+			exportedAt: '2026-10-24T00:00:00.000Z'
 		});
-		expect(pkg.plcConnections[0].cpuType).toBe('Q');
 		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
-		expect(parsed.plcConnections[0].cpuType).toBe('Q');
+		expect(parsed.plcConnections[0].settings).toEqual({
+			host: '10.0.0.9',
+			port: 1502,
+			unit_id: 7,
+			word_order: 'high_low'
+		});
+		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 
-	it('parseConfigPackage は不正な cpuType を拒否する', () => {
-		const pkg = makePackage();
-		const withBadCpu = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map((c) => ({ ...c, cpuType: 'L' }))
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withBadCpu))).toThrow(/cpuType/);
+	it('版 3: settings が無い・オブジェクトでない接続は、項目の場所を示して拒否する', () => {
+		const raw = JSON.parse(serializeConfigPackage(makePackage()));
+		delete raw.plcConnections[0].settings;
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/plcConnections\[0\]\.settings はオブジェクトである必要があります/
+		);
+		raw.plcConnections[0].settings = [];
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(/plcConnections\[0\]\.settings/);
 	});
 
-	// --- 2026-09-08 オーナー決定（issue #325 の修正）: modbus-tcp 接続の
-	// wordOrder（既定が high_low に変わった）が export/import で正しく
-	// 往復すること。以前は UI が modbus-tcp でこのフィールドを一切編集させず
-	// 常に列の初期値 'low_high' が保存されていたため、この経路は事実上
-	// 'low_high' しか通っていなかった - 'high_low' を明示的に持つ modbus-tcp
-	// 接続が壊れずに往復することを固定する。
-
-	it('buildConfigPackage/parseConfigPackage は modbus-tcp 接続の wordOrder（high_low）を正しく往復する', () => {
-		const modbusHighLow: PlcConnection = { ...BASE_CONNECTION, wordOrder: 'high_low' };
-		const pkg = buildConfigPackage({
-			plcConnections: [modbusHighLow],
-			collectionGroups: [],
-			tags: [],
-			mqtt: MQTT,
-			grpc: GRPC,
-			exportedAt: '2026-08-11T00:00:00.000Z'
-		});
-		expect(pkg.plcConnections[0].wordOrder).toBe('high_low');
-
-		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
-		expect(parsed.plcConnections[0].wordOrder).toBe('high_low');
+	it('版 3: settings に秘密の値（$secret）を持つ接続は拒否する（黙って捨てない）', () => {
+		const raw = JSON.parse(serializeConfigPackage(makePackage()));
+		raw.plcConnections[0].settings.token = { $secret: 'set' };
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/plcConnections\[0\]\.settings\.token は秘密の値です/
+		);
 	});
 
 	// --- T19 S1-b（UX-34）+ 版 2: defaultWritable は必須。
@@ -498,7 +490,7 @@ describe('configPackage', () => {
 		const pkg = makePackage();
 		const text = serializeConfigPackage(pkg);
 		expect(text).not.toContain('threshold');
-		expect(CONFIG_PACKAGE_SCHEMA_VERSION).toBe(2);
+		expect(CONFIG_PACKAGE_SCHEMA_VERSION).toBe(3);
 	});
 
 	it('#533: parseConfigPackage は しきい値が null の旧パッケージを受け入れ、しきい値を持ち込まない', () => {
@@ -529,13 +521,11 @@ describe('configPackage', () => {
 		);
 	});
 
-	// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）:
-	// postgres（DB Source）接続は database/username を export に含むが、
-	// パスワードは絶対に含まない - `CONFIG_PACKAGE_EXCLUDED_SECRETS`に
-	// `'plc_connections.password'`が追加されていること、実際に`password`
-	// キーが export の JSON に一切現れないことの両方を固定する。
+	// --- S1（docs/banto-hub-external-db-design.md §4.1・§2.2、実装指示5）+ 版 3:
+	// postgres（DB Source）接続は settings の host/port/database/username を export に
+	// 含むが、パスワード（応答の `{"$secret": …}`）は絶対に含まない。
 
-	it('S1: buildConfigPackage は postgres 接続の database/username を含み、password は一切含まない', () => {
+	it('S1: buildConfigPackage は postgres 接続の settings を含み、password は一切含まない', () => {
 		const pkg = buildConfigPackage({
 			plcConnections: [BASE_CONNECTION, DB_CONNECTION],
 			collectionGroups: [BASE_GROUP],
@@ -548,30 +538,35 @@ describe('configPackage', () => {
 		expect(exported).toEqual({
 			name: 'pg-a',
 			protocol: 'postgres',
-			host: '10.0.0.5',
-			port: 5432,
-			unitId: 1,
 			enabled: true,
 			simulation: false,
-			wordOrder: 'low_high',
-			cpuType: 'R',
-			database: 'appdb',
-			username: 'appuser'
+			settings: { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' }
 		});
-		expect(exported).not.toHaveProperty('password');
-		expect(exported).not.toHaveProperty('passwordSet');
 		// シリアライズした JSON テキストの plcConnections 部分自体にも
-		// "password" という文字列が一切現れないことを固定する
-		// （フィールド名の綴りミスでうっかり別の場所から漏れる、といった
-		// 事故の防止線）。`excludedSecrets`（'plc_connections.password' /
-		// 'mqtt.password'という文字列そのもの）はこの一致対象から除く -
-		// あちらは「除外した」ことの宣言であって漏洩ではない。
+		// "password"・"$secret" という文字列が一切現れないことを固定する
+		// （`excludedSecrets` は「除外した」ことの宣言であって漏洩ではないので除く）。
 		const plcConnectionsJson = JSON.stringify(pkg.plcConnections);
 		expect(plcConnectionsJson).not.toMatch(/password/i);
+		expect(plcConnectionsJson).not.toContain('$secret');
 	});
 
-	it('S1: CONFIG_PACKAGE_EXCLUDED_SECRETS は plc_connections.password を含む', () => {
-		expect(CONFIG_PACKAGE_EXCLUDED_SECRETS).toContain('plc_connections.password');
+	it('S1: 読めない秘密値（unreadable）も書き出さない', () => {
+		const unreadable: PlcConnectionWire = {
+			...DB_CONNECTION,
+			settings: { ...DB_CONNECTION.settings, password: { $secret: 'unreadable' } }
+		};
+		const pkg = buildConfigPackage({
+			plcConnections: [unreadable],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC
+		});
+		expect(pkg.plcConnections[0].settings).not.toHaveProperty('password');
+	});
+
+	it('S1: CONFIG_PACKAGE_EXCLUDED_SECRETS は接続の秘密のキーを含む', () => {
+		expect(CONFIG_PACKAGE_EXCLUDED_SECRETS).toContain('plc_connections.settings.$secret');
 	});
 
 	it('S1: postgres 接続を含むパッケージは serializeConfigPackage/parseConfigPackage で往復できる（password 抜きのまま）', () => {
@@ -587,29 +582,9 @@ describe('configPackage', () => {
 		expect(parsed).toEqual(original);
 		expect(parsed.plcConnections[0]).toMatchObject({
 			protocol: 'postgres',
-			database: 'appdb',
-			username: 'appuser'
+			settings: { database: 'appdb', username: 'appuser' }
 		});
-	});
-
-	it('S1: parseConfigPackage は database/username を持たない旧パッケージ（非postgres接続のみ）を受け入れる', () => {
-		const pkg = makePackage();
-		const withoutDbFields = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map(
-				({ database: _database, username: _username, ...rest }) => rest
-			)
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withoutDbFields))).not.toThrow();
-	});
-
-	it('S1: parseConfigPackage は不正な protocol（postgres 追加後の許容値外）を拒否する', () => {
-		const pkg = makePackage();
-		const withBadProtocol = {
-			...pkg,
-			plcConnections: pkg.plcConnections.map((c) => ({ ...c, protocol: 'mysql' }))
-		};
-		expect(() => parseConfigPackage(JSON.stringify(withBadProtocol))).toThrow(/protocol/);
+		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 
 	// --- S3（docs/banto-hub-external-db-design.md §7 row S3）: 収集グループの
@@ -813,7 +788,12 @@ describe('configPackage', () => {
 
 	// --- 版 2（2026-10-19 オーナー決定: グループ名は接続内で一意）----------------
 
-	const LINE_B: PlcConnection = { ...BASE_CONNECTION, id: 4, name: 'line-b', port: 503 };
+	const LINE_B: PlcConnectionWire = {
+		...BASE_CONNECTION,
+		id: 4,
+		name: 'line-b',
+		settings: { ...BASE_CONNECTION.settings, port: 503 }
+	};
 	const GROUP_A_ON_B: CollectionGroup = { ...BASE_GROUP, id: 13, plcConnectionId: LINE_B.id };
 	const TAG_A_ON_B: Tag = { ...BASE_TAG, id: 103, collectionGroupId: GROUP_A_ON_B.id };
 
@@ -927,13 +907,12 @@ describe('configPackage', () => {
 
 // R2a-2e（docs/banto-hub-ingest-design.md §3.1・§5.1）: push 接続の `settings`
 // の往復。ブリッジの読む DB は id ではなく接続名（`dbConnectionName`）で持ち運ぶ。
-const PUSH_BRIDGE_CONNECTION: PlcConnection = {
-	...BASE_CONNECTION,
+const PUSH_BRIDGE_CONNECTION: PlcConnectionWire = {
 	id: 12,
 	name: 'Bridge1',
 	protocol: 'push',
-	host: '',
-	port: 0,
+	enabled: true,
+	simulation: false,
 	settings: {
 		stale_timeout_ms: 5000,
 		bridge: {
@@ -954,15 +933,19 @@ const PUSH_BRIDGE_CONNECTION: PlcConnection = {
 	}
 };
 
-const PUSH_PLAIN_CONNECTION: PlcConnection = {
-	...BASE_CONNECTION,
+// 版 3: 既定のままの push 接続の settings は `{}`（REST の応答）。
+const PUSH_PLAIN_CONNECTION: PlcConnectionWire = {
 	id: 13,
 	name: 'Script1',
 	protocol: 'push',
-	host: '',
-	port: 0,
-	settings: null
+	enabled: true,
+	simulation: false,
+	settings: {}
 };
+
+function pushSettingsOf(pkg: ConfigPackage, name: string): ConfigPackagePushSettings {
+	return pkg.plcConnections.find((c) => c.name === name)!.settings as ConfigPackagePushSettings;
+}
 
 function makePushPackage(): ConfigPackage {
 	return buildConfigPackage({
@@ -1000,9 +983,16 @@ describe('configPackage: R2a-2e push 接続の settings（dbConnectionName）', 
 		});
 		expect(JSON.stringify(bridge)).not.toContain('db_connection_id');
 		expect(pkg.plcConnections.find((c) => c.name === 'Script1')?.settings).toEqual({});
-		// push 以外の接続は settings を書かない。
-		expect('settings' in pkg.plcConnections.find((c) => c.name === 'pg-a')!).toBe(false);
-		expect('settings' in pkg.plcConnections.find((c) => c.name === 'line-a')!).toBe(false);
+		// 版 3: push 以外の接続も settings を書く（秘密のキーは落とす）。
+		expect(pkg.plcConnections.find((c) => c.name === 'pg-a')!.settings).toEqual({
+			host: '10.0.0.5',
+			port: 5432,
+			database: 'appdb',
+			username: 'appuser'
+		});
+		expect(pkg.plcConnections.find((c) => c.name === 'line-a')!.settings).toEqual(
+			BASE_CONNECTION.settings
+		);
 		// API キーは持ち運ばない（項目そのものが無い）。
 		expect(serializeConfigPackage(pkg)).not.toContain('ingest:#');
 	});
@@ -1014,7 +1004,7 @@ describe('configPackage: R2a-2e push 接続の settings（dbConnectionName）', 
 
 	it('取り込み先の id に付け直す（resolvePushSettings）。名前を引けなければ null', () => {
 		const pkg = makePushPackage();
-		const settings = pkg.plcConnections.find((c) => c.name === 'Bridge1')!.settings!;
+		const settings = pushSettingsOf(pkg, 'Bridge1');
 		const resolved = resolvePushSettings(settings, (name) => (name === 'pg-a' ? 77 : undefined));
 		expect(resolved?.bridge?.db_connection_id).toBe(77);
 		expect(resolved?.stale_timeout_ms).toBe(5000);
@@ -1044,16 +1034,12 @@ describe('configPackage: R2a-2e push 接続の settings（dbConnectionName）', 
 			/settings\.bridge\.dbConnectionName.*pg-a/
 		);
 		const notPg = structuredClone(pkg);
-		notPg.plcConnections.find((c) => c.name === 'Bridge1')!.settings!.bridge!.dbConnectionName =
-			'line-a';
+		pushSettingsOf(notPg, 'Bridge1').bridge!.dbConnectionName = 'line-a';
 		expect(() => parseConfigPackage(serializeConfigPackage(notPg))).toThrow(/postgres/);
 	});
 
-	it('parseConfigPackage は push 以外の settings と、形の崩れた settings を断る', () => {
+	it('parseConfigPackage は形の崩れた push の settings を断る', () => {
 		const pkg = makePushPackage();
-		const onModbus = JSON.parse(serializeConfigPackage(pkg));
-		onModbus.plcConnections.find((c: { name: string }) => c.name === 'line-a').settings = {};
-		expect(() => parseConfigPackage(JSON.stringify(onModbus))).toThrow(/push 接続でだけ/);
 		const badKind = JSON.parse(serializeConfigPackage(pkg));
 		badKind.plcConnections.find(
 			(c: { name: string }) => c.name === 'Bridge1'
@@ -1065,16 +1051,185 @@ describe('configPackage: R2a-2e push 接続の settings（dbConnectionName）', 
 		expect(() => parseConfigPackage(JSON.stringify(noColumns))).toThrow(/columns/);
 	});
 
-	it('settings を持たない push 接続（手で書いたパッケージ）は既定（{}）として読む', () => {
+	it('版 3: settings を持たない push 接続（手で書いたパッケージ）は既定で埋めずに断る', () => {
 		const raw = JSON.parse(serializeConfigPackage(makePushPackage()));
 		delete raw.plcConnections.find((c: { name: string }) => c.name === 'Script1').settings;
-		expect(
-			parseConfigPackage(JSON.stringify(raw)).plcConnections.find((c) => c.name === 'Script1')
-				?.settings
-		).toEqual({});
+		expect(() => parseConfigPackage(JSON.stringify(raw))).toThrow(
+			/plcConnections\[1\]\.settings はオブジェクトである必要があります/
+		);
+	});
+
+	it('版 3: 往復した push のパッケージは欄の確かめも通る（push の欄はどれも任意）', () => {
+		const parsed = parseConfigPackage(serializeConfigPackage(makePushPackage()));
+		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 
 	it('案内の見出しは「取り込みのキーは移りません」', () => {
 		expect(INGEST_KEYS_NOT_MIGRATED_MESSAGE).toBe('取り込みのキーは移りません');
+	});
+});
+
+// 版 3（R2b-6b-3、設計 §7.1 の表の最後の行）: 欠けた欄は既定で埋めずに断る。欄はドライバの
+// スキーマ（`GET /api/drivers`、ここでは `TEST_DRIVERS`）とホストの接続の表で決める。
+describe('configPackage: checkConfigPackageConnectionFields（欠けた欄の断り）', () => {
+	function pkgWith(...connections: ConfigPackage['plcConnections']): ConfigPackage {
+		return { ...makePackage(), plcConnections: connections };
+	}
+	const modbus = (settings: Record<string, unknown>) => ({
+		name: 'line-a',
+		protocol: 'modbus-tcp',
+		enabled: true,
+		simulation: false,
+		settings
+	});
+	const FULL_MODBUS = { host: '127.0.0.1', port: 502, unit_id: 1, word_order: 'high_low' };
+
+	it('必須で既定の無い欄（host）の欠けは断る', () => {
+		const { host: _host, ...rest } = FULL_MODBUS;
+		expect(() => checkConfigPackageConnectionFields(pkgWith(modbus(rest)), TEST_DRIVERS)).toThrow(
+			/plcConnections\[0\]\.settings\.host がありません（接続 'line-a'。既定値では埋めません/
+		);
+	});
+
+	it('必須で既定つきの欄（port）の欠け・null は断る', () => {
+		const { port: _port, ...rest } = FULL_MODBUS;
+		expect(() => checkConfigPackageConnectionFields(pkgWith(modbus(rest)), TEST_DRIVERS)).toThrow(
+			/settings\.port がありません/
+		);
+		expect(() =>
+			checkConfigPackageConnectionFields(
+				pkgWith(modbus({ ...FULL_MODBUS, port: null })),
+				TEST_DRIVERS
+			)
+		).toThrow(/settings\.port がありません/);
+	});
+
+	it('任意で既定つきの欄（unit_id・word_order・SLMP の cpu_type）の欠けも断る', () => {
+		const { unit_id: _unit, ...noUnit } = FULL_MODBUS;
+		expect(() => checkConfigPackageConnectionFields(pkgWith(modbus(noUnit)), TEST_DRIVERS)).toThrow(
+			/settings\.unit_id がありません/
+		);
+		const { word_order: _order, ...noOrder } = FULL_MODBUS;
+		expect(() =>
+			checkConfigPackageConnectionFields(pkgWith(modbus(noOrder)), TEST_DRIVERS)
+		).toThrow(/settings\.word_order がありません/);
+		const slmp = {
+			name: 'line-q',
+			protocol: 'slmp',
+			enabled: true,
+			simulation: false,
+			settings: { host: '192.168.11.10', port: 3100, word_order: 'low_high' }
+		};
+		expect(() => checkConfigPackageConnectionFields(pkgWith(slmp), TEST_DRIVERS)).toThrow(
+			/settings\.cpu_type がありません/
+		);
+	});
+
+	it('Secret の欄（必須でも）と既定の無い任意の欄の欠けは通る', () => {
+		const fake = {
+			name: 'fake',
+			protocol: 'fake-secret',
+			enabled: true,
+			simulation: false,
+			settings: { host: 'h' }
+		};
+		expect(() => checkConfigPackageConnectionFields(pkgWith(fake), TEST_DRIVERS)).not.toThrow();
+	});
+
+	it('Secret の欄に値があれば断る（パッケージは秘密値を持たない）', () => {
+		const fake = {
+			name: 'fake',
+			protocol: 'fake-secret',
+			enabled: true,
+			simulation: false,
+			settings: { host: 'h', token: 'plain' }
+		};
+		expect(() => checkConfigPackageConnectionFields(pkgWith(fake), TEST_DRIVERS)).toThrow(
+			/settings\.token は秘密の欄です/
+		);
+	});
+
+	it('Secret の欄は null・空文字でも断る（REST は消す指示と読むので値でなくキーの有無で見る）', () => {
+		for (const value of [null, '', 'x']) {
+			const fake = {
+				name: 'fake',
+				protocol: 'fake-secret',
+				enabled: true,
+				simulation: false,
+				settings: { host: 'h', token: value }
+			};
+			expect(() => checkConfigPackageConnectionFields(pkgWith(fake), TEST_DRIVERS)).toThrow(
+				/settings\.token は秘密の欄です/
+			);
+		}
+		const pg = {
+			name: 'pg-a',
+			protocol: 'postgres',
+			enabled: true,
+			simulation: false,
+			settings: { host: 'h', port: 5432, database: 'd', username: 'u', password: null }
+		};
+		expect(() => checkConfigPackageConnectionFields(pkgWith(pg), TEST_DRIVERS)).toThrow(
+			/settings\.password は秘密の欄です/
+		);
+	});
+
+	it('postgres: host・port・database・username の欠けは断り、password の欠けは通り、値があれば断る', () => {
+		const pg = (settings: Record<string, unknown>) => ({
+			name: 'pg-a',
+			protocol: 'postgres',
+			enabled: true,
+			simulation: false,
+			settings
+		});
+		const full = { host: '10.0.0.5', port: 5432, database: 'appdb', username: 'appuser' };
+		expect(() => checkConfigPackageConnectionFields(pkgWith(pg(full)), TEST_DRIVERS)).not.toThrow();
+		for (const key of ['host', 'port', 'database', 'username']) {
+			const rest: Record<string, unknown> = { ...full };
+			delete rest[key];
+			expect(() => checkConfigPackageConnectionFields(pkgWith(pg(rest)), TEST_DRIVERS)).toThrow(
+				new RegExp(`settings\\.${key} がありません`)
+			);
+		}
+		expect(() =>
+			checkConfigPackageConnectionFields(pkgWith(pg({ ...full, password: 'x' })), TEST_DRIVERS)
+		).toThrow(/settings\.password は秘密の欄です/);
+	});
+
+	it('この Hub に無いプロトコルは断り、virtual は見ない', () => {
+		const unknown = { ...modbus(FULL_MODBUS), protocol: 'mysql' };
+		expect(() => checkConfigPackageConnectionFields(pkgWith(unknown), TEST_DRIVERS)).toThrow(
+			/plcConnections\[0\]\.protocol 'mysql' はこの banto-hub にありません/
+		);
+		const virtual = { ...modbus({}), name: 'calc', protocol: 'virtual' };
+		expect(() => checkConfigPackageConnectionFields(pkgWith(virtual), TEST_DRIVERS)).not.toThrow();
+	});
+
+	it('書き出したパッケージは往復して欄の確かめを通る（Modbus・SLMP・postgres・push）', () => {
+		const pkg = buildConfigPackage({
+			plcConnections: [
+				BASE_CONNECTION,
+				SLMP_CONNECTION,
+				DB_CONNECTION,
+				PUSH_BRIDGE_CONNECTION,
+				PUSH_PLAIN_CONNECTION,
+				VIRTUAL_CONNECTION
+			],
+			collectionGroups: [],
+			tags: [],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-24T00:00:00.000Z'
+		});
+		const parsed = parseConfigPackage(serializeConfigPackage(pkg));
+		expect(parsed).toEqual(pkg);
+		expect(parsed.plcConnections.map((c) => c.name)).toEqual([
+			'line-a',
+			'line-q',
+			'pg-a',
+			'Bridge1',
+			'Script1'
+		]);
+		expect(() => checkConfigPackageConnectionFields(parsed, TEST_DRIVERS)).not.toThrow();
 	});
 });

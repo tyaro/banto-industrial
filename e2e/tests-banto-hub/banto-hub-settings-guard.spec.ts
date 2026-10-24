@@ -30,7 +30,7 @@ const IMPORT_BLOCKED_MESSAGE = '構成パッケージの取り込みは収集を
 
 function emptyConfigPackageJson(): string {
 	return JSON.stringify({
-		schemaVersion: 2,
+		schemaVersion: 3,
 		product: 'banto-hub',
 		exportedAt: new Date().toISOString(),
 		excludedSecrets: [],

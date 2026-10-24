@@ -1,19 +1,20 @@
 import {
 	createCollectionGroup,
-	createPlcConnection,
+	createPlcConnectionWire,
 	createTag,
 	listCollectionGroups,
-	listPlcConnections,
+	listDrivers,
+	listPlcConnectionsWire,
 	listTags,
 	updateCollectionGroup,
-	updatePlcConnection,
+	updatePlcConnectionWire,
 	updateTag,
-	isVirtualConnection,
 	isQueuedWhileRunningError,
+	isSecretStateWire,
 	type CollectionGroup,
 	type CollectionGroupInput,
-	type PlcConnection,
-	type PlcConnectionInput,
+	type PlcConnectionWire,
+	type PlcConnectionWireInput,
 	type Tag,
 	type TagInput
 } from './tagRegistryAdmin';
@@ -28,7 +29,9 @@ import {
 } from './sinkGroupsAdmin';
 import {
 	buildConfigPackage,
+	checkConfigPackageConnectionFields,
 	configPackageGroupKey,
+	configPackagePushBridge,
 	configPackageTagKey,
 	describeConfigPackageTagRef,
 	planByKey,
@@ -38,6 +41,7 @@ import {
 	type ConfigPackage,
 	type ConfigPackageIngestConnection,
 	type ConfigPackagePlcConnection,
+	type ConfigPackagePushSettings,
 	type ConfigPackageImportOptions,
 	type ConfigPackageImportSummary,
 	type ConfigPackageInspection
@@ -68,8 +72,25 @@ function uniqueWarnings(items: readonly string[]): string[] {
 	return [...new Set(items)];
 }
 
-function buildConnectionMap(connections: readonly PlcConnection[]): Map<string, PlcConnection> {
+function buildConnectionMap(
+	connections: readonly PlcConnectionWire[]
+): Map<string, PlcConnectionWire> {
 	return new Map(connections.map((connection) => [connection.name, connection]));
+}
+
+/** 予約の `virtual` 接続（`calc`・`mem`）。パッケージに載せず、取り込みもしない。 */
+function isVirtualConnection(connection: { protocol: string }): boolean {
+	return connection.protocol === 'virtual';
+}
+
+/**
+ * 版 3: 既存の `postgres` 接続のパスワードがこの PC で使えるか（応答の
+ * `settings.password` が `{"$secret": "set"}`）。`unreadable`（保存した値をこの PC で
+ * 読めない）と、値が無い（キーが載らない）は使えない。
+ */
+function hasUsablePassword(connection: PlcConnectionWire): boolean {
+	const value = connection.settings?.password;
+	return isSecretStateWire(value) && value.$secret === 'set';
 }
 
 /**
@@ -84,7 +105,7 @@ interface RegistryKeys {
 }
 
 function registryKeys(
-	connections: readonly PlcConnection[],
+	connections: readonly Pick<PlcConnectionWire, 'id' | 'name'>[],
 	groups: readonly CollectionGroup[]
 ): RegistryKeys {
 	const connectionNameById = new Map(connections.map((c) => [c.id, c.name]));
@@ -126,7 +147,7 @@ function buildSinkGroupMap(groups: readonly SinkGroup[]): Map<string, SinkGroup>
 }
 
 function collectConnectionNames(
-	current: readonly PlcConnection[],
+	current: readonly PlcConnectionWire[],
 	pkg: ConfigPackage
 ): Set<string> {
 	const names = new Set(current.map((connection) => connection.name));
@@ -182,7 +203,7 @@ function resolveMqttCredentials(
 
 export async function loadConfigPackage(): Promise<ConfigPackage> {
 	const [plcConnections, collectionGroups, tags, sinkGroups, mqtt, grpc] = await Promise.all([
-		listPlcConnections(),
+		listPlcConnectionsWire(),
 		listCollectionGroups(),
 		listTags(),
 		listSinkGroups(),
@@ -238,22 +259,27 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		currentTags,
 		currentSinkGroups,
 		mqttSettings,
-		grpcSettings
+		grpcSettings,
+		drivers
 	] = await Promise.all([
-		listPlcConnections(),
+		listPlcConnectionsWire(),
 		listCollectionGroups(),
 		listTags(),
 		listSinkGroups(),
 		getMqttSettings(),
-		getGrpcSettings()
+		getGrpcSettings(),
+		listDrivers()
 	]);
+	// 版 3（設計 §7.1）: 欠けた欄・秘密の欄をこの Hub のドライバのスキーマで断る。確認の
+	// 画面に進む前（読み込みのエラーとして）に出す。
+	checkConfigPackageConnectionFields(pkg, drivers);
 
 	const keys = registryKeys(currentConnections, currentGroups);
 	const currentConnectionNames = collectConnectionNames(currentConnections, pkg);
 	const currentGroupKeys = collectGroupKeys(currentGroups, keys, pkg);
 	const connectionPlans = planByName(
 		pkg.plcConnections,
-		currentConnections.filter((connection: PlcConnection) => !isVirtualConnection(connection))
+		currentConnections.filter((connection) => !isVirtualConnection(connection))
 	);
 	// 版 2: グループは (接続名, グループ名)、タグは (接続名, グループ名, タグ名) で
 	// 突き合わせる（グループ名は接続内でのみ一意 - 2026-10-19 オーナー決定）。
@@ -326,24 +352,24 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 		mqttSettings,
 		grpcSettings,
 		// S1（実装指示5）: export に password を含めない
-		// （`CONFIG_PACKAGE_EXCLUDED_SECRETS`の`'plc_connections.password'`）
-		// ので、パッケージが持つ postgres 接続は必ずパスワード無しで
-		// import される。ただし apply 側は name が一致する既存接続を
-		// `password` 省略で update するだけなら保存済みパスワードを
-		// そのまま維持する（S1a tri-state、`updatePlcConnection`参照）ため、
-		// 既に `passwordSet: true` の既存 postgres 接続を更新するだけの
-		// ケースでは再入力は不要 - 過剰に「全件再設定要」と案内しない
-		// よう、実際に再設定が必要な接続だけに絞る（2026-09 レビュー是正）:
+		// （`CONFIG_PACKAGE_EXCLUDED_SECRETS`）ので、パッケージが持つ postgres 接続は
+		// 必ずパスワード無しで import される。ただし apply 側は name が一致する既存接続を
+		// `settings.password` 抜きで update する（秘密のキーの省略は「保つ」、REST の
+		// tri-state）ので、使えるパスワードを持つ既存 postgres 接続を更新するだけの
+		// ケースでは再入力は不要 - 過剰に「全件再設定要」と案内しないよう、実際に再設定が
+		// 必要な接続だけに絞る（2026-09 レビュー是正）:
 		// (a) 新規作成される postgres 接続（このパッケージにしか存在しない）
-		// (b) 既存 postgres 接続を更新するが、サーバー側で現在
-		//     `passwordSet: false`（未設定）のもの
+		// (b) 既存の接続を更新するが、今の `settings.password` が `{"$secret": "set"}` で
+		//     ないもの（未設定・この PC で読めない `unreadable`・postgres 以外からの切り替え）
+		//     - 版 3 で `passwordSet` の代わりに `$secret` の状態で見る（設計 §7.1）
 		dbConnectionsPasswordRequired: [
 			...connectionPlans.create
 				.filter((connection) => connection.protocol === 'postgres')
 				.map((connection) => connection.name),
 			...connectionPlans.update
 				.filter(
-					({ incoming, existing }) => incoming.protocol === 'postgres' && !existing.passwordSet
+					({ incoming, existing }) =>
+						incoming.protocol === 'postgres' && !hasUsablePassword(existing)
 				)
 				.map(({ incoming }) => incoming.name)
 		],
@@ -363,7 +389,7 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 export function connectionImportOrder(
 	connections: readonly ConfigPackagePlcConnection[]
 ): ConfigPackagePlcConnection[] {
-	const hasBridge = (c: ConfigPackagePlcConnection) => c.settings?.bridge !== undefined;
+	const hasBridge = (c: ConfigPackagePlcConnection) => configPackagePushBridge(c) !== undefined;
 	return [...connections.filter((c) => !hasBridge(c)), ...connections.filter(hasBridge)];
 }
 
@@ -387,14 +413,18 @@ async function applyConfigPackageInner(
 	pkg: ConfigPackage,
 	options: ConfigPackageImportOptions
 ): Promise<ConfigPackageImportSummary> {
-	const [currentConnections, currentGroups, currentTags, currentSinkGroups, currentMqtt] =
+	const [currentConnections, currentGroups, currentTags, currentSinkGroups, currentMqtt, drivers] =
 		await Promise.all([
-			listPlcConnections(),
+			listPlcConnectionsWire(),
 			listCollectionGroups(),
 			listTags(),
 			listSinkGroups(),
-			getMqttSettings()
+			getMqttSettings(),
+			listDrivers()
 		]);
+	// 版 3: 確認の画面（`inspectConfigPackage`）と同じ確かめを、書き込む前にもう一度する
+	// （確認の後にドライバの構成が変わっても、欠けた欄を既定で埋めて書き込まない）。
+	checkConfigPackageConnectionFields(pkg, drivers);
 
 	const warnings: string[] = [];
 	const connectionByName = buildConnectionMap(currentConnections);
@@ -404,28 +434,38 @@ async function applyConfigPackageInner(
 			warnings.push(`virtual connection '${pkgConnection.name}' は構成パッケージに含めません`);
 			continue;
 		}
-		const { settings: pkgSettings, ...rest } = pkgConnection;
-		let connection: PlcConnectionInput = rest;
+		let settings: Record<string, unknown> = { ...pkgConnection.settings };
 		if (pkgConnection.protocol === 'push') {
 			// R2a-2e（§3.1・§5.1）: ブリッジの読む DB の名前を、取り込み先の id に
 			// 付け直す（上の順で postgres 接続は作成・更新済み）。引けなければ
 			// 壊れた参照で作らず、警告を積んでこの接続を飛ばす。
-			const settings = resolvePushSettings(
-				pkgSettings ?? {},
+			const resolved = resolvePushSettings(
+				pkgConnection.settings as ConfigPackagePushSettings,
 				(name) => connectionByName.get(name)?.id
 			);
-			if (settings === null) {
+			if (resolved === null) {
 				warnings.push(
-					`push 接続 '${pkgConnection.name}' のブリッジが読む接続 '${pkgSettings?.bridge?.dbConnectionName}' を解決できませんでした`
+					`push 接続 '${pkgConnection.name}' のブリッジが読む接続 '${configPackagePushBridge(pkgConnection)?.dbConnectionName}' を解決できませんでした`
 				);
 				continue;
 			}
-			connection = { ...rest, settings };
+			settings = { ...resolved };
 		}
+		// 版 3: REST の `settings` は丸ごと置き換え。パッケージは秘密のキーを持たない
+		// （`checkConfigPackageConnectionFields` が値に関わらずキーの存在で断る。REST は
+		// null・空文字を「消す」と読むので、ここに秘密のキーが来ると保存済みの秘密が消える）ので、既存の接続の更新では
+		// 秘密のキーの省略 =「保存済みを保つ」になる（postgres のパスワードを消さない）。
+		const connection: PlcConnectionWireInput = {
+			name: pkgConnection.name,
+			protocol: pkgConnection.protocol,
+			enabled: pkgConnection.enabled,
+			simulation: pkgConnection.simulation,
+			settings
+		};
 		const existing = connectionByName.get(connection.name);
 		const saved = existing
-			? await updatePlcConnection(existing.id, connection)
-			: await createPlcConnection(connection);
+			? await updatePlcConnectionWire(existing.id, connection)
+			: await createPlcConnectionWire(connection);
 		connectionByName.set(saved.name, saved);
 		if (saved.protocol === 'push') ingestConnections.push({ name: saved.name, id: saved.id });
 	}
@@ -464,8 +504,7 @@ async function applyConfigPackageInner(
 			// S3（docs/banto-hub-external-db-design.md §4.1・§4.2）: postgres
 			// 接続配下のグループでは非 undefined、それ以外では `pkg` 側が
 			// 既に省略している（`configPackage.ts::sanitizeGroup`）ので
-			// そのまま渡すだけでよい - `database`/`username`（S1）と同じ
-			// 「pkg の値をそのまま転記する」扱い。
+			// そのまま渡すだけでよい（「pkg の値をそのまま転記する」扱い）。
 			querySql: group.querySql
 		};
 		const groupKey = configPackageGroupKey(group.plcConnectionName, group.name);
