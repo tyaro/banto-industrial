@@ -1459,3 +1459,50 @@ describe('applyConfigPackage: R2a-2e push 接続のブリッジ（dbConnectionNa
 		expect((await inspectConfigPackage(pkg)).ingestConnections).toEqual([]);
 	});
 });
+
+describe('秘密の欄が null のパッケージは書き込みの前に断る（保存済みの秘密を消さない）', () => {
+	const nullSecretConnections: ConfigPackage['plcConnections'][] = [
+		[
+			{
+				name: 'pg1',
+				protocol: 'postgres',
+				enabled: true,
+				simulation: false,
+				settings: {
+					host: '10.0.0.5',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: null
+				}
+			}
+		],
+		[
+			{
+				name: 'fake1',
+				protocol: FAKE_SECRET_DRIVER.id,
+				enabled: true,
+				simulation: false,
+				settings: { host: 'h', token: null }
+			}
+		]
+	];
+
+	for (const connections of nullSecretConnections) {
+		it(`${connections[0].protocol}: inspect と apply が断り、作成・更新を 1 回も呼ばない`, async () => {
+			vi.mocked(listPlcConnectionsWire).mockResolvedValue([]);
+			const target: ConfigPackage = {
+				...pkg,
+				plcConnections: connections,
+				collectionGroups: [],
+				tags: []
+			};
+
+			await expect(inspectConfigPackage(target)).rejects.toThrow(/は秘密の欄です/);
+			await expect(applyConfigPackage(target)).rejects.toThrow(/は秘密の欄です/);
+
+			expect(createPlcConnectionWire).not.toHaveBeenCalled();
+			expect(updatePlcConnectionWire).not.toHaveBeenCalled();
+		});
+	}
+});

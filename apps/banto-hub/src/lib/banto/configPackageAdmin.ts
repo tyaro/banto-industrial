@@ -452,7 +452,8 @@ async function applyConfigPackageInner(
 			settings = { ...resolved };
 		}
 		// 版 3: REST の `settings` は丸ごと置き換え。パッケージは秘密のキーを持たない
-		// （`checkConfigPackageConnectionFields` が断る）ので、既存の接続の更新では
+		// （`checkConfigPackageConnectionFields` が値に関わらずキーの存在で断る。REST は
+		// null・空文字を「消す」と読むので、ここに秘密のキーが来ると保存済みの秘密が消える）ので、既存の接続の更新では
 		// 秘密のキーの省略 =「保存済みを保つ」になる（postgres のパスワードを消さない）。
 		const connection: PlcConnectionWireInput = {
 			name: pkgConnection.name,

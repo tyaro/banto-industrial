@@ -801,7 +801,9 @@ export function checkConfigPackageConnectionFields(
 			const value = connection.settings[rule.key];
 			const present = value !== undefined && value !== null;
 			if (rule.secret) {
-				if (present) {
+				// 値ではなくキーの有無で断る。REST は null・空文字を「消す」と読むので、
+				// `"password": null` を通すと取り込み先の保存済みの秘密が消える。
+				if (Object.hasOwn(connection.settings, rule.key)) {
 					throw new ConfigPackageParseError(
 						`${path}.settings.${rule.key} は秘密の欄です。構成パッケージは秘密の値を持ちません（取り込んだ後に画面で設定してください）`
 					);

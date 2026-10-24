@@ -1149,6 +1149,31 @@ describe('configPackage: checkConfigPackageConnectionFields（欠けた欄の断
 		);
 	});
 
+	it('Secret の欄は null・空文字でも断る（REST は消す指示と読むので値でなくキーの有無で見る）', () => {
+		for (const value of [null, '', 'x']) {
+			const fake = {
+				name: 'fake',
+				protocol: 'fake-secret',
+				enabled: true,
+				simulation: false,
+				settings: { host: 'h', token: value }
+			};
+			expect(() => checkConfigPackageConnectionFields(pkgWith(fake), TEST_DRIVERS)).toThrow(
+				/settings\.token は秘密の欄です/
+			);
+		}
+		const pg = {
+			name: 'pg-a',
+			protocol: 'postgres',
+			enabled: true,
+			simulation: false,
+			settings: { host: 'h', port: 5432, database: 'd', username: 'u', password: null }
+		};
+		expect(() => checkConfigPackageConnectionFields(pkgWith(pg), TEST_DRIVERS)).toThrow(
+			/settings\.password は秘密の欄です/
+		);
+	});
+
 	it('postgres: host・port・database・username の欠けは断り、password の欠けは通り、値があれば断る', () => {
 		const pg = (settings: Record<string, unknown>) => ({
 			name: 'pg-a',
