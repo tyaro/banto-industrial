@@ -10,6 +10,7 @@ import {
 	driverFor,
 	driverSettingsForSubmit,
 	driverStateAfterProtocolChange,
+	driverFieldsOnLoad,
 	rebuiltDriverState,
 	formToConnectionInput,
 	nextConnectionName,
@@ -796,5 +797,54 @@ describe('driverSettingsForSubmit / rebuiltDriverState（スキーマが分か�
 		expect(rebuiltDriverState({ ...form, protocol: 'slmp' }, 'modbus-tcp', DRIVERS)).toBeNull();
 		expect(rebuiltDriverState(blank(), 'modbus-tcp', DRIVERS)).toBeNull();
 		expect(rebuiltDriverState(connectionToForm(saved, DRIVERS), 'modbus-tcp', DRIVERS)).toBeNull();
+	});
+});
+
+describe('driverFieldsOnLoad（一覧の取得完了でフォームのどこを差し替えるか）', () => {
+	const saved: PlcConnection = {
+		id: 1,
+		name: 'X',
+		protocol: 'modbus-tcp',
+		enabled: true,
+		simulation: false,
+		settings: { host: 'h', port: 1502 }
+	};
+
+	it('新規・プロトコルが空: 先頭のドライバを入れて既定で埋める', () => {
+		const form = blankConnectionForm([]);
+		const patch = driverFieldsOnLoad(form, null, DRIVERS);
+		expect(patch?.protocol).toBe(DRIVERS[0].id);
+		expect(Object.keys(patch?.driver.values ?? {}).length).toBeGreaterThan(0);
+	});
+
+	it('新規・postgres を選択済み: 触らない', () => {
+		const form = { ...blankConnectionForm([]), protocol: 'postgres' };
+		expect(driverFieldsOnLoad(form, null, DRIVERS)).toBeNull();
+	});
+
+	it('新規・push を選択済み: 触らない', () => {
+		const form = { ...blankConnectionForm([]), protocol: 'push' };
+		expect(driverFieldsOnLoad(form, null, DRIVERS)).toBeNull();
+	});
+
+	it('新規・一覧が空: 触らない', () => {
+		expect(driverFieldsOnLoad(blankConnectionForm([]), null, [])).toBeNull();
+	});
+
+	it('編集・同じプロトコルで欄が空: 保存済みの settings から作る（プロトコルは変えない）', () => {
+		const form = connectionToForm(saved, []);
+		const patch = driverFieldsOnLoad(form, 'modbus-tcp', DRIVERS);
+		expect(patch?.protocol).toBeUndefined();
+		expect(patch?.driver.values.host).toBe('h');
+	});
+
+	it('編集・欄が既にある: 触らない', () => {
+		const form = connectionToForm(saved, DRIVERS);
+		expect(driverFieldsOnLoad(form, 'modbus-tcp', DRIVERS)).toBeNull();
+	});
+
+	it('編集・利用者がプロトコルを替えた: 触らない', () => {
+		const form = { ...connectionToForm(saved, []), protocol: 'slmp' };
+		expect(driverFieldsOnLoad(form, 'modbus-tcp', DRIVERS)).toBeNull();
 	});
 });

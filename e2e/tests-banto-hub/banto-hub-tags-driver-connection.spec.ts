@@ -15,7 +15,7 @@
  *
  * 前提データは REST で作る/消す。同期点は `waitForResponse`（クリックより前に張る）。
  */
-import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
+import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
@@ -58,6 +58,10 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 	});
 
 	test('1〜3. 既定はドライバの先頭（SLMP）。Modbus へ替えると既定が追従し、範囲外は保存前に断られる', async () => {
+		let testCalls = 0;
+		page.on('request', (req) => {
+			if (req.url().includes('/api/plc-connections/test')) testCalls += 1;
+		});
 		await page.goto('/tags');
 		await page.getByRole('button', { name: 'PLC接続を追加', exact: true }).click();
 		const wizard = page.getByRole('dialog', { name: '新規作成', exact: true });
@@ -86,10 +90,13 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 		await expect(wizard.getByTestId('driver-advanced')).not.toHaveAttribute('open', '');
 
 		// 範囲外のポートは送る前に欄の下で断る（サーバーと同じ文言）。
+		// 手順 2 の「次へ」で断られ（手順 3 へ進まない）、接続テストの API も呼ばれない。
 		await wizard.getByLabel('ポート').fill('70000');
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
-		await wizard.getByRole('button', { name: '作成', exact: true }).click();
 		await expect(wizard.getByText('1〜65535 で指定してください')).toBeVisible();
+		await expect(wizard.getByLabel('プロトコル')).toBeVisible();
+		await expect(wizard.getByRole('button', { name: '作成', exact: true })).toHaveCount(0);
+		expect(testCalls).toBe(0);
 
 		// 直して作成する。
 		await wizard.getByLabel('ポート').fill('5200');
@@ -185,5 +192,38 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 				settings: before!.settings
 			}
 		});
+	});
+
+	test('7. 一覧の取得待ちに入力した名前・手順は、取得が終わっても巻き戻らない', async () => {
+		await page.goto('/tags');
+		let held: Route | null = null;
+		let arrived!: () => void;
+		const reached = new Promise<void>((resolve) => (arrived = resolve));
+		await page.route('**/api/drivers', (route) => {
+			held = route;
+			arrived();
+		});
+		try {
+			await page.getByRole('button', { name: 'PLC接続を追加', exact: true }).click();
+			const wizard = page.getByRole('dialog', { name: '新規作成', exact: true });
+			await expect(wizard).toBeVisible();
+			await reached;
+
+			// 取得待ちの間に名前を入れて手順 2 へ進む（ドライバの欄に頼る操作は止まっている）。
+			await wizard.locator('#connection-name').fill(`${CONN}-hold`);
+			await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+			await expect(wizard.getByTestId('drivers-loading')).toBeVisible();
+			await expect(wizard.getByRole('button', { name: '次へ', exact: true })).toBeDisabled();
+
+			// 取得が終わっても、手順は 2 のまま・名前は入力したまま。ドライバの欄だけが補われる。
+			await held!.continue();
+			await expect(wizard.getByTestId('drivers-loading')).toHaveCount(0);
+			await expect(wizard.getByLabel('プロトコル')).toHaveValue('slmp');
+			await expect(wizard.getByLabel('ポート')).toHaveValue('5007');
+			await wizard.getByRole('button', { name: '戻る', exact: true }).click();
+			await expect(wizard.locator('#connection-name')).toHaveValue(`${CONN}-hold`);
+		} finally {
+			await page.unroute('**/api/drivers');
+		}
 	});
 });

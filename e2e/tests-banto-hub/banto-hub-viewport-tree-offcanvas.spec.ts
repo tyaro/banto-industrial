@@ -1051,6 +1051,9 @@ test.describe.serial('banto-hub 狭幅でツリーペインを退避する (#378
 		await page.getByRole('tree').getByRole('button', { name: CONNECTION_NAME }).click({
 			button: 'right'
 		});
+		// 「接続を削除」は開いた直後に自動の確認（window.confirm）を出す。先に listener を張って
+		// 自動の確認を確実に閉じ、手動の削除の確認と取り違えない。
+		page.once('dialog', (dialog) => void dialog.dismiss());
 		await page.getByRole('menuitem', { name: '接続を削除', exact: true }).click();
 
 		const connectionDrawer = page.getByRole('dialog', { name: `${CONNECTION_NAME} を編集` });

@@ -117,7 +117,6 @@
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
 	import {
 		REQUIRED_MESSAGE,
-		defaultDriverState,
 		mapSettingsFieldErrors,
 		summarizeDriverValues,
 		validateDriverValues
@@ -143,7 +142,7 @@
 		validatePushFields,
 		connectionToForm,
 		formToConnectionInput,
-		rebuiltDriverState,
+		driverFieldsOnLoad,
 		nextConnectionName,
 		validatePostgresFields,
 		type PlcConnectionFormState
@@ -363,8 +362,7 @@
 		try {
 			drivers = await listDrivers();
 			driversStatus = 'ready';
-			applyDriversToBlankForm();
-			applyDriversToEditForm();
+			applyDriversToForm();
 		} catch (err) {
 			driversError = errorMessage(err);
 			driversStatus = 'error';
@@ -372,28 +370,24 @@
 	}
 
 	/**
-	 * 一覧の読み込みに失敗した後の再取得で成功したとき、まだプロトコルが空の新規作成フォームへ
-	 * 先頭のドライバを入れる（システム側の更新なので baseline も揃えて dirty にしない）。
+	 * 一覧の読み込みが成功したとき、ドライバの欄（と空だったプロトコル）だけを補う。開いた時点で
+	 * 一覧が無くても初期化は済んでおり、利用者が触った他の欄（名前など）は上書きしない。
+	 * システム側の更新なので baseline もドライバの部分だけ揃えて dirty にしない
+	 * （利用者が先に触った欄は dirty のまま残る）。
 	 */
-	function applyDriversToBlankForm(): void {
-		const first = drivers[0];
-		if (form.protocol !== '' || !first) return;
-		form.protocol = first.id;
-		form.driver = defaultDriverState(first.settingsSchema.fields);
-		lastProtocol = first.id;
-		baseline = { ...baseline, protocol: first.id, driver: $state.snapshot(form.driver) };
-	}
-
-	/**
-	 * スキーマが無いまま開いた編集フォームは、再取得に成功したら保存済みの settings から欄を作り直す
-	 * （システム側の更新なので baseline も揃えて dirty にしない）。
-	 */
-	function applyDriversToEditForm(): void {
-		if (!connection) return;
-		const rebuilt = rebuiltDriverState(form, connection.protocol, drivers);
-		if (!rebuilt) return;
-		form.driver = rebuilt;
-		baseline = { ...baseline, driver: $state.snapshot(form.driver) };
+	function applyDriversToForm(): void {
+		const patch = driverFieldsOnLoad(form, connection ? connection.protocol : null, drivers);
+		if (!patch) return;
+		if (patch.protocol !== undefined) {
+			form.protocol = patch.protocol;
+			lastProtocol = patch.protocol;
+		}
+		form.driver = patch.driver;
+		baseline = {
+			...baseline,
+			...(patch.protocol !== undefined ? { protocol: patch.protocol } : {}),
+			driver: $state.snapshot(form.driver)
+		};
 	}
 
 	$effect(() => {
@@ -427,8 +421,8 @@
 			lastOpenKey = null;
 			return;
 		}
-		// ドライバの一覧が決着してから初期化する（読めなくても、ホストの接続は編集できる）。
-		if (driversStatus === 'idle' || driversStatus === 'loading') return;
+		// 初期化は開いた時点で行う（ドライバの一覧は待たない。取得の完了は `applyDriversToForm` が
+		// ドライバの欄だけ補う）。
 		const key = connection ? `edit:${connection.id}` : 'create';
 		if (key === lastOpenKey) return;
 		lastOpenKey = key;
@@ -541,6 +535,14 @@
 		return target;
 	}
 
+	/** 一覧の取得中は、ドライバの欄に頼る操作（次へ・保存・接続テスト・プロトコル選択）を止める。 */
+	const driversBlocking = $derived.by(() => {
+		const status: string = driversStatus;
+		return (
+			status === 'loading' && form.protocol !== POSTGRES_PROTOCOL && form.protocol !== PUSH_PROTOCOL
+		);
+	});
+
 	const canAdvanceFromStep1 = $derived(form.name.trim() !== '');
 	/**
 	 * S1: postgres 接続は`host`に加えて`database`/`username`も必須
@@ -640,7 +642,15 @@
 
 	function goNext(): void {
 		if (step === 1 && canAdvanceFromStep1) step = 2;
-		else if (step === 2 && canAdvanceFromStep2) step = 3;
+		else if (step === 2 && canAdvanceFromStep2) {
+			// 範囲などの誤りは手順 3 へ進む前に欄の下へ出す（接続テストの理由が見えない状態を作らない）。
+			if (driver) {
+				const found = validateDriverValues(driver.settingsSchema.fields, form.driver.values);
+				driverErrors = found;
+				if (Object.keys(found).length > 0) return;
+			}
+			step = 3;
+		}
 	}
 
 	function goBack(): void {
@@ -657,7 +667,11 @@
 			// 範囲などの誤りは送る前に欄の下へ出す（サーバーと同じ規則）。
 			const found = validateDriverValues(driver.settingsSchema.fields, form.driver.values);
 			driverErrors = found;
-			if (Object.keys(found).length > 0) return;
+			if (Object.keys(found).length > 0) {
+				// 手順 3（確認）にはドライバの欄が無い。保存時の validateBeforeSubmit と同じく手順 2 へ戻す。
+				if (isCreate && step === 3) step = 2;
+				return;
+			}
 		}
 		testState.testing = true;
 		testState.result = null;
@@ -862,7 +876,11 @@
 	<div class="form-grid">
 		<label class="field">
 			プロトコル
-			<select bind:value={form.protocol} onchange={onProtocolChange} disabled={readOnly}>
+			<select
+				bind:value={form.protocol}
+				onchange={onProtocolChange}
+				disabled={readOnly || driversBlocking}
+			>
 				{#each protocolChoices as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
@@ -1217,7 +1235,12 @@
 
 {#snippet testConnectionBlock()}
 	<div class="test-connection">
-		<button type="button" class="test-btn" onclick={runConnectionTest} disabled={testState.testing}>
+		<button
+			type="button"
+			class="test-btn"
+			onclick={runConnectionTest}
+			disabled={testState.testing || driversBlocking}
+		>
 			{#if testState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
 			接続テスト
 		</button>
@@ -1360,9 +1383,13 @@
 			{#if step === 1}
 				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep1}>次へ</button>
 			{:else if step === 2}
-				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep2}>次へ</button>
+				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep2 || driversBlocking}>
+					次へ
+				</button>
 			{:else}
-				<button type="button" onclick={handleCreate} disabled={saving}>作成</button>
+				<button type="button" onclick={handleCreate} disabled={saving || driversBlocking}>
+					作成
+				</button>
 			{/if}
 		</div>
 	</Modal>
@@ -1392,7 +1419,9 @@
 				{@render testConnectionBlock()}
 			{/if}
 			<div class="actions">
-				<button type="button" onclick={handleSave} disabled={saving || deleting}>保存</button>
+				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>
+					保存
+				</button>
 				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
 					削除
 				</button>

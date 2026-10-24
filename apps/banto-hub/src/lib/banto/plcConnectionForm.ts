@@ -457,6 +457,36 @@ export function rebuiltDriverState(
 	return driverStateFromSettings(driver.settingsSchema.fields, form.savedSettings);
 }
 
+/** {@link driverFieldsOnLoad} の結果。差し替えるのはドライバの欄（と空だったプロトコル）だけ。 */
+export interface DriverFieldsPatch {
+	/** 空だったプロトコルを先頭のドライバで埋めるときだけ入る。 */
+	protocol?: PlcProtocol;
+	driver: DriverFormState;
+}
+
+/**
+ * ドライバの一覧の読み込みが成功したとき、フォームのどこを差し替えるか（利用者が触った他の欄は
+ * 触らない。開いた時点で一覧が無くても初期化は済んでいる）。
+ *
+ * - 新規作成（`savedProtocol` が `null`）: プロトコルがまだ空なら先頭のドライバを入れて既定で
+ *   埋める。既に何か（postgres・push を含む）選んでいれば `null`。
+ * - 編集: {@link rebuiltDriverState} と同じ（保存済みと同じプロトコルで欄が空のとき、保存済みの
+ *   settings から作る）。
+ */
+export function driverFieldsOnLoad(
+	form: Pick<PlcConnectionFormState, 'protocol' | 'driver' | 'savedSettings'>,
+	savedProtocol: string | null,
+	drivers: readonly DriverInfo[]
+): DriverFieldsPatch | null {
+	if (savedProtocol === null) {
+		const first = drivers[0];
+		if (form.protocol !== '' || !first) return null;
+		return { protocol: first.id, driver: defaultDriverState(first.settingsSchema.fields) };
+	}
+	const rebuilt = rebuiltDriverState(form, savedProtocol, drivers);
+	return rebuilt ? { driver: rebuilt } : null;
+}
+
 // --- R2a-2e: 取り込み口 `push` の設定（docs/banto-hub-ingest-design.md §3.2・§7.1） ---
 
 /** {@link parseBridgeColumns} の結果。`error` は最初に見つけた行の誤り（無ければ `null`）。 */
