@@ -2076,6 +2076,7 @@ async fn queued_connection_writes_reject_bad_protocol_and_stray_secrets_without_
     let bad_inputs = [
         json!({ "protocol": "postgresql", "name": "typo", "settings": { "host": "h", "password": "s3cret-typo" } }),
         json!({ "protocol": "modbus-tcp", "name": "stray", "settings": { "host": "127.0.0.1", "port": 15041, "password": "s3cret-typo" } }),
+        json!({ "protocol": "push", "name": "pushy", "settings": { "password": "dummy-secret" } }),
     ];
     for body in &bad_inputs {
         let (status, response) = admin_post(
@@ -2101,4 +2102,8 @@ async fn queued_connection_writes_reject_bad_protocol_and_stray_secrets_without_
         .await
         .unwrap();
     assert!(rows.is_empty(), "nothing may be queued: {rows:?}");
+    assert!(
+        !format!("{rows:?}").contains("dummy-secret"),
+        "no plaintext secret may stay queued"
+    );
 }

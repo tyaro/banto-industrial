@@ -3135,6 +3135,9 @@ async fn queued_connection_tools_reject_bad_protocol_and_stray_secrets_without_q
         json!({ "name": "stray", "protocol": "slmp", "enabled": true, "simulation": false,
                 "settings": { "host": "127.0.0.1", "port": 5010, "cpu_type": "Q",
                               "password": "s3cret-typo" } }),
+        // host route: the flat (push) validation must also run before queueing.
+        json!({ "name": "pushy", "protocol": "push", "enabled": true, "simulation": false,
+                "settings": { "password": "dummy-secret" } }),
     ];
     for input in &bad_inputs {
         let mut update = input.clone();
@@ -3154,6 +3157,14 @@ async fn queued_connection_tools_reject_bad_protocol_and_stray_secrets_without_q
         .await
         .unwrap();
     assert!(payloads.is_empty(), "nothing may be queued: {payloads:?}");
+    let all_rows: Vec<String> = sqlx::query_scalar("SELECT payload FROM pending_changes")
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert!(
+        !format!("{all_rows:?}").contains("dummy-secret"),
+        "no plaintext secret may stay queued"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

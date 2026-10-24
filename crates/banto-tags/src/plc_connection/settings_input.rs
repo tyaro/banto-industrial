@@ -127,9 +127,18 @@ impl PlcConnectionService {
 
     /// 未適用キューに積む前に、適用時（[`Self::create_settings_tx`] /
     /// [`Self::update_settings_tx`]）と同じ規則で `settings` の形を検査する（平文の秘密値を
-    /// キューに残さない）。DB には触らない。
+    /// キューに残さない）。DB には触らない。ホストの接続（push・postgres など）は適用時の
+    /// 平らな検証（`validate_plc_connection_input`。`push` の `settings` の中身も含む）も通す。
+    /// 機器のドライバの必須の秘密の欠けは、更新で保存済みを保つ場合があるので見ない。
     pub fn check_settings_input(&self, input: &ConnectionSettingsInput) -> Result<(), BantoError> {
-        self.route(input.clone()).map(|_| ())
+        match self.route(input.clone())? {
+            Route::Host(flat) => {
+                let flat = super::normalize_plc_connection_input(flat);
+                let secret_keys = self.secret_keys(&flat.protocol);
+                super::validate_plc_connection_input(&flat, &secret_keys)
+            }
+            Route::Driver(..) => Ok(()),
+        }
     }
 
     fn route(&self, input: ConnectionSettingsInput) -> Result<Route, BantoError> {
