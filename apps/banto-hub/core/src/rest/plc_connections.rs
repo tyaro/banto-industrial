@@ -135,6 +135,18 @@ impl PlcConnectionPayload {
         })
     }
 
+    /// 未適用キューに積む前の検査: 適用時と同じ規則（`protocol` の登録・`settings` のキー）で
+    /// 断る。これが無いと、未登録の `protocol` や余計な `password` の平文が封印されずにキューに
+    /// 残る（#827 のレビュー）。積む前（`queue_form` の前）に呼ぶ。
+    pub(crate) fn check_before_queue(
+        &self,
+        service: &banto_tags::PlcConnectionService,
+        secret_keys: &[String],
+    ) -> Result<(), BantoError> {
+        let input = self.clone().into_input(secret_keys)?;
+        service.check_settings_input(&input)
+    }
+
     /// 未適用キューに積む形（R2b-6b、`crate::pending_changes` の doc）: 秘密のキーの文字列の
     /// 値は**積む前に封印して** `sealedSecrets`（キー → `crate::secrets::sealed_password_json`
     /// の形）へ移し、`settings` から外す。空文字（消す）は `null` にする。省略（保つ）・`null`
@@ -370,6 +382,9 @@ pub(super) async fn plc_connections_create(
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
+        input
+            .check_before_queue(&state.plc_connections, &secret_keys)
+            .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,
@@ -461,6 +476,9 @@ pub(super) async fn plc_connections_update(
     let secret_keys = state.plc_connections.secret_keys(&input.protocol);
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
+        input
+            .check_before_queue(&state.plc_connections, &secret_keys)
+            .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
             &state,

@@ -125,6 +125,13 @@ impl PlcConnectionService {
         Ok(updated)
     }
 
+    /// 未適用キューに積む前に、適用時（[`Self::create_settings_tx`] /
+    /// [`Self::update_settings_tx`]）と同じ規則で `settings` の形を検査する（平文の秘密値を
+    /// キューに残さない）。DB には触らない。
+    pub fn check_settings_input(&self, input: &ConnectionSettingsInput) -> Result<(), BantoError> {
+        self.route(input.clone()).map(|_| ())
+    }
+
     fn route(&self, input: ConnectionSettingsInput) -> Result<Route, BantoError> {
         let Some(registry) = &self.registry else {
             return Err(validation_error(vec![FieldError {

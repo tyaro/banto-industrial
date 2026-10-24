@@ -3105,6 +3105,57 @@ async fn a_queued_update_connection_carries_the_settings_and_replaces_on_apply()
     assert_eq!(row["settings"]["cpu_type"], "Q", "{row:?}");
 }
 
+/// #827 review P2: a queued MCP create/update validates `protocol` and the `settings` keys
+/// before queueing, so a stray plaintext `password` never reaches the queue table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn queued_connection_tools_reject_bad_protocol_and_stray_secrets_without_queueing() {
+    let app = test_app("r2b7a-mcp-queue-precheck").await;
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-p2", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 5009, "cpu_type": "Q" } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let created: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let id = created["created"]["id"].as_i64().unwrap();
+
+    app.commissioning.lock_down().await.expect("lock_down");
+    start_collection(&app.router, &app.admin_token).await;
+
+    let bad_inputs = [
+        json!({ "name": "typo", "protocol": "postgresql", "enabled": true, "simulation": false,
+                "settings": { "host": "h", "password": "s3cret-typo" } }),
+        json!({ "name": "stray", "protocol": "slmp", "enabled": true, "simulation": false,
+                "settings": { "host": "127.0.0.1", "port": 5010, "cpu_type": "Q",
+                              "password": "s3cret-typo" } }),
+    ];
+    for input in &bad_inputs {
+        let mut update = input.clone();
+        update["id"] = json!(id);
+        for (tool, args) in [
+            ("create_connection", input.clone()),
+            ("update_connection", update),
+        ] {
+            let (status, body) =
+                mcp_post(&app.router, Some(&admin_key), tools_call(tool, args)).await;
+            assert_eq!(status, StatusCode::OK, "{body:?}");
+            assert_eq!(body["result"]["isError"], true, "{tool}: {body:?}");
+        }
+    }
+    let payloads: Vec<String> = sqlx::query_scalar("SELECT payload FROM pending_changes")
+        .fetch_all(&app.pool)
+        .await
+        .unwrap();
+    assert!(payloads.is_empty(), "nothing may be queued: {payloads:?}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_connection_reports_failure_for_an_unreachable_port() {
     let app = test_app("s1c-test-conn-fail").await;

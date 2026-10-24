@@ -1,7 +1,7 @@
 use super::super::*;
 use super::common::{
-    admin_get, admin_post, issue_api_key, seed_scope_fixture, test_env, test_env_unlocked, v1_get,
-    CLIENT_HEADER,
+    admin_get, admin_post, admin_put, issue_api_key, seed_scope_fixture, test_env,
+    test_env_unlocked, v1_get, CLIENT_HEADER,
 };
 use crate::pending_changes::PendingChangeState;
 use axum::body::Body;
@@ -2047,4 +2047,58 @@ async fn pending_apply_plc_connection_update_succeeds_when_row_unchanged() {
         .await
         .unwrap();
     assert_eq!(updated.name, "line-fp-ok-renamed");
+}
+
+/// #827 のレビュー P2: 未適用キューに積む前に `protocol` と `settings` のキーを適用時と同じ規則で
+/// 検査する。未登録の `protocol`・登録済みのドライバの余計な `password` は、封印されないまま
+/// 平文でキューに残る前に項目エラーで断る。
+#[tokio::test]
+async fn queued_connection_writes_reject_bad_protocol_and_stray_secrets_without_queueing() {
+    let env = test_env().await;
+    let (status, conn) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "protocol": "modbus-tcp", "name": "line-p2", "settings": { "host": "127.0.0.1", "port": 15040 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{conn:?}");
+    let conn_id = conn["id"].as_i64().unwrap();
+    let (status, _) = admin_post(
+        &env.router,
+        "/api/collection/start",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let bad_inputs = [
+        json!({ "protocol": "postgresql", "name": "typo", "settings": { "host": "h", "password": "s3cret-typo" } }),
+        json!({ "protocol": "modbus-tcp", "name": "stray", "settings": { "host": "127.0.0.1", "port": 15041, "password": "s3cret-typo" } }),
+    ];
+    for body in &bad_inputs {
+        let (status, response) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response:?}");
+        let (status, response) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{conn_id}"),
+            &env.admin_token,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response:?}");
+    }
+
+    let rows: Vec<String> = sqlx::query_scalar("SELECT payload FROM pending_changes")
+        .fetch_all(&env.pool)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "nothing may be queued: {rows:?}");
 }
