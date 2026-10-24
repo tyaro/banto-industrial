@@ -10,13 +10,17 @@
  * - **ドライバの接続**（`slmp`・`modbus-tcp` など `/api/drivers` に載るもの）: アドレスの
  *   文法の説明は `driver.addressHelp` をそのまま使う（中身は解析しない。TS にプロトコルの
  *   知識を持たない）。占有の注意だけは、プロトコルに依らずデータ型から作る汎用の 1 関数。
+ *   placeholder は `DriverInfo` に例が無いので、プロトコル固有の例を含まない汎用の文言。
+ * - **ドライバの一覧がまだ届いていない**（`driversLoaded === false`）ドライバの id: 「読み込み中」
+ *   の説明（placeholder は汎用の文言）。
  * - **ホストの接続**（`push`・`virtual`）と未選択: `/api/drivers` に載らないので、この
- *   モジュールの表を残す。ドライバの id なのに一覧がまだ届いていない・一覧に無いときは
+ *   モジュールの表を残す。ドライバの id なのに一覧には届いたが載っていないときは
  *   未選択と同じ説明にする。
  *
  * 検証そのものはしない（実際の検証はサーバー側 preflight / `createTagsBatch(..., dryRun=true)`
  * に委ねる - このモジュールは「何を書けばよいか」を示すだけ）。
  */
+import { isDriverPending } from './tagDataTypeOptions';
 import type { DriverInfo, PlcProtocol, TagDataType } from './tagRegistryAdmin';
 
 /** アドレス例1件。`address` は入力欄にそのまま書ける値、`description` は短い注記。 */
@@ -74,7 +78,7 @@ const VIRTUAL_DEVICE_HINT = '内部（mem）／演算（calc）タグは PLC ア
 function driverOccupancyHint(kind: OccupancyKind): string {
 	switch (kind) {
 		case 'bit':
-			return 'bit 型はビットデバイス（コイル等）の 1 点、またはワード内の 1 ビットを指定します。';
+			return 'bit 型はビットのデバイスの 1 点、またはワード内の 1 ビットを指定します。';
 		case 'double-word':
 			return '32bit 型（i32/u32/f32）はワード 2 点分を連続して占有します（先頭アドレスの次のワードまで）。';
 		case 'quad-word':
@@ -134,6 +138,9 @@ function unknownProtocolHelp(_dataType: TagDataType): AddressHelp {
 	};
 }
 
+/** ドライバの接続の placeholder。`DriverInfo` に例が無いので、プロトコル固有の例を含まない。構造体登録の欄には説明が出ないので、説明の位置には触れない。 */
+export const DRIVER_ADDRESS_PLACEHOLDER = 'ドライバの書き方でアドレスを入力';
+
 /**
  * 選択中のプロトコル・そのドライバ・`data_type` から、アドレス欄に出すヒント一式を組み立てる。
  * `protocol` は `connectionForGroupId(form.collectionGroupId)?.protocol`（グループ未選択なら
@@ -143,13 +150,24 @@ function unknownProtocolHelp(_dataType: TagDataType): AddressHelp {
 export function addressHelpFor(
 	protocol: PlcProtocol | undefined,
 	dataType: TagDataType,
-	driver?: DriverInfo
+	driver?: DriverInfo,
+	driversLoaded = true
 ): AddressHelp {
 	const kind = occupancyKindOf(dataType);
 	if (driver) {
 		return {
 			driverHelp: driver.addressHelp,
-			placeholder: '',
+			placeholder: DRIVER_ADDRESS_PLACEHOLDER,
+			examples: [],
+			deviceHint: '',
+			occupancyHint: driverOccupancyHint(kind),
+			bitHint: ''
+		};
+	}
+	if (isDriverPending(protocol, driversLoaded, driver)) {
+		return {
+			driverHelp: 'ドライバの情報を読み込み中です。',
+			placeholder: DRIVER_ADDRESS_PLACEHOLDER,
 			examples: [],
 			deviceHint: '',
 			occupancyHint: driverOccupancyHint(kind),

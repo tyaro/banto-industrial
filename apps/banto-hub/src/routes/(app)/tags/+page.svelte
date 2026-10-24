@@ -228,6 +228,8 @@
 	 * 画面は動く（失敗時は空のままで、ホストの表と未選択の説明に落ちる）。
 	 */
 	let drivers: DriverInfo[] = $state.raw([]);
+	/** 一覧の取得が済んだか（失敗も済み扱い）。未着と「届いたが載っていない」を区別する。 */
+	let driversLoaded = $state(false);
 
 	async function loadDrivers(): Promise<void> {
 		try {
@@ -235,6 +237,7 @@
 		} catch {
 			drivers = [];
 		}
+		driversLoaded = true;
 	}
 
 	/** 接続のプロトコル（= ドライバの id）に対応する記述子。ホストの接続・未選択・未着は `undefined`。 */
@@ -248,7 +251,7 @@
 	 * ホストの表では `push` だけが出す（サーバー側 `banto-tags` が最終防衛線として拒否する）。
 	 */
 	function dataTypeOptionsFor(protocol: PlcProtocol | undefined): DataTypeOption[] {
-		return dataTypeOptionsForConnection(protocol, driverFor(protocol));
+		return dataTypeOptionsForConnection(protocol, driverFor(protocol), driversLoaded);
 	}
 
 	/**
@@ -5284,7 +5287,12 @@
 				安全。
 			-->
 			{@const protocol = connectionForGroupId(form.collectionGroupId)?.protocol}
-			{@const addressHelp = addressHelpFor(protocol, form.dataType, driverFor(protocol))}
+			{@const addressHelp = addressHelpFor(
+				protocol,
+				form.dataType,
+				driverFor(protocol),
+				driversLoaded
+			)}
 			{@const preflightFieldErrors = addressPreflight.result
 				? fieldErrorsFromList(addressPreflight.result.errors[0]?.fieldErrors ?? [])
 				: {}}
@@ -6294,15 +6302,21 @@
 		以前は MELSEC 固有の説明（X/Y/B/W/SB/SW/DX/DY の 16 進）と `D3000` が固定で出ていた。
 	-->
 	{@const addrProtocol = connectionForGroupId(continuousForm.collectionGroupId)?.protocol}
-	{@const addrHelp = addressHelpFor(addrProtocol, continuousForm.dataType, driverFor(addrProtocol))}
+	{@const addrHelp = addressHelpFor(
+		addrProtocol,
+		continuousForm.dataType,
+		driverFor(addrProtocol),
+		driversLoaded
+	)}
 	<div class="drawer-section">
 		<p class="note">
 			名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
 			<code>temp{'{n}'}</code> + 開始1 + 3点 → temp1, temp2,
 			temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
 			等のワード型は+1、i32/u32/f32 は+2、i64/u64/f64 は+4、string は文字列長分）。<code>.N</code
-			>（ビット位置）付きのアドレス（例: <code>D100.5</code>）はワード内 bit 連番になります（bit15
-			の次は次ワードの bit0）。桁上がりなどアドレスの進み方はドライバのアドレス規則に従います。
+			>（ビット位置）付きのアドレス（ワード内のビット指定。書き方はドライバによる）はワード内 bit
+			連番になります（bit15 の次は次ワードの
+			bit0）。桁上がりなどアドレスの進み方はドライバのアドレス規則に従います。
 		</p>
 		{#if continuousForm.collectionGroupId !== ''}
 			<!--
@@ -7456,11 +7470,17 @@
 						<input
 							type="text"
 							bind:value={structForm.baseAddress}
-							placeholder={addressHelpFor(structProtocol, 'u16', driverFor(structProtocol))
-								.placeholder}
+							placeholder={addressHelpFor(
+								structProtocol,
+								'u16',
+								driverFor(structProtocol),
+								driversLoaded
+							).placeholder}
 							data-testid="struct-reg-base-address"
 						/>
-						<span class="hint">ビットサフィックス（例: D100.5）は指定できません。</span>
+						<span class="hint"
+							>ワード内のビット指定は使えません。ワードのアドレスを指定してください。</span
+						>
 					</label>
 				{/if}
 				<label class="field checkbox">
@@ -7534,7 +7554,8 @@
 									placeholder={addressHelpFor(
 										structProtocol,
 										field.dataType,
-										driverFor(structProtocol)
+										driverFor(structProtocol),
+										driversLoaded
 									).placeholder}
 									data-testid={`struct-reg-field-address-${i}`}
 								/>

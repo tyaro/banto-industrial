@@ -61,7 +61,7 @@ export type StructAllocationResult =
 
 /** ワード内ビットのベースアドレスを断る文言（以前の `allocateStructFields` と同じ）。 */
 export const STRUCT_BASE_BIT_ERROR =
-	'ベースアドレスにビット指定（例: D100.5）は使えません。ワードアドレス（例: D100）を指定してください。';
+	'ベースアドレスにワード内のビット指定は使えません。ワードのアドレスを指定してください。';
 
 /** 1 つのフィールドを引く要求の素（アドレスだけ差し替える）。 */
 function fieldItemBase(field: StructField) {
