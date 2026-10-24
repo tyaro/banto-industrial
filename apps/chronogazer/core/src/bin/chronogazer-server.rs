@@ -29,7 +29,8 @@
 //! 3. ルートを作って A1 の排他を取る（`server_host::lock`）。取れなければルートの下に
 //!    何も作らず、理由はコンソールだけに出して終了コード 2。
 //! 4. ログを開き（`<root>\logs\chronogazer-server-YYYY-MM-DD.log`）、標準出力・標準
-//!    エラー出力をそこへ向け直してコンソールにも写す（Windows。`chronogazer_server/console.rs`）。
+//!    エラー出力をそこへ向け直してコンソールにも写す（Windows。`chronogazer_core::stdio_log`、
+//!    Ctrl の扱いは `chronogazer_server/console.rs`）。
 //!    **リストア予約の適用と DB の初期化より前**（#598 のオーナーレビュー P2: DB を
 //!    開けない理由と対処、リストア予約の警告を日次ログに残す）。
 //! 5. リストア予約の適用 → DB の初期化（`LockedServer::open`）→ Hub のキーの保存先 →

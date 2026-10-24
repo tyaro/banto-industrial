@@ -170,7 +170,9 @@ pub const LOG_FILE_PREFIX: &str = "chronogazer-server-";
 pub const LOG_FILE_SUFFIX: &str = ".log";
 /// デスクトップ（シェル）が設定モードの間に書くログのファイル名の接頭辞
 /// （`chronogazer-desktop-YYYY-MM-DD.log`。#623 PR-4、2026-10-18 オーナー決定 (3)）。
-/// 書くのは `crate::mode_switch::append_desktop_log`。古いファイルはサービスのログと同じ
+/// 書くのは `crate::mode_switch::append_desktop_log`（モードの切り替えの行）と、デスクトップの
+/// 診断のログ（[`ServerLog::open_desktop`] + `crate::stdio_log`。2026-10-24 オーナー決定「案 A」）。
+/// 古いファイルはサービスのログと同じ
 /// 保持日数で [`LogPrune`] が消す（[`parse_log_file_date`] が両方の形を受ける）。
 pub const DESKTOP_LOG_FILE_PREFIX: &str = "chronogazer-desktop-";
 
@@ -951,9 +953,13 @@ impl LogDir {
 }
 
 /// 日付ごとのログファイル（モジュール doc「ログ」）。書き込みの失敗は捨てる
-/// （ログが書けないことで収集を止めない）。
+/// （ログが書けないことで収集を止めない）。ファイル名の接頭辞は `chronogazer-server`
+/// （[`ServerLog::open`]・[`ServerLog::open_in`]）か、デスクトップの
+/// `chronogazer-desktop-`（[`ServerLog::open_desktop`]。2026-10-24 オーナー決定「案 A」）。
 pub struct ServerLog {
     dir: LogDir,
+    /// ファイル名の接頭辞（[`LOG_FILE_PREFIX`] か [`DESKTOP_LOG_FILE_PREFIX`]）。
+    prefix: &'static str,
     clock: Arc<dyn Clock>,
     current: Option<(LocalDate, File)>,
     /// `None` の間は消さない（保持日数をまだ読んでいない・無制限）。
@@ -967,7 +973,22 @@ impl ServerLog {
     pub fn open(dir: impl Into<PathBuf>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        Self::start(LogDir::Path(dir), clock)
+        Self::start(LogDir::Path(dir), LOG_FILE_PREFIX, clock)
+    }
+
+    /// デスクトップの診断のログ（`dir` の `chronogazer-desktop-YYYY-MM-DD.log`。2026-10-24
+    /// オーナー決定「案 A」）。開き方は [`ServerLog::open`] と同じ（パス。デスクトップは利用者の
+    /// 権限で動き、設定モードの間だけ書く - `banto_safe_root::Mode::Plain` と同じ扱い）。
+    /// 同じファイルには `crate::mode_switch::append_desktop_log` も追記する（同じ行の形）。
+    pub fn open_desktop(dir: impl Into<PathBuf>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
+        let dir = dir.into();
+        std::fs::create_dir_all(&dir)?;
+        Self::start(LogDir::Path(dir), DESKTOP_LOG_FILE_PREFIX, clock)
+    }
+
+    /// [`ServerLog::open_desktop`] を OS の時計で（デスクトップが使う）。
+    pub fn open_desktop_now(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
+        Self::open_desktop(dir, Arc::new(banto_tstore::SystemClock))
     }
 
     /// 握ったフォルダ（`<root>\logs` を `SafeRoot::open_managed` で握った物）に今日のファイルを
@@ -975,12 +996,13 @@ impl ServerLog {
     /// ハンドルで確かめる。サービス。#623 PR-3、設計 §3.1 の 6）。日跨ぎの新しいファイルも
     /// 同じく開き、古いファイルの削除は `remove_where`（印のファイルは消さない）。
     pub fn open_in(dir: Arc<ManagedDir>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
-        Self::start(LogDir::Managed(dir), clock)
+        Self::start(LogDir::Managed(dir), LOG_FILE_PREFIX, clock)
     }
 
-    fn start(dir: LogDir, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
+    fn start(dir: LogDir, prefix: &'static str, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
         let mut log = Self {
             dir,
+            prefix,
             clock,
             current: None,
             retention_days: None,
@@ -996,7 +1018,8 @@ impl ServerLog {
     }
 
     fn open_file(&self, date: LocalDate) -> std::io::Result<File> {
-        self.dir.open_append(&log_file_name(date))
+        self.dir
+            .open_append(&dated_log_file_name(self.prefix, date))
     }
 
     /// 今書いているファイル。
@@ -1006,7 +1029,7 @@ impl ServerLog {
             .as_ref()
             .map(|(date, _)| *date)
             .unwrap_or_else(|| self.today());
-        self.dir.path().join(log_file_name(date))
+        self.dir.path().join(dated_log_file_name(self.prefix, date))
     }
 
     pub fn dir(&self) -> &Path {

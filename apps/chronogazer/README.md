@@ -51,8 +51,15 @@ Git Bash: `CHRONOGAZER_ROOT=/d/scratch/cg-dev pnpm --filter chronogazer tauri de
 
 - ルートの下: DB `chronogazer.sqlite3`、時系列データ `data\`（`data.dir` の既定）、バックアップ
   `backups\chronogazer.sqlite3\`、監査の保留 `audit-spool\chronogazer.sqlite3\`、Hub の API キー
-  `secrets\hub-keys\`（DPAPI で守ったファイル。以前の版は OS キーリング）。デスクトップ版はログ `logs\` と
-  `run\endpoint.json` は書かない（`chronogazer-server` のもの）。
+  `secrets\hub-keys\`（DPAPI で守ったファイル。以前の版は OS キーリング）。デスクトップ版は
+  `run\endpoint.json` を書かない（`chronogazer-server` のもの）。
+- **デスクトップのログ**（2026-10-24〜、オーナー決定「案 A」）: `logs\chronogazer-desktop-YYYY-MM-DD.log`。
+  設定モードでこの PC の中で収集している間の**診断**（記録エンジン・収集・Hub の購読などが標準エラー出力に
+  出す行。書き込みの失敗・セッションの起動の失敗など）と、モードの切り替えの行が、各行に時刻
+  `[YYYY-MM-DD HH:MM:SS]` を付けて入る。書くのは記録エンジンが動き始めてから、終了・運用モードへの切り替えで
+  止めるまで（運用モードの間は `logs\` が読み取りだけなので書かない。運用モードの間の記録はサービスの
+  `chronogazer-server-YYYY-MM-DD.log`）。古いファイルは `chronogazer-server` と同じ保持日数（`log.retention_days`、
+  既定 30 日）で消える。デバッグビルドではコンソールにも同じ行が出る。ログを書けなくても収集は止めない。
 - ルートが無ければ作る。そのときは継承しない ACL（SYSTEM・Administrators にフル、作った利用者に「変更」、
   Users なし）を付ける。**同じ PC の他の利用者はそのデータを使えない**（起動するとデータを使えない旨のエラーの窓が出る）。
   既にあるルートの ACL には触らない。ルートを使えない・作れないときは理由と「終了」だけの窓が出る。
@@ -273,7 +280,8 @@ DB スキーマを banto の admin-template と同じ形に整理した（2026-1
 - 既に起動中・旧形式の DB: 上の各節の窓（今までどおり）。
 
 選んだ対処は監査ログに `startup_recovery` として残る（バックアップから戻したときは `restore_applied` も）。
-デスクトップ版はログファイルを残さないので、問い合わせには窓の「詳しい理由」を控える。
+起動に失敗した理由はデスクトップのログ（`logs\chronogazer-desktop-YYYY-MM-DD.log`）に残らないので、問い合わせには
+窓の「詳しい理由」を控える。
 
 ### 1 つの DB につき 1 プロセス（2026-10-10〜）
 

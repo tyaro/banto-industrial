@@ -3,7 +3,7 @@
 //!
 //! 削除は起動時の `ServerLog::set_retention` の 1 件だけでなく、サービスが日付をまたいで
 //! 動くと `ServerLog::write_line` の日付の切り替えでも起きる（向け直しのポンプ
-//! `console::pump` と `StdioRedirect::write_through`）。削除は握った `logs\` の子を名前で
+//! `chronogazer_core::stdio_log` の `pump` と `StdioRedirect::write_through`）。削除は握った `logs\` の子を名前で
 //! 開いて消すので（`ManagedDir::remove_where`）、STOP で ACL を緩め始めた後に重なると
 //! 約束 2「緩め始めたら新しく開かない」に反する。そこでサービスの中の削除はすべて
 //! [`LogPrunes::spawn`] で走らせ、STOP は

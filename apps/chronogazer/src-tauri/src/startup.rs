@@ -11,7 +11,8 @@
 //! - それ以外は対処の窓（`static/startup-recovery.html`、label
 //!   [`RECOVERY_WINDOW_LABEL`]）。表に当てはまらない失敗（データの置き場所を
 //!   作れない・画面を作れない など）は「終了」だけの窓で、理由とデータの置き場所を
-//!   出す（デスクトップ版はログファイルを残さないので、その旨も出す）。
+//!   出す（起動に失敗した理由はデスクトップのログファイルに残らないので、その旨も出す。
+//!   診断のログ（`crate::diag_log`）を向け直すのは A1 の排他を取った後で、失敗したら外す）。
 //!
 //! # 窓と Rust のやりとり
 //!
@@ -52,10 +53,11 @@
 //! 側（サービス・コンソール版）を名指しして出る（`StartupErrorNotice::already_running`）。
 //!
 //! 旧データ（`%APPDATA%\dev.tyaro.chronogazer\`）は**読まない・移さない・消さない**
-//! （H9）。案内は [`crate::legacy_notice`]。デスクトップ host はログファイル
-//! （`<root>\logs`）も `run\endpoint.json` も書かない（どちらも `chronogazer-server`
-//! のもの。endpoint はシェルの probe がサービスを探すためのもので、デスクトップが
-//! 書くと別の host を指す）。
+//! （H9）。案内は [`crate::legacy_notice`]。デスクトップ host は `run\endpoint.json` を
+//! 書かない（`chronogazer-server` のもの。endpoint はシェルの probe がサービスを探すための
+//! もので、デスクトップが書くと別の host を指す）。ログは `chronogazer-server` の日次ログ
+//! とは別の `<root>\logs\chronogazer-desktop-YYYY-MM-DD.log` に、設定モードの間だけ書く
+//! （モードの切り替えの行と診断。`crate::diag_log`、2026-10-24 オーナー決定「案 A」）。
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -391,7 +393,7 @@ fn build_view(
         detail,
         path: paths.db_path.display().to_string(),
         log_hint: format!(
-            "デスクトップ版の ChronoGazer はログファイルを残しません。問い合わせるときは、上の詳しい理由を控えてください（選択してコピーできます）。データの置き場所: {}",
+            "デスクトップ版の ChronoGazer は、起動に失敗した理由をログファイルに残しません。問い合わせるときは、上の詳しい理由を控えてください（選択してコピーできます）。データの置き場所: {}",
             paths.data_dir.display()
         ),
         choices: choices
@@ -621,7 +623,7 @@ pub(crate) fn show_fatal(app: &AppHandle, detail: String) {
         message: failure_text(FailureKind::Other).1.to_string(),
         detail: detail.clone(),
         path: String::new(),
-        log_hint: "デスクトップ版の ChronoGazer はログファイルを残しません。問い合わせるときは、上の詳しい理由を控えてください（選択してコピーできます）。".to_string(),
+        log_hint: "デスクトップ版の ChronoGazer は、起動に失敗した理由をログファイルに残しません。問い合わせるときは、上の詳しい理由を控えてください（選択してコピーできます）。".to_string(),
         choices: vec![choice_view(RecoveryChoice::Quit, "", "")],
         backups: Vec::new(),
         backups_error: None,
