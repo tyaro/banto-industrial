@@ -1500,9 +1500,11 @@ async fn validate_tag_kind_placement_tx(
     Ok(placement)
 }
 
-/// A disabled update at the same read location may repair an old invalid tag.
-/// Read the old row through the caller's transaction so this decision cannot
-/// race a concurrent change of its placement.
+/// A disabled update at the same PLC read location may keep an old invalid
+/// address. Only the address parse may be waived: kind placement, Hub/push
+/// rules, driver kind/write restrictions and uniqueness still apply.
+/// Read both rows through the caller's transaction so this decision cannot
+/// race a concurrent change of placement.
 async fn placement_for_update_tx(
     connection: &mut SqliteConnection,
     registry: Option<&DriverRegistry>,
@@ -1510,19 +1512,44 @@ async fn placement_for_update_tx(
     id: i64,
     input: &TagInput,
 ) -> Result<Placement, BantoError> {
-    if registry.is_some() && !input.enabled {
+    if let Some(registry) = registry.filter(|_| !input.enabled) {
         if let Some(before) = fetch_tag_row(connection, id)
             .await
             .map_err(banto_storage::storage_error)?
         {
-            if before.collection_group_id == input.collection_group_id
+            if before.tag_kind == PLC_TAG_KIND
+                && input.tag_kind == PLC_TAG_KIND
+                && before.collection_group_id == input.collection_group_id
                 && before.address == input.address
                 && before.data_type == input.data_type
+                // With an unparseable address the driver cannot tell whether
+                // this is a writable area. Do not newly enable writing here.
+                && (!input.writable || before.writable)
             {
-                return Ok(Placement {
-                    unique: None,
-                    address: before.address,
-                });
+                let row: Option<(i64, String, String)> = sqlx::query_as(PLACEMENT_CONNECTION_SQL)
+                    .bind(input.collection_group_id)
+                    .fetch_optional(&mut *connection)
+                    .await
+                    .map_err(banto_storage::storage_error)?;
+                if let Some((_, conn_name, protocol)) = row {
+                    if let Err(errors) = normalize_tag_address_with_hub(
+                        &conn_name,
+                        &protocol,
+                        input,
+                        registry,
+                        accept_hub_connections,
+                    ) {
+                        if errors.iter().all(|error| error.field == "address") {
+                            return Ok(Placement {
+                                unique: None,
+                                address: before.address,
+                            });
+                        }
+                        return Err(BantoError::Validation {
+                            field_errors: errors,
+                        });
+                    }
+                }
             }
         }
     }
@@ -9439,6 +9466,147 @@ mod tests {
                 .field,
                 "address"
             );
+        }
+
+        #[tokio::test]
+        async fn disabled_update_still_checks_kind_and_driver_write_area() {
+            let (legacy, tags, group) = reg_setup().await;
+            let placed = tags.create(tag_at("Placed", group, "D100")).await.unwrap();
+            let mut misplaced = tag_at("Placed", group, "D100");
+            misplaced.enabled = false;
+            misplaced.tag_kind = DB_TAG_KIND.to_string();
+            assert_eq!(
+                field_errors_of(tags.update(placed.id, misplaced).await.unwrap_err())[0].field,
+                "tagKind"
+            );
+
+            let read_only = tags.create(tag_at("Read", group, "r100")).await.unwrap();
+            let mut writable = tag_at("Read", group, "R100");
+            writable.enabled = false;
+            writable.writable = true;
+            assert_eq!(
+                field_errors_of(tags.update(read_only.id, writable).await.unwrap_err())[0].field,
+                "writable"
+            );
+
+            // A malformed address cannot establish the driver's write area.
+            let old = legacy.create(tag_at("Old", group, "bad!")).await.unwrap();
+            let mut writable = tag_at("Old", group, "bad!");
+            writable.enabled = false;
+            writable.writable = true;
+            assert!(tags.update(old.id, writable).await.is_err());
+            assert!(tags.get(old.id).await.unwrap().enabled);
+        }
+
+        #[tokio::test]
+        async fn disabled_update_still_checks_hub_and_push_write_and_scaling() {
+            let (legacy, tags, _) = reg_setup().await;
+            let hub = hub_group(&legacy.pool).await;
+            let push = push_group(&legacy.pool, "Bridge").await;
+            let tags = tags.accept_hub_connections();
+            for (name, group, address) in [("Hub", hub, "PLC.G.T"), ("Push", push, "temperature")] {
+                let created = tags.create(tag_at(name, group, address)).await.unwrap();
+                let mut disabled = tag_at(name, group, address);
+                disabled.enabled = false;
+                disabled.writable = true;
+                assert_eq!(
+                    field_errors_of(tags.update(created.id, disabled.clone()).await.unwrap_err())
+                        [0]
+                    .field,
+                    "writable"
+                );
+                disabled.writable = false;
+                disabled.raw_lo = Some(0.0);
+                disabled.raw_hi = Some(100.0);
+                disabled.eng_lo = Some(0.0);
+                disabled.eng_hi = Some(1.0);
+                assert_eq!(
+                    field_errors_of(tags.update(created.id, disabled).await.unwrap_err())[0].field,
+                    "scaling"
+                );
+                assert!(tags.get(created.id).await.unwrap().enabled);
+            }
+        }
+
+        #[tokio::test]
+        async fn disabled_batch_checks_placement_and_keeps_legacy_address_exception() {
+            let (legacy, tags, group) = reg_setup().await;
+            let hub = hub_group(&legacy.pool).await;
+            let push = push_group(&legacy.pool, "Bridge").await;
+            let tags = tags.accept_hub_connections();
+            let placed = tags.create(tag_at("Placed", group, "D100")).await.unwrap();
+            let old = legacy.create(tag_at("Old", group, "bad!")).await.unwrap();
+            let read_only = tags.create(tag_at("Read", group, "r100")).await.unwrap();
+            let hub_tag = tags.create(tag_at("Hub", hub, "PLC.G.T")).await.unwrap();
+            let push_tag = tags
+                .create(tag_at("Push", push, "temperature"))
+                .await
+                .unwrap();
+            let mut misplaced = tag_at("Placed", group, "D100");
+            misplaced.enabled = false;
+            misplaced.tag_kind = DB_TAG_KIND.to_string();
+            let mut disabled = tag_at("Old", group, "bad!");
+            disabled.enabled = false;
+            let mut driver_write = tag_at("Read", group, "R100");
+            driver_write.enabled = false;
+            driver_write.writable = true;
+            let mut hub_write = tag_at("Hub", hub, "PLC.G.T");
+            hub_write.enabled = false;
+            hub_write.writable = true;
+            let mut push_scaling = tag_at("Push", push, "temperature");
+            push_scaling.enabled = false;
+            push_scaling.raw_lo = Some(0.0);
+            push_scaling.raw_hi = Some(100.0);
+            push_scaling.eng_lo = Some(0.0);
+            push_scaling.eng_hi = Some(1.0);
+
+            let mut tx = tags.pool.begin().await.unwrap();
+            let outcome = tags
+                .update_batch_tx(
+                    &mut tx,
+                    &[
+                        (old.id, disabled.clone()),
+                        (placed.id, misplaced),
+                        (read_only.id, driver_write),
+                        (hub_tag.id, hub_write),
+                        (push_tag.id, push_scaling),
+                    ],
+                )
+                .await
+                .unwrap();
+            let BatchTagUpdateOutcome::Invalid(errors) = outcome else {
+                panic!("expected invalid placement");
+            };
+            assert_eq!(errors.len(), 4, "{errors:?}");
+            for (error, (index, field)) in errors.iter().zip([
+                (1, "tagKind"),
+                (2, "writable"),
+                (3, "writable"),
+                (4, "scaling"),
+            ]) {
+                assert_eq!(error.index, index);
+                assert_eq!(error.field_errors[0].field, field);
+            }
+            tx.rollback().await.unwrap();
+            assert!(tags.get(old.id).await.unwrap().enabled);
+            assert!(tags.get(placed.id).await.unwrap().enabled);
+            assert!(tags.get(read_only.id).await.unwrap().enabled);
+            assert!(tags.get(hub_tag.id).await.unwrap().enabled);
+            assert!(tags.get(push_tag.id).await.unwrap().enabled);
+
+            let mut tx = tags.pool.begin().await.unwrap();
+            let outcome = tags
+                .update_batch_tx(&mut tx, &[(old.id, disabled)])
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                BatchTagUpdateOutcome::Valid { count: 1, .. }
+            ));
+            tx.commit().await.unwrap();
+            let old = tags.get(old.id).await.unwrap();
+            assert!(!old.enabled);
+            assert_eq!(old.address, "bad!");
         }
 
         // -- Q2: protocol change and group move re-parse the tags -----------------
