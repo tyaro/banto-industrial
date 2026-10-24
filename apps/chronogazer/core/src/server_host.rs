@@ -1069,7 +1069,12 @@ impl ServerLog {
             }
         }
         if let Some((_, file)) = self.current.as_mut() {
-            let _ = writeln!(file, "[{}] {line}", format_timestamp(now_ms, offset_ms));
+            // 1 行を組み立ててから 1 回で書く（`writeln!` は時刻・本文・改行を別々に書く）。
+            // デスクトップでは `crate::mode_switch::append_desktop_log` が同じファイルへ別の
+            // ハンドルで追記するので、追記モードが守るのは 1 回の書き込みの単位だけ（#825 の
+            // レビュー P2）。
+            let record = format!("[{}] {line}\n", format_timestamp(now_ms, offset_ms));
+            let _ = file.write_all(record.as_bytes());
         }
         prune
     }
