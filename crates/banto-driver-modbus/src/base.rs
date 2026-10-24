@@ -161,6 +161,19 @@ impl DriverBase for ModbusDriver {
             .as_modbus_ref()
             .expect("Address::parse always yields a ModbusRef");
         check_kind(text, area, bit, kind)?;
+        // A multi-word kind occupies `offset..offset + words`; the last
+        // register must still be inside the 16-bit register space.
+        let words = u32::from(kind.word_count().max(1));
+        if u32::from(offset) + words - 1 > 65_535 {
+            return Err(AddressError::new(format!(
+                "アドレス {:?} から {} 型（{words} ワード）を置くと末尾が Modbus の範囲（…65536）を超えます",
+                text.trim(),
+                match kind {
+                    TagKind::Numeric(data_type) => data_type.to_string(),
+                    _ => "このデータ".to_owned(),
+                }
+            )));
+        }
         let driver_address = DriverAddress::new(
             descriptor().id.clone(),
             address.to_string(),
@@ -220,11 +233,15 @@ impl DriverBase for ModbusDriver {
         }
         let step = i128::from(kind.word_count().max(1));
         let next = i128::from(offset) + step * i128::from(n);
-        let next = u16::try_from(next).map_err(|_| {
-            AddressError::new(format!(
-                "アドレス {canonical:?} から {n} 点先のアドレスを算出できません（範囲外です）"
-            ))
-        })?;
+        let last = next + step - 1;
+        let next = u16::try_from(next)
+            .ok()
+            .filter(|_| last <= 65_535)
+            .ok_or_else(|| {
+                AddressError::new(format!(
+                    "アドレス {canonical:?} から {n} 点先のアドレスを算出できません（範囲外です）"
+                ))
+            })?;
         Ok(Address::ModbusRef {
             area,
             offset: next,
@@ -496,13 +513,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_address_refuses_a_tail_past_the_register_space() {
+        let ok = |text: &str, t: DataType| ModbusDriver.parse_address(text, &kind(t)).is_ok();
+        assert!(ok("465536", DataType::U16));
+        assert!(!ok("465536", DataType::I32));
+        assert!(ok("465535", DataType::F32));
+        assert!(!ok("465536", DataType::F32));
+        assert!(ok("465533", DataType::F64));
+        assert!(!ok("465534", DataType::F64));
+        assert!(ok("065536", DataType::Bit));
+    }
+
+    #[test]
     fn parse_address_reports_the_zero_based_index() {
         let index = |text: &str, k: TagKind| ModbusDriver.parse_address(text, &k).unwrap().index;
         assert_eq!(index("40001", one_word()), Some(0));
         assert_eq!(index("400010", one_word()), Some(9));
         assert_eq!(index("40001.3", kind(DataType::Bit)), Some(0));
         assert_eq!(index("00005", kind(DataType::Bit)), Some(4));
-        assert_eq!(index("465536", kind(DataType::F32)), Some(65_535));
+        assert_eq!(index("465535", kind(DataType::F32)), Some(65_534));
+        assert_eq!(index("465536", one_word()), Some(65_535));
     }
 
     // ------------------------------------------------------------------
@@ -899,7 +929,7 @@ mod tests {
             ("065536", bit(), "065536"),
             ("00001", bit(), "000001"),
             ("30001", kind(DataType::F32), "300001"),
-            ("465536", kind(DataType::I32), "465536"),
+            ("465535", kind(DataType::I32), "465535"),
         ];
         for (text, k, canonical) in rows {
             let a = ModbusDriver

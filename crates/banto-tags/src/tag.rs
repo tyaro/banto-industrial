@@ -1687,6 +1687,69 @@ pub fn parse_tag_address(
     normalize_tag_address(conn_name, protocol, &input, registry)
 }
 
+/// How [`offset_tag_address`] counts `n` (docs/banto-hub-driver-ui-design.md §4.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OffsetUnit {
+    /// `n` points of the tag's own kind (continuous registration): the driver's
+    /// `offset_address` (an f32 `D100` + 1 = `D102`).
+    Points,
+    /// `n` words of physical displacement (offset copy, struct registration):
+    /// the driver's `offset_words` (an f32 `D100` + 1 = `D101`; `D100.5` + 1 =
+    /// `D101.5`).
+    Words,
+}
+
+/// The address `n` units away from `probe`'s (R2b-6d-1, docs/banto-hub-driver-ui-design.md
+/// §4.3): the pure core of `POST /api/tags/offset-addresses`. The address is first
+/// verified with the very function the save path uses ([`parse_tag_address`]) and
+/// moved from its canonical form by the connection's driver ([`OffsetUnit`]); the
+/// moved address is verified again with the same kind, so leaving the address space
+/// (a 64-bit tag running past the end) is an error of this item. Only a driver
+/// connection can be moved: a protocol without a registry entry or a host-provided
+/// one (`postgres` / `push` / `virtual`) is an `address` error.
+pub fn offset_tag_address(
+    conn_name: &str,
+    protocol: &str,
+    probe: &AddressProbe<'_>,
+    registry: &DriverRegistry,
+    n: i64,
+    unit: OffsetUnit,
+) -> Result<NormalizedAddress, Vec<FieldError>> {
+    let address_error = |message: String| {
+        vec![FieldError {
+            field: "address".to_string(),
+            message,
+        }]
+    };
+    let entry = match registry.get(protocol) {
+        Some(entry) if !matches!(entry.kind(), banto_driver_api::DriverKind::HostProvided(_)) => {
+            entry
+        }
+        _ => {
+            return Err(address_error(format!(
+                "この接続のプロトコル {protocol} はアドレスを動かせません"
+            )))
+        }
+    };
+    let current = parse_tag_address(conn_name, protocol, probe, registry)?;
+    let kind = tag_kind(probe.data_type, probe.string_length, probe.string_encoding)
+        .ok_or_else(|| address_error("データ型から種類を組み立てられません".to_string()))?;
+    let moved = match unit {
+        OffsetUnit::Points => entry.base().offset_address(&current.canonical, &kind, n),
+        OffsetUnit::Words => entry.base().offset_words(&current.canonical, n),
+    }
+    .map_err(|e| address_error(e.message().to_string()))?;
+    parse_tag_address(
+        conn_name,
+        protocol,
+        &AddressProbe {
+            address: &moved,
+            ..*probe
+        },
+        registry,
+    )
+}
+
 /// The `plc` arm of [`normalize_tag_address`].
 fn normalize_plc_address(
     protocol: &str,

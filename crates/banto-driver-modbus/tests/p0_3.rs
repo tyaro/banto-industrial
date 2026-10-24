@@ -307,8 +307,15 @@ async fn a_span_past_the_address_space_is_unsupported_alone() {
     let mut session = connect(&sim, Duration::from_secs(5)).await.unwrap();
     let specs = [
         spec("465535", n(DataType::U16)),
-        // offset 65535 の U32 は 65537 で終わる。
-        spec("465536", n(DataType::U32)),
+        // offset 65535 の U32 は 65537 で終わる。`parse_address` は末尾が
+        // 範囲を超えるアドレスを断るので、保存を経ない spec（計画の守り）を
+        // U16 で解いた住所に U32 の種類を付けて作る。
+        TagSpec::new(
+            ModbusDriver
+                .parse_address("465536", &n(DataType::U16))
+                .unwrap(),
+            n(DataType::U32),
+        ),
         // offset 65534 の U32 は 65536 ちょうどで終わる。
         spec("465535", n(DataType::U32)),
     ];
