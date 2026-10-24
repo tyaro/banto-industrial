@@ -2956,6 +2956,11 @@ impl Lifecycle {
             Some(factory) => (factory.clone(), Vec::new()),
             None => {
                 let sync = self.ctx.sessions().sync(&snapshot, &mut config).await;
+                for (id, reason) in &sync.failures {
+                    eprintln!(
+                        "banto: ブローカーセッションの起動に失敗しました (接続 {id}): {reason}"
+                    );
+                }
                 (sync.factory, sync.stale)
             }
         };

@@ -2968,3 +2968,38 @@ async fn apply_config_writer_rotation_preserves_old_and_new_data() {
         "the rotated file should hold B's real recorded value"
     );
 }
+
+/// A session that cannot be started is reported in `SessionSync::failures`
+/// (not printed by the library), and gets no client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_that_cannot_start_is_reported_in_failures() {
+    let _serial = TEST_SERIAL.lock().await;
+    let env = TempEnv::new("session-failure");
+    let pool = open_registry(&env).await;
+    let conn = PlcConnectionService::new(pool.clone())
+        .create(conn_input("PLC1", 502))
+        .await
+        .unwrap();
+    let group = CollectionGroupService::new(pool.clone())
+        .create(group_input("G1", conn.id, 100))
+        .await
+        .unwrap();
+    TagService::new(pool.clone())
+        .create(tag_input("t1", group.id, "40001", "i16"))
+        .await
+        .unwrap();
+    // The plan is built with the real drivers, but the sessions dial through
+    // an empty registry: the protocol has no driver there.
+    let mut config = build_config(&pool, drivers()).await.unwrap();
+    let sessions = BrokerSessions::new(
+        Arc::new(DriverRegistry::new()),
+        fast_options().broker_options(),
+    );
+    let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
+    let sync = sessions.sync(&snapshot, &mut config).await;
+    assert_eq!(sync.failures.len(), 1);
+    assert_eq!(sync.failures[0].0, conn.id);
+    assert!(!sync.failures[0].1.is_empty());
+    assert_eq!(sessions.connection_count(), 0);
+    sessions.shutdown().await;
+}

@@ -45,6 +45,11 @@ pub struct SessionSync {
     /// Connection ids that still have a session but are no longer collected -
     /// to [`BrokerSessions::remove`] after the collector commit succeeded.
     pub stale: Vec<i64>,
+    /// Connections whose session could not be started `(connection id,
+    /// reason)`: they get a client that never connects (their tags read Bad)
+    /// while collection of the others goes on. The caller logs them with its
+    /// own logger - this crate no longer prints them.
+    pub failures: Vec<(i64, String)>,
 }
 
 /// See this module's doc.
@@ -86,8 +91,9 @@ impl BrokerSessions {
     /// connection `config` plans, its dial settings resolved by the
     /// simulation registry (a changed target drops the old session first),
     /// and the plan stamped with the session's fingerprint. A connection
-    /// whose session cannot be started is logged and gets a client that
-    /// never connects (its tags read Bad); collection of the others goes on.
+    /// whose session cannot be started is reported in
+    /// [`SessionSync::failures`] and gets a client that never connects (its
+    /// tags read Bad); collection of the others goes on.
     pub async fn sync(
         &self,
         snapshot: &RegistrySnapshot,
@@ -96,6 +102,7 @@ impl BrokerSessions {
         let planned = config.broker_connection_keys();
         let mut handles: HashMap<String, ReadOnlyHandle> = HashMap::new();
         let mut wanted: HashSet<i64> = HashSet::new();
+        let mut failures: Vec<(i64, String)> = Vec::new();
         for conn in &snapshot.connections {
             let key = format!("conn:{}", conn.id);
             if !planned.contains(&key) {
@@ -119,10 +126,7 @@ impl BrokerSessions {
                 Ok(handle) => {
                     handles.insert(key, handle.read_only());
                 }
-                Err(err) => eprintln!(
-                    "banto-collect: ブローカーセッションの起動に失敗しました (接続 {}): {err}",
-                    conn.id
-                ),
+                Err(err) => failures.push((conn.id, err.to_string())),
             }
         }
         let stale = self
@@ -134,6 +138,7 @@ impl BrokerSessions {
         SessionSync {
             factory: broker_client_factory(Arc::new(handles)),
             stale,
+            failures,
         }
     }
 
