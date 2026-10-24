@@ -922,7 +922,7 @@
 	 */
 	let createWritableArea = $state<boolean | undefined>(undefined);
 	let createWritableAreaSeq = 0;
-	// 数値の `$derived` にして、3 秒ごとの一覧の再読み込み（`groups`・`connections` の
+	// 数値の `$derived` にして、操作の後の一覧の再読み込み（`reload()` の `groups`・`connections` の
 	// 付け替え）で effect が再実行されて既定が点滅しないようにする。
 	const createConnectionId = $derived(connectionForGroupId(createForm.collectionGroupId)?.id);
 
@@ -3770,7 +3770,7 @@
 	const continuousConnectionId = $derived(
 		connectionForGroupId(continuousForm.collectionGroupId)?.id
 	);
-	/** 入力の中身が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	/** 入力の中身が変わったときだけ再計算する（操作の後の `reload()` による一覧の付け替えでは変わらない）。 */
 	const continuousParamsKey = $derived.by(() => {
 		const params = buildContinuousParams(continuousForm);
 		return params ? JSON.stringify(params) : null;
@@ -4088,7 +4088,7 @@
 		}));
 	}
 
-	/** 入力の中身が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	/** 入力の中身が変わったときだけ再計算する（操作の後の `reload()` による一覧の付け替えでは変わらない）。 */
 	const structInputKey = $derived(
 		structForm.collectionGroupId === ''
 			? null
@@ -4868,7 +4868,7 @@
 	 * （プレビューを出さない - 連続登録/構造体登録と同じ「静かに空のまま」方針）。 */
 	let bulkOffsetCopyResult = $state<OffsetCopyResult | null>(null);
 	let bulkOffsetCopySeq = 0;
-	/** 入力の中身（選択タグとオフセット）が変わったときだけ再計算する（3 秒ごとの一覧の付け替えでは変わらない）。 */
+	/** 入力の中身（選択タグとオフセット）が変わったときだけ再計算する（操作の後の `reload()` による一覧の付け替えでは変わらない）。 */
 	const bulkOffsetCopyKey = $derived.by((): string | null => {
 		if (bulkAction !== 'offset-copy') return null;
 		const offset = parseOptionalNumber(bulkOffsetWords);
