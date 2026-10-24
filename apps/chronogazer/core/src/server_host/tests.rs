@@ -778,3 +778,52 @@ async fn an_unwritable_store_dir_stops_the_start_with_exit_code_3() {
     assert!(!failure.guidance.is_empty());
     assert!(!DataLayout::new(dir.path()).endpoint_file().exists());
 }
+
+/// デスクトップの日次ログ（2026-10-24 オーナー決定「案 A」）: `chronogazer-desktop-` の形で
+/// 開き、日付で切り替え、`append_desktop_log` と同じ行の形（`[YYYY-MM-DD HH:MM:SS] ...`）で
+/// 同じファイルに書く。保持日数の削除はサーバーと同じく両方の形の古いファイルを消す。
+#[test]
+fn desktop_log_uses_the_desktop_prefix_and_shares_the_file_with_mode_switch_lines() {
+    let dir = TempDir::new();
+    let logs = dir.path().join("logs");
+    let clock = Arc::new(ManualClock::new(just_before_midnight_jst(), JST));
+    let mut log = ServerLog::open_desktop(&logs, clock.clone()).expect("open");
+    assert_eq!(
+        log.current_path(),
+        logs.join("chronogazer-desktop-2026-10-13.log")
+    );
+    assert_eq!(log.write_line("診断の行"), None);
+    log.flush();
+    crate::mode_switch::append_desktop_log(
+        &logs,
+        clock.as_ref(),
+        &[crate::mode_switch::DesktopLogEntry::now(
+            clock.as_ref(),
+            "切り替えの行",
+        )],
+    )
+    .expect("append");
+    let text = std::fs::read_to_string(logs.join("chronogazer-desktop-2026-10-13.log")).unwrap();
+    assert_eq!(
+        text,
+        "[2026-10-13 23:59:58] 診断の行\n[2026-10-13 23:59:58] 切り替えの行\n"
+    );
+
+    log.set_retention(Some(30)).expect("削除").run();
+    let old_desktop = logs.join("chronogazer-desktop-2026-01-01.log");
+    let old_server = logs.join("chronogazer-server-2026-01-01.log");
+    for path in [&old_desktop, &old_server] {
+        std::fs::write(path, "x").unwrap();
+    }
+    clock.advance_ms(4_000);
+    let prune = log
+        .write_line("翌日の行")
+        .expect("日付の切り替えで削除を返す");
+    assert_eq!(
+        log.current_path(),
+        logs.join("chronogazer-desktop-2026-10-14.log")
+    );
+    prune.run();
+    assert!(!old_desktop.exists() && !old_server.exists());
+    assert!(logs.join("chronogazer-desktop-2026-10-13.log").exists());
+}

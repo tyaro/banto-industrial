@@ -73,6 +73,9 @@
 //! budgets, opening windows) goes through ONE state machine with one lock and
 //! one explicit table, [`lifecycle`]. Adding an entry point is adding a row.
 
+// 2026-10-24 オーナー決定「案 A」: デスクトップの診断のログ（標準出力・標準エラー出力を
+// 設定モードの間だけ `logs\chronogazer-desktop-YYYY-MM-DD.log` へ向け直す）。
+mod diag_log;
 mod keyring_store;
 // #392 B2-4c の後: シェルのライフサイクルの状態機械（終了・切り替え・復旧の判断の表）。
 mod lifecycle;
@@ -3844,7 +3847,18 @@ struct ExitOnce(ExitCleanupOnce<ExitCleanupReport, ExitTrigger>);
 ///
 /// エンジンが無い（旧形式の DB・同じ DB の使用中で起動を止めた）ときは
 /// 閉じるものが無いので `None`。
+///
+/// 2026-10-24 オーナー決定「案 A」: 後始末の本体（エンジンの停止と結果の記録）の**後で**、
+/// デスクトップの診断のログを封じる（流しきる → 閉じる。[`diag_log`]）。運用モードへの
+/// 切り替え（`switch::hand_off`）もここを通るので、サービスが `logs\` を締める前に外れている。
 fn exit_cleanup(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitCleanupReport> {
+    diag_log::run_then_seal(diag_log::global(), diag_log::FLUSH_WAIT, || {
+        exit_cleanup_body(app, trigger)
+    })
+}
+
+/// [`exit_cleanup`] の本体（診断のログを封じる前）。
+fn exit_cleanup_body(app: &tauri::AppHandle, trigger: ExitTrigger) -> Option<ExitCleanupReport> {
     // #392 B2-4c: 先にシェルの扉を閉じ（以後の移り変わりと、エンジンを置くことを
     // 断る）、走っている移り変わり（Fallback の「再試行」の Desktop の起動）の終わりを
     // 待つ。待った後にエンジンを探すので、移り変わりの中で置かれたエンジンも
@@ -4348,6 +4362,32 @@ async fn launch_desktop(
     paths: &startup::LaunchPaths,
     prelude: startup::Prelude,
 ) -> Result<(), startup::LaunchError> {
+    let result = launch_desktop_inner(app, paths, prelude).await;
+    if let Err(err) = &result {
+        if stops_diag_log_on_launch_error(err) {
+            // 2026-10-24 オーナー決定「案 A」: 起動に失敗したら診断のログの向け直しを外す
+            // （[`diag_log`]。同じプロセスのやり直しでまた始める）。
+            diag_log::global().stop(diag_log::FLUSH_WAIT);
+        }
+    }
+    result
+}
+
+/// 起動の失敗で診断のログの向け直しを外すか。`Exiting` は外さない（#825 のレビュー P2）:
+/// 終了の後始末がもう始まっていて、エンジンを登録した後でもこれが返る（登録後の初期化を
+/// 待つ間にトレイの「終了」）。ここで外すと、その後に後始末が止めるエンジンの停止・最終の
+/// 書き出しの失敗・後始末の結果の行がログに残らない。封じるのは後始末（[`exit_cleanup`] の
+/// `diag_log::run_then_seal`）に任せる。
+fn stops_diag_log_on_launch_error(err: &startup::LaunchError) -> bool {
+    !matches!(err, startup::LaunchError::Exiting)
+}
+
+/// [`launch_desktop`] の本体（失敗したときの診断のログの片付けは呼び出し側）。
+async fn launch_desktop_inner(
+    app: &tauri::AppHandle,
+    paths: &startup::LaunchPaths,
+    prelude: startup::Prelude,
+) -> Result<(), startup::LaunchError> {
     use startup::{LaunchError, Prelude};
 
     // #392 B2-4c: 終了に入っていたら起動しない（Fallback の「再試行」・対処の窓の
@@ -4377,6 +4417,10 @@ async fn launch_desktop(
         }
     }
     .map_err(LaunchError::Engine)?;
+    // 2026-10-24 オーナー決定「案 A」: A1 の排他を取った後（= サービスが `logs\` を締め
+    // られない間）に、標準出力・標準エラー出力を診断のログへ向け直す（[`diag_log`]。失敗しても
+    // 起動は続ける）。
+    diag_log::global().start(&paths.layout.logs_dir());
     // #392 B2-4b: A1 の排他を取った後に Hub のキーの保存先を開く（[`desktop_key_store`]）。
     let opened = opened.with_key_store(desktop_key_store(&paths.layout));
     let mut opened = match recovery_note {
@@ -4503,6 +4547,19 @@ async fn launch_desktop(
     })
     .await?;
     let services = engine.services().clone();
+    // 診断のログの保持日数（`chronogazer-server` と同じ設定。読めなければ消さない）。
+    match services
+        .settings
+        .get(chronogazer_core::server_host::LOG_RETENTION_KEY)
+        .await
+    {
+        Ok(raw) => diag_log::global().set_retention(
+            chronogazer_core::server_host::parse_log_retention(raw.as_deref()),
+        ),
+        Err(err) => {
+            eprintln!("banto: ログの保持日数を読めなかったため、古い診断のログを消しません: {err}")
+        }
+    }
 
     // M11 bootstrap: decide the webview's starting session (see
     // [`initial_desktop_session`]). #392 B1-2: this now runs after the
@@ -4850,6 +4907,18 @@ pub fn run() {
 mod tests {
     use super::*;
     use banto_server::AuthState;
+
+    /// #825 のレビュー P2: 終了が始まった（`Exiting`）起動の失敗では診断のログを外さず、
+    /// 後始末の封じに任せる。それ以外の起動の失敗では外す（同じプロセスのやり直しのため）。
+    #[test]
+    fn a_launch_cut_short_by_exit_leaves_the_diag_log_to_exit_cleanup() {
+        assert!(!stops_diag_log_on_launch_error(
+            &startup::LaunchError::Exiting
+        ));
+        assert!(stops_diag_log_on_launch_error(
+            &startup::LaunchError::Settings(BantoError::Unauthorized)
+        ));
+    }
     use chronogazer_core::backup::BackupService;
     use chronogazer_core::collect::CollectorService;
     use chronogazer_core::db::Db;
