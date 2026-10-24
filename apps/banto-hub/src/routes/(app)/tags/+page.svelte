@@ -3801,6 +3801,44 @@
 		return () => clearTimeout(timer);
 	});
 
+	/**
+	 * R2b-6d-3（実機の確かめ 2026-10-24）: 連続登録の `writable` の既定。単体の新規登録
+	 * （`createWritableTouched` / `createWritableArea`）と同じ仕組みで、チェックボックスを
+	 * 利用者が触るまで「PLC タグかつ書き込める領域かつグループの `defaultWritable`」から自動で決める。
+	 * 領域の判定は下の `continuousPrefillSeq` の effect が開始アドレスを解析した結果の
+	 * `writableArea` を使い回す（新しい API 呼び出しは増やさない）。`undefined` = 判定不能。
+	 * フォームを空に戻す `handleApplyContinuous` で両方リセットする（`openContinuousDrawer` は
+	 * フォーム自体を保つので、ここも保つ）。
+	 */
+	let continuousWritableTouched = $state(false);
+	let continuousWritableArea = $state<boolean | undefined>(undefined);
+
+	/** 連続登録の対象グループの `defaultWritable`（未選択・見つからない間は全体既定の `true`）。 */
+	function continuousGroupWritableDefault(): boolean {
+		const groupId = Number(continuousForm.collectionGroupId);
+		const selectedGroup =
+			continuousForm.collectionGroupId !== '' && Number.isFinite(groupId)
+				? groups.find((g) => g.id === groupId)
+				: undefined;
+		return selectedGroup?.defaultWritable ?? true;
+	}
+
+	// 既定の適用（利用者が触るまで）。依存は `drawerMode`・touched・グループ・`groups`・area。
+	// `continuousForm.writable` 自身は読まない（自分の書き込みで再実行しない）。
+	$effect(() => {
+		if (drawerMode !== 'continuous' || continuousWritableTouched) return;
+		continuousForm.writable =
+			canDefaultWritable('plc', continuousWritableArea) && continuousGroupWritableDefault();
+	});
+
+	// 確定した断りへの追従: 読み取り専用の領域と確定したら、触った後でも `false` に揃える
+	// （単体の新規登録と同じ。`false` にしか書かないので再実行してもループしない）。
+	$effect(() => {
+		if (drawerMode !== 'continuous') return;
+		const next = writableAfterAreaVerdict('plc', continuousWritableArea, continuousForm.writable);
+		if (continuousForm.writable && !next) continuousForm.writable = false;
+	});
+
 	let continuousPrefillSeq = 0;
 	/**
 	 * R2b-6d-2a（設計 §7.1）: 開始アドレスから名前パターン・開始番号の既定を導出する。導出は
@@ -3819,12 +3857,20 @@
 		const apply = (parsed: ParsedAddress | undefined) => {
 			if (seq !== continuousPrefillSeq) return;
 			untrack(() => {
+				// R2b-6d-3: 書き込める領域かどうかの判定にも同じ解析結果を使う。選択中の型で通らず
+				// u16 で代わりに通った結果でも、領域（読み取り専用かどうか）はアドレスの
+				// デバイス／エリアで決まり型に依らないので使ってよい（型の不一致は登録時の検証が断る）。
+				continuousWritableArea = parsed?.ok ? (parsed.writableArea ?? undefined) : undefined;
 				const nextPattern = nextNamePatternOnParsed(address, parsed, continuousNamePatternTouched);
 				if (nextPattern !== null) continuousForm.namePattern = nextPattern;
 				const nextStart = nextStartNumberOnParsed(address, parsed, continuousStartNumberTouched);
 				if (nextStart !== null) continuousForm.startNumber = nextStart;
 			});
 		};
+		// 入力が変わったら、結果が届く前に古い値で既定を決めない（単体の新規登録と同じ）。
+		untrack(() => {
+			continuousWritableArea = undefined;
+		});
 		if (address === '' || connectionId === undefined) {
 			apply(undefined);
 			return;
@@ -3840,7 +3886,10 @@
 			const items = dataType === 'u16' ? [probe(dataType)] : [probe(dataType), probe('u16')];
 			parseTagAddresses(connectionId, items).then(
 				(results) => apply(results.find((r) => r.ok) ?? results[0]),
-				() => {}
+				() => {
+					// 通信の失敗は判定不能（既定 ON を当てない）。名前・番号の欄には触れない。
+					if (seq === continuousPrefillSeq) continuousWritableArea = undefined;
+				}
 			);
 		}, 300);
 		return () => clearTimeout(timer);
@@ -3908,6 +3957,9 @@
 				// アドレス入力がプリフィルされなくなる。
 				continuousNamePatternTouched = false;
 				continuousStartNumberTouched = false;
+				// R2b-6d-3: writable の既定も次回に持ち越さない。
+				continuousWritableTouched = false;
+				continuousWritableArea = undefined;
 				continuousDetailOpen = { display: false };
 				invalidateContinuousValidation();
 				await reload();
@@ -5914,7 +5966,14 @@
 		有効
 	</label>
 	<label class="field checkbox">
-		<input type="checkbox" bind:checked={continuousForm.writable} />
+		<input
+			type="checkbox"
+			bind:checked={continuousForm.writable}
+			onchange={() => {
+				// R2b-6d-3: 利用者が決めた値は既定で上書きしない。
+				continuousWritableTouched = true;
+			}}
+		/>
 		書き込み可（writable）
 	</label>
 	<!--
@@ -6229,6 +6288,13 @@
 {/snippet}
 
 {#snippet continuousFormBody()}
+	<!--
+		R2b-6d-3（実機の確かめ 2026-10-24）: アドレスの説明・placeholder は単体の欄と同じく
+		`addressHelpFor`（ドライバの `addressHelp` をそのまま出す。UI にプロトコルの知識を持たない）。
+		以前は MELSEC 固有の説明（X/Y/B/W/SB/SW/DX/DY の 16 進）と `D3000` が固定で出ていた。
+	-->
+	{@const addrProtocol = connectionForGroupId(continuousForm.collectionGroupId)?.protocol}
+	{@const addrHelp = addressHelpFor(addrProtocol, continuousForm.dataType, driverFor(addrProtocol))}
 	<div class="drawer-section">
 		<p class="note">
 			名前パターン（<code>{'{n}'}</code>が連番に置き換わります。例:
@@ -6236,9 +6302,7 @@
 			temp3）・開始アドレス・点数・共通設定から連続タグを一括生成します。アドレスの増分はデータ型から自動決定（i16/u16
 			等のワード型は+1、i32/u32/f32 は+2、i64/u64/f64 は+4、string は文字列長分）。<code>.N</code
 			>（ビット位置）付きのアドレス（例: <code>D100.5</code>）はワード内 bit 連番になります（bit15
-			の次は次ワードの bit0）。<code>X</code>/<code>Y</code>/<code>B</code>/<code>W</code>/<code
-				>SB</code
-			>/<code>SW</code>/<code>DX</code>/<code>DY</code> は16進デバイス番号として桁上がりを扱います。
+			の次は次ワードの bit0）。桁上がりなどアドレスの進み方はドライバのアドレス規則に従います。
 		</p>
 		{#if continuousForm.collectionGroupId !== ''}
 			<!--
@@ -6270,7 +6334,7 @@
 				<input
 					type="text"
 					bind:value={continuousForm.namePattern}
-					placeholder="D{'{n}'}"
+					placeholder="tag{'{n}'}"
 					oninput={() => {
 						// T19 S1-b（UX-35）: ユーザーが直接編集した合図 - 以後は
 						// 開始アドレス入力に追従させない（上の
@@ -6291,7 +6355,22 @@
 			</label>
 			<label class="field">
 				開始アドレス
-				<input type="text" bind:value={continuousForm.startAddress} placeholder="D3000" />
+				<input
+					type="text"
+					bind:value={continuousForm.startAddress}
+					placeholder={addrHelp.placeholder}
+				/>
+				{#if addrHelp.driverHelp !== ''}
+					<span class="hint driver-help">{addrHelp.driverHelp}</span>
+				{/if}
+				{#if addrHelp.deviceHint !== ''}
+					<span class="hint">{addrHelp.deviceHint}</span>
+				{/if}
+				{#if addrHelp.examples.length > 0}
+					<span class="hint"
+						>例: {addrHelp.examples.map((e) => `${e.address}（${e.description}）`).join('、')}</span
+					>
+				{/if}
 			</label>
 			<label class="field">
 				点数
@@ -7377,7 +7456,8 @@
 						<input
 							type="text"
 							bind:value={structForm.baseAddress}
-							placeholder="D3000"
+							placeholder={addressHelpFor(structProtocol, 'u16', driverFor(structProtocol))
+								.placeholder}
 							data-testid="struct-reg-base-address"
 						/>
 						<span class="hint">ビットサフィックス（例: D100.5）は指定できません。</span>
@@ -7451,7 +7531,11 @@
 								<input
 									type="text"
 									bind:value={field.address}
-									placeholder="D3000"
+									placeholder={addressHelpFor(
+										structProtocol,
+										field.dataType,
+										driverFor(structProtocol)
+									).placeholder}
 									data-testid={`struct-reg-field-address-${i}`}
 								/>
 							</label>
