@@ -325,6 +325,28 @@ async fn modbus_points_words_and_range() {
 }
 
 #[tokio::test]
+async fn modbus_multi_word_tail_must_stay_in_the_register_space() {
+    let app = test_app("modbus-tail").await;
+    let c = modbus(&app).await;
+    let r = offset(
+        &app,
+        vec![
+            item(c, "465533", "f64", 1, "words"),
+            item(c, "465530", "f64", 1, "points"),
+            item(c, "465534", "f32", 1, "words"),
+            item(c, "465534", "f32", 2, "words"),
+            item(c, "465529", "f64", 1, "points"),
+        ],
+    )
+    .await;
+    assert_eq!(r[0]["ok"], false, "{:?}", r[0]);
+    assert_eq!(r[1]["ok"], false, "{:?}", r[1]);
+    assert_eq!(ok(&r[2]), "465535");
+    assert_eq!(r[3]["ok"], false, "{:?}", r[3]);
+    assert_eq!(ok(&r[4]), "465533");
+}
+
+#[tokio::test]
 async fn mixed_connections_and_non_driver_connections_are_per_item() {
     let app = test_app("mixed").await;
     let q = slmp(&app).await;
