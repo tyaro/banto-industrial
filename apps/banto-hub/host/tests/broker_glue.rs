@@ -42,8 +42,7 @@ fn slmp_conn(id: i64, port: u16, cpu: &str) -> PlcConnection {
 
 /// #605 → R2b-3a-2: 同じ host/port で CPU だけ R→Q に変えると `resolve` が changed を
 /// 返し（設定の指紋が変わる）、セッションを捨てて作り直すとフレームのサブコマンドが
-/// Q になる。Modbus の設定は CPU を持たないので、平らな欄の CPU が変わっても
-/// changed にならない。
+/// Q になる。Modbus では設定を変えずに名前だけ更新しても changed にならない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cpu_only_change_replaces_the_slmp_broker_session() {
     use banto_driver_api::{DataType, TagKind, TagSpec};
@@ -87,13 +86,15 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
     let mut modbus = conn_of(
         2,
         "modbus-tcp",
-        serde_json::json!({ "host": "127.0.0.1", "port": 502, "unit_id": 1 }),
+        serde_json::json!({
+            "host": "127.0.0.1", "port": 502, "unit_id": 1, "word_order": "high_low"
+        }),
     );
     let (_, changed) = registry.resolve(&modbus, &drivers).await;
     assert!(changed);
-    modbus.settings.insert("cpu_type".into(), "Q".into());
+    modbus.name = "renamed-modbus".to_string();
     let (_, changed) = registry.resolve(&modbus, &drivers).await;
-    assert!(!changed, "Modbus は CPU 列では再接続しない");
+    assert!(!changed, "Modbus の名前だけでは再接続しない");
 
     sessions.shutdown().await;
     sim.stop();
