@@ -399,7 +399,7 @@ jobs:
       # Canonical guest source is a public, separate repository. This test is
       # ignored in the normal nextest archive because that archive has no guest
       # artifact; run it explicitly here after building the pinned component.
-      - name: test (WASM FC3 Hub connection)
+      - name: test (WASM Hub components)
         if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
         shell: pwsh
         run: |
