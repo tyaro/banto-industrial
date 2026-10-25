@@ -16,6 +16,7 @@ banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # `builtin().registry` の 2 つ（R2b-3c / 3d から `DriverEntry::frame`。broker の表は無くなった）。
 banto-driver-slmp = { path = "../banto-driver-slmp" }
 banto-driver-modbus = { path = "../banto-driver-modbus" }
+banto-driver-wasm = { path = "../banto-driver-wasm" }
 # R1-4b: トリップワイヤ（`ALLOWED_PROTOCOLS`）。R2b-1c: `settings_to_api(settings_from_flat(..))`
 # （R1 の `settings_from_connection` の後継）のテスト。
 banto-tags = { path = "../banto-tags" }

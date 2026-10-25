@@ -60,8 +60,9 @@ const G = {
 		{
 			name: 'banto-drivers',
 			dir: 'crates/banto-drivers',
-			deps: ['banto-driver-api', 'banto-driver-modbus', 'banto-driver-slmp']
+			deps: ['banto-driver-api', 'banto-driver-modbus', 'banto-driver-slmp', 'banto-driver-wasm']
 		},
+		{ name: 'banto-driver-wasm', dir: 'crates/banto-driver-wasm', deps: ['banto-driver-api'] },
 		// R1-4a: banto-broker から移した SLMP / Modbus TCP のドライバ（内部 crate）。driver-api は
 		// dev-dependency。banto-plc・banto-tags・broker・plc-write にも依存するが、G には写して
 		// いない（banto-plc / banto-tags の行の期待を R1-6 まで揺らさないため。banto-drivers が
@@ -423,7 +424,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-driver-wasm -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -468,6 +469,19 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-modbus -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true
+		}
+	],
+	[
+		'banto-driver-wasm は registry を通じて Hub host・shell・sink へ届く',
+		['crates/banto-driver-wasm/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args:
+				'-p banto-driver-wasm -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -987,6 +1001,44 @@ test('実グラフ: crates/ の下の追跡ファイルはすべてどれかの�
 		files.filter((f) => owningPackage(g, f) === null),
 		[]
 	);
+});
+
+test('WASM crate の変更は Hub host を選び、固定ゲストの ignored 接続試験を明示実行する', () => {
+	const jobs = classify({
+		event: 'pull_request',
+		files: ['crates/banto-driver-wasm/src/lib.rs'],
+		graph: real()
+	}).jobs;
+	assert.equal(jobs.run_rust, true);
+	assert.ok(jobs.rust_args.includes('-p banto-hub-host'));
+	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
+	const start = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
+	const end = workflow.indexOf('      # crate ごとのビルド時間', start);
+	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
+	const step = workflow.slice(start, end);
+	assert.match(step, /be5753d003aa49d065405e30753a2a0903d3e24c/);
+	for (const revision of [
+		'${sha}:wit/driver.wit',
+		'HEAD:crates/banto-driver-wasm/wit/driver.wit',
+		'${sha}:component/manifest.json',
+		'HEAD:crates/banto-driver-wasm/tests/manifest.json'
+	]) {
+		assert.ok(step.includes(revision), `blob reference missing: ${revision}`);
+	}
+	for (const label of [
+		'canonical WIT blob lookup failed',
+		'host WIT blob lookup failed',
+		'canonical manifest blob lookup failed',
+		'host manifest blob lookup failed'
+	]) {
+		assert.ok(step.includes(label), `Git error guard missing: ${label}`);
+	}
+	assert.doesNotMatch(step, /Get-FileHash/);
+	assert.match(step, /canonical manifest and host manifest differ/);
+	assert.match(step, /cargo \+1\.98\.1 build/);
+	assert.match(step, /wasm-tools --version 1\.262\.0 --locked/);
+	assert.match(step, /-- --ignored --exact/);
+	assert.match(step, /1 passed; 0 failed; 0 ignored/);
 });
 
 // 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。

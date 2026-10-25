@@ -68,6 +68,7 @@ members = [
     "crates/banto-drivers",
     "crates/banto-driver-slmp",
     "crates/banto-driver-modbus",
+    "crates/banto-driver-wasm",
     "crates/banto-plc",
     "crates/banto-plc-write",
     "crates/banto-tstore",

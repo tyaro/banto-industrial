@@ -58,8 +58,8 @@ use banto_plc::modbus::simulator::Simulator as ModbusSimulator;
 use banto_plc::slmp::simulator::Simulator as SlmpSimulator;
 use banto_server::{AuthState, Identity};
 use banto_tags::{
-    CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
-    TagInput, TagService,
+    CollectionGroupInput, CollectionGroupService, ConnectionSettingsInput, PlcConnectionInput,
+    PlcConnectionService, TagInput, TagService,
 };
 use banto_tstore::SystemClock;
 use serde_json::{json, Value};
@@ -235,10 +235,22 @@ impl Drop for TestApp {
 }
 
 async fn test_app(label: &str) -> TestApp {
-    test_app_with_secret_driver(label, false).await
+    test_app_with_drivers(label, false, None).await
 }
 
 async fn test_app_with_secret_driver(label: &str, with_secret_driver: bool) -> TestApp {
+    test_app_with_drivers(label, with_secret_driver, None).await
+}
+
+async fn test_app_with_wasm(label: &str, component: &[u8]) -> TestApp {
+    test_app_with_drivers(label, false, Some(component)).await
+}
+
+async fn test_app_with_drivers(
+    label: &str,
+    with_secret_driver: bool,
+    wasm_component: Option<&[u8]>,
+) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -274,6 +286,14 @@ async fn test_app_with_secret_driver(label: &str, with_secret_driver: bool) -> T
     let auth_for_test = auth.clone();
 
     let mut drivers = common::hub_drivers();
+    if let Some(component) = wasm_component {
+        banto_drivers::register_wasm(
+            Arc::get_mut(&mut drivers.registry).unwrap(),
+            include_bytes!("../../../../crates/banto-driver-wasm/tests/manifest.json"),
+            component,
+        )
+        .expect("register WASM frame driver");
+    }
     if with_secret_driver {
         let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
         Arc::get_mut(&mut drivers.registry)
@@ -920,6 +940,114 @@ async fn modbus_test_reuses_existing_broker_session_without_dialing_a_second_soc
         "the connection test must reuse the existing broker session, not open a second socket (#337)"
     );
 
+    sim.stop();
+}
+
+/// The canonical component is supplied explicitly after the test host builds
+/// it. This runs the ordinary REST connection test through the broker's
+/// FrameSession and controlled local Modbus TCP, without a second socket for
+/// an active connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_COMPONENT_WASM to a built canonical component"]
+async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
+    let component = std::fs::read(std::env::var("BANTO_COMPONENT_WASM").expect("component path"))
+        .expect("component bytes");
+    let app = test_app_with_wasm("t12-wasm-fc3", &component).await;
+    let sim = ModbusSimulator::start().await;
+    let settings = json!({ "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1 });
+    let payload = json!({
+        "protocol": "modbus-fc3-wasm", "simulation": false, "settings": settings
+    });
+
+    // No connectionId: the common test path dials, reads probe 40001, then closes.
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        payload.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert_eq!(sim.connection_count(), 1);
+
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(ConnectionSettingsInput {
+            name: "wasm-line".into(),
+            protocol: "modbus-fc3-wasm".into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .expect("save WASM connection");
+    // A saved id with no active broker session still takes the direct path.
+    let mut matching = payload.clone();
+    matching["connectionId"] = json!(saved.id);
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        matching.clone(),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert_eq!(sim.connection_count(), 2);
+
+    let group =
+        CollectionGroupService::with_registry(app.pool.clone(), app.manager.registry().clone())
+            .create(group_input("wasm-fast", saved.id, 100))
+            .await
+            .expect("create group");
+    app.manager
+        .tags()
+        .create(tag_input("wasm-u16", group.id, "40001", "u16"))
+        .await
+        .expect("create U16 tag");
+    app.manager.rebuild().await.expect("start WASM collection");
+    let mut watch = app.sessions.status_watch(saved.id).expect("broker session");
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        watch.wait_for(|status| *status == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .expect("WASM connection timeout")
+    .expect("WASM connection is connected");
+    assert_eq!(sim.connection_count(), 3);
+
+    // Matching saved settings reuse the one active session.
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        matching.clone(),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body:?}");
+    assert_eq!(sim.connection_count(), 3, "must reuse the broker socket");
+
+    // An unsaved form change cannot be tested through that old session.
+    matching["settings"]["host"] = json!("127.0.0.2");
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        matching,
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("保存してからテスト"));
+    assert_eq!(sim.connection_count(), 3, "must not dial changed settings");
     sim.stop();
 }
 
