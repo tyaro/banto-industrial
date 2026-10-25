@@ -1036,7 +1036,8 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.doesNotMatch(step, /Get-FileHash/);
 	assert.match(step, /canonical manifest and host manifest differ/);
 	assert.match(step, /cargo \+1\.98\.1 build/);
-	assert.match(step, /wasm-tools --version 1\.262\.0 --locked/);
+	assert.match(step, /\$wasmToolsVersion = wasm-tools --version/);
+	assert.match(step, /wasm-tools version mismatch/);
 	assert.match(step, /-- --ignored --exact/);
 	assert.match(step, /1 passed; 0 failed; 0 ignored/);
 });
@@ -1205,4 +1206,24 @@ test('escapeRegExp は正規表現の特別な文字をすべて文字どおり�
 	// `crates/` のような特別でない文字はそのまま。ドットは任意の 1 文字にならない。
 	assert.equal(escapeRegExp('crates/'), 'crates/');
 	assert.ok(!new RegExp('^' + escapeRegExp('a.b') + '$').test('axb'));
+});
+
+test('WASM FC3 の wasm-tools は固定版の検証済みバイナリを fallback なしで使う', () => {
+	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
+	const installStart = workflow.indexOf(
+		'      - name: Install wasm-tools 1.262.0 (verified binary)'
+	);
+	const testStart = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
+	assert.ok(installStart !== -1 && testStart > installStart);
+	const install = workflow.slice(installStart, testStart);
+	assert.match(install, /^        uses: taiki-e\/install-action@v2$/m);
+	assert.match(install, /^          tool: wasm-tools@1\.262\.0$/m);
+	assert.match(install, /^          checksum: true$/m);
+	assert.match(install, /^          fallback: none$/m);
+	const condition =
+		"if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')";
+	assert.ok(install.includes(condition));
+	assert.ok(workflow.slice(testStart).includes(condition));
+	assert.match(workflow.slice(testStart), /wasm-tools --version/);
+	assert.doesNotMatch(workflow, /cargo \+1\.98\.1 install wasm-tools/);
 });

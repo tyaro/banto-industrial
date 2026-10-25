@@ -389,6 +389,13 @@ jobs:
       # 走らない（ci-gate も赤になるので見落としはしない）。
       - name: test (doctest)
         run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
+      - name: Install wasm-tools 1.262.0 (verified binary)
+        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
+        uses: taiki-e/install-action@v2
+        with:
+          tool: wasm-tools@1.262.0
+          checksum: true
+          fallback: none
       # Canonical guest source is a public, separate repository. This test is
       # ignored in the normal nextest archive because that archive has no guest
       # artifact; run it explicitly here after building the pinned component.
@@ -418,8 +425,11 @@ jobs:
           if ($canonicalManifest -ne $hostManifest) { throw 'canonical manifest and host manifest differ' }
           rustup target add wasm32-unknown-unknown --toolchain 1.98.1
           if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
-          cargo +1.98.1 install wasm-tools --version 1.262.0 --locked
-          if ($LASTEXITCODE -ne 0) { throw 'wasm-tools installation failed' }
+          $wasmToolsVersion = wasm-tools --version
+          Write-Host "wasm-tools version: $wasmToolsVersion"
+          if ($LASTEXITCODE -ne 0 -or $wasmToolsVersion -ne 'wasm-tools 1.262.0') {
+            throw 'wasm-tools version mismatch'
+          }
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
           if ($LASTEXITCODE -ne 0) { throw 'canonical guest build failed' }
           $module = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
