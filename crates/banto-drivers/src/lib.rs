@@ -42,6 +42,41 @@
 //!   injects.
 
 use banto_driver_api::{DriverEntry, DriverRegistry};
+use banto_driver_wasm::{LoadError, WasmDriver};
+use std::sync::Arc;
+
+/// An explicitly supplied WASM component could not be registered.
+#[derive(Debug)]
+pub enum WasmRegistrationError {
+    Load(LoadError),
+    Registry(banto_driver_api::RegistryError),
+}
+
+impl std::fmt::Display for WasmRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load(error) => error.fmt(f),
+            Self::Registry(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WasmRegistrationError {}
+
+/// Load and register a verified, read-only component supplied by the host.
+/// Package signature and artifact provenance checks belong before this call.
+/// The returned handle exposes structured runtime diagnostics.
+pub fn register_wasm(
+    registry: &mut DriverRegistry,
+    manifest: &[u8],
+    component: &[u8],
+) -> Result<Arc<WasmDriver>, WasmRegistrationError> {
+    let driver = WasmDriver::load(manifest, component).map_err(WasmRegistrationError::Load)?;
+    registry
+        .register(DriverEntry::frame(driver.clone()))
+        .map_err(WasmRegistrationError::Registry)?;
+    Ok(driver)
+}
 
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {

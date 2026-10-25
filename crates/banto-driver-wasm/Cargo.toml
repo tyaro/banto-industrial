@@ -1,0 +1,11 @@
+[package]
+name = "banto-driver-wasm"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
+semver = "1"
+serde_json = "1"
+wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std"] }

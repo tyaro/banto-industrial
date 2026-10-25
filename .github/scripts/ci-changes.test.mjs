@@ -60,8 +60,9 @@ const G = {
 		{
 			name: 'banto-drivers',
 			dir: 'crates/banto-drivers',
-			deps: ['banto-driver-api', 'banto-driver-modbus', 'banto-driver-slmp']
+			deps: ['banto-driver-api', 'banto-driver-modbus', 'banto-driver-slmp', 'banto-driver-wasm']
 		},
+		{ name: 'banto-driver-wasm', dir: 'crates/banto-driver-wasm', deps: ['banto-driver-api'] },
 		// R1-4a: banto-broker から移した SLMP / Modbus TCP のドライバ（内部 crate）。driver-api は
 		// dev-dependency。banto-plc・banto-tags・broker・plc-write にも依存するが、G には写して
 		// いない（banto-plc / banto-tags の行の期待を R1-6 まで揺らさないため。banto-drivers が
@@ -423,7 +424,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args:
-				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
+				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-driver-wasm -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -468,6 +469,19 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-modbus -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_rust_db_source: true,
+			run_linux_clippy: true,
+			run_e2e_hub: true
+		}
+	],
+	[
+		'banto-driver-wasm は registry を通じて Hub host・shell・sink へ届く',
+		['crates/banto-driver-wasm/src/lib.rs'],
+		{
+			...NONE,
+			run_rust: true,
+			rust_args:
+				'-p banto-driver-wasm -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true

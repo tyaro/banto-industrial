@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "modbus-fc3-wasm",
+  "version": "0.1.0",
+  "hubApi": "1",
+  "settingsVersion": 1,
+  "displayName": "Modbus TCP FC3 U16 (WASM)",
+  "transports": ["tcp"],
+  "capabilities": ["read"]
+}
