@@ -416,6 +416,28 @@ async fn admin_write(
     (status, json)
 }
 
+async fn admin_get(router: &Router, path: &str, token: &str) -> (StatusCode, Value) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .uri(path)
+                .header("Authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
 /// ケース7後半(CSRF ヘッダ無し)専用 - `admin_write`と違い
 /// `X-Banto-Client`ヘッダを意図的に付けない。
 async fn write_without_csrf_header(
@@ -954,7 +976,11 @@ async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
         .expect("component bytes");
     let app = test_app_with_wasm("t12-wasm-fc3", &component).await;
     let sim = ModbusSimulator::start().await;
-    let settings = json!({ "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1 });
+    sim.set_holding_registers(0, &[42, 0x1234, 0xabcd]);
+    let settings = json!({
+        "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1,
+        "word_order": "low_high"
+    });
     let payload = json!({
         "protocol": "modbus-fc3-wasm", "simulation": false, "settings": settings
     });
@@ -1004,11 +1030,18 @@ async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
             .create(group_input("wasm-fast", saved.id, 100))
             .await
             .expect("create group");
-    app.manager
+    let u16_tag = app
+        .manager
         .tags()
         .create(tag_input("wasm-u16", group.id, "40001", "u16"))
         .await
         .expect("create U16 tag");
+    let u32_tag = app
+        .manager
+        .tags()
+        .create(tag_input("wasm-u32", group.id, "40002", "u32"))
+        .await
+        .expect("create U32 tag");
     app.manager.rebuild().await.expect("start WASM collection");
     let mut watch = app.sessions.status_watch(saved.id).expect("broker session");
     tokio::time::timeout(
@@ -1019,6 +1052,48 @@ async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
     .expect("WASM connection timeout")
     .expect("WASM connection is connected");
     assert_eq!(sim.connection_count(), 3);
+
+    let u16_key = format!("tag:{}", u16_tag.id);
+    let u32_key = format!("tag:{}", u32_tag.id);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let u16_value = app
+                .manager
+                .current_values()
+                .and_then(|values| values.get(&u16_key))
+                .and_then(|value| value.value);
+            let u32_value = app
+                .manager
+                .current_values()
+                .and_then(|values| values.get(&u32_key))
+                .and_then(|value| value.value);
+            if u16_value == Some(42.0) && u32_value == Some(0xabcd_1234u32 as f64) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("WASM U16/U32 collection values");
+    let (status, body) = admin_get(
+        &app.router,
+        "/api/v1/values/wasm-line.wasm-fast.wasm-u16",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["v"], 42.0, "{body:?}");
+    assert_eq!(body["q"], "good", "{body:?}");
+    let path = "/api/v1/values/wasm-line.wasm-fast.wasm-u32";
+    let (status, body) = admin_get(&app.router, path, &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["v"], 0xabcd_1234u32 as f64, "{body:?}");
+    assert_eq!(body["q"], "good", "{body:?}");
+    let (status, body) =
+        admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["v"], 0xabcd_1234u32 as f64, "{body:?}");
+    assert_eq!(body["q"], "good", "{body:?}");
 
     // Matching saved settings reuse the one active session.
     let (_, body) = admin_write(

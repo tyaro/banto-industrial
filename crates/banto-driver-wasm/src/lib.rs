@@ -95,9 +95,17 @@ impl WasmDriver {
                     .ok_or_else(|| LoadError::Contract(format!("unknown supported kind: {s}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if supported != [KindName::Numeric(DataType::U16)] {
+        // Keep previously registered U16-only guests usable while accepting
+        // the canonical U16/U32 guest. No other capability is in this contract.
+        if supported != [KindName::Numeric(DataType::U16)]
+            && supported
+                != [
+                    KindName::Numeric(DataType::U16),
+                    KindName::Numeric(DataType::U32),
+                ]
+        {
             return Err(LoadError::Contract(
-                "initial WASM component must support only U16".into(),
+                "WASM FC3 component must support U16 or U16 and U32".into(),
             ));
         }
         let secrets = instance
@@ -198,20 +206,24 @@ fn validate_secret_fields(fields: &[SettingField], secrets: &[String]) -> Result
 }
 
 /// Check guest-reported address metadata before passing it to the Hub. The
-/// initial FC3 contract is one U16 holding register at a numeric offset.
+/// FC3 supports one U16 register or two U32 registers at a numeric offset.
 fn checked_parsed_address(
     driver: &DriverId,
     kind: &TagKind,
     parsed: address::Parsed,
 ) -> Result<DriverAddress, AddressError> {
-    if *kind != TagKind::numeric(DataType::U16)
-        || parsed.area != "holding_register"
+    let expected_words: u16 = match kind {
+        TagKind::Numeric(DataType::U16) => 1,
+        TagKind::Numeric(DataType::U32) => 2,
+        _ => return Err(AddressError::new("WASM FC3 supports only U16 and U32")),
+    };
+    if parsed.area != "holding_register"
         || !parsed.writable_area
-        || parsed.word_count != 1
+        || parsed.word_count != u32::from(expected_words)
         || parsed.bit.is_some()
     {
         return Err(AddressError::new(
-            "WASM FC3 address metadata violates the U16 contract",
+            "WASM FC3 address metadata violates the register contract",
         ));
     }
     let digits = parsed
@@ -228,6 +240,9 @@ fn checked_parsed_address(
         .checked_sub(1)
         .and_then(|n| u16::try_from(n).ok())
         .ok_or_else(|| AddressError::new("WASM FC3 canonical address is out of range"))?;
+    if expected_words == 2 && offset == u16::MAX {
+        return Err(AddressError::new("WASM FC3 U32 exceeds the register range"));
+    }
     if parsed.index != Some(u64::from(offset)) {
         return Err(AddressError::new(
             "WASM FC3 canonical address and index disagree",
@@ -238,7 +253,7 @@ fn checked_parsed_address(
         parsed.canonical,
         parsed.area,
         parsed.writable_area,
-        1,
+        expected_words,
     )
     .with_index(u64::from(offset)))
 }
@@ -340,16 +355,20 @@ fn wit_planned(planned: &Planned) -> Result<read::Planned, FatalError> {
     })
 }
 
-fn checked_fc3_u16(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
-    if *kind != TagKind::numeric(DataType::U16) {
-        return Err(FatalError::Protocol(
-            "WASM returned a value for a non-U16 tag".into(),
-        ));
-    }
+fn checked_fc3_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
+    let max = match kind {
+        TagKind::Numeric(DataType::U16) => u64::from(u16::MAX),
+        TagKind::Numeric(DataType::U32) => u64::from(u32::MAX),
+        _ => {
+            return Err(FatalError::Protocol(
+                "WASM returned a value for an unsupported tag".into(),
+            ))
+        }
+    };
     match value {
-        types::Value::Uint(n) if n <= u16::MAX as u64 => Ok(RawValue::Uint(n)),
+        types::Value::Uint(n) if n <= max => Ok(RawValue::Uint(n)),
         _ => Err(FatalError::Protocol(
-            "WASM FC3 U16 result has wrong type or range".into(),
+            "WASM FC3 result has wrong type or range".into(),
         )),
     }
 }
@@ -581,7 +600,7 @@ impl FrameConnection for WasmConnection {
                         .ok_or_else(|| {
                             FatalError::Protocol("WASM returned a result outside covers".into())
                         })?;
-                    checked_fc3_u16(&spec.kind, value).map(Ok)
+                    checked_fc3_value(&spec.kind, value).map(Ok)
                 }
                 Err(types::ItemError::Device(e)) => Ok(Err(ItemError::Device(
                     api::DeviceError::new(e.code, e.message),
@@ -617,19 +636,27 @@ mod tests {
 
     #[test]
     fn fc3_boundary_checks_variant_and_range() {
-        let kind = TagKind::numeric(DataType::U16);
+        let u16_kind = TagKind::numeric(DataType::U16);
+        let u32_kind = TagKind::numeric(DataType::U32);
         assert_eq!(
-            checked_fc3_u16(&kind, types::Value::Uint(0)).unwrap(),
+            checked_fc3_value(&u16_kind, types::Value::Uint(0)).unwrap(),
             RawValue::Uint(0)
         );
         assert_eq!(
-            checked_fc3_u16(&kind, types::Value::Uint(65535)).unwrap(),
+            checked_fc3_value(&u16_kind, types::Value::Uint(65535)).unwrap(),
             RawValue::Uint(65535)
         );
-        assert!(checked_fc3_u16(&kind, types::Value::Uint(65536)).is_err());
-        assert!(checked_fc3_u16(&kind, types::Value::Int(1)).is_err());
-        assert!(checked_fc3_u16(&kind, types::Value::Float(1.0)).is_err());
-        assert!(checked_fc3_u16(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err());
+        assert_eq!(
+            checked_fc3_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX))).unwrap(),
+            RawValue::Uint(u64::from(u32::MAX))
+        );
+        assert!(checked_fc3_value(&u16_kind, types::Value::Uint(65536)).is_err());
+        assert!(checked_fc3_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX) + 1)).is_err());
+        assert!(checked_fc3_value(&u32_kind, types::Value::Int(1)).is_err());
+        assert!(checked_fc3_value(&u16_kind, types::Value::Float(1.0)).is_err());
+        assert!(
+            checked_fc3_value(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err()
+        );
     }
 
     fn parsed() -> address::Parsed {
@@ -674,6 +701,19 @@ mod tests {
         assert!(
             checked_parsed_address(&driver, &TagKind::numeric(DataType::I16), parsed()).is_err()
         );
+
+        let u32_kind = TagKind::numeric(DataType::U32);
+        let mut two_words = parsed();
+        two_words.word_count = 2;
+        let valid = checked_parsed_address(&driver, &u32_kind, two_words.clone()).unwrap();
+        assert_eq!(valid.word_count, 2);
+        assert!(checked_parsed_address(&driver, &u32_kind, parsed()).is_err());
+        two_words.canonical = "465535".into();
+        two_words.index = Some(65_534);
+        assert!(checked_parsed_address(&driver, &u32_kind, two_words.clone()).is_ok());
+        two_words.canonical = "465536".into();
+        two_words.index = Some(65_535);
+        assert!(checked_parsed_address(&driver, &u32_kind, two_words).is_err());
     }
 
     #[test]

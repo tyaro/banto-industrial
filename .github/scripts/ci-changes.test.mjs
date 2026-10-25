@@ -1016,7 +1016,7 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	const end = workflow.indexOf('      # crate ごとのビルド時間', start);
 	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
 	const step = workflow.slice(start, end);
-	assert.match(step, /be5753d003aa49d065405e30753a2a0903d3e24c/);
+	assert.match(step, /5233d55a4d1c278c473e9c44df608c1423c1a629/);
 	for (const revision of [
 		'${sha}:wit/driver.wit',
 		'HEAD:crates/banto-driver-wasm/wit/driver.wit',
@@ -1041,6 +1041,7 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.match(step, /wasm-tools version mismatch/);
 	assert.match(step, /-- --ignored --exact/);
 	assert.match(step, /1 passed; 0 failed; 0 ignored/);
+	assert.match(step, /3 passed; 0 failed; 0 ignored/);
 });
 
 // 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。
