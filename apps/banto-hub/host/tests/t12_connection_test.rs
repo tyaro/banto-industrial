@@ -280,12 +280,36 @@ async fn test_app_with_controlled_write_manifest(
     .await
 }
 
+async fn test_app_with_controlled_r_test_manifest(
+    label: &str,
+    manifest: &[u8],
+    component: &[u8],
+) -> TestApp {
+    let mut options = fast_options();
+    options.connect_timeout = Duration::from_secs(3);
+    options.response_timeout = Duration::from_secs(3);
+    test_app_with_drivers_and_options(
+        label,
+        false,
+        Some(WasmFixture::ControlledRTest {
+            manifest,
+            component,
+        }),
+        options,
+    )
+    .await
+}
+
 enum WasmFixture<'a> {
     ReadOnly {
         manifest: &'a [u8],
         component: &'a [u8],
     },
     ControlledWrite {
+        manifest: &'a [u8],
+        component: &'a [u8],
+    },
+    ControlledRTest {
         manifest: &'a [u8],
         component: &'a [u8],
     },
@@ -296,6 +320,17 @@ async fn test_app_with_drivers(
     with_secret_driver: bool,
     wasm_component: Option<WasmFixture<'_>>,
 ) -> TestApp {
+    test_app_with_drivers_and_options(label, with_secret_driver, wasm_component, fast_options())
+        .await
+}
+
+async fn test_app_with_drivers_and_options(
+    label: &str,
+    with_secret_driver: bool,
+    wasm_component: Option<WasmFixture<'_>>,
+    options: CollectorOptions,
+) -> TestApp {
+    let controlled_r_test = matches!(&wasm_component, Some(WasmFixture::ControlledRTest { .. }));
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -351,6 +386,16 @@ async fn test_app_with_drivers(
                 .expect("load controlled WASM write fixture");
                 registry.register(DriverEntry::frame(driver)).unwrap();
             }
+            WasmFixture::ControlledRTest {
+                manifest,
+                component,
+            } => {
+                let driver = banto_driver_wasm::WasmDriver::load_controlled_r_test_fixture(
+                    manifest, component,
+                )
+                .expect("load the isolated R test WASM write fixture");
+                registry.register(DriverEntry::frame(driver)).unwrap();
+            }
         }
     }
     if with_secret_driver {
@@ -378,7 +423,7 @@ async fn test_app_with_drivers(
         pool.clone(),
         env.data_dir(),
         Arc::new(SystemClock),
-        fast_options(),
+        options,
         sessions.clone(),
         sim_registry,
         computed,
@@ -390,9 +435,12 @@ async fn test_app_with_drivers(
     let write_audit = WriteAuditService::new(pool.clone());
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     let api_keys = ApiKeysService::new(pool.clone());
-    let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(
-        WriteRateLimitConfig::default(),
-    )));
+    let mut write_limit = WriteRateLimitConfig::default();
+    if controlled_r_test {
+        write_limit.global_max = 2;
+        write_limit.per_tag_max = 2;
+    }
+    let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(write_limit)));
     let grpc_service = GrpcService::new(
         manager.clone(),
         api_keys.clone(),
@@ -1657,3 +1705,6 @@ mod slmp_wasm_test;
 
 #[path = "t12_slmp_wasm_write/mod.rs"]
 mod slmp_wasm_write_test;
+
+#[path = "t12_slmp_wasm_hub_live/mod.rs"]
+mod slmp_wasm_hub_live_test;
