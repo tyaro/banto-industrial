@@ -54,12 +54,15 @@ pub fn decode_register_value(
     order: WordOrder,
 ) -> Result<TagValue, PlcError> {
     let span = data_type.register_span() as usize;
-    let window = regs.get(start..start + span).ok_or_else(|| {
-        PlcError::Protocol(format!(
-            "register window out of bounds: start={start} span={span} len={}",
-            regs.len()
-        ))
-    })?;
+    let window = start
+        .checked_add(span)
+        .and_then(|end| regs.get(start..end))
+        .ok_or_else(|| {
+            PlcError::Protocol(format!(
+                "register window out of bounds: start={start} span={span} len={}",
+                regs.len()
+            ))
+        })?;
 
     let value = match data_type {
         DataType::I16 => window[0] as i16 as f64,
@@ -507,6 +510,9 @@ mod tests {
         // Wire bytes have already been normalized to u16 words at this layer.
         for (high_low, low_high, expected_f64_bits) in [
             ([0x3fc0, 0x0000], [0x0000, 0x3fc0], 0x3ff8_0000_0000_0000), // 1.5
+            ([0x0000, 0x0001], [0x0001, 0x0000], 0x36a0_0000_0000_0000), // min positive subnormal
+            ([0x0080, 0x0000], [0x0000, 0x0080], 0x3810_0000_0000_0000), // min positive normal
+            ([0x7f7f, 0xffff], [0xffff, 0x7f7f], 0x47ef_ffff_e000_0000), // max finite
             ([0x0000, 0x0000], [0x0000, 0x0000], 0x0000_0000_0000_0000), // +0
             ([0x8000, 0x0000], [0x0000, 0x8000], 0x8000_0000_0000_0000), // -0
             ([0x7f80, 0x0000], [0x0000, 0x7f80], 0x7ff0_0000_0000_0000), // +inf
@@ -534,6 +540,21 @@ mod tests {
                 [0x3ff8, 0x0000, 0x0000, 0x0000],
                 [0x0000, 0x0000, 0x0000, 0x3ff8],
                 0x3ff8_0000_0000_0000, // 1.5
+            ),
+            (
+                [0x0000, 0x0000, 0x0000, 0x0001],
+                [0x0001, 0x0000, 0x0000, 0x0000],
+                0x0000_0000_0000_0001, // min positive subnormal
+            ),
+            (
+                [0x0010, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x0010],
+                0x0010_0000_0000_0000, // min positive normal
+            ),
+            (
+                [0x7fef, 0xffff, 0xffff, 0xffff],
+                [0xffff, 0xffff, 0xffff, 0x7fef],
+                0x7fef_ffff_ffff_ffff, // max finite
             ),
             (
                 [0x0000, 0x0000, 0x0000, 0x0000],
@@ -578,6 +599,32 @@ mod tests {
             WordOrder::LowHigh,
         )
         .is_nan());
+    }
+
+    #[test]
+    fn overflowing_register_windows_return_protocol_in_both_word_orders() {
+        let regs = [0u16; 4];
+        for data_type in [
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F32,
+            DataType::F64,
+        ] {
+            let span = usize::from(data_type.register_span());
+            for start in [usize::MAX - span, usize::MAX - span + 1, usize::MAX] {
+                for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+                    let err = decode_register_value(&regs, start, data_type, order).unwrap_err();
+                    assert!(
+                        matches!(err, PlcError::Protocol(_)),
+                        "{data_type:?} at {start} with {order:?} returned {err:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
