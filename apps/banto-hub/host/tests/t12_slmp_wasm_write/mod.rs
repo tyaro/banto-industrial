@@ -93,7 +93,13 @@ impl Fixture {
                             (0, body)
                         }
                     }
-                    0x0401 => (0, 7u16.to_le_bytes().to_vec()),
+                    0x0401 => {
+                        let count_offset = if subcommand == 2 { 25 } else { 24 };
+                        let count =
+                            u16::from_le_bytes([request[count_offset], request[count_offset + 1]]);
+                        assert!((1..=960).contains(&count));
+                        (0, 7u16.to_le_bytes().repeat(usize::from(count)))
+                    }
                     0x1401 => {
                         assert_eq!(start, 3010);
                         assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
