@@ -117,6 +117,13 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(page.getByRole('heading', { level: 3, name: '接続' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: '収集グループ' })).toBeVisible();
 		await expect(page.getByRole('heading', { level: 3, name: 'タグ' })).toBeVisible();
+		const connectionForm = page.locator('section.registry-section').nth(0).locator('div.create');
+		await connectionForm.getByLabel('プロトコル').selectOption('slmp');
+		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(1);
+		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(0);
+		await connectionForm.getByLabel('プロトコル').selectOption('modbus-tcp');
+		await expect(connectionForm.getByTestId('driver-field-unit_id')).toHaveCount(1);
+		await expect(connectionForm.getByTestId('driver-field-cpu_type')).toHaveCount(0);
 	});
 
 	test('2. PLC接続を作成すると一覧に出る', async () => {
@@ -124,7 +131,22 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		const form = section.locator('div.create');
 		await form.getByLabel('名前').fill(CONNECTION_NAME);
 		await form.getByLabel('ホスト').fill('192.168.11.200');
-		await form.getByRole('button', { name: '作成' }).click();
+		let releasePost: () => void = () => {};
+		const pendingPost = new Promise<void>((resolve) => {
+			releasePost = resolve;
+		});
+		await page.route('**/api/plc-connections', async (route) => {
+			if (route.request().method() === 'POST') await pendingPost;
+			await route.continue();
+		});
+		try {
+			await form.getByRole('button', { name: '作成' }).click();
+			await expect(form.getByTestId('driver-field-host').locator('input')).toBeDisabled();
+			await expect(form.getByTestId('driver-field-port').locator('input')).toBeDisabled();
+		} finally {
+			releasePost();
+			await page.unroute('**/api/plc-connections', { behavior: 'wait' });
+		}
 		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toBeVisible();
 	});
 
@@ -137,6 +159,94 @@ test.describe.serial('chronogazer タグ設定画面（#383 段階2a / R1-B）',
 		await expect(form.getByText('既に使用されています')).toBeVisible();
 		// 重複作成は成立していない - 一覧の行数は増えない。
 		await expect(section.locator('div.list').getByText(CONNECTION_NAME)).toHaveCount(1);
+	});
+
+	test('3a. 保存待ちのドライバ欄は編集できず、非既定設定が保存される', async () => {
+		const section = page.locator('section.registry-section').nth(0);
+		await section
+			.locator('div.list')
+			.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
+			.click();
+		const detail = section.locator('div.detail');
+		await detail.getByLabel('ホスト').fill('192.168.11.202');
+		await detail.getByLabel('ポート').fill('1502');
+		await detail.getByLabel('ユニットID').fill('7');
+		let releasePut: () => void = () => {};
+		const pendingPut = new Promise<void>((resolve) => {
+			releasePut = resolve;
+		});
+		await page.route('**/api/plc-connections/*', async (route) => {
+			if (route.request().method() === 'PUT') await pendingPut;
+			await route.continue();
+		});
+		try {
+			await detail.getByRole('button', { name: '保存' }).click();
+			await expect(detail.getByTestId('driver-field-host').locator('input')).toBeDisabled();
+			await expect(detail.getByTestId('driver-field-port').locator('input')).toBeDisabled();
+		} finally {
+			releasePut();
+			await page.unroute('**/api/plc-connections/*', { behavior: 'wait' });
+		}
+		await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
+		await expect(detail.getByLabel('ポート')).toHaveValue('1502');
+		await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
+	});
+
+	test('3b. catalog が接続選択より後に届いても保存済み設定を復元する', async () => {
+		let releaseCatalog: () => void = () => {};
+		const pendingCatalog = new Promise<void>((resolve) => {
+			releaseCatalog = resolve;
+		});
+		await page.route('**/api/drivers', async (route) => {
+			await pendingCatalog;
+			await route.continue();
+		});
+		try {
+			await page.reload({ waitUntil: 'domcontentloaded' });
+			const section = page.locator('section.registry-section').nth(0);
+			await section
+				.locator('div.list')
+				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
+				.click();
+			releaseCatalog();
+			const detail = section.locator('div.detail');
+			await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
+			await expect(detail.getByLabel('ポート')).toHaveValue('1502');
+			await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
+		} finally {
+			releaseCatalog();
+			await page.unroute('**/api/drivers', { behavior: 'wait' });
+		}
+	});
+
+	test('3c. catalog 取得失敗後の再試行でも保存済み設定を復元する', async () => {
+		let failOnce = true;
+		await page.route('**/api/drivers', async (route) => {
+			if (failOnce) {
+				failOnce = false;
+				await route.fulfill({ status: 503, contentType: 'application/json', body: '{}' });
+			} else {
+				await route.continue();
+			}
+		});
+		try {
+			await page.reload({ waitUntil: 'domcontentloaded' });
+			const section = page.locator('section.registry-section').nth(0);
+			await expect(
+				section.locator('div.create').getByText('ドライバ一覧を読み込めませんでした')
+			).toBeVisible();
+			await section
+				.locator('div.list')
+				.getByRole('gridcell', { name: CONNECTION_NAME, exact: true })
+				.click();
+			await section.locator('div.create').getByRole('button', { name: '再試行' }).click();
+			const detail = section.locator('div.detail');
+			await expect(detail.getByLabel('ホスト')).toHaveValue('192.168.11.202');
+			await expect(detail.getByLabel('ポート')).toHaveValue('1502');
+			await expect(detail.getByLabel('ユニットID')).toHaveValue('7');
+		} finally {
+			await page.unroute('**/api/drivers');
+		}
 	});
 
 	test('4. 収集グループを作成すると一覧に出る（直前のPLC接続がプルダウンに現れる）', async () => {

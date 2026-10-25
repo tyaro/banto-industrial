@@ -420,3 +420,28 @@ async fn an_unknown_protocol_is_one_protocol_error() {
         .unwrap_err();
     assert_eq!(fields(err), ["protocol"]);
 }
+
+#[tokio::test]
+async fn omitted_simulation_is_retained_by_settings_update() {
+    let svc = service().await;
+    let mut create = input("A", "plain", json!({"host": "h"}));
+    create.simulation = true;
+    let created = svc.create_settings(create).await.unwrap();
+    assert!(created.simulation);
+
+    let updated = svc
+        .update_settings_preserving_simulation(
+            created.id,
+            input("B", "plain", json!({"host": "h2"})),
+        )
+        .await
+        .unwrap();
+    assert!(updated.simulation);
+    assert_eq!(updated.name, "B");
+
+    let explicit = svc
+        .update_settings(created.id, input("B", "plain", json!({"host": "h2"})))
+        .await
+        .unwrap();
+    assert!(!explicit.simulation);
+}

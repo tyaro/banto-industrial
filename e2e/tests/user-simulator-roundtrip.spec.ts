@@ -157,11 +157,8 @@ interface ConnectionRow {
 	id: number;
 	name: string;
 	protocol: string;
-	host: string;
-	port: number;
-	unitId: number;
+	settings: Record<string, unknown>;
 	enabled: boolean;
-	wordOrder: string;
 }
 interface NamedRow {
 	id: number;
@@ -221,11 +218,8 @@ async function setConnectionEnabled(
 		data: {
 			name: conn.name,
 			protocol: conn.protocol,
-			host: conn.host,
-			port: conn.port,
-			unitId: conn.unitId,
 			enabled,
-			wordOrder: conn.wordOrder
+			settings: conn.settings
 		}
 	});
 	if (!res.ok()) {
@@ -522,7 +516,7 @@ test.describe.serial('chronogazer 開発用 PLC 相手の収集の一巡（R1-C 
 			await getList<ConnectionRow>(page.request, apiHeaders, '/api/plc-connections')
 		).find((c) => c.name === CONNECTION_NAME);
 		expect(created, '作った接続が一覧に無い').toBeDefined();
-		expect(created?.port).toBe(DEV_PLC_PORT);
+		expect(created?.settings['port']).toBe(DEV_PLC_PORT);
 		connectionId = created?.id ?? -1;
 	});
 

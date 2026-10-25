@@ -219,9 +219,8 @@ use banto_server::{
     GrantRegistry, GrantSpec, ServerEvent,
 };
 use banto_tags::{
-    CollectionGroup, CollectionGroupInput, CollectionGroupService, PlcConnection,
-    PlcConnectionInput, PlcConnectionService, Tag, TagInput, TagService, HUB_PROTOCOL,
-    MODBUS_PROTOCOL,
+    CollectionGroup, CollectionGroupInput, CollectionGroupService, ConnectionSettingsInput,
+    PlcConnection, PlcConnectionService, Tag, TagInput, TagService, HUB_PROTOCOL,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -835,227 +834,139 @@ fn default_payload_enabled() -> bool {
     true
 }
 
-fn default_plc_protocol() -> String {
-    MODBUS_PROTOCOL.to_string()
-}
-
-fn default_plc_unit_id() -> i64 {
-    1
-}
-
 fn default_tag_decimals() -> i64 {
     0
 }
 
-/// chronogazer は PLC 直結アプリ（recorder-requirements.md §1「対象環境」）
-/// で、`banto_tags::ALLOWED_PROTOCOLS` の4つのうち `"virtual"`（演算/内部
-/// タグの置き場、banto-hub が calc/mem を自動発行する仕組み）と
-/// `"postgres"`（DB Source/Sink、banto-hub 固有）はどちらも banto-hub の
-/// 機能で、chronogazer には対応する画面もタグ種別も無い。指示書の指定
-/// どおり `"modbus-tcp"`/`"slmp"` だけを受け付ける - relay-wright の
-/// `reject_postgres_connection_protocol`（postgres だけを拒否）より一段
-/// 狭い許可リスト方式にしているのは、chronogazer が「PLC 直結」以外の
-/// 用途を一切持たないため（将来 `ALLOWED_PROTOCOLS` が5つ目を増やしても、
-/// ここで拒否されるのが安全側のデフォルト）。#383 段階3 P2 で 5 つ目の
-/// `"hub"`（Hub 経由の接続、2026-10-10 オーナー決定 H1）が増えた。これは
-/// chronogazer のための種別なので、**P4（2026-10-11）で許可した**: 画面は
-/// 「Hub から追加」（`crate::hub_tags`）で暗黙に作り、一覧では読み取り専用で
-/// 出すが、REST・Tauri の作成・更新・削除も受け付ける（接続先とキーは
-/// `hub.record` にあり、この行は host/port を持たない - `banto-tags` が
-/// ""/0 に正規化する。Hub は 1 つ・グループを持つ間の削除やプロトコルの
-/// 付け替えの拒否も `banto-tags` が持つ）。**banto-hub は引き続き拒否する**
-/// （`apps/banto-hub/core/src/rest.rs`）。REST の create/update ハンドラ
-/// と、双方向対称の Tauri コマンド（`apps/chronogazer/src-tauri/src/lib.rs`
-/// の `plc_connections_create`/`plc_connections_update`）の両方から呼ぶ -
-/// 片方だけに書くともう片方の経路から通ってしまう。
-fn reject_disallowed_connection_protocol(protocol: &str) -> Result<(), BantoError> {
-    const ALLOWED: [&str; 3] = [MODBUS_PROTOCOL, "slmp", HUB_PROTOCOL];
-    if ALLOWED.contains(&protocol) {
+/// ChronoGazer accepts registered device drivers and its single host-provided
+/// `hub` marker. The same check is used by REST and Tauri.
+pub fn reject_disallowed_connection_protocol(
+    registry: &banto_driver_api::DriverRegistry,
+    protocol: &str,
+) -> Result<(), BantoError> {
+    use banto_driver_api::DriverKind;
+    let allowed = protocol == HUB_PROTOCOL
+        || registry.get(protocol).is_some_and(|entry| {
+            matches!(entry.kind(), DriverKind::Frame(_) | DriverKind::Session(_))
+        });
+    if allowed {
         return Ok(());
     }
+    let mut ids: Vec<String> = registry
+        .ids()
+        .filter(|id| {
+            registry.get(id.as_str()).is_some_and(|entry| {
+                matches!(entry.kind(), DriverKind::Frame(_) | DriverKind::Session(_))
+            })
+        })
+        .map(ToString::to_string)
+        .collect();
+    ids.push(HUB_PROTOCOL.to_owned());
     Err(BantoError::Validation {
         field_errors: vec![FieldError {
             field: "protocol".to_string(),
             message: format!(
                 "chronogazer が対応するプロトコルは {} のいずれかです",
-                ALLOWED.join(", ")
+                ids.join(", ")
             ),
         }],
     })
 }
 
-/// Wire-shaped (camelCase) create/update payload for `plc_connections`.
-///
-/// R1-B 指示書（#383 段階2a）どおり、banto-tags/relay-wright/banto-hub の
-/// `PlcConnectionInput`/`PlcConnectionPayload` から chronogazer に不要な
-/// フィールドを落とした最小形: `database`/`username`/`password`
-/// （`"postgres"` 専用列 - [`reject_disallowed_connection_protocol`] が
-/// postgres 接続の作成自体を拒否するので、この3列を持たせても常に空に
-/// しかならない）はワイヤに出さない。`word_order` は残す（指示書の残す
-/// 一覧に明記）。
-///
-/// **`simulation`（接続単位シミュレーション）は 2026-09-23 のオーナー決定
-/// （#413）で開けた**。R1-B では「banto-hub 固有機能」として落とし、常に
-/// `false` を書いていたが、「実機が無いときに設定できないのは使い物に
-/// ならない」ため。**省略できる**（`Option<bool>`）: **作成で省略 = `false`**
-/// （#413 の前と同じ）、**更新で省略 = 既存行の値を保つ**
-/// （[`update_plc_connection`]。UPDATE の時点の値を保つ - #417）。他の項目は更新でも全項目の
-/// 置き換えのままで、`simulation` だけを例外にしているのは、黙って `false` に
-/// 戻ると**登録済みのホスト（実機）へ実際に接続しに行き、記録も始まる**という
-/// 重い変化になるから - フィールドを知らない呼び出し元（スクリプト・E2E の
-/// 部分的な PUT 等）で起きても実機に触れないようにする。
-/// シミュレーション接続の値は現在値・しきい値イベントには出るが、**データ
-/// ファイル（tstore）には記録されない** - `banto-collect` の約束で、
-/// banto-hub と共有しているためこのアプリでは変えない
-/// （`crates/banto-collect/src/task.rs`）。切替はレジストリの変更なので、
-/// 走っている収集には「収集を再起動」まで反映されない（C-2 の決定）。
+/// Wire form shared with Hub. On create, omitted simulation means false; on
+/// update, omission keeps the stored value at UPDATE time.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PlcConnectionPayload {
     pub name: String,
-    #[serde(default = "default_plc_protocol")]
     pub protocol: String,
-    pub host: String,
-    pub port: i64,
-    #[serde(default = "default_plc_unit_id")]
-    pub unit_id: i64,
     #[serde(default = "default_payload_enabled")]
     pub enabled: bool,
-    /// `""` = 未指定（プロトコルの既定に従う） - `PlcConnectionInput::
-    /// word_order`のドキュメント参照。素通しするだけで chronogazer 側の
-    /// 追加ロジックは無い。
-    #[serde(default)]
-    pub word_order: String,
-    /// #413: 接続単位シミュレーション。`None`（省略）は作成なら `false`、
-    /// 更新なら既存行の値を保つ（型の doc 参照）。
     #[serde(default)]
     pub simulation: Option<bool>,
+    #[serde(default)]
+    pub settings: serde_json::Map<String, serde_json::Value>,
 }
 
 impl PlcConnectionPayload {
-    /// 作成用の `PlcConnectionInput`。`simulation` の省略は `false`。
-    ///
-    /// `From` を実装しないのは、作成と更新で省略の意味が違うため - 呼び出し側
-    /// がどちらかを必ず選ぶようにする（更新は [`update_plc_connection`]）。
-    pub fn into_create_input(self) -> PlcConnectionInput {
+    pub fn into_create_input(self) -> ConnectionSettingsInput {
         let simulation = self.simulation.unwrap_or(false);
         self.into_input(simulation)
     }
 
-    fn into_input(self, simulation: bool) -> PlcConnectionInput {
-        PlcConnectionInput {
+    fn into_input(self, simulation: bool) -> ConnectionSettingsInput {
+        ConnectionSettingsInput {
             name: self.name,
             protocol: self.protocol,
-            host: self.host,
-            port: self.port,
-            unit_id: self.unit_id,
             enabled: self.enabled,
             simulation,
-            word_order: self.word_order,
-            // #605: chronogazer の画面はこの項目を送らない。作成は R、更新は
-            // 既存行を保つ（banto-tags の省略規則）。
-            cpu_type: None,
-            // postgres 専用列。[`reject_disallowed_connection_protocol`]
-            // が postgres 接続の作成を拒否するので常に `None` でよい。
-            database: None,
-            username: None,
+            settings: self.settings,
             secrets: Default::default(),
-            settings: None,
         }
     }
 }
 
-/// PLC 接続の更新（#417）。**`simulation` を省略した更新は、UPDATE の時点で
-/// 保存されている値を保つ**（他の項目は置き換え - [`PlcConnectionPayload`] の
-/// doc）。REST の `plc_connections_update` と Tauri の同名コマンドの**両方が
-/// これを呼ぶ** - 経路によって省略の意味が割れないように。
-///
-/// **既存の値を先に読んで書き戻すことはしない**（オーナーレビュー P2）: 読んで
-/// から書くまでの間に別の更新が明示的に切り替えると、読んだ古い値でその切替を
-/// 取り消してしまう（黙って実機へ接続しに行く / 記録されなくなる）。省略時は
-/// `banto_tags::PlcConnectionService::update_preserving_simulation`
-/// （`simulation = COALESCE(NULL, simulation)`）を使い、保持を UPDATE 文
-/// そのものに任せる - `simulation` を読む手順がそもそも無いので、挟み込まれる
-/// 窓が無い。存在しない `id` は `update` と同じ `NotFound`。
+/// Shared REST/Tauri update path. Omission retains simulation in one transaction.
 pub async fn update_plc_connection(
     plc_connections: &PlcConnectionService,
     id: i64,
     payload: PlcConnectionPayload,
 ) -> Result<PlcConnection, BantoError> {
     match payload.simulation {
-        Some(value) => plc_connections.update(id, payload.into_input(value)).await,
-        // `into_input` に渡す値は使われない（保存されている値が残る）。
+        Some(value) => {
+            plc_connections
+                .update_settings(id, payload.into_input(value))
+                .await
+        }
         None => {
             plc_connections
-                .update_preserving_simulation(id, payload.into_input(false))
+                .update_settings_preserving_simulation(id, payload.into_input(false))
                 .await
         }
     }
 }
 
-/// `plc_connections` の GET/list/create/update が返す読み取り DTO。
-/// `banto_tags::PlcConnection` をそのまま `Serialize` すると `password`
-/// 列（`banto_hub`/relay-wright と共有する平文カラム、
-/// `PlcConnection::password`の doc comment「外部呼び出し元へ決して
-/// シリアライズしない」）がそのまま応答に出てしまう。chronogazer は
-/// postgres 接続を作成できない（[`reject_disallowed_connection_protocol`]）
-/// ので通常運用でこの列が非空になることは無いはずだが、防御的に - 何らか
-/// の経路（データベースファイルの直接操作等）で非空の `password` を持つ行
-/// が紛れ込んでいても外へ出さない。`database`/`username` も同じ理由
-/// （chronogazer は一切書かない列）で応答から省く - relay-wright の同名
-/// DTO と異なり、これらの列を「常に既定値のまま」であることを応答形から
-/// 見ても分かるようにしている。
-///
-/// `simulation` は #413（2026-09-23 オーナー決定）で書けるようにしたので
-/// **返す**（R1-B では「一切書かない列」として省いていた）。真偽 1 つで、
-/// 読み取りの床（viewer 以上）に出して困る情報ではない。
+/// Read DTO. Stored secret references are never returned.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnectionResponse {
     pub id: i64,
     pub name: String,
     pub protocol: String,
-    pub host: String,
-    pub port: i64,
-    pub unit_id: i64,
     pub enabled: bool,
-    pub word_order: String,
-    /// #413: 接続単位シミュレーション（レジストリの値）。走っている収集が
-    /// 実際にシミュレータ相手かどうかは `GET /api/collect/connections` の
-    /// `simulation`（切替は「収集を再起動」まで反映されないので、両者は
-    /// 一時的に食い違いうる）。
     pub simulation: bool,
+    pub settings: serde_json::Map<String, serde_json::Value>,
+}
+
+fn public_settings(conn: &PlcConnection) -> serde_json::Map<String, serde_json::Value> {
+    conn.settings
+        .iter()
+        .filter(|(_, value)| !banto_tags::settings_json::is_secret_ref(value))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 impl From<PlcConnection> for PlcConnectionResponse {
     fn from(conn: PlcConnection) -> Self {
+        let settings = public_settings(&conn);
         Self {
             id: conn.id,
             name: conn.name,
             protocol: conn.protocol,
-            host: conn.host,
-            port: conn.port,
-            unit_id: conn.unit_id,
             enabled: conn.enabled,
-            word_order: conn.word_order,
             simulation: conn.simulation,
+            settings,
         }
     }
 }
 
-/// `plc_connections` の作成・更新の監査 `detail`。REST（このモジュール）と
-/// Tauri（`apps/chronogazer/src-tauri/src/lib.rs` の
-/// `plc_connections_create`/`plc_connections_update`）の**両方がこれを使う** -
-/// 経路によって記録の中身が割れないように。
-///
-/// #413: `simulation` を足した。切替は「値が記録されなくなる」操作なので、
-/// 誰がいつ切り替えたかを監査から辿れるようにする（`name`/`enabled` と
-/// 同じく、保存**後**の行の値を記録する）。
+/// Audit fields reflect the saved row; secret references are removed.
 pub fn plc_connection_audit_detail(conn: &PlcConnection) -> serde_json::Value {
     json!({
         "name": conn.name,
         "enabled": conn.enabled,
         "simulation": conn.simulation,
+        "settings": public_settings(conn),
     })
 }
 
@@ -1232,6 +1143,12 @@ struct TagRegistryState {
     drivers: Arc<banto_driver_api::DriverRegistry>,
 }
 
+async fn drivers_list(
+    State(state): State<TagRegistryState>,
+) -> Json<Vec<banto_tags::driver_catalog::DriverListItem>> {
+    Json(banto_tags::driver_catalog::driver_list(&state.drivers))
+}
+
 async fn plc_connections_list(
     State(state): State<TagRegistryState>,
 ) -> Result<Json<Vec<PlcConnectionResponse>>, ApiError> {
@@ -1270,10 +1187,10 @@ async fn plc_connections_create(
         "/api/plc-connections",
     )
     .await?;
-    reject_disallowed_connection_protocol(&input.protocol)?;
+    reject_disallowed_connection_protocol(&state.drivers, &input.protocol)?;
     let created = state
         .plc_connections
-        .create(input.into_create_input())
+        .create_settings(input.into_create_input())
         .await?;
     record_write(
         &state.audit,
@@ -1306,7 +1223,7 @@ async fn plc_connections_update(
         "/api/plc-connections/{id}",
     )
     .await?;
-    reject_disallowed_connection_protocol(&input.protocol)?;
+    reject_disallowed_connection_protocol(&state.drivers, &input.protocol)?;
     let updated = update_plc_connection(&state.plc_connections, id, input).await?;
     record_write(
         &state.audit,
@@ -1819,6 +1736,7 @@ fn tag_registry_router(
             get(tags_get).put(tags_update).delete(tags_delete),
         )
         .route("/api/config-exclusions", get(config_exclusions_list))
+        .route("/api/drivers", get(drivers_list))
         .with_state(state)
         .layer(middleware::from_fn_with_state(auth, require_auth))
 }
@@ -4052,11 +3970,74 @@ mod tests {
         json!({
             "name": name,
             "protocol": "modbus-tcp",
-            "host": "192.168.11.200",
-            "port": 502,
-            "unitId": 1,
-            "enabled": true
+            "enabled": true,
+            "settings": {"host": "192.168.11.200", "port": 502}
         })
+    }
+
+    #[tokio::test]
+    async fn drivers_catalog_is_viewer_readable_and_keeps_registration_order() {
+        let (router, _admin, _editor, viewer) = router_with_role_tokens().await;
+        let denied = router.clone().oneshot(get("/api/drivers")).await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        let response = router
+            .oneshot(get_auth("/api/drivers", &viewer))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rows = body_json(response).await;
+        assert_eq!(rows[0]["id"], "slmp");
+        assert_eq!(rows[1]["id"], "modbus-tcp");
+        assert!(rows[0]["settingsSchema"]["fields"].is_array());
+        assert!(rows
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["kind"] != "host"));
+    }
+
+    #[tokio::test]
+    async fn connection_wire_form_rejects_flat_fields_and_returns_settings() {
+        let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
+        let old = json!({
+            "name": "old", "protocol": "modbus-tcp", "enabled": true,
+            "host": "127.0.0.1", "port": 502
+        });
+        let response = router
+            .clone()
+            .oneshot(post_json_auth("/api/plc-connections", &editor, old))
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error());
+
+        let created = router
+            .clone()
+            .oneshot(post_json_auth(
+                "/api/plc-connections",
+                &editor,
+                json!({
+                    "name": "slmp", "protocol": "slmp", "enabled": true,
+                    "settings": {"host": "127.0.0.1", "port": 5000, "cpu_type": "Q"}
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::OK);
+        let row = body_json(created).await;
+        assert_eq!(row["settings"]["cpu_type"], "Q");
+        assert_eq!(row["settings"]["host"], "127.0.0.1");
+        for flat in ["host", "port", "unitId", "wordOrder", "cpuType"] {
+            assert!(row.get(flat).is_none(), "{flat} leaked into the response");
+        }
+        let id = row["id"].as_i64().unwrap();
+        let listed = router
+            .oneshot(get_auth("/api/plc-connections", &editor))
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let rows = body_json(listed).await;
+        assert_eq!(rows[0]["id"], id);
+        assert_eq!(rows[0]["settings"]["cpu_type"], "Q");
     }
 
     /// R0 §3.6: 読み取りは viewer 以上、書き込みは editor 以上 - 3エンティティ
@@ -4099,7 +4080,7 @@ mod tests {
         assert_eq!(create_conn.status(), StatusCode::OK);
         let conn = body_json(create_conn).await;
         assert_eq!(conn["name"], "plc1");
-        assert_eq!(conn["wordOrder"], "high_low"); // #325: modbus-tcp の既定
+        assert_eq!(conn["settings"]["word_order"], "high_low"); // #325: modbus-tcp の既定
         let conn_id = conn["id"].as_i64().unwrap();
 
         // editor: そのPLC接続配下に収集グループを作成できる。
@@ -4210,7 +4191,7 @@ mod tests {
     async fn plc_connection_create_rejects_virtual_and_postgres_protocol_readably() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
 
-        for protocol in ["virtual", "postgres"] {
+        for protocol in ["virtual", "postgres", "push", "unknown-driver"] {
             let mut payload = plc_connection_payload("not-allowed");
             payload["protocol"] = json!(protocol);
             let response = router
@@ -4233,7 +4214,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_hub_connection_can_be_created_once_and_deleted_only_when_empty() {
         let (router, _admin, editor, _viewer) = router_with_role_tokens().await;
-        let hub_payload = |name: &str| json!({ "name": name, "protocol": "hub", "host": "", "port": 0, "enabled": true });
+        let hub_payload = |name: &str| json!({ "name": name, "protocol": "hub", "enabled": true, "settings": {} });
 
         let created = router
             .clone()
@@ -4247,8 +4228,7 @@ mod tests {
         assert_eq!(created.status(), StatusCode::OK);
         let created = body_json(created).await;
         assert_eq!(created["protocol"], json!("hub"));
-        assert_eq!(created["host"], json!(""));
-        assert_eq!(created["port"], json!(0));
+        assert_eq!(created["settings"], json!({}));
         let hub_id = created["id"].as_i64().unwrap();
 
         // 2026-10-11 オーナー決定: Hub 接続の有効・無効は PLC 接続と同じ更新で切り替える。
@@ -4257,7 +4237,7 @@ mod tests {
             .oneshot(put_json_auth(
                 &format!("/api/plc-connections/{hub_id}"),
                 &editor,
-                json!({ "name": "Hub", "protocol": "hub", "host": "", "port": 0, "enabled": false }),
+                json!({ "name": "Hub", "protocol": "hub", "enabled": false, "settings": {} }),
             ))
             .await
             .unwrap();
@@ -5110,7 +5090,7 @@ mod tests {
         let conn_id = created["id"].as_i64().unwrap();
 
         let mut updated_payload = plc_connection_payload("audited-plc-renamed");
-        updated_payload["port"] = json!(503);
+        updated_payload["settings"]["port"] = json!(503);
         router
             .clone()
             .oneshot(put_json(

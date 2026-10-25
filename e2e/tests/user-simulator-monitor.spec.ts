@@ -97,11 +97,8 @@ interface NamedRow {
 }
 interface ConnectionRow extends NamedRow {
 	protocol: string;
-	host: string;
-	port: number;
-	unitId: number;
+	settings: Record<string, unknown>;
 	enabled: boolean;
-	wordOrder: string;
 }
 
 async function fetchApiHeaders(request: APIRequestContext): Promise<ApiHeaders> {
@@ -172,11 +169,8 @@ async function setConnectionEnabled(
 		data: {
 			name: conn.name,
 			protocol: conn.protocol,
-			host: conn.host,
-			port: conn.port,
-			unitId: conn.unitId,
 			enabled,
-			wordOrder: conn.wordOrder
+			settings: conn.settings
 		}
 	});
 	if (!res.ok()) {
@@ -258,11 +252,8 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		const conn = await postJson<NamedRow>(page.request, headers, '/api/plc-connections', {
 			name: CONNECTION_NAME,
 			protocol: 'modbus-tcp',
-			host: '127.0.0.1',
-			port: DEV_PLC_PORT,
-			unitId: 1,
 			enabled: true,
-			wordOrder: ''
+			settings: { host: '127.0.0.1', port: DEV_PLC_PORT, unit_id: 1 }
 		});
 		const cg = await postJson<NamedRow>(page.request, headers, '/api/collection-groups', {
 			name: COLLECTION_GROUP_NAME,

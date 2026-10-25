@@ -82,6 +82,7 @@
 	import { canWriteResources } from '#lib/permissions.js';
 	import {
 		listPlcConnections,
+		listDrivers,
 		createPlcConnection,
 		updatePlcConnection,
 		deletePlcConnection,
@@ -99,14 +100,23 @@
 		ALLOWED_PERIOD_MS,
 		type PlcConnection,
 		type PlcConnectionInput,
-		type PlcProtocol,
-		type WordOrder,
+		type DriverInfo,
 		type CollectionGroup,
 		type CollectionGroupInput,
 		type Tag,
 		type ExclusionView
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import { exclusionUnitLabel } from '#lib/banto/collectAdmin.js';
+	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
+	import {
+		buildDriverSettings,
+		defaultDriverState,
+		driverStateFromSettings,
+		mapSettingsFieldErrors,
+		summarizeDriverValues,
+		switchDriverState,
+		validateDriverValues
+	} from '#lib/banto/driverSettingsForm.js';
 	import HubImportDialog from './HubImportDialog.svelte';
 	import {
 		getTagThresholds,
@@ -205,26 +215,28 @@
 	const PLC_CREATE = 'plcCreate';
 	const PLC_EDIT = 'plcEdit';
 
-	const protocolOptions: { value: PlcProtocol; label: string }[] = [
-		{ value: 'modbus-tcp', label: 'Modbus TCP' },
-		{ value: 'slmp', label: 'SLMP（MELSEC MCプロトコル）' }
-	];
+	let drivers = $state<DriverInfo[] | null>(null);
+	let driversError: string | null = $state(null);
+	const protocolOptions = $derived(
+		(drivers ?? [])
+			.filter((driver) => driver.id !== 'hub')
+			.map((driver) => ({ value: driver.id, label: driver.displayName }))
+	);
+	const driverFor = (protocol: string): DriverInfo | undefined =>
+		(drivers ?? []).find((driver) => driver.id === protocol && driver.id !== 'hub');
 
-	// `@banto/forms`のSelectFieldは値なし用の固定プレースホルダ
-	// `<option value="">選択してください</option>`を常に持つ - wire上の
-	// 「未指定」を表す `''`（`PlcConnectionInput::word_order`のdoc comment
-	// 参照）をそのままオプション値に使うと、このプレースホルダと value が
-	// 衝突し、ブラウザは先勝ちでプレースホルダ側を選択してしまう（実機で
-	// 確認済み: 既定を選んでも `<select>` が「選択してください」のまま表示
-	// される）。UI専用のセンチネル `WORD_ORDER_AUTO`（wire には出さない）で
-	// 衝突を避け、`toPlcConnectionInput`/`connectionFormValues` で wire の
-	// `''` と相互変換する。
-	const WORD_ORDER_AUTO = 'auto';
-	const wordOrderOptions: { value: string; label: string }[] = [
-		{ value: WORD_ORDER_AUTO, label: '既定（プロトコルに合わせる）' },
-		{ value: 'low_high', label: 'Low-High' },
-		{ value: 'high_low', label: 'High-Low' }
-	];
+	async function reloadDrivers(): Promise<void> {
+		try {
+			const catalog = await listDrivers();
+			drivers = catalog.filter((driver) => driver.id !== 'hub');
+			driversError = null;
+			if (!createConnectionStore.isDirty) {
+				createConnectionStore = createFormStore(connectionSchema(PLC_CREATE));
+			}
+		} catch (err) {
+			driversError = errorMessage(err);
+		}
+	}
 
 	/** `prefix` はこのモジュール doc comment の「フィールド名の接頭辞について」参照（例: `plcCreate`/`plcEdit`）。 */
 	function connectionSchema(prefix: string): FormSchema {
@@ -236,39 +248,8 @@
 					label: 'プロトコル',
 					type: 'select',
 					required: true,
-					default: 'modbus-tcp',
+					default: protocolOptions[0]?.value ?? '',
 					options: protocolOptions
-				},
-				{
-					name: `${prefix}Host`,
-					label: 'ホスト',
-					type: 'text',
-					required: true,
-					placeholder: '192.168.1.10'
-				},
-				{
-					name: `${prefix}Port`,
-					label: 'ポート',
-					type: 'number',
-					required: true,
-					min: 1,
-					max: 65535,
-					default: 502
-				},
-				{
-					name: `${prefix}UnitId`,
-					label: 'ユニットID',
-					type: 'number',
-					min: 0,
-					max: 255,
-					default: 1
-				},
-				{
-					name: `${prefix}WordOrder`,
-					label: 'ワードオーダー',
-					type: 'select',
-					default: WORD_ORDER_AUTO,
-					options: wordOrderOptions
 				},
 				{ name: `${prefix}Enabled`, label: '有効', type: 'checkbox', default: true },
 				// #413: 接続単位シミュレーション。ラベルに「記録されない」ことを
@@ -286,32 +267,23 @@
 
 	function toPlcConnectionInput(
 		prefix: string,
-		values: Record<string, unknown>
+		values: Record<string, unknown>,
+		settings: Record<string, unknown>
 	): PlcConnectionInput {
-		const wordOrder = values[`${prefix}WordOrder`];
-		const port = values[`${prefix}Port`];
-		const unitId = values[`${prefix}UnitId`];
 		return {
 			name: String(values[`${prefix}Name`] ?? ''),
-			protocol: (values[`${prefix}Protocol`] as PlcProtocol) ?? 'modbus-tcp',
-			host: String(values[`${prefix}Host`] ?? ''),
-			port: typeof port === 'number' ? port : 0,
-			unitId: typeof unitId === 'number' ? unitId : 1,
+			protocol: String(values[`${prefix}Protocol`] ?? ''),
 			enabled: Boolean(values[`${prefix}Enabled`]),
-			wordOrder: wordOrder === WORD_ORDER_AUTO || wordOrder == null ? '' : (wordOrder as WordOrder),
+			settings,
 			simulation: Boolean(values[`${prefix}Simulation`])
 		};
 	}
 
-	/** 編集フォームの初期値（`toPlcConnectionInput`の逆）。wire の `wordOrder`（`''` = 未指定）を選択肢の `WORD_ORDER_AUTO` へ変換する。 */
+	/** 編集フォームの共通項目の初期値。ドライバの値はスキーマから復元する。 */
 	function connectionFormValues(prefix: string, conn: PlcConnection): Record<string, unknown> {
 		return {
 			[`${prefix}Name`]: conn.name,
 			[`${prefix}Protocol`]: conn.protocol,
-			[`${prefix}Host`]: conn.host,
-			[`${prefix}Port`]: conn.port,
-			[`${prefix}UnitId`]: conn.unitId,
-			[`${prefix}WordOrder`]: conn.wordOrder === '' ? WORD_ORDER_AUTO : conn.wordOrder,
 			[`${prefix}Enabled`]: conn.enabled,
 			[`${prefix}Simulation`]: conn.simulation
 		};
@@ -322,6 +294,35 @@
 	// ようにする）。CREATE/EDIT どちらのプレフィックスで計算しても剥がした
 	// 後の wire 名は同じなので、ここでは PLC_CREATE 側で一度だけ計算する。
 	const CONNECTION_WIRE_FIELDS = schemaWireFields(PLC_CREATE, connectionSchema(PLC_CREATE).fields);
+
+	function applyConnectionErrors(
+		prefix: string,
+		err: unknown,
+		store: ReturnType<typeof createFormStore>,
+		driver: DriverInfo,
+		creating: boolean
+	): void {
+		if (isProviderError(err) && err.body.kind === 'validation') {
+			const fieldErrors = Object.fromEntries(
+				(err.body.field_errors ?? []).map(({ field, message }) => [field, message])
+			);
+			const mapped = mapSettingsFieldErrors(
+				driver.settingsSchema.fields.map((field) => field.key),
+				fieldErrors
+			);
+			if (creating) createDriverErrors = mapped.fields;
+			else editDriverErrors = mapped.fields;
+			const { formErrors, toastMessages } = splitServerFieldErrors(
+				prefix,
+				CONNECTION_WIRE_FIELDS,
+				Object.entries(mapped.other).map(([field, message]) => ({ field, message }))
+			);
+			if (formErrors.length > 0) store.setServerErrors(formErrors);
+			for (const message of toastMessages) toastStore.push('error', message);
+			return;
+		}
+		applyServerErrors(prefix, CONNECTION_WIRE_FIELDS, err, store);
+	}
 
 	// `null` は「まだ読めていない」。`[]`（読めた結果0件）とは**別物**として
 	// 扱う（#394レビュー P1-3。同じアプリのHub側 `HubView.tags` と同じ規律で、
@@ -386,18 +387,49 @@
 	// スキーマは動的な options を持たないため untrack が無くても警告は出ないが、
 	// 他の2セクションと同じ書き方に揃えている。
 	let createConnectionStore = $state(untrack(() => createFormStore(connectionSchema(PLC_CREATE))));
+	let createDriverState = $state(defaultDriverState([]));
+	let createDriverId = $state('');
+	let createDriverErrors: Record<string, string> = $state({});
 	let creatingConnection = $state(false);
 
+	$effect(() => {
+		const protocol = String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '');
+		const driver = driverFor(protocol);
+		if (!driver || protocol === createDriverId) return;
+		const previous = driverFor(createDriverId);
+		createDriverState = switchDriverState(
+			previous ? { fields: previous.settingsSchema.fields, state: createDriverState } : null,
+			driver.settingsSchema.fields
+		);
+		createDriverId = protocol;
+		createDriverErrors = {};
+	});
+
 	async function handleCreateConnection(values: Record<string, unknown>): Promise<void> {
+		const driver = driverFor(String(values[`${PLC_CREATE}Protocol`] ?? ''));
+		if (!driver) return;
+		createDriverErrors = validateDriverValues(
+			driver.settingsSchema.fields,
+			createDriverState.values
+		);
+		if (Object.keys(createDriverErrors).length > 0) return;
 		creatingConnection = true;
 		try {
-			const created = await createPlcConnection(toPlcConnectionInput(PLC_CREATE, values));
+			const created = await createPlcConnection(
+				toPlcConnectionInput(
+					PLC_CREATE,
+					values,
+					buildDriverSettings(driver.settingsSchema.fields, createDriverState.values)
+				)
+			);
 			// #413: 応答の行（保存された値）で文言を決める - 送った値ではなく。
 			toastStore.push('success', connectionSavedMessage(null, created));
 			createConnectionStore = createFormStore(connectionSchema(PLC_CREATE));
+			createDriverState = defaultDriverState(driver.settingsSchema.fields);
+			createDriverErrors = {};
 			await reloadConnections();
 		} catch (err) {
-			applyServerErrors(PLC_CREATE, CONNECTION_WIRE_FIELDS, err, createConnectionStore);
+			applyConnectionErrors(PLC_CREATE, err, createConnectionStore, driver, true);
 		} finally {
 			creatingConnection = false;
 		}
@@ -416,29 +448,27 @@
 		{
 			id: 'protocol',
 			header: 'プロトコル',
-			accessor: (row) => (row.protocol === 'hub' ? 'Hub 経由' : row.protocol),
-			width: 110
-		},
-		// #383 段階3 P4: Hub 接続はホスト・ポートを持たない（接続先は「設定 > Hub接続」）。
-		{
-			id: 'host',
-			header: 'ホスト',
-			accessor: (row) => (row.protocol === 'hub' ? '—' : row.host),
-			width: 140
+			accessor: (row) =>
+				row.protocol === 'hub'
+					? 'Hub 経由'
+					: (driverFor(row.protocol)?.displayName ?? row.protocol),
+			width: 150
 		},
 		{
-			id: 'port',
-			header: 'ポート',
-			accessor: (row) => (row.protocol === 'hub' ? '—' : row.port),
-			width: 80,
-			align: 'right'
-		},
-		{
-			id: 'unitId',
-			header: 'ユニットID',
-			accessor: (row) => (row.protocol === 'hub' ? '—' : row.unitId),
-			width: 90,
-			align: 'right'
+			id: 'settings',
+			header: '接続設定',
+			accessor: (row) => {
+				const driver = driverFor(row.protocol);
+				return driver
+					? summarizeDriverValues(
+							driver.settingsSchema.fields,
+							driverStateFromSettings(driver.settingsSchema.fields, row.settings).values
+						)
+							.map(({ label, text }) => `${label}: ${text}`)
+							.join(' / ')
+					: '—';
+			},
+			width: 300
 		},
 		{
 			id: 'enabled',
@@ -459,6 +489,9 @@
 
 	let selectedConnection: PlcConnection | null = $state(null);
 	let editConnectionStore = $state(untrack(() => createFormStore(connectionSchema(PLC_EDIT))));
+	let editDriverState = $state(defaultDriverState([]));
+	let editDriverId = $state('');
+	let editDriverErrors: Record<string, string> = $state({});
 	let savingConnection = $state(false);
 	let deletingConnection = $state(false);
 
@@ -475,10 +508,36 @@
 			connectionSchema(PLC_EDIT),
 			connectionFormValues(PLC_EDIT, conn)
 		);
+		const driver = driverFor(conn.protocol);
+		editDriverState = driverStateFromSettings(driver?.settingsSchema.fields ?? [], conn.settings);
+		editDriverId = driver ? conn.protocol : '';
+		editDriverErrors = {};
 		editHubConnectionStore = createFormStore(hubConnectionSchema(HUB_EDIT), {
 			[`${HUB_EDIT}Enabled`]: conn.enabled
 		});
 	}
+
+	$effect(() => {
+		const protocol = String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '');
+		const driver = driverFor(protocol);
+		if (
+			!selectedConnection ||
+			selectedConnection.protocol === 'hub' ||
+			!driver ||
+			protocol === editDriverId
+		)
+			return;
+		const previous = driverFor(editDriverId);
+		editDriverState =
+			!previous && protocol === selectedConnection.protocol
+				? driverStateFromSettings(driver.settingsSchema.fields, selectedConnection.settings)
+				: switchDriverState(
+						previous ? { fields: previous.settingsSchema.fields, state: editDriverState } : null,
+						driver.settingsSchema.fields
+					);
+		editDriverId = protocol;
+		editDriverErrors = {};
+	});
 
 	/** #383 段階3 P4: 選んだ接続が Hub 接続か（編集フォームの代わりに読み取り専用の欄を出す）。 */
 	const selectedConnectionIsHub = $derived.by(() => selectedConnection?.protocol === 'hub');
@@ -567,6 +626,10 @@
 	async function saveConnection(): Promise<void> {
 		if (!selectedConnection || savingConnection || deletingConnection) return;
 		if (!editConnectionStore.validateAll()) return;
+		const driver = driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''));
+		if (!driver) return;
+		editDriverErrors = validateDriverValues(driver.settingsSchema.fields, editDriverState.values);
+		if (Object.keys(editDriverErrors).length > 0) return;
 		const pending: SaveGuardToken<typeof editConnectionStore> = {
 			id: selectedConnection.id,
 			store: editConnectionStore
@@ -579,7 +642,11 @@
 				pending,
 				updatePlcConnection(
 					selectedConnection.id,
-					toPlcConnectionInput(PLC_EDIT, editConnectionStore.values)
+					toPlcConnectionInput(
+						PLC_EDIT,
+						editConnectionStore.values,
+						buildDriverSettings(driver.settingsSchema.fields, editDriverState.values)
+					)
 				),
 				() => ({ id: selectedConnection?.id, store: editConnectionStore })
 			);
@@ -590,6 +657,11 @@
 					// 行き、ここは通らない - 画面は切り替わったように見せない）。
 					toastStore.push('success', connectionSavedMessage(before, outcome.entity));
 					editConnectionStore.markClean();
+					editDriverState = driverStateFromSettings(
+						driver.settingsSchema.fields,
+						outcome.entity.settings
+					);
+					editDriverErrors = {};
 					selectedConnection = outcome.entity;
 					await reloadConnections();
 					break;
@@ -599,7 +671,7 @@
 					await reloadConnections();
 					break;
 				case 'error':
-					applyServerErrors(PLC_EDIT, CONNECTION_WIRE_FIELDS, outcome.err, editConnectionStore);
+					applyConnectionErrors(PLC_EDIT, outcome.err, editConnectionStore, driver, false);
 					break;
 				case 'stale-error':
 					// 古いエラーを今開いている別の接続のフォームには出さない
@@ -1290,9 +1362,11 @@
 	guardUnsavedChanges({
 		isDirty: () =>
 			createConnectionStore.isDirty ||
+			Object.values(createDriverState.touched).some(Boolean) ||
 			createGroupStore.isDirty ||
 			createTagStore.isDirty ||
-			(selectedConnection !== null && editConnectionStore.isDirty) ||
+			(selectedConnection !== null &&
+				(editConnectionStore.isDirty || Object.values(editDriverState.touched).some(Boolean))) ||
 			// #383 段階3 P4: Hub 接続の「有効」（Hub 接続を選んでいる間だけ数える）。
 			(selectedConnection !== null && selectedConnectionIsHub && editHubConnectionStore.isDirty) ||
 			(selectedGroup !== null && editGroupStore.isDirty) ||
@@ -1359,6 +1433,7 @@
 	}
 
 	$effect(() => {
+		void reloadDrivers();
 		void reloadConnections();
 		void reloadGroups();
 		void reloadTags();
@@ -1415,14 +1490,44 @@
 			{#if canWrite}
 				<div class="create">
 					<h4>新規作成</h4>
-					<UnsavedChangesNotice pending={createConnectionStore.isDirty} label={UNSAVED_NOTICE} />
-					<BantoForm
-						schema={connectionSchema(PLC_CREATE)}
-						store={createConnectionStore}
-						onSubmit={handleCreateConnection}
-						submitting={creatingConnection}
-						submitLabel="作成"
-					/>
+					{#if driversError}
+						<p class="load-error" role="alert">
+							ドライバ一覧を読み込めませんでした（{driversError}）。<button
+								type="button"
+								onclick={() => void reloadDrivers()}>再試行</button
+							>
+						</p>
+					{:else if drivers === null}
+						<p class="loading">ドライバ一覧を読み込み中…</p>
+					{:else if protocolOptions.length === 0}
+						<p class="load-error" role="alert">利用できるドライバがありません。</p>
+					{:else}
+						<UnsavedChangesNotice
+							pending={createConnectionStore.isDirty ||
+								Object.values(createDriverState.touched).some(Boolean)}
+							label={UNSAVED_NOTICE}
+						/>
+						<BantoForm
+							schema={connectionSchema(PLC_CREATE)}
+							store={createConnectionStore}
+							onSubmit={handleCreateConnection}
+							submitting={creatingConnection}
+							submitLabel="作成"
+						>
+							{#if driverFor(String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? ''))}
+								{@const driver = driverFor(
+									String(createConnectionStore.values[`${PLC_CREATE}Protocol`] ?? '')
+								)!}
+								<DriverSettingsForm
+									schema={driver.settingsSchema.fields}
+									bind:value={createDriverState}
+									errors={createDriverErrors}
+									readOnly={creatingConnection}
+									idPrefix="plc-create-driver"
+								/>
+							{/if}
+						</BantoForm>
+					{/if}
 				</div>
 			{/if}
 
@@ -1515,7 +1620,11 @@
 			{:else if selectedConnection && canWrite}
 				<div class="detail">
 					<h4>{selectedConnection.name} を編集</h4>
-					<UnsavedChangesNotice pending={editConnectionStore.isDirty} label={UNSAVED_NOTICE} />
+					<UnsavedChangesNotice
+						pending={editConnectionStore.isDirty ||
+							Object.values(editDriverState.touched).some(Boolean)}
+						label={UNSAVED_NOTICE}
+					/>
 					<BantoForm
 						schema={connectionSchema(PLC_EDIT)}
 						store={editConnectionStore}
@@ -1523,6 +1632,18 @@
 						submitting={savingConnection || deletingConnection}
 						submitLabel="保存"
 					>
+						{#if driverFor(String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? ''))}
+							{@const driver = driverFor(
+								String(editConnectionStore.values[`${PLC_EDIT}Protocol`] ?? '')
+							)!}
+							<DriverSettingsForm
+								schema={driver.settingsSchema.fields}
+								bind:value={editDriverState}
+								errors={editDriverErrors}
+								readOnly={savingConnection || deletingConnection}
+								idPrefix="plc-edit-driver"
+							/>
+						{/if}
 						<button
 							type="button"
 							class="danger"

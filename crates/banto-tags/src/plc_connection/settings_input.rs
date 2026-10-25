@@ -99,17 +99,40 @@ impl PlcConnectionService {
         id: i64,
         input: ConnectionSettingsInput,
     ) -> Result<PlcConnection, BantoError> {
+        let simulation = input.simulation;
+        self.update_settings_optional_simulation_tx(connection, id, input, Some(simulation))
+            .await
+    }
+
+    /// Update while retaining the stored simulation value when it was omitted.
+    /// The choice is applied in the UPDATE statement inside the caller's transaction.
+    pub async fn update_settings_preserving_simulation_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        input: ConnectionSettingsInput,
+    ) -> Result<PlcConnection, BantoError> {
+        self.update_settings_optional_simulation_tx(connection, id, input, None)
+            .await
+    }
+
+    async fn update_settings_optional_simulation_tx(
+        &self,
+        connection: &mut SqliteConnection,
+        id: i64,
+        input: ConnectionSettingsInput,
+        simulation: Option<bool>,
+    ) -> Result<PlcConnection, BantoError> {
         match self.route(input)? {
-            Route::Host(flat) => self.update_tx(connection, id, flat).await,
+            Route::Host(flat) => self.update_in(connection, id, flat, simulation, None).await,
             Route::Driver(flat, typed) => {
-                let simulation = flat.simulation;
-                self.update_in(connection, id, flat, Some(simulation), Some(typed))
+                self.update_in(connection, id, flat, simulation, Some(typed))
                     .await
             }
         }
     }
 
-    /// [`Self::update_settings_tx`] を自前の `BEGIN IMMEDIATE` のトランザクションで。
+    /// `update_settings_tx` in its own immediate transaction.
     pub async fn update_settings(
         &self,
         id: i64,
@@ -121,6 +144,24 @@ impl PlcConnectionService {
             .await
             .map_err(banto_storage::storage_error)?;
         let updated = self.update_settings_tx(&mut tx, id, input).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(updated)
+    }
+
+    /// `update_settings_preserving_simulation_tx` in its own immediate transaction.
+    pub async fn update_settings_preserving_simulation(
+        &self,
+        id: i64,
+        input: ConnectionSettingsInput,
+    ) -> Result<PlcConnection, BantoError> {
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
+            .await
+            .map_err(banto_storage::storage_error)?;
+        let updated = self
+            .update_settings_preserving_simulation_tx(&mut tx, id, input)
+            .await?;
         tx.commit().await.map_err(banto_storage::storage_error)?;
         Ok(updated)
     }

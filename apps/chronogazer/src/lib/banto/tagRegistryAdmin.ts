@@ -32,37 +32,56 @@ export type { ExclusionView };
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
-/**
- * chronogazer は PLC 直結アプリで、`banto_tags::ALLOWED_PROTOCOLS` の
- * `"virtual"`/`"postgres"`（どちらも banto-hub 固有）には対応しない -
- * `chronogazer_core::rest::reject_disallowed_connection_protocol`の doc
- * comment参照。
- */
-export type PlcProtocol = 'modbus-tcp' | 'slmp';
+/** 利用可能な機器プロトコルは `listDrivers()` の応答で決める。 */
+export type PlcProtocol = string;
 
 /**
  * #383 段階3 P2（2026-10-10 オーナー決定 H1）: レジストリには Hub 経由の接続
  * （`protocol: 'hub'`、`banto_tags::HUB_PROTOCOL`）も入りうるので、**読み取った**
- * 接続の型はこちら。作成・更新の入力（{@link PlcConnectionInput}）は
- * {@link PlcProtocol} のまま - Hub 接続は画面の作成フォームでは作らず、P4 の
+ * 接続の型はこちら。Hub 接続は画面の作成フォームでは作らず、P4 の
  * 「Hub から追加」（{@link registerTagsFromHub}）がサーバー側で暗黙に作る
  * （REST・Tauri は P4 から `hub` の作成も受け付ける）。一覧では読み取り専用で出す。
  */
-export type RegistryProtocol = PlcProtocol | 'hub';
+export type RegistryProtocol = PlcProtocol;
 
-/** `""` = 未指定（プロトコルの既定に従う）。 */
-export type WordOrder = '' | 'low_high' | 'high_low';
+export interface DriverSettingField {
+	key: string;
+	label: string;
+	help: string | null;
+	kind: DriverFieldKind;
+	required: boolean;
+	default: string | number | boolean | null;
+	group: 'basic' | 'advanced';
+}
+
+export type DriverFieldKind =
+	| { type: 'text'; max_len: number | null; placeholder: string | null }
+	| { type: 'host' }
+	| { type: 'integer'; min: number | null; max: number | null }
+	| { type: 'choice'; options: { value: string; label: string }[] }
+	| { type: 'bool' }
+	| { type: 'secret' };
+
+export interface DriverInfo {
+	id: string;
+	displayName: string;
+	vendor: string | null;
+	version: string;
+	capabilities: { read: boolean; write: boolean };
+	transports: string[];
+	settingsSchema: { fields: DriverSettingField[] };
+	supportedKinds: string[];
+	addressHelp: string;
+	kind: 'frame' | 'session';
+}
 
 /** Mirrors `chronogazer_core::rest::PlcConnectionResponse`. */
 export interface PlcConnection {
 	id: number;
 	name: string;
 	protocol: RegistryProtocol;
-	host: string;
-	port: number;
-	unitId: number;
 	enabled: boolean;
-	wordOrder: WordOrder;
+	settings: Record<string, unknown>;
 	/**
 	 * #413（2026-09-23 オーナー決定）: 接続単位シミュレーション（**レジストリの
 	 * 値**）。`true` の接続は実機の代わりにプロセス内シミュレータへ接続し、
@@ -78,15 +97,12 @@ export interface PlcConnection {
 export interface PlcConnectionInput {
 	name: string;
 	/**
-	 * 作成フォームが出すのは {@link PlcProtocol} だけ。`'hub'` は Hub 接続の「有効」の
+	 * 作成フォームが出すのは `listDrivers()` にあるプロトコルだけ。`'hub'` は Hub 接続の「有効」の
 	 * 切り替え（#383 段階3 P4）の更新でだけ送る。
 	 */
 	protocol: RegistryProtocol;
-	host: string;
-	port: number;
-	unitId: number;
 	enabled: boolean;
-	wordOrder: WordOrder;
+	settings: Record<string, unknown>;
 	/** #413: サーバー側では省略可（作成なら `false`、更新なら既存の値を保つ - `PlcConnectionPayload::simulation`）。この画面は常に送る。 */
 	simulation: boolean;
 }
@@ -265,6 +281,12 @@ export async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 }
 
 // --- PLC connections --------------------------------------------------------
+
+export async function listDrivers(): Promise<DriverInfo[]> {
+	if (!isTagRegistryAvailable()) throw demoModeError();
+	if (getBantoMode() === 'tauri') return invokeCommand<DriverInfo[]>('drivers_list');
+	return httpRequest<DriverInfo[]>('/api/drivers', { method: 'GET' });
+}
 
 export async function listPlcConnections(): Promise<PlcConnection[]> {
 	if (!isTagRegistryAvailable()) throw demoModeError();

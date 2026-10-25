@@ -115,11 +115,8 @@ test.describe.serial('chronogazer グループ設定画面（#393）', () => {
 		const conn = await postJson(page.request, headers, '/api/plc-connections', {
 			name: CONNECTION_NAME,
 			protocol: 'modbus-tcp',
-			host: '127.0.0.1',
-			port: 502,
-			unitId: 1,
 			enabled: false,
-			wordOrder: ''
+			settings: { host: '127.0.0.1', port: 502, unit_id: 1 }
 		});
 		const group = await postJson(page.request, headers, '/api/collection-groups', {
 			name: COLLECTION_GROUP_NAME,
