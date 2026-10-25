@@ -389,6 +389,48 @@ jobs:
       # 走らない（ci-gate も赤になるので見落としはしない）。
       - name: test (doctest)
         run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
+      # Canonical guest source is a public, separate repository. This test is
+      # ignored in the normal nextest archive because that archive has no guest
+      # artifact; run it explicitly here after building the pinned component.
+      - name: test (WASM FC3 Hub connection)
+        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = 'be5753d003aa49d065405e30753a2a0903d3e24c'
+          $guest = Join-Path $env:RUNNER_TEMP 'banto-driver-wasm'
+          git clone --quiet https://github.com/tyaro/banto-driver-wasm.git $guest
+          if ($LASTEXITCODE -ne 0) { throw 'canonical guest clone failed' }
+          git -C $guest checkout --quiet --detach $sha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $sha) {
+            throw 'canonical guest SHA mismatch'
+          }
+          $canonicalWit = (Get-FileHash (Join-Path $guest 'wit/driver.wit') -Algorithm SHA256).Hash
+          $hostWit = (Get-FileHash 'crates/banto-driver-wasm/wit/driver.wit' -Algorithm SHA256).Hash
+          if ($canonicalWit -ne $hostWit) { throw 'canonical WIT and host WIT differ' }
+          $canonicalManifest = (Get-FileHash (Join-Path $guest 'component/manifest.json') -Algorithm SHA256).Hash
+          $hostManifest = (Get-FileHash 'crates/banto-driver-wasm/tests/manifest.json' -Algorithm SHA256).Hash
+          if ($canonicalManifest -ne $hostManifest) { throw 'canonical manifest and host manifest differ' }
+          rustup target add wasm32-unknown-unknown --toolchain 1.98.1
+          if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
+          cargo +1.98.1 install wasm-tools --version 1.262.0 --locked
+          if ($LASTEXITCODE -ne 0) { throw 'wasm-tools installation failed' }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'canonical guest build failed' }
+          $module = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
+          $env:BANTO_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'banto-modbus-tcp-component.wasm'
+          wasm-tools component new $module -o $env:BANTO_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'component creation failed' }
+          wasm-tools validate $env:BANTO_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'component validation failed' }
+          wasm-tools component targets (Join-Path $guest 'wit/driver.wit') $env:BANTO_COMPONENT_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'component world mismatch' }
+          $testLog = Join-Path $env:RUNNER_TEMP 'wasm-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test wasm_fc3_connection_test_direct_reuse_and_changed_settings --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $testLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM Hub connection test failed' }
+          if (-not (Select-String -Path $testLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM Hub connection test did not run exactly once'
+          }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()

@@ -1003,6 +1003,27 @@ test('実グラフ: crates/ の下の追跡ファイルはすべてどれかの�
 	);
 });
 
+test('WASM crate の変更は Hub host を選び、固定ゲストの ignored 接続試験を明示実行する', () => {
+	const jobs = classify({
+		event: 'pull_request',
+		files: ['crates/banto-driver-wasm/src/lib.rs'],
+		graph: real()
+	}).jobs;
+	assert.equal(jobs.run_rust, true);
+	assert.ok(jobs.rust_args.includes('-p banto-hub-host'));
+	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
+	const start = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
+	const end = workflow.indexOf('      # crate ごとのビルド時間', start);
+	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
+	const step = workflow.slice(start, end);
+	assert.match(step, /be5753d003aa49d065405e30753a2a0903d3e24c/);
+	assert.match(step, /canonical manifest and host manifest differ/);
+	assert.match(step, /cargo \+1\.98\.1 build/);
+	assert.match(step, /wasm-tools --version 1\.262\.0 --locked/);
+	assert.match(step, /-- --ignored --exact/);
+	assert.match(step, /1 passed; 0 failed; 0 ignored/);
+});
+
 // 過去の実例（実グラフで引く）。今までの判定は 3 つとも workspace 全体だった。
 const PR_622 = [
 	'.github/scripts/ci-changes.mjs',
