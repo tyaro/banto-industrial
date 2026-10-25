@@ -483,7 +483,7 @@ jobs:
           }
           # The SLMP guest is reviewed separately. Pin it, and keep this Hub
           # acceptance test on the existing WIT and test-only registry path.
-          $slmpSha = '5e10afa283f24a851451e72f8f55be1e32299d5d'
+          $slmpSha = 'dec290e4b1a0da8ac3affa29d0e93d3fcf32f310'
           git -C $guest checkout --quiet --detach $slmpSha
           if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpSha) {
             throw 'SLMP guest SHA mismatch'
@@ -503,7 +503,7 @@ jobs:
           $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM Hub tests failed' }
-          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 8 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 11 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM Hub tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
