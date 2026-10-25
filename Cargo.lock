@@ -898,6 +898,7 @@ dependencies = [
  "banto-collect",
  "banto-core",
  "banto-driver-api",
+ "banto-driver-engine",
  "banto-driver-wasm",
  "banto-drivers",
  "banto-hub-core",
