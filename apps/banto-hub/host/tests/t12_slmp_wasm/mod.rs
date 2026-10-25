@@ -28,6 +28,7 @@ enum Scenario {
     RZero,
     Multi,
     MultiItemRefusal,
+    BatchRefusal,
 }
 
 #[derive(Clone, Debug)]
@@ -216,11 +217,25 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
         (0x0401, Some(0xa8)) => match scenario {
             Scenario::ReadRefused => (0xc05b, vec![], false),
             Scenario::ReadFraming => (0, 42u16.to_le_bytes().to_vec(), true),
-            Scenario::MultiItemRefusal if request.start == Some(1) => (0xc05b, vec![], false),
-            Scenario::Multi | Scenario::MultiItemRefusal => {
-                let value = u16::try_from(request.connection * 1_000 + version * 100).unwrap()
-                    + u16::try_from(request.start.unwrap()).unwrap();
-                (0, value.to_le_bytes().to_vec(), false)
+            // D100 is outside the confirmed Q range and must stay an individual request.
+            Scenario::MultiItemRefusal if request.start == Some(100) => (0xc05b, vec![], false),
+            Scenario::BatchRefusal if request.start == Some(0) && request.count != Some(1) => {
+                (0xc05b, vec![], false)
+            }
+            Scenario::Multi | Scenario::MultiItemRefusal | Scenario::BatchRefusal => {
+                let start = request.start.unwrap();
+                let count = request.count.unwrap();
+                assert!(
+                    (1..=100).contains(&count),
+                    "unexpected D word count: {request:?}"
+                );
+                let mut body = Vec::with_capacity(usize::from(count) * 2);
+                for address in start..start + u32::from(count) {
+                    let value = u16::try_from(request.connection * 1_000 + version * 100).unwrap()
+                        + u16::try_from(address).unwrap();
+                    body.extend_from_slice(&value.to_le_bytes());
+                }
+                (0, body, false)
             }
             _ => {
                 let value: u16 = match request.start.unwrap() {
@@ -595,23 +610,22 @@ async fn multiple_tags_collect_and_read_now_returns_a_fresh_value() {
     .await;
     assert_eq!(fixture.connection_count(), 1);
     let events = fixture.requests();
-    assert!(events.len() >= 5, "{events:?}");
+    assert!(events.len() >= 4, "{events:?}");
     assert_eq!(
-        commands(&events, 1)[..5],
+        commands(&events, 1)[..4],
         [
             (0x0101, None, None, None),
             (0x0401, Some(0xa9), Some(302), Some(1)),
-            (0x0401, Some(0xa8), Some(0), Some(1)),
-            (0x0401, Some(0xa8), Some(1), Some(1)),
+            (0x0401, Some(0xa8), Some(0), Some(2)),
             (0x0401, Some(0xa8), Some(100), Some(1)),
         ]
     );
-    for address in [0, 1, 100] {
+    for (address, count) in [(0, 2), (100, 1)] {
         assert!(events[2..].iter().any(|request| {
             request.connection == 1
                 && request.device == Some(0xa8)
                 && request.start == Some(address)
-                && request.count == Some(1)
+                && request.count == Some(count)
                 && request.subcommand == 0
         }));
     }
@@ -662,17 +676,55 @@ async fn one_device_refusal_marks_only_its_tag_bad() {
         ids,
         [
             (Some(1_000.0), Quality::Good),
+            (Some(1_001.0), Quality::Good),
             (None, Quality::Bad),
-            (Some(1_100.0), Quality::Good),
         ],
     )
     .await;
     assert_eq!(fixture.connection_count(), 1, "item refusal is not fatal");
     let events = fixture.requests();
-    assert!(events.iter().any(|event| event.start == Some(1)));
+    assert!(events.iter().any(|event| {
+        event.device == Some(0xa8) && event.start == Some(0) && event.count == Some(2)
+    }));
     assert!(events.iter().any(|event| event.start == Some(100)));
     for (name, expected) in [
         ("first", Some(1_000.0)),
+        ("second", Some(1_001.0)),
+        ("unknown", None),
+    ] {
+        let (status, body) = admin_get(&app.router, &multi_path(name), &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["v"].as_f64(), expected, "{name}: {body:?}");
+        assert_eq!(body["q"], if expected.is_some() { "good" } else { "bad" });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned batch-capable SLMP component"]
+async fn batch_device_refusal_marks_its_covers_bad_but_not_unknown_individual() {
+    let fixture = SlmpFixture::start(Scenario::BatchRefusal).await;
+    let app = app("t12-slmp-wasm-batch-refusal").await;
+    let ids = multi_collection(&app, &fixture, 1_000).await;
+    wait_multi_values(
+        &app,
+        ids,
+        [
+            (None, Quality::Bad),
+            (None, Quality::Bad),
+            (Some(1_100.0), Quality::Good),
+        ],
+    )
+    .await;
+    assert_eq!(fixture.connection_count(), 1, "device refusal is not fatal");
+    let events = fixture.requests();
+    assert!(events.iter().any(|event| {
+        event.device == Some(0xa8) && event.start == Some(0) && event.count == Some(2)
+    }));
+    assert!(events.iter().any(|event| {
+        event.device == Some(0xa8) && event.start == Some(100) && event.count == Some(1)
+    }));
+    for (name, expected) in [
+        ("first", None),
         ("second", None),
         ("unknown", Some(1_100.0)),
     ] {
@@ -725,23 +777,22 @@ async fn reconnect_rediscovers_and_refreshes_all_tags_on_one_new_connection() {
         .into_iter()
         .filter(|request| request.connection == 2)
         .collect();
-    assert!(events.len() >= 5, "{events:?}");
+    assert!(events.len() >= 4, "{events:?}");
     assert_eq!(
-        commands(&events, 2)[..5],
+        commands(&events, 2)[..4],
         [
             (0x0101, None, None, None),
             (0x0401, Some(0xa9), Some(302), Some(1)),
-            (0x0401, Some(0xa8), Some(0), Some(1)),
-            (0x0401, Some(0xa8), Some(1), Some(1)),
+            (0x0401, Some(0xa8), Some(0), Some(2)),
             (0x0401, Some(0xa8), Some(100), Some(1)),
         ],
         "new physical connection must discover before reading tags"
     );
-    for address in [0, 1, 100] {
+    for (address, count) in [(0, 2), (100, 1)] {
         assert!(events[2..].iter().any(|request| {
             request.device == Some(0xa8)
                 && request.start == Some(address)
-                && request.count == Some(1)
+                && request.count == Some(count)
                 && request.subcommand == 0
         }));
     }
@@ -749,7 +800,7 @@ async fn reconnect_rediscovers_and_refreshes_all_tags_on_one_new_connection() {
 
 #[test]
 #[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned SLMP component"]
-fn multiple_tags_plan_separate_requests_and_keep_result_indices() {
+fn noncontiguous_tags_plan_separate_requests_and_keep_result_indices() {
     let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
     let driver = WasmDriver::load(MANIFEST, &component).unwrap();
     let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "5000")]).unwrap();
@@ -760,8 +811,8 @@ fn multiple_tags_plan_separate_requests_and_keep_result_indices() {
     let count = wire_response(&sd_step.send, 0, &100u16.to_le_bytes(), false);
     assert!(connection.handshake_next(Some(&count)).unwrap().is_none());
     let kind = TagKind::numeric(DataType::U16);
-    // Deliberately different from address order: covers must refer to input indices.
-    let specs = ["D1", "D0", "D100"]
+    // The gaps and Unknown boundary require one request per input index.
+    let specs = ["D1", "D3", "D100"]
         .map(|text| TagSpec::new(driver.parse_address(text, &kind).unwrap(), kind.clone()));
     let planned = connection.plan_read(&specs).unwrap();
     assert_eq!(planned.len(), 3, "one D/u16 request per tag");
@@ -778,7 +829,7 @@ fn multiple_tags_plan_separate_requests_and_keep_result_indices() {
         seen[index] = true;
         let request = Request::from_bytes(1, &item.step.send);
         assert_eq!(request.device, Some(0xa8));
-        assert_eq!(request.start, Some([1, 0, 100][index]));
+        assert_eq!(request.start, Some([1, 3, 100][index]));
         assert_eq!(request.count, Some(1));
         let response = if index == 0 {
             wire_response(&item.step.send, 0xc05b, &[], false)
@@ -794,4 +845,114 @@ fn multiple_tags_plan_separate_requests_and_keep_result_indices() {
         }
     }
     assert_eq!(seen, [true; 3]);
+}
+
+#[test]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned batch-capable SLMP component"]
+fn confirmed_contiguous_words_batch_without_filling_gaps_or_mixing_unknown() {
+    let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
+    let driver = WasmDriver::load(MANIFEST, &component).unwrap();
+    let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "5000")]).unwrap();
+    let mut connection = driver.create_connection(&settings).unwrap();
+    let type_step = connection.handshake_next(None).unwrap().unwrap();
+    let model = wire_response(&type_step.send, 0, &model("Q02UCPU", 0x0263), false);
+    let sd_step = connection.handshake_next(Some(&model)).unwrap().unwrap();
+    let count = wire_response(&sd_step.send, 0, &100u16.to_le_bytes(), false);
+    assert!(connection.handshake_next(Some(&count)).unwrap().is_none());
+
+    let kind = TagKind::numeric(DataType::U16);
+    // D2 is deliberately absent; D100 is outside the confirmed 0..100 range.
+    // The batch is not at index zero, so covers must map back to input tags.
+    let addresses: [u32; 5] = [3, 0, 1, 99, 100];
+    let specs = addresses.map(|address| {
+        TagSpec::new(
+            driver.parse_address(&format!("D{address}"), &kind).unwrap(),
+            kind.clone(),
+        )
+    });
+    let planned = connection.plan_read(&specs).unwrap();
+    assert_eq!(planned.len(), 4, "only D0-D1 may share one request");
+    let mut seen = [false; 5];
+    for item in planned {
+        let request = Request::from_bytes(1, &item.step.send);
+        assert_eq!(request.device, Some(0xa8));
+        let (start, count, covers): (u32, u16, &[u32]) = match (request.start, request.count) {
+            (Some(0), Some(2)) => (0, 2, &[1, 2]),
+            (Some(3), Some(1)) => (3, 1, &[0]),
+            (Some(99), Some(1)) => (99, 1, &[3]),
+            (Some(100), Some(1)) => (100, 1, &[4]),
+            other => panic!("gap, boundary or Unknown was batched: {other:?}"),
+        };
+        assert_eq!(item.covers.as_slice(), covers);
+        let mut body = Vec::new();
+        for address in start..start + u32::from(count) {
+            body.extend_from_slice(&u16::try_from(200 + address).unwrap().to_le_bytes());
+        }
+        let response = wire_response(&item.step.send, 0, &body, false);
+        let decoded = connection.decode_read(&item, &specs, &response).unwrap();
+        assert_eq!(decoded.len(), covers.len());
+        for (&index, value) in item.covers.iter().zip(decoded) {
+            let index = index as usize;
+            assert!(!seen[index], "duplicate result index {index}");
+            seen[index] = true;
+            assert_eq!(value, Ok(RawValue::Uint(u64::from(200 + addresses[index]))));
+        }
+    }
+    assert_eq!(seen, [true; 5]);
+}
+
+#[test]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned batch-capable SLMP component"]
+fn confirmed_run_splits_at_the_960_word_request_limit() {
+    let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
+    let driver = WasmDriver::load(MANIFEST, &component).unwrap();
+    let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "5000")]).unwrap();
+    let mut connection = driver.create_connection(&settings).unwrap();
+    let type_step = connection.handshake_next(None).unwrap().unwrap();
+    let model = wire_response(&type_step.send, 0, &model("Q02UCPU", 0x0263), false);
+    let sd_step = connection.handshake_next(Some(&model)).unwrap().unwrap();
+    let count = wire_response(&sd_step.send, 0, &1000u16.to_le_bytes(), false);
+    assert!(connection.handshake_next(Some(&count)).unwrap().is_none());
+
+    let kind = TagKind::numeric(DataType::U16);
+    let specs = (0..=960)
+        .map(|address| {
+            TagSpec::new(
+                driver.parse_address(&format!("D{address}"), &kind).unwrap(),
+                kind.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let planned = connection.plan_read(&specs).unwrap();
+    assert_eq!(planned.len(), 2);
+    assert_eq!(planned[0].covers.len(), 960);
+    assert_eq!(planned[0].covers[0], 0);
+    assert_eq!(planned[0].covers[959], 959);
+    assert_eq!(planned[1].covers.as_slice(), &[960]);
+    let first_request = Request::from_bytes(1, &planned[0].step.send);
+    assert_eq!(
+        (first_request.start, first_request.count),
+        (Some(0), Some(960))
+    );
+    let second_request = Request::from_bytes(1, &planned[1].step.send);
+    assert_eq!(
+        (second_request.start, second_request.count),
+        (Some(960), Some(1))
+    );
+
+    let mut words = vec![0; 960 * 2];
+    words[..2].copy_from_slice(&0x1234u16.to_le_bytes());
+    words[1918..].copy_from_slice(&0x5678u16.to_le_bytes());
+    let response = wire_response(&planned[0].step.send, 0, &words, false);
+    let decoded = connection
+        .decode_read(&planned[0], &specs, &response)
+        .unwrap();
+    assert_eq!(decoded.len(), 960);
+    assert_eq!(decoded[0], Ok(RawValue::Uint(0x1234)));
+    assert_eq!(decoded[959], Ok(RawValue::Uint(0x5678)));
+    let response = wire_response(&planned[1].step.send, 0, &42u16.to_le_bytes(), false);
+    let decoded = connection
+        .decode_read(&planned[1], &specs, &response)
+        .unwrap();
+    assert_eq!(decoded, vec![Ok(RawValue::Uint(42))]);
 }
