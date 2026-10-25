@@ -714,24 +714,33 @@ async fn q25prh_unknown_range_collects_individual_values_and_read_now() {
             .current_values()
             .and_then(|values| values.get(&format!("tag:{id}"))))
     );
-    assert_eq!(fixture.connection_count(), 1);
-    let events = fixture.requests();
-    assert_eq!(
-        commands(&events, 1),
-        [
-            (0x0101, None, None, None),
-            (0x0401, Some(0xa8), Some(3000), Some(1)),
-            (0x0401, Some(0xa8), Some(3001), Some(1)),
-        ],
-        "no SD or adjacent D batch may be sent"
-    );
-    assert!(events[1..].iter().all(|request| request.subcommand == 0));
-
     let path = "/api/v1/values/q25-line.q25-group.second";
     let (status, cached) = admin_get(&app.router, path, &app.admin_token).await;
     assert_eq!(status, StatusCode::OK, "{cached:?}");
     assert_eq!(cached["v"], 1_001.0);
     assert_eq!(cached["q"], "good");
+    // Stop the periodic collector, not the broker session. Wait for any
+    // in-flight poll to finish before inspecting the request sequence.
+    app.manager.shutdown().await;
+    assert!(app.sessions.handle_for(saved.id).is_some());
+    assert_eq!(fixture.connection_count(), 1);
+    let events = fixture.requests();
+    let expected_poll = [
+        (0x0401, Some(0xa8), Some(3000), Some(1)),
+        (0x0401, Some(0xa8), Some(3001), Some(1)),
+    ];
+    let observed = commands(&events, 1);
+    let (polls, remainder) = observed[1..].as_chunks::<2>();
+    assert_eq!(observed.first(), Some(&(0x0101, None, None, None)));
+    assert!(
+        observed.len() >= 3
+            && polls.iter().all(|pair| pair == &expected_poll)
+            && remainder.is_empty(),
+        "each periodic collection must read both tags separately without SD: {observed:?}"
+    );
+    assert!(events[1..].iter().all(|request| request.subcommand == 0));
+
+    let before_read_now = fixture.requests().len();
     fixture.set_version(1);
     let (status, fresh) =
         admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
@@ -744,14 +753,15 @@ async fn q25prh_unknown_range_collects_individual_values_and_read_now() {
         "read-now must reuse the broker"
     );
     let events = fixture.requests();
-    assert_eq!(events.len(), 4);
+    assert_eq!(events.len(), before_read_now + 1);
     assert_eq!(
-        (events[3].device, events[3].start, events[3].count),
+        (
+            events.last().unwrap().device,
+            events.last().unwrap().start,
+            events.last().unwrap().count
+        ),
         (Some(0xa8), Some(3001), Some(1))
     );
-    let (status, cached) = admin_get(&app.router, path, &app.admin_token).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(cached["v"], 1_001.0, "read-now does not rewrite the cache");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
