@@ -345,4 +345,290 @@ mod tests {
         let err = decode_register_bit(&regs, 0, 0).unwrap_err();
         assert!(matches!(err, PlcError::Protocol(_)));
     }
+
+    // Literal normalized words are deliberately independent of the production
+    // combine/decomposition code. TagValue still projects every integer to f64.
+    fn projected(regs: &[u16], data_type: DataType, order: WordOrder) -> f64 {
+        match decode_register_value(regs, 0, data_type, order).unwrap() {
+            TagValue::F64(value) => value,
+            TagValue::Bit(_) => panic!("numeric decoding returned a bit"),
+        }
+    }
+
+    #[test]
+    fn golden_integer_16_and_32_boundaries() {
+        for (data_type, word, expected) in [
+            (DataType::I16, 0x8000, -32_768.0),
+            (DataType::I16, 0x7fff, 32_767.0),
+            (DataType::U16, 0x0000, 0.0),
+            (DataType::U16, 0xffff, 65_535.0),
+        ] {
+            for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+                assert_eq!(projected(&[word], data_type, order), expected);
+            }
+        }
+
+        // (high-word-first, low-word-first, exact integer bits, current f64).
+        for (data_type, high_low, low_high, bits, expected) in [
+            (
+                DataType::I32,
+                [0x8000, 0x0000],
+                [0x0000, 0x8000],
+                0x8000_0000,
+                -2_147_483_648.0,
+            ),
+            (
+                DataType::I32,
+                [0x7fff, 0xffff],
+                [0xffff, 0x7fff],
+                0x7fff_ffff,
+                2_147_483_647.0,
+            ),
+            (
+                DataType::U32,
+                [0x0000, 0x0000],
+                [0x0000, 0x0000],
+                0x0000_0000,
+                0.0,
+            ),
+            (
+                DataType::U32,
+                [0xffff, 0xffff],
+                [0xffff, 0xffff],
+                0xffff_ffff,
+                4_294_967_295.0,
+            ),
+            (
+                DataType::U32,
+                [0x1234, 0xabcd],
+                [0xabcd, 0x1234],
+                0x1234_abcd,
+                305_441_741.0,
+            ),
+        ] {
+            assert_eq!(combine_u32(high_low, WordOrder::HighLow), bits);
+            assert_eq!(combine_u32(low_high, WordOrder::LowHigh), bits);
+            assert_eq!(
+                projected(&high_low, data_type, WordOrder::HighLow),
+                expected
+            );
+            assert_eq!(
+                projected(&low_high, data_type, WordOrder::LowHigh),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn golden_integer_64_bits_and_existing_f64_projection() {
+        // The exact bits and the projected f64 are separate assertions: these
+        // tests characterize the rounding rather than promise exact 64-bit IO.
+        for (data_type, high_low, low_high, bits, projected_f64) in [
+            (
+                DataType::I64,
+                [0x7fff, 0xffff, 0xffff, 0xffff],
+                [0xffff, 0xffff, 0xffff, 0x7fff],
+                0x7fff_ffff_ffff_ffff,
+                9_223_372_036_854_775_808.0,
+            ),
+            (
+                DataType::I64,
+                [0x8000, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x8000],
+                0x8000_0000_0000_0000,
+                -9_223_372_036_854_775_808.0,
+            ),
+            (
+                DataType::I64,
+                [0x0020, 0x0000, 0x0000, 0x0001],
+                [0x0001, 0x0000, 0x0000, 0x0020],
+                0x0020_0000_0000_0001,
+                9_007_199_254_740_992.0,
+            ),
+            (
+                DataType::I64,
+                [0xffdf, 0xffff, 0xffff, 0xffff],
+                [0xffff, 0xffff, 0xffff, 0xffdf],
+                0xffdf_ffff_ffff_ffff,
+                -9_007_199_254_740_992.0,
+            ),
+            (
+                DataType::U64,
+                [0x0000, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x0000],
+                0x0000_0000_0000_0000,
+                0.0,
+            ),
+            (
+                DataType::U64,
+                [0xffff, 0xffff, 0xffff, 0xffff],
+                [0xffff, 0xffff, 0xffff, 0xffff],
+                0xffff_ffff_ffff_ffff,
+                18_446_744_073_709_551_616.0,
+            ),
+            (
+                DataType::U64,
+                [0x001f, 0xffff, 0xffff, 0xffff],
+                [0xffff, 0xffff, 0xffff, 0x001f],
+                0x001f_ffff_ffff_ffff,
+                9_007_199_254_740_991.0,
+            ),
+            (
+                DataType::U64,
+                [0x0020, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x0020],
+                0x0020_0000_0000_0000,
+                9_007_199_254_740_992.0,
+            ),
+            (
+                DataType::U64,
+                [0x0020, 0x0000, 0x0000, 0x0001],
+                [0x0001, 0x0000, 0x0000, 0x0020],
+                0x0020_0000_0000_0001,
+                9_007_199_254_740_992.0,
+            ),
+        ] {
+            assert_eq!(combine_u64(high_low, WordOrder::HighLow), bits);
+            // LowHigh reverses all four words, not the two 32-bit pairs.
+            assert_eq!(combine_u64(low_high, WordOrder::LowHigh), bits);
+            assert_eq!(
+                projected(&high_low, data_type, WordOrder::HighLow),
+                projected_f64
+            );
+            assert_eq!(
+                projected(&low_high, data_type, WordOrder::LowHigh),
+                projected_f64
+            );
+        }
+    }
+
+    #[test]
+    fn golden_f32_bits_after_projection_to_f64() {
+        // Wire bytes have already been normalized to u16 words at this layer.
+        for (high_low, low_high, expected_f64_bits) in [
+            ([0x3fc0, 0x0000], [0x0000, 0x3fc0], 0x3ff8_0000_0000_0000), // 1.5
+            ([0x0000, 0x0000], [0x0000, 0x0000], 0x0000_0000_0000_0000), // +0
+            ([0x8000, 0x0000], [0x0000, 0x8000], 0x8000_0000_0000_0000), // -0
+            ([0x7f80, 0x0000], [0x0000, 0x7f80], 0x7ff0_0000_0000_0000), // +inf
+            ([0xff80, 0x0000], [0x0000, 0xff80], 0xfff0_0000_0000_0000), // -inf
+        ] {
+            for (words, order) in [
+                (high_low, WordOrder::HighLow),
+                (low_high, WordOrder::LowHigh),
+            ] {
+                assert_eq!(
+                    projected(&words, DataType::F32, order).to_bits(),
+                    expected_f64_bits
+                );
+            }
+        }
+        // f32 NaN payload bits need not survive widening to f64.
+        assert!(projected(&[0x7fc1, 0x0001], DataType::F32, WordOrder::HighLow).is_nan());
+        assert!(projected(&[0x0001, 0x7fc1], DataType::F32, WordOrder::LowHigh).is_nan());
+    }
+
+    #[test]
+    fn golden_f64_bits_and_nonfinite_classification() {
+        for (high_low, low_high, expected_bits) in [
+            (
+                [0x3ff8, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x3ff8],
+                0x3ff8_0000_0000_0000, // 1.5
+            ),
+            (
+                [0x0000, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x0000],
+                0x0000_0000_0000_0000, // +0
+            ),
+            (
+                [0x8000, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x8000],
+                0x8000_0000_0000_0000, // -0
+            ),
+            (
+                [0x7ff0, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0x7ff0],
+                0x7ff0_0000_0000_0000, // +inf
+            ),
+            (
+                [0xfff0, 0x0000, 0x0000, 0x0000],
+                [0x0000, 0x0000, 0x0000, 0xfff0],
+                0xfff0_0000_0000_0000, // -inf
+            ),
+        ] {
+            for (words, order) in [
+                (high_low, WordOrder::HighLow),
+                (low_high, WordOrder::LowHigh),
+            ] {
+                assert_eq!(
+                    projected(&words, DataType::F64, order).to_bits(),
+                    expected_bits
+                );
+            }
+        }
+        assert!(projected(
+            &[0x7ff8, 0x0000, 0x0000, 0x0001],
+            DataType::F64,
+            WordOrder::HighLow,
+        )
+        .is_nan());
+        assert!(projected(
+            &[0x0001, 0x0000, 0x0000, 0x7ff8],
+            DataType::F64,
+            WordOrder::LowHigh,
+        )
+        .is_nan());
+    }
+
+    #[test]
+    fn numeric_short_windows_and_nonoverflowing_offsets_return_protocol_errors() {
+        for data_type in [
+            DataType::I16,
+            DataType::U16,
+            DataType::I32,
+            DataType::U32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F32,
+            DataType::F64,
+        ] {
+            let span = usize::from(data_type.register_span());
+            for order in [WordOrder::HighLow, WordOrder::LowHigh] {
+                for len in [0, span - 1] {
+                    let short = vec![0u16; len];
+                    assert!(matches!(
+                        decode_register_value(&short, 0, data_type, order),
+                        Err(PlcError::Protocol(_))
+                    ));
+                }
+                assert!(matches!(
+                    decode_register_value(&[0x1234], 1, data_type, order),
+                    Err(PlcError::Protocol(_))
+                ));
+            }
+        }
+        assert_eq!(
+            decode_register_value(
+                &[0xdead, 0x1234, 0xabcd],
+                1,
+                DataType::U32,
+                WordOrder::HighLow
+            )
+            .unwrap(),
+            TagValue::F64(305_441_741.0),
+        );
+        assert!(matches!(
+            decode_register_value(
+                &[0u16; 4],
+                usize::MAX - 4,
+                DataType::U64,
+                WordOrder::HighLow
+            ),
+            Err(PlcError::Protocol(_))
+        ));
+        assert!(matches!(
+            decode_register_bit(&[0], usize::MAX, 0),
+            Err(PlcError::Protocol(_))
+        ));
+    }
 }

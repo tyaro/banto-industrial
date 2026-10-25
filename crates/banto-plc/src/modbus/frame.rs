@@ -382,6 +382,20 @@ mod tests {
     }
 
     #[test]
+    fn literal_big_endian_register_bytes_normalize_to_words() {
+        // Wire byte order is per register. WordOrder is applied later by the
+        // value decoder, not by this PDU parser.
+        let pdu = [FC_READ_HOLDING_REGISTERS, 4, 0x12, 0x34, 0xab, 0xcd];
+        match parse_response_pdu(&pdu, FC_READ_HOLDING_REGISTERS, 2).unwrap() {
+            ParsedResponse::Registers(words) => assert_eq!(words, [0x1234, 0xabcd]),
+            other => panic!(
+                "expected Registers, got a different variant: {}",
+                matches_variant_name(&other)
+            ),
+        }
+    }
+
+    #[test]
     fn encode_then_parse_bits_round_trips_with_partial_final_byte() {
         // 10 bits -> 2 bytes, second byte only half used - proves the
         // trailing-padding bits are dropped rather than leaking as data.
