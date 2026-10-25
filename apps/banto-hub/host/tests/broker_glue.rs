@@ -91,7 +91,7 @@ async fn cpu_only_change_replaces_the_slmp_broker_session() {
     );
     let (_, changed) = registry.resolve(&modbus, &drivers).await;
     assert!(changed);
-    modbus.cpu_type = "Q".to_string();
+    modbus.settings.insert("cpu_type".into(), "Q".into());
     let (_, changed) = registry.resolve(&modbus, &drivers).await;
     assert!(!changed, "Modbus は CPU 列では再接続しない");
 

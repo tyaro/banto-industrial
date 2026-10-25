@@ -273,9 +273,8 @@ fn builtin_key_kinds(protocol: &str) -> &'static [(&'static str, JsonKind)] {
 /// 2. **組み込みのプロトコルのキーの型**（§3.2）: `modbus-tcp`・`slmp`・`postgres` の
 ///    `host`・`word_order`・`cpu_type`・`database`・`username` は文字列、`port`・`unit_id` は
 ///    整数。`virtual`・`hub` は `{}` だけ。これで「検証に通った JSON は
-///    `legacy::flat_view` で同じ値に戻る」ことを保つ（`flat_view` は文字列は文字列として、
-///    整数は JSON の整数として読む。例えば `"database": 123` は `settings_to_api` を経た
-///    ドライバの検証は通るが、`flat_view` は `None` にしてしまう）。`push` の中身は
+///    the JSON keys have the types that production readers expect. `push` uses
+///    `validate_push_settings`; plugin protocols use their driver validation.
 ///    `validate_push_settings` が、プラグインのプロトコルはドライバが見る。
 pub fn check_settings_shape(
     protocol: &str,

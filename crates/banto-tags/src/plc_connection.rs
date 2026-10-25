@@ -17,10 +17,10 @@
 //! do not overlap, so a mismatch surfaces as a per-tag error rather than a
 //! misdirected read.
 //!
-//! [`PlcConnection::unit_id`] is Modbus-specific (a slave id inherited from
+//! `settings.unit_id` is Modbus-specific (a slave id inherited from
 //! RTU gateways). SLMP has no equivalent single byte - its station addressing
 //! is the network/PC/IO/area access route in `banto_plc::slmp::SlmpConfig` - so
-//! `"slmp"` rows simply carry the column's default.
+//! `"slmp"` rows have no `unit_id` setting.
 //!
 //! ## `"virtual"` (T6-2, docs/tag-server-design.md §4.2/§4.3(a))
 //!
@@ -96,8 +96,8 @@
 //! doc comment), and the registry holds it as a host-provided protocol (not a
 //! session-type driver), so `banto_broker` never opens a session against it.
 //!
-//! Three settings exist only for this protocol: [`PlcConnection::database`]/
-//! [`PlcConnection::username`] and the password. [`validate_plc_connection_input`]
+//! Three settings exist only for this protocol: `settings.database`,
+//! `settings.username` and the password. [`validate_plc_connection_input`]
 //! enforces the two directions of one rule: `database`/`username` are required
 //! (non-empty, trimmed, capped) when `protocol == `[`POSTGRES_PROTOCOL`], and they
 //! and a password must be empty/absent for every other protocol - a
@@ -112,14 +112,12 @@
 //!
 //! ## R2b-1d: `settings` for every protocol (migration `0025`)
 //!
-//! The table now has only `id`・`name`・`protocol`・`enabled`・`simulation`・`settings`・
-//! `settings_version`; every per-protocol value lives in the JSON `settings`
-//! (design §3.2's table) and the flat fields of [`PlcConnection`] are a read-only
-//! projection of it (`settings_json::legacy::flat_view`). The SQL `CHECK` on
+//! The table now has only `id`, `name`, `protocol`, `enabled`, `simulation`,
+//! `settings`, and `settings_version`. Per-protocol values live in the JSON settings.
 //! `protocol` is only the `DriverId` grammar now - [`ALLOWED_PROTOCOLS`] (and the
 //! hand-written validation) is the old rule set a service without a registry
-//! ([`PlcConnectionService::new`], ChronoGazer, R2b-7) still enforces; a service
-//! with one ([`PlcConnectionService::with_registry`], banto-hub) adds the driver's
+//! ([`PlcConnectionService::new`], host compatibility and tests) still enforces; a service
+//! with one ([`PlcConnectionService::with_registry`], Hub and ChronoGazer) adds the driver's
 //! validation after it. Each write runs in one transaction that also writes/deletes
 //! the connection's sealed secret rows (design §5.3).
 //!
@@ -836,61 +834,20 @@ where
 /// future settings grid (docs/recorder-requirements.md §6 "タグ設定"
 /// screen: "PLC 接続設定含む").
 ///
-/// ## R2b-1d: `settings` is the truth, the flat fields are a read-only projection
+/// ## R2b-7c: `settings` is the only protocol settings source
 ///
-/// Since migration `0025` (docs/banto-hub-connection-settings-design.md §3.1・§3.2) the
-/// table has only `id`・`name`・`protocol`・`enabled`・`simulation`・`settings`・
-/// `settings_version`. The per-protocol endpoint/PLC settings live in [`Self::settings`]
-/// (a JSON object, every protocol); [`Self::host`]・[`Self::port`]・[`Self::unit_id`]・
-/// [`Self::word_order`]・[`Self::cpu_type`]・[`Self::database`]・[`Self::username`] are
-/// **built from it** by `settings_json::legacy::flat_view` (in [`Self::from_settings`],
-/// which `FromRow` calls) so the collection, the broker and ChronoGazer keep reading the
-/// flat fields until R2b-7 (design §4.3・§7). Writing to them changes nothing in the
-/// database. A key a protocol does not read, or that is absent, reads as today's default.
-///
-/// The postgres password is **not** a field any more: `settings.password` holds only a
-/// reference `{"$secret": "<ref>"}` to a sealed row of `plc_connection_secrets`
-/// (design §3.3, [`crate::connection_secret`]). [`Self::secret_ref`] reads the reference;
-/// opening the sealed value is banto-hub's `secrets` module's job.
+/// A stored connection. Protocol settings live solely in `settings`.
+/// Passwords are secret references resolved by the host.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlcConnection {
     pub id: i64,
     pub name: String,
     pub protocol: String,
-    /// Read-only projection of `settings.host` (`""` when absent or not read by the protocol).
-    pub host: String,
-    /// Read-only projection of `settings.port` (`0` when absent or not read by the protocol).
-    pub port: i64,
-    /// Read-only projection of `settings.unit_id` (`modbus-tcp` only; `1` otherwise).
-    pub unit_id: i64,
     pub enabled: bool,
-    /// T9-1 (this module's doc comment, "simulation" section). Still a column (a host
-    /// concept, design §3.1).
     pub simulation: bool,
-    /// P3-b (this module's doc comment, [`ALLOWED_WORD_ORDERS`]). Read-only projection
-    /// of `settings.word_order` - meaningful for `"slmp"` **and `"modbus-tcp"`** (#325,
-    /// 2026-09-08 - this module's doc comment, "`word_order` is a Modbus setting too");
-    /// every other protocol reads as its default ([`default_word_order_for`]).
-    pub word_order: String,
-    /// #605: SLMP の CPU 種別（[`CPU_TYPE_Q`] / [`CPU_TYPE_R`]）。`settings.cpu_type` の
-    /// 読み取りの写し（`slmp` だけ。ほかのプロトコルと無いときは [`CPU_TYPE_R`]）。
-    pub cpu_type: String,
-    /// S1: read-only projection of `settings.database` (`"postgres"` only, `None`
-    /// otherwise).
-    pub database: Option<String>,
-    /// S1: read-only projection of `settings.username` (`"postgres"` only, `None`
-    /// otherwise).
-    pub username: Option<String>,
-    /// R2b-1d: the connection's JSON settings (migration `0025`'s `settings` column,
-    /// `NOT NULL`, always an object). Per-protocol keys are design §3.2's table; a
-    /// `"push"` row's object is what [`crate::push::validate_push_settings`] accepted
-    /// (R2a). Secret keys hold only references (`{"$secret": "<ref>"}`), never a value,
-    /// so this may be serialized as is.
     #[serde(default)]
     pub settings: Map<String, Value>,
-    /// R2b-1d (design §3.4): the driver's settings-shape version the row was written
-    /// with. Always `1` in R2b-1.
     #[serde(default = "default_settings_version")]
     pub settings_version: i64,
 }
@@ -899,13 +856,7 @@ fn default_settings_version() -> i64 {
     1
 }
 
-/// Hand-written instead of `#[derive(sqlx::FromRow)]` because of
-/// [`PlcConnection::settings`]: the column is JSON text (the derive's `#[sqlx(json)]`
-/// needs sqlx's `json` feature, which this workspace does not enable) and the flat
-/// fields are projected from it ([`PlcConnection::from_settings`]). `COLUMNS` and
-/// `banto_collect`'s `load_connection` SELECT must still name every column
-/// (implementation-checklist §5, #605). A `settings` that is not a JSON object fails the
-/// row (the column's `CHECK` makes that impossible for a row SQLite accepted, design §4.4).
+/// Decode the JSON settings column without sqlx's optional JSON feature.
 impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for PlcConnection {
     fn from_row(row: &'r sqlx::sqlite::SqliteRow) -> Result<Self, sqlx::Error> {
         use sqlx::Row;
@@ -928,9 +879,7 @@ impl<'r> sqlx::FromRow<'r, sqlx::sqlite::SqliteRow> for PlcConnection {
 }
 
 impl PlcConnection {
-    /// Build a connection from its stored columns, projecting the flat fields from
-    /// `settings` (`settings_json::legacy::flat_view`, design §4.3). `FromRow` uses this;
-    /// so can a test or a caller that holds a `settings` object.
+    /// Build a connection from its stored columns.
     pub fn from_settings(
         id: i64,
         name: String,
@@ -940,22 +889,28 @@ impl PlcConnection {
         settings: Map<String, Value>,
         settings_version: i64,
     ) -> Self {
-        let flat = crate::settings_json::legacy::flat_view(&protocol, &settings);
-        PlcConnection {
+        Self {
             id,
             name,
             protocol,
-            host: flat.host,
-            port: flat.port,
-            unit_id: flat.unit_id,
             enabled,
             simulation,
-            word_order: flat.word_order,
-            cpu_type: flat.cpu_type,
-            database: flat.database,
-            username: flat.username,
             settings,
             settings_version,
+        }
+    }
+
+    /// Read a string setting without a protocol-specific projection or default.
+    pub fn setting_str(&self, key: &str) -> Option<&str> {
+        self.settings.get(key).and_then(Value::as_str)
+    }
+
+    /// Read an integer setting. Decimal strings remain readable for legacy rows.
+    pub fn setting_i64(&self, key: &str) -> Option<i64> {
+        match self.settings.get(key) {
+            Some(Value::Number(number)) => number.as_i64(),
+            Some(Value::String(text)) => text.trim().parse().ok(),
+            _ => None,
         }
     }
 
@@ -1013,8 +968,7 @@ pub struct PlcConnectionInput {
     /// T9-1 (this module's doc comment, "simulation" section).
     #[serde(default = "default_simulation")]
     pub simulation: bool,
-    /// P3-b. See [`PlcConnection::word_order`]'s doc comment for what the
-    /// value means.
+    /// P3-b. The legacy host input's word order is stored in `settings.word_order`.
     ///
     /// **The empty string means "unspecified"** (#325, 2026-09-08 - this
     /// module's doc comment, "`word_order` is a Modbus setting too"). Since
@@ -1071,12 +1025,12 @@ pub struct PlcConnectionInput {
     ///   しない。
     #[serde(default)]
     pub cpu_type: Option<String>,
-    /// S1. See [`PlcConnection::database`]'s doc comment. Required
+    /// S1. The legacy host input maps this to `settings.database`. It is required
     /// (non-empty after trim) when `protocol == `[`POSTGRES_PROTOCOL`],
     /// forbidden (must be `None`/empty) otherwise.
     #[serde(default)]
     pub database: Option<String>,
-    /// S1. See [`PlcConnection::username`]'s doc comment. Same
+    /// S1. This maps to `settings.username` and has the same
     /// required-for-postgres/forbidden-otherwise rule as [`Self::database`].
     #[serde(default)]
     pub username: Option<String>,
@@ -1490,7 +1444,7 @@ impl PlcConnectionService {
     /// plaintext (or any non-reference) value under a secret key - the last line that keeps
     /// a plaintext secret out of the database whichever entrance forgot to seal it (design
     /// §3.3・§8-1) - and enforces design §3.2's JSON types for the built-in protocols so
-    /// that `flat_view` reads back exactly what was validated (§10's R2b-1d note).
+    /// that stored settings can be read back in the validated shape.
     fn validate_settings(
         &self,
         protocol: &str,
@@ -2231,6 +2185,44 @@ mod tests {
     use banto_core::{FilterOp, FilterState, Pagination, SortDirection, SortState};
     use serde_json::json;
 
+    #[test]
+    fn connection_settings_accessors_read_only_the_requested_json_key() {
+        let settings = serde_json::json!({
+            "host": " db01 ", "port": " 5432 ", "negative": -1,
+            "not_integer": true, "password": {"$secret": "ref"}
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let conn = PlcConnection::from_settings(
+            1,
+            "db".into(),
+            "postgres".into(),
+            true,
+            false,
+            settings,
+            1,
+        );
+        assert_eq!(conn.setting_str("host"), Some(" db01 "));
+        assert_eq!(conn.setting_i64("port"), Some(5432));
+        assert_eq!(conn.setting_i64("negative"), Some(-1));
+        assert_eq!(conn.setting_i64("not_integer"), None);
+        assert_eq!(conn.setting_str("password"), None);
+        assert_eq!(conn.setting_str("missing"), None);
+        assert_eq!(conn.setting_i64("missing"), None);
+        let json = serde_json::to_value(&conn).unwrap();
+        for field in [
+            "host",
+            "port",
+            "unitId",
+            "wordOrder",
+            "cpuType",
+            "database",
+            "username",
+        ] {
+            assert!(json.get(field).is_none(), "flat field {field} leaked");
+        }
+    }
     async fn service() -> PlcConnectionService {
         let pool = banto_storage::connect_sqlite_memory()
             .await
@@ -2267,14 +2259,17 @@ mod tests {
             .expect("create should succeed");
         assert_eq!(created.name, "Line1 PLC");
         assert_eq!(created.protocol, "modbus-tcp");
-        assert_eq!(created.host, "192.168.1.10");
-        assert_eq!(created.port, 502);
-        assert_eq!(created.unit_id, 1);
+        assert_eq!(created.setting_str("host").unwrap_or(""), "192.168.1.10");
+        assert_eq!(created.setting_i64("port").unwrap_or(0), 502);
+        assert_eq!(created.setting_i64("unit_id").unwrap_or(1), 1);
         assert!(created.enabled);
 
         let fetched = svc.get(created.id).await.expect("get should succeed");
         assert_eq!(fetched, created);
-        assert_eq!(created.cpu_type, CPU_TYPE_R);
+        assert_eq!(
+            created.setting_str("cpu_type").unwrap_or(CPU_TYPE_R),
+            CPU_TYPE_R
+        );
     }
 
     /// #605: 作成の省略は R。更新の省略は既存の Q を保つ。未知の値は拒否し、
@@ -2293,24 +2288,27 @@ mod tests {
         };
         let created = svc.create(slmp("cpu-line")).await.unwrap();
         assert_eq!(created.settings.get("cpu_type"), Some(&json!("R")));
-        assert_eq!(created.cpu_type, "R");
+        assert_eq!(created.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "R");
 
         let mut q = slmp("cpu-line");
         q.cpu_type = Some("Q".to_string());
         let updated = svc.update(created.id, q).await.unwrap();
-        assert_eq!(updated.cpu_type, "Q");
+        assert_eq!(updated.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "Q");
 
         let mut omit = slmp("cpu-line");
         omit.host = "192.168.1.11".to_string();
         omit.cpu_type = None;
         let kept = svc.update(created.id, omit).await.unwrap();
-        assert_eq!(kept.host, "192.168.1.11");
-        assert_eq!(kept.cpu_type, "Q");
+        assert_eq!(kept.setting_str("host").unwrap_or(""), "192.168.1.11");
+        assert_eq!(kept.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "Q");
 
         let mut blank = slmp("cpu-line");
         blank.cpu_type = Some(String::new());
         let kept_blank = svc.update(created.id, blank).await.unwrap();
-        assert_eq!(kept_blank.cpu_type, "Q");
+        assert_eq!(
+            kept_blank.setting_str("cpu_type").unwrap_or(CPU_TYPE_R),
+            "Q"
+        );
 
         let mut bad = slmp("cpu-line");
         bad.cpu_type = Some("L".to_string());
@@ -2323,7 +2321,14 @@ mod tests {
             }
             other => panic!("expected validation, got {other:?}"),
         }
-        assert_eq!(svc.get(created.id).await.unwrap().cpu_type, "Q");
+        assert_eq!(
+            svc.get(created.id)
+                .await
+                .unwrap()
+                .setting_str("cpu_type")
+                .unwrap_or(CPU_TYPE_R),
+            "Q"
+        );
 
         // update_tx keeps it too (the merge reads inside the caller's transaction).
         let mut tx = svc.pool.begin().await.unwrap();
@@ -2332,17 +2337,17 @@ mod tests {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        assert_eq!(kept_tx.cpu_type, "Q");
+        assert_eq!(kept_tx.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "Q");
 
         // A modbus row has no cpu_type (design §3.2); switching it to slmp without
         // naming one gives R, and a modbus payload's cpu_type is not stored.
         let mut modbus = sample_input("modbus-line");
         modbus.cpu_type = Some("Q".to_string());
         let modbus = svc.create(modbus).await.unwrap();
-        assert_eq!(modbus.cpu_type, "R");
+        assert_eq!(modbus.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "R");
         assert!(!modbus.settings.contains_key("cpu_type"));
         let switched = svc.update(modbus.id, slmp("modbus-line")).await.unwrap();
-        assert_eq!(switched.cpu_type, "R");
+        assert_eq!(switched.setting_str("cpu_type").unwrap_or(CPU_TYPE_R), "R");
     }
 
     #[tokio::test]
@@ -2352,7 +2357,7 @@ mod tests {
         input.host = "  10.0.0.1  ".to_string();
         let created = svc.create(input).await.expect("create should succeed");
         assert_eq!(created.name, "Padded");
-        assert_eq!(created.host, "10.0.0.1");
+        assert_eq!(created.setting_str("host").unwrap_or(""), "10.0.0.1");
     }
 
     #[tokio::test]
@@ -2459,7 +2464,7 @@ mod tests {
             .expect("update_preserving_simulation");
         assert!(kept.simulation, "stale value overwrote the explicit toggle");
         assert_eq!(kept.name, "Keeper renamed", "other fields are replaced");
-        assert_eq!(kept.port, 503);
+        assert_eq!(kept.setting_i64("port").unwrap_or(0), 503);
 
         // The other direction: an explicit `false` is kept against a stale `true`.
         let mut off = sample_input("Keeper renamed");
@@ -2813,8 +2818,8 @@ mod tests {
             })
             .await
             .expect("a virtual connection should accept empty host / port 0");
-        assert_eq!(created.host, "");
-        assert_eq!(created.port, 0);
+        assert_eq!(created.setting_str("host").unwrap_or(""), "");
+        assert_eq!(created.setting_i64("port").unwrap_or(0), 0);
     }
 
     /// A non-virtual protocol must keep rejecting empty host / port 0 - the
@@ -3498,8 +3503,8 @@ mod tests {
             .create(postgres_input("PgNoPassword"))
             .await
             .expect("postgres without a password should be accepted");
-        assert_eq!(created.database.as_deref(), Some("appdb"));
-        assert_eq!(created.username.as_deref(), Some("appuser"));
+        assert_eq!(created.setting_str("database"), Some("appdb"));
+        assert_eq!(created.setting_str("username"), Some("appuser"));
         assert_eq!(created.secret_ref(PASSWORD_KEY), None);
         assert_eq!(stored_password(&svc, created.id).await, None);
         let cleared = svc
@@ -3622,8 +3627,13 @@ mod tests {
         input.word_order = "high_low".to_string();
         input.simulation = true;
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.unit_id, 1);
-        assert_eq!(created.word_order, "low_high");
+        assert_eq!(created.setting_i64("unit_id").unwrap_or(1), 1);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "low_high"
+        );
         assert!(!created.simulation);
     }
 
@@ -3790,7 +3800,7 @@ mod tests {
             .await
             .expect("update should succeed");
         assert_eq!(updated.name, "After");
-        assert_eq!(updated.port, 503);
+        assert_eq!(updated.setting_i64("port").unwrap_or(0), 503);
     }
 
     // --- P3-b: "word_order" column (migration 0010) ------------------------
@@ -3806,10 +3816,20 @@ mod tests {
         let mut input = sample_input("WordOrder1");
         input.protocol = "slmp".to_string();
         let created = svc.create(input).await.unwrap();
-        assert_eq!(created.word_order, "low_high");
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "low_high"
+        );
 
         let fetched = svc.get(created.id).await.unwrap();
-        assert_eq!(fetched.word_order, "low_high");
+        assert_eq!(
+            fetched
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "low_high"
+        );
     }
 
     /// `word_order: "high_low"` is accepted and persists through both
@@ -3822,14 +3842,31 @@ mod tests {
         input.protocol = "slmp".to_string();
         input.word_order = "high_low".to_string();
         let created = svc.create(input).await.unwrap();
-        assert_eq!(created.word_order, "high_low");
-        assert_eq!(svc.get(created.id).await.unwrap().word_order, "high_low");
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "high_low"
+        );
+        assert_eq!(
+            svc.get(created.id)
+                .await
+                .unwrap()
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "high_low"
+        );
 
         let mut back = sample_input("WordOrder2");
         back.protocol = "slmp".to_string();
         back.word_order = "low_high".to_string();
         let updated = svc.update(created.id, back).await.unwrap();
-        assert_eq!(updated.word_order, "low_high");
+        assert_eq!(
+            updated
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "low_high"
+        );
     }
 
     /// An unrecognized `word_order` is rejected as a `FieldError` on
@@ -3864,7 +3901,12 @@ mod tests {
                     "{word_order} is in ALLOWED_WORD_ORDERS but the SQL CHECK rejected it: {e:?}"
                 )
             });
-            assert_eq!(&created.word_order, word_order);
+            assert_eq!(
+                &created
+                    .setting_str("word_order")
+                    .unwrap_or(WORD_ORDER_LOW_HIGH),
+                word_order
+            );
         }
     }
 
@@ -3924,7 +3966,12 @@ mod tests {
             .list(ListParams::default())
             .await
             .expect("list should succeed");
-        assert_eq!(rows.rows[0].word_order, "low_high");
+        assert_eq!(
+            rows.rows[0]
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            "low_high"
+        );
     }
 
     // --- #325 (2026-09-08): Modbus defaults to "high_low" ------------------
@@ -3966,9 +4013,18 @@ mod tests {
         }))
         .expect("deserialize");
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_HIGH_LOW);
         assert_eq!(
-            svc.get(created.id).await.unwrap().word_order,
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_HIGH_LOW
+        );
+        assert_eq!(
+            svc.get(created.id)
+                .await
+                .unwrap()
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
             WORD_ORDER_HIGH_LOW
         );
     }
@@ -3987,7 +4043,12 @@ mod tests {
         }))
         .expect("deserialize");
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
     }
 
     /// The default must not become a *policy*: an operator who deliberately
@@ -4008,7 +4069,12 @@ mod tests {
         }))
         .expect("deserialize");
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
 
         let update: PlcConnectionInput = serde_json::from_value(json!({
             "name": "Modbus explicit",
@@ -4022,9 +4088,18 @@ mod tests {
             .update(created.id, update)
             .await
             .expect("update should succeed");
-        assert_eq!(updated.word_order, WORD_ORDER_LOW_HIGH);
         assert_eq!(
-            svc.get(created.id).await.unwrap().word_order,
+            updated
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
+        assert_eq!(
+            svc.get(created.id)
+                .await
+                .unwrap()
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
             WORD_ORDER_LOW_HIGH
         );
     }
@@ -4040,7 +4115,12 @@ mod tests {
         let mut input = sample_input("Modbus update");
         input.word_order = WORD_ORDER_LOW_HIGH.to_string();
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
 
         let update: PlcConnectionInput = serde_json::from_value(json!({
             "name": "Modbus update",
@@ -4053,7 +4133,12 @@ mod tests {
             .update(created.id, update)
             .await
             .expect("update should succeed");
-        assert_eq!(updated.word_order, WORD_ORDER_HIGH_LOW);
+        assert_eq!(
+            updated
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_HIGH_LOW
+        );
     }
 
     /// Switching an existing connection's protocol re-decides the default
@@ -4075,7 +4160,12 @@ mod tests {
             )
             .await
             .expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_HIGH_LOW);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_HIGH_LOW
+        );
 
         let updated = svc
             .update(
@@ -4090,7 +4180,12 @@ mod tests {
             )
             .await
             .expect("update should succeed");
-        assert_eq!(updated.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            updated
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
     }
 
     /// `"postgres"` keeps winning: `normalize_postgres_input` runs *after*
@@ -4116,7 +4211,12 @@ mod tests {
                 .create(serde_json::from_value(payload).expect("deserialize"))
                 .await
                 .expect("create should succeed");
-            assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+            assert_eq!(
+                created
+                    .setting_str("word_order")
+                    .unwrap_or(WORD_ORDER_LOW_HIGH),
+                WORD_ORDER_LOW_HIGH
+            );
         }
     }
 
@@ -4289,12 +4389,21 @@ mod tests {
         let mut input = sample_input("Deliberate low_high");
         input.word_order = WORD_ORDER_LOW_HIGH.to_string();
         let created = svc.create(input).await.expect("create should succeed");
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
 
         migrate(&pool).await.expect("migrate should be idempotent");
 
         assert_eq!(
-            svc.get(created.id).await.unwrap().word_order,
+            svc.get(created.id)
+                .await
+                .unwrap()
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
             WORD_ORDER_LOW_HIGH
         );
     }
@@ -4656,16 +4765,27 @@ mod tests {
         input.simulation = true;
         let created = svc.create(input.clone()).await.expect("hub create");
         assert_eq!(created.protocol, HUB_PROTOCOL);
-        assert_eq!(created.host, "");
-        assert_eq!(created.port, 0);
-        assert_eq!(created.unit_id, 1);
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(created.setting_str("host").unwrap_or(""), "");
+        assert_eq!(created.setting_i64("port").unwrap_or(0), 0);
+        assert_eq!(created.setting_i64("unit_id").unwrap_or(1), 1);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
         assert!(!created.simulation);
         assert!(created.is_hub_source());
         assert!(!created.is_db_source());
 
         let updated = svc.update(created.id, input.clone()).await.expect("update");
-        assert_eq!((updated.host.as_str(), updated.port), ("", 0));
+        assert_eq!(
+            (
+                updated.setting_str("host").unwrap_or(""),
+                updated.setting_i64("port").unwrap_or(0)
+            ),
+            ("", 0)
+        );
         assert!(!updated.simulation);
 
         let preserved = svc
@@ -4810,7 +4930,13 @@ mod tests {
             .await
             .expect("an empty connection may become the hub");
         assert_eq!(switched.protocol, HUB_PROTOCOL);
-        assert_eq!((switched.host.as_str(), switched.port), ("", 0));
+        assert_eq!(
+            (
+                switched.setting_str("host").unwrap_or(""),
+                switched.setting_i64("port").unwrap_or(0)
+            ),
+            ("", 0)
+        );
     }
 
     #[test]
@@ -5239,10 +5365,15 @@ mod tests {
             .await
             .expect("create push");
         assert_eq!(created.protocol, PUSH_PROTOCOL);
-        assert_eq!(created.host, "");
-        assert_eq!(created.port, 0);
-        assert_eq!(created.unit_id, 1);
-        assert_eq!(created.word_order, WORD_ORDER_LOW_HIGH);
+        assert_eq!(created.setting_str("host").unwrap_or(""), "");
+        assert_eq!(created.setting_i64("port").unwrap_or(0), 0);
+        assert_eq!(created.setting_i64("unit_id").unwrap_or(1), 1);
+        assert_eq!(
+            created
+                .setting_str("word_order")
+                .unwrap_or(WORD_ORDER_LOW_HIGH),
+            WORD_ORDER_LOW_HIGH
+        );
         assert!(!created.simulation);
         assert!(created.settings.is_empty());
         svc.create(push_input("Bridge2"))
@@ -6375,13 +6506,13 @@ mod tests {
             .map(|c| {
                 (
                     c.id,
-                    c.host.as_str(),
-                    c.port,
-                    c.unit_id,
-                    c.word_order.as_str(),
-                    c.cpu_type.as_str(),
-                    c.database.as_deref(),
-                    c.username.as_deref(),
+                    c.setting_str("host").unwrap_or(""),
+                    c.setting_i64("port").unwrap_or(0),
+                    c.setting_i64("unit_id").unwrap_or(1),
+                    c.setting_str("word_order").unwrap_or(WORD_ORDER_LOW_HIGH),
+                    c.setting_str("cpu_type").unwrap_or(CPU_TYPE_R),
+                    c.setting_str("database"),
+                    c.setting_str("username"),
                 )
             })
             .collect();
@@ -6932,10 +7063,10 @@ mod tests {
     }
 
     /// §10's R2b-1d note: what the write path stores reads back unchanged through the
-    /// flat projection - every value the old validation accepts for a built-in protocol
-    /// round-trips (`create` → `get`) through `settings` and `flat_view`.
+    /// settings object: every value the old validation accepts for a built-in protocol
+    /// round-trips (`create` to `get`) through `settings`.
     #[tokio::test]
-    async fn validated_settings_read_back_identically_through_the_flat_view() {
+    async fn validated_settings_read_back_identically() {
         let svc = service().await;
         let cases: Vec<PlcConnectionInput> = vec![
             {
@@ -6965,24 +7096,42 @@ mod tests {
             let again = svc.get(created.id).await.unwrap();
             assert_eq!(again, created);
             let normalized = normalize_plc_connection_input(input);
-            let flat = crate::settings_json::legacy::flat_view(&again.protocol, &again.settings);
-            assert_eq!(flat.host, normalized.host.trim(), "{}", again.name);
-            assert_eq!(flat.port, normalized.port, "{}", again.name);
+            assert_eq!(
+                again.setting_str("host"),
+                Some(normalized.host.trim()),
+                "{}",
+                again.name
+            );
+            assert_eq!(
+                again.setting_i64("port"),
+                Some(normalized.port),
+                "{}",
+                again.name
+            );
             if again.protocol == MODBUS_PROTOCOL {
-                assert_eq!(flat.unit_id, normalized.unit_id);
+                assert_eq!(again.setting_i64("unit_id"), Some(normalized.unit_id));
             }
             if again.protocol != POSTGRES_PROTOCOL {
-                assert_eq!(flat.word_order, normalized.word_order);
+                assert_eq!(
+                    again.setting_str("word_order"),
+                    Some(normalized.word_order.as_str())
+                );
             }
             if again.protocol == "slmp" {
-                assert_eq!(Some(flat.cpu_type.clone()), normalized.cpu_type);
+                assert_eq!(
+                    again.setting_str("cpu_type"),
+                    normalized.cpu_type.as_deref()
+                );
             }
             if again.protocol == POSTGRES_PROTOCOL {
                 assert_eq!(
-                    flat.database.as_deref(),
+                    again.setting_str("database"),
                     normalized.database.as_deref().map(str::trim)
                 );
-                assert_eq!(flat.username, normalized.username);
+                assert_eq!(
+                    again.setting_str("username"),
+                    normalized.username.as_deref()
+                );
             }
         }
     }

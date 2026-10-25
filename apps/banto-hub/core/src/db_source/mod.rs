@@ -507,12 +507,14 @@ pub async fn test_connection(
     conn: &PlcConnection,
     secret_rows: &[banto_tags::StoredSecretRow],
 ) -> DbConnectionTestOutcome {
-    let port = if conn.port < 1 || conn.port > 65535 {
+    let Some(port) = conn
+        .setting_i64("port")
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port >= 1)
+    else {
         return DbConnectionTestOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
         );
-    } else {
-        conn.port as u16
     };
 
     let password = match connection_password(conn, secret_rows) {
@@ -520,10 +522,10 @@ pub async fn test_connection(
         Err(message) => return DbConnectionTestOutcome::failed(message),
     };
     let options = pg_connect_options(
-        &conn.host,
+        conn.setting_str("host").unwrap_or(""),
         port,
-        conn.database.as_deref().unwrap_or(""),
-        conn.username.as_deref().unwrap_or(""),
+        conn.setting_str("database").unwrap_or(""),
+        conn.setting_str("username").unwrap_or(""),
         &password,
         &conn.name,
     );
@@ -645,12 +647,14 @@ pub async fn describe_group(
     secret_rows: &[banto_tags::StoredSecretRow],
     query_sql: &str,
 ) -> DescribeGroupOutcome {
-    let port = if conn.port < 1 || conn.port > 65535 {
+    let Some(port) = conn
+        .setting_i64("port")
+        .and_then(|port| u16::try_from(port).ok())
+        .filter(|port| *port >= 1)
+    else {
         return DescribeGroupOutcome::failed(
             "ポート番号が不正です(1〜65535の範囲で指定してください)。".to_string(),
         );
-    } else {
-        conn.port as u16
     };
 
     let password = match connection_password(conn, secret_rows) {
@@ -658,10 +662,10 @@ pub async fn describe_group(
         Err(message) => return DescribeGroupOutcome::failed(message),
     };
     let options = pg_connect_options(
-        &conn.host,
+        conn.setting_str("host").unwrap_or(""),
         port,
-        conn.database.as_deref().unwrap_or(""),
-        conn.username.as_deref().unwrap_or(""),
+        conn.setting_str("database").unwrap_or(""),
+        conn.setting_str("username").unwrap_or(""),
         &password,
         &conn.name,
     );
@@ -714,16 +718,14 @@ mod tests {
             id: 1,
             name: "Test DB".to_string(),
             protocol: "postgres".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 1,
-            unit_id: 1,
             enabled: true,
             simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: Some("appdb".to_string()),
-            username: Some("appuser".to_string()),
-            settings: Default::default(),
+            settings: serde_json::json!({
+                "host": "127.0.0.1", "port": 1, "database": "appdb", "username": "appuser"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
             settings_version: 1,
         };
         with_password(conn, "s3cret-password").0
@@ -812,13 +814,13 @@ mod tests {
         let mut conn = base_conn();
 
         // Test port > 65535
-        conn.port = 70_000;
+        conn.settings.insert("port".into(), 70_000.into());
         let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
 
         // Test port = 0
-        conn.port = 0;
+        conn.settings.insert("port".into(), 0.into());
         let outcome = test_connection(&conn, &base_rows()).await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
@@ -842,16 +844,15 @@ mod tests {
             id: 1,
             name: "Real PG".to_string(),
             protocol: "postgres".to_string(),
-            host: options.get_host().to_string(),
-            port: options.get_port() as i64,
-            unit_id: 1,
             enabled: true,
             simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: options.get_database().map(|s| s.to_string()),
-            username: Some(options.get_username().to_string()),
-            settings: Default::default(),
+            settings: serde_json::json!({
+                "host": options.get_host(), "port": options.get_port(),
+                "database": options.get_database(), "username": options.get_username()
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
             settings_version: 1,
         };
 
@@ -940,7 +941,7 @@ mod tests {
     #[tokio::test]
     async fn describe_group_rejects_an_out_of_range_port() {
         let mut conn = base_conn();
-        conn.port = 70_000;
+        conn.settings.insert("port".into(), 70_000.into());
         let outcome = describe_group(&conn, &base_rows(), "SELECT 1 AS a").await;
         assert!(!outcome.ok);
         assert!(outcome.error.expect("error").contains("1〜65535"));
@@ -988,16 +989,15 @@ mod tests {
             id: 1,
             name: "Real PG".to_string(),
             protocol: "postgres".to_string(),
-            host: options.get_host().to_string(),
-            port: options.get_port() as i64,
-            unit_id: 1,
             enabled: true,
             simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: "R".to_string(),
-            database: options.get_database().map(|s| s.to_string()),
-            username: Some(options.get_username().to_string()),
-            settings: Default::default(),
+            settings: serde_json::json!({
+                "host": options.get_host(), "port": options.get_port(),
+                "database": options.get_database(), "username": options.get_username()
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
             settings_version: 1,
         };
 

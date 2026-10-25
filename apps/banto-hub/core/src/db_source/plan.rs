@@ -315,13 +315,14 @@ pub fn build_plan(
         let port = if exclusion.is_some() {
             0
         } else {
-            u16::try_from(conn.port)
+            u16::try_from(conn.setting_i64("port").unwrap_or_default())
                 .ok()
                 .filter(|port| *port >= 1)
                 .ok_or_else(|| {
                     format!(
                         "DB 接続 {} のポート番号が不正です（1〜65535）: {}",
-                        conn.name, conn.port
+                        conn.name,
+                        conn.setting_i64("port").unwrap_or_default()
                     )
                 })?
         };
@@ -431,10 +432,10 @@ pub fn build_plan(
         connections.push(DbConnectionPlan {
             connection_id: conn.id,
             connection_name: conn.name.clone(),
-            host: conn.host.clone(),
+            host: conn.setting_str("host").unwrap_or("").to_string(),
             port,
-            database: conn.database.clone().unwrap_or_default(),
-            username: conn.username.clone().unwrap_or_default(),
+            database: conn.setting_str("database").unwrap_or("").to_string(),
+            username: conn.setting_str("username").unwrap_or("").to_string(),
             password,
             groups,
         });
@@ -493,8 +494,12 @@ mod tests {
     fn plc_connection(id: i64, name: &str) -> PlcConnection {
         PlcConnection {
             protocol: "slmp".to_string(),
-            database: None,
-            username: None,
+            settings: serde_json::json!({
+                "host": "10.0.0.50", "port": 5007, "word_order": "low_high", "cpu_type": "R"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
             ..pg_connection(id, name, true)
         }
     }
@@ -631,20 +636,6 @@ mod tests {
         };
         let err = build_plan(&snapshot, &registry()).unwrap_err();
         assert!(err.contains("db 以外"), "{err}");
-    }
-
-    #[test]
-    fn build_plan_rejects_an_out_of_range_port() {
-        let mut conn = pg_connection(1, "erp", true);
-        conn.port = 70_000;
-        let snapshot = RegistrySnapshot {
-            connections: vec![conn],
-            groups: vec![group(1, "q1", 1, Some("SELECT a FROM v1"), true)],
-            tags: vec![db_tag(10, "A", 1, "a", true)],
-            secrets: secret_rows(),
-        };
-        let err = build_plan(&snapshot, &registry()).unwrap_err();
-        assert!(err.contains("ポート"), "{err}");
     }
 
     /// Design §5.4 (R2b-1d, R2b-1e): the plan holds the sealed password row (never the

@@ -4823,22 +4823,15 @@ mod tests {
             async move {
                 let conn = connections.get(id).await.unwrap();
                 connections
-                    .update(
+                    .update_settings(
                         id,
-                        banto_tags::PlcConnectionInput {
+                        banto_tags::ConnectionSettingsInput {
                             name: conn.name,
                             protocol: conn.protocol,
-                            host: conn.host,
-                            port: conn.port,
-                            unit_id: conn.unit_id,
                             enabled,
                             simulation: conn.simulation,
-                            word_order: conn.word_order,
-                            cpu_type: None,
-                            database: None,
-                            username: None,
                             secrets: Default::default(),
-                            settings: None,
+                            settings: conn.settings,
                         },
                     )
                     .await
@@ -4925,22 +4918,15 @@ mod tests {
             async move {
                 let conn = connections.get(id).await.unwrap();
                 connections
-                    .update(
+                    .update_settings(
                         id,
-                        banto_tags::PlcConnectionInput {
+                        banto_tags::ConnectionSettingsInput {
                             name: conn.name,
                             protocol: conn.protocol,
-                            host: conn.host,
-                            port: conn.port,
-                            unit_id: conn.unit_id,
                             enabled,
                             simulation: conn.simulation,
-                            word_order: conn.word_order,
-                            cpu_type: None,
-                            database: None,
-                            username: None,
                             secrets: Default::default(),
-                            settings: None,
+                            settings: conn.settings,
                         },
                     )
                     .await

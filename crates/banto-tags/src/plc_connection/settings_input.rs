@@ -1,4 +1,4 @@
-//! `settings` の形の書き込みの入口（R2b-6b、docs/banto-hub-driver-ui-design.md §4.2・§5）。
+//! `settings` の形の書き込みの入口（R2b-6b／R2b-7d、docs/banto-hub-driver-r2b7-design.md §6）。
 //!
 //! Hub の REST（`/api/plc-connections`）は R2b-6b から接続を
 //! `{ name, protocol, enabled, simulation, settings }` で受ける。この入口は
@@ -21,7 +21,7 @@
 //! スキーマで必須の秘密の欄は、書き込みの最後の `settings` に参照が無ければ「必須です」で
 //! 断る（作成で欠けた・消した・更新で保つが保存済みの値も無い、のどれも）。
 //!
-//! レジストリを持つサービス（[`PlcConnectionService::with_registry`]、Hub）だけが使う。
+//! レジストリを持つサービス（[`PlcConnectionService::with_registry`]、Hub と ChronoGazer）が使う。
 
 use banto_core::{BantoError, FieldError};
 use banto_driver_api::{DriverKind, FieldKind};

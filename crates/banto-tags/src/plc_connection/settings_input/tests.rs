@@ -361,8 +361,8 @@ async fn postgres_takes_its_four_keys_and_the_password_secret() {
     );
     pg.secrets.insert("password".into(), set(REF_A));
     let created = svc.create_settings(pg).await.unwrap();
-    assert_eq!(created.host, "db");
-    assert_eq!(created.database.as_deref(), Some("d"));
+    assert_eq!(created.setting_str("host").unwrap_or(""), "db");
+    assert_eq!(created.setting_str("database"), Some("d"));
     assert_eq!(created.secret_ref("password"), Some(REF_A));
 
     let err = svc
