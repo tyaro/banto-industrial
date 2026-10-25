@@ -149,7 +149,7 @@ use banto_server::{
     TAURI_IPC_CONNECT_SRC,
 };
 use banto_tags::{
-    CollectionGroupService, PlcConnectionInput, PlcConnectionService, TagService,
+    CollectionGroupService, ConnectionSettingsInput, PlcConnectionService, TagService,
     CALC_CONNECTION_NAME, MEM_CONNECTION_NAME, VIRTUAL_PROTOCOL,
 };
 use banto_tstore::{LocalDate, SystemClock};
@@ -1258,21 +1258,13 @@ async fn ensure_virtual_connection(
     // `crate::computed::driver::VirtualDriver`、host が登録する）。
     let svc = PlcConnectionService::with_registry(pool.clone(), registry.clone());
     if let Err(err) = svc
-        .create(PlcConnectionInput {
+        .create_settings(ConnectionSettingsInput {
             name: name.to_string(),
             protocol: VIRTUAL_PROTOCOL.to_string(),
-            host: String::new(),
-            port: 0,
-            unit_id: 1,
             enabled: true,
             simulation: false,
-
-            word_order: "low_high".to_string(),
-            cpu_type: None,
-            database: None,
-            username: None,
             secrets: Default::default(),
-            settings: None,
+            settings: Default::default(),
         })
         .await
     {

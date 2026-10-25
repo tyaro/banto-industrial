@@ -90,8 +90,8 @@
 //! the substitution happens before the session is ensured, as described next.
 //!
 //! A broker-managed connection: [`HubSessions::ensure_connection`]
-//! dials `conn.host`/`conn.port` straight from the `banto_tags::PlcConnection`
-//! row, and `crate::hub::CollectorManager::rebuild` calls it (session sync)
+//! obtains the endpoint from the driver settings in `PlcConnection::settings`,
+//! and `crate::hub::CollectorManager::rebuild` calls it (session sync)
 //! *before* building the client factory (`banto_collect::broker_client_factory`)
 //! it hands to `Collector::apply_config` - i.e. the broker session for an SLMP connection
 //! is already established by the time `Collector` would otherwise decide to

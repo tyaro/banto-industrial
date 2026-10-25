@@ -562,36 +562,46 @@ fn dropped_values(old: &OldRow, new: &PlcConnection) -> Vec<String> {
             ));
         }
     };
-    check("host", text(&old.host).to_string(), new.host.clone());
+    check(
+        "host",
+        text(&old.host).to_string(),
+        new.setting_str("host").unwrap_or("").to_string(),
+    );
     check(
         "port",
         old.port.unwrap_or_default().to_string(),
-        new.port.to_string(),
+        new.setting_i64("port").unwrap_or_default().to_string(),
     );
     check(
         "unitId",
         old.unit_id.unwrap_or(1).to_string(),
-        new.unit_id.to_string(),
+        new.setting_i64("unit_id").unwrap_or(1).to_string(),
     );
     check(
         "wordOrder",
         text(&old.word_order).to_string(),
-        new.word_order.clone(),
+        new.setting_str("word_order")
+            .unwrap_or(if new.protocol == "modbus-tcp" {
+                "high_low"
+            } else {
+                "low_high"
+            })
+            .to_string(),
     );
     check(
         "cpuType",
         text(&old.cpu_type).to_string(),
-        new.cpu_type.clone(),
+        new.setting_str("cpu_type").unwrap_or("R").to_string(),
     );
     check(
         "database",
         text(&old.database).to_string(),
-        text(&new.database).to_string(),
+        new.setting_str("database").unwrap_or("").to_string(),
     );
     check(
         "username",
         text(&old.username).to_string(),
-        text(&new.username).to_string(),
+        new.setting_str("username").unwrap_or("").to_string(),
     );
     dropped
 }

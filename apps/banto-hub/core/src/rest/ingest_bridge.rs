@@ -299,10 +299,10 @@ pub(crate) fn build_sources(
                 id: db.id,
                 name: db.name.clone(),
                 enabled: db.enabled,
-                host: db.host.clone(),
-                port: db.port,
-                database: db.database.clone(),
-                username: db.username.clone(),
+                host: db.setting_str("host").unwrap_or("").to_string(),
+                port: db.setting_i64("port").unwrap_or_default(),
+                database: db.setting_str("database").map(str::to_string),
+                username: db.setting_str("username").map(str::to_string),
                 password,
             },
         });
@@ -387,27 +387,12 @@ mod tests {
             id,
             name: format!("c{id}"),
             protocol: protocol.to_string(),
-            host: if protocol == POSTGRES_PROTOCOL {
-                "db01".to_string()
-            } else {
-                String::new()
-            },
-            port: if protocol == POSTGRES_PROTOCOL {
-                5432
-            } else {
-                0
-            },
-            unit_id: 1,
             enabled,
             simulation: false,
-            word_order: "low_high".to_string(),
-            cpu_type: String::new(),
-            database: (protocol == POSTGRES_PROTOCOL).then(|| "mes".to_string()),
-            username: (protocol == POSTGRES_PROTOCOL).then(|| "reader".to_string()),
             // R2b-1d: a postgres row's password is a reference to its sealed row
             // ([`secret_rows`]); a push row's settings are the object itself.
             settings: if protocol == POSTGRES_PROTOCOL {
-                json!({ "password": { "$secret": pw_ref(id) } })
+                json!({ "host": "db01", "port": 5432, "database": "mes", "username": "reader", "password": { "$secret": pw_ref(id) } })
                     .as_object()
                     .unwrap()
                     .clone()
