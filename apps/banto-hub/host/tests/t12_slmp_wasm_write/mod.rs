@@ -24,11 +24,13 @@ enum Peer {
     DeviceRefusal,
     BadAck,
     Timeout,
+    TimeoutOnce,
 }
 
 struct Fixture {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<(u16, u32)>>>,
+    write_values: Arc<Mutex<Vec<u16>>>,
     d_reads: Arc<Mutex<Vec<(u32, u16)>>>,
     accepted: tokio::sync::watch::Receiver<usize>,
     closed: tokio::sync::watch::Receiver<usize>,
@@ -41,6 +43,8 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let events = commands.clone();
+        let write_values = Arc::new(Mutex::new(Vec::new()));
+        let writes = write_values.clone();
         let d_reads = Arc::new(Mutex::new(Vec::new()));
         let reads = d_reads.clone();
         let (accepted_tx, accepted) = tokio::sync::watch::channel(0usize);
@@ -117,8 +121,16 @@ impl Fixture {
                             assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
                             assert_eq!(request[23], 0xa8);
                             assert_eq!(u16::from_le_bytes([request[25], request[26]]), 1);
-                            assert_eq!(u16::from_le_bytes([request[27], request[28]]), 9);
-                            if matches!(peer, Peer::Timeout) {
+                            let value = u16::from_le_bytes([request[27], request[28]]);
+                            assert!(matches!(value, 9 | 10));
+                            let write_count = {
+                                let mut values = writes.lock().unwrap();
+                                values.push(value);
+                                values.len()
+                            };
+                            if matches!(peer, Peer::Timeout)
+                                || (matches!(peer, Peer::TimeoutOnce) && write_count == 1)
+                            {
                                 continue;
                             }
                             (
@@ -151,6 +163,7 @@ impl Fixture {
         Self {
             address,
             commands,
+            write_values,
             d_reads,
             accepted,
             closed,
@@ -160,6 +173,10 @@ impl Fixture {
 
     fn commands(&self) -> Vec<(u16, u32)> {
         self.commands.lock().unwrap().clone()
+    }
+
+    fn write_values(&self) -> Vec<u16> {
+        self.write_values.lock().unwrap().clone()
     }
 
     fn d_reads(&self) -> Vec<(u32, u16)> {
@@ -704,10 +721,10 @@ async fn hub_write_gates_and_audit_still_wrap_the_controlled_guest() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
-async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
+async fn hub_api_timeout_then_explicit_recovery_and_revoked_key_rejection() {
     use banto_hub_core::api_keys::{ApiKeyLookup, ApiKeysService};
 
-    let mut fixture = Fixture::start(Peer::Timeout).await;
+    let mut fixture = Fixture::start(Peer::TimeoutOnce).await;
     let component =
         std::fs::read(std::env::var("BANTO_SLMP_WRITE_COMPONENT_WASM").unwrap()).unwrap();
     let app = super::test_app_with_controlled_write_manifest(
@@ -734,7 +751,7 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
         app.pool.clone(),
         app.manager.registry().clone(),
     )
-    .create(super::group_input("slmp-write-group", saved.id, 10_000))
+    .create(super::group_input("slmp-write-group", saved.id, 60_000))
     .await
     .unwrap();
     let mut tag = super::tag_input("word", group.id, "D3010", "u16");
@@ -779,12 +796,15 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
     // Do not assert until after revoke and TestApp cleanup. A failed assertion
     // must not leave the temporary test key active or the DB directory behind.
     let path = "/api/v1/values/slmp-write-fixture-line.slmp-write-group.word";
-    let (write_status, write_body) = super::admin_write(
-        &app.router,
-        "POST",
-        path,
-        &issued.key,
-        serde_json::json!({"v":9}),
+    let first_write = tokio::time::timeout(
+        Duration::from_secs(15),
+        super::admin_write(
+            &app.router,
+            "POST",
+            path,
+            &issued.key,
+            serde_json::json!({"v":9}),
+        ),
     )
     .await;
     let first_closed = tokio::time::timeout(
@@ -807,22 +827,84 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
     .is_ok_and(|result| result.is_ok());
     let read_after_reconnect =
         tokio::time::timeout(Duration::from_secs(5), handle.read(vec![spec])).await;
+    // This is an explicit second request, distinguishable from a replay of v=9.
+    let recovery_write = if matches!(
+        &first_write,
+        Ok((super::StatusCode::BAD_GATEWAY, body)) if body["error"] == "write_failed"
+    ) && matches!(
+        &read_after_reconnect,
+        Ok(Ok(values)) if values == &vec![Ok(DriverValue::F64(7.0))]
+    ) {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                super::admin_write(
+                    &app.router,
+                    "POST",
+                    path,
+                    &issued.key,
+                    serde_json::json!({"v":10}),
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
     let accepted_before_shutdown = *fixture.accepted.borrow();
     let closed_before_shutdown = *fixture.closed.borrow();
-    let (audit_status, audit) = super::admin_write(
-        &app.router,
-        "POST",
-        "/api/write-audit/list",
-        &app.admin_token,
-        serde_json::json!({}),
+    let audit_before_revoke = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/write-audit/list",
+            &app.admin_token,
+            serde_json::json!({}),
+        ),
+    )
+    .await;
+    let commands_before_revoke = fixture.commands();
+    let accepted_before_revoke = *fixture.accepted.borrow();
+
+    let key_summaries = tokio::time::timeout(Duration::from_secs(5), api_keys.list()).await;
+    let revoked = tokio::time::timeout(Duration::from_secs(5), api_keys.revoke(issued_id)).await;
+    // Do not attempt another write if revocation failed or its result is unknown.
+    let revoked_write = if matches!(&revoked, Ok(Ok(_))) {
+        Some(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                super::admin_write(
+                    &app.router,
+                    "POST",
+                    path,
+                    &issued.key,
+                    serde_json::json!({"v":10}),
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+    let commands_after_revoke = fixture.commands();
+    let accepted_after_revoke = *fixture.accepted.borrow();
+    let audit_after_revoke = tokio::time::timeout(
+        Duration::from_secs(5),
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/write-audit/list",
+            &app.admin_token,
+            serde_json::json!({}),
+        ),
     )
     .await;
 
     app.write_control.disable();
     let write_control_disabled = !app.write_control.is_enabled();
-    let revoked = api_keys.revoke(issued_id).await;
-    let lookup_after_revoke = api_keys.lookup(&issued.key, now_ms).await;
-    let key_summaries = api_keys.list().await;
+    let lookup_after_revoke =
+        tokio::time::timeout(Duration::from_secs(5), api_keys.lookup(&issued.key, now_ms)).await;
     drop(issued);
     drop(api_keys);
     drop(handle);
@@ -841,24 +923,49 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
     let db_removed = !db_path.exists();
     let temp_dir_removed = !temp_dir.exists();
 
-    let revoked = revoked.expect("revoke temporary test key");
+    let revoked = revoked
+        .expect("bounded key revocation")
+        .expect("revoke temporary test key");
     assert!(revoked.revoked_at.is_some());
     assert!(matches!(
         lookup_after_revoke,
-        Ok(ApiKeyLookup::Revoked { id, .. }) if id == issued_id
+        Ok(Ok(ApiKeyLookup::Revoked { id, .. })) if id == issued_id
     ));
-    let key_summaries = key_summaries.expect("read temporary key metadata");
+    let key_summaries = key_summaries
+        .expect("bounded key metadata lookup")
+        .expect("read temporary key metadata");
     let key_summary = key_summaries
         .iter()
         .find(|key| key.id == issued_id)
         .unwrap();
     assert_eq!(issued_scopes, vec![scope]);
+    assert_eq!(key_summary.scopes, issued_scopes);
     assert_eq!(key_summary.expires_at, Some(expires_at));
     assert!(write_control_disabled);
     assert!(db_removed, "temporary test database must be removed");
     assert!(temp_dir_removed, "temporary test directory must be removed");
 
-    assert!(!write_status.is_success(), "{write_body:?}");
+    let (write_status, write_body) = first_write.expect("bounded failed REST write");
+    assert_eq!(
+        write_status,
+        super::StatusCode::BAD_GATEWAY,
+        "{write_body:?}"
+    );
+    assert_eq!(write_body["error"], "write_failed");
+    let timeout_reason = write_body["detail"].as_str().unwrap();
+    assert!(timeout_reason.contains(&FatalError::Timeout.to_string()));
+    let (recovery_status, recovery_body) = recovery_write
+        .expect("recovery write must be attempted")
+        .expect("bounded recovery REST write");
+    assert_eq!(recovery_status, super::StatusCode::OK, "{recovery_body:?}");
+    assert_eq!(recovery_body["result"], "ok");
+    let (revoked_status, revoked_body) = revoked_write
+        .expect("revoked key must be tested through REST")
+        .expect("bounded revoked-key REST request");
+    assert_eq!(revoked_status, super::StatusCode::UNAUTHORIZED);
+    assert!(revoked_body["kind"] == "unauthorized" || revoked_body["error"] == "unauthorized");
+
+    let (audit_status, audit) = audit_before_revoke.expect("bounded first audit list");
     assert_eq!(audit_status, super::StatusCode::OK, "{audit:?}");
     let matching_rows: Vec<_> = audit["rows"]
         .as_array()
@@ -866,11 +973,36 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
         .iter()
         .filter(|row| row["tagId"].as_i64() == Some(tag_id))
         .collect();
-    assert_eq!(matching_rows.len(), 1, "{audit:?}");
-    assert_eq!(matching_rows[0]["result"], "failed");
-    assert!(matching_rows[0]["detail"]
-        .as_str()
-        .is_some_and(|s| !s.is_empty()));
+    assert_eq!(matching_rows.len(), 2, "{audit:?}");
+    let failed_row = matching_rows
+        .iter()
+        .find(|row| row["result"] == "failed")
+        .unwrap();
+    let failed_detail: serde_json::Value =
+        serde_json::from_str(failed_row["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(failed_detail["target"], "plc");
+    assert_eq!(failed_detail["detail"], timeout_reason);
+    assert_eq!(
+        matching_rows
+            .iter()
+            .filter(|row| row["result"] == "ok")
+            .count(),
+        1
+    );
+    let (audit_status_after, audit_after) = audit_after_revoke.expect("bounded final audit list");
+    assert_eq!(audit_status_after, super::StatusCode::OK);
+    let rows_after: Vec<_> = audit_after["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["tagId"].as_i64() == Some(tag_id))
+        .collect();
+    assert_eq!(
+        rows_after, matching_rows,
+        "revoked request must not create a write audit row"
+    );
+    assert_eq!(commands_before_revoke, commands_after_revoke);
+    assert_eq!(accepted_before_revoke, accepted_after_revoke);
     assert!(first_closed);
     assert!(second_accepted);
     assert!(second_connected);
@@ -881,12 +1013,13 @@ async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
     assert_eq!((accepted_before_shutdown, closed_before_shutdown), (2, 1));
     assert!(second_closed);
     assert_eq!((final_accepted, final_closed), (2, 2));
+    assert_eq!(fixture.write_values(), vec![9, 10]);
     assert_eq!(
         commands
             .iter()
             .filter(|(command, _)| *command == 0x1401)
             .count(),
-        1,
-        "the failed REST write must not be replayed"
+        2,
+        "only the failed write and the explicit recovery write may be sent"
     );
 }
