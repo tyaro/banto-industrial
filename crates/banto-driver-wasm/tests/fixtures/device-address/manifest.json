@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "device-address-wasm",
+  "version": "0.1.0",
+  "hubApi": "1",
+  "settingsVersion": 1,
+  "displayName": "Device address test component",
+  "transports": ["tcp"],
+  "capabilities": ["read"]
+}

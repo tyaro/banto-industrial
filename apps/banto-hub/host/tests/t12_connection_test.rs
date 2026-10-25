@@ -243,13 +243,22 @@ async fn test_app_with_secret_driver(label: &str, with_secret_driver: bool) -> T
 }
 
 async fn test_app_with_wasm(label: &str, component: &[u8]) -> TestApp {
-    test_app_with_drivers(label, false, Some(component)).await
+    test_app_with_manifest(
+        label,
+        include_bytes!("../../../../crates/banto-driver-wasm/tests/manifest.json"),
+        component,
+    )
+    .await
+}
+
+async fn test_app_with_manifest(label: &str, manifest: &[u8], component: &[u8]) -> TestApp {
+    test_app_with_drivers(label, false, Some((manifest, component))).await
 }
 
 async fn test_app_with_drivers(
     label: &str,
     with_secret_driver: bool,
-    wasm_component: Option<&[u8]>,
+    wasm_component: Option<(&[u8], &[u8])>,
 ) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
@@ -286,10 +295,10 @@ async fn test_app_with_drivers(
     let auth_for_test = auth.clone();
 
     let mut drivers = common::hub_drivers();
-    if let Some(component) = wasm_component {
+    if let Some((manifest, component)) = wasm_component {
         banto_drivers::register_wasm(
             Arc::get_mut(&mut drivers.registry).unwrap(),
-            include_bytes!("../../../../crates/banto-driver-wasm/tests/manifest.json"),
+            manifest,
             component,
         )
         .expect("register WASM frame driver");
@@ -1588,3 +1597,6 @@ async fn drivers_list_needs_a_session_and_a_viewer_may_read_it() {
     assert_eq!(status, StatusCode::OK, "{body:?}");
     assert_eq!(body.as_array().map(Vec::len), Some(2), "{body:?}");
 }
+
+#[path = "t12_device_address/mod.rs"]
+mod device_address_test;
