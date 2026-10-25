@@ -20,6 +20,10 @@ banto-hub-core = { path = "../core" }
 # core へ注入する。R1-3b では bin が core の中にあったので core が一時的に normal で
 # 持っていた（2026-10-20 オーナー決定）。R1-7a でこの package へ移し、core は dev のみ。
 banto-drivers = { path = "../../../crates/banto-drivers" }
+banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0" }
+banto-driver-wasm = { path = "../../../crates/banto-driver-wasm" }
+ring = "0.17"
+semver = "1"
 # `bin/banto_hub/win_service.rs`（Windows 専用）が profile のルートの締める・緩める・
 # 見張り（`banto_safe_root::mode`・`guard`・`open_root` 等）を直接使う。
 banto-safe-root = { path = "../../../crates/banto-safe-root" }
@@ -59,6 +63,7 @@ windows-sys = { version = "0.61", features = [
 # `tests/common/mod.rs` は core の `tests/common/mod.rs` を `#[path]` で読み、
 # `hub_drivers()`（`builtin()`）だけを足す。
 [dev-dependencies]
+tempfile = "3"
 # `net` は空きポートの探索と TCP のプローブ、`test-util` は core と同じ（仮想時計）。
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
 axum = { workspace = true, features = ["ws"] }

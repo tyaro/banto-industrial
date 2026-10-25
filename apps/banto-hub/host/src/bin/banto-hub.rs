@@ -82,6 +82,8 @@
 // バイナリターゲットとして自動検出してしまう（`[[bin]]`で明示済みの
 // `banto-hub`とは別に、`win_service.rs`単体にも`fn main()`を要求される）
 // ため、直下ではなくサブディレクトリ + `#[path]`で読み込む。
+#[path = "banto_hub/wasm_plugins.rs"]
+mod wasm_plugins;
 #[cfg(windows)]
 #[path = "banto_hub/win_service.rs"]
 mod win_service;
@@ -108,6 +110,7 @@ fn hub_drivers() -> HubDrivers {
     let mut registry = builtin.registry;
     banto_hub_core::register_host_provided(&mut registry)
         .expect("host-provided driver ids are distinct from the built-ins");
+    wasm_plugins::register_from_env(&mut registry);
     HubDrivers::new(std::sync::Arc::new(registry))
 }
 

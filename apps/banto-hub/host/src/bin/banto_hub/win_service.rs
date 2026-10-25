@@ -925,6 +925,13 @@ impl HubProgram {
                 }
             }
         }
+        if let Some((success, message)) = crate::wasm_plugins::take_startup_message() {
+            if success {
+                self.log.line(&message);
+            } else {
+                self.log.error(&message);
+            }
+        }
         let switch_started = Instant::now();
         self.say(&redirection_guard_line(redirection));
         self.say(&mode_switch_begin_line());
