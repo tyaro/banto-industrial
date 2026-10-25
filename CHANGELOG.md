@@ -2,6 +2,17 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
+## v0.3.0-alpha.1 — 2026-10-25（アルファ、公開前）
+
+R2b-7（#827・#828・#829・#830・#842 と文書・版の更新）。接続の保存と公開 API をドライバの `settings` に揃えました。**旧い平らな接続入力とは互換性がありません。** 設定パッケージは `schemaVersion: 3` のままで、DB マイグレーションもありません。ChronoGazer 自身の版は 0.1.0 のままです。実機確認、タグ作成、リリース公開は未実施です。
+
+### 変更
+
+- **Hub の MCP 接続ツールを REST と同じ形にしました。** `create_connection`・`update_connection`・`test_connection` は `settings` を受け、`list_connections` も REST と同じ接続を返します。`update_connection` の `settings` は丸ごと置き換えで、秘密のキーだけ省略時に保存済みの値を保ちます。従来の直下の `host`・`unitId` などは受けません。`list_drivers` でドライバの設定スキーマを取得できます。
+- **接続の項目エラーを `settings.<key>` に揃えました。** ドライバの欄名はスキーマの snake_case です。`push` の入れ子はその場所を返します。ホスト提供の `postgres` 接続の旧い検証は R2b-8 まで残ります。
+- **ChronoGazer の接続の REST・Tauri・画面を `settings` の形にしました。** ドライバの一覧に基づくフォームを使い、保存時のアドレス検証は `banto-tags` のレジストリに揃えました。`hub` 接続は専用の許可口で扱います。既存タグの自動移行は行いません。
+- **内部**: `banto-tags` の接続の平らな読み取り欄と `flat_view`、`banto-collect` の旧アドレス検証と通常の `banto-plc` 依存を撤去しました。ホスト接続とテストのための平らな書き込み入力は残ります。
+
 ## v0.2.0-alpha.39 — 2026-10-24（アルファ）
 
 R2b-6（接続設定とアドレス補助をドライバのスキーマ・記述子から組み立てる。#810〜#819 と docs・版）。詳細設計は [docs/banto-hub-driver-ui-design.md](docs/banto-hub-driver-ui-design.md)。**DB の形は変えていません**（マイグレーションはありません。alpha.38 の DB をそのまま開けます）。**REST（接続の API）と設定パッケージの形は変わります**（下の「変更」。使用者がまだいない前提で、旧い形は受けません）。MCP の形は変えていません（平らな形のまま。R2b-7 で見直します）。タグ・リリースの扱いは alpha.37 と同じです。

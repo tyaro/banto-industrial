@@ -1,8 +1,8 @@
 # banto-hub REST / MCP の形の変更と ChronoGazer の追従 詳細設計（R2b-7）
 
 作成日: 2026-10-24
-最終更新: 2026-10-24（オーナー決定を反映）
-状態: **設計確定（2026-10-24 オーナー決定。§11 の Q1〜Q10 はすべて推奨どおり）・未実装**。コード調査（§1）は 2026-10-24 の main（`33952ad0`、v0.2.0-alpha.39、R2b-6 完了・#821〜#825 マージ後）に対して行った。前提のオーナー決定: **使用者はいない前提で、既存データの移行と旧い形との互換は考えない**（2026-10-22。R2b-7 以降も同じ）・**破壊的変更してよい。新しい形だけ受けて、合わなければ断る**（2026-10-17）・**接続の項目エラーの欄名を R2b-7 で `settings.<key>` に揃える**（2026-10-24、#821）・**シリアル接続（#803）は凍結、R2b-4 と iframe の枠は W 段**。
+最終更新: 2026-10-25（R2b-7a〜7c・7d-1・7d-2 の完了と 7e の版更新を反映）
+状態: **設計確定（2026-10-24 オーナー決定。§11 の Q1〜Q10 はすべて推奨どおり）・実装済み（7a #827、7b #828、7d-1 #829、7d-2a/2b #830、7c #842。7e は文書・版の差分を準備中、公開前）**。実機確認は §10 のとおり未実施。§1 のコード調査は 2026-10-24 の main（`33952ad0`、v0.2.0-alpha.39、R2b-6 完了・#821〜#825 マージ後）の時点の記録。前提のオーナー決定: **使用者はいない前提で、既存データの移行と旧い形との互換は考えない**（2026-10-22。R2b-7 以降も同じ）・**破壊的変更してよい。新しい形だけ受けて、合わなければ断る**（2026-10-17）・**接続の項目エラーの欄名を R2b-7 で `settings.<key>` に揃える**（2026-10-24、#821）・**シリアル接続（#803）は凍結、R2b-4 と iframe の枠は W 段**。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-7「REST / MCP / 設定パッケージの形の変更（設定パッケージは版を上げる）と ChronoGazer の追従」。前の段で R2b-7 へ送った分を §1 で拾う。
 関連: [banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。§2 の R2b-7 との境、§4.2 の検証の順、§4.3 平らな形のアダプタ、Q4・Q6・Q13）、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)（R2b-2。Q7 ChronoGazer の追従、§5 の前倒しの案）、[banto-hub-driver-io-design.md](banto-hub-driver-io-design.md)（R2b-3。Q5 の「保存時の規則は R2b-7」）、[banto-hub-driver-sim-design.md](banto-hub-driver-sim-design.md)（R2b-5。§5 の `address_notation`・`banto-plc` の依存）、[banto-hub-driver-ui-design.md](banto-hub-driver-ui-design.md)（R2b-6。§4.2 のスキーマでの保存、§5 REST の形、Q2・Q7・Q11）、[banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)（MCP の接続ツール）、[implementation-checklist.md](implementation-checklist.md)。
 

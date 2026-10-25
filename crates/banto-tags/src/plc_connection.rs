@@ -293,14 +293,11 @@ use settings_input::TypedSettings;
 /// ([`PlcConnectionService::with_registry`], design
 /// `banto-hub-connection-settings-design.md` §4). This list stays, unchanged,
 /// as the rule of a service built without a registry
-/// ([`PlcConnectionService::new`]: ChronoGazer and tests) and of the old flat
-/// validation step (1) that [`validate_plc_connection_input`] still runs
-/// first, until R2b-7 retires both (refactor-plan; Q6). Until then, adding a
-/// protocol to the Hub means registering a driver **and** widening this list:
-/// step (1) runs first on every service, registry or not, and refuses any
-/// protocol missing here before the registry's validation is reached (so a
-/// registry-only protocol would fail every REST/MCP create and update). After
-/// R2b-7 registering the driver alone is enough. It originally mirrored the SQL
+/// ([`PlcConnectionService::new`], used for host connections and tests) and of
+/// [`validate_plc_connection_input`] for that legacy input. Since R2b-7,
+/// both Hub and ChronoGazer use registry-backed services for driver
+/// connections: registering a driver does not require widening this list.
+/// It originally mirrored the SQL
 /// `CHECK` (as widened by `migrations/0004_plc_connections_allow_slmp.sql`
 /// and later ones); `every_allowed_protocol_is_accepted_by_the_sql_check`
 /// still inserts every entry through the service.
