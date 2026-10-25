@@ -21,6 +21,7 @@ fn canonical_component_runs_through_frame_adapter() {
         .parse_address("40001", &TagKind::numeric(DataType::U16))
         .unwrap();
     assert_eq!(address.canonical, "400001");
+    assert!(address.writable_area);
     let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "502")]).unwrap();
     assert!(driver.validate_config(&settings).is_empty());
     let mut conn = driver.create_connection(&settings).unwrap();

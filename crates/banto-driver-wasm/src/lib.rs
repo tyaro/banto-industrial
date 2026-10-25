@@ -206,6 +206,7 @@ fn checked_parsed_address(
 ) -> Result<DriverAddress, AddressError> {
     if *kind != TagKind::numeric(DataType::U16)
         || parsed.area != "holding_register"
+        || !parsed.writable_area
         || parsed.word_count != 1
         || parsed.bit.is_some()
     {
@@ -217,7 +218,7 @@ fn checked_parsed_address(
         .canonical
         .strip_prefix('4')
         .ok_or_else(|| AddressError::new("WASM FC3 canonical address is invalid"))?;
-    if !matches!(digits.len(), 4 | 5) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.len() != 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(AddressError::new("WASM FC3 canonical address is invalid"));
     }
     let number = digits
@@ -659,10 +660,16 @@ mod tests {
         wrong.area = "coil".into();
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
         let mut wrong = parsed();
+        wrong.writable_area = false;
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
         wrong.index = Some(1);
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
         let mut wrong = parsed();
         wrong.canonical = "400002".into();
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
+        wrong.canonical = "40001".into();
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
         assert!(
             checked_parsed_address(&driver, &TagKind::numeric(DataType::I16), parsed()).is_err()
