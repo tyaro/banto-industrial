@@ -1012,6 +1012,7 @@ version = "0.3.0-alpha.1"
 dependencies = [
  "banto-driver-api",
  "banto-plc-address",
+ "banto-register-codec",
  "encoding_rs",
  "slmp",
  "thiserror 2.0.21",
@@ -1032,6 +1033,10 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
 ]
+
+[[package]]
+name = "banto-register-codec"
+version = "0.3.0-alpha.1"
 
 [[package]]
 name = "banto-rtsp"

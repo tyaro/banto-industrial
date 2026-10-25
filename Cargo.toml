@@ -62,6 +62,7 @@ members = [
     "crates/banto-tags",
     "crates/banto-db-source",
     "crates/banto-plc-address",
+    "crates/banto-register-codec",
     "crates/banto-driver-api",
     "crates/banto-driver-conformance",
     "crates/banto-driver-engine",
