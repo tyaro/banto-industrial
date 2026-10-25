@@ -7,31 +7,15 @@
 use crate::error::PlcError;
 use crate::types::{DataType, TagValue};
 
-/// Which register holds the high 16 bits of a 32-bit value (or the highest
-/// 16 bits of a 4-register 64-bit value) - `banto_driver_api::WordOrder`,
-/// re-exported at its pre-R1-1 path (`banto_plc::decode::WordOrder`). Only the
-/// enum moved (docs/banto-driver-api-design.md §3.1); combining registers per
-/// order (`combine_u32` / `combine_u64`) stays here.
+/// Register word order at the existing public `banto-plc` path.
 pub use banto_driver_api::WordOrder;
+use banto_register_codec::{self as codec, WordOrder as CodecWordOrder};
 
-/// Combine two registers into a `u32` per `order`.
-fn combine_u32(regs: [u16; 2], order: WordOrder) -> u32 {
-    let (hi, lo) = match order {
-        WordOrder::HighLow => (regs[0], regs[1]),
-        WordOrder::LowHigh => (regs[1], regs[0]),
-    };
-    ((hi as u32) << 16) | (lo as u32)
-}
-
-/// Combine four registers into a `u64` per `order`, the same convention as
-/// [`combine_u32`] extended to a 4-word group (64-bit types, owner decision
-/// 2026-09-08).
-fn combine_u64(regs: [u16; 4], order: WordOrder) -> u64 {
-    let [a, b, c, d] = match order {
-        WordOrder::HighLow => regs,
-        WordOrder::LowHigh => [regs[3], regs[2], regs[1], regs[0]],
-    };
-    ((a as u64) << 48) | ((b as u64) << 32) | ((c as u64) << 16) | (d as u64)
+fn codec_order(order: WordOrder) -> CodecWordOrder {
+    match order {
+        WordOrder::HighLow => CodecWordOrder::HighLow,
+        WordOrder::LowHigh => CodecWordOrder::LowHigh,
+    }
 }
 
 /// Decode the value at `regs[start..]` (1, 2 or 4 registers, per `data_type`)
@@ -64,20 +48,20 @@ pub fn decode_register_value(
             ))
         })?;
 
+    let order = codec_order(order);
     let value = match data_type {
-        DataType::I16 => window[0] as i16 as f64,
+        DataType::I16 => codec::decode_i16(window[0]) as f64,
         DataType::U16 => window[0] as f64,
-        DataType::I32 => combine_u32([window[0], window[1]], order) as i32 as f64,
-        DataType::U32 => combine_u32([window[0], window[1]], order) as f64,
-        DataType::F32 => f32::from_bits(combine_u32([window[0], window[1]], order)) as f64,
+        DataType::I32 => codec::decode_i32([window[0], window[1]], order) as f64,
+        DataType::U32 => codec::decode_u32([window[0], window[1]], order) as f64,
+        DataType::F32 => codec::decode_f32([window[0], window[1]], order) as f64,
         DataType::I64 => {
-            combine_u64([window[0], window[1], window[2], window[3]], order) as i64 as f64
+            codec::decode_i64([window[0], window[1], window[2], window[3]], order) as f64
         }
-        DataType::U64 => combine_u64([window[0], window[1], window[2], window[3]], order) as f64,
-        DataType::F64 => f64::from_bits(combine_u64(
-            [window[0], window[1], window[2], window[3]],
-            order,
-        )),
+        DataType::U64 => {
+            codec::decode_u64([window[0], window[1], window[2], window[3]], order) as f64
+        }
+        DataType::F64 => codec::decode_f64([window[0], window[1], window[2], window[3]], order),
         DataType::Bit => {
             return Err(PlcError::Protocol(
                 "decode_register_value called with DataType::Bit".to_string(),
@@ -409,8 +393,8 @@ mod tests {
                 305_441_741.0,
             ),
         ] {
-            assert_eq!(combine_u32(high_low, WordOrder::HighLow), bits);
-            assert_eq!(combine_u32(low_high, WordOrder::LowHigh), bits);
+            assert_eq!(codec::decode_u32(high_low, CodecWordOrder::HighLow), bits);
+            assert_eq!(codec::decode_u32(low_high, CodecWordOrder::LowHigh), bits);
             assert_eq!(
                 projected(&high_low, data_type, WordOrder::HighLow),
                 expected
@@ -491,9 +475,9 @@ mod tests {
                 9_007_199_254_740_992.0,
             ),
         ] {
-            assert_eq!(combine_u64(high_low, WordOrder::HighLow), bits);
+            assert_eq!(codec::decode_u64(high_low, CodecWordOrder::HighLow), bits);
             // LowHigh reverses all four words, not the two 32-bit pairs.
-            assert_eq!(combine_u64(low_high, WordOrder::LowHigh), bits);
+            assert_eq!(codec::decode_u64(low_high, CodecWordOrder::LowHigh), bits);
             assert_eq!(
                 projected(&high_low, data_type, WordOrder::HighLow),
                 projected_f64

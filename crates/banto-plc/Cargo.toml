@@ -19,6 +19,7 @@ banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 # `banto-plc-write` - see its module doc. `src/address.rs` re-exports it so
 # `banto_plc::AddressArea` is unchanged for every existing caller.
 banto-plc-address = { path = "../banto-plc-address" }
+banto-register-codec = { path = "../banto-register-codec" }
 # Only the pieces this crate actually touches: TCP I/O (net), connect/response
 # timeouts (time), frame read/write (io-util). No "rt"/"macros" here - this
 # crate never spawns tasks or defines its own #[tokio::main]/#[tokio::test];
