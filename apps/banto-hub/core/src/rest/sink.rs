@@ -385,11 +385,11 @@ async fn build_sink_config_response(
         };
         connections.push(SinkConfigConnectionEntry {
             id: conn.id,
-            name: conn.name,
-            host: conn.host,
-            port: conn.port,
-            database: conn.database,
-            username: conn.username,
+            name: conn.name.clone(),
+            host: conn.setting_str("host").unwrap_or("").to_string(),
+            port: conn.setting_i64("port").unwrap_or_default(),
+            database: conn.setting_str("database").map(str::to_string),
+            username: conn.setting_str("username").map(str::to_string),
             password,
         });
     }

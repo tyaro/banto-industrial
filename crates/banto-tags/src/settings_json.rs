@@ -2,13 +2,8 @@
 //! レジストリによる検証（R2b-1c、docs/banto-hub-connection-settings-design.md
 //! §3.2・§3.3・§3.5・§4.2・§4.3）。
 //!
-//! R2b-1c で部品として足し、**R2b-1d から保存と読み込みが使う**（migration `0025` で
-//! `plc_connections` の固定列は `settings` へ移った）: 書き込みの全入口は
-//! [`legacy::settings_from_flat`] で平らな入力を `settings` に写し（「省略は保つ」欄は
-//! 書き込みのトランザクションの中で今の行と合わせる、`plc_connection.rs`）、
-//! `PlcConnection` の `FromRow` は [`legacy::flat_view`] で平らな欄を作る。レジストリを持つ
-//! サービス（`PlcConnectionService::with_registry`）は [`validate_settings_with_registry`] を
-//! 旧い検証 (1) の後に走らせる。
+//! The legacy host input adapter writes validated settings to the JSON column.
+//! Registry-backed readers use the JSON settings directly.
 //!
 //! ## [`settings_to_api`]（設計 §3.5）
 //!
@@ -32,12 +27,9 @@
 //! 辞書順）ので、`Settings` の並びも辞書順になる。並びに意味を持たせる呼び出し側は
 //! 無い（検証は `get` で引く）。
 //!
-//! ## [`legacy`]（設計 §4.3、R2b-7 まで）
+//! ## [`legacy`]
 //!
-//! REST・MCP・設定パッケージ・ChronoGazer の**平らな形**（`host`・`port`・`unit_id`・
-//! `word_order`・`cpu_type`・`database`・`username`・`password`）と `settings` の間の
-//! アダプタ。[`legacy::settings_from_flat`] は §3.2 の表のとおりにプロトコルごとに写し、
-//! [`legacy::flat_view`] は逆向き（`settings` から平らな欄を作る読み取りの写し）。
+//! The flat host input adapter remains for host connections and tests.
 //!
 //! ## [`validate_settings_with_registry`]（設計 §4.2 の (3)(4)）
 //!
@@ -318,28 +310,16 @@ fn check_field_value(field: &SettingField, value: &Value) -> Result<(), String> 
     }
 }
 
-/// 平らな形 ⇔ `settings` のアダプタ（設計 §4.3、R2b-7 で消える）。
+/// ホスト接続とテスト用の平らな入力を `settings` に写すアダプタ（設計 §5、Q3）。
 pub mod legacy {
     use super::{validate_settings_with_registry, DriverRegistry, FieldError, Map, Value};
     use crate::plc_connection::{
-        default_word_order_for, normalize_plc_connection_input, PlcConnectionInput, CPU_TYPE_R,
-        MODBUS_PROTOCOL, POSTGRES_PROTOCOL, PUSH_PROTOCOL,
+        normalize_plc_connection_input, PlcConnectionInput, MODBUS_PROTOCOL, POSTGRES_PROTOCOL,
+        PUSH_PROTOCOL,
     };
 
     /// `slmp` の綴り（`ALLOWED_PROTOCOLS` と同じ。定数は無い）。
     pub(crate) const SLMP_PROTOCOL: &str = "slmp";
-
-    /// 平らな欄を `settings` から作った読み取りの写し（`PlcConnection` の同名の欄）。
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    pub struct FlatView {
-        pub host: String,
-        pub port: i64,
-        pub unit_id: i64,
-        pub word_order: String,
-        pub cpu_type: String,
-        pub database: Option<String>,
-        pub username: Option<String>,
-    }
 
     /// 正規化（`normalize_plc_connection_input`）と旧い検証を通った入力を、設計 §3.2 の
     /// 表のとおりに `settings` へ写す。**プロトコルが読まない欄は写さない**（捨てる）。
@@ -355,10 +335,8 @@ pub mod legacy {
     /// | その他       | `{}`（レジストリが断る）                              |
     ///
     /// - `host`・`database`・`username` は保存と同じく前後の空白を除く。
-    /// - `slmp` の `cpu_type` は、入力が `None`・空のとき**キーを置かない**（作成は既定の
-    ///   `R`、更新は既存を保つ、`PlcConnectionInput::cpu_type`。書き込みの入口が
-    ///   トランザクションの中で合わせて、保存する `settings` には必ず置く。`flat_view` は
-    ///   無ければ `R`）。
+    /// - `slmp` の `cpu_type` は、入力が `None`・空のとき**キーを置かない**。
+    ///   書き込みの入口が作成時の既定値 `R`、更新時の既存値を合わせる。
     /// - **秘密値（`postgres` の `password`）は写さない**。`settings` には
     ///   `{"$secret": "<ref>"}` しか置かない（設計 §3.3）。参照は書き込みの入口が
     ///   `PlcConnectionInput::secrets`（封印済みの値）から挿す（R2b-1d）。
@@ -411,67 +389,11 @@ pub mod legacy {
         let settings = settings_from_flat(&input);
         validate_settings_with_registry(registry, &input.protocol, &settings)
     }
-
-    /// `settings` から平らな欄を作る（設計 §4.3）。**プロトコルが読むキーだけ**を読み
-    /// （`settings_from_flat` の表と同じ）、読まない欄と無いキーは今の既定にする:
-    /// `host` は `""`、`port` は 0、`unit_id` は 1、`word_order` はプロトコルの既定
-    /// （`modbus-tcp` は `high_low`、ほかは `low_high`）、`cpu_type` は `R`、
-    /// `database`・`username` は `None`。
-    ///
-    /// 数は JSON の数のほか、10 進の整数を表す文字列も受ける（`settings_to_api` が
-    /// 文字列にして渡す先のドライバと同じ読み方）。読めない型は既定にする（失敗しない。
-    /// 検証に通らない `settings` はレジストリの検証が断る）。
-    pub fn flat_view(protocol: &str, settings: &Map<String, Value>) -> FlatView {
-        let reads_endpoint = protocol == MODBUS_PROTOCOL
-            || protocol == SLMP_PROTOCOL
-            || protocol == POSTGRES_PROTOCOL;
-        let text = |key: &str| {
-            settings
-                .get(key)
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        };
-        let int = |key: &str| match settings.get(key) {
-            Some(Value::Number(number)) => number.as_i64(),
-            Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
-            _ => None,
-        };
-        let is_postgres = protocol == POSTGRES_PROTOCOL;
-        FlatView {
-            host: if reads_endpoint {
-                text("host").unwrap_or_default()
-            } else {
-                String::new()
-            },
-            port: if reads_endpoint {
-                int("port").unwrap_or(0)
-            } else {
-                0
-            },
-            unit_id: if protocol == MODBUS_PROTOCOL {
-                int("unit_id").unwrap_or(1)
-            } else {
-                1
-            },
-            word_order: if protocol == MODBUS_PROTOCOL || protocol == SLMP_PROTOCOL {
-                text("word_order").unwrap_or_else(|| default_word_order_for(protocol))
-            } else {
-                default_word_order_for(protocol)
-            },
-            cpu_type: if protocol == SLMP_PROTOCOL {
-                text("cpu_type").unwrap_or_else(|| CPU_TYPE_R.to_string())
-            } else {
-                CPU_TYPE_R.to_string()
-            },
-            database: if is_postgres { text("database") } else { None },
-            username: if is_postgres { text("username") } else { None },
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::legacy::{flat_view, settings_from_flat, FlatView};
+    use super::legacy::settings_from_flat;
     use super::*;
     use crate::plc_connection::PlcConnectionInput;
     use serde_json::json;
@@ -667,153 +589,6 @@ mod tests {
             slmp.cpu_type = unspecified;
             let map = settings_from_flat(&slmp);
             assert!(!map.contains_key("cpu_type"));
-            assert_eq!(flat_view("slmp", &map).cpu_type, "R");
-        }
-    }
-
-    // ---- flat_view の既定（設計 §4.3）----
-
-    #[test]
-    fn flat_view_of_an_empty_settings_is_the_defaults() {
-        let empty = Map::new();
-        let defaults = |word_order: &str| FlatView {
-            host: String::new(),
-            port: 0,
-            unit_id: 1,
-            word_order: word_order.to_string(),
-            cpu_type: "R".to_string(),
-            database: None,
-            username: None,
-        };
-        assert_eq!(flat_view("modbus-tcp", &empty), defaults("high_low"));
-        for protocol in ["slmp", "postgres", "virtual", "hub", "push", "bogus"] {
-            assert_eq!(
-                flat_view(protocol, &empty),
-                defaults("low_high"),
-                "{protocol}"
-            );
-        }
-    }
-
-    #[test]
-    fn flat_view_reads_only_the_keys_the_protocol_reads() {
-        let everything = object(json!({
-            "host": "h", "port": 9, "unit_id": 3, "word_order": "high_low",
-            "cpu_type": "Q", "database": "d", "username": "u",
-        }));
-        let view = |protocol: &str| flat_view(protocol, &everything);
-        let modbus = view("modbus-tcp");
-        assert_eq!(
-            (modbus.host.as_str(), modbus.port, modbus.unit_id),
-            ("h", 9, 3)
-        );
-        assert_eq!(modbus.word_order, "high_low");
-        assert_eq!(
-            (modbus.cpu_type.as_str(), modbus.database, modbus.username),
-            ("R", None, None)
-        );
-        let slmp = view("slmp");
-        assert_eq!((slmp.host.as_str(), slmp.port, slmp.unit_id), ("h", 9, 1));
-        assert_eq!(
-            (slmp.word_order.as_str(), slmp.cpu_type.as_str()),
-            ("high_low", "Q")
-        );
-        assert_eq!((slmp.database, slmp.username), (None, None));
-        let postgres = view("postgres");
-        assert_eq!(
-            (postgres.host.as_str(), postgres.port, postgres.unit_id),
-            ("h", 9, 1)
-        );
-        assert_eq!(postgres.word_order, "low_high");
-        assert_eq!(postgres.database.as_deref(), Some("d"));
-        assert_eq!(postgres.username.as_deref(), Some("u"));
-        for protocol in ["virtual", "hub", "push"] {
-            assert_eq!(
-                view(protocol),
-                flat_view(protocol, &Map::new()),
-                "{protocol}"
-            );
-        }
-    }
-
-    #[test]
-    fn flat_view_reads_decimal_strings_as_numbers_and_ignores_unreadable_types() {
-        let strings = object(json!({"host": "h", "port": " 502 ", "unit_id": "7"}));
-        let view = flat_view("modbus-tcp", &strings);
-        assert_eq!((view.port, view.unit_id), (502, 7));
-        let junk = object(json!({"host": 5, "port": "x", "unit_id": true, "word_order": 1}));
-        let view = flat_view("modbus-tcp", &junk);
-        assert_eq!(
-            (
-                view.host.as_str(),
-                view.port,
-                view.unit_id,
-                view.word_order.as_str()
-            ),
-            ("", 0, 1, "high_low")
-        );
-    }
-
-    /// 往復: 正規化した入力 → `settings_from_flat` → `flat_view` が、プロトコルが読む欄を
-    /// 再現し、捨てた欄は既定にする。
-    #[test]
-    fn flat_view_of_settings_from_flat_round_trips_per_protocol() {
-        struct Row {
-            protocol: &'static str,
-            want: FlatView,
-        }
-        let view = |host: &str,
-                    port,
-                    unit_id,
-                    word_order: &str,
-                    cpu: &str,
-                    db: Option<&str>,
-                    user: Option<&str>| FlatView {
-            host: host.to_string(),
-            port,
-            unit_id,
-            word_order: word_order.to_string(),
-            cpu_type: cpu.to_string(),
-            database: db.map(str::to_string),
-            username: user.map(str::to_string),
-        };
-        let rows = [
-            Row {
-                protocol: "modbus-tcp",
-                want: view("10.0.0.5", 5000, 7, "high_low", "R", None, None),
-            },
-            Row {
-                protocol: "slmp",
-                want: view("10.0.0.5", 5000, 1, "high_low", "Q", None, None),
-            },
-            Row {
-                protocol: "postgres",
-                want: view(
-                    "10.0.0.5",
-                    5000,
-                    1,
-                    "low_high",
-                    "R",
-                    Some("appdb"),
-                    Some("alice"),
-                ),
-            },
-            Row {
-                protocol: "virtual",
-                want: view("", 0, 1, "low_high", "R", None, None),
-            },
-            Row {
-                protocol: "hub",
-                want: view("", 0, 1, "low_high", "R", None, None),
-            },
-            Row {
-                protocol: "push",
-                want: view("", 0, 1, "low_high", "R", None, None),
-            },
-        ];
-        for row in rows {
-            let map = settings_from_flat(&input(row.protocol));
-            assert_eq!(flat_view(row.protocol, &map), row.want, "{}", row.protocol);
         }
     }
 

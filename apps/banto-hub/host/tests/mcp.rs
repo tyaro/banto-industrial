@@ -2087,7 +2087,7 @@ async fn update_connection_with_admin_scope_updates_and_audits() {
         .await
         .unwrap();
     assert_eq!(stored.name, "line1-renamed");
-    assert_eq!(stored.port, 15099);
+    assert_eq!(stored.setting_i64("port"), Some(15099));
 
     let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
         .fetch_one(&app.pool)
@@ -2155,7 +2155,11 @@ async fn update_connection_missing_field_is_rejected_and_row_unchanged() {
         .await
         .unwrap();
     assert_eq!(after.name, before.name, "row must not change");
-    assert_eq!(after.port, before.port, "row must not change");
+    assert_eq!(
+        after.setting_i64("port"),
+        before.setting_i64("port"),
+        "row must not change"
+    );
     assert_eq!(after.enabled, before.enabled, "row must not change");
 
     let audit_count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")

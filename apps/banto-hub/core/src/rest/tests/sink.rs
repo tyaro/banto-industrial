@@ -386,6 +386,10 @@ async fn sink_config_get_requires_admin_and_carries_password_and_stable_ids() {
     let connections = body["connections"].as_array().unwrap();
     assert_eq!(connections.len(), 1);
     assert_eq!(connections[0]["id"], db_connection_id);
+    assert_eq!(connections[0]["host"], "10.0.0.50");
+    assert_eq!(connections[0]["port"], 5432);
+    assert_eq!(connections[0]["database"], "erp");
+    assert_eq!(connections[0]["username"], "reader");
     assert_eq!(connections[0]["password"], "s3cret");
 
     // admin スコープを持つ API キーでも通ること(サイドカーの本来の
@@ -494,6 +498,9 @@ async fn bridge_config_requires_admin_and_returns_the_password_only_with_the_ing
     assert_eq!(source["db"]["id"], pg["id"]);
     assert_eq!(source["db"]["enabled"], json!(true));
     assert_eq!(source["db"]["host"], json!("10.0.0.50"));
+    assert_eq!(source["db"]["port"], json!(5432));
+    assert_eq!(source["db"]["database"], json!("erp"));
+    assert_eq!(source["db"]["username"], json!("reader"));
     assert_eq!(source["db"]["password"], json!("s3cret"));
 }
 

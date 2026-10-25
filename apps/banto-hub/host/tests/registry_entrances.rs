@@ -51,6 +51,14 @@ const NEEDLES: &[(&str, &str)] = &[
         "`CollectionGroupService::with_registry`",
     ),
     (
+        "PlcConnectionInput {",
+        "use ConnectionSettingsInput for production connection writes",
+    ),
+    (
+        "ALLOWED_PROTOCOLS",
+        "use the driver registry for production protocol validation",
+    ),
+    (
         "Address::parse(",
         "レジストリのドライバの `parse_address`（`read_path::resolve_plc_address`）",
     ),

@@ -2205,7 +2205,7 @@ mod tests {
             .create(q_input)
             .await
             .unwrap();
-        assert_eq!(q.cpu_type, "Q");
+        assert_eq!(q.setting_str("cpu_type"), Some("Q"));
         let group = CollectionGroupService::new(pool.clone())
             .create(group_input("G1", q.id, 1_000))
             .await
@@ -3340,15 +3340,8 @@ mod tests {
             id,
             name: name.to_string(),
             protocol: PUSH_PROTOCOL.to_string(),
-            host: String::new(),
-            port: 0,
-            unit_id: 1,
             enabled: true,
             simulation: false,
-            word_order: "high-low".to_string(),
-            cpu_type: "R".to_string(),
-            database: None,
-            username: None,
             settings: Default::default(),
             settings_version: 1,
         }
@@ -3435,9 +3428,9 @@ mod tests {
         drop(tx);
         assert_eq!(loaded, in_tx);
         assert_eq!(in_tx.connections.len(), 2);
-        assert_eq!(in_tx.connections[0].host, "127.0.0.1");
-        assert_eq!(in_tx.connections[0].port, 5432);
-        assert_eq!(in_tx.connections[0].database.as_deref(), Some("erp"));
+        assert_eq!(in_tx.connections[0].setting_str("host"), Some("127.0.0.1"));
+        assert_eq!(in_tx.connections[0].setting_i64("port"), Some(5432));
+        assert_eq!(in_tx.connections[0].setting_str("database"), Some("erp"));
         assert_eq!(in_tx.connections[1].settings_version, 1);
         assert_eq!(in_tx.secrets.len(), 1);
         assert_eq!(in_tx.secrets[0].connection_id, pg.id);
@@ -3696,8 +3689,6 @@ mod tests {
         // A hub-less PLC next to it, to show the rest still runs.
         snapshot.connections.push(PlcConnection {
             protocol: "modbus-tcp".to_string(),
-            host: "127.0.0.1".to_string(),
-            port: 502,
             // R2b-3a-3: the plan reads `settings` (what the broker dials with).
             settings: serde_json::json!({"host": "127.0.0.1", "port": 502})
                 .as_object()
