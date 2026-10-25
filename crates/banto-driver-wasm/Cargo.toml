@@ -5,6 +5,10 @@ edition = "2021"
 license.workspace = true
 publish = false
 
+[features]
+# Only integration-test builds can construct the loopback write fixture.
+controlled-write-fixture = []
+
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 semver = "1"

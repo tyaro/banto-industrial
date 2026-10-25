@@ -1,5 +1,6 @@
-//! Read-only Wasmtime Component Model frame driver. The host owns transport,
-//! timeouts and frame limits; this crate only runs the canonical WIT exports.
+//! Wasmtime Component Model frame driver. The normal loader is read-only; the
+//! versioned write export is available only to isolated controlled fixtures.
+//! The host owns transport, timeouts and frame limits.
 
 mod manifest;
 mod runtime;
@@ -17,9 +18,13 @@ use api::{
     AddressError, DataType, DriverAddress, DriverBase, DriverDescriptor, DriverId, FatalError,
     FieldError, FieldGroup, FieldKind, FrameCheck, FrameConnection, FrameDriver, FrameRule,
     ItemError, KindName, Planned, PrefixEncoding, PrefixSpec, RawValue, SettingField, SettingValue,
-    Settings, SettingsSchema, Step, TagKind, TagSpec,
+    Settings, SettingsSchema, Step, TagKind, TagSpec, WriteItem, WriteProgress,
 };
 use banto_driver_api as api;
+use runtime::write_v1::{
+    banto::driver::types as write_types,
+    exports::banto::driver::{session as write_session, write_v1 as write},
+};
 use runtime::{
     banto::driver::types,
     exports::banto::driver::{address, config, read, session},
@@ -56,6 +61,7 @@ fn normalize(error: RuntimeError) -> FatalError {
 pub struct WasmDriver {
     descriptor: DriverDescriptor,
     runtime: Arc<Runtime>,
+    controlled_write_fixture: bool,
     probe: Option<(String, TagKind)>,
     supported: Vec<KindName>,
     secrets: Vec<String>,
@@ -66,8 +72,37 @@ impl WasmDriver {
     /// Validate metadata, compile a read-only component, and evaluate its
     /// stateless exports before making it visible to a registry.
     pub fn load(manifest: &[u8], component: &[u8]) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, false)
+    }
+
+    /// Explicit entry point for isolated loopback fixtures. Normal
+    /// registration remains read-only; production startup never calls this.
+    #[cfg(feature = "controlled-write-fixture")]
+    pub fn load_controlled_write_fixture(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, true)
+    }
+
+    fn load_inner(
+        manifest: &[u8],
+        component: &[u8],
+        controlled_write_fixture: bool,
+    ) -> Result<Arc<Self>, LoadError> {
         let manifest = Manifest::parse(manifest).map_err(LoadError::Manifest)?;
-        let runtime = Arc::new(Runtime::new(component).map_err(LoadError::Runtime)?);
+        if manifest.requests_write != controlled_write_fixture {
+            return Err(LoadError::Contract(
+                "write-v1 is available only through the controlled fixture loader".into(),
+            ));
+        }
+        if controlled_write_fixture && manifest.descriptor.id.as_str() != "slmp-write-fixture" {
+            return Err(LoadError::Contract(
+                "controlled write fixture requires the isolated SLMP driver id".into(),
+            ));
+        }
+        let runtime =
+            Arc::new(Runtime::new(component, manifest.requests_write).map_err(LoadError::Runtime)?);
         let mut instance = runtime.instantiate().map_err(LoadError::Runtime)?;
         let probe = instance
             .driver
@@ -122,9 +157,14 @@ impl WasmDriver {
             .map(convert_field)
             .collect();
         validate_secret_fields(&fields, &secrets)?;
+        // Only expose write capability after the extended world has actually
+        // bound on this component. The manifest alone never grants it.
+        let mut descriptor = manifest.descriptor;
+        descriptor.capabilities.write = manifest.requests_write;
         Ok(Arc::new(Self {
-            descriptor: manifest.descriptor,
+            descriptor,
             runtime,
+            controlled_write_fixture,
             probe,
             supported,
             secrets,
@@ -362,6 +402,89 @@ fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalE
     }
 }
 
+/// The controlled fixture has an independent host allowlist before the guest
+/// can produce any frame. The guest still checks the live R model and SD range.
+fn controlled_write_item(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+) -> Result<write::WriteItem, WriteProgress> {
+    let refused = || {
+        WriteProgress::Done(vec![
+            Err(ItemError::Unsupported(
+                "controlled WASM write accepts only one D3010/u16 fixture item".into(),
+            ));
+            items.len()
+        ])
+    };
+    if items.len() != 1 {
+        return Err(refused());
+    }
+    let item = &items[0];
+    let address = &item.spec.address;
+    if address.driver != *driver_id
+        || address.canonical != "D3010"
+        || address.area != "D"
+        || address.index != Some(3010)
+        || address.bit.is_some()
+        || address.word_count != 1
+        || !address.writable_area
+        || !matches!(item.spec.kind, TagKind::Numeric(DataType::U16))
+    {
+        return Err(refused());
+    }
+    let api::Value::F64(value) = item.value else {
+        return Err(refused());
+    };
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
+        return Err(refused());
+    }
+    Ok(write::WriteItem {
+        spec: write_types::TagSpec {
+            address: address.canonical.clone(),
+            data_type: "u16".into(),
+            string_words: None,
+        },
+        value: write_types::Value::Float(value),
+    })
+}
+
+fn api_write_fatal(value: write_types::FatalError) -> FatalError {
+    match value {
+        write_types::FatalError::Framing(m) => FatalError::Framing(m),
+        write_types::FatalError::Protocol(m) => FatalError::Protocol(m),
+        write_types::FatalError::InvalidConfig(m) => FatalError::InvalidConfig(m),
+    }
+}
+
+fn api_write_item_error(value: write_types::ItemError) -> ItemError {
+    match value {
+        write_types::ItemError::Device(e) => {
+            ItemError::Device(api::DeviceError::new(e.code, e.message))
+        }
+        write_types::ItemError::Unsupported(m) => ItemError::Unsupported(m),
+        write_types::ItemError::Rejected(m) => ItemError::Rejected(m),
+    }
+}
+
+fn api_write_step(step: write_session::Step) -> Step {
+    let rule = match step.expect {
+        write_session::FrameRule::None => FrameRule::None,
+        write_session::FrameRule::Fixed(n) => FrameRule::Fixed(n),
+        write_session::FrameRule::LengthPrefixed(p) => FrameRule::LengthPrefixed(
+            PrefixSpec::new(p.offset, p.width, p.big_endian, p.adjust).with_encoding(
+                match p.encoding {
+                    write_session::PrefixEncoding::Binary => PrefixEncoding::Binary,
+                    write_session::PrefixEncoding::AsciiHex => PrefixEncoding::AsciiHex,
+                    write_session::PrefixEncoding::AsciiDec => PrefixEncoding::AsciiDec,
+                },
+            ),
+        ),
+        write_session::FrameRule::Terminator(bytes) => FrameRule::Terminator(bytes),
+        write_session::FrameRule::PluginDecides => FrameRule::DriverDecides,
+    };
+    Step::new(step.send, rule, step.max_len)
+}
+
 impl DriverBase for WasmDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &self.descriptor
@@ -479,6 +602,15 @@ impl FrameDriver for WasmDriver {
         &self,
         settings: &Settings,
     ) -> Result<Box<dyn FrameConnection>, FatalError> {
+        if self.controlled_write_fixture
+            && !settings
+                .iter()
+                .any(|setting| setting.key == "host" && setting.value == "127.0.0.1")
+        {
+            return Err(FatalError::InvalidConfig(
+                "controlled WASM write fixture requires loopback host".into(),
+            ));
+        }
         let mut instance = self.runtime.instantiate().map_err(normalize)?;
         let resource = instance
             .driver
@@ -492,6 +624,8 @@ impl FrameDriver for WasmDriver {
             resource,
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
+            controlled_write_fixture: self.controlled_write_fixture,
+            driver_id: self.descriptor.id.clone(),
         }))
     }
 }
@@ -501,6 +635,8 @@ struct WasmConnection {
     resource: wasmtime::component::ResourceAny,
     runtime: Arc<Runtime>,
     failed: AtomicBool,
+    controlled_write_fixture: bool,
+    driver_id: DriverId,
 }
 
 impl WasmConnection {
@@ -527,6 +663,44 @@ impl WasmConnection {
 }
 
 impl FrameConnection for WasmConnection {
+    fn write_next(
+        &mut self,
+        items: &[WriteItem],
+        prev_response: Option<&[u8]>,
+    ) -> Result<WriteProgress, FatalError> {
+        if !self.controlled_write_fixture {
+            return Ok(WriteProgress::Done(vec![
+                Err(ItemError::Unsupported(
+                    "WASM driver is read-only".into()
+                ));
+                items.len()
+            ]));
+        }
+        let item = match controlled_write_item(items, &self.driver_id) {
+            Ok(item) => item,
+            Err(refused) => return Ok(refused),
+        };
+        self.call("write-v1.write-next", |i, resource| {
+            i.write_driver
+                .as_ref()
+                .expect("write export bound before capability enablement")
+                .banto_driver_write_v1()
+                .call_write_next(&mut i.store, resource, &[item], prev_response)
+        })?
+        .map(|progress| match progress {
+            write::WriteProgress::Send(planned) => {
+                WriteProgress::Send(Planned::new(api_write_step(planned.step), planned.covers))
+            }
+            write::WriteProgress::Done(results) => WriteProgress::Done(
+                results
+                    .into_iter()
+                    .map(|result| result.map_err(api_write_item_error))
+                    .collect(),
+            ),
+        })
+        .map_err(api_write_fatal)
+    }
+
     fn handshake_next(&mut self, prev_response: Option<&[u8]>) -> Result<Option<Step>, FatalError> {
         self.call("session.handshake-next", |i, resource| {
             i.driver
@@ -649,6 +823,54 @@ impl Drop for WasmConnection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn fixture_write_item(value: api::Value) -> WriteItem {
+        let id = DriverId::new("slmp-write-fixture").unwrap();
+        let address = DriverAddress::new(id, "D3010", "D", true, 1).with_index(3010);
+        WriteItem::new(
+            TagSpec::new(address, TagKind::numeric(DataType::U16)),
+            value,
+        )
+    }
+
+    #[test]
+    fn controlled_write_preflight_is_all_or_nothing_and_exactly_scoped() {
+        let id = DriverId::new("slmp-write-fixture").unwrap();
+        let valid = fixture_write_item(api::Value::F64(65535.0));
+        assert!(controlled_write_item(std::slice::from_ref(&valid), &id).is_ok());
+        for value in [f64::NAN, f64::INFINITY, -1.0, 0.5, 65536.0] {
+            let item = fixture_write_item(api::Value::F64(value));
+            assert!(controlled_write_item(&[item], &id).is_err());
+        }
+        assert!(controlled_write_item(&[fixture_write_item(api::Value::Bit(true))], &id).is_err());
+        let mut wrong = valid.clone();
+        wrong.spec.address.canonical = "D3000".into();
+        assert!(controlled_write_item(&[wrong], &id).is_err());
+        let mut wrong = valid.clone();
+        wrong.spec.address.index = Some(3000);
+        assert!(controlled_write_item(&[wrong], &id).is_err());
+        let mut wrong = valid.clone();
+        wrong.spec.address.writable_area = false;
+        assert!(controlled_write_item(&[wrong], &id).is_err());
+        let mut wrong = valid.clone();
+        wrong.spec.kind = TagKind::numeric(DataType::U32);
+        assert!(controlled_write_item(&[wrong], &id).is_err());
+        let result = controlled_write_item(&[valid.clone(), valid], &id);
+        assert!(
+            matches!(result, Err(WriteProgress::Done(results)) if results.len() == 2 && results.iter().all(Result::is_err))
+        );
+    }
+
+    #[test]
+    fn normal_loader_rejects_write_manifest_before_component_execution() {
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(include_bytes!("../tests/manifest.json")).unwrap();
+        manifest["capabilities"] = json!(["read", "write"]);
+        manifest["writeApi"] = json!("1");
+        let result = WasmDriver::load(&serde_json::to_vec(&manifest).unwrap(), &[]);
+        assert!(matches!(result, Err(LoadError::Contract(_))));
+    }
 
     #[test]
     fn boundary_checks_variant_and_range() {

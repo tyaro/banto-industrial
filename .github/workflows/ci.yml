@@ -503,8 +503,41 @@ jobs:
           $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM Hub tests failed' }
-          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 15 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 16 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM Hub tests did not all run'
+          }
+          # The optional write world is accepted only by the controlled test
+          # loader. Keep the read-only guest pinned above for regression tests.
+          $slmpWriteSha = 'fdb161520019b81a22bc2fec2bc9bf3d837f5bd3'
+          git -C $guest checkout --quiet --detach $slmpWriteSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpWriteSha) {
+            throw 'SLMP write guest SHA mismatch'
+          }
+          $slmpWriteReadWit = git -C $guest rev-parse --verify "${slmpWriteSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $slmpWriteReadWit -ne $hostWit) {
+            throw 'SLMP write guest read WIT mismatch'
+          }
+          $hostWriteWit = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/wit/write-v1.wit'
+          if ($LASTEXITCODE -ne 0) { throw 'host SLMP write WIT is missing' }
+          $slmpWriteWit = git -C $guest rev-parse --verify "${slmpWriteSha}:wit/write-v1.wit"
+          if ($LASTEXITCODE -ne 0 -or $slmpWriteWit -ne $hostWriteWit) {
+            throw 'SLMP write guest WIT mismatch'
+          }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP write guest build failed' }
+          $slmpWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_SLMP_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-write-component.wasm'
+          wasm-tools component new $slmpWriteModule -o $env:BANTO_SLMP_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component creation failed' }
+          wasm-tools validate $env:BANTO_SLMP_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_WRITE_COMPONENT_WASM --world driver-with-write-v1
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP write component world mismatch' }
+          $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpWriteTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM controlled write Hub tests failed' }
+          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP WASM controlled write Hub tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings

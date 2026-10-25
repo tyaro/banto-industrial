@@ -1,0 +1,24 @@
+// Optional write extension. The existing world `driver` in driver.wit is
+// unchanged; hosts must negotiate this larger world before enabling writes.
+interface write-v1 {
+  use types.{tag-spec, value, item-error, fatal-error};
+  use session.{connection};
+  use read.{planned};
+
+  record write-item { spec: tag-spec, value: value }
+  variant write-progress {
+    send(planned),
+    done(list<result<_, item-error>>),
+  }
+
+  write-next: func(conn: borrow<connection>, items: list<write-item>, prev-response: option<list<u8>>)
+    -> result<write-progress, fatal-error>;
+}
+
+world driver-with-write-v1 {
+  export session;
+  export read;
+  export address;
+  export config;
+  export write-v1;
+}

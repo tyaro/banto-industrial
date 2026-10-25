@@ -5,7 +5,7 @@ use super::*;
 use banto_collect::current::Quality;
 use banto_driver_api::{ConnectContext, DataType, ItemError, RawValue, TagSpec};
 use banto_driver_engine::{transport::TransportSpec, FrameSession};
-use banto_driver_wasm::WasmDriver;
+use banto_driver_wasm::{LoadError, WasmDriver};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -16,6 +16,26 @@ use tokio::task::JoinHandle;
 const MANIFEST: &[u8] = include_bytes!("manifest.json");
 const PROTOCOL: &str = "slmp-read-wasm";
 const MAX_D_RESPONSE_LEN: usize = 15 + 960 * 2;
+
+#[test]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned legacy read component"]
+fn legacy_read_component_cannot_satisfy_a_write_manifest() {
+    let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
+    let mut manifest: Value = serde_json::from_slice(MANIFEST).unwrap();
+    manifest["id"] = serde_json::json!("slmp-write-fixture");
+    manifest["capabilities"] = serde_json::json!(["read", "write"]);
+    manifest["writeApi"] = serde_json::json!("1");
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    assert!(matches!(
+        WasmDriver::load(&manifest, &component),
+        Err(LoadError::Contract(_))
+    ));
+    assert!(matches!(
+        WasmDriver::load_controlled_write_fixture(&manifest, &component),
+        Err(LoadError::Runtime(error)) if error.0.operation == "bind-write-v1"
+    ));
+    assert!(WasmDriver::load(MANIFEST, &component).is_ok());
+}
 
 #[derive(Clone, Copy, Debug)]
 enum Scenario {
