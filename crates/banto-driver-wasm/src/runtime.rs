@@ -14,6 +14,12 @@ use wasmtime::{Config, Engine, ResourceLimiter, Store, StoreLimits, StoreLimitsB
 
 wasmtime::component::bindgen!({ path: "wit", world: "driver" });
 
+/// The write-capable world is generated separately so the legacy read-only
+/// component remains loadable without a write export.
+pub(crate) mod write_v1 {
+    wasmtime::component::bindgen!({ path: "wit", world: "driver-with-write-v1" });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeCause {
     Trap,
@@ -109,18 +115,20 @@ pub(crate) struct HostState {
 pub struct Instance {
     pub store: Store<HostState>,
     pub driver: Driver,
+    pub write_driver: Option<write_v1::DriverWithWriteV1>,
 }
 
 pub struct Runtime {
     engine: Engine,
     component: Component,
+    write_requested: bool,
     diagnostics: Diagnostics,
     ticking: Arc<AtomicBool>,
     ticker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Runtime {
-    pub fn new(bytes: &[u8]) -> Result<Self, RuntimeError> {
+    pub fn new(bytes: &[u8], write_requested: bool) -> Result<Self, RuntimeError> {
         let mut config = Config::new();
         config.wasm_component_model(true).epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| classify("engine", e))?;
@@ -137,6 +145,7 @@ impl Runtime {
         Ok(Self {
             engine,
             component,
+            write_requested,
             diagnostics: Diagnostics(Arc::new(Mutex::new(VecDeque::new()))),
             ticking,
             ticker: Some(ticker),
@@ -162,9 +171,23 @@ impl Runtime {
         // One second, with a 10 ms epoch ticker. Calls have a bounded CPU budget.
         store.set_epoch_deadline(100);
         let linker = Linker::new(&self.engine);
-        let driver = Driver::instantiate(&mut store, &self.component, &linker)
+        // Resolve both worlds against one instance. A separate instantiation
+        // would give the write binding a different session.connection resource.
+        let component_instance = linker
+            .instantiate(&mut store, &self.component)
             .map_err(|e| self.record("instantiate", e))?;
-        Ok(Instance { store, driver })
+        let driver = Driver::new(&mut store, &component_instance)
+            .map_err(|e| self.record("bind-read", e))?;
+        let write_driver = self
+            .write_requested
+            .then(|| write_v1::DriverWithWriteV1::new(&mut store, &component_instance))
+            .transpose()
+            .map_err(|e| self.record("bind-write-v1", e))?;
+        Ok(Instance {
+            store,
+            driver,
+            write_driver,
+        })
     }
 
     pub fn record(&self, operation: &'static str, error: wasmtime::Error) -> RuntimeError {
@@ -247,7 +270,7 @@ mod tests {
         let bytes =
             std::fs::read(std::env::var("BANTO_COMPONENT_WASM").expect("BANTO_COMPONENT_WASM"))
                 .expect("component bytes");
-        let runtime = Runtime::new(&bytes).expect("component runtime");
+        let runtime = Runtime::new(&bytes, false).expect("component runtime");
         let mut instance = runtime.instantiate().expect("instance");
         instance.store.set_epoch_deadline(0);
         std::thread::sleep(Duration::from_millis(30));

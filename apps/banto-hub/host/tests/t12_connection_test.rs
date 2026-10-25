@@ -223,6 +223,7 @@ struct TestApp {
     /// directly (`connection_count`) - here to prove the connection-test
     /// endpoint's broker-reuse path does not dial a second session.
     sessions: Arc<HubSessions>,
+    write_control: Arc<WriteControl>,
     _env: TempEnv,
 }
 
@@ -252,13 +253,48 @@ async fn test_app_with_wasm(label: &str, component: &[u8]) -> TestApp {
 }
 
 async fn test_app_with_manifest(label: &str, manifest: &[u8], component: &[u8]) -> TestApp {
-    test_app_with_drivers(label, false, Some((manifest, component))).await
+    test_app_with_drivers(
+        label,
+        false,
+        Some(WasmFixture::ReadOnly {
+            manifest,
+            component,
+        }),
+    )
+    .await
+}
+
+async fn test_app_with_controlled_write_manifest(
+    label: &str,
+    manifest: &[u8],
+    component: &[u8],
+) -> TestApp {
+    test_app_with_drivers(
+        label,
+        false,
+        Some(WasmFixture::ControlledWrite {
+            manifest,
+            component,
+        }),
+    )
+    .await
+}
+
+enum WasmFixture<'a> {
+    ReadOnly {
+        manifest: &'a [u8],
+        component: &'a [u8],
+    },
+    ControlledWrite {
+        manifest: &'a [u8],
+        component: &'a [u8],
+    },
 }
 
 async fn test_app_with_drivers(
     label: &str,
     with_secret_driver: bool,
-    wasm_component: Option<(&[u8], &[u8])>,
+    wasm_component: Option<WasmFixture<'_>>,
 ) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
@@ -295,13 +331,27 @@ async fn test_app_with_drivers(
     let auth_for_test = auth.clone();
 
     let mut drivers = common::hub_drivers();
-    if let Some((manifest, component)) = wasm_component {
-        banto_drivers::register_wasm(
-            Arc::get_mut(&mut drivers.registry).unwrap(),
-            manifest,
-            component,
-        )
-        .expect("register WASM frame driver");
+    if let Some(wasm_component) = wasm_component {
+        let registry = Arc::get_mut(&mut drivers.registry).unwrap();
+        match wasm_component {
+            WasmFixture::ReadOnly {
+                manifest,
+                component,
+            } => {
+                banto_drivers::register_wasm(registry, manifest, component)
+                    .expect("register WASM frame driver");
+            }
+            WasmFixture::ControlledWrite {
+                manifest,
+                component,
+            } => {
+                let driver = banto_driver_wasm::WasmDriver::load_controlled_write_fixture(
+                    manifest, component,
+                )
+                .expect("load controlled WASM write fixture");
+                registry.register(DriverEntry::frame(driver)).unwrap();
+            }
+        }
     }
     if with_secret_driver {
         let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
@@ -375,7 +425,7 @@ async fn test_app_with_drivers(
         commissioning,
         events_tx,
         false,
-        write_control,
+        write_control.clone(),
         write_audit,
         mqtt,
         grpc_server,
@@ -391,6 +441,7 @@ async fn test_app_with_drivers(
         pool,
         manager,
         sessions,
+        write_control,
         _env: env,
     }
 }
@@ -1603,3 +1654,6 @@ mod device_address_test;
 
 #[path = "t12_slmp_wasm/mod.rs"]
 mod slmp_wasm_test;
+
+#[path = "t12_slmp_wasm_write/mod.rs"]
+mod slmp_wasm_write_test;

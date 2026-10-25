@@ -1,5 +1,5 @@
-//! Validation of the first read-only TCP component manifest. Native descriptor
-//! defaults do not apply to this input.
+//! Validation of TCP component manifests. Native descriptor defaults do not
+//! apply; a write declaration is only a request until its export is bound.
 
 use banto_driver_api::{Capabilities, DriverDescriptor, DriverId};
 use serde_json::Value;
@@ -7,6 +7,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
     pub descriptor: DriverDescriptor,
+    /// A request to negotiate the optional extension, never permission by itself.
+    pub requests_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,13 +57,25 @@ impl Manifest {
                 "initial WASM driver requires only tcp transport".into(),
             ));
         }
-        if object.get("capabilities").and_then(Value::as_array)
-            != Some(&vec![Value::String("read".into())])
-        {
-            return Err(ManifestError(
-                "initial WASM driver requires read-only capability".into(),
-            ));
-        }
+        let requests_write = match object.get("capabilities").and_then(Value::as_array) {
+            Some(values) if values == &vec![Value::String("read".into())] => {
+                if object.contains_key("writeApi") {
+                    return Err(ManifestError(
+                        "read-only manifest must omit writeApi".into(),
+                    ));
+                }
+                false
+            }
+            Some(values)
+                if values == &vec![Value::String("read".into()), Value::String("write".into())] =>
+            {
+                if object.get("writeApi").and_then(Value::as_str) != Some("1") {
+                    return Err(ManifestError("write capability requires writeApi 1".into()));
+                }
+                true
+            }
+            _ => return Err(ManifestError("unsupported WASM capabilities".into())),
+        };
         let id = DriverId::new(text("id")?).map_err(|e| ManifestError(e.to_string()))?;
         let plugin_version = text("version")?;
         semver::Version::parse(plugin_version)
@@ -81,7 +95,10 @@ impl Manifest {
                     .into(),
             );
         }
-        Ok(Self { descriptor })
+        Ok(Self {
+            descriptor,
+            requests_write,
+        })
     }
 }
 
@@ -124,5 +141,20 @@ mod tests {
             manifest["version"] = json!(invalid);
             assert!(Manifest::parse(&serde_json::to_vec(&manifest).unwrap()).is_err());
         }
+    }
+
+    #[test]
+    fn write_request_never_sets_descriptor_capability() {
+        let sample = include_bytes!("../tests/manifest.json");
+        let mut manifest: Value = serde_json::from_slice(sample).unwrap();
+        assert!(!Manifest::parse(sample).unwrap().requests_write);
+        manifest["capabilities"] = json!(["read", "write"]);
+        assert!(Manifest::parse(&serde_json::to_vec(&manifest).unwrap()).is_err());
+        manifest["writeApi"] = json!("1");
+        let parsed = Manifest::parse(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert!(parsed.requests_write);
+        assert!(!parsed.descriptor.capabilities.write);
+        manifest["capabilities"] = json!(["read"]);
+        assert!(Manifest::parse(&serde_json::to_vec(&manifest).unwrap()).is_err());
     }
 }
