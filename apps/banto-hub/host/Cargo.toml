@@ -65,7 +65,7 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 tempfile = "3"
 # `net` は空きポートの探索と TCP のプローブ、`test-util` は core と同じ（仮想時計）。
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "sync", "test-util"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "sync", "test-util"] }
 axum = { workspace = true, features = ["ws"] }
 tower = { workspace = true, features = ["util"] }
 serde_json = { workspace = true }

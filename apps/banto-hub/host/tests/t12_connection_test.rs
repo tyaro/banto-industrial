@@ -1600,3 +1600,6 @@ async fn drivers_list_needs_a_session_and_a_viewer_may_read_it() {
 
 #[path = "t12_device_address/mod.rs"]
 mod device_address_test;
+
+#[path = "t12_slmp_wasm/mod.rs"]
+mod slmp_wasm_test;
