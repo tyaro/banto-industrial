@@ -96,7 +96,7 @@ impl WasmDriver {
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Keep previously registered U16-only guests usable while accepting
-        // the canonical U16/U32 guest. No other capability is in this contract.
+        // U16/U32 guests. Other value kinds need their own boundary contract.
         if supported != [KindName::Numeric(DataType::U16)]
             && supported
                 != [
@@ -105,7 +105,7 @@ impl WasmDriver {
                 ]
         {
             return Err(LoadError::Contract(
-                "WASM FC3 component must support U16 or U16 and U32".into(),
+                "WASM component must support U16 or U16 and U32".into(),
             ));
         }
         let secrets = instance
@@ -205,8 +205,8 @@ fn validate_secret_fields(fields: &[SettingField], secrets: &[String]) -> Result
     Ok(())
 }
 
-/// Check guest-reported address metadata before passing it to the Hub. The
-/// FC3 supports one U16 register or two U32 registers at a numeric offset.
+/// Check protocol-independent address metadata before passing it to the Hub.
+/// The guest owns the grammar, area, and device-specific index limits.
 fn checked_parsed_address(
     driver: &DriverId,
     kind: &TagKind,
@@ -215,47 +215,34 @@ fn checked_parsed_address(
     let expected_words: u16 = match kind {
         TagKind::Numeric(DataType::U16) => 1,
         TagKind::Numeric(DataType::U32) => 2,
-        _ => return Err(AddressError::new("WASM FC3 supports only U16 and U32")),
+        _ => return Err(AddressError::new("WASM guest supports only U16 and U32")),
     };
-    if parsed.area != "holding_register"
-        || !parsed.writable_area
+    if parsed.canonical.is_empty()
+        || parsed.area.is_empty()
         || parsed.word_count != u32::from(expected_words)
         || parsed.bit.is_some()
     {
         return Err(AddressError::new(
-            "WASM FC3 address metadata violates the register contract",
+            "WASM address metadata violates the tag contract",
         ));
     }
-    let digits = parsed
-        .canonical
-        .strip_prefix('4')
-        .ok_or_else(|| AddressError::new("WASM FC3 canonical address is invalid"))?;
-    if digits.len() != 5 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(AddressError::new("WASM FC3 canonical address is invalid"));
+    if parsed
+        .index
+        .is_some_and(|index| index.checked_add(u64::from(expected_words - 1)).is_none())
+    {
+        return Err(AddressError::new("WASM address range overflows"));
     }
-    let number = digits
-        .parse::<u32>()
-        .map_err(|_| AddressError::new("WASM FC3 canonical address is invalid"))?;
-    let offset = number
-        .checked_sub(1)
-        .and_then(|n| u16::try_from(n).ok())
-        .ok_or_else(|| AddressError::new("WASM FC3 canonical address is out of range"))?;
-    if expected_words == 2 && offset == u16::MAX {
-        return Err(AddressError::new("WASM FC3 U32 exceeds the register range"));
-    }
-    if parsed.index != Some(u64::from(offset)) {
-        return Err(AddressError::new(
-            "WASM FC3 canonical address and index disagree",
-        ));
-    }
-    Ok(DriverAddress::new(
+    let mut address = DriverAddress::new(
         driver.clone(),
         parsed.canonical,
         parsed.area,
         parsed.writable_area,
         expected_words,
-    )
-    .with_index(u64::from(offset)))
+    );
+    if let Some(index) = parsed.index {
+        address = address.with_index(index);
+    }
+    Ok(address)
 }
 
 fn wit_settings(settings: &Settings) -> Vec<types::Setting> {
@@ -355,7 +342,9 @@ fn wit_planned(planned: &Planned) -> Result<read::Planned, FatalError> {
     })
 }
 
-fn checked_fc3_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
+/// Keep the requested kind's variant and exact numeric range checks at the
+/// WASM boundary; the engine's RawValue conversion is not a substitute.
+fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
     let max = match kind {
         TagKind::Numeric(DataType::U16) => u64::from(u16::MAX),
         TagKind::Numeric(DataType::U32) => u64::from(u32::MAX),
@@ -368,7 +357,7 @@ fn checked_fc3_value(kind: &TagKind, value: types::Value) -> Result<RawValue, Fa
     match value {
         types::Value::Uint(n) if n <= max => Ok(RawValue::Uint(n)),
         _ => Err(FatalError::Protocol(
-            "WASM FC3 result has wrong type or range".into(),
+            "WASM result has wrong type or range".into(),
         )),
     }
 }
@@ -412,6 +401,28 @@ impl DriverBase for WasmDriver {
             })
             .map_err(|e| AddressError::new(e.to_string()))?
             .map_err(AddressError::new)?;
+        // The guest defines its grammar. Round-trip its canonical form instead
+        // of imposing a Modbus spelling or deriving an index in the host.
+        let round_trip = self
+            .with_instance("address.parse", |i| {
+                i.driver.banto_driver_address().call_parse(
+                    &mut i.store,
+                    &result.canonical,
+                    &data_type,
+                    string_words,
+                )
+            })
+            .map_err(|e| AddressError::new(e.to_string()))?
+            .map_err(AddressError::new)?;
+        if result.canonical != round_trip.canonical
+            || result.area != round_trip.area
+            || result.writable_area != round_trip.writable_area
+            || result.bit != round_trip.bit
+            || result.word_count != round_trip.word_count
+            || result.index != round_trip.index
+        {
+            return Err(AddressError::new("WASM canonical address is not stable"));
+        }
         checked_parsed_address(&self.descriptor.id, kind, result)
     }
 
@@ -588,6 +599,11 @@ impl FrameConnection for WasmConnection {
                 )
             })?
             .map_err(api_fatal)?;
+        if decoded.len() != planned.covers.len() {
+            return Err(FatalError::Protocol(
+                "WASM returned a different number of results than planned".into(),
+            ));
+        }
         decoded
             .into_iter()
             .enumerate()
@@ -600,7 +616,7 @@ impl FrameConnection for WasmConnection {
                         .ok_or_else(|| {
                             FatalError::Protocol("WASM returned a result outside covers".into())
                         })?;
-                    checked_fc3_value(&spec.kind, value).map(Ok)
+                    checked_value(&spec.kind, value).map(Ok)
                 }
                 Err(types::ItemError::Device(e)) => Ok(Err(ItemError::Device(
                     api::DeviceError::new(e.code, e.message),
@@ -635,28 +651,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fc3_boundary_checks_variant_and_range() {
+    fn boundary_checks_variant_and_range() {
         let u16_kind = TagKind::numeric(DataType::U16);
         let u32_kind = TagKind::numeric(DataType::U32);
         assert_eq!(
-            checked_fc3_value(&u16_kind, types::Value::Uint(0)).unwrap(),
+            checked_value(&u16_kind, types::Value::Uint(0)).unwrap(),
             RawValue::Uint(0)
         );
         assert_eq!(
-            checked_fc3_value(&u16_kind, types::Value::Uint(65535)).unwrap(),
+            checked_value(&u16_kind, types::Value::Uint(65535)).unwrap(),
             RawValue::Uint(65535)
         );
         assert_eq!(
-            checked_fc3_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX))).unwrap(),
+            checked_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX))).unwrap(),
             RawValue::Uint(u64::from(u32::MAX))
         );
-        assert!(checked_fc3_value(&u16_kind, types::Value::Uint(65536)).is_err());
-        assert!(checked_fc3_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX) + 1)).is_err());
-        assert!(checked_fc3_value(&u32_kind, types::Value::Int(1)).is_err());
-        assert!(checked_fc3_value(&u16_kind, types::Value::Float(1.0)).is_err());
-        assert!(
-            checked_fc3_value(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err()
-        );
+        assert!(checked_value(&u16_kind, types::Value::Uint(65536)).is_err());
+        assert!(checked_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX) + 1)).is_err());
+        assert!(checked_value(&u32_kind, types::Value::Int(1)).is_err());
+        assert!(checked_value(&u16_kind, types::Value::Float(1.0)).is_err());
+        assert!(checked_value(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err());
     }
 
     fn parsed() -> address::Parsed {
@@ -671,7 +685,7 @@ mod tests {
     }
 
     #[test]
-    fn fc3_parsed_address_metadata_is_checked() {
+    fn parsed_address_metadata_is_generic_but_bounded() {
         let driver = DriverId::new("modbus-fc3-wasm").unwrap();
         let kind = TagKind::numeric(DataType::U16);
         let valid = checked_parsed_address(&driver, &kind, parsed()).unwrap();
@@ -683,20 +697,21 @@ mod tests {
         let mut wrong = parsed();
         wrong.bit = Some(1);
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut other = parsed();
+        other.canonical = "X:1F".into();
+        other.area = "X".into();
+        other.writable_area = false;
+        other.index = Some(31);
+        let accepted = checked_parsed_address(&driver, &kind, other).unwrap();
+        assert_eq!(accepted.canonical, "X:1F");
+        assert_eq!(accepted.area, "X");
+        assert_eq!(accepted.index, Some(31));
+        assert!(!accepted.writable_area);
         let mut wrong = parsed();
-        wrong.area = "coil".into();
+        wrong.canonical.clear();
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
         let mut wrong = parsed();
-        wrong.writable_area = false;
-        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
-        let mut wrong = parsed();
-        wrong.index = Some(1);
-        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
-        let mut wrong = parsed();
-        wrong.canonical = "400002".into();
-        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
-        let mut wrong = parsed();
-        wrong.canonical = "40001".into();
+        wrong.area.clear();
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
         assert!(
             checked_parsed_address(&driver, &TagKind::numeric(DataType::I16), parsed()).is_err()
@@ -708,11 +723,10 @@ mod tests {
         let valid = checked_parsed_address(&driver, &u32_kind, two_words.clone()).unwrap();
         assert_eq!(valid.word_count, 2);
         assert!(checked_parsed_address(&driver, &u32_kind, parsed()).is_err());
-        two_words.canonical = "465535".into();
-        two_words.index = Some(65_534);
+        two_words.canonical = "X:FFFF".into();
+        two_words.index = Some(u64::MAX - 1);
         assert!(checked_parsed_address(&driver, &u32_kind, two_words.clone()).is_ok());
-        two_words.canonical = "465536".into();
-        two_words.index = Some(65_535);
+        two_words.index = Some(u64::MAX);
         assert!(checked_parsed_address(&driver, &u32_kind, two_words).is_err());
     }
 

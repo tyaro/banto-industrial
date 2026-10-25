@@ -446,6 +446,23 @@ jobs:
           if (-not (Select-String -Path $testLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'WASM Hub connection test did not run exactly once'
           }
+          $fixture = 'crates/banto-driver-wasm/tests/fixtures/device-address'
+          cargo +1.98.1 build --manifest-path (Join-Path $fixture 'Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'device-address test guest build failed' }
+          $deviceModule = Join-Path $fixture 'target/wasm32-unknown-unknown/debug/banto_device_address_test_component.wasm'
+          $env:BANTO_DEVICE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'device-address-component.wasm'
+          wasm-tools component new $deviceModule -o $env:BANTO_DEVICE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'device-address component creation failed' }
+          wasm-tools validate $env:BANTO_DEVICE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'device-address component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_DEVICE_COMPONENT_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'device-address component world mismatch' }
+          $deviceTestLog = Join-Path $env:RUNNER_TEMP 'wasm-device-address-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test device_address_test::saves_collects_reads_now_and_reuses_broker --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $deviceTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'device-address Hub test failed' }
+          if (-not (Select-String -Path $deviceTestLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'device-address Hub test did not run exactly once'
+          }
           $componentTestLog = Join-Path $env:RUNNER_TEMP 'wasm-component-test.txt'
           cargo +1.98.1 test -p banto-driver-wasm --test component --locked -- --ignored 2>&1 | Tee-Object -FilePath $componentTestLog
           if ($LASTEXITCODE -ne 0) { throw 'WASM component adapter tests failed' }
