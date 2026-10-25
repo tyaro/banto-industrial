@@ -2,7 +2,8 @@
 //! This fixture only listens on loopback and never contacts a PLC.
 
 use super::*;
-use banto_driver_api::{DataType, TagSpec};
+use banto_collect::current::Quality;
+use banto_driver_api::{DataType, ItemError, RawValue, TagSpec};
 use banto_driver_wasm::WasmDriver;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -25,6 +26,8 @@ enum Scenario {
     ReadRefused,
     ReadFraming,
     RZero,
+    Multi,
+    MultiItemRefusal,
 }
 
 #[derive(Clone, Debug)]
@@ -73,6 +76,7 @@ struct SlmpFixture {
     connections: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<Request>>>,
     clients: Arc<Mutex<Vec<JoinHandle<()>>>>,
+    version: Arc<AtomicUsize>,
     listener: JoinHandle<()>,
 }
 
@@ -83,15 +87,18 @@ impl SlmpFixture {
         let connections = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let clients = Arc::new(Mutex::new(Vec::new()));
+        let version = Arc::new(AtomicUsize::new(0));
         let counts = connections.clone();
         let events = requests.clone();
         let handlers = clients.clone();
+        let reply_version = version.clone();
         let listener = tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let connection = counts.fetch_add(1, Ordering::SeqCst) + 1;
                 let events = events.clone();
+                let version = reply_version.clone();
                 let handler = tokio::spawn(async move {
-                    serve_connection(stream, connection, scenario, events).await;
+                    serve_connection(stream, connection, scenario, events, version).await;
                 });
                 handlers.lock().unwrap().push(handler);
             }
@@ -101,6 +108,7 @@ impl SlmpFixture {
             connections,
             requests,
             clients,
+            version,
             listener,
         }
     }
@@ -118,6 +126,10 @@ impl SlmpFixture {
             client.abort();
         }
     }
+
+    fn set_version(&self, version: usize) {
+        self.version.store(version, Ordering::SeqCst);
+    }
 }
 
 impl Drop for SlmpFixture {
@@ -132,6 +144,7 @@ async fn serve_connection(
     connection: usize,
     scenario: Scenario,
     requests: Arc<Mutex<Vec<Request>>>,
+    version: Arc<AtomicUsize>,
 ) {
     loop {
         let mut head = [0; 13];
@@ -149,7 +162,8 @@ async fn serve_connection(
         }
         let request = Request::from_bytes(connection, &frame);
         requests.lock().unwrap().push(request.clone());
-        let (end_code, body, bad_serial) = reply(scenario, &request);
+        let (end_code, body, bad_serial) =
+            reply(scenario, &request, version.load(Ordering::SeqCst));
         let response = wire_response(&frame, end_code, &body, bad_serial);
         if stream.write_all(&response).await.is_err() {
             return;
@@ -176,7 +190,7 @@ fn model(name: &str, code: u16) -> Vec<u8> {
     body
 }
 
-fn reply(scenario: Scenario, request: &Request) -> (u16, Vec<u8>, bool) {
+fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>, bool) {
     match (request.command, request.device) {
         (0x0101, None) => match scenario {
             Scenario::R | Scenario::RZero => (0, model("R04CPU", 0x4800), false),
@@ -202,6 +216,12 @@ fn reply(scenario: Scenario, request: &Request) -> (u16, Vec<u8>, bool) {
         (0x0401, Some(0xa8)) => match scenario {
             Scenario::ReadRefused => (0xc05b, vec![], false),
             Scenario::ReadFraming => (0, 42u16.to_le_bytes().to_vec(), true),
+            Scenario::MultiItemRefusal if request.start == Some(1) => (0xc05b, vec![], false),
+            Scenario::Multi | Scenario::MultiItemRefusal => {
+                let value = u16::try_from(request.connection * 1_000 + version * 100).unwrap()
+                    + u16::try_from(request.start.unwrap()).unwrap();
+                (0, value.to_le_bytes().to_vec(), false)
+            }
             _ => {
                 let value: u16 = match request.start.unwrap() {
                     31 => 0xabcd,
@@ -248,6 +268,74 @@ fn commands(requests: &[Request], connection: usize) -> Vec<Command> {
             )
         })
         .collect()
+}
+
+async fn multi_collection(app: &TestApp, fixture: &SlmpFixture, period_ms: i64) -> [i64; 3] {
+    let settings = json!({"host":"127.0.0.1", "port":fixture.addr.port()});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(ConnectionSettingsInput {
+            name: "slmp-multi-line".into(),
+            protocol: PROTOCOL.into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group =
+        CollectionGroupService::with_registry(app.pool.clone(), app.manager.registry().clone())
+            .create(group_input("slmp-multi-group", saved.id, period_ms))
+            .await
+            .unwrap();
+    let mut ids = [0; 3];
+    for (index, (name, address)) in [("first", "D0"), ("second", "D1"), ("unknown", "D100")]
+        .into_iter()
+        .enumerate()
+    {
+        ids[index] = app
+            .manager
+            .tags()
+            .create(tag_input(name, group.id, address, "u16"))
+            .await
+            .unwrap()
+            .id;
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut watch = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        watch.wait_for(|status| *status == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    ids
+}
+
+async fn wait_multi_values(app: &TestApp, ids: [i64; 3], expected: [(Option<f64>, Quality); 3]) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let actual = ids.map(|id| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .map(|sample| (sample.value, sample.quality))
+            });
+            if actual == expected.map(Some) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("three separately decoded SLMP tag values");
+}
+
+fn multi_path(name: &str) -> String {
+    format!("/api/v1/values/slmp-multi-line.slmp-multi-group.{name}")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -468,7 +556,8 @@ async fn device_refusal_differs_from_framing_fatal_and_r_outside_suppresses_send
             "protocol",
             1,
         ),
-        (Scenario::RZero, "t12-slmp-wasm-r-outside", "protocol", 2),
+        // Uncovered R addresses become a per-item Unsupported in the Host.
+        (Scenario::RZero, "t12-slmp-wasm-r-outside", "device", 2),
     ] {
         let fixture = SlmpFixture::start(scenario).await;
         let app = app(label).await;
@@ -487,9 +576,180 @@ async fn device_refusal_differs_from_framing_fatal_and_r_outside_suppresses_send
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned multi-tag SLMP component"]
+async fn multiple_tags_collect_and_read_now_returns_a_fresh_value() {
+    let fixture = SlmpFixture::start(Scenario::Multi).await;
+    let app = app("t12-slmp-wasm-multi-fresh").await;
+    // A long period keeps the cached sample fixed while read-now uses the broker.
+    let ids = multi_collection(&app, &fixture, 10_000).await;
+    wait_multi_values(
+        &app,
+        ids,
+        [
+            (Some(1_000.0), Quality::Good),
+            (Some(1_001.0), Quality::Good),
+            (Some(1_100.0), Quality::Good),
+        ],
+    )
+    .await;
+    assert_eq!(fixture.connection_count(), 1);
+    let events = fixture.requests();
+    assert!(events.len() >= 5, "{events:?}");
+    assert_eq!(
+        commands(&events, 1)[..5],
+        [
+            (0x0101, None, None, None),
+            (0x0401, Some(0xa9), Some(302), Some(1)),
+            (0x0401, Some(0xa8), Some(0), Some(1)),
+            (0x0401, Some(0xa8), Some(1), Some(1)),
+            (0x0401, Some(0xa8), Some(100), Some(1)),
+        ]
+    );
+    for address in [0, 1, 100] {
+        assert!(events[2..].iter().any(|request| {
+            request.connection == 1
+                && request.device == Some(0xa8)
+                && request.start == Some(address)
+                && request.count == Some(1)
+                && request.subcommand == 0
+        }));
+    }
+    for (name, value) in [
+        ("first", 1_000.0),
+        ("second", 1_001.0),
+        ("unknown", 1_100.0),
+    ] {
+        let (status, body) = admin_get(&app.router, &multi_path(name), &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["v"], value, "{name}: {body:?}");
+        assert_eq!(body["q"], "good", "{name}: {body:?}");
+    }
+
+    fixture.set_version(1);
+    let before = fixture.requests().len();
+    let path = multi_path("second");
+    let (status, body) =
+        admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(
+        body["v"], 1_101.0,
+        "read-now must not return the cached 1001"
+    );
+    assert_eq!(body["q"], "good");
+    assert_eq!(fixture.connection_count(), 1, "read-now reuses the broker");
+    let later = fixture.requests();
+    assert_eq!(
+        later.len(),
+        before + 1,
+        "read-now must issue one fresh read"
+    );
+    assert_eq!(later[before].device, Some(0xa8));
+    assert_eq!(later[before].start, Some(1));
+    let (status, cached) = admin_get(&app.router, &path, &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["v"], 1_001.0, "read-now must not alter the cache");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned multi-tag SLMP component"]
+async fn one_device_refusal_marks_only_its_tag_bad() {
+    let fixture = SlmpFixture::start(Scenario::MultiItemRefusal).await;
+    let app = app("t12-slmp-wasm-multi-refusal").await;
+    let ids = multi_collection(&app, &fixture, 1_000).await;
+    wait_multi_values(
+        &app,
+        ids,
+        [
+            (Some(1_000.0), Quality::Good),
+            (None, Quality::Bad),
+            (Some(1_100.0), Quality::Good),
+        ],
+    )
+    .await;
+    assert_eq!(fixture.connection_count(), 1, "item refusal is not fatal");
+    let events = fixture.requests();
+    assert!(events.iter().any(|event| event.start == Some(1)));
+    assert!(events.iter().any(|event| event.start == Some(100)));
+    for (name, expected) in [
+        ("first", Some(1_000.0)),
+        ("second", None),
+        ("unknown", Some(1_100.0)),
+    ] {
+        let (status, body) = admin_get(&app.router, &multi_path(name), &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["v"].as_f64(), expected, "{name}: {body:?}");
+        assert_eq!(body["q"], if expected.is_some() { "good" } else { "bad" });
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned multi-tag SLMP component"]
+async fn reconnect_rediscovers_and_refreshes_all_tags_on_one_new_connection() {
+    let fixture = SlmpFixture::start(Scenario::Multi).await;
+    let app = app("t12-slmp-wasm-multi-reconnect").await;
+    let ids = multi_collection(&app, &fixture, 500).await;
+    wait_multi_values(
+        &app,
+        ids,
+        [
+            (Some(1_000.0), Quality::Good),
+            (Some(1_001.0), Quality::Good),
+            (Some(1_100.0), Quality::Good),
+        ],
+    )
+    .await;
+    fixture.close_clients();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if fixture.connection_count() >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("broker reconnects after socket close");
+    wait_multi_values(
+        &app,
+        ids,
+        [
+            (Some(2_000.0), Quality::Good),
+            (Some(2_001.0), Quality::Good),
+            (Some(2_100.0), Quality::Good),
+        ],
+    )
+    .await;
+    let events: Vec<_> = fixture
+        .requests()
+        .into_iter()
+        .filter(|request| request.connection == 2)
+        .collect();
+    assert!(events.len() >= 5, "{events:?}");
+    assert_eq!(
+        commands(&events, 2)[..5],
+        [
+            (0x0101, None, None, None),
+            (0x0401, Some(0xa9), Some(302), Some(1)),
+            (0x0401, Some(0xa8), Some(0), Some(1)),
+            (0x0401, Some(0xa8), Some(1), Some(1)),
+            (0x0401, Some(0xa8), Some(100), Some(1)),
+        ],
+        "new physical connection must discover before reading tags"
+    );
+    for address in [0, 1, 100] {
+        assert!(events[2..].iter().any(|request| {
+            request.device == Some(0xa8)
+                && request.start == Some(address)
+                && request.count == Some(1)
+                && request.subcommand == 0
+        }));
+    }
+}
+
 #[test]
 #[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned SLMP component"]
-fn two_tags_are_rejected_before_any_read_step_is_planned() {
+fn multiple_tags_plan_separate_requests_and_keep_result_indices() {
     let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
     let driver = WasmDriver::load(MANIFEST, &component).unwrap();
     let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "5000")]).unwrap();
@@ -500,10 +760,38 @@ fn two_tags_are_rejected_before_any_read_step_is_planned() {
     let count = wire_response(&sd_step.send, 0, &100u16.to_le_bytes(), false);
     assert!(connection.handshake_next(Some(&count)).unwrap().is_none());
     let kind = TagKind::numeric(DataType::U16);
-    let specs = ["D0", "D1"]
+    // Deliberately different from address order: covers must refer to input indices.
+    let specs = ["D1", "D0", "D100"]
         .map(|text| TagSpec::new(driver.parse_address(text, &kind).unwrap(), kind.clone()));
-    let error = connection.plan_read(&specs).unwrap_err();
-    assert!(
-        matches!(error, FatalError::InvalidConfig(message) if message.contains("exactly one D tag"))
-    );
+    let planned = connection.plan_read(&specs).unwrap();
+    assert_eq!(planned.len(), 3, "one D/u16 request per tag");
+    let mut seen = [false; 3];
+    for item in planned {
+        assert_eq!(
+            item.covers.len(),
+            1,
+            "no known/Unknown mixing in one request"
+        );
+        let index = item.covers[0] as usize;
+        assert!(index < specs.len());
+        assert!(!seen[index], "duplicate result index {index}");
+        seen[index] = true;
+        let request = Request::from_bytes(1, &item.step.send);
+        assert_eq!(request.device, Some(0xa8));
+        assert_eq!(request.start, Some([1, 0, 100][index]));
+        assert_eq!(request.count, Some(1));
+        let response = if index == 0 {
+            wire_response(&item.step.send, 0xc05b, &[], false)
+        } else {
+            wire_response(&item.step.send, 0, &[21, 0], false)
+        };
+        let decoded = connection.decode_read(&item, &specs, &response).unwrap();
+        assert_eq!(decoded.len(), 1);
+        if index == 0 {
+            assert!(matches!(&decoded[0], Err(ItemError::Device(error)) if error.code == 0xc05b));
+        } else {
+            assert_eq!(decoded[0], Ok(RawValue::Uint(21)));
+        }
+    }
+    assert_eq!(seen, [true; 3]);
 }
