@@ -536,7 +536,7 @@ jobs:
           $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpWriteTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM controlled write Hub tests failed' }
-          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM controlled write Hub tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。

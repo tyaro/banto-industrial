@@ -29,6 +29,7 @@ enum Peer {
 struct Fixture {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<(u16, u32)>>>,
+    d_reads: Arc<Mutex<Vec<(u32, u16)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -38,6 +39,8 @@ impl Fixture {
         let address = listener.local_addr().unwrap();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let events = commands.clone();
+        let d_reads = Arc::new(Mutex::new(Vec::new()));
+        let reads = d_reads.clone();
         let task = tokio::spawn(async move {
             let (mut socket, _) = listener.accept().await.unwrap();
             loop {
@@ -94,10 +97,11 @@ impl Fixture {
                         }
                     }
                     0x0401 => {
-                        let count_offset = if subcommand == 2 { 25 } else { 24 };
+                        let count_offset = if subcommand == 2 { 25 } else { 23 };
                         let count =
                             u16::from_le_bytes([request[count_offset], request[count_offset + 1]]);
                         assert!((1..=960).contains(&count));
+                        reads.lock().unwrap().push((start, count));
                         (0, 7u16.to_le_bytes().repeat(usize::from(count)))
                     }
                     0x1401 => {
@@ -136,12 +140,17 @@ impl Fixture {
         Self {
             address,
             commands,
+            d_reads,
             task,
         }
     }
 
     fn commands(&self) -> Vec<(u16, u32)> {
         self.commands.lock().unwrap().clone()
+    }
+
+    fn d_reads(&self) -> Vec<(u32, u16)> {
+        self.d_reads.lock().unwrap().clone()
     }
 }
 
@@ -180,6 +189,23 @@ fn item(driver: &WasmDriver, address: &str, value: f64) -> WriteItem {
     let kind = TagKind::numeric(DataType::U16);
     let parsed = driver.parse_address(address, &kind).unwrap();
     WriteItem::new(TagSpec::new(parsed, kind), DriverValue::F64(value))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
+async fn q_and_r_two_word_reads_use_their_respective_count_offsets() {
+    for peer in [Peer::Q, Peer::R] {
+        let (fixture, driver, mut session) = connected_session(peer).await;
+        let kind = TagKind::numeric(DataType::U16);
+        let specs = ["D3010", "D3011"].map(|address| {
+            TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind.clone())
+        });
+        assert_eq!(
+            session.read_batch(&specs).await.unwrap(),
+            vec![Ok(DriverValue::F64(7.0)), Ok(DriverValue::F64(7.0))]
+        );
+        assert_eq!(fixture.d_reads(), vec![(3010, 2)]);
+    }
 }
 
 #[test]
