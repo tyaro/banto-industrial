@@ -31,6 +31,9 @@ enum Scenario {
     Multi,
     MultiItemRefusal,
     BatchRefusal,
+    Q25Prh,
+    Q25PrhWrongName,
+    Q25PrhWrongCode,
     LargeSplit,
     LargeShort,
     LargeOverlong,
@@ -241,6 +244,9 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
     match (request.command, request.device) {
         (0x0101, None) => match scenario {
             Scenario::R | Scenario::RZero => (0, model("R04CPU", 0x4800), false),
+            Scenario::Q25Prh => (0, model("Q25PRHCPU", 0x004c), false),
+            Scenario::Q25PrhWrongName => (0, model("Q25PRXCPU", 0x004c), false),
+            Scenario::Q25PrhWrongCode => (0, model("Q25PRHCPU", 0x004d), false),
             Scenario::UnknownModel => (0, model("RCPU", 0x0360), false),
             Scenario::TypeRefused => (0xc05b, vec![], false),
             Scenario::TypeFraming => (0, model("Q02UCPU", 0x0263), true),
@@ -280,6 +286,17 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
                     body.extend_from_slice(&(1000 + offset).to_le_bytes());
                 }
                 (0, body, false)
+            }
+            Scenario::Q25Prh => {
+                let value = match request.start {
+                    Some(0) => 42u16, // connection-test probe
+                    Some(3000 | 3001) if request.count == Some(1) => {
+                        u16::try_from(request.connection * 1_000 + version * 100).unwrap()
+                            + u16::try_from(request.start.unwrap() - 3000).unwrap()
+                    }
+                    _ => return (0xc05b, vec![], false),
+                };
+                (0, value.to_le_bytes().to_vec(), false)
             }
             Scenario::Multi | Scenario::MultiItemRefusal | Scenario::BatchRefusal => {
                 let start = request.start.unwrap();
@@ -587,6 +604,172 @@ async fn unknown_model_and_type_refusal_stop_before_sd_or_tag_read() {
             vec![(0x0101, None, None, None)]
         );
         // handshake-next completed, but the guest cannot choose Q/R 0401 framing.
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned Q25PRH-capable SLMP component"]
+async fn q25prh_unknown_range_collects_individual_values_and_read_now() {
+    let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
+    let driver = WasmDriver::load(MANIFEST, &component).unwrap();
+    let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "5000")]).unwrap();
+    let mut connection = driver.create_connection(&settings).unwrap();
+    let type_step = connection.handshake_next(None).unwrap().unwrap();
+    assert_eq!(Request::from_bytes(1, &type_step.send).command, 0x0101);
+    let type_response = wire_response(&type_step.send, 0, &model("Q25PRHCPU", 0x004c), false);
+    assert!(
+        connection
+            .handshake_next(Some(&type_response))
+            .unwrap()
+            .is_none(),
+        "Q25PRHCPU must not use the standard-Q SD range map"
+    );
+    let kind = TagKind::numeric(DataType::U16);
+    let specs = ["D3000", "D3001"]
+        .map(|address| TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind.clone()));
+    let planned = connection.plan_read(&specs).unwrap();
+    assert_eq!(
+        planned.len(),
+        2,
+        "adjacent tags with Unknown range stay separate"
+    );
+    for (index, plan) in planned.iter().enumerate() {
+        assert_eq!(plan.covers.as_slice(), &[index as u32]);
+        let request = Request::from_bytes(1, &plan.step.send);
+        assert_eq!(request.device, Some(0xa8));
+        assert_eq!(request.start, Some(3000 + index as u32));
+        assert_eq!(request.count, Some(1));
+        assert_eq!(request.subcommand, 0, "Q word wire");
+    }
+
+    let fixture = SlmpFixture::start(Scenario::Q25Prh).await;
+    let app = app("t12-slmp-wasm-q25prh").await;
+    let settings = json!({"host":"127.0.0.1", "port":fixture.addr.port()});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(ConnectionSettingsInput {
+            name: "q25-line".into(),
+            protocol: PROTOCOL.into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group =
+        CollectionGroupService::with_registry(app.pool.clone(), app.manager.registry().clone())
+            .create(group_input("q25-group", saved.id, 1_000))
+            .await
+            .unwrap();
+    let mut ids = [0; 2];
+    for (index, (name, address)) in [("first", "D3000"), ("second", "D3001")]
+        .into_iter()
+        .enumerate()
+    {
+        ids[index] = app
+            .manager
+            .tags()
+            .create(tag_input(name, group.id, address, "u16"))
+            .await
+            .unwrap()
+            .id;
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut watch = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        watch.wait_for(|status| *status == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let collected = tokio::time::timeout(Duration::from_secs(6), async {
+        loop {
+            let values = ids.map(|id| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .map(|sample| (sample.value, sample.quality))
+            });
+            if values
+                == [
+                    Some((Some(1_000.0), Quality::Good)),
+                    Some((Some(1_001.0), Quality::Good)),
+                ]
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(
+        collected.is_ok(),
+        "Q25PRH collection: requests={:?}, values={:?}",
+        fixture.requests(),
+        ids.map(|id| app
+            .manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}"))))
+    );
+    assert_eq!(fixture.connection_count(), 1);
+    let events = fixture.requests();
+    assert_eq!(
+        commands(&events, 1),
+        [
+            (0x0101, None, None, None),
+            (0x0401, Some(0xa8), Some(3000), Some(1)),
+            (0x0401, Some(0xa8), Some(3001), Some(1)),
+        ],
+        "no SD or adjacent D batch may be sent"
+    );
+    assert!(events[1..].iter().all(|request| request.subcommand == 0));
+
+    let path = "/api/v1/values/q25-line.q25-group.second";
+    let (status, cached) = admin_get(&app.router, path, &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{cached:?}");
+    assert_eq!(cached["v"], 1_001.0);
+    assert_eq!(cached["q"], "good");
+    fixture.set_version(1);
+    let (status, fresh) =
+        admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK, "{fresh:?}");
+    assert_eq!(fresh["v"], 1_101.0);
+    assert_eq!(fresh["q"], "good");
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "read-now must reuse the broker"
+    );
+    let events = fixture.requests();
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        (events[3].device, events[3].start, events[3].count),
+        (Some(0xa8), Some(3001), Some(1))
+    );
+    let (status, cached) = admin_get(&app.router, path, &app.admin_token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cached["v"], 1_001.0, "read-now does not rewrite the cache");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned Q25PRH-capable SLMP component"]
+async fn q25prh_mismatched_name_or_code_suppresses_sd_and_d_reads() {
+    for (scenario, label) in [
+        (Scenario::Q25PrhWrongName, "t12-slmp-wasm-q25-wrong-name"),
+        (Scenario::Q25PrhWrongCode, "t12-slmp-wasm-q25-wrong-code"),
+    ] {
+        let fixture = SlmpFixture::start(scenario).await;
+        let app = app(label).await;
+        let body = connection_test(&app, &fixture).await;
+        assert_eq!(body["ok"], false, "{scenario:?}: {body:?}");
+        assert_eq!(body["error"]["kind"], "protocol", "{body:?}");
+        assert_eq!(
+            commands(&fixture.requests(), 1),
+            [(0x0101, None, None, None)]
+        );
     }
 }
 
