@@ -1012,7 +1012,7 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.equal(jobs.run_rust, true);
 	assert.ok(jobs.rust_args.includes('-p banto-hub-host'));
 	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
-	const start = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
+	const start = workflow.indexOf('      - name: test (WASM Hub components)');
 	const end = workflow.indexOf('      # crate ごとのビルド時間', start);
 	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
 	const step = workflow.slice(start, end);
@@ -1215,7 +1215,7 @@ test('WASM FC3 の wasm-tools は固定版の検証済みバイナリを fallbac
 	const installStart = workflow.indexOf(
 		'      - name: Install wasm-tools 1.262.0 (verified binary)'
 	);
-	const testStart = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
+	const testStart = workflow.indexOf('      - name: test (WASM Hub components)');
 	assert.ok(installStart !== -1 && testStart > installStart);
 	const install = workflow.slice(installStart, testStart);
 	assert.ok(install.includes('        uses: taiki-e/install-action@v2\n'));

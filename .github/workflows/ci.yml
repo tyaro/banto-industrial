@@ -399,7 +399,7 @@ jobs:
       # Canonical guest source is a public, separate repository. This test is
       # ignored in the normal nextest archive because that archive has no guest
       # artifact; run it explicitly here after building the pinned component.
-      - name: test (WASM FC3 Hub connection)
+      - name: test (WASM Hub components)
         if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
         shell: pwsh
         run: |
@@ -480,6 +480,31 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'WASM component epoch test failed' }
           if (-not (Select-String -Path $epochTestLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'WASM component epoch test did not run exactly once'
+          }
+          # The SLMP guest is reviewed separately. Pin it, and keep this Hub
+          # acceptance test on the existing WIT and test-only registry path.
+          $slmpSha = 'cf861e356e3d8c087362f9ab418009ffcd1c80c4'
+          git -C $guest checkout --quiet --detach $slmpSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpSha) {
+            throw 'SLMP guest SHA mismatch'
+          }
+          $slmpWit = git -C $guest rev-parse --verify "${slmpSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $slmpWit -ne $hostWit) { throw 'SLMP guest WIT mismatch' }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP guest build failed' }
+          $slmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_SLMP_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-read-component.wasm'
+          wasm-tools component new $slmpModule -o $env:BANTO_SLMP_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP component creation failed' }
+          wasm-tools validate $env:BANTO_SLMP_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_SLMP_COMPONENT_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP component world mismatch' }
+          $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM Hub tests failed' }
+          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP WASM Hub tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings

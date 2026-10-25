@@ -1,0 +1,10 @@
+{
+  "manifestVersion": 1,
+  "id": "slmp-read-wasm",
+  "version": "0.1.0",
+  "hubApi": "1",
+  "settingsVersion": 1,
+  "displayName": "Controlled SLMP Q/R read fixture (WASM)",
+  "transports": ["tcp"],
+  "capabilities": ["read"]
+}
