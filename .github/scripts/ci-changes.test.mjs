@@ -1216,10 +1216,10 @@ test('WASM FC3 の wasm-tools は固定版の検証済みバイナリを fallbac
 	const testStart = workflow.indexOf('      - name: test (WASM FC3 Hub connection)');
 	assert.ok(installStart !== -1 && testStart > installStart);
 	const install = workflow.slice(installStart, testStart);
-	assert.match(install, /^        uses: taiki-e\/install-action@v2$/m);
-	assert.match(install, /^          tool: wasm-tools@1\.262\.0$/m);
-	assert.match(install, /^          checksum: true$/m);
-	assert.match(install, /^          fallback: none$/m);
+	assert.ok(install.includes('        uses: taiki-e/install-action@v2\n'));
+	assert.ok(install.includes('          tool: wasm-tools@1.262.0\n'));
+	assert.ok(install.includes('          checksum: true\n'));
+	assert.ok(install.includes('          fallback: none\n'));
 	const condition =
 		"if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')";
 	assert.ok(install.includes(condition));
