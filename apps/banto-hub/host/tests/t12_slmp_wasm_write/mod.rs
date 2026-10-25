@@ -30,6 +30,8 @@ struct Fixture {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<(u16, u32)>>>,
     d_reads: Arc<Mutex<Vec<(u32, u16)>>>,
+    accepted: tokio::sync::watch::Receiver<usize>,
+    closed: tokio::sync::watch::Receiver<usize>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -41,106 +43,117 @@ impl Fixture {
         let events = commands.clone();
         let d_reads = Arc::new(Mutex::new(Vec::new()));
         let reads = d_reads.clone();
+        let (accepted_tx, accepted) = tokio::sync::watch::channel(0usize);
+        let (closed_tx, closed) = tokio::sync::watch::channel(0usize);
         let task = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
             loop {
-                let mut head = [0; 13];
-                if socket.read_exact(&mut head).await.is_err() {
-                    break;
-                }
-                let length = usize::from(u16::from_le_bytes([head[11], head[12]]));
-                let mut request = head.to_vec();
-                request.resize(13 + length, 0);
-                if socket.read_exact(&mut request[13..]).await.is_err() {
-                    break;
-                }
-                let command = u16::from_le_bytes([request[15], request[16]]);
-                let subcommand = u16::from_le_bytes([request[17], request[18]]);
-                let start = if matches!(command, 0x0401 | 0x1401) {
-                    u32::from_le_bytes([
-                        request[19],
-                        request[20],
-                        request[21],
-                        if subcommand == 2 { request[22] } else { 0 },
-                    ])
-                } else {
-                    0
-                };
-                events.lock().unwrap().push((command, start));
-                let (end_code, body): (u16, Vec<u8>) = match command {
-                    0x0101 => {
-                        let (name, code) = if matches!(peer, Peer::Q) {
-                            ("Q02UCPU", 0x0263u16)
-                        } else {
-                            ("R04CPU", 0x4800u16)
-                        };
-                        let mut body = vec![b' '; 18];
-                        body[..name.len()].copy_from_slice(name.as_bytes());
-                        body[16..18].copy_from_slice(&code.to_le_bytes());
-                        (0, body)
+                let (mut socket, _) = listener.accept().await.unwrap();
+                accepted_tx.send_modify(|count| *count += 1);
+                loop {
+                    let mut head = [0; 13];
+                    if socket.read_exact(&mut head).await.is_err() {
+                        break;
                     }
-                    0x0401 if request[if subcommand == 2 { 23 } else { 22 }] == 0xa9 => {
-                        if matches!(peer, Peer::RSdRefused) {
-                            (0xc05b, vec![])
-                        } else {
-                            let limit = if matches!(peer, Peer::RShort) {
-                                100
+                    let length = usize::from(u16::from_le_bytes([head[11], head[12]]));
+                    let mut request = head.to_vec();
+                    request.resize(13 + length, 0);
+                    if socket.read_exact(&mut request[13..]).await.is_err() {
+                        break;
+                    }
+                    let command = u16::from_le_bytes([request[15], request[16]]);
+                    let subcommand = u16::from_le_bytes([request[17], request[18]]);
+                    let start = if matches!(command, 0x0401 | 0x1401) {
+                        u32::from_le_bytes([
+                            request[19],
+                            request[20],
+                            request[21],
+                            if subcommand == 2 { request[22] } else { 0 },
+                        ])
+                    } else {
+                        0
+                    };
+                    events.lock().unwrap().push((command, start));
+                    let (end_code, body): (u16, Vec<u8>) = match command {
+                        0x0101 => {
+                            let (name, code) = if matches!(peer, Peer::Q) {
+                                ("Q02UCPU", 0x0263u16)
                             } else {
-                                4000
+                                ("R04CPU", 0x4800u16)
                             };
-                            let body = if matches!(peer, Peer::Q) {
-                                (limit as u16).to_le_bytes().to_vec()
-                            } else {
-                                (limit as u32).to_le_bytes().to_vec()
-                            };
+                            let mut body = vec![b' '; 18];
+                            body[..name.len()].copy_from_slice(name.as_bytes());
+                            body[16..18].copy_from_slice(&code.to_le_bytes());
                             (0, body)
                         }
-                    }
-                    0x0401 => {
-                        let count_offset = if subcommand == 2 { 25 } else { 23 };
-                        let count =
-                            u16::from_le_bytes([request[count_offset], request[count_offset + 1]]);
-                        assert!((1..=960).contains(&count));
-                        reads.lock().unwrap().push((start, count));
-                        (0, 7u16.to_le_bytes().repeat(usize::from(count)))
-                    }
-                    0x1401 => {
-                        assert_eq!(start, 3010);
-                        assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
-                        assert_eq!(request[23], 0xa8);
-                        assert_eq!(u16::from_le_bytes([request[25], request[26]]), 1);
-                        assert_eq!(u16::from_le_bytes([request[27], request[28]]), 9);
-                        if matches!(peer, Peer::Timeout) {
-                            continue;
-                        }
-                        (
-                            if matches!(peer, Peer::DeviceRefusal) {
-                                0xc05b
+                        0x0401 if request[if subcommand == 2 { 23 } else { 22 }] == 0xa9 => {
+                            if matches!(peer, Peer::RSdRefused) {
+                                (0xc05b, vec![])
                             } else {
-                                0
-                            },
-                            vec![],
-                        )
+                                let limit = if matches!(peer, Peer::RShort) {
+                                    100
+                                } else {
+                                    4000
+                                };
+                                let body = if matches!(peer, Peer::Q) {
+                                    (limit as u16).to_le_bytes().to_vec()
+                                } else {
+                                    (limit as u32).to_le_bytes().to_vec()
+                                };
+                                (0, body)
+                            }
+                        }
+                        0x0401 => {
+                            let count_offset = if subcommand == 2 { 25 } else { 23 };
+                            let count = u16::from_le_bytes([
+                                request[count_offset],
+                                request[count_offset + 1],
+                            ]);
+                            assert!((1..=960).contains(&count));
+                            reads.lock().unwrap().push((start, count));
+                            (0, 7u16.to_le_bytes().repeat(usize::from(count)))
+                        }
+                        0x1401 => {
+                            assert_eq!(start, 3010);
+                            assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
+                            assert_eq!(request[23], 0xa8);
+                            assert_eq!(u16::from_le_bytes([request[25], request[26]]), 1);
+                            assert_eq!(u16::from_le_bytes([request[27], request[28]]), 9);
+                            if matches!(peer, Peer::Timeout) {
+                                continue;
+                            }
+                            (
+                                if matches!(peer, Peer::DeviceRefusal) {
+                                    0xc05b
+                                } else {
+                                    0
+                                },
+                                vec![],
+                            )
+                        }
+                        _ => panic!("unexpected command {command:#x}"),
+                    };
+                    let mut response = vec![0xd4, 0];
+                    response.extend_from_slice(&request[2..11]);
+                    response
+                        .extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
+                    response.extend_from_slice(&end_code.to_le_bytes());
+                    response.extend_from_slice(&body);
+                    if matches!(peer, Peer::BadAck) && command == 0x1401 {
+                        response[2] ^= 1;
                     }
-                    _ => panic!("unexpected command {command:#x}"),
-                };
-                let mut response = vec![0xd4, 0];
-                response.extend_from_slice(&request[2..11]);
-                response.extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
-                response.extend_from_slice(&end_code.to_le_bytes());
-                response.extend_from_slice(&body);
-                if matches!(peer, Peer::BadAck) && command == 0x1401 {
-                    response[2] ^= 1;
+                    if socket.write_all(&response).await.is_err() {
+                        break;
+                    }
                 }
-                if socket.write_all(&response).await.is_err() {
-                    break;
-                }
+                closed_tx.send_modify(|count| *count += 1);
             }
         });
         Self {
             address,
             commands,
             d_reads,
+            accepted,
+            closed,
             task,
         }
     }
@@ -409,6 +422,133 @@ async fn broker_serializes_read_write_read_on_one_controlled_session() {
             .filter(|(command, _)| *command == 0x1401)
             .count(),
         1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
+async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect() {
+    let mut fixture = Fixture::start(Peer::Timeout).await;
+    let component =
+        std::fs::read(std::env::var("BANTO_SLMP_WRITE_COMPONENT_WASM").unwrap()).unwrap();
+    let app = super::test_app_with_controlled_write_manifest(
+        "t12-slmp-wasm-write-timeout",
+        MANIFEST,
+        &component,
+    )
+    .await;
+    let settings = serde_json::json!({"host":"127.0.0.1","port":fixture.address.port()});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "slmp-write-fixture-line".into(),
+            protocol: "slmp-write-fixture".into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("slmp-write-group", saved.id, 10_000))
+    .await
+    .unwrap();
+    app.manager
+        .tags()
+        .create(super::tag_input("word", group.id, "D3010", "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .expect("first broker connection")
+    .unwrap();
+
+    let driver = app.manager.registry().get("slmp-write-fixture").unwrap();
+    let kind = TagKind::numeric(DataType::U16);
+    let spec = TagSpec::new(driver.base().parse_address("D3010", &kind).unwrap(), kind);
+    let handle = app.manager.write_broker_handle_peek(saved.id).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        handle.write(vec![WriteItem::new(spec.clone(), DriverValue::F64(9.0))]),
+    )
+    .await
+    .expect("bounded broker write");
+    assert!(matches!(
+        result,
+        Err(banto_broker::BrokerError::ConnectionFailed { .. })
+    ));
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.closed.wait_for(|count| *count >= 1),
+    )
+    .await
+    .expect("failed session closes the first socket")
+    .unwrap();
+
+    // The broker reconnects for future work, but it must not replay the failed write.
+    tokio::time::timeout(
+        Duration::from_secs(8),
+        fixture.accepted.wait_for(|count| *count >= 2),
+    )
+    .await
+    .expect("broker reconnects after the write failure")
+    .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .expect("second broker connection is ready")
+    .unwrap();
+    // A round trip on the same broker handle proves the second socket is usable.
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), handle.read(vec![spec]))
+            .await
+            .expect("bounded read after reconnect")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(*fixture.accepted.borrow(), 2);
+    assert_eq!(*fixture.closed.borrow(), 1);
+    let write_events = fixture.commands.clone();
+    let write_count = || {
+        write_events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(command, _)| *command == 0x1401)
+            .count()
+    };
+    assert_eq!(
+        write_count(),
+        1,
+        "a failed write must not be replayed after reconnect"
+    );
+
+    drop(handle);
+    drop(app);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.closed.wait_for(|count| *count >= 2),
+    )
+    .await
+    .expect("test app shutdown closes the second socket")
+    .unwrap();
+    assert_eq!(
+        write_count(),
+        1,
+        "shutdown must not replay the failed write"
     );
 }
 
