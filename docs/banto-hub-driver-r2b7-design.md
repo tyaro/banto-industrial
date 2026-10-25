@@ -1,8 +1,8 @@
 # banto-hub REST / MCP の形の変更と ChronoGazer の追従 詳細設計（R2b-7）
 
 作成日: 2026-10-24
-最終更新: 2026-10-24（オーナー決定を反映）
-状態: **設計確定（2026-10-24 オーナー決定。§11 の Q1〜Q10 はすべて推奨どおり）・未実装**。コード調査（§1）は 2026-10-24 の main（`33952ad0`、v0.2.0-alpha.39、R2b-6 完了・#821〜#825 マージ後）に対して行った。前提のオーナー決定: **使用者はいない前提で、既存データの移行と旧い形との互換は考えない**（2026-10-22。R2b-7 以降も同じ）・**破壊的変更してよい。新しい形だけ受けて、合わなければ断る**（2026-10-17）・**接続の項目エラーの欄名を R2b-7 で `settings.<key>` に揃える**（2026-10-24、#821）・**シリアル接続（#803）は凍結、R2b-4 と iframe の枠は W 段**。
+最終更新: 2026-10-25（R2b-7a〜7c・7d-1・7d-2 の完了と 7e の版更新を反映）
+状態: **設計確定（2026-10-24 オーナー決定。§11 の Q1〜Q10 はすべて推奨どおり）・実装済み（7a #827、7b #828、7d-1 #829、7d-2a/2b #830、7c #842。7e は文書・版の差分を準備中、公開前）**。実機確認は §10 のとおり未実施。§1 のコード調査は 2026-10-24 の main（`33952ad0`、v0.2.0-alpha.39、R2b-6 完了・#821〜#825 マージ後）の時点の記録。前提のオーナー決定: **使用者はいない前提で、既存データの移行と旧い形との互換は考えない**（2026-10-22。R2b-7 以降も同じ）・**破壊的変更してよい。新しい形だけ受けて、合わなければ断る**（2026-10-17）・**接続の項目エラーの欄名を R2b-7 で `settings.<key>` に揃える**（2026-10-24、#821）・**シリアル接続（#803）は凍結、R2b-4 と iframe の枠は W 段**。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-7「REST / MCP / 設定パッケージの形の変更（設定パッケージは版を上げる）と ChronoGazer の追従」。前の段で R2b-7 へ送った分を §1 で拾う。
 関連: [banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。§2 の R2b-7 との境、§4.2 の検証の順、§4.3 平らな形のアダプタ、Q4・Q6・Q13）、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)（R2b-2。Q7 ChronoGazer の追従、§5 の前倒しの案）、[banto-hub-driver-io-design.md](banto-hub-driver-io-design.md)（R2b-3。Q5 の「保存時の規則は R2b-7」）、[banto-hub-driver-sim-design.md](banto-hub-driver-sim-design.md)（R2b-5。§5 の `address_notation`・`banto-plc` の依存）、[banto-hub-driver-ui-design.md](banto-hub-driver-ui-design.md)（R2b-6。§4.2 のスキーマでの保存、§5 REST の形、Q2・Q7・Q11）、[banto-hub-mcp-reference.md](banto-hub-mcp-reference.md)（MCP の接続ツール）、[implementation-checklist.md](implementation-checklist.md)。
 
@@ -161,7 +161,7 @@
 
 - `banto-plc` の `decode_string_value` は `#[cfg(test)]` だけで本番の呼び手が無い: 7d-1 で消す（§6.1）。
 - 上限を超える文字列（`string_length` が計画に載らない）をエンジンが一律 `Err(ItemError::Unsupported("計画に含まれない"))`（`crates/banto-driver-engine/src/lib.rs:355`）で返し、ドライバの断りの理由が落ちる: 本番のエンジンの振る舞いの変更で R2b-7 の形の変更と無関係なので、**Issue を立てて別にする**（直し方の候補: `plan_read` が計画から外した項目の理由を `Unsupported(理由)` で返す口を `DriverBase` に足す）。
-- `real_plc_verify` の書き込みフェーズ 2・3 は R2b-7 の実機の確かめ（§10）と一緒に扱うかをオーナーに確かめる。
+- `real_plc_verify` の書き込みフェーズ 2・3 は未実施。2026-10-25 オーナー判断: WASM SLMP ドライバができた段階で、SLMP と Modbus の書き込み試験をまとめて行う。実行前に対象機器・書き込み範囲を確認する（§10）。WASM ホストの基盤だけができた段階では実施しない。
 
 ## 9. PR の分け方
 
@@ -184,7 +184,7 @@
 - 7d-1: ChronoGazer の core のテストのうち、旧規則の文言・`field` に依るもの（`tag_address.rs` のテスト、`rest.rs` のプロトコル変更・グループ移動のテスト）を `banto-tags` の登録簿モードの文言に書き換える。`hub` の下のタグが断られない（§6.1 の反証）。`collect_roundtrip.rs` 等の 7 本は `PlcConnectionInput` で作っているのでそのまま通る（`new()` は残る）。grep のテスト。`cargo test -p banto-collect` で `banto-plc` 無しに通る。
 - 7d-2: REST（`rest.rs` のテスト）と Tauri（`src-tauri` のテスト）で、作成・更新・一覧の新しい形、`simulation` の省略が保つ、`hub` 行の有効/無効、`reject_disallowed_connection_protocol` が `postgres`・`push`・`virtual`・未知の id を断り `modbus-tcp`・`slmp`・`hub` を通す。`GET /api/drivers` の中身が Hub と同じ順（SLMP が先頭）。vitest。
 - 7c: `banto-tags` の単体（`setting_str` / `setting_i64`、`from_settings`）。`db_source` と `sink` の既存のテスト（`db_source/mod.rs:815-943` の `conn.port = 70_000` 等は `settings` に書く形に直す）。`GET /api/sink/config`・`GET /api/ingest/bridge-config` の応答の形が変わらないことを既存のテストで。grep のテスト。
-- 実機（7e の前。STATUS の実機の確かめの欄に入れる）: MELSEC（R08 試験機）と Modbus で、(1) Hub の MCP から接続の作成・更新・接続テスト（`settings` の形）、(2) ChronoGazer の画面から接続の作成・編集・タグの登録・収集の開始、(3) ChronoGazer の「Hub から追加」で `hub` 接続とタグができ、収集が動く（R2b-3a-3 の未確認の項目と一緒に）。
+- 実機（未実施。STATUS の実機の確かめの欄に入れる）: MELSEC（R08 試験機）と Modbus で、(1) Hub の MCP から接続の作成・更新・接続テスト（`settings` の形）、(2) ChronoGazer の画面から接続の作成・編集・タグの登録・収集の開始、(3) ChronoGazer の「Hub から追加」で `hub` 接続とタグができ、収集が動く（R2b-3a-3 の未確認の項目と一緒に）。書き込み試験は WASM SLMP ドライバができた段階で SLMP と Modbus をまとめて行い、実行前に対象機器・書き込み範囲を確認する（2026-10-25 オーナー判断）。
 - 反証（checklist §5）: 7b で `unitId` を返す経路が残っていないことは、新しい公開の経路（REST の作成・更新・接続テスト、MCP の 4 ツール）の応答を統合テストで確かめる（型違い・範囲外・未知のキー・必須の秘密の欄が `settings.<key>` で返り、`unitId`・`wordOrder`・`cpuType` が返らない）。`rg` の 0 件は条件にしない（§5 で残す旧い検証 (1)・`postgres`・そのテストが同じ綴りを持つため）。7c で `conn.host` 等の読み手が残っていないことはコンパイルが証明する。
 
 ## 11. オーナー判断
@@ -212,7 +212,7 @@
 - 7c の後、`banto-hub-sink` の `flush.rs` は `GET /api/sink/config` の応答（別の型）を読むので影響は無いが、`bridge_parity.rs` 等の sink のテストが `PlcConnection` の平らな欄を組んでいれば直す。
 - 7a で MCP の未適用キューの項目の形が変わる。R2b-6 の Q10 と同じく、古い形は捨てて起動ログに出す。キューに残った項目があるまま版を上げる使い方は無い前提。
 - `encoding_rs` 0.8.35: 7e の `cargo update -w` で動かないことを `git diff Cargo.lock` で確かめる。
-- `real_plc_verify` の書き込みフェーズ 2・3（`REAL_PLC_CONFIRM_WRITE=1`）は未実行のまま（§8）。
+- `real_plc_verify` の書き込みフェーズ 2・3（`REAL_PLC_CONFIRM_WRITE=1`）は未実行。WASM SLMP ドライバ完成後に SLMP と Modbus をまとめて確認する予定（§8・§10）。
 
 ## 13. 既存の文書の直し（7e で）
 
