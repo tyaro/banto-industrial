@@ -503,7 +503,7 @@ jobs:
           $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM Hub tests failed' }
-          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 11 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 13 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM Hub tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。

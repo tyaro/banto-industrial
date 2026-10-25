@@ -3,7 +3,8 @@
 
 use super::*;
 use banto_collect::current::Quality;
-use banto_driver_api::{DataType, ItemError, RawValue, TagSpec};
+use banto_driver_api::{ConnectContext, DataType, ItemError, RawValue, TagSpec};
+use banto_driver_engine::{transport::TransportSpec, FrameSession};
 use banto_driver_wasm::WasmDriver;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,6 +15,7 @@ use tokio::task::JoinHandle;
 
 const MANIFEST: &[u8] = include_bytes!("manifest.json");
 const PROTOCOL: &str = "slmp-read-wasm";
+const MAX_D_RESPONSE_LEN: usize = 15 + 960 * 2;
 
 #[derive(Clone, Copy, Debug)]
 enum Scenario {
@@ -29,6 +31,9 @@ enum Scenario {
     Multi,
     MultiItemRefusal,
     BatchRefusal,
+    LargeSplit,
+    LargeShort,
+    LargeOverlong,
 }
 
 #[derive(Clone, Debug)]
@@ -165,7 +170,48 @@ async fn serve_connection(
         requests.lock().unwrap().push(request.clone());
         let (end_code, body, bad_serial) =
             reply(scenario, &request, version.load(Ordering::SeqCst));
-        let response = wire_response(&frame, end_code, &body, bad_serial);
+        let mut response = wire_response(&frame, end_code, &body, bad_serial);
+        if matches!(
+            scenario,
+            Scenario::LargeSplit | Scenario::LargeShort | Scenario::LargeOverlong
+        ) && request.device == Some(0xa8)
+        {
+            assert_eq!(response.len(), MAX_D_RESPONSE_LEN);
+            match scenario {
+                Scenario::LargeSplit => {
+                    // Pause around the header, length field, payload and final word so
+                    // a full-size response must be accumulated over multiple reads.
+                    let mut start = 0;
+                    for end in [
+                        2,
+                        11,
+                        13,
+                        15,
+                        513,
+                        1024,
+                        MAX_D_RESPONSE_LEN - 1,
+                        MAX_D_RESPONSE_LEN,
+                    ] {
+                        if stream.write_all(&response[start..end]).await.is_err() {
+                            return;
+                        }
+                        start = end;
+                        tokio::time::sleep(Duration::from_millis(2)).await;
+                    }
+                    continue;
+                }
+                Scenario::LargeShort => {
+                    let _ = stream.write_all(&response[..response.len() - 2]).await;
+                    return;
+                }
+                Scenario::LargeOverlong => {
+                    response[11..13].copy_from_slice(&1924u16.to_le_bytes());
+                    let _ = stream.write_all(&response).await;
+                    return;
+                }
+                _ => unreachable!(),
+            }
+        }
         if stream.write_all(&response).await.is_err() {
             return;
         }
@@ -210,6 +256,11 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
                     32
                 };
                 (0, count.to_le_bytes().to_vec(), false)
+            } else if matches!(
+                scenario,
+                Scenario::LargeSplit | Scenario::LargeShort | Scenario::LargeOverlong
+            ) {
+                (0, 1000u16.to_le_bytes().to_vec(), false)
             } else {
                 (0, 100u16.to_le_bytes().to_vec(), false)
             }
@@ -221,6 +272,14 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
             Scenario::MultiItemRefusal if request.start == Some(100) => (0xc05b, vec![], false),
             Scenario::BatchRefusal if request.start == Some(0) && request.count != Some(1) => {
                 (0xc05b, vec![], false)
+            }
+            Scenario::LargeSplit | Scenario::LargeShort | Scenario::LargeOverlong => {
+                assert_eq!((request.start, request.count), (Some(0), Some(960)));
+                let mut body = Vec::with_capacity(960 * 2);
+                for offset in 0..960u16 {
+                    body.extend_from_slice(&(1000 + offset).to_le_bytes());
+                }
+                (0, body, false)
             }
             Scenario::Multi | Scenario::MultiItemRefusal | Scenario::BatchRefusal => {
                 let start = request.start.unwrap();
@@ -955,4 +1014,99 @@ fn confirmed_run_splits_at_the_960_word_request_limit() {
         .decode_read(&planned[1], &specs, &response)
         .unwrap();
     assert_eq!(decoded, vec![Ok(RawValue::Uint(42))]);
+}
+
+async fn large_frame_session(scenario: Scenario) -> (SlmpFixture, FrameSession, Vec<TagSpec>) {
+    let fixture = SlmpFixture::start(scenario).await;
+    let component = std::fs::read(std::env::var("BANTO_SLMP_COMPONENT_WASM").unwrap()).unwrap();
+    let driver = WasmDriver::load(MANIFEST, &component).unwrap();
+    let settings = Settings::from_pairs([
+        ("host".to_owned(), "127.0.0.1".to_owned()),
+        ("port".to_owned(), fixture.addr.port().to_string()),
+    ])
+    .unwrap();
+    let transport = TransportSpec::Tcp {
+        host: "127.0.0.1".into(),
+        port: fixture.addr.port(),
+    };
+    let cx = ConnectContext::new(
+        "slmp-large-frame",
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+    );
+    let mut session = FrameSession::connect(driver.as_ref(), &settings, &transport, &cx, None)
+        .await
+        .unwrap();
+    let kind = TagKind::numeric(DataType::U16);
+    let specs = (0..960)
+        .map(|address| {
+            TagSpec::new(
+                driver.parse_address(&format!("D{address}"), &kind).unwrap(),
+                kind.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let planned = session.connection_mut().unwrap().plan_read(&specs).unwrap();
+    assert_eq!(planned.len(), 1);
+    assert_eq!(planned[0].covers.len(), 960);
+    assert_eq!(planned[0].step.max_len, MAX_D_RESPONSE_LEN as u32);
+    for (index, &cover) in planned[0].covers.iter().enumerate() {
+        assert_eq!(cover as usize, index, "word must cover its original tag");
+    }
+    let request = Request::from_bytes(1, &planned[0].step.send);
+    assert_eq!((request.start, request.count), (Some(0), Some(960)));
+    (fixture, session, specs)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned batch-capable SLMP component"]
+async fn max_size_split_tcp_response_reaches_every_original_cover() {
+    let (fixture, mut session, specs) = large_frame_session(Scenario::LargeSplit).await;
+    let values = tokio::time::timeout(Duration::from_secs(10), session.read_raw_batch(&specs))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(values.len(), 960);
+    for (index, value) in values.into_iter().enumerate() {
+        assert_eq!(
+            value,
+            Ok(RawValue::Uint(1000 + index as u64)),
+            "D{index} did not receive its own response word"
+        );
+    }
+    assert_eq!(fixture.connection_count(), 1);
+    assert_eq!(
+        commands(&fixture.requests(), 1),
+        [
+            (0x0101, None, None, None),
+            (0x0401, Some(0xa9), Some(302), Some(1)),
+            (0x0401, Some(0xa8), Some(0), Some(960)),
+        ]
+    );
+    assert!(session.is_connected());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_COMPONENT_WASM to the pinned batch-capable SLMP component"]
+async fn short_or_overlong_max_size_tcp_frame_is_fatal_without_partial_values() {
+    for scenario in [Scenario::LargeShort, Scenario::LargeOverlong] {
+        let (fixture, mut session, specs) = large_frame_session(scenario).await;
+        let error = tokio::time::timeout(Duration::from_secs(10), session.read_raw_batch(&specs))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            match scenario {
+                Scenario::LargeShort => matches!(error, FatalError::Io(_)),
+                Scenario::LargeOverlong => matches!(error, FatalError::Framing(_)),
+                _ => unreachable!(),
+            },
+            "{scenario:?}: {error:?}"
+        );
+        assert!(!session.is_connected(), "{scenario:?} must close session");
+        assert_eq!(fixture.connection_count(), 1);
+        assert!(fixture.requests().iter().any(|request| {
+            request.device == Some(0xa8) && request.start == Some(0) && request.count == Some(960)
+        }));
+    }
 }

@@ -79,6 +79,7 @@ banto-driver-api = { path = "../../../crates/banto-driver-api", version = "0.3.0
 banto-tstore = { path = "../../../crates/banto-tstore" }
 banto-collect = { path = "../../../crates/banto-collect" }
 banto-broker = { path = "../../../crates/banto-broker" }
+banto-driver-engine = { path = "../../../crates/banto-driver-engine", version = "0.2.0" }
 # Modbus TCP のシミュレータ（`banto-plc` の `simulator` feature）と、読み書きできる
 # SLMP のシミュレータ（`banto-plc-write` の同 feature）。
 banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
