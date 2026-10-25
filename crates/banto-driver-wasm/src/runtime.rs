@@ -2,6 +2,7 @@
 //! `../wit/driver.wit` is a checked-in byte-for-byte copy for host builds.
 //! No WASI linker is installed, so the guest has no filesystem or socket I/O.
 
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
@@ -43,18 +44,28 @@ impl std::fmt::Display for RuntimeError {
 
 impl std::error::Error for RuntimeError {}
 
+const MAX_DIAGNOSTICS: usize = 256;
+
 #[derive(Clone)]
-pub struct Diagnostics(Arc<Mutex<Vec<Diagnostic>>>);
+pub struct Diagnostics(Arc<Mutex<VecDeque<Diagnostic>>>);
 
 impl Diagnostics {
+    /// Return the most recent 256 failures in chronological order. Older
+    /// entries are evicted; this does not drain the retained history.
     pub fn snapshot(&self) -> Vec<Diagnostic> {
-        self.0.lock().expect("diagnostic lock").clone()
-    }
-    fn record(&self, error: RuntimeError) -> RuntimeError {
         self.0
             .lock()
             .expect("diagnostic lock")
-            .push(error.0.clone());
+            .iter()
+            .cloned()
+            .collect()
+    }
+    fn record(&self, error: RuntimeError) -> RuntimeError {
+        let mut history = self.0.lock().expect("diagnostic lock");
+        if history.len() == MAX_DIAGNOSTICS {
+            history.pop_front();
+        }
+        history.push_back(error.0.clone());
         error
     }
 }
@@ -126,7 +137,7 @@ impl Runtime {
         Ok(Self {
             engine,
             component,
-            diagnostics: Diagnostics(Arc::new(Mutex::new(Vec::new()))),
+            diagnostics: Diagnostics(Arc::new(Mutex::new(VecDeque::new()))),
             ticking,
             ticker: Some(ticker),
         })
@@ -210,6 +221,48 @@ mod tests {
         assert_eq!(
             classify("read", Trap::MemoryOutOfBounds.into()).0.cause,
             RuntimeCause::Trap
+        );
+    }
+
+    #[test]
+    fn diagnostics_keep_only_the_newest_errors_in_order() {
+        let diagnostics = Diagnostics(Arc::new(Mutex::new(VecDeque::new())));
+        for n in 0..(MAX_DIAGNOSTICS + 4) {
+            diagnostics.record(RuntimeError(Diagnostic {
+                operation: "read.decode",
+                cause: RuntimeCause::Trap,
+                detail: n.to_string(),
+            }));
+        }
+        let snapshot = diagnostics.snapshot();
+        assert_eq!(snapshot.len(), MAX_DIAGNOSTICS);
+        assert_eq!(snapshot.first().unwrap().detail, "4");
+        assert_eq!(snapshot.last().unwrap().detail, "259");
+        assert_eq!(diagnostics.snapshot(), snapshot);
+    }
+
+    #[test]
+    #[ignore = "requires BANTO_COMPONENT_WASM built from the canonical guest"]
+    fn real_component_export_expires_at_epoch_deadline() {
+        let bytes =
+            std::fs::read(std::env::var("BANTO_COMPONENT_WASM").expect("BANTO_COMPONENT_WASM"))
+                .expect("component bytes");
+        let runtime = Runtime::new(&bytes).expect("component runtime");
+        let mut instance = runtime.instantiate().expect("instance");
+        instance.store.set_epoch_deadline(0);
+        std::thread::sleep(Duration::from_millis(30));
+        let error = instance
+            .driver
+            .banto_driver_address()
+            .call_help(&mut instance.store)
+            .expect_err("expired export call must fail");
+        assert_eq!(
+            runtime.record("address.help", error).0.cause,
+            RuntimeCause::EpochDeadline
+        );
+        assert_eq!(
+            runtime.diagnostics().snapshot()[0].operation,
+            "address.help"
         );
     }
 }

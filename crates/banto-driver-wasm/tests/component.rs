@@ -45,3 +45,18 @@ fn canonical_component_runs_through_frame_adapter() {
     );
     assert!(driver.diagnostics().snapshot().is_empty());
 }
+
+#[test]
+#[ignore = "requires a separately built banto-driver-wasm component"]
+fn idle_connection_drop_does_not_report_epoch_deadline() {
+    let bytes = std::fs::read(std::env::var("BANTO_COMPONENT_WASM").expect("BANTO_COMPONENT_WASM"))
+        .expect("component bytes");
+    let driver = WasmDriver::load(include_bytes!("manifest.json"), &bytes).expect("load component");
+    let settings = Settings::from_pairs([("host", "127.0.0.1"), ("port", "502")]).unwrap();
+    let conn = driver.create_connection(&settings).unwrap();
+    // The connection's original epoch deadline has now passed. Cleanup is
+    // still a fresh bounded guest call, not a continuation of the idle time.
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    drop(conn);
+    assert!(driver.diagnostics().snapshot().is_empty());
+}

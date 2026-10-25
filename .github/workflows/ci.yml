@@ -436,6 +436,18 @@ jobs:
           if (-not (Select-String -Path $testLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'WASM Hub connection test did not run exactly once'
           }
+          $componentTestLog = Join-Path $env:RUNNER_TEMP 'wasm-component-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test component --locked -- --ignored 2>&1 | Tee-Object -FilePath $componentTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM component adapter tests failed' }
+          if (-not (Select-String -Path $componentTestLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM component adapter tests did not both run'
+          }
+          $epochTestLog = Join-Path $env:RUNNER_TEMP 'wasm-epoch-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --lib runtime::tests::real_component_export_expires_at_epoch_deadline --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $epochTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM component epoch test failed' }
+          if (-not (Select-String -Path $epochTestLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM component epoch test did not run exactly once'
+          }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()

@@ -7,21 +7,22 @@ mod runtime;
 pub use manifest::{Manifest, ManifestError};
 pub use runtime::{Diagnostic, Diagnostics, RuntimeCause, RuntimeError};
 
+use std::collections::BTreeSet;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex,
 };
 
 use api::{
-    AddressError, DataType, DriverAddress, DriverBase, DriverDescriptor, FatalError, FieldError,
-    FieldGroup, FieldKind, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError,
-    KindName, Planned, PrefixEncoding, PrefixSpec, RawValue, SettingField, SettingValue, Settings,
-    SettingsSchema, Step, TagKind, TagSpec,
+    AddressError, DataType, DriverAddress, DriverBase, DriverDescriptor, DriverId, FatalError,
+    FieldError, FieldGroup, FieldKind, FrameCheck, FrameConnection, FrameDriver, FrameRule,
+    ItemError, KindName, Planned, PrefixEncoding, PrefixSpec, RawValue, SettingField, SettingValue,
+    Settings, SettingsSchema, Step, TagKind, TagSpec,
 };
 use banto_driver_api as api;
 use runtime::{
     banto::driver::types,
-    exports::banto::driver::{config, read, session},
+    exports::banto::driver::{address, config, read, session},
     Instance, Runtime,
 };
 
@@ -104,7 +105,7 @@ impl WasmDriver {
             .banto_driver_config()
             .call_secret_keys(&mut instance.store)
             .map_err(|e| LoadError::Runtime(runtime.record("config.secret-keys", e)))?;
-        let fields = instance
+        let fields: Vec<SettingField> = instance
             .driver
             .banto_driver_config()
             .call_schema(&mut instance.store)
@@ -112,6 +113,7 @@ impl WasmDriver {
             .into_iter()
             .map(convert_field)
             .collect();
+        validate_secret_fields(&fields, &secrets)?;
         Ok(Arc::new(Self {
             descriptor: manifest.descriptor,
             runtime,
@@ -169,6 +171,75 @@ fn convert_field(field: config::SettingField) -> SettingField {
         config::FieldGroup::Advanced => FieldGroup::Advanced,
     };
     result
+}
+
+fn validate_secret_fields(fields: &[SettingField], secrets: &[String]) -> Result<(), LoadError> {
+    let declared: BTreeSet<&str> = secrets.iter().map(String::as_str).collect();
+    let field_keys: BTreeSet<&str> = fields.iter().map(|field| field.key.as_str()).collect();
+    let secret_field_count = fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Secret))
+        .count();
+    let in_schema: BTreeSet<&str> = fields
+        .iter()
+        .filter(|field| matches!(field.kind, FieldKind::Secret))
+        .map(|field| field.key.as_str())
+        .collect();
+    if field_keys.len() != fields.len()
+        || declared.len() != secrets.len()
+        || in_schema.len() != secret_field_count
+        || declared != in_schema
+    {
+        return Err(LoadError::Contract(
+            "config schema keys must be unique and secret-keys must match Secret fields".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Check guest-reported address metadata before passing it to the Hub. The
+/// initial FC3 contract is one U16 holding register at a numeric offset.
+fn checked_parsed_address(
+    driver: &DriverId,
+    kind: &TagKind,
+    parsed: address::Parsed,
+) -> Result<DriverAddress, AddressError> {
+    if *kind != TagKind::numeric(DataType::U16)
+        || parsed.area != "holding_register"
+        || parsed.word_count != 1
+        || parsed.bit.is_some()
+    {
+        return Err(AddressError::new(
+            "WASM FC3 address metadata violates the U16 contract",
+        ));
+    }
+    let digits = parsed
+        .canonical
+        .strip_prefix('4')
+        .ok_or_else(|| AddressError::new("WASM FC3 canonical address is invalid"))?;
+    if !matches!(digits.len(), 4 | 5) || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(AddressError::new("WASM FC3 canonical address is invalid"));
+    }
+    let number = digits
+        .parse::<u32>()
+        .map_err(|_| AddressError::new("WASM FC3 canonical address is invalid"))?;
+    let offset = number
+        .checked_sub(1)
+        .and_then(|n| u16::try_from(n).ok())
+        .ok_or_else(|| AddressError::new("WASM FC3 canonical address is out of range"))?;
+    if parsed.index != Some(u64::from(offset)) {
+        return Err(AddressError::new(
+            "WASM FC3 canonical address and index disagree",
+        ));
+    }
+    Ok(DriverAddress::new(
+        driver.clone(),
+        parsed.canonical,
+        parsed.area,
+        parsed.writable_area,
+        1,
+    )
+    .with_index(u64::from(offset)))
 }
 
 fn wit_settings(settings: &Settings) -> Vec<types::Setting> {
@@ -321,18 +392,7 @@ impl DriverBase for WasmDriver {
             })
             .map_err(|e| AddressError::new(e.to_string()))?
             .map_err(AddressError::new)?;
-        let word_count = u16::try_from(result.word_count)
-            .map_err(|_| AddressError::new("word count exceeds u16"))?;
-        let mut address = DriverAddress::new(
-            self.descriptor.id.clone(),
-            result.canonical,
-            result.area,
-            result.writable_area,
-            word_count,
-        );
-        address.bit = result.bit;
-        address.index = result.index;
-        Ok(address)
+        checked_parsed_address(&self.descriptor.id, kind, result)
     }
 
     fn offset_address(
@@ -534,7 +594,15 @@ impl FrameConnection for WasmConnection {
 
 impl Drop for WasmConnection {
     fn drop(&mut self) {
+        // A failed instance is discarded with its Store. Do not run guest
+        // destruction after a trap or record a second, misleading failure.
+        if self.failed.load(Ordering::Acquire) {
+            return;
+        }
         if let Ok(mut instance) = self.instance.lock() {
+            // Connection stores may be idle for much longer than the normal
+            // invocation budget; destruction starts a fresh bounded call.
+            instance.store.set_epoch_deadline(100);
             if let Err(e) = self.resource.resource_drop(&mut instance.store) {
                 self.runtime.record("connection.drop", e);
             }
@@ -561,5 +629,66 @@ mod tests {
         assert!(checked_fc3_u16(&kind, types::Value::Int(1)).is_err());
         assert!(checked_fc3_u16(&kind, types::Value::Float(1.0)).is_err());
         assert!(checked_fc3_u16(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err());
+    }
+
+    fn parsed() -> address::Parsed {
+        address::Parsed {
+            canonical: "400001".into(),
+            area: "holding_register".into(),
+            writable_area: true,
+            bit: None,
+            word_count: 1,
+            index: Some(0),
+        }
+    }
+
+    #[test]
+    fn fc3_parsed_address_metadata_is_checked() {
+        let driver = DriverId::new("modbus-fc3-wasm").unwrap();
+        let kind = TagKind::numeric(DataType::U16);
+        let valid = checked_parsed_address(&driver, &kind, parsed()).unwrap();
+        assert!(valid.writable_area); // Read-only capability does not change area metadata.
+        assert_eq!(valid.index, Some(0));
+        let mut wrong = parsed();
+        wrong.word_count = 2;
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
+        wrong.bit = Some(1);
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
+        wrong.area = "coil".into();
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
+        wrong.index = Some(1);
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let mut wrong = parsed();
+        wrong.canonical = "400002".into();
+        assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        assert!(
+            checked_parsed_address(&driver, &TagKind::numeric(DataType::I16), parsed()).is_err()
+        );
+    }
+
+    #[test]
+    fn schema_secret_fields_match_declared_keys() {
+        let secret = SettingField::new("password", "Password", FieldKind::Secret);
+        let host = SettingField::new("host", "Host", FieldKind::Host);
+        assert!(
+            validate_secret_fields(&[host.clone(), secret.clone()], &["password".into()]).is_ok()
+        );
+        assert!(validate_secret_fields(&[host.clone(), secret.clone()], &[]).is_err());
+        assert!(validate_secret_fields(std::slice::from_ref(&host), &["password".into()]).is_err());
+        assert!(
+            validate_secret_fields(&[secret.clone(), secret.clone()], &["password".into()])
+                .is_err()
+        );
+        let conflicting = SettingField::new("password", "Shown as text", FieldKind::text());
+        assert!(
+            validate_secret_fields(&[secret.clone(), conflicting], &["password".into()]).is_err()
+        );
+        assert!(
+            validate_secret_fields(&[host, secret], &["password".into(), "password".into()])
+                .is_err()
+        );
     }
 }
