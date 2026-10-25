@@ -61,18 +61,53 @@ fn normalize(error: RuntimeError) -> FatalError {
 pub struct WasmDriver {
     descriptor: DriverDescriptor,
     runtime: Arc<Runtime>,
-    controlled_write_fixture: bool,
+    controlled_write_target: ControlledWriteTarget,
     probe: Option<(String, TagKind)>,
     supported: Vec<KindName>,
     secrets: Vec<String>,
     schema: SettingsSchema,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ControlledWriteTarget {
+    None,
+    #[cfg(feature = "controlled-write-fixture")]
+    Loopback,
+    #[cfg(feature = "controlled-live-write-fixture")]
+    RTestPlc,
+}
+
+impl ControlledWriteTarget {
+    fn allows_write(self) -> bool {
+        self != Self::None
+    }
+
+    fn accepts_settings(self, settings: &Settings) -> bool {
+        let _ = settings;
+        match self {
+            Self::None => true,
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::Loopback => settings
+                .iter()
+                .any(|setting| setting.key == "host" && setting.value == "127.0.0.1"),
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::RTestPlc => {
+                settings
+                    .iter()
+                    .any(|setting| setting.key == "host" && setting.value == "192.168.11.200")
+                    && settings
+                        .iter()
+                        .any(|setting| setting.key == "port" && setting.value == "3109")
+            }
+        }
+    }
+}
+
 impl WasmDriver {
     /// Validate metadata, compile a read-only component, and evaluate its
     /// stateless exports before making it visible to a registry.
     pub fn load(manifest: &[u8], component: &[u8]) -> Result<Arc<Self>, LoadError> {
-        Self::load_inner(manifest, component, false)
+        Self::load_inner(manifest, component, ControlledWriteTarget::None)
     }
 
     /// Explicit entry point for isolated loopback fixtures. Normal
@@ -82,21 +117,34 @@ impl WasmDriver {
         manifest: &[u8],
         component: &[u8],
     ) -> Result<Arc<Self>, LoadError> {
-        Self::load_inner(manifest, component, true)
+        Self::load_inner(manifest, component, ControlledWriteTarget::Loopback)
+    }
+
+    /// Explicit test-only loader for the approved R test PLC. The caller must
+    /// also verify its TransportSpec before dialing; settings are not the wire
+    /// destination. Production registration always uses `load` instead.
+    #[cfg(feature = "controlled-live-write-fixture")]
+    pub fn load_controlled_r_test_fixture(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, ControlledWriteTarget::RTestPlc)
     }
 
     fn load_inner(
         manifest: &[u8],
         component: &[u8],
-        controlled_write_fixture: bool,
+        controlled_write_target: ControlledWriteTarget,
     ) -> Result<Arc<Self>, LoadError> {
         let manifest = Manifest::parse(manifest).map_err(LoadError::Manifest)?;
-        if manifest.requests_write != controlled_write_fixture {
+        if manifest.requests_write != controlled_write_target.allows_write() {
             return Err(LoadError::Contract(
                 "write-v1 is available only through the controlled fixture loader".into(),
             ));
         }
-        if controlled_write_fixture && manifest.descriptor.id.as_str() != "slmp-write-fixture" {
+        if controlled_write_target.allows_write()
+            && manifest.descriptor.id.as_str() != "slmp-write-fixture"
+        {
             return Err(LoadError::Contract(
                 "controlled write fixture requires the isolated SLMP driver id".into(),
             ));
@@ -164,7 +212,7 @@ impl WasmDriver {
         Ok(Arc::new(Self {
             descriptor,
             runtime,
-            controlled_write_fixture,
+            controlled_write_target,
             probe,
             supported,
             secrets,
@@ -602,13 +650,9 @@ impl FrameDriver for WasmDriver {
         &self,
         settings: &Settings,
     ) -> Result<Box<dyn FrameConnection>, FatalError> {
-        if self.controlled_write_fixture
-            && !settings
-                .iter()
-                .any(|setting| setting.key == "host" && setting.value == "127.0.0.1")
-        {
+        if !self.controlled_write_target.accepts_settings(settings) {
             return Err(FatalError::InvalidConfig(
-                "controlled WASM write fixture requires loopback host".into(),
+                "controlled WASM write fixture endpoint mismatch".into(),
             ));
         }
         let mut instance = self.runtime.instantiate().map_err(normalize)?;
@@ -624,7 +668,7 @@ impl FrameDriver for WasmDriver {
             resource,
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
-            controlled_write_fixture: self.controlled_write_fixture,
+            controlled_write_fixture: self.controlled_write_target.allows_write(),
             driver_id: self.descriptor.id.clone(),
         }))
     }
@@ -870,6 +914,22 @@ mod tests {
         manifest["writeApi"] = json!("1");
         let result = WasmDriver::load(&serde_json::to_vec(&manifest).unwrap(), &[]);
         assert!(matches!(result, Err(LoadError::Contract(_))));
+    }
+
+    #[cfg(feature = "controlled-live-write-fixture")]
+    #[test]
+    fn controlled_r_test_loader_settings_are_exact() {
+        let settings = |host: &str, port: &str| {
+            Settings::from_pairs([
+                ("host".to_owned(), host.to_owned()),
+                ("port".to_owned(), port.to_owned()),
+            ])
+            .unwrap()
+        };
+        let target = ControlledWriteTarget::RTestPlc;
+        assert!(target.accepts_settings(&settings("192.168.11.200", "3109")));
+        assert!(!target.accepts_settings(&settings("127.0.0.1", "3109")));
+        assert!(!target.accepts_settings(&settings("192.168.11.200", "3100")));
     }
 
     #[test]

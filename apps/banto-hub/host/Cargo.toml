@@ -63,7 +63,8 @@ windows-sys = { version = "0.61", features = [
 # `tests/common/mod.rs` は core の `tests/common/mod.rs` を `#[path]` で読み、
 # `hub_drivers()`（`builtin()`）だけを足す。
 [dev-dependencies]
-banto-driver-wasm = { path = "../../../crates/banto-driver-wasm", features = ["controlled-write-fixture"] }
+banto-driver-wasm = { path = "../../../crates/banto-driver-wasm", features = ["controlled-write-fixture", "controlled-live-write-fixture"] }
+sha2 = { workspace = true }
 tempfile = "3"
 # `net` は空きポートの探索と TCP のプローブ、`test-util` は core と同じ（仮想時計）。
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "sync", "test-util"] }

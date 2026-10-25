@@ -8,6 +8,8 @@ publish = false
 [features]
 # Only integration-test builds can construct the loopback write fixture.
 controlled-write-fixture = []
+# Test-only loader for the one explicitly named R test PLC endpoint.
+controlled-live-write-fixture = ["controlled-write-fixture"]
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
