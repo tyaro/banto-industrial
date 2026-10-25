@@ -1037,6 +1037,7 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.match(step, /canonical manifest and host manifest differ/);
 	assert.match(step, /cargo \+1\.98\.1 build/);
 	assert.match(step, /\$wasmToolsVersion = wasm-tools --version/);
+	assert.ok(step.includes("$wasmToolsVersion -notmatch '^wasm-tools 1\\.262\\.0"));
 	assert.match(step, /wasm-tools version mismatch/);
 	assert.match(step, /-- --ignored --exact/);
 	assert.match(step, /1 passed; 0 failed; 0 ignored/);

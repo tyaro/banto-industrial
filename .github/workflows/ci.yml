@@ -427,7 +427,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
           $wasmToolsVersion = wasm-tools --version
           Write-Host "wasm-tools version: $wasmToolsVersion"
-          if ($LASTEXITCODE -ne 0 -or $wasmToolsVersion -ne 'wasm-tools 1.262.0') {
+          if ($LASTEXITCODE -ne 0 -or $wasmToolsVersion -notmatch '^wasm-tools 1\.262\.0(?: \([0-9a-f]{9} \d{4}-\d{2}-\d{2}\))?$') {
             throw 'wasm-tools version mismatch'
           }
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
