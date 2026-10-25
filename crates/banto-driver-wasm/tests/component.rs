@@ -14,6 +14,13 @@ fn canonical_component_runs_through_frame_adapter() {
     assert_eq!(driver.descriptor().settings_version, 1);
     assert_eq!(driver.descriptor().id.as_str(), "modbus-fc3-wasm");
     assert_eq!(
+        driver.supported_kinds(),
+        vec![
+            banto_driver_api::KindName::Numeric(DataType::U16),
+            banto_driver_api::KindName::Numeric(DataType::U32),
+        ]
+    );
+    assert_eq!(
         driver.probe(),
         Some(("40001".into(), TagKind::numeric(DataType::U16)))
     );
@@ -44,6 +51,46 @@ fn canonical_component_runs_through_frame_adapter() {
         conn.decode_read(&planned[0], &specs, &response).unwrap(),
         [Ok(RawValue::Uint(42))]
     );
+    assert!(driver.diagnostics().snapshot().is_empty());
+}
+
+#[test]
+#[ignore = "requires a separately built banto-driver-wasm component"]
+fn canonical_component_reads_u32_in_both_word_orders() {
+    let bytes = std::fs::read(std::env::var("BANTO_COMPONENT_WASM").expect("BANTO_COMPONENT_WASM"))
+        .expect("component bytes");
+    let driver = WasmDriver::load(include_bytes!("manifest.json"), &bytes).expect("load component");
+    let kind = TagKind::numeric(DataType::U32);
+    let address = driver.parse_address("40001", &kind).expect("U32 address");
+    assert_eq!(address.word_count, 2);
+    assert_eq!(address.canonical, "400001");
+    assert_eq!(
+        driver.parse_address("465535", &kind).unwrap().index,
+        Some(65_534)
+    );
+    assert!(driver.parse_address("465536", &kind).is_err());
+    assert_eq!(driver.offset_address("400001", &kind, 1).unwrap(), "400003");
+    let specs = [TagSpec::new(address, kind)];
+    for (order, expected) in [("low_high", 0xabcd_1234u64), ("high_low", 0x1234_abcdu64)] {
+        let settings = Settings::from_pairs([
+            ("host", "127.0.0.1"),
+            ("port", "502"),
+            ("word_order", order),
+        ])
+        .unwrap();
+        assert!(driver.validate_config(&settings).is_empty());
+        let mut conn = driver.create_connection(&settings).unwrap();
+        let planned = conn.plan_read(&specs).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].covers, [0]);
+        assert_eq!(&planned[0].step.send[2..], &[0, 0, 0, 6, 1, 3, 0, 0, 0, 2]);
+        let mut response = planned[0].step.send[..2].to_vec();
+        response.extend_from_slice(&[0, 0, 0, 7, 1, 3, 4, 0x12, 0x34, 0xab, 0xcd]);
+        assert_eq!(
+            conn.decode_read(&planned[0], &specs, &response).unwrap(),
+            [Ok(RawValue::Uint(expected))]
+        );
+    }
     assert!(driver.diagnostics().snapshot().is_empty());
 }
 

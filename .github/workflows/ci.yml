@@ -404,7 +404,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $sha = 'be5753d003aa49d065405e30753a2a0903d3e24c'
+          $sha = '5233d55a4d1c278c473e9c44df608c1423c1a629'
           $guest = Join-Path $env:RUNNER_TEMP 'banto-driver-wasm'
           git clone --quiet https://github.com/tyaro/banto-driver-wasm.git $guest
           if ($LASTEXITCODE -ne 0) { throw 'canonical guest clone failed' }
@@ -449,8 +449,8 @@ jobs:
           $componentTestLog = Join-Path $env:RUNNER_TEMP 'wasm-component-test.txt'
           cargo +1.98.1 test -p banto-driver-wasm --test component --locked -- --ignored 2>&1 | Tee-Object -FilePath $componentTestLog
           if ($LASTEXITCODE -ne 0) { throw 'WASM component adapter tests failed' }
-          if (-not (Select-String -Path $componentTestLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
-            throw 'WASM component adapter tests did not both run'
+          if (-not (Select-String -Path $componentTestLog -Pattern '^test result: ok\. 3 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM component adapter tests did not all run'
           }
           $epochTestLog = Join-Path $env:RUNNER_TEMP 'wasm-epoch-test.txt'
           cargo +1.98.1 test -p banto-driver-wasm --lib runtime::tests::real_component_export_expires_at_epoch_deadline --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $epochTestLog
