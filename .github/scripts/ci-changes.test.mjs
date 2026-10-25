@@ -1017,6 +1017,23 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
 	const step = workflow.slice(start, end);
 	assert.match(step, /be5753d003aa49d065405e30753a2a0903d3e24c/);
+	for (const revision of [
+		'${sha}:wit/driver.wit',
+		'HEAD:crates/banto-driver-wasm/wit/driver.wit',
+		'${sha}:component/manifest.json',
+		'HEAD:crates/banto-driver-wasm/tests/manifest.json'
+	]) {
+		assert.ok(step.includes(revision), `blob reference missing: ${revision}`);
+	}
+	for (const label of [
+		'canonical WIT blob lookup failed',
+		'host WIT blob lookup failed',
+		'canonical manifest blob lookup failed',
+		'host manifest blob lookup failed'
+	]) {
+		assert.ok(step.includes(label), `Git error guard missing: ${label}`);
+	}
+	assert.doesNotMatch(step, /Get-FileHash/);
 	assert.match(step, /canonical manifest and host manifest differ/);
 	assert.match(step, /cargo \+1\.98\.1 build/);
 	assert.match(step, /wasm-tools --version 1\.262\.0 --locked/);

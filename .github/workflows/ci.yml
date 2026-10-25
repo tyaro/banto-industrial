@@ -405,11 +405,16 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $sha) {
             throw 'canonical guest SHA mismatch'
           }
-          $canonicalWit = (Get-FileHash (Join-Path $guest 'wit/driver.wit') -Algorithm SHA256).Hash
-          $hostWit = (Get-FileHash 'crates/banto-driver-wasm/wit/driver.wit' -Algorithm SHA256).Hash
+          # Compare committed blobs: Windows may check out either worktree with CRLF.
+          $canonicalWit = git -C $guest rev-parse --verify "${sha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0) { throw 'canonical WIT blob lookup failed' }
+          $hostWit = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/wit/driver.wit'
+          if ($LASTEXITCODE -ne 0) { throw 'host WIT blob lookup failed' }
           if ($canonicalWit -ne $hostWit) { throw 'canonical WIT and host WIT differ' }
-          $canonicalManifest = (Get-FileHash (Join-Path $guest 'component/manifest.json') -Algorithm SHA256).Hash
-          $hostManifest = (Get-FileHash 'crates/banto-driver-wasm/tests/manifest.json' -Algorithm SHA256).Hash
+          $canonicalManifest = git -C $guest rev-parse --verify "${sha}:component/manifest.json"
+          if ($LASTEXITCODE -ne 0) { throw 'canonical manifest blob lookup failed' }
+          $hostManifest = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/tests/manifest.json'
+          if ($LASTEXITCODE -ne 0) { throw 'host manifest blob lookup failed' }
           if ($canonicalManifest -ne $hostManifest) { throw 'canonical manifest and host manifest differ' }
           rustup target add wasm32-unknown-unknown --toolchain 1.98.1
           if ($LASTEXITCODE -ne 0) { throw 'wasm32 target installation failed' }
