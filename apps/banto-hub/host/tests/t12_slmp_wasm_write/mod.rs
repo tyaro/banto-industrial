@@ -479,7 +479,7 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
     let handle = app.manager.write_broker_handle_peek(saved.id).unwrap();
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        handle.write(vec![WriteItem::new(spec, DriverValue::F64(9.0))]),
+        handle.write(vec![WriteItem::new(spec.clone(), DriverValue::F64(9.0))]),
     )
     .await
     .expect("bounded broker write");
@@ -510,12 +510,28 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
     .await
     .expect("second broker connection is ready")
     .unwrap();
+    // A round trip on the same broker handle proves the second socket is usable.
     assert_eq!(
-        fixture
-            .commands()
+        tokio::time::timeout(Duration::from_secs(5), handle.read(vec![spec]))
+            .await
+            .expect("bounded read after reconnect")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(*fixture.accepted.borrow(), 2);
+    assert_eq!(*fixture.closed.borrow(), 1);
+    let write_events = fixture.commands.clone();
+    let write_count = || {
+        write_events
+            .lock()
+            .unwrap()
             .iter()
             .filter(|(command, _)| *command == 0x1401)
-            .count(),
+            .count()
+    };
+    assert_eq!(
+        write_count(),
         1,
         "a failed write must not be replayed after reconnect"
     );
@@ -529,6 +545,11 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
     .await
     .expect("test app shutdown closes the second socket")
     .unwrap();
+    assert_eq!(
+        write_count(),
+        1,
+        "shutdown must not replay the failed write"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
