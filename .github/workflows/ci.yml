@@ -457,6 +457,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'device-address component validation failed' }
           wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_DEVICE_COMPONENT_WASM --world driver
           if ($LASTEXITCODE -ne 0) { throw 'device-address component world mismatch' }
+          $startupTestLog = Join-Path $env:RUNNER_TEMP 'wasm-signed-startup-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --bin banto-hub wasm_plugins::tests::real_component_registers_on_restart_and_rejects_tampering --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $startupTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'signed startup registration test failed' }
+          if (-not (Select-String -Path $startupTestLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'signed startup registration test did not run exactly once'
+          }
           $deviceTestLog = Join-Path $env:RUNNER_TEMP 'wasm-device-address-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test device_address_test::saves_collects_reads_now_and_reuses_broker --locked -- --ignored --exact 2>&1 | Tee-Object -FilePath $deviceTestLog
           if ($LASTEXITCODE -ne 0) { throw 'device-address Hub test failed' }
