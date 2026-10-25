@@ -515,9 +515,8 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
         tokio::time::timeout(Duration::from_secs(5), handle.read(vec![spec]))
             .await
             .expect("bounded read after reconnect")
-            .unwrap()
-            .len(),
-        1
+            .unwrap(),
+        vec![Ok(DriverValue::F64(7.0))]
     );
     assert_eq!(*fixture.accepted.borrow(), 2);
     assert_eq!(*fixture.closed.borrow(), 1);
@@ -549,6 +548,11 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
         write_count(),
         1,
         "shutdown must not replay the failed write"
+    );
+    assert_eq!(
+        *fixture.accepted.borrow(),
+        2,
+        "shutdown must not open a third socket"
     );
 }
 
@@ -696,4 +700,193 @@ async fn hub_write_gates_and_audit_still_wrap_the_controlled_guest() {
         .unwrap()
         .iter()
         .any(|row| { row["tagId"].as_i64() == Some(tag_id) && row["result"] == "ok" }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
+async fn hub_api_timeout_audits_failure_and_cleans_up_without_replay() {
+    use banto_hub_core::api_keys::{ApiKeyLookup, ApiKeysService};
+
+    let mut fixture = Fixture::start(Peer::Timeout).await;
+    let component =
+        std::fs::read(std::env::var("BANTO_SLMP_WRITE_COMPONENT_WASM").unwrap()).unwrap();
+    let app = super::test_app_with_controlled_write_manifest(
+        "t12-slmp-wasm-write-rest-timeout",
+        MANIFEST,
+        &component,
+    )
+    .await;
+    let settings = serde_json::json!({"host":"127.0.0.1","port":fixture.address.port()});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "slmp-write-fixture-line".into(),
+            protocol: "slmp-write-fixture".into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("slmp-write-group", saved.id, 10_000))
+    .await
+    .unwrap();
+    let mut tag = super::tag_input("word", group.id, "D3010", "u16");
+    tag.writable = true;
+    let tag_id = app.manager.tags().create(tag).await.unwrap().id;
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .expect("first broker connection")
+    .unwrap();
+
+    let driver = app.manager.registry().get("slmp-write-fixture").unwrap();
+    let kind = TagKind::numeric(DataType::U16);
+    let spec = TagSpec::new(driver.base().parse_address("D3010", &kind).unwrap(), kind);
+    let handle = app.manager.write_broker_handle_peek(saved.id).unwrap();
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let expires_at = now_ms + 600_000;
+    let scope = "write:slmp-write-fixture-line.slmp-write-group.word".to_owned();
+    let issued = api_keys
+        .issue(
+            "fixture-timeout-writer",
+            vec![scope.clone()],
+            Some(expires_at),
+        )
+        .await
+        .expect("issue scoped key in the temporary test database");
+    let issued_id = issued.id;
+    let issued_scopes = issued.scopes.clone();
+    app.write_control.enable();
+
+    // Do not assert until after revoke and TestApp cleanup. A failed assertion
+    // must not leave the temporary test key active or the DB directory behind.
+    let path = "/api/v1/values/slmp-write-fixture-line.slmp-write-group.word";
+    let (write_status, write_body) = super::admin_write(
+        &app.router,
+        "POST",
+        path,
+        &issued.key,
+        serde_json::json!({"v":9}),
+    )
+    .await;
+    let first_closed = tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.closed.wait_for(|count| *count >= 1),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let second_accepted = tokio::time::timeout(
+        Duration::from_secs(8),
+        fixture.accepted.wait_for(|count| *count >= 2),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let second_connected = tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let read_after_reconnect =
+        tokio::time::timeout(Duration::from_secs(5), handle.read(vec![spec])).await;
+    let accepted_before_shutdown = *fixture.accepted.borrow();
+    let closed_before_shutdown = *fixture.closed.borrow();
+    let (audit_status, audit) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+
+    app.write_control.disable();
+    let write_control_disabled = !app.write_control.is_enabled();
+    let revoked = api_keys.revoke(issued_id).await;
+    let lookup_after_revoke = api_keys.lookup(&issued.key, now_ms).await;
+    let key_summaries = api_keys.list().await;
+    drop(issued);
+    drop(api_keys);
+    drop(handle);
+    let db_path = app._env.registry_path();
+    let temp_dir = db_path.parent().unwrap().to_path_buf();
+    drop(app);
+    let second_closed = tokio::time::timeout(
+        Duration::from_secs(5),
+        fixture.closed.wait_for(|count| *count >= 2),
+    )
+    .await
+    .is_ok_and(|result| result.is_ok());
+    let final_accepted = *fixture.accepted.borrow();
+    let final_closed = *fixture.closed.borrow();
+    let commands = fixture.commands();
+    let db_removed = !db_path.exists();
+    let temp_dir_removed = !temp_dir.exists();
+
+    let revoked = revoked.expect("revoke temporary test key");
+    assert!(revoked.revoked_at.is_some());
+    assert!(matches!(
+        lookup_after_revoke,
+        Ok(ApiKeyLookup::Revoked { id, .. }) if id == issued_id
+    ));
+    let key_summaries = key_summaries.expect("read temporary key metadata");
+    let key_summary = key_summaries
+        .iter()
+        .find(|key| key.id == issued_id)
+        .unwrap();
+    assert_eq!(issued_scopes, vec![scope]);
+    assert_eq!(key_summary.expires_at, Some(expires_at));
+    assert!(write_control_disabled);
+    assert!(db_removed, "temporary test database must be removed");
+    assert!(temp_dir_removed, "temporary test directory must be removed");
+
+    assert!(!write_status.is_success(), "{write_body:?}");
+    assert_eq!(audit_status, super::StatusCode::OK, "{audit:?}");
+    let matching_rows: Vec<_> = audit["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["tagId"].as_i64() == Some(tag_id))
+        .collect();
+    assert_eq!(matching_rows.len(), 1, "{audit:?}");
+    assert_eq!(matching_rows[0]["result"], "failed");
+    assert!(matching_rows[0]["detail"]
+        .as_str()
+        .is_some_and(|s| !s.is_empty()));
+    assert!(first_closed);
+    assert!(second_accepted);
+    assert!(second_connected);
+    assert_eq!(
+        read_after_reconnect.unwrap().unwrap(),
+        vec![Ok(DriverValue::F64(7.0))]
+    );
+    assert_eq!((accepted_before_shutdown, closed_before_shutdown), (2, 1));
+    assert!(second_closed);
+    assert_eq!((final_accepted, final_closed), (2, 2));
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|(command, _)| *command == 0x1401)
+            .count(),
+        1,
+        "the failed REST write must not be replayed"
+    );
 }
