@@ -218,7 +218,8 @@ utoipa = "6"
 # `apps/banto-hub/core/tests/snapshots/openapi.json` のスナップショットテストで
 # 意味的同等性を確認済み（`Option<T>` の oneOf の並び順のみ変化）。zip が 8 系に
 # 上がり、arbitrary/derive_arbitrary は木から消え typed-path が加わった。
-utoipa-swagger-ui = { version = "10", default-features = false, features = [
+# 2026-10-26 (#651): 10.0.2 で build-dependency の zip が修正版の 9 系になった。
+utoipa-swagger-ui = { version = "10.0.2", default-features = false, features = [
     "axum",
     "vendored",
 ] }
