@@ -67,6 +67,10 @@ allow = [
     "0BSD",              # adler2
     "ISC",               # libloading 0.7.4(tray-icon -> libappindicator 経由、T16-0)
 ]
+# rustls-platform-verifier が使う証明書データのライセンス。全 crate には広げない。
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
 # confidence-threshold・include-build・include-dev・unused-allowed-license
 # などは既定値のまま(明示的に変える理由がないため)。
 
