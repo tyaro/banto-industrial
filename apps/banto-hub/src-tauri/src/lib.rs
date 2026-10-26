@@ -2286,10 +2286,7 @@ fn repair_profile_acl(target: &ProbeTarget) -> Result<(), String> {
         user_sid.as_ref().ok().map(|sid| sid.as_str()),
         target.profile_id.as_str(),
     )?;
-    let elev = host_switch_ipc::resolve_elev_exe().ok_or_else(|| {
-        "banto-hub-elev.exe が見つかりません（シェルと同じディレクトリに配置してください）"
-            .to_string()
-    })?;
+    let elev = host_switch_ipc::resolve_elev_exe_for_launch()?;
     // #706 実機確認（オーナー決定）: 既定でない profile も、このアプリを動かしている利用者の
     // SID と profile-id を渡して修復する（[`launch_gate::repair_tokens`]）。
     let tokens = launch_gate::repair_tokens(

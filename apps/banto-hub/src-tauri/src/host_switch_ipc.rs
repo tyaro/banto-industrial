@@ -8,10 +8,7 @@
 //!   （どのホストで走るか）に属する。
 //! - **やらない**: タグ CRUD・収集開始/停止などの運転 API（Hub REST のまま）。
 //!
-//! `banto-hub-elev.exe` の探索順（`set_service_autostart`）:
-//! 1. このシェル実行ファイルと同じディレクトリ
-//! 2. 親ディレクトリ直下 / `_verify_t17` 配下（staging 配置向け）
-//! 3. カレントディレクトリ / `_verify_t17` 配下（開発時）
+//! `banto-hub-elev.exe` はシェル実行ファイルと同じディレクトリからだけ起動する。
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -262,10 +259,7 @@ pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Resul
         } else {
             ElevatedAction::AUTOSTART_DISABLE
         };
-        let elev = resolve_elev_exe().ok_or_else(|| {
-            "banto-hub-elev.exe が見つかりません（シェルと同じディレクトリに配置してください）"
-                .to_string()
-        })?;
+        let elev = resolve_elev_exe_for_launch()?;
         run_elev_uac(&elev, action)
     }
     #[cfg(not(windows))]
@@ -275,34 +269,28 @@ pub fn set_service_autostart(state: State<'_, AppState>, enabled: bool) -> Resul
     }
 }
 
-/// `banto-hub-elev.exe` の探索（モジュール doc の探索順）。
+/// 見つからない場合は昇格を試みず、インストールの修復を案内する。
+pub(crate) const ELEV_NOT_FOUND: &str =
+    "banto-hub-elev.exe が見つかりません（再インストールしてください）";
+
+/// シェルと同じディレクトリにある `banto-hub-elev.exe` だけを解決する。
 pub(crate) fn resolve_elev_exe() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
-    let dir = current.parent()?;
-    let candidate = dir.join("banto-hub-elev.exe");
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-    if let Some(parent) = dir.parent() {
-        let staged = parent.join("_verify_t17").join("banto-hub-elev.exe");
-        if staged.is_file() {
-            return Some(staged);
-        }
-        let sibling = parent.join("banto-hub-elev.exe");
-        if sibling.is_file() {
-            return Some(sibling);
-        }
-    }
-    let cwd = std::env::current_dir().ok()?;
-    let from_cwd = cwd.join("banto-hub-elev.exe");
-    if from_cwd.is_file() {
-        return Some(from_cwd);
-    }
-    let verify = cwd.join("_verify_t17").join("banto-hub-elev.exe");
-    if verify.is_file() {
-        return Some(verify);
-    }
-    None
+    resolve_elev_exe_next_to(&current)
+}
+
+/// 解決できないときは UAC を起動する前に拒否する。
+pub(crate) fn resolve_elev_exe_for_launch() -> Result<PathBuf, String> {
+    elev_or_reinstall(resolve_elev_exe())
+}
+
+fn elev_or_reinstall(candidate: Option<PathBuf>) -> Result<PathBuf, String> {
+    candidate.ok_or_else(|| ELEV_NOT_FOUND.to_string())
+}
+
+fn resolve_elev_exe_next_to(shell_exe: &Path) -> Option<PathBuf> {
+    let candidate = shell_exe.parent()?.join("banto-hub-elev.exe");
+    candidate.is_file().then_some(candidate)
 }
 
 /// `banto-hub-elev.exe <action>`を UAC で昇格して起動し、終わりを待つ。
@@ -350,8 +338,52 @@ pub(crate) fn elev_result_message(
 
 #[cfg(test)]
 mod tests {
-    use super::elev_result_message;
+    use super::{elev_or_reinstall, elev_result_message, resolve_elev_exe_next_to, ELEV_NOT_FOUND};
     use banto_service_elev::launch::LaunchError;
+    use std::fs;
+
+    /// 通常の配布配置では、シェルと同じディレクトリの helper だけを返す。
+    #[test]
+    fn resolves_only_sibling_elev() {
+        let root = tempfile::tempdir().unwrap();
+        let shell_dir = root.path().join("install");
+        fs::create_dir(&shell_dir).unwrap();
+        let shell = shell_dir.join("banto-hub-shell.exe");
+        let sibling = shell_dir.join("banto-hub-elev.exe");
+        fs::write(&sibling, b"test fixture").unwrap();
+
+        assert_eq!(
+            elev_or_reinstall(resolve_elev_exe_next_to(&shell)),
+            Ok(sibling)
+        );
+    }
+
+    /// 隣が欠けていれば、親・検証用・別の作業ディレクトリに同名 exe があっても拒否する。
+    #[test]
+    fn missing_sibling_refuses_parent_cwd_and_verify_decoys() {
+        let root = tempfile::tempdir().unwrap();
+        let shell_dir = root.path().join("install");
+        let parent_verify = root.path().join("_verify_t17");
+        let cwd = root.path().join("working-directory");
+        let cwd_verify = cwd.join("_verify_t17");
+        for dir in [&shell_dir, &parent_verify, &cwd_verify] {
+            fs::create_dir_all(dir).unwrap();
+        }
+        for decoy in [
+            root.path().join("banto-hub-elev.exe"),
+            parent_verify.join("banto-hub-elev.exe"),
+            cwd.join("banto-hub-elev.exe"),
+            cwd_verify.join("banto-hub-elev.exe"),
+        ] {
+            fs::write(decoy, b"untrusted fixture").unwrap();
+        }
+
+        let shell = shell_dir.join("banto-hub-shell.exe");
+        assert_eq!(
+            elev_or_reinstall(resolve_elev_exe_next_to(&shell)),
+            Err(ELEV_NOT_FOUND.to_string())
+        );
+    }
 
     /// #392 B3-3a: 共有 crate へ移した後も、invoke が返す文言は移す前と
     /// 1 バイトも変えない（golden）。
