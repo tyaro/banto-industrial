@@ -88,7 +88,10 @@ pub use clock::{Clock, ManualClock, SystemClock};
 pub use config::{GroupConfig, StoreConfig, TagColumn};
 pub use date::LocalDate;
 pub use error::TstoreError;
-pub use files::{list_data_files, plan_prune, prune_files, DataFileInfo, PruneReport};
+pub use files::{
+    list_data_files, parse_data_file_info, plan_prune, plan_prune_candidates, prune_files,
+    DataFileInfo, PruneReport,
+};
 pub use findable::{candidate_date_range, ptime_is_findable_in, MAX_OFFSET_PAD_MS};
 pub use meta::{ColumnMeta, GroupMeta};
 pub use reader::{Sample, TsReader};

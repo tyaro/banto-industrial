@@ -25,6 +25,18 @@ pub struct DataFileInfo {
     pub seq: u32,
 }
 
+/// Parse one directory entry using the same file-name rule as the ordinary
+/// path-based scan. Callers using a held directory handle can supply its
+/// final path for reporting without reopening that path.
+pub fn parse_data_file_info(dir: &Path, name: &str) -> Option<DataFileInfo> {
+    let (date, seq) = parse_data_file_name(name)?;
+    Some(DataFileInfo {
+        path: dir.join(name),
+        date,
+        seq,
+    })
+}
+
 /// List every recognized data file in `data_dir`, sorted ascending by
 /// `(date, seq)` - the order [`crate::reader::TsReader`] consumers walk when
 /// resolving a date range to files ("日付範囲→該当ファイル解決の補助").
@@ -47,12 +59,8 @@ pub fn list_data_files(data_dir: &Path) -> Result<Vec<DataFileInfo>, TstoreError
         let Some(file_name) = file_name.to_str() else {
             continue; // non-UTF-8 name: cannot be one of ours, skip
         };
-        if let Some((date, seq)) = parse_data_file_name(file_name) {
-            files.push(DataFileInfo {
-                path: entry.path(),
-                date,
-                seq,
-            });
+        if let Some(file) = parse_data_file_info(data_dir, file_name) {
+            files.push(file);
         }
     }
 
@@ -109,10 +117,26 @@ pub(crate) fn plan_prune_excluding(
     today: LocalDate,
     pinned: &[LocalDate],
 ) -> Result<PruneReport, TstoreError> {
+    Ok(plan_prune_candidates(
+        list_data_files(data_dir)?,
+        retention_days,
+        today,
+        pinned,
+    ))
+}
+
+/// Classify already enumerated data files. A caller with a held directory
+/// can list relative to that handle, then use this identical retention rule.
+pub fn plan_prune_candidates(
+    files: impl IntoIterator<Item = DataFileInfo>,
+    retention_days: u32,
+    today: LocalDate,
+    pinned: &[LocalDate],
+) -> PruneReport {
     let mut report = PruneReport::default();
     let today_days = today.to_days_since_epoch();
 
-    for file in list_data_files(data_dir)? {
+    for file in files {
         let age_days = today_days - file.date.to_days_since_epoch();
         if age_days > retention_days as i64 && !pinned.contains(&file.date) {
             report.deleted.push(file.path);
@@ -121,7 +145,7 @@ pub(crate) fn plan_prune_excluding(
         }
     }
 
-    Ok(report)
+    report
 }
 
 /// Delete every recognized data file older than `retention_days` relative to

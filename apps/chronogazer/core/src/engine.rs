@@ -238,7 +238,7 @@ use crate::local_grant::{LocalAccess, LocalGrantStart};
 use crate::rest::{api_router, user_auth_state, HostAccess};
 use crate::retention::RetentionTask;
 use crate::server_admin::{AlwaysOnListener, LanControl, LanRouterFactory, LanStatusCache};
-use crate::service_data_dir::validate_service_data_dir;
+use crate::service_data_dir::{check_service_writable_dir, open_service_data_dir};
 use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
@@ -1039,14 +1039,14 @@ impl OpenedEngine {
                 Default::default()
             }
         };
-        let collect_data_dir = if cfg.host == ChronoGazerHost::Service {
+        let (collect_data_dir, service_data_dir) = if cfg.host == ChronoGazerHost::Service {
             let checked = cfg
                 .service_data_root
                 .as_deref()
                 .ok_or_else(|| "サービスのデータルートのハンドルがありません".to_string())
-                .and_then(|root| validate_service_data_dir(root, &store_settings.data_dir));
+                .and_then(|root| open_service_data_dir(root, &store_settings.data_dir));
             match checked {
-                Ok(dir) => dir,
+                Ok((dir, held)) => (dir, Some(held)),
                 Err(reason) => {
                     hub.shutdown().await;
                     pool.close().await;
@@ -1057,11 +1057,20 @@ impl OpenedEngine {
                 }
             }
         } else {
-            resolve_data_dir(&cfg.data_base, &store_settings.data_dir)
+            (
+                resolve_data_dir(&cfg.data_base, &store_settings.data_dir),
+                None,
+            )
         };
         // #392: 保存先に書き込めるか（`store_dir_check_required` のときだけ）。
         if cfg.store_dir_check_required {
-            if let Err(err) = check_writable_dir(&collect_data_dir).await {
+            let check = match &service_data_dir {
+                Some(held) => {
+                    check_service_writable_dir(held).map_err(crate::startup_recovery::RecoveryError)
+                }
+                None => check_writable_dir(&collect_data_dir).await,
+            };
+            if let Err(err) = check {
                 hub.shutdown().await;
                 pool.close().await;
                 return Err(EngineStartError::StoreDirUnwritable {
@@ -1070,7 +1079,15 @@ impl OpenedEngine {
                 });
             }
         }
-        let collect = CollectorService::new(pool.clone(), collect_data_dir, cfg.drivers.clone());
+        let collect = match service_data_dir {
+            Some(held) => CollectorService::new_for_service(
+                pool.clone(),
+                collect_data_dir,
+                cfg.drivers.clone(),
+                held,
+            ),
+            None => CollectorService::new(pool.clone(), collect_data_dir, cfg.drivers.clone()),
+        };
         if cfg.attach_hub {
             // 自動開始（下）より前に繋ぐ。
             collect.attach_hub(hub.clone());
