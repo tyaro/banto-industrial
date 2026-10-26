@@ -75,6 +75,8 @@ enum ControlledWriteTarget {
     Loopback,
     #[cfg(feature = "controlled-live-write-fixture")]
     RTestPlc,
+    #[cfg(feature = "controlled-live-write-fixture")]
+    RTestRangePlc,
 }
 
 impl ControlledWriteTarget {
@@ -90,6 +92,20 @@ impl ControlledWriteTarget {
             Self::Loopback => matches!(index, 3010 | 3012),
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestPlc => index == 3010,
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::RTestRangePlc => false,
+        }
+    }
+
+    fn allows_contiguous_range(self) -> bool {
+        match self {
+            Self::None => false,
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::Loopback => true,
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::RTestPlc => false,
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::RTestRangePlc => true,
         }
     }
 
@@ -102,7 +118,7 @@ impl ControlledWriteTarget {
                 .iter()
                 .any(|setting| setting.key == "host" && setting.value == "127.0.0.1"),
             #[cfg(feature = "controlled-live-write-fixture")]
-            Self::RTestPlc => {
+            Self::RTestPlc | Self::RTestRangePlc => {
                 settings
                     .iter()
                     .any(|setting| setting.key == "host" && setting.value == "192.168.11.200")
@@ -140,6 +156,17 @@ impl WasmDriver {
         component: &[u8],
     ) -> Result<Arc<Self>, LoadError> {
         Self::load_inner(manifest, component, ControlledWriteTarget::RTestPlc)
+    }
+
+    /// A separate, explicit test-only loader for exactly four contiguous R D
+    /// words. The ordinary loader and the existing single-word R fixture keep
+    /// their original write limits. Callers must also guard the real transport.
+    #[cfg(feature = "controlled-live-write-fixture")]
+    pub fn load_controlled_r_range_test_fixture(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, ControlledWriteTarget::RTestRangePlc)
     }
 
     fn load_inner(
@@ -498,48 +525,60 @@ fn controlled_write_item(
     items: &[WriteItem],
     driver_id: &DriverId,
     target: ControlledWriteTarget,
-) -> Result<write::WriteItem, WriteProgress> {
+) -> Result<Vec<write::WriteItem>, WriteProgress> {
     let refused = || {
         WriteProgress::Done(vec![
             Err(ItemError::Unsupported(
-                "controlled WASM write accepts only one explicitly allowed D/u16 fixture item"
-                    .into(),
+                "controlled WASM write accepts one allowed D/u16 item or the exact loopback D3010..D3013 range".into(),
             ));
             items.len()
         ])
     };
-    if items.len() != 1 {
-        return Err(refused());
-    }
-    let item = &items[0];
-    let address = &item.spec.address;
-    if address.driver != *driver_id
-        || !address
+    let expected_indices: Vec<u64> = if let [item] = items {
+        let Some(index) = item
+            .spec
+            .address
             .index
-            .is_some_and(|index| target.allows_address(index))
-        || address.canonical != format!("D{}", address.index.unwrap())
-        || address.area != "D"
-        || address.bit.is_some()
-        || address.word_count != 1
-        || !address.writable_area
-        || !matches!(item.spec.kind, TagKind::Numeric(DataType::U16))
-    {
-        return Err(refused());
-    }
-    let api::Value::F64(value) = item.value else {
+            .filter(|&index| target.allows_address(index))
+        else {
+            return Err(refused());
+        };
+        vec![index]
+    } else if items.len() == 4 && target.allows_contiguous_range() {
+        vec![3010, 3011, 3012, 3013]
+    } else {
         return Err(refused());
     };
-    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
-        return Err(refused());
+    let mut checked = Vec::with_capacity(items.len());
+    for (item, index) in items.iter().zip(expected_indices) {
+        let address = &item.spec.address;
+        if address.driver != *driver_id
+            || address.index != Some(index)
+            || address.canonical != format!("D{index}")
+            || address.area != "D"
+            || address.bit.is_some()
+            || address.word_count != 1
+            || !address.writable_area
+            || !matches!(item.spec.kind, TagKind::Numeric(DataType::U16))
+        {
+            return Err(refused());
+        }
+        let api::Value::F64(value) = item.value else {
+            return Err(refused());
+        };
+        if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
+            return Err(refused());
+        }
+        checked.push(write::WriteItem {
+            spec: write_types::TagSpec {
+                address: address.canonical.clone(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: write_types::Value::Float(value),
+        });
     }
-    Ok(write::WriteItem {
-        spec: write_types::TagSpec {
-            address: address.canonical.clone(),
-            data_type: "u16".into(),
-            string_words: None,
-        },
-        value: write_types::Value::Float(value),
-    })
+    Ok(checked)
 }
 
 fn api_write_fatal(value: write_types::FatalError) -> FatalError {
@@ -766,17 +805,17 @@ impl FrameConnection for WasmConnection {
                 items.len()
             ]));
         }
-        let item = match controlled_write_item(items, &self.driver_id, self.controlled_write_target)
-        {
-            Ok(item) => item,
-            Err(refused) => return Ok(refused),
-        };
+        let checked =
+            match controlled_write_item(items, &self.driver_id, self.controlled_write_target) {
+                Ok(item) => item,
+                Err(refused) => return Ok(refused),
+            };
         self.call("write-v1.write-next", |i, resource| {
             i.write_driver
                 .as_ref()
                 .expect("write export bound before capability enablement")
                 .banto_driver_write_v1()
-                .call_write_next(&mut i.store, resource, &[item], prev_response)
+                .call_write_next(&mut i.store, resource, &checked, prev_response)
         })?
         .map(|progress| match progress {
             write::WriteProgress::Send(planned) => {
@@ -989,6 +1028,58 @@ mod tests {
         assert!(
             matches!(result, Err(WriteProgress::Done(results)) if results.len() == 2 && results.iter().all(Result::is_err))
         );
+
+        let range: Vec<_> = (3010..=3013)
+            .enumerate()
+            .map(|(position, index)| {
+                fixture_write_item_at(index, api::Value::F64((position + 1) as f64))
+            })
+            .collect();
+        let checked = controlled_write_item(&range, &id, target).unwrap();
+        assert_eq!(checked.len(), 4);
+        assert_eq!(
+            checked
+                .iter()
+                .map(|item| item.spec.address.as_str())
+                .collect::<Vec<_>>(),
+            ["D3010", "D3011", "D3012", "D3013"]
+        );
+        let mut invalid_ranges = Vec::new();
+        let mut reversed = range.clone();
+        reversed.reverse();
+        invalid_ranges.push(reversed);
+        let mut hole = range.clone();
+        hole[1] = fixture_write_item_at(3014, api::Value::F64(2.0));
+        invalid_ranges.push(hole);
+        let mut duplicate = range.clone();
+        duplicate[1] = range[0].clone();
+        invalid_ranges.push(duplicate);
+        let mut protected = range.clone();
+        protected[0] = fixture_write_item_at(3000, api::Value::F64(1.0));
+        invalid_ranges.push(protected);
+        let mut protected = range.clone();
+        protected[0] = fixture_write_item_at(3001, api::Value::F64(1.0));
+        invalid_ranges.push(protected);
+        let mut overlapping = range.clone();
+        overlapping[0].spec.address.word_count = 2;
+        invalid_ranges.push(overlapping);
+        let mut protected_span = range.clone();
+        protected_span[0] = fixture_write_item_at(2999, api::Value::F64(1.0));
+        protected_span[0].spec.address.word_count = 4;
+        invalid_ranges.push(protected_span);
+        let mut wrong_kind = range.clone();
+        wrong_kind[2].spec.kind = TagKind::numeric(DataType::U32);
+        invalid_ranges.push(wrong_kind);
+        let mut non_finite = range.clone();
+        non_finite[3].value = api::Value::F64(f64::NAN);
+        invalid_ranges.push(non_finite);
+        for invalid in invalid_ranges {
+            assert!(matches!(
+                controlled_write_item(&invalid, &id, target),
+                Err(WriteProgress::Done(results))
+                    if results.len() == 4 && results.iter().all(Result::is_err)
+            ));
+        }
     }
 
     #[test]
@@ -1026,6 +1117,25 @@ mod tests {
             &[fixture_write_item_at(3012, api::Value::F64(1.0))],
             &id,
             target
+        )
+        .is_err());
+        let range: Vec<_> = (3010..=3013)
+            .map(|index| fixture_write_item_at(index, api::Value::F64(1.0)))
+            .collect();
+        assert!(matches!(
+            controlled_write_item(&range, &id, target),
+            Err(WriteProgress::Done(results))
+                if results.len() == 4 && results.iter().all(Result::is_err)
+        ));
+        let range_target = ControlledWriteTarget::RTestRangePlc;
+        assert!(range_target.accepts_settings(&settings("192.168.11.200", "3109")));
+        assert!(!range_target.accepts_settings(&settings("127.0.0.1", "3109")));
+        assert!(!range_target.accepts_settings(&settings("192.168.11.200", "3100")));
+        assert!(controlled_write_item(&range, &id, range_target).is_ok());
+        assert!(controlled_write_item(
+            &[fixture_write_item_at(3010, api::Value::F64(1.0))],
+            &id,
+            range_target
         )
         .is_err());
     }

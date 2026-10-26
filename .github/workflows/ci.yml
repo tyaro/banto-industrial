@@ -533,10 +533,35 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'SLMP write component validation failed' }
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_WRITE_COMPONENT_WASM --world driver-with-write-v1
           if ($LASTEXITCODE -ne 0) { throw 'SLMP write component world mismatch' }
+          # The range-write guest is pinned separately. Keep the earlier
+          # write-v1 component above for single-word compatibility tests.
+          $slmpRangeWriteSha = 'c95e7f84e0a3b275298901882a9f6b2512c4f41a'
+          git -C $guest checkout --quiet --detach $slmpRangeWriteSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpRangeWriteSha) {
+            throw 'SLMP range-write guest SHA mismatch'
+          }
+          $slmpRangeReadWit = git -C $guest rev-parse --verify "${slmpRangeWriteSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $slmpRangeReadWit -ne $hostWit) {
+            throw 'SLMP range-write guest read WIT mismatch'
+          }
+          $slmpRangeWriteWit = git -C $guest rev-parse --verify "${slmpRangeWriteSha}:wit/write-v1.wit"
+          if ($LASTEXITCODE -ne 0 -or $slmpRangeWriteWit -ne $hostWriteWit) {
+            throw 'SLMP range-write guest WIT mismatch'
+          }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write guest build failed' }
+          $slmpRangeWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-range-write-component.wasm'
+          wasm-tools component new $slmpRangeWriteModule -o $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component creation failed' }
+          wasm-tools validate $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM --world driver-with-write-v1
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP range-write component world mismatch' }
           $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpWriteTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM controlled write Hub tests failed' }
-          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 13 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM controlled write Hub tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.

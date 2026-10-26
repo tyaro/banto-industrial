@@ -8,12 +8,13 @@ use banto_driver_api::{
     ConnectContext, DataType, DriverBase, FatalError, FrameDriver, ItemError, Session as _,
     Settings, TagKind, TagSpec, Value as DriverValue, WriteItem,
 };
-use banto_driver_engine::{transport::TransportSpec, FrameSession};
+use banto_driver_engine::{transport::TransportSpec, EngineEvent, EngineEvents, FrameSession};
 use banto_driver_wasm::WasmDriver;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 const MANIFEST: &[u8] = include_bytes!("manifest.json");
+type RecordedWriteFrames = Arc<Mutex<Vec<(u32, Vec<u16>)>>>;
 
 #[derive(Clone, Copy)]
 enum Peer {
@@ -31,6 +32,7 @@ struct Fixture {
     address: SocketAddr,
     commands: Arc<Mutex<Vec<(u16, u32)>>>,
     write_values: Arc<Mutex<Vec<u16>>>,
+    write_frames: RecordedWriteFrames,
     d_reads: Arc<Mutex<Vec<(u32, u16)>>>,
     accepted: tokio::sync::watch::Receiver<usize>,
     closed: tokio::sync::watch::Receiver<usize>,
@@ -45,6 +47,8 @@ impl Fixture {
         let events = commands.clone();
         let write_values = Arc::new(Mutex::new(Vec::new()));
         let writes = write_values.clone();
+        let write_frames: RecordedWriteFrames = Arc::new(Mutex::new(Vec::new()));
+        let frames = write_frames.clone();
         let d_reads = Arc::new(Mutex::new(Vec::new()));
         let reads = d_reads.clone();
         let (accepted_tx, accepted) = tokio::sync::watch::channel(0usize);
@@ -90,6 +94,11 @@ impl Fixture {
                             (0, body)
                         }
                         0x0401 if request[if subcommand == 2 { 23 } else { 22 }] == 0xa9 => {
+                            let count_offset = if subcommand == 2 { 25 } else { 23 };
+                            let count = u16::from_le_bytes([
+                                request[count_offset],
+                                request[count_offset + 1],
+                            ]);
                             if matches!(peer, Peer::RSdRefused) {
                                 (0xc05b, vec![])
                             } else {
@@ -98,10 +107,16 @@ impl Fixture {
                                 } else {
                                     4000
                                 };
-                                let body = if matches!(peer, Peer::Q) {
+                                let body = if matches!(peer, Peer::Q) && count == 1 {
                                     (limit as u16).to_le_bytes().to_vec()
-                                } else {
+                                } else if count == 2 {
                                     (limit as u32).to_le_bytes().to_vec()
+                                } else if subcommand == 2 && count == 4 {
+                                    let mut words = (limit as u32).to_le_bytes().to_vec();
+                                    words.extend_from_slice(&(limit as u32).to_le_bytes());
+                                    words
+                                } else {
+                                    panic!("unexpected SD count {count}")
                                 };
                                 (0, body)
                             }
@@ -114,19 +129,43 @@ impl Fixture {
                             ]);
                             assert!((1..=960).contains(&count));
                             reads.lock().unwrap().push((start, count));
-                            (0, 7u16.to_le_bytes().repeat(usize::from(count)))
+                            let stored = frames.lock().unwrap().last().cloned();
+                            let data = stored
+                                .filter(|(first, values)| {
+                                    start >= *first
+                                        && u64::from(start) + u64::from(count)
+                                            <= u64::from(*first) + values.len() as u64
+                                        && values.len() == 4
+                                })
+                                .map(|(first, values)| {
+                                    let offset = (start - first) as usize;
+                                    values[offset..offset + usize::from(count)].to_vec()
+                                })
+                                .unwrap_or_else(|| vec![7; usize::from(count)]);
+                            (
+                                0,
+                                data.iter().flat_map(|value| value.to_le_bytes()).collect(),
+                            )
                         }
                         0x1401 => {
                             assert!(matches!(start, 3010 | 3012));
                             assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
                             assert_eq!(request[23], 0xa8);
-                            assert_eq!(u16::from_le_bytes([request[25], request[26]]), 1);
-                            let value = u16::from_le_bytes([request[27], request[28]]);
-                            assert!(matches!(value, 9 | 10));
+                            let count = usize::from(u16::from_le_bytes([request[25], request[26]]));
+                            assert!(count == 1 || (start == 3010 && count == 4));
+                            assert_eq!(request.len(), 27 + count * 2);
+                            let values: Vec<_> = request[27..]
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .map(|word| u16::from_le_bytes(*word))
+                                .collect();
+                            assert!(values.iter().all(|value| matches!(*value, 9 | 10)));
+                            writes.lock().unwrap().extend(&values);
                             let write_count = {
-                                let mut values = writes.lock().unwrap();
-                                values.push(value);
-                                values.len()
+                                let mut sent = frames.lock().unwrap();
+                                sent.push((start, values));
+                                sent.len()
                             };
                             if matches!(peer, Peer::Timeout)
                                 || (matches!(peer, Peer::TimeoutOnce) && write_count == 1)
@@ -164,6 +203,7 @@ impl Fixture {
             address,
             commands,
             write_values,
+            write_frames,
             d_reads,
             accepted,
             closed,
@@ -179,6 +219,10 @@ impl Fixture {
         self.write_values.lock().unwrap().clone()
     }
 
+    fn write_frames(&self) -> Vec<(u32, Vec<u16>)> {
+        self.write_frames.lock().unwrap().clone()
+    }
+
     fn d_reads(&self) -> Vec<(u32, u16)> {
         self.d_reads.lock().unwrap().clone()
     }
@@ -190,10 +234,23 @@ impl Drop for Fixture {
     }
 }
 
-async fn connected_session(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSession) {
+struct WriteSteps(Mutex<Vec<Vec<u32>>>);
+
+impl EngineEvents for WriteSteps {
+    fn record(&self, event: EngineEvent) {
+        if let EngineEvent::WriteStep(covers) = event {
+            self.0.lock().unwrap().push(covers);
+        }
+    }
+}
+
+async fn connected_session_with(
+    peer: Peer,
+    component_env: &str,
+    events: Option<Arc<dyn EngineEvents>>,
+) -> (Fixture, Arc<WasmDriver>, FrameSession) {
     let fixture = Fixture::start(peer).await;
-    let component =
-        std::fs::read(std::env::var("BANTO_SLMP_WRITE_COMPONENT_WASM").unwrap()).unwrap();
+    let component = std::fs::read(std::env::var(component_env).unwrap()).unwrap();
     let driver = WasmDriver::load_controlled_write_fixture(MANIFEST, &component).unwrap();
     let settings = Settings::from_pairs([
         ("host".to_owned(), "127.0.0.1".to_owned()),
@@ -209,10 +266,19 @@ async fn connected_session(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSessio
         Duration::from_millis(300),
         Duration::from_millis(300),
     );
-    let session = FrameSession::connect(driver.as_ref(), &settings, &transport, &context, None)
+    let session = FrameSession::connect(driver.as_ref(), &settings, &transport, &context, events)
         .await
-        .unwrap();
+        .unwrap_or_else(|error| {
+            panic!(
+                "SLMP fixture connect failed: {error:?}; commands={:?}",
+                fixture.commands()
+            )
+        });
     (fixture, driver, session)
+}
+
+async fn connected_session(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSession) {
+    connected_session_with(peer, "BANTO_SLMP_WRITE_COMPONENT_WASM", None).await
 }
 
 fn item(driver: &WasmDriver, address: &str, value: f64) -> WriteItem {
@@ -398,6 +464,264 @@ async fn loopback_allowlist_accepts_only_named_d_words() {
             .collect::<Vec<_>>(),
         vec![(0x1401, 3012)]
     );
+}
+
+fn range_items(driver: &WasmDriver) -> Vec<WriteItem> {
+    ["D3010", "D3011", "D3012", "D3013"]
+        .into_iter()
+        .zip([9.0, 10.0, 9.0, 10.0])
+        .map(|(address, value)| item(driver, address, value))
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
+async fn range_host_preflight_rejects_every_bad_item_without_a_write_frame() {
+    let (fixture, driver, mut session) = connected_session(Peer::R).await;
+    let valid = range_items(&driver);
+    let mut invalid = Vec::new();
+    let mut reversed = valid.clone();
+    reversed.reverse();
+    invalid.push(reversed);
+    let mut hole = valid.clone();
+    hole[1] = item(&driver, "D3014", 10.0);
+    invalid.push(hole);
+    let mut duplicate = valid.clone();
+    duplicate[1] = valid[0].clone();
+    invalid.push(duplicate);
+    let mut protected = valid.clone();
+    protected[0] = item(&driver, "D3000", 9.0);
+    invalid.push(protected);
+    let mut protected = valid.clone();
+    protected[0] = item(&driver, "D3001", 9.0);
+    invalid.push(protected);
+    let mut outside = valid.clone();
+    outside[3] = item(&driver, "D3014", 10.0);
+    invalid.push(outside);
+    let mut overlap = valid.clone();
+    overlap[0].spec.address.word_count = 2;
+    invalid.push(overlap);
+    let mut protected_span = valid.clone();
+    protected_span[0] = item(&driver, "D2999", 9.0);
+    protected_span[0].spec.address.word_count = 4;
+    invalid.push(protected_span);
+    let mut wrong_kind = valid.clone();
+    wrong_kind[2].spec.kind = TagKind::numeric(DataType::U32);
+    invalid.push(wrong_kind);
+    let mut bad_value = valid.clone();
+    bad_value[3].value = DriverValue::F64(f64::NAN);
+    invalid.push(bad_value);
+    invalid.push(valid[..3].to_vec());
+    invalid.push([valid.clone(), vec![item(&driver, "D3014", 9.0)]].concat());
+    for items in invalid {
+        let result = session.write_batch(&items).await.unwrap();
+        assert_eq!(result.len(), items.len());
+        assert!(result
+            .iter()
+            .all(|entry| matches!(entry, Err(ItemError::Unsupported(_)))));
+        assert!(fixture.write_frames().is_empty());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM to the reviewed range-write component"]
+async fn contiguous_four_word_range_is_one_frame_with_ordered_covers_and_readback() {
+    let steps = Arc::new(WriteSteps(Mutex::new(Vec::new())));
+    let (fixture, driver, mut session) = connected_session_with(
+        Peer::R,
+        "BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM",
+        Some(steps.clone()),
+    )
+    .await;
+    let items = range_items(&driver);
+    assert_eq!(session.write_batch(&items).await.unwrap(), vec![Ok(()); 4]);
+    assert_eq!(fixture.write_frames(), vec![(3010, vec![9, 10, 9, 10])]);
+    assert_eq!(*steps.0.lock().unwrap(), vec![vec![0, 1, 2, 3]]);
+    let specs: Vec<_> = items.iter().map(|item| item.spec.clone()).collect();
+    assert_eq!(
+        session.read_batch(&specs).await.unwrap(),
+        [9.0, 10.0, 9.0, 10.0]
+            .map(|value| Ok(DriverValue::F64(value)))
+            .to_vec()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM to the reviewed range-write component"]
+async fn hub_rest_range_batch_keeps_scope_audit_and_one_broker_frame() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let fixture = Fixture::start(Peer::R).await;
+    let component =
+        std::fs::read(std::env::var("BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM").unwrap()).unwrap();
+    let app = super::test_app_with_controlled_write_manifest(
+        "t12-slmp-range-write-rest",
+        MANIFEST,
+        &component,
+    )
+    .await;
+    let settings = serde_json::json!({"host":"127.0.0.1","port":fixture.address.port()});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "slmp-range-fixture-line".into(),
+            protocol: "slmp-write-fixture".into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("slmp-range-group", saved.id, 60_000))
+    .await
+    .unwrap();
+    let mut tag_ids = Vec::new();
+    let mut tag_names = Vec::new();
+    for index in 3010..=3013 {
+        let name = format!("word{index}");
+        let mut tag = super::tag_input(&name, group.id, &format!("D{index}"), "u16");
+        tag.writable = true;
+        tag_ids.push(app.manager.tags().create(tag).await.unwrap().id);
+        tag_names.push(format!("slmp-range-fixture-line.slmp-range-group.{name}"));
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "fixture-range-writer",
+            tag_names.iter().map(|tag| format!("write:{tag}")).collect(),
+            Some(now_ms + 600_000),
+        )
+        .await
+        .expect("issue a scoped key in the temporary test database");
+    app.write_control.enable();
+    let request = serde_json::json!({
+        "writes": tag_names
+            .iter()
+            .zip([9, 10, 9, 10])
+            .map(|(tag, value)| serde_json::json!({"tag":tag,"v":value}))
+            .collect::<Vec<_>>()
+    });
+    let response = tokio::time::timeout(
+        Duration::from_secs(15),
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/v1/values/batch",
+            &issued.key,
+            request,
+        ),
+    )
+    .await;
+    let frames = fixture.write_frames();
+    let audit = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    drop(app);
+
+    assert!(revoked.expect("revoke temporary key").revoked_at.is_some());
+    let (status, body) = response.expect("bounded REST range write");
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    let writes = body["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 4);
+    for (result, tag) in writes.iter().zip(&tag_names) {
+        assert_eq!(result["tag"], *tag);
+        assert_eq!(result["ok"], true, "{result:?}");
+    }
+    assert_eq!(frames, vec![(3010, vec![9, 10, 9, 10])]);
+    assert_eq!(audit.0, super::StatusCode::OK);
+    let rows = audit.1["rows"].as_array().unwrap();
+    for tag_id in tag_ids {
+        assert!(rows
+            .iter()
+            .any(|row| row["tagId"].as_i64() == Some(tag_id) && row["result"] == "ok"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM to the reviewed range-write component"]
+async fn uncertain_four_word_ack_closes_session_without_a_second_write_frame() {
+    for peer in [Peer::BadAck, Peer::Timeout] {
+        let (mut fixture, driver, mut session) =
+            connected_session_with(peer, "BANTO_SLMP_RANGE_WRITE_COMPONENT_WASM", None).await;
+        let result = session.write_batch(&range_items(&driver)).await;
+        assert!(matches!(
+            result,
+            Err(FatalError::Framing(_)) | Err(FatalError::Protocol(_)) | Err(FatalError::Timeout)
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fixture.closed.wait_for(|count| *count >= 1),
+        )
+        .await
+        .expect("failed range write closes the socket")
+        .unwrap();
+        assert_eq!(fixture.write_frames(), vec![(3010, vec![9, 10, 9, 10])]);
+
+        let settings = Settings::from_pairs([
+            ("host".to_owned(), "127.0.0.1".to_owned()),
+            ("port".to_owned(), fixture.address.port().to_string()),
+        ])
+        .unwrap();
+        let transport = TransportSpec::Tcp {
+            host: "127.0.0.1".into(),
+            port: fixture.address.port(),
+        };
+        let context = ConnectContext::new(
+            "slmp-range-reconnect",
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        );
+        let mut recovered =
+            FrameSession::connect(driver.as_ref(), &settings, &transport, &context, None)
+                .await
+                .unwrap();
+        let kind = TagKind::numeric(DataType::U16);
+        let spec = TagSpec::new(driver.parse_address("D3010", &kind).unwrap(), kind);
+        assert_eq!(
+            recovered.read_batch(&[spec]).await.unwrap(),
+            vec![Ok(DriverValue::F64(9.0))]
+        );
+        assert_eq!(fixture.write_frames(), vec![(3010, vec![9, 10, 9, 10])]);
+        assert_eq!(*fixture.accepted.borrow(), 2);
+        recovered.disconnect().await;
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            fixture.closed.wait_for(|count| *count >= 2),
+        )
+        .await
+        .expect("reconnected range session closes")
+        .unwrap();
+        assert_eq!(fixture.write_frames(), vec![(3010, vec![9, 10, 9, 10])]);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
