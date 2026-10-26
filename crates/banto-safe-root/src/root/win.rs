@@ -78,20 +78,38 @@ pub(super) fn open_managed_one(
     owners: &[InstallUserSid],
     create_access: Option<&DirAccess>,
 ) -> std::result::Result<ManagedDir, ManagedRefusal> {
-    let opened = match parent
-        .open_child_dir(spec.name)
-        .map_err(ManagedRefusal::Io)?
-    {
+    open_managed_child(
+        parent,
+        parent_display,
+        spec.name,
+        spec.create,
+        owners,
+        create_access,
+    )
+}
+
+pub(super) fn open_managed_child(
+    parent: &PinnedDir,
+    parent_display: &Path,
+    name: &str,
+    create: bool,
+    owners: &[InstallUserSid],
+    create_access: Option<&DirAccess>,
+) -> std::result::Result<ManagedDir, ManagedRefusal> {
+    if !guard::is_plain_child_name(name) {
+        return Err(ManagedRefusal::Spec(super::SpecProblem::InvalidName));
+    }
+    let opened = match parent.open_child_dir(name).map_err(ManagedRefusal::Io)? {
         Some(dir) => dir,
-        None if !spec.create => return Err(ManagedRefusal::Absent),
+        None if !create => return Err(ManagedRefusal::Absent),
         None => match parent
-            .create_child_dir(spec.name, create_access)
+            .create_child_dir(name, create_access)
             .map_err(ManagedRefusal::Io)?
         {
             Some(dir) => dir,
             // 確かめてから作るまでの間に誰かが作った。親のハンドルを基準に開き直す。
             None => parent
-                .open_child_dir(spec.name)
+                .open_child_dir(name)
                 .map_err(ManagedRefusal::Io)?
                 .ok_or(ManagedRefusal::Absent)?,
         },
@@ -101,7 +119,7 @@ pub(super) fn open_managed_one(
         return Err(ManagedRefusal::Refused(refusal));
     }
     // 親のハンドルを基準に開いたので外には出ないはずだが、本当のパスでも確かめる（多重の防御）。
-    let expected = parent.final_path().join(spec.name);
+    let expected = parent.final_path().join(name);
     if !guard::paths_match(opened.final_path(), &expected) {
         return Err(ManagedRefusal::Refused(Refusal::Elsewhere {
             actual: opened.final_path().to_path_buf(),
@@ -110,7 +128,7 @@ pub(super) fn open_managed_one(
     if !owner_allowed(&opened.info().owner, owners) {
         return Err(ManagedRefusal::ForeignOwner(opened.info().owner.clone()));
     }
-    Ok(ManagedDir::guarded(opened, parent_display.join(spec.name)))
+    Ok(ManagedDir::guarded(opened, parent_display.join(name)))
 }
 
 fn refused(display: &Path, refusal: Refusal) -> SafeRootError {

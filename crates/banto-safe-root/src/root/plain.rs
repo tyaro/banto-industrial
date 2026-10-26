@@ -61,7 +61,18 @@ pub(super) fn open_managed_one(
     parent: &ManagedDir,
     spec: &ManagedSpec,
 ) -> std::result::Result<ManagedDir, ManagedRefusal> {
-    let path = parent.final_path.join(spec.name);
+    open_managed_child(parent, spec.name, spec.create)
+}
+
+pub(super) fn open_managed_child(
+    parent: &ManagedDir,
+    name: &str,
+    create: bool,
+) -> std::result::Result<ManagedDir, ManagedRefusal> {
+    if !crate::guard::is_plain_child_name(name) {
+        return Err(ManagedRefusal::Spec(super::SpecProblem::InvalidName));
+    }
+    let path = parent.final_path.join(name);
     let refuse_io = |op| move |e: std::io::Error| ManagedRefusal::Io(SafeRootError::io(op, &e));
     match std::fs::metadata(&path) {
         Ok(meta) if meta.is_dir() => {}
@@ -71,7 +82,7 @@ pub(super) fn open_managed_one(
             ))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            if !spec.create {
+            if !create {
                 return Err(ManagedRefusal::Absent);
             }
             match std::fs::create_dir(&path) {
@@ -93,10 +104,7 @@ pub(super) fn open_managed_one(
             crate::error::Refusal::NotADirectory,
         ));
     }
-    Ok(ManagedDir::plain(
-        parent.display.join(spec.name),
-        final_path,
-    ))
+    Ok(ManagedDir::plain(parent.display.join(name), final_path))
 }
 
 pub(super) fn create_new(dir: &Path, name: &str) -> Result<Option<File>> {

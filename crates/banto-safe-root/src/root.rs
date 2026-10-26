@@ -695,6 +695,61 @@ impl SafeRoot {
         Ok(ManagedSet { dirs })
     }
 
+    /// Open or create a dynamically configured relative child directory,
+    /// keeping its final handle. Every component is opened from the preceding
+    /// held handle with the same checks as `open_managed`, then checked against
+    /// the operation-mode ACL. The caller must first validate path policy and
+    /// establish the root's operation mode. Plain mode is only a compatibility
+    /// fallback for simulation; it provides no non-following boundary.
+    pub fn open_relative_operation_dir(
+        &self,
+        relative: &Path,
+    ) -> std::result::Result<ManagedDir, ManagedRefusal> {
+        let operation = self
+            .dir
+            .is_guarded()
+            .then(|| DirAccess::with_readers(self.owners.clone()));
+        let mut opened: Option<ManagedDir> = None;
+        for component in relative.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(ManagedRefusal::Spec(SpecProblem::InvalidName));
+            };
+            let name = name
+                .to_str()
+                .filter(|name| guard::is_plain_child_name(name))
+                .ok_or(ManagedRefusal::Spec(SpecProblem::InvalidName))?;
+            let parent = opened.as_ref().unwrap_or(&self.dir);
+            let child = match &parent.inner {
+                #[cfg(windows)]
+                Inner::Guarded(pinned) => win::open_managed_child(
+                    pinned,
+                    &parent.display,
+                    name,
+                    true,
+                    &self.owners,
+                    operation.as_ref(),
+                )?,
+                Inner::Plain => plain::open_managed_child(parent, name, true)?,
+            };
+            if let Some(access) = &operation {
+                child.recheck(access).map_err(|failure| match failure {
+                    crate::mode::RecheckFailure::ReparsePoint { tag } => {
+                        ManagedRefusal::Refused(Refusal::ReparsePoint { tag })
+                    }
+                    crate::mode::RecheckFailure::NotADirectory => {
+                        ManagedRefusal::Refused(Refusal::NotADirectory)
+                    }
+                    crate::mode::RecheckFailure::Acl(mismatch) => {
+                        ManagedRefusal::Io(SafeRootError::AclMismatch(mismatch))
+                    }
+                    crate::mode::RecheckFailure::Io(error) => ManagedRefusal::Io(error),
+                })?;
+            }
+            opened = Some(child);
+        }
+        opened.ok_or(ManagedRefusal::Spec(SpecProblem::InvalidName))
+    }
+
     fn open_one(
         &self,
         parent: &ManagedDir,

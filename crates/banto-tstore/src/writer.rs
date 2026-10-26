@@ -456,6 +456,19 @@ impl TsWriter {
         )
     }
 
+    /// Run an alternative directory-backed prune while holding the same
+    /// writer lock and protecting both the current file and buffered dates.
+    /// The callback is synchronous so no rotation can interleave with it.
+    pub async fn prune_files_with(
+        &self,
+        retention_days: u32,
+        today: LocalDate,
+        prune: impl FnOnce(u32, LocalDate, &[LocalDate]) -> Result<PruneReport, TstoreError>,
+    ) -> Result<PruneReport, TstoreError> {
+        let inner = self.inner.lock().await;
+        prune(retention_days, today, &inner.pinned_dates())
+    }
+
     /// [`Self::prune_files`] の予行（何も消さない）。同じロックの下で、同じ
     /// 「開いている日付と未書き込みの行がある日付は消さない」判定をするので、
     /// 設定画面の削除予定数と実際に消える数がずれない（#541）。
@@ -2320,6 +2333,32 @@ mod tests {
         let report = writer.prune_files(1, today).await.unwrap();
         assert_eq!(report.deleted, vec![day1_file.clone()]);
         assert!(!day1_file.exists(), "切り替え後は消せる");
+        writer.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn directory_backed_prune_callback_receives_the_pinned_date() {
+        let dir = TempDir::new("prune-callback-pinned");
+        let clock = clock_at(DAY1_START_MS);
+        let writer = TsWriter::open(dir.path(), two_group_config(), clock)
+            .await
+            .unwrap();
+        let file = list_data_files(dir.path()).unwrap().remove(0);
+        let today = LocalDate::new(file.date.year, file.date.month, file.date.day + 3);
+        let report = writer
+            .prune_files_with(0, today, |days, date, pinned| {
+                Ok(crate::files::plan_prune_candidates(
+                    vec![file.clone()],
+                    days,
+                    date,
+                    pinned,
+                ))
+            })
+            .await
+            .unwrap();
+        assert!(report.deleted.is_empty());
+        assert_eq!(report.kept, vec![file.path.clone()]);
+        assert!(file.path.exists());
         writer.close().await.unwrap();
     }
 
