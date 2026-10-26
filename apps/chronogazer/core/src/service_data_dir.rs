@@ -12,7 +12,9 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use banto_safe_root::guard::{is_plain_child_name, is_same_or_inside, paths_match};
+#[cfg(windows)]
+use banto_safe_root::guard::paths_match;
+use banto_safe_root::guard::{is_plain_child_name, is_same_or_inside};
 use banto_safe_root::SafeRoot;
 
 /// Resolve a service setting to a child of the held root without changing the
