@@ -82,6 +82,17 @@ impl ControlledWriteTarget {
         self != Self::None
     }
 
+    fn allows_address(self, index: u64) -> bool {
+        let _ = index;
+        match self {
+            Self::None => false,
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::Loopback => matches!(index, 3010 | 3012),
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::RTestPlc => index == 3010,
+        }
+    }
+
     fn accepts_settings(self, settings: &Settings) -> bool {
         let _ = settings;
         match self {
@@ -486,11 +497,13 @@ fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalE
 fn controlled_write_item(
     items: &[WriteItem],
     driver_id: &DriverId,
+    target: ControlledWriteTarget,
 ) -> Result<write::WriteItem, WriteProgress> {
     let refused = || {
         WriteProgress::Done(vec![
             Err(ItemError::Unsupported(
-                "controlled WASM write accepts only one D3010/u16 fixture item".into(),
+                "controlled WASM write accepts only one explicitly allowed D/u16 fixture item"
+                    .into(),
             ));
             items.len()
         ])
@@ -501,9 +514,11 @@ fn controlled_write_item(
     let item = &items[0];
     let address = &item.spec.address;
     if address.driver != *driver_id
-        || address.canonical != "D3010"
+        || !address
+            .index
+            .is_some_and(|index| target.allows_address(index))
+        || address.canonical != format!("D{}", address.index.unwrap())
         || address.area != "D"
-        || address.index != Some(3010)
         || address.bit.is_some()
         || address.word_count != 1
         || !address.writable_area
@@ -699,7 +714,7 @@ impl FrameDriver for WasmDriver {
             resource,
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
-            controlled_write_fixture: self.controlled_write_target.allows_write(),
+            controlled_write_target: self.controlled_write_target,
             driver_id: self.descriptor.id.clone(),
         }))
     }
@@ -710,7 +725,7 @@ struct WasmConnection {
     resource: wasmtime::component::ResourceAny,
     runtime: Arc<Runtime>,
     failed: AtomicBool,
-    controlled_write_fixture: bool,
+    controlled_write_target: ControlledWriteTarget,
     driver_id: DriverId,
 }
 
@@ -743,7 +758,7 @@ impl FrameConnection for WasmConnection {
         items: &[WriteItem],
         prev_response: Option<&[u8]>,
     ) -> Result<WriteProgress, FatalError> {
-        if !self.controlled_write_fixture {
+        if !self.controlled_write_target.allows_write() {
             return Ok(WriteProgress::Done(vec![
                 Err(ItemError::Unsupported(
                     "WASM driver is read-only".into()
@@ -751,7 +766,8 @@ impl FrameConnection for WasmConnection {
                 items.len()
             ]));
         }
-        let item = match controlled_write_item(items, &self.driver_id) {
+        let item = match controlled_write_item(items, &self.driver_id, self.controlled_write_target)
+        {
             Ok(item) => item,
             Err(refused) => return Ok(refused),
         };
@@ -900,6 +916,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[cfg(feature = "controlled-write-fixture")]
     fn fixture_write_item(value: api::Value) -> WriteItem {
         let id = DriverId::new("slmp-write-fixture").unwrap();
         let address = DriverAddress::new(id, "D3010", "D", true, 1).with_index(3010);
@@ -909,25 +926,52 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "controlled-write-fixture")]
+    fn fixture_write_item_at(index: u64, value: api::Value) -> WriteItem {
+        let mut item = fixture_write_item(value);
+        item.spec.address.canonical = format!("D{index}");
+        item.spec.address.index = Some(index);
+        item
+    }
+
+    #[cfg(feature = "controlled-write-fixture")]
     #[test]
     fn controlled_write_preflight_is_all_or_nothing_and_exactly_scoped() {
         let id = DriverId::new("slmp-write-fixture").unwrap();
         let valid = fixture_write_item(api::Value::F64(65535.0));
-        assert!(controlled_write_item(std::slice::from_ref(&valid), &id).is_ok());
+        let target = ControlledWriteTarget::Loopback;
+        assert!(controlled_write_item(std::slice::from_ref(&valid), &id, target).is_ok());
+        assert!(controlled_write_item(
+            &[fixture_write_item_at(3012, api::Value::F64(9.0))],
+            &id,
+            target
+        )
+        .is_ok());
+        for index in [3000, 3001, 3009, 3011, 3013] {
+            assert!(controlled_write_item(
+                &[fixture_write_item_at(index, api::Value::F64(9.0))],
+                &id,
+                target
+            )
+            .is_err());
+        }
         for value in [f64::NAN, f64::INFINITY, -1.0, 0.5, 65536.0] {
             let item = fixture_write_item(api::Value::F64(value));
-            assert!(controlled_write_item(&[item], &id).is_err());
+            assert!(controlled_write_item(&[item], &id, target).is_err());
         }
-        assert!(controlled_write_item(&[fixture_write_item(api::Value::Bit(true))], &id).is_err());
+        assert!(
+            controlled_write_item(&[fixture_write_item(api::Value::Bit(true))], &id, target)
+                .is_err()
+        );
         let mut wrong = valid.clone();
         wrong.spec.address.canonical = "D3000".into();
-        assert!(controlled_write_item(&[wrong], &id).is_err());
+        assert!(controlled_write_item(&[wrong], &id, target).is_err());
         let mut wrong = valid.clone();
         wrong.spec.address.index = Some(3000);
-        assert!(controlled_write_item(&[wrong], &id).is_err());
+        assert!(controlled_write_item(&[wrong], &id, target).is_err());
         let mut wrong = valid.clone();
         wrong.spec.address.writable_area = false;
-        assert!(controlled_write_item(&[wrong], &id).is_err());
+        assert!(controlled_write_item(&[wrong], &id, target).is_err());
         for data_type in [
             DataType::I16,
             DataType::U32,
@@ -939,9 +983,9 @@ mod tests {
         ] {
             let mut wrong = valid.clone();
             wrong.spec.kind = TagKind::numeric(data_type);
-            assert!(controlled_write_item(&[wrong], &id).is_err());
+            assert!(controlled_write_item(&[wrong], &id, target).is_err());
         }
-        let result = controlled_write_item(&[valid.clone(), valid], &id);
+        let result = controlled_write_item(&[valid.clone(), valid], &id, target);
         assert!(
             matches!(result, Err(WriteProgress::Done(results)) if results.len() == 2 && results.iter().all(Result::is_err))
         );
@@ -971,6 +1015,19 @@ mod tests {
         assert!(target.accepts_settings(&settings("192.168.11.200", "3109")));
         assert!(!target.accepts_settings(&settings("127.0.0.1", "3109")));
         assert!(!target.accepts_settings(&settings("192.168.11.200", "3100")));
+        let id = DriverId::new("slmp-write-fixture").unwrap();
+        assert!(controlled_write_item(
+            &[fixture_write_item_at(3010, api::Value::F64(1.0))],
+            &id,
+            target
+        )
+        .is_ok());
+        assert!(controlled_write_item(
+            &[fixture_write_item_at(3012, api::Value::F64(1.0))],
+            &id,
+            target
+        )
+        .is_err());
     }
 
     #[test]
