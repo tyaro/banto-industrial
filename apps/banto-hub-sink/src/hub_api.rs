@@ -329,12 +329,17 @@ pub struct HubApi {
 
 impl HubApi {
     pub fn new(config: &SidecarConfig) -> Result<Self, HubApiError> {
-        let http = ClientBuilder::new()
+        if !config.transport_is_valid() {
+            return Err(HubApiError::Transport);
+        }
+        let mut builder = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|_| HubApiError::Transport)?;
+            .timeout(REQUEST_TIMEOUT);
+        if let Some(pins) = &config.hub_tls {
+            builder = pins.configure_reqwest(builder);
+        }
+        let http = builder.build().map_err(|_| HubApiError::Transport)?;
         let base = config.hub_url.trim_end_matches('/');
         Ok(Self {
             http,

@@ -10,6 +10,7 @@ use crate::binding::BindingRequest;
 use crate::endpoint::Endpoint;
 use crate::error::{Error, ErrorKind, Result};
 use crate::handle::{validate_start_requests, TagClientHandle};
+use crate::pinned_tls::PinnedHubTls;
 use crate::secret::SecretApiKey;
 use crate::types::{CatalogSnapshot, ValuesSnapshot};
 use crate::write::{send_write, validate_write_name, RequestedValue};
@@ -24,6 +25,7 @@ pub struct RestClient {
     endpoint: Endpoint,
     secret: SecretApiKey,
     http: Client,
+    pinned_tls: Option<PinnedHubTls>,
 }
 
 impl RestClient {
@@ -33,7 +35,7 @@ impl RestClient {
     /// contract. Use [`with_request_timeout`](Self::with_request_timeout) to
     /// opt in to a bound on each call.
     pub fn new(endpoint: Endpoint, secret: SecretApiKey) -> Result<Self> {
-        Self::build(endpoint, secret, None)
+        Self::build(endpoint, secret, None, None)
     }
 
     /// Like [`new`](Self::new), but bound each REST call made through this
@@ -54,13 +56,35 @@ impl RestClient {
         secret: SecretApiKey,
         timeout: Duration,
     ) -> Result<Self> {
-        Self::build(endpoint, secret, Some(timeout))
+        Self::build(endpoint, secret, Some(timeout), None)
     }
 
-    fn build(endpoint: Endpoint, secret: SecretApiKey, timeout: Option<Duration>) -> Result<Self> {
+    /// Use only the provided, protected Hub certificate pins on both REST and
+    /// WebSocket connections. A new TLS handshake rechecks the pin on reconnect.
+    pub fn with_pinned_tls(
+        endpoint: Endpoint,
+        secret: SecretApiKey,
+        timeout: Duration,
+        pins: PinnedHubTls,
+    ) -> Result<Self> {
+        if endpoint.scheme() != "https" {
+            return Err(Error::new(ErrorKind::InvalidEndpoint));
+        }
+        Self::build(endpoint, secret, Some(timeout), Some(pins))
+    }
+
+    fn build(
+        endpoint: Endpoint,
+        secret: SecretApiKey,
+        timeout: Option<Duration>,
+        pinned_tls: Option<PinnedHubTls>,
+    ) -> Result<Self> {
         let mut builder = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy();
+        if let Some(pins) = &pinned_tls {
+            builder = builder.tls_backend_preconfigured((*pins.rustls_config()).clone());
+        }
         if let Some(timeout) = timeout {
             builder = builder.timeout(timeout);
         }
@@ -72,6 +96,7 @@ impl RestClient {
             endpoint,
             secret,
             http,
+            pinned_tls,
         })
     }
 
@@ -171,7 +196,7 @@ impl RestClient {
 
     /// Connect the stream using this client's endpoint and secret.
     pub(crate) async fn connect_stream(&self) -> Result<WebSocketConnection> {
-        crate::ws_transport::connect(&self.endpoint, &self.secret).await
+        crate::ws_transport::connect(&self.endpoint, &self.secret, self.pinned_tls.as_ref()).await
     }
 
     /// Log a safe, secret-free diagnostic for a failed REST send or body

@@ -868,6 +868,9 @@ pub async fn run<F>(
 where
     F: Future<Output = StopRequest>,
 {
+    if !config.transport_is_valid() {
+        return Err(HubApiError::Transport);
+    }
     let status_push = config.status_push;
     let config_refresh = config.config_refresh;
     let health_tick = options.health_tick;
@@ -1071,6 +1074,82 @@ mod tests {
 
     use super::*;
     use crate::hub_api::SinkConfigTag;
+
+    fn temporary_hub_tls() -> (
+        tempfile::TempDir,
+        banto_tagclient::PinnedHubTls,
+        tokio_rustls::TlsAcceptor,
+    ) {
+        use std::process::Command;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("hub.pem");
+        let key = dir.path().join("hub.key");
+        let output = Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args([
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let pem = std::fs::read_to_string(&cert).unwrap();
+        let certs = CertificateDer::pem_file_iter(&cert)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = PrivateKeyDer::from_pem_file(&key).unwrap();
+        let server = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+            tokio_rustls::rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap();
+        let pins = banto_tagclient::PinnedHubTls::from_pem(&[pem]).unwrap();
+        (dir, pins, tokio_rustls::TlsAcceptor::from(Arc::new(server)))
+    }
+
+    #[tokio::test]
+    async fn programmatic_loopback_http_is_rejected_before_starting() {
+        let mut config = SidecarConfig::from_toml_str(
+            "hub_url = 'http://192.0.2.1:8722'\napi_key = 'bh_dummy.secret'\n",
+            std::path::Path::new("dummy.toml"),
+        )
+        .unwrap();
+        config.hub_url = "http://127.0.0.1:8722".into();
+        assert!(HubApi::new(&config).is_err());
+        assert!(matches!(
+            run(config.clone(), SidecarOptions::default(), async {
+                panic!("started")
+            })
+            .await,
+            Err(HubApiError::Transport)
+        ));
+        config.hub_url = "https://127.0.0.1:9443".into();
+        assert!(HubApi::new(&config).is_err());
+        assert!(matches!(
+            run(config, SidecarOptions::default(), async {
+                panic!("started")
+            })
+            .await,
+            Err(HubApiError::Transport)
+        ));
+    }
 
     fn plan(resolved: &[&str], unresolved: &[&str]) -> BindingPlan {
         BindingPlan {
@@ -1397,11 +1476,12 @@ mod tests {
     async fn held_catalog_still_reaches_shutdown_within_the_deadline() {
         let _log_guard = service_log_lock().await;
         let log_path = enable_test_service_log("held-catalog");
+        let (_tls_dir, hub_tls, tls_acceptor) = temporary_hub_tls();
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
-        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let hub_url = format!("https://{}", listener.local_addr().expect("addr"));
         let tags_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let (held_tx, held_rx) = tokio::sync::oneshot::channel::<()>();
         let held_tx = Arc::new(std::sync::Mutex::new(Some(held_tx)));
@@ -1417,9 +1497,12 @@ mod tests {
                 let held_tx = held_tx.clone();
                 let config = config.to_owned();
                 let catalog = catalog.to_owned();
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-                    let mut stream = stream;
+                    let Ok(mut stream) = tls_acceptor.accept(stream).await else {
+                        return;
+                    };
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
                     loop {
@@ -1472,6 +1555,7 @@ mod tests {
         let config = SidecarConfig {
             hub_url,
             api_key: "bh_test.secret".to_owned(),
+            hub_tls: Some(hub_tls),
             config_refresh: Duration::from_secs(60),
             status_push: Duration::from_secs(60),
             queue_max_rows: 100,
@@ -1515,18 +1599,23 @@ mod tests {
     async fn unresponsive_db_still_reaches_stopped_within_the_deadline() {
         let _log_guard = service_log_lock().await;
         let log_path = enable_test_service_log("blackhole-db");
+        let (_tls_dir, hub_tls, tls_acceptor) = temporary_hub_tls();
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
             .await
             .expect("bind");
-        let hub_url = format!("http://{}", listener.local_addr().expect("addr"));
+        let hub_url = format!("https://{}", listener.local_addr().expect("addr"));
         tokio::spawn(async move {
             loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
+                let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
+                let tls_acceptor = tls_acceptor.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let Ok(mut stream) = tls_acceptor.accept(stream).await else {
+                        return;
+                    };
                     let mut request = Vec::new();
                     let mut buf = [0_u8; 1024];
                     loop {
@@ -1552,6 +1641,7 @@ mod tests {
         let config = SidecarConfig {
             hub_url,
             api_key: "bh_test.secret".to_owned(),
+            hub_tls: Some(hub_tls),
             config_refresh: Duration::from_secs(60),
             status_push: Duration::from_secs(60),
             queue_max_rows: 100,

@@ -239,12 +239,13 @@
 				<code>banto-hub-elev.exe prepare-sink-config</code> を実行してください。置き場とファイルが保護されていないと、サイドカーは起動しません。
 			</p>
 			<div class="config-snippet">
-				<pre>hub_url = "http://127.0.0.1:&lt;Hub のポート&gt;"
+				<pre>hub_url = "https://127.0.0.1:&lt;Hub TLS のポート&gt;"
+hub_tls_pinned_certs = ['''&lt;確認済み Hub 証明書 PEM&gt;''']
 api_key = "&lt;発行したキー&gt;"</pre>
 			</div>
 			<p class="note warning">
-				⚠ <code>GET /api/sink/config</code> は DB 接続のパスワードを平文で返します。サイドカーは Hub と同一マシンでループバック
-				（127.0.0.1）接続する運用にしてください。
+				⚠ <code>GET /api/sink/config</code> は DB 接続のパスワードを平文で返します。Hub 証明書は信頼できる管理者経路で確認してから保護済み設定に登録してください。ループバック
+				HTTP はサイドカー起動前に拒否されます。
 			</p>
 		</section>
 	{/if}

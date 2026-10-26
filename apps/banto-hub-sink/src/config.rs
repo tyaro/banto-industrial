@@ -36,9 +36,14 @@
 //! ## 書式（すべての項目・既定値つき）
 //!
 //! ```toml
-//! # 必須。Hub のループバック URL（§6-15: パスワードが平文で流れるため
-//! # Hub と同一マシンでの運用が前提）。
-//! hub_url = "http://127.0.0.1:8722"
+//! # 必須。Hub のループバック TLS URL。既存の loopback HTTP 設定は
+//! # 証明書 pin の配布まで起動前に拒否する。
+//! hub_url = "https://127.0.0.1:9443"
+//! # The protected config must contain one or two verified Hub server PEM
+//! # certificates. The Sink never learns a pin from its network endpoint.
+//! hub_tls_pinned_certs = ['''-----BEGIN CERTIFICATE-----
+//! ...verified Hub certificate...
+//! -----END CERTIFICATE-----''']
 //! # 必須。Hub で発行した API キー。スコープは `admin` と `read` の両方
 //! # （下記「API キーに必要なスコープ」参照）。**このファイルに平文で
 //! # 置かれる** - v1 は MQTT のパスワードと同じ前提（§2.2・§6-3）なので、
@@ -343,6 +348,8 @@ impl std::error::Error for ConfigError {}
 struct FileConfig {
     hub_url: String,
     api_key: String,
+    #[serde(default)]
+    hub_tls_pinned_certs: Vec<String>,
     #[serde(default = "default_config_refresh_secs")]
     config_refresh_secs: u64,
     #[serde(default = "default_status_push_secs")]
@@ -379,13 +386,15 @@ fn default_shutdown_flush_secs() -> u64 {
 /// 検証済みの設定。`Debug` は手書き（このモジュールの doc comment参照）。
 #[derive(Clone)]
 pub struct SidecarConfig {
-    /// `http://127.0.0.1:<port>`。`banto_tagclient::Endpoint` が受け付ける
-    /// 形（http のみ・クエリ/フラグメント/userinfo なし）であることを
-    /// 読み込み時に確認済み。
+    /// Loopback requires HTTPS plus a pinned Hub certificate. Explicit
+    /// non-loopback HTTP retains the existing compatibility mode.
+    /// Userinfo, query and fragment are rejected when loading the config.
     pub hub_url: String,
     /// `admin` + `read` スコープの API キー（このモジュールの doc comment
     /// 「API キーに必要なスコープ」参照）。**ログ禁止**。
     pub api_key: String,
+    /// Configured only for the loopback HTTPS transport.
+    pub hub_tls: Option<banto_tagclient::PinnedHubTls>,
     pub config_refresh: Duration,
     pub status_push: Duration,
     pub queue_max_rows: usize,
@@ -399,6 +408,7 @@ impl fmt::Debug for SidecarConfig {
         f.debug_struct("SidecarConfig")
             .field("hub_url", &self.hub_url)
             .field("api_key", &"<redacted>")
+            .field("hub_tls", &self.hub_tls)
             .field("config_refresh", &self.config_refresh)
             .field("status_push", &self.status_push)
             .field("queue_max_rows", &self.queue_max_rows)
@@ -422,15 +432,39 @@ impl SidecarConfig {
 
     fn from_file_config(file: FileConfig) -> Result<Self, ConfigError> {
         let hub_url = file.hub_url.trim().to_string();
-        // `Endpoint::new` は http 限定・userinfo/クエリ/フラグメント拒否と
-        // いう、このサイドカーが必要とする検証をそのまま持っている
-        // （SDK が実際に使う型なので、ここで通れば購読も通る）。
-        banto_tagclient::Endpoint::new(&hub_url).map_err(|_| ConfigError::Invalid {
-            field: "hub_url",
-            message:
-                "http://<host>:<port> の形で指定してください（https・クエリ・ユーザー情報は不可）"
-                    .to_string(),
-        })?;
+        // Validate the actual SDK endpoint before a bearer credential can be sent.
+        let endpoint =
+            banto_tagclient::Endpoint::new(&hub_url).map_err(|_| ConfigError::Invalid {
+                field: "hub_url",
+                message: "http:// または https:// の URL を指定してください".to_string(),
+            })?;
+        let loopback = endpoint.host().is_some_and(is_loopback_host);
+        let hub_tls = match (endpoint.scheme(), loopback) {
+            ("http", true) => {
+                return Err(ConfigError::Invalid {
+                    field: "hub_url",
+                    message:
+                        "loopback HTTP は許可されません。Hub TLS と証明書 pin を設定してください"
+                            .to_string(),
+                });
+            }
+            ("https", true) => Some(
+                banto_tagclient::PinnedHubTls::from_pem(&file.hub_tls_pinned_certs).map_err(
+                    |_| ConfigError::Invalid {
+                        field: "hub_tls_pinned_certs",
+                        message: "Hub 証明書 pin を 1～2 件設定してください".to_string(),
+                    },
+                )?,
+            ),
+            ("http", false) if file.hub_tls_pinned_certs.is_empty() => None,
+            _ => {
+                return Err(ConfigError::Invalid {
+                    field: "hub_url",
+                    message: "非 loopback 接続は従来の HTTP 設定のみ明示的に利用できます"
+                        .to_string(),
+                });
+            }
+        };
 
         let api_key = file.api_key.trim().to_string();
         if api_key.is_empty() {
@@ -498,6 +532,7 @@ impl SidecarConfig {
         Ok(Self {
             hub_url,
             api_key,
+            hub_tls,
             config_refresh: Duration::from_secs(file.config_refresh_secs),
             status_push: Duration::from_secs(file.status_push_secs),
             queue_max_rows: file.queue_max_rows,
@@ -513,13 +548,34 @@ impl SidecarConfig {
     /// 設計はそれを「明記する」とだけ決めている）。
     pub fn hub_is_loopback(&self) -> bool {
         match banto_tagclient::Endpoint::new(&self.hub_url) {
-            Ok(endpoint) => matches!(
-                endpoint.host(),
-                Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1")
-            ),
+            Ok(endpoint) => endpoint.host().is_some_and(is_loopback_host),
             Err(_) => false,
         }
     }
+
+    /// Recheck public, programmatically constructed configurations before the
+    /// Sink starts or creates any client that can send its Bearer credential.
+    pub(crate) fn transport_is_valid(&self) -> bool {
+        let Ok(endpoint) = banto_tagclient::Endpoint::new(&self.hub_url) else {
+            return false;
+        };
+        match (
+            endpoint.scheme(),
+            endpoint.host().is_some_and(is_loopback_host),
+        ) {
+            ("https", true) => self.hub_tls.is_some(),
+            ("http", false) => self.hub_tls.is_none(),
+            _ => false,
+        }
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
+        || host
+            .trim_matches(['[', ']'])
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
 }
 
 fn range_u64(field: &'static str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
@@ -607,21 +663,21 @@ mod tests {
     }
 
     const MINIMAL: &str = r#"
-hub_url = "http://127.0.0.1:8722"
+hub_url = "http://192.0.2.1:8722"
 api_key = "bh_test.secret"
 "#;
 
     #[test]
     fn minimal_file_fills_in_every_default() {
         let config = SidecarConfig::from_toml_str(MINIMAL, &path()).expect("minimal config");
-        assert_eq!(config.hub_url, "http://127.0.0.1:8722");
+        assert_eq!(config.hub_url, "http://192.0.2.1:8722");
         assert_eq!(config.config_refresh, Duration::from_secs(30));
         assert_eq!(config.status_push, Duration::from_secs(5));
         assert_eq!(config.queue_max_rows, 10_000);
         assert_eq!(config.flush_interval, Duration::from_millis(1_000));
         assert_eq!(config.batch_size, 500);
         assert_eq!(config.shutdown_flush, Duration::from_secs(5));
-        assert!(config.hub_is_loopback());
+        assert!(!config.hub_is_loopback());
     }
 
     #[test]
@@ -665,9 +721,13 @@ shutdown_flush_secs = 0
     }
 
     #[test]
-    fn hub_url_must_be_a_plain_http_endpoint() {
+    fn hub_url_rejects_ambiguous_or_unpinned_endpoints() {
         for bad in [
-            "https://127.0.0.1:8722",
+            "http://127.0.0.1:8722",
+            "http://127.0.0.2:8722",
+            "http://localhost:8722",
+            "http://localhost.:8722",
+            "http://[::1]:8722",
             "http://user:pw@127.0.0.1:8722",
             "http://127.0.0.1:8722/?x=1",
             "127.0.0.1:8722",
@@ -684,8 +744,30 @@ shutdown_flush_secs = 0
     }
 
     #[test]
+    fn loopback_https_requires_a_protected_pin_before_startup() {
+        let raw = "hub_url = \"https://127.0.0.1:9443\"\napi_key = \"bh_dummy.key\"\n";
+        let err = SidecarConfig::from_toml_str(raw, &path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "hub_tls_pinned_certs",
+                ..
+            }
+        ));
+        let raw = format!("{raw}hub_tls_pinned_certs = [\"not a PEM certificate\"]\n");
+        let err = SidecarConfig::from_toml_str(&raw, &path()).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                field: "hub_tls_pinned_certs",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn api_key_must_be_present_and_header_safe() {
-        let raw = "hub_url = \"http://127.0.0.1:8722\"\napi_key = \"\"\n";
+        let raw = "hub_url = \"http://192.0.2.1:8722\"\napi_key = \"\"\n";
         let err = SidecarConfig::from_toml_str(raw, &path()).expect_err("empty key");
         assert!(
             matches!(
@@ -698,7 +780,7 @@ shutdown_flush_secs = 0
             "{err:?}"
         );
 
-        let raw = "hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh with space\"\n";
+        let raw = "hub_url = \"http://192.0.2.1:8722\"\napi_key = \"bh with space\"\n";
         let err = SidecarConfig::from_toml_str(raw, &path()).expect_err("space in key");
         assert!(
             matches!(

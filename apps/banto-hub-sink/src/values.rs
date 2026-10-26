@@ -164,7 +164,11 @@ pub fn plan_bindings(desired: &[String], catalog: &CatalogSnapshot) -> BindingPl
 fn rest_client(config: &SidecarConfig) -> Result<RestClient, banto_tagclient::Error> {
     let endpoint = Endpoint::new(&config.hub_url)?;
     let secret = SecretApiKey::new(config.api_key.clone())?;
-    RestClient::with_request_timeout(endpoint, secret, REQUEST_TIMEOUT)
+    if let Some(pins) = &config.hub_tls {
+        RestClient::with_pinned_tls(endpoint, secret, REQUEST_TIMEOUT, pins.clone())
+    } else {
+        RestClient::with_request_timeout(endpoint, secret, REQUEST_TIMEOUT)
+    }
 }
 
 /// catalog を 1 回取得して `desired` の購読計画を返す。**購読は張らない**
@@ -540,6 +544,7 @@ mod tests {
         let config = SidecarConfig {
             hub_url,
             api_key: "bh_test.secret".to_owned(),
+            hub_tls: None,
             config_refresh: std::time::Duration::from_secs(30),
             status_push: std::time::Duration::from_secs(10),
             queue_max_rows: 1000,

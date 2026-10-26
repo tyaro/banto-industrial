@@ -248,7 +248,7 @@ impl FakeOps {
             existing: HashMap::new(),
             dirs,
             files,
-            contents: Ok(b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh_x.y\"\n".to_vec()),
+            contents: Ok(b"hub_url = \"http://192.0.2.1:8722\"\napi_key = \"bh_x.y\"\n".to_vec()),
             log: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -841,7 +841,7 @@ mod windows {
         }
     }
 
-    const TOML: &[u8] = b"hub_url = \"http://127.0.0.1:8722\"\napi_key = \"bh_dummy.key\"\n";
+    const TOML: &[u8] = b"hub_url = \"http://192.0.2.1:8722\"\napi_key = \"bh_dummy.key\"\n";
 
     /// 今のルートと同じ「継承の DACL」の置き場・ファイルは、中身を読まずに断る（所有者が
     /// 利用者・利用者への許可）。管理者でなくても走る。
@@ -1024,7 +1024,7 @@ mod windows {
         assert_eq!(path, dir.join("banto-hub-sink.toml"));
         assert_eq!(text.as_bytes(), TOML);
         let config = crate::config::SidecarConfig::from_toml_str(&text, &path).unwrap();
-        assert_eq!(config.hub_url, "http://127.0.0.1:8722");
+        assert_eq!(config.hub_url, "http://192.0.2.1:8722");
         // 読んだらすぐ閉じている: 共有なし・書き込みで開ける（持ち続けていれば共有違反）。
         assert_exclusive_open(&path);
     }

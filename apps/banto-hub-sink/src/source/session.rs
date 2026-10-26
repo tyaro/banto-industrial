@@ -115,7 +115,9 @@ use tokio_tungstenite::tungstenite::http::{header::AUTHORIZATION, HeaderValue};
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::protocol::{CloseFrame, Message, WebSocketConfig};
 use tokio_tungstenite::tungstenite::Error as WsError;
-use tokio_tungstenite::{connect_async_with_config, MaybeTlsStream, WebSocketStream};
+use tokio_tungstenite::{
+    connect_async_tls_with_config, connect_async_with_config, MaybeTlsStream, WebSocketStream,
+};
 
 use crate::flush::backoff_delay;
 use crate::hub_api::BridgeSourceConfig;
@@ -239,6 +241,7 @@ pub struct SourceStatus {
 pub struct SourceContext {
     /// `ws://{hub}/api/v1/ingest/{connectionId}/stream`。
     pub ws_url: String,
+    pub hub_tls: Option<banto_tagclient::PinnedHubTls>,
     pub api_key: String,
     pub redactor: Redactor,
     /// 設定を取り直させる（`welcome`・`config_changed`・404・409・`connection_changed`）。
@@ -354,7 +357,11 @@ impl ConnectError {
     }
 }
 
-async fn connect_ws(url: &str, api_key: &str) -> Result<Ws, ConnectError> {
+async fn connect_ws(
+    url: &str,
+    api_key: &str,
+    pinned_tls: Option<&banto_tagclient::PinnedHubTls>,
+) -> Result<Ws, ConnectError> {
     let mut request = url
         .into_client_request()
         .map_err(|_| ConnectError::InvalidRequest)?;
@@ -365,10 +372,19 @@ async fn connect_ws(url: &str, api_key: &str) -> Result<Ws, ConnectError> {
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_INCOMING_MESSAGE_BYTES))
         .max_frame_size(Some(MAX_INCOMING_MESSAGE_BYTES));
-    match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        connect_async_with_config(request, Some(config), false),
-    )
+    match tokio::time::timeout(CONNECT_TIMEOUT, async {
+        if let Some(pins) = pinned_tls {
+            connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                Some(pins.websocket_connector()),
+            )
+            .await
+        } else {
+            connect_async_with_config(request, Some(config), false).await
+        }
+    })
     .await
     {
         Err(_) => Err(ConnectError::Timeout),
@@ -427,7 +443,7 @@ async fn run_source(
         let connected = tokio::select! {
             biased;
             _ = stop.changed() => break,
-            result = connect_ws(&runtime.ctx.ws_url, &runtime.ctx.api_key) => result,
+            result = connect_ws(&runtime.ctx.ws_url, &runtime.ctx.api_key, runtime.ctx.hub_tls.as_ref()) => result,
         };
         match connected {
             Ok(ws) => {
@@ -1224,6 +1240,116 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[allow(clippy::result_large_err)] // tungstenite fixes the callback's error type.
+    async fn ingest_ws_checks_the_pin_before_sending_bearer() {
+        use std::process::Command;
+        use std::sync::Arc;
+        use tokio::net::TcpListener;
+        use tokio_rustls::rustls::pki_types::pem::PemObject;
+        use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use tokio_rustls::TlsAcceptor;
+        use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
+
+        fn cert() -> (
+            tempfile::TempDir,
+            String,
+            Arc<tokio_rustls::rustls::ServerConfig>,
+        ) {
+            let dir = tempfile::tempdir().unwrap();
+            let cert = dir.path().join("hub.pem");
+            let key = dir.path().join("hub.key");
+            let output = Command::new("openssl")
+                .args([
+                    "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+                ])
+                .arg("-keyout")
+                .arg(&key)
+                .arg("-out")
+                .arg(&cert)
+                .args([
+                    "-subj",
+                    "/CN=localhost",
+                    "-addext",
+                    "subjectAltName=DNS:localhost,IP:127.0.0.1",
+                    "-addext",
+                    "basicConstraints=critical,CA:FALSE",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let pem = std::fs::read_to_string(&cert).unwrap();
+            let certs = CertificateDer::pem_file_iter(&cert)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let key = PrivateKeyDer::from_pem_file(&key).unwrap();
+            let server = tokio_rustls::rustls::ServerConfig::builder_with_provider(Arc::new(
+                tokio_rustls::rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+            (dir, pem, Arc::new(server))
+        }
+
+        async fn listen(
+            cert: Arc<tokio_rustls::rustls::ServerConfig>,
+        ) -> (String, tokio::task::JoinHandle<bool>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!(
+                "wss://127.0.0.1:{}/api/v1/ingest/1/stream",
+                listener.local_addr().unwrap().port()
+            );
+            let task = tokio::spawn(async move {
+                let Ok(Ok((stream, _))) =
+                    tokio::time::timeout(Duration::from_secs(5), listener.accept()).await
+                else {
+                    return false;
+                };
+                let Ok(stream) = TlsAcceptor::from(cert).accept(stream).await else {
+                    return false;
+                };
+                let seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let observed = seen.clone();
+                let _ = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |request: &Request, response: Response| {
+                        if request
+                            .headers()
+                            .get("authorization")
+                            .is_some_and(|value| value == "Bearer bh_dummy.secret")
+                        {
+                            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Ok(response)
+                    },
+                )
+                .await;
+                seen.load(std::sync::atomic::Ordering::SeqCst)
+            });
+            (url, task)
+        }
+
+        let (_real_dir, real_pem, server) = cert();
+        let (_wrong_dir, wrong_pem, _) = cert();
+        let pins = banto_tagclient::PinnedHubTls::from_pem(&[real_pem]).unwrap();
+        let (url, listener) = listen(server.clone()).await;
+        assert!(connect_ws(&url, "bh_dummy.secret", Some(&pins))
+            .await
+            .is_ok());
+        assert!(listener.await.unwrap());
+
+        let wrong_pins = banto_tagclient::PinnedHubTls::from_pem(&[wrong_pem]).unwrap();
+        let (url, listener) = listen(server).await;
+        assert!(connect_ws(&url, "bh_dummy.secret", Some(&wrong_pins))
+            .await
+            .is_err());
+        assert!(!listener.await.unwrap());
+    }
+
     #[test]
     fn truncate_bytes_keeps_char_boundaries() {
         assert_eq!(truncate_bytes("abc", 10), "abc");
@@ -1596,6 +1722,7 @@ mod tests {
         (
             SourceContext {
                 ws_url: url.to_string(),
+                hub_tls: None,
                 api_key: "bh_unit_test_key".to_string(),
                 redactor,
                 refresh: refresh.clone(),

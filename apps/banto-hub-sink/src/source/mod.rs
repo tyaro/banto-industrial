@@ -92,6 +92,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use banto_tagclient::PinnedHubTls;
+
 use tokio::sync::{watch, Notify, Semaphore};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
@@ -326,6 +328,7 @@ impl BridgeSupervisor {
         let supervisor = Supervisor {
             hub,
             hub_url: config.hub_url.clone(),
+            hub_tls: config.hub_tls.clone(),
             api_key: config.api_key.clone(),
             refresh_interval: config.config_refresh,
             redactor,
@@ -407,6 +410,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct Supervisor {
     hub: HubApi,
     hub_url: String,
+    hub_tls: Option<PinnedHubTls>,
     api_key: String,
     refresh_interval: Duration,
     redactor: Redactor,
@@ -598,6 +602,7 @@ impl Supervisor {
                 .clone();
             let ctx = session::SourceContext {
                 ws_url: ingest_ws_url(&self.hub_url, id),
+                hub_tls: self.hub_tls.clone(),
                 api_key: self.api_key.clone(),
                 redactor: self.redactor.clone(),
                 refresh: self.refresh.clone(),
