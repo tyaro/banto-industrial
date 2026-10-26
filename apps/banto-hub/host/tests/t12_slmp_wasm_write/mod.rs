@@ -117,7 +117,7 @@ impl Fixture {
                             (0, 7u16.to_le_bytes().repeat(usize::from(count)))
                         }
                         0x1401 => {
-                            assert_eq!(start, 3010);
+                            assert!(matches!(start, 3010 | 3012));
                             assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
                             assert_eq!(request[23], 0xa8);
                             assert_eq!(u16::from_le_bytes([request[25], request[26]]), 1);
@@ -362,6 +362,42 @@ async fn controlled_write_v1_rejects_before_send_and_checks_ack() {
             1
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_WRITE_COMPONENT_WASM to the pinned write-v1 component"]
+async fn loopback_allowlist_accepts_only_named_d_words() {
+    let (fixture, driver, mut session) = connected_session(Peer::R).await;
+    for address in ["D3000", "D3001", "D3011", "D3013"] {
+        let result = session
+            .write_batch(&[item(&driver, address, 10.0)])
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.as_slice(),
+            [Err(ItemError::Unsupported(_))]
+        ));
+    }
+    assert!(!fixture
+        .commands()
+        .iter()
+        .any(|(command, _)| *command == 0x1401));
+    assert_eq!(
+        session
+            .write_batch(&[item(&driver, "D3012", 10.0)])
+            .await
+            .unwrap(),
+        vec![Ok(())]
+    );
+    assert_eq!(
+        fixture
+            .commands()
+            .iter()
+            .filter(|(command, _)| *command == 0x1401)
+            .copied()
+            .collect::<Vec<_>>(),
+        vec![(0x1401, 3012)]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

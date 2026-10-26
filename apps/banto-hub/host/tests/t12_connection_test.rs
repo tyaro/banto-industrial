@@ -1234,6 +1234,124 @@ async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
     sim.stop();
 }
 
+/// The stage-2 guest must pass through saved tag validation, collection, and
+/// REST using the same numeric projection as native drivers. The component is
+/// supplied explicitly; this test never registers a startup plugin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_STAGE2_MODBUS_WASM and BANTO_STAGE2_MODBUS_MANIFEST"]
+async fn wasm_fc3_eight_numeric_kinds_collect_and_serve_rest() {
+    let manifest = std::fs::read(std::env::var("BANTO_STAGE2_MODBUS_MANIFEST").unwrap()).unwrap();
+    let component = std::fs::read(std::env::var("BANTO_STAGE2_MODBUS_WASM").unwrap()).unwrap();
+    modbus_numeric_hub_case(&manifest, &component, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_LOCAL_FC4_WASM and BANTO_LOCAL_FC4_MANIFEST"]
+async fn wasm_fc4_eight_numeric_kinds_collect_and_serve_rest() {
+    let manifest = std::fs::read(std::env::var("BANTO_LOCAL_FC4_MANIFEST").unwrap()).unwrap();
+    let component = std::fs::read(std::env::var("BANTO_LOCAL_FC4_WASM").unwrap()).unwrap();
+    modbus_numeric_hub_case(&manifest, &component, true).await;
+}
+
+async fn modbus_numeric_hub_case(manifest: &[u8], component: &[u8], input_register: bool) {
+    let app = test_app_with_manifest("t12-wasm-numeric", manifest, component).await;
+    let sim = ModbusSimulator::start().await;
+    let words = [
+        42, 0x8000, 0x1234, 0xabcd, 0, 0x8000, 1, 0, 0, 0x0020, 0, 0, 0, 0x8000, 0, 0x3fc0, 0, 0,
+        0, 0x3ff8,
+    ];
+    if input_register {
+        for (offset, word) in words.into_iter().enumerate() {
+            sim.set_input_register(u16::try_from(offset).unwrap(), word);
+        }
+    } else {
+        sim.set_holding_registers(0, &words);
+    }
+    let settings = json!({
+        "host": "127.0.0.1", "port": sim.addr.port(), "unit_id": 1,
+        "word_order": "low_high"
+    });
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(ConnectionSettingsInput {
+            name: "numeric-line".into(),
+            protocol: "modbus-fc3-wasm".into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group =
+        CollectionGroupService::with_registry(app.pool.clone(), app.manager.registry().clone())
+            .create(group_input("numeric-group", saved.id, 100))
+            .await
+            .unwrap();
+    let cases = [
+        ("u16", 0, 42.0),
+        ("i16", 1, i16::MIN as f64),
+        ("u32", 2, 0xabcd_1234u32 as f64),
+        ("i32", 4, i32::MIN as f64),
+        ("u64", 6, (1u64 << 53) as f64),
+        ("i64", 10, i64::MIN as f64),
+        ("f32", 14, 1.5),
+        ("f64", 16, 1.5),
+    ];
+    let mut tag_ids = Vec::new();
+    for (kind, start, expected) in cases {
+        let register = if input_register { 300_001 } else { 400_001 };
+        let tag = app
+            .manager
+            .tags()
+            .create(tag_input(
+                kind,
+                group.id,
+                &(register + start).to_string(),
+                kind,
+            ))
+            .await
+            .unwrap();
+        assert!(!tag.writable);
+        tag_ids.push((kind, tag.id, expected));
+    }
+    app.manager.rebuild().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tag_ids.iter().all(|(_, id, expected)| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .and_then(|sample| sample.value)
+                    == Some(*expected)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("eight saved WASM numeric values");
+    for (kind, _, expected) in tag_ids {
+        let path = format!("/api/v1/values/numeric-line.numeric-group.{kind}");
+        let (status, body) = admin_get(&app.router, &path, &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], expected, "{kind}: {body:?}");
+        assert_eq!(body["q"], "good", "{kind}: {body:?}");
+        let (status, body) =
+            admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], expected, "{kind}: {body:?}");
+    }
+    assert_eq!(
+        sim.connection_count(),
+        1,
+        "REST reads reuse the broker session"
+    );
+    sim.stop();
+}
+
 // ---------------------------------------------------------------------------
 // 6. virtual 拒否
 // ---------------------------------------------------------------------------

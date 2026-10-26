@@ -2,6 +2,8 @@
 //! Set BANTO_STAGE2_MODBUS_WASM, BANTO_STAGE2_MODBUS_MANIFEST, and
 //! BANTO_STAGE2_SLMP_WASM, then run this test target with `--ignored`.
 //! Transport responses are generated in memory; no PLC or TCP listener is used.
+//! The separately gated `local_` cases accept unpublished FC4/W components
+//! through BANTO_LOCAL_FC4_MANIFEST, BANTO_LOCAL_FC4_WASM, and BANTO_LOCAL_W_WASM.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -20,8 +22,10 @@ const SLMP_MANIFEST: &[u8] = br#"{"manifestVersion":1,"id":"slmp-read-wasm","ver
 #[derive(Clone, Copy)]
 enum Protocol {
     Modbus,
+    ModbusFc4,
     SlmpR,
     SlmpQ,
+    SlmpW,
 }
 
 struct ScriptedTransport {
@@ -47,29 +51,34 @@ impl ScriptedTransport {
 
     fn response(&self, request: &[u8]) -> Vec<u8> {
         match self.protocol {
-            Protocol::Modbus => {
+            Protocol::Modbus | Protocol::ModbusFc4 => {
                 assert_eq!(request.len(), 12);
-                assert_eq!(request[7], 3);
+                let function = if matches!(self.protocol, Protocol::ModbusFc4) {
+                    4
+                } else {
+                    3
+                };
+                assert_eq!(request[7], function);
                 let start = u32::from(u16::from_be_bytes([request[8], request[9]]));
                 let count = u16::from_be_bytes([request[10], request[11]]);
                 let mut response = request[..2].to_vec();
                 response.extend_from_slice(&[0, 0]);
                 response.extend_from_slice(&(3 + count * 2).to_be_bytes());
-                response.extend_from_slice(&[request[6], 3, (count * 2) as u8]);
+                response.extend_from_slice(&[request[6], function, (count * 2) as u8]);
                 for address in start..start + u32::from(count) {
                     response.extend_from_slice(&self.words[&address].to_be_bytes());
                 }
                 response
             }
-            Protocol::SlmpR | Protocol::SlmpQ => {
+            Protocol::SlmpR | Protocol::SlmpQ | Protocol::SlmpW => {
                 assert_eq!(&request[..2], &[0x54, 0]);
                 let command = u16::from_le_bytes([request[15], request[16]]);
                 let subcommand = u16::from_le_bytes([request[17], request[18]]);
                 let body = if command == 0x0101 {
                     let (name, code) = match self.protocol {
-                        Protocol::SlmpR => ("R04CPU", 0x4800_u16),
+                        Protocol::SlmpR | Protocol::SlmpW => ("R04CPU", 0x4800_u16),
                         Protocol::SlmpQ => ("Q02UCPU", 0x0263_u16),
-                        Protocol::Modbus => unreachable!(),
+                        Protocol::Modbus | Protocol::ModbusFc4 => unreachable!(),
                     };
                     let mut body = vec![b' '; 18];
                     body[..name.len()].copy_from_slice(name.as_bytes());
@@ -77,7 +86,7 @@ impl ScriptedTransport {
                     body
                 } else {
                     assert_eq!(command, 0x0401);
-                    let is_r = matches!(self.protocol, Protocol::SlmpR);
+                    let is_r = matches!(self.protocol, Protocol::SlmpR | Protocol::SlmpW);
                     assert_eq!(subcommand, if is_r { 2 } else { 0 });
                     let start = u32::from_le_bytes([
                         request[19],
@@ -91,13 +100,22 @@ impl ScriptedTransport {
                         u16::from_le_bytes([request[count_offset], request[count_offset + 1]]);
                     if device == 0xa9 {
                         assert_eq!(start, if is_r { 280 } else { 302 });
-                        if is_r {
+                        if matches!(self.protocol, Protocol::SlmpW) {
+                            [100_u32.to_le_bytes(), 32_u32.to_le_bytes()].concat()
+                        } else if is_r {
                             100_u32.to_le_bytes().to_vec()
                         } else {
                             100_u16.to_le_bytes().to_vec()
                         }
                     } else {
-                        assert_eq!(device, 0xa8);
+                        assert_eq!(
+                            device,
+                            if matches!(self.protocol, Protocol::SlmpW) {
+                                0xb4
+                            } else {
+                                0xa8
+                            }
+                        );
                         let mut body = Vec::with_capacity(usize::from(count) * 2);
                         for address in start..start + u32::from(count) {
                             body.extend_from_slice(&self.words[&address].to_le_bytes());
@@ -151,6 +169,17 @@ fn load_modbus() -> Arc<WasmDriver> {
 
 fn load_slmp() -> Arc<WasmDriver> {
     let component = std::fs::read(std::env::var("BANTO_STAGE2_SLMP_WASM").unwrap()).unwrap();
+    WasmDriver::load(SLMP_MANIFEST, &component).unwrap()
+}
+
+fn load_local_fc4() -> Arc<WasmDriver> {
+    let manifest = std::fs::read(std::env::var("BANTO_LOCAL_FC4_MANIFEST").unwrap()).unwrap();
+    let component = std::fs::read(std::env::var("BANTO_LOCAL_FC4_WASM").unwrap()).unwrap();
+    WasmDriver::load(&manifest, &component).unwrap()
+}
+
+fn load_local_w() -> Arc<WasmDriver> {
+    let component = std::fs::read(std::env::var("BANTO_LOCAL_W_WASM").unwrap()).unwrap();
     WasmDriver::load(SLMP_MANIFEST, &component).unwrap()
 }
 
@@ -484,4 +513,106 @@ async fn short_slmp_response_is_rejected_by_actual_component() {
         connection.decode_read(&planned[0], &specs, &response),
         Err(FatalError::Framing(_) | FatalError::Protocol(_))
     ));
+}
+
+#[tokio::test]
+#[ignore = "requires the reviewed local FC4 component and manifest"]
+async fn local_fc4_eight_kinds_use_input_registers_without_write_capability() {
+    let driver = load_local_fc4();
+    assert!(!driver.descriptor().capabilities.write);
+    let starts = [0, 1, 2, 4, 6, 10, 14, 16];
+    let specs: Vec<_> = starts
+        .into_iter()
+        .zip(kinds())
+        .map(|(start, data_type)| {
+            let kind = TagKind::numeric(data_type);
+            let address = driver
+                .parse_address(&(300_001_u32 + start).to_string(), &kind)
+                .unwrap();
+            assert_eq!(address.area, "input_register");
+            assert_eq!(address.word_count, kind.word_count());
+            assert!(!address.writable_area);
+            TagSpec::new(address, kind)
+        })
+        .collect();
+    let settings = Settings::from_pairs([
+        ("host", "127.0.0.1"),
+        ("port", "502"),
+        ("word_order", "low_high"),
+    ])
+    .unwrap();
+    let (wire, sent) = ScriptedTransport::new(Protocol::ModbusFc4, sample_words());
+    let mut session = FrameSession::with_transport(
+        driver.as_ref(),
+        &settings,
+        Box::new(wire),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session.read_raw_batch(&specs).await.unwrap(),
+        expected_values()
+    );
+    let requests = sent.lock().unwrap();
+    assert_eq!(requests.len(), 8);
+    for (index, request) in requests.iter().enumerate() {
+        assert_eq!(request[7], 4);
+        assert_eq!(
+            u16::from_be_bytes([request[8], request[9]]),
+            u16::try_from(starts[index]).unwrap()
+        );
+        assert_eq!(
+            u16::from_be_bytes([request[10], request[11]]),
+            specs[index].kind.word_count()
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires the reviewed local SLMP W component"]
+async fn local_r_w_eight_kinds_use_hex_addresses_without_write_capability() {
+    let driver = load_local_w();
+    assert!(!driver.descriptor().capabilities.write);
+    let starts = [0, 1, 2, 4, 6, 10, 14, 16];
+    let specs: Vec<_> = starts
+        .into_iter()
+        .zip(kinds())
+        .map(|(start, data_type)| {
+            let kind = TagKind::numeric(data_type);
+            let address = driver.parse_address(&format!("W{start:X}"), &kind).unwrap();
+            assert_eq!(address.area, "W");
+            assert_eq!(address.word_count, kind.word_count());
+            assert!(!address.writable_area);
+            TagSpec::new(address, kind)
+        })
+        .collect();
+    let settings = Settings::from_pairs([
+        ("host", "127.0.0.1"),
+        ("port", "5000"),
+        ("word_order", "low_high"),
+    ])
+    .unwrap();
+    let (wire, sent) = ScriptedTransport::new(Protocol::SlmpW, sample_words());
+    let mut session = FrameSession::with_transport(
+        driver.as_ref(),
+        &settings,
+        Box::new(wire),
+        Duration::from_secs(2),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        session.read_raw_batch(&specs).await.unwrap(),
+        expected_values()
+    );
+    let requests = sent.lock().unwrap();
+    assert!(requests.iter().any(|request| {
+        u16::from_le_bytes([request[15], request[16]]) == 0x0401 && request[23] == 0xb4
+    }));
+    assert!(!requests
+        .iter()
+        .any(|request| { u16::from_le_bytes([request[15], request[16]]) == 0x1401 }));
 }

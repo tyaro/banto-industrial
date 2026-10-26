@@ -501,7 +501,7 @@ jobs:
           wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_SLMP_COMPONENT_WASM --world driver
           if ($LASTEXITCODE -ne 0) { throw 'SLMP component world mismatch' }
           $slmpTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-hub-test.txt'
-          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpTestLog
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_test:: --locked -- --ignored --skip slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest --skip slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest 2>&1 | Tee-Object -FilePath $slmpTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM Hub tests failed' }
           if (-not (Select-String -Path $slmpTestLog -Pattern '^test result: ok\. 16 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM Hub tests did not all run'
@@ -536,7 +536,7 @@ jobs:
           $slmpWriteTestLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-write-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpWriteTestLog
           if ($LASTEXITCODE -ne 0) { throw 'SLMP WASM controlled write Hub tests failed' }
-          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 8 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM controlled write Hub tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
@@ -572,10 +572,60 @@ jobs:
           wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_STAGE2_SLMP_WASM --world driver
           if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component world mismatch' }
           $numericTestLog = Join-Path $env:RUNNER_TEMP 'wasm-numeric-stage2-test.txt'
-          cargo +1.98.1 test -p banto-driver-wasm --test numeric_stage2 --locked -- --ignored 2>&1 | Tee-Object -FilePath $numericTestLog
+          cargo +1.98.1 test -p banto-driver-wasm --test numeric_stage2 --locked -- --ignored --skip local_fc4_eight_kinds_use_input_registers_without_write_capability --skip local_r_w_eight_kinds_use_hex_addresses_without_write_capability 2>&1 | Tee-Object -FilePath $numericTestLog
           if ($LASTEXITCODE -ne 0) { throw 'WASM numeric stage-2 host tests failed' }
           if (-not (Select-String -Path $numericTestLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'WASM numeric stage-2 host tests did not all run'
+          }
+          $numericHubLog = Join-Path $env:RUNNER_TEMP 'wasm-numeric-stage2-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test eight_numeric_kinds_collect_and_serve_rest --locked -- --ignored --skip wasm_fc4_eight_numeric_kinds_collect_and_serve_rest --skip slmp_wasm_test::r_w_eight_numeric_kinds_collect_and_serve_rest 2>&1 | Tee-Object -FilePath $numericHubLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM numeric stage-2 Hub tests failed' }
+          if (-not (Select-String -Path $numericHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM numeric stage-2 Hub tests did not both run'
+          }
+          # FC4 and SLMP W use a separately reviewed read-only guest revision.
+          # Keep the stage-2 and write revisions above pinned for regressions.
+          $fc4WSha = '290648da33895a707abcaaafeb23bd0f05d5b828'
+          git -C $guest checkout --quiet --detach $fc4WSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $fc4WSha) {
+            throw 'FC4/W guest SHA mismatch'
+          }
+          $fc4WWit = git -C $guest rev-parse --verify "${fc4WSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $fc4WWit -ne $hostWit) {
+            throw 'FC4/W guest read WIT mismatch'
+          }
+          $env:BANTO_LOCAL_FC4_MANIFEST = Join-Path $guest 'component/manifest.json'
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus guest build failed' }
+          $fc4Module = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
+          $env:BANTO_LOCAL_FC4_WASM = Join-Path $env:RUNNER_TEMP 'fc4-modbus-component.wasm'
+          wasm-tools component new $fc4Module -o $env:BANTO_LOCAL_FC4_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component creation failed' }
+          wasm-tools validate $env:BANTO_LOCAL_FC4_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_LOCAL_FC4_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus component world mismatch' }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP W guest build failed' }
+          $wModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_LOCAL_W_WASM = Join-Path $env:RUNNER_TEMP 'slmp-w-component.wasm'
+          wasm-tools component new $wModule -o $env:BANTO_LOCAL_W_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component creation failed' }
+          wasm-tools validate $env:BANTO_LOCAL_W_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_LOCAL_W_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP W component world mismatch' }
+          $fc4WHostLog = Join-Path $env:RUNNER_TEMP 'wasm-fc4-w-host-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test numeric_stage2 local_ --locked -- --ignored 2>&1 | Tee-Object -FilePath $fc4WHostLog
+          if ($LASTEXITCODE -ne 0) { throw 'FC4/W host tests failed' }
+          if (-not (Select-String -Path $fc4WHostLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'FC4/W host tests did not both run'
+          }
+          $fc4WHubLog = Join-Path $env:RUNNER_TEMP 'wasm-fc4-w-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test eight_numeric_kinds_collect_and_serve_rest --locked -- --ignored --skip wasm_fc3_eight_numeric_kinds_collect_and_serve_rest --skip slmp_wasm_test::r_eight_numeric_kinds_collect_and_serve_rest 2>&1 | Tee-Object -FilePath $fc4WHubLog
+          if ($LASTEXITCODE -ne 0) { throw 'FC4/W Hub tests failed' }
+          if (-not (Select-String -Path $fc4WHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'FC4/W Hub tests did not both run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings

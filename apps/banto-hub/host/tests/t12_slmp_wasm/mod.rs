@@ -57,6 +57,8 @@ enum Scenario {
     LargeSplit,
     LargeShort,
     LargeOverlong,
+    Numeric,
+    NumericW,
 }
 
 #[derive(Clone, Debug)]
@@ -263,7 +265,9 @@ fn model(name: &str, code: u16) -> Vec<u8> {
 fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>, bool) {
     match (request.command, request.device) {
         (0x0101, None) => match scenario {
-            Scenario::R | Scenario::RZero => (0, model("R04CPU", 0x4800), false),
+            Scenario::R | Scenario::RZero | Scenario::Numeric | Scenario::NumericW => {
+                (0, model("R04CPU", 0x4800), false)
+            }
             Scenario::Q25Prh => (0, model("Q25PRHCPU", 0x004c), false),
             Scenario::Q25PrhWrongName => (0, model("Q25PRXCPU", 0x004c), false),
             Scenario::Q25PrhWrongCode => (0, model("Q25PRHCPU", 0x004d), false),
@@ -275,13 +279,22 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
         (0x0401, Some(0xa9)) => {
             if matches!(scenario, Scenario::SdRefused) {
                 (0xc05b, vec![], false)
-            } else if matches!(scenario, Scenario::R | Scenario::RZero) {
+            } else if matches!(
+                scenario,
+                Scenario::R | Scenario::RZero | Scenario::Numeric | Scenario::NumericW
+            ) {
                 let count: u32 = if matches!(scenario, Scenario::RZero) {
                     0
+                } else if matches!(scenario, Scenario::Numeric | Scenario::NumericW) {
+                    100
                 } else {
                     32
                 };
-                (0, count.to_le_bytes().to_vec(), false)
+                let mut body = count.to_le_bytes().to_vec();
+                if matches!(scenario, Scenario::NumericW) {
+                    body.extend_from_slice(&32_u32.to_le_bytes());
+                }
+                (0, body, false)
             } else if matches!(
                 scenario,
                 Scenario::LargeSplit | Scenario::LargeShort | Scenario::LargeOverlong
@@ -292,6 +305,7 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
             }
         }
         (0x0401, Some(0xa8)) => match scenario {
+            Scenario::Numeric => (0, numeric_words(request), false),
             Scenario::ReadRefused => (0xc05b, vec![], false),
             Scenario::ReadFraming => (0, 42u16.to_le_bytes().to_vec(), true),
             // D100 is outside the confirmed Q range and must stay an individual request.
@@ -342,8 +356,25 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
                 (0, value.to_le_bytes().to_vec(), false)
             }
         },
+        (0x0401, Some(0xb4)) if matches!(scenario, Scenario::NumericW) => {
+            (0, numeric_words(request), false)
+        }
         _ => panic!("unexpected SLMP request: {request:?}"),
     }
+}
+
+fn numeric_words(request: &Request) -> Vec<u8> {
+    const WORDS: [u16; 20] = [
+        42, 0x8000, 0x1234, 0xabcd, 0, 0x8000, 1, 0, 0, 0x0020, 0, 0, 0, 0x8000, 0, 0x3fc0, 0, 0,
+        0, 0x3ff8,
+    ];
+    let start = request.start.unwrap() as usize;
+    let end = start + usize::from(request.count.unwrap());
+    let mut body = Vec::with_capacity((end - start) * 2);
+    for word in WORDS.get(start..end).expect("numeric request bounds") {
+        body.extend_from_slice(&word.to_le_bytes());
+    }
+    body
 }
 
 async fn app(label: &str) -> TestApp {
@@ -447,6 +478,114 @@ async fn wait_multi_values(app: &TestApp, ids: [i64; 3], expected: [(Option<f64>
 
 fn multi_path(name: &str) -> String {
     format!("/api/v1/values/slmp-multi-line.slmp-multi-group.{name}")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_STAGE2_SLMP_WASM to the pinned numeric SLMP component"]
+async fn r_eight_numeric_kinds_collect_and_serve_rest() {
+    let component = std::fs::read(std::env::var("BANTO_STAGE2_SLMP_WASM").unwrap()).unwrap();
+    numeric_hub_case(&component, Scenario::Numeric).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_LOCAL_W_WASM to the reviewed local SLMP W component"]
+async fn r_w_eight_numeric_kinds_collect_and_serve_rest() {
+    let component = std::fs::read(std::env::var("BANTO_LOCAL_W_WASM").unwrap()).unwrap();
+    numeric_hub_case(&component, Scenario::NumericW).await;
+}
+
+async fn numeric_hub_case(component: &[u8], scenario: Scenario) {
+    let fixture = SlmpFixture::start(scenario).await;
+    let app = test_app_with_manifest("t12-slmp-eight", MANIFEST, component).await;
+    let settings = serde_json::json!({"host":"127.0.0.1", "port":fixture.addr.port(), "word_order":"low_high"});
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(ConnectionSettingsInput {
+            name: "slmp-numeric-line".into(),
+            protocol: PROTOCOL.into(),
+            enabled: true,
+            simulation: false,
+            settings: settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group =
+        CollectionGroupService::with_registry(app.pool.clone(), app.manager.registry().clone())
+            .create(group_input("slmp-numeric-group", saved.id, 100))
+            .await
+            .unwrap();
+    let cases = [
+        ("u16", 0, 42.0),
+        ("i16", 1, i16::MIN as f64),
+        ("u32", 2, 0xabcd_1234u32 as f64),
+        ("i32", 4, i32::MIN as f64),
+        ("u64", 6, (1u64 << 53) as f64),
+        ("i64", 10, i64::MIN as f64),
+        ("f32", 14, 1.5),
+        ("f64", 16, 1.5),
+    ];
+    let mut tag_ids = Vec::new();
+    for (kind, start, expected) in cases {
+        let address = if matches!(scenario, Scenario::NumericW) {
+            format!("W{start:X}")
+        } else {
+            format!("D{start}")
+        };
+        let tag = app
+            .manager
+            .tags()
+            .create(tag_input(kind, group.id, &address, kind))
+            .await
+            .unwrap();
+        assert!(!tag.writable);
+        tag_ids.push((kind, tag.id, expected));
+    }
+    app.manager.rebuild().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tag_ids.iter().all(|(_, id, expected)| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .is_some_and(|sample| {
+                        sample.value == Some(*expected) && sample.quality == Quality::Good
+                    })
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("eight saved SLMP numeric values");
+    for (kind, _, expected) in tag_ids {
+        let path = format!("/api/v1/values/slmp-numeric-line.slmp-numeric-group.{kind}");
+        let (status, body) = admin_get(&app.router, &path, &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], expected, "{kind}: {body:?}");
+        assert_eq!(body["q"], "good", "{kind}: {body:?}");
+        let (status, body) =
+            admin_get(&app.router, &format!("{path}/read-now"), &app.admin_token).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], expected, "{kind}: {body:?}");
+    }
+    assert_eq!(
+        fixture.connection_count(),
+        1,
+        "REST reads reuse the broker session"
+    );
+    assert!(!fixture
+        .requests()
+        .iter()
+        .any(|request| request.command == 0x1401));
+    if matches!(scenario, Scenario::NumericW) {
+        assert!(fixture
+            .requests()
+            .iter()
+            .any(|request| request.device == Some(0xb4)));
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
