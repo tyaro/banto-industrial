@@ -1126,20 +1126,40 @@ mod tests {
 
     #[tokio::test]
     async fn programmatic_loopback_http_is_rejected_before_starting() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
         let mut config = SidecarConfig::from_toml_str(
             "hub_url = 'http://192.0.2.1:8722'\napi_key = 'bh_dummy.secret'\n",
             std::path::Path::new("dummy.toml"),
         )
         .unwrap();
-        config.hub_url = "http://127.0.0.1:8722".into();
-        assert!(HubApi::new(&config).is_err());
-        assert!(matches!(
-            run(config.clone(), SidecarOptions::default(), async {
-                panic!("started")
-            })
-            .await,
-            Err(HubApiError::Transport)
-        ));
+        for host in [
+            "127.0.0.1",
+            "127.99.4.2",
+            "[::ffff:127.0.0.1]",
+            "[::ffff:7f00:1]",
+            "[::ffff:127.99.4.2]",
+            "[::ffff:7f63:402]",
+        ] {
+            config.hub_url = format!("http://{host}:{port}");
+            assert!(HubApi::new(&config).is_err(), "{host}");
+            assert!(
+                matches!(
+                    run(config.clone(), SidecarOptions::default(), async {
+                        panic!("started")
+                    })
+                    .await,
+                    Err(HubApiError::Transport)
+                ),
+                "{host}"
+            );
+        }
+        // A rejected endpoint must never connect to the plaintext listener or send its Bearer.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                .await
+                .is_err()
+        );
         config.hub_url = "https://127.0.0.1:9443".into();
         assert!(HubApi::new(&config).is_err());
         assert!(matches!(

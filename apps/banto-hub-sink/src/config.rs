@@ -575,7 +575,7 @@ fn is_loopback_host(host: &str) -> bool {
         || host
             .trim_matches(['[', ']'])
             .parse::<std::net::IpAddr>()
-            .is_ok_and(|addr| addr.is_loopback())
+            .is_ok_and(|addr| addr.to_canonical().is_loopback())
 }
 
 fn range_u64(field: &'static str, value: u64, min: u64, max: u64) -> Result<(), ConfigError> {
@@ -725,9 +725,14 @@ shutdown_flush_secs = 0
         for bad in [
             "http://127.0.0.1:8722",
             "http://127.0.0.2:8722",
+            "http://127.99.4.2:8722",
             "http://localhost:8722",
             "http://localhost.:8722",
             "http://[::1]:8722",
+            "http://[::ffff:127.0.0.1]:8722",
+            "http://[::ffff:7f00:1]:8722",
+            "http://[::ffff:127.99.4.2]:8722",
+            "http://[::ffff:7f63:402]:8722",
             "http://user:pw@127.0.0.1:8722",
             "http://127.0.0.1:8722/?x=1",
             "127.0.0.1:8722",
