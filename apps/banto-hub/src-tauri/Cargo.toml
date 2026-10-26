@@ -71,4 +71,5 @@ banto-safe-root = { path = "../../../crates/banto-safe-root" }
 # 増えない。
 [dev-dependencies]
 banto-server = { workspace = true }
+tempfile = { workspace = true }
 
