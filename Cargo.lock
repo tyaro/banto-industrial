@@ -787,8 +787,10 @@ name = "banto-driver-wasm"
 version = "0.1.0"
 dependencies = [
  "banto-driver-api",
+ "banto-driver-engine",
  "semver",
  "serde_json",
+ "tokio",
  "wasmtime",
 ]
 

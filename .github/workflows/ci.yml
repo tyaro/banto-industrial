@@ -539,6 +539,44 @@ jobs:
           if (-not (Select-String -Path $slmpWriteTestLog -Pattern '^test result: ok\. 8 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP WASM controlled write Hub tests did not all run'
           }
+          # Stage-2 numeric reads use the separately reviewed guest revision.
+          # Keep the older guest revisions above for read and write regressions.
+          $numericSha = '9ffa939ffc3551325551b28e4993ec62b8ddc34d'
+          git -C $guest checkout --quiet --detach $numericSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $numericSha) {
+            throw 'numeric guest SHA mismatch'
+          }
+          $numericWit = git -C $guest rev-parse --verify "${numericSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $numericWit -ne $hostWit) {
+            throw 'numeric guest read WIT mismatch'
+          }
+          $env:BANTO_STAGE2_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus guest build failed' }
+          $numericModbusModule = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
+          $env:BANTO_STAGE2_MODBUS_WASM = Join-Path $env:RUNNER_TEMP 'numeric-modbus-component.wasm'
+          wasm-tools component new $numericModbusModule -o $env:BANTO_STAGE2_MODBUS_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component creation failed' }
+          wasm-tools validate $env:BANTO_STAGE2_MODBUS_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_STAGE2_MODBUS_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus component world mismatch' }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP guest build failed' }
+          $numericSlmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_STAGE2_SLMP_WASM = Join-Path $env:RUNNER_TEMP 'numeric-slmp-component.wasm'
+          wasm-tools component new $numericSlmpModule -o $env:BANTO_STAGE2_SLMP_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component creation failed' }
+          wasm-tools validate $env:BANTO_STAGE2_SLMP_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit/driver.wit' $env:BANTO_STAGE2_SLMP_WASM --world driver
+          if ($LASTEXITCODE -ne 0) { throw 'numeric SLMP component world mismatch' }
+          $numericTestLog = Join-Path $env:RUNNER_TEMP 'wasm-numeric-stage2-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test numeric_stage2 --locked -- --ignored 2>&1 | Tee-Object -FilePath $numericTestLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM numeric stage-2 host tests failed' }
+          if (-not (Select-String -Path $numericTestLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM numeric stage-2 host tests did not all run'
+          }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()
