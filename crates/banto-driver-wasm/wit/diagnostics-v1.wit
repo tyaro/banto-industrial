@@ -1,0 +1,60 @@
+// Optional per-connection SLMP discovery and tag-range diagnostics.
+// The existing driver and driver-with-write-v1 worlds remain unchanged.
+interface diagnostics-v1 {
+  use types.{tag-spec, fatal-error};
+  use session.{connection, step};
+
+  record model-info {
+    raw-name: list<u8>,
+    name: string,
+    code: u16,
+    family: string,
+  }
+  variant count-bound { exact(u32), at-least(u32), unknown(string) }
+  record area-count {
+    area: string,
+    scope: string,
+    unit: string,
+    bound: count-bound,
+    source: string,
+  }
+  variant tag-verdict {
+    inside(string),
+    outside(string),
+    unknown(string),
+    invalid(string),
+    unsupported(string),
+  }
+  record tag-diagnostic {
+    address: string,
+    verdict: tag-verdict,
+  }
+  record report {
+    model: option<model-info>,
+    model-reason: option<string>,
+    counts: list<area-count>,
+    tags: list<tag-diagnostic>,
+  }
+  variant progress { send(step), done(report) }
+
+  // Call with no response to start. If send is returned, pass the single
+  // response with the same specs. Abandoning a send requires closing conn.
+  diagnose-next: func(conn: borrow<connection>, specs: list<tag-spec>, prev-response: option<list<u8>>)
+    -> result<progress, fatal-error>;
+}
+
+world driver-with-diagnostics-v1 {
+  export session;
+  export read;
+  export address;
+  export config;
+  export diagnostics-v1;
+}
+world driver-with-write-and-diagnostics-v1 {
+  export session;
+  export read;
+  export address;
+  export config;
+  export write-v1;
+  export diagnostics-v1;
+}

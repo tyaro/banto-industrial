@@ -309,6 +309,7 @@ fn session(conn: Conn, wire: Wire, events: Arc<Recorder>) -> FrameSession {
             transport: Box::new(wire),
             response_timeout: T,
             can_write: true,
+            outside: std::collections::HashSet::new(),
             events: Some(events),
             last_quiet_from: None,
         }),

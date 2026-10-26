@@ -139,6 +139,25 @@ impl CurrentValuesHandle {
         }
     }
 
+    /// Invalidate a cached PLC value when a same-session diagnostic proves
+    /// its address outside the device range. A diagnostic is not a read
+    /// attempt, so keep the sample time and last-good time unchanged.
+    pub fn mark_outside_bad(&self, tag_key: &str) {
+        let now_ms = self.clock.now_ms();
+        let mut map = self
+            .map
+            .write()
+            .expect("current-value cache lock poisoned (a writer panicked)");
+        if let Some(entry) = map.get_mut(tag_key) {
+            let was_bad = entry.stored_quality == Quality::Bad;
+            entry.value = None;
+            entry.stored_quality = Quality::Bad;
+            if !was_bad {
+                entry.quality_since_ms = now_ms;
+            }
+        }
+    }
+
     /// Record a fresh sample for `tag_key`. Called once per tag per tick by
     /// the collection tasks. A PLC task passes Good or Bad only (its Stale is
     /// derived on read); an external-source task (`crate::external`) may
@@ -331,6 +350,20 @@ mod tests {
         assert_eq!(s.value, Some(42.0));
         assert_eq!(s.quality, Quality::Good);
         assert_eq!(s.ptime_ms, 1_000);
+    }
+
+    #[test]
+    fn outside_diagnostic_invalidates_value_without_faking_a_read() {
+        let (handle, clock) = handle_at(1_000);
+        handle.set("t1", Some(42.0), 1_000, Quality::Good, 1_000);
+        clock.set_now_ms(1_100);
+        handle.mark_outside_bad("t1");
+        let reading = handle.get_reading("t1").unwrap();
+        assert_eq!(reading.sample.value, None);
+        assert_eq!(reading.sample.quality, Quality::Bad);
+        assert_eq!(reading.sample.ptime_ms, 1_000);
+        assert_eq!(reading.last_good_ms, Some(1_000));
+        assert_eq!(reading.quality_since_ms, Some(1_100));
     }
 
     #[test]

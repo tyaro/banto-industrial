@@ -889,7 +889,19 @@ struct Inner {
 /// Shared behind `Arc` by the REST layer (cloning a `CollectorManager`
 /// itself is deliberately not supported - a `Collector` is not `Clone` and
 /// there must be exactly one lifecycle owner per process).
+struct StoredRangeDiagnostic {
+    revision: u64,
+    driver_version: String,
+    epoch: banto_broker::SessionEpoch,
+    tag_ids: Vec<i64>,
+    report: banto_driver_api::DiagnosticReport,
+}
+
 pub struct CollectorManager {
+    /// Ephemeral read-only discovery. A report is usable only while its
+    /// physical broker session, catalog, driver version and latest attempt
+    /// still match. Nothing is persisted or promoted to an allowlist.
+    range_diagnostics: Mutex<HashMap<i64, StoredRangeDiagnostic>>,
     /// #341 レビュー対応（2026-09-14）: **テスト専用の失敗注入**。
     /// `true` のとき、次の [`Self::apply_run`] は collector 側のコミットを
     /// 実際には行わずに `Err` を返す（フラグはその場で降りる）。
@@ -1089,6 +1101,7 @@ impl CollectorManager {
         let db_source = Arc::new(DbSourceEngine::new(computed.server_store(), clock.clone()));
         let ingest = Arc::new(IngestHub::new(clock.clone()));
         Self {
+            range_diagnostics: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_next_apply: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -2211,6 +2224,106 @@ impl CollectorManager {
             .expect("hub state lock poisoned")
             .map
             .clone()
+    }
+
+    /// Snapshot the applied registry, not an in-flight database edit. This
+    /// keeps the diagnostic tag set aligned with the broker's catalog.
+    pub(crate) fn diagnostic_registry_snapshot(&self) -> (u64, RegistrySnapshot) {
+        let inner = self.inner.lock().expect("hub state lock poisoned");
+        (inner.revision, inner.applied_registry.clone())
+    }
+
+    pub(crate) fn publish_range_diagnostic(
+        &self,
+        connection_id: i64,
+        revision: u64,
+        driver_version: &str,
+        epoch: banto_broker::SessionEpoch,
+        tag_ids: Vec<i64>,
+        report: banto_driver_api::DiagnosticReport,
+    ) -> bool {
+        let Some(handle) = self.sessions.handle_for(connection_id) else {
+            return false;
+        };
+        let current_version = self.diagnostic_driver_version(connection_id);
+        if self.revision() != revision
+            || current_version.as_deref() != Some(driver_version)
+            || !epoch.is_current(&handle)
+        {
+            return false;
+        }
+        let outside_ids: Vec<_> = tag_ids
+            .iter()
+            .zip(&report.tags)
+            .filter_map(|(id, tag)| {
+                matches!(tag.verdict, banto_driver_api::TagVerdict::Outside(_)).then_some(*id)
+            })
+            .collect();
+        self.range_diagnostics
+            .lock()
+            .expect("diagnostic lock poisoned")
+            .insert(
+                connection_id,
+                StoredRangeDiagnostic {
+                    revision,
+                    driver_version: driver_version.into(),
+                    epoch,
+                    tag_ids,
+                    report,
+                },
+            );
+        if let Some(values) = self.current_values() {
+            for id in outside_ids {
+                values.mark_outside_bad(&tag_key(id));
+            }
+        }
+        true
+    }
+
+    fn diagnostic_driver_version(&self, connection_id: i64) -> Option<String> {
+        let inner = self.inner.lock().expect("hub state lock poisoned");
+        let connection = inner
+            .applied_registry
+            .connections
+            .iter()
+            .find(|c| c.id == connection_id)?;
+        Some(
+            self.registry()
+                .get(&connection.protocol)?
+                .descriptor()
+                .version
+                .clone(),
+        )
+    }
+
+    /// Return a prior report only while the original session is still live.
+    /// Reconnects, later attempts, catalog changes and driver changes all
+    /// invalidate it before it can be displayed again.
+    pub(crate) fn current_range_diagnostic(
+        &self,
+        connection_id: i64,
+    ) -> Option<(u64, String, Vec<i64>, banto_driver_api::DiagnosticReport)> {
+        let handle = self.sessions.handle_for(connection_id);
+        let revision = self.revision();
+        let driver_version = self.diagnostic_driver_version(connection_id);
+        let mut reports = self
+            .range_diagnostics
+            .lock()
+            .expect("diagnostic lock poisoned");
+        let record = reports.get(&connection_id)?;
+        if record.revision != revision
+            || driver_version.as_deref() != Some(record.driver_version.as_str())
+            || !handle.as_ref().is_some_and(|h| record.epoch.is_current(h))
+        {
+            reports.remove(&connection_id);
+            return None;
+        }
+        Some((
+            record.revision,
+            record.driver_version.clone(),
+            record.tag_ids.clone(),
+            record.report.clone(),
+        ))
     }
 
     pub fn revision(&self) -> u64 {

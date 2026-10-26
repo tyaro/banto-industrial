@@ -200,12 +200,13 @@
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DriverKind, DriverRegistry, FatalError, ItemError, Session, SessionDriver,
-    Settings, TagSpec, Value, WordOrder, WriteItem,
+    ConnectContext, DiagnosticReport, DriverKind, DriverRegistry, FatalError, ItemError, Session,
+    SessionDriver, Settings, TagSpec, Value, WordOrder, WriteItem,
 };
 pub use banto_driver_engine::sim::SimDevice;
 use banto_tags::PlcConnection;
@@ -321,6 +322,12 @@ pub fn write_job_limit(items: usize, response: Duration) -> Duration {
         items.saturating_mul(3).saturating_add(EXTRA_STEPS),
         response,
     )
+}
+
+/// Diagnostics may take additional read steps after the initial handshake.
+/// The frame engine independently caps the exchange at 16 steps.
+pub fn diagnostic_job_limit(response: Duration) -> Duration {
+    steps_limit(16, response)
 }
 
 fn steps_limit(steps: usize, response: Duration) -> Duration {
@@ -611,10 +618,14 @@ pub enum BrokerError {
 }
 
 /// One thing a broker task can be asked to do, paired with where to send the
-/// result. Exactly two variants - this *is* the read/write safety boundary a
+/// result. Read and Diagnose are read-only; this is the read/write safety boundary a
 /// caller relies on: a caller that only ever gets a [`ReadOnlyHandle`] can
 /// never construct a `Write` job.
 enum Job {
+    Diagnose {
+        specs: Vec<TagSpec>,
+        respond_to: oneshot::Sender<DiagnosticOutcome>,
+    },
     Read {
         specs: Vec<TagSpec>,
         respond_to: oneshot::Sender<ReadOutcome>,
@@ -630,6 +641,9 @@ pub type ReadOutcome = Result<Vec<Result<Value, ItemError>>, BrokerError>;
 
 /// What a write job answers: one result per item, in order.
 pub type WriteOutcome = Result<Vec<Result<(), ItemError>>, BrokerError>;
+
+/// `None` means this session driver does not implement diagnostics.
+pub type DiagnosticOutcome = Result<Option<DiagnosticReport>, BrokerError>;
 
 /// Observable connection state for one broker task's session (I6 T2-1
 /// addition, 2026-08-05) - see the module doc's "Connection status
@@ -659,6 +673,33 @@ pub struct BrokerHandle {
     status_rx: watch::Receiver<BrokerConnectionStatus>,
     /// See [`Self::settings_fingerprint`].
     fingerprint: Option<SettingsFingerprint>,
+    task_identity: Arc<()>,
+    diagnostic_attempt: Arc<AtomicU64>,
+}
+
+/// Captures one connected physical session for an asynchronous diagnostic.
+/// A reconnect may return to `Connected` before a previous result arrives;
+/// the watch version still changes, so that result must not be published.
+pub struct SessionEpoch {
+    task_identity: Arc<()>,
+    status_rx: watch::Receiver<BrokerConnectionStatus>,
+    fingerprint: Option<SettingsFingerprint>,
+    diagnostic_attempt: Arc<AtomicU64>,
+    attempt: u64,
+}
+
+impl SessionEpoch {
+    /// A result is current only while the same broker task and the same
+    /// physical connection remain connected without an intervening transition.
+    /// The caller must also compare its catalog/driver revision and diagnostic
+    /// attempt number before publishing the result.
+    pub fn is_current(&self, current: &ReadOnlyHandle) -> bool {
+        Arc::ptr_eq(&self.task_identity, &current.inner.task_identity)
+            && self.fingerprint == current.inner.fingerprint
+            && self.diagnostic_attempt.load(Ordering::Acquire) == self.attempt
+            && matches!(self.status_rx.has_changed(), Ok(false))
+            && *current.inner.status_rx.borrow() == BrokerConnectionStatus::Connected
+    }
 }
 
 impl std::fmt::Debug for BrokerHandle {
@@ -671,6 +712,42 @@ impl std::fmt::Debug for BrokerHandle {
 }
 
 impl BrokerHandle {
+    /// Submit a read-only diagnostic as one exclusive broker job.
+    pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::Diagnose { specs, respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })?
+    }
+    /// Snapshot the current broker session before starting a diagnostic. The
+    /// token becomes invalid after any disconnect/reconnect, including a
+    /// transition back to `Connected`, or after the task is replaced.
+    pub fn session_epoch(&self) -> Option<SessionEpoch> {
+        let mut status_rx = self.status_rx.clone();
+        if *status_rx.borrow_and_update() != BrokerConnectionStatus::Connected {
+            return None;
+        }
+        let attempt = self
+            .diagnostic_attempt
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                previous.checked_add(1)
+            })
+            .ok()?
+            + 1;
+        Some(SessionEpoch {
+            task_identity: self.task_identity.clone(),
+            status_rx,
+            fingerprint: self.fingerprint,
+            diagnostic_attempt: self.diagnostic_attempt.clone(),
+            attempt,
+        })
+    }
     /// The fingerprint of the settings this session dials with (R2b-3a-2,
     /// replacing #605's `slmp_cpu`): metadata of the same generation as the
     /// handle, never re-read from a registry later. A session re-created with
@@ -738,6 +815,14 @@ pub struct ReadOnlyHandle {
 }
 
 impl ReadOnlyHandle {
+    /// Submit the same read-only diagnostic without write capability.
+    pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
+        self.inner.diagnose(specs).await
+    }
+    /// Capture the same session epoch without granting write capability.
+    pub fn session_epoch(&self) -> Option<SessionEpoch> {
+        self.inner.session_epoch()
+    }
     /// Identical to [`BrokerHandle::settings_fingerprint`].
     pub fn settings_fingerprint(&self) -> Option<SettingsFingerprint> {
         self.inner.settings_fingerprint()
@@ -798,6 +883,9 @@ pub fn spawn_test_handle_with_status(
     let task = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
+                Job::Diagnose { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(None));
+                }
                 Job::Read { respond_to, .. } => {
                     let _ = respond_to.send(Ok(Vec::new()));
                 }
@@ -813,6 +901,8 @@ pub fn spawn_test_handle_with_status(
             tx,
             status_rx,
             fingerprint: None,
+            task_identity: Arc::new(()),
+            diagnostic_attempt: Arc::new(AtomicU64::new(0)),
         },
         status_tx,
         task,
@@ -1412,6 +1502,8 @@ fn spawn_task_with_connector_limit(
             tx,
             status_rx,
             fingerprint: None,
+            task_identity: Arc::new(()),
+            diagnostic_attempt: Arc::new(AtomicU64::new(0)),
         },
         TaskEntry {
             stop_tx,
@@ -1574,6 +1666,20 @@ async fn run_broker_task(
                 // `state` from ending mid-await from ever overlapping with the
                 // reassignment below.
                 let fatal = match job {
+                    Job::Diagnose { specs, respond_to } => {
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                tokio::time::timeout(
+                                    diagnostic_job_limit(timeouts.response),
+                                    session.diagnose_batch(&specs),
+                                )
+                                .await
+                                .unwrap_or(Err(FatalError::Timeout)),
+                            ),
+                            _ => None,
+                        };
+                        answer(connection_id, respond_to, outcome)
+                    }
                     Job::Read { specs, respond_to } => {
                         let outcome = match &mut state {
                             ConnState::Connected(session) => Some(
@@ -1645,8 +1751,8 @@ async fn run_broker_task(
 /// whether it was fatal (the caller drops the session).
 fn answer<T>(
     connection_id: i64,
-    respond_to: oneshot::Sender<Result<Vec<T>, BrokerError>>,
-    outcome: Option<Result<Vec<T>, FatalError>>,
+    respond_to: oneshot::Sender<Result<T, BrokerError>>,
+    outcome: Option<Result<T, FatalError>>,
 ) -> bool {
     match outcome {
         Some(Ok(results)) => {
@@ -2618,6 +2724,79 @@ mod tests {
     // -----------------------------------------------------------------
     // Connection status observability (I6 T2-1 addition)
     // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn diagnostic_epoch_rejects_reconnect_and_replaced_task() {
+        let (handle, status, task) =
+            spawn_test_handle_with_status(1, BrokerConnectionStatus::Connected);
+        let read_only = handle.read_only();
+        let first = read_only.session_epoch().expect("connected");
+        assert!(first.is_current(&read_only));
+
+        status
+            .send(BrokerConnectionStatus::Reconnecting { attempt: 1 })
+            .unwrap();
+        status.send(BrokerConnectionStatus::Connected).unwrap();
+        assert!(
+            !first.is_current(&read_only),
+            "a late result cannot survive reconnect"
+        );
+
+        let second = read_only.session_epoch().expect("reconnected");
+        assert!(second.is_current(&read_only));
+        let third = read_only.session_epoch().expect("new diagnostic attempt");
+        assert!(
+            !second.is_current(&read_only),
+            "newer attempt supersedes old result"
+        );
+        assert!(third.is_current(&read_only));
+        let (replacement, replacement_status, replacement_task) =
+            spawn_test_handle_with_status(1, BrokerConnectionStatus::Connected);
+        assert!(!third.is_current(&replacement.read_only()));
+
+        drop(first);
+        drop(second);
+        drop(third);
+        drop(read_only);
+        drop(handle);
+        drop(status);
+        task.await.unwrap();
+        drop(replacement);
+        drop(replacement_status);
+        replacement_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_epoch_requires_a_connected_session() {
+        let (handle, status, task) =
+            spawn_test_handle_with_status(1, BrokerConnectionStatus::Reconnecting { attempt: 1 });
+        assert!(handle.read_only().session_epoch().is_none());
+        status.send(BrokerConnectionStatus::Connected).unwrap();
+        let read_only = handle.read_only();
+        let epoch = read_only.session_epoch().expect("connected");
+        assert!(epoch.is_current(&read_only));
+        status.send(BrokerConnectionStatus::Stopped).unwrap();
+        assert!(!epoch.is_current(&read_only));
+        drop(epoch);
+        drop(read_only);
+        drop(handle);
+        drop(status);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn diagnostic_epoch_does_not_keep_an_unowned_broker_task_alive() {
+        let (handle, status, task) =
+            spawn_test_handle_with_status(1, BrokerConnectionStatus::Connected);
+        let epoch = handle.session_epoch().expect("connected");
+        drop(handle);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("diagnostic token must not retain the job sender")
+            .unwrap();
+        drop(status);
+        drop(epoch);
+    }
 
     #[tokio::test]
     async fn status_watch_observes_connected_then_reconnecting_after_stop() {

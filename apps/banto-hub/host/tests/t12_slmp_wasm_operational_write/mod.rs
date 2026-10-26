@@ -6,7 +6,7 @@ use std::time::Duration;
 use banto_collect::current::Quality;
 use banto_driver_api::{
     ConnectContext, DataType, DriverBase, FatalError, ItemError, Session as _, Settings, TagKind,
-    TagSpec, Value, WriteItem,
+    TagSpec, TagVerdict, Value, WriteItem,
 };
 use banto_driver_engine::{transport::TransportSpec, FrameSession};
 use banto_driver_wasm::WasmDriver;
@@ -15,7 +15,9 @@ use tokio::net::TcpListener;
 
 const MANIFEST: &[u8] = include_bytes!("manifest.json");
 const COMPONENT_ENV: &str = "BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM";
+const DIAGNOSTIC_COMPONENT_ENV: &str = "BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM";
 type RecordedFrames = Arc<Mutex<Vec<(u32, Vec<u16>)>>>;
+type RecordedBits = Arc<Mutex<Vec<(u32, u8, Vec<bool>)>>>;
 
 #[derive(Clone, Copy)]
 enum Peer {
@@ -29,6 +31,7 @@ struct Fixture {
     frames: RecordedFrames,
     commands: Arc<Mutex<Vec<(u16, u32, u16)>>>,
     write_devices: Arc<Mutex<Vec<u8>>>,
+    bit_frames: RecordedBits,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -42,6 +45,8 @@ impl Fixture {
         let events = commands.clone();
         let write_devices = Arc::new(Mutex::new(Vec::new()));
         let devices = write_devices.clone();
+        let bit_frames: RecordedBits = Arc::new(Mutex::new(Vec::new()));
+        let bits_written = bit_frames.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -90,21 +95,44 @@ impl Fixture {
                             let words = u16::from_le_bytes([request[offset], request[offset + 1]]);
                             match peer {
                                 Peer::R => {
-                                    assert_eq!((subcommand, start, words), (2, 280, 4));
-                                    let mut body = count.to_le_bytes().to_vec();
-                                    body.extend_from_slice(&count.to_le_bytes());
-                                    (0, body)
+                                    if (subcommand, start, words) == (2, 262, 14) {
+                                        let mut body = vec![0; 28];
+                                        for at in [0, 2, 4, 12] {
+                                            body[at * 2..at * 2 + 4]
+                                                .copy_from_slice(&64u32.to_le_bytes());
+                                        }
+                                        (0, body)
+                                    } else {
+                                        assert_eq!((subcommand, start, words), (2, 280, 4));
+                                        let mut body = count.to_le_bytes().to_vec();
+                                        body.extend_from_slice(&count.to_le_bytes());
+                                        (0, body)
+                                    }
                                 }
                                 Peer::Q => {
-                                    assert_eq!((subcommand, start, words), (0, 302, 1));
-                                    (0, u16::try_from(count).unwrap().to_le_bytes().to_vec())
-                                }
-                                Peer::StandardQ => {
-                                    assert_eq!((subcommand, start, words), (0, 302, 2));
+                                    assert_eq!((subcommand, start), (0, 302));
+                                    assert!(matches!(words, 1 | 2));
                                     let mut body =
                                         u16::try_from(count).unwrap().to_le_bytes().to_vec();
-                                    body.extend_from_slice(&64u16.to_le_bytes());
+                                    if words == 2 {
+                                        body.extend_from_slice(&64u16.to_le_bytes());
+                                    }
                                     (0, body)
+                                }
+                                Peer::StandardQ => {
+                                    if (subcommand, start, words) == (0, 290, 5) {
+                                        let body = [0u16, 64, 64, 64, 64]
+                                            .into_iter()
+                                            .flat_map(u16::to_le_bytes)
+                                            .collect();
+                                        (0, body)
+                                    } else {
+                                        assert_eq!((subcommand, start, words), (0, 302, 2));
+                                        let mut body =
+                                            u16::try_from(count).unwrap().to_le_bytes().to_vec();
+                                        body.extend_from_slice(&64u16.to_le_bytes());
+                                        (0, body)
+                                    }
                                 }
                             }
                         }
@@ -170,26 +198,58 @@ impl Fixture {
                             }
                         }
                         0x1401 => {
-                            let offset = if subcommand == 2 { 25 } else { 23 };
-                            let device = request[if subcommand == 2 { 23 } else { 22 }];
-                            assert!(matches!(device, 0xa8 | 0xb4));
-                            assert_eq!(subcommand, if matches!(peer, Peer::R) { 2 } else { 0 });
+                            let offset = if matches!(subcommand, 2 | 3) { 25 } else { 23 };
+                            let device = request[if matches!(subcommand, 2 | 3) { 23 } else { 22 }];
+                            let is_bit = matches!(device, 0x90 | 0x9d | 0x92 | 0xa0);
+                            assert!(matches!(device, 0xa8 | 0xb4 | 0x90 | 0x9d | 0x92 | 0xa0));
+                            assert_eq!(
+                                subcommand,
+                                if matches!(peer, Peer::R) {
+                                    if is_bit {
+                                        3
+                                    } else {
+                                        2
+                                    }
+                                } else {
+                                    if is_bit {
+                                        1
+                                    } else {
+                                        0
+                                    }
+                                }
+                            );
                             let words = usize::from(u16::from_le_bytes([
                                 request[offset],
                                 request[offset + 1],
                             ]));
-                            assert_eq!(request.len(), offset + 2 + words * 2);
-                            assert!(
-                                (device == 0xa8 && (3010..=3013).contains(&start))
-                                    || (device == 0xb4 && (0x1a..=0x1f).contains(&start))
-                            );
-                            let values = request[offset + 2..]
-                                .as_chunks::<2>()
-                                .0
-                                .iter()
-                                .map(|word| u16::from_le_bytes(*word))
-                                .collect();
-                            writes.lock().unwrap().push((start, values));
+                            if is_bit {
+                                assert!(words > 0 && words <= 64);
+                                assert_eq!(request.len(), offset + 2 + words.div_ceil(2));
+                                let values = (0..words)
+                                    .map(|n| {
+                                        let pair = request[offset + 2 + n / 2];
+                                        if n % 2 == 0 {
+                                            pair & 0x10 != 0
+                                        } else {
+                                            pair & 1 != 0
+                                        }
+                                    })
+                                    .collect();
+                                bits_written.lock().unwrap().push((start, device, values));
+                            } else {
+                                assert_eq!(request.len(), offset + 2 + words * 2);
+                                assert!(
+                                    (device == 0xa8 && (3010..=3013).contains(&start))
+                                        || (device == 0xb4 && (0x1a..=0x1f).contains(&start))
+                                );
+                                let values = request[offset + 2..]
+                                    .as_chunks::<2>()
+                                    .0
+                                    .iter()
+                                    .map(|word| u16::from_le_bytes(*word))
+                                    .collect();
+                                writes.lock().unwrap().push((start, values));
+                            }
                             devices.lock().unwrap().push(device);
                             (0, Vec::new())
                         }
@@ -215,6 +275,7 @@ impl Fixture {
             frames,
             commands,
             write_devices,
+            bit_frames,
             task,
         }
     }
@@ -230,6 +291,10 @@ impl Fixture {
     fn write_devices(&self) -> Vec<u8> {
         self.write_devices.lock().unwrap().clone()
     }
+
+    fn bit_frames(&self) -> Vec<(u32, u8, Vec<bool>)> {
+        self.bit_frames.lock().unwrap().clone()
+    }
 }
 
 impl Drop for Fixture {
@@ -240,6 +305,169 @@ impl Drop for Fixture {
 
 fn component() -> Vec<u8> {
     std::fs::read(std::env::var(COMPONENT_ENV).expect("set component path")).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM to the pinned diagnostic guest"]
+async fn diagnostic_guest_uses_existing_connection_and_preserves_read() {
+    let bytes = std::fs::read(
+        std::env::var(DIAGNOSTIC_COMPONENT_ENV).expect("set diagnostic component path"),
+    )
+    .unwrap();
+    let driver = WasmDriver::load_operational_write(MANIFEST, &bytes).unwrap();
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let transport = TransportSpec::Tcp {
+        host: "127.0.0.1".into(),
+        port: fixture.address.port(),
+    };
+    let context = ConnectContext::new(
+        "slmp-wasm-operational-write",
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    let mut session = FrameSession::connect(
+        driver.as_ref(),
+        &settings(fixture.address.port(), "disabled", ""),
+        &transport,
+        &context,
+        None,
+    )
+    .await
+    .unwrap();
+    let kind = TagKind::numeric(DataType::U16);
+    let bit = TagKind::numeric(DataType::Bit);
+    let specs = [
+        TagSpec::new(driver.parse_address("D3010", &kind).unwrap(), kind.clone()),
+        TagSpec::new(driver.parse_address("D4000", &kind).unwrap(), kind.clone()),
+        TagSpec::new(driver.parse_address("M10", &bit).unwrap(), bit),
+    ];
+    let report = session
+        .diagnose_batch(&specs)
+        .await
+        .unwrap()
+        .expect("diagnostics export");
+    assert_eq!(report.model.as_ref().unwrap().name, "R04CPU");
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
+    assert!(fixture
+        .commands()
+        .iter()
+        .any(|(command, start, _)| *command == 0x0401 && *start == 262));
+    let values = session.read_batch(&specs[..1]).await.unwrap();
+    assert_eq!(values.len(), 1);
+    assert!(values[0].is_ok());
+    let before = fixture.commands().len();
+    let outside = session.read_batch(&specs[1..2]).await.unwrap();
+    assert_eq!(outside.len(), 1);
+    assert!(outside[0].is_err());
+    assert_eq!(
+        fixture.commands().len(),
+        before,
+        "outside tag must not reach the PLC"
+    );
+    let mixed = session.read_batch(&specs[..2]).await.unwrap();
+    assert!(mixed[0].is_ok());
+    assert!(mixed[1].is_err());
+    assert!(fixture.commands()[before..]
+        .iter()
+        .all(|(_, start, _)| *start != 4000));
+    assert!(fixture.frames().is_empty());
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM to the pinned diagnostic guest"]
+async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path() {
+    let bytes = std::fs::read(
+        std::env::var(DIAGNOSTIC_COMPONENT_ENV).expect("set diagnostic component path"),
+    )
+    .unwrap();
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-range-diagnostic-rest",
+        MANIFEST,
+        &bytes,
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "diagnostic-line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1", "port": fixture.address.port(),
+                "d_u16_write_mode": "disabled", "d_u16_write_allowlist": ""
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("diagnostic-group", saved.id, 60_000))
+    .await
+    .unwrap();
+    let inside = app
+        .manager
+        .tags()
+        .create(super::tag_input("inside", group.id, "D3010", "u16"))
+        .await
+        .unwrap();
+    let outside = app
+        .manager
+        .tags()
+        .create(super::tag_input("outside", group.id, "D4000", "u16"))
+        .await
+        .unwrap();
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let path = format!("/api/plc-connections/{}/diagnostics", saved.id);
+    let (status, report) = super::admin_write(
+        &app.router,
+        "POST",
+        &path,
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{report:?}");
+    assert_eq!(report["status"], "current");
+    assert!(report["tags"].as_array().is_some_and(|tags| {
+        tags.iter()
+            .any(|tag| tag["tagId"] == inside.id && tag["verdict"] == "inside")
+            && tags
+                .iter()
+                .any(|tag| tag["tagId"] == outside.id && tag["verdict"] == "outside")
+    }));
+    let (status, cached) = super::admin_write(
+        &app.router,
+        "GET",
+        &path,
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK);
+    assert_eq!(cached["status"], "current");
+    assert_eq!(cached["tags"], report["tags"]);
+    assert!(fixture.frames().is_empty());
+    drop(app);
 }
 
 fn settings(port: u16, mode: &str, allowlist: &str) -> Settings {
@@ -292,6 +520,17 @@ async fn connect(
     allowlist: &str,
     bad_ack: bool,
 ) -> (Fixture, Arc<WasmDriver>, FrameSession) {
+    connect_with_order(peer, count, mode, allowlist, bad_ack, "low_high").await
+}
+
+async fn connect_with_order(
+    peer: Peer,
+    count: u32,
+    mode: &str,
+    allowlist: &str,
+    bad_ack: bool,
+    word_order: &str,
+) -> (Fixture, Arc<WasmDriver>, FrameSession) {
     let fixture = Fixture::start(peer, count, bad_ack).await;
     let driver = WasmDriver::load_operational_write(MANIFEST, &component()).unwrap();
     let transport = TransportSpec::Tcp {
@@ -303,9 +542,21 @@ async fn connect(
         Duration::from_millis(500),
         Duration::from_millis(500),
     );
+    let mut connection_settings = settings(fixture.address.port(), mode, allowlist);
+    if word_order != "low_high" {
+        let port_text = fixture.address.port().to_string();
+        connection_settings = Settings::from_pairs([
+            ("host", "127.0.0.1"),
+            ("port", port_text.as_str()),
+            ("d_u16_write_mode", mode),
+            ("d_u16_write_allowlist", allowlist),
+            ("word_order", word_order),
+        ])
+        .unwrap();
+    }
     let session = FrameSession::connect(
         driver.as_ref(),
-        &settings(fixture.address.port(), mode, allowlist),
+        &connection_settings,
         &transport,
         &context,
         None,
@@ -313,6 +564,145 @@ async fn connect(
     .await
     .unwrap();
     (fixture, driver, session)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the typed bit guest"]
+async fn high_low_word_order_is_preserved_through_host_and_guest() {
+    let (fixture, driver, mut session) =
+        connect_with_order(Peer::R, 4000, "enabled", "D3010-D3015", false, "high_low").await;
+    let items = [
+        ("D3010", DataType::U32, 305419896.0),
+        ("D3012", DataType::F64, 1.5),
+    ]
+    .map(|(address, data_type, value)| {
+        let kind = TagKind::numeric(data_type);
+        WriteItem::new(
+            TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind),
+            Value::F64(value),
+        )
+    });
+    assert_eq!(session.write_batch(&items).await.unwrap(), vec![Ok(()); 2]);
+    assert_eq!(
+        fixture.frames(),
+        vec![(3010, vec![0x1234, 0x5678, 0x3ff8, 0, 0, 0])]
+    );
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the typed bit guest"]
+async fn typed_words_are_one_complete_frame_and_bad_items_send_nothing() {
+    for peer in [Peer::R, Peer::StandardQ] {
+        let (area, first, allowlist) = if matches!(peer, Peer::R) {
+            ("D", 3010_u32, "D3010-D3029")
+        } else {
+            ("W", 0x1a_u32, "W1A-W2D")
+        };
+        let (fixture, driver, mut session) = connect(peer, 4000, "enabled", allowlist, false).await;
+        let typed = [
+            (0, DataType::I16, -2.0),
+            (1, DataType::U16, 65535.0),
+            (2, DataType::I32, -1.0),
+            (4, DataType::U32, 305419896.0),
+            (6, DataType::I64, -2.0),
+            (10, DataType::U64, 9_007_199_254_740_991.0),
+            (14, DataType::F32, 1.5),
+            (16, DataType::F64, 1.5),
+        ];
+        let valid = typed
+            .iter()
+            .map(|(offset, kind, value)| {
+                let kind = TagKind::numeric(*kind);
+                let index = first + offset;
+                let address = if area == "D" {
+                    format!("D{index}")
+                } else {
+                    format!("W{index:X}")
+                };
+                WriteItem::new(
+                    TagSpec::new(driver.parse_address(&address, &kind).unwrap(), kind),
+                    Value::F64(*value),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut bad = valid.clone();
+        bad[3].value = Value::Bit(true);
+        assert!(session
+            .write_batch(&bad)
+            .await
+            .unwrap()
+            .iter()
+            .all(|result| matches!(result, Err(ItemError::Unsupported(_)))));
+        bad = valid.clone();
+        bad[6].value = Value::F64(f64::NAN);
+        assert!(session
+            .write_batch(&bad)
+            .await
+            .unwrap()
+            .iter()
+            .all(|result| matches!(result, Err(ItemError::Unsupported(_)))));
+        assert!(fixture.frames().is_empty());
+        assert_eq!(session.write_batch(&valid).await.unwrap(), vec![Ok(()); 8]);
+        assert_eq!(
+            fixture.frames(),
+            vec![(
+                first,
+                vec![
+                    0xfffe, 0xffff, 0xffff, 0xffff, 0x5678, 0x1234, 0xfffe, 0xffff, 0xffff, 0xffff,
+                    0xffff, 0xffff, 0xffff, 0x001f, 0, 0x3fc0, 0, 0, 0, 0x3ff8,
+                ]
+            )]
+        );
+        session.disconnect().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the typed bit guest"]
+async fn standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run() {
+    for peer in [Peer::R, Peer::StandardQ] {
+        for (name, start, device, allowlist) in [
+            ("M", "10", 0x90, "M10-M11"),
+            ("Y", "1A", 0x9d, "Y1A-Y1B"),
+            ("L", "10", 0x92, "L10-L11"),
+            ("B", "20", 0xa0, "B20-B21"),
+        ] {
+            let (fixture, driver, mut session) =
+                connect(peer, 4000, "enabled", allowlist, false).await;
+            let index = u32::from_str_radix(start, if matches!(name, "M" | "L") { 10 } else { 16 })
+                .unwrap();
+            let valid = (0..2)
+                .map(|offset| {
+                    let kind = TagKind::numeric(DataType::Bit);
+                    let address = if matches!(name, "M" | "L") {
+                        format!("{name}{}", index + offset)
+                    } else {
+                        format!("{name}{:X}", index + offset)
+                    };
+                    WriteItem::new(
+                        TagSpec::new(driver.parse_address(&address, &kind).unwrap(), kind),
+                        Value::Bit(offset == 0),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut bad = valid.clone();
+            bad[1].value = Value::F64(0.0);
+            assert!(session
+                .write_batch(&bad)
+                .await
+                .unwrap()
+                .iter()
+                .all(|result| matches!(result, Err(ItemError::Unsupported(_)))));
+            assert!(fixture.bit_frames().is_empty());
+            assert_eq!(session.write_batch(&valid).await.unwrap(), vec![Ok(()); 2]);
+            assert_eq!(
+                fixture.bit_frames(),
+                vec![(index, device, vec![true, false])]
+            );
+            session.disconnect().await;
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

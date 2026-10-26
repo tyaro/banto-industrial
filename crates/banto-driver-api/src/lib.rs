@@ -98,6 +98,7 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod diagnostics;
 pub mod driver;
 pub mod error;
 pub mod frame;
@@ -108,6 +109,10 @@ pub mod settings;
 pub mod types;
 
 pub use address::{DriverAddress, DriverId, InvalidDriverId};
+pub use diagnostics::{
+    AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
+    TagVerdict,
+};
 pub use driver::{
     AddressError, Capabilities, DriverBase, DriverDescriptor, Transport, API_VERSION,
 };

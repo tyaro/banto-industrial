@@ -19,9 +19,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_driver_api::{
-    BoxFuture, ConnectContext, FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule,
-    ItemError, PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value,
-    WriteItem, WriteProgress,
+    BoxFuture, ConnectContext, DiagnosticProgress, DiagnosticReport, FatalError, FrameCheck,
+    FrameConnection, FrameDriver, FrameRule, ItemError, PrefixEncoding, PrefixSpec, RawValue,
+    Session, Settings, Step, TagSpec, Value, WriteItem, WriteProgress,
 };
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
@@ -62,6 +62,7 @@ struct Core {
     transport: Box<dyn Transport>,
     response_timeout: Duration,
     can_write: bool,
+    outside: std::collections::HashSet<(String, banto_driver_api::TagKind)>,
     events: Option<Arc<dyn EngineEvents>>,
     /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。
     last_quiet_from: Option<Instant>,
@@ -116,6 +117,7 @@ impl FrameSession {
             can_write: driver.descriptor().capabilities.write,
             events,
             last_quiet_from: None,
+            outside: std::collections::HashSet::new(),
         };
         let result = core.handshake().await;
         match result {
@@ -203,6 +205,37 @@ fn record_driver_error(
 }
 
 impl Session for FrameSession {
+    fn diagnose_batch<'a>(
+        &'a mut self,
+        specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, Result<Option<DiagnosticReport>, FatalError>> {
+        Box::pin(async move {
+            let mut core = self.take_core()?;
+            if !core.conn.supports_diagnostics() {
+                self.core = Some(core);
+                return Ok(None);
+            }
+            match core.diagnose(specs).await {
+                Ok(report) => {
+                    for (spec, result) in specs.iter().zip(&report.tags) {
+                        let key = (spec.address.canonical.clone(), spec.kind.clone());
+                        if matches!(result.verdict, banto_driver_api::TagVerdict::Outside(_)) {
+                            core.outside.insert(key);
+                        } else {
+                            core.outside.remove(&key);
+                        }
+                    }
+                    self.core = Some(core);
+                    Ok(Some(report))
+                }
+                Err(error) => {
+                    core.close().await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
     fn read_batch<'a>(
         &'a mut self,
         specs: &'a [TagSpec],
@@ -319,7 +352,114 @@ impl Core {
         unreachable!()
     }
 
+    async fn diagnose(&mut self, specs: &[TagSpec]) -> Result<DiagnosticReport, FatalError> {
+        const MAX_DIAGNOSTIC_STEPS: usize = 16;
+        let mut previous = None;
+        for step in 0..=MAX_DIAGNOSTIC_STEPS {
+            match self
+                .conn
+                .diagnose_next(specs, previous.as_deref())
+                .map_err(|e| self.driver_fatal("diagnose_next", e))?
+            {
+                DiagnosticProgress::Send(_) if step == MAX_DIAGNOSTIC_STEPS => {
+                    return Err(
+                        self.violation_fatal("C16", "diagnostic step limit exceeded".into())
+                    );
+                }
+                DiagnosticProgress::Send(next) => previous = Some(self.exchange(&next).await?),
+                DiagnosticProgress::Done(report) => {
+                    if report.tags.len() != specs.len()
+                        || report
+                            .tags
+                            .iter()
+                            .zip(specs)
+                            .any(|(result, spec)| result.address != spec.address.canonical)
+                    {
+                        return Err(self.violation_fatal(
+                            "C3",
+                            "diagnostic results differ from requested tags".into(),
+                        ));
+                    }
+                    // Guest-owned range semantics are opaque to the host, but
+                    // the result shape and display strings remain bounded.
+                    let text_ok = |text: &str| text.len() <= 256;
+                    let model_ok = report.model.as_ref().is_none_or(|model| {
+                        model.raw_name.len() <= 64 && text_ok(&model.name) && text_ok(&model.family)
+                    });
+                    let counts_ok = report.counts.len() <= 16
+                        && report.counts.iter().all(|count| {
+                            text_ok(&count.area)
+                                && text_ok(&count.scope)
+                                && text_ok(&count.unit)
+                                && text_ok(&count.source)
+                                && match &count.bound {
+                                    banto_driver_api::CountBound::Unknown(reason) => {
+                                        text_ok(reason)
+                                    }
+                                    _ => true,
+                                }
+                        });
+                    let verdicts_ok = report.tags.iter().all(|tag| {
+                        let reason = match &tag.verdict {
+                            banto_driver_api::TagVerdict::Inside(reason)
+                            | banto_driver_api::TagVerdict::Outside(reason)
+                            | banto_driver_api::TagVerdict::Unknown(reason)
+                            | banto_driver_api::TagVerdict::Invalid(reason)
+                            | banto_driver_api::TagVerdict::Unsupported(reason) => reason,
+                        };
+                        text_ok(reason)
+                    });
+                    if !model_ok
+                        || !report.model_reason.as_deref().is_none_or(text_ok)
+                        || !counts_ok
+                        || !verdicts_ok
+                    {
+                        return Err(self.violation_fatal(
+                            "C9",
+                            "diagnostic report exceeds host display limits".into(),
+                        ));
+                    }
+                    return Ok(report);
+                }
+            }
+        }
+        unreachable!()
+    }
+
     async fn read(
+        &mut self,
+        specs: &[TagSpec],
+    ) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {
+        if self.outside.is_empty() {
+            return self.read_unchecked(specs).await;
+        }
+        let active: Vec<(usize, TagSpec)> = specs
+            .iter()
+            .enumerate()
+            .filter(|(_, spec)| {
+                !self
+                    .outside
+                    .contains(&(spec.address.canonical.clone(), spec.kind.clone()))
+            })
+            .map(|(index, spec)| (index, spec.clone()))
+            .collect();
+        let mut results = vec![
+            Err(ItemError::Unsupported(
+                "diagnostic proved tag outside the configured range".into()
+            ));
+            specs.len()
+        ];
+        if !active.is_empty() {
+            let requested: Vec<_> = active.iter().map(|(_, spec)| spec.clone()).collect();
+            let values = self.read_unchecked(&requested).await?;
+            for ((index, _), value) in active.into_iter().zip(values) {
+                results[index] = value;
+            }
+        }
+        Ok(results)
+    }
+
+    async fn read_unchecked(
         &mut self,
         specs: &[TagSpec],
     ) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {

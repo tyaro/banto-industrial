@@ -13,6 +13,7 @@ use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
     collection_groups_get, collection_groups_list, collection_groups_update,
 };
+use super::diagnostics::{range_diagnostic_get, range_diagnostic_post};
 use super::drivers::drivers_list;
 use super::plc_connections::{
     plc_connections_create, plc_connections_delete, plc_connections_get, plc_connections_list,
@@ -1393,6 +1394,10 @@ pub(super) fn tag_registry_router(
         // 固定パスなので `/api/plc-connections/{id}` と衝突しない
         // (下の `/api/tags/batch` と同型のパス設計)。
         .route("/api/plc-connections/test", post(plc_connections_test))
+        .route(
+            "/api/plc-connections/{id}/diagnostics",
+            get(range_diagnostic_get).post(range_diagnostic_post),
+        )
         // S1a (docs/banto-hub-external-db-design.md §4.6): 保存済み接続の
         // 接続テスト - `{id}` の下の固定サブパスなので
         // `/api/plc-connections/{id}` の GET/PUT/DELETE とは axum のルート
