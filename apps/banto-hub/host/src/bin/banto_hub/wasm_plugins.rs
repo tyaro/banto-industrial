@@ -12,6 +12,7 @@ use ring::digest::{Context, SHA256};
 use ring::signature::{UnparsedPublicKey, ED25519};
 
 const SELECT_ENV: &str = "BANTO_WASM_PLUGIN";
+const WRITE_SELECT_ENV: &str = "BANTO_WASM_WRITE_PLUGIN";
 const MANIFEST: &str = "manifest.json";
 const COMPONENT: &str = "component.wasm";
 const SIGNATURE: &str = "signature.ed25519";
@@ -83,17 +84,25 @@ pub(super) fn register_from_env(registry: &mut DriverRegistry) {
             return;
         }
     };
-    let outcome = std::env::var_os("ProgramData")
-        .filter(|path| !path.is_empty())
-        .ok_or_else(|| "ProgramData is unavailable".to_owned())
-        .and_then(|base| {
-            register_selected(
-                registry,
-                &PathBuf::from(base).join("BantoHub").join("plugins"),
-                &selection,
-                TRUSTED_PUBLIC_KEYS,
-            )
-        });
+    let write_selection: Result<Option<String>, String> = match std::env::var(WRITE_SELECT_ENV) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(_) => Err("WASM write selection is not UTF-8".into()),
+    };
+    let outcome = write_selection.and_then(|write_selection| {
+        std::env::var_os("ProgramData")
+            .filter(|path| !path.is_empty())
+            .ok_or_else(|| "ProgramData is unavailable".to_owned())
+            .and_then(|base| {
+                register_selected_with_write_opt_in(
+                    registry,
+                    &PathBuf::from(base).join("BantoHub").join("plugins"),
+                    &selection,
+                    TRUSTED_PUBLIC_KEYS,
+                    write_selection.as_deref(),
+                )
+            })
+    });
     let (success, message) = match outcome {
         Ok(()) => (true, format!("WASM plugin registered: {selection}")),
         Err(reason) => (
@@ -114,13 +123,27 @@ pub(super) fn register_from_env(registry: &mut DriverRegistry) {
 
 /// The root and keys are arguments so tests can use a temporary directory and
 /// an ephemeral key. A bad plugin never changes the existing registry.
+#[cfg(test)]
 fn register_selected(
     registry: &mut DriverRegistry,
     root: &Path,
     selector: &str,
     trusted_keys: &[[u8; 32]],
 ) -> Result<(), String> {
+    register_selected_with_write_opt_in(registry, root, selector, trusted_keys, None)
+}
+
+fn register_selected_with_write_opt_in(
+    registry: &mut DriverRegistry,
+    root: &Path,
+    selector: &str,
+    trusted_keys: &[[u8; 32]],
+    write_selection: Option<&str>,
+) -> Result<(), String> {
     let selection = Selection::parse(selector)?;
+    if write_selection.is_some_and(|chosen| chosen != selector) {
+        return Err("write opt-in must match the selected plugin id@version".into());
+    }
     if trusted_keys.is_empty() {
         return Err("no trusted plugin verification key is configured".into());
     }
@@ -177,8 +200,19 @@ fn register_selected(
     {
         return Err("signed manifest id/version differs from selection".into());
     }
-    banto_drivers::register_wasm(registry, &manifest, &component)
-        .map_err(|error| format!("component registration failed: {error}"))?;
+    if parsed.requests_write {
+        if write_selection != Some(selector) {
+            return Err("write manifest requires an exact BANTO_WASM_WRITE_PLUGIN opt-in".into());
+        }
+        banto_drivers::register_wasm_operational_write(registry, &manifest, &component)
+            .map_err(|error| format!("component registration failed: {error}"))?;
+    } else {
+        if write_selection.is_some() {
+            return Err("write opt-in selected a read-only plugin".into());
+        }
+        banto_drivers::register_wasm(registry, &manifest, &component)
+            .map_err(|error| format!("component registration failed: {error}"))?;
+    }
     Ok(())
 }
 
@@ -317,6 +351,57 @@ mod tests {
         let error =
             register_selected(&mut registry, temporary.path(), SELECTOR, &[public]).unwrap_err();
         assert!(error.contains("hubApi"));
+    }
+
+    #[test]
+    fn signed_write_manifest_requires_exact_separate_startup_selection() {
+        let mut write_manifest: serde_json::Value = serde_json::from_slice(TEST_MANIFEST).unwrap();
+        write_manifest["capabilities"] = serde_json::json!(["read", "write"]);
+        write_manifest["writeApi"] = serde_json::json!("1");
+        let bytes = serde_json::to_vec(&write_manifest).unwrap();
+        let (temporary, public) = signed_directory(&bytes, b"not a component");
+        let mut registry = banto_drivers::builtin().registry;
+        let original = registry.len();
+        let missing = register_selected_with_write_opt_in(
+            &mut registry,
+            temporary.path(),
+            SELECTOR,
+            &[public],
+            None,
+        )
+        .unwrap_err();
+        assert!(missing.contains("exact BANTO_WASM_WRITE_PLUGIN opt-in"));
+        let mismatched = register_selected_with_write_opt_in(
+            &mut registry,
+            temporary.path(),
+            SELECTOR,
+            &[public],
+            Some("another@0.1.0"),
+        )
+        .unwrap_err();
+        assert!(mismatched.contains("must match"));
+        let invalid_component = register_selected_with_write_opt_in(
+            &mut registry,
+            temporary.path(),
+            SELECTOR,
+            &[public],
+            Some(SELECTOR),
+        )
+        .unwrap_err();
+        assert!(invalid_component.contains("component registration failed"));
+        assert_eq!(registry.len(), original);
+
+        let (read_only, read_key) = signed_directory(TEST_MANIFEST, b"not a component");
+        let not_write = register_selected_with_write_opt_in(
+            &mut registry,
+            read_only.path(),
+            SELECTOR,
+            &[read_key],
+            Some(SELECTOR),
+        )
+        .unwrap_err();
+        assert!(not_write.contains("read-only plugin"));
+        assert_eq!(registry.len(), original);
     }
 
     #[test]

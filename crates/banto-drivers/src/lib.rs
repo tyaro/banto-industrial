@@ -78,6 +78,23 @@ pub fn register_wasm(
     Ok(driver)
 }
 
+/// Register an explicitly selected write component after the caller verifies
+/// its signature.
+/// Each connection still needs its own enabled D/u16 allowlist. The ordinary
+/// `register_wasm` entry point remains read-only.
+pub fn register_wasm_operational_write(
+    registry: &mut DriverRegistry,
+    manifest: &[u8],
+    component: &[u8],
+) -> Result<Arc<WasmDriver>, WasmRegistrationError> {
+    let driver = WasmDriver::load_operational_write(manifest, component)
+        .map_err(WasmRegistrationError::Load)?;
+    registry
+        .register(DriverEntry::frame(driver.clone()))
+        .map_err(WasmRegistrationError::Registry)?;
+    Ok(driver)
+}
+
 /// Everything a host injects to give the engine its drivers.
 pub struct Builtin {
     /// The driver registry (design §6.1): `modbus-tcp` as a frame-type entry

@@ -602,6 +602,38 @@ jobs:
           if (-not (Select-String -Path $qGuardLog -Pattern '^test result: ok\. 2 passed; 0 failed; 1 ignored;' -Quiet)) {
             throw 'Q25PRH test-write guard tests did not all run, or live test was selected'
           }
+          # Normal Q/R D/u16 writes use a separately selected, signed plugin.
+          # This job exercises only loopback PLCs and temporary TestApp state;
+          # its ignored live-PLC fixtures are not selected.
+          $normalWriteSha = 'ce6513a127d956ca00508f8d47480567c73e4a49'
+          git -C $guest checkout --quiet --detach $normalWriteSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $normalWriteSha) {
+            throw 'normal SLMP write guest SHA mismatch'
+          }
+          $normalReadWit = git -C $guest rev-parse --verify "${normalWriteSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $normalReadWit -ne $hostWit) {
+            throw 'normal SLMP write guest read WIT mismatch'
+          }
+          $normalWriteWit = git -C $guest rev-parse --verify "${normalWriteSha}:wit/write-v1.wit"
+          if ($LASTEXITCODE -ne 0 -or $normalWriteWit -ne $hostWriteWit) {
+            throw 'normal SLMP write guest WIT mismatch'
+          }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write guest build failed' }
+          $normalWriteModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-normal-write-component.wasm'
+          wasm-tools component new $normalWriteModule -o $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component creation failed' }
+          wasm-tools validate $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
+          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component world mismatch' }
+          $normalWriteLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-normal-write-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $normalWriteLog
+          if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write Hub tests failed' }
+          if (-not (Select-String -Path $normalWriteLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'normal SLMP write Hub tests did not all run'
+          }
           # Stage-2 numeric reads use the separately reviewed guest revision.
           # Keep the older guest revisions above for read and write regressions.
           $numericSha = '9ffa939ffc3551325551b28e4993ec62b8ddc34d'
