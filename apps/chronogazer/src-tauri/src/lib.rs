@@ -4227,6 +4227,7 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         // `data.dir` の相対パスは**データのルート基準**（#392 B2-4b。既定 `"./data"` を
         // プロセスの作業ディレクトリに作らない。`chronogazer-server` と同じ）。
         data_base: paths.data_dir.clone(),
+        service_data_root: None,
         // #392 B2-4b（決定 4）: Hub の API キーは `<root>\secrets\hub-keys\` の DPAPI の
         // ファイル。保存先の作成・ACL の付与は共有のルートの下に物を作るので、A1 の
         // 排他を取った後（`open` の後）に [`desktop_key_store`] で開いて
@@ -5283,6 +5284,7 @@ mod tests {
             drivers: EngineConfig::builtin_drivers(),
             db_path: dir.join("chronogazer.sqlite3"),
             data_base: dir.to_path_buf(),
+            service_data_root: None,
             key_store: Arc::new(chronogazer_core::hub::UnavailableKeyStore),
             attach_hub: true,
             host: ChronoGazerHost::Desktop,

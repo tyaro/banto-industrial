@@ -55,6 +55,7 @@ pub mod server_host;
 // 文言（終了コード・停止の予算・インストール利用者の SID・install/uninstall の文言）。
 // SCM とのやりとりは `banto-service-control`、本体と登録の手順は bin。
 pub mod server_service;
+mod service_data_dir;
 // #392 B2-4a: シェルがサービスの health を確かめる probe（`run\endpoint.json` →
 // `GET /api/host`、O8 の条件）。std の TCP だけで、Tauri に依存しない。
 pub mod service_probe;

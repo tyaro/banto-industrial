@@ -105,7 +105,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_hub_bootstrap::KeyStore;
-use banto_safe_root::ManagedDir;
+use banto_safe_root::{ManagedDir, SafeRoot};
 use banto_server::ServerConfig;
 use banto_tstore::{Clock, LocalDate};
 
@@ -533,11 +533,35 @@ pub fn lock_held(
     }
 }
 
+/// Service entry with the same `SafeRoot` handle kept by `run-service`.
+pub fn lock_held_with_root(
+    layout: DataLayout,
+    instance_lock: InstanceGuard,
+    db_path: PathBuf,
+    root: Arc<SafeRoot>,
+    run_dir: Arc<ManagedDir>,
+) -> LockedServer {
+    let mut config = engine_config(
+        root.final_path().to_path_buf(),
+        db_path,
+        ChronoGazerHost::Service,
+    );
+    config.service_data_root = Some(root);
+    let locked = EngineRuntime::lock_with(config, instance_lock);
+    LockedServer {
+        locked,
+        layout,
+        host: ChronoGazerHost::Service,
+        run_dir: Some(run_dir),
+    }
+}
+
 /// `chronogazer-server` のエンジンの設定（[`lock`]・[`lock_held`] で同じ）。
 fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) -> EngineConfig {
     EngineConfig {
         drivers: EngineConfig::builtin_drivers(),
         data_base,
+        service_data_root: None,
         db_path,
         // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
         key_store: Arc::new(FailedKeyStore::new(

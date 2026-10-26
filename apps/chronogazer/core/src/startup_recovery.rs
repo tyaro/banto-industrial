@@ -237,6 +237,7 @@ pub fn classify(err: &EngineStartError) -> FailureKind {
             other => other,
         },
         EngineStartError::StoreDirUnwritable { .. } => FailureKind::StoreDirUnwritable,
+        EngineStartError::StoreDirNotAllowed { .. } => FailureKind::Other,
         EngineStartError::Listen { .. } => FailureKind::Other,
     }
 }
