@@ -11,10 +11,33 @@ const MAX_INTERVALS: usize = 16;
 const MAX_TEXT_LEN: usize = 256;
 const MAX_DEVICE: u32 = 0x00ff_ffff;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WriteArea {
+    D,
+    W,
+}
+
+impl WriteArea {
+    pub(super) fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "D" => Some(Self::D),
+            "W" => Some(Self::W),
+            _ => None,
+        }
+    }
+
+    pub(super) fn canonical(self, index: u32) -> String {
+        match self {
+            Self::D => format!("D{index}"),
+            Self::W => format!("W{index:X}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct WritePolicy {
     enabled: bool,
-    ranges: Vec<(u32, u32)>,
+    ranges: Vec<(WriteArea, u32, u32)>,
 }
 
 impl WritePolicy {
@@ -35,23 +58,31 @@ impl WritePolicy {
                     return Err((ALLOWLIST_KEY, "too many write ranges"));
                 }
                 let Some((start, end)) = interval.split_once('-') else {
-                    return Err((ALLOWLIST_KEY, "expected Dstart-Dend ranges"));
+                    return Err((ALLOWLIST_KEY, "expected same-area start-end ranges"));
                 };
-                let start = parse_device(start)?;
-                let end = parse_device(end)?;
+                let (area, start) = parse_device(start)?;
+                let (end_area, end) = parse_device(end)?;
+                if area != end_area {
+                    return Err((ALLOWLIST_KEY, "write range must remain in one device area"));
+                }
                 if end < start || end - start >= MAX_WORDS as u32 {
                     return Err((
                         ALLOWLIST_KEY,
                         "write range is reversed or exceeds 960 words",
                     ));
                 }
-                if start <= 3001 && end >= 3000 {
+                if area == WriteArea::D && start <= 3001 && end >= 3000 {
                     return Err((ALLOWLIST_KEY, "D3000 and D3001 are protected"));
                 }
-                if ranges.last().is_some_and(|&(_, last)| start <= last) {
+                if ranges
+                    .iter()
+                    .rev()
+                    .find(|&&(other, _, _)| other == area)
+                    .is_some_and(|&(_, _, last)| start <= last)
+                {
                     return Err((ALLOWLIST_KEY, "write ranges must be ordered and disjoint"));
                 }
-                ranges.push((start, end));
+                ranges.push((area, start, end));
             }
         }
         if enabled && ranges.is_empty() {
@@ -69,7 +100,7 @@ impl WritePolicy {
         Ok(Self { enabled, ranges })
     }
 
-    pub(super) fn allows_span(&self, start: u32, len: usize) -> bool {
+    pub(super) fn allows_device_span(&self, area: WriteArea, start: u32, len: usize) -> bool {
         if !self.enabled || len == 0 || len > MAX_WORDS {
             return false;
         }
@@ -80,26 +111,41 @@ impl WritePolicy {
             return false;
         };
         end <= MAX_DEVICE
-            && (start > 3001 || end < 3000)
+            && (area != WriteArea::D || start > 3001 || end < 3000)
             && self
                 .ranges
                 .iter()
-                .any(|&(allowed_start, allowed_end)| start >= allowed_start && end <= allowed_end)
+                .any(|&(allowed_area, allowed_start, allowed_end)| {
+                    area == allowed_area && start >= allowed_start && end <= allowed_end
+                })
     }
 }
 
-fn parse_device(value: &str) -> Result<u32, (&'static str, &'static str)> {
-    let digits = value
-        .strip_prefix('D')
-        .filter(|digits| !digits.is_empty() && digits.bytes().all(|ch| ch.is_ascii_digit()))
-        .ok_or((ALLOWLIST_KEY, "expected decimal D addresses"))?;
-    let number = digits
-        .parse::<u32>()
+fn parse_device(value: &str) -> Result<(WriteArea, u32), (&'static str, &'static str)> {
+    let (area, digits, radix) = if let Some(digits) = value.strip_prefix('D') {
+        (WriteArea::D, digits, 10)
+    } else if let Some(digits) = value.strip_prefix('W') {
+        (WriteArea::W, digits, 16)
+    } else {
+        return Err((ALLOWLIST_KEY, "expected D or W address"));
+    };
+    if digits.is_empty()
+        || !digits.bytes().all(|ch| {
+            if radix == 10 {
+                ch.is_ascii_digit()
+            } else {
+                ch.is_ascii_hexdigit() && !ch.is_ascii_lowercase()
+            }
+        })
+    {
+        return Err((ALLOWLIST_KEY, "invalid write address"));
+    }
+    let number = u32::from_str_radix(digits, radix)
         .map_err(|_| (ALLOWLIST_KEY, "write address is out of range"))?;
     if number > MAX_DEVICE {
         return Err((ALLOWLIST_KEY, "write address is out of range"));
     }
-    Ok(number)
+    Ok((area, number))
 }
 
 #[cfg(test)]
@@ -113,10 +159,11 @@ mod tests {
     #[test]
     fn default_disabled_and_explicit_range_only() {
         let disabled = WritePolicy::parse(&Settings::new()).unwrap();
-        assert!(!disabled.allows_span(3010, 1));
+        assert!(!disabled.allows_device_span(WriteArea::D, 3010, 1));
         let enabled = WritePolicy::parse(&settings("enabled", "D3010-D3013,D4000-D4009")).unwrap();
-        assert!(enabled.allows_span(3010, 4));
-        assert!(enabled.allows_span(4003, 2));
+        assert!(enabled.allows_device_span(WriteArea::D, 3010, 4));
+        assert!(enabled.allows_device_span(WriteArea::D, 4003, 2));
+        assert!(!enabled.allows_device_span(WriteArea::W, 0x1a, 1));
         for (start, len) in [
             (3000, 1),
             (3001, 1),
@@ -128,7 +175,25 @@ mod tests {
             (3010, 0),
             (3010, 961),
         ] {
-            assert!(!enabled.allows_span(start, len), "{start} / {len}");
+            assert!(
+                !enabled.allows_device_span(WriteArea::D, start, len),
+                "{start} / {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_common_policy_requires_an_explicit_w_range() {
+        let policy = WritePolicy::parse(&settings("enabled", "D3010-D3013,W1A-W1F")).unwrap();
+        assert!(policy.allows_device_span(WriteArea::D, 3010, 4));
+        assert!(policy.allows_device_span(WriteArea::W, 0x1a, 6));
+        assert!(!policy.allows_device_span(WriteArea::W, 0x1f, 2));
+        assert!(!policy.allows_device_span(WriteArea::D, 0x1a, 1));
+        for bad in ["W1A-D27", "W1A-W20,W1F-W21", "W1G-W1F", "w1a-w1f"] {
+            assert!(
+                WritePolicy::parse(&settings("enabled", bad)).is_err(),
+                "{bad}"
+            );
         }
     }
 

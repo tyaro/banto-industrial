@@ -23,7 +23,7 @@ use api::{
     Settings, SettingsSchema, Step, TagKind, TagSpec, WriteItem, WriteProgress,
 };
 use banto_driver_api as api;
-use operational_write::{WritePolicy, ALLOWLIST_KEY, MODE_KEY};
+use operational_write::{WriteArea, WritePolicy, ALLOWLIST_KEY, MODE_KEY};
 use runtime::write_v1::{
     banto::driver::types as write_types,
     exports::banto::driver::{session as write_session, write_v1 as write},
@@ -334,11 +334,12 @@ impl WasmDriver {
     }
 }
 
-/// U16 remains the required probe kind. Other numeric kinds use the existing
-/// WIT int/uint/float variants and are validated again at the value boundary.
+/// U16 remains the required probe kind. Bit and the other numeric kinds use
+/// their exact WIT variants and are validated again at the value boundary.
 fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
     let allowed = [
         KindName::Numeric(DataType::U16),
+        KindName::Numeric(DataType::Bit),
         KindName::Numeric(DataType::U32),
         KindName::Numeric(DataType::I16),
         KindName::Numeric(DataType::I32),
@@ -355,7 +356,7 @@ fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
             .any(|(index, kind)| !allowed.contains(kind) || supported[..index].contains(kind))
     {
         return Err(LoadError::Contract(
-            "WASM component must support U16 and may add the other seven numeric read kinds once each"
+            "WASM component must support U16 and may add bit and the other seven numeric read kinds once each"
                 .into(),
         ));
     }
@@ -465,6 +466,7 @@ fn checked_parsed_address(
     parsed: address::Parsed,
 ) -> Result<DriverAddress, AddressError> {
     let expected_words: u16 = match kind {
+        TagKind::Numeric(DataType::Bit) => 1,
         TagKind::Numeric(DataType::U16 | DataType::I16) => 1,
         TagKind::Numeric(DataType::U32 | DataType::I32 | DataType::F32) => 2,
         TagKind::Numeric(DataType::U64 | DataType::I64 | DataType::F64) => 4,
@@ -477,7 +479,9 @@ fn checked_parsed_address(
     if parsed.canonical.is_empty()
         || parsed.area.is_empty()
         || parsed.word_count != u32::from(expected_words)
-        || parsed.bit.is_some()
+        || parsed
+            .bit
+            .is_some_and(|bit| !matches!(kind, TagKind::Numeric(DataType::Bit)) || bit >= 16)
     {
         return Err(AddressError::new(
             "WASM address metadata violates the tag contract",
@@ -498,6 +502,9 @@ fn checked_parsed_address(
     );
     if let Some(index) = parsed.index {
         address = address.with_index(index);
+    }
+    if let Some(bit) = parsed.bit {
+        address = address.with_bit(bit);
     }
     Ok(address)
 }
@@ -603,6 +610,7 @@ fn wit_planned(planned: &Planned) -> Result<read::Planned, FatalError> {
 /// WASM boundary; the engine's RawValue conversion is not a substitute.
 fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
     match (kind, value) {
+        (TagKind::Numeric(DataType::Bit), types::Value::Bool(value)) => Ok(RawValue::Bool(value)),
         (TagKind::Numeric(DataType::U16), types::Value::Uint(n)) if u16::try_from(n).is_ok() => {
             Ok(RawValue::Uint(n))
         }
@@ -692,7 +700,7 @@ fn controlled_write_item(
 }
 
 /// Require an entire contiguous request to fit inside one saved connection's
-/// explicit D/u16 interval before the guest can plan a write frame.
+/// explicit D or W u16 interval before the guest can plan a write frame.
 fn operational_write_item(
     items: &[WriteItem],
     driver_id: &DriverId,
@@ -701,29 +709,30 @@ fn operational_write_item(
     let refused = || {
         WriteProgress::Done(vec![
             Err(ItemError::Unsupported(
-                "D/u16 write is disabled or outside the connection allowlist".into(),
+                "D/W u16 write is disabled or outside the connection allowlist".into(),
             ));
             items.len()
         ])
     };
-    let Some(start) = items
-        .first()
-        .and_then(|item| item.spec.address.index)
-        .and_then(|index| u32::try_from(index).ok())
-    else {
+    let Some((area, start)) = items.first().and_then(|item| {
+        Some((
+            WriteArea::from_name(&item.spec.address.area)?,
+            u32::try_from(item.spec.address.index?).ok()?,
+        ))
+    }) else {
         return Err(refused());
     };
-    if !policy.allows_span(start, items.len()) {
+    if !policy.allows_device_span(area, start, items.len()) {
         return Err(refused());
     }
     let mut checked = Vec::with_capacity(items.len());
     for (offset, item) in items.iter().enumerate() {
-        let index = start + offset as u32; // bounded by allows_span
+        let index = start + offset as u32; // bounded by allows_device_span
         let address = &item.spec.address;
         if address.driver != *driver_id
             || address.index != Some(u64::from(index))
-            || address.canonical != format!("D{index}")
-            || address.area != "D"
+            || address.canonical != area.canonical(index)
+            || WriteArea::from_name(&address.area) != Some(area)
             || address.bit.is_some()
             || address.word_count != 1
             || !address.writable_area
@@ -1150,6 +1159,67 @@ mod tests {
             TagSpec::new(address, TagKind::numeric(DataType::U16)),
             value,
         )
+    }
+
+    fn operational_w_item(index: u64, value: api::Value) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let address = DriverAddress::new(id, format!("W{index:X}"), "W", true, 1).with_index(index);
+        WriteItem::new(
+            TagSpec::new(address, TagKind::numeric(DataType::U16)),
+            value,
+        )
+    }
+
+    #[test]
+    fn operational_w_write_uses_the_same_policy_and_atomic_preflight() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let old = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "D3010-D3013")]).unwrap(),
+        )
+        .unwrap();
+        let valid: Vec<_> = (0x1a..=0x1f)
+            .map(|index| {
+                operational_w_item(
+                    index,
+                    api::Value::F64(f64::from(u16::try_from(index).unwrap())),
+                )
+            })
+            .collect();
+        assert!(operational_write_item(&valid, &id, &old).is_err());
+        let policy = WritePolicy::parse(
+            &Settings::from_pairs([
+                (MODE_KEY, "enabled"),
+                (ALLOWLIST_KEY, "D3010-D3013,W1A-W1F"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            operational_write_item(&valid, &id, &policy).unwrap().len(),
+            6
+        );
+        let mut invalid = Vec::new();
+        let mut mixed = valid.clone();
+        mixed[2] = operational_item(28, api::Value::F64(28.0));
+        invalid.push(mixed);
+        let mut lowercase = valid.clone();
+        lowercase[2].spec.address.canonical = "W1c".into();
+        invalid.push(lowercase);
+        let mut hole = valid.clone();
+        hole[2] = operational_w_item(0x1d, api::Value::F64(28.0));
+        invalid.push(hole);
+        let mut bad_value = valid.clone();
+        bad_value[2].value = api::Value::F64(f64::NAN);
+        invalid.push(bad_value);
+        let mut wrong_area = valid.clone();
+        wrong_area[2].spec.address.area = "D".into();
+        invalid.push(wrong_area);
+        for items in invalid {
+            assert!(matches!(
+                operational_write_item(&items, &id, &policy),
+                Err(WriteProgress::Done(results)) if results.len() == 6 && results.iter().all(Result::is_err)
+            ));
+        }
     }
 
     #[test]
@@ -1588,12 +1658,28 @@ mod tests {
             },
             (-0.0_f64).to_bits()
         );
-        assert!(checked_value(&TagKind::numeric(DataType::Bit), types::Value::Bool(true)).is_err());
+        let bit_kind = TagKind::numeric(DataType::Bit);
+        for value in [false, true] {
+            assert_eq!(
+                checked_value(&bit_kind, types::Value::Bool(value)).unwrap(),
+                RawValue::Bool(value)
+            );
+        }
+        for wrong in [
+            types::Value::Uint(1),
+            types::Value::Int(1),
+            types::Value::Float(1.0),
+            types::Value::Bytes(vec![1]),
+        ] {
+            assert!(checked_value(&bit_kind, wrong).is_err());
+        }
+        assert!(checked_value(&u16_kind, types::Value::Bool(true)).is_err());
     }
 
     #[test]
     fn supported_kinds_keep_old_guests_and_reject_unvalidated_kinds() {
         let u16_kind = KindName::Numeric(DataType::U16);
+        let bit_kind = KindName::Numeric(DataType::Bit);
         let u32_kind = KindName::Numeric(DataType::U32);
         let i16_kind = KindName::Numeric(DataType::I16);
         let i32_kind = KindName::Numeric(DataType::I32);
@@ -1603,16 +1689,19 @@ mod tests {
         let f64_kind = KindName::Numeric(DataType::F64);
         assert!(validate_supported_kinds(&[u16_kind]).is_ok());
         assert!(validate_supported_kinds(&[u16_kind, u32_kind]).is_ok());
+        assert!(validate_supported_kinds(&[bit_kind, u16_kind]).is_ok());
         assert!(validate_supported_kinds(&[u16_kind, u32_kind, i16_kind, i32_kind]).is_ok());
         assert!(validate_supported_kinds(&[i32_kind, u16_kind, i16_kind, u32_kind]).is_ok());
         assert!(validate_supported_kinds(&[
-            u16_kind, u32_kind, i16_kind, i32_kind, i64_kind, u64_kind, f32_kind, f64_kind,
+            bit_kind, u16_kind, u32_kind, i16_kind, i32_kind, i64_kind, u64_kind, f32_kind,
+            f64_kind,
         ])
         .is_ok());
         assert!(validate_supported_kinds(&[]).is_err());
         assert!(validate_supported_kinds(&[i16_kind, i32_kind]).is_err());
         assert!(validate_supported_kinds(&[u16_kind, u16_kind]).is_err());
-        assert!(validate_supported_kinds(&[u16_kind, KindName::Numeric(DataType::Bit)]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, bit_kind, bit_kind]).is_err());
+        assert!(validate_supported_kinds(&[bit_kind]).is_err());
         assert!(validate_supported_kinds(&[u16_kind, KindName::String]).is_err());
     }
 
@@ -1637,6 +1726,30 @@ mod tests {
         let mut wrong = parsed();
         wrong.word_count = 2;
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
+        let bit_kind = TagKind::numeric(DataType::Bit);
+        let mut device_bit = parsed();
+        device_bit.canonical = "M0".into();
+        device_bit.area = "M".into();
+        device_bit.writable_area = false;
+        assert_eq!(
+            checked_parsed_address(&driver, &bit_kind, device_bit)
+                .unwrap()
+                .word_count,
+            1
+        );
+        let mut word_bit = parsed();
+        word_bit.canonical = "D0.F".into();
+        word_bit.area = "D".into();
+        word_bit.bit = Some(15);
+        word_bit.writable_area = false;
+        assert_eq!(
+            checked_parsed_address(&driver, &bit_kind, word_bit.clone())
+                .unwrap()
+                .bit,
+            Some(15)
+        );
+        word_bit.bit = Some(16);
+        assert!(checked_parsed_address(&driver, &bit_kind, word_bit).is_err());
         let mut wrong = parsed();
         wrong.bit = Some(1);
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
@@ -1693,9 +1806,9 @@ mod tests {
         assert!(checked_parsed_address(&driver, &i32_kind, two_words.clone()).is_ok());
         two_words.index = Some(u64::MAX);
         assert!(checked_parsed_address(&driver, &i32_kind, two_words).is_err());
-        assert!(
-            checked_parsed_address(&driver, &TagKind::numeric(DataType::Bit), parsed()).is_err()
-        );
+        let mut invalid_bit = parsed();
+        invalid_bit.word_count = 2;
+        assert!(checked_parsed_address(&driver, &bit_kind, invalid_bit).is_err());
     }
 
     #[test]
