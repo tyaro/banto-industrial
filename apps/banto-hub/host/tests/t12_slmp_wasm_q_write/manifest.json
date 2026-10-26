@@ -1,0 +1,11 @@
+{
+  "manifestVersion": 1,
+  "id": "slmp-write-fixture",
+  "version": "0.1.0",
+  "hubApi": "1",
+  "writeApi": "1",
+  "settingsVersion": 1,
+  "displayName": "Controlled SLMP Q25PRH write fixture (WASM)",
+  "transports": ["tcp"],
+  "capabilities": ["read", "write"]
+}

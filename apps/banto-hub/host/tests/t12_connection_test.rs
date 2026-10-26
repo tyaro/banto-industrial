@@ -280,6 +280,22 @@ async fn test_app_with_controlled_write_manifest(
     .await
 }
 
+async fn test_app_with_controlled_q_write_manifest(
+    label: &str,
+    manifest: &[u8],
+    component: &[u8],
+) -> TestApp {
+    test_app_with_drivers(
+        label,
+        false,
+        Some(WasmFixture::ControlledQWrite {
+            manifest,
+            component,
+        }),
+    )
+    .await
+}
+
 async fn test_app_with_controlled_r_test_manifest(
     label: &str,
     manifest: &[u8],
@@ -306,6 +322,10 @@ enum WasmFixture<'a> {
         component: &'a [u8],
     },
     ControlledWrite {
+        manifest: &'a [u8],
+        component: &'a [u8],
+    },
+    ControlledQWrite {
         manifest: &'a [u8],
         component: &'a [u8],
     },
@@ -384,6 +404,16 @@ async fn test_app_with_drivers_and_options(
                     manifest, component,
                 )
                 .expect("load controlled WASM write fixture");
+                registry.register(DriverEntry::frame(driver)).unwrap();
+            }
+            WasmFixture::ControlledQWrite {
+                manifest,
+                component,
+            } => {
+                let driver = banto_driver_wasm::WasmDriver::load_controlled_q_test_fixture(
+                    manifest, component,
+                )
+                .expect("load isolated Q25PRH loopback write fixture");
                 registry.register(DriverEntry::frame(driver)).unwrap();
             }
             WasmFixture::ControlledRTest {
@@ -1823,6 +1853,9 @@ mod slmp_wasm_test;
 
 #[path = "t12_slmp_wasm_write/mod.rs"]
 mod slmp_wasm_write_test;
+
+#[path = "t12_slmp_wasm_q_write/mod.rs"]
+mod slmp_wasm_q_write_test;
 
 #[path = "t12_slmp_wasm_hub_live/mod.rs"]
 mod slmp_wasm_hub_live_test;
