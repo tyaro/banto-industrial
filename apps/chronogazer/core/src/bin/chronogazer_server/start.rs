@@ -231,12 +231,15 @@ fn abort_start(hooks: &impl StartHooks, origin: &str) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use banto_safe_root::guard::KnownFolders;
+    use banto_safe_root::{open_root, ManagedSpec, Mode, RootSpec};
     use std::time::Duration;
 
     /// 差し込みの呼ばれ方を記録する偽物（ログは開かない・向け直さない）。
     #[derive(Default)]
     struct FakeHooks {
         events: Mutex<Vec<String>>,
+        locked: Mutex<Option<LockedServer>>,
         /// `stop_requested` が何回目の呼び出しから合図を返すか（`None` は返さない）。
         stop_from_call: Option<usize>,
         stop_calls: Mutex<usize>,
@@ -254,6 +257,18 @@ mod tests {
     }
 
     impl StartHooks for FakeHooks {
+        fn lock(
+            &self,
+            layout: DataLayout,
+            host: ChronoGazerHost,
+            access: &DirAccessSource,
+        ) -> Result<LockedServer, StartFailure> {
+            if let Some(locked) = self.locked.lock().unwrap().take() {
+                return Ok(locked);
+            }
+            server_host::lock(layout, host, access)
+        }
+
         fn stop_requested(&self) -> Option<&'static str> {
             let mut calls = self.stop_calls.lock().unwrap();
             *calls += 1;
@@ -307,6 +322,42 @@ mod tests {
         });
     }
 
+    fn held_service_lock(layout: &DataLayout) -> LockedServer {
+        // The in-process fixture uses Plain mode; the real service supplies
+        // its Guarded root through the same lock_held_with_root entry point.
+        let root = Arc::new(
+            open_root(&RootSpec {
+                expected: layout.root().to_path_buf(),
+                known: KnownFolders::default(),
+                owners: vec![],
+                create_access: None,
+                create: false,
+                mode: Mode::Plain,
+            })
+            .expect("test root"),
+        );
+        let run = Arc::new(
+            root.open_managed(
+                &[ManagedSpec {
+                    key: "run",
+                    parent: None,
+                    name: "run",
+                    create: true,
+                }],
+                None,
+            )
+            .expect("run directory")
+            .take("run")
+            .expect("run directory"),
+        );
+        let instance_lock = chronogazer_core::instance_lock::acquire_for_db(
+            &layout.db_path(),
+            ChronoGazerHost::Service,
+        )
+        .expect("lock");
+        server_host::lock_held_with_root(layout.clone(), instance_lock, layout.db_path(), root, run)
+    }
+
     fn spec<'a>(layout: &'a DataLayout, access: &'a DirAccessSource) -> StartSpec<'a> {
         StartSpec {
             layout,
@@ -324,7 +375,10 @@ mod tests {
         let layout = DataLayout::new(dir.path().join("root"));
         let runtime = runtime();
         prepare_root(&runtime, &layout);
-        let hooks = FakeHooks::default();
+        let hooks = FakeHooks {
+            locked: Mutex::new(Some(held_service_lock(&layout))),
+            ..FakeHooks::default()
+        };
         let started = start_server(
             &runtime,
             spec(&layout, &DirAccessSource::CurrentProcess),

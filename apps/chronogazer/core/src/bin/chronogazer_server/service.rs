@@ -619,6 +619,12 @@ impl ServerProgram {
         };
 
         // 5. A1 の排他（握ったルートの中に診断ファイル）。取れなければ何も開かずに 2。
+        // RealAcl must give the service a non-following handle. The Plain
+        // root exists only in this binary's FakeAcl state-machine tests.
+        if !root.as_dir().is_guarded() && !cfg!(test) {
+            eprintln!("{SERVER_LABEL}: サービスのデータルートを安全に開けません");
+            return service_exit_for(EXIT_START_FAILED);
+        }
         let instance_lock = match acquire_for_db_in(root.as_dir(), ChronoGazerHost::Service) {
             Ok(guard) => guard,
             Err(failure) => {
@@ -796,12 +802,11 @@ impl ServerProgram {
                 return service_exit_for(exit_after_relax_back(relaxed, EXIT_START_FAILED));
             }
         };
-        let locked = server_host::lock_held(
+        let locked = server_host::lock_held_with_root(
             layout.clone(),
-            ChronoGazerHost::Service,
             instance_lock,
             db,
-            root.final_path().to_path_buf(),
+            root.clone(),
             run.clone(),
         );
         let key_store = open_key_store_in(hub_keys, mode.operation().clone());

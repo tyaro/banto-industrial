@@ -238,6 +238,7 @@ use crate::local_grant::{LocalAccess, LocalGrantStart};
 use crate::rest::{api_router, user_auth_state, HostAccess};
 use crate::retention::RetentionTask;
 use crate::server_admin::{AlwaysOnListener, LanControl, LanRouterFactory, LanStatusCache};
+use crate::service_data_dir::validate_service_data_dir;
 use crate::settings::{data_dir_value_unreadable, store_config, ServerSettings, SettingsService};
 use crate::startup_recovery::{check_writable_dir, RecoveryLock, RecoveryNote};
 use crate::users::UsersService;
@@ -268,6 +269,10 @@ pub struct EngineConfig {
     /// アプリのデータディレクトリ、`banto-serve` は DB の置き場
     /// （[`EngineConfig::db_dir_of`]）。
     pub data_base: PathBuf,
+    /// Service mode uses the root already pinned by `run-service` to validate
+    /// `data.dir` before any probe or collector is created. Other hosts leave
+    /// this unset and keep their existing path behavior.
+    pub service_data_root: Option<Arc<banto_safe_root::SafeRoot>>,
     /// Hub の API キーの置き場（`HubService::new` に渡す）。
     pub key_store: Arc<dyn KeyStore>,
     /// 収集に Hub を繋ぐか（`CollectorService::attach_hub`）。キーを保存できる
@@ -343,6 +348,8 @@ pub enum EngineStartError {
     /// 解決済みの保存先に書き込めない（[`EngineConfig::store_dir_check_required`]
     /// のときだけ）。`reason` は利用者向けの理由。
     StoreDirUnwritable { dir: PathBuf, reason: String },
+    /// Service `data.dir` does not resolve to a safe child of its held root.
+    StoreDirNotAllowed { dir: PathBuf, reason: String },
     /// [`EngineListen::Required`] の待ち受けを開けなかった。
     Listen {
         config: ServerConfig,
@@ -366,6 +373,7 @@ impl std::fmt::Display for EngineStartError {
                 )
             }
             Self::StoreDirUnwritable { reason, .. } => f.write_str(reason),
+            Self::StoreDirNotAllowed { reason, .. } => f.write_str(reason),
             Self::Listen { config, source } => write!(
                 f,
                 "待ち受け（{}:{}）を開始できませんでした: {source}",
@@ -383,7 +391,7 @@ impl std::error::Error for EngineStartError {
             Self::Hub(err)
             | Self::StoreConfig { source: err, .. }
             | Self::Listen { source: err, .. } => Some(err),
-            Self::StoreDirUnwritable { .. } => None,
+            Self::StoreDirUnwritable { .. } | Self::StoreDirNotAllowed { .. } => None,
         }
     }
 }
@@ -1031,7 +1039,26 @@ impl OpenedEngine {
                 Default::default()
             }
         };
-        let collect_data_dir = resolve_data_dir(&cfg.data_base, &store_settings.data_dir);
+        let collect_data_dir = if cfg.host == ChronoGazerHost::Service {
+            let checked = cfg
+                .service_data_root
+                .as_deref()
+                .ok_or_else(|| "サービスのデータルートのハンドルがありません".to_string())
+                .and_then(|root| validate_service_data_dir(root, &store_settings.data_dir));
+            match checked {
+                Ok(dir) => dir,
+                Err(reason) => {
+                    hub.shutdown().await;
+                    pool.close().await;
+                    return Err(EngineStartError::StoreDirNotAllowed {
+                        dir: resolve_data_dir(&cfg.data_base, &store_settings.data_dir),
+                        reason,
+                    });
+                }
+            }
+        } else {
+            resolve_data_dir(&cfg.data_base, &store_settings.data_dir)
+        };
         // #392: 保存先に書き込めるか（`store_dir_check_required` のときだけ）。
         if cfg.store_dir_check_required {
             if let Err(err) = check_writable_dir(&collect_data_dir).await {
@@ -1501,6 +1528,7 @@ mod tests {
         EngineConfig {
             drivers: crate::test_support::drivers(),
             data_base: EngineConfig::db_dir_of(&db_path),
+            service_data_root: None,
             db_path,
             key_store: Arc::new(UnavailableKeyStore),
             attach_hub: false,

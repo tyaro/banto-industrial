@@ -124,6 +124,7 @@ async fn main() {
     let engine = match EngineRuntime::start(EngineConfig {
         drivers: EngineConfig::builtin_drivers(),
         data_base: EngineConfig::db_dir_of(&db_path_buf),
+        service_data_root: None,
         db_path: db_path_buf,
         key_store,
         attach_hub: hub_memory_keys,

@@ -6,6 +6,8 @@ use crate::db::Db;
 use crate::settings::SettingsService;
 use crate::test_support::TempDir;
 use banto_hub_bootstrap::state::memory::MemoryKeyStore;
+use banto_safe_root::guard::KnownFolders;
+use banto_safe_root::{open_root, ManagedSpec, Mode, RootSpec};
 use banto_tstore::ManualClock;
 
 fn server(enabled: bool, bind: &str) -> ServerSettings {
@@ -609,12 +611,37 @@ async fn the_given_host_kind_reaches_the_lock_the_host_api_and_the_endpoint() {
     let dir = TempDir::new();
     prepare_root(dir.path(), &[]).await;
     let layout = DataLayout::new(dir.path());
-    let locked = lock(
-        layout.clone(),
-        ChronoGazerHost::Service,
-        &DirAccessSource::CurrentProcess,
-    )
-    .expect("lock");
+    // Simulate the service's held root, run directory and A1 lock. Plain mode
+    // is for this in-process fixture only; RealAcl requires Guarded mode.
+    let root = Arc::new(
+        open_root(&RootSpec {
+            expected: layout.root().to_path_buf(),
+            known: KnownFolders::default(),
+            owners: vec![],
+            create_access: None,
+            create: false,
+            mode: Mode::Plain,
+        })
+        .expect("test root"),
+    );
+    let run = Arc::new(
+        root.open_managed(
+            &[ManagedSpec {
+                key: "run",
+                parent: None,
+                name: "run",
+                create: true,
+            }],
+            None,
+        )
+        .expect("run directory")
+        .take("run")
+        .expect("run directory"),
+    );
+    let instance_lock =
+        crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Service)
+            .expect("lock");
+    let locked = lock_held_with_root(layout.clone(), instance_lock, layout.db_path(), root, run);
 
     // A1 の診断ファイル: 2 人目は持ち主を「service」と読む。
     match crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Desktop) {
