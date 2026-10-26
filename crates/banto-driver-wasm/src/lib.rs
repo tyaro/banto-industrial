@@ -178,19 +178,7 @@ impl WasmDriver {
                     .ok_or_else(|| LoadError::Contract(format!("unknown supported kind: {s}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // Keep previously registered U16-only guests usable while accepting
-        // U16/U32 guests. Other value kinds need their own boundary contract.
-        if supported != [KindName::Numeric(DataType::U16)]
-            && supported
-                != [
-                    KindName::Numeric(DataType::U16),
-                    KindName::Numeric(DataType::U32),
-                ]
-        {
-            return Err(LoadError::Contract(
-                "WASM component must support U16 or U16 and U32".into(),
-            ));
-        }
+        validate_supported_kinds(&supported)?;
         let secrets = instance
             .driver
             .banto_driver_config()
@@ -232,6 +220,34 @@ impl WasmDriver {
         let mut instance = self.runtime.instantiate()?;
         f(&mut instance).map_err(|e| self.runtime.record(operation, e))
     }
+}
+
+/// U16 remains the required probe kind. Other numeric kinds use the existing
+/// WIT int/uint/float variants and are validated again at the value boundary.
+fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
+    let allowed = [
+        KindName::Numeric(DataType::U16),
+        KindName::Numeric(DataType::U32),
+        KindName::Numeric(DataType::I16),
+        KindName::Numeric(DataType::I32),
+        KindName::Numeric(DataType::I64),
+        KindName::Numeric(DataType::U64),
+        KindName::Numeric(DataType::F32),
+        KindName::Numeric(DataType::F64),
+    ];
+    if !supported.contains(&allowed[0])
+        || supported.len() > allowed.len()
+        || supported
+            .iter()
+            .enumerate()
+            .any(|(index, kind)| !allowed.contains(kind) || supported[..index].contains(kind))
+    {
+        return Err(LoadError::Contract(
+            "WASM component must support U16 and may add the other seven numeric read kinds once each"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn convert_field(field: config::SettingField) -> SettingField {
@@ -301,9 +317,14 @@ fn checked_parsed_address(
     parsed: address::Parsed,
 ) -> Result<DriverAddress, AddressError> {
     let expected_words: u16 = match kind {
-        TagKind::Numeric(DataType::U16) => 1,
-        TagKind::Numeric(DataType::U32) => 2,
-        _ => return Err(AddressError::new("WASM guest supports only U16 and U32")),
+        TagKind::Numeric(DataType::U16 | DataType::I16) => 1,
+        TagKind::Numeric(DataType::U32 | DataType::I32 | DataType::F32) => 2,
+        TagKind::Numeric(DataType::U64 | DataType::I64 | DataType::F64) => 4,
+        _ => {
+            return Err(AddressError::new(
+                "WASM guest supports only numeric register reads",
+            ))
+        }
     };
     if parsed.canonical.is_empty()
         || parsed.area.is_empty()
@@ -433,17 +454,27 @@ fn wit_planned(planned: &Planned) -> Result<read::Planned, FatalError> {
 /// Keep the requested kind's variant and exact numeric range checks at the
 /// WASM boundary; the engine's RawValue conversion is not a substitute.
 fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalError> {
-    let max = match kind {
-        TagKind::Numeric(DataType::U16) => u64::from(u16::MAX),
-        TagKind::Numeric(DataType::U32) => u64::from(u32::MAX),
-        _ => {
-            return Err(FatalError::Protocol(
-                "WASM returned a value for an unsupported tag".into(),
-            ))
+    match (kind, value) {
+        (TagKind::Numeric(DataType::U16), types::Value::Uint(n)) if u16::try_from(n).is_ok() => {
+            Ok(RawValue::Uint(n))
         }
-    };
-    match value {
-        types::Value::Uint(n) if n <= max => Ok(RawValue::Uint(n)),
+        (TagKind::Numeric(DataType::U32), types::Value::Uint(n)) if u32::try_from(n).is_ok() => {
+            Ok(RawValue::Uint(n))
+        }
+        (TagKind::Numeric(DataType::I16), types::Value::Int(n)) if i16::try_from(n).is_ok() => {
+            Ok(RawValue::Int(n))
+        }
+        (TagKind::Numeric(DataType::I32), types::Value::Int(n)) if i32::try_from(n).is_ok() => {
+            Ok(RawValue::Int(n))
+        }
+        (TagKind::Numeric(DataType::I64), types::Value::Int(n)) => Ok(RawValue::Int(n)),
+        (TagKind::Numeric(DataType::U64), types::Value::Uint(n)) => Ok(RawValue::Uint(n)),
+        (TagKind::Numeric(DataType::F32), types::Value::Float(n))
+            if n.is_nan() || n as f32 as f64 == n =>
+        {
+            Ok(RawValue::Float(n))
+        }
+        (TagKind::Numeric(DataType::F64), types::Value::Float(n)) => Ok(RawValue::Float(n)),
         _ => Err(FatalError::Protocol(
             "WASM result has wrong type or range".into(),
         )),
@@ -897,9 +928,19 @@ mod tests {
         let mut wrong = valid.clone();
         wrong.spec.address.writable_area = false;
         assert!(controlled_write_item(&[wrong], &id).is_err());
-        let mut wrong = valid.clone();
-        wrong.spec.kind = TagKind::numeric(DataType::U32);
-        assert!(controlled_write_item(&[wrong], &id).is_err());
+        for data_type in [
+            DataType::I16,
+            DataType::U32,
+            DataType::I32,
+            DataType::I64,
+            DataType::U64,
+            DataType::F32,
+            DataType::F64,
+        ] {
+            let mut wrong = valid.clone();
+            wrong.spec.kind = TagKind::numeric(data_type);
+            assert!(controlled_write_item(&[wrong], &id).is_err());
+        }
         let result = controlled_write_item(&[valid.clone(), valid], &id);
         assert!(
             matches!(result, Err(WriteProgress::Done(results)) if results.len() == 2 && results.iter().all(Result::is_err))
@@ -936,6 +977,8 @@ mod tests {
     fn boundary_checks_variant_and_range() {
         let u16_kind = TagKind::numeric(DataType::U16);
         let u32_kind = TagKind::numeric(DataType::U32);
+        let i16_kind = TagKind::numeric(DataType::I16);
+        let i32_kind = TagKind::numeric(DataType::I32);
         assert_eq!(
             checked_value(&u16_kind, types::Value::Uint(0)).unwrap(),
             RawValue::Uint(0)
@@ -952,7 +995,124 @@ mod tests {
         assert!(checked_value(&u32_kind, types::Value::Uint(u64::from(u32::MAX) + 1)).is_err());
         assert!(checked_value(&u32_kind, types::Value::Int(1)).is_err());
         assert!(checked_value(&u16_kind, types::Value::Float(1.0)).is_err());
-        assert!(checked_value(&TagKind::numeric(DataType::I16), types::Value::Uint(1)).is_err());
+        for value in [i64::from(i16::MIN), -1, 0, i64::from(i16::MAX)] {
+            assert_eq!(
+                checked_value(&i16_kind, types::Value::Int(value)).unwrap(),
+                RawValue::Int(value)
+            );
+        }
+        for value in [i64::from(i32::MIN), -1, 0, i64::from(i32::MAX)] {
+            assert_eq!(
+                checked_value(&i32_kind, types::Value::Int(value)).unwrap(),
+                RawValue::Int(value)
+            );
+        }
+        for value in [i64::from(i16::MIN) - 1, i64::from(i16::MAX) + 1] {
+            assert!(checked_value(&i16_kind, types::Value::Int(value)).is_err());
+        }
+        for value in [i64::from(i32::MIN) - 1, i64::from(i32::MAX) + 1] {
+            assert!(checked_value(&i32_kind, types::Value::Int(value)).is_err());
+        }
+        assert!(checked_value(&i16_kind, types::Value::Uint(1)).is_err());
+        assert!(checked_value(&i32_kind, types::Value::Uint(1)).is_err());
+        assert!(checked_value(&u16_kind, types::Value::Int(-1)).is_err());
+        assert!(checked_value(&u32_kind, types::Value::Int(-1)).is_err());
+        let i64_kind = TagKind::numeric(DataType::I64);
+        let u64_kind = TagKind::numeric(DataType::U64);
+        let f32_kind = TagKind::numeric(DataType::F32);
+        let f64_kind = TagKind::numeric(DataType::F64);
+        for value in [i64::MIN, -(1_i64 << 53) - 1, i64::MAX] {
+            assert_eq!(
+                checked_value(&i64_kind, types::Value::Int(value)).unwrap(),
+                RawValue::Int(value)
+            );
+        }
+        for value in [0, (1_u64 << 53) + 1, u64::MAX] {
+            assert_eq!(
+                checked_value(&u64_kind, types::Value::Uint(value)).unwrap(),
+                RawValue::Uint(value)
+            );
+        }
+        for (kind, wrong) in [
+            (&i64_kind, types::Value::Uint(1)),
+            (&u64_kind, types::Value::Int(1)),
+            (&f32_kind, types::Value::Int(1)),
+            (&f64_kind, types::Value::Uint(1)),
+        ] {
+            assert!(checked_value(kind, wrong).is_err());
+        }
+        for value in [
+            f64::from(f32::from_bits(1)),
+            f64::from(f32::MIN_POSITIVE),
+            1.5_f64,
+            f64::from(f32::MAX),
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert_eq!(
+                checked_value(&f32_kind, types::Value::Float(value)).unwrap(),
+                RawValue::Float(value)
+            );
+        }
+        assert!(matches!(
+            checked_value(&f32_kind, types::Value::Float(f64::NAN)),
+            Ok(RawValue::Float(value)) if value.is_nan()
+        ));
+        for value in [f64::from_bits(1), f64::MAX] {
+            assert!(checked_value(&f32_kind, types::Value::Float(value)).is_err());
+            assert_eq!(
+                checked_value(&f64_kind, types::Value::Float(value)).unwrap(),
+                RawValue::Float(value)
+            );
+        }
+        assert_eq!(
+            match checked_value(&f32_kind, types::Value::Float(-0.0)).unwrap() {
+                RawValue::Float(value) => value.to_bits(),
+                other => panic!("expected float, got {other:?}"),
+            },
+            (-0.0_f64).to_bits()
+        );
+        assert!(matches!(
+            checked_value(&f64_kind, types::Value::Float(f64::NAN)),
+            Ok(RawValue::Float(value)) if value.is_nan()
+        ));
+        assert_eq!(
+            checked_value(&f64_kind, types::Value::Float(f64::NEG_INFINITY)).unwrap(),
+            RawValue::Float(f64::NEG_INFINITY)
+        );
+        assert_eq!(
+            match checked_value(&f64_kind, types::Value::Float(-0.0)).unwrap() {
+                RawValue::Float(value) => value.to_bits(),
+                other => panic!("expected float, got {other:?}"),
+            },
+            (-0.0_f64).to_bits()
+        );
+        assert!(checked_value(&TagKind::numeric(DataType::Bit), types::Value::Bool(true)).is_err());
+    }
+
+    #[test]
+    fn supported_kinds_keep_old_guests_and_reject_unvalidated_kinds() {
+        let u16_kind = KindName::Numeric(DataType::U16);
+        let u32_kind = KindName::Numeric(DataType::U32);
+        let i16_kind = KindName::Numeric(DataType::I16);
+        let i32_kind = KindName::Numeric(DataType::I32);
+        let i64_kind = KindName::Numeric(DataType::I64);
+        let u64_kind = KindName::Numeric(DataType::U64);
+        let f32_kind = KindName::Numeric(DataType::F32);
+        let f64_kind = KindName::Numeric(DataType::F64);
+        assert!(validate_supported_kinds(&[u16_kind]).is_ok());
+        assert!(validate_supported_kinds(&[u16_kind, u32_kind]).is_ok());
+        assert!(validate_supported_kinds(&[u16_kind, u32_kind, i16_kind, i32_kind]).is_ok());
+        assert!(validate_supported_kinds(&[i32_kind, u16_kind, i16_kind, u32_kind]).is_ok());
+        assert!(validate_supported_kinds(&[
+            u16_kind, u32_kind, i16_kind, i32_kind, i64_kind, u64_kind, f32_kind, f64_kind,
+        ])
+        .is_ok());
+        assert!(validate_supported_kinds(&[]).is_err());
+        assert!(validate_supported_kinds(&[i16_kind, i32_kind]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, u16_kind]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, KindName::Numeric(DataType::Bit)]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, KindName::String]).is_err());
     }
 
     fn parsed() -> address::Parsed {
@@ -995,9 +1155,16 @@ mod tests {
         let mut wrong = parsed();
         wrong.area.clear();
         assert!(checked_parsed_address(&driver, &kind, wrong).is_err());
-        assert!(
-            checked_parsed_address(&driver, &TagKind::numeric(DataType::I16), parsed()).is_err()
+        let i16_kind = TagKind::numeric(DataType::I16);
+        assert_eq!(
+            checked_parsed_address(&driver, &i16_kind, parsed())
+                .unwrap()
+                .word_count,
+            1
         );
+        let mut wrong = parsed();
+        wrong.word_count = 2;
+        assert!(checked_parsed_address(&driver, &i16_kind, wrong).is_err());
 
         let u32_kind = TagKind::numeric(DataType::U32);
         let mut two_words = parsed();
@@ -1010,6 +1177,48 @@ mod tests {
         assert!(checked_parsed_address(&driver, &u32_kind, two_words.clone()).is_ok());
         two_words.index = Some(u64::MAX);
         assert!(checked_parsed_address(&driver, &u32_kind, two_words).is_err());
+
+        let i32_kind = TagKind::numeric(DataType::I32);
+        let mut two_words = parsed();
+        two_words.word_count = 2;
+        assert_eq!(
+            checked_parsed_address(&driver, &i32_kind, two_words.clone())
+                .unwrap()
+                .word_count,
+            2
+        );
+        assert!(checked_parsed_address(&driver, &i32_kind, parsed()).is_err());
+        two_words.index = Some(u64::MAX - 1);
+        assert!(checked_parsed_address(&driver, &i32_kind, two_words.clone()).is_ok());
+        two_words.index = Some(u64::MAX);
+        assert!(checked_parsed_address(&driver, &i32_kind, two_words).is_err());
+        assert!(
+            checked_parsed_address(&driver, &TagKind::numeric(DataType::Bit), parsed()).is_err()
+        );
+    }
+
+    #[test]
+    fn wide_numeric_address_metadata_checks_span_and_overflow() {
+        let driver = DriverId::new("modbus-fc3-wasm").unwrap();
+        for (data_type, words) in [
+            (DataType::F32, 2_u32),
+            (DataType::I64, 4),
+            (DataType::U64, 4),
+            (DataType::F64, 4),
+        ] {
+            let kind = TagKind::numeric(data_type);
+            let mut metadata = parsed();
+            metadata.word_count = words;
+            metadata.index = Some(u64::MAX - u64::from(words - 1));
+            let accepted = checked_parsed_address(&driver, &kind, metadata.clone()).unwrap();
+            assert_eq!(accepted.word_count, words as u16);
+            assert!(accepted.writable_area); // Read support never authorizes writing.
+            metadata.word_count = words - 1;
+            assert!(checked_parsed_address(&driver, &kind, metadata.clone()).is_err());
+            metadata.word_count = words;
+            metadata.index = Some(u64::MAX - u64::from(words - 2));
+            assert!(checked_parsed_address(&driver, &kind, metadata).is_err());
+        }
     }
 
     #[test]
