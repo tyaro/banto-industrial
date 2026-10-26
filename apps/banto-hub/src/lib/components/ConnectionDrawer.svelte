@@ -727,12 +727,18 @@
 			const request = rangeDiagnosticRequest;
 			try {
 				const result = await getCurrentPlcRangeDiagnostic(id);
-				if (active && connection?.id === id && request === rangeDiagnosticRequest && !rangeDiagnosticBusy) {
+				if (
+					active &&
+					connection?.id === id &&
+					request === rangeDiagnosticRequest &&
+					!rangeDiagnosticBusy
+				) {
 					rangeDiagnostic = result.status === 'current' ? result : null;
 				}
 			} catch {
 				// A transient UI request error must not turn an unknown range into a verified one.
-				if (active && connection?.id === id && request === rangeDiagnosticRequest) rangeDiagnostic = null;
+				if (active && connection?.id === id && request === rangeDiagnosticRequest)
+					rangeDiagnostic = null;
 			}
 		};
 		void refresh();
@@ -1310,27 +1316,51 @@
 {#snippet rangeDiagnosticBlock()}
 	{#if connection}
 		<section class="test-connection" aria-label="Device range diagnostic">
-			<button type="button" class="test-btn" onclick={runRangeDiagnostic} disabled={rangeDiagnosticBusy}>
+			<button
+				type="button"
+				class="test-btn"
+				onclick={runRangeDiagnostic}
+				disabled={rangeDiagnosticBusy}
+			>
 				{rangeDiagnosticBusy ? '診断中…' : '機器の設定範囲を確認'}
 			</button>
 			{#if rangeDiagnostic?.status === 'current'}
 				<div class="test-result">
-					<div>型式: {rangeDiagnostic.model?.name ?? '不明'}（{rangeDiagnostic.model?.family ?? rangeDiagnostic.modelReason ?? '理由不明'}）</div>
-					<div>診断は現在の接続・設定・ドライバー版にだけ有効です。範囲不明は無制限を意味しません。</div>
-					{#each rangeDiagnostic.counts ?? [] as count}
-						<div>{count.area}: {count.bound === 'unknown' ? `不明 (${count.reason ?? '理由不明'})` : `${count.points} ${count.unit} (${count.bound === 'exact' ? '確定' : '最低点数'})`} — {count.source || count.scope}</div>
+					<div>
+						型式: {rangeDiagnostic.model?.name ?? '不明'}（{rangeDiagnostic.model?.family ??
+							rangeDiagnostic.modelReason ??
+							'理由不明'}）
+					</div>
+					<div>
+						診断は現在の接続・設定・ドライバー版にだけ有効です。範囲不明は無制限を意味しません。
+					</div>
+					{#each rangeDiagnostic.counts ?? [] as count (count.area)}
+						<div>
+							{count.area}: {count.bound === 'unknown'
+								? `不明 (${count.reason ?? '理由不明'})`
+								: `${count.points} ${count.unit} (${count.bound === 'exact' ? '確定' : '最低点数'})`}
+							— {count.source || count.scope}
+						</div>
 					{/each}
 					<details>
 						<summary>タグ別の範囲判定（{rangeDiagnostic.tags?.length ?? 0}件）</summary>
 						<ul>
 							{#each rangeDiagnostic.tags ?? [] as tag (tag.tagId)}
-								<li>{tag.address}: {tag.verdict === 'inside' ? '範囲内' : tag.verdict === 'outside' ? '範囲外' : '判定不能'} — {tag.reason}</li>
+								<li>
+									{tag.address}: {tag.verdict === 'inside'
+										? '範囲内'
+										: tag.verdict === 'outside'
+											? '範囲外'
+											: '判定不能'} — {tag.reason}
+								</li>
 							{/each}
 						</ul>
 					</details>
 				</div>
 			{:else if rangeDiagnostic}
-				<span class="test-result">{rangeDiagnostic.reason ?? 'この接続では診断を利用できません'}</span>
+				<span class="test-result"
+					>{rangeDiagnostic.reason ?? 'この接続では診断を利用できません'}</span
+				>
 			{/if}
 		</section>
 	{/if}
