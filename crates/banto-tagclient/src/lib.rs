@@ -44,6 +44,7 @@ pub mod close;
 pub mod endpoint;
 pub mod error;
 mod handle;
+mod pinned_tls;
 pub mod rest;
 pub mod secret;
 /// S2a remains crate-internal until the S2b-2 worker slice wires it in.
@@ -61,6 +62,7 @@ pub use binding::{
 pub use endpoint::{Endpoint, RestUrls};
 pub use error::{Error, ErrorKind, Result};
 pub use handle::TagClientHandle;
+pub use pinned_tls::PinnedHubTls;
 pub use rest::RestClient;
 pub use secret::{SecretApiKey, SecretError};
 pub use types::{

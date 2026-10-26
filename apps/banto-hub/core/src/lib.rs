@@ -255,6 +255,7 @@ pub mod subscribe_core;
 pub mod system_info;
 #[cfg(test)]
 pub(crate) mod test_support;
+mod tls_listener;
 /// R2b-1d（docs/banto-hub-connection-settings-design.md §6.1〜§6.4）: 戻せない移行
 /// （`banto-tags` の 0025）の前の掃除・写しでの予行と preflight・バックアップ・
 /// 起動時の秘密値の整合の確認。

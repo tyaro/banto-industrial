@@ -137,6 +137,10 @@
 //! `manager`より先に、のくだり）と揃えたのも同じ理由 - eval ループは
 //! `manager`の、prune ループは settings/data_dir の読み取り専用消費者。
 
+//! #644 exception: the optional TLS listener reads BANTO_HUB_TLS_PORT,
+//! BANTO_HUB_TLS_CERT and BANTO_HUB_TLS_KEY here so all Hub hosts retain
+//! their current public config shape. Incomplete settings fail before DB init.
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -181,6 +185,8 @@ use crate::profile_paths::{resolve_hub_root, resolve_profile_paths, DB_FILE_NAME
 use crate::rest::{api_router_with_controller, opcua_settings_router, user_auth_state};
 use crate::settings::{HubSettingsExt, SettingsService, DEFAULT_PORT};
 use crate::subscribe_core::EVAL_TICK_MS;
+pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
+use crate::tls_listener::{self, TlsConfig};
 use crate::users::UsersService;
 use crate::write_audit::WriteAuditService;
 use crate::write_control::{load_startup_decision, WriteControl};
@@ -240,6 +246,29 @@ pub struct HubConfig {
     pub skip_profile_lock: bool,
 }
 
+/// Explicit TLS listener settings for callers that manage their own temporary
+/// or provisioned PEM files. The listener always binds to 127.0.0.1.
+#[derive(Debug, Clone)]
+pub struct HubTlsConfig {
+    /// TLS port. Zero requests an OS-assigned port for an isolated test.
+    pub port: u16,
+    pub certificate_pem: PathBuf,
+    pub private_key_pem: PathBuf,
+}
+
+/// Serve an existing Hub router on a dedicated loopback TLS listener.
+/// Callers can reuse the exact router used by the normal HTTP listener.
+pub async fn start_tls_router(
+    router: axum::Router,
+    tls: HubTlsConfig,
+) -> Result<RunningTlsServer, HubStartError> {
+    let config = TlsConfig::explicit(tls.port, tls.certificate_pem, tls.private_key_pem)
+        .map_err(|err| HubStartError::Tls(err.to_string()))?;
+    tls_listener::start(&config, router)
+        .await
+        .map_err(|err| HubStartError::Tls(err.to_string()))
+}
+
 /// [`HubRuntime::start`]の失敗モード。旧 `hub_run::run`は同じ4箇所を
 /// `expect()`でプロセスごと落としていた（設計 §2「現行コード地図」）。
 /// T14-1 でライブラリとして呼び出し側が構造化エラーとして扱えるよう
@@ -249,6 +278,8 @@ pub struct HubConfig {
 /// （broker_glue.rs参照）は T14-1 のスコープ外。
 #[derive(Debug, Error)]
 pub enum HubStartError {
+    #[error("banto-hub: TLS listener setup failed: {0}")]
+    Tls(String),
     /// `db::init_db`失敗（旧: `"init_db should succeed"`で `expect`）。
     #[error("banto-hub: DB 初期化に失敗しました: {0}")]
     InitDb(BantoError),
@@ -359,6 +390,11 @@ impl HubRuntime {
             host_kind,
             skip_profile_lock,
         } = config;
+
+        // Optional dedicated loopback transport. Validate all three operator
+        // settings before taking a profile lock or opening the settings DB.
+        let tls_config =
+            TlsConfig::from_env().map_err(|err| HubStartError::Tls(err.to_string()))?;
 
         // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: DB init を
         // 含む一切のリソース確保より前に profile 排他を取る - 失敗した場合
@@ -848,7 +884,7 @@ impl HubRuntime {
         // `port_fallback_from` に持ち、`RunningHub::port_fallback_from` で見せる。
         let fallback_allowed = port_fallback_applies(host_kind, port_override, port);
         let (server, port_fallback_from) =
-            match start_with_port_fallback(&bind, port, app, fallback_allowed).await {
+            match start_with_port_fallback(&bind, port, app.clone(), fallback_allowed).await {
                 Ok(started) => started,
                 Err(err) => {
                     // ここまでに起こした背景タスクを残さない（`JoinHandle` を捨てても
@@ -861,6 +897,22 @@ impl HubRuntime {
                     return Err(HubStartError::ServerStart(err));
                 }
             };
+        let tls_server = if let Some(config) = tls_config.as_ref() {
+            match tls_listener::start(config, app).await {
+                Ok(listener) => Some(listener),
+                Err(err) => {
+                    server.stop().await;
+                    eval_handle.abort();
+                    prune_handle.abort();
+                    mqtt.shutdown().await;
+                    grpc_server.shutdown().await;
+                    opcua.shutdown().await;
+                    return Err(HubStartError::Tls(err.to_string()));
+                }
+            }
+        } else {
+            None
+        };
         // REST が先にポートを確保する。同じポートを OPC UA に指定しても
         // 失敗するのはオプションの OPC UA だけで、Hub 本体は継続する。
         opcua.initialize(&opcua_settings).await;
@@ -881,6 +933,12 @@ impl HubRuntime {
         log_line("banto-hub: listening at:");
         for url in listening_urls(server.local_addr()) {
             log_line(&format!("  {url}"));
+        }
+        if let Some(listener) = &tls_server {
+            log_line(&format!(
+                "banto-hub: TLS listening at https://{}",
+                listener.local_addr()
+            ));
         }
         if grpc_settings.enabled {
             log_line(&format!(
@@ -917,6 +975,7 @@ impl HubRuntime {
             sessions,
             sim_registry,
             server,
+            tls_server,
             port_fallback_from,
             eval_handle,
             prune_handle,
@@ -1047,6 +1106,7 @@ pub struct RunningHub {
     sessions: Arc<HubSessions>,
     sim_registry: Arc<BrokerSimRegistry>,
     server: RunningServer,
+    tls_server: Option<RunningTlsServer>,
     /// #479: デスクトップシェルが既定ポートの競合で OS 割り当てへ退避したとき、
     /// 本来 bind したかったポート。退避しなかったら `None`。
     port_fallback_from: Option<u16>,
@@ -1098,6 +1158,11 @@ impl RunningHub {
     /// を直接使っていたのと同じ（設計 §3「D1」の `local_addr()`）。
     pub fn local_addr(&self) -> std::net::SocketAddr {
         self.server.local_addr()
+    }
+
+    /// The dedicated loopback TLS address, when configured.
+    pub fn tls_local_addr(&self) -> Option<std::net::SocketAddr> {
+        self.tls_server.as_ref().map(RunningTlsServer::local_addr)
     }
 
     /// #479: 既定ポートが埋まっていて OS 割り当てのポートへ退避して起動したとき、
@@ -1176,6 +1241,9 @@ impl RunningHub {
         // (`sessions`), so they are stopped last - see this module's doc
         // comment ("シャットダウン順序").
         self.sim_registry.shutdown().await;
+        if let Some(tls_server) = self.tls_server {
+            tls_server.stop().await;
+        }
         self.server.stop().await;
         // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。

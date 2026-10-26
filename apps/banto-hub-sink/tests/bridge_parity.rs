@@ -110,6 +110,10 @@ use sqlx::SqlitePool;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
+#[path = "common/tls_fixture.rs"]
+mod tls_fixture;
+use tls_fixture::TlsFixture;
+
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
 /// ポーリング待ちの上限（DB の再接続のバックオフ 1 → 2 → 4 秒をまたげる長さ）。
@@ -261,6 +265,9 @@ async fn execute(admin: &PgPool, sql: &str) {
 
 struct TestApp {
     server: Option<banto_server::RunningServer>,
+    tls_server: Option<banto_hub_core::runtime::RunningTlsServer>,
+    tls_fixture: TlsFixture,
+    tls_port: u16,
     router: Router,
     token: String,
     port: u16,
@@ -275,6 +282,9 @@ impl TestApp {
         self.manager.db_source_engine().shutdown().await;
         self.manager.shutdown().await;
         if let Some(server) = self.server.take() {
+            server.stop().await;
+        }
+        if let Some(server) = self.tls_server.take() {
             server.stop().await;
         }
         self.pool.close().await;
@@ -416,8 +426,17 @@ async fn test_app() -> TestApp {
     .await
     .expect("server should start");
     let port = server.local_addr().port();
+    let tls_fixture = TlsFixture::generate(temp.path());
+    let tls_server =
+        banto_hub_core::runtime::start_tls_router(router.clone(), tls_fixture.hub_config())
+            .await
+            .expect("TLS test server should start");
+    let tls_port = tls_server.local_addr().port();
     TestApp {
         server: Some(server),
+        tls_server: Some(tls_server),
+        tls_fixture,
+        tls_port,
         router,
         token,
         port,
@@ -592,13 +611,12 @@ async fn create_group(
 }
 
 fn spawn_bridge(app: &TestApp, api_key: &str) -> BridgeSupervisor {
+    let base = app.tls_fixture.pinned_config(app.tls_port, api_key);
     let config = SidecarConfig::from_toml_str(
         &format!(
-            "hub_url = \"http://127.0.0.1:{}\"\n\
-             api_key = \"{api_key}\"\n\
+            "{base}\
              config_refresh_secs = 5\n\
-             status_push_secs = 1\n",
-            app.port
+             status_push_secs = 1\n"
         ),
         Path::new("banto-hub-sink.toml"),
     )

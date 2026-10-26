@@ -166,6 +166,8 @@ fn main() -> Result<()> {
             .join("assets")
             .join("banto-hub-sink.toml.example"),
     )?;
+    let cdla_license =
+        require_file(installer_dir.join("assets").join("CDLA-Permissive-2.0.txt"))?;
 
     let package_settings = PackageSettings {
         product_name: PRODUCT_NAME.to_string(),
@@ -189,6 +191,8 @@ fn main() -> Result<()> {
     // ディレクトリに依存しない。
     let mut resources_map = HashMap::new();
     resources_map.insert(path_to_string(&sink_config_example)?, String::new());
+    // The bundled root certificate data is shared with the binaries; install its license text.
+    resources_map.insert(path_to_string(&cdla_license)?, String::new());
 
     let bundle_settings = BundleSettings {
         identifier: Some(BUNDLE_IDENTIFIER.to_string()),

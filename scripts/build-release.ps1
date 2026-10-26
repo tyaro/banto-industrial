@@ -110,6 +110,14 @@ foreach ($name in $copies.Keys) {
     Copy-Item -Path (Join-Path $releaseDir $name) -Destination (Join-Path $OutDir $copies[$name]) -Force
 }
 
+# The bundled root certificate data uses CDLA-Permissive-2.0. Ship its full
+# license text with standalone binaries as well as inside the NSIS installer.
+$cdlaLicense = Join-Path $repoRoot 'apps\banto-hub\installer\assets\CDLA-Permissive-2.0.txt'
+if (-not (Test-Path -LiteralPath $cdlaLicense -PathType Leaf)) {
+    throw "Missing bundled certificate data license: $cdlaLicense"
+}
+Copy-Item -LiteralPath $cdlaLicense -Destination (Join-Path $OutDir 'CDLA-Permissive-2.0.txt') -Force
+
 if (-not $SkipInstaller) {
     # tauri-bundler の既定命名規則（apps/banto-hub/installer/src/main.rs 参照）。
     $setupSrc = Join-Path $releaseDir "bundle\nsis\BantoHub_${Version}_x64-setup.exe"

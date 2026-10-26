@@ -82,6 +82,10 @@ use tokio::sync::broadcast;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
+#[path = "common/tls_fixture.rs"]
+mod tls_fixture;
+use tls_fixture::TlsFixture;
+
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
 /// DB Source のポーリング周期（Hub の `period_ms` CHECK の許容値）。
@@ -231,9 +235,11 @@ async fn stored_rows(pool: &PgPool, table: &str) -> Vec<StoredRow> {
 
 struct TestApp {
     server: Option<banto_server::RunningServer>,
+    tls_server: Option<banto_hub_core::runtime::RunningTlsServer>,
+    tls_fixture: TlsFixture,
+    tls_port: u16,
     router: Router,
     token: String,
-    port: u16,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     _temp: tempfile::TempDir,
@@ -248,6 +254,9 @@ impl TestApp {
         self.manager.db_source_engine().shutdown().await;
         self.manager.shutdown().await;
         if let Some(server) = self.server.take() {
+            server.stop().await;
+        }
+        if let Some(server) = self.tls_server.take() {
             server.stop().await;
         }
         self.pool.close().await;
@@ -384,13 +393,20 @@ async fn test_app() -> TestApp {
     )
     .await
     .expect("server should start");
-    let port = server.local_addr().port();
+    let tls_fixture = TlsFixture::generate(temp.path());
+    let tls_server =
+        banto_hub_core::runtime::start_tls_router(router.clone(), tls_fixture.hub_config())
+            .await
+            .expect("TLS test server should start");
+    let tls_port = tls_server.local_addr().port();
 
     TestApp {
         server: Some(server),
+        tls_server: Some(tls_server),
+        tls_fixture,
+        tls_port,
         router,
         token,
-        port,
         pool,
         manager,
         _temp: temp,
@@ -584,10 +600,10 @@ fn sink_group_state(sink: &Value, group_id: i64) -> Option<String> {
         .map(str::to_string)
 }
 
-fn sidecar_toml(port: u16, api_key: &str) -> String {
+fn sidecar_toml(tls: &TlsFixture, port: u16, api_key: &str) -> String {
+    let base = tls.pinned_config(port, api_key);
     format!(
-        "hub_url = \"http://127.0.0.1:{port}\"\n\
-         api_key = \"{api_key}\"\n\
+        "{base}\
          config_refresh_secs = 5\n\
          status_push_secs = 1\n\
          queue_max_rows = 1000\n\
@@ -638,7 +654,11 @@ async fn sidecar_writes_rows_recovers_from_a_missing_table_and_pushes_a_final_st
         .tempdir()
         .expect("config dir");
     let config_path = config_dir.path().join("banto-hub-sink.toml");
-    std::fs::write(&config_path, sidecar_toml(app.port, &api_key)).expect("write toml");
+    std::fs::write(
+        &config_path,
+        sidecar_toml(&app.tls_fixture, app.tls_port, &api_key),
+    )
+    .expect("write toml");
     let config = banto_hub_sink::config::load_config_from(&config_path).expect("load config");
 
     let shutdown = Arc::new(Notify::new());
@@ -785,7 +805,11 @@ async fn on_change_mode_writes_once_for_a_constant_value() {
         .tempdir()
         .expect("config dir");
     let config_path = config_dir.path().join("banto-hub-sink.toml");
-    std::fs::write(&config_path, sidecar_toml(app.port, &api_key)).expect("write toml");
+    std::fs::write(
+        &config_path,
+        sidecar_toml(&app.tls_fixture, app.tls_port, &api_key),
+    )
+    .expect("write toml");
     let config: SidecarConfig =
         banto_hub_sink::config::load_config_from(&config_path).expect("load config");
 
@@ -838,7 +862,8 @@ async fn starting_without_a_hub_waits_instead_of_exiting() {
         .tempdir()
         .expect("config dir");
     let config_path = config_dir.path().join("banto-hub-sink.toml");
-    std::fs::write(&config_path, sidecar_toml(port, "bh_absent.key")).expect("write toml");
+    let tls = TlsFixture::generate(config_dir.path());
+    std::fs::write(&config_path, sidecar_toml(&tls, port, "bh_absent.key")).expect("write toml");
     let config = banto_hub_sink::config::load_config_from(&config_path).expect("load config");
 
     let shutdown = Arc::new(Notify::new());
@@ -952,7 +977,11 @@ async fn an_unreadable_password_is_listed_and_never_dialled() {
         .tempdir()
         .expect("config dir");
     let config_path = config_dir.path().join("banto-hub-sink.toml");
-    std::fs::write(&config_path, sidecar_toml(app.port, &api_key)).expect("write toml");
+    std::fs::write(
+        &config_path,
+        sidecar_toml(&app.tls_fixture, app.tls_port, &api_key),
+    )
+    .expect("write toml");
     let config = banto_hub_sink::config::load_config_from(&config_path).expect("load config");
     let shutdown = Arc::new(Notify::new());
     let shutdown_signal = shutdown.clone();

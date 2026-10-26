@@ -8,19 +8,20 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde::Serialize;
 use tokio_tungstenite::{
-    connect_async_with_config,
+    connect_async_tls_with_config, connect_async_with_config,
     tungstenite::{
         client::IntoClientRequest,
         protocol::{Message, WebSocketConfig},
         Error as WsError,
     },
-    WebSocketStream,
+    Connector, WebSocketStream,
 };
 
 use crate::{
     close::classify_close,
     endpoint::Endpoint,
     error::{Error, ErrorKind, Result},
+    pinned_tls::PinnedHubTls,
     secret::SecretApiKey,
     stream_core::validate_tag_selection,
 };
@@ -38,13 +39,15 @@ pub(crate) struct WebSocketConnection {
 pub(crate) async fn connect(
     endpoint: &Endpoint,
     secret: &SecretApiKey,
+    pinned_tls: Option<&PinnedHubTls>,
 ) -> Result<WebSocketConnection> {
-    connect_with_timeout(endpoint, secret, CONNECT_TIMEOUT).await
+    connect_with_timeout(endpoint, secret, pinned_tls, CONNECT_TIMEOUT).await
 }
 
 async fn connect_with_timeout(
     endpoint: &Endpoint,
     secret: &SecretApiKey,
+    pinned_tls: Option<&PinnedHubTls>,
     timeout: Duration,
 ) -> Result<WebSocketConnection> {
     let url = endpoint.stream_url()?;
@@ -59,10 +62,19 @@ async fn connect_with_timeout(
         .max_write_buffer_size(MAX_WEBSOCKET_SIZE);
     let host = endpoint.host().map(str::to_owned);
     let port = endpoint.port();
-    let result = tokio::time::timeout(
-        timeout,
-        connect_async_with_config(request, Some(config), false),
-    )
+    let result = tokio::time::timeout(timeout, async {
+        if let Some(pins) = pinned_tls {
+            connect_async_tls_with_config(
+                request,
+                Some(config),
+                false,
+                Some(Connector::Rustls(pins.rustls_config())),
+            )
+            .await
+        } else {
+            connect_async_with_config(request, Some(config), false).await
+        }
+    })
     .await
     .map_err(|_| {
         tracing::warn!(
@@ -413,7 +425,7 @@ mod tests {
             let _ = accept_hdr_async(stream, callback).await;
         });
         let (endpoint, secret) = client(format!("{address}/private-prefix"));
-        let connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+        let connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(2))
             .await
             .unwrap();
         assert_eq!(
@@ -447,7 +459,7 @@ mod tests {
         ] {
             let address = status_server(status, "private-body-token").await;
             let (endpoint, secret) = client(address);
-            let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+            let error = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(2))
                 .await
                 .err()
                 .unwrap();
@@ -468,7 +480,7 @@ mod tests {
             let _ = stream.shutdown().await;
         });
         let (endpoint, secret) = client(format!("{address}/private-path"));
-        let error = connect_with_timeout(&endpoint, &secret, Duration::from_millis(20))
+        let error = connect_with_timeout(&endpoint, &secret, None, Duration::from_millis(20))
             .await
             .err()
             .unwrap();
@@ -508,7 +520,7 @@ mod tests {
             }
         });
         let (endpoint, secret) = client(address);
-        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         let tags = vec!["first".to_owned(), "second".to_owned()];
@@ -531,7 +543,7 @@ mod tests {
                 .is_err()
         });
         let (endpoint, secret) = client(address);
-        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         for tags in [
@@ -567,7 +579,7 @@ mod tests {
                 .unwrap();
         });
         let (endpoint, secret) = client(address);
-        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         let tags = vec!["temperature".to_owned()];
@@ -603,7 +615,7 @@ mod tests {
                 .unwrap();
         });
         let (endpoint, secret) = client(address);
-        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         connection
@@ -628,7 +640,7 @@ mod tests {
             socket.send(message).await.unwrap();
         });
         let (endpoint, secret) = client(address);
-        let mut connection = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut connection = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         connection
@@ -688,7 +700,7 @@ mod tests {
             drop(socket);
         });
         let (endpoint, secret) = client(address);
-        let mut eof = connect_with_timeout(&endpoint, &secret, Duration::from_secs(1))
+        let mut eof = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(1))
             .await
             .unwrap();
         eof.subscribe_on_change(1, &["tag".to_owned()])
@@ -788,7 +800,7 @@ mod tests {
         let (log, _guard) = crate::test_support::capture();
         let address = status_server(401, "unauthorized-body-with-token").await;
         let (endpoint, secret) = client(format!("{address}/private-secret-path"));
-        let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+        let error = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(2))
             .await
             .err()
             .unwrap();
@@ -806,7 +818,7 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
         let (endpoint, secret) = client(format!("{address}/private-refused-path"));
-        let error = connect_with_timeout(&endpoint, &secret, Duration::from_secs(2))
+        let error = connect_with_timeout(&endpoint, &secret, None, Duration::from_secs(2))
             .await
             .err()
             .unwrap();
@@ -828,7 +840,7 @@ mod tests {
             let _ = stream.shutdown().await;
         });
         let (endpoint, secret) = client(format!("{address}/private-timeout-path"));
-        let error = connect_with_timeout(&endpoint, &secret, Duration::from_millis(20))
+        let error = connect_with_timeout(&endpoint, &secret, None, Duration::from_millis(20))
             .await
             .err()
             .unwrap();

@@ -15,14 +15,14 @@ pub struct Endpoint {
 impl Endpoint {
     pub fn new<S: AsRef<str>>(input: S) -> Result<Self> {
         let raw = input.as_ref();
-        if raw
-            .strip_prefix("http://")
-            .is_some_and(|rest| rest.split(['/', '?', '#']).next().is_none_or(str::is_empty))
-        {
+        if ["http://", "https://"].iter().any(|prefix| {
+            raw.strip_prefix(prefix)
+                .is_some_and(|rest| rest.split(['/', '?', '#']).next().is_none_or(str::is_empty))
+        }) {
             return Err(Error::new(ErrorKind::InvalidEndpoint));
         }
         let mut base = Url::parse(raw).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
-        if base.scheme() != "http"
+        if !matches!(base.scheme(), "http" | "https")
             || base.host_str().is_none()
             || base.username() != ""
             || base.password().is_some()
@@ -62,8 +62,8 @@ impl Endpoint {
         self.rest_urls().values
     }
 
-    pub fn scheme(&self) -> &'static str {
-        "http"
+    pub fn scheme(&self) -> &str {
+        self.base.scheme()
     }
 
     pub fn host(&self) -> Option<&str> {
@@ -76,8 +76,12 @@ impl Endpoint {
 
     pub(crate) fn stream_url(&self) -> Result<Url> {
         let mut url = append_path(&self.base, "stream");
-        url.set_scheme("ws")
-            .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+        url.set_scheme(if self.base.scheme() == "https" {
+            "wss"
+        } else {
+            "ws"
+        })
+        .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
         Ok(url)
     }
 
@@ -159,7 +163,6 @@ mod tests {
     #[test]
     fn rejects_non_http_and_ambiguous_url_parts() {
         for input in [
-            "https://example.test",
             "ws://example.test",
             "http://name@example.test",
             "http://name:part@example.test",
@@ -186,6 +189,14 @@ mod tests {
         );
         assert!(url.query().is_none());
         assert!(url.fragment().is_none());
+    }
+
+    #[test]
+    fn https_routes_use_the_same_origin_and_wss() {
+        let endpoint = Endpoint::new("https://127.0.0.1:9443").unwrap();
+        assert_eq!(endpoint.scheme(), "https");
+        assert_eq!(endpoint.tags_url().scheme(), "https");
+        assert_eq!(endpoint.stream_url().unwrap().scheme(), "wss");
     }
 
     #[test]

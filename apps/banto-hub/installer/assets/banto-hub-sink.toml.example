@@ -22,9 +22,17 @@
 #      実行してください）。
 #   4. Start-Service BantoHubSink
 #
-# 必須。Hub のループバック URL（§6-15: パスワードが平文で流れるため
-# Hub と同一マシンでの運用が前提）。既定ポートは 8722。
-hub_url = "http://127.0.0.1:8722"
+# 必須。Hub と同一マシンで使用する専用 TLS 待受のループバック URL。
+# Hub の TLS ポートを設定し、接続先証明書を確認してから有効化する。
+# Set this to Hub's separately configured loopback TLS listener. Plain
+# loopback HTTP is rejected before the Sink starts or sends an API key.
+hub_url = "https://127.0.0.1:9443"
+
+# Paste the verified Hub server certificate here through the protected config
+# preparation workflow. Never retrieve a pin from the URL above. During a
+# planned rotation, list the old and new certificates (maximum two), then
+# remove the old one after the new listener is verified.
+hub_tls_pinned_certs = []
 
 # 必須。Hub の管理 UI で発行した API キー。スコープは `admin` と
 # `read` の両方が必要（admin だけでは /api/v1/{tags,values,stream} が

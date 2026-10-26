@@ -20,6 +20,7 @@ default = []
 embed-ui = ["dep:rust-embed"]
 
 [dependencies]
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 banto-opcua-server = { workspace = true }
 banto-core = { workspace = true }
 banto-storage = { workspace = true, features = ["sqlite"] }

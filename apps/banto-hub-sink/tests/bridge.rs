@@ -75,12 +75,17 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sqlx::postgres::{PgConnectOptions, PgPool};
 use sqlx::SqlitePool;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::broadcast;
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::WebSocketStream;
 use tower::ServiceExt;
+
+#[path = "common/tls_fixture.rs"]
+mod tls_fixture;
+use tls_fixture::TlsFixture;
 
 const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 
@@ -217,6 +222,9 @@ async fn bridge_sessions(admin: &PgPool, source_name: &str) -> i64 {
 
 struct TestApp {
     server: Option<banto_server::RunningServer>,
+    tls_server: Option<banto_hub_core::runtime::RunningTlsServer>,
+    tls_fixture: TlsFixture,
+    tls_port: u16,
     router: Router,
     token: String,
     port: u16,
@@ -230,6 +238,9 @@ impl TestApp {
         self.manager.db_source_engine().shutdown().await;
         self.manager.shutdown().await;
         if let Some(server) = self.server.take() {
+            server.stop().await;
+        }
+        if let Some(server) = self.tls_server.take() {
             server.stop().await;
         }
         self.pool.close().await;
@@ -369,8 +380,17 @@ async fn test_app() -> TestApp {
     .await
     .expect("server should start");
     let port = server.local_addr().port();
+    let tls_fixture = TlsFixture::generate(temp.path());
+    let tls_server =
+        banto_hub_core::runtime::start_tls_router(router.clone(), tls_fixture.hub_config())
+            .await
+            .expect("TLS test server should start");
+    let tls_port = tls_server.local_addr().port();
     TestApp {
         server: Some(server),
+        tls_server: Some(tls_server),
+        tls_fixture,
+        tls_port,
         router,
         token,
         port,
@@ -590,10 +610,10 @@ fn push_external(source_name: &str, i: usize) -> String {
     format!("{source_name}.g{}.t{i}", i / TAGS_PER_GROUP)
 }
 
-fn bridge_toml(port: u16, api_key: &str) -> String {
+fn bridge_toml(tls: &TlsFixture, port: u16, api_key: &str) -> String {
+    let base = tls.pinned_config(port, api_key);
     format!(
-        "hub_url = \"http://127.0.0.1:{port}\"\n\
-         api_key = \"{api_key}\"\n\
+        "{base}\
          config_refresh_secs = 5\n\
          status_push_secs = 1\n"
     )
@@ -601,7 +621,7 @@ fn bridge_toml(port: u16, api_key: &str) -> String {
 
 fn spawn_bridge(app: &TestApp, api_key: &str) -> BridgeSupervisor {
     let config = SidecarConfig::from_toml_str(
-        &bridge_toml(app.port, api_key),
+        &bridge_toml(&app.tls_fixture, app.tls_port, api_key),
         Path::new("banto-hub-sink.toml"),
     )
     .expect("config");
@@ -1055,13 +1075,21 @@ struct FakeBridgeHub {
     hold: Arc<AtomicBool>,
     /// 応答した設定の取得の数（成功・失敗とも）。
     fetches: Arc<AtomicU64>,
-    sockets: tokio::sync::mpsc::UnboundedReceiver<WebSocketStream<TcpStream>>,
+    sockets: tokio::sync::mpsc::UnboundedReceiver<FakeWs>,
     port: u16,
     task: tokio::task::JoinHandle<()>,
+    tls_fixture: TlsFixture,
+    _temp: tempfile::TempDir,
 }
+
+type FakeStream = BufStream<TlsStream<TcpStream>>;
+type FakeWs = WebSocketStream<FakeStream>;
 
 impl FakeBridgeHub {
     async fn start(config: Value) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let tls_fixture = TlsFixture::generate(temp.path());
+        let acceptor = TlsAcceptor::from(tls_fixture.server_config());
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let config = Arc::new(std::sync::Mutex::new(config));
@@ -1081,8 +1109,13 @@ impl FakeBridgeHub {
                         fetches.clone(),
                         socket_tx.clone(),
                     );
+                    let acceptor = acceptor.clone();
                     tokio::spawn(async move {
-                        if is_config_request(&stream).await {
+                        let Ok(stream) = acceptor.accept(stream).await else {
+                            return;
+                        };
+                        let mut stream = BufStream::new(stream);
+                        if is_config_request(&mut stream).await {
                             serve_config(stream, &config, &fail, &hold, &fetches).await;
                         } else if let Ok(ws) = tokio_tungstenite::accept_async(stream).await {
                             let _ = socket_tx.send(ws);
@@ -1099,6 +1132,8 @@ impl FakeBridgeHub {
             sockets,
             port,
             task,
+            tls_fixture,
+            _temp: temp,
         }
     }
 
@@ -1111,7 +1146,7 @@ impl FakeBridgeHub {
     }
 
     /// ブリッジが張った次の WS。
-    async fn next_socket(&mut self) -> WebSocketStream<TcpStream> {
+    async fn next_socket(&mut self) -> FakeWs {
         tokio::time::timeout(WAIT, self.sockets.recv())
             .await
             .expect("the bridge connects to the ingest stream")
@@ -1119,13 +1154,9 @@ impl FakeBridgeHub {
     }
 
     fn spawn_bridge(&self) -> BridgeSupervisor {
+        let base = self.tls_fixture.pinned_config(self.port, "bh_fake.bridge");
         let config = SidecarConfig::from_toml_str(
-            &format!(
-                "hub_url = \"http://127.0.0.1:{}\"\n\
-                 api_key = \"bh_fake.bridge\"\n\
-                 config_refresh_secs = 60\n",
-                self.port
-            ),
+            &format!("{base}config_refresh_secs = 60\n"),
             Path::new("banto-hub-sink.toml"),
         )
         .expect("config");
@@ -1140,12 +1171,11 @@ impl Drop for FakeBridgeHub {
 }
 
 /// 要求の行が `GET /api/ingest/bridge-config` か（読まずに覗く）。
-async fn is_config_request(stream: &TcpStream) -> bool {
-    let mut buf = [0u8; 128];
+async fn is_config_request(stream: &mut FakeStream) -> bool {
     for _ in 0..200 {
-        let n = stream.peek(&mut buf).await.unwrap_or(0);
-        if n == buf.len() || buf[..n].contains(&b'\n') {
-            return buf[..n].starts_with(b"GET /api/ingest/bridge-config");
+        let buf = stream.fill_buf().await.unwrap_or_default();
+        if buf.len() >= 128 || buf.contains(&b'\n') {
+            return buf.starts_with(b"GET /api/ingest/bridge-config");
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -1153,7 +1183,7 @@ async fn is_config_request(stream: &TcpStream) -> bool {
 }
 
 async fn serve_config(
-    mut stream: TcpStream,
+    mut stream: FakeStream,
     config: &std::sync::Mutex<Value>,
     fail: &AtomicBool,
     hold: &AtomicBool,
@@ -1209,7 +1239,7 @@ fn fake_bridge_config(
 const SQL_A: &str = "SELECT 1.5::float8 AS a";
 const SQL_B: &str = "SELECT 2.5::float8 AS a";
 
-async fn fake_welcome(ws: &mut WebSocketStream<TcpStream>, collecting: bool, epoch: u64) {
+async fn fake_welcome(ws: &mut FakeWs, collecting: bool, epoch: u64) {
     let welcome = json!({ "op": "welcome", "connection_id": FAKE_ID, "connection": "fake",
         "collecting": collecting, "epoch": epoch, "stale_timeout_ms": 3_000,
         "limits": { "max_items": 1000, "max_message_bytes": 262_144,
@@ -1220,10 +1250,7 @@ async fn fake_welcome(ws: &mut WebSocketStream<TcpStream>, collecting: bool, epo
 }
 
 /// `within` の間に届いた `values` と、その間にブリッジが WS を閉じたか。
-async fn fake_values_within(
-    ws: &mut WebSocketStream<TcpStream>,
-    within: Duration,
-) -> (Vec<Value>, bool) {
+async fn fake_values_within(ws: &mut FakeWs, within: Duration) -> (Vec<Value>, bool) {
     let mut out = Vec::new();
     let deadline = tokio::time::Instant::now() + within;
     loop {
@@ -1242,17 +1269,14 @@ async fn fake_values_within(
 }
 
 /// 次の `values`（[`WAIT`] まで）。
-async fn fake_next_values(ws: &mut WebSocketStream<TcpStream>) -> Value {
+async fn fake_next_values(ws: &mut FakeWs) -> Value {
     let (values, closed) = fake_values_until(ws, |_| true).await;
     assert!(!closed, "the bridge closed the stream: {values:?}");
     values.into_iter().last().expect("values")
 }
 
 /// `done` が真になる `values` まで（[`WAIT`] まで）。それまでに届いた `values` を全部返す。
-async fn fake_values_until(
-    ws: &mut WebSocketStream<TcpStream>,
-    done: impl Fn(&Value) -> bool,
-) -> (Vec<Value>, bool) {
+async fn fake_values_until(ws: &mut FakeWs, done: impl Fn(&Value) -> bool) -> (Vec<Value>, bool) {
     let mut out = Vec::new();
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -1286,7 +1310,7 @@ fn k1(value: &Value) -> (Option<f64>, String, u64) {
 }
 
 /// ブリッジが WS を閉じるまで待つ（その間の `values` を返す）。
-async fn fake_until_closed(ws: &mut WebSocketStream<TcpStream>) -> Vec<Value> {
+async fn fake_until_closed(ws: &mut FakeWs) -> Vec<Value> {
     let (values, closed) = fake_values_within(ws, WAIT).await;
     assert!(closed, "the bridge must close the old stream: {values:?}");
     values

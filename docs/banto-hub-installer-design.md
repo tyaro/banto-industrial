@@ -111,6 +111,8 @@ cargo build --release -p banto-hub-sink
 cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release
 ```
 
+`webpki-root-certs` のルート証明書データを含む配布物には、CDLA-Permissive-2.0 の全文をデータと共に提供する。NSIS インストーラは `apps/banto-hub/installer/assets/CDLA-Permissive-2.0.txt` をインストール先に配置し、`scripts/build-release.ps1` は単体 exe と同じ配布ディレクトリへコピーして `SHA256SUMS.txt` に含める。単体 exe を別の経路で配布する場合も、この本文を添付する。証明書データを解析結果として扱って省略しない。
+
 生成ツールは `target/release/` の 4 exe を既定で拾い、無ければ明確なエラーで止める。
 
 ### 4.7 VC++ ランタイム（C ランタイムの静的リンク）

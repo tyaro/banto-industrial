@@ -75,6 +75,7 @@ tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 
 [dev-dependencies]
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 # 管理者でしか走らない確かめ（保護された置き場から読む）のゲート（#630。
 # `config::place` のテスト。CI は管理者）。
 banto-service-elev = { path = "../../crates/banto-service-elev" }
