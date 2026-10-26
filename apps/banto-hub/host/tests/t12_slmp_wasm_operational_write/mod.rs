@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use banto_collect::current::Quality;
 use banto_driver_api::{
     ConnectContext, DataType, DriverBase, FatalError, ItemError, Session as _, Settings, TagKind,
     TagSpec, Value, WriteItem,
@@ -20,12 +21,14 @@ type RecordedFrames = Arc<Mutex<Vec<(u32, Vec<u16>)>>>;
 enum Peer {
     R,
     Q,
+    StandardQ,
 }
 
 struct Fixture {
     address: std::net::SocketAddr,
     frames: RecordedFrames,
     commands: Arc<Mutex<Vec<(u16, u32, u16)>>>,
+    write_devices: Arc<Mutex<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -37,6 +40,8 @@ impl Fixture {
         let writes = frames.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let events = commands.clone();
+        let write_devices = Arc::new(Mutex::new(Vec::new()));
+        let devices = write_devices.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -60,7 +65,11 @@ impl Fixture {
                             request[19],
                             request[20],
                             request[21],
-                            if subcommand == 2 { request[22] } else { 0 },
+                            if matches!(subcommand, 2 | 3) {
+                                request[22]
+                            } else {
+                                0
+                            },
                         ])
                     };
                     events.lock().unwrap().push((command, start, subcommand));
@@ -69,6 +78,7 @@ impl Fixture {
                             let (name, code) = match peer {
                                 Peer::R => ("R04CPU", 0x4800u16),
                                 Peer::Q => ("Q25PRHCPU", 0x004cu16),
+                                Peer::StandardQ => ("Q02UCPU", 0x0263u16),
                             };
                             let mut body = vec![b' '; 18];
                             body[..name.len()].copy_from_slice(name.as_bytes());
@@ -89,53 +99,90 @@ impl Fixture {
                                     assert_eq!((subcommand, start, words), (0, 302, 1));
                                     (0, u16::try_from(count).unwrap().to_le_bytes().to_vec())
                                 }
+                                Peer::StandardQ => {
+                                    assert_eq!((subcommand, start, words), (0, 302, 2));
+                                    let mut body =
+                                        u16::try_from(count).unwrap().to_le_bytes().to_vec();
+                                    body.extend_from_slice(&64u16.to_le_bytes());
+                                    (0, body)
+                                }
                             }
                         }
                         0x0401 => {
-                            let offset = if subcommand == 2 { 25 } else { 23 };
+                            let is_r = matches!(subcommand, 2 | 3);
+                            let offset = if is_r { 25 } else { 23 };
                             let words = usize::from(u16::from_le_bytes([
                                 request[offset],
                                 request[offset + 1],
                             ]));
-                            assert_eq!(request[if subcommand == 2 { 23 } else { 22 }], 0xa8);
+                            let device = request[if is_r { 23 } else { 22 }];
                             let end = start.checked_add(u32::try_from(words).unwrap()).unwrap();
                             assert!(
                                 words > 0
-                                    && ((start == 3000 && end == 3001)
-                                        || (start >= 3010 && end <= 3015))
+                                    && ((device == 0xa8
+                                        && ((start == 10 && end == 11)
+                                            || (start == 3000 && end == 3001)
+                                            || (start >= 3010 && end <= 3015)))
+                                        || (device == 0xb4 && start >= 0x1a && end <= 0x20)
+                                        || (device == 0x90 && start >= 10 && end <= 13))
                             );
-                            let stored = writes.lock().unwrap().last().cloned();
-                            let values: Vec<u16> = (start..end)
-                                .map(|index| {
-                                    stored
-                                        .as_ref()
-                                        .and_then(|(first, data)| {
-                                            index.checked_sub(*first).and_then(|offset| {
-                                                data.get(usize::try_from(offset).unwrap())
-                                            })
+                            if device == 0x90 {
+                                assert_eq!(subcommand, if is_r { 3 } else { 1 });
+                                if start == 12 {
+                                    (0xc051, Vec::new())
+                                } else {
+                                    let bits =
+                                        (start..end).map(|index| index == 10).collect::<Vec<_>>();
+                                    let body = bits
+                                        .chunks(2)
+                                        .map(|pair| {
+                                            (u8::from(pair[0]) << 4)
+                                                | u8::from(pair.get(1).copied().unwrap_or(false))
                                         })
-                                        .copied()
-                                        .unwrap_or(7)
-                                })
-                                .collect();
-                            (
-                                0,
-                                values
-                                    .iter()
-                                    .flat_map(|value| value.to_le_bytes())
-                                    .collect(),
-                            )
+                                        .collect();
+                                    (0, body)
+                                }
+                            } else {
+                                let stored = writes.lock().unwrap().last().cloned();
+                                let values: Vec<u16> = (start..end)
+                                    .map(|index| {
+                                        if device == 0xa8 && index == 10 {
+                                            return 0x8000;
+                                        }
+                                        stored
+                                            .as_ref()
+                                            .and_then(|(first, data)| {
+                                                index.checked_sub(*first).and_then(|offset| {
+                                                    data.get(usize::try_from(offset).unwrap())
+                                                })
+                                            })
+                                            .copied()
+                                            .unwrap_or(7)
+                                    })
+                                    .collect();
+                                (
+                                    0,
+                                    values
+                                        .iter()
+                                        .flat_map(|value| value.to_le_bytes())
+                                        .collect(),
+                                )
+                            }
                         }
                         0x1401 => {
                             let offset = if subcommand == 2 { 25 } else { 23 };
-                            assert_eq!(request[if subcommand == 2 { 23 } else { 22 }], 0xa8);
+                            let device = request[if subcommand == 2 { 23 } else { 22 }];
+                            assert!(matches!(device, 0xa8 | 0xb4));
                             assert_eq!(subcommand, if matches!(peer, Peer::R) { 2 } else { 0 });
                             let words = usize::from(u16::from_le_bytes([
                                 request[offset],
                                 request[offset + 1],
                             ]));
                             assert_eq!(request.len(), offset + 2 + words * 2);
-                            assert!((3010..=3013).contains(&start));
+                            assert!(
+                                (device == 0xa8 && (3010..=3013).contains(&start))
+                                    || (device == 0xb4 && (0x1a..=0x1f).contains(&start))
+                            );
                             let values = request[offset + 2..]
                                 .as_chunks::<2>()
                                 .0
@@ -143,6 +190,7 @@ impl Fixture {
                                 .map(|word| u16::from_le_bytes(*word))
                                 .collect();
                             writes.lock().unwrap().push((start, values));
+                            devices.lock().unwrap().push(device);
                             (0, Vec::new())
                         }
                         _ => panic!("unexpected SLMP command {command:#x}"),
@@ -166,6 +214,7 @@ impl Fixture {
             address,
             frames,
             commands,
+            write_devices,
             task,
         }
     }
@@ -176,6 +225,10 @@ impl Fixture {
 
     fn commands(&self) -> Vec<(u16, u32, u16)> {
         self.commands.lock().unwrap().clone()
+    }
+
+    fn write_devices(&self) -> Vec<u8> {
+        self.write_devices.lock().unwrap().clone()
     }
 }
 
@@ -205,6 +258,18 @@ fn specs(driver: &WasmDriver) -> Vec<TagSpec> {
         .map(|index| {
             TagSpec::new(
                 driver.parse_address(&format!("D{index}"), &kind).unwrap(),
+                kind.clone(),
+            )
+        })
+        .collect()
+}
+
+fn w_specs(driver: &WasmDriver) -> Vec<TagSpec> {
+    let kind = TagKind::numeric(DataType::U16);
+    (0x1a..=0x1f)
+        .map(|index| {
+            TagSpec::new(
+                driver.parse_address(&format!("W{index:X}"), &kind).unwrap(),
                 kind.clone(),
             )
         })
@@ -327,6 +392,181 @@ async fn q_and_r_normal_write_are_one_frame_with_per_connection_gate() {
             1
         );
         session.disconnect().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
+async fn bit_bool_values_and_device_error_survive_the_host_read_boundary() {
+    let (fixture, driver, mut session) = connect(Peer::R, 4000, "disabled", "", false).await;
+    let bit = TagKind::numeric(DataType::Bit);
+    for (address, expected) in [
+        ("M10", Value::Bit(true)),
+        ("M11", Value::Bit(false)),
+        ("D10.F", Value::Bit(true)),
+        ("D10.0", Value::Bit(false)),
+    ] {
+        let spec = TagSpec::new(driver.parse_address(address, &bit).unwrap(), bit.clone());
+        assert_eq!(
+            session.read_batch(&[spec]).await.unwrap(),
+            vec![Ok(expected)]
+        );
+    }
+    let rejected = TagSpec::new(driver.parse_address("M12", &bit).unwrap(), bit);
+    assert!(matches!(
+        session.read_batch(&[rejected]).await.unwrap().as_slice(),
+        [Err(ItemError::Device(_))]
+    ));
+    assert!(fixture.frames().is_empty());
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
+async fn saved_bit_tags_keep_values_and_quality_after_collection() {
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-operational-bit-read-loopback",
+        MANIFEST,
+        &component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "bit-read-loopback".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "d_u16_write_mode": "disabled"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("bit-group", saved.id, 100))
+    .await
+    .unwrap();
+    let mut tags = Vec::new();
+    for (name, address, value, quality) in [
+        ("set", "M10", Some(1.0), Quality::Good),
+        ("clear", "M11", Some(0.0), Quality::Good),
+        ("word-bit", "D10.F", Some(1.0), Quality::Good),
+        ("device-error", "M12", None, Quality::Bad),
+    ] {
+        let tag = app
+            .manager
+            .tags()
+            .create(super::tag_input(name, group.id, address, "bit"))
+            .await
+            .unwrap();
+        assert!(!tag.writable);
+        tags.push((tag.id, value, quality));
+    }
+    app.manager.rebuild().await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tags.iter().all(|(id, value, quality)| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .is_some_and(|sample| sample.value == *value && sample.quality == *quality)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("saved bit values and per-tag quality");
+    assert!(fixture.frames().is_empty());
+    drop(app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
+async fn explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d() {
+    for peer in [Peer::R, Peer::StandardQ] {
+        let (fixture, driver, mut session) =
+            connect(peer, 4000, "enabled", "D3010-D3013", false).await;
+        let specs = w_specs(&driver);
+        let items: Vec<_> = specs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, spec)| WriteItem::new(spec, Value::F64((index + 1) as f64)))
+            .collect();
+        assert!(session
+            .write_batch(&items)
+            .await
+            .unwrap()
+            .iter()
+            .all(Result::is_err));
+        assert!(fixture.frames().is_empty());
+        session.disconnect().await;
+
+        let (fixture, driver, mut session) =
+            connect(peer, 4000, "enabled", "D3010-D3013,W1A-W1F", false).await;
+        let specs = w_specs(&driver);
+        let items: Vec<_> = specs
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, spec)| WriteItem::new(spec, Value::F64((index + 1) as f64)))
+            .collect();
+        let mut invalid = items.clone();
+        invalid[2].spec = specs[3].clone(); // hole and duplicate
+        let mut mixed = items.clone();
+        mixed[2].spec = self::specs(&driver)[2].clone();
+        let mut nonfinite = items.clone();
+        nonfinite[2].value = Value::F64(f64::NAN);
+        for request in [
+            invalid,
+            mixed,
+            nonfinite,
+            items.iter().cloned().rev().collect(),
+        ] {
+            assert!(session
+                .write_batch(&request)
+                .await
+                .unwrap()
+                .iter()
+                .all(Result::is_err));
+        }
+        assert!(fixture.frames().is_empty());
+        assert_eq!(session.write_batch(&items).await.unwrap(), vec![Ok(()); 6]);
+        assert_eq!(fixture.frames(), vec![(0x1a, vec![1, 2, 3, 4, 5, 6])]);
+        assert_eq!(fixture.write_devices(), vec![0xb4]);
+        assert_eq!(
+            session.read_batch(&specs).await.unwrap(),
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+                .map(|value| Ok(Value::F64(value)))
+                .to_vec()
+        );
+        session.disconnect().await;
+
+        let (fixture, driver, mut session) = connect(peer, 4000, "enabled", "W1A-W1F", true).await;
+        let specs = w_specs(&driver);
+        let items: Vec<_> = specs
+            .into_iter()
+            .enumerate()
+            .map(|(index, spec)| WriteItem::new(spec, Value::F64((index + 1) as f64)))
+            .collect();
+        assert!(session.write_batch(&items).await.is_err());
+        session.disconnect().await;
+        assert_eq!(fixture.frames().len(), 1);
+        assert_eq!(fixture.write_devices(), vec![0xb4]);
     }
 }
 

@@ -291,7 +291,11 @@ fn reply(scenario: Scenario, request: &Request, version: usize) -> (u16, Vec<u8>
                     32
                 };
                 let mut body = count.to_le_bytes().to_vec();
-                if matches!(scenario, Scenario::NumericW) {
+                // The current guest reads both D and W counts (four SD words).
+                // Keep the two-word response for pinned older Numeric guests.
+                if matches!(scenario, Scenario::NumericW)
+                    || (matches!(scenario, Scenario::Numeric) && request.count == Some(4))
+                {
                     body.extend_from_slice(&32_u32.to_le_bytes());
                 }
                 (0, body, false)

@@ -629,10 +629,48 @@ jobs:
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
           if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component world mismatch' }
           $normalWriteLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-normal-write-hub-test.txt'
-          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $normalWriteLog
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip bit_bool_values_and_device_error_survive_the_host_read_boundary --skip saved_bit_tags_keep_values_and_quality_after_collection --skip explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d 2>&1 | Tee-Object -FilePath $normalWriteLog
           if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write Hub tests failed' }
           if (-not (Select-String -Path $normalWriteLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'normal SLMP write Hub tests did not all run'
+          }
+          # The merged common D/W guest also advertises bit reads. Keep the
+          # earlier D-only guest regression above, then build this revision
+          # independently instead of relying on a developer's local component.
+          $commonDwSha = '532e0ba1f0b91a67422e33dac72e9edbb7c3fe0e'
+          git -C $guest checkout --quiet --detach $commonDwSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $commonDwSha) {
+            throw 'common D/W SLMP guest SHA mismatch'
+          }
+          $commonDwReadWit = git -C $guest rev-parse --verify "${commonDwSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $commonDwReadWit -ne $hostWit) {
+            throw 'common D/W SLMP guest read WIT mismatch'
+          }
+          $commonDwWriteWit = git -C $guest rev-parse --verify "${commonDwSha}:wit/write-v1.wit"
+          if ($LASTEXITCODE -ne 0 -or $commonDwWriteWit -ne $hostWriteWit) {
+            throw 'common D/W SLMP guest write WIT mismatch'
+          }
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP guest build failed' }
+          $commonDwModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
+          $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-common-dw-component.wasm'
+          wasm-tools component new $commonDwModule -o $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component creation failed' }
+          wasm-tools validate $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
+          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component world mismatch' }
+          $commonDwLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-common-dw-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $commonDwLog
+          if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP Hub tests failed' }
+          if (-not (Select-String -Path $commonDwLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'common D/W SLMP Hub tests did not all run'
+          }
+          $env:BANTO_STAGE2_SLMP_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          $env:BANTO_LOCAL_W_WASM = $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM
+          foreach ($numericTest in @('r_eight_numeric_kinds_collect_and_serve_rest', 'r_w_eight_numeric_kinds_collect_and_serve_rest')) {
+            cargo +1.98.1 test -p banto-hub-host --test t12_connection_test "slmp_wasm_test::$numericTest" --locked -- --ignored
+            if ($LASTEXITCODE -ne 0) { throw "common D/W SLMP numeric regression failed: $numericTest" }
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
           # Keep the older guest revisions above for read and write regressions.
