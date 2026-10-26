@@ -98,19 +98,26 @@ impl Fixture {
                                 request[offset + 1],
                             ]));
                             assert_eq!(request[if subcommand == 2 { 23 } else { 22 }], 0xa8);
-                            assert!((3010..=3013).contains(&start));
-                            assert!(words > 0 && start as usize + words <= 3014);
+                            let end = start.checked_add(u32::try_from(words).unwrap()).unwrap();
+                            assert!(
+                                words > 0
+                                    && ((start == 3000 && end == 3001)
+                                        || (start >= 3010 && end <= 3015))
+                            );
                             let stored = writes.lock().unwrap().last().cloned();
-                            let values = stored
-                                .filter(|(first, data)| {
-                                    *first <= start
-                                        && start as usize + words <= *first as usize + data.len()
+                            let values: Vec<u16> = (start..end)
+                                .map(|index| {
+                                    stored
+                                        .as_ref()
+                                        .and_then(|(first, data)| {
+                                            index.checked_sub(*first).and_then(|offset| {
+                                                data.get(usize::try_from(offset).unwrap())
+                                            })
+                                        })
+                                        .copied()
+                                        .unwrap_or(7)
                                 })
-                                .map(|(first, data)| {
-                                    data[(start - first) as usize..(start - first) as usize + words]
-                                        .to_vec()
-                                })
-                                .unwrap_or_else(|| vec![7; words]);
+                                .collect();
                             (
                                 0,
                                 values
@@ -250,6 +257,21 @@ async fn q_and_r_normal_write_are_one_frame_with_per_connection_gate() {
         let (fixture, driver, mut session) =
             connect(peer, 4000, "enabled", "D3010-D3013", false).await;
         let specs = specs(&driver);
+        // These are all saved collection tags in the REST fixture. A collector
+        // tick may read them before or after the explicit write.
+        let read_specs: Vec<_> = [3000, 3010, 3011, 3012, 3013, 3014]
+            .map(|index| {
+                let kind = TagKind::numeric(DataType::U16);
+                TagSpec::new(
+                    driver.parse_address(&format!("D{index}"), &kind).unwrap(),
+                    kind,
+                )
+            })
+            .into();
+        assert_eq!(
+            session.read_batch(&read_specs).await.unwrap(),
+            vec![Ok(Value::F64(7.0)); read_specs.len()]
+        );
         let mut bad = items(&specs);
         bad[2].value = Value::F64(f64::NAN);
         let mut outside = items(&specs);
@@ -287,6 +309,12 @@ async fn q_and_r_normal_write_are_one_frame_with_per_connection_gate() {
         assert_eq!(
             session.read_batch(&specs).await.unwrap(),
             [1.0, 2.0, 3.0, 4.0]
+                .map(|value| Ok(Value::F64(value)))
+                .to_vec()
+        );
+        assert_eq!(
+            session.read_batch(&read_specs).await.unwrap(),
+            [7.0, 1.0, 2.0, 3.0, 4.0, 7.0]
                 .map(|value| Ok(Value::F64(value)))
                 .to_vec()
         );
