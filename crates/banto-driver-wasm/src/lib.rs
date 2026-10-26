@@ -73,10 +73,14 @@ enum ControlledWriteTarget {
     None,
     #[cfg(feature = "controlled-write-fixture")]
     Loopback,
+    #[cfg(feature = "controlled-write-fixture")]
+    QTestLoopback,
     #[cfg(feature = "controlled-live-write-fixture")]
     RTestPlc,
     #[cfg(feature = "controlled-live-write-fixture")]
     RTestRangePlc,
+    #[cfg(feature = "controlled-live-write-fixture")]
+    QTestRangePlc,
 }
 
 impl ControlledWriteTarget {
@@ -90,10 +94,14 @@ impl ControlledWriteTarget {
             Self::None => false,
             #[cfg(feature = "controlled-write-fixture")]
             Self::Loopback => matches!(index, 3010 | 3012),
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::QTestLoopback => false,
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestPlc => index == 3010,
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestRangePlc => false,
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::QTestRangePlc => false,
         }
     }
 
@@ -102,10 +110,14 @@ impl ControlledWriteTarget {
             Self::None => false,
             #[cfg(feature = "controlled-write-fixture")]
             Self::Loopback => true,
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::QTestLoopback => true,
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestPlc => false,
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestRangePlc => true,
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::QTestRangePlc => true,
         }
     }
 
@@ -117,6 +129,15 @@ impl ControlledWriteTarget {
             Self::Loopback => settings
                 .iter()
                 .any(|setting| setting.key == "host" && setting.value == "127.0.0.1"),
+            #[cfg(feature = "controlled-write-fixture")]
+            Self::QTestLoopback => {
+                settings
+                    .iter()
+                    .any(|setting| setting.key == "host" && setting.value == "127.0.0.1")
+                    && settings.iter().any(|setting| {
+                        setting.key == "q25prh_d3010_3013_test_write" && setting.value == "enabled"
+                    })
+            }
             #[cfg(feature = "controlled-live-write-fixture")]
             Self::RTestPlc | Self::RTestRangePlc => {
                 settings
@@ -125,6 +146,18 @@ impl ControlledWriteTarget {
                     && settings
                         .iter()
                         .any(|setting| setting.key == "port" && setting.value == "3109")
+            }
+            #[cfg(feature = "controlled-live-write-fixture")]
+            Self::QTestRangePlc => {
+                settings
+                    .iter()
+                    .any(|setting| setting.key == "host" && setting.value == "192.168.11.10")
+                    && settings
+                        .iter()
+                        .any(|setting| setting.key == "port" && setting.value == "3109")
+                    && settings.iter().any(|setting| {
+                        setting.key == "q25prh_d3010_3013_test_write" && setting.value == "enabled"
+                    })
             }
         }
     }
@@ -147,6 +180,16 @@ impl WasmDriver {
         Self::load_inner(manifest, component, ControlledWriteTarget::Loopback)
     }
 
+    /// Separate Q25PRH-only loopback write fixture; requires the guest's
+    /// explicit hidden opt-in in addition to the host's four-word allowlist.
+    #[cfg(feature = "controlled-write-fixture")]
+    pub fn load_controlled_q_test_fixture(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, ControlledWriteTarget::QTestLoopback)
+    }
+
     /// Explicit test-only loader for the approved R test PLC. The caller must
     /// also verify its TransportSpec before dialing; settings are not the wire
     /// destination. Production registration always uses `load` instead.
@@ -167,6 +210,16 @@ impl WasmDriver {
         component: &[u8],
     ) -> Result<Arc<Self>, LoadError> {
         Self::load_inner(manifest, component, ControlledWriteTarget::RTestRangePlc)
+    }
+
+    /// Isolated Q25PRH test-PLC entry point. The caller must verify the
+    /// transport destination and every outbound frame before a live dial.
+    #[cfg(feature = "controlled-live-write-fixture")]
+    pub fn load_controlled_q_range_test_fixture(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, ControlledWriteTarget::QTestRangePlc)
     }
 
     fn load_inner(
@@ -529,7 +582,7 @@ fn controlled_write_item(
     let refused = || {
         WriteProgress::Done(vec![
             Err(ItemError::Unsupported(
-                "controlled WASM write accepts one allowed D/u16 item or the exact loopback D3010..D3013 range".into(),
+                "controlled WASM write accepts one allowed D/u16 item or the exact D3010..D3013 test range".into(),
             ));
             items.len()
         ])
@@ -1138,6 +1191,46 @@ mod tests {
             range_target
         )
         .is_err());
+    }
+
+    #[cfg(all(
+        feature = "controlled-write-fixture",
+        feature = "controlled-live-write-fixture"
+    ))]
+    #[test]
+    fn controlled_q_range_requires_opt_in_and_never_allows_single_word() {
+        let settings = |host: &str, port: &str, enabled: bool| {
+            let mut pairs = vec![
+                ("host".to_owned(), host.to_owned()),
+                ("port".to_owned(), port.to_owned()),
+            ];
+            if enabled {
+                pairs.push(("q25prh_d3010_3013_test_write".into(), "enabled".into()));
+            }
+            Settings::from_pairs(pairs).unwrap()
+        };
+        let loopback = ControlledWriteTarget::QTestLoopback;
+        let live = ControlledWriteTarget::QTestRangePlc;
+        assert!(loopback.accepts_settings(&settings("127.0.0.1", "5000", true)));
+        assert!(!loopback.accepts_settings(&settings("127.0.0.1", "5000", false)));
+        assert!(live.accepts_settings(&settings("192.168.11.10", "3109", true)));
+        assert!(!live.accepts_settings(&settings("192.168.11.10", "3109", false)));
+        assert!(!live.accepts_settings(&settings("192.168.11.10", "3100", true)));
+        assert!(!live.accepts_settings(&settings("192.168.11.200", "3109", true)));
+        let id = DriverId::new("slmp-write-fixture").unwrap();
+        let range: Vec<_> = (3010..=3013)
+            .map(|index| fixture_write_item_at(index, api::Value::F64(1.0)))
+            .collect();
+        for target in [loopback, live] {
+            assert!(controlled_write_item(&range, &id, target).is_ok());
+            assert!(controlled_write_item(&range[..1], &id, target).is_err());
+            let mut outside = range.clone();
+            outside[3] = fixture_write_item_at(3014, api::Value::F64(1.0));
+            assert!(controlled_write_item(&outside, &id, target).is_err());
+            let mut protected = range.clone();
+            protected[0] = fixture_write_item_at(3000, api::Value::F64(1.0));
+            assert!(controlled_write_item(&protected, &id, target).is_err());
+        }
     }
 
     #[test]
