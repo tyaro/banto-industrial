@@ -1,0 +1,11 @@
+{
+  "manifestVersion": 1,
+  "id": "slmp-wasm-operational-write",
+  "version": "0.1.0",
+  "hubApi": "1",
+  "writeApi": "1",
+  "settingsVersion": 1,
+  "displayName": "Isolated SLMP operational write mock (WASM)",
+  "transports": ["tcp"],
+  "capabilities": ["read", "write"]
+}

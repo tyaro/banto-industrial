@@ -356,6 +356,8 @@ P1 の先行範囲として、`banto-hub` ホストの起動時に `BANTO_WASM_P
 
 この限定形式ではディレクトリ内を `manifest.json`・`component.wasm`・`signature.ed25519` の 3 ファイルに固定する。署名ファイルは生の Ed25519 署名 64 バイト。署名対象は `SHA-256("banto-hub-wasm-directory-v1\0" || entry...)` の 32 バイトで、`entry` は `component.wasm`、`manifest.json` の順に、それぞれファイル名の UTF-8 バイト長（u16 big-endian）・ファイル名・内容長（u64 big-endian）・内容の生バイトを連結する。署名ファイル自体を含めない。上限は manifest 64 KiB、component 64 MiB。検証済みの同一バイト列を WASM ローダーへ渡し、署名、`hubApi`、選択した id/version、既存 ID との衝突のいずれかが不正なら登録せず理由を記録し、組み込みドライバを残す。再起動時も検証し直す。P2 のパッケージ形式・失効・更新方式をここで確定するものではない。
 
+案（通常 D/u16 書込みの限定追加）: 読取り専用 guest の登録は従来どおりとし、書込み宣言を持つ guest は `BANTO_WASM_WRITE_PLUGIN` が `BANTO_WASM_PLUGIN` と同じ `id@version` を明示した場合だけ、上記の署名検証後に登録する。接続設定の `d_u16_write_mode` は既定 `disabled`、`d_u16_write_allowlist` は既定で空とし、通常書込みには両方の明示設定を要する。許可リストは昇順・非重複の `D3010-D3013,D4000-D4009` 形式、最大 16 区間・各区間 960 語まで。Hub は全項目と全 span を送信前に検査し、D3000/D3001 に重なる書込みを拒否する。guest は同一接続の機種・SD 範囲を別に確認する。既存の認可・書込み制御・監査・broker は維持する。信頼鍵と保護配置が未設定の間は実運用での登録を開始しない。
+
 ### 7.4 更新とロールバック
 
 - **有効なバージョンはプラグイン ID ごとに 1 つ**（Hub 全体の設定）。接続ごとのバージョン固定は v1 では持たない（Q4）。

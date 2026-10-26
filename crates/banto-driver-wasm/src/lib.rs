@@ -1,8 +1,10 @@
-//! Wasmtime Component Model frame driver. The normal loader is read-only; the
-//! versioned write export is available only to isolated controlled fixtures.
+//! Wasmtime Component Model frame driver. The normal loader is read-only;
+//! signed, explicitly selected write components have a separate loader and
+//! a per-connection host policy. Isolated controlled fixtures remain separate.
 //! The host owns transport, timeouts and frame limits.
 
 mod manifest;
+mod operational_write;
 mod runtime;
 
 pub use manifest::{Manifest, ManifestError};
@@ -21,6 +23,7 @@ use api::{
     Settings, SettingsSchema, Step, TagKind, TagSpec, WriteItem, WriteProgress,
 };
 use banto_driver_api as api;
+use operational_write::{WritePolicy, ALLOWLIST_KEY, MODE_KEY};
 use runtime::write_v1::{
     banto::driver::types as write_types,
     exports::banto::driver::{session as write_session, write_v1 as write},
@@ -71,6 +74,7 @@ pub struct WasmDriver {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ControlledWriteTarget {
     None,
+    Operational,
     #[cfg(feature = "controlled-write-fixture")]
     Loopback,
     #[cfg(feature = "controlled-write-fixture")]
@@ -92,6 +96,7 @@ impl ControlledWriteTarget {
         let _ = index;
         match self {
             Self::None => false,
+            Self::Operational => false,
             #[cfg(feature = "controlled-write-fixture")]
             Self::Loopback => matches!(index, 3010 | 3012),
             #[cfg(feature = "controlled-write-fixture")]
@@ -108,6 +113,7 @@ impl ControlledWriteTarget {
     fn allows_contiguous_range(self) -> bool {
         match self {
             Self::None => false,
+            Self::Operational => false,
             #[cfg(feature = "controlled-write-fixture")]
             Self::Loopback => true,
             #[cfg(feature = "controlled-write-fixture")]
@@ -125,6 +131,7 @@ impl ControlledWriteTarget {
         let _ = settings;
         match self {
             Self::None => true,
+            Self::Operational => true,
             #[cfg(feature = "controlled-write-fixture")]
             Self::Loopback => settings
                 .iter()
@@ -168,6 +175,16 @@ impl WasmDriver {
     /// stateless exports before making it visible to a registry.
     pub fn load(manifest: &[u8], component: &[u8]) -> Result<Arc<Self>, LoadError> {
         Self::load_inner(manifest, component, ControlledWriteTarget::None)
+    }
+
+    /// The caller must verify the component signature before using this
+    /// loader. Calling it is an explicit plugin-level opt-in; each saved
+    /// connection is still disabled until its own allowlist is configured.
+    pub fn load_operational_write(
+        manifest: &[u8],
+        component: &[u8],
+    ) -> Result<Arc<Self>, LoadError> {
+        Self::load_inner(manifest, component, ControlledWriteTarget::Operational)
     }
 
     /// Explicit entry point for isolated loopback fixtures. Normal
@@ -230,10 +247,11 @@ impl WasmDriver {
         let manifest = Manifest::parse(manifest).map_err(LoadError::Manifest)?;
         if manifest.requests_write != controlled_write_target.allows_write() {
             return Err(LoadError::Contract(
-                "write-v1 is available only through the controlled fixture loader".into(),
+                "write-v1 requires an explicit write loader".into(),
             ));
         }
         if controlled_write_target.allows_write()
+            && controlled_write_target != ControlledWriteTarget::Operational
             && manifest.descriptor.id.as_str() != "slmp-write-fixture"
         {
             return Err(LoadError::Contract(
@@ -284,6 +302,9 @@ impl WasmDriver {
             .map(convert_field)
             .collect();
         validate_secret_fields(&fields, &secrets)?;
+        if controlled_write_target == ControlledWriteTarget::Operational {
+            validate_operational_schema(&fields, &secrets)?;
+        }
         // Only expose write capability after the extended world has actually
         // bound on this component. The manifest alone never grants it.
         let mut descriptor = manifest.descriptor;
@@ -395,6 +416,42 @@ fn validate_secret_fields(fields: &[SettingField], secrets: &[String]) -> Result
     {
         return Err(LoadError::Contract(
             "config schema keys must be unique and secret-keys must match Secret fields".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_operational_schema(
+    fields: &[SettingField],
+    secrets: &[String],
+) -> Result<(), LoadError> {
+    if secrets
+        .iter()
+        .any(|key| key == MODE_KEY || key == ALLOWLIST_KEY)
+    {
+        return Err(LoadError::Contract(
+            "write policy fields must not be guest secrets".into(),
+        ));
+    }
+    let mode = fields.iter().find(|field| field.key == MODE_KEY);
+    let allowlist = fields.iter().find(|field| field.key == ALLOWLIST_KEY);
+    let mode_ok = mode.is_some_and(|field| {
+        matches!(&field.default, Some(SettingValue::Text(value)) if value == "disabled")
+            && matches!(&field.kind, FieldKind::Choice { options }
+                if options.len() == 2
+                    && options.iter().any(|option| option.value == "disabled")
+                    && options.iter().any(|option| option.value == "enabled"))
+    });
+    let allowlist_ok = allowlist.is_some_and(|field| {
+        (field.default.is_none()
+            || matches!(&field.default, Some(SettingValue::Text(value)) if value.is_empty()))
+            && matches!(&field.kind, FieldKind::Text { max_len: Some(max_len), .. }
+                if *max_len <= 256)
+    });
+    if !mode_ok || !allowlist_ok {
+        return Err(LoadError::Contract(
+            "operational write requires disabled-by-default mode and bounded empty allowlist schema"
+                .into(),
         ));
     }
     Ok(())
@@ -634,6 +691,64 @@ fn controlled_write_item(
     Ok(checked)
 }
 
+/// Require an entire contiguous request to fit inside one saved connection's
+/// explicit D/u16 interval before the guest can plan a write frame.
+fn operational_write_item(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+    policy: &WritePolicy,
+) -> Result<Vec<write::WriteItem>, WriteProgress> {
+    let refused = || {
+        WriteProgress::Done(vec![
+            Err(ItemError::Unsupported(
+                "D/u16 write is disabled or outside the connection allowlist".into(),
+            ));
+            items.len()
+        ])
+    };
+    let Some(start) = items
+        .first()
+        .and_then(|item| item.spec.address.index)
+        .and_then(|index| u32::try_from(index).ok())
+    else {
+        return Err(refused());
+    };
+    if !policy.allows_span(start, items.len()) {
+        return Err(refused());
+    }
+    let mut checked = Vec::with_capacity(items.len());
+    for (offset, item) in items.iter().enumerate() {
+        let index = start + offset as u32; // bounded by allows_span
+        let address = &item.spec.address;
+        if address.driver != *driver_id
+            || address.index != Some(u64::from(index))
+            || address.canonical != format!("D{index}")
+            || address.area != "D"
+            || address.bit.is_some()
+            || address.word_count != 1
+            || !address.writable_area
+            || !matches!(item.spec.kind, TagKind::Numeric(DataType::U16))
+        {
+            return Err(refused());
+        }
+        let api::Value::F64(value) = item.value else {
+            return Err(refused());
+        };
+        if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
+            return Err(refused());
+        }
+        checked.push(write::WriteItem {
+            spec: write_types::TagSpec {
+                address: address.canonical.clone(),
+                data_type: "u16".into(),
+                string_words: None,
+            },
+            value: write_types::Value::Float(value),
+        });
+    }
+    Ok(checked)
+}
+
 fn api_write_fatal(value: write_types::FatalError) -> FatalError {
     match value {
         write_types::FatalError::Framing(m) => FatalError::Framing(m),
@@ -677,7 +792,7 @@ impl DriverBase for WasmDriver {
     }
 
     fn validate_config(&self, settings: &Settings) -> Vec<FieldError> {
-        match self.with_instance("config.validate", |i| {
+        let mut errors = match self.with_instance("config.validate", |i| {
             i.driver
                 .banto_driver_config()
                 .call_validate(&mut i.store, &wit_settings(settings))
@@ -690,7 +805,13 @@ impl DriverBase for WasmDriver {
                 "settings",
                 format!("WASM validation failed: {:?}", e.0.cause),
             )],
+        };
+        if self.controlled_write_target == ControlledWriteTarget::Operational {
+            if let Err((key, reason)) = WritePolicy::parse(settings) {
+                errors.push(FieldError::new(key, reason));
+            }
         }
+        errors
     }
 
     fn secret_keys(&self) -> Vec<String> {
@@ -793,6 +914,15 @@ impl FrameDriver for WasmDriver {
                 "controlled WASM write fixture endpoint mismatch".into(),
             ));
         }
+        let operational_write_policy =
+            if self.controlled_write_target == ControlledWriteTarget::Operational {
+                Some(
+                    WritePolicy::parse(settings)
+                        .map_err(|(_, reason)| FatalError::InvalidConfig(reason.into()))?,
+                )
+            } else {
+                None
+            };
         let mut instance = self.runtime.instantiate().map_err(normalize)?;
         let resource = instance
             .driver
@@ -807,6 +937,7 @@ impl FrameDriver for WasmDriver {
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
             controlled_write_target: self.controlled_write_target,
+            operational_write_policy,
             driver_id: self.descriptor.id.clone(),
         }))
     }
@@ -818,6 +949,7 @@ struct WasmConnection {
     runtime: Arc<Runtime>,
     failed: AtomicBool,
     controlled_write_target: ControlledWriteTarget,
+    operational_write_policy: Option<WritePolicy>,
     driver_id: DriverId,
 }
 
@@ -858,11 +990,14 @@ impl FrameConnection for WasmConnection {
                 items.len()
             ]));
         }
-        let checked =
-            match controlled_write_item(items, &self.driver_id, self.controlled_write_target) {
-                Ok(item) => item,
-                Err(refused) => return Ok(refused),
-            };
+        let checked = match if let Some(policy) = &self.operational_write_policy {
+            operational_write_item(items, &self.driver_id, policy)
+        } else {
+            controlled_write_item(items, &self.driver_id, self.controlled_write_target)
+        } {
+            Ok(item) => item,
+            Err(refused) => return Ok(refused),
+        };
         self.call("write-v1.write-next", |i, resource| {
             i.write_driver
                 .as_ref()
@@ -1007,6 +1142,112 @@ impl Drop for WasmConnection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn operational_item(index: u64, value: api::Value) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let address = DriverAddress::new(id, format!("D{index}"), "D", true, 1).with_index(index);
+        WriteItem::new(
+            TagSpec::new(address, TagKind::numeric(DataType::U16)),
+            value,
+        )
+    }
+
+    #[test]
+    fn operational_write_preflight_is_atomic_and_bound_to_one_connection_range() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let settings = Settings::from_pairs([
+            (MODE_KEY, "enabled"),
+            (ALLOWLIST_KEY, "D3010-D3013,D4000-D4009"),
+        ])
+        .unwrap();
+        let policy = WritePolicy::parse(&settings).unwrap();
+        let valid: Vec<_> = (3010..=3013)
+            .enumerate()
+            .map(|(offset, index)| operational_item(index, api::Value::F64((offset + 1) as f64)))
+            .collect();
+        assert_eq!(
+            operational_write_item(&valid, &id, &policy).unwrap().len(),
+            4
+        );
+        let disabled = WritePolicy::parse(&Settings::new()).unwrap();
+        assert!(operational_write_item(&valid, &id, &disabled).is_err());
+
+        let mut invalid_cases = Vec::new();
+        let mut hole = valid.clone();
+        hole[2] = operational_item(3014, api::Value::F64(3.0));
+        invalid_cases.push(hole);
+        let mut duplicate = valid.clone();
+        duplicate[2] = duplicate[1].clone();
+        invalid_cases.push(duplicate);
+        let mut wrong_value = valid.clone();
+        wrong_value[2].value = api::Value::F64(f64::NAN);
+        invalid_cases.push(wrong_value);
+        let mut too_large = valid.clone();
+        too_large[2].value = api::Value::F64(65536.0);
+        invalid_cases.push(too_large);
+        let mut fractional = valid.clone();
+        fractional[2].value = api::Value::F64(2.5);
+        invalid_cases.push(fractional);
+        let mut wrong_kind = valid.clone();
+        wrong_kind[2].spec.kind = TagKind::numeric(DataType::U32);
+        invalid_cases.push(wrong_kind);
+        let mut wrong_width = valid.clone();
+        wrong_width[2].spec.address.word_count = 2;
+        invalid_cases.push(wrong_width);
+        let mut not_writable = valid.clone();
+        not_writable[2].spec.address.writable_area = false;
+        invalid_cases.push(not_writable);
+        let mut wrong_driver = valid.clone();
+        wrong_driver[2].spec.address.driver = DriverId::new("other-driver").unwrap();
+        invalid_cases.push(wrong_driver);
+        for invalid in invalid_cases {
+            match operational_write_item(&invalid, &id, &policy) {
+                Err(WriteProgress::Done(results)) => {
+                    assert_eq!(results.len(), 4);
+                    assert!(results.iter().all(Result::is_err));
+                }
+                _ => panic!("invalid range must be rejected before a frame is planned"),
+            }
+        }
+        assert!(operational_write_item(
+            &[operational_item(3000, api::Value::F64(1.0))],
+            &id,
+            &policy,
+        )
+        .is_err());
+        assert!(operational_write_item(&valid[..3], &id, &policy).is_ok());
+        assert!(operational_write_item(&valid[1..], &id, &policy).is_ok());
+    }
+
+    #[test]
+    fn operational_schema_must_declare_safe_defaults() {
+        let mode = SettingField::new(
+            MODE_KEY,
+            "Write mode",
+            FieldKind::choice(vec![
+                api::ChoiceOption::new("disabled", "Disabled"),
+                api::ChoiceOption::new("enabled", "Enabled"),
+            ]),
+        )
+        .default("disabled");
+        let allowlist = SettingField::new(
+            ALLOWLIST_KEY,
+            "D/u16 allowlist",
+            FieldKind::Text {
+                max_len: Some(256),
+                placeholder: None,
+            },
+        )
+        .default("");
+        assert!(validate_operational_schema(&[mode.clone(), allowlist.clone()], &[]).is_ok());
+        assert!(validate_operational_schema(std::slice::from_ref(&mode), &[]).is_err());
+        assert!(
+            validate_operational_schema(&[mode.default("enabled"), allowlist.clone()], &[])
+                .is_err()
+        );
+        assert!(validate_operational_schema(std::slice::from_ref(&allowlist), &[]).is_err());
+        assert!(validate_operational_schema(&[allowlist], &[MODE_KEY.into()]).is_err());
+    }
 
     #[cfg(feature = "controlled-write-fixture")]
     fn fixture_write_item(value: api::Value) -> WriteItem {
