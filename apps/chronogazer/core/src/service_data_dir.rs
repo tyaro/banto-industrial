@@ -289,12 +289,14 @@ mod tests {
         let report =
             prune_service_data_files(&held, 0, banto_tstore::LocalDate::new(2026, 10, 26), &[])
                 .unwrap();
+        // A Windows temp path may use an 8.3 alias while the held handle
+        // reports its long spelling. Compare full paths from that handle.
         assert_eq!(
             report.deleted,
             [
-                root_path.join("data/20260101-001.sqlite3"),
-                root_path.join("data/20260101-002.sqlite3"),
-                root_path.join("data/20260102-001.sqlite3"),
+                held.final_path().join("20260101-001.sqlite3"),
+                held.final_path().join("20260101-002.sqlite3"),
+                held.final_path().join("20260102-001.sqlite3"),
             ]
         );
         assert!(!root_path.join("data").join(old).exists());
