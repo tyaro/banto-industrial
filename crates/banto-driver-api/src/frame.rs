@@ -238,6 +238,29 @@ pub trait FrameDriver: DriverBase {
 /// by reads and writes) and `write_next` (numbering and the write in
 /// progress). `decode_read` and `is_complete` take `&self`.
 pub trait FrameConnection: Send + 'static {
+    /// Replace protocol-local discovery state before an explicit recheck.
+    /// The engine then handshakes the replacement over the same transport.
+    /// Legacy drivers keep their existing connection state.
+    fn refresh_for_diagnostic(&mut self) -> Result<bool, FatalError> {
+        Ok(false)
+    }
+
+    /// Optional read-only discovery on this physical connection. Legacy
+    /// drivers keep their existing read/write behavior without this export.
+    fn supports_diagnostics(&self) -> bool {
+        false
+    }
+
+    /// One bounded diagnostic step. The engine keeps the entire sequence
+    /// exclusive on the connection and closes it if a send is abandoned.
+    fn diagnose_next(
+        &mut self,
+        _specs: &[TagSpec],
+        _prev_response: Option<&[u8]>,
+    ) -> Result<crate::DiagnosticProgress, FatalError> {
+        Err(FatalError::Protocol("range diagnostics unsupported".into()))
+    }
+
     /// The handshake, one step at a time (WIT `handshake-next`). First call
     /// `None`, then the previous step's response; return `Ok(None)` when
     /// done. A refusal is `Err` (the connection is not considered up).

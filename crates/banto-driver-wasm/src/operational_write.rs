@@ -7,6 +7,7 @@ pub(super) const MODE_KEY: &str = "d_u16_write_mode";
 pub(super) const ALLOWLIST_KEY: &str = "d_u16_write_allowlist";
 const Q_TEST_KEY: &str = "q25prh_d3010_3013_test_write";
 pub(super) const MAX_WORDS: usize = 960;
+pub(super) const MAX_BITS: usize = 7168;
 const MAX_INTERVALS: usize = 16;
 const MAX_TEXT_LEN: usize = 256;
 const MAX_DEVICE: u32 = 0x00ff_ffff;
@@ -15,6 +16,10 @@ const MAX_DEVICE: u32 = 0x00ff_ffff;
 pub(super) enum WriteArea {
     D,
     W,
+    M,
+    Y,
+    L,
+    B,
 }
 
 impl WriteArea {
@@ -22,6 +27,10 @@ impl WriteArea {
         match name {
             "D" => Some(Self::D),
             "W" => Some(Self::W),
+            "M" => Some(Self::M),
+            "Y" => Some(Self::Y),
+            "L" => Some(Self::L),
+            "B" => Some(Self::B),
             _ => None,
         }
     }
@@ -30,7 +39,15 @@ impl WriteArea {
         match self {
             Self::D => format!("D{index}"),
             Self::W => format!("W{index:X}"),
+            Self::M => format!("M{index}"),
+            Self::Y => format!("Y{index:X}"),
+            Self::L => format!("L{index}"),
+            Self::B => format!("B{index:X}"),
         }
+    }
+
+    pub(super) fn is_bit(self) -> bool {
+        matches!(self, Self::M | Self::Y | Self::L | Self::B)
     }
 }
 
@@ -65,10 +82,11 @@ impl WritePolicy {
                 if area != end_area {
                     return Err((ALLOWLIST_KEY, "write range must remain in one device area"));
                 }
-                if end < start || end - start >= MAX_WORDS as u32 {
+                let limit = if area.is_bit() { MAX_BITS } else { MAX_WORDS };
+                if end < start || end - start >= limit as u32 {
                     return Err((
                         ALLOWLIST_KEY,
-                        "write range is reversed or exceeds 960 words",
+                        "write range is reversed or exceeds device request limit",
                     ));
                 }
                 if area == WriteArea::D && start <= 3001 && end >= 3000 {
@@ -101,7 +119,7 @@ impl WritePolicy {
     }
 
     pub(super) fn allows_device_span(&self, area: WriteArea, start: u32, len: usize) -> bool {
-        if !self.enabled || len == 0 || len > MAX_WORDS {
+        if !self.enabled || len == 0 || len > if area.is_bit() { MAX_BITS } else { MAX_WORDS } {
             return false;
         }
         let Ok(offset) = u32::try_from(len - 1) else {
@@ -122,12 +140,14 @@ impl WritePolicy {
 }
 
 fn parse_device(value: &str) -> Result<(WriteArea, u32), (&'static str, &'static str)> {
-    let (area, digits, radix) = if let Some(digits) = value.strip_prefix('D') {
-        (WriteArea::D, digits, 10)
-    } else if let Some(digits) = value.strip_prefix('W') {
-        (WriteArea::W, digits, 16)
-    } else {
-        return Err((ALLOWLIST_KEY, "expected D or W address"));
+    let (area, digits, radix) = match value.as_bytes().first() {
+        Some(b'D') => (WriteArea::D, &value[1..], 10),
+        Some(b'W') => (WriteArea::W, &value[1..], 16),
+        Some(b'M') => (WriteArea::M, &value[1..], 10),
+        Some(b'Y') => (WriteArea::Y, &value[1..], 16),
+        Some(b'L') => (WriteArea::L, &value[1..], 10),
+        Some(b'B') => (WriteArea::B, &value[1..], 16),
+        _ => return Err((ALLOWLIST_KEY, "expected D/W/M/Y/L/B address")),
     };
     if digits.is_empty()
         || !digits.bytes().all(|ch| {
@@ -195,6 +215,27 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn bit_areas_use_the_same_explicit_policy_and_point_limit() {
+        let old = WritePolicy::parse(&settings("enabled", "D3010-D3013,W1A-W1F")).unwrap();
+        assert!(!old.allows_device_span(WriteArea::M, 10, 1));
+        let policy = WritePolicy::parse(&settings(
+            "enabled",
+            "D3010-D3013,M10-M17,Y1A-Y1F,L10-L10,B20-B21",
+        ))
+        .unwrap();
+        assert!(policy.allows_device_span(WriteArea::M, 10, 8));
+        assert!(policy.allows_device_span(WriteArea::Y, 0x1a, 6));
+        assert!(policy.allows_device_span(WriteArea::L, 10, 1));
+        assert!(policy.allows_device_span(WriteArea::B, 0x20, 2));
+        assert!(!policy.allows_device_span(WriteArea::M, 17, 2));
+        assert!(!policy.allows_device_span(WriteArea::D, 3010, 5));
+        assert!(WritePolicy::parse(&settings("enabled", "M0-M7167")).is_ok());
+        assert!(WritePolicy::parse(&settings("enabled", "M0-M7168")).is_err());
+        assert!(WritePolicy::parse(&settings("enabled", "D3000-D3002")).is_err());
+        assert!(WritePolicy::parse(&settings("enabled", "Y1a-Y1F")).is_err());
     }
 
     #[test]

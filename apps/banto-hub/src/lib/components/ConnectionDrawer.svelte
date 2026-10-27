@@ -101,6 +101,8 @@
 	import { passwordStatusView } from '#lib/banto/secretStorageView.js';
 	import {
 		createPlcConnection,
+		diagnosePlcConnection,
+		getCurrentPlcRangeDiagnostic,
 		deletePlcConnection,
 		PUSH_PROTOCOL,
 		isQueuedWhileRunningError,
@@ -112,6 +114,7 @@
 		type DbConnectionTestOutcome,
 		type DriverInfo,
 		type PlcConnection,
+		type PlcRangeDiagnostic,
 		type PlcConnectionTestResult
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
@@ -350,6 +353,9 @@
 	let saving = $state(false);
 	let deleting = $state(false);
 	let testState: TestState = $state(blankTestState());
+	let rangeDiagnostic: PlcRangeDiagnostic | null = $state(null);
+	let rangeDiagnosticBusy = $state(false);
+	let rangeDiagnosticRequest = 0;
 	let dbTestState: DbTestState = $state(blankDbTestState());
 	let step: 1 | 2 | 3 = $state(1);
 	/** 直前のプロトコル（ドライバを替えたときの引き継ぎの元を引く）。 */
@@ -442,6 +448,7 @@
 		errors = {};
 		driverErrors = {};
 		testState = blankTestState();
+		rangeDiagnostic = null;
 		dbTestState = blankDbTestState();
 		step = 1;
 		lastProtocol = form.protocol;
@@ -505,6 +512,7 @@
 		driverErrors = {};
 		errors = {};
 		testState = blankTestState();
+		rangeDiagnostic = null;
 	}
 
 	/** 送信前のフィールド → 該当ウィザードステップの対応（作成時のエラー誘導用）。 */
@@ -693,6 +701,53 @@
 			testState.testing = false;
 		}
 	}
+
+	async function runRangeDiagnostic(): Promise<void> {
+		const id = connection?.id;
+		if (!id || rangeDiagnosticBusy) return;
+		rangeDiagnosticBusy = true;
+		const request = ++rangeDiagnosticRequest;
+		try {
+			const result = await diagnosePlcConnection(id);
+			if (connection?.id === id && request === rangeDiagnosticRequest) rangeDiagnostic = result;
+		} catch (err) {
+			if (connection?.id === id) rangeDiagnostic = null;
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			rangeDiagnosticBusy = false;
+		}
+	}
+
+	$effect(() => {
+		const id = connection?.id;
+		if (!id) return;
+		let active = true;
+		const refresh = async () => {
+			if (rangeDiagnosticBusy) return;
+			const request = rangeDiagnosticRequest;
+			try {
+				const result = await getCurrentPlcRangeDiagnostic(id);
+				if (
+					active &&
+					connection?.id === id &&
+					request === rangeDiagnosticRequest &&
+					!rangeDiagnosticBusy
+				) {
+					rangeDiagnostic = result.status === 'current' ? result : null;
+				}
+			} catch {
+				// A transient UI request error must not turn an unknown range into a verified one.
+				if (active && connection?.id === id && request === rangeDiagnosticRequest)
+					rangeDiagnostic = null;
+			}
+		};
+		void refresh();
+		const timer = setInterval(() => void refresh(), 5_000);
+		return () => {
+			active = false;
+			clearInterval(timer);
+		};
+	});
 
 	/**
 	 * S1（docs/banto-hub-external-db-design.md §4.6）:
@@ -1258,6 +1313,59 @@
 	</div>
 {/snippet}
 
+{#snippet rangeDiagnosticBlock()}
+	{#if connection}
+		<section class="test-connection" aria-label="Device range diagnostic">
+			<button
+				type="button"
+				class="test-btn"
+				onclick={runRangeDiagnostic}
+				disabled={rangeDiagnosticBusy}
+			>
+				{rangeDiagnosticBusy ? '診断中…' : '機器の設定範囲を確認'}
+			</button>
+			{#if rangeDiagnostic?.status === 'current'}
+				<div class="test-result">
+					<div>
+						型式: {rangeDiagnostic.model?.name ?? '不明'}（{rangeDiagnostic.model?.family ??
+							rangeDiagnostic.modelReason ??
+							'理由不明'}）
+					</div>
+					<div>
+						診断は現在の接続・設定・ドライバー版にだけ有効です。範囲不明は無制限を意味しません。
+					</div>
+					{#each rangeDiagnostic.counts ?? [] as count (count.area)}
+						<div>
+							{count.area}: {count.bound === 'unknown'
+								? `不明 (${count.reason ?? '理由不明'})`
+								: `${count.points} ${count.unit} (${count.bound === 'exact' ? '確定' : '最低点数'})`}
+							— {count.source || count.scope}
+						</div>
+					{/each}
+					<details>
+						<summary>タグ別の範囲判定（{rangeDiagnostic.tags?.length ?? 0}件）</summary>
+						<ul>
+							{#each rangeDiagnostic.tags ?? [] as tag (tag.tagId)}
+								<li>
+									{tag.address}: {tag.verdict === 'inside'
+										? '範囲内'
+										: tag.verdict === 'outside'
+											? '範囲外'
+											: '判定不能'} — {tag.reason}
+								</li>
+							{/each}
+						</ul>
+					</details>
+				</div>
+			{:else if rangeDiagnostic}
+				<span class="test-result"
+					>{rangeDiagnostic.reason ?? 'この接続では診断を利用できません'}</span
+				>
+			{/if}
+		</section>
+	{/if}
+{/snippet}
+
 {#snippet dbTestConnectionBlock()}
 	<!--
 		S1（docs/banto-hub-external-db-design.md §4.6、実装指示3）: 保存済み
@@ -1373,6 +1481,7 @@
 				{@render dbTestConnectionBlock()}
 			{:else if driver}
 				{@render testConnectionBlock()}
+				{@render rangeDiagnosticBlock()}
 			{/if}
 		{/if}
 
@@ -1417,6 +1526,7 @@
 				{@render dbTestConnectionBlock()}
 			{:else if driver}
 				{@render testConnectionBlock()}
+				{@render rangeDiagnosticBlock()}
 			{/if}
 			<div class="actions">
 				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>

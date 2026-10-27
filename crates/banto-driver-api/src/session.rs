@@ -70,6 +70,30 @@ pub trait SessionDriver: DriverBase {
 /// One live connection (what `banto-broker`'s job loop runs since R2b-3a-2).
 /// Owned by one host task, which serializes reads and writes (`&mut self`).
 pub trait Session: Send + 'static {
+    /// Reacquire device evidence on the existing physical session before a
+    /// new diagnostic attempt. Old drivers have no optional diagnostics.
+    fn refresh_diagnostic<'a>(&'a mut self) -> BoxFuture<'a, Result<(), FatalError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Optional read-only diagnostic on the same connection as normal reads.
+    /// `None` means the driver has no diagnostic contract, not an unlimited
+    /// range or successful validation.
+    fn diagnose_batch<'a>(
+        &'a mut self,
+        _specs: &'a [TagSpec],
+    ) -> BoxFuture<'a, Result<Option<crate::DiagnosticReport>, FatalError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    /// Apply a diagnostic only after its caller has accepted the complete
+    /// report. A timed-out or superseded diagnostic must have no read effect.
+    fn accept_diagnostic(&mut self, _specs: &[TagSpec], _report: &crate::DiagnosticReport) {}
+
+    /// Drop a previously accepted diagnostic when publication lost its
+    /// catalog/driver generation race.
+    fn discard_diagnostic(&mut self) {}
+
     /// Read `specs`. `Ok` has `specs.len()` results in `specs` order; `Err`
     /// is connection-fatal.
     fn read_batch<'a>(

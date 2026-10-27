@@ -22,8 +22,16 @@ use api::{
     ItemError, KindName, Planned, PrefixEncoding, PrefixSpec, RawValue, SettingField, SettingValue,
     Settings, SettingsSchema, Step, TagKind, TagSpec, WriteItem, WriteProgress,
 };
+use api::{
+    AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
+    TagVerdict,
+};
 use banto_driver_api as api;
 use operational_write::{WriteArea, WritePolicy, ALLOWLIST_KEY, MODE_KEY};
+use runtime::diagnostics_v1::{
+    banto::driver::types as diagnostic_types,
+    exports::banto::driver::{diagnostics_v1 as diagnostic, session as diagnostic_session},
+};
 use runtime::write_v1::{
     banto::driver::types as write_types,
     exports::banto::driver::{session as write_session, write_v1 as write},
@@ -568,6 +576,66 @@ fn api_step(step: session::Step) -> Step {
     Step::new(step.send, rule, step.max_len)
 }
 
+fn diagnostic_step(step: diagnostic_session::Step) -> Step {
+    let rule = match step.expect {
+        diagnostic_session::FrameRule::None => FrameRule::None,
+        diagnostic_session::FrameRule::Fixed(n) => FrameRule::Fixed(n),
+        diagnostic_session::FrameRule::LengthPrefixed(p) => FrameRule::LengthPrefixed(
+            PrefixSpec::new(p.offset, p.width, p.big_endian, p.adjust).with_encoding(
+                match p.encoding {
+                    diagnostic_session::PrefixEncoding::Binary => PrefixEncoding::Binary,
+                    diagnostic_session::PrefixEncoding::AsciiHex => PrefixEncoding::AsciiHex,
+                    diagnostic_session::PrefixEncoding::AsciiDec => PrefixEncoding::AsciiDec,
+                },
+            ),
+        ),
+        diagnostic_session::FrameRule::Terminator(bytes) => FrameRule::Terminator(bytes),
+        diagnostic_session::FrameRule::PluginDecides => FrameRule::DriverDecides,
+    };
+    Step::new(step.send, rule, step.max_len)
+}
+
+fn diagnostic_report(report: diagnostic::Report) -> DiagnosticReport {
+    DiagnosticReport {
+        model: report.model.map(|m| DiagnosticModel {
+            raw_name: m.raw_name,
+            name: m.name,
+            code: m.code,
+            family: m.family,
+        }),
+        model_reason: report.model_reason,
+        counts: report
+            .counts
+            .into_iter()
+            .map(|c| AreaCount {
+                area: c.area,
+                scope: c.scope,
+                unit: c.unit,
+                source: c.source,
+                bound: match c.bound {
+                    diagnostic::CountBound::Exact(n) => CountBound::Exact(n),
+                    diagnostic::CountBound::AtLeast(n) => CountBound::AtLeast(n),
+                    diagnostic::CountBound::Unknown(r) => CountBound::Unknown(r),
+                },
+            })
+            .collect(),
+        tags: report
+            .tags
+            .into_iter()
+            .map(|t| TagDiagnostic {
+                address: t.address,
+                verdict: match t.verdict {
+                    diagnostic::TagVerdict::Inside(r) => TagVerdict::Inside(r),
+                    diagnostic::TagVerdict::Outside(r) => TagVerdict::Outside(r),
+                    diagnostic::TagVerdict::Unknown(r) => TagVerdict::Unknown(r),
+                    diagnostic::TagVerdict::Invalid(r) => TagVerdict::Invalid(r),
+                    diagnostic::TagVerdict::Unsupported(r) => TagVerdict::Unsupported(r),
+                },
+            })
+            .collect(),
+    }
+}
+
 fn wit_step(step: &Step) -> Result<session::Step, FatalError> {
     let rule = match &step.expect {
         FrameRule::None => session::FrameRule::None,
@@ -699,8 +767,8 @@ fn controlled_write_item(
     Ok(checked)
 }
 
-/// Require an entire contiguous request to fit inside one saved connection's
-/// explicit D or W u16 interval before the guest can plan a write frame.
+/// Validate every value and its complete word/bit span against the saved
+/// connection policy before allowing the guest to plan a frame.
 fn operational_write_item(
     items: &[WriteItem],
     driver_id: &DriverId,
@@ -709,7 +777,7 @@ fn operational_write_item(
     let refused = || {
         WriteProgress::Done(vec![
             Err(ItemError::Unsupported(
-                "D/W u16 write is disabled or outside the connection allowlist".into(),
+                "SLMP write is disabled or outside the connection allowlist".into(),
             ));
             items.len()
         ])
@@ -722,38 +790,100 @@ fn operational_write_item(
     }) else {
         return Err(refused());
     };
-    if !policy.allows_device_span(area, start, items.len()) {
+    if items.len()
+        > if area.is_bit() {
+            operational_write::MAX_BITS
+        } else {
+            operational_write::MAX_WORDS
+        }
+    {
         return Err(refused());
     }
     let mut checked = Vec::with_capacity(items.len());
-    for (offset, item) in items.iter().enumerate() {
-        let index = start + offset as u32; // bounded by allows_device_span
+    let mut next = start;
+    for item in items {
         let address = &item.spec.address;
+        let TagKind::Numeric(kind) = &item.spec.kind else {
+            return Err(refused());
+        };
+        let kind = *kind;
+        let width = if area.is_bit() {
+            if kind != DataType::Bit {
+                return Err(refused());
+            }
+            1_u32
+        } else {
+            if kind == DataType::Bit {
+                return Err(refused());
+            }
+            u32::from(kind.register_span())
+        };
         if address.driver != *driver_id
-            || address.index != Some(u64::from(index))
-            || address.canonical != area.canonical(index)
+            || address.index != Some(u64::from(next))
+            || address.canonical != area.canonical(next)
             || WriteArea::from_name(&address.area) != Some(area)
             || address.bit.is_some()
-            || address.word_count != 1
+            || u32::from(address.word_count) != width
             || !address.writable_area
-            || !matches!(item.spec.kind, TagKind::Numeric(DataType::U16))
         {
             return Err(refused());
         }
-        let api::Value::F64(value) = item.value else {
-            return Err(refused());
+        let value = match (kind, &item.value) {
+            (DataType::Bit, api::Value::Bit(bit)) if area.is_bit() => {
+                write_types::Value::Bool(*bit)
+            }
+            (DataType::I16 | DataType::I32 | DataType::I64, api::Value::F64(value))
+                if !area.is_bit()
+                    && value.is_finite()
+                    && value.fract() == 0.0
+                    && value.abs() <= 9_007_199_254_740_991.0
+                    && match kind {
+                        DataType::I16 => (-32768.0..=32767.0).contains(value),
+                        DataType::I32 => (-2147483648.0..=2147483647.0).contains(value),
+                        _ => true,
+                    } =>
+            {
+                write_types::Value::Float(*value)
+            }
+            (DataType::U16 | DataType::U32 | DataType::U64, api::Value::F64(value))
+                if !area.is_bit()
+                    && value.is_finite()
+                    && value.fract() == 0.0
+                    && (0.0..=match kind {
+                        DataType::U16 => 65535.0,
+                        DataType::U32 => 4294967295.0,
+                        _ => 9_007_199_254_740_991.0,
+                    })
+                        .contains(value) =>
+            {
+                write_types::Value::Float(*value)
+            }
+            (DataType::F32, api::Value::F64(value))
+                if !area.is_bit() && value.is_finite() && (*value as f32).is_finite() =>
+            {
+                write_types::Value::Float(*value)
+            }
+            (DataType::F64, api::Value::F64(value)) if !area.is_bit() && value.is_finite() => {
+                write_types::Value::Float(*value)
+            }
+            _ => return Err(refused()),
         };
-        if !value.is_finite() || value.fract() != 0.0 || !(0.0..=65535.0).contains(&value) {
-            return Err(refused());
-        }
         checked.push(write::WriteItem {
             spec: write_types::TagSpec {
                 address: address.canonical.clone(),
-                data_type: "u16".into(),
+                data_type: kind.to_string(),
                 string_words: None,
             },
-            value: write_types::Value::Float(value),
+            value,
         });
+        next = next.checked_add(width).ok_or_else(refused)?;
+    }
+    if !policy.allows_device_span(
+        area,
+        start,
+        usize::try_from(next - start).map_err(|_| refused())?,
+    ) {
+        return Err(refused());
     }
     Ok(checked)
 }
@@ -943,6 +1073,7 @@ impl FrameDriver for WasmDriver {
         Ok(Box::new(WasmConnection {
             instance: Mutex::new(instance),
             resource,
+            settings: settings.clone(),
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
             controlled_write_target: self.controlled_write_target,
@@ -955,6 +1086,7 @@ impl FrameDriver for WasmDriver {
 struct WasmConnection {
     instance: Mutex<Instance>,
     resource: wasmtime::component::ResourceAny,
+    settings: Settings,
     runtime: Arc<Runtime>,
     failed: AtomicBool,
     controlled_write_target: ControlledWriteTarget,
@@ -986,6 +1118,86 @@ impl WasmConnection {
 }
 
 impl FrameConnection for WasmConnection {
+    fn refresh_for_diagnostic(&mut self) -> Result<bool, FatalError> {
+        if !self.runtime.diagnostics_available() {
+            return Ok(false);
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(FatalError::Protocol("WASM connection was discarded".into()));
+        }
+        let mut locked = self
+            .instance
+            .lock()
+            .map_err(|_| FatalError::Protocol("WASM store lock poisoned".into()))?;
+        let instance = &mut *locked;
+        instance.store.set_epoch_deadline(100);
+        let resource = instance
+            .driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut instance.store, &wit_settings(&self.settings))
+            .map_err(|e| {
+                self.failed.store(true, Ordering::Release);
+                normalize(self.runtime.record("diagnostics.connection.create", e))
+            })?
+            .map_err(api_fatal)?;
+        let previous = std::mem::replace(&mut self.resource, resource);
+        if let Err(error) = previous.resource_drop(&mut instance.store) {
+            self.failed.store(true, Ordering::Release);
+            return Err(normalize(
+                self.runtime.record("diagnostics.connection.drop", error),
+            ));
+        }
+        Ok(true)
+    }
+
+    fn supports_diagnostics(&self) -> bool {
+        self.runtime.diagnostics_available()
+    }
+
+    fn diagnose_next(
+        &mut self,
+        specs: &[TagSpec],
+        prev_response: Option<&[u8]>,
+    ) -> Result<DiagnosticProgress, FatalError> {
+        if !self.runtime.diagnostics_available() {
+            return Err(FatalError::Protocol("range diagnostics unsupported".into()));
+        }
+        if specs.len() > 256 {
+            return Err(FatalError::Protocol("too many diagnostic tags".into()));
+        }
+        let wit_specs: Vec<diagnostic_types::TagSpec> = specs
+            .iter()
+            .map(|spec| {
+                let (data_type, string_words) = kind_parts(&spec.kind);
+                diagnostic_types::TagSpec {
+                    address: spec.address.canonical.clone(),
+                    data_type,
+                    string_words,
+                }
+            })
+            .collect();
+        let progress = self
+            .call("diagnostics-v1.diagnose-next", |i, resource| {
+                i.diagnostic_driver
+                    .as_ref()
+                    .expect("diagnostics export bound before capability enablement")
+                    .banto_driver_diagnostics_v1()
+                    .call_diagnose_next(&mut i.store, resource, &wit_specs, prev_response)
+            })?
+            .map_err(|e| match e {
+                diagnostic_types::FatalError::Framing(m) => FatalError::Framing(m),
+                diagnostic_types::FatalError::Protocol(m) => FatalError::Protocol(m),
+                diagnostic_types::FatalError::InvalidConfig(m) => FatalError::InvalidConfig(m),
+            })?;
+        match progress {
+            diagnostic::Progress::Send(step) => Ok(DiagnosticProgress::Send(diagnostic_step(step))),
+            diagnostic::Progress::Done(report) => {
+                Ok(DiagnosticProgress::Done(diagnostic_report(report)))
+            }
+        }
+    }
+
     fn write_next(
         &mut self,
         items: &[WriteItem],
@@ -1168,6 +1380,111 @@ mod tests {
             TagSpec::new(address, TagKind::numeric(DataType::U16)),
             value,
         )
+    }
+
+    fn typed_item(area: WriteArea, index: u64, kind: DataType, value: api::Value) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let address = DriverAddress::new(
+            id,
+            area.canonical(index as u32),
+            match area {
+                WriteArea::D => "D",
+                WriteArea::W => "W",
+                WriteArea::M => "M",
+                WriteArea::Y => "Y",
+                WriteArea::L => "L",
+                WriteArea::B => "B",
+            },
+            true,
+            kind.register_span(),
+        )
+        .with_index(index);
+        WriteItem::new(TagSpec::new(address, TagKind::numeric(kind)), value)
+    }
+
+    #[test]
+    fn operational_typed_words_check_full_span_and_exact_integer_boundary() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let policy = WritePolicy::parse(
+            &Settings::from_pairs([
+                (MODE_KEY, "enabled"),
+                (ALLOWLIST_KEY, "D3010-D3019,W1A-W1F"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let valid = [
+            typed_item(WriteArea::D, 3010, DataType::I32, api::Value::F64(-2.0)),
+            typed_item(
+                WriteArea::D,
+                3012,
+                DataType::U64,
+                api::Value::F64(9_007_199_254_740_991.0),
+            ),
+            typed_item(WriteArea::D, 3016, DataType::F32, api::Value::F64(1.5)),
+            typed_item(WriteArea::D, 3018, DataType::U16, api::Value::F64(65535.0)),
+        ];
+        let accepted = operational_write_item(&valid, &id, &policy).unwrap();
+        assert_eq!(accepted.len(), 4);
+        assert_eq!(accepted[0].spec.data_type, "i32");
+        assert_eq!(accepted[1].spec.data_type, "u64");
+        let mut bad = valid.to_vec();
+        bad[1].value = api::Value::F64(9_007_199_254_740_992.0);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        bad = valid.to_vec();
+        bad[1].spec.address.word_count = 2;
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        bad = valid.to_vec();
+        bad[1].spec.address.index = Some(3013);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        bad = valid.to_vec();
+        bad[2].value = api::Value::F64(f64::INFINITY);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        let protected = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "D2999-D2999")]).unwrap(),
+        )
+        .unwrap();
+        assert!(operational_write_item(
+            &[typed_item(
+                WriteArea::D,
+                2999,
+                DataType::U32,
+                api::Value::F64(1.0)
+            ),],
+            &id,
+            &protected
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn operational_bits_are_bool_only_and_atomically_preflighted() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let old = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "D3010-D3013")]).unwrap(),
+        )
+        .unwrap();
+        let valid = [
+            typed_item(WriteArea::M, 10, DataType::Bit, api::Value::Bit(true)),
+            typed_item(WriteArea::M, 11, DataType::Bit, api::Value::Bit(false)),
+        ];
+        assert!(operational_write_item(&valid, &id, &old).is_err());
+        let policy = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "M10-M17")]).unwrap(),
+        )
+        .unwrap();
+        let accepted = operational_write_item(&valid, &id, &policy).unwrap();
+        assert!(matches!(accepted[0].value, write_types::Value::Bool(true)));
+        assert!(matches!(accepted[1].value, write_types::Value::Bool(false)));
+        let mut bad = valid.to_vec();
+        bad[1].value = api::Value::F64(0.0);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        bad = valid.to_vec();
+        bad[1].spec.address.bit = Some(0);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
+        bad = valid.to_vec();
+        bad[1].spec.address.index = Some(12);
+        assert!(operational_write_item(&bad, &id, &policy).is_err());
     }
 
     #[test]

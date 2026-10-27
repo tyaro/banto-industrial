@@ -20,6 +20,12 @@ pub(crate) mod write_v1 {
     wasmtime::component::bindgen!({ path: "wit", world: "driver-with-write-v1" });
 }
 
+/// Optional read-only diagnostic interface, bound to the same instance and
+/// connection resource as the legacy read and write interfaces.
+pub(crate) mod diagnostics_v1 {
+    wasmtime::component::bindgen!({ path: "wit", world: "driver-with-diagnostics-v1" });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeCause {
     Trap,
@@ -116,12 +122,14 @@ pub struct Instance {
     pub store: Store<HostState>,
     pub driver: Driver,
     pub write_driver: Option<write_v1::DriverWithWriteV1>,
+    pub diagnostic_driver: Option<diagnostics_v1::DriverWithDiagnosticsV1>,
 }
 
 pub struct Runtime {
     engine: Engine,
     component: Component,
     write_requested: bool,
+    diagnostics_available: bool,
     diagnostics: Diagnostics,
     ticking: Arc<AtomicBool>,
     ticker: Option<std::thread::JoinHandle<()>>,
@@ -133,6 +141,9 @@ impl Runtime {
         config.wasm_component_model(true).epoch_interruption(true);
         let engine = Engine::new(&config).map_err(|e| classify("engine", e))?;
         let component = Component::new(&engine, bytes).map_err(|e| classify("compile", e))?;
+        let diagnostics_available = component
+            .get_export_index(None, "banto:driver/diagnostics-v1@1.0.0")
+            .is_some();
         let ticking = Arc::new(AtomicBool::new(true));
         let tick_enabled = ticking.clone();
         let tick_engine = engine.clone();
@@ -146,6 +157,7 @@ impl Runtime {
             engine,
             component,
             write_requested,
+            diagnostics_available,
             diagnostics: Diagnostics(Arc::new(Mutex::new(VecDeque::new()))),
             ticking,
             ticker: Some(ticker),
@@ -154,6 +166,10 @@ impl Runtime {
 
     pub fn diagnostics(&self) -> Diagnostics {
         self.diagnostics.clone()
+    }
+
+    pub fn diagnostics_available(&self) -> bool {
+        self.diagnostics_available
     }
 
     pub fn instantiate(&self) -> Result<Instance, RuntimeError> {
@@ -183,10 +199,16 @@ impl Runtime {
             .then(|| write_v1::DriverWithWriteV1::new(&mut store, &component_instance))
             .transpose()
             .map_err(|e| self.record("bind-write-v1", e))?;
+        let diagnostic_driver = self
+            .diagnostics_available
+            .then(|| diagnostics_v1::DriverWithDiagnosticsV1::new(&mut store, &component_instance))
+            .transpose()
+            .map_err(|e| self.record("bind-diagnostics-v1", e))?;
         Ok(Instance {
             store,
             driver,
             write_driver,
+            diagnostic_driver,
         })
     }
 

@@ -1146,3 +1146,42 @@ export async function testPlcConnection(
 		body: input
 	});
 }
+
+/** Optional, session-bound range information. Confirmed outside tags become Bad. */
+export interface PlcRangeDiagnostic {
+	status: 'current' | 'unavailable' | 'unsupported';
+	reason?: string;
+	catalogRevision?: number;
+	driverVersion?: string;
+	model?: { name: string; code: number; family: string; rawName: number[] } | null;
+	modelReason?: string | null;
+	counts?: Array<{
+		area: string;
+		scope: string;
+		unit: string;
+		bound: 'exact' | 'atLeast' | 'unknown';
+		points: number | null;
+		reason: string | null;
+		source: string;
+	}>;
+	tags?: Array<{
+		tagId: number;
+		address: string;
+		verdict: 'inside' | 'outside' | 'unknown' | 'invalid' | 'unsupported';
+		reason: string;
+	}>;
+}
+
+/** Reuse the running broker connection; this never opens another PLC socket. */
+export async function diagnosePlcConnection(id: number): Promise<PlcRangeDiagnostic> {
+	return httpRequest<PlcRangeDiagnostic>(`/api/plc-connections/${id}/diagnostics`, {
+		method: 'POST',
+		body: { tagIds: [] }
+	});
+}
+
+export async function getCurrentPlcRangeDiagnostic(id: number): Promise<PlcRangeDiagnostic> {
+	return httpRequest<PlcRangeDiagnostic>(`/api/plc-connections/${id}/diagnostics`, {
+		method: 'GET'
+	});
+}
