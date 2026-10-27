@@ -547,7 +547,7 @@ impl Flusher {
             match insert_batch(&self.pool, &group.table, &batch).await {
                 Ok(()) => {
                     // commit されてからキューを進める（at-least-once）。
-                    group.commit_batch(batch.len());
+                    group.commit_batch(&batch);
                     if group.mark_flushed(now_ms()) {
                         log_line(&format!(
                             "banto-hub-sink: グループ {} (id={}) の保存を再開しました",
