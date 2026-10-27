@@ -5,12 +5,36 @@ mod tls_fixture;
 
 use std::time::Duration;
 
+use banto_hub_sink::config::ConfigError;
 use banto_hub_sink::hub_api::{HubApi, SinkStatusPush};
 use banto_hub_sink::SidecarConfig;
 use tls_fixture::TlsFixture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+
+#[test]
+fn installer_template_requires_a_pin_even_with_a_dummy_api_key() {
+    let template = include_str!("../../banto-hub/installer/assets/banto-hub-sink.toml.example");
+    assert!(template.contains("hub_url = \"https://127.0.0.1:9443\""));
+    assert!(template.contains("hub_tls_pinned_certs = []"));
+    assert!(template.contains("api_key = \"\""));
+
+    // Provisioning the API key alone must not make the shipped template runnable.
+    let provisioned_key = template.replacen("api_key = \"\"", "api_key = \"bh_dummy.secret\"", 1);
+    let error = SidecarConfig::from_toml_str(
+        &provisioned_key,
+        std::path::Path::new("banto-hub-sink.toml"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ConfigError::Invalid {
+            field: "hub_tls_pinned_certs",
+            ..
+        }
+    ));
+}
 
 async fn status_listener(cert: &TlsFixture) -> (u16, tokio::task::JoinHandle<String>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
