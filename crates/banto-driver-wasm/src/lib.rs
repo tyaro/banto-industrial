@@ -4,6 +4,7 @@
 //! The host owns transport, timeouts and frame limits.
 
 mod manifest;
+mod modbus_write;
 mod operational_write;
 mod runtime;
 
@@ -291,8 +292,12 @@ impl WasmDriver {
             .map_err(|e| LoadError::Runtime(runtime.record("address.supported-kinds", e)))?
             .into_iter()
             .map(|s| {
-                KindName::parse(&s)
-                    .ok_or_else(|| LoadError::Contract(format!("unknown supported kind: {s}")))
+                (if manifest.descriptor.id.as_str() == "modbus-fc3-wasm" && s == "bool" {
+                    Some(KindName::Numeric(DataType::Bit))
+                } else {
+                    KindName::parse(&s)
+                })
+                .ok_or_else(|| LoadError::Contract(format!("unknown supported kind: {s}")))
             })
             .collect::<Result<Vec<_>, _>>()?;
         validate_supported_kinds(&supported)?;
@@ -301,7 +306,7 @@ impl WasmDriver {
             .banto_driver_config()
             .call_secret_keys(&mut instance.store)
             .map_err(|e| LoadError::Runtime(runtime.record("config.secret-keys", e)))?;
-        let fields: Vec<SettingField> = instance
+        let mut fields: Vec<SettingField> = instance
             .driver
             .banto_driver_config()
             .call_schema(&mut instance.store)
@@ -311,7 +316,12 @@ impl WasmDriver {
             .collect();
         validate_secret_fields(&fields, &secrets)?;
         if controlled_write_target == ControlledWriteTarget::Operational {
-            validate_operational_schema(&fields, &secrets)?;
+            if manifest.descriptor.id.as_str() == "modbus-fc3-wasm" {
+                modbus_write::validate_guest_schema(&fields, &secrets)?;
+                fields.extend(modbus_write::schema_fields());
+            } else {
+                validate_operational_schema(&fields, &secrets)?;
+            }
         }
         // Only expose write capability after the extended world has actually
         // bound on this component. The manifest alone never grants it.
@@ -527,19 +537,20 @@ fn wit_settings(settings: &Settings) -> Vec<types::Setting> {
         .collect()
 }
 
-fn kind_parts(kind: &TagKind) -> (String, Option<u32>) {
+fn kind_parts(kind: &TagKind, modbus_bool: bool) -> (String, Option<u32>) {
     match kind {
+        TagKind::Numeric(DataType::Bit) if modbus_bool => ("bool".into(), None),
         TagKind::Numeric(value) => (value.to_string(), None),
         TagKind::Str { words, .. } => ("string".into(), Some(u32::from(*words))),
         _ => ("unsupported".into(), None),
     }
 }
 
-fn wit_specs(specs: &[TagSpec]) -> Vec<types::TagSpec> {
+fn wit_specs(specs: &[TagSpec], modbus_bool: bool) -> Vec<types::TagSpec> {
     specs
         .iter()
         .map(|spec| {
-            let (data_type, string_words) = kind_parts(&spec.kind);
+            let (data_type, string_words) = kind_parts(&spec.kind, modbus_bool);
             types::TagSpec {
                 address: spec.address.canonical.clone(),
                 data_type,
@@ -946,7 +957,12 @@ impl DriverBase for WasmDriver {
             )],
         };
         if self.controlled_write_target == ControlledWriteTarget::Operational {
-            if let Err((key, reason)) = WritePolicy::parse(settings) {
+            let result = if self.descriptor.id.as_str() == "modbus-fc3-wasm" {
+                modbus_write::Policy::parse(settings).map(|_| ())
+            } else {
+                WritePolicy::parse(settings).map(|_| ())
+            };
+            if let Err((key, reason)) = result {
                 errors.push(FieldError::new(key, reason));
             }
         }
@@ -958,7 +974,8 @@ impl DriverBase for WasmDriver {
     }
 
     fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
-        let (data_type, string_words) = kind_parts(kind);
+        let (data_type, string_words) =
+            kind_parts(kind, self.descriptor.id.as_str() == "modbus-fc3-wasm");
         let result = self
             .with_instance("address.parse", |i| {
                 i.driver.banto_driver_address().call_parse(
@@ -1001,7 +1018,8 @@ impl DriverBase for WasmDriver {
         kind: &TagKind,
         n: i64,
     ) -> Result<String, AddressError> {
-        let (data_type, string_words) = kind_parts(kind);
+        let (data_type, string_words) =
+            kind_parts(kind, self.descriptor.id.as_str() == "modbus-fc3-wasm");
         self.with_instance("address.offset", |i| {
             i.driver.banto_driver_address().call_offset(
                 &mut i.store,
@@ -1053,15 +1071,28 @@ impl FrameDriver for WasmDriver {
                 "controlled WASM write fixture endpoint mismatch".into(),
             ));
         }
-        let operational_write_policy =
-            if self.controlled_write_target == ControlledWriteTarget::Operational {
-                Some(
-                    WritePolicy::parse(settings)
-                        .map_err(|(_, reason)| FatalError::InvalidConfig(reason.into()))?,
-                )
-            } else {
-                None
-            };
+        let operational_write_policy = if self.controlled_write_target
+            == ControlledWriteTarget::Operational
+            && self.descriptor.id.as_str() != "modbus-fc3-wasm"
+        {
+            Some(
+                WritePolicy::parse(settings)
+                    .map_err(|(_, reason)| FatalError::InvalidConfig(reason.into()))?,
+            )
+        } else {
+            None
+        };
+        let modbus_write_policy = if self.controlled_write_target
+            == ControlledWriteTarget::Operational
+            && self.descriptor.id.as_str() == "modbus-fc3-wasm"
+        {
+            Some(
+                modbus_write::Policy::parse(settings)
+                    .map_err(|(_, reason)| FatalError::InvalidConfig(reason.into()))?,
+            )
+        } else {
+            None
+        };
         let mut instance = self.runtime.instantiate().map_err(normalize)?;
         let resource = instance
             .driver
@@ -1078,6 +1109,7 @@ impl FrameDriver for WasmDriver {
             failed: AtomicBool::new(false),
             controlled_write_target: self.controlled_write_target,
             operational_write_policy,
+            modbus_write_policy,
             driver_id: self.descriptor.id.clone(),
         }))
     }
@@ -1091,6 +1123,7 @@ struct WasmConnection {
     failed: AtomicBool,
     controlled_write_target: ControlledWriteTarget,
     operational_write_policy: Option<WritePolicy>,
+    modbus_write_policy: Option<modbus_write::Policy>,
     driver_id: DriverId,
 }
 
@@ -1169,7 +1202,8 @@ impl FrameConnection for WasmConnection {
         let wit_specs: Vec<diagnostic_types::TagSpec> = specs
             .iter()
             .map(|spec| {
-                let (data_type, string_words) = kind_parts(&spec.kind);
+                let (data_type, string_words) =
+                    kind_parts(&spec.kind, self.driver_id.as_str() == "modbus-fc3-wasm");
                 diagnostic_types::TagSpec {
                     address: spec.address.canonical.clone(),
                     data_type,
@@ -1211,7 +1245,9 @@ impl FrameConnection for WasmConnection {
                 items.len()
             ]));
         }
-        let checked = match if let Some(policy) = &self.operational_write_policy {
+        let checked = match if let Some(policy) = &self.modbus_write_policy {
+            modbus_write::preflight(items, &self.driver_id, policy)
+        } else if let Some(policy) = &self.operational_write_policy {
             operational_write_item(items, &self.driver_id, policy)
         } else {
             controlled_write_item(items, &self.driver_id, self.controlled_write_target)
@@ -1281,9 +1317,11 @@ impl FrameConnection for WasmConnection {
 
     fn plan_read(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, FatalError> {
         self.call("read.plan", |i, resource| {
-            i.driver
-                .banto_driver_read()
-                .call_plan(&mut i.store, resource, &wit_specs(specs))
+            i.driver.banto_driver_read().call_plan(
+                &mut i.store,
+                resource,
+                &wit_specs(specs, self.driver_id.as_str() == "modbus-fc3-wasm"),
+            )
         })?
         .map(|plans| {
             plans
@@ -1307,7 +1345,7 @@ impl FrameConnection for WasmConnection {
                     &mut i.store,
                     resource,
                     &plan,
-                    &wit_specs(specs),
+                    &wit_specs(specs, self.driver_id.as_str() == "modbus-fc3-wasm"),
                     response,
                 )
             })?
