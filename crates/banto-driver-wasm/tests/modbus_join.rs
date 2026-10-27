@@ -4,12 +4,12 @@
 //! responses are synthesized here; no socket or PLC is opened.
 
 use banto_driver_api::{
-    DataType, DriverBase, FrameDriver, RawValue, Settings, TagKind, TagSpec, Value, WriteItem,
-    WriteProgress,
+    DataType, DriverBase, FatalError, FrameConnection, FrameDriver, ItemError, RawValue, Settings,
+    TagKind, TagSpec, Value, WriteItem, WriteProgress,
 };
 use banto_driver_wasm::WasmDriver;
 
-const READ_MANIFEST: &[u8] = br#"{"manifestVersion":1,"id":"modbus-fc3-wasm","version":"0.4.0","hubApi":"1","settingsVersion":1,"displayName":"Modbus simulated join","transports":["tcp"],"capabilities":["read"]}"#;
+const READ_MANIFEST: &[u8] = br#"{"manifestVersion":1,"id":"modbus-fc3-wasm","version":"0.5.0","hubApi":"1","settingsVersion":1,"displayName":"Modbus simulated join","transports":["tcp"],"capabilities":["read"]}"#;
 
 fn write_manifest() -> Vec<u8> {
     std::fs::read(std::env::var("BANTO_MODBUS_MANIFEST").expect("BANTO_MODBUS_MANIFEST"))
@@ -181,7 +181,7 @@ fn write_world_gates_fc5_fc16_before_send_and_checks_ack() {
 
 #[test]
 #[ignore = "requires the pinned Modbus WASM package files"]
-fn register_bits_round_trip_and_reject_writes_before_send() {
+fn register_bits_round_trip_and_holding_bit_writes_use_fc22() {
     let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
     let mut conn = driver.create_connection(&settings("30001", true)).unwrap();
     for (address, canonical, bit, function) in [
@@ -206,7 +206,206 @@ fn register_bits_round_trip_and_reject_writes_before_send() {
             );
         }
         let item = WriteItem::new(tag, Value::Bit(true));
-        assert!(matches!(conn.write_next(&[item], None).unwrap(),
-            WriteProgress::Done(results) if results.iter().all(Result::is_err)));
+        match conn.write_next(std::slice::from_ref(&item), None).unwrap() {
+            // Until #44 (the 02a92645 pin) every register-bit write was
+            // refused here before send. A holding bit now becomes one FC22.
+            WriteProgress::Send(plan) if function == 3 => {
+                assert_eq!(plan.step.send[6..], [1, 22, 0, 0, 0xff, 0xfe, 0, 1]);
+                assert!(matches!(
+                    conn.write_next(&[item], Some(&plan.step.send)).unwrap(),
+                    WriteProgress::Done(results) if results == [Ok(())]
+                ));
+            }
+            // An input-register bit stays refused before send.
+            WriteProgress::Done(results) if function == 4 => {
+                assert!(results.iter().all(Result::is_err), "{results:?}");
+            }
+            other => panic!("unexpected register-bit write for {address}: {other:?}"),
+        }
+    }
+}
+
+fn bit_settings(
+    guest_mode: &str,
+    guest_allow: &str,
+    host_mode: &str,
+    host_allow: &str,
+) -> Settings {
+    Settings::from_pairs([
+        ("host", "127.0.0.1"),
+        ("port", "502"),
+        ("unit_id", "1"),
+        ("probe_address", "40001"),
+        ("write_mode", guest_mode),
+        ("write_allowlist", guest_allow),
+        ("modbus_operational_write_mode", host_mode),
+        ("modbus_operational_write_allowlist", host_allow),
+    ])
+    .unwrap()
+}
+
+fn connected(driver: &WasmDriver, settings: &Settings) -> Box<dyn FrameConnection> {
+    let mut conn = driver.create_connection(settings).unwrap();
+    let probe = conn.handshake_next(None).unwrap().unwrap();
+    assert!(conn
+        .handshake_next(Some(&read_response(&probe.send, &[2, 0, 0])))
+        .unwrap()
+        .is_none());
+    conn
+}
+
+fn bit_write(driver: &WasmDriver, address: &str, value: Value) -> WriteItem {
+    WriteItem::new(spec(driver, address, DataType::Bit), value)
+}
+
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn fc22_sets_and_clears_one_holding_bit_with_exact_masks() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let mut conn = connected(
+        &driver,
+        &bit_settings("enabled", "400001-400010", "enabled", "400001-400010"),
+    );
+    for (address, value, offset, and_mask, or_mask) in [
+        ("40002.3", true, 1_u16, 0xfff7_u16, 0x0008_u16),
+        ("40002.3", false, 1, 0xfff7, 0x0000),
+        ("40010.15", true, 9, 0x7fff, 0x8000),
+        ("40001.0", false, 0, 0xfffe, 0x0000),
+    ] {
+        let item = bit_write(&driver, address, Value::Bit(value));
+        let plan = match conn.write_next(std::slice::from_ref(&item), None).unwrap() {
+            WriteProgress::Send(plan) => plan,
+            other => panic!("expected FC22 for {address}={value}: {other:?}"),
+        };
+        assert_eq!(plan.covers, [0]);
+        let mut expected = plan.step.send[..2].to_vec();
+        expected.extend_from_slice(&[0, 0, 0, 8, 1, 22]);
+        expected.extend_from_slice(&offset.to_be_bytes());
+        expected.extend_from_slice(&and_mask.to_be_bytes());
+        expected.extend_from_slice(&or_mask.to_be_bytes());
+        assert_eq!(plan.step.send, expected, "{address}={value}");
+        // The acknowledgement echoes the whole request.
+        assert!(matches!(
+            conn.write_next(&[item], Some(&plan.step.send)).unwrap(),
+            WriteProgress::Done(results) if results == [Ok(())]
+        ));
+    }
+}
+
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn fc22_exception_is_per_item_and_a_mask_mismatch_poisons_writes() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let mut conn = connected(
+        &driver,
+        &bit_settings("enabled", "400001-400010", "enabled", "400001-400010"),
+    );
+    let item = bit_write(&driver, "40002.3", Value::Bit(true));
+    let send = |conn: &mut Box<dyn FrameConnection>| match conn
+        .write_next(std::slice::from_ref(&item), None)
+        .unwrap()
+    {
+        WriteProgress::Send(plan) => plan.step.send,
+        other => panic!("expected FC22: {other:?}"),
+    };
+
+    // A device without FC22: exception code 1 is an item-level device error
+    // and the connection keeps working.
+    let request = send(&mut conn);
+    let mut exception = request[..4].to_vec();
+    exception.extend_from_slice(&[0, 3, 1, 0x96, 1]);
+    match conn
+        .write_next(std::slice::from_ref(&item), Some(&exception))
+        .unwrap()
+    {
+        WriteProgress::Done(results) => match results.as_slice() {
+            [Err(ItemError::Device(error))] => assert_eq!(error.code, 1, "{error:?}"),
+            other => panic!("expected a device error: {other:?}"),
+        },
+        other => panic!("expected Done: {other:?}"),
+    }
+    let request = send(&mut conn);
+    assert!(matches!(
+        conn.write_next(std::slice::from_ref(&item), Some(&request)).unwrap(),
+        WriteProgress::Done(results) if results == [Ok(())]
+    ));
+
+    // An acknowledgement whose OR mask differs leaves the outcome unknown:
+    // fatal, and no further write is planned on this connection.
+    let request = send(&mut conn);
+    let mut mismatch = request.clone();
+    mismatch[13] = 0;
+    assert!(matches!(
+        conn.write_next(std::slice::from_ref(&item), Some(&mismatch)),
+        Err(FatalError::Protocol(_))
+    ));
+    assert!(matches!(
+        conn.write_next(std::slice::from_ref(&item), None),
+        Err(FatalError::Protocol(_))
+    ));
+}
+
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn register_bit_writes_are_refused_before_send_by_the_layer_that_owns_each_rule() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let refused = |settings: Settings, items: Vec<WriteItem>| -> Vec<ItemError> {
+        let mut conn = connected(&driver, &settings);
+        match conn.write_next(&items, None).unwrap() {
+            WriteProgress::Done(results) => {
+                assert_eq!(results.len(), items.len());
+                results.into_iter().map(Result::unwrap_err).collect()
+            }
+            other => panic!("a write frame was planned for {items:?}: {other:?}"),
+        }
+    };
+    let both = || bit_settings("enabled", "400001-400010", "enabled", "400001-400010");
+    let bit = |address: &str| bit_write(&driver, address, Value::Bit(true));
+    let numeric = WriteItem::new(spec(&driver, "40003", DataType::U16), Value::F64(1.0));
+
+    // The guest's own rules, reached because the host permission allows the
+    // word: guest write_mode disabled, and a word outside the guest list.
+    for (settings, item) in [
+        (
+            bit_settings("disabled", "", "enabled", "400001-400010"),
+            bit("40002.3"),
+        ),
+        (
+            bit_settings("enabled", "400001-400005", "enabled", "400001-400010"),
+            bit("40008.0"),
+        ),
+    ] {
+        let errors = refused(settings, vec![item]);
+        assert!(
+            matches!(errors.as_slice(), [ItemError::Rejected(_)]),
+            "guest refusal expected: {errors:?}"
+        );
+    }
+
+    // Rules the host gate enforces first (the guest has the same rules; its
+    // own refusal is covered by the guest's unit tests): input-register bit,
+    // mixed with numeric, two bits in one request, non-Bool value, a word
+    // outside the host list, and host permission disabled.
+    for (settings, items) in [
+        (both(), vec![bit("30001.15")]),
+        (both(), vec![bit("40001.0"), numeric.clone()]),
+        (both(), vec![bit("40001.0"), bit("40001.1")]),
+        (both(), vec![bit_write(&driver, "40001.0", Value::F64(1.0))]),
+        (
+            bit_settings("enabled", "400001-400010", "enabled", "400001-400005"),
+            vec![bit("40008.0")],
+        ),
+        (
+            bit_settings("enabled", "400001-400010", "disabled", ""),
+            vec![bit("40002.3")],
+        ),
+    ] {
+        let errors = refused(settings, items);
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, ItemError::Unsupported(_))),
+            "host refusal expected: {errors:?}"
+        );
     }
 }
