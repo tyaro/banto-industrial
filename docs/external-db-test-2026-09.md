@@ -195,7 +195,13 @@ Restart-Service BantoHub
 
 #### サービスの起動の種類（2026-10-28 オーナー決定）
 
-Hub のサービス（`BantoHub`）は普段は Manual のまま、本番の当日だけ B-15 の前に Automatic に変え、S7 が終わったら Manual に戻す。サイドカーのサービス（`BantoHubSink`）の扱いは B-15 の前にオーナーと決める。記録は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) の「サービスの起動の種類」。
+Hub のサービス（`BantoHub`）とサイドカーのサービス（`BantoHubSink`）は、普段は Manual のまま、本番の当日だけ B-15 の前に 2 本とも同じときに Automatic (Delayed Start) に変え、S7 が終わったら 2 本とも同じときに Manual に戻す。
+
+- 変えるときは管理者の PowerShell で `sc.exe config BantoHub start=delayed-auto; sc.exe config BantoHubSink start=delayed-auto`、戻すときは同じ 2 本を `start=demand` で流す（2 本を 1 行で続けて打つ）。Delayed Start は製品が自動起動にするときと同じ形（`crates/banto-service-control/src/lib.rs` の `set_delayed_auto_start`）。
+- サービスの依存関係（`DependOnService`）は足さない。足すと Hub の再起動でサイドカーまで止まり、製品の登録と違う形で試験することになる（`apps/banto-hub-sink/src/service.rs` 冒頭）。サイドカーが Hub より先に起動しても、Hub に繋がるまで待つ（間隔は最長 30 秒）。
+- 変えた後・戻した後に `sc.exe qc BantoHub` と `sc.exe qc BantoHubSink` で `START_TYPE` を読み戻す（変えた後は `AUTO_START (DELAYED)`、戻した後は `DEMAND_START`）。
+- 戻し忘れると、次の OS 起動で Hub のサービスがデスクトップシェルとぶつかり、サイドカーは Hub のいない間ずっと待ち続ける（#644 の窓が開いたままになる）ので、2 本とも必ず戻す。
+- 記録は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) の「サービスの起動の種類」。
 
 ### D. 当日の順番
 
