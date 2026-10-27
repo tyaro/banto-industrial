@@ -270,6 +270,7 @@ pub fn prevalidate_rows(rows: &[HubTagRow], registered: &HashSet<String>) -> Vec
 /// 1 行をタグの入力にする（**純関数**）。モジュール doc「登録の規則」。
 pub fn tag_input_for(row: &HubTagRow, collection_group_id: i64) -> TagInput {
     TagInput {
+        comment: None,
         name: row.name.clone(),
         collection_group_id,
         address: row.external_name.trim().to_owned(),

@@ -116,6 +116,7 @@ fn default_string_encoding() -> String {
 }
 
 const MAX_NAME_LEN: usize = 100;
+pub const MAX_COMMENT_LEN: usize = 500;
 const MIN_DECIMALS: i64 = 0;
 const MAX_DECIMALS: i64 = 6;
 /// `string_length` bounds, in 16-bit words (2 SJIS bytes per word, so 128
@@ -302,6 +303,8 @@ pub fn validate_hub_tag_address(address: &str) -> Result<(), String> {
 pub struct Tag {
     pub id: i64,
     pub name: String,
+    #[serde(default)]
+    pub comment: String,
     pub collection_group_id: i64,
     pub address: String,
     pub data_type: String,
@@ -399,6 +402,9 @@ pub struct GroupTagCount {
 #[derive(Debug, Clone, Deserialize)]
 pub struct TagInput {
     pub name: String,
+    /// None keeps the stored comment on update; Some("") explicitly clears it.
+    #[serde(default)]
+    pub comment: Option<String>,
     pub collection_group_id: i64,
     pub address: String,
     pub data_type: String,
@@ -626,6 +632,15 @@ fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<Validated
             field: "name".to_string(),
             message: max_length_message(MAX_NAME_LEN),
         });
+    }
+
+    if let Some(comment) = &input.comment {
+        if comment.chars().count() > MAX_COMMENT_LEN {
+            errors.push(FieldError {
+                field: "comment".to_string(),
+                message: max_length_message(MAX_COMMENT_LEN),
+            });
+        }
     }
 
     // Address format is protocol-dependent. Without a registry (the legacy
@@ -1749,6 +1764,7 @@ pub fn parse_tag_address(
     registry: &DriverRegistry,
 ) -> Result<NormalizedAddress, Vec<FieldError>> {
     let input = TagInput {
+        comment: None,
         // Placeholders that satisfy the rules this function ignores.
         name: "parse".to_string(),
         collection_group_id: 0,
@@ -1976,7 +1992,7 @@ fn column_map() -> ColumnMap {
 }
 
 const RESOURCE: &str = "tags";
-const COLUMNS: &str = "id, name, collection_group_id, address, data_type, string_length, \
+const COLUMNS: &str = "id, name, comment, collection_group_id, address, data_type, string_length, \
      string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, \
      writable, tag_kind, expression, retain, revision";
 const FK_MESSAGE: &str = "指定された収集グループが見つかりません";
@@ -1997,10 +2013,10 @@ const NAME_ALREADY_USED_IN_GROUP: &str = "この収集グループ内では既�
 fn insert_tag_sql() -> String {
     format!(
         "INSERT INTO tags (\
-            name, collection_group_id, address, data_type, string_length, \
+            name, comment, collection_group_id, address, data_type, string_length, \
             string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, enabled, \
             writable, tag_kind, expression, retain\
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         ) VALUES (?, COALESCE(?, ''), ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          RETURNING {COLUMNS}"
     )
 }
@@ -2025,7 +2041,7 @@ fn update_tag_sql(with_expected_revision: bool) -> String {
     };
     format!(
         "UPDATE tags SET \
-            name = ?, collection_group_id = ?, address = ?, data_type = ?, \
+            name = ?, comment = COALESCE(?, comment), collection_group_id = ?, address = ?, data_type = ?, \
             string_length = ?, string_encoding = ?, raw_lo = ?, raw_hi = ?, eng_lo = ?, eng_hi = ?, unit = ?, decimals = ?, \
             enabled = ?, \
             writable = ?, tag_kind = ?, expression = ?, retain = ?, revision = revision + 1 \
@@ -2058,6 +2074,7 @@ impl Tag {
     /// [`normalize_tag_address`].
     pub(crate) fn to_input(&self) -> TagInput {
         TagInput {
+            comment: Some(self.comment.clone()),
             name: self.name.clone(),
             collection_group_id: self.collection_group_id,
             address: self.address.clone(),
@@ -2494,6 +2511,7 @@ impl TagService {
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
             .bind(&validated.name)
+            .bind(&input.comment)
             .bind(input.collection_group_id)
             .bind(&validated.address)
             .bind(&input.data_type)
@@ -2535,6 +2553,7 @@ impl TagService {
         // 構築される文字列で外部入力は含まれない（本ファイル内の関数定義参照）。
         sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(insert_tag_sql()))
             .bind(&validated.name)
+            .bind(&input.comment)
             .bind(input.collection_group_id)
             .bind(&validated.address)
             .bind(&input.data_type)
@@ -2601,6 +2620,7 @@ impl TagService {
         // 再利用しないのでそのまま move する。
         let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql))
             .bind(&validated.name)
+            .bind(&input.comment)
             .bind(input.collection_group_id)
             .bind(&validated.address)
             .bind(&input.data_type)
@@ -2691,6 +2711,7 @@ impl TagService {
         // 以降再利用しないので move する。
         let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql))
             .bind(&validated.name)
+            .bind(&input.comment)
             .bind(input.collection_group_id)
             .bind(&validated.address)
             .bind(&input.data_type)
@@ -3048,6 +3069,7 @@ impl TagService {
             // 固定文字列を、行ごとに使い回しているだけ（外部入力は含まれない）。
             let mut query = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&value.name)
+                .bind(&input.comment)
                 .bind(input.collection_group_id)
                 .bind(&value.address)
                 .bind(&input.data_type)
@@ -3406,6 +3428,7 @@ impl TagService {
             // 使い回しているだけ（外部入力は含まれない）。
             let row = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&value.name)
+                .bind(&input.comment)
                 .bind(input.collection_group_id)
                 .bind(&value.address)
                 .bind(&input.data_type)
@@ -3666,6 +3689,7 @@ impl TagService {
             // 使い回しているだけ（外部入力は含まれない）。
             let row = sqlx::query_as::<_, Tag>(sqlx::AssertSqlSafe(sql.as_str()))
                 .bind(&validated.name)
+                .bind(&input.comment)
                 .bind(input.collection_group_id)
                 .bind(&validated.address)
                 .bind(&input.data_type)
@@ -3801,6 +3825,7 @@ mod tests {
 
     fn sample_input(name: &str, collection_group_id: i64) -> TagInput {
         TagInput {
+            comment: None,
             name: name.to_string(),
             collection_group_id,
             address: "40001".to_string(),
@@ -3841,6 +3866,139 @@ mod tests {
 
         let fetched = svc.get(created.id).await.expect("get should succeed");
         assert_eq!(fetched, created);
+    }
+
+    #[tokio::test]
+    async fn comments_round_trip_for_every_tag_kind_and_survive_unrelated_updates() {
+        let (svc, plc_group) = setup().await;
+        let calc_group = virtual_group(&svc.pool, CALC_CONNECTION_NAME).await;
+        let mem_group = virtual_group(&svc.pool, MEM_CONNECTION_NAME).await;
+        let db_group = postgres_group(&svc.pool).await;
+        let cases = [
+            (PLC_TAG_KIND, plc_group, "40001"),
+            (COMPUTED_TAG_KIND, calc_group, ""),
+            (INTERNAL_TAG_KIND, mem_group, ""),
+            (DB_TAG_KIND, db_group, "rate"),
+        ];
+        for (kind, group, address) in cases {
+            let mut input = sample_input(kind, group);
+            input.tag_kind = kind.to_string();
+            input.address = address.to_string();
+            if kind == COMPUTED_TAG_KIND {
+                input.expression = Some("1 + 2".to_string());
+            }
+            if kind == DB_TAG_KIND {
+                input.data_type = "f32".to_string();
+            }
+            let comment = format!("設備の説明: {kind}\n<script>alert(1)</script>");
+            input.comment = Some(comment.clone());
+            let created = svc
+                .create(input.clone())
+                .await
+                .expect("create with comment");
+            assert_eq!(created.comment, comment);
+            assert_eq!(svc.get(created.id).await.unwrap().comment, comment);
+            assert_eq!(serde_json::to_value(&created).unwrap()["comment"], comment);
+
+            input.comment = None;
+            input.enabled = false;
+            let updated = svc
+                .update(created.id, input.clone())
+                .await
+                .expect("update without comment");
+            assert_eq!(updated.comment, comment);
+            let reloaded = TagService::new(svc.pool.clone());
+            assert_eq!(reloaded.get(created.id).await.unwrap().comment, comment);
+
+            input.comment = Some(String::new());
+            assert_eq!(svc.update(created.id, input).await.unwrap().comment, "");
+        }
+    }
+
+    #[tokio::test]
+    async fn comment_length_uses_unicode_characters_and_old_payloads_stay_empty() {
+        let (svc, group) = setup().await;
+        let legacy: TagInput = serde_json::from_value(json!({
+            "name": "legacy", "collection_group_id": group,
+            "address": "40001", "data_type": "i16"
+        }))
+        .unwrap();
+        let old = svc.create(legacy).await.unwrap();
+        assert_eq!(old.comment, "");
+        let mut old_json = serde_json::to_value(&old).unwrap();
+        old_json.as_object_mut().unwrap().remove("comment");
+        assert_eq!(serde_json::from_value::<Tag>(old_json).unwrap().comment, "");
+
+        let mut input = sample_input("boundary", group);
+        input.comment = Some("界".repeat(MAX_COMMENT_LEN));
+        let saved = svc.create(input.clone()).await.unwrap();
+        assert_eq!(saved.comment.chars().count(), MAX_COMMENT_LEN);
+        input.comment = Some("界".repeat(MAX_COMMENT_LEN + 1));
+        let err = svc.update(saved.id, input).await.unwrap_err();
+        assert!(
+            matches!(err, BantoError::Validation { field_errors } if field_errors.iter().any(|error| error.field == "comment"))
+        );
+        assert_eq!(svc.get(saved.id).await.unwrap().comment, saved.comment);
+        assert!(sqlx::query("UPDATE tags SET comment = ? WHERE id = ?")
+            .bind("界".repeat(MAX_COMMENT_LEN + 1))
+            .bind(saved.id)
+            .execute(&svc.pool)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn migration_adds_empty_comment_without_changing_old_rows_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tags.sqlite3");
+        let pool = banto_storage::connect_sqlite(&path).await.unwrap();
+        crate::migrate_to(&pool, 26).await.unwrap();
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "PLC1".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "10.0.0.1".to_string(),
+                port: 502,
+                unit_id: 1,
+                enabled: true,
+                simulation: false,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            })
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "G1".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 1_000,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tags (name, collection_group_id, address, data_type) VALUES ('old', ?, '40001', 'i16')",
+        )
+        .bind(group.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        migrate(&pool).await.unwrap();
+        let before = TagService::new(pool.clone()).get(1).await.unwrap();
+        assert_eq!(before.comment, "");
+        assert_eq!(before.name, "old");
+        assert_eq!(before.address, "40001");
+        pool.close().await;
+
+        let reopened = banto_storage::connect_sqlite(&path).await.unwrap();
+        migrate(&reopened).await.unwrap();
+        assert_eq!(TagService::new(reopened).get(1).await.unwrap(), before);
     }
 
     #[tokio::test]
@@ -6784,6 +6942,7 @@ mod tests {
                 "retain",
                 "revision",
                 "string_encoding",
+                "comment",
             ]
         );
 
@@ -6793,6 +6952,7 @@ mod tests {
         assert_eq!(
             a,
             Tag {
+                comment: String::new(),
                 id: 1,
                 name: "A".to_string(),
                 collection_group_id: 4,
@@ -7291,6 +7451,31 @@ mod tests {
     }
 
     // --- update_batch_tx (T18-3b, bulk tag operations) ----------------------
+
+    #[tokio::test]
+    async fn batch_update_preserves_omitted_comment_and_clears_explicit_empty_comment() {
+        let (svc, group_id) = setup().await;
+        let mut input = sample_input("batch-comment", group_id);
+        input.comment = Some("点検記録".to_string());
+        let created = svc.create(input.clone()).await.unwrap();
+
+        input.comment = None;
+        input.enabled = false;
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.update_batch_tx(&mut tx, &[(created.id, input.clone())])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(svc.get(created.id).await.unwrap().comment, "点検記録");
+
+        input.comment = Some(String::new());
+        let mut tx = svc.pool.begin().await.unwrap();
+        svc.update_batch_tx(&mut tx, &[(created.id, input)])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(svc.get(created.id).await.unwrap().comment, "");
+    }
 
     #[tokio::test]
     async fn update_batch_tx_updates_every_row_in_one_transaction() {

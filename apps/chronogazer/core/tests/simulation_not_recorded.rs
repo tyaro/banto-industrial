@@ -131,6 +131,7 @@ async fn register(
         .expect("収集グループを登録できる");
     let tag = TagService::new(pool.clone())
         .create(TagInput {
+            comment: None,
             name: format!("{name}-ramp"),
             collection_group_id: group.id,
             address: "40001".to_string(),

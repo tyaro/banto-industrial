@@ -94,6 +94,7 @@ const tagInput: TagInput = {
 const tagResource: Tag = {
 	id: 1,
 	name: 'tag1',
+	comment: '',
 	collectionGroupId: 1,
 	address: 'D3000',
 	dataType: 'i16',

@@ -69,6 +69,7 @@ async fn fixture() -> Fixture {
 
 fn tag(name: &str, group: i64, address: &str, data_type: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group,
         address: address.to_string(),

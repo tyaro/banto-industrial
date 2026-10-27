@@ -474,7 +474,7 @@ impl RegistrySnapshot {
         .await
         .map_err(|err| CollectError::Registry(banto_core::BantoError::Storage(err.to_string())))?;
         let tags = sqlx::query_as::<_, Tag>(
-            "SELECT id, name, collection_group_id, address, data_type, \
+            "SELECT id, name, comment, collection_group_id, address, data_type, \
              string_length, string_encoding, raw_lo, raw_hi, eng_lo, eng_hi, unit, decimals, \
              enabled, writable, tag_kind, expression, retain, revision FROM tags ORDER BY id",
         )
@@ -1608,6 +1608,7 @@ mod tests {
 
     fn tag_input(name: &str, group_id: i64, address: &str) -> TagInput {
         TagInput {
+            comment: None,
             name: name.to_string(),
             collection_group_id: group_id,
             address: address.to_string(),
@@ -3361,6 +3362,7 @@ mod tests {
 
     fn tag_of(id: i64, group: i64, address: &str, data_type: &str) -> Tag {
         Tag {
+            comment: String::new(),
             id,
             name: format!("t{id}"),
             collection_group_id: group,

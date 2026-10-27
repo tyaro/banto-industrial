@@ -4,6 +4,7 @@
 // して残る - `configPackage.test.ts` で `./setup` が評価され、EventProvider の
 // 接続（`localStorage`）が未処理の reject になった。このモジュールは型以外を
 // import しない純関数のまま保つ。
+import { MAX_COMMENT_LENGTH } from './tagComment';
 import type {
 	CollectionGroup,
 	CollectionGroupInput,
@@ -336,6 +337,17 @@ function expectString(value: unknown, path: string): string {
 	return result;
 }
 
+function expectTagComment(value: unknown, path: string): string | undefined {
+	if (value === undefined) return undefined;
+	const comment = expectString(value, path);
+	if (Array.from(comment).length > MAX_COMMENT_LENGTH) {
+		throw new ConfigPackageParseError(
+			`${path} は ${MAX_COMMENT_LENGTH} 文字以内で指定してください`
+		);
+	}
+	return comment;
+}
+
 function expectInteger(value: unknown, path: string): number {
 	const result = asInteger(value);
 	if (result === undefined) {
@@ -515,6 +527,7 @@ function sanitizeGroup(
 function sanitizeTag(input: Tag, connectionName: string, groupName: string): ConfigPackageTag {
 	return {
 		name: input.name,
+		comment: input.comment,
 		plcConnectionName: connectionName,
 		collectionGroupName: groupName,
 		address: input.address,
@@ -933,6 +946,9 @@ function parseTags(raw: unknown): ConfigPackageTag[] {
 		rejectTagThresholds(item, index);
 		return {
 			name: expectString(item.name, `tags[${index}].name`),
+			...(item.comment === undefined
+				? {}
+				: { comment: expectTagComment(item.comment, `tags[${index}].comment`) }),
 			plcConnectionName: expectString(item.plcConnectionName, `tags[${index}].plcConnectionName`),
 			collectionGroupName: expectString(
 				item.collectionGroupName,

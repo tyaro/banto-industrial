@@ -2857,6 +2857,7 @@ mod tests {
             .unwrap();
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "t".to_string(),
                 collection_group_id: group.id,
                 address: "40001".to_string(),
@@ -3333,6 +3334,7 @@ mod tests {
             query_sql: None,
         };
         let tag_in_group1 = Tag {
+            comment: String::new(),
             id: 100,
             name: "D100".to_string(),
             collection_group_id: group1.id,
@@ -3417,6 +3419,7 @@ mod tests {
             tags: tags
                 .iter()
                 .map(|&(id, group, name)| Tag {
+                    comment: String::new(),
                     id,
                     name: name.to_string(),
                     collection_group_id: group,
@@ -3683,6 +3686,7 @@ mod tests {
             .unwrap();
         let tag = TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "temp01".to_string(),
                 collection_group_id: group.id,
                 address: "40001".to_string(),
@@ -3762,6 +3766,7 @@ mod tests {
             // サービスは外部名を知らないので、検証より前の行と同じく重なりを書ける。
             let tag = TagService::new(pool.clone())
                 .create(TagInput {
+                    comment: None,
                     name: "d".to_string(),
                     collection_group_id: group.id,
                     address: "40001".to_string(),
@@ -3897,6 +3902,7 @@ mod tests {
             .unwrap();
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "t1".to_string(),
                 collection_group_id: group.id,
                 address: "40001".to_string(),
@@ -4004,6 +4010,7 @@ mod tests {
         manager
             .tags()
             .create(TagInput {
+                comment: None,
                 name: format!("{name}-t"),
                 collection_group_id: group.id,
                 address: "40001".to_string(),
@@ -4372,6 +4379,7 @@ mod tests {
         // fails at build_config time.
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "bad".to_string(),
                 collection_group_id: group.id,
                 address: "99999".to_string(),

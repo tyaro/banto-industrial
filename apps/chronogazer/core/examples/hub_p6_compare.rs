@@ -700,6 +700,7 @@ async fn register_direct(
     for (name, address, data_type) in tag_specs() {
         let tag = tags
             .create(TagInput {
+                comment: None,
                 name: name.clone(),
                 collection_group_id: group.id,
                 address,

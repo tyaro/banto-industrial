@@ -28,6 +28,7 @@ function makeTag(overrides: Partial<Tag>): Tag {
 	return {
 		id: 1,
 		name: 'temp01',
+		comment: '',
 		collectionGroupId: 1,
 		address: '40001',
 		dataType: 'f32',

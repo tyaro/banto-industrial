@@ -195,6 +195,7 @@ async fn register(pool: &SqlitePool, port: u16) -> Vec<RegisteredGroup> {
         for address in addresses {
             let tag = TagService::new(pool.clone())
                 .create(TagInput {
+                    comment: None,
                     name: format!("{name}-{address}"),
                     collection_group_id: group.id,
                     address,

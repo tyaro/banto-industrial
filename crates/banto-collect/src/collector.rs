@@ -1361,6 +1361,7 @@ mod tests {
                 query_sql: None,
             };
             let tag_input = |name: &str, group: i64, address: &str, data_type: &str| TagInput {
+                comment: None,
                 name: name.to_string(),
                 collection_group_id: group,
                 address: address.to_string(),

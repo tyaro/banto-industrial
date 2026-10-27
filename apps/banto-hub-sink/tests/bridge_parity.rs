@@ -568,6 +568,7 @@ fn push_input(name: &str, settings: Value) -> PlcConnectionInput {
 
 fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str, kind: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: address.to_string(),

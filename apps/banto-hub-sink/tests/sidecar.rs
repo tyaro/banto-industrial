@@ -507,6 +507,7 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
         .expect("query group");
     let tag = TagService::new(app.pool.clone())
         .create(TagInput {
+            comment: None,
             name: "a".to_string(),
             collection_group_id: group.id,
             address: "a".to_string(),

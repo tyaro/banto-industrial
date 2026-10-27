@@ -106,6 +106,7 @@ function makeTag(overrides: Partial<Tag> = {}): Tag {
 	return {
 		id: 1,
 		name: 'Tag1',
+		comment: '',
 		collectionGroupId: GROUP_A_X.id,
 		address: 'D100',
 		dataType: 'i16',
@@ -151,7 +152,8 @@ const DEFAULT_ROW: CsvRowFields = {
 	writable: '',
 	tagKind: '',
 	expression: '',
-	retain: ''
+	retain: '',
+	comment: ''
 };
 
 function row(overrides: Partial<CsvRowFields> = {}): string[] {
@@ -431,8 +433,8 @@ describe('serializeCsv', () => {
 // ==============================================================================
 
 describe('TAG_CSV_COLUMNS', () => {
-	it('18 列である（#533 でしきい値の 4 列を外した）', () => {
-		expect(TAG_CSV_COLUMNS.length).toBe(18);
+	it('19 列である（コメント列を末尾に追加）', () => {
+		expect(TAG_CSV_COLUMNS.length).toBe(19);
 	});
 
 	it('列順のスナップショット', () => {
@@ -454,7 +456,46 @@ describe('TAG_CSV_COLUMNS', () => {
 			'writable',
 			'tagKind',
 			'expression',
-			'retain'
+			'retain',
+			'comment'
+		]);
+	});
+});
+
+describe('tag comment CSV compatibility', () => {
+	it.each(['plc', 'computed', 'internal', 'db'] as const)(
+		'round-trips a Unicode comment for %s tags',
+		(tagKind) => {
+			const group = tagKind === 'db' ? GROUP_PG : GROUP_A_X;
+			const tag = makeTag({
+				tagKind,
+				collectionGroupId: group.id,
+				address: tagKind === 'plc' ? 'D100' : tagKind === 'db' ? 'temperature' : '',
+				expression: tagKind === 'computed' ? '1 + 1' : null,
+				comment: '点検メモ <img src=x>\n 余白  '
+			});
+			const parsed = expectOk(
+				parseTagsCsv(exportTagsCsv([tag], CONNECTIONS, GROUPS), CONNECTIONS, GROUPS)
+			);
+			expect(parsed[0].tag.comment).toBe(tag.comment);
+		}
+	);
+
+	it('accepts the previous header without setting a comment', () => {
+		const csv = buildCsv([row().slice(0, -1)], { header: [...TAG_CSV_COLUMNS.slice(0, -1)] });
+		const parsed = expectOk(parseTagsCsv(csv, CONNECTIONS, GROUPS));
+		expect(parsed[0].tag.comment).toBeUndefined();
+	});
+
+	it('accepts 500 Unicode characters and rejects 501', () => {
+		expect(
+			expectOk(parseTagsCsv(buildCsv([row({ comment: '界'.repeat(500) })]), CONNECTIONS, GROUPS))[0]
+				.tag.comment
+		).toHaveLength(500);
+		expect(
+			expectErr(parseTagsCsv(buildCsv([row({ comment: '界'.repeat(501) })]), CONNECTIONS, GROUPS))
+		).toEqual([
+			expect.objectContaining({ lineNumber: 2, message: expect.stringContaining('comment') })
 		]);
 	});
 });
@@ -579,6 +620,7 @@ describe('exportTagsCsv', () => {
 			expect(rows).toHaveLength(1);
 			expect(rows[0].tag).toEqual({
 				name: 'Full,Tag "A"',
+				comment: '',
 				collectionGroupId: GROUP_A_X.id,
 				address: 'D200',
 				dataType: 'f32',
@@ -719,7 +761,7 @@ describe('parseTagsCsv', () => {
 		});
 
 		it('列数が少ないとヘッダ不一致エラー(lineNumber:1)', () => {
-			const header = TAG_CSV_COLUMNS.slice(0, -1) as unknown as string[];
+			const header = TAG_CSV_COLUMNS.slice(0, -2) as unknown as string[];
 			const text = buildCsv([], { header });
 			const errors = expectErr(parseTagsCsv(text, CONNECTIONS, GROUPS));
 			expect(errors[0].lineNumber).toBe(1);
@@ -770,6 +812,7 @@ describe('parseTagsCsv', () => {
 				groupName: 'GroupX',
 				tag: {
 					name: 'Tag1',
+					comment: '',
 					collectionGroupId: GROUP_A_X.id,
 					address: 'D100',
 					dataType: 'i16',

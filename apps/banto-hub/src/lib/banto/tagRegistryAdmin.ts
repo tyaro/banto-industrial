@@ -407,6 +407,7 @@ export const TAG_KIND_OPTIONS: { value: TagKind; label: string }[] = [
 export interface Tag {
 	id: number;
 	name: string;
+	comment: string;
 	collectionGroupId: number;
 	address: string;
 	dataType: TagDataType;
@@ -449,6 +450,8 @@ export interface Tag {
 /** Mirrors `banto_hub_core::rest::TagPayload`. */
 export interface TagInput {
 	name: string;
+	/** Omitted on update: keep the stored comment. Empty string: clear it. */
+	comment?: string;
 	collectionGroupId: number;
 	address: string;
 	dataType: TagDataType;
@@ -495,6 +498,7 @@ export interface TagInput {
 /** `string` tag `stringLength` bounds — mirrors the backend CHECK/validation. */
 export const MIN_STRING_LENGTH = 1;
 export const MAX_STRING_LENGTH = 128;
+export { MAX_COMMENT_LENGTH } from './tagComment';
 
 /**
  * `decimals` bounds — mirrors `banto_tags::tag::{MIN_DECIMALS, MAX_DECIMALS}`

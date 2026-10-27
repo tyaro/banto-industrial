@@ -126,6 +126,7 @@ fn tag_input(
     writable: bool,
 ) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: address.to_string(),

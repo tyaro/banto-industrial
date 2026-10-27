@@ -105,6 +105,7 @@ fn tag_input(
     enabled: bool,
 ) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: address.to_string(),
@@ -157,6 +158,7 @@ fn scaled_tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -
 /// と同型) - read-on-demand の「PLC タグのみ対象」ゲートの検証用。
 fn internal_tag_input(name: &str, group_id: i64, data_type: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: String::new(),

@@ -345,6 +345,7 @@ async fn register_hub_specs(
     for (name, data_type) in specs {
         let tag = tags
             .create(TagInput {
+                comment: None,
                 name: name.rsplit('.').next().unwrap().to_string(),
                 collection_group_id: group.id,
                 address: name.to_string(),

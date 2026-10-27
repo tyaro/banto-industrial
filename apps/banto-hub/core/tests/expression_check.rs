@@ -115,6 +115,7 @@ fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput
 
 fn computed_tag_input(name: &str, group_id: i64, expression: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: String::new(),
@@ -145,6 +146,7 @@ fn internal_tag_input(
     writable: bool,
 ) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: String::new(),

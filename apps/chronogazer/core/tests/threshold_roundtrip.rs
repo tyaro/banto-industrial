@@ -113,6 +113,7 @@ async fn register(pool: &SqlitePool, port: u16) -> i64 {
         .expect("収集グループを登録できる");
     TagService::new(pool.clone())
         .create(TagInput {
+            comment: None,
             name: "ランプ".to_string(),
             collection_group_id: group.id,
             address: "40001".to_string(),
