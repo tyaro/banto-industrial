@@ -87,7 +87,7 @@ pub(crate) const WORD_ORDER_HELP: &str = "32bit値（u32/f32等）の上位/下�
 pub(crate) const PLACEHOLDER: &str = "D100（ビット指定: D100.5）";
 
 /// `tagAddressHelp.ts` `SLMP_DEVICE_HINT`.
-pub(crate) const DEVICE_HINT: &str = "ビットデバイス（X/Y/M/L/F/V/B/S/TS/TC/SS/SC/CS/CC/SB/SM/DX/DY）とワードデバイス（D/W/Z/R/ZR/TN/SN/CN/SD/SW）があります。X/Y/B/W/SB/SW/DX/DY は16進数、それ以外のデバイス番号は10進数で書きます。";
+pub(crate) const DEVICE_HINT: &str = "ビットデバイス（X/Y/M/L/F/B/S/TS/TC/SS/SC/CS/CC/SB/SM/DX/DY）とワードデバイス（D/W/Z/R/ZR/TN/SN/CN/SD/SW）があります。X/Y/B/W/SB/SW/DX/DY は16進数、それ以外のデバイス番号は10進数で書きます。";
 
 /// `tagAddressHelp.ts` `SLMP_BIT_HINT`.
 pub(crate) const BIT_HINT: &str = "ワードデバイスの特定ビットだけを読み書きするときは「D100.F」のように「.」+ビット位置（0〜F、16進。D100.F は bit 15）を付けます（data_type = bit のタグでのみ使えます）。ビットデバイス自体には「.」指定はできません。";
@@ -163,6 +163,7 @@ impl DriverBase for SlmpDriver {
         let (device, number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
+        reject_v_device(device)?;
         check_kind(text, device, bit, kind)?;
         if let Some(message) = past_last_number(text.trim(), device, number, bit, kind) {
             return Err(AddressError::new(message));
@@ -221,6 +222,7 @@ impl DriverBase for SlmpDriver {
         let (device, number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
+        reject_v_device(device)?;
 
         let (next_number, next_bit) = match bit {
             Some(bit) => {
@@ -335,6 +337,7 @@ impl DriverBase for SlmpDriver {
         let (device, number, bit) = address
             .as_slmp()
             .expect("Address::parse_slmp always yields an Slmp address");
+        reject_v_device(device)?;
         let next = i128::from(number) + i128::from(n);
         if next < 0 || next > i128::from(MAX_DEVICE_NUMBER) {
             return Err(AddressError::new(format!(
@@ -348,6 +351,16 @@ impl DriverBase for SlmpDriver {
         }
         .to_string())
     }
+}
+
+/// Periodic collection cannot reliably capture the state of a V device.
+fn reject_v_device(device: SlmpDevice) -> Result<(), AddressError> {
+    if device == SlmpDevice::V {
+        return Err(AddressError::new(
+            "SLMP V デバイスは定期収集で状態を確実に取得できないため、収集タグに登録できません",
+        ));
+    }
+    Ok(())
 }
 
 /// The kind-dependent refusals (address design §3.2, Q4): what is wrong with
@@ -736,6 +749,32 @@ mod tests {
     }
 
     #[test]
+    fn v_device_is_refused_for_collection_and_offsets() {
+        let bit = kind(DataType::Bit);
+        for text in ["V0", "v12", " V123 "] {
+            let error = SlmpDriver.parse_address(text, &bit).unwrap_err();
+            assert!(error.message().contains("定期収集"), "{error}");
+            assert_eq!(
+                SlmpDriver
+                    .offset_address(text, &bit, 1)
+                    .unwrap_err()
+                    .message(),
+                error.message()
+            );
+            assert_eq!(
+                SlmpDriver.offset_words(text, 1).unwrap_err().message(),
+                error.message()
+            );
+        }
+        for text in ["M1", "L1", "F1", "B1"] {
+            assert!(SlmpDriver.parse_address(text, &bit).is_ok(), "{text}");
+            assert!(SlmpDriver.offset_address(text, &bit, 1).is_ok(), "{text}");
+            assert!(SlmpDriver.offset_words(text, 1).is_ok(), "{text}");
+        }
+        assert!(!DEVICE_HINT.contains("/V/"));
+    }
+
+    #[test]
     fn parse_address_word_count_follows_the_kind() {
         for (data_type, text, words) in [
             (DataType::Bit, "M100", 1),
@@ -938,14 +977,14 @@ mod tests {
         assert!(help.contains(BIT_HINT));
     }
 
-    /// The TypeScript strings, character for character.
+    /// The supported device hint and the remaining TypeScript strings.
     #[test]
     fn help_texts_are_the_ts_strings() {
         assert_eq!(PLACEHOLDER, "D100（ビット指定: D100.5）");
         assert_eq!(
             DEVICE_HINT,
             concat!(
-                "ビットデバイス（X/Y/M/L/F/V/B/S/TS/TC/SS/SC/CS/CC/SB/SM/DX/DY）とワードデバイス（D/W/Z/R/ZR/TN/SN/CN/SD/SW）があります。",
+                "ビットデバイス（X/Y/M/L/F/B/S/TS/TC/SS/SC/CS/CC/SB/SM/DX/DY）とワードデバイス（D/W/Z/R/ZR/TN/SN/CN/SD/SW）があります。",
                 "X/Y/B/W/SB/SW/DX/DY は16進数、それ以外のデバイス番号は10進数で書きます。"
             )
         );
