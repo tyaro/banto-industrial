@@ -547,9 +547,22 @@ mod tests {
         let mut wrong_bit = ok.clone();
         wrong_bit.spec.address = wrong_bit.spec.address.with_bit(1);
         assert!(preflight(&[wrong_bit], &id, &gate).is_err());
-        let mut wrong_index = ok;
+        let mut wrong_index = ok.clone();
         wrong_index.spec.address = wrong_index.spec.address.with_index(1);
         assert!(preflight(&[wrong_index], &id, &gate).is_err());
+        let mut other_driver = ok.clone();
+        other_driver.spec.address.driver = DriverId::new("other-driver").unwrap();
+        assert!(preflight(&[other_driver], &id, &gate).is_err());
+        let mut read_only_area = ok.clone();
+        read_only_area.spec.address.writable_area = false;
+        assert!(preflight(&[read_only_area], &id, &gate).is_err());
+        let mut padded_bit = bit_item("400001.03", "holding_register", 0, 3, api::Value::Bit(true));
+        assert!(preflight(std::slice::from_ref(&padded_bit), &id, &gate).is_err());
+        padded_bit.spec.address.canonical = "400001.3".into();
+        assert!(preflight(&[padded_bit], &id, &gate).is_ok());
+        let mut mismatched_bit = ok;
+        mismatched_bit.spec.address.canonical = "400001.1".into();
+        assert!(preflight(&[mismatched_bit], &id, &gate).is_err());
     }
 
     #[test]
