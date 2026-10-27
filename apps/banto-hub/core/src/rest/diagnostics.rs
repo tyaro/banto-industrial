@@ -188,12 +188,12 @@ pub(super) async fn range_diagnostic_post(
     let Some(epoch) = handle.session_epoch() else {
         return Ok(Json(unavailable("broker session is disconnected")).into_response());
     };
-    // The guest keeps the discovered bit counts on its connection resource.
-    // Acquire a fresh resource once per request, then diagnose all chunks on
-    // that same physical session. A bit chunk comes first so later reports
-    // share the same SD evidence; the final result is restored to tag ID order.
-    let mut selected: Vec<_> = tag_ids.iter().copied().zip(specs.iter().cloned()).collect();
-    selected.sort_by_key(|(id, spec)| (!matches!(spec.kind, TagKind::Numeric(DataType::Bit)), *id));
+    // The guest keeps discovered bit counts on its connection resource.
+    // Preflight every bit chunk when the request needs splitting. A first
+    // chunk of X bits may not trigger M/Y/L/B SD acquisition, whereas a later
+    // chunk does. Discard preflight verdicts and publish only the subsequent
+    // complete pass with one consistent set of evidence, in saved-tag order.
+    let selected: Vec<_> = tag_ids.iter().copied().zip(specs.iter().cloned()).collect();
     let result = tokio::time::timeout(Duration::from_secs(12), async {
         handle
             .refresh_diagnostic()
@@ -201,6 +201,26 @@ pub(super) async fn range_diagnostic_post(
             .map_err(|_| "diagnostic refresh failed")?;
         if !epoch.is_current(&handle) {
             return Err("connection changed during diagnostic refresh");
+        }
+        if selected.len() > 256 {
+            let bit_specs: Vec<_> = selected
+                .iter()
+                .filter(|(_, spec)| matches!(spec.kind, TagKind::Numeric(DataType::Bit)))
+                .map(|(_, spec)| spec.clone())
+                .collect();
+            for chunk in bit_specs.chunks(256) {
+                if handle
+                    .diagnose(chunk.to_vec())
+                    .await
+                    .map_err(|_| "diagnostic bit discovery failed")?
+                    .is_none()
+                {
+                    return Ok(None);
+                }
+                if !epoch.is_current(&handle) {
+                    return Err("connection changed during bit discovery");
+                }
+            }
         }
         let chunks: Vec<&[(i64, TagSpec)]> = if selected.is_empty() {
             vec![&[]]
@@ -235,7 +255,7 @@ pub(super) async fn range_diagnostic_post(
         Ok(complete)
     })
     .await;
-    let mut report = match result {
+    let report = match result {
         Ok(Ok(Some(report))) => report,
         Ok(Ok(None)) => {
             return Ok(Json(
@@ -250,13 +270,6 @@ pub(super) async fn range_diagnostic_post(
             )
         }
     };
-    let mut ordered: Vec<_> = selected
-        .iter()
-        .map(|(id, _)| *id)
-        .zip(report.tags)
-        .collect();
-    ordered.sort_by_key(|(id, _)| *id);
-    report.tags = ordered.into_iter().map(|(_, tag)| tag).collect();
     if !epoch.is_current(&handle) {
         return Ok(Json(unavailable("connection changed; result discarded")).into_response());
     }
@@ -281,5 +294,8 @@ pub(super) async fn range_diagnostic_post(
         ))
         .into_response());
     }
+    // Publication is synchronous; enqueue finalization before the next await
+    // so a later diagnostic cannot treat this accepted result as tentative.
+    let _ = handle.finalize_diagnostic(epoch).await;
     Ok(Json(response(revision, &version, &tag_ids, &report)).into_response())
 }

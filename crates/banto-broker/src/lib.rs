@@ -639,6 +639,10 @@ enum Job {
         epoch: SessionEpoch,
         respond_to: oneshot::Sender<bool>,
     },
+    FinalizeDiagnostic {
+        epoch: SessionEpoch,
+        respond_to: oneshot::Sender<bool>,
+    },
     Read {
         specs: Vec<TagSpec>,
         respond_to: oneshot::Sender<ReadOutcome>,
@@ -780,6 +784,20 @@ impl BrokerHandle {
         })
     }
 
+    /// Release tentative suppression ownership after its report is published.
+    pub async fn finalize_diagnostic(&self, epoch: SessionEpoch) -> Result<bool, BrokerError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::FinalizeDiagnostic { epoch, respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })
+    }
+
     /// Submit a read-only diagnostic as one exclusive broker job.
     pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
         let (respond_to, rx) = oneshot::channel();
@@ -900,6 +918,10 @@ impl ReadOnlyHandle {
         self.inner.discard_diagnostic(epoch).await
     }
 
+    pub async fn finalize_diagnostic(&self, epoch: SessionEpoch) -> Result<bool, BrokerError> {
+        self.inner.finalize_diagnostic(epoch).await
+    }
+
     /// Submit the same read-only diagnostic without write capability.
     pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
         self.inner.diagnose(specs).await
@@ -978,6 +1000,9 @@ pub fn spawn_test_handle_with_status(
                     let _ = respond_to.send(true);
                 }
                 Job::DiscardDiagnostic { respond_to, .. } => {
+                    let _ = respond_to.send(true);
+                }
+                Job::FinalizeDiagnostic { respond_to, .. } => {
                     let _ = respond_to.send(true);
                 }
                 Job::Read { respond_to, .. } => {
@@ -1708,6 +1733,9 @@ async fn run_broker_task(
 ) {
     let mut attempt: u32 = 0;
     let mut state = ConnState::Backoff { at: Instant::now() };
+    // The latest started attempt may differ from the attempt whose tentative
+    // read suppression is installed in the session.
+    let mut pending_diagnostic: Option<u64> = None;
 
     loop {
         tokio::select! {
@@ -1735,6 +1763,7 @@ async fn run_broker_task(
                     }
                     ConnEvent::Finished(Ok(session)) => {
                         attempt = 0;
+                        pending_diagnostic = None;
                         state = ConnState::Connected(session);
                         let _ = status_tx.send(BrokerConnectionStatus::Connected);
                     }
@@ -1792,26 +1821,45 @@ async fn run_broker_task(
                     Job::AcceptDiagnostic { specs, report, epoch, respond_to } => {
                         let current = epoch.diagnostic_attempt.load(Ordering::Acquire) == epoch.attempt
                             && matches!(epoch.status_rx.has_changed(), Ok(false))
-                            && !respond_to.is_closed();
+                            && !respond_to.is_closed()
+                            && pending_diagnostic.is_none();
                         let accepted = if current {
                             if let ConnState::Connected(session) = &mut state {
                                 session.accept_diagnostic(&specs, &report);
+                                pending_diagnostic = Some(epoch.attempt);
                                 true
                             } else { false }
                         } else { false };
-                        let _ = respond_to.send(accepted);
+                        if respond_to.send(accepted).is_err() && accepted {
+                            // The requester disappeared after the initial check.
+                            // Nothing can publish this tentative suppression.
+                            if let ConnState::Connected(session) = &mut state {
+                                session.discard_diagnostic();
+                            }
+                            pending_diagnostic = None;
+                        }
                         false
                     }
                     Job::DiscardDiagnostic { epoch, respond_to } => {
-                        let current = epoch.diagnostic_attempt.load(Ordering::Acquire) == epoch.attempt
+                        let current = pending_diagnostic == Some(epoch.attempt)
                             && matches!(epoch.status_rx.has_changed(), Ok(false));
                         let discarded = if current {
                             if let ConnState::Connected(session) = &mut state {
                                 session.discard_diagnostic();
+                                pending_diagnostic = None;
                                 true
                             } else { false }
                         } else { false };
                         let _ = respond_to.send(discarded);
+                        false
+                    }
+                    Job::FinalizeDiagnostic { epoch, respond_to } => {
+                        let current = pending_diagnostic == Some(epoch.attempt)
+                            && matches!(epoch.status_rx.has_changed(), Ok(false));
+                        if current {
+                            pending_diagnostic = None;
+                        }
+                        let _ = respond_to.send(current);
                         false
                     }
                     Job::Read { specs, respond_to } => {
@@ -1845,6 +1893,7 @@ async fn run_broker_task(
                 };
                 if fatal {
                     state = ConnState::Backoff { at: Instant::now() };
+                    pending_diagnostic = None;
                     attempt = 0;
                     let _ = status_tx.send(BrokerConnectionStatus::Reconnecting { attempt: 1 });
                 }
@@ -2930,6 +2979,56 @@ mod tests {
             .unwrap();
         drop(status);
         drop(epoch);
+    }
+
+    #[tokio::test]
+    async fn discard_uses_applied_diagnostic_owner_not_latest_started_attempt() {
+        let plc = FakePlc::new();
+        let (handle, task, _shutdown) = spawn_task(
+            plc.connector(),
+            BackoffConfig::default(),
+            SessionTimeouts::default(),
+        );
+        wait_connected(&handle).await;
+        let spec = rspec("D0", DataType::U16);
+        let report = DiagnosticReport {
+            model: None,
+            model_reason: None,
+            counts: Vec::new(),
+            tags: vec![banto_driver_api::TagDiagnostic {
+                address: spec.address.canonical.clone(),
+                verdict: banto_driver_api::TagVerdict::Outside("test".into()),
+            }],
+        };
+        let first = handle.session_epoch().expect("A");
+        assert!(handle
+            .accept_diagnostic(first.clone(), vec![spec.clone()], report.clone())
+            .await
+            .unwrap());
+        let second = handle.session_epoch().expect("B starts before A publishes");
+        assert!(!first.is_current(&handle.read_only()));
+        assert!(!handle
+            .accept_diagnostic(second.clone(), vec![spec.clone()], report.clone())
+            .await
+            .unwrap());
+        // B has started, but has not applied any suppression. A still owns
+        // the tentative side effect and must be able to undo it.
+        assert!(handle.discard_diagnostic(first.clone()).await.unwrap());
+        assert!(handle
+            .accept_diagnostic(second.clone(), vec![spec.clone()], report.clone())
+            .await
+            .unwrap());
+        assert!(!handle.discard_diagnostic(first).await.unwrap());
+        assert!(handle.finalize_diagnostic(second).await.unwrap());
+
+        let third = handle.session_epoch().expect("C");
+        assert!(handle
+            .accept_diagnostic(third.clone(), vec![spec], report)
+            .await
+            .unwrap());
+        assert!(handle.discard_diagnostic(third).await.unwrap());
+        drop(handle);
+        task.join_handle.await.unwrap();
     }
 
     #[tokio::test]

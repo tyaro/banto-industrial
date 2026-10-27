@@ -440,6 +440,27 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
     .create(super::group_input("diagnostic-group", saved.id, 60_000))
     .await
     .unwrap();
+    for index in 0..256 {
+        app.manager
+            .tags()
+            .create(super::tag_input(
+                &format!("x-{index}"),
+                group.id,
+                &format!("X{index:X}"),
+                "bit",
+            ))
+            .await
+            .unwrap();
+    }
+    // The first chunk is exclusively X bits, which do not fetch M/Y/L/B SD.
+    // M10 is the very next saved tag and must not make the aggregate evidence
+    // disagree with that first chunk.
+    let bit = app
+        .manager
+        .tags()
+        .create(super::tag_input("bit", group.id, "M10", "bit"))
+        .await
+        .unwrap();
     let inside = app
         .manager
         .tags()
@@ -452,24 +473,6 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
         .create(super::tag_input("outside", group.id, "D4000", "u16"))
         .await
         .unwrap();
-    let bit = app
-        .manager
-        .tags()
-        .create(super::tag_input("bit", group.id, "M10", "bit"))
-        .await
-        .unwrap();
-    for index in 0..254 {
-        app.manager
-            .tags()
-            .create(super::tag_input(
-                &format!("extra-{index}"),
-                group.id,
-                &format!("D{index}"),
-                "u16",
-            ))
-            .await
-            .unwrap();
-    }
     app.manager.rebuild().await.unwrap();
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
@@ -490,7 +493,7 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
     .await;
     assert_eq!(status, super::StatusCode::OK, "{report:?}");
     assert_eq!(report["status"], "current");
-    assert_eq!(report["tags"].as_array().map(Vec::len), Some(257));
+    assert_eq!(report["tags"].as_array().map(Vec::len), Some(259));
     assert!(report["tags"].as_array().is_some_and(|tags| {
         tags.iter()
             .any(|tag| tag["tagId"] == inside.id && tag["verdict"] == "inside")
