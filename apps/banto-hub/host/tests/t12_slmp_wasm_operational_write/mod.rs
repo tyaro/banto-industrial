@@ -1969,15 +1969,6 @@ async fn rest_scoped_write_and_denied_spans_are_audited_without_extra_frames() {
     }
 }
 
-fn assert_no_item_succeeded<E: std::fmt::Debug>(
-    result: Result<Vec<Result<(), ItemError>>, E>,
-    what: &str,
-) {
-    if let Ok(items) = result {
-        assert!(items.iter().all(Result::is_err), "{what}: {items:?}");
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
 async fn malformed_allowlist_notation_is_rejected_and_sends_no_write_frame() {
@@ -2016,11 +2007,10 @@ async fn malformed_allowlist_notation_is_rejected_and_sends_no_write_frame() {
                 None,
             )
             .await;
-            if let Ok(mut session) = connected {
-                assert_no_item_succeeded(session.write_batch(&items(&specs(&driver))).await, bad);
-                assert_no_item_succeeded(session.write_batch(&items(&w_specs(&driver))).await, bad);
-                session.disconnect().await;
-            }
+            assert!(
+                matches!(connected, Err(FatalError::InvalidConfig(_))),
+                "{bad:?} must fail the connection as invalid config"
+            );
             assert!(fixture.frames().is_empty(), "{bad:?} sent a write frame");
             assert!(
                 fixture
@@ -2076,7 +2066,14 @@ async fn w_write_with_unknown_ack_or_plc_error_never_succeeds_or_replays() {
             connect(peer, 4000, "enabled", "D3010-D3013,W1A-W1F", false).await;
         fixture.set_write_end_code(0xc051);
         let result = session.write_batch(&w_items(&driver)).await;
-        assert_no_item_succeeded(result, "PLC error");
+        let items = result.expect("a PLC end code is reported per item, not as a fatal error");
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert!(
+            items
+                .iter()
+                .all(|item| matches!(item, Err(ItemError::Device(_)))),
+            "PLC error must fail every item as a device error: {items:?}"
+        );
         assert_eq!(fixture.frames(), vec![(0x1a, vec![1, 2, 3, 4, 5, 6])]);
         assert_eq!(fixture.write_devices(), vec![0xb4]);
         session.disconnect().await;

@@ -703,7 +703,7 @@ jobs:
           $diagnosticLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-diagnostics-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_ 2>&1 | Tee-Object -FilePath $diagnosticLog
           if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP Hub tests failed' }
-          if (-not (Select-String -Path $diagnosticLog -Pattern '^test result: ok\. 14 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $diagnosticLog -Pattern '^test result: ok\. 16 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'diagnostic SLMP Hub tests did not all run'
           }
           # Keep the earlier diagnostic and read/write guests above for
@@ -743,7 +743,7 @@ jobs:
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-35-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 18 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 20 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
