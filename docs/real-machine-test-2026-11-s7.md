@@ -1,7 +1,7 @@
 # #229 S7 実 DB 検証の記録（外部 DB 連携、実機・別マシンの PostgreSQL）
 
 作成日: 2026-10-28
-状態: **未実施**（2026-10-28: 準備 P-7 として空の表と R-2 の採取スクリプトを用意した）
+状態: **未実施**（2026-10-28: 準備 P-7 として空の表と R-2 の採取スクリプトを用意した。スクリプトは同日、ローカルの PostgreSQL 15（`127.0.0.1:5432`）と模擬の Hub で PowerShell 7（3 行）・5.1（2 行）を流し、件数・増分・CSV の形と、Hub 不在・psql の接続拒否・キー未設定でも止まらないことを確かめた。本物の Hub での採取は当日の機材で 1 回試す）
 
 [external-db-test-2026-09.md](external-db-test-2026-09.md) §3.3 の S7 本番（2026-11-02〜11-08、オーナー同席）の結果を書く文書。**手順と期待は手順書が正で、この文書は記録だけ**（各段の順番は §3.3 D、期待は §2・§3・§3.1・§3.3 S）。値は当日に埋める。キー・パスワードは書かない。
 
@@ -89,7 +89,9 @@ SQL は手順書 §3.3 R-3。結果は**候補の数**として書き、R-4 の�
 
 ## 付録 R-2 の採取スクリプト
 
-PowerShell 7 と Windows PowerShell 5.1 のどちらでも動く。Hub の `GET /api/v1/status`（`Authorization: Bearer <read スコープの API キー>`）と `psql` の `SELECT count(*), max(ts) FROM tag_history` を 1 回ごとに CSV へ 1 行足す。API か psql の片方が失敗しても止まらず、その列を空にして `error` 列に短い理由を書き、次の回へ進む。`last_flush_at` はローカル時刻の ISO 8601 に直す。`delta_since_prev` は直前に取れた件数との差（psql が続けて失敗したときは、その間の合計の増分になる）。
+PowerShell 7 と Windows PowerShell 5.1 のどちらでも動く。Hub の `GET /api/v1/status`（`Authorization: Bearer <read スコープの API キー>`）と `psql` の `SELECT count(*), max(ts) FROM tag_history` を 1 回ごとに CSV へ 1 行足す。API か psql の片方が失敗しても止まらず、その列を空にして `error` 列に短い理由を書き、次の回へ進む。`last_flush_at` はローカル時刻の ISO 8601 に直す。`delta_since_prev` は直前に取れた件数との差（psql が続けて失敗したときは、その間の合計の増分になる）。psql は `-w` でパスワードを対話で求めず、求められたら失敗として `error` 列に書く（夜間に入力待ちで止まらないため）。
+
+**キーは R-2 の採取用に `read` だけのものを 1 つ発行する**（`admin` を付けない。Sink のキーを流用しない。手順書 P-6）。
 
 文字コードの取り違えを避けるため、スクリプトは ASCII だけで書いてある（5.1 は BOM の無いファイルを ANSI として読む）。`s7-collect-r2.ps1` として保存して使う。リポジトリには置かない。
 
@@ -182,7 +184,7 @@ while ($true) {
 
     # --- DB row count ---
     try {
-        $psqlArgs = @('-X', '-q', '-t', '-A', '-F', ',')
+        $psqlArgs = @('-X', '-q', '-w', '-t', '-A', '-F', ',')   # -w: never prompt for a password (fail instead)
         if ($PgHost) { $psqlArgs += @('-h', $PgHost) }
         if ($PgPort) { $psqlArgs += @('-p', $PgPort) }
         if ($PgUser) { $psqlArgs += @('-U', $PgUser) }
@@ -236,6 +238,9 @@ $env:PGPASSWORD = '<DB のパスワード>'
 
 - 止め方: `-Count` を省略すると止めるまで続く。止めるのは Ctrl+C（CSV は 1 回ごとに追記しているので、止めても失われない）。
 - `-PgHost` などを省略すると `PGHOST`・`PGPORT`・`PGUSER`・`PGDATABASE` の環境変数が効く。接続の待ちは `PGCONNECT_TIMEOUT` = 10 秒にしてある。
+- パスワードは `PGPASSWORD` だけで渡す。`-PgDatabase` に `postgresql://user:pass@…` の接続 URI を書かない（`error` 列やプロセスの一覧に出得る）。
+- 実行ポリシーで `.ps1` が動かない PC では `powershell -ExecutionPolicy Bypass -File .\s7-collect-r2.ps1 …`（7 なら `pwsh`）で起動する。
+- `tag_history_max_ts` は psql のセッションの `TimeZone`（`PGTZ` か DB の既定）で表示される。`time` 列（PC のローカル時刻）と時刻帯が違って見えたらそのため。R-3 の SQL の `<開始>`・`<終了>` も時刻帯を付けて書く。
 - Hub の URL の既定は `http://127.0.0.1:8722`。`/api/v1/status` は管理系の `GET /api/status`（ログインのセッションが要る）とは別で、API キー（`read`）で読める。
 - 2 回目以降は前の回の終わりではなく開始から `-IntervalSeconds` 後に次の回を始める。夜をまたぐ間は、スクリプトを動かす PC がスリープしないようにしておく。
 - CSV は UTF-8（BOM なし）。ヘッダーは新しいファイルの最初だけ。同じファイルへ再開して足してもよい（`delta_since_prev` は再開の 1 行目だけ空になる）。
