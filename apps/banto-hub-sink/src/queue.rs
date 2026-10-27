@@ -8,7 +8,7 @@
 //!    という判断（§6-8 のオーナー決定）。ディスクスプールは将来。
 //! 2. **at-least-once**: 行は INSERT が **commit されてから**キューを
 //!    出る（§5.4）。そのため取り出しは [`RowQueue::peek_batch`]（複製）と
-//!    [`RowQueue::commit`]（先頭 n 件の削除）の 2 段構えで、失敗した
+//!    [`RowQueue::commit`]（送信した行だけの ACK）の 2 段構えで、失敗した
 //!    バッチは何もしなければ次回そのまま再送される。`(ts, tag_id)` の
 //!    一意制約を張るかどうかは利用者の選択（§5.4）。
 //!
@@ -37,9 +37,26 @@ pub struct Row {
 /// 先入れ先出し・満杯なら最古を捨てる行キュー。
 #[derive(Debug)]
 pub struct RowQueue {
-    rows: VecDeque<Row>,
+    rows: VecDeque<(u128, Row)>,
+    next_id: u128,
     max_rows: usize,
     dropped: u64,
+}
+
+/// INSERT に渡す行と、その時点で最後に送信する行のキュー内 ID。
+/// 値が同じ行でも ID は異なるため、ACK を値の比較に頼らない。
+#[derive(Debug)]
+pub struct RowBatch {
+    rows: Vec<Row>,
+    last_id: Option<u128>,
+}
+
+impl std::ops::Deref for RowBatch {
+    type Target = [Row];
+
+    fn deref(&self) -> &Self::Target {
+        &self.rows
+    }
 }
 
 impl RowQueue {
@@ -48,6 +65,7 @@ impl RowQueue {
             // 満杯時に再確保しないよう最初から確保する…のは 1,000 万行
             // 設定で無駄なので、実運用の既定（10,000）程度までに留める。
             rows: VecDeque::with_capacity(max_rows.min(10_000)),
+            next_id: 0,
             max_rows,
             dropped: 0,
         }
@@ -84,18 +102,30 @@ impl RowQueue {
             self.rows.pop_front();
             self.dropped = self.dropped.saturating_add(1);
         }
-        self.rows.push_back(row);
+        let id = self.next_id;
+        self.next_id = self.next_id.checked_add(1).expect("queue row ID exhausted");
+        self.rows.push_back((id, row));
     }
 
     /// 先頭から最大 `limit` 件を**複製**して返す（キューからは出さない -
     /// このモジュールの doc comment の不変条件 2）。
-    pub fn peek_batch(&self, limit: usize) -> Vec<Row> {
-        self.rows.iter().take(limit).cloned().collect()
+    pub fn peek_batch(&self, limit: usize) -> RowBatch {
+        let mut rows = Vec::with_capacity(limit.min(self.rows.len()));
+        let mut last_id = None;
+        for (id, row) in self.rows.iter().take(limit) {
+            rows.push(row.clone());
+            last_id = Some(*id);
+        }
+        RowBatch { rows, last_id }
     }
 
-    /// commit 済みの先頭 `count` 件を捨てる。
-    pub fn commit(&mut self, count: usize) {
-        for _ in 0..count.min(self.rows.len()) {
+    /// INSERT が成功したバッチの行だけを削除する。送信中に overflow した行は
+    /// 既に無く、後から追加された行は ID が大きいので残る。
+    pub fn commit(&mut self, batch: &RowBatch) {
+        while batch
+            .last_id
+            .is_some_and(|last_id| self.rows.front().is_some_and(|(id, _)| *id <= last_id))
+        {
             self.rows.pop_front();
         }
     }
@@ -162,7 +192,7 @@ mod tests {
     }
 
     /// flusher の刻み方（`peek_batch(batch_size)` → INSERT →
-    /// `commit(len)` の繰り返し）で、順序を保ったまま全行がちょうど 1 回
+    /// `commit(&batch)` の繰り返し）で、順序を保ったまま全行がちょうど 1 回
     /// ずつ出ること。
     #[test]
     fn chunking_by_batch_size_covers_every_row_exactly_once_in_order() {
@@ -179,7 +209,7 @@ mod tests {
             }
             batches += 1;
             sent.extend(batch.iter().map(|r| r.tag_id));
-            queue.commit(batch.len());
+            queue.commit(&batch);
         }
         assert_eq!(batches, 3, "7 行を 3 行刻みで 3 バッチ（3/3/1）");
         assert_eq!(sent, vec![1, 2, 3, 4, 5, 6, 7]);
@@ -197,7 +227,7 @@ mod tests {
         assert_eq!(batch.len(), 3);
         // 失敗した想定: 何も commit しなければ 5 件のまま。
         assert_eq!(queue.len(), 5);
-        queue.commit(batch.len());
+        queue.commit(&batch);
         assert_eq!(queue.len(), 2);
         assert_eq!(
             queue
@@ -209,11 +239,87 @@ mod tests {
         );
     }
 
+    /// INSERT を待つ間に満杯で先頭が入れ替わっても、未送信行を ACK しない。
     #[test]
-    fn commit_beyond_the_queue_length_is_clamped() {
-        let mut queue = RowQueue::new(10);
+    fn overflow_during_insert_must_not_ack_unsent_rows() {
+        let mut queue = RowQueue::new(3);
+        for id in 1..=3 {
+            queue.push(row(id, id * 10));
+        }
+        let batch = queue.peek_batch(2); // A, B を送信中
+        queue.push(row(4, 40)); // A が overflow で消え、B, C, D が残る
+        queue.commit(&batch); // INSERT 成功後の ACK
+        assert_eq!(
+            queue
+                .peek_batch(3)
+                .iter()
+                .map(|r| r.tag_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4], // 未送信の C を残す
+        );
+        assert_eq!(queue.dropped(), 1, "overflow の既存 drop 方針を維持");
+    }
+
+    #[test]
+    fn commit_after_all_sent_rows_were_dropped_preserves_new_rows() {
+        let mut queue = RowQueue::new(2);
         queue.push(row(1, 10));
-        queue.commit(99);
+        queue.push(row(2, 20));
+        let batch = queue.peek_batch(1);
+        queue.push(row(3, 30));
+        queue.push(row(4, 40));
+        queue.commit(&batch);
+        assert_eq!(
+            queue
+                .peek_batch(2)
+                .iter()
+                .map(|r| r.tag_id)
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert_eq!(queue.dropped(), 2);
+    }
+
+    #[test]
+    fn failed_insert_retries_the_same_rows_after_overflow() {
+        let mut queue = RowQueue::new(3);
+        for id in 1..=3 {
+            queue.push(row(id, id * 10));
+        }
+        let _failed = queue.peek_batch(2);
+        queue.push(row(4, 40));
+        // INSERT 失敗: ACK しない。A は overflow したが B は再送できる。
+        let retry = queue.peek_batch(2);
+        assert_eq!(
+            retry.iter().map(|r| r.tag_id).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        queue.commit(&retry);
+        assert_eq!(queue.peek_batch(2)[0].tag_id, 4);
+    }
+
+    #[test]
+    fn ack_preserves_rows_enqueued_during_insert_including_identical_values() {
+        let mut queue = RowQueue::new(3);
+        queue.push(row(1, 10));
+        let batch = queue.peek_batch(1);
+        queue.push(row(1, 10));
+        queue.commit(&batch);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.peek_batch(1)[0], row(1, 10));
+    }
+
+    #[test]
+    fn shutdown_drain_acks_only_successful_batches_then_counts_remainder() {
+        let mut queue = RowQueue::new(4);
+        for id in 1..=4 {
+            queue.push(row(id, id * 10));
+        }
+        let first = queue.peek_batch(2);
+        queue.commit(&first);
+        let _failed = queue.peek_batch(2); // 停止時 flush の次の INSERT が失敗した想定
+        assert_eq!(queue.discard_all(), 2);
+        assert_eq!(queue.dropped(), 2);
         assert!(queue.is_empty());
     }
 

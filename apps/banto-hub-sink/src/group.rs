@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
 
 use crate::hub_api::SinkConfigGroup;
-use crate::queue::{Row, RowQueue};
+use crate::queue::{Row, RowBatch, RowQueue};
 use crate::sql::Table;
 use crate::status::GroupState;
 use crate::values::ValueView;
@@ -212,12 +212,12 @@ impl GroupRuntime {
         self.queue().dropped()
     }
 
-    pub fn peek_batch(&self, limit: usize) -> Vec<Row> {
+    pub fn peek_batch(&self, limit: usize) -> RowBatch {
         self.queue().peek_batch(limit)
     }
 
-    pub fn commit_batch(&self, count: usize) {
-        self.queue().commit(count);
+    pub fn commit_batch(&self, batch: &RowBatch) {
+        self.queue().commit(batch);
     }
 
     /// 停止時に残った行を捨てて `dropped` に計上する（設計 §5.6）。
