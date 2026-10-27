@@ -63,6 +63,7 @@ struct Core {
     response_timeout: Duration,
     can_write: bool,
     outside: std::collections::HashSet<(String, banto_driver_api::TagKind)>,
+    outside_before_accept: Option<std::collections::HashSet<(String, banto_driver_api::TagKind)>>,
     events: Option<Arc<dyn EngineEvents>>,
     /// 最後に送り終えた・受け終えた時刻の遅い方（フレーム間の無音の起点）。
     last_quiet_from: Option<Instant>,
@@ -118,6 +119,7 @@ impl FrameSession {
             events,
             last_quiet_from: None,
             outside: std::collections::HashSet::new(),
+            outside_before_accept: None,
         };
         let result = core.handshake().await;
         match result {
@@ -205,6 +207,27 @@ fn record_driver_error(
 }
 
 impl Session for FrameSession {
+    fn refresh_diagnostic<'a>(&'a mut self) -> BoxFuture<'a, Result<(), FatalError>> {
+        Box::pin(async move {
+            let mut core = self.take_core()?;
+            let result = match core.conn.refresh_for_diagnostic() {
+                Ok(true) => core.handshake().await,
+                Ok(false) => Ok(()),
+                Err(error) => Err(error),
+            };
+            match result {
+                Ok(()) => {
+                    self.core = Some(core);
+                    Ok(())
+                }
+                Err(error) => {
+                    core.close().await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
     fn diagnose_batch<'a>(
         &'a mut self,
         specs: &'a [TagSpec],
@@ -217,14 +240,6 @@ impl Session for FrameSession {
             }
             match core.diagnose(specs).await {
                 Ok(report) => {
-                    for (spec, result) in specs.iter().zip(&report.tags) {
-                        let key = (spec.address.canonical.clone(), spec.kind.clone());
-                        if matches!(result.verdict, banto_driver_api::TagVerdict::Outside(_)) {
-                            core.outside.insert(key);
-                        } else {
-                            core.outside.remove(&key);
-                        }
-                    }
                     self.core = Some(core);
                     Ok(Some(report))
                 }
@@ -234,6 +249,36 @@ impl Session for FrameSession {
                 }
             }
         })
+    }
+
+    fn accept_diagnostic(&mut self, specs: &[TagSpec], report: &DiagnosticReport) {
+        if specs.len() != report.tags.len() {
+            return;
+        }
+        if let Some(core) = self.core.as_mut() {
+            for (spec, result) in specs.iter().zip(&report.tags) {
+                if spec.address.canonical != result.address {
+                    return;
+                }
+            }
+            core.outside_before_accept = Some(core.outside.clone());
+            for (spec, result) in specs.iter().zip(&report.tags) {
+                let key = (spec.address.canonical.clone(), spec.kind.clone());
+                if matches!(result.verdict, banto_driver_api::TagVerdict::Outside(_)) {
+                    core.outside.insert(key);
+                } else {
+                    core.outside.remove(&key);
+                }
+            }
+        }
+    }
+
+    fn discard_diagnostic(&mut self) {
+        if let Some(core) = self.core.as_mut() {
+            if let Some(previous) = core.outside_before_accept.take() {
+                core.outside = previous;
+            }
+        }
     }
 
     fn read_batch<'a>(

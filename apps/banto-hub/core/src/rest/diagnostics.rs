@@ -5,7 +5,7 @@ use super::{
     require_editor, ApiError, HeaderMap, IntoResponse, Json, Path, Response, State, StatusCode,
     TagRegistryState,
 };
-use banto_driver_api::{CountBound, TagSpec, TagVerdict};
+use banto_driver_api::{CountBound, DataType, TagKind, TagSpec, TagVerdict};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -129,6 +129,13 @@ pub(super) async fn range_diagnostic_post(
         .map(|g| g.id)
         .collect();
     let requested: HashSet<_> = input.tag_ids.iter().copied().collect();
+    if input.tag_ids.len() > 256 {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(unavailable("select at most 256 saved PLC tags")),
+        )
+            .into_response());
+    }
     if requested.len() != input.tag_ids.len() {
         return Ok((
             StatusCode::BAD_REQUEST,
@@ -146,12 +153,10 @@ pub(super) async fn range_diagnostic_post(
         })
         .collect();
     tags.sort_by_key(|tag| tag.id);
-    if tags.len() > 256 || (!requested.is_empty() && tags.len() != requested.len()) {
+    if !requested.is_empty() && tags.len() != requested.len() {
         return Ok((
             StatusCode::BAD_REQUEST,
-            Json(unavailable(
-                "select 1..=256 saved PLC tags on this connection",
-            )),
+            Json(unavailable("select saved PLC tags on this connection")),
         )
             .into_response());
     }
@@ -183,8 +188,54 @@ pub(super) async fn range_diagnostic_post(
     let Some(epoch) = handle.session_epoch() else {
         return Ok(Json(unavailable("broker session is disconnected")).into_response());
     };
-    let result = tokio::time::timeout(Duration::from_secs(12), handle.diagnose(specs)).await;
-    let report = match result {
+    // The guest keeps the discovered bit counts on its connection resource.
+    // Acquire a fresh resource once per request, then diagnose all chunks on
+    // that same physical session. A bit chunk comes first so later reports
+    // share the same SD evidence; the final result is restored to tag ID order.
+    let mut selected: Vec<_> = tag_ids.iter().copied().zip(specs.iter().cloned()).collect();
+    selected.sort_by_key(|(id, spec)| (!matches!(spec.kind, TagKind::Numeric(DataType::Bit)), *id));
+    let result = tokio::time::timeout(Duration::from_secs(12), async {
+        handle
+            .refresh_diagnostic()
+            .await
+            .map_err(|_| "diagnostic refresh failed")?;
+        if !epoch.is_current(&handle) {
+            return Err("connection changed during diagnostic refresh");
+        }
+        let chunks: Vec<&[(i64, TagSpec)]> = if selected.is_empty() {
+            vec![&[]]
+        } else {
+            selected.chunks(256).collect()
+        };
+        let mut complete: Option<banto_driver_api::DiagnosticReport> = None;
+        for chunk in chunks {
+            let request: Vec<_> = chunk.iter().map(|(_, spec)| spec.clone()).collect();
+            let Some(part) = handle
+                .diagnose(request)
+                .await
+                .map_err(|_| "diagnostic failed")?
+            else {
+                return Ok(None);
+            };
+            if !epoch.is_current(&handle) {
+                return Err("connection changed during diagnostic");
+            }
+            if let Some(report) = &mut complete {
+                if report.model != part.model
+                    || report.model_reason != part.model_reason
+                    || report.counts != part.counts
+                {
+                    return Err("device evidence changed between diagnostic chunks");
+                }
+                report.tags.extend(part.tags);
+            } else {
+                complete = Some(part);
+            }
+        }
+        Ok(complete)
+    })
+    .await;
+    let mut report = match result {
         Ok(Ok(Some(report))) => report,
         Ok(Ok(None)) => {
             return Ok(Json(
@@ -192,26 +243,39 @@ pub(super) async fn range_diagnostic_post(
             )
             .into_response())
         }
-        Ok(Err(_)) => {
-            return Ok(Json(unavailable(
-                "diagnostic failed; retry after checking the connection",
-            ))
-            .into_response())
-        }
+        Ok(Err(reason)) => return Ok(Json(unavailable(reason)).into_response()),
         Err(_) => {
             return Ok(
                 Json(unavailable("diagnostic timed out; result was discarded")).into_response(),
             )
         }
     };
+    let mut ordered: Vec<_> = selected
+        .iter()
+        .map(|(id, _)| *id)
+        .zip(report.tags)
+        .collect();
+    ordered.sort_by_key(|(id, _)| *id);
+    report.tags = ordered.into_iter().map(|(_, tag)| tag).collect();
+    if !epoch.is_current(&handle) {
+        return Ok(Json(unavailable("connection changed; result discarded")).into_response());
+    }
+    let accepted = handle
+        .accept_diagnostic(epoch.clone(), specs, report.clone())
+        .await
+        .unwrap_or(false);
+    if !accepted {
+        return Ok(Json(unavailable("connection changed; result discarded")).into_response());
+    }
     if !manager.publish_range_diagnostic(
         connection_id,
         revision,
         &version,
-        epoch,
+        epoch.clone(),
         tag_ids.clone(),
         report.clone(),
     ) {
+        let _ = handle.discard_diagnostic(epoch).await;
         return Ok(Json(unavailable(
             "connection, settings, driver or catalog changed; result discarded",
         ))

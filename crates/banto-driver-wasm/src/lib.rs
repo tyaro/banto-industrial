@@ -1073,6 +1073,7 @@ impl FrameDriver for WasmDriver {
         Ok(Box::new(WasmConnection {
             instance: Mutex::new(instance),
             resource,
+            settings: settings.clone(),
             runtime: self.runtime.clone(),
             failed: AtomicBool::new(false),
             controlled_write_target: self.controlled_write_target,
@@ -1085,6 +1086,7 @@ impl FrameDriver for WasmDriver {
 struct WasmConnection {
     instance: Mutex<Instance>,
     resource: wasmtime::component::ResourceAny,
+    settings: Settings,
     runtime: Arc<Runtime>,
     failed: AtomicBool,
     controlled_write_target: ControlledWriteTarget,
@@ -1116,6 +1118,39 @@ impl WasmConnection {
 }
 
 impl FrameConnection for WasmConnection {
+    fn refresh_for_diagnostic(&mut self) -> Result<bool, FatalError> {
+        if !self.runtime.diagnostics_available() {
+            return Ok(false);
+        }
+        if self.failed.load(Ordering::Acquire) {
+            return Err(FatalError::Protocol("WASM connection was discarded".into()));
+        }
+        let mut locked = self
+            .instance
+            .lock()
+            .map_err(|_| FatalError::Protocol("WASM store lock poisoned".into()))?;
+        let instance = &mut *locked;
+        instance.store.set_epoch_deadline(100);
+        let resource = instance
+            .driver
+            .banto_driver_session()
+            .connection()
+            .call_create(&mut instance.store, &wit_settings(&self.settings))
+            .map_err(|e| {
+                self.failed.store(true, Ordering::Release);
+                normalize(self.runtime.record("diagnostics.connection.create", e))
+            })?
+            .map_err(api_fatal)?;
+        let previous = std::mem::replace(&mut self.resource, resource);
+        if let Err(error) = previous.resource_drop(&mut instance.store) {
+            self.failed.store(true, Ordering::Release);
+            return Err(normalize(
+                self.runtime.record("diagnostics.connection.drop", error),
+            ));
+        }
+        Ok(true)
+    }
+
     fn supports_diagnostics(&self) -> bool {
         self.runtime.diagnostics_available()
     }

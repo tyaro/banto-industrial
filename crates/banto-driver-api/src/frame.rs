@@ -238,6 +238,13 @@ pub trait FrameDriver: DriverBase {
 /// by reads and writes) and `write_next` (numbering and the write in
 /// progress). `decode_read` and `is_complete` take `&self`.
 pub trait FrameConnection: Send + 'static {
+    /// Replace protocol-local discovery state before an explicit recheck.
+    /// The engine then handshakes the replacement over the same transport.
+    /// Legacy drivers keep their existing connection state.
+    fn refresh_for_diagnostic(&mut self) -> Result<bool, FatalError> {
+        Ok(false)
+    }
+
     /// Optional read-only discovery on this physical connection. Legacy
     /// drivers keep their existing read/write behavior without this export.
     fn supports_diagnostics(&self) -> bool {

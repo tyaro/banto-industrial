@@ -22,6 +22,7 @@ GET /api/pending-changes
 GET /api/pending-changes/{id}
 GET /api/plc-connections
 GET /api/plc-connections/{id}
+GET /api/plc-connections/{id}/diagnostics
 GET /api/sink/config
 GET /api/sink/groups
 GET /api/sink/groups/{id}
@@ -69,6 +70,7 @@ POST /api/pending-changes/{id}/cancel
 POST /api/pending-changes/{id}/requeue
 POST /api/plc-connections
 POST /api/plc-connections/test
+POST /api/plc-connections/{id}/diagnostics
 POST /api/plc-connections/{id}/test
 POST /api/sink/groups
 POST /api/store-settings/prune-now

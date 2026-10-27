@@ -622,9 +622,22 @@ pub enum BrokerError {
 /// caller relies on: a caller that only ever gets a [`ReadOnlyHandle`] can
 /// never construct a `Write` job.
 enum Job {
+    RefreshDiagnostic {
+        respond_to: oneshot::Sender<Result<(), BrokerError>>,
+    },
     Diagnose {
         specs: Vec<TagSpec>,
         respond_to: oneshot::Sender<DiagnosticOutcome>,
+    },
+    AcceptDiagnostic {
+        specs: Vec<TagSpec>,
+        report: DiagnosticReport,
+        epoch: SessionEpoch,
+        respond_to: oneshot::Sender<bool>,
+    },
+    DiscardDiagnostic {
+        epoch: SessionEpoch,
+        respond_to: oneshot::Sender<bool>,
     },
     Read {
         specs: Vec<TagSpec>,
@@ -680,6 +693,7 @@ pub struct BrokerHandle {
 /// Captures one connected physical session for an asynchronous diagnostic.
 /// A reconnect may return to `Connected` before a previous result arrives;
 /// the watch version still changes, so that result must not be published.
+#[derive(Clone)]
 pub struct SessionEpoch {
     task_identity: Arc<()>,
     status_rx: watch::Receiver<BrokerConnectionStatus>,
@@ -712,6 +726,60 @@ impl std::fmt::Debug for BrokerHandle {
 }
 
 impl BrokerHandle {
+    /// Reacquire device discovery on the existing physical broker session.
+    pub async fn refresh_diagnostic(&self) -> Result<(), BrokerError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::RefreshDiagnostic { respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })?
+    }
+
+    /// Commit read suppression only for a report the caller accepted.
+    pub async fn accept_diagnostic(
+        &self,
+        epoch: SessionEpoch,
+        specs: Vec<TagSpec>,
+        report: DiagnosticReport,
+    ) -> Result<bool, BrokerError> {
+        if !epoch.is_current(&self.read_only()) {
+            return Ok(false);
+        }
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::AcceptDiagnostic {
+                specs,
+                report,
+                epoch,
+                respond_to,
+            })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })
+    }
+
+    pub async fn discard_diagnostic(&self, epoch: SessionEpoch) -> Result<bool, BrokerError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::DiscardDiagnostic { epoch, respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })
+    }
+
     /// Submit a read-only diagnostic as one exclusive broker job.
     pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
         let (respond_to, rx) = oneshot::channel();
@@ -815,6 +883,23 @@ pub struct ReadOnlyHandle {
 }
 
 impl ReadOnlyHandle {
+    pub async fn refresh_diagnostic(&self) -> Result<(), BrokerError> {
+        self.inner.refresh_diagnostic().await
+    }
+
+    pub async fn accept_diagnostic(
+        &self,
+        epoch: SessionEpoch,
+        specs: Vec<TagSpec>,
+        report: DiagnosticReport,
+    ) -> Result<bool, BrokerError> {
+        self.inner.accept_diagnostic(epoch, specs, report).await
+    }
+
+    pub async fn discard_diagnostic(&self, epoch: SessionEpoch) -> Result<bool, BrokerError> {
+        self.inner.discard_diagnostic(epoch).await
+    }
+
     /// Submit the same read-only diagnostic without write capability.
     pub async fn diagnose(&self, specs: Vec<TagSpec>) -> DiagnosticOutcome {
         self.inner.diagnose(specs).await
@@ -883,8 +968,17 @@ pub fn spawn_test_handle_with_status(
     let task = tokio::spawn(async move {
         while let Some(job) = rx.recv().await {
             match job {
+                Job::RefreshDiagnostic { respond_to } => {
+                    let _ = respond_to.send(Ok(()));
+                }
                 Job::Diagnose { respond_to, .. } => {
                     let _ = respond_to.send(Ok(None));
+                }
+                Job::AcceptDiagnostic { respond_to, .. } => {
+                    let _ = respond_to.send(true);
+                }
+                Job::DiscardDiagnostic { respond_to, .. } => {
+                    let _ = respond_to.send(true);
                 }
                 Job::Read { respond_to, .. } => {
                     let _ = respond_to.send(Ok(Vec::new()));
@@ -1666,6 +1760,21 @@ async fn run_broker_task(
                 // `state` from ending mid-await from ever overlapping with the
                 // reassignment below.
                 let fatal = match job {
+                    Job::RefreshDiagnostic { respond_to } => {
+                        if respond_to.is_closed() {
+                            continue;
+                        }
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                tokio::time::timeout(
+                                    diagnostic_job_limit(timeouts.response),
+                                    session.refresh_diagnostic(),
+                                ).await.unwrap_or(Err(FatalError::Timeout)),
+                            ),
+                            _ => None,
+                        };
+                        answer(connection_id, respond_to, outcome)
+                    }
                     Job::Diagnose { specs, respond_to } => {
                         let outcome = match &mut state {
                             ConnState::Connected(session) => Some(
@@ -1679,6 +1788,31 @@ async fn run_broker_task(
                             _ => None,
                         };
                         answer(connection_id, respond_to, outcome)
+                    }
+                    Job::AcceptDiagnostic { specs, report, epoch, respond_to } => {
+                        let current = epoch.diagnostic_attempt.load(Ordering::Acquire) == epoch.attempt
+                            && matches!(epoch.status_rx.has_changed(), Ok(false))
+                            && !respond_to.is_closed();
+                        let accepted = if current {
+                            if let ConnState::Connected(session) = &mut state {
+                                session.accept_diagnostic(&specs, &report);
+                                true
+                            } else { false }
+                        } else { false };
+                        let _ = respond_to.send(accepted);
+                        false
+                    }
+                    Job::DiscardDiagnostic { epoch, respond_to } => {
+                        let current = epoch.diagnostic_attempt.load(Ordering::Acquire) == epoch.attempt
+                            && matches!(epoch.status_rx.has_changed(), Ok(false));
+                        let discarded = if current {
+                            if let ConnState::Connected(session) = &mut state {
+                                session.discard_diagnostic();
+                                true
+                            } else { false }
+                        } else { false };
+                        let _ = respond_to.send(discarded);
+                        false
                     }
                     Job::Read { specs, respond_to } => {
                         let outcome = match &mut state {

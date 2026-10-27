@@ -310,10 +310,48 @@ fn session(conn: Conn, wire: Wire, events: Arc<Recorder>) -> FrameSession {
             response_timeout: T,
             can_write: true,
             outside: std::collections::HashSet::new(),
+            outside_before_accept: None,
             events: Some(events),
             last_quiet_from: None,
         }),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn abandoned_diagnostic_does_not_suppress_reads_and_rejected_adoption_rolls_back() {
+    let stats = Arc::<Stats>::default();
+    let mut session = session(
+        Conn::new(stats.clone()),
+        Wire::new(stats.clone()),
+        Arc::default(),
+    );
+    let spec = spec();
+    let report = DiagnosticReport {
+        model: None,
+        model_reason: None,
+        counts: Vec::new(),
+        tags: vec![banto_driver_api::TagDiagnostic {
+            address: spec.address.canonical.clone(),
+            verdict: banto_driver_api::TagVerdict::Outside("configured-count".into()),
+        }],
+    };
+    // Constructing or returning a report is inert until the caller accepts it.
+    assert!(session
+        .read_batch(std::slice::from_ref(&spec))
+        .await
+        .unwrap()[0]
+        .is_ok());
+    let sent = stats.sends.load(Ordering::SeqCst);
+    session.accept_diagnostic(std::slice::from_ref(&spec), &report);
+    assert!(session
+        .read_batch(std::slice::from_ref(&spec))
+        .await
+        .unwrap()[0]
+        .is_err());
+    assert_eq!(stats.sends.load(Ordering::SeqCst), sent);
+    session.discard_diagnostic();
+    assert!(session.read_batch(&[spec]).await.unwrap()[0].is_ok());
+    assert!(stats.sends.load(Ordering::SeqCst) > sent);
 }
 
 #[tokio::test(start_paused = true)]

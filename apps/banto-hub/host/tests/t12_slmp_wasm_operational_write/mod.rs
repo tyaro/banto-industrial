@@ -1,5 +1,6 @@
 //! Normal D/u16 policy acceptance through an isolated loopback SLMP peer.
 
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +31,7 @@ struct Fixture {
     address: std::net::SocketAddr,
     frames: RecordedFrames,
     commands: Arc<Mutex<Vec<(u16, u32, u16)>>>,
+    count: Arc<AtomicU32>,
     write_devices: Arc<Mutex<Vec<u8>>>,
     bit_frames: RecordedBits,
     task: tokio::task::JoinHandle<()>,
@@ -43,6 +45,8 @@ impl Fixture {
         let writes = frames.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let events = commands.clone();
+        let live_count = Arc::new(AtomicU32::new(count));
+        let count_on_wire = live_count.clone();
         let write_devices = Arc::new(Mutex::new(Vec::new()));
         let devices = write_devices.clone();
         let bit_frames: RecordedBits = Arc::new(Mutex::new(Vec::new()));
@@ -62,6 +66,7 @@ impl Fixture {
                         break;
                     }
                     let command = u16::from_le_bytes([request[15], request[16]]);
+                    let count = count_on_wire.load(Ordering::SeqCst);
                     let subcommand = u16::from_le_bytes([request[17], request[18]]);
                     let start = if command == 0x0101 {
                         0
@@ -274,6 +279,7 @@ impl Fixture {
             address,
             frames,
             commands,
+            count: live_count,
             write_devices,
             bit_frames,
             task,
@@ -286,6 +292,10 @@ impl Fixture {
 
     fn commands(&self) -> Vec<(u16, u32, u16)> {
         self.commands.lock().unwrap().clone()
+    }
+
+    fn set_count(&self, count: u32) {
+        self.count.store(count, Ordering::SeqCst);
     }
 
     fn write_devices(&self) -> Vec<u8> {
@@ -354,6 +364,7 @@ async fn diagnostic_guest_uses_existing_connection_and_preserves_read() {
         .commands()
         .iter()
         .any(|(command, start, _)| *command == 0x0401 && *start == 262));
+    session.accept_diagnostic(&specs, &report);
     let values = session.read_batch(&specs[..1]).await.unwrap();
     assert_eq!(values.len(), 1);
     assert!(values[0].is_ok());
@@ -372,6 +383,19 @@ async fn diagnostic_guest_uses_existing_connection_and_preserves_read() {
     assert!(fixture.commands()[before..]
         .iter()
         .all(|(_, start, _)| *start != 4000));
+    fixture.set_count(2000);
+    session.refresh_diagnostic().await.unwrap();
+    let refreshed = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(matches!(refreshed.tags[0].verdict, TagVerdict::Outside(_)));
+    assert_eq!(
+        fixture
+            .commands()
+            .iter()
+            .filter(|(command, _, _)| *command == 0x0101)
+            .count(),
+        2,
+        "recheck must fetch the model on the same physical session again"
+    );
     assert!(fixture.frames().is_empty());
     session.disconnect().await;
 }
@@ -428,6 +452,24 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
         .create(super::tag_input("outside", group.id, "D4000", "u16"))
         .await
         .unwrap();
+    let bit = app
+        .manager
+        .tags()
+        .create(super::tag_input("bit", group.id, "M10", "bit"))
+        .await
+        .unwrap();
+    for index in 0..254 {
+        app.manager
+            .tags()
+            .create(super::tag_input(
+                &format!("extra-{index}"),
+                group.id,
+                &format!("D{index}"),
+                "u16",
+            ))
+            .await
+            .unwrap();
+    }
     app.manager.rebuild().await.unwrap();
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
@@ -448,13 +490,35 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
     .await;
     assert_eq!(status, super::StatusCode::OK, "{report:?}");
     assert_eq!(report["status"], "current");
+    assert_eq!(report["tags"].as_array().map(Vec::len), Some(257));
     assert!(report["tags"].as_array().is_some_and(|tags| {
         tags.iter()
             .any(|tag| tag["tagId"] == inside.id && tag["verdict"] == "inside")
             && tags
                 .iter()
                 .any(|tag| tag["tagId"] == outside.id && tag["verdict"] == "outside")
+            && tags
+                .iter()
+                .any(|tag| tag["tagId"] == bit.id && tag["verdict"] == "inside")
     }));
+    assert!(report["counts"].as_array().is_some_and(|counts| counts
+        .iter()
+        .any(|count| { count["area"] == "M" && count["bound"] != "unknown" })));
+    let all_ids: Vec<_> = report["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tag| tag["tagId"].as_i64().unwrap())
+        .collect();
+    let (too_many, _) = super::admin_write(
+        &app.router,
+        "POST",
+        &path,
+        &app.admin_token,
+        serde_json::json!({ "tagIds": all_ids }),
+    )
+    .await;
+    assert_eq!(too_many, super::StatusCode::BAD_REQUEST);
     let (status, cached) = super::admin_write(
         &app.router,
         "GET",
@@ -466,6 +530,29 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
     assert_eq!(status, super::StatusCode::OK);
     assert_eq!(cached["status"], "current");
     assert_eq!(cached["tags"], report["tags"]);
+    fixture.set_count(2000);
+    let (status, refreshed) = super::admin_write(
+        &app.router,
+        "POST",
+        &path,
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{refreshed:?}");
+    assert!(refreshed["tags"].as_array().is_some_and(|tags| tags
+        .iter()
+        .any(|tag| { tag["tagId"] == inside.id && tag["verdict"] == "outside" })));
+    assert_eq!(app.sessions.connection_count(), 1);
+    assert_eq!(
+        fixture
+            .commands()
+            .iter()
+            .filter(|(command, _, _)| *command == 0x0101)
+            .count(),
+        3,
+        "every recheck must reacquire model and SD on the broker connection"
+    );
     assert!(fixture.frames().is_empty());
     drop(app);
 }
