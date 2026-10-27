@@ -523,8 +523,8 @@ async fn test_app_with_drivers_and_options(
         users.clone(),
         audit,
         manager.plc_connections(),
-        CollectionGroupService::new(pool.clone()),
-        TagService::new(pool.clone()),
+        manager.collection_groups(),
+        manager.tags(),
         api_keys,
         manager.clone(),
         auth,
@@ -1922,6 +1922,7 @@ async fn native_slmp_v_is_rejected_by_tag_rest_and_csv_style_batch() {
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["field_errors"][0]["field"], "address", "{body:?}");
     assert!(body.to_string().contains("定期収集"), "{body:?}");
     // CSV import submits its parsed rows to the batch endpoint.
     let (status, body) = admin_write(
@@ -1932,9 +1933,12 @@ async fn native_slmp_v_is_rejected_by_tag_rest_and_csv_style_batch() {
         json!({"tags": [payload("csv-ok", "M1"), payload("csv-v", "V1")], "dryRun": false}),
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false, "{body:?}");
+    assert_eq!(body["count"], 0, "{body:?}");
+    assert_eq!(body["errors"][0]["index"], 1, "{body:?}");
     assert_eq!(
-        body["field_errors"][0]["field"], "configuration",
+        body["errors"][0]["fieldErrors"][0]["field"], "address",
         "{body:?}"
     );
     assert!(body.to_string().contains("定期収集"), "{body:?}");
@@ -1944,4 +1948,14 @@ async fn native_slmp_v_is_rejected_by_tag_rest_and_csv_style_batch() {
         .await
         .unwrap();
     assert_eq!(count, 0);
+    let (status, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.admin_token,
+        payload("m-accepted", "M1"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["address"], "M1", "{body:?}");
 }
