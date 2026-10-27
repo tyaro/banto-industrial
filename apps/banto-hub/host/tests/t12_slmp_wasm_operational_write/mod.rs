@@ -560,6 +560,232 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
     drop(app);
 }
 
+const NEW_GUEST_COMPONENT_ENV: &str = "BANTO_SLMP_NEW_COMPONENT_WASM";
+const V_REASON: &str = "V edge relay cannot be collected reliably: a one-scan edge may be missed";
+
+fn new_guest_component() -> Vec<u8> {
+    std::fs::read(std::env::var(NEW_GUEST_COMPONENT_ENV).expect("set new SLMP guest path")).unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #34 component"]
+async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
+    use banto_driver_api::DriverAddress;
+
+    let bytes = new_guest_component();
+    let driver = WasmDriver::load_operational_write(MANIFEST, &bytes).unwrap();
+    let bit = TagKind::numeric(DataType::Bit);
+    for address in ["V0", "V14"] {
+        assert_eq!(
+            driver.parse_address(address, &bit).unwrap_err().message(),
+            V_REASON
+        );
+        assert_eq!(
+            driver
+                .offset_address(address, &bit, 1)
+                .unwrap_err()
+                .message(),
+            V_REASON
+        );
+        assert_eq!(
+            driver.offset_words(address, 1).unwrap_err().message(),
+            V_REASON
+        );
+    }
+    assert!(driver
+        .address_help()
+        .contains("V edge relays cannot be registered"));
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let transport = TransportSpec::Tcp {
+        host: "127.0.0.1".into(),
+        port: fixture.address.port(),
+    };
+    let context = ConnectContext::new(
+        "slmp-wasm-operational-write",
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    let mut session = FrameSession::connect(
+        driver.as_ref(),
+        &settings(fixture.address.port(), "disabled", ""),
+        &transport,
+        &context,
+        None,
+    )
+    .await
+    .unwrap();
+    let word = TagKind::numeric(DataType::U16);
+    // A saved V tag cannot be created with this guest. Supply one manually here
+    // to check that read planning and diagnostics still defend the boundary.
+    let v = TagSpec::new(
+        DriverAddress::new(driver.descriptor().id.clone(), "V14", "V", false, 1).with_index(14),
+        bit.clone(),
+    );
+    let specs = vec![
+        TagSpec::new(driver.parse_address("D3010", &word).unwrap(), word.clone()),
+        v,
+        TagSpec::new(driver.parse_address("D3011", &word).unwrap(), word),
+        TagSpec::new(driver.parse_address("M10", &bit).unwrap(), bit),
+    ];
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert_eq!(report.tags.len(), 4);
+    assert!(matches!(&report.tags[1].verdict, TagVerdict::Invalid(reason) if reason == V_REASON));
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[3].verdict, TagVerdict::Inside(_)));
+    let values = session.read_batch(&specs).await.unwrap();
+    assert_eq!(values[0], Ok(Value::F64(7.0)));
+    assert!(matches!(values[1], Err(ItemError::Unsupported(_))));
+    assert_eq!(values[2], Ok(Value::F64(7.0)));
+    assert_eq!(values[3], Ok(Value::Bit(true)));
+    let plans = session.connection_mut().unwrap().plan_read(&specs).unwrap();
+    assert_eq!(
+        plans
+            .iter()
+            .map(|plan| plan.covers.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![0], vec![2], vec![3]]
+    );
+    assert!(fixture
+        .commands()
+        .iter()
+        .all(|(command, start, _)| *command != 0x0401 || *start != 14));
+    assert!(fixture.frames().is_empty());
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #34 component"]
+async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let bytes = new_guest_component();
+    let app =
+        super::test_app_with_operational_write_manifest("t12-slmp-v-guest", MANIFEST, &bytes).await;
+    let saved = app.manager.plc_connections().create_settings(super::ConnectionSettingsInput {
+        name: "v-line".into(),
+        protocol: "slmp-wasm-operational-write".into(),
+        enabled: true,
+        simulation: false,
+        settings: serde_json::json!({"host":"127.0.0.1", "port":fixture.address.port(), "d_u16_write_mode":"disabled", "d_u16_write_allowlist":""})
+            .as_object().unwrap().clone(),
+        secrets: Default::default(),
+    }).await.unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("v-group", saved.id, 100))
+    .await
+    .unwrap();
+    let rejected = app
+        .manager
+        .tags()
+        .create(super::tag_input("v-direct", group.id, "V14", "bit"))
+        .await
+        .unwrap_err();
+    assert!(format!("{rejected:?}").contains(V_REASON), "{rejected:?}");
+    let payload = |name: &str, address: &str, data_type: &str| {
+        serde_json::json!({
+            "name": name, "collectionGroupId": group.id, "address": address,
+            "dataType": data_type, "enabled": true, "writable": false
+        })
+    };
+    let (status, body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.admin_token,
+        payload("v-rest", "V14", "bit"),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["field_errors"][0]["field"], "address");
+    assert!(body.to_string().contains(V_REASON), "{body:?}");
+    let (status, body) = super::admin_write(&app.router, "POST", "/api/tags/batch", &app.admin_token,
+        serde_json::json!({"tags": [payload("mixed-m", "M10", "bit"), payload("mixed-v", "V14", "bit")], "dryRun": false})).await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["count"], 0);
+    assert_eq!(body["errors"][0]["index"], 1);
+    assert_eq!(body["errors"][0]["fieldErrors"][0]["field"], "address");
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tags WHERE collection_group_id = ?")
+        .bind(group.id)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let mut ids = Vec::new();
+    for (name, address, kind) in [("word", "D3010", "u16"), ("bit", "M10", "bit")] {
+        let (status, body) = super::admin_write(
+            &app.router,
+            "POST",
+            "/api/tags",
+            &app.admin_token,
+            payload(name, address, kind),
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{body:?}");
+        ids.push(body["id"].as_i64().unwrap());
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut connection_status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        connection_status
+            .wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if ids.iter().all(|id| {
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .is_some_and(|sample| sample.quality == Quality::Good)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for (name, value) in [
+        ("word", serde_json::json!(7.0)),
+        ("bit", serde_json::json!(true)),
+    ] {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/v-line.v-group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], value, "{body:?}");
+        assert_eq!(body["q"], "good");
+    }
+    let (status, report) = super::admin_write(
+        &app.router,
+        "POST",
+        &format!("/api/plc-connections/{}/diagnostics", saved.id),
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{report:?}");
+    assert_eq!(report["status"], "current");
+    assert_eq!(report["tags"].as_array().map(Vec::len), Some(2));
+    assert!(report["tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tag| tag["verdict"] == "inside"));
+    assert_eq!(app.sessions.connection_count(), 1);
+    assert!(fixture.frames().is_empty());
+    drop(app);
+}
 fn settings(port: u16, mode: &str, allowlist: &str) -> Settings {
     Settings::from_pairs([
         ("host".to_owned(), "127.0.0.1".to_owned()),
