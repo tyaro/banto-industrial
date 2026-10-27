@@ -1,7 +1,7 @@
 # 外部 DB 連携 検証手順（S3 手動 smoke / S7 実 DB 検証 / R2a の DB ブリッジ）
 
 作成日: 2026-09-07
-状態: **手順のみ（未実施）**。2026-10-28: §3.3 に S7 本番（2026-11-02〜11-08）の準備 P-1〜P-8・当日の順番 D-1〜D-6・#229 の確認項目のうち §3 に無いもの S-1〜S-5・記録様式 R-1〜R-6 を追加し、#644 で Hub–Sink が loopback の専用 TLS だけになったことを §1・B-3 に反映した。P-1・P-5・P-7 をオーナーが推奨案どおりに決め、結果の文書を足した（未実施）。2026-10-22（R2b-1f）: §3.2 に R2b-1 の移行・DPAPI の封印・戻し方の実機確認 C-1〜C-14 を追加（オーナー同席、未実施）。2026-10-21（R2a-3c）: §3.1 に DB ブリッジ（取り込み口 `push`）の実機確認 B-16〜B-28 を追加（Hub 内の DB Source と同じ SQL を読むブリッジを並べて値と品質の一致を確かめる。自動テスト `bridge_parity.rs` の実機版、オーナー同席で行う。未実施）。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
+状態: **手順のみ（本番は未実施、準備は済み）**。2026-10-28（#892）: 準備 P-1〜P-6 をオーナー同席で行い、結果を real-machine-test-2026-11-s7.md に記録した。DB の PC が Wi-Fi の Mac になったので、切断の手段を Mac の Wi-Fi を切ることに替え、Mac でのコマンドを P-1 の決定に足した。同日: §3.3 に S7 本番（2026-11-02〜11-08）の準備 P-1〜P-8・当日の順番 D-1〜D-6・#229 の確認項目のうち §3 に無いもの S-1〜S-5・記録様式 R-1〜R-6 を追加し、#644 で Hub–Sink が loopback の専用 TLS だけになったことを §1・B-3 に反映した。P-1・P-5・P-7 をオーナーが推奨案どおりに決め、結果の文書を足した（未実施）。2026-10-22（R2b-1f）: §3.2 に R2b-1 の移行・DPAPI の封印・戻し方の実機確認 C-1〜C-14 を追加（オーナー同席、未実施）。2026-10-21（R2a-3c）: §3.1 に DB ブリッジ（取り込み口 `push`）の実機確認 B-16〜B-28 を追加（Hub 内の DB Source と同じ SQL を読むブリッジを並べて値と品質の一致を確かめる。自動テスト `bridge_parity.rs` の実機版、オーナー同席で行う。未実施）。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。結果は §5 に記録する。
 対象: [banto-hub-external-db-design.md](banto-hub-external-db-design.md) の DB Source（#228）と DB Sink（#229）。設計の決定事項は同書 §6、実装の所在は §7。
 
 関連: [real-machine-test-2026-09.md](real-machine-test-2026-09.md)（実機検証の記録の書き方の先例）、[banto-hub-operations.md](banto-hub-operations.md)（Hub の起動・サービス化）。
@@ -157,6 +157,11 @@ GRANT INSERT, SELECT ON tag_history TO banto_sink;
 2026-10-28 にオーナーが 3 つとも下の推奨案どおりに決めた。結果の文書は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md)（R-1〜R-6 の空の表・P-1・P-2 の欄・R-2 の採取スクリプト）。
 
 **P-1 LAN を切る方法**: **PostgreSQL の PC とスイッチの間のケーブルを抜く**ことを勧める。抜いた・挿した時刻を R-4 に書く。
+
+- **2026-10-28 の変更（オーナー決定）**: 機材が決まり、PostgreSQL の PC は Wi-Fi で繋がる Mac（192.168.10.12）になったので、**Mac の Wi-Fi を切る**ことにした。PostgreSQL の PC の側だけを切るので、下の理由（Hub の PC の PLC の経路に触れない）はそのまま成り立つ。Hub の PC の PLC は有線の別の網（192.168.11.x）。切った・戻した時刻を R-4 に書く。
+- Wi-Fi なので、当日は次も見る: 24 時間の間に意図しない切断が無いか（R-4 に事象として書く）。Mac がスリープしないこと（D-3 の前に `caffeinate -s` などで止める）。Wi-Fi を戻したあとの再接続と IP（192.168.10.12 のまま）。
+- Mac では、次点の切り方は Mac の前で `networksetup -setairportpower en0 off` → `on`（Wi-Fi のデバイス名は `networksetup -listallhardwareports` で確かめる）。A-10・A-11・S-1 (c)(d) の PostgreSQL の停止・起動・再起動は `brew services stop|start|restart postgresql@15`。
+- P-4 の「PostgreSQL のログに `application_name` が出る」の確かめは、準備では省き D-1 で Hub の接続のログを見る（2026-10-28 オーナー判断）。
 
 - 理由: 実際の断線に一番近く、Hub の PC 側の PLC・シミュレーションの経路に触れない（S-1 の「Hub の収集は続く」を、ほかの経路を巻き込まずに確かめられる）。
 - 抜けない置き方なら、次点は PostgreSQL の PC のコンソールで `Disable-NetAdapter -Name <NIC>` → `Enable-NetAdapter`（リモートからでは戻せなくなるので、必ずその PC の前で行う）。
