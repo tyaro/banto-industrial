@@ -324,6 +324,7 @@ async fn register(
         .expect("グループ");
     TagService::new(pool.clone())
         .create(TagInput {
+            comment: None,
             name: "値".to_string(),
             collection_group_id: group.id,
             address: address.to_string(),

@@ -60,6 +60,7 @@
 		isTagRevisionConflictError,
 		MIN_STRING_LENGTH,
 		MAX_STRING_LENGTH,
+		MAX_COMMENT_LENGTH,
 		MIN_DECIMALS,
 		MAX_DECIMALS,
 		TAG_KIND_OPTIONS,
@@ -281,6 +282,7 @@
 
 	interface FormState {
 		name: string;
+		comment: string;
 		collectionGroupId: string;
 		address: string;
 		dataType: TagDataType;
@@ -367,6 +369,7 @@
 	function blankForm(): FormState {
 		return {
 			name: '',
+			comment: '',
 			collectionGroupId: '',
 			address: '',
 			dataType: 'f32',
@@ -393,6 +396,7 @@
 	function formFromTag(t: Tag): FormState {
 		return {
 			name: t.name,
+			comment: t.comment,
 			collectionGroupId: String(t.collectionGroupId),
 			address: t.address,
 			dataType: t.dataType,
@@ -420,6 +424,7 @@
 	 */
 	const FIELD_LABELS: Record<string, string> = {
 		name: '名前',
+		comment: 'コメント',
 		collectionGroupId: '収集グループ',
 		address: 'アドレス',
 		dataType: 'データ型',
@@ -473,6 +478,7 @@
 		const isPush = connectionForGroupId(form.collectionGroupId)?.protocol === 'push';
 		return {
 			name: form.name,
+			comment: form.comment,
 			collectionGroupId: Number(form.collectionGroupId),
 			address: isPlc || isDb ? form.address : '',
 			dataType: form.dataType,
@@ -5051,6 +5057,7 @@
 				filterable: true,
 				filterType: 'text'
 			},
+			{ id: 'comment', header: 'コメント', accessor: 'comment', width: 220 },
 			{
 				id: 'collectionGroupId',
 				header: '収集グループ',
@@ -5254,6 +5261,23 @@
 				aria-describedby={describedBy(errors.name && 'tag-name-err')}
 			/>
 			{#if errors.name}<span class="err" id="tag-name-err">{errors.name}</span>{/if}
+		</label>
+		<label class="field">
+			コメント
+			<textarea
+				id="tag-comment"
+				bind:value={form.comment}
+				oninput={(event) => {
+					const limited = Array.from(event.currentTarget.value)
+						.slice(0, MAX_COMMENT_LENGTH)
+						.join('');
+					event.currentTarget.value = limited;
+					form.comment = limited;
+				}}
+				rows="3"
+				aria-invalid={errors.comment ? 'true' : undefined}
+				aria-describedby={describedBy(errors.comment && 'tag-comment-err')}></textarea>
+			{#if errors.comment}<span class="err" id="tag-comment-err">{errors.comment}</span>{/if}
 		</label>
 		{#if form.tagKind === 'plc'}
 			<!--

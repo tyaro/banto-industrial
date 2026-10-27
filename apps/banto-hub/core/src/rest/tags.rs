@@ -65,6 +65,8 @@ fn default_tag_kind() -> String {
 #[serde(rename_all = "camelCase")]
 pub struct TagPayload {
     pub name: String,
+    #[serde(default)]
+    pub comment: Option<String>,
     pub collection_group_id: i64,
     pub address: String,
     pub data_type: String,
@@ -167,6 +169,7 @@ impl From<TagPayload> for TagInput {
     fn from(payload: TagPayload) -> Self {
         Self {
             name: payload.name,
+            comment: payload.comment,
             collection_group_id: payload.collection_group_id,
             address: payload.address,
             data_type: payload.data_type,

@@ -815,6 +815,7 @@ fn tool_definitions() -> Vec<Value> {
                     "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
                     "address": { "type": "string", "description": "PLC アドレス(tagKind=db では結果列名)。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
                     "dataType": { "type": "string", "description": "データ型。" },
+                    "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
                     "stringLength": {
                         "type": ["integer", "null"],
                         "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",
@@ -853,6 +854,7 @@ fn tool_definitions() -> Vec<Value> {
                     "collectionGroupId": { "type": "integer", "description": "所属する収集グループの id。" },
                     "address": { "type": "string", "description": "PLC アドレス。保存時にドライバで解析して正規形にする(Modbus は 6 桁の 400001、SLMP は大文字の D100)。応答は正規形。" },
                     "dataType": { "type": "string", "description": "データ型。" },
+                    "comment": { "type": "string", "maxLength": 500, "description": "任意のタグコメント。省略すると既存値を保持し、空文字でクリア。" },
                     "stringLength": {
                         "type": ["integer", "null"],
                         "description": "dataType が string のとき必須(1-128、16bit ワード数)。未使用時は null。",

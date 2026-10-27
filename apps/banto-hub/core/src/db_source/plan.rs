@@ -524,6 +524,7 @@ mod tests {
 
     fn db_tag(id: i64, name: &str, group_id: i64, column: &str, enabled: bool) -> Tag {
         Tag {
+            comment: String::new(),
             id,
             name: name.to_string(),
             collection_group_id: group_id,

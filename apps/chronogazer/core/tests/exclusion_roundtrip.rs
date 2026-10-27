@@ -151,6 +151,7 @@ async fn group(pool: &SqlitePool, name: &str, conn_id: i64) -> i64 {
 async fn tag(pool: &SqlitePool, name: &str, group_id: i64, address: &str) -> i64 {
     TagService::new(pool.clone())
         .create(TagInput {
+            comment: None,
             name: name.to_string(),
             collection_group_id: group_id,
             address: address.to_string(),

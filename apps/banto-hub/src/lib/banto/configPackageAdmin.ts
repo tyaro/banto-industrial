@@ -529,6 +529,7 @@ async function applyConfigPackageInner(
 		}
 		const input: TagInput = {
 			name: tag.name,
+			...(tag.comment === undefined ? {} : { comment: tag.comment }),
 			collectionGroupId: group.id,
 			address: tag.address,
 			dataType: tag.dataType,

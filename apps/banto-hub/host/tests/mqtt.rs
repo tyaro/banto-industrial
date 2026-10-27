@@ -121,6 +121,7 @@ fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput
 
 fn tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: address.to_string(),
@@ -1305,6 +1306,7 @@ async fn mqtt_payload_carries_value_source_across_run_modes() {
         .unwrap();
     TagService::new(app.pool.clone())
         .create(TagInput {
+            comment: None,
             name: "avg".to_string(),
             collection_group_id: calc_group.id,
             address: String::new(),

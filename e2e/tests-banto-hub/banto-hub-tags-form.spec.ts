@@ -100,6 +100,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await expect(drawer).toBeVisible();
 
 		await drawer.getByLabel('名前').fill(CREATE_TAG_NAME);
+		await drawer.getByLabel('コメント').fill('初回点検');
 		const addressInput = drawer.getByLabel('アドレス');
 		// modbus-tcp 接続配下なので Modbus 参照番号形式（`Address::parse`、
 		// crates/banto-plc/src/address.rs）が必要 - 他 spec と同じ理由。
@@ -122,6 +123,7 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		// Drawer 右上の × （aria-label="閉じる"）と二重マッチするため exact 指定。
 		await drawer.getByRole('button', { name: '閉じる', exact: true }).click();
 		await expect(page.getByRole('gridcell', { name: CREATE_TAG_NAME, exact: true })).toBeVisible();
+		await expect(page.getByRole('gridcell', { name: '初回点検', exact: true })).toBeVisible();
 		// R2b-2d: `40010` で作ったタグは、保存時にドライバの正規形（Modbus は 6 桁）になり、
 		// 一覧にも `400010` で出る（保存された値も同じ）。
 		await expect(page.getByRole('gridcell', { name: '400010', exact: true }).first()).toBeVisible();
@@ -370,6 +372,28 @@ test.describe.serial('banto-hub タグ create/edit Drawer の form 化 (TAG-UX-C
 		await unitInput.fill('℃');
 		await unitInput.press('Enter');
 
+		await expect(page.getByText('更新しました')).toBeVisible();
+	});
+
+	test('comment is edited, safely listed, reloaded and cleared', async () => {
+		const comment = '設備の説明 <img src=x onerror=alert(1)>';
+		await page.goto('/tags');
+		await page.getByPlaceholder('名前・アドレスで検索').fill(EDIT_TAG_NAME);
+		await page.getByRole('gridcell', { name: EDIT_TAG_NAME, exact: true }).click();
+		const drawer = page.getByRole('complementary', { name: `${EDIT_TAG_NAME} を編集` });
+		await drawer.getByLabel('コメント').fill('😀'.repeat(501));
+		await expect(drawer.getByLabel('コメント')).toHaveValue('😀'.repeat(500));
+		await drawer.getByLabel('コメント').fill(comment);
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		await expect(page.getByText('更新しました')).toBeVisible();
+		await page.reload();
+		await page.getByPlaceholder('名前・アドレスで検索').fill(EDIT_TAG_NAME);
+		await expect(page.getByRole('gridcell', { name: comment, exact: true })).toBeVisible();
+		expect(await page.locator('img[src="x"]').count()).toBe(0);
+		await page.getByRole('gridcell', { name: EDIT_TAG_NAME, exact: true }).click();
+		await expect(drawer.getByLabel('コメント')).toHaveValue(comment);
+		await drawer.getByLabel('コメント').fill('');
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
 		await expect(page.getByText('更新しました')).toBeVisible();
 	});
 });

@@ -77,6 +77,7 @@ function makeTag(overrides: Partial<Tag> = {}): Tag {
 	return {
 		id: 1,
 		name: 'Tag1',
+		comment: '',
 		collectionGroupId: GROUP_A.id,
 		address: 'D100',
 		dataType: 'i16',
@@ -120,7 +121,8 @@ const DEFAULT_ROW: CsvRowFields = {
 	writable: '',
 	tagKind: '',
 	expression: '',
-	retain: ''
+	retain: '',
+	comment: ''
 };
 
 function csvRow(overrides: Partial<CsvRowFields> = {}): CsvRowFields {
@@ -190,6 +192,23 @@ describe('classifyCsvUpdate: added', () => {
 // ==============================================================================
 
 describe('classifyCsvUpdate: changed', () => {
+	it('updates only the comment when the new CSV column changes', () => {
+		const existing = makeTag({ comment: '旧メモ' });
+		const result = classifyCsvUpdate(parsed([csvRow({ comment: '新メモ' })]), [existing]);
+		expect(result.rows[0].diffs?.map((diff) => diff.field)).toEqual(['comment']);
+		expect(result.updateRows[0].comment).toBe('新メモ');
+	});
+
+	it('keeps an existing comment when a legacy CSV changes another field', () => {
+		const columns = TAG_CSV_COLUMNS.slice(0, -1);
+		const oldRow = csvRow({ address: 'D200' });
+		const csv = [columns.join(','), columns.map((column) => oldRow[column]).join(',')].join('\r\n');
+		const parsedLegacy = parseTagsCsv(csv, CONNECTIONS, GROUPS);
+		if (!parsedLegacy.ok) throw new Error(JSON.stringify(parsedLegacy.errors));
+		const result = classifyCsvUpdate(parsedLegacy.rows, [makeTag({ comment: '保持' })]);
+		expect(result.rows[0].diffs?.map((diff) => diff.field)).toEqual(['address']);
+		expect(result.updateRows[0].comment).toBe('保持');
+	});
 	it('既存タグと値が異なれば changed になり、diffs に変更フィールドが入る', () => {
 		const existing = makeTag({ address: 'D100' });
 		const rows = parsed([csvRow({ address: 'D200' })]);

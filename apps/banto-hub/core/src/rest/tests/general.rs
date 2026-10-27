@@ -10,6 +10,32 @@ use banto_tstore::SystemClock;
 use tokio::sync::broadcast as tokio_broadcast;
 use tower::ServiceExt;
 
+#[test]
+fn tag_payload_comment_preserves_omission_and_explicit_clear() {
+    let base = json!({
+        "name": "motor", "collectionGroupId": 1,
+        "address": "40001", "dataType": "i16"
+    });
+    let omitted: TagInput = serde_json::from_value::<TagPayload>(base.clone())
+        .unwrap()
+        .into();
+    assert_eq!(omitted.comment, None);
+    let with_comment: TagInput = serde_json::from_value::<TagPayload>(json!({
+        "name": "motor", "collectionGroupId": 1,
+        "address": "40001", "dataType": "i16", "comment": "設備Aの説明"
+    }))
+    .unwrap()
+    .into();
+    assert_eq!(with_comment.comment.as_deref(), Some("設備Aの説明"));
+    let cleared: TagInput = serde_json::from_value::<TagPayload>(json!({
+        "name": "motor", "collectionGroupId": 1,
+        "address": "40001", "dataType": "i16", "comment": ""
+    }))
+    .unwrap()
+    .into();
+    assert_eq!(cleared.comment.as_deref(), Some(""));
+}
+
 fn slmp_conn_with_cpu(id: i64, cpu: &str) -> banto_tags::PlcConnection {
     let serde_json::Value::Object(settings) = serde_json::json!({
         "host": "127.0.0.1", "port": 5007, "word_order": "low_high", "cpu_type": cpu,

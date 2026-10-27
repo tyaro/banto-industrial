@@ -1096,6 +1096,7 @@ impl TagPayload {
 impl From<TagPayload> for TagInput {
     fn from(payload: TagPayload) -> Self {
         Self {
+            comment: None,
             name: payload.name,
             collection_group_id: payload.collection_group_id,
             address: payload.address,

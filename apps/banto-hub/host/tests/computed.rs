@@ -144,6 +144,7 @@ fn group_input(name: &str, conn_id: i64, period_ms: i64) -> CollectionGroupInput
 
 fn plc_tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: address.to_string(),
@@ -167,6 +168,7 @@ fn plc_tag_input(name: &str, group_id: i64, address: &str, data_type: &str) -> T
 
 fn computed_tag_input(name: &str, group_id: i64, expression: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: String::new(),
@@ -197,6 +199,7 @@ fn internal_tag_input(
     retain: bool,
 ) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: String::new(),

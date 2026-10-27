@@ -415,6 +415,7 @@ async fn prepare_root_db(layout: &DataLayout, plc_port: Option<u16>) {
             .expect("グループ");
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "値".to_string(),
                 collection_group_id: group.id,
                 address: "40001".to_string(),

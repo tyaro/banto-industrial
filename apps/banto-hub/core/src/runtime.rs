@@ -2191,6 +2191,7 @@ mod tests {
             .expect("group");
         TagService::new(pool.clone())
             .create(banto_tags::TagInput {
+                comment: None,
                 name: "temperature".to_owned(),
                 collection_group_id: group.id,
                 address: String::new(),

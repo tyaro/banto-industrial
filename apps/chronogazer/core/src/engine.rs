@@ -2216,6 +2216,7 @@ mod tests {
             .expect("グループ");
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "ランプ".to_string(),
                 collection_group_id: group.id,
                 address: "40001".to_string(),

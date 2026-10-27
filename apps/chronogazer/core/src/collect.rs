@@ -3631,6 +3631,7 @@ mod tests {
     async fn seed_tag(pool: &SqlitePool, group_id: i64, address: &str, enabled: bool) {
         TagService::new(pool.clone())
             .create(TagInput {
+                comment: None,
                 name: "T1".to_string(),
                 collection_group_id: group_id,
                 address: address.to_string(),
@@ -3666,6 +3667,7 @@ mod tests {
     /// 前に入った不正なタグ（#414 段階2 の対象）をそのまま作れる。
     async fn seed_named_tag(pool: &SqlitePool, group_id: i64, name: &str, address: &str) -> i64 {
         let input = TagInput {
+            comment: None,
             name: name.to_string(),
             collection_group_id: group_id,
             address: address.to_string(),
@@ -4571,6 +4573,7 @@ mod tests {
             query_sql: None,
         };
         let tag = |id: i64, group: i64, address: &str, enabled: bool| Tag {
+            comment: String::new(),
             id,
             name: format!("t{id}"),
             collection_group_id: group,

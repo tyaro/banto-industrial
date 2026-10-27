@@ -104,6 +104,7 @@ const DB_GROUP: CollectionGroup = {
 const BASE_TAG: Tag = {
 	id: 100,
 	name: 'tag-a',
+	comment: '',
 	collectionGroupId: BASE_GROUP.id,
 	address: 'D100',
 	dataType: 'i16',
@@ -223,6 +224,7 @@ describe('configPackage', () => {
 		expect(pkg.tags).toEqual([
 			{
 				name: 'tag-a',
+				comment: '',
 				plcConnectionName: 'line-a',
 				collectionGroupName: 'group-a',
 				address: 'D100',
@@ -243,6 +245,7 @@ describe('configPackage', () => {
 			},
 			{
 				name: 'tag-calc',
+				comment: '',
 				plcConnectionName: 'calc',
 				collectionGroupName: 'group-calc',
 				address: '',
@@ -279,6 +282,30 @@ describe('configPackage', () => {
 		const original = makePackage();
 		const parsed = parseConfigPackage(serializeConfigPackage(original));
 		expect(parsed).toEqual(original);
+	});
+
+	it('tag comments survive package round trips and old packages omit the update field', () => {
+		const text = '設備Aの説明\n<img src=x onerror=alert(1)>';
+		const pkg = buildConfigPackage({
+			plcConnections: [BASE_CONNECTION],
+			collectionGroups: [BASE_GROUP],
+			tags: [{ ...BASE_TAG, comment: text }],
+			mqtt: MQTT,
+			grpc: GRPC,
+			exportedAt: '2026-10-27T00:00:00.000Z'
+		});
+		expect(parseConfigPackage(serializeConfigPackage(pkg)).tags[0].comment).toBe(text);
+		const old = JSON.parse(serializeConfigPackage(pkg));
+		delete old.tags[0].comment;
+		expect(parseConfigPackage(JSON.stringify(old)).tags[0]).not.toHaveProperty('comment');
+		old.tags[0].comment = '';
+		expect(parseConfigPackage(JSON.stringify(old)).tags[0].comment).toBe('');
+		old.tags[0].comment = '界'.repeat(500);
+		expect(parseConfigPackage(JSON.stringify(old)).tags[0].comment).toHaveLength(500);
+		old.tags[0].comment = '界'.repeat(501);
+		expect(() => parseConfigPackage(JSON.stringify(old))).toThrow(/tags\[0\]\.comment/);
+		old.tags[0].comment = null;
+		expect(() => parseConfigPackage(JSON.stringify(old))).toThrow(/tags\[0\]\.comment/);
 	});
 
 	it('parseConfigPackage は reserved virtual 名を参照する package も受け入れる', () => {

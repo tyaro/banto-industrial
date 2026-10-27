@@ -132,6 +132,7 @@ const pkg: ConfigPackage = {
 	tags: [
 		{
 			name: 'tag1',
+			comment: '',
 			plcConnectionName: 'plc1',
 			collectionGroupName: 'group1',
 			address: 'D3000',
@@ -202,6 +203,7 @@ function registryTag(id: number, name: string, collectionGroupId: number): Tag {
 	return {
 		id,
 		name,
+		comment: '',
 		collectionGroupId,
 		address: 'D3000',
 		dataType: 'i16',
@@ -354,6 +356,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 		vi.mocked(createTag).mockResolvedValue({
 			id: 1,
 			name: 'tag1',
+			comment: '',
 			collectionGroupId: 1,
 			address: 'D3000',
 			dataType: 'i16',
@@ -377,6 +380,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 		expect(summary.counts.plcConnections).toEqual({ create: 1, update: 0 });
 		expect(summary.counts.collectionGroups).toEqual({ create: 1, update: 0 });
 		expect(summary.counts.tags).toEqual({ create: 1, update: 0 });
+		expect(createTag).toHaveBeenCalledWith(expect.objectContaining({ comment: '' }));
 		expect(summary.mqttApplied).toBe(true);
 		expect(summary.grpcApplied).toBe(true);
 		expect(summary.warnings).toEqual([]);
@@ -407,6 +411,7 @@ describe('applyConfigPackage: 全件成功する通常の import（回帰ガー�
 		vi.mocked(createTag).mockResolvedValue({
 			id: 1,
 			name: 'tag1',
+			comment: '',
 			collectionGroupId: 1,
 			address: 'D3000',
 			dataType: 'i16',
@@ -775,6 +780,7 @@ describe('applyConfigPackage: sink group は接続名・タグ名を id へ解�
 			{
 				id: 55,
 				name: 'temp01',
+				comment: '',
 				collectionGroupId: 1,
 				address: 'D100',
 				dataType: 'i16',
@@ -1028,6 +1034,38 @@ describe('applyConfigPackage / inspectConfigPackage: 版 3 の settings（欠け
 
 describe('applyConfigPackage / inspectConfigPackage: 版 2 のキーで突き合わせる', () => {
 	const tagTemplate = pkg.tags[0];
+
+	it('legacy JSON import preserves an existing comment and an empty comment clears it', async () => {
+		vi.mocked(listPlcConnections).mockResolvedValue([plcConnection(1, 'plc1')]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([collectionGroup(1, 'group1', 1)]);
+		vi.mocked(listTags).mockResolvedValue([{ ...registryTag(7, 'tag1', 1), comment: '既存メモ' }]);
+		vi.mocked(updatePlcConnection).mockImplementation(async (id, input) =>
+			plcConnection(id, input.name)
+		);
+		vi.mocked(updateCollectionGroup).mockImplementation(async (id, input) =>
+			collectionGroup(id, input.name, input.plcConnectionId)
+		);
+		vi.mocked(updateTag).mockImplementation(async (id, input) =>
+			registryTag(id, input.name, input.collectionGroupId)
+		);
+
+		const legacy = parseConfigPackage(
+			JSON.stringify({ ...pkg, tags: [{ ...tagTemplate, comment: undefined }] })
+		);
+		await applyConfigPackage(legacy);
+		expect(vi.mocked(updateTag).mock.calls[0][1]).not.toHaveProperty('comment');
+
+		vi.mocked(updateTag).mockClear();
+		await applyConfigPackage({ ...pkg, tags: [{ ...tagTemplate, comment: '' }] });
+		expect(vi.mocked(updateTag).mock.calls[0][1].comment).toBe('');
+
+		vi.mocked(listTags).mockResolvedValue([]);
+		vi.mocked(createTag).mockImplementation(async (input) =>
+			registryTag(8, input.name, input.collectionGroupId)
+		);
+		await applyConfigPackage(legacy);
+		expect(vi.mocked(createTag).mock.calls[0][0]).not.toHaveProperty('comment');
+	});
 
 	it('2 つの接続の同名グループ・同名タグを別々に扱う（既存は更新、もう一方は作成）', async () => {
 		vi.mocked(listPlcConnections).mockResolvedValue([

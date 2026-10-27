@@ -188,6 +188,7 @@ fn query_group_input(name: &str, conn_id: i64, sql: &str) -> CollectionGroupInpu
 
 fn db_tag_input(name: &str, group_id: i64, column: &str) -> TagInput {
     TagInput {
+        comment: None,
         name: name.to_string(),
         collection_group_id: group_id,
         address: column.to_string(),

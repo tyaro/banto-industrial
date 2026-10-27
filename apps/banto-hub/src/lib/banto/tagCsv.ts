@@ -19,6 +19,7 @@
  * 同ディレクトリの `tagCsv.test.ts`（vitest、H5 で導入）が全公開 API を
  * 網羅する。
  */
+import { MAX_COMMENT_LENGTH } from './tagComment';
 import type {
 	CollectionGroup,
 	PlcConnection,
@@ -163,8 +164,11 @@ export const TAG_CSV_COLUMNS = [
 	'writable',
 	'tagKind',
 	'expression',
-	'retain'
+	'retain',
+	'comment'
 ] as const;
+
+const LEGACY_TAG_CSV_COLUMNS = TAG_CSV_COLUMNS.slice(0, -1);
 
 type TagCsvColumn = (typeof TAG_CSV_COLUMNS)[number];
 
@@ -210,7 +214,8 @@ export function exportTagsCsv(
 			t.writable ? 'true' : 'false',
 			t.tagKind,
 			t.expression ?? '',
-			t.retain ? 'true' : 'false'
+			t.retain ? 'true' : 'false',
+			t.comment
 		]);
 	}
 	return '\uFEFF' + serializeCsv(rows);
@@ -309,8 +314,13 @@ export function parseTagsCsv(
 	if (table.length === 0) return { ok: true, rows: [] };
 
 	const header = table[0];
-	const headerMismatch =
-		header.length !== TAG_CSV_COLUMNS.length || TAG_CSV_COLUMNS.some((col, i) => header[i] !== col);
+	const hasCommentColumn =
+		header.length === TAG_CSV_COLUMNS.length &&
+		TAG_CSV_COLUMNS.every((col, i) => header[i] === col);
+	const legacyHeader =
+		header.length === LEGACY_TAG_CSV_COLUMNS.length &&
+		LEGACY_TAG_CSV_COLUMNS.every((col, i) => header[i] === col);
+	const headerMismatch = !hasCommentColumn && !legacyHeader;
 	if (headerMismatch) {
 		return {
 			ok: false,
@@ -339,6 +349,11 @@ export function parseTagsCsv(
 
 		const col = (name: TagCsvColumn): string => (cells[COLUMN_INDEX[name]] ?? '').trim();
 		const rowErrors: string[] = [];
+		// コメントは表示用の自由文なので、前後の空白と改行も保持する。
+		const comment = hasCommentColumn ? (cells[COLUMN_INDEX.comment] ?? '') : undefined;
+		if (comment !== undefined && Array.from(comment).length > MAX_COMMENT_LENGTH) {
+			rowErrors.push(`comment は${MAX_COMMENT_LENGTH}文字以内で指定してください。`);
+		}
 
 		const connectionName = col('connection');
 		const groupName = col('group');
@@ -485,6 +500,7 @@ export function parseTagsCsv(
 
 		const tag: TagInput = {
 			name,
+			...(comment === undefined ? {} : { comment }),
 			collectionGroupId: group!.id,
 			address,
 			dataType,

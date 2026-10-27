@@ -158,6 +158,7 @@ async fn run(mode: Mode) {
         .unwrap();
     TagService::with_registry(pool.clone(), registry)
         .create(TagInput {
+            comment: None,
             name: "bit".into(),
             collection_group_id: group.id,
             address: "W10.0".into(),
