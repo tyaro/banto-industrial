@@ -193,6 +193,10 @@ Restart-Service BantoHub
 - 文書は、R-1〜R-6 の空の表と、P-1・P-2 の機材と版の欄を持たせて、準備の PR で先に作る。
 - R-2 の 1 時間ごとの採取は、**PowerShell の小さなスクリプトで自動にする**（夜をまたぐので手では取りきれない）: `Invoke-RestMethod` で `GET /api/v1/status`（`read` のキー。管理系の `GET /api/status` はログインのセッションが要り、API キーでは読めない）と、`psql -c "SELECT count(*), max(ts) FROM tag_history"` を 1 時間ごとに CSV に 1 行足す。スクリプトは結果の文書の付録に載せ、11/1 までにローカルの PostgreSQL（`127.0.0.1:5432`）で 2〜3 回分動かして形を確かめる。キーは環境変数で渡し、CSV とスクリプトに書かない。
 
+#### サービスの起動の種類（2026-10-28 オーナー決定）
+
+Hub のサービス（`BantoHub`）は普段は Manual のまま、本番の当日だけ B-15 の前に Automatic に変え、S7 が終わったら Manual に戻す。サイドカーのサービス（`BantoHubSink`）の扱いは B-15 の前にオーナーと決める。記録は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) の「サービスの起動の種類」。
+
 ### D. 当日の順番
 
 日ごとの区切りは目安。24 時間の計測（D-3）を先に始められるよう、D-1・D-2・D-2b は 1 日目に終える。各段の合否は R-1 に書く。

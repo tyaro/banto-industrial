@@ -24,7 +24,7 @@ SLMP guest #34 (`c9cf3b8e`) は V edge relay を周期収集で確実に捕捉�
 
 CI は SLMP guest #35 merge `b3d944f5` を固定して別途ビルドし、既存の Host テスト用 manifest と `driver-with-write-and-diagnostics-v1` world で Hub のループバック受入れを行います。標準 Q の X は SD290、標準 R の SB/F は SD268–271 の点数を報告します。各領域の N−1/N とゼロ、Q X=32768 の exact、R の low/high word、SD 取得拒否時の `unknown`、`outside` の読取り除外を確認します。旧 guest の固定回帰、`outside` の `Bad` 品質、接続停止後の GET `unavailable` も確認します。#886 の診断 UI 修正には手を加えません。実 PLC と本番配置は対象外です。
 
-## 受入れの対応表（#845、2026-10-27）
+## 受入れの対応表（#845、2026-10-27。A1・A5 の決定は 2026-10-28）
 
 Issue #845 の受入れ条件ごとの、実装と模擬試験の対応（main `19c90110` 時点）。「模擬試験あり」は模擬 transport と固定 guest による確認で、実 PLC・本番での確認は含まない。略記: OW = `apps/banto-hub/host/tests/t12_slmp_wasm_operational_write/mod.rs`、UI = `e2e/tests-banto-hub/banto-hub-tags-range-diagnostic.spec.ts`。
 
