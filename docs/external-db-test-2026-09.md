@@ -195,7 +195,7 @@ Restart-Service BantoHub
 
 #### サービスの起動の種類（2026-10-28 オーナー決定）
 
-Hub のサービス（`BantoHub`）は普段は Manual のまま、本番の当日だけ B-15 の前に Automatic に変え、S7 が終わったら Manual に戻す。サイドカーのサービス（`BantoHubSink`）の扱いは B-15 の前にオーナーと決める。記録は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) の「サービスの起動の種類」。
+Hub のサービス（`BantoHub`）は普段は Manual のまま、本番の当日だけ B-15 の前に Automatic に変え、S7 が終わったら Manual に戻す。サイドカーのサービス（`BantoHubSink`）も Hub に合わせて同じときに変え、同じときに戻す。記録は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) の「サービスの起動の種類」。
 
 ### D. 当日の順番
 
