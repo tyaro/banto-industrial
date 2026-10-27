@@ -1,6 +1,6 @@
 //! Normal D/u16 policy acceptance through an isolated loopback SLMP peer.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -37,6 +37,7 @@ struct Fixture {
     diagnostic_bit_counts: Arc<Mutex<[u32; 3]>>,
     refuse_bit_sd: Arc<AtomicBool>,
     write_devices: Arc<Mutex<Vec<u8>>>,
+    write_end_code: Arc<AtomicU16>,
     bit_frames: RecordedBits,
     task: tokio::task::JoinHandle<()>,
 }
@@ -59,6 +60,8 @@ impl Fixture {
         let refuse_bit_sd_on_wire = refuse_bit_sd.clone();
         let write_devices = Arc::new(Mutex::new(Vec::new()));
         let devices = write_devices.clone();
+        let write_end_code = Arc::new(AtomicU16::new(0));
+        let write_end_code_on_wire = write_end_code.clone();
         let bit_frames: RecordedBits = Arc::new(Mutex::new(Vec::new()));
         let bits_written = bit_frames.clone();
         let task = tokio::spawn(async move {
@@ -291,7 +294,7 @@ impl Fixture {
                                 writes.lock().unwrap().push((start, values));
                             }
                             devices.lock().unwrap().push(device);
-                            (0, Vec::new())
+                            (write_end_code_on_wire.load(Ordering::SeqCst), Vec::new())
                         }
                         _ => panic!("unexpected SLMP command {command:#x}"),
                     };
@@ -319,6 +322,7 @@ impl Fixture {
             diagnostic_bit_counts,
             refuse_bit_sd,
             write_devices,
+            write_end_code,
             bit_frames,
             task,
         }
@@ -346,6 +350,11 @@ impl Fixture {
 
     fn set_bit_sd_refused(&self, refused: bool) {
         self.refuse_bit_sd.store(refused, Ordering::SeqCst);
+    }
+
+    /// End code the fixture answers to every 0x1401 write with (0 = success).
+    fn set_write_end_code(&self, end_code: u16) {
+        self.write_end_code.store(end_code, Ordering::SeqCst);
     }
 
     fn write_devices(&self) -> Vec<u8> {
@@ -1957,5 +1966,117 @@ async fn rest_scoped_write_and_denied_spans_are_audited_without_extra_frames() {
                 .iter()
                 .any(|row| { row["tagId"].as_i64() == Some(*id) && row["result"] == "failed" }));
         }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
+async fn malformed_allowlist_notation_is_rejected_and_sends_no_write_frame() {
+    for peer in [Peer::R, Peer::StandardQ] {
+        for bad in [
+            "w1a-w1f",
+            "D3010-D3013, W1A-W1F",
+            "W1A - W1F",
+            "W1G-W1F",
+            "W1A-D27",
+            "D3010-D3013,W1A-W1F,D3012-D3014",
+            "W1A-W1F,D3010-D3013,W1C-W1D",
+        ] {
+            let driver = WasmDriver::load_operational_write(MANIFEST, &component()).unwrap();
+            assert!(
+                !driver
+                    .validate_config(&settings(5000, "enabled", bad))
+                    .is_empty(),
+                "guest/host validation must reject {bad:?}"
+            );
+            let fixture = Fixture::start(peer, 4000, false).await;
+            let transport = TransportSpec::Tcp {
+                host: "127.0.0.1".into(),
+                port: fixture.address.port(),
+            };
+            let context = ConnectContext::new(
+                "slmp-wasm-operational-write",
+                Duration::from_millis(500),
+                Duration::from_millis(500),
+            );
+            let connected = FrameSession::connect(
+                driver.as_ref(),
+                &settings(fixture.address.port(), "enabled", bad),
+                &transport,
+                &context,
+                None,
+            )
+            .await;
+            assert!(
+                matches!(connected, Err(FatalError::InvalidConfig(_))),
+                "{bad:?} must fail the connection as invalid config"
+            );
+            assert!(fixture.frames().is_empty(), "{bad:?} sent a write frame");
+            assert!(
+                fixture
+                    .commands()
+                    .iter()
+                    .all(|(command, _, _)| *command != 0x1401),
+                "{bad:?} sent a write command"
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM to the reviewed D/W component"]
+async fn w_write_with_unknown_ack_or_plc_error_never_succeeds_or_replays() {
+    for peer in [Peer::R, Peer::StandardQ] {
+        let w_items = |driver: &WasmDriver| -> Vec<WriteItem> {
+            w_specs(driver)
+                .into_iter()
+                .zip(1..=6)
+                .map(|(spec, value)| WriteItem::new(spec, Value::F64(f64::from(value))))
+                .collect()
+        };
+        let w_commands = |fixture: &Fixture| {
+            fixture
+                .commands()
+                .iter()
+                .filter(|(command, _, _)| *command == 0x1401)
+                .count()
+        };
+
+        // Unknown outcome: the response does not match the request, so the
+        // write is an error and must not be sent a second time.
+        let (fixture, driver, mut session) = connect(peer, 4000, "enabled", "W1A-W1F", true).await;
+        let result = session.write_batch(&w_items(&driver)).await;
+        assert!(
+            matches!(
+                result,
+                Err(FatalError::Framing(_))
+                    | Err(FatalError::Protocol(_))
+                    | Err(FatalError::Timeout)
+            ),
+            "{result:?}"
+        );
+        assert_eq!(fixture.frames(), vec![(0x1a, vec![1, 2, 3, 4, 5, 6])]);
+        assert_eq!(fixture.write_devices(), vec![0xb4]);
+        session.disconnect().await;
+        assert_eq!(w_commands(&fixture), 1, "unknown outcome must not replay");
+
+        // PLC device error (end code 0xC051): never reported as success, and
+        // the single frame is not retried.
+        let (fixture, driver, mut session) =
+            connect(peer, 4000, "enabled", "D3010-D3013,W1A-W1F", false).await;
+        fixture.set_write_end_code(0xc051);
+        let result = session.write_batch(&w_items(&driver)).await;
+        let items = result.expect("a PLC end code is reported per item, not as a fatal error");
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert!(
+            items
+                .iter()
+                .all(|item| matches!(item, Err(ItemError::Device(_)))),
+            "PLC error must fail every item as a device error: {items:?}"
+        );
+        assert_eq!(fixture.frames(), vec![(0x1a, vec![1, 2, 3, 4, 5, 6])]);
+        assert_eq!(fixture.write_devices(), vec![0xb4]);
+        session.disconnect().await;
+        assert_eq!(w_commands(&fixture), 1, "PLC error must not replay");
     }
 }
