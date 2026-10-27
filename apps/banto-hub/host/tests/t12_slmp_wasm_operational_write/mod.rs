@@ -1,6 +1,6 @@
 //! Normal D/u16 policy acceptance through an isolated loopback SLMP peer.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ const COMPONENT_ENV: &str = "BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM";
 const DIAGNOSTIC_COMPONENT_ENV: &str = "BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM";
 type RecordedFrames = Arc<Mutex<Vec<(u32, Vec<u16>)>>>;
 type RecordedBits = Arc<Mutex<Vec<(u32, u8, Vec<bool>)>>>;
+type RecordedReads = Arc<Mutex<Vec<(u8, u32, u16)>>>;
 
 #[derive(Clone, Copy)]
 enum Peer {
@@ -31,7 +32,10 @@ struct Fixture {
     address: std::net::SocketAddr,
     frames: RecordedFrames,
     commands: Arc<Mutex<Vec<(u16, u32, u16)>>>,
+    read_spans: RecordedReads,
     count: Arc<AtomicU32>,
+    diagnostic_bit_counts: Arc<Mutex<[u32; 3]>>,
+    refuse_bit_sd: Arc<AtomicBool>,
     write_devices: Arc<Mutex<Vec<u8>>>,
     bit_frames: RecordedBits,
     task: tokio::task::JoinHandle<()>,
@@ -45,8 +49,14 @@ impl Fixture {
         let writes = frames.clone();
         let commands = Arc::new(Mutex::new(Vec::new()));
         let events = commands.clone();
+        let read_spans: RecordedReads = Arc::new(Mutex::new(Vec::new()));
+        let reads_on_wire = read_spans.clone();
         let live_count = Arc::new(AtomicU32::new(count));
         let count_on_wire = live_count.clone();
+        let diagnostic_bit_counts = Arc::new(Mutex::new([0u32; 3]));
+        let bit_counts_on_wire = diagnostic_bit_counts.clone();
+        let refuse_bit_sd = Arc::new(AtomicBool::new(false));
+        let refuse_bit_sd_on_wire = refuse_bit_sd.clone();
         let write_devices = Arc::new(Mutex::new(Vec::new()));
         let devices = write_devices.clone();
         let bit_frames: RecordedBits = Arc::new(Mutex::new(Vec::new()));
@@ -101,12 +111,19 @@ impl Fixture {
                             match peer {
                                 Peer::R => {
                                     if (subcommand, start, words) == (2, 262, 14) {
-                                        let mut body = vec![0; 28];
-                                        for at in [0, 2, 4, 12] {
-                                            body[at * 2..at * 2 + 4]
-                                                .copy_from_slice(&64u32.to_le_bytes());
+                                        if refuse_bit_sd_on_wire.load(Ordering::SeqCst) {
+                                            (0xc051, Vec::new())
+                                        } else {
+                                            let mut body = vec![0; 28];
+                                            for at in [0, 2, 4, 12] {
+                                                body[at * 2..at * 2 + 4]
+                                                    .copy_from_slice(&64u32.to_le_bytes());
+                                            }
+                                            let [_, sb, f] = *bit_counts_on_wire.lock().unwrap();
+                                            body[6 * 2..8 * 2].copy_from_slice(&sb.to_le_bytes());
+                                            body[8 * 2..10 * 2].copy_from_slice(&f.to_le_bytes());
+                                            (0, body)
                                         }
-                                        (0, body)
                                     } else {
                                         assert_eq!((subcommand, start, words), (2, 280, 4));
                                         let mut body = count.to_le_bytes().to_vec();
@@ -126,11 +143,16 @@ impl Fixture {
                                 }
                                 Peer::StandardQ => {
                                     if (subcommand, start, words) == (0, 290, 5) {
-                                        let body = [0u16, 64, 64, 64, 64]
-                                            .into_iter()
-                                            .flat_map(u16::to_le_bytes)
-                                            .collect();
-                                        (0, body)
+                                        if refuse_bit_sd_on_wire.load(Ordering::SeqCst) {
+                                            (0xc051, Vec::new())
+                                        } else {
+                                            let [x, _, _] = *bit_counts_on_wire.lock().unwrap();
+                                            let body = [u16::try_from(x).unwrap(), 64, 64, 64, 64]
+                                                .into_iter()
+                                                .flat_map(u16::to_le_bytes)
+                                                .collect();
+                                            (0, body)
+                                        }
                                     } else {
                                         assert_eq!((subcommand, start, words), (0, 302, 2));
                                         let mut body =
@@ -149,6 +171,11 @@ impl Fixture {
                                 request[offset + 1],
                             ]));
                             let device = request[if is_r { 23 } else { 22 }];
+                            reads_on_wire.lock().unwrap().push((
+                                device,
+                                start,
+                                u16::try_from(words).unwrap(),
+                            ));
                             let end = start.checked_add(u32::try_from(words).unwrap()).unwrap();
                             assert!(
                                 words > 0
@@ -157,15 +184,23 @@ impl Fixture {
                                             || (start == 3000 && end == 3001)
                                             || (start >= 3010 && end <= 3015)))
                                         || (device == 0xb4 && start >= 0x1a && end <= 0x20)
-                                        || (device == 0x90 && start >= 10 && end <= 13))
+                                        || (device == 0x90 && start >= 10 && end <= 13)
+                                        || (device == 0x9c
+                                            && matches!(peer, Peer::StandardQ)
+                                            && end <= 32768)
+                                        || (device == 0xa1
+                                            && matches!(peer, Peer::R)
+                                            && end <= 65538)
+                                        || (device == 0x93 && matches!(peer, Peer::R) && end <= 3))
                             );
-                            if device == 0x90 {
+                            if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93) {
                                 assert_eq!(subcommand, if is_r { 3 } else { 1 });
-                                if start == 12 {
+                                if device == 0x90 && start == 12 {
                                     (0xc051, Vec::new())
                                 } else {
-                                    let bits =
-                                        (start..end).map(|index| index == 10).collect::<Vec<_>>();
+                                    let bits = (start..end)
+                                        .map(|index| index == 10 || index == 1 || index == 65537)
+                                        .collect::<Vec<_>>();
                                     let body = bits
                                         .chunks(2)
                                         .map(|pair| {
@@ -279,7 +314,10 @@ impl Fixture {
             address,
             frames,
             commands,
+            read_spans,
             count: live_count,
+            diagnostic_bit_counts,
+            refuse_bit_sd,
             write_devices,
             bit_frames,
             task,
@@ -294,8 +332,20 @@ impl Fixture {
         self.commands.lock().unwrap().clone()
     }
 
+    fn read_spans(&self) -> Vec<(u8, u32, u16)> {
+        self.read_spans.lock().unwrap().clone()
+    }
+
     fn set_count(&self, count: u32) {
         self.count.store(count, Ordering::SeqCst);
+    }
+
+    fn set_diagnostic_bit_counts(&self, x: u32, sb: u32, f: u32) {
+        *self.diagnostic_bit_counts.lock().unwrap() = [x, sb, f];
+    }
+
+    fn set_bit_sd_refused(&self, refused: bool) {
+        self.refuse_bit_sd.store(refused, Ordering::SeqCst);
     }
 
     fn write_devices(&self) -> Vec<u8> {
@@ -567,8 +617,221 @@ fn new_guest_component() -> Vec<u8> {
     std::fs::read(std::env::var(NEW_GUEST_COMPONENT_ENV).expect("set new SLMP guest path")).unwrap()
 }
 
+async fn connect_new_guest(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSession) {
+    let fixture = Fixture::start(peer, 4000, false).await;
+    let driver = WasmDriver::load_operational_write(MANIFEST, &new_guest_component()).unwrap();
+    let transport = TransportSpec::Tcp {
+        host: "127.0.0.1".into(),
+        port: fixture.address.port(),
+    };
+    let context = ConnectContext::new(
+        "slmp-wasm-operational-write",
+        Duration::from_millis(500),
+        Duration::from_millis(500),
+    );
+    let session = FrameSession::connect(
+        driver.as_ref(),
+        &settings(fixture.address.port(), "disabled", ""),
+        &transport,
+        &context,
+        None,
+    )
+    .await
+    .unwrap();
+    (fixture, driver, session)
+}
+
+fn bit_specs(driver: &WasmDriver, addresses: &[&str]) -> Vec<TagSpec> {
+    let bit = TagKind::numeric(DataType::Bit);
+    addresses
+        .iter()
+        .map(|address| TagSpec::new(driver.parse_address(address, &bit).unwrap(), bit.clone()))
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #34 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
+    use banto_driver_api::CountBound;
+
+    let (fixture, driver, mut session) = connect_new_guest(Peer::StandardQ).await;
+    fixture.set_diagnostic_bit_counts(16, 0, 0);
+    let specs = bit_specs(&driver, &["XF", "X10"]);
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    let x = report
+        .counts
+        .iter()
+        .find(|count| count.area == "X")
+        .unwrap();
+    assert_eq!(
+        (x.unit.as_str(), x.scope.as_str(), x.source.as_str()),
+        ("bit", "total", "SD290")
+    );
+    assert_eq!(x.bound, CountBound::Exact(16));
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+    session.accept_diagnostic(&specs, &report);
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert!(values[0].is_ok());
+    assert!(values[1].is_err());
+    let spans = fixture.read_spans();
+    let x_spans: Vec<_> = spans[before..]
+        .iter()
+        .filter(|(device, _, _)| *device == 0x9c)
+        .collect();
+    assert!(!x_spans.is_empty());
+    assert!(x_spans.iter().all(|(_, start, points)| {
+        start
+            .checked_add(u32::from(*points))
+            .is_some_and(|end| end <= 16)
+    }));
+
+    fixture.set_diagnostic_bit_counts(0, 0, 0);
+    session.refresh_diagnostic().await.unwrap();
+    let zero = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert_eq!(
+        zero.counts
+            .iter()
+            .find(|count| count.area == "X")
+            .unwrap()
+            .bound,
+        CountBound::Exact(0)
+    );
+    assert!(zero
+        .tags
+        .iter()
+        .all(|tag| matches!(tag.verdict, TagVerdict::Outside(_))));
+
+    fixture.set_diagnostic_bit_counts(32768, 0, 0);
+    session.refresh_diagnostic().await.unwrap();
+    let edge = bit_specs(&driver, &["X7FFF", "X8000"]);
+    let exact = session.diagnose_batch(&edge).await.unwrap().unwrap();
+    assert_eq!(
+        exact
+            .counts
+            .iter()
+            .find(|count| count.area == "X")
+            .unwrap()
+            .bound,
+        CountBound::Exact(32768)
+    );
+    assert!(matches!(exact.tags[0].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(exact.tags[1].verdict, TagVerdict::Outside(_)));
+
+    fixture.set_bit_sd_refused(true);
+    session.refresh_diagnostic().await.unwrap();
+    let unknown_spec = bit_specs(&driver, &["X1"]);
+    let unknown = session
+        .diagnose_batch(&unknown_spec)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&unknown.counts.iter().find(|count| count.area == "X").unwrap().bound, CountBound::Unknown(reason) if reason == "sd-refused")
+    );
+    assert!(
+        matches!(&unknown.tags[0].verdict, TagVerdict::Unknown(reason) if reason == "sd-refused")
+    );
+    session.accept_diagnostic(&unknown_spec, &unknown);
+    let before = fixture.commands().len();
+    assert!(session.read_batch(&unknown_spec).await.unwrap()[0].is_ok());
+    assert!(
+        fixture.commands().len() > before,
+        "unknown must remain readable"
+    );
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
+    use banto_driver_api::CountBound;
+
+    let (fixture, driver, mut session) = connect_new_guest(Peer::R).await;
+    fixture.set_diagnostic_bit_counts(0, 65538, 2);
+    let specs = bit_specs(&driver, &["SB10001", "SB10002", "F1", "F2"]);
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    for (area, source, bound) in [("SB", "SD268-269", 65538), ("F", "SD270-271", 2)] {
+        let count = report
+            .counts
+            .iter()
+            .find(|count| count.area == area)
+            .unwrap();
+        assert_eq!(
+            (
+                count.unit.as_str(),
+                count.scope.as_str(),
+                count.source.as_str()
+            ),
+            ("bit", "total", source)
+        );
+        assert_eq!(count.bound, CountBound::Exact(bound));
+    }
+    for (index, expected_inside) in [(0, true), (1, false), (2, true), (3, false)] {
+        assert_eq!(
+            matches!(report.tags[index].verdict, TagVerdict::Inside(_)),
+            expected_inside
+        );
+        assert_eq!(
+            matches!(report.tags[index].verdict, TagVerdict::Outside(_)),
+            !expected_inside
+        );
+    }
+    session.accept_diagnostic(&specs, &report);
+    let before = fixture.read_spans().len();
+    let sb_values = session.read_batch(&specs[..2]).await.unwrap();
+    assert!(sb_values[0].is_ok());
+    assert!(sb_values[1].is_err());
+    let values = session.read_batch(&specs[2..]).await.unwrap();
+    assert!(values[0].is_ok());
+    assert!(values[1].is_err());
+    let spans = fixture.read_spans();
+    let bit_spans: Vec<_> = spans[before..]
+        .iter()
+        .filter(|(device, _, _)| matches!(*device, 0xa1 | 0x93))
+        .collect();
+    assert!(bit_spans.iter().any(|(device, _, _)| *device == 0xa1));
+    assert!(bit_spans.iter().any(|(device, _, _)| *device == 0x93));
+    assert!(bit_spans.iter().all(|(device, start, points)| {
+        start
+            .checked_add(u32::from(*points))
+            .is_some_and(|end| end <= if *device == 0xa1 { 65538 } else { 2 })
+    }));
+
+    fixture.set_diagnostic_bit_counts(0, 0, 0);
+    session.refresh_diagnostic().await.unwrap();
+    let zero_specs = bit_specs(&driver, &["SB0", "F0"]);
+    let zero = session.diagnose_batch(&zero_specs).await.unwrap().unwrap();
+    assert!(zero
+        .tags
+        .iter()
+        .all(|tag| matches!(tag.verdict, TagVerdict::Outside(_))));
+
+    fixture.set_bit_sd_refused(true);
+    session.refresh_diagnostic().await.unwrap();
+    let unknown = session.diagnose_batch(&zero_specs).await.unwrap().unwrap();
+    assert!(unknown
+        .tags
+        .iter()
+        .all(|tag| matches!(&tag.verdict, TagVerdict::Unknown(reason) if reason == "sd-refused")));
+    session.accept_diagnostic(&zero_specs, &unknown);
+    let before = fixture.commands().len();
+    assert!(session
+        .read_batch(&zero_specs)
+        .await
+        .unwrap()
+        .iter()
+        .all(Result::is_ok));
+    assert!(
+        fixture.commands().len() > before,
+        "unknown must remain readable"
+    );
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
 async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
     use banto_driver_api::DriverAddress;
 
@@ -655,7 +918,7 @@ async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #34 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
 async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
     let fixture = Fixture::start(Peer::R, 4000, false).await;
     let bytes = new_guest_component();
@@ -715,7 +978,12 @@ async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
         .unwrap();
     assert_eq!(count, 0);
     let mut ids = Vec::new();
-    for (name, address, kind) in [("word", "D3010", "u16"), ("bit", "M10", "bit")] {
+    for (name, address, kind) in [
+        ("word", "D3010", "u16"),
+        ("bit", "M10", "bit"),
+        ("sb-outside", "SB0", "bit"),
+        ("f-outside", "F0", "bit"),
+    ] {
         let (status, body) = super::admin_write(
             &app.router,
             "POST",
@@ -776,14 +1044,43 @@ async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
     .await;
     assert_eq!(status, super::StatusCode::OK, "{report:?}");
     assert_eq!(report["status"], "current");
-    assert_eq!(report["tags"].as_array().map(Vec::len), Some(2));
-    assert!(report["tags"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|tag| tag["verdict"] == "inside"));
+    assert_eq!(report["tags"].as_array().map(Vec::len), Some(4));
+    for (index, verdict) in ["inside", "inside", "outside", "outside"]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(report["tags"][index]["verdict"], verdict);
+    }
+    for (area, source) in [("SB", "SD268-269"), ("F", "SD270-271")] {
+        assert!(report["counts"].as_array().unwrap().iter().any(|count| {
+            count["area"] == area
+                && count["source"] == source
+                && count["bound"] == "exact"
+                && count["points"] == 0
+        }));
+    }
+    for id in &ids[2..] {
+        let sample = app
+            .manager
+            .current_values()
+            .unwrap()
+            .get(&format!("tag:{id}"))
+            .unwrap();
+        assert_eq!(sample.quality, Quality::Bad);
+    }
     assert_eq!(app.sessions.connection_count(), 1);
     assert!(fixture.frames().is_empty());
+    assert!(app.sessions.stop_and_join(saved.id).await);
+    let (status, expired) = super::admin_write(
+        &app.router,
+        "GET",
+        &format!("/api/plc-connections/{}/diagnostics", saved.id),
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK);
+    assert_eq!(expired["status"], "unavailable");
     drop(app);
 }
 fn settings(port: u16, mode: &str, allowlist: &str) -> Settings {
