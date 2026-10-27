@@ -673,7 +673,7 @@ async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
     session.accept_diagnostic(&specs, &report);
     let before = fixture.read_spans().len();
     let values = session.read_batch(&specs).await.unwrap();
-    assert!(values[0].is_ok());
+    assert_eq!(values[0], Ok(Value::Bit(false)));
     assert!(values[1].is_err());
     let spans = fixture.read_spans();
     let x_spans: Vec<_> = spans[before..]
@@ -781,10 +781,10 @@ async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
     session.accept_diagnostic(&specs, &report);
     let before = fixture.read_spans().len();
     let sb_values = session.read_batch(&specs[..2]).await.unwrap();
-    assert!(sb_values[0].is_ok());
+    assert_eq!(sb_values[0], Ok(Value::Bit(true)));
     assert!(sb_values[1].is_err());
     let values = session.read_batch(&specs[2..]).await.unwrap();
-    assert!(values[0].is_ok());
+    assert_eq!(values[0], Ok(Value::Bit(true)));
     assert!(values[1].is_err());
     let spans = fixture.read_spans();
     let bit_spans: Vec<_> = spans[before..]
