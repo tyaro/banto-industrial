@@ -629,7 +629,7 @@ jobs:
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
           if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write component world mismatch' }
           $normalWriteLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-normal-write-hub-test.txt'
-          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_rejects_v_and_keeps_mixed_read_covers --skip new_guest_registry_rest_broker_and_diagnostics_reject_v --skip bit_bool_values_and_device_error_survive_the_host_read_boundary --skip saved_bit_tags_keep_values_and_quality_after_collection --skip explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d --skip diagnostic_guest_uses_existing_connection_and_preserves_read --skip saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path --skip high_low_word_order_is_preserved_through_host_and_guest --skip typed_words_are_one_complete_frame_and_bad_items_send_nothing --skip standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run 2>&1 | Tee-Object -FilePath $normalWriteLog
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_ --skip bit_bool_values_and_device_error_survive_the_host_read_boundary --skip saved_bit_tags_keep_values_and_quality_after_collection --skip explicit_w_range_uses_the_same_q_and_r_gate_without_broadening_d --skip diagnostic_guest_uses_existing_connection_and_preserves_read --skip saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path --skip high_low_word_order_is_preserved_through_host_and_guest --skip typed_words_are_one_complete_frame_and_bad_items_send_nothing --skip standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run 2>&1 | Tee-Object -FilePath $normalWriteLog
           if ($LASTEXITCODE -ne 0) { throw 'normal SLMP write Hub tests failed' }
           if (-not (Select-String -Path $normalWriteLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'normal SLMP write Hub tests did not all run'
@@ -661,7 +661,7 @@ jobs:
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM --world driver-with-write-v1
           if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP component world mismatch' }
           $commonDwLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-common-dw-hub-test.txt'
-          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_rejects_v_and_keeps_mixed_read_covers --skip new_guest_registry_rest_broker_and_diagnostics_reject_v --skip diagnostic_guest_uses_existing_connection_and_preserves_read --skip saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path --skip high_low_word_order_is_preserved_through_host_and_guest --skip typed_words_are_one_complete_frame_and_bad_items_send_nothing --skip standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run 2>&1 | Tee-Object -FilePath $commonDwLog
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_ --skip diagnostic_guest_uses_existing_connection_and_preserves_read --skip saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path --skip high_low_word_order_is_preserved_through_host_and_guest --skip typed_words_are_one_complete_frame_and_bad_items_send_nothing --skip standard_q_and_r_bit_areas_use_bool_and_one_frame_per_allowed_run 2>&1 | Tee-Object -FilePath $commonDwLog
           if ($LASTEXITCODE -ne 0) { throw 'common D/W SLMP Hub tests failed' }
           if (-not (Select-String -Path $commonDwLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'common D/W SLMP Hub tests did not all run'
@@ -701,14 +701,14 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'optional diagnostics world compatibility failed' }
           $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM
           $diagnosticLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-diagnostics-hub-test.txt'
-          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_rejects_v_and_keeps_mixed_read_covers --skip new_guest_registry_rest_broker_and_diagnostics_reject_v 2>&1 | Tee-Object -FilePath $diagnosticLog
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored --skip new_guest_ 2>&1 | Tee-Object -FilePath $diagnosticLog
           if ($LASTEXITCODE -ne 0) { throw 'diagnostic SLMP Hub tests failed' }
           if (-not (Select-String -Path $diagnosticLog -Pattern '^test result: ok\. 14 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'diagnostic SLMP Hub tests did not all run'
           }
           # Keep the earlier diagnostic and read/write guests above for
-          # compatibility. Build merged SLMP #34 separately for Hub acceptance.
-          $newSlmpSha = 'c9cf3b8e1406c9a5bd4cdd0baa3f27e4744226ad'
+          # compatibility. Build merged SLMP #35 separately for Hub acceptance.
+          $newSlmpSha = 'b3d944f58a8dad86e2a5c8db5f76be6a471bdac0'
           git -C $guest checkout --quiet --detach $newSlmpSha
           if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $newSlmpSha) {
             throw 'new SLMP guest SHA mismatch'
@@ -731,7 +731,7 @@ jobs:
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP guest build failed' }
           $newSlmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
-          $env:BANTO_SLMP_NEW_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-34-component.wasm'
+          $env:BANTO_SLMP_NEW_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'slmp-35-component.wasm'
           wasm-tools component new $newSlmpModule -o $env:BANTO_SLMP_NEW_COMPONENT_WASM
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component creation failed' }
           wasm-tools validate $env:BANTO_SLMP_NEW_COMPONENT_WASM
@@ -740,10 +740,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component world mismatch' }
           $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
-          $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-34-hub-test.txt'
+          $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-35-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 16 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 18 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.

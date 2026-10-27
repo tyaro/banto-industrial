@@ -17,3 +17,7 @@ Hub の `POST /api/plc-connections/{id}/diagnostics` は保存済み PLC タグ�
 ## SLMP guest #34 の追加受入れ
 
 SLMP guest #34 (`c9cf3b8e`) は V edge relay を周期収集で確実に捕捉できないため登録・offset・read plan で拒否し、診断では理由付き `invalid` にします。混在要求の正常タグは元の covers 順と値対応を保ちます。Hub の接続設定保存・タグ登録・broker 読取り・REST 診断を固定 guest のループバック試験で確認します。診断 `unknown` は理由を表示しつつ明示読取りを続け、`Bad` へ落とす対象は現在の有効な診断の `outside` に限ります。全タグ範囲の実機検証や世代管理など #845 の残件は、この模擬受入れだけで完了としません。
+
+## SLMP guest #35 の Hub 受入れ
+
+CI は SLMP guest #35 merge `b3d944f5` を固定して別途ビルドし、既存の Host テスト用 manifest と `driver-with-write-and-diagnostics-v1` world で Hub のループバック受入れを行います。標準 Q の X は SD290、標準 R の SB/F は SD268–271 の点数を報告します。各領域の N−1/N とゼロ、Q X=32768 の exact、R の low/high word、SD 取得拒否時の `unknown`、`outside` の読取り除外を確認します。旧 guest の固定回帰、`outside` の `Bad` 品質、接続停止後の GET `unavailable` も確認します。#886 の診断 UI 修正には手を加えません。実 PLC と本番配置は対象外です。
