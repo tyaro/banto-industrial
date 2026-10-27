@@ -1151,7 +1151,7 @@ mod tests {
             config,
             pool,
             groups,
-            test_options(Duration::from_millis(100)),
+            test_options(DB_OPERATION_TIMEOUT),
             Redactor::new(),
         );
         if drain_first {
@@ -1159,10 +1159,16 @@ mod tests {
         } else {
             handle.waker().notify_one();
         }
-        tokio::time::timeout(Duration::from_secs(2), reached)
+        tokio::time::timeout(Duration::from_secs(10), reached)
             .await
             .expect("COMMIT reached the mock DB")
             .expect("COMMIT signal");
+        // The 30-second operation clock started before connect. Advance it
+        // only after the mock confirms COMMIT was received, so slow CI startup
+        // cannot accidentally time out an earlier stage.
+        tokio::time::pause();
+        tokio::time::advance(DB_OPERATION_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(2), async {
             while group.state() != GroupState::Error {
                 tokio::task::yield_now().await;
