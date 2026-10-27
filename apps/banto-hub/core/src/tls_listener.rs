@@ -331,6 +331,30 @@ mod tests {
         };
         assert!(matches!(missing_key.acceptor(), Err(TlsError::PrivateKey)));
 
+        let unrelated_key = temp.path().join("unrelated.key");
+        let output = std::process::Command::new("openssl")
+            .args([
+                "genpkey",
+                "-algorithm",
+                "RSA",
+                "-pkeyopt",
+                "rsa_keygen_bits:2048",
+            ])
+            .arg("-out")
+            .arg(&unrelated_key)
+            .output()
+            .expect("openssl was available for the certificate fixture");
+        assert!(output.status.success(), "temporary key generation failed");
+        let mismatched_identity = TlsConfig {
+            port: 0,
+            cert: cert.clone(),
+            key: unrelated_key,
+        };
+        assert!(matches!(
+            mismatched_identity.acceptor(),
+            Err(TlsError::InvalidIdentity)
+        ));
+
         let app = Router::new().route("/probe", get(|| async { "hub-route" }));
         let plain = banto_server::start(
             banto_server::ServerConfig {
