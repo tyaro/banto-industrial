@@ -13,3 +13,7 @@ Hub の `POST /api/plc-connections/{id}/diagnostics` は保存済み PLC タグ�
 検証は模擬 transport と実 Wasmtime component で行います。実 PLC、通常起動への新 guest 登録、署名鍵配置、64 bit 整数を正確に扱う公開 API、標準 Q の D 書込みはこの変更の対象外です。
 
 同じ PR の書込み適合では、既存の接続別 D/W 共通 allowlist を使い、数値 8 型と標準 Q/R の M/Y/L/B Bool を Hub の型・幅・値域検査へ追加します。旧 D/u16 は維持します。allowlist、独立した書込み認可と監査、署名付き loader、D3000/D3001 保護、送信後の結果不明時に自動再送しない規則は変えません。現行の公開値 API は f64 なので、表現不能な 64 bit 整数は丸めて書かず拒否します。標準 Q の D 書込みは引き続き非対応です。
+
+## SLMP guest #34 の追加受入れ
+
+SLMP guest #34 (`c9cf3b8e`) は V edge relay を周期収集で確実に捕捉できないため登録・offset・read plan で拒否し、診断では理由付き `invalid` にします。混在要求の正常タグは元の covers 順と値対応を保ちます。Hub の接続設定保存・タグ登録・broker 読取り・REST 診断を固定 guest のループバック試験で確認します。診断 `unknown` は理由を表示しつつ明示読取りを続け、`Bad` へ落とす対象は現在の有効な診断の `outside` に限ります。全タグ範囲の実機検証や世代管理など #845 の残件は、この模擬受入れだけで完了としません。
