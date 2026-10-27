@@ -1,6 +1,6 @@
 # WASM SLMP 範囲診断（#845）
 
-状態: **限定実装・模擬試験済み（2026-10-27）**。診断 API・世代管理（#878）、旧結果と未保存設定の遮断（#886）、SLMP guest #35 の Hub 受入れ（#887）を実装した。受入れ項目の対応表、全設定・全世代の組合せの網羅、実 PLC・本番での確認は未実施。
+状態: **限定実装・模擬試験済み（2026-10-27）**。診断 API・世代管理（#878）、旧結果と未保存設定の遮断（#886）、SLMP guest #35 の Hub 受入れ（#887）を実装した。受入れ項目の対応表は末尾の節（2026-10-27 作成）。A1・A5 の扱いはオーナー判断待ち。全設定・全世代の組合せの網羅、実 PLC・本番での確認は未実施。
 
 `diagnostics-v1` は既存の read/write WIT world を変更しない任意の export です。
 export がない旧 guest は診断非対応として表示し、既存の読取り・書込みは継続します。
@@ -23,3 +23,18 @@ SLMP guest #34 (`c9cf3b8e`) は V edge relay を周期収集で確実に捕捉�
 ## SLMP guest #35 の Hub 受入れ
 
 CI は SLMP guest #35 merge `b3d944f5` を固定して別途ビルドし、既存の Host テスト用 manifest と `driver-with-write-and-diagnostics-v1` world で Hub のループバック受入れを行います。標準 Q の X は SD290、標準 R の SB/F は SD268–271 の点数を報告します。各領域の N−1/N とゼロ、Q X=32768 の exact、R の low/high word、SD 取得拒否時の `unknown`、`outside` の読取り除外を確認します。旧 guest の固定回帰、`outside` の `Bad` 品質、接続停止後の GET `unavailable` も確認します。#886 の診断 UI 修正には手を加えません。実 PLC と本番配置は対象外です。
+
+## 受入れの対応表（#845、2026-10-27）
+
+Issue #845 の受入れ条件ごとの、実装と模擬試験の対応（main `19c90110` 時点）。「模擬試験あり」は模擬 transport と固定 guest による確認で、実 PLC・本番での確認は含まない。略記: OW = `apps/banto-hub/host/tests/t12_slmp_wasm_operational_write/mod.rs`、UI = `e2e/tests-banto-hub/banto-hub-tags-range-diagnostic.spec.ts`。
+
+| 条件                                              | 状態                       | 主な実装と試験                                                                                                                                                                                         |
+| ------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| A1 保存時の静的検査と実機検証の分離               | 部分的（オーナー判断待ち） | 診断は保存済みタグに対する別の操作（`rest/diagnostics.rs`）で、保存を止めない。「実機未確認」という明示のタグ状態・表示はない。`unknown` と未診断で足りるかは未決。                                    |
+| A2 接続成功と全タグ成功の区別、タグ別の理由       | 模擬試験あり               | `TagVerdict` が理由付き。UI「unknown の理由と outside を分け、接続成功を全タグ成功として扱わない」、OW `saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path`。                     |
+| A3 読取りのみ、outside は送信しない、境界またぎ   | 部分的                     | outside の読取り除外は `banto-driver-engine` の `read`。OW `new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub` ほか。U32・文字列の境界またぎを Hub 側で確かめる試験はない（guest の責務）。        |
+| A4 outside・未確認で過去の正常値を使わない        | 模擬試験あり               | `banto-collect` の `mark_outside_bad` と `outside_diagnostic_invalidates_value_without_faking_a_read`。`unknown` は契約どおり Bad にせず明示読取りを続ける。                                           |
+| A5 書込み前の全範囲検査、範囲外なら全体をエラー   | 部分的（オーナー判断待ち） | Host の allowlist・型・幅・値域の全件検査と guest の SD による全範囲確認で拒否する（OW `typed_words_are_one_complete_frame_and_bad_items_send_nothing`）。書込みは診断の outside 集合を使わない。      |
+| A6 接続先・時点の対応付け、再取得、取得失敗の扱い | 模擬試験あり               | revision・driver version・epoch で現在性を検査（`hub.rs` の `current_range_diagnostic`）。`banto-broker` の `diagnostic_epoch_rejects_reconnect_and_replaced_task`、UI の 10 件、SD 拒否は `unknown`。 |
+
+検証観点のうち、通常範囲・範囲外の混在・点数取得失敗・同じ接続での点数の縮小（OW の `set_count(2000)` の再診断）は模擬試験がある。型式不明だけの試験、「未確認から PLC の設定完了後の再テスト」の流れ、再接続をまたいだ縮小で Bad になる試験、D の末尾の複数語タグの Hub 側の試験はない。全設定・全世代の組合せ、実 PLC・本番は別枠で未実施。

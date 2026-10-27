@@ -267,4 +267,26 @@ mod tests {
         .unwrap();
         assert!(WritePolicy::parse(&combined).is_err());
     }
+
+    #[test]
+    fn overlap_is_rejected_even_when_another_area_sits_between() {
+        for bad in [
+            "D3010-D3013,W1A-W1F,D3012-D3014",
+            "D3010-D3013,W1A-W1F,D3013-D3014",
+            "W1A-W1F,D3010-D3013,W1C-W1D",
+            "W1A-W1F,D3010-D3013,W1F-W20",
+        ] {
+            assert_eq!(
+                WritePolicy::parse(&settings("enabled", bad)).err(),
+                Some((ALLOWLIST_KEY, "write ranges must be ordered and disjoint")),
+                "{bad}"
+            );
+        }
+        let ok =
+            WritePolicy::parse(&settings("enabled", "D3010-D3011,W1A-W1F,D3020-D3021")).unwrap();
+        assert!(ok.allows_device_span(WriteArea::D, 3010, 2));
+        assert!(ok.allows_device_span(WriteArea::W, 0x1a, 6));
+        assert!(ok.allows_device_span(WriteArea::D, 3020, 2));
+        assert!(!ok.allows_device_span(WriteArea::D, 3012, 1));
+    }
 }
