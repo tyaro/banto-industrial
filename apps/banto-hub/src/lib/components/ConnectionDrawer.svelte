@@ -356,6 +356,38 @@
 	let rangeDiagnostic: PlcRangeDiagnostic | null = $state(null);
 	let rangeDiagnosticBusy = $state(false);
 	let rangeDiagnosticRequest = 0;
+	/**
+	 * 保存成功時に更新 API が返した接続（P2 レビュー対応）。親は一覧を取り直す
+	 * だけで `connection` prop を差し替えないため、保存したプロトコルの変更
+	 * （空の PLC 接続 → push など）を表示・ポーリングへ反映する基準にする。
+	 * 未保存の `form.protocol` は基準にしない。
+	 */
+	let savedRecord: SavedConnectionRecord | null = $state.raw(null);
+	const savedConnection = $derived(resolveSavedConnection(connection, savedRecord));
+	const savedIsPush = $derived(isSavedPushConnection(connection, savedRecord));
+	const diagnosticFormSignature = $derived.by(() => {
+		const input = formToConnectionInput(form, drivers);
+		return JSON.stringify([input.protocol, input.simulation, input.settings]);
+	});
+	const diagnosticSavedSignature = $derived.by(() => {
+		if (!savedConnection) return null;
+		const input = formToConnectionInput(connectionToForm(savedConnection, drivers), drivers);
+		return JSON.stringify([input.protocol, input.simulation, input.settings]);
+	});
+	const diagnosticSettingsMatch = $derived(
+		diagnosticSavedSignature !== null && diagnosticFormSignature === diagnosticSavedSignature
+	);
+	const rangeDiagnosticContext = $derived(
+		open && savedConnection
+			? JSON.stringify([
+					savedConnection.id,
+					diagnosticSavedSignature,
+					diagnosticFormSignature,
+					driver?.version
+				])
+			: null
+	);
+	let lastRangeDiagnosticContext: string | null = null;
 	let dbTestState: DbTestState = $state(blankDbTestState());
 	let step: 1 | 2 | 3 = $state(1);
 	/** 直前のプロトコル（ドライバを替えたときの引き継ぎの元を引く）。 */
@@ -460,6 +492,15 @@
 		if (requestDelete && connection && !readOnly) {
 			void handleDelete();
 		}
+	});
+
+	$effect(() => {
+		const context = rangeDiagnosticContext;
+		if (context === lastRangeDiagnosticContext) return;
+		lastRangeDiagnosticContext = context;
+		rangeDiagnosticRequest += 1;
+		rangeDiagnostic = null;
+		rangeDiagnosticBusy = false;
 	});
 
 	/**
@@ -600,16 +641,6 @@
 	let ingestStatusLoaded = $state(false);
 	let ingestStatusError: string | null = $state(null);
 
-	/**
-	 * 保存成功時に更新 API が返した接続（P2 レビュー対応）。親は一覧を取り直す
-	 * だけで `connection` prop を差し替えないため、保存したプロトコルの変更
-	 * （空の PLC 接続 → push など）を表示・ポーリングへ反映する基準にする。
-	 * 未保存の `form.protocol` は基準にしない。
-	 */
-	let savedRecord: SavedConnectionRecord | null = $state.raw(null);
-	const savedConnection = $derived(resolveSavedConnection(connection, savedRecord));
-	const savedIsPush = $derived(isSavedPushConnection(connection, savedRecord));
-
 	$effect(() => {
 		const id = savedConnection?.id;
 		if (!open || id === undefined || !savedIsPush) return;
@@ -703,24 +734,34 @@
 	}
 
 	async function runRangeDiagnostic(): Promise<void> {
-		const id = connection?.id;
-		if (!id || rangeDiagnosticBusy) return;
+		const id = savedConnection?.id;
+		const context = rangeDiagnosticContext;
+		if (!id || !context || !diagnosticSettingsMatch || rangeDiagnosticBusy) return;
 		rangeDiagnosticBusy = true;
 		const request = ++rangeDiagnosticRequest;
+		const isCurrent = () =>
+			open &&
+			savedConnection?.id === id &&
+			diagnosticSettingsMatch &&
+			rangeDiagnosticContext === context &&
+			request === rangeDiagnosticRequest;
 		try {
 			const result = await diagnosePlcConnection(id);
-			if (connection?.id === id && request === rangeDiagnosticRequest) rangeDiagnostic = result;
+			if (isCurrent()) rangeDiagnostic = result;
 		} catch (err) {
-			if (connection?.id === id) rangeDiagnostic = null;
-			toastStore.push('error', errorMessage(err));
+			if (isCurrent()) {
+				rangeDiagnostic = null;
+				toastStore.push('error', errorMessage(err));
+			}
 		} finally {
-			rangeDiagnosticBusy = false;
+			if (isCurrent()) rangeDiagnosticBusy = false;
 		}
 	}
 
 	$effect(() => {
-		const id = connection?.id;
-		if (!id) return;
+		const id = savedConnection?.id;
+		const context = rangeDiagnosticContext;
+		if (!id || !context || !diagnosticSettingsMatch) return;
 		let active = true;
 		const refresh = async () => {
 			if (rangeDiagnosticBusy) return;
@@ -729,7 +770,10 @@
 				const result = await getCurrentPlcRangeDiagnostic(id);
 				if (
 					active &&
-					connection?.id === id &&
+					open &&
+					savedConnection?.id === id &&
+					diagnosticSettingsMatch &&
+					rangeDiagnosticContext === context &&
 					request === rangeDiagnosticRequest &&
 					!rangeDiagnosticBusy
 				) {
@@ -737,7 +781,15 @@
 				}
 			} catch {
 				// A transient UI request error must not turn an unknown range into a verified one.
-				if (active && connection?.id === id && request === rangeDiagnosticRequest)
+				if (
+					active &&
+					open &&
+					savedConnection?.id === id &&
+					diagnosticSettingsMatch &&
+					rangeDiagnosticContext === context &&
+					request === rangeDiagnosticRequest &&
+					!rangeDiagnosticBusy
+				)
 					rangeDiagnostic = null;
 			}
 		};
@@ -1320,11 +1372,13 @@
 				type="button"
 				class="test-btn"
 				onclick={runRangeDiagnostic}
-				disabled={rangeDiagnosticBusy}
+				disabled={rangeDiagnosticBusy || !diagnosticSettingsMatch}
 			>
 				{rangeDiagnosticBusy ? '診断中…' : '機器の設定範囲を確認'}
 			</button>
-			{#if rangeDiagnostic?.status === 'current'}
+			{#if !diagnosticSettingsMatch}
+				<p class="hint" data-testid="range-diagnostic-unsaved">保存後に診断してください。</p>
+			{:else if rangeDiagnostic?.status === 'current'}
 				<div class="test-result">
 					<div>
 						型式: {rangeDiagnostic.model?.name ?? '不明'}（{rangeDiagnostic.model?.family ??
