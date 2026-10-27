@@ -687,7 +687,7 @@ fn bit_specs(driver: &WasmDriver, addresses: &[&str]) -> Vec<TagSpec> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
     use banto_driver_api::CountBound;
 
@@ -781,7 +781,7 @@ async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
     use banto_driver_api::CountBound;
 
@@ -868,7 +868,7 @@ async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
     use banto_driver_api::DriverAddress;
 
@@ -955,7 +955,7 @@ async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
     let fixture = Fixture::start(Peer::R, 4000, false).await;
     let bytes = new_guest_component();
@@ -1136,8 +1136,9 @@ fn covered(session: &mut FrameSession, specs: &[TagSpec]) -> Vec<u32> {
 }
 
 /// Guest #43: with an exact same-connection SD count, a bit tag at or past it is
-/// left out of the plan. The Host then reports the guest's own per-item
-/// `Unsupported` ("計画に含まれない"); no frame is sent and neighbours keep values.
+/// left out of the plan (the guest only leaves the tag out of `covers`). The Host
+/// engine then reports its default per-item `Unsupported` for indices the guest
+/// left out ("計画に含まれない"); no frame is sent and neighbours keep values.
 /// Once the Hub also adopts the diagnostic, its own earlier gate answers with
 /// `HUB_OUTSIDE` instead. Both are per-item `Err(Unsupported)`, never Good.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1288,8 +1289,17 @@ async fn new_guest_refused_or_saturated_counts_keep_explicit_bit_reads() {
     let specs = bit_specs(&driver, &["M32767", "M40000", "B7FFF", "B9C40"]);
     let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
     assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
-    assert!(!matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
-    assert!(!matches!(report.tags[3].verdict, TagVerdict::Outside(_)));
+    for (index, expected) in [
+        (1, "configured-range-unproven"),
+        (3, "configured-range-unproven"),
+    ] {
+        assert!(
+            matches!(&report.tags[index].verdict, TagVerdict::Unknown(r) if r == expected),
+            "{:?}",
+            report.tags[index].verdict
+        );
+    }
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
     let before = fixture.read_spans().len();
     let values = session.read_batch(&specs).await.unwrap();
     assert!(values.iter().all(Result::is_ok), "{values:?}");
@@ -1303,7 +1313,8 @@ async fn new_guest_refused_or_saturated_counts_keep_explicit_bit_reads() {
 /// Guest #43 through the real Hub path: the write handshake of a saved
 /// `write_mode=enabled` connection obtains the exact M count (64), so M64 is
 /// left out of the plan. Collection stores it as `None`/Bad, read-now answers
-/// 502 `read_failed` carrying the guest's per-item `Unsupported` text, the
+/// 502 `read_failed` carrying the Host engine's default per-item `Unsupported`
+/// text for a tag the guest left out of `covers`, the
 /// neighbours M10/M63 stay Good, and no read frame ever covers M64.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
@@ -1374,6 +1385,8 @@ async fn new_guest_saved_outside_m_bit_is_bad_and_never_sent_through_the_hub() {
     })
     .await
     .expect("M10/M63 Good, M64 Bad");
+    // Checks M64 stays Bad over several 100 ms collection cycles (the never-sent
+    // check is the final `read_spans` assertion).
     // A few more ticks: M64 never turns Good or gains a value.
     tokio::time::sleep(Duration::from_millis(400)).await;
     let outside = sample_of(ids[2]).unwrap();
