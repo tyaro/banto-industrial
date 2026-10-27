@@ -1,5 +1,6 @@
 //! Offline join test for the pinned banto-driver-wasm Modbus component.
-//! Build the component separately and set BANTO_MODBUS_COMPONENT_WASM. All
+//! Build the component separately and set BANTO_MODBUS_COMPONENT_WASM and
+//! BANTO_MODBUS_MANIFEST to the pinned package files. All
 //! responses are synthesized here; no socket or PLC is opened.
 
 use banto_driver_api::{
@@ -8,8 +9,12 @@ use banto_driver_api::{
 };
 use banto_driver_wasm::WasmDriver;
 
-const WRITE_MANIFEST: &[u8] = br#"{"manifestVersion":1,"id":"modbus-fc3-wasm","version":"0.4.0","hubApi":"1","settingsVersion":1,"displayName":"Modbus simulated join","transports":["tcp"],"capabilities":["read","write"],"writeApi":"1"}"#;
 const READ_MANIFEST: &[u8] = br#"{"manifestVersion":1,"id":"modbus-fc3-wasm","version":"0.4.0","hubApi":"1","settingsVersion":1,"displayName":"Modbus simulated join","transports":["tcp"],"capabilities":["read"]}"#;
+
+fn write_manifest() -> Vec<u8> {
+    std::fs::read(std::env::var("BANTO_MODBUS_MANIFEST").expect("BANTO_MODBUS_MANIFEST"))
+        .expect("published package manifest bytes")
+}
 
 fn component() -> Vec<u8> {
     std::fs::read(
@@ -97,7 +102,7 @@ fn read_world_keeps_old_loader_and_handshake_checks_fc4() {
 #[test]
 #[ignore = "requires BANTO_MODBUS_COMPONENT_WASM from the pinned guest"]
 fn handshake_rejects_exception_and_wrong_transaction() {
-    let driver = WasmDriver::load_operational_write(WRITE_MANIFEST, &component()).unwrap();
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
     for mut response in [
         vec![0, 0, 0, 0, 0, 3, 1, 0x84, 2],
         vec![0, 1, 0, 0, 0, 5, 1, 4, 2, 0, 1],
@@ -114,7 +119,7 @@ fn handshake_rejects_exception_and_wrong_transaction() {
 #[test]
 #[ignore = "requires BANTO_MODBUS_COMPONENT_WASM from the pinned guest"]
 fn write_world_gates_fc5_fc16_before_send_and_checks_ack() {
-    let driver = WasmDriver::load_operational_write(WRITE_MANIFEST, &component()).unwrap();
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
     assert!(driver.descriptor().capabilities.write);
     let coil = WriteItem::new(spec(&driver, "000001", DataType::Bit), Value::Bit(true));
     let holding = WriteItem::new(
