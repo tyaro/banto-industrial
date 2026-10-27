@@ -66,6 +66,9 @@ const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 /// One table check or one complete batch (acquire, BEGIN, INSERT, COMMIT).
 pub(crate) const DB_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Check a delayed group again during drain without spinning or delaying stop.
+const DRAIN_IDLE_POLL: Duration = Duration::from_millis(50);
+
 /// `pg_stat_activity` で見分けるための固定名（実装指示）。DB Source は
 /// 接続名を後ろに付けるが、Sink は 1 プロセス 1 用途なので固定文字列。
 const APPLICATION_NAME: &str = "banto-hub-sink";
@@ -540,20 +543,39 @@ impl Flusher {
     async fn run(self) {
         let mut attempt: u32 = 0;
         loop {
-            if !self.draining.load(Ordering::Relaxed) {
+            let draining = self.draining.load(Ordering::Relaxed);
+            let queued_before = if draining { self.queued_rows() } else { 0 };
+            if !draining {
                 tokio::select! {
                     _ = self.stop.notified() => return,
                     _ = self.wake.notified() => {}
                     _ = tokio::time::sleep(self.options.flush_interval) => {}
                 }
-            } else if self.all_queues_empty() {
+            } else if queued_before == 0 {
                 // drain 指示済みでキューも空 - 停止要求を待つだけ。
                 self.stop.notified().await;
                 return;
+            } else {
+                // Check stop even when a completed round needs no DB await.
+                tokio::select! {
+                    biased;
+                    _ = self.stop.notified() => return,
+                    _ = std::future::ready(()) => {}
+                }
             }
 
             match self.round().await {
-                RoundOutcome::Idle => attempt = 0,
+                RoundOutcome::Idle => {
+                    attempt = 0;
+                    // A timed-out group keeps its queue while waiting for the
+                    // next table check. A shrinking queue keeps draining fast.
+                    if draining && self.queued_rows() >= queued_before {
+                        tokio::select! {
+                            _ = self.stop.notified() => return,
+                            _ = tokio::time::sleep(DRAIN_IDLE_POLL) => {}
+                        }
+                    }
+                }
                 RoundOutcome::ConnectionFailed => {
                     attempt = attempt.saturating_add(1);
                     let delay = backoff_delay(attempt);
@@ -566,11 +588,12 @@ impl Flusher {
         }
     }
 
-    fn all_queues_empty(&self) -> bool {
+    fn queued_rows(&self) -> usize {
         self.groups
             .for_connection(self.connection_id)
             .iter()
-            .all(|group| group.queued() == 0)
+            .map(|group| group.queued())
+            .sum()
     }
 
     async fn round(&self) -> RoundOutcome {
@@ -779,6 +802,7 @@ mod tests {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum StallAt {
+        Never,
         TableCheck,
         Begin,
         Insert,
@@ -1113,6 +1137,101 @@ mod tests {
         );
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(group.queued(), 1, "unknown COMMIT cannot ACK on stop");
+    }
+
+    async fn assert_stop_after_group_timeout(drain_first: bool) {
+        use crate::status::GroupState;
+        let (pool, config, _server, reached, _inserts) = mock_pool(StallAt::Commit).await;
+        let group = group(1);
+        group.mark_table_ready();
+        group.push_rows(vec![test_row(1)]);
+        let groups = Arc::new(GroupRegistry::new());
+        groups.insert(group.clone());
+        let handle = spawn_flusher(
+            config,
+            pool,
+            groups,
+            test_options(Duration::from_millis(100)),
+            Redactor::new(),
+        );
+        if drain_first {
+            handle.request_drain();
+        } else {
+            handle.waker().notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(2), reached)
+            .await
+            .expect("COMMIT reached the mock DB")
+            .expect("COMMIT signal");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while group.state() != GroupState::Error {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("operation timeout becomes a group error");
+        if !drain_first {
+            handle.request_drain();
+        }
+        // On one worker, a synchronous drain spin prevents even this yield
+        // and the independent heartbeat from running.
+        tokio::task::yield_now().await;
+        let heartbeat = tokio::spawn(async { 1 });
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(500), heartbeat)
+                .await
+                .expect("other task gets CPU")
+                .expect("heartbeat"),
+            1
+        );
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                handle.stop(Duration::from_millis(500))
+            )
+            .await
+            .expect("stop budget is schedulable"),
+            FlusherStopOutcome::Completed
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(group.queued(), 1, "unknown COMMIT must remain unacked");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn timeout_then_drain_recheck_wait_yields_and_stops() {
+        assert_stop_after_group_timeout(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn drain_during_timeout_recheck_wait_yields_and_stops() {
+        assert_stop_after_group_timeout(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn successful_drain_flushes_all_batches() {
+        let (pool, config, _server, _reached, inserts) = mock_pool(StallAt::Never).await;
+        let group = group(1);
+        group.mark_table_ready();
+        group.push_rows(vec![test_row(1), test_row(2), test_row(3)]);
+        let groups = Arc::new(GroupRegistry::new());
+        groups.insert(group.clone());
+        let mut options = test_options(Duration::from_secs(1));
+        options.batch_size = 1;
+        let handle = spawn_flusher(config, pool, groups, options, Redactor::new());
+        handle.request_drain();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while group.queued() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drain commits all batches");
+        assert_eq!(inserts.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            handle.stop(Duration::from_millis(500)).await,
+            FlusherStopOutcome::Completed
+        );
     }
 
     /// プールの構築はネットワーク I/O を伴わない（`connect_lazy_with`）
