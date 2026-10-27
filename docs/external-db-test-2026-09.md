@@ -152,6 +152,40 @@ GRANT SELECT ON machine_status TO banto_source;
 GRANT INSERT, SELECT ON tag_history TO banto_sink;
 ```
 
+#### P-1・P-5・P-7 の推奨案（2026-10-28、オーナーの決定待ち）
+
+**P-1 LAN を切る方法**: **PostgreSQL の PC とスイッチの間のケーブルを抜く**ことを勧める。抜いた・挿した時刻を R-4 に書く。
+
+- 理由: 実際の断線に一番近く、Hub の PC 側の PLC・シミュレーションの経路に触れない（S-1 の「Hub の収集は続く」を、ほかの経路を巻き込まずに確かめられる）。
+- 抜けない置き方なら、次点は PostgreSQL の PC のコンソールで `Disable-NetAdapter -Name <NIC>` → `Enable-NetAdapter`（リモートからでは戻せなくなるので、必ずその PC の前で行う）。
+- Windows ファイアウォールの規則で塞ぐ案は勧めない。規則は新しい接続の確立で効くので、張り済みの TCP の接続が切れずに残ることがあり、「切断」にならない場合がある。
+- Hub の PC の NIC を落とす案も勧めない。PLC やほかの経路まで止まり、S-1 の「Hub の収集は続く」が確かめられない。
+
+**P-5 Hub のサービスに TLS の環境変数を渡す方法**: **サービスのレジストリの `Environment`（REG_MULTI_SZ）** を勧める。SCM はこの値をサービスのプロセスの環境に足して起動する。
+
+- ポートは **8723**（8722 の隣、ChronoGazer の 8721 と重ならない）。当日の前に `Get-NetTCPConnection -LocalPort 8723` で空きを確かめる。
+- 証明書と秘密鍵は `%ProgramData%\BantoHub\tls\` に置き、このフォルダの ACL を SYSTEM・Administrators だけにする（Hub のサービスは LocalSystem）。作るのは Git for Windows に同梱の `openssl.exe` で足りる（P-5 の例の 1 行に `-keyout`・`-out` を付ける）。期限は S7 の期間を覆う 30 日。
+- 管理者の PowerShell で、**先に既存の値を確かめて**から書く（`Environment` が既にあれば、残す行を足して書き直す。上書きで消さない）:
+
+```powershell
+Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub -Name Environment -ErrorAction SilentlyContinue
+New-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub -Name Environment -PropertyType MultiString -Force -Value @(
+  'BANTO_HUB_TLS_PORT=8723',
+  'BANTO_HUB_TLS_CERT=C:\ProgramData\BantoHub\tls\hub-cert.pem',
+  'BANTO_HUB_TLS_KEY=C:\ProgramData\BantoHub\tls\hub-key.pem')
+Restart-Service BantoHub
+```
+
+- 確かめ: Hub のサービスログに TLS の待受が出る・`Test-NetConnection 127.0.0.1 -Port 8723` が通る・LAN 側の IP の 8723 には繋がらない。
+- 戻し方: `Remove-ItemProperty ... -Name Environment`（または元の値に書き直す）→ `Restart-Service BantoHub`。S7 の後に戻すかは、そのときにオーナーが決める。
+- `sc config` や `setx /M` は勧めない。`sc config` には環境変数を渡す口が無く、`setx /M` はマシン全体の環境を変えてほかのプロセスにも効く。
+
+**P-7 結果を書く文書の置き場**: **新しい文書 `docs/real-machine-test-2026-11-s7.md`** を勧める（#229 のオーナーのコメント「結果は real-machine 系 docs に記録」に合わせる）。
+
+- この手順書の §5 には、その文書へのリンクと合否の一覧だけを書く（24 時間の表と SQL の結果が長く、手順書が読みにくくなるため）。
+- 文書は、R-1〜R-6 の空の表と、P-1・P-2 の機材と版の欄を持たせて、準備の PR で先に作る。
+- R-2 の 1 時間ごとの採取は、**PowerShell の小さなスクリプトで自動にする**（夜をまたぐので手では取りきれない）: `Invoke-RestMethod` で `GET /api/status`（`read` のキー）と、`psql -c "SELECT count(*), max(ts) FROM tag_history"` を 1 時間ごとに CSV に 1 行足す。スクリプトは結果の文書の付録に載せ、11/1 までにローカルの PostgreSQL（`127.0.0.1:5432`）で 2〜3 回分動かして形を確かめる。キーは環境変数で渡し、CSV とスクリプトに書かない。
+
 ### D. 当日の順番
 
 日ごとの区切りは目安。24 時間の計測（D-3）を先に始められるよう、D-1・D-2 は 1 日目に終える。各段の合否は R-1 に書く。
