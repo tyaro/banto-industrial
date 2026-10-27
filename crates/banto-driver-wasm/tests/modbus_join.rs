@@ -178,3 +178,35 @@ fn write_world_gates_fc5_fc16_before_send_and_checks_ack() {
             || !driver.diagnostics().snapshot().is_empty()
     );
 }
+
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn register_bits_round_trip_and_reject_writes_before_send() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let mut conn = driver.create_connection(&settings("30001", true)).unwrap();
+    for (address, canonical, bit, function) in [
+        ("40001.0", "400001.0", 0, 3),
+        ("30001.15", "300001.15", 15, 4),
+    ] {
+        let tag = spec(&driver, address, DataType::Bit);
+        assert_eq!(tag.address.canonical, canonical);
+        assert_eq!(tag.address.bit, Some(bit));
+        for (word, expected) in [(0_u16, false), (1_u16 << bit, true)] {
+            let planned = conn.plan_read(std::slice::from_ref(&tag)).unwrap();
+            assert_eq!(planned[0].step.send[7], function);
+            let [hi, lo] = word.to_be_bytes();
+            assert_eq!(
+                conn.decode_read(
+                    &planned[0],
+                    std::slice::from_ref(&tag),
+                    &read_response(&planned[0].step.send, &[2, hi, lo])
+                )
+                .unwrap(),
+                [Ok(RawValue::Bool(expected))]
+            );
+        }
+        let item = WriteItem::new(tag, Value::Bit(true));
+        assert!(matches!(conn.write_next(&[item], None).unwrap(),
+            WriteProgress::Done(results) if results.iter().all(Result::is_err)));
+    }
+}

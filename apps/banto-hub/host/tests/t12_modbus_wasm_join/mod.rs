@@ -1,5 +1,6 @@
 //! Loopback-only Hub join for the pinned Modbus write guest. No PLC is used.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -12,6 +13,7 @@ struct Fixture {
     port: u16,
     frames: Arc<Mutex<Vec<(u8, u16, u16)>>>,
     task: tokio::task::JoinHandle<()>,
+    register_bits: Arc<AtomicBool>,
 }
 
 impl Fixture {
@@ -20,10 +22,13 @@ impl Fixture {
         let port = listener.local_addr().unwrap().port();
         let frames = Arc::new(Mutex::new(Vec::new()));
         let recorded = frames.clone();
+        let register_bits = Arc::new(AtomicBool::new(false));
+        let bit_state = register_bits.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let frames = recorded.clone();
+                let bit_state = bit_state.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut mbap = [0u8; 6];
@@ -57,7 +62,14 @@ impl Fixture {
                                 let mut pdu = vec![function, (count * 2) as u8];
                                 for offset in start..start + count {
                                     pdu.extend_from_slice(
-                                        &(if function == 4 { 42 } else { offset }).to_be_bytes(),
+                                        &(if bit_state.load(Ordering::SeqCst) {
+                                            0x8001_u16
+                                        } else if function == 4 {
+                                            42
+                                        } else {
+                                            offset
+                                        })
+                                        .to_be_bytes(),
                                     );
                                 }
                                 pdu
@@ -81,7 +93,12 @@ impl Fixture {
                 });
             }
         });
-        Self { port, frames, task }
+        Self {
+            port,
+            frames,
+            task,
+            register_bits,
+        }
     }
 
     fn frames(&self) -> Vec<(u8, u16, u16)> {
@@ -304,4 +321,127 @@ async fn saved_settings_broker_and_rest_enforce_modbus_policy_and_audit() {
     assert!(keys.revoke(issued.id).await.unwrap().revoked_at.is_some());
     app.write_control.disable();
     drop(app);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn register_bits_reach_broker_and_read_now_as_booleans() {
+    let fixture = Fixture::start().await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-modbus-register-bits",
+        &manifest(),
+        &component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "bits-line".into(),
+            protocol: "modbus-fc3-wasm".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1", "port": fixture.port, "unit_id": 1,
+                "probe_address": "30001", "write_mode": "enabled",
+                "write_allowlist": "400001-400010",
+                "modbus_operational_write_mode": "enabled",
+                "modbus_operational_write_allowlist": "400001-400010"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("line", saved.id, 60_000))
+    .await
+    .unwrap();
+    for (name, address) in [("holding_bit", "40001.0"), ("input_bit", "30001.15")] {
+        app.manager
+            .tags()
+            .create(super::tag_input(name, group.id, address, "bit"))
+            .await
+            .unwrap();
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let driver = app.manager.registry().get("modbus-fc3-wasm").unwrap();
+    let native = app.manager.registry().get("modbus-tcp").unwrap();
+    let specs = [("40001.0", "400001.0", 0), ("30001.15", "300001.15", 15)].map(
+        |(address, canonical, bit)| {
+            let kind = TagKind::numeric(DataType::Bit);
+            let parsed = driver.base().parse_address(address, &kind).unwrap();
+            let native_parsed = native.base().parse_address(address, &kind).unwrap();
+            assert_eq!(parsed.canonical, canonical);
+            assert_eq!(parsed.canonical, native_parsed.canonical);
+            assert_eq!(parsed.bit, Some(bit));
+            assert_eq!(parsed.bit, native_parsed.bit);
+            TagSpec::new(parsed, kind)
+        },
+    );
+    let handle = app.manager.write_broker_handle_peek(saved.id).unwrap();
+    let names = ["holding_bit", "input_bit"];
+    let issued = ApiKeysService::new(app.pool.clone())
+        .issue(
+            "register-bit-reader",
+            names
+                .iter()
+                .map(|name| format!("read:bits-line.line.{name}"))
+                .collect(),
+            None,
+        )
+        .await
+        .unwrap();
+    let before_reads = fixture.frames().len();
+    for expected in [false, true] {
+        fixture.register_bits.store(expected, Ordering::SeqCst);
+        assert_eq!(
+            handle.read(specs.to_vec()).await.unwrap(),
+            vec![Ok(Value::Bit(expected)), Ok(Value::Bit(expected))]
+        );
+        for name in names {
+            let (status, body) = super::admin_get(
+                &app.router,
+                &format!("/api/v1/values/bits-line.line.{name}/read-now"),
+                &issued.key,
+            )
+            .await;
+            assert_eq!(status, super::StatusCode::OK, "{name}: {body:?}");
+            assert_eq!(body["v"], serde_json::json!(expected), "{name}: {body:?}");
+        }
+    }
+    let frames = fixture.frames();
+    for function in [3, 4] {
+        assert!(
+            frames[before_reads..].contains(&(function, 0, 1)),
+            "missing FC{function} register-bit read: {frames:?}"
+        );
+    }
+    let before = frames.len();
+    for spec in specs {
+        assert!(handle
+            .write(vec![WriteItem::new(spec, Value::Bit(true))])
+            .await
+            .unwrap()
+            .iter()
+            .all(Result::is_err));
+    }
+    assert_eq!(
+        fixture.frames().len(),
+        before,
+        "register bit writes must be rejected before send"
+    );
 }

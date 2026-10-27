@@ -371,3 +371,54 @@ async fn changing_modbus_to_slmp_with_tags_is_refused_and_changes_nothing() {
         .unwrap();
     assert_eq!(protocol, "modbus-tcp");
 }
+
+#[tokio::test]
+async fn native_slmp_v_is_refused_on_shared_registration_paths() {
+    let f = fixture().await;
+    for address in ["V0", "v12"] {
+        let errors = field_errors(
+            f.tags
+                .create(tag("v-rejected", f.slmp_group, address, "bit"))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(errors[0].0, "address");
+        assert!(errors[0].1.contains("定期収集"), "{errors:?}");
+    }
+    let valid = f
+        .tags
+        .create(tag("V_is_a_name", f.slmp_group, "M1", "bit"))
+        .await
+        .unwrap();
+    let errors = field_errors(
+        f.tags
+            .update(valid.id, tag("V_is_a_name", f.slmp_group, "V1", "bit"))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(errors[0].0, "address");
+    let before = count(&f.pool).await;
+    let result = f
+        .tags
+        .create_batch(
+            vec![
+                tag("batch-ok", f.slmp_group, "L1", "bit"),
+                tag("batch-v", f.slmp_group, "V1", "bit"),
+            ],
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(result, BatchTagOutcome::Invalid(_)));
+    assert_eq!(count(&f.pool).await, before);
+    for (name, address) in [("l", "L1"), ("f", "F1"), ("b", "B1")] {
+        f.tags
+            .create(tag(name, f.slmp_group, address, "bit"))
+            .await
+            .unwrap();
+    }
+    f.tags
+        .create(tag("V_modbus_name", f.modbus_group, "40001", "u16"))
+        .await
+        .unwrap();
+}
