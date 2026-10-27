@@ -64,6 +64,7 @@ use tokio::time::Instant;
 use crate::config::SidecarConfig;
 use crate::flush::{
     backoff_delay, build_pool, spawn_flusher, FlushOptions, FlusherHandle, FlusherStopOutcome,
+    DB_OPERATION_TIMEOUT,
 };
 use crate::group::{
     run_interval_producer, run_on_change_producer, GroupRegistry, GroupRuntime, GroupSetupError,
@@ -86,8 +87,8 @@ const HEALTH_TICK: Duration = Duration::from_secs(1);
 const DEFAULT_REPLAN_INTERVAL: Duration = Duration::from_secs(30);
 
 /// 停止時に flusher の join とプールの close を合わせた上限（これを超えたら
-/// abort し、閉じていないプールは待たずに捨てる。commit 前なので二重
-/// 書き込みにはならない。応答しない DB の `pool.close()` もこの中）。
+/// abort し、閉じていないプールは待たずに捨てる。COMMIT の応答が失われた
+/// 行は再送で重複し得る。応答しない DB の `pool.close()` もこの中）。
 const FLUSHER_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 停止時の drain 監視のポーリング間隔。
@@ -330,6 +331,7 @@ impl Engine {
             flush_interval: self.config.flush_interval,
             batch_size: self.config.batch_size,
             table_recheck: self.options.table_recheck,
+            operation_timeout: DB_OPERATION_TIMEOUT,
         }
     }
 
