@@ -794,6 +794,40 @@ jobs:
           if (-not (Select-String -Path $fc4WHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'FC4/W Hub tests did not both run'
           }
+          # Modbus FC1/2/3/4 and gated FC5/16 join uses the exact reviewed
+          # guest package manifest and the optional write world.
+          $modbusJoinSha = 'a7018684e4db8eadf2853a6d7169ea203662fe6a'
+          git -C $guest checkout --quiet --detach $modbusJoinSha
+          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $modbusJoinSha) {
+            throw 'Modbus join guest SHA mismatch'
+          }
+          $modbusReadWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/driver.wit"
+          if ($LASTEXITCODE -ne 0 -or $modbusReadWit -ne $hostWit) { throw 'Modbus join read WIT mismatch' }
+          $modbusWriteWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/write-v1.wit"
+          if ($LASTEXITCODE -ne 0 -or $modbusWriteWit -ne $hostWriteWit) { throw 'Modbus join write WIT mismatch' }
+          $env:BANTO_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'
+          cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus join guest build failed' }
+          $modbusJoinModule = Join-Path $guest 'component/target/wasm32-unknown-unknown/debug/banto_modbus_tcp_component.wasm'
+          $env:BANTO_MODBUS_COMPONENT_WASM = Join-Path $env:RUNNER_TEMP 'modbus-join-component.wasm'
+          wasm-tools component new $modbusJoinModule -o $env:BANTO_MODBUS_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus join component creation failed' }
+          wasm-tools validate $env:BANTO_MODBUS_COMPONENT_WASM
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus join component validation failed' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_MODBUS_COMPONENT_WASM --world driver-with-write-v1
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus join write world mismatch' }
+          $modbusJoinLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-join-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test modbus_join --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusJoinLog
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus join adapter tests failed' }
+          if (-not (Select-String -Path $modbusJoinLog -Pattern '^test result: ok\. 3 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'Modbus join adapter tests did not all run'
+          }
+          $modbusHubLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-hub-join-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test modbus_wasm_join_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusHubLog
+          if ($LASTEXITCODE -ne 0) { throw 'Modbus Hub join test failed' }
+          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'Modbus Hub join test did not run exactly once'
+          }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
         if: always()
