@@ -800,8 +800,9 @@ jobs:
           }
           # Modbus FC1/2/3/4 and gated FC5/16/22 join uses the exact reviewed
           # guest package manifest and the optional write world (guest main:
-          # Modbus code as of #44, WIT as of #47).
-          $modbusJoinSha = $canonicalSha
+          # Modbus code as of #58 (A1 coil/discrete probe, B1 register_bit_write);
+          # its WIT is still the #47 one, so Enter-GuestPin keeps the WIT checkout).
+          $modbusJoinSha = 'f06a90ffadb21fbd3a7157bf27bb20560c81182e'
           Enter-GuestPin $modbusJoinSha 'Modbus join guest'
           $modbusWriteWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $modbusWriteWit -ne $hostWriteWit) { throw 'Modbus join write WIT mismatch' }
@@ -825,7 +826,7 @@ jobs:
           $modbusHubLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-hub-join-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test modbus_wasm_join_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusHubLog
           if ($LASTEXITCODE -ne 0) { throw 'Modbus Hub join tests failed' }
-          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus Hub join tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
