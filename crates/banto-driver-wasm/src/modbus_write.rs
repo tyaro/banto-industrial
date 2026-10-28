@@ -201,6 +201,8 @@ pub(super) fn validate_guest_schema(
 
 const REASON_TYPE: &str = "tag type cannot be written to this area";
 const REASON_RUN: &str = "request is not one contiguous run of writable addresses";
+const REASON_VALUE: &str = "value does not fit the tag type";
+const REASON_BIT: &str = "register bit address does not match this connection";
 
 pub(super) fn preflight(
     items: &[WriteItem],
@@ -295,7 +297,7 @@ pub(super) fn preflight(
             {
                 write_types::Value::Float(*value)
             }
-            _ => return Err(refused("value is out of range for the tag type")),
+            _ => return Err(refused(REASON_VALUE)),
         };
         checked.push(write::WriteItem {
             spec: write_types::TagSpec {
@@ -312,6 +314,7 @@ pub(super) fn preflight(
         next = next.checked_add(width).ok_or_else(|| refused(REASON_RUN))?;
     }
     let span = next - start;
+    // Unreachable (items are non-empty and every width is at least 1); kept as a guard.
     if span == 0 {
         return Err(refused(REASON_RUN));
     }
@@ -332,20 +335,20 @@ fn register_bit(
     policy: &Policy,
 ) -> Result<Vec<write::WriteItem>, &'static str> {
     let address = &item.spec.address;
-    let bit = address.bit.filter(|bit| *bit <= 15).ok_or(REASON_RUN)?;
-    let (word, bit_text) = address.canonical.split_once('.').ok_or(REASON_RUN)?;
+    let bit = address.bit.filter(|bit| *bit <= 15).ok_or(REASON_BIT)?;
+    let (word, bit_text) = address.canonical.split_once('.').ok_or(REASON_BIT)?;
     let parsed = parse_reference(word);
     if parsed.map_or(address.area != Area::Holding.name(), |(area, _)| {
         area != Area::Holding
     }) {
         return Err("only holding register bits can be written");
     }
-    let (area, index) = parsed.map_err(|_| REASON_RUN)?;
+    let (area, index) = parsed.map_err(|_| REASON_BIT)?;
     if item.spec.kind != TagKind::numeric(DataType::Bit) {
         return Err(REASON_TYPE);
     }
     let api::Value::Bit(value) = item.value else {
-        return Err("value is out of range for the tag type");
+        return Err(REASON_VALUE);
     };
     if bit_text != bit.to_string()
         || address.driver != *driver_id
@@ -354,7 +357,7 @@ fn register_bit(
         || address.index != Some(u64::from(index))
         || address.word_count != 1
     {
-        return Err(REASON_RUN);
+        return Err(REASON_BIT);
     }
     policy.check(area, index, index)?;
     Ok(vec![write::WriteItem {
@@ -483,12 +486,12 @@ mod tests {
             (
                 vec![h("400001", 0, DataType::U16, api::Value::F64(70000.0))],
                 on.clone(),
-                "value is out of range for the tag type",
+                "value does not fit the tag type",
             ),
             (
                 vec![h("400001", 0, DataType::F32, api::Value::F64(f64::NAN))],
                 on.clone(),
-                "value is out of range for the tag type",
+                "value does not fit the tag type",
             ),
             (
                 vec![
@@ -508,6 +511,87 @@ mod tests {
                 )],
                 on.clone(),
                 "tag type cannot be written to this area",
+            ),
+            (
+                vec![bit_item(
+                    "400001.0",
+                    "holding_register",
+                    0,
+                    0,
+                    api::Value::Bit(true),
+                )],
+                policy("disabled", ""),
+                "Modbus writes are disabled",
+            ),
+            (
+                vec![bit_item(
+                    "400300.0",
+                    "holding_register",
+                    299,
+                    0,
+                    api::Value::Bit(true),
+                )],
+                on.clone(),
+                "outside the Modbus write allowlist",
+            ),
+            (
+                vec![bit_item(
+                    "400001.0",
+                    "holding_register",
+                    0,
+                    0,
+                    api::Value::F64(1.0),
+                )],
+                on.clone(),
+                "value does not fit the tag type",
+            ),
+            (
+                vec![{
+                    let mut x =
+                        bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true));
+                    x.spec.kind = TagKind::numeric(DataType::U16);
+                    x
+                }],
+                on.clone(),
+                "tag type cannot be written to this area",
+            ),
+            (
+                vec![bit_item(
+                    "400001.16",
+                    "holding_register",
+                    0,
+                    16,
+                    api::Value::Bit(true),
+                )],
+                on.clone(),
+                "register bit address does not match this connection",
+            ),
+            (
+                vec![{
+                    let mut x =
+                        bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true));
+                    x.spec.address.writable_area = false;
+                    x
+                }],
+                on.clone(),
+                "register bit address does not match this connection",
+            ),
+            (
+                vec![{
+                    let mut x = h("400001", 0, DataType::U16, api::Value::F64(1.0));
+                    x.spec.kind = TagKind::string(2, banto_driver_api::StringEncoding::Utf8);
+                    x
+                }],
+                on.clone(),
+                "tag type cannot be written to this area",
+            ),
+            (
+                vec![
+                    h("400001", 0, DataType::U16, api::Value::F64(1.0)),
+                    bit_item("400002.0", "holding_register", 1, 0, api::Value::Bit(true)),
+                ],
+                on.clone(),
+                "a register bit must be written alone",
             ),
             (
                 vec![
