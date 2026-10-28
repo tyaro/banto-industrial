@@ -55,6 +55,7 @@
 	import { page } from '$app/state';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
+	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 	import {
 		listApiKeys,
 		createApiKey,
@@ -435,7 +436,7 @@
 							<td>{key.name}</td>
 							<td><code>{key.prefix}</code></td>
 							<td>{describeScopes(key.scopes)}</td>
-							<td>{key.createdAt}</td>
+							<td>{formatSqliteUtc(key.createdAt)}</td>
 							<td>
 								{formatLastUsed(key.lastUsedAt)}
 								{#if apiKeyWarnings(key, nowMs).longUnused}
@@ -450,12 +451,16 @@
 									<span class="badge badge-expiring-soon">期限接近</span>
 								{/if}
 							</td>
-							<td>{key.revokedAt === null ? '有効' : `失効済み（${key.revokedAt}）`}</td>
+							<td
+								>{key.revokedAt === null
+									? '有効'
+									: `失効済み（${formatSqliteUtc(key.revokedAt)}）`}</td
+							>
 							<td>
 								{#if key.trippedAt === null}
 									-
 								{:else}
-									<span class="trip-badge">トリップ中（{key.trippedAt}）</span>
+									<span class="trip-badge">トリップ中（{formatSqliteUtc(key.trippedAt)}）</span>
 								{/if}
 							</td>
 							<td class="actions">

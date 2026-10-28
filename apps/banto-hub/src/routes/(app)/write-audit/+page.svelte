@@ -11,6 +11,7 @@
 	import { onMount } from 'svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
+	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 	import { listWriteAudit, type WriteAuditEntry } from '#lib/banto/writeAuditAdmin.js';
 
 	function errorMessage(err: unknown): string {
@@ -152,7 +153,7 @@
 				<tbody>
 					{#each rows as row (row.id)}
 						<tr class:alert-row={isAlertResult(row.result)} onclick={() => selectRow(row)}>
-							<td>{row.ts}</td>
+							<td>{formatSqliteUtc(row.ts)}</td>
 							<td>{row.apiKeyNameSnapshot}</td>
 							<td class="tag-name">{row.externalNameSnapshot}</td>
 							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
@@ -175,7 +176,7 @@
 			<h3>詳細（ID: {selected.id}）</h3>
 			<dl>
 				<dt>時刻</dt>
-				<dd>{selected.ts}</dd>
+				<dd>{formatSqliteUtc(selected.ts)}</dd>
 				<dt>APIキー</dt>
 				<dd>{selected.apiKeyNameSnapshot}（ID: {selected.apiKeyId}）</dd>
 				<dt>タグ</dt>
