@@ -12,6 +12,13 @@
 #   跳ね上がらないようにする(値を使い切ったら随時引き上げを検討する)。
 # - コミットメッセージは本リポジトリの Conventional Commits 風の
 #   慣習(scope を括弧で示す)に軽く合わせて prefix を指定する。
+# - groups（2026-10-28 オーナー決定）: 1 本ずつだと rebase と CI の待ちが
+#   本数分かかるので、製品の出力に効かないもの（ビルド時だけの crate、
+#   lint・型検査・試験の道具、CI の action）は 1 本の PR にまとめる。
+#   実行時・ビルドの出力に効くもの（tokio・TLS・svelte・kit・vite・tauri など）は
+#   入れず、今までどおり 1 本ずつ出させる。S7 のような実機試験の前に
+#   「道具だけ先に上げ、実行時に効くものは後へ回す」と分けられるようにするため。
+#   グループは version updates だけに効き、security updates は 1 本ずつのまま。
 #
 # 備考: banto-core/banto-storage/banto-server は crates.io ではなく
 # `https://github.com/tyaro/banto.git` への git 依存(tag 固定、
@@ -38,6 +45,17 @@ updates:
       - dependency-name: 'banto-core'
       - dependency-name: 'banto-storage'
       - dependency-name: 'banto-server'
+    # ビルド時だけに使う crate（リソースの埋め込み・Tauri のビルド・protoc の同梱）。
+    # prost-build は prost と版をそろえるので入れない。
+    groups:
+      cargo-build-tools:
+        patterns:
+          - 'embed-resource'
+          - 'tauri-build'
+          - 'protoc-bin-vendored*'
+        update-types:
+          - 'minor'
+          - 'patch'
 
   - package-ecosystem: 'npm'
     directory: '/'
@@ -46,6 +64,26 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: 'chore(deps)'
+    # lint・整形・型検査・試験の道具（ビルドの出力に入らない）。typescript は
+    # Svelte の前処理に関わるので入れない。
+    groups:
+      npm-tooling:
+        patterns:
+          - 'eslint'
+          - 'eslint-*'
+          - '@eslint/*'
+          - 'typescript-eslint'
+          - '@typescript-eslint/*'
+          - 'globals'
+          - 'prettier'
+          - 'prettier-*'
+          - 'svelte-check'
+          - 'vitest'
+          - '@vitest/*'
+          - '@playwright/test'
+        update-types:
+          - 'minor'
+          - 'patch'
 
   - package-ecosystem: 'github-actions'
     directory: '/'
@@ -61,3 +99,8 @@ updates:
     # rust-toolchain.toml と同じ PR で手で上げるので、明示的に除外する。
     ignore:
       - dependency-name: 'dtolnay/rust-toolchain'
+    # CI の action は製品に入らないので、major も含めて 1 本にまとめる。
+    groups:
+      github-actions:
+        patterns:
+          - '*'
