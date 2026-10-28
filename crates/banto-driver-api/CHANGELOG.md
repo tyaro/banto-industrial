@@ -20,6 +20,7 @@ R2b-6a（docs/banto-hub-driver-ui-design.md §3。2026-10-24）。UI をドラ�
 ### 壊れること
 
 - なし（0.x の minor は設計 §3.6 の方針で上げる）。`DriverAddress` を `Hash` / `Eq` で比べるコードは、`index` も比べられることに注意。
+- `ItemError::Rejected` の意味を送る前の拒否だけに狭めた（#902）。送ったあとの確認読みの不一致を `Rejected` で返していたドライバは `VerificationFailed` に変える（conformance の C14 で落ちる）。
 
 ## 0.2.0 — 未公開
 
