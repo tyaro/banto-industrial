@@ -1017,8 +1017,16 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
 	const step = workflow.slice(start, end);
 	assert.match(step, /5233d55a4d1c278c473e9c44df608c1423c1a629/);
+	// #902: 固定の driver.wit は guest main と同じか、古い WIT のときだけ差し替える。
+	assert.match(step, /\$canonicalSha = '3b7f0f6120af689fdd7a807cff7837657242c6b2'/);
+	assert.match(step, /\$legacyDriverWit = '313a79ed545a366c938c9bc2d8f86f7c3ca0141e'/);
+	assert.match(step, /function Enter-GuestPin/);
+	assert.match(step, /Enter-GuestPin \$sha 'canonical guest'/);
+	for (const label of ['read WIT mismatch', 'WIT swap failed', 'swapped WIT mismatch']) {
+		assert.ok(step.includes(label), `pin guard missing: ${label}`);
+	}
 	for (const revision of [
-		'${sha}:wit/driver.wit',
+		'${canonicalSha}:wit/driver.wit',
 		'HEAD:crates/banto-driver-wasm/wit/driver.wit',
 		'${sha}:component/manifest.json',
 		'HEAD:crates/banto-driver-wasm/tests/manifest.json'
