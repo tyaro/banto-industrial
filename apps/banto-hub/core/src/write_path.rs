@@ -149,6 +149,31 @@
 //! そのテキストを `WriteAuditRow::with_value_requested_text` 経由で
 //! `insert_pending`/`insert_row` 時点に書き込むことで解消した(`set_result`
 //! は `value_requested_text` に触れないので、後段の更新で消えない)。
+//!
+//! ## 監査の `result` の分類(#898、2026-10-28 オーナー決定)
+//!
+//! gate 8 の結果は、監査行を `failed`(確かに効いていない)と `uncertain`
+//! (送ったあとで結果が分からない)に分けて確定する(値の意味は
+//! `crate::write_audit` のモジュール doc)。判定は [`broker_error_audit_result`]
+//! と [`item_error_audit_result`] の 2 か所だけに置く:
+//!
+//! | 結果の出所 | `result` | 理由 |
+//! | --- | --- | --- |
+//! | 送る前の拒否(範囲外・アドレス不正・`build_*` の Err) | `failed` | broker に渡していない |
+//! | broker セッションが無い(T15-4 の peek が `None`) | `failed` | 何も送っていない |
+//! | `BrokerError::Disconnected` | `failed` | 未接続で即時に断られた(fail-fast) |
+//! | `BrokerError::UnsupportedProtocol`/`InvalidSettings` | `failed` | セッションを作る前に断られた |
+//! | `BrokerError::ConnectionFailed` | `uncertain` | 生きたセッションで送っている最中の致命的な失敗(送信後のタイムアウト・切断・応答の不一致) |
+//! | `BrokerError::TaskGone` | `uncertain` | 「投入できなかった」と「投入後に応答前にタスクが死んだ」が同じ値で区別できないので、安全側に倒す |
+//! | `Ok(results)` で項目の結果が欠けた | `uncertain` | broker に渡したあとで結果が無い |
+//! | `ItemError::Device` | `failed` | PLC が完全な応答でエラーを返した |
+//! | `ItemError::Unsupported` | `failed` | 送る前の組み合わせの拒否 |
+//! | `ItemError::Rejected` | `failed` | ドライバの事前の拒否(同じビットに true と false など)。RMW の確認読みの不一致もこの値で来て区別できない(既知の限界、#898 の報告) |
+//! | 将来の `ItemError` の値 | `uncertain` | 意味が分からない値は「効いていない」と言い切らない |
+//!
+//! HTTP/gRPC の応答([`WriteRejection`])は変えていない: どちらも
+//! `WriteFailed`(REST: 502 `write_failed`)のまま。区別は監査行にだけ残す。
+//! `uncertain` でも自動では再送しない。
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -956,7 +981,10 @@ pub async fn execute_write(
     // T20 ①a(案A): string は常に PLC タグ([`ConvertedValue`]のdoc comment
     // 参照)なので internal 分岐には絶対に来ない - 到達したら防御的に
     // `Internal` を返す(banto-tags の登録時検証が緩んだ場合の保険)。
-    let outcome = match &converted {
+    //
+    // #898: internal タグと防御的な拒否は broker を通らないので `failed`
+    // (`From<WriteRejection>`)。PLC タグだけが `uncertain` になりうる。
+    let outcome: Result<(), PlcWriteFailure> = match &converted {
         ConvertedValue::Numeric(data_type, value) => {
             if let Some(conn) = &resolved.conn {
                 write_plc_tag(deps, conn, &resolved.entry, *data_type, &tag_row, *value).await
@@ -970,20 +998,23 @@ pub async fn execute_write(
                     *value,
                 )
                 .await
+                .map_err(PlcWriteFailure::from)
             }
         }
         ConvertedValue::Str(text) => match &resolved.conn {
             Some(conn) => write_plc_string_tag(deps, conn, &resolved.entry, &tag_row, text).await,
             None => Err(WriteRejection::Internal(
                 "internal タグへの文字列書き込みが解決されました(想定外)".to_string(),
-            )),
+            )
+            .into()),
         },
     };
 
     let final_result = match &outcome {
         Ok(()) => WriteAuditResult::Ok,
-        Err(_) => WriteAuditResult::Failed,
+        Err(failure) => failure.audit,
     };
+    let outcome = outcome.map_err(|failure| failure.rejection);
     // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): carry the
     // rejection's detail (e.g. `PlcWriteError::BitWriteVerificationFailed`'s
     // 「書き戻し競合の可能性があります」for a T8 RMW confirmation-read
@@ -1456,11 +1487,9 @@ pub async fn execute_write_batch(
         // T15-4: 単票と同じ non-spawning peek のみを使う(このモジュール
         // doc comment「gate 8 は broker セッションを新規に張らない」節参照)。
         let Some(handle) = deps.manager.write_broker_handle_peek(connection_id) else {
+            // 何も送っていないので監査は `failed`(#898)。
             for (i, audit_id) in sent_indices {
-                let rejection = WriteRejection::WriteFailed(
-                    "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
-                        .to_string(),
-                );
+                let rejection = no_session_rejection();
                 let detail = write_target_detail(prepared[i].target, rejection.detail().as_deref());
                 if let Err(err) = deps
                     .write_audit
@@ -1482,17 +1511,13 @@ pub async fn execute_write_batch(
         match handle.write(requests).await {
             Ok(results) => {
                 for (k, (i, audit_id)) in sent_indices.into_iter().enumerate() {
-                    let outcome = match results.get(k) {
-                        Some(Ok(())) => Ok(()),
-                        Some(Err(item_err)) => Err(item_rejection(item_err)),
-                        None => Err(WriteRejection::WriteFailed(
-                            "broker から応答がありませんでした".to_string(),
-                        )),
-                    };
+                    // 単票と同じ分類(#898、`item_outcome`)。
+                    let outcome = item_outcome(results.get(k));
                     let final_result = match &outcome {
                         Ok(()) => WriteAuditResult::Ok,
-                        Err(_) => WriteAuditResult::Failed,
+                        Err(failure) => failure.audit,
                     };
+                    let outcome = outcome.map_err(|failure| failure.rejection);
                     let failure_detail = outcome.as_ref().err().and_then(WriteRejection::detail);
                     let detail = write_target_detail(prepared[i].target, failure_detail.as_deref());
                     if let Err(err) = deps
@@ -1510,14 +1535,15 @@ pub async fn execute_write_batch(
             }
             Err(err) => {
                 // グループ全体が broker 呼び出し自体で失敗(単票の
-                // `handle.write` の `Err(err)` 分岐と同じ扱い)。
+                // `handle.write` の `Err(err)` 分岐と同じ扱い。監査の結果も
+                // 同じ分類 - #898、`broker_failure`)。
                 for (i, audit_id) in sent_indices {
-                    let rejection = WriteRejection::WriteFailed(err.to_string());
+                    let PlcWriteFailure { rejection, audit } = broker_failure(&err);
                     let detail =
                         write_target_detail(prepared[i].target, rejection.detail().as_deref());
                     if let Err(set_err) = deps
                         .write_audit
-                        .set_result(audit_id, WriteAuditResult::Failed, detail.as_deref())
+                        .set_result(audit_id, audit, detail.as_deref())
                         .await
                     {
                         eprintln!(
@@ -1551,6 +1577,10 @@ pub async fn execute_write_batch(
 /// (`CollectorManager::write_broker_handle_peek`)のみを使う - セッションが
 /// 既に無ければ(≒ 収集停止と競合してセッションが落ちていた)、新規に
 /// ダイヤルせずそのまま [`WriteRejection::WriteFailed`] を返す。
+///
+/// #898: Err は監査行に残す結果(`failed`/`uncertain`)を伴う
+/// ([`PlcWriteFailure`]、このモジュールの doc comment「監査の `result` の
+/// 分類」)。
 async fn write_plc_tag(
     deps: &WriteDeps<'_>,
     conn: &banto_tags::PlcConnection,
@@ -1558,7 +1588,7 @@ async fn write_plc_tag(
     data_type: DataType,
     tag_row: &banto_tags::Tag,
     requested: f64,
-) -> Result<(), WriteRejection> {
+) -> Result<(), PlcWriteFailure> {
     let request = build_plc_write_item(
         deps.manager.registry(),
         conn,
@@ -1571,21 +1601,13 @@ async fn write_plc_tag(
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
         // 新規に実機へダイヤルしてはならないので fail closed する。
-        return Err(WriteRejection::WriteFailed(
-            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
-                .to_string(),
-        ));
+        // 何も送っていないので監査は `failed`(#898)。
+        return Err(no_session_rejection().into());
     };
 
     match handle.write(vec![request]).await {
-        Ok(results) => match results.into_iter().next() {
-            Some(Ok(())) => Ok(()),
-            Some(Err(item_err)) => Err(item_rejection(&item_err)),
-            None => Err(WriteRejection::WriteFailed(
-                "broker から応答がありませんでした".to_string(),
-            )),
-        },
-        Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
+        Ok(results) => item_outcome(results.first()),
+        Err(err) => Err(broker_failure(&err)),
     }
 }
 
@@ -1674,6 +1696,97 @@ fn item_rejection(err: &ItemError) -> WriteRejection {
     WriteRejection::WriteFailed(err.to_string())
 }
 
+/// gate 8 の PLC 分岐の失敗(#898): 呼び出し元へ返す拒否と、監査行に残す
+/// 結果の組。拒否(= REST/gRPC の応答)は従来と同じで、`audit` だけが
+/// `failed`/`uncertain` を分ける(このモジュールの doc comment「監査の
+/// `result` の分類」)。
+#[derive(Debug, Clone, PartialEq)]
+struct PlcWriteFailure {
+    rejection: WriteRejection,
+    audit: WriteAuditResult,
+}
+
+impl From<WriteRejection> for PlcWriteFailure {
+    /// broker に渡す前の拒否(`build_*` の Err・セッション無し)は、何も
+    /// 送っていないので `failed`。
+    fn from(rejection: WriteRejection) -> Self {
+        Self {
+            rejection,
+            audit: WriteAuditResult::Failed,
+        }
+    }
+}
+
+/// T15-4 の「セッションが無い」拒否(単票の数値・文字列とバッチで同じ文言)。
+fn no_session_rejection() -> WriteRejection {
+    WriteRejection::WriteFailed(
+        "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
+            .to_string(),
+    )
+}
+
+/// `BrokerHandle::write` 自体の Err を監査の結果に分類する(#898。表は
+/// このモジュールの doc comment「監査の `result` の分類」)。
+fn broker_error_audit_result(err: &banto_broker::BrokerError) -> WriteAuditResult {
+    use banto_broker::BrokerError;
+    match err {
+        // 未接続で即時に断られた・セッションを作る前に断られた: 何も送っていない。
+        BrokerError::Disconnected { .. }
+        | BrokerError::UnsupportedProtocol { .. }
+        | BrokerError::InvalidSettings { .. } => WriteAuditResult::Failed,
+        // 生きたセッションで送っている最中の致命的な失敗(送信後のタイム
+        // アウト・切断・応答の不一致)。PLC 側では効いている可能性がある。
+        BrokerError::ConnectionFailed { .. } => WriteAuditResult::Uncertain,
+        // `BrokerHandle::write` は「ジョブを投入できなかった」と「投入した
+        // あと、応答する前に broker のタスクが終わった」の両方をこの値に
+        // する。後者は送信済みの可能性があり、ここでは区別できないので
+        // 安全側(「効いていない」と言い切らない)に倒す。
+        BrokerError::TaskGone { .. } => WriteAuditResult::Uncertain,
+    }
+}
+
+/// ドライバの項目ごとの Err を監査の結果に分類する(#898)。
+fn item_error_audit_result(err: &ItemError) -> WriteAuditResult {
+    match err {
+        // PLC が完全な応答でエラーを返した・送る前の組み合わせの拒否・
+        // ドライバの事前の拒否。`Rejected` には RMW の確認読みの不一致
+        // (送ったあと)も来るが、値の上で区別できないので `failed` のまま
+        // (このモジュールの doc comment の表、既知の限界)。
+        ItemError::Device(_) | ItemError::Unsupported(_) | ItemError::Rejected(_) => {
+            WriteAuditResult::Failed
+        }
+        // `ItemError` は `#[non_exhaustive]`。意味の分からない値で
+        // 「効いていない」と言い切らない。
+        _ => WriteAuditResult::Uncertain,
+    }
+}
+
+/// `BrokerHandle::write` の Err を、拒否と監査の結果にする(単票・バッチが
+/// 共有する)。拒否の文言は従来どおり broker のエラーの文。
+fn broker_failure(err: &banto_broker::BrokerError) -> PlcWriteFailure {
+    PlcWriteFailure {
+        rejection: WriteRejection::WriteFailed(err.to_string()),
+        audit: broker_error_audit_result(err),
+    }
+}
+
+/// `BrokerHandle::write` が `Ok(results)` を返したときの 1 件ぶんの結果を、
+/// 拒否と監査の結果にする(単票・バッチが共有する)。結果が欠けた
+/// (`None`)ときは、broker に渡したあとで結果が無いので `uncertain`。
+fn item_outcome(result: Option<&Result<(), ItemError>>) -> Result<(), PlcWriteFailure> {
+    match result {
+        Some(Ok(())) => Ok(()),
+        Some(Err(item_err)) => Err(PlcWriteFailure {
+            rejection: item_rejection(item_err),
+            audit: item_error_audit_result(item_err),
+        }),
+        None => Err(PlcWriteFailure {
+            rejection: WriteRejection::WriteFailed("broker から応答がありませんでした".to_string()),
+            audit: WriteAuditResult::Uncertain,
+        }),
+    }
+}
+
 /// gate 8 の文字列タグ分岐(T20 ①a、docs/banto-hub-t20-design.md §3.1、
 /// 案A「書き込みは write_path 経由（記録計の read/cache には触れない）」)。
 /// 数値タグの [`write_plc_tag`] と並ぶ、string タグ専用の書き込み - broker
@@ -1687,28 +1800,19 @@ async fn write_plc_string_tag(
     entry: &crate::hub::TagEntry,
     tag_row: &banto_tags::Tag,
     value: &str,
-) -> Result<(), WriteRejection> {
+) -> Result<(), PlcWriteFailure> {
     let request =
         build_plc_string_write_item(deps.manager.registry(), conn, entry, tag_row, value)?;
 
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: 単票の write_plc_tag と同じ fail-closed(このモジュールの
         // doc comment「gate 8 は broker セッションを新規に張らない」参照)。
-        return Err(WriteRejection::WriteFailed(
-            "PLC への接続セッションがありません(書き込みは新しいセッションを開始しません。収集が稼働中か確認してください)"
-                .to_string(),
-        ));
+        return Err(no_session_rejection().into());
     };
 
     match handle.write(vec![request]).await {
-        Ok(results) => match results.into_iter().next() {
-            Some(Ok(())) => Ok(()),
-            Some(Err(item_err)) => Err(item_rejection(&item_err)),
-            None => Err(WriteRejection::WriteFailed(
-                "broker から応答がありませんでした".to_string(),
-            )),
-        },
-        Err(err) => Err(WriteRejection::WriteFailed(err.to_string())),
+        Ok(results) => item_outcome(results.first()),
+        Err(err) => Err(broker_failure(&err)),
     }
 }
 
@@ -1926,5 +2030,96 @@ mod tests {
         let numeric = ConvertedValue::Numeric(DataType::F32, 1.5);
         assert_eq!(numeric.as_audit_value(), Some(1.5));
         assert_eq!(numeric.as_audit_text(), None);
+    }
+
+    /// #898: broker 自体の Err の分類。送ったあとで分からなくなったもの
+    /// (`ConnectionFailed`)と区別できないもの(`TaskGone`)は `uncertain`、
+    /// 何も送っていないものは `failed`。拒否(応答)は従来どおり
+    /// `WriteFailed` + broker の文。
+    #[test]
+    fn broker_errors_split_into_failed_and_uncertain() {
+        use banto_broker::BrokerError;
+        for (err, audit) in [
+            (
+                BrokerError::Disconnected { connection_id: 1 },
+                WriteAuditResult::Failed,
+            ),
+            (
+                BrokerError::UnsupportedProtocol {
+                    connection_id: 1,
+                    protocol: "x".into(),
+                },
+                WriteAuditResult::Failed,
+            ),
+            (
+                BrokerError::InvalidSettings {
+                    connection_id: 1,
+                    reason: "port".into(),
+                },
+                WriteAuditResult::Failed,
+            ),
+            (
+                BrokerError::ConnectionFailed {
+                    connection_id: 1,
+                    reason: "応答タイムアウト".into(),
+                },
+                WriteAuditResult::Uncertain,
+            ),
+            (
+                BrokerError::TaskGone { connection_id: 1 },
+                WriteAuditResult::Uncertain,
+            ),
+        ] {
+            assert_eq!(
+                broker_failure(&err),
+                PlcWriteFailure {
+                    rejection: WriteRejection::WriteFailed(err.to_string()),
+                    audit,
+                },
+                "{err:?}"
+            );
+        }
+    }
+
+    /// #898: `Ok(results)` の 1 件ぶん。PLC のエラー(`Device`)・送る前の
+    /// 拒否は `failed`、結果が欠けたら `uncertain`、成功は `Ok`。
+    #[test]
+    fn item_results_split_into_failed_and_uncertain() {
+        assert_eq!(item_outcome(Some(&Ok(()))), Ok(()));
+        for item_err in [
+            ItemError::Device(banto_driver_api::DeviceError::new(
+                0xC059,
+                "コマンドが違います",
+            )),
+            ItemError::Unsupported("coil に f32".into()),
+            ItemError::Rejected("同じビットに true と false".into()),
+        ] {
+            assert_eq!(
+                item_outcome(Some(&Err(item_err.clone()))),
+                Err(PlcWriteFailure {
+                    rejection: WriteRejection::WriteFailed(item_err.to_string()),
+                    audit: WriteAuditResult::Failed,
+                }),
+                "{item_err:?}"
+            );
+        }
+        assert_eq!(
+            item_outcome(None),
+            Err(PlcWriteFailure {
+                rejection: WriteRejection::WriteFailed(
+                    "broker から応答がありませんでした".to_string()
+                ),
+                audit: WriteAuditResult::Uncertain,
+            })
+        );
+    }
+
+    /// #898: broker に渡す前の拒否(`build_*` の Err・セッション無し)は
+    /// `failed`。
+    #[test]
+    fn a_refusal_before_the_broker_is_failed() {
+        let failure = PlcWriteFailure::from(no_session_rejection());
+        assert_eq!(failure.audit, WriteAuditResult::Failed);
+        assert_eq!(failure.rejection, no_session_rejection());
     }
 }

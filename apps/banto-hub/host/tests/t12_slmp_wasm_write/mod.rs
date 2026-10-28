@@ -1334,14 +1334,15 @@ async fn hub_api_timeout_then_explicit_recovery_and_revoked_key_rejection() {
         .filter(|row| row["tagId"].as_i64() == Some(tag_id))
         .collect();
     assert_eq!(matching_rows.len(), 2, "{audit:?}");
-    let failed_row = matching_rows
+    let uncertain_row = matching_rows
         .iter()
-        .find(|row| row["result"] == "failed")
+        // #898: a response timeout after the request was sent is `uncertain`.
+        .find(|row| row["result"] == "uncertain")
         .unwrap();
-    let failed_detail: serde_json::Value =
-        serde_json::from_str(failed_row["detail"].as_str().unwrap()).unwrap();
-    assert_eq!(failed_detail["target"], "plc");
-    assert_eq!(failed_detail["detail"], timeout_reason);
+    let uncertain_detail: serde_json::Value =
+        serde_json::from_str(uncertain_row["detail"].as_str().unwrap()).unwrap();
+    assert_eq!(uncertain_detail["target"], "plc");
+    assert_eq!(uncertain_detail["detail"], timeout_reason);
     assert_eq!(
         matching_rows
             .iter()

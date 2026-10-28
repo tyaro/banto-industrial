@@ -51,13 +51,13 @@ async fn c16_hub_gates_and_audit_precede_exclusive_frame_rmw_and_confirmation() 
         .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn c16_hub_verify_timeout_is_failed_and_unknown_write_is_not_replayed() {
+async fn c16_hub_verify_timeout_is_uncertain_and_unknown_write_is_not_replayed() {
     tokio::time::timeout(Duration::from_secs(30), run(Mode::Timeout))
         .await
         .unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn c16_hub_verify_fatal_is_failed_and_unknown_write_is_not_replayed() {
+async fn c16_hub_verify_fatal_is_uncertain_and_unknown_write_is_not_replayed() {
     tokio::time::timeout(Duration::from_secs(30), run(Mode::Fatal))
         .await
         .unwrap();
@@ -338,7 +338,9 @@ async fn run(mode: Mode) {
                 "{error:?}"
             );
         }
-        assert_eq!(result, "failed");
+        // #898: the write was handed to the device and the outcome became
+        // unknown (timeout/fatal after send) - `uncertain`, not `failed`.
+        assert_eq!(result, "uncertain");
         tokio::time::timeout(
             Duration::from_secs(3),
             handle

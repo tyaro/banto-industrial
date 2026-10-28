@@ -10,10 +10,28 @@
 //! `action = 'write'`・`result = 'failed'`(まだ確定していない、が
 //! 「試みられた」ことは残る安全側の暫定状態)の行を **`broker.write`
 //! を呼ぶ前に** 挿入し、[`set_result`] がその行を `broker.write` の
-//! 結果に応じて `ok`/`failed` に更新する。途中でプロセスが死んでも
-//! (電源断・パニック等)「試みられたが成功が未確認」という記録が
+//! 結果に応じて `ok`/`failed`/`uncertain` に更新する。途中でプロセスが
+//! 死んでも(電源断・パニック等)「試みられたが成功が未確認」という記録が
 //! 残る - これが安全側の解釈(relay-wright の同モジュール doc comment
-//! と同じ理由付け: 「試みたのに記録がない」よりずっと安全)。
+//! と同じ理由付け: 「試みたのに記録がない」よりずっと安全)。暫定行の
+//! 値は `failed` のまま(#898 でも変えていない)。
+//!
+//! ## `failed` と `uncertain` の区別 (#898、2026-10-28 オーナー決定)
+//!
+//! 確定した失敗の行は 2 つに分ける:
+//!
+//! - `failed`: **確かに効いていない**。送る前に断った(範囲外・アドレス
+//!   不正・ドライバの事前の拒否)、PLC が完全な応答でエラーを返した
+//!   (SLMP の終了コード・Modbus の例外)、セッションが無く何も送って
+//!   いない(`BrokerError::Disconnected` など)。
+//! - `uncertain`: **送ったあとで結果が分からなくなった**。送信後の
+//!   タイムアウト・切断・応答の不一致(`BrokerError::ConnectionFailed`。
+//!   FC22 の ACK のマスクの不一致もここに来る)、broker からの応答が
+//!   欠けた。PLC 側では効いている可能性がある。
+//!
+//! どちらに入れるかは `crate::write_path` が broker の結果から決める
+//! (分類の表は同モジュールの doc comment「監査の `result` の分類」)。
+//! `uncertain` でも自動では再送しない(broker の約束のまま)。
 //!
 //! 一方、**物理書き込みを一切試みない抑制**(受付 off による
 //! `suppressed_disabled`、レート制限超過による `rate_limit_tripped`/
@@ -59,8 +77,14 @@ impl WriteAuditAction {
 pub enum WriteAuditResult {
     /// 物理書き込みが成功した。
     Ok,
-    /// 物理書き込みを試みたが broker がエラーを返した。
+    /// 物理書き込みが確かに効いていない(送る前に断った・PLC がエラーを
+    /// 返した・セッションが無く送っていない)。log-before-write の暫定行も
+    /// この値(モジュール doc)。
     Failed,
+    /// #898: 送ったあとで結果が分からなくなった(送信後のタイムアウト・
+    /// 切断・応答の不一致)。PLC 側では効いている可能性がある。自動では
+    /// 再送しない。
+    Uncertain,
     /// 書き込み受付(§6-6)が off だったため、物理書き込みを一切試みず抑制した。
     SuppressedDisabled,
     /// レート制限(§6-4)を超過するため、物理書き込みを一切試みず抑制した。
@@ -72,6 +96,7 @@ impl WriteAuditResult {
         match self {
             WriteAuditResult::Ok => "ok",
             WriteAuditResult::Failed => "failed",
+            WriteAuditResult::Uncertain => "uncertain",
             WriteAuditResult::SuppressedDisabled => "suppressed_disabled",
             WriteAuditResult::SuppressedRateLimited => "suppressed_rate_limited",
         }
@@ -233,7 +258,8 @@ impl WriteAuditService {
     }
 
     /// [`Self::insert_pending`] した行の `result` を確定させる
-    /// (`broker.write` 成功なら `Ok`、それ以外は `Failed`)。`detail` は
+    /// (`broker.write` 成功なら `Ok`、確かに効いていなければ `Failed`、
+    /// 送ったあとで結果が分からなければ `Uncertain` - #898)。`detail` は
     /// 失敗理由の説明文(T8-2、docs/tag-server-design.md §6.1、
     /// 2026-08-06: 例えば T8 の RMW 確認読み不一致
     /// `PlcWriteError::BitWriteVerificationFailed` の
@@ -383,6 +409,41 @@ mod tests {
             result.rows[0].detail.as_deref(),
             Some("ビット書き込みの確認読みで不一致を検出しました。書き戻し競合の可能性があります")
         );
+    }
+
+    /// #898: 送ったあとで結果が分からない書込みは `uncertain` で確定でき、
+    /// 一覧で `failed` と別に絞り込める。
+    #[tokio::test]
+    async fn uncertain_is_kept_apart_from_failed_in_the_list() {
+        let svc = service().await;
+        let failed = svc.insert_pending(&sample_row()).await.unwrap();
+        svc.set_result(failed, WriteAuditResult::Failed, Some("PLC のエラー"))
+            .await
+            .unwrap();
+        let uncertain = svc.insert_pending(&sample_row()).await.unwrap();
+        svc.set_result(
+            uncertain,
+            WriteAuditResult::Uncertain,
+            Some("応答タイムアウト"),
+        )
+        .await
+        .unwrap();
+
+        let only = |value: &str| ListParams {
+            filters: vec![banto_core::FilterState {
+                field: "result".to_string(),
+                op: banto_core::FilterOp::Eq,
+                value: serde_json::json!(value),
+            }],
+            ..Default::default()
+        };
+        let listed = svc.list(only("uncertain")).await.unwrap();
+        assert_eq!(listed.total_count, 1);
+        assert_eq!(listed.rows[0].id, uncertain);
+        assert_eq!(listed.rows[0].detail.as_deref(), Some("応答タイムアウト"));
+        let listed = svc.list(only("failed")).await.unwrap();
+        assert_eq!(listed.total_count, 1);
+        assert_eq!(listed.rows[0].id, failed);
     }
 
     #[tokio::test]
