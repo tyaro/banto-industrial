@@ -90,4 +90,22 @@ test.describe.serial('banto-hub sidebar toggle placement (#714)', () => {
 		await expect(page.getByRole('link', { name: 'タグ登録' })).toBeHidden();
 		await expect(menuBtn).toBeVisible();
 	});
+
+	test('7. 狭幅でヘッダーの ☰ にフォーカスがある状態から広幅へ戻すと、サイドバー側の ☰ へフォーカスが移る（#909 レビュー）', async () => {
+		const menuBtn = page.locator('header').getByRole('button', { name: 'メニューを開く' });
+		await menuBtn.focus();
+		await expect(menuBtn).toBeFocused();
+		await page.setViewportSize({ width: 1280, height: 800 });
+		await expect(page.locator('header [data-nav-toggle]')).toHaveCount(0);
+		await expect(collapseBtn(page)).toBeFocused();
+	});
+
+	test('8. 広幅でサイドバー側の ☰ にフォーカスがある状態から狭幅にすると、ヘッダーの ☰ へフォーカスが移る', async () => {
+		await collapseBtn(page).focus();
+		await expect(collapseBtn(page)).toBeFocused();
+		await page.setViewportSize({ width: 400, height: 800 });
+		await expect(
+			page.locator('header').getByRole('button', { name: 'メニューを開く' })
+		).toBeFocused();
+	});
 });

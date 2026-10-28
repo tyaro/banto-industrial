@@ -12,6 +12,7 @@ import {
 	applyNarrowChange,
 	findVisibleNavToggle,
 	initialMobileNavState,
+	NAV_TOGGLE_ATTR,
 	resolveHamburgerTarget,
 	type MobileNavState
 } from './mobileNav';
@@ -66,7 +67,22 @@ class MobileNavStore {
 	watchViewport(): () => void {
 		return watchMediaQuery(NARROW_BREAKPOINT_QUERY, (matches) => {
 			untrack(() => {
+				// #714（#909 レビュー）: 幅の切り替えで、フォーカスのあった ☰ が消える
+				// ことがある（狭幅のヘッダー ☰ → 広幅で消える、など）。消えるとフォーカスが
+				// `<body>` に落ちるので、**状態を変える前（DOM 更新前）**に「☰ にフォーカスが
+				// あったか」を控え、更新後に見えている側の ☰ へ移す。☰ 以外にフォーカスが
+				// あるときは何もしない（奪わない）。
+				const active = document.activeElement;
+				const hadToggleFocus =
+					active instanceof HTMLElement && active.hasAttribute(NAV_TOGGLE_ATTR);
 				this.#state = applyNarrowChange(this.#state, matches);
+				if (!hadToggleFocus) return;
+				void tick().then(() => {
+					const now = document.activeElement;
+					const stillOnToggle =
+						now instanceof HTMLElement && now.isConnected && now.hasAttribute(NAV_TOGGLE_ATTR);
+					if (!stillOnToggle) findVisibleNavToggle()?.focus();
+				});
 			});
 		});
 	}
