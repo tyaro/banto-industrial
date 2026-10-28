@@ -54,3 +54,10 @@ updates:
     open-pull-requests-limit: 5
     commit-message:
       prefix: 'chore(ci)'
+    # dtolnay/rust-toolchain は action の版ではなく、タグの名前が Rust の版
+    # （ci.yml の MSRV `@1.85`、supply-chain.yml の `@1.98.1`）。Dependabot は
+    # これを action の版とみなし、まだ無い Rust の版のタグ（1.120）へ上げる PR を
+    # 出した（#831、2026-08-30 にも同じ型）。版は rust-version・
+    # rust-toolchain.toml と同じ PR で手で上げるので、明示的に除外する。
+    ignore:
+      - dependency-name: 'dtolnay/rust-toolchain'
