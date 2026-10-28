@@ -28,7 +28,27 @@ enum Peer {
     StandardQ,
 }
 
+/// Wire behaviour the new-guest E1/E2 tests choose explicitly. The default is
+/// the 4E, own-station behaviour every earlier test relies on.
+#[derive(Clone, Copy, Default)]
+struct Wire {
+    /// Answer a 3E request with a 4E (`D4`) response header.
+    answer_4e_to_3e: bool,
+    /// Answer with the own-station route (00 FF FF03 00) instead of the
+    /// request's route.
+    fold_own_route: bool,
+    /// Added to the response length field (the bytes sent do not change).
+    length_delta: i32,
+}
+
+/// Subheader (first two bytes) and route (network, station, I/O LE, multidrop)
+/// of one request as it arrived on the wire.
+type RecordedHeader = ([u8; 2], [u8; 5]);
+
 struct Fixture {
+    wire: Arc<Mutex<Wire>>,
+    headers: Arc<Mutex<Vec<RecordedHeader>>>,
+    connections: Arc<AtomicU32>,
     address: std::net::SocketAddr,
     frames: RecordedFrames,
     commands: Arc<Mutex<Vec<(u16, u32, u16)>>>,
@@ -45,6 +65,10 @@ struct Fixture {
 
 impl Fixture {
     async fn start(peer: Peer, count: u32, bad_ack: bool) -> Self {
+        Self::start_wire(peer, count, bad_ack, Wire::default()).await
+    }
+
+    async fn start_wire(peer: Peer, count: u32, bad_ack: bool, wire: Wire) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let frames: RecordedFrames = Arc::new(Mutex::new(Vec::new()));
@@ -67,20 +91,48 @@ impl Fixture {
         let write_end_code_on_wire = write_end_code.clone();
         let bit_frames: RecordedBits = Arc::new(Mutex::new(Vec::new()));
         let bits_written = bit_frames.clone();
+        let wire = Arc::new(Mutex::new(wire));
+        let wire_on_wire = wire.clone();
+        let headers: Arc<Mutex<Vec<RecordedHeader>>> = Arc::new(Mutex::new(Vec::new()));
+        let headers_on_wire = headers.clone();
+        let connections = Arc::new(AtomicU32::new(0));
+        let connections_on_wire = connections.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                connections_on_wire.fetch_add(1, Ordering::SeqCst);
                 loop {
-                    let mut head = [0; 13];
-                    if socket.read_exact(&mut head).await.is_err() {
+                    // 4E: 5400 serial reserved route length(11..13) ...;
+                    // 3E: 5000 route length(7..9) .... A 3E request is
+                    // normalised to the 4E layout below so the handlers
+                    // keep their offsets; only the response framing differs.
+                    let mut sub = [0; 2];
+                    if socket.read_exact(&mut sub).await.is_err() {
                         break;
                     }
-                    let length = usize::from(u16::from_le_bytes([head[11], head[12]]));
-                    let mut request = head.to_vec();
+                    let three_e = sub == [0x50, 0x00];
+                    assert!(three_e || sub == [0x54, 0x00], "subheader {sub:02x?}");
+                    let mut rest = vec![0; if three_e { 7 } else { 11 }];
+                    if socket.read_exact(&mut rest).await.is_err() {
+                        break;
+                    }
+                    let route: [u8; 5] = rest[rest.len() - 7..rest.len() - 2].try_into().unwrap();
+                    let length = usize::from(u16::from_le_bytes([
+                        rest[rest.len() - 2],
+                        rest[rest.len() - 1],
+                    ]));
+                    let mut request = if three_e {
+                        vec![0x54, 0, 0, 0, 0, 0]
+                    } else {
+                        sub.to_vec()
+                    };
+                    request.extend_from_slice(&rest);
                     request.resize(13 + length, 0);
                     if socket.read_exact(&mut request[13..]).await.is_err() {
                         break;
                     }
+                    headers_on_wire.lock().unwrap().push((sub, route));
+                    let wire = *wire_on_wire.lock().unwrap();
                     let command = u16::from_le_bytes([request[15], request[16]]);
                     let count = count_on_wire.load(Ordering::SeqCst);
                     let subcommand = u16::from_le_bytes([request[17], request[18]]);
@@ -190,7 +242,8 @@ impl Fixture {
                             assert!(
                                 words > 0
                                     && ((device == 0xa8
-                                        && ((start == 10 && end == 11)
+                                        && ((start == 0 && end == 1) // connection-test probe D0
+                                            || (start == 10 && end == 11)
                                             || (start == 3000 && end == 3001)
                                             || (start >= 3010 && end <= 3015)))
                                         || (device == 0xb4 && start >= 0x1a && end <= 0x20)
@@ -318,10 +371,21 @@ impl Fixture {
                         }
                         _ => panic!("unexpected SLMP command {command:#x}"),
                     };
-                    let mut response = vec![0xd4, 0];
-                    response.extend_from_slice(&request[2..11]);
-                    response
-                        .extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
+                    let route_out: [u8; 5] = if wire.fold_own_route {
+                        [0, 0xff, 0xff, 0x03, 0]
+                    } else {
+                        route
+                    };
+                    let mut response = if three_e && !wire.answer_4e_to_3e {
+                        vec![0xd0, 0]
+                    } else {
+                        let mut head = vec![0xd4, 0];
+                        head.extend_from_slice(&request[2..6]);
+                        head
+                    };
+                    response.extend_from_slice(&route_out);
+                    let announced = i32::try_from(body.len() + 2).unwrap() + wire.length_delta;
+                    response.extend_from_slice(&u16::try_from(announced).unwrap().to_le_bytes());
                     response.extend_from_slice(&end_code.to_le_bytes());
                     response.extend_from_slice(&body);
                     if bad_ack && command == 0x1401 {
@@ -334,6 +398,9 @@ impl Fixture {
             }
         });
         Self {
+            wire,
+            headers,
+            connections,
             address,
             frames,
             commands,
@@ -347,6 +414,18 @@ impl Fixture {
             bit_frames,
             task,
         }
+    }
+
+    fn set_wire(&self, wire: Wire) {
+        *self.wire.lock().unwrap() = wire;
+    }
+
+    fn headers(&self) -> Vec<RecordedHeader> {
+        self.headers.lock().unwrap().clone()
+    }
+
+    fn connections(&self) -> u32 {
+        self.connections.load(Ordering::SeqCst)
     }
 
     fn frames(&self) -> Vec<(u32, Vec<u16>)> {
@@ -661,7 +740,26 @@ async fn connect_new_guest_with(
     mode: &str,
     allowlist: &str,
 ) -> (Fixture, Arc<WasmDriver>, FrameSession) {
-    let fixture = Fixture::start(peer, 4000, false).await;
+    let (fixture, driver, session) =
+        connect_new_guest_cfg(peer, Wire::default(), mode, allowlist, &[]).await;
+    (fixture, driver, session.unwrap())
+}
+
+/// Like `connect_new_guest_with`, with extra connection settings (E1 `frame`,
+/// E2 `network_no`/`station_no`/`target_cpu`) and a chosen wire behaviour. The
+/// connect result is returned as is so a test can expect it to fail.
+async fn connect_new_guest_cfg(
+    peer: Peer,
+    wire: Wire,
+    mode: &str,
+    allowlist: &str,
+    extra: &[(&str, &str)],
+) -> (
+    Fixture,
+    Arc<WasmDriver>,
+    Result<FrameSession, impl std::fmt::Debug>,
+) {
+    let fixture = Fixture::start_wire(peer, 4000, false, wire).await;
     let driver = WasmDriver::load_operational_write(MANIFEST, &new_guest_component()).unwrap();
     let transport = TransportSpec::Tcp {
         host: "127.0.0.1".into(),
@@ -672,15 +770,28 @@ async fn connect_new_guest_with(
         Duration::from_millis(500),
         Duration::from_millis(500),
     );
+    let mut pairs: Vec<(String, String)> = [
+        ("host", "127.0.0.1".to_owned()),
+        ("port", fixture.address.port().to_string()),
+        ("d_u16_write_mode", mode.to_owned()),
+        ("d_u16_write_allowlist", allowlist.to_owned()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect();
+    pairs.extend(
+        extra
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+    );
     let session = FrameSession::connect(
         driver.as_ref(),
-        &settings(fixture.address.port(), mode, allowlist),
+        &Settings::from_pairs(pairs).unwrap(),
         &transport,
         &context,
         None,
     )
-    .await
-    .unwrap();
+    .await;
     (fixture, driver, session)
 }
 
@@ -1600,7 +1711,32 @@ async fn saved_new_guest_collection(
     allowlist: &str,
     tags: &[(&str, &str, &str)],
 ) -> (Fixture, super::TestApp, Vec<i64>) {
-    let fixture = Fixture::start(peer, 4000, false).await;
+    saved_new_guest_collection_with(label, peer, Wire::default(), &[], allowlist, tags).await
+}
+
+/// `saved_new_guest_collection` with a wire behaviour and extra settings (E1/E2).
+async fn saved_new_guest_collection_with(
+    label: &str,
+    peer: Peer,
+    wire: Wire,
+    extra: &[(&str, &str)],
+    allowlist: &str,
+    tags: &[(&str, &str, &str)],
+) -> (Fixture, super::TestApp, Vec<i64>) {
+    let fixture = Fixture::start_wire(peer, 4000, false, wire).await;
+    let mut connection_settings = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": fixture.address.port(),
+        "d_u16_write_mode": "enabled",
+        "d_u16_write_allowlist": allowlist
+    });
+    for (key, value) in extra {
+        // The Hub schema types `network_no` and `station_no` as integers.
+        connection_settings[*key] = match value.parse::<i64>() {
+            Ok(number) => serde_json::json!(number),
+            Err(_) => serde_json::json!(value),
+        };
+    }
     let app =
         super::test_app_with_operational_write_manifest(label, MANIFEST, &new_guest_component())
             .await;
@@ -1612,15 +1748,7 @@ async fn saved_new_guest_collection(
             protocol: "slmp-wasm-operational-write".into(),
             enabled: true,
             simulation: false,
-            settings: serde_json::json!({
-                "host": "127.0.0.1",
-                "port": fixture.address.port(),
-                "d_u16_write_mode": "enabled",
-                "d_u16_write_allowlist": allowlist
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
+            settings: connection_settings.as_object().unwrap().clone(),
             secrets: Default::default(),
         })
         .await
@@ -2772,4 +2900,593 @@ async fn w_write_with_unknown_ack_or_plc_error_never_succeeds_or_replays() {
         session.disconnect().await;
         assert_eq!(w_commands(&fixture), 1, "PLC error must not replay");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Guests #57 (E1: 3E binary frame) and #58 (E2: routed access), accepted
+// against the loopback fixture above.
+// ---------------------------------------------------------------------------
+
+const OWN_ROUTE: [u8; 5] = [0x00, 0xff, 0xff, 0x03, 0x00];
+/// network 2, station 5, request destination I/O 03E1H (cpu2), multidrop 0.
+const ROUTE_2_5_CPU2: [u8; 5] = [0x02, 0x05, 0xe1, 0x03, 0x00];
+
+fn word_spec(driver: &WasmDriver, address: &str) -> TagSpec {
+    let kind = TagKind::numeric(DataType::U16);
+    TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind)
+}
+
+/// A read that came back is not Good: a fatal error or a per-item error.
+fn is_not_good(result: &Result<Vec<Result<Value, ItemError>>, FatalError>) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(items) => items.iter().all(Result::is_err),
+    }
+}
+
+/// Guest #57 through the real Hub path: with `frame=3e` the handshake (0101, SD)
+/// passes, saved tags are collected Good and answer read-now, and every frame
+/// the peer receives is a 3E (`5000`) request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_frame_3e_handshake_collection_and_read_now_use_only_3e() {
+    for peer in [Peer::R, Peer::Q, Peer::StandardQ] {
+        let (fixture, app, ids) = saved_new_guest_collection_with(
+            "t12-new-guest-frame-3e-hub",
+            peer,
+            Wire::default(),
+            &[("frame", "3e")],
+            "D3010-D3013",
+            &[("d3010", "D3010", "u16"), ("d3011", "D3011", "u16")],
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if ids.iter().all(|id| {
+                    app.manager
+                        .current_values()
+                        .and_then(|values| values.get(&format!("tag:{id}")))
+                        .is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("3E tags collected Good");
+        for name in ["d3010", "d3011"] {
+            let (status, body) = super::admin_get(
+                &app.router,
+                &format!("/api/v1/values/line.group.{name}/read-now"),
+                &app.admin_token,
+            )
+            .await;
+            assert_eq!(status, super::StatusCode::OK, "{body:?}");
+            assert_eq!(body["v"], serde_json::json!(7.0), "{body:?}");
+            assert_eq!(body["q"], "good", "{body:?}");
+        }
+        let commands = fixture.commands();
+        assert!(commands.iter().any(|(command, _, _)| *command == 0x0101));
+        assert!(commands.iter().any(|(command, _, _)| *command == 0x0401));
+        let headers = fixture.headers();
+        // Collection keeps running: a header is recorded before its command
+        // and is snapshotted after `commands`, so it can only be ahead.
+        assert!(
+            headers.len() >= commands.len(),
+            "{headers:02x?} {commands:?}"
+        );
+        assert!(
+            headers
+                .iter()
+                .all(|(sub, route)| *sub == [0x50, 0x00] && *route == OWN_ROUTE),
+            "{headers:02x?}"
+        );
+        drop(app);
+    }
+}
+
+/// Guest #57: an allowed write on a `frame=3e` connection is one 3E frame, is
+/// applied, and leaves an `ok` audit row (the same REST path as the 4E test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_frame_3e_write_is_one_3e_frame_and_audited() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-frame-3e-write",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "frame": "3e",
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "D3010-D3013"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 60_000))
+    .await
+    .unwrap();
+    let mut names = Vec::new();
+    let mut ids = Vec::new();
+    for index in [3010, 3011, 3012, 3013] {
+        let name = format!("word{index}");
+        let mut tag = super::tag_input(&name, group.id, &format!("D{index}"), "u16");
+        tag.writable = true;
+        ids.push(app.manager.tags().create(tag).await.unwrap().id);
+        names.push(format!("line.group.{name}"));
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    // One short-lived key limited to these four tags; revoked below.
+    let issued = api_keys
+        .issue(
+            "frame-3e-loopback-writer",
+            names.iter().map(|tag| format!("write:{tag}")).collect(),
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let allowed = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/v1/values/batch",
+        &issued.key,
+        serde_json::json!({
+            "writes": names
+                .iter()
+                .zip(1..=4)
+                .map(|(tag, value)| serde_json::json!({"tag": tag, "v": value}))
+                .collect::<Vec<_>>()
+        }),
+    )
+    .await;
+    let frames = fixture.frames();
+    let headers = fixture.headers();
+    let commands = fixture.commands();
+    let audit = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    drop(app);
+
+    assert!(revoked.unwrap().revoked_at.is_some());
+    assert_eq!(allowed.0, super::StatusCode::OK, "{:?}", allowed.1);
+    let writes = allowed.1["writes"].as_array().unwrap();
+    assert_eq!(writes.len(), 4);
+    assert!(writes.iter().all(|result| result["ok"] == true));
+    assert_eq!(frames, vec![(3010, vec![1, 2, 3, 4])]);
+    assert_eq!(
+        commands
+            .iter()
+            .filter(|(command, _, _)| *command == 0x1401)
+            .count(),
+        1
+    );
+    assert!(
+        headers
+            .iter()
+            .all(|(sub, route)| *sub == [0x50, 0x00] && *route == OWN_ROUTE),
+        "{headers:02x?}"
+    );
+    assert_eq!(audit.0, super::StatusCode::OK, "{:?}", audit.1);
+    let rows = audit.1["rows"].as_array().unwrap();
+    for id in &ids {
+        assert!(rows
+            .iter()
+            .any(|row| { row["tagId"].as_i64() == Some(*id) && row["result"] == "ok" }));
+    }
+}
+
+/// Guest #57: a peer that answers a 3E request with a 4E header, or with a
+/// length that does not match the bytes sent, never yields a Good value and
+/// the connection is not usable afterwards. A write whose answer is bad is
+/// not replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_frame_3e_bad_answer_is_never_good_and_cuts_the_connection() {
+    let bad_wires = [
+        (
+            "4E header to a 3E request",
+            Wire {
+                answer_4e_to_3e: true,
+                ..Wire::default()
+            },
+        ),
+        (
+            "length one too long",
+            Wire {
+                length_delta: 1,
+                ..Wire::default()
+            },
+        ),
+        (
+            "length one too short",
+            Wire {
+                length_delta: -1,
+                ..Wire::default()
+            },
+        ),
+    ];
+    for (label, bad) in bad_wires {
+        let (fixture, driver, session) = connect_new_guest_cfg(
+            Peer::R,
+            Wire::default(),
+            "enabled",
+            "D3010-D3013",
+            &[("frame", "3e")],
+        )
+        .await;
+        let mut session = session.unwrap();
+        let read_specs = [word_spec(&driver, "D3010"), word_spec(&driver, "D3011")];
+        // Healthy first: the same session reads Good over 3E.
+        assert_eq!(
+            session.read_batch(&read_specs).await.unwrap(),
+            vec![Ok(Value::F64(7.0)); 2],
+            "{label}"
+        );
+        fixture.set_wire(bad);
+        let result = session.read_batch(&read_specs).await;
+        assert!(is_not_good(&result), "{label}: {result:?}");
+        // The connection was cut: even a healthy peer no longer yields Good.
+        fixture.set_wire(Wire::default());
+        let result = session.read_batch(&read_specs).await;
+        assert!(is_not_good(&result), "{label} (after): {result:?}");
+        assert_eq!(fixture.connections(), 1, "{label}: no hidden reconnect");
+        session.disconnect().await;
+
+        // A write answered badly is reported as not successful and sent once.
+        let (fixture, driver, session) = connect_new_guest_cfg(
+            Peer::R,
+            Wire::default(),
+            "enabled",
+            "D3010-D3013",
+            &[("frame", "3e")],
+        )
+        .await;
+        let mut session = session.unwrap();
+        fixture.set_wire(bad);
+        let write_specs: Vec<_> = (3010..=3013)
+            .map(|index| word_spec(&driver, &format!("D{index}")))
+            .collect();
+        let result = session.write_batch(&items(&write_specs)).await;
+        let succeeded = matches!(&result, Ok(items) if items.iter().any(Result::is_ok));
+        assert!(!succeeded, "{label}: {result:?}");
+        assert_eq!(
+            fixture
+                .commands()
+                .iter()
+                .filter(|(command, _, _)| *command == 0x1401)
+                .count(),
+            1,
+            "{label}: a bad answer must not replay the write"
+        );
+        assert_eq!(fixture.frames().len(), 1, "{label}");
+        session.disconnect().await;
+    }
+}
+
+/// Guest #58 (with #57): `network_no=2`, `station_no=5`, `target_cpu=cpu2` puts
+/// the route (02, 05, 03E1H) into every frame — 0101, SD, tag reads and the
+/// write — in both 4E and 3E, and the handshake and reads pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_routed_connection_puts_the_route_in_every_frame() {
+    for frame in ["4e", "3e"] {
+        let (fixture, driver, session) = connect_new_guest_cfg(
+            Peer::R,
+            Wire::default(),
+            "enabled",
+            "D3010-D3013",
+            &[
+                ("frame", frame),
+                ("network_no", "2"),
+                ("station_no", "5"),
+                ("target_cpu", "cpu2"),
+            ],
+        )
+        .await;
+        let mut session = session.unwrap();
+        let read_specs = [word_spec(&driver, "D3010"), word_spec(&driver, "D3011")];
+        assert_eq!(
+            session.read_batch(&read_specs).await.unwrap(),
+            vec![Ok(Value::F64(7.0)); 2],
+            "{frame}"
+        );
+        let write_specs: Vec<_> = (3010..=3013)
+            .map(|index| word_spec(&driver, &format!("D{index}")))
+            .collect();
+        assert_eq!(
+            session.write_batch(&items(&write_specs)).await.unwrap(),
+            vec![Ok(()); 4],
+            "{frame}"
+        );
+        let commands = fixture.commands();
+        for wanted in [0x0101, 0x0401, 0x1401] {
+            assert!(
+                commands.iter().any(|(command, _, _)| *command == wanted),
+                "{frame}: {wanted:#x} {commands:?}"
+            );
+        }
+        let headers = fixture.headers();
+        assert_eq!(headers.len(), commands.len());
+        let sub = if frame == "3e" {
+            [0x50, 0x00]
+        } else {
+            [0x54, 0x00]
+        };
+        assert!(
+            headers
+                .iter()
+                .all(|(got, route)| *got == sub && *route == ROUTE_2_5_CPU2),
+            "{frame}: {headers:02x?}"
+        );
+        session.disconnect().await;
+    }
+}
+
+/// Guest #58 through the real Hub path: a saved routed connection collects Good
+/// and answers read-now, and its frames all carry the route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_saved_routed_connection_is_collected_good_through_the_hub() {
+    let (fixture, app, ids) = saved_new_guest_collection_with(
+        "t12-new-guest-routed-hub",
+        Peer::StandardQ,
+        Wire::default(),
+        &[
+            ("network_no", "2"),
+            ("station_no", "5"),
+            ("target_cpu", "cpu2"),
+        ],
+        "D3010-D3013",
+        &[("d3010", "D3010", "u16")],
+    )
+    .await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if app
+                .manager
+                .current_values()
+                .and_then(|values| values.get(&format!("tag:{}", ids[0])))
+                .is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("routed tag collected Good");
+    let (status, body) = super::admin_get(
+        &app.router,
+        "/api/v1/values/line.group.d3010/read-now",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    assert_eq!(body["q"], "good", "{body:?}");
+    let headers = fixture.headers();
+    assert!(headers.len() >= 3, "{headers:02x?}");
+    assert!(
+        headers
+            .iter()
+            .all(|(sub, route)| *sub == [0x54, 0x00] && *route == ROUTE_2_5_CPU2),
+        "{headers:02x?}"
+    );
+    drop(app);
+}
+
+/// Guest #58: a peer that folds the own-station route back instead of the
+/// requested one is a frame error. The handshake fails, and a connected session
+/// stops yielding Good values once the route is folded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_routed_connection_rejects_a_folded_own_route() {
+    let routed = [
+        ("network_no", "2"),
+        ("station_no", "5"),
+        ("target_cpu", "cpu2"),
+    ];
+    for frame in ["4e", "3e"] {
+        let mut extra = vec![("frame", frame)];
+        extra.extend(routed);
+        // Folded from the start: connect (handshake) fails.
+        let (fixture, _driver, session) = connect_new_guest_cfg(
+            Peer::R,
+            Wire {
+                fold_own_route: true,
+                ..Wire::default()
+            },
+            "disabled",
+            "",
+            &extra,
+        )
+        .await;
+        assert!(session.is_err(), "{frame}: handshake must fail");
+        assert!(fixture.connections() >= 1);
+
+        // Folded after the handshake: the read is not Good.
+        let (fixture, driver, session) =
+            connect_new_guest_cfg(Peer::R, Wire::default(), "disabled", "", &extra).await;
+        let mut session = session.unwrap();
+        let read_specs = [word_spec(&driver, "D3010")];
+        assert_eq!(
+            session.read_batch(&read_specs).await.unwrap(),
+            vec![Ok(Value::F64(7.0))]
+        );
+        fixture.set_wire(Wire {
+            fold_own_route: true,
+            ..Wire::default()
+        });
+        let result = session.read_batch(&read_specs).await;
+        assert!(is_not_good(&result), "{frame}: {result:?}");
+        session.disconnect().await;
+    }
+}
+
+/// Guests #57 and #58: the connection test API accepts a valid frame/route and
+/// refuses invalid ones before any connection reaches the peer; the saved
+/// connection is refused the same way; and `GET /api/drivers` lists the four
+/// settings in the guest's schema.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_frame_and_route_settings_are_validated_before_connecting() {
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-frame-route-validation",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let payload = |extra: serde_json::Value| {
+        let mut settings = serde_json::json!({
+            "host": "127.0.0.1",
+            "port": fixture.address.port(),
+            "d_u16_write_mode": "disabled",
+            "d_u16_write_allowlist": ""
+        });
+        for (key, value) in extra.as_object().unwrap() {
+            settings[key] = value.clone();
+        }
+        serde_json::json!({
+            "protocol": "slmp-wasm-operational-write",
+            "simulation": false,
+            "settings": settings
+        })
+    };
+    let test = |body: serde_json::Value| {
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            body,
+        )
+    };
+
+    for good in [
+        serde_json::json!({}),
+        serde_json::json!({"frame": "3e"}),
+        serde_json::json!({"network_no": 2, "station_no": 5, "target_cpu": "cpu2"}),
+        serde_json::json!({"frame": "3e", "network_no": 2, "station_no": 5}),
+    ] {
+        let (status, body) = test(payload(good.clone())).await;
+        assert_eq!(status, super::StatusCode::OK, "{good}: {body:?}");
+        assert_eq!(body["ok"], true, "{good}: {body:?}");
+    }
+    let connected = fixture.connections();
+    assert!(connected >= 4);
+
+    let bad_settings = [
+        serde_json::json!({"network_no": 2}),
+        serde_json::json!({"network_no": 0, "station_no": 5}),
+        serde_json::json!({"network_no": 240, "station_no": 5}),
+        serde_json::json!({"network_no": 2, "station_no": 121}),
+        serde_json::json!({"network_no": 2, "station_no": 0}),
+        serde_json::json!({"target_cpu": "cpu9"}),
+        serde_json::json!({"frame": "2e"}),
+    ];
+    for bad in &bad_settings {
+        let (status, body) = test(payload(bad.clone())).await;
+        // Either a 4xx refusal or an `ok: false` answer, never a success.
+        assert!(
+            !status.is_success() || body["ok"] == false,
+            "{bad}: {status} {body:?}"
+        );
+    }
+    // Saving the same settings is refused too.
+    for bad in &bad_settings {
+        let settings = payload(bad.clone())["settings"]
+            .as_object()
+            .unwrap()
+            .clone();
+        let saved = app
+            .manager
+            .plc_connections()
+            .create_settings(super::ConnectionSettingsInput {
+                name: "bad".into(),
+                protocol: "slmp-wasm-operational-write".into(),
+                enabled: false,
+                simulation: false,
+                settings,
+                secrets: Default::default(),
+            })
+            .await;
+        assert!(saved.is_err(), "{bad}: saved");
+    }
+    assert_eq!(
+        fixture.connections(),
+        connected,
+        "an invalid setting must not reach the peer"
+    );
+
+    let (status, body) = super::admin_write(
+        &app.router,
+        "GET",
+        "/api/drivers",
+        &app.admin_token,
+        serde_json::Value::Null,
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    let entry = body
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item.to_string().contains("slmp-wasm-operational-write"))
+        .unwrap_or_else(|| panic!("driver not listed: {body:?}"));
+    let schema = entry.to_string();
+    for key in ["frame", "network_no", "station_no", "target_cpu"] {
+        assert!(
+            schema.contains(&format!("\"key\":\"{key}\"")),
+            "{key} missing from the schema: {schema}"
+        );
+    }
+    drop(app);
 }
