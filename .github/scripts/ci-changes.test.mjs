@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
 	classify,
 	classifyAreas,
+	derive,
 	escapeRegExp,
 	graphFromMetadata,
 	JOB_PACKAGES,
@@ -196,6 +197,7 @@ const ALL = {
 	run_frontend_chronogazer: true,
 	run_rust: true,
 	rust_args: '--workspace',
+	run_wasm: true,
 	run_driver_api: true,
 	run_rust_db_source: true,
 	run_linux_clippy: true,
@@ -209,6 +211,7 @@ const NONE = {
 	run_frontend_chronogazer: false,
 	run_rust: false,
 	rust_args: '',
+	run_wasm: false,
 	run_driver_api: false,
 	run_rust_db_source: false,
 	run_linux_clippy: false,
@@ -232,6 +235,7 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: HUB_RUST,
+			run_wasm: true,
 			run_linux_clippy: true,
 			run_rust_db_source: true,
 			run_e2e_hub: true
@@ -245,6 +249,7 @@ const TABLE = [
 			run_frontend_hub: true,
 			run_rust: true,
 			rust_args: HUB_RUST,
+			run_wasm: true,
 			run_linux_clippy: true,
 			run_rust_db_source: true,
 			run_e2e_hub: true
@@ -278,6 +283,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -300,6 +306,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -322,6 +329,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -341,6 +349,7 @@ const TABLE = [
 				'-p banto-hub-shell',
 				'-p banto-hub-sink'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -363,6 +372,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -387,6 +397,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -411,6 +422,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -425,6 +437,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-api -p banto-driver-conformance -p banto-driver-engine -p banto-driver-modbus -p banto-driver-slmp -p banto-driver-wasm -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink -p banto-plc -p banto-tags -p chronogazer -p chronogazer-core -p chronogazer-elev',
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -443,6 +456,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-conformance -p banto-driver-modbus -p banto-driver-slmp -p banto-drivers -p banto-hub-core -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -456,6 +470,7 @@ const TABLE = [
 			...NONE,
 			run_rust: true,
 			rust_args: '-p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -469,6 +484,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-modbus -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -482,6 +498,7 @@ const TABLE = [
 			run_rust: true,
 			rust_args:
 				'-p banto-driver-wasm -p banto-drivers -p banto-hub-host -p banto-hub-shell -p banto-hub-sink',
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true
@@ -526,6 +543,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -651,6 +669,7 @@ const TABLE = [
 				'-p chronogazer-core',
 				'-p chronogazer-elev'
 			].join(' '),
+			run_wasm: true,
 			run_rust_db_source: true,
 			run_linux_clippy: true,
 			run_e2e_hub: true,
@@ -1013,8 +1032,15 @@ test('WASM crate の変更は Hub host を選び、固定ゲストの ignored �
 	assert.ok(jobs.rust_args.includes('-p banto-hub-host'));
 	const workflow = readFileSync(new URL('../workflows/ci.yml', import.meta.url), 'utf8');
 	const start = workflow.indexOf('      - name: test (WASM Hub components)');
-	const end = workflow.indexOf('      # crate ごとのビルド時間', start);
-	assert.ok(start > 0 && end > start, 'rust-test-build に WASM 接続試験がない');
+	const end = workflow.indexOf('\n  rust-test:\n', start);
+	assert.ok(start > 0 && end > start, 'rust-wasm に WASM 接続試験がない');
+	// #ci-speed（2026-10-28）: 別ジョブ rust-wasm に切り出した。条件はジョブ側（run_wasm）。
+	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
+	assert.ok(jobStart > 0 && jobStart < start, 'rust-wasm ジョブがない');
+	assert.ok(
+		workflow.slice(jobStart, start).includes("if: needs.changes.outputs.run_wasm == 'true'"),
+		'rust-wasm のジョブ条件が run_wasm でない'
+	);
 	const step = workflow.slice(start, end);
 	assert.match(step, /5233d55a4d1c278c473e9c44df608c1423c1a629/);
 	// #902: 固定の driver.wit は guest main と同じか、古い WIT のときだけ差し替える。
@@ -1230,10 +1256,29 @@ test('WASM FC3 の wasm-tools は固定版の検証済みバイナリを fallbac
 	assert.ok(install.includes('          tool: wasm-tools@1.262.0\n'));
 	assert.ok(install.includes('          checksum: true\n'));
 	assert.ok(install.includes('          fallback: none\n'));
-	const condition =
-		"if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')";
-	assert.ok(install.includes(condition));
-	assert.ok(workflow.slice(testStart).includes(condition));
+	// #ci-speed（2026-10-28）: 条件はステップの `if:` からジョブ rust-wasm の `run_wasm` に移した。
+	assert.ok(!install.includes('if: needs.changes.outputs.rust_args'));
+	assert.ok(!workflow.slice(testStart, testStart + 200).includes('if: needs.changes'));
+	const jobStart = workflow.indexOf('\n  rust-wasm:\n');
+	assert.ok(jobStart !== -1 && jobStart < installStart);
+	assert.ok(
+		workflow.slice(jobStart, installStart).includes("if: needs.changes.outputs.run_wasm == 'true'")
+	);
 	assert.match(workflow.slice(testStart), /wasm-tools --version/);
 	assert.doesNotMatch(workflow, /cargo \+1\.98\.1 install wasm-tools/);
+});
+
+test('run_wasm: workspace 全体か、-p に banto-hub-host が入るときだけ true', () => {
+	const only = (/** @type {string[]} */ pkgs) => derive({}, pkgs);
+	// banto-hub-host を含まない -p
+	assert.equal(only(['banto-plc']).run_wasm, false);
+	assert.equal(only(['banto-hub-shell', 'banto-hub-sink']).run_wasm, false);
+	assert.equal(only([]).run_wasm, false);
+	// banto-hub-host を含む -p
+	const hit = only(['banto-plc', 'banto-hub-host']);
+	assert.equal(hit.run_wasm, true);
+	assert.match(hit.rust_args, /(^| )-p banto-hub-host( |$)/);
+	// workspace 全体
+	assert.equal(derive({ full: true }).run_wasm, true);
+	assert.equal(derive({ rust_all: true }).run_wasm, true);
 });
