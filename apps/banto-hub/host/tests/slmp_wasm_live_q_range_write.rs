@@ -20,6 +20,9 @@ const PORT: u16 = 3109;
 const MANIFEST: &[u8] = include_bytes!("t12_slmp_wasm_q_write/manifest.json");
 // Built from the pinned Q25PRH test guest commit 33171bbb990859c5a46df44cfafc233e58ba5317.
 // A separate start signal is still required before running this ignored real-Q test.
+// #902: that guest's driver.wit predates item-error.verification-failed. Rebuild it after
+// `git checkout 3b7f0f6120af689fdd7a807cff7837657242c6b2 -- wit/driver.wit` and update
+// this hash at the next live run.
 const COMPONENT_SHA256: [u8; 32] = [
     0xb8, 0xc2, 0xdc, 0x8d, 0x47, 0xce, 0x71, 0xc4, 0xc1, 0xc3, 0x1a, 0xc0, 0x47, 0x64, 0x32, 0xb8,
     0xfa, 0x5b, 0xe0, 0x8c, 0x2f, 0x39, 0xda, 0xf1, 0x1c, 0xf3, 0x83, 0xda, 0xe3, 0x9e, 0x51, 0x0f,

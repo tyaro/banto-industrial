@@ -18,11 +18,10 @@
 use std::fmt;
 
 /// A per-item (non-fatal) error: only that tag is Bad (WIT
-/// `variant item-error { device(device-error), unsupported(string), rejected(string) }`).
+/// `variant item-error { device(device-error), unsupported(string), rejected(string), verification-failed(string) }`).
 ///
-/// [`ItemError::VerificationFailed`] is not in the WIT `item-error` yet
-/// (a follow-up PR, #902); a WASM guest's `rejected` maps to
-/// [`ItemError::Rejected`].
+/// The WASM adapter maps each WIT case to the variant of the same name
+/// (`verification-failed` to [`ItemError::VerificationFailed`], #902).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(

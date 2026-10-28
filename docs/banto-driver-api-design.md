@@ -1,7 +1,7 @@
 # banto-driver-api 詳細設計（R1: ドライバ API とレジストリ）
 
 作成日: 2026-10-19
-状態: **設計確定（2026-10-19 オーナー決定。§12 の Q1〜Q8 と §0.1 の再確認（P0-3 の 6 本目を含む）を決定済み）・R2b-5（シミュレーションを値の層へ、`SimSession`）完了（2026-10-24）・R2b-6（接続設定とアドレス補助をドライバから組み立てる、`settings_schema`・`supported_kinds`・`offset_words`・`DriverAddress::index`、0.3.0）完了（2026-10-24、v0.2.0-alpha.39）・R1 の全 PR 完了（2026-10-21。R1-7a の `build-release.ps1` の dry run も同日 Windows の手元で通過）・R2b-0（core のテストを実ドライバから切り離す）完了（2026-10-21）・R2b-2（アドレスの不透明化、#781〜#784 と R2b-2e）完了（2026-10-22、§3.3・§3.4・§6.2・§7.1 に追記）・R2b-3（I/O の一本化）完了（2026-10-23、v0.2.0-alpha.37。シリアル接続は #803 へ後回し。§0・§4.2・§4.4・§6.2・§7.3・§8・§9.1・§13 に注記）**。2026-10-19 レビュー指摘で書き込みの手順を状態機械に修正（§4.2.1。`encode_write` / `check_write` を `write_next` に置き換え、適合テストに C13〜C16 を追加）。同日、§3.3・§7.3・§12・§13 に残っていた「再確認待ち」「推奨」の記述を決定済みに揃えた。[banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R1 を実装できる粒度に落としたもの。R1 の各 PR は本書を指示書として使う。 2026-10-20 #739 のオーナーレビュー P2 で §7.2 の `WriteCase` に読み戻しの期待値を足し、C3・C10 の値の照合を `TagKind` に沿う 1 つの規則にした。同日 R1-3b 着手時のオーナー決定で、bin が core 内にある R1-7a までは core が `banto-drivers` を一時的に normal で持つことにした（§6.4）。 2026-10-27、ネイティブ SLMP の V 収集タグ登録とオフセット計算を拒否。2026-10-28（#902）、`ItemError::VerificationFailed` を足して、送ったあとの確認読みの不一致を `Rejected` から分けた（WIT は未変更、§3.4）。
+状態: **設計確定（2026-10-19 オーナー決定。§12 の Q1〜Q8 と §0.1 の再確認（P0-3 の 6 本目を含む）を決定済み）・R2b-5（シミュレーションを値の層へ、`SimSession`）完了（2026-10-24）・R2b-6（接続設定とアドレス補助をドライバから組み立てる、`settings_schema`・`supported_kinds`・`offset_words`・`DriverAddress::index`、0.3.0）完了（2026-10-24、v0.2.0-alpha.39）・R1 の全 PR 完了（2026-10-21。R1-7a の `build-release.ps1` の dry run も同日 Windows の手元で通過）・R2b-0（core のテストを実ドライバから切り離す）完了（2026-10-21）・R2b-2（アドレスの不透明化、#781〜#784 と R2b-2e）完了（2026-10-22、§3.3・§3.4・§6.2・§7.1 に追記）・R2b-3（I/O の一本化）完了（2026-10-23、v0.2.0-alpha.37。シリアル接続は #803 へ後回し。§0・§4.2・§4.4・§6.2・§7.3・§8・§9.1・§13 に注記）**。2026-10-19 レビュー指摘で書き込みの手順を状態機械に修正（§4.2.1。`encode_write` / `check_write` を `write_next` に置き換え、適合テストに C13〜C16 を追加）。同日、§3.3・§7.3・§12・§13 に残っていた「再確認待ち」「推奨」の記述を決定済みに揃えた。[banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R1 を実装できる粒度に落としたもの。R1 の各 PR は本書を指示書として使う。 2026-10-20 #739 のオーナーレビュー P2 で §7.2 の `WriteCase` に読み戻しの期待値を足し、C3・C10 の値の照合を `TagKind` に沿う 1 つの規則にした。同日 R1-3b 着手時のオーナー決定で、bin が core 内にある R1-7a までは core が `banto-drivers` を一時的に normal で持つことにした（§6.4）。 2026-10-27、ネイティブ SLMP の V 収集タグ登録とオフセット計算を拒否。2026-10-28（#902）、`ItemError::VerificationFailed` を足して、送ったあとの確認読みの不一致を `Rejected` から分けた（§3.4）。同日、WIT の `item-error` に `verification-failed` を足し、WASM のアダプタが `VerificationFailed` に写すようにした（§3.4・§9.2）。
 対象: `banto-driver-api`（公開する型と trait）・適合テスト一式・組み立て役 `banto-drivers`・既存の Modbus TCP / SLMP の載せ替え・banto-hub のバイナリの package 分離・CI の判定。R2a（取り込み口 `push`）・R2b（I/O の一本化・アドレスの不透明化・SQL の `CHECK` の撤去）・W（WASM 本体）が **API を壊さずに** 載ることを設計の条件にする。
 関連: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md)（段の順番・決定事項）、[banto-hub-driver-plugin-design.md](banto-hub-driver-plugin-design.md)（§2・§3.1・§3.2・§6 の WIT・§12、監査 B2 / M5 / M6。**§6.2 の WIT は本書 §9.2 と同じ PR で直す**）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §9.5（`push` はセッション型）、[tag-server-design.md](tag-server-design.md) §3.4 / §3.4.1 / §6（書き込みの安全）、[h9-slmp-structured-error-spec.md](h9-slmp-structured-error-spec.md)（構造化エラー）、[implementation-checklist.md](implementation-checklist.md)（PR の手順）。
 
@@ -271,7 +271,7 @@ impl DriverAddress {
 ### 3.4 エラーの分類（h9 と `is_connection_fatal` を型にする）
 
 ```rust
-/// WIT: variant item-error { device(device-error), unsupported(string), rejected(string) } ― 非致命（そのタグだけ Bad）
+/// WIT: variant item-error { device(device-error), unsupported(string), rejected(string), verification-failed(string) } ― 非致命（そのタグだけ Bad）
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ItemError {
@@ -283,7 +283,7 @@ pub enum ItemError {
     /// 機器の拒否でも設定の不整合でもない非致命
     Rejected(String),
     /// 書込みを送ったあと、ドライバ自身の確認読み（RMW の確認読み）が合わない。機器には効いているかもしれない（#902）。
-    /// WIT の `item-error` にはまだ無い（別の PR）。WASM ゲストの `rejected` は `Rejected` に写る
+    /// WIT の `item-error` の `verification-failed` がこれに写る（WASM ゲストの `rejected` は `Rejected`）
     VerificationFailed(String),
 }
 #[non_exhaustive]
@@ -866,7 +866,7 @@ R1 の Modbus / SLMP は `HostBound` なので、`frame::run_all` は走らせ�
 | `RawValue`                                                         | `types.value`                                                                      | 読み取りの戻り                                                                                                                                                                                                                           |
 | `WriteItem.value: Value`                                           | `write-item.value: types.value`                                                    | WASM ホストは `Bit → bool`、`F64 → float`、`Str → bytes`（`encoding` で符号化）に写す。**書き込み側で `int` / `uint` は使わない**。整数型への丸めと範囲の検査はプラグイン側（`encode.rs:192` の `require_integral_in_range` と同じ規則） |
 | `Value`                                                            | -（Hub 側の型）                                                                    |                                                                                                                                                                                                                                          |
-| `ItemError` / `DeviceError`                                        | `types.item-error { device, unsupported, rejected }` / `device-error`              | `VerificationFailed` は WIT に未反映（#902 の続きで足す）。それまでゲストの `rejected` は `Rejected` に写る                                                                                                                              |
+| `ItemError` / `DeviceError`                                        | `types.item-error { device, unsupported, rejected, verification-failed }`          | `DeviceError` は `device-error`。各値は名前の同じ値に写す（#902）。今のゲストは `verification-failed` を返さない                                                                                                                         |
 | `FatalError::{Framing, Protocol, InvalidConfig}`                   | `types.fatal-error`                                                                | `Io` / `Timeout` は WIT に無い（Hub 側）。フレーム型は返さない（C4）                                                                                                                                                                     |
 | `FrameRule` / `PrefixSpec` / `PrefixEncoding` / `Step` / `Planned` | `session.frame-rule` / `prefix-spec` / `prefix-encoding` / `step` / `read.planned` | `DriverDecides` ↔ `plugin-decides`                                                                                                                                                                                                       |
 | `SessionDriver` / `Session`                                        | -（WIT の対象外。組み込みのみ）                                                    |                                                                                                                                                                                                                                          |
@@ -900,7 +900,7 @@ R1 の完了条件（plan §4）: 既存テストが全部通り、Modbus / SLMP
 - API の `DriverAddress.writable_area` と `Capabilities.write` は**プロトコルの事実**であり、書き込みの許可の判断ではない。`write_path.rs` の関門（`writable`・API キーの `write` スコープ・受付トグル・頻度・監査・broker の直列化）は R1 で一切触らない（§10 で触るのは R1-3a の `is_supported_protocol` の呼び出し 1 行だけ）。
 - `FrameConnection::write_next` の非合体（C10）は `banto-plc-write` の gap-tolerance-zero をそのまま API の契約にしたもの。
 - 書き込みの状態機械（§4.2.1）はプロトコルの手順（RMW と確認読み）だけを表す。関門と監査の先書きは最初の `write_next(None)` より前に Hub が済ませ、1 回の論理書き込みの間は同じ接続に他の要求を挟まない（今の broker の 1 ジョブ = 1 書き込みと同じ）。
-- `ItemError::Rejected` は `ConflictingBitWrite`（送る前の拒否）の写し、`ItemError::VerificationFailed` は `BitWriteVerificationFailed`（送ったあとの確認読みの不一致、#902）の写しで、どちらも今と同じく非致命（そのタグだけ Bad、接続は保つ）。確認読みの不一致を「成功」に倒さないための variant で、関門の判断には使わない。Hub の書込み監査は `VerificationFailed` を `uncertain`、`Rejected` を `failed` にする。WIT の `item-error` に `VerificationFailed` 相当はまだ無い（別の PR）。
+- `ItemError::Rejected` は `ConflictingBitWrite`（送る前の拒否）の写し、`ItemError::VerificationFailed` は `BitWriteVerificationFailed`（送ったあとの確認読みの不一致、#902）の写しで、どちらも今と同じく非致命（そのタグだけ Bad、接続は保つ）。確認読みの不一致を「成功」に倒さないための variant で、関門の判断には使わない。Hub の書込み監査は `VerificationFailed` を `uncertain`、`Rejected` を `failed` にする。WIT の `item-error` の `verification-failed` は `VerificationFailed` に写る（2026-10-28、#902。今のゲストは返さない）。
 
 ## 12. オーナー判断（2026-10-19 すべて決定済み）
 

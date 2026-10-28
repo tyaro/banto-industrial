@@ -404,20 +404,41 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Guest main: its wit/driver.wit is the host WIT (#902 added
+          # item-error.verification-failed in guest #47).
+          $canonicalSha = '3b7f0f6120af689fdd7a807cff7837657242c6b2'
+          # Regression pins below predate #47. Their driver.wit (this blob)
+          # lacks that one item-error case, and Wasmtime's component type
+          # check needs the exact variant cases, so they are built with the
+          # guest main driver.wit swapped in. That blob pair differs only in
+          # the item-error line; each pin's code and other WIT files are kept.
+          $legacyDriverWit = '313a79ed545a366c938c9bc2d8f86f7c3ca0141e'
           $sha = '5233d55a4d1c278c473e9c44df608c1423c1a629'
           $guest = Join-Path $env:RUNNER_TEMP 'banto-driver-wasm'
           git clone --quiet https://github.com/tyaro/banto-driver-wasm.git $guest
           if ($LASTEXITCODE -ne 0) { throw 'canonical guest clone failed' }
-          git -C $guest checkout --quiet --detach $sha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $sha) {
-            throw 'canonical guest SHA mismatch'
-          }
           # Compare committed blobs: Windows may check out either worktree with CRLF.
-          $canonicalWit = git -C $guest rev-parse --verify "${sha}:wit/driver.wit"
+          $canonicalWit = git -C $guest rev-parse --verify "${canonicalSha}:wit/driver.wit"
           if ($LASTEXITCODE -ne 0) { throw 'canonical WIT blob lookup failed' }
           $hostWit = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/wit/driver.wit'
           if ($LASTEXITCODE -ne 0) { throw 'host WIT blob lookup failed' }
           if ($canonicalWit -ne $hostWit) { throw 'canonical WIT and host WIT differ' }
+          function Enter-GuestPin([string]$pin, [string]$label) {
+            # --force drops the previous pin's swapped driver.wit.
+            git -C $guest checkout --quiet --force --detach $pin
+            if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $pin) {
+              throw "$label SHA mismatch"
+            }
+            $pinWit = git -C $guest rev-parse --verify "${pin}:wit/driver.wit"
+            if ($LASTEXITCODE -ne 0) { throw "$label WIT blob lookup failed" }
+            if ($pinWit -eq $hostWit) { return }
+            if ($pinWit -ne $legacyDriverWit) { throw "$label read WIT mismatch" }
+            git -C $guest checkout --quiet $canonicalSha -- wit/driver.wit
+            if ($LASTEXITCODE -ne 0) { throw "$label WIT swap failed" }
+            $swapped = git -C $guest rev-parse --verify ':wit/driver.wit'
+            if ($LASTEXITCODE -ne 0 -or $swapped -ne $hostWit) { throw "$label swapped WIT mismatch" }
+          }
+          Enter-GuestPin $sha 'canonical guest'
           $canonicalManifest = git -C $guest rev-parse --verify "${sha}:component/manifest.json"
           if ($LASTEXITCODE -ne 0) { throw 'canonical manifest blob lookup failed' }
           $hostManifest = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/tests/manifest.json'
@@ -484,12 +505,7 @@ jobs:
           # The SLMP guest is reviewed separately. Pin it, and keep this Hub
           # acceptance test on the existing WIT and test-only registry path.
           $slmpSha = '3df89fdb0ed16b08897076495ab7cb29ac2c1b77'
-          git -C $guest checkout --quiet --detach $slmpSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpSha) {
-            throw 'SLMP guest SHA mismatch'
-          }
-          $slmpWit = git -C $guest rev-parse --verify "${slmpSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $slmpWit -ne $hostWit) { throw 'SLMP guest WIT mismatch' }
+          Enter-GuestPin $slmpSha 'SLMP guest'
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'slmp-component/Cargo.toml') --target wasm32-unknown-unknown --locked
           if ($LASTEXITCODE -ne 0) { throw 'SLMP guest build failed' }
           $slmpModule = Join-Path $guest 'slmp-component/target/wasm32-unknown-unknown/debug/banto_slmp_read_component.wasm'
@@ -509,14 +525,7 @@ jobs:
           # The optional write world is accepted only by the controlled test
           # loader. Keep the read-only guest pinned above for regression tests.
           $slmpWriteSha = 'fdb161520019b81a22bc2fec2bc9bf3d837f5bd3'
-          git -C $guest checkout --quiet --detach $slmpWriteSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpWriteSha) {
-            throw 'SLMP write guest SHA mismatch'
-          }
-          $slmpWriteReadWit = git -C $guest rev-parse --verify "${slmpWriteSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $slmpWriteReadWit -ne $hostWit) {
-            throw 'SLMP write guest read WIT mismatch'
-          }
+          Enter-GuestPin $slmpWriteSha 'SLMP write guest'
           $hostWriteWit = git rev-parse --verify 'HEAD:crates/banto-driver-wasm/wit/write-v1.wit'
           if ($LASTEXITCODE -ne 0) { throw 'host SLMP write WIT is missing' }
           $slmpWriteWit = git -C $guest rev-parse --verify "${slmpWriteSha}:wit/write-v1.wit"
@@ -536,14 +545,7 @@ jobs:
           # The range-write guest is pinned separately. Keep the earlier
           # write-v1 component above for single-word compatibility tests.
           $slmpRangeWriteSha = 'c95e7f84e0a3b275298901882a9f6b2512c4f41a'
-          git -C $guest checkout --quiet --detach $slmpRangeWriteSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $slmpRangeWriteSha) {
-            throw 'SLMP range-write guest SHA mismatch'
-          }
-          $slmpRangeReadWit = git -C $guest rev-parse --verify "${slmpRangeWriteSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $slmpRangeReadWit -ne $hostWit) {
-            throw 'SLMP range-write guest read WIT mismatch'
-          }
+          Enter-GuestPin $slmpRangeWriteSha 'SLMP range-write guest'
           $slmpRangeWriteWit = git -C $guest rev-parse --verify "${slmpRangeWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $slmpRangeWriteWit -ne $hostWriteWit) {
             throw 'SLMP range-write guest WIT mismatch'
@@ -568,14 +570,7 @@ jobs:
           # Pin the separately published guest and exercise settings persistence and broker
           # routing with a mock Q endpoint. Never run the ignored live Q test.
           $qTestWriteSha = '33171bbb990859c5a46df44cfafc233e58ba5317'
-          git -C $guest checkout --quiet --detach $qTestWriteSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $qTestWriteSha) {
-            throw 'Q25PRH test-write guest SHA mismatch'
-          }
-          $qTestReadWit = git -C $guest rev-parse --verify "${qTestWriteSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $qTestReadWit -ne $hostWit) {
-            throw 'Q25PRH test-write guest read WIT mismatch'
-          }
+          Enter-GuestPin $qTestWriteSha 'Q25PRH test-write guest'
           $qTestWriteWit = git -C $guest rev-parse --verify "${qTestWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $qTestWriteWit -ne $hostWriteWit) {
             throw 'Q25PRH test-write guest WIT mismatch'
@@ -606,14 +601,7 @@ jobs:
           # This job exercises only loopback PLCs and temporary TestApp state;
           # its ignored live-PLC fixtures are not selected.
           $normalWriteSha = 'ce6513a127d956ca00508f8d47480567c73e4a49'
-          git -C $guest checkout --quiet --detach $normalWriteSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $normalWriteSha) {
-            throw 'normal SLMP write guest SHA mismatch'
-          }
-          $normalReadWit = git -C $guest rev-parse --verify "${normalWriteSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $normalReadWit -ne $hostWit) {
-            throw 'normal SLMP write guest read WIT mismatch'
-          }
+          Enter-GuestPin $normalWriteSha 'normal SLMP write guest'
           $normalWriteWit = git -C $guest rev-parse --verify "${normalWriteSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $normalWriteWit -ne $hostWriteWit) {
             throw 'normal SLMP write guest WIT mismatch'
@@ -638,14 +626,7 @@ jobs:
           # earlier D-only guest regression above, then build this revision
           # independently instead of relying on a developer's local component.
           $commonDwSha = '532e0ba1f0b91a67422e33dac72e9edbb7c3fe0e'
-          git -C $guest checkout --quiet --detach $commonDwSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $commonDwSha) {
-            throw 'common D/W SLMP guest SHA mismatch'
-          }
-          $commonDwReadWit = git -C $guest rev-parse --verify "${commonDwSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $commonDwReadWit -ne $hostWit) {
-            throw 'common D/W SLMP guest read WIT mismatch'
-          }
+          Enter-GuestPin $commonDwSha 'common D/W SLMP guest'
           $commonDwWriteWit = git -C $guest rev-parse --verify "${commonDwSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $commonDwWriteWit -ne $hostWriteWit) {
             throw 'common D/W SLMP guest write WIT mismatch'
@@ -676,11 +657,8 @@ jobs:
           # Optional diagnostics use a new world. The existing read/write
           # worlds and their pinned regression guests above remain unchanged.
           $diagnosticSha = 'f20766041ed75de1f6102c01dc94151d48785d5e'
-          git -C $guest checkout --quiet --detach $diagnosticSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $diagnosticSha) {
-            throw 'diagnostic SLMP guest SHA mismatch'
-          }
-          foreach ($wit in @('driver.wit', 'write-v1.wit', 'diagnostics-v1.wit')) {
+          Enter-GuestPin $diagnosticSha 'diagnostic SLMP guest'
+          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${diagnosticSha}:wit/$wit"
             $hostBlob = git rev-parse --verify "HEAD:crates/banto-driver-wasm/wit/$wit"
             if ($LASTEXITCODE -ne 0 -or $guestBlob -ne $hostBlob) {
@@ -707,15 +685,13 @@ jobs:
             throw 'diagnostic SLMP Hub tests did not all run'
           }
           # Keep the earlier diagnostic and read/write guests above for
-          # compatibility. Build merged SLMP #44 separately for Hub acceptance.
+          # compatibility. Build guest main (SLMP code as of #44, WIT as of #47)
+          # separately for Hub acceptance.
           # #43 (53f7fc1, included here) leaves bit tags proven Outside out of the
           # read plan; the earlier guests above still read them one by one.
-          $newSlmpSha = 'c9c3d83d06416c37a97934ab84f935bc38e55d0d'
-          git -C $guest checkout --quiet --detach $newSlmpSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $newSlmpSha) {
-            throw 'new SLMP guest SHA mismatch'
-          }
-          foreach ($wit in @('driver.wit', 'write-v1.wit', 'diagnostics-v1.wit')) {
+          $newSlmpSha = $canonicalSha
+          Enter-GuestPin $newSlmpSha 'new SLMP guest'
+          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
             $hostBlob = git rev-parse --verify "HEAD:crates/banto-driver-wasm/wit/$wit"
             if ($LASTEXITCODE -ne 0 -or $guestBlob -ne $hostBlob) {
@@ -751,14 +727,7 @@ jobs:
           # Stage-2 numeric reads use the separately reviewed guest revision.
           # Keep the older guest revisions above for read and write regressions.
           $numericSha = '9ffa939ffc3551325551b28e4993ec62b8ddc34d'
-          git -C $guest checkout --quiet --detach $numericSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $numericSha) {
-            throw 'numeric guest SHA mismatch'
-          }
-          $numericWit = git -C $guest rev-parse --verify "${numericSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $numericWit -ne $hostWit) {
-            throw 'numeric guest read WIT mismatch'
-          }
+          Enter-GuestPin $numericSha 'numeric guest'
           $env:BANTO_STAGE2_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
           if ($LASTEXITCODE -ne 0) { throw 'numeric Modbus guest build failed' }
@@ -795,14 +764,7 @@ jobs:
           # FC4 and SLMP W use a separately reviewed read-only guest revision.
           # Keep the stage-2 and write revisions above pinned for regressions.
           $fc4WSha = '290648da33895a707abcaaafeb23bd0f05d5b828'
-          git -C $guest checkout --quiet --detach $fc4WSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $fc4WSha) {
-            throw 'FC4/W guest SHA mismatch'
-          }
-          $fc4WWit = git -C $guest rev-parse --verify "${fc4WSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $fc4WWit -ne $hostWit) {
-            throw 'FC4/W guest read WIT mismatch'
-          }
+          Enter-GuestPin $fc4WSha 'FC4/W guest'
           $env:BANTO_LOCAL_FC4_MANIFEST = Join-Path $guest 'component/manifest.json'
           cargo +1.98.1 build --manifest-path (Join-Path $guest 'component/Cargo.toml') --target wasm32-unknown-unknown --locked
           if ($LASTEXITCODE -ne 0) { throw 'FC4 Modbus guest build failed' }
@@ -837,14 +799,10 @@ jobs:
             throw 'FC4/W Hub tests did not both run'
           }
           # Modbus FC1/2/3/4 and gated FC5/16/22 join uses the exact reviewed
-          # guest package manifest and the optional write world.
-          $modbusJoinSha = 'c9c3d83d06416c37a97934ab84f935bc38e55d0d'
-          git -C $guest checkout --quiet --detach $modbusJoinSha
-          if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $modbusJoinSha) {
-            throw 'Modbus join guest SHA mismatch'
-          }
-          $modbusReadWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/driver.wit"
-          if ($LASTEXITCODE -ne 0 -or $modbusReadWit -ne $hostWit) { throw 'Modbus join read WIT mismatch' }
+          # guest package manifest and the optional write world (guest main:
+          # Modbus code as of #44, WIT as of #47).
+          $modbusJoinSha = $canonicalSha
+          Enter-GuestPin $modbusJoinSha 'Modbus join guest'
           $modbusWriteWit = git -C $guest rev-parse --verify "${modbusJoinSha}:wit/write-v1.wit"
           if ($LASTEXITCODE -ne 0 -or $modbusWriteWit -ne $hostWriteWit) { throw 'Modbus join write WIT mismatch' }
           $env:BANTO_MODBUS_MANIFEST = Join-Path $guest 'component/manifest.json'

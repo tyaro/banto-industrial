@@ -4,7 +4,7 @@ interface types {
   record setting { key: string, value: string }
   variant value { %bool(bool), int(s64), uint(u64), float(f64), bytes(list<u8>) }
   record device-error { code: u32, message: string }
-  variant item-error { device(device-error), unsupported(string), rejected(string) }
+  variant item-error { device(device-error), unsupported(string), rejected(string), verification-failed(string) }
   variant fatal-error { framing(string), protocol(string), invalid-config(string) }
   record tag-spec {
     address: string,

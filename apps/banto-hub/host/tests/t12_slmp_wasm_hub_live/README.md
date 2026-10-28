@@ -3,7 +3,8 @@
 この試験はテスト機 R `192.168.11.200:3109` の `D3010/u16` 単点だけを対象とする。実機ケースは `#[ignore]` と明示 opt-in で保護し、通常起動の WASM 登録や本番鍵・設定は変更しない。
 
 - guest: `tyaro/banto-driver-wasm` の `fdb161520019b81a22bc2fec2bc9bf3d837f5bd3`
-- 検証済み component SHA-256: `3cb4451f712fc4c0de3ab83e85f9bb8aefde6fa26b5de5a8b09971748c9d714e`
+- 検証済み component SHA-256: `3cb4451f712fc4c0de3ab83e85f9bb8aefde6fa26b5de5a8b09971748c9d714e`（2026-10-25 の実機結果のもの）
+- 2026-10-28（#902）以降のホストは `item-error` に `verification-failed` を持つ WIT を使うため、この guest をそのまま作った component は読み込めない。作り直すときは CI と同じく、guest を `fdb16152…` に checkout したあと `git checkout 3b7f0f6120af689fdd7a807cff7837657242c6b2 -- wit/driver.wit` で `driver.wit` だけを差し替えてから作る。その component の SHA-256 は上の値と変わる（再試験は未実施）。
 - 直接試験では実 transport の宛先と送信前のフレームを限定する。Hub API 試験では一時 DB に登録する接続・タグの入力を登録前に検査し、保存後の接続先を broker 起動前に再確認する。Hub の60秒窓の書込みレート制限は全体・タグ単位とも2回に設定する。
 - Hub API 試験の一時キーはこのタグの read/write scope のみ、有効期限10分。外部 listener は立てず、成功時には revoke する。
 

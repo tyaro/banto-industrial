@@ -914,6 +914,18 @@ fn api_write_item_error(value: write_types::ItemError) -> ItemError {
         }
         write_types::ItemError::Unsupported(m) => ItemError::Unsupported(m),
         write_types::ItemError::Rejected(m) => ItemError::Rejected(m),
+        write_types::ItemError::VerificationFailed(m) => ItemError::VerificationFailed(m),
+    }
+}
+
+/// Maps a read-world item error. Kept next to [`api_write_item_error`] so a
+/// new WIT case cannot be mapped in one world and forgotten in the other.
+fn api_read_item_error(value: types::ItemError) -> ItemError {
+    match value {
+        types::ItemError::Device(e) => ItemError::Device(api::DeviceError::new(e.code, e.message)),
+        types::ItemError::Unsupported(m) => ItemError::Unsupported(m),
+        types::ItemError::Rejected(m) => ItemError::Rejected(m),
+        types::ItemError::VerificationFailed(m) => ItemError::VerificationFailed(m),
     }
 }
 
@@ -1369,11 +1381,7 @@ impl FrameConnection for WasmConnection {
                         })?;
                     checked_value(&spec.kind, value).map(Ok)
                 }
-                Err(types::ItemError::Device(e)) => Ok(Err(ItemError::Device(
-                    api::DeviceError::new(e.code, e.message),
-                ))),
-                Err(types::ItemError::Unsupported(m)) => Ok(Err(ItemError::Unsupported(m))),
-                Err(types::ItemError::Rejected(m)) => Ok(Err(ItemError::Rejected(m))),
+                Err(e) => Ok(Err(api_read_item_error(e))),
             })
             .collect()
     }
@@ -1401,6 +1409,28 @@ impl Drop for WasmConnection {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn verification_failed_maps_from_both_wit_worlds() {
+        // #902: the WIT `verification-failed` case is a sent-then-mismatched
+        // read-back, not a pre-send rejection. Both worlds must keep it apart.
+        assert_eq!(
+            api_read_item_error(types::ItemError::VerificationFailed("d".into())),
+            ItemError::VerificationFailed("d".into())
+        );
+        assert_eq!(
+            api_write_item_error(write_types::ItemError::VerificationFailed("d".into())),
+            ItemError::VerificationFailed("d".into())
+        );
+        assert_eq!(
+            api_read_item_error(types::ItemError::Rejected("r".into())),
+            ItemError::Rejected("r".into())
+        );
+        assert_eq!(
+            api_write_item_error(write_types::ItemError::Rejected("r".into())),
+            ItemError::Rejected("r".into())
+        );
+    }
 
     fn operational_item(index: u64, value: api::Value) -> WriteItem {
         let id = DriverId::new("slmp-wasm-write").unwrap();

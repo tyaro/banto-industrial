@@ -19,6 +19,9 @@ const HOST: &str = "192.168.11.200";
 const PORT: u16 = 3109;
 const MANIFEST: &[u8] = include_bytes!("t12_slmp_wasm_write/manifest.json");
 // Built locally from the reviewed fdb161520019b81a22bc2fec2bc9bf3d837f5bd3 guest.
+// #902: that guest's driver.wit predates item-error.verification-failed. Rebuild it after
+// `git checkout 3b7f0f6120af689fdd7a807cff7837657242c6b2 -- wit/driver.wit` and update
+// this hash at the next live run.
 const COMPONENT_SHA256: [u8; 32] = [
     0x3c, 0xb4, 0x45, 0x1f, 0x71, 0x2f, 0xc4, 0xc0, 0xde, 0x3a, 0xb8, 0x3e, 0x85, 0xf9, 0xbb, 0x8a,
     0xef, 0xde, 0x6f, 0xa2, 0x6b, 0x5d, 0xe5, 0xa8, 0xb0, 0x99, 0x71, 0x74, 0x8c, 0x9d, 0x71, 0x4e,
