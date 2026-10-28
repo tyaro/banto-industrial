@@ -150,7 +150,10 @@ pub(super) fn schema_fields() -> [SettingField; 2] {
     );
     allowlist.default = Some(SettingValue::Text(String::new()));
     allowlist.group = FieldGroup::Advanced;
-    allowlist.help = Some("Host allowlist for complete FC5 coil or FC16 holding spans.".into());
+    allowlist.help = Some(
+        "Host allowlist for complete FC5 coil or FC16 holding spans, or the word of one FC22 holding register bit."
+            .into(),
+    );
     [mode, allowlist]
 }
 
@@ -201,6 +204,11 @@ pub(super) fn preflight(
             items.len()
         ])
     };
+    if let [item] = items {
+        if item.spec.address.bit.is_some() {
+            return register_bit(item, driver_id, policy).ok_or_else(refused);
+        }
+    }
     let first = items.first().ok_or_else(refused)?;
     let (area, start) = parse_reference(&first.spec.address.canonical).map_err(|_| refused())?;
     if area == Area::Coil && items.len() != 1 {
@@ -299,6 +307,43 @@ pub(super) fn preflight(
         return Err(refused());
     }
     Ok(checked)
+}
+
+/// One holding register bit `4xxxxx.N` written alone (the guest sends one
+/// FC22 mask write that changes only that bit). The host permission must
+/// cover the whole word. Input-register bits, non-Bool values and bits
+/// mixed into a multi-item request never reach the guest.
+fn register_bit(
+    item: &WriteItem,
+    driver_id: &DriverId,
+    policy: &Policy,
+) -> Option<Vec<write::WriteItem>> {
+    let address = &item.spec.address;
+    let bit = address.bit.filter(|bit| *bit <= 15)?;
+    let (word, bit_text) = address.canonical.split_once('.')?;
+    let (area, index) = parse_reference(word).ok()?;
+    let api::Value::Bit(value) = item.value else {
+        return None;
+    };
+    (area == Area::Holding
+        && item.spec.kind == TagKind::numeric(DataType::Bit)
+        && bit_text == bit.to_string()
+        && address.driver == *driver_id
+        && address.area == area.name()
+        && address.writable_area
+        && address.index == Some(u64::from(index))
+        && address.word_count == 1
+        && policy.allows(area, index, index))
+    .then(|| {
+        vec![write::WriteItem {
+            spec: write_types::TagSpec {
+                address: address.canonical.clone(),
+                data_type: "bool".into(),
+                string_words: None,
+            },
+            value: write_types::Value::Bool(value),
+        }]
+    })
 }
 
 #[cfg(test)]
@@ -415,6 +460,109 @@ mod tests {
         );
         bad.spec.address.word_count = 1;
         assert!(preflight(&[bad], &id, &gate).is_err());
+    }
+
+    fn bit_item(reference: &str, area: &str, index: u64, bit: u8, value: api::Value) -> WriteItem {
+        let mut item = item(reference, area, index, DataType::Bit, value);
+        item.spec.address = item.spec.address.with_bit(bit);
+        item
+    }
+
+    #[test]
+    fn one_holding_register_bit_passes_only_inside_the_host_word_allowlist() {
+        let id = DriverId::new("modbus-fc3-wasm").unwrap();
+        let gate = policy("enabled", "400001-400010");
+        for value in [false, true] {
+            let checked = preflight(
+                &[bit_item(
+                    "400010.15",
+                    "holding_register",
+                    9,
+                    15,
+                    api::Value::Bit(value),
+                )],
+                &id,
+                &gate,
+            )
+            .unwrap();
+            assert_eq!(checked.len(), 1);
+            assert_eq!(checked[0].spec.address, "400010.15");
+            assert_eq!(checked[0].spec.data_type, "bool");
+            assert!(matches!(checked[0].value, write_types::Value::Bool(v) if v == value));
+        }
+        let ok = bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true));
+        assert!(preflight(std::slice::from_ref(&ok), &id, &gate).is_ok());
+        assert!(preflight(
+            std::slice::from_ref(&ok),
+            &id,
+            &Policy::parse(&Settings::new()).unwrap()
+        )
+        .is_err());
+        for bad in [
+            vec![bit_item(
+                "400011.0",
+                "holding_register",
+                10,
+                0,
+                api::Value::Bit(true),
+            )],
+            vec![bit_item(
+                "300001.0",
+                "input_register",
+                0,
+                0,
+                api::Value::Bit(true),
+            )],
+            vec![bit_item(
+                "400001.0",
+                "holding_register",
+                0,
+                0,
+                api::Value::F64(1.0),
+            )],
+            vec![bit_item(
+                "400001.16",
+                "holding_register",
+                0,
+                16,
+                api::Value::Bit(true),
+            )],
+            vec![
+                ok.clone(),
+                bit_item("400001.1", "holding_register", 0, 1, api::Value::Bit(true)),
+            ],
+            vec![
+                ok.clone(),
+                item(
+                    "400002",
+                    "holding_register",
+                    1,
+                    DataType::U16,
+                    api::Value::F64(1.0),
+                ),
+            ],
+        ] {
+            assert!(preflight(&bad, &id, &gate).is_err(), "{bad:?}");
+        }
+        let mut wrong_bit = ok.clone();
+        wrong_bit.spec.address = wrong_bit.spec.address.with_bit(1);
+        assert!(preflight(&[wrong_bit], &id, &gate).is_err());
+        let mut wrong_index = ok.clone();
+        wrong_index.spec.address = wrong_index.spec.address.with_index(1);
+        assert!(preflight(&[wrong_index], &id, &gate).is_err());
+        let mut other_driver = ok.clone();
+        other_driver.spec.address.driver = DriverId::new("other-driver").unwrap();
+        assert!(preflight(&[other_driver], &id, &gate).is_err());
+        let mut read_only_area = ok.clone();
+        read_only_area.spec.address.writable_area = false;
+        assert!(preflight(&[read_only_area], &id, &gate).is_err());
+        let mut padded_bit = bit_item("400001.03", "holding_register", 0, 3, api::Value::Bit(true));
+        assert!(preflight(std::slice::from_ref(&padded_bit), &id, &gate).is_err());
+        padded_bit.spec.address.canonical = "400001.3".into();
+        assert!(preflight(&[padded_bit], &id, &gate).is_ok());
+        let mut mismatched_bit = ok;
+        mismatched_bit.spec.address.canonical = "400001.1".into();
+        assert!(preflight(&[mismatched_bit], &id, &gate).is_err());
     }
 
     #[test]

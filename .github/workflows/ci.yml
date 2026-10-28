@@ -836,9 +836,9 @@ jobs:
           if (-not (Select-String -Path $fc4WHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'FC4/W Hub tests did not both run'
           }
-          # Modbus FC1/2/3/4 and gated FC5/16 join uses the exact reviewed
+          # Modbus FC1/2/3/4 and gated FC5/16/22 join uses the exact reviewed
           # guest package manifest and the optional write world.
-          $modbusJoinSha = '02a92645cc9a352e61c3f55ce58faab1fd7e8895'
+          $modbusJoinSha = 'c9c3d83d06416c37a97934ab84f935bc38e55d0d'
           git -C $guest checkout --quiet --detach $modbusJoinSha
           if ($LASTEXITCODE -ne 0 -or (git -C $guest rev-parse HEAD).Trim() -ne $modbusJoinSha) {
             throw 'Modbus join guest SHA mismatch'
@@ -861,14 +861,14 @@ jobs:
           $modbusJoinLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-join-test.txt'
           cargo +1.98.1 test -p banto-driver-wasm --test modbus_join --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusJoinLog
           if ($LASTEXITCODE -ne 0) { throw 'Modbus join adapter tests failed' }
-          if (-not (Select-String -Path $modbusJoinLog -Pattern '^test result: ok\. 4 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $modbusJoinLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus join adapter tests did not all run'
           }
           $modbusHubLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-hub-join-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test modbus_wasm_join_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusHubLog
           if ($LASTEXITCODE -ne 0) { throw 'Modbus Hub join tests failed' }
-          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
-            throw 'Modbus Hub join tests did not both run'
+          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'Modbus Hub join tests did not all run'
           }
       # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
       - name: Upload cargo timings
