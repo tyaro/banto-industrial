@@ -1,7 +1,7 @@
 # banto-hub ドライバプラグイン設計（WASM）
 
 作成日: 2026-10-19
-状態: **段階的な限定実装中（2026-10-25。2026-10-28（#899）に FC22 の無応答の失敗文言へ「FC22 非対応の可能性」のヒントを足した（動きは変えない）。2026-10-28 に Modbus WASM の結合試験の固定版を FC22 の書込みへ更新、模擬のみ）**。2026-10-19 の実装保留判断の後、受け皿と P0/P1 の一部（U16/U32 の明示登録、broker 収集・即時読取り）を実装した。非 Modbus アドレスの実 component 試験を追加した。通常起動の明示選択と署名再検証は限定実装中。実運用の信頼鍵・保護配置の設定、導入・更新は未完了。本書全体の承認を意味せず、§2 の D1〜D6 は当初の方向・§11 は未決事項として扱う。着手する場合も一括移行はせず、組み込みドライバとの併用期間を経て判断する。§2 の D1〜D6 は 2026-10-19 のオーナーとの議論で出た方向で、**本書の承認をもって決定**とする（承認後に日付付きの決定記録へ移す）。§11 は未決事項、§12 は破壊的変更を許す場合の構成案（2026-10-19 検討・未決定。ただし外部 DB の取り込み口 `push` の形は external-db-design §9.5 でオーナー決定）（Q11 は 2026-10-19 オーナー決定で解決済み）。2026-10-19 に上位モデルの監査を受け、指摘（現状記述の誤り・broker 構造・WIT の読み取り単位・同梱 UI と展開経路の安全・レジストリ変更）を反映済み。同日の Codex レビュー（ハンドシェイクを応答依存で進める・有効化前の preflight・fingerprint に内容のダイジェスト・同梱 UI の配信の認証）と、オーナーのレビュー（プラグイン固有のアドレスを broker まで運ぶ経路 §3.2、ハンドシェイクの拒否応答）も反映済み。同日、§6.2 の WIT を R1 の詳細設計 [banto-driver-api-design.md](banto-driver-api-design.md) §9.2 に合わせて改訂し、§12.6 に「R1 の時点の CI の姿」を補足した。
+状態: **段階的な限定実装中（2026-10-25。2026-10-28（#899）に FC22 の無応答の失敗文言へ「FC22 非対応の可能性」のヒントを足した（動きは変えない）。2026-10-28 に Modbus WASM の結合試験の固定版を FC22 の書込みへ更新、模擬のみ。2026-10-28（#902）に WIT の `item-error` へ `verification-failed` を足し、ホストの WIT とゲストの固定を guest main `3b7f0f6` に揃えた（今のゲストはこの値を返さない））**。2026-10-19 の実装保留判断の後、受け皿と P0/P1 の一部（U16/U32 の明示登録、broker 収集・即時読取り）を実装した。非 Modbus アドレスの実 component 試験を追加した。通常起動の明示選択と署名再検証は限定実装中。実運用の信頼鍵・保護配置の設定、導入・更新は未完了。本書全体の承認を意味せず、§2 の D1〜D6 は当初の方向・§11 は未決事項として扱う。着手する場合も一括移行はせず、組み込みドライバとの併用期間を経て判断する。§2 の D1〜D6 は 2026-10-19 のオーナーとの議論で出た方向で、**本書の承認をもって決定**とする（承認後に日付付きの決定記録へ移す）。§11 は未決事項、§12 は破壊的変更を許す場合の構成案（2026-10-19 検討・未決定。ただし外部 DB の取り込み口 `push` の形は external-db-design §9.5 でオーナー決定）（Q11 は 2026-10-19 オーナー決定で解決済み）。2026-10-19 に上位モデルの監査を受け、指摘（現状記述の誤り・broker 構造・WIT の読み取り単位・同梱 UI と展開経路の安全・レジストリ変更）を反映済み。同日の Codex レビュー（ハンドシェイクを応答依存で進める・有効化前の preflight・fingerprint に内容のダイジェスト・同梱 UI の配信の認証）と、オーナーのレビュー（プラグイン固有のアドレスを broker まで運ぶ経路 §3.2、ハンドシェイクの拒否応答）も反映済み。同日、§6.2 の WIT を R1 の詳細設計 [banto-driver-api-design.md](banto-driver-api-design.md) §9.2 に合わせて改訂し、§12.6 に「R1 の時点の CI の姿」を補足した。
 対象: PLC ドライバ（メーカー固有のプロトコルと登録 UI）を、banto-hub 本体を再ビルド・再リリースせずに追加・更新できるようにする。
 関連: [tag-server-design.md](tag-server-design.md) §3.4（PLC 通信ドライバとの関係）・§3.4.1（新しい PLC ドライバの置き場所、#438）・§4（タグ空間のセマンティクス）・§6（書き込み）、
 [banto-hub-t17-design.md](banto-hub-t17-design.md)（サービス・profile・UAC）、
@@ -165,9 +165,10 @@ interface types {
   record setting { key: string, value: string }
   variant value { %bool(bool), int(s64), uint(u64), float(f64), bytes(list<u8>) }
   // 非致命（そのタグだけ Bad）。これ以外はすべて接続致命（§6.1）。
-  // rejected = プラグイン自身が断った・確認で不一致を見つけた（同じワードの同じビットへ true / false が同時、
-  // RMW の確認読みの不一致）。機器の拒否（device）でも設定の不整合（unsupported）でもない非致命
-  variant item-error { device(device-error), unsupported(string), rejected(string) }
+  // rejected = プラグイン自身が送る前に断った（同じワードの同じビットへ true / false が同時）。
+  // verification-failed = 書込みを送ったあとの RMW の確認読みの不一致（機器には効いているかもしれない。2026-10-28、#902）。
+  // どちらも機器の拒否（device）でも設定の不整合（unsupported）でもない非致命
+  variant item-error { device(device-error), unsupported(string), rejected(string), verification-failed(string) }
   record device-error { code: u32, message: string }
   variant fatal-error { framing(string), protocol(string), invalid-config(string) }
   // 読み書きの単位。現行の ReadRequest / StringReadRequest に合わせる
@@ -412,6 +413,8 @@ P1 の先行範囲として、`banto-hub` ホストの起動時に `BANTO_WASM_P
 2026-10-25 時点で P4 のうち `write-v1` の隔離テスト用登録と、SLMP R の `D3010/u16` 単点について直接経路・Hub REST API + broker 経路の実機試験を行った（[試験記録](../apps/banto-hub/host/tests/t12_slmp_wasm_hub_live/README.md)）。通常の `WasmDriver::load` は書込みマニフェストを拒否したまま。任意のプラグインやレシピ書込み、通常起動での登録・本番鍵配布は、この限定試験では確認していないため、P4 の完了とは扱わない。
 
 2026-10-28: Modbus WASM の結合試験（CI の `modbus_join` と `t12_connection_test` の `modbus_wasm_join_test::`）の固定版を tyaro/banto-driver-wasm #44（`c9c3d83d06416c37a97934ab84f935bc38e55d0d`、manifest の `version` 0.4.0 → 0.5.0、`settingsVersion` は 1 のまま）へ上げた。それまでの固定版 `02a92645` は `4xxxx.N` / `3xxxx.N` のレジスタのビットの書込みを送る前に断っていた（#884 の試験はこの拒否を確かめていた）。#44 では `4xxxx.N` を 1 点ずつ FC22 Mask Write Register の 1 要求で書く（AND マスク `!(1 << N)`、OR マスクは set で `1 << N`・clear で `0`。読んでから書く手順は無い）。Hub 側の運用書込みゲート（`crates/banto-driver-wasm/src/modbus_write.rs`、保存済みの `modbus_operational_write_mode` / `_allowlist`）も、単独の保持レジスタのビット 1 点だけを、その語が許可範囲に入るときに限って guest へ渡すように広げた（入力レジスタのビット・数値との混在・2 点以上・Bool 以外は従来どおり guest へ渡さない）。模擬サーバで確かめたのは次のとおり: 3 つのゲート（Hub の保存済み方針、書込み受付と API キーの書込み権限、guest の `write_mode=enabled` と保持レジスタの `write_allowlist`）を通ったときだけ FC22 の set・clear が正確なマスクで届き監査が `ok`、どちらかのゲートが断れば機器へ何も届かない、機器の例外応答（FC22 非対応の例外コード 1）はその項目だけの失敗（REST は 502 `write_failed`、監査は `failed`）で接続と他の項目は続く、ACK のマスクが要求と違えば結果は未確定として 502 `write_failed`・監査 `failed` になり、その接続は切られ、同じ要求は送り直さない。実機の確認（2026-10-28、アダプタの層。Hub の REST・preflight は通していない）: iQ-R（R08ENCPU）の Modbus/TCP は保持レジスタ 400001 → D0 の既定の対応で、FC22 を受け付けた。安全範囲の D の 2 語（元の値が 0 の語と、ビットが立っている語）で bit0 を立てて落とし、SLMP と FC3 の両方で変わったのはそのビットだけだと確かめ、元の値に戻した。Modbus のシミュレータ（ModbusSlave）では、入力レジスタのビット（3xxxx.N）の Bool の読取りが生の値と一致した。3xxxx.N への書込みは送る前に断られ、入力領域を許可範囲に入れる設定はゲストと Hub の両方で断られた。このシミュレータは FC22 にも未定義の FC にも応答しなかった（例外を返さない）。そのため FC22 はバッチ全体の `Timeout` になり、セッションは破棄された。**FC22 の例外応答を項目ごとの `Device` にする経路は、実機では未確認**（模擬試験だけ）。2026-10-28（#899、オーナー決定: 動きは変えない）: 保持レジスタのビット（FC22）の書込みが機器の無応答（`Timeout`）で失敗したときは、Hub が失敗の文言（応答と監査の `detail`）に「機器が FC22 に対応していない可能性があります」というヒントを添える。例外応答（`Device`）や他の失敗、ワード・コイルの書込みには付けない。監査は `uncertain`、HTTP は 502 `write_failed` のまま。本番での書込みの有効化は別途オーナーの承認が要る。
+
+2026-10-28（#902）: WIT の `item-error` に `verification-failed(string)` を足した（tyaro/banto-driver-wasm #47、guest main `3b7f0f6120af689fdd7a807cff7837657242c6b2`）。ホストの `driver.wit` はこれとバイト単位で同じ。WASM のアダプタはこれを `ItemError::VerificationFailed` に写し、Hub の書込み監査は `uncertain` にする（今のゲストはこの値を返さない）。Wasmtime の component の型検査は variant の値が完全に一致することを求めるので、#47 より前の WIT で作ったゲストはこのホストに読み込めない（破壊的変更）。CI の結合試験は、#44 を固定していた SLMP の受入れと Modbus の結合を guest main `3b7f0f6` へ移した（コードは #44 と同じ）。それより前の回帰用の固定 10 か所（Modbus FC3・SLMP 読取り・SLMP 単点書込み・範囲書込み・Q25PRH・D 専用・D/W 共通・診断・数値の段 2・FC4/W）は振舞いを固定したまま、`driver.wit` だけを guest main のものに差し替えて作る（差し替える前の blob が `313a79ed` であることを確かめる。差は `item-error` の 1 行だけ）。
 
 ## 11. 未決事項（オーナー判断）
 

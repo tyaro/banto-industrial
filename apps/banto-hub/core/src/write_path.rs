@@ -169,7 +169,7 @@
 //! | `ItemError::Device` | `failed` | PLC が完全な応答でエラーを返した |
 //! | `ItemError::Unsupported` | `failed` | 送る前の組み合わせの拒否 |
 //! | `ItemError::Rejected` | `failed` | ドライバの送る前の拒否(同じビットに true と false など) |
-//! | `ItemError::VerificationFailed` | `uncertain` | 送ったあとの RMW の確認読みの不一致(#902)。機器には効いているかもしれない。WASM ゲストはこの値をまだ返せない(WIT に無い) |
+//! | `ItemError::VerificationFailed` | `uncertain` | 送ったあとの RMW の確認読みの不一致(#902)。機器には効いているかもしれない。WASM ゲストの `verification-failed` もこれに写る(今のゲストは返さない) |
 //! | 将来の `ItemError` の値 | `uncertain` | 意味が分からない値は「効いていない」と言い切らない |
 //!
 //! HTTP/gRPC の応答([`WriteRejection`])は変えていない: どちらも
