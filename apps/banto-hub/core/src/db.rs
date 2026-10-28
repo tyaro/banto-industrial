@@ -35,6 +35,10 @@
 //!   それぞれを扱うモジュールの doc 参照。上流の番号と重ならないよう 0101 から
 //!   始める。今後の列追加は新しい番号のファイルで足す（既存のファイルは
 //!   書き換えない）。
+//! - `0107_hub_write_audit_uncertain.sql`（#898、2026-10-28）は、その規則で
+//!   `hub_write_audit.result` の CHECK に `uncertain` を足したもの。SQLite は
+//!   CHECK を ALTER で変えられないので、表を作り直して行を写す（テスト
+//!   `an_existing_audit_row_survives_the_0107_rebuild`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -359,7 +363,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107]
         );
     }
 
@@ -487,7 +491,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
@@ -503,6 +507,107 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(index, 1);
+        pool.close().await;
+    }
+
+    /// #898: `0107` は `hub_write_audit` を作り直して CHECK に `uncertain` を
+    /// 足す。0106 までを適用済みの DB（＝今ある DB）が次の起動で 0107 を取り、
+    /// 既存の行と AUTOINCREMENT の続き番号と索引が残ること、新しい CHECK が
+    /// `uncertain` を受け、知らない値は今までどおり断ることを確かめる。
+    #[tokio::test]
+    async fn an_existing_audit_row_survives_the_0107_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_set = dir.path().join("migrations-before-0107");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0107_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        let insert = "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot, tag_id, \
+             external_name_snapshot, value_requested, value_requested_text, action, result, \
+             detail) VALUES (1, 'k', 10, 'line.t', 7.0, NULL, 'write', ?, 'd')";
+        for result in ["ok", "failed"] {
+            sqlx::query(insert)
+                .bind(result)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert!(
+            sqlx::query(insert)
+                .bind("uncertain")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "0103's CHECK must not know 'uncertain' yet"
+        );
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0107 on the next startup");
+        let rows: Vec<(i64, String, Option<f64>, Option<String>)> = sqlx::query_as(
+            "SELECT id, result, value_requested, detail FROM hub_write_audit ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "ok".to_string(), Some(7.0), Some("d".to_string())),
+                (2, "failed".to_string(), Some(7.0), Some("d".to_string())),
+            ]
+        );
+        sqlx::query(insert)
+            .bind("uncertain")
+            .execute(&pool)
+            .await
+            .expect("the rebuilt CHECK accepts 'uncertain'");
+        let next: i64 = sqlx::query_scalar("SELECT MAX(id) FROM hub_write_audit")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(next, 3, "AUTOINCREMENT continues after the copied ids");
+        assert!(
+            sqlx::query(insert)
+                .bind("maybe")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "an unknown result is still refused"
+        );
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' \
+             AND tbl_name = 'hub_write_audit' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            vec!["idx_hub_write_audit_tag", "idx_hub_write_audit_ts"]
+        );
+        let leftover: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'hub_write_audit_new'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(leftover, 0);
         pool.close().await;
     }
 

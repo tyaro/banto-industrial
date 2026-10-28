@@ -847,7 +847,7 @@ async fn register_bit_writes_refused_by_either_gate_never_reach_the_device() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires the pinned Modbus WASM package files"]
-async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_failed_without_replay() {
+async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_uncertain_without_replay() {
     let fixture = Fixture::start().await;
     let app = super::test_app_with_operational_write_manifest(
         "t12-modbus-fc22-errors",
@@ -914,7 +914,8 @@ async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_failed_without_replay
 
     // An acknowledgement with a different OR mask leaves the outcome unknown:
     // the write fails, the connection is dropped, and the request is not
-    // replayed on that or the next connection.
+    // replayed on that or the next connection. The audit keeps it apart from
+    // the device's exception above (#898): `uncertain`, not `failed`.
     fixture.fc22.store(FC22_BAD_MASK, Ordering::SeqCst);
     let result = post(&app, &key, bit, false).await;
     assert_eq!(result.0, super::StatusCode::BAD_GATEWAY, "{:?}", result.1);
@@ -926,7 +927,7 @@ async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_failed_without_replay
     );
     let rows = audit_rows(&app, ids[0]).await;
     assert_eq!(rows.len(), 2, "{rows:?}");
-    assert_eq!(rows[1]["result"], "failed", "{rows:?}");
+    assert_eq!(rows[1]["result"], "uncertain", "{rows:?}");
     assert_eq!(rows[1]["valueRequested"].as_f64(), Some(0.0), "{rows:?}");
     let audited: serde_json::Value =
         serde_json::from_str(rows[1]["detail"].as_str().unwrap()).unwrap();

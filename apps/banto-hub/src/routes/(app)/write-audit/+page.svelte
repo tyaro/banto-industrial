@@ -24,6 +24,7 @@
 	const resultLabels: Record<string, string> = {
 		ok: '成功',
 		failed: '失敗',
+		uncertain: '結果不明',
 		suppressed_disabled: '抑制（受付off）',
 		suppressed_rate_limited: '抑制（レート制限）'
 	};
@@ -46,6 +47,11 @@
 	let totalCount = $state(0);
 	let loading = $state(false);
 	let loadedOffset = $state(0);
+	/**
+	 * 結果での絞り込み（#898）。空文字は「すべて」。`uncertain`（結果不明 =
+	 * 送ったあとで結果が分からなくなった書込み）を `failed` と分けて見るため。
+	 */
+	let resultFilter = $state('');
 
 	async function loadMore(): Promise<void> {
 		loading = true;
@@ -53,7 +59,7 @@
 			const result = await listWriteAudit({
 				pagination: { offset: loadedOffset, limit: BLOCK_SIZE },
 				sort: [{ field: 'ts', direction: 'desc' }],
-				filters: []
+				filters: resultFilter ? [{ field: 'result', op: 'eq', value: resultFilter }] : []
 			});
 			rows = [...rows, ...result.rows];
 			totalCount = result.totalCount;
@@ -68,6 +74,15 @@
 	$effect(() => {
 		void loadMore();
 	});
+
+	function changeResultFilter(event: Event): void {
+		resultFilter = (event.currentTarget as HTMLSelectElement).value;
+		rows = [];
+		totalCount = 0;
+		loadedOffset = 0;
+		selected = null;
+		void loadMore();
+	}
 
 	let selected: WriteAuditEntry | null = $state(null);
 
@@ -89,6 +104,16 @@
 	<div class="page-header">
 		<h2>書き込み監査</h2>
 	</div>
+
+	<label class="filter">
+		結果
+		<select value={resultFilter} onchange={changeResultFilter}>
+			<option value="">すべて</option>
+			{#each Object.entries(resultLabels) as [value, label] (value)}
+				<option {value}>{label}</option>
+			{/each}
+		</select>
+	</label>
 
 	<p class="note">
 		{totalCount.toLocaleString()}件の記録があります（{rows.length}件読み込み済み）。行をクリックすると下に詳細が表示されます。
@@ -177,6 +202,13 @@
 
 	.loading {
 		color: var(--banto-text-muted);
+	}
+
+	.filter {
+		display: flex;
+		align-items: center;
+		gap: 0.5rem;
+		font-size: 0.85rem;
 	}
 
 	.table-wrap {
