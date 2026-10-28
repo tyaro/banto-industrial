@@ -37,6 +37,7 @@
 		createAuditLogResource,
 		type AuditLogEntry
 	} from '#lib/banto/auditLogAdmin.js';
+	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 
 	const actionLabels: Record<string, string> = {
 		create: '作成',
@@ -75,7 +76,13 @@
 	}
 
 	const columns: GridColumn<AuditLogEntry>[] = [
-		{ id: 'ts', header: '時刻', accessor: 'ts', width: 175 },
+		{
+			id: 'ts',
+			header: '時刻',
+			accessor: 'ts',
+			width: 175,
+			format: (value) => formatSqliteUtc(String(value))
+		},
 		{
 			id: 'actorUsername',
 			header: 'ユーザー',
@@ -259,7 +266,7 @@
 			<h3>詳細（ID: {selected.id}）</h3>
 			<dl>
 				<dt>時刻</dt>
-				<dd>{selected.ts}</dd>
+				<dd>{formatSqliteUtc(selected.ts)}</dd>
 				<dt>ユーザー</dt>
 				<dd>{selected.actorUsername ?? '-'}</dd>
 				<dt>ロール</dt>
