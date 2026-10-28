@@ -19,7 +19,7 @@ Hub は保存設定、タグの正規アドレスとエリア、幅、型、値�
 
 現行コードの通常書込み経路は StandardR の D/W 数値型、StandardQ の内部 W 数値型、同一接続の SD302 で内部範囲全体を証明できる Q25PRH の D 数値型、および標準 Q/R の M/Y/L/B Bool を対象とする。Host は数値8型の型・幅・値域を検査し、guest は数値型を語列へ変換する。Q25PRH の通常 D 書込みも明示 allowlist と独立した Host ゲートが必要で、`u16` のみに固定されていない。一方、隔離された `q25prh_d3010_3013_test_write` モードは D3010-D3013 の4点 `u16` に限定され、通常書込みと同時有効化できない。Q25PRH の数値8型すべてを本受入れ試験で検証したという意味ではない。既存の `d_u16_*` 設定キーを共通ゲートとして使うが、キー名は値型の上限を意味しない。Q25PRH の W・bit、標準 Q の D 書込み、word-bit、timer/counter、および他の bit エリアはこの設定で許可されない。読取りでは M/Y/L/B などの Bool を WIT Bool から Hub の Bit 値へ変換し、収集では true/false を 1/0・Good、機器拒否を値なし・Bad とする。別型の WIT 値は拒否し、数値8型読取りの f64 投影を維持する。
 
-CI は旧 read/write・診断 guest の固定コミットによる回帰を残し、最新の SLMP guest は #35 の merge `b3d944f5` を独立ビルドして WIT/world と Hub ループバックを照合する（#887 で #34 の `c9cf3b8e` から置き換えた。#34 の V の拒否は #35 にも含まれる）。#34 は V edge relay を周期収集タグとして登録不可にする。1スキャンの edge を取り逃がし得るためであり、SLMP の低レベル V 読取り能力全体を否定するものではない。guest リポジトリには SLMP 専用 manifest がなく、Hub 受入れはこのリポジトリの checked-in テスト manifest を使う。旧 D 専用 guest の回帰も別に残す。模擬試験には実 PLC 通信、実際の本番有効化、信頼鍵の配置を含まない。
+CI は旧 read/write・診断 guest の固定コミットによる回帰を残し、最新の SLMP guest は #44 の merge `c9c3d83d` を独立ビルドして WIT/world と Hub ループバックを照合する（#887 で #34 の `c9cf3b8e` から #35 `b3d944f5` へ置き換え、続いて #43 の bit の outside 除外を含む #44 へ更新した。#34 の V の拒否は #44 にも含まれる）。#34 は V edge relay を周期収集タグとして登録不可にする。1スキャンの edge を取り逃がし得るためであり、SLMP の低レベル V 読取り能力全体を否定するものではない。guest リポジトリには SLMP 専用 manifest がなく、Hub 受入れはこのリポジトリの checked-in テスト manifest を使う。旧 D 専用 guest の回帰も別に残す。模擬試験には実 PLC 通信、実際の本番有効化、信頼鍵の配置を含まない。
 
 ## 受入れの対応表（#875、2026-10-27）
 
@@ -38,7 +38,7 @@ Issue #875 の受入れ条件ごとの、実装と模擬試験の対応。統合
 
 ### 未検証・未対応
 
-- SD の根拠不足による書込みの拒否を Hub 側で確かめたのは Q25PRH の D だけ。StandardR の D/W と StandardQ の内部 W は guest の試験で確かめる（banto-driver-wasm #37 の `standard_r_dw_and_q_internal_w_writes_send_nothing_without_complete_sd_span`: 点数の 1 語不足・SD の拒否と破損・型式不明・0101 の拒否で書込みフレームを作らない。ほかに `write_extension_borrows_the_same_discovered_resource`・`common_allowlist_w_write_uses_same_sd_evidence_and_word_ack`）。Hub が固定する guest（#35 `b3d944f5`）は #37 より前だが、#37 は試験だけを足した。
+- SD の根拠不足による書込みの拒否を Hub 側で確かめたのは Q25PRH の D だけ。StandardR の D/W と StandardQ の内部 W は guest の試験で確かめる（banto-driver-wasm #37 の `standard_r_dw_and_q_internal_w_writes_send_nothing_without_complete_sd_span`: 点数の 1 語不足・SD の拒否と破損・型式不明・0101 の拒否で書込みフレームを作らない。ほかに `write_extension_borrows_the_same_discovered_resource`・`common_allowlist_w_write_uses_same_sd_evidence_and_word_ack`）。Hub が固定する guest（#44 `c9c3d83d`）は #37 を含む。
 - 送信後に応答が来ない（ACK 不一致ではない純粋な無応答）W の書込みは、D の broker の timeout の試験だけ。
 - 実 PLC での W の書込み、本番の有効化・信頼鍵の配置は未実施（#875 の対象外）。
 - Q25PRH の W・bit、標準 Q の D 書込み、word-bit、timer/counter は書込みの対象外。
