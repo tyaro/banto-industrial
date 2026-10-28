@@ -5,21 +5,28 @@
 	import { hubLogout } from '#lib/banto/hubLogout.js';
 	import { pageTitle, resolveAppPath } from '#lib/navigation.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { NAV_TOGGLE_ATTR, SIDEBAR_ID } from '#lib/mobileNav.js';
+	import { settings } from '#lib/settings.svelte.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
 	let { pendingCount = 0 }: { pendingCount?: number } = $props();
 
-	// T19 S3-a（UX-43）: ☰ の振り分け - 狭幅(≤900px)ではオフキャンバスの
+	// T19 S3-a（UX-43）+ #714: ☰ の振り分けと置き場所 - 狭幅(≤900px)ではオフキャンバスの
 	// 開閉、デスクトップでは従来どおりサイドバーの折り畳み
 	// （`mobileNavStore.toggleHamburger` に判断を集約、mobileNav.ts 参照）。
+	// ヘッダー側に出すのは「サイドバーが見えていないとき」（狭幅 / 折り畳み中）だけ。
+	// 広幅で開いている間は `Sidebar.svelte` のロゴ行に折り畳みボタンがあり、
+	// ここには出さない（トグルを 2 つ同時に出さない）。
+	const showToggle = $derived(mobileNavStore.isNarrow || settings.sidebarCollapsed);
 	const hamburgerLabel = $derived(
 		mobileNavStore.isNarrow
 			? mobileNavStore.open
 				? 'メニューを閉じる'
 				: 'メニューを開く'
-			: 'サイドバーの切り替え'
+			: 'サイドバーを開く'
 	);
+	const hamburgerExpanded = $derived(mobileNavStore.isNarrow ? mobileNavStore.open : false);
 
 	async function logout() {
 		// banto v2.0.0 (#260, design §6.1): logout() -> confirm the session ->
@@ -32,15 +39,19 @@
 </script>
 
 <header>
-	<button
-		type="button"
-		class="icon-button"
-		onclick={() => mobileNavStore.toggleHamburger()}
-		aria-label={hamburgerLabel}
-		aria-expanded={mobileNavStore.isNarrow ? mobileNavStore.open : undefined}
-	>
-		☰
-	</button>
+	{#if showToggle}
+		<button
+			type="button"
+			class="icon-button"
+			onclick={() => mobileNavStore.toggleHamburger()}
+			aria-label={hamburgerLabel}
+			aria-expanded={hamburgerExpanded}
+			aria-controls={SIDEBAR_ID}
+			{...{ [NAV_TOGGLE_ATTR]: '' }}
+		>
+			☰
+		</button>
+	{/if}
 
 	<h1>{pageTitle(page.url.pathname)}</h1>
 

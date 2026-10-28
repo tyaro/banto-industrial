@@ -31,12 +31,13 @@
 	 * - フォーカスの戻し（約束 5）: 閉じたら開いた元へ、`tick()` の後に判定する
 	 *   （ナビ系コマンドの `goto()` → `afterNavigate` でサイドバーが畳まれ、
 	 *   戻し先が同じ流れの中で `inert` になるため）。戻し先が消えている /
-	 *   `inert` / 不可視なら `focusFallback`（ヘッダーの先頭ボタン ☰ - 常設で
-	 *   どの画面にもある）へ。`<body>` には落とさない。
+	 *   `inert` / 不可視なら `focusFallback`（いま見えている ☰ トグル（広幅・開いている間は
+	 *   サイドバー側、狭幅・折り畳み中はヘッダー側 - #714））へ。`<body>` には落とさない。
 	 */
 	import { CommandPalette } from '@banto/ui';
 	import { isProviderError, notify, searchCommands, type PaletteCommand } from '@banto/admin-core';
 	import { buildCommands, loadRecentCommandIds, recordRecentCommand } from '#lib/commands.js';
+	import { findVisibleNavToggle } from '#lib/mobileNav.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
 	// 開くたびにマウントされるので、どちらも開いた時点の値。
@@ -69,5 +70,5 @@
 	{search}
 	onExecute={execute}
 	onClose={() => commandPaletteStore.hide()}
-	focusFallback={() => document.querySelector<HTMLElement>('header button')}
+	focusFallback={() => findVisibleNavToggle()}
 />

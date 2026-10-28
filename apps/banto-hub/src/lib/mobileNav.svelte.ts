@@ -6,10 +6,11 @@
  * （vitest 対象）に切り出し、ここでは runes への配線と
  * `window.matchMedia` の購読（`viewportWatch.ts`）だけを行う。
  */
-import { untrack } from 'svelte';
+import { tick, untrack } from 'svelte';
 import { settings } from './settings.svelte';
 import {
 	applyNarrowChange,
+	findVisibleNavToggle,
 	initialMobileNavState,
 	resolveHamburgerTarget,
 	type MobileNavState
@@ -71,14 +72,17 @@ class MobileNavStore {
 	}
 
 	/**
-	 * `Header.svelte` の ☰ ボタンから呼ぶ振り分け: 狭幅ではオフキャンバスの
-	 * 開閉、デスクトップでは従来どおりサイドバーの折り畳み。
+	 * `Header.svelte`（狭幅・折り畳み中）と `Sidebar.svelte`（広幅・開いている間）の
+	 * トグルから呼ぶ振り分け: 狭幅ではオフキャンバスの開閉、デスクトップでは
+	 * サイドバーの折り畳み。デスクトップでは押したボタンが入れ替わって消えるので、
+	 * 描画後に見えている側のトグルへフォーカスを移す（#714）。
 	 */
 	toggleHamburger(): void {
 		if (resolveHamburgerTarget(this.#state.isNarrow) === 'offcanvas') {
 			this.toggleNav();
 		} else {
 			settings.toggleSidebar();
+			void tick().then(() => findVisibleNavToggle()?.focus());
 		}
 	}
 }
