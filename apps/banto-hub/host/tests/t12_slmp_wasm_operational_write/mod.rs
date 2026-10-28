@@ -36,6 +36,7 @@ struct Fixture {
     count: Arc<AtomicU32>,
     diagnostic_bit_counts: Arc<Mutex<[u32; 3]>>,
     refuse_bit_sd: Arc<AtomicBool>,
+    q_mb_count: Arc<AtomicU32>,
     write_devices: Arc<Mutex<Vec<u8>>>,
     write_end_code: Arc<AtomicU16>,
     bit_frames: RecordedBits,
@@ -58,6 +59,8 @@ impl Fixture {
         let bit_counts_on_wire = diagnostic_bit_counts.clone();
         let refuse_bit_sd = Arc::new(AtomicBool::new(false));
         let refuse_bit_sd_on_wire = refuse_bit_sd.clone();
+        let q_mb_count = Arc::new(AtomicU32::new(64));
+        let q_mb_count_on_wire = q_mb_count.clone();
         let write_devices = Arc::new(Mutex::new(Vec::new()));
         let devices = write_devices.clone();
         let write_end_code = Arc::new(AtomicU16::new(0));
@@ -150,7 +153,11 @@ impl Fixture {
                                             (0xc051, Vec::new())
                                         } else {
                                             let [x, _, _] = *bit_counts_on_wire.lock().unwrap();
-                                            let body = [u16::try_from(x).unwrap(), 64, 64, 64, 64]
+                                            let mb = u16::try_from(
+                                                q_mb_count_on_wire.load(Ordering::SeqCst),
+                                            )
+                                            .unwrap();
+                                            let body = [u16::try_from(x).unwrap(), 64, mb, 64, mb]
                                                 .into_iter()
                                                 .flat_map(u16::to_le_bytes)
                                                 .collect();
@@ -188,15 +195,22 @@ impl Fixture {
                                             || (start >= 3010 && end <= 3015)))
                                         || (device == 0xb4 && start >= 0x1a && end <= 0x20)
                                         || (device == 0x90 && start >= 10 && end <= 13)
+                                        // Explicit reads at the Q/R M boundary and past a
+                                        // saturated Q M/B count (new-guest tests only).
+                                        || (device == 0x90 && start >= 63 && end <= 65)
+                                        || (matches!(device, 0x90 | 0xa0)
+                                            && matches!(peer, Peer::StandardQ)
+                                            && start >= 32767
+                                            && end <= 40001)
                                         || (device == 0x9c
                                             && matches!(peer, Peer::StandardQ)
                                             && end <= 32768)
                                         || (device == 0xa1
                                             && matches!(peer, Peer::R)
-                                            && end <= 65538)
+                                            && end <= 65539)
                                         || (device == 0x93 && matches!(peer, Peer::R) && end <= 3))
                             );
-                            if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93) {
+                            if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93 | 0xa0) {
                                 assert_eq!(subcommand, if is_r { 3 } else { 1 });
                                 if device == 0x90 && start == 12 {
                                     (0xc051, Vec::new())
@@ -321,6 +335,7 @@ impl Fixture {
             count: live_count,
             diagnostic_bit_counts,
             refuse_bit_sd,
+            q_mb_count,
             write_devices,
             write_end_code,
             bit_frames,
@@ -350,6 +365,11 @@ impl Fixture {
 
     fn set_bit_sd_refused(&self, refused: bool) {
         self.refuse_bit_sd.store(refused, Ordering::SeqCst);
+    }
+
+    /// Q M/B point count the SD answers with (default 64; 32768 = saturated field).
+    fn set_q_mb_count(&self, count: u32) {
+        self.q_mb_count.store(count, Ordering::SeqCst);
     }
 
     /// End code the fixture answers to every 0x1401 write with (0 = success).
@@ -627,6 +647,14 @@ fn new_guest_component() -> Vec<u8> {
 }
 
 async fn connect_new_guest(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSession) {
+    connect_new_guest_with(peer, "disabled", "").await
+}
+
+async fn connect_new_guest_with(
+    peer: Peer,
+    mode: &str,
+    allowlist: &str,
+) -> (Fixture, Arc<WasmDriver>, FrameSession) {
     let fixture = Fixture::start(peer, 4000, false).await;
     let driver = WasmDriver::load_operational_write(MANIFEST, &new_guest_component()).unwrap();
     let transport = TransportSpec::Tcp {
@@ -640,7 +668,7 @@ async fn connect_new_guest(peer: Peer) -> (Fixture, Arc<WasmDriver>, FrameSessio
     );
     let session = FrameSession::connect(
         driver.as_ref(),
-        &settings(fixture.address.port(), "disabled", ""),
+        &settings(fixture.address.port(), mode, allowlist),
         &transport,
         &context,
         None,
@@ -659,7 +687,7 @@ fn bit_specs(driver: &WasmDriver, addresses: &[&str]) -> Vec<TagSpec> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
     use banto_driver_api::CountBound;
 
@@ -753,7 +781,7 @@ async fn new_guest_q_x_sd290_exact_bound_and_refusal_reach_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
     use banto_driver_api::CountBound;
 
@@ -840,7 +868,7 @@ async fn new_guest_r_sb_f_low_high_bounds_and_refusal_reach_hub() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
     use banto_driver_api::DriverAddress;
 
@@ -927,7 +955,7 @@ async fn new_guest_rejects_v_and_keeps_mixed_read_covers() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #35 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
 async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
     let fixture = Fixture::start(Peer::R, 4000, false).await;
     let bytes = new_guest_component();
@@ -1092,6 +1120,315 @@ async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
     assert_eq!(expired["status"], "unavailable");
     drop(app);
 }
+
+const PLAN_EXCLUDED: &str = "計画に含まれない";
+const HUB_OUTSIDE: &str = "diagnostic proved tag outside the configured range";
+
+fn is_unsupported(result: &Result<Value, ItemError>, reason: &str) -> bool {
+    matches!(result, Err(ItemError::Unsupported(text)) if text == reason)
+}
+
+fn covered(session: &mut FrameSession, specs: &[TagSpec]) -> Vec<u32> {
+    let plans = session.connection_mut().unwrap().plan_read(specs).unwrap();
+    let mut covers: Vec<u32> = plans.iter().flat_map(|plan| plan.covers.clone()).collect();
+    covers.sort_unstable();
+    covers
+}
+
+/// Guest #43: with an exact same-connection SD count, a bit tag at or past it is
+/// left out of the plan (the guest only leaves the tag out of `covers`). The Host
+/// engine then reports its default per-item `Unsupported` for indices the guest
+/// left out ("計画に含まれない"); no frame is sent and neighbours keep values.
+/// Once the Hub also adopts the diagnostic, its own earlier gate answers with
+/// `HUB_OUTSIDE` instead. Both are per-item `Err(Unsupported)`, never Good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
+async fn new_guest_outside_q_x_bit_is_left_out_of_the_plan_and_never_sent() {
+    let (fixture, driver, mut session) = connect_new_guest(Peer::StandardQ).await;
+    fixture.set_diagnostic_bit_counts(16, 0, 0);
+    // X10 is hexadecimal 16: the first point past the count. XF is N-1.
+    let specs = bit_specs(&driver, &["X1", "XF", "X10"]);
+    // No count yet: the same tag is still read one-by-one explicitly.
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs[2..]).await.unwrap();
+    assert_eq!(values, vec![Ok(Value::Bit(false))]);
+    assert_eq!(fixture.read_spans()[before..], [(0x9c, 16, 1)]);
+
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Inside(_)));
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Outside(_)));
+    // Diagnostics are not accepted by the Hub here, so this is the guest's gate.
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert_eq!(values[0], Ok(Value::Bit(true)));
+    assert_eq!(values[1], Ok(Value::Bit(false)));
+    assert!(is_unsupported(&values[2], PLAN_EXCLUDED), "{values:?}");
+    let spans = fixture.read_spans();
+    assert!(!spans[before..].is_empty());
+    assert!(spans[before..]
+        .iter()
+        .all(|(device, start, points)| { *device == 0x9c && start + u32::from(*points) <= 16 }));
+
+    // After the Hub adopts the diagnostic its own gate answers first.
+    session.accept_diagnostic(&specs, &report);
+    let before = fixture.commands().len();
+    let values = session.read_batch(&specs[2..]).await.unwrap();
+    assert!(is_unsupported(&values[0], HUB_OUTSIDE), "{values:?}");
+    assert_eq!(fixture.commands().len(), before);
+    // plan_read bypasses the Hub gate: the guest alone leaves X10 uncovered.
+    assert_eq!(covered(&mut session, &specs), vec![0, 1]);
+    session.disconnect().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
+async fn new_guest_outside_r_sb_and_f_bits_are_left_out_of_the_plan_and_never_sent() {
+    let (fixture, driver, mut session) = connect_new_guest(Peer::R).await;
+    fixture.set_diagnostic_bit_counts(0, 65538, 2);
+    let specs = bit_specs(&driver, &["SB10001", "SB10002", "F1", "F2"]);
+    // No count yet: SB10002 and F2 are read explicitly, one request per tag.
+    let before = fixture.read_spans().len();
+    let values = session
+        .read_batch(&[specs[1].clone(), specs[3].clone()])
+        .await
+        .unwrap();
+    assert!(values.iter().all(Result::is_ok), "{values:?}");
+    assert_eq!(
+        fixture.read_spans()[before..],
+        [(0xa1, 65538, 1), (0x93, 2, 1)]
+    );
+
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(matches!(report.tags[1].verdict, TagVerdict::Outside(_)));
+    assert!(matches!(report.tags[3].verdict, TagVerdict::Outside(_)));
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert_eq!(values[0], Ok(Value::Bit(true)));
+    assert!(is_unsupported(&values[1], PLAN_EXCLUDED), "{values:?}");
+    assert_eq!(values[2], Ok(Value::Bit(true)));
+    assert!(is_unsupported(&values[3], PLAN_EXCLUDED), "{values:?}");
+    let spans = fixture.read_spans();
+    assert!(spans[before..].iter().all(|(device, start, points)| {
+        let end = start + u32::from(*points);
+        (*device == 0xa1 && end <= 65538) || (*device == 0x93 && end <= 2)
+    }));
+    assert!(spans[before..].iter().any(|(device, _, _)| *device == 0xa1));
+    assert!(spans[before..].iter().any(|(device, _, _)| *device == 0x93));
+    session.disconnect().await;
+}
+
+/// The write handshake obtains exact M counts on the same connection, at
+/// connect time and before any write. A D-only allowlist obtains none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
+async fn new_guest_write_handshake_count_leaves_outside_m_bit_out_of_the_plan() {
+    for peer in [Peer::StandardQ, Peer::R] {
+        // M63 is N-1 and M64 the first point past the exact count of 64.
+        let (fixture, driver, mut session) =
+            connect_new_guest_with(peer, "enabled", "M10-M11").await;
+        let specs = bit_specs(&driver, &["M63", "M64"]);
+        let values = session.read_batch(&specs).await.unwrap();
+        assert!(values[0].is_ok(), "{values:?}");
+        assert!(is_unsupported(&values[1], PLAN_EXCLUDED), "{values:?}");
+        assert!(!fixture.read_spans().is_empty());
+        assert!(fixture
+            .read_spans()
+            .iter()
+            .all(|(device, start, points)| *device == 0x90 && start + u32::from(*points) <= 64));
+        session.disconnect().await;
+
+        let (fixture, _driver, mut session) =
+            connect_new_guest_with(peer, "enabled", "D3010-D3013").await;
+        let values = session.read_batch(&specs).await.unwrap();
+        assert!(values.iter().all(Result::is_ok), "{values:?}");
+        assert!(fixture.read_spans().contains(&(0x90, 64, 1)));
+        session.disconnect().await;
+    }
+}
+
+/// A refused SD or a saturated Q M/B field proves nothing, so the tag is still
+/// read one-by-one as before #43 (and an `Unknown` verdict stays readable).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
+async fn new_guest_refused_or_saturated_counts_keep_explicit_bit_reads() {
+    // SD refused: Q X and R SB/F.
+    let (fixture, driver, mut session) = connect_new_guest(Peer::StandardQ).await;
+    fixture.set_bit_sd_refused(true);
+    let specs = bit_specs(&driver, &["X10"]);
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(matches!(&report.tags[0].verdict, TagVerdict::Unknown(r) if r == "sd-refused"));
+    let before = fixture.read_spans().len();
+    assert_eq!(
+        session.read_batch(&specs).await.unwrap(),
+        vec![Ok(Value::Bit(false))]
+    );
+    assert_eq!(fixture.read_spans()[before..], [(0x9c, 16, 1)]);
+    session.disconnect().await;
+
+    let (fixture, driver, mut session) = connect_new_guest(Peer::R).await;
+    fixture.set_bit_sd_refused(true);
+    let specs = bit_specs(&driver, &["SB10002", "F2"]);
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(report
+        .tags
+        .iter()
+        .all(|tag| matches!(&tag.verdict, TagVerdict::Unknown(r) if r == "sd-refused")));
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert!(values.iter().all(Result::is_ok), "{values:?}");
+    assert_eq!(
+        fixture.read_spans()[before..],
+        [(0xa1, 65538, 1), (0x93, 2, 1)]
+    );
+    session.disconnect().await;
+
+    // Q M/B saturated at 32768: only the leading area is guaranteed, so the tags
+    // past it stay readable while 32767 (the last guaranteed point) is normal.
+    let (fixture, driver, mut session) = connect_new_guest(Peer::StandardQ).await;
+    fixture.set_q_mb_count(32768);
+    let specs = bit_specs(&driver, &["M32767", "M40000", "B7FFF", "B9C40"]);
+    let report = session.diagnose_batch(&specs).await.unwrap().unwrap();
+    assert!(matches!(report.tags[0].verdict, TagVerdict::Inside(_)));
+    for (index, expected) in [
+        (1, "configured-range-unproven"),
+        (3, "configured-range-unproven"),
+    ] {
+        assert!(
+            matches!(&report.tags[index].verdict, TagVerdict::Unknown(r) if r == expected),
+            "{:?}",
+            report.tags[index].verdict
+        );
+    }
+    assert!(matches!(report.tags[2].verdict, TagVerdict::Inside(_)));
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert!(values.iter().all(Result::is_ok), "{values:?}");
+    let spans = fixture.read_spans();
+    for expected in [(0x90, 40000, 1), (0xa0, 40000, 1)] {
+        assert!(spans[before..].contains(&expected), "{expected:?}");
+    }
+    session.disconnect().await;
+}
+
+/// Guest #43 through the real Hub path: the write handshake of a saved
+/// `write_mode=enabled` connection obtains the exact M count (64), so M64 is
+/// left out of the plan. Collection stores it as `None`/Bad, read-now answers
+/// 502 `read_failed` carrying the Host engine's default per-item `Unsupported`
+/// text for a tag the guest left out of `covers`, the
+/// neighbours M10/M63 stay Good, and no read frame ever covers M64.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #44 component"]
+async fn new_guest_saved_outside_m_bit_is_bad_and_never_sent_through_the_hub() {
+    let fixture = Fixture::start(Peer::StandardQ, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-outside-m-hub",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "m-line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "M10-M11"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("m-group", saved.id, 100))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (name, address) in [("m10", "M10"), ("m63", "M63"), ("m64", "M64")] {
+        let tag = app
+            .manager
+            .tags()
+            .create(super::tag_input(name, group.id, address, "bit"))
+            .await
+            .unwrap();
+        ids.push(tag.id);
+    }
+    app.manager.rebuild().await.unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    // M64 is Bad with no value; M10 and M63 are Good with a value.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if sample_of(ids[0]).is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+                && sample_of(ids[1])
+                    .is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+                && sample_of(ids[2]).is_some_and(|s| s.quality == Quality::Bad)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("M10/M63 Good, M64 Bad");
+    // Checks M64 stays Bad over several 100 ms collection cycles (the never-sent
+    // check is the final `read_spans` assertion).
+    // A few more ticks: M64 never turns Good or gains a value.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let outside = sample_of(ids[2]).unwrap();
+    assert_eq!(outside.quality, Quality::Bad);
+    assert_eq!(outside.value, None);
+
+    for name in ["m10", "m63"] {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/m-line.m-group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{body:?}");
+        assert_eq!(body["q"], "good", "{body:?}");
+    }
+    let (status, body) = super::admin_get(
+        &app.router,
+        "/api/v1/values/m-line.m-group.m64/read-now",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::BAD_GATEWAY, "{body:?}");
+    assert_eq!(body["error"], "read_failed", "{body:?}");
+    assert_eq!(
+        body["detail"],
+        format!("扱えない組み合わせです: {PLAN_EXCLUDED}"),
+        "{body:?}"
+    );
+
+    // The mock PLC never received a read covering M64 (device 0x90, point 64).
+    let spans = fixture.read_spans();
+    assert!(!spans.is_empty());
+    assert!(
+        spans
+            .iter()
+            .all(|(device, start, points)| *device == 0x90 && start + u32::from(*points) <= 64),
+        "{spans:?}"
+    );
+    drop(app);
+}
+
 fn settings(port: u16, mode: &str, allowlist: &str) -> Settings {
     Settings::from_pairs([
         ("host".to_owned(), "127.0.0.1".to_owned()),
