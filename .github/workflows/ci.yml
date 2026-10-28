@@ -690,7 +690,7 @@ jobs:
           # #43 leaves bit tags proven Outside out of the read plan; the earlier
           # guests above still read them one by one. #51 reads W word bits
           # (W1A.0), #55 and #56 read S/Z/RD and the Q ZR as read-only
-          # range-Unknown tags (E1/E2 are not accepted here yet).
+          # range-Unknown tags (E1 3E frame and E2 routed access are accepted here).
           $newSlmpSha = 'f06a90ffadb21fbd3a7157bf27bb20560c81182e'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
@@ -723,7 +723,7 @@ jobs:
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 29 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok. 36 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
