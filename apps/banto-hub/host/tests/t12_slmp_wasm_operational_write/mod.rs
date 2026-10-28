@@ -208,9 +208,15 @@ impl Fixture {
                                         || (device == 0xa1
                                             && matches!(peer, Peer::R)
                                             && end <= 65539)
-                                        || (device == 0x93 && matches!(peer, Peer::R) && end <= 3))
+                                        || (device == 0x93 && matches!(peer, Peer::R) && end <= 3)
+                                        // Unknown-range read-only devices (new-guest tests only):
+                                        // S10, Z3, RD7 and ZR10, one tag per request.
+                                        || (device == 0x98 && (start, end) == (10, 11))
+                                        || (device == 0xcc && (start, end) == (3, 4))
+                                        || (device == 0x2c && (start, end) == (7, 8))
+                                        || (device == 0xb0 && (start, end) == (0x10, 0x11)))
                             );
-                            if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93 | 0xa0) {
+                            if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93 | 0xa0 | 0x98) {
                                 assert_eq!(subcommand, if is_r { 3 } else { 1 });
                                 if device == 0x90 && start == 12 {
                                     (0xc051, Vec::new())
@@ -1426,6 +1432,356 @@ async fn new_guest_saved_outside_m_bit_is_bad_and_never_sent_through_the_hub() {
             .all(|(device, start, points)| *device == 0x90 && start + u32::from(*points) <= 64),
         "{spans:?}"
     );
+    drop(app);
+}
+
+fn typed_specs(driver: &WasmDriver, tags: &[(&str, DataType)]) -> Vec<TagSpec> {
+    tags.iter()
+        .map(|(address, data_type)| {
+            let kind = TagKind::numeric(*data_type);
+            TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind)
+        })
+        .collect()
+}
+
+/// Guest #51 (A2): `W1A.0` reads the one hexadecimal W word and extracts the
+/// bit. The handshake count of the write-enabled connection (R 4000 words,
+/// standard Q SD303 = 64) proves the word in or out of range, so a word-bit tag
+/// at or past it is left out of the plan and no read frame covers it. The
+/// fixture only answers W reads inside 0x1A..0x20, so a frame for the outside
+/// word would also break the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_w_word_bit_is_read_from_one_w_word_and_outside_is_never_sent() {
+    for (peer, outside) in [(Peer::StandardQ, "W40.0"), (Peer::R, "WFA0.0")] {
+        let (fixture, driver, mut session) =
+            connect_new_guest_with(peer, "enabled", "W1A-W1F").await;
+        // Fixture words read 7 (0b111): bit 0 and 2 are set, 3 and F are clear.
+        let specs = bit_specs(&driver, &["W1A.0", "W1A.2", "W1A.3", "W1F.F", outside]);
+        let before = fixture.read_spans().len();
+        let values = session.read_batch(&specs).await.unwrap();
+        assert_eq!(values[0], Ok(Value::Bit(true)), "{values:?}");
+        assert_eq!(values[1], Ok(Value::Bit(true)));
+        assert_eq!(values[2], Ok(Value::Bit(false)));
+        assert_eq!(values[3], Ok(Value::Bit(false)));
+        assert!(is_unsupported(&values[4], PLAN_EXCLUDED), "{values:?}");
+        let spans = fixture.read_spans();
+        assert!(!spans[before..].is_empty());
+        assert!(spans[before..]
+            .iter()
+            .all(|(device, start, points)| *device == 0xb4 && *start + u32::from(*points) <= 0x20));
+        // plan_read: the guest alone leaves the outside word uncovered.
+        assert_eq!(covered(&mut session, &specs), vec![0, 1, 2, 3]);
+        // The word-bit tag is read-only: a write never reaches the PLC.
+        let results = session
+            .write_batch(&[WriteItem::new(specs[0].clone(), Value::Bit(true))])
+            .await
+            .unwrap();
+        assert!(results.iter().all(Result::is_err), "{results:?}");
+        assert!(fixture.frames().is_empty() && fixture.bit_frames().is_empty());
+        session.disconnect().await;
+    }
+}
+
+/// Guest #55 (D1) and #56 (D2): S (bit), Z, RD and ZR are read-only devices
+/// with range `Unknown`. The Hub therefore never gates them on a count: each tag
+/// is one explicit single-point 0401 request, and no write ever reaches the PLC
+/// even when the write policy is enabled for D. LZ needs 0403 and is refused at
+/// the address; RD is R-only; Q25PRH has no ZR path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_s_z_rd_zr_are_read_only_unknown_range_reads() {
+    type Case = (Peer, Vec<(&'static str, DataType)>, Vec<(u8, u32)>);
+    let cases: [Case; 2] = [
+        (
+            Peer::R,
+            vec![
+                ("S10", DataType::Bit),
+                ("Z3", DataType::U16),
+                ("RD7", DataType::U16),
+                ("ZR10", DataType::U16),
+            ],
+            vec![(0x98, 10), (0xcc, 3), (0x2c, 7), (0xb0, 0x10)],
+        ),
+        (
+            Peer::StandardQ,
+            vec![
+                ("S10", DataType::Bit),
+                ("Z3", DataType::U16),
+                ("ZR10", DataType::U16),
+            ],
+            vec![(0x98, 10), (0xcc, 3), (0xb0, 0x10)],
+        ),
+    ];
+    for (peer, tags, wire) in cases {
+        let (fixture, driver, mut session) =
+            connect_new_guest_with(peer, "enabled", "D3010-D3013").await;
+        let specs = typed_specs(&driver, &tags);
+        let before = fixture.read_spans().len();
+        let values = session.read_batch(&specs).await.unwrap();
+        // Fixture: S10 is set; Z, RD and ZR words read 7.
+        assert_eq!(values[0], Ok(Value::Bit(true)), "{values:?}");
+        for value in &values[1..] {
+            assert_eq!(*value, Ok(Value::F64(7.0)), "{values:?}");
+        }
+        // One request per tag, one point each.
+        let mut spans: Vec<_> = fixture.read_spans()[before..]
+            .iter()
+            .map(|(device, start, points)| {
+                assert_eq!(*points, 1);
+                (*device, *start)
+            })
+            .collect();
+        spans.sort_unstable();
+        let mut expected = wire.clone();
+        expected.sort_unstable();
+        assert_eq!(spans, expected);
+        // Unknown range: nothing is left out of the plan.
+        assert_eq!(
+            covered(&mut session, &specs),
+            (0..u32::try_from(specs.len()).unwrap()).collect::<Vec<_>>()
+        );
+        // Writes are refused before any frame is built.
+        let writes = [
+            Value::Bit(true),
+            Value::F64(1.0),
+            Value::F64(1.0),
+            Value::F64(1.0),
+        ];
+        for (spec, value) in specs.iter().zip(writes) {
+            let results = session
+                .write_batch(&[WriteItem::new(spec.clone(), value)])
+                .await
+                .unwrap();
+            assert!(results.iter().all(Result::is_err), "{results:?}");
+        }
+        assert!(fixture
+            .commands()
+            .iter()
+            .all(|(command, _, _)| *command != 0x1401));
+        assert!(
+            fixture.frames().is_empty()
+                && fixture.bit_frames().is_empty()
+                && fixture.write_devices().is_empty()
+        );
+        session.disconnect().await;
+    }
+
+    // LZ is refused at the address on every model; RD only exists on R; Q25PRH
+    // has no ZR path. None of them sends a read frame.
+    let (fixture, driver, mut session) = connect_new_guest(Peer::R).await;
+    let word = TagKind::numeric(DataType::U32);
+    for address in ["LZ0", "LZ1"] {
+        assert!(driver.parse_address(address, &word).is_err(), "{address}");
+    }
+    session.disconnect().await;
+    assert!(fixture.read_spans().is_empty());
+
+    let (fixture, driver, mut session) = connect_new_guest(Peer::StandardQ).await;
+    let specs = typed_specs(&driver, &[("RD7", DataType::U16)]);
+    let values = session.read_batch(&specs).await.unwrap();
+    assert!(values[0].is_err(), "{values:?}");
+    session.disconnect().await;
+    assert!(fixture.read_spans().is_empty());
+
+    let (fixture, driver, mut session) = connect_new_guest(Peer::Q).await;
+    let specs = typed_specs(&driver, &[("ZR10", DataType::U16)]);
+    let values = session.read_batch(&specs).await.unwrap();
+    assert!(values[0].is_err(), "{values:?}");
+    session.disconnect().await;
+    assert!(fixture.read_spans().is_empty());
+}
+
+/// Runs one saved connection with one group through the real Hub path and
+/// returns the tag ids in `tags` order. The tags are `(name, address, type)`.
+async fn saved_new_guest_collection(
+    label: &str,
+    peer: Peer,
+    allowlist: &str,
+    tags: &[(&str, &str, &str)],
+) -> (Fixture, super::TestApp, Vec<i64>) {
+    let fixture = Fixture::start(peer, 4000, false).await;
+    let app =
+        super::test_app_with_operational_write_manifest(label, MANIFEST, &new_guest_component())
+            .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": allowlist
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 100))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (name, address, data_type) in tags {
+        let tag = app
+            .manager
+            .tags()
+            .create(super::tag_input(name, group.id, address, data_type))
+            .await
+            .unwrap();
+        ids.push(tag.id);
+    }
+    app.manager.rebuild().await.unwrap();
+    (fixture, app, ids)
+}
+
+/// Guest #51 through the real Hub path: a saved `W1A.0` is collected Good and
+/// answers read-now with the extracted bit, while a saved word-bit tag past the
+/// W count (SD303 = 64, so W40) stays Bad, answers 502 `read_failed`, and no
+/// read frame ever covers the outside word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_saved_w_word_bit_is_good_inside_and_bad_outside_through_the_hub() {
+    let (fixture, app, ids) = saved_new_guest_collection(
+        "t12-new-guest-w-bit-hub",
+        Peer::StandardQ,
+        "W1A-W1F",
+        &[
+            ("w1a0", "W1A.0", "bit"),
+            ("w1a3", "W1A.3", "bit"),
+            ("w40", "W40.0", "bit"),
+        ],
+    )
+    .await;
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if [ids[0], ids[1]].iter().all(|&id| {
+                sample_of(id).is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+            }) && sample_of(ids[2]).is_some_and(|s| s.quality == Quality::Bad)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("W1A.0/W1A.3 Good, W40.0 Bad");
+    // W40.0 stays Bad over several 100 ms cycles (never-sent: `read_spans` below).
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let outside = sample_of(ids[2]).unwrap();
+    assert_eq!(outside.quality, Quality::Bad);
+    assert_eq!(outside.value, None);
+
+    for (name, value) in [("w1a0", true), ("w1a3", false)] {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], serde_json::json!(value), "{body:?}");
+        assert_eq!(body["q"], "good", "{body:?}");
+    }
+    let (status, body) = super::admin_get(
+        &app.router,
+        "/api/v1/values/line.group.w40/read-now",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::BAD_GATEWAY, "{body:?}");
+    assert_eq!(body["error"], "read_failed", "{body:?}");
+    assert_eq!(
+        body["detail"],
+        format!("扱えない組み合わせです: {PLAN_EXCLUDED}"),
+        "{body:?}"
+    );
+    let spans = fixture.read_spans();
+    assert!(!spans.is_empty());
+    assert!(
+        spans
+            .iter()
+            .all(|(device, start, points)| *device == 0xb4 && start + u32::from(*points) <= 0x20),
+        "{spans:?}"
+    );
+    drop(app);
+}
+
+/// Guests #55 and #56 through the real Hub path: saved S, Z, RD and ZR tags on
+/// an R CPU are collected Good (range `Unknown` never turns them Bad) and
+/// answer read-now; every read is one single-point request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
+async fn new_guest_saved_s_z_rd_zr_are_collected_good_through_the_hub() {
+    let (fixture, app, ids) = saved_new_guest_collection(
+        "t12-new-guest-s-z-rd-zr-hub",
+        Peer::R,
+        "D3010-D3013",
+        &[
+            ("s10", "S10", "bit"),
+            ("z3", "Z3", "u16"),
+            ("rd7", "RD7", "u16"),
+            ("zr10", "ZR10", "u16"),
+        ],
+    )
+    .await;
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if ids.iter().all(|&id| {
+                sample_of(id).is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("S/Z/RD/ZR Good");
+    for (name, value) in [
+        ("s10", serde_json::json!(true)),
+        ("z3", serde_json::json!(7.0)),
+        ("rd7", serde_json::json!(7.0)),
+        ("zr10", serde_json::json!(7.0)),
+    ] {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{body:?}");
+        assert_eq!(body["v"], value, "{body:?}");
+        assert_eq!(body["q"], "good", "{body:?}");
+    }
+    let spans = fixture.read_spans();
+    for device in [0x98, 0xcc, 0x2c, 0xb0] {
+        assert!(
+            spans.iter().any(|(seen, _, _)| *seen == device),
+            "{device:#x} was never read: {spans:?}"
+        );
+    }
+    assert!(spans.iter().all(|(_, _, points)| *points == 1), "{spans:?}");
     drop(app);
 }
 
