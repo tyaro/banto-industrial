@@ -73,7 +73,7 @@
 //! | `single_bit_clear_via_rmw_leaves_other_bits_unchanged` | the same name |
 //! | `all_sixteen_bit_positions_set_and_clear_correctly` | the same name |
 //! | `mask_composed_bits_of_one_word_cost_exactly_one_wire_write` | the same name (on the write crate's simulator, which counts reads) |
-//! | `confirmation_mismatch_is_rejected_with_a_race_hint` | `confirmation_mismatch_is_reported_as_bad_with_a_race_hint` (`ItemError::Rejected`; also `conformance.rs` C14) |
+//! | `confirmation_mismatch_is_rejected_with_a_race_hint` | `confirmation_mismatch_is_reported_as_bad_with_a_race_hint` (`ItemError::VerificationFailed`; also `conformance.rs` C14) |
 //! | `confirmation_mismatch_on_one_bit_does_not_fail_its_batch_mates` | the same name |
 //! | `bit_writes_to_different_words_are_independent` | the same name |
 //! | `ordinary_write_and_bit_in_word_write_coexist_in_one_batch` | the same name |
@@ -2239,7 +2239,7 @@ async fn confirmation_mismatch_is_rejected_with_a_race_hint() {
         .expect("the wire call itself succeeds - this is a per-item error");
     assert_eq!(results.len(), 1);
     match &results[0] {
-        Err(ItemError::Rejected(m)) => {
+        Err(ItemError::VerificationFailed(m)) => {
             // The full text pins the area, the bit and the race hint.
             assert_eq!(
                 m,
@@ -2250,7 +2250,7 @@ async fn confirmation_mismatch_is_rejected_with_a_race_hint() {
                 .to_string()
             );
         }
-        other => panic!("expected Err(Rejected), got {other:?}"),
+        other => panic!("expected Err(VerificationFailed), got {other:?}"),
     }
     session.disconnect().await;
     sim.stop();
@@ -2272,7 +2272,7 @@ async fn confirmation_mismatch_on_one_bit_does_not_fail_its_batch_mates() {
     assert_eq!(results.len(), 2);
     assert_eq!(results[0], Ok(()), "bit 0 landed correctly");
     match &results[1] {
-        Err(ItemError::Rejected(m)) => assert_eq!(
+        Err(ItemError::VerificationFailed(m)) => assert_eq!(
             m,
             &PlcWriteError::BitWriteVerificationFailed {
                 area: "D100".into(),
@@ -2281,7 +2281,7 @@ async fn confirmation_mismatch_on_one_bit_does_not_fail_its_batch_mates() {
             .to_string(),
             "bit 5 was corrupted after the write"
         ),
-        other => panic!("expected Err(Rejected) for bit 5, got {other:?}"),
+        other => panic!("expected Err(VerificationFailed) for bit 5, got {other:?}"),
     }
     session.disconnect().await;
     sim.stop();

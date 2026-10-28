@@ -262,8 +262,8 @@ impl WriteAuditService {
     /// 送ったあとで結果が分からなければ `Uncertain` - #898)。`detail` は
     /// 失敗理由の説明文(T8-2、docs/tag-server-design.md §6.1、
     /// 2026-08-06: 例えば T8 の RMW 確認読み不一致
-    /// `PlcWriteError::BitWriteVerificationFailed` の
-    /// 「書き戻し競合の可能性があります」)- `crate::write_path::execute_write`
+    /// `PlcWriteError::BitWriteVerificationFailed`
+    /// (`ItemError::VerificationFailed`)の「書き戻し競合の可能性があります」)- `crate::write_path::execute_write`
     /// は成功時に `None`、失敗時に `WriteRejection::detail()` をそのまま渡す
     /// (REST/gRPC の応答本文と同じ文言を監査行にも残す)。
     pub async fn set_result(

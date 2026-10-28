@@ -74,9 +74,9 @@ pub fn classify_write(err: PlcWriteError) -> Result<ItemError, FatalError> {
         | PlcWriteError::AddressSpanOutOfRange { .. } => {
             Ok(ItemError::Unsupported(err.to_string()))
         }
-        PlcWriteError::ConflictingBitWrite { .. }
-        | PlcWriteError::BitWriteVerificationFailed { .. } => {
-            Ok(ItemError::Rejected(err.to_string()))
+        PlcWriteError::ConflictingBitWrite { .. } => Ok(ItemError::Rejected(err.to_string())),
+        PlcWriteError::BitWriteVerificationFailed { .. } => {
+            Ok(ItemError::VerificationFailed(err.to_string()))
         }
         PlcWriteError::ConnectTimeout(message) | PlcWriteError::Connection(message) => {
             Err(FatalError::Io(message))
@@ -99,6 +99,7 @@ mod tests {
         Device,
         Unsupported,
         Rejected,
+        VerificationFailed,
         Io,
         Timeout,
         Framing,
@@ -134,8 +135,8 @@ mod tests {
             | PlcWriteError::ModbusReadOnlyArea { .. }
             | PlcWriteError::UnsupportedRequestKind { .. }
             | PlcWriteError::AddressSpanOutOfRange { .. } => Want::Unsupported,
-            PlcWriteError::ConflictingBitWrite { .. }
-            | PlcWriteError::BitWriteVerificationFailed { .. } => Want::Rejected,
+            PlcWriteError::ConflictingBitWrite { .. } => Want::Rejected,
+            PlcWriteError::BitWriteVerificationFailed { .. } => Want::VerificationFailed,
             PlcWriteError::ConnectTimeout(_)
             | PlcWriteError::Connection(_)
             | PlcWriteError::NotConnected => Want::Io,
@@ -149,6 +150,7 @@ mod tests {
             Ok(ItemError::Device(_)) => Want::Device,
             Ok(ItemError::Unsupported(_)) => Want::Unsupported,
             Ok(ItemError::Rejected(_)) => Want::Rejected,
+            Ok(ItemError::VerificationFailed(_)) => Want::VerificationFailed,
             Err(FatalError::Io(_)) => Want::Io,
             Err(FatalError::Timeout) => Want::Timeout,
             Err(FatalError::Framing(_)) => Want::Framing,
@@ -347,6 +349,14 @@ mod tests {
         assert_eq!(
             classify_write(e.clone()),
             Ok(ItemError::Rejected(e.to_string()))
+        );
+        let e = PlcWriteError::BitWriteVerificationFailed {
+            area: "D100".into(),
+            bit: 5,
+        };
+        assert_eq!(
+            classify_write(e.clone()),
+            Ok(ItemError::VerificationFailed(e.to_string()))
         );
         // Fatal rows keep the underlying text.
         assert_eq!(

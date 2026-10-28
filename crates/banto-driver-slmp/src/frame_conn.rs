@@ -41,7 +41,7 @@
 //!   again to confirm. A non-zero end code at any step is
 //!   `ItemError::Device` for the items of that write or that RMW alone, and
 //!   that RMW sends nothing more; the next write or RMW is still sent. A
-//!   confirming read that disagrees is `ItemError::Rejected` for the
+//!   confirming read that disagrees is `ItemError::VerificationFailed` for the
 //!   disagreeing bit alone (`BitWriteVerificationFailed`). A response whose
 //!   fields do not match is `FatalError::Framing` and drops the write in
 //!   progress. `write_next(None)` always starts afresh.
@@ -1058,7 +1058,7 @@ mod tests {
     }
 
     /// C14 on the driver: the confirming read disagrees for one bit; that
-    /// item alone is `Rejected`.
+    /// item alone is `VerificationFailed`.
     #[test]
     fn a_confirmation_mismatch_rejects_that_bit_alone() {
         let mut c = conn("R", "low_high");
@@ -1069,7 +1069,7 @@ mod tests {
         sent(c.write_next(&items, Some(&ok(&[]))).unwrap());
         let r = done(c.write_next(&items, Some(&word(0x0020))).unwrap());
         assert!(
-            matches!(&r[0], Err(ItemError::Rejected(m)) if m.contains("D400")),
+            matches!(&r[0], Err(ItemError::VerificationFailed(m)) if m.contains("D400")),
             "{r:?}"
         );
         assert_eq!(r[1], Ok(()));
