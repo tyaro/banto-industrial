@@ -77,6 +77,7 @@
 	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
 	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
 	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
+	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 	import { secretStorageWarnings } from '#lib/banto/secretStorageView.js';
 	import {
 		startCollection,
@@ -164,7 +165,7 @@
 	}
 
 	function formatDateTime(value: string): string {
-		return new Date(value).toLocaleString('ja-JP');
+		return formatSqliteUtc(value);
 	}
 
 	/**
