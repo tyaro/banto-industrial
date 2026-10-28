@@ -529,6 +529,32 @@ async fn save_line(
     host: (&str, &str),
     tags: &[(&str, &str, &str)],
 ) -> (i64, Vec<i64>) {
+    save_line_with(app, fixture, name, guest, host, &[], tags).await
+}
+
+/// [save_line] with extra guest settings (for example `register_bit_write`).
+async fn save_line_with(
+    app: &super::TestApp,
+    fixture: &Fixture,
+    name: &str,
+    guest: (&str, &str),
+    host: (&str, &str),
+    extra: &[(&str, &str)],
+    tags: &[(&str, &str, &str)],
+) -> (i64, Vec<i64>) {
+    let mut settings = serde_json::json!({
+        "host": "127.0.0.1", "port": fixture.port, "unit_id": 1,
+        "probe_address": "30001",
+        "write_mode": guest.0, "write_allowlist": guest.1,
+        "modbus_operational_write_mode": host.0,
+        "modbus_operational_write_allowlist": host.1
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    for (key, value) in extra {
+        settings.insert((*key).into(), (*value).into());
+    }
     let saved = app
         .manager
         .plc_connections()
@@ -537,16 +563,7 @@ async fn save_line(
             protocol: "modbus-fc3-wasm".into(),
             enabled: true,
             simulation: false,
-            settings: serde_json::json!({
-                "host": "127.0.0.1", "port": fixture.port, "unit_id": 1,
-                "probe_address": "30001",
-                "write_mode": guest.0, "write_allowlist": guest.1,
-                "modbus_operational_write_mode": host.0,
-                "modbus_operational_write_allowlist": host.1
-            })
-            .as_object()
-            .unwrap()
-            .clone(),
+            settings,
             secrets: Default::default(),
         })
         .await
@@ -965,6 +982,107 @@ async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_uncertain_without_rep
     );
     assert!(fc22[2].0 > first_connection, "{fc22:?}");
     assert_eq!(fc22[2].1, vec![22, 0, 1, 0xff, 0xf7, 0, 8]);
+    assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
+    app.write_control.disable();
+}
+
+/// A coil-only or discrete-input-only device passes the Hub connection test
+/// through its one `0xxxx` / `1xxxx` probe point: the handshake reads exactly
+/// one bit with FC1 / FC2 and never reaches for a holding register (FC3).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn coil_and_discrete_input_probe_pass_the_connection_test_with_one_bit_read() {
+    for (probe, function) in [("00001", 1_u8), ("10001", 2_u8)] {
+        let fixture = Fixture::start().await;
+        let app = super::test_app_with_operational_write_manifest(
+            &format!("t12-modbus-probe-{probe}"),
+            &manifest(),
+            &component(),
+        )
+        .await;
+        let (status, body) = super::admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            serde_json::json!({
+                "protocol": "modbus-fc3-wasm", "simulation": false,
+                "settings": {
+                    "host": "127.0.0.1", "port": fixture.port, "unit_id": 1,
+                    "probe_address": probe
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, axum::http::StatusCode::OK, "{probe}: {body:?}");
+        assert_eq!(body["ok"], true, "{probe}: {body:?}");
+        let frames = fixture.frames();
+        assert_eq!(
+            frames.len(),
+            1,
+            "{probe}: exactly one bit read expected, got {frames:?}"
+        );
+        let (code, _, count) = frames[0];
+        assert_eq!((code, count), (function, 1), "{probe}: {frames:?}");
+        assert_eq!(fixture.accepted.load(Ordering::SeqCst), 1, "{probe}");
+    }
+}
+
+/// A connection declared without FC22 refuses `4xxxx.N` writes before send:
+/// nothing reaches the device, the link stays up and the refusal is audited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn register_bit_write_disabled_refuses_rest_write_before_send() {
+    let fixture = Fixture::start().await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-modbus-no-fc22",
+        &manifest(),
+        &component(),
+    )
+    .await;
+    let (connection, ids) = save_line_with(
+        &app,
+        &fixture,
+        "no-fc22-line",
+        ("enabled", "400001-400010"),
+        ("enabled", "400001-400010"),
+        &[("register_bit_write", "disabled")],
+        &[("hbit", "40002.3", "bit")],
+    )
+    .await;
+    app.manager.rebuild().await.unwrap();
+    wait_connected(&app, connection).await;
+    app.write_control.enable();
+    let tag = "no-fc22-line.line.hbit";
+    let (keys, key_id, key) = write_key(&app, "no-fc22", &[tag]).await;
+
+    for value in [true, false] {
+        let result = post(&app, &key, tag, value).await;
+        assert_eq!(
+            result.0,
+            super::StatusCode::BAD_GATEWAY,
+            "{value}: {:?}",
+            result.1
+        );
+        assert_eq!(result.1["error"], "write_failed", "{:?}", result.1);
+    }
+    let rows = audit_rows(&app, ids[0]).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert!(rows.iter().all(|row| row["result"] == "failed"), "{rows:?}");
+    assert!(
+        fixture.writes().is_empty(),
+        "no write frame may reach the device: {:?}",
+        fixture.writes()
+    );
+    assert_eq!(
+        fixture.accepted.load(Ordering::SeqCst),
+        1,
+        "a refusal must not drop or reopen the TCP connection"
+    );
+    assert_eq!(
+        *app.sessions.status_watch(connection).unwrap().borrow(),
+        banto_broker::BrokerConnectionStatus::Connected
+    );
     assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
     app.write_control.disable();
 }
