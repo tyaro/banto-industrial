@@ -8,6 +8,7 @@
 	 * シンプルな実装にしている（書き込み監査は監査ログほど件数の伸びが
 	 * 速くない想定 - 収集ではなく能動的な書き込み操作のみが対象）。
 	 */
+	import { onMount } from 'svelte';
 	import { isProviderError } from '@banto/admin-core';
 	import { toastStore } from '#lib/toast.svelte.js';
 	import { listWriteAudit, type WriteAuditEntry } from '#lib/banto/writeAuditAdmin.js';
@@ -53,7 +54,14 @@
 	 */
 	let resultFilter = $state('');
 
+	/**
+	 * 絞り込みを変えるたびに進める世代。`loadMore` は await の前に控え、戻った
+	 * ときに世代が変わっていたら（= 前の絞り込みの応答）捨てる。
+	 */
+	let generation = 0;
+
 	async function loadMore(): Promise<void> {
+		const gen = generation;
 		loading = true;
 		try {
 			const result = await listWriteAudit({
@@ -61,21 +69,26 @@
 				sort: [{ field: 'ts', direction: 'desc' }],
 				filters: resultFilter ? [{ field: 'result', op: 'eq', value: resultFilter }] : []
 			});
+			if (gen !== generation) return;
 			rows = [...rows, ...result.rows];
 			totalCount = result.totalCount;
 			loadedOffset += result.rows.length;
 		} catch (err) {
+			if (gen !== generation) return;
 			toastStore.push('error', errorMessage(err));
 		} finally {
-			loading = false;
+			// 古い要求が、新しい要求の loading を落とさない。
+			if (gen === generation) loading = false;
 		}
 	}
 
-	$effect(() => {
+	// 最初のページは mount で 1 回だけ。以後の絞り込み変更は changeResultFilter が起点。
+	onMount(() => {
 		void loadMore();
 	});
 
 	function changeResultFilter(event: Event): void {
+		generation += 1;
 		resultFilter = (event.currentTarget as HTMLSelectElement).value;
 		rows = [];
 		totalCount = 0;

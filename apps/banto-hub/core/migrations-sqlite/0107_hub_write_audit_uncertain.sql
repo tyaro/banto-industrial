@@ -8,6 +8,8 @@
 -- 足す」）。`hub_write_audit` を参照する FOREIGN KEY は無いので、単純な
 -- 作り直しで足りる。`id` をそのまま写すので、AUTOINCREMENT の続き番号は
 -- 写した最大値から続く（RENAME で `sqlite_sequence` の名前も付け替わる）。
+-- 作り直し後の `sqlite_sequence` は写した行の MAX(id) から再開するので、末尾で
+-- 消した行の id は再利用され得る。監査行を消す処理は無いので今は害が無い。
 CREATE TABLE hub_write_audit_new (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts TEXT NOT NULL DEFAULT (datetime('now')),
