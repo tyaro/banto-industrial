@@ -19,6 +19,7 @@ R2b-6a（docs/banto-hub-driver-ui-design.md §3.3・§3.4・§3.6）。`banto-dr
 ### 壊れること
 
 - 新しい確認で、既存のドライバが落ちうる。**スキーマが空で、`kind_examples` / `word_offsets` を渡さないドライバは今までどおり通る**（C20 は `probe` の種類が `supported_kinds` に入っていることだけを見る。既定の一覧は 64bit を除く数値と bit なので、`probe` が 64bit や string のドライバは `supported_kinds` を足す）。スキーマを書いたドライバは C17〜C19 を満たすこと。
+- C14（`verify_mismatch`）で、確認読みが合わないビットの結果に `ItemError::VerificationFailed` を求めるようにした（#902。これまでは `Rejected`）。送ったあとの確認読みの不一致を `Rejected` で返していたドライバは、`VerificationFailed` に変える。
 
 ## 0.2.0 — 未公開
 

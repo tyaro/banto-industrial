@@ -760,7 +760,7 @@ impl EchoConnection {
                                 results[*i] = Some(if (got >> bit & 1 == 1) == *on {
                                     Ok(())
                                 } else {
-                                    Err(ItemError::Rejected(format!(
+                                    Err(ItemError::VerificationFailed(format!(
                                         "確認読みでビット {bit} が違う"
                                     )))
                                 });

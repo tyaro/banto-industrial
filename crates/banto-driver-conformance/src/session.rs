@@ -26,7 +26,7 @@
 //! | C8 | 100 alternating reads and writes use exactly one accepted connection (#337), and every write reads back as written |
 //! | C12 | a string of 0 words, or of `fixtures.max_string_words + 1`, is `ItemError::Unsupported` (or refused by `parse_address`) |
 //! | C13 | for each [`BitWriteCase`]: on a word holding `0x0000`, `0x0100`, `0xFFFF` and `0x0008`, writing the bit `true` / `false` changes only that bit; writing two bits of the word in one batch sends no more than writing one (one read-modify-write) |
-//! | C14 | (`verify_mismatch`) when the check read disagrees for one bit, that bit's request alone is `ItemError::Rejected`, its batch-mate succeeds, the connection is kept and the next write is correct |
+//! | C14 | (`verify_mismatch`) when the check read disagrees for one bit, that bit's request alone is `ItemError::VerificationFailed`, its batch-mate succeeds, the connection is kept and the next write is correct |
 //! | C15 | (`refusals`) a device refusal at any step of the read-modify-write makes the bit's request `ItemError::Device`, no further request is sent (counted by turn, [`FaultProxy::request_count`], so TCP segmentation does not matter), the connection is kept and the next write is correct |
 //!
 //! C9-C11 and C16 are frame-type checks (R2b-3). C13-C15 run only for the
@@ -1154,7 +1154,7 @@ impl Cx<'_, '_, '_> {
                 self.proxy.set_faults(Faults::new());
                 match result {
                     Ok(r)
-                        if matches!(r.as_slice(), [Err(ItemError::Rejected(_)), Ok(())]) => {}
+                        if matches!(r.as_slice(), [Err(ItemError::VerificationFailed(_)), Ok(())]) => {}
                     other => self.fail(
                         "C14",
                         format!(

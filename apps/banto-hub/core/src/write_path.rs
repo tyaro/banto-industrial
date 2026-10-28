@@ -168,7 +168,8 @@
 //! | `Ok(results)` で項目の結果が欠けた | `uncertain` | broker に渡したあとで結果が無い |
 //! | `ItemError::Device` | `failed` | PLC が完全な応答でエラーを返した |
 //! | `ItemError::Unsupported` | `failed` | 送る前の組み合わせの拒否 |
-//! | `ItemError::Rejected` | `failed` | ドライバの事前の拒否(同じビットに true と false など)。RMW の確認読みの不一致もこの値で来て区別できない(既知の限界、#898 の報告) |
+//! | `ItemError::Rejected` | `failed` | ドライバの送る前の拒否(同じビットに true と false など) |
+//! | `ItemError::VerificationFailed` | `uncertain` | 送ったあとの RMW の確認読みの不一致(#902)。機器には効いているかもしれない。WASM ゲストはこの値をまだ返せない(WIT に無い) |
 //! | 将来の `ItemError` の値 | `uncertain` | 意味が分からない値は「効いていない」と言い切らない |
 //!
 //! HTTP/gRPC の応答([`WriteRejection`])は変えていない: どちらも
@@ -1016,7 +1017,8 @@ pub async fn execute_write(
     };
     let outcome = outcome.map_err(|failure| failure.rejection);
     // T8-2 (docs/tag-server-design.md §6.1, 2026-08-06): carry the
-    // rejection's detail (e.g. `PlcWriteError::BitWriteVerificationFailed`'s
+    // rejection's detail (e.g. `PlcWriteError::BitWriteVerificationFailed`'s,
+    // i.e. `ItemError::VerificationFailed` - audited as `uncertain`, #902:
     // 「書き戻し競合の可能性があります」for a T8 RMW confirmation-read
     // mismatch) into the confirmed audit row, reusing exactly the same
     // `WriteRejection::detail()` the REST/gRPC response bodies already show
@@ -1753,12 +1755,13 @@ fn broker_error_audit_result(err: &banto_broker::BrokerError) -> WriteAuditResul
 fn item_error_audit_result(err: &ItemError) -> WriteAuditResult {
     match err {
         // PLC が完全な応答でエラーを返した・送る前の組み合わせの拒否・
-        // ドライバの事前の拒否。`Rejected` には RMW の確認読みの不一致
-        // (送ったあと)も来るが、値の上で区別できないので `failed` のまま
-        // (このモジュールの doc comment の表、既知の限界)。
+        // ドライバの送る前の拒否。どれも効いていない。
         ItemError::Device(_) | ItemError::Unsupported(_) | ItemError::Rejected(_) => {
             WriteAuditResult::Failed
         }
+        // 送ったあとの確認読みの不一致(#902)。機器には効いているかもしれ
+        // ないので、「効いていない」と言い切らない。
+        ItemError::VerificationFailed(_) => WriteAuditResult::Uncertain,
         // `ItemError` は `#[non_exhaustive]`。意味の分からない値で
         // 「効いていない」と言い切らない。
         _ => WriteAuditResult::Uncertain,
@@ -2206,6 +2209,28 @@ mod tests {
                 ),
                 audit: WriteAuditResult::Uncertain,
             })
+        );
+    }
+
+    /// #902: 送ったあとの確認読みの不一致は `uncertain`(送る前の
+    /// `Rejected` は `failed`)。
+    #[test]
+    fn a_verification_mismatch_after_sending_is_uncertain() {
+        let mismatch = ItemError::VerificationFailed("D100 のビット 5".into());
+        assert_eq!(
+            item_error_audit_result(&mismatch),
+            WriteAuditResult::Uncertain
+        );
+        assert_eq!(
+            item_outcome(Some(&Err(mismatch.clone()))),
+            Err(PlcWriteFailure {
+                rejection: WriteRejection::WriteFailed(mismatch.to_string()),
+                audit: WriteAuditResult::Uncertain,
+            })
+        );
+        assert_eq!(
+            item_error_audit_result(&ItemError::Rejected("同じビットに true と false".into())),
+            WriteAuditResult::Failed
         );
     }
 

@@ -19,6 +19,10 @@ use std::fmt;
 
 /// A per-item (non-fatal) error: only that tag is Bad (WIT
 /// `variant item-error { device(device-error), unsupported(string), rejected(string) }`).
+///
+/// [`ItemError::VerificationFailed`] is not in the WIT `item-error` yet
+/// (a follow-up PR, #902); a WASM guest's `rejected` maps to
+/// [`ItemError::Rejected`].
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(
@@ -34,11 +38,15 @@ pub enum ItemError {
     /// (data type vs. area, string length out of range, the other
     /// protocol's notation).
     Unsupported(String),
-    /// The driver itself refused, or its verification found a mismatch
-    /// (true and false written to the same bit of one word in one batch, a
-    /// read-modify-write check read that disagrees). Neither a device
-    /// refusal nor a configuration mismatch; still non-fatal.
+    /// The driver itself refused **before sending** (true and false written
+    /// to the same bit of one word in one batch). Nothing reached the
+    /// device. Neither a device refusal nor a configuration mismatch; still
+    /// non-fatal.
     Rejected(String),
+    /// The write was sent, and the driver's own confirming read disagrees
+    /// (a read-modify-write check read). The device may have applied it;
+    /// read back before writing again. Still non-fatal.
+    VerificationFailed(String),
 }
 
 impl fmt::Display for ItemError {
@@ -47,6 +55,9 @@ impl fmt::Display for ItemError {
             ItemError::Device(e) => fmt::Display::fmt(e, f),
             ItemError::Unsupported(m) => write!(f, "扱えない組み合わせです: {m}"),
             ItemError::Rejected(m) => write!(f, "ドライバが断りました: {m}"),
+            ItemError::VerificationFailed(m) => {
+                write!(f, "書込み後の確認読みが合いません: {m}")
+            }
         }
     }
 }
@@ -177,6 +188,10 @@ mod tests {
         assert_eq!(
             ItemError::Rejected("同じビットに true と false".into()).to_string(),
             "ドライバが断りました: 同じビットに true と false"
+        );
+        assert_eq!(
+            ItemError::VerificationFailed("D100 のビット 5".into()).to_string(),
+            "書込み後の確認読みが合いません: D100 のビット 5"
         );
     }
 
