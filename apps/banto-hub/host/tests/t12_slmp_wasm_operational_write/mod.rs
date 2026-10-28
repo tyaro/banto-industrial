@@ -2970,7 +2970,12 @@ async fn new_guest_frame_3e_handshake_collection_and_read_now_use_only_3e() {
         assert!(commands.iter().any(|(command, _, _)| *command == 0x0101));
         assert!(commands.iter().any(|(command, _, _)| *command == 0x0401));
         let headers = fixture.headers();
-        assert_eq!(headers.len(), commands.len());
+        // Collection keeps running: a header is recorded before its command
+        // and is snapshotted after `commands`, so it can only be ahead.
+        assert!(
+            headers.len() >= commands.len(),
+            "{headers:02x?} {commands:?}"
+        );
         assert!(
             headers
                 .iter()
