@@ -6,11 +6,13 @@
  * （vitest 対象）に切り出し、ここでは runes への配線と
  * `window.matchMedia` の購読（`viewportWatch.ts`）だけを行う。
  */
-import { untrack } from 'svelte';
+import { tick, untrack } from 'svelte';
 import { settings } from './settings.svelte';
 import {
 	applyNarrowChange,
+	findVisibleNavToggle,
 	initialMobileNavState,
+	NAV_TOGGLE_ATTR,
 	resolveHamburgerTarget,
 	type MobileNavState
 } from './mobileNav';
@@ -65,20 +67,38 @@ class MobileNavStore {
 	watchViewport(): () => void {
 		return watchMediaQuery(NARROW_BREAKPOINT_QUERY, (matches) => {
 			untrack(() => {
+				// #714（#909 レビュー）: 幅の切り替えで、フォーカスのあった ☰ が消える
+				// ことがある（狭幅のヘッダー ☰ → 広幅で消える、など）。消えるとフォーカスが
+				// `<body>` に落ちるので、**状態を変える前（DOM 更新前）**に「☰ にフォーカスが
+				// あったか」を控え、更新後に見えている側の ☰ へ移す。☰ 以外にフォーカスが
+				// あるときは何もしない（奪わない）。
+				const active = document.activeElement;
+				const hadToggleFocus =
+					active instanceof HTMLElement && active.hasAttribute(NAV_TOGGLE_ATTR);
 				this.#state = applyNarrowChange(this.#state, matches);
+				if (!hadToggleFocus) return;
+				void tick().then(() => {
+					const now = document.activeElement;
+					const stillOnToggle =
+						now instanceof HTMLElement && now.isConnected && now.hasAttribute(NAV_TOGGLE_ATTR);
+					if (!stillOnToggle) findVisibleNavToggle()?.focus();
+				});
 			});
 		});
 	}
 
 	/**
-	 * `Header.svelte` の ☰ ボタンから呼ぶ振り分け: 狭幅ではオフキャンバスの
-	 * 開閉、デスクトップでは従来どおりサイドバーの折り畳み。
+	 * `Header.svelte`（狭幅・折り畳み中）と `Sidebar.svelte`（広幅・開いている間）の
+	 * トグルから呼ぶ振り分け: 狭幅ではオフキャンバスの開閉、デスクトップでは
+	 * サイドバーの折り畳み。デスクトップでは押したボタンが入れ替わって消えるので、
+	 * 描画後に見えている側のトグルへフォーカスを移す（#714）。
 	 */
 	toggleHamburger(): void {
 		if (resolveHamburgerTarget(this.#state.isNarrow) === 'offcanvas') {
 			this.toggleNav();
 		} else {
 			settings.toggleSidebar();
+			void tick().then(() => findVisibleNavToggle()?.focus());
 		}
 	}
 }

@@ -37,3 +37,25 @@ export type HamburgerTarget = 'offcanvas' | 'desktop-collapse';
 export function resolveHamburgerTarget(isNarrow: boolean): HamburgerTarget {
 	return isNarrow ? 'offcanvas' : 'desktop-collapse';
 }
+
+/** ☰ ボタン（ヘッダー側・サイドバー側）が付ける印。フォーカスの逃げ先の探索に使う。 */
+export const NAV_TOGGLE_ATTR = 'data-nav-toggle';
+
+/** サイドバー（`<aside>`）の id。トグルの `aria-controls` が指す。 */
+export const SIDEBAR_ID = 'app-sidebar';
+
+/**
+ * #714: 折り畳み/開くボタンは状態により「サイドバー側」と「ヘッダー側」の
+ * どちらか一方だけが出る（広幅・開いている → サイドバー側、折り畳み中 /
+ * 狭幅 → ヘッダー側）。押すと押した側が消えるので、フォーカスの逃げ先は
+ * **いま見えている方のトグル**を探して返す（`<body>` に落とさない）。
+ */
+export function findVisibleNavToggle(root: ParentNode = document): HTMLElement | null {
+	for (const el of root.querySelectorAll<HTMLElement>(`[${NAV_TOGGLE_ATTR}]`)) {
+		if (el.closest('[inert]')) continue;
+		if (el.getClientRects().length === 0) continue;
+		if (getComputedStyle(el).visibility === 'hidden') continue;
+		return el;
+	}
+	return null;
+}

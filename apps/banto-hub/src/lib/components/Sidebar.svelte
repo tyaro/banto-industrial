@@ -5,6 +5,7 @@
 	import { navItems, resolveAppPath, type NavItem } from '#lib/navigation.js';
 	import { settings } from '#lib/settings.svelte.js';
 	import { mobileNavStore } from '#lib/mobileNav.svelte.js';
+	import { NAV_TOGGLE_ATTR, SIDEBAR_ID, findVisibleNavToggle } from '#lib/mobileNav.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 	import { APP_NAME } from '#lib/appName.js';
@@ -32,7 +33,7 @@
 
 	/**
 	 * #381 レビュー対応12回目（層の約束・項目6、`@banto/ui` の `layering.ts`）: **退避した
-	 * 瞬間、中にフォーカスが残っていたらヘッダーの ☰ へ逃がす**（`SplitPane` の
+	 * 瞬間、中にフォーカスが残っていたらいま見えている ☰ トグルへ逃がす**（`SplitPane` の
 	 * `focusFallback` と同じ役割）。オフキャンバスは閉じると `inert` になるので、
 	 * 中の項目にフォーカスが残っていると `<body>` へ落ちる - 実際に踏むのは
 	 * 「サイドバーの項目にフォーカス → コマンドパレットのナビ系コマンド →
@@ -66,7 +67,7 @@
 			// フォーカスがあった」ことがもう分からない。移すのは更新後（`tick()`）。
 			const active = document.activeElement;
 			if (!(active instanceof HTMLElement) || !asideEl?.contains(active)) return;
-			void tick().then(() => document.querySelector<HTMLElement>('header button')?.focus());
+			void tick().then(() => findVisibleNavToggle()?.focus());
 		});
 	});
 
@@ -85,6 +86,7 @@
 	`visibility: hidden` を併用する（`SplitPane` の退避ペインと同じ形）。
 -->
 <aside
+	id={SIDEBAR_ID}
 	bind:this={asideEl}
 	class:collapsed
 	class:offcanvas={mobileNavStore.isNarrow}
@@ -96,6 +98,23 @@
 		<span class="brand-icon">🏮</span>
 		{#if !collapsed}
 			<span class="brand-name">{APP_NAME}</span>
+		{/if}
+		<!--
+			#714: 広幅・開いている間の折り畳みボタン（ロゴ行）。折り畳み中 / 狭幅は
+			ヘッダー側の ☰ が開く役（`Header.svelte`）。同時に 2 つは出さない。
+		-->
+		{#if !mobileNavStore.isNarrow && !collapsed}
+			<button
+				type="button"
+				class="collapse-toggle"
+				onclick={() => mobileNavStore.toggleHamburger()}
+				aria-label="サイドバーを折りたたむ"
+				aria-expanded={true}
+				aria-controls={SIDEBAR_ID}
+				{...{ [NAV_TOGGLE_ATTR]: '' }}
+			>
+				☰
+			</button>
 		{/if}
 	</div>
 
@@ -201,6 +220,24 @@
 		padding: 0 0.9rem;
 		border-bottom: 1px solid var(--banto-border);
 		font-weight: 700;
+	}
+
+	/* #714: ロゴ行の右端に寄せる折り畳みボタン（Header の .icon-button と同じ見た目）。 */
+	.collapse-toggle {
+		margin-left: auto;
+		border: none;
+		background: none;
+		color: var(--banto-text-muted);
+		padding: 0.35rem 0.5rem;
+		border-radius: var(--banto-radius);
+		cursor: pointer;
+		font-size: 0.875rem;
+		font-weight: 400;
+	}
+
+	.collapse-toggle:hover {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		color: var(--banto-text);
 	}
 
 	nav {
