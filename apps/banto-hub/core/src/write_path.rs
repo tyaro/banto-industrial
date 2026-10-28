@@ -1507,7 +1507,9 @@ pub async fn execute_write_batch(
         };
 
         // 同一接続は1ジョブ(§3.3 の核心) - `requests` を丸ごと1回
-        // `handle.write` へ渡す。
+        // `handle.write` へ渡す。送る前に、項目ごとの「保持レジスタのビット
+        // か」を控える(#899、グループ全体の失敗でもヒントは該当項目だけ)。
+        let register_bits: Vec<bool> = requests.iter().map(is_holding_register_bit).collect();
         match handle.write(requests).await {
             Ok(results) => {
                 for (k, (i, audit_id)) in sent_indices.into_iter().enumerate() {
@@ -1537,8 +1539,9 @@ pub async fn execute_write_batch(
                 // グループ全体が broker 呼び出し自体で失敗(単票の
                 // `handle.write` の `Err(err)` 分岐と同じ扱い。監査の結果も
                 // 同じ分類 - #898、`broker_failure`)。
-                for (i, audit_id) in sent_indices {
-                    let PlcWriteFailure { rejection, audit } = broker_failure(&err);
+                for (k, (i, audit_id)) in sent_indices.into_iter().enumerate() {
+                    let register_bit = register_bits.get(k).copied().unwrap_or(false);
+                    let PlcWriteFailure { rejection, audit } = broker_failure(&err, register_bit);
                     let detail =
                         write_target_detail(prepared[i].target, rejection.detail().as_deref());
                     if let Err(set_err) = deps
@@ -1597,6 +1600,7 @@ async fn write_plc_tag(
         tag_row,
         requested,
     )?;
+    let register_bit = is_holding_register_bit(&request);
 
     let Some(handle) = deps.manager.write_broker_handle_peek(conn.id) else {
         // T15-4: セッションが無い(収集停止・`stop_and_join`との競合など) -
@@ -1607,7 +1611,7 @@ async fn write_plc_tag(
 
     match handle.write(vec![request]).await {
         Ok(results) => item_outcome(results.first()),
-        Err(err) => Err(broker_failure(&err)),
+        Err(err) => Err(broker_failure(&err, register_bit)),
     }
 }
 
@@ -1761,11 +1765,40 @@ fn item_error_audit_result(err: &ItemError) -> WriteAuditResult {
     }
 }
 
-/// `BrokerHandle::write` の Err を、拒否と監査の結果にする(単票・バッチが
-/// 共有する)。拒否の文言は従来どおり broker のエラーの文。
-fn broker_failure(err: &banto_broker::BrokerError) -> PlcWriteFailure {
+/// Modbus の保持レジスタのビット書込み(`4xxxx.N`)が無応答のときに、拒否の
+/// 文言へ足すヒント(#899、2026-10-28 オーナー決定: 動きは変えず文言だけ)。
+const FC22_TIMEOUT_HINT: &str = "(保持レジスタのビットの書込みは FC22 で送ります。応答が無い場合、機器が FC22 に対応していない可能性があります)";
+
+/// 書込み項目が Modbus の保持レジスタのビット(`4xxxx.N`、WASM の Modbus
+/// ドライバが FC22 Mask Write 1 本で送る)か(#899)。アドレスの構造
+/// (area が `holding_register` で `bit` つき)で見る。SLMP の `D100.5` は
+/// area が `D` なので当たらない。native の Modbus ドライバはこの組み合わせを
+/// `Unsupported` で送る前に断る(`banto-driver-modbus` の `write_request`)ので、
+/// ドライバ側の絞り込みは要らない。
+fn is_holding_register_bit(item: &WriteItem) -> bool {
+    let address = &item.spec.address;
+    address.area == "holding_register" && address.bit.is_some()
+}
+
+/// `BrokerHandle::write` 自体の Err を、拒否と監査の結果にする(単票・バッチが
+/// 共有する)。拒否の文言は従来どおり broker のエラーの文。ただし
+/// `register_bit`(保持レジスタのビット)で、機器が応答しなかった
+/// (`ConnectionFailed` の理由が `FatalError::Timeout` の文)ときだけ、
+/// FC22 に未対応の可能性のヒントを添える(#899)。監査の結果・HTTP の分類は
+/// 変えない。
+fn broker_failure(err: &banto_broker::BrokerError, register_bit: bool) -> PlcWriteFailure {
+    let mut message = err.to_string();
+    if register_bit
+        && matches!(
+            err,
+            banto_broker::BrokerError::ConnectionFailed { reason, .. }
+                if *reason == banto_driver_api::FatalError::Timeout.to_string()
+        )
+    {
+        message.push_str(FC22_TIMEOUT_HINT);
+    }
     PlcWriteFailure {
-        rejection: WriteRejection::WriteFailed(err.to_string()),
+        rejection: WriteRejection::WriteFailed(message),
         audit: broker_error_audit_result(err),
     }
 }
@@ -1812,7 +1845,7 @@ async fn write_plc_string_tag(
 
     match handle.write(vec![request]).await {
         Ok(results) => item_outcome(results.first()),
-        Err(err) => Err(broker_failure(&err)),
+        Err(err) => Err(broker_failure(&err, false)),
     }
 }
 
@@ -2071,7 +2104,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                broker_failure(&err),
+                broker_failure(&err, false),
                 PlcWriteFailure {
                     rejection: WriteRejection::WriteFailed(err.to_string()),
                     audit,
@@ -2079,6 +2112,68 @@ mod tests {
                 "{err:?}"
             );
         }
+    }
+
+    fn write_item_at(area: &str, bit: Option<u8>) -> WriteItem {
+        let mut address = banto_driver_api::DriverAddress::new(
+            banto_driver_api::DriverId::new("modbus-fc3-wasm").unwrap(),
+            "400001",
+            area,
+            true,
+            1,
+        );
+        if let Some(bit) = bit {
+            address = address.with_bit(bit);
+        }
+        WriteItem::new(
+            TagSpec::new(address, TagKind::numeric(DataType::Bit)),
+            Value::Bit(true),
+        )
+    }
+
+    /// #899: 保持レジスタのビット(FC22)の無応答だけに、FC22 未対応の可能性の
+    /// ヒントが付く。監査の結果は `uncertain` のまま。
+    #[test]
+    fn fc22_hint_only_on_holding_register_bit_timeout() {
+        use banto_broker::BrokerError;
+        let bit = write_item_at("holding_register", Some(3));
+        let word = write_item_at("holding_register", None);
+        let coil = write_item_at("coil", None);
+        let slmp_bit = write_item_at("D", Some(5));
+        assert!(is_holding_register_bit(&bit));
+        assert!(!is_holding_register_bit(&word));
+        assert!(!is_holding_register_bit(&coil));
+        assert!(!is_holding_register_bit(&slmp_bit));
+
+        let timeout = BrokerError::ConnectionFailed {
+            connection_id: 1,
+            reason: banto_driver_api::FatalError::Timeout.to_string(),
+        };
+        let with_hint = broker_failure(&timeout, true);
+        assert_eq!(
+            with_hint.rejection,
+            WriteRejection::WriteFailed(format!("{timeout}{FC22_TIMEOUT_HINT}"))
+        );
+        assert_eq!(with_hint.audit, WriteAuditResult::Uncertain);
+        assert!(with_hint.rejection.detail().unwrap().contains("FC22"));
+        // ワード・コイルなど(register_bit = false)にはヒントを付けない。
+        let plain = broker_failure(&timeout, false);
+        assert_eq!(
+            plain.rejection,
+            WriteRejection::WriteFailed(timeout.to_string())
+        );
+        assert_eq!(plain.audit, WriteAuditResult::Uncertain);
+        // 応答なし以外の ConnectionFailed(応答の不一致など)にも付けない。
+        let mismatch = BrokerError::ConnectionFailed {
+            connection_id: 1,
+            reason: "応答のプロトコルが一致しません".into(),
+        };
+        let got = broker_failure(&mismatch, true);
+        assert_eq!(
+            got.rejection,
+            WriteRejection::WriteFailed(mismatch.to_string())
+        );
+        assert_eq!(got.audit, WriteAuditResult::Uncertain);
     }
 
     /// #898: `Ok(results)` の 1 件ぶん。PLC のエラー(`Device`)・送る前の
