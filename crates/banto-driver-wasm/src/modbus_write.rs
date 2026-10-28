@@ -96,13 +96,21 @@ impl Policy {
         Ok(Self { enabled, ranges })
     }
 
-    fn allows(&self, area: Area, start: u32, end: u32) -> bool {
-        self.enabled
-            && end <= MAX_ADDRESS
+    /// Host permission for the span; the error is the refusal reason ("disabled" wins).
+    fn check(&self, area: Area, start: u32, end: u32) -> Result<(), &'static str> {
+        if !self.enabled {
+            return Err("Modbus writes are disabled");
+        }
+        if end <= MAX_ADDRESS
             && self
                 .ranges
                 .iter()
                 .any(|&(candidate, from, to)| candidate == area && from <= start && end <= to)
+        {
+            Ok(())
+        } else {
+            Err("outside the Modbus write allowlist")
+        }
     }
 }
 
@@ -191,28 +199,35 @@ pub(super) fn validate_guest_schema(
     Ok(())
 }
 
+const REASON_TYPE: &str = "tag type cannot be written to this area";
+const REASON_RUN: &str = "request is not one contiguous run of writable addresses";
+const REASON_VALUE: &str = "value does not fit the tag type";
+const REASON_BIT: &str = "register bit address does not match this connection";
+
 pub(super) fn preflight(
     items: &[WriteItem],
     driver_id: &DriverId,
     policy: &Policy,
 ) -> Result<Vec<write::WriteItem>, WriteProgress> {
-    let refused = || {
+    let refused = |reason: &str| {
         WriteProgress::Done(vec![
-            Err(ItemError::Unsupported(
-                "Modbus write is disabled or outside the operational allowlist".into()
-            ));
+            Err(ItemError::Unsupported(reason.into()));
             items.len()
         ])
     };
     if let [item] = items {
         if item.spec.address.bit.is_some() {
-            return register_bit(item, driver_id, policy).ok_or_else(refused);
+            return register_bit(item, driver_id, policy).map_err(refused);
         }
     }
-    let first = items.first().ok_or_else(refused)?;
-    let (area, start) = parse_reference(&first.spec.address.canonical).map_err(|_| refused())?;
+    let first = items.first().ok_or_else(|| refused(REASON_RUN))?;
+    if items.iter().any(|item| item.spec.address.bit.is_some()) {
+        return Err(refused("a register bit must be written alone"));
+    }
+    let (area, start) =
+        parse_reference(&first.spec.address.canonical).map_err(|_| refused(REASON_RUN))?;
     if area == Area::Coil && items.len() != 1 {
-        return Err(refused());
+        return Err(refused("coil writes are one point per request"));
     }
     let mut next = start;
     let mut checked = Vec::with_capacity(items.len());
@@ -220,16 +235,16 @@ pub(super) fn preflight(
         let address = &item.spec.address;
         let kind = match &item.spec.kind {
             TagKind::Numeric(kind) => *kind,
-            _ => return Err(refused()),
+            _ => return Err(refused(REASON_TYPE)),
         };
         let width = if area == Area::Coil {
             if kind != DataType::Bit {
-                return Err(refused());
+                return Err(refused(REASON_TYPE));
             }
             1
         } else {
             if kind == DataType::Bit {
-                return Err(refused());
+                return Err(refused(REASON_TYPE));
             }
             u32::from(kind.register_span())
         };
@@ -237,12 +252,11 @@ pub(super) fn preflight(
             || address.driver != *driver_id
             || address.area != area.name()
             || !address.writable_area
-            || address.bit.is_some()
             || address.index != Some(u64::from(next))
             || address.canonical != area.canonical(next)
             || u32::from(address.word_count) != width
         {
-            return Err(refused());
+            return Err(refused(REASON_RUN));
         }
         let value = match (kind, &item.value) {
             (DataType::Bit, api::Value::Bit(value)) if area == Area::Coil => {
@@ -283,7 +297,7 @@ pub(super) fn preflight(
             {
                 write_types::Value::Float(*value)
             }
-            _ => return Err(refused()),
+            _ => return Err(refused(REASON_VALUE)),
         };
         checked.push(write::WriteItem {
             spec: write_types::TagSpec {
@@ -297,15 +311,17 @@ pub(super) fn preflight(
             },
             value,
         });
-        next = next.checked_add(width).ok_or_else(refused)?;
+        next = next.checked_add(width).ok_or_else(|| refused(REASON_RUN))?;
     }
     let span = next - start;
-    if span == 0
-        || span > if area == Area::Coil { 1 } else { MAX_WORDS }
-        || !policy.allows(area, start, next - 1)
-    {
-        return Err(refused());
+    // Unreachable (items are non-empty and every width is at least 1); kept as a guard.
+    if span == 0 {
+        return Err(refused(REASON_RUN));
     }
+    if span > if area == Area::Coil { 1 } else { MAX_WORDS } {
+        return Err(refused("too many registers in one request"));
+    }
+    policy.check(area, start, next - 1).map_err(refused)?;
     Ok(checked)
 }
 
@@ -317,33 +333,41 @@ fn register_bit(
     item: &WriteItem,
     driver_id: &DriverId,
     policy: &Policy,
-) -> Option<Vec<write::WriteItem>> {
+) -> Result<Vec<write::WriteItem>, &'static str> {
     let address = &item.spec.address;
-    let bit = address.bit.filter(|bit| *bit <= 15)?;
-    let (word, bit_text) = address.canonical.split_once('.')?;
-    let (area, index) = parse_reference(word).ok()?;
+    let bit = address.bit.filter(|bit| *bit <= 15).ok_or(REASON_BIT)?;
+    let (word, bit_text) = address.canonical.split_once('.').ok_or(REASON_BIT)?;
+    let parsed = parse_reference(word);
+    if parsed.map_or(address.area != Area::Holding.name(), |(area, _)| {
+        area != Area::Holding
+    }) {
+        return Err("only holding register bits can be written");
+    }
+    let (area, index) = parsed.map_err(|_| REASON_BIT)?;
+    if item.spec.kind != TagKind::numeric(DataType::Bit) {
+        return Err(REASON_TYPE);
+    }
     let api::Value::Bit(value) = item.value else {
-        return None;
+        return Err(REASON_VALUE);
     };
-    (area == Area::Holding
-        && item.spec.kind == TagKind::numeric(DataType::Bit)
-        && bit_text == bit.to_string()
-        && address.driver == *driver_id
-        && address.area == area.name()
-        && address.writable_area
-        && address.index == Some(u64::from(index))
-        && address.word_count == 1
-        && policy.allows(area, index, index))
-    .then(|| {
-        vec![write::WriteItem {
-            spec: write_types::TagSpec {
-                address: address.canonical.clone(),
-                data_type: "bool".into(),
-                string_words: None,
-            },
-            value: write_types::Value::Bool(value),
-        }]
-    })
+    if bit_text != bit.to_string()
+        || address.driver != *driver_id
+        || address.area != area.name()
+        || !address.writable_area
+        || address.index != Some(u64::from(index))
+        || address.word_count != 1
+    {
+        return Err(REASON_BIT);
+    }
+    policy.check(area, index, index)?;
+    Ok(vec![write::WriteItem {
+        spec: write_types::TagSpec {
+            address: address.canonical.clone(),
+            data_type: "bool".into(),
+            string_words: None,
+        },
+        value: write_types::Value::Bool(value),
+    }])
 }
 
 #[cfg(test)]
@@ -407,6 +431,195 @@ mod tests {
         invalid = items.to_vec();
         invalid[1].value = api::Value::F64(f64::NAN);
         assert!(preflight(&invalid, &id, &policy("enabled", "400001-400006")).is_err());
+    }
+
+    fn refusal_text(result: Result<Vec<write::WriteItem>, WriteProgress>, count: usize) -> String {
+        let Err(WriteProgress::Done(results)) = result else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(results.len(), count);
+        let mut texts = results.into_iter().map(|result| match result {
+            Err(ItemError::Unsupported(text)) => text,
+            other => panic!("unexpected {other:?}"),
+        });
+        let first = texts.next().unwrap();
+        assert!(texts.all(|text| text == first));
+        first
+    }
+
+    #[test]
+    fn refusals_say_why() {
+        let id = DriverId::new("modbus-fc3-wasm").unwrap();
+        let on = policy("enabled", "000001-000016,400001-400200");
+        let h = |r: &str, i: u64, k: DataType, v: api::Value| item(r, "holding_register", i, k, v);
+        let u16_ok = || h("400001", 0, DataType::U16, api::Value::F64(1.0));
+        let cases: Vec<(Vec<WriteItem>, Policy, &str)> = vec![
+            (
+                vec![u16_ok()],
+                policy("disabled", ""),
+                "Modbus writes are disabled",
+            ),
+            (
+                vec![h("400300", 299, DataType::U16, api::Value::F64(1.0))],
+                on.clone(),
+                "outside the Modbus write allowlist",
+            ),
+            (
+                vec![bit_item(
+                    "300001.0",
+                    "input_register",
+                    0,
+                    0,
+                    api::Value::Bit(true),
+                )],
+                on.clone(),
+                "only holding register bits can be written",
+            ),
+            (
+                vec![
+                    bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true)),
+                    h("400002", 1, DataType::U16, api::Value::F64(1.0)),
+                ],
+                on.clone(),
+                "a register bit must be written alone",
+            ),
+            (
+                vec![h("400001", 0, DataType::U16, api::Value::F64(70000.0))],
+                on.clone(),
+                "value does not fit the tag type",
+            ),
+            (
+                vec![h("400001", 0, DataType::F32, api::Value::F64(f64::NAN))],
+                on.clone(),
+                "value does not fit the tag type",
+            ),
+            (
+                vec![
+                    item("000001", "coil", 0, DataType::Bit, api::Value::Bit(true)),
+                    item("000002", "coil", 1, DataType::Bit, api::Value::Bit(true)),
+                ],
+                on.clone(),
+                "coil writes are one point per request",
+            ),
+            (
+                vec![item(
+                    "000001",
+                    "coil",
+                    0,
+                    DataType::U16,
+                    api::Value::F64(1.0),
+                )],
+                on.clone(),
+                "tag type cannot be written to this area",
+            ),
+            (
+                vec![bit_item(
+                    "400001.0",
+                    "holding_register",
+                    0,
+                    0,
+                    api::Value::Bit(true),
+                )],
+                policy("disabled", ""),
+                "Modbus writes are disabled",
+            ),
+            (
+                vec![bit_item(
+                    "400300.0",
+                    "holding_register",
+                    299,
+                    0,
+                    api::Value::Bit(true),
+                )],
+                on.clone(),
+                "outside the Modbus write allowlist",
+            ),
+            (
+                vec![bit_item(
+                    "400001.0",
+                    "holding_register",
+                    0,
+                    0,
+                    api::Value::F64(1.0),
+                )],
+                on.clone(),
+                "value does not fit the tag type",
+            ),
+            (
+                vec![{
+                    let mut x =
+                        bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true));
+                    x.spec.kind = TagKind::numeric(DataType::U16);
+                    x
+                }],
+                on.clone(),
+                "tag type cannot be written to this area",
+            ),
+            (
+                vec![bit_item(
+                    "400001.16",
+                    "holding_register",
+                    0,
+                    16,
+                    api::Value::Bit(true),
+                )],
+                on.clone(),
+                "register bit address does not match this connection",
+            ),
+            (
+                vec![{
+                    let mut x =
+                        bit_item("400001.0", "holding_register", 0, 0, api::Value::Bit(true));
+                    x.spec.address.writable_area = false;
+                    x
+                }],
+                on.clone(),
+                "register bit address does not match this connection",
+            ),
+            (
+                vec![{
+                    let mut x = h("400001", 0, DataType::U16, api::Value::F64(1.0));
+                    x.spec.kind = TagKind::string(2, banto_driver_api::StringEncoding::Utf8);
+                    x
+                }],
+                on.clone(),
+                "tag type cannot be written to this area",
+            ),
+            (
+                vec![
+                    h("400001", 0, DataType::U16, api::Value::F64(1.0)),
+                    bit_item("400002.0", "holding_register", 1, 0, api::Value::Bit(true)),
+                ],
+                on.clone(),
+                "a register bit must be written alone",
+            ),
+            (
+                vec![
+                    h("400001", 0, DataType::U16, api::Value::F64(1.0)),
+                    h("400003", 2, DataType::U16, api::Value::F64(1.0)),
+                ],
+                on.clone(),
+                "request is not one contiguous run of writable addresses",
+            ),
+            (
+                (0..124)
+                    .map(|i| {
+                        h(
+                            &format!("{}", 400001 + i),
+                            i,
+                            DataType::U16,
+                            api::Value::F64(1.0),
+                        )
+                    })
+                    .collect(),
+                on.clone(),
+                "too many registers in one request",
+            ),
+        ];
+        for (items, gate, expected) in cases {
+            let count = items.len();
+            assert_eq!(refusal_text(preflight(&items, &id, &gate), count), expected);
+        }
     }
 
     #[test]
