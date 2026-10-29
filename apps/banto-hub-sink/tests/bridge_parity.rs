@@ -53,6 +53,18 @@
 //! の `STALE_PERIOD_FACTOR`）が負荷の高い CI で偽の Stale を作るので、200 ms（500 ms の
 //! 猶予）に留める。
 //!
+//! ## 読むときに導かれた Stale は外す（#946）
+//!
+//! それでも CPU が詰まって `push` のグループの tick が 500 ms を超えて遅れると（CI では、
+//! 同じプロセスで同時に走る 9 が約 24 万件を送る）、保存が Good の値を、収集の現在値が
+//! 読むときに Stale と導く。これは製品として正しい表示だが、この試験が見たいのはブリッジが
+//! 送る品質なので、ブリッジのタグの `stale` のうち、値の時刻からの経過が
+//! [`DERIVED_STALE_AFTER_MS`] を超えたもの（[`is_derived_stale`]）だけを外す: 並びでは
+//! 控えず（[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、負の条件では保存
+//! されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。7c）。ブリッジが
+//! 送る `stale`（クエリの失敗の 1 回目）は送るたびに時刻が新しいので、今までどおり捕まえる。
+//! 試験の周期や並べ方は緩めない。
+//!
 //! ## 反証（§10.4・checklist §5、PR に書く）
 //!
 //! - ブリッジの梯子を 1 か所変える（`apps/banto-hub-sink/src/source/poll.rs` の
@@ -697,6 +709,28 @@ fn read_tag_aged(manager: &CollectorManager, external: &str) -> (Reading, i64) {
 /// `banto_collect` の `STALE_PERIOD_FACTOR`）。
 const DERIVED_STALE_AFTER_MS: i64 = 500;
 
+/// 読みと、その値の時刻からの経過（ms）（[`read_tag_aged`]）。
+type Aged = (Reading, i64);
+
+/// [`read_tag_aged`] の読みが、読むときに導かれた Stale（`push` のグループの tick の遅れで、
+/// 保存が Good の値が Stale に見えているもの）か。保存された `stale`（ブリッジが送ったもの）
+/// は、送るたびに時刻が新しいので、経過が [`DERIVED_STALE_AFTER_MS`] を超えない（#946）。
+fn is_derived_stale(reading: &Reading, age_ms: i64) -> bool {
+    reading.quality == "stale" && age_ms > DERIVED_STALE_AFTER_MS
+}
+
+/// 読むときに導かれた Stale を、保存されている Good（同じ値）に戻す。それ以外はそのまま。
+fn ignoring_derived_stale((reading, age_ms): Aged) -> Reading {
+    if is_derived_stale(&reading, age_ms) {
+        Reading {
+            value: reading.value,
+            quality: "good",
+        }
+    } else {
+        reading
+    }
+}
+
 /// タグの状態の並び（変わったときだけ控える）を 10 ms ごとに読んで集める。
 struct Recorder {
     stop: Arc<AtomicBool>,
@@ -722,10 +756,7 @@ impl Recorder {
                     sequences.iter_mut().zip(&externals).enumerate()
                 {
                     let (reading, age_ms) = read_tag_aged(&manager, external);
-                    if skip_derived_stale == Some(index)
-                        && reading.quality == "stale"
-                        && age_ms > DERIVED_STALE_AFTER_MS
-                    {
+                    if skip_derived_stale == Some(index) && is_derived_stale(&reading, age_ms) {
                         continue;
                     }
                     if sequence.last() != Some(&reading) {
@@ -920,6 +951,31 @@ impl Fixture {
             .collect()
     }
 
+    /// [`Self::pair`] を、それぞれの値の時刻からの経過（ms）付きで読む。
+    fn pair_aged(&self, column: &str) -> (Aged, Aged) {
+        (
+            read_tag_aged(&self.app.manager, &Self::db_external(column)),
+            read_tag_aged(&self.app.manager, &self.push_external(column)),
+        )
+    }
+
+    fn pairs_aged(&self) -> Vec<(String, (Aged, Aged))> {
+        self.columns
+            .iter()
+            .map(|c| (c.clone(), self.pair_aged(c)))
+            .collect()
+    }
+
+    /// ブリッジのタグの今の読み。ただし、読むときに導かれた Stale（[`is_derived_stale`]。
+    /// [`Self::record_ignoring_derived_stale`] と同じ基準）は、保存されている Good とみなす
+    /// （#946）。ブリッジが送った `stale` はそのまま返す。
+    fn bridge_ignoring_derived_stale(&self, column: &str) -> Reading {
+        ignoring_derived_stale(read_tag_aged(
+            &self.app.manager,
+            &self.push_external(column),
+        ))
+    }
+
     /// 全列が、両方とも `expected` の状態に落ち着くまで待つ（落ち着かなければ落とす）。
     async fn settle(&self, expected: &[(&str, Reading)]) {
         let settled = wait_until(WAIT, || async {
@@ -945,8 +1001,9 @@ impl Fixture {
         )
     }
 
-    /// [`Self::record`] で、ブリッジのタグだけ、読むときに導かれた Stale（tick の遅れ）を
-    /// 控えない。
+    /// [`Self::record`] で、ブリッジのタグだけ、読むときに導かれた Stale（tick の遅れ。
+    /// [`is_derived_stale`]）を控えない（#946。モジュールの doc）。Hub 内の Source のタグは
+    /// 厳密なまま（周期 1,000 ms なので導くのは 2,500 ms の遅れから）。
     fn record_ignoring_derived_stale(&self, column: &str) -> Recorder {
         Recorder::start(
             self.app.manager.clone(),
@@ -955,11 +1012,16 @@ impl Fixture {
         )
     }
 
-    /// `duration` の間 50 ms ごとに読み、`check` が一度でも偽なら落とす（負の条件）。
+    /// `duration` の間 50 ms ごとに読み、`check` が一度でも偽なら落とす（負の条件）。落とす
+    /// ときは、全列の (Hub 内の Source, ブリッジ) を経過（ms）付きで載せる。
     async fn hold(&self, duration: Duration, what: &str, check: impl Fn(&Self) -> bool) {
         let deadline = tokio::time::Instant::now() + duration;
         while tokio::time::Instant::now() < deadline {
-            assert!(check(self), "{what}: {:?}", self.pairs());
+            assert!(
+                check(self),
+                "{what}: (reading, age_ms) {:?}",
+                self.pairs_aged()
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     }
@@ -1148,6 +1210,8 @@ async fn parity_3_text_and_missing_columns_are_bad() {
 }
 
 /// 4: 0 行は、両方とも Bad（梯子に乗せない - Stale を挟まない）。行を戻すと Good。
+/// ブリッジのタグは、読むときに導かれた Stale だけを控えない（#946）。ブリッジが 0 行で
+/// `stale` を送れば、時刻が新しいので並びに現れて落ちる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_4_zero_rows_are_bad() {
     let target = require_pg!();
@@ -1162,7 +1226,7 @@ async fn parity_4_zero_rows_are_bad() {
     )
     .await;
     fixture.settle(&[("a", good(3.5))]).await;
-    let recorder = fixture.record("a");
+    let recorder = fixture.record_ignoring_derived_stale("a");
     fixture
         .exec(&format!("DELETE FROM \"{}\"", fixture.table))
         .await;
@@ -1180,7 +1244,10 @@ async fn parity_4_zero_rows_are_bad() {
 
 /// 5: クエリの失敗（表を消す）は、両方とも「1 回目に直前値で Stale、2 回目から Bad」。
 /// 表を戻すと Good。2 つの Source は別々に問い合わせるので、同じ瞬間ではなく**同じ状態の
-/// 並び**を通ることを比べる（§10.4 の注）。
+/// 並び**を通ることを比べる（§10.4 の注）。ブリッジのタグは、読むときに導かれた Stale
+/// だけを控えない（#946）。梯子の `stale` はブリッジが送るので時刻が新しく、控えられる。
+/// 外すのは取り除くことだけなので、ブリッジが 1 回目に `stale` を送らなければ並びから
+/// 消えて落ちる（反証はモジュールの doc）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_5_query_failure_walks_the_same_ladder() {
     let target = require_pg!();
@@ -1195,7 +1262,7 @@ async fn parity_5_query_failure_walks_the_same_ladder() {
     )
     .await;
     fixture.settle(&[("a", good(7.25))]).await;
-    let recorder = fixture.record("a");
+    let recorder = fixture.record_ignoring_derived_stale("a");
     fixture
         .exec(&format!("DROP TABLE \"{}\"", fixture.table))
         .await;
@@ -1232,6 +1299,8 @@ async fn parity_5_query_failure_walks_the_same_ladder() {
 /// 時点でプールの接続が使われていたかどうかの時間で決まる（Hub 内の Source とブリッジは
 /// 同じ `classify` を使うが、別々のプールなので同じ瞬間に同じ側に落ちるとは限らない）。
 /// 並びの中に、停止前の値以外の値と、Good・Stale・Bad 以外の状態が無いことだけを見る。
+/// ブリッジのタグは、読むときに導かれた Stale だけを控えない（#946。復帰の後の tick の
+/// 遅れが `stale(6.5)` を作り、停止中の並びに混ざるのを外す）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_6_db_outage_is_bad_and_recovers() {
     let target = require_pg!();
@@ -1246,7 +1315,7 @@ async fn parity_6_db_outage_is_bad_and_recovers() {
     )
     .await;
     fixture.settle(&[("a", good(5.5))]).await;
-    let recorder = fixture.record("a");
+    let recorder = fixture.record_ignoring_derived_stale("a");
     fixture.role.set_login(&fixture.admin, false).await;
     fixture.role.terminate_sessions(&fixture.admin).await;
     fixture.settle(&[("a", BAD)]).await;
@@ -1472,7 +1541,9 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         .hold(
             Duration::from_millis(1_500),
             "the removed key stays Bad",
-            |f| f.pair("b").1 == BAD && f.pair("a").1 == good(31.5),
+            // 残したキーは、読むときに導かれた Stale（tick の遅れ、#946）だけ Good とみなす。
+            // ブリッジが `stale` を送ったら（時刻が新しい）今までどおり落とす。
+            |f| f.pair("b").1 == BAD && f.bridge_ignoring_derived_stale("a") == good(31.5),
         )
         .await;
     fixture.finish().await;
@@ -1755,4 +1826,26 @@ async fn parity_9_three_queries_at_the_registration_limit() {
     app.shutdown().await;
     role.drop_role(&admin).await;
     admin.close().await;
+}
+
+/// 7c の `hold` と 4・5・6・8 の並びが外すのは、読むときに導かれた Stale だけ（#946）。
+/// ブリッジが送った `stale`（時刻が新しい）と Bad は外さない。
+#[test]
+fn only_a_derived_stale_is_ignored() {
+    // 導かれた Stale（経過が 500 ms を超えた）は、保存されている Good とみなす。
+    assert!(is_derived_stale(&stale(31.5), DERIVED_STALE_AFTER_MS + 1));
+    assert_eq!(
+        ignoring_derived_stale((stale(31.5), 798)),
+        good(31.5),
+        "the derived Stale of the CI failure (798 ms) is the stored Good"
+    );
+    // ブリッジが送った `stale`（経過が短い）は、そのまま（7c の `hold` は落ちる）。
+    for age_ms in [0, 30, DERIVED_STALE_AFTER_MS] {
+        assert!(!is_derived_stale(&stale(31.5), age_ms));
+        assert_eq!(ignoring_derived_stale((stale(31.5), age_ms)), stale(31.5));
+    }
+    // Good・Bad は経過によらず、そのまま。
+    assert_eq!(ignoring_derived_stale((good(31.5), 10_000)), good(31.5));
+    assert_eq!(ignoring_derived_stale((BAD, 10_000)), BAD);
+    assert!(!is_derived_stale(&BAD, 10_000));
 }
