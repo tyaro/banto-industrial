@@ -19,6 +19,13 @@ pub trait Transport: Send + 'static {
     fn tx_time(&self, _len: usize) -> Duration {
         Duration::ZERO
     }
+    /// データグラムの通信路か（既定は `false` = バイトのストリーム）。`true` なら
+    /// エンジンは 1 回の `recv` を 1 応答として扱い（次の受信を足し込まない）、各送信の前に
+    /// `discard_input` で溜まった受信を捨て、0 往復のハンドシェイクを断る（設計 io-design §7.6）。
+    /// `recv` は 1 回に 1 データグラムをそのまま足すこと（空のデータグラムは 0 を返す）。
+    fn datagram(&self) -> bool {
+        false
+    }
     fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>>;
     fn recv<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> BoxFuture<'a, Result<usize, FatalError>>;
     fn discard_input(&mut self) -> BoxFuture<'_, ()>;
@@ -45,6 +52,12 @@ pub enum TransportSpec {
         host: String,
         port: u16,
     },
+    /// UDP（#916）。接続ごとに新しいエフェメラルポートを bind し、相手に `connect` する
+    /// （他の送信元のデータグラムは OS が捨てる）。1 データグラム = 1 フレーム。
+    Udp {
+        host: String,
+        port: u16,
+    },
 }
 
 impl TransportSpec {
@@ -65,6 +78,19 @@ impl TransportSpec {
                 stream.set_nodelay(true).map_err(io_error)?;
                 Ok(Box::new(TcpTransport::new(stream)))
             }
+            Self::Udp { host, port } => {
+                // 名前の解決だけが待ちうる。bind と connect は OS の呼び出しで、相手に何も送らない。
+                let peer = tokio::time::timeout(
+                    connect_timeout,
+                    tokio::net::lookup_host((host.as_str(), *port)),
+                )
+                .await
+                .map_err(|_| FatalError::Timeout)?
+                .map_err(io_error)?
+                .next()
+                .ok_or_else(|| FatalError::Io(format!("{host} のアドレスが見つからない")))?;
+                UdpTransport::connect(peer).map(|t| Box::new(t) as Box<dyn Transport>)
+            }
             Self::Serial { port, line } => {
                 // ポートを開くのは同期の呼び出しで、`connect_timeout` は効かない（Windows の
                 // CreateFileW / Linux の open は通常すぐ返る。ハングする仮想ポートは実機の確かめの対象）。
@@ -84,6 +110,7 @@ impl TransportSpec {
             "tcp" => (TransportKind::Tcp, "TCP"),
             "serial" => (TransportKind::Serial, "シリアル"),
             "serial_over_tcp" => (TransportKind::SerialOverTcp, "シリアル over TCP"),
+            "udp" => (TransportKind::Udp, "UDP"),
             _ => {
                 return Err(FieldError::new(
                     keys::TRANSPORT,
@@ -118,10 +145,10 @@ impl TransportSpec {
             .and_then(|port| port.parse::<u16>().ok())
             .filter(|port| *port != 0)
             .ok_or_else(|| FieldError::new(keys::PORT, "1〜65535 で指定してください"))?;
-        Ok(if kind == TransportKind::Tcp {
-            Self::Tcp { host, port }
-        } else {
-            Self::SerialOverTcp { host, port }
+        Ok(match kind {
+            TransportKind::Tcp => Self::Tcp { host, port },
+            TransportKind::Udp => Self::Udp { host, port },
+            _ => Self::SerialOverTcp { host, port },
         })
     }
 }
@@ -464,6 +491,114 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for StreamTra
     }
 }
 
+/// 1 回の受信に使うバッファの大きさ（UDP のデータグラムの最大）。`max_len` はエンジンが後で当てる。
+pub const UDP_RECV_BUFFER: usize = 64 * 1024;
+
+/// UDP の通信路（#916、設計 io-design §7.6）。1 接続 = 1 個の接続済み（`connect`）ソケット。
+///
+/// - 接続ごとに新しいエフェメラルポートを bind するので、時間切れで捨てた接続への遅れた応答は
+///   次の接続に届かない（古いポートは閉じている）。
+/// - 接続済みなので、相手以外の送信元からのデータグラムは OS が捨てる。
+/// - `recv` は 1 回で 1 データグラムを受け、64 KiB のバッファからそのまま足す。
+/// - `discard_input` は溜まったデータグラム（重複・遅れた応答）を空読みで捨てる。
+///   tokio の readiness を経ずに OS に直接問い合わせるため、同じソケットの複製（ノンブロッキングの
+///   `std` のソケット）で読む。readiness が古いまま残っても、tokio は次の受信で `WouldBlock` を
+///   受けて待ち直すだけ。
+/// - 再送はしない。ICMP の port unreachable（`recv` の ECONNREFUSED、Windows の WSAECONNRESET）は
+///   `FatalError::Io` になる。
+pub struct UdpTransport {
+    socket: tokio::net::UdpSocket,
+    drain: std::net::UdpSocket,
+    rx: Box<[u8]>,
+}
+
+impl UdpTransport {
+    /// 相手のアドレスと同じ族の未指定アドレスのエフェメラルポートを bind し、相手に `connect` する。
+    pub fn connect(peer: std::net::SocketAddr) -> Result<Self, FatalError> {
+        let local: std::net::SocketAddr = if peer.is_ipv4() {
+            (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+        } else {
+            (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+        };
+        let std_socket = std::net::UdpSocket::bind(local).map_err(io_error)?;
+        std_socket.connect(peer).map_err(io_error)?;
+        std_socket.set_nonblocking(true).map_err(io_error)?;
+        let drain = std_socket.try_clone().map_err(io_error)?;
+        let socket = tokio::net::UdpSocket::from_std(std_socket).map_err(io_error)?;
+        Ok(Self {
+            socket,
+            drain,
+            rx: vec![0; UDP_RECV_BUFFER].into_boxed_slice(),
+        })
+    }
+
+    /// このソケットの bind したアドレス（試験用）。
+    pub fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// 受信キューにデータグラムが溜まるまで待つ（消費しない。試験の前提の観測用）。
+    /// tokio の readiness は受信の成功では消えないので使わず、OS に直接 peek する。
+    #[cfg(test)]
+    pub(crate) async fn wait_queued(&self) {
+        let mut probe = [0u8; 64];
+        loop {
+            match self.drain.peek(&mut probe) {
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(5)).await
+                }
+                _ => return,
+            }
+        }
+    }
+}
+
+impl Transport for UdpTransport {
+    fn datagram(&self) -> bool {
+        true
+    }
+
+    fn send<'a>(&'a mut self, bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
+        Box::pin(async move {
+            let n = self.socket.send(bytes).await.map_err(io_error)?;
+            if n != bytes.len() {
+                return Err(FatalError::Io(format!(
+                    "UDP の送信が {n} / {} バイトで切れた",
+                    bytes.len()
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    fn recv<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> BoxFuture<'a, Result<usize, FatalError>> {
+        Box::pin(async move {
+            let n = self.socket.recv(&mut self.rx).await.map_err(io_error)?;
+            buf.extend_from_slice(&self.rx[..n]);
+            Ok(n)
+        })
+    }
+
+    fn discard_input(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {
+            // 上限は相手が流し続けても抜けるため。残りは次の応答の照合（フレーム規則）に当たる。
+            for _ in 0..1024 {
+                match self.drain.recv(&mut self.rx) {
+                    Ok(_) => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                    // 前の送信への ICMP の報告などは、捨てる受信と同じく過去のもの。
+                    Err(error) => tracing::debug!(%error, "UDP の受信の破棄でエラーを読み捨てた"),
+                }
+            }
+        })
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        // ソケットの drop で閉じる。相手に送るものはない。
+        Box::pin(async {})
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +727,7 @@ mod tests {
 
     #[test]
     fn transport_spec_is_built_from_settings() {
-        use TransportKind::{Serial, SerialOverTcp, Tcp};
+        use TransportKind::{Serial, SerialOverTcp, Tcp, Udp};
         let tcp = settings(&[("host", "10.0.0.5"), ("port", "502")]);
         assert_eq!(
             TransportSpec::from_settings(&tcp, &[Tcp]).unwrap(),
@@ -629,6 +764,22 @@ mod tests {
         // (設定, ドライバの対応, 指すキー)
         let cases: Vec<(Settings, &[TransportKind], &str)> = vec![
             (settings(&[("transport", "udp")]), &[Tcp], "transport"),
+            (settings(&[("transport", "quic")]), &[Tcp, Udp], "transport"),
+            (
+                settings(&[("transport", "udp"), ("port", "5000")]),
+                &[Udp],
+                "host",
+            ),
+            (
+                settings(&[("transport", "udp"), ("host", "h"), ("port", "0")]),
+                &[Udp],
+                "port",
+            ),
+            (
+                settings(&[("transport", "tcp"), ("host", "h"), ("port", "1")]),
+                &[Udp],
+                "transport",
+            ),
             (
                 settings(&[("host", "h"), ("port", "1")]),
                 &[Serial],
@@ -674,8 +825,22 @@ mod tests {
             let e = TransportSpec::from_settings(&s, transports).unwrap_err();
             assert_eq!(e.key, key, "{s:?}");
         }
+        let udp = settings(&[("transport", "udp"), ("host", "10.0.0.6"), ("port", "5000")]);
         assert_eq!(
-            TransportSpec::from_settings(&settings(&[("transport", "udp")]), &[Tcp])
+            TransportSpec::from_settings(&udp, &[Tcp, Udp]).unwrap(),
+            TransportSpec::Udp {
+                host: "10.0.0.6".into(),
+                port: 5000
+            }
+        );
+        assert_eq!(
+            TransportSpec::from_settings(&udp, &[Tcp])
+                .unwrap_err()
+                .message,
+            "このドライバは UDP 通信に対応していません"
+        );
+        assert_eq!(
+            TransportSpec::from_settings(&settings(&[("transport", "quic")]), &[Tcp])
                 .unwrap_err()
                 .message,
             "このエンジンで未対応の通信方式です"

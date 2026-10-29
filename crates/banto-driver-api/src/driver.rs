@@ -142,7 +142,8 @@ impl Capabilities {
 ///
 /// R1 accepts only [`Tcp`](Transport::Tcp) (a driver's `validate_config`
 /// refuses the others with a [`FieldError`]); R2b-3's engine adds the serial
-/// transports without changing the API.
+/// transports without changing the API, and #916 adds [`Udp`](Transport::Udp)
+/// (one datagram is one frame; the engine never retransmits).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(
@@ -157,6 +158,11 @@ pub enum Transport {
     Serial,
     /// Raw serial bytes through a serial-to-TCP converter.
     SerialOverTcp,
+    /// A connected UDP socket to the device (#916): each request is one
+    /// datagram and each response must be exactly one datagram. The engine
+    /// never retransmits, and requires a handshake with at least one round
+    /// trip (the only evidence that the peer is there).
+    Udp,
 }
 
 /// The stateless part of a driver (design §4.1). Called concurrently from
@@ -435,5 +441,20 @@ mod tests {
         value.as_object_mut().unwrap().remove("settings_version");
         let old: DriverDescriptor = serde_json::from_value(value).unwrap();
         assert_eq!(old.settings_version, 1);
+    }
+
+    /// The transport spellings match `keys::TRANSPORT`'s values.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn transport_serde_spellings_match_the_setting_values() {
+        for (transport, text) in [
+            (Transport::Tcp, "\"tcp\""),
+            (Transport::Serial, "\"serial\""),
+            (Transport::SerialOverTcp, "\"serial_over_tcp\""),
+            (Transport::Udp, "\"udp\""),
+        ] {
+            assert_eq!(serde_json::to_string(&transport).unwrap(), text);
+            assert_eq!(serde_json::from_str::<Transport>(text).unwrap(), transport);
+        }
     }
 }
