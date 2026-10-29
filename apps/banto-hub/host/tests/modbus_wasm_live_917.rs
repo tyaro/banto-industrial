@@ -990,6 +990,18 @@ async fn modbus_c1_holding_string_write_readback_restore() {
         live.numeric(target.string_second, DataType::U32),
     ];
     let string_spec = live.string(target.string_address, 4);
+    let first_register: u32 = target.string_address.parse().expect("numeric address");
+    let register_addresses: Vec<String> =
+        (0..4).map(|n| (first_register + n).to_string()).collect();
+    let register_labels: Vec<String> = register_addresses
+        .iter()
+        .map(|a| format!("{a} u16"))
+        .collect();
+    let register_label_refs: Vec<&str> = register_labels.iter().map(String::as_str).collect();
+    let register_specs: Vec<TagSpec> = register_addresses
+        .iter()
+        .map(|a| live.numeric(a, DataType::U16))
+        .collect();
     let read_span = |items: Vec<Result<Value, ItemError>>| -> Vec<f64> {
         items
             .iter()
@@ -1040,6 +1052,19 @@ async fn modbus_c1_holding_string_write_readback_restore() {
         live.frames().iter().any(|f| f.starts_with(&fc16_prefix)),
         "one FC16 over the span expected: {:?}",
         live.frames()
+    );
+    let back_registers = read_span(
+        live.read(
+            "c1_trial_registers_readback",
+            &register_label_refs,
+            &register_specs,
+        )
+        .await,
+    );
+    assert_eq!(
+        back_registers,
+        vec![f64::from(0x4142u16), 0.0, 0.0, 0.0],
+        "registers read back differ (span {back_span:?}); stop, no restoration"
     );
     assert_eq!(
         back[0],

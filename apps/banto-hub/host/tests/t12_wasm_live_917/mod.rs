@@ -599,9 +599,30 @@ async fn hub_slmp_reads(plc: &Plc) {
     let registered: Vec<&String> = names.iter().filter(|n| !n.is_empty()).collect();
     let scopes: Vec<String> = registered.iter().map(|n| format!("read:{n}")).collect();
     let (key_id, key) = temp_key(&app, &format!("{}-reads-917", plc.name), &scopes).await;
-    for name in &registered {
-        read_now(&app, &key, name).await;
+    let mut a2: Vec<Option<Value>> = Vec::new();
+    for (name, tag) in names.iter().zip(&tags) {
+        if name.is_empty() {
+            continue;
+        }
+        let (_, body) = read_now(&app, &key, name).await;
+        if ["w1a", "w1a0", "w1af"].contains(&tag.0) {
+            a2.push(body.get("v").cloned());
+        }
     }
+    let word = a2[0]
+        .as_ref()
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("W1A not a u16: {a2:?}"));
+    assert_eq!(
+        a2[1],
+        Some(json!(word & 1 != 0)),
+        "W1A.0 differs from W1A={word:#06x}"
+    );
+    assert_eq!(
+        a2[2],
+        Some(json!(word & (1 << 15) != 0)),
+        "W1A.F differs from W1A={word:#06x}"
+    );
     let (status, _) = write_one(&app, &key, registered[0], json!(0)).await;
     assert_eq!(
         status,
@@ -1104,6 +1125,9 @@ async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
 async fn hub_modbus_c1_holding_string_write_readback_restore() {
     require_opt_in();
     let target = modbus_target();
+    let first_register: u32 = target.string_address.parse().expect("numeric address");
+    let register_addresses: Vec<String> =
+        (0..4).map(|n| (first_register + n).to_string()).collect();
     let (app, _connection, ids, names) = saved_app(
         "wasm-live-917-modbus-c1",
         MODBUS_PROTOCOL,
@@ -1122,13 +1146,19 @@ async fn hub_modbus_c1_holding_string_write_readback_restore() {
             ("w0", target.string_address, "u32", None, true),
             ("w1", target.string_second, "u32", None, true),
             ("str", target.string_address, "string", Some(4), true),
+            ("r0", &register_addresses[0], "u16", None, false),
+            ("r1", &register_addresses[1], "u16", None, false),
+            ("r2", &register_addresses[2], "u16", None, false),
+            ("r3", &register_addresses[3], "u16", None, false),
         ],
     )
     .await;
     let mut scopes = Vec::new();
-    for name in &names {
+    for (index, name) in names.iter().enumerate() {
         scopes.push(format!("read:{name}"));
-        scopes.push(format!("write:{name}"));
+        if index < 3 {
+            scopes.push(format!("write:{name}"));
+        }
     }
     let (key_id, key) = temp_key(&app, "mb-c1-917", &scopes).await;
     app.write_control.enable();
@@ -1157,10 +1187,20 @@ async fn hub_modbus_c1_holding_string_write_readback_restore() {
     let (status, body) = write_one(&app, &key, string, json!("AB")).await;
     let back = read_now(&app, &key, string).await.1;
     let back_span = read_span(&app, key.clone()).await;
+    let mut back_registers = Vec::new();
+    for tag in &names[3..7] {
+        let (_, reg) = read_now(&app, &key, tag).await;
+        back_registers.push(reg["v"].as_f64());
+    }
     assert_eq!(
         status,
         super::StatusCode::OK,
         "string write uncertain; stop: {body:?}"
+    );
+    assert_eq!(
+        back_registers,
+        vec![Some(f64::from(0x4142u16)), Some(0.0), Some(0.0), Some(0.0)],
+        "registers read back differ (span {back_span:?}); stop, no restoration"
     );
     assert_eq!(
         back["v"], "AB",

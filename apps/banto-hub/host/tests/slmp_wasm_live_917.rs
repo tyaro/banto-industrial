@@ -800,17 +800,22 @@ async fn s2_w_word_bit_read(plc: &'static Plc) {
         live.numeric("W1A.5", DataType::Bit),
     ];
     let items = live.read(&stage, &labels, &specs).await;
-    if let Some(word) = as_u16(&items[0]) {
-        for (at, bit) in [(1usize, 0u16), (2, 15), (3, 5)] {
-            let expected = word & (1 << bit) != 0;
-            audit(
-                &stage,
-                format!(
-                    "{} expected_from_word={expected} got={:?}",
-                    labels[at], items[at]
-                ),
-            );
-        }
+    let word = as_u16(&items[0]).unwrap_or_else(|| panic!("{stage}: W1A not a u16: {items:?}"));
+    for (at, bit) in [(1usize, 0u16), (2, 15), (3, 5)] {
+        let expected = word & (1 << bit) != 0;
+        audit(
+            &stage,
+            format!(
+                "{} expected_from_word={expected} got={:?}",
+                labels[at], items[at]
+            ),
+        );
+        assert_eq!(
+            items[at],
+            Ok(Value::Bit(expected)),
+            "{stage}: {} differs from W1A={word:#06x}",
+            labels[at]
+        );
     }
     assert_eq!(live.writes_sent(), 0);
     live.close().await;
