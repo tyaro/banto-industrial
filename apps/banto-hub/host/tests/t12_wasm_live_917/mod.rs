@@ -1,5 +1,5 @@
 //! #917: explicitly ignored Hub REST checks of the WASM guest stages against
-//! the R and Q test PLCs (TCP 3108) and the local ModbusSlave (127.0.0.1:502).
+//! the R and Q test PLCs (TCP 3108) and the Modbus targets (local ModbusSlave `127.0.0.1:502` or R `192.168.11.200:502`).
 //! The router is in-process (no listener); the database and the API key are
 //! temporary: the key carries only the read/write scopes of the case's tags,
 //! expires after 10 minutes and is revoked at the end; the database is
@@ -40,8 +40,8 @@ const SLMP_PROTOCOL: &str = "slmp-wasm-operational-write";
 const MODBUS_PROTOCOL: &str = "modbus-fc3-wasm";
 const HUB_PORT: u16 = 3108;
 const FORBIDDEN_PORTS: [u16; 2] = [5200, 3100];
-const MODBUS_HOST: &str = "127.0.0.1";
 const MODBUS_PORT: u16 = 502;
+const MODBUS_TARGET_ENV: &str = "BANTO_MODBUS_LIVE_917_TARGET";
 const GROUP: &str = "g";
 const BIT: u8 = 5;
 
@@ -485,6 +485,71 @@ fn hub_live_917_destination_check_refuses_resident_ports_and_other_hosts() {
     }
 }
 
+#[test]
+fn hub_live_917_destination_modbus_targets_are_kept_apart() {
+    let saved = |target: &ModbusTarget, host: &str, port: i64| {
+        let mut settings = modbus_settings(target, "", "", &[])
+            .as_object()
+            .unwrap()
+            .clone();
+        settings.insert("host".into(), json!(host));
+        settings.insert("port".into(), json!(port));
+        PlcConnection::from_settings(
+            1,
+            "mb-live-917".into(),
+            MODBUS_PROTOCOL.into(),
+            true,
+            false,
+            settings,
+            1,
+        )
+    };
+    for (target, other) in [(&MODBUS_SLAVE, &MODBUS_R), (&MODBUS_R, &MODBUS_SLAVE)] {
+        let port = i64::from(MODBUS_PORT);
+        assert!(approved_destination(
+            &saved(target, target.host, port),
+            MODBUS_PROTOCOL,
+            target.host,
+            MODBUS_PORT
+        ));
+        // The saved connection names the other target, or the approved
+        // destination is the other target: both refused.
+        assert!(!approved_destination(
+            &saved(target, other.host, port),
+            MODBUS_PROTOCOL,
+            target.host,
+            MODBUS_PORT
+        ));
+        assert!(!approved_destination(
+            &saved(target, target.host, port),
+            MODBUS_PROTOCOL,
+            other.host,
+            MODBUS_PORT
+        ));
+        assert!(!approved_destination(
+            &saved(target, target.host, 5020),
+            MODBUS_PROTOCOL,
+            target.host,
+            MODBUS_PORT
+        ));
+        assert!(!approved_destination(
+            &saved(target, target.host, 5200),
+            MODBUS_PROTOCOL,
+            target.host,
+            5200
+        ));
+    }
+    assert_eq!(parse_modbus_target(None).label, "slave");
+    assert_eq!(parse_modbus_target(Some("slave")).label, "slave");
+    assert_eq!(parse_modbus_target(Some("r")).label, "r");
+    for bad in ["", "R", "q", "127.0.0.1", "192.168.11.200"] {
+        assert!(
+            std::panic::catch_unwind(|| parse_modbus_target(Some(bad))).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
 // -------------------------------------------------------- SLMP: reads
 
 /// E1/E2 (frame and own-station route from the connection settings), A2, D1-D3,
@@ -741,10 +806,82 @@ async fn hub_slmp_writes(plc: &Plc) {
 
 // ------------------------------------------------------------- Modbus
 
-fn modbus_settings(guest_allowlist: &str, host_allowlist: &str, extra: &[(&str, &str)]) -> Value {
+/// One approved Modbus destination: the local ModbusSlave or the R CPU.
+/// Allowlists and addresses use the guest's notation.
+struct ModbusTarget {
+    label: &'static str,
+    host: &'static str,
+    coil_allowlist: &'static str,
+    holding_allowlist: &'static str,
+    /// B2: the 1-based number of the first of eight coils.
+    first_coil_number: u16,
+    probe_coil: &'static str,
+    probe_holding: &'static str,
+    bit_address: &'static str,
+    word_address: &'static str,
+    string_address: &'static str,
+    string_second: &'static str,
+}
+
+const MODBUS_SLAVE: ModbusTarget = ModbusTarget {
+    label: "slave",
+    host: "127.0.0.1",
+    coil_allowlist: "000001-000008",
+    holding_allowlist: "400010-400029",
+    first_coil_number: 1,
+    probe_coil: "00001",
+    probe_holding: "40010",
+    bit_address: "40010.3",
+    word_address: "40010",
+    string_address: "40020",
+    string_second: "40022",
+};
+
+/// R CPU: coil offset 8192+n = M n, holding offset n = D n. Coils
+/// 09193-09200 = M1000-M1007, holding 43021-43040 = D3020-D3039.
+const MODBUS_R: ModbusTarget = ModbusTarget {
+    label: "r",
+    host: "192.168.11.200",
+    coil_allowlist: "009193-009200",
+    holding_allowlist: "403021-403040",
+    first_coil_number: 9193,
+    probe_coil: "09193",
+    probe_holding: "43021",
+    bit_address: "43021.3",
+    word_address: "43021",
+    string_address: "43031",
+    string_second: "43033",
+};
+
+fn parse_modbus_target(value: Option<&str>) -> &'static ModbusTarget {
+    match value {
+        None | Some("slave") => &MODBUS_SLAVE,
+        Some("r") => &MODBUS_R,
+        Some(other) => panic!("{MODBUS_TARGET_ENV} must be `slave` or `r`, not {other:?}"),
+    }
+}
+
+fn modbus_target() -> &'static ModbusTarget {
+    let target = parse_modbus_target(std::env::var(MODBUS_TARGET_ENV).ok().as_deref());
+    audit(
+        "modbus_target",
+        format!(
+            "target={} destination={}:{MODBUS_PORT}",
+            target.label, target.host
+        ),
+    );
+    target
+}
+
+fn modbus_settings(
+    target: &ModbusTarget,
+    guest_allowlist: &str,
+    host_allowlist: &str,
+    extra: &[(&str, &str)],
+) -> Value {
     let mut settings = json!({
-        "host": MODBUS_HOST, "port": MODBUS_PORT, "unit_id": 1,
-        "probe_address": "40010",
+        "host": target.host, "port": MODBUS_PORT, "unit_id": 1,
+        "probe_address": target.probe_holding,
         "write_mode": "enabled", "write_allowlist": guest_allowlist,
         "modbus_operational_write_mode": "enabled",
         "modbus_operational_write_allowlist": host_allowlist
@@ -757,9 +894,10 @@ fn modbus_settings(guest_allowlist: &str, host_allowlist: &str, extra: &[(&str, 
 
 /// A1: the Hub connection test of a coil-only device (probe 00001) over REST.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn hub_modbus_a1_coil_only_connection_test() {
     require_opt_in();
+    let target = modbus_target();
     let app = super::test_app_with_operational_write_manifest(
         "wasm-live-917-modbus-a1",
         &modbus_manifest(),
@@ -773,36 +911,41 @@ async fn hub_modbus_a1_coil_only_connection_test() {
         &app.admin_token,
         json!({
             "protocol": MODBUS_PROTOCOL, "simulation": false,
-            "settings": {"host": MODBUS_HOST, "port": MODBUS_PORT, "unit_id": 1, "probe_address": "00001"}
+            "settings": {"host": target.host, "port": MODBUS_PORT, "unit_id": 1, "probe_address": target.probe_coil}
         }),
     )
     .await;
-    audit("a1_connection_test", format!("status={status} body={body}"));
+    audit(
+        "a1_connection_test",
+        format!("target={} status={status} body={body}", target.label),
+    );
     assert_eq!(status, super::StatusCode::OK, "{body:?}");
     assert_eq!(body["ok"], true, "{body:?}");
     drop(app);
 }
 
-/// B1: `register_bit_write=disabled` refuses a `40010.3` write before send
+/// B1: `register_bit_write=disabled` refuses a register-bit write before send
 /// (502 `write_failed`, audited `failed`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn hub_modbus_b1_register_bit_write_refused_without_fc22() {
     require_opt_in();
+    let target = modbus_target();
     let (app, _connection, ids, names) = saved_app(
         "wasm-live-917-modbus-b1",
         MODBUS_PROTOCOL,
         "mb-live-917",
-        MODBUS_HOST,
+        target.host,
         MODBUS_PORT,
         modbus_settings(
-            "400010-400029",
-            "400010-400029",
+            target,
+            target.holding_allowlist,
+            target.holding_allowlist,
             &[("register_bit_write", "disabled")],
         ),
         &modbus_manifest(),
         &modbus_component(),
-        &[("hbit", "40010.3", "bit", None, true)],
+        &[("hbit", target.bit_address, "bit", None, true)],
     )
     .await;
     let scopes = vec![format!("read:{}", names[0]), format!("write:{}", names[0])];
@@ -820,30 +963,33 @@ async fn hub_modbus_b1_register_bit_write_refused_without_fc22() {
     drop(app);
 }
 
-/// B2: coils 00001-00008 inverted as one batch (FC15), 40010 written with
+/// B2: eight coils inverted as one batch (FC15), the word written with
 /// `register_write=fc6`, both read back and restored. Writes: 8 + 1 + 8 + 1
 /// audit rows, well inside the default 30/60 s global and 10/60 s per-tag
 /// rate limits of the test app.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     require_opt_in();
+    let target = modbus_target();
     let coil_names: Vec<String> = (1..=8).map(|n| format!("c{n}")).collect();
-    let coil_addresses: Vec<String> = (1..=8).map(|n| format!("{n:05}")).collect();
+    let coil_addresses: Vec<String> = (0..8)
+        .map(|i| format!("{:05}", target.first_coil_number + i))
+        .collect();
     let mut tags: Vec<Tag<'_>> = coil_names
         .iter()
         .zip(&coil_addresses)
         .map(|(name, address)| (name.as_str(), address.as_str(), "bit", None, true))
         .collect();
-    tags.push(("h", "40010", "u16", None, true));
-    let allowlist = "000001-000008,400010-400029";
+    tags.push(("h", target.word_address, "u16", None, true));
+    let allowlist = format!("{},{}", target.coil_allowlist, target.holding_allowlist);
     let (app, _connection, ids, names) = saved_app(
         "wasm-live-917-modbus-b2",
         MODBUS_PROTOCOL,
         "mb-live-917",
-        MODBUS_HOST,
+        target.host,
         MODBUS_PORT,
-        modbus_settings(allowlist, allowlist, &[("register_write", "fc6")]),
+        modbus_settings(target, &allowlist, &allowlist, &[("register_write", "fc6")]),
         &modbus_manifest(),
         &modbus_component(),
         &tags,
@@ -875,12 +1021,12 @@ async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
         }
     };
     let coils_1 = read_coils(&app, key.clone()).await;
-    let word_1 = good_u16(&read_now(&app, &key, holding).await.1).expect("40010 u16");
+    let word_1 = good_u16(&read_now(&app, &key, holding).await.1).expect("word u16");
     tokio::time::sleep(Duration::from_secs(1)).await;
     let coils_2 = read_coils(&app, key.clone()).await;
-    let word_2 = good_u16(&read_now(&app, &key, holding).await.1).expect("40010 u16");
+    let word_2 = good_u16(&read_now(&app, &key, holding).await.1).expect("word u16");
     assert_eq!(coils_1, coils_2, "coils changed; nothing written");
-    assert_eq!(word_1, word_2, "40010 changed; nothing written");
+    assert_eq!(word_1, word_2, "word changed; nothing written");
 
     let batch = |values: &[bool]| -> Vec<(String, Value)> {
         coils
@@ -914,12 +1060,12 @@ async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     assert_eq!(
         status,
         super::StatusCode::OK,
-        "40010 write uncertain; stop: {body:?}"
+        "word write uncertain; stop: {body:?}"
     );
     assert_eq!(
         word_back,
         Some(trial),
-        "40010 read back differs; stop, no restoration"
+        "word read back differs; stop, no restoration"
     );
 
     let (status, body) = write_batch(&app, &key, &batch(&coils_1)).await;
@@ -937,7 +1083,7 @@ async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     assert_eq!(
         status,
         super::StatusCode::OK,
-        "40010 restoration uncertain: {body:?}"
+        "word restoration uncertain: {body:?}"
     );
     assert_eq!(
         good_u16(&read_now(&app, &key, holding).await.1),
@@ -951,25 +1097,31 @@ async fn hub_modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     drop(app);
 }
 
-/// C1: the 4-word string at 40020 is read as two u32, written as "AB" (one
+/// C1: the 4-word string at the target's string address is read as two u32, written as "AB" (one
 /// FC16), read back, and the two original u32 are written back as one batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn hub_modbus_c1_holding_string_write_readback_restore() {
     require_opt_in();
+    let target = modbus_target();
     let (app, _connection, ids, names) = saved_app(
         "wasm-live-917-modbus-c1",
         MODBUS_PROTOCOL,
         "mb-live-917",
-        MODBUS_HOST,
+        target.host,
         MODBUS_PORT,
-        modbus_settings("400010-400029", "400010-400029", &[]),
+        modbus_settings(
+            target,
+            target.holding_allowlist,
+            target.holding_allowlist,
+            &[],
+        ),
         &modbus_manifest(),
         &modbus_component(),
         &[
-            ("w0", "40020", "u32", None, true),
-            ("w1", "40022", "u32", None, true),
-            ("str", "40020", "string", Some(4), true),
+            ("w0", target.string_address, "u32", None, true),
+            ("w1", target.string_second, "u32", None, true),
+            ("str", target.string_address, "string", Some(4), true),
         ],
     )
     .await;

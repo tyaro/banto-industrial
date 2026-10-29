@@ -1,13 +1,15 @@
 //! #917: explicitly ignored checks of the pinned Modbus WASM guest (A1, B1,
-//! B2, C1, UDP probe) against the local ModbusSlave at `127.0.0.1:502`,
-//! unit 1, over the direct engine path (`WasmDriver::load_operational_write`
+//! B2, C1, UDP probe) against the local ModbusSlave at `127.0.0.1:502` or the
+//! R CPU (Modbus/TCP) at `192.168.11.200:502`, unit 1, chosen by
+//! `BANTO_MODBUS_LIVE_917_TARGET` (`slave` = default, or `r`), over the direct engine path (`WasmDriver::load_operational_write`
 //! + `FrameSession`).
 //!
 //! Every case is `#[ignore]` and refuses to open a socket unless
 //! `BANTO_WASM_LIVE_917=1`. The destination is fixed; a `WireGate` inspects
-//! every MBAP frame: reads (FC1-FC4) pass, writes pass only for coils
-//! 00001-00008 and holding registers 40010-40029 and only while the case has
-//! authorised a write. Results are `audit` lines with a UTC Unix-ns stamp.
+//! every MBAP frame: reads (FC1-FC4) pass, writes pass only inside the
+//! target's coil and holding ranges (`slave`: coils 00001-00008, holding
+//! 40010-40029; `r`: coils 09193-09200 = M1000-M1007, holding 43021-43040 =
+//! D3020-D3039) and only while the case has authorised a write. Results are `audit` lines with a UTC Unix-ns stamp.
 //! When a read back disagrees the case stops without retry or restoration.
 //!
 //! Run one case at a time:
@@ -36,15 +38,96 @@ const COMPONENT_SHA256: &str = "af6cb1685991b5296f3423ac129e6c1482c371dc0a18e1b9
 /// `component/manifest.json` of the same guest commit (`modbus-fc3-wasm` 0.9.0).
 const MANIFEST_SHA256: &str = "7399a90c0a145d803c73ed6ded9b28c695d9462f8989cf608f30dca8df2f6c43";
 
-const HOST: &str = "127.0.0.1";
+const TARGET_ENV: &str = "BANTO_MODBUS_LIVE_917_TARGET";
 const PORT: u16 = 502;
 const UNIT: u8 = 1;
-/// Coils 00001-00008 as protocol addresses.
-const COIL_RANGE: std::ops::RangeInclusive<u16> = 0..=7;
-/// Holding registers 40010-40029 as protocol addresses.
-const HOLDING_RANGE: std::ops::RangeInclusive<u16> = 9..=28;
-const COIL_ALLOWLIST: &str = "000001-000008";
-const HOLDING_ALLOWLIST: &str = "400010-400029";
+
+/// One approved destination with its own write ranges and addresses. The
+/// offsets are protocol addresses (0-based); the allowlists and addresses use
+/// the guest's notation.
+struct Target {
+    label: &'static str,
+    host: &'static str,
+    coil_range: (u16, u16),
+    holding_range: (u16, u16),
+    coil_allowlist: &'static str,
+    holding_allowlist: &'static str,
+    /// B2: the 1-based number of the first of eight coils (`00001`).
+    first_coil_number: u16,
+    /// A1 probe (coil only).
+    probe_coil: &'static str,
+    /// Probe of the holding-register cases.
+    probe_holding: &'static str,
+    /// B1: a bit of a holding register.
+    bit_address: &'static str,
+    /// B2: the register written with FC6 (also the UDP probe register).
+    word_address: &'static str,
+    word_offset: u16,
+    /// C1: first of two u32 / a 4-word string, and the second u32.
+    string_address: &'static str,
+    string_second: &'static str,
+    string_offset: u16,
+}
+
+/// ModbusSlave on this PC: coils 00001-00008, holding 40010-40029.
+const SLAVE: Target = Target {
+    label: "slave",
+    host: "127.0.0.1",
+    coil_range: (0, 7),
+    holding_range: (9, 28),
+    coil_allowlist: "000001-000008",
+    holding_allowlist: "400010-400029",
+    first_coil_number: 1,
+    probe_coil: "00001",
+    probe_holding: "40010",
+    bit_address: "40010.3",
+    word_address: "40010",
+    word_offset: 9,
+    string_address: "40020",
+    string_second: "40022",
+    string_offset: 19,
+};
+
+/// R CPU: coil offset 8192+n = M n, holding offset n = D n. Coils
+/// 09193-09200 = M1000-M1007, holding 43021-43040 = D3020-D3039.
+const R: Target = Target {
+    label: "r",
+    host: "192.168.11.200",
+    coil_range: (9192, 9199),
+    holding_range: (3020, 3039),
+    coil_allowlist: "009193-009200",
+    holding_allowlist: "403021-403040",
+    first_coil_number: 9193,
+    probe_coil: "09193",
+    probe_holding: "43021",
+    bit_address: "43021.3",
+    word_address: "43021",
+    word_offset: 3020,
+    string_address: "43031",
+    string_second: "43033",
+    string_offset: 3030,
+};
+
+fn parse_target(value: Option<&str>) -> &'static Target {
+    match value {
+        None | Some("slave") => &SLAVE,
+        Some("r") => &R,
+        Some(other) => panic!("{TARGET_ENV} must be `slave` or `r`, not {other:?}"),
+    }
+}
+
+fn target() -> &'static Target {
+    parse_target(std::env::var(TARGET_ENV).ok().as_deref())
+}
+
+impl Target {
+    fn coil_addresses(&self) -> Vec<String> {
+        (0..8)
+            .map(|i| format!("{:05}", self.first_coil_number + i))
+            .collect()
+    }
+}
+
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn audit(stage: &str, detail: impl std::fmt::Display) {
@@ -52,7 +135,10 @@ fn audit(stage: &str, detail: impl std::fmt::Display) {
         .duration_since(UNIX_EPOCH)
         .expect("UTC clock before Unix epoch")
         .as_nanos();
-    println!("utc_unix_ns={unix_ns} stage={stage} {detail}");
+    println!(
+        "utc_unix_ns={unix_ns} target={} stage={stage} {detail}",
+        target().label
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -87,25 +173,35 @@ fn manifest() -> Vec<u8> {
     pinned_file(MANIFEST_ENV, MANIFEST_SHA256, "manifest")
 }
 
-fn require_destination(settings: &Settings, spec: &TransportSpec) -> Result<(), String> {
-    let settings_ok = settings.get("host") == Some(HOST)
+fn require_destination(
+    target: &Target,
+    settings: &Settings,
+    spec: &TransportSpec,
+) -> Result<(), String> {
+    let settings_ok = settings.get("host") == Some(target.host)
         && settings.get("port") == Some("502")
         && settings.get("unit_id") == Some("1")
         && settings.get("transport").unwrap_or("tcp") == "tcp";
     let spec_ok =
-        matches!(spec, TransportSpec::Tcp { host, port } if host == HOST && *port == PORT);
+        matches!(spec, TransportSpec::Tcp { host, port } if host == target.host && *port == PORT);
     if settings_ok && spec_ok {
         Ok(())
     } else {
         Err(format!(
-            "settings and transport {spec:?} must both be {HOST}:{PORT} unit {UNIT}"
+            "settings and transport {spec:?} must both be {}:{PORT} unit {UNIT}",
+            target.host
         ))
     }
 }
 
-fn settings(probe: &str, write: Option<(&str, &str)>, extra: &[(&str, &str)]) -> Settings {
+fn settings(
+    target: &Target,
+    probe: &str,
+    write: Option<(&str, &str)>,
+    extra: &[(&str, &str)],
+) -> Settings {
     let mut pairs = vec![
-        ("host", HOST),
+        ("host", target.host),
         ("port", "502"),
         ("unit_id", "1"),
         ("probe_address", probe),
@@ -123,6 +219,7 @@ fn settings(probe: &str, write: Option<(&str, &str)>, extra: &[(&str, &str)]) ->
 }
 
 struct WireGate {
+    target: &'static Target,
     /// Every frame that passed (`FCn detail`).
     frames: Vec<String>,
     write_budget: usize,
@@ -134,8 +231,9 @@ fn be16(bytes: &[u8]) -> u16 {
 }
 
 impl WireGate {
-    fn new() -> Self {
+    fn new(target: &'static Target) -> Self {
         Self {
+            target,
             frames: Vec::new(),
             write_budget: 0,
             writes_sent: 0,
@@ -164,13 +262,14 @@ impl WireGate {
         }
         let pdu = &bytes[7..];
         let function = pdu[0];
-        let span = |range: std::ops::RangeInclusive<u16>, start: u16, count: u16| {
+        let span = |(first, last): (u16, u16), start: u16, count: u16| {
             count >= 1
-                && range.contains(&start)
+                && (first..=last).contains(&start)
                 && start
                     .checked_add(count - 1)
-                    .is_some_and(|last| range.contains(&last))
+                    .is_some_and(|end| (first..=last).contains(&end))
         };
+        let (coils, holding) = (self.target.coil_range, self.target.holding_range);
         let (is_write, detail) = match function {
             1..=4 if pdu.len() == 5 => (
                 false,
@@ -178,8 +277,8 @@ impl WireGate {
             ),
             5 if pdu.len() == 5 => {
                 let start = be16(&pdu[1..3]);
-                if !span(COIL_RANGE, start, 1) {
-                    return Err(blocked("FC5 outside coils 00001-00008"));
+                if !span(coils, start, 1) {
+                    return Err(blocked("FC5 outside the approved coils"));
                 }
                 (
                     true,
@@ -188,11 +287,11 @@ impl WireGate {
             }
             15 if pdu.len() >= 7 => {
                 let (start, count) = (be16(&pdu[1..3]), be16(&pdu[3..5]));
-                if !span(COIL_RANGE, start, count)
+                if !span(coils, start, count)
                     || pdu.len() != 6 + usize::from(pdu[5])
                     || usize::from(pdu[5]) != usize::from(count).div_ceil(8)
                 {
-                    return Err(blocked("FC15 outside coils 00001-00008 or malformed"));
+                    return Err(blocked("FC15 outside the approved coils or malformed"));
                 }
                 (
                     true,
@@ -201,8 +300,8 @@ impl WireGate {
             }
             6 if pdu.len() == 5 => {
                 let start = be16(&pdu[1..3]);
-                if !span(HOLDING_RANGE, start, 1) {
-                    return Err(blocked("FC6 outside holding 40010-40029"));
+                if !span(holding, start, 1) {
+                    return Err(blocked("FC6 outside the approved holding registers"));
                 }
                 (
                     true,
@@ -211,12 +310,14 @@ impl WireGate {
             }
             16 if pdu.len() >= 8 => {
                 let (start, count) = (be16(&pdu[1..3]), be16(&pdu[3..5]));
-                if !span(HOLDING_RANGE, start, count)
+                if !span(holding, start, count)
                     || count > 123
                     || usize::from(pdu[5]) != usize::from(count) * 2
                     || pdu.len() != 6 + usize::from(pdu[5])
                 {
-                    return Err(blocked("FC16 outside holding 40010-40029 or malformed"));
+                    return Err(blocked(
+                        "FC16 outside the approved holding registers or malformed",
+                    ));
                 }
                 (
                     true,
@@ -228,8 +329,8 @@ impl WireGate {
             }
             22 if pdu.len() == 7 => {
                 let start = be16(&pdu[1..3]);
-                if !span(HOLDING_RANGE, start, 1) {
-                    return Err(blocked("FC22 outside holding 40010-40029"));
+                if !span(holding, start, 1) {
+                    return Err(blocked("FC22 outside the approved holding registers"));
                 }
                 (
                     true,
@@ -401,25 +502,25 @@ fn as_bits(items: &[Result<Value, ItemError>]) -> Option<Vec<bool>> {
         .collect()
 }
 
-async fn connect(settings: Settings) -> Live {
+async fn connect(target: &'static Target, settings: Settings) -> Live {
     require_opt_in();
     let driver = WasmDriver::load_operational_write(&manifest(), &component()).unwrap();
     let spec = TransportSpec::Tcp {
-        host: HOST.into(),
+        host: target.host.into(),
         port: PORT,
     };
-    require_destination(&settings, &spec).expect("destination must match before dial");
+    require_destination(target, &settings, &spec).expect("destination must match before dial");
     let errors = driver.validate_config(&settings);
     assert!(errors.is_empty(), "guest refused the settings: {errors:?}");
     audit(
         "connect_start",
-        format!("destination={HOST}:{PORT} unit={UNIT}"),
+        format!("destination={}:{PORT} unit={UNIT}", target.host),
     );
-    let gate = Arc::new(Mutex::new(WireGate::new()));
+    let gate = Arc::new(Mutex::new(WireGate::new(target)));
     let wire = spec
         .connect(RESPONSE_TIMEOUT)
         .await
-        .expect("local ModbusSlave connection");
+        .expect("Modbus connection");
     let guarded = Box::new(GuardedTransport {
         inner: wire,
         gate: gate.clone(),
@@ -441,62 +542,159 @@ async fn connect(settings: Settings) -> Live {
 
 // ---------------------------------------------------------------- offline
 
+fn mbap(pdu: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0x00, 0x01, 0x00, 0x00];
+    bytes.extend_from_slice(&u16::try_from(pdu.len() + 1).unwrap().to_be_bytes());
+    bytes.push(UNIT);
+    bytes.extend_from_slice(pdu);
+    bytes
+}
+
+fn pdu5(function: u8, addr: u16, value: [u8; 2]) -> Vec<u8> {
+    let mut pdu = vec![function];
+    pdu.extend_from_slice(&addr.to_be_bytes());
+    pdu.extend_from_slice(&value);
+    pdu
+}
+
+fn fc15(start: u16, count: u16) -> Vec<u8> {
+    let bytes = usize::from(count).div_ceil(8);
+    let mut pdu = vec![15];
+    pdu.extend_from_slice(&start.to_be_bytes());
+    pdu.extend_from_slice(&count.to_be_bytes());
+    pdu.push(u8::try_from(bytes).unwrap());
+    pdu.extend(std::iter::repeat_n(0xa5, bytes));
+    pdu
+}
+
+fn fc16(start: u16, count: u16) -> Vec<u8> {
+    let mut pdu = vec![16];
+    pdu.extend_from_slice(&start.to_be_bytes());
+    pdu.extend_from_slice(&count.to_be_bytes());
+    pdu.push(u8::try_from(count * 2).unwrap());
+    pdu.extend(std::iter::repeat_n(0x01, usize::from(count) * 2));
+    pdu
+}
+
+fn fc22(addr: u16) -> Vec<u8> {
+    let mut pdu = vec![22];
+    pdu.extend_from_slice(&addr.to_be_bytes());
+    pdu.extend_from_slice(&[0xff, 0xf7, 0, 8]);
+    pdu
+}
+
 #[test]
 fn gate_passes_reads_and_only_authorised_in_range_writes() {
-    let mut gate = WireGate::new();
-    let frame = |pdu: &[u8]| {
-        let mut bytes = vec![0x00, 0x01, 0x00, 0x00];
-        bytes.extend_from_slice(&u16::try_from(pdu.len() + 1).unwrap().to_be_bytes());
-        bytes.push(UNIT);
-        bytes.extend_from_slice(pdu);
-        bytes
-    };
-    for function in 1..=4u8 {
-        gate.check_before_send(&frame(&[function, 0, 0, 0, 1]))
+    for target in [&SLAVE, &R] {
+        let mut gate = WireGate::new(target);
+        let (c0, c1) = target.coil_range;
+        let (h0, h1) = target.holding_range;
+        for function in 1..=4u8 {
+            gate.check_before_send(&mbap(&pdu5(function, 0, [0, 1])))
+                .unwrap();
+        }
+        gate.check_before_send(&mbap(&pdu5(3, 100, [0, 10])))
             .unwrap();
+        // Wrong unit, unknown function, writes without budget.
+        let mut other_unit = mbap(&pdu5(3, 0, [0, 1]));
+        other_unit[6] = 2;
+        assert!(gate.check_before_send(&other_unit).is_err());
+        assert!(gate.check_before_send(&mbap(&pdu5(8, 0, [0, 0]))).is_err());
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(5, c0, [0xff, 0])))
+            .is_err());
+        gate.authorize_writes(6);
+        // Coils: only the target's range.
+        gate.check_before_send(&mbap(&pdu5(5, c1, [0xff, 0])))
+            .unwrap();
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(5, c1 + 1, [0xff, 0])))
+            .is_err());
+        if c0 > 0 {
+            assert!(gate
+                .check_before_send(&mbap(&pdu5(5, c0 - 1, [0xff, 0])))
+                .is_err());
+        }
+        gate.check_before_send(&mbap(&fc15(c0, 8))).unwrap();
+        assert!(gate.check_before_send(&mbap(&fc15(c0 + 1, 8))).is_err());
+        assert!(gate.check_before_send(&mbap(&fc15(c0, 9))).is_err());
+        // Holding: only the target's range.
+        gate.check_before_send(&mbap(&pdu5(6, h0, [0x12, 0x34])))
+            .unwrap();
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(6, h0 - 1, [0x12, 0x34])))
+            .is_err());
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(6, h1 + 1, [0x12, 0x34])))
+            .is_err());
+        gate.check_before_send(&mbap(&fc16(h0 + 10, 4))).unwrap();
+        assert!(gate.check_before_send(&mbap(&fc16(h1, 2))).is_err());
+        gate.check_before_send(&mbap(&fc22(h0))).unwrap();
+        assert!(gate.check_before_send(&mbap(&fc22(h1 + 1))).is_err());
+        assert_eq!(gate.writes_sent, 5, "{}", target.label);
+        gate.check_before_send(&mbap(&pdu5(6, h1, [0, 0]))).unwrap();
+        assert!(gate.check_before_send(&mbap(&pdu5(6, h1, [0, 0]))).is_err());
+        assert_eq!(gate.writes_sent, 6);
     }
-    gate.check_before_send(&frame(&[3, 0, 100, 0, 10])).unwrap();
-    // Wrong unit, unknown function, writes without budget.
-    let mut other_unit = frame(&[3, 0, 0, 0, 1]);
-    other_unit[6] = 2;
-    assert!(gate.check_before_send(&other_unit).is_err());
-    assert!(gate.check_before_send(&frame(&[8, 0, 0, 0, 0])).is_err());
-    assert!(gate.check_before_send(&frame(&[5, 0, 0, 0xff, 0])).is_err());
-    gate.authorize_writes(6);
-    // Coils: 00001-00008 only (addresses 0-7).
-    gate.check_before_send(&frame(&[5, 0, 7, 0xff, 0])).unwrap();
-    assert!(gate.check_before_send(&frame(&[5, 0, 8, 0xff, 0])).is_err());
-    gate.check_before_send(&frame(&[15, 0, 0, 0, 8, 1, 0xa5]))
-        .unwrap();
-    assert!(gate
-        .check_before_send(&frame(&[15, 0, 1, 0, 8, 1, 0xa5]))
-        .is_err());
-    assert!(gate
-        .check_before_send(&frame(&[15, 0, 0, 0, 9, 2, 0xa5, 0x01]))
-        .is_err());
-    // Holding: 40010-40029 only (addresses 9-28).
-    gate.check_before_send(&frame(&[6, 0, 9, 0x12, 0x34]))
-        .unwrap();
-    assert!(gate
-        .check_before_send(&frame(&[6, 0, 8, 0x12, 0x34]))
-        .is_err());
-    assert!(gate
-        .check_before_send(&frame(&[6, 0, 29, 0x12, 0x34]))
-        .is_err());
-    gate.check_before_send(&frame(&[16, 0, 19, 0, 4, 8, 0, 1, 0, 2, 0, 3, 0, 4]))
-        .unwrap();
-    assert!(gate
-        .check_before_send(&frame(&[16, 0, 28, 0, 2, 4, 0, 1, 0, 2]))
-        .is_err());
-    gate.check_before_send(&frame(&[22, 0, 9, 0xff, 0xf7, 0, 8]))
-        .unwrap();
-    assert!(gate
-        .check_before_send(&frame(&[22, 0, 30, 0xff, 0xf7, 0, 8]))
-        .is_err());
-    assert_eq!(gate.writes_sent, 5);
-    gate.check_before_send(&frame(&[6, 0, 28, 0, 0])).unwrap();
-    assert!(gate.check_before_send(&frame(&[6, 0, 28, 0, 0])).is_err());
-    assert_eq!(gate.writes_sent, 6);
+}
+
+#[test]
+fn gate_refuses_the_other_targets_write_ranges() {
+    for (target, other) in [(&SLAVE, &R), (&R, &SLAVE)] {
+        let mut gate = WireGate::new(target);
+        gate.authorize_writes(10);
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(5, other.coil_range.0, [0xff, 0])))
+            .is_err());
+        assert!(gate
+            .check_before_send(&mbap(&fc15(other.coil_range.0, 8)))
+            .is_err());
+        assert!(gate
+            .check_before_send(&mbap(&pdu5(6, other.holding_range.0, [0, 1])))
+            .is_err());
+        assert!(gate
+            .check_before_send(&mbap(&fc16(other.holding_range.0, 4)))
+            .is_err());
+        assert_eq!(gate.writes_sent, 0, "{}", target.label);
+    }
+}
+
+#[test]
+fn r_target_ranges_and_allowlists_match_the_approved_cells() {
+    // Coil offset 8192+n = M n: M1000-M1007 = offsets 9192-9199 = 09193-09200.
+    assert_eq!(R.coil_range, (8192 + 1000, 8192 + 1007));
+    assert_eq!(R.coil_addresses().first().unwrap(), "09193");
+    assert_eq!(R.coil_addresses().last().unwrap(), "09200");
+    // Holding offset n = D n: D3020-D3039.
+    assert_eq!(R.holding_range, (3020, 3039));
+    assert_eq!(R.word_offset, 3020);
+    assert_eq!(R.string_offset, 3030);
+    assert_eq!(R.word_address, "43021");
+    assert_eq!(R.string_address, "43031");
+    assert_eq!(R.string_second, "43033");
+    assert_eq!(R.holding_allowlist, "403021-403040");
+    assert_eq!(R.coil_allowlist, "009193-009200");
+    for target in [&SLAVE, &R] {
+        assert_eq!(target.coil_addresses().len(), 8);
+        let (h0, h1) = target.holding_range;
+        for offset in [target.word_offset, target.string_offset + 3] {
+            assert!((h0..=h1).contains(&offset), "{}", target.label);
+        }
+        assert!((h0..=h1).contains(&target.string_offset));
+    }
+}
+
+#[test]
+fn target_env_accepts_only_slave_and_r() {
+    assert_eq!(parse_target(None).label, "slave");
+    assert_eq!(parse_target(Some("slave")).label, "slave");
+    assert_eq!(parse_target(Some("r")).label, "r");
+    for bad in ["", "R", "q", "127.0.0.1", "192.168.11.200"] {
+        assert!(
+            std::panic::catch_unwind(|| parse_target(Some(bad))).is_err(),
+            "{bad:?}"
+        );
+    }
 }
 
 #[test]
@@ -505,24 +703,32 @@ fn destination_guard_refuses_other_hosts_ports_units_and_transports() {
         host: host.into(),
         port,
     };
-    let good = settings("40001", None, &[]);
-    assert!(require_destination(&good, &tcp(HOST, PORT)).is_ok());
-    assert!(require_destination(&good, &tcp("192.168.11.200", PORT)).is_err());
-    assert!(require_destination(&good, &tcp(HOST, 5020)).is_err());
-    assert!(require_destination(
-        &good,
-        &TransportSpec::Udp {
-            host: HOST.into(),
-            port: PORT
-        }
-    )
-    .is_err());
-    let other_unit =
-        Settings::from_pairs([("host", HOST), ("port", "502"), ("unit_id", "2")]).unwrap();
-    assert!(require_destination(&other_unit, &tcp(HOST, PORT)).is_err());
-    let other_port =
-        Settings::from_pairs([("host", HOST), ("port", "5020"), ("unit_id", "1")]).unwrap();
-    assert!(require_destination(&other_port, &tcp(HOST, PORT)).is_err());
+    for (target, other) in [(&SLAVE, &R), (&R, &SLAVE)] {
+        let host = target.host;
+        let good = settings(target, target.probe_holding, None, &[]);
+        assert!(require_destination(target, &good, &tcp(host, PORT)).is_ok());
+        // The other target's host is refused in both the settings and the transport.
+        let other_settings = settings(other, other.probe_holding, None, &[]);
+        assert!(require_destination(target, &other_settings, &tcp(host, PORT)).is_err());
+        assert!(require_destination(target, &good, &tcp(other.host, PORT)).is_err());
+        assert!(require_destination(target, &good, &tcp("192.168.11.10", PORT)).is_err());
+        assert!(require_destination(target, &good, &tcp(host, 5020)).is_err());
+        assert!(require_destination(
+            target,
+            &good,
+            &TransportSpec::Udp {
+                host: host.into(),
+                port: PORT
+            }
+        )
+        .is_err());
+        let other_unit =
+            Settings::from_pairs([("host", host), ("port", "502"), ("unit_id", "2")]).unwrap();
+        assert!(require_destination(target, &other_unit, &tcp(host, PORT)).is_err());
+        let other_port =
+            Settings::from_pairs([("host", host), ("port", "5020"), ("unit_id", "1")]).unwrap();
+        assert!(require_destination(target, &other_port, &tcp(host, PORT)).is_err());
+    }
 }
 
 #[test]
@@ -535,12 +741,13 @@ fn every_live_case_refuses_to_start_without_the_opt_in() {
 
 // ----------------------------------------------------------------- cases
 
-/// A1: a coil-only connection (probe 00001) connects with exactly one FC1
+/// A1: a coil-only connection (probe coil) connects with exactly one FC1
 /// read of one point; no holding register is touched.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn modbus_a1_coil_only_probe_connects_with_one_fc1_read() {
-    let live = connect(settings("00001", None, &[])).await;
+    let target = target();
+    let live = connect(target, settings(target, target.probe_coil, None, &[])).await;
     let frames = live.frames();
     audit("a1", format!("handshake frames={frames:?}"));
     assert_eq!(frames.len(), 1, "exactly one probe read: {frames:?}");
@@ -549,20 +756,29 @@ async fn modbus_a1_coil_only_probe_connects_with_one_fc1_read() {
     live.close().await;
 }
 
-/// B1: with `register_bit_write=disabled` a `40010.3` write is refused by the
-/// guest before send (`Rejected`); the bit is still readable.
+/// B1: with `register_bit_write=disabled` a register-bit write is refused by
+/// the guest before send (`Rejected`); the bit is still readable.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn modbus_b1_register_bit_write_without_fc22_is_refused_before_send() {
-    let mut live = connect(settings(
-        "40010",
-        Some((HOLDING_ALLOWLIST, HOLDING_ALLOWLIST)),
-        &[("register_bit_write", "disabled")],
-    ))
+    let target = target();
+    let mut live = connect(
+        target,
+        settings(
+            target,
+            target.probe_holding,
+            Some((target.holding_allowlist, target.holding_allowlist)),
+            &[("register_bit_write", "disabled")],
+        ),
+    )
     .await;
-    let spec = live.numeric("40010.3", DataType::Bit);
+    let spec = live.numeric(target.bit_address, DataType::Bit);
     let items = live
-        .read("b1_read", &["40010.3"], std::slice::from_ref(&spec))
+        .read(
+            "b1_read",
+            &[target.bit_address],
+            std::slice::from_ref(&spec),
+        )
         .await;
     audit("b1", format!("read={items:?}"));
     for value in [true, false] {
@@ -579,22 +795,28 @@ async fn modbus_b1_register_bit_write_without_fc22_is_refused_before_send() {
 /// back, 40010 is read twice, written (`register_write=fc6`, one FC6) and
 /// read back; then both are restored and read back. Four writes in all.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
-    let allowlist = format!("{COIL_ALLOWLIST},{HOLDING_ALLOWLIST}");
-    let mut live = connect(settings(
-        "40010",
-        Some((&allowlist, &allowlist)),
-        &[("register_write", "fc6")],
-    ))
+    let target = target();
+    let allowlist = format!("{},{}", target.coil_allowlist, target.holding_allowlist);
+    let word_address = target.word_address;
+    let mut live = connect(
+        target,
+        settings(
+            target,
+            target.probe_holding,
+            Some((&allowlist, &allowlist)),
+            &[("register_write", "fc6")],
+        ),
+    )
     .await;
-    let coil_addresses: Vec<String> = (1..=8).map(|n| format!("{n:05}")).collect();
+    let coil_addresses = target.coil_addresses();
     let coil_labels: Vec<&str> = coil_addresses.iter().map(String::as_str).collect();
     let coil_specs: Vec<TagSpec> = coil_addresses
         .iter()
         .map(|a| live.numeric(a, DataType::Bit))
         .collect();
-    let word_spec = live.numeric("40010", DataType::U16);
+    let word_spec = live.numeric(word_address, DataType::U16);
 
     let coils_1 = as_bits(
         &live
@@ -605,8 +827,8 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     let word_1 = as_number(
         &live
             .read(
-                "b2_40010_read_1",
-                &["40010"],
+                "b2_word_read_1",
+                &[word_address],
                 std::slice::from_ref(&word_spec),
             )
             .await[0],
@@ -622,8 +844,8 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     let word_2 = as_number(
         &live
             .read(
-                "b2_40010_read_2",
-                &["40010"],
+                "b2_word_read_2",
+                &[word_address],
                 std::slice::from_ref(&word_spec),
             )
             .await[0],
@@ -635,7 +857,7 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     );
     assert_eq!(
         word_1, word_2,
-        "40010 changed between reads; nothing written"
+        "{word_address} changed between reads; nothing written"
     );
 
     let inverted: Vec<WriteItem> = coil_specs
@@ -655,10 +877,9 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
         vec![Ok(()); 8],
         "coil run not confirmed; stop, no restoration"
     );
+    let fc15_prefix = format!("FC15 coils start={} count=8", target.first_coil_number - 1);
     assert!(
-        live.frames()
-            .iter()
-            .any(|f| f.starts_with("FC15 coils start=0 count=8")),
+        live.frames().iter().any(|f| f.starts_with(&fc15_prefix)),
         "one FC15 over the run expected: {:?}",
         live.frames()
     );
@@ -673,15 +894,15 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     live.authorize(1);
     let results = live
         .write(
-            "b2_40010_trial_write",
+            "b2_word_trial_write",
             &[WriteItem::new(word_spec.clone(), Value::F64(trial))],
         )
         .await;
     let word_back = as_number(
         &live
             .read(
-                "b2_40010_trial_readback",
-                &["40010"],
+                "b2_word_trial_readback",
+                &[word_address],
                 std::slice::from_ref(&word_spec),
             )
             .await[0],
@@ -689,7 +910,7 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     assert_eq!(
         results,
         vec![Ok(())],
-        "40010 write not confirmed; stop, no restoration"
+        "{word_address} write not confirmed; stop, no restoration"
     );
     assert!(
         live.frames().iter().any(|f| f.starts_with("FC6 ")),
@@ -699,7 +920,7 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     assert_eq!(
         word_back,
         Some(trial),
-        "40010 read back differs; stop, no restoration"
+        "{word_address} read back differs; stop, no restoration"
     );
 
     let restore: Vec<WriteItem> = coil_specs
@@ -723,21 +944,21 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
     live.authorize(1);
     let results = live
         .write(
-            "b2_40010_restore_write",
+            "b2_word_restore_write",
             &[WriteItem::new(word_spec.clone(), Value::F64(word_1))],
         )
         .await;
-    assert_eq!(results, vec![Ok(())], "40010 restoration not confirmed");
+    assert_eq!(results, vec![Ok(())], "word restoration not confirmed");
     let word_restored = as_number(
         &live
             .read(
-                "b2_40010_restore_readback",
-                &["40010"],
+                "b2_word_restore_readback",
+                &[word_address],
                 std::slice::from_ref(&word_spec),
             )
             .await[0],
     );
-    assert_eq!(word_restored, Some(word_1), "original 40010 not confirmed");
+    assert_eq!(word_restored, Some(word_1), "original word not confirmed");
     assert_eq!(live.writes_sent(), 4);
     live.close().await;
 }
@@ -747,20 +968,28 @@ async fn modbus_b2_fc15_coils_and_fc6_register_write_readback_restore() {
 /// read back, then the two original u32 are written back as one FC16
 /// (contiguous span) and read back. Two writes in all.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn modbus_c1_holding_string_write_readback_restore() {
-    let mut live = connect(settings(
-        "40010",
-        Some((HOLDING_ALLOWLIST, HOLDING_ALLOWLIST)),
-        &[],
-    ))
+    let target = target();
+    let mut live = connect(
+        target,
+        settings(
+            target,
+            target.probe_holding,
+            Some((target.holding_allowlist, target.holding_allowlist)),
+            &[],
+        ),
+    )
     .await;
-    let labels = ["40020 u32", "40022 u32"];
+    let first_label = format!("{} u32", target.string_address);
+    let second_label = format!("{} u32", target.string_second);
+    let str_label = format!("{} str4", target.string_address);
+    let labels = [first_label.as_str(), second_label.as_str()];
     let span_specs = vec![
-        live.numeric("40020", DataType::U32),
-        live.numeric("40022", DataType::U32),
+        live.numeric(target.string_address, DataType::U32),
+        live.numeric(target.string_second, DataType::U32),
     ];
-    let string_spec = live.string("40020", 4);
+    let string_spec = live.string(target.string_address, 4);
     let read_span = |items: Vec<Result<Value, ItemError>>| -> Vec<f64> {
         items
             .iter()
@@ -777,7 +1006,7 @@ async fn modbus_c1_holding_string_write_readback_restore() {
     let text = live
         .read(
             "c1_string_read",
-            &["40020 str4"],
+            &[str_label.as_str()],
             std::slice::from_ref(&string_spec),
         )
         .await;
@@ -793,7 +1022,7 @@ async fn modbus_c1_holding_string_write_readback_restore() {
     let back = live
         .read(
             "c1_trial_string_readback",
-            &["40020 str4"],
+            &[str_label.as_str()],
             std::slice::from_ref(&string_spec),
         )
         .await;
@@ -806,10 +1035,9 @@ async fn modbus_c1_holding_string_write_readback_restore() {
         vec![Ok(())],
         "string write not confirmed; stop, no restoration"
     );
+    let fc16_prefix = format!("FC16 registers start={} count=4", target.string_offset);
     assert!(
-        live.frames()
-            .iter()
-            .any(|f| f.starts_with("FC16 registers start=19 count=4")),
+        live.frames().iter().any(|f| f.starts_with(&fc16_prefix)),
         "one FC16 over the span expected: {:?}",
         live.frames()
     );
@@ -833,19 +1061,30 @@ async fn modbus_c1_holding_string_write_readback_restore() {
     live.close().await;
 }
 
-/// UDP: one FC3 datagram (40010, one register) to 127.0.0.1:502/udp; the
+/// UDP: one FC3 datagram (the target's word register, one register) to
+/// `<target host>:502/udp`; the
 /// answer or its absence is recorded. The guest manifest lists TCP only, so
 /// nothing more is attempted over UDP.
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "local ModbusSlave; BANTO_WASM_LIVE_917=1 and owner approval required"]
+#[ignore = "Modbus target (BANTO_MODBUS_LIVE_917_TARGET); BANTO_WASM_LIVE_917=1 and owner approval required"]
 async fn modbus_udp_probe_records_whether_the_slave_answers() {
     require_opt_in();
+    let target = target();
+    let [hi, lo] = target.word_offset.to_be_bytes();
     let request = [
-        0x00, 0x01, 0x00, 0x00, 0x00, 0x06, UNIT, 0x03, 0x00, 0x09, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x00, 0x00, 0x06, UNIT, 0x03, hi, lo, 0x00, 0x01,
     ];
-    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    socket.connect((HOST, PORT)).await.unwrap();
-    audit("udp", format!("send {HOST}:{PORT} bytes={}", hex(&request)));
+    let local = if target.host == "127.0.0.1" {
+        "127.0.0.1:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let socket = tokio::net::UdpSocket::bind(local).await.unwrap();
+    socket.connect((target.host, PORT)).await.unwrap();
+    audit(
+        "udp",
+        format!("send {}:{PORT} bytes={}", target.host, hex(&request)),
+    );
     socket.send(&request).await.unwrap();
     let mut buffer = vec![0u8; 260];
     match tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut buffer)).await {
