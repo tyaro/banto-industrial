@@ -39,6 +39,88 @@
 //! [`insert_row`] 1回で完結する(pending 経由にする理由がない -
 //! そもそも broker を呼んでいない)。
 //!
+//! ## 定義上の拒否 `rejected` (#711、2026-10-29 オーナー決定)
+//!
+//! 書込み不可(`not_writable`)・catalog に無い(`not_found`)・スコープ外
+//! (`missing_write_scope`)・タグ無効(`tag_disabled`)の拒否も、
+//! `action = 'write'`・`result = 'rejected'` の行として残す(不正な試みや
+//! 外部システムの設定誤りを追えるように)。理由のコードは `detail` に入る。
+//! catalog に無いタグは `tag_id` を引けないので 0 を入れ、要求された名前を
+//! `external_name_snapshot` に残す。物理書き込みは試みないので pending を経ず、
+//! 下の「拒否の表」に件数を足すだけで完結する([`WriteAuditService::record_rejection`])。
+//! タグが重複したバッチ(`DuplicateTagInBatch`)は 4 つの理由の外なので残らない
+//! (#945 の総点検 P3-6)。
+//!
+//! ### 拒否の表と周期の書き手 (#945 の総点検、2026-10-30 オーナー決定)
+//!
+//! 監査が拒否で埋まらないよう、**同じ(API キー, 外部名, 理由)は 60 秒
+//! ([`REJECTION_WINDOW`])の窓に 1 行**にまとめる(例: `not_writable（60 秒の窓で計 13 件）`。
+//! 1 件のときはコードだけ)。窓が明けた次の拒否は新しい行で窓を始め直す。
+//!
+//! - **要求の経路**([`WriteAuditService::record_rejections`]): async ではなく、
+//!   `std::sync::Mutex` の表を 1 回だけ lock して件数を足すだけ(DB にも async の
+//!   ロックにも触れない)。403・404 の応答は変えず、監査で遅らせない。バッチは
+//!   1 回の lock で全件を足し、呼び手は `tag_map()` を呼び出しごとに 1 回だけ取る。
+//!   表が満杯のときの空け直しの走査は、次に期限が切れる時刻まで飛ばし、バッチの同じ
+//!   (名前, 理由)は件数でまとめて表に 1 回だけ足す(あふれる拒否が表の全走査を繰り返さない)。
+//! - **書き手**([`WriteAuditService::spawn_rejection_writer`]、`HubRuntime::start` が
+//!   失敗しうる起動手順をすべて終えたあと、`RunningHub` を組み立てる直前に起動する。
+//!   それより前に gRPC・REST が受けた拒否も表に足すだけなので失われず、最初の周期で
+//!   書かれる。[`RejectionWriter`] を `shutdown` せずに捨てると、書き手と見張りは
+//!   止まる): [`REJECTION_WRITE_PERIOD`](2 秒)ごとに、表を lock して書き終えていない組の
+//!   写しを取り、lock を放してから 1 つのトランザクションで書く。新しい窓は INSERT
+//!   (`ts` は窓の最初の拒否の時刻)、行のある窓は `detail` を UPDATE(0 行なら INSERT
+//!   し直す)。1 周期は [`REJECTION_WRITE_MAX_PAIRS`](256)組まで、残りは次の周期へ。
+//!   書き終えていない組が 256 を超えるときは、まだ一度も書いていない組から先に、
+//!   次に最後に書いたのが古い組の順に選ぶ(窓が明けた組も同じ並び)ので、どの組も
+//!   「組の数 ÷ 256」周期のうちに順に書かれる。落ちたときに失う件数は、最大でおよそ
+//!   「組の数 ÷ 256 × 周期」ぶん。
+//!   DB の操作は「書き終えていない組の数 ÷ 周期」で頭打ちになり、要求の頻度とは
+//!   切り離される(同じ組を 1 万回足しても、1 周期の UPDATE は 1 回)。失敗したら
+//!   表を変えずに次の周期で書き直す(件数を失わない。ログは失敗が続く間の最初の
+//!   1 回と、戻ったときだけ)。窓が明けて書き終えた組は表から消す。
+//! - **件数の遅れと失う範囲**: 件数は周期ぶん(最大 2 秒と 1 回の書込みの時間)遅れて
+//!   DB に入る。プロセスが落ちたとき(電源断・強制終了)は、最後の周期のあとに足した
+//!   分を失う。正常な終了では書き切る(下の「終了」)。
+//! - **書き手の死**: 書き手のタスクが panic したら、見張りのタスクがログに出して
+//!   起こし直す(待ちは 2 秒から倍々で 60 秒まで)。件数は表に残っているので、起こし
+//!   直した書き手が書く。見張りごと止まった(ランタイムの終了など)ときは、要求の経路が
+//!   書き手の最後の周期の時刻を見て、[`REJECTION_WRITER_STALE`](30 秒)を過ぎていれば
+//!   ログに 1 回出す。
+//!
+//! **表の大きさの上限**(メモリを抱えないように):
+//!
+//! - 組は [`REJECTION_TABLE_MAX_PAIRS`](1000)まで。満ちたら窓の明けた組を外す
+//!   (書き終えていない組は「明けた組」の置き場([`REJECTION_TABLE_MAX_CLOSED`]、1000)へ
+//!   移して書き切る)。
+//! - **キーごとの行の上限**: 1 つの API キーが窓の中で別々の行にできる(外部名, 理由)の
+//!   組は [`REJECTION_ROWS_PER_KEY`](20)まで。超えた拒否は、そのキーと理由ごとの
+//!   **まとめの行**(`external_name_snapshot = '*'`、`tag_id = 0`、例:
+//!   `not_found（60 秒の窓で、上限を超えたほかのタグ名で計 7 件）`)に数える。キーの予算の
+//!   窓と組ごとの窓は別々に始まるので、窓の境界をまたぐと 1 つのキーの行は最大で
+//!   およそ 2 倍(上限の 2 倍 + 理由の数)になる(P3-4)。予算の記憶もキー 1000 個まで
+//!   (超えて捨てたキーは予算を数え直す)。
+//! - 新しい組もまとめの組も表に入らなければ、件数を**あふれ**に足し、書き手が
+//!   **あふれの行**(`api_key_id = 0`・キー名とプレフィックスは空・
+//!   `external_name_snapshot = '*'`・`tag_id = 0`・
+//!   `detail = 'overflow（N 件を記録できなかった）'`)を 1 行残す(どのキーの拒否かは
+//!   数えない)。置き場が満ちたときの、書いていない件数もここに足す。置き場が満ちた
+//!   ときに捨てるのは、書き手が書いている最中(写しを取って結果が戻っていない)で
+//!   **ない**組だけ(#945 のレビュー)。書いている最中の組を捨てると、書けたときに
+//!   普通の行とあふれの行の両方に数えてしまう(二重の計上)ので、それはなくした。
+//!   書いている最中の組は 1 周期に [`REJECTION_WRITE_MAX_PAIRS`](256)組までで置き場の
+//!   上限より少ないので、捨てられる組は必ずあり、置き場は上限を超えない。
+//! - 外部名とキー名は [`REJECTION_NAME_MAX_CHARS`](256 文字)までに切り詰め、末尾を `…`
+//!   にして監査に残す。先頭が同じ長い名前どうしは、切り詰めた後で同じ組として数えうる。
+//! - **メモリの見積もり**: 組 1 つは構造体と名前(外部名は UTF-8 で最大 1023 バイト。
+//!   キー名とプレフィックスは呼び出しごとに `Arc<str>` で共有)で、最悪およそ 1.2 KB。
+//!   開いた組と置き場を合わせて 2000 組、およそ 2.5 MB に収まる。
+//!
+//! **終了**: `RunningHub::shutdown_and_report` が書込みの入口を止めたあと、設定 DB の
+//! pool を閉じる前に [`RejectionWriter::shutdown`] で書き手を止め(書いている周期は
+//! 終わらせる)、表の残りをすべて書き切る(上限 `WRITE_AUDIT_FLUSH_TIMEOUT` = 5 秒)。
+//! 時間切れなら、書けなかった件数を 1 行のログにまとめて先へ進む。
+//!
 //! ## スナップショット列 (`api_key_name_snapshot`/`api_key_prefix_snapshot`/`external_name_snapshot`)
 //!
 //! API キーは失効(`revoked_at`)されても行として残るが、失効後に削除
@@ -48,6 +130,12 @@
 //! 何が起きたか」を後から名前解決なしに読めるよう、キー名・外部名を
 //! **書き込み時点の値としてスナップショット**する(`crate::audit`の
 //! `rule_name_snapshot` と同じ設計判断)。
+
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime};
 
 use banto_core::{BantoError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -91,6 +179,10 @@ pub enum WriteAuditResult {
     SuppressedDisabled,
     /// レート制限(§6-4)を超過するため、物理書き込みを一切試みず抑制した。
     SuppressedRateLimited,
+    /// #711(2026-10-29 オーナー決定): 定義上の拒否(書込み不可・catalog に
+    /// 無い・スコープ外・タグ無効)。理由のコードは `detail` に入る
+    /// ([`WriteRejectionReason`])。`action` は `write` のまま。
+    Rejected,
 }
 
 impl WriteAuditResult {
@@ -101,6 +193,7 @@ impl WriteAuditResult {
             WriteAuditResult::Uncertain => "uncertain",
             WriteAuditResult::SuppressedDisabled => "suppressed_disabled",
             WriteAuditResult::SuppressedRateLimited => "suppressed_rate_limited",
+            WriteAuditResult::Rejected => "rejected",
         }
     }
 }
@@ -219,43 +312,982 @@ fn column_map() -> ColumnMap {
         .column("detail", "detail")
 }
 
+/// #711: 定義上の拒否の理由(`result = 'rejected'` の行の `detail` の先頭に
+/// 入るコード。REST の応答の `error` と同じ綴り)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteRejectionReason {
+    /// `writable == false`(`db` タグを含む)。
+    NotWritable,
+    /// catalog に無い外部名。
+    NotFound,
+    /// `write:{タグ}` スコープが無い。
+    MissingWriteScope,
+    /// 実効 enabled が false。
+    TagDisabled,
+}
+
+impl WriteRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WriteRejectionReason::NotWritable => "not_writable",
+            WriteRejectionReason::NotFound => "not_found",
+            WriteRejectionReason::MissingWriteScope => "missing_write_scope",
+            WriteRejectionReason::TagDisabled => "tag_disabled",
+        }
+    }
+}
+
+/// #711: 同じ(キー, タグ, 理由)の拒否を 1 行にまとめる窓。
+pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// #945 の総点検: 拒否の表に持つ組(窓)の上限。満ちたら、窓が明けた組を表から外して
+/// 場所を空ける(書き終えていない組は「明けた組」の置き場へ移すので件数は失われない)。
+/// それでも空かなければ、(キー, 理由)ごとのまとめの組に足し、それも作れなければ
+/// あふれの件数に足す。キーごとの行の予算([`REJECTION_ROWS_PER_KEY`])の記憶も同じ
+/// 上限で持つ。
+pub const REJECTION_TABLE_MAX_PAIRS: usize = 1000;
+
+/// #945 の総点検: 窓が明けたが、まだ DB に書き終えていない組の置き場の上限(DB の
+/// 書込みが続けて失敗しているときだけ溜まる)。満ちているときは、書き手が書いている
+/// 最中でない組を 1 つ選んで、その書いていない件数をあふれに足して捨てる(#945 の
+/// レビュー: 書いている最中の組は捨てない。書けたら普通の行とあふれの両方に数えて
+/// しまうため)。書いている最中の組は 1 周期で [`REJECTION_WRITE_MAX_PAIRS`] 組までで、
+/// この上限より少ないので、捨てられる組は必ず見つかり、置き場は上限を超えない。
+pub const REJECTION_TABLE_MAX_CLOSED: usize = 1000;
+
+/// #945 のレビュー: 1 つの API キーが、[`REJECTION_WINDOW`] の中で別々の行として
+/// 残せる(外部名, 理由)の組の数。超えた拒否は、そのキーと理由ごとの
+/// まとめの行(外部名 `*`、`tag_id` 0)に数える。キーの予算の窓とタグの組の窓は
+/// 別々に始まるので、窓の境界をまたぐと 1 つのキーの行は最大でおよそ 2 倍になる。
+pub const REJECTION_ROWS_PER_KEY: usize = 20;
+
+/// #945 のレビュー: 表に持つ外部名・キー名の長さの上限(文字数)。超えた名前は
+/// 先頭の `上限 - 1` 文字に `…` を付けて切り詰め、監査にもその形で残す。切り詰めた
+/// 名前どうしは、まとめのキーとして同じ組になりうる(先頭が同じ長い名前は 1 行に
+/// 数える)。
+pub const REJECTION_NAME_MAX_CHARS: usize = 256;
+
+/// まとめの行・あふれの行の外部名。
+pub const REJECTION_SUMMARY_NAME: &str = "*";
+
+/// #945 の総点検: 拒否の表を DB へ書く周期。件数はこの周期ぶん遅れて DB に入る。
+pub const REJECTION_WRITE_PERIOD: Duration = Duration::from_secs(2);
+
+/// #945 の総点検: 1 周期(1 つのトランザクション)で書く組の上限。残りは次の周期へ回す。
+pub const REJECTION_WRITE_MAX_PAIRS: usize = 256;
+
+// 置き場が満ちたとき、書いている最中でない組を必ず選べる(`RejectionTable::retire`)。
+const _: () = assert!(REJECTION_TABLE_MAX_CLOSED > REJECTION_WRITE_MAX_PAIRS);
+
+/// #945 の総点検: 書き手の最後の周期からこれだけ経っても次の周期が来なければ、
+/// 拒否を足す側(要求の経路)が「書き手が止まっている」とログに 1 回出す。
+pub const REJECTION_WRITER_STALE: Duration = Duration::from_secs(30);
+
+/// 書き手のタスクが panic したあと起こし直すまでの待ち(最初)。続けて panic する
+/// たびに倍にし、[`REJECTION_WRITER_RESTART_MAX`] で頭打ちにする。
+const REJECTION_WRITER_RESTART_MIN: Duration = Duration::from_secs(2);
+const REJECTION_WRITER_RESTART_MAX: Duration = Duration::from_secs(60);
+
+/// #711: 行をまとめる相手。タグごとの行か、キーごとの上限を超えた分のまとめの行か。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RejectionTarget {
+    Tag(String),
+    OtherTags,
+}
+
+type PairKey = (i64, RejectionTarget, WriteRejectionReason);
+
+/// #945 の総点検: 組の 1 つの窓(表の 1 行ぶん)。
+#[derive(Debug, Clone)]
+struct PairWindow {
+    /// 窓を見分ける通し番号(書き手が書いている間に窓が明けて置き場へ移っても、
+    /// 書けた結果を正しい窓へ戻すため)。
+    generation: u64,
+    /// 窓の最初の拒否の時刻(窓はここから [`REJECTION_WINDOW`])。
+    start: Instant,
+    /// 窓の最初の拒否の時計の時刻(行の `ts` に入れる)。
+    first_at: SystemTime,
+    /// 窓の中の拒否の合計。
+    count: u64,
+    /// DB の行に書き終えた件数(`count` と違えば書き直しが要る)。
+    written: u64,
+    /// 挿入した行の id(まだ挿入していなければ `None`)。
+    row_id: Option<i64>,
+    /// 最後に書けた周期の通し番号(まだ一度も書いていなければ `None`)。書く組が上限を
+    /// 超えるとき、`None` から先に、古い順に選ぶのに使う。
+    last_written: Option<u64>,
+    /// 書き手が写しを取った周期の通し番号(#945 のレビュー)。表の
+    /// `in_flight` と同じなら、書き手がこの窓を書いている最中(結果がまだ戻っていない)。
+    taken: Option<u64>,
+    key_name: Arc<str>,
+    key_prefix: Arc<str>,
+    tag_id: i64,
+}
+
+impl PairWindow {
+    fn dirty(&self) -> bool {
+        self.row_id.is_none() || self.written != self.count
+    }
+
+    /// まだ DB に書いていない件数。
+    fn unwritten(&self) -> u64 {
+        if self.row_id.is_some() {
+            self.count.saturating_sub(self.written)
+        } else {
+            self.count
+        }
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.start) >= REJECTION_WINDOW
+    }
+}
+
+/// #945 のレビュー: キーごとの、窓の中で作ったタグごとの組の数。
+#[derive(Debug, Clone, Copy)]
+struct KeyBudget {
+    start: Instant,
+    rows: usize,
+}
+
+/// #945 の総点検: 拒否の表。要求の経路は `std::sync::Mutex` を 1 回取って件数を足す
+/// だけ(DB にも async のロックにも触れない)。書き手が周期ごとに書き出す。
+#[derive(Debug, Default)]
+struct RejectionTable {
+    /// いま開いている窓。
+    open: HashMap<PairKey, PairWindow>,
+    /// 窓が明けたが、まだ書き終えていない組(書き終えたら消す)。
+    closed: Vec<(PairKey, PairWindow)>,
+    budgets: HashMap<i64, KeyBudget>,
+    /// 表に入らなかった件数(あふれの行に書く)。
+    overflow: u64,
+    next_generation: u64,
+    /// 書き手の周期の通し番号(`take_jobs` のたびに進む)。
+    cycle: u64,
+    /// 書き手が書いている最中の周期(`take_jobs` で立て、`apply` か `release` で下ろす)。
+    /// 書き手の future が途中で捨てられて下りなくても、次の `take_jobs` で上書きされる。
+    in_flight: Option<u64>,
+    /// 開いた窓の `start + REJECTION_WINDOW` の最小値(次に期限が切れうる時刻)。窓を
+    /// 外しても更新しない(早めにずれるだけで害がない)。[`Self::make_room`] が走査した
+    /// ときに計算し直す。満杯のとき、これより前の拒否は走査を飛ばしてあふれに数える。
+    next_expiry: Option<Instant>,
+    /// 試験用: `make_room` が表を走査した回数。
+    #[cfg(test)]
+    scans: u64,
+}
+
+/// 要求の経路で、呼び出しごとに 1 回だけ作るキー名とプレフィックス。
+struct KeyNames<'a> {
+    key: RejectingKey<'a>,
+    shared: Option<(Arc<str>, Arc<str>)>,
+}
+
+impl KeyNames<'_> {
+    fn get(&mut self) -> (Arc<str>, Arc<str>) {
+        let key = self.key;
+        self.shared
+            .get_or_insert_with(|| {
+                (
+                    Arc::from(truncate_name(key.name).as_ref()),
+                    Arc::from(truncate_name(key.prefix).as_ref()),
+                )
+            })
+            .clone()
+    }
+}
+
+impl RejectionTable {
+    /// 開いた窓に `n` 件を足す。窓が無ければ `false`。明けていたら置き場へ移して `false`。
+    fn bump(&mut self, key: &PairKey, now: Instant, n: u64) -> bool {
+        let Some(w) = self.open.get_mut(key) else {
+            return false;
+        };
+        if w.expired(now) {
+            self.retire(key);
+            return false;
+        }
+        w.count = w.count.saturating_add(n);
+        true
+    }
+
+    /// 書き手がこの窓を書いている最中か(結果がまだ戻っていない)。
+    fn in_flight(&self, w: &PairWindow) -> bool {
+        self.in_flight.is_some() && w.taken == self.in_flight
+    }
+
+    /// 開いた窓を表から外す。書き終えていなければ置き場へ移す。置き場が満ちていれば、
+    /// 書き手が書いている最中でない組を 1 つ選び(外す窓がそうならそれを、そうでなければ
+    /// 置き場の組を)、書いていない件数をあふれに足して捨てる(#945 のレビュー: 書いて
+    /// いる最中の窓を捨てると、書けたときに普通の行とあふれの両方に数えてしまう)。
+    fn retire(&mut self, key: &PairKey) {
+        let Some(w) = self.open.remove(key) else {
+            return;
+        };
+        if !w.dirty() {
+            return;
+        }
+        if self.closed.len() >= REJECTION_TABLE_MAX_CLOSED {
+            if !self.in_flight(&w) {
+                self.overflow = self.overflow.saturating_add(w.unwritten());
+                return;
+            }
+            // 書いている最中の組は REJECTION_WRITE_MAX_PAIRS までなので、置き場には必ず
+            // 書いている最中でない組がある(見つからなければ上限を一時的に超えて置く)。
+            if let Some(i) = self.closed.iter().position(|(_, c)| !self.in_flight(c)) {
+                let (_, old) = self.closed.remove(i);
+                self.overflow = self.overflow.saturating_add(old.unwritten());
+            }
+        }
+        self.closed.push((key.clone(), w));
+    }
+
+    /// 新しい組を入れる場所があるか。満ちていたら、窓が明けた組を外して空ける。
+    fn make_room(&mut self, now: Instant) -> bool {
+        if self.open.len() < REJECTION_TABLE_MAX_PAIRS {
+            return true;
+        }
+        // 満杯でも、どの窓もまだ期限が切れていなければ走査しても空かない。
+        if self.next_expiry.is_some_and(|t| now < t) {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.scans += 1;
+        }
+        let expired: Vec<PairKey> = self
+            .open
+            .iter()
+            .filter(|(_, w)| w.expired(now))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in &expired {
+            self.retire(k);
+        }
+        self.next_expiry = self.open.values().map(|w| w.start + REJECTION_WINDOW).min();
+        self.open.len() < REJECTION_TABLE_MAX_PAIRS
+    }
+
+    fn insert_window(
+        &mut self,
+        key: PairKey,
+        now: Instant,
+        wall: SystemTime,
+        names: &mut KeyNames<'_>,
+        tag_id: i64,
+        n: u64,
+    ) {
+        let (key_name, key_prefix) = names.get();
+        self.next_generation += 1;
+        let expiry = now + REJECTION_WINDOW;
+        self.next_expiry = Some(self.next_expiry.map_or(expiry, |t| t.min(expiry)));
+        self.open.insert(
+            key,
+            PairWindow {
+                generation: self.next_generation,
+                start: now,
+                first_at: wall,
+                count: n,
+                written: 0,
+                row_id: None,
+                last_written: None,
+                taken: None,
+                key_name,
+                key_prefix,
+                tag_id,
+            },
+        );
+    }
+
+    /// キーの予算の中で、新しいタグの組を作れるか(作ったら [`Self::spend_budget`])。
+    fn budget_allows(&self, key_id: i64, now: Instant) -> bool {
+        match self.budgets.get(&key_id) {
+            Some(b) if now.saturating_duration_since(b.start) < REJECTION_WINDOW => {
+                b.rows < REJECTION_ROWS_PER_KEY
+            }
+            _ => true,
+        }
+    }
+
+    fn spend_budget(&mut self, key_id: i64, now: Instant) {
+        if let Some(b) = self.budgets.get_mut(&key_id) {
+            if now.saturating_duration_since(b.start) < REJECTION_WINDOW {
+                b.rows += 1;
+                return;
+            }
+        }
+        if self.budgets.len() >= REJECTION_TABLE_MAX_PAIRS && !self.budgets.contains_key(&key_id) {
+            self.budgets
+                .retain(|_, b| now.saturating_duration_since(b.start) < REJECTION_WINDOW);
+            if self.budgets.len() >= REJECTION_TABLE_MAX_PAIRS {
+                // 捨てたキーは次に予算を数え直す(モジュールの doc comment)。
+                if let Some(oldest) = self
+                    .budgets
+                    .iter()
+                    .min_by_key(|(_, b)| b.start)
+                    .map(|(k, _)| *k)
+                {
+                    self.budgets.remove(&oldest);
+                }
+            }
+        }
+        self.budgets.insert(
+            key_id,
+            KeyBudget {
+                start: now,
+                rows: 1,
+            },
+        );
+    }
+
+    /// 拒否 `n` 件を足す(要求の経路。DB には触れない)。
+    #[allow(clippy::too_many_arguments)] // 時刻 2 つと呼び出しごとの名前を渡す内部の形
+    fn add(
+        &mut self,
+        now: Instant,
+        wall: SystemTime,
+        names: &mut KeyNames<'_>,
+        tag_id: i64,
+        external_name: &str,
+        reason: WriteRejectionReason,
+        n: u64,
+    ) {
+        let key_id = names.key.id;
+        let tag_key: PairKey = (
+            key_id,
+            RejectionTarget::Tag(truncate_name(external_name).into_owned()),
+            reason,
+        );
+        if self.bump(&tag_key, now, n) {
+            return;
+        }
+        if self.budget_allows(key_id, now) && self.make_room(now) {
+            self.insert_window(tag_key, now, wall, names, tag_id, n);
+            self.spend_budget(key_id, now);
+            return;
+        }
+        let summary_key: PairKey = (key_id, RejectionTarget::OtherTags, reason);
+        if self.bump(&summary_key, now, n) {
+            return;
+        }
+        if self.make_room(now) {
+            self.insert_window(summary_key, now, wall, names, 0, n);
+            return;
+        }
+        self.overflow = self.overflow.saturating_add(n);
+    }
+
+    /// 書き手のための写し(上限 `max` 組まで)。lock の中で呼ぶ。書き終えていない組が
+    /// `max` を超えるときは、まだ一度も書いていない組から先に、次に最後に書いたのが
+    /// 古い順に選ぶ(周期をまたいで公平に回し、同じ組が待っている組を押しのけ続けない)。
+    /// 窓が明けた置き場の組も同じ並びに入れる(優先しない。置き場は
+    /// `REJECTION_TABLE_MAX_CLOSED` で頭打ちなので、回ってくるのが遅れても溜まらない)。
+    /// 写しを取った窓には、結果が戻るまで「書いている最中」の印を付ける
+    /// ([`Self::retire`] が捨てない)。
+    fn take_jobs(&mut self, max: usize) -> (Vec<WriteJob>, u64) {
+        self.cycle += 1;
+        let cycle = self.cycle;
+        self.in_flight = Some(cycle);
+        let mut cands: Vec<(Option<u64>, &PairKey, &mut PairWindow)> = self
+            .closed
+            .iter_mut()
+            .map(|(k, w)| (&*k, w))
+            .chain(self.open.iter_mut())
+            .filter(|(_, w)| w.dirty())
+            .map(|(k, w)| (w.last_written, k, w))
+            .collect();
+        if cands.len() > max {
+            if max > 0 {
+                cands.select_nth_unstable_by_key(max - 1, |c| c.0);
+            }
+            cands.truncate(max);
+        }
+        let jobs = cands
+            .into_iter()
+            .map(|(_, k, w)| {
+                w.taken = Some(cycle);
+                WriteJob::of(k, w)
+            })
+            .collect();
+        (jobs, self.overflow)
+    }
+
+    /// 書込みが失敗した(表は変えない)。書いている最中の印を下ろす。
+    fn release(&mut self) {
+        self.in_flight = None;
+    }
+
+    /// 書けた結果を戻す(`row_id` と書いた件数)。窓が明けて置き場へ移っていても
+    /// 通し番号で見つける。
+    fn apply(&mut self, done: &[(WriteJob, i64)], overflow_written: u64) {
+        let cycle = self.cycle;
+        for (job, row_id) in done {
+            let w = match self.open.get_mut(&job.key) {
+                Some(w) if w.generation == job.generation => Some(w),
+                _ => self
+                    .closed
+                    .iter_mut()
+                    .find(|(_, w)| w.generation == job.generation)
+                    .map(|(_, w)| w),
+            };
+            if let Some(w) = w {
+                w.row_id = Some(*row_id);
+                w.written = job.count;
+                w.last_written = Some(cycle);
+            }
+        }
+        self.overflow = self.overflow.saturating_sub(overflow_written);
+        self.in_flight = None;
+    }
+
+    /// 窓が明けて書き終えた組と、明けたキーの予算を消す。
+    fn collect_garbage(&mut self, now: Instant) {
+        self.open.retain(|_, w| w.dirty() || !w.expired(now));
+        self.closed.retain(|(_, w)| w.dirty());
+        self.budgets
+            .retain(|_, b| now.saturating_duration_since(b.start) < REJECTION_WINDOW);
+    }
+
+    /// まだ DB に書いていない件数(終了のログ・試験用)。
+    fn unwritten(&self) -> u64 {
+        let open: u64 = self.open.values().map(PairWindow::unwritten).sum();
+        let closed: u64 = self.closed.iter().map(|(_, w)| w.unwritten()).sum();
+        open + closed + self.overflow
+    }
+
+    fn dirty_pairs(&self) -> usize {
+        self.open.values().filter(|w| w.dirty()).count()
+            + self.closed.iter().filter(|(_, w)| w.dirty()).count()
+    }
+}
+
+/// 書き手が 1 組を書くための写し。
+#[derive(Debug, Clone)]
+struct WriteJob {
+    key: PairKey,
+    generation: u64,
+    first_at: SystemTime,
+    count: u64,
+    row_id: Option<i64>,
+    key_name: Arc<str>,
+    key_prefix: Arc<str>,
+    tag_id: i64,
+}
+
+impl WriteJob {
+    fn of(key: &PairKey, w: &PairWindow) -> Self {
+        Self {
+            key: key.clone(),
+            generation: w.generation,
+            first_at: w.first_at,
+            count: w.count,
+            row_id: w.row_id,
+            key_name: w.key_name.clone(),
+            key_prefix: w.key_prefix.clone(),
+            tag_id: w.tag_id,
+        }
+    }
+
+    fn external_name(&self) -> &str {
+        match &self.key.1 {
+            RejectionTarget::Tag(name) => name,
+            RejectionTarget::OtherTags => REJECTION_SUMMARY_NAME,
+        }
+    }
+
+    fn detail(&self) -> String {
+        match self.key.1 {
+            RejectionTarget::Tag(_) => rejection_detail(self.key.2, self.count),
+            RejectionTarget::OtherTags => rejection_summary_detail(self.key.2, self.count),
+        }
+    }
+}
+
+fn rejection_detail(reason: WriteRejectionReason, count: u64) -> String {
+    if count > 1 {
+        format!(
+            "{}（{} 秒の窓で計 {} 件）",
+            reason.as_str(),
+            REJECTION_WINDOW.as_secs(),
+            count
+        )
+    } else {
+        reason.as_str().to_string()
+    }
+}
+
+fn rejection_summary_detail(reason: WriteRejectionReason, count: u64) -> String {
+    format!(
+        "{}（{} 秒の窓で、上限を超えたほかのタグ名で計 {} 件）",
+        reason.as_str(),
+        REJECTION_WINDOW.as_secs(),
+        count
+    )
+}
+
+fn overflow_detail(count: u64) -> String {
+    format!("overflow（{count} 件を記録できなかった）")
+}
+
+/// 名前を [`REJECTION_NAME_MAX_CHARS`] 文字までに切り詰める(超えたら末尾を `…`)。
+fn truncate_name(s: &str) -> std::borrow::Cow<'_, str> {
+    match s.char_indices().nth(REJECTION_NAME_MAX_CHARS - 1) {
+        Some((keep, _)) if s[keep..].chars().nth(1).is_some() => {
+            let mut out = s[..keep].to_string();
+            out.push('…');
+            std::borrow::Cow::Owned(out)
+        }
+        _ => std::borrow::Cow::Borrowed(s),
+    }
+}
+
+fn unix_seconds(t: SystemTime) -> i64 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => -i64::try_from(e.duration().as_secs()).unwrap_or(i64::MAX),
+    }
+}
+
+/// 完結した 1 行を挿入して新しい `id` を返す。
+async fn insert_row_in(pool: &SqlitePool, row: &WriteAuditRow) -> Result<i64, BantoError> {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO hub_write_audit (\
+            api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
+            external_name_snapshot, value_requested, value_requested_text, action, \
+            result, detail\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(row.api_key_id)
+    .bind(&row.api_key_name_snapshot)
+    .bind(&row.api_key_prefix_snapshot)
+    .bind(row.tag_id)
+    .bind(&row.external_name_snapshot)
+    .bind(row.value_requested)
+    .bind(&row.value_requested_text)
+    .bind(row.action.as_str())
+    .bind(row.result.as_str())
+    .bind(&row.detail)
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    Ok(id)
+}
+
+/// 拒否の行を 1 行挿入する(`ts` は窓の最初の拒否の時刻)。
+async fn insert_rejected_row(
+    conn: &mut sqlx::SqliteConnection,
+    job: &WriteJob,
+    detail: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO hub_write_audit (\
+            ts, api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
+            external_name_snapshot, action, result, detail\
+         ) VALUES (datetime(?, 'unixepoch'), ?, ?, ?, ?, ?, ?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(unix_seconds(job.first_at))
+    .bind(job.key.0)
+    .bind(&*job.key_name)
+    .bind(&*job.key_prefix)
+    .bind(job.tag_id)
+    .bind(job.external_name())
+    .bind(WriteAuditAction::Write.as_str())
+    .bind(WriteAuditResult::Rejected.as_str())
+    .bind(detail)
+    .fetch_one(conn)
+    .await
+}
+
+/// 1 周期で DB に書いた数([`WriteAuditService::write_pending`] の結果)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RejectionWriteStats {
+    /// 挿入した行(新しい窓、または UPDATE が 0 行だったので挿入し直した行)。
+    pub inserted: usize,
+    /// 件数を UPDATE した行。
+    pub updated: usize,
+    /// あふれの行を書いたら 1。
+    pub overflow_rows: usize,
+    /// 上限([`REJECTION_WRITE_MAX_PAIRS`])で次の周期に回した、書き終えていない組の数。
+    pub remaining: usize,
+}
+
+/// 1 つのトランザクションで写しを書く。途中で失敗したら全体を巻き戻す(表は変えない
+/// ので、次の周期で同じ組を書き直す)。
+async fn write_jobs(
+    pool: &SqlitePool,
+    jobs: &[WriteJob],
+    overflow: u64,
+) -> Result<(Vec<i64>, RejectionWriteStats), sqlx::Error> {
+    let mut stats = RejectionWriteStats::default();
+    let mut tx = pool.begin().await?;
+    let mut ids = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        let detail = job.detail();
+        if let Some(id) = job.row_id {
+            let done = sqlx::query("UPDATE hub_write_audit SET detail = ? WHERE id = ?")
+                .bind(&detail)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            if done.rows_affected() == 1 {
+                stats.updated += 1;
+                ids.push(id);
+                continue;
+            }
+            // 行が消えていた(0 行): 件数を失わないよう挿入し直す。
+        }
+        let id = insert_rejected_row(&mut tx, job, &detail).await?;
+        stats.inserted += 1;
+        ids.push(id);
+    }
+    if overflow > 0 {
+        sqlx::query(
+            "INSERT INTO hub_write_audit (\
+                api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
+                external_name_snapshot, action, result, detail\
+             ) VALUES (0, '', '', 0, ?, ?, ?, ?)",
+        )
+        .bind(REJECTION_SUMMARY_NAME)
+        .bind(WriteAuditAction::Write.as_str())
+        .bind(WriteAuditResult::Rejected.as_str())
+        .bind(overflow_detail(overflow))
+        .execute(&mut *tx)
+        .await?;
+        stats.overflow_rows = 1;
+    }
+    tx.commit().await?;
+    Ok((ids, stats))
+}
+
+/// #945 の総点検: 拒否の表と書き手の様子(サービスの複製の間で共有する)。
+struct RejectionShared {
+    table: std::sync::Mutex<RejectionTable>,
+    /// 書き手どうし(周期のタスク・終了の書き切り・試験)を 1 本ずつにする。
+    write_lock: tokio::sync::Mutex<()>,
+    /// 書き手の最後の周期の時刻(`base` からのミリ秒)。
+    base: Instant,
+    last_cycle_ms: AtomicU64,
+    /// 周期の書き手を起動していて、まだ止めていない。
+    writer_running: AtomicBool,
+    /// 「書き手が止まっている」のログを出した(次の周期で下ろす)。
+    stale_warned: AtomicBool,
+    /// 書込みの失敗が続いている(最初の 1 回と、直ったときだけログに出す)。
+    failing: AtomicBool,
+    /// 試験用: 次の周期で書き手を panic させる。
+    #[cfg(test)]
+    panic_next: AtomicBool,
+}
+
+impl RejectionShared {
+    fn table(&self) -> std::sync::MutexGuard<'_, RejectionTable> {
+        // 表の操作は panic しない形だが、毒されても件数は使える(要求の経路を落とさない)。
+        self.table
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn millis_since_base(&self, now: Instant) -> u64 {
+        u64::try_from(now.saturating_duration_since(self.base).as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// 書き手が動いているはずなのに、最後の周期から [`REJECTION_WRITER_STALE`] を
+    /// 過ぎていれば `true`(ログは 1 回だけ出す)。
+    fn check_writer(&self, now: Instant) -> bool {
+        if !self.writer_running.load(Ordering::Acquire) {
+            return false;
+        }
+        let last = self.last_cycle_ms.load(Ordering::Acquire);
+        let age = self.millis_since_base(now).saturating_sub(last);
+        if age < u64::try_from(REJECTION_WRITER_STALE.as_millis()).unwrap_or(u64::MAX) {
+            return false;
+        }
+        if !self.stale_warned.swap(true, Ordering::AcqRel) {
+            crate::hub_log::log_err_line(&format!(
+                "banto-hub: [WARN] 書き込み監査(rejected)の書き手が {} 秒より長く書いていません（拒否は表に溜めています）",
+                age / 1000
+            ));
+        }
+        true
+    }
+}
+
+/// #711 / #945 の総点検: 拒否を足すキー(認証のときのキーの値)。
+#[derive(Debug, Clone, Copy)]
+pub struct RejectingKey<'a> {
+    pub id: i64,
+    pub name: &'a str,
+    pub prefix: &'a str,
+}
+
+/// #945 の総点検: 周期の書き手のタスク([`WriteAuditService::spawn_rejection_writer`])。
+/// [`Self::shutdown`] で止めて、残りを書き切る。
+///
+/// #945 のレビュー: `shutdown` を呼ばずに捨てても(起動の途中の失敗など)、止める合図を
+/// 送るので、書き手と見張りのタスクは次の周期を待たずに終わり、pool を持ったまま
+/// 残らない(書き切りはしない。表の残りは捨てる)。`JoinHandle` を捨てるだけでは
+/// タスクは止まらない。
+pub struct RejectionWriter {
+    svc: WriteAuditService,
+    stop: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl RejectionWriter {
+    /// 書き手を止め(書いている周期は終わらせる)、表に残ったものをすべて書き切る。
+    /// DB が失敗し続けると返らないので、呼び手が上限時間で切る(切られたら
+    /// [`WriteAuditService::unwritten_rejections`] で残りを数えてログに出す)。
+    pub async fn shutdown(mut self) {
+        let _ = self.stop.send(true);
+        let _ = (&mut self.join).await;
+        loop {
+            match self.svc.write_pending().await {
+                Ok(_) if self.svc.unwritten_rejections() == 0 => return,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+            }
+        }
+    }
+}
+
+impl Drop for RejectionWriter {
+    fn drop(&mut self) {
+        // 受け手(書き手と見張り)が先に終わっていれば失敗するが、それでよい。
+        let _ = self.stop.send(true);
+    }
+}
+
+/// 周期の書き手の本体。止めるよう言われるまで周期ごとに書く。
+async fn run_rejection_writer(
+    svc: WriteAuditService,
+    period: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut tick = tokio::time::interval(period);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.wait_for(|s| *s) => return,
+            _ = tick.tick() => {}
+        }
+        #[cfg(test)]
+        if svc.rejections.panic_next.swap(false, Ordering::AcqRel) {
+            panic!("試験: 書き手を panic させる");
+        }
+        // 失敗はこの中でログに出す(表は残るので次の周期で書き直す)。
+        let _ = svc.write_pending().await;
+    }
+}
+
+/// 書き手を見張り、panic したらログに出して起こし直す(表の件数は残っているので、
+/// 起こし直した書き手が書く)。止めるよう言われたら終わる。
+async fn supervise_rejection_writer(
+    svc: WriteAuditService,
+    period: Duration,
+    restart_min: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut delay = restart_min;
+    loop {
+        let inner = tokio::spawn(run_rejection_writer(svc.clone(), period, stop.clone()));
+        match inner.await {
+            Ok(()) => break,
+            Err(err) => {
+                if *stop.borrow() {
+                    break;
+                }
+                let left = svc.unwritten_rejections();
+                crate::hub_log::log_err_line(&format!(
+                    "banto-hub: [WARN] 書き込み監査(rejected)の書き手が止まりました（{err}）。{} 秒後に起こし直します（未書込み {left} 件は表に残っています）",
+                    delay.as_secs_f32()
+                ));
+                tokio::select! {
+                    _ = stop.wait_for(|s| *s) => break,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                delay = (delay * 2).min(REJECTION_WRITER_RESTART_MAX);
+            }
+        }
+    }
+    svc.rejections
+        .writer_running
+        .store(false, Ordering::Release);
+}
+
 /// 書き込み監査サービス(`crate::audit::AuditLogService` と同じ形の
 /// 薄いラッパー)。`Clone` は安価(`SqlitePool` は `Arc` バックド)。
+/// 拒否の表([`Self::record_rejections`])は複製の間で共有する。
 #[derive(Clone)]
 pub struct WriteAuditService {
     pool: SqlitePool,
+    rejections: Arc<RejectionShared>,
 }
 
 impl WriteAuditService {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        let base = Instant::now();
+        Self {
+            rejections: Arc::new(RejectionShared {
+                table: std::sync::Mutex::new(RejectionTable::default()),
+                write_lock: tokio::sync::Mutex::new(()),
+                base,
+                last_cycle_ms: AtomicU64::new(0),
+                writer_running: AtomicBool::new(false),
+                stale_warned: AtomicBool::new(false),
+                failing: AtomicBool::new(false),
+                #[cfg(test)]
+                panic_next: AtomicBool::new(false),
+            }),
+            pool,
+        }
+    }
+
+    /// #711: 定義上の拒否を 1 件足す(窓の中の同じ(キー, タグ, 理由)は 1 行に
+    /// まとまる)。複数件は [`Self::record_rejections`]。async ではなく、DB にも触れない。
+    pub fn record_rejection(
+        &self,
+        key: RejectingKey<'_>,
+        tag_id: i64,
+        external_name: &str,
+        reason: WriteRejectionReason,
+    ) {
+        self.record_rejections(key, [(tag_id, external_name, reason)]);
+    }
+
+    /// #945 の総点検: 1 つのキーの拒否(`(tag_id, 外部名, 理由)`)を、表を 1 回だけ
+    /// lock して足す。**async ではなく、DB にも async のロックにも触れない**(403・404 を
+    /// 監査で遅らせない。要求の future が捨てられても、足し終えた分は欠けない)。
+    /// 表に入らない分はまとめの組・あふれの件数に足す(モジュールの doc comment)。
+    /// DB へは周期の書き手([`Self::spawn_rejection_writer`])が書く。
+    pub fn record_rejections<'n>(
+        &self,
+        key: RejectingKey<'_>,
+        entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
+    ) {
+        let now = Instant::now();
+        self.record_rejections_at(now, SystemTime::now(), key, entries);
+        self.rejections.check_writer(now);
+    }
+
+    fn record_rejections_at<'n>(
+        &self,
+        now: Instant,
+        wall: SystemTime,
+        key: RejectingKey<'_>,
+        entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
+    ) {
+        let mut names = KeyNames { key, shared: None };
+        // 同じ(切り詰めた名前, 理由)は lock の前に件数でまとめ、表には 1 回だけ足す
+        // (#945 のレビュー: 同じ拒否が大量のバッチで表の操作を繰り返さない)。
+        let mut index: HashMap<(Cow<'n, str>, WriteRejectionReason), usize> = HashMap::new();
+        let mut grouped: Vec<(i64, Cow<'n, str>, WriteRejectionReason, u64)> = Vec::new();
+        for (tag_id, name, reason) in entries {
+            let name = truncate_name(name);
+            match index.entry((name.clone(), reason)) {
+                std::collections::hash_map::Entry::Occupied(e) => grouped[*e.get()].3 += 1,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(grouped.len());
+                    grouped.push((tag_id, name, reason, 1));
+                }
+            }
+        }
+        let mut table = self.rejections.table();
+        for (tag_id, name, reason, n) in &grouped {
+            table.add(now, wall, &mut names, *tag_id, name, *reason, *n);
+        }
+    }
+
+    /// まだ DB に書いていない拒否の件数(あふれを含む)。
+    pub fn unwritten_rejections(&self) -> u64 {
+        self.rejections.table().unwritten()
+    }
+
+    /// #945 の総点検: 周期の書き手を起動する([`REJECTION_WRITE_PERIOD`] ごとに
+    /// [`Self::write_pending`])。`HubRuntime::start` が 1 回だけ呼ぶ。panic したら
+    /// ログに出して起こし直す。
+    pub fn spawn_rejection_writer(&self) -> RejectionWriter {
+        self.spawn_rejection_writer_with(REJECTION_WRITE_PERIOD, REJECTION_WRITER_RESTART_MIN)
+    }
+
+    fn spawn_rejection_writer_with(
+        &self,
+        period: Duration,
+        restart_min: Duration,
+    ) -> RejectionWriter {
+        let (stop, rx) = tokio::sync::watch::channel(false);
+        let shared = &self.rejections;
+        shared
+            .last_cycle_ms
+            .store(shared.millis_since_base(Instant::now()), Ordering::Release);
+        shared.writer_running.store(true, Ordering::Release);
+        let join = tokio::spawn(supervise_rejection_writer(
+            self.clone(),
+            period,
+            restart_min,
+            rx,
+        ));
+        RejectionWriter {
+            svc: self.clone(),
+            stop,
+            join,
+        }
+    }
+
+    /// #945 の総点検: 表の書き終えていない組を、今すぐ 1 周期ぶん書く(周期の書き手が
+    /// 呼ぶ。試験では拒否の直後に監査を読むために呼ぶ)。1 つのトランザクションで最大
+    /// [`REJECTION_WRITE_MAX_PAIRS`] 組。新しい窓は INSERT(`ts` は窓の最初の拒否の時刻)、
+    /// 行のある窓は UPDATE(0 行なら INSERT し直す)。失敗したら表を変えずに返す
+    /// (次の周期で書き直す)。失敗は続いている間の最初の 1 回だけログに出す。
+    pub async fn write_pending(&self) -> Result<RejectionWriteStats, BantoError> {
+        self.write_pending_at(Instant::now()).await
+    }
+
+    async fn write_pending_at(&self, now: Instant) -> Result<RejectionWriteStats, BantoError> {
+        let shared = &self.rejections;
+        let _writing = shared.write_lock.lock().await;
+        let (jobs, overflow) = shared.table().take_jobs(REJECTION_WRITE_MAX_PAIRS);
+        let result = if jobs.is_empty() && overflow == 0 {
+            Ok((Vec::new(), RejectionWriteStats::default()))
+        } else {
+            write_jobs(&self.pool, &jobs, overflow).await
+        };
+        let outcome = match result {
+            Ok((ids, mut stats)) => {
+                let mut table = shared.table();
+                let done: Vec<(WriteJob, i64)> = jobs.into_iter().zip(ids).collect();
+                table.apply(&done, if stats.overflow_rows > 0 { overflow } else { 0 });
+                table.collect_garbage(now);
+                stats.remaining = table.dirty_pairs();
+                drop(table);
+                if shared.failing.swap(false, Ordering::AcqRel) {
+                    crate::hub_log::log_line(
+                        "banto-hub: 書き込み監査(rejected)の書込みが戻りました",
+                    );
+                }
+                Ok(stats)
+            }
+            Err(err) => {
+                shared.table().release();
+                if !shared.failing.swap(true, Ordering::AcqRel) {
+                    crate::hub_log::log_err_line(&format!(
+                        "banto-hub: [WARN] 書き込み監査(rejected)の書込みに失敗しました（件数は表に残し、次の周期で書き直します）: {err}"
+                    ));
+                }
+                Err(banto_storage::storage_error(err))
+            }
+        };
+        shared
+            .last_cycle_ms
+            .store(shared.millis_since_base(Instant::now()), Ordering::Release);
+        shared.stale_warned.store(false, Ordering::Release);
+        outcome
     }
 
     /// 完結した1行をそのまま挿入する(抑制系: `suppressed_disabled`/
     /// `rate_limit_tripped`)。新しい `id` を返す。
     pub async fn insert_row(&self, row: &WriteAuditRow) -> Result<i64, BantoError> {
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO hub_write_audit (\
-                api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
-                external_name_snapshot, value_requested, value_requested_text, action, \
-                result, detail\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             RETURNING id",
-        )
-        .bind(row.api_key_id)
-        .bind(&row.api_key_name_snapshot)
-        .bind(&row.api_key_prefix_snapshot)
-        .bind(row.tag_id)
-        .bind(&row.external_name_snapshot)
-        .bind(row.value_requested)
-        .bind(&row.value_requested_text)
-        .bind(row.action.as_str())
-        .bind(row.result.as_str())
-        .bind(&row.detail)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-        Ok(id)
+        insert_row_in(&self.pool, row).await
     }
 
     /// log-before-write (§6-3): `broker.write` を呼ぶ**前**に
@@ -590,5 +1622,637 @@ mod tests {
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.rows[0].tag_id, 20);
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+    use crate::db::migrate_memory;
+
+    const KEY: RejectingKey<'static> = RejectingKey {
+        id: 1,
+        name: "mes",
+        prefix: "bk_abc",
+    };
+
+    async fn service() -> WriteAuditService {
+        WriteAuditService::new(migrate_memory().await.expect("migrate_memory"))
+    }
+
+    async fn rows(svc: &WriteAuditService) -> Vec<WriteAuditEntry> {
+        let mut rows = svc.list(ListParams::default()).await.unwrap().rows;
+        rows.sort_by_key(|r| r.id);
+        rows
+    }
+
+    /// 行の `detail` から件数を読む(コードだけなら 1)。
+    fn count_of(detail: &str) -> u64 {
+        match detail.split("計 ").nth(1) {
+            Some(rest) => rest.split(' ').next().unwrap().parse().unwrap(),
+            None => 1,
+        }
+    }
+
+    fn add(svc: &WriteAuditService, now: Instant, name: &str, reason: WriteRejectionReason) {
+        svc.record_rejections_at(now, SystemTime::now(), KEY, [(7, name, reason)]);
+    }
+
+    #[test]
+    fn the_request_path_is_a_plain_function_that_does_not_return_a_future() {
+        // 戻り値が `()`(future ではない)ことを型で確かめる。
+        let _single: fn(&WriteAuditService, RejectingKey<'_>, i64, &str, WriteRejectionReason) =
+            WriteAuditService::record_rejection;
+        type Batch<'n> = Vec<(i64, &'n str, WriteRejectionReason)>;
+        let _batch: fn(&WriteAuditService, RejectingKey<'_>, Batch<'_>) =
+            |svc, key, entries| svc.record_rejections(key, entries);
+    }
+
+    #[tokio::test]
+    async fn adding_works_with_a_closed_pool_because_it_never_touches_the_db() {
+        let svc = service().await;
+        svc.pool.close().await;
+        svc.record_rejection(KEY, 7, "line.t", WriteRejectionReason::NotWritable);
+        assert_eq!(svc.unwritten_rejections(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_same_pair_100k_times_is_one_row_with_the_total() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        svc.record_rejections(KEY, std::iter::repeat_n((7, "line.t", r), 100_000));
+        let stats = svc.write_pending().await.unwrap();
+        assert_eq!((stats.inserted, stats.updated), (1, 0));
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].result, "rejected");
+        assert_eq!(got[0].action, "write");
+        assert_eq!(got[0].api_key_name_snapshot, "mes");
+        assert_eq!(got[0].api_key_prefix_snapshot.as_deref(), Some("bk_abc"));
+        assert_eq!(got[0].tag_id, 7);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 100000 件）")
+        );
+        assert_eq!(svc.unwritten_rejections(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_rejection_has_only_the_code() {
+        let svc = service().await;
+        svc.record_rejection(KEY, 0, "nope", WriteRejectionReason::NotFound);
+        svc.write_pending().await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].detail.as_deref(), Some("not_found"));
+    }
+
+    #[tokio::test]
+    async fn one_cycle_updates_a_dirty_pair_once_however_many_were_added() {
+        let svc = service().await;
+        let r = WriteRejectionReason::TagDisabled;
+        svc.record_rejection(KEY, 7, "line.t", r);
+        svc.write_pending().await.unwrap();
+        for _ in 0..10_000 {
+            svc.record_rejection(KEY, 7, "line.t", r);
+        }
+        let stats = svc.write_pending().await.unwrap();
+        assert_eq!((stats.inserted, stats.updated), (0, 1));
+        // 書き終えたら、次の周期は何もしない。
+        let idle = svc.write_pending().await.unwrap();
+        assert_eq!(idle, RejectionWriteStats::default());
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(count_of(got[0].detail.as_deref().unwrap()), 10_001);
+    }
+
+    #[tokio::test]
+    async fn one_cycle_writes_at_most_the_cap_and_leaves_the_rest_for_the_next() {
+        let svc = service().await;
+        // キーごとの予算(20)に当たらないよう、キーを変えて組を増やす。
+        for k in 0..300 {
+            let key = RejectingKey {
+                id: 100 + k,
+                name: "k",
+                prefix: "p",
+            };
+            svc.record_rejection(key, 0, "x", WriteRejectionReason::NotFound);
+        }
+        let first = svc.write_pending().await.unwrap();
+        assert_eq!(first.inserted, REJECTION_WRITE_MAX_PAIRS);
+        assert_eq!(first.remaining, 300 - REJECTION_WRITE_MAX_PAIRS);
+        let second = svc.write_pending().await.unwrap();
+        assert_eq!(second.inserted, 300 - REJECTION_WRITE_MAX_PAIRS);
+        assert_eq!(second.remaining, 0);
+        assert_eq!(rows(&svc).await.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn pairs_beyond_the_cap_are_written_in_turn_even_when_all_keep_rejecting() {
+        let svc = service().await;
+        let keys: Vec<RejectingKey<'static>> = (0..300)
+            .map(|k| RejectingKey {
+                id: 100 + k,
+                name: "k",
+                prefix: "p",
+            })
+            .collect();
+        let mut written = std::collections::HashSet::new();
+        for _ in 0..2 {
+            for key in &keys {
+                svc.record_rejection(*key, 0, "x", WriteRejectionReason::NotFound);
+            }
+            svc.write_pending().await.unwrap();
+            for row in rows(&svc).await {
+                written.insert(row.api_key_id);
+            }
+        }
+        assert_eq!(written.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn a_thousand_tag_names_fit_in_the_per_key_rows_plus_a_summary() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotFound;
+        let names: Vec<String> = (0..1000).map(|i| format!("no_such_{i}")).collect();
+        svc.record_rejections(KEY, names.iter().map(|n| (0, n.as_str(), r)));
+        svc.write_pending().await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), REJECTION_ROWS_PER_KEY + 1);
+        let summary: Vec<_> = got
+            .iter()
+            .filter(|row| row.external_name_snapshot == REJECTION_SUMMARY_NAME)
+            .collect();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(
+            summary[0].detail.as_deref(),
+            Some("not_found（60 秒の窓で、上限を超えたほかのタグ名で計 980 件）")
+        );
+        let total: u64 = got
+            .iter()
+            .map(|row| count_of(row.detail.as_deref().unwrap()))
+            .sum();
+        assert_eq!(total, 1000);
+    }
+
+    #[tokio::test]
+    async fn the_row_ts_is_the_time_of_the_first_rejection() {
+        let svc = service().await;
+        // 2001-09-09 01:46:40 UTC
+        let first_at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        svc.record_rejections_at(
+            Instant::now(),
+            first_at,
+            KEY,
+            [(7, "line.t", WriteRejectionReason::NotWritable)],
+        );
+        svc.record_rejection(KEY, 7, "line.t", WriteRejectionReason::NotWritable);
+        svc.write_pending().await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].ts, "2001-09-09 01:46:40");
+    }
+
+    #[tokio::test]
+    async fn an_update_of_zero_rows_inserts_the_row_again() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        add(&svc, Instant::now(), "line.t", r);
+        svc.write_pending().await.unwrap();
+        sqlx::query("DELETE FROM hub_write_audit")
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        add(&svc, Instant::now(), "line.t", r);
+        let stats = svc.write_pending().await.unwrap();
+        assert_eq!((stats.inserted, stats.updated), (1, 0));
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 2 件）")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_keeps_the_counts_for_the_next_cycle() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        add(&svc, Instant::now(), "a", r);
+        svc.write_pending().await.unwrap();
+        for stmt in [
+            "CREATE TRIGGER fail_ins BEFORE INSERT ON hub_write_audit \
+             BEGIN SELECT RAISE(ABORT, 'test'); END",
+            "CREATE TRIGGER fail_upd BEFORE UPDATE ON hub_write_audit \
+             BEGIN SELECT RAISE(ABORT, 'test'); END",
+        ] {
+            sqlx::query(stmt).execute(&svc.pool).await.unwrap();
+        }
+        add(&svc, Instant::now(), "a", r);
+        add(&svc, Instant::now(), "b", r);
+        assert!(svc.write_pending().await.is_err());
+        assert!(svc.write_pending().await.is_err());
+        // トランザクションごと巻き戻るので、半端な行は残らない。
+        assert_eq!(rows(&svc).await.len(), 1);
+        assert_eq!(svc.unwritten_rejections(), 2);
+        for stmt in ["DROP TRIGGER fail_ins", "DROP TRIGGER fail_upd"] {
+            sqlx::query(stmt).execute(&svc.pool).await.unwrap();
+        }
+        let stats = svc.write_pending().await.unwrap();
+        assert_eq!((stats.inserted, stats.updated), (1, 1));
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 2 件）")
+        );
+        assert_eq!(got[1].external_name_snapshot, "b");
+        assert_eq!(svc.unwritten_rejections(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_window_is_a_new_row_and_keeps_the_old_total() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            add(&svc, t0, "line.t", r);
+        }
+        svc.write_pending_at(t0).await.unwrap();
+        let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+        add(&svc, t1, "line.t", r);
+        svc.write_pending_at(t1).await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 3 件）")
+        );
+        assert_eq!(got[1].detail.as_deref(), Some("not_writable"));
+    }
+
+    #[tokio::test]
+    async fn a_window_closed_before_it_was_written_is_still_written() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        let t0 = Instant::now();
+        add(&svc, t0, "line.t", r);
+        add(&svc, t0, "line.t", r);
+        // 書く前に窓が明けて、同じ組の次の拒否が来た。
+        let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+        add(&svc, t1, "line.t", r);
+        svc.write_pending_at(t1).await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 2);
+        let total: u64 = got
+            .iter()
+            .map(|row| count_of(row.detail.as_deref().unwrap()))
+            .sum();
+        assert_eq!(total, 3);
+        assert_eq!(svc.unwritten_rejections(), 0);
+    }
+
+    #[tokio::test]
+    async fn written_pairs_are_dropped_after_the_window() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        add(&svc, t0, "line.t", WriteRejectionReason::NotWritable);
+        svc.write_pending_at(t0).await.unwrap();
+        assert_eq!(svc.rejections.table().open.len(), 1);
+        svc.write_pending_at(t0 + REJECTION_WINDOW).await.unwrap();
+        let table = svc.rejections.table();
+        assert!(table.open.is_empty());
+        assert!(table.budgets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_table_is_not_rescanned_for_overflowing_rejections() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        for k in 0..REJECTION_TABLE_MAX_PAIRS {
+            let key = RejectingKey {
+                id: 1000 + k as i64,
+                name: "k",
+                prefix: "p",
+            };
+            svc.record_rejections_at(
+                t0,
+                SystemTime::now(),
+                key,
+                [(0, "x", WriteRejectionReason::NotFound)],
+            );
+        }
+        let scans_before = svc.rejections.table().scans;
+        const N: u64 = 100_000;
+        let started = Instant::now();
+        // 別のキーからの同じ拒否 N 件(バッチ 1 回)と、1 件ずつの追加。
+        svc.record_rejections_at(
+            t0,
+            SystemTime::now(),
+            KEY,
+            (0..N).map(|_| (7, "y", WriteRejectionReason::NotFound)),
+        );
+        for _ in 0..1000 {
+            add(&svc, t0, "z", WriteRejectionReason::NotFound);
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let table = svc.rejections.table();
+        // 期限内の窓だけなので、走査は 1 回もしない(空きは作れない)。
+        assert_eq!(table.scans, scans_before);
+        assert_eq!(table.overflow, N + 1000);
+        drop(table);
+        assert_eq!(
+            svc.unwritten_rejections(),
+            REJECTION_TABLE_MAX_PAIRS as u64 + N + 1000
+        );
+        // 期限が切れたら 1 回だけ走査して空ける。
+        add(
+            &svc,
+            t0 + REJECTION_WINDOW,
+            "y",
+            WriteRejectionReason::NotFound,
+        );
+        assert_eq!(svc.rejections.table().scans, scans_before + 1);
+    }
+
+    #[tokio::test]
+    async fn rejections_that_do_not_fit_are_left_as_an_overflow_row() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        // 表を組で満たす(キーごとに 1 組)。
+        for k in 0..REJECTION_TABLE_MAX_PAIRS {
+            let key = RejectingKey {
+                id: 1000 + k as i64,
+                name: "k",
+                prefix: "p",
+            };
+            svc.record_rejections_at(
+                t0,
+                SystemTime::now(),
+                key,
+                [(0, "x", WriteRejectionReason::NotFound)],
+            );
+        }
+        // 新しいキーは、組もまとめの組も作れないので、あふれに数える。
+        for _ in 0..5 {
+            add(&svc, t0, "y", WriteRejectionReason::NotFound);
+        }
+        assert_eq!(
+            svc.unwritten_rejections(),
+            REJECTION_TABLE_MAX_PAIRS as u64 + 5
+        );
+        while svc.write_pending_at(t0).await.unwrap().remaining > 0 {}
+        let overflow: Vec<_> = rows(&svc)
+            .await
+            .into_iter()
+            .filter(|row| row.api_key_id == 0)
+            .collect();
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(
+            overflow[0].detail.as_deref(),
+            Some("overflow（5 件を記録できなかった）")
+        );
+        assert_eq!(overflow[0].external_name_snapshot, REJECTION_SUMMARY_NAME);
+        assert_eq!(svc.unwritten_rejections(), 0);
+    }
+
+    /// 置き場を、書いている最中でない書き終えていない組(各 1 件)で満たす。
+    fn fill_closed(svc: &WriteAuditService, t0: Instant) {
+        let mut table = svc.rejections.table();
+        for i in 0..REJECTION_TABLE_MAX_CLOSED {
+            table.next_generation += 1;
+            let w = PairWindow {
+                generation: table.next_generation,
+                start: t0,
+                first_at: SystemTime::now(),
+                count: 1,
+                written: 0,
+                row_id: None,
+                // 一度書いた扱いにして、写しを取る順を後ろにする。
+                last_written: Some(0),
+                taken: None,
+                key_name: Arc::from("k"),
+                key_prefix: Arc::from("p"),
+                tag_id: 0,
+            };
+            let key = (
+                5000 + i as i64,
+                RejectionTarget::Tag("x".into()),
+                WriteRejectionReason::NotFound,
+            );
+            table.closed.push((key, w));
+        }
+    }
+
+    /// 監査の行に数えた件数の合計(普通の行, あふれの行)。
+    async fn counted(svc: &WriteAuditService) -> (u64, u64) {
+        let mut normal = 0;
+        let mut overflow = 0;
+        for row in rows(svc).await {
+            let detail = row.detail.as_deref().unwrap();
+            if row.api_key_id == 0 {
+                let n = detail
+                    .strip_prefix("overflow（")
+                    .and_then(|r| r.split(' ').next())
+                    .unwrap();
+                overflow += n.parse::<u64>().unwrap();
+            } else {
+                normal += count_of(detail);
+            }
+        }
+        (normal, overflow)
+    }
+
+    /// #945 のレビュー(Codex P2): 置き場が満ちているときに、書き手が書いている最中の
+    /// 窓が明けても、その窓はあふれに数えない(書けたら普通の行だけに数える)。
+    #[tokio::test]
+    async fn a_window_being_written_is_not_counted_as_overflow_when_the_closed_store_is_full() {
+        for fail in [false, true] {
+            let svc = service().await;
+            let r = WriteRejectionReason::NotWritable;
+            let t0 = Instant::now();
+            fill_closed(&svc, t0);
+            add(&svc, t0, "a", r);
+            add(&svc, t0, "a", r);
+            // 書き手が "a" の写しを取った(結果はまだ戻っていない)。
+            let (jobs, overflow) = svc.rejections.table().take_jobs(1);
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].external_name(), "a");
+            // その間に "a" の窓が明け、同じ組の次の拒否が来た。
+            let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+            add(&svc, t1, "a", r);
+            {
+                let table = svc.rejections.table();
+                assert_eq!(table.closed.len(), REJECTION_TABLE_MAX_CLOSED);
+                // 退いたのは書いている最中でない置き場の組(1 件)。
+                assert_eq!(table.overflow, 1);
+            }
+            let total = REJECTION_TABLE_MAX_CLOSED as u64 + 3;
+            assert_eq!(svc.unwritten_rejections(), total);
+            if fail {
+                sqlx::query(
+                    "CREATE TRIGGER fail_ins BEFORE INSERT ON hub_write_audit                      BEGIN SELECT RAISE(ABORT, 'test'); END",
+                )
+                .execute(&svc.pool)
+                .await
+                .unwrap();
+            }
+            let result = write_jobs(&svc.pool, &jobs, overflow).await;
+            match result {
+                Ok((ids, stats)) => {
+                    assert!(!fail);
+                    let done: Vec<(WriteJob, i64)> = jobs.into_iter().zip(ids).collect();
+                    let ov = if stats.overflow_rows > 0 { overflow } else { 0 };
+                    svc.rejections.table().apply(&done, ov);
+                    // 書けた 2 件はもう未書込みに数えない(あふれにも足していない)。
+                    assert_eq!(svc.unwritten_rejections(), total - 2);
+                }
+                Err(_) => {
+                    assert!(fail);
+                    svc.rejections.table().release();
+                    assert_eq!(svc.unwritten_rejections(), total);
+                    sqlx::query("DROP TRIGGER fail_ins")
+                        .execute(&svc.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            while svc.write_pending_at(t1).await.unwrap().remaining > 0 {}
+            assert_eq!(svc.unwritten_rejections(), 0);
+            // 二重にも欠けにもならない: 普通の行 + あふれの行 = 拒否の数。
+            let (normal, overflow) = counted(&svc).await;
+            assert_eq!((normal, overflow), (total - 1, 1), "fail = {fail}");
+            // 書き直した順で行の id は変わるので、件数だけを並べて比べる。
+            let mut a: Vec<_> = rows(&svc)
+                .await
+                .into_iter()
+                .filter(|row| row.external_name_snapshot == "a")
+                .map(|row| count_of(row.detail.as_deref().unwrap()))
+                .collect();
+            a.sort_unstable();
+            assert_eq!(a, vec![1, 2], "fail = {fail}");
+        }
+    }
+
+    /// 書いている最中でない窓は、置き場が満ちていれば従来どおりあふれに数える。
+    #[tokio::test]
+    async fn a_window_not_being_written_goes_to_overflow_when_the_closed_store_is_full() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        let t0 = Instant::now();
+        fill_closed(&svc, t0);
+        add(&svc, t0, "a", r);
+        add(&svc, t0, "a", r);
+        let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+        add(&svc, t1, "a", r);
+        let table = svc.rejections.table();
+        assert_eq!(table.closed.len(), REJECTION_TABLE_MAX_CLOSED);
+        assert_eq!(table.overflow, 2);
+    }
+
+    #[tokio::test]
+    async fn a_long_external_name_is_truncated_with_a_mark() {
+        let svc = service().await;
+        let long = "あ".repeat(REJECTION_NAME_MAX_CHARS + 10);
+        let other = format!("{}い", "あ".repeat(REJECTION_NAME_MAX_CHARS + 10));
+        let r = WriteRejectionReason::NotFound;
+        svc.record_rejections(KEY, [(0, long.as_str(), r), (0, other.as_str(), r)]);
+        svc.write_pending().await.unwrap();
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        let cut = &got[0].external_name_snapshot;
+        assert_eq!(cut.chars().count(), REJECTION_NAME_MAX_CHARS);
+        assert!(cut.ends_with('…'));
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_found（60 秒の窓で計 2 件）")
+        );
+        // 上限ちょうどの名前は切り詰めない。
+        let exact = "a".repeat(REJECTION_NAME_MAX_CHARS);
+        assert_eq!(truncate_name(&exact), exact.as_str());
+    }
+
+    #[tokio::test]
+    async fn different_key_tag_or_reason_are_recorded_separately() {
+        let svc = service().await;
+        let other_key = RejectingKey {
+            id: 2,
+            name: "other",
+            prefix: "bk_x",
+        };
+        svc.record_rejection(KEY, 7, "a", WriteRejectionReason::NotWritable);
+        svc.record_rejection(KEY, 7, "a", WriteRejectionReason::TagDisabled);
+        svc.record_rejection(KEY, 8, "b", WriteRejectionReason::NotWritable);
+        svc.record_rejection(other_key, 7, "a", WriteRejectionReason::NotWritable);
+        svc.write_pending().await.unwrap();
+        assert_eq!(rows(&svc).await.len(), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_periodic_writer_writes_and_its_shutdown_writes_everything() {
+        let svc = service().await;
+        let writer = svc.spawn_rejection_writer_with(Duration::from_millis(20), Duration::ZERO);
+        svc.record_rejection(KEY, 7, "a", WriteRejectionReason::NotWritable);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows(&svc).await.is_empty() {
+            assert!(Instant::now() < deadline, "周期の書き手が書かない");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        svc.record_rejection(KEY, 7, "b", WriteRejectionReason::NotWritable);
+        writer.shutdown().await;
+        assert_eq!(rows(&svc).await.len(), 2);
+        assert!(!svc.rejections.writer_running.load(Ordering::Acquire));
+    }
+
+    /// #945 のレビュー(Codex P2): `shutdown` を呼ばずに捨てた書き手(起動の途中の失敗)は
+    /// 止まり、タスクがサービス(pool)の複製を持ったまま残らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_dropped_without_shutdown_stops_and_releases_the_pool() {
+        let svc = service().await;
+        let writer =
+            svc.spawn_rejection_writer_with(Duration::from_secs(3600), Duration::from_secs(3600));
+        assert!(svc.rejections.writer_running.load(Ordering::Acquire));
+        assert!(Arc::strong_count(&svc.rejections) > 1);
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while svc.rejections.writer_running.load(Ordering::Acquire)
+            || Arc::strong_count(&svc.rejections) > 1
+        {
+            assert!(Instant::now() < deadline, "捨てた書き手が止まらない");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_panicked_writer_is_restarted_and_keeps_the_counts() {
+        let svc = service().await;
+        svc.rejections.panic_next.store(true, Ordering::Release);
+        let writer =
+            svc.spawn_rejection_writer_with(Duration::from_millis(20), Duration::from_millis(20));
+        svc.record_rejection(KEY, 7, "a", WriteRejectionReason::NotWritable);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while rows(&svc).await.is_empty() {
+            assert!(Instant::now() < deadline, "起こし直した書き手が書かない");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!svc.rejections.panic_next.load(Ordering::Acquire));
+        assert!(svc.rejections.writer_running.load(Ordering::Acquire));
+        writer.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_request_path_notices_a_writer_that_stopped_writing() {
+        let svc = service().await;
+        let now = Instant::now();
+        // 書き手を起動していなければ(試験の組み立てなど)、気にしない。
+        assert!(!svc.rejections.check_writer(now + Duration::from_secs(3600)));
+        svc.rejections.writer_running.store(true, Ordering::Release);
+        assert!(!svc.rejections.check_writer(now));
+        let late = now + REJECTION_WRITER_STALE + Duration::from_secs(1);
+        assert!(svc.rejections.check_writer(late));
+        assert!(svc.rejections.stale_warned.load(Ordering::Acquire));
+        // 書き手が 1 周期まわれば、印は下りる。
+        svc.write_pending().await.unwrap();
+        assert!(!svc.rejections.stale_warned.load(Ordering::Acquire));
     }
 }

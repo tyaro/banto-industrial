@@ -27,7 +27,13 @@ export interface WriteAuditEntry {
 	valueRequestedText: string | null;
 	action: 'write' | 'rate_limit_tripped' | string;
 	result:
-		'ok' | 'failed' | 'uncertain' | 'suppressed_disabled' | 'suppressed_rate_limited' | string;
+		| 'ok'
+		| 'failed'
+		| 'uncertain'
+		| 'suppressed_disabled'
+		| 'suppressed_rate_limited'
+		| 'rejected'
+		| string;
 	detail: string | null;
 }
 

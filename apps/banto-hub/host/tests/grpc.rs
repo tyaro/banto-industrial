@@ -191,6 +191,8 @@ fn free_port() -> u16 {
 }
 
 struct TestApp {
+    /// #945 のレビュー: 拒否の監査を読む前に `flush` で待つため。
+    write_audit: WriteAuditService,
     router: Router,
     admin_token: String,
     pool: SqlitePool,
@@ -273,6 +275,7 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
     let write_audit = WriteAuditService::new(pool.clone());
+    let write_audit_handle = write_audit.clone();
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     let api_keys = ApiKeysService::new(pool.clone());
     let rate_limiter = Arc::new(AsyncMutex::new(WriteRateLimiter::new(
@@ -331,6 +334,7 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
     );
 
     TestApp {
+        write_audit: write_audit_handle,
         router,
         admin_token,
         pool,
@@ -1190,6 +1194,26 @@ async fn write_value_not_writable_is_permission_denied() {
         .await
         .expect_err("not_writable tag should be rejected");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // #711: 定義上の拒否も `rejected` として書込み監査に残る。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
+    let (status, body) = admin_post(
+        &app.router,
+        "/api/write-audit/list",
+        &app.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let rows = body["rows"].as_array().expect("rows array");
+    assert!(
+        rows.iter()
+            .any(|row| row["result"] == "rejected" && row["detail"] == "not_writable"),
+        "expected a rejected/not_writable write-audit row, got: {body:?}"
+    );
 
     sim.stop();
 }

@@ -1578,6 +1578,13 @@ async fn tool_write_tag_value(
     // ロックダウン前: REST の `v1_write_value` と同一の事前段
     // (`write:{tag}`の完全一致)。
     if !ctx.has_write_scope(&tag) {
+        // #711: スコープ外の拒否も書込み監査に残す。
+        crate::write_path::record_missing_write_scope(
+            state.manager.as_ref(),
+            &state.write_audit,
+            ctx,
+            &tag,
+        );
         return Ok(tool_error(format!(
             "missing_write_scope: タグ '{tag}' への write:{{tag}} スコープを持つ API キーが必要です。"
         )));
@@ -1668,6 +1675,13 @@ async fn tool_write_recipe(
         .map(|(tag, _)| tag.as_str())
         .collect();
     if !missing_scope.is_empty() {
+        // #711: スコープが無かったエントリごとに書込み監査へ残す。
+        crate::write_path::record_missing_write_scopes(
+            state.manager.as_ref(),
+            &state.write_audit,
+            ctx,
+            &missing_scope,
+        );
         return Ok(tool_error(format!(
             "missing_write_scope: 次のタグへの write:{{tag}} スコープを持つ API キーが必要です: {}",
             missing_scope.join(", ")

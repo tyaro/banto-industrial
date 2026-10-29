@@ -34,9 +34,13 @@
 //! ## ゲート順(§6 実装指示 §5、relay-wright `engine/writer.rs` のゲート順を踏襲)
 //!
 //! 1. catalog 解決(未定義 → [`WriteRejection::NotFound`])
-//! 2. `writable == false` → [`WriteRejection::NotWritable`](監査不要 -
-//!    定義上の拒否)
+//! 2. `writable == false` → [`WriteRejection::NotWritable`]
 //! 3. 実効 enabled == false → [`WriteRejection::TagDisabled`]
+//!
+//!    1〜3 の拒否と、各入口のスコープ外(`missing_write_scope`)の拒否は、
+//!    #711(2026-10-29 オーナー決定)で書込み監査に `rejected` として残す
+//!    ようにした(以前は「監査不要 - 定義上の拒否」)。同じ(キー, タグ,
+//!    理由)は 60 秒に 1 行にまとめる([`crate::write_audit`] 参照)。
 //! 4. 接続のプロトコルに broker ドライバが登録されていない →
 //!    [`WriteRejection::UnsupportedProtocol`](`HubSessions::is_broker_managed`
 //!    = レジストリにセッション型のドライバがあること（R2b-3a-2、それまでは
@@ -193,8 +197,11 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::api_keys::{ApiKeyContext, ApiKeysService};
 use crate::computed::upsert_retained_value;
 use crate::controller::{CollectionController, CollectionState, RunMode};
-use crate::hub::CollectorManager;
-use crate::write_audit::{WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService};
+use crate::hub::{CollectorManager, TagMap};
+use crate::write_audit::{
+    RejectingKey, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
+    WriteRejectionReason,
+};
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
 
@@ -360,7 +367,10 @@ pub enum WriteRejection {
     /// `execute_write`(単票)からは絶対に返らない - [`execute_write_batch`]
     /// 専用の結果(REST/gRPC の `write_rejection_response`/
     /// `write_rejection_status` がこの分岐に `unreachable!` を置いている
-    /// 理由)。監査行も一切残らない(§3.3「1件も書かない」)。
+    /// 理由)。このエントリの監査行は残らない(§3.3「1件も書かない」。NG だった
+    /// エントリ自身の定義上の拒否は `rejected` で残る - #711)。ただし、タグが
+    /// 重複したバッチ([`WriteRejection::DuplicateTagInBatch`])は定義上の拒否を残さない
+    /// (#711 の 4 つの理由の外。#945 の総点検 P3-6)。
     BatchAborted,
     /// T20-3a(2026-09-05 監査対応): バッチ内に同じ外部名が2回以上現れた
     /// (=同じタグに2つの値を書けと言われた・どちらが最終値か曖昧なユーザー
@@ -837,6 +847,82 @@ async fn prepare_batch_entry(
     })
 }
 
+/// #711(2026-10-29 オーナー決定): 定義上の拒否(catalog に無い・書込み不可・
+/// タグ無効)を書込み監査へ `rejected` として残す。以前は「監査不要」として
+/// 残していなかった。同じ(キー, タグ, 理由)は窓の中で 1 行にまとまる
+/// ([`WriteAuditService::record_rejection`])。監査の書込みに失敗しても
+/// 応答は変えない(ログのみ)。ほかの拒否理由(値の型・範囲・受付 off など)
+/// は対象外。
+fn gate_rejection_reason(rejection: &WriteRejection) -> Option<WriteRejectionReason> {
+    match rejection {
+        WriteRejection::NotFound => Some(WriteRejectionReason::NotFound),
+        WriteRejection::NotWritable => Some(WriteRejectionReason::NotWritable),
+        WriteRejection::TagDisabled => Some(WriteRejectionReason::TagDisabled),
+        _ => None,
+    }
+}
+
+fn record_gate_rejection(
+    deps: &WriteDeps<'_>,
+    ctx: &ApiKeyContext,
+    tag: &str,
+    rejection: &WriteRejection,
+) {
+    if let Some(reason) = gate_rejection_reason(rejection) {
+        let tag_id = rejection_tag_id(&deps.manager.tag_map(), tag);
+        deps.write_audit
+            .record_rejection(rejecting_key(ctx), tag_id, tag, reason);
+    }
+}
+
+/// スコープ外(`missing_write_scope`)の拒否を残す。判定は各入口(REST・gRPC・
+/// MCP)にあるので、入口がここを呼ぶ。`write:{タグ}` を持たないキーの要求
+/// なので、タグは catalog に無いかもしれない(その場合 `tag_id` は 0)。
+/// async ではなく、DB にも触れない(拒否の表に足すだけ。`crate::write_audit`)。
+pub fn record_missing_write_scope(
+    manager: &CollectorManager,
+    write_audit: &WriteAuditService,
+    ctx: &ApiKeyContext,
+    tag: &str,
+) {
+    record_missing_write_scopes(manager, write_audit, ctx, &[tag]);
+}
+
+/// [`record_missing_write_scope`] のバッチ版。`tag_map()` は 1 回だけ取り、拒否の表は
+/// 1 回だけ lock して全件を足す(#945 の総点検)。
+pub fn record_missing_write_scopes<S: AsRef<str>>(
+    manager: &CollectorManager,
+    write_audit: &WriteAuditService,
+    ctx: &ApiKeyContext,
+    tags: &[S],
+) {
+    let map = manager.tag_map();
+    write_audit.record_rejections(
+        rejecting_key(ctx),
+        tags.iter().map(|tag| {
+            let tag = tag.as_ref();
+            (
+                rejection_tag_id(&map, tag),
+                tag,
+                WriteRejectionReason::MissingWriteScope,
+            )
+        }),
+    );
+}
+
+fn rejecting_key(ctx: &ApiKeyContext) -> RejectingKey<'_> {
+    RejectingKey {
+        id: ctx.id,
+        name: &ctx.name,
+        prefix: &ctx.prefix,
+    }
+}
+
+/// 拒否の監査の `tag_id`(catalog に無ければ 0)。
+fn rejection_tag_id(map: &TagMap, tag: &str) -> i64 {
+    map.get(tag).map(|entry| entry.ids.2).unwrap_or(0)
+}
+
 /// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
 ///
 /// T20-3a(docs/banto-hub-t20-design.md §3.3)でゲート1〜4・値型 present を
@@ -871,7 +957,13 @@ pub async fn execute_write(
         None
     };
 
-    let resolved = resolve_write_target(deps, collection_mode, tag, requested).await?;
+    let resolved = match resolve_write_target(deps, collection_mode, tag, requested).await {
+        Ok(resolved) => resolved,
+        Err(rejection) => {
+            record_gate_rejection(deps, ctx, tag, &rejection);
+            return Err(rejection);
+        }
+    };
 
     // gate 5: 書き込み受付(WriteControl)が off。gate 7(値変換)より**前**
     // - 元実装と同じ順序(このモジュールの上のdoc comment参照)。監査の
@@ -1169,13 +1261,30 @@ pub async fn execute_write_batch(
     // 2. 事前ゲート all-or-nothing: 全エントリを prepare_batch_entry
     // (resolve_write_target → convert_value)へ通す。
     let mut prepare_results = Vec::with_capacity(entries.len());
+    let mut rejected = Vec::new();
     for (tag, requested) in &entries {
-        prepare_results
-            .push(prepare_batch_entry(deps, collection_mode, tag, requested.clone()).await);
+        let prepared = prepare_batch_entry(deps, collection_mode, tag, requested.clone()).await;
+        if let Err(rejection) = &prepared {
+            if let Some(reason) = gate_rejection_reason(rejection) {
+                rejected.push((tag.as_str(), reason));
+            }
+        }
+        prepare_results.push(prepared);
+    }
+    // 拒否の監査は、`tag_map()` を 1 回だけ取り、表を 1 回だけ lock して全件を足す
+    // (DB を待たない。#945 の総点検)。
+    if !rejected.is_empty() {
+        let map = deps.manager.tag_map();
+        deps.write_audit.record_rejections(
+            rejecting_key(ctx),
+            rejected
+                .iter()
+                .map(|&(tag, reason)| (rejection_tag_id(&map, tag), tag, reason)),
+        );
     }
 
     if prepare_results.iter().any(Result::is_err) {
-        // 1件でも NG なら実書き込みを一切しない - 監査行も broker 呼び出し
+        // 1件でも NG なら実書き込みを一切しない - 書込みの監査行も broker 呼び出し
         // もまだ発生していない(prepare_batch_entry は副作用が無い)ので、
         // ここで返すだけで「1件も書かない」が成立する。
         return entries

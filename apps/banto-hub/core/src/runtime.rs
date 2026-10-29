@@ -188,7 +188,7 @@ use crate::subscribe_core::EVAL_TICK_MS;
 pub use crate::tls_listener::RunningTlsListener as RunningTlsServer;
 use crate::tls_listener::{self, TlsConfig};
 use crate::users::UsersService;
-use crate::write_audit::WriteAuditService;
+use crate::write_audit::{RejectionWriter, WriteAuditService};
 use crate::write_control::{load_startup_decision, WriteControl};
 use crate::write_rate::{WriteRateLimitConfig, WriteRateLimiter};
 
@@ -886,7 +886,7 @@ impl HubRuntime {
                 events,
                 allow_setup,
                 write_control,
-                write_audit,
+                write_audit.clone(),
                 mqtt.clone(),
                 grpc_server.clone(),
                 rate_limiter,
@@ -938,6 +938,14 @@ impl HubRuntime {
         // ものがすべて済んでから起こす。先に起こしたものは、失敗する経路で
         // abort する（上のサーバー起動の失敗側）。
         let audit_spool_handle: Option<JoinHandle<()>> = audit_for_spool.spawn_spool_flusher();
+        // #945 の総点検: 拒否の監査を周期で DB へ書く書き手。終了のときに止めて書き切る
+        // （`shutdown_and_report`）。#945 のレビュー: 上の約束どおり、失敗しうる起動手順が
+        // すべて済んでから起こす（先に起こすと、起動の失敗で `RejectionWriter` が捨て
+        // られても見張りのタスクが pool を持ったまま残る）。gRPC（`grpc_server.apply`）と
+        // REST（サーバー起動）はこれより前に要求を受け始めるが、拒否は表に足すだけなので、
+        // 書き手が起きる前の拒否も表に残り、最初の周期で書かれる（書き手を起こすまでは
+        // 「書き手が止まっている」のログも出さない）。
+        let rejection_writer = write_audit.spawn_rejection_writer();
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
@@ -998,6 +1006,8 @@ impl HubRuntime {
             prune_handle,
             audit_spool_handle,
             pool,
+            write_audit,
+            rejection_writer,
             _profile_lock: profile_lock,
             _profile_dirs: given_dirs,
         })
@@ -1151,6 +1161,10 @@ pub struct RunningHub {
     /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
     /// （[`RunningHub::shutdown_and_report`]）。
     pool: SqlitePool,
+    /// 書込み監査（拒否の表の残りを数えてログに出すために持つ。#945 の総点検）。
+    write_audit: WriteAuditService,
+    /// 拒否の監査の周期の書き手（pool を閉じる前に止めて書き切る。#945 の総点検）。
+    rejection_writer: RejectionWriter,
     /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
     /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
     _profile_dirs: Option<ProfileDirs>,
@@ -1168,6 +1182,9 @@ pub struct HubShutdownReport {
 /// 接続が返るのを待つので、返らない接続があっても停止を止めない。デスクトップの終了の
 /// 予算（15 秒）の中に収まる長さ。
 pub const DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 終了のとき、拒否の監査の書き手を止めて表を書き切るのを待つ上限（#945 の総点検）。
+pub const WRITE_AUDIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RunningHub {
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
@@ -1262,6 +1279,20 @@ impl RunningHub {
             tls_server.stop().await;
         }
         self.server.stop().await;
+        // #945 の総点検: 書込みの入口（REST・gRPC・MCP）が止まったので、拒否の監査の
+        // 書き手を止めて、表の残りを書き切ってから pool を閉じる（閉じたあとでは書けず
+        // 失われる）。DB が詰まっていても止めないよう上限で切り上げ、残りは 1 行のログに
+        // まとめる。
+        if tokio::time::timeout(WRITE_AUDIT_FLUSH_TIMEOUT, self.rejection_writer.shutdown())
+            .await
+            .is_err()
+        {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 拒否の監査を {} 秒のうちに書き切れませんでした（{} 件を記録できずに終了します）",
+                WRITE_AUDIT_FLUSH_TIMEOUT.as_secs(),
+                self.write_audit.unwritten_rejections()
+            ));
+        }
         // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
         let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, self.pool.close())
@@ -1624,6 +1655,75 @@ mod tests {
         assert!(report.db_closed, "{report:?}");
         assert!(db.is_file());
         std::fs::remove_file(&db).expect("閉じた DB は消せる");
+    }
+
+    /// #945 の総点検: 終了のとき、書き手を止めて拒否の表の残りを、pool を閉じる前に
+    /// 書き切る（閉じたあとでは書けずに失われる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_writes_the_rejection_table_before_closing_the_db() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-audit-drain");
+        let dirs = plain_profile_dirs(&dir);
+        let db = dirs.config.path().join(DB_FILE_NAME);
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db.to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
+            .await
+            .expect("start with profile dirs");
+        // 周期（2 秒）を待たずに終了しても、表に足した拒否はすべて残る。
+        let key = crate::write_audit::RejectingKey {
+            id: 1,
+            name: "k",
+            prefix: "pfx",
+        };
+        for i in 0..20 {
+            hub.write_audit.record_rejection(
+                key,
+                0,
+                &format!("no_such_tag_{i}"),
+                crate::write_audit::WriteRejectionReason::NotFound,
+            );
+        }
+        // 窓の中の同じ組は 1 行にまとまり、件数は終了の書き切りで最後の値になる。
+        for _ in 0..5 {
+            hub.write_audit.record_rejection(
+                key,
+                0,
+                "no_such_tag_0",
+                crate::write_audit::WriteRejectionReason::NotFound,
+            );
+        }
+        let report = hub.shutdown_and_report().await;
+        assert!(report.db_closed, "{report:?}");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db)
+                .read_only(true),
+        )
+        .await
+        .expect("reopen");
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM hub_write_audit WHERE result = 'rejected'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let detail: Option<String> = sqlx::query_scalar(
+            "SELECT detail FROM hub_write_audit WHERE external_name_snapshot = 'no_such_tag_0'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        assert_eq!(n, 20, "終了前に表へ足した拒否はすべて残る");
+        assert_eq!(detail.as_deref(), Some("not_found（60 秒の窓で計 6 件）"));
     }
 
     /// #693 レビュー: 監査の保留の場所が普通のファイルでも、握った組を渡した起動は

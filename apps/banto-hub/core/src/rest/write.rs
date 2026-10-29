@@ -222,6 +222,13 @@ pub(super) async fn v1_write_value(
     };
     // 事前段(b): write:{tag} スコープの完全一致(read スコープでは書けない)。
     if !ctx.has_write_scope(&tag) {
+        // #711: スコープ外の拒否も書込み監査に残す。
+        crate::write_path::record_missing_write_scope(
+            state.manager.as_ref(),
+            &state.write_audit,
+            &ctx,
+            &tag,
+        );
         return missing_write_scope_response();
     }
 
@@ -359,7 +366,21 @@ pub(super) async fn v1_write_values_batch(
     // 事前ゲート all-or-nothing をスコープ検査にも適用する(設計 §3.3
     // REST 節): 1件でも write スコープが無ければ、どのエントリも
     // execute_write_batch へ進めず全体を 403 で拒否する。
-    if body.writes.iter().any(|w| !ctx.has_write_scope(&w.tag)) {
+    // #711: スコープが無かったエントリごとに書込み監査へ残す。
+    let missing: Vec<&str> = body
+        .writes
+        .iter()
+        .filter(|w| !ctx.has_write_scope(&w.tag))
+        .map(|w| w.tag.as_str())
+        .collect();
+    let scope_missing = !missing.is_empty();
+    crate::write_path::record_missing_write_scopes(
+        state.manager.as_ref(),
+        &state.write_audit,
+        &ctx,
+        &missing,
+    );
+    if scope_missing {
         return missing_write_scope_response();
     }
 

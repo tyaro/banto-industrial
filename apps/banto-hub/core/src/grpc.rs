@@ -919,6 +919,13 @@ impl TagServiceTrait for GrpcService {
         // REST の事前段(b)と同じ規律: write:{tag} の完全一致(設計「write
         // scope 完全一致」)。
         if !ctx.has_write_scope(&req.tag) {
+            // #711: スコープ外の拒否も書込み監査に残す。
+            write_path::record_missing_write_scope(
+                self.manager.as_ref(),
+                &self.write_audit,
+                &ctx,
+                &req.tag,
+            );
             return Err(Status::permission_denied("missing_write_scope"));
         }
 
