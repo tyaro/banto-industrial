@@ -263,6 +263,32 @@ fn good_u16(body: &Value) -> Option<u16> {
         .then_some(value as u16)
 }
 
+/// Audit `result` values of the rows for `tag_ids`, in list order.
+async fn audited_results(app: &super::TestApp, tag_ids: &[i64]) -> Vec<String> {
+    let (status, rows) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{rows:?}");
+    let results: Vec<String> = rows["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| {
+            row["tagId"]
+                .as_i64()
+                .is_some_and(|id| tag_ids.contains(&id))
+        })
+        .map(|row| row["result"].as_str().unwrap_or("?").to_string())
+        .collect();
+    audit("write_audit_results", format!("{results:?}"));
+    results
+}
+
 async fn audited_ok_writes(app: &super::TestApp, tag_ids: &[i64]) -> usize {
     let (status, rows) = super::admin_write(
         &app.router,
@@ -974,12 +1000,34 @@ async fn hub_modbus_b1_register_bit_write_refused_without_fc22() {
     let scopes = vec![format!("read:{}", names[0]), format!("write:{}", names[0])];
     let (key_id, key) = temp_key(&app, "mb-b1-917", &scopes).await;
     app.write_control.enable();
-    read_now(&app, &key, &names[0]).await;
+    // Evidence on this path is the driver's refusal reason plus an audit row
+    // `failed` (refused before send), not an observed wire frame. `uncertain`
+    // (sent, outcome unknown) stops the test at once.
+    let (status, before) = read_now(&app, &key, &names[0]).await;
+    assert_eq!(status, super::StatusCode::OK, "{before:?}");
+    assert_eq!(before["q"], "good", "{before:?}");
+    assert!(before["v"].is_boolean(), "{before:?}");
+    let mut rows = audited_results(&app, &ids).await.len();
     for value in [true, false] {
         let (status, body) = write_one(&app, &key, &names[0], json!(value)).await;
         assert_eq!(status, super::StatusCode::BAD_GATEWAY, "{body:?}");
         assert_eq!(body["error"], "write_failed", "{body:?}");
+        assert!(
+            body.to_string().contains("register_bit_write=disabled"),
+            "{body:?}"
+        );
+        let results = audited_results(&app, &ids).await;
+        assert_eq!(results.len(), rows + 1, "{results:?}");
+        rows += 1;
+        if results.iter().any(|r| r == "uncertain") {
+            panic!("audit shows `uncertain`: outcome unknown, stopping: {results:?}");
+        }
+        // The count grew by one and every row is `failed` (none `ok`).
+        assert!(results.iter().all(|r| r == "failed"), "{results:?}");
     }
+    let (status, after) = read_now(&app, &key, &names[0]).await;
+    assert_eq!(status, super::StatusCode::OK, "{after:?}");
+    assert_eq!(after["v"], before["v"], "{after:?}");
     assert_eq!(audited_ok_writes(&app, &ids).await, 0);
     app.write_control.disable();
     revoke_key(&app, key_id).await;

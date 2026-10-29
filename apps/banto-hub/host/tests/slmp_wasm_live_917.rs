@@ -339,6 +339,10 @@ impl Transport for GuardedTransport {
         })
     }
 
+    fn datagram(&self) -> bool {
+        self.inner.datagram()
+    }
+
     fn recv<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> BoxFuture<'a, Result<usize, FatalError>> {
         self.inner.recv(buf)
     }
@@ -349,6 +353,59 @@ impl Transport for GuardedTransport {
 
     fn close(&mut self) -> BoxFuture<'_, ()> {
         self.inner.close()
+    }
+}
+
+/// Offline stand-in for the wire: hands out one prepared datagram per `recv`.
+struct FakeWire {
+    datagram: bool,
+    queue: std::collections::VecDeque<Vec<u8>>,
+}
+
+impl Transport for FakeWire {
+    fn datagram(&self) -> bool {
+        self.datagram
+    }
+
+    fn send<'a>(&'a mut self, _bytes: &'a [u8]) -> BoxFuture<'a, Result<(), FatalError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn recv<'a>(&'a mut self, buf: &'a mut Vec<u8>) -> BoxFuture<'a, Result<usize, FatalError>> {
+        Box::pin(async move {
+            let next = self.queue.pop_front().unwrap_or_default();
+            buf.extend_from_slice(&next);
+            Ok(next.len())
+        })
+    }
+
+    fn discard_input(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+
+    fn close(&mut self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
+    }
+}
+
+#[tokio::test]
+async fn guarded_transport_forwards_datagram_and_keeps_datagram_boundaries() {
+    for datagram in [true, false] {
+        let gate = Arc::new(Mutex::new(WireGate::new(&R)));
+        let mut guarded = GuardedTransport {
+            inner: Box::new(FakeWire {
+                datagram,
+                queue: [vec![1, 2], vec![3]].into(),
+            }),
+            gate,
+        };
+        assert_eq!(guarded.datagram(), datagram);
+        let mut first = Vec::new();
+        assert_eq!(guarded.recv(&mut first).await.unwrap(), 2);
+        assert_eq!(first, [1, 2]);
+        let mut second = Vec::new();
+        assert_eq!(guarded.recv(&mut second).await.unwrap(), 1);
+        assert_eq!(second, [3]);
     }
 }
 
