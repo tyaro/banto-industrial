@@ -625,12 +625,33 @@ async fn hub_slmp_reads(plc: &Plc) {
     let registered: Vec<&String> = names.iter().filter(|n| !n.is_empty()).collect();
     let scopes: Vec<String> = registered.iter().map(|n| format!("read:{n}")).collect();
     let (key_id, key) = temp_key(&app, &format!("{}-reads-917", plc.name), &scopes).await;
+    // Tags that must read on this PLC; the rest are recorded only.
+    let mut required: Vec<&str> = vec!["d0", "d1", "d2", "d3", "w1a", "w1a0", "w1af", "str"];
+    if plc.label == "R" {
+        required.extend(["z3", "rd7", "zr10", "u0g0", "u0g0b", "u0g0s", "u3e0"]);
+    }
     let mut a2: Vec<Option<Value>> = Vec::new();
     for (name, tag) in names.iter().zip(&tags) {
+        let must_read = required.contains(&tag.0);
         if name.is_empty() {
+            assert!(!must_read, "tag {} failed to register", tag.0);
             continue;
         }
-        let (_, body) = read_now(&app, &key, name).await;
+        let (status, body) = read_now(&app, &key, name).await;
+        audit(
+            "read_checked",
+            format!("tag={} record_only={}", tag.0, !must_read),
+        );
+        if must_read {
+            assert_eq!(status, super::StatusCode::OK, "{}: {body:?}", tag.0);
+            assert_eq!(body.get("q"), Some(&json!("good")), "{}: {body:?}", tag.0);
+            let v = body.get("v").unwrap_or(&Value::Null);
+            match tag.2 {
+                "string" => assert!(v.is_string(), "{} not a string: {body:?}", tag.0),
+                "bit" => assert!(v.is_boolean(), "{} not a bool: {body:?}", tag.0),
+                _ => assert!(v.is_number(), "{} not a number: {body:?}", tag.0),
+            }
+        }
         if ["w1a", "w1a0", "w1af"].contains(&tag.0) {
             a2.push(body.get("v").cloned());
         }
