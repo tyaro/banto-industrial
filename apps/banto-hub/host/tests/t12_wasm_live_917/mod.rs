@@ -611,7 +611,9 @@ async fn hub_slmp_reads(plc: &Plc) {
     }
     let word = a2[0]
         .as_ref()
-        .and_then(Value::as_u64)
+        .and_then(Value::as_f64)
+        .filter(|v| v.is_finite() && v.fract() == 0.0 && (0.0..=65535.0).contains(v))
+        .map(|v| v as u64)
         .unwrap_or_else(|| panic!("W1A not a u16: {a2:?}"));
     assert_eq!(
         a2[1],
