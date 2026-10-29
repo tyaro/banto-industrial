@@ -39,6 +39,9 @@
 //!   `hub_write_audit.result` の CHECK に `uncertain` を足したもの。SQLite は
 //!   CHECK を ALTER で変えられないので、表を作り直して行を写す（テスト
 //!   `an_existing_audit_row_survives_the_0107_rebuild`）。
+//! - `0108_hub_write_audit_key_prefix.sql`（#713、2026-10-29）は、失効した
+//!   API キーの削除の後も書込み監査から読めるよう、`hub_write_audit` に
+//!   `api_key_prefix_snapshot` を足したもの（`ADD COLUMN`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -363,7 +366,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108]
         );
     }
 
@@ -491,7 +494,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")

@@ -1,3 +1,4 @@
+DELETE /api/api-keys/{id}
 DELETE /api/collection-groups/{id}
 DELETE /api/plc-connections/{id}
 DELETE /api/sink/groups/{id}

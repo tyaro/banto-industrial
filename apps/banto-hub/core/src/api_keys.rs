@@ -507,6 +507,15 @@ pub struct ApiKeySummary {
     pub expires_at: Option<i64>,
 }
 
+/// [`ApiKeysService::delete`] の結果（#713）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum ApiKeyDeleteOutcome {
+    /// 削除した（削除前の要約）。
+    Deleted(ApiKeySummary),
+    /// 失効していないので削除しなかった。
+    StillActive,
+}
+
 /// [`ApiKeysService::lookup`] が有効なキーに対して返す文脈情報 -
 /// `crate::rest` の `/api/v1/*` ミドルウェアがスコープ判定と
 /// `last_used_at` スロットル更新に使う。
@@ -907,8 +916,8 @@ impl ApiKeysService {
         rows.into_iter().map(row_to_summary).collect()
     }
 
-    /// `id` を失効させる（`revoked_at` を立てるだけ - 物理削除しない、
-    /// 設計: 「DELETE は設けない（失効履歴を残す方針）」）。**冪等**:
+    /// `id` を失効させる（`revoked_at` を立てるだけ - ここでは物理削除
+    /// しない。削除は失効の後に [`Self::delete`] で別に行う）。**冪等**:
     /// 既に失効済みの場合は何もせず現在の状態を返す（2回目の呼び出しで
     /// `revoked_at` が上書きされて最初の失効時刻が失われることはない）。
     /// `id` が存在しない場合のみ `NotFound`。
@@ -923,6 +932,33 @@ impl ApiKeysService {
         .map_err(banto_storage::storage_error)?;
 
         self.fetch_summary(id).await
+    }
+
+    /// #713（2026-10-29 オーナー決定）: **失効済みの** `id` を物理削除する
+    /// （名前を使い直せるようにする）。失効していないキーは
+    /// [`ApiKeyDeleteOutcome::StillActive`] で断る（先に [`Self::revoke`]）。
+    /// 存在しない `id` は `NotFound`。成功時は削除した行の要約（監査ログに
+    /// 名前とプレフィックスを残すため）を返す。
+    ///
+    /// 参照の扱い: `hub_write_audit` は `api_key_id` を持つが FK は無く、
+    /// 名前（`api_key_name_snapshot`）とプレフィックス
+    /// （`api_key_prefix_snapshot`）を書込み時点の値として持つので、削除の
+    /// 後も読める。ほかに `api_keys` を参照する表は無い。
+    pub async fn delete(&self, id: i64) -> Result<ApiKeyDeleteOutcome, BantoError> {
+        let summary = self.fetch_summary(id).await?;
+        // 判定と削除を 1 文にする（間に別の要求が割り込んでも、失効していない
+        // キーは消えない）。
+        let result = sqlx::query("DELETE FROM api_keys WHERE id = ? AND revoked_at IS NOT NULL")
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(banto_storage::storage_error)?;
+        if result.rows_affected() == 1 {
+            return Ok(ApiKeyDeleteOutcome::Deleted(summary));
+        }
+        // 0 行: 直前の確認の後に消えた（NotFound）か、失効していない。
+        self.fetch_summary(id).await?;
+        Ok(ApiKeyDeleteOutcome::StillActive)
     }
 
     /// T2-4（設計 §6-4）: `id` をトリップさせる（`tripped_at` を立てる -

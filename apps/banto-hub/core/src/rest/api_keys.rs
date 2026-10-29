@@ -8,9 +8,11 @@
 use super::{
     get, json, middleware, post, record_write, require_session, require_session_role, ApiError,
     ApiKeysService, Arc, AuditLogService, AuthGate, AuthState, BantoError, CollectorManager,
-    Deserialize, FieldError, HeaderMap, IssuedApiKey, Json, OperationKind, Path, Role, Router,
-    Serialize, SessionRoleGuard, State, StatusCode, ToSchema,
+    Deserialize, ErrorBody, FieldError, HeaderMap, IntoResponse, IssuedApiKey, Json, OperationKind,
+    Path, Response, Role, Router, Serialize, SessionRoleGuard, State, StatusCode, ToSchema,
 };
+use crate::api_keys::ApiKeyDeleteOutcome;
+use axum::routing::delete;
 
 // --- API キー管理 (docs/tag-server-design.md §5.6・T0-2 実装指示 §1「管理
 // REST」): admin ロール限定、CSRF + bearer セッション（このルーター自体は
@@ -152,8 +154,8 @@ async fn api_keys_list(
     Ok(Json(state.api_keys.list().await?))
 }
 
-/// `POST /api/api-keys/{id}/revoke` - 失効（冪等、設計: 「DELETE は設けない
-/// （失効履歴を残す方針）」）。
+/// `POST /api/api-keys/{id}/revoke` - 失効（冪等）。物理削除は失効の後に
+/// [`api_keys_delete`]（#713）。
 async fn api_keys_revoke(
     State(state): State<ApiKeysAdminState>,
     headers: HeaderMap,
@@ -171,6 +173,41 @@ async fn api_keys_revoke(
     )
     .await;
     Ok(Json(summary))
+}
+
+/// `DELETE /api/api-keys/{id}` - 失効済みキーの削除（#713、2026-10-29
+/// オーナー決定。それまでは「DELETE は設けない（失効履歴を残す方針）」）。
+/// 削除すると同じ名前で発行し直せる。失効していないキーは `409`（先に
+/// `revoke`）、存在しない id は `404`。書込み監査などはキーの名前と
+/// プレフィックスのスナップショットを持つので、削除の後も読める。監査ログ
+/// には名前とプレフィックスを `delete` として残す。成功は `204`。
+async fn api_keys_delete(
+    State(state): State<ApiKeysAdminState>,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+) -> Result<Response, ApiError> {
+    match state.api_keys.delete(id).await? {
+        ApiKeyDeleteOutcome::Deleted(summary) => {
+            record_write(
+                &state.audit,
+                &state.auth,
+                &headers,
+                "delete",
+                "api_keys",
+                Some(&id.to_string()),
+                Some(json!({ "name": summary.name, "prefix": summary.prefix })),
+            )
+            .await;
+            Ok(StatusCode::NO_CONTENT.into_response())
+        }
+        ApiKeyDeleteOutcome::StillActive => Ok((
+            StatusCode::CONFLICT,
+            Json(ErrorBody::Other {
+                message: "有効な API キーは削除できません。先に失効させてください".to_string(),
+            }),
+        )
+            .into_response()),
+    }
 }
 
 /// `POST /api/api-keys/{id}/clear-trip` - トリップ解除（冪等、T2-4・
@@ -217,6 +254,7 @@ pub(super) fn api_keys_router(
     };
     Router::new()
         .route("/api/api-keys", get(api_keys_list).post(api_keys_create))
+        .route("/api/api-keys/{id}", delete(api_keys_delete))
         .route("/api/api-keys/{id}/revoke", post(api_keys_revoke))
         .route("/api/api-keys/{id}/clear-trip", post(api_keys_clear_trip))
         .with_state(state)
