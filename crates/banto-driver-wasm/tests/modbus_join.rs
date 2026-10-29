@@ -409,3 +409,245 @@ fn register_bit_writes_are_refused_before_send_by_the_layer_that_owns_each_rule(
         );
     }
 }
+
+/// Guest and host policy settings plus extra guest settings
+/// (for example `register_write`).
+fn policy_settings(guest_allow: &str, host_allow: &str, extra: &[(&str, &str)]) -> Settings {
+    let mut pairs = vec![
+        ("host", "127.0.0.1"),
+        ("port", "502"),
+        ("unit_id", "1"),
+        ("probe_address", "40001"),
+        ("write_mode", "enabled"),
+        ("write_allowlist", guest_allow),
+        ("modbus_operational_write_mode", "enabled"),
+        ("modbus_operational_write_allowlist", host_allow),
+    ];
+    pairs.extend_from_slice(extra);
+    Settings::from_pairs(pairs).unwrap()
+}
+
+fn coils(driver: &WasmDriver, first: u32, values: &[bool]) -> Vec<WriteItem> {
+    values
+        .iter()
+        .zip(first..)
+        .map(|(value, number)| bit_write(driver, &format!("{number:05}"), Value::Bit(*value)))
+        .collect()
+}
+
+fn refused_before_send(conn: &mut Box<dyn FrameConnection>, items: &[WriteItem]) -> Vec<ItemError> {
+    match conn.write_next(items, None).unwrap() {
+        WriteProgress::Done(results) => {
+            assert_eq!(results.len(), items.len());
+            results.into_iter().map(Result::unwrap_err).collect()
+        }
+        other => panic!("a write frame was planned for {items:?}: {other:?}"),
+    }
+}
+
+/// #915: a contiguous coil run inside one host interval passes the host
+/// gate and the guest sends it as one FC15 frame, packed LSB-first.
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn fc15_coil_run_inside_one_host_interval_is_one_frame_with_per_item_exceptions() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    // The guest allows 00001-00016 as one interval; the host splits it in two.
+    let mut conn = connected(
+        &driver,
+        &policy_settings("000001-000016", "000001-000008,000009-000016", &[]),
+    );
+    let values = [true, false, true, true, false, false, true, true];
+    let items = coils(&driver, 1, &values);
+    let plan = match conn.write_next(&items, None).unwrap() {
+        WriteProgress::Send(plan) => plan,
+        other => panic!("expected FC15: {other:?}"),
+    };
+    assert_eq!(plan.covers, (0..8).collect::<Vec<u32>>());
+    let mut expected = plan.step.send[..2].to_vec();
+    // Byte count 1; bits 0..7 = 1,0,1,1,0,0,1,1 LSB-first = 0xCD.
+    expected.extend_from_slice(&[0, 0, 0, 8, 1, 15, 0, 0, 0, 8, 1, 0xcd]);
+    assert_eq!(plan.step.send, expected);
+    let mut ack = plan.step.send[..12].to_vec();
+    ack[4..6].copy_from_slice(&6_u16.to_be_bytes());
+    assert!(matches!(
+        conn.write_next(&items, Some(&ack)).unwrap(),
+        WriteProgress::Done(results) if results == vec![Ok(()); 8]
+    ));
+
+    // Eight coils filling the second host interval.
+    let items = coils(&driver, 9, &[true; 8]);
+    let plan = match conn.write_next(&items, None).unwrap() {
+        WriteProgress::Send(plan) => plan,
+        other => panic!("expected FC15: {other:?}"),
+    };
+    assert_eq!(plan.step.send[7..], [15, 0, 8, 0, 8, 1, 0xff]);
+
+    // An exception is an item-level device error for every coil of the run,
+    // and the connection keeps working.
+    let mut exception = plan.step.send[..4].to_vec();
+    exception.extend_from_slice(&[0, 3, 1, 0x8f, 2]);
+    match conn.write_next(&items, Some(&exception)).unwrap() {
+        WriteProgress::Done(results) => {
+            assert_eq!(results.len(), items.len());
+            for result in results {
+                match result {
+                    Err(ItemError::Device(error)) => assert_eq!(error.code, 2, "{error:?}"),
+                    other => panic!("expected a device error: {other:?}"),
+                }
+            }
+        }
+        other => panic!("expected Done: {other:?}"),
+    }
+    let plan = match conn.write_next(&items, None).unwrap() {
+        WriteProgress::Send(plan) => plan,
+        other => panic!("expected FC15 again: {other:?}"),
+    };
+    let mut ack = plan.step.send[..12].to_vec();
+    ack[4..6].copy_from_slice(&6_u16.to_be_bytes());
+    assert!(matches!(
+        conn.write_next(&items, Some(&ack)).unwrap(),
+        WriteProgress::Done(results) if results == vec![Ok(()); 8]
+    ));
+
+    // Refused by the host gate before send: a run straddling the two host
+    // intervals (the guest alone would allow it), a gap, a descending pair,
+    // and a coil mixed with a holding register.
+    let holding = WriteItem::new(spec(&driver, "40001", DataType::U16), Value::F64(1.0));
+    let mut mixed = coils(&driver, 1, &[true]);
+    mixed.push(holding);
+    for items in [
+        coils(&driver, 7, &[true, false, true, false]),
+        vec![
+            bit_write(&driver, "00001", Value::Bit(true)),
+            bit_write(&driver, "00003", Value::Bit(true)),
+        ],
+        vec![
+            bit_write(&driver, "00002", Value::Bit(true)),
+            bit_write(&driver, "00001", Value::Bit(true)),
+        ],
+        mixed,
+    ] {
+        let errors = refused_before_send(&mut conn, &items);
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, ItemError::Unsupported(_))),
+            "host refusal expected for {items:?}: {errors:?}"
+        );
+    }
+
+    // Inside the host interval but outside the guest's list: the guest
+    // refuses before send.
+    let mut narrow = connected(
+        &driver,
+        &policy_settings("000001-000004", "000001-000016", &[]),
+    );
+    let errors = refused_before_send(&mut narrow, &coils(&driver, 3, &[true, true, true]));
+    assert!(
+        errors
+            .iter()
+            .all(|error| matches!(error, ItemError::Rejected(_))),
+        "guest refusal expected: {errors:?}"
+    );
+}
+
+/// #915: `register_write=fc6` sends one i16/u16 holding write as FC6; a
+/// write needing more than one word is refused by the guest before send.
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let both = "000001-000016,400001-400010";
+    let mut conn = connected(
+        &driver,
+        &policy_settings(both, both, &[("register_write", "fc6")]),
+    );
+    for (address, kind, value, offset, word) in [
+        ("40003", DataType::U16, 0x1234 as f64, 2_u16, 0x1234_u16),
+        ("40010", DataType::I16, -2.0, 9, 0xfffe),
+    ] {
+        let item = WriteItem::new(spec(&driver, address, kind), Value::F64(value));
+        let plan = match conn.write_next(std::slice::from_ref(&item), None).unwrap() {
+            WriteProgress::Send(plan) => plan,
+            other => panic!("expected FC6 for {address}: {other:?}"),
+        };
+        let mut expected = plan.step.send[..2].to_vec();
+        expected.extend_from_slice(&[0, 0, 0, 6, 1, 6]);
+        expected.extend_from_slice(&offset.to_be_bytes());
+        expected.extend_from_slice(&word.to_be_bytes());
+        assert_eq!(plan.step.send, expected, "{address}");
+        // The acknowledgement echoes the address and value.
+        assert!(matches!(
+            conn.write_next(&[item], Some(&plan.step.send)).unwrap(),
+            WriteProgress::Done(results) if results == [Ok(())]
+        ));
+    }
+
+    // An exception is an item-level device error.
+    let item = WriteItem::new(spec(&driver, "40003", DataType::U16), Value::F64(7.0));
+    let plan = match conn.write_next(std::slice::from_ref(&item), None).unwrap() {
+        WriteProgress::Send(plan) => plan,
+        other => panic!("expected FC6: {other:?}"),
+    };
+    let mut exception = plan.step.send[..4].to_vec();
+    exception.extend_from_slice(&[0, 3, 1, 0x86, 2]);
+    match conn
+        .write_next(std::slice::from_ref(&item), Some(&exception))
+        .unwrap()
+    {
+        WriteProgress::Done(results) => match results.as_slice() {
+            [Err(ItemError::Device(error))] => assert_eq!(error.code, 2, "{error:?}"),
+            other => panic!("expected a device error: {other:?}"),
+        },
+        other => panic!("expected Done: {other:?}"),
+    }
+
+    // Wider than one word: passes the host gate (inside its allowlist) and is
+    // refused by the guest before send.
+    for items in [
+        vec![WriteItem::new(
+            spec(&driver, "40001", DataType::U32),
+            Value::F64(1.0),
+        )],
+        vec![
+            WriteItem::new(spec(&driver, "40001", DataType::U16), Value::F64(1.0)),
+            WriteItem::new(spec(&driver, "40002", DataType::U16), Value::F64(2.0)),
+        ],
+    ] {
+        let errors = refused_before_send(&mut conn, &items);
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, ItemError::Rejected(_))),
+            "guest refusal expected for {items:?}: {errors:?}"
+        );
+    }
+    // Outside the host allowlist: the host refuses first.
+    let errors = refused_before_send(
+        &mut conn,
+        &[WriteItem::new(
+            spec(&driver, "40011", DataType::U16),
+            Value::F64(1.0),
+        )],
+    );
+    assert!(
+        matches!(errors.as_slice(), [ItemError::Unsupported(_)]),
+        "{errors:?}"
+    );
+
+    // register_write does not affect coils: one coil stays FC5, a run FC15.
+    for (values, function) in [(&[true][..], 5_u8), (&[true, false][..], 15)] {
+        let items = coils(&driver, 1, values);
+        let plan = match conn.write_next(&items, None).unwrap() {
+            WriteProgress::Send(plan) => plan,
+            other => panic!("expected FC{function}: {other:?}"),
+        };
+        assert_eq!(plan.step.send[7], function);
+        let mut ack = plan.step.send[..12].to_vec();
+        ack[4..6].copy_from_slice(&6_u16.to_be_bytes());
+        assert!(matches!(
+            conn.write_next(&items, Some(&ack)).unwrap(),
+            WriteProgress::Done(results) if results.iter().all(Result::is_ok)
+        ));
+    }
+}

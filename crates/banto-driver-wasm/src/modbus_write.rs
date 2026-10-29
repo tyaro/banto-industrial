@@ -9,6 +9,9 @@ const MAX_RANGES: usize = 16;
 const MAX_TEXT: usize = 512;
 const MAX_ADDRESS: u32 = 65_535;
 const MAX_WORDS: u32 = 123;
+/// FC15 allows 1968 coils per request, but the guest caps every write at 123
+/// items (CONTRACT.md, guest #53), so the host cap is min(1968, 123).
+const MAX_COILS: u32 = 123;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Area {
@@ -159,7 +162,7 @@ pub(super) fn schema_fields() -> [SettingField; 2] {
     allowlist.default = Some(SettingValue::Text(String::new()));
     allowlist.group = FieldGroup::Advanced;
     allowlist.help = Some(
-        "Host allowlist for complete FC5 coil or FC16 holding spans, or the word of one FC22 holding register bit."
+        "Host allowlist for complete FC5/FC15 coil or FC16/FC6 holding spans (each request inside one range), or the word of one FC22 holding register bit."
             .into(),
     );
     [mode, allowlist]
@@ -226,9 +229,6 @@ pub(super) fn preflight(
     }
     let (area, start) =
         parse_reference(&first.spec.address.canonical).map_err(|_| refused(REASON_RUN))?;
-    if area == Area::Coil && items.len() != 1 {
-        return Err(refused("coil writes are one point per request"));
-    }
     let mut next = start;
     let mut checked = Vec::with_capacity(items.len());
     for item in items {
@@ -318,8 +318,14 @@ pub(super) fn preflight(
     if span == 0 {
         return Err(refused(REASON_RUN));
     }
-    if span > if area == Area::Coil { 1 } else { MAX_WORDS } {
-        return Err(refused("too many registers in one request"));
+    // A coil run of 2+ points is one FC15 (guest #53); the whole span must
+    // still lie inside one host allowlist interval (`Policy::check`).
+    match area {
+        Area::Coil if span > MAX_COILS => return Err(refused("too many coils in one request")),
+        Area::Holding if span > MAX_WORDS => {
+            return Err(refused("too many registers in one request"))
+        }
+        _ => {}
     }
     policy.check(area, start, next - 1).map_err(refused)?;
     Ok(checked)
@@ -496,10 +502,23 @@ mod tests {
             (
                 vec![
                     item("000001", "coil", 0, DataType::Bit, api::Value::Bit(true)),
-                    item("000002", "coil", 1, DataType::Bit, api::Value::Bit(true)),
+                    item("000003", "coil", 2, DataType::Bit, api::Value::Bit(true)),
                 ],
                 on.clone(),
-                "coil writes are one point per request",
+                "request is not one contiguous run of writable addresses",
+            ),
+            (
+                vec![
+                    item("000016", "coil", 15, DataType::Bit, api::Value::Bit(true)),
+                    item("000017", "coil", 16, DataType::Bit, api::Value::Bit(true)),
+                ],
+                on.clone(),
+                "outside the Modbus write allowlist",
+            ),
+            (
+                coil_run(0, 124),
+                policy("enabled", "000001-000200"),
+                "too many coils in one request",
             ),
             (
                 vec![item(
@@ -673,6 +692,109 @@ mod tests {
         );
         bad.spec.address.word_count = 1;
         assert!(preflight(&[bad], &id, &gate).is_err());
+    }
+
+    /// `count` contiguous coils from zero-based `first`, alternating values.
+    fn coil_run(first: u64, count: u64) -> Vec<WriteItem> {
+        (first..first + count)
+            .map(|i| {
+                item(
+                    &format!("{:06}", i + 1),
+                    "coil",
+                    i,
+                    DataType::Bit,
+                    api::Value::Bit(i.is_multiple_of(2)),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn contiguous_coil_runs_pass_only_inside_one_host_interval() {
+        let id = DriverId::new("modbus-fc3-wasm").unwrap();
+        // Two adjacent intervals: a run may not straddle them.
+        let gate = policy(
+            "enabled",
+            "000001-000008,000009-000016,000101-000300,400001-400010",
+        );
+        for (first, count) in [(0, 2), (0, 8), (8, 8), (3, 5), (100, 123)] {
+            let items = coil_run(first, count);
+            let checked = preflight(&items, &id, &gate).unwrap();
+            assert_eq!(checked.len(), items.len());
+            for (i, (checked, item)) in checked.iter().zip(&items).enumerate() {
+                assert_eq!(checked.spec.address, item.spec.address.canonical);
+                assert_eq!(checked.spec.data_type, "bool");
+                let expected = (first + i as u64).is_multiple_of(2);
+                assert!(
+                    matches!(checked.value, write_types::Value::Bool(v) if v == expected),
+                    "{first}+{i}"
+                );
+            }
+        }
+        let refused = |items: Vec<WriteItem>, gate: &Policy| {
+            let count = items.len();
+            refusal_text(preflight(&items, &id, gate), count)
+        };
+        // Straddles 000008/000009, or leaves the last interval.
+        assert_eq!(
+            refused(coil_run(6, 4), &gate),
+            "outside the Modbus write allowlist"
+        );
+        assert_eq!(
+            refused(coil_run(295, 10), &gate),
+            "outside the Modbus write allowlist"
+        );
+        // Host permission off.
+        assert_eq!(
+            refused(coil_run(0, 2), &policy("disabled", "")),
+            "Modbus writes are disabled"
+        );
+        // 124 coils inside one interval: over the guest's 123-item cap.
+        assert_eq!(
+            refused(coil_run(100, 124), &gate),
+            "too many coils in one request"
+        );
+        // Gap, duplicate, descending.
+        for order in [[0_usize, 2], [0, 0], [1, 0]] {
+            let run = coil_run(0, 3);
+            let items = order.iter().map(|&i| run[i].clone()).collect();
+            assert_eq!(
+                refused(items, &gate),
+                "request is not one contiguous run of writable addresses",
+                "{order:?}"
+            );
+        }
+        // A coil mixed with a holding register, either way round.
+        let holding = item(
+            "400001",
+            "holding_register",
+            0,
+            DataType::U16,
+            api::Value::F64(1.0),
+        );
+        let mut coils = coil_run(0, 2);
+        coils.push(holding.clone());
+        assert_eq!(refused(coils, &gate), REASON_TYPE);
+        let mut mixed = vec![holding];
+        mixed.extend(coil_run(1, 1));
+        assert_eq!(refused(mixed, &gate), REASON_TYPE);
+        // A non-Bool value, a non-Bit type, another driver, a read-only area,
+        // or a canonical address that does not match the index.
+        let mut bad = coil_run(0, 3);
+        bad[1].value = api::Value::F64(1.0);
+        assert_eq!(refused(bad, &gate), REASON_VALUE);
+        let mut bad = coil_run(0, 3);
+        bad[2].spec.kind = TagKind::numeric(DataType::U16);
+        assert_eq!(refused(bad, &gate), REASON_TYPE);
+        for mutate in [
+            |x: &mut WriteItem| x.spec.address.driver = DriverId::new("other-driver").unwrap(),
+            |x: &mut WriteItem| x.spec.address.writable_area = false,
+            |x: &mut WriteItem| x.spec.address.canonical = "000009".into(),
+        ] {
+            let mut bad = coil_run(0, 3);
+            mutate(&mut bad[1]);
+            assert_eq!(refused(bad, &gate), REASON_RUN);
+        }
     }
 
     fn bit_item(reference: &str, area: &str, index: u64, bit: u8, value: api::Value) -> WriteItem {
