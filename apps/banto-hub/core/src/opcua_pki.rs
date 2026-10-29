@@ -23,24 +23,36 @@
 //!
 //! ## 鍵を作る前の確かめ（[`prepare`]）
 //!
-//! - **Windows**: 置き場が無ければ、保護された DACL（SYSTEM・Administrators のフルと、
-//!   このプロセスの利用者の「変更」。サービス（LocalSystem）なら SYSTEM・Administrators
-//!   だけ）で作る（`banto_safe_root::acl::create_dir_if_absent`。作ってから絞るまでの間に
-//!   広い権限で見える時間を作らない）。その後、置き場と中の子のすべて（既にある鍵・証明書を
-//!   含む）を辿らずに開いて記述子を読み（`inspect_file`）、**許可リスト**で確かめる
-//!   （#943 のレビュー P1）。許可リストは次の相手:
+//! - **Windows**: 親の `opcua` と置き場 `pki` が無ければ、保護された DACL（SYSTEM・
+//!   Administrators のフルと、このプロセスの利用者の「変更」。サービス（LocalSystem）なら
+//!   SYSTEM・Administrators だけ）で作る（`banto_safe_root::acl::create_dir_if_absent`。
+//!   作ってから絞るまでの間に広い権限で見える時間を作らない）。その後、**固定の一覧**
+//!   （`pki`・`pki\own`・`pki\private` の 3 フォルダと、証明書 `own\cert.der`・秘密鍵
+//!   `private\private.pem` の 2 ファイル。banto-opcua の `with_pki_dir` の置き方で、Unix と
+//!   同じ一覧）を 1 つずつ辿らずに開いて記述子を読み（`inspect_file`）、**許可リスト**で
+//!   確かめる（#943 のレビュー P1・総点検 P1-1）。無い物は飛ばす（初回は banto-opcua が作る）。
+//!   **中を辿らない**: banto-safe-root の `close_tree` が木のすべてのフォルダに置く印の
+//!   ファイル（`.banto-safe-root`。SYSTEM・Administrators だけ、所有者 Administrators で、
+//!   緩めても記述子は変えない）は、管理者でない利用者には `READ_CONTROL` でも開けないので、
+//!   辿ると、一度でもサービス（運用モード）を通した profile でデスクトップが毎回断られる。
+//!   印のファイル・`trusted`・`rejected`（クライアントの証明書が溜まる）は開かない。
+//!   許可リストは次の相手:
 //!   1. SYSTEM・Administrators（と、`exposure` が同じく信頼する TrustedInstaller）。
 //!   2. このプロセスのトークンの利用者（実行しているアカウント）。
 //!   3. **明示的に許可された profile の利用者**: 握った profile のフォルダ自身の DACL で、
-//!      普通の許可の ACE（`INHERIT_ONLY` でないもの）を持つ利用者のアカウント（SID が
-//!      `S-1-5-21-…`・`S-1-12-1-…` で、`check_user_account`（`LookupAccountSidW` の
-//!      `SidTypeUser`）が通るもの。グループ・well-known は入れない）。profile の DACL は
+//!      普通の許可の ACE（`INHERIT_ONLY` でないもの）を持ち、SID が利用者のアカウントの形
+//!      （`S-1-5-21-…`・`S-1-12-1-…`）で、広いグループ（Domain Users など）でないもの。
+//!      **名前の解決（`LookupAccountSidW`）はしない**（総点検 P2-2）: profile のルートに
+//!      利用者の ACE を書く経路（`grant-profile-acl`・`relax_tree`・`close_tree`）は、どれも
+//!      書く前に `ensure_user_account` で利用者のアカウントに限っている。ここでもう一度
+//!      解決すると、DC・Entra に届かないときに正当な構成を断るだけで、守りは増えない。
+//!      管理者が手で足した ACE は、管理者の判断として許す。profile の DACL は
 //!      `grant-profile-acl`・サービスの設定モード ⇔ 運用モードの切り替えが決める（どちらも
 //!      profile のフォルダを根に、木の全体へ同じ利用者を書く）。デスクトップだけで使う継承の
 //!      profile では空になりうる（そのときは 1・2 だけ）。profile を握らずに起動したとき
 //!      （テストなど）も 1・2 だけ。
 //!
-//!   次のものがあれば**鍵を作らず・読まずに**起動を断る:
+//!   固定の一覧の物に次のものがあれば**鍵を作らず・読まずに**起動を断る:
 //!   - 許可リストにない相手への**許可**の ACE（明示・継承・`INHERIT_ONLY` を問わず、マスクも
 //!     問わない。多めに断る側に倒す）。`CREATOR OWNER`（`S-1-3-0`）などの継承専用の相手も、
 //!     banto-safe-root が書く DACL（`create_dir_if_absent`・`relax_tree`・`close_tree`・
@@ -51,8 +63,25 @@
 //!   - reparse point（ジャンクション・シンボリックリンク）・ハードリンク（リンク数 2 以上）。
 //!
 //!   拒否の ACE は断らない（読める相手を減らすだけなので）。profile のフォルダの DACL を
-//!   読めないときも断る（許可リストを決められないため）。
-//! - **Unix**: banto-opcua が鍵のフォルダを 0700・鍵を 0600 にする。ここでは、既にある鍵が
+//!   読めないときも断る（許可リストを決められないため）。一覧の物の種類（フォルダか
+//!   ファイルか）の違いは、banto-opcua が `Error::Pki` で断る。
+//!
+//!   **親の `opcua`**（総点検 P2-1。Unix の「所有者が自分か root、他人が書けない」とそろえる）:
+//!   別の利用者が `opcua` を先に作ったり、`opcua` に持つ削除の権利で `pki` を名前の変更で
+//!   退かして入れ替えたりできないことを確かめる。次のものがあれば断る:
+//!   - 許可リストにない所有者。
+//!   - 許可リストにない相手への許可の ACE（`INHERIT_ONLY` でない、`opcua` 自身に効く物）で、
+//!     マスクに `DELETE`・`FILE_DELETE_CHILD`・`WRITE_DAC`・`WRITE_OWNER` か、汎用の
+//!     `GENERIC_ALL`（展開すると `FILE_ALL_ACCESS` で上を含む）・`GENERIC_WRITE`（ファイルの
+//!     展開には上を含まないが、多めに断る側に倒す）があるもの。
+//!   - reparse point・null DACL・種類の分からない ACE・SID の読めない ACE（`pki` と同じ）。
+//!
+//!   読む・辿る・作る（`FILE_ADD_FILE`・`FILE_ADD_SUBDIRECTORY` など）だけの許可は許す。継承の
+//!   既定の profile（デスクトップだけ、ProgramData の下）では、Users に「読み取りと実行」と
+//!   「作成」だけの継承の ACE が付き、それを断ると起動できないため。`INHERIT_ONLY` の ACE
+//!   （`CREATOR OWNER` など）も `opcua` 自身には効かないので許す（`pki` は保護された DACL で
+//!   作り、既にあれば上の一覧で確かめる）。
+//! - **Unix**（本番の対象外）: banto-opcua が鍵のフォルダを 0700・鍵を 0600 にする。ここでは、既にある鍵が
 //!   グループ・他人に開いている（`mode & 0o077`）、置き場・`own`・`private` と
 //!   証明書がグループ・他人に書ける（`mode & 0o022`）、どれかがシンボリックリンクなら断る。
 //!   **所有者**も確かめる（#943 のレビュー P1）: 置き場・`own`・`private`・証明書・鍵の
@@ -61,17 +90,21 @@
 //!   親の `opcua` は、所有者が実行している利用者か root で、グループ・他人に書けないこと。
 //!   実効 UID は、既にある依存の `sysinfo` で自分のプロセスの実効 UID を読む（`libc` を
 //!   足さない。読めなければ断る）。置き場がなければ 0700 で作る（既にある置き場の権限は
-//!   書き換えない）。
+//!   書き換えない）。所有者は実効 UID との一致が必須なので、同じ profile を利用者
+//!   （デスクトップ）と root（サービス）で行き来すると断られる（`chown` で揃える。総点検
+//!   P3-1。Unix は本番の対象でないので変えない）。
 //!
 //! ### 親を辿らずに作る・確かめる（両方の OS。#943 のレビュー P2）
 //!
 //! データのフォルダから `opcua`、`opcua/pki` へと 1 段ずつ、**最後の要素のリンクを辿らずに**
 //! 確かめながら作る（`create_dir_all` で辿らない）。各段がリンク（Unix はシンボリックリンク、
 //! Windows は reparse point = ジャンクション・シンボリックリンクなど）か、フォルダでなければ
-//! 断る。無ければ作り（Unix は 0700、Windows の `opcua` は親から継承・`pki` は上の保護された
-//! DACL）、作ったあともう一度確かめる。最後に、置き場の本当のパス（`canonicalize`。Windows では
+//! 断る。無ければ作り（Unix は 0700、Windows は `opcua`・`pki` とも上の保護された DACL）、
+//! 作ったあともう一度確かめる。最後に、置き場の本当のパス（`canonicalize`。Windows では
 //! `GetFinalPathNameByHandleW`）が、データのフォルダの本当のパスの下にあることを確かめる
-//! （別の profile などの外を指していれば断る）。
+//! （`check_inside`）。`opcua`・`pki` がリンクでないと確かめたあとでは、データのフォルダが
+//! どこを指していても置き場はその本当のパスの `opcua/pki` になるので、**この確かめは常に
+//! 成り立つ**（総点検 6）。確かめどうしの間にすり替えられた場合の網として残す（安い）。
 //!
 //! - **データのフォルダ自身とその上は確かめない**: 本番ではデータのフォルダは握った profile の
 //!   `data\` の本当のパスで、profile の仕組み（`crate::profile_lock`・`crate::profile_grant`）が
@@ -212,16 +245,23 @@ fn check_inside(data_dir: &Path, dir: &Path) -> Result<(), String> {
 mod imp {
     use std::path::Path;
 
-    use banto_safe_root::acl::{self, Exposure, InstallUserSid, ObservedDacl};
+    use banto_safe_root::acl::{self, Exposure, FileSecurity, InstallUserSid, ObservedDacl};
     use banto_safe_root::DirAccess;
-
-    /// 辿る子の数・深さの上限（置き場の中は async-opcua の数個のフォルダだけ）。
-    const MAX_ENTRIES: usize = 1024;
-    const MAX_DEPTH: usize = 8;
 
     /// `ACE_HEADER.AceFlags` の `INHERIT_ONLY_ACE`・`INHERITED_ACE`。
     const INHERIT_ONLY_ACE: u8 = 0x08;
     const INHERITED_ACE: u8 = 0x10;
+
+    /// 親の `opcua` で、許可リストの外の相手に許さない権利（モジュール doc「親の `opcua`」）と、
+    /// その表示の名前。
+    const PARENT_FORBIDDEN: [(u32, &str); 6] = [
+        (0x0001_0000, "DELETE"),
+        (0x0000_0040, "FILE_DELETE_CHILD"),
+        (0x0004_0000, "WRITE_DAC"),
+        (0x0008_0000, "WRITE_OWNER"),
+        (0x1000_0000, "GENERIC_ALL"),
+        (0x4000_0000, "GENERIC_WRITE"),
+    ];
 
     pub(super) fn prepare(dir: &Path, profile_dir: Option<&Path>) -> Result<(), String> {
         // `./data` のような `.` の要素は `inspect_file` が断るので、先に絶対パスにする
@@ -243,18 +283,6 @@ mod imp {
             .clone()
             .map(DirAccess::with_install_user)
             .unwrap_or_else(DirAccess::service_only);
-        // `opcua` → `opcua\pki` を 1 段ずつ、辿らずに確かめながら作る（#943 のレビュー P2）。
-        let opcua = dir.parent().expect("data_dir_of が確かめた");
-        ensure_dir_step(opcua, || match std::fs::create_dir(opcua) {
-            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => Err(err.to_string()),
-            _ => Ok(()),
-        })?;
-        ensure_dir_step(&dir, || {
-            acl::create_dir_if_absent(&dir, &access)
-                .map(|_| ())
-                .map_err(|err| format!("保護された置き場を作れません: {err}"))
-        })?;
-        super::check_inside(data_dir, &dir)?;
         // 許可リストの 2・3（1 は `exposure` が理由にしない）。
         let mut allowed: Vec<String> = me.iter().map(|sid| sid.as_str().to_owned()).collect();
         if let Some(profile) = profile_dir {
@@ -264,9 +292,44 @@ mod imp {
                 }
             }
         }
+        let create_protected = |path: &Path| {
+            acl::create_dir_if_absent(path, &access)
+                .map(|_| ())
+                .map_err(|err| format!("保護されたフォルダを作れません: {err}"))
+        };
         let mut problems = Vec::new();
-        let mut count = 0;
-        walk(&dir, 0, &mut count, &allowed, &mut problems)?;
+        // `opcua` → `opcua\pki` を 1 段ずつ、辿らずに確かめながら作る（#943 のレビュー P2）。
+        // 親の `opcua` の所有者と ACL も確かめる（総点検 P2-1）。
+        let opcua = dir.parent().expect("data_dir_of が確かめた");
+        let opcua_security = ensure_dir_step(opcua, || create_protected(opcua))?;
+        for reason in parent_refusals(&opcua_security, &allowed) {
+            problems.push(format!("{}: {reason}", opcua.display()));
+        }
+        ensure_dir_step(&dir, || create_protected(&dir))?;
+        super::check_inside(data_dir, &dir)?;
+        // 固定の一覧だけを確かめ、中を辿らない（総点検 P1-1。モジュール doc）。
+        let own = dir.join("own");
+        let private = dir.join("private");
+        // 種類（フォルダかファイルか）の違いは banto-opcua が `Error::Pki` で断る。
+        for path in [
+            dir.clone(),
+            own.clone(),
+            private.clone(),
+            own.join("cert.der"),
+            private.join("private.pem"),
+        ] {
+            let Some(security) = acl::inspect_file(&path)
+                .map_err(|err| format!("{} の権限を読めません: {err}", path.display()))?
+            else {
+                // まだ無い（初回は banto-opcua が作る）。
+                continue;
+            };
+            for exposure in acl::exposure(&security) {
+                if let Some(reason) = refusal(&exposure, &allowed) {
+                    problems.push(format!("{}: {reason}", path.display()));
+                }
+            }
+        }
         if problems.is_empty() {
             Ok(())
         } else {
@@ -280,10 +343,11 @@ mod imp {
     /// `path` を辿らずに開いて確かめ（`inspect_file`）、無ければ `create` で作ってもう一度
     /// 確かめる。reparse point・フォルダでないものは断る（モジュール doc「親を辿らずに作る・
     /// 確かめる」）。
+    /// 確かめた記述子を返す。
     fn ensure_dir_step(
         path: &Path,
         create: impl FnOnce() -> Result<(), String>,
-    ) -> Result<(), String> {
+    ) -> Result<FileSecurity, String> {
         let inspect = || {
             acl::inspect_file(path)
                 .map_err(|err| format!("{} を確かめられません: {err}", path.display()))
@@ -305,11 +369,12 @@ mod imp {
         if !security.is_dir {
             return Err(format!("{} がフォルダではありません", path.display()));
         }
-        Ok(())
+        Ok(security)
     }
 
     /// profile のフォルダ自身の DACL で許可されている利用者のアカウント（モジュール doc の
-    /// 許可リストの 3）。読めなければ断る（許可リストを決められない）。
+    /// 許可リストの 3）。読めなければ断る（許可リストを決められない）。名前の解決はしない
+    /// （モジュール doc。総点検 P2-2）。
     fn profile_users(profile: &Path) -> Result<Vec<String>, String> {
         let fail = |reason: String| {
             format!(
@@ -325,18 +390,10 @@ mod imp {
                 "リンク（reparse point）か、フォルダではありません".to_owned(),
             ));
         }
-        Ok(profile_user_candidates(&security.dacl)
-            .into_iter()
-            .filter(|sid| {
-                InstallUserSid::parse(sid)
-                    .and_then(|sid| acl::check_user_account(&sid))
-                    .is_ok()
-            })
-            .collect())
+        Ok(profile_user_candidates(&security.dacl))
     }
 
-    /// profile の DACL から、許可リストの 3 の候補（利用者のアカウントかの確かめの前）を取る
-    /// 純関数: 普通の許可の ACE（条件付き・オブジェクトの許可は入れない）で、`INHERIT_ONLY`
+    /// profile の DACL から、許可リストの 3 を取る純関数（名前の解決はしない）: 普通の許可の ACE（条件付き・オブジェクトの許可は入れない）で、`INHERIT_ONLY`
     /// でなく、SID が利用者のアカウントの形（`S-1-5-21-…`・`S-1-12-1-…`）で、広いグループ
     /// （Domain Users など）でないもの。null DACL なら空。
     pub(super) fn profile_user_candidates(dacl: &ObservedDacl) -> Vec<String> {
@@ -353,42 +410,35 @@ mod imp {
         users
     }
 
-    /// `path` とその中を辿らずに確かめ、断る理由を `problems` に足す。
-    fn walk(
-        path: &Path,
-        depth: usize,
-        count: &mut usize,
-        allowed: &[String],
-        problems: &mut Vec<String>,
-    ) -> Result<(), String> {
-        *count += 1;
-        if *count > MAX_ENTRIES {
-            return Err(format!("中の物が多すぎます（{MAX_ENTRIES} を超えました）"));
-        }
-        let Some(security) = acl::inspect_file(path)
-            .map_err(|err| format!("{} の権限を読めません: {err}", path.display()))?
-        else {
-            // 確かめの間に消えた。
-            return Ok(());
-        };
-        for exposure in acl::exposure(&security) {
-            if let Some(reason) = refusal(&exposure, allowed) {
-                problems.push(format!("{}: {reason}", path.display()));
-            }
-        }
-        if security.is_dir && !security.is_reparse_point {
-            if depth >= MAX_DEPTH {
-                return Err(format!("{} の階層が深すぎます", path.display()));
-            }
-            let entries = std::fs::read_dir(path)
-                .map_err(|err| format!("{} の中を読めません: {err}", path.display()))?;
-            for entry in entries {
-                let entry =
-                    entry.map_err(|err| format!("{} の中を読めません: {err}", path.display()))?;
-                walk(&entry.path(), depth + 1, count, allowed, problems)?;
-            }
-        }
-        Ok(())
+    /// 親の `opcua` の記述子 `security` で断る理由（モジュール doc「親の `opcua`」。純関数）。
+    /// `allowed` は許可リストの 2・3。許可の ACE は、`INHERIT_ONLY` でなく、相手が許可リストの
+    /// 外で、[`PARENT_FORBIDDEN`] の権利を含むものだけを断る。ほかの理由は [`refusal`] と同じ。
+    pub(super) fn parent_refusals(security: &FileSecurity, allowed: &[String]) -> Vec<String> {
+        acl::exposure(security)
+            .iter()
+            .filter_map(|exposure| match exposure {
+                Exposure::AllowsOther {
+                    flags, mask, sid, ..
+                } => {
+                    if allowed.iter().any(|user| user == sid) || flags & INHERIT_ONLY_ACE != 0 {
+                        return None;
+                    }
+                    let rights: Vec<&str> = PARENT_FORBIDDEN
+                        .iter()
+                        .filter(|(bit, _)| mask & bit != 0)
+                        .map(|(_, name)| *name)
+                        .collect();
+                    (!rights.is_empty()).then(|| {
+                        format!(
+                            "{}へ、中の物を消せる・入れ替えられる許可の ACE があります（{}。mask {mask:#x}）",
+                            describe(sid),
+                            rights.join("・")
+                        )
+                    })
+                }
+                other => refusal(other, allowed),
+            })
+            .collect()
     }
 
     /// 相手の表示（広いグループなら名前つき）。
@@ -944,6 +994,175 @@ mod tests {
         prepare(&dir, Some(&profile)).expect("operation mode shape");
         // 後片付けのために書ける形へ戻す。
         acl::reset_dir_acl(&dir, &setting).expect("relax pki again");
+    }
+
+    /// 印のファイル（`close_tree` が木のすべてのフォルダに置く。SYSTEM・Administrators だけ、
+    /// 所有者 Administrators）と同じく、この利用者が `READ_CONTROL` でも開けないファイルが
+    /// `opcua`・`pki`・`own`・`private` にあっても、固定の一覧だけを確かめるので通る（総点検
+    /// P1-1）。管理者でない利用者は所有者を Administrators に移せないので、所有者は自分のまま
+    /// `OWNER RIGHTS`（`S-1-3-4`）の ACE で所有者の暗黙の権利を消し、`READ_CONTROL` を
+    /// 渡さない（消せるように DELETE だけ残す）。昇格した管理者では開けてしまい意味がないので
+    /// 走らせない。
+    #[cfg(windows)]
+    #[test]
+    fn unreadable_marker_files_in_the_tree_are_not_opened() {
+        const TEST: &str = "unreadable_marker_files_in_the_tree_are_not_opened";
+        if banto_service_elev::is_current_process_admin().unwrap_or(false) {
+            eprintln!(
+                "skip {TEST}: 昇格した管理者は印の形のファイルも開けるので、確かめにならない（昇格していない利用者で走らせる）"
+            );
+            return;
+        }
+        let root = crate::test_support::TempDir::new("opcua-pki-marker");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir, None).expect("fresh pki dir");
+        std::fs::create_dir_all(dir.join("own")).unwrap();
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        let markers: Vec<PathBuf> = [
+            dir.parent().unwrap().to_path_buf(),
+            dir.clone(),
+            dir.join("own"),
+            dir.join("private"),
+        ]
+        .iter()
+        .map(|folder| folder.join(".banto-safe-root"))
+        .collect();
+        for marker in &markers {
+            std::fs::write(marker, b"").unwrap();
+            icacls(
+                marker,
+                &[
+                    "/inheritance:r",
+                    "/grant:r",
+                    "*S-1-5-18:(F)",
+                    "*S-1-5-32-544:(F)",
+                    "*S-1-3-4:(DE,RA,S)",
+                ],
+            );
+            // 以前の再帰の確かめは、ここで断られていた。
+            assert!(
+                banto_safe_root::acl::inspect_file(marker).is_err(),
+                "印の形のファイルを開けてしまう（確かめにならない）: {}",
+                marker.display()
+            );
+        }
+        prepare(&dir, None).expect("marker files are not opened");
+        for marker in &markers {
+            std::fs::remove_file(marker).unwrap();
+        }
+    }
+
+    /// 親の `opcua` に、許可リストにない利用者（Guest）への削除（`D`）・子の削除（`DC`）の
+    /// 許可があれば断り、外すと通る（総点検 P2-1）。継承の既定の profile の形（Users への
+    /// 「読み取りと実行」と「作成」だけ）は通る。
+    #[cfg(windows)]
+    #[test]
+    fn a_delete_right_on_opcua_for_another_user_is_refused() {
+        let Some(guest) = local_guest() else {
+            eprintln!("skip: この PC ではテスト用の別の利用者（Guest）を解決できません");
+            return;
+        };
+        let root = crate::test_support::TempDir::new("opcua-pki-parent");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir, None).expect("fresh pki dir");
+        let opcua = dir.parent().unwrap();
+        for right in ["(D)", "(DC)"] {
+            icacls(opcua, &["/grant", &format!("*{guest}:{right}")]);
+            let reason = prepare(&dir, None).expect_err(right);
+            assert!(reason.contains(&guest), "{right}: {reason}");
+            assert!(reason.contains("opcua"), "{right}: {reason}");
+            icacls(opcua, &["/remove:g", &format!("*{guest}")]);
+            prepare(&dir, None).unwrap_or_else(|err| panic!("{right} removed: {err}"));
+        }
+        icacls(
+            opcua,
+            &[
+                "/grant",
+                "*S-1-5-32-545:(OI)(CI)(RX)",
+                "*S-1-5-32-545:(CI)(WD,AD,WEA,WA)",
+            ],
+        );
+        prepare(&dir, None).expect("Users can only read and create in opcua");
+    }
+
+    /// 親の `opcua` の判定（純関数）: 許可リストの外への削除・入れ替えの権利と汎用の
+    /// `GENERIC_ALL`・`GENERIC_WRITE` は断り、読む・作るだけ・継承専用・許可リストの中は通す。
+    /// 所有者が許可リストの外なら断る。
+    #[cfg(windows)]
+    #[test]
+    fn parent_refusals_allow_only_read_and_create_for_others() {
+        use banto_safe_root::acl::{self, FileSecurity, ObservedAce, ObservedDacl};
+        const OTHER: &str = "S-1-5-21-1-2-3-1001";
+        const ME: &str = "S-1-5-21-1-2-3-1002";
+        let allowed = [ME.to_owned()];
+        let security = |owner: &str, aces: Vec<(u8, u32, &str)>| FileSecurity {
+            is_dir: true,
+            is_reparse_point: false,
+            links: 1,
+            dacl: ObservedDacl {
+                protected: false,
+                owner: owner.to_owned(),
+                aces: Some(
+                    aces.into_iter()
+                        .map(|(flags, mask, sid)| ObservedAce {
+                            ace_type: acl::ACCESS_ALLOWED_ACE_TYPE,
+                            flags,
+                            mask,
+                            sid: sid.to_owned(),
+                        })
+                        .collect(),
+                ),
+            },
+        };
+        // 継承の既定の profile（ProgramData の下）の形。
+        let inherited = security(
+            ME,
+            vec![
+                (0x10, acl::FULL_ACCESS_MASK, acl::SYSTEM_SID),
+                (0x10, acl::FULL_ACCESS_MASK, acl::ADMINISTRATORS_SID),
+                (0x1b, 0x1000_0000, "S-1-3-0"),
+                (0x13, acl::READ_EXECUTE_ACCESS_MASK, "S-1-5-32-545"),
+                (0x12, 0x0000_0116, "S-1-5-32-545"),
+                (0x13, acl::MODIFY_ACCESS_MASK, ME),
+            ],
+        );
+        assert!(
+            imp::parent_refusals(&inherited, &allowed).is_empty(),
+            "{:?}",
+            imp::parent_refusals(&inherited, &allowed)
+        );
+        for (mask, name) in [
+            (0x0001_0000, "DELETE"),
+            (0x0000_0040, "FILE_DELETE_CHILD"),
+            (0x0004_0000, "WRITE_DAC"),
+            (0x0008_0000, "WRITE_OWNER"),
+            (0x1000_0000, "GENERIC_ALL"),
+            (0x4000_0000, "GENERIC_WRITE"),
+            (acl::MODIFY_ACCESS_MASK, "DELETE"),
+        ] {
+            for sid in [OTHER, "S-1-5-32-545"] {
+                let reasons =
+                    imp::parent_refusals(&security(ME, vec![(0x00, mask, sid)]), &allowed);
+                assert_eq!(reasons.len(), 1, "{mask:#x} {sid}: {reasons:?}");
+                assert!(
+                    reasons[0].contains(name) && reasons[0].contains(sid),
+                    "{reasons:?}"
+                );
+            }
+            // 許可リストの中・継承専用は通す。
+            assert!(
+                imp::parent_refusals(&security(ME, vec![(0x00, mask, ME)]), &allowed).is_empty()
+            );
+            assert!(
+                imp::parent_refusals(&security(ME, vec![(0x0b, mask, OTHER)]), &allowed).is_empty()
+            );
+        }
+        let reasons = imp::parent_refusals(&security(OTHER, vec![]), &allowed);
+        assert_eq!(reasons.len(), 1, "{reasons:?}");
+        assert!(reasons[0].contains("所有者"), "{reasons:?}");
+        assert!(
+            imp::parent_refusals(&security(acl::ADMINISTRATORS_SID, vec![]), &allowed).is_empty()
+        );
     }
 
     #[cfg(unix)]
