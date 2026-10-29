@@ -1769,8 +1769,10 @@ const QUEUED_MESSAGE: &str = "ロックダウン済みで収集中のため、�
 
 /// 構成操作の監査（設計 §3.3「全構成操作を audit_log に記録する」）- REST の
 /// `record_write`（`crate::rest`）と同じ `AuditEntry` の組み立て方だが、
-/// actor は bearer セッションの identity ではなく **API キー名**
-/// （`ctx.name`）、`actor_role` は固定文字列 `"api_key"`、`origin` は
+/// actor は bearer セッションの identity ではなく **API キーの
+/// 表記 `"{name}（{prefix}）"`**（[`ApiKeyContext::actor_label`]）。#713 で失効
+/// キーを削除すると同じ名前で再発行できるため、名前だけでは旧いキーと新しい
+/// キーの操作を区別できない。プレフィックスを付けて見分ける。`actor_role` は固定文字列 `"api_key"`、`origin` は
 /// `"mcp"`（REST は `"rest"`）。呼び出し元は実際に mutation が確定した後
 /// （直接コミット・pending queue 投入のいずれかの成功後）にのみ呼ぶこと -
 /// pending queue 投入も監査する点は意図的に REST と異なる（REST の
@@ -1793,7 +1795,7 @@ async fn audit_config_action(
     state
         .audit
         .record(AuditEntry {
-            actor_username: Some(ctx.name.as_str()),
+            actor_username: Some(ctx.actor_label().as_str()),
             actor_role: Some("api_key"),
             action,
             resource,
@@ -1883,7 +1885,7 @@ async fn tool_create_connection(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2026,7 +2028,7 @@ async fn tool_delete_connection(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2268,7 +2270,7 @@ async fn tool_update_connection(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2481,7 +2483,7 @@ async fn tool_create_group(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2609,7 +2611,7 @@ async fn tool_update_group(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2740,7 +2742,7 @@ async fn tool_delete_group(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -2908,7 +2910,7 @@ async fn tool_create_tag(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -3038,7 +3040,7 @@ async fn tool_update_tag(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -3211,7 +3213,7 @@ async fn tool_delete_tag(
                 &payload,
                 state.manager.configured_revision() as i64,
                 base_fingerprint.as_deref(),
-                Some(ctx.name.as_str()),
+                Some(ctx.actor_label().as_str()),
                 Some("api_key"),
             )
             .await
@@ -3384,7 +3386,7 @@ async fn tool_set_write_control(
     let action = if enabled { "enable" } else { "disable" };
     let follow_up = {
         let audit = state.audit.clone();
-        let key_name = ctx.name.clone();
+        let key_name = ctx.actor_label();
         move |change: WriteControlChange| async move {
             audit_write_control_outcome(&audit, &key_name, action, &change).await;
         }
@@ -3394,7 +3396,7 @@ async fn tool_set_write_control(
         .set_enabled_detached(
             &state.manager.pool(),
             enabled,
-            Some(ctx.name.as_str()),
+            Some(ctx.actor_label().as_str()),
             follow_up,
         )
         .await;
@@ -3413,7 +3415,7 @@ async fn tool_set_write_control(
 /// の `follow_up` として、停止・再開と同じ別タスクの中で呼ぶ。成功は
 /// [`audit_config_action`] と同じ形（`result: "ok"`）、失敗は `result:
 /// "failed"`（`crate::rest::record_write_control_failure` と同じ形）。actor は
-/// API キー名、`actor_role` は `"api_key"`、`origin` は `"mcp"`。
+/// API キーの表記（`name（prefix）`）、`actor_role` は `"api_key"`、`origin` は `"mcp"`。
 async fn audit_write_control_outcome(
     audit: &AuditLogService,
     key_name: &str,

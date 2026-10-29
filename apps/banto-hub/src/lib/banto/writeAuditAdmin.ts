@@ -19,6 +19,8 @@ export interface WriteAuditEntry {
 	ts: string;
 	apiKeyId: number;
 	apiKeyNameSnapshot: string;
+	/** #713: 書込み時点のプレフィックス（古い行は null）。 */
+	apiKeyPrefixSnapshot: string | null;
 	tagId: number;
 	externalNameSnapshot: string;
 	valueRequested: number | null;

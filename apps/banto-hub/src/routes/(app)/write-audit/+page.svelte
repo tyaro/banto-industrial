@@ -154,7 +154,10 @@
 					{#each rows as row (row.id)}
 						<tr class:alert-row={isAlertResult(row.result)} onclick={() => selectRow(row)}>
 							<td>{formatSqliteUtc(row.ts)}</td>
-							<td>{row.apiKeyNameSnapshot}</td>
+							<td
+								>{row.apiKeyNameSnapshot}{#if row.apiKeyPrefixSnapshot}
+									<small class="key-prefix">{row.apiKeyPrefixSnapshot}</small>{/if}</td
+							>
 							<td class="tag-name">{row.externalNameSnapshot}</td>
 							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
 							<td>{actionLabel(row.action)}</td>
@@ -178,7 +181,10 @@
 				<dt>時刻</dt>
 				<dd>{formatSqliteUtc(selected.ts)}</dd>
 				<dt>APIキー</dt>
-				<dd>{selected.apiKeyNameSnapshot}（ID: {selected.apiKeyId}）</dd>
+				<dd>
+					{selected.apiKeyNameSnapshot}{#if selected.apiKeyPrefixSnapshot}
+						<small class="key-prefix">{selected.apiKeyPrefixSnapshot}</small>{/if}（ID: {selected.apiKeyId}）
+				</dd>
 				<dt>タグ</dt>
 				<dd>{selected.externalNameSnapshot}（ID: {selected.tagId}）</dd>
 				<dt>要求値</dt>
@@ -197,6 +203,12 @@
 </div>
 
 <style>
+	.key-prefix {
+		color: var(--banto-text-muted, #6b7280);
+		font-family: monospace;
+		margin-left: 0.25rem;
+	}
+
 	.page {
 		display: flex;
 		flex-direction: column;

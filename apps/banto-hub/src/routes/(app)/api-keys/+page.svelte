@@ -60,6 +60,7 @@
 		listApiKeys,
 		createApiKey,
 		revokeApiKey,
+		deleteApiKey,
 		clearTripApiKey,
 		apiKeyWarnings,
 		describeApiKeyScope,
@@ -288,6 +289,29 @@
 		}
 	}
 
+	// --- delete (#713: 失効済みのキーだけ。名前を使い直せるようにする) ---
+	let deletingId: number | null = $state(null);
+
+	async function handleDelete(key: ApiKeySummary): Promise<void> {
+		if (
+			!window.confirm(
+				`失効済みの ${key.name}（${key.prefix}）を削除しますか？
+削除すると同じ名前で発行し直せます。書込み監査にはキーの名前とプレフィックスが残ります。`
+			)
+		)
+			return;
+		deletingId = key.id;
+		try {
+			await deleteApiKey(key.id);
+			toastStore.push('success', '削除しました');
+			await reload();
+		} catch (err) {
+			toastStore.push('error', errorMessage(err));
+		} finally {
+			deletingId = null;
+		}
+	}
+
 	// --- clear-trip (T2-4、設計 §6-4: レート制限ブレーカのトリップ解除) ---
 	let clearingTripId: number | null = $state(null);
 
@@ -482,6 +506,15 @@
 										disabled={revokingId === key.id}
 									>
 										失効
+									</button>
+								{:else}
+									<button
+										type="button"
+										class="danger"
+										onclick={() => handleDelete(key)}
+										disabled={deletingId === key.id}
+									>
+										削除
 									</button>
 								{/if}
 							</td>

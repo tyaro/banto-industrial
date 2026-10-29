@@ -1328,6 +1328,7 @@ pub(crate) mod tests {
         let ctx = ApiKeyContext {
             id: 1,
             name: "k".to_string(),
+            prefix: "kkkkkkkk".to_string(),
             scopes: vec!["read".to_string()],
             last_used_at_ms: None,
         };
