@@ -812,6 +812,7 @@ async fn routes_snapshot_matches() {
         crate::opcua::OpcUaPublisher::new(
             env.manager.clone(),
             std::env::temp_dir().join("banto-hub-routes-snapshot-opcua-pki-unused"),
+            None,
         ),
         audit.clone(),
         user_auth_state(users, audit),

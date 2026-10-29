@@ -42,7 +42,7 @@
 //! データの下の置き場（[`crate::opcua_pki::pki_dir`]）を渡す。鍵と証明書は初回だけ作り、
 //! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。
 //! - 本番の starter は、blocking 用のスレッドで**鍵を作る・読む前に**
-//!   [`crate::opcua_pki::prepare`] で置き場を用意して ACL を確かめ、広い ACE などで断られたら
+//!   [`crate::opcua_pki::prepare`] で置き場を用意して ACL を許可リストで確かめ、断られたら
 //!   起動しない（`failed` と理由）。
 //! - banto-opcua の `Error::Pki`（置き場・組を用意できない）も `failed` と理由（置き場と
 //!   再試行のしかたつき）にしてログに出す。原因を直したあと、同じ設定の保存が再試行になる
@@ -148,13 +148,19 @@ type Starter =
 /// 鍵と証明書の置き場（`config.pki_dir`）があれば、鍵を作る・読む前に
 /// [`crate::opcua_pki::prepare`] で用意して確かめ、断られたら起動しない
 /// （モジュール doc「鍵と証明書の置き場」）。
-fn real_starter() -> Starter {
-    Arc::new(|config| {
+///
+/// `profile_dir` は握った profile のフォルダ（本当のパス）。その DACL で許可されている
+/// 利用者も、置き場の許可リストに入る（[`crate::opcua_pki::prepare`]）。
+fn real_starter(profile_dir: Option<PathBuf>) -> Starter {
+    Arc::new(move |config| {
+        let profile_dir = profile_dir.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || start_blocking(&handle, config))
-                .await
-                .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
+            tokio::task::spawn_blocking(move || {
+                start_blocking(&handle, config, profile_dir.as_deref())
+            })
+            .await
+            .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
         })
     })
 }
@@ -163,12 +169,13 @@ fn real_starter() -> Starter {
 fn start_blocking(
     handle: &tokio::runtime::Handle,
     config: ServerConfig,
+    profile_dir: Option<&std::path::Path>,
 ) -> Result<RunningServer, String> {
     #[cfg(test)]
     start_gate::wait(config.port);
     let pki_dir = config.pki_dir.clone();
     if let Some(dir) = &pki_dir {
-        crate::opcua_pki::prepare(dir)?;
+        crate::opcua_pki::prepare(dir, profile_dir)?;
     }
     handle
         .block_on(OpcUaServer::start(config))
@@ -287,9 +294,15 @@ pub struct OpcUaPublisher {
 
 impl OpcUaPublisher {
     /// `pki_dir` は鍵と証明書の置き場（profile の保護されたデータの下。
-    /// [`crate::opcua_pki::pki_dir`]）。
-    pub fn new(manager: Arc<CollectorManager>, pki_dir: PathBuf) -> Arc<Self> {
-        Self::with_starter(manager, real_starter(), Some(pki_dir))
+    /// [`crate::opcua_pki::pki_dir`]）。`profile_dir` は握った profile のフォルダの本当の
+    /// パス（握っていなければ `None`）。その DACL で許可されている利用者も、置き場の
+    /// 許可リストに入る（[`crate::opcua_pki::prepare`]）。
+    pub fn new(
+        manager: Arc<CollectorManager>,
+        pki_dir: PathBuf,
+        profile_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_starter(manager, real_starter(profile_dir), Some(pki_dir))
     }
 
     fn with_starter(
@@ -713,7 +726,7 @@ mod tests {
                     .send(release_tx)
                     .expect("test receives start calls");
                 release_rx.await.expect("test releases the start")?;
-                real_starter()(config).await
+                real_starter(None)(config).await
             })
         });
         (publisher_with(starter).await, calls_rx)
@@ -995,7 +1008,7 @@ mod tests {
     async fn a_second_start_reuses_the_key_and_certificate() {
         let root = crate::test_support::TempDir::new("opcua-pki-reuse");
         let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
-        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let publisher = publisher_with_pki(real_starter(None), Some(pki.clone())).await;
         let port = free_port();
         let first_started = tokio::time::Instant::now();
         publisher.apply(&enabled(port)).await;
@@ -1025,10 +1038,10 @@ mod tests {
     async fn a_pki_error_is_reported_and_the_same_settings_retry_after_the_fix() {
         let root = crate::test_support::TempDir::new("opcua-pki-error");
         let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
-        crate::opcua_pki::prepare(&pki).expect("pki dir");
+        crate::opcua_pki::prepare(&pki, None).expect("pki dir");
         let blocker = pki.join("own").join("cert.der");
         std::fs::create_dir_all(blocker.join("blocker")).unwrap();
-        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let publisher = publisher_with_pki(real_starter(None), Some(pki.clone())).await;
         let settings = enabled(free_port());
         publisher.apply(&settings).await;
         let failed = wait_state(&publisher, OpcUaState::Failed).await;
@@ -1052,7 +1065,7 @@ mod tests {
     async fn a_broad_ace_on_the_pki_dir_fails_without_a_key_and_retries_after_the_fix() {
         let root = crate::test_support::TempDir::new("opcua-pki-broad-ace");
         let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
-        crate::opcua_pki::prepare(&pki).expect("pki dir");
+        crate::opcua_pki::prepare(&pki, None).expect("pki dir");
         let icacls = |args: &[&str]| {
             let output = std::process::Command::new("icacls")
                 .arg(&pki)
@@ -1062,7 +1075,7 @@ mod tests {
             assert!(output.status.success(), "icacls {args:?}: {output:?}");
         };
         icacls(&["/grant", "*S-1-5-32-545:(OI)(CI)(R)"]);
-        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let publisher = publisher_with_pki(real_starter(None), Some(pki.clone())).await;
         let settings = enabled(free_port());
         publisher.apply(&settings).await;
         let failed = wait_state(&publisher, OpcUaState::Failed).await;
