@@ -1677,15 +1677,13 @@ async fn tool_write_recipe(
         .collect();
     if !missing_scope.is_empty() {
         // #711: スコープが無かったエントリごとに書込み監査へ残す。
-        for tag in &missing_scope {
-            crate::write_path::record_missing_write_scope(
-                state.manager.as_ref(),
-                &state.write_audit,
-                ctx,
-                tag,
-            )
-            .await;
-        }
+        crate::write_path::record_missing_write_scopes(
+            state.manager.as_ref(),
+            &state.write_audit,
+            ctx,
+            &missing_scope,
+        )
+        .await;
         return Ok(tool_error(format!(
             "missing_write_scope: 次のタグへの write:{{tag}} スコープを持つ API キーが必要です: {}",
             missing_scope.join(", ")

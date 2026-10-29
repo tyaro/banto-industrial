@@ -199,7 +199,8 @@ use crate::computed::upsert_retained_value;
 use crate::controller::{CollectionController, CollectionState, RunMode};
 use crate::hub::CollectorManager;
 use crate::write_audit::{
-    WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService, WriteRejectionReason,
+    RejectionEntry, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
+    WriteRejectionReason,
 };
 use crate::write_control::WriteControl;
 use crate::write_rate::WriteRateLimiter;
@@ -850,19 +851,25 @@ async fn prepare_batch_entry(
 /// ([`WriteAuditService::record_rejection`])。監査の書込みに失敗しても
 /// 応答は変えない(ログのみ)。ほかの拒否理由(値の型・範囲・受付 off など)
 /// は対象外。
+fn gate_rejection_reason(rejection: &WriteRejection) -> Option<WriteRejectionReason> {
+    match rejection {
+        WriteRejection::NotFound => Some(WriteRejectionReason::NotFound),
+        WriteRejection::NotWritable => Some(WriteRejectionReason::NotWritable),
+        WriteRejection::TagDisabled => Some(WriteRejectionReason::TagDisabled),
+        _ => None,
+    }
+}
+
 async fn record_gate_rejection(
     deps: &WriteDeps<'_>,
     ctx: &ApiKeyContext,
     tag: &str,
     rejection: &WriteRejection,
 ) {
-    let reason = match rejection {
-        WriteRejection::NotFound => WriteRejectionReason::NotFound,
-        WriteRejection::NotWritable => WriteRejectionReason::NotWritable,
-        WriteRejection::TagDisabled => WriteRejectionReason::TagDisabled,
-        _ => return,
-    };
-    record_rejection_for(deps.manager, deps.write_audit, ctx, tag, reason).await;
+    if let Some(reason) = gate_rejection_reason(rejection) {
+        let entry = rejection_entry(deps.manager, ctx, tag, reason);
+        deps.write_audit.record_rejections(vec![entry]).await;
+    }
 }
 
 /// スコープ外(`missing_write_scope`)の拒否を残す。判定は各入口(REST・gRPC・
@@ -874,31 +881,50 @@ pub async fn record_missing_write_scope(
     ctx: &ApiKeyContext,
     tag: &str,
 ) {
-    record_rejection_for(
-        manager,
-        write_audit,
-        ctx,
-        tag,
-        WriteRejectionReason::MissingWriteScope,
-    )
-    .await;
+    record_missing_write_scopes(manager, write_audit, ctx, &[tag]).await;
 }
 
-async fn record_rejection_for(
+/// [`record_missing_write_scope`] のバッチ版。全件を 1 つのタスクで記録する
+/// (途中で切断されても残りが欠けない)。
+pub async fn record_missing_write_scopes<S: AsRef<str>>(
     manager: &CollectorManager,
     write_audit: &WriteAuditService,
     ctx: &ApiKeyContext,
+    tags: &[S],
+) {
+    let entries = tags
+        .iter()
+        .map(|tag| {
+            rejection_entry(
+                manager,
+                ctx,
+                tag.as_ref(),
+                WriteRejectionReason::MissingWriteScope,
+            )
+        })
+        .collect();
+    write_audit.record_rejections(entries).await;
+}
+
+fn rejection_entry(
+    manager: &CollectorManager,
+    ctx: &ApiKeyContext,
     tag: &str,
     reason: WriteRejectionReason,
-) {
+) -> RejectionEntry {
     let tag_id = manager
         .tag_map()
         .get(tag)
         .map(|entry| entry.ids.2)
         .unwrap_or(0);
-    write_audit
-        .record_rejection(ctx.id, &ctx.name, &ctx.prefix, tag_id, tag, reason)
-        .await;
+    RejectionEntry {
+        api_key_id: ctx.id,
+        api_key_name: ctx.name.clone(),
+        api_key_prefix: ctx.prefix.clone(),
+        tag_id,
+        external_name: tag.to_string(),
+        reason,
+    }
 }
 
 /// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
@@ -1239,13 +1265,18 @@ pub async fn execute_write_batch(
     // 2. 事前ゲート all-or-nothing: 全エントリを prepare_batch_entry
     // (resolve_write_target → convert_value)へ通す。
     let mut prepare_results = Vec::with_capacity(entries.len());
+    let mut rejected = Vec::new();
     for (tag, requested) in &entries {
         let prepared = prepare_batch_entry(deps, collection_mode, tag, requested.clone()).await;
         if let Err(rejection) = &prepared {
-            record_gate_rejection(deps, ctx, tag, rejection).await;
+            if let Some(reason) = gate_rejection_reason(rejection) {
+                rejected.push(rejection_entry(deps.manager, ctx, tag, reason));
+            }
         }
         prepare_results.push(prepared);
     }
+    // 拒否の監査は全件を 1 つのタスクで残す(切断で残りが欠けない。#945 のレビュー)。
+    deps.write_audit.record_rejections(rejected).await;
 
     if prepare_results.iter().any(Result::is_err) {
         // 1件でも NG なら実書き込みを一切しない - 書込みの監査行も broker 呼び出し

@@ -368,17 +368,20 @@ pub(super) async fn v1_write_values_batch(
     // REST 節): 1件でも write スコープが無ければ、どのエントリも
     // execute_write_batch へ進めず全体を 403 で拒否する。
     // #711: スコープが無かったエントリごとに書込み監査へ残す。
-    let mut scope_missing = false;
-    for w in body.writes.iter().filter(|w| !ctx.has_write_scope(&w.tag)) {
-        scope_missing = true;
-        crate::write_path::record_missing_write_scope(
-            state.manager.as_ref(),
-            &state.write_audit,
-            &ctx,
-            &w.tag,
-        )
-        .await;
-    }
+    let missing: Vec<&str> = body
+        .writes
+        .iter()
+        .filter(|w| !ctx.has_write_scope(&w.tag))
+        .map(|w| w.tag.as_str())
+        .collect();
+    let scope_missing = !missing.is_empty();
+    crate::write_path::record_missing_write_scopes(
+        state.manager.as_ref(),
+        &state.write_audit,
+        &ctx,
+        &missing,
+    )
+    .await;
     if scope_missing {
         return missing_write_scope_response();
     }

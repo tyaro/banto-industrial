@@ -335,6 +335,17 @@ fn rejection_detail(reason: WriteRejectionReason, count: u32) -> String {
     }
 }
 
+/// [`WriteAuditService::record_rejections`] に渡す拒否 1 件分。
+#[derive(Debug, Clone)]
+pub struct RejectionEntry {
+    pub api_key_id: i64,
+    pub api_key_name: String,
+    pub api_key_prefix: String,
+    pub tag_id: i64,
+    pub external_name: String,
+    pub reason: WriteRejectionReason,
+}
+
 /// 書き込み監査サービス(`crate::audit::AuditLogService` と同じ形の
 /// 薄いラッパー)。`Clone` は安価(`SqlitePool` は `Arc` バックド)。
 /// 拒否のまとめの記憶([`Self::record_rejection`])は複製の間で共有する。
@@ -355,6 +366,7 @@ impl WriteAuditService {
     /// #711: 定義上の拒否を `result = 'rejected'` で残す(窓の中の同じ
     /// (キー, タグ, 理由)は 1 行にまとめる)。時刻は [`Instant::now`]。
     /// 失敗は応答を変えないよう、エラーはログに残して握りつぶす。
+    /// 1 件だけの入口。複数件は [`Self::record_rejections`]。
     pub async fn record_rejection(
         &self,
         api_key_id: i64,
@@ -364,16 +376,43 @@ impl WriteAuditService {
         external_name: &str,
         reason: WriteRejectionReason,
     ) {
-        self.record_rejection_at(
-            Instant::now(),
+        self.record_rejections(vec![RejectionEntry {
             api_key_id,
-            api_key_name,
-            api_key_prefix,
+            api_key_name: api_key_name.to_string(),
+            api_key_prefix: api_key_prefix.to_string(),
             tag_id,
-            external_name,
+            external_name: external_name.to_string(),
             reason,
-        )
+        }])
         .await;
+    }
+
+    /// 複数の拒否を順に残す。全件を 1 つのタスクにまとめて走らせる。
+    /// クライアントの切断でハンドラの future が捨てられても、拒否の監査が
+    /// (mutex や DB 接続の待ちの途中で)欠けないよう、要求から切り離す
+    /// (#945 のレビュー。`rest/api_keys.rs` の `tokio::spawn` と同じ流儀)。
+    pub async fn record_rejections(&self, entries: Vec<RejectionEntry>) {
+        if entries.is_empty() {
+            return;
+        }
+        let svc = self.clone();
+        let handle = tokio::spawn(async move {
+            for e in entries {
+                svc.record_rejection_at(
+                    Instant::now(),
+                    e.api_key_id,
+                    &e.api_key_name,
+                    &e.api_key_prefix,
+                    e.tag_id,
+                    &e.external_name,
+                    e.reason,
+                )
+                .await;
+            }
+        });
+        if let Err(err) = handle.await {
+            eprintln!("banto-hub: 書き込み監査(rejected)のタスクが異常終了しました: {err}");
+        }
     }
 
     /// [`Self::record_rejection`] の時刻を注入できる形(試験用)。
