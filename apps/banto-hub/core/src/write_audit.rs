@@ -79,6 +79,32 @@
 //! 拒否かは数えない)。ワーカーは最初に使うときに呼んだ側のランタイムで起動する。
 //! 監査の書込みに失敗しても応答は変えず、ワーカーがログ(`eprintln!`)に残す。
 //!
+//! **送る前のまとめとキューの予算**(#945 のレビュー: 大きなバッチの拒否で、
+//! キューがメモリを抱えないように):
+//!
+//! - 送る前に、同じ(キー, 外部名, 理由)を件数つきの 1 エントリにまとめる。ワーカーは
+//!   件数ぶんを一度に数える(DB の操作は 1 エントリにつき 1 回)。同じタグを 10 万件
+//!   並べたバッチも 1 エントリ・1 回の UPDATE になる。
+//! - 1 メッセージの別々のエントリは [`REJECTION_MESSAGE_MAX_TAGS`](32)まで。超えた分は
+//!   (キー, 理由)ごとのまとめのエントリ(まとめの行に数える)にし、まとめのエントリも
+//!   [`REJECTION_MESSAGE_MAX_SUMMARIES`](32)までで、超えた件数はあふれに足す。上限が
+//!   キーごとの行の上限より大きいので、1 キーの要求ならワーカーの結果はほぼ変わらない
+//!   (窓の中ですでに行のあるタグ名が 33 番目以降に来たときだけ、まとめの行に数える)。
+//! - 外部名とキー名は [`REJECTION_NAME_MAX_CHARS`](256 文字)までに切り詰め、末尾を
+//!   `…` にして監査に残す。先頭が同じ長い名前どうしは、切り詰めた後で同じ組として
+//!   数えうる。
+//! - キュー全体で抱える(まとめた後の)エントリは [`REJECTION_QUEUE_MAX_ENTRIES`]
+//!   (16384)まで。送るときに足し、ワーカーが処理したら引く。超えるメッセージは送らず、
+//!   件数をあふれに足す。
+//!
+//! **メモリの見積もり**: 1 エントリの構造体は 128 バイト以下(試験で確かめる。いまは
+//! およそ 80 バイト)、外部名は 256 文字(UTF-8 で最大 1023 バイト)まで、キー名と
+//! プレフィックスはメッセージの中でキーごとに共有する。キューが抱えるのは、最悪でも
+//! 16384 × (128 + 1023) バイト ≒ 19 MB に、メッセージ(4096 まで)ごとのキー名・
+//! プレフィックス(各 1023 バイトまで)の約 8 MB を足した、およそ 27 MB。ASCII の
+//! 短い名前なら数 MB。まとめる前の拒否の `Vec` は要求ごとの一時のもので、要求の
+//! 本文の上限(REST のバッチは axum の既定の 2 MB)で抑えられる。
+//!
 //! **終了時**: 正常な終了では、`RunningHub::shutdown_and_report` が書込みの入口を
 //! 止めたあと、設定 DB の pool を閉じる前に [`WriteAuditService::flush`] でキューを
 //! 書き切る(上限 `WRITE_AUDIT_FLUSH_TIMEOUT` = 5 秒。超えたらログに出して先へ進む)。
@@ -97,7 +123,7 @@
 //! `rule_name_snapshot` と同じ設計判断)。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -321,6 +347,30 @@ pub const REJECTION_ROWS_PER_KEY: usize = 20;
 /// バッチの拒否は 1 メッセージ)。一杯のときは捨てて、あふれの件数を数える。
 pub const REJECTION_QUEUE_CAPACITY: usize = 4096;
 
+/// #945 のレビュー: キュー全体で抱える(まとめた後の)エントリの予算。送るときに
+/// 足し、ワーカーが処理したら引く。超えるメッセージは送らず、件数をあふれに足す。
+/// 抱えるメモリの見積もりはモジュールの doc comment の「背景のキュー」。
+pub const REJECTION_QUEUE_MAX_ENTRIES: usize = 16384;
+
+/// #945 のレビュー: 1 つのメッセージに入れる、別々の(キー, 外部名, 理由)の
+/// エントリの上限。超えた分は(キー, 理由)ごとのまとめのエントリ
+/// (`RejectionTarget::OtherTags`)の件数にする。キーごとの行の上限
+/// ([`REJECTION_ROWS_PER_KEY`])より大きいので、1 つのキーの要求ならワーカーの結果は
+/// 変わらない(窓の中ですでに行のあるタグ名が 33 番目以降に来たときだけ、その行では
+/// なくまとめの行に数える)。
+pub const REJECTION_MESSAGE_MAX_TAGS: usize = 32;
+
+/// #945 のレビュー: 1 つのメッセージに入れる、まとめのエントリ((キー, 理由)ごと)の
+/// 上限。超えた分はあふれの件数に足す(呼び出しは要求ごとに 1 つのキーなので、
+/// ふつうは理由の数(4)を超えない)。
+pub const REJECTION_MESSAGE_MAX_SUMMARIES: usize = 32;
+
+/// #945 のレビュー: キューに抱える外部名・キー名の長さの上限(文字数)。超えた名前は
+/// 先頭の `上限 - 1` 文字に `…` を付けて切り詰め、監査にもその形で残す。切り詰めた
+/// 名前どうしは、まとめのキーとして同じ組になりうる(先頭が同じ長い名前は 1 行に
+/// 数える)。
+pub const REJECTION_NAME_MAX_CHARS: usize = 256;
+
 /// まとめの行・あふれの行の外部名。
 pub const REJECTION_SUMMARY_NAME: &str = "*";
 
@@ -407,6 +457,104 @@ pub struct RejectionEntry {
     pub reason: WriteRejectionReason,
 }
 
+/// #945 のレビュー: キューに入れる、まとめた後のエントリ。同じ
+/// (キー, 外部名, 理由)を `count` 件にまとめ、キー名とプレフィックスはキーごとに
+/// 共有する。
+#[derive(Debug, Clone)]
+struct QueuedRejection {
+    api_key_id: i64,
+    api_key_name: Arc<str>,
+    api_key_prefix: Arc<str>,
+    tag_id: i64,
+    target: RejectionTarget,
+    reason: WriteRejectionReason,
+    count: u32,
+}
+
+/// 名前を [`REJECTION_NAME_MAX_CHARS`] 文字までに切り詰める(超えたら末尾を `…`)。
+fn truncate_name(mut s: String) -> String {
+    if s.char_indices().nth(REJECTION_NAME_MAX_CHARS).is_some() {
+        let keep = s
+            .char_indices()
+            .nth(REJECTION_NAME_MAX_CHARS - 1)
+            .map_or(s.len(), |(i, _)| i);
+        s.truncate(keep);
+        s.push('…');
+    }
+    s
+}
+
+/// #945 のレビュー: 送る前のまとめ。同じ(キー, 外部名, 理由)を 1 件にまとめ、
+/// 別々のエントリは [`REJECTION_MESSAGE_MAX_TAGS`] まで、超えた分は(キー, 理由)ごとの
+/// まとめのエントリ([`REJECTION_MESSAGE_MAX_SUMMARIES`] まで)に数える。それも超えた
+/// 件数は 2 つ目の値で返す(あふれに足す)。
+fn coalesce_rejections(entries: Vec<RejectionEntry>) -> (Vec<QueuedRejection>, u64) {
+    let mut out: Vec<QueuedRejection> = Vec::new();
+    let mut tag_index: HashMap<(i64, WriteRejectionReason, String), usize> = HashMap::new();
+    let mut summary_index: HashMap<(i64, WriteRejectionReason), usize> = HashMap::new();
+    let mut names: HashMap<i64, (Arc<str>, Arc<str>)> = HashMap::new();
+    let mut tags = 0usize;
+    let mut dropped: u64 = 0;
+    for e in entries {
+        let reason = e.reason;
+        let key_id = e.api_key_id;
+        let k = (key_id, reason, truncate_name(e.external_name));
+        if let Some(&i) = tag_index.get(&k) {
+            out[i].count = out[i].count.saturating_add(1);
+            continue;
+        }
+        if tags >= REJECTION_MESSAGE_MAX_TAGS {
+            if let Some(&i) = summary_index.get(&(key_id, reason)) {
+                out[i].count = out[i].count.saturating_add(1);
+                continue;
+            }
+            if summary_index.len() >= REJECTION_MESSAGE_MAX_SUMMARIES {
+                dropped += 1;
+                continue;
+            }
+        }
+        let (name, prefix) = names
+            .entry(key_id)
+            .or_insert_with(|| {
+                (
+                    Arc::from(truncate_name(e.api_key_name)),
+                    Arc::from(truncate_name(e.api_key_prefix)),
+                )
+            })
+            .clone();
+        let i = out.len();
+        if tags < REJECTION_MESSAGE_MAX_TAGS {
+            out.push(QueuedRejection {
+                api_key_id: key_id,
+                api_key_name: name,
+                api_key_prefix: prefix,
+                tag_id: e.tag_id,
+                target: RejectionTarget::Tag(k.2.clone()),
+                reason,
+                count: 1,
+            });
+            tag_index.insert(k, i);
+            tags += 1;
+        } else {
+            out.push(QueuedRejection {
+                api_key_id: key_id,
+                api_key_name: name,
+                api_key_prefix: prefix,
+                tag_id: 0,
+                target: RejectionTarget::OtherTags,
+                reason,
+                count: 1,
+            });
+            summary_index.insert((key_id, reason), i);
+        }
+    }
+    (out, dropped)
+}
+
+fn queued_total(entries: &[QueuedRejection]) -> u64 {
+    entries.iter().map(|e| u64::from(e.count)).sum()
+}
+
 /// 完結した 1 行を挿入して新しい `id` を返す。
 async fn insert_row_in(pool: &SqlitePool, row: &WriteAuditRow) -> Result<i64, BantoError> {
     let id: i64 = sqlx::query_scalar(
@@ -451,9 +599,9 @@ impl RejectionWorker {
         }
     }
 
-    /// 窓の中なら件数を足して UPDATE する。窓が無い・明けたなら `false`(明けた
-    /// 組は記憶から消す)。
-    async fn bump(&mut self, key: &RejectionKey, now: Instant) -> bool {
+    /// 窓の中なら件数(`add`)を足して UPDATE する(件数がいくつでも 1 回)。窓が無い・
+    /// 明けたなら `false`(明けた組は記憶から消す)。
+    async fn bump(&mut self, key: &RejectionKey, now: Instant, add: u32) -> bool {
         let Some(w) = self.windows.get_mut(key) else {
             return false;
         };
@@ -462,7 +610,7 @@ impl RejectionWorker {
             self.windows.remove(key);
             return false;
         }
-        w.count = w.count.saturating_add(1);
+        w.count = w.count.saturating_add(add);
         let reason = key.2;
         let detail = match key.1 {
             RejectionTarget::Tag(_) => rejection_detail(reason, w.count),
@@ -483,8 +631,15 @@ impl RejectionWorker {
     }
 
     /// 新しい窓の最初の行を挿入して記憶する。挿入に失敗した組は記憶に残さない
-    /// (次の拒否で挿入をやり直す)。成功したら `true`。
-    async fn insert_first(&mut self, key: RejectionKey, now: Instant, row: WriteAuditRow) -> bool {
+    /// (次の拒否で挿入をやり直す)。成功したら `true`。`count` は行の `detail` に
+    /// 書いた件数。
+    async fn insert_first(
+        &mut self,
+        key: RejectionKey,
+        now: Instant,
+        row: WriteAuditRow,
+        count: u32,
+    ) -> bool {
         match insert_row_in(&self.pool, &row).await {
             Ok(row_id) => {
                 make_room(&mut self.windows, now, |w| w.start);
@@ -493,7 +648,7 @@ impl RejectionWorker {
                     RejectionWindow {
                         start: now,
                         row_id,
-                        count: 1,
+                        count,
                     },
                 );
                 true
@@ -508,68 +663,69 @@ impl RejectionWorker {
         }
     }
 
-    /// 拒否 1 件を残す(時刻を注入できる形。試験はこれを直接呼ぶ)。
-    async fn record_at(&mut self, now: Instant, e: &RejectionEntry) {
-        let tag_key: RejectionKey = (
-            e.api_key_id,
-            RejectionTarget::Tag(e.external_name.clone()),
-            e.reason,
-        );
-        if self.bump(&tag_key, now).await {
-            return;
-        }
-        // 新しい行が要る。キーごとの予算の中ならタグごとの行にする。
-        let budget = self.budgets.get(&e.api_key_id);
-        let fresh =
-            budget.is_none_or(|b| now.saturating_duration_since(b.start) >= REJECTION_WINDOW);
-        let used = if fresh {
-            0
-        } else {
-            budget.map_or(0, |b| b.rows)
-        };
-        if used < REJECTION_ROWS_PER_KEY {
-            let row = WriteAuditRow::new(
-                e.api_key_id,
-                e.api_key_name.as_str(),
-                e.api_key_prefix.as_str(),
-                e.tag_id,
-                e.external_name.as_str(),
-                WriteAuditAction::Write,
-                WriteAuditResult::Rejected,
-            )
-            .with_detail(e.reason.as_str());
-            if self.insert_first(tag_key, now, row).await {
-                if fresh {
-                    make_room(&mut self.budgets, now, |b| b.start);
-                    self.budgets.insert(
-                        e.api_key_id,
-                        KeyBudget {
-                            start: now,
-                            rows: 1,
-                        },
-                    );
-                } else if let Some(b) = self.budgets.get_mut(&e.api_key_id) {
-                    b.rows += 1;
-                }
+    /// まとめたエントリ 1 件(`count` 件の拒否)を残す(時刻を注入できる形。試験は
+    /// これを直接呼ぶ)。件数がいくつでも、DB の操作は 1 回(UPDATE か INSERT)。
+    async fn record_at(&mut self, now: Instant, e: &QueuedRejection) {
+        let count = e.count.max(1);
+        if let RejectionTarget::Tag(name) = &e.target {
+            let tag_key: RejectionKey = (e.api_key_id, e.target.clone(), e.reason);
+            if self.bump(&tag_key, now, count).await {
+                return;
             }
-            return;
+            // 新しい行が要る。キーごとの予算の中ならタグごとの行にする。
+            let budget = self.budgets.get(&e.api_key_id);
+            let fresh =
+                budget.is_none_or(|b| now.saturating_duration_since(b.start) >= REJECTION_WINDOW);
+            let used = if fresh {
+                0
+            } else {
+                budget.map_or(0, |b| b.rows)
+            };
+            if used < REJECTION_ROWS_PER_KEY {
+                let row = WriteAuditRow::new(
+                    e.api_key_id,
+                    &*e.api_key_name,
+                    &*e.api_key_prefix,
+                    e.tag_id,
+                    name.as_str(),
+                    WriteAuditAction::Write,
+                    WriteAuditResult::Rejected,
+                )
+                .with_detail(rejection_detail(e.reason, count));
+                if self.insert_first(tag_key, now, row, count).await {
+                    if fresh {
+                        make_room(&mut self.budgets, now, |b| b.start);
+                        self.budgets.insert(
+                            e.api_key_id,
+                            KeyBudget {
+                                start: now,
+                                rows: 1,
+                            },
+                        );
+                    } else if let Some(b) = self.budgets.get_mut(&e.api_key_id) {
+                        b.rows += 1;
+                    }
+                }
+                return;
+            }
         }
-        // 予算を超えた: キーと理由ごとのまとめの行に数える。
+        // 予算を超えた(または送る前にまとめのエントリになった): キーと理由ごとの
+        // まとめの行に数える。
         let summary_key: RejectionKey = (e.api_key_id, RejectionTarget::OtherTags, e.reason);
-        if self.bump(&summary_key, now).await {
+        if self.bump(&summary_key, now, count).await {
             return;
         }
         let row = WriteAuditRow::new(
             e.api_key_id,
-            e.api_key_name.as_str(),
-            e.api_key_prefix.as_str(),
+            &*e.api_key_name,
+            &*e.api_key_prefix,
             0,
             REJECTION_SUMMARY_NAME,
             WriteAuditAction::Write,
             WriteAuditResult::Rejected,
         )
-        .with_detail(rejection_summary_detail(e.reason, 1));
-        self.insert_first(summary_key, now, row).await;
+        .with_detail(rejection_summary_detail(e.reason, count));
+        self.insert_first(summary_key, now, row, count).await;
     }
 
     /// キューのあふれの件数があれば、まとめの行として 1 行残して 0 に戻す。
@@ -599,8 +755,8 @@ impl RejectionWorker {
 }
 
 enum RejectionMsg {
-    /// 受け取った時刻(キューで待った分は窓をずらさない)と拒否。
-    Rejections(Instant, Vec<RejectionEntry>),
+    /// 受け取った時刻(キューで待った分は窓をずらさない)と、まとめた後の拒否。
+    Rejections(Instant, Vec<QueuedRejection>),
     /// それより前に渡した分を書き終えたら応答する。
     Flush(tokio::sync::oneshot::Sender<()>),
 }
@@ -610,6 +766,7 @@ enum RejectionMsg {
 struct QueueDrain {
     rx: mpsc::Receiver<RejectionMsg>,
     overflow: Arc<AtomicU64>,
+    pending: Arc<AtomicUsize>,
 }
 
 impl Drop for QueueDrain {
@@ -617,7 +774,8 @@ impl Drop for QueueDrain {
         let mut left: u64 = self.overflow.swap(0, Ordering::Relaxed);
         while let Ok(msg) = self.rx.try_recv() {
             if let RejectionMsg::Rejections(_, entries) = msg {
-                left += entries.len() as u64;
+                left += queued_total(&entries);
+                self.pending.fetch_sub(entries.len(), Ordering::Relaxed);
             }
         }
         if left > 0 {
@@ -634,6 +792,8 @@ async fn run_rejection_worker(mut worker: RejectionWorker, mut q: QueueDrain) {
                 for e in &entries {
                     worker.record_at(at, e).await;
                 }
+                // 処理し終えたので予算を返す。
+                q.pending.fetch_sub(entries.len(), Ordering::Relaxed);
             }
             RejectionMsg::Flush(ack) => {
                 let _ = ack.send(());
@@ -651,8 +811,12 @@ async fn run_rejection_worker(mut worker: RejectionWorker, mut q: QueueDrain) {
 struct RejectionQueue {
     pool: SqlitePool,
     capacity: usize,
+    /// 抱えてよい(まとめた後の)エントリの数([`REJECTION_QUEUE_MAX_ENTRIES`])。
+    max_entries: usize,
     tx: OnceLock<mpsc::Sender<RejectionMsg>>,
     overflow: Arc<AtomicU64>,
+    /// いまキューに抱えている(まだ処理し終えていない)エントリの数。
+    pending: Arc<AtomicUsize>,
 }
 
 impl RejectionQueue {
@@ -670,10 +834,20 @@ impl RejectionQueue {
             let drain = QueueDrain {
                 rx,
                 overflow: self.overflow.clone(),
+                pending: self.pending.clone(),
             };
             handle.spawn(run_rejection_worker(worker, drain));
             tx
         }))
+    }
+
+    /// エントリの予算を `n` だけ取る。予算を超えるなら取らずに `false`。
+    fn reserve(&self, n: usize) -> bool {
+        self.pending
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                cur.checked_add(n).filter(|&next| next <= self.max_entries)
+            })
+            .is_ok()
     }
 }
 
@@ -688,16 +862,22 @@ pub struct WriteAuditService {
 
 impl WriteAuditService {
     pub fn new(pool: SqlitePool) -> Self {
-        Self::with_rejection_queue_capacity(pool, REJECTION_QUEUE_CAPACITY)
+        Self::with_rejection_queue_limits(
+            pool,
+            REJECTION_QUEUE_CAPACITY,
+            REJECTION_QUEUE_MAX_ENTRIES,
+        )
     }
 
-    fn with_rejection_queue_capacity(pool: SqlitePool, capacity: usize) -> Self {
+    fn with_rejection_queue_limits(pool: SqlitePool, capacity: usize, max_entries: usize) -> Self {
         Self {
             rejections: Arc::new(RejectionQueue {
                 pool: pool.clone(),
                 capacity,
+                max_entries,
                 tx: OnceLock::new(),
                 overflow: Arc::new(AtomicU64::new(0)),
+                pending: Arc::new(AtomicUsize::new(0)),
             }),
             pool,
         }
@@ -727,22 +907,44 @@ impl WriteAuditService {
 
     /// 複数の拒否を背景のワーカーへ渡して、**DB を待たずにすぐ返す**(#945 の
     /// レビュー: 403・404 を監査の DB の待ちで遅らせない)。同期の `try_send` なので、
-    /// 要求の future が捨てられても、渡し終えたものは失われない。キューが一杯
-    /// ([`REJECTION_QUEUE_CAPACITY`])なら捨てて、あふれの件数に足す(ワーカーが
-    /// 次に書くときに `queue_overflow` の行として残す)。記録の失敗はワーカーが
-    /// ログに残す。
+    /// 要求の future が捨てられても、渡し終えたものは失われない。
+    ///
+    /// 送る前に、同じ(キー, 外部名, 理由)を件数つきの 1 件にまとめ、別々のエントリを
+    /// [`REJECTION_MESSAGE_MAX_TAGS`] まで、超えた分を(キー, 理由)ごとのまとめに
+    /// する(名前は [`REJECTION_NAME_MAX_CHARS`] 文字まで)。キューが一杯
+    /// ([`REJECTION_QUEUE_CAPACITY`] メッセージ)か、抱えるエントリが予算
+    /// ([`REJECTION_QUEUE_MAX_ENTRIES`])を超えるなら送らずに、件数をあふれに足す
+    /// (ワーカーが次に書くときに `queue_overflow` の行として残す)。記録の失敗は
+    /// ワーカーがログに残す。
     pub fn record_rejections(&self, entries: Vec<RejectionEntry>) {
         if entries.is_empty() {
             return;
         }
-        let n = entries.len() as u64;
         let Some(tx) = self.rejections.sender() else {
             return;
         };
+        let (queued, dropped) = coalesce_rejections(entries);
+        if dropped > 0 {
+            self.rejections
+                .overflow
+                .fetch_add(dropped, Ordering::Relaxed);
+        }
+        if queued.is_empty() {
+            return;
+        }
+        let n_entries = queued.len();
+        let n = queued_total(&queued);
+        if !self.rejections.reserve(n_entries) {
+            self.rejections.overflow.fetch_add(n, Ordering::Relaxed);
+            return;
+        }
         if tx
-            .try_send(RejectionMsg::Rejections(Instant::now(), entries))
+            .try_send(RejectionMsg::Rejections(Instant::now(), queued))
             .is_err()
         {
+            self.rejections
+                .pending
+                .fetch_sub(n_entries, Ordering::Relaxed);
             self.rejections.overflow.fetch_add(n, Ordering::Relaxed);
         }
     }
@@ -1131,7 +1333,8 @@ mod rejection_tests {
                 external_name: external_name.to_string(),
                 reason,
             };
-            self.w.record_at(now, &e).await;
+            let (queued, _) = coalesce_rejections(vec![e]);
+            self.w.record_at(now, &queued[0]).await;
         }
     }
 
@@ -1357,7 +1560,8 @@ mod rejection_tests {
     #[tokio::test]
     async fn queue_overflow_is_left_as_a_summary_row() {
         let pool = migrate_memory().await.expect("migrate_memory");
-        let svc = WriteAuditService::with_rejection_queue_capacity(pool, 2);
+        let svc =
+            WriteAuditService::with_rejection_queue_limits(pool, 2, REJECTION_QUEUE_MAX_ENTRIES);
         let r = WriteRejectionReason::NotWritable;
         // ワーカーが走る前に容量 2 を超えて渡す: 2 件はキューへ、3 件はあふれ。
         for i in 0..5 {
@@ -1378,5 +1582,182 @@ mod rejection_tests {
         // 件数は 0 に戻っている(次の flush で行が増えない)。
         svc.flush().await;
         assert_eq!(rows(&svc).await.len(), 3);
+    }
+
+    fn entry(name: &str, reason: WriteRejectionReason) -> RejectionEntry {
+        RejectionEntry {
+            api_key_id: 1,
+            api_key_name: "k".into(),
+            api_key_prefix: "bk_k".into(),
+            tag_id: 0,
+            external_name: name.into(),
+            reason,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_same_tag_100k_times_is_one_entry_and_one_row() {
+        let r = WriteRejectionReason::MissingWriteScope;
+        let entries = vec![entry("x", r); 100_000];
+        // 送る前に 1 エントリ(件数 10 万)にまとまる。
+        let (queued, dropped) = coalesce_rejections(entries.clone());
+        assert_eq!(dropped, 0);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].count, 100_000);
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = WriteAuditService::new(pool);
+        svc.record_rejections(entries);
+        svc.flush().await;
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("missing_write_scope（60 秒の窓で計 100000 件）")
+        );
+        assert_eq!(svc.rejections.pending.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_batch_of_1000_tag_names_is_capped_per_message() {
+        let r = WriteRejectionReason::MissingWriteScope;
+        let entries: Vec<_> = (0..1000).map(|i| entry(&format!("t{i}"), r)).collect();
+        let (queued, dropped) = coalesce_rejections(entries.clone());
+        assert_eq!(dropped, 0);
+        assert_eq!(queued.len(), REJECTION_MESSAGE_MAX_TAGS + 1);
+        let summary: Vec<_> = queued
+            .iter()
+            .filter(|q| q.target == RejectionTarget::OtherTags)
+            .collect();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].count as usize, 1000 - REJECTION_MESSAGE_MAX_TAGS);
+        assert_eq!(queued_total(&queued), 1000);
+
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = WriteAuditService::new(pool);
+        svc.record_rejections(entries);
+        svc.flush().await;
+        let got = rows(&svc).await;
+        // キーごとの行の上限 + まとめの行 1 つ。
+        assert_eq!(got.len(), REJECTION_ROWS_PER_KEY + 1);
+        let over = 1000 - REJECTION_ROWS_PER_KEY;
+        let summary_row: Vec<_> = got
+            .iter()
+            .filter(|e| e.external_name_snapshot == REJECTION_SUMMARY_NAME)
+            .collect();
+        assert_eq!(summary_row.len(), 1);
+        assert_eq!(
+            summary_row[0].detail.clone().unwrap(),
+            format!("missing_write_scope（60 秒の窓で、上限を超えたほかのタグ名で計 {over} 件）")
+        );
+        // タグごとの行は 1 件ずつ: 合計は 1000 件。
+        let tag_rows = got
+            .iter()
+            .filter(|e| e.detail.as_deref() == Some("missing_write_scope"))
+            .count();
+        assert_eq!(tag_rows + over, 1000);
+    }
+
+    #[tokio::test]
+    async fn summaries_beyond_the_cap_go_to_the_overflow() {
+        // 多数のキー(呼び出しはふつう 1 キーだが)の、まとめのエントリの上限。
+        let r = WriteRejectionReason::NotFound;
+        let mut entries: Vec<_> = (0..REJECTION_MESSAGE_MAX_TAGS)
+            .map(|i| entry(&format!("t{i}"), r))
+            .collect();
+        for key in 0..(REJECTION_MESSAGE_MAX_SUMMARIES as i64 + 3) {
+            let mut e = entry("other", r);
+            e.api_key_id = 100 + key;
+            entries.push(e.clone());
+            entries.push(e);
+        }
+        let (queued, dropped) = coalesce_rejections(entries);
+        assert_eq!(
+            queued.len(),
+            REJECTION_MESSAGE_MAX_TAGS + REJECTION_MESSAGE_MAX_SUMMARIES
+        );
+        assert_eq!(dropped, 6);
+    }
+
+    #[tokio::test]
+    async fn a_message_over_the_queue_budget_is_not_sent_and_counted_as_overflow() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let budget = REJECTION_MESSAGE_MAX_TAGS + 8;
+        let svc =
+            WriteAuditService::with_rejection_queue_limits(pool, REJECTION_QUEUE_CAPACITY, budget);
+        let r = WriteRejectionReason::NotWritable;
+        // ワーカーが走る前に渡す(同期の呼び出しで await しない)。
+        // 1 つ目: 32 エントリ + まとめ 1 = 33 エントリ(予算 40 の中)。
+        let first: Vec<_> = (0..100).map(|i| entry(&format!("a{i}"), r)).collect();
+        svc.record_rejections(first);
+        assert_eq!(
+            svc.rejections.pending.load(Ordering::Relaxed),
+            REJECTION_MESSAGE_MAX_TAGS + 1
+        );
+        // 2 つ目: 10 エントリ(計 43 で予算を超える)は送らず、10 件をあふれに。
+        let second: Vec<_> = (0..10).map(|i| entry(&format!("b{i}"), r)).collect();
+        svc.record_rejections(second);
+        assert_eq!(svc.rejections.overflow.load(Ordering::Relaxed), 10);
+        assert_eq!(
+            svc.rejections.pending.load(Ordering::Relaxed),
+            REJECTION_MESSAGE_MAX_TAGS + 1
+        );
+        svc.flush().await;
+        assert_eq!(svc.rejections.pending.load(Ordering::Relaxed), 0);
+        let got = rows(&svc).await;
+        assert!(got
+            .iter()
+            .all(|e| !e.external_name_snapshot.starts_with('b')));
+        let overflow: Vec<_> = got
+            .iter()
+            .filter(|e| e.detail.as_deref() == Some("queue_overflow（10 件を記録できなかった）"))
+            .collect();
+        assert_eq!(overflow.len(), 1);
+        // 1 つ目は記録されている(タグごとの行 + まとめの行)。
+        assert_eq!(got.len(), REJECTION_ROWS_PER_KEY + 1 + 1);
+        // 予算が戻ったので、次は送れる(キーの行の上限を超えているので、まとめの行に
+        // 数える: 100 - 20 = 80 件 + 1 件)。
+        svc.record_rejection(1, "k", "bk_k", 0, "c", r);
+        svc.flush().await;
+        let summary = rows(&svc)
+            .await
+            .into_iter()
+            .find(|e| e.api_key_id == 1 && e.external_name_snapshot == REJECTION_SUMMARY_NAME)
+            .unwrap();
+        assert_eq!(
+            summary.detail.as_deref(),
+            Some("not_writable（60 秒の窓で、上限を超えたほかのタグ名で計 81 件）")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_external_name_is_truncated_with_a_mark() {
+        let exact = "あ".repeat(REJECTION_NAME_MAX_CHARS);
+        assert_eq!(truncate_name(exact.clone()), exact);
+        let long = "あ".repeat(REJECTION_NAME_MAX_CHARS + 50);
+        let cut = truncate_name(long.clone());
+        assert_eq!(cut.chars().count(), REJECTION_NAME_MAX_CHARS);
+        assert!(cut.ends_with('…'));
+        assert!(long.starts_with(cut.trim_end_matches('…')));
+
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = WriteAuditService::new(pool);
+        let r = WriteRejectionReason::NotFound;
+        // 先頭が同じ長い名前どうしは、切り詰めた後で同じ組になる。
+        let other = format!("{}い", "あ".repeat(REJECTION_NAME_MAX_CHARS + 10));
+        svc.record_rejections(vec![entry(&long, r), entry(&other, r)]);
+        svc.flush().await;
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].external_name_snapshot, cut);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_found（60 秒の窓で計 2 件）")
+        );
+    }
+
+    #[test]
+    fn a_queued_entry_stays_small_for_the_memory_estimate() {
+        // モジュールの doc comment のメモリの見積もり(1 エントリの構造体 128 バイト以下)。
+        assert!(std::mem::size_of::<QueuedRejection>() <= 128);
     }
 }
