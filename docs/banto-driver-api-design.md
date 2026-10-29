@@ -488,6 +488,8 @@ pub trait FrameConnection: Send + 'static {
     fn is_complete(&self, step: &Step, buf: &[u8]) -> Result<FrameCheck, FatalError>;
     /// WIT read.plan。&mut self: トランザクション ID 等の採番を読み書きで共有する（modbus_driver.rs:41-79）
     fn plan_read(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, FatalError>;
+    /// どの `covers` にも入らなかった spec の理由（WIT には無い。WASM は既定の None）。Some なら `Unsupported(理由)`、None なら "計画に含まれない"
+    fn unplanned_reason(&self, _spec: &TagSpec) -> Option<String> { None }
     /// WIT read.decode。specs は plan_read に渡したものと同じスライス。戻りは planned.covers と同じ長さ・順序。
     /// ドライバは specs[covers[i]].kind で解釈を決める（同じアドレス・同じフレームでも U32 と F32 は別の値）
     fn decode_read(&self, planned: &Planned, specs: &[TagSpec], response: &[u8]) -> Result<Vec<Result<RawValue, ItemError>>, FatalError>;
@@ -502,7 +504,7 @@ pub trait FrameConnection: Send + 'static {
 
 - **decode に文脈を渡す理由**（レビュー 1）: `Planned` は `Step` と `covers` しか持たないので、`decode_read` が「どの型で読むか」を知るには元の `specs` が要る。今の `banto-plc` も `planning.rs:85-114` の `MappedRequest` が `offset_in_read`・`data_type`・`bit` を持ち、`decode.rs:66-100` が `data_type` で分岐している。同じ Modbus のアドレスを U32 と F32 で読むとフレームも `covers` も同じになるので、`specs` を渡さない契約では区別できない。エンジンの不変条件: **`decode_read` に渡す `specs` は直前の `plan_read` に渡したスライスと同一**（ハーネスがこれを守る。C3 の「同じアドレス・別の型」のケースで確かめる）。
 - **状態を変える呼び出し**: `handshake_next`・`farewell`（接続の状態）、`plan_read`（採番）、`write_next`（採番と書き込みの途中の状態）。`decode_read`・`is_complete` は `&self`。WIT の `borrow<connection>` は可変性を区別しないが、WASM ホストでも接続は 1 タスクが専有するので同じ契約になる。
-- **要求 - 応答の手順（エンジンが R2b-3 で実装する契約。R1 では適合テストのハーネスが同じ手順を持つ。R2b-3b で実装済み: 置き場所は公開 crate `banto-driver-engine` の `FrameSession`、適合テストのハーネスも同じエンジンを記憶上の通信路で動かす）**: (1) `plan_read` で `Vec<Planned>` を得る → (2) 各 `Planned` について `step.send` を送り、`expect` に従って受信（`None` なら受信しない。`DriverDecides` なら受信のたびに `is_complete`。`Discard(n)` なら先頭 n バイトを捨てて続ける）→ (3) `max_len` 超過・`response_timeout` 超過は致命で、**受信バッファを捨てて接続を切る**（遅れて届いた応答を次の step に流用しない。`banto-plc/src/error.rs:39-47` の `ResponseTimeout` の理由と同じ）→ (4) `decode_read(planned, specs, response)` → (5) `covers` の添字で結果を `specs` の順に並べる。`covers` に出てこない添字は `ItemError::Unsupported("計画に含まれない")`。
+- **要求 - 応答の手順（エンジンが R2b-3 で実装する契約。R1 では適合テストのハーネスが同じ手順を持つ。R2b-3b で実装済み: 置き場所は公開 crate `banto-driver-engine` の `FrameSession`、適合テストのハーネスも同じエンジンを記憶上の通信路で動かす）**: (1) `plan_read` で `Vec<Planned>` を得る → (2) 各 `Planned` について `step.send` を送り、`expect` に従って受信（`None` なら受信しない。`DriverDecides` なら受信のたびに `is_complete`。`Discard(n)` なら先頭 n バイトを捨てて続ける）→ (3) `max_len` 超過・`response_timeout` 超過は致命で、**受信バッファを捨てて接続を切る**（遅れて届いた応答を次の step に流用しない。`banto-plc/src/error.rs:39-47` の `ResponseTimeout` の理由と同じ）→ (4) `decode_read(planned, specs, response)` → (5) `covers` の添字で結果を `specs` の順に並べる。`covers` に出てこない添字は `ItemError::Unsupported(理由)`（理由は `FrameConnection::unplanned_reason` が `Some` のときその文言、`None`（既定）なら "計画に含まれない"。ネイティブの SLMP・Modbus は計画の理由を返す）。
 - **Modbus RTU の終端の決め方**（監査 M5。R2b-3 の実装者向けに R1 で固定する規則）: `DriverDecides` で、長さは **FC とバイト数の欄から**決める（例外応答は FC の最上位ビットで判定し 5 バイト固定）。CRC は**検証**に使い、合えば `Complete`、合わなければ `FatalError::Framing`。「CRC が合った時点を完結とする」規則は採らない（途中のバイト列で偶然 CRC が合う誤判定があるため）。
 - **ワード順**は `Settings` の `word_order` から `create_connection` が読む（監査 B2）。文字列は `RawValue::Bytes` で返し、エンジンが `TagKind::Str.encoding` で decode する（`banto-plc/src/decode.rs` の `decode_string_value` と同じ規則: 語の下位バイトが先、最初の NUL で切る）。
 

@@ -20,6 +20,8 @@ R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（ア�
 
 R2b-5b・5c: broker（`banto-broker`）が `simulation = true` の接続をこの `SimDevice` で張り（`SimDevice::id()` を接続の指紋に含める）、アプリの振る舞いが変わった。破壊はなく、`0.1.0` からの追加のみ（minor）。
 
+- 計画に含まれなかった spec は、`FrameConnection::unplanned_reason` が `Some` ならその理由の `Unsupported` を返す（`None` は従来の "計画に含まれない"）。
+
 ## 0.1.0 — 未公開
 
 R2b-3b-core（docs/banto-hub-driver-io-design.md §5）・R2b-3e-1（同 §7）。最初の版。MSRV は Rust 1.85。依存は `banto-driver-api`・`tokio`（`rt` / `time` / `net` / `io-util`）・`tokio-serial`（`default-features = false`。Linux でも libudev は要らない）・`tracing` だけ。banto-hub の `banto-broker` が `Frame` の接続をこのエンジンで動かし、適合テスト `banto-driver-conformance` も同じエンジンを記憶上の通信路で動かす（手順の実装は 1 つ）。

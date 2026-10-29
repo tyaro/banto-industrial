@@ -240,7 +240,7 @@ pub enum TransportSpec { Tcp { host: String, port: u16 }, Serial(SerialSpec) }  
 3. 時間切れ（`FatalError::Timeout`）・`max_len` 超過・相手の切断は致命。**受信バッファを捨て、トランスポートを閉じる**（TCP）。遅れて届いた応答を次の step に使わない（`banto-plc/src/error.rs:39-47` の `ResponseTimeout` の理由と同じ）。
 4. `Complete { len }` の後ろに余りがあれば捨てる（次の step に持ち越さない、`frame.rs` の `FrameCheck::Complete` の doc）。
 5. `conn.decode_read(planned, specs, response)` → `covers` と同じ長さの結果（長さの食い違いは致命）。`RawValue` を `Value` に写す: `Bool` → `Bit`、`Int` / `Uint` / `Float` → `F64`、`Bytes` → `TagKind::Str` の `encoding` で decode（今の `decode_string_value` の規則: 語の下位バイトが先、最初の NUL で切る）。`Numeric` に `Bytes` が来たら、そのタグだけ `ItemError::Unsupported`。
-6. `covers` に出てこない添字は `ItemError::Unsupported("計画に含まれない")`。結果を `specs` の順に並べる。
+6. `covers` に出てこない添字は `ItemError::Unsupported(理由)`（`FrameConnection::unplanned_reason` が `Some` ならその文言、既定の `None` なら "計画に含まれない"）。結果を `specs` の順に並べる。
 7. フレーム型のドライバが `FatalError::Io` / `Timeout` を返したら契約違反（C4）。エンジンは致命として扱い、ログに残す。
 
 ### 5.3 書き込み

@@ -146,6 +146,7 @@ struct Conn {
     error: Option<(&'static str, FatalError)>,
     farewell: bool,
     gap: Duration,
+    unplanned_reason: Option<String>,
 }
 impl Conn {
     fn new(stats: Arc<Stats>) -> Self {
@@ -165,6 +166,7 @@ impl Conn {
             error: None,
             farewell: false,
             gap: Duration::ZERO,
+            unplanned_reason: None,
         }
     }
     fn fail(&self, method: &str) -> Result<(), FatalError> {
@@ -206,6 +208,9 @@ impl FrameConnection for Conn {
                 (0..specs.len() as u32).collect(),
             )]
         }))
+    }
+    fn unplanned_reason(&self, _spec: &TagSpec) -> Option<String> {
+        self.unplanned_reason.clone()
     }
     fn decode_read(
         &self,
@@ -1189,4 +1194,35 @@ async fn the_farewell_waits_for_the_tx_estimate_before_closing() {
         let elapsed = at(Kind::Close) - at(Kind::SendStart);
         assert_eq!(elapsed, Duration::from_millis(expected_ms), "tx={tx_ms}");
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unplanned_spec_carries_the_drivers_reason() {
+    let stats = Arc::<Stats>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.plan = Some(vec![Planned::new(conn.step.clone(), vec![1])]);
+    conn.unplanned_reason = Some("文字列の長さが上限 128 を超える".into());
+    let mut s = session(conn, Wire::new(stats), Arc::default());
+    let values = s.read_batch(&[spec(), spec()]).await.unwrap();
+    assert_eq!(
+        values[0],
+        Err(ItemError::Unsupported(
+            "文字列の長さが上限 128 を超える".into()
+        ))
+    );
+    assert_eq!(values[1], Ok(Value::F64(7.0)));
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unplanned_spec_without_a_reason_keeps_the_generic_text() {
+    let stats = Arc::<Stats>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.plan = Some(vec![Planned::new(conn.step.clone(), vec![1])]);
+    let mut s = session(conn, Wire::new(stats), Arc::default());
+    let values = s.read_batch(&[spec(), spec()]).await.unwrap();
+    assert_eq!(
+        values[0],
+        Err(ItemError::Unsupported("計画に含まれない".into()))
+    );
+    assert_eq!(values[1], Ok(Value::F64(7.0)));
 }

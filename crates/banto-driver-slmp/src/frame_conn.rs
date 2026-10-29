@@ -233,6 +233,19 @@ impl FrameConnection for SlmpConnection {
             .collect()
     }
 
+    /// Why `spec` is in no step: the planner's own reason (for example a
+    /// string longer than the driver reads), or the request gate's.
+    fn unplanned_reason(&self, spec: &TagSpec) -> Option<String> {
+        match read_request(spec) {
+            Ok(Prep::Item(ItemError::Unsupported(reason))) => Some(reason),
+            Ok(Prep::Request(request)) => plan_slmp_batch(&[request])
+                .immediate_bad
+                .first()
+                .map(|(_, err)| err.to_string()),
+            _ => None,
+        }
+    }
+
     fn decode_read(
         &self,
         planned: &Planned,
