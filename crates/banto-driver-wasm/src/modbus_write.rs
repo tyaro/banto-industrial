@@ -8,7 +8,8 @@ pub(super) const ALLOWLIST_KEY: &str = "modbus_operational_write_allowlist";
 const MAX_RANGES: usize = 16;
 const MAX_TEXT: usize = 512;
 const MAX_ADDRESS: u32 = 65_535;
-const MAX_WORDS: u32 = 123;
+/// Also the cap on a Modbus WASM string tag (#914 C1), which is one request.
+pub(super) const MAX_WORDS: u32 = 123;
 /// FC15 allows 1968 coils per request, but the guest caps every write at 123
 /// items (CONTRACT.md, guest #53), so the host cap is min(1968, 123).
 const MAX_COILS: u32 = 123;
@@ -206,6 +207,7 @@ const REASON_TYPE: &str = "tag type cannot be written to this area";
 const REASON_RUN: &str = "request is not one contiguous run of writable addresses";
 const REASON_VALUE: &str = "value does not fit the tag type";
 const REASON_BIT: &str = "register bit address does not match this connection";
+const REASON_STRING_AREA: &str = "only a holding register span can be written as a string";
 
 pub(super) fn preflight(
     items: &[WriteItem],
@@ -218,6 +220,12 @@ pub(super) fn preflight(
             items.len()
         ])
     };
+    if items
+        .iter()
+        .any(|item| matches!(item.spec.kind, TagKind::Str { .. }))
+    {
+        return string_registers(items, driver_id, policy).map_err(refused);
+    }
     if let [item] = items {
         if item.spec.address.bit.is_some() {
             return register_bit(item, driver_id, policy).map_err(refused);
@@ -329,6 +337,53 @@ pub(super) fn preflight(
     }
     policy.check(area, start, next - 1).map_err(refused)?;
     Ok(checked)
+}
+
+/// #914 C1: a request holding a string tag must be exactly that one holding
+/// register string of at most 123 words. Its whole span `[start, start +
+/// words - 1]` must lie inside one host interval, and the value is sent as the
+/// encoded, 0x00-padded span ([`encoded_string`]) for the guest's one FC16.
+fn string_registers(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+    policy: &Policy,
+) -> Result<Vec<write::WriteItem>, &'static str> {
+    let [item] = items else {
+        return Err("a string tag must be written alone");
+    };
+    let address = &item.spec.address;
+    let TagKind::Str { words, encoding } = item.spec.kind else {
+        return Err(REASON_TYPE);
+    };
+    let (area, start) = parse_reference(&address.canonical).map_err(|_| REASON_STRING_AREA)?;
+    if area != Area::Holding {
+        return Err(REASON_STRING_AREA);
+    }
+    if u32::from(words) > MAX_WORDS {
+        return Err("too many registers in one request");
+    }
+    let end = (start + u32::from(words))
+        .checked_sub(1)
+        .ok_or(REASON_RUN)?;
+    if address.driver != *driver_id
+        || address.area != area.name()
+        || !address.writable_area
+        || address.index != Some(u64::from(start))
+        || address.bit.is_some()
+        || address.word_count != words
+    {
+        return Err(REASON_RUN);
+    }
+    policy.check(area, start, end)?;
+    let bytes = encoded_string(&item.value, words, encoding).ok_or(REASON_VALUE)?;
+    Ok(vec![write::WriteItem {
+        spec: write_types::TagSpec {
+            address: address.canonical.clone(),
+            data_type: "string".into(),
+            string_words: Some(u32::from(words)),
+        },
+        value: write_types::Value::Bytes(bytes),
+    }])
 }
 
 /// One holding register bit `4xxxxx.N` written alone (the guest sends one
@@ -598,11 +653,13 @@ mod tests {
             (
                 vec![{
                     let mut x = h("400001", 0, DataType::U16, api::Value::F64(1.0));
+                    // #914 C1: a holding string is writable, but only with text.
                     x.spec.kind = TagKind::string(2, banto_driver_api::StringEncoding::Utf8);
+                    x.spec.address.word_count = 2;
                     x
                 }],
                 on.clone(),
-                "tag type cannot be written to this area",
+                "value does not fit the tag type",
             ),
             (
                 vec![
@@ -920,5 +977,118 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    fn string_item(reference: &str, area: &str, index: u64, words: u16, value: &str) -> WriteItem {
+        let id = DriverId::new("modbus-fc3-wasm").unwrap();
+        let address = DriverAddress::new(id, reference, area, area == "holding_register", words)
+            .with_index(index);
+        WriteItem::new(
+            TagSpec::new(address, TagKind::string(words, api::StringEncoding::Utf8)),
+            api::Value::Str(value.into()),
+        )
+    }
+
+    #[test]
+    fn one_holding_register_string_passes_only_as_a_whole_span_inside_one_interval() {
+        let id = DriverId::new("modbus-fc3-wasm").unwrap();
+        let gate = policy("enabled", "400001-400010,400101-400300");
+        let accepted = preflight(
+            &[string_item("400001", "holding_register", 0, 4, "AB")],
+            &id,
+            &gate,
+        )
+        .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].spec.address, "400001");
+        assert_eq!(accepted[0].spec.data_type, "string");
+        assert_eq!(accepted[0].spec.string_words, Some(4));
+        // Character order; packing into registers (high byte first) is the guest's.
+        assert!(matches!(&accepted[0].value,
+            write_types::Value::Bytes(bytes) if bytes == b"AB\0\0\0\0\0\0"));
+        assert!(preflight(
+            &[string_item("400001", "holding_register", 0, 10, "A")],
+            &id,
+            &gate
+        )
+        .is_ok());
+        let max = preflight(
+            &[string_item("400101", "holding_register", 100, 123, "A")],
+            &id,
+            &gate,
+        )
+        .unwrap();
+        assert!(matches!(&max[0].value, write_types::Value::Bytes(bytes) if bytes.len() == 246));
+
+        let check = |item: WriteItem| refusal_text(preflight(&[item], &id, &gate), 1);
+        assert_eq!(
+            check(string_item("400008", "holding_register", 7, 4, "A")),
+            "outside the Modbus write allowlist"
+        );
+        assert_eq!(
+            check(string_item("400101", "holding_register", 100, 124, "A")),
+            "too many registers in one request"
+        );
+        assert_eq!(
+            check(string_item("300001", "input_register", 0, 4, "A")),
+            REASON_STRING_AREA
+        );
+        assert_eq!(
+            check(string_item("000001", "coil", 0, 1, "A")),
+            REASON_STRING_AREA
+        );
+        assert_eq!(
+            check(string_item("400001", "holding_register", 0, 4, "ABCDEFGHI")),
+            REASON_VALUE
+        );
+        let mut numeric_value = string_item("400001", "holding_register", 0, 4, "A");
+        numeric_value.value = api::Value::F64(1.0);
+        assert_eq!(check(numeric_value), REASON_VALUE);
+        let mut wrong_span = string_item("400001", "holding_register", 0, 4, "A");
+        wrong_span.spec.address.word_count = 3;
+        assert_eq!(check(wrong_span), REASON_RUN);
+        let mut wrong_index = string_item("400001", "holding_register", 0, 4, "A");
+        wrong_index.spec.address.index = Some(1);
+        assert_eq!(check(wrong_index), REASON_RUN);
+
+        let mixed = [
+            string_item("400001", "holding_register", 0, 2, "A"),
+            item(
+                "400003",
+                "holding_register",
+                2,
+                DataType::U16,
+                api::Value::F64(1.0),
+            ),
+        ];
+        assert_eq!(
+            refusal_text(preflight(&mixed, &id, &gate), 2),
+            "a string tag must be written alone"
+        );
+        let mixed = [
+            item(
+                "400001",
+                "holding_register",
+                0,
+                DataType::U16,
+                api::Value::F64(1.0),
+            ),
+            string_item("400002", "holding_register", 1, 2, "A"),
+        ];
+        assert_eq!(
+            refusal_text(preflight(&mixed, &id, &gate), 2),
+            "a string tag must be written alone"
+        );
+        assert_eq!(
+            refusal_text(
+                preflight(
+                    &[string_item("400001", "holding_register", 0, 4, "A")],
+                    &id,
+                    &policy("disabled", "400001-400010")
+                ),
+                1
+            ),
+            "Modbus writes are disabled"
+        );
     }
 }

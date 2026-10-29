@@ -811,6 +811,7 @@ version = "0.1.0"
 dependencies = [
  "banto-driver-api",
  "banto-driver-engine",
+ "banto-plc-write",
  "semver",
  "serde_json",
  "tokio",
