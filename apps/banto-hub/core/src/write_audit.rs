@@ -50,10 +50,15 @@
 //! [`WriteAuditService::record_rejection`] で 1 回の挿入で完結する。
 //!
 //! 監査が拒否で埋まらないよう、**同じ(API キー, 外部名, 理由)は 60 秒
-//! ([`REJECTION_WINDOW`])に 1 行**にまとめる。窓が明けて次に書く行の
-//! `detail` に、その間に省いた件数を入れる。まとめの記憶はメモリ上だけで
-//! (上限 [`REJECTION_THROTTLE_MAX_ENTRIES`] 組)、再起動で省いた件数は
-//! 消える。監査の書込みに失敗しても応答は変えず、ログだけ残す。
+//! ([`REJECTION_WINDOW`])の窓に 1 行**にまとめる。窓の最初の拒否で行を挿入し、
+//! 同じ窓の 2 件目以降はその行の `detail` を UPDATE して合計を書く
+//! (例: `not_writable（60 秒の窓で計 13 件）`。1 件のときはコードだけ)。
+//! 件数は常に DB の行にあるので、拒否が止まっても、記憶の組を上限
+//! ([`REJECTION_THROTTLE_MAX_ENTRIES`] 組)で捨てても、再起動しても失われない。
+//! 窓が明けた次の拒否は新しい行を挿入して窓を始め直す。記憶(窓の最初の行の
+//! id と件数)はメモリ上だけで、判定から挿入/UPDATE までを `tokio::sync::Mutex`
+//! のロックを持ったまま行う(並行の 2 件目が件数を失わない)。挿入に失敗した
+//! 組は記憶に残さない。監査の書込みに失敗しても応答は変えず、ログだけ残す。
 //!
 //! ## スナップショット列 (`api_key_name_snapshot`/`api_key_prefix_snapshot`/`external_name_snapshot`)
 //!
@@ -66,7 +71,7 @@
 //! `rule_name_snapshot` と同じ設計判断)。
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use banto_core::{BantoError, ListParams, ListResult};
@@ -272,48 +277,61 @@ impl WriteRejectionReason {
 /// #711: 同じ(キー, タグ, 理由)の拒否を 1 行にまとめる窓。
 pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
 
-/// #711: まとめの記憶に持つ組の上限。超えたら窓の明けた(省略 0 件の)組、
-/// それでも足りなければ最も古い組を捨てる(捨てた組の省略件数は監査に
-/// 出なくなる)。
+/// #711: まとめの記憶に持つ組の上限。超えたら窓の明けた組、それでも足りなければ
+/// 最も古い窓の組を捨てる。捨てても、件数はすでに DB の行の `detail` にあるので
+/// 失われない(捨てた組の次の拒否は、新しい行を挿入して窓を始め直す)。
 pub const REJECTION_THROTTLE_MAX_ENTRIES: usize = 1000;
 
-/// #711: 拒否の行をまとめる記憶(メモリ上のみ。再起動で省略件数は消える)。
+/// #711: 組ごとの現在の窓。
+struct RejectionWindow {
+    /// 窓の最初の拒否の時刻(窓はここから [`REJECTION_WINDOW`])。
+    start: Instant,
+    /// 窓の最初の拒否で挿入した行の id(以降の拒否はこの行を UPDATE する)。
+    row_id: i64,
+    /// 窓の中の拒否の合計(最初の 1 件を含む)。
+    count: u32,
+}
+
+type RejectionKey = (i64, String, WriteRejectionReason);
+
+/// #711: 拒否の行をまとめる記憶(メモリ上のみ)。件数は行の `detail` に
+/// 書き込み済みなので、再起動や組の破棄で件数が失われることはない。
 #[derive(Default)]
 struct RejectionThrottle {
-    /// 組 → (最後に行を書いた時刻, その後に省いた件数)
-    map: HashMap<(i64, String, WriteRejectionReason), (Instant, u32)>,
+    map: HashMap<RejectionKey, RejectionWindow>,
 }
 
 impl RejectionThrottle {
-    /// 行を書くべきなら `Some(前の窓で省いた件数)`、窓の中なら省いて `None`。
-    fn admit(&mut self, key: (i64, String, WriteRejectionReason), now: Instant) -> Option<u32> {
-        if let Some((last, suppressed)) = self.map.get_mut(&key) {
-            if now.saturating_duration_since(*last) < REJECTION_WINDOW {
-                *suppressed = suppressed.saturating_add(1);
-                return None;
-            }
-            let omitted = *suppressed;
-            *last = now;
-            *suppressed = 0;
-            return Some(omitted);
+    /// 新しい組を入れる前に、上限を超えないよう組を捨てる。
+    fn make_room(&mut self, now: Instant) {
+        if self.map.len() < REJECTION_THROTTLE_MAX_ENTRIES {
+            return;
         }
+        self.map
+            .retain(|_, w| now.saturating_duration_since(w.start) < REJECTION_WINDOW);
         if self.map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
-            self.map.retain(|_, (last, suppressed)| {
-                *suppressed > 0 || now.saturating_duration_since(*last) < REJECTION_WINDOW
-            });
-            if self.map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
-                if let Some(oldest) = self
-                    .map
-                    .iter()
-                    .min_by_key(|(_, (last, _))| *last)
-                    .map(|(k, _)| k.clone())
-                {
-                    self.map.remove(&oldest);
-                }
+            if let Some(oldest) = self
+                .map
+                .iter()
+                .min_by_key(|(_, w)| w.start)
+                .map(|(k, _)| k.clone())
+            {
+                self.map.remove(&oldest);
             }
         }
-        self.map.insert(key, (now, 0));
-        Some(0)
+    }
+}
+
+fn rejection_detail(reason: WriteRejectionReason, count: u32) -> String {
+    if count > 1 {
+        format!(
+            "{}（{} 秒の窓で計 {} 件）",
+            reason.as_str(),
+            REJECTION_WINDOW.as_secs(),
+            count
+        )
+    } else {
+        reason.as_str().to_string()
     }
 }
 
@@ -323,14 +341,14 @@ impl RejectionThrottle {
 #[derive(Clone)]
 pub struct WriteAuditService {
     pool: SqlitePool,
-    rejections: Arc<Mutex<RejectionThrottle>>,
+    rejections: Arc<tokio::sync::Mutex<RejectionThrottle>>,
 }
 
 impl WriteAuditService {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
-            rejections: Arc::new(Mutex::new(RejectionThrottle::default())),
+            rejections: Arc::new(tokio::sync::Mutex::new(RejectionThrottle::default())),
         }
     }
 
@@ -366,23 +384,31 @@ impl WriteAuditService {
         external_name: &str,
         reason: WriteRejectionReason,
     ) {
-        let omitted = {
-            let mut throttle = self.rejections.lock().unwrap_or_else(|e| e.into_inner());
-            throttle.admit((api_key_id, external_name.to_string(), reason), now)
-        };
-        let Some(omitted) = omitted else {
-            return;
-        };
-        let detail = if omitted > 0 {
-            format!(
-                "{}（前の {} 秒で {} 件を省略）",
-                reason.as_str(),
-                REJECTION_WINDOW.as_secs(),
-                omitted
-            )
-        } else {
-            reason.as_str().to_string()
-        };
+        let key: RejectionKey = (api_key_id, external_name.to_string(), reason);
+        // 判定から挿入/UPDATE までロックを持ったまま行う。挿入が終わる前に同じ組の
+        // 2 件目が来ても、行 id が決まってから数えるので件数が失われない(拒否の
+        // 監査の書込みだけが直列になる)。
+        let mut throttle = self.rejections.lock().await;
+        if let Some(w) = throttle.map.get_mut(&key) {
+            if now.saturating_duration_since(w.start) < REJECTION_WINDOW {
+                w.count = w.count.saturating_add(1);
+                let detail = rejection_detail(reason, w.count);
+                let result = sqlx::query("UPDATE hub_write_audit SET detail = ? WHERE id = ?")
+                    .bind(&detail)
+                    .bind(w.row_id)
+                    .execute(&self.pool)
+                    .await;
+                if let Err(err) = result {
+                    eprintln!(
+                        "banto-hub: 書き込み監査(rejected: {})の件数の更新に失敗しました: {err}",
+                        reason.as_str()
+                    );
+                }
+                return;
+            }
+            // 窓が明けた: 前の行はそのまま残し、新しい行で窓を始め直す。
+            throttle.map.remove(&key);
+        }
         let row = WriteAuditRow::new(
             api_key_id,
             api_key_name,
@@ -391,12 +417,24 @@ impl WriteAuditService {
             WriteAuditAction::Write,
             WriteAuditResult::Rejected,
         )
-        .with_detail(detail);
-        if let Err(err) = self.insert_row(&row).await {
-            eprintln!(
+        .with_detail(reason.as_str());
+        match self.insert_row(&row).await {
+            Ok(row_id) => {
+                throttle.make_room(now);
+                throttle.map.insert(
+                    key,
+                    RejectionWindow {
+                        start: now,
+                        row_id,
+                        count: 1,
+                    },
+                );
+            }
+            // 失敗した組は記憶に残さない(次の拒否で挿入をやり直す)。
+            Err(err) => eprintln!(
                 "banto-hub: 書き込み監査(rejected: {})の記録に失敗しました: {err}",
                 reason.as_str()
-            );
+            ),
         }
     }
 
@@ -778,7 +816,7 @@ mod rejection_tests {
     }
 
     #[tokio::test]
-    async fn repeated_rejection_inside_the_window_is_one_row_then_reports_omitted() {
+    async fn repeated_rejection_inside_the_window_is_one_row_with_the_total() {
         let svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
@@ -786,19 +824,88 @@ mod rejection_tests {
             svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", 5, "a.b", r)
                 .await;
         }
+        // 拒否が止まっても、何も呼ばずに読んで件数が残っている。
         let got = rows(&svc).await;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].result, "rejected");
         assert_eq!(got[0].action, "write");
-        assert_eq!(got[0].detail.as_deref(), Some("not_writable"));
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 13 件）")
+        );
+    }
 
+    #[tokio::test]
+    async fn a_single_rejection_has_only_the_code() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotFound;
+        svc.record_rejection_at(Instant::now(), 1, "k", 0, "x", r)
+            .await;
+        assert_eq!(rows(&svc).await[0].detail.as_deref(), Some("not_found"));
+    }
+
+    #[tokio::test]
+    async fn a_new_window_is_a_new_row_and_keeps_the_old_total() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        let r = WriteRejectionReason::NotWritable;
+        for i in 0..5 {
+            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", 5, "a.b", r)
+                .await;
+        }
         svc.record_rejection_at(t0 + REJECTION_WINDOW, 1, "k", 5, "a.b", r)
             .await;
+        svc.record_rejection_at(
+            t0 + REJECTION_WINDOW + Duration::from_secs(1),
+            1,
+            "k",
+            5,
+            "a.b",
+            r,
+        )
+        .await;
         let got = rows(&svc).await;
         assert_eq!(got.len(), 2);
         assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_writable（60 秒の窓で計 5 件）")
+        );
+        assert_eq!(
             got[1].detail.as_deref(),
-            Some("not_writable（前の 60 秒で 12 件を省略）")
+            Some("not_writable（60 秒の窓で計 2 件）")
+        );
+    }
+
+    #[tokio::test]
+    async fn counts_survive_when_the_memory_drops_a_pair_at_the_cap() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        let r = WriteRejectionReason::NotFound;
+        // 最初の組に 3 件。
+        for _ in 0..3 {
+            svc.record_rejection_at(t0, 1, "k", 0, "first", r).await;
+        }
+        // 上限を超える数の別の組で、最初の組を記憶から捨てさせる。
+        for i in 0..REJECTION_THROTTLE_MAX_ENTRIES {
+            svc.record_rejection_at(
+                t0 + Duration::from_millis(1 + i as u64),
+                1,
+                "k",
+                0,
+                &format!("tag{i}"),
+                r,
+            )
+            .await;
+        }
+        assert!(svc.rejections.lock().await.map.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
+        let got = svc.list(ListParams::default()).await.unwrap().rows;
+        let first = got
+            .iter()
+            .find(|e| e.external_name_snapshot == "first")
+            .unwrap();
+        assert_eq!(
+            first.detail.as_deref(),
+            Some("not_found（60 秒の窓で計 3 件）")
         );
     }
 
@@ -820,15 +927,5 @@ mod rejection_tests {
         )
         .await;
         assert_eq!(rows(&svc).await.len(), 4);
-    }
-
-    #[test]
-    fn throttle_memory_is_bounded() {
-        let mut t = RejectionThrottle::default();
-        let now = Instant::now();
-        for i in 0..(REJECTION_THROTTLE_MAX_ENTRIES + 50) {
-            t.admit((1, format!("tag{i}"), WriteRejectionReason::NotFound), now);
-        }
-        assert!(t.map.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
     }
 }

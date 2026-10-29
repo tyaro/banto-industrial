@@ -856,7 +856,11 @@ async fn gate_writable_false_is_403_not_writable() {
     }
     assert_eq!(
         rejected_rows(&app).await,
-        vec![(external_name.clone(), tag_id, "not_writable".to_string())]
+        vec![(
+            external_name.clone(),
+            tag_id,
+            "not_writable（60 秒の窓で計 4 件）".to_string()
+        )]
     );
     sim.stop();
 }

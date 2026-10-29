@@ -42,7 +42,7 @@
 
 	/**
 	 * 拒否の行の理由（例: 「書込み不可のタグ」）。detail が
-	 * `not_writable（前の 60 秒で 12 件を省略）` の形のときは省略の注記も添える。
+	 * `not_writable（60 秒の窓で計 13 件）` の形のときは件数の注記も添える。
 	 */
 	function rejectionReason(row: WriteAuditEntry): string | null {
 		if (row.result !== 'rejected' || !row.detail) return null;
