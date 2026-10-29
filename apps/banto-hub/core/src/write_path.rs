@@ -897,7 +897,7 @@ async fn record_rejection_for(
         .map(|entry| entry.ids.2)
         .unwrap_or(0);
     write_audit
-        .record_rejection(ctx.id, &ctx.name, tag_id, tag, reason)
+        .record_rejection(ctx.id, &ctx.name, &ctx.prefix, tag_id, tag, reason)
         .await;
 }
 

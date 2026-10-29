@@ -359,6 +359,7 @@ impl WriteAuditService {
         &self,
         api_key_id: i64,
         api_key_name: &str,
+        api_key_prefix: &str,
         tag_id: i64,
         external_name: &str,
         reason: WriteRejectionReason,
@@ -367,6 +368,7 @@ impl WriteAuditService {
             Instant::now(),
             api_key_id,
             api_key_name,
+            api_key_prefix,
             tag_id,
             external_name,
             reason,
@@ -375,11 +377,13 @@ impl WriteAuditService {
     }
 
     /// [`Self::record_rejection`] の時刻を注入できる形(試験用)。
+    #[allow(clippy::too_many_arguments)] // 時刻の注入で 1 つ増える試験用の形
     pub async fn record_rejection_at(
         &self,
         now: Instant,
         api_key_id: i64,
         api_key_name: &str,
+        api_key_prefix: &str,
         tag_id: i64,
         external_name: &str,
         reason: WriteRejectionReason,
@@ -412,6 +416,7 @@ impl WriteAuditService {
         let row = WriteAuditRow::new(
             api_key_id,
             api_key_name,
+            api_key_prefix,
             tag_id,
             external_name,
             WriteAuditAction::Write,
@@ -821,13 +826,14 @@ mod rejection_tests {
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
         for i in 0..13 {
-            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", 5, "a.b", r)
+            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", "bk_k", 5, "a.b", r)
                 .await;
         }
         // 拒否が止まっても、何も呼ばずに読んで件数が残っている。
         let got = rows(&svc).await;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].result, "rejected");
+        assert_eq!(got[0].api_key_prefix_snapshot.as_deref(), Some("bk_k"));
         assert_eq!(got[0].action, "write");
         assert_eq!(
             got[0].detail.as_deref(),
@@ -839,7 +845,7 @@ mod rejection_tests {
     async fn a_single_rejection_has_only_the_code() {
         let svc = service().await;
         let r = WriteRejectionReason::NotFound;
-        svc.record_rejection_at(Instant::now(), 1, "k", 0, "x", r)
+        svc.record_rejection_at(Instant::now(), 1, "k", "bk_k", 0, "x", r)
             .await;
         assert_eq!(rows(&svc).await[0].detail.as_deref(), Some("not_found"));
     }
@@ -850,15 +856,16 @@ mod rejection_tests {
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
         for i in 0..5 {
-            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", 5, "a.b", r)
+            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", "bk_k", 5, "a.b", r)
                 .await;
         }
-        svc.record_rejection_at(t0 + REJECTION_WINDOW, 1, "k", 5, "a.b", r)
+        svc.record_rejection_at(t0 + REJECTION_WINDOW, 1, "k", "bk_k", 5, "a.b", r)
             .await;
         svc.record_rejection_at(
             t0 + REJECTION_WINDOW + Duration::from_secs(1),
             1,
             "k",
+            "bk_k",
             5,
             "a.b",
             r,
@@ -883,7 +890,8 @@ mod rejection_tests {
         let r = WriteRejectionReason::NotFound;
         // 最初の組に 3 件。
         for _ in 0..3 {
-            svc.record_rejection_at(t0, 1, "k", 0, "first", r).await;
+            svc.record_rejection_at(t0, 1, "k", "bk_k", 0, "first", r)
+                .await;
         }
         // 上限を超える数の別の組で、最初の組を記憶から捨てさせる。
         for i in 0..REJECTION_THROTTLE_MAX_ENTRIES {
@@ -891,6 +899,7 @@ mod rejection_tests {
                 t0 + Duration::from_millis(1 + i as u64),
                 1,
                 "k",
+                "bk_k",
                 0,
                 &format!("tag{i}"),
                 r,
@@ -914,13 +923,17 @@ mod rejection_tests {
         let svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
-        svc.record_rejection_at(t0, 1, "k", 5, "a.b", r).await;
-        svc.record_rejection_at(t0, 2, "k2", 5, "a.b", r).await;
-        svc.record_rejection_at(t0, 1, "k", 6, "a.c", r).await;
+        svc.record_rejection_at(t0, 1, "k", "bk_k", 5, "a.b", r)
+            .await;
+        svc.record_rejection_at(t0, 2, "k2", "bk_k", 5, "a.b", r)
+            .await;
+        svc.record_rejection_at(t0, 1, "k", "bk_k", 6, "a.c", r)
+            .await;
         svc.record_rejection_at(
             t0,
             1,
             "k",
+            "bk_k",
             5,
             "a.b",
             WriteRejectionReason::MissingWriteScope,
