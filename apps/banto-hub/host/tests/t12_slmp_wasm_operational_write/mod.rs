@@ -39,6 +39,12 @@ struct Wire {
     fold_own_route: bool,
     /// Added to the response length field (the bytes sent do not change).
     length_delta: i32,
+    /// End code for D/W word reads outside the SD handshake (0 = answer);
+    /// guest #61 (F) step 1 and 3 of the word-bit read-modify-write.
+    word_read_end_code: u16,
+    /// Answer D/W word reads as if no write had been stored (every word 7),
+    /// so a word-bit confirm read disagrees with the write-back (guest #61).
+    stale_word_reads: bool,
 }
 
 /// Subheader (first two bytes) and route (network, station, I/O LE, multidrop)
@@ -60,6 +66,7 @@ struct Fixture {
     write_devices: Arc<Mutex<Vec<u8>>>,
     write_end_code: Arc<AtomicU16>,
     bit_frames: RecordedBits,
+    q_w_total: Arc<Mutex<Option<u32>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -97,6 +104,8 @@ impl Fixture {
         let headers_on_wire = headers.clone();
         let connections = Arc::new(AtomicU32::new(0));
         let connections_on_wire = connections.clone();
+        let q_w_total: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+        let q_w_total_on_wire = q_w_total.clone();
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -200,7 +209,16 @@ impl Fixture {
                                     (0, body)
                                 }
                                 Peer::StandardQ => {
-                                    if (subcommand, start, words) == (0, 290, 5) {
+                                    if (subcommand, start, words) == (0, 310, 2) {
+                                        // Guest #60 (D3): QnU reads the internal +
+                                        // extended W total. Refused unless a test
+                                        // opts in, which keeps the internal-W-only
+                                        // behaviour every earlier test relies on.
+                                        match *q_w_total_on_wire.lock().unwrap() {
+                                            Some(total) => (0, total.to_le_bytes().to_vec()),
+                                            None => (0xc051, Vec::new()),
+                                        }
+                                    } else if (subcommand, start, words) == (0, 290, 5) {
                                         if refuse_bit_sd_on_wire.load(Ordering::SeqCst) {
                                             (0xc051, Vec::new())
                                         } else {
@@ -247,6 +265,15 @@ impl Fixture {
                                             || (start == 3000 && end == 3001)
                                             || (start >= 3010 && end <= 3015)))
                                         || (device == 0xb4 && start >= 0x1a && end <= 0x20)
+                                        // Q extended W below the opted-in SD310-311
+                                        // total (guest #60 D3, new-guest tests only).
+                                        || (device == 0xb4
+                                            && matches!(peer, Peer::StandardQ)
+                                            && start >= 0x40
+                                            && q_w_total_on_wire
+                                                .lock()
+                                                .unwrap()
+                                                .is_some_and(|total| end <= total))
                                         || (device == 0x90 && start >= 10 && end <= 13)
                                         // Explicit reads at the Q/R M boundary and past a
                                         // saturated Q M/B count (new-guest tests only).
@@ -286,8 +313,15 @@ impl Fixture {
                                         .collect();
                                     (0, body)
                                 }
+                            } else if wire.word_read_end_code != 0 && matches!(device, 0xa8 | 0xb4)
+                            {
+                                (wire.word_read_end_code, Vec::new())
                             } else {
-                                let stored = writes.lock().unwrap().last().cloned();
+                                let stored = if wire.stale_word_reads {
+                                    None
+                                } else {
+                                    writes.lock().unwrap().last().cloned()
+                                };
                                 let values: Vec<u16> = (start..end)
                                     .map(|index| {
                                         if device == 0xa8 && index == 10 {
@@ -412,8 +446,15 @@ impl Fixture {
             write_devices,
             write_end_code,
             bit_frames,
+            q_w_total,
             task,
         }
+    }
+
+    /// Answer the QnU SD310-311 total (guest #60 D3) with `total`; the default
+    /// `None` refuses it with an end code.
+    fn set_q_w_total(&self, total: Option<u32>) {
+        *self.q_w_total.lock().unwrap() = total;
     }
 
     fn set_wire(&self, wire: Wire) {
@@ -760,6 +801,18 @@ async fn connect_new_guest_cfg(
     Result<FrameSession, impl std::fmt::Debug>,
 ) {
     let fixture = Fixture::start_wire(peer, 4000, false, wire).await;
+    let (driver, session) = connect_new_guest_fixture(&fixture, mode, allowlist, extra).await;
+    (fixture, driver, session)
+}
+
+/// Connect the new guest to an already started fixture, so a test can set the
+/// fixture's handshake answers (D3 SD310-311) before the handshake runs.
+async fn connect_new_guest_fixture(
+    fixture: &Fixture,
+    mode: &str,
+    allowlist: &str,
+    extra: &[(&str, &str)],
+) -> (Arc<WasmDriver>, Result<FrameSession, impl std::fmt::Debug>) {
     let driver = WasmDriver::load_operational_write(MANIFEST, &new_guest_component()).unwrap();
     let transport = TransportSpec::Tcp {
         host: "127.0.0.1".into(),
@@ -792,7 +845,7 @@ async fn connect_new_guest_cfg(
         None,
     )
     .await;
-    (fixture, driver, session)
+    (driver, session)
 }
 
 fn bit_specs(driver: &WasmDriver, addresses: &[&str]) -> Vec<TagSpec> {
@@ -1583,7 +1636,8 @@ async fn new_guest_w_word_bit_is_read_from_one_w_word_and_outside_is_never_sent(
             .all(|(device, start, points)| *device == 0xb4 && *start + u32::from(*points) <= 0x20));
         // plan_read: the guest alone leaves the outside word uncovered.
         assert_eq!(covered(&mut session, &specs), vec![0, 1, 2, 3]);
-        // The word-bit tag is read-only: a write never reaches the PLC.
+        // A word interval (`W1A-W1F`) never authorizes a bit of the word
+        // (guest #61 F): the Hub gate refuses it and nothing reaches the PLC.
         let results = session
             .write_batch(&[WriteItem::new(specs[0].clone(), Value::Bit(true))])
             .await
@@ -3489,4 +3543,497 @@ async fn new_guest_frame_and_route_settings_are_validated_before_connecting() {
         );
     }
     drop(app);
+}
+
+// ---------------------------------------------------------------------------
+// Guests #60 (D3: QnU extended W read) and #61 (F: D/W word-bit write by
+// read-modify-write), accepted against the loopback fixture above.
+// ---------------------------------------------------------------------------
+
+/// The Hub gate's own refusal (`operational_write_item`), as opposed to the
+/// guest's `Rejected`: nothing is handed to the guest.
+const HUB_GATE: &str = "SLMP write is disabled or outside the connection allowlist";
+
+fn is_hub_gate_refusal(result: &Result<(), ItemError>) -> bool {
+    matches!(result, Err(ItemError::Unsupported(text)) if text == HUB_GATE)
+}
+
+fn word_bit_writes(driver: &WasmDriver, bits: &[(&str, bool)]) -> Vec<WriteItem> {
+    let addresses: Vec<&str> = bits.iter().map(|(address, _)| *address).collect();
+    bit_specs(driver, &addresses)
+        .into_iter()
+        .zip(bits)
+        .map(|(spec, (_, value))| WriteItem::new(spec, Value::Bit(*value)))
+        .collect()
+}
+
+/// Guest #61 (F): a write of distinct bits of one R D word and one R W word,
+/// and of a standard Q W word (SD303), is exactly 0401 read, 1401 write-back
+/// of `(current & !(set | clear)) | set` and 0401 confirm read. The fixture's
+/// words read 7, so bits 1 and 2 must survive. Standard Q D has no write range
+/// proof and is refused by the guest before anything is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #61 component"]
+async fn new_guest_word_bit_write_is_read_modify_write_and_keeps_other_bits() {
+    let allowlist = "D3010.0-D3010.F,W1A.0-W1A.F";
+    for (peer, subcommand) in [(Peer::R, 2), (Peer::StandardQ, 0)] {
+        let (fixture, driver, mut session) =
+            connect_new_guest_with(peer, "enabled", allowlist).await;
+        let mut cases = vec![(0xb4, 0x1a, vec![("W1A.0", false), ("W1A.F", true)], 0x8006)];
+        if matches!(peer, Peer::R) {
+            cases.insert(
+                0,
+                (
+                    0xa8,
+                    3010,
+                    vec![("D3010.5", true), ("D3010.0", false)],
+                    0x0026,
+                ),
+            );
+        }
+        for (device, word, bits, merged) in cases {
+            let before = fixture.commands().len();
+            let results = session
+                .write_batch(&word_bit_writes(&driver, &bits))
+                .await
+                .unwrap();
+            assert_eq!(results, vec![Ok(()); bits.len()], "{bits:?}");
+            assert_eq!(
+                fixture.commands()[before..],
+                [
+                    (0x0401, word, subcommand),
+                    (0x1401, word, subcommand),
+                    (0x0401, word, subcommand),
+                ],
+                "{bits:?}"
+            );
+            assert_eq!(fixture.frames().last(), Some(&(word, vec![merged])));
+            assert_eq!(fixture.write_devices().last(), Some(&device));
+        }
+        if matches!(peer, Peer::StandardQ) {
+            let before = fixture.commands().len();
+            let results = session
+                .write_batch(&word_bit_writes(&driver, &[("D3010.5", true)]))
+                .await
+                .unwrap();
+            assert!(
+                matches!(results.as_slice(), [Err(ItemError::Rejected(_))]),
+                "standard Q D has no write range proof: {results:?}"
+            );
+            assert_eq!(fixture.commands().len(), before, "nothing is sent");
+        }
+        session.disconnect().await;
+    }
+}
+
+/// Guest #61 (F): the Hub's own gate refuses, before the guest plans a frame,
+/// a bit outside every bit interval, a bit covered only by a word interval, and
+/// a request mixing a word bit with a word. A bit interval touching D3000/D3001
+/// is refused by both the guest and the Hub when the settings are tested or
+/// saved, while a valid bit interval passes the Hub's settings check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #61 component"]
+async fn new_guest_hub_gate_refuses_word_bits_outside_bit_intervals_before_send() {
+    let (fixture, driver, mut session) =
+        connect_new_guest_with(Peer::R, "enabled", "D3010-D3013,D3010.3-D3010.5").await;
+    let before = fixture.commands().len();
+    let outside = word_bit_writes(&driver, &[("D3010.6", true)]);
+    let word_interval_only = word_bit_writes(&driver, &[("D3011.0", true)]);
+    let mut mixed = word_bit_writes(&driver, &[("D3010.4", true)]);
+    mixed.push(WriteItem::new(word_spec(&driver, "D3011"), Value::F64(1.0)));
+    let mut mixed_word_first = vec![WriteItem::new(word_spec(&driver, "D3011"), Value::F64(1.0))];
+    mixed_word_first.extend(word_bit_writes(&driver, &[("D3010.4", true)]));
+    for items in [outside, word_interval_only, mixed, mixed_word_first] {
+        let results = session.write_batch(&items).await.unwrap();
+        assert_eq!(results.len(), items.len());
+        assert!(results.iter().all(is_hub_gate_refusal), "{results:?}");
+    }
+    assert_eq!(fixture.commands().len(), before, "no frame for a refusal");
+    assert!(fixture.frames().is_empty());
+    session.disconnect().await;
+
+    // A word interval alone: the bit is refused by the Hub as well.
+    let (fixture, driver, mut session) =
+        connect_new_guest_with(Peer::R, "enabled", "D3010-D3013").await;
+    let before = fixture.commands().len();
+    let results = session
+        .write_batch(&word_bit_writes(&driver, &[("D3010.4", true)]))
+        .await
+        .unwrap();
+    assert!(results.iter().all(is_hub_gate_refusal), "{results:?}");
+    assert_eq!(fixture.commands().len(), before);
+    session.disconnect().await;
+
+    // Settings: the Hub accepts the guest's bit grammar and refuses D3000/D3001.
+    let accepted = settings(5000, "enabled", "D3010.0-D3010.F,W1A.0-W1B.F");
+    assert!(driver.validate_config(&accepted).is_empty());
+    for bad in ["D2999.0-D3000.0", "D3001.F-D3001.F", "D3000.0-D3000.0"] {
+        let errors = driver.validate_config(&settings(5000, "enabled", bad));
+        // One error from the guest and one from the Hub's own parse.
+        assert_eq!(
+            errors
+                .iter()
+                .filter(|error| error.message == "D3000 and D3001 are protected")
+                .count(),
+            2,
+            "{bad}: {errors:?}"
+        );
+    }
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-word-bit-settings",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let settings_json = |allowlist: &str| {
+        serde_json::json!({
+            "host": "127.0.0.1",
+            "port": fixture.address.port(),
+            "d_u16_write_mode": "enabled",
+            "d_u16_write_allowlist": allowlist
+        })
+    };
+    let test = |allowlist: &str| {
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            serde_json::json!({
+                "protocol": "slmp-wasm-operational-write",
+                "simulation": false,
+                "settings": settings_json(allowlist)
+            }),
+        )
+    };
+    let (status, body) = test("D3010.0-D3010.F").await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    assert_eq!(body["ok"], true, "{body:?}");
+    let connected = fixture.connections();
+    for bad in ["D2999.0-D3000.0", "D3001.F-D3001.F"] {
+        let (status, body) = test(bad).await;
+        assert!(
+            !status.is_success() || body["ok"] == false,
+            "{bad}: {status} {body:?}"
+        );
+        let saved = app
+            .manager
+            .plc_connections()
+            .create_settings(super::ConnectionSettingsInput {
+                name: "bad".into(),
+                protocol: "slmp-wasm-operational-write".into(),
+                enabled: false,
+                simulation: false,
+                settings: settings_json(bad).as_object().unwrap().clone(),
+                secrets: Default::default(),
+            })
+            .await;
+        assert!(saved.is_err(), "{bad}: saved");
+    }
+    assert_eq!(fixture.connections(), connected, "never reaches the peer");
+    assert!(fixture
+        .commands()
+        .iter()
+        .all(|(command, _, _)| *command != 0x1401));
+    drop(app);
+}
+
+/// Guest #61 (F): a confirm read that disagrees is `verification-failed` for
+/// that item only, and an end code at the first read is `device` for every
+/// item with no write-back sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #61 component"]
+async fn new_guest_word_bit_confirm_mismatch_and_read_refusal_reach_the_hub() {
+    let (fixture, driver, mut session) =
+        connect_new_guest_with(Peer::R, "enabled", "D3010.0-D3010.F").await;
+    // Confirm reads 7 again: bit 5 (set) disagrees, bit 0 (set) agrees.
+    fixture.set_wire(Wire {
+        stale_word_reads: true,
+        ..Wire::default()
+    });
+    let results = session
+        .write_batch(&word_bit_writes(
+            &driver,
+            &[("D3010.5", true), ("D3010.0", true)],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            results.as_slice(),
+            [Err(ItemError::VerificationFailed(_)), Ok(())]
+        ),
+        "{results:?}"
+    );
+    assert_eq!(fixture.frames(), vec![(3010, vec![0x0027])]);
+
+    fixture.set_wire(Wire {
+        word_read_end_code: 0xc051,
+        ..Wire::default()
+    });
+    let before = fixture.commands().len();
+    let results = session
+        .write_batch(&word_bit_writes(
+            &driver,
+            &[("D3010.5", true), ("D3010.1", false)],
+        ))
+        .await
+        .unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, Err(ItemError::Device(_)))),
+        "{results:?}"
+    );
+    assert_eq!(fixture.commands()[before..], [(0x0401, 3010, 2)]);
+    assert_eq!(
+        fixture.frames().len(),
+        1,
+        "no write-back after a refused read"
+    );
+    session.disconnect().await;
+}
+
+/// Guest #61 (F) through the real Hub path: saved writable word-bit tags are
+/// written over REST by an API key. A batch of two bits of D3010 and a W1A bit
+/// succeed and are audited `ok`; a confirm mismatch is audited `uncertain`; an
+/// end code at the first read is audited `failed` with no write-back; a bit
+/// outside the bit interval and a request mixing a word and a bit are refused
+/// by the Hub gate, audited `failed` and send nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #61 component"]
+async fn new_guest_rest_word_bit_writes_are_audited_by_outcome() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-word-bit-rest",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "D3011-D3011,D3010.0-D3010.9,W1A.0-W1A.F"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 60_000))
+    .await
+    .unwrap();
+    let tags = [
+        ("d3010_5", "D3010.5", "bit"),
+        ("d3010_0", "D3010.0", "bit"),
+        ("w1a_f", "W1A.F", "bit"),
+        ("d3010_7", "D3010.7", "bit"),
+        ("d3010_9", "D3010.9", "bit"),
+        ("d3010_a", "D3010.A", "bit"),
+        ("d3011", "D3011", "u16"),
+        ("d3010_2", "D3010.2", "bit"),
+    ];
+    let mut names = Vec::new();
+    let mut ids = Vec::new();
+    for (name, address, data_type) in tags {
+        let mut tag = super::tag_input(name, group.id, address, data_type);
+        tag.writable = true;
+        ids.push(app.manager.tags().create(tag).await.unwrap().id);
+        names.push(format!("line.group.{name}"));
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "word-bit-loopback-writer",
+            names.iter().map(|tag| format!("write:{tag}")).collect(),
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let batch = |writes: Vec<(usize, serde_json::Value)>| {
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/v1/values/batch",
+            &issued.key,
+            serde_json::json!({
+                "writes": writes
+                    .into_iter()
+                    .map(|(at, value)| serde_json::json!({"tag": names[at], "v": value}))
+                    .collect::<Vec<_>>()
+            }),
+        )
+    };
+    let write_commands = || {
+        fixture
+            .commands()
+            .iter()
+            .filter(|(command, _, _)| *command == 0x1401)
+            .count()
+    };
+    let t = serde_json::json!(true);
+    let f = serde_json::json!(false);
+    let one_word = batch(vec![(0, t.clone()), (1, f.clone())]).await;
+    let w_bit = batch(vec![(2, t.clone())]).await;
+    let after_ok = (fixture.frames(), write_commands());
+    fixture.set_wire(Wire {
+        stale_word_reads: true,
+        ..Wire::default()
+    });
+    let mismatch = batch(vec![(3, t.clone())]).await;
+    fixture.set_wire(Wire {
+        word_read_end_code: 0xc051,
+        ..Wire::default()
+    });
+    let refused_read = batch(vec![(4, t.clone())]).await;
+    let after_refused_read = write_commands();
+    fixture.set_wire(Wire::default());
+    let outside = batch(vec![(5, t.clone())]).await;
+    let mixed = batch(vec![(6, serde_json::json!(1)), (7, t.clone())]).await;
+    let after_gate = write_commands();
+    let audit = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    drop(app);
+
+    assert!(revoked.unwrap().revoked_at.is_some());
+    for (label, (status, body), oks) in [
+        ("one word", &one_word, 2),
+        ("W bit", &w_bit, 1),
+        ("mismatch", &mismatch, 0),
+        ("refused read", &refused_read, 0),
+        ("outside", &outside, 0),
+        ("mixed", &mixed, 0),
+    ] {
+        assert_eq!(*status, super::StatusCode::OK, "{label}: {body:?}");
+        let writes = body["writes"].as_array().unwrap();
+        assert_eq!(
+            writes.iter().filter(|result| result["ok"] == true).count(),
+            oks,
+            "{label}: {body:?}"
+        );
+        assert!(
+            writes.iter().all(|result| result["ok"] == (oks > 0)),
+            "{label}: {body:?}"
+        );
+    }
+    // 7 = 0b0111: D3010 bit 5 set, bit 0 cleared; W1A bit F set.
+    let (frames, commands_ok) = after_ok;
+    assert_eq!(frames, vec![(3010, vec![0x0026]), (0x1a, vec![0x8007])]);
+    assert_eq!(commands_ok, 2);
+    assert_eq!(after_refused_read, 3, "only the mismatch wrote back");
+    assert_eq!(after_gate, 3, "Hub gate refusals send nothing");
+    assert_eq!(audit.0, super::StatusCode::OK, "{:?}", audit.1);
+    let rows = audit.1["rows"].as_array().unwrap();
+    for (at, result) in [
+        (0, "ok"),
+        (1, "ok"),
+        (2, "ok"),
+        (3, "uncertain"),
+        (4, "failed"),
+        (5, "failed"),
+        (6, "failed"),
+        (7, "failed"),
+    ] {
+        assert!(
+            rows.iter()
+                .any(|row| row["tagId"].as_i64() == Some(ids[at]) && row["result"] == result),
+            "{}: expected {result}: {rows:?}",
+            names[at]
+        );
+    }
+}
+
+/// Guest #60 (D3): a QnU CPU (Q02UCPU) whose SD310-311 total T exceeds the
+/// internal W count WC (SD303 = 64) reads W tags in [WC, T) as extended W with
+/// plain B4H reads. A tag at T is outside and never sent, and a tag crossing
+/// WC is not read. Writes still use the internal W range only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #61 component"]
+async fn new_guest_qnu_extended_w_is_read_below_the_sd310_total_only() {
+    let fixture = Fixture::start(Peer::StandardQ, 4000, false).await;
+    fixture.set_q_w_total(Some(0x100));
+    let (driver, session) =
+        connect_new_guest_fixture(&fixture, "enabled", "W1A-W1F,W40-W41", &[]).await;
+    let mut session = session.unwrap();
+    assert!(fixture.commands().contains(&(0x0401, 310, 0)), "SD310 read");
+    let specs = typed_specs(
+        &driver,
+        &[
+            ("W1A", DataType::U16),
+            ("W40", DataType::U16),
+            ("WFF", DataType::U16),
+            ("W100", DataType::U16),
+            ("W3F", DataType::U32),
+        ],
+    );
+    let before = fixture.read_spans().len();
+    let values = session.read_batch(&specs).await.unwrap();
+    assert_eq!(values[0], Ok(Value::F64(7.0)), "{values:?}");
+    assert_eq!(values[1], Ok(Value::F64(7.0)), "{values:?}");
+    assert_eq!(values[2], Ok(Value::F64(7.0)), "{values:?}");
+    assert!(values[3].is_err() && values[4].is_err(), "{values:?}");
+    let spans = fixture.read_spans();
+    assert!(spans[before..].iter().all(|(device, start, points)| {
+        let end = *start + u32::from(*points);
+        *device == 0xb4 && ((*start >= 0x1a && end <= 0x20) || (*start >= 0x40 && end <= 0x100))
+    }));
+    // The extended W total never authorizes a write past the internal count.
+    let before = fixture.commands().len();
+    let results = session
+        .write_batch(&[WriteItem::new(specs[1].clone(), Value::F64(1.0))])
+        .await
+        .unwrap();
+    assert!(
+        matches!(results.as_slice(), [Err(ItemError::Rejected(_))]),
+        "{results:?}"
+    );
+    assert_eq!(fixture.commands().len(), before);
+    // plan_read (last: it leaves the plans undecoded): the guest alone covers
+    // the internal and extended tags only.
+    assert_eq!(covered(&mut session, &specs), vec![0, 1, 2]);
+    session.disconnect().await;
 }

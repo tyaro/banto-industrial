@@ -725,13 +725,16 @@ jobs:
             throw 'diagnostic SLMP Hub tests did not all run'
           }
           # Keep the earlier diagnostic and read/write guests above for
-          # compatibility. Build guest main (SLMP code as of #58, WIT as of #47)
+          # compatibility. Build guest main (SLMP code as of #61, WIT as of #47)
           # separately for Hub acceptance. Its own pin: $canonicalSha stays at #47.
           # #43 leaves bit tags proven Outside out of the read plan; the earlier
           # guests above still read them one by one. #51 reads W word bits
           # (W1A.0), #55 and #56 read S/Z/RD and the Q ZR as read-only
           # range-Unknown tags (E1 3E frame and E2 routed access are accepted here).
-          $newSlmpSha = 'f06a90ffadb21fbd3a7157bf27bb20560c81182e'
+          # #60 (D3) reads QnU extended W below the SD310-311 total and W10000H;
+          # #61 (F) writes D/W word bits by read-modify-write, authorized only by
+          # word-bit intervals of the same allowlist (Hub gate in banto-driver-wasm).
+          $newSlmpSha = '3e1c2d989e31e25ac4c1fc8adffecafbbd2e20e5'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -760,10 +763,18 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component world mismatch' }
           $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
+          # Component-level word-bit RMW: a confirm-read mismatch is
+          # verification-failed for that item only (#906).
+          $wordBitLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-word-bit-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_word_bit_write --locked -- --ignored 2>&1 | Tee-Object -FilePath $wordBitLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP word-bit component test failed' }
+          if (-not (Select-String -Path $wordBitLog -Pattern '^test result: ok\. 1 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP word-bit component test did not run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 36 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 41 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
@@ -840,9 +851,10 @@ jobs:
           if (-not (Select-String -Path $fc4WHubLog -Pattern '^test result: ok\. 2 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'FC4/W Hub tests did not both run'
           }
-          # Modbus FC1/2/3/4 and gated FC5/16/22 join uses the exact reviewed
+          # Modbus FC1/2/3/4 and gated FC5/6/15/16/22 join uses the exact reviewed
           # guest package manifest and the optional write world (guest main:
-          # Modbus code as of #58 (A1 coil/discrete probe, B1 register_bit_write);
+          # Modbus code as of #58 (A1 coil/discrete probe, B1 register_bit_write,
+          # B2 FC15 coil runs and register_write=fc6 from #53);
           # its WIT is still the #47 one, so Enter-GuestPin keeps the WIT checkout).
           $modbusJoinSha = 'f06a90ffadb21fbd3a7157bf27bb20560c81182e'
           Enter-GuestPin $modbusJoinSha 'Modbus join guest'
@@ -862,13 +874,13 @@ jobs:
           $modbusJoinLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-join-test.txt'
           cargo +1.98.1 test -p banto-driver-wasm --test modbus_join --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusJoinLog
           if ($LASTEXITCODE -ne 0) { throw 'Modbus join adapter tests failed' }
-          if (-not (Select-String -Path $modbusJoinLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $modbusJoinLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus join adapter tests did not all run'
           }
           $modbusHubLog = Join-Path $env:RUNNER_TEMP 'wasm-modbus-hub-join-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test modbus_wasm_join_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $modbusHubLog
           if ($LASTEXITCODE -ne 0) { throw 'Modbus Hub join tests failed' }
-          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 9 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus Hub join tests did not all run'
           }
 
