@@ -228,8 +228,7 @@ pub(super) async fn v1_write_value(
             &state.write_audit,
             &ctx,
             &tag,
-        )
-        .await;
+        );
         return missing_write_scope_response();
     }
 
@@ -380,8 +379,7 @@ pub(super) async fn v1_write_values_batch(
         &state.write_audit,
         &ctx,
         &missing,
-    )
-    .await;
+    );
     if scope_missing {
         return missing_write_scope_response();
     }

@@ -544,8 +544,11 @@ async fn one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_wri
 
     // 決定的固定その1: 書込みの監査行は入らない(suppressed 系すら発生しない)。
     // #711: NG だったエントリ自身の定義上の拒否だけが `rejected` で 1 行残る。
-    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
-    app.write_audit.flush().await;
+    // 拒否の監査は周期の書き手が書く(#945 の総点検)。読む前に今すぐ 1 周期ぶん書く。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let audit_after = audit_row_count(&app.router, &app.admin_token).await;
     assert_eq!(
         audit_before + 1,
@@ -662,8 +665,11 @@ async fn range_out_of_bounds_entry_aborts_the_whole_batch_with_no_audit_rows_and
     // 決定的固定その1: write_audit の行数が増えていない(1件も監査 insert
     // されていない - レンジ外の判定は commit フェーズに到達する前の
     // 事前ゲートで完結している)。
-    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
-    app.write_audit.flush().await;
+    // 拒否の監査は周期の書き手が書く(#945 の総点検)。読む前に今すぐ 1 周期ぶん書く。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let audit_after = audit_row_count(&app.router, &app.admin_token).await;
     assert_eq!(
         audit_before, audit_after,
@@ -753,8 +759,11 @@ async fn duplicate_tag_in_the_same_batch_aborts_the_whole_batch() {
     assert_eq!(writes[2]["error"], "duplicate_tag_in_batch");
 
     // 1件も書かれていない: 監査行数不変・レジスタ不変。
-    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
-    app.write_audit.flush().await;
+    // 拒否の監査は周期の書き手が書く(#945 の総点検)。読む前に今すぐ 1 周期ぶん書く。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let audit_after = audit_row_count(&app.router, &app.admin_token).await;
     assert_eq!(audit_before, audit_after);
     assert_eq!(sim.get_word(SlmpDevice::D, 100), 0);
@@ -1081,8 +1090,11 @@ async fn rate_limit_exceeded_by_one_entry_rejects_the_whole_batch() {
 
     // 監査: トリップの原因になった a には rate_limit_tripped が1行増える
     // が、b には増えない(このモジュールの doc comment 参照)。
-    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
-    app.write_audit.flush().await;
+    // 拒否の監査は周期の書き手が書く(#945 の総点検)。読む前に今すぐ 1 周期ぶん書く。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let audit_after = audit_row_count(&app.router, &app.admin_token).await;
     assert_eq!(audit_after, audit_before + 1);
     let rows_b = audit_rows_for_tag(&app.router, &app.admin_token, tag_b).await;

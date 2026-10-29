@@ -925,8 +925,7 @@ impl TagServiceTrait for GrpcService {
                 &self.write_audit,
                 &ctx,
                 &req.tag,
-            )
-            .await;
+            );
             return Err(Status::permission_denied("missing_write_scope"));
         }
 

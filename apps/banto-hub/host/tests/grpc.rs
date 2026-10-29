@@ -1196,7 +1196,10 @@ async fn write_value_not_writable_is_permission_denied() {
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
     // #711: 定義上の拒否も `rejected` として書込み監査に残る。
-    app.write_audit.flush().await;
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let (status, body) = admin_post(
         &app.router,
         "/api/write-audit/list",

@@ -1584,8 +1584,7 @@ async fn tool_write_tag_value(
             &state.write_audit,
             ctx,
             &tag,
-        )
-        .await;
+        );
         return Ok(tool_error(format!(
             "missing_write_scope: タグ '{tag}' への write:{{tag}} スコープを持つ API キーが必要です。"
         )));
@@ -1682,8 +1681,7 @@ async fn tool_write_recipe(
             &state.write_audit,
             ctx,
             &missing_scope,
-        )
-        .await;
+        );
         return Ok(tool_error(format!(
             "missing_write_scope: 次のタグへの write:{{tag}} スコープを持つ API キーが必要です: {}",
             missing_scope.join(", ")

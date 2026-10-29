@@ -197,9 +197,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::api_keys::{ApiKeyContext, ApiKeysService};
 use crate::computed::upsert_retained_value;
 use crate::controller::{CollectionController, CollectionState, RunMode};
-use crate::hub::CollectorManager;
+use crate::hub::{CollectorManager, TagMap};
 use crate::write_audit::{
-    RejectionEntry, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
+    RejectingKey, WriteAuditAction, WriteAuditResult, WriteAuditRow, WriteAuditService,
     WriteRejectionReason,
 };
 use crate::write_control::WriteControl;
@@ -368,7 +368,9 @@ pub enum WriteRejection {
     /// 専用の結果(REST/gRPC の `write_rejection_response`/
     /// `write_rejection_status` がこの分岐に `unreachable!` を置いている
     /// 理由)。このエントリの監査行は残らない(§3.3「1件も書かない」。NG だった
-    /// エントリ自身の定義上の拒否は `rejected` で残る - #711)。
+    /// エントリ自身の定義上の拒否は `rejected` で残る - #711)。ただし、タグが
+    /// 重複したバッチ([`WriteRejection::DuplicateTagInBatch`])は定義上の拒否を残さない
+    /// (#711 の 4 つの理由の外。#945 の総点検 P3-6)。
     BatchAborted,
     /// T20-3a(2026-09-05 監査対応): バッチ内に同じ外部名が2回以上現れた
     /// (=同じタグに2つの値を書けと言われた・どちらが最終値か曖昧なユーザー
@@ -860,71 +862,65 @@ fn gate_rejection_reason(rejection: &WriteRejection) -> Option<WriteRejectionRea
     }
 }
 
-async fn record_gate_rejection(
+fn record_gate_rejection(
     deps: &WriteDeps<'_>,
     ctx: &ApiKeyContext,
     tag: &str,
     rejection: &WriteRejection,
 ) {
     if let Some(reason) = gate_rejection_reason(rejection) {
-        let entry = rejection_entry(deps.manager, ctx, tag, reason);
-        deps.write_audit.record_rejections(vec![entry]);
+        let tag_id = rejection_tag_id(&deps.manager.tag_map(), tag);
+        deps.write_audit
+            .record_rejection(rejecting_key(ctx), tag_id, tag, reason);
     }
 }
 
 /// スコープ外(`missing_write_scope`)の拒否を残す。判定は各入口(REST・gRPC・
 /// MCP)にあるので、入口がここを呼ぶ。`write:{タグ}` を持たないキーの要求
 /// なので、タグは catalog に無いかもしれない(その場合 `tag_id` は 0)。
-pub async fn record_missing_write_scope(
+/// async ではなく、DB にも触れない(拒否の表に足すだけ。`crate::write_audit`)。
+pub fn record_missing_write_scope(
     manager: &CollectorManager,
     write_audit: &WriteAuditService,
     ctx: &ApiKeyContext,
     tag: &str,
 ) {
-    record_missing_write_scopes(manager, write_audit, ctx, &[tag]).await;
+    record_missing_write_scopes(manager, write_audit, ctx, &[tag]);
 }
 
-/// [`record_missing_write_scope`] のバッチ版。全件を 1 つのメッセージで背景のキューへ渡す
-/// (DB を待たずに返る。渡し終えた分は切断でも欠けない)。
-pub async fn record_missing_write_scopes<S: AsRef<str>>(
+/// [`record_missing_write_scope`] のバッチ版。`tag_map()` は 1 回だけ取り、拒否の表は
+/// 1 回だけ lock して全件を足す(#945 の総点検)。
+pub fn record_missing_write_scopes<S: AsRef<str>>(
     manager: &CollectorManager,
     write_audit: &WriteAuditService,
     ctx: &ApiKeyContext,
     tags: &[S],
 ) {
-    let entries = tags
-        .iter()
-        .map(|tag| {
-            rejection_entry(
-                manager,
-                ctx,
-                tag.as_ref(),
+    let map = manager.tag_map();
+    write_audit.record_rejections(
+        rejecting_key(ctx),
+        tags.iter().map(|tag| {
+            let tag = tag.as_ref();
+            (
+                rejection_tag_id(&map, tag),
+                tag,
                 WriteRejectionReason::MissingWriteScope,
             )
-        })
-        .collect();
-    write_audit.record_rejections(entries);
+        }),
+    );
 }
 
-fn rejection_entry(
-    manager: &CollectorManager,
-    ctx: &ApiKeyContext,
-    tag: &str,
-    reason: WriteRejectionReason,
-) -> RejectionEntry {
-    let tag_id = manager
-        .tag_map()
-        .get(tag)
-        .map(|entry| entry.ids.2)
-        .unwrap_or(0);
-    RejectionEntry {
-        api_key_id: ctx.id,
-        api_key_name: ctx.name.clone(),
-        api_key_prefix: ctx.prefix.clone(),
-        tag_id,
-        external_name: tag.to_string(),
-        reason,
+fn rejecting_key(ctx: &ApiKeyContext) -> RejectingKey<'_> {
+    RejectingKey {
+        id: ctx.id,
+        name: &ctx.name,
+        prefix: &ctx.prefix,
     }
+}
+
+/// 拒否の監査の `tag_id`(catalog に無ければ 0)。
+fn rejection_tag_id(map: &TagMap, tag: &str) -> i64 {
+    map.get(tag).map(|entry| entry.ids.2).unwrap_or(0)
 }
 
 /// 書き込みゲート1〜8の本体(このモジュールの doc comment 参照)。
@@ -964,7 +960,7 @@ pub async fn execute_write(
     let resolved = match resolve_write_target(deps, collection_mode, tag, requested).await {
         Ok(resolved) => resolved,
         Err(rejection) => {
-            record_gate_rejection(deps, ctx, tag, &rejection).await;
+            record_gate_rejection(deps, ctx, tag, &rejection);
             return Err(rejection);
         }
     };
@@ -1270,13 +1266,22 @@ pub async fn execute_write_batch(
         let prepared = prepare_batch_entry(deps, collection_mode, tag, requested.clone()).await;
         if let Err(rejection) = &prepared {
             if let Some(reason) = gate_rejection_reason(rejection) {
-                rejected.push(rejection_entry(deps.manager, ctx, tag, reason));
+                rejected.push((tag.as_str(), reason));
             }
         }
         prepare_results.push(prepared);
     }
-    // 拒否の監査は全件を 1 つのメッセージで背景のキューへ渡す(待たない。#945 のレビュー)。
-    deps.write_audit.record_rejections(rejected);
+    // 拒否の監査は、`tag_map()` を 1 回だけ取り、表を 1 回だけ lock して全件を足す
+    // (DB を待たない。#945 の総点検)。
+    if !rejected.is_empty() {
+        let map = deps.manager.tag_map();
+        deps.write_audit.record_rejections(
+            rejecting_key(ctx),
+            rejected
+                .iter()
+                .map(|&(tag, reason)| (rejection_tag_id(&map, tag), tag, reason)),
+        );
+    }
 
     if prepare_results.iter().any(Result::is_err) {
         // 1件でも NG なら実書き込みを一切しない - 書込みの監査行も broker 呼び出し

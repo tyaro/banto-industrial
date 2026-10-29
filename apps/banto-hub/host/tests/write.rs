@@ -762,8 +762,11 @@ async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and
 
 /// #711: 書込み監査の `rejected` 行を (外部名, tag_id, detail) で返す。
 async fn rejected_rows(app: &TestApp) -> Vec<(String, i64, String)> {
-    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
-    app.write_audit.flush().await;
+    // 拒否の監査は周期の書き手が書く(#945 の総点検)。読む前に今すぐ 1 周期ぶん書く。
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
     let (status, listed) = admin_post(
         &app.router,
         "/api/write-audit/list",
