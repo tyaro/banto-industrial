@@ -713,7 +713,10 @@ async fn routes_snapshot_matches() {
     let (tx, _rx) = tokio_broadcast::channel(16);
     let opcua_router = opcua_settings_router(
         env.manager.clone(),
-        crate::opcua::OpcUaPublisher::new(env.manager.clone()),
+        crate::opcua::OpcUaPublisher::new(
+            env.manager.clone(),
+            std::env::temp_dir().join("banto-hub-routes-snapshot-opcua-pki-unused"),
+        ),
         audit.clone(),
         user_auth_state(users, audit),
         tx,

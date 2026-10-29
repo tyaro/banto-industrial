@@ -3,7 +3,7 @@
 //!
 //! ## listener の起動は裏で行う（#634、2026-10-17 オーナー決定 案 2）
 //!
-//! `OpcUaServer::start` は一時 RSA 鍵の生成などで数秒〜10 秒超かかる。
+//! `OpcUaServer::start` は初回の RSA 鍵の生成などで数秒〜10 秒超かかる。
 //! [`OpcUaPublisher::apply`] は設定を記録して起動を背景タスクへ渡したらすぐ
 //! 返り、起動の結果は [`OpcUaStatus`]（`GET /api/opcua-status`）に出す。
 //! 状態は「停止 → 起動中 → 起動済み / 失敗（理由つき）」。
@@ -35,10 +35,25 @@
 //! - **panic しても `starting` に残さない**: 起動タスクが panic したら、
 //!   世代が最新のときは `failed`（理由つき）にする。`initialize` の起動の
 //!   待ちには、ハングを検出するための有限の上限（[`SETTLE_LIMIT`]）がある。
+//!
+//! ## 鍵と証明書の置き場（#634 の残り、2026-10-29 オーナー決定「採用する」）
+//!
+//! banto-opcua の `ServerConfig::with_pki_dir`（banto-opcua#23）に、profile の保護された
+//! データの下の置き場（[`crate::opcua_pki::pki_dir`]）を渡す。鍵と証明書は初回だけ作り、
+//! 次の起動からは再利用する（以前は起動のたびに一時 PKI で作っていた）。
+//! - 本番の starter は、blocking 用のスレッドで**鍵を作る・読む前に**
+//!   [`crate::opcua_pki::prepare`] で置き場を用意して ACL を確かめ、広い ACE などで断られたら
+//!   起動しない（`failed` と理由）。
+//! - banto-opcua の `Error::Pki`（置き場・組を用意できない）も `failed` と理由（置き場と
+//!   再試行のしかたつき）にしてログに出す。原因を直したあと、同じ設定の保存が再試行になる
+//!   （`apply` は `failed` のときの同じ設定を再試行として扱う）。
+//! - 同じ置き場への起動は重ならない: 置き場は profile ごと（profile は 1 プロセスだけが
+//!   握る）で、このプロセスの中では上の「停止と起動が重ならない」の鎖で起動が 1 つずつ走る。
 
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -129,16 +144,81 @@ type Starter =
 /// 本番の starter。`OpcUaServer::start` の同期の処理（`builder.build`・
 /// 鍵の生成）を blocking 用のスレッドで行い、async の worker を塞がない
 /// （モジュール doc「async の worker を塞がない」）。
+///
+/// 鍵と証明書の置き場（`config.pki_dir`）があれば、鍵を作る・読む前に
+/// [`crate::opcua_pki::prepare`] で用意して確かめ、断られたら起動しない
+/// （モジュール doc「鍵と証明書の置き場」）。
 fn real_starter() -> Starter {
     Arc::new(|config| {
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || handle.block_on(OpcUaServer::start(config)))
+            tokio::task::spawn_blocking(move || start_blocking(&handle, config))
                 .await
                 .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
-                .map_err(|err| err.to_string())
         })
     })
+}
+
+/// blocking 用のスレッドで行う起動の本体（置き場の確かめ → `OpcUaServer::start`）。
+fn start_blocking(
+    handle: &tokio::runtime::Handle,
+    config: ServerConfig,
+) -> Result<RunningServer, String> {
+    #[cfg(test)]
+    start_gate::wait(config.port);
+    let pki_dir = config.pki_dir.clone();
+    if let Some(dir) = &pki_dir {
+        crate::opcua_pki::prepare(dir)?;
+    }
+    handle
+        .block_on(OpcUaServer::start(config))
+        .map_err(|err| describe_start_error(&err, pki_dir.as_deref()))
+}
+
+/// 起動の失敗の文言。`Error::Pki`（置き場・鍵と証明書の組を用意できない）には、
+/// 置き場と再試行のしかたを足す（banto-opcua#23: 片方だけ残ったファイルは次の起動で
+/// 消して組で作り直す。存在の確かめ自体が権限エラーのときは消さずに止まるので、
+/// 原因を直してから再試行する）。
+fn describe_start_error(
+    err: &banto_opcua_server::Error,
+    pki_dir: Option<&std::path::Path>,
+) -> String {
+    match (err, pki_dir) {
+        (banto_opcua_server::Error::Pki(_), Some(dir)) => format!(
+            "{err}（鍵と証明書の置き場: {}。原因を直してから、同じ設定でもう一度保存すると再試行します。片方だけ残った鍵・証明書は次の起動で作り直します）",
+            dir.display()
+        ),
+        _ => err.to_string(),
+    }
+}
+
+/// テストだけの、起動を止める門（`runtime` のテスト
+/// `opcua_put_and_status_respond_during_a_real_start_on_one_worker`）。ポートごとに
+/// 登録し、本物の starter の blocking 用のスレッドの中で**同期で**待つ（鍵の生成の
+/// 遅さに頼らずに「起動中」を作る。`spawn_blocking` をやめると唯一の worker が
+/// 塞がって落ちる）。送り手を落とすと待ちが終わる。
+#[cfg(test)]
+pub(crate) mod start_gate {
+    use std::collections::HashMap;
+    use std::sync::mpsc::{channel, Receiver, Sender};
+    use std::sync::{LazyLock, Mutex};
+
+    static GATES: LazyLock<Mutex<HashMap<u16, Receiver<()>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    /// `port` への次の起動を、返した送り手が送る（落ちる）まで止める。
+    pub(crate) fn hold(port: u16) -> Sender<()> {
+        let (tx, rx) = channel();
+        GATES.lock().expect("gates").insert(port, rx);
+        tx
+    }
+
+    pub(super) fn wait(port: u16) {
+        let gate = GATES.lock().expect("gates").remove(&port);
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
+    }
 }
 
 /// panic の内容を文言にする。
@@ -200,14 +280,23 @@ pub struct OpcUaPublisher {
     /// 状態は `inner` のロックの下でだけ書く（世代の判定と同じ順序に乗せる）。
     status: watch::Sender<OpcUaStatus>,
     starter: Starter,
+    /// 鍵と証明書の置き場（[`crate::opcua_pki`]）。`None` は起動のたびの一時 PKI
+    /// （テストだけ）。
+    pki_dir: Option<PathBuf>,
 }
 
 impl OpcUaPublisher {
-    pub fn new(manager: Arc<CollectorManager>) -> Arc<Self> {
-        Self::with_starter(manager, real_starter())
+    /// `pki_dir` は鍵と証明書の置き場（profile の保護されたデータの下。
+    /// [`crate::opcua_pki::pki_dir`]）。
+    pub fn new(manager: Arc<CollectorManager>, pki_dir: PathBuf) -> Arc<Self> {
+        Self::with_starter(manager, real_starter(), Some(pki_dir))
     }
 
-    fn with_starter(manager: Arc<CollectorManager>, starter: Starter) -> Arc<Self> {
+    fn with_starter(
+        manager: Arc<CollectorManager>,
+        starter: Starter,
+        pki_dir: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             manager,
             inner: Mutex::new(Inner {
@@ -222,6 +311,7 @@ impl OpcUaPublisher {
             }),
             status: watch::channel(OpcUaStatus::stopped(0)).0,
             starter,
+            pki_dir,
         })
     }
 
@@ -294,7 +384,7 @@ impl OpcUaPublisher {
             self.status.send_replace(OpcUaStatus::stopped(generation));
             return;
         }
-        let config = match server_config(settings) {
+        let config = match server_config(settings, self.pki_dir.as_deref()) {
             Ok(config) => config,
             Err(reason) => {
                 log_err_line(&format!("banto-hub: OPC UA を起動しません: {reason}"));
@@ -543,7 +633,10 @@ impl OpcUaPublisher {
 }
 
 /// 保存済みの設定から listener の設定を作る。不正なら状態の API に出す理由を返す。
-fn server_config(settings: &OpcUaSettings) -> Result<ServerConfig, String> {
+fn server_config(
+    settings: &OpcUaSettings,
+    pki_dir: Option<&std::path::Path>,
+) -> Result<ServerConfig, String> {
     let validation = crate::rest::validate_opcua_settings(settings);
     if !validation.is_empty() {
         let fields = validation
@@ -565,6 +658,9 @@ fn server_config(settings: &OpcUaSettings) -> Result<ServerConfig, String> {
         .with_sample_tags(false);
     if let Some(host) = &settings.advertised_host {
         config = config.with_advertised_host(host);
+    }
+    if let Some(dir) = pki_dir {
+        config = config.with_pki_dir(dir);
     }
     Ok(config)
 }
@@ -624,6 +720,10 @@ mod tests {
     }
 
     async fn publisher_with(starter: Starter) -> Arc<OpcUaPublisher> {
+        publisher_with_pki(starter, None).await
+    }
+
+    async fn publisher_with_pki(starter: Starter, pki_dir: Option<PathBuf>) -> Arc<OpcUaPublisher> {
         let pool = crate::db::migrate_memory().await.expect("migrate_memory");
         let computed = Arc::new(crate::computed::ComputedEngine::new(Arc::new(
             crate::computed::ServerTagStore::new(),
@@ -640,7 +740,7 @@ mod tests {
             Arc::new(crate::broker_glue::BrokerSimRegistry::new()),
             computed,
         ));
-        OpcUaPublisher::with_starter(manager, starter)
+        OpcUaPublisher::with_starter(manager, starter, pki_dir)
     }
 
     fn free_port() -> u16 {
@@ -887,6 +987,98 @@ mod tests {
         assert!(tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .is_err());
+    }
+
+    /// #634: 鍵と証明書の置き場を渡すと、2 回目の起動は同じ鍵と証明書を再利用する
+    /// （ファイルの中身が同じ。初回だけ生成するので 2 回目は速い）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_second_start_reuses_the_key_and_certificate() {
+        let root = crate::test_support::TempDir::new("opcua-pki-reuse");
+        let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
+        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let port = free_port();
+        let first_started = tokio::time::Instant::now();
+        publisher.apply(&enabled(port)).await;
+        wait_state(&publisher, OpcUaState::Running).await;
+        let first_elapsed = first_started.elapsed();
+        let cert = pki.join("own").join("cert.der");
+        let key = pki.join("private").join("private.pem");
+        let first = (std::fs::read(&cert).unwrap(), std::fs::read(&key).unwrap());
+        assert!(!first.0.is_empty() && !first.1.is_empty());
+
+        publisher.apply(&disabled(port)).await;
+        let second_started = tokio::time::Instant::now();
+        publisher.apply(&enabled(port)).await;
+        let running = wait_state(&publisher, OpcUaState::Running).await;
+        let second_elapsed = second_started.elapsed();
+        assert_eq!(running.generation, 3);
+        let second = (std::fs::read(&cert).unwrap(), std::fs::read(&key).unwrap());
+        assert_eq!(first, second, "鍵と証明書は作り直さずに再利用する");
+        eprintln!("OPC UA の起動: 初回 {first_elapsed:?}、2 回目 {second_elapsed:?}");
+        publisher.shutdown().await;
+    }
+
+    /// #634: banto-opcua の `Error::Pki`（ここでは証明書の場所がフォルダで、片方だけの
+    /// ファイルとして消せない）は `failed` と理由（置き場と再試行のしかた）になる。原因を
+    /// 取り除くと、同じ設定の保存で起動できる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pki_error_is_reported_and_the_same_settings_retry_after_the_fix() {
+        let root = crate::test_support::TempDir::new("opcua-pki-error");
+        let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
+        crate::opcua_pki::prepare(&pki).expect("pki dir");
+        let blocker = pki.join("own").join("cert.der");
+        std::fs::create_dir_all(blocker.join("blocker")).unwrap();
+        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let settings = enabled(free_port());
+        publisher.apply(&settings).await;
+        let failed = wait_state(&publisher, OpcUaState::Failed).await;
+        let reason = failed.error.expect("reason");
+        assert!(reason.contains("証明書ディレクトリ"), "{reason}");
+        assert!(reason.contains(&pki.display().to_string()), "{reason}");
+        assert!(reason.contains("再試行"), "{reason}");
+
+        std::fs::remove_dir_all(&blocker).unwrap();
+        publisher.apply(&settings).await;
+        let running = wait_state(&publisher, OpcUaState::Running).await;
+        assert_eq!(running.generation, 2);
+        assert!(pki.join("private").join("private.pem").is_file());
+        publisher.shutdown().await;
+    }
+
+    /// #634: 置き場に広い ACE（Users）があると、鍵を作らずに `failed` になり、理由が状態に
+    /// 出る。ACE を外すと、同じ設定の保存で起動できる。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broad_ace_on_the_pki_dir_fails_without_a_key_and_retries_after_the_fix() {
+        let root = crate::test_support::TempDir::new("opcua-pki-broad-ace");
+        let pki = crate::opcua_pki::pki_dir(&root.path().join("data"));
+        crate::opcua_pki::prepare(&pki).expect("pki dir");
+        let icacls = |args: &[&str]| {
+            let output = std::process::Command::new("icacls")
+                .arg(&pki)
+                .args(args)
+                .output()
+                .expect("icacls");
+            assert!(output.status.success(), "icacls {args:?}: {output:?}");
+        };
+        icacls(&["/grant", "*S-1-5-32-545:(OI)(CI)(R)"]);
+        let publisher = publisher_with_pki(real_starter(), Some(pki.clone())).await;
+        let settings = enabled(free_port());
+        publisher.apply(&settings).await;
+        let failed = wait_state(&publisher, OpcUaState::Failed).await;
+        let reason = failed.error.expect("reason");
+        assert!(reason.contains("Users（S-1-5-32-545）"), "{reason}");
+        assert!(reason.contains("鍵を作らず"), "{reason}");
+        assert!(
+            !pki.join("private").join("private.pem").exists(),
+            "鍵を作らない"
+        );
+
+        icacls(&["/remove:g", "*S-1-5-32-545"]);
+        publisher.apply(&settings).await;
+        wait_state(&publisher, OpcUaState::Running).await;
+        assert!(pki.join("private").join("private.pem").is_file());
+        publisher.shutdown().await;
     }
 
     #[test]

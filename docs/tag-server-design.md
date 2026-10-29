@@ -1,7 +1,7 @@
 # タグサーバーアプリ 設計ドキュメント（草案）
 
 作成日: 2026-08-04
-状態: **実装追従中（2026-10-28 更新: §6 の 3 項（log-before-write）に、監査の結果 `uncertain`（送ったあとで結果が分からなくなった書込み、#898、migration `0107`）を足した。2026-10-23 更新: §3.4・§3.4.1 に R2b-3（I/O の一本化）後のドライバの層構造を注記した（Modbus TCP・SLMP は `FrameDriver`、通信は公開 crate `banto-driver-engine`、シリアル接続は #803 へ後回し）。2026-10-21 更新: §5.1 の表に DB ブリッジの設定の取得口 `GET /api/ingest/bridge-config`（R2a-3b）を足した。同日更新: §5.1 の表に取り込み口の WebSocket の送信口 `GET /api/v1/ingest/{id}/stream`（R2a-2d）を足した。同日更新: §5.1 の表に取り込み口の REST の送信口 `POST /api/v1/ingest/{id}/values`（R2a-2c）を足した。2026-10-19 更新: §4 に収集グループ名の一意性を接続内へ緩めたこと（migration 0022）と設定パッケージの版 2（版 1 は読まない）をオーナー決定として足した。同日更新: §3.4.1 に受け側（アダプター）を別リポジトリで先行して作り後から取り込む方針（オーナー決定）を足した。同日更新: §3.4.1 に OPC UA クライアントのドライバは async-opcua をサーバーとそろえる決まり（4）を足した。2026-10-18 更新: §3.4.1 に新しい PLC ドライバの置き場所（ワイヤ層は別リポジトリ、つなぎ部分は本リポジトリ）のオーナー決定を足した（#438）。2026-10-17 更新: §4 にドットを含む名前による外部名の重なりの扱い（作成・改名で断る、既存の重なりは起動時に警告）を足した（#635）。§5.5 の OPC UA の有効化 PUT を、保存して起動を始めたらすぐ返す形にし、listener の状態を `GET /api/opcua-status` に出した（#634）。§5.5 の banto-opcua ADR へのリンクを、固定先と同じ banto-opcua main のコミット `d6e0291` に揃えた（#633）。2026-10-16 更新: #201 の診断用 OPC UA Phase 2 を追加。#615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
+状態: **実装追従中（2026-10-29 更新: §5.5 で banto-opcua の `with_pki_dir`（banto-opcua#23、rev `42328ea`）を採用し、OPC UA の鍵と証明書を profile の `data\opcua\pki` に保存して再利用するようにした。鍵を作る前の ACL の確かめ・`Error::Pki` の表示と再試行・起動の直列化も記録した（#634、オーナー決定「採用する」）。2026-10-28 更新: §6 の 3 項（log-before-write）に、監査の結果 `uncertain`（送ったあとで結果が分からなくなった書込み、#898、migration `0107`）を足した。2026-10-23 更新: §3.4・§3.4.1 に R2b-3（I/O の一本化）後のドライバの層構造を注記した（Modbus TCP・SLMP は `FrameDriver`、通信は公開 crate `banto-driver-engine`、シリアル接続は #803 へ後回し）。2026-10-21 更新: §5.1 の表に DB ブリッジの設定の取得口 `GET /api/ingest/bridge-config`（R2a-3b）を足した。同日更新: §5.1 の表に取り込み口の WebSocket の送信口 `GET /api/v1/ingest/{id}/stream`（R2a-2d）を足した。同日更新: §5.1 の表に取り込み口の REST の送信口 `POST /api/v1/ingest/{id}/values`（R2a-2c）を足した。2026-10-19 更新: §4 に収集グループ名の一意性を接続内へ緩めたこと（migration 0022）と設定パッケージの版 2（版 1 は読まない）をオーナー決定として足した。同日更新: §3.4.1 に受け側（アダプター）を別リポジトリで先行して作り後から取り込む方針（オーナー決定）を足した。同日更新: §3.4.1 に OPC UA クライアントのドライバは async-opcua をサーバーとそろえる決まり（4）を足した。2026-10-18 更新: §3.4.1 に新しい PLC ドライバの置き場所（ワイヤ層は別リポジトリ、つなぎ部分は本リポジトリ）のオーナー決定を足した（#438）。2026-10-17 更新: §4 にドットを含む名前による外部名の重なりの扱い（作成・改名で断る、既存の重なりは起動時に警告）を足した（#635）。§5.5 の OPC UA の有効化 PUT を、保存して起動を始めたらすぐ返す形にし、listener の状態を `GET /api/opcua-status` に出した（#634）。§5.5 の banto-opcua ADR へのリンクを、固定先と同じ banto-opcua main のコミット `d6e0291` に揃えた（#633）。2026-10-16 更新: #201 の診断用 OPC UA Phase 2 を追加。#615 の現在値の不正値を全 IF で欠測・Bad に統一。2026-10-14 更新: §9 P3-b の SLMP CPU 種別を接続ごとに選べるようにした（#605、migration `0021`、既定 R。Q は QJ71E71 の 4E フレーム。アクセスルートは未露出）。2026-10-10 更新: §7 の「ChronoGazer の banto-hub 経由ドライバ」の行に、#383 段階3 の P2（レジストリの接続の種別 `hub`。banto-hub 自身は `hub` 接続を作らず、REST・MCP・未適用キューの適用で断る）を足した。2026-10-09 更新: しきい値を Hub から外した（#533）。§4 のメタデータと §5 の `/api/v1/events` の行を実装に合わせた。2026-10-08 更新: §4 のメタデータに、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07 更新: §5.6 制約1 の応答の CSP の運用条件を、banto v5.1.0 の `request_is_loopback_local`（接続元と宛先の `Host` の両方が loopback）に合わせて書き換えた。2026-10-06 更新: §5.6 制約1 の同一ホストのリバースプロキシの運用条件に、応答の CSP（loopback の接続元にだけ Tauri IPC を足す、#505・banto v5.0.0）も同じ前提に立つことを追記。2026-10-04 更新: §5.6「試運転モードとロックダウン」を banto v3.0.0（ADR-0017）の grant 方式に書き換えた - 試運転中も管理 REST/WS は bearer が必須で、loopback の接続元だけが `POST /api/auth/grant/commissioning` で合成 admin の grant を受け取る。ロックダウンは「保存 → 失効」。リバースプロキシ配下の運用条件 2 点を追記。banto-hub v0.2.0-alpha.28。2026-10-02 更新: §5.6「試運転モードとロックダウン」の実装状況に、管理 UI の
 セッションの確定は banto v2.0.0 の SessionController に寄せ、試運転は policy runner の `adopt`/`end` で
 確定・終了することを追記（v2 移行 PR1d、banto-hub v0.2.0-alpha.26。サーバー側の設計・wire は変更なし）。
 2026-09-30 更新: §4.1 のバインディングキーを外部名のみに改め、安定 ID によるリネーム検出を撤回（オーナー決定、scada-design.md §9.6）。2026-09-24 更新: §6 の 6 項に、書き込み受付の停止を DB と状態ファイルの
@@ -1153,7 +1153,7 @@ message TagValue {
 設定変更と終了時には古い listener と同期タスクを停止する。
 
 `PUT /api/opcua-settings` は設定を保存して listener の停止・起動を始めたら
-すぐ返る（#634、2026-10-17 オーナー決定。起動は一時 RSA 鍵の生成などで
+すぐ返る（#634、2026-10-17 オーナー決定。初回の起動は RSA 鍵の生成などで
 数秒〜10 秒超かかる）。200 は「保存した」までを意味し、listener の状態は
 admin 限定の `GET /api/opcua-status` に `stopped`・`starting`・`running`
 （`endpoint` つき）・`failed`（`error` に理由）で出す。bind の失敗もここと
@@ -1164,9 +1164,35 @@ admin 限定の `GET /api/opcua-status` に `stopped`・`starting`・`running`
 Hub の起動時の復元だけは、これまでどおり起動の結果まで待つ（上限 120 秒）。
 `OpcUaServer::start` の同期の処理（`builder.build`・鍵の生成）は blocking 用の
 スレッドで行い、async の worker を塞がない。起動処理の panic は `failed` にする。
-ここまでは #634 の PUT の非同期化で、鍵を保存して起動を速くする banto-opcua の
-`with_pki_dir`（banto-opcua#23）の採用（profile ごとの保護された場所・ACL の確認・
-`Error::Pki` の扱い・起動の直列化）は #634 に残っている。
+
+**鍵と証明書の保存（#634、2026-10-29 オーナー決定「採用する」）**: banto-opcua の
+`ServerConfig::with_pki_dir`（banto-opcua#23、
+[ADR-0003](https://github.com/tyaro/banto-opcua/blob/42328ea2698979472241645b4cab2f8e3ee1d5a5/docs/adr/0003-persistent-pki-dir.md)、
+依存の rev は `42328ea`）を採用し、自己署名の鍵と証明書を初回だけ作って次の起動から
+再利用する（手元の計測で、初回 約 0.4 秒・2 回目 約 0.06 秒）。
+
+- 置き場は**対象の profile の保護されたデータ**の下の `opcua\pki`（profile を握って
+  起動したときは profile の `data\` の本当のパスの下。`BANTO_HUB_DATA` で tstore を
+  外へ移していても profile の中。握っていないときは実効のデータのフォルダの下）。
+  製品のルートや profile をまたいで共有されうる場所には置かない。
+- **秘密鍵を作る・読む前に**、置き場を確かめる（`banto-hub-core` の `opcua_pki`）。
+  無ければ保護された DACL（SYSTEM・Administrators のフルと、実行している利用者の
+  「変更」。LocalSystem なら SYSTEM・Administrators だけ）で作る。あれば置き場と中の
+  子のすべて（既にある鍵・証明書を含む）を辿らずに開いて記述子を読み、広いグループ
+  （Everyone・Users・Authenticated Users・Domain Users など）への許可の ACE（明示・
+  継承を問わない）、null DACL、種類の分からない ACE、reparse point・ハードリンクが
+  あれば、鍵を作らずに起動を `failed` にする。Windows 以外は、既にある鍵の
+  `mode & 0o077`、置き場・`own`・`private` の `mode & 0o002`、シンボリックリンクで断る
+  （banto-opcua が鍵のフォルダを 0700・鍵を 0600 にする）。
+- banto-opcua の `Error::Pki`（置き場・組を用意できない）と ACL の拒否は、ログと
+  `GET /api/opcua-status` の `failed`（理由に置き場と再試行のしかた）に出す。原因を
+  直したあと、同じ設定の保存が再試行になる（片方だけ残った鍵・証明書は banto-opcua が
+  次の起動で消して組で作り直す。存在の確かめ自体が権限エラーなら消さずに止まる）。
+- 同じ置き場への起動は重ならない: profile は 1 プロセスだけが握り（profile の排他）、
+  プロセスの中では上の「次の起動は前の起動の後始末が終わってから」の直列化で起動が
+  1 つずつ走る。
+- 運用の手順（置き場・作り直し・失敗の表示）は
+  [運用ガイド §22](banto-hub-operations.md#22-opc-ua-の鍵と証明書)。
 
 Hub の TagMap を周期的に照合し、タグの追加・削除・改名・型変更を OPC UA の
 Browse 空間へ反映する。Variable NodeId は `{connection}.{group}.{tag}` の
@@ -1194,7 +1220,7 @@ RUSTSEC-2023-0071（RSA 秘密操作のタイミングサイドチャネル）�
 Phase 2 は None/Anonymous 固定でその操作を提供しないため、`deny.toml` で
 この advisory のみ期限付きで除外する。2027-01-15 または証明書・SecurityPolicy
 を扱う Phase 3 着手時の早い方で見直し、修正版が出たら依存を更新して除外を外す。
-根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/d6e0291d492890261636a5103ea434665b02c476/docs/adr/0001-async-opcua-base.md) に記録する。
+根拠は [banto-opcua ADR-0001](https://github.com/tyaro/banto-opcua/blob/42328ea2698979472241645b4cab2f8e3ee1d5a5/docs/adr/0001-async-opcua-base.md) に記録する。
 
 ### 5.6 認証（全プロトコル共通)
 
