@@ -182,29 +182,28 @@ impl banto_driver_api::SessionDriver for FrameDial {
     }
 }
 
-/// Transport validation belongs to the host that opens it. Serial support and
-/// resynchronisation are added in 3e; never silently dial TCP for an unknown kind.
+/// Transport validation belongs to the host that opens it. TCP and (#916) UDP
+/// are dialled when the descriptor lists them; serial waits for the line
+/// resynchronisation (#803). Never silently dial TCP for an unknown kind.
 fn frame_transport(
     settings: &banto_driver_api::Settings,
     descriptor: &banto_driver_api::DriverDescriptor,
 ) -> Result<banto_driver_engine::transport::TransportSpec, banto_driver_api::FieldError> {
-    use banto_driver_api::{keys, FieldError};
-    match settings.get(keys::TRANSPORT).unwrap_or("tcp") {
-        "tcp" => {}
+    use banto_driver_api::{keys, FieldError, Transport};
+    let (kind, label) = match settings.get(keys::TRANSPORT).unwrap_or("tcp") {
+        "tcp" => (Transport::Tcp, "TCP"),
+        "udp" => (Transport::Udp, "UDP"),
         _ => {
             return Err(FieldError::new(
                 keys::TRANSPORT,
                 "このエンジンで未対応の通信方式です",
             ))
         }
-    }
-    if !descriptor
-        .transports
-        .contains(&banto_driver_api::Transport::Tcp)
-    {
+    };
+    if !descriptor.transports.contains(&kind) {
         return Err(FieldError::new(
             keys::TRANSPORT,
-            "このドライバは TCP 通信に対応していません",
+            format!("このドライバは {label} 通信に対応していません"),
         ));
     }
     let host = settings
@@ -216,8 +215,10 @@ fn frame_transport(
         .and_then(|port| port.parse::<u16>().ok())
         .filter(|port| *port != 0)
         .ok_or_else(|| FieldError::new(keys::PORT, "1〜65535 で指定してください"))?;
-    Ok(banto_driver_engine::transport::TransportSpec::Tcp {
-        host: host.to_owned(),
-        port,
+    let host = host.to_owned();
+    Ok(if kind == Transport::Udp {
+        banto_driver_engine::transport::TransportSpec::Udp { host, port }
+    } else {
+        banto_driver_engine::transport::TransportSpec::Tcp { host, port }
     })
 }

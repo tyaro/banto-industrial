@@ -515,6 +515,23 @@ async fn frame_transport_policy_rejects_before_directory_or_direct_dial_io() {
         ),
         (vec![Transport::Serial], Some("tcp"), "対応していません"),
         (vec![Transport::Serial], None, "対応していません"),
+        // #916: UDP only when the descriptor lists it, and never TCP instead.
+        (
+            vec![Transport::Tcp],
+            Some("udp"),
+            "UDP 通信に対応していません",
+        ),
+        (vec![Transport::Udp], None, "TCP 通信に対応していません"),
+        (
+            vec![Transport::Udp],
+            Some("tcp"),
+            "TCP 通信に対応していません",
+        ),
+        (
+            vec![Transport::Tcp, Transport::Udp],
+            Some("serial"),
+            "未対応",
+        ),
     ] {
         let stats = Arc::<Stats>::default();
         let mut driver = Driver::new(stats.clone(), 0);
@@ -559,6 +576,67 @@ async fn frame_transport_policy_rejects_before_directory_or_direct_dial_io() {
         assert_eq!(stats.connects.load(Ordering::SeqCst), 0);
         assert_eq!(supervisor.directory().connection_count(), 0);
         supervisor.shutdown().await;
+    }
+}
+
+/// #916: a driver listing UDP is dialled over UDP through the engine (one
+/// datagram each way), and a handshake with no round trip is refused there.
+#[tokio::test]
+async fn frame_dial_connects_over_udp_when_the_descriptor_lists_it() {
+    use banto_driver_api::Transport;
+    const LONG: Duration = Duration::from_secs(10);
+    let peer = tokio::net::UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+    let port = peer.local_addr().unwrap().port().to_string();
+    let settings = Settings::from_pairs([
+        ("transport", "udp"),
+        ("host", "127.0.0.1"),
+        ("port", port.as_str()),
+    ])
+    .unwrap();
+    let answer = |expect: u8| {
+        let peer = &peer;
+        async move {
+            let mut buf = [0u8; 16];
+            let (n, from) = tokio::time::timeout(LONG, peer.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(&buf[..n], [expect]);
+            peer.send_to(&[expect], from).await.unwrap();
+        }
+    };
+    for handshake in [1, 0] {
+        let mut driver = Driver::new(Arc::default(), 0);
+        driver.descriptor.transports = vec![Transport::Udp];
+        driver.handshake = handshake;
+        let mut registry = DriverRegistry::new();
+        registry
+            .register(DriverEntry::frame(Arc::new(driver)))
+            .unwrap();
+        let resolved = resolve_session_driver(&registry, "frame-test").unwrap();
+        assert_eq!(resolved.driver().validate_config(&settings), vec![]);
+        let connect = resolved
+            .driver()
+            .connect(&settings, ConnectContext::new("test", LONG, LONG));
+        if handshake == 0 {
+            assert!(matches!(
+                connect.await,
+                Err(FatalError::Protocol(ref reason)) if reason.contains("1 往復")
+            ));
+            continue;
+        }
+        let (session, ()) = tokio::join!(connect, answer(b'H'));
+        let mut session = session.unwrap();
+        let specs = [TagSpec::new(
+            resolved
+                .driver()
+                .parse_address("D0", &TagKind::numeric(DataType::U16))
+                .unwrap(),
+            TagKind::numeric(DataType::U16),
+        )];
+        let (values, ()) = tokio::join!(session.read_batch(&specs), answer(b'R'));
+        assert_eq!(values.unwrap(), vec![Ok(Value::F64(7.0))]);
+        session.disconnect().await;
     }
 }
 

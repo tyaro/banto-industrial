@@ -3,8 +3,8 @@
 > 2026-10-25 追記: R2b-7 の追従結果: 7d-1 #829 で ChronoGazer の保存規則を `banto-tags` のレジストリへ移し、`banto-collect` の `check_tag_address`・`address_notation`・通常の `banto-plc` 依存を撤去した。7a/7d-2 で MCP と ChronoGazer の接続の外の形を `settings` に揃えた。§8 と Q5 の旧規則は R2b-3 当時の記録。シリアル #803 は引き続き凍結。
 
 作成日: 2026-10-22
-最終更新: 2026-10-25（R2b-7e の実装結果を追記）。以前: 2026-10-23（R2b-3f（docs・CHANGELOG・版上げ）で R2b-3 を閉じた。シリアル接続（3e-2 以降）は 2026-10-23 オーナー判断で #803 へ移した）
-状態: **R2b-3 は 3f で完了（2026-10-23、v0.2.0-alpha.37）。ただしシリアル接続は #803 へ後回し（2026-10-23 オーナー判断）**。設計確定は 2026-10-22（オーナー決定。§13 の Q1〜Q14 はすべて推奨どおり。Q4 の SLMP のフレームの自前化も推奨どおり）。実装済みの PR 列: 3a-1 #787・3a-2 #788（後追い #790）・3a-3 #791（Modbus / SLMP の `SessionDriver`・broker と Hub の要求の型・収集と ChronoGazer を broker へ・橋の削除）、3b-core #789・3b-join #792（エンジン `banto-driver-engine`・broker の Frame ダイヤル・適合テストのハーネスを本物のエンジンへ）、3c #795・3c-join #797（Modbus TCP を `FrameDriver` に）、3d #793・#798・3d-join #799（SLMP の 4E フレームを自前化し `FrameDriver` に。`PlcClient` / `PlcWriteClient` など旧 I/O を削除）、3e-1 #800（エンジンのシリアルのトランスポートなど）、関連 #794・#796、3f（本 PR。docs・CHANGELOG・版）。**シリアル接続（3e-2 以降: 時間切れ後の線の同期 §7.3・broker の配線・Modbus RTU・1 ポート = 1 接続の検査・REST / MCP / 設定パッケージで `settings` を渡す口 §7.5）は #803 へ移した**（#801 は同じ形の指摘が 20 件超続いたためマージせず閉じた。WIP はブランチ `wip/r2b3e2`）。3e-1 は main に残るが、broker はシリアルを断ったまま（`frame_transport` は TCP だけ）で、利用者からシリアルは使えない。オーナーのレビュー 4 回（P1 2 件・P2 3 件を反映）と Codex のレビュー（P1 3 件を反映）を通した。コード調査（§1）は 2026-10-22 の main（`708ec58a`、v0.2.0-alpha.35、R2b-2 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提: 既存データの移行・旧い REST / MCP / 設定パッケージとの互換は考えない（R2b-7 以降も同じ）」と「版上げは段の最後でまとめて」に従う。
+最終更新: 2026-10-29（§7.6 に UDP のデータグラムの契約を追加。#916。同日、直前の接続のポートを使わないことを追記）。以前: 2026-10-25（R2b-7e の実装結果を追記）。以前: 2026-10-23（R2b-3f（docs・CHANGELOG・版上げ）で R2b-3 を閉じた。シリアル接続（3e-2 以降）は 2026-10-23 オーナー判断で #803 へ移した）
+状態: **R2b-3 は 3f で完了（2026-10-23、v0.2.0-alpha.37）。ただしシリアル接続は #803 へ後回し（2026-10-23 オーナー判断）。UDP のトランスポート（§7.6、#916）は 2026-10-29 に Hub 側を実装（ゲストの SLMP E4 は未実装）**。設計確定は 2026-10-22（オーナー決定。§13 の Q1〜Q14 はすべて推奨どおり。Q4 の SLMP のフレームの自前化も推奨どおり）。実装済みの PR 列: 3a-1 #787・3a-2 #788（後追い #790）・3a-3 #791（Modbus / SLMP の `SessionDriver`・broker と Hub の要求の型・収集と ChronoGazer を broker へ・橋の削除）、3b-core #789・3b-join #792（エンジン `banto-driver-engine`・broker の Frame ダイヤル・適合テストのハーネスを本物のエンジンへ）、3c #795・3c-join #797（Modbus TCP を `FrameDriver` に）、3d #793・#798・3d-join #799（SLMP の 4E フレームを自前化し `FrameDriver` に。`PlcClient` / `PlcWriteClient` など旧 I/O を削除）、3e-1 #800（エンジンのシリアルのトランスポートなど）、関連 #794・#796、3f（本 PR。docs・CHANGELOG・版）。**シリアル接続（3e-2 以降: 時間切れ後の線の同期 §7.3・broker の配線・Modbus RTU・1 ポート = 1 接続の検査・REST / MCP / 設定パッケージで `settings` を渡す口 §7.5）は #803 へ移した**（#801 は同じ形の指摘が 20 件超続いたためマージせず閉じた。WIP はブランチ `wip/r2b3e2`）。3e-1 は main に残るが、broker はシリアルを断ったまま（`frame_transport` は TCP だけ）で、利用者からシリアルは使えない。オーナーのレビュー 4 回（P1 2 件・P2 3 件を反映）と Codex のレビュー（P1 3 件を反映）を通した。コード調査（§1）は 2026-10-22 の main（`708ec58a`、v0.2.0-alpha.35、R2b-2 完了の後）に対して行った。§0.1 に既存の決定・計画から外れる点をまとめた。2026-10-22 のオーナー決定「使用者無しの前提: 既存データの移行・旧い REST / MCP / 設定パッケージとの互換は考えない（R2b-7 以降も同じ）」と「版上げは段の最後でまとめて」に従う。
 対象: [banto-hub-driver-refactor-plan.md](banto-hub-driver-refactor-plan.md) §4 の R2b-3「I/O を担う部分の一本化（Hub と ChronoGazer で共用）。トランスポートを抽象化し、TCP・シリアル（COM ポート直結）・変換器向けの TCP（生データ）を扱える形にする（最初の実装は TCP と COM 直結）。P0-3 のテストを全部通す」を実装できる粒度に落とす。オーナーの言い方では「broker と `PlcClient` の要求の型を `DriverAddress`（`TagSpec`）にし、間をつなぐ橋（HostBound の橋、`banto_plc::Address` への戻し）をなくす段」。
 関連: [banto-driver-api-design.md](banto-driver-api-design.md)（R1。§4.2 の要求 - 応答の手順、§4.2.1 の書き込みの状態機械、§4.4 の `HostBound`、§6.2 の「R2b に残したもの」、§7 の適合テスト C9〜C11・C16、§8 のシリアル、§9 の版 0.2.0、§13 の 5）、[banto-hub-driver-address-design.md](banto-hub-driver-address-design.md)（R2b-2。§4.2「要求の型と HostBound の橋（Q3）」）、[banto-hub-connection-settings-design.md](banto-hub-connection-settings-design.md)（R2b-1。§3.5 の `$secret` を接続にだけ開封して渡す話）、[banto-hub-ingest-design.md](banto-hub-ingest-design.md)（`push` は `HostProvided`）、[implementation-checklist.md](implementation-checklist.md)。
 
@@ -273,7 +273,7 @@ Hub の即時読み取り（`read_path.rs:198`）と書き込み（`write_path.r
 - この関係のテスト（3a-2 は偽のセッション型、3b はエンジン）: 各 step を `0.95 × T` かかる遅い送受信にして step 数の上限まで続けても、書き込みが外側の上限で切られずに `Done` まで行く。逆に step を `1.05 × T` にするとエンジンの step の期限で `Timeout` になる（外側ではなく内側で切れる）。
 - 上限は broker の `run_broker_task` の 1 か所（ジョブを `await` する所）と `ensure_connection` のダイヤルで掛ける。ドライバが守るべき時間（`ConnectContext`）は今のまま渡す。
 - 適合テストに「`response_timeout` を守らない偽のセッション型ドライバでも、broker のジョブが上限で返る」を足す（broker の単体テスト、3a-2）。
-- **3b-join の通信方式（2026-10-23 レビュー対応）**: broker の Frame アダプタは `transport` が未指定か `tcp` の場合だけを受け、ドライバの `descriptor.transports` に `Tcp` があることも検査する。`serial` / `serial_over_tcp` は同期と無音時間を配線する 3e まで断る。設定検証を経ずに直接 `connect` した場合も同じ検査を行う。Hub の接続テストも broker と共通の `resolve_session_driver` と種類別の接続期限を使い、Session / Frame のいずれも受け付ける。
+- **3b-join の通信方式（2026-10-23 レビュー対応）**: broker の Frame アダプタは `transport` が未指定か `tcp` の場合だけを受け、ドライバの `descriptor.transports` に `Tcp` があることも検査する。（2026-10-29 #916: `udp` も、`descriptor.transports` に `Udp` があれば受ける。§7.6）`serial` / `serial_over_tcp` は同期と無音時間を配線する 3e まで断る。設定検証を経ずに直接 `connect` した場合も同じ検査を行う。Hub の接続テストも broker と共通の `resolve_session_driver` と種類別の接続期限を使い、Session / Frame のいずれも受け付ける。
 - **3b-join の TCP の予算（2026-10-22 実装）**: `Frame` のダイヤルの外側は `connect_timeout + 32 × response_timeout + CLOSE_TIMEOUT（100 ms）+ CONNECT_SLACK（1 秒）`。名前解決と TCP 接続に `connect_timeout`、ハンドシェイクの最大 32 step にそれぞれ `T`、失敗の後始末に 100 ms を許す。`Session` の従来の `connect_timeout + 1 秒` は維持する。秘密値の開封の待ちも外側の有限上限の中で行い、開いた設定の各コピーは成功・失敗・キャンセルでゼロ化する。
 - **3b-join の読み書きの外側は既存の `2T × step 上限 + 1 秒` を共用**する。TCP の Frame エンジンは読み取り `specs.len() + 8`、書き込み `3 × items.len() + 8`、各 step の送受信を合わせて `T`、致命時の close は 100 ms なので、この内側の和より外側が長い。broker は論理書き込みの `write_next(None)` から `Done`（RMW の確認読みも含む）まで専有する。致命・時間切れ・step 上限ではエンジンの接続・手順状態・受信バッファを捨て、broker は再接続だけを行う。**結果不明の書き込みは自動再送しない**。新しい明示的な要求だけが新しい接続で始まる。シリアルの gap・同期の追加予算は 3e で配線する。
 - C16 の実装確認: `banto-broker/src/frame_tests.rs` は本番エンジンで最大 step 数の 0.95T、1.05T の内側時間切れ、致命・step 超過時の破棄・再接続と再送なし、および Frame 登録から 32 step の遅いハンドシェイクを検証する。`apps/banto-hub/core/tests/frame_write.rs` は実際の `execute_write` で受付ゲートの拒否・監査 insert 失敗時の無通信、最初の RMW 読み取り時に存在する暫定 `failed` 監査、読み取りが割り込まない RMW の読む→書く→確認読むと、成功監査の `ok` を照合する。確認読みの無応答・致命では `failed` のまま、新しい接続でも自動再送しないことを確認する。初期のサンドボックスでは localhost の bind が権限で拒否された。その後、#792 の作者は macOS・ローカル TCP 可の環境で `frame_tests`（32 step のハンドシェイク・秘密値のゼロ化を含む）と `frame_write` 3 件の成功を報告している。head `81a7072d` の CI も、レビュー取得時点で Rust のテスト・fmt/clippy は成功していた（banto-hub の E2E はその時点では pending）。これは作者の実行報告と CI の記録であり、2026-10-23 のネットワーク不可のサンドボックスでの再検証とは区別する。
@@ -318,7 +318,7 @@ Hub の即時読み取り（`read_path.rs:198`）と書き込み（`write_path.r
 
 | キー                                       | 値                                                | 備考                                                                                       |
 | ------------------------------------------ | ------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| `transport`                                | `tcp`（既定）・`serial`・`serial_over_tcp`        | ドライバの `descriptor().transports` に無いものは `validate_config` が断る（今と同じ形）   |
+| `transport`                                | `tcp`（既定）・`udp`・`serial`・`serial_over_tcp` | ドライバの `descriptor().transports` に無いものは `validate_config` が断る（今と同じ形）   |
 | `serial_port`                              | Windows は `COM1`〜`COM256`、Linux は `/dev/tty*` | 許可リストの文法で検査する（checklist §5 の「外から来た名前」。`NUL`・`:` などを通さない） |
 | `baud`・`data_bits`・`parity`・`stop_bits` | 9600 / 8 / `none` / 1 など                        | 新しいキー（追加なので API の破壊ではない、api-design §9.1）                               |
 | `station`                                  | 局番                                              | Modbus RTU は `unit_id` と同じ意味（api-design §3.5 の `keys::STATION`）                   |
@@ -383,6 +383,20 @@ R2b-3 の規則は「**同期が取れたと証明できるまで、その線で
   - MCP: `protocol` の enum を固定の配列からレジストリの id（`HostProvided` の内部用を除く）で組む。`settings` を受ける欄を足す。
   - 設定パッケージ: 接続の `settings` を書き出し・読み込みで往復させる（R2a-2e の `push` と同じ形）。往復のテストに `modbus-rtu` を足す。
   - 画面は R2b-6 まで出さないが、一覧・ドロワーで `modbus-rtu` の接続が壊れずに見える（知らない欄は出さない）ことを E2E で 1 本確かめる。
+
+### 7.6 UDP（#916）
+
+2026-10-29 オーナー決定（#916 の 2026-10-28 の作者決定。plugin-design Q6）。シリアルの同期（§7.3）とは独立に、broker が `transport = "udp"` を繋ぐ。ドライバは `descriptor().transports` に `Udp` を名乗る（WASM は manifest の `transports` に `"udp"`、plugin-design §4.2）。組み込みの SLMP・Modbus は TCP のまま。WIT は変えない。
+
+- **1 データグラム = 1 応答**。`FrameRule` はそのデータグラム単体に当てる。足りない・フレームの後ろに余りがある・`max_len` を超える（空も含む）はフレーム不正（致命）。TCP のように次の受信を足し込まない。受信は 64 KiB のバッファで受けてから `max_len` を当てる。
+- **接続ごとにエフェメラルポート**を bind し、相手に `connect` する（相手以外の送信元は OS が捨てる）。OS は閉じたばかりのポートを続けて返すことがあるので、エンジンは相手ごとに直前の接続のポートを覚え、同じなら持ったまま bind し直す（2026-10-29、#933 のレビュー P2）。時間切れ・致命で接続を閉じるので、直前の接続への遅れた応答は閉じたポートに届いて OS が捨てる。覚えるのは直前の 1 つだけで、プロセスごと（Hub の再起動で忘れるが、そのとき古いソケットも無い）。もっと古い接続のポートが後で再び割り当てられれば、その接続への応答が届く余地は残る（4E はシリアル番号の照合が捕まえ、3E は発行順だけ。#916 の作者決定で受け入れた）。
+- **各送信の前に、溜まった受信を捨てる**（`discard_input` を空読みにする）。前の要求への重複・遅れた応答を、この要求の応答と取り違えない。
+- **再送しない**（トランスポートでもエンジンでも。不変条件として試験で固定）。応答が失われた書込みは、これまでどおり結果不明（`Uncertain`）として監査に残し、自動再送しない（§5.5）。
+- **ハンドシェイクは 1 往復以上必須**。UDP には接続の確立が無く、相手が居る根拠は応答だけなので、応答を待つ step が 1 つも無いハンドシェイクの接続はエンジンが `FatalError::Protocol` で断る（TCP は従来どおり 0 往復でよい）。
+- ICMP の port unreachable（`recv` の ECONNREFUSED、Windows の WSAECONNRESET）は `FatalError::Io`。
+- SLMP の 3E は UDP でも許す。3E にはシリアル番号が無く応答を発行順だけで照合するので、接続ごとのポートと送信前の破棄で狭めても重複したデータグラムで古い値を取り込む危険は残る。これは利用者の責任とし、ゲストの設定の説明に明記する。4E の書込みのゲートは TCP と同じ（ゲストの allowlist と Hub の独立ゲート）。
+- 実装: `banto-driver-engine` の `TransportSpec::Udp`・`UdpTransport`・`Transport::datagram`、`banto-broker` の `frame_transport`、`banto-driver-wasm` の manifest。試験はエンジンのループバックの UDP（`src/udp_tests.rs`）と、組み込みの SLMP の 4E フレームを借りた結合（`banto-driver-slmp/tests/udp_engine.rs`）。UDP のゲストの component の試験は、ゲストの E4 と一緒に足す。
+- 未確認: 960 語の読取り応答（約 1.9 KB）・7168 点のビット読取り（約 3.6 KB）は 1 MTU を超えて IP フラグメントになる。SLMP の UDP の上限は実機で確かめる。
 
 ## 8. ChronoGazer（Q5）
 

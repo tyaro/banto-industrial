@@ -9,6 +9,10 @@
 //! 前のフレームの最後のバイト（送り終え・受け終えの遅い方）から無音を空ける（§7.3.1）。
 //! シリアルの send は flush（Unix では同期の tcdrain で runtime を止める）を呼ばないので、
 //! 送り終えた時刻は `Transport::tx_time` で見積もる。
+//! データグラムの通信路（UDP、#916。`Transport::datagram`）では、1 回の受信を 1 応答として
+//! フレーム規則をそのデータグラム単体に当て（足りない・余る・`max_len` 超過はフレーム不正。
+//! 次の受信を足し込まない）、各送信の前に溜まった受信を捨て、0 往復のハンドシェイクを断る
+//! （接続が生きている根拠は応答だけ）。再送はしない（io-design §7.6）。
 //! 公開する crate は API → engine → conformance の順に公開する。
 
 pub mod decode;
@@ -378,12 +382,22 @@ impl Core {
 
     async fn handshake(&mut self) -> Result<(), FatalError> {
         let mut previous = None;
+        // 応答を待つ step（`FrameRule::None` 以外）を往復できた数。
+        let mut round_trips = 0usize;
         for steps in 0..=MAX_HANDSHAKE_STEPS {
             match self
                 .conn
                 .handshake_next(previous.as_deref())
                 .map_err(|e| self.driver_fatal("handshake_next", e))?
             {
+                None if round_trips == 0 && self.transport.datagram() => {
+                    // UDP には接続の確立がなく、相手が居る根拠はハンドシェイクの応答だけ（#916 の作者決定）。
+                    return Err(FatalError::Protocol(
+                        "UDP の接続には応答を待つハンドシェイクが 1 往復以上必要です\
+                         （このドライバのハンドシェイクは往復しない）"
+                            .into(),
+                    ));
+                }
                 None => return Ok(()),
                 Some(_) if steps == MAX_HANDSHAKE_STEPS => {
                     return Err(self.violation_fatal(
@@ -391,7 +405,13 @@ impl Core {
                         format!("ハンドシェイクが {MAX_HANDSHAKE_STEPS} step で終わらない"),
                     ))
                 }
-                Some(step) => previous = Some(self.exchange(&step).await?),
+                Some(step) => {
+                    let response = self.exchange(&step).await?;
+                    if !matches!(step.expect, FrameRule::None) {
+                        round_trips += 1;
+                    }
+                    previous = Some(response);
+                }
             }
         }
         unreachable!()
@@ -638,6 +658,13 @@ impl Core {
         timeout_at(deadline, wait_quiet(self.last_quiet_from, gap))
             .await
             .map_err(|_| FatalError::Timeout)?;
+        let datagram = self.transport.datagram();
+        if datagram {
+            // 前の要求への重複・遅れたデータグラムを、この要求の応答と取り違えない。
+            timeout_at(deadline, self.transport.discard_input())
+                .await
+                .map_err(|_| FatalError::Timeout)?;
+        }
         // tx_time の見積もりの起点は、待ちの後の時刻。
         let send_start = Instant::now();
         timeout_at(deadline, self.transport.send(&step.send))
@@ -648,6 +675,9 @@ impl Core {
         self.last_quiet_from = Some(sent_at);
         if matches!(step.expect, FrameRule::None) {
             return Ok(Vec::new());
+        }
+        if datagram {
+            return self.receive_datagram(step, deadline).await;
         }
         let mut buf = Vec::new();
         loop {
@@ -686,6 +716,46 @@ impl Core {
             }
         }
     }
+    /// データグラムの通信路の受信: 1 データグラム = 1 応答（io-design §7.6）。再送も、次の受信の
+    /// 足し込みもしない。フレーム規則はこのデータグラム単体に当て、`max_len` 超過・足りない・
+    /// 余りがあるはフレーム不正（接続を閉じる。同じ相手への次の接続は直前のポートを使わないので、遅れた応答はそこに届かない）。
+    async fn receive_datagram(
+        &mut self,
+        step: &Step,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, FatalError> {
+        let mut buf = Vec::new();
+        let n = timeout_at(deadline, self.transport.recv(&mut buf))
+            .await
+            .map_err(|_| FatalError::Timeout)??;
+        let received_at = Instant::now();
+        self.last_quiet_from = Some(
+            self.last_quiet_from
+                .map_or(received_at, |t| t.max(received_at)),
+        );
+        if buf.len() != n {
+            return Err(FatalError::Protocol(
+                "Transport::recv の件数と受信が合いません".into(),
+            ));
+        }
+        if n > step.max_len as usize {
+            return Err(FatalError::Framing(format!(
+                "応答のデータグラム（{n} バイト）が max_len（{}）を超えた",
+                step.max_len
+            )));
+        }
+        match self.check_complete(step, &mut buf)? {
+            Some(len) if len == buf.len() => Ok(buf),
+            Some(len) => Err(FatalError::Framing(format!(
+                "応答のデータグラムにフレームの後ろの余り（{} バイト）がある",
+                buf.len() - len
+            ))),
+            None => Err(FatalError::Framing(format!(
+                "応答のデータグラム（{n} バイト）でフレームが完結しない"
+            ))),
+        }
+    }
+
     fn validate_step(&mut self, step: &Step) -> Result<(), FatalError> {
         let problem = match &step.expect {
             FrameRule::None => None,
@@ -856,3 +926,5 @@ impl Core {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod udp_tests;
