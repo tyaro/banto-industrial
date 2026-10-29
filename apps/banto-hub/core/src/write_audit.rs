@@ -61,6 +61,8 @@
 //!   `std::sync::Mutex` の表を 1 回だけ lock して件数を足すだけ(DB にも async の
 //!   ロックにも触れない)。403・404 の応答は変えず、監査で遅らせない。バッチは
 //!   1 回の lock で全件を足し、呼び手は `tag_map()` を呼び出しごとに 1 回だけ取る。
+//!   表が満杯のときの空け直しの走査は、次に期限が切れる時刻まで飛ばし、バッチの同じ
+//!   (名前, 理由)は件数でまとめて表に 1 回だけ足す(あふれる拒否が表の全走査を繰り返さない)。
 //! - **書き手**([`WriteAuditService::spawn_rejection_writer`]、`HubRuntime::start` が
 //!   失敗しうる起動手順をすべて終えたあと、`RunningHub` を組み立てる直前に起動する。
 //!   それより前に gRPC・REST が受けた拒否も表に足すだけなので失われず、最初の周期で
@@ -129,6 +131,7 @@
 //! **書き込み時点の値としてスナップショット**する(`crate::audit`の
 //! `rule_name_snapshot` と同じ設計判断)。
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -464,6 +467,13 @@ struct RejectionTable {
     /// 書き手が書いている最中の周期(`take_jobs` で立て、`apply` か `release` で下ろす)。
     /// 書き手の future が途中で捨てられて下りなくても、次の `take_jobs` で上書きされる。
     in_flight: Option<u64>,
+    /// 開いた窓の `start + REJECTION_WINDOW` の最小値(次に期限が切れうる時刻)。窓を
+    /// 外しても更新しない(早めにずれるだけで害がない)。[`Self::make_room`] が走査した
+    /// ときに計算し直す。満杯のとき、これより前の拒否は走査を飛ばしてあふれに数える。
+    next_expiry: Option<Instant>,
+    /// 試験用: `make_room` が表を走査した回数。
+    #[cfg(test)]
+    scans: u64,
 }
 
 /// 要求の経路で、呼び出しごとに 1 回だけ作るキー名とプレフィックス。
@@ -536,6 +546,14 @@ impl RejectionTable {
         if self.open.len() < REJECTION_TABLE_MAX_PAIRS {
             return true;
         }
+        // 満杯でも、どの窓もまだ期限が切れていなければ走査しても空かない。
+        if self.next_expiry.is_some_and(|t| now < t) {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.scans += 1;
+        }
         let expired: Vec<PairKey> = self
             .open
             .iter()
@@ -545,6 +563,7 @@ impl RejectionTable {
         for k in &expired {
             self.retire(k);
         }
+        self.next_expiry = self.open.values().map(|w| w.start + REJECTION_WINDOW).min();
         self.open.len() < REJECTION_TABLE_MAX_PAIRS
     }
 
@@ -559,6 +578,8 @@ impl RejectionTable {
     ) {
         let (key_name, key_prefix) = names.get();
         self.next_generation += 1;
+        let expiry = now + REJECTION_WINDOW;
+        self.next_expiry = Some(self.next_expiry.map_or(expiry, |t| t.min(expiry)));
         self.open.insert(
             key,
             PairWindow {
@@ -1157,9 +1178,23 @@ impl WriteAuditService {
         entries: impl IntoIterator<Item = (i64, &'n str, WriteRejectionReason)>,
     ) {
         let mut names = KeyNames { key, shared: None };
-        let mut table = self.rejections.table();
+        // 同じ(切り詰めた名前, 理由)は lock の前に件数でまとめ、表には 1 回だけ足す
+        // (#945 のレビュー: 同じ拒否が大量のバッチで表の操作を繰り返さない)。
+        let mut index: HashMap<(Cow<'n, str>, WriteRejectionReason), usize> = HashMap::new();
+        let mut grouped: Vec<(i64, Cow<'n, str>, WriteRejectionReason, u64)> = Vec::new();
         for (tag_id, name, reason) in entries {
-            table.add(now, wall, &mut names, tag_id, name, reason, 1);
+            let name = truncate_name(name);
+            match index.entry((name.clone(), reason)) {
+                std::collections::hash_map::Entry::Occupied(e) => grouped[*e.get()].3 += 1,
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(grouped.len());
+                    grouped.push((tag_id, name, reason, 1));
+                }
+            }
+        }
+        let mut table = self.rejections.table();
+        for (tag_id, name, reason, n) in &grouped {
+            table.add(now, wall, &mut names, *tag_id, name, *reason, *n);
         }
     }
 
@@ -1886,6 +1921,56 @@ mod rejection_tests {
         let table = svc.rejections.table();
         assert!(table.open.is_empty());
         assert!(table.budgets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_full_table_is_not_rescanned_for_overflowing_rejections() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        for k in 0..REJECTION_TABLE_MAX_PAIRS {
+            let key = RejectingKey {
+                id: 1000 + k as i64,
+                name: "k",
+                prefix: "p",
+            };
+            svc.record_rejections_at(
+                t0,
+                SystemTime::now(),
+                key,
+                [(0, "x", WriteRejectionReason::NotFound)],
+            );
+        }
+        let scans_before = svc.rejections.table().scans;
+        const N: u64 = 100_000;
+        let started = Instant::now();
+        // 別のキーからの同じ拒否 N 件(バッチ 1 回)と、1 件ずつの追加。
+        svc.record_rejections_at(
+            t0,
+            SystemTime::now(),
+            KEY,
+            (0..N).map(|_| (7, "y", WriteRejectionReason::NotFound)),
+        );
+        for _ in 0..1000 {
+            add(&svc, t0, "z", WriteRejectionReason::NotFound);
+        }
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let table = svc.rejections.table();
+        // 期限内の窓だけなので、走査は 1 回もしない(空きは作れない)。
+        assert_eq!(table.scans, scans_before);
+        assert_eq!(table.overflow, N + 1000);
+        drop(table);
+        assert_eq!(
+            svc.unwritten_rejections(),
+            REJECTION_TABLE_MAX_PAIRS as u64 + N + 1000
+        );
+        // 期限が切れたら 1 回だけ走査して空ける。
+        add(
+            &svc,
+            t0 + REJECTION_WINDOW,
+            "y",
+            WriteRejectionReason::NotFound,
+        );
+        assert_eq!(svc.rejections.table().scans, scans_before + 1);
     }
 
     #[tokio::test]
