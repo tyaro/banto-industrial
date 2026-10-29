@@ -62,7 +62,10 @@
 //!   ロックにも触れない)。403・404 の応答は変えず、監査で遅らせない。バッチは
 //!   1 回の lock で全件を足し、呼び手は `tag_map()` を呼び出しごとに 1 回だけ取る。
 //! - **書き手**([`WriteAuditService::spawn_rejection_writer`]、`HubRuntime::start` が
-//!   起動): [`REJECTION_WRITE_PERIOD`](2 秒)ごとに、表を lock して書き終えていない組の
+//!   失敗しうる起動手順をすべて終えたあと、`RunningHub` を組み立てる直前に起動する。
+//!   それより前に gRPC・REST が受けた拒否も表に足すだけなので失われず、最初の周期で
+//!   書かれる。[`RejectionWriter`] を `shutdown` せずに捨てると、書き手と見張りは
+//!   止まる): [`REJECTION_WRITE_PERIOD`](2 秒)ごとに、表を lock して書き終えていない組の
 //!   写しを取り、lock を放してから 1 つのトランザクションで書く。新しい窓は INSERT
 //!   (`ts` は窓の最初の拒否の時刻)、行のある窓は `detail` を UPDATE(0 行なら INSERT
 //!   し直す)。1 周期は [`REJECTION_WRITE_MAX_PAIRS`](256)組まで、残りは次の周期へ。
@@ -99,7 +102,12 @@
 //!   **あふれの行**(`api_key_id = 0`・キー名とプレフィックスは空・
 //!   `external_name_snapshot = '*'`・`tag_id = 0`・
 //!   `detail = 'overflow（N 件を記録できなかった）'`)を 1 行残す(どのキーの拒否かは
-//!   数えない)。置き場が満ちたときの、書いていない件数もここに足す。
+//!   数えない)。置き場が満ちたときの、書いていない件数もここに足す。置き場が満ちた
+//!   ときに捨てるのは、書き手が書いている最中(写しを取って結果が戻っていない)で
+//!   **ない**組だけ(#945 のレビュー)。書いている最中の組を捨てると、書けたときに
+//!   普通の行とあふれの行の両方に数えてしまう(二重の計上)ので、それはなくした。
+//!   書いている最中の組は 1 周期に [`REJECTION_WRITE_MAX_PAIRS`](256)組までで置き場の
+//!   上限より少ないので、捨てられる組は必ずあり、置き場は上限を超えない。
 //! - 外部名とキー名は [`REJECTION_NAME_MAX_CHARS`](256 文字)までに切り詰め、末尾を `…`
 //!   にして監査に残す。先頭が同じ長い名前どうしは、切り詰めた後で同じ組として数えうる。
 //! - **メモリの見積もり**: 組 1 つは構造体と名前(外部名は UTF-8 で最大 1023 バイト。
@@ -337,7 +345,11 @@ pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
 pub const REJECTION_TABLE_MAX_PAIRS: usize = 1000;
 
 /// #945 の総点検: 窓が明けたが、まだ DB に書き終えていない組の置き場の上限(DB の
-/// 書込みが続けて失敗しているときだけ溜まる)。超えた組の書いていない件数はあふれに足す。
+/// 書込みが続けて失敗しているときだけ溜まる)。満ちているときは、書き手が書いている
+/// 最中でない組を 1 つ選んで、その書いていない件数をあふれに足して捨てる(#945 の
+/// レビュー: 書いている最中の組は捨てない。書けたら普通の行とあふれの両方に数えて
+/// しまうため)。書いている最中の組は 1 周期で [`REJECTION_WRITE_MAX_PAIRS`] 組までで、
+/// この上限より少ないので、捨てられる組は必ず見つかり、置き場は上限を超えない。
 pub const REJECTION_TABLE_MAX_CLOSED: usize = 1000;
 
 /// #945 のレビュー: 1 つの API キーが、[`REJECTION_WINDOW`] の中で別々の行として
@@ -360,6 +372,9 @@ pub const REJECTION_WRITE_PERIOD: Duration = Duration::from_secs(2);
 
 /// #945 の総点検: 1 周期(1 つのトランザクション)で書く組の上限。残りは次の周期へ回す。
 pub const REJECTION_WRITE_MAX_PAIRS: usize = 256;
+
+// 置き場が満ちたとき、書いている最中でない組を必ず選べる(`RejectionTable::retire`)。
+const _: () = assert!(REJECTION_TABLE_MAX_CLOSED > REJECTION_WRITE_MAX_PAIRS);
 
 /// #945 の総点検: 書き手の最後の周期からこれだけ経っても次の周期が来なければ、
 /// 拒否を足す側(要求の経路)が「書き手が止まっている」とログに 1 回出す。
@@ -398,6 +413,9 @@ struct PairWindow {
     /// 最後に書けた周期の通し番号(まだ一度も書いていなければ `None`)。書く組が上限を
     /// 超えるとき、`None` から先に、古い順に選ぶのに使う。
     last_written: Option<u64>,
+    /// 書き手が写しを取った周期の通し番号(#945 のレビュー)。表の
+    /// `in_flight` と同じなら、書き手がこの窓を書いている最中(結果がまだ戻っていない)。
+    taken: Option<u64>,
     key_name: Arc<str>,
     key_prefix: Arc<str>,
     tag_id: i64,
@@ -406,6 +424,15 @@ struct PairWindow {
 impl PairWindow {
     fn dirty(&self) -> bool {
         self.row_id.is_none() || self.written != self.count
+    }
+
+    /// まだ DB に書いていない件数。
+    fn unwritten(&self) -> u64 {
+        if self.row_id.is_some() {
+            self.count.saturating_sub(self.written)
+        } else {
+            self.count
+        }
     }
 
     fn expired(&self, now: Instant) -> bool {
@@ -434,6 +461,9 @@ struct RejectionTable {
     next_generation: u64,
     /// 書き手の周期の通し番号(`take_jobs` のたびに進む)。
     cycle: u64,
+    /// 書き手が書いている最中の周期(`take_jobs` で立て、`apply` か `release` で下ろす)。
+    /// 書き手の future が途中で捨てられて下りなくても、次の `take_jobs` で上書きされる。
+    in_flight: Option<u64>,
 }
 
 /// 要求の経路で、呼び出しごとに 1 回だけ作るキー名とプレフィックス。
@@ -470,8 +500,15 @@ impl RejectionTable {
         true
     }
 
-    /// 開いた窓を表から外す。書き終えていなければ置き場へ移す(置き場が満ちていれば、
-    /// 書いていない件数をあふれに足す)。
+    /// 書き手がこの窓を書いている最中か(結果がまだ戻っていない)。
+    fn in_flight(&self, w: &PairWindow) -> bool {
+        self.in_flight.is_some() && w.taken == self.in_flight
+    }
+
+    /// 開いた窓を表から外す。書き終えていなければ置き場へ移す。置き場が満ちていれば、
+    /// 書き手が書いている最中でない組を 1 つ選び(外す窓がそうならそれを、そうでなければ
+    /// 置き場の組を)、書いていない件数をあふれに足して捨てる(#945 のレビュー: 書いて
+    /// いる最中の窓を捨てると、書けたときに普通の行とあふれの両方に数えてしまう)。
     fn retire(&mut self, key: &PairKey) {
         let Some(w) = self.open.remove(key) else {
             return;
@@ -479,16 +516,19 @@ impl RejectionTable {
         if !w.dirty() {
             return;
         }
-        if self.closed.len() < REJECTION_TABLE_MAX_CLOSED {
-            self.closed.push((key.clone(), w));
-        } else {
-            let unwritten = if w.row_id.is_some() {
-                w.count.saturating_sub(w.written)
-            } else {
-                w.count
-            };
-            self.overflow = self.overflow.saturating_add(unwritten);
+        if self.closed.len() >= REJECTION_TABLE_MAX_CLOSED {
+            if !self.in_flight(&w) {
+                self.overflow = self.overflow.saturating_add(w.unwritten());
+                return;
+            }
+            // 書いている最中の組は REJECTION_WRITE_MAX_PAIRS までなので、置き場には必ず
+            // 書いている最中でない組がある(見つからなければ上限を一時的に超えて置く)。
+            if let Some(i) = self.closed.iter().position(|(_, c)| !self.in_flight(c)) {
+                let (_, old) = self.closed.remove(i);
+                self.overflow = self.overflow.saturating_add(old.unwritten());
+            }
         }
+        self.closed.push((key.clone(), w));
     }
 
     /// 新しい組を入れる場所があるか。満ちていたら、窓が明けた組を外して空ける。
@@ -529,6 +569,7 @@ impl RejectionTable {
                 written: 0,
                 row_id: None,
                 last_written: None,
+                taken: None,
                 key_name,
                 key_prefix,
                 tag_id,
@@ -619,13 +660,17 @@ impl RejectionTable {
     /// 古い順に選ぶ(周期をまたいで公平に回し、同じ組が待っている組を押しのけ続けない)。
     /// 窓が明けた置き場の組も同じ並びに入れる(優先しない。置き場は
     /// `REJECTION_TABLE_MAX_CLOSED` で頭打ちなので、回ってくるのが遅れても溜まらない)。
+    /// 写しを取った窓には、結果が戻るまで「書いている最中」の印を付ける
+    /// ([`Self::retire`] が捨てない)。
     fn take_jobs(&mut self, max: usize) -> (Vec<WriteJob>, u64) {
         self.cycle += 1;
-        let mut cands: Vec<(Option<u64>, &PairKey, &PairWindow)> = self
+        let cycle = self.cycle;
+        self.in_flight = Some(cycle);
+        let mut cands: Vec<(Option<u64>, &PairKey, &mut PairWindow)> = self
             .closed
-            .iter()
-            .map(|(k, w)| (k, w))
-            .chain(self.open.iter())
+            .iter_mut()
+            .map(|(k, w)| (&*k, w))
+            .chain(self.open.iter_mut())
             .filter(|(_, w)| w.dirty())
             .map(|(k, w)| (w.last_written, k, w))
             .collect();
@@ -637,9 +682,17 @@ impl RejectionTable {
         }
         let jobs = cands
             .into_iter()
-            .map(|(_, k, w)| WriteJob::of(k, w))
+            .map(|(_, k, w)| {
+                w.taken = Some(cycle);
+                WriteJob::of(k, w)
+            })
             .collect();
         (jobs, self.overflow)
+    }
+
+    /// 書込みが失敗した(表は変えない)。書いている最中の印を下ろす。
+    fn release(&mut self) {
+        self.in_flight = None;
     }
 
     /// 書けた結果を戻す(`row_id` と書いた件数)。窓が明けて置き場へ移っていても
@@ -662,6 +715,7 @@ impl RejectionTable {
             }
         }
         self.overflow = self.overflow.saturating_sub(overflow_written);
+        self.in_flight = None;
     }
 
     /// 窓が明けて書き終えた組と、明けたキーの予算を消す。
@@ -674,15 +728,8 @@ impl RejectionTable {
 
     /// まだ DB に書いていない件数(終了のログ・試験用)。
     fn unwritten(&self) -> u64 {
-        let pending = |w: &PairWindow| {
-            if w.row_id.is_some() {
-                w.count.saturating_sub(w.written)
-            } else {
-                w.count
-            }
-        };
-        let open: u64 = self.open.values().map(pending).sum();
-        let closed: u64 = self.closed.iter().map(|(_, w)| pending(w)).sum();
+        let open: u64 = self.open.values().map(PairWindow::unwritten).sum();
+        let closed: u64 = self.closed.iter().map(|(_, w)| w.unwritten()).sum();
         open + closed + self.overflow
     }
 
@@ -954,6 +1001,11 @@ pub struct RejectingKey<'a> {
 
 /// #945 の総点検: 周期の書き手のタスク([`WriteAuditService::spawn_rejection_writer`])。
 /// [`Self::shutdown`] で止めて、残りを書き切る。
+///
+/// #945 のレビュー: `shutdown` を呼ばずに捨てても(起動の途中の失敗など)、止める合図を
+/// 送るので、書き手と見張りのタスクは次の周期を待たずに終わり、pool を持ったまま
+/// 残らない(書き切りはしない。表の残りは捨てる)。`JoinHandle` を捨てるだけでは
+/// タスクは止まらない。
 pub struct RejectionWriter {
     svc: WriteAuditService,
     stop: tokio::sync::watch::Sender<bool>,
@@ -964,9 +1016,9 @@ impl RejectionWriter {
     /// 書き手を止め(書いている周期は終わらせる)、表に残ったものをすべて書き切る。
     /// DB が失敗し続けると返らないので、呼び手が上限時間で切る(切られたら
     /// [`WriteAuditService::unwritten_rejections`] で残りを数えてログに出す)。
-    pub async fn shutdown(self) {
+    pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
-        let _ = self.join.await;
+        let _ = (&mut self.join).await;
         loop {
             match self.svc.write_pending().await {
                 Ok(_) if self.svc.unwritten_rejections() == 0 => return,
@@ -974,6 +1026,13 @@ impl RejectionWriter {
                 Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
             }
         }
+    }
+}
+
+impl Drop for RejectionWriter {
+    fn drop(&mut self) {
+        // 受け手(書き手と見張り)が先に終わっていれば失敗するが、それでよい。
+        let _ = self.stop.send(true);
     }
 }
 
@@ -1172,6 +1231,7 @@ impl WriteAuditService {
                 Ok(stats)
             }
             Err(err) => {
+                shared.table().release();
                 if !shared.failing.swap(true, Ordering::AcqRel) {
                     eprintln!(
                         "banto-hub: [WARN] 書き込み監査(rejected)の書込みに失敗しました（件数は表に残し、次の周期で書き直します）: {err}"
@@ -1869,6 +1929,140 @@ mod rejection_tests {
         assert_eq!(svc.unwritten_rejections(), 0);
     }
 
+    /// 置き場を、書いている最中でない書き終えていない組(各 1 件)で満たす。
+    fn fill_closed(svc: &WriteAuditService, t0: Instant) {
+        let mut table = svc.rejections.table();
+        for i in 0..REJECTION_TABLE_MAX_CLOSED {
+            table.next_generation += 1;
+            let w = PairWindow {
+                generation: table.next_generation,
+                start: t0,
+                first_at: SystemTime::now(),
+                count: 1,
+                written: 0,
+                row_id: None,
+                // 一度書いた扱いにして、写しを取る順を後ろにする。
+                last_written: Some(0),
+                taken: None,
+                key_name: Arc::from("k"),
+                key_prefix: Arc::from("p"),
+                tag_id: 0,
+            };
+            let key = (
+                5000 + i as i64,
+                RejectionTarget::Tag("x".into()),
+                WriteRejectionReason::NotFound,
+            );
+            table.closed.push((key, w));
+        }
+    }
+
+    /// 監査の行に数えた件数の合計(普通の行, あふれの行)。
+    async fn counted(svc: &WriteAuditService) -> (u64, u64) {
+        let mut normal = 0;
+        let mut overflow = 0;
+        for row in rows(svc).await {
+            let detail = row.detail.as_deref().unwrap();
+            if row.api_key_id == 0 {
+                let n = detail
+                    .strip_prefix("overflow（")
+                    .and_then(|r| r.split(' ').next())
+                    .unwrap();
+                overflow += n.parse::<u64>().unwrap();
+            } else {
+                normal += count_of(detail);
+            }
+        }
+        (normal, overflow)
+    }
+
+    /// #945 のレビュー(Codex P2): 置き場が満ちているときに、書き手が書いている最中の
+    /// 窓が明けても、その窓はあふれに数えない(書けたら普通の行だけに数える)。
+    #[tokio::test]
+    async fn a_window_being_written_is_not_counted_as_overflow_when_the_closed_store_is_full() {
+        for fail in [false, true] {
+            let svc = service().await;
+            let r = WriteRejectionReason::NotWritable;
+            let t0 = Instant::now();
+            fill_closed(&svc, t0);
+            add(&svc, t0, "a", r);
+            add(&svc, t0, "a", r);
+            // 書き手が "a" の写しを取った(結果はまだ戻っていない)。
+            let (jobs, overflow) = svc.rejections.table().take_jobs(1);
+            assert_eq!(jobs.len(), 1);
+            assert_eq!(jobs[0].external_name(), "a");
+            // その間に "a" の窓が明け、同じ組の次の拒否が来た。
+            let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+            add(&svc, t1, "a", r);
+            {
+                let table = svc.rejections.table();
+                assert_eq!(table.closed.len(), REJECTION_TABLE_MAX_CLOSED);
+                // 退いたのは書いている最中でない置き場の組(1 件)。
+                assert_eq!(table.overflow, 1);
+            }
+            let total = REJECTION_TABLE_MAX_CLOSED as u64 + 3;
+            assert_eq!(svc.unwritten_rejections(), total);
+            if fail {
+                sqlx::query(
+                    "CREATE TRIGGER fail_ins BEFORE INSERT ON hub_write_audit                      BEGIN SELECT RAISE(ABORT, 'test'); END",
+                )
+                .execute(&svc.pool)
+                .await
+                .unwrap();
+            }
+            let result = write_jobs(&svc.pool, &jobs, overflow).await;
+            match result {
+                Ok((ids, stats)) => {
+                    assert!(!fail);
+                    let done: Vec<(WriteJob, i64)> = jobs.into_iter().zip(ids).collect();
+                    let ov = if stats.overflow_rows > 0 { overflow } else { 0 };
+                    svc.rejections.table().apply(&done, ov);
+                    // 書けた 2 件はもう未書込みに数えない(あふれにも足していない)。
+                    assert_eq!(svc.unwritten_rejections(), total - 2);
+                }
+                Err(_) => {
+                    assert!(fail);
+                    svc.rejections.table().release();
+                    assert_eq!(svc.unwritten_rejections(), total);
+                    sqlx::query("DROP TRIGGER fail_ins")
+                        .execute(&svc.pool)
+                        .await
+                        .unwrap();
+                }
+            }
+            while svc.write_pending_at(t1).await.unwrap().remaining > 0 {}
+            assert_eq!(svc.unwritten_rejections(), 0);
+            // 二重にも欠けにもならない: 普通の行 + あふれの行 = 拒否の数。
+            let (normal, overflow) = counted(&svc).await;
+            assert_eq!((normal, overflow), (total - 1, 1), "fail = {fail}");
+            // 書き直した順で行の id は変わるので、件数だけを並べて比べる。
+            let mut a: Vec<_> = rows(&svc)
+                .await
+                .into_iter()
+                .filter(|row| row.external_name_snapshot == "a")
+                .map(|row| count_of(row.detail.as_deref().unwrap()))
+                .collect();
+            a.sort_unstable();
+            assert_eq!(a, vec![1, 2], "fail = {fail}");
+        }
+    }
+
+    /// 書いている最中でない窓は、置き場が満ちていれば従来どおりあふれに数える。
+    #[tokio::test]
+    async fn a_window_not_being_written_goes_to_overflow_when_the_closed_store_is_full() {
+        let svc = service().await;
+        let r = WriteRejectionReason::NotWritable;
+        let t0 = Instant::now();
+        fill_closed(&svc, t0);
+        add(&svc, t0, "a", r);
+        add(&svc, t0, "a", r);
+        let t1 = t0 + REJECTION_WINDOW + Duration::from_secs(1);
+        add(&svc, t1, "a", r);
+        let table = svc.rejections.table();
+        assert_eq!(table.closed.len(), REJECTION_TABLE_MAX_CLOSED);
+        assert_eq!(table.overflow, 2);
+    }
+
     #[tokio::test]
     async fn a_long_external_name_is_truncated_with_a_mark() {
         let svc = service().await;
@@ -1921,6 +2115,25 @@ mod rejection_tests {
         writer.shutdown().await;
         assert_eq!(rows(&svc).await.len(), 2);
         assert!(!svc.rejections.writer_running.load(Ordering::Acquire));
+    }
+
+    /// #945 のレビュー(Codex P2): `shutdown` を呼ばずに捨てた書き手(起動の途中の失敗)は
+    /// 止まり、タスクがサービス(pool)の複製を持ったまま残らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_writer_dropped_without_shutdown_stops_and_releases_the_pool() {
+        let svc = service().await;
+        let writer =
+            svc.spawn_rejection_writer_with(Duration::from_secs(3600), Duration::from_secs(3600));
+        assert!(svc.rejections.writer_running.load(Ordering::Acquire));
+        assert!(Arc::strong_count(&svc.rejections) > 1);
+        drop(writer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while svc.rejections.writer_running.load(Ordering::Acquire)
+            || Arc::strong_count(&svc.rejections) > 1
+        {
+            assert!(Instant::now() < deadline, "捨てた書き手が止まらない");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

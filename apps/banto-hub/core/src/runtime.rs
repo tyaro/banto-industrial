@@ -785,9 +785,6 @@ impl HubRuntime {
         });
         let controller = Arc::new(CollectionController::new(manager.clone()));
         let write_audit = WriteAuditService::new(pool.clone());
-        // #945 の総点検: 拒否の監査を周期で DB へ書く書き手。終了のときに止めて書き切る
-        // （`shutdown_and_report`）。
-        let rejection_writer = write_audit.spawn_rejection_writer();
 
         // T3 (docs/tag-server-design.md §5.3): construct stopped, then
         // apply the persisted settings - `enabled` comes straight from
@@ -924,6 +921,14 @@ impl HubRuntime {
         // ものがすべて済んでから起こす。先に起こしたものは、失敗する経路で
         // abort する（上のサーバー起動の失敗側）。
         let audit_spool_handle: Option<JoinHandle<()>> = audit_for_spool.spawn_spool_flusher();
+        // #945 の総点検: 拒否の監査を周期で DB へ書く書き手。終了のときに止めて書き切る
+        // （`shutdown_and_report`）。#945 のレビュー: 上の約束どおり、失敗しうる起動手順が
+        // すべて済んでから起こす（先に起こすと、起動の失敗で `RejectionWriter` が捨て
+        // られても見張りのタスクが pool を持ったまま残る）。gRPC（`grpc_server.apply`）と
+        // REST（サーバー起動）はこれより前に要求を受け始めるが、拒否は表に足すだけなので、
+        // 書き手が起きる前の拒否も表に残り、最初の周期で書かれる（書き手を起こすまでは
+        // 「書き手が止まっている」のログも出さない）。
+        let rejection_writer = write_audit.spawn_rejection_writer();
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
