@@ -226,6 +226,7 @@ async fn run(mode: Mode) {
     let ctx = ApiKeyContext {
         id: 1,
         name: "writer".into(),
+        prefix: "kkkkkkkk".to_string(),
         scopes: vec!["write:line.slow.bit".into()],
         last_used_at_ms: None,
     };
@@ -591,6 +592,7 @@ async fn fc22_hint_run() {
     let ctx = ApiKeyContext {
         id: 1,
         name: "writer".into(),
+        prefix: "kkkkkkkk".to_string(),
         scopes: vec!["write:line.slow.bit".into(), "write:line.slow.word".into()],
         last_used_at_ms: None,
     };

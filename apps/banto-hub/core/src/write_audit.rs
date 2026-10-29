@@ -39,10 +39,11 @@
 //! [`insert_row`] 1回で完結する(pending 経由にする理由がない -
 //! そもそも broker を呼んでいない)。
 //!
-//! ## スナップショット列 (`api_key_name_snapshot`/`external_name_snapshot`)
+//! ## スナップショット列 (`api_key_name_snapshot`/`api_key_prefix_snapshot`/`external_name_snapshot`)
 //!
-//! API キーは失効(`revoked_at`)されても行として残るが名前が変わる
-//! ことはない一方、タグは削除・リネームされうる。監査行は「その時点で
+//! API キーは失効(`revoked_at`)されても行として残るが、失効後に削除
+//! できる(#713、2026-10-29)。タグも削除・リネームされうる。プレフィックスは
+//! 挿入時に `api_keys` から写す(0108 より前の行は `NULL`)。監査行は「その時点で
 //! 何が起きたか」を後から名前解決なしに読めるよう、キー名・外部名を
 //! **書き込み時点の値としてスナップショット**する(`crate::audit`の
 //! `rule_name_snapshot` と同じ設計判断)。
@@ -183,6 +184,10 @@ pub struct WriteAuditEntry {
     pub ts: String,
     pub api_key_id: i64,
     pub api_key_name_snapshot: String,
+    /// #713（2026-10-29 オーナー決定）: 書込み時点のキーのプレフィックス
+    /// （失効したキーを削除した後も記録から読めるようにする。0108 より前の
+    /// 行は `NULL`）。
+    pub api_key_prefix_snapshot: Option<String>,
     pub tag_id: i64,
     pub external_name_snapshot: String,
     pub value_requested: Option<f64>,
@@ -198,6 +203,7 @@ fn column_map() -> ColumnMap {
         .column("ts", "ts")
         .column("apiKeyId", "api_key_id")
         .column("apiKeyNameSnapshot", "api_key_name_snapshot")
+        .column("apiKeyPrefixSnapshot", "api_key_prefix_snapshot")
         .column("tagId", "tag_id")
         .column("externalNameSnapshot", "external_name_snapshot")
         .column("valueRequested", "value_requested")
@@ -224,12 +230,15 @@ impl WriteAuditService {
     pub async fn insert_row(&self, row: &WriteAuditRow) -> Result<i64, BantoError> {
         let id: i64 = sqlx::query_scalar(
             "INSERT INTO hub_write_audit (\
-                api_key_id, api_key_name_snapshot, tag_id, external_name_snapshot, \
-                value_requested, value_requested_text, action, result, detail\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+                api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
+                external_name_snapshot, value_requested, value_requested_text, action, \
+                result, detail\
+             ) VALUES (?, ?, (SELECT prefix FROM api_keys WHERE id = ?), ?, ?, ?, ?, ?, ?, ?) \
+             RETURNING id",
         )
         .bind(row.api_key_id)
         .bind(&row.api_key_name_snapshot)
+        .bind(row.api_key_id)
         .bind(row.tag_id)
         .bind(&row.external_name_snapshot)
         .bind(row.value_requested)
@@ -292,7 +301,7 @@ impl WriteAuditService {
         let columns = column_map();
 
         let mut rows_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT id, ts, api_key_id, api_key_name_snapshot, tag_id, external_name_snapshot, \
+            "SELECT id, ts, api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, external_name_snapshot, \
              value_requested, value_requested_text, action, result, detail FROM hub_write_audit",
         );
         banto_storage::list_query::sqlite::apply_list_params(&mut rows_builder, &columns, &params)?;
@@ -359,6 +368,41 @@ mod tests {
         assert_eq!(row.value_requested, Some(42.5));
         assert_eq!(row.action, "write");
         assert_eq!(row.result, "ok");
+    }
+
+    /// #713: キーを削除した後も、監査行から名前とプレフィックスが読める
+    /// （プレフィックスは挿入時に `api_keys` から写す）。
+    #[tokio::test]
+    async fn name_and_prefix_stay_readable_after_the_key_is_deleted() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let keys = crate::api_keys::ApiKeysService::new(pool.clone());
+        let issued = keys
+            .issue("gone-soon", vec!["write:c.g.t".into()], None)
+            .await
+            .unwrap();
+        let svc = WriteAuditService::new(pool);
+        let row = WriteAuditRow::new(
+            issued.id,
+            "gone-soon",
+            10,
+            "line1.fast.temp01",
+            WriteAuditAction::Write,
+            WriteAuditResult::Ok,
+        );
+        svc.insert_row(&row).await.unwrap();
+
+        keys.revoke(issued.id).await.unwrap();
+        assert!(matches!(
+            keys.delete(issued.id).await.unwrap(),
+            crate::api_keys::ApiKeyDeleteOutcome::Deleted(_)
+        ));
+
+        let listed = svc.list(ListParams::default()).await.unwrap();
+        assert_eq!(listed.rows[0].api_key_name_snapshot, "gone-soon");
+        assert_eq!(
+            listed.rows[0].api_key_prefix_snapshot.as_deref(),
+            Some(issued.prefix.as_str())
+        );
     }
 
     #[tokio::test]

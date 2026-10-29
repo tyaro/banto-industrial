@@ -6,8 +6,8 @@
  *
  * `POST /api/api-keys` の応答に含まれる平文 `key` は **この応答限り**
  * （`apps/banto-hub/core/src/api_keys.rs` の doc comment 参照 - DB には
- * ハッシュしか保存されない）。DELETE ルートは存在しない（失効履歴を残す
- * 設計のため revoke のみ、設計 §5.6）。
+ * ハッシュしか保存されない）。削除は失効済みのキーだけ（#713、2026-10-29
+ * オーナー決定。有効なキーは 409 で断られる）。
  *
  * T2-4（設計 §6-4）: `trippedAt`/`clearTripApiKey` はレート制限ブレーカが
  * トリップさせたキーの状態と手動解除 - `revoke`（不可逆）とは別の
@@ -107,6 +107,8 @@ function currentToken(): string | null {
 interface HttpInit {
 	method: string;
 	body?: unknown;
+	/** DELETE の 204 応答を JSON パースしない（`sinkGroupsAdmin.ts` と同じ規約）。 */
+	expectNoContent?: boolean;
 }
 
 async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
@@ -144,6 +146,7 @@ async function httpRequest<T>(path: string, init: HttpInit): Promise<T> {
 		});
 	}
 
+	if (init.expectNoContent) return undefined as T;
 	return (await response.json()) as T;
 }
 
@@ -156,9 +159,17 @@ export async function createApiKey(input: CreateApiKeyInput): Promise<IssuedApiK
 	return httpRequest<IssuedApiKey>('/api/api-keys', { method: 'POST', body: input });
 }
 
-/** 失効（冪等）。DELETE は無い - 失効履歴は revokedAt として残る。 */
+/** 失効（冪等）。行は残り、`revokedAt` が立つ（物理削除は `deleteApiKey`）。 */
 export async function revokeApiKey(id: number): Promise<ApiKeySummary> {
 	return httpRequest<ApiKeySummary>(`/api/api-keys/${id}/revoke`, { method: 'POST' });
+}
+
+/**
+ * #713: 失効済みのキーを削除する（admin のみ。有効なキーは 409）。書込み監査
+ * などの記録には、キーの名前とプレフィックスが残る。
+ */
+export async function deleteApiKey(id: number): Promise<void> {
+	await httpRequest<void>(`/api/api-keys/${id}`, { method: 'DELETE', expectNoContent: true });
 }
 
 /** T2-4: トリップ解除（冪等）。`revoke` と違い再び通常どおり使えるようになる。 */

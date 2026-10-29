@@ -553,6 +553,102 @@ async fn viewer_role_cannot_issue_api_keys() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 
+/// #713: `DELETE /api/api-keys/{id}` の補助（ステータスだけ返す）。
+async fn delete_api_key(router: &Router, token: &str, id: i64) -> StatusCode {
+    router
+        .clone()
+        .oneshot(
+            HttpRequest::delete(format!("/api/api-keys/{id}"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn revoke_api_key(router: &Router, token: &str, id: i64) {
+    let response = router
+        .clone()
+        .oneshot(
+            HttpRequest::post(format!("/api/api-keys/{id}/revoke"))
+                .header("Authorization", format!("Bearer {token}"))
+                .header(CLIENT_HEADER.0, CLIENT_HEADER.1)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// #713（2026-10-29 オーナー決定）: 有効なキーの削除は 409 で断り、キーは
+/// 残る。失効させれば削除でき（204）、同じ名前で発行し直せる。存在しない
+/// id は 404。削除は監査ログに名前とプレフィックスつきで残る。
+#[tokio::test]
+async fn only_a_revoked_api_key_can_be_deleted_and_its_name_is_reusable() {
+    let env = test_env().await;
+    let (_s, issued) = issue_api_key(&env.router, &env.admin_token, "reuse-me", &["read"]).await;
+    let id = issued["id"].as_i64().unwrap();
+    let prefix = issued["prefix"].as_str().unwrap().to_string();
+
+    assert_eq!(
+        delete_api_key(&env.router, &env.admin_token, id).await,
+        StatusCode::CONFLICT
+    );
+    let keys = ApiKeysService::new(env.pool.clone());
+    assert_eq!(keys.list().await.unwrap().len(), 1, "active key must stay");
+
+    // 名前はまだ使用中。
+    let (status, _) = issue_api_key(&env.router, &env.admin_token, "reuse-me", &["read"]).await;
+    assert_ne!(status, StatusCode::CREATED);
+
+    revoke_api_key(&env.router, &env.admin_token, id).await;
+    assert_eq!(
+        delete_api_key(&env.router, &env.admin_token, id).await,
+        StatusCode::NO_CONTENT
+    );
+    assert!(keys.list().await.unwrap().is_empty());
+    assert_eq!(
+        delete_api_key(&env.router, &env.admin_token, id).await,
+        StatusCode::NOT_FOUND
+    );
+
+    let (status, again) = issue_api_key(&env.router, &env.admin_token, "reuse-me", &["read"]).await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_ne!(again["id"].as_i64().unwrap(), id);
+
+    let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
+    let entries = audit.list(ListParams::default()).await.unwrap();
+    let row = entries
+        .rows
+        .iter()
+        .find(|row| row.action == "delete" && row.resource == "api_keys")
+        .expect("a delete/api_keys audit row should exist");
+    assert_eq!(row.entity_id.as_deref(), Some(id.to_string().as_str()));
+    let detail = row.detail.as_deref().unwrap_or_default();
+    assert!(
+        detail.contains("reuse-me") && detail.contains(&prefix),
+        "{detail}"
+    );
+}
+
+#[tokio::test]
+async fn viewer_role_cannot_delete_api_keys() {
+    let env = test_env().await;
+    let (_s, issued) = issue_api_key(&env.router, &env.admin_token, "keep-me", &["read"]).await;
+    let id = issued["id"].as_i64().unwrap();
+    revoke_api_key(&env.router, &env.admin_token, id).await;
+    assert_eq!(
+        delete_api_key(&env.router, &env.viewer_token, id).await,
+        StatusCode::FORBIDDEN
+    );
+    let keys = ApiKeysService::new(env.pool.clone());
+    assert_eq!(keys.list().await.unwrap().len(), 1);
+}
+
 /// `GET /api/v1/openapi.json` は認証不要で 200、`/api/v1/values` 等の
 /// パスを含む（実装指示 §3の7件目）。
 #[tokio::test]

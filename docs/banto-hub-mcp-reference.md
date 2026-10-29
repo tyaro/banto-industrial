@@ -233,8 +233,9 @@ MCP から banto-hub を**構成**するツール群（T21、docs/banto-hub-t21-
 - すべて **`admin` スコープ必須**（read/write とは直交＝admin だけのキーはタグ値を
   読み書きできない）。**ロックダウン後も admin スコープで利用可**（設計 §3.2。write 系
   データツールは §3 のとおりアドバイザリ化するが、構成ツールは影響を受けない）。
-- **全操作を `audit_log` に記録**（`origin:"mcp"`、actor=API キー名。pending queue へ
-  入った場合も記録）。
+- **全操作を `audit_log` に記録**（`origin:"mcp"`、actor=`API キー名（プレフィックス）`。失効キーの削除後は同じ名前を
+  再発行できるので、プレフィックスで旧いキーと区別する。pending queue へ入った場合も記録、
+  依頼者も同じ表記）。
 - **不可逆操作は `confirm:true` 必須**（`delete_*`・`revoke_api_key`・`lock_down`）。
 - 接続/グループ/タグの変更は、**ロックダウン済みで収集中のときだけ** pending queue に
   投入される（REST と同じ）。**試運転中（未ロックダウン）は収集中でもその場で
