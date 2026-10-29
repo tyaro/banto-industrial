@@ -356,12 +356,17 @@ async fn a_datagram_from_another_port_is_ignored_and_times_out() {
     assert!(!session.is_connected());
 }
 
-/// 時間切れの後に届いた応答は、次の接続（新しいエフェメラルポート）には届かない。
+/// 時間切れの後に届いた応答は、同じ相手への次の接続には届かない（次の接続は直前の接続の
+/// ポートを使わないので、`assert_ne!` は作りで保証される。重なる経路は下の `bind_avoiding` の試験）。
 #[tokio::test]
 async fn a_reply_after_a_timeout_never_reaches_the_next_connection() {
     let peer = Peer::bind().await;
     let driver = UdpDriver::new(Handshake::RoundTrip);
     let (mut first, _, _, first_addr) = open(&peer, &driver).await;
+    assert_eq!(
+        UdpTransport::last_port(peer.addr()),
+        Some(first_addr.port())
+    );
     shorten(&mut first);
     let (_, result) = tokio::join!(peer.next(), read_one(&mut first));
     assert_eq!(result, Err(FatalError::Timeout));
@@ -369,8 +374,9 @@ async fn a_reply_after_a_timeout_never_reaches_the_next_connection() {
 
     let (mut second, _, _, second_addr) = open(&peer, &driver).await;
     assert_ne!(
-        second_addr, first_addr,
-        "接続ごとに新しいポートを bind する"
+        second_addr.port(),
+        first_addr.port(),
+        "直前の接続のポートは使わない"
     );
     // 遅れた応答（99）を古い接続のポートへ送る。
     peer.reply(first_addr, &[b'R', 99]).await;
@@ -382,6 +388,126 @@ async fn a_reply_after_a_timeout_never_reaches_the_next_connection() {
     };
     let (_, value) = tokio::join!(peer_side, read_one(&mut second));
     assert_eq!(value, Ok(RawValue::Uint(7)));
+}
+
+/// 偽のソケット。生きている数を数え、bind のたびに前に作ったものがまだ生きているかを見る。
+struct FakeSocket {
+    port: u16,
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for FakeSocket {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// `ports` の順にポートを渡す偽の bind。各回の bind の時点で、それまでに渡したソケットが
+/// すべて生きている（= 重なったソケットを持ったまま bind し直している）ことを確かめる。
+fn fake_bind(
+    ports: &'static [u16],
+    live: Arc<AtomicUsize>,
+) -> impl FnMut() -> std::io::Result<FakeSocket> {
+    let mut next = 0;
+    move || {
+        assert_eq!(
+            live.load(Ordering::SeqCst),
+            next,
+            "重なったソケットを持ったまま bind し直していない"
+        );
+        let port = ports[next];
+        next += 1;
+        live.fetch_add(1, Ordering::SeqCst);
+        Ok(FakeSocket {
+            port,
+            live: live.clone(),
+        })
+    }
+}
+
+/// OS が直前の接続のポートを返したら、それを持ったまま bind し直し、別のポートを採る。
+/// 重なったソケットは戻る時に閉じる。避ける対象が無ければ最初のポートを採る。
+#[test]
+fn bind_avoiding_holds_a_colliding_port_and_binds_again() {
+    let live = Arc::new(AtomicUsize::new(0));
+    let (socket, port) = crate::transport::bind_avoiding(
+        Some(5000),
+        fake_bind(&[5000, 5000, 5001], live.clone()),
+        |s| Ok(s.port),
+    )
+    .unwrap();
+    assert_eq!((socket.port, port), (5001, 5001));
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        1,
+        "重なったソケットを閉じていない"
+    );
+
+    let live = Arc::new(AtomicUsize::new(0));
+    let (_, port) =
+        crate::transport::bind_avoiding(None, fake_bind(&[5000], live.clone()), |s| Ok(s.port))
+            .unwrap();
+    assert_eq!(port, 5000);
+
+    // 重なり続ける（実際の OS では起きない）なら、上限の回数で Io にする。
+    let live = Arc::new(AtomicUsize::new(0));
+    let result =
+        crate::transport::bind_avoiding(Some(7), fake_bind(&[7; 8], live.clone()), |s| Ok(s.port));
+    assert!(matches!(result, Err(FatalError::Io(_))));
+    assert_eq!(live.load(Ordering::SeqCst), 0);
+}
+
+/// 本物のソケットで: 直前のポート P をまだ持っているソケットを 1 回目の bind として渡すと、
+/// 2 回目の bind（ポート 0）は OS が P を渡せないので必ず別のポートになる。
+#[test]
+fn bind_avoiding_rebinds_a_real_socket_while_holding_the_previous_port() {
+    let previous = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+    let p = previous.local_addr().unwrap().port();
+    let mut first = Some(previous);
+    let (socket, port) = crate::transport::bind_avoiding(
+        Some(p),
+        || match first.take() {
+            Some(s) => Ok(s),
+            None => std::net::UdpSocket::bind(("127.0.0.1", 0)),
+        },
+        |s| s.local_addr().map(|a| a.port()),
+    )
+    .unwrap();
+    assert_ne!(port, p);
+    assert_eq!(socket.local_addr().unwrap().port(), port);
+}
+
+/// `UdpTransport::connect` の配線: OS が覚えたポートを返したら（ここでは、そのポートを持つ
+/// ソケットを 1 回目の bind として渡す）、それを避けて別のポートで接続し、新しいポートを覚える。
+#[tokio::test]
+async fn connect_skips_the_remembered_port_when_the_os_hands_it_out() {
+    let peer = Peer::bind().await;
+    let colliding = std::net::UdpSocket::bind(("0.0.0.0", 0)).unwrap();
+    let p = colliding.local_addr().unwrap().port();
+    UdpTransport::remember_port(peer.addr(), p);
+    let mut first = Some(colliding);
+    let transport = UdpTransport::connect_with(peer.addr(), |local| match first.take() {
+        Some(s) => Ok(s),
+        None => std::net::UdpSocket::bind(local),
+    })
+    .unwrap();
+    let port = transport.local_addr().unwrap().port();
+    assert_ne!(port, p, "覚えたポートで接続した");
+    assert_eq!(UdpTransport::last_port(peer.addr()), Some(port));
+}
+
+/// 同じ相手へ続けて開き直すと、毎回その接続のポートを覚え、直前のポートを使わない。
+#[tokio::test]
+async fn consecutive_connections_to_one_peer_never_reuse_the_previous_port() {
+    let peer = Peer::bind().await;
+    let mut previous = None;
+    for _ in 0..200 {
+        let transport = UdpTransport::connect(peer.addr()).unwrap();
+        let port = transport.local_addr().unwrap().port();
+        assert_ne!(Some(port), previous);
+        assert_eq!(UdpTransport::last_port(peer.addr()), Some(port));
+        previous = Some(port);
+    }
 }
 
 /// 前の要求への重複の応答がキューに残っていても、次の要求の送信の前に捨てる。

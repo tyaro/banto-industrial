@@ -15,7 +15,7 @@ R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（ア�
 #916（docs/banto-hub-driver-io-design.md §7.6）: UDP のトランスポート。破壊はなく追加のみ（minor）。
 
 - `TransportSpec::Udp { host, port }`（`TransportSpec` は `#[non_exhaustive]`）と `from_settings` の `transport = "udp"`（ドライバの `transports` に `Udp` が要る）。
-- `UdpTransport`（`UDP_RECV_BUFFER` = 64 KiB）: 接続ごとに新しいエフェメラルポートを bind して相手に `connect` する。`discard_input` は溜まったデータグラムを空読みで捨てる。
+- `UdpTransport`（`UDP_RECV_BUFFER` = 64 KiB）: 接続ごとにエフェメラルポートを bind して相手に `connect` する（同じ相手への直前の接続のポートは使わない。プロセスの中で相手ごとに 1 つ覚える）。`discard_input` は溜まったデータグラムを空読みで捨てる。
 - `Transport::datagram`（既定 `false`。既存の実装は直さなくてよい）。`true` の通信路では、1 回の受信を 1 応答としてフレーム規則を当て（足りない・余り・`max_len` 超過はフレーム不正）、各送信の前に受信を捨て、応答を待つ step の無いハンドシェイクを `FatalError::Protocol` で断る。再送はしない。
 
 R2b-5b・5c: broker（`banto-broker`）が `simulation = true` の接続をこの `SimDevice` で張り（`SimDevice::id()` を接続の指紋に含める）、アプリの振る舞いが変わった。破壊はなく、`0.1.0` からの追加のみ（minor）。

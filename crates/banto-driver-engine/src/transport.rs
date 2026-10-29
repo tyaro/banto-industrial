@@ -52,8 +52,9 @@ pub enum TransportSpec {
         host: String,
         port: u16,
     },
-    /// UDP（#916）。接続ごとに新しいエフェメラルポートを bind し、相手に `connect` する
-    /// （他の送信元のデータグラムは OS が捨てる）。1 データグラム = 1 フレーム。
+    /// UDP（#916）。接続ごとにエフェメラルポートを bind し（同じ相手への直前の接続のポートは
+    /// 使わない）、相手に `connect` する（他の送信元のデータグラムは OS が捨てる）。
+    /// 1 データグラム = 1 フレーム。
     Udp {
         host: String,
         port: u16,
@@ -494,10 +495,54 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send + 'static> Transport for StreamTra
 /// 1 回の受信に使うバッファの大きさ（UDP のデータグラムの最大）。`max_len` はエンジンが後で当てる。
 pub const UDP_RECV_BUFFER: usize = 64 * 1024;
 
+/// 前の接続のポートと重なったときに bind し直す回数の上限（重なりは保持中のポートでは起きない
+/// ので、2 回目で抜けるのが普通。上限は OS の異常で回り続けないため）。
+const UDP_BIND_ATTEMPTS: usize = 8;
+/// 相手ごとの直前のポートを覚える数の上限。超えたら全部忘れる（忘れた相手は次の 1 回だけ
+/// 避ける対象が無くなる。接続先の数がこれを超える構成は想定していない）。
+const UDP_LAST_PORTS_CAP: usize = 1024;
+
+/// 相手のアドレスごとの、直前に開いた UDP の接続のローカルポート（プロセスごと）。
+/// 再接続は broker が `SessionDriver::connect` を呼び直すだけで、接続の枠をまたいで持ち越す
+/// 状態がエンジンにも broker にも無いので、ここに置く（診断の接続など、別の枠からの同じ相手への
+/// 接続もまとめて避けられる）。Hub を再起動すると忘れるが、そのとき古いソケットも残っていない。
+fn udp_last_ports(
+) -> &'static std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, u16>> {
+    static LAST: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::net::SocketAddr, u16>>,
+    > = std::sync::OnceLock::new();
+    LAST.get_or_init(Default::default)
+}
+
+/// `bind` を呼び、得たポートが `avoid` と同じなら、そのソケットを持ったまま bind し直す
+/// （OS は bind 中のポートを渡さないので、次は必ず別のポートになる）。重なったソケットは
+/// 戻る時に閉じる。`UDP_BIND_ATTEMPTS` 回重なり続けたら `FatalError::Io`。
+pub(crate) fn bind_avoiding<S>(
+    avoid: Option<u16>,
+    mut bind: impl FnMut() -> std::io::Result<S>,
+    port_of: impl Fn(&S) -> std::io::Result<u16>,
+) -> Result<(S, u16), FatalError> {
+    let mut held = Vec::new();
+    for _ in 0..UDP_BIND_ATTEMPTS {
+        let socket = bind().map_err(io_error)?;
+        let port = port_of(&socket).map_err(io_error)?;
+        if Some(port) != avoid {
+            return Ok((socket, port));
+        }
+        held.push(socket);
+    }
+    Err(FatalError::Io(format!(
+        "UDP のポートが {UDP_BIND_ATTEMPTS} 回続けて前の接続と同じになった"
+    )))
+}
+
 /// UDP の通信路（#916、設計 io-design §7.6）。1 接続 = 1 個の接続済み（`connect`）ソケット。
 ///
-/// - 接続ごとに新しいエフェメラルポートを bind するので、時間切れで捨てた接続への遅れた応答は
-///   次の接続に届かない（古いポートは閉じている）。
+/// - 接続ごとにエフェメラルポートを bind し、同じ相手への**直前の接続のポートは使わない**
+///   （`bind_avoiding`）。時間切れで閉じた接続への遅れた応答は、閉じたポートに届いて OS が捨てる。
+///   覚えるのは直前の 1 つだけなので、もっと古い接続のポートが後で再び割り当てられれば、
+///   その接続への応答が届く余地は残る（4E はシリアル番号の照合が捕まえ、3E は発行順だけ。
+///   #916 の作者決定で受け入れた）。各送信の前の破棄（`discard_input`）も合わせて狭める。
 /// - 接続済みなので、相手以外の送信元からのデータグラムは OS が捨てる。
 /// - `recv` は 1 回で 1 データグラムを受け、64 KiB のバッファからそのまま足す。
 /// - `discard_input` は溜まったデータグラム（重複・遅れた応答）を空読みで捨てる。
@@ -514,22 +559,63 @@ pub struct UdpTransport {
 
 impl UdpTransport {
     /// 相手のアドレスと同じ族の未指定アドレスのエフェメラルポートを bind し、相手に `connect` する。
+    /// 同じ相手への直前の接続のポートは使わない（型の doc）。覚えたポートの読み・bind・記録は
+    /// 1 つの lock の中で行う（どれも待たない OS の呼び出し）。
     pub fn connect(peer: std::net::SocketAddr) -> Result<Self, FatalError> {
+        Self::connect_with(peer, std::net::UdpSocket::bind)
+    }
+
+    /// `connect` の本体。`bind` は試験で OS の割り当てを差し替える口（本番は `UdpSocket::bind`）。
+    pub(crate) fn connect_with(
+        peer: std::net::SocketAddr,
+        mut bind: impl FnMut(std::net::SocketAddr) -> std::io::Result<std::net::UdpSocket>,
+    ) -> Result<Self, FatalError> {
         let local: std::net::SocketAddr = if peer.is_ipv4() {
             (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
         } else {
             (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
         };
-        let std_socket = std::net::UdpSocket::bind(local).map_err(io_error)?;
+        let mut last = udp_last_ports()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (std_socket, port) = bind_avoiding(
+            last.get(&peer).copied(),
+            || bind(local),
+            |s| s.local_addr().map(|a| a.port()),
+        )?;
         std_socket.connect(peer).map_err(io_error)?;
         std_socket.set_nonblocking(true).map_err(io_error)?;
         let drain = std_socket.try_clone().map_err(io_error)?;
         let socket = tokio::net::UdpSocket::from_std(std_socket).map_err(io_error)?;
+        if last.len() >= UDP_LAST_PORTS_CAP && !last.contains_key(&peer) {
+            last.clear();
+        }
+        last.insert(peer, port);
+        drop(last);
         Ok(Self {
             socket,
             drain,
             rx: vec![0; UDP_RECV_BUFFER].into_boxed_slice(),
         })
+    }
+
+    /// `peer` への直前の接続のポートを書き込む（試験用）。
+    #[cfg(test)]
+    pub(crate) fn remember_port(peer: std::net::SocketAddr, port: u16) {
+        udp_last_ports()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(peer, port);
+    }
+
+    /// `peer` への直前の接続のポート（試験用）。
+    #[cfg(test)]
+    pub(crate) fn last_port(peer: std::net::SocketAddr) -> Option<u16> {
+        udp_last_ports()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&peer)
+            .copied()
     }
 
     /// このソケットの bind したアドレス（試験用）。
