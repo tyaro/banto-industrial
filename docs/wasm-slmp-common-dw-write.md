@@ -1,6 +1,6 @@
 # SLMP WASM D/W 書込み境界
 
-状態: **限定実装（2026-10-29）**。D/W 共通の u16 書込み（#877）と型付き書込み（#878）を実装した。2026-10-29 に D/W のワード内ビット書込み（guest #61 の F、RMW）を Host ゲートに足した（模擬のみ、実機未確認。下の「ワード内ビットの書込み」）。同日、D/W の文字列タグの書込みも Host ゲートに足し（#914 の C1 の Hub 側）、guest #63（固定 `f6c8781`）で component と t12 の模擬受入れを済ませた（実機未確認。下の「文字列タグの書込み」）。既定で無効で、本番鍵・保護配置・本番での有効化は未実施。受入れの対応表は末尾の節（2026-10-27）。Issue #875 は照合の結果をオーナーが確かめるまで開いたまま。
+状態: **限定実装（2026-10-29）**。D/W 共通の u16 書込み（#877）と型付き書込み（#878）を実装した。2026-10-29 に D/W のワード内ビット書込み（guest #61 の F、RMW）を Host ゲートに足した（模擬のみ、実機未確認。下の「ワード内ビットの書込み」）。同日、D/W の文字列タグの書込みも Host ゲートに足し（#914 の C1 の Hub 側）、guest #63（固定 `f6c8781`）で component と t12 の模擬受入れを済ませた（実機未確認。下の「文字列タグの書込み」）。2026-10-29 に U\G バッファメモリ（guest #65 の G1、固定 `1fac51a`）が読取り専用で、Host ゲートが送る前に断ることを模擬で確かめた（下の「U\G バッファメモリは書かない」）。既定で無効で、本番鍵・保護配置・本番での有効化は未実施。受入れの対応表は末尾の節（2026-10-27）。Issue #875 は照合の結果をオーナーが確かめるまで開いたまま。
 
 Hub は署名検証済みの write-v1 guest を明示選択した接続でのみ、SLMP の許可済み D/W 数値タグと標準 Q/R の M/Y/L/B Bool タグの書込みを受け付ける。通常の読取り専用 loader は write 宣言を拒否する。実際の配置先、信頼鍵、接続設定を整えるまで、本番での有効化は行わない。
 
@@ -28,6 +28,10 @@ CI は旧 read/write・診断 guest の固定コミットによる回帰を残�
 ### 文字列タグの書込み（C1、2026-10-29、模擬のみ・実機未確認）
 
 要求が D/W の文字列タグ 1 つだけで、範囲 `[先頭, 先頭 + 語数 − 1]` 全体が `d_u16_write_allowlist` の 1 つのワード区間に入るとき（D3000・D3001 は保護のまま）、Host は値を native SLMP と同じ `encode_string_value` で符号化し、0 埋めした `2 × 語数` バイトを文字順の `value::bytes`（`data-type` `"string"`・`string-words` 付き）で guest へ渡す。表せない文字・長すぎる値・他の項目との混在は送る前に断る。下位バイト先の詰め方は guest の仕事（banto-driver-wasm `docs/PLAN.md` の C1）。guest #63（固定 `f6c8781`）で模擬受入れを済ませた（2026-10-29）: guest は 0 埋めの全体を 1 回の 1401 で下位バイト先のまま送り、範囲の外へはみ出す文字列・他の項目との混在・長すぎる値は Host のゲートが送る前に断る（`crates/banto-driver-wasm/tests/slmp_udp_strings.rs`）。保存済みの D・W の文字列タグを REST から書くと監査が `ok` で read-now が読み戻し、断った書込みは何も送らず監査が `failed`（OW `new_guest_saved_d_and_w_strings_are_written_audited_and_read_back_over_rest`）。実機は未確認。
+
+### U\G バッファメモリは書かない（G1、2026-10-29、模擬のみ・実機未確認）
+
+guest #65（固定 `1fac51a`）の `U<h>\G<n>` は読取り専用で、`writableArea` は偽。Host の書込みゲートは D/W/M/Y/L/B 以外の `area` を元から断るので、数値・ワード内ビット・文字列のどれを `U\G` へ書いても、許可リストの D と同じ要求に混ぜても、何も送らず項目ごとの `Unsupported` になる。許可リストの記法にも `U\G` は書けない。REST の `writable: true` の登録は読み取り専用の領域として 422（`crates/banto-driver-wasm/tests/slmp_unit_buffer.rs` の `unit_buffer_writes_are_refused_before_send`、t12 の `new_guest_saved_unit_buffer_tags_are_collected_and_read_now_on_r` / `_on_q`）。
 
 ## 受入れの対応表（#875、2026-10-27）
 
