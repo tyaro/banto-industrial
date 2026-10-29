@@ -1894,6 +1894,9 @@ mod slmp_wasm_operational_write_test;
 #[path = "t12_slmp_wasm_hub_live/mod.rs"]
 mod slmp_wasm_hub_live_test;
 
+#[path = "t12_wasm_live_917/mod.rs"]
+mod wasm_live_917_test;
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn native_slmp_v_is_rejected_by_tag_rest_and_csv_style_batch() {
     let app = test_app("slmp-v-registration").await;
