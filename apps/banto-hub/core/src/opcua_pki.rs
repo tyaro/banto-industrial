@@ -55,7 +55,32 @@
 //! - **Unix**: banto-opcua が鍵のフォルダを 0700・鍵を 0600 にする。ここでは、既にある鍵が
 //!   グループ・他人に開いている（`mode & 0o077`）、置き場・`own`・`private` と
 //!   証明書がグループ・他人に書ける（`mode & 0o022`）、どれかがシンボリックリンクなら断る。
-//!   置き場がなければ 0700 で作る（既にある置き場の権限は書き換えない）。
+//!   **所有者**も確かめる（#943 のレビュー P1）: 置き場・`own`・`private`・証明書・鍵の
+//!   所有者の UID が、実行している利用者の実効 UID と違えば断る（別の利用者が持つ `0700` の
+//!   フォルダ・`0600` の鍵を、root で動く Hub が使い回さない・その所有者に読ませない）。
+//!   親の `opcua` は、所有者が実行している利用者か root で、グループ・他人に書けないこと。
+//!   実効 UID は、既にある依存の `sysinfo` で自分のプロセスの実効 UID を読む（`libc` を
+//!   足さない。読めなければ断る）。置き場がなければ 0700 で作る（既にある置き場の権限は
+//!   書き換えない）。
+//!
+//! ### 親を辿らずに作る・確かめる（両方の OS。#943 のレビュー P2）
+//!
+//! データのフォルダから `opcua`、`opcua/pki` へと 1 段ずつ、**最後の要素のリンクを辿らずに**
+//! 確かめながら作る（`create_dir_all` で辿らない）。各段がリンク（Unix はシンボリックリンク、
+//! Windows は reparse point = ジャンクション・シンボリックリンクなど）か、フォルダでなければ
+//! 断る。無ければ作り（Unix は 0700、Windows の `opcua` は親から継承・`pki` は上の保護された
+//! DACL）、作ったあともう一度確かめる。最後に、置き場の本当のパス（`canonicalize`。Windows では
+//! `GetFinalPathNameByHandleW`）が、データのフォルダの本当のパスの下にあることを確かめる
+//! （別の profile などの外を指していれば断る）。
+//!
+//! - **データのフォルダ自身とその上は確かめない**: 本番ではデータのフォルダは握った profile の
+//!   `data\` の本当のパスで、profile の仕組み（`crate::profile_lock`・`crate::profile_grant`）が
+//!   起動時に確かめてある、という前提に立つ。profile を握らないとき（テストなど）は、実効の
+//!   データのフォルダを `create_dir_all` で作る。
+//! - Windows で `pin_dir`（ハンドルを握って相対で作る）を使わないのは、それが
+//!   `WRITE_DAC | WRITE_OWNER` を求めるため（設定モードの profile では、デスクトップの利用者は
+//!   「変更」しか持たず開けない）。代わりに、読むだけの権利で辿らずに開く `inspect_file` で
+//!   各段を確かめる。確かめから使うまでの間のすり替えは、下の競合と同じく防がない。
 //!
 //! 断ったとき・banto-opcua の `Error::Pki` のときは、理由をログと状態の API
 //! （`GET /api/opcua-status` の `failed`）に出す（`crate::opcua`）。原因を直したあと、
@@ -138,6 +163,51 @@ pub(crate) fn prepare(dir: &Path, profile_dir: Option<&Path>) -> Result<(), Stri
     })
 }
 
+/// 置き場 `dir`（[`pki_dir`] の形）から、データのフォルダを取る。`…/opcua/pki` で
+/// 終わっていなければ断る（1 段ずつ辿って確かめる範囲を決められない）。
+#[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+fn data_dir_of(dir: &Path) -> Result<&Path, String> {
+    let mut data = dir;
+    for name in PKI_SUBDIRS.iter().rev() {
+        if data.file_name().and_then(|n| n.to_str()) != Some(name) {
+            return Err(format!(
+                "置き場のパスが `…{sep}opcua{sep}pki` の形ではありません",
+                sep = std::path::MAIN_SEPARATOR
+            ));
+        }
+        data = data
+            .parent()
+            .ok_or_else(|| "置き場の親のデータのフォルダがありません".to_owned())?;
+    }
+    Ok(data)
+}
+
+/// 置き場の本当のパス `pki_real` が、データのフォルダの本当のパス `data_real` の下（同じ
+/// パスは除く）にあるかを確かめる純関数（モジュール doc「親を辿らずに作る・確かめる」）。
+#[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+fn ensure_inside(data_real: &Path, pki_real: &Path) -> Result<(), String> {
+    if pki_real != data_real && pki_real.starts_with(data_real) {
+        Ok(())
+    } else {
+        Err(format!(
+            "置き場の本当のパス（{}）が、データのフォルダの本当のパス（{}）の下にありません（リンクで profile の外を指しています）",
+            pki_real.display(),
+            data_real.display()
+        ))
+    }
+}
+
+/// データのフォルダ `data_dir` と置き場 `dir` の本当のパスを読み、[`ensure_inside`] で
+/// 確かめる（Windows の `canonicalize` は `GetFinalPathNameByHandleW`）。
+#[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+fn check_inside(data_dir: &Path, dir: &Path) -> Result<(), String> {
+    let real = |path: &Path| {
+        std::fs::canonicalize(path)
+            .map_err(|err| format!("{} の本当のパスを読めません: {err}", path.display()))
+    };
+    ensure_inside(&real(data_dir)?, &real(dir)?)
+}
+
 #[cfg(windows)]
 mod imp {
     use std::path::Path;
@@ -158,11 +228,14 @@ mod imp {
         // （Windows では `GetFullPathNameW` で `.`・`..` も畳む）。
         let dir =
             std::path::absolute(dir).map_err(|err| format!("パスを絶対パスにできません: {err}"))?;
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| {
-                format!("親のフォルダ（{}）を作れません: {err}", parent.display())
-            })?;
-        }
+        let data_dir = super::data_dir_of(&dir)?;
+        // データのフォルダとその上は profile の仕組みが確かめてある前提（モジュール doc）。
+        std::fs::create_dir_all(data_dir).map_err(|err| {
+            format!(
+                "データのフォルダ（{}）を作れません: {err}",
+                data_dir.display()
+            )
+        })?;
         // このプロセスの利用者（デスクトップ）には「変更」。LocalSystem など利用者の
         // アカウントでなければ SYSTEM・Administrators だけ。
         let me = acl::current_user_sid().ok();
@@ -170,8 +243,18 @@ mod imp {
             .clone()
             .map(DirAccess::with_install_user)
             .unwrap_or_else(DirAccess::service_only);
-        acl::create_dir_if_absent(&dir, &access)
-            .map_err(|err| format!("保護された置き場を作れません: {err}"))?;
+        // `opcua` → `opcua\pki` を 1 段ずつ、辿らずに確かめながら作る（#943 のレビュー P2）。
+        let opcua = dir.parent().expect("data_dir_of が確かめた");
+        ensure_dir_step(opcua, || match std::fs::create_dir(opcua) {
+            Err(err) if err.kind() != std::io::ErrorKind::AlreadyExists => Err(err.to_string()),
+            _ => Ok(()),
+        })?;
+        ensure_dir_step(&dir, || {
+            acl::create_dir_if_absent(&dir, &access)
+                .map(|_| ())
+                .map_err(|err| format!("保護された置き場を作れません: {err}"))
+        })?;
+        super::check_inside(data_dir, &dir)?;
         // 許可リストの 2・3（1 は `exposure` が理由にしない）。
         let mut allowed: Vec<String> = me.iter().map(|sid| sid.as_str().to_owned()).collect();
         if let Some(profile) = profile_dir {
@@ -192,6 +275,37 @@ mod imp {
                 problems.join(" / ")
             ))
         }
+    }
+
+    /// `path` を辿らずに開いて確かめ（`inspect_file`）、無ければ `create` で作ってもう一度
+    /// 確かめる。reparse point・フォルダでないものは断る（モジュール doc「親を辿らずに作る・
+    /// 確かめる」）。
+    fn ensure_dir_step(
+        path: &Path,
+        create: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let inspect = || {
+            acl::inspect_file(path)
+                .map_err(|err| format!("{} を確かめられません: {err}", path.display()))
+        };
+        let security = match inspect()? {
+            Some(security) => security,
+            None => {
+                create().map_err(|err| format!("{} を作れません: {err}", path.display()))?;
+                inspect()?
+                    .ok_or_else(|| format!("{} を作ったのに見つかりません", path.display()))?
+            }
+        };
+        if security.is_reparse_point {
+            return Err(format!(
+                "{} がリンク（reparse point。ジャンクション・シンボリックリンクなど）です。リンクを消して、置き場を profile の中に作り直させてください",
+                path.display()
+            ));
+        }
+        if !security.is_dir {
+            return Err(format!("{} がフォルダではありません", path.display()));
+        }
+        Ok(())
     }
 
     /// profile のフォルダ自身の DACL で許可されている利用者のアカウント（モジュール doc の
@@ -326,32 +440,123 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     use std::path::Path;
 
-    /// 置き場がなければ 0700 で作る。親は通常の権限で作り、置き場だけを 0700 に固定する
-    /// （umask に左右されないよう、作ったあとに明示的に 0700 にする）。既にある置き場の
-    /// 権限は書き換えず、広ければ下の確かめで断る。
-    fn create_pki_dir(dir: &Path) -> Result<(), String> {
-        let fail = |err: std::io::Error| format!("置き場を作れません: {err}");
-        if let Some(parent) = dir.parent() {
-            std::fs::create_dir_all(parent).map_err(fail)?;
+    /// root の UID。
+    const ROOT_UID: u32 = 0;
+
+    /// 実行している利用者の実効 UID。既にある依存の `sysinfo` で、自分のプロセスの実効 UID を
+    /// 読む（Linux は `/proc/self/status` の `Uid:` の 2 つ目）。`libc` を足さないため
+    /// （`Cargo.lock` を変えない）。読めなければ断る（所有者を確かめられない）。
+    fn effective_uid() -> Result<u32, String> {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let fail = |reason: &str| format!("実行している利用者の UID を読めません（{reason}）");
+        let pid = sysinfo::get_current_pid().map_err(fail)?;
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_user(UpdateKind::Always),
+        );
+        let uid = system
+            .process(pid)
+            .and_then(|process| process.effective_user_id())
+            .ok_or_else(|| fail("自分のプロセスの実効 UID が取れません"))?;
+        Ok(**uid)
+    }
+
+    /// 所有者の UID `owner` を、実行している利用者の実効 UID `me` と比べる純関数（#943 の
+    /// レビュー P1）。`root_ok` なら root（UID 0）の所有も通す（親の `opcua`）。断るときは
+    /// 直し方つきの理由を返す。
+    pub(super) fn owner_refusal(path: &Path, owner: u32, me: u32, root_ok: bool) -> Option<String> {
+        if owner == me || (root_ok && owner == ROOT_UID) {
+            return None;
         }
-        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-            Ok(()) => {
-                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)
+        Some(format!(
+            "{} の所有者（UID {owner}）が、実行している利用者（UID {me}）ではありません{}。`chown {me} {}` で直すか、置き場を消して作り直させてください",
+            path.display(),
+            if root_ok { "・root でもありません" } else { "" },
+            path.display()
+        ))
+    }
+
+    /// `path` を辿らずに確かめ（`symlink_metadata`）、無ければ 0700 で作ってもう一度確かめる。
+    /// シンボリックリンク・フォルダでないものは断る（モジュール doc「親を辿らずに作る・
+    /// 確かめる」）。umask に左右されないよう、作ったときは確かめたあと明示的に 0700 にする。
+    /// 既にあるフォルダの権限は書き換えず、広ければ呼ぶ側の確かめで断る。
+    fn ensure_dir_step(path: &Path) -> Result<(), String> {
+        let fail = |err: std::io::Error| format!("{} を作れません: {err}", path.display());
+        let created = match std::fs::symlink_metadata(path) {
+            Ok(_) => false,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::DirBuilder::new().mode(0o700).create(path) {
+                    Ok(()) => true,
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => false,
+                    Err(err) => return Err(fail(err)),
+                }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
-            Err(err) => Err(fail(err)),
+            Err(err) => return Err(format!("{} を確かめられません: {err}", path.display())),
+        };
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|err| format!("{} を確かめられません: {err}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "{} がシンボリックリンクです。リンクを消して、置き場を profile の中に作り直させてください",
+                path.display()
+            ));
         }
+        if !metadata.is_dir() {
+            return Err(format!("{} がフォルダではありません", path.display()));
+        }
+        if created {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(fail)?;
+        }
+        Ok(())
+    }
+
+    /// 権限が広すぎるときの理由（`forbidden` のビットが立っていれば）。
+    fn mode_refusal(path: &Path, mode: u32, forbidden: u32, is_dir: bool) -> Option<String> {
+        if mode & forbidden == 0 {
+            return None;
+        }
+        let fix = if is_dir { "chmod 700" } else { "chmod 600" };
+        Some(format!(
+            "{} の権限が広すぎます（{:o}。グループ・他人が書込み{}できます）。`{fix} {}` で絞ってください",
+            path.display(),
+            mode & 0o777,
+            if forbidden == 0o077 { "・読取り" } else { "" },
+            path.display()
+        ))
     }
 
     pub(super) fn prepare(dir: &Path, _profile_dir: Option<&Path>) -> Result<(), String> {
-        create_pki_dir(dir)?;
+        let data_dir = super::data_dir_of(dir)?;
+        // データのフォルダとその上は profile の仕組みが確かめてある前提（モジュール doc）。
+        std::fs::create_dir_all(data_dir).map_err(|err| {
+            format!(
+                "データのフォルダ（{}）を作れません: {err}",
+                data_dir.display()
+            )
+        })?;
+        let me = effective_uid()?;
+        // `opcua` → `opcua/pki` を 1 段ずつ、辿らずに確かめながら作る（#943 のレビュー P2）。
+        let opcua = dir.parent().expect("data_dir_of が確かめた");
+        ensure_dir_step(opcua)?;
+        let metadata = std::fs::symlink_metadata(opcua)
+            .map_err(|err| format!("{} を確かめられません: {err}", opcua.display()))?;
+        if let Some(reason) = owner_refusal(opcua, metadata.uid(), me, true)
+            .or_else(|| mode_refusal(opcua, metadata.permissions().mode(), 0o022, true))
+        {
+            return Err(reason);
+        }
+        ensure_dir_step(dir)?;
+        super::check_inside(data_dir, dir)?;
+
         let key = dir.join("private").join("private.pem");
         let cert = dir.join("own").join("cert.der");
         // ディレクトリ・証明書はグループ/他人の書込み（0o022）、鍵はグループ/他人の
-        // あらゆる権限（0o077）を断る。
+        // あらゆる権限（0o077）を断る。所有者はどれも実行している利用者に限る。
         for (path, forbidden, is_dir) in [
             (dir.to_path_buf(), 0o022, true),
             (dir.join("own"), 0o022, true),
@@ -367,16 +572,10 @@ mod imp {
             if metadata.file_type().is_symlink() {
                 return Err(format!("{} がシンボリックリンクです", path.display()));
             }
-            let mode = metadata.permissions().mode();
-            if mode & forbidden != 0 {
-                let fix = if is_dir { "chmod 700" } else { "chmod 600" };
-                return Err(format!(
-                    "{} の権限が広すぎます（{:o}。グループ・他人が書込み{}できます）。`{fix} {}` で絞ってください",
-                    path.display(),
-                    mode & 0o777,
-                    if forbidden == 0o077 { "・読取り" } else { "" },
-                    path.display()
-                ));
+            if let Some(reason) = owner_refusal(&path, metadata.uid(), me, false)
+                .or_else(|| mode_refusal(&path, metadata.permissions().mode(), forbidden, is_dir))
+            {
+                return Err(reason);
             }
         }
         Ok(())
@@ -813,5 +1012,121 @@ mod tests {
         prepare(&dir, None).unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
+    }
+
+    /// 置き場のパスからデータのフォルダを取る。`…/opcua/pki` の形でなければ断る。
+    #[test]
+    fn the_data_dir_is_taken_from_the_pki_dir() {
+        let data = Path::new("root").join("data");
+        assert_eq!(data_dir_of(&pki_dir(&data)).unwrap(), data.as_path());
+        assert!(data_dir_of(&data.join("pki")).is_err());
+        assert!(data_dir_of(&data.join("opcua").join("other")).is_err());
+    }
+
+    /// 置き場の本当のパスがデータのフォルダの本当のパスの下になければ（別の profile・外を
+    /// 指すリンクを辿った先など）断る（#943 のレビュー P2）。
+    #[test]
+    fn a_pki_dir_resolved_outside_the_data_dir_is_refused() {
+        let data = Path::new("root").join("profile-a").join("data");
+        ensure_inside(&data, &pki_dir(&data)).expect("inside");
+        let reason = ensure_inside(&data, &pki_dir(&Path::new("root").join("profile-b")))
+            .expect_err("another profile");
+        assert!(reason.contains("profile-b"), "{reason}");
+        ensure_inside(&data, &data).expect_err("the data dir itself");
+        // 名前の前方一致（`data-other`）は下ではない。
+        ensure_inside(
+            &data,
+            &Path::new("root").join("profile-a").join("data-other"),
+        )
+        .expect_err("sibling with a common prefix");
+    }
+
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .stdout(std::process::Stdio::null())
+            .status()
+            .expect("cmd を起動できない");
+        assert!(status.success(), "mklink /J に失敗した");
+    }
+
+    /// 親の `opcua`、または置き場の `pki` がジャンクション（別の profile などを指す）なら、
+    /// 辿らずに断り、その先に何も作らない（#943 のレビュー P2）。
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_on_opcua_or_pki_is_refused() {
+        let root = crate::test_support::TempDir::new("opcua-pki-junction");
+        let other = root.path().join("other-profile");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        junction(&data.join("opcua"), &other);
+        let reason = prepare(&pki_dir(&data), None).expect_err("opcua is a junction");
+        assert!(reason.contains("reparse point"), "{reason}");
+        assert!(reason.contains("opcua"), "{reason}");
+        assert!(!other.join("pki").exists(), "辿った先に作った");
+
+        let data = root.path().join("data2");
+        std::fs::create_dir_all(data.join("opcua")).unwrap();
+        junction(&data.join("opcua").join("pki"), &other);
+        let reason = prepare(&pki_dir(&data), None).expect_err("pki is a junction");
+        assert!(reason.contains("reparse point"), "{reason}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_on_opcua_or_pki_is_refused() {
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-symlink");
+        let other = root.path().join("other-profile");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let data = root.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::os::unix::fs::symlink(&other, data.join("opcua")).unwrap();
+        let reason = prepare(&pki_dir(&data), None).expect_err("opcua is a symlink");
+        assert!(reason.contains("シンボリックリンク"), "{reason}");
+        assert!(!other.join("pki").exists(), "辿った先に作った");
+
+        let data = root.path().join("data2");
+        std::fs::create_dir_all(data.join("opcua")).unwrap();
+        std::os::unix::fs::symlink(&other, data.join("opcua").join("pki")).unwrap();
+        let reason = prepare(&pki_dir(&data), None).expect_err("pki is a symlink");
+        assert!(reason.contains("シンボリックリンク"), "{reason}");
+    }
+
+    /// 所有者の比較: 実行している利用者と違う UID は断り、理由に UID と `chown` が出る。
+    /// root の所有は `opcua`（`root_ok`）だけ通す（#943 のレビュー P1）。
+    #[cfg(unix)]
+    #[test]
+    fn a_foreign_owner_is_refused() {
+        let path = Path::new("/srv/data/opcua/pki/private/private.pem");
+        assert_eq!(imp::owner_refusal(path, 1000, 1000, false), None);
+        let reason = imp::owner_refusal(path, 1001, 1000, false).expect("foreign owner");
+        assert!(
+            reason.contains("UID 1001") && reason.contains("UID 1000"),
+            "{reason}"
+        );
+        assert!(reason.contains("chown 1000"), "{reason}");
+        assert!(imp::owner_refusal(path, 0, 1000, false).is_some());
+        assert_eq!(imp::owner_refusal(path, 0, 1000, true), None);
+        assert!(imp::owner_refusal(path, 1001, 1000, true).is_some());
+        // root で動く Hub は、別の利用者の置き場を断る。
+        assert!(imp::owner_refusal(path, 1000, 0, false).is_some());
+    }
+
+    /// 実行している利用者が作った置き場は、所有者の確かめに通る（実効 UID が読める）。
+    #[cfg(unix)]
+    #[test]
+    fn a_pki_dir_owned_by_the_current_user_is_accepted() {
+        use std::os::unix::fs::MetadataExt;
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-owner");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir, None).expect("own pki dir");
+        let uid = std::fs::symlink_metadata(&dir).unwrap().uid();
+        assert_eq!(imp::owner_refusal(&dir, uid, uid, false), None);
     }
 }
