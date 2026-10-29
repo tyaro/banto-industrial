@@ -73,8 +73,14 @@
 //! 変われば試験の観測も変わる（#947 のレビュー）。
 //!
 //! 導かれた Stale を Good とみなすと、`push` のグループが `a` を更新しなくなっても 7c の
-//! `hold` は通ってしまう。そこで 7c では、`hold` の終わりの値の時刻（`ptime_ms`）を基準に、
-//! その後 1,500 ms までに `a` の時刻が進むことも確かめる（#947 のレビュー）。
+//! `hold` の品質の判定は通ってしまう。そこで 7c の `hold` では、`hold` の 1.5 秒全体で
+//! 「`a` の更新が止まっていないこと」を 1 つの考え方で確かめる（[`Fixture::hold_while_updating`]）:
+//! 50 ms ごとに値の時刻（`ptime_ms`）を観測し、前の観測より進んだら、その更新が正しい
+//! （保存が Good で値が期待どおり）ことを確かめ、最後に進んでからの経過が
+//! [`MAX_UPDATE_GAP`]（1,200 ms）を超えたら落とす。`hold` の開始時点は、開始時に控えた
+//! `ptime_ms` からの経過で数えるので、開始の直後でも途中でも、止まれば上限で落ちる。
+//! `hold` の後に、終わりの時刻から進むのを待つ確かめも残す: `hold` の終わりの直前に止まった
+//! 場合は、上限に届く前に `hold` が終わるため（#947 のレビュー）。
 //! 試験の周期や並べ方は緩めない。
 //!
 //! ## 反証（§10.4・checklist §5、PR に書く）
@@ -691,6 +697,11 @@ const BAD: Reading = Reading {
     quality: "bad",
 };
 
+/// 7c の `hold` で、`a` の値の時刻（`ptime_ms`）が進まない時間の上限（ms）。`push` のグループ
+/// （200 ms）の tick は、CPU 1 コア固定で最大 1,160 ms 遅れた（#946 の調べ）ので、それに
+/// 少し余裕を足した値。これより長く進まなければ、更新が止まったとみなす。
+const MAX_UPDATE_GAP: Duration = Duration::from_millis(1_200);
+
 /// 外部名 `external` のタグを、Hub の全 IF が通る `read_current` で読む。
 fn read_tag(manager: &CollectorManager, external: &str) -> Reading {
     read_tag_aged(manager, external).reading
@@ -1051,6 +1062,51 @@ impl Fixture {
     async fn hold(&self, duration: Duration, what: &str, check: impl Fn(&Self) -> bool) {
         let deadline = tokio::time::Instant::now() + duration;
         while tokio::time::Instant::now() < deadline {
+            assert!(
+                check(self),
+                "{what}: (reading, stored_quality, age_ms) {:?}",
+                self.pairs_aged()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// [`Self::hold`] に加えて、ブリッジのタグ `column` の更新が止まっていないことを、`hold` の
+    /// 全体で確かめる（モジュールの doc の #946 の節）。50 ms ごとに `ptime_ms` を観測し、
+    /// 進んだ観測は保存が Good で値が `expected` であること、最後に進んでからの経過
+    /// （開始時点は開始時の `ptime_ms` からの経過）は [`MAX_UPDATE_GAP`] 以下であることを確かめる。
+    async fn hold_while_updating(
+        &self,
+        duration: Duration,
+        what: &str,
+        column: &str,
+        expected: Option<f64>,
+        check: impl Fn(&Self) -> bool,
+    ) {
+        let start = tokio::time::Instant::now();
+        let deadline = start + duration;
+        let mut last_ptime = self.bridge_ptime_ms(column);
+        let mut last_advance = start;
+        while tokio::time::Instant::now() < deadline {
+            let aged = read_tag_aged(&self.app.manager, &self.push_external(column));
+            let now = tokio::time::Instant::now();
+            if aged.ptime_ms > last_ptime {
+                assert!(
+                    aged.stored_quality == Some("good") && aged.reading.value == expected,
+                    "{what}: `{column}` advanced to a wrong update (hold started {:?} ago, ptime_ms {last_ptime} -> {}): {aged:?}",
+                    now - start,
+                    aged.ptime_ms
+                );
+                last_ptime = aged.ptime_ms;
+                last_advance = now;
+            }
+            assert!(
+                now - last_advance <= MAX_UPDATE_GAP,
+                "{what}: `{column}` was not updated for {:?} (limit {MAX_UPDATE_GAP:?}; hold started {:?} ago, last ptime_ms {last_ptime}, last advance {:?} ago): {aged:?}",
+                now - last_advance,
+                now - start,
+                now - last_advance
+            );
             assert!(
                 check(self),
                 "{what}: (reading, stored_quality, age_ms) {:?}",
@@ -1572,19 +1628,19 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         "{body:?}"
     );
     fixture
-        .hold(
+        .hold_while_updating(
             Duration::from_millis(1_500),
             "the removed key stays Bad",
-            // 残したキーは、読むときに導かれた Stale（tick の遅れ、#946）だけ Good とみなす。
-            // ブリッジが `stale` を送ったら（保存も `stale`）今までどおり落とす。
+            "a",
+            Some(31.5),
+            // 残したキーの品質は、読むときに導かれた Stale（tick の遅れ、#946）だけ Good とみなす。
+            // ブリッジが `stale` を送ったら（保存も `stale`）今までどおり落とす。更新が止まって
+            // いないことは `hold_while_updating` が `hold` の全体で確かめる。
             |f| f.pair("b").1 == BAD && f.bridge_ignoring_derived_stale("a") == good(31.5),
         )
         .await;
-    // 導かれた Stale を Good とみなすので、残したキーの更新が止まっても上の `hold` は通る。
-    // `push` のグループ（200 ms）が `a` を読み続けていることを別に確かめる（#947 のレビュー）。
-    // 基準は `hold` の終わりの値の時刻にする。開始前の値と比べると、開始直後に 1 回だけ
-    // 更新して止まった場合も合格してしまう。止まっていれば、終わりのあとも進まない。
-    // 1 コア固定で測った tick の最大の遅れ（1,160 ms、#946）を踏まえ、1,500 ms まで待つ。
+    // `hold` の終わりの直前に止まった場合は、`hold` の中では上限に届かないので、終わりの値の
+    // 時刻から進むのを、1,500 ms まで待って確かめる（#947 のレビュー）。
     let a_ptime_at_hold_end = fixture.bridge_ptime_ms("a");
     let advanced = wait_until(Duration::from_millis(1_500), || async {
         fixture.bridge_ptime_ms("a") > a_ptime_at_hold_end
