@@ -516,6 +516,22 @@ impl HubRuntime {
             Some(dir) => dir.final_path().to_path_buf(),
             None => data_dir,
         };
+        // #634: OPC UA の鍵と証明書の置き場は、profile を握っていれば profile の `data\` の
+        // 本当のパスの下（`BANTO_HUB_DATA` で tstore を外へ移していても profile の中）、
+        // 握っていなければ実効のデータのフォルダの下（`crate::opcua_pki` のモジュール doc）。
+        let opcua_pki_dir = crate::opcua_pki::pki_dir(match &given_dirs {
+            Some(dirs) => dirs.data.final_path(),
+            None => &data_dir,
+        });
+        // 置き場の許可リストに入れる「profile の利用者」は、握った profile のフォルダの DACL の
+        // 候補を、この profile の id の戻す相手の記録（HKLM の `Owners`）か、記録が無ければ
+        // アカウントの種類で絞る（`crate::opcua_pki` のモジュール doc）。
+        let opcua_profile = given_dirs
+            .as_ref()
+            .map(|dirs| crate::opcua_pki::PkiProfile {
+                dir: dirs.profile.final_path().to_path_buf(),
+                id: profile_id.clone(),
+            });
 
         // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・
         // 応答しない監査はデータディレクトリの保留ファイルに退避し、`record` は
@@ -833,7 +849,8 @@ impl HubRuntime {
             crate::settings::GrpcSettings::default()
         });
         grpc_server.apply(&grpc_settings).await;
-        let opcua = crate::opcua::OpcUaPublisher::new(manager.clone());
+        let opcua =
+            crate::opcua::OpcUaPublisher::new(manager.clone(), opcua_pki_dir, opcua_profile);
         let opcua_settings = settings.opcua_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(
                 "banto-hub: OPC UA 設定の読み取りに失敗しました: {err}"
@@ -1769,13 +1786,18 @@ mod tests {
     }
 
     /// PR #650 のオーナーレビュー P2: async の worker が 1 本でも、本物の starter が
-    /// listener を起動している（同期の鍵の生成をしている）間に、有効化の PUT と
+    /// listener を起動している（同期の処理をしている）間に、有効化の PUT と
     /// 状態の GET が応答し、`starting` が見える。2 本の worker と非同期の待ちでは
     /// この停止は見えないので、worker 1 本で書く。
     ///
-    /// 反証: `real_starter` の `spawn_blocking` をやめて `OpcUaServer::start` を
-    /// そのまま await すると、鍵の生成が唯一の worker を塞ぎ、PUT が上限内に
-    /// 返らないか、最初の状態の GET が起動の終わった後の `running` になって落ちる。
+    /// #634 の Nit: 鍵を再利用すると起動が速くなり、鍵の生成の遅さに頼った「最初の
+    /// GET が `starting`」は不安定になる。そこで、本物の starter の blocking 用の
+    /// スレッドの中に、テストだけの**同期の**門（`crate::opcua::start_gate`）を置き、
+    /// 門を開けるまで起動を止める。
+    ///
+    /// 反証: `real_starter` の `spawn_blocking` をやめて同期の処理をそのまま worker で
+    /// 走らせると、門の同期の待ちが唯一の worker を塞ぎ、PUT・GET が上限内に返らずに
+    /// 落ちる。
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn opcua_put_and_status_respond_during_a_real_start_on_one_worker() {
         let dir = crate::test_support::TempDir::new("hub-runtime-opcua-one-worker");
@@ -1834,11 +1856,12 @@ mod tests {
             .port();
         settings["enabled"] = serde_json::json!(true);
         settings["port"] = serde_json::json!(port);
+        let gate = crate::opcua::start_gate::hold(port);
 
         let (status, _) = call_path(
             addr,
             "/api/opcua-settings",
-            "enable OPC UA (must not wait for the key generation)",
+            "enable OPC UA (must not wait for the blocking start)",
             "PUT",
             Some(&token),
             Some(&settings),
@@ -1858,6 +1881,20 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         assert_eq!(first["state"], "starting", "{first}");
+        // 門を閉じたまま、もう一度読んでも応答し、まだ起動中。
+        let (status, second) = call_path(
+            addr,
+            "/api/opcua-status",
+            "status while the start is held",
+            "GET",
+            Some(&token),
+            None,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(second["state"], "starting", "{second}");
+        gate.send(()).expect("release the start");
 
         let started = tokio::time::Instant::now();
         loop {

@@ -233,6 +233,7 @@ pub mod ingest;
 pub mod mcp;
 pub mod mqtt;
 pub mod opcua;
+pub mod opcua_pki;
 pub mod pending_changes;
 pub mod profile_grant;
 pub mod profile_lock;
