@@ -75,12 +75,13 @@
 //! 導かれた Stale を Good とみなすと、`push` のグループが `a` を更新しなくなっても 7c の
 //! `hold` の品質の判定は通ってしまう。そこで 7c の `hold` では、`hold` の 1.5 秒全体で
 //! 「`a` の更新が止まっていないこと」を 1 つの考え方で確かめる（[`Fixture::hold_while_updating`]）:
-//! 50 ms ごとに値の時刻（`ptime_ms`）を観測し、前の観測より進んだら、その更新が正しい
-//! （保存が Good で値が期待どおり）ことを確かめ、最後に進んでからの経過が
-//! [`MAX_UPDATE_GAP`]（1,200 ms）を超えたら落とす。`hold` の開始時点は、開始時に控えた
-//! `ptime_ms` からの経過で数えるので、開始の直後でも途中でも、止まれば上限で落ちる。
-//! `hold` の後に、終わりの時刻から進むのを待つ確かめも残す: `hold` の終わりの直前に止まった
-//! 場合は、上限に届く前に `hold` が終わるため（#947 のレビュー）。
+//! 50 ms ごとに観測し、基準は 1 つ: 値の時刻（`ptime_ms`）からの経過 `age_ms` が
+//! [`MAX_UPDATE_GAP`]（1,200 ms）を超えたら落とす。更新が止まれば `age_ms` は伸び続けるので、
+//! `hold` の開始前から止まっていた時間も、最初の観測から数えられる。`ptime_ms` が前の観測より
+//! 進んだら、その更新が正しい（保存が Good で値が期待どおり。[`assert_update_is_correct`]）
+//! ことも確かめる。`hold` の後に、終わりの時刻から進むのを待ち、進んだ更新も同じ関数で
+//! 確かめる: `hold` の終わりの直前に止まった場合は、上限に届く前に `hold` が終わるため
+//! （#947 のレビュー）。落とすときのメッセージには `age_ms` と観測の中身を載せる。
 //! 試験の周期や並べ方は緩めない。
 //!
 //! ## 反証（§10.4・checklist §5、PR に書く）
@@ -758,6 +759,17 @@ fn is_derived_stale(aged: &Aged) -> bool {
     aged.reading.quality == "stale" && aged.stored_quality == Some("good")
 }
 
+/// `ptime_ms` が進んだ観測 `aged` の更新が正しい（保存が Good で、値が `expected`）ことを
+/// 確かめる。Bad や誤った値の更新は、時刻が進んでいても落とす（#947 のレビュー）。
+fn assert_update_is_correct(what: &str, column: &str, expected: Option<f64>, aged: &Aged) {
+    assert!(
+        aged.stored_quality == Some("good") && aged.reading.value == expected,
+        "{what}: `{column}` advanced to a wrong update (ptime_ms {}, age_ms {}, expected value {expected:?}): {aged:?}",
+        aged.ptime_ms,
+        aged.age_ms
+    );
+}
+
 /// 読むときに導かれた Stale を、保存されている Good（同じ値）に戻す。それ以外はそのまま。
 fn ignoring_derived_stale(aged: Aged) -> Reading {
     if is_derived_stale(&aged) {
@@ -1072,9 +1084,11 @@ impl Fixture {
     }
 
     /// [`Self::hold`] に加えて、ブリッジのタグ `column` の更新が止まっていないことを、`hold` の
-    /// 全体で確かめる（モジュールの doc の #946 の節）。50 ms ごとに `ptime_ms` を観測し、
-    /// 進んだ観測は保存が Good で値が `expected` であること、最後に進んでからの経過
-    /// （開始時点は開始時の `ptime_ms` からの経過）は [`MAX_UPDATE_GAP`] 以下であることを確かめる。
+    /// 全体で確かめる（モジュールの doc の #946 の節）。50 ms ごとに観測し、基準は 1 つ:
+    /// **値の時刻（`ptime_ms`）からの経過 `age_ms`** が [`MAX_UPDATE_GAP`] 以下であること。
+    /// 更新が止まれば `age_ms` は伸び続けるので、`hold` の開始前から止まっていた時間も
+    /// 最初の観測から数えられる。`ptime_ms` が進んだ観測は、その更新が正しい（保存が Good で
+    /// 値が `expected`）ことも確かめる（[`assert_update_is_correct`]）。
     async fn hold_while_updating(
         &self,
         duration: Duration,
@@ -1085,28 +1099,21 @@ impl Fixture {
     ) {
         let start = tokio::time::Instant::now();
         let deadline = start + duration;
-        let mut last_ptime = self.bridge_ptime_ms(column);
-        let mut last_advance = start;
+        let mut last_ptime: Option<i64> = None;
         while tokio::time::Instant::now() < deadline {
             let aged = read_tag_aged(&self.app.manager, &self.push_external(column));
-            let now = tokio::time::Instant::now();
-            if aged.ptime_ms > last_ptime {
-                assert!(
-                    aged.stored_quality == Some("good") && aged.reading.value == expected,
-                    "{what}: `{column}` advanced to a wrong update (hold started {:?} ago, ptime_ms {last_ptime} -> {}): {aged:?}",
-                    now - start,
-                    aged.ptime_ms
-                );
-                last_ptime = aged.ptime_ms;
-                last_advance = now;
-            }
+            let held = start.elapsed();
             assert!(
-                now - last_advance <= MAX_UPDATE_GAP,
-                "{what}: `{column}` was not updated for {:?} (limit {MAX_UPDATE_GAP:?}; hold started {:?} ago, last ptime_ms {last_ptime}, last advance {:?} ago): {aged:?}",
-                now - last_advance,
-                now - start,
-                now - last_advance
+                aged.age_ms <= MAX_UPDATE_GAP.as_millis() as i64,
+                "{what}: `{column}` was not updated for {} ms (limit {MAX_UPDATE_GAP:?}; hold started {held:?} ago, ptime_ms {}): {aged:?}",
+                aged.age_ms,
+                aged.ptime_ms
             );
+            // 最初の観測は基準を決めるだけ（開始前の更新の正しさは見ない）。
+            if last_ptime.is_some_and(|p| aged.ptime_ms > p) {
+                assert_update_is_correct(what, column, expected, &aged);
+            }
+            last_ptime = Some(aged.ptime_ms);
             assert!(
                 check(self),
                 "{what}: (reading, stored_quality, age_ms) {:?}",
@@ -1642,8 +1649,15 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
     // `hold` の終わりの直前に止まった場合は、`hold` の中では上限に届かないので、終わりの値の
     // 時刻から進むのを、1,500 ms まで待って確かめる（#947 のレビュー）。
     let a_ptime_at_hold_end = fixture.bridge_ptime_ms("a");
+    let advanced_to = std::cell::Cell::new(None::<Aged>);
     let advanced = wait_until(Duration::from_millis(1_500), || async {
-        fixture.bridge_ptime_ms("a") > a_ptime_at_hold_end
+        let aged = read_tag_aged(&fixture.app.manager, &fixture.push_external("a"));
+        if aged.ptime_ms > a_ptime_at_hold_end {
+            advanced_to.set(Some(aged));
+            true
+        } else {
+            false
+        }
     })
     .await;
     assert!(
@@ -1651,6 +1665,12 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         "the kept key `a` is still updated after the hold (ptime_ms at the hold end {a_ptime_at_hold_end}, after waiting {}): {:?}",
         fixture.bridge_ptime_ms("a"),
         fixture.pairs_aged()
+    );
+    assert_update_is_correct(
+        "after the hold",
+        "a",
+        Some(31.5),
+        &advanced_to.get().expect("advanced"),
     );
     fixture.finish().await;
 }
