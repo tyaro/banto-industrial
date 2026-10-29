@@ -160,7 +160,7 @@
 ## 8. 持ち越し（#799 から。Q8）
 
 - `banto-plc` の `decode_string_value` は `#[cfg(test)]` だけで本番の呼び手が無い: 7d-1 で消す（§6.1）。
-- 上限を超える文字列（`string_length` が計画に載らない）をエンジンが一律 `Err(ItemError::Unsupported("計画に含まれない"))`（`crates/banto-driver-engine/src/lib.rs:355`）で返し、ドライバの断りの理由が落ちる: 本番のエンジンの振る舞いの変更で R2b-7 の形の変更と無関係なので、**Issue を立てて別にする**（直し方の候補: `plan_read` が計画から外した項目の理由を `Unsupported(理由)` で返す口を `DriverBase` に足す）。**直した（PR 番号は後で）**: `FrameConnection::unplanned_reason`（既定 `None`）を足し、ネイティブの SLMP・Modbus が計画の理由を返す。WASM は既定のまま。
+- 上限を超える文字列（`string_length` が計画に載らない）をエンジンが一律 `Err(ItemError::Unsupported("計画に含まれない"))`（`crates/banto-driver-engine/src/lib.rs:355`）で返し、ドライバの断りの理由が落ちる: 本番のエンジンの振る舞いの変更で R2b-7 の形の変更と無関係なので、**Issue を立てて別にする**（直し方の候補: `plan_read` が計画から外した項目の理由を `Unsupported(理由)` で返す口を `DriverBase` に足す）。**直した（#939）**: `FrameConnection::unplanned_reason`（既定 `None`）を足し、ネイティブの SLMP・Modbus が計画の理由を返す。WASM は既定のまま。
 - `real_plc_verify` の書き込みフェーズ 2・3 は未実施。2026-10-25 オーナー判断: WASM SLMP ドライバができた段階で、SLMP と Modbus の書き込み試験をまとめて行う。実行前に対象機器・書き込み範囲を確認する（§10）。WASM ホストの基盤だけができた段階では実施しない。
 
 ## 9. PR の分け方
