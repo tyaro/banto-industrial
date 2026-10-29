@@ -23,6 +23,9 @@ struct Fixture {
     accepted: Arc<AtomicUsize>,
     /// FC22 answer: [FC22_ECHO], [FC22_EXCEPTION] or [FC22_BAD_MASK].
     fc22: Arc<AtomicU8>,
+    /// FC15 / FC6 answer (#915), opt-in: [MULTI_UNSUPPORTED] (the default,
+    /// exception code 1 as before), [MULTI_ECHO] or [MULTI_EXCEPTION].
+    fc15_fc6: Arc<AtomicU8>,
 }
 
 const FC22_ECHO: u8 = 0;
@@ -30,6 +33,13 @@ const FC22_ECHO: u8 = 0;
 const FC22_EXCEPTION: u8 = 1;
 /// An acknowledgement whose OR mask differs from the request.
 const FC22_BAD_MASK: u8 = 2;
+
+/// FC15 / FC6 not answered (exception code 1), as before #915.
+const MULTI_UNSUPPORTED: u8 = 0;
+/// FC15 echoes start and quantity; FC6 echoes address and value.
+const MULTI_ECHO: u8 = 1;
+/// Exception code 2 (illegal data address).
+const MULTI_EXCEPTION: u8 = 2;
 
 impl Fixture {
     async fn start() -> Self {
@@ -42,8 +52,13 @@ impl Fixture {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let accepted = Arc::new(AtomicUsize::new(0));
         let fc22 = Arc::new(AtomicU8::new(FC22_ECHO));
-        let (all_requests, accept_count, fc22_mode) =
-            (requests.clone(), accepted.clone(), fc22.clone());
+        let fc15_fc6 = Arc::new(AtomicU8::new(MULTI_UNSUPPORTED));
+        let (all_requests, accept_count, fc22_mode, multi_mode) = (
+            requests.clone(),
+            accepted.clone(),
+            fc22.clone(),
+            fc15_fc6.clone(),
+        );
         let task = tokio::spawn(async move {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
@@ -52,6 +67,7 @@ impl Fixture {
                 let bit_state = bit_state.clone();
                 let requests = all_requests.clone();
                 let fc22_mode = fc22_mode.clone();
+                let multi_mode = multi_mode.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut mbap = [0u8; 6];
@@ -115,6 +131,20 @@ impl Fixture {
                                     echo
                                 }
                             },
+                            6 | 15
+                                if (function == 6 && payload.len() == 6)
+                                    || (function == 15
+                                        && (1..=1968).contains(&count)
+                                        && payload.len() == 7 + usize::from(count).div_ceil(8)
+                                        && usize::from(payload[6])
+                                            == usize::from(count).div_ceil(8)) =>
+                            {
+                                match multi_mode.load(Ordering::SeqCst) {
+                                    MULTI_ECHO => payload[1..6].to_vec(),
+                                    MULTI_EXCEPTION => vec![function | 0x80, 2],
+                                    _ => vec![function | 0x80, 1],
+                                }
+                            }
                             _ => vec![function | 0x80, 1],
                         };
                         let mut response = mbap[..4].to_vec();
@@ -138,6 +168,7 @@ impl Fixture {
             requests,
             accepted,
             fc22,
+            fc15_fc6,
         }
     }
 
@@ -145,13 +176,14 @@ impl Fixture {
         self.frames.lock().unwrap().clone()
     }
 
-    /// Write PDUs (FC5, FC16, FC22) in arrival order with their connection.
+    /// Write PDUs (FC5, FC6, FC15, FC16, FC22) in arrival order with their
+    /// connection.
     fn writes(&self) -> Vec<(usize, Vec<u8>)> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, pdu)| matches!(pdu[0], 5 | 16 | 22))
+            .filter(|(_, pdu)| matches!(pdu[0], 5 | 6 | 15 | 16 | 22))
             .cloned()
             .collect()
     }
@@ -1082,6 +1114,286 @@ async fn register_bit_write_disabled_refuses_rest_write_before_send() {
     assert_eq!(
         *app.sessions.status_watch(connection).unwrap().borrow(),
         banto_broker::BrokerConnectionStatus::Connected
+    );
+    assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
+    app.write_control.disable();
+}
+
+/// `POST /api/v1/values/batch` with `(tag, v)` entries in this order.
+async fn post_batch(
+    app: &super::TestApp,
+    key: &str,
+    entries: &[(&str, serde_json::Value)],
+) -> Vec<serde_json::Value> {
+    let (status, body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/v1/values/batch",
+        key,
+        serde_json::json!({
+            "writes": entries
+                .iter()
+                .map(|(tag, v)| serde_json::json!({ "tag": tag, "v": v }))
+                .collect::<Vec<_>>()
+        }),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    let writes = body["writes"].as_array().unwrap().clone();
+    assert_eq!(writes.len(), entries.len(), "{body:?}");
+    writes
+}
+
+/// #915: a contiguous coil run written as one REST batch passes the Hub
+/// gates, the host allowlist (one interval) and the guest, reaches the device
+/// as one FC15 frame packed LSB-first, and leaves one audit row per coil.
+/// A run leaving the host interval is refused before send; an FC15 exception
+/// is an item-level error for every coil, audited as `failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn fc15_coil_batch_is_one_frame_inside_one_host_interval_and_audited_per_coil() {
+    let fixture = Fixture::start().await;
+    fixture.fc15_fc6.store(MULTI_ECHO, Ordering::SeqCst);
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-modbus-fc15",
+        &manifest(),
+        &component(),
+    )
+    .await;
+    let names: Vec<String> = (1..=10).map(|n| format!("c{n}")).collect();
+    let addresses: Vec<String> = (1..=10).map(|n| format!("{n:05}")).collect();
+    let tags: Vec<(&str, &str, &str)> = names
+        .iter()
+        .zip(&addresses)
+        .map(|(name, address)| (name.as_str(), address.as_str(), "bit"))
+        .collect();
+    // The guest allows 00001-00016 as one interval; the Hub splits it in two.
+    let (connection, ids) = save_line(
+        &app,
+        &fixture,
+        "fc15-line",
+        ("enabled", "000001-000016"),
+        ("enabled", "000001-000008,000009-000016"),
+        &tags,
+    )
+    .await;
+    app.manager.rebuild().await.unwrap();
+    wait_connected(&app, connection).await;
+    app.write_control.enable();
+    let external: Vec<String> = names
+        .iter()
+        .map(|name| format!("fc15-line.line.{name}"))
+        .collect();
+    let refs: Vec<&str> = external.iter().map(String::as_str).collect();
+    let (keys, key_id, key) = write_key(&app, "fc15-writer", &refs).await;
+    let first_connection = fixture.accepted.load(Ordering::SeqCst);
+
+    // 00001-00008 = 1,0,1,1,0,0,1,1 -> one FC15, byte count 1, 0xCD.
+    let values = [true, false, true, true, false, false, true, true];
+    let entries: Vec<(&str, serde_json::Value)> = refs[..8]
+        .iter()
+        .zip(values)
+        .map(|(tag, value)| (*tag, serde_json::json!(value)))
+        .collect();
+    let results = post_batch(&app, &key, &entries).await;
+    assert!(
+        results.iter().all(|result| result["ok"] == true),
+        "{results:?}"
+    );
+    assert_eq!(
+        fixture.writes(),
+        vec![(first_connection, vec![15, 0, 0, 0, 8, 1, 0xcd])],
+        "one FC15 frame for the whole run"
+    );
+    for (id, value) in ids[..8].iter().zip(values) {
+        let rows = audit_rows(&app, *id).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["result"], "ok", "{rows:?}");
+        assert_eq!(rows[0]["action"], "write", "{rows:?}");
+        assert_eq!(
+            rows[0]["valueRequested"].as_f64(),
+            Some(f64::from(u8::from(value))),
+            "{rows:?}"
+        );
+        assert_eq!(rows[0]["apiKeyId"].as_i64(), Some(key_id), "{rows:?}");
+        assert_eq!(rows[0]["detail"], r#"{"target":"plc"}"#, "{rows:?}");
+    }
+
+    // 00007-00010 straddles the two Hub intervals (the guest alone would
+    // allow it): refused before send, every coil audited as failed.
+    let entries: Vec<(&str, serde_json::Value)> = refs[6..10]
+        .iter()
+        .map(|tag| (*tag, serde_json::json!(true)))
+        .collect();
+    let results = post_batch(&app, &key, &entries).await;
+    assert!(
+        results.iter().all(|result| result["ok"] == false
+            && result["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains("扱えない組み合わせです"))),
+        "{results:?}"
+    );
+    assert_eq!(fixture.writes().len(), 1, "{:?}", fixture.writes());
+    for id in &ids[6..10] {
+        let rows = audit_rows(&app, *id).await;
+        let last = rows.last().unwrap();
+        assert_eq!(last["result"], "failed", "{rows:?}");
+        assert!(
+            last["detail"]
+                .as_str()
+                .unwrap()
+                .contains("outside the Modbus write allowlist"),
+            "{rows:?}"
+        );
+    }
+
+    // An FC15 exception: an item-level device error for every coil of the
+    // run, audited as failed, and the connection stays.
+    fixture.fc15_fc6.store(MULTI_EXCEPTION, Ordering::SeqCst);
+    let entries: Vec<(&str, serde_json::Value)> = refs[8..10]
+        .iter()
+        .map(|tag| (*tag, serde_json::json!(true)))
+        .collect();
+    let results = post_batch(&app, &key, &entries).await;
+    for result in &results {
+        assert_eq!(result["ok"], false, "{results:?}");
+        let detail = result["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("コード=0x0002") && detail.contains("Modbus exception 0x02"),
+            "{detail}"
+        );
+    }
+    assert_eq!(
+        fixture.writes()[1..],
+        [(first_connection, vec![15, 0, 8, 0, 2, 1, 0b11])],
+        "the exception run was sent once"
+    );
+    for id in &ids[8..10] {
+        let rows = audit_rows(&app, *id).await;
+        assert_eq!(rows.last().unwrap()["result"], "failed", "{rows:?}");
+    }
+    assert_eq!(
+        fixture.accepted.load(Ordering::SeqCst),
+        first_connection,
+        "an exception keeps the connection"
+    );
+    assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
+    app.write_control.disable();
+}
+
+/// #915: with `register_write=fc6` a one-word holding write reaches the
+/// device as FC6 (never FC16) and is audited; a two-word type is refused by
+/// the guest before send; a write outside the Hub allowlist is refused by the
+/// Hub before send; an FC6 exception is an item-level error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send() {
+    let fixture = Fixture::start().await;
+    fixture.fc15_fc6.store(MULTI_ECHO, Ordering::SeqCst);
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-modbus-fc6",
+        &manifest(),
+        &component(),
+    )
+    .await;
+    let (connection, ids) = save_line_with(
+        &app,
+        &fixture,
+        "fc6-line",
+        ("enabled", "400001-400020"),
+        ("enabled", "400001-400010"),
+        &[("register_write", "fc6")],
+        &[
+            ("word", "40003", "u16"),
+            ("dword", "40005", "u32"),
+            ("outside", "40011", "u16"),
+        ],
+    )
+    .await;
+    app.manager.rebuild().await.unwrap();
+    wait_connected(&app, connection).await;
+    app.write_control.enable();
+    let tags = [
+        "fc6-line.line.word",
+        "fc6-line.line.dword",
+        "fc6-line.line.outside",
+    ];
+    let (keys, key_id, key) = write_key(&app, "fc6-writer", &tags).await;
+    let first_connection = fixture.accepted.load(Ordering::SeqCst);
+    let write = |tag: &'static str, v: serde_json::Value| {
+        let app = &app;
+        let key = key.clone();
+        async move {
+            super::admin_write(
+                &app.router,
+                "POST",
+                &format!("/api/v1/values/{tag}"),
+                &key,
+                serde_json::json!({ "v": v }),
+            )
+            .await
+        }
+    };
+
+    let result = write(tags[0], serde_json::json!(0x1234)).await;
+    assert_eq!(result.0, super::StatusCode::OK, "{:?}", result.1);
+    assert_eq!(
+        fixture.writes(),
+        vec![(first_connection, vec![6, 0, 2, 0x12, 0x34])],
+        "one FC6 frame, no FC16"
+    );
+    let rows = audit_rows(&app, ids[0]).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["result"], "ok", "{rows:?}");
+    assert_eq!(rows[0]["valueRequested"].as_f64(), Some(4660.0), "{rows:?}");
+    assert_eq!(rows[0]["detail"], r#"{"target":"plc"}"#, "{rows:?}");
+
+    // Two words: the Hub allows the span, the guest refuses before send.
+    // Outside the Hub allowlist: the Hub refuses before send.
+    for (tag, id, refusal) in [
+        (tags[1], ids[1], "ドライバが断りました"),
+        (tags[2], ids[2], "扱えない組み合わせです"),
+    ] {
+        let result = write(tag, serde_json::json!(1)).await;
+        assert_eq!(
+            result.0,
+            super::StatusCode::BAD_GATEWAY,
+            "{tag}: {:?}",
+            result.1
+        );
+        assert_eq!(result.1["error"], "write_failed", "{tag}: {:?}", result.1);
+        let rows = audit_rows(&app, id).await;
+        assert_eq!(rows.len(), 1, "{tag}: {rows:?}");
+        assert_eq!(rows[0]["result"], "failed", "{tag}: {rows:?}");
+        assert!(
+            rows[0]["detail"].as_str().unwrap().contains(refusal),
+            "{tag}: {rows:?}"
+        );
+    }
+    assert_eq!(fixture.writes().len(), 1, "{:?}", fixture.writes());
+
+    // An FC6 exception is an item-level error, audited as failed; the
+    // connection stays.
+    fixture.fc15_fc6.store(MULTI_EXCEPTION, Ordering::SeqCst);
+    let result = write(tags[0], serde_json::json!(7)).await;
+    assert_eq!(result.0, super::StatusCode::BAD_GATEWAY, "{:?}", result.1);
+    assert_eq!(result.1["error"], "write_failed", "{:?}", result.1);
+    let detail = result.1["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("コード=0x0002") && detail.contains("Modbus exception 0x02"),
+        "{detail}"
+    );
+    let rows = audit_rows(&app, ids[0]).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[1]["result"], "failed", "{rows:?}");
+    assert_eq!(
+        fixture.writes()[1..],
+        [(first_connection, vec![6, 0, 2, 0, 7])]
+    );
+    assert_eq!(
+        fixture.accepted.load(Ordering::SeqCst),
+        first_connection,
+        "an exception keeps the connection"
     );
     assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
     app.write_control.disable();
