@@ -1003,10 +1003,10 @@ impl RejectionShared {
             return false;
         }
         if !self.stale_warned.swap(true, Ordering::AcqRel) {
-            eprintln!(
+            crate::hub_log::log_err_line(&format!(
                 "banto-hub: [WARN] 書き込み監査(rejected)の書き手が {} 秒より長く書いていません（拒否は表に溜めています）",
                 age / 1000
-            );
+            ));
         }
         true
     }
@@ -1098,10 +1098,10 @@ async fn supervise_rejection_writer(
                     break;
                 }
                 let left = svc.unwritten_rejections();
-                eprintln!(
+                crate::hub_log::log_err_line(&format!(
                     "banto-hub: [WARN] 書き込み監査(rejected)の書き手が止まりました（{err}）。{} 秒後に起こし直します（未書込み {left} 件は表に残っています）",
                     delay.as_secs_f32()
-                );
+                ));
                 tokio::select! {
                     _ = stop.wait_for(|s| *s) => break,
                     _ = tokio::time::sleep(delay) => {}
@@ -1261,16 +1261,18 @@ impl WriteAuditService {
                 stats.remaining = table.dirty_pairs();
                 drop(table);
                 if shared.failing.swap(false, Ordering::AcqRel) {
-                    eprintln!("banto-hub: 書き込み監査(rejected)の書込みが戻りました");
+                    crate::hub_log::log_line(
+                        "banto-hub: 書き込み監査(rejected)の書込みが戻りました",
+                    );
                 }
                 Ok(stats)
             }
             Err(err) => {
                 shared.table().release();
                 if !shared.failing.swap(true, Ordering::AcqRel) {
-                    eprintln!(
+                    crate::hub_log::log_err_line(&format!(
                         "banto-hub: [WARN] 書き込み監査(rejected)の書込みに失敗しました（件数は表に残し、次の周期で書き直します）: {err}"
-                    );
+                    ));
                 }
                 Err(banto_storage::storage_error(err))
             }
