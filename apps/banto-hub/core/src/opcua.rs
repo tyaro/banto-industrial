@@ -1046,9 +1046,15 @@ mod tests {
         publisher.apply(&settings).await;
         let failed = wait_state(&publisher, OpcUaState::Failed).await;
         let reason = failed.error.expect("reason");
-        assert!(reason.contains("証明書ディレクトリ"), "{reason}");
-        assert!(reason.contains(&pki.display().to_string()), "{reason}");
-        assert!(reason.contains("再試行"), "{reason}");
+        if cfg!(unix) {
+            // Unix では Hub 側の確かめが先に断る（普通のファイルでない）。
+            assert!(reason.contains("ディレクトリ"), "{reason}");
+            assert!(reason.contains("cert.der"), "{reason}");
+        } else {
+            assert!(reason.contains("証明書ディレクトリ"), "{reason}");
+            assert!(reason.contains(&pki.display().to_string()), "{reason}");
+            assert!(reason.contains("再試行"), "{reason}");
+        }
 
         std::fs::remove_dir_all(&blocker).unwrap();
         publisher.apply(&settings).await;

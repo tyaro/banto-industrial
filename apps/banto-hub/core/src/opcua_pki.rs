@@ -760,6 +760,31 @@ mod imp {
         Ok(())
     }
 
+    /// 既にある証明書・鍵が普通のファイルでないときの理由（#943 のレビュー P2）。FIFO・
+    /// ソケット・デバイスは、権限が 0600 でも、依存側が読むときに起動が止まったままに
+    /// なりうるため、読み込む前に断る。
+    pub(super) fn kind_refusal(path: &Path, file_type: &std::fs::FileType) -> Option<String> {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_file() {
+            return None;
+        }
+        let kind = if file_type.is_dir() {
+            "ディレクトリ"
+        } else if file_type.is_fifo() {
+            "FIFO"
+        } else if file_type.is_socket() {
+            "ソケット"
+        } else if file_type.is_block_device() || file_type.is_char_device() {
+            "デバイス"
+        } else {
+            "普通のファイルではないもの"
+        };
+        Some(format!(
+            "{} が普通のファイルではありません（{kind}）。その物を消してください。次の起動で作り直します",
+            path.display()
+        ))
+    }
+
     /// 権限が広すぎるときの理由（`forbidden` のビットが立っていれば）。
     fn mode_refusal(path: &Path, mode: u32, forbidden: u32, is_dir: bool) -> Option<String> {
         if mode & forbidden == 0 {
@@ -816,6 +841,11 @@ mod imp {
             };
             if metadata.file_type().is_symlink() {
                 return Err(format!("{} がシンボリックリンクです", path.display()));
+            }
+            if !is_dir {
+                if let Some(reason) = kind_refusal(&path, &metadata.file_type()) {
+                    return Err(reason);
+                }
             }
             if let Some(reason) = owner_refusal(&path, metadata.uid(), me, false)
                 .or_else(|| mode_refusal(&path, metadata.permissions().mode(), forbidden, is_dir))
@@ -1585,6 +1615,42 @@ mod tests {
         assert!(prepare(&dir, None).is_err());
         std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
         prepare(&dir, None).expect("cert readable but not writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_key_is_refused_before_it_is_read() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-fifo");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir, None).unwrap();
+        let key = dir.join("private").join("private.pem");
+        let made = std::process::Command::new("mkfifo").arg(&key).status();
+        if !matches!(made, Ok(status) if status.success()) {
+            eprintln!("mkfifo が使えないため skip");
+            return;
+        }
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let reason = prepare(&dir, None).expect_err("FIFO is refused");
+        assert!(reason.contains("private.pem"), "{reason}");
+        assert!(reason.contains("FIFO"), "{reason}");
+        std::fs::remove_file(&key).unwrap();
+        prepare(&dir, None).expect("accepted once the FIFO is gone");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_certificate_is_refused() {
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-cert-dir");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir, None).unwrap();
+        let cert = dir.join("own").join("cert.der");
+        std::fs::create_dir_all(&cert).unwrap();
+        let reason = prepare(&dir, None).expect_err("directory is refused");
+        assert!(reason.contains("cert.der"), "{reason}");
+        assert!(reason.contains("ディレクトリ"), "{reason}");
+        std::fs::remove_dir_all(&cert).unwrap();
+        prepare(&dir, None).expect("accepted once the directory is gone");
     }
 
     #[cfg(unix)]
