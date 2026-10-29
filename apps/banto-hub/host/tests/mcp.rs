@@ -310,6 +310,13 @@ async fn issue_key(router: &Router, admin_token: &str, name: &str, scopes: &[&st
     body["key"].as_str().unwrap().to_string()
 }
 
+/// MCP の監査・保留中の変更に残る API キーの主体表記 `"{name}（{prefix}）"`
+/// （`ApiKeyContext::actor_label`）。平文キーは `bh_{prefix 8文字}_{secret}`。
+/// #713: 失効キーの削除で名前を再利用できるため、名前だけでは区別できない。
+fn actor_label(plaintext_key: &str, name: &str) -> String {
+    format!("{name}（{}）", &plaintext_key[3..11])
+}
+
 /// タグ・グループ・接続を1本作って rebuild まで済ませ、`(tag_id,
 /// external_name)` を返す共通フィクスチャ (`write.rs::make_tag`と同型)。
 #[allow(clippy::too_many_arguments)]
@@ -1604,7 +1611,7 @@ async fn create_connection_with_admin_scope_while_stopped_creates_and_audits() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
     assert_eq!(
         latest_audit_column(&app, "actor_role").await.as_deref(),
@@ -1622,6 +1629,78 @@ async fn create_connection_with_admin_scope_while_stopped_creates_and_audits() {
         latest_audit_column(&app, "origin").await.as_deref(),
         Some("mcp")
     );
+}
+
+/// #713 のレビュー: 失効したキーを削除して同じ名前で再発行しても、MCP の構成
+/// 操作の監査の actor（名前＋プレフィックス）で旧いキーと新しいキーを区別できる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_audit_actor_distinguishes_a_reissued_key_with_the_same_name() {
+    let app = test_app("audit-actor-reissue").await;
+    let old_key = issue_key(&app.router, &app.admin_token, "dup", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&old_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-old", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 15022 } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let old_actor = latest_audit_column(&app, "actor_username").await.unwrap();
+
+    // 失効して削除（REST、管理者セッション）。
+    let old_prefix = &old_key[3..11];
+    let id: i64 = sqlx::query_scalar("SELECT id FROM api_keys WHERE prefix = ?")
+        .bind(old_prefix)
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+    for (method, uri) in [
+        ("POST", format!("/api/api-keys/{id}/revoke")),
+        ("DELETE", format!("/api/api-keys/{id}")),
+    ] {
+        let response = app
+            .router
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("Authorization", format!("Bearer {}", app.admin_token))
+                    .header("X-Banto-Client", "banto")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            response.status().is_success(),
+            "{method}: {}",
+            response.status()
+        );
+    }
+
+    let new_key = issue_key(&app.router, &app.admin_token, "dup", &["admin"]).await;
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&new_key),
+        tools_call(
+            "create_connection",
+            json!({ "name": "line-new", "protocol": "slmp",
+                    "settings": { "host": "127.0.0.1", "port": 15023 } }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let new_actor = latest_audit_column(&app, "actor_username").await.unwrap();
+
+    assert_eq!(old_actor, actor_label(&old_key, "dup"));
+    assert_eq!(new_actor, actor_label(&new_key, "dup"));
+    assert_ne!(old_actor, new_actor, "same name, different keys");
 }
 
 /// T21 小改善（実機検証 2026-09-06）: `PlcConnectionService::create_tx`が
@@ -1727,7 +1806,7 @@ async fn delete_connection_with_confirm_deletes_and_audits() {
     assert_eq!(audit_count_after, audit_count_before + 1);
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
     assert_eq!(
         latest_audit_column(&app, "actor_role").await.as_deref(),
@@ -1810,7 +1889,7 @@ async fn create_connection_while_collection_running_is_queued_not_applied() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
 }
 
@@ -1974,7 +2053,7 @@ async fn create_group_with_admin_scope_while_stopped_creates_and_audits() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
 }
 
@@ -3549,7 +3628,7 @@ async fn create_tag_with_admin_scope_while_stopped_creates_and_audits() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
     assert_eq!(
         latest_audit_column(&app, "actor_role").await.as_deref(),
@@ -3864,7 +3943,7 @@ async fn delete_tag_with_confirm_deletes_and_audits() {
     assert_eq!(audit_count_after, audit_count_before + 1);
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
     assert_eq!(
         latest_audit_column(&app, "actor_role").await.as_deref(),
@@ -4170,7 +4249,7 @@ async fn set_collection_start_and_stop_transition_state_and_audit() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
 
     let (status, body) = mcp_post(
@@ -4354,7 +4433,7 @@ async fn set_write_control_stop_is_audited_once_even_if_the_client_disconnects()
     let (result, origin, actor, detail) = &rows[0];
     assert_eq!(result, "ok");
     assert_eq!(origin, "mcp");
-    assert_eq!(actor, "admin-key");
+    assert_eq!(actor, &actor_label(&admin_key, "admin-key"));
     let detail: Value = serde_json::from_str(detail).unwrap();
     assert_eq!(detail["persistedDb"], true, "{detail}");
     assert!(!app.write_control.is_enabled());
@@ -4641,7 +4720,7 @@ async fn set_retention_persists_and_audits_then_round_trips_through_get() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
 
     let settings = SettingsService::new(Db::Sqlite(app.pool.clone()));
@@ -5014,7 +5093,7 @@ async fn create_api_key_issues_a_usable_key_and_audits() {
     );
     assert_eq!(
         latest_audit_column(&app, "actor_username").await.as_deref(),
-        Some("admin-key")
+        Some(actor_label(&admin_key, "admin-key").as_str())
     );
 
     // 決定的な証拠: 発行された平文キーで実際に MCP 認証が通る。

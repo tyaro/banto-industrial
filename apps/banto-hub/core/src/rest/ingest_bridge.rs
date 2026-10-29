@@ -437,6 +437,7 @@ mod tests {
         ApiKeyContext {
             id: 1,
             name: "bridge".to_string(),
+            prefix: "kkkkkkkk".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             last_used_at_ms: None,
         }

@@ -523,6 +523,10 @@ pub enum ApiKeyDeleteOutcome {
 pub struct ApiKeyContext {
     pub id: i64,
     pub name: String,
+    /// 平文で保存している先頭 8 文字（`api_keys.prefix`）。#713 で失効キーの
+    /// 名前を再利用できるため、名前だけでは旧いキーと新しいキーを区別できない。
+    /// 監査の主体表記（[`ApiKeyContext::actor_label`]）に使う。
+    pub prefix: String,
     pub scopes: Vec<String>,
     /// 直近の `last_used_at`（epoch ミリ秒）。[`should_touch_last_used`] に
     /// そのまま渡す。
@@ -530,6 +534,14 @@ pub struct ApiKeyContext {
 }
 
 impl ApiKeyContext {
+    /// 監査ログ・保留中の変更の依頼者に残す主体の表記
+    /// `"{name}（{prefix}）"`。#713 で失効したキーを削除すると同じ名前で
+    /// 再発行できるため、名前だけでは旧いキーと新しいキーの操作を区別できない。
+    /// 書込み監査の画面（名前の横にプレフィックス）と同じ見せ方にそろえる。
+    pub fn actor_label(&self) -> String {
+        format!("{}（{}）", self.name, self.prefix)
+    }
+
     /// H10 ③（Option B、docs/h10-3-read-scope-proposal.md §6）: 認証層の
     /// 「`/api/v1/*` の read 系ルートに入れるか」のゲート。素の `read` か、
     /// 任意の `read:...`（完全一致・グループ・ワイルドカードいずれも）を
@@ -1099,6 +1111,7 @@ impl ApiKeysService {
         Ok(ApiKeyLookup::Valid(ApiKeyContext {
             id,
             name,
+            prefix: prefix.to_string(),
             scopes,
             last_used_at_ms,
         }))
@@ -1761,6 +1774,7 @@ mod tests {
         let ctx = ApiKeyContext {
             id: 1,
             name: "k".to_string(),
+            prefix: "kkkkkkkk".to_string(),
             scopes: vec!["write:line1.fast.temp01".to_string()],
             last_used_at_ms: None,
         };
@@ -1774,6 +1788,7 @@ mod tests {
         let ctx = ApiKeyContext {
             id: 1,
             name: "k".to_string(),
+            prefix: "kkkkkkkk".to_string(),
             scopes: vec!["read".to_string()],
             last_used_at_ms: None,
         };
@@ -1786,6 +1801,7 @@ mod tests {
         ApiKeyContext {
             id: 1,
             name: "k".to_string(),
+            prefix: "kkkkkkkk".to_string(),
             scopes: scopes.iter().map(|s| s.to_string()).collect(),
             last_used_at_ms: None,
         }
