@@ -149,18 +149,17 @@ type Starter =
 /// [`crate::opcua_pki::prepare`] で用意して確かめ、断られたら起動しない
 /// （モジュール doc「鍵と証明書の置き場」）。
 ///
-/// `profile_dir` は握った profile のフォルダ（本当のパス）。その DACL で許可されている
-/// 利用者も、置き場の許可リストに入る（[`crate::opcua_pki::prepare`]）。
-fn real_starter(profile_dir: Option<PathBuf>) -> Starter {
+/// `profile` は握った profile（フォルダの本当のパスと id）。その DACL で許可されている
+/// 利用者のうち、確かめ済みの記録にある（記録が無ければ利用者のアカウントに解決できる）
+/// ものも、置き場の許可リストに入る（[`crate::opcua_pki::prepare`]）。
+fn real_starter(profile: Option<crate::opcua_pki::PkiProfile>) -> Starter {
     Arc::new(move |config| {
-        let profile_dir = profile_dir.clone();
+        let profile = profile.clone();
         Box::pin(async move {
             let handle = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                start_blocking(&handle, config, profile_dir.as_deref())
-            })
-            .await
-            .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
+            tokio::task::spawn_blocking(move || start_blocking(&handle, config, profile.as_ref()))
+                .await
+                .map_err(|err| format!("OPC UA の起動処理が異常終了しました: {err}"))?
         })
     })
 }
@@ -169,13 +168,13 @@ fn real_starter(profile_dir: Option<PathBuf>) -> Starter {
 fn start_blocking(
     handle: &tokio::runtime::Handle,
     config: ServerConfig,
-    profile_dir: Option<&std::path::Path>,
+    profile: Option<&crate::opcua_pki::PkiProfile>,
 ) -> Result<RunningServer, String> {
     #[cfg(test)]
     start_gate::wait(config.port);
     let pki_dir = config.pki_dir.clone();
     if let Some(dir) = &pki_dir {
-        crate::opcua_pki::prepare(dir, profile_dir)?;
+        crate::opcua_pki::prepare(dir, profile)?;
     }
     handle
         .block_on(OpcUaServer::start(config))
@@ -294,15 +293,16 @@ pub struct OpcUaPublisher {
 
 impl OpcUaPublisher {
     /// `pki_dir` は鍵と証明書の置き場（profile の保護されたデータの下。
-    /// [`crate::opcua_pki::pki_dir`]）。`profile_dir` は握った profile のフォルダの本当の
-    /// パス（握っていなければ `None`）。その DACL で許可されている利用者も、置き場の
-    /// 許可リストに入る（[`crate::opcua_pki::prepare`]）。
+    /// [`crate::opcua_pki::pki_dir`]）。`profile` は握った profile（フォルダの本当のパスと
+    /// id。握っていなければ `None`）。その DACL で許可されている利用者のうち、確かめ済みの
+    /// 記録にある（記録が無ければ利用者のアカウントに解決できる）ものも、置き場の許可リストに
+    /// 入る（[`crate::opcua_pki::prepare`]）。
     pub fn new(
         manager: Arc<CollectorManager>,
         pki_dir: PathBuf,
-        profile_dir: Option<PathBuf>,
+        profile: Option<crate::opcua_pki::PkiProfile>,
     ) -> Arc<Self> {
-        Self::with_starter(manager, real_starter(profile_dir), Some(pki_dir))
+        Self::with_starter(manager, real_starter(profile), Some(pki_dir))
     }
 
     fn with_starter(

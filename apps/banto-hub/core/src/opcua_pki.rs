@@ -39,18 +39,32 @@
 //!   許可リストは次の相手:
 //!   1. SYSTEM・Administrators（と、`exposure` が同じく信頼する TrustedInstaller）。
 //!   2. このプロセスのトークンの利用者（実行しているアカウント）。
-//!   3. **明示的に許可された profile の利用者**: 握った profile のフォルダ自身の DACL で、
+//!   3. **確かめ済みの profile の利用者**: 候補は、握った profile のフォルダ自身の DACL で、
 //!      普通の許可の ACE（`INHERIT_ONLY` でないもの）を持ち、SID が利用者のアカウントの形
 //!      （`S-1-5-21-…`・`S-1-12-1-…`）で、広いグループ（Domain Users など）でないもの。
-//!      **名前の解決（`LookupAccountSidW`）はしない**（総点検 P2-2）: profile のルートに
-//!      利用者の ACE を書く経路（`grant-profile-acl`・`relax_tree`・`close_tree`）は、どれも
-//!      書く前に `ensure_user_account` で利用者のアカウントに限っている。ここでもう一度
-//!      解決すると、DC・Entra に届かないときに正当な構成を断るだけで、守りは増えない。
-//!      管理者が手で足した ACE は、管理者の判断として許す。profile の DACL は
-//!      `grant-profile-acl`・サービスの設定モード ⇔ 運用モードの切り替えが決める（どちらも
-//!      profile のフォルダを根に、木の全体へ同じ利用者を書く）。デスクトップだけで使う継承の
-//!      profile では空になりうる（そのときは 1・2 だけ）。profile を握らずに起動したとき
-//!      （テストなど）も 1・2 だけ。
+//!      **SID の形だけでは、利用者と独自のドメイン（ローカル）グループを区別できない**（どちらも
+//!      「ドメインの SID + RID」。#943 のレビュー P1）ので、候補をそのまま入れず、次の順で絞る
+//!      （`profile_allowlist`）:
+//!      1. **戻す相手の記録が使えるとき**（HKLM の `Owners`、`crate::profile_owners`。キーは
+//!         握った profile の id で、`crate::runtime` が [`PkiProfile`] で渡す）: 候補のうち
+//!         **記録にある SID だけ**。記録を書く `grant-profile-acl` とサービスの緩める側は、書く
+//!         前に `ensure_user_account` で利用者のアカウントかを確かめているので、ここでは
+//!         **名前の解決（`LookupAccountSidW`）をしない**（総点検 P2-2: サービス（LocalSystem）で
+//!         DC・Entra に届かないときに、正当な構成の OPC UA を断らない）。
+//!      2. **記録が無い・使えないとき**（サービスを入れていない、デスクトップだけの PC など。
+//!         使えない記録は `crate::profile_grant::repair_plan` と同じく信じない）: 候補のうち、
+//!         置き場・`opcua` で断る理由になりうる相手（許可の ACE の相手・所有者）だけを
+//!         `owner_lookup`（`LookupAccountSidW`）で照会し、`SidTypeUser` だけを入れる。
+//!         グループ・削除済み・名前を解決できない・確かめられない SID は入れず、断るときは
+//!         その理由（グループか、DC・Entra に届かない可能性か）と直し方を添える。
+//!         デスクトップだけの PC では、置き場は実行しているアカウントが自分の「変更」つきで
+//!         作る（2 で通る）ので、ふつうは照会の要る相手がおらず、名前の解決は起きない。
+//!
+//!      profile の DACL は `grant-profile-acl`・サービスの設定モード ⇔ 運用モードの切り替えが
+//!      決める（どちらも profile のフォルダを根に、木の全体へ同じ利用者を書く）。記録がある
+//!      のに記録にない利用者（管理者が手で足した ACE など）は入れない（`grant-profile-acl` で
+//!      足す）。デスクトップだけで使う継承の profile では候補が空になりうる（そのときは
+//!      1・2 だけ）。profile を握らずに起動したとき（テストなど）も 1・2 だけ。
 //!
 //!   固定の一覧の物に次のものがあれば**鍵を作らず・読まずに**起動を断る:
 //!   - 許可リストにない相手への**許可**の ACE（明示・継承・`INHERIT_ONLY` を問わず、マスクも
@@ -182,13 +196,23 @@ pub(crate) fn broad_group_name(sid: &str) -> Option<&'static str> {
     }
 }
 
+/// 握った profile（モジュール doc の許可リストの 3 を決める材料）。
+#[derive(Debug, Clone)]
+pub struct PkiProfile {
+    /// profile のフォルダの本当のパス（その DACL から利用者の候補を取る）。
+    pub dir: PathBuf,
+    /// profile の id（HKLM の戻す相手の記録 `Owners`、`crate::profile_owners` を読む鍵）。
+    pub id: String,
+}
+
 /// 鍵と証明書の置き場 `dir` を用意し、許されていない利用者が鍵を読めない（書けない）
-/// ことを確かめる（モジュール doc「鍵を作る前の確かめ」）。`profile_dir` は握った profile の
-/// フォルダ（本当のパス）で、その DACL で許可されている利用者も許可リストに入る（Windows）。
+/// ことを確かめる（モジュール doc「鍵を作る前の確かめ」）。`profile` は握った profile で、
+/// その DACL で許可されている利用者のうち、確かめ済みの記録にある（記録が無ければ利用者の
+/// アカウントに解決できる）ものも許可リストに入る（Windows）。
 /// 断るときは、ログと状態の API に出す理由（直し方つき）を返す。同期の I/O なので、
 /// blocking 用のスレッドで呼ぶ。
-pub(crate) fn prepare(dir: &Path, profile_dir: Option<&Path>) -> Result<(), String> {
-    imp::prepare(dir, profile_dir).map_err(|reason| {
+pub(crate) fn prepare(dir: &Path, profile: Option<&PkiProfile>) -> Result<(), String> {
+    imp::prepare(dir, profile).map_err(|reason| {
         format!(
             "OPC UA の鍵と証明書の置き場（{}）を使えないため、鍵を作らず（読まず）に止めました: {reason}。原因を直してから、同じ設定でもう一度保存すると再試行します（置き場を消すと、次の起動で保護された形で作り直し、鍵と証明書も作り直します）",
             dir.display()
@@ -248,6 +272,9 @@ mod imp {
     use banto_safe_root::acl::{self, Exposure, FileSecurity, InstallUserSid, ObservedDacl};
     use banto_safe_root::DirAccess;
 
+    use crate::profile_grant::OwnerLookup;
+    use crate::profile_mode::{check_stored_owners, StoredOwners};
+
     /// `ACE_HEADER.AceFlags` の `INHERIT_ONLY_ACE`・`INHERITED_ACE`。
     const INHERIT_ONLY_ACE: u8 = 0x08;
     const INHERITED_ACE: u8 = 0x10;
@@ -263,7 +290,33 @@ mod imp {
         (0x4000_0000, "GENERIC_WRITE"),
     ];
 
-    pub(super) fn prepare(dir: &Path, profile_dir: Option<&Path>) -> Result<(), String> {
+    pub(super) fn prepare(dir: &Path, profile: Option<&super::PkiProfile>) -> Result<(), String> {
+        let source = profile.map(|profile| ProfileSource {
+            dir: &profile.dir,
+            // 確かめ済みの記録を先に使う（名前の解決は要らない。モジュール doc）。
+            stored: check_stored_owners(crate::profile_owners::read_owners(&profile.id)),
+            location: crate::profile_owners::owners_location(&profile.id),
+        });
+        prepare_in(dir, source, crate::profile_grant::win::owner_lookup)
+    }
+
+    /// 握った profile の、許可リストの 3 を決める材料（[`prepare_in`]）。
+    pub(super) struct ProfileSource<'a> {
+        /// profile のフォルダの本当のパス。
+        pub(super) dir: &'a Path,
+        /// HKLM の戻す相手の記録を確かめた結果。
+        pub(super) stored: StoredOwners,
+        /// 記録の場所の表示（理由の文言用）。
+        pub(super) location: String,
+    }
+
+    /// [`prepare`] の本体。記録（`profile.stored`）と名前の照会（`lookup`）を外から受ける
+    /// （テストは HKLM を読まない）。
+    pub(super) fn prepare_in(
+        dir: &Path,
+        profile: Option<ProfileSource<'_>>,
+        lookup: impl FnMut(&InstallUserSid) -> OwnerLookup,
+    ) -> Result<(), String> {
         // `./data` のような `.` の要素は `inspect_file` が断るので、先に絶対パスにする
         // （Windows では `GetFullPathNameW` で `.`・`..` も畳む）。
         let dir =
@@ -283,33 +336,25 @@ mod imp {
             .clone()
             .map(DirAccess::with_install_user)
             .unwrap_or_else(DirAccess::service_only);
-        // 許可リストの 2・3（1 は `exposure` が理由にしない）。
-        let mut allowed: Vec<String> = me.iter().map(|sid| sid.as_str().to_owned()).collect();
-        if let Some(profile) = profile_dir {
-            for user in profile_users(profile)? {
-                if !allowed.contains(&user) {
-                    allowed.push(user);
-                }
-            }
-        }
+        // profile のフォルダの DACL の候補（許可リストの 3 はこの中から、下で絞る）。
+        let candidates = match &profile {
+            Some(profile) => profile_users(profile.dir)?,
+            None => Vec::new(),
+        };
         let create_protected = |path: &Path| {
             acl::create_dir_if_absent(path, &access)
                 .map(|_| ())
                 .map_err(|err| format!("保護されたフォルダを作れません: {err}"))
         };
-        let mut problems = Vec::new();
         // `opcua` → `opcua\pki` を 1 段ずつ、辿らずに確かめながら作る（#943 のレビュー P2）。
-        // 親の `opcua` の所有者と ACL も確かめる（総点検 P2-1）。
         let opcua = dir.parent().expect("data_dir_of が確かめた");
         let opcua_security = ensure_dir_step(opcua, || create_protected(opcua))?;
-        for reason in parent_refusals(&opcua_security, &allowed) {
-            problems.push(format!("{}: {reason}", opcua.display()));
-        }
         ensure_dir_step(&dir, || create_protected(&dir))?;
         super::check_inside(data_dir, &dir)?;
         // 固定の一覧だけを確かめ、中を辿らない（総点検 P1-1。モジュール doc）。
         let own = dir.join("own");
         let private = dir.join("private");
+        let mut inspected = Vec::new();
         // 種類（フォルダかファイルか）の違いは banto-opcua が `Error::Pki` で断る。
         for path in [
             dir.clone(),
@@ -318,26 +363,171 @@ mod imp {
             own.join("cert.der"),
             private.join("private.pem"),
         ] {
-            let Some(security) = acl::inspect_file(&path)
+            // 無ければ飛ばす（初回は banto-opcua が作る）。
+            if let Some(security) = acl::inspect_file(&path)
                 .map_err(|err| format!("{} の権限を読めません: {err}", path.display()))?
-            else {
-                // まだ無い（初回は banto-opcua が作る）。
-                continue;
-            };
-            for exposure in acl::exposure(&security) {
-                if let Some(reason) = refusal(&exposure, &allowed) {
+            {
+                inspected.push((path, acl::exposure(&security)));
+            }
+        }
+        // 許可リストの 2・3（1 は `exposure` が理由にしない）。3 の名前の照会（記録が無い
+        // とき）は、断る理由になりうる相手だけにする（モジュール doc）。
+        let mut allowed: Vec<String> = me.iter().map(|sid| sid.as_str().to_owned()).collect();
+        let mut referenced = parent_referenced(&opcua_security);
+        for (_, exposures) in &inspected {
+            for sid in exposures.iter().filter_map(exposure_sid) {
+                if !referenced.iter().any(|known| known == sid) {
+                    referenced.push(sid.to_owned());
+                }
+            }
+        }
+        referenced.retain(|sid| !allowed.contains(sid));
+        let profile_list = match &profile {
+            Some(profile) => profile_allowlist(
+                &candidates,
+                &referenced,
+                &profile.stored,
+                &profile.location,
+                lookup,
+            ),
+            None => ProfileAllowlist::default(),
+        };
+        for user in profile_list.users {
+            if !allowed.contains(&user) {
+                allowed.push(user);
+            }
+        }
+        let mut problems = Vec::new();
+        // 親の `opcua` の所有者と ACL も確かめる（総点検 P2-1）。
+        for reason in parent_refusals(&opcua_security, &allowed) {
+            problems.push(format!("{}: {reason}", opcua.display()));
+        }
+        for (path, exposures) in &inspected {
+            for exposure in exposures {
+                if let Some(reason) = refusal(exposure, &allowed) {
                     problems.push(format!("{}: {reason}", path.display()));
                 }
             }
         }
         if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(format!(
-                "許されていない利用者が読める（書ける）状態です（{}）",
-                problems.join(" / ")
-            ))
+            return Ok(());
         }
+        // profile の候補にいたのに許可リストに入れなかった相手の、理由と直し方。
+        for (sid, note) in &profile_list.excluded {
+            if !allowed.contains(sid) {
+                problems.push(format!(
+                    "profile の利用者の候補 {sid} を許可リストに入れていません: {note}"
+                ));
+            }
+        }
+        Err(format!(
+            "許されていない利用者が読める（書ける）状態です（{}）",
+            problems.join(" / ")
+        ))
+    }
+
+    /// `exposure` の相手の SID（許可の ACE の相手・所有者）。
+    fn exposure_sid(exposure: &Exposure) -> Option<&str> {
+        match exposure {
+            Exposure::AllowsOther { sid, .. } | Exposure::ForeignOwner(sid) => Some(sid),
+            _ => None,
+        }
+    }
+
+    /// 親の `opcua` で、許可リストに無ければ断る理由になる相手（[`parent_refusals`] と同じ
+    /// 範囲: 所有者と、`INHERIT_ONLY` でなく [`PARENT_FORBIDDEN`] の権利を含む許可の ACE）。
+    fn parent_referenced(security: &FileSecurity) -> Vec<String> {
+        let mut sids: Vec<String> = Vec::new();
+        for exposure in acl::exposure(security) {
+            let sid = match &exposure {
+                Exposure::ForeignOwner(sid) => sid,
+                Exposure::AllowsOther {
+                    flags, mask, sid, ..
+                } if flags & INHERIT_ONLY_ACE == 0 && !parent_forbidden(*mask).is_empty() => sid,
+                _ => continue,
+            };
+            if !sids.contains(sid) {
+                sids.push(sid.clone());
+            }
+        }
+        sids
+    }
+
+    /// 許可リストの 3 を決めた結果（[`profile_allowlist`]）。
+    #[derive(Debug, Default, PartialEq, Eq)]
+    pub(super) struct ProfileAllowlist {
+        /// 許可リストに入れる profile の利用者。
+        pub(super) users: Vec<String>,
+        /// 候補だったが入れなかった相手と、その理由（直し方つき）。断るときの文言に足す。
+        pub(super) excluded: Vec<(String, String)>,
+    }
+
+    /// profile の DACL の候補 `candidates` から、許可リストの 3 を決める純関数（モジュール doc
+    /// の許可リストの 3）。`referenced` は置き場・`opcua` で断る理由になりうる相手。
+    /// - 記録が使える（`StoredOwners::Valid`）: 候補のうち記録にある SID だけ。名前の解決は
+    ///   しない（DC・Entra に依存しない。総点検 P2-2）。
+    /// - 記録が無い・使えない: 候補のうち `referenced` にあるものだけを `lookup` で照会し、
+    ///   利用者のアカウント（`SidTypeUser`）だけを入れる。グループ・削除済み・名前を解決
+    ///   できない・確かめられない SID は入れない（#943 のレビュー P1）。使えない記録は信じない
+    ///   （`crate::profile_grant::repair_plan` と同じく、断る側に倒す）。
+    pub(super) fn profile_allowlist(
+        candidates: &[String],
+        referenced: &[String],
+        stored: &StoredOwners,
+        location: &str,
+        mut lookup: impl FnMut(&InstallUserSid) -> OwnerLookup,
+    ) -> ProfileAllowlist {
+        let mut list = ProfileAllowlist::default();
+        let record = match stored {
+            StoredOwners::Valid(owners) => {
+                for candidate in candidates {
+                    if owners.iter().any(|owner| owner.as_str() == candidate) {
+                        list.users.push(candidate.clone());
+                    } else {
+                        list.excluded.push((
+                            candidate.clone(),
+                            format!(
+                                "戻す相手の記録（{location}）にありません（記録があるときは、確かめ済みの記録にある利用者だけを入れます。グループの ACE を入れないため）。この利用者に使わせるなら grant-profile-acl でこの利用者を足し、そうでなければ置き場からこの ACE を外してください"
+                            ),
+                        ));
+                    }
+                }
+                return list;
+            }
+            StoredOwners::Unusable(reason) => {
+                format!("戻す相手の記録（{location}）が使えない（{reason}）ため、")
+            }
+            StoredOwners::Missing => format!("戻す相手の記録（{location}）が無いため、"),
+        };
+        for candidate in candidates {
+            if !referenced.contains(candidate) {
+                continue;
+            }
+            let Ok(sid) = InstallUserSid::parse(candidate) else {
+                continue;
+            };
+            let retry = "ドメイン・Entra に届くようになってから同じ設定でもう一度保存するか、grant-profile-acl で戻す相手の記録を作ってください（記録があれば名前の解決なしで確かめます）";
+            let note = match lookup(&sid) {
+                OwnerLookup::User => {
+                    list.users.push(candidate.clone());
+                    continue;
+                }
+                OwnerLookup::NotAUser => format!(
+                    "{record}アカウントの種類を照会したところ、利用者のアカウントではありません（グループなど）。グループの ACE は許可リストに入れません。置き場（と profile）からグループの ACE を外し、使わせる利用者ごとに grant-profile-acl を実行してください"
+                ),
+                OwnerLookup::Unmapped { local: true } => format!(
+                    "{record}アカウントの種類を照会したところ、この PC のローカルのアカウントにありません（削除済み）。置き場からこの ACE を外してください"
+                ),
+                OwnerLookup::Unmapped { local: false } => format!(
+                    "{record}アカウントの種類を照会しましたが、名前を解決できません（DC・Entra に届かない可能性があります）。{retry}"
+                ),
+                OwnerLookup::LookupFailed(why) => format!(
+                    "{record}アカウントの種類を照会しましたが、確かめられません（{why}。DC・Entra に届かない可能性があります）。{retry}"
+                ),
+            };
+            list.excluded.push((candidate.clone(), note));
+        }
+        list
     }
 
     /// `path` を辿らずに開いて確かめ（`inspect_file`）、無ければ `create` で作ってもう一度
@@ -423,11 +613,7 @@ mod imp {
                     if allowed.iter().any(|user| user == sid) || flags & INHERIT_ONLY_ACE != 0 {
                         return None;
                     }
-                    let rights: Vec<&str> = PARENT_FORBIDDEN
-                        .iter()
-                        .filter(|(bit, _)| mask & bit != 0)
-                        .map(|(_, name)| *name)
-                        .collect();
+                    let rights = parent_forbidden(*mask);
                     (!rights.is_empty()).then(|| {
                         format!(
                             "{}へ、中の物を消せる・入れ替えられる許可の ACE があります（{}。mask {mask:#x}）",
@@ -438,6 +624,15 @@ mod imp {
                 }
                 other => refusal(other, allowed),
             })
+            .collect()
+    }
+
+    /// `mask` に含まれる [`PARENT_FORBIDDEN`] の権利の名前。
+    fn parent_forbidden(mask: u32) -> Vec<&'static str> {
+        PARENT_FORBIDDEN
+            .iter()
+            .filter(|(bit, _)| mask & bit != 0)
+            .map(|(_, name)| *name)
             .collect()
     }
 
@@ -580,7 +775,7 @@ mod imp {
         ))
     }
 
-    pub(super) fn prepare(dir: &Path, _profile_dir: Option<&Path>) -> Result<(), String> {
+    pub(super) fn prepare(dir: &Path, _profile: Option<&super::PkiProfile>) -> Result<(), String> {
         let data_dir = super::data_dir_of(dir)?;
         // データのフォルダとその上は profile の仕組みが確かめてある前提（モジュール doc）。
         std::fs::create_dir_all(data_dir).map_err(|err| {
@@ -636,7 +831,7 @@ mod imp {
 mod imp {
     pub(super) fn prepare(
         _dir: &std::path::Path,
-        _profile_dir: Option<&std::path::Path>,
+        _profile: Option<&super::PkiProfile>,
     ) -> Result<(), String> {
         Ok(())
     }
@@ -952,12 +1147,32 @@ mod tests {
         prepare(&dir, None).expect("ACE removed");
     }
 
-    /// profile のフォルダに利用者 X の許可の ACE があれば、置き場の X の ACE は通る。
+    /// profile を握った起動の確かめ（HKLM の記録は読まず、`stored` を渡す。名前の照会は本物）。
+    #[cfg(windows)]
+    fn prepare_on(
+        dir: &Path,
+        profile: &Path,
+        stored: crate::profile_mode::StoredOwners,
+    ) -> Result<(), String> {
+        imp::prepare_in(
+            dir,
+            Some(imp::ProfileSource {
+                dir: profile,
+                stored,
+                location: "テストの記録".to_owned(),
+            }),
+            crate::profile_grant::win::owner_lookup,
+        )
+    }
+
+    /// profile のフォルダに利用者 X の許可の ACE があれば、置き場の X の ACE は通る（記録が
+    /// 無ければ X が利用者のアカウントに解決できるとき、記録があれば記録に X があるとき）。
     /// profile の木を書く形（設定モード = 「変更」、運用モード = 「読み取りと実行」）を
     /// profile と置き場に付けても通る。
     #[cfg(windows)]
     #[test]
     fn a_user_allowed_on_the_profile_dir_is_accepted_on_the_pki_dir() {
+        use crate::profile_mode::StoredOwners;
         use banto_safe_root::acl::{self, DirAccess, InstallUserSid};
         let Some(guest) = local_guest() else {
             eprintln!("skip: この PC ではテスト用の別の利用者（Guest）を解決できません");
@@ -966,7 +1181,7 @@ mod tests {
         let root = crate::test_support::TempDir::new("opcua-pki-profile-user");
         let profile = root.path().join("profile");
         let dir = pki_dir(&profile.join("data"));
-        prepare(&dir, Some(&profile)).expect("fresh pki dir");
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("fresh pki dir");
         let key = dir.join("private").join("private.pem");
         std::fs::create_dir_all(key.parent().unwrap()).unwrap();
         std::fs::write(&key, b"dummy").unwrap();
@@ -975,25 +1190,175 @@ mod tests {
         // profile を握らない・profile に X がいないなら断る。
         let reason = prepare(&dir, None).expect_err("guest is not allowed");
         assert!(reason.contains(&guest), "{reason}");
-        let reason = prepare(&dir, Some(&profile)).expect_err("guest is not on the profile");
+        let reason = prepare_on(&dir, &profile, StoredOwners::Missing)
+            .expect_err("guest is not on the profile");
         assert!(reason.contains(&guest), "{reason}");
 
-        // profile に X の明示の許可があれば通る。
+        // profile に X の明示の許可があれば、記録が無いときは X を利用者のアカウントと確かめて
+        // 通る。
         icacls(&profile, &["/grant", &format!("*{guest}:(OI)(CI)(RX)")]);
-        prepare(&dir, Some(&profile)).expect("guest is allowed on the profile");
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("guest is a user account");
+        // 記録があれば、記録にある X だけが通る（名前の照会はしない）。
+        let me = acl::current_user_sid().expect("current user");
+        let guest_sid = InstallUserSid::parse(&guest).unwrap();
+        prepare_on(
+            &dir,
+            &profile,
+            StoredOwners::Valid(vec![me.clone(), guest_sid.clone()]),
+        )
+        .expect("guest is in the record");
+        let reason = prepare_on(&dir, &profile, StoredOwners::Valid(vec![me.clone()]))
+            .expect_err("guest is not in the record");
+        assert!(
+            reason.contains("戻す相手の記録（テストの記録）にありません"),
+            "{reason}"
+        );
+        // 使えない記録は信じず、名前で確かめる。
+        prepare_on(
+            &dir,
+            &profile,
+            StoredOwners::Unusable("記録が空です".to_owned()),
+        )
+        .expect("an unusable record falls back to the account kind");
 
         // profile の木を書く形（自分と X）を profile と置き場に付けても通る。
-        let me = acl::current_user_sid().expect("current user");
-        let users = [me, InstallUserSid::parse(&guest).unwrap()];
+        let users = [me, guest_sid];
         let setting = DirAccess::with_install_users(users.clone());
         let operation = DirAccess::with_readers(users);
         acl::reset_dir_acl(&profile, &setting).expect("relax profile");
         acl::reset_dir_acl(&dir, &setting).expect("relax pki");
-        prepare(&dir, Some(&profile)).expect("setting mode shape");
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("setting mode shape");
         acl::reset_dir_acl(&dir, &operation).expect("close pki");
-        prepare(&dir, Some(&profile)).expect("operation mode shape");
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("operation mode shape");
         // 後片付けのために書ける形へ戻す。
         acl::reset_dir_acl(&dir, &setting).expect("relax pki again");
+    }
+
+    /// テスト用のローカルグループ: 実行しているアカウントと同じ機械の、利用者の形の SID
+    /// （`S-1-5-21-<機械>-<RID>`）を持つグループ（RID 1000〜1099 で最初に見つかった物）。
+    /// 作るには管理者が要るので、無い PC では `None`。
+    #[cfg(windows)]
+    fn local_group() -> Option<String> {
+        use crate::profile_grant::OwnerLookup;
+        use banto_safe_root::acl::{self, InstallUserSid};
+        let me = acl::current_user_sid().ok()?;
+        let (domain, _) = me.as_str().strip_prefix("S-1-5-21-")?.rsplit_once('-')?;
+        (1000..1100).find_map(|rid| {
+            let sid = InstallUserSid::parse(&format!("S-1-5-21-{domain}-{rid}")).ok()?;
+            (crate::profile_grant::win::owner_lookup(&sid) == OwnerLookup::NotAUser)
+                .then(|| sid.as_str().to_owned())
+        })
+    }
+
+    /// profile と置き場の両方に、利用者の形の SID を持つグループの許可の ACE があっても、
+    /// 記録が無ければアカウントの種類で確かめ、グループは許可リストに入れずに断る（#943 の
+    /// レビュー P1）。
+    #[cfg(windows)]
+    #[test]
+    fn a_group_allowed_on_the_profile_dir_is_refused_on_the_pki_dir() {
+        use crate::profile_mode::StoredOwners;
+        let Some(group) = local_group() else {
+            eprintln!("skip: この PC には利用者の形の SID を持つローカルグループがありません");
+            return;
+        };
+        let root = crate::test_support::TempDir::new("opcua-pki-profile-group");
+        let profile = root.path().join("profile");
+        let dir = pki_dir(&profile.join("data"));
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("fresh pki dir");
+        icacls(&profile, &["/grant", &format!("*{group}:(OI)(CI)(RX)")]);
+        icacls(&dir, &["/grant", &format!("*{group}:(OI)(CI)(RX)")]);
+
+        let reason = prepare_on(&dir, &profile, StoredOwners::Missing)
+            .expect_err("a group is not a profile user");
+        assert!(
+            reason.contains(&format!("許可リストにない相手（{group}）")),
+            "{reason}"
+        );
+        assert!(
+            reason.contains("利用者のアカウントではありません（グループなど）"),
+            "{reason}"
+        );
+
+        icacls(&dir, &["/remove:g", &format!("*{group}")]);
+        prepare_on(&dir, &profile, StoredOwners::Missing).expect("group ACE removed");
+    }
+
+    /// 許可リストの 3 の決め方（純関数）: 記録があれば記録にある候補だけで、名前は照会しない。
+    #[cfg(windows)]
+    #[test]
+    fn a_valid_record_keeps_only_recorded_candidates_without_lookups() {
+        use crate::profile_mode::StoredOwners;
+        use banto_safe_root::acl::InstallUserSid;
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+        const GROUP: &str = "S-1-5-21-1-2-3-1234";
+        let candidates = [USER.to_owned(), GROUP.to_owned()];
+        let stored = StoredOwners::Valid(vec![InstallUserSid::parse(USER).unwrap()]);
+        let list = imp::profile_allowlist(&candidates, &candidates, &stored, "記録", |sid| {
+            panic!("a valid record needs no lookup: {}", sid.as_str())
+        });
+        assert_eq!(list.users, vec![USER.to_owned()]);
+        assert_eq!(list.excluded.len(), 1);
+        assert_eq!(list.excluded[0].0, GROUP);
+        assert!(list.excluded[0]
+            .1
+            .contains("戻す相手の記録（記録）にありません"));
+    }
+
+    /// 記録が無い・使えないときは、断る理由になりうる候補だけを照会し、利用者のアカウント
+    /// だけを入れる。グループ・削除済み・名前を解決できない・確かめられないは、理由を分けて
+    /// 外す。
+    #[cfg(windows)]
+    #[test]
+    fn without_a_record_candidates_are_sorted_by_the_account_kind() {
+        use crate::profile_grant::OwnerLookup;
+        use crate::profile_mode::StoredOwners;
+        const USER: &str = "S-1-5-21-1-2-3-1001";
+        const GROUP: &str = "S-1-5-21-1-2-3-1234";
+        const DELETED: &str = "S-1-5-21-1-2-3-1002";
+        const DOMAIN: &str = "S-1-5-21-7-8-9-1105";
+        const FAILED: &str = "S-1-12-1-4-5-6-7";
+        const UNUSED: &str = "S-1-5-21-1-2-3-1003";
+        let candidates: Vec<String> = [USER, GROUP, DELETED, DOMAIN, FAILED, UNUSED]
+            .iter()
+            .map(|sid| (*sid).to_owned())
+            .collect();
+        let referenced = candidates[..5].to_vec();
+        for stored in [
+            StoredOwners::Missing,
+            StoredOwners::Unusable("記録が空です".to_owned()),
+        ] {
+            let mut asked = Vec::new();
+            let list = imp::profile_allowlist(&candidates, &referenced, &stored, "記録", |sid| {
+                asked.push(sid.as_str().to_owned());
+                match sid.as_str() {
+                    USER => OwnerLookup::User,
+                    GROUP => OwnerLookup::NotAUser,
+                    DELETED => OwnerLookup::Unmapped { local: true },
+                    DOMAIN => OwnerLookup::Unmapped { local: false },
+                    _ => OwnerLookup::LookupFailed("RPC に届きません".to_owned()),
+                }
+            });
+            // 断る理由にならない候補（置き場に ACE の無い相手）は照会しない。
+            assert_eq!(asked, referenced, "{stored:?}");
+            assert_eq!(list.users, vec![USER.to_owned()], "{stored:?}");
+            let note = |sid: &str| {
+                list.excluded
+                    .iter()
+                    .find(|(excluded, _)| excluded == sid)
+                    .map(|(_, note)| note.clone())
+                    .unwrap_or_else(|| panic!("{sid} is not excluded: {list:?}"))
+            };
+            assert!(note(GROUP).contains("グループなど"), "{stored:?}");
+            assert!(note(DELETED).contains("削除済み"), "{stored:?}");
+            assert!(note(DOMAIN).contains("名前を解決できません"), "{stored:?}");
+            assert!(note(FAILED).contains("RPC に届きません"), "{stored:?}");
+            assert_eq!(list.excluded.len(), 4, "{stored:?}");
+            let record = match &stored {
+                StoredOwners::Missing => "戻す相手の記録（記録）が無いため",
+                _ => "戻す相手の記録（記録）が使えない（記録が空です）ため",
+            };
+            assert!(note(GROUP).starts_with(record), "{stored:?}");
+        }
     }
 
     /// 印のファイル（`close_tree` が木のすべてのフォルダに置く。SYSTEM・Administrators だけ、

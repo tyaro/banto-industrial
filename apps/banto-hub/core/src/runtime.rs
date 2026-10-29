@@ -523,11 +523,15 @@ impl HubRuntime {
             Some(dirs) => dirs.data.final_path(),
             None => &data_dir,
         });
-        // 置き場の許可リストに入れる「明示的に許可された profile の利用者」は、握った profile の
-        // フォルダの DACL から取る（`crate::opcua_pki` のモジュール doc）。
-        let opcua_profile_dir = given_dirs
+        // 置き場の許可リストに入れる「profile の利用者」は、握った profile のフォルダの DACL の
+        // 候補を、この profile の id の戻す相手の記録（HKLM の `Owners`）か、記録が無ければ
+        // アカウントの種類で絞る（`crate::opcua_pki` のモジュール doc）。
+        let opcua_profile = given_dirs
             .as_ref()
-            .map(|dirs| dirs.profile.final_path().to_path_buf());
+            .map(|dirs| crate::opcua_pki::PkiProfile {
+                dir: dirs.profile.final_path().to_path_buf(),
+                id: profile_id.clone(),
+            });
 
         // #437（banto ADR-0019）: 監査は保留つきで組む - DB に書けない・
         // 応答しない監査はデータディレクトリの保留ファイルに退避し、`record` は
@@ -846,7 +850,7 @@ impl HubRuntime {
         });
         grpc_server.apply(&grpc_settings).await;
         let opcua =
-            crate::opcua::OpcUaPublisher::new(manager.clone(), opcua_pki_dir, opcua_profile_dir);
+            crate::opcua::OpcUaPublisher::new(manager.clone(), opcua_pki_dir, opcua_profile);
         let opcua_settings = settings.opcua_config().await.unwrap_or_else(|err| {
             log_err_line(&format!(
                 "banto-hub: OPC UA 設定の読み取りに失敗しました: {err}"
