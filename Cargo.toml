@@ -299,3 +299,59 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
+
+# #ci-speed（2026-10-28）: wasmtime / cranelift（WASM ゲストを動かす実行系）も同じく dev・テストで
+# 最適化する。`banto-driver-wasm` の `Runtime::new`（crates/banto-driver-wasm/src/runtime.rs）は
+# テストのたびにゲストを Cranelift でコンパイルするので、最適化なし（opt-level 0）だと
+# 1 件が数十秒〜数分かかり、CI の WASM Hub components ステップ（ignored テスト）が約 17 分
+# 占めていた。opt-level 3 にすると Linux（4 コア）の実測で ignored テスト一式が 712 秒 → 84 秒
+# （約 8.5 倍）になり、`-p banto-hub-host -p banto-driver-wasm` のテストの cold ビルドは
+# 下の対象で 263 秒 → 314 秒（+51 秒）。キャッシュが外れたときだけ払う増分で、テストの
+# 短縮の方が大きい。
+# 対象は実行時にリンクされる crate だけ（`cargo tree -p banto-driver-wasm -e normal` で確認）。
+# build script だけが使う cranelift-codegen-meta / -assembler-x64-meta / -isle / -srcgen と、
+# proc-macro（wasmtime-internal-component-macro / -versioned-export-macros とその先の
+# -wit-bindgen）は、最適化しても実行は速くならずビルドが延びるだけなので入れない。
+# wasmtime-internal-fiber / -jit-debug は今の feature では木に出てこないので入れない。
+[profile.dev.package.cranelift-assembler-x64]
+opt-level = 3
+[profile.dev.package.cranelift-bforest]
+opt-level = 3
+[profile.dev.package.cranelift-bitset]
+opt-level = 3
+[profile.dev.package.cranelift-codegen]
+opt-level = 3
+[profile.dev.package.cranelift-codegen-shared]
+opt-level = 3
+[profile.dev.package.cranelift-control]
+opt-level = 3
+[profile.dev.package.cranelift-entity]
+opt-level = 3
+[profile.dev.package.cranelift-frontend]
+opt-level = 3
+[profile.dev.package.cranelift-native]
+opt-level = 3
+[profile.dev.package.wasmtime]
+opt-level = 3
+[profile.dev.package.wasmtime-environ]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-component-util]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-core]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-cranelift]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-jit-icache-coherence]
+opt-level = 3
+[profile.dev.package.wasmtime-internal-unwinder]
+opt-level = 3
+[profile.dev.package.regalloc2]
+opt-level = 3
+[profile.dev.package.pulley-interpreter]
+opt-level = 3
+[profile.dev.package.wasmparser]
+opt-level = 3
+[profile.dev.package.object]
+opt-level = 3
+[profile.dev.package.gimli]
+opt-level = 3

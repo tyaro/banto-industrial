@@ -7,6 +7,7 @@
 #             ├─ rust                   （条件付き。fmt / clippy。対象は workspace 全体か -p に絞る）
 #             ├─ rust-test-build        （条件付き。テストを 1 回だけビルドして nextest archive にし、doctest も回す。対象は rust と同じ）
 #             │    └─ rust-test         （rust-test-build の後。アーカイブを 3 台にシャーディングして実行）
+#             ├─ rust-wasm              （条件付き。WASM Hub components の ignored テスト。workspace 全体か -p banto-hub-host を含むとき。rust-test-build と並列）
 #             ├─ rust-db-source         （条件付き。PostgreSQL）
 #             ├─ linux-clippy           （条件付き。昇格まわりの 2 crate を ubuntu で）
 #             ├─ driver-api             （条件付き。公開する banto-driver-api・conformance の MSRV・features・semver）
@@ -98,6 +99,7 @@ jobs:
       run_frontend_chronogazer: ${{ steps.classify.outputs.run_frontend_chronogazer }}
       run_rust: ${{ steps.classify.outputs.run_rust }}
       rust_args: ${{ steps.classify.outputs.rust_args }}
+      run_wasm: ${{ steps.classify.outputs.run_wasm }}
       run_driver_api: ${{ steps.classify.outputs.run_driver_api }}
       run_rust_db_source: ${{ steps.classify.outputs.run_rust_db_source }}
       run_linux_clippy: ${{ steps.classify.outputs.run_linux_clippy }}
@@ -389,8 +391,47 @@ jobs:
       # 走らない（ci-gate も赤になるので見落としはしない）。
       - name: test (doctest)
         run: cargo test --doc ${{ needs.changes.outputs.rust_args }}
+      # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
+      - name: Upload cargo timings
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: cargo-timings-test
+          path: target/cargo-timings/cargo-timing-*.html
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # #ci-speed（2026-10-28）: WASM Hub components の ignored テスト（約 17 分）を
+  # `rust-test-build` から別ジョブに切り出した。rust-test-build の末尾に直列で付けると、
+  # シャード（rust-test）が WASM の分だけ待たされてクリティカルパスに乗る。別ジョブなら
+  # archive → シャードの流れと並列に走る。
+  # - 実行条件は旧ステップの `if:` と同じ（workspace 全体か `-p banto-hub-host` を含む）。
+  #   ci-changes.mjs の `run_wasm` に移した。
+  # - rust-cache は `shared-key: rust-test` で rust-test-build のキャッシュを読むだけ
+  #   （`save-if: false`）。ここでも保存すると 1 本約 1GB の Windows キャッシュがもう 1 つ
+  #   増えて上限 10GB に近づく（rust-test-build の rust-cache のコメント参照）。
+  #   CARGO_PROFILE_DEV_DEBUG もキャッシュキーに効くので rust-test-build と揃える。
+  # - rust-cache は自前（workspace）の crate を保存しないので、このジョブは毎回
+  #   banto-hub-host などのテストを自分でコンパイルする（旧ステップは archive のビルド
+  #   済みの target を使えた）。第三者 crate はキャッシュから戻る。シャードより先に
+  #   終われば、このコンパイルはクリティカルパスに乗らない。
+  rust-wasm:
+    name: Rust WASM Hub components
+    needs: changes
+    if: needs.changes.outputs.run_wasm == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    env:
+      # rust-test-build と同じ（キャッシュキーを揃える）。
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rust-test
+          save-if: false
       - name: Install wasm-tools 1.262.0 (verified binary)
-        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
         uses: taiki-e/install-action@v2
         with:
           tool: wasm-tools@1.262.0
@@ -400,7 +441,6 @@ jobs:
       # ignored in the normal nextest archive because that archive has no guest
       # artifact; run it explicitly here after building the pinned component.
       - name: test (WASM Hub components)
-        if: needs.changes.outputs.rust_args == '--workspace' || contains(format(' {0} ', needs.changes.outputs.rust_args), ' -p banto-hub-host ')
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -831,15 +871,6 @@ jobs:
           if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus Hub join tests did not all run'
           }
-      # crate ごとのビルド時間（nextest のテストビルド）。失敗しても残す。
-      - name: Upload cargo timings
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: cargo-timings-test
-          path: target/cargo-timings/cargo-timing-*.html
-          if-no-files-found: ignore
-          retention-days: 14
 
   # #ci-speed（2026-10-19）: `rust-test-build` のアーカイブを 3 台にシャーディングして
   # 走らせる。ビルドはしない（Rust ツールチェーンも rust-cache も使わない）。
@@ -1257,6 +1288,7 @@ jobs:
       - frontend-chronogazer
       - rust
       - rust-test-build
+      - rust-wasm
       - rust-test
       - rust-db-source
       - linux-clippy
@@ -1305,6 +1337,7 @@ jobs:
           check frontend-chronogazer run_frontend_chronogazer
           check rust run_rust
           check rust-test-build run_rust
+          check rust-wasm run_wasm
           check rust-test run_rust
           check rust-db-source run_rust_db_source
           check linux-clippy run_linux_clippy

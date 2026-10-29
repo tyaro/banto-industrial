@@ -377,6 +377,9 @@ export function derive(a, crateAffected = []) {
 	const hits = (/** @type {keyof typeof JOB_PACKAGES} */ job) =>
 		JOB_PACKAGES[job].some((p) => packages.has(p));
 	const runRust = rustWorkspace || packages.size > 0;
+	// WASM Hub components（ci.yml の rust-wasm ジョブ）は、workspace 全体か、
+	// -p に banto-hub-host が入るときだけ。rust_args と同じ値から決める。
+	const runWasm = rustWorkspace || packages.has('banto-hub-host');
 	return {
 		// 判定したら必ず走る（repo 全体の ESLint + Prettier。docs の整形もここ）。
 		run_lint_format: true,
@@ -391,6 +394,7 @@ export function derive(a, crateAffected = []) {
 						.sort()
 						.map((p) => `-p ${p}`)
 						.join(' '),
+		run_wasm: runWasm,
 		run_driver_api: rustWorkspace || hits('run_driver_api'),
 		run_rust_db_source: rustWorkspace || a.hub || a.hub_sink || hits('run_rust_db_source'),
 		run_linux_clippy: rustWorkspace || hits('run_linux_clippy'),
