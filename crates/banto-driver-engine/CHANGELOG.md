@@ -12,6 +12,12 @@ R2b-5a（docs/banto-hub-driver-sim-design.md §3）。配線はしない（ア�
 
 - `sim`: 値の層のシミュレータ `SimDevice`（`DriverAddress::canonical` と `TagKind` の組を鍵にした共有の表で、種類が違えば別のセル。`get(canonical, &kind)` / `set(canonical, kind, value)` / `write_count` / `held_count`）と、その接続 `SimSession`（`Session`）。読み取りは held（書かれた値）があればそれ、無ければ時刻（100 ms）と初めて見た順から決定的に生成する（ビットは反転・整数と浮動小数はランプ・文字列は `SIM-{index}-{phase}`（phase は数値と同じ tick + index × 16）の末尾を語数 × 2 バイト残す）。書き込みは書けない領域・種類違い・NaN や ±inf（どの数値型も）・整数型への小数・型の範囲外・文字列の長すぎ（タグの符号化でバイト数を数え、表せない文字も断る。NUL も容量に数える）を `ItemError::Rejected` にし、通れば held にする。held は実機ならその書き込みの後の読み取りが返す値（文字列は符号化して `decode_string` で戻した値 = 最初の NUL で切れる、F32 は f32 に丸めた値、整数は -0.0 でなく 0）。ビット指定のアドレス（`bit: Some`）は bit 型のタグでだけ読み書きでき、それ以外の種類はその項目だけ `Unsupported`。`SessionDriver` は実装せず、`SimDevice::connect` で作る。
 
+#916（docs/banto-hub-driver-io-design.md §7.6）: UDP のトランスポート。破壊はなく追加のみ（minor）。
+
+- `TransportSpec::Udp { host, port }`（`TransportSpec` は `#[non_exhaustive]`）と `from_settings` の `transport = "udp"`（ドライバの `transports` に `Udp` が要る）。
+- `UdpTransport`（`UDP_RECV_BUFFER` = 64 KiB）: 接続ごとにエフェメラルポートを bind して相手に `connect` する（同じ相手への直前の接続のポートは使わない。プロセスの中で相手ごとに 1 つ覚える）。`discard_input` は溜まったデータグラムを空読みで捨てる。
+- `Transport::datagram`（既定 `false`。既存の実装は直さなくてよい）。`true` の通信路では、1 回の受信を 1 応答としてフレーム規則を当て（足りない・余り・`max_len` 超過はフレーム不正）、各送信の前に受信を捨て、応答を待つ step の無いハンドシェイクを `FatalError::Protocol` で断る。再送はしない。
+
 R2b-5b・5c: broker（`banto-broker`）が `simulation = true` の接続をこの `SimDevice` で張り（`SimDevice::id()` を接続の指紋に含める）、アプリの振る舞いが変わった。破壊はなく、`0.1.0` からの追加のみ（minor）。
 
 ## 0.1.0 — 未公開

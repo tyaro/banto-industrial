@@ -34,8 +34,10 @@ pub mod keys {
     pub const RESPONSE_TIMEOUT_MS: &str = "response_timeout_ms";
     /// SLMP CPU type (#605): `"R"` | `"Q"`.
     pub const CPU_TYPE: &str = "cpu_type";
-    /// Transport: `"tcp"` (default) | `"serial"` | `"serial_over_tcp"`. The
-    /// driver must list it in its descriptor's `transports`.
+    /// Transport: `"tcp"` (default) | `"udp"` | `"serial"` |
+    /// `"serial_over_tcp"`. The driver must list it in its descriptor's
+    /// `transports`. With `"udp"`, `host` / `port` name the device's UDP
+    /// port (#916).
     pub const TRANSPORT: &str = "transport";
     /// Serial port name for `transport = "serial"`: `COM1`..`COM256` on
     /// Windows, `/dev/tty*` on Unix (checked against an allow-list grammar).

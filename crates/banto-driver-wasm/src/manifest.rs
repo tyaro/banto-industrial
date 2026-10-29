@@ -1,7 +1,11 @@
-//! Validation of TCP component manifests. Native descriptor defaults do not
+//! Validation of component manifests. Native descriptor defaults do not
 //! apply; a write declaration is only a request until its export is bound.
+//! `transports` is a non-empty, duplicate-free subset of `tcp` / `udp` (#916;
+//! serial stays out of scope, #803) and is copied into the descriptor, which
+//! is what the broker checks before dialling. The WIT does not change: the
+//! guest never sees the transport.
 
-use banto_driver_api::{Capabilities, DriverDescriptor, DriverId};
+use banto_driver_api::{Capabilities, DriverDescriptor, DriverId, Transport};
 use serde_json::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,13 +54,7 @@ impl Manifest {
         if text("hubApi")? != "1" {
             return Err(ManifestError("unsupported hubApi".into()));
         }
-        if object.get("transports").and_then(Value::as_array)
-            != Some(&vec![Value::String("tcp".into())])
-        {
-            return Err(ManifestError(
-                "initial WASM driver requires only tcp transport".into(),
-            ));
-        }
+        let transports = parse_transports(object.get("transports"))?;
         let requests_write = match object.get("capabilities").and_then(Value::as_array) {
             Some(values) if values == &vec![Value::String("read".into())] => {
                 if object.contains_key("writeApi") {
@@ -86,7 +84,8 @@ impl Manifest {
             text("displayName")?,
             Capabilities::READ_ONLY,
         )
-        .with_settings_version(version);
+        .with_settings_version(version)
+        .with_transports(transports);
         if let Some(vendor) = object.get("vendor") {
             descriptor.vendor = Some(
                 vendor
@@ -100,6 +99,31 @@ impl Manifest {
             requests_write,
         })
     }
+}
+
+/// `transports`: a non-empty array of distinct `"tcp"` / `"udp"`, in the
+/// manifest's order.
+fn parse_transports(value: Option<&Value>) -> Result<Vec<Transport>, ManifestError> {
+    let error = || {
+        ManifestError("transports must be a non-empty array of distinct \"tcp\" / \"udp\"".into())
+    };
+    let values = value.and_then(Value::as_array).ok_or_else(error)?;
+    if values.is_empty() {
+        return Err(error());
+    }
+    let mut transports = Vec::with_capacity(values.len());
+    for value in values {
+        let transport = match value.as_str() {
+            Some("tcp") => Transport::Tcp,
+            Some("udp") => Transport::Udp,
+            _ => return Err(error()),
+        };
+        if transports.contains(&transport) {
+            return Err(error());
+        }
+        transports.push(transport);
+    }
+    Ok(transports)
 }
 
 #[cfg(test)]
@@ -130,6 +154,46 @@ mod tests {
         }
         let mut missing = base;
         missing.as_object_mut().unwrap().remove("settingsVersion");
+        assert!(Manifest::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
+    }
+
+    #[test]
+    fn transports_are_a_distinct_subset_of_tcp_and_udp() {
+        let sample = include_bytes!("../tests/manifest.json");
+        let base: Value = serde_json::from_slice(sample).unwrap();
+        let parse = |transports: Value| {
+            let mut changed = base.clone();
+            changed["transports"] = transports;
+            Manifest::parse(&serde_json::to_vec(&changed).unwrap())
+        };
+        for (transports, expected) in [
+            (json!(["tcp"]), vec![Transport::Tcp]),
+            (json!(["udp"]), vec![Transport::Udp]),
+            (json!(["tcp", "udp"]), vec![Transport::Tcp, Transport::Udp]),
+            (json!(["udp", "tcp"]), vec![Transport::Udp, Transport::Tcp]),
+        ] {
+            assert_eq!(
+                parse(transports.clone()).unwrap().descriptor.transports,
+                expected,
+                "{transports}"
+            );
+        }
+        for invalid in [
+            json!([]),
+            json!(["tcp", "tcp"]),
+            json!(["udp", "tcp", "udp"]),
+            json!(["serial"]),
+            json!(["serial_over_tcp"]),
+            json!(["tcp", "serial"]),
+            json!(["TCP"]),
+            json!([1]),
+            json!("tcp"),
+            Value::Null,
+        ] {
+            assert!(parse(invalid.clone()).is_err(), "{invalid}");
+        }
+        let mut missing = base;
+        missing.as_object_mut().unwrap().remove("transports");
         assert!(Manifest::parse(&serde_json::to_vec(&missing).unwrap()).is_err());
     }
 
