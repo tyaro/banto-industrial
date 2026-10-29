@@ -125,24 +125,30 @@ async fn api_keys_create(
         }
     }
 
-    let issued = state
-        .api_keys
-        .issue(&body.name, body.scopes, body.expires_at)
-        .await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "create",
-        "api_keys",
-        Some(&issued.id.to_string()),
-        Some(json!({
-            "name": issued.name,
-            "scopes": issued.scopes,
-            "expiresAt": body.expires_at,
-        })),
-    )
-    .await;
+    // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
+    let issued = tokio::spawn(async move {
+        let issued = state
+            .api_keys
+            .issue(&body.name, body.scopes, body.expires_at)
+            .await?;
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "create",
+            "api_keys",
+            Some(&issued.id.to_string()),
+            Some(json!({
+                "name": issued.name,
+                "scopes": issued.scopes,
+                "expiresAt": body.expires_at,
+            })),
+        )
+        .await;
+        Ok::<_, BantoError>(issued)
+    })
+    .await
+    .map_err(|err| ApiError(BantoError::Other(format!("API キー発行タスク: {err}"))))??;
     Ok((StatusCode::CREATED, Json(issued.into())))
 }
 
@@ -161,17 +167,23 @@ async fn api_keys_revoke(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
-    let summary = state.api_keys.revoke(id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "revoke",
-        "api_keys",
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
+    // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
+    let summary = tokio::spawn(async move {
+        let summary = state.api_keys.revoke(id).await?;
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "revoke",
+            "api_keys",
+            Some(&id.to_string()),
+            None,
+        )
+        .await;
+        Ok::<_, BantoError>(summary)
+    })
+    .await
+    .map_err(|err| ApiError(BantoError::Other(format!("API キー失効タスク: {err}"))))??;
     Ok(Json(summary))
 }
 
@@ -186,8 +198,10 @@ async fn api_keys_delete(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
-    match state.api_keys.delete(id).await? {
-        ApiKeyDeleteOutcome::Deleted(summary) => {
+    // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
+    let outcome = tokio::spawn(async move {
+        let outcome = state.api_keys.delete(id).await?;
+        if let ApiKeyDeleteOutcome::Deleted(summary) = &outcome {
             record_write(
                 &state.audit,
                 &state.auth,
@@ -198,8 +212,13 @@ async fn api_keys_delete(
                 Some(json!({ "name": summary.name, "prefix": summary.prefix })),
             )
             .await;
-            Ok(StatusCode::NO_CONTENT.into_response())
         }
+        Ok::<_, BantoError>(outcome)
+    })
+    .await
+    .map_err(|err| ApiError(BantoError::Other(format!("API キー削除タスク: {err}"))))??;
+    match outcome {
+        ApiKeyDeleteOutcome::Deleted(_) => Ok(StatusCode::NO_CONTENT.into_response()),
         ApiKeyDeleteOutcome::StillActive => Ok((
             StatusCode::CONFLICT,
             Json(ErrorBody::Other {
@@ -219,17 +238,27 @@ async fn api_keys_clear_trip(
     headers: HeaderMap,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
-    let summary = state.api_keys.clear_trip(id).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "clear_trip",
-        "api_keys",
-        Some(&id.to_string()),
-        None,
-    )
-    .await;
+    // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
+    let summary = tokio::spawn(async move {
+        let summary = state.api_keys.clear_trip(id).await?;
+        record_write(
+            &state.audit,
+            &state.auth,
+            &headers,
+            "clear_trip",
+            "api_keys",
+            Some(&id.to_string()),
+            None,
+        )
+        .await;
+        Ok::<_, BantoError>(summary)
+    })
+    .await
+    .map_err(|err| {
+        ApiError(BantoError::Other(format!(
+            "API キートリップ解除タスク: {err}"
+        )))
+    })??;
     Ok(Json(summary))
 }
 
