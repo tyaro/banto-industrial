@@ -58,11 +58,14 @@
 //! それでも CPU が詰まって `push` のグループの tick が 500 ms を超えて遅れると（CI では、
 //! 同じプロセスで同時に走る 9 が約 24 万件を送る）、保存が Good の値を、収集の現在値が
 //! 読むときに Stale と導く。これは製品として正しい表示だが、この試験が見たいのはブリッジが
-//! 送る品質なので、ブリッジのタグの `stale` のうち、値の時刻からの経過が
-//! [`DERIVED_STALE_AFTER_MS`] を超えたもの（[`is_derived_stale`]）だけを外す: 並びでは
-//! 控えず（[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、負の条件では保存
-//! されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。7c）。ブリッジが
-//! 送る `stale`（クエリの失敗の 1 回目）は送るたびに時刻が新しいので、今までどおり捕まえる。
+//! 送る品質なので、ブリッジのタグの `stale` のうち、収集の現在値に**保存された品質が Good**
+//! のもの（[`is_derived_stale`]。保存の品質は `CurrentValuesHandle::get_stored` で読む）
+//! だけを外す: 並びでは控えず（[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、
+//! 負の条件では保存されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。
+//! 7c）。ブリッジが送る `stale`（クエリの失敗の 1 回目）は保存も `stale` なので、読むまでに
+//! どれだけ遅れても今までどおり捕まえる（値の時刻からの経過では、tick の遅れでブリッジの
+//! `stale` の読みも遅れると区別できない。#947 のレビュー）。経過は落とすときのメッセージに
+//! 載せるだけ。
 //! 試験の周期や並べ方は緩めない。
 //!
 //! ## 反証（§10.4・checklist §5、PR に書く）
@@ -681,53 +684,73 @@ const BAD: Reading = Reading {
 
 /// 外部名 `external` のタグを、Hub の全 IF が通る `read_current` で読む。
 fn read_tag(manager: &CollectorManager, external: &str) -> Reading {
-    read_tag_aged(manager, external).0
+    read_tag_aged(manager, external).reading
 }
 
-/// [`read_tag`] と、その値の試行の時刻からの経過（ms）。
-fn read_tag_aged(manager: &CollectorManager, external: &str) -> (Reading, i64) {
+/// [`read_tag`] と、収集の現在値に保存された品質（導く前）と、その値の試行の時刻からの経過
+/// （ms）。保存の品質と読みは同じ値から取る（間で値が書かれたら読み直す）。
+fn read_tag_aged(manager: &CollectorManager, external: &str) -> Aged {
     let map = manager.tag_map();
     let entry = map
         .get(external)
         .unwrap_or_else(|| panic!("tag {external} is not in the catalog"));
     let current = manager.current_values();
     let store = manager.server_store();
-    let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now_ms());
-    // 経過は導出の後に測る（導出の時計は `read_current` の中で別に読まれる。前に測ると、
-    // 間で止まったときに導かれた Stale が新しく見える）。
-    let now = now_ms();
-    (
-        Reading {
-            value,
-            quality: quality_str(quality),
-        },
-        now - ptime_ms,
-    )
+    for _ in 0..1_000 {
+        let stored = current
+            .as_ref()
+            .and_then(|handle| handle.get_stored(&entry.tag_key));
+        let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now_ms());
+        // 経過は導出の後に測る（導出の時計は `read_current` の中で別に読まれる。前に測ると、
+        // 間で止まったときに導かれた Stale が新しく見える）。
+        let now = now_ms();
+        if stored.is_some_and(|stored| stored.ptime_ms != ptime_ms) {
+            continue;
+        }
+        return Aged {
+            reading: Reading {
+                value,
+                quality: quality_str(quality),
+            },
+            stored_quality: stored.map(|stored| quality_str(stored.quality)),
+            age_ms: now - ptime_ms,
+        };
+    }
+    panic!("tag {external}: the stored sample kept changing while it was read");
 }
 
-/// `push` のグループ（200 ms）の現在値が、読むときに Stale を導く経過（周期 × 2.5。
-/// `banto_collect` の `STALE_PERIOD_FACTOR`）。
-const DERIVED_STALE_AFTER_MS: i64 = 500;
+/// 読みと、収集の現在値に保存された品質（導く前。値が無ければ `None`）と、その値の時刻からの
+/// 経過（ms）（[`read_tag_aged`]）。経過は落とすときのメッセージ（`Debug`）に載せるためだけに
+/// 持つ。
+#[derive(Clone, Copy)]
+struct Aged {
+    reading: Reading,
+    stored_quality: Option<&'static str>,
+    age_ms: i64,
+}
 
-/// 読みと、その値の時刻からの経過（ms）（[`read_tag_aged`]）。
-type Aged = (Reading, i64);
+impl std::fmt::Debug for Aged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self.reading, self.stored_quality, self.age_ms).fmt(f)
+    }
+}
 
 /// [`read_tag_aged`] の読みが、読むときに導かれた Stale（`push` のグループの tick の遅れで、
-/// 保存が Good の値が Stale に見えているもの）か。保存された `stale`（ブリッジが送ったもの）
-/// は、送るたびに時刻が新しいので、経過が [`DERIVED_STALE_AFTER_MS`] を超えない（#946）。
-fn is_derived_stale(reading: &Reading, age_ms: i64) -> bool {
-    reading.quality == "stale" && age_ms > DERIVED_STALE_AFTER_MS
+/// 保存が Good の値が Stale に見えているもの）か。保存された品質で決める: 保存が `stale`
+/// （ブリッジが送ったもの）なら、経過がどれだけ長くても外さない（#946・#947 のレビュー）。
+fn is_derived_stale(aged: &Aged) -> bool {
+    aged.reading.quality == "stale" && aged.stored_quality == Some("good")
 }
 
 /// 読むときに導かれた Stale を、保存されている Good（同じ値）に戻す。それ以外はそのまま。
-fn ignoring_derived_stale((reading, age_ms): Aged) -> Reading {
-    if is_derived_stale(&reading, age_ms) {
+fn ignoring_derived_stale(aged: Aged) -> Reading {
+    if is_derived_stale(&aged) {
         Reading {
-            value: reading.value,
+            value: aged.reading.value,
             quality: "good",
         }
     } else {
-        reading
+        aged.reading
     }
 }
 
@@ -738,10 +761,9 @@ struct Recorder {
 }
 
 impl Recorder {
-    /// `skip_derived_stale` が `Some(i)` なら、`externals[i]` だけは、経過が
-    /// [`DERIVED_STALE_AFTER_MS`] を超えた Stale（tick の遅れで読むときに導かれたもの）を
-    /// 控えない（他のタグは厳密なまま。止まり続けても見逃さない）。ブリッジや Source が送った
-    /// `stale` は送るたびに時刻が新しいので、控えられる。
+    /// `skip_derived_stale` が `Some(i)` なら、`externals[i]` だけは、読むときに導かれた
+    /// Stale（保存は Good。tick の遅れ。[`is_derived_stale`]）を控えない（他のタグは厳密な
+    /// まま）。ブリッジや Source が送った `stale` は保存も `stale` なので、経過によらず控える。
     fn start(
         manager: Arc<CollectorManager>,
         externals: Vec<String>,
@@ -755,10 +777,11 @@ impl Recorder {
                 for (index, (sequence, external)) in
                     sequences.iter_mut().zip(&externals).enumerate()
                 {
-                    let (reading, age_ms) = read_tag_aged(&manager, external);
-                    if skip_derived_stale == Some(index) && is_derived_stale(&reading, age_ms) {
+                    let aged = read_tag_aged(&manager, external);
+                    if skip_derived_stale == Some(index) && is_derived_stale(&aged) {
                         continue;
                     }
+                    let reading = aged.reading;
                     if sequence.last() != Some(&reading) {
                         sequence.push(reading);
                     }
@@ -1019,7 +1042,7 @@ impl Fixture {
         while tokio::time::Instant::now() < deadline {
             assert!(
                 check(self),
-                "{what}: (reading, age_ms) {:?}",
+                "{what}: (reading, stored_quality, age_ms) {:?}",
                 self.pairs_aged()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1828,24 +1851,39 @@ async fn parity_9_three_queries_at_the_registration_limit() {
     admin.close().await;
 }
 
-/// 7c の `hold` と 4・5・6・8 の並びが外すのは、読むときに導かれた Stale だけ（#946）。
-/// ブリッジが送った `stale`（時刻が新しい）と Bad は外さない。
+/// 7c の `hold` と 4・5・6・8 の並びが外すのは、読むときに導かれた Stale（保存は Good）だけ
+/// （#946・#947 のレビュー）。ブリッジが送った `stale`（保存も `stale`）は、経過がどれだけ長く
+/// ても外さない。Bad も外さない。
 #[test]
 fn only_a_derived_stale_is_ignored() {
-    // 導かれた Stale（経過が 500 ms を超えた）は、保存されている Good とみなす。
-    assert!(is_derived_stale(&stale(31.5), DERIVED_STALE_AFTER_MS + 1));
-    assert_eq!(
-        ignoring_derived_stale((stale(31.5), 798)),
-        good(31.5),
-        "the derived Stale of the CI failure (798 ms) is the stored Good"
-    );
-    // ブリッジが送った `stale`（経過が短い）は、そのまま（7c の `hold` は落ちる）。
-    for age_ms in [0, 30, DERIVED_STALE_AFTER_MS] {
-        assert!(!is_derived_stale(&stale(31.5), age_ms));
-        assert_eq!(ignoring_derived_stale((stale(31.5), age_ms)), stale(31.5));
+    let aged = |reading: Reading, stored_quality: Option<&'static str>, age_ms: i64| Aged {
+        reading,
+        stored_quality,
+        age_ms,
+    };
+    // 導かれた Stale（保存は Good）は、経過によらず保存されている Good とみなす。
+    for age_ms in [0, 501, 798, 10_000] {
+        let derived = aged(stale(31.5), Some("good"), age_ms);
+        assert!(is_derived_stale(&derived));
+        assert_eq!(
+            ignoring_derived_stale(derived),
+            good(31.5),
+            "a derived Stale ({age_ms} ms) is the stored Good"
+        );
     }
-    // Good・Bad は経過によらず、そのまま。
-    assert_eq!(ignoring_derived_stale((good(31.5), 10_000)), good(31.5));
-    assert_eq!(ignoring_derived_stale((BAD, 10_000)), BAD);
-    assert!(!is_derived_stale(&BAD, 10_000));
+    // ブリッジが送った `stale`（保存も `stale`）は、経過が長くてもそのまま（7c の `hold` は
+    // 落ち、並びには控える）。tick が遅れて読むまでに 500 ms を超えた場合も同じ。
+    for age_ms in [0, 30, 500, 501, 798, 10_000] {
+        let sent = aged(stale(31.5), Some("stale"), age_ms);
+        assert!(!is_derived_stale(&sent), "a sent stale ({age_ms} ms)");
+        assert_eq!(ignoring_derived_stale(sent), stale(31.5));
+    }
+    // Good・Bad と、収集の現在値に無いものは、そのまま。
+    assert_eq!(
+        ignoring_derived_stale(aged(good(31.5), Some("good"), 10_000)),
+        good(31.5)
+    );
+    assert_eq!(ignoring_derived_stale(aged(BAD, Some("bad"), 10_000)), BAD);
+    assert!(!is_derived_stale(&aged(BAD, Some("good"), 10_000)));
+    assert!(!is_derived_stale(&aged(stale(31.5), None, 10_000)));
 }
