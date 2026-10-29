@@ -801,6 +801,10 @@ fn operational_write_item(
     }) else {
         return Err(refused());
     };
+    if items[0].spec.address.bit.is_some() {
+        return operational_word_bit_items(items, driver_id, policy, area, start)
+            .ok_or_else(refused);
+    }
     if items.len()
         > if area.is_bit() {
             operational_write::MAX_BITS
@@ -897,6 +901,58 @@ fn operational_write_item(
         return Err(refused());
     }
     Ok(checked)
+}
+
+/// A request naming a word bit (`D100.5`, `W1A.0`) must consist only of
+/// distinct bool bits of one D/W word, every one inside a word-bit interval;
+/// the guest then performs read, masked write-back and confirm read. Word
+/// intervals never authorize these, and a request mixing word bits with words
+/// or other devices is refused as a whole (`None`) before any frame is planned.
+fn operational_word_bit_items(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+    policy: &WritePolicy,
+    area: WriteArea,
+    word: u32,
+) -> Option<Vec<write::WriteItem>> {
+    if !matches!(area, WriteArea::D | WriteArea::W) || items.len() > 16 {
+        return None;
+    }
+    let mut seen = 0_u16;
+    let mut bits = Vec::with_capacity(items.len());
+    let mut checked = Vec::with_capacity(items.len());
+    for item in items {
+        let address = &item.spec.address;
+        let bit = address.bit.filter(|&bit| bit < 16)?;
+        let mask = 1_u16 << bit;
+        let api::Value::Bit(value) = item.value else {
+            return None;
+        };
+        if address.driver != *driver_id
+            || WriteArea::from_name(&address.area) != Some(area)
+            || address.index != Some(u64::from(word))
+            || address.canonical != format!("{}.{bit:X}", area.canonical(word))
+            || address.word_count != 1
+            || !address.writable_area
+            || !matches!(item.spec.kind, TagKind::Numeric(DataType::Bit))
+            || seen & mask != 0
+        {
+            return None;
+        }
+        seen |= mask;
+        bits.push(bit);
+        checked.push(write::WriteItem {
+            spec: write_types::TagSpec {
+                address: address.canonical.clone(),
+                data_type: DataType::Bit.to_string(),
+                string_words: None,
+            },
+            value: write_types::Value::Bool(value),
+        });
+    }
+    policy
+        .allows_word_bits(area, word, &bits)
+        .then_some(checked)
 }
 
 fn api_write_fatal(value: write_types::FatalError) -> FatalError {
@@ -1553,6 +1609,142 @@ mod tests {
         bad = valid.to_vec();
         bad[1].spec.address.index = Some(12);
         assert!(operational_write_item(&bad, &id, &policy).is_err());
+    }
+
+    fn word_bit_item(area: WriteArea, word: u64, bit: u8, value: bool) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let name = if area == WriteArea::D { "D" } else { "W" };
+        let address = DriverAddress::new(
+            id,
+            format!("{}.{bit:X}", area.canonical(word as u32)),
+            name,
+            true,
+            1,
+        )
+        .with_index(word)
+        .with_bit(bit);
+        WriteItem::new(
+            TagSpec::new(address, TagKind::numeric(DataType::Bit)),
+            api::Value::Bit(value),
+        )
+    }
+
+    #[test]
+    fn operational_word_bits_need_a_bit_interval_and_one_word() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let policy = WritePolicy::parse(
+            &Settings::from_pairs([
+                (MODE_KEY, "enabled"),
+                (ALLOWLIST_KEY, "D100-D105,D100.3-D100.5,W1A.0-W1A.F"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let valid = [
+            word_bit_item(WriteArea::D, 100, 5, true),
+            word_bit_item(WriteArea::D, 100, 3, false),
+        ];
+        let accepted = operational_write_item(&valid, &id, &policy).unwrap();
+        assert_eq!(accepted.len(), 2);
+        assert_eq!(accepted[0].spec.address, "D100.5");
+        assert_eq!(accepted[0].spec.data_type, "bit");
+        assert!(matches!(accepted[0].value, write_types::Value::Bool(true)));
+        assert!(matches!(accepted[1].value, write_types::Value::Bool(false)));
+        let w = [word_bit_item(WriteArea::W, 0x1a, 0, true)];
+        assert_eq!(
+            operational_write_item(&w, &id, &policy).unwrap()[0]
+                .spec
+                .address,
+            "W1A.0"
+        );
+        // A word interval alone never authorizes a bit of that word.
+        let words_only = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "D100-D105")]).unwrap(),
+        )
+        .unwrap();
+        assert!(operational_write_item(&valid, &id, &words_only).is_err());
+        // A bit interval never authorizes the whole word.
+        let bits_only = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "enabled"), (ALLOWLIST_KEY, "D100.0-D100.F")])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(operational_write_item(
+            &[operational_item(100, api::Value::F64(1.0))],
+            &id,
+            &bits_only
+        )
+        .is_err());
+        let mut invalid = vec![
+            vec![word_bit_item(WriteArea::D, 100, 2, true)],
+            vec![
+                word_bit_item(WriteArea::D, 100, 5, true),
+                word_bit_item(WriteArea::D, 100, 5, false),
+            ],
+            vec![
+                word_bit_item(WriteArea::D, 100, 5, true),
+                word_bit_item(WriteArea::D, 101, 3, true),
+            ],
+            // Mixed word-bit and word requests are refused whichever comes first.
+            vec![
+                word_bit_item(WriteArea::D, 100, 5, true),
+                operational_item(100, api::Value::F64(1.0)),
+            ],
+            vec![
+                operational_item(100, api::Value::F64(1.0)),
+                word_bit_item(WriteArea::D, 100, 5, true),
+            ],
+            vec![
+                word_bit_item(WriteArea::D, 100, 5, true),
+                word_bit_item(WriteArea::W, 0x1a, 0, true),
+            ],
+        ];
+        let mut numeric = valid.to_vec();
+        numeric[1].value = api::Value::F64(1.0);
+        invalid.push(numeric);
+        let mut wrong_kind = valid.to_vec();
+        wrong_kind[1].spec.kind = TagKind::numeric(DataType::U16);
+        invalid.push(wrong_kind);
+        let mut lowercase = vec![word_bit_item(WriteArea::W, 0x1a, 0xf, true)];
+        lowercase[0].spec.address.canonical = "W1A.f".into();
+        invalid.push(lowercase);
+        let mut not_writable = valid.to_vec();
+        not_writable[1].spec.address.writable_area = false;
+        invalid.push(not_writable);
+        let mut wrong_driver = valid.to_vec();
+        wrong_driver[1].spec.address.driver = DriverId::new("other-driver").unwrap();
+        invalid.push(wrong_driver);
+        let mut wrong_width = valid.to_vec();
+        wrong_width[1].spec.address.word_count = 2;
+        invalid.push(wrong_width);
+        let mut out_of_range = valid.to_vec();
+        out_of_range[1].spec.address.bit = Some(16);
+        invalid.push(out_of_range);
+        let mut bit_device = vec![typed_item(
+            WriteArea::M,
+            100,
+            DataType::Bit,
+            api::Value::Bit(true),
+        )];
+        bit_device[0].spec.address.bit = Some(3);
+        invalid.push(bit_device);
+        for items in invalid {
+            let len = items.len();
+            assert!(
+                matches!(
+                    operational_write_item(&items, &id, &policy),
+                    Err(WriteProgress::Done(results))
+                        if results.len() == len && results.iter().all(Result::is_err)
+                ),
+                "{items:?}"
+            );
+        }
+        let disabled = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "disabled"), (ALLOWLIST_KEY, "D100.0-D100.F")])
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(operational_write_item(&valid, &id, &disabled).is_err());
     }
 
     #[test]
