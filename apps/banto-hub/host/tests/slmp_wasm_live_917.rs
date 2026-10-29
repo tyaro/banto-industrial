@@ -529,6 +529,7 @@ fn as_u16(item: &Result<Value, ItemError>) -> Option<u16> {
 #[derive(Clone, Copy)]
 enum Expect {
     Word,
+    DWord,
     Bit,
     Text,
 }
@@ -550,6 +551,9 @@ fn check_items(
         let Some(want) = want else { continue };
         let good = match want {
             Expect::Word => as_u16(item).is_some(),
+            Expect::DWord => {
+                matches!(item, Ok(Value::F64(v)) if v.is_finite() && v.fract() == 0.0 && (0.0..=4_294_967_295.0).contains(v))
+            }
             Expect::Bit => matches!(item, Ok(Value::Bit(_))),
             Expect::Text => matches!(item, Ok(Value::Str(_))),
         };
@@ -984,7 +988,7 @@ async fn s4_unit_buffer_reads(plc: &'static Plc) {
     let expect: Vec<Option<Expect>> = if plc.label == "R" {
         vec![
             Some(Expect::Word),
-            Some(Expect::Word),
+            Some(Expect::DWord),
             Some(Expect::Bit),
             Some(Expect::Text),
             Some(Expect::Word),
