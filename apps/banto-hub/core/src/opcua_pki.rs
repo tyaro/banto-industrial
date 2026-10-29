@@ -38,8 +38,9 @@
 //!   特定の利用者（profile のインストール利用者など）への許可は断らない（profile の
 //!   ACL の設計が決める範囲）。
 //! - **Unix**: banto-opcua が鍵のフォルダを 0700・鍵を 0600 にする。ここでは、既にある鍵が
-//!   グループ・他人に開いている（`mode & 0o077`）、置き場・`own`・`private` が他人に
-//!   書ける（`mode & 0o002`）、どれかがシンボリックリンクなら断る。
+//!   グループ・他人に開いている（`mode & 0o077`）、置き場・`own`・`private` と
+//!   証明書がグループ・他人に書ける（`mode & 0o022`）、どれかがシンボリックリンクなら断る。
+//!   置き場がなければ 0700 で作る（既にある置き場の権限は書き換えない）。
 //!
 //! 断ったとき・banto-opcua の `Error::Pki` のときは、理由をログと状態の API
 //! （`GET /api/opcua-status` の `failed`）に出す（`crate::opcua`）。原因を直したあと、
@@ -225,17 +226,38 @@ mod imp {
 
 #[cfg(unix)]
 mod imp {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::Path;
 
+    /// 置き場がなければ 0700 で作る。親は通常の権限で作り、置き場だけを 0700 に固定する
+    /// （umask に左右されないよう、作ったあとに明示的に 0700 にする）。既にある置き場の
+    /// 権限は書き換えず、広ければ下の確かめで断る。
+    fn create_pki_dir(dir: &Path) -> Result<(), String> {
+        let fail = |err: std::io::Error| format!("置き場を作れません: {err}");
+        if let Some(parent) = dir.parent() {
+            std::fs::create_dir_all(parent).map_err(fail)?;
+        }
+        match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+            Ok(()) => {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(fail)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(err) => Err(fail(err)),
+        }
+    }
+
     pub(super) fn prepare(dir: &Path) -> Result<(), String> {
-        std::fs::create_dir_all(dir).map_err(|err| format!("置き場を作れません: {err}"))?;
+        create_pki_dir(dir)?;
         let key = dir.join("private").join("private.pem");
-        for (path, forbidden) in [
-            (dir.to_path_buf(), 0o002),
-            (dir.join("own"), 0o002),
-            (dir.join("private"), 0o002),
-            (key, 0o077),
+        let cert = dir.join("own").join("cert.der");
+        // ディレクトリ・証明書はグループ/他人の書込み（0o022）、鍵はグループ/他人の
+        // あらゆる権限（0o077）を断る。
+        for (path, forbidden, is_dir) in [
+            (dir.to_path_buf(), 0o022, true),
+            (dir.join("own"), 0o022, true),
+            (dir.join("private"), 0o022, true),
+            (cert, 0o022, false),
+            (key, 0o077, false),
         ] {
             let metadata = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -247,10 +269,13 @@ mod imp {
             }
             let mode = metadata.permissions().mode();
             if mode & forbidden != 0 {
+                let fix = if is_dir { "chmod 700" } else { "chmod 600" };
                 return Err(format!(
-                    "{} の権限が広すぎます（{:o}）",
+                    "{} の権限が広すぎます（{:o}。グループ・他人が書込み{}できます）。`{fix} {}` で絞ってください",
                     path.display(),
-                    mode & 0o777
+                    mode & 0o777,
+                    if forbidden == 0o077 { "・読取り" } else { "" },
+                    path.display()
                 ));
             }
         }
@@ -371,5 +396,57 @@ mod tests {
         assert!(reason.contains("private.pem"), "{reason}");
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
         prepare(&dir).expect("restricted key");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn group_writable_pki_directories_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-grpw");
+        let dir = pki_dir(&root.path().join("data"));
+        std::fs::create_dir_all(dir.join("own")).unwrap();
+        std::fs::create_dir_all(dir.join("private")).unwrap();
+        for sub in ["", "own", "private"] {
+            let path = if sub.is_empty() {
+                dir.clone()
+            } else {
+                dir.join(sub)
+            };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o770)).unwrap();
+            let reason = prepare(&dir).expect_err("group writable dir");
+            assert!(
+                reason.contains("chmod 700") && reason.contains("770"),
+                "{reason}"
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        prepare(&dir).expect("restricted dirs");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_writable_certificate_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-cert");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("own")).unwrap();
+        let cert = dir.join("own").join("cert.der");
+        std::fs::write(&cert, b"dummy").unwrap();
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o664)).unwrap();
+        assert!(prepare(&dir).is_err());
+        std::fs::set_permissions(&cert, std::fs::Permissions::from_mode(0o644)).unwrap();
+        prepare(&dir).expect("cert readable but not writable");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_pki_dir_is_created_with_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::test_support::TempDir::new("opcua-pki-unix-new");
+        let dir = pki_dir(&root.path().join("data"));
+        prepare(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 }
