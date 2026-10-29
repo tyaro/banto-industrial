@@ -737,8 +737,11 @@ jobs:
           # #62 (E4) accepts the setting transport=udp (frames unchanged; the
           # Host owns the UDP transport, #933). #63 (C1) reads D/W strings of
           # 1-128 words as bytes low byte first per word and writes one string
-          # item as one 1401 (Hub gate #934).
-          $newSlmpSha = 'f6c8781bab6f85a6c866e4d552039b547c4390ac'
+          # item as one 1401 (Hub gate #934). #65 (G1) reads U\G buffer memory
+          # (U<h>\G<n>, numeric, word-bit and string, read-only, one request per
+          # tag; Q 0080 / R 0082 with FAH for the R CPU buffer U3E0-U3E3) and
+          # reports area U<h>\G per module (Hub string gate #917).
+          $newSlmpSha = '1fac51ad380a9c3b5416660dea6bdd4926b2879f'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -784,10 +787,18 @@ jobs:
           if (-not (Select-String -Path $slmpUdpStringLog -Pattern '^test result: ok\. 4 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP UDP/string component tests did not all run'
           }
+          # Component-level G1 (U\G reads on Q and R, byte-exact frames, one
+          # request per tag, per-item Unsupported, end codes, no writes).
+          $slmpUnitBufferLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-unit-buffer-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_unit_buffer --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpUnitBufferLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP U\G component tests failed' }
+          if (-not (Select-String -Path $slmpUnitBufferLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP U\G component tests did not all run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 43 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 45 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.

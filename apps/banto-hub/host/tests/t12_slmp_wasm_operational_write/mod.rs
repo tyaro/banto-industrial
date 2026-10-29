@@ -4483,3 +4483,591 @@ async fn new_guest_saved_d_and_w_strings_are_written_audited_and_read_back_over_
     assert_eq!(results_of(1), ["ok"], "{rows:?}");
     assert_eq!(results_of(2), ["failed"], "{rows:?}");
 }
+
+/// Loopback TCP SLMP peer for guest #65 (G1, #917): an R04CPU or Q02UCPU with
+/// a D word memory and a buffer memory keyed by module `h` and address. It
+/// answers the handshake, plain D reads and device-extension 0401 (Q 0080, R
+/// 0082), and records every extension request from the reserved bytes on, the
+/// count of 1401 writes, and the connections made.
+struct UnitBufferPeer {
+    address: std::net::SocketAddr,
+    ext: Arc<Mutex<Vec<Vec<u8>>>>,
+    writes: Arc<AtomicU32>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UnitBufferPeer {
+    async fn start(r: bool, buffer: &[(u16, u32, u16)], d: &[(u32, u16)]) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let buffer: Arc<std::collections::BTreeMap<(u16, u32), u16>> =
+            Arc::new(buffer.iter().map(|&(h, n, w)| ((h, n), w)).collect());
+        let d: Arc<std::collections::BTreeMap<u32, u16>> = Arc::new(d.iter().copied().collect());
+        let ext = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(AtomicU32::new(0));
+        let task = {
+            let (ext, writes) = (ext.clone(), writes.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    loop {
+                        let mut head = [0u8; 13];
+                        if socket.read_exact(&mut head).await.is_err() {
+                            break;
+                        }
+                        assert_eq!(&head[..2], &[0x54, 0x00], "4E request");
+                        let length = usize::from(u16::from_le_bytes([head[11], head[12]]));
+                        let mut request = head.to_vec();
+                        request.resize(13 + length, 0);
+                        if socket.read_exact(&mut request[13..]).await.is_err() {
+                            break;
+                        }
+                        let command = u16::from_le_bytes([request[15], request[16]]);
+                        let sub = u16::from_le_bytes([request[17], request[18]]);
+                        let (end_code, body): (u16, Vec<u8>) = match (command, sub) {
+                            (0x0101, _) => {
+                                let (name, code) = if r {
+                                    ("R04CPU", 0x4800u16)
+                                } else {
+                                    ("Q02UCPU", 0x0263)
+                                };
+                                let mut body = vec![b' '; 18];
+                                body[..name.len()].copy_from_slice(name.as_bytes());
+                                body[16..18].copy_from_slice(&code.to_le_bytes());
+                                (0, body)
+                            }
+                            (0x1401, _) => {
+                                writes.fetch_add(1, Ordering::SeqCst);
+                                (0, Vec::new())
+                            }
+                            (0x0401, 0x0080 | 0x0082) => {
+                                ext.lock().unwrap().push(request[4..].to_vec());
+                                let (h_at, count_at, number) = if sub == 0x0080 {
+                                    (
+                                        27,
+                                        30,
+                                        u32::from_le_bytes([
+                                            request[21],
+                                            request[22],
+                                            request[23],
+                                            0,
+                                        ]),
+                                    )
+                                } else {
+                                    (
+                                        29,
+                                        32,
+                                        u32::from_le_bytes([
+                                            request[21],
+                                            request[22],
+                                            request[23],
+                                            request[24],
+                                        ]),
+                                    )
+                                };
+                                let h = u16::from_le_bytes([request[h_at], request[h_at + 1]]);
+                                let count =
+                                    u16::from_le_bytes([request[count_at], request[count_at + 1]]);
+                                let body = (0..u32::from(count))
+                                    .flat_map(|at| {
+                                        buffer
+                                            .get(&(h, number + at))
+                                            .copied()
+                                            .unwrap_or(0)
+                                            .to_le_bytes()
+                                    })
+                                    .collect();
+                                (0, body)
+                            }
+                            (0x0401, _) => {
+                                let (start, device, points) = if sub == 0 {
+                                    (
+                                        u32::from_le_bytes([
+                                            request[19],
+                                            request[20],
+                                            request[21],
+                                            0,
+                                        ]),
+                                        request[22],
+                                        u16::from_le_bytes([request[23], request[24]]),
+                                    )
+                                } else {
+                                    (
+                                        u32::from_le_bytes([
+                                            request[19],
+                                            request[20],
+                                            request[21],
+                                            request[22],
+                                        ]),
+                                        request[23],
+                                        u16::from_le_bytes([request[25], request[26]]),
+                                    )
+                                };
+                                match device {
+                                    0xa9 if r && (start, points) == (280, 4) => {
+                                        let mut body = 4000u32.to_le_bytes().to_vec();
+                                        body.extend_from_slice(&4000u32.to_le_bytes());
+                                        (0, body)
+                                    }
+                                    0xa9 if !r && start == 302 && matches!(points, 1 | 2) => {
+                                        let mut body = 4000u16.to_le_bytes().to_vec();
+                                        if points == 2 {
+                                            body.extend_from_slice(&64u16.to_le_bytes());
+                                        }
+                                        (0, body)
+                                    }
+                                    0xa9 => (0xc051, Vec::new()),
+                                    0xa8 => (
+                                        0,
+                                        (0..u32::from(points))
+                                            .flat_map(|at| {
+                                                d.get(&(start + at))
+                                                    .copied()
+                                                    .unwrap_or(0)
+                                                    .to_le_bytes()
+                                            })
+                                            .collect(),
+                                    ),
+                                    other => panic!("unexpected device {other:#x}"),
+                                }
+                            }
+                            other => panic!("unexpected command {other:x?}"),
+                        };
+                        let mut response = vec![0xd4, 0, request[2], request[3], 0, 0];
+                        response.extend_from_slice(&request[6..11]);
+                        response.extend_from_slice(
+                            &u16::try_from(body.len() + 2).unwrap().to_le_bytes(),
+                        );
+                        response.extend_from_slice(&end_code.to_le_bytes());
+                        response.extend_from_slice(&body);
+                        if socket.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            address,
+            ext,
+            writes,
+            task,
+        }
+    }
+
+    fn ext(&self) -> Vec<Vec<u8>> {
+        self.ext.lock().unwrap().clone()
+    }
+}
+
+impl Drop for UnitBufferPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// The expected extension request from the reserved bytes on (see the layout
+/// in `crates/banto-driver-wasm/tests/slmp_unit_buffer.rs`).
+fn unit_buffer_frame(r: bool, h: u16, number: u32, count: u16) -> Vec<u8> {
+    let mut data = vec![0x01, 0x04];
+    if r {
+        data.extend_from_slice(&[0x82, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&number.to_le_bytes());
+        data.extend_from_slice(&[0xab, 0x00, 0x00, 0x00]);
+    } else {
+        data.extend_from_slice(&[0x80, 0x00, 0x00, 0x00]);
+        data.extend_from_slice(&number.to_le_bytes()[..3]);
+        data.extend_from_slice(&[0xab, 0x00, 0x00]);
+    }
+    data.extend_from_slice(&h.to_le_bytes());
+    data.push(if (0x3e0..=0x3e3).contains(&h) {
+        0xfa
+    } else {
+        0xf8
+    });
+    data.extend_from_slice(&count.to_le_bytes());
+    let mut frame = vec![0x00, 0x00, 0x00, 0xff, 0xff, 0x03, 0x00];
+    frame.extend_from_slice(&u16::try_from(data.len() + 2).unwrap().to_le_bytes());
+    frame.extend_from_slice(&[0x10, 0x00]);
+    frame.extend_from_slice(&data);
+    frame
+}
+
+/// `(name, address, dataType, stringLength, expected read-now value, Good on this model)`.
+type UnitBufferTag<'a> = (
+    &'a str,
+    &'a str,
+    &'a str,
+    Option<i64>,
+    serde_json::Value,
+    bool,
+);
+
+/// Guest #65 (G1) through the real Hub path (#917), R and Q: saved U\G
+/// numeric, word-bit and string tags pass registration over REST (the string
+/// on U\G is accepted, a writable U\G tag is refused), are collected Good by
+/// the periodic collection (a string tag only by read-now, as for D/W
+/// strings) and answer read-now, each tag as its own exact
+/// request (never merged with `U3\G11` next to `U3\G10`, nor with the D tag).
+/// `U3\G10` and `U5\G10` register with different `area`s (`U3\G`, `U5\G`), so
+/// the registration screen does not treat them as overlapping, and read their
+/// own module. On Q the CPU buffer `U3E0` and a span past 0xFFFFFF stay Bad
+/// and are never sent. A write to a U\G tag with an API key sends nothing.
+async fn unit_buffer_tags_register_collect_and_read_now(r: bool) {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let model = if r { "r" } else { "q" };
+    let peer = UnitBufferPeer::start(
+        r,
+        &[
+            (3, 10, 0x1111),
+            (3, 11, 0x3333),
+            (5, 10, 0x2222),
+            (3, 12, 0x5678),
+            (3, 13, 0x0001),
+            (3, 20, 0x0020),
+            (3, 30, u16::from_le_bytes(*b"HE")),
+            (3, 31, u16::from_le_bytes(*b"LL")),
+            (3, 32, u16::from_le_bytes(*b"O!")),
+            (0x3e0, 1, 0xbeef),
+            (0xff, 0xff_ffff, 0x0abc),
+        ],
+        &[(100, 77)],
+    )
+    .await;
+    let app = super::test_app_with_operational_write_manifest(
+        &format!("t12-new-guest-unit-buffer-{model}"),
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": peer.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "D3010-D3013"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 100))
+    .await
+    .unwrap();
+
+    let mut tags: Vec<UnitBufferTag> = vec![
+        (
+            "u3g10",
+            "U3\\G10",
+            "u16",
+            None,
+            serde_json::json!(4369.0),
+            true,
+        ),
+        (
+            "u3g11",
+            "U3\\G11",
+            "u16",
+            None,
+            serde_json::json!(13107.0),
+            true,
+        ),
+        (
+            "u5g10",
+            "U5\\G10",
+            "u16",
+            None,
+            serde_json::json!(8738.0),
+            true,
+        ),
+        (
+            "u3g12",
+            "U3\\G12",
+            "u32",
+            None,
+            serde_json::json!(87_672.0),
+            true,
+        ),
+        (
+            "u3g20b5",
+            "U3\\G20.5",
+            "bit",
+            None,
+            serde_json::json!(true),
+            true,
+        ),
+        (
+            "u3g30s",
+            "U3\\G30",
+            "string",
+            Some(3),
+            serde_json::json!("HELLO!"),
+            true,
+        ),
+        ("d100", "D100", "u16", None, serde_json::json!(77.0), true),
+        (
+            "cpu",
+            "U3E0\\G1",
+            "u16",
+            None,
+            serde_json::json!(48879.0),
+            r,
+        ),
+    ];
+    if !r {
+        tags.push((
+            "over",
+            "UFF\\G16777215",
+            "u32",
+            None,
+            serde_json::Value::Null,
+            false,
+        ));
+    }
+    let payload = |name: &str, address: &str, data_type: &str, length: Option<i64>, writable| {
+        let mut body = serde_json::json!({
+            "name": name, "collectionGroupId": group.id, "address": address,
+            "dataType": data_type, "enabled": true, "writable": writable
+        });
+        if let Some(length) = length {
+            body["stringLength"] = serde_json::json!(length);
+        }
+        body
+    };
+    // Registration over REST. A writable U\G tag is refused: read-only area.
+    let (status, body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/tags",
+        &app.admin_token,
+        payload("w", "U3\\G10", "u16", None, true),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(body.to_string().contains("読み取り専用"), "{body:?}");
+    let mut ids = Vec::new();
+    for (name, address, data_type, length, ..) in &tags {
+        let (status, body) = super::admin_write(
+            &app.router,
+            "POST",
+            "/api/tags",
+            &app.admin_token,
+            payload(name, address, data_type, *length, false),
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{address}: {body:?}");
+        assert_eq!(body["address"], *address, "{body:?}");
+        ids.push(body["id"].as_i64().unwrap());
+    }
+    // The address facts the registration screen's overlap check uses.
+    let (status, parsed) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/tags/parse-addresses",
+        &app.admin_token,
+        serde_json::json!({
+            "connectionId": saved.id,
+            "items": [
+                {"tagKind": "plc", "address": "U3\\G10", "dataType": "u16"},
+                {"tagKind": "plc", "address": "U5\\G10", "dataType": "u16"},
+                {"tagKind": "plc", "address": "U3\\G20.5", "dataType": "bit"},
+                {"tagKind": "plc", "address": "U03\\G010", "dataType": "u32"},
+                {"tagKind": "plc", "address": "U3\\G30", "dataType": "string", "stringLength": 3},
+                {"tagKind": "plc", "address": "U100\\G1", "dataType": "u16"},
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{parsed:?}");
+    let items = parsed["items"].as_array().unwrap();
+    for (at, canonical, area, index, bit, words) in [
+        (0, "U3\\G10", "U3\\G", 10, None, 1),
+        (1, "U5\\G10", "U5\\G", 10, None, 1),
+        (2, "U3\\G20.5", "U3\\G", 20, Some(5), 1),
+        (3, "U3\\G10", "U3\\G", 10, None, 2),
+        (4, "U3\\G30", "U3\\G", 30, None, 3),
+    ] {
+        let item = &items[at];
+        assert_eq!(item["ok"], true, "{item:?}");
+        assert_eq!(item["canonical"], canonical, "{item:?}");
+        assert_eq!(item["area"], area, "{item:?}");
+        assert_eq!(item["index"], index, "{item:?}");
+        assert_eq!(item["writableArea"], false, "{item:?}");
+        assert_eq!(item["wordCount"], words, "{item:?}");
+        assert_eq!(
+            item["bit"],
+            bit.map_or(serde_json::Value::Null, |bit| serde_json::json!(bit)),
+            "{item:?}"
+        );
+    }
+    assert_ne!(
+        items[0]["area"], items[1]["area"],
+        "U3\\G10 and U5\\G10 differ"
+    );
+    assert_eq!(items[0]["index"], items[1]["index"]);
+    assert_eq!(
+        items[5]["ok"], false,
+        "U100 is outside the grammar: {:?}",
+        items[5]
+    );
+
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // The periodic collection skips string tags (they are read by
+            // read-now only, as for D/W strings), so they are not awaited.
+            if tags
+                .iter()
+                .zip(&ids)
+                .all(|((_, _, data_type, _, _, good), &id)| {
+                    !good
+                        || *data_type == "string"
+                        || sample_of(id).is_some_and(|s| s.quality == Quality::Good)
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        let states: Vec<_> = tags
+            .iter()
+            .zip(&ids)
+            .map(|((name, ..), &id)| (*name, sample_of(id).map(|s| s.quality)))
+            .collect();
+        panic!(
+            "every readable U\\G tag is collected Good: {states:?} {:x?}",
+            peer.ext()
+        )
+    });
+    // Let a few more cycles run so a merged or stray request would show.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for ((name, address, _, _, value, good), &id) in tags.iter().zip(&ids) {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        if *good {
+            assert_eq!(status, super::StatusCode::OK, "{address}: {body:?}");
+            assert_eq!(body["v"], *value, "{address}: {body:?}");
+            assert_eq!(body["q"], "good", "{address}: {body:?}");
+        } else {
+            assert!(
+                !status.is_success(),
+                "{address} read-now: {status} {body:?}"
+            );
+            assert_ne!(
+                sample_of(id).map(|s| s.quality),
+                Some(Quality::Good),
+                "{address}"
+            );
+        }
+    }
+
+    // One exact request per U\G tag, nothing else on the extension path.
+    let mut expected = vec![
+        unit_buffer_frame(r, 3, 10, 1),
+        unit_buffer_frame(r, 3, 11, 1),
+        unit_buffer_frame(r, 5, 10, 1),
+        unit_buffer_frame(r, 3, 12, 2),
+        unit_buffer_frame(r, 3, 20, 1),
+        unit_buffer_frame(r, 3, 30, 3),
+    ];
+    if r {
+        expected.push(unit_buffer_frame(true, 0x3e0, 1, 1));
+    }
+    expected.sort();
+    let mut seen = peer.ext();
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen, expected, "{model}: each tag is its own request");
+
+    // A write to a U\G tag never reaches the PLC, whatever the key allows.
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "unit-buffer-writer",
+            vec![
+                "write:line.group.u3g10".into(),
+                "write:line.group.u3g30s".into(),
+            ],
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    for (tag, value) in [
+        ("line.group.u3g10", serde_json::json!(1.0)),
+        ("line.group.u3g30s", serde_json::json!("AB")),
+    ] {
+        let (status, body) = super::admin_write(
+            &app.router,
+            "POST",
+            "/api/v1/values/batch",
+            &issued.key,
+            serde_json::json!({ "writes": [{ "tag": tag, "v": value }] }),
+        )
+        .await;
+        assert!(
+            !status.is_success() || body["writes"][0]["ok"] == false,
+            "{tag}: {status} {body:?}"
+        );
+    }
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    assert!(revoked.unwrap().revoked_at.is_some());
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+    assert_eq!(peer.writes.load(Ordering::SeqCst), 0, "no 1401 was sent");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #65 component"]
+async fn new_guest_saved_unit_buffer_tags_are_collected_and_read_now_on_r() {
+    unit_buffer_tags_register_collect_and_read_now(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #65 component"]
+async fn new_guest_saved_unit_buffer_tags_are_collected_and_read_now_on_q() {
+    unit_buffer_tags_register_collect_and_read_now(false).await;
+}

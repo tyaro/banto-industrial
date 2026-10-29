@@ -554,12 +554,33 @@ fn checked_string_words(driver: &DriverId, words: u16, area: &str) -> Result<u16
                 "Modbus WASM string tags need a holding or input register area",
             ));
         }
-    } else if !matches!(area, "D" | "W") {
+    } else if !matches!(area, "D" | "W") && !is_unit_buffer_area(area) {
         return Err(AddressError::new(
-            "WASM string tags need a D or W word area",
+            "WASM string tags need a D, W or U\\G word area",
         ));
     }
     Ok(words)
+}
+
+/// #917 G1: the `area` the SLMP guest reports for a buffer memory address,
+/// `U<h>\G` per module (`U3\G`, `U3E0\G`; the address is `U<h>\G<n>`, `n` is
+/// the index). Only the guest's canonical spelling is accepted: `U`, one to
+/// three uppercase hex digits without a leading zero (`U0` itself is fine),
+/// then `\G`. Which modules a model can read is the guest's call, made at
+/// `read.plan`; the buffer memory is read-only, so nothing here makes it
+/// writable (the write gates take D/W only).
+fn is_unit_buffer_area(area: &str) -> bool {
+    let Some(module) = area
+        .strip_prefix('U')
+        .and_then(|rest| rest.strip_suffix("\\G"))
+    else {
+        return false;
+    };
+    (1..=3).contains(&module.len())
+        && module
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b))
+        && (module == "0" || !module.starts_with('0'))
 }
 
 /// #914 C1: a string write's WIT `value::bytes` is the tag's text encoded in
@@ -2582,6 +2603,41 @@ mod tests {
         }
         assert!(checked_parsed_address(&modbus, &kind(1), string_parsed("coil", 1)).is_err());
         assert!(checked_parsed_address(&modbus, &kind(4), string_parsed("D", 4)).is_err());
+    }
+
+    /// #917 G1: an SLMP string may sit in a buffer memory module `U<h>\G`, in
+    /// exactly the guest's canonical spelling, and nowhere looser.
+    #[test]
+    fn unit_buffer_areas_are_accepted_only_in_the_guests_canonical_spelling() {
+        for area in ["U0\\G", "U3\\G", "UFF\\G", "U10\\G", "U3E0\\G", "U3E3\\G"] {
+            assert!(is_unit_buffer_area(area), "{area}");
+        }
+        for area in [
+            "", "U", "U\\G", "U3", "U3\\", "U3G", "U3/G", "u3\\G", "U3\\g", "U03\\G", "U00\\G",
+            "U1000\\G", "U3e0\\G", "UG\\G", "U3E0\\G ", " U3\\G", "U-1\\G", "U+1\\G", "U3\\GG",
+            "U3\\G1", "U3.0\\G", "UX3\\G", "D", "U3\\G\\G",
+        ] {
+            assert!(!is_unit_buffer_area(area), "{area:?}");
+        }
+        let slmp = DriverId::new("slmp-read-wasm").unwrap();
+        let modbus = DriverId::new("modbus-fc3-wasm").unwrap();
+        let kind = |words| string_kind(words, StringEncoding::Utf8);
+        let unit = |area: &str, words| {
+            let mut parsed = string_parsed(area, words);
+            parsed.canonical = format!("{area}10");
+            parsed.writable_area = false;
+            parsed
+        };
+        for area in ["U3\\G", "U3E0\\G"] {
+            let accepted = checked_parsed_address(&slmp, &kind(8), unit(area, 8)).unwrap();
+            assert_eq!((accepted.area.as_str(), accepted.word_count), (area, 8));
+        }
+        assert!(checked_parsed_address(&slmp, &kind(128), unit("U3\\G", 128)).is_ok());
+        assert!(checked_parsed_address(&slmp, &kind(129), unit("U3\\G", 129)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(8), unit("U03\\G", 8)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(8), unit("U3\\G", 7)).is_err());
+        // Never a Modbus area.
+        assert!(checked_parsed_address(&modbus, &kind(8), unit("U3\\G", 8)).is_err());
     }
 
     fn string_item(
