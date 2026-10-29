@@ -59,7 +59,7 @@
 //! 同じプロセスで同時に走る 9 が約 24 万件を送る）、保存が Good の値を、収集の現在値が
 //! 読むときに Stale と導く。これは製品として正しい表示だが、この試験が見たいのはブリッジが
 //! 送る品質なので、ブリッジのタグの `stale` のうち、収集の現在値に**保存された品質が Good**
-//! のもの（[`is_derived_stale`]。保存の品質は `CurrentValuesHandle::get_stored` で読む）
+//! のもの（[`is_derived_stale`]。保存の品質は `CurrentValuesHandle::get_with_stored` で、導いた後の品質と同じロックの 1 つの読みから取る）
 //! だけを外す: 並びでは控えず（[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、
 //! 負の条件では保存されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。
 //! 7c）。ブリッジが送る `stale`（クエリの失敗の 1 回目）は保存も `stale` なので、読むまでに
@@ -96,7 +96,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
-use banto_collect::{BackoffConfig, CollectorOptions};
+use banto_collect::{BackoffConfig, CollectorOptions, Quality};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
@@ -688,35 +688,48 @@ fn read_tag(manager: &CollectorManager, external: &str) -> Reading {
 }
 
 /// [`read_tag`] と、収集の現在値に保存された品質（導く前）と、その値の試行の時刻からの経過
-/// （ms）。保存の品質と読みは同じ値から取る（間で値が書かれたら読み直す）。
+/// （ms）。導いた後の読みと保存の品質は、収集の現在値の 1 つの読み（同じロック・同じ時計）
+/// から取る（別々に読むと、間で書かれた値の品質を組み合わせてしまう）。
 fn read_tag_aged(manager: &CollectorManager, external: &str) -> Aged {
     let map = manager.tag_map();
     let entry = map
         .get(external)
         .unwrap_or_else(|| panic!("tag {external} is not in the catalog"));
     let current = manager.current_values();
-    let store = manager.server_store();
-    for _ in 0..1_000 {
-        let stored = current
-            .as_ref()
-            .and_then(|handle| handle.get_stored(&entry.tag_key));
-        let (value, quality, ptime_ms) = read_current(entry, current.as_ref(), &store, now_ms());
-        // 経過は導出の後に測る（導出の時計は `read_current` の中で別に読まれる。前に測ると、
-        // 間で止まったときに導かれた Stale が新しく見える）。
-        let now = now_ms();
-        if stored.is_some_and(|stored| stored.ptime_ms != ptime_ms) {
-            continue;
-        }
+    let snapshot = current
+        .as_ref()
+        .and_then(|handle| handle.get_with_stored(&entry.tag_key));
+    let Some((sample, stored)) = snapshot else {
+        // 現在値が無い（欠測など）: 保存の品質は無い。
+        let (value, quality, ptime_ms) =
+            read_current(entry, current.as_ref(), &manager.server_store(), now_ms());
         return Aged {
             reading: Reading {
                 value,
                 quality: quality_str(quality),
             },
-            stored_quality: stored.map(|stored| quality_str(stored.quality)),
-            age_ms: now - ptime_ms,
+            stored_quality: None,
+            age_ms: now_ms() - ptime_ms,
         };
+    };
+    // 経過は導出の後に測る（前に測ると、間で止まったときに導かれた Stale が新しく見える）。
+    let now = now_ms();
+    let (value, quality) = if entry.enabled
+        && sample.value.is_some_and(|value| {
+            value.is_finite() && (entry.data_type != "bit" || value == 0.0 || value == 1.0)
+        }) {
+        (sample.value, sample.quality)
+    } else {
+        (None, Quality::Bad)
+    };
+    Aged {
+        reading: Reading {
+            value,
+            quality: quality_str(quality),
+        },
+        stored_quality: Some(quality_str(stored)),
+        age_ms: now - sample.ptime_ms,
     }
-    panic!("tag {external}: the stored sample kept changing while it was read");
 }
 
 /// 読みと、収集の現在値に保存された品質（導く前。値が無ければ `None`）と、その値の時刻からの

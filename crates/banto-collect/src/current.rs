@@ -282,23 +282,22 @@ impl CurrentValuesHandle {
         map.get(tag_key).map(|entry| Self::derive(entry, now_ms))
     }
 
-    /// The latest sample for `tag_key` **as stored**: its quality is the
-    /// stored one (Good/Bad, or an external source's own Stale), never the
-    /// read-time Stale derivation of [`Self::get`]. For test observation only
-    /// (試験の観測のため。banto-industrial #946/#947: telling a stored Stale
-    /// from a derived one); display layers must use [`Self::get`] /
+    /// [`Self::get`]'s sample together with the quality **as stored** (Good/Bad,
+    /// or an external source's own Stale, before the read-time Stale
+    /// derivation), both from one entry under one read lock and one clock
+    /// instant. For test observation only (試験の観測のため。banto-industrial
+    /// #946/#947: telling a stored Stale from a derived one without a gap
+    /// between two reads); display layers must use [`Self::get`] /
     /// [`Self::get_reading`].
     #[doc(hidden)]
-    pub fn get_stored(&self, tag_key: &str) -> Option<CurrentSample> {
+    pub fn get_with_stored(&self, tag_key: &str) -> Option<(CurrentSample, Quality)> {
+        let now_ms = self.clock.now_ms();
         let map = self
             .map
             .read()
             .expect("current-value cache lock poisoned (a writer panicked)");
-        map.get(tag_key).map(|entry| CurrentSample {
-            value: entry.value,
-            ptime_ms: entry.ptime_ms,
-            quality: entry.stored_quality,
-        })
+        map.get(tag_key)
+            .map(|entry| (Self::derive(entry, now_ms), entry.stored_quality))
     }
 
     /// A snapshot of every known tag's latest sample, quality derived as in
@@ -405,22 +404,31 @@ mod tests {
     }
 
     #[test]
-    fn get_stored_skips_the_read_time_stale_derivation() {
+    fn get_with_stored_returns_derived_and_stored_quality_together() {
         let (handle, clock) = handle_at(1_000);
         handle.set("good", Some(1.0), 1_000, Quality::Good, 1_000);
         handle.set("stale", Some(2.0), 1_000, Quality::Stale, 1_000);
         clock.set_now_ms(1_000 + 2_600);
-        assert_eq!(handle.get("good").unwrap().quality, Quality::Stale);
+        // Stored Good aged into a derived Stale.
         assert_eq!(
-            handle.get_stored("good").unwrap(),
-            CurrentSample {
-                value: Some(1.0),
-                ptime_ms: 1_000,
-                quality: Quality::Good,
-            }
+            handle.get_with_stored("good").unwrap(),
+            (
+                CurrentSample {
+                    value: Some(1.0),
+                    ptime_ms: 1_000,
+                    quality: Quality::Stale,
+                },
+                Quality::Good
+            )
         );
-        assert_eq!(handle.get_stored("stale").unwrap().quality, Quality::Stale);
-        assert_eq!(handle.get_stored("missing"), None);
+        assert_eq!(
+            handle.get_with_stored("good").unwrap().0,
+            handle.get("good").unwrap()
+        );
+        // Stored Stale stays Stale in both.
+        let (derived, stored) = handle.get_with_stored("stale").unwrap();
+        assert_eq!((derived.quality, stored), (Quality::Stale, Quality::Stale));
+        assert_eq!(handle.get_with_stored("missing"), None);
     }
 
     #[test]
