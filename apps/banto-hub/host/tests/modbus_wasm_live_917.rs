@@ -837,7 +837,11 @@ async fn modbus_b1_register_bit_write_without_fc22_is_refused_before_send() {
             std::slice::from_ref(&spec),
         )
         .await;
-    audit("b1", format!("read={items:?}"));
+    audit("b1", format!("read={items:?} record_only=false"));
+    assert!(
+        matches!(items.as_slice(), [Ok(Value::Bit(_))]),
+        "b1: the register bit must read as a bit: {items:?}"
+    );
     for value in [true, false] {
         live.write_refused(
             "b1_write",
@@ -1079,7 +1083,14 @@ async fn modbus_c1_holding_string_write_readback_restore() {
             std::slice::from_ref(&string_spec),
         )
         .await;
-    audit("c1", format!("original string={text:?} span={original:?}"));
+    audit(
+        "c1",
+        format!("original string={text:?} span={original:?} record_only=false"),
+    );
+    assert!(
+        matches!(text.as_slice(), [Ok(Value::Str(_))]),
+        "c1: the original string must read as a string: {text:?}"
+    );
 
     live.authorize(1);
     let results = live

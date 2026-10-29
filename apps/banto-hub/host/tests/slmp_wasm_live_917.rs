@@ -526,6 +526,37 @@ fn as_u16(item: &Result<Value, ItemError>) -> Option<u16> {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Expect {
+    Word,
+    Bit,
+    Text,
+}
+
+/// Items the PLC must answer are `Ok` with the right value type; a `None`
+/// entry is recorded only (and says so in the audit line).
+fn check_items(
+    stage: &str,
+    labels: &[&str],
+    items: &[Result<Value, ItemError>],
+    expect: &[Option<Expect>],
+) {
+    assert_eq!(items.len(), labels.len(), "{stage}: item count");
+    for ((label, item), want) in labels.iter().zip(items).zip(expect) {
+        audit(
+            stage,
+            format!("read_checked {label} record_only={}", want.is_none()),
+        );
+        let Some(want) = want else { continue };
+        let good = match want {
+            Expect::Word => as_u16(item).is_some(),
+            Expect::Bit => matches!(item, Ok(Value::Bit(_))),
+            Expect::Text => matches!(item, Ok(Value::Str(_))),
+        };
+        assert!(good, "{stage}: {label} did not read as expected: {item:?}");
+    }
+}
+
 async fn connect(plc: &'static Plc, spec: TransportSpec, extra: &[(&str, &str)]) -> Live {
     require_opt_in();
     let driver = WasmDriver::load_operational_write(MANIFEST, &component()).unwrap();
@@ -831,7 +862,12 @@ async fn s1_frame_3e_and_own_route(plc: &'static Plc) {
             .collect();
         let labels: Vec<&str> = words.iter().map(String::as_str).collect();
         let items = live.read(&stage, &labels, &specs).await;
-        assert!(items.iter().all(Result::is_ok), "{stage}: {items:?}");
+        check_items(
+            &stage,
+            &labels,
+            &items,
+            &vec![Some(Expect::Word); labels.len()],
+        );
         let wanted = if extra[0].1 == "3e" { "3E " } else { "4E " };
         let frames = live.gate.lock().unwrap().frames.clone();
         assert!(
@@ -895,6 +931,18 @@ async fn s3_unknown_range_reads_and_write_refusals(plc: &'static Plc) {
     let specs: Vec<TagSpec> = tags.iter().map(|(a, t)| live.numeric(a, *t)).collect();
     let items = live.read(&stage, &labels, &specs).await;
     audit(&stage, format!("results={items:?}"));
+    // S10 is record-only (R: PLC answers 0x4031). On R Z3, RD7, ZR10 must read;
+    // on Q Z3 and ZR10 are record-only.
+    let r = plc.label == "R";
+    let expect: Vec<Option<Expect>> = tags
+        .iter()
+        .map(|(a, _)| match *a {
+            "S10" => None,
+            _ if r => Some(Expect::Word),
+            _ => None,
+        })
+        .collect();
+    check_items(&stage, &labels, &items, &expect);
     for (spec, (address, data_type)) in specs.iter().zip(&tags) {
         let value = match data_type {
             DataType::Bit => Value::Bit(true),
@@ -932,6 +980,19 @@ async fn s4_unit_buffer_reads(plc: &'static Plc) {
     ];
     let items = live.read(&stage, &labels, &specs).await;
     audit(&stage, format!("results={items:?}"));
+    // R must read all five; Q25PRH has no U\G path in the guest (record-only).
+    let expect: Vec<Option<Expect>> = if plc.label == "R" {
+        vec![
+            Some(Expect::Word),
+            Some(Expect::Word),
+            Some(Expect::Bit),
+            Some(Expect::Text),
+            Some(Expect::Word),
+        ]
+    } else {
+        vec![None; 5]
+    };
+    check_items(&stage, &labels, &items, &expect);
     live.write_refused(
         &format!("{stage}_write_u0g0"),
         &[WriteItem::new(specs[0].clone(), Value::F64(0.0))],
@@ -1054,6 +1115,12 @@ async fn s6_string_write(plc: &'static Plc) {
     audit(
         &stage,
         format!("original string={text:?} words={original:04x?}"),
+    );
+    check_items(
+        &format!("{stage}_original_string"),
+        &[&words[0]],
+        &text,
+        &[Some(Expect::Text)],
     );
 
     live.authorize(1);
