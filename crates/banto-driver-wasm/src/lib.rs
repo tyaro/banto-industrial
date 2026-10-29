@@ -21,7 +21,7 @@ use api::{
     AddressError, DataType, DriverAddress, DriverBase, DriverDescriptor, DriverId, FatalError,
     FieldError, FieldGroup, FieldKind, FrameCheck, FrameConnection, FrameDriver, FrameRule,
     ItemError, KindName, Planned, PrefixEncoding, PrefixSpec, RawValue, SettingField, SettingValue,
-    Settings, SettingsSchema, Step, TagKind, TagSpec, WriteItem, WriteProgress,
+    Settings, SettingsSchema, Step, StringEncoding, TagKind, TagSpec, WriteItem, WriteProgress,
 };
 use api::{
     AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
@@ -354,6 +354,8 @@ impl WasmDriver {
 
 /// U16 remains the required probe kind. Bit and the other numeric kinds use
 /// their exact WIT variants and are validated again at the value boundary.
+/// `string` (#914 C1) is accepted once; its tags are limited to word areas by
+/// [`checked_string_words`] and its results to exact-length bytes.
 fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
     let allowed = [
         KindName::Numeric(DataType::U16),
@@ -365,6 +367,7 @@ fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
         KindName::Numeric(DataType::U64),
         KindName::Numeric(DataType::F32),
         KindName::Numeric(DataType::F64),
+        KindName::String,
     ];
     if !supported.contains(&allowed[0])
         || supported.len() > allowed.len()
@@ -374,7 +377,7 @@ fn validate_supported_kinds(supported: &[KindName]) -> Result<(), LoadError> {
             .any(|(index, kind)| !allowed.contains(kind) || supported[..index].contains(kind))
     {
         return Err(LoadError::Contract(
-            "WASM component must support U16 and may add bit and the other seven numeric read kinds once each"
+            "WASM component must support U16 and may add bit, the other seven numeric read kinds and string once each"
                 .into(),
         ));
     }
@@ -488,9 +491,10 @@ fn checked_parsed_address(
         TagKind::Numeric(DataType::U16 | DataType::I16) => 1,
         TagKind::Numeric(DataType::U32 | DataType::I32 | DataType::F32) => 2,
         TagKind::Numeric(DataType::U64 | DataType::I64 | DataType::F64) => 4,
+        TagKind::Str { words, .. } => checked_string_words(driver, *words, &parsed.area)?,
         _ => {
             return Err(AddressError::new(
-                "WASM guest supports only numeric register reads",
+                "WASM guest supports only numeric register and word-area string reads",
             ))
         }
     };
@@ -525,6 +529,52 @@ fn checked_parsed_address(
         address = address.with_bit(bit);
     }
     Ok(address)
+}
+
+/// The registry's string length limit (`banto-tags`' `string_length`).
+const MAX_STRING_WORDS: u16 = 128;
+
+/// #914 C1: a string tag spans `words` words of a word area, read and written
+/// as one request. The Hub accepts it only on SLMP D/W and Modbus holding /
+/// input registers. A Modbus request carries at most 123 registers, so a
+/// Modbus string longer than that is refused here, at registration (the
+/// registry calls `parse_address`), and again by the write gate.
+fn checked_string_words(driver: &DriverId, words: u16, area: &str) -> Result<u16, AddressError> {
+    if words == 0 || words > MAX_STRING_WORDS {
+        return Err(AddressError::new("WASM string tags need 1 to 128 words"));
+    }
+    if driver.as_str() == "modbus-fc3-wasm" {
+        if u32::from(words) > modbus_write::MAX_WORDS {
+            return Err(AddressError::new(
+                "Modbus WASM string tags are limited to 123 words (one request)",
+            ));
+        }
+        if !matches!(area, "holding_register" | "input_register") {
+            return Err(AddressError::new(
+                "Modbus WASM string tags need a holding or input register area",
+            ));
+        }
+    } else if !matches!(area, "D" | "W") {
+        return Err(AddressError::new(
+            "WASM string tags need a D or W word area",
+        ));
+    }
+    Ok(words)
+}
+
+/// #914 C1: a string write's WIT `value::bytes` is the tag's text encoded in
+/// character order and 0x00-padded to exactly `2 × words` bytes. It uses the
+/// encoder of native SLMP and of the Hub's write gate, so unrepresentable
+/// characters and values longer than the span are refused (never truncated).
+/// That encoder packs each word low byte first, so `to_le_bytes` restores the
+/// character order; packing bytes into words is the guest's job.
+fn encoded_string(value: &api::Value, words: u16, encoding: StringEncoding) -> Option<Vec<u8>> {
+    let api::Value::Str(text) = value else {
+        return None;
+    };
+    let encoded = banto_plc_write::encode_string_value(text, words, encoding).ok()?;
+    let bytes: Vec<u8> = encoded.iter().flat_map(|word| word.to_le_bytes()).collect();
+    (bytes.len() == usize::from(words) * 2).then_some(bytes)
 }
 
 fn wit_settings(settings: &Settings) -> Vec<types::Setting> {
@@ -716,6 +766,38 @@ fn checked_value(kind: &TagKind, value: types::Value) -> Result<RawValue, FatalE
     }
 }
 
+/// #914 C1: a string tag's result is its raw word span in character order,
+/// exactly `2 × string-words` bytes, handed to the engine's `decode_value`
+/// unchanged (the path native SLMP strings take: cut at the first NUL, an
+/// invalid encoding is an item error). A wrong length, bytes for a non-string
+/// tag, or a non-bytes value for a string tag is that item's error, so the
+/// rest of the batch keeps its values. Numeric results keep [`checked_value`].
+fn checked_item(
+    kind: &TagKind,
+    value: types::Value,
+) -> Result<Result<RawValue, ItemError>, FatalError> {
+    match (kind, value) {
+        (TagKind::Str { words, .. }, types::Value::Bytes(bytes)) => {
+            let expected = usize::from(*words) * 2;
+            Ok(if bytes.len() == expected {
+                Ok(RawValue::Bytes(bytes))
+            } else {
+                Err(ItemError::Unsupported(format!(
+                    "WASM string result has {} bytes; the tag needs exactly {expected}",
+                    bytes.len()
+                )))
+            })
+        }
+        (TagKind::Str { .. }, _) => Ok(Err(ItemError::Unsupported(
+            "WASM result for a string tag must be bytes".into(),
+        ))),
+        (_, types::Value::Bytes(_)) => Ok(Err(ItemError::Unsupported(
+            "WASM returned bytes for a non-string tag".into(),
+        ))),
+        (kind, value) => checked_value(kind, value).map(Ok),
+    }
+}
+
 /// The controlled fixture has an independent host allowlist before the guest
 /// can produce any frame. The guest still checks the live R model and SD range.
 fn controlled_write_item(
@@ -793,6 +875,17 @@ fn operational_write_item(
             items.len()
         ])
     };
+    if items
+        .iter()
+        .any(|item| matches!(item.spec.kind, TagKind::Str { .. }))
+    {
+        return operational_string_item(items, driver_id, policy).map_err(|reason| {
+            WriteProgress::Done(vec![
+                Err(ItemError::Unsupported(reason.into()));
+                items.len()
+            ])
+        });
+    }
     let Some((area, start)) = items.first().and_then(|item| {
         Some((
             WriteArea::from_name(&item.spec.address.area)?,
@@ -901,6 +994,54 @@ fn operational_write_item(
         return Err(refused());
     }
     Ok(checked)
+}
+
+/// #914 C1: a request holding a string tag must be exactly that one D/W
+/// string. Its whole word span `[start, start + words - 1]` must lie inside one
+/// word interval (D3000/D3001 stay protected), and the value is sent as the
+/// encoded, 0x00-padded span ([`encoded_string`]) in one request.
+fn operational_string_item(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+    policy: &WritePolicy,
+) -> Result<Vec<write::WriteItem>, &'static str> {
+    const OUTSIDE: &str = "SLMP write is disabled or outside the connection allowlist";
+    let [item] = items else {
+        return Err("a string tag must be written alone");
+    };
+    let address = &item.spec.address;
+    let TagKind::Str { words, encoding } = item.spec.kind else {
+        return Err(OUTSIDE);
+    };
+    let area = WriteArea::from_name(&address.area)
+        .filter(|area| matches!(area, WriteArea::D | WriteArea::W))
+        .ok_or("only D/W word spans can be written as a string")?;
+    let start = address
+        .index
+        .and_then(|index| u32::try_from(index).ok())
+        .ok_or(OUTSIDE)?;
+    if words == 0
+        || address.driver != *driver_id
+        || address.canonical != area.canonical(start)
+        || address.bit.is_some()
+        || address.word_count != words
+        || !address.writable_area
+    {
+        return Err(OUTSIDE);
+    }
+    if !policy.allows_device_span(area, start, usize::from(words)) {
+        return Err(OUTSIDE);
+    }
+    let bytes = encoded_string(&item.value, words, encoding)
+        .ok_or("string value does not fit the tag's words or encoding")?;
+    Ok(vec![write::WriteItem {
+        spec: write_types::TagSpec {
+            address: address.canonical.clone(),
+            data_type: "string".into(),
+            string_words: Some(u32::from(words)),
+        },
+        value: write_types::Value::Bytes(bytes),
+    }])
 }
 
 /// A request naming a word bit (`D100.5`, `W1A.0`) must consist only of
@@ -1418,29 +1559,37 @@ impl FrameConnection for WasmConnection {
                 )
             })?
             .map_err(api_fatal)?;
-        if decoded.len() != planned.covers.len() {
-            return Err(FatalError::Protocol(
-                "WASM returned a different number of results than planned".into(),
-            ));
-        }
-        decoded
-            .into_iter()
-            .enumerate()
-            .map(|(index, result)| match result {
-                Ok(value) => {
-                    let spec = planned
-                        .covers
-                        .get(index)
-                        .and_then(|n| specs.get(*n as usize))
-                        .ok_or_else(|| {
-                            FatalError::Protocol("WASM returned a result outside covers".into())
-                        })?;
-                    checked_value(&spec.kind, value).map(Ok)
-                }
-                Err(e) => Ok(Err(api_read_item_error(e))),
-            })
-            .collect()
+        checked_results(&planned.covers, specs, decoded)
     }
+}
+
+/// Map one decoded step's results back to the specs it covers.
+fn checked_results(
+    covers: &[u32],
+    specs: &[TagSpec],
+    decoded: Vec<Result<types::Value, types::ItemError>>,
+) -> Result<Vec<Result<RawValue, ItemError>>, FatalError> {
+    if decoded.len() != covers.len() {
+        return Err(FatalError::Protocol(
+            "WASM returned a different number of results than planned".into(),
+        ));
+    }
+    decoded
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| match result {
+            Ok(value) => {
+                let spec = covers
+                    .get(index)
+                    .and_then(|n| specs.get(*n as usize))
+                    .ok_or_else(|| {
+                        FatalError::Protocol("WASM returned a result outside covers".into())
+                    })?;
+                checked_item(&spec.kind, value)
+            }
+            Err(e) => Ok(Err(api_read_item_error(e))),
+        })
+        .collect()
 }
 
 impl Drop for WasmConnection {
@@ -2279,7 +2428,336 @@ mod tests {
         assert!(validate_supported_kinds(&[u16_kind, u16_kind]).is_err());
         assert!(validate_supported_kinds(&[u16_kind, bit_kind, bit_kind]).is_err());
         assert!(validate_supported_kinds(&[bit_kind]).is_err());
-        assert!(validate_supported_kinds(&[u16_kind, KindName::String]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, KindName::String]).is_ok());
+        assert!(validate_supported_kinds(&[KindName::String]).is_err());
+        assert!(validate_supported_kinds(&[u16_kind, KindName::String, KindName::String]).is_err());
+    }
+
+    fn string_kind(words: u16, encoding: StringEncoding) -> TagKind {
+        TagKind::string(words, encoding)
+    }
+
+    #[test]
+    fn string_results_need_exact_bytes_and_are_item_errors_otherwise() {
+        let kind = string_kind(4, StringEncoding::Utf8);
+        assert_eq!(
+            checked_item(&kind, types::Value::Bytes(b"ABC\0\0\0\0\0".to_vec())).unwrap(),
+            Ok(RawValue::Bytes(b"ABC\0\0\0\0\0".to_vec()))
+        );
+        for length in [0, 7, 9, 256] {
+            assert!(matches!(
+                checked_item(&kind, types::Value::Bytes(vec![0x41; length])),
+                Ok(Err(ItemError::Unsupported(_)))
+            ));
+        }
+        for wrong in [
+            types::Value::Uint(1),
+            types::Value::Int(1),
+            types::Value::Float(1.0),
+            types::Value::Bool(true),
+        ] {
+            assert!(matches!(
+                checked_item(&kind, wrong),
+                Ok(Err(ItemError::Unsupported(_)))
+            ));
+        }
+        for numeric in [DataType::U16, DataType::Bit, DataType::F64] {
+            assert!(matches!(
+                checked_item(&TagKind::numeric(numeric), types::Value::Bytes(vec![0; 2])),
+                Ok(Err(ItemError::Unsupported(_)))
+            ));
+        }
+        // Numeric results keep the existing batch-fatal range checks.
+        let u16_kind = TagKind::numeric(DataType::U16);
+        assert_eq!(
+            checked_item(&u16_kind, types::Value::Uint(7)).unwrap(),
+            Ok(RawValue::Uint(7))
+        );
+        assert!(checked_item(&u16_kind, types::Value::Uint(65536)).is_err());
+    }
+
+    #[test]
+    fn one_bad_string_result_keeps_the_rest_of_the_batch() {
+        let id = DriverId::new("slmp-read-wasm").unwrap();
+        let specs = [
+            TagSpec::new(
+                DriverAddress::new(id.clone(), "D100", "D", true, 2).with_index(100),
+                string_kind(2, StringEncoding::Utf8),
+            ),
+            TagSpec::new(
+                DriverAddress::new(id.clone(), "D102", "D", true, 1).with_index(102),
+                TagKind::numeric(DataType::U16),
+            ),
+            TagSpec::new(
+                DriverAddress::new(id, "D103", "D", true, 2).with_index(103),
+                string_kind(2, StringEncoding::Utf8),
+            ),
+        ];
+        let results = checked_results(
+            &[0, 1, 2],
+            &specs,
+            vec![
+                Ok(types::Value::Bytes(vec![0x41; 3])),
+                Ok(types::Value::Uint(7)),
+                Ok(types::Value::Bytes(b"OK\0\0".to_vec())),
+            ],
+        )
+        .unwrap();
+        assert!(matches!(results[0], Err(ItemError::Unsupported(_))));
+        assert_eq!(results[1], Ok(RawValue::Uint(7)));
+        assert_eq!(results[2], Ok(RawValue::Bytes(b"OK\0\0".to_vec())));
+    }
+
+    #[test]
+    fn string_bytes_take_the_engines_shared_decoding() {
+        use banto_driver_engine::decode::decode_value;
+        let utf8 = string_kind(4, StringEncoding::Utf8);
+        let raw = checked_item(&utf8, types::Value::Bytes(b"AB\0CD\0\0\0".to_vec()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_value(&utf8, raw), Ok(api::Value::Str("AB".into())));
+        let sjis = string_kind(4, StringEncoding::ShiftJis);
+        let raw = checked_item(
+            &sjis,
+            types::Value::Bytes(vec![0x83, 0x65, 0x83, 0x58, 0x83, 0x67, 0, 0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            decode_value(&sjis, raw),
+            Ok(api::Value::Str("テスト".into()))
+        );
+        let raw = checked_item(
+            &utf8,
+            types::Value::Bytes(vec![0xFF, 0x41, 0, 0, 0, 0, 0, 0]),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            decode_value(&utf8, raw),
+            Err(ItemError::Unsupported(_))
+        ));
+    }
+
+    fn string_parsed(area: &str, words: u32) -> address::Parsed {
+        address::Parsed {
+            canonical: if area == "D" {
+                "D100".into()
+            } else {
+                "400001".into()
+            },
+            area: area.into(),
+            writable_area: true,
+            bit: None,
+            word_count: words,
+            index: Some(100),
+        }
+    }
+
+    #[test]
+    fn string_addresses_are_word_areas_with_the_exact_span() {
+        let slmp = DriverId::new("slmp-read-wasm").unwrap();
+        let modbus = DriverId::new("modbus-fc3-wasm").unwrap();
+        let kind = |words| string_kind(words, StringEncoding::Utf8);
+        let accepted = checked_parsed_address(&slmp, &kind(4), string_parsed("D", 4)).unwrap();
+        assert_eq!(accepted.word_count, 4);
+        assert!(checked_parsed_address(&slmp, &kind(128), string_parsed("W", 128)).is_ok());
+        assert!(checked_parsed_address(&slmp, &kind(4), string_parsed("D", 3)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(4), string_parsed("M", 4)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(4), string_parsed("ZR", 4)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(0), string_parsed("D", 0)).is_err());
+        assert!(checked_parsed_address(&slmp, &kind(129), string_parsed("D", 129)).is_err());
+        let mut bit = string_parsed("D", 4);
+        bit.bit = Some(0);
+        assert!(checked_parsed_address(&slmp, &kind(4), bit).is_err());
+        let mut overflow = string_parsed("D", 4);
+        overflow.index = Some(u64::MAX - 2);
+        assert!(checked_parsed_address(&slmp, &kind(4), overflow).is_err());
+
+        for area in ["holding_register", "input_register"] {
+            assert!(checked_parsed_address(&modbus, &kind(123), string_parsed(area, 123)).is_ok());
+            let refused =
+                checked_parsed_address(&modbus, &kind(124), string_parsed(area, 124)).unwrap_err();
+            assert!(refused.to_string().contains("123 words"), "{refused}");
+        }
+        assert!(checked_parsed_address(&modbus, &kind(1), string_parsed("coil", 1)).is_err());
+        assert!(checked_parsed_address(&modbus, &kind(4), string_parsed("D", 4)).is_err());
+    }
+
+    fn string_item(
+        area: &str,
+        index: u64,
+        words: u16,
+        encoding: StringEncoding,
+        value: &str,
+    ) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let canonical = if area == "W" {
+            format!("W{index:X}")
+        } else {
+            format!("{area}{index}")
+        };
+        let address = DriverAddress::new(id, canonical, area, true, words).with_index(index);
+        WriteItem::new(
+            TagSpec::new(address, string_kind(words, encoding)),
+            api::Value::Str(value.into()),
+        )
+    }
+
+    fn refusal(result: Result<Vec<write::WriteItem>, WriteProgress>, count: usize) -> String {
+        let Err(WriteProgress::Done(results)) = result else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(results.len(), count);
+        match &results[0] {
+            Err(ItemError::Unsupported(text)) => text.clone(),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn operational_string_write_is_one_whole_span_inside_one_interval() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let policy = WritePolicy::parse(
+            &Settings::from_pairs([
+                (MODE_KEY, "enabled"),
+                (ALLOWLIST_KEY, "D2990-D2999,D3010-D3019,W1A-W1F"),
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+        let utf8 = StringEncoding::Utf8;
+        let accepted =
+            operational_write_item(&[string_item("D", 3010, 4, utf8, "ABC")], &id, &policy)
+                .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].spec.address, "D3010");
+        assert_eq!(accepted[0].spec.data_type, "string");
+        assert_eq!(accepted[0].spec.string_words, Some(4));
+        assert!(matches!(&accepted[0].value,
+            write_types::Value::Bytes(bytes) if bytes == b"ABC\0\0\0\0\0"));
+        let sjis = operational_write_item(
+            &[string_item(
+                "W",
+                0x1A,
+                4,
+                StringEncoding::ShiftJis,
+                "テスト",
+            )],
+            &id,
+            &policy,
+        )
+        .unwrap();
+        assert!(matches!(&sjis[0].value,
+            write_types::Value::Bytes(bytes) if bytes == &[0x83, 0x65, 0x83, 0x58, 0x83, 0x67, 0, 0]));
+        // Exactly the interval, and exactly the capacity, unpadded.
+        let full = operational_write_item(
+            &[string_item("D", 3010, 10, utf8, "ABCDEFGHIJKLMNOPQRST")],
+            &id,
+            &policy,
+        )
+        .unwrap();
+        assert!(matches!(&full[0].value,
+            write_types::Value::Bytes(bytes) if bytes == b"ABCDEFGHIJKLMNOPQRST"));
+
+        let outside = "SLMP write is disabled or outside the connection allowlist";
+        for item in [
+            string_item("D", 3012, 10, utf8, "A"), // straddles D3019
+            string_item("D", 100, 1, utf8, "A"),
+            string_item("W", 0x1E, 4, utf8, "A"),
+            // D2998..D3001 would reach the protected D3000/D3001.
+            string_item("D", 2998, 4, utf8, "A"),
+        ] {
+            assert_eq!(
+                refusal(operational_write_item(&[item], &id, &policy), 1),
+                outside
+            );
+        }
+        let too_long = "string value does not fit the tag's words or encoding";
+        assert_eq!(
+            refusal(
+                operational_write_item(
+                    &[string_item("D", 3010, 4, utf8, "ABCDEFGHI")],
+                    &id,
+                    &policy
+                ),
+                1
+            ),
+            too_long
+        );
+        assert_eq!(
+            refusal(
+                operational_write_item(
+                    &[string_item("D", 3010, 4, StringEncoding::ShiftJis, "🚀")],
+                    &id,
+                    &policy
+                ),
+                1
+            ),
+            too_long
+        );
+        let mut numeric_value = string_item("D", 3010, 4, utf8, "A");
+        numeric_value.value = api::Value::F64(1.0);
+        assert_eq!(
+            refusal(operational_write_item(&[numeric_value], &id, &policy), 1),
+            too_long
+        );
+
+        let alone = "a string tag must be written alone";
+        let mixed = [
+            string_item("D", 3010, 4, utf8, "A"),
+            typed_item(WriteArea::D, 3014, DataType::U16, api::Value::F64(1.0)),
+        ];
+        assert_eq!(
+            refusal(operational_write_item(&mixed, &id, &policy), 2),
+            alone
+        );
+        let mixed = [
+            typed_item(WriteArea::D, 3014, DataType::U16, api::Value::F64(1.0)),
+            string_item("D", 3015, 4, utf8, "A"),
+        ];
+        assert_eq!(
+            refusal(operational_write_item(&mixed, &id, &policy), 2),
+            alone
+        );
+        let two = [
+            string_item("D", 3010, 2, utf8, "A"),
+            string_item("D", 3012, 2, utf8, "B"),
+        ];
+        assert_eq!(
+            refusal(operational_write_item(&two, &id, &policy), 2),
+            alone
+        );
+
+        let mut bad = string_item("D", 3010, 4, utf8, "A");
+        bad.spec.address.word_count = 3;
+        assert_eq!(
+            refusal(operational_write_item(&[bad], &id, &policy), 1),
+            outside
+        );
+        let mut bad = string_item("D", 3010, 4, utf8, "A");
+        bad.spec.address.writable_area = false;
+        assert_eq!(
+            refusal(operational_write_item(&[bad], &id, &policy), 1),
+            outside
+        );
+        let mut bad = string_item("D", 3010, 4, utf8, "A");
+        bad.spec.address.driver = DriverId::new("other").unwrap();
+        assert_eq!(
+            refusal(operational_write_item(&[bad], &id, &policy), 1),
+            outside
+        );
+        assert!(
+            operational_write_item(&[string_item("M", 10, 1, utf8, "A")], &id, &policy).is_err()
+        );
+        let disabled = WritePolicy::parse(&Settings::new()).unwrap();
+        assert_eq!(
+            refusal(
+                operational_write_item(&[string_item("D", 3010, 4, utf8, "A")], &id, &disabled),
+                1
+            ),
+            outside
+        );
     }
 
     fn parsed() -> address::Parsed {

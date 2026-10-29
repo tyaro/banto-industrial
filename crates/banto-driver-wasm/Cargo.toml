@@ -13,6 +13,10 @@ controlled-live-write-fixture = ["controlled-write-fixture"]
 
 [dependencies]
 banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
+# String writes (#914 C1) use the same encoder as native SLMP and the Hub's
+# write gate (`encode_string_value`: unrepresentable characters and values
+# longer than the span are refused, the rest of the span is 0x00-padded).
+banto-plc-write = { path = "../banto-plc-write" }
 semver = "1"
 serde_json = "1"
 wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std"] }
