@@ -5,6 +5,7 @@
 	import { notifyLogoutOutcome } from '#lib/banto/logoutNotice.js';
 	import { pageTitle, resolveAppPath } from '#lib/navigation.js';
 	import { settings } from '#lib/settings.svelte.js';
+	import { NAV_TOGGLE_ATTR, SIDEBAR_ID, toggleSidebarWithFocus } from '#lib/sidebarToggle.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { commandPaletteStore } from '#lib/commandPalette.svelte.js';
 
@@ -18,14 +19,24 @@
 </script>
 
 <header>
-	<button
-		type="button"
-		class="icon-button"
-		onclick={() => settings.toggleSidebar()}
-		aria-label="サイドバーの切り替え"
-	>
-		☰
-	</button>
+	<!--
+		banto-hub の #714 と同じ: ヘッダーの ☰ は「サイドバーが見えていないとき（折り畳み中）」
+		だけ出す。開いている間は `Sidebar.svelte` のロゴ行に折り畳みボタンがあり、
+		トグルを 2 つ同時に出さない。
+	-->
+	{#if settings.sidebarCollapsed}
+		<button
+			type="button"
+			class="icon-button"
+			onclick={() => toggleSidebarWithFocus()}
+			aria-label="サイドバーを開く"
+			aria-expanded={false}
+			aria-controls={SIDEBAR_ID}
+			{...{ [NAV_TOGGLE_ATTR]: '' }}
+		>
+			☰
+		</button>
+	{/if}
 
 	<h1>{pageTitle(page.url.pathname)}</h1>
 

@@ -35,6 +35,7 @@
 		type GridColumn,
 		type SortState
 	} from '@banto/grid-svelte';
+	import { formatSqliteUtc } from '#lib/banto/sqliteTime.js';
 	import { auditSpoolNotice } from '#lib/banto/auditSpoolWarning.js';
 	import {
 		AUDIT_SNAPSHOT_EXPIRED_MESSAGE,
@@ -85,7 +86,14 @@
 	}
 
 	const columns: GridColumn<AuditLogEntry>[] = [
-		{ id: 'ts', header: '時刻', accessor: 'ts', width: 175 },
+		{
+			id: 'ts',
+			header: '時刻',
+			accessor: 'ts',
+			width: 175,
+			// #712 と同じ: サーバーの `ts` は UTC（SQLite 形式）なのでローカル時刻で見せる。
+			format: (value) => formatSqliteUtc(String(value))
+		},
 		{
 			id: 'actorUsername',
 			header: 'ユーザー',
@@ -328,7 +336,7 @@
 				<h3>詳細（ID: {selected.id}）</h3>
 				<dl>
 					<dt>時刻</dt>
-					<dd>{selected.ts}</dd>
+					<dd>{formatSqliteUtc(selected.ts)}</dd>
 					<dt>ユーザー</dt>
 					<dd>{selected.actorUsername ?? '-'}</dd>
 					<dt>ロール</dt>

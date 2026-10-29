@@ -215,7 +215,7 @@
 		<button
 			type="button"
 			class="nav-backdrop"
-			onclick={() => mobileNavStore.closeNav()}
+			onclick={() => mobileNavStore.closeNavFromBackdrop()}
 			aria-label="背景をクリックしてメニューを閉じる"
 		></button>
 	{/if}

@@ -2,6 +2,7 @@
 	import { page } from '$app/state';
 	import { navItems, publicNavItems, resolveAppPath, type NavItem } from '#lib/navigation.js';
 	import { settings } from '#lib/settings.svelte.js';
+	import { NAV_TOGGLE_ATTR, SIDEBAR_ID, toggleSidebarWithFocus } from '#lib/sidebarToggle.js';
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
 
@@ -30,11 +31,23 @@
 	);
 </script>
 
-<aside class:collapsed={settings.sidebarCollapsed}>
+<aside id={SIDEBAR_ID} class:collapsed={settings.sidebarCollapsed}>
 	<div class="brand">
 		<span class="brand-icon">🏮</span>
 		{#if !settings.sidebarCollapsed}
 			<span class="brand-name">ChronoGazer</span>
+			<!-- banto-hub #714: 開いている間の折り畳みボタン（ロゴ行）。折り畳み中はヘッダーの ☰ が開く。 -->
+			<button
+				type="button"
+				class="collapse-toggle"
+				onclick={() => toggleSidebarWithFocus()}
+				aria-label="サイドバーを折りたたむ"
+				aria-expanded={true}
+				aria-controls={SIDEBAR_ID}
+				{...{ [NAV_TOGGLE_ATTR]: '' }}
+			>
+				☰
+			</button>
 		{/if}
 	</div>
 
@@ -80,6 +93,24 @@
 		padding: 0 0.9rem;
 		border-bottom: 1px solid var(--banto-border);
 		font-weight: 700;
+	}
+
+	/* banto-hub #714: ロゴ行の右端に寄せる折り畳みボタン（Header の .icon-button と同じ見た目）。 */
+	.collapse-toggle {
+		margin-left: auto;
+		border: none;
+		background: none;
+		color: var(--banto-text-muted);
+		padding: 0.35rem 0.5rem;
+		border-radius: var(--banto-radius);
+		cursor: pointer;
+		font-size: 0.875rem;
+		font-weight: 400;
+	}
+
+	.collapse-toggle:hover {
+		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		color: var(--banto-text);
 	}
 
 	nav {
