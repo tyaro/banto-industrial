@@ -73,8 +73,8 @@
 //! 変われば試験の観測も変わる（#947 のレビュー）。
 //!
 //! 導かれた Stale を Good とみなすと、`push` のグループが `a` を更新しなくなっても 7c の
-//! `hold` は通ってしまう。そこで 7c では、`hold` の終わり（余裕 1,000 ms）までに `a` の値の
-//! 時刻（`ptime_ms`）が `hold` の開始時より進むことも確かめる（#947 のレビュー）。
+//! `hold` は通ってしまう。そこで 7c では、`hold` の終わりの値の時刻（`ptime_ms`）を基準に、
+//! その後 1,500 ms までに `a` の時刻が進むことも確かめる（#947 のレビュー）。
 //! 試験の周期や並べ方は緩めない。
 //!
 //! ## 反証（§10.4・checklist §5、PR に書く）
@@ -1571,7 +1571,6 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         json!("not_in_bridge_set"),
         "{body:?}"
     );
-    let a_ptime_before = fixture.bridge_ptime_ms("a");
     fixture
         .hold(
             Duration::from_millis(1_500),
@@ -1582,17 +1581,19 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         )
         .await;
     // 導かれた Stale を Good とみなすので、残したキーの更新が止まっても上の `hold` は通る。
-    // `push` のグループ（200 ms）が `a` を読み続けて値の時刻が進むことを別に確かめる
-    // （#947 のレビュー）。1 コア固定で測った tick の最大の遅れ（1,160 ms、#946）は
-    // 1,500 ms の `hold` に収まるが、余裕として `hold` の後に 1,000 ms まで待つ。更新が
-    // 止まっていれば、どれだけ待っても進まない。
-    let advanced = wait_until(Duration::from_millis(1_000), || async {
-        fixture.bridge_ptime_ms("a") > a_ptime_before
+    // `push` のグループ（200 ms）が `a` を読み続けていることを別に確かめる（#947 のレビュー）。
+    // 基準は `hold` の終わりの値の時刻にする。開始前の値と比べると、開始直後に 1 回だけ
+    // 更新して止まった場合も合格してしまう。止まっていれば、終わりのあとも進まない。
+    // 1 コア固定で測った tick の最大の遅れ（1,160 ms、#946）を踏まえ、1,500 ms まで待つ。
+    let a_ptime_at_hold_end = fixture.bridge_ptime_ms("a");
+    let advanced = wait_until(Duration::from_millis(1_500), || async {
+        fixture.bridge_ptime_ms("a") > a_ptime_at_hold_end
     })
     .await;
     assert!(
         advanced,
-        "the kept key `a` is still updated (ptime_ms before the hold {a_ptime_before}): {:?}",
+        "the kept key `a` is still updated after the hold (ptime_ms at the hold end {a_ptime_at_hold_end}, after waiting {}): {:?}",
+        fixture.bridge_ptime_ms("a"),
         fixture.pairs_aged()
     );
     fixture.finish().await;
