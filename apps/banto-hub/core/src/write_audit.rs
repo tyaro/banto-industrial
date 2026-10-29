@@ -66,6 +66,10 @@
 //!   写しを取り、lock を放してから 1 つのトランザクションで書く。新しい窓は INSERT
 //!   (`ts` は窓の最初の拒否の時刻)、行のある窓は `detail` を UPDATE(0 行なら INSERT
 //!   し直す)。1 周期は [`REJECTION_WRITE_MAX_PAIRS`](256)組まで、残りは次の周期へ。
+//!   書き終えていない組が 256 を超えるときは、まだ一度も書いていない組から先に、
+//!   次に最後に書いたのが古い組の順に選ぶ(窓が明けた組も同じ並び)ので、どの組も
+//!   「組の数 ÷ 256」周期のうちに順に書かれる。落ちたときに失う件数は、最大でおよそ
+//!   「組の数 ÷ 256 × 周期」ぶん。
 //!   DB の操作は「書き終えていない組の数 ÷ 周期」で頭打ちになり、要求の頻度とは
 //!   切り離される(同じ組を 1 万回足しても、1 周期の UPDATE は 1 回)。失敗したら
 //!   表を変えずに次の周期で書き直す(件数を失わない。ログは失敗が続く間の最初の
@@ -391,6 +395,9 @@ struct PairWindow {
     written: u64,
     /// 挿入した行の id(まだ挿入していなければ `None`)。
     row_id: Option<i64>,
+    /// 最後に書けた周期の通し番号(まだ一度も書いていなければ `None`)。書く組が上限を
+    /// 超えるとき、`None` から先に、古い順に選ぶのに使う。
+    last_written: Option<u64>,
     key_name: Arc<str>,
     key_prefix: Arc<str>,
     tag_id: i64,
@@ -425,6 +432,8 @@ struct RejectionTable {
     /// 表に入らなかった件数(あふれの行に書く)。
     overflow: u64,
     next_generation: u64,
+    /// 書き手の周期の通し番号(`take_jobs` のたびに進む)。
+    cycle: u64,
 }
 
 /// 要求の経路で、呼び出しごとに 1 回だけ作るキー名とプレフィックス。
@@ -519,6 +528,7 @@ impl RejectionTable {
                 count: n,
                 written: 0,
                 row_id: None,
+                last_written: None,
                 key_name,
                 key_prefix,
                 tag_id,
@@ -604,24 +614,38 @@ impl RejectionTable {
         self.overflow = self.overflow.saturating_add(n);
     }
 
-    /// 書き手のための写し(置き場の組から先に、上限 `max` 組まで)。lock の中で呼ぶ。
-    fn take_jobs(&self, max: usize) -> (Vec<WriteJob>, u64) {
-        let closed = self
+    /// 書き手のための写し(上限 `max` 組まで)。lock の中で呼ぶ。書き終えていない組が
+    /// `max` を超えるときは、まだ一度も書いていない組から先に、次に最後に書いたのが
+    /// 古い順に選ぶ(周期をまたいで公平に回し、同じ組が待っている組を押しのけ続けない)。
+    /// 窓が明けた置き場の組も同じ並びに入れる(優先しない。置き場は
+    /// `REJECTION_TABLE_MAX_CLOSED` で頭打ちなので、回ってくるのが遅れても溜まらない)。
+    fn take_jobs(&mut self, max: usize) -> (Vec<WriteJob>, u64) {
+        self.cycle += 1;
+        let mut cands: Vec<(Option<u64>, &PairKey, &PairWindow)> = self
             .closed
             .iter()
+            .map(|(k, w)| (k, w))
+            .chain(self.open.iter())
             .filter(|(_, w)| w.dirty())
-            .map(|(k, w)| WriteJob::of(k, w));
-        let open = self
-            .open
-            .iter()
-            .filter(|(_, w)| w.dirty())
-            .map(|(k, w)| WriteJob::of(k, w));
-        (closed.chain(open).take(max).collect(), self.overflow)
+            .map(|(k, w)| (w.last_written, k, w))
+            .collect();
+        if cands.len() > max {
+            if max > 0 {
+                cands.select_nth_unstable_by_key(max - 1, |c| c.0);
+            }
+            cands.truncate(max);
+        }
+        let jobs = cands
+            .into_iter()
+            .map(|(_, k, w)| WriteJob::of(k, w))
+            .collect();
+        (jobs, self.overflow)
     }
 
     /// 書けた結果を戻す(`row_id` と書いた件数)。窓が明けて置き場へ移っていても
     /// 通し番号で見つける。
     fn apply(&mut self, done: &[(WriteJob, i64)], overflow_written: u64) {
+        let cycle = self.cycle;
         for (job, row_id) in done {
             let w = match self.open.get_mut(&job.key) {
                 Some(w) if w.generation == job.generation => Some(w),
@@ -634,6 +658,7 @@ impl RejectionTable {
             if let Some(w) = w {
                 w.row_id = Some(*row_id);
                 w.written = job.count;
+                w.last_written = Some(cycle);
             }
         }
         self.overflow = self.overflow.saturating_sub(overflow_written);
@@ -1623,6 +1648,29 @@ mod rejection_tests {
         assert_eq!(second.inserted, 300 - REJECTION_WRITE_MAX_PAIRS);
         assert_eq!(second.remaining, 0);
         assert_eq!(rows(&svc).await.len(), 300);
+    }
+
+    #[tokio::test]
+    async fn pairs_beyond_the_cap_are_written_in_turn_even_when_all_keep_rejecting() {
+        let svc = service().await;
+        let keys: Vec<RejectingKey<'static>> = (0..300)
+            .map(|k| RejectingKey {
+                id: 100 + k,
+                name: "k",
+                prefix: "p",
+            })
+            .collect();
+        let mut written = std::collections::HashSet::new();
+        for _ in 0..2 {
+            for key in &keys {
+                svc.record_rejection(*key, 0, "x", WriteRejectionReason::NotFound);
+            }
+            svc.write_pending().await.unwrap();
+            for row in rows(&svc).await {
+                written.insert(row.api_key_id);
+            }
+        }
+        assert_eq!(written.len(), 300);
     }
 
     #[tokio::test]
