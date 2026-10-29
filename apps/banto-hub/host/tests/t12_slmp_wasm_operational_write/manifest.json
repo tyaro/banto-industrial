@@ -6,6 +6,6 @@
   "writeApi": "1",
   "settingsVersion": 1,
   "displayName": "Isolated SLMP operational write mock (WASM)",
-  "transports": ["tcp"],
+  "transports": ["tcp", "udp"],
   "capabilities": ["read", "write"]
 }

@@ -26,6 +26,10 @@ struct Fixture {
     /// FC15 / FC6 answer (#915), opt-in: [MULTI_UNSUPPORTED] (the default,
     /// exception code 1 as before), [MULTI_ECHO] or [MULTI_EXCEPTION].
     fc15_fc6: Arc<AtomicU8>,
+    /// Holding registers from [STRING_BASE] on (#914 C1 string tests only):
+    /// FC16 there stores its data, FC3 there reads 1-123 stored words (0 if
+    /// never written). Lower offsets keep the answers above.
+    strings: Arc<Mutex<std::collections::BTreeMap<u16, u16>>>,
 }
 
 const FC22_ECHO: u8 = 0;
@@ -41,6 +45,9 @@ const MULTI_ECHO: u8 = 1;
 /// Exception code 2 (illegal data address).
 const MULTI_EXCEPTION: u8 = 2;
 
+/// First holding register offset (400101) of the string memory.
+const STRING_BASE: u16 = 100;
+
 impl Fixture {
     async fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -53,11 +60,13 @@ impl Fixture {
         let accepted = Arc::new(AtomicUsize::new(0));
         let fc22 = Arc::new(AtomicU8::new(FC22_ECHO));
         let fc15_fc6 = Arc::new(AtomicU8::new(MULTI_UNSUPPORTED));
-        let (all_requests, accept_count, fc22_mode, multi_mode) = (
+        let strings = Arc::new(Mutex::new(std::collections::BTreeMap::<u16, u16>::new()));
+        let (all_requests, accept_count, fc22_mode, multi_mode, string_memory) = (
             requests.clone(),
             accepted.clone(),
             fc22.clone(),
             fc15_fc6.clone(),
+            strings.clone(),
         );
         let task = tokio::spawn(async move {
             loop {
@@ -68,6 +77,7 @@ impl Fixture {
                 let requests = all_requests.clone();
                 let fc22_mode = fc22_mode.clone();
                 let multi_mode = multi_mode.clone();
+                let string_memory = string_memory.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut mbap = [0u8; 6];
@@ -101,6 +111,16 @@ impl Fixture {
                             .push((connection, payload[1..].to_vec()));
                         let pdu = match function {
                             1 | 2 if count == 1 => vec![function, 1, u8::from(function == 2)],
+                            3 if start >= STRING_BASE && (1..=123).contains(&count) => {
+                                let memory = string_memory.lock().unwrap();
+                                let mut pdu = vec![function, (count * 2) as u8];
+                                for offset in start..start + count {
+                                    pdu.extend_from_slice(
+                                        &memory.get(&offset).copied().unwrap_or(0).to_be_bytes(),
+                                    );
+                                }
+                                pdu
+                            }
                             3 | 4 if (1..=4).contains(&count) => {
                                 let mut pdu = vec![function, (count * 2) as u8];
                                 for offset in start..start + count {
@@ -119,6 +139,14 @@ impl Fixture {
                             }
                             5 if payload.len() == 6 => payload[1..].to_vec(),
                             16 if payload.len() >= 7 && (1..=123).contains(&count) => {
+                                if start >= STRING_BASE {
+                                    let mut memory = string_memory.lock().unwrap();
+                                    for (offset, word) in
+                                        (start..).zip(payload[7..].as_chunks::<2>().0)
+                                    {
+                                        memory.insert(offset, u16::from_be_bytes(*word));
+                                    }
+                                }
                                 payload[1..6].to_vec()
                             }
                             22 if payload.len() == 8 => match fc22_mode.load(Ordering::SeqCst) {
@@ -169,6 +197,7 @@ impl Fixture {
             accepted,
             fc22,
             fc15_fc6,
+            strings,
         }
     }
 
@@ -1395,6 +1424,124 @@ async fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send(
         first_connection,
         "an exception keeps the connection"
     );
+    assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
+    app.write_control.disable();
+}
+
+/// #914 / guest #63 (C1) through the real Hub path: a saved holding register
+/// string tag written over REST by an API key passes the Hub gate, the host
+/// allowlist and the guest, reaches the device as one FC16 over the whole
+/// span with the encoded, 0x00-padded text high byte first per register, is
+/// audited `ok`, and reads back over read-now. A span leaving the host
+/// interval and text longer than the span are refused before send and
+/// audited `failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the pinned Modbus WASM package files"]
+async fn holding_string_tag_rest_write_is_one_fc16_audited_and_read_back() {
+    let fixture = Fixture::start().await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-modbus-string",
+        &manifest(),
+        &component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "str-line".into(),
+            protocol: "modbus-fc3-wasm".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1", "port": fixture.port, "unit_id": 1,
+                "probe_address": "30001",
+                "write_mode": "enabled", "write_allowlist": "400101-400200",
+                "modbus_operational_write_mode": "enabled",
+                "modbus_operational_write_allowlist": "400101-400112"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .expect("save guest and host policy");
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("line", saved.id, 60_000))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (tag, address, words) in [("s40101", "40101", 4), ("s40111", "40111", 4)] {
+        let mut input = super::tag_input(tag, group.id, address, "string");
+        input.string_length = Some(words);
+        input.writable = true;
+        ids.push(app.manager.tags().create(input).await.unwrap().id);
+    }
+    app.manager.rebuild().await.unwrap();
+    wait_connected(&app, saved.id).await;
+    app.write_control.enable();
+    let (keys, key_id, key) = write_key(
+        &app,
+        "string-writer",
+        &["str-line.line.s40101", "str-line.line.s40111"],
+    )
+    .await;
+
+    let results = post_batch(
+        &app,
+        &key,
+        &[("str-line.line.s40101", serde_json::json!("ABC"))],
+    )
+    .await;
+    assert_eq!(results[0]["ok"], true, "{results:?}");
+    let writes = fixture.writes();
+    assert_eq!(writes.len(), 1, "{writes:?}");
+    assert_eq!(
+        writes[0].1,
+        [&[16, 0, 100, 0, 4, 8][..], b"ABC\0\0\0\0\0"].concat(),
+        "one FC16 over the whole span"
+    );
+    assert_eq!(
+        fixture.strings.lock().unwrap().get(&100),
+        Some(&0x4142),
+        "high byte first"
+    );
+    let rows = audit_rows(&app, ids[0]).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0]["result"], "ok", "{rows:?}");
+    assert_eq!(rows[0]["apiKeyId"].as_i64(), Some(key_id), "{rows:?}");
+
+    let (status, body) = super::admin_get(
+        &app.router,
+        "/api/v1/values/str-line.line.s40101/read-now",
+        &app.admin_token,
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    assert_eq!(body["v"], "ABC", "{body:?}");
+    assert_eq!(body["q"], "good", "{body:?}");
+    assert!(
+        fixture.frames().contains(&(3, 100, 4)),
+        "one FC3 over the span: {:?}",
+        fixture.frames()
+    );
+
+    // 400111-400114 leaves the host interval 400101-400112 (the guest alone
+    // would allow it); nine bytes do not fit four registers.
+    for (tag, value, at) in [
+        ("str-line.line.s40111", "AB", 1),
+        ("str-line.line.s40101", "ABCDEFGHI", 0),
+    ] {
+        let results = post_batch(&app, &key, &[(tag, serde_json::json!(value))]).await;
+        assert_eq!(results[0]["ok"], false, "{tag}: {results:?}");
+        let rows = audit_rows(&app, ids[at]).await;
+        assert_eq!(rows.last().unwrap()["result"], "failed", "{tag}: {rows:?}");
+    }
+    assert_eq!(fixture.writes().len(), 1, "refusals send nothing");
     assert!(keys.revoke(key_id).await.unwrap().revoked_at.is_some());
     app.write_control.disable();
 }

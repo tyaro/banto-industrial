@@ -4037,3 +4037,449 @@ async fn new_guest_qnu_extended_w_is_read_below_the_sd310_total_only() {
     assert_eq!(covered(&mut session, &specs), vec![0, 1, 2]);
     session.disconnect().await;
 }
+
+/// Loopback UDP SLMP peer for guest #62 (E4, #916): an R04CPU with SD280-283
+/// = 4000/4000 and a D word memory, answering each datagram with exactly one
+/// datagram in the request's frame (4E echoes the serial). Other SD reads are
+/// refused (C051). It records `(subheader, command)` of every request.
+struct UdpPeer {
+    address: std::net::SocketAddr,
+    seen: Arc<Mutex<Vec<(u8, u16)>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl UdpPeer {
+    async fn start(words: &[(u32, u16)]) -> Self {
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = socket.local_addr().unwrap();
+        let words: Arc<Mutex<std::collections::BTreeMap<u32, u16>>> =
+            Arc::new(Mutex::new(words.iter().copied().collect()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let task = {
+            let (words, seen) = (words.clone(), seen.clone());
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 65536];
+                loop {
+                    let (len, from) = match socket.recv_from(&mut buf).await {
+                        Ok(pair) => pair,
+                        // Windows reports an ICMP for an earlier send here.
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                        Err(e) => panic!("UDP peer recv: {e}"),
+                    };
+                    let response = Self::answer(&buf[..len], &words, &seen);
+                    let _ = socket.send_to(&response, from).await;
+                }
+            })
+        };
+        Self {
+            address,
+            seen,
+            task,
+        }
+    }
+
+    fn answer(
+        datagram: &[u8],
+        words: &Mutex<std::collections::BTreeMap<u32, u16>>,
+        seen: &Mutex<Vec<(u8, u16)>>,
+    ) -> Vec<u8> {
+        let sub = datagram[0];
+        assert!(
+            matches!(&datagram[..2], [0x54, 0] | [0x50, 0]),
+            "{datagram:02x?}"
+        );
+        // 3E is normalised to the 4E layout, as `Fixture` does.
+        let request: Vec<u8> = if sub == 0x50 {
+            [0x54, 0, 0, 0, 0, 0]
+                .into_iter()
+                .chain(datagram[2..].iter().copied())
+                .collect()
+        } else {
+            datagram.to_vec()
+        };
+        let length = usize::from(u16::from_le_bytes([request[11], request[12]]));
+        assert_eq!(request.len(), 13 + length, "one datagram is one request");
+        let command = u16::from_le_bytes([request[15], request[16]]);
+        seen.lock().unwrap().push((sub, command));
+        let (end_code, body): (u16, Vec<u8>) = if command == 0x0101 {
+            let mut body = vec![b' '; 18];
+            body[..6].copy_from_slice(b"R04CPU");
+            body[16..18].copy_from_slice(&0x4800u16.to_le_bytes());
+            (0, body)
+        } else {
+            assert_eq!(u16::from_le_bytes([request[17], request[18]]), 2);
+            let start = u32::from_le_bytes([request[19], request[20], request[21], request[22]]);
+            let points = u16::from_le_bytes([request[25], request[26]]);
+            match (command, request[23]) {
+                (0x0401, 0xa9) if (start, points) == (280, 4) => {
+                    let mut body = 4000u32.to_le_bytes().to_vec();
+                    body.extend_from_slice(&4000u32.to_le_bytes());
+                    (0, body)
+                }
+                (0x0401, 0xa9) => (0xc051, Vec::new()),
+                (0x0401, 0xa8) => {
+                    let words = words.lock().unwrap();
+                    let body = (start..start + u32::from(points))
+                        .flat_map(|index| words.get(&index).copied().unwrap_or(0).to_le_bytes())
+                        .collect();
+                    (0, body)
+                }
+                other => panic!("unexpected UDP request {command:#x} {other:x?}"),
+            }
+        };
+        let mut response = if sub == 0x50 {
+            vec![0xd0, 0]
+        } else {
+            vec![0xd4, 0, request[2], request[3], 0, 0]
+        };
+        response.extend_from_slice(&request[6..11]);
+        response.extend_from_slice(&u16::try_from(body.len() + 2).unwrap().to_le_bytes());
+        response.extend_from_slice(&end_code.to_le_bytes());
+        response.extend_from_slice(&body);
+        response
+    }
+
+    fn seen(&self) -> Vec<(u8, u16)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+impl Drop for UdpPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// Guest #62 (E4) through the real Hub path (#916): a saved connection with
+/// `transport=udp` passes the connection test, is collected Good and answers
+/// read-now through the broker over loopback UDP, with the 4E and the 3E
+/// frame; every request reaches the peer as one datagram in that frame. With
+/// a manifest that lists only `tcp`, the same settings fail the connection
+/// test and no datagram is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #63 component"]
+async fn new_guest_saved_udp_connection_is_collected_and_read_now_over_udp() {
+    for (frame, subheader) in [("4e", 0x54u8), ("3e", 0x50)] {
+        let peer = UdpPeer::start(&[(3010, 4321), (3011, 0x8001)]).await;
+        let settings = serde_json::json!({
+            "host": "127.0.0.1",
+            "port": peer.address.port(),
+            "transport": "udp",
+            "frame": frame,
+            "d_u16_write_mode": "enabled",
+            "d_u16_write_allowlist": "D3010-D3013"
+        });
+        let app = super::test_app_with_operational_write_manifest(
+            &format!("t12-new-guest-udp-{frame}"),
+            MANIFEST,
+            &new_guest_component(),
+        )
+        .await;
+        let (status, body) = super::admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            serde_json::json!({
+                "protocol": "slmp-wasm-operational-write",
+                "simulation": false,
+                "settings": settings
+            }),
+        )
+        .await;
+        assert_eq!(status, super::StatusCode::OK, "{frame}: {body:?}");
+        assert_eq!(body["ok"], true, "{frame}: {body:?}");
+        let saved = app
+            .manager
+            .plc_connections()
+            .create_settings(super::ConnectionSettingsInput {
+                name: "line".into(),
+                protocol: "slmp-wasm-operational-write".into(),
+                enabled: true,
+                simulation: false,
+                settings: settings.as_object().unwrap().clone(),
+                secrets: Default::default(),
+            })
+            .await
+            .unwrap();
+        let group = super::CollectionGroupService::with_registry(
+            app.pool.clone(),
+            app.manager.registry().clone(),
+        )
+        .create(super::group_input("group", saved.id, 100))
+        .await
+        .unwrap();
+        let mut ids = Vec::new();
+        for (name, address) in [("d3010", "D3010"), ("d3011", "D3011")] {
+            let tag = super::tag_input(name, group.id, address, "u16");
+            ids.push(app.manager.tags().create(tag).await.unwrap().id);
+        }
+        app.manager.rebuild().await.unwrap();
+        let sample_of = |id: i64| {
+            app.manager
+                .current_values()
+                .and_then(|values| values.get(&format!("tag:{id}")))
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if ids.iter().all(|&id| {
+                    sample_of(id).is_some_and(|s| s.quality == Quality::Good && s.value.is_some())
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("D3010/D3011 Good over UDP");
+        for (name, value) in [("d3010", 4321.0), ("d3011", 32769.0)] {
+            let (status, body) = super::admin_get(
+                &app.router,
+                &format!("/api/v1/values/line.group.{name}/read-now"),
+                &app.admin_token,
+            )
+            .await;
+            assert_eq!(status, super::StatusCode::OK, "{frame}: {body:?}");
+            assert_eq!(body["v"], serde_json::json!(value), "{frame}: {body:?}");
+            assert_eq!(body["q"], "good", "{frame}: {body:?}");
+        }
+        drop(app);
+        let seen = peer.seen();
+        assert!(seen.iter().any(|(_, command)| *command == 0x0101));
+        assert!(
+            seen.iter()
+                .filter(|(_, command)| *command == 0x0401)
+                .count()
+                >= 3,
+            "{frame}: {seen:x?}"
+        );
+        assert!(
+            seen.iter().all(|(sub, _)| *sub == subheader),
+            "{frame}: {seen:x?}"
+        );
+    }
+
+    // The same settings with a manifest that lists only TCP.
+    let peer = UdpPeer::start(&[]).await;
+    let tcp_only = String::from_utf8(MANIFEST.to_vec()).unwrap().replace(
+        r#""transports": ["tcp", "udp"]"#,
+        r#""transports": ["tcp"]"#,
+    );
+    assert!(!tcp_only.contains("udp"));
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-udp-tcp-only",
+        tcp_only.as_bytes(),
+        &new_guest_component(),
+    )
+    .await;
+    let (status, body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        serde_json::json!({
+            "protocol": "slmp-wasm-operational-write",
+            "simulation": false,
+            "settings": {
+                "host": "127.0.0.1",
+                "port": peer.address.port(),
+                "transport": "udp",
+                "d_u16_write_mode": "disabled",
+                "d_u16_write_allowlist": ""
+            }
+        }),
+    )
+    .await;
+    assert!(
+        !status.is_success() || body["ok"] == false,
+        "{status} {body:?}"
+    );
+    assert!(
+        body.to_string().contains("UDP 通信に対応していません"),
+        "{status} {body:?}"
+    );
+    drop(app);
+    assert!(peer.seen().is_empty(), "no datagram: {:?}", peer.seen());
+}
+
+/// Guest #63 (C1) through the real Hub path (#914): saved D and W string tags
+/// written over REST by an API key pass the Hub gate and the guest allowlist,
+/// reach the PLC as one 1401 over the whole span with the encoded, 0x00-padded
+/// text low byte first per word, are audited `ok`, and read back over
+/// read-now. A span reaching past the allowlist and text longer than the span
+/// are refused before send and audited `failed`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #63 component"]
+async fn new_guest_saved_d_and_w_strings_are_written_audited_and_read_back_over_rest() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let fixture = Fixture::start(Peer::R, 4000, false).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-string-rest",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": fixture.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "D3010-D3013,W1A-W1F"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 60_000))
+    .await
+    .unwrap();
+    let mut names = Vec::new();
+    let mut ids = Vec::new();
+    for (name, address, words) in [
+        ("d3010s", "D3010", 4),
+        ("w1as", "W1A", 2),
+        ("d3011s", "D3011", 4),
+    ] {
+        let mut tag = super::tag_input(name, group.id, address, "string");
+        tag.string_length = Some(words);
+        tag.writable = true;
+        ids.push(app.manager.tags().create(tag).await.unwrap().id);
+        names.push(format!("line.group.{name}"));
+    }
+    app.manager.rebuild().await.unwrap();
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "string-loopback-writer",
+            names.iter().map(|tag| format!("write:{tag}")).collect(),
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let write = |at: usize, value: &str| {
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/v1/values/batch",
+            &issued.key,
+            serde_json::json!({ "writes": [{ "tag": names[at], "v": value }] }),
+        )
+    };
+    let read_now = |at: usize| {
+        let path = format!("/api/v1/values/{}/read-now", names[at]);
+        let (router, token) = (app.router.clone(), app.admin_token.clone());
+        async move { super::admin_get(&router, &path, &token).await }
+    };
+    let write_commands = || {
+        fixture
+            .commands()
+            .iter()
+            .filter(|(command, _, _)| *command == 0x1401)
+            .count()
+    };
+
+    let d_written = write(0, "ABC").await;
+    let d_frames = (fixture.frames(), fixture.write_devices());
+    let d_read = read_now(0).await;
+    let w_written = write(1, "WXYZ").await;
+    let w_frames = (fixture.frames(), fixture.write_devices());
+    let w_read = read_now(1).await;
+    let outside = write(2, "AB").await;
+    let too_long = write(0, "ABCDEFGHI").await;
+    let after_refusals = write_commands();
+    let audit = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    drop(app);
+
+    assert!(revoked.unwrap().revoked_at.is_some());
+    for (label, (status, body), ok) in [
+        ("D string", &d_written, true),
+        ("W string", &w_written, true),
+        ("outside", &outside, false),
+        ("too long", &too_long, false),
+    ] {
+        assert_eq!(*status, super::StatusCode::OK, "{label}: {body:?}");
+        assert_eq!(body["writes"][0]["ok"], ok, "{label}: {body:?}");
+    }
+    // One 1401 each, low byte first per word, 0x00-padded to the whole span.
+    assert_eq!(
+        d_frames,
+        (
+            vec![(3010, vec![0x4241, 0x0043, 0x0000, 0x0000])],
+            vec![0xa8]
+        )
+    );
+    assert_eq!(
+        w_frames,
+        (
+            vec![
+                (3010, vec![0x4241, 0x0043, 0x0000, 0x0000]),
+                (0x1a, vec![0x5857, 0x5a59])
+            ],
+            vec![0xa8, 0xb4]
+        )
+    );
+    assert_eq!(after_refusals, 2, "refusals send nothing");
+    for (label, (status, body), value) in [("D", &d_read, "ABC"), ("W", &w_read, "WXYZ")] {
+        assert_eq!(*status, super::StatusCode::OK, "{label}: {body:?}");
+        assert_eq!(body["v"], value, "{label}: {body:?}");
+        assert_eq!(body["q"], "good", "{label}: {body:?}");
+    }
+    assert!(fixture.read_spans().contains(&(0xa8, 3010, 4)));
+    assert!(fixture.read_spans().contains(&(0xb4, 0x1a, 2)));
+    assert_eq!(audit.0, super::StatusCode::OK, "{:?}", audit.1);
+    let rows = audit.1["rows"].as_array().unwrap();
+    let results_of = |at: usize| -> Vec<&str> {
+        let mut rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row["tagId"].as_i64() == Some(ids[at]))
+            .collect();
+        rows.sort_by_key(|row| row["id"].as_i64());
+        rows.iter()
+            .map(|row| row["result"].as_str().unwrap())
+            .collect()
+    };
+    assert_eq!(results_of(0), ["ok", "failed"], "{rows:?}");
+    assert_eq!(results_of(1), ["ok"], "{rows:?}");
+    assert_eq!(results_of(2), ["failed"], "{rows:?}");
+}
