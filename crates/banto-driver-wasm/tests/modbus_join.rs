@@ -5,7 +5,7 @@
 
 use banto_driver_api::{
     DataType, DriverBase, FatalError, FrameConnection, FrameDriver, ItemError, RawValue, Settings,
-    TagKind, TagSpec, Value, WriteItem, WriteProgress,
+    StringEncoding, TagKind, TagSpec, Value, WriteItem, WriteProgress,
 };
 use banto_driver_wasm::WasmDriver;
 
@@ -650,4 +650,172 @@ fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send() {
             WriteProgress::Done(results) if results.iter().all(Result::is_ok)
         ));
     }
+}
+
+fn string_spec(driver: &WasmDriver, address: &str, words: u16) -> TagSpec {
+    let kind = TagKind::string(words, StringEncoding::Utf8);
+    TagSpec::new(driver.parse_address(address, &kind).unwrap(), kind)
+}
+
+/// #63 (C1): a holding or input register string is one FC3 / FC4 over its
+/// whole span, and the result is the register data unchanged (each register
+/// high byte first, which is character order), exactly `2 × words` bytes and
+/// not cut at NUL. 123 words is accepted; 124, a coil and a register bit are
+/// refused at registration.
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn holding_and_input_register_strings_read_high_byte_first_with_exact_length() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let mut conn = connected(
+        &driver,
+        &policy_settings("400101-400300", "400101-400300", &[]),
+    );
+    for (address, canonical, function, offset, words) in [
+        ("40101", "400101", 3_u8, 100_u16, 3_u16),
+        ("30001", "300001", 4, 0, 2),
+        ("40201", "400201", 3, 200, 123),
+    ] {
+        let spec = string_spec(&driver, address, words);
+        assert_eq!(spec.address.canonical, canonical);
+        assert_eq!(spec.address.word_count, words);
+        // Characters 'A'.. with a NUL in the middle and at the end.
+        let data: Vec<u8> = (0..usize::from(words) * 2)
+            .map(|at| match at {
+                1 => 0,
+                at if at + 1 == usize::from(words) * 2 => 0,
+                at => b'A' + u8::try_from(at % 26).unwrap(),
+            })
+            .collect();
+        let planned = conn.plan_read(std::slice::from_ref(&spec)).unwrap();
+        assert_eq!(planned.len(), 1, "{address}");
+        let request = &planned[0].step.send;
+        assert_eq!(request[7], function, "{address}");
+        assert_eq!(
+            request[8..12],
+            [offset.to_be_bytes(), words.to_be_bytes()].concat()
+        );
+        let mut body = vec![u8::try_from(data.len()).unwrap()];
+        body.extend_from_slice(&data);
+        assert_eq!(
+            conn.decode_read(
+                &planned[0],
+                std::slice::from_ref(&spec),
+                &read_response(request, &body)
+            )
+            .unwrap(),
+            [Ok(RawValue::Bytes(data))],
+            "{address}"
+        );
+    }
+    let kind = |words| TagKind::string(words, StringEncoding::Utf8);
+    for (address, words) in [
+        ("40101", 124),
+        ("40101", 0),
+        ("00001", 1),
+        ("10001", 1),
+        ("40001.3", 1),
+    ] {
+        assert!(
+            driver.parse_address(address, &kind(words)).is_err(),
+            "{address} x {words} accepted"
+        );
+    }
+}
+
+/// #63 (C1) and #934: a holding register string write is one FC16 over the
+/// whole span with the Hub's encoded, 0x00-padded bytes, high byte first per
+/// register; 123 words is one FC16. With `register_write=fc6` a one-word
+/// string is one FC6 and a wider one is refused by the guest before send. The
+/// host gate refuses first a span reaching outside its allowlist, an input
+/// register, a string with another item, and text longer than the span.
+#[test]
+#[ignore = "requires the pinned Modbus WASM package files"]
+fn holding_string_write_is_one_fc16_of_the_padded_span_and_alone() {
+    let driver = WasmDriver::load_operational_write(&write_manifest(), &component()).unwrap();
+    let text = |address: &str, words: u16, value: &str| {
+        WriteItem::new(
+            string_spec(&driver, address, words),
+            Value::Str(value.into()),
+        )
+    };
+    let mut conn = connected(
+        &driver,
+        &policy_settings("400101-400400", "400101-400400", &[]),
+    );
+    let mut max = vec![b'A'];
+    max.resize(246, 0);
+    for (item, offset, words, data) in [
+        (
+            text("40101", 4, "ABC"),
+            100_u16,
+            4_u16,
+            b"ABC\0\0\0\0\0".to_vec(),
+        ),
+        (text("40201", 123, "A"), 200, 123, max),
+    ] {
+        let plan = match conn.write_next(std::slice::from_ref(&item), None).unwrap() {
+            WriteProgress::Send(plan) => plan,
+            other => panic!("expected FC16: {other:?}"),
+        };
+        let mut expected = plan.step.send[..2].to_vec();
+        expected.extend_from_slice(&[0, 0]);
+        expected.extend_from_slice(&(7 + u16::try_from(data.len()).unwrap()).to_be_bytes());
+        expected.extend_from_slice(&[1, 16]);
+        expected.extend_from_slice(&offset.to_be_bytes());
+        expected.extend_from_slice(&words.to_be_bytes());
+        expected.push(u8::try_from(data.len()).unwrap());
+        expected.extend_from_slice(&data);
+        assert_eq!(plan.step.send, expected, "{words} words");
+        let mut ack = plan.step.send[..12].to_vec();
+        ack[4..6].copy_from_slice(&6_u16.to_be_bytes());
+        assert!(matches!(
+            conn.write_next(&[item], Some(&ack)).unwrap(),
+            WriteProgress::Done(results) if results == [Ok(())]
+        ));
+    }
+
+    // Refused by the host gate before send.
+    for items in [
+        vec![text("40399", 4, "AB")],
+        vec![text("40101", 4, "ABCDEFGHI")],
+        vec![
+            text("40101", 2, "AB"),
+            WriteItem::new(spec(&driver, "40110", DataType::U16), Value::F64(1.0)),
+        ],
+        vec![text("30001", 2, "AB")],
+    ] {
+        let errors = refused_before_send(&mut conn, &items);
+        assert!(
+            errors
+                .iter()
+                .all(|error| matches!(error, ItemError::Unsupported(_))),
+            "host refusal expected for {items:?}: {errors:?}"
+        );
+    }
+
+    let mut fc6 = connected(
+        &driver,
+        &policy_settings(
+            "400101-400300",
+            "400101-400300",
+            &[("register_write", "fc6")],
+        ),
+    );
+    let item = text("40103", 1, "AB");
+    let plan = match fc6.write_next(std::slice::from_ref(&item), None).unwrap() {
+        WriteProgress::Send(plan) => plan,
+        other => panic!("expected FC6: {other:?}"),
+    };
+    let mut expected = plan.step.send[..2].to_vec();
+    expected.extend_from_slice(&[0, 0, 0, 6, 1, 6, 0, 102, b'A', b'B']);
+    assert_eq!(plan.step.send, expected);
+    assert!(matches!(
+        fc6.write_next(&[item], Some(&plan.step.send)).unwrap(),
+        WriteProgress::Done(results) if results == [Ok(())]
+    ));
+    let errors = refused_before_send(&mut fc6, &[text("40101", 2, "ABC")]);
+    assert!(
+        matches!(errors.as_slice(), [ItemError::Rejected(_)]),
+        "guest refusal expected: {errors:?}"
+    );
 }
