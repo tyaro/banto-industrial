@@ -868,7 +868,7 @@ async fn record_gate_rejection(
 ) {
     if let Some(reason) = gate_rejection_reason(rejection) {
         let entry = rejection_entry(deps.manager, ctx, tag, reason);
-        deps.write_audit.record_rejections(vec![entry]).await;
+        deps.write_audit.record_rejections(vec![entry]);
     }
 }
 
@@ -884,8 +884,8 @@ pub async fn record_missing_write_scope(
     record_missing_write_scopes(manager, write_audit, ctx, &[tag]).await;
 }
 
-/// [`record_missing_write_scope`] のバッチ版。全件を 1 つのタスクで記録する
-/// (途中で切断されても残りが欠けない)。
+/// [`record_missing_write_scope`] のバッチ版。全件を 1 つのメッセージで背景のキューへ渡す
+/// (DB を待たずに返る。渡し終えた分は切断でも欠けない)。
 pub async fn record_missing_write_scopes<S: AsRef<str>>(
     manager: &CollectorManager,
     write_audit: &WriteAuditService,
@@ -903,7 +903,7 @@ pub async fn record_missing_write_scopes<S: AsRef<str>>(
             )
         })
         .collect();
-    write_audit.record_rejections(entries).await;
+    write_audit.record_rejections(entries);
 }
 
 fn rejection_entry(
@@ -1275,8 +1275,8 @@ pub async fn execute_write_batch(
         }
         prepare_results.push(prepared);
     }
-    // 拒否の監査は全件を 1 つのタスクで残す(切断で残りが欠けない。#945 のレビュー)。
-    deps.write_audit.record_rejections(rejected).await;
+    // 拒否の監査は全件を 1 つのメッセージで背景のキューへ渡す(待たない。#945 のレビュー)。
+    deps.write_audit.record_rejections(rejected);
 
     if prepare_results.iter().any(Result::is_err) {
         // 1件でも NG なら実書き込みを一切しない - 書込みの監査行も broker 呼び出し

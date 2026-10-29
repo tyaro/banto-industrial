@@ -415,6 +415,8 @@ fn tools_call(name: &str, arguments: Value) -> Value {
 }
 
 async fn write_audit_row_count(app: &TestApp) -> u64 {
+    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
+    app.write_audit.flush().await;
     app.write_audit
         .list(ListParams::default())
         .await
@@ -424,6 +426,7 @@ async fn write_audit_row_count(app: &TestApp) -> u64 {
 
 /// 最新の書込み監査 1 行の (外部名, result, detail)。
 async fn last_audit_row(app: &TestApp) -> (String, String, String) {
+    app.write_audit.flush().await;
     sqlx::query_as(
         "SELECT external_name_snapshot, result, COALESCE(detail, '')          FROM hub_write_audit ORDER BY id DESC LIMIT 1",
     )
@@ -797,6 +800,7 @@ async fn read_only_key_can_list_and_read_but_not_write() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("missing_write_scope"), "{text}");
     // #711: スコープ外の拒否も監査に残る（タグは実在するので tag_id が入る）。
+    app.write_audit.flush().await;
     let row: (String, String, String) = sqlx::query_as(
         "SELECT external_name_snapshot, result, detail FROM hub_write_audit WHERE tag_id > 0",
     )
@@ -915,6 +919,7 @@ async fn write_before_lockdown_unknown_tag_reaches_the_gate_as_not_found() {
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("not_found"), "{text}");
     // #711: catalog に無いタグの拒否も監査に残る（tag_id は 0）。
+    app.write_audit.flush().await;
     let row: (i64, String, String, String) = sqlx::query_as(
         "SELECT tag_id, external_name_snapshot, result, detail FROM hub_write_audit",
     )

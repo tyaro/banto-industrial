@@ -55,10 +55,33 @@
 //! (例: `not_writable（60 秒の窓で計 13 件）`。1 件のときはコードだけ)。
 //! 件数は常に DB の行にあるので、拒否が止まっても、記憶の組を上限
 //! ([`REJECTION_THROTTLE_MAX_ENTRIES`] 組)で捨てても、再起動しても失われない。
-//! 窓が明けた次の拒否は新しい行を挿入して窓を始め直す。記憶(窓の最初の行の
-//! id と件数)はメモリ上だけで、判定から挿入/UPDATE までを `tokio::sync::Mutex`
-//! のロックを持ったまま行う(並行の 2 件目が件数を失わない)。挿入に失敗した
-//! 組は記憶に残さない。監査の書込みに失敗しても応答は変えず、ログだけ残す。
+//! 窓が明けた次の拒否は新しい行を挿入して窓を始め直す。挿入に失敗した組は
+//! 記憶に残さない。
+//!
+//! **キーごとの行の上限**(#945 のレビュー): 1 つの API キーが窓の中で別々の行に
+//! できる(外部名, 理由)の組は [`REJECTION_ROWS_PER_KEY`] 組まで。超えた拒否は、
+//! そのキーと理由ごとの**まとめの行**(`external_name_snapshot = '*'`、
+//! `tag_id = 0`、例: `not_found（60 秒の窓で、上限を超えたほかのタグ名で計 7 件）`)
+//! に数え、窓の中では同じく UPDATE する。毎回違うタグ名を送っても、1 つのキーが
+//! 60 秒に作る行はおよそ「上限 + 理由の数(4)」に収まる。キーの数は発行済みの
+//! キーの数で決まり(拒否の監査は認証を通った要求だけ)、記憶は組・キーとも
+//! [`REJECTION_THROTTLE_MAX_ENTRIES`] まで(超えて捨てたキーは予算を数え直すので、
+//! 1000 を超えるキーが同時に拒否を浴びると上の行数を超えうる)。
+//!
+//! **背景のキュー**(#945 のレビュー): [`WriteAuditService::record_rejections`] は
+//! 拒否を上限つきのキュー([`REJECTION_QUEUE_CAPACITY`] メッセージ)へ `try_send`
+//! で渡してすぐ返す(403・404 を DB の待ちで遅らせない。同期の送信なので、要求の
+//! future が切断で捨てられても渡し終えた分は欠けない)。記憶と書込みは 1 つの
+//! ワーカーのタスクだけが持つので、ロックは要らない(件数は順に数える)。キューが
+//! 一杯なら捨てて件数を数え、ワーカーが次に書くときに**あふれの行**(`api_key_id = 0`・
+//! キー名とプレフィックスは空・`external_name_snapshot = '*'`・`tag_id = 0`・
+//! `detail = 'queue_overflow（N 件を記録できなかった）'`)を 1 行残す(どのキーの
+//! 拒否かは数えない)。ワーカーは最初に使うときに呼んだ側のランタイムで起動する。
+//! 監査の書込みに失敗しても応答は変えず、ワーカーがログ(`eprintln!`)に残す。
+//!
+//! **終了時**: サービスの複製がすべて捨てられると、ワーカーはキューの残りを
+//! 書き切ってから終わる。ランタイムの終了でワーカーが先に捨てられた場合は、
+//! キューに残った分とあふれの件数を数えてログに出し、捨てる(書き切らない)。
 //!
 //! ## スナップショット列 (`api_key_name_snapshot`/`api_key_prefix_snapshot`/`external_name_snapshot`)
 //!
@@ -71,13 +94,15 @@
 //! `rule_name_snapshot` と同じ設計判断)。
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use banto_core::{BantoError, ListParams, ListResult};
 use banto_storage::ColumnMap;
 use serde::Serialize;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use tokio::sync::mpsc;
 use utoipa::ToSchema;
 
 /// `hub_write_audit.action` の値 (`db.rs` の SQL `CHECK` と対応)。
@@ -280,7 +305,28 @@ pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
 /// #711: まとめの記憶に持つ組の上限。超えたら窓の明けた組、それでも足りなければ
 /// 最も古い窓の組を捨てる。捨てても、件数はすでに DB の行の `detail` にあるので
 /// 失われない(捨てた組の次の拒否は、新しい行を挿入して窓を始め直す)。
+/// キーごとの行の予算([`REJECTION_ROWS_PER_KEY`])の記憶も同じ上限で持つ。
 pub const REJECTION_THROTTLE_MAX_ENTRIES: usize = 1000;
+
+/// #945 のレビュー: 1 つの API キーが、[`REJECTION_WINDOW`] の中で別々の行として
+/// 残せる(外部名, 理由)の組の数。超えた拒否は、そのキーと理由ごとの
+/// まとめの行(外部名 `*`、`tag_id` 0)に数える。毎回違うタグ名を送っても、
+/// 1 つのキーが窓の中で挿入できる行は、およそ「この上限 + 理由の数(4)」に収まる。
+pub const REJECTION_ROWS_PER_KEY: usize = 20;
+
+/// #945 のレビュー: 拒否の監査を背景のワーカーへ渡すキューの容量(メッセージの数。
+/// バッチの拒否は 1 メッセージ)。一杯のときは捨てて、あふれの件数を数える。
+pub const REJECTION_QUEUE_CAPACITY: usize = 4096;
+
+/// まとめの行・あふれの行の外部名。
+pub const REJECTION_SUMMARY_NAME: &str = "*";
+
+/// #711: 行をまとめる相手。タグごとの行か、キーごとの上限を超えた分のまとめの行か。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum RejectionTarget {
+    Tag(String),
+    OtherTags,
+}
 
 /// #711: 組ごとの現在の窓。
 struct RejectionWindow {
@@ -292,32 +338,31 @@ struct RejectionWindow {
     count: u32,
 }
 
-type RejectionKey = (i64, String, WriteRejectionReason);
-
-/// #711: 拒否の行をまとめる記憶(メモリ上のみ)。件数は行の `detail` に
-/// 書き込み済みなので、再起動や組の破棄で件数が失われることはない。
-#[derive(Default)]
-struct RejectionThrottle {
-    map: HashMap<RejectionKey, RejectionWindow>,
+/// #945 のレビュー: キーごとの、窓の中で挿入したタグごとの行の数。
+struct KeyBudget {
+    start: Instant,
+    rows: usize,
 }
 
-impl RejectionThrottle {
-    /// 新しい組を入れる前に、上限を超えないよう組を捨てる。
-    fn make_room(&mut self, now: Instant) {
-        if self.map.len() < REJECTION_THROTTLE_MAX_ENTRIES {
-            return;
-        }
-        self.map
-            .retain(|_, w| now.saturating_duration_since(w.start) < REJECTION_WINDOW);
-        if self.map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
-            if let Some(oldest) = self
-                .map
-                .iter()
-                .min_by_key(|(_, w)| w.start)
-                .map(|(k, _)| k.clone())
-            {
-                self.map.remove(&oldest);
-            }
+type RejectionKey = (i64, RejectionTarget, WriteRejectionReason);
+
+/// 上限を超えないよう、窓の明けたもの、それでも足りなければ最も古いものを捨てる。
+fn make_room<K: Clone + Eq + std::hash::Hash, V>(
+    map: &mut HashMap<K, V>,
+    now: Instant,
+    start: impl Fn(&V) -> Instant,
+) {
+    if map.len() < REJECTION_THROTTLE_MAX_ENTRIES {
+        return;
+    }
+    map.retain(|_, v| now.saturating_duration_since(start(v)) < REJECTION_WINDOW);
+    if map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, v)| start(v))
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
         }
     }
 }
@@ -335,6 +380,19 @@ fn rejection_detail(reason: WriteRejectionReason, count: u32) -> String {
     }
 }
 
+fn rejection_summary_detail(reason: WriteRejectionReason, count: u32) -> String {
+    format!(
+        "{}（{} 秒の窓で、上限を超えたほかのタグ名で計 {} 件）",
+        reason.as_str(),
+        REJECTION_WINDOW.as_secs(),
+        count
+    )
+}
+
+fn queue_overflow_detail(count: u64) -> String {
+    format!("queue_overflow（{count} 件を記録できなかった）")
+}
+
 /// [`WriteAuditService::record_rejections`] に渡す拒否 1 件分。
 #[derive(Debug, Clone)]
 pub struct RejectionEntry {
@@ -346,28 +404,306 @@ pub struct RejectionEntry {
     pub reason: WriteRejectionReason,
 }
 
+/// 完結した 1 行を挿入して新しい `id` を返す。
+async fn insert_row_in(pool: &SqlitePool, row: &WriteAuditRow) -> Result<i64, BantoError> {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO hub_write_audit (\
+            api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
+            external_name_snapshot, value_requested, value_requested_text, action, \
+            result, detail\
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         RETURNING id",
+    )
+    .bind(row.api_key_id)
+    .bind(&row.api_key_name_snapshot)
+    .bind(&row.api_key_prefix_snapshot)
+    .bind(row.tag_id)
+    .bind(&row.external_name_snapshot)
+    .bind(row.value_requested)
+    .bind(&row.value_requested_text)
+    .bind(row.action.as_str())
+    .bind(row.result.as_str())
+    .bind(&row.detail)
+    .fetch_one(pool)
+    .await
+    .map_err(banto_storage::storage_error)?;
+    Ok(id)
+}
+
+/// #711 / #945 のレビュー: 拒否の行をまとめる記憶と書込み。背景のワーカーだけが
+/// 持つ(ロックは要らない)。件数は行の `detail` に書き込み済みなので、再起動や
+/// 組の破棄で件数が失われることはない。
+struct RejectionWorker {
+    pool: SqlitePool,
+    windows: HashMap<RejectionKey, RejectionWindow>,
+    budgets: HashMap<i64, KeyBudget>,
+}
+
+impl RejectionWorker {
+    fn new(pool: SqlitePool) -> Self {
+        Self {
+            pool,
+            windows: HashMap::new(),
+            budgets: HashMap::new(),
+        }
+    }
+
+    /// 窓の中なら件数を足して UPDATE する。窓が無い・明けたなら `false`(明けた
+    /// 組は記憶から消す)。
+    async fn bump(&mut self, key: &RejectionKey, now: Instant) -> bool {
+        let Some(w) = self.windows.get_mut(key) else {
+            return false;
+        };
+        if now.saturating_duration_since(w.start) >= REJECTION_WINDOW {
+            // 窓が明けた: 前の行はそのまま残し、新しい行で窓を始め直す。
+            self.windows.remove(key);
+            return false;
+        }
+        w.count = w.count.saturating_add(1);
+        let reason = key.2;
+        let detail = match key.1 {
+            RejectionTarget::Tag(_) => rejection_detail(reason, w.count),
+            RejectionTarget::OtherTags => rejection_summary_detail(reason, w.count),
+        };
+        let result = sqlx::query("UPDATE hub_write_audit SET detail = ? WHERE id = ?")
+            .bind(&detail)
+            .bind(w.row_id)
+            .execute(&self.pool)
+            .await;
+        if let Err(err) = result {
+            eprintln!(
+                "banto-hub: 書き込み監査(rejected: {})の件数の更新に失敗しました: {err}",
+                reason.as_str()
+            );
+        }
+        true
+    }
+
+    /// 新しい窓の最初の行を挿入して記憶する。挿入に失敗した組は記憶に残さない
+    /// (次の拒否で挿入をやり直す)。成功したら `true`。
+    async fn insert_first(&mut self, key: RejectionKey, now: Instant, row: WriteAuditRow) -> bool {
+        match insert_row_in(&self.pool, &row).await {
+            Ok(row_id) => {
+                make_room(&mut self.windows, now, |w| w.start);
+                self.windows.insert(
+                    key,
+                    RejectionWindow {
+                        start: now,
+                        row_id,
+                        count: 1,
+                    },
+                );
+                true
+            }
+            Err(err) => {
+                eprintln!(
+                    "banto-hub: 書き込み監査(rejected: {})の記録に失敗しました: {err}",
+                    key.2.as_str()
+                );
+                false
+            }
+        }
+    }
+
+    /// 拒否 1 件を残す(時刻を注入できる形。試験はこれを直接呼ぶ)。
+    async fn record_at(&mut self, now: Instant, e: &RejectionEntry) {
+        let tag_key: RejectionKey = (
+            e.api_key_id,
+            RejectionTarget::Tag(e.external_name.clone()),
+            e.reason,
+        );
+        if self.bump(&tag_key, now).await {
+            return;
+        }
+        // 新しい行が要る。キーごとの予算の中ならタグごとの行にする。
+        let budget = self.budgets.get(&e.api_key_id);
+        let fresh =
+            budget.is_none_or(|b| now.saturating_duration_since(b.start) >= REJECTION_WINDOW);
+        let used = if fresh {
+            0
+        } else {
+            budget.map_or(0, |b| b.rows)
+        };
+        if used < REJECTION_ROWS_PER_KEY {
+            let row = WriteAuditRow::new(
+                e.api_key_id,
+                e.api_key_name.as_str(),
+                e.api_key_prefix.as_str(),
+                e.tag_id,
+                e.external_name.as_str(),
+                WriteAuditAction::Write,
+                WriteAuditResult::Rejected,
+            )
+            .with_detail(e.reason.as_str());
+            if self.insert_first(tag_key, now, row).await {
+                if fresh {
+                    make_room(&mut self.budgets, now, |b| b.start);
+                    self.budgets.insert(
+                        e.api_key_id,
+                        KeyBudget {
+                            start: now,
+                            rows: 1,
+                        },
+                    );
+                } else if let Some(b) = self.budgets.get_mut(&e.api_key_id) {
+                    b.rows += 1;
+                }
+            }
+            return;
+        }
+        // 予算を超えた: キーと理由ごとのまとめの行に数える。
+        let summary_key: RejectionKey = (e.api_key_id, RejectionTarget::OtherTags, e.reason);
+        if self.bump(&summary_key, now).await {
+            return;
+        }
+        let row = WriteAuditRow::new(
+            e.api_key_id,
+            e.api_key_name.as_str(),
+            e.api_key_prefix.as_str(),
+            0,
+            REJECTION_SUMMARY_NAME,
+            WriteAuditAction::Write,
+            WriteAuditResult::Rejected,
+        )
+        .with_detail(rejection_summary_detail(e.reason, 1));
+        self.insert_first(summary_key, now, row).await;
+    }
+
+    /// キューのあふれの件数があれば、まとめの行として 1 行残して 0 に戻す。
+    /// 挿入に失敗したら件数を戻す(次の機会にもう一度試す)。
+    async fn write_overflow(&mut self, overflow: &AtomicU64) {
+        let n = overflow.swap(0, Ordering::Relaxed);
+        if n == 0 {
+            return;
+        }
+        let row = WriteAuditRow::new(
+            0,
+            "",
+            "",
+            0,
+            REJECTION_SUMMARY_NAME,
+            WriteAuditAction::Write,
+            WriteAuditResult::Rejected,
+        )
+        .with_detail(queue_overflow_detail(n));
+        if let Err(err) = insert_row_in(&self.pool, &row).await {
+            overflow.fetch_add(n, Ordering::Relaxed);
+            eprintln!(
+                "banto-hub: 書き込み監査(rejected)のあふれ {n} 件の記録に失敗しました: {err}"
+            );
+        }
+    }
+}
+
+enum RejectionMsg {
+    /// 受け取った時刻(キューで待った分は窓をずらさない)と拒否。
+    Rejections(Instant, Vec<RejectionEntry>),
+    /// それより前に渡した分を書き終えたら応答する。
+    Flush(tokio::sync::oneshot::Sender<()>),
+}
+
+/// ワーカーのタスクが(ランタイムの終了で)捨てられたとき、キューに残った分を
+/// 数えてログに出す。
+struct QueueDrain {
+    rx: mpsc::Receiver<RejectionMsg>,
+    overflow: Arc<AtomicU64>,
+}
+
+impl Drop for QueueDrain {
+    fn drop(&mut self) {
+        let mut left: u64 = self.overflow.swap(0, Ordering::Relaxed);
+        while let Ok(msg) = self.rx.try_recv() {
+            if let RejectionMsg::Rejections(_, entries) = msg {
+                left += entries.len() as u64;
+            }
+        }
+        if left > 0 {
+            eprintln!("banto-hub: 書き込み監査(rejected)の {left} 件を記録できずに終了しました");
+        }
+    }
+}
+
+async fn run_rejection_worker(mut worker: RejectionWorker, mut q: QueueDrain) {
+    while let Some(msg) = q.rx.recv().await {
+        worker.write_overflow(&q.overflow).await;
+        match msg {
+            RejectionMsg::Rejections(at, entries) => {
+                for e in &entries {
+                    worker.record_at(at, e).await;
+                }
+            }
+            RejectionMsg::Flush(ack) => {
+                let _ = ack.send(());
+            }
+        }
+        worker.write_overflow(&q.overflow).await;
+    }
+    // すべての送り手が捨てられた: 残りは書き切った。
+    worker.write_overflow(&q.overflow).await;
+}
+
+/// #945 のレビュー: 拒否の監査のキュー。ワーカーは最初に使うときに、呼んだ側の
+/// tokio のランタイムで起動する(`WriteAuditService::new` はランタイムの外でも
+/// 呼べる)。
+struct RejectionQueue {
+    pool: SqlitePool,
+    capacity: usize,
+    tx: OnceLock<mpsc::Sender<RejectionMsg>>,
+    overflow: Arc<AtomicU64>,
+}
+
+impl RejectionQueue {
+    fn sender(&self) -> Option<&mpsc::Sender<RejectionMsg>> {
+        if let Some(tx) = self.tx.get() {
+            return Some(tx);
+        }
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            eprintln!("banto-hub: 書き込み監査(rejected)のワーカーを tokio のランタイムの外では起動できません");
+            return None;
+        };
+        Some(self.tx.get_or_init(|| {
+            let (tx, rx) = mpsc::channel(self.capacity);
+            let worker = RejectionWorker::new(self.pool.clone());
+            let drain = QueueDrain {
+                rx,
+                overflow: self.overflow.clone(),
+            };
+            handle.spawn(run_rejection_worker(worker, drain));
+            tx
+        }))
+    }
+}
+
 /// 書き込み監査サービス(`crate::audit::AuditLogService` と同じ形の
 /// 薄いラッパー)。`Clone` は安価(`SqlitePool` は `Arc` バックド)。
-/// 拒否のまとめの記憶([`Self::record_rejection`])は複製の間で共有する。
+/// 拒否のキューとワーカー([`Self::record_rejections`])は複製の間で共有する。
 #[derive(Clone)]
 pub struct WriteAuditService {
     pool: SqlitePool,
-    rejections: Arc<tokio::sync::Mutex<RejectionThrottle>>,
+    rejections: Arc<RejectionQueue>,
 }
 
 impl WriteAuditService {
     pub fn new(pool: SqlitePool) -> Self {
+        Self::with_rejection_queue_capacity(pool, REJECTION_QUEUE_CAPACITY)
+    }
+
+    fn with_rejection_queue_capacity(pool: SqlitePool, capacity: usize) -> Self {
         Self {
+            rejections: Arc::new(RejectionQueue {
+                pool: pool.clone(),
+                capacity,
+                tx: OnceLock::new(),
+                overflow: Arc::new(AtomicU64::new(0)),
+            }),
             pool,
-            rejections: Arc::new(tokio::sync::Mutex::new(RejectionThrottle::default())),
         }
     }
 
     /// #711: 定義上の拒否を `result = 'rejected'` で残す(窓の中の同じ
-    /// (キー, タグ, 理由)は 1 行にまとめる)。時刻は [`Instant::now`]。
-    /// 失敗は応答を変えないよう、エラーはログに残して握りつぶす。
-    /// 1 件だけの入口。複数件は [`Self::record_rejections`]。
-    pub async fn record_rejection(
+    /// (キー, タグ, 理由)は 1 行にまとめる)。1 件だけの入口。複数件は
+    /// [`Self::record_rejections`]。DB を待たずにすぐ返す。
+    pub fn record_rejection(
         &self,
         api_key_id: i64,
         api_key_name: &str,
@@ -383,130 +719,47 @@ impl WriteAuditService {
             tag_id,
             external_name: external_name.to_string(),
             reason,
-        }])
-        .await;
+        }]);
     }
 
-    /// 複数の拒否を順に残す。全件を 1 つのタスクにまとめて走らせる。
-    /// クライアントの切断でハンドラの future が捨てられても、拒否の監査が
-    /// (mutex や DB 接続の待ちの途中で)欠けないよう、要求から切り離す
-    /// (#945 のレビュー。`rest/api_keys.rs` の `tokio::spawn` と同じ流儀)。
-    pub async fn record_rejections(&self, entries: Vec<RejectionEntry>) {
+    /// 複数の拒否を背景のワーカーへ渡して、**DB を待たずにすぐ返す**(#945 の
+    /// レビュー: 403・404 を監査の DB の待ちで遅らせない)。同期の `try_send` なので、
+    /// 要求の future が捨てられても、渡し終えたものは失われない。キューが一杯
+    /// ([`REJECTION_QUEUE_CAPACITY`])なら捨てて、あふれの件数に足す(ワーカーが
+    /// 次に書くときに `queue_overflow` の行として残す)。記録の失敗はワーカーが
+    /// ログに残す。
+    pub fn record_rejections(&self, entries: Vec<RejectionEntry>) {
         if entries.is_empty() {
             return;
         }
-        let svc = self.clone();
-        let handle = tokio::spawn(async move {
-            for e in entries {
-                svc.record_rejection_at(
-                    Instant::now(),
-                    e.api_key_id,
-                    &e.api_key_name,
-                    &e.api_key_prefix,
-                    e.tag_id,
-                    &e.external_name,
-                    e.reason,
-                )
-                .await;
-            }
-        });
-        if let Err(err) = handle.await {
-            eprintln!("banto-hub: 書き込み監査(rejected)のタスクが異常終了しました: {err}");
+        let n = entries.len() as u64;
+        let Some(tx) = self.rejections.sender() else {
+            return;
+        };
+        if tx
+            .try_send(RejectionMsg::Rejections(Instant::now(), entries))
+            .is_err()
+        {
+            self.rejections.overflow.fetch_add(n, Ordering::Relaxed);
         }
     }
 
-    /// [`Self::record_rejection`] の時刻を注入できる形(試験用)。
-    #[allow(clippy::too_many_arguments)] // 時刻の注入で 1 つ増える試験用の形
-    pub async fn record_rejection_at(
-        &self,
-        now: Instant,
-        api_key_id: i64,
-        api_key_name: &str,
-        api_key_prefix: &str,
-        tag_id: i64,
-        external_name: &str,
-        reason: WriteRejectionReason,
-    ) {
-        let key: RejectionKey = (api_key_id, external_name.to_string(), reason);
-        // 判定から挿入/UPDATE までロックを持ったまま行う。挿入が終わる前に同じ組の
-        // 2 件目が来ても、行 id が決まってから数えるので件数が失われない(拒否の
-        // 監査の書込みだけが直列になる)。
-        let mut throttle = self.rejections.lock().await;
-        if let Some(w) = throttle.map.get_mut(&key) {
-            if now.saturating_duration_since(w.start) < REJECTION_WINDOW {
-                w.count = w.count.saturating_add(1);
-                let detail = rejection_detail(reason, w.count);
-                let result = sqlx::query("UPDATE hub_write_audit SET detail = ? WHERE id = ?")
-                    .bind(&detail)
-                    .bind(w.row_id)
-                    .execute(&self.pool)
-                    .await;
-                if let Err(err) = result {
-                    eprintln!(
-                        "banto-hub: 書き込み監査(rejected: {})の件数の更新に失敗しました: {err}",
-                        reason.as_str()
-                    );
-                }
-                return;
-            }
-            // 窓が明けた: 前の行はそのまま残し、新しい行で窓を始め直す。
-            throttle.map.remove(&key);
-        }
-        let row = WriteAuditRow::new(
-            api_key_id,
-            api_key_name,
-            api_key_prefix,
-            tag_id,
-            external_name,
-            WriteAuditAction::Write,
-            WriteAuditResult::Rejected,
-        )
-        .with_detail(reason.as_str());
-        match self.insert_row(&row).await {
-            Ok(row_id) => {
-                throttle.make_room(now);
-                throttle.map.insert(
-                    key,
-                    RejectionWindow {
-                        start: now,
-                        row_id,
-                        count: 1,
-                    },
-                );
-            }
-            // 失敗した組は記憶に残さない(次の拒否で挿入をやり直す)。
-            Err(err) => eprintln!(
-                "banto-hub: 書き込み監査(rejected: {})の記録に失敗しました: {err}",
-                reason.as_str()
-            ),
+    /// それまでに渡した拒否をワーカーが書き終えるのを待つ(試験で、拒否の直後に
+    /// 監査を読むため。製品の経路は呼ばない)。
+    pub async fn flush(&self) {
+        let Some(tx) = self.rejections.sender() else {
+            return;
+        };
+        let (ack, done) = tokio::sync::oneshot::channel();
+        if tx.send(RejectionMsg::Flush(ack)).await.is_ok() {
+            let _ = done.await;
         }
     }
 
     /// 完結した1行をそのまま挿入する(抑制系: `suppressed_disabled`/
     /// `rate_limit_tripped`)。新しい `id` を返す。
     pub async fn insert_row(&self, row: &WriteAuditRow) -> Result<i64, BantoError> {
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO hub_write_audit (\
-                api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
-                external_name_snapshot, value_requested, value_requested_text, action, \
-                result, detail\
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-             RETURNING id",
-        )
-        .bind(row.api_key_id)
-        .bind(&row.api_key_name_snapshot)
-        .bind(&row.api_key_prefix_snapshot)
-        .bind(row.tag_id)
-        .bind(&row.external_name_snapshot)
-        .bind(row.value_requested)
-        .bind(&row.value_requested_text)
-        .bind(row.action.as_str())
-        .bind(row.result.as_str())
-        .bind(&row.detail)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(banto_storage::storage_error)?;
-        Ok(id)
+        insert_row_in(&self.pool, row).await
     }
 
     /// log-before-write (§6-3): `broker.write` を呼ぶ**前**に
@@ -849,8 +1102,42 @@ mod rejection_tests {
     use super::*;
     use crate::db::migrate_memory;
 
-    async fn service() -> WriteAuditService {
-        WriteAuditService::new(migrate_memory().await.expect("migrate_memory"))
+    /// ワーカーの処理を直接呼ぶ試験の組(時刻を注入する)。
+    struct Rec {
+        svc: WriteAuditService,
+        w: RejectionWorker,
+    }
+
+    impl Rec {
+        #[allow(clippy::too_many_arguments)] // 時刻の注入で 1 つ増える試験用の形
+        async fn record_rejection_at(
+            &mut self,
+            now: Instant,
+            api_key_id: i64,
+            api_key_name: &str,
+            api_key_prefix: &str,
+            tag_id: i64,
+            external_name: &str,
+            reason: WriteRejectionReason,
+        ) {
+            let e = RejectionEntry {
+                api_key_id,
+                api_key_name: api_key_name.to_string(),
+                api_key_prefix: api_key_prefix.to_string(),
+                tag_id,
+                external_name: external_name.to_string(),
+                reason,
+            };
+            self.w.record_at(now, &e).await;
+        }
+    }
+
+    async fn service() -> Rec {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        Rec {
+            svc: WriteAuditService::new(pool.clone()),
+            w: RejectionWorker::new(pool),
+        }
     }
 
     async fn rows(svc: &WriteAuditService) -> Vec<WriteAuditEntry> {
@@ -861,7 +1148,7 @@ mod rejection_tests {
 
     #[tokio::test]
     async fn repeated_rejection_inside_the_window_is_one_row_with_the_total() {
-        let svc = service().await;
+        let mut svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
         for i in 0..13 {
@@ -869,7 +1156,7 @@ mod rejection_tests {
                 .await;
         }
         // 拒否が止まっても、何も呼ばずに読んで件数が残っている。
-        let got = rows(&svc).await;
+        let got = rows(&svc.svc).await;
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].result, "rejected");
         assert_eq!(got[0].api_key_prefix_snapshot.as_deref(), Some("bk_k"));
@@ -882,16 +1169,16 @@ mod rejection_tests {
 
     #[tokio::test]
     async fn a_single_rejection_has_only_the_code() {
-        let svc = service().await;
+        let mut svc = service().await;
         let r = WriteRejectionReason::NotFound;
         svc.record_rejection_at(Instant::now(), 1, "k", "bk_k", 0, "x", r)
             .await;
-        assert_eq!(rows(&svc).await[0].detail.as_deref(), Some("not_found"));
+        assert_eq!(rows(&svc.svc).await[0].detail.as_deref(), Some("not_found"));
     }
 
     #[tokio::test]
     async fn a_new_window_is_a_new_row_and_keeps_the_old_total() {
-        let svc = service().await;
+        let mut svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
         for i in 0..5 {
@@ -910,7 +1197,7 @@ mod rejection_tests {
             r,
         )
         .await;
-        let got = rows(&svc).await;
+        let got = rows(&svc.svc).await;
         assert_eq!(got.len(), 2);
         assert_eq!(
             got[0].detail.as_deref(),
@@ -924,7 +1211,7 @@ mod rejection_tests {
 
     #[tokio::test]
     async fn counts_survive_when_the_memory_drops_a_pair_at_the_cap() {
-        let svc = service().await;
+        let mut svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotFound;
         // 最初の組に 3 件。
@@ -932,11 +1219,12 @@ mod rejection_tests {
             svc.record_rejection_at(t0, 1, "k", "bk_k", 0, "first", r)
                 .await;
         }
-        // 上限を超える数の別の組で、最初の組を記憶から捨てさせる。
+        // 上限を超える数の別の組(キーごとの行の上限に掛からないよう、別々のキー)で、
+        // 最初の組を記憶から捨てさせる。
         for i in 0..REJECTION_THROTTLE_MAX_ENTRIES {
             svc.record_rejection_at(
                 t0 + Duration::from_millis(1 + i as u64),
-                1,
+                2 + i as i64,
                 "k",
                 "bk_k",
                 0,
@@ -945,8 +1233,9 @@ mod rejection_tests {
             )
             .await;
         }
-        assert!(svc.rejections.lock().await.map.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
-        let got = svc.list(ListParams::default()).await.unwrap().rows;
+        assert!(svc.w.windows.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
+        assert!(svc.w.budgets.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
+        let got = svc.svc.list(ListParams::default()).await.unwrap().rows;
         let first = got
             .iter()
             .find(|e| e.external_name_snapshot == "first")
@@ -959,7 +1248,7 @@ mod rejection_tests {
 
     #[tokio::test]
     async fn different_key_tag_or_reason_are_recorded_separately() {
-        let svc = service().await;
+        let mut svc = service().await;
         let t0 = Instant::now();
         let r = WriteRejectionReason::NotWritable;
         svc.record_rejection_at(t0, 1, "k", "bk_k", 5, "a.b", r)
@@ -978,6 +1267,113 @@ mod rejection_tests {
             WriteRejectionReason::MissingWriteScope,
         )
         .await;
-        assert_eq!(rows(&svc).await.len(), 4);
+        assert_eq!(rows(&svc.svc).await.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn one_key_with_many_tag_names_stops_at_the_cap_plus_a_summary_row() {
+        let mut svc = service().await;
+        let t0 = Instant::now();
+        let r = WriteRejectionReason::MissingWriteScope;
+        let total = REJECTION_ROWS_PER_KEY + 30;
+        for i in 0..total {
+            svc.record_rejection_at(
+                t0 + Duration::from_millis(i as u64),
+                1,
+                "k",
+                "bk_k",
+                0,
+                &format!("tag{i}"),
+                r,
+            )
+            .await;
+        }
+        // 上限の中のタグ名を繰り返しても、そのタグの行に数える(まとめには入らない)。
+        svc.record_rejection_at(t0 + Duration::from_secs(1), 1, "k", "bk_k", 0, "tag0", r)
+            .await;
+        let got = rows(&svc.svc).await;
+        assert_eq!(got.len(), REJECTION_ROWS_PER_KEY + 1);
+        let summary: Vec<_> = got
+            .iter()
+            .filter(|e| e.external_name_snapshot == REJECTION_SUMMARY_NAME)
+            .collect();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].tag_id, 0);
+        assert_eq!(summary[0].api_key_id, 1);
+        assert_eq!(
+            summary[0].detail.as_deref(),
+            Some("missing_write_scope（60 秒の窓で、上限を超えたほかのタグ名で計 30 件）")
+        );
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("missing_write_scope（60 秒の窓で計 2 件）")
+        );
+        // ほかのキーは別の予算。
+        svc.record_rejection_at(t0, 2, "k2", "bk_k2", 0, "tagx", r)
+            .await;
+        assert_eq!(rows(&svc.svc).await.len(), REJECTION_ROWS_PER_KEY + 2);
+        // 窓が明けたら、同じキーでもタグごとの行に戻る。
+        svc.record_rejection_at(t0 + REJECTION_WINDOW, 1, "k", "bk_k", 0, "late", r)
+            .await;
+        let got = rows(&svc.svc).await;
+        assert_eq!(got.len(), REJECTION_ROWS_PER_KEY + 3);
+        assert_eq!(got.last().unwrap().external_name_snapshot, "late");
+    }
+
+    #[tokio::test]
+    async fn record_rejection_returns_before_the_worker_writes() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = WriteAuditService::new(pool.clone());
+        let r = WriteRejectionReason::NotFound;
+        // DB の接続をふさいだままでも、呼び出し(同期。await しない)は戻る。
+        let held = pool.acquire().await.expect("acquire");
+        svc.record_rejection(1, "k", "bk_k", 0, "x", r);
+        svc.record_rejections(vec![
+            RejectionEntry {
+                api_key_id: 1,
+                api_key_name: "k".into(),
+                api_key_prefix: "bk_k".into(),
+                tag_id: 0,
+                external_name: "x".into(),
+                reason: r,
+            };
+            2
+        ]);
+        // ワーカーを走らせても、接続を待つだけで呼び出し側は止まらない。
+        tokio::task::yield_now().await;
+        drop(held);
+        svc.flush().await;
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].detail.as_deref(),
+            Some("not_found（60 秒の窓で計 3 件）")
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_overflow_is_left_as_a_summary_row() {
+        let pool = migrate_memory().await.expect("migrate_memory");
+        let svc = WriteAuditService::with_rejection_queue_capacity(pool, 2);
+        let r = WriteRejectionReason::NotWritable;
+        // ワーカーが走る前に容量 2 を超えて渡す: 2 件はキューへ、3 件はあふれ。
+        for i in 0..5 {
+            svc.record_rejection(1, "k", "bk_k", 5, &format!("t{i}"), r);
+        }
+        svc.flush().await;
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 3);
+        let overflow: Vec<_> = got
+            .iter()
+            .filter(|e| e.detail.as_deref() == Some("queue_overflow（3 件を記録できなかった）"))
+            .collect();
+        assert_eq!(overflow.len(), 1);
+        assert_eq!(overflow[0].api_key_id, 0);
+        assert_eq!(overflow[0].tag_id, 0);
+        assert_eq!(overflow[0].external_name_snapshot, REJECTION_SUMMARY_NAME);
+        assert_eq!(overflow[0].result, "rejected");
+        // 件数は 0 に戻っている(次の flush で行が増えない)。
+        svc.flush().await;
+        assert_eq!(rows(&svc).await.len(), 3);
     }
 }

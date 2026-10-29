@@ -166,6 +166,8 @@ where
 }
 
 struct TestApp {
+    /// #945 のレビュー: 拒否の監査を読む前に `flush` で待つため。
+    write_audit: WriteAuditService,
     router: Router,
     admin_token: String,
     pool: SqlitePool,
@@ -264,6 +266,7 @@ async fn test_app(label: &str) -> TestApp {
         state_file.clone(),
     ));
     let write_audit = WriteAuditService::new(pool.clone());
+    let write_audit_handle = write_audit.clone();
     let mqtt = Arc::new(banto_hub_core::mqtt::MqttPublisher::new(manager.clone()));
     let api_keys = ApiKeysService::new(pool.clone());
     // T4: `tests/grpc.rs` が gRPC 経由の書き込みゲートを検証するので、この
@@ -314,6 +317,7 @@ async fn test_app(label: &str) -> TestApp {
     );
 
     TestApp {
+        write_audit: write_audit_handle,
         router,
         admin_token,
         pool,
@@ -758,6 +762,8 @@ async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and
 
 /// #711: 書込み監査の `rejected` 行を (外部名, tag_id, detail) で返す。
 async fn rejected_rows(app: &TestApp) -> Vec<(String, i64, String)> {
+    // 拒否の監査は背景のキューで書く(#945 のレビュー)。読む前に書き終えるのを待つ。
+    app.write_audit.flush().await;
     let (status, listed) = admin_post(
         &app.router,
         "/api/write-audit/list",
