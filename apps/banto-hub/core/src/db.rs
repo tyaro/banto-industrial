@@ -42,6 +42,10 @@
 //! - `0108_hub_write_audit_key_prefix.sql`（#713、2026-10-29）は、失効した
 //!   API キーの削除の後も書込み監査から読めるよう、`hub_write_audit` に
 //!   `api_key_prefix_snapshot` を足したもの（`ADD COLUMN`）。
+//! - `0109_hub_write_audit_rejected.sql`（#711、2026-10-29）は、定義上の拒否を
+//!   残すため `hub_write_audit.result` の CHECK に `rejected` を足したもの。
+//!   0107 と同じ作り直しで、0108 の `api_key_prefix_snapshot` も写す（テスト
+//!   `an_existing_audit_row_and_key_prefix_survive_the_0109_rebuild`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -366,7 +370,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
     }
 
@@ -494,7 +498,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")
@@ -526,7 +530,11 @@ mod tests {
         for entry in std::fs::read_dir(&source).unwrap() {
             let entry = entry.unwrap();
             let name = entry.file_name();
-            if name.to_string_lossy().starts_with("0107_") {
+            let name_text = name.to_string_lossy();
+            if name_text.starts_with("0107_")
+                || name_text.starts_with("0108_")
+                || name_text.starts_with("0109_")
+            {
                 continue;
             }
             std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
@@ -611,6 +619,79 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(leftover, 0);
+        pool.close().await;
+    }
+
+    /// #711: `0109` は `hub_write_audit` を作り直して CHECK に `rejected` を
+    /// 足す。0108 までを適用済みの DB が 0109 を取り、既存の行と 0108 の
+    /// `api_key_prefix_snapshot` が写ること、`rejected` を受けることを確かめる。
+    #[tokio::test]
+    async fn an_existing_audit_row_and_key_prefix_survive_the_0109_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_set = dir.path().join("migrations-before-0109");
+        std::fs::create_dir(&old_set).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-sqlite");
+        for entry in std::fs::read_dir(&source).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("0109_") {
+                continue;
+            }
+            std::fs::copy(entry.path(), old_set.join(&name)).unwrap();
+        }
+
+        let db_path = dir.path().join("registry.sqlite3");
+        let pool = banto_storage::connect_sqlite(&db_path).await.unwrap();
+        let mut old = sqlx::migrate::Migrator::new(old_set.as_path())
+            .await
+            .unwrap();
+        old.dangerous_set_table_name(MIGRATIONS_TABLE);
+        old.run(&pool).await.unwrap();
+        let insert = "INSERT INTO hub_write_audit (api_key_id, api_key_name_snapshot,              api_key_prefix_snapshot, tag_id, external_name_snapshot, value_requested, action,              result, detail) VALUES (1, 'k', 'bk_abc', 10, 'line.t', 7.0, 'write', ?, 'd')";
+        sqlx::query(insert).bind("ok").execute(&pool).await.unwrap();
+        assert!(
+            sqlx::query(insert)
+                .bind("rejected")
+                .execute(&pool)
+                .await
+                .is_err(),
+            "0107's CHECK must not know 'rejected' yet"
+        );
+        pool.close().await;
+
+        let pool = init_db(&db_path)
+            .await
+            .expect("an existing DB must take 0109 on the next startup");
+        let rows: Vec<(i64, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, result, api_key_prefix_snapshot FROM hub_write_audit ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(1, "ok".to_string(), Some("bk_abc".to_string()))]
+        );
+        sqlx::query(insert)
+            .bind("rejected")
+            .execute(&pool)
+            .await
+            .expect("the rebuilt CHECK accepts 'rejected'");
+        assert!(sqlx::query(insert)
+            .bind("maybe")
+            .execute(&pool)
+            .await
+            .is_err());
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index'              AND tbl_name = 'hub_write_audit' AND name LIKE 'idx_%' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            indexes,
+            vec!["idx_hub_write_audit_tag", "idx_hub_write_audit_ts"]
+        );
         pool.close().await;
     }
 

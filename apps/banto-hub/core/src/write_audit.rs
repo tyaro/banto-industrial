@@ -39,6 +39,22 @@
 //! [`insert_row`] 1回で完結する(pending 経由にする理由がない -
 //! そもそも broker を呼んでいない)。
 //!
+//! ## 定義上の拒否 `rejected` (#711、2026-10-29 オーナー決定)
+//!
+//! 書込み不可(`not_writable`)・catalog に無い(`not_found`)・スコープ外
+//! (`missing_write_scope`)・タグ無効(`tag_disabled`)の拒否も、
+//! `action = 'write'`・`result = 'rejected'` の行として残す(不正な試みや
+//! 外部システムの設定誤りを追えるように)。理由のコードは `detail` に入る。
+//! catalog に無いタグは `tag_id` を引けないので 0 を入れ、要求された名前を
+//! `external_name_snapshot` に残す。物理書き込みは試みないので
+//! [`WriteAuditService::record_rejection`] で 1 回の挿入で完結する。
+//!
+//! 監査が拒否で埋まらないよう、**同じ(API キー, 外部名, 理由)は 60 秒
+//! ([`REJECTION_WINDOW`])に 1 行**にまとめる。窓が明けて次に書く行の
+//! `detail` に、その間に省いた件数を入れる。まとめの記憶はメモリ上だけで
+//! (上限 [`REJECTION_THROTTLE_MAX_ENTRIES`] 組)、再起動で省いた件数は
+//! 消える。監査の書込みに失敗しても応答は変えず、ログだけ残す。
+//!
 //! ## スナップショット列 (`api_key_name_snapshot`/`api_key_prefix_snapshot`/`external_name_snapshot`)
 //!
 //! API キーは失効(`revoked_at`)されても行として残るが、失効後に削除
@@ -48,6 +64,10 @@
 //! 何が起きたか」を後から名前解決なしに読めるよう、キー名・外部名を
 //! **書き込み時点の値としてスナップショット**する(`crate::audit`の
 //! `rule_name_snapshot` と同じ設計判断)。
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use banto_core::{BantoError, ListParams, ListResult};
 use banto_storage::ColumnMap;
@@ -91,6 +111,10 @@ pub enum WriteAuditResult {
     SuppressedDisabled,
     /// レート制限(§6-4)を超過するため、物理書き込みを一切試みず抑制した。
     SuppressedRateLimited,
+    /// #711(2026-10-29 オーナー決定): 定義上の拒否(書込み不可・catalog に
+    /// 無い・スコープ外・タグ無効)。理由のコードは `detail` に入る
+    /// ([`WriteRejectionReason`])。`action` は `write` のまま。
+    Rejected,
 }
 
 impl WriteAuditResult {
@@ -101,6 +125,7 @@ impl WriteAuditResult {
             WriteAuditResult::Uncertain => "uncertain",
             WriteAuditResult::SuppressedDisabled => "suppressed_disabled",
             WriteAuditResult::SuppressedRateLimited => "suppressed_rate_limited",
+            WriteAuditResult::Rejected => "rejected",
         }
     }
 }
@@ -219,16 +244,160 @@ fn column_map() -> ColumnMap {
         .column("detail", "detail")
 }
 
+/// #711: 定義上の拒否の理由(`result = 'rejected'` の行の `detail` の先頭に
+/// 入るコード。REST の応答の `error` と同じ綴り)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WriteRejectionReason {
+    /// `writable == false`(`db` タグを含む)。
+    NotWritable,
+    /// catalog に無い外部名。
+    NotFound,
+    /// `write:{タグ}` スコープが無い。
+    MissingWriteScope,
+    /// 実効 enabled が false。
+    TagDisabled,
+}
+
+impl WriteRejectionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WriteRejectionReason::NotWritable => "not_writable",
+            WriteRejectionReason::NotFound => "not_found",
+            WriteRejectionReason::MissingWriteScope => "missing_write_scope",
+            WriteRejectionReason::TagDisabled => "tag_disabled",
+        }
+    }
+}
+
+/// #711: 同じ(キー, タグ, 理由)の拒否を 1 行にまとめる窓。
+pub const REJECTION_WINDOW: Duration = Duration::from_secs(60);
+
+/// #711: まとめの記憶に持つ組の上限。超えたら窓の明けた(省略 0 件の)組、
+/// それでも足りなければ最も古い組を捨てる(捨てた組の省略件数は監査に
+/// 出なくなる)。
+pub const REJECTION_THROTTLE_MAX_ENTRIES: usize = 1000;
+
+/// #711: 拒否の行をまとめる記憶(メモリ上のみ。再起動で省略件数は消える)。
+#[derive(Default)]
+struct RejectionThrottle {
+    /// 組 → (最後に行を書いた時刻, その後に省いた件数)
+    map: HashMap<(i64, String, WriteRejectionReason), (Instant, u32)>,
+}
+
+impl RejectionThrottle {
+    /// 行を書くべきなら `Some(前の窓で省いた件数)`、窓の中なら省いて `None`。
+    fn admit(&mut self, key: (i64, String, WriteRejectionReason), now: Instant) -> Option<u32> {
+        if let Some((last, suppressed)) = self.map.get_mut(&key) {
+            if now.saturating_duration_since(*last) < REJECTION_WINDOW {
+                *suppressed = suppressed.saturating_add(1);
+                return None;
+            }
+            let omitted = *suppressed;
+            *last = now;
+            *suppressed = 0;
+            return Some(omitted);
+        }
+        if self.map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
+            self.map.retain(|_, (last, suppressed)| {
+                *suppressed > 0 || now.saturating_duration_since(*last) < REJECTION_WINDOW
+            });
+            if self.map.len() >= REJECTION_THROTTLE_MAX_ENTRIES {
+                if let Some(oldest) = self
+                    .map
+                    .iter()
+                    .min_by_key(|(_, (last, _))| *last)
+                    .map(|(k, _)| k.clone())
+                {
+                    self.map.remove(&oldest);
+                }
+            }
+        }
+        self.map.insert(key, (now, 0));
+        Some(0)
+    }
+}
+
 /// 書き込み監査サービス(`crate::audit::AuditLogService` と同じ形の
 /// 薄いラッパー)。`Clone` は安価(`SqlitePool` は `Arc` バックド)。
+/// 拒否のまとめの記憶([`Self::record_rejection`])は複製の間で共有する。
 #[derive(Clone)]
 pub struct WriteAuditService {
     pool: SqlitePool,
+    rejections: Arc<Mutex<RejectionThrottle>>,
 }
 
 impl WriteAuditService {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            rejections: Arc::new(Mutex::new(RejectionThrottle::default())),
+        }
+    }
+
+    /// #711: 定義上の拒否を `result = 'rejected'` で残す(窓の中の同じ
+    /// (キー, タグ, 理由)は 1 行にまとめる)。時刻は [`Instant::now`]。
+    /// 失敗は応答を変えないよう、エラーはログに残して握りつぶす。
+    pub async fn record_rejection(
+        &self,
+        api_key_id: i64,
+        api_key_name: &str,
+        tag_id: i64,
+        external_name: &str,
+        reason: WriteRejectionReason,
+    ) {
+        self.record_rejection_at(
+            Instant::now(),
+            api_key_id,
+            api_key_name,
+            tag_id,
+            external_name,
+            reason,
+        )
+        .await;
+    }
+
+    /// [`Self::record_rejection`] の時刻を注入できる形(試験用)。
+    pub async fn record_rejection_at(
+        &self,
+        now: Instant,
+        api_key_id: i64,
+        api_key_name: &str,
+        tag_id: i64,
+        external_name: &str,
+        reason: WriteRejectionReason,
+    ) {
+        let omitted = {
+            let mut throttle = self.rejections.lock().unwrap_or_else(|e| e.into_inner());
+            throttle.admit((api_key_id, external_name.to_string(), reason), now)
+        };
+        let Some(omitted) = omitted else {
+            return;
+        };
+        let detail = if omitted > 0 {
+            format!(
+                "{}（前の {} 秒で {} 件を省略）",
+                reason.as_str(),
+                REJECTION_WINDOW.as_secs(),
+                omitted
+            )
+        } else {
+            reason.as_str().to_string()
+        };
+        let row = WriteAuditRow::new(
+            api_key_id,
+            api_key_name,
+            tag_id,
+            external_name,
+            WriteAuditAction::Write,
+            WriteAuditResult::Rejected,
+        )
+        .with_detail(detail);
+        if let Err(err) = self.insert_row(&row).await {
+            eprintln!(
+                "banto-hub: 書き込み監査(rejected: {})の記録に失敗しました: {err}",
+                reason.as_str()
+            );
+        }
     }
 
     /// 完結した1行をそのまま挿入する(抑制系: `suppressed_disabled`/
@@ -590,5 +759,76 @@ mod tests {
             .unwrap();
         assert_eq!(result.total_count, 1);
         assert_eq!(result.rows[0].tag_id, 20);
+    }
+}
+
+#[cfg(test)]
+mod rejection_tests {
+    use super::*;
+    use crate::db::migrate_memory;
+
+    async fn service() -> WriteAuditService {
+        WriteAuditService::new(migrate_memory().await.expect("migrate_memory"))
+    }
+
+    async fn rows(svc: &WriteAuditService) -> Vec<WriteAuditEntry> {
+        let mut rows = svc.list(ListParams::default()).await.unwrap().rows;
+        rows.sort_by_key(|r| r.id);
+        rows
+    }
+
+    #[tokio::test]
+    async fn repeated_rejection_inside_the_window_is_one_row_then_reports_omitted() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        let r = WriteRejectionReason::NotWritable;
+        for i in 0..13 {
+            svc.record_rejection_at(t0 + Duration::from_secs(i), 1, "k", 5, "a.b", r)
+                .await;
+        }
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].result, "rejected");
+        assert_eq!(got[0].action, "write");
+        assert_eq!(got[0].detail.as_deref(), Some("not_writable"));
+
+        svc.record_rejection_at(t0 + REJECTION_WINDOW, 1, "k", 5, "a.b", r)
+            .await;
+        let got = rows(&svc).await;
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[1].detail.as_deref(),
+            Some("not_writable（前の 60 秒で 12 件を省略）")
+        );
+    }
+
+    #[tokio::test]
+    async fn different_key_tag_or_reason_are_recorded_separately() {
+        let svc = service().await;
+        let t0 = Instant::now();
+        let r = WriteRejectionReason::NotWritable;
+        svc.record_rejection_at(t0, 1, "k", 5, "a.b", r).await;
+        svc.record_rejection_at(t0, 2, "k2", 5, "a.b", r).await;
+        svc.record_rejection_at(t0, 1, "k", 6, "a.c", r).await;
+        svc.record_rejection_at(
+            t0,
+            1,
+            "k",
+            5,
+            "a.b",
+            WriteRejectionReason::MissingWriteScope,
+        )
+        .await;
+        assert_eq!(rows(&svc).await.len(), 4);
+    }
+
+    #[test]
+    fn throttle_memory_is_bounded() {
+        let mut t = RejectionThrottle::default();
+        let now = Instant::now();
+        for i in 0..(REJECTION_THROTTLE_MAX_ENTRIES + 50) {
+            t.admit((1, format!("tag{i}"), WriteRejectionReason::NotFound), now);
+        }
+        assert!(t.map.len() <= REJECTION_THROTTLE_MAX_ENTRIES);
     }
 }

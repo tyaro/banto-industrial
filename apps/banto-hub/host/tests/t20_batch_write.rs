@@ -538,12 +538,13 @@ async fn one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_wri
     assert_eq!(writes[2]["ok"], false);
     assert_eq!(writes[2]["error"], "batch_aborted");
 
-    // 決定的固定その1: write_audit の行数が増えていない(1件も監査 insert
-    // されていない - suppressed 系すら発生しない)。
+    // 決定的固定その1: 書込みの監査行は入らない(suppressed 系すら発生しない)。
+    // #711: NG だったエントリ自身の定義上の拒否だけが `rejected` で 1 行残る。
     let audit_after = audit_row_count(&app.router, &app.admin_token).await;
     assert_eq!(
-        audit_before, audit_after,
-        "no audit row should be inserted when the batch is aborted pre-gate"
+        audit_before + 1,
+        audit_after,
+        "only the rejected entry is audited when the batch is aborted pre-gate"
     );
 
     // 決定的固定その2: シミュレータのレジスタが初期値(0)のまま - a・b

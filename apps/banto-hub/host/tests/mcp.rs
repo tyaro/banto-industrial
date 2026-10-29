@@ -422,6 +422,16 @@ async fn write_audit_row_count(app: &TestApp) -> u64 {
         .total_count
 }
 
+/// 最新の書込み監査 1 行の (外部名, result, detail)。
+async fn last_audit_row(app: &TestApp) -> (String, String, String) {
+    sqlx::query_as(
+        "SELECT external_name_snapshot, result, COALESCE(detail, '')          FROM hub_write_audit ORDER BY id DESC LIMIT 1",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("a write audit row")
+}
+
 // ---------------------------------------------------------------------------
 // 1. initialize / tools/list
 // ---------------------------------------------------------------------------
@@ -786,6 +796,21 @@ async fn read_only_key_can_list_and_read_but_not_write() {
     assert_eq!(body["result"]["isError"], true);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("missing_write_scope"), "{text}");
+    // #711: スコープ外の拒否も監査に残る（タグは実在するので tag_id が入る）。
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT external_name_snapshot, result, detail FROM hub_write_audit WHERE tag_id > 0",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("one rejected row");
+    assert_eq!(
+        row,
+        (
+            external_name.clone(),
+            "rejected".into(),
+            "missing_write_scope".into()
+        )
+    );
 
     sim.stop();
 }
@@ -889,6 +914,22 @@ async fn write_before_lockdown_unknown_tag_reaches_the_gate_as_not_found() {
     assert_eq!(body["result"]["isError"], true);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("not_found"), "{text}");
+    // #711: catalog に無いタグの拒否も監査に残る（tag_id は 0）。
+    let row: (i64, String, String, String) = sqlx::query_as(
+        "SELECT tag_id, external_name_snapshot, result, detail FROM hub_write_audit",
+    )
+    .fetch_one(&app.pool)
+    .await
+    .expect("one rejected row");
+    assert_eq!(
+        row,
+        (
+            0,
+            "nope.nope.nope".into(),
+            "rejected".into(),
+            "not_found".into()
+        )
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -928,6 +969,14 @@ async fn write_before_lockdown_not_writable_tag_reaches_the_gate() {
     assert_eq!(body["result"]["isError"], true);
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("not_writable"), "{text}");
+    assert_eq!(
+        last_audit_row(&app).await,
+        (
+            external_name.clone(),
+            "rejected".into(),
+            "not_writable".into()
+        )
+    );
     sim.stop();
 }
 
@@ -1356,10 +1405,20 @@ async fn write_recipe_missing_scope_on_one_entry_rejects_the_whole_batch() {
     assert!(text.contains("missing_write_scope"), "{text}");
     assert!(text.contains(&name_b), "{text}");
 
+    // #711: 書込みは走らず、スコープが無かった b だけが `rejected` で 1 行残る。
     assert_eq!(
         write_audit_row_count(&app).await,
-        audit_before,
-        "execute_write_batch must not run when one entry is missing write scope"
+        audit_before + 1,
+        "execute_write_batch must not run; only the missing-scope entry is audited"
+    );
+    let rejected = last_audit_row(&app).await;
+    assert_eq!(
+        rejected,
+        (
+            name_b.clone(),
+            "rejected".to_string(),
+            "missing_write_scope".to_string()
+        )
     );
     assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
     assert_eq!(sim.get_word(SlmpDevice::D, 101), 0, "tag b must not land");
@@ -1424,12 +1483,21 @@ async fn write_recipe_one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_an
     assert_eq!(writes[1]["ok"], false);
     assert_eq!(writes[1]["error"], "not_writable");
 
-    // 決定的固定: 事前ゲート all-or-nothing により1件も監査 insert されず
-    // (suppressed 系すら発生しない)、シミュレータのレジスタも初期値のまま。
+    // 決定的固定: 事前ゲート all-or-nothing により書込みの監査行は 1 件も
+    // 入らず(suppressed 系すら発生しない)、シミュレータのレジスタも初期値の
+    // まま。#711: NG だった bad だけが `rejected` で 1 行残る。
     assert_eq!(
         write_audit_row_count(&app).await,
-        audit_before,
-        "no audit row should be inserted when the batch is aborted pre-gate"
+        audit_before + 1,
+        "only the rejected entry is audited when the batch is aborted pre-gate"
+    );
+    assert_eq!(
+        last_audit_row(&app).await,
+        (
+            name_bad.clone(),
+            "rejected".to_string(),
+            "not_writable".to_string()
+        )
     );
     assert_eq!(sim.get_word(SlmpDevice::D, 100), 0, "tag a must not land");
 

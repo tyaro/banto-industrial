@@ -1191,6 +1191,22 @@ async fn write_value_not_writable_is_permission_denied() {
         .expect_err("not_writable tag should be rejected");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
+    // #711: 定義上の拒否も `rejected` として書込み監査に残る。
+    let (status, body) = admin_post(
+        &app.router,
+        "/api/write-audit/list",
+        &app.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let rows = body["rows"].as_array().expect("rows array");
+    assert!(
+        rows.iter()
+            .any(|row| row["result"] == "rejected" && row["detail"] == "not_writable"),
+        "expected a rejected/not_writable write-audit row, got: {body:?}"
+    );
+
     sim.stop();
 }
 

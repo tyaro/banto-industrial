@@ -756,6 +756,32 @@ async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and
 // 2. ゲート網羅
 // ---------------------------------------------------------------------------
 
+/// #711: 書込み監査の `rejected` 行を (外部名, tag_id, detail) で返す。
+async fn rejected_rows(app: &TestApp) -> Vec<(String, i64, String)> {
+    let (status, listed) = admin_post(
+        &app.router,
+        "/api/write-audit/list",
+        &app.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{listed:?}");
+    listed["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["result"] == "rejected")
+        .map(|r| {
+            assert_eq!(r["action"], "write");
+            (
+                r["externalNameSnapshot"].as_str().unwrap().to_string(),
+                r["tagId"].as_i64().unwrap(),
+                r["detail"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_undefined_tag_is_404() {
     let app = test_app("gate-404").await;
@@ -776,13 +802,18 @@ async fn gate_undefined_tag_is_404() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    // #711: catalog に無いタグの拒否も監査に残る（tag_id は 0）。
+    assert_eq!(
+        rejected_rows(&app).await,
+        vec![("nope.nope.nope".to_string(), 0, "not_found".to_string())]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gate_writable_false_is_403_not_writable() {
     let app = test_app("gate-not-writable").await;
     let sim = Simulator::start().await;
-    let (_tag_id, external_name) = make_tag(
+    let (tag_id, external_name) = make_tag(
         &app,
         "line1",
         "slmp",
@@ -812,6 +843,21 @@ async fn gate_writable_false_is_403_not_writable() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "not_writable");
+    // #711: 書込み不可の拒否も監査に残る。同じ組の繰り返しは 1 行にまとまる。
+    for _ in 0..3 {
+        let (status, _) = v1_post(
+            &app.router,
+            &format!("/api/v1/values/{external_name}"),
+            &key,
+            json!({ "v": 1 }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    assert_eq!(
+        rejected_rows(&app).await,
+        vec![(external_name.clone(), tag_id, "not_writable".to_string())]
+    );
     sim.stop();
 }
 
@@ -819,7 +865,7 @@ async fn gate_writable_false_is_403_not_writable() {
 async fn gate_disabled_tag_is_409_tag_disabled() {
     let app = test_app("gate-disabled").await;
     let sim = Simulator::start().await;
-    let (_tag_id, external_name) = make_tag(
+    let (tag_id, external_name) = make_tag(
         &app,
         "line1",
         "slmp",
@@ -849,6 +895,11 @@ async fn gate_disabled_tag_is_409_tag_disabled() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "tag_disabled");
+    // #711: 無効なタグへの拒否も監査に残る。
+    assert_eq!(
+        rejected_rows(&app).await,
+        vec![(external_name.clone(), tag_id, "tag_disabled".to_string())]
+    );
     sim.stop();
 }
 
@@ -1084,7 +1135,7 @@ async fn gate_writes_disabled_wins_over_a_type_mismatched_value_and_stays_503() 
 async fn gate_read_only_scope_key_cannot_write() {
     let app = test_app("gate-read-only").await;
     let sim = Simulator::start().await;
-    let (_tag_id, external_name) = make_tag(
+    let (tag_id, external_name) = make_tag(
         &app,
         "line1",
         "slmp",
@@ -1108,6 +1159,15 @@ async fn gate_read_only_scope_key_cannot_write() {
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(body["error"], "missing_write_scope");
+    // #711: スコープ外の拒否も監査に残る（タグは実在するので tag_id が入る）。
+    assert_eq!(
+        rejected_rows(&app).await,
+        vec![(
+            external_name.clone(),
+            tag_id,
+            "missing_write_scope".to_string()
+        )]
+    );
     sim.stop();
 }
 

@@ -28,8 +28,29 @@
 		failed: '失敗',
 		uncertain: '結果不明',
 		suppressed_disabled: '抑制（受付off）',
-		suppressed_rate_limited: '抑制（レート制限）'
+		suppressed_rate_limited: '抑制（レート制限）',
+		rejected: '拒否'
 	};
+
+	/** 拒否（#711）の理由のコード。`detail` の先頭に入る。 */
+	const rejectionReasonLabels: Record<string, string> = {
+		not_writable: '書込み不可のタグ',
+		not_found: 'タグが存在しない',
+		missing_write_scope: '書込みスコープがない',
+		tag_disabled: 'タグが無効'
+	};
+
+	/**
+	 * 拒否の行の理由（例: 「書込み不可のタグ」）。detail が
+	 * `not_writable（前の 60 秒で 12 件を省略）` の形のときは省略の注記も添える。
+	 */
+	function rejectionReason(row: WriteAuditEntry): string | null {
+		if (row.result !== 'rejected' || !row.detail) return null;
+		const match = /^([a-z_]+)(.*)$/s.exec(row.detail);
+		if (!match) return row.detail;
+		const label = rejectionReasonLabels[match[1]];
+		return label ? `${label}${match[2]}` : row.detail;
+	}
 
 	function actionLabel(action: string): string {
 		return actionLabels[action] ?? action;
@@ -161,7 +182,10 @@
 							<td class="tag-name">{row.externalNameSnapshot}</td>
 							<td class="value">{row.valueRequested ?? row.valueRequestedText ?? '-'}</td>
 							<td>{actionLabel(row.action)}</td>
-							<td class:alert={isAlertResult(row.result)}>{resultLabel(row.result)}</td>
+							<td class:alert={isAlertResult(row.result)}
+								>{resultLabel(row.result)}{#if rejectionReason(row)}
+									<small class="key-prefix">{rejectionReason(row)}</small>{/if}</td
+							>
 						</tr>
 					{/each}
 				</tbody>
@@ -186,16 +210,24 @@
 						<small class="key-prefix">{selected.apiKeyPrefixSnapshot}</small>{/if}（ID: {selected.apiKeyId}）
 				</dd>
 				<dt>タグ</dt>
-				<dd>{selected.externalNameSnapshot}（ID: {selected.tagId}）</dd>
+				<dd>
+					{selected.externalNameSnapshot}{selected.tagId > 0
+						? `（ID: ${selected.tagId}）`
+						: '（タグなし）'}
+				</dd>
 				<dt>要求値</dt>
 				<dd>{selected.valueRequested ?? selected.valueRequestedText ?? '-'}</dd>
 				<dt>アクション</dt>
 				<dd>{actionLabel(selected.action)}</dd>
 				<dt>結果</dt>
 				<dd class:alert={isAlertResult(selected.result)}>{resultLabel(selected.result)}</dd>
+				{#if rejectionReason(selected)}
+					<dt>理由</dt>
+					<dd>{rejectionReason(selected)}</dd>
+				{/if}
 			</dl>
 			{#if selectedDetail}
-				<h4>詳細情報（JSON）</h4>
+				<h4>詳細情報</h4>
 				<pre>{selectedDetail}</pre>
 			{/if}
 		</section>
