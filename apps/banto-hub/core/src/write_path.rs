@@ -882,6 +882,7 @@ pub async fn execute_write(
         let row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
+            ctx.prefix.clone(),
             resolved.tag_id,
             resolved.tag_name.clone(),
             WriteAuditAction::Write,
@@ -913,6 +914,7 @@ pub async fn execute_write(
         let row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
+            ctx.prefix.clone(),
             resolved.tag_id,
             resolved.tag_name.clone(),
             WriteAuditAction::RateLimitTripped,
@@ -957,6 +959,7 @@ pub async fn execute_write(
     let pending_row = WriteAuditRow::new(
         ctx.id,
         ctx.name.clone(),
+        ctx.prefix.clone(),
         resolved.tag_id,
         resolved.tag_name.clone(),
         WriteAuditAction::Write,
@@ -1198,6 +1201,7 @@ pub async fn execute_write_batch(
             let row = WriteAuditRow::new(
                 ctx.id,
                 ctx.name.clone(),
+                ctx.prefix.clone(),
                 p.tag_id,
                 p.tag_name.clone(),
                 WriteAuditAction::Write,
@@ -1244,6 +1248,7 @@ pub async fn execute_write_batch(
             let row = WriteAuditRow::new(
                 ctx.id,
                 ctx.name.clone(),
+                ctx.prefix.clone(),
                 p.tag_id,
                 p.tag_name.clone(),
                 WriteAuditAction::RateLimitTripped,
@@ -1331,6 +1336,7 @@ pub async fn execute_write_batch(
         let pending_row = WriteAuditRow::new(
             ctx.id,
             ctx.name.clone(),
+            ctx.prefix.clone(),
             p.tag_id,
             p.tag_name.clone(),
             WriteAuditAction::Write,
@@ -1402,6 +1408,7 @@ pub async fn execute_write_batch(
             let pending_row = WriteAuditRow::new(
                 ctx.id,
                 ctx.name.clone(),
+                ctx.prefix.clone(),
                 p.tag_id,
                 p.tag_name.clone(),
                 WriteAuditAction::Write,
