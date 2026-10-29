@@ -869,7 +869,7 @@ impl HubRuntime {
                 events,
                 allow_setup,
                 write_control,
-                write_audit,
+                write_audit.clone(),
                 mqtt.clone(),
                 grpc_server.clone(),
                 rate_limiter,
@@ -981,6 +981,7 @@ impl HubRuntime {
             prune_handle,
             audit_spool_handle,
             pool,
+            write_audit,
             _profile_lock: profile_lock,
             _profile_dirs: given_dirs,
         })
@@ -1134,6 +1135,8 @@ pub struct RunningHub {
     /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
     /// （[`RunningHub::shutdown_and_report`]）。
     pool: SqlitePool,
+    /// 書込み監査（拒否の背景のキューを、pool を閉じる前に書き切るために持つ。#945 のレビュー）。
+    write_audit: WriteAuditService,
     /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
     /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
     _profile_dirs: Option<ProfileDirs>,
@@ -1151,6 +1154,9 @@ pub struct HubShutdownReport {
 /// 接続が返るのを待つので、返らない接続があっても停止を止めない。デスクトップの終了の
 /// 予算（15 秒）の中に収まる長さ。
 pub const DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// 終了のとき、拒否の監査のキューを書き切るのを待つ上限（#945 のレビュー）。
+pub const WRITE_AUDIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RunningHub {
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
@@ -1245,6 +1251,18 @@ impl RunningHub {
             tls_server.stop().await;
         }
         self.server.stop().await;
+        // #945 のレビュー: 書込みの入口（REST・gRPC・MCP）が止まったので、拒否の監査の
+        // キューを書き切ってから pool を閉じる（閉じたあとでは挿入が失敗して失われる）。
+        // DB が詰まっていても止めないよう上限で切り上げる。
+        if tokio::time::timeout(WRITE_AUDIT_FLUSH_TIMEOUT, self.write_audit.flush())
+            .await
+            .is_err()
+        {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 拒否の監査のキューを {} 秒のうちに書き切れませんでした（残りは捨てます）",
+                WRITE_AUDIT_FLUSH_TIMEOUT.as_secs()
+            ));
+        }
         // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
         let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, self.pool.close())
@@ -1607,6 +1625,55 @@ mod tests {
         assert!(report.db_closed, "{report:?}");
         assert!(db.is_file());
         std::fs::remove_file(&db).expect("閉じた DB は消せる");
+    }
+
+    /// #945 のレビュー: 終了のとき、キューに残った拒否の監査を、pool を閉じる前に
+    /// 書き切る（閉じたあとでは挿入が失敗して失われる）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_drains_the_rejection_audit_queue_before_closing_the_db() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-audit-drain");
+        let dirs = plain_profile_dirs(&dir);
+        let db = dirs.config.path().join(DB_FILE_NAME);
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db.to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "dirs".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
+            .await
+            .expect("start with profile dirs");
+        for i in 0..20 {
+            hub.write_audit.record_rejection(
+                1,
+                "k",
+                "pfx",
+                0,
+                &format!("no_such_tag_{i}"),
+                crate::write_audit::WriteRejectionReason::NotFound,
+            );
+        }
+        let report = hub.shutdown_and_report().await;
+        assert!(report.db_closed, "{report:?}");
+        let pool = SqlitePool::connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&db)
+                .read_only(true),
+        )
+        .await
+        .expect("reopen");
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM hub_write_audit WHERE result = 'rejected'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        pool.close().await;
+        assert_eq!(n, 20, "終了前にキューへ入れた拒否はすべて残る");
     }
 
     /// #693 レビュー: 監査の保留の場所が普通のファイルでも、握った組を渡した起動は
