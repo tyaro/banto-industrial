@@ -43,7 +43,8 @@
 //!
 //! API キーは失効(`revoked_at`)されても行として残るが、失効後に削除
 //! できる(#713、2026-10-29)。タグも削除・リネームされうる。プレフィックスは
-//! 挿入時に `api_keys` から写す(0108 より前の行は `NULL`)。監査行は「その時点で
+//! 認証のときの値を写す(#940 のレビュー: 書込みの途中でキーが削除されても
+//! `NULL` にならない。0108 より前の行は `NULL`)。監査行は「その時点で
 //! 何が起きたか」を後から名前解決なしに読めるよう、キー名・外部名を
 //! **書き込み時点の値としてスナップショット**する(`crate::audit`の
 //! `rule_name_snapshot` と同じ設計判断)。
@@ -110,6 +111,9 @@ impl WriteAuditResult {
 pub struct WriteAuditRow {
     pub api_key_id: i64,
     pub api_key_name_snapshot: String,
+    /// 認証のときのキーのプレフィックス（`ApiKeyContext::prefix`）。名前と
+    /// 同じ出どころで、書込みの途中でキーが削除されても `NULL` にならない。
+    pub api_key_prefix_snapshot: String,
     pub tag_id: i64,
     pub external_name_snapshot: String,
     pub value_requested: Option<f64>,
@@ -125,6 +129,7 @@ impl WriteAuditRow {
     pub fn new(
         api_key_id: i64,
         api_key_name_snapshot: impl Into<String>,
+        api_key_prefix_snapshot: impl Into<String>,
         tag_id: i64,
         external_name_snapshot: impl Into<String>,
         action: WriteAuditAction,
@@ -133,6 +138,7 @@ impl WriteAuditRow {
         Self {
             api_key_id,
             api_key_name_snapshot: api_key_name_snapshot.into(),
+            api_key_prefix_snapshot: api_key_prefix_snapshot.into(),
             tag_id,
             external_name_snapshot: external_name_snapshot.into(),
             value_requested: None,
@@ -233,12 +239,12 @@ impl WriteAuditService {
                 api_key_id, api_key_name_snapshot, api_key_prefix_snapshot, tag_id, \
                 external_name_snapshot, value_requested, value_requested_text, action, \
                 result, detail\
-             ) VALUES (?, ?, (SELECT prefix FROM api_keys WHERE id = ?), ?, ?, ?, ?, ?, ?, ?) \
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
              RETURNING id",
         )
         .bind(row.api_key_id)
         .bind(&row.api_key_name_snapshot)
-        .bind(row.api_key_id)
+        .bind(&row.api_key_prefix_snapshot)
         .bind(row.tag_id)
         .bind(&row.external_name_snapshot)
         .bind(row.value_requested)
@@ -345,6 +351,7 @@ mod tests {
         WriteAuditRow::new(
             1,
             "mes-gateway",
+            "bk_abc123",
             10,
             "line1.fast.temp01",
             WriteAuditAction::Write,
@@ -370,8 +377,9 @@ mod tests {
         assert_eq!(row.result, "ok");
     }
 
-    /// #713: キーを削除した後も、監査行から名前とプレフィックスが読める
-    /// （プレフィックスは挿入時に `api_keys` から写す）。
+    /// #713: キーを削除した後も、監査行から名前とプレフィックスが読める。
+    /// 監査行は**キーを削除した後に**挿入する（認証のときのプレフィックスを
+    /// 持たせる。#940 のレビュー: 書込みの途中でキーが削除されても NULL にならない）。
     #[tokio::test]
     async fn name_and_prefix_stay_readable_after_the_key_is_deleted() {
         let pool = migrate_memory().await.expect("migrate_memory");
@@ -381,21 +389,23 @@ mod tests {
             .await
             .unwrap();
         let svc = WriteAuditService::new(pool);
-        let row = WriteAuditRow::new(
-            issued.id,
-            "gone-soon",
-            10,
-            "line1.fast.temp01",
-            WriteAuditAction::Write,
-            WriteAuditResult::Ok,
-        );
-        svc.insert_row(&row).await.unwrap();
 
         keys.revoke(issued.id).await.unwrap();
         assert!(matches!(
             keys.delete(issued.id).await.unwrap(),
             crate::api_keys::ApiKeyDeleteOutcome::Deleted(_)
         ));
+
+        let row = WriteAuditRow::new(
+            issued.id,
+            "gone-soon",
+            issued.prefix.clone(),
+            10,
+            "line1.fast.temp01",
+            WriteAuditAction::Write,
+            WriteAuditResult::Ok,
+        );
+        svc.insert_row(&row).await.unwrap();
 
         let listed = svc.list(ListParams::default()).await.unwrap();
         assert_eq!(listed.rows[0].api_key_name_snapshot, "gone-soon");
@@ -511,6 +521,7 @@ mod tests {
         let row = WriteAuditRow::new(
             2,
             "writer-only",
+            "bk_def456",
             10,
             "line1.fast.temp01",
             WriteAuditAction::RateLimitTripped,
@@ -540,6 +551,7 @@ mod tests {
         let row = WriteAuditRow::new(
             1,
             "mes-gateway",
+            "bk_abc123",
             10,
             "line1.recipe_name",
             WriteAuditAction::Write,
