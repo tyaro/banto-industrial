@@ -556,8 +556,21 @@ impl Core {
                 *slot = true;
             }
         }
-        let mut out =
-            vec![Err(ItemError::Unsupported("計画に含まれない".into())); specs.len()];
+        let mut out: Vec<Result<RawValue, ItemError>> = specs
+            .iter()
+            .zip(&seen)
+            .map(|(spec, &covered)| {
+                if covered {
+                    // Overwritten by the decoded value below.
+                    return Err(ItemError::Unsupported("計画に含まれない".into()));
+                }
+                let reason = self
+                    .conn
+                    .unplanned_reason(spec)
+                    .unwrap_or_else(|| "計画に含まれない".into());
+                Err(ItemError::Unsupported(reason))
+            })
+            .collect();
         for p in &planned {
             let response = self.exchange(&p.step).await?;
             let decoded = self

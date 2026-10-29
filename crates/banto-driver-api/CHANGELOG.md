@@ -16,6 +16,7 @@ R2b-6a（docs/banto-hub-driver-ui-design.md §3。2026-10-24）。UI をドラ�
 - `DriverBase::settings_schema`（既定: 空）、`DriverBase::supported_kinds`（既定: 64bit を除く数値と bit。string なし）、`DriverBase::offset_words`（既定: 「ワード単位のオフセットに対応しません」のエラー）。
 - `ItemError::VerificationFailed(String)`（#902）: 書込みを送ったあとの、ドライバ自身の確認読みの不一致（RMW の確認読み）。機器には効いているかもしれない。これまで `Rejected` に混ざっていたものを分けた。`Rejected` は送る前の拒否（同じビットに true と false など）だけになる。`ItemError` は `#[non_exhaustive]` なので、`_` を書いた `match` は直さなくてよい。WIT の `item-error` の `verification-failed` がこれに写る（WASM ゲストの `rejected` は `Rejected` のまま）。
 - `Transport::Udp`（`"udp"`。#916）: UDP の接続済みソケット。1 データグラム = 1 応答、エンジンは再送しない、ハンドシェイクは 1 往復以上が必須（docs/banto-hub-driver-io-design.md §7.6）。`Transport` は `#[non_exhaustive]` なので、`_` を書いた `match` は直さなくてよい。`keys::TRANSPORT` の説明に `"udp"` を足した。
+- `FrameConnection::unplanned_reason`（既定: `None`）: `plan_read` が `covers` に入れなかった spec の理由。エンジンはこれが `Some(理由)` のとき `Unsupported(理由)`、`None` のとき従来の "計画に含まれない" を返す。WIT には写さない（WASM は既定のまま）。
 - `DriverAddress::index: Option<u64>` と `with_index`（アドレスの area の中の位置。`new` は `None`）。`DriverAddress` は `#[non_exhaustive]` なので、`new` / `with_*` で作っているコードは直さなくてよい。
 
 ### 壊れること

@@ -289,6 +289,16 @@ pub trait FrameConnection: Send + 'static {
     /// Plan the steps that read `specs` (WIT `read.plan`).
     fn plan_read(&mut self, specs: &[TagSpec]) -> Result<Vec<Planned>, FatalError>;
 
+    /// Why [`plan_read`](Self::plan_read) left `spec` out of every
+    /// [`Planned::covers`] (for example a string longer than the driver can
+    /// read). The engine answers such a spec `ItemError::Unsupported(reason)`
+    /// when this returns `Some(reason)`, and the generic text
+    /// `"計画に含まれない"` when it returns `None` (the default). Called only
+    /// for specs that no step covers; it must not touch the wire.
+    fn unplanned_reason(&self, _spec: &TagSpec) -> Option<String> {
+        None
+    }
+
     /// Decode one step's response (WIT `read.decode`). `specs` is the very
     /// slice given to [`plan_read`](Self::plan_read); the result has
     /// `planned.covers.len()` entries in `covers` order, each interpreted by

@@ -1129,10 +1129,9 @@ async fn an_over_cap_string_is_unsupported_without_blocking_batch_mates() {
         .await
         .unwrap();
     assert!(
-        // The frame path carries no per-span reason (the engine answers every
-        // spec the planner skipped with this text); the old client's
-        // `StringSpanUnsupported { words: 481 }` text is not reproduced.
-        matches!(&results[0], Err(ItemError::Unsupported(m)) if m == "計画に含まれない"),
+        // The driver's `unplanned_reason` carries the planner's own text,
+        // with the limit.
+        matches!(&results[0], Err(ItemError::Unsupported(m)) if m.contains("481") && m.contains("480")),
         "{results:?}"
     );
     assert_eq!(results[1], Ok(Value::F64(7.0)));
