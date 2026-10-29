@@ -114,6 +114,8 @@ test.describe.serial('banto-hub offcanvas sidebar (narrow viewport)', () => {
 
 		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeVisible();
 		await expectNavHidden(page, 'タグ登録');
+		// フォーカスは `<body>` に落とさず、見えている ☰ に戻る（バックドロップが消えても）。
+		await expect(page.getByRole('button', { name: 'メニューを開く' })).toBeFocused();
 	});
 
 	test('5. Escape キーでもオフキャンバスが閉じる', async () => {

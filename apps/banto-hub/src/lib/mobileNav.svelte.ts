@@ -18,6 +18,9 @@ import {
 } from './mobileNav';
 import { watchMediaQuery } from './viewportWatch';
 
+/** `(app)/+layout.svelte` のバックドロップ `<button>` のクラス名。 */
+export const NAV_BACKDROP_CLASS = 'nav-backdrop';
+
 /** admin-template のブレークポイント・docs/banto-hub-t19-design.md §8.2 に合わせる。 */
 export const NARROW_BREAKPOINT_QUERY = '(max-width: 900px)';
 
@@ -40,6 +43,24 @@ class MobileNavStore {
 	closeNav(): void {
 		if (!this.#state.open) return;
 		this.#state = { ...this.#state, open: false };
+	}
+
+	/**
+	 * バックドロップのクリックで閉じる（#714 の続き）。バックドロップ自身が閉じると同時に
+	 * DOM から消えるので、フォーカスが `<body>` に落ちる。クリックしたボタンはサイドバーの
+	 * 外にあり `Sidebar.svelte` の退避（中にフォーカスがあるときだけ動く）では拾えないため、
+	 * 閉じた後に見えている ☰ へ移す。バックドロップ以外にフォーカスがあるとき
+	 * は奪わない。
+	 */
+	closeNavFromBackdrop(): void {
+		const active = document.activeElement;
+		// クリックでボタンにフォーカスが付かない環境（Safari 等）では `<body>` のまま。
+		const hadFocus =
+			active === document.body ||
+			(active instanceof HTMLElement && active.classList.contains(NAV_BACKDROP_CLASS));
+		this.closeNav();
+		if (!hadFocus) return;
+		void tick().then(() => findVisibleNavToggle()?.focus());
 	}
 
 	toggleNav(): void {
