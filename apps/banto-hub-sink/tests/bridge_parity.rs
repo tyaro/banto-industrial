@@ -59,13 +59,22 @@
 //! 同じプロセスで同時に走る 9 が約 24 万件を送る）、保存が Good の値を、収集の現在値が
 //! 読むときに Stale と導く。これは製品として正しい表示だが、この試験が見たいのはブリッジが
 //! 送る品質なので、ブリッジのタグの `stale` のうち、収集の現在値に**保存された品質が Good**
-//! のもの（[`is_derived_stale`]。保存の品質は `CurrentValuesHandle::get_with_stored` で、導いた後の品質と同じロックの 1 つの読みから取る）
-//! だけを外す: 並びでは控えず（[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、
-//! 負の条件では保存されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。
-//! 7c）。ブリッジが送る `stale`（クエリの失敗の 1 回目）は保存も `stale` なので、読むまでに
-//! どれだけ遅れても今までどおり捕まえる（値の時刻からの経過では、tick の遅れでブリッジの
-//! `stale` の読みも遅れると区別できない。#947 のレビュー）。経過は落とすときのメッセージに
-//! 載せるだけ。
+//! のもの（[`is_derived_stale`]）だけを外す: 並びでは控えず
+//! （[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、負の条件では保存されている
+//! Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。7c）。ブリッジが送る `stale`
+//! （クエリの失敗の 1 回目）は保存も `stale` なので、読むまでにどれだけ遅れても今までどおり
+//! 捕まえる（値の時刻からの経過では、tick の遅れでブリッジの `stale` の読みも遅れると区別
+//! できない。#947 のレビュー）。経過は落とすときのメッセージに載せるだけ。
+//!
+//! 読みと保存の品質は、どちらも Hub の読み取りの共通処理
+//! `banto_hub_core::hub::read_current_view_with_stored`（`read_current` と同じ有効化・値の
+//! 検証を通り、収集の現在値を同じロック・同じ時計の 1 つの読みで読む）から取る
+//! （[`read_tag_aged`]）。試験の中に読み取りの処理を複製しないので、Hub の読み取り処理が
+//! 変われば試験の観測も変わる（#947 のレビュー）。
+//!
+//! 導かれた Stale を Good とみなすと、`push` のグループが `a` を更新しなくなっても 7c の
+//! `hold` は通ってしまう。そこで 7c では、`hold` の終わり（余裕 1,000 ms）までに `a` の値の
+//! 時刻（`ptime_ms`）が `hold` の開始時より進むことも確かめる（#947 のレビュー）。
 //! 試験の周期や並べ方は緩めない。
 //!
 //! ## 反証（§10.4・checklist §5、PR に書く）
@@ -96,7 +105,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{Request as HttpRequest, StatusCode};
 use axum::Router;
-use banto_collect::{BackoffConfig, CollectorOptions, Quality};
+use banto_collect::{BackoffConfig, CollectorOptions};
 use banto_hub_core::api_keys::ApiKeysService;
 use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
@@ -104,7 +113,7 @@ use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
 use banto_hub_core::db::{init_db, Db};
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
-use banto_hub_core::hub::{quality_str, read_current, CollectorManager};
+use banto_hub_core::hub::{quality_str, read_current_view_with_stored, CollectorManager};
 use banto_hub_core::rest::{api_router, user_session_lookup};
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
@@ -687,58 +696,41 @@ fn read_tag(manager: &CollectorManager, external: &str) -> Reading {
     read_tag_aged(manager, external).reading
 }
 
-/// [`read_tag`] と、収集の現在値に保存された品質（導く前）と、その値の試行の時刻からの経過
-/// （ms）。導いた後の読みと保存の品質は、収集の現在値の 1 つの読み（同じロック・同じ時計）
-/// から取る（別々に読むと、間で書かれた値の品質を組み合わせてしまう）。
+/// [`read_tag`] と、収集の現在値に保存された品質（導く前）と、値の時刻（`ptime_ms`）と、
+/// その時刻からの経過（ms）。読みも保存の品質も、Hub の読み取りの共通処理
+/// `banto_hub_core::hub::read_current_view_with_stored`（`read_current` と同じ
+/// `effective_current_view` を通る。収集の現在値の 1 つの読み = 同じロック・同じ時計）
+/// から取る。試験の中に有効化や値の検証を複製しないので、Hub の読み取り処理が変われば
+/// この試験の観測も変わる（#947 のレビュー）。
 fn read_tag_aged(manager: &CollectorManager, external: &str) -> Aged {
     let map = manager.tag_map();
     let entry = map
         .get(external)
         .unwrap_or_else(|| panic!("tag {external} is not in the catalog"));
     let current = manager.current_values();
-    let snapshot = current
-        .as_ref()
-        .and_then(|handle| handle.get_with_stored(&entry.tag_key));
-    let Some((sample, stored)) = snapshot else {
-        // 現在値が無い（欠測など）: 保存の品質は無い。
-        let (value, quality, ptime_ms) =
-            read_current(entry, current.as_ref(), &manager.server_store(), now_ms());
-        return Aged {
-            reading: Reading {
-                value,
-                quality: quality_str(quality),
-            },
-            stored_quality: None,
-            age_ms: now_ms() - ptime_ms,
-        };
-    };
-    // 経過は導出の後に測る（前に測ると、間で止まったときに導かれた Stale が新しく見える）。
+    let (view, stored) =
+        read_current_view_with_stored(entry, current.as_ref(), &manager.server_store(), now_ms());
+    // 経過は読みの後に測る（前に測ると、間で止まったときに導かれた Stale が新しく見える）。
     let now = now_ms();
-    let (value, quality) = if entry.enabled
-        && sample.value.is_some_and(|value| {
-            value.is_finite() && (entry.data_type != "bit" || value == 0.0 || value == 1.0)
-        }) {
-        (sample.value, sample.quality)
-    } else {
-        (None, Quality::Bad)
-    };
     Aged {
         reading: Reading {
-            value,
-            quality: quality_str(quality),
+            value: view.value,
+            quality: quality_str(view.quality),
         },
-        stored_quality: Some(quality_str(stored)),
-        age_ms: now - sample.ptime_ms,
+        stored_quality: stored.map(quality_str),
+        ptime_ms: view.timestamp_ms,
+        age_ms: now - view.timestamp_ms,
     }
 }
 
-/// 読みと、収集の現在値に保存された品質（導く前。値が無ければ `None`）と、その値の時刻からの
-/// 経過（ms）（[`read_tag_aged`]）。経過は落とすときのメッセージ（`Debug`）に載せるためだけに
-/// 持つ。
+/// 読みと、収集の現在値に保存された品質（導く前。値が無ければ `None`）と、値の時刻
+/// （`ptime_ms`。値が無ければ読んだ時刻）と、その時刻からの経過（ms）（[`read_tag_aged`]）。
+/// 経過は落とすときのメッセージ（`Debug`）に載せるためだけに持つ。
 #[derive(Clone, Copy)]
 struct Aged {
     reading: Reading,
     stored_quality: Option<&'static str>,
+    ptime_ms: i64,
     age_ms: i64,
 }
 
@@ -1010,6 +1002,12 @@ impl Fixture {
             &self.app.manager,
             &self.push_external(column),
         ))
+    }
+
+    /// ブリッジのタグの値の時刻（`ptime_ms`。[`read_tag_aged`]）。`push` のグループが読む
+    /// たびに進む（7c で、導かれた Stale を許容しても更新の停止を見逃さないため）。
+    fn bridge_ptime_ms(&self, column: &str) -> i64 {
+        read_tag_aged(&self.app.manager, &self.push_external(column)).ptime_ms
     }
 
     /// 全列が、両方とも `expected` の状態に落ち着くまで待つ（落ち着かなければ落とす）。
@@ -1573,15 +1571,30 @@ async fn parity_7c_a_key_removed_from_columns_goes_bad() {
         json!("not_in_bridge_set"),
         "{body:?}"
     );
+    let a_ptime_before = fixture.bridge_ptime_ms("a");
     fixture
         .hold(
             Duration::from_millis(1_500),
             "the removed key stays Bad",
             // 残したキーは、読むときに導かれた Stale（tick の遅れ、#946）だけ Good とみなす。
-            // ブリッジが `stale` を送ったら（時刻が新しい）今までどおり落とす。
+            // ブリッジが `stale` を送ったら（保存も `stale`）今までどおり落とす。
             |f| f.pair("b").1 == BAD && f.bridge_ignoring_derived_stale("a") == good(31.5),
         )
         .await;
+    // 導かれた Stale を Good とみなすので、残したキーの更新が止まっても上の `hold` は通る。
+    // `push` のグループ（200 ms）が `a` を読み続けて値の時刻が進むことを別に確かめる
+    // （#947 のレビュー）。1 コア固定で測った tick の最大の遅れ（1,160 ms、#946）は
+    // 1,500 ms の `hold` に収まるが、余裕として `hold` の後に 1,000 ms まで待つ。更新が
+    // 止まっていれば、どれだけ待っても進まない。
+    let advanced = wait_until(Duration::from_millis(1_000), || async {
+        fixture.bridge_ptime_ms("a") > a_ptime_before
+    })
+    .await;
+    assert!(
+        advanced,
+        "the kept key `a` is still updated (ptime_ms before the hold {a_ptime_before}): {:?}",
+        fixture.pairs_aged()
+    );
     fixture.finish().await;
 }
 
@@ -1872,6 +1885,7 @@ fn only_a_derived_stale_is_ignored() {
     let aged = |reading: Reading, stored_quality: Option<&'static str>, age_ms: i64| Aged {
         reading,
         stored_quality,
+        ptime_ms: 0,
         age_ms,
     };
     // 導かれた Stale（保存は Good）は、経過によらず保存されている Good とみなす。
