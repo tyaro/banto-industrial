@@ -23,7 +23,7 @@
 //! gRPC/MQTT の PLC タグ向け E2E テストと合わせて読み取りパスの単一化を
 //! 論証する - 個別に演算タグ版を複製しない判断):
 //! 1. E2E: plc タグ + 演算タグ(平均) → 良好、PLC 断で bad
-//! 2. 演算タグの連鎖(トポロジカル順)・循環登録の拒否(rebuild 失敗)
+//! 2. 演算タグの連鎖(トポロジカル順)・循環登録の拒否(catalog の commit 失敗)
 //! 3. 内部タグの書き込み→読み取り、computed への書き込みは403、retain
 //!    true/false の再起動相当の復元/Bad
 //! 4. WS で演算タグの値が流れる(代表1本)
@@ -245,6 +245,8 @@ struct TestApp {
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -257,6 +259,19 @@ impl Drop for TestApp {
 }
 
 impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+    }
+
     fn ws_url(&self, path: &str) -> String {
         format!("ws://127.0.0.1:{}{path}", self.server.local_addr().port())
     }
@@ -334,7 +349,10 @@ async fn test_app(label: &str) -> TestApp {
             .expect("virtual connection should be provisioned");
     }
 
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
@@ -394,6 +412,7 @@ async fn test_app(label: &str) -> TestApp {
     .await
     .expect("server should start");
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         server,
         router,
@@ -401,6 +420,7 @@ async fn test_app(label: &str) -> TestApp {
         pool,
         manager,
         write_control,
+        controller,
         _env: env,
     }
 }
@@ -568,7 +588,7 @@ async fn e2e_computed_avg_reflects_plc_inputs_then_goes_bad_on_disconnect() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // Wait for the plc inputs to be collected AND the computed tag to be
     // evaluated to the expected average (150).
@@ -629,7 +649,7 @@ async fn computed_chain_is_evaluated_in_dependency_order() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild should succeed");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(5), || async {
@@ -648,7 +668,7 @@ async fn computed_chain_is_evaluated_in_dependency_order() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cyclic_pair_of_computed_tags_fails_rebuild_and_keeps_the_old_state() {
+async fn a_cyclic_pair_of_computed_tags_fails_the_catalog_commit_and_keeps_the_old_state() {
     let app = test_app("cycle").await;
     let revision_before = app.manager.revision();
 
@@ -677,9 +697,13 @@ async fn a_cyclic_pair_of_computed_tags_fails_rebuild_and_keeps_the_old_state() 
 
     let err = app
         .manager
-        .rebuild()
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
         .await
-        .expect_err("a cyclic pair of computed tags must fail rebuild");
+        .expect_err("a cyclic pair of computed tags must fail the catalog commit");
     assert!(err.contains("循環"), "error should mention 循環: {err}");
 
     // Old state (whatever revision existed before the cyclic tags were
@@ -744,7 +768,7 @@ async fn internal_tag_write_then_read_and_computed_write_is_forbidden() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let key = issue_key(
         &app.router,
@@ -825,7 +849,7 @@ async fn retain_true_restores_the_value_across_a_restart_and_retain_false_starts
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let key = issue_key(
         &app.router,
@@ -873,7 +897,14 @@ async fn retain_true_restores_the_value_across_a_restart_and_retain_false_starts
         fresh_sim_registry,
         fresh_computed,
     ));
-    fresh_manager.rebuild().await.expect("post-restart rebuild");
+    fresh_manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("post-restart catalog commit");
 
     let now_ms = fresh_manager.clock().now_ms();
     let map = fresh_manager.tag_map();
@@ -924,7 +955,7 @@ async fn ws_stream_carries_a_computed_tag_value() {
         .create(computed_tag_input("k", group.id, "1 + 1"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // Drive one eval tick before subscribing so the initial snapshot already
     // carries a computed value (WS's own 250ms loop would also pick it up on
@@ -1052,7 +1083,10 @@ async fn controller_test_app(label: &str) -> ControllerTestApp {
             .expect("virtual connection should be provisioned");
     }
 
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
@@ -1206,7 +1240,10 @@ async fn api_key_catalog_and_values_follow_335_contract() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     let key = issue_key(&app.router, &app.admin_token, "sdk", &["read"]).await;
 
