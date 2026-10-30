@@ -59,7 +59,8 @@
 //! 注 2）、`obs`/`skip`/`stop` = 見張りの観測・今回は見ない・見張りを終える、
 //! `ask`/`noask` = 確認を出す／出さずに同意として進む（Fallback）、
 //! `proceed`/`again`/`cancel` = 確認の答え（終了へ進む・収集中の文言で確かめ直す・
-//! 取り消し）、`w60`/`w5`/`nowait` = 移り変わりの終わりを 60 秒・5 秒待つ・待たない。
+//! 取り消し）、`defer` = 復旧が終わるまで終了を保留する（注 5）、
+//! `w60`/`w5`/`nowait` = 移り変わりの終わりを 60 秒・5 秒待つ・待たない。
 //!
 //! | 出来事（入り口）                                   | St     | D       | Df      | S       | F       | Fc      | T      | Te     | R      | Rb      | Q       | Qt     | X      | Xt     | Xo     |
 //! | -------------------------------------------------- | ------ | ------- | ------- | ------- | ------- | ------- | ------ | ------ | ------ | ------- | ------- | ------ | ------ | ------ | ------ |
@@ -77,6 +78,7 @@
 //! | 起動を続けてよいか（`launch_desktop`）             | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | exit   | exit   | exit   |
 //! | エンジンを置く（`start_and_register`）             | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | exit   | exit   | exit   |
 //! | トレイ・Fallback の「終了」                        | ask    | ask     | ask     | ask     | noask   | conf    | noask  | noask  | rec    | ask     | quit    | quit   | quit   | quit   | ask    |
+//! | インストーラからの終了の要求（注 5）               | noask  | noask   | noask   | noask   | noask   | noask   | noask  | noask  | defer  | noask   | quit    | quit   | quit   | quit   | noask  |
 //! | 確認の答え: 取り消し                               | ign    | ign     | ign     | ign     | ign     | cancel  | ign    | ign    | ign    | ign     | ign     | ign    | ign    | ign    | ign    |
 //! | 確認の答え: 同意（暇 → 暇）                        | ign    | ign     | ign     | ign     | ign     | proceed | ign    | ign    | rec    | ign     | ign     | ign    | ign    | ign    | ign    |
 //! | 確認の答え: 同意（暇の文言 → 今は収集中）          | ign    | ign     | ign     | ign     | ign     | again   | ign    | ign    | rec    | ign     | ign     | ign    | ign    | ign    | ign    |
@@ -131,6 +133,27 @@
 //!   「運用モードへ」の続き。札の種類は移り変わり（`Transition`）で、Service・Fallback の画面の
 //!   ときだけ（`nosvc`。Desktop は上の注 3 の道）。終了が確定した後は始めない（`quit`。サービスへ
 //!   開始・停止を出してから終了が走ると、切り替えが途中で見捨てられる）。
+//! - **注 5（インストーラからの終了の要求、#392 B3-4）**: `chronogazer.exe --quit-for-update`
+//!   を single-instance で受けたとき（`tray::request_quit_for_update`）。トレイの「終了」と同じ
+//!   確認の段階を「押す → 同意」と続けて通し（[`Lifecycle::request_quit_for_update`]、同じ
+//!   ロックの中）、確認は出さない（`noask`）。確認ダイアログが出ていれば（Fc）その答えを
+//!   待たずに同意とする（遅れて届いた答えは `ign`）。復旧中（R）は断らずに**保留する**
+//!   （`defer`。印 `pending_quit_for_update` を立て、要求を [`DeferredQuitForUpdate`] として
+//!   入れ物に預かる。復旧の途中で切らず、復旧がすぐ後に終わったときにインストーラの上限で
+//!   強制終了に進ませないため - PR #970 のオーナーレビュー P1）。保留の間（**Rp** = R に印を
+//!   足した状態。判断は R と同じで、この行だけ `ign` = 2 つ目の要求は何もしない。テスト
+//!   `pending_quit_for_update_decides_like_recovering`）に、利用者がトレイの「終了」を押しても
+//!   R と同じく断る（`rec`。保留は残る）。復旧の札が返った時点（成功で Desktop・Service・
+//!   Fallback のどれかを置く `TransitionFinish`、失敗してエラーの窓に戻る `TransitionAbort`
+//!   のどちらでも）で印を下ろし、[`Lifecycle::apply`] が**同じロックの中で**この出来事を
+//!   もう一度通して終了を確定し（R の後の状態では必ず `noask`。収集の受付の印は、その時点の
+//!   収集で立てる - 復旧の時点ではエンジンが無い）、ロックの外で預かった終了処理（`tray::quit`）を
+//!   走らせる。終了が確定した後（Q〜Xt）は何もしない（`quit`。インストーラはプロセスの
+//!   終わりを待つ）。インストーラが待つ上限は [`QUIT_FOR_UPDATE_WORST_CASE`] に合わせる。
+//!   起動の途中（起動の判定の前。`ShellState` を置く前）に届いた要求は、表の外の受け皿
+//!   [`QuitForUpdateInbox`] が保留し、`shell::start` が起動の判定を終えた直後（または起動に
+//!   失敗して「終了」だけの窓を出した直後）に 1 回だけ取り出してこの行を通す（PR #970 の
+//!   オーナーレビュー P2。黙って捨てるとインストーラは上限まで待って強制終了に進む）。
 //!
 //! 表に出てこない約束（テスト `invariants_hold_from_every_state` が印のすべての組で
 //! 確かめる）:
@@ -140,6 +163,8 @@
 //! - 見張りは Desktop を観測しない（Desktop・Starting では見張りを終える。移り変わりの
 //!   判断 `shell::on_tick` が Desktop を返さないことは `shell` の表のテスト）。
 //! - 復旧の札と終了の確定は同時に立たない（どちらも同じロックの中で相手を見て断る）。
+//! - 終了の保留（`pending_quit_for_update`）は復旧の札がある間だけ立ち、立てるのは
+//!   インストーラからの終了の要求だけ、下ろすのは札を返す出来事だけ（注 5）。
 //! - 復旧の札を取るのはエンジンが無いときだけ。復旧の札とエンジンが並ぶのは、札を
 //!   持ったままエンジンを置いた（対処の後の起動が `start()` を終えた）ときだけ（表の注 2）。
 //! - 札は常に 1 つ。見張りの古い世代の適用は断る。世代は札を返して新しい画面を置いた
@@ -269,6 +294,19 @@ pub(crate) const EXIT_CLEANUP_BUDGET: Duration = Duration::from_secs(5);
 /// 自発的な終了（トレイ・Fallback の「終了」）が移り変わりを待つ上限。
 pub(crate) const TRANSITION_WAIT_ON_QUIT: Duration = Duration::from_secs(60);
 
+/// インストーラからの終了の要求（`--quit-for-update`、#392 B3-4）を受けてから、シェルが
+/// `app.exit(0)` に至るまでの**最悪の時間**（PR #970 のオーナーレビュー P2）。要求は
+/// トレイの「終了」と同じ [`ExitTrigger::TrayQuit`] の予算で後始末するので、移り変わりの
+/// 終わりの待ち（[`TRANSITION_WAIT_ON_QUIT`]）と後始末（[`EXIT_CLEANUP_BUDGET`]）の和
+/// = 65 秒。インストーラがプロセスの終わりを待つ上限は、これに余裕を足した値にする
+/// （設計書 §3.3「インストーラによるシェルの停止」の 90 秒）。どちらかの予算を変えたら
+/// 設計書の値も直す（テスト `quit_for_update_worst_case_is_the_tray_quit_budget`）。
+///
+/// 含まないもの: DB の復旧中の保留（表の注 5。復旧の長さは上限を持たない）と、後始末が
+/// 済まなかったときの知らせのダイアログ（`tray::quit`。利用者が OK を押すまで終わらない）。
+pub(crate) const QUIT_FOR_UPDATE_WORST_CASE: Duration =
+    TRANSITION_WAIT_ON_QUIT.saturating_add(EXIT_CLEANUP_BUDGET);
+
 /// 終了の後始末に入った経路（記録の文言と待ちの上限 [`exit_budgets`] のため）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExitTrigger {
@@ -370,6 +408,9 @@ pub(crate) struct LifecycleState {
     pub(crate) engine: bool,
     /// 対処の窓の処理中（二度押しを無視し、窓の × を止める）。
     pub(crate) recovery_action: bool,
+    /// インストーラからの終了の要求を、DB の復旧が終わるまで保留している（モジュール doc の
+    /// 表の注 5）。復旧の札がある間だけ立つ。
+    pub(crate) pending_quit_for_update: bool,
 }
 
 impl LifecycleState {
@@ -384,6 +425,7 @@ impl LifecycleState {
             exiting: false,
             engine: false,
             recovery_action: false,
+            pending_quit_for_update: false,
         }
     }
 
@@ -466,6 +508,9 @@ pub(crate) enum Event {
     EngineAdmit,
     /// トレイ・Fallback の窓の「終了」が押された。
     QuitRequest,
+    /// インストーラからの終了の要求（`--quit-for-update`、#392 B3-4。注 5）。確認を出さずに
+    /// 同意として進む。確認ダイアログが出ていればその答えを待たずに同意とする。
+    QuitForUpdate,
     /// 終了の確認の答え（確認しない態では同意として）。`now_busy` は、同意で確認中・
     /// 復旧中でないときだけ、収集の受付の印を立てて読んだ値（それ以外は使わない）。
     QuitAnswer {
@@ -561,6 +606,8 @@ pub(crate) enum Decision {
         confirm: bool,
     },
     QuitAnswer(QuitAnswerOutcome),
+    /// インストーラからの終了の要求を、DB の復旧が終わるまで保留した（表の注 5）。
+    DeferQuit,
     /// 終了の後始末へ: 移り変わりの終わりを `transition_wait` まで待ってから
     /// （`None` なら待たずに）後始末へ進む。
     Exit {
@@ -639,6 +686,9 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 next.generation = state.generation.wrapping_add(1);
                 next.streak = 0;
                 next.ticket = Ticket::None;
+                // 復旧が終わった: 保留していたインストーラからの終了の要求を下ろす
+                // （`Lifecycle::apply` が同じロックの中でもう一度通す。注 5）。
+                next.pending_quit_for_update = false;
                 Decision::Applied
             }
         }
@@ -647,6 +697,7 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 Decision::Ignored
             } else {
                 next.ticket = Ticket::None;
+                next.pending_quit_for_update = false;
                 Decision::Applied
             }
         }
@@ -683,6 +734,29 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 Decision::AskQuit {
                     confirm: crate::tray::needs_quit_confirm(&mode),
                 }
+            }
+        },
+        // 注 5: トレイの「終了」と同じ確認の段階を通るが、確認は出さない（`confirm: false`）。
+        // 確認ダイアログが出ていても（Fc）断らず、同意として進む - 断るとインストーラは
+        // 上限の後に強制終了し、最終 flush を失う。復旧中（R）は断らずに保留する
+        // （復旧の途中で切らず、復旧が終わった時点で `Lifecycle::apply` がもう一度通す。
+        // 既に保留していれば 2 つ目は何もしない）。終了が確定した後（Q〜Xt）は 2 つ目を
+        // 走らせない。
+        Event::QuitForUpdate => match decide_request(state.quit) {
+            (_, QuitRequestDecision::AlreadyQuitting) => {
+                Decision::Refused(Refusal::AlreadyQuitting)
+            }
+            _ if state.ticket == Ticket::Recovery => {
+                if state.pending_quit_for_update {
+                    Decision::Ignored
+                } else {
+                    next.pending_quit_for_update = true;
+                    Decision::DeferQuit
+                }
+            }
+            (phase, _) => {
+                next.quit = phase;
+                Decision::AskQuit { confirm: false }
             }
         },
         Event::QuitAnswer {
@@ -862,6 +936,107 @@ pub(crate) enum QuitRequestOutcome {
     AlreadyHandled,
 }
 
+/// インストーラからの終了の要求（`--quit-for-update`）にすること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitForUpdateOutcome {
+    /// 確認を出さずに終了処理へ進む（終了は確定し、新しい復旧を始めない）。
+    Proceed,
+    /// DB の復旧の途中なので、復旧が終わるまで保留した（預かった
+    /// [`DeferredQuitForUpdate`] を、復旧の札が返った時点で入れ物が走らせる）。
+    Deferred,
+    /// 既に保留している - 2 つ目は何もしない（最初の要求が復旧の後に走る）。
+    AlreadyDeferred,
+    /// 終了処理は既に走っている - 何もしない（インストーラはプロセスの終わりを待つ）。
+    AlreadyQuitting,
+}
+
+/// 復旧が終わるまで保留したインストーラからの終了の要求（表の注 5）。復旧の札が返った
+/// 時点で [`Lifecycle::apply`] が、同じロックの中で `admission` から作った収集の受付の口で
+/// 終了を確定し、ロックの外で `run`（`tray::quit`）を走らせる。
+pub(crate) struct DeferredQuitForUpdate {
+    /// 終了を確定する時点の収集の受付の口（復旧の時点ではエンジンが無く、復旧の後の起動で
+    /// 置かれるので、保留の時点の口は使わない）。ロックを握ったまま呼ぶ - 即時に終わる
+    /// 読み取りだけにする（モジュール doc「ロックと待ち」）。
+    pub(crate) admission: Box<dyn Fn() -> Box<dyn QuitAdmission> + Send>,
+    /// 終了が確定した後にロックの外で走らせる終了処理。
+    pub(crate) run: Box<dyn FnOnce() + Send>,
+}
+
+impl std::fmt::Debug for DeferredQuitForUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DeferredQuitForUpdate")
+    }
+}
+
+/// 起動の途中（`shell::start` が起動の判定を終えて `ShellState` を置く前、または起動に
+/// 失敗して「終了」だけの窓になる前）に届いたインストーラからの終了の要求の受け皿
+/// （PR #970 のオーナーレビュー P2。`run()` が manage する）。single-instance のコール
+/// バックは起動の処理と同じメインスレッドで動くが、窓を作る間のメッセージの処理で
+/// 起動の途中に割り込めるので、届いた要求を落とさずに「保留」として覚え、起動の判定が
+/// 終わった時点（[`Self::open`]）で 1 回だけ取り出して走らせる。開いた後の要求は受け皿を
+/// 通らず、呼び出し側がそのまま処理する。ロック 1 つで、[`Self::receive`] と
+/// [`Self::open`] がどの順で重なっても要求は**ちょうど 1 回**処理される（受け皿を開く前に
+/// 届けば `open` が拾い、後に届けば `receive` が「即時」を返す。2 つ目以降の要求は
+/// 保留の間は何もしない）。Tauri に依存しない（テスト）。
+#[derive(Debug, Default)]
+pub(crate) struct QuitForUpdateInbox {
+    state: Mutex<InboxState>,
+}
+
+/// [`QuitForUpdateInbox`] の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InboxState {
+    /// 起動の途中（届いた要求は保留する）。
+    #[default]
+    Closed,
+    /// 起動の途中に要求が届いた（開いたときに 1 回走らせる）。
+    Held,
+    /// 起動の判定が終わった（要求は呼び出し側がそのまま処理する）。
+    Open,
+}
+
+/// [`QuitForUpdateInbox::receive`] の答え。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboxReceipt {
+    /// 受け皿は開いている - 呼び出し側が今すぐ処理する。
+    Immediate,
+    /// 起動の途中なので保留した - 開いたときに走る。
+    Held,
+    /// 既に保留している - 何もしない（最初の要求が開いたときに走る）。
+    AlreadyHeld,
+}
+
+impl QuitForUpdateInbox {
+    fn lock(&self) -> MutexGuard<'_, InboxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 要求が届いた。
+    pub(crate) fn receive(&self) -> InboxReceipt {
+        let mut state = self.lock();
+        match *state {
+            InboxState::Open => InboxReceipt::Immediate,
+            InboxState::Closed => {
+                *state = InboxState::Held;
+                InboxReceipt::Held
+            }
+            InboxState::Held => InboxReceipt::AlreadyHeld,
+        }
+    }
+
+    /// 起動の判定が終わった（`ShellState` を置いた直後、または「終了」だけの窓を出した
+    /// 直後）。保留していた要求があれば `true`（呼び出し側が 1 回走らせる）。2 回目以降は
+    /// `false`。
+    pub(crate) fn open(&self) -> bool {
+        let mut state = self.lock();
+        let held = *state == InboxState::Held;
+        *state = InboxState::Open;
+        held
+    }
+}
+
 /// 終了の後始末に入るときの計画（[`Lifecycle::begin_exit`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ExitPlan {
@@ -876,6 +1051,10 @@ pub(crate) struct Lifecycle {
     state: Mutex<LifecycleState>,
     /// 札が返ったときに起こす（[`Self::wait_idle`]）。
     idle: Condvar,
+    /// 復旧が終わるまで保留したインストーラからの終了の要求（`state` の
+    /// `pending_quit_for_update` と対。`state` のロックを握ったままでしか触らないので、
+    /// 順序は常に `state` → `deferred_quit`）。
+    deferred_quit: Mutex<Option<DeferredQuitForUpdate>>,
 }
 
 impl Lifecycle {
@@ -884,6 +1063,7 @@ impl Lifecycle {
         Arc::new(Self {
             state: Mutex::new(LifecycleState::starting()),
             idle: Condvar::new(),
+            deferred_quit: Mutex::new(None),
         })
     }
 
@@ -911,19 +1091,51 @@ impl Lifecycle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// 出来事を 1 つ [`step`] に通す。札が返ったら待っている側を起こす。
+    /// 出来事を 1 つ [`step`] に通す。札が返ったら待っている側を起こす。復旧の札が返って
+    /// 保留していたインストーラからの終了の要求が下りたら、**同じロックの中で**その要求を
+    /// もう一度通して終了を確定し（表の注 5）、ロックの外で預かった終了処理を走らせる。
     fn apply(&self, event: Event) -> Decision {
-        let released = {
+        let (released, decision, resume) = {
             let mut state = self.lock();
             let (next, decision) = step(&state, &event);
             let released = state.ticket != Ticket::None && next.ticket == Ticket::None;
+            let pending_dropped = state.pending_quit_for_update && !next.pending_quit_for_update;
             *state = next;
-            (released, decision)
+            let resume = if pending_dropped {
+                self.resume_deferred_quit_locked(&mut state)
+            } else {
+                None
+            };
+            (released, decision, resume)
         };
-        if released.0 {
+        if released {
             self.idle.notify_all();
         }
-        released.1
+        if let Some(run) = resume {
+            run();
+        }
+        decision
+    }
+
+    /// 復旧の札が返った時点で、預かっていた終了の要求をもう一度通す（ロックの中）。
+    /// 終了を確定できたら、ロックの外で走らせる終了処理を返す。
+    fn resume_deferred_quit_locked(
+        &self,
+        state: &mut LifecycleState,
+    ) -> Option<Box<dyn FnOnce() + Send>> {
+        let deferred = self
+            .deferred_quit
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()?;
+        let admission = call_under_lock(|| (deferred.admission)());
+        match Self::quit_for_update_locked(state, admission.as_ref()) {
+            QuitForUpdateOutcome::Proceed => Some(deferred.run),
+            // 札が返った直後なので保留にはならない。終了が既に確定していれば（復旧中には
+            // 立たないので来ない）2 つ目は走らせない。
+            QuitForUpdateOutcome::AlreadyQuitting => None,
+            other => unreachable!("a resumed quit for update proceeds: {other:?}"),
+        }
     }
 
     /// 今の状態の写し（テスト）。
@@ -1098,10 +1310,20 @@ impl Lifecycle {
         admission: &dyn QuitAdmission,
     ) -> QuitAnswerOutcome {
         let mut state = self.lock();
-        let now_busy = needs_admission(&state, confirmed)
-            && call_under_lock(|| admission.begin_quit_confirm());
+        Self::answer_quit_locked(&mut state, confirmed, prompted_busy, admission)
+    }
+
+    /// [`Lifecycle::answer_quit`] の本体（ロックの中）。
+    fn answer_quit_locked(
+        state: &mut LifecycleState,
+        confirmed: bool,
+        prompted_busy: bool,
+        admission: &dyn QuitAdmission,
+    ) -> QuitAnswerOutcome {
+        let now_busy =
+            needs_admission(state, confirmed) && call_under_lock(|| admission.begin_quit_confirm());
         let (next, decision) = step(
-            &state,
+            state,
             &Event::QuitAnswer {
                 confirmed,
                 prompted_busy,
@@ -1116,6 +1338,53 @@ impl Lifecycle {
             call_under_lock(|| admission.cancel_quit_confirm());
         }
         outcome
+    }
+
+    /// インストーラからの終了の要求（`--quit-for-update`、#392 B3-4。表の注 5）。トレイの
+    /// 「終了」の「押す → 同意」を**同じロックの中で**続けて通す（確認は出さない。収集の
+    /// 受付の印は [`Lifecycle::answer_quit`] と同じ形で立てる）。同意は「収集中の文言で
+    /// 同意した」として渡すので、収集中でも確かめ直さずに進む（止めるものは後始末が
+    /// 止める）。復旧中は `deferred` を預かって保留し（復旧の札が返った時点で [`Self::apply`]
+    /// が走らせる）、既に保留していれば何もしない。終了が確定した後は何もしない。
+    pub(crate) fn request_quit_for_update(
+        &self,
+        admission: &dyn QuitAdmission,
+        deferred: DeferredQuitForUpdate,
+    ) -> QuitForUpdateOutcome {
+        let mut state = self.lock();
+        let outcome = Self::quit_for_update_locked(&mut state, admission);
+        if outcome == QuitForUpdateOutcome::Deferred {
+            let replaced = self
+                .deferred_quit
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .replace(deferred);
+            debug_assert!(replaced.is_none(), "保留の印が立つときは預かりは空");
+        }
+        outcome
+    }
+
+    /// [`Lifecycle::request_quit_for_update`] の本体（ロックの中。預かりは触らない）。
+    fn quit_for_update_locked(
+        state: &mut LifecycleState,
+        admission: &dyn QuitAdmission,
+    ) -> QuitForUpdateOutcome {
+        let (next, decision) = step(state, &Event::QuitForUpdate);
+        *state = next;
+        match decision {
+            Decision::AskQuit { .. } => {}
+            Decision::DeferQuit => return QuitForUpdateOutcome::Deferred,
+            Decision::Ignored => return QuitForUpdateOutcome::AlreadyDeferred,
+            Decision::Refused(Refusal::AlreadyQuitting) => {
+                return QuitForUpdateOutcome::AlreadyQuitting;
+            }
+            other => unreachable!("QuitForUpdate decides AskQuit, defers or refuses: {other:?}"),
+        }
+        match Self::answer_quit_locked(state, true, true, admission) {
+            QuitAnswerOutcome::Proceed => QuitForUpdateOutcome::Proceed,
+            // 確認の段階は上で Confirming にし、復旧中は上で保留しているので、ここは進むだけ。
+            other => unreachable!("a quit for update proceeds: {other:?}"),
+        }
     }
 
     /// 終了の扉を閉じ（以後の移り変わり・エンジンを置くこと・起動の続きを断る）、
@@ -1374,6 +1643,7 @@ mod tests {
             Decision::QuitAnswer(QuitAnswerOutcome::RecoveryInProgress) => "rec",
             Decision::QuitAnswer(QuitAnswerOutcome::Cancelled) => "cancel",
             Decision::QuitAnswer(QuitAnswerOutcome::Ignored) => "ign",
+            Decision::DeferQuit => "defer",
             Decision::Exit {
                 transition_wait, ..
             } => match transition_wait {
@@ -1412,6 +1682,7 @@ mod tests {
             ("起動を続けてよいか", Event::LaunchCheck, ["go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "exit", "exit", "exit"]),
             ("エンジンを置く", Event::EngineAdmit, ["go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "exit", "exit", "exit"]),
             ("終了", Event::QuitRequest, ["ask", "ask", "ask", "ask", "noask", "conf", "noask", "noask", "rec", "ask", "quit", "quit", "quit", "quit", "ask"]),
+            ("インストーラからの終了の要求", Event::QuitForUpdate, ["noask", "noask", "noask", "noask", "noask", "noask", "noask", "noask", "defer", "noask", "quit", "quit", "quit", "quit", "noask"]),
             ("答え: 取り消し", answer(false, false, false), ["ign", "ign", "ign", "ign", "ign", "cancel", "ign", "ign", "ign", "ign", "ign", "ign", "ign", "ign", "ign"]),
             ("答え: 同意（暇 → 暇）", answer(true, false, false), ["ign", "ign", "ign", "ign", "ign", "proceed", "ign", "ign", "rec", "ign", "ign", "ign", "ign", "ign", "ign"]),
             ("答え: 同意（暇 → 収集中）", answer(true, false, true), ["ign", "ign", "ign", "ign", "ign", "again", "ign", "ign", "rec", "ign", "ign", "ign", "ign", "ign", "ign"]),
@@ -1491,6 +1762,45 @@ mod tests {
         );
     }
 
+    /// 表の注 5: 終了を保留した復旧中（Rp = R に `pending_quit_for_update` を足した状態）の
+    /// 判断は、どの出来事でも R と同じで、「インストーラからの終了の要求」の行だけ `ign`
+    /// （2 つ目の要求は何もしない）。札を返す 2 行は保留を下ろし、ほかの出来事は保留を
+    /// 持ち続ける。
+    #[test]
+    fn pending_quit_for_update_decides_like_recovering() {
+        let columns = columns();
+        let (_, recovering) = columns
+            .iter()
+            .find(|(name, _)| *name == "R")
+            .expect("R column");
+        let pending = LifecycleState {
+            pending_quit_for_update: true,
+            ..recovering.clone()
+        };
+        let r_index = columns.iter().position(|(name, _)| *name == "R").unwrap();
+        let mut mismatches = Vec::new();
+        for (label, event, expected) in table() {
+            let want = if event == Event::QuitForUpdate {
+                "ign"
+            } else {
+                expected[r_index]
+            };
+            let (next, decision) = step(&pending, &event);
+            let got = code(&decision);
+            if got != want {
+                mismatches.push(format!("{label} × Rp: 期待 {want}、実際 {got}"));
+            }
+            let keeps = !matches!(event, Event::TransitionFinish(_) | Event::TransitionAbort);
+            if next.pending_quit_for_update != keeps {
+                mismatches.push(format!(
+                    "{label} × Rp: 保留が {}",
+                    if keeps { "下りた" } else { "残った" }
+                ));
+            }
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
     // ---- 約束（印のすべての組で） ----
 
     fn all_views() -> Vec<Option<ShellView>> {
@@ -1508,7 +1818,9 @@ mod tests {
         state.engine && state.ticket == Ticket::Recovery
     }
 
-    /// 印のすべての組（画面 4 × 札 3 × 終了の段階 3 × 扉 2 × エンジン 2 × 対処の窓 2）。
+    /// 印のすべての組（画面 4 × 札 3 × 終了の段階 3 × 扉 2 × エンジン 2 × 対処の窓 2、
+    /// 復旧の札の組には終了の保留 2）。保留は復旧の札がある間だけ立つ（注 5）ので、
+    /// ほかの札との組は作らない。
     fn all_states() -> Vec<LifecycleState> {
         let mut states = Vec::new();
         for view in all_views() {
@@ -1517,16 +1829,24 @@ mod tests {
                     for exiting in [false, true] {
                         for engine in [false, true] {
                             for recovery_action in [false, true] {
-                                states.push(LifecycleState {
-                                    view: view.clone(),
-                                    generation: GEN,
-                                    streak: 1,
-                                    ticket,
-                                    quit,
-                                    exiting,
-                                    engine,
-                                    recovery_action,
-                                });
+                                let pendings: &[bool] = if ticket == Ticket::Recovery {
+                                    &[false, true]
+                                } else {
+                                    &[false]
+                                };
+                                for &pending_quit_for_update in pendings {
+                                    states.push(LifecycleState {
+                                        view: view.clone(),
+                                        generation: GEN,
+                                        streak: 1,
+                                        ticket,
+                                        quit,
+                                        exiting,
+                                        engine,
+                                        recovery_action,
+                                        pending_quit_for_update,
+                                    });
+                                }
                             }
                         }
                     }
@@ -1559,6 +1879,7 @@ mod tests {
             Event::LaunchCheck,
             Event::EngineAdmit,
             Event::QuitRequest,
+            Event::QuitForUpdate,
             Event::ExitBegin(ExitTrigger::TrayQuit),
             Event::ExitBegin(ExitTrigger::RunEventExit),
             Event::OpenWindow,
@@ -1636,6 +1957,31 @@ mod tests {
                 if !both(&state) {
                     assert!(!both(&next), "復旧と終了の確定が並んだ: {at}");
                 }
+                // 終了の保留は復旧の札がある間だけ立ち、立てるのはインストーラからの
+                // 終了の要求だけ、下ろすのは札を返す出来事だけ（注 5）。
+                assert!(
+                    !next.pending_quit_for_update || next.ticket == Ticket::Recovery,
+                    "復旧の札なしに保留が立った: {at}"
+                );
+                if !state.pending_quit_for_update && next.pending_quit_for_update {
+                    assert_eq!(event, Event::QuitForUpdate, "{at}");
+                    assert_eq!(decision, Decision::DeferQuit, "{at}");
+                }
+                if state.pending_quit_for_update && !next.pending_quit_for_update {
+                    assert!(
+                        matches!(event, Event::TransitionFinish(_) | Event::TransitionAbort),
+                        "{at}"
+                    );
+                    assert_eq!(next.ticket, Ticket::None, "{at}");
+                }
+                assert_eq!(
+                    decision == Decision::DeferQuit,
+                    event == Event::QuitForUpdate
+                        && state.ticket == Ticket::Recovery
+                        && state.quit != QuitPhase::Quitting
+                        && !state.pending_quit_for_update,
+                    "{at}"
+                );
                 // 復旧の札とエンジンが並ぶのは、札を持ったままエンジンを置いたときだけ
                 // （復旧の札はエンジンが無いときだけ取る。表の注 2）。
                 if !recovery_with_engine(&state) && recovery_with_engine(&next) {
@@ -1694,6 +2040,16 @@ mod tests {
                             Decision::Refused(Refusal::RecoveryInProgress),
                             "{at}"
                         );
+                    }
+                    // インストーラからの終了の要求は、復旧中は断らずに保留する（注 5）。
+                    if event == Event::QuitForUpdate && state.quit != QuitPhase::Quitting {
+                        let expected = if state.pending_quit_for_update {
+                            Decision::Ignored
+                        } else {
+                            Decision::DeferQuit
+                        };
+                        assert_eq!(decision, expected, "{at}");
+                        assert!(next.pending_quit_for_update, "{at}");
                     }
                     if let Event::QuitAnswer {
                         confirmed: true, ..
@@ -1800,7 +2156,8 @@ mod tests {
     /// 表の注 2: エンジンが置かれた状態からは、どの状態でも復旧の札を出さない。
     #[test]
     fn recovery_ticket_is_only_taken_without_an_engine() {
-        assert_eq!(all_states().len(), 288);
+        // 288 の組に、復旧の札の組（96）の終了の保留が加わる（注 5）。
+        assert_eq!(all_states().len(), 288 + 96);
         for state in all_states().into_iter().filter(|state| state.engine) {
             let (next, decision) = step(&state, &Event::RecoveryBegin);
             assert_ne!(decision, Decision::Proceed, "{state:?}");
@@ -2216,6 +2573,227 @@ mod tests {
         );
     }
 
+    /// #392 B3-4: インストーラからの終了の要求は、どの画面でも確認を出さずに終了を確定し
+    /// （収集中でも確かめ直さない）、収集の受付の印はトレイの同意と同じく 1 回立てる。
+    /// 2 回目は何もしない。
+    #[test]
+    fn quit_for_update_proceeds_without_confirmation_in_every_view() {
+        for view in [
+            ShellView::Desktop,
+            ShellView::Service { port: 1 },
+            fallback_view(),
+        ] {
+            let gate = Lifecycle::started(view.clone());
+            let busy = Counting {
+                busy: true,
+                ..Counting::default()
+            };
+            let (deferred, trace) = deferred_quit();
+            assert_eq!(
+                gate.request_quit_for_update(&busy, deferred),
+                QuitForUpdateOutcome::Proceed,
+                "{view:?}"
+            );
+            assert_eq!(busy.begun.load(Ordering::SeqCst), 1, "{view:?}");
+            assert_eq!(busy.cancelled.load(Ordering::SeqCst), 0, "{view:?}");
+            // 保留していないので、預かりは使わない。
+            assert_eq!(trace.ran.load(Ordering::SeqCst), 0, "{view:?}");
+            assert!(gate.quitting(), "{view:?}");
+            assert!(!gate.may_open_window(), "{view:?}");
+            let (deferred, _) = deferred_quit();
+            assert_eq!(
+                gate.request_quit_for_update(&busy, deferred),
+                QuitForUpdateOutcome::AlreadyQuitting,
+                "{view:?}"
+            );
+            assert_eq!(busy.begun.load(Ordering::SeqCst), 1, "{view:?}");
+            // トレイの「終了」も 2 つ目は走らない。
+            assert_eq!(gate.request_quit(), QuitRequestOutcome::AlreadyHandled);
+        }
+    }
+
+    /// #392 B3-4: 確認ダイアログが出ている間に要求が来たら、答えを待たずに同意として進み、
+    /// 遅れて届いた答えは無視する。
+    #[test]
+    fn quit_for_update_takes_over_a_pending_prompt() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        assert_eq!(
+            gate.request_quit(),
+            QuitRequestOutcome::Ask { confirm: true }
+        );
+        let (deferred, _) = deferred_quit();
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy, deferred),
+            QuitForUpdateOutcome::Proceed
+        );
+        assert!(gate.quitting());
+        assert_eq!(
+            gate.answer_quit(true, false, &NotBusy),
+            QuitAnswerOutcome::Ignored
+        );
+        assert_eq!(
+            gate.answer_quit(false, false, &NotBusy),
+            QuitAnswerOutcome::Ignored
+        );
+    }
+
+    /// 預かる終了の要求（テスト用）。走った回数と、終了を確定する時点に作った収集の
+    /// 受付の口を呼んだ回数を数える。
+    #[derive(Default)]
+    struct DeferredTrace {
+        ran: AtomicUsize,
+        admissions_made: AtomicUsize,
+        begun: AtomicUsize,
+    }
+
+    fn deferred_quit() -> (DeferredQuitForUpdate, Arc<DeferredTrace>) {
+        let trace = Arc::new(DeferredTrace::default());
+        struct TracingAdmission(Arc<DeferredTrace>);
+        impl QuitAdmission for TracingAdmission {
+            fn begin_quit_confirm(&self) -> bool {
+                self.0.begun.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+            fn cancel_quit_confirm(&self) {}
+        }
+        let for_admission = Arc::clone(&trace);
+        let for_run = Arc::clone(&trace);
+        let deferred = DeferredQuitForUpdate {
+            admission: Box::new(move || {
+                for_admission.admissions_made.fetch_add(1, Ordering::SeqCst);
+                Box::new(TracingAdmission(Arc::clone(&for_admission)))
+            }),
+            run: Box::new(move || {
+                for_run.ran.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        (deferred, trace)
+    }
+
+    /// PR #970 のオーナーレビュー P1: 復旧中の要求は断らずに保留し（扉は閉じず、終了も
+    /// 確定しない）、復旧が終わった時点で終了を確定して預かった終了処理を 1 回走らせる。
+    /// 成功（Desktop・Service・Fallback のどれかを置く）でも失敗（札を落としてエラーの窓に
+    /// 戻る）でも同じ。収集の受付の口は、確定する時点に作る。
+    #[test]
+    fn quit_for_update_is_deferred_while_recovering_and_runs_when_recovery_ends() {
+        let outcomes: Vec<Box<dyn Fn(TransitionGuard)>> = vec![
+            Box::new(|guard| guard.finish(ShellView::Desktop)),
+            Box::new(|guard| guard.finish(ShellView::Service { port: 1 })),
+            Box::new(|guard| guard.finish(fallback_view())),
+            Box::new(drop),
+        ];
+        for (index, end_recovery) in outcomes.iter().enumerate() {
+            let gate = Lifecycle::started(ShellView::Desktop);
+            let recovery = gate.begin_recovery().expect("recovery");
+            let (deferred, trace) = deferred_quit();
+            assert_eq!(
+                gate.request_quit_for_update(&NotBusy, deferred),
+                QuitForUpdateOutcome::Deferred,
+                "{index}"
+            );
+            let state = gate.snapshot();
+            assert!(state.pending_quit_for_update, "{index}");
+            assert_eq!(state.quit, QuitPhase::Idle, "{index}");
+            assert!(!gate.is_exiting(), "{index}");
+            assert_eq!(trace.ran.load(Ordering::SeqCst), 0, "{index}");
+            assert_eq!(trace.admissions_made.load(Ordering::SeqCst), 0, "{index}");
+
+            end_recovery(recovery);
+
+            let state = gate.snapshot();
+            assert!(!state.pending_quit_for_update, "{index}");
+            assert_eq!(state.ticket, Ticket::None, "{index}");
+            assert!(gate.quitting(), "{index}");
+            assert_eq!(trace.admissions_made.load(Ordering::SeqCst), 1, "{index}");
+            assert_eq!(trace.begun.load(Ordering::SeqCst), 1, "{index}");
+            assert_eq!(trace.ran.load(Ordering::SeqCst), 1, "{index}");
+            // 確定の後は窓を開かず、新しい復旧も始めず、2 つ目の終了も走らない。
+            assert!(!gate.may_open_window(), "{index}");
+            assert_eq!(gate.begin_recovery().unwrap_err(), Refusal::Exiting);
+            assert_eq!(gate.request_quit(), QuitRequestOutcome::AlreadyHandled);
+            let (again, again_trace) = deferred_quit();
+            assert_eq!(
+                gate.request_quit_for_update(&NotBusy, again),
+                QuitForUpdateOutcome::AlreadyQuitting,
+                "{index}"
+            );
+            assert_eq!(again_trace.ran.load(Ordering::SeqCst), 0, "{index}");
+        }
+    }
+
+    /// 保留の間: 2 つ目の要求は何もしない（最初の預かりが残り、復旧の後に 1 回だけ走る）。
+    /// 利用者がトレイの「終了」を押しても復旧中と同じく断り、保留は残る。
+    #[test]
+    fn a_deferred_quit_for_update_survives_a_second_request_and_a_tray_quit() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        let recovery = gate.begin_recovery().expect("recovery");
+        let (first, first_trace) = deferred_quit();
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy, first),
+            QuitForUpdateOutcome::Deferred
+        );
+        let (second, second_trace) = deferred_quit();
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy, second),
+            QuitForUpdateOutcome::AlreadyDeferred
+        );
+        assert_eq!(gate.request_quit(), QuitRequestOutcome::RecoveryInProgress);
+        // 遅れて届いた同意も復旧中なので断る（表の R の列と同じ）。
+        assert_eq!(
+            gate.answer_quit(true, false, &NotBusy),
+            QuitAnswerOutcome::RecoveryInProgress
+        );
+        let state = gate.snapshot();
+        assert!(state.pending_quit_for_update);
+        assert_eq!(state.quit, QuitPhase::Idle);
+        assert!(!gate.is_exiting());
+
+        drop(recovery);
+        assert!(gate.quitting());
+        assert_eq!(first_trace.ran.load(Ordering::SeqCst), 1);
+        assert_eq!(second_trace.ran.load(Ordering::SeqCst), 0);
+        assert_eq!(second_trace.admissions_made.load(Ordering::SeqCst), 0);
+    }
+
+    /// 確認ダイアログを出した後に復旧が始まり、その間に要求が来た場合: 保留し、復旧の後に
+    /// 答えを待たずに確定する（遅れて届いた答えは無視）。
+    #[test]
+    fn a_deferred_quit_for_update_takes_over_a_prompt_shown_before_recovery() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        assert_eq!(
+            gate.request_quit(),
+            QuitRequestOutcome::Ask { confirm: true }
+        );
+        let recovery = gate.begin_recovery().expect("recovery");
+        let (deferred, trace) = deferred_quit();
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy, deferred),
+            QuitForUpdateOutcome::Deferred
+        );
+        assert_eq!(gate.snapshot().quit, QuitPhase::Confirming);
+        drop(recovery);
+        assert!(gate.quitting());
+        assert_eq!(trace.ran.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            gate.answer_quit(true, false, &NotBusy),
+            QuitAnswerOutcome::Ignored
+        );
+    }
+
+    /// PR #970 のオーナーレビュー P2: インストーラに伝える最悪の終了時間は、トレイの終了の
+    /// 予算（移り変わりの待ち + 後始末）の和 = 65 秒。設計書 §3.3 の 90 秒（余裕 25 秒）は
+    /// これを超えている。
+    #[test]
+    fn quit_for_update_worst_case_is_the_tray_quit_budget() {
+        let tray = exit_budgets(ExitTrigger::TrayQuit);
+        assert_eq!(
+            QUIT_FOR_UPDATE_WORST_CASE,
+            tray.transition_wait + tray.cleanup_after(tray.transition_wait)
+        );
+        assert_eq!(QUIT_FOR_UPDATE_WORST_CASE, Duration::from_secs(65));
+        assert!(QUIT_FOR_UPDATE_WORST_CASE < Duration::from_secs(90));
+    }
+
     /// 終了が確定した後は「終了処理中」以外の書き換えをせず、窓も開かない。
     #[test]
     fn only_the_quitting_label_is_applied_after_quit() {
@@ -2284,5 +2862,70 @@ mod tests {
         gate.settle_recovery_action();
         assert!(gate.recovery_window_may_close());
         assert!(gate.begin_recovery_action());
+    }
+
+    // ---- 起動の途中の受け皿（PR #970 のレビュー P2） ----
+
+    /// 登録の前に届いた要求は保留され、開いたときに 1 回だけ取り出せる（2 回目の open は空）。
+    #[test]
+    fn a_quit_for_update_received_before_open_is_taken_out_once_by_open() {
+        let inbox = QuitForUpdateInbox::default();
+        assert_eq!(inbox.receive(), InboxReceipt::Held);
+        assert!(inbox.open());
+        assert!(!inbox.open());
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+    }
+
+    /// 登録の後の要求は受け皿を通らず即時（開くだけでは何も走らない）。
+    #[test]
+    fn a_quit_for_update_received_after_open_is_immediate() {
+        let inbox = QuitForUpdateInbox::default();
+        assert!(!inbox.open());
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        assert!(!inbox.open());
+    }
+
+    /// 保留の間の 2 つ目の要求は何もしない（開いたときに走るのは 1 回）。
+    #[test]
+    fn a_second_quit_for_update_while_held_is_ignored() {
+        let inbox = QuitForUpdateInbox::default();
+        assert_eq!(inbox.receive(), InboxReceipt::Held);
+        assert_eq!(inbox.receive(), InboxReceipt::AlreadyHeld);
+        assert_eq!(inbox.receive(), InboxReceipt::AlreadyHeld);
+        assert!(inbox.open());
+        assert!(!inbox.open());
+    }
+
+    /// 開くのと要求が競合しても、処理されるのはちょうど 1 回（`open` が拾うか `receive` が
+    /// 即時を返すかのどちらか一方）。何度も試す。
+    #[test]
+    fn a_quit_for_update_racing_with_open_is_processed_exactly_once() {
+        for _ in 0..200 {
+            let inbox = Arc::new(QuitForUpdateInbox::default());
+            let go = Arc::new(std::sync::Barrier::new(3));
+            let receiver = {
+                let (inbox, go) = (Arc::clone(&inbox), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    go.wait();
+                    inbox.receive()
+                })
+            };
+            let opener = {
+                let (inbox, go) = (Arc::clone(&inbox), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    go.wait();
+                    inbox.open()
+                })
+            };
+            go.wait();
+            let receipt = receiver.join().unwrap();
+            let taken = opener.join().unwrap();
+            let runs = usize::from(receipt == InboxReceipt::Immediate) + usize::from(taken);
+            assert_eq!(runs, 1, "receipt={receipt:?} taken={taken}");
+            assert_ne!(receipt, InboxReceipt::AlreadyHeld);
+            assert!(!inbox.open());
+            assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        }
     }
 }
