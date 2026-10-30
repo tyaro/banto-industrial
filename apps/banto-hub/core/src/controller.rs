@@ -203,13 +203,17 @@ pub struct CollectionController {
     run_seq: AtomicU64,
     status_tx: watch::Sender<RuntimeStatus>,
     /// 次の [`Self::commit_catalog_and_apply_live`] が snapshot を読んだ後、
-    /// commit の前に挟む待ち（ミリ秒、0 は無し。テスト専用）。
+    /// commit の前で止まる 1 回限りの門が張られているか（テスト専用）。
     #[cfg(test)]
-    snapshot_commit_delay_ms: AtomicU64,
-    /// 上の待ちに入った合図（テスト専用）。`notify_one` は許可を貯めるので、
+    snapshot_commit_pause_armed: AtomicBool,
+    /// 門で止まった合図（テスト専用）。`notify_one` は許可を貯めるので、
     /// 試験側が後から `notified()` を待っても取りこぼさない。
     #[cfg(test)]
-    snapshot_commit_delay_started: tokio::sync::Notify,
+    snapshot_commit_paused: tokio::sync::Notify,
+    /// 門を開ける合図（テスト専用）。同じく許可を貯めるので、開けるのが
+    /// 止まるより先でも取りこぼさない。
+    #[cfg(test)]
+    snapshot_commit_release: tokio::sync::Notify,
 }
 
 #[derive(Clone, Debug)]
@@ -258,38 +262,50 @@ impl CollectionController {
             run_seq: AtomicU64::new(0),
             status_tx,
             #[cfg(test)]
-            snapshot_commit_delay_ms: AtomicU64::new(0),
+            snapshot_commit_pause_armed: AtomicBool::new(false),
             #[cfg(test)]
-            snapshot_commit_delay_started: tokio::sync::Notify::new(),
+            snapshot_commit_paused: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            snapshot_commit_release: tokio::sync::Notify::new(),
         }
     }
 
     /// 次の [`Self::commit_catalog_and_apply_live`] の「snapshot を読んだ後・
-    /// commit の前」に指定の時間だけ待ちを挟む（テスト専用・1 回限り）。
+    /// commit の前」に門を張る（テスト専用・1 回限り）。そこで止まった適用は
+    /// [`Self::release_snapshot_commit_for_test`] が呼ばれるまで進まない。
     /// #958 PR 5 のレビュー対応: `hub.rs` の module doc「catalog の commit と
     /// 収集の適用は直列化されている」が塞ぐ競合（古い snapshot の commit が
-    /// 後から勝つ）の窓を決定的に作り、`transition` ロックを外したら試験が
-    /// 落ちるようにするために要る。`CollectorManager::delay_next_apply_for_test`
-    /// と同じ流儀で `#[cfg(test)]`。
+    /// 後から勝つ）の窓を、固定時間の待ちに頼らず（遅い機械で窓が閉じて
+    /// 試験がすり抜けないよう）通知だけで決定的に作る。
+    /// `CollectorManager::delay_next_apply_for_test` と同じ流儀で `#[cfg(test)]`。
     #[cfg(test)]
-    pub(crate) fn delay_next_snapshot_commit_for_test(&self, delay: std::time::Duration) {
-        self.snapshot_commit_delay_ms
-            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    pub(crate) fn pause_next_snapshot_commit_for_test(&self) {
+        self.snapshot_commit_pause_armed
+            .store(true, Ordering::SeqCst);
     }
 
-    /// [`Self::snapshot_commit_delay_ms`] を読んで下ろし、待つ（テスト専用）。
+    /// 門で止まっている適用を放す（テスト専用）。止まるより先に呼んでも
+    /// 許可が貯まるので取りこぼさない。
     #[cfg(test)]
-    async fn take_injected_snapshot_commit_delay(&self) {
-        let millis = self.snapshot_commit_delay_ms.swap(0, Ordering::SeqCst);
-        if millis > 0 {
-            self.snapshot_commit_delay_started.notify_one();
-            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+    pub(crate) fn release_snapshot_commit_for_test(&self) {
+        self.snapshot_commit_release.notify_one();
+    }
+
+    /// 門が張られていれば、止まった合図を出して放されるまで待つ（テスト専用）。
+    #[cfg(test)]
+    async fn take_injected_snapshot_commit_pause(&self) {
+        if self
+            .snapshot_commit_pause_armed
+            .swap(false, Ordering::SeqCst)
+        {
+            self.snapshot_commit_paused.notify_one();
+            self.snapshot_commit_release.notified().await;
         }
     }
 
     #[cfg(not(test))]
     #[inline]
-    async fn take_injected_snapshot_commit_delay(&self) {}
+    async fn take_injected_snapshot_commit_pause(&self) {}
 
     /// 終了の受付の印を立て、**同じ `state` ロックの中で**読んだその時点の
     /// 状態を返す（このモジュールの doc「終了の受付」）。以降の開始は
@@ -486,7 +502,7 @@ impl CollectionController {
         let snapshot = RegistrySnapshot::load(&self.manager.pool())
             .await
             .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
-        self.take_injected_snapshot_commit_delay().await;
+        self.take_injected_snapshot_commit_pause().await;
         self.manager.commit_catalog(&snapshot).await?;
         let current = self.status();
         if current.state != CollectionState::Running {
@@ -1278,8 +1294,9 @@ mod tests {
     /// （古い snapshot を後から commit して、片方の変更が catalog・収集から
     /// 消える）への回帰テスト。
     ///
-    /// 悪い順序を試験用の待ち（`delay_next_snapshot_commit_for_test`）で強制する:
-    /// 適用 A が snapshot を読んだ**後**に待たせ、その間にタグ b を書いて適用 B を
+    /// 悪い順序を試験用の門（`pause_next_snapshot_commit_for_test`）で強制する
+    /// （固定時間の待ちは使わない）:
+    /// 適用 A が snapshot を読んだ**後**に止め、その間にタグ b を書いて適用 B を
     /// 走らせる。`transition` ロックがあれば B は A の完了を待ち、B の snapshot は
     /// a・b の両方を含む。ロックが無いと B が先に commit し、A が a だけの古い
     /// snapshot を後から commit して b が catalog から消える。
@@ -1362,23 +1379,41 @@ mod tests {
             .await
             .expect("タグ a を作れる");
         // A: snapshot を読んだ後、commit の前で止める。
-        controller.delay_next_snapshot_commit_for_test(Duration::from_millis(500));
+        controller.pause_next_snapshot_commit_for_test();
         let a = {
             let controller = controller.clone();
             tokio::spawn(async move { controller.commit_catalog_and_apply_live().await })
         };
-        // A が待ちに入った（= snapshot は a だけを見ている）のを確かめてから b を書く。
+        // A が門で止まった（= snapshot は a だけを見ている）のを確かめてから b を書く。
         tokio::time::timeout(
             Duration::from_secs(10),
-            controller.snapshot_commit_delay_started.notified(),
+            controller.snapshot_commit_paused.notified(),
         )
         .await
-        .expect("A が snapshot の読込み後の待ちに入る");
+        .expect("A が snapshot の読込み後の門で止まる");
         let tag_b = tags
             .create(tag_input("b".to_string(), "40002".to_string()))
             .await
             .expect("タグ b を作れる");
-        let b_result = controller.commit_catalog_and_apply_live().await;
+        let b = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.commit_catalog_and_apply_live().await })
+        };
+        // A を放す時機を、時間ではなく `transition` ロックの状態で決める。
+        // ロックがある正しい実装では、止まっている A がロックを握っているので
+        // `try_lock` は失敗し、B はロック待ちで A より先に commit できない。
+        // そのまま A を放せばよく、時間は何も待たない。
+        // ロックが無い（回帰）と誰も握っておらず `try_lock` が成功する。そのとき
+        // は B を最後まで走らせてから A を放し、A が古い snapshot を最後に
+        // commit する悪い順序を決定的に作る（ここで試験が落ちる）。
+        let b_result = if controller.transition.try_lock().is_err() {
+            controller.release_snapshot_commit_for_test();
+            b.await.expect("task b")
+        } else {
+            let r = b.await.expect("task b");
+            controller.release_snapshot_commit_for_test();
+            r
+        };
         let a_result = a.await.expect("task a");
         a_result.expect("live apply a は Ok");
         b_result.expect("live apply b は Ok");
