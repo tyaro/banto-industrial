@@ -31,7 +31,7 @@
 //! ```powershell
 //! # 1. 先に 3 つの release バイナリをビルド（scripts/build-release-chronogazer.ps1 が一括で行う）
 //! pnpm --filter chronogazer build
-//! cargo build --release -p chronogazer --features embed-ui
+//! cargo build --release -p chronogazer --features embed-ui,tauri/custom-protocol
 //! cargo build --release -p chronogazer-core --bin chronogazer-server --features embed-ui
 //! cargo build --release -p chronogazer-elev
 //!
@@ -134,7 +134,7 @@ fn main() -> Result<()> {
             "次の実行ファイルが見つかりません（対象ディレクトリ: {}）: {missing_list}\n\
              先に以下を実行してから再度お試しください:\n\
              \u{20}\u{20}pnpm --filter chronogazer build\n\
-             \u{20}\u{20}cargo build --release -p chronogazer --features embed-ui\n\
+             \u{20}\u{20}cargo build --release -p chronogazer --features embed-ui,tauri/custom-protocol\n\
              \u{20}\u{20}cargo build --release -p chronogazer-core --bin chronogazer-server --features embed-ui\n\
              \u{20}\u{20}cargo build --release -p chronogazer-elev\n\
              別のディレクトリに 3 つの exe が揃っている場合は、第 1 引数でそのディレクトリを指定してください。",

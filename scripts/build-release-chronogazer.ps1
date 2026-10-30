@@ -69,9 +69,12 @@ try {
 
     # --- (c)(d)(e) 3 バイナリのリリースビルド（順序は installer/src/main.rs
     # の使い方コメントと同じ）。シェルと記録エンジンは UI を埋め込む
-    # （embed-ui。シェルの LAN 公開と headless host の画面）。 ---
-    Invoke-Native 'cargo build --release -p chronogazer --features embed-ui' {
-        cargo build --release -p chronogazer --features embed-ui
+    # （embed-ui。シェルの LAN 公開と headless host の画面）。
+    # シェルには tauri/custom-protocol も付ける。これが無いと tauri は開発の
+    # ビルドとみなし、窓が同梱の UI ではなく devUrl（http://localhost:1420）を
+    # 開く（`cargo tauri build` は自分で付けるが、ここは cargo を直に呼ぶ）。 ---
+    Invoke-Native 'cargo build --release -p chronogazer --features embed-ui,tauri/custom-protocol' {
+        cargo build --release -p chronogazer --features embed-ui,tauri/custom-protocol
     }
     Invoke-Native 'cargo build --release -p chronogazer-core --bin chronogazer-server --features embed-ui' {
         cargo build --release -p chronogazer-core --bin chronogazer-server --features embed-ui
