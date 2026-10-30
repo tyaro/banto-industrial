@@ -1353,8 +1353,15 @@ impl CollectorManager {
     }
 
     /// Rebuild the catalog and reconfigure the `Collector` from the current
-    /// registry state (design §4.3, T7: "部分適用"). Called once at boot and
-    /// after every I1 CRUD write that succeeds.
+    /// registry state (design §4.3, T7: "部分適用").
+    ///
+    /// **Not called from product code** - a test-only entry point left from
+    /// before the `CollectionController`. It bypasses the controller: it syncs
+    /// sessions from the saved values (same as `Configured`) and starts the
+    /// `Collector`. In the product, boot only does `commit_catalog`, and after
+    /// a CRUD write `CollectionController::commit_catalog_and_apply_live`
+    /// commits the catalog (and applies live only while Running; while
+    /// stopped it never dials). Removal is tracked separately.
     ///
     /// On success: `revision` advances by exactly 1, `last_error` clears,
     /// and the new catalog/`Collector` state (or no `Collector` at all, if
