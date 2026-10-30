@@ -597,7 +597,8 @@ pub(crate) fn request_quit_for_update(app: &AppHandle) {
 /// （Desktop の起動は `launch_may_proceed` で扉の閉じたことを見て何も始めない。扉を閉じる
 /// のは [`quit`] の別スレッドなので、先に DB を開いてしまったときは `Lifecycle::admit` が
 /// 断ってその場で止める）。「終了」だけの窓の後は、止めるものが無いので [`quit`] →
-/// `exit_cleanup` が何もせずに `app.exit(0)`（窓の「終了」と同じ）。
+/// `exit_cleanup` が何もせずに `app.exit(0)`（窓の「終了」と同じ）。状態機械が無い異常時も
+/// 要求は捨てず、[`run_quit_for_update`] が記録して処理する。
 pub(crate) fn open_quit_for_update_inbox(app: &AppHandle) {
     let held = app
         .try_state::<QuitForUpdateInbox>()
@@ -614,8 +615,25 @@ pub(crate) fn open_quit_for_update_inbox(app: &AppHandle) {
 }
 
 /// [`request_quit_for_update`] の本体（受け皿を通った後）。`note` は記録する 1 行。
+///
+/// 終了の状態機械（`Lifecycle`）は `run()` が起動の前に置くので無いはずがないが、無くても
+/// 要求を黙って捨てない: 止める収集（`AppState`）も無ければ記録して直接 [`quit`]
+/// （`exit_cleanup` は `Lifecycle` 無しでも既定の予算で動く）、収集があるのに状態機械が
+/// 無いときはデータを守るため終了せず、その旨を記録して戻る。
 fn run_quit_for_update(app: &AppHandle, note: &str) {
     let Some(lifecycle) = crate::shell::lifecycle(app) else {
+        if app.try_state::<AppState>().is_none() {
+            note_quit_for_update(
+                app,
+                "終了の状態機械が見つからないので、止める収集が無いことを確かめて直接終了します（--quit-for-update）",
+            );
+            quit(app.clone());
+        } else {
+            note_quit_for_update(
+                app,
+                "終了の状態機械が見つからず収集が動いている可能性があるため、データを守るために終了しません（--quit-for-update）",
+            );
+        }
         return;
     };
     note_quit_for_update(app, note);
