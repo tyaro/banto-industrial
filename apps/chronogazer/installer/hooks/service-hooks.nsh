@@ -9,12 +9,20 @@
 ; 意図的に残す、下記「PREUNINSTALL」節）。
 ;
 ; 作りは Hub のフック（apps/banto-hub/installer/hooks/service-hooks.nsh）と同じ
-; （2026-10-31 オーナー決定「基本 Hub と同じで」）。違いは次の 3 つだけ:
+; （2026-10-31 オーナー決定「基本 Hub と同じで」）。違いは次の 4 つだけ:
 ;   - サービスは `ChronoGazer` の 1 本（サイドカーは無い）。
 ;   - シェルは `taskkill` ではなく **`chronogazer.exe --quit-for-update` で正常終了を
 ;     頼み、プロセスが無くなるまで待つ**（下記「シェルの終了」節。PR #970 の口）。
 ;   - 旧い利用者単位の版（`cargo tauri build` の currentUser インストーラ）が
 ;     あれば案内する（O-3）。
+;   - tauri-bundler の NSIS テンプレートを当て直して使う（src/main.rs の
+;     TEMPLATE_PATCHES、#972 のオーナーレビュー P1・P2）: 既に入っていても
+;     「先にアンインストール」の頁を出さず**常にその場で上書き**し（旧い版の
+;     アンインストーラが PREUNINSTALL でサービスを解除してしまい、新しい
+;     PREINSTALL に「動いていない」と見えて再開も起動種別も失う、を防ぐ。
+;     service-install は登録済みなら作り直さないので起動種別は保たれる）、
+;     tauri-bundler 自身の `CheckIfAppIsRunning`（強制終了）を使わない
+;     （下記「シェルの終了」節）。
 ;
 ; main バイナリはシェル `chronogazer.exe`（`${MAINBINARYNAME}`）。記録エンジン
 ; `chronogazer-server.exe`・昇格ヘルパー `chronogazer-elev.exe` は main ではない
@@ -95,12 +103,24 @@
 ; 場所の ChronoGazer - 旧い利用者単位の版や開発のビルド - が動いている）とき
 ; は頼む口が無いので、待たずにすぐ同じ問いを出す。
 ;
-; **待ちの後に tauri-bundler 自身の `CheckIfAppIsRunning`（nsis/utils.nsh）が
-; 走る**（PREINSTALL・PREUNINSTALL のどちらも、フックの直後）。これは
-; `chronogazer.exe` が残っていれば silent では問答無用で、UI では OK/キャンセルの
-; 後に `KillProcess` する。上の待ちでプロセスが無いことを確かめてから進む、
-; [キャンセル] では `Abort` で手前で止める、の 2 つで、その強制終了に進まない
-; ようにしている。
+; **tauri-bundler 自身の `CheckIfAppIsRunning`（nsis/utils.nsh）は使わない**
+; （#972 のオーナーレビュー P2）。原本のテンプレートは PREINSTALL・PREUNINSTALL の
+; 直後に `!insertmacro CheckIfAppIsRunning` を置き、`chronogazer.exe` が残って
+; いれば silent では問答無用で、UI では OK の後に `KillProcess` する。フックの
+; 待ちの後にシェルが起動されただけでそこに入るので、src/main.rs の
+; TEMPLATE_PATCHES がその挿入を **同じ `QuitShellForUpdate` の再確認**に置き換え
+; ている（プロセスが無ければすぐ返る。残っていれば同じ頼んで待つ・再試行／中止）。
+; つまり Section Install では「フックの待ち → サービスの停止 → 再確認 → ファイルの
+; 上書き」の順になり、再確認の [キャンセル] は止めたサービスを戻してから `Abort`
+; する（`restart_service_on_cancel` = 1）。Section Uninstall の再確認は、
+; PREUNINSTALL が既にサービスの登録を解除した後なので戻せない（文言で知らせる）。
+; 残る隙間は「再確認の後・ファイルの上書きの前にシェルが起動される」の一瞬だけで、
+; そのときは NSIS 自身の「ファイルが使用中」の中止／再試行／無視の窓になる
+; （強制終了にはならない）。
+;
+; 当て直したテンプレートも `QuitShellForUpdate` を `!insertmacro` するので、
+; マクロの名前・引数の並びを変えるときは src/main.rs の TEMPLATE_PATCHES も
+; 一緒に直す（試験 `patch_template_applies_p1_and_p2` が引数の並びを見る）。
 ;
 ; プロセスの有無は共通部品の TerminateProcessIfRunning と同じ
 ; `cmd /c tasklist /FI "IMAGENAME eq ..." | findstr ...` の終了コードで見る
@@ -137,48 +157,60 @@ Var ShellQuitWaitCounter
 !macroend
 
 ; シェルに正常終了を頼み、プロセスが無くなるまで待つ（上の「シェルの終了」節）。
-; `action` は問いの文言に出す「インストール」／「アンインストール」。
+; プロセスが無ければ何もせずすぐ抜ける。
+;   `action`: 問いの文言に出す「インストール」／「アンインストール」。
+;   `restart_service_on_cancel`: 1 なら [キャンセル] の `Abort` の前に、
+;     PREINSTALL で止めたサービスを StartServiceIfStopped で戻す（Section Install
+;     の再確認用。フックの中では止める前なので 0）。
+;   `cancel_note`: [キャンセル] の文言に添える「中止したら何が残るか」。
 ; [キャンセル] では `Abort` で呼び出し元の Section ごと止まる。
-!macro QuitShellForUpdate action
-  !define UniqueID ${__LINE__}
+; フックの中と、当て直したテンプレート（src/main.rs の TEMPLATE_PATCHES）の
+; Section Install／Uninstall の再確認から、同じ Section に 2 回ずつ挿入される
+; ので、ラベルは `${__COUNTER__}`（挿入ごとに増える）で一意にする（`__LINE__`
+; だと別のファイルからの挿入と同じ行番号になり得る）。
+!macro QuitShellForUpdate action restart_service_on_cancel cancel_note
+  !define ShellQuitID ${__COUNTER__}
 
   !insertmacro CheckShellProcess
   ${If} $0 != "0"
-    Goto shellquit_done_${UniqueID}
+    Goto shellquit_done_${ShellQuitID}
   ${EndIf}
 
   ${If} ${FileExists} "$INSTDIR\${CHRONOGAZER_SHELL_EXE}"
     DetailPrint "chronogazer: デスクトップシェル (${CHRONOGAZER_SHELL_EXE}) に終了を頼んでいます（後始末の終わりを最大 ${CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS} 秒待ちます）..."
     ExecWait '"$INSTDIR\${CHRONOGAZER_SHELL_EXE}" --quit-for-update' $0
-    Goto shellquit_wait_${UniqueID}
+    Goto shellquit_wait_${ShellQuitID}
   ${Else}
     DetailPrint "chronogazer: デスクトップシェル (${CHRONOGAZER_SHELL_EXE}) が動いていますが、$INSTDIR に終了を頼める exe が無いので待てません。"
-    Goto shellquit_ask_${UniqueID}
+    Goto shellquit_ask_${ShellQuitID}
   ${EndIf}
 
-  shellquit_wait_${UniqueID}:
+  shellquit_wait_${ShellQuitID}:
     StrCpy $ShellQuitWaitCounter 0
-  shellquit_poll_${UniqueID}:
+  shellquit_poll_${ShellQuitID}:
     !insertmacro CheckShellProcess
     ${If} $0 != "0"
       DetailPrint "chronogazer: デスクトップシェルは終了しました。"
-      Goto shellquit_done_${UniqueID}
+      Goto shellquit_done_${ShellQuitID}
     ${EndIf}
     IntOp $ShellQuitWaitCounter $ShellQuitWaitCounter + 1
     ${If} $ShellQuitWaitCounter >= ${CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS}
       DetailPrint "chronogazer: デスクトップシェルの終了待ちが ${CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS} 秒を超えました（強制終了はしません）。"
-      Goto shellquit_ask_${UniqueID}
+      Goto shellquit_ask_${ShellQuitID}
     ${EndIf}
     Sleep 1000
-    Goto shellquit_poll_${UniqueID}
+    Goto shellquit_poll_${ShellQuitID}
 
-  shellquit_ask_${UniqueID}:
-    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "ChronoGazer のデスクトップシェル (${CHRONOGAZER_SHELL_EXE}) がまだ終了していません。$\r$\n$\r$\nタスクトレイの ChronoGazer から「終了」を選び（後始末の知らせの窓が出ていれば OK を押し）、終了してから [再試行] を押してください（もう ${CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS} 秒待ちます）。$\r$\n[キャンセル] で${action}を中止します（強制終了はしません。まだ何も変更していません）。" /SD IDCANCEL IDRETRY shellquit_wait_${UniqueID}
-    DetailPrint "chronogazer: デスクトップシェルが終了しないため${action}を中止しました。タスクトレイの ChronoGazer から「終了」を選んでから、もう一度実行してください。"
+  shellquit_ask_${ShellQuitID}:
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "ChronoGazer のデスクトップシェル (${CHRONOGAZER_SHELL_EXE}) がまだ終了していません。$\r$\n$\r$\nタスクトレイの ChronoGazer から「終了」を選び（後始末の知らせの窓が出ていれば OK を押し）、終了してから [再試行] を押してください（もう ${CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS} 秒待ちます）。$\r$\n[キャンセル] で${action}を中止します（強制終了はしません。${cancel_note}）。" /SD IDCANCEL IDRETRY shellquit_wait_${ShellQuitID}
+    DetailPrint "chronogazer: デスクトップシェルが終了しないため${action}を中止しました（${cancel_note}）。タスクトレイの ChronoGazer から「終了」を選んでから、もう一度実行してください。"
+    !if "${restart_service_on_cancel}" == "1"
+      !insertmacro StartServiceIfStopped "ChronoGazer" $ChronoGazerWasRunning
+    !endif
     Abort "ChronoGazer のデスクトップシェルが終了していないため、${action}を中止しました。"
 
-  shellquit_done_${UniqueID}:
-  !undef UniqueID
+  shellquit_done_${ShellQuitID}:
+  !undef ShellQuitID
 !macroend
 
 ; O-3: 旧い利用者単位の版があれば案内する（上の「旧い利用者単位の版」節）。
@@ -195,7 +227,7 @@ Var ShellQuitWaitCounter
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro WarnAboutLegacyCurrentUserInstall
-  !insertmacro QuitShellForUpdate "インストール"
+  !insertmacro QuitShellForUpdate "インストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
 !macroend
 
@@ -213,7 +245,7 @@ Var ShellQuitWaitCounter
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro QuitShellForUpdate "アンインストール"
+  !insertmacro QuitShellForUpdate "アンインストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
 
   DetailPrint "chronogazer: Windows サービス (ChronoGazer) の登録を解除しています..."

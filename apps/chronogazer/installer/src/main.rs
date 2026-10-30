@@ -60,6 +60,43 @@
 //! 再開の部品は Hub と共通の `installer-common/service-common.nsh` にあり、この
 //! ツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す
 //! （[`render_hooks`]）。
+//!
+//! ## NSIS テンプレートの当て直し（`templates/installer.nsi`、[`TEMPLATE_PATCHES`]）
+//!
+//! tauri-bundler 2.9.4 の `installer.nsi` には、このインストーラの方針と合わない
+//! 箇所が 2 つある（PR #972 のオーナーレビュー P1・P2）:
+//!
+//! - **P1 再インストールの頁**（`PageReinstall`／`PageLeaveReinstall`）: 既に
+//!   入っていると「先にアンインストールしてから入れる」が既定の選択で、旧い版の
+//!   アンインストーラが走る。その `PREUNINSTALL` はサービスを止めて
+//!   `service-uninstall` するので、新しい版の `PREINSTALL` にはサービスが「動いて
+//!   いない」と見え、`POSTINSTALL` は再開せず、起動種別（自動開始）も手動に戻る。
+//! - **P2 `CheckIfAppIsRunning`**（`utils.nsh`。Section Install／Uninstall の
+//!   フックの直後）: `chronogazer.exe` が残っていれば silent では問答無用で、UI
+//!   では OK の後に `KillProcess` する。フックの待ちの後にシェルが起動された
+//!   だけで、「強制終了はしない」（最終 flush を失わない）の約束が破れる。
+//!
+//! tauri-bundler の `NsisSettings::template`（handlebars の自前テンプレート）で、
+//! **2.9.4 の `installer.nsi` をそのまま写した `templates/installer.nsi`** に
+//! [`TEMPLATE_PATCHES`]（文字列の完全一致の置き換え。各 1 回だけ一致しなければ
+//! エラー）を当てたものを渡す（[`patch_template`]）。写しは byte 単位で同じ
+//! （[`VENDORED_TEMPLATE_SHA256`] を試験で確かめる。`Cargo.toml` は `=2.9.4`
+//! で固定）。tauri-bundler は自前テンプレートでも `utils.nsh`・
+//! `FileAssociation.nsh` を同じ出力先に書くので、`!include` はそのまま通る
+//! （`nsis/mod.rs` で確認済み）。
+//!
+//! 当てる内容（決定は docs/chronogazer-service-design.md §4 の B3-4 PR-C の実装メモ）:
+//!
+//! 1. P1: `PageReinstall` の先頭で `Abort`（頁を出さない = 旧い版の
+//!    アンインストーラを走らせず、**常にその場で上書きする**。テンプレートが
+//!    `/UPDATE` のときにしているのと同じ）。`PageLeaveReinstall` も先頭で
+//!    `reinst_done` へ飛ばし、`reinst_uninstall` に届かないよう二重に塞ぐ。
+//!    これで `PREINSTALL` が動いているサービスを止めて記録し、`POSTINSTALL` の
+//!    `service-install` は登録済みなら作り直さない（`banto-service-control`
+//!    の `install`。起動種別は保たれる）ので、止めたサービスをそのまま再開できる。
+//! 2. P2: Section Install／Uninstall の `CheckIfAppIsRunning` の挿入を、フックの
+//!    `QuitShellForUpdate`（再試行／中止だけで強制終了しない。プロセスが無ければ
+//!    すぐ返る）の再確認に置き換える。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -112,6 +149,86 @@ const REQUIRED_BINARY_NAMES: [&str; 3] = [SHELL_BINARY_NAME, SERVER_BINARY_NAME,
 /// こと。`scripts/build-release-chronogazer.ps1` は生成物のファイル名をルートの
 /// 版から組み立てるので、ずれると「インストーラが見つかりません」で止まる。
 const PRODUCT_VERSION: &str = "0.3.0-alpha.1";
+
+/// tauri-bundler **2.9.4** の `src/bundle/windows/nsis/installer.nsi` の写し
+/// （crates.io の tauri-bundler-2.9.4、2026-10-31 に byte 単位でそのまま写した。
+/// 改行は LF）。手を入れずに置き、当て直しは [`TEMPLATE_PATCHES`] で行う。
+/// tauri-bundler の版を上げるときは写しを取り直し（`Cargo.toml` の `=2.9.4` も）、
+/// [`VENDORED_TEMPLATE_SHA256`] を更新し、各パッチの土台がまだ 1 回だけ一致するかを
+/// 試験（`vendored_template_*`・`patch_template_*`）で確かめる。
+const VENDORED_TEMPLATE: &str = include_str!("../templates/installer.nsi");
+
+/// [`VENDORED_TEMPLATE`] の SHA-256（`sha256sum installer.nsi` の値）。写しが黙って
+/// 変わっていない（= 2.9.4 の原本のまま）ことを試験で確かめる（試験だけが使う）。
+#[cfg(test)]
+const VENDORED_TEMPLATE_SHA256: &str =
+    "20f4ecc730defb71f1342eaeaec4021df13be3d843abba0effe88ea5835fa079";
+
+/// [`VENDORED_TEMPLATE`] に当てる置き換え（`(名前, 土台, 置き換え後)`）。土台は
+/// 写しの中に**ちょうど 1 回**現れる文字列でなければならず、違えば
+/// [`patch_template`] が名前を挙げて止まる（tauri-bundler の版を上げて土台が
+/// 変わったときに黙って当たらないままにしない）。順に当てる。置き換え後の文字列は
+/// NSIS のソースなので LF 改行・2 空白のインデント（原本に合わせる）。
+///
+/// 置き換え後で挿入する `QuitShellForUpdate` は `hooks/service-hooks.nsh` の
+/// マクロ（テンプレートはフックを先頭近くで `!include` するので、Section
+/// Install／Uninstall の時点で定義済み）。引数の意味はフック側を参照。
+const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
+    (
+        // P1: 再インストールの頁を出さない。頁の関数の `Abort` は「この頁を
+        // 飛ばす」（テンプレート自身が「入っていなければ飛ばす」に使っている形）。
+        // 頁が無いので `PageLeaveReinstall`（旧い版のアンインストーラの起動）は
+        // 呼ばれず、常にその場で上書きする。silent はもともと頁の関数を呼ばない
+        // ので、silent と UI の挙動が揃う。WiX（msi）版の検出も頁の中にあるが、
+        // ChronoGazer に WiX 版は無い。
+        "P1-reinstall-page",
+        "Function PageReinstall\n",
+        "Function PageReinstall\n\
+         \x20 ; chronogazer-installer (#972 P1): 旧い版のアンインストーラを走らせず、\n\
+         \x20 ; 常にその場で上書きするので、この頁は出さない（Abort = 頁を飛ばす）。\n\
+         \x20 Abort\n",
+    ),
+    (
+        // P1 の二重の塞ぎ: 万一 leave が呼ばれても `reinst_uninstall` には進まない
+        // （`/UPDATE` のときの `Goto reinst_done` と同じ道）。
+        "P1-reinstall-leave",
+        "Function PageLeaveReinstall\n",
+        "Function PageLeaveReinstall\n\
+         \x20 ; chronogazer-installer (#972 P1): 常にその場で上書き（/UPDATE と同じ道）。\n\
+         \x20 Goto reinst_done\n",
+    ),
+    (
+        // P2（Install）: 強制終了する `CheckIfAppIsRunning` の代わりに、フックと
+        // 同じ「頼んで待つ・再試行／中止」で再確認する。[キャンセル] なら
+        // PREINSTALL で止めたサービスを戻してから中止（ファイルはまだ触っていない）。
+        "P2-install-check",
+        "    !insertmacro NSIS_HOOK_PREINSTALL\n\
+         \x20 !endif\n\
+         \n\
+         \x20 !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n",
+        "    !insertmacro NSIS_HOOK_PREINSTALL\n\
+         \x20 !endif\n\
+         \n\
+         \x20 ; chronogazer-installer (#972 P2): tauri-bundler の CheckIfAppIsRunning（残って\n\
+         \x20 ; いれば KillProcess）の代わりに、フックと同じ強制終了しない再確認。\n\
+         \x20 !insertmacro QuitShellForUpdate \"インストール\" 1 \"まだファイルは変更していません。上書き前に止めたサービスは再開します\"\n",
+    ),
+    (
+        // P2（Uninstall）: 同上。ここでは PREUNINSTALL が既にサービスの登録を
+        // 解除しているので、[キャンセル] でもそれは戻らない（文言で知らせる）。
+        "P2-uninstall-check",
+        "    !insertmacro NSIS_HOOK_PREUNINSTALL\n\
+         \x20 !endif\n\
+         \n\
+         \x20 !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n",
+        "    !insertmacro NSIS_HOOK_PREUNINSTALL\n\
+         \x20 !endif\n\
+         \n\
+         \x20 ; chronogazer-installer (#972 P2): tauri-bundler の CheckIfAppIsRunning（残って\n\
+         \x20 ; いれば KillProcess）の代わりに、フックと同じ強制終了しない再確認。\n\
+         \x20 !insertmacro QuitShellForUpdate \"アンインストール\" 0 \"サービス ChronoGazer の登録は既に解除しています（ファイルは残ります。もう一度アンインストールするか、インストーラで入れ直してください）\"\n",
+    ),
+];
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -183,6 +300,13 @@ fn main() -> Result<()> {
     )
     .context("フックの書き出しに失敗しました")?;
 
+    // 当て直した NSIS テンプレート（冒頭の「NSIS テンプレートの当て直し」）。
+    // tauri-bundler は handlebars で描画した結果を出力先の installer.nsi に書くので、
+    // 生成物を確かめるときはそちら（<対象ディレクトリ>/bundle/nsis/installer.nsi）を見る。
+    let installer_template = hooks_work_dir.join("installer.nsi");
+    std::fs::write(&installer_template, patch_template(VENDORED_TEMPLATE)?)
+        .context("テンプレートの書き出しに失敗しました")?;
+
     let package_settings = PackageSettings {
         product_name: PRODUCT_NAME.to_string(),
         version: PRODUCT_VERSION.to_string(),
@@ -213,6 +337,7 @@ fn main() -> Result<()> {
                 install_mode: NSISInstallerMode::PerMachine,
                 languages: Some(vec!["Japanese".to_string(), "English".to_string()]),
                 installer_hooks: Some(installer_hooks),
+                template: Some(installer_template),
                 ..Default::default()
             }),
             ..Default::default()
@@ -307,6 +432,24 @@ fn render_hooks(hooks: &str, common_dir: &Path) -> Result<String> {
     ))
 }
 
+/// [`TEMPLATE_PATCHES`] を順に当てる。土台が 1 回も無い・2 回以上ある、の
+/// どちらも名前を挙げたエラー（tauri-bundler の版を上げて原本が変わったときの
+/// 合図）。写しそのものが原本と違うかは試験（`vendored_template_*`）で見る。
+fn patch_template(template: &str) -> Result<String> {
+    let mut out = template.to_string();
+    for (name, anchor, replacement) in TEMPLATE_PATCHES {
+        match out.matches(anchor).count() {
+            1 => out = out.replacen(anchor, replacement, 1),
+            n => bail!(
+                "NSIS テンプレートの当て直し {name} の土台が {n} 回一致しました（ちょうど 1 回のはず）。\
+                 tauri-bundler の installer.nsi が変わっていないか、templates/installer.nsi の写しと \
+                 TEMPLATE_PATCHES を見直してください"
+            ),
+        }
+    }
+    Ok(out)
+}
+
 fn require_file(path: PathBuf) -> Result<PathBuf> {
     if !path.is_file() {
         bail!("必要なファイルが見つかりません: {}", path.display());
@@ -399,5 +542,99 @@ mod tests {
         std::fs::create_dir(dir.path().join(format!("{SERVER_BINARY_NAME}.exe"))).expect("mkdir");
 
         assert!(missing_binaries(dir.path()).contains(&SERVER_BINARY_NAME));
+    }
+
+    /// 写しは tauri-bundler 2.9.4 の原本のまま（黙って手を入れない。当て直しは
+    /// `TEMPLATE_PATCHES` で）。版を上げたら写しを取り直してこの定数も更新する。
+    #[test]
+    fn vendored_template_is_the_unmodified_2_9_4_original() {
+        use sha2::{Digest, Sha256};
+        let digest = hex::encode(Sha256::digest(VENDORED_TEMPLATE.as_bytes()));
+        assert_eq!(digest, VENDORED_TEMPLATE_SHA256);
+        // 原本は LF。土台の文字列も LF で書いてあるので、CRLF に変わると当たらない。
+        assert!(!VENDORED_TEMPLATE.contains('\r'));
+    }
+
+    /// 各パッチの土台が写しにちょうど 1 回ある（版を上げて原本が変わったら
+    /// ここで気づく）。置き換え後の文字列は土台と違う。
+    #[test]
+    fn vendored_template_contains_every_patch_anchor_exactly_once() {
+        for (name, anchor, replacement) in TEMPLATE_PATCHES {
+            assert_eq!(
+                VENDORED_TEMPLATE.matches(anchor).count(),
+                1,
+                "パッチ {name} の土台が 1 回だけ一致しない"
+            );
+            assert_ne!(anchor, replacement, "パッチ {name} が何も変えない");
+        }
+    }
+
+    /// 当て直した結果: P2 - Section Install／Uninstall の `CheckIfAppIsRunning` の
+    /// 挿入が無く、フックの `QuitShellForUpdate` の再確認に置き換わっている。
+    /// P1 - 再インストールの頁の関数が先頭で `Abort`、leave が先頭で
+    /// `reinst_done` へ飛ぶ。フックの `!include` は Section より前にある。
+    #[test]
+    fn patch_template_applies_p1_and_p2() {
+        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+
+        // P2: KillProcess に進む挿入が残っていない（utils.nsh のマクロ定義はそのまま
+        // include されるが、挿入が無ければ呼ばれない）。
+        assert!(!out.contains("!insertmacro CheckIfAppIsRunning"));
+        assert_eq!(out.matches("!insertmacro QuitShellForUpdate").count(), 2);
+        let install = out.find("Section Install\n").expect("Section Install");
+        let uninstall = out.find("Section Uninstall\n").expect("Section Uninstall");
+        let install_body = &out[install..uninstall];
+        assert!(install_body.contains("!insertmacro NSIS_HOOK_PREINSTALL"));
+        assert!(install_body.contains("!insertmacro QuitShellForUpdate \"インストール\" 1 "));
+        assert!(
+            out[uninstall..].contains("!insertmacro QuitShellForUpdate \"アンインストール\" 0 ")
+        );
+        // 再確認はフックの直後（テンプレートの挿入位置と同じ）。
+        let hook = install_body
+            .find("!insertmacro NSIS_HOOK_PREINSTALL")
+            .expect("hook");
+        let recheck = install_body
+            .find("!insertmacro QuitShellForUpdate")
+            .expect("recheck");
+        assert!(hook < recheck);
+        // フックはテンプレートの先頭近くで include されるので、マクロは Section の
+        // 時点で定義済み。
+        let include = out
+            .find("!include \"{{installer_hooks}}\"")
+            .expect("include");
+        assert!(include < install);
+
+        // P1: 頁の関数は最初の命令が Abort、leave は最初の命令が Goto reinst_done。
+        fn first_instruction<'a>(text: &'a str, function: &str) -> &'a str {
+            let start = text.find(function).expect("function") + function.len();
+            text[start..]
+                .lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty() && !line.starts_with(';'))
+                .expect("instruction")
+        }
+        assert_eq!(first_instruction(&out, "Function PageReinstall\n"), "Abort");
+        assert_eq!(
+            first_instruction(&out, "Function PageLeaveReinstall\n"),
+            "Goto reinst_done"
+        );
+        // 原本の「入っていなければ飛ばす」と `reinst_uninstall` のラベル自体は
+        // 残る（届かないだけ）。
+        assert!(out.contains("reinst_uninstall:"));
+        assert!(out.contains("reinst_done:"));
+    }
+
+    /// 土台が 1 回だけでなければ名前を挙げて止まる（0 回・2 回の両方）。
+    #[test]
+    fn patch_template_rejects_a_template_whose_anchor_count_is_not_one() {
+        let (name, anchor, _) = TEMPLATE_PATCHES[0];
+        let missing = VENDORED_TEMPLATE.replacen(anchor, "", 1);
+        let err = patch_template(&missing).expect_err("0 回");
+        assert!(err.to_string().contains(name), "{err}");
+        assert!(err.to_string().contains("0 回"), "{err}");
+
+        let doubled = format!("{VENDORED_TEMPLATE}\n{anchor}");
+        let err = patch_template(&doubled).expect_err("2 回");
+        assert!(err.to_string().contains("2 回"), "{err}");
     }
 }

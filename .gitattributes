@@ -21,3 +21,7 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# tauri-bundler の installer.nsi の写し。byte 単位で原本と同じでなければならない
+# （SHA-256 の試験と、改行を含む当て直しの土台。CRLF にすると当て直しが止まる）
+apps/chronogazer/installer/templates/installer.nsi -text
