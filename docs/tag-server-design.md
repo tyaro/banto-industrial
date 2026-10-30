@@ -1037,7 +1037,7 @@ axum の `ws` アップグレードで `/api/v1/stream`。メッセージは JSO
 - 管理 REST: `GET/PUT /api/mqtt-settings`（admin 限定、CSRF 必須）。
   `GET` は `password` を一切返さない。`PUT` の `password` は**空文字を
   「変更なし」**として扱う。保存成功で `MqttPublisher::apply` を呼び
-  **即時適用**する（`CollectorManager::rebuild` と同じ「古いタスクを
+  **即時適用**する（`CollectorManager::apply_run` と同じ「古いタスクを
   止めて新しいタスクを起動」パターン）
 - `GET /api/v1/status` に `mqtt: { "enabled": bool, "connected": bool }`
   を追加（`enabled` は設定値、`connected` は実際にブローカーへ接続できて
@@ -1674,7 +1674,7 @@ relay-wright が構想していた領域で、同アプリは 2026-09-24 に mai
   （`apps/relay-wright/core/src/engine/monitor.rs` のコメント参照）。
 - **T8-2（hub 配線）**: `banto-collect::config::build_request` が、ビット付き
   アドレスと `data_type != bit` の組み合わせを構成エラーとして拒否する。
-  `CollectorManager::rebuild` の all-or-nothing により、このエラーは
+  `CollectorManager::commit_catalog` の検証（all-or-nothing）により、このエラーは
   `last_config_error` に現れ、旧構成が維持される。`banto-hub` の書き込み
   ゲート7（`write_path::execute_write` の `write_plc_tag`）は、対象
   アドレスがビット付き（`Address::Slmp` の `bit` フィールドが `Some`）なら

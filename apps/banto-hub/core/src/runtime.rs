@@ -17,7 +17,7 @@
 //! [`HubRuntime::start`]が構築してサーバー稼働状態の[`RunningHub`]を返し、
 //! 各ホストは自分の停止トリガーを待ってから[`RunningHub::shutdown`]を呼ぶ
 //! （「構築 → shutdown 待機 → teardown」というホスト側のループ自体は
-//! 変わらない - DB初期化・各サービス構築・`CollectorManager::rebuild`・
+//! 変わらない - DB初期化・各サービス構築・`CollectorManager::commit_catalog`・
 //! MQTT/gRPC起動・axumサーバー起動・シャットダウン順序という本体のロジックは
 //! 元どおりこの1ファイルにしかない）。
 //!
@@ -68,7 +68,8 @@
 //! `CollectorManager` の外で生存するブローカーセッション directory）→
 //! `BrokerSimRegistry` 構築（T9-2、docs/ux-plan.md §1。同じく
 //! `CollectorManager` の外で生存する broker シミュレータ registry）→
-//! `CollectorManager::rebuild()`（起動時1回、設計 §4.3）→ tstore 剪定
+//! `CollectorManager::commit_catalog`（起動時1回、catalog だけ。収集の開始は
+//! ホストが [`RunningHub::controller`] から行う - T14-3）→ tstore 剪定
 //! （起動時1回 + 24h 周期、設計 §3.3・保持既定7日）→ 監査ログ剪定
 //! （起動時1回 + tstore と同じ24h周期タスクに相乗り、
 //! docs/banto-hub-remaining-plan.md P3-a 追補・2026-08-12。banto-hub は
@@ -476,8 +477,8 @@ impl HubRuntime {
         crate::upgrade::log_upkeep(&upkeep);
 
         // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): auto-provision the
-        // reserved `calc`/`mem` virtual connections BEFORE the first rebuild
-        // below, so an operator can start creating computed/internal tags
+        // reserved `calc`/`mem` virtual connections BEFORE the startup
+        // catalog commit below, so an operator can start creating computed/internal tags
         // immediately - the registry's own `UNIQUE` constraint on `name` is
         // what then protects both names from ever being claimed by a real
         // connection (`banto_tags::plc_connection`'s module doc "virtual"
@@ -618,8 +619,9 @@ impl HubRuntime {
         let clock = Arc::new(SystemClock);
         // T2-2 (docs/tag-server-design.md §6-5): constructed here, OUTSIDE
         // `CollectorManager`, so a broker-managed session (SLMP, Modbus TCP)
-        // survives every `CollectorManager::rebuild` - see `HubSessions`'s
-        // doc comment.
+        // survives every catalog commit and run apply
+        // (`CollectorManager::commit_catalog`/`apply_run`) - see
+        // `HubSessions`'s doc comment.
         // Held as its own `Arc` (not only the clone `CollectorManager` gets)
         // so this binary can call `sessions.shutdown()` after
         // `manager.shutdown()` on the way out - see this module's doc
@@ -640,8 +642,9 @@ impl HubRuntime {
         // T9-2 (docs/ux-plan.md §1): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - a
         // simulator started for a `simulation = true` broker-routed
-        // connection must survive every `CollectorManager::rebuild` (see
-        // `BrokerSimRegistry`'s doc comment). Held as its own `Arc` so this
+        // connection must survive every run apply
+        // (`CollectorManager::apply_run`, see `BrokerSimRegistry`'s doc
+        // comment). Held as its own `Arc` so this
         // binary can call `sim_registry.shutdown()` at the correct point on
         // the way out - see this module's doc comment ("シャットダウン順序")
         // for why that is AFTER `sessions.shutdown()`.
@@ -650,7 +653,7 @@ impl HubRuntime {
         // T6-2 (docs/tag-server-design.md §4.2): constructed here, OUTSIDE
         // `CollectorManager`, for the same reason `sessions` is - the
         // computed engine's plan and `ServerTagStore`'s values must outlive
-        // every single `rebuild`, and the background evaluation loop below
+        // every single catalog commit, and the background evaluation loop below
         // needs its own `Arc` clone independent of `CollectorManager`'s
         // lifecycle.
         let server_store = Arc::new(ServerTagStore::new());
@@ -658,7 +661,7 @@ impl HubRuntime {
 
         // T6-2 (design §4.2 "retain フラグで再起動時の最終値復元"): seed
         // every persisted internal-tag value BEFORE the startup
-        // rebuild/eval loop start touching the store - quality Good,
+        // catalog commit/eval loop start touching the store - quality Good,
         // timestamp = the time it was saved (design: "起動時にロードして
         // ServerTagStore を初期化(品質 Good・時刻は保存時刻)"). A tag_id
         // with no persisted row here simply stays absent from the store,
@@ -1349,7 +1352,7 @@ fn is_profile_dir(path: &Path, dir: &banto_safe_root::ManagedDir) -> bool {
 /// defaults (empty/`0` - `banto_tags::plc_connection`'s relaxed validation
 /// for `"virtual"`). A failure here (e.g. a corrupt registry) is logged and
 /// never fatal - same "must not prevent the server from starting" posture
-/// as the startup rebuild just above.
+/// as the startup catalog commit in [`HubRuntime::start`].
 async fn ensure_virtual_connection(
     pool: &SqlitePool,
     registry: &Arc<banto_driver_api::DriverRegistry>,
@@ -1574,8 +1577,8 @@ mod tests {
     /// T14-1 実装指示 §7「テスト」の最小 smoke テスト:
     /// `HubRuntime::start` → `local_addr()` → `shutdown()` が一時 DB /
     /// 一時 data_dir を使って一巡できることを確認する - レジストリが空
-    /// （PLC 接続0件）でも `manager.rebuild()` は成功する
-    /// （`crate::hub::tests::rebuild_on_an_empty_registry_is_not_an_error`
+    /// （PLC 接続0件）でも起動時の catalog の commit は成功する
+    /// （`crate::hub::tests::commit_and_apply_on_an_empty_registry_is_not_an_error`
     /// と同じ前提）。`port_override: Some(0)`で OS に空きポートを選ばせる
     /// ので、他のテストとの bind 競合が起きない。
     ///
@@ -2638,7 +2641,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("disable tag");
-        hub.manager.rebuild().await.expect("publish disabled tag");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish disabled tag");
         let disabled = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
             .await
             .expect("disabled DataChange timeout")
@@ -2653,7 +2659,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("re-enable tag");
-        hub.manager.rebuild().await.expect("publish enabled tag");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish enabled tag");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 if receiver.recv().await.expect("subscription closed").status() == StatusCode::Good
@@ -2671,7 +2680,10 @@ mod tests {
             .execute(&pool)
             .await
             .expect("rename tag");
-        hub.manager.rebuild().await.expect("publish renamed tag");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish renamed tag");
         let old = tokio::time::timeout(Duration::from_secs(10), receiver.recv())
             .await
             .expect("rename DataChange timeout")
@@ -2730,7 +2742,10 @@ mod tests {
             .delete(entry.ids.2)
             .await
             .expect("delete tag");
-        hub.manager.rebuild().await.expect("publish deleted tag");
+        hub.controller()
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("publish deleted tag");
         let deleted = tokio::time::timeout(Duration::from_secs(10), renamed_receiver.recv())
             .await
             .expect("delete DataChange timeout")

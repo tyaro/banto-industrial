@@ -1,6 +1,6 @@
 //! T11-1 の統合テスト（docs/ux-plan.md §3「一括登録 API」）:
 //! `POST /api/tags/batch` の all-or-nothing 検証・単一トランザクション
-//! 適用・rebuild 1回・dry run・重複名検出を、実際の `CollectorManager` +
+//! 適用・catalog の commit 1回・dry run・重複名検出を、実際の `CollectorManager` +
 //! axum ルーター経由で確認する。
 //!
 //! `tests/t7_partial_reconfig.rs` と同じ理由で `TestApp`/`get_json`/
@@ -9,11 +9,11 @@
 //! `TempEnv` は `tests/common/mod.rs` に集約済み（2026-08-08、テスト一時
 //! ディレクトリリークの根治）。
 //!
-//! 「rebuild が1回だけ走る」の検証方法: `CollectorManager::revision()` は
-//! `rebuild()` が成功するたびにちょうど1つ進む（`tests/t7_partial_reconfig.rs`
-//! が単発 CRUD の rebuild 確認に使っているのと同じ性質 - `hub.rs::rebuild`
-//! の doc comment 参照）。よって「バッチ適用前後で revision がちょうど+1」
-//! であることは「rebuild がちょうど1回呼ばれた」ことの直接証拠になる - N
+//! 「catalog の commit が1回だけ走る」の検証方法: `CollectorManager::revision()`
+//! は `CollectorManager::commit_catalog` が成功するたびにちょうど1つ進む
+//! （`tests/t7_partial_reconfig.rs` が単発 CRUD の commit 確認に使っているのと
+//! 同じ性質）。よって「バッチ適用前後で revision がちょうど+1」であることは
+//! 「catalog の commit がちょうど1回呼ばれた」ことの直接証拠になる - N
 //! 件のタグを `POST /api/tags` で N 回叩けば revision は+Nになるところ、
 //! バッチ API は件数によらず常に+1。
 //!
@@ -21,7 +21,7 @@
 //! 同種の統合テスト（一括 enabled 切替・グループ移動・不正 id/revision
 //! 競合での all-or-nothing rollback・dry run・稼働中キュー）も同居させて
 //! いる - `/api/tags/batch`（T11-1、上のセクション群）の update 版で、
-//! 検証観点（all-or-nothing・単一トランザクション・rebuild 1回・dry run）
+//! 検証観点（all-or-nothing・単一トランザクション・commit 1回・dry run）
 //! が完全に対になるため、専用ファイルへ分けずここに追加した。
 
 use banto_hub_core::db::Db;
