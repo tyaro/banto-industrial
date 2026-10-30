@@ -107,6 +107,11 @@ export const RULES = [
 	{ re: /^apps\/banto-hub-sink\//, areas: ['hub_sink'], why: 'banto-hub-sink' },
 	{ re: /^apps\/banto-hub\//, areas: ['hub'], why: 'banto-hub' },
 	{ re: /^apps\/chronogazer\//, areas: ['chronogazer'], why: 'chronogazer' },
+	{
+		re: /^installer-common\//,
+		areas: ['hub', 'chronogazer'],
+		why: 'Hub と ChronoGazer のインストーラが共有する NSIS の部品'
+	},
 
 	// --- E2E 基盤（アプリ固有のものを先に、残りは両方）
 	{
