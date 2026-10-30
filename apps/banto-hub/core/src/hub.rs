@@ -380,15 +380,39 @@ pub fn read_current_view(
     server_store: &ServerTagStore,
     now_ms: i64,
 ) -> CurrentView {
-    let reading = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
-        collect.and_then(|c| c.get_reading(&entry.tag_key))
+    read_current_view_with_stored(entry, collect, server_store, now_ms).0
+}
+
+/// [`read_current_view`]'s view together with the quality **as stored** in
+/// the collection cache, before its read-time Stale derivation. 試験の観測の
+/// ため（#946/#947）: `apps/banto-hub-sink/tests/bridge_parity.rs` tells a
+/// derived Stale (stored Good, a late tick) from a Stale the bridge sent.
+/// Both come from one `CurrentValuesHandle` read (one lock, one clock
+/// instant), and the view goes through the same [`effective_current_view`]
+/// and quality-interval rules as every IF, so a change to the Hub's read path
+/// also changes what that test observes. PLC tags only: a
+/// [`ServerTagStore`] tag (computed/internal/DB) has no derivation and
+/// returns `None`, as does a PLC tag with no sample. Display layers must use
+/// [`read_current_view`] / [`read_current`].
+#[doc(hidden)]
+pub fn read_current_view_with_stored(
+    entry: &TagEntry,
+    collect: Option<&CurrentValuesHandle>,
+    server_store: &ServerTagStore,
+    now_ms: i64,
+) -> (CurrentView, Option<Quality>) {
+    let (reading, stored) = if entry.tag_kind == banto_tags::PLC_TAG_KIND {
+        match collect.and_then(|c| c.get_with_stored(&entry.tag_key)) {
+            Some((reading, stored)) => (Some(reading), Some(stored)),
+            None => (None, None),
+        }
     } else {
-        server_store.get_reading(&entry.tag_key)
+        (server_store.get_reading(&entry.tag_key), None)
     };
     let mut view = effective_current_view(entry, reading, now_ms);
     view.quality_since_ms =
         server_store.effective_quality_since(&entry.tag_key, view.quality, view.quality_since_ms);
-    view
+    (view, stored)
 }
 
 /// The wire string for a [`Quality`] - `"good"`/`"bad"`/`"stale"`, identical
@@ -2949,6 +2973,63 @@ mod tests {
                 Some(if quality == Quality::Bad { 700 } else { 1_000 })
             );
         }
+    }
+
+    /// `read_current_view_with_stored`（試験の観測のため、#946/#947）は
+    /// `read_current_view` と同じビューを返し、導く前の保存品質も返す:
+    /// 保存が Good で導いたあとが Stale の組、無効なタグ、不正な値（bit で
+    /// 0/1 以外）、収集の現在値が無いとき。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn read_current_view_with_stored_matches_the_view_and_returns_stored_quality() {
+        let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
+        let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
+        seed_running_simulation(&pool).await;
+        manager.rebuild().await.unwrap();
+        let collect = manager.current_values().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if collect.get("tag:1").is_some_and(|sample| {
+                    sample
+                        .value
+                        .is_some_and(|value| value != 0.0 && value != 1.0)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        manager.shutdown().await;
+        let map = manager.tag_map();
+        let entry = map.iter().next().unwrap().clone();
+        let mut bit = entry.clone();
+        bit.data_type = "bit".to_string();
+        let mut disabled = entry.clone();
+        disabled.enabled = false;
+        let store = manager.server_store();
+        let read = |entry: &TagEntry| {
+            let now = clock.now_ms();
+            let (view, stored) = read_current_view_with_stored(entry, Some(&collect), &store, now);
+            assert_eq!(view, read_current_view(entry, Some(&collect), &store, now));
+            (view.value.is_some(), view.quality, stored)
+        };
+        assert_eq!(read(&entry), (true, Quality::Good, Some(Quality::Good)));
+        assert_eq!(read(&bit), (false, Quality::Bad, Some(Quality::Good)));
+        assert_eq!(read(&disabled), (false, Quality::Bad, Some(Quality::Good)));
+        // 保存は Good のまま、読むときに Stale と導かれる。
+        clock.set_now_ms(10_000);
+        assert_eq!(read(&entry), (true, Quality::Stale, Some(Quality::Good)));
+        assert_eq!(read(&bit), (false, Quality::Bad, Some(Quality::Good)));
+        assert_eq!(read(&disabled), (false, Quality::Bad, Some(Quality::Good)));
+        // 収集の現在値が無い: 保存品質も無い。
+        let now = clock.now_ms();
+        let (view, stored) = read_current_view_with_stored(&entry, None, &store, now);
+        assert_eq!(view, read_current_view(&entry, None, &store, now));
+        assert_eq!(
+            (view.value, view.quality, stored),
+            (None, Quality::Bad, None)
+        );
     }
 
     /// Re-enabling an unchanged server value begins a new effective Good
