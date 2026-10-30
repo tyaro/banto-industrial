@@ -45,7 +45,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
-use banto_hub_core::controller::CollectionController;
+use banto_hub_core::controller::{CollectionController, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -230,7 +230,25 @@ struct TestApp {
     /// [`test_app_with_sim_controller`] だけ（そのときルーターも同じコントローラーの
     /// 本番構成になる）。それ以外は従来どおり互換ルーターで、`None`。
     controller: Option<Arc<CollectionController>>,
+    /// 試験が収集を起こす入口（製品と同じ `CollectionController`）。`controller` が
+    /// `Some` のときは同じもの、`None` のときはルーターに渡さない専用のもの。
+    runner: Arc<CollectionController>,
     _env: TempEnv,
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。
+    async fn commit_and_start(&self) {
+        self.runner
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.runner
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+    }
 }
 
 // See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
@@ -520,7 +538,10 @@ async fn test_app_with_drivers_and_options(
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -535,6 +556,9 @@ async fn test_app_with_drivers_and_options(
     let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(write_limit)));
     let controller =
         with_sim_controller.then(|| Arc::new(CollectionController::new(manager.clone())));
+    let runner = controller
+        .clone()
+        .unwrap_or_else(|| Arc::new(CollectionController::new(manager.clone())));
     let mut grpc_service = GrpcService::new(
         manager.clone(),
         api_keys.clone(),
@@ -610,6 +634,7 @@ async fn test_app_with_drivers_and_options(
         manager,
         sessions,
         write_control,
+        runner,
         controller,
         _env: env,
     }
@@ -892,14 +917,14 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
         .create(tag_input("t1", group.id, "D100", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // Wait for the broker session to actually come up (mirrors
     // `tests/integration.rs::e2e_slmp_session_survives_a_rebuild_via_broker`).
     let mut status_watch = app
         .sessions
         .status_watch(conn.id)
-        .expect("a broker session should exist for this connection after rebuild");
+        .expect("a broker session should exist for this connection after the collection starts");
     status_watch
         .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
         .await
@@ -958,7 +983,7 @@ async fn slmp_test_refuses_a_session_whose_cpu_differs_from_the_form() {
         .create(tag_input("t1", group.id, "D100", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
     let mut status_watch = app
         .sessions
         .status_watch(conn.id)
@@ -1022,7 +1047,7 @@ async fn start_collecting(app: &TestApp, input: PlcConnectionInput) -> i64 {
         .create(tag_input("t1", group.id, address, data_type))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
     let mut status_watch = app
         .sessions
         .status_watch(conn.id)
@@ -1146,14 +1171,14 @@ async fn modbus_test_reuses_existing_broker_session_without_dialing_a_second_soc
         .create(tag_input("temp01", group.id, "40001", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // broker セッションが実際に張られる(= 収集が稼働している)のを待つ
     // (ケース4の SLMP テストと同じ手順)。
     let mut status_watch = app
         .sessions
         .status_watch(conn.id)
-        .expect("a broker session should exist for this connection after rebuild");
+        .expect("a broker session should exist for this connection after the collection starts");
     status_watch
         .wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected)
         .await
@@ -1271,7 +1296,7 @@ async fn wasm_fc3_connection_test_direct_reuse_and_changed_settings() {
         .create(tag_input("wasm-u32", group.id, "40002", "u32"))
         .await
         .expect("create U32 tag");
-    app.manager.rebuild().await.expect("start WASM collection");
+    app.commit_and_start().await;
     let mut watch = app.sessions.status_watch(saved.id).expect("broker session");
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -1437,7 +1462,7 @@ async fn modbus_numeric_hub_case(manifest: &[u8], component: &[u8], input_regist
         assert!(!tag.writable);
         tag_ids.push((kind, tag.id, expected));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if tag_ids.iter().all(|(_, id, expected)| {

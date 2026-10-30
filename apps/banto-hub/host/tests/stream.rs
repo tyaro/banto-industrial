@@ -147,7 +147,7 @@ where
 }
 
 /// 1テスト分の環境: 実サーバー（`RunningServer`、`server.stop()` で終了）+
-/// ログイン済みトークン + `CollectorManager`（rebuild を直接叩くため）+
+/// ログイン済みトークン + `CollectorManager`（catalog の commit を直接叩くため）+
 /// 生成物を握る `TempEnv`。`Simulator` はテスト側で個別に持つ（PLC アドレス
 /// をテストごとに変えるため）。
 struct TestApp {
@@ -271,7 +271,10 @@ async fn test_app_with(
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
     let write_control =
         std::sync::Arc::new(banto_hub_core::write_control::WriteControl::new(false));
     let controller = std::sync::Arc::new(CollectionController::new(manager.clone()));
@@ -552,7 +555,10 @@ async fn subscribe_exact_tag_gets_initial_snapshot_then_on_change_data() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -622,7 +628,10 @@ async fn api_key_ws_keeps_streaming_normal_output_during_all_simulation() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
     assert!(
         wait_until(Duration::from_secs(10), || async {
             app.manager
@@ -705,7 +714,10 @@ async fn wildcard_subscription_picks_up_a_tag_added_after_config_changed() {
         .create(tag_input("a", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -741,10 +753,10 @@ async fn wildcard_subscription_picks_up_a_tag_added_after_config_changed() {
         .create(tag_input("b", group.id, "40002", "i16"))
         .await
         .unwrap();
-    app.manager
-        .rebuild()
+    app.controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect("rebuild after adding tag b");
+        .expect("apply after adding tag b");
     assert!(app.manager.revision() > revision_before);
 
     let config_changed = recv_matching(&mut ws, |m| m["op"] == "config_changed").await;
@@ -797,7 +809,10 @@ async fn interval_mode_sends_data_on_a_schedule_even_without_changes() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -887,7 +902,10 @@ async fn unsubscribe_stops_further_data() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -999,7 +1017,10 @@ async fn plc_disconnect_is_relayed_as_an_event() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     // H7 ⑤ follow-up (2026-08-09, CI flake on PR #96): the previous
     // pre-check only required `CurrentSample::is_some()`. That can pass on a
@@ -1127,7 +1148,10 @@ async fn a_slow_subscriber_gets_disconnected_once_the_outbound_queue_fills() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1223,7 +1247,10 @@ async fn valid_session_token_via_subprotocol_header_authenticates_and_streams_da
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1313,7 +1340,7 @@ async fn malformed_subprotocol_header_is_still_rejected_with_401() {
 /// `line2.slow.press01`(tag:2)を、同一シミュレータの別レジスタに割り当てて
 /// 別接続・別グループで作る(1プロセスに複数シミュレータを立てなくても
 /// host:port の重複は `plc_connections` に一意制約が無く許容されるため
-/// 問題ない)。呼び出し元は続けて `app.manager.rebuild()` を呼ぶこと。
+/// 問題ない)。呼び出し元は続けて `app.controller.commit_catalog_and_apply_live()` を呼ぶこと。
 async fn seed_two_connections_two_tags(app: &TestApp, sim_port: u16) {
     let conn1 = PlcConnectionService::new(app.pool.clone())
         .create(conn_input("line1", sim_port))
@@ -1350,7 +1377,10 @@ async fn wildcard_subscription_with_per_tag_read_scope_only_receives_in_scope_ta
     sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
 
     seed_two_connections_two_tags(&app, sim.addr.port()).await;
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1433,7 +1463,10 @@ async fn wildcard_subscription_with_bare_read_scope_receives_every_tag() {
     sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
 
     seed_two_connections_two_tags(&app, sim.addr.port()).await;
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1509,7 +1542,10 @@ async fn group_wildcard_subscription_only_receives_its_own_group_tag() {
     sim.set_holding_register(1, 2); // line2.slow.press01 (40002)
 
     seed_two_connections_two_tags(&app, sim.addr.port()).await;
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1606,7 +1642,10 @@ async fn admin_tag_stream_accepts_the_commissioning_grant_via_subprotocol() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1741,7 +1780,10 @@ async fn seed_one_tag(app: &TestApp, sim: &Simulator, value: u16) {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
     assert!(
         wait_until(Duration::from_secs(10), || async {
             app.manager

@@ -239,7 +239,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry.clone(),
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -482,7 +485,10 @@ async fn simulated_connection_write_is_applied_and_held(
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
     let status = app
         .controller
         .start(RunMode::Configured)
@@ -660,7 +666,10 @@ async fn all_simulation_run_applies_writes_to_the_simulator_too() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
     let status = app
         .controller
         .start(RunMode::AllSimulation)
@@ -765,7 +774,10 @@ async fn a_real_connection_write_still_fails_and_is_audited_as_plc() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
     let status = app
         .controller
         .start(RunMode::Configured)

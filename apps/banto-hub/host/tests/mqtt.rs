@@ -354,7 +354,25 @@ struct TestApp {
     token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
+    /// 製品と同じ入口で収集を起こす（`MqttPublisher`・router には渡さない -
+    /// 発行側は従来どおりコントローラ非注入）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+    }
 }
 
 // See `tests/common/mod.rs`'s module doc ("Why `TestApp` also needs
@@ -414,7 +432,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -467,11 +488,13 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         router,
         token,
         pool,
         manager,
+        controller,
         _env: env,
     }
 }
@@ -546,7 +569,10 @@ async fn all_simulation_test_app(label: &str) -> AllSimulationTestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -753,7 +779,7 @@ async fn e2e_publishes_values_with_retain_and_online_state() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -828,7 +854,7 @@ async fn retain_delivers_last_value_to_a_fresh_subscriber() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -914,7 +940,7 @@ async fn throttle_suppresses_rapid_changes_and_sends_the_latest_value_once_the_w
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -1032,7 +1058,7 @@ async fn disabled_publishes_nothing_and_enabling_via_put_starts_publishing_immed
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(6), || async {
@@ -1128,7 +1154,10 @@ async fn normal_topic_publishes_during_all_simulation() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
 
     let (status, _) = put_mqtt_settings(
         &app.router,
@@ -1190,7 +1219,10 @@ async fn mqtt_publishing_continues_after_collection_stop_and_restart() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
 
     let (status, _) = put_mqtt_settings(
         &app.router,
@@ -1329,7 +1361,10 @@ async fn mqtt_payload_carries_value_source_across_run_modes() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after seeding");
 
     let (status, _) = put_mqtt_settings(
         &app.router,
