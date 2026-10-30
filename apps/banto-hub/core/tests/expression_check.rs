@@ -47,7 +47,7 @@ use banto_hub_core::controller::{CollectionController, CollectionState, RunMode}
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
@@ -174,8 +174,8 @@ struct TestApp {
     admin_token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
-    /// 製品と同じ入口で収集を起こす（router には渡さない。`api_router` は
-    /// 内部に自前のコントローラを持つ）。
+    /// router と同じコントローラ（製品と同じく REST の状態と一致する）。
+    /// 製品と同じ入口で収集を起こすのに使う。
     controller: Arc<CollectionController>,
     _env: TempEnv,
 }
@@ -298,7 +298,8 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("CommissioningService::load");
 
-    let router = api_router(
+    let controller = Arc::new(CollectionController::new(manager.clone()));
+    let router = api_router_with_controller(
         users,
         audit,
         PlcConnectionService::new(pool.clone()),
@@ -306,6 +307,7 @@ async fn test_app(label: &str) -> TestApp {
         TagService::new(pool.clone()),
         api_keys,
         manager.clone(),
+        controller.clone(),
         auth,
         commissioning,
         events_tx,
@@ -322,7 +324,7 @@ async fn test_app(label: &str) -> TestApp {
         router,
         admin_token,
         pool,
-        controller: Arc::new(CollectionController::new(manager.clone())),
+        controller,
         manager,
         _env: env,
     }
