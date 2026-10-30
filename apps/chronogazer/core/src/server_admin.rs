@@ -37,6 +37,11 @@
 //! - **デスクトップ・`banto-serve` の REST では `PUT` を断る**（`403`）。デスクトップの LAN の
 //!   listener は画面（Tauri の `server_apply`）が入れ替えるもので、REST から入れ替えると
 //!   その listener 自身の上の要求になりうる。`GET` はどの host でも答える。
+//! - **lock を待つ間に失効したトークンでは変えない**（#392 B2-2 のレビュー・#941）: 要求の
+//!   トークンを、古い listener を止める前（LAN の slot の下）と保存の直前
+//!   （`auth_config_lock` の下）に確かめ直す。保存の直前に見つけたときは古い listener が
+//!   もう止まっていることがあるので、保存や bind の失敗と同じ経路で開き直し、状態を公開し、
+//!   `failed` を監査に残してから `401` を返す（[`ApplyContext::recheck_token`]）。
 //!
 //! # 認証の設定と、ログイン不要モード（`auth.disabled`）の扱い
 //!
@@ -311,17 +316,21 @@ pub struct ApplyContext<'a> {
     pub origin: &'a str,
     /// ログの接頭辞（`banto` / `chronogazer-server`）。
     pub log_label: &'a str,
-    /// REST の要求のトークン（#392 B2-2 のレビュー）。`Some` なら LAN の slot を取った
-    /// **後**にもう一度 `authenticate` し、無効（失効済み・期限切れ）なら何もせずに
-    /// `401`。認可は lock の手前で済んでいるので、lock を待つ間に失効したトークン
-    /// （setup の後の失効など）で変更を通さないため。デスクトップの Tauri のコマンドは
-    /// トークンを持たないので `None`。
+    /// REST の要求のトークン（#392 B2-2 のレビュー、#941）。`Some` なら lock を取った
+    /// **後**にもう一度 `authenticate` し、無効（失効済み・期限切れ）なら `401`。認可は
+    /// lock の手前で済んでいるので、lock を待つ間に失効したトークン（setup の後の失効
+    /// など）で変更を通さないため。確かめるのは 2 か所: LAN の slot の下で古い listener を
+    /// 止める前（何もせずに `401`）と、`auth_config_lock` の下で保存の直前（保存せず、
+    /// 保存の失敗と同じ経路で巻き戻して `failed` を監査に残す）。常時の listener の形が
+    /// 変わる（保存だけの）経路は止めるものが無いので、保存の直前の 1 か所だけ。
+    /// デスクトップの Tauri のコマンドはトークンを持たないので `None`。
     pub recheck_token: Option<&'a str>,
 }
 
 /// lock を取った後の認可の再確認（[`ApplyContext::recheck_token`]）。`Ok(None)`（失効済み・
-/// 期限切れ）は `Unauthorized`、読めない（DB の失敗）はその誤り。監査は残さない（認証の
-/// 層の `401` と同じ扱い。何も変えていない）。
+/// 期限切れ）は `Unauthorized`、読めない（DB の失敗）はその誤り。この関数は監査を残さない
+/// （何も変える前に断る呼び手は、認証の層の `401` と同じく残さない。LAN の入れ替えの
+/// 途中で断る `save_server_config_locked` は、呼び手の失敗の経路が `failed` を残す）。
 pub(crate) async fn recheck_token(auth: &AuthState, token: Option<&str>) -> Result<(), BantoError> {
     let Some(token) = token else {
         return Ok(());
@@ -351,16 +360,16 @@ pub(crate) async fn recheck_token(auth: &AuthState, token: Option<&str>) -> Resu
 /// `127.0.0.1:<port>` を一度 bind できるか確かめる。
 ///
 /// lock の順序: LAN の slot（適用の間ずっと。並行する適用の直列化と、状態の表示が
-/// 止めて開き直す間の隙間を見ないため）→ `auth_config_lock`（検証・保存・失効の間だけ。
-/// 古い listener の停止と bind の間は持たない）。
+/// 止めて開き直す間の隙間を見ないため）→ `auth_config_lock`（トークンの再確認・検証・
+/// 保存・失効の間だけ。古い listener の停止と bind の間は持たない）。`auth_config_lock` を
+/// 待つ間に要求のトークンが失効したら、保存せず、保存の失敗と同じ経路（上の巻き戻しと
+/// `failed` の監査）で `401` を返す（#941、[`ApplyContext::recheck_token`]）。
 pub async fn apply_server_settings(
     ctx: &ApplyContext<'_>,
     config: ServerSettings,
     actor: ApplyActor<'_>,
 ) -> Result<ServerStatusView, BantoError> {
     let mut slot = ctx.lan.slot.lock().await;
-    // 認可は lock の手前で済んでいる。待つ間に失効したトークンでは何もしない。
-    recheck_token(ctx.rest_auth, ctx.recheck_token).await?;
 
     // 許されない認証と LAN の組み合わせは、何かを止める前に断る。
     ctx.settings.validate_server_config(&config).await?;
@@ -450,6 +459,11 @@ pub async fn apply_server_settings(
         Some(auth) => ctx.lan.desired_lan(auth, &config),
         None => ctx.lan.desired_lan(&AuthSettings::default(), &config),
     };
+
+    // 認可は lock の手前で済んでいる。slot を待つ間に失効したトークンでは、古い listener を
+    // 止める前に断る（まだ何も変えていないので監査は残さない）。`auth_config_lock` を待つ
+    // 間の失効は、保存の直前に確かめ直す（`save_server_config_locked`、#941）。
+    recheck_token(ctx.rest_auth, ctx.recheck_token).await?;
 
     // 巻き戻しは「動いていたもの」を、そのときのアドレスで開き直す。
     let was_running = slot.take();
@@ -545,14 +559,21 @@ pub async fn apply_server_settings(
     }
 }
 
-/// 検証し直して（`set_server_config` が `auth.disabled` を読み直す）保存し、閲覧公開が
-/// OFF なら閲覧者のトークンを失効させる。すべて `auth_config_lock` の下（検証と保存の
-/// 間に `auth.*` の書き込みが割り込まない。#294 review）。
+/// 要求のトークンを確かめ直し、検証し直して（`set_server_config` が `auth.disabled` を
+/// 読み直す）保存し、閲覧公開が OFF なら閲覧者のトークンを失効させる。すべて
+/// `auth_config_lock` の下（検証と保存の間に `auth.*` の書き込みが割り込まない。#294
+/// review）。
+///
+/// トークンの再確認（#941）: lock を待つ間に失効したトークン（setup の後の失効など）では
+/// 保存しない。`Unauthorized` は保存や bind の失敗と同じ誤りとして呼び手へ返り、呼び手の
+/// 既存の失敗の経路（古い listener の開き直し・状態の公開・`failed` の監査）がそのまま
+/// 片付ける（失効を見つけた時点で古い listener はもう止まっていることがある）。
 async fn save_server_config_locked(
     ctx: &ApplyContext<'_>,
     config: &ServerSettings,
 ) -> Result<(), BantoError> {
     let _auth_config = ctx.auth_config_lock.lock().await;
+    recheck_token(ctx.rest_auth, ctx.recheck_token).await?;
     ctx.settings.set_server_config(config).await?;
     if !config.viewer_public {
         // ADR-0017 §2: 閉じた条件を保存してから失効。
