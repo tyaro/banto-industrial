@@ -678,7 +678,7 @@ async fn saved_tags_are_diagnosed_through_the_authenticated_rest_and_broker_path
         .create(super::tag_input("outside", group.id, "D4000", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -1202,7 +1202,7 @@ async fn new_guest_registry_rest_broker_and_diagnostics_reject_v() {
         assert_eq!(status, super::StatusCode::OK, "{body:?}");
         ids.push(body["id"].as_i64().unwrap());
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut connection_status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -1534,7 +1534,7 @@ async fn new_guest_saved_outside_m_bit_is_bad_and_never_sent_through_the_hub() {
             .unwrap();
         ids.push(tag.id);
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let sample_of = |id: i64| {
         app.manager
             .current_values()
@@ -1824,7 +1824,7 @@ async fn saved_new_guest_collection_with(
             .unwrap();
         ids.push(tag.id);
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     (fixture, app, ids)
 }
 
@@ -2361,7 +2361,7 @@ async fn saved_bit_tags_keep_values_and_quality_after_collection() {
         assert!(!tag.writable);
         tags.push((tag.id, value, quality));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if tags.iter().all(|(id, value, quality)| {
@@ -2571,7 +2571,7 @@ async fn saved_hub_settings_and_broker_use_the_same_q_and_r_write_policy() {
             tag.writable = true;
             app.manager.tags().create(tag).await.unwrap();
         }
-        app.manager.rebuild().await.unwrap();
+        app.commit_and_start().await;
         let mut status = app.sessions.status_watch(saved.id).unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -2657,7 +2657,7 @@ async fn rest_session_without_api_key_cannot_send_an_operational_write() {
         let mut tag = super::tag_input("word3010", group.id, "D3010", "u16");
         tag.writable = true;
         app.manager.tags().create(tag).await.unwrap();
-        app.manager.rebuild().await.unwrap();
+        app.commit_and_start().await;
         let mut status = app.sessions.status_watch(saved.id).unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -2744,7 +2744,7 @@ async fn rest_scoped_write_and_denied_spans_are_audited_without_extra_frames() {
             ids.push(app.manager.tags().create(tag).await.unwrap().id);
             names.push(format!("normal-write-line.normal-write-group.{name}"));
         }
-        app.manager.rebuild().await.unwrap();
+        app.commit_and_start().await;
         let mut status = app.sessions.status_watch(saved.id).unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -3092,7 +3092,7 @@ async fn new_guest_frame_3e_write_is_one_3e_frame_and_audited() {
         ids.push(app.manager.tags().create(tag).await.unwrap().id);
         names.push(format!("line.group.{name}"));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -3859,7 +3859,7 @@ async fn new_guest_rest_word_bit_writes_are_audited_by_outcome() {
         ids.push(app.manager.tags().create(tag).await.unwrap().id);
         names.push(format!("line.group.{name}"));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -4214,7 +4214,7 @@ async fn new_guest_saved_udp_connection_is_collected_and_read_now_over_udp() {
             let tag = super::tag_input(name, group.id, address, "u16");
             ids.push(app.manager.tags().create(tag).await.unwrap().id);
         }
-        app.manager.rebuild().await.unwrap();
+        app.commit_and_start().await;
         let sample_of = |id: i64| {
             app.manager
                 .current_values()
@@ -4361,7 +4361,7 @@ async fn new_guest_saved_d_and_w_strings_are_written_audited_and_read_back_over_
         ids.push(app.manager.tags().create(tag).await.unwrap().id);
         names.push(format!("line.group.{name}"));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -4926,7 +4926,7 @@ async fn unit_buffer_tags_register_collect_and_read_now(r: bool) {
         items[5]
     );
 
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),

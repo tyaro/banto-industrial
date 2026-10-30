@@ -449,7 +449,7 @@ async fn multi_collection(app: &TestApp, fixture: &SlmpFixture, period_ms: i64) 
             .unwrap()
             .id;
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut watch = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -546,7 +546,7 @@ async fn numeric_hub_case(component: &[u8], scenario: Scenario) {
         assert!(!tag.writable);
         tag_ids.push((kind, tag.id, expected));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if tag_ids.iter().all(|(_, id, expected)| {
@@ -652,7 +652,7 @@ async fn q_and_r_discovery_collect_read_now_reuse_and_reconnect() {
             .await
             .unwrap();
         assert_eq!(tag.address, address);
-        app.manager.rebuild().await.unwrap();
+        app.commit_and_start().await;
         let mut watch = app.sessions.status_watch(saved.id).unwrap();
         tokio::time::timeout(
             Duration::from_secs(5),
@@ -839,7 +839,7 @@ async fn q25prh_unknown_range_collects_individual_values_and_read_now() {
             .unwrap()
             .id;
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut watch = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),

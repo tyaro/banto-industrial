@@ -347,7 +347,7 @@ async fn q25prh_normal_hub_settings_connect_and_broker_write_one_frame() {
         tag.writable = true;
         app.manager.tags().create(tag).await.unwrap();
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
