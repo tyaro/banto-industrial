@@ -401,7 +401,7 @@ async fn saved_app(
         .expect("saved connection");
     assert!(approved_destination(&reloaded, protocol, host, port));
     audit("broker_connect_start", format!("destination={host}:{port}"));
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, saved.id).await;
     (app, saved.id, ids, names)
 }

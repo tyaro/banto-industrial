@@ -69,10 +69,7 @@ async fn saves_collects_reads_now_and_reuses_broker() {
         .await
         .expect("save non-native address");
     assert_eq!(tag.address, "D:0");
-    app.manager
-        .rebuild()
-        .await
-        .expect("start device collection");
+    app.commit_and_start().await;
     let mut watch = app.sessions.status_watch(saved.id).expect("broker session");
     tokio::time::timeout(
         Duration::from_secs(5),

@@ -235,7 +235,7 @@ async fn hub_api_wasm_r_d3010_write_readback_restore_once() {
     let read_path = format!("{path}/read-now");
 
     audit("broker_connect_start", format!("destination={HOST}:{PORT}"));
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut connection_status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(Duration::from_secs(7), async {
         connection_status

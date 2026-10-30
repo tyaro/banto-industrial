@@ -590,7 +590,7 @@ async fn hub_rest_range_batch_keeps_scope_audit_and_one_broker_frame() {
         tag_ids.push(app.manager.tags().create(tag).await.unwrap().id);
         tag_names.push(format!("slmp-range-fixture-line.slmp-range-group.{name}"));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -760,7 +760,7 @@ async fn broker_serializes_read_write_read_on_one_controlled_session() {
     let mut tag = super::tag_input("word", group.id, "D3010", "u16");
     tag.writable = true;
     app.manager.tags().create(tag).await.unwrap();
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -840,7 +840,7 @@ async fn broker_timeout_after_write_closes_socket_without_resending_on_reconnect
         .create(super::tag_input("word", group.id, "D3010", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -975,7 +975,7 @@ async fn hub_write_gates_and_audit_still_wrap_the_controlled_guest() {
     disabled.writable = true;
     disabled.enabled = false;
     app.manager.tags().create(disabled).await.unwrap();
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -1117,7 +1117,7 @@ async fn hub_api_timeout_then_explicit_recovery_and_revoked_key_rejection() {
     let mut tag = super::tag_input("word", group.id, "D3010", "u16");
     tag.writable = true;
     let tag_id = app.manager.tags().create(tag).await.unwrap().id;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),

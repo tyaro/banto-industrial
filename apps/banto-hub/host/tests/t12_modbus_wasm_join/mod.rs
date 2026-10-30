@@ -294,7 +294,7 @@ async fn saved_settings_broker_and_rest_enforce_modbus_policy_and_audit() {
         let tag = app.manager.tags().create(input).await.unwrap();
         records.push((name, tag.id));
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -490,7 +490,7 @@ async fn register_bits_reach_broker_and_read_now_as_booleans() {
             .await
             .unwrap();
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     let mut status = app.sessions.status_watch(saved.id).unwrap();
     tokio::time::timeout(
         Duration::from_secs(5),
@@ -738,7 +738,7 @@ async fn fc22_set_and_clear_pass_all_three_gates_and_are_audited() {
         &[("hbit", "40002.3", "bit")],
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, connection).await;
     let tag = "fc22-line.line.hbit";
     let (keys, key_id, key) = write_key(&app, "fc22-writer", &[tag]).await;
@@ -837,7 +837,7 @@ async fn register_bit_writes_refused_by_either_gate_never_reach_the_device() {
         &[("hbit", "40002.3", "bit")],
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     for connection in [narrow, guest_off, host_off] {
         wait_connected(&app, connection).await;
     }
@@ -942,7 +942,7 @@ async fn fc22_exception_is_per_item_and_a_mask_mismatch_is_uncertain_without_rep
         &[("hbit", "40002.3", "bit"), ("hword", "40003", "u16")],
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, connection).await;
     app.write_control.enable();
     let (bit, word) = ("err-line.line.hbit", "err-line.line.hword");
@@ -1111,7 +1111,7 @@ async fn register_bit_write_disabled_refuses_rest_write_before_send() {
         &[("hbit", "40002.3", "bit")],
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, connection).await;
     app.write_control.enable();
     let tag = "no-fc22-line.line.hbit";
@@ -1206,7 +1206,7 @@ async fn fc15_coil_batch_is_one_frame_inside_one_host_interval_and_audited_per_c
         &tags,
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, connection).await;
     app.write_control.enable();
     let external: Vec<String> = names
@@ -1339,7 +1339,7 @@ async fn register_write_fc6_sends_one_word_and_refuses_wider_writes_before_send(
         ],
     )
     .await;
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, connection).await;
     app.write_control.enable();
     let tags = [
@@ -1481,7 +1481,7 @@ async fn holding_string_tag_rest_write_is_one_fc16_audited_and_read_back() {
         input.writable = true;
         ids.push(app.manager.tags().create(input).await.unwrap().id);
     }
-    app.manager.rebuild().await.unwrap();
+    app.commit_and_start().await;
     wait_connected(&app, saved.id).await;
     app.write_control.enable();
     let (keys, key_id, key) = write_key(
