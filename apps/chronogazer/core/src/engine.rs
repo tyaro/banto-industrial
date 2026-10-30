@@ -2924,6 +2924,234 @@ mod tests {
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
     }
 
+    /// #941 の試験の組み立て: 常時の listener（`127.0.0.1:<port>`）と LAN の slot の
+    /// listener（`127.0.0.1:<任意>`）があり、保存値は `enabled: true`・`127.0.0.1`・`<port>`。
+    /// 未初期化なので、この PC からの `localDesktop` の grant で admin のトークンを得る。
+    async fn engine_for_recheck(dir: &Path) -> (RunningEngine, u16, SocketAddr, String) {
+        let port = free_port();
+        let opened = EngineRuntime::open(config(dir, EngineListen::Disabled))
+            .await
+            .expect("open");
+        let settings = opened.settings();
+        let saved = settings.server_config().await.unwrap();
+        settings
+            .set_server_config(&ServerSettings {
+                enabled: true,
+                bind: "127.0.0.1".to_string(),
+                port,
+                ..saved
+            })
+            .await
+            .unwrap();
+        let engine = opened
+            .with_loopback(ServerConfig {
+                bind: "127.0.0.1".to_string(),
+                port,
+            })
+            .with_listen(EngineListen::BestEffort(loopback_any_port()))
+            .with_loopback_local_access()
+            .start()
+            .await
+            .expect("start");
+        let loopback = engine.loopback_addr().await.expect("loopback");
+        let (status, body) = http(
+            loopback,
+            "POST",
+            "/api/auth/grant/localDesktop",
+            &loopback.to_string(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().expect("token").to_string();
+        (engine, port, loopback, token)
+    }
+
+    /// `settings_change`（`origin: rest`）の監査の行の `(result, detail)`。
+    async fn rest_settings_changes(engine: &RunningEngine) -> Vec<(String, serde_json::Value)> {
+        engine
+            .services()
+            .audit
+            .list(banto_core::ListParams::default())
+            .await
+            .unwrap()
+            .rows
+            .into_iter()
+            .filter(|row| row.action == "settings_change" && row.origin == "rest")
+            .map(|row| {
+                let detail = row
+                    .detail
+                    .as_deref()
+                    .map(|detail| serde_json::from_str(detail).expect("detail"))
+                    .unwrap_or(serde_json::Value::Null);
+                (row.result, detail)
+            })
+            .collect()
+    }
+
+    /// #941: `PUT /api/settings/server` の LAN の listener を入れ替える経路で、
+    /// `auth_config_lock` を待つ間に要求のトークンが失効したら、保存せず `401` を返し、
+    /// 既存の失敗の経路で、もう止めた古い LAN の listener を同じアドレスで開き直し、状態を
+    /// 公開し、`failed`（`saved: false`・`restoredPrevious: true`）を監査に残す。
+    ///
+    /// 決定的に置くため、テストが設定の lock（`auth_config_lock`）を先に握る。古い LAN の
+    /// listener が止まった（接続できない）のを見てから失効させる - 停止は slot の下の最初の
+    /// 再確認の後なので、この時点で適用は最初の再確認を通り、保存の手前の lock で止まって
+    /// いる。それから lock を放す。時間の長さに頼らない（待ちは上限つきの条件待ち）。
+    ///
+    /// 反証: `save_server_config_locked` の再確認を外すと、失効したトークンの変更が保存され
+    /// （`enabled: false`）、`200` が返って落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_put_swap_refuses_a_token_revoked_while_waiting_for_the_settings_lock() {
+        let dir = TempDir::new();
+        let (engine, port, loopback, token) = engine_for_recheck(dir.path()).await;
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+
+        let held = engine.services().settings_lock.clone().lock_owned().await;
+        let put = {
+            let (host, token) = (loopback.to_string(), token.clone());
+            tokio::spawn(async move {
+                http(
+                    loopback,
+                    "PUT",
+                    "/api/settings/server",
+                    &host,
+                    Some(&token),
+                    Some(serde_json::json!({
+                        "enabled": false, "bind": "127.0.0.1", "port": port, "viewerPublic": false
+                    })),
+                )
+                .await
+            })
+        };
+        // 古い LAN の listener が止まるまで待つ（= 最初の再確認を通り、保存の手前の lock を
+        // 待っている）。
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while tokio::net::TcpStream::connect(lan).await.is_ok() {
+            assert!(
+                Instant::now() < deadline,
+                "古い LAN の listener が 20 秒以内に止まらなかった"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!put.is_finished(), "lock を握っている間に適用が終わった");
+        engine
+            .services()
+            .rest_auth
+            .revoke_grant_tokens(&crate::local_grant::local_desktop_grant_kind());
+        drop(held);
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(20), put)
+            .await
+            .expect("PUT が終わらない")
+            .unwrap();
+        assert_eq!(status, 401, "{body}");
+        let saved = engine.services().settings.server_config().await.unwrap();
+        assert!(
+            saved.enabled,
+            "失効したトークンの変更が保存された: {saved:?}"
+        );
+        assert_eq!(
+            engine.server_slot().local_addr().await,
+            Some(lan),
+            "古い LAN の listener が開き直されていない"
+        );
+        tokio::net::TcpStream::connect(lan)
+            .await
+            .expect("開き直した LAN の listener に繋がらない");
+        let published = engine
+            .services()
+            .lan_status
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("公開された状態");
+        assert!(published.enabled && published.running, "{published:?}");
+        let changes = rest_settings_changes(&engine).await;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let (result, detail) = &changes[0];
+        assert_eq!(result, "failed", "{detail}");
+        assert_eq!(detail["saved"], false, "{detail}");
+        assert_eq!(detail["restoredPrevious"], true, "{detail}");
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
+    /// #941: `PUT /api/settings/server` の保存だけして再起動を求める経路（ポートの変更）でも、
+    /// `auth_config_lock` を待つ間に失効したトークンでは保存せず `401` を返し、既存の失敗の
+    /// 経路で状態を公開し、`failed`（`saved: false`）を監査に残す。listener には触れない。
+    ///
+    /// 決定的に置くため、テストが設定の lock を先に握り、適用が LAN の slot を取った
+    /// （`try_lock` が失敗する）のを見てから失効させ、lock を放す。この経路のトークンの
+    /// 再確認は保存の直前（lock の下）の 1 か所だけなので、slot を取った後のどの時点で
+    /// 失効させても結果は同じ（時間に頼らない）。
+    ///
+    /// 反証: `save_server_config_locked` の再確認を外すと、新しいポートが保存され、`200`
+    /// （`restartRequired: true`）が返って落ちる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn rest_put_restart_required_refuses_a_token_revoked_while_waiting_for_the_settings_lock()
+    {
+        let dir = TempDir::new();
+        let (engine, port, loopback, token) = engine_for_recheck(dir.path()).await;
+        let lan = engine.server_slot().local_addr().await.expect("lan");
+        let other = free_port();
+
+        let held = engine.services().settings_lock.clone().lock_owned().await;
+        let put = {
+            let (host, token) = (loopback.to_string(), token.clone());
+            tokio::spawn(async move {
+                http(
+                    loopback,
+                    "PUT",
+                    "/api/settings/server",
+                    &host,
+                    Some(&token),
+                    Some(serde_json::json!({
+                        "enabled": true, "bind": "127.0.0.1", "port": other, "viewerPublic": false
+                    })),
+                )
+                .await
+            })
+        };
+        let slot = engine.server_slot().clone();
+        wait_until("適用が LAN の slot を取る", || {
+            slot.try_lock().is_err()
+        })
+        .await;
+        assert!(!put.is_finished(), "lock を握っている間に適用が終わった");
+        engine
+            .services()
+            .rest_auth
+            .revoke_grant_tokens(&crate::local_grant::local_desktop_grant_kind());
+        drop(held);
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(20), put)
+            .await
+            .expect("PUT が終わらない")
+            .unwrap();
+        assert_eq!(status, 401, "{body}");
+        let saved = engine.services().settings.server_config().await.unwrap();
+        assert_eq!(saved.port, port, "失効したトークンの変更が保存された");
+        assert_eq!(engine.loopback_addr().await, Some(loopback));
+        assert_eq!(engine.server_slot().local_addr().await, Some(lan));
+        let published = engine
+            .services()
+            .lan_status
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("公開された状態");
+        assert_eq!(published.port, port, "{published:?}");
+        assert!(!published.restart_required, "{published:?}");
+        let changes = rest_settings_changes(&engine).await;
+        assert_eq!(changes.len(), 1, "{changes:?}");
+        let (result, detail) = &changes[0];
+        assert_eq!(result, "failed", "{detail}");
+        assert_eq!(detail["saved"], false, "{detail}");
+        assert_eq!(detail["restartRequired"], true, "{detail}");
+        assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
     /// #600 の監査 F1: 未初期化の間に受け取った `localDesktop`（admin）のトークンは、
     /// setup を送った側が commit の直後に接続を切っても失効する（setup の commit と失効・
     /// 監査を応答の future から切り離した）。setup が commit したのを DB で見てから FIN を
