@@ -15,6 +15,11 @@
 //!   `AppHandle::exit` する。
 //! - 2 つ目の起動は `tauri-plugin-single-instance` が受け、既存の窓を前に出して
 //!   2 つ目のプロセスは終わる（`run()` の登録箇所の注記）。
+//! - **インストーラからの終了の要求**（#392 B3-4、`chronogazer.exe --quit-for-update`）:
+//!   2 つ目の起動の引数で受け、確認ダイアログを出さずに「終了」と同じ終了処理を通す
+//!   （[`request_quit_for_update`]。窓は開かない）。`taskkill /F` では最終 flush と
+//!   `collection_stopped` を失うため。判断は状態機械の表の「インストーラからの終了の要求」
+//!   の行（復旧中は断る・終了処理中は何もしない）。
 //!
 //! 窓の前面化・× で隠す・初回通知・確認ダイアログ・終了の二重実行防止は
 //! banto-hub と共有する `banto-desktop-tray`（`crates/`）の部品を使う。
@@ -114,7 +119,7 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-use crate::lifecycle::{QuitAnswerOutcome, QuitRequestOutcome};
+use crate::lifecycle::{QuitAnswerOutcome, QuitForUpdateOutcome, QuitRequestOutcome};
 use crate::shell::{FALLBACK_WINDOW_LABEL, SERVICE_WINDOW_LABEL};
 use crate::startup::RECOVERY_WINDOW_LABEL;
 use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
@@ -531,6 +536,47 @@ pub(crate) fn request_quit(app: &AppHandle) {
         // 確認ダイアログは出ている／終了処理は走っている - どちらも 2 つ目は
         // 作らない。
         QuitRequestOutcome::AlreadyHandled => {}
+    }
+}
+
+/// インストーラからの終了の要求（#392 B3-4。`run()` の single-instance のコールバックから、
+/// `--quit-for-update` を受けたとき）。確認を出さずに [`quit`]（「終了」と同じ後始末）へ
+/// 進む。復旧中は断り（ダイアログは出さず記録だけ。インストーラは上限まで待つ）、終了処理が
+/// 走っていれば何もしない。どの態（Desktop・Service・Fallback）でも同じ。デスクトップの
+/// ログに 1 行残す（運用モードの間は `logs\` に書けないので標準エラー出力に落ちる）。
+pub(crate) fn request_quit_for_update(app: &AppHandle) {
+    let Some(lifecycle) = crate::shell::lifecycle(app) else {
+        return;
+    };
+    note_quit_for_update(
+        app,
+        "インストーラからの終了の要求を受けました（--quit-for-update）",
+    );
+    let admission = CollectorQuitAdmission(
+        app.try_state::<AppState>()
+            .map(|state| state.services.collect.clone()),
+    );
+    match lifecycle.request_quit_for_update(&admission) {
+        QuitForUpdateOutcome::Proceed => quit(app.clone()),
+        QuitForUpdateOutcome::RecoveryInProgress => note_quit_for_update(
+            app,
+            "データベースの復旧の途中のため、インストーラからの終了の要求を断りました",
+        ),
+        QuitForUpdateOutcome::AlreadyQuitting => {}
+    }
+}
+
+/// インストーラからの終了の要求の記録（デスクトップのログと標準エラー出力）。
+fn note_quit_for_update(app: &AppHandle, text: &str) {
+    eprintln!("banto: {text}");
+    if let Some(shell) = app.try_state::<crate::shell::ShellState>() {
+        let entry = chronogazer_core::mode_switch::DesktopLogEntry::now_system(text);
+        if let Err(err) = chronogazer_core::mode_switch::append_desktop_log_now(
+            &shell.layout.logs_dir(),
+            &[entry],
+        ) {
+            eprintln!("banto: デスクトップのログに書けませんでした（{err}）");
+        }
     }
 }
 

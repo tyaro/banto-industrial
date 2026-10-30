@@ -4696,8 +4696,18 @@ pub fn run() {
         // `chronogazer-server`（コンソール・サービス）が先に使っている場合は、
         // A1 の排他（下）が受け止めてエラーの窓を出す - 2 つ目の起動でそのエラーの
         // 窓が前に出る（`tray::open_main_window`）。
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            tray::open_main_window(app);
+        //
+        // #392 B3-4: 2 つ目の起動の引数が `--quit-for-update`（インストーラからの終了の
+        // 要求）なら、窓を開かずに確認なしの終了へ（[`tray::request_quit_for_update`]）。
+        // `args` は 2 つ目のプロセスの argv（プログラム名を含む）。
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if chronogazer_core::mode_switch::wants_quit_for_update(
+                args.iter().map(String::as_str),
+            ) {
+                tray::request_quit_for_update(app);
+            } else {
+                tray::open_main_window(app);
+            }
         }))
         // #392 A2: トレイの「終了」の確認と、× で隠した初回の通知
         // （`banto-desktop-tray` が Rust 側から呼ぶ。JS 側の権限は使わない）。
@@ -4711,6 +4721,20 @@ pub fn run() {
         // #392: 起動に失敗したときの対処の窓の状態（[`startup`]）。
         .manage(startup::RecoveryGate::default())
         .setup(|app| {
+            // #392 B3-4: `--quit-for-update` で起動されたのにここへ来た = 終わらせる相手の
+            // シェルが居ない（居れば single-instance のプラグインの setup が引数を渡して
+            // このプロセスを終えている）。昇格したインストーラから起動されるので、何も
+            // 始めずに終わる: ここは A1 の排他・データのルート・DB・窓・トレイのどれにも
+            // 触れる前（`shell::start` の前）で、single-instance の判定より後に置ける最初の
+            // 場所。`AppHandle::exit` はイベントループを一度回すので、使わずにそのまま終わる
+            // （`AppState` は無く、後始末に止めるものも無い）。
+            let args: Vec<String> = std::env::args().skip(1).collect();
+            if chronogazer_core::mode_switch::wants_quit_for_update(
+                args.iter().map(String::as_str),
+            ) {
+                eprintln!("banto: 終わらせる ChronoGazer が動いていないので、何もせずに終わります（--quit-for-update）");
+                std::process::exit(0);
+            }
             let handle = app.handle().clone();
             // #392（2026-10-12 オーナー決定）: 起動を止める失敗は panic せず、
             // エラーの窓を出す（[`startup`] のモジュール doc）。データの置き場所を

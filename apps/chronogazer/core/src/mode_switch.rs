@@ -47,6 +47,13 @@
 //! エンジンを止めてプロセスを終え、新しいシェルに [`HANDOFF_TO_OPERATION_ARG`] と
 //! [`HANDOFF_WAIT_PID_PREFIX`] を渡して続きを任せる。新しいシェルは古いプロセスが終わるのを
 //! 待ってから（[`wait_for_process_exit`]。single-instance の判定より前）サービスを開始する。
+//!
+//! # インストーラからの終了の要求（[`QUIT_FOR_UPDATE_ARG`]、#392 B3-4）
+//!
+//! インストーラは `taskkill /F` の代わりに `chronogazer.exe --quit-for-update` を起動する。動いて
+//! いるシェルが single-instance で受け取り、確認ダイアログを出さずにトレイの「終了」と同じ
+//! 後始末（最終 flush・`collection_stopped`）を通して終わる。引数の解釈は
+//! [`wants_quit_for_update`]（純関数）。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -463,6 +470,22 @@ pub fn handoff_args(wait_pid: u32) -> [String; 2] {
         HANDOFF_TO_OPERATION_ARG.to_string(),
         format!("{HANDOFF_WAIT_PID_PREFIX}{wait_pid}"),
     ]
+}
+
+// ---------------------------------------------------------------------------
+// インストーラからの終了の要求（#392 B3-4）
+// ---------------------------------------------------------------------------
+
+/// インストーラが動いているシェルに「確認を出さずに後始末を通して終わる」ことを頼む引数
+/// （`docs/chronogazer-service-design.md` §4「インストーラによるシェルの停止」）。シェルが
+/// 動いていれば single-instance でそのプロセスへ渡り、動いていなければ何も始めずに 0 で
+/// 終わる（`src-tauri` の `run()`）。
+pub const QUIT_FOR_UPDATE_ARG: &str = "--quit-for-update";
+
+/// 起動の引数（プログラム名を除いても含んでもよい）に [`QUIT_FOR_UPDATE_ARG`] があるか
+/// （純関数。形が完全に一致するものだけ）。
+pub fn wants_quit_for_update<'a>(args: impl IntoIterator<Item = &'a str>) -> bool {
+    args.into_iter().any(|arg| arg == QUIT_FOR_UPDATE_ARG)
 }
 
 /// `pid` のプロセスが終わるまで待つ（上限つき。終わったら `true`）。

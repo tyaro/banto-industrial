@@ -77,6 +77,7 @@
 //! | 起動を続けてよいか（`launch_desktop`）             | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | exit   | exit   | exit   |
 //! | エンジンを置く（`start_and_register`）             | go     | go      | go      | go      | go      | go      | go     | go     | go     | go      | go      | go     | exit   | exit   | exit   |
 //! | トレイ・Fallback の「終了」                        | ask    | ask     | ask     | ask     | noask   | conf    | noask  | noask  | rec    | ask     | quit    | quit   | quit   | quit   | ask    |
+//! | インストーラからの終了の要求（注 5）               | noask  | noask   | noask   | noask   | noask   | noask   | noask  | noask  | rec    | noask   | quit    | quit   | quit   | quit   | noask  |
 //! | 確認の答え: 取り消し                               | ign    | ign     | ign     | ign     | ign     | cancel  | ign    | ign    | ign    | ign     | ign     | ign    | ign    | ign    | ign    |
 //! | 確認の答え: 同意（暇 → 暇）                        | ign    | ign     | ign     | ign     | ign     | proceed | ign    | ign    | rec    | ign     | ign     | ign    | ign    | ign    | ign    |
 //! | 確認の答え: 同意（暇の文言 → 今は収集中）          | ign    | ign     | ign     | ign     | ign     | again   | ign    | ign    | rec    | ign     | ign     | ign    | ign    | ign    | ign    |
@@ -131,6 +132,13 @@
 //!   「運用モードへ」の続き。札の種類は移り変わり（`Transition`）で、Service・Fallback の画面の
 //!   ときだけ（`nosvc`。Desktop は上の注 3 の道）。終了が確定した後は始めない（`quit`。サービスへ
 //!   開始・停止を出してから終了が走ると、切り替えが途中で見捨てられる）。
+//! - **注 5（インストーラからの終了の要求、#392 B3-4）**: `chronogazer.exe --quit-for-update`
+//!   を single-instance で受けたとき（`tray::request_quit_for_update`）。トレイの「終了」と同じ
+//!   確認の段階を「押す → 同意」と続けて通し（[`Lifecycle::request_quit_for_update`]、同じ
+//!   ロックの中）、確認は出さない（`noask`）。確認ダイアログが出ていれば（Fc）その答えを
+//!   待たずに同意とする（遅れて届いた答えは `ign`）。復旧中（R）はトレイの「終了」と同じく
+//!   断る（`rec`。インストーラは上限まで待って強制終了するが、復旧の途中で切るよりよい）。
+//!   終了が確定した後（Q〜Xt）は何もしない（`quit`。インストーラはプロセスの終わりを待つ）。
 //!
 //! 表に出てこない約束（テスト `invariants_hold_from_every_state` が印のすべての組で
 //! 確かめる）:
@@ -466,6 +474,9 @@ pub(crate) enum Event {
     EngineAdmit,
     /// トレイ・Fallback の窓の「終了」が押された。
     QuitRequest,
+    /// インストーラからの終了の要求（`--quit-for-update`、#392 B3-4。注 5）。確認を出さずに
+    /// 同意として進む。確認ダイアログが出ていればその答えを待たずに同意とする。
+    QuitForUpdate,
     /// 終了の確認の答え（確認しない態では同意として）。`now_busy` は、同意で確認中・
     /// 復旧中でないときだけ、収集の受付の印を立てて読んだ値（それ以外は使わない）。
     QuitAnswer {
@@ -685,6 +696,20 @@ pub(crate) fn step(state: &LifecycleState, event: &Event) -> (LifecycleState, De
                 }
             }
         },
+        // 注 5: トレイの「終了」と同じ確認の段階を通るが、確認は出さない（`confirm: false`）。
+        // 確認ダイアログが出ていても（Fc）断らず、同意として進む - 断るとインストーラは
+        // 上限の後に強制終了し、最終 flush を失う。復旧中（R）は「終了」と同じく断る
+        // （データを守る側に倒す）。終了が確定した後（Q〜Xt）は 2 つ目を走らせない。
+        Event::QuitForUpdate => match decide_request(state.quit) {
+            (_, QuitRequestDecision::AlreadyQuitting) => {
+                Decision::Refused(Refusal::AlreadyQuitting)
+            }
+            _ if state.ticket == Ticket::Recovery => Decision::Refused(Refusal::RecoveryInProgress),
+            (phase, _) => {
+                next.quit = phase;
+                Decision::AskQuit { confirm: false }
+            }
+        },
         Event::QuitAnswer {
             confirmed,
             prompted_busy,
@@ -860,6 +885,17 @@ pub(crate) enum QuitRequestOutcome {
     RecoveryInProgress,
     /// 確認ダイアログが出ている・終了処理が走っている - 何もしない。
     AlreadyHandled,
+}
+
+/// インストーラからの終了の要求（`--quit-for-update`）にすること。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuitForUpdateOutcome {
+    /// 確認を出さずに終了処理へ進む（終了は確定し、新しい復旧を始めない）。
+    Proceed,
+    /// DB の復旧の途中なので断る（記録だけ。インストーラは上限まで待つ）。
+    RecoveryInProgress,
+    /// 終了処理は既に走っている - 何もしない（インストーラはプロセスの終わりを待つ）。
+    AlreadyQuitting,
 }
 
 /// 終了の後始末に入るときの計画（[`Lifecycle::begin_exit`]）。
@@ -1098,10 +1134,20 @@ impl Lifecycle {
         admission: &dyn QuitAdmission,
     ) -> QuitAnswerOutcome {
         let mut state = self.lock();
-        let now_busy = needs_admission(&state, confirmed)
-            && call_under_lock(|| admission.begin_quit_confirm());
+        Self::answer_quit_locked(&mut state, confirmed, prompted_busy, admission)
+    }
+
+    /// [`Lifecycle::answer_quit`] の本体（ロックの中）。
+    fn answer_quit_locked(
+        state: &mut LifecycleState,
+        confirmed: bool,
+        prompted_busy: bool,
+        admission: &dyn QuitAdmission,
+    ) -> QuitAnswerOutcome {
+        let now_busy =
+            needs_admission(state, confirmed) && call_under_lock(|| admission.begin_quit_confirm());
         let (next, decision) = step(
-            &state,
+            state,
             &Event::QuitAnswer {
                 confirmed,
                 prompted_busy,
@@ -1116,6 +1162,35 @@ impl Lifecycle {
             call_under_lock(|| admission.cancel_quit_confirm());
         }
         outcome
+    }
+
+    /// インストーラからの終了の要求（`--quit-for-update`、#392 B3-4。表の注 5）。トレイの
+    /// 「終了」の「押す → 同意」を**同じロックの中で**続けて通す（確認は出さない。収集の
+    /// 受付の印は [`Lifecycle::answer_quit`] と同じ形で立てる）。同意は「収集中の文言で
+    /// 同意した」として渡すので、収集中でも確かめ直さずに進む（止めるものは後始末が
+    /// 止める）。復旧中は断り、終了が確定した後は何もしない。
+    pub(crate) fn request_quit_for_update(
+        &self,
+        admission: &dyn QuitAdmission,
+    ) -> QuitForUpdateOutcome {
+        let mut state = self.lock();
+        let (next, decision) = step(&state, &Event::QuitForUpdate);
+        *state = next;
+        match decision {
+            Decision::AskQuit { .. } => {}
+            Decision::Refused(Refusal::RecoveryInProgress) => {
+                return QuitForUpdateOutcome::RecoveryInProgress;
+            }
+            Decision::Refused(Refusal::AlreadyQuitting) => {
+                return QuitForUpdateOutcome::AlreadyQuitting;
+            }
+            other => unreachable!("QuitForUpdate decides AskQuit or refuses: {other:?}"),
+        }
+        match Self::answer_quit_locked(&mut state, true, true, admission) {
+            QuitAnswerOutcome::Proceed => QuitForUpdateOutcome::Proceed,
+            // 確認の段階は上で Confirming にし、復旧中は上で断っているので、ここは進むだけ。
+            other => unreachable!("a quit for update proceeds: {other:?}"),
+        }
     }
 
     /// 終了の扉を閉じ（以後の移り変わり・エンジンを置くこと・起動の続きを断る）、
@@ -1412,6 +1487,7 @@ mod tests {
             ("起動を続けてよいか", Event::LaunchCheck, ["go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "exit", "exit", "exit"]),
             ("エンジンを置く", Event::EngineAdmit, ["go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "go", "exit", "exit", "exit"]),
             ("終了", Event::QuitRequest, ["ask", "ask", "ask", "ask", "noask", "conf", "noask", "noask", "rec", "ask", "quit", "quit", "quit", "quit", "ask"]),
+            ("インストーラからの終了の要求", Event::QuitForUpdate, ["noask", "noask", "noask", "noask", "noask", "noask", "noask", "noask", "rec", "noask", "quit", "quit", "quit", "quit", "noask"]),
             ("答え: 取り消し", answer(false, false, false), ["ign", "ign", "ign", "ign", "ign", "cancel", "ign", "ign", "ign", "ign", "ign", "ign", "ign", "ign", "ign"]),
             ("答え: 同意（暇 → 暇）", answer(true, false, false), ["ign", "ign", "ign", "ign", "ign", "proceed", "ign", "ign", "rec", "ign", "ign", "ign", "ign", "ign", "ign"]),
             ("答え: 同意（暇 → 収集中）", answer(true, false, true), ["ign", "ign", "ign", "ign", "ign", "again", "ign", "ign", "rec", "ign", "ign", "ign", "ign", "ign", "ign"]),
@@ -1559,6 +1635,7 @@ mod tests {
             Event::LaunchCheck,
             Event::EngineAdmit,
             Event::QuitRequest,
+            Event::QuitForUpdate,
             Event::ExitBegin(ExitTrigger::TrayQuit),
             Event::ExitBegin(ExitTrigger::RunEventExit),
             Event::OpenWindow,
@@ -1689,6 +1766,13 @@ mod tests {
                 // 復旧中の「終了」・同意は断る。同意で終了へ進むのは確認中だけ。
                 if state.ticket == Ticket::Recovery {
                     if event == Event::QuitRequest && state.quit == QuitPhase::Idle {
+                        assert_eq!(
+                            decision,
+                            Decision::Refused(Refusal::RecoveryInProgress),
+                            "{at}"
+                        );
+                    }
+                    if event == Event::QuitForUpdate && state.quit != QuitPhase::Quitting {
                         assert_eq!(
                             decision,
                             Decision::Refused(Refusal::RecoveryInProgress),
@@ -2213,6 +2297,79 @@ mod tests {
         assert_eq!(
             gate.request_quit(),
             QuitRequestOutcome::Ask { confirm: true }
+        );
+    }
+
+    /// #392 B3-4: インストーラからの終了の要求は、どの画面でも確認を出さずに終了を確定し
+    /// （収集中でも確かめ直さない）、収集の受付の印はトレイの同意と同じく 1 回立てる。
+    /// 2 回目は何もしない。
+    #[test]
+    fn quit_for_update_proceeds_without_confirmation_in_every_view() {
+        for view in [
+            ShellView::Desktop,
+            ShellView::Service { port: 1 },
+            fallback_view(),
+        ] {
+            let gate = Lifecycle::started(view.clone());
+            let busy = Counting {
+                busy: true,
+                ..Counting::default()
+            };
+            assert_eq!(
+                gate.request_quit_for_update(&busy),
+                QuitForUpdateOutcome::Proceed,
+                "{view:?}"
+            );
+            assert_eq!(busy.begun.load(Ordering::SeqCst), 1, "{view:?}");
+            assert_eq!(busy.cancelled.load(Ordering::SeqCst), 0, "{view:?}");
+            assert!(gate.quitting(), "{view:?}");
+            assert!(!gate.may_open_window(), "{view:?}");
+            assert_eq!(
+                gate.request_quit_for_update(&busy),
+                QuitForUpdateOutcome::AlreadyQuitting,
+                "{view:?}"
+            );
+            assert_eq!(busy.begun.load(Ordering::SeqCst), 1, "{view:?}");
+            // トレイの「終了」も 2 つ目は走らない。
+            assert_eq!(gate.request_quit(), QuitRequestOutcome::AlreadyHandled);
+        }
+    }
+
+    /// #392 B3-4: 確認ダイアログが出ている間に要求が来たら、答えを待たずに同意として進み、
+    /// 遅れて届いた答えは無視する。復旧中は断り、扉は閉じない。
+    #[test]
+    fn quit_for_update_takes_over_a_pending_prompt_and_is_refused_while_recovering() {
+        let gate = Lifecycle::started(ShellView::Desktop);
+        assert_eq!(
+            gate.request_quit(),
+            QuitRequestOutcome::Ask { confirm: true }
+        );
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy),
+            QuitForUpdateOutcome::Proceed
+        );
+        assert!(gate.quitting());
+        assert_eq!(
+            gate.answer_quit(true, false, &NotBusy),
+            QuitAnswerOutcome::Ignored
+        );
+        assert_eq!(
+            gate.answer_quit(false, false, &NotBusy),
+            QuitAnswerOutcome::Ignored
+        );
+
+        let gate = Lifecycle::started(ShellView::Desktop);
+        let recovery = gate.begin_recovery().expect("recovery");
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy),
+            QuitForUpdateOutcome::RecoveryInProgress
+        );
+        assert_eq!(gate.snapshot().quit, QuitPhase::Idle);
+        assert!(!gate.is_exiting());
+        drop(recovery);
+        assert_eq!(
+            gate.request_quit_for_update(&NotBusy),
+            QuitForUpdateOutcome::Proceed
         );
     }
 

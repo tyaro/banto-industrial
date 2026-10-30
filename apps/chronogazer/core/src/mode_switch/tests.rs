@@ -541,6 +541,29 @@ fn handoff_args_round_trip_and_only_exact_shapes_count() {
     }
 }
 
+// ---- インストーラからの終了の要求 ----
+
+#[test]
+fn quit_for_update_is_only_the_exact_argument() {
+    assert!(wants_quit_for_update([QUIT_FOR_UPDATE_ARG]));
+    // single-instance は 2 つ目のプロセスの argv をプログラム名ごと渡す。
+    assert!(wants_quit_for_update([
+        r"C:\Program Files\ChronoGazer\chronogazer.exe",
+        "--quit-for-update"
+    ]));
+    assert!(!wants_quit_for_update([]));
+    for other in [
+        "--Quit-For-Update",
+        "--quit-for-update=1",
+        "quit-for-update",
+        HANDOFF_TO_OPERATION_ARG,
+    ] {
+        assert!(!wants_quit_for_update([other]), "{other}");
+    }
+    // 引き継ぎの引数の解釈はこの引数を無視する。
+    assert_eq!(parse_handoff([QUIT_FOR_UPDATE_ARG]), Handoff::default());
+}
+
 #[test]
 fn waiting_for_a_finished_process_returns_at_once() {
     let mut child = std::process::Command::new(if cfg!(windows) { "cmd" } else { "true" })
