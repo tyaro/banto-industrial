@@ -50,9 +50,11 @@
         "description": "`POST /api/v1/values/batch` の request body（設計 §3.3\n「`[{tag, value}, ...]` を受ける」）。",
         "properties": {
           "writes": {
+            "description": "上限は 1000 件（超過は 422）。",
             "items": {
               "$ref": "#/components/schemas/BatchWriteEntryRequest"
             },
+            "maxItems": 1000,
             "type": "array"
           }
         },

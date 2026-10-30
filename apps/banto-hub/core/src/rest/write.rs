@@ -294,6 +294,10 @@ pub(super) struct BatchWriteEntryRequest {
 /// 「`[{tag, value}, ...]` を受ける」）。
 #[derive(Debug, Deserialize, ToSchema)]
 pub(super) struct BatchWriteValueRequest {
+    /// 上限は 1000 件（超過は 422）。
+    // リテラルしか書けないため、`crate::write_path::MAX_BATCH_WRITE_ENTRIES` と
+    // 一致させること（`openapi_max_items_matches_limit` が固定している）。
+    #[schema(max_items = 1000)]
     writes: Vec<BatchWriteEntryRequest>,
 }
 
