@@ -528,10 +528,10 @@ pub struct TagEntry {
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
-/// every [`CollectorManager::apply_run`] (design §4.1's "revision" is the
+/// every [`CollectorManager::commit_catalog`] (design §4.1's "revision" is the
 /// generation counter of exactly this snapshot). Cheap to clone (wrap in
 /// `Arc`) since a REST handler reading the catalog must not block a
-/// concurrent rebuild.
+/// concurrent catalog commit.
 #[derive(Debug, Default)]
 pub struct TagMap {
     by_external: HashMap<String, TagEntry>,
@@ -1002,7 +1002,7 @@ pub struct CollectorManager {
     computed: Arc<ComputedEngine>,
     /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.2・§4.5）:
     /// DB Source のポーリングエンジン。`computed` と**全く同じ扱い**で
-    /// [`Self::apply_run`]/[`Self::commit_catalog`] が
+    /// [`Self::commit_catalog`] が
     /// `crate::db_source::build_plan`（純関数）の結果を catalog/`Collector`/
     /// 演算 plan の入れ替えと同じ all-or-nothing の1ステップで commit する
     /// （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
@@ -1609,7 +1609,7 @@ impl CollectorManager {
     ///
     /// **T9-2 fourth return value (`read_routed_keys`; #131 2026-09-01,
     /// reworked by #337 2026-09-08)**: the connection keys whose *collection
-    /// reads* are broker-routed - the set [`Self::commit_catalog`]/[`Self::apply_run`]
+    /// reads* are broker-routed - the set [`Self::apply_run`]
     /// feed into `banto_collect::CollectorConfig::suppress_simulation_for`
     /// ("something else already substitutes this connection's simulator,
     /// stand down your own").
@@ -1756,7 +1756,7 @@ impl CollectorManager {
             // in R2b-3a-3) `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
             // the broker), so putting a Modbus key into the set
-            // `Self::commit_catalog`/`Self::apply_run` feed to
+            // `Self::apply_run` feeds to
             // `CollectorConfig::suppress_simulation_for` - which tells
             // `Collector` "something else already handles this connection's
             // simulation, stand down your own simulator" - would have left a
