@@ -19,7 +19,7 @@ banto-driver-api = { path = "../banto-driver-api", version = "0.3.0" }
 banto-plc-write = { path = "../banto-plc-write" }
 semver = "1"
 serde_json = "1"
-wasmtime = { version = "=50.0.0", default-features = false, features = ["component-model", "runtime", "cranelift", "std"] }
+wasmtime = { version = "=50.0.1", default-features = false, features = ["component-model", "runtime", "cranelift", "std"] }
 
 [dev-dependencies]
 banto-driver-engine = { path = "../banto-driver-engine", version = "0.2.0" }
