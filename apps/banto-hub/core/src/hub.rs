@@ -8,8 +8,8 @@
 //! レジストリが変わるたびに `banto_collect::Collector` をまるごと作り直して
 //! いた（ChronoGazer と同型）。**T7 でこれを卒業**し、既に稼働中の
 //! `Collector` があるときは [`banto_collect::Collector::apply_config`]
-//! （T7-1、差分適用・`ApplyReport` 返却）を呼ぶよう [`CollectorManager::rebuild`]
-//! を書き換えた。段階実装の狙いどおり、外部契約（`revision`・`config_changed`・
+//! （T7-1、差分適用・`ApplyReport` 返却）を呼ぶよう収集の適用（当時は `rebuild`、
+//! いまは [`CollectorManager::apply_run`]）を書き換えた。段階実装の狙いどおり、外部契約（`revision`・`config_changed`・
 //! `last_error`、設計 §4.1）はこの移行の前後でまったく変わっていない —
 //! クライアントは何も気付かずに「変更時に他接続の値まで一瞬 Bad になっていた
 //! (T0〜T6) → ならなくなった (T7)」という体験の向上だけを受け取る（設計 §4.3
@@ -39,7 +39,7 @@
 //! `Collector` を新規作成した瞬間（起動時 / 空構成からの復帰時）だけ
 //! 更新する。`apply_config` 実行中でも `current_values()` は一切ブロック
 //! されず、常に最新の（かつ正しい）ハンドルを返す — 「無関係な接続 A の値が
-//! rebuild 中も途切れない」という T7 の対外的要件を、REST/WS/gRPC/MQTT の
+//! 構成の適用中も途切れない」という T7 の対外的要件を、REST/WS/gRPC/MQTT の
 //! 呼び出し側コードを一切変更せずに満たす（`connection_status` はブロック
 //! される可能性があるが、そのブロックは「待てば正しい最新状態が返る」だけで
 //! 「間違った/空の状態が返る」ことは決してない - 遅延であって不整合ではない）。
@@ -49,8 +49,8 @@
 //! T2-2 は broker セッションの同期を `ensure_connection` のみ（追加専用）と
 //! していた（`crate::broker_glue::HubSessions` のモジュール doc「Session
 //! sync policy」参照）。T7-2 で `banto_broker::SessionDirectory::remove` が
-//! 追加されたことを受け、[`CollectorManager::rebuild`] は毎回「追加 +
-//! 削除」の完全同期を行う: レジストリの現在の有効な broker 管理対象プロト
+//! 追加されたことを受け、収集の適用（当時は `rebuild`、いまは
+//! [`CollectorManager::apply_run`]）は毎回「追加 + 削除」の完全同期を行う: レジストリの現在の有効な broker 管理対象プロト
 //! コル接続集合（#131、2026-09-01: `HubSessions::is_broker_managed` -
 //! 現状 slmp と modbus-tcp。以前は slmp のみだった）を
 //! `ensure_connection`（従来どおり）した後、**Collector 側のコミットが
@@ -84,8 +84,8 @@
 //! タスクを止めて待ってから（2026-10-24 オーナー決定。以前は `remove` だけで、
 //! 待たなかった）`ensure_connection` して古いセッションの使い回しを防ぐ（#131、
 //! 2026-09-01 以降この resolve/ensure_connection 自体は Modbus TCP 接続にも
-//! 及ぶ - `sync_broker_sessions_from`のモジュール doc参照）。[`Self::rebuild`]
-//! はさらに、`sync_broker_sessions_from`の第4戻り値（`read_routed_keys` =
+//! 及ぶ - `sync_broker_sessions_from`のモジュール doc参照）。
+//! [`CollectorManager::apply_run`] はさらに、`sync_broker_sessions_from`の第4戻り値（`read_routed_keys` =
 //! *収集読み取り*が broker 経由になっている接続キーの集合）を
 //! `banto_collect::CollectorConfig::suppress_simulation_for` に渡し、
 //! `Collector` 自身が同じ接続に対して二重にシミュレータを起動しないようにする
@@ -108,11 +108,12 @@
 //! トグル前後で構造的に同一と比較され、`Collector::apply_config`はそれを
 //! 「unchanged」と分類してその接続の収集タスクに一切手を触れない -
 //! ところがタスクが起動時に捕まえた`ClientFactory`（そのクロージャが閉じる
-//! `ReadOnlyHandle`）はタスクの生存期間を通じて固定なので、rebuild の度に
+//! `ReadOnlyHandle`）はタスクの生存期間を通じて固定なので、適用の度に
 //! 新しく組み立てる`banto_collect::broker_client_factory`はタスクへ届かない。結果、broker
 //! セッションが`BrokerSimRegistry::resolve`の`changed`検出で実際には
 //! 入れ替わっていても、動き続けている収集タスクは古い（既に directory
-//! から外れた）セッションを黙って読み続けてしまう。そこで`Self::rebuild`は
+//! から外れた）セッションを黙って読み続けてしまう。そこで
+//! [`CollectorManager::apply_run`]は
 //! `sync_broker_sessions_from`が返す解決済みダイヤル先を
 //! `banto_collect::CollectorConfig::set_broker_dial_target`で該当接続の
 //! plan に書き戻す - `ProtocolConfig`（実際の接続には使われない、diff 専用の
@@ -123,15 +124,20 @@
 //! ## all-or-nothing の実現（設計 §4.3 最終段落、T7 で `apply_config` にも
 //! 継承）
 //!
-//! [`CollectorManager::rebuild`] は `build_config`（純粋な読み取り、
-//! 副作用なし）→ Collector 側の適用（`apply_config` または
+//! [`CollectorManager::commit_catalog`] は catalog・演算タグ・DB Source・
+//! `build_config` の検証（純粋な読み取り、副作用なし）をすべて通してから
+//! 初めて `map`/`revision` を commit する（検証に失敗したら `last_error` に
+//! 記録するだけで何も進めない）。[`CollectorManager::apply_run`] は
+//! `build_config` → Collector 側の適用（`apply_config` または
 //! `start_with_client_factory` - どちらも「失敗したら呼び出し前の状態を
-//! 完全に維持する」契約を持つ）→ 成功して初めて `map`/`revision`/
-//! `last_error`/`last_apply` を commit、という順序を守る。Collector 側が
-//! `Err` を返した場合（`apply_config` の失敗要因は tstore の writer を
-//! 開けない場合のみ - banto-collect 側のモジュール doc 参照）は
-//! `last_error` に記録するだけで catalog/`Collector`/`last_apply` は
-//! 一切進めない。
+//! 完全に維持する」契約を持つ）→ 成功して初めて `current`/`last_apply` を
+//! commit、という順序を守る。Collector 側が `Err` を返した場合
+//! （`apply_config` の失敗要因は tstore の writer を開けない場合のみ -
+//! banto-collect 側のモジュール doc 参照）は broker セッションを直前の成功
+//! 構成へ戻し、`last_error` に記録するだけで `Collector`/`last_apply` は
+//! 一切進めない。稼働中の構成変更でこの失敗が起きたときは、先に commit
+//! した catalog も `crate::controller::CollectionController::commit_catalog_and_apply_live`
+//! が [`CollectorManager::rollback_catalog`] で直前の成功構成へ戻す。
 //!
 //! **既知の制約は T7 で解消（旧 T0〜T6 の記述を更新）**: 従来の全体再構築
 //! 方式では、レジストリが同じ接続を指したまま構成が変わった場合（例:
@@ -143,27 +149,31 @@
 //! 自体が存在しない（同一の `Collector` インスタンスを in-place で
 //! 書き換えるだけ）。
 //!
-//! ## `rebuild` は直列化されている（監査レビュー指摘・2026-08-05 対応）
+//! ## catalog の commit と収集の適用は直列化されている（監査レビュー指摘・2026-08-05 対応）
 //!
-//! [`CollectorManager::rebuild`] 全体（レジストリ読み取り〜commit〜旧
-//! `Collector` の stop）は `rebuild_lock`（`tokio::sync::Mutex<()>`）で
-//! 直列化する。直列化なしだと、管理 UI の2セッションが同時に I1 CRUD を
-//! 叩いた場合に rebuild A（古いレジストリを読取）と rebuild B（新しい
-//! レジストリを読取）が交錯し、**B が先に commit されたあとで A が commit**
-//! すると「revision は2回進むが catalog/`Collector` は A が読んだ古い
-//! レジストリ状態のまま、`last_error` は `None`」という不整合が外部から
-//! 検知できない形で残ってしまう（catalog の revision と実体が食い違う）。
-//! `rebuild_lock` を rebuild() の冒頭で取得し、返すまで保持することで、
-//! 「最後に走り終えた rebuild が必ず最新のレジストリ状態を読んで commit
-//! する」ことを保証する（ロック取得後にレジストリを読むため、後から
-//! 呼ばれた rebuild は必ず先行 rebuild の commit 後の状態を見る）。
+//! [`CollectorManager::commit_catalog`] と [`CollectorManager::apply_run`]
+//! （当時は `rebuild`）は、それぞれ全体（apply_run ならレジストリ読み取り〜
+//! commit〜旧 `Collector` の stop）を `rebuild_lock`
+//! （`tokio::sync::Mutex<()>`）の下で行う。直列化なしだと、管理 UI の
+//! 2セッションが同時に I1 CRUD を叩いた場合に適用 A（古いレジストリを読取）と
+//! 適用 B（新しいレジストリを読取）が交錯し、**B が先に commit されたあとで
+//! A が commit** すると「revision は2回進むが catalog/`Collector` は A が
+//! 読んだ古いレジストリ状態のまま、`last_error` は `None`」という不整合が
+//! 外部から検知できない形で残ってしまう（catalog の revision と実体が
+//! 食い違う）。`rebuild_lock` を冒頭で取得し、返すまで保持することで、
+//! 「最後に走り終えた適用が必ず最新のレジストリ状態を読んで commit する」
+//! ことを保証する（`apply_run` はロック取得後にレジストリを読むため、後から
+//! 呼ばれた適用は必ず先行する適用の commit 後の状態を見る。`commit_catalog`
+//! が受け取る snapshot の鮮度は、呼び出し側（
+//! `crate::controller::CollectionController::commit_catalog_and_apply_live`
+//! など）が `transition` ロックの下で読み直して守る）。
 //! `inner` を保護する `std::sync::Mutex` は従来どおり短時間保持のまま
 //! （await をまたがせない）— 直列化の役目は `rebuild_lock` だけが持つ。
 //!
 //! ## T1: `revision` watch と `subscribe_events`（設計 §4.1/§5.2）
 //!
 //! `crate::stream`（WebSocket 購読）が使う2つの購読口をここに足した:
-//! [`CollectorManager::subscribe_revision`]（`rebuild` が commit する
+//! [`CollectorManager::subscribe_revision`]（`commit_catalog` が commit する
 //! たびに新しい revision を流す `watch` チャンネル - `config_changed` の
 //! 送信元）と [`CollectorManager::subscribe_events`]（`CollectEvent` の
 //! 中継元）。後者は `events` フィールド（[`EventSink`]、設計 §3.2/§4.1
@@ -178,8 +188,9 @@
 //!
 //! [`CollectorManager`] は [`crate::broker_glue::HubSessions`]（`sessions`
 //! フィールド）を保持する - **`CollectorManager` の外**（`bin/banto-hub.rs`）
-//! で構築・生存する共有 `Arc` で、`rebuild` を跨いでも SLMP セッションが
-//! 切れない。`rebuild` は毎回 [`CollectorManager::sync_broker_sessions_from`] で
+//! で構築・生存する共有 `Arc` で、構成の適用を跨いでも SLMP セッションが
+//! 切れない。[`CollectorManager::apply_run`] は毎回
+//! [`CollectorManager::sync_broker_sessions_from`] で
 //! レジストリの現在の broker 管理対象接続集合を `sessions` に
 //! `ensure_connection`（新規なら起動・既存ならそのまま）し、得た
 //! ハンドル群を `banto_collect::broker_client_factory` に渡す - broker
@@ -1040,8 +1051,10 @@ pub struct CollectorManager {
     /// is not.
     collector: AsyncMutex<Option<Collector>>,
     inner: Mutex<Inner>,
-    /// Serializes the whole body of [`CollectorManager::rebuild`] - see this
-    /// module's doc comment ("`rebuild` は直列化されている") for why a plain
+    /// Serializes the whole body of [`CollectorManager::commit_catalog`] and
+    /// [`CollectorManager::apply_run`] (and the test-only
+    /// [`CollectorManager::rebuild`]) - see this module's doc comment
+    /// ("catalog の commit と収集の適用は直列化されている") for why a plain
     /// `inner` lock alone is not enough (it is only held across the short
     /// commit step, not across the registry read that precedes it).
     rebuild_lock: AsyncMutex<()>,
@@ -1389,8 +1402,8 @@ impl CollectorManager {
     ///
     /// **Serialized**: concurrent callers queue on `rebuild_lock` and run one
     /// at a time, each reading the registry fresh after acquiring the lock -
-    /// see this module's doc comment ("`rebuild` は直列化されている") for why
-    /// this matters (without it, two racing rebuilds could commit
+    /// see this module's doc comment ("catalog の commit と収集の適用は
+    /// 直列化されている") for why this matters (without it, two racing rebuilds could commit
     /// out of order and leave `revision` advanced but the catalog/`Collector`
     /// reflecting a stale registry read).
     pub async fn rebuild(&self) -> Result<(), String> {
@@ -2854,8 +2867,29 @@ mod tests {
         (dir, manager, pool)
     }
 
-    /// シミュレーション接続 1 本・有効タグ 1 つを登録する（`rebuild` で収集が
-    /// 実際に走る最小構成）。
+    /// 製品の入口で、登録の内容を収集へ反映する: レジストリを読み直して
+    /// catalog を commit し、通常運転（`Configured`）で収集を(再)適用する。
+    /// 収集中の構成変更で製品が通る
+    /// `crate::controller::CollectionController::commit_catalog_and_apply_live`
+    /// と同じ順で、`apply_run` が失敗したら `rollback_catalog` で catalog も
+    /// 直前の成功構成へ戻す（#958 で、試験だけが使っていた `rebuild` を置き換え）。
+    async fn commit_and_apply(manager: &CollectorManager) -> Result<(), String> {
+        let snapshot = RegistrySnapshot::load(&manager.pool())
+            .await
+            .map_err(|err| err.to_string())?;
+        manager.commit_catalog(&snapshot).await?;
+        if let Err(err) = manager
+            .apply_run(crate::controller::RunMode::Configured)
+            .await
+        {
+            manager.rollback_catalog().await;
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// シミュレーション接続 1 本・有効タグ 1 つを登録する（`commit_and_apply`
+    /// で収集が実際に走る最小構成）。
     async fn seed_running_simulation(pool: &sqlx::SqlitePool) {
         let conn = PlcConnectionService::new(pool.clone())
             .create(PlcConnectionInput {
@@ -2917,7 +2951,7 @@ mod tests {
         let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
         let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
         seed_running_simulation(&pool).await;
-        manager.rebuild().await.unwrap();
+        commit_and_apply(&manager).await.unwrap();
         let collect = manager.current_values().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -2991,7 +3025,7 @@ mod tests {
         let clock = Arc::new(banto_tstore::ManualClock::new(1_000, 0));
         let (_dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
         seed_running_simulation(&pool).await;
-        manager.rebuild().await.unwrap();
+        commit_and_apply(&manager).await.unwrap();
         let collect = manager.current_values().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -3066,7 +3100,7 @@ mod tests {
                     let snapshot = RegistrySnapshot::load(&pool).await.unwrap();
                     manager.commit_catalog(&snapshot).await.unwrap();
                 } else {
-                    manager.rebuild().await.unwrap();
+                    commit_and_apply(&manager).await.unwrap();
                 }
             };
             publish().await;
@@ -3154,7 +3188,7 @@ mod tests {
     async fn prune_while_running_does_not_defeat_the_writer_close_on_stop() {
         let (dir, manager, pool) = manager_env().await;
         seed_running_simulation(&pool).await;
-        manager.rebuild().await.expect("rebuild");
+        commit_and_apply(&manager).await.expect("commit and apply");
         let data_dir = dir.path().join("data");
         let old = data_dir.join("20200101-001.sqlite3");
         std::fs::write(&old, b"").unwrap();
@@ -3187,7 +3221,7 @@ mod tests {
         ));
         let (dir, manager, pool) = manager_env_with_clock(clock.clone()).await;
         seed_running_simulation(&pool).await;
-        manager.rebuild().await.expect("rebuild");
+        commit_and_apply(&manager).await.expect("commit and apply");
         let data_dir = dir.path().join("data");
 
         let day1 = banto_tstore::list_data_files(&data_dir).unwrap();
@@ -3293,10 +3327,13 @@ mod tests {
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_on_an_empty_registry_is_not_an_error() {
+    async fn commit_and_apply_on_an_empty_registry_is_not_an_error() {
         let (_dir, manager, _pool) = manager_env().await;
-        manager.rebuild().await.expect("empty rebuild should be Ok");
-        assert_eq!(manager.revision(), 1);
+        commit_and_apply(&manager)
+            .await
+            .expect("an empty commit and apply should be Ok");
+        assert_eq!(manager.revision(), 1, "the catalog commit is one revision");
+        assert_eq!(manager.running_revision(), 1, "the run is applied once");
         assert_eq!(manager.last_error(), None);
         assert!(manager.tag_map().is_empty());
         assert!(manager.current_values().is_none());
@@ -3739,7 +3776,7 @@ mod tests {
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_builds_a_catalog_entry_with_effective_enabled_state() {
+    async fn commit_and_apply_builds_a_catalog_entry_with_effective_enabled_state() {
         let (_dir, manager, pool) = manager_env().await;
 
         let conn = PlcConnectionService::new(pool.clone())
@@ -3799,26 +3836,28 @@ mod tests {
 
         // Nothing enabled to actually collect (the tag itself is disabled),
         // but the catalog must still show it (design §4: 欠測を隠さない).
-        manager.rebuild().await.expect("rebuild should be Ok");
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
         let map = manager.tag_map();
         let entry = map.get("line1.fast.temp01").expect("catalog entry");
         assert_eq!(entry.ids, (conn.id, group.id, tag.id));
         assert_eq!(entry.address, "40001");
         assert!(!entry.enabled, "tag itself is disabled");
 
-        // `rebuild()` above spawned a real (if unreachable) per-connection
-        // collector task that would otherwise outlive this test and keep
-        // its `EventSink` pool clone checked out - see
+        // `commit_and_apply` above also applies the run, and any
+        // per-connection collector task it spawns would otherwise outlive
+        // this test and keep its `EventSink` pool clone checked out - see
         // `crate::test_support`'s module doc for why that alone defeats
         // `TempDir::drop`'s retry regardless of ordering.
         manager.shutdown().await;
     }
 
     /// #635: 既に外部名が重なっている DB（2026-10-17 の検証より前に書いた行）でも
-    /// catalog の再構築は失敗しない（起動を止めない、オーナー決定）。重なりは
-    /// catalog に載り、警告の行に出る（`warn_external_name_collisions`）。
+    /// catalog の commit と収集の適用は失敗しない（起動を止めない、オーナー決定）。
+    /// 重なりは catalog に載り、警告の行に出る（`warn_external_name_collisions`）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_keeps_running_with_an_existing_external_name_collision() {
+    async fn commit_and_apply_keep_running_with_an_existing_external_name_collision() {
         let (_dir, manager, pool) = manager_env().await;
         let mut ids = Vec::new();
         for (conn_name, group_name, port) in [("a.b", "c", 15024), ("a", "b.c", 15025)] {
@@ -3879,10 +3918,9 @@ mod tests {
             ids.push(tag.id);
         }
 
-        manager
-            .rebuild()
+        commit_and_apply(&manager)
             .await
-            .expect("rebuild must not fail on a collision");
+            .expect("commit and apply must not fail on a collision");
         let map = manager.tag_map();
         assert_eq!(map.len(), 1);
         assert_eq!(map.collisions().len(), 1);
@@ -3903,7 +3941,7 @@ mod tests {
     /// "registered but still empty connection stuck in reconnecting"
     /// grievance this slice fixes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_does_not_sync_a_broker_session_for_a_tagless_connection() {
+    async fn apply_run_does_not_sync_a_broker_session_for_a_tagless_connection() {
         let (_dir, manager, pool) = manager_env().await;
 
         let conn = PlcConnectionService::new(pool.clone())
@@ -3926,7 +3964,9 @@ mod tests {
             .await
             .unwrap();
 
-        manager.rebuild().await.expect("rebuild should be Ok");
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
 
         assert!(
             !manager.sessions().connection_ids().contains(&conn.id),
@@ -3951,11 +3991,11 @@ mod tests {
     }
 
     /// Regression guard for the flip side of
-    /// `rebuild_does_not_sync_a_broker_session_for_a_tagless_connection`: a
+    /// `apply_run_does_not_sync_a_broker_session_for_a_tagless_connection`: a
     /// connection with an enabled group and an enabled tag keeps getting its
     /// broker session pre-synced exactly as before T19 S2-a.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_still_syncs_a_broker_session_for_a_connection_with_a_tag() {
+    async fn apply_run_still_syncs_a_broker_session_for_a_connection_with_a_tag() {
         let (_dir, manager, pool) = manager_env().await;
 
         let conn = PlcConnectionService::new(pool.clone())
@@ -4013,7 +4053,9 @@ mod tests {
             .await
             .unwrap();
 
-        manager.rebuild().await.expect("rebuild should be Ok");
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
 
         assert!(
             manager.sessions().connection_ids().contains(&conn.id),
@@ -4185,7 +4227,9 @@ mod tests {
         let a = seed_collected_connection(&manager, "a", "fake-session", port_a).await;
         let b = seed_collected_connection(&manager, "b", "modbus-tcp", port_b).await;
 
-        manager.rebuild().await.expect("first rebuild");
+        commit_and_apply(&manager)
+            .await
+            .expect("first commit and apply");
         let wait = Duration::from_secs(5);
         let mut socket_a = tokio::time::timeout(wait, sockets_a.recv())
             .await
@@ -4201,8 +4245,7 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        manager
-            .rebuild()
+        commit_and_apply(&manager)
             .await
             .expect("a simulation of any session-type driver is planned");
 
@@ -4269,7 +4312,9 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
-        manager.rebuild().await.expect("first rebuild");
+        commit_and_apply(&manager)
+            .await
+            .expect("first commit and apply");
 
         let old_a = manager.sessions().handle_for(a).expect("A has a session");
         let old_b = manager.sessions().handle_for(b).expect("B has a session");
@@ -4339,8 +4384,10 @@ mod tests {
             old_b.settings_fingerprint()
         );
 
-        // The whole rebuild converges: A's new session comes up, B's stays.
-        manager.rebuild().await.expect("second rebuild");
+        // The whole commit and apply converges: A's new session comes up, B's stays.
+        commit_and_apply(&manager)
+            .await
+            .expect("second commit and apply");
         let mut rx = new_a.status_watch();
         tokio::time::timeout(
             wait,
@@ -4418,107 +4465,14 @@ mod tests {
         manager.shutdown().await;
     }
 
-    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
-    // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_keeps_the_old_state_on_a_config_error() {
-        let (_dir, manager, pool) = manager_env().await;
-
-        let conn = PlcConnectionService::new(pool.clone())
-            .create(PlcConnectionInput {
-                name: "line1".to_string(),
-                protocol: "modbus-tcp".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 15021,
-                unit_id: 1,
-                enabled: true,
-                simulation: false,
-
-                word_order: "low_high".to_string(),
-                cpu_type: None,
-                database: None,
-                username: None,
-                secrets: Default::default(),
-                settings: None,
-            })
-            .await
-            .unwrap();
-        let group = CollectionGroupService::new(pool.clone())
-            .create(CollectionGroupInput {
-                name: "fast".to_string(),
-                plc_connection_id: conn.id,
-                period_ms: 100,
-                enabled: true,
-                default_writable: true,
-                query_sql: None,
-            })
-            .await
-            .unwrap();
-
-        // First rebuild: still empty (no tags yet), succeeds and bumps
-        // revision to 1.
-        manager.rebuild().await.unwrap();
-        assert_eq!(manager.revision(), 1);
-
-        // A tag with an address `build_config` cannot parse under Modbus
-        // rules ("99999" has an unknown area prefix, see
-        // banto-collect::config's own `invalid_address_is_a_config_error`
-        // test) - passes banto-tags' own (non-empty-only) validation but
-        // fails at build_config time.
-        TagService::new(pool.clone())
-            .create(TagInput {
-                comment: None,
-                name: "bad".to_string(),
-                collection_group_id: group.id,
-                address: "99999".to_string(),
-                data_type: "i16".to_string(),
-                string_length: None,
-                string_encoding: "utf8".to_string(),
-                raw_lo: None,
-                raw_hi: None,
-                eng_lo: None,
-                eng_hi: None,
-                unit: None,
-                decimals: 0,
-                enabled: true,
-                writable: false,
-                tag_kind: "plc".to_string(),
-                expression: None,
-                retain: false,
-                expected_revision: None,
-            })
-            .await
-            .unwrap();
-
-        let err = manager
-            .rebuild()
-            .await
-            .expect_err("bad address should fail rebuild");
-        assert!(!err.is_empty());
-        // Old state (empty catalog, revision 1) is untouched.
-        assert_eq!(manager.revision(), 1);
-        assert_eq!(manager.last_error(), Some(err));
-        assert!(manager.tag_map().is_empty());
-
-        // See the shutdown note in `rebuild_builds_a_catalog_entry_with_effective_enabled_state`
-        // above - the first (successful, empty-registry) rebuild here never
-        // spawns a task, but this test's whole point is the SECOND rebuild
-        // attempt with a real connection, which does (and fails at
-        // build_config time before ever reaching that task - but the FIRST
-        // rebuild already committed the empty config with zero tasks, so
-        // there is nothing to stop from that one either; shutdown is still
-        // the harmless, correct thing to call unconditionally).
-        manager.shutdown().await;
-    }
-
     /// T9-2 フォローアップ (2026-08-06): `log_simulation_warnings`（この
-    /// テストでは `rebuild` 経由で間接的に呼ばれる）が実際に注入された
+    /// テストでは `apply_run` 経由で間接的に呼ばれる）が実際に注入された
     /// `DiagLog` を経由すること - 素の `println!` に黙って落ちないことの
     /// 回帰確認（`crate::diag_log` モジュール doc「PR #43 監査指摘」参照）。
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn rebuild_routes_the_simulation_warning_through_the_injected_diag_log() {
+    async fn apply_run_routes_the_simulation_warning_through_the_injected_diag_log() {
         let (_dir, manager, pool) = manager_env().await;
         let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
         let captured = lines.clone();
@@ -4527,27 +4481,19 @@ mod tests {
             |_msg| {},
         ));
 
-        PlcConnectionService::new(pool.clone())
-            .create(PlcConnectionInput {
-                name: "simline".to_string(),
-                protocol: "modbus-tcp".to_string(),
-                host: "127.0.0.1".to_string(),
-                port: 15023,
-                unit_id: 1,
-                enabled: true,
-                simulation: true,
-
-                word_order: "low_high".to_string(),
-                cpu_type: None,
-                database: None,
-                username: None,
-                secrets: Default::default(),
-                settings: None,
-            })
+        // `apply_run` は収集するものがあるときに注意を出す（収集するグループが
+        // 無い構成は空の分岐で返り、注意を出さない）ので、有効なタグを 1 つ持つ
+        // 接続をシミュレーションにする。
+        let conn = seed_collected_connection(&manager, "simline", "modbus-tcp", 15023).await;
+        sqlx::query("UPDATE plc_connections SET simulation = 1 WHERE id = ?")
+            .bind(conn)
+            .execute(&pool)
             .await
             .unwrap();
 
-        manager.rebuild().await.expect("rebuild should be Ok");
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
 
         {
             let captured_lines = lines.lock().unwrap();
@@ -4618,7 +4564,7 @@ mod tests {
         }
     }
 
-    /// #616: 設定の 1 回の変更で `rebuild`・`apply_run` が続けて呼ばれても、同じ注意は 1 回
+    /// #616: 同じ構成の適用（`apply_run`）が続けて呼ばれても、同じ注意は 1 回
     /// だけ。間隔を過ぎた後・シミュレーションの接続を無くしてから再び有効にした後は、もう一度
     /// 出す。
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
@@ -4642,56 +4588,70 @@ mod tests {
                 .count()
         };
         let service = PlcConnectionService::new(pool.clone());
-        let created = service.create(sim_input(true)).await.unwrap();
+        // `apply_run` は収集するものがあるときに注意を出すので、有効なタグを
+        // 1 つ持つ接続をシミュレーションにする。
+        let id = seed_collected_connection(&manager, "simline", "modbus-tcp", 15024).await;
+        service.update(id, sim_input(true)).await.unwrap();
 
         for _ in 0..3 {
-            manager.rebuild().await.expect("rebuild should be Ok");
+            commit_and_apply(&manager)
+                .await
+                .expect("commit and apply should be Ok");
         }
         assert_eq!(count(), 1, "同じ変更で重複した");
 
         clock.advance_ms(SIM_WARNING_REPEAT_MS);
-        manager.rebuild().await.expect("rebuild should be Ok");
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
         assert_eq!(count(), 2, "間隔を過ぎたらもう一度出す");
 
         // シミュレーションを外すと忘れ、再び有効にしたら（間隔の中でも）出す。
-        service.update(created.id, sim_input(false)).await.unwrap();
-        manager.rebuild().await.expect("rebuild should be Ok");
-        service.update(created.id, sim_input(true)).await.unwrap();
-        manager.rebuild().await.expect("rebuild should be Ok");
+        service.update(id, sim_input(false)).await.unwrap();
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
+        service.update(id, sim_input(true)).await.unwrap();
+        commit_and_apply(&manager)
+            .await
+            .expect("commit and apply should be Ok");
         assert_eq!(count(), 3, "再び有効にしたら出す");
 
         manager.shutdown().await;
     }
 
-    /// Two concurrent `rebuild()` calls must not panic (no double-lock /
-    /// re-entrancy deadlock on `rebuild_lock`) and must both actually run to
-    /// completion (not silently coalesce) - `revision` ends up advanced by
-    /// exactly 2 either way, since both calls see the same (empty) registry
-    /// and each legitimately commits its own generation. This does not
-    /// assert anything about *ordering* (not this fix's concern, per the
-    /// review note) - only that serialization does not corrupt state or
-    /// deadlock under concurrency.
+    /// Two concurrent "commit the catalog, then apply the run" sequences
+    /// (`commit_catalog` and `apply_run`, the product entries that queue on
+    /// `rebuild_lock`) must not panic (no double-lock / re-entrancy deadlock
+    /// on `rebuild_lock`) and must all actually run to completion (not
+    /// silently coalesce) - `revision` and `running_revision` each end up
+    /// advanced by exactly 2 however the four calls interleave, since both
+    /// sequences see the same (empty) registry and each call legitimately
+    /// commits its own generation. This does not assert anything about
+    /// *ordering* (not this fix's concern, per the review note) - only that
+    /// serialization does not corrupt state or deadlock under concurrency.
     // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
     // multi-thread runtime.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_rebuild_calls_are_serialized_and_both_succeed() {
+    async fn concurrent_commit_and_apply_calls_are_serialized_and_all_succeed() {
         let (_dir, manager, _pool) = manager_env().await;
         let manager = Arc::new(manager);
 
         let a = manager.clone();
         let b = manager.clone();
         let (result_a, result_b) = tokio::join!(
-            tokio::spawn(async move { a.rebuild().await }),
-            tokio::spawn(async move { b.rebuild().await }),
+            tokio::spawn(async move { commit_and_apply(&a).await }),
+            tokio::spawn(async move { commit_and_apply(&b).await }),
         );
         result_a
             .expect("task a should not panic")
-            .expect("rebuild a should succeed");
+            .expect("commit and apply a should succeed");
         result_b
             .expect("task b should not panic")
-            .expect("rebuild b should succeed");
+            .expect("commit and apply b should succeed");
 
         assert_eq!(manager.revision(), 2);
+        assert_eq!(manager.running_revision(), 2);
         assert_eq!(manager.last_error(), None);
     }
 }

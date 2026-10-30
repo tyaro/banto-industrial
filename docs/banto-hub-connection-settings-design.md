@@ -349,7 +349,7 @@ HubRuntime::start（runtime.rs:340-）
      c. banto_tags::migrate（0025 を含む）→ banto_collect::migrate（今どおり）
   3. 秘密値の後処理（§6.5）: Windows なら plain-v1 → dpapi-machine-v1、未適用キューの平文の封印、
      整合の確認（§5.3）、必要なら VACUUM
-  4. 以降は今どおり（予約接続・CollectorManager::rebuild ほか）
+  4. 以降は今どおり（予約接続・CollectorManager::commit_catalog ほか）
 ```
 
 - 2-b のレジストリは `HubConfig.drivers.registry`（`runtime.rs:206-207`、`init_db` より前に手元にある）。
