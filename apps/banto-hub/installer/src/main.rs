@@ -78,7 +78,10 @@
 //! `banto-hub-sink.exe grant-service-acl` → `banto-hub-elev.exe
 //! prepare-sink-config`（#630: 保護された置き場 `%ProgramData%\BantoHub\sink\` を
 //! 整え、`$INSTDIR` の `banto-hub-sink.toml.example` をそこへ差し替える）→ PREINSTALL で止めた
-//! サービスの再開、の順で実行する。PREUNINSTALL はシェルとサイドカーを
+//! サービスの再開、の順で実行する。サービスの停止・シェルの終了・再開の部品は
+//! ChronoGazer のインストーラと共通の `installer-common/service-common.nsh` にあり、
+//! このツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す
+//! （[`render_hooks`]）。PREUNINSTALL はシェルとサイドカーを
 //! 止めてからサービス登録を解除する。どのステップも失敗してインストーラ
 //! 自体を中断させない（`DetailPrint` で案内するだけ - T5-2 以来の方針）。
 
@@ -159,15 +162,44 @@ fn main() -> Result<()> {
     let icon_png = require_file(icon_dir.join("icon.png"))?;
     let icon_ico = require_file(icon_dir.join("icon.ico"))?;
 
-    let installer_hooks = require_file(installer_dir.join("hooks").join("service-hooks.nsh"))?;
+    // 共通部品（installer-common/service-common.nsh）の場所を、フックの先頭へ絶対パスで
+    // `!define` して渡す。makensis の作業ディレクトリは tauri-bundler の出力先なので、
+    // フック内の相対 `!include` は頼れない。
+    let common_dir = require_file(
+        installer_dir
+            .join("..")
+            .join("..")
+            .join("..")
+            .join("installer-common")
+            .join("service-common.nsh"),
+    )?
+    .parent()
+    .map(Path::to_path_buf)
+    .context("installer-common の場所を解決できません")?;
+    let common_dir = common_dir
+        .canonicalize()
+        .context("installer-common を正規化できません")?;
+    let hooks_src = require_file(installer_dir.join("hooks").join("service-hooks.nsh"))?;
+    let hooks_work_dir =
+        env::temp_dir().join(format!("banto-hub-installer-hooks-{}", std::process::id()));
+    std::fs::create_dir_all(&hooks_work_dir).context("フックの作業ディレクトリを作れません")?;
+    let installer_hooks = hooks_work_dir.join("service-hooks.nsh");
+    std::fs::write(
+        &installer_hooks,
+        render_hooks(
+            &std::fs::read_to_string(&hooks_src)
+                .with_context(|| format!("読めません: {}", hooks_src.display()))?,
+            &common_dir,
+        )?,
+    )
+    .context("フックの書き出しに失敗しました")?;
 
     let sink_config_example = require_file(
         installer_dir
             .join("assets")
             .join("banto-hub-sink.toml.example"),
     )?;
-    let cdla_license =
-        require_file(installer_dir.join("assets").join("CDLA-Permissive-2.0.txt"))?;
+    let cdla_license = require_file(installer_dir.join("assets").join("CDLA-Permissive-2.0.txt"))?;
 
     let package_settings = PackageSettings {
         product_name: PRODUCT_NAME.to_string(),
@@ -257,7 +289,9 @@ fn main() -> Result<()> {
     );
 
     let bundles = tauri_bundler::bundle_project(&settings)
-        .context("tauri_bundler::bundle_project に失敗しました")?;
+        .context("tauri_bundler::bundle_project に失敗しました");
+    let _ = std::fs::remove_dir_all(&hooks_work_dir);
+    let bundles = bundles?;
 
     for bundle in &bundles {
         for path in &bundle.bundle_paths {
@@ -310,6 +344,20 @@ fn missing_binaries(dir: &Path) -> Vec<&'static str> {
         .collect()
 }
 
+/// フック本体の先頭に `BANTO_INSTALLER_COMMON_DIR`（共通部品のディレクトリの
+/// 絶対パス）の `!define` を足す。NSIS の文字列に埋められないパス
+/// （`"`・`$`・改行）は拒否する。
+fn render_hooks(hooks: &str, common_dir: &Path) -> Result<String> {
+    let dir = path_to_string(common_dir)?;
+    if dir.contains(['"', '$', '\n', '\r']) {
+        bail!("共通部品のパスに NSIS で扱えない文字があります: {dir}");
+    }
+    let nl = if hooks.contains("\r\n") { "\r\n" } else { "\n" };
+    Ok(format!(
+        "!define BANTO_INSTALLER_COMMON_DIR \"{dir}\"{nl}{hooks}"
+    ))
+}
+
 fn require_file(path: PathBuf) -> Result<PathBuf> {
     if !path.is_file() {
         bail!("必要なファイルが見つかりません: {}", path.display());
@@ -326,6 +374,20 @@ fn path_to_string(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_hooks_prepends_the_common_dir_define() {
+        let out = render_hooks("body\r\n", Path::new("C:/x/installer-common")).expect("render");
+        assert_eq!(
+            out,
+            "!define BANTO_INSTALLER_COMMON_DIR \"C:/x/installer-common\"\r\nbody\r\n"
+        );
+    }
+
+    #[test]
+    fn render_hooks_rejects_paths_nsis_cannot_embed() {
+        assert!(render_hooks("b", Path::new("C:/a$b")).is_err());
+    }
 
     #[test]
     fn missing_binaries_lists_all_when_dir_empty() {
