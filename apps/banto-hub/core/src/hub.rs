@@ -4619,39 +4619,4 @@ mod tests {
 
         manager.shutdown().await;
     }
-
-    /// Two concurrent "commit the catalog, then apply the run" sequences
-    /// (`commit_catalog` and `apply_run`, the product entries that queue on
-    /// `rebuild_lock`) must not panic (no double-lock / re-entrancy deadlock
-    /// on `rebuild_lock`) and must all actually run to completion (not
-    /// silently coalesce) - `revision` and `running_revision` each end up
-    /// advanced by exactly 2 however the four calls interleave, since both
-    /// sequences see the same (empty) registry and each call legitimately
-    /// commits its own generation. This does not assert anything about
-    /// *ordering* (not this fix's concern, per the review note) - only that
-    /// serialization does not corrupt state or deadlock under concurrency.
-    // `crate::test_support`'s module doc: `TempDir::drop`'s retry needs a
-    // multi-thread runtime.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn concurrent_commit_and_apply_calls_are_serialized_and_all_succeed() {
-        let (_dir, manager, _pool) = manager_env().await;
-        let manager = Arc::new(manager);
-
-        let a = manager.clone();
-        let b = manager.clone();
-        let (result_a, result_b) = tokio::join!(
-            tokio::spawn(async move { commit_and_apply(&a).await }),
-            tokio::spawn(async move { commit_and_apply(&b).await }),
-        );
-        result_a
-            .expect("task a should not panic")
-            .expect("commit and apply a should succeed");
-        result_b
-            .expect("task b should not panic")
-            .expect("commit and apply b should succeed");
-
-        assert_eq!(manager.revision(), 2);
-        assert_eq!(manager.running_revision(), 2);
-        assert_eq!(manager.last_error(), None);
-    }
 }

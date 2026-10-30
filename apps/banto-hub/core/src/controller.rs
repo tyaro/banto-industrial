@@ -1231,6 +1231,155 @@ mod tests {
         assert_eq!(controller.status().state, CollectionState::Stopped);
     }
 
+    /// 収集中（`Running`）に、**違う構成変更**を 2 つ並行に書き、それぞれが
+    /// 続けて [`CollectionController::commit_catalog_and_apply_live`] を呼ぶ
+    /// （REST の CRUD が 2 本同時に来た場面）。`hub.rs` の module doc の節
+    /// 「catalog の commit と収集の適用は直列化されている」が塞ぐ競合
+    /// （古い snapshot を後から適用して、片方の変更が catalog・収集から
+    /// 消える）への回帰テスト。
+    ///
+    /// live apply は `transition` ロックの下で snapshot を読み直してから
+    /// commit → `apply_run` するので、どう前後しても**最後の適用は両方の
+    /// 書込みの後のレジストリ**を見る。確かめること: 両方 Ok・`last_error`
+    /// なし、catalog（`tag_map`）に両方のタグがある、実際に動いている収集が
+    /// 両方の値を集める、`revision` と `running_revision`（Running 中の
+    /// live apply は成功のたびに両方を 1 つ進める）がちょうど 2 進む。
+    /// 前後の入れ替わりが起きやすいよう、2 つの書込みを同時に始め、並行の段を
+    /// くり返す。ただし「snapshot の読込みと commit の間に、もう片方の書込みと
+    /// commit が割り込む」窓そのものは強制していない（その隙間に遅延を差す
+    /// 仕掛けが無い）ので、`transition` ロックを外しても毎回落ちるとは限らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_live_applies_of_different_changes_converge_on_the_latest_registry() {
+        use banto_tags::{
+            CollectionGroupInput, CollectionGroupService, PlcConnectionInput, PlcConnectionService,
+            TagInput, TagService,
+        };
+
+        let (_dir, controller) = controller_env().await;
+        let pool = controller.manager.pool();
+        // ネットワークに出ないシミュレーションの接続（値は模擬で流れる）。
+        let conn = PlcConnectionService::new(pool.clone())
+            .create(PlcConnectionInput {
+                name: "simline".to_string(),
+                protocol: "modbus-tcp".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 15032,
+                unit_id: 1,
+                enabled: true,
+                simulation: true,
+                word_order: "low_high".to_string(),
+                cpu_type: None,
+                database: None,
+                username: None,
+                secrets: Default::default(),
+                settings: None,
+            })
+            .await
+            .unwrap();
+        let group = CollectionGroupService::new(pool.clone())
+            .create(CollectionGroupInput {
+                name: "g".to_string(),
+                plc_connection_id: conn.id,
+                period_ms: 100,
+                enabled: true,
+                default_writable: true,
+                query_sql: None,
+            })
+            .await
+            .unwrap();
+        let tag_input = move |name: String, address: String| TagInput {
+            comment: None,
+            name,
+            collection_group_id: group.id,
+            address,
+            data_type: "i16".to_string(),
+            string_length: None,
+            string_encoding: "utf8".to_string(),
+            raw_lo: None,
+            raw_hi: None,
+            eng_lo: None,
+            eng_hi: None,
+            unit: None,
+            decimals: 0,
+            enabled: true,
+            writable: false,
+            tag_kind: "plc".to_string(),
+            expression: None,
+            retain: false,
+            expected_revision: None,
+        };
+
+        let running = controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(running.state, CollectionState::Running);
+
+        const ROUNDS: u32 = 10;
+        for round in 0..ROUNDS {
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let revision_before = controller.manager.revision();
+            let running_before = controller.manager.running_revision();
+
+            let spawn_change = |name: String, address: String| {
+                let controller = controller.clone();
+                let tags = TagService::new(pool.clone());
+                let input = tag_input(name, address);
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    // 2 つの書込みを同時に始め、片方の snapshot の読込みと
+                    // もう片方の書込みが重なる機会を作る。
+                    barrier.wait().await;
+                    let tag = tags.create(input).await.expect("タグを作れる");
+                    controller
+                        .commit_catalog_and_apply_live()
+                        .await
+                        .map(|()| tag.id)
+                })
+            };
+            let a = spawn_change(format!("a{round}"), format!("{}", 40001 + round * 2));
+            let b = spawn_change(format!("b{round}"), format!("{}", 40002 + round * 2));
+            let (a, b) = tokio::join!(a, b);
+            let id_a = a.expect("task a").expect("live apply a は Ok");
+            let id_b = b.expect("task b").expect("live apply b は Ok");
+
+            assert_eq!(controller.manager.last_error(), None, "round {round}");
+            assert_eq!(
+                controller.manager.revision(),
+                revision_before + 2,
+                "round {round}: commit は 2 回とも走る"
+            );
+            assert_eq!(
+                controller.manager.running_revision(),
+                running_before + 2,
+                "round {round}: Running 中の live apply は 2 回とも適用する"
+            );
+            assert_eq!(controller.status().state, CollectionState::Running);
+
+            let keys = [format!("tag:{id_a}"), format!("tag:{id_b}")];
+            let map = controller.manager.tag_map();
+            for key in &keys {
+                assert!(
+                    map.iter().any(|entry| &entry.tag_key == key),
+                    "round {round}: catalog に {key} がある（最後の適用が両方の書込みを見た）"
+                );
+            }
+            assert!(
+                wait_until(Duration::from_secs(5), || async {
+                    controller.manager.current_values().is_some_and(|values| {
+                        keys.iter()
+                            .all(|key| values.get(key).is_some_and(|sample| sample.value.is_some()))
+                    })
+                })
+                .await,
+                "round {round}: 動いている収集が {keys:?} の両方を集める"
+            );
+        }
+
+        controller.stop().await;
+        controller.manager.shutdown().await;
+    }
+
     /// Poll `predicate` every 10ms until it returns true or `timeout` elapses.
     async fn wait_until<F, Fut>(timeout: Duration, mut predicate: F) -> bool
     where
