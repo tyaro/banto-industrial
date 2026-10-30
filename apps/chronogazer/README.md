@@ -147,8 +147,8 @@ target\debug\chronogazer-server.exe        # Ctrl-C で停止
 
 同じ `chronogazer-server.exe` を Windows サービス `ChronoGazer`（表示名「ChronoGazer 記録エンジン」、
 LocalSystem、手動開始）として登録する。サインアウトしても止まらず、OS のシャットダウンでは最終 flush と
-`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。インストーラはこれから（B3-4）
-なので、今は**管理者として実行した PowerShell**（★）から手で行う。Operators・ACL・自動開始まで含めて一度に
+`collection_stopped` を残してから止まる（PRESHUTDOWN、後始末は最大 24 秒）。登録はインストーラ（下の「インストーラ」、
+B3-4）が行う。手で行うときは**管理者として実行した PowerShell**（★）から。Operators・ACL・自動開始まで含めて一度に
 整えるなら、下の「昇格ヘルパー `chronogazer-elev`」の `service-install` を使う（`install` と同じ登録をしてから
 続きを行う）。
 
@@ -244,6 +244,34 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
 - `ChronoGazer Operators` のメンバーは、昇格せずに `sc.exe start ChronoGazer` / `sc.exe stop ChronoGazer` が
   できる（設定の変更はできない）。データのフォルダには Operators・Users の権利を付けないので、画面を使う人は
   インストール利用者にする。
+
+#### インストーラ（2026-10-31〜、#392 B3-4）
+
+`ChronoGazer_<version>_x64-setup.exe`（NSIS、全利用者向け = UAC で昇格、`C:\Program Files\ChronoGazer\`）が
+シェル `chronogazer.exe`・記録エンジン `chronogazer-server.exe`・昇格ヘルパー `chronogazer-elev.exe` を同じ
+フォルダに入れ、WebView2 が無い PC では取得し、`chronogazer-elev.exe service-install`（登録・Operators・
+サービスの ACL・データの ACL。登録は手動開始）まで行う。作り方は `scripts/build-release-chronogazer.ps1`
+（フロントエンド → 3 つの release ビルド → `apps/chronogazer/installer`（Hub と同じ xtask）→ `dist/chronogazer/<version>/`）。
+設計は [docs/chronogazer-service-design.md](../../docs/chronogazer-service-design.md) §3.3 と §4 の B3-4 の実装メモ。
+
+- **上書きインストール**: 動いているシェルには `chronogazer.exe --quit-for-update` で正常終了を頼み（確認なしで
+  最終 flush と `collection_stopped` を残して終わる）、プロセスが無くなるまで最大 90 秒待つ。超えても強制終了は
+  せず、[再試行]（もう 90 秒）か [キャンセル]（インストールを中止。トレイの「終了」で閉じてからもう一度）を聞く。
+  サービス `ChronoGazer` は動いていれば止め、入れ替えの後に**止めたときだけ**再開する（新規では起動しない）。
+- **アンインストール**: 同じ手順でシェルを終え、サービスを止めて登録を解除する。**`%ProgramData%\ChronoGazer\`
+  （DB・時系列データ・Hub のキー・ログ）は残す**。全部消すときは手で削除する。アンインストーラの「アプリの
+  データを削除する」はこのフォルダに触らない（インストーラの識別子を `dev.tyaro.chronogazer-setup` にしてあるので、
+  以前の版の `%APPDATA%\dev.tyaro.chronogazer\` にも触らない）。
+- **以前の版（利用者単位のインストール）が残っているとき**: インストーラの最初に案内が出る（消しはしない）。
+  設定の「アプリ」から ChronoGazer のうち利用者単位の版をアンインストールする。その版のアンインストーラで
+  「アプリのデータを削除する」にチェックを付けると `%APPDATA%\dev.tyaro.chronogazer\` の旧い DB も消える。
+- **既知の制限（インストール利用者）**: インストーラの `service-install` には `--install-user-sid` を渡さない。
+  **別の管理者の資格情報で UAC を通す（over-the-shoulder）と、インストール利用者はその管理者になる**（Hub と
+  同じ制限）。画面を使う人をインストール利用者にするには、その人が管理者としてインストールするか、インストールの
+  後に上の「昇格ヘルパー」の手順で `service-uninstall` → `service-install --install-user-sid <その人の SID>` を行う。
+- 以前の版の案内は昇格したプロセスの HKCU を見るので、別の管理者の資格情報で UAC を通したときは出ない
+  （その管理者の HKCU になる。害は無い）。
+- インストーラは `firewall` の規則を作らない（LAN 公開を有効にしたときにシェル／サービスが行う）。
 
 ### 旧形式の DB で起動しないとき（2026-10-02〜）
 
