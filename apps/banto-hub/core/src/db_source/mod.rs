@@ -26,7 +26,7 @@
 //!
 //! ## エンジンのライフサイクル
 //!
-//! `crate::hub::CollectorManager` が1つ構築して保持し、`rebuild` /
+//! `crate::hub::CollectorManager` が1つ構築して保持し、
 //! `commit_catalog` が catalog・`Collector`・演算 plan の入れ替えと**同じ
 //! all-or-nothing の1ステップ**として [`DbSourceEngine::commit`] を呼ぶ
 //! （設計 §4.5「Source の task は `commit_catalog` の完了を受けて配下の
@@ -39,7 +39,7 @@
 //!
 //! | 呼ばれるもの                      | 誰が呼ぶ                                              | 何をする                                                       |
 //! | --------------------------------- | ----------------------------------------------------- | -------------------------------------------------------------- |
-//! | [`DbSourceEngine::commit`]        | `CollectorManager::rebuild`/`commit_catalog`          | 計画を保存。Running なら接続単位の差分で task を作り直す       |
+//! | [`DbSourceEngine::commit`]        | `CollectorManager::commit_catalog`                    | 計画を保存。Running なら接続単位の差分で task を作り直す       |
 //! | [`DbSourceEngine::start`]         | `crate::controller::CollectionController::start_locked` | 保存済みの計画から task を起動する                             |
 //! | [`DbSourceEngine::stop`]          | `crate::controller::CollectionController::stop_locked`  | task を止め、計画上の全 `db` タグへ Bad を書く                 |
 //! | [`DbSourceEngine::shutdown`]      | `crate::runtime::RunningHub::shutdown`                | プロセス終了時に task を止める（値は書かない）                 |
@@ -230,7 +230,7 @@ impl DbSourceEngine {
 
     /// 検証済みの計画を採用する（[`plan::build_plan`] が `Ok` を返した
     /// ときだけ呼ぶこと - all-or-nothing は呼び出し元
-    /// `crate::hub::CollectorManager::rebuild`/`commit_catalog` が担保する。
+    /// `crate::hub::CollectorManager::commit_catalog` が担保する。
     /// `crate::computed::ComputedEngine::commit` と全く同じ契約）。
     ///
     /// **v1 の差分方針: 接続単位で「設定が変わったら丸ごと再起動」。**

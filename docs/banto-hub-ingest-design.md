@@ -52,16 +52,16 @@
 
 ### 1.2 Hub の収集の組み立て
 
-| 項目                | 場所                                                                                                                                                                                                     | 事実                                                                                                             |
-| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
-| 計画の作成          | `apps/banto-hub/core/src/hub.rs:1448`（`rebuild`）・`:2304`（`commit_catalog`）・`apply_run`（`:2369-`）が `build_config_from`（**厳格版**、`config.rs:598-604`: 除外が 1 件でもあれば全体が失敗）を呼ぶ | 今の Hub に `push` 接続があると `UnsupportedProtocol` で収集全体が止まる                                         |
-| 収集の起動          | `hub.rs:1589`・`:2466` `Collector::start_with_client_factory`（源なし）、`apply_config`（`:1584`）                                                                                                       | ここを `start_with_sources(.., Some(ingest))` に替えるのが R2a-1 の差し込み口                                    |
-| 計画と同時の commit | `hub.rs:1529-1531`・`:1629-1630`・`:2310-2311` で `computed.commit` と `db_source.commit` を catalog の入れ替えと同じ点で行う                                                                            | `IngestHub::commit` も同じ点に置く                                                                               |
-| Running / Stopped   | `controller.rs:640`（Running になったら `db_source.start()`）、`:662`（停止で `db_source.stop()` → `manager.stop()`）                                                                                    | 停止中は `Collector` が無く、`plc` タグは `read_current` で Bad（`hub.rs:318-326`）                              |
-| 読み出しの統一点    | `hub.rs:283-291` `read_current`、`:375` `tag_kind == plc` なら収集のキャッシュ、それ以外は `ServerTagStore`                                                                                              | `push` のタグは `plc` なので収集のキャッシュを読む                                                               |
-| ビットの値          | `hub.rs:308-310` `valid_current_value`（`bit` は 0 / 1 以外を Bad）                                                                                                                                      |                                                                                                                  |
-| 全シミュレーション  | `hub.rs:233` `matches!(protocol, "modbus-tcp" \| "slmp")` だけを simulation にする                                                                                                                       | `push` はシミュレーションに切り替わらない（そのまま受けた値）                                                    |
-| broker の対象       | `HubSessions::is_broker_managed`（`DriverTable::is_supported`）。`write_path.rs:670-680`・`read_path.rs:177-179` は broker に無いプロトコルを `UnsupportedProtocol` で断る                               | `push` のタグへの書き込み・read-now は追加の分岐なしで断られる（登録時の `writable = false` に加えた二重の防御） |
+| 項目                | 場所                                                                                                                                                                       | 事実                                                                                                             |
+| ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| 計画の作成          | `apps/banto-hub/core/src/hub.rs` の `commit_catalog`・`apply_run`が `build_config_from`（**厳格版**、`config.rs:598-604`: 除外が 1 件でもあれば全体が失敗）を呼ぶ          | 今の Hub に `push` 接続があると `UnsupportedProtocol` で収集全体が止まる                                         |
+| 収集の起動          | `hub.rs:1589`・`:2466` `Collector::start_with_client_factory`（源なし）、`apply_config`（`:1584`）                                                                         | ここを `start_with_sources(.., Some(ingest))` に替えるのが R2a-1 の差し込み口                                    |
+| 計画と同時の commit | `hub.rs:1529-1531`・`:1629-1630`・`:2310-2311` で `computed.commit` と `db_source.commit` を catalog の入れ替えと同じ点で行う                                              | `IngestHub::commit` も同じ点に置く                                                                               |
+| Running / Stopped   | `controller.rs:640`（Running になったら `db_source.start()`）、`:662`（停止で `db_source.stop()` → `manager.stop()`）                                                      | 停止中は `Collector` が無く、`plc` タグは `read_current` で Bad（`hub.rs:318-326`）                              |
+| 読み出しの統一点    | `hub.rs:283-291` `read_current`、`:375` `tag_kind == plc` なら収集のキャッシュ、それ以外は `ServerTagStore`                                                                | `push` のタグは `plc` なので収集のキャッシュを読む                                                               |
+| ビットの値          | `hub.rs:308-310` `valid_current_value`（`bit` は 0 / 1 以外を Bad）                                                                                                        |                                                                                                                  |
+| 全シミュレーション  | `hub.rs:233` `matches!(protocol, "modbus-tcp" \| "slmp")` だけを simulation にする                                                                                         | `push` はシミュレーションに切り替わらない（そのまま受けた値）                                                    |
+| broker の対象       | `HubSessions::is_broker_managed`（`DriverTable::is_supported`）。`write_path.rs:670-680`・`read_path.rs:177-179` は broker に無いプロトコルを `UnsupportedProtocol` で断る | `push` のタグへの書き込み・read-now は追加の分岐なしで断られる（登録時の `writable = false` に加えた二重の防御） |
 
 ### 1.3 今の `db_source`（Hub 内の PostgreSQL Source）
 
@@ -284,7 +284,7 @@ impl ExternalSource for IngestHub {
 }
 ```
 
-- Hub の `rebuild` / `commit_catalog` / `apply_run` は `build_config_from_with(snapshot, PushSource::Available)` を使い、`Collector` は `start_with_sources(.., Some(ingest.clone()))` で作る（`hub.rs:1589`・`:2466`）。`apply_config` は収集を作った時の源を使い続ける（`collector.rs:315`）。
+- Hub の `commit_catalog` / `apply_run` は `build_config_from_with(snapshot, PushSource::Available)` を使い、`Collector` は `start_with_sources(.., Some(ingest.clone()))` で作る（`hub.rs:1589`・`:2466`）。`apply_config` は収集を作った時の源を使い続ける（`collector.rs:315`）。
 - 保持値は `IngestSlot` が持ち、収集のタスクの作り直し（`apply_config` の replaced）では消えない。
 - `snapshot` は読み取りロック 1 回と値の複製だけ（`external.rs:146-150` の契約。tick を止めない）。
 

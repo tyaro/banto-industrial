@@ -1102,7 +1102,7 @@ async fn commit_catalog_and_notify_syncs_a_session_for_a_newly_tagged_connection
 /// T19 S2-a 案B: the "remove" flip side - once a connection's last
 /// enabled collection group is disabled while collection is `Running`,
 /// its broker session is torn down on that same catalog commit, mirroring
-/// `CollectorManager::rebuild`'s own add+remove sync (T7-2).
+/// `CollectorManager::apply_run`'s own add+remove sync (T7-2).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn commit_catalog_and_notify_removes_a_session_once_the_last_group_is_disabled_while_running()
 {

@@ -154,7 +154,7 @@ use utoipa::ToSchema;
 
 /// Hub の収集の計画（厳格版）: `push` 接続を外部の接続として計画する
 /// （`PushSource::Available`、§4.1・§4.2）。Hub の計画を作る全部の点
-/// （`CollectorManager::rebuild` / `commit_catalog` / `apply_run` と REST の
+/// （`CollectorManager::commit_catalog` / `apply_run` と REST の
 /// preflight）がこれを通る - preflight と実際の計画がずれて「保存できたのに収集が
 /// 断る」ことが無いように。
 ///
@@ -895,8 +895,7 @@ impl IngestHub {
         }
     }
 
-    /// catalog の入れ替えと同じ点で呼ぶ（`CollectorManager::rebuild` の 2 つの枝と
-    /// `commit_catalog`）。`push` 接続の追加・削除と、キーの集合・送る集合・
+    /// catalog の入れ替えと同じ点で呼ぶ（`CollectorManager::commit_catalog`）。`push` 接続の追加・削除と、キーの集合・送る集合・
     /// `stale_timeout_ms` の更新。登録から消えたキー・無効になったキーの保持値は
     /// 捨てる（キーの改名で古い値が残らない）。ブリッジの設定・有効が変わった接続は
     /// [`commit_effect`] の表に従う。データ型が変わったキーの保持値も捨てる（型が

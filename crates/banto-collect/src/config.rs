@@ -2800,7 +2800,7 @@ mod tests {
     /// T9-2: `suppress_simulation_for` forces `simulation = false` for every
     /// connection whose key is in the given set, and leaves every other
     /// connection's `simulation` flag untouched - the mechanism
-    /// `CollectorManager::rebuild` (apps/banto-hub/core) uses to prevent
+    /// `CollectorManager::apply_run` (apps/banto-hub/core) uses to prevent
     /// `Collector` from starting a redundant simulator for a broker-routed
     /// connection that `BrokerSimRegistry` already simulates itself.
     #[tokio::test]

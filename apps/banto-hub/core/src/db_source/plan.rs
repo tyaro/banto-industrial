@@ -6,7 +6,7 @@
 //! どのグループを何 ms ごとにどの SQL で回し、その結果のどの列をどの
 //! タグへ流すか」を組み立てる。副作用は一切持たず、
 //! [`crate::db_source::DbSourceEngine::commit`] に渡すまで何も起きない -
-//! `crate::hub::CollectorManager::rebuild`/`commit_catalog` が catalog /
+//! `crate::hub::CollectorManager::commit_catalog` が catalog /
 //! `Collector` / 演算タグ plan の入れ替えと**同じ all-or-nothing の1ステップ**
 //! として commit するため（設計 §4.3(a)「変更の影響半径 = 触ったものだけ」、
 //! `hub.rs` の `computed` フィールド doc comment 参照）。
@@ -263,7 +263,7 @@ pub fn resolve_group(group: &DbGroupPlan, described: &[(String, String)]) -> Res
 
 /// `snapshot` から DB Source の実行計画を組み立てる純関数
 /// （[`crate::computed::build_plan`] と同じ契約 - `Err` は呼び出し元
-/// `crate::hub::CollectorManager::rebuild`/`commit_catalog` が rebuild 全体の
+/// `crate::hub::CollectorManager::commit_catalog` が commit 全体の
 /// 失敗として扱い、catalog も `Collector` も演算 plan も**古いまま**残る）。
 ///
 /// 拾うもの / 落とすもの:

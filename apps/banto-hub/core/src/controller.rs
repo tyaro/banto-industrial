@@ -391,7 +391,7 @@ impl CollectionController {
     /// mutation と `execute_pending_apply` が必ず通る唯一の点）専用の
     /// primitive で、他に呼び出し元を作らないこと。
     ///
-    /// # なぜ `commit_catalog` + `apply_run` で、`rebuild` ではないのか
+    /// # なぜ `commit_catalog` + `apply_run` なのか
     ///
     /// - [`CollectorManager::commit_catalog`] が catalog・演算タグ plan・
     ///   DB Source plan を同じ点で入れ替え、`configured_revision` を進めて
@@ -402,11 +402,11 @@ impl CollectionController {
     ///   [`banto_collect::Collector::apply_config`]（T7 の接続単位の部分
     ///   再構成）へ通し、broker セッションの追加/削除も同じ順序
     ///   （collect タスク停止 → セッション削除）で同期する。
-    /// - [`CollectorManager::rebuild`] は run mode を一切見ず
-    ///   `RegistrySnapshot` をそのまま `build_config_from` へ渡すため、
-    ///   `AllSimulation` で稼働中にこれを呼ぶと**シミュレーション中のはずの
-    ///   接続が実機へダイヤルされる**。live re-apply の primitive には
-    ///   絶対に使えない（これが `apply_run` を選んだ決定的な理由）。
+    /// - かつて試験だけが使っていた `rebuild`（#958 で撤去）は run mode を
+    ///   一切見ず `RegistrySnapshot` をそのまま `build_config_from` へ渡して
+    ///   いたため、`AllSimulation` で稼働中に呼ぶと**シミュレーション中の
+    ///   はずの接続が実機へダイヤルされた**。live re-apply の primitive には
+    ///   使えなかった（これが `apply_run` を選んだ決定的な理由）。
     ///
     /// この構成により、T19 S2-a 案B の `resync_sessions_for_catalog_change`
     /// （catalog-only commit のときに broker セッションだけ同期していた、
@@ -423,7 +423,7 @@ impl CollectionController {
     ///   いる構成には無い」状態を無言で残してしまい、#341 が塞ごうとして
     ///   いる穴そのものになる）。ロック順序は常に `transition` →
     ///   `CollectorManager::rebuild_lock` の一方向で、逆順に取る経路は
-    ///   存在しない（`rebuild`/`commit_catalog`/`apply_run` はこの
+    ///   存在しない（`commit_catalog`/`apply_run` はこの
     ///   controller を一切参照しない）ためデッドロックしない。呼び出し元
     ///   （REST ハンドラ）は DB トランザクションを既にコミット済みで、
     ///   他のロックを保持していないことも前提。

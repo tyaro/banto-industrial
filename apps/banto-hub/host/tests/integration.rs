@@ -163,7 +163,7 @@ struct TestApp {
     /// T2-2 (docs/tag-server-design.md §6-5): the broker session directory
     /// `manager` was built with - exposed so a test can inspect broker-side
     /// state directly (e.g. `sessions.status_watch`) without going through
-    /// REST, the way `e2e_slmp_session_survives_a_rebuild_via_broker` below
+    /// REST, the way `e2e_slmp_session_survives_a_reapply_via_broker` below
     /// does.
     sessions: Arc<HubSessions>,
     /// 製品と同じ入口で収集を起こす（router には渡さない - これらの試験は
@@ -638,7 +638,7 @@ async fn e2e_read_slmp_via_rest_after_commit() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
+async fn e2e_slmp_session_survives_a_reapply_via_broker() {
     let app = test_app("e2e-slmp-broker-session").await;
     let sim = SlmpSimulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 111);
