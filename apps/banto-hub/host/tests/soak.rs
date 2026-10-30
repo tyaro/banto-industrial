@@ -120,6 +120,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -457,6 +458,8 @@ struct TestApp {
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     mqtt: Arc<MqttPublisher>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     env: TempEnv,
 }
 
@@ -473,6 +476,22 @@ impl Drop for TestApp {
 }
 
 impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
+    }
+
     fn ws_url(&self, path: &str) -> String {
         format!(
             "ws://127.0.0.1:{}{path}",
@@ -534,7 +553,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
@@ -598,12 +620,14 @@ async fn test_app(label: &str) -> TestApp {
     .await
     .expect("server should start");
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         server: Some(server),
         token,
         pool,
         manager,
         mqtt,
+        controller,
         env,
     }
 }
@@ -728,7 +752,7 @@ async fn run_soak(label: &str, duration: Duration) -> SoakReport {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(6), || async {

@@ -28,10 +28,11 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::{HubSettingsExt, SettingsService};
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
@@ -164,6 +165,8 @@ struct TestApp {
     /// `Arc<AtomicBool>`共有なので、ここから`lock_down()`すれば router 側の
     /// `crate::mcp`が見る状態も即座に変わる）。
     commissioning: CommissioningService,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -178,6 +181,24 @@ impl Drop for TestApp {
 /// `locked_down = false`（試運転モードのまま）で返す - `write.rs`の
 /// `test_app`と違い、ここでは呼び出し元が必要なときだけ
 /// `app.commissioning.lock_down().await`する。
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
+    }
+}
+
 async fn test_app(label: &str) -> TestApp {
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
@@ -227,7 +248,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -253,7 +277,10 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("CommissioningService::load");
 
-    let router = api_router(
+    // REST の `/api/collection/start`・`stop` と試験の `commit_and_start` が同じ
+    // controller を使う。
+    let controller = Arc::new(CollectionController::new(manager.clone()));
+    let router = api_router_with_controller(
         users,
         audit,
         manager.plc_connections(),
@@ -261,6 +288,7 @@ async fn test_app(label: &str) -> TestApp {
         TagService::new(pool.clone()),
         api_keys,
         manager.clone(),
+        controller.clone(),
         auth,
         commissioning.clone(),
         events_tx,
@@ -281,6 +309,7 @@ async fn test_app(label: &str) -> TestApp {
         write_control,
         write_audit,
         commissioning,
+        controller,
         _env: env,
     }
 }
@@ -317,7 +346,7 @@ fn actor_label(plaintext_key: &str, name: &str) -> String {
     format!("{name}（{}）", &plaintext_key[3..11])
 }
 
-/// タグ・グループ・接続を1本作って rebuild まで済ませ、`(tag_id,
+/// タグ・グループ・接続を1本作って 収集開始まで済ませ、`(tag_id,
 /// external_name)` を返す共通フィクスチャ (`write.rs::make_tag`と同型)。
 #[allow(clippy::too_many_arguments)]
 async fn make_tag(
@@ -344,7 +373,7 @@ async fn make_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -374,7 +403,7 @@ async fn make_string_tag(
         })
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -866,7 +895,7 @@ async fn per_tag_read_scope_filters_both_list_tags_and_read_tag_values() {
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     let hidden = format!("line1.fast.{}", hidden_tag.name);
 
     let key = issue_key(
@@ -905,6 +934,9 @@ async fn per_tag_read_scope_filters_both_list_tags_and_read_tag_values() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_before_lockdown_unknown_tag_reaches_the_gate_as_not_found() {
     let app = test_app("write-not-found").await;
+    // 製品の router（`api_router_with_controller`）は書込み前に収集が
+    // Running であることを要求する（`CollectionNotRunning` ゲート）。
+    app.commit_and_start().await;
     app.write_control.enable();
     let key = issue_key(
         &app.router,
@@ -1241,7 +1273,7 @@ async fn add_tag_to_first_group(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     format!("{conn_name}.fast.{}", tag.name)
 }
 
