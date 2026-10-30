@@ -352,8 +352,7 @@ pub(super) struct BatchWriteValuesResponse {
 /// (`crate::write_path::execute_write_batch` へは進まない)。
 ///
 /// 事前段(0): エントリ数が `crate::write_path::MAX_BATCH_WRITE_ENTRIES` を超えたら
-/// スコープ検査より**前**に 422（validation）で断る(#954 - 仕事量が件数に比例し、
-/// 過大な 1 リクエストが共有の拒否集計表とキーごとの行予算を一度に埋めるのを防ぐ)。
+/// スコープ検査より**前**に 422（validation）で断る(#954 - 仕事量が件数に比例する)。
 /// 何も書かず、監査行も残さない。
 ///
 /// スコープを通過した後は、`v` の正規化(単票と同じ
@@ -378,8 +377,7 @@ pub(super) async fn v1_write_values_batch(
     let Some(Extension(ctx)) = ctx else {
         return session_token_cannot_write_response();
     };
-    // #954: 件数上限。スコープ検査より前(仕事量が件数に比例するのと、拒否集計表を
-    // 一度に埋めるのを防ぐ)。監査は残さない。
+    // #954: 件数上限。スコープ検査より前(仕事量が件数に比例する)。監査は残さない。
     let max = crate::write_path::MAX_BATCH_WRITE_ENTRIES;
     if body.writes.len() > max {
         return ApiError(BantoError::Validation {

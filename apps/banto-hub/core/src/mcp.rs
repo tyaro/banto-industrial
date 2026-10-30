@@ -1644,7 +1644,7 @@ async fn tool_write_recipe(
     }
 
     // #954: 件数上限。ロックダウン助言・スコープ検査より前に断る
-    // (仕事量が件数に比例するのと、拒否集計表を一度に埋めるのを防ぐ)。監査は残さない。
+    // (仕事量が件数に比例する)。監査は残さない。
     let max = crate::write_path::MAX_BATCH_WRITE_ENTRIES;
     if writes.len() > max {
         return Ok(tool_error(format!(

@@ -390,10 +390,9 @@ pub enum WriteRejection {
 /// #954: 1 回のバッチ書き込み(REST `POST /api/v1/values/batch`・MCP `write_recipe`)に
 /// 含められるエントリ数の上限。1 リクエストの仕事量(スコープ検査・重複検出・
 /// 解決と `convert_value`・応答封筒)が件数に比例し、2 MB の本文だけで数万件になりうる。
-/// また過大な 1 リクエストが、共有の拒否集計表(`REJECTION_TABLE_MAX_PAIRS`)と
-/// キーごとの行予算(`REJECTION_ROWS_PER_KEY`)を一度に埋めて、ほかの拒否を
-/// 要約・溢れ行へ押し出す。REST と MCP で同じ値を共有し、スコープ検査より前に断る
-/// (監査は残さない)。
+/// 拒否の監査は件数に比例しない(#945: 拒否の表へはキーごとに
+/// `REJECTION_ROWS_PER_KEY` 組とまとめの組だけが入るので、この上限とは独立に有界)。
+/// REST と MCP で同じ値を共有し、スコープ検査より前に断る(監査は残さない)。
 pub const MAX_BATCH_WRITE_ENTRIES: usize = 1_000;
 
 /// [`execute_write`] が必要とする共有状態一式への借用。REST/gRPC いずれの
