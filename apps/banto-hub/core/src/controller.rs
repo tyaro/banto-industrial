@@ -202,6 +202,14 @@ pub struct CollectionController {
     live_apply_in_progress: AtomicBool,
     run_seq: AtomicU64,
     status_tx: watch::Sender<RuntimeStatus>,
+    /// 次の [`Self::commit_catalog_and_apply_live`] が snapshot を読んだ後、
+    /// commit の前に挟む待ち（ミリ秒、0 は無し。テスト専用）。
+    #[cfg(test)]
+    snapshot_commit_delay_ms: AtomicU64,
+    /// 上の待ちに入った合図（テスト専用）。`notify_one` は許可を貯めるので、
+    /// 試験側が後から `notified()` を待っても取りこぼさない。
+    #[cfg(test)]
+    snapshot_commit_delay_started: tokio::sync::Notify,
 }
 
 #[derive(Clone, Debug)]
@@ -249,8 +257,39 @@ impl CollectionController {
             live_apply_in_progress: AtomicBool::new(false),
             run_seq: AtomicU64::new(0),
             status_tx,
+            #[cfg(test)]
+            snapshot_commit_delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            snapshot_commit_delay_started: tokio::sync::Notify::new(),
         }
     }
+
+    /// 次の [`Self::commit_catalog_and_apply_live`] の「snapshot を読んだ後・
+    /// commit の前」に指定の時間だけ待ちを挟む（テスト専用・1 回限り）。
+    /// #958 PR 5 のレビュー対応: `hub.rs` の module doc「catalog の commit と
+    /// 収集の適用は直列化されている」が塞ぐ競合（古い snapshot の commit が
+    /// 後から勝つ）の窓を決定的に作り、`transition` ロックを外したら試験が
+    /// 落ちるようにするために要る。`CollectorManager::delay_next_apply_for_test`
+    /// と同じ流儀で `#[cfg(test)]`。
+    #[cfg(test)]
+    pub(crate) fn delay_next_snapshot_commit_for_test(&self, delay: std::time::Duration) {
+        self.snapshot_commit_delay_ms
+            .store(delay.as_millis() as u64, Ordering::SeqCst);
+    }
+
+    /// [`Self::snapshot_commit_delay_ms`] を読んで下ろし、待つ（テスト専用）。
+    #[cfg(test)]
+    async fn take_injected_snapshot_commit_delay(&self) {
+        let millis = self.snapshot_commit_delay_ms.swap(0, Ordering::SeqCst);
+        if millis > 0 {
+            self.snapshot_commit_delay_started.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    async fn take_injected_snapshot_commit_delay(&self) {}
 
     /// 終了の受付の印を立て、**同じ `state` ロックの中で**読んだその時点の
     /// 状態を返す（このモジュールの doc「終了の受付」）。以降の開始は
@@ -447,6 +486,7 @@ impl CollectionController {
         let snapshot = RegistrySnapshot::load(&self.manager.pool())
             .await
             .map_err(|err| format!("レジストリのスナップショット取得に失敗しました: {err}"))?;
+        self.take_injected_snapshot_commit_delay().await;
         self.manager.commit_catalog(&snapshot).await?;
         let current = self.status();
         if current.state != CollectionState::Running {
@@ -1231,23 +1271,21 @@ mod tests {
         assert_eq!(controller.status().state, CollectionState::Stopped);
     }
 
-    /// 収集中（`Running`）に、**違う構成変更**を 2 つ並行に書き、それぞれが
-    /// 続けて [`CollectionController::commit_catalog_and_apply_live`] を呼ぶ
+    /// 収集中（`Running`）に、**違う構成変更**を 2 つ重ねて書き、それぞれが
+    /// [`CollectionController::commit_catalog_and_apply_live`] を呼ぶ
     /// （REST の CRUD が 2 本同時に来た場面）。`hub.rs` の module doc の節
     /// 「catalog の commit と収集の適用は直列化されている」が塞ぐ競合
-    /// （古い snapshot を後から適用して、片方の変更が catalog・収集から
+    /// （古い snapshot を後から commit して、片方の変更が catalog・収集から
     /// 消える）への回帰テスト。
     ///
-    /// live apply は `transition` ロックの下で snapshot を読み直してから
-    /// commit → `apply_run` するので、どう前後しても**最後の適用は両方の
-    /// 書込みの後のレジストリ**を見る。確かめること: 両方 Ok・`last_error`
-    /// なし、catalog（`tag_map`）に両方のタグがある、実際に動いている収集が
-    /// 両方の値を集める、`revision` と `running_revision`（Running 中の
-    /// live apply は成功のたびに両方を 1 つ進める）がちょうど 2 進む。
-    /// 前後の入れ替わりが起きやすいよう、2 つの書込みを同時に始め、並行の段を
-    /// くり返す。ただし「snapshot の読込みと commit の間に、もう片方の書込みと
-    /// commit が割り込む」窓そのものは強制していない（その隙間に遅延を差す
-    /// 仕掛けが無い）ので、`transition` ロックを外しても毎回落ちるとは限らない。
+    /// 悪い順序を試験用の待ち（`delay_next_snapshot_commit_for_test`）で強制する:
+    /// 適用 A が snapshot を読んだ**後**に待たせ、その間にタグ b を書いて適用 B を
+    /// 走らせる。`transition` ロックがあれば B は A の完了を待ち、B の snapshot は
+    /// a・b の両方を含む。ロックが無いと B が先に commit し、A が a だけの古い
+    /// snapshot を後から commit して b が catalog から消える。
+    /// 確かめること: 両方 Ok・`last_error` なし、catalog（`tag_map`）に両方の
+    /// タグがある、動いている収集が両方の値を集める、`revision` と
+    /// `running_revision` がちょうど 2 進む。
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_live_applies_of_different_changes_converge_on_the_latest_registry() {
         use banto_tags::{
@@ -1315,66 +1353,67 @@ mod tests {
             .expect("収集を開始できる");
         assert_eq!(running.state, CollectionState::Running);
 
-        const ROUNDS: u32 = 10;
-        for round in 0..ROUNDS {
-            let barrier = Arc::new(tokio::sync::Barrier::new(2));
-            let revision_before = controller.manager.revision();
-            let running_before = controller.manager.running_revision();
+        let tags = TagService::new(pool.clone());
+        let revision_before = controller.manager.revision();
+        let running_before = controller.manager.running_revision();
 
-            let spawn_change = |name: String, address: String| {
-                let controller = controller.clone();
-                let tags = TagService::new(pool.clone());
-                let input = tag_input(name, address);
-                let barrier = barrier.clone();
-                tokio::spawn(async move {
-                    // 2 つの書込みを同時に始め、片方の snapshot の読込みと
-                    // もう片方の書込みが重なる機会を作る。
-                    barrier.wait().await;
-                    let tag = tags.create(input).await.expect("タグを作れる");
-                    controller
-                        .commit_catalog_and_apply_live()
-                        .await
-                        .map(|()| tag.id)
-                })
-            };
-            let a = spawn_change(format!("a{round}"), format!("{}", 40001 + round * 2));
-            let b = spawn_change(format!("b{round}"), format!("{}", 40002 + round * 2));
-            let (a, b) = tokio::join!(a, b);
-            let id_a = a.expect("task a").expect("live apply a は Ok");
-            let id_b = b.expect("task b").expect("live apply b は Ok");
+        let tag_a = tags
+            .create(tag_input("a".to_string(), "40001".to_string()))
+            .await
+            .expect("タグ a を作れる");
+        // A: snapshot を読んだ後、commit の前で止める。
+        controller.delay_next_snapshot_commit_for_test(Duration::from_millis(500));
+        let a = {
+            let controller = controller.clone();
+            tokio::spawn(async move { controller.commit_catalog_and_apply_live().await })
+        };
+        // A が待ちに入った（= snapshot は a だけを見ている）のを確かめてから b を書く。
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            controller.snapshot_commit_delay_started.notified(),
+        )
+        .await
+        .expect("A が snapshot の読込み後の待ちに入る");
+        let tag_b = tags
+            .create(tag_input("b".to_string(), "40002".to_string()))
+            .await
+            .expect("タグ b を作れる");
+        let b_result = controller.commit_catalog_and_apply_live().await;
+        let a_result = a.await.expect("task a");
+        a_result.expect("live apply a は Ok");
+        b_result.expect("live apply b は Ok");
 
-            assert_eq!(controller.manager.last_error(), None, "round {round}");
-            assert_eq!(
-                controller.manager.revision(),
-                revision_before + 2,
-                "round {round}: commit は 2 回とも走る"
-            );
-            assert_eq!(
-                controller.manager.running_revision(),
-                running_before + 2,
-                "round {round}: Running 中の live apply は 2 回とも適用する"
-            );
-            assert_eq!(controller.status().state, CollectionState::Running);
+        assert_eq!(controller.manager.last_error(), None);
+        assert_eq!(
+            controller.manager.revision(),
+            revision_before + 2,
+            "commit は 2 回とも走る"
+        );
+        assert_eq!(
+            controller.manager.running_revision(),
+            running_before + 2,
+            "Running 中の live apply は 2 回とも適用する"
+        );
+        assert_eq!(controller.status().state, CollectionState::Running);
 
-            let keys = [format!("tag:{id_a}"), format!("tag:{id_b}")];
-            let map = controller.manager.tag_map();
-            for key in &keys {
-                assert!(
-                    map.iter().any(|entry| &entry.tag_key == key),
-                    "round {round}: catalog に {key} がある（最後の適用が両方の書込みを見た）"
-                );
-            }
+        let keys = [format!("tag:{}", tag_a.id), format!("tag:{}", tag_b.id)];
+        let map = controller.manager.tag_map();
+        for key in &keys {
             assert!(
-                wait_until(Duration::from_secs(5), || async {
-                    controller.manager.current_values().is_some_and(|values| {
-                        keys.iter()
-                            .all(|key| values.get(key).is_some_and(|sample| sample.value.is_some()))
-                    })
-                })
-                .await,
-                "round {round}: 動いている収集が {keys:?} の両方を集める"
+                map.iter().any(|entry| &entry.tag_key == key),
+                "catalog に {key} がある（最後の適用が両方の書込みを見た）"
             );
         }
+        assert!(
+            wait_until(Duration::from_secs(5), || async {
+                controller.manager.current_values().is_some_and(|values| {
+                    keys.iter()
+                        .all(|key| values.get(key).is_some_and(|sample| sample.value.is_some()))
+                })
+            })
+            .await,
+            "動いている収集が {keys:?} の両方を集める"
+        );
 
         controller.stop().await;
         controller.manager.shutdown().await;
