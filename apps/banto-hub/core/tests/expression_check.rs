@@ -43,10 +43,11 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
@@ -173,6 +174,9 @@ struct TestApp {
     admin_token: String,
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
+    /// router と同じコントローラ（製品と同じく REST の状態と一致する）。
+    /// 製品と同じ入口で収集を起こすのに使う。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -181,6 +185,24 @@ struct TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。起動に失敗すると
+    /// `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
     }
 }
 
@@ -246,7 +268,10 @@ async fn test_app(label: &str) -> TestApp {
             .expect("virtual connection should be provisioned");
     }
 
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let api_keys = ApiKeysService::new(pool.clone());
     let (events_tx, _rx) = broadcast::channel(16);
@@ -273,7 +298,8 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("CommissioningService::load");
 
-    let router = api_router(
+    let controller = Arc::new(CollectionController::new(manager.clone()));
+    let router = api_router_with_controller(
         users,
         audit,
         PlcConnectionService::new(pool.clone()),
@@ -281,6 +307,7 @@ async fn test_app(label: &str) -> TestApp {
         TagService::new(pool.clone()),
         api_keys,
         manager.clone(),
+        controller.clone(),
         auth,
         commissioning,
         events_tx,
@@ -297,6 +324,7 @@ async fn test_app(label: &str) -> TestApp {
         router,
         admin_token,
         pool,
+        controller,
         manager,
         _env: env,
     }
@@ -434,7 +462,7 @@ async fn ok_expression_returns_result_type_refs_and_evaluated_preview() {
         .create(internal_tag_input("a", group, "f32", Some("degC"), true))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let key = issue_key(&app.router, &app.admin_token, "writer", &["write:mem.x.a"]).await;
     let (status, body) = v1_post(
@@ -556,7 +584,7 @@ async fn self_referencing_expression_with_external_name_is_a_cycle() {
         .create(computed_tag_input("c", group, "1"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let (status, body) = admin_post(
         &app.router,
@@ -601,7 +629,7 @@ async fn bad_reference_skips_preview_evaluation() {
         .create(internal_tag_input("b", group, "f32", None, true))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
     // `mem.x.b` には一度も書き込んでいない -> Bad（値なし）。
 
     let (status, body) = admin_post(
@@ -659,7 +687,7 @@ async fn mcp_check_expression_matches_rest_for_ok_and_syntax_error() {
         .create(internal_tag_input("a", group, "f32", Some("degC"), true))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let write_key = issue_key(&app.router, &app.admin_token, "writer", &["write:mem.x.a"]).await;
     let (status, body) = v1_post(

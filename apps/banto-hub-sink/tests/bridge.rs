@@ -325,7 +325,10 @@ async fn test_app() -> TestApp {
         Arc::new(BrokerSimRegistry::new()),
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
     write_control.enable();
@@ -678,7 +681,14 @@ async fn bridge_delivers_values_and_follows_collection_ws_and_db_outages() {
         ],
     )
     .await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     let ext = |tag: &str| format!("{source_name}.g0.{tag}");
     let api_key = issue_key(
         &app,
@@ -917,7 +927,14 @@ async fn a_bridge_without_the_ingest_scope_never_runs() {
         .await
         .expect("push connection");
     push_tags(&app, push.id, &[("k".to_string(), "f32")]).await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     collection(&app, "start").await;
     let api_key = issue_key(
         &app,
@@ -1013,7 +1030,14 @@ async fn an_unreachable_db_sends_bad_and_reports_it() {
         .await
         .expect("push connection");
     push_tags(&app, push.id, &[("k".to_string(), "f32")]).await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     collection(&app, "start").await;
     let api_key = issue_key(
         &app,
