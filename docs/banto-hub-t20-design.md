@@ -183,6 +183,8 @@ per-entry 結果を返す。**同一バッチ内の重複タグは拒否**（`Du
 
 **③b（MCP `write_recipe`）: 完了（2026-09-05）。** `execute_write_batch` を叩く MCP ツール `write_recipe`（`{writes:[{tag,value}]}`）を追加。`write_tag_value` と同型の安全ポリシー: **ロックダウン後はアドバイザリのみ**（`execute_write_batch` を呼ばず、推奨レシピを助言。監査/レジスタ不変をテスト固定）、ロックダウン前は per-entry の `write:{tag}` スコープ検査→`execute_write_batch`。応答は per-entry 封筒＋`applied` 件数。
 
+**件数上限（2026-10-30、#954）**: REST `POST /api/v1/values/batch` と MCP `write_recipe` は 1 回あたり `write_path::MAX_BATCH_WRITE_ENTRIES`（1000 件）まで。上限超過は**スコープ検査より前**に断り（REST は validation の 422 `writes`、MCP はツールエラー）、何も書かず監査も残さない。理由は、1 リクエストの仕事量（スコープ検査・重複検出・解決と `convert_value`・応答封筒）が件数に比例して本文 2 MB で数万件になりうること、過大な 1 リクエストが共有の拒否集計表（`REJECTION_TABLE_MAX_PAIRS` = 1000 組）とキーごとの行予算（`REJECTION_ROWS_PER_KEY`）を一度に埋め、ほかの拒否を要約・溢れ行へ押し出すこと（拒否の監査自体は #945 で集計済みで行数は有界）。`execute_write_batch` も先頭で同じ上限を見て全件を `batch_too_large` で拒否する（多層防御・DB/監査/レート制限に触れない）。
+
 **③c（レシピ UI）: 不採用（オーナー決定 2026-09-05）。** タグサーバーの責務は
 一括書き込みの手段（REST `POST /api/v1/values/batch` ＋ MCP `write_recipe`）を提供する
 ところまでで、レシピの編集・保存・呼び出しといった UI は**下流アプリ（レシピ DL アプリ等）の

@@ -295,6 +295,9 @@ fn write_rejection_status(rejection: WriteRejection) -> Status {
         WriteRejection::DuplicateTagInBatch(_) => unreachable!(
             "execute_write は DuplicateTagInBatch を返さない - execute_write_batch 専用の結果"
         ),
+        WriteRejection::BatchTooLarge => unreachable!(
+            "execute_write は BatchTooLarge を返さない - execute_write_batch 専用の結果"
+        ),
     };
     let rest_code = rejection.rest_error_code();
     let message = match rejection.detail() {

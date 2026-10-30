@@ -548,12 +548,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "write_recipe",
-            "description": "複数タグへ設定値一式(レシピ)を一括書き込みする。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。",
+            "description": "複数タグへ設定値一式(レシピ)を一括書き込みする。ロックダウン後(本番稼働中)は実際には書き込まず、何を書き込むべきかの助言のみを返す - 実行は管理 UI から人が行うこと。1 回の writes は 1000 件まで。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "writes": {
                         "type": "array",
+                        "maxItems": 1000,
                         "items": {
                             "type": "object",
                             "properties": {
@@ -1640,6 +1641,16 @@ async fn tool_write_recipe(
         return Err(RpcError::invalid_params(
             "arguments.writes must not be empty",
         ));
+    }
+
+    // #954: 件数上限。ロックダウン助言・スコープ検査より前に断る
+    // (仕事量が件数に比例するのと、拒否集計表を一度に埋めるのを防ぐ)。監査は残さない。
+    let max = crate::write_path::MAX_BATCH_WRITE_ENTRIES;
+    if writes.len() > max {
+        return Ok(tool_error(format!(
+            "writes は {max} 件以下にしてください(受け取った件数: {})。何も書き込んでいません",
+            writes.len()
+        )));
     }
 
     let mut parsed: Vec<(String, Value)> = Vec::with_capacity(writes.len());

@@ -367,6 +367,20 @@ async fn audit_row_count(router: &Router, admin_token: &str) -> usize {
     listed["rows"].as_array().unwrap().len()
 }
 
+/// 書込み監査の総件数。拒否の監査は周期の書き手が書くので、数える前に今すぐ書き出す
+/// (#945 の総点検)。既定ページの行数ではなく `total_count` で見る。
+async fn write_audit_total(app: &TestApp) -> u64 {
+    app.write_audit
+        .write_pending()
+        .await
+        .expect("write pending rejections");
+    app.write_audit
+        .list(banto_core::ListParams::default())
+        .await
+        .expect("write_audit.list")
+        .total_count
+}
+
 async fn audit_rows_for_tag(router: &Router, admin_token: &str, tag_id: i64) -> Vec<Value> {
     let (status, listed) =
         admin_post(router, "/api/write-audit/list", admin_token, json!({})).await;
@@ -1211,6 +1225,65 @@ async fn missing_write_scope_on_one_entry_rejects_the_whole_batch() {
     assert!(rows_a.is_empty());
 
     sim.stop();
+}
+
+/// #954: 件数上限ちょうど(`MAX_BATCH_WRITE_ENTRIES`)は件数検査を通る。
+/// スコープの無いキーなので次段の 403 で止まる(=422 ではない)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_with_exactly_the_max_entries_passes_the_size_check() {
+    let app = test_app("batch-max-entries").await;
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "noscope",
+        &["write:other.g.t"],
+    )
+    .await;
+    let max = banto_hub_core::write_path::MAX_BATCH_WRITE_ENTRIES;
+    let writes: Vec<Value> = (0..max)
+        .map(|i| json!({ "tag": format!("x.y.t{i}"), "v": 1 }))
+        .collect();
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/batch",
+        &key,
+        json!({ "writes": writes }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body:?}");
+    assert_eq!(body["error"], "missing_write_scope");
+}
+
+/// #954: 上限+1 件は 422(既存の validation と同じ)。スコープ検査より前に断るので、
+/// 拒否の監査(集計表・行予算)に何も入らず、書込み監査の総数は増えない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn batch_over_the_max_entries_is_422_and_records_no_audit_rows() {
+    let app = test_app("batch-over-max-entries").await;
+    let (key, _id) = issue_key(
+        &app.router,
+        &app.admin_token,
+        "noscope",
+        &["write:other.g.t"],
+    )
+    .await;
+    let max = banto_hub_core::write_path::MAX_BATCH_WRITE_ENTRIES;
+    let before = write_audit_total(&app).await;
+    let writes: Vec<Value> = (0..=max)
+        .map(|i| json!({ "tag": format!("x.y.t{i}"), "v": 1 }))
+        .collect();
+    let (status, body) = v1_post(
+        &app.router,
+        "/api/v1/values/batch",
+        &key,
+        json!({ "writes": writes }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(
+        write_audit_total(&app).await,
+        before,
+        "over-limit batch must not write audit rows"
+    );
 }
 
 // ---------------------------------------------------------------------------

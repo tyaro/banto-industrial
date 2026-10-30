@@ -139,6 +139,11 @@ fn write_rejection_response(tag: String, rejection: crate::write_path::WriteReje
                 "execute_write は DuplicateTagInBatch を返さない - execute_write_batch 専用の結果"
             )
         }
+        WriteRejection::BatchTooLarge => {
+            unreachable!(
+                "execute_write は BatchTooLarge を返さない - execute_write_batch 専用の結果"
+            )
+        }
     };
     (status, Json(rejection.to_json())).into_response()
 }
@@ -342,6 +347,11 @@ pub(super) struct BatchWriteValuesResponse {
 /// **全体を拒否**して 403 `missing_write_scope` を返し、1件も書かない
 /// (`crate::write_path::execute_write_batch` へは進まない)。
 ///
+/// 事前段(0): エントリ数が `crate::write_path::MAX_BATCH_WRITE_ENTRIES` を超えたら
+/// スコープ検査より**前**に 422（validation）で断る(#954 - 仕事量が件数に比例し、
+/// 過大な 1 リクエストが共有の拒否集計表とキーごとの行予算を一度に埋めるのを防ぐ)。
+/// 何も書かず、監査行も残さない。
+///
 /// スコープを通過した後は、`v` の正規化(単票と同じ
 /// [`parse_requested_value`])を済ませ、ゲート1〜8の本体をまるごと
 /// `crate::write_path::execute_write_batch` へ委譲する。
@@ -351,6 +361,7 @@ pub(super) struct BatchWriteValuesResponse {
     request_body = BatchWriteValueRequest,
     responses(
         (status = 200, description = "常に200 - per-entry の ok/error は writes[] を参照", body = BatchWriteValuesResponse),
+        (status = 422, description = "writes が上限（1000 件）を超えた（何も書かず、監査も残さない）"),
         (status = 403, description = "missing_write_scope（1件でもスコープ不足）/ session_token_cannot_write"),
     ),
     tag = "tag-space",
@@ -363,6 +374,18 @@ pub(super) async fn v1_write_values_batch(
     let Some(Extension(ctx)) = ctx else {
         return session_token_cannot_write_response();
     };
+    // #954: 件数上限。スコープ検査より前(仕事量が件数に比例するのと、拒否集計表を
+    // 一度に埋めるのを防ぐ)。監査は残さない。
+    let max = crate::write_path::MAX_BATCH_WRITE_ENTRIES;
+    if body.writes.len() > max {
+        return ApiError(BantoError::Validation {
+            field_errors: vec![banto_core::FieldError {
+                field: "writes".to_string(),
+                message: format!("writes は {max} 件以下にしてください"),
+            }],
+        })
+        .into_response();
+    }
     // 事前ゲート all-or-nothing をスコープ検査にも適用する(設計 §3.3
     // REST 節): 1件でも write スコープが無ければ、どのエントリも
     // execute_write_batch へ進めず全体を 403 で拒否する。
