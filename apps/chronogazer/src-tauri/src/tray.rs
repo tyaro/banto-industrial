@@ -20,7 +20,9 @@
 //!   （[`request_quit_for_update`]。窓は開かない）。`taskkill /F` では最終 flush と
 //!   `collection_stopped` を失うため。判断は状態機械の表の「インストーラからの終了の要求」
 //!   の行（DB の復旧中は復旧が終わるまで保留し、終わった時点で状態機械が同じ終了処理を
-//!   走らせる・終了処理中は何もしない）。シェル側の最悪の終了時間は
+//!   走らせる・終了処理中は何もしない）。起動の途中に届いた要求は受け皿
+//!   `lifecycle::QuitForUpdateInbox` が保留し、起動の判定が終わった直後に
+//!   [`open_quit_for_update_inbox`] が 1 回だけ実行する。シェル側の最悪の終了時間は
 //!   `lifecycle::QUIT_FOR_UPDATE_WORST_CASE`（インストーラの待ちの上限はこれに合わせる）。
 //!
 //! 窓の前面化・× で隠す・初回通知・確認ダイアログ・終了の二重実行防止は
@@ -122,7 +124,8 @@ use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
 use crate::lifecycle::{
-    DeferredQuitForUpdate, QuitAnswerOutcome, QuitForUpdateOutcome, QuitRequestOutcome,
+    DeferredQuitForUpdate, InboxReceipt, QuitAnswerOutcome, QuitForUpdateInbox,
+    QuitForUpdateOutcome, QuitRequestOutcome,
 };
 use crate::shell::{FALLBACK_WINDOW_LABEL, SERVICE_WINDOW_LABEL};
 use crate::startup::RECOVERY_WINDOW_LABEL;
@@ -550,17 +553,72 @@ pub(crate) fn request_quit(app: &AppHandle) {
 /// 終了処理が走っていれば何もしない。どの態（Desktop・Service・Fallback）でも同じ。
 /// デスクトップのログに 1 行残す（運用モードの間は `logs\` に書けないので標準エラー出力に
 /// 落ちる）。保留したときは、実行するときにも 1 行。
+///
+/// **起動の途中**（`shell::start` が起動の判定を終えて `ShellState` を置く前。窓を作る間の
+/// メッセージの処理でコールバックが割り込める）に届いた要求は、受け皿
+/// [`QuitForUpdateInbox`] が保留し、起動の判定が終わった直後に
+/// [`open_quit_for_update_inbox`] が 1 回だけ取り出して同じ処理を通す（PR #970 のオーナー
+/// レビュー P2。黙って捨てるとインストーラは上限まで待って強制終了に進む）。
 pub(crate) fn request_quit_for_update(app: &AppHandle) {
-    let Some(lifecycle) = crate::shell::lifecycle(app) else {
-        return;
-    };
-    note_quit_for_update(
+    // 受け皿は `run()` が manage する。無い（テストなど）なら保留せずそのまま処理する。
+    let receipt = app
+        .try_state::<QuitForUpdateInbox>()
+        .map(|inbox| inbox.receive())
+        .unwrap_or(InboxReceipt::Immediate);
+    match receipt {
+        InboxReceipt::Immediate => {}
+        InboxReceipt::Held => {
+            note_quit_for_update(
+                app,
+                "インストーラからの終了の要求を起動の途中で受けたので、起動が終わってから実行します（--quit-for-update）",
+            );
+            return;
+        }
+        InboxReceipt::AlreadyHeld => {
+            note_quit_for_update(
+                app,
+                "インストーラからの終了の要求は既に受けています（起動が終わってから実行します）",
+            );
+            return;
+        }
+    }
+    run_quit_for_update(
         app,
         &format!(
             "インストーラからの終了の要求を受けました（--quit-for-update。終了処理は最長 {} 秒）",
             crate::lifecycle::QUIT_FOR_UPDATE_WORST_CASE.as_secs()
         ),
     );
+}
+
+/// 起動の判定が終わった（`shell::start` が `ShellState` を置いた直後、または起動に失敗して
+/// 「終了」だけの窓を出した直後）。以後の要求は受け皿を通らず即時に処理し、起動の途中に
+/// 保留した要求があればここで 1 回だけ実行する。`ShellState` を置いた直後は画面を始める前
+/// （Desktop の起動は `launch_may_proceed` で扉の閉じたことを見て何も始めない。扉を閉じる
+/// のは [`quit`] の別スレッドなので、先に DB を開いてしまったときは `Lifecycle::admit` が
+/// 断ってその場で止める）。「終了」だけの窓の後は、止めるものが無いので [`quit`] →
+/// `exit_cleanup` が何もせずに `app.exit(0)`（窓の「終了」と同じ）。
+pub(crate) fn open_quit_for_update_inbox(app: &AppHandle) {
+    let held = app
+        .try_state::<QuitForUpdateInbox>()
+        .is_some_and(|inbox| inbox.open());
+    if held {
+        run_quit_for_update(
+            app,
+            &format!(
+                "起動の途中で受けたインストーラからの終了の要求を、起動が終わったので実行します（終了処理は最長 {} 秒）",
+                crate::lifecycle::QUIT_FOR_UPDATE_WORST_CASE.as_secs()
+            ),
+        );
+    }
+}
+
+/// [`request_quit_for_update`] の本体（受け皿を通った後）。`note` は記録する 1 行。
+fn run_quit_for_update(app: &AppHandle, note: &str) {
+    let Some(lifecycle) = crate::shell::lifecycle(app) else {
+        return;
+    };
+    note_quit_for_update(app, note);
     let admission = collector_quit_admission(app);
     let deferred = DeferredQuitForUpdate {
         // 復旧の後の起動でエンジン（`AppState`）が置かれるので、受付の口は確定する時点に

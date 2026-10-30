@@ -150,6 +150,10 @@
 //!   収集で立てる - 復旧の時点ではエンジンが無い）、ロックの外で預かった終了処理（`tray::quit`）を
 //!   走らせる。終了が確定した後（Q〜Xt）は何もしない（`quit`。インストーラはプロセスの
 //!   終わりを待つ）。インストーラが待つ上限は [`QUIT_FOR_UPDATE_WORST_CASE`] に合わせる。
+//!   起動の途中（起動の判定の前。`ShellState` を置く前）に届いた要求は、表の外の受け皿
+//!   [`QuitForUpdateInbox`] が保留し、`shell::start` が起動の判定を終えた直後（または起動に
+//!   失敗して「終了」だけの窓を出した直後）に 1 回だけ取り出してこの行を通す（PR #970 の
+//!   オーナーレビュー P2。黙って捨てるとインストーラは上限まで待って強制終了に進む）。
 //!
 //! 表に出てこない約束（テスト `invariants_hold_from_every_state` が印のすべての組で
 //! 確かめる）:
@@ -961,6 +965,75 @@ pub(crate) struct DeferredQuitForUpdate {
 impl std::fmt::Debug for DeferredQuitForUpdate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("DeferredQuitForUpdate")
+    }
+}
+
+/// 起動の途中（`shell::start` が起動の判定を終えて `ShellState` を置く前、または起動に
+/// 失敗して「終了」だけの窓になる前）に届いたインストーラからの終了の要求の受け皿
+/// （PR #970 のオーナーレビュー P2。`run()` が manage する）。single-instance のコール
+/// バックは起動の処理と同じメインスレッドで動くが、窓を作る間のメッセージの処理で
+/// 起動の途中に割り込めるので、届いた要求を落とさずに「保留」として覚え、起動の判定が
+/// 終わった時点（[`Self::open`]）で 1 回だけ取り出して走らせる。開いた後の要求は受け皿を
+/// 通らず、呼び出し側がそのまま処理する。ロック 1 つで、[`Self::receive`] と
+/// [`Self::open`] がどの順で重なっても要求は**ちょうど 1 回**処理される（受け皿を開く前に
+/// 届けば `open` が拾い、後に届けば `receive` が「即時」を返す。2 つ目以降の要求は
+/// 保留の間は何もしない）。Tauri に依存しない（テスト）。
+#[derive(Debug, Default)]
+pub(crate) struct QuitForUpdateInbox {
+    state: Mutex<InboxState>,
+}
+
+/// [`QuitForUpdateInbox`] の状態。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InboxState {
+    /// 起動の途中（届いた要求は保留する）。
+    #[default]
+    Closed,
+    /// 起動の途中に要求が届いた（開いたときに 1 回走らせる）。
+    Held,
+    /// 起動の判定が終わった（要求は呼び出し側がそのまま処理する）。
+    Open,
+}
+
+/// [`QuitForUpdateInbox::receive`] の答え。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InboxReceipt {
+    /// 受け皿は開いている - 呼び出し側が今すぐ処理する。
+    Immediate,
+    /// 起動の途中なので保留した - 開いたときに走る。
+    Held,
+    /// 既に保留している - 何もしない（最初の要求が開いたときに走る）。
+    AlreadyHeld,
+}
+
+impl QuitForUpdateInbox {
+    fn lock(&self) -> MutexGuard<'_, InboxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 要求が届いた。
+    pub(crate) fn receive(&self) -> InboxReceipt {
+        let mut state = self.lock();
+        match *state {
+            InboxState::Open => InboxReceipt::Immediate,
+            InboxState::Closed => {
+                *state = InboxState::Held;
+                InboxReceipt::Held
+            }
+            InboxState::Held => InboxReceipt::AlreadyHeld,
+        }
+    }
+
+    /// 起動の判定が終わった（`ShellState` を置いた直後、または「終了」だけの窓を出した
+    /// 直後）。保留していた要求があれば `true`（呼び出し側が 1 回走らせる）。2 回目以降は
+    /// `false`。
+    pub(crate) fn open(&self) -> bool {
+        let mut state = self.lock();
+        let held = *state == InboxState::Held;
+        *state = InboxState::Open;
+        held
     }
 }
 
@@ -2789,5 +2862,70 @@ mod tests {
         gate.settle_recovery_action();
         assert!(gate.recovery_window_may_close());
         assert!(gate.begin_recovery_action());
+    }
+
+    // ---- 起動の途中の受け皿（PR #970 のレビュー P2） ----
+
+    /// 登録の前に届いた要求は保留され、開いたときに 1 回だけ取り出せる（2 回目の open は空）。
+    #[test]
+    fn a_quit_for_update_received_before_open_is_taken_out_once_by_open() {
+        let inbox = QuitForUpdateInbox::default();
+        assert_eq!(inbox.receive(), InboxReceipt::Held);
+        assert!(inbox.open());
+        assert!(!inbox.open());
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+    }
+
+    /// 登録の後の要求は受け皿を通らず即時（開くだけでは何も走らない）。
+    #[test]
+    fn a_quit_for_update_received_after_open_is_immediate() {
+        let inbox = QuitForUpdateInbox::default();
+        assert!(!inbox.open());
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        assert!(!inbox.open());
+    }
+
+    /// 保留の間の 2 つ目の要求は何もしない（開いたときに走るのは 1 回）。
+    #[test]
+    fn a_second_quit_for_update_while_held_is_ignored() {
+        let inbox = QuitForUpdateInbox::default();
+        assert_eq!(inbox.receive(), InboxReceipt::Held);
+        assert_eq!(inbox.receive(), InboxReceipt::AlreadyHeld);
+        assert_eq!(inbox.receive(), InboxReceipt::AlreadyHeld);
+        assert!(inbox.open());
+        assert!(!inbox.open());
+    }
+
+    /// 開くのと要求が競合しても、処理されるのはちょうど 1 回（`open` が拾うか `receive` が
+    /// 即時を返すかのどちらか一方）。何度も試す。
+    #[test]
+    fn a_quit_for_update_racing_with_open_is_processed_exactly_once() {
+        for _ in 0..200 {
+            let inbox = Arc::new(QuitForUpdateInbox::default());
+            let go = Arc::new(std::sync::Barrier::new(3));
+            let receiver = {
+                let (inbox, go) = (Arc::clone(&inbox), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    go.wait();
+                    inbox.receive()
+                })
+            };
+            let opener = {
+                let (inbox, go) = (Arc::clone(&inbox), Arc::clone(&go));
+                std::thread::spawn(move || {
+                    go.wait();
+                    inbox.open()
+                })
+            };
+            go.wait();
+            let receipt = receiver.join().unwrap();
+            let taken = opener.join().unwrap();
+            let runs = usize::from(receipt == InboxReceipt::Immediate) + usize::from(taken);
+            assert_eq!(runs, 1, "receipt={receipt:?} taken={taken}");
+            assert_ne!(receipt, InboxReceipt::AlreadyHeld);
+            assert!(!inbox.open());
+            assert_eq!(inbox.receive(), InboxReceipt::Immediate);
+        }
     }
 }

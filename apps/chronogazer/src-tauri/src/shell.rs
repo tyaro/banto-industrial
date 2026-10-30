@@ -1086,6 +1086,10 @@ pub(crate) fn start(app: &AppHandle) {
     let layout = crate::startup::layout_from_env();
     if let Err(detail) = crate::startup::check_root(&layout) {
         crate::startup::show_fatal(app, detail);
+        // `ShellState` は置かない経路。起動の途中に届いたインストーラからの終了の要求が
+        // 残らないよう、ここで受け皿を開く（止めるものが無いので `exit_cleanup` は何も
+        // せず `app.exit(0)` - 窓の「終了」と同じ終わり方）。
+        crate::tray::open_quit_for_update_inbox(app);
         return;
     }
     let hooks = test_hooks();
@@ -1133,6 +1137,11 @@ pub(crate) fn start(app: &AppHandle) {
         hooks,
         pending_log: std::sync::Mutex::new(Vec::new()),
     });
+    // #392 B3-4: 起動の途中（ここより前）に届いたインストーラからの終了の要求を、画面を
+    // 始める前に 1 回だけ実行する（PR #970 のレビュー P2。`tray::open_quit_for_update_inbox`。
+    // 以後の要求は即時）。終了の扉が閉じれば下の Desktop の起動は何も始めない
+    // （`launch_may_proceed`）か、置く前のエンジンをその場で止める（`Lifecycle::admit`）。
+    crate::tray::open_quit_for_update_inbox(app);
 
     match view {
         ShellView::Desktop => start_desktop(app, layout),

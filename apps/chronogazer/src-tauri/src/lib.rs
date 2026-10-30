@@ -4720,6 +4720,10 @@ pub fn run() {
         .manage(ExitOnce(ExitCleanupOnce::new()))
         // #392: 起動に失敗したときの対処の窓の状態（[`startup`]）。
         .manage(startup::RecoveryGate::default())
+        // #392 B3-4: 起動の途中に届いたインストーラからの終了の要求の受け皿（PR #970 の
+        // レビュー P2）。`shell::start` が起動の判定を終えた直後に開く
+        // （`tray::open_quit_for_update_inbox`）。
+        .manage(lifecycle::QuitForUpdateInbox::default())
         .setup(|app| {
             // #392 B3-4: `--quit-for-update` で起動されたのにここへ来た = 終わらせる相手の
             // シェルが居ない（居れば single-instance のプラグインの setup が引数を渡して
