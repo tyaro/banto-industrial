@@ -363,15 +363,18 @@ struct TestApp {
 impl TestApp {
     /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
     /// 起こす（製品の「設定を保存 → 収集開始」と同じ順）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
     async fn commit_and_start(&self) {
         self.controller
             .commit_catalog_and_apply_live()
             .await
             .expect("commit catalog after seeding");
-        self.controller
+        let status = self
+            .controller
             .start(RunMode::Configured)
             .await
             .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
     }
 }
 
