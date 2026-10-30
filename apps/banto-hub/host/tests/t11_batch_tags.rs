@@ -83,7 +83,7 @@ fn fast_options() -> CollectorOptions {
 
 /// A disabled connection: the batch tests only care about registry writes
 /// and `CollectorManager::revision()`, never about actual PLC connectivity -
-/// `enabled: false` keeps `rebuild()` from ever attempting a real socket
+/// `enabled: false` keeps the collector start from ever attempting a real socket
 /// connect (no simulator needed in this file, unlike `t7_partial_reconfig.rs`).
 fn disabled_conn_input(name: &str) -> PlcConnectionInput {
     PlcConnectionInput {
@@ -182,7 +182,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));

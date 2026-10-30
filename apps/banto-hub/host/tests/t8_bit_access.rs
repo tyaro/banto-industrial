@@ -20,7 +20,7 @@
 //!    読み戻して `/api/v1/values` に反映される（読み書き単一セッションの
 //!    実証、`tests/write.rs`のハッピーパスと同型）
 //! 3. data_type 不一致: ビット付きアドレス（`D100.5`）+ `data_type=i16` の
-//!    登録 -> rebuild が構成エラー（`banto-collect::config::build_request`、
+//!    登録 -> catalog の commit が構成エラー（`banto-collect::config::build_request`、
 //!    T8-2 で追加した検証）で旧構成を維持する（§4.3 の all-or-nothing、
 //!    `last_config_error` に現れる）
 //! 4. 確認読み不一致: `Simulator::corrupt_after_next_write` で PLC 側の
@@ -45,6 +45,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -176,6 +177,8 @@ struct TestApp {
     pool: SqlitePool,
     manager: Arc<CollectorManager>,
     write_control: Arc<WriteControl>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -184,6 +187,21 @@ struct TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
     }
 }
 
@@ -236,7 +254,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -286,12 +307,14 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         router,
         admin_token,
         pool,
         manager,
         write_control,
+        controller,
         _env: env,
     }
 }
@@ -396,8 +419,8 @@ async fn make_conn_and_group(app: &TestApp, conn_name: &str, port: u16) -> (i64,
     (conn.id, group.id)
 }
 
-/// 1タグ登録して `tag_id` を返す（rebuild はしない - 呼び出し元が必要な数
-/// 登録し終えてから1回だけ `app.manager.rebuild()` する）。
+/// 1タグ登録して `tag_id` を返す（収集開始はしない - 呼び出し元が必要な数
+/// 登録し終えてから1回だけ `app.commit_and_start()` する）。
 #[allow(clippy::too_many_arguments)]
 async fn add_tag(
     app: &TestApp,
@@ -416,7 +439,7 @@ async fn add_tag(
         .id
 }
 
-/// タグ・グループ・接続を1本作って rebuild まで済ませ、`(tag_id,
+/// タグ・グループ・接続を1本作って収集開始まで済ませ、`(tag_id,
 /// external_name)` を返す共通フィクスチャ（`tests/write.rs::make_tag` と同型）。
 #[allow(clippy::too_many_arguments)]
 async fn make_tag(
@@ -430,7 +453,7 @@ async fn make_tag(
 ) -> (i64, String) {
     let (_conn_id, group_id) = make_conn_and_group(app, conn_name, port).await;
     let tag_id = add_tag(app, group_id, tag_name, address, data_type, writable).await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag_id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -450,7 +473,7 @@ async fn collection_reads_bit_and_word_tags_off_the_same_word() {
     add_tag(&app, group_id, "bit5", "D100.5", "bit", false).await;
     add_tag(&app, group_id, "bit12", "D100.C", "bit", false).await;
     add_tag(&app, group_id, "word", "D100", "u16", false).await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
 
     // Collection is async (100ms period) - poll until every tag settles.
     assert!(
@@ -606,10 +629,7 @@ async fn a_bit_qualified_address_on_a_non_bit_tag_is_a_config_error_and_keeps_th
 
     let (_conn_id, group_id) = make_conn_and_group(&app, "line1", sim.addr.port()).await;
     add_tag(&app, group_id, "temp01", "D100", "u16", false).await;
-    app.manager
-        .rebuild()
-        .await
-        .expect("the first rebuild (valid tag) should succeed");
+    app.commit_and_start().await;
     let revision_before = app.manager.revision();
     assert_eq!(app.manager.last_error(), None);
 
@@ -619,10 +639,10 @@ async fn a_bit_qualified_address_on_a_non_bit_tag_is_a_config_error_and_keeps_th
     // build_config time.
     add_tag(&app, group_id, "bad", "D100.5", "i16", false).await;
     let err = app
-        .manager
-        .rebuild()
+        .controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect_err("a bit-in-word address on a non-bit tag must fail rebuild");
+        .expect_err("a bit-in-word address on a non-bit tag must fail the catalog commit");
     assert!(!err.is_empty());
 
     // §4.3 all-or-nothing: revision does not advance, last_config_error is

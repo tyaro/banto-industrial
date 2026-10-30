@@ -1,7 +1,7 @@
 //! T7-2 の E2E テスト（docs/tag-server-design.md §4.3、実装指示のテスト計画
 //! 1・2・3・5 に対応 - 4「不正変更の all-or-nothing 維持」は
 //! `tests/integration.rs::an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_error`
-//! が新実装（`apply_config` 経由の rebuild）下でも通り続けることで確認済み
+//! が新実装（`apply_config` 経由の再反映）下でも通り続けることで確認済み
 //! （このファイルに複製しない）。6「既存全テストを壊さない」はこのクレート・
 //! `banto-collect`・`banto-broker`・`relay-wright-core` の既存スイートを流す
 //! ことで確認する（このファイル自体はそれに寄与しない）。
@@ -19,7 +19,7 @@
 //! 担っていた。#341 でそのフラグごと撤去し、`CollectionController` が
 //! `Running` のときだけ走る `commit_catalog_and_apply_live` に一本化した
 //! ので、各テストは (a) `test_app` をロックダウンしない（試運転中 =
-//! 収集中でも即時反映）、(b) `rebuild` で catalog を用意したうえで
+//! 収集中でも即時反映）、(b) catalog を commit したうえで
 //! `start_collection` で controller を `Running` にする、という形に
 //! 揃えてある。ロックダウン済み（queue + 明示適用、こちらも無停止）の
 //! 対になる E2E は `tests/live_reconfig.rs`。
@@ -54,10 +54,11 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::api_router_with_controller;
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::UsersService;
 use banto_hub_core::write_audit::WriteAuditService;
@@ -214,6 +215,8 @@ struct TestApp {
     /// check broker-side session bookkeeping directly (e.g.
     /// `HubSessions::connection_count`) without going through REST.
     sessions: Arc<HubSessions>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -228,6 +231,21 @@ impl Drop for TestApp {
 impl TestApp {
     fn ws_url(&self, path: &str) -> String {
         format!("ws://127.0.0.1:{}{path}", self.server.local_addr().port())
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
     }
 }
 
@@ -280,7 +298,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -313,7 +334,10 @@ async fn test_app(label: &str) -> TestApp {
         .await
         .expect("CommissioningService::load");
 
-    let router = api_router(
+    // REST の `/api/collection/start` と試験の `commit_and_start` が同じ
+    // controller を使う。
+    let controller = Arc::new(CollectionController::new(manager.clone()));
+    let router = api_router_with_controller(
         users,
         audit,
         PlcConnectionService::new(pool.clone()),
@@ -321,6 +345,7 @@ async fn test_app(label: &str) -> TestApp {
         TagService::new(pool.clone()),
         api_keys,
         manager.clone(),
+        controller.clone(),
         auth,
         commissioning,
         events_tx,
@@ -350,6 +375,7 @@ async fn test_app(label: &str) -> TestApp {
         pool,
         manager,
         sessions,
+        controller,
         _env: env,
     }
 }
@@ -444,7 +470,7 @@ async fn recv_matching(ws: &mut WsStream, predicate: impl Fn(&Value) -> bool) ->
 
 /// #341（2026-09-14）: 収集を `CollectionController` 経由で開始する。
 ///
-/// 以前はどのテストも `app.manager.rebuild()` を直接呼んで収集を起こして
+/// 以前はどのテストも `CollectorManager` の試験用の入口を直接呼んで収集を起こして
 /// いたが、それだと `CollectionController` は `Stopped` のままなので、
 /// REST の CRUD が `commit_catalog_and_apply_live` の live 分岐へ入らない
 /// （= 走行中の `Collector` が更新されない）。本番と同じく controller を
@@ -512,12 +538,15 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
         .unwrap();
 
     // このファイルのテストはレジストリをサービス層で直接作る（REST を
-    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 通さない）ので、catalog を進めるのはこの catalog の commit だけ - これが
     // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
     // controller 経由で `Running` にする（`start_collection` の doc
     // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
     // ここで走っているタスクは一切揺さぶられない。
-    app.manager.rebuild().await.expect("initial rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("initial catalog commit");
     start_collection(&app).await;
 
     assert!(
@@ -701,12 +730,15 @@ async fn server_side_tag_only_change_never_touches_the_collector() {
         .unwrap();
 
     // このファイルのテストはレジストリをサービス層で直接作る（REST を
-    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 通さない）ので、catalog を進めるのはこの catalog の commit だけ - これが
     // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
     // controller 経由で `Running` にする（`start_collection` の doc
     // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
     // ここで走っているタスクは一切揺さぶられない。
-    app.manager.rebuild().await.expect("initial rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("initial catalog commit");
     start_collection(&app).await;
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -832,12 +864,15 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
         .unwrap();
 
     // このファイルのテストはレジストリをサービス層で直接作る（REST を
-    // 通さない）ので、catalog を進めるのはこの `rebuild` だけ - これが
+    // 通さない）ので、catalog を進めるのはこの catalog の commit だけ - これが
     // 無いと `/api/v1/values/{tag}` が 404 になる。その上で収集を
     // controller 経由で `Running` にする（`start_collection` の doc
     // comment 参照）。`apply_run` は同じ構成を差分適用するだけなので、
     // ここで走っているタスクは一切揺さぶられない。
-    app.manager.rebuild().await.expect("initial rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("initial catalog commit");
     start_collection(&app).await;
 
     assert!(
@@ -978,13 +1013,13 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
 async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
     let app = test_app("last-apply-status").await;
 
-    // 起動直後の初回成功(この時点では空構成 - test_app 内の initial rebuild)
+    // 起動直後の初回成功(この時点では空構成 - test_app 内の initial catalog commit)
     // - apply_config を経由していないので last_apply は null。
     let (status, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);
     assert!(status_json["last_apply"].is_null());
 
-    // A を登録して rebuild - Collector がまだ無いので
+    // A を登録して収集を開始 - Collector がまだ無いので
     // start_with_client_factory(新規起動)経由 - これも apply_config を
     // 経由しないので last_apply はまだ null のまま。
     let sim_a = Simulator::start().await;
@@ -1001,7 +1036,7 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         .create(tag_input("ta1", group_a.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("fresh start rebuild");
+    app.commit_and_start().await;
 
     let (status, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);
@@ -1010,7 +1045,7 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         "a fresh Collector start never goes through apply_config: {status_json:?}"
     );
 
-    // B を登録して rebuild - 今度は Collector が既に生きているので
+    // B を登録して live apply - 今度は Collector が既に生きているので
     // apply_config 経由 - B が added として現れる。
     let sim_b = Simulator::start().await;
     sim_b.set_holding_register(0, 2);
@@ -1026,7 +1061,10 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         .create(tag_input("tb1", group_b.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("apply_config rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("live apply: apply_config");
 
     let (status, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);
@@ -1037,7 +1075,7 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         &format!("conn:{}", conn_b.id)
     ));
 
-    // B を削除して rebuild - apply_config 経由で B が removed として現れる。
+    // B を削除して live apply - apply_config 経由で B が removed として現れる。
     TagService::new(app.pool.clone())
         .delete(tag_b.id)
         .await
@@ -1050,7 +1088,10 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         .delete(conn_b.id)
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("removal rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("live apply: removal");
 
     let (status, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);
@@ -1075,7 +1116,10 @@ async fn status_last_apply_reflects_fresh_start_apply_and_stop() {
         .delete(conn_a.id)
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("stop rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("live apply: empty config");
 
     let (status, status_json) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);

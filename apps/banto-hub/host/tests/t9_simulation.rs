@@ -12,7 +12,7 @@
 //!
 //! テスト構成:
 //! 1. `POST /api/plc-connections`（`simulation: true`）で broker 経由 SLMP
-//!    接続を作り、グループ・タグを足して rebuild すると、このテスト自身は
+//!    接続を作り、グループ・タグを足して収集を開始すると、このテスト自身は
 //!    SLMP シミュレータを一切起動していないのに `/api/v1/values/{tag}` が
 //!    changing な good 品質の値を返す - 接続のセッションが値の層の
 //!    `SimDevice`（R2b-5b。ワイヤのシミュレータではない）であることの証明。`GET /api/v1/status`/`GET /api/v1/tags`が
@@ -26,7 +26,7 @@
 //!    いないと、古いセッションを読み続けて値が変わらないままになる。
 //!    `app.sessions.connection_count()`が終始 1 のままであることも確認する
 //!    （孤立した二重セッションが増えないこと）。続けて、無関係なタグ追加
-//!    （同じグループへの2本目のタグ）で rebuild しても
+//!    （同じグループへの2本目のタグ）で構成を再反映しても
 //!    `connection_count()`が変わらないこと（`BrokerSimRegistry::resolve`の
 //!    `changed`判定がダイヤル先が実際には変わっていない限り安定して
 //!    `false`であること）も確認する - `tests/integration.rs`の
@@ -53,6 +53,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -161,6 +162,8 @@ struct TestApp {
     sessions: Arc<HubSessions>,
     /// R2b-5b: the simulated connections' value tables.
     sim_registry: Arc<BrokerSimRegistry>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -169,6 +172,21 @@ struct TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        self.controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
     }
 }
 
@@ -221,7 +239,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry.clone(),
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -271,6 +292,7 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         router,
         admin_token,
@@ -278,6 +300,7 @@ async fn test_app(label: &str) -> TestApp {
         manager,
         sessions,
         sim_registry,
+        controller,
         _env: env,
     }
 }
@@ -381,7 +404,7 @@ async fn broker_routed_slmp_connection_serves_synthetic_ramp_values() {
         .create(tag_input("t1", group.id, "D5", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // good 品質の値が返るまで待つ - BrokerSimRegistry がシミュレータを起動し、
     // ensure_connection がそのアドレスへ接続していないと、これは Bad のまま
@@ -486,7 +509,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
         .create(tag_input("t1", group.id, "D5", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // Phase 1: simulation=false - values come from the test-owned external
     // simulator.
@@ -518,7 +541,10 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    app.manager.rebuild().await.expect("rebuild after toggle");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after toggle");
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -584,10 +610,10 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
         .create(tag_input("t2", group.id, "D6", "u16"))
         .await
         .unwrap();
-    app.manager
-        .rebuild()
+    app.controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect("rebuild after unrelated edit");
+        .expect("commit catalog after unrelated edit");
 
     assert_eq!(
         app.sessions.connection_count(),
@@ -621,7 +647,10 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    app.manager.rebuild().await.expect("rebuild after revert");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("commit catalog after revert");
     assert!(
         wait_until(Duration::from_secs(10), || async {
             let (status, json) = get_json(
@@ -690,7 +719,7 @@ async fn a_simulated_connection_opens_no_socket_and_serves_strings_and_far_addre
     let mut text = tag_input("text", sgroup.id, "D100", "string");
     text.string_length = Some(4);
     tags.create(text).await.unwrap();
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // The collection never reads a string tag (the plan skips them), so the
     // string goes through the on-demand read; the number through collection.
