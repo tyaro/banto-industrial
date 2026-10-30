@@ -30,7 +30,7 @@
 //!    `connection_count()`が変わらないこと（`BrokerSimRegistry::resolve`の
 //!    `changed`判定がダイヤル先が実際には変わっていない限り安定して
 //!    `false`であること）も確認する - `tests/integration.rs`の
-//!    `e2e_slmp_session_survives_a_rebuild_via_broker`と同型の回帰確認。
+//!    `e2e_slmp_session_survives_a_reapply_via_broker`と同型の回帰確認。
 //!    最後に`simulation: false`へ戻すと、値がテスト所有のシミュレータの
 //!    111 に戻り、`SimDevice`が捨てられる（R2b-5b: 指紋のシミュレーションの
 //!    印が無いと、古い`SimSession`を読み続けて落ちる）。
@@ -156,7 +156,7 @@ struct TestApp {
     manager: Arc<CollectorManager>,
     /// T2-2/T9-2: exposed so a test can assert broker session identity
     /// directly (`connection_count`), the way
-    /// `tests/integration.rs::e2e_slmp_session_survives_a_rebuild_via_broker`
+    /// `tests/integration.rs::e2e_slmp_session_survives_a_reapply_via_broker`
     /// does - here to prove a simulation toggle re-points the existing
     /// session rather than leaking a second one.
     sessions: Arc<HubSessions>,
@@ -608,7 +608,7 @@ async fn toggling_simulation_repoints_the_broker_session_without_leaking_session
     // re-point/reopen the session again - `BrokerSimRegistry::resolve`'s
     // `changed` detection must stay stable (false) when the dial target has
     // not actually changed, mirroring
-    // `tests/integration.rs::e2e_slmp_session_survives_a_rebuild_via_broker`.
+    // `tests/integration.rs::e2e_slmp_session_survives_a_reapply_via_broker`.
     TagService::new(app.pool.clone())
         .create(tag_input("t2", group.id, "D6", "u16"))
         .await

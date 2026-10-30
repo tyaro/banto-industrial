@@ -15,7 +15,7 @@
 //!   検証 → 即時反映。本モジュールの [`build_plan`] が純関数（レジストリを
 //!   読まない・`TagMap` スナップショットだけを見る）で、[`ComputedEngine::commit`]
 //!   が唯一の書き込み口である設計は、この「検証してから即座に反映」の
-//!   規律をそのままコードで体現する - `crate::hub::CollectorManager::rebuild`
+//!   規律をそのままコードで体現する - `crate::hub::CollectorManager::apply_run`
 //!   が catalog/`Collector` の入れ替えと**同じ all-or-nothing の1トランザ
 //!   クション**として呼ぶ（`hub.rs` の `computed` フィールド doc comment
 //!   参照）。
@@ -253,7 +253,7 @@ impl ServerTagStore {
 /// [`build_plan`] の成功結果 - コンパイル済み式一式とトポロジカル順
 /// （依存先が先）。`ComputedEngine::commit` に渡すまでは何の副作用も持たない
 /// 純粋なデータ（§4.3(a) の all-or-nothing を保つための設計 - `hub.rs` の
-/// `CollectorManager::rebuild` 参照）。
+/// `CollectorManager::apply_run` 参照）。
 #[derive(Debug, Clone)]
 pub struct ComputedPlan {
     /// 演算タグの外部名一覧、依存先が先に来る順（`banto_expr::validate_dag`
@@ -305,7 +305,7 @@ pub(crate) fn resolve_referenced_tag<'a>(
 /// - レジストリを読まず `TagMap` スナップショットだけを見る）。
 ///
 /// 失敗はテスト計画2・4の「登録時（rebuild 時）拒否」「循環登録の拒否」に
-/// 対応する - 呼び出し元（`crate::hub::CollectorManager::rebuild`）はこの
+/// 対応する - 呼び出し元（`crate::hub::CollectorManager::apply_run`）はこの
 /// `Err` を rebuild 全体の失敗として扱う（§4.3(a) の all-or-nothing、
 /// `computed` フィールドの doc comment参照）。
 pub fn build_plan(map: &TagMap) -> Result<ComputedPlan, String> {
@@ -381,7 +381,7 @@ struct EngineState {
 
 /// 演算タグの評価エンジン（このモジュールの doc comment参照）。
 /// `bin/banto-hub.rs` が1個構築して `Arc` で共有する -
-/// `crate::hub::CollectorManager`（`rebuild` からの `commit` 呼び出し用）と
+/// `crate::hub::CollectorManager`（`apply_run` からの `commit` 呼び出し用）と
 /// 背景評価タスク（`evaluate_tick` を250ms ごとに呼ぶ）の両方がこの同じ
 /// `Arc` を持つ。
 pub struct ComputedEngine {
@@ -423,7 +423,7 @@ impl ComputedEngine {
 
     /// `build_plan` が成功したときだけ呼ぶこと - 新しい plan に入れ替え、
     /// baseline を全消去する（§4.3(a) の all-or-nothing は呼び出し元
-    /// `crate::hub::CollectorManager::rebuild` が担保する - このメソッド
+    /// `crate::hub::CollectorManager::apply_run` が担保する - このメソッド
     /// 自体は「検証済みの plan を無条件で採用する」だけ）。
     pub fn commit(&self, plan: ComputedPlan) {
         let mut state = self.state.lock().expect("ComputedEngine lock poisoned");

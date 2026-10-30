@@ -194,7 +194,7 @@
 //! `remove` only ever accounts for this directory's own clone). relay-wright
 //! does not call `remove` (its own session set only ever grows for the
 //! process lifetime, §6-5/T2-2's original design); it is wired for
-//! banto-hub's T7-2 slice (banto-hub's `CollectorManager::rebuild` diffs
+//! banto-hub's T7-2 slice (banto-hub's `CollectorManager::apply_run` diffs
 //! [`SessionDirectory::connection_ids`] against the registry's current
 //! enabled broker-managed connection set to find what to remove).
 
@@ -1272,7 +1272,7 @@ impl SessionDirectory {
 
     /// Every connection id currently tracked (seeded + on-demand, minus
     /// anything [`Self::remove`]d since) - the set a caller like banto-hub's
-    /// `CollectorManager::rebuild` diffs against the registry's current
+    /// `CollectorManager::apply_run` diffs against the registry's current
     /// enabled broker-managed connection set to find sessions to
     /// [`Self::remove`].
     pub fn connection_ids(&self) -> Vec<i64> {

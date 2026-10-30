@@ -317,7 +317,7 @@ impl MqttPublisher {
 
     /// 現在の設定を即時反映する: 実行中インスタンスがあれば止め、
     /// `settings.enabled`なら新しい設定で起動し直す
-    /// （`CollectorManager::rebuild`と同じ「古いタスクを止めて新しいタスク」
+    /// （`CollectorManager::apply_run`と同じ「古いタスクを止めて新しいタスク」
     /// パターン、実装指示どおり）。`bin/banto-hub.rs`の起動シーケンスと
     /// `PUT /api/mqtt-settings`の両方から呼ばれる。
     pub async fn apply(&self, settings: &MqttSettings) {

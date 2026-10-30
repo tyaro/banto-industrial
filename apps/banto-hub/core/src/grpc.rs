@@ -994,7 +994,7 @@ impl GrpcServer {
 
     /// 現在の設定を即時反映する: 実行中インスタンスがあれば止め、
     /// `settings.enabled` なら `settings.bind:settings.port` で bind し直す
-    /// (`MqttPublisher::apply`/`CollectorManager::rebuild` と同じ「古い
+    /// (`MqttPublisher::apply`/`CollectorManager::apply_run` と同じ「古い
     /// タスクを止めて新しいタスク」パターン)。`bin/banto-hub.rs` の起動
     /// シーケンスと `PUT /api/grpc-settings` の両方から呼ばれる。
     ///

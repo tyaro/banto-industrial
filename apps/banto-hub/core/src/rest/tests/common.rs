@@ -33,7 +33,7 @@ pub(super) const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 /// rebuild (I1 CRUD tests below only cover auth/RBAC/plumbing, not the
 /// collector lifecycle itself - that is `hub.rs`'s and the integration
 /// test's job). Points at a real temp dir since `CollectorManager` always
-/// needs a `data_dir`, even if `rebuild` is never called in a given test.
+/// needs a `data_dir`, even if `apply_run` is never called in a given test.
 ///
 /// `clock` is injectable (H10 ①): every pre-existing caller goes through
 /// [`test_env`], which passes `Arc::new(SystemClock)` - same behavior as
@@ -451,8 +451,8 @@ pub(super) async fn v1_put(
 /// admin 系ルーター(CSRF ヘッダ必須)への `POST` - `issue_api_key` と
 /// `line1.fast.temp01`/`line1.fast.temp02`/`line2.slow.press01` の3タグを
 /// 別接続・別グループで作る(admin REST 経由 - I1 の書き込みハンドラは
-/// 成功のたびに `CollectorManager::rebuild` を自動で呼ぶので、明示的な
-/// rebuild 呼び出しは不要、このモジュールの doc comment「I1 CRUD 書き
+/// 成功のたびに catalog の commit（と稼働中なら live 適用）を自動で行うので、
+/// 明示的な適用呼び出しは不要、このモジュールの doc comment「I1 CRUD 書き
 /// 込み後の再構築」参照)。catalog は registry の読み取りだけで完結する
 /// (`crate::hub::build_catalog`)ため、実際に PLC へ繋がらないポートでも
 /// rebuild は成功しカタログへ反映される -

@@ -613,7 +613,7 @@ async fn unrelated_connection_is_uninterrupted_by_a_partial_reconfigure() {
     );
 
     // A の PlcDisconnected イベントが出ない - the POST handler already
-    // awaited the triggered rebuild (and therefore `apply_config`) to
+    // awaited the triggered apply (and therefore `apply_config`) to
     // completion before responding, so every event it could have caused is
     // already in the channel by now; no extra wait/timeout needed.
     let conn_a_key = format!("conn:{}", conn_a.id);
@@ -933,7 +933,7 @@ async fn deleting_a_connection_untracks_its_broker_session_and_leaves_others_run
     // The group deletion above is the point where B actually drops out of
     // `build_config`'s output (a connection with zero collectible groups is
     // dropped from `CollectorConfig`, per `banto_collect::build_config`'s own
-    // doc comment) - so THIS rebuild's `last_apply` is the one that shows B
+    // doc comment) - so THIS apply's `last_apply` is the one that shows B
     // as `removed`, not the connection-row deletion below (which changes
     // nothing further in the collect config, since B was already gone from
     // it here).

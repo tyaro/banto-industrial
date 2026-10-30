@@ -328,7 +328,7 @@ async fn seed_group(app: &TestApp, label: &str) -> i64 {
 /// Seed an enabled connection/group for a test that must reach
 /// `banto-collect`'s address/config validation. The ordinary batch fixture is
 /// disabled so it never attempts a PLC connection during compatibility
-/// rebuilds.
+/// catalog commits.
 async fn seed_enabled_group(app: &TestApp, label: &str) -> i64 {
     let mut connection = disabled_conn_input(&format!("enabled_conn_{label}"));
     connection.enabled = true;
@@ -362,11 +362,11 @@ async fn tag_count(app: &TestApp) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// 1. 全件成功 + rebuild が1回だけ走る (revision がちょうど+1)
+// 1. 全件成功 + catalog の commit が1回だけ走る (revision がちょうど+1)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_create_all_succeed_and_rebuilds_exactly_once() {
+async fn batch_create_all_succeed_and_commits_the_catalog_exactly_once() {
     let app = test_app("all-succeed").await;
     let group_id = seed_group(&app, "a").await;
 
@@ -394,7 +394,7 @@ async fn batch_create_all_succeed_and_rebuilds_exactly_once() {
     assert_eq!(body["tags"].as_array().unwrap().len(), 3);
     assert_eq!(body["errors"].as_array().unwrap().len(), 0);
 
-    // 3件追加したにもかかわらず revision はちょうど+1 - rebuild が (3回で
+    // 3件追加したにもかかわらず revision はちょうど+1 - catalog の commit が (3回で
     // はなく) 1回だけ走ったことの直接証拠。
     assert_eq!(
         app.manager.configured_revision(),
@@ -405,7 +405,7 @@ async fn batch_create_all_succeed_and_rebuilds_exactly_once() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. 1件不正で全体拒否 (DB 無変更・rebuild も走らない)
+// 2. 1件不正で全体拒否 (DB 無変更・catalog の commit も走らない)
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -448,7 +448,7 @@ async fn batch_create_rejects_whole_batch_on_one_invalid_row() {
         "{field_errors:?}"
     );
 
-    // DB 無変更・rebuild も走っていない(良いタグ2件も含めて何も書かれない)。
+    // DB 無変更・catalog の commit も走っていない(良いタグ2件も含めて何も書かれない)。
     assert_eq!(app.manager.revision(), revision_before);
     assert_eq!(tag_count(&app).await, before_count);
 }
@@ -614,7 +614,7 @@ async fn batch_rejects_a_name_already_used_by_an_existing_tag() {
         "{field_errors:?}"
     );
 
-    // 既存タグとの衝突検出は rebuild を伴わない(何も書かれていない)。
+    // 既存タグとの衝突検出は catalog の commit を伴わない(何も書かれていない)。
     assert_eq!(app.manager.revision(), revision_before);
 }
 
@@ -641,7 +641,7 @@ async fn batch_with_empty_tags_array_is_a_harmless_success() {
     assert_eq!(
         app.manager.revision(),
         revision_before,
-        "no rebuild for an empty batch"
+        "no catalog commit for an empty batch"
     );
 }
 
@@ -684,11 +684,11 @@ async fn create_tag(app: &TestApp, name: &str, group_id: i64, address: &str) -> 
 }
 
 // ---------------------------------------------------------------------------
-// U1. 全件成功（一括 enabled 切替）+ rebuild が1回だけ走る
+// U1. 全件成功（一括 enabled 切替）+ catalog の commit が1回だけ走る
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_update_all_succeed_and_rebuilds_exactly_once() {
+async fn batch_update_all_succeed_and_commits_the_catalog_exactly_once() {
     let app = test_app("update-all-succeed").await;
     let group_id = seed_group(&app, "u1").await;
 
@@ -727,7 +727,7 @@ async fn batch_update_all_succeed_and_rebuilds_exactly_once() {
         "{body:?}"
     );
 
-    // 3件更新したにもかかわらず revision はちょうど+1 - rebuild が1回だけ
+    // 3件更新したにもかかわらず revision はちょうど+1 - catalog の commit が1回だけ
     // 走ったことの直接証拠（T11-1 と同じ検証方法）。
     assert_eq!(
         app.manager.configured_revision(),
@@ -835,7 +835,7 @@ async fn batch_update_rejects_whole_batch_on_a_nonexistent_id() {
     );
 
     // All-or-nothing: t1's individually-fine rename was not written either,
-    // and no rebuild happened.
+    // and no catalog commit happened.
     assert_eq!(app.manager.revision(), revision_before);
     let (_, fetched1) = get_json(
         &app.router,
@@ -900,7 +900,7 @@ async fn batch_update_rejects_whole_batch_on_a_stale_expected_revision() {
     );
 
     // All-or-nothing: t2 (whose row was individually fine) is still
-    // untouched, and no rebuild happened for this batch attempt.
+    // untouched, and no catalog commit happened for this batch attempt.
     assert_eq!(app.manager.revision(), revision_before);
     let (_, fetched2) = get_json(
         &app.router,
@@ -983,7 +983,7 @@ async fn batch_update_with_empty_tags_array_is_a_harmless_success() {
     assert_eq!(
         app.manager.revision(),
         revision_before,
-        "no rebuild for an empty batch"
+        "no catalog commit for an empty batch"
     );
 }
 
@@ -1052,11 +1052,11 @@ async fn batch_update_non_dry_run_while_running_is_accepted_and_queued() {
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// D1. 全件成功 + rebuild が1回だけ走る
+// D1. 全件成功 + catalog の commit が1回だけ走る
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn batch_delete_all_succeed_and_rebuilds_exactly_once() {
+async fn batch_delete_all_succeed_and_commits_the_catalog_exactly_once() {
     let app = test_app("delete-all-succeed").await;
     let group_id = seed_group(&app, "d1").await;
 
@@ -1079,7 +1079,7 @@ async fn batch_delete_all_succeed_and_rebuilds_exactly_once() {
     assert_eq!(body["count"], json!(2));
     assert_eq!(body["errors"].as_array().unwrap().len(), 0);
 
-    // 2件削除したにもかかわらず revision はちょうど+1 - rebuild が1回だけ
+    // 2件削除したにもかかわらず revision はちょうど+1 - catalog の commit が1回だけ
     // 走ったことの直接証拠（T11-1/T18-3b と同じ検証方法）。
     assert_eq!(
         app.manager.configured_revision(),
@@ -1148,7 +1148,7 @@ async fn batch_delete_rejects_whole_batch_on_a_nonexistent_id() {
     );
 
     // All-or-nothing: t1 (individually a valid id) was not deleted either,
-    // and no rebuild happened.
+    // and no catalog commit happened.
     assert_eq!(app.manager.revision(), revision_before);
     let (status, _) = get_json(
         &app.router,
@@ -1217,7 +1217,7 @@ async fn batch_delete_with_empty_ids_array_is_a_harmless_success() {
     assert_eq!(
         app.manager.revision(),
         revision_before,
-        "no rebuild for an empty batch"
+        "no catalog commit for an empty batch"
     );
 }
 

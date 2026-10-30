@@ -170,7 +170,7 @@ async fn mqtt_settings_put(
     };
     settings_service.set_mqtt_config(&config).await?;
 
-    // 実装指示「保存で即時適用」- CollectorManager::rebuild と同じ「古い
+    // 実装指示「保存で即時適用」- CollectorManager::apply_run と同じ「古い
     // タスクを止めて新しいタスク」パターン（`crate::mqtt`のモジュール doc
     // comment参照）。
     state.mqtt.apply(&config).await;

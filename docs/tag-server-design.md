@@ -774,7 +774,7 @@ SC2 のオペレータ一式（[オペレータ](https://docs.roboticsware.com/j
 
 **T7 実装済み（2026-08-05）**: 段階実装（上記「T0 は全体再構築で開始してよい」
 の見込みどおり）を卒業し、I7（接続単位の部分再構成 = `banto_collect::Collector::apply_config`、
-T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2）
+T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::apply_run`、T7-2。当時は `rebuild`）
 へ配線した。外部契約（`revision`/`config_changed`）は移行の前後で一切変えて
 おらず、既存クライアントは何も変更せずに「変更時に他接続の値まで一瞬 Bad に
 なっていた → ならなくなった」という体験向上だけを受け取る（本節冒頭の見込み
@@ -846,8 +846,8 @@ T7-1）を `apps/banto-hub/core/src/hub.rs`（`CollectorManager::rebuild`、T7-2
 >   `apply_run` は `runtime_snapshot_for_mode` で **run mode の
 >   オーバーライドを尊重**したうえで本節の `apply_config` を通すので、
 >   `AllSimulation` 運転中の構成変更が実機へダイヤルし直すことはない
->   （run mode を見ない `CollectorManager::rebuild` は live re-apply には
->   使えない）。broker セッションの追加/削除同期も `apply_run` が内包する
+>   （かつての run mode を見ない `CollectorManager::rebuild`（#958 で撤去）は
+>   live re-apply には使えなかった）。broker セッションの追加/削除同期も `apply_run` が内包する
 >   ため、T19 S2-a 案B の `resync_broker_sessions`（catalog-only commit 用の
 >   セッション同期だけを行う経路）は撤去した。
 > - 直列化は `CollectionController` の `transition` ロック（start/stop/

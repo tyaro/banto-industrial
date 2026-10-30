@@ -55,7 +55,7 @@
 - 実効のシミュレーション: `rest/tag_space.rs:119-130` が `matches!(protocol, "modbus-tcp" | "slmp") && (configured_simulation || mode == AllSimulation)`。`/api/status` の接続の `simulation` / `configured_simulation` / `effective_simulation`（`rest/admin_status.rs:88-102`）。#335: 読み取り出力（`value_source`）はシミュレーションで塞がない。
 - 書き込み（#363）: `write_path.rs:521-560` `WriteTarget::{Plc,Simulator}` は監査の `detail` にだけ使う（`{"target":"simulator"}`）。関門の順は変えない。書き込み自体は broker のセッション経由なので、相手がワイヤのシミュレータでも値の層でも同じ道。
 - 接続テスト: `rest/plc_connections.rs:784-792` フォームの `simulation = true` は `ok:false` の 200 で断る（ux-plan §4）。MCP の `tool_test_connection`（`mcp.rs:2403-2412`）はこれに委譲。
-- 警告: `hub.rs:2199` `log_simulation_warnings`（有効なシミュレーション接続を起動時と rebuild のたびに列挙。ux-plan §1 の事故防止）。
+- 警告: `hub.rs:2199` `log_simulation_warnings`（有効なシミュレーション接続を起動時と構成の適用のたびに列挙。ux-plan §1 の事故防止）。
 - UI: 接続 Drawer のチェックボックス（`ConnectionDrawer.svelte:910`）、`⚠ シミュレーション中`（1265 行）、状態ページの全シミュレーションの表示（`status/+page.svelte:399-428・1008`）、設定パッケージの `simulation`（`configPackage.ts:431・739`）。いずれも接続の `simulation` フラグだけを見る。
 
 ### 1.4 ChronoGazer

@@ -14,12 +14,11 @@
 //! 3. **run mode のオーバーライドが尊重される** - `AllSimulation` で
 //!    稼働中の live re-apply が、レジストリの `simulation: false` を
 //!    そのまま読んで実機（このテストでは誰も listen していないポート）へ
-//!    ダイヤルし直してしまわない。`CollectorManager::rebuild` は run mode
-//!    を見ないので、もし live re-apply の primitive にそれを選んでいたら
+//!    ダイヤルし直してしまわない。撤去済みの `rebuild` は run mode
+//!    を見なかったので、live re-apply の primitive にそれを選んでいたら
 //!    このテストは両方のタグが Bad になって落ちる
 //!    （`CollectionController::commit_catalog_and_apply_live` の doc
-//!    comment「なぜ `commit_catalog` + `apply_run` で、`rebuild` では
-//!    ないのか」）。
+//!    comment「なぜ `commit_catalog` + `apply_run` なのか」）。
 //!
 //! 試運転中（即時反映）とロックダウン済み（pending queue + 明示適用）の
 //! 両方で同じ結果になることを、同じ検証で2本並べて確認する。

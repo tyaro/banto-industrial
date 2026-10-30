@@ -33,7 +33,7 @@
 //! - [`HubSessions`]: the broker session directory itself, owned **outside**
 //!   `CollectorManager` (design §6-5: "broker 本体は CollectorManager の外で
 //!   生存させ、構成再構築を跨いで SLMP セッションを維持する") so a
-//!   `CollectorManager::rebuild` never tears down a live SLMP socket - only
+//!   `CollectorManager::apply_run` never tears down a live SLMP socket - only
 //!   `bin/banto-hub.rs`'s own shutdown does, via [`HubSessions::shutdown`].
 //! - The collection reads go through `banto_collect::BrokerReadClient` (a
 //!   `banto_collect::CollectClient` around a [`banto_broker::ReadOnlyHandle`]),
@@ -91,7 +91,7 @@
 //!
 //! A broker-managed connection: [`HubSessions::ensure_connection`]
 //! obtains the endpoint from the driver settings in `PlcConnection::settings`,
-//! and `crate::hub::CollectorManager::rebuild` calls it (session sync)
+//! and `crate::hub::CollectorManager::apply_run` calls it (session sync)
 //! *before* building the client factory (`banto_collect::broker_client_factory`)
 //! it hands to `Collector::apply_config` - i.e. the broker session for an SLMP connection
 //! is already established by the time `Collector` would otherwise decide to
@@ -100,22 +100,22 @@
 //! *real* (and, in dev/test use, generally unreachable) host/port -
 //! simulation mode would silently not take effect for it.
 //!
-//! The natural substitution point: `rebuild` must know the simulator's
+//! The natural substitution point: `apply_run` must know the simulator's
 //! address *before* calling `ensure_connection`, which means the simulator
 //! for such a connection cannot be owned by `Collector` (whose simulator only
 //! exists once its task spawns, which is necessarily later in the same
-//! `rebuild` call). Two options were considered: (a) give `CollectorManager`
+//! `apply_run` call). Two options were considered: (a) give `CollectorManager`
 //! its own simulator registry, sibling to [`HubSessions`], keyed by
 //! connection id, consulted before `ensure_connection` for any enabled
 //! `simulation = true` SLMP connection (and torn down on the same removal
 //! sweep this struct's "Session sync policy" section already performs) -
 //! `Collector` would then see `simulation = false` effectively for
 //! broker-routed connections and simply not start a second, redundant
-//! simulator; or (b) reorder `rebuild` so session sync runs *after*
+//! simulator; or (b) reorder `apply_run` so session sync runs *after*
 //! `Collector::apply_config`, threading the address `Collector` already
 //! assigned back into `ensure_connection` - rejected as the bigger change,
 //! since every other ordering constraint this struct documents (the T7-2
-//! "Session sync policy" section, and `CollectorManager::rebuild`'s own doc
+//! "Session sync policy" section, and `CollectorManager::apply_run`'s own doc
 //! comment) is built around sync-then-apply. (a) was the smaller, more
 //! surgical change and is what T9-2 implemented, as [`BrokerSimRegistry`] -
 //! see that struct's own doc comment for the concrete mechanism (it lives in
@@ -196,7 +196,7 @@ impl HubDrivers {
 /// The broker session directory itself, owned outside `CollectorManager` (see
 /// this module's doc comment for why) and shared (via `Arc`) between
 /// `bin/banto-hub.rs` (construction + final shutdown) and
-/// `crate::hub::CollectorManager` (session sync on every `rebuild`, status
+/// `crate::hub::CollectorManager` (session sync on every `apply_run`, status
 /// lookups for `/api/v1/status`).
 ///
 /// ## Session sync policy: additive + removal (T7-2, 2026-08-05 更新)
@@ -215,7 +215,7 @@ impl HubDrivers {
 /// **T7-2 closes that gap**: `SessionDirectory` now has
 /// [`banto_broker::SessionDirectory::remove`] (see that crate's own doc
 /// comment for the exact mechanism and its explicit non-guarantee), so
-/// `crate::hub::CollectorManager::rebuild` now performs a full sync each
+/// `crate::hub::CollectorManager::apply_run` now performs a full sync each
 /// call - `ensure_connection` for every currently-enabled connection whose
 /// protocol the broker manages (unchanged, additive - as of #131,
 /// 2026-09-01, this is [`HubSessions::is_broker_managed`], i.e. `"slmp"`
@@ -225,7 +225,7 @@ impl HubDrivers {
 /// that wanted set (deleted from the registry, disabled, or changed away
 /// from a broker-managed protocol). The removal step runs strictly AFTER the
 /// collector-side commit that stops the corresponding collect task (if any)
-/// succeeds - see `CollectorManager::rebuild`'s own doc comment for why that
+/// succeeds - see `CollectorManager::apply_run`'s own doc comment for why that
 /// ordering matters (a `banto_collect::BrokerReadClient` must never outlive the
 /// session it reads through). This was chosen over "stop everything and respawn"
 /// (which would re-open every SLMP session on every rebuild, defeating the
@@ -470,7 +470,7 @@ impl HubSessions {
     }
 
     /// Every connection id this directory currently tracks a session for -
-    /// proxies [`SessionDirectory::connection_ids`]. `CollectorManager::rebuild`
+    /// proxies [`SessionDirectory::connection_ids`]. `CollectorManager::apply_run`
     /// (T7-2, widened past SLMP by #131) diffs this against the registry's
     /// current enabled-and-broker-managed-protocol connection set to find
     /// which ids to [`Self::remove`].

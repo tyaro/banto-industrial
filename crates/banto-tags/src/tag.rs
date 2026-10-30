@@ -3488,7 +3488,7 @@ impl TagService {
     /// `TagService` method, rebuilding is the caller's job. The intended
     /// caller (`apps/banto-hub/core/src/rest.rs`'s `POST /api/tags/batch`)
     /// calls [`crate::plc_connection::PlcConnectionService`]'s sibling hub
-    /// type (`CollectorManager::rebuild`) exactly once after a
+    /// type (`CollectorManager::apply_run`) exactly once after a
     /// `Valid { tags: Some(_), .. }` result, never per row.
     ///
     /// A DB-level failure surfacing only at INSERT time (e.g. a `name` that

@@ -528,7 +528,7 @@ pub struct TagEntry {
 }
 
 /// Immutable snapshot of the external-name catalog, rebuilt from scratch on
-/// every [`CollectorManager::rebuild`] (design §4.1's "revision" is the
+/// every [`CollectorManager::apply_run`] (design §4.1's "revision" is the
 /// generation counter of exactly this snapshot). Cheap to clone (wrap in
 /// `Arc`) since a REST handler reading the catalog must not block a
 /// concurrent rebuild.
@@ -888,7 +888,7 @@ struct Inner {
     /// The most recent `apply_config` call's report, or `None` if the last
     /// successful rebuild did not go through `apply_config` (a fresh
     /// `Collector` start, or a transition to the empty state - see
-    /// [`CollectorManager::rebuild`]'s doc comment). Cleared together with
+    /// [`CollectorManager::apply_run`]'s doc comment). Cleared together with
     /// `current` whenever a rebuild does not call `apply_config`.
     last_apply: Option<ApplyReport>,
     /// #341 レビュー対応（2026-09-14）: **直近で実際に適用に成功した
@@ -971,15 +971,15 @@ pub struct CollectorManager {
     /// owned OUTSIDE this manager (`bin/banto-hub.rs` constructs it and holds
     /// its own `Arc` clone for final shutdown) so a broker session (SLMP
     /// since T2-2, Modbus TCP since #131/#337) survives a
-    /// `rebuild` - see `crate::broker_glue::HubSessions`'s doc comment for
-    /// the full rationale and the session-sync policy `rebuild` follows.
+    /// `apply_run` - see `crate::broker_glue::HubSessions`'s doc comment for
+    /// the full rationale and the session-sync policy `apply_run` follows.
     sessions: Arc<HubSessions>,
     /// T9-2 (docs/ux-plan.md §1): the broker session simulator registry
     /// (`BrokerSimRegistry`, formerly `SlmpSimRegistry` - see that type's own
     /// doc comment for why the old name said SLMP only even though it has
     /// driven Modbus TCP too since #131, and why #339 renamed it),
     /// owned OUTSIDE this manager for exactly the same reason `sessions` is - it must
-    /// survive every `rebuild` (a simulator started for a connection stays
+    /// survive every `apply_run` (a simulator started for a connection stays
     /// up across rebuilds that leave it `simulation = true`, mirroring how a
     /// broker session stays up), and `bin/banto_hub` needs its own `Arc`
     /// clone to call `BrokerSimRegistry::shutdown` at the correct point in
@@ -987,13 +987,13 @@ pub struct CollectorManager {
     /// outlive the broker sessions that dial them). See
     /// `crate::broker_glue::BrokerSimRegistry`'s doc comment for the full
     /// mechanism, and this module's doc comment ("接続単位の
-    /// シミュレーションモード") for how `rebuild` uses it.
+    /// シミュレーションモード") for how `apply_run` uses it.
     sim_registry: Arc<BrokerSimRegistry>,
     /// T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): owned OUTSIDE this
     /// manager for the same reason `sessions` is (`bin/banto-hub.rs`
     /// constructs it and keeps its own `Arc` clone so `ServerTagStore`'s
     /// retained values and the running evaluation loop both outlive any
-    /// single `rebuild`). [`CollectorManager::rebuild`] calls
+    /// single `apply_run`). [`CollectorManager::commit_catalog`] calls
     /// [`ComputedEngine`]'s pure `crate::computed::build_plan` against the
     /// freshly-built catalog and commits the result in the SAME
     /// all-or-nothing step as the catalog/`Collector` swap (§4.3(a): "変更の
@@ -1002,7 +1002,7 @@ pub struct CollectorManager {
     computed: Arc<ComputedEngine>,
     /// 外部 DB 連携 S2（docs/banto-hub-external-db-design.md §4.2・§4.5）:
     /// DB Source のポーリングエンジン。`computed` と**全く同じ扱い**で
-    /// [`Self::rebuild`]/[`Self::commit_catalog`] が
+    /// [`Self::apply_run`]/[`Self::commit_catalog`] が
     /// `crate::db_source::build_plan`（純関数）の結果を catalog/`Collector`/
     /// 演算 plan の入れ替えと同じ all-or-nothing の1ステップで commit する
     /// （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
@@ -1031,7 +1031,7 @@ pub struct CollectorManager {
     /// `push` 接続の外部ソースとして、この manager が作る `Collector` に
     /// `start_with_sources` で渡す（`apply_config` は作った時の源を使い続ける）。
     /// 計画の commit（`push` 接続・キーの集合・ブリッジの送る集合）は catalog の
-    /// 入れ替えと同じ点（[`Self::rebuild`] の 2 つの枝と [`Self::commit_catalog`]）、
+    /// 入れ替えと同じ点（[`Self::apply_run`] の 2 つの枝と [`Self::commit_catalog`]）、
     /// 収集の遷移に連動する保持値の破棄と epoch は
     /// `crate::controller::CollectionController`（[`Self::ingest_hub`] 経由。
     /// `db_source` と同じ理由で manager の側には置かない）。`db_source` と同じく
@@ -1039,7 +1039,7 @@ pub struct CollectorManager {
     ingest: Arc<IngestHub>,
     /// The running `Collector` itself (`None` when nothing is enabled to
     /// collect - a normal state, not an error, see
-    /// [`CollectorManager::rebuild`]). **`tokio::sync::Mutex`, not
+    /// [`CollectorManager::apply_run`]). **`tokio::sync::Mutex`, not
     /// `std::sync::Mutex`** (T7): [`Collector::apply_config`] needs `&mut
     /// Collector` held across several `.await` points (stopping/joining
     /// changed tasks, possibly reopening the tstore writer), which a std
@@ -1052,8 +1052,7 @@ pub struct CollectorManager {
     collector: AsyncMutex<Option<Collector>>,
     inner: Mutex<Inner>,
     /// Serializes the whole body of [`CollectorManager::commit_catalog`] and
-    /// [`CollectorManager::apply_run`] (and the test-only
-    /// [`CollectorManager::rebuild`]) - see this module's doc comment
+    /// [`CollectorManager::apply_run`] - see this module's doc comment
     /// ("catalog の commit と収集の適用は直列化されている") for why a plain
     /// `inner` lock alone is not enough (it is only held across the short
     /// commit step, not across the registry read that precedes it).
@@ -1071,7 +1070,7 @@ pub struct CollectorManager {
     /// `watch` channel so `crate::stream`'s per-connection tasks can await
     /// "revision changed" without polling. Sent from inside the same
     /// `inner` critical section that advances `revision` (see
-    /// [`CollectorManager::rebuild`]), so a `watch::Receiver` never observes
+    /// [`CollectorManager::apply_run`]), so a `watch::Receiver` never observes
     /// a `revision()` that is stale relative to what it already saw here -
     /// only ever the same value or a later one. A `watch` channel coalesces
     /// rapid updates (a receiver that is not actively awaiting only ever
@@ -1081,7 +1080,7 @@ pub struct CollectorManager {
     /// once per intermediate revision.
     revision_tx: watch::Sender<u64>,
     /// T9-2 フォローアップ（2026-08-06、`crate::diag_log` モジュール doc
-    /// 参照）: `rebuild`/`sync_broker_sessions_from`/`log_simulation_warnings` の
+    /// 参照）: `apply_run`/`sync_broker_sessions_from`/`log_simulation_warnings` の
     /// 診断ログの出力先。[`Self::new`] では [`DiagLog::default`]（素の
     /// `println!`/`eprintln!` と同じ）で初期化され、[`Self::with_diag_log`]
     /// を呼んだ場合のみ差し替わる - `bin/banto_hub` はここへ
@@ -1089,7 +1088,7 @@ pub struct CollectorManager {
     /// でもこれらの診断がサービスログファイルに届くようにする。
     diag_log: DiagLog,
     /// #616: 最後に出したシミュレーションの注意の文面と時刻（`clock` のミリ秒）。設定の
-    /// 1 回の変更で `rebuild`・`apply_run` が続けて呼ばれ、同じ注意が同じ時刻に 2〜4 回
+    /// 1 回の変更で `commit_catalog`・`apply_run` が続けて呼ばれ、同じ注意が同じ時刻に 2〜4 回
     /// 出ていたのを、[`sim_warning_due`] で抑える。シミュレーションの接続が無くなったら
     /// `None` に戻す（再び有効にしたときに出す）。
     last_sim_warning: std::sync::Mutex<Option<(String, i64)>>,
@@ -1120,7 +1119,7 @@ impl CollectorManager {
     /// `ManualClock` in tests, same contract as `Collector::start`. `sessions`
     /// is the broker session directory (T2-2, §6-5) - constructed and owned
     /// by the caller (`bin/banto-hub.rs`) so it outlives every
-    /// `CollectorManager::rebuild`; see [`CollectorManager`]'s `sessions`
+    /// `CollectorManager::apply_run`; see [`CollectorManager`]'s `sessions`
     /// field doc comment. `sim_registry` (T9-2) is the broker simulator
     /// registry, constructed and owned the same way - see
     /// [`CollectorManager`]'s `sim_registry` field doc comment.
@@ -1173,7 +1172,7 @@ impl CollectorManager {
     }
 
     /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
-    /// （`rebuild`/`sync_broker_sessions_from`/`log_simulation_warnings`）を
+    /// （`apply_run`/`sync_broker_sessions_from`/`log_simulation_warnings`）を
     /// `hub_log::log_line`/`log_err_line` 経由にルーティングし、Windows
     /// サービスモードでもサービスログファイルへ届くようにする - `bin/
     /// banto_hub` が呼ぶ。これを呼ばなければ既定の素の
@@ -1199,7 +1198,7 @@ impl CollectorManager {
     /// T6-2: the shared [`ComputedEngine`] - `bin/banto-hub.rs` clones this
     /// to hand to the background 250ms evaluation loop task (this struct's
     /// `computed` field doc comment: the engine's plan/state must outlive any
-    /// single `rebuild`, but the tick loop itself is not part of `rebuild`).
+    /// single `apply_run`, but the tick loop itself is not part of `apply_run`).
     pub fn computed_engine(&self) -> Arc<ComputedEngine> {
         self.computed.clone()
     }
@@ -1363,306 +1362,6 @@ impl CollectorManager {
                 "削除予定の確認が異常終了しました: {err}"
             ))),
         }
-    }
-
-    /// Rebuild the catalog and reconfigure the `Collector` from the current
-    /// registry state (design §4.3, T7: "部分適用").
-    ///
-    /// **Not called from product code** - a test-only entry point left from
-    /// before the `CollectionController`. It bypasses the controller: it syncs
-    /// sessions from the saved values (same as `Configured`) and starts the
-    /// `Collector`. In the product, boot only does `commit_catalog`, and after
-    /// a CRUD write `CollectionController::commit_catalog_and_apply_live`
-    /// commits the catalog (and applies live only while Running; while
-    /// stopped it never dials). Removal is tracked separately.
-    ///
-    /// On success: `revision` advances by exactly 1, `last_error` clears,
-    /// and the new catalog/`Collector` state (or no `Collector` at all, if
-    /// nothing is enabled - see below) are live.
-    ///
-    /// On failure (registry read error, a config-level problem
-    /// `build_config` catches - e.g. an unparsable address - or a
-    /// `Collector` lifecycle failure, from either `apply_config` or
-    /// `start_with_client_factory`): the OLD catalog and OLD `Collector`
-    /// state are left completely untouched, `revision` does not advance, and
-    /// `last_error` is set to the failure message. The caller (an I1 CRUD
-    /// handler) must NOT treat this `Err` as its own failure - the write
-    /// itself already succeeded; only the collector's view is stale until
-    /// the registry is fixed and rebuilt again (design's T0-1 instructions:
-    /// "rebuild 失敗は CRUD 自体の失敗にしない").
-    ///
-    /// A registry with nothing enabled (`build_config` returns zero
-    /// connections) is NOT a failure: this stops any previously-running
-    /// `Collector` outright (see this module's doc comment - the T7-2
-    /// instructions keep this branch as the pre-T7 "stop" path rather than
-    /// routing it through `apply_config`), commits an empty (or whatever it
-    /// resolves to) catalog, and still advances `revision` - a legitimate
-    /// "collecting nothing" state, not an error (design's instructions: "タグ
-    /// が0件でも正常起動")．
-    ///
-    /// **Serialized**: concurrent callers queue on `rebuild_lock` and run one
-    /// at a time, each reading the registry fresh after acquiring the lock -
-    /// see this module's doc comment ("catalog の commit と収集の適用は
-    /// 直列化されている") for why this matters (without it, two racing rebuilds could commit
-    /// out of order and leave `revision` advanced but the catalog/`Collector`
-    /// reflecting a stale registry read).
-    pub async fn rebuild(&self) -> Result<(), String> {
-        let _guard = self.rebuild_lock.lock().await;
-
-        let snapshot = match RegistrySnapshot::load(&self.pool).await {
-            Ok(snapshot) => snapshot,
-            Err(err) => {
-                let message = format!("レジストリのスナップショット取得に失敗しました: {err}");
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        let new_map = match build_catalog_from(&snapshot) {
-            Ok(map) => map,
-            Err(err) => {
-                let message = format!("catalog の読み取りに失敗しました: {err}");
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        // T6-2 (docs/tag-server-design.md §4.2/§4.3(a)): compile every
-        // `computed` tag's expression against `new_map` and validate the DAG
-        // - pure computation, no mutation of `self.computed` yet (mirrors
-        // `build_catalog`/`build_config` just above: a failure here must
-        // leave EVERYTHING - catalog, `Collector`, and the computed engine's
-        // plan - on the old state, §4.3(a)'s all-or-nothing). Committed only
-        // at the same point the catalog/`Collector` swap happens, below.
-        let computed_plan = match computed::build_plan(&new_map) {
-            Ok(plan) => plan,
-            Err(err) => {
-                let message = format!("演算タグの検証に失敗しました: {err}");
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        // 外部 DB 連携 S2 (docs/banto-hub-external-db-design.md §4.2・§4.5):
-        // `computed_plan` と全く同じ扱い - 純粋な組み立てだけをここで行い、
-        // commit は catalog/`Collector` の入れ替えと同じ点で行う。DB Source
-        // の計画が不整合なら rebuild 全体が失敗し、走行中のタスクは
-        // 一切触られない（§4.3(a) の all-or-nothing）。
-        let db_source_plan = match db_source::build_plan(&snapshot, self.registry()) {
-            Ok(plan) => plan,
-            Err(err) => {
-                let message = format!("DB Source の検証に失敗しました: {err}");
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        let mut config = match build_hub_config(&snapshot, self.registry()) {
-            Ok(config) => config,
-            Err(err) => {
-                let message = err.to_string();
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        // T2-2/T7-2/#131 (docs/tag-server-design.md §6-5/§4.3): additive
-        // ensure_connection (unchanged from T2-2, now covers every
-        // broker-managed protocol - `HubSessions::is_broker_managed`, not
-        // just SLMP) plus the set of tracked ids that are no longer
-        // wanted - see `Self::sync_broker_sessions_from`'s doc comment.
-        // Deliberately unconditional (runs even when `config.group_count()
-        // == 0` just below) - independent of whether the resulting
-        // collector config ends up empty, every OTHER still-collectible
-        // connection's broker session bookkeeping (add/remove) must still
-        // happen this rebuild, and this step never touches
-        // `inner`/`collector` so it carries no all-or-nothing risk either
-        // way. **Since T19 S2-a (UX-48)**, a connection with zero enabled
-        // collection groups no longer gets a session synced here at all -
-        // see `Self::sync_broker_sessions_from`'s own doc comment (this
-        // paragraph used to claim the opposite - "a connection can be
-        // enabled with no collectible groups yet and still deserve a live
-        // broker session" - which stopped being true the moment that fn
-        // started filtering on `banto_collect::connections_with_collected_groups`).
-        // `CollectionController::commit_catalog_and_apply_live`'s doc
-        // comment (#341, T19 S2-a 案B の後継) covers how such a connection
-        // can still get a session before the next start/stop cycle, via a
-        // registry change committed while a run is already `Running` -
-        // that path now goes all the way through `Self::apply_run`, so this
-        // very fn is what runs. `stale_broker_ids` is only
-        // actually removed AFTER a successful commit below - see
-        // `Self::remove_stale_broker_sessions`'s doc comment for why the
-        // ordering matters.
-        let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
-            self.sync_broker_sessions_from(&snapshot).await;
-
-        // T9-2/#131/#337: `read_routed_keys` (the fourth return value) is
-        // the set of connections whose *collection reads* are broker-routed,
-        // whose dial target `Self::sync_broker_sessions_from` already resolved
-        // (simulator substitution included, via `BrokerSimRegistry::resolve`)
-        // before `ensure_connection` ran. Telling `Collector` to treat these
-        // as `simulation = false` stops it from starting a second, redundant
-        // in-process simulator for a connection `BrokerSimRegistry` already
-        // simulates - see `CollectorConfig::suppress_simulation_for`'s doc
-        // comment (`crates/banto-collect/src/config.rs`) and this module's
-        // doc comment ("接続単位のシミュレーションモード") for the full
-        // derivation. Under #131 this set was deliberately narrower than
-        // `broker_handles.keys()` (SLMP only, because Modbus reads were not
-        // broker-routed); since #337 they coincide, and
-        // `sync_broker_sessions_from` derives this one from `broker_handles`
-        // precisely so the two cannot drift apart again - see that fn's
-        // `read_routed_keys` doc paragraph.
-        config.suppress_simulation_for(&read_routed_keys);
-
-        // T9-2: also stamp each broker-routed connection plan with the SAME
-        // resolved dial target `sync_broker_sessions_from` just used, so a
-        // simulation toggle (or a simulator restart, or an in-place host/port
-        // edit) that actually moved the broker session makes `apply_config`'s
-        // `PartialEq` diff notice and respawn that connection's task with a
-        // fresh `ClientFactory` - suppressing `simulation` alone leaves the
-        // plan otherwise byte-for-byte identical across such a toggle, which
-        // would classify the connection "unchanged" and leave its running
-        // task wired to a now-superseded broker session forever. See
-        // `CollectorConfig::set_broker_dial_target`'s doc comment
-        // (`crates/banto-collect/src/config.rs`) for the full derivation.
-        for (key, fingerprint) in &resolved_broker_targets {
-            config.set_broker_dial_target(key, *fingerprint);
-        }
-
-        // `CollectorConfig`'s internals are `pub(crate)` to banto-collect, so
-        // `group_count() == 0` is the public equivalent of "nothing
-        // collectible" - `build_config` already drops any connection with
-        // zero collectible groups (see its own doc comment), so this is
-        // exactly the same condition `Collector::start_with_client_factory`'s
-        // own `connections.is_empty()` check would use.
-        if config.group_count() == 0 {
-            // T6-2: commit the validated computed-tag plan in the same
-            // all-or-nothing step as the catalog swap below - see
-            // `computed_plan`'s own comment above.
-            self.computed.commit(computed_plan);
-            self.db_source.commit(db_source_plan);
-            self.ingest.commit(&snapshot);
-            // 停止は削除と直列（`Self::writer_gate`）。`stop` が終わるまで持つ。
-            let _writer_gate = self.writer_gate.lock().await;
-            let old_collector = self.collector.lock().await.take();
-            let new_revision = {
-                let mut inner = self.inner.lock().expect("hub state lock poisoned");
-                self.server_store()
-                    .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
-                warn_external_name_collisions(&inner.map, &new_map);
-                inner.map = Arc::new(new_map);
-                inner.revision += 1;
-                inner.last_error = None;
-                inner.current = None;
-                inner.last_apply = None;
-                // #341 レビュー対応: `Self::apply_run` と同じロールバック
-                // 基準をここでも更新する（`rebuild` は run mode を持たない
-                // ので snapshot そのものが runtime snapshot）。
-                inner.applied_runtime = snapshot.clone();
-                inner.applied_registry = snapshot.clone();
-                inner.revision
-            };
-            // Sent while still holding `rebuild_lock` (not `inner`'s lock,
-            // already released above) - see this struct's `revision_tx` doc
-            // comment for why serializing the send against `rebuild`'s own
-            // serialization is what keeps a `watch::Receiver` from ever
-            // observing a value older than what `revision()` already reports.
-            let _ = self.revision_tx.send(new_revision);
-            if let Some(collector) = old_collector {
-                let _ = collector.stop().await;
-            }
-            self.remove_stale_broker_sessions(&stale_broker_ids).await;
-            self.log_simulation_warnings().await;
-            return Ok(());
-        }
-
-        // T7 (docs/tag-server-design.md §4.3): reconfigure the already-running
-        // `Collector` in place via `apply_config` if one exists, otherwise
-        // start a fresh one - see this module's doc comment for the full
-        // derivation. Either path leaves `self.collector`/`self.inner`
-        // completely untouched on `Err` (preserving the old Collector/TagMap
-        // on failure), matching the pre-T7 "start the new one before
-        // touching the old one" discipline - `apply_config` and
-        // `start_with_client_factory` both carry that same "no partial
-        // effect on failure" contract themselves now. T2-2/#337: the client
-        // factory routes every broker-managed connection (SLMP since T2-2,
-        // Modbus TCP since #337) through the broker sessions just synced
-        // above; a connection defensively missing from the handle map gets a
-        // client that never connects (R2b-3a-3: there is no direct client to
-        // fall back to any more - `banto_collect::broker_client_factory`).
-        let factory = banto_collect::broker_client_factory(Arc::new(broker_handles));
-        let mut collector_guard = self.collector.lock().await;
-        let commit: Result<(Option<ApplyReport>, CurrentValuesHandle), String> =
-            if let Some(collector) = collector_guard.as_mut() {
-                match collector.apply_config(config, factory).await {
-                    Ok(report) => Ok((Some(report), collector.current_values())),
-                    Err(err) => Err(err.to_string()),
-                }
-            } else {
-                match Collector::start_with_sources(
-                    config,
-                    &self.data_dir,
-                    self.clock.clone(),
-                    self.events.clone(),
-                    self.options,
-                    factory,
-                    Some(self.ingest.clone() as Arc<dyn ExternalSource>),
-                )
-                .await
-                {
-                    Ok(collector) => {
-                        let handle = collector.current_values();
-                        *collector_guard = Some(collector);
-                        Ok((None, handle))
-                    }
-                    Err(err) => Err(err.to_string()),
-                }
-            };
-        drop(collector_guard);
-
-        let (apply_report, current_handle) = match commit {
-            Ok(pair) => pair,
-            Err(message) => {
-                // #341 レビュー対応: `Self::apply_run` と同じ理由・同じ
-                // 手当て（同 fn の「失敗時のロールバック」節）。
-                self.rollback_broker_sessions().await;
-                self.set_last_error(message.clone());
-                return Err(message);
-            }
-        };
-
-        if let Some(report) = &apply_report {
-            self.diag_log.err_line(&format!(
-                "banto-hub: rebuild (部分適用) added={:?} removed={:?} replaced={:?} unchanged={:?} writer_rotated={}",
-                report.added, report.removed, report.replaced, report.unchanged, report.writer_rotated,
-            ));
-        }
-
-        // T6-2: commit alongside the catalog/`Collector` state - same
-        // reasoning as the `group_count() == 0` branch above.
-        self.computed.commit(computed_plan);
-        self.db_source.commit(db_source_plan);
-        self.ingest.commit(&snapshot);
-        let new_revision = {
-            let mut inner = self.inner.lock().expect("hub state lock poisoned");
-            self.server_store()
-                .observe_catalog(&inner.map, &new_map, self.clock.now_ms());
-            warn_external_name_collisions(&inner.map, &new_map);
-            inner.map = Arc::new(new_map);
-            inner.revision += 1;
-            inner.last_error = None;
-            inner.current = Some(current_handle);
-            inner.last_apply = apply_report;
-            inner.applied_runtime = snapshot.clone();
-            inner.applied_registry = snapshot.clone();
-            inner.revision
-        };
-        let _ = self.revision_tx.send(new_revision);
-
-        self.remove_stale_broker_sessions(&stale_broker_ids).await;
-        self.log_simulation_warnings().await;
-
-        Ok(())
     }
 
     fn set_last_error(&self, message: String) {
@@ -1860,7 +1559,7 @@ impl CollectorManager {
     /// through the stopped handle and reads Bad. [`Self::rollback_broker_sessions`]
     /// runs this same fn, so a rollback stops and joins the same way.
     ///
-    /// The stale ids are returned, not removed here - [`Self::rebuild`]
+    /// The stale ids are returned, not removed here - [`Self::apply_run`]
     /// only calls [`Self::remove_stale_broker_sessions`] with them AFTER the
     /// collector-side commit for this same rebuild has succeeded (so any
     /// collect task reading through that connection's session is already
@@ -1872,10 +1571,10 @@ impl CollectorManager {
     /// on both counts: every broker-managed connection reads Bad for this one
     /// rebuild (`banto_collect::broker_client_factory` hands a client that
     /// never connects for a missing handle), and no session is removed
-    /// on a registry hiccup) rather than failing the whole `rebuild` - this
+    /// on a registry hiccup) rather than failing the whole `apply_run` - this
     /// sync step is additive/best-effort infrastructure wiring, not a
     /// correctness precondition for the collector build that follows it
-    /// (unlike `build_catalog`/`build_config`, whose failures `rebuild` does
+    /// (unlike `build_catalog`/`build_config`, whose failures `apply_run` does
     /// propagate). Treating a read failure as "nothing stale" specifically
     /// avoids tearing down a session that is still wanted just because the
     /// registry could not be read this one time.
@@ -1884,7 +1583,7 @@ impl CollectorManager {
     /// session's settings fingerprint since R2b-3a-3, `(host, port)` before)
     /// carries the SAME resolved dial target `resolve` just
     /// computed for every broker-routed connection, regardless of
-    /// whether it changed. [`Self::rebuild`] feeds every entry into
+    /// whether it changed. [`Self::apply_run`] feeds every entry into
     /// `banto_collect::CollectorConfig::set_broker_dial_target` - necessary
     /// because `BrokerSimRegistry::resolve`'s `changed`-triggered
     /// `sessions.stop_and_join` + re-`ensure_connection` swaps the broker session
@@ -1910,7 +1609,7 @@ impl CollectorManager {
     ///
     /// **T9-2 fourth return value (`read_routed_keys`; #131 2026-09-01,
     /// reworked by #337 2026-09-08)**: the connection keys whose *collection
-    /// reads* are broker-routed - the set [`Self::rebuild`]/[`Self::apply_run`]
+    /// reads* are broker-routed - the set [`Self::commit_catalog`]/[`Self::apply_run`]
     /// feed into `banto_collect::CollectorConfig::suppress_simulation_for`
     /// ("something else already substitutes this connection's simulator,
     /// stand down your own").
@@ -1978,7 +1677,7 @@ impl CollectorManager {
     ///
     /// **T19 S2-a 案B (2026-09-03) closed the write-gap this paragraph used
     /// to describe, and #341 (2026-09-14) widened that fix**: a connection
-    /// with zero enabled groups the last time `Self::rebuild`/
+    /// with zero enabled groups the last time `Self::apply_run`/
     /// `Self::apply_run` ran no longer has to wait for the next
     /// rebuild/apply_run (typically: stopping and restarting the collection
     /// run) to get a session once a group/tag is registered under it -
@@ -1991,7 +1690,7 @@ impl CollectorManager {
     /// since #341 the whole `apply_run` runs, so the session sync and the
     /// collect tasks move together - see that method's doc comment for the
     /// full derivation, including why it is safe against the same T15-4
-    /// stop-vs-write race this fn's caller ([`Self::rebuild`]) already had
+    /// stop-vs-write race this fn's caller ([`Self::apply_run`]) already had
     /// to reckon with.
     async fn sync_broker_sessions_from(
         &self,
@@ -2057,7 +1756,7 @@ impl CollectorManager {
             // in R2b-3a-3) `ModbusTcp` arm read through banto-collect's own direct
             // `ModbusTcpClient` (#131 moved only Modbus writes/status onto
             // the broker), so putting a Modbus key into the set
-            // `Self::rebuild`/`Self::apply_run` feed to
+            // `Self::commit_catalog`/`Self::apply_run` feed to
             // `CollectorConfig::suppress_simulation_for` - which tells
             // `Collector` "something else already handles this connection's
             // simulation, stand down your own simulator" - would have left a
@@ -2125,7 +1824,7 @@ impl CollectorManager {
     /// [`crate::broker_glue::BrokerSimRegistry::remove`] for every id in
     /// `stale`. Must only be called AFTER the collector-side commit for the
     /// same rebuild has succeeded (see
-    /// [`Self::rebuild`]/[`Self::sync_broker_sessions_from`]'s doc comments) - by
+    /// [`Self::apply_run`]/[`Self::sync_broker_sessions_from`]'s doc comments) - by
     /// then, `apply_config`/the pre-commit `Collector` stop has already
     /// stopped any collect task that was reading through one of these
     /// connections' broker sessions. `async` (T9-2: `BrokerSimRegistry::remove`
@@ -2139,7 +1838,7 @@ impl CollectorManager {
 
     /// T9-2 accident-prevention (c): a one-line warning listing every
     /// enabled `simulation = true` connection, printed after every
-    /// successful `rebuild` commit (both the empty-config early return and
+    /// successful `apply_run` commit (both the empty-config early return and
     /// the normal path) so an operator watching hub's stdout is reminded a
     /// simulated connection is live - simulation mode is a dev/test
     /// convenience (docs/ux-plan.md §1) and must never silently persist into
@@ -2156,7 +1855,7 @@ impl CollectorManager {
     /// that already committed successfully.
     ///
     /// #616: 同じ文面は続けて出さない（[`sim_warning_due`]。設定の 1 回の変更で
-    /// `rebuild`・`apply_run` が続けて呼ばれ、同じ時刻に 2〜4 回出ていた）。起動直後・
+    /// `commit_catalog`・`apply_run` が続けて呼ばれ、同じ時刻に 2〜4 回出ていた）。起動直後・
     /// 再び有効にしたとき・文面が変わったとき・[`SIM_WARNING_REPEAT_MS`] を過ぎた後は出す。
     async fn log_simulation_warnings(&self) {
         let connections = match self.plc_connections().list(ListParams::default()).await {
@@ -2234,8 +1933,8 @@ impl CollectorManager {
     /// `banto_collect::broker_client_factory`の doc comment 参照）。
     ///
     /// `HubSessions::ensure_connection` は冪等（既存セッションがあれば
-    /// それをそのまま返す）なので、直近の `rebuild` が既に確保済みの
-    /// セッションと同じものが返る。`rebuild` と競合しても安全（同じ
+    /// それをそのまま返す）なので、直近の `apply_run` が既に確保済みの
+    /// セッションと同じものが返る。`apply_run` と競合しても安全（同じ
     /// セッションに収束する）。
     ///
     /// **T15-4 以降、書き込み経路（`crate::write_path::write_plc_tag`）は
@@ -2416,7 +2115,7 @@ impl CollectorManager {
                 return Err(message);
             }
         };
-        // 外部 DB 連携 S2: `Self::rebuild` と同じ位置・同じ理由
+        // 外部 DB 連携 S2: `Self::apply_run` と同じ位置・同じ理由
         // （§4.5「Source の task は `commit_catalog` の完了を受けて配下の
         // グループ集合を再読込する」- 稼働中の pending queue 適用がここを
         // 通るので、走行中の DB Source もこの1点で追従する）。
@@ -2470,8 +2169,8 @@ impl CollectorManager {
     /// （実機の host/port へは一度もダイヤルしない）。
     /// 生の `snapshot` を使うのは catalog / 演算タグ / DB Source の
     /// **検証**だけで、これらは run mode に依存しない。
-    /// （run mode を一切見ないのは [`Self::rebuild`] の方で、だからこそ
-    /// 稼働中の live re-apply には使えない -
+    /// （かつての `rebuild`（#958 で撤去）は run mode を一切見なかったので
+    /// 稼働中の live re-apply には使えなかった -
     /// `crate::controller::CollectionController::commit_catalog_and_apply_live`
     /// の doc comment 参照。）
     ///
@@ -2500,7 +2199,7 @@ impl CollectorManager {
         // （`/api/v1/status` の `last_config_error`）へ残す - 以前はここだけ
         // `map_err(..)?` で素通りしていて、`crate::rest::commit_catalog_and_notify`
         // の契約（「500 の詳細は `last_config_error` にも残る」）と食い違って
-        // いた。`Self::rebuild`/`Self::commit_catalog` は元から同じ扱い。
+        // いた。`Self::apply_run`/`Self::commit_catalog` は元から同じ扱い。
         let snapshot = RegistrySnapshot::load(&self.pool).await.map_err(|err| {
             self.set_last_error(format!(
                 "レジストリのスナップショット取得に失敗しました: {err}"
@@ -2519,7 +2218,7 @@ impl CollectorManager {
         })?;
         // 外部 DB 連携 S2: ここは `computed` と同じく**検証だけ**行い commit
         // はしない - 構成の反映（= 計画の入れ替え）は
-        // `Self::rebuild`/`Self::commit_catalog` の担当だから。
+        // `Self::apply_run`/`Self::commit_catalog` の担当だから。
         //
         // S2b（§4.8・§6-16）: 収集開始で DB Source の task を起こすのは
         // `crate::controller::CollectionController::start_locked` であって
@@ -2547,7 +2246,7 @@ impl CollectorManager {
 
         let (broker_handles, stale_broker_ids, resolved_broker_targets, read_routed_keys) =
             self.sync_broker_sessions_from(&runtime_snapshot).await;
-        // See `Self::rebuild`'s matching call for what `read_routed_keys` is
+        // See `Self::apply_run`'s matching call for what `read_routed_keys` is
         // and why it is `sync_broker_sessions_from`'s job to derive it (#131's
         // narrowing, reworked by #337).
         config.suppress_simulation_for(&read_routed_keys);
@@ -2652,7 +2351,7 @@ impl CollectorManager {
 
     /// A handle onto the running collector's current-value cache, or `None`
     /// if nothing is currently collecting (no `Collector` running - either
-    /// before the first successful [`CollectorManager::rebuild`], or because
+    /// before the first successful [`CollectorManager::apply_run`], or because
     /// the registry currently has nothing enabled). Every tag in the catalog
     /// reads as `quality: "bad", value: null` in that case (design: 未収集
     /// タグは 404 にせず bad を返す) - the REST layer distinguishes "no
@@ -2678,7 +2377,7 @@ impl CollectorManager {
     /// The most recent `apply_config` call's [`ApplyReport`] (T7-2, design
     /// §4.3), or `None` if the last successful rebuild did not go through
     /// `apply_config` (a fresh `Collector` start, or a transition to the
-    /// empty state - see [`Self::rebuild`]'s doc comment). Surfaced at
+    /// empty state - see [`Self::apply_run`]'s doc comment). Surfaced at
     /// `/api/v1/status` as `last_apply`.
     pub fn last_apply(&self) -> Option<ApplyReport> {
         self.inner
@@ -2693,7 +2392,7 @@ impl CollectorManager {
     /// `self.events` (the one [`EventSink`] this manager builds once in
     /// [`CollectorManager::new`] and hands to every `Collector::start` call)
     /// rather than `self.inner.collector.subscribe_events()` - the running
-    /// `Collector` is replaced wholesale on every [`CollectorManager::rebuild`]
+    /// `Collector` is replaced wholesale on every [`CollectorManager::apply_run`]
     /// (this module's doc comment, "T0 は「全体再構築」"), which would orphan
     /// a receiver obtained from the old one. `EventSink` itself is `Arc`-backed
     /// and stays the same value across every rebuild (see its field doc

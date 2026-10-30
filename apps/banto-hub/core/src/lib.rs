@@ -35,7 +35,7 @@
 //!   T0 では中身（フロントエンド）は作らない — 枠だけ用意する
 //! - [`computed`]: T6-2（設計 §4.2/§4.3(a)）。演算タグ・内部タグの評価
 //!   エンジン（[`computed::ComputedEngine`]）とタグ空間ストア
-//!   （[`computed::ServerTagStore`]）。`hub::CollectorManager::rebuild` が
+//!   （[`computed::ServerTagStore`]）。`hub::CollectorManager::apply_run` が
 //!   catalog/`Collector` と同じ all-or-nothing で式のコンパイル・DAG 検証
 //!   結果を commit する
 //! - [`broker_glue`]: T2-2（設計 §6-5）。broker 管理対象接続の収集読み取りを

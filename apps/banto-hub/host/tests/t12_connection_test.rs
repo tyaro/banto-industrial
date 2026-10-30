@@ -7,7 +7,7 @@
 //! 相当をこのファイル内に複製している(`t9_simulation.rs`のものをベースに
 //! した)。`TempEnv`は`tests/common/mod.rs`に集約済み(2026-08-08、テスト
 //! 一時ディレクトリリークの根治)。broker 経由 SLMP 接続のセットアップは
-//! `tests/integration.rs`の`e2e_slmp_session_survives_a_rebuild_via_broker`を
+//! `tests/integration.rs`の`e2e_slmp_session_survives_a_reapply_via_broker`を
 //! 参考にしている。
 //!
 //! テスト構成:
@@ -923,7 +923,7 @@ async fn slmp_test_reuses_existing_broker_session_without_dialing_a_second_conne
     app.commit_and_start().await;
 
     // Wait for the broker session to actually come up (mirrors
-    // `tests/integration.rs::e2e_slmp_session_survives_a_rebuild_via_broker`).
+    // `tests/integration.rs::e2e_slmp_session_survives_a_reapply_via_broker`).
     let mut status_watch = app
         .sessions
         .status_watch(conn.id)
