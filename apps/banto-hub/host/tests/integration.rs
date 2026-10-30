@@ -18,6 +18,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::hub::CollectorManager;
 use banto_hub_core::rest::api_router;
@@ -87,7 +88,7 @@ fn conn_input(name: &str, port: u16) -> PlcConnectionInput {
 }
 
 /// I8 (2026-08-05, crates/banto-collect の SLMP 対応): the `"slmp"` twin of
-/// [`conn_input`], used by [`e2e_read_slmp_via_rest_after_rebuild`].
+/// [`conn_input`], used by [`e2e_read_slmp_via_rest_after_commit`].
 fn slmp_conn_input(name: &str, port: u16) -> PlcConnectionInput {
     PlcConnectionInput {
         protocol: "slmp".to_string(),
@@ -151,7 +152,7 @@ where
 /// Everything one E2E test needs: a logged-in admin token, the assembled
 /// `Router`, the registry pool (to seed I1 rows directly, faster/less
 /// verbose than round-tripping every fixture through REST), the
-/// `CollectorManager` (to call `rebuild()` directly rather than only via a
+/// `CollectorManager` (to commit the catalog directly rather than only via a
 /// CRUD write, per T0-1's "再構築" test case), and the owning `TempEnv`
 /// (kept alive for the whole test via the return tuple).
 struct TestApp {
@@ -165,6 +166,9 @@ struct TestApp {
     /// REST, the way `e2e_slmp_session_survives_a_rebuild_via_broker` below
     /// does.
     sessions: Arc<HubSessions>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない - これらの試験は
+    /// わざとコントローラのゲートの無い router を使う）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -176,6 +180,24 @@ struct TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
     }
 }
 
@@ -228,7 +250,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     // T2-4: WriteControl always constructs disabled (docs/tag-server-design.md
@@ -285,12 +310,14 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         router,
         token,
         pool,
         manager,
         sessions,
+        controller,
         _env: env,
     }
 }
@@ -346,11 +373,11 @@ async fn write_json(
 }
 
 // ---------------------------------------------------------------------------
-// 1. E2E 読み取り: シミュレータ -> レジストリ -> rebuild -> /api/v1/values/{tag}
+// 1. E2E 読み取り: シミュレータ -> レジストリ -> catalog commit -> /api/v1/values/{tag}
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_read_via_rest_after_rebuild() {
+async fn e2e_read_via_rest_after_commit() {
     let app = test_app("e2e-read").await;
     let sim = Simulator::start().await;
     sim.set_holding_register(0, 1234); // 40001
@@ -368,7 +395,7 @@ async fn e2e_read_via_rest_after_rebuild() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -460,7 +487,7 @@ async fn deleting_a_connection_with_tags_cascades_and_preserves_tstore_history()
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -556,13 +583,13 @@ async fn read_all_group_rows(data_dir: &std::path::Path) -> Vec<banto_tstore::Sa
 }
 
 // ---------------------------------------------------------------------------
-// 1b. E2E 読み取り (SLMP, I8): シミュレータ -> レジストリ -> rebuild ->
-//     /api/v1/values/{tag} - the SLMP twin of `e2e_read_via_rest_after_rebuild`,
+// 1b. E2E 読み取り (SLMP, I8): シミュレータ -> レジストリ -> catalog commit ->
+//     /api/v1/values/{tag} - the SLMP twin of `e2e_read_via_rest_after_commit`,
 //     proving banto-collect's SLMP wiring reaches all the way through the hub.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn e2e_read_slmp_via_rest_after_rebuild() {
+async fn e2e_read_slmp_via_rest_after_commit() {
     let app = test_app("e2e-read-slmp").await;
     let sim = SlmpSimulator::start().await;
     sim.set_word(SlmpDevice::D, 100, 4321);
@@ -580,7 +607,7 @@ async fn e2e_read_slmp_via_rest_after_rebuild() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -606,7 +633,7 @@ async fn e2e_read_slmp_via_rest_after_rebuild() {
 
 // ---------------------------------------------------------------------------
 // 1c. E2E ブローカーセッション維持 (T2-2, docs/tag-server-design.md §6-5):
-//     SLMP 接続の読み取りが banto-broker 経由であることと、rebuild を跨いでも
+//     SLMP 接続の読み取りが banto-broker 経由であることと、catalog の commit を跨いでも
 //     同じセッション（同じ broker タスク）が維持されることを検証する。
 // ---------------------------------------------------------------------------
 
@@ -629,11 +656,11 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("first rebuild");
+    app.commit_and_start().await;
 
     // The value is readable through REST - proof the read actually went
     // through the broker-backed `BrokerReadClient`
-    // (`CollectorManager::rebuild`'s client factory routes every SLMP
+    // (`CollectorManager::apply_run`'s client factory routes every SLMP
     // connection through `banto_broker` - see hub.rs's doc comment).
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -657,14 +684,14 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
         .expect("broker session should report Connected");
 
     // Simulate an unrelated registry edit (a second tag added to the SAME
-    // connection's group) and rebuild again - the whole point of T2-2 is
+    // connection's group) and commit again - the whole point of T2-2 is
     // that this must NOT reopen the SLMP session.
     sim.set_word(SlmpDevice::D, 102, 222);
     TagService::new(app.pool.clone())
         .create(tag_input("t2", group.id, "D102", "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("second rebuild");
+    app.commit_and_start().await;
 
     // Still exactly one broker session: `ensure_connection` reused the
     // existing task instead of spawning a second one for the same
@@ -672,11 +699,11 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
     assert_eq!(
         app.sessions.connection_count(),
         1,
-        "the SLMP session must survive the rebuild, not be reopened"
+        "the SLMP session must survive the catalog commit, not be reopened"
     );
 
     // Value continuity through the surviving session: both the pre-existing
-    // tag and the newly-added one read correctly after the rebuild.
+    // tag and the newly-added one read correctly after the catalog commit.
     assert!(
         wait_until(Duration::from_secs(10), || async {
             let (s1, b1) = get_json(&app.router, "/api/v1/values/line1.fast.t1", &app.token).await;
@@ -684,7 +711,7 @@ async fn e2e_slmp_session_survives_a_rebuild_via_broker() {
             s1 == StatusCode::OK && b1["v"] == 111.0 && s2 == StatusCode::OK && b2["v"] == 222.0
         })
         .await,
-        "both tags should read correctly after the rebuild - the session never dropped"
+        "both tags should read correctly after the catalog commit - the session never dropped"
     );
 
     // `/api/v1/status` sources an SLMP connection's status from the broker
@@ -780,7 +807,7 @@ async fn start_session(app: &TestApp, conn_id: i64) {
         .create(group_input("fast", conn_id, 100))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("first rebuild");
+    app.commit_and_start().await;
     app.sessions
         .status_watch(conn_id)
         .expect("a broker session")
@@ -822,14 +849,11 @@ async fn a_protocol_only_change_redials_the_broker_session_with_the_new_driver()
     assert_eq!(sim.connection_count(), 1);
 
     // 同じ設定の再構築は張り直さない。
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     assert_eq!(live_fingerprint(&app, conn.id), first);
 
     set_row("slmp").await;
-    app.manager
-        .rebuild()
-        .await
-        .expect("rebuild after the protocol change");
+    app.commit_and_start().await;
     assert_redialed(&app, &sim, conn.id, first, 2, "protocol だけの変更").await;
     sim.stop();
 }
@@ -853,15 +877,12 @@ async fn a_modbus_unit_id_or_word_order_change_redials_the_broker_session() {
     let mut input = conn_input("line1", sim.addr.port());
     input.unit_id = 2;
     service.update(conn.id, input.clone()).await.unwrap();
-    app.manager.rebuild().await.expect("rebuild after unit_id");
+    app.commit_and_start().await;
     let second = assert_redialed(&app, &sim, conn.id, first, 2, "unit_id の変更").await;
 
     input.word_order = "high_low".to_string();
     service.update(conn.id, input).await.unwrap();
-    app.manager
-        .rebuild()
-        .await
-        .expect("rebuild after word_order");
+    app.commit_and_start().await;
     assert_redialed(&app, &sim, conn.id, second, 3, "word_order の変更").await;
     sim.stop();
 }
@@ -887,13 +908,12 @@ async fn catalog_exposes_external_name_address_and_stable_ids() {
         .create(tag_input("temp01", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
 
     let (status, json) = get_json(&app.router, "/api/v1/tags", &app.token).await;
     assert_eq!(status, StatusCode::OK);
-    // `test_app()` already did one rebuild against the still-empty registry
-    // (revision 1); seeding the fixture and rebuilding again here is a
-    // second generation.
+    // `test_app()` already committed the still-empty registry (revision 1);
+    // seeding the fixture and committing again here is a second generation.
     assert_eq!(json["revision"], 2);
     let tags = json["tags"].as_array().unwrap();
     assert_eq!(tags.len(), 1);
@@ -933,7 +953,7 @@ async fn undefined_tag_is_404_and_disabled_tag_reads_bad() {
         .create(disabled)
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
 
     let (status, _json) = get_json(&app.router, "/api/v1/values/nope.nope.nope", &app.token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -953,7 +973,7 @@ async fn undefined_tag_is_404_and_disabled_tag_reads_bad() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn creating_a_tag_via_rest_bumps_revision_and_appears_in_catalog() {
-    let app = test_app("crud-rebuild").await;
+    let app = test_app("crud-commit").await;
     let sim = Simulator::start().await;
 
     let (status, conn_json) = write_json(
@@ -1153,7 +1173,7 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
         .create(tag_input("good_tag", group.id, "40001", "i16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("first rebuild");
+    app.commit_and_start().await;
 
     assert!(
         wait_until(Duration::from_secs(10), || async {
@@ -1164,7 +1184,7 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
                 == Some(Some(777.0))
         })
         .await,
-        "good_tag should read its value before the bad rebuild"
+        "good_tag should read its value before the bad catalog commit"
     );
     let (status, before) = get_json(&app.router, "/api/v1/status", &app.token).await;
     assert_eq!(status, StatusCode::OK);
@@ -1179,10 +1199,10 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
         .await
         .unwrap();
     let err = app
-        .manager
-        .rebuild()
+        .controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect_err("an unparsable address should fail rebuild");
+        .expect_err("an unparsable address should fail the catalog commit");
     assert!(!err.is_empty());
 
     let (status, after) = get_json(&app.router, "/api/v1/status", &app.token).await;
@@ -1197,9 +1217,9 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
     // quality is derived at *read* time as period(100ms) x
     // STALE_PERIOD_FACTOR(2.5) = 250ms of grace (`banto_collect::current`),
     // not pushed by the collector. The old collector's own polling task was
-    // never touched by the rejected rebuild above (it keeps running
+    // never touched by the rejected catalog commit above (it keeps running
     // unchanged), but on a busy CI runner its scheduling can still lag past
-    // that 250ms grace window between the failed `rebuild()` call and this
+    // that 250ms grace window between the failed catalog commit and this
     // read, making good_tag transiently look "stale" even though the
     // collector never actually stopped. We only care that good_tag is (or
     // promptly becomes) good/777 again, not the exact timing, so absorb the
@@ -1216,7 +1236,7 @@ async fn an_invalid_config_keeps_the_old_collector_and_surfaces_last_config_erro
             s == StatusCode::OK && v["v"] == 777.0 && v["q"] == "good"
         })
         .await,
-        "good_tag should remain/become good after the rejected rebuild, even under scheduling jitter"
+        "good_tag should remain/become good after the rejected catalog commit, even under scheduling jitter"
     );
     let (status, value) = get_json(
         &app.router,
@@ -1338,7 +1358,7 @@ async fn modbus_collection_uses_exactly_one_socket() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     // 収集が実際に成立していること（= 少なくとも1本は張られ、読めている）。
     assert!(
@@ -1423,7 +1443,7 @@ async fn plc_events_do_not_flap_while_the_plc_is_unreachable() {
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.commit_and_start().await;
 
     let good = || async {
         app.manager

@@ -24,6 +24,7 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -208,12 +209,33 @@ struct TestApp {
     /// セッション無し状態を作る)ためのハンドル - `tests/t15_write_peek.rs`
     /// と同じ理由。
     sessions: Arc<HubSessions>,
+    /// 製品と同じ入口で収集を起こす（router には渡さない - これらの試験は
+    /// わざとコントローラのゲートの無い router を使う）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
     }
 }
 
@@ -266,7 +288,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -316,6 +341,7 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         router,
         admin_token,
@@ -323,6 +349,7 @@ async fn test_app(label: &str) -> TestApp {
         manager,
         write_control,
         sessions,
+        controller,
         _env: env,
     }
 }
@@ -424,7 +451,7 @@ async fn make_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -455,7 +482,7 @@ async fn make_string_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -479,7 +506,7 @@ async fn make_scaled_tag(
         .create(scaled_tag_input(tag_name, group.id, address, data_type))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -523,7 +550,7 @@ async fn make_internal_tag(app: &TestApp, tag_name: &str) -> String {
         .create(internal_tag_input(tag_name, group.id, "u16"))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     format!("{MEM_CONNECTION_NAME}.{group_name}.{tag_name}")
 }
 
@@ -883,7 +910,7 @@ async fn read_now_is_503_when_the_broker_session_is_gone() {
     )
     .await;
 
-    // rebuild が確立したセッションを直接落とす(`tests/t15_write_peek.rs`
+    // 収集の開始が確立したセッションを直接落とす(`tests/t15_write_peek.rs`
     // と同じ手法)。
     let conn_id = PlcConnectionService::new(app.pool.clone())
         .list(banto_core::ListParams::default())
@@ -899,7 +926,7 @@ async fn read_now_is_503_when_the_broker_session_is_gone() {
             app.sessions.connection_count() == 1
         })
         .await,
-        "rebuild should have established exactly one broker session"
+        "収集の開始がちょうど 1 本の broker セッションを確立しているはず"
     );
     assert!(app.sessions.stop_and_join(conn_id).await);
     assert_eq!(app.sessions.connection_count(), 0);
@@ -1064,7 +1091,7 @@ async fn mcp_read_tag_now_denies_missing_read_scope() {
 //    (docs/banto-hub-driver-address-design.md §4.1・§5・§9)
 //
 // 計画(`build_hub_config`)は厳格版なので、有効な数値タグの不正なアドレスは
-// rebuild ごと断る(カタログに載らない)。カタログの `entry.address` が不正な
+// commit_catalog ごと断る(カタログに載らない)。カタログの `entry.address` が不正な
 // 綴りになりうるのは、計画が読まない行 = **string タグ**(S1: 計画の前に外れる)
 // と**無効なタグ**だけ。その行を生の SQL で書き換えて検証する。
 // ---------------------------------------------------------------------------
@@ -1086,7 +1113,7 @@ async fn raw_set_address(app: &TestApp, tag_id: i64, address: &str) {
 }
 
 /// A string tag under `conn_input`, written valid and then edited by raw SQL to
-/// `bad_address`; the rebuild still succeeds (a string tag is never planned).
+/// `bad_address`; the commit still succeeds (a string tag is never planned).
 async fn make_hand_edited_string_tag(
     app: &TestApp,
     conn_input: PlcConnectionInput,
@@ -1113,7 +1140,7 @@ async fn make_hand_edited_string_tag(
         .await
         .unwrap();
     raw_set_address(app, tag.id, bad_address).await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.recipe"))
 }
 
@@ -1231,7 +1258,7 @@ async fn read_now_reads_a_tag_stored_in_a_pre_canonical_spelling() {
     )
     .await;
     raw_set_address(&app, tag_id, "d100").await;
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     assert!(
         wait_until(Duration::from_secs(10), || async {
             app.sessions.connection_count() == 1
@@ -1256,16 +1283,21 @@ async fn read_now_reads_a_tag_stored_in_a_pre_canonical_spelling() {
     sim.stop();
 }
 
-/// 厳格な計画: 有効な数値タグの不正な綴り(手で書き換えた行)は rebuild ごと断る。
+/// 厳格な計画: 有効な数値タグの不正な綴り(手で書き換えた行)は catalog の
+/// commit ごと断る（`commit_catalog` が `build_hub_config` で検証する。
+/// 失敗しても revision・旧 catalog は変わらない）。
 /// 寛容版(そのタグだけ `InvalidTag`)の検証は `banto-collect` の
 /// `a_registry_plan_excludes_only_the_tag_its_driver_refuses`。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rebuild_refuses_an_enabled_numeric_tag_whose_driver_refuses_the_address() {
-    let app = test_app("rebuild-bad-numeric").await;
+async fn commit_catalog_refuses_an_enabled_numeric_tag_whose_driver_refuses_the_address() {
+    let app = test_app("commit-bad-numeric").await;
     let (tag_id, name) = make_tag(&app, "line1", 1, "t1", "D100", "u16", false, true).await;
     raw_set_address(&app, tag_id, "400001").await;
     let before = app.manager.revision();
-    assert!(app.manager.rebuild().await.is_err());
+    let snapshot = banto_collect::RegistrySnapshot::load(&app.pool)
+        .await
+        .unwrap();
+    assert!(app.manager.commit_catalog(&snapshot).await.is_err());
     let message = app.manager.last_error().expect("last error");
     assert!(message.contains("400001"), "{message}");
     assert_eq!(app.manager.revision(), before, "the catalog is kept");

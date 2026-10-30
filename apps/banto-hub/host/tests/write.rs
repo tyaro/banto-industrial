@@ -33,6 +33,7 @@ use banto_hub_core::audit_spool;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::{CollectionController, CollectionState, RunMode};
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
@@ -185,6 +186,9 @@ struct TestApp {
     audit: AuditLogService,
     /// #437: the data dir (the spool lives in it).
     data_dir: std::path::PathBuf,
+    /// 製品と同じ入口で収集を起こす（router には渡さない - これらの試験は
+    /// わざとコントローラのゲートの無い router を使う）。
+    controller: Arc<CollectionController>,
     _env: TempEnv,
 }
 
@@ -193,6 +197,24 @@ struct TestApp {
 impl Drop for TestApp {
     fn drop(&mut self) {
         common::shutdown_test_app(&self.manager, &self.pool);
+    }
+}
+
+impl TestApp {
+    /// 登録の後に catalog を commit して、通常運転（`Configured`）で収集を
+    /// 起こす（製品の「設定を保存 → 収集開始」と同じ順。収集中なら live apply）。
+    /// 起動に失敗すると `start` は `Ok(Faulted)` を返すので、`Running` まで確かめる。
+    async fn commit_and_start(&self) {
+        self.controller
+            .commit_catalog_and_apply_live()
+            .await
+            .expect("commit catalog after seeding");
+        let status = self
+            .controller
+            .start(RunMode::Configured)
+            .await
+            .expect("収集を開始できる");
+        assert_eq!(status.state, CollectionState::Running, "{status:?}");
     }
 }
 
@@ -248,7 +270,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     // T2-4 (docs/tag-server-design.md §6-6): this fixture constructs the
@@ -316,6 +341,7 @@ async fn test_app(label: &str) -> TestApp {
         banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
     );
 
+    let controller = Arc::new(CollectionController::new(manager.clone()));
     TestApp {
         write_audit: write_audit_handle,
         router,
@@ -327,6 +353,7 @@ async fn test_app(label: &str) -> TestApp {
         state_file,
         audit,
         data_dir: env.data_dir(),
+        controller,
         _env: env,
     }
 }
@@ -436,7 +463,7 @@ async fn issue_key(
     )
 }
 
-/// タグ・グループ・接続を1本作って rebuild まで済ませ、`(tag_id,
+/// タグ・グループ・接続を1本作って収集開始まで済ませ、`(tag_id,
 /// external_name)` を返す共通フィクスチャ。
 #[allow(clippy::too_many_arguments)]
 async fn make_tag(
@@ -469,7 +496,7 @@ async fn make_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -701,7 +728,7 @@ async fn simulated_modbus_connection_write_lands_on_the_in_process_simulator_and
         .create(tag_input("temp01", group.id, "40017", "u16", true, true))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     app.write_control.enable();
 
     assert!(
@@ -929,7 +956,7 @@ async fn gate_disabled_tag_is_409_tag_disabled() {
 /// to pin down what actually happens now instead of deleting the coverage:
 /// the connection points at a port nothing listens on (15099, same as
 /// before), so the write now passes the protocol gate, reaches the broker
-/// session (which `rebuild` spawned but which never manages to connect), and
+/// session (which the collection start spawned but which never manages to connect), and
 /// fails at the broker call itself with `WriteRejection::WriteFailed` (502) -
 /// proving the gate genuinely passed rather than the write succeeding for
 /// the wrong reason (e.g. some other gate silently absorbing the rejection).
@@ -1009,10 +1036,10 @@ async fn gate_unsupported_broker_protocol_is_501_write_unsupported_protocol() {
         .execute(&app.pool)
         .await
         .expect("hand-edit the connection's protocol");
-    app.manager
-        .rebuild()
+    app.controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect("rebuild after hand-edit");
+        .expect("commit catalog after hand-edit");
 
     app.write_control.enable();
     let (key, _id) = issue_key(
@@ -1477,7 +1504,7 @@ async fn global_rate_limit_trips_across_tags() {
             .await
             .unwrap();
     }
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     app.write_control.enable();
 
     let (key, _id) = issue_key(
@@ -1875,7 +1902,7 @@ async fn make_string_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.commit_and_start().await;
     format!("{conn_name}.fast.{tag_name}")
 }
 
