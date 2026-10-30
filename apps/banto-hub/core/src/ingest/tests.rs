@@ -428,6 +428,35 @@ impl Env {
         (view.value, view.quality)
     }
 
+    /// タグの現在の標本の `ptime_ms`（最後の試行＝tick の時刻。Bad でも進む）。
+    /// 収集の 1 tick は現在値の更新と tstore の 1 行を同じ `ptime_ms` で行う
+    /// （`banto_collect::task::record_ticks`）ので、稼働中の tick の数え方になる。
+    fn current_ptime(&self, tag_id: i64) -> Option<i64> {
+        self.manager
+            .current_values()
+            .as_ref()?
+            .get(&format!("tag:{tag_id}"))
+            .map(|sample| sample.ptime_ms)
+    }
+
+    /// `from_ms` 以上の異なる tick を `n` 個観測するまで待つ（上限 10 秒）。時間で
+    /// 待つと CI の負荷で tick が足りない（#957）。観測が tick を取りこぼしても、
+    /// 観測数は実際の行数以下なので、行数の下限として正しい。
+    async fn wait_ticks(&self, tag_id: i64, from_ms: i64, n: usize) {
+        let mut seen = std::collections::BTreeSet::new();
+        let reached = wait_until(Duration::from_secs(10), || {
+            if let Some(ptime) = self.current_ptime(tag_id).filter(|p| *p >= from_ms) {
+                seen.insert(ptime);
+            }
+            seen.len() >= n
+        })
+        .await;
+        assert!(
+            reached,
+            "tag {tag_id}: expected {n} ticks since {from_ms}, observed {seen:?}"
+        );
+    }
+
     async fn wait_current(&self, tag_id: i64, expected: (Option<f64>, Quality)) {
         let reached = wait_until(Duration::from_secs(5), || self.current(tag_id) == expected).await;
         assert!(
@@ -733,7 +762,8 @@ async fn values_are_recorded_every_cycle_stale_records_null_and_stop_gives_bad()
     env.wait_current(level, (Some(7.0), Quality::Stale)).await;
     assert_eq!(env.current(empty), BAD);
     let since = env.now_ms();
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // 時間で待たず観測の数で待つ（#957）。
+    env.wait_ticks(temp, since, 4).await;
     let until = env.now_ms();
 
     env.stop().await;
@@ -855,7 +885,9 @@ async fn a_good_value_before_a_stop_is_not_good_after_the_restart() {
     // 開始の直後（最初の tick はタスクの起動と同時）から Bad。ping は続いている。
     assert_eq!(env.current(general_tag), BAD);
     assert_eq!(env.current(bridge_tag), BAD);
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // 時間で待たず観測の数で待つ（#957）。
+    env.wait_ticks(general_tag, restart_ms, 3).await;
+    env.wait_ticks(bridge_tag, restart_ms, 3).await;
     assert_eq!(env.current(general_tag), BAD);
     assert_eq!(env.current(bridge_tag), BAD);
     env.stop().await;
@@ -892,7 +924,8 @@ async fn a_general_senders_values_received_while_stopped_are_good_right_after_st
     let start_ms = env.now_ms();
     env.start().await;
     env.wait_current(temp, good(3.0)).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // 時間で待たず観測の数で待つ（#957）。
+    env.wait_ticks(temp, start_ms, 3).await;
     env.stop().await;
 
     let rows: Vec<_> = env
