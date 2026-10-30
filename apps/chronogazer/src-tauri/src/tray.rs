@@ -19,7 +19,9 @@
 //!   2 つ目の起動の引数で受け、確認ダイアログを出さずに「終了」と同じ終了処理を通す
 //!   （[`request_quit_for_update`]。窓は開かない）。`taskkill /F` では最終 flush と
 //!   `collection_stopped` を失うため。判断は状態機械の表の「インストーラからの終了の要求」
-//!   の行（復旧中は断る・終了処理中は何もしない）。
+//!   の行（DB の復旧中は復旧が終わるまで保留し、終わった時点で状態機械が同じ終了処理を
+//!   走らせる・終了処理中は何もしない）。シェル側の最悪の終了時間は
+//!   `lifecycle::QUIT_FOR_UPDATE_WORST_CASE`（インストーラの待ちの上限はこれに合わせる）。
 //!
 //! 窓の前面化・× で隠す・初回通知・確認ダイアログ・終了の二重実行防止は
 //! banto-hub と共有する `banto-desktop-tray`（`crates/`）の部品を使う。
@@ -119,7 +121,9 @@ use tauri::tray::{TrayIcon, TrayIconBuilder};
 use tauri::{AppHandle, Manager, Wry};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 
-use crate::lifecycle::{QuitAnswerOutcome, QuitForUpdateOutcome, QuitRequestOutcome};
+use crate::lifecycle::{
+    DeferredQuitForUpdate, QuitAnswerOutcome, QuitForUpdateOutcome, QuitRequestOutcome,
+};
 use crate::shell::{FALLBACK_WINDOW_LABEL, SERVICE_WINDOW_LABEL};
 use crate::startup::RECOVERY_WINDOW_LABEL;
 use crate::{AppState, ExitCleanupReport, ExitTrigger, LEGACY_DB_WINDOW_LABEL, MAIN_WINDOW_LABEL};
@@ -541,29 +545,61 @@ pub(crate) fn request_quit(app: &AppHandle) {
 
 /// インストーラからの終了の要求（#392 B3-4。`run()` の single-instance のコールバックから、
 /// `--quit-for-update` を受けたとき）。確認を出さずに [`quit`]（「終了」と同じ後始末）へ
-/// 進む。復旧中は断り（ダイアログは出さず記録だけ。インストーラは上限まで待つ）、終了処理が
-/// 走っていれば何もしない。どの態（Desktop・Service・Fallback）でも同じ。デスクトップの
-/// ログに 1 行残す（運用モードの間は `logs\` に書けないので標準エラー出力に落ちる）。
+/// 進む。DB の復旧中は、復旧が終わるまで保留する（ダイアログは出さず記録だけ。復旧の札が
+/// 返った時点で状態機械が終了を確定し、預けた [`quit`] を走らせる - 成功でも失敗でも）。
+/// 終了処理が走っていれば何もしない。どの態（Desktop・Service・Fallback）でも同じ。
+/// デスクトップのログに 1 行残す（運用モードの間は `logs\` に書けないので標準エラー出力に
+/// 落ちる）。保留したときは、実行するときにも 1 行。
 pub(crate) fn request_quit_for_update(app: &AppHandle) {
     let Some(lifecycle) = crate::shell::lifecycle(app) else {
         return;
     };
     note_quit_for_update(
         app,
-        "インストーラからの終了の要求を受けました（--quit-for-update）",
+        &format!(
+            "インストーラからの終了の要求を受けました（--quit-for-update。終了処理は最長 {} 秒）",
+            crate::lifecycle::QUIT_FOR_UPDATE_WORST_CASE.as_secs()
+        ),
     );
-    let admission = CollectorQuitAdmission(
-        app.try_state::<AppState>()
-            .map(|state| state.services.collect.clone()),
-    );
-    match lifecycle.request_quit_for_update(&admission) {
+    let admission = collector_quit_admission(app);
+    let deferred = DeferredQuitForUpdate {
+        // 復旧の後の起動でエンジン（`AppState`）が置かれるので、受付の口は確定する時点に
+        // 作る。`try_state` は即時の読み取りだけ（状態機械のロックの中で呼ばれる）。
+        admission: {
+            let app = app.clone();
+            Box::new(move || Box::new(collector_quit_admission(&app)))
+        },
+        run: {
+            let app = app.clone();
+            Box::new(move || {
+                note_quit_for_update(
+                    &app,
+                    "データベースの復旧が終わったので、保留していたインストーラからの終了の要求を実行します",
+                );
+                quit(app.clone());
+            })
+        },
+    };
+    match lifecycle.request_quit_for_update(&admission, deferred) {
         QuitForUpdateOutcome::Proceed => quit(app.clone()),
-        QuitForUpdateOutcome::RecoveryInProgress => note_quit_for_update(
+        QuitForUpdateOutcome::Deferred => note_quit_for_update(
             app,
-            "データベースの復旧の途中のため、インストーラからの終了の要求を断りました",
+            "データベースの復旧の途中のため、復旧が終わるまで終了を保留します",
+        ),
+        QuitForUpdateOutcome::AlreadyDeferred => note_quit_for_update(
+            app,
+            "インストーラからの終了の要求は既に保留しています（復旧が終わるまで待ちます）",
         ),
         QuitForUpdateOutcome::AlreadyQuitting => {}
     }
+}
+
+/// 今の収集の受付の口（`AppState` が無ければ止める収集も無い）。
+fn collector_quit_admission(app: &AppHandle) -> CollectorQuitAdmission {
+    CollectorQuitAdmission(
+        app.try_state::<AppState>()
+            .map(|state| state.services.collect.clone()),
+    )
 }
 
 /// インストーラからの終了の要求の記録（デスクトップのログと標準エラー出力）。
