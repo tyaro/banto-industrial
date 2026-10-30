@@ -270,7 +270,10 @@ async fn test_app_with(label: &str, revalidation: Option<StreamRevalidationTimin
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -442,7 +445,7 @@ async fn issue_key(
     )
 }
 
-/// タグ・グループ・接続を1本作って rebuild まで済ませ、`(tag_id,
+/// タグ・グループ・接続を1本作って catalog の commit と反映まで済ませ、`(tag_id,
 /// external_name)` を返す共通フィクスチャ(`tests/write.rs`の`make_tag`と
 /// 同型 - SLMP 固定でよい、gRPC 自体はプロトコルを意識しない)。
 #[allow(clippy::too_many_arguments)]
@@ -470,7 +473,10 @@ async fn make_tag(
         ))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply");
     (tag.id, format!("{conn_name}.fast.{tag_name}"))
 }
 
@@ -992,7 +998,10 @@ async fn stream_values_wildcard_picks_up_a_tag_added_after_config_changed() {
         .create(group_input("fast", conn.id, 100))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild (no tags yet)");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply (no tags yet)");
 
     let (key, _id) = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
     let (_port, mut client) = start_grpc_and_connect(&app.grpc_server).await;
@@ -1022,10 +1031,10 @@ async fn stream_values_wildcard_picks_up_a_tag_added_after_config_changed() {
         .create(tag_input("temp02", group.id, "D200", "u16", false, true))
         .await
         .unwrap();
-    app.manager
-        .rebuild()
+    app.controller
+        .commit_catalog_and_apply_live()
         .await
-        .expect("rebuild after adding tag");
+        .expect("apply after adding tag");
 
     let appeared: ValueBatch = tokio::time::timeout(Duration::from_secs(3), stream.message())
         .await
@@ -1630,7 +1639,7 @@ async fn grpc_apply_with_invalid_bind_does_not_crash_and_leaves_port_unbound() {
 
 /// このセクション共通のフィクスチャ: `line1.fast.temp01`(tag:1)・
 /// `line2.slow.press01`(tag:2)を、同一シミュレータの別アドレスに割り当てて
-/// 別接続・別グループで作り rebuild する。`make_tag`はグループ名を
+/// 別接続・別グループで作り catalog を commit して反映する。`make_tag`はグループ名を
 /// `"fast"`固定で作るため2回呼ぶとグループ名の `UNIQUE` 制約に衝突する -
 /// ここでは`slmp_conn_input`/`group_input`/`tag_input`を直接使い、2本目の
 /// グループ名を`"slow"`にして衝突を避ける(`make_tag`自体は既存の呼び出し元
@@ -1663,7 +1672,10 @@ async fn seed_two_connections_two_tags(app: &TestApp, sim_port: u16) -> (String,
         .await
         .unwrap();
 
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
     (
         "line1.fast.temp01".to_string(),
         "line2.slow.press01".to_string(),

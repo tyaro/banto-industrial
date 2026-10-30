@@ -241,7 +241,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -370,7 +373,7 @@ async fn issue_key(router: &Router, admin_token: &str, name: &str, scopes: &[&st
     body["key"].as_str().unwrap().to_string()
 }
 
-/// タグ・グループ・接続を1本作って rebuild まで済ませ、`(connection_id,
+/// タグ・グループ・接続を1本作って catalog の commit と反映まで済ませ、`(connection_id,
 /// external_name)` を返す共通フィクスチャ。
 async fn make_writable_tag(app: &TestApp, port: u16) -> (i64, String) {
     let conn = PlcConnectionService::new(app.pool.clone())
@@ -385,7 +388,10 @@ async fn make_writable_tag(app: &TestApp, port: u16) -> (i64, String) {
         .create(tag_input("temp01", group.id, "D100", "u16", true, true))
         .await
         .unwrap();
-    app.manager.rebuild().await.expect("rebuild");
+    app.controller
+        .commit_catalog_and_apply_live()
+        .await
+        .expect("apply after seeding");
     (conn.id, "line1.fast.temp01".to_string())
 }
 
@@ -414,7 +420,7 @@ async fn write_after_session_stop_and_join_fails_closed_without_spawning_a_new_s
             app.sessions.connection_count() == 1
         })
         .await,
-        "rebuild should have established exactly one broker session"
+        "the running collection should have established exactly one broker session"
     );
     assert!(
         wait_until(Duration::from_secs(10), || async {
