@@ -332,7 +332,10 @@ async fn test_app() -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -529,7 +532,14 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
         })
         .await
         .expect("db tag");
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     (connection.id, tag.id, "erp.q1.a".to_string())
 }
 

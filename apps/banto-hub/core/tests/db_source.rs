@@ -304,7 +304,10 @@ async fn test_app(label: &str) -> TestApp {
         sim_registry,
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
 
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
@@ -491,9 +494,9 @@ async fn stop_collection(app: &TestApp) {
 }
 
 /// レジストリを直接叩いて「接続1つ + グループ1つ + タグ N 本」を作り、
-/// rebuild する（REST 経由の登録は S3 の UI が来るまで使わない）。
+/// catalog を commit する（REST 経由の登録は S3 の UI が来るまで使わない）。
 ///
-/// **rebuild するだけで収集は開始しない** - S2b 以降、値を待つテストは
+/// **catalog を commit するだけで収集は開始しない** - S2b 以降、値を待つテストは
 /// この後に [`start_collection`] を呼ぶ必要がある（停止中は DB へ繋がない）。
 async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&str]) -> i64 {
     let conn = PlcConnectionService::new(app.pool.clone())
@@ -510,7 +513,14 @@ async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&st
             .await
             .unwrap_or_else(|e| panic!("db tag {column} should be created: {e:?}"));
     }
-    app.manager.rebuild().await.expect("rebuild after seeding");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     group.id
 }
 
@@ -1032,7 +1042,7 @@ async fn the_db_source_runs_only_while_collection_is_running() {
     let external = format!("{S2B_CONNECTION_NAME}.q1.a");
 
     // --- (a) 停止中: 1本も繋がない・状態は stopped・タグは Bad -------------
-    // 数周期ぶん待っても接続が増えないことを確かめる（`seed` は rebuild
+    // 数周期ぶん待っても接続が増えないことを確かめる（`seed` は catalog の commit
     // まで済ませているので、S2 の挙動ならここで既に繋ぎに行っている）。
     tokio::time::sleep(Duration::from_millis(PERIOD_MS as u64 * 4)).await;
     assert_eq!(

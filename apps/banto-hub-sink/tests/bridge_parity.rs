@@ -404,7 +404,10 @@ async fn test_app() -> TestApp {
         Arc::new(BrokerSimRegistry::new()),
         computed,
     ));
-    manager.rebuild().await.expect("initial rebuild");
+    manager
+        .commit_catalog(&banto_collect::RegistrySnapshot::load(&pool).await.unwrap())
+        .await
+        .expect("initial catalog commit");
     let (events_tx, _rx) = broadcast::channel(16);
     let write_control = Arc::new(WriteControl::new(false));
     write_control.enable();
@@ -998,7 +1001,14 @@ impl Fixture {
                 .expect("push tag");
             push_tag_ids.insert(column.name.to_string(), tag.id);
         }
-        app.manager.rebuild().await.expect("rebuild");
+        app.manager
+            .commit_catalog(
+                &banto_collect::RegistrySnapshot::load(&app.pool)
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .expect("catalog commit after seeding");
         let api_key = issue_key(
             &app,
             "bridge",
@@ -1956,7 +1966,14 @@ async fn parity_9_three_queries_at_the_registration_limit() {
                 .expect("db tag");
         }
     }
-    app.manager.rebuild().await.expect("rebuild");
+    app.manager
+        .commit_catalog(
+            &banto_collect::RegistrySnapshot::load(&app.pool)
+                .await
+                .unwrap(),
+        )
+        .await
+        .expect("catalog commit after seeding");
     let api_key = issue_key(
         &app,
         "bridge-limit",

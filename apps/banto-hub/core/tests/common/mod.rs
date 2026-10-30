@@ -63,7 +63,7 @@
 //! The measurements above used a bare `SqlitePool` with a handful of short
 //! lived clones - close to worst case for the OS-level release lag, but
 //! every clone was actually returned to the pool before `drop` ran. A real
-//! `TestApp` is different: `CollectorManager::rebuild()` spawns a
+//! `TestApp` is different: starting collection (`CollectionController::start`)
 //! **long-lived background task per PLC connection**
 //! (`banto_collect::Collector`), and each of those tasks holds its own
 //! `SqlitePool` connection checked out **for as long as the task keeps
