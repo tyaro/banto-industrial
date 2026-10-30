@@ -42,7 +42,10 @@
 //!
 //! 5 は 2 つの Source が別々に問い合わせるので「同じ瞬間に同じ」ではなく「同じ状態の並びを
 //! 通る」ことを確かめる（§10.4 の注）: [`Recorder`] が両方のタグを 10 ms ごとに読み、
-//! 変わったときだけ控えた並びを比べる。4・7・8 も同じ並びで確かめる。
+//! 変わったときだけ控えた並びを比べる。4・7・8 も同じ並びで確かめる。最初の読みは
+//! [`Recorder`] を作る中で済ませ、途中の Bad は次の段へ進む前に並びに入ったことを待つ
+//! （[`Recorder::wait_recorded`]）: CPU が詰まると読みのタスクが遅れ、場面の段の方が先に
+//! 進んで状態が並びから抜ける（#948）。
 //!
 //! ## 周期
 //!
@@ -60,11 +63,11 @@
 //! 読むときに Stale と導く。これは製品として正しい表示だが、この試験が見たいのはブリッジが
 //! 送る品質なので、ブリッジのタグの `stale` のうち、収集の現在値に**保存された品質が Good**
 //! のもの（[`is_derived_stale`]）だけを外す: 並びでは控えず
-//! （[`Fixture::record_ignoring_derived_stale`]。4・5・6・8）、負の条件では保存されている
-//! Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。7c）。ブリッジが送る `stale`
-//! （クエリの失敗の 1 回目）は保存も `stale` なので、読むまでにどれだけ遅れても今までどおり
-//! 捕まえる（値の時刻からの経過では、tick の遅れでブリッジの `stale` の読みも遅れると区別
-//! できない。#947 のレビュー）。経過は落とすときのメッセージに載せるだけ。
+//! （[`Fixture::record_ignoring_derived_stale`]。4・5・6・7・8。7 は #948）、負の条件では
+//! 保存されている Good とみなす（[`Fixture::bridge_ignoring_derived_stale`]。7c）。ブリッジが
+//! 送る `stale`（クエリの失敗の 1 回目）は保存も `stale` なので、読むまでにどれだけ遅れても
+//! 今までどおり捕まえる（値の時刻からの経過では、tick の遅れでブリッジの `stale` の読みも
+//! 遅れると区別できない。#947 のレビュー）。経過は落とすときのメッセージに載せるだけ。
 //!
 //! 読みと保存の品質は、どちらも Hub の読み取りの共通処理
 //! `banto_hub_core::hub::read_current_view_with_stored`（`read_current` と同じ有効化・値の
@@ -105,8 +108,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -783,9 +786,17 @@ fn ignoring_derived_stale(aged: Aged) -> Reading {
 }
 
 /// タグの状態の並び（変わったときだけ控える）を 10 ms ごとに読んで集める。
+///
+/// 最初の 1 回は [`Self::start`] の中で読む（#948）: 読みを `tokio::spawn` のタスクに
+/// 任せると、CPU が詰まったときにタスクが最初に動く前に場面が次の段へ進み（収集の停止
+/// など）、場面の始めの状態が並びから抜ける。途中の状態も、場面が次の段へ進む前に
+/// [`Self::wait_recorded`] で並びに入ったことを待てる（10 ms ごとの読みも詰まると遅れる）。
 struct Recorder {
     stop: Arc<AtomicBool>,
-    task: tokio::task::JoinHandle<Vec<Vec<Reading>>>,
+    sequences: Arc<Mutex<Vec<Vec<Reading>>>>,
+    /// 続けた 2 回の読みの間の最長（ms）。落ちたときの出力に載せる（[`Self::finish`]）。
+    max_gap_ms: Arc<AtomicU64>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 impl Recorder {
@@ -797,30 +808,65 @@ impl Recorder {
         externals: Vec<String>,
         skip_derived_stale: Option<usize>,
     ) -> Self {
+        let count = externals.len();
+        let sample = move |sequences: &Mutex<Vec<Vec<Reading>>>| {
+            let mut sequences = sequences.lock().expect("recorder lock");
+            for (index, (sequence, external)) in sequences.iter_mut().zip(&externals).enumerate() {
+                let aged = read_tag_aged(&manager, external);
+                if skip_derived_stale == Some(index) && is_derived_stale(&aged) {
+                    continue;
+                }
+                let reading = aged.reading;
+                if sequence.last() != Some(&reading) {
+                    sequence.push(reading);
+                }
+            }
+        };
         let stop = Arc::new(AtomicBool::new(false));
+        let sequences = Arc::new(Mutex::new(vec![Vec::new(); count]));
+        // 最初の読みは戻る前に済ませる（この型の doc）。
+        sample(&sequences);
         let flag = stop.clone();
+        let shared = sequences.clone();
+        let max_gap_ms = Arc::new(AtomicU64::new(0));
+        let gap = max_gap_ms.clone();
         let task = tokio::spawn(async move {
-            let mut sequences: Vec<Vec<Reading>> = vec![Vec::new(); externals.len()];
+            let mut last = std::time::Instant::now();
             loop {
-                for (index, (sequence, external)) in
-                    sequences.iter_mut().zip(&externals).enumerate()
-                {
-                    let aged = read_tag_aged(&manager, external);
-                    if skip_derived_stale == Some(index) && is_derived_stale(&aged) {
-                        continue;
-                    }
-                    let reading = aged.reading;
-                    if sequence.last() != Some(&reading) {
-                        sequence.push(reading);
-                    }
-                }
-                if flag.load(Ordering::SeqCst) {
-                    return sequences;
-                }
                 tokio::time::sleep(Duration::from_millis(10)).await;
+                sample(&shared);
+                let now = std::time::Instant::now();
+                gap.fetch_max((now - last).as_millis() as u64, Ordering::SeqCst);
+                last = now;
+                if flag.load(Ordering::SeqCst) {
+                    return;
+                }
             }
         });
-        Self { stop, task }
+        Self {
+            stop,
+            sequences,
+            max_gap_ms,
+            task,
+        }
+    }
+
+    /// 全部の並びの最後が `reading` になるまで待つ（ならなければ落とす）。場面の途中の
+    /// 状態を、次の段へ進む前に並びに入れるため（この型の doc）。並びの中身は変えない。
+    async fn wait_recorded(&self, reading: Reading) {
+        let recorded = wait_until(WAIT, || async {
+            self.sequences
+                .lock()
+                .expect("recorder lock")
+                .iter()
+                .all(|sequence| sequence.last() == Some(&reading))
+        })
+        .await;
+        assert!(
+            recorded,
+            "the recorder did not record {reading:?}: {:?}",
+            self.sequences.lock().expect("recorder lock")
+        );
     }
 
     async fn finish(self) -> Vec<Vec<Reading>> {
@@ -828,7 +874,13 @@ impl Recorder {
         tokio::time::timeout(WAIT, self.task)
             .await
             .expect("the recorder ends")
-            .expect("the recorder does not panic")
+            .expect("the recorder does not panic");
+        // 落ちたときだけ試験の出力に出る（読みが詰まって状態を取り逃したかの手がかり）。
+        eprintln!(
+            "recorder: the longest gap between reads was {} ms",
+            self.max_gap_ms.load(Ordering::SeqCst)
+        );
+        std::mem::take(&mut *self.sequences.lock().expect("recorder lock"))
     }
 }
 
@@ -1049,18 +1101,10 @@ impl Fixture {
         );
     }
 
-    /// 列 `column` の (Hub 内の Source, ブリッジ) の並びを控え始める。
-    fn record(&self, column: &str) -> Recorder {
-        Recorder::start(
-            self.app.manager.clone(),
-            vec![Self::db_external(column), self.push_external(column)],
-            None,
-        )
-    }
-
-    /// [`Self::record`] で、ブリッジのタグだけ、読むときに導かれた Stale（tick の遅れ。
-    /// [`is_derived_stale`]）を控えない（#946。モジュールの doc）。Hub 内の Source のタグは
-    /// 厳密なまま（周期 1,000 ms なので導くのは 2,500 ms の遅れから）。
+    /// 列 `column` の (Hub 内の Source, ブリッジ) の並びを控え始める。ブリッジのタグだけ、
+    /// 読むときに導かれた Stale（tick の遅れ。[`is_derived_stale`]）を控えない（#946。
+    /// モジュールの doc）。Hub 内の Source のタグは厳密なまま（周期 1,000 ms なので導くのは
+    /// 2,500 ms の遅れから）。
     fn record_ignoring_derived_stale(&self, column: &str) -> Recorder {
         Recorder::start(
             self.app.manager.clone(),
@@ -1069,22 +1113,10 @@ impl Fixture {
         )
     }
 
-    /// `duration` の間 50 ms ごとに読み、`check` が一度でも偽なら落とす（負の条件）。落とす
-    /// ときは、全列の (Hub 内の Source, ブリッジ) を経過（ms）付きで載せる。
-    async fn hold(&self, duration: Duration, what: &str, check: impl Fn(&Self) -> bool) {
-        let deadline = tokio::time::Instant::now() + duration;
-        while tokio::time::Instant::now() < deadline {
-            assert!(
-                check(self),
-                "{what}: (reading, stored_quality, age_ms) {:?}",
-                self.pairs_aged()
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-    }
-
-    /// [`Self::hold`] に加えて、ブリッジのタグ `column` の更新が止まっていないことを、`hold` の
-    /// 全体で確かめる（モジュールの doc の #946 の節）。50 ms ごとに観測し、基準は 1 つ:
+    /// `duration` の間 50 ms ごとに読み、`check` が一度でも偽なら落とす（負の条件。落とす
+    /// ときは、全列の (Hub 内の Source, ブリッジ) を経過（ms）付きで載せる）。それに加えて、
+    /// ブリッジのタグ `column` の更新が止まっていないことを、`hold` の全体で確かめる
+    /// （モジュールの doc の #946 の節）。50 ms ごとに観測し、基準は 1 つ:
     /// **値の時刻（`ptime_ms`）からの経過 `age_ms`** が [`MAX_UPDATE_GAP`] 以下であること。
     /// 更新が止まれば `age_ms` は伸び続けるので、`hold` の開始前から止まっていた時間も
     /// 最初の観測から数えられる。`ptime_ms` が進んだ観測は、その更新が正しい（保存が Good で
@@ -1118,6 +1150,51 @@ impl Fixture {
                 check(self),
                 "{what}: (reading, stored_quality, age_ms) {:?}",
                 self.pairs_aged()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// 50 ms ごとに読み、`check` が一度でも偽なら落とす（負の条件。落とすときは全列の
+    /// (Hub 内の Source, ブリッジ) を経過（ms）付きで載せる）。これを `duration` 以上続け、
+    /// さらにブリッジのタグ `column` の値の時刻（`ptime_ms`。収集の現在値に保存された標本の
+    /// 時刻）が `since_ms` 以降で `ticks` 通り観測されるまで続ける（#948。上限は `duration` + [`WAIT`]）。CPU が詰まると `push` の
+    /// グループの tick が遅れ、決めた時間の中に tick が足りない（tstore の行が足りない）ので、
+    /// 時間ではなく観測した tick の数で終わりを決める。観測の間も `check` は 50 ms ごとに
+    /// 確かめ続ける（負の条件は緩めない）。標本が無いときの `ptime_ms` は読んだ時刻なので
+    /// 数えない。
+    async fn hold_for_ticks(
+        &self,
+        duration: Duration,
+        ticks: usize,
+        since_ms: i64,
+        what: &str,
+        column: &str,
+        check: impl Fn(&Self) -> bool,
+    ) {
+        let start = tokio::time::Instant::now();
+        let mut seen: Vec<i64> = Vec::new();
+        loop {
+            let aged = read_tag_aged(&self.app.manager, &self.push_external(column));
+            if aged.stored_quality.is_some()
+                && aged.ptime_ms >= since_ms
+                && seen.last() != Some(&aged.ptime_ms)
+            {
+                seen.push(aged.ptime_ms);
+            }
+            assert!(
+                check(self),
+                "{what}: (reading, stored_quality, age_ms) {:?}",
+                self.pairs_aged()
+            );
+            let held = start.elapsed();
+            if held >= duration && seen.len() >= ticks {
+                return;
+            }
+            assert!(
+                held < duration + WAIT,
+                "{what}: only {} ticks of `{column}` since {since_ms} were observed in {held:?}: {seen:?}",
+                seen.len()
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -1328,6 +1405,7 @@ async fn parity_4_zero_rows_are_bad() {
         .exec(&format!("DELETE FROM \"{}\"", fixture.table))
         .await;
     fixture.settle(&[("a", BAD)]).await;
+    recorder.wait_recorded(BAD).await;
     fixture
         .exec(&format!("INSERT INTO \"{}\" VALUES (4.5)", fixture.table))
         .await;
@@ -1364,6 +1442,7 @@ async fn parity_5_query_failure_walks_the_same_ladder() {
         .exec(&format!("DROP TABLE \"{}\"", fixture.table))
         .await;
     fixture.settle(&[("a", BAD)]).await;
+    recorder.wait_recorded(BAD).await;
     // 表を戻す（同じ名前・同じ列。ロールに読み取りを与え直す）。
     fixture
         .exec(&format!("CREATE TABLE \"{}\" (a float8)", fixture.table))
@@ -1382,8 +1461,10 @@ async fn parity_5_query_failure_walks_the_same_ladder() {
     let expected = vec![good(7.25), stale(7.25), BAD, good(8.5)];
     assert_eq!(sequences[0], expected, "Hub DB Source");
     assert_eq!(
-        sequences[1], sequences[0],
-        "the bridge must walk the same ladder as the Hub DB Source"
+        sequences[1],
+        sequences[0],
+        "the bridge must walk the same ladder as the Hub DB Source / bridge {:?}",
+        fixture.bridge.as_ref().map(|b| b.statuses())
     );
     fixture.finish().await;
 }
@@ -1416,6 +1497,7 @@ async fn parity_6_db_outage_is_bad_and_recovers() {
     fixture.role.set_login(&fixture.admin, false).await;
     fixture.role.terminate_sessions(&fixture.admin).await;
     fixture.settle(&[("a", BAD)]).await;
+    recorder.wait_recorded(BAD).await;
     fixture
         .exec(&format!("UPDATE \"{}\" SET a = 6.5", fixture.table))
         .await;
@@ -1440,7 +1522,9 @@ async fn parity_6_db_outage_is_bad_and_recovers() {
 /// 7: 収集の停止で両方とも Bad。開始の直後の最初の tick は Bad で、停止前の Good を記録
 /// しない。新しい問い合わせの後で Good（止めている間に変えた値）。並びは両方とも
 /// 「停止前の値 → Bad → 新しい値」で、開始の後に停止前の値が一度も出ない。tstore にも
-/// 開始の後の停止前の値の行が無い（ブリッジのタグ）。
+/// 開始の後の停止前の値の行が無い（ブリッジのタグ）。ブリッジのタグは、読むときに導かれた
+/// Stale だけを控えない（#948。開始の後の tick の遅れが `stale(12.5)` を作る。4・5・6・8 と
+/// 同じ）。開始の後に保存が Good の停止前の値が戻れば、tstore の行の確かめで落ちる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_7_stop_and_start_never_revive_the_old_value() {
     let target = require_pg!();
@@ -1455,9 +1539,10 @@ async fn parity_7_stop_and_start_never_revive_the_old_value() {
     )
     .await;
     fixture.settle(&[("a", good(11.5))]).await;
-    let recorder = fixture.record("a");
+    let recorder = fixture.record_ignoring_derived_stale("a");
     collection(&fixture.app, "stop").await;
     fixture.settle(&[("a", BAD)]).await;
+    recorder.wait_recorded(BAD).await;
     fixture
         .exec(&format!("UPDATE \"{}\" SET a = 12.5", fixture.table))
         .await;
@@ -1512,16 +1597,25 @@ async fn parity_7b_start_with_the_db_down_stays_bad() {
     let restart_ms = now_ms();
     collection(&fixture.app, "start").await;
     // `stale_timeout_ms`（3 秒）を超えて見続ける: ブリッジの `ping`（1 秒ごと）で Live の
-    // まま、値は Bad のまま。
+    // まま、値は Bad のまま。下の tstore の確かめ（開始の後の行が 10 以上）の分の tick を
+    // 観測するまで続ける（#948）。
     fixture
-        .hold(
+        .hold_for_ticks(
             Duration::from_millis(STALE_TIMEOUT_MS + 1_500),
+            10,
+            restart_ms,
             "the bridge tag must stay Bad while the DB is down",
+            "a",
             |f| f.pair("a").1 == BAD,
         )
         .await;
     let status = fixture.ingest_status();
-    assert!(status.live, "the bridge keeps pinging: {status:?}");
+    assert!(
+        status.live,
+        "the bridge keeps pinging: {status:?} (restart_ms {restart_ms}, now_ms {}) / bridge {:?}",
+        now_ms(),
+        fixture.bridge.as_ref().map(|b| b.statuses())
+    );
     assert!(
         status
             .last_seen_ms
@@ -1954,7 +2048,7 @@ async fn parity_9_three_queries_at_the_registration_limit() {
     admin.close().await;
 }
 
-/// 7c の `hold` と 4・5・6・8 の並びが外すのは、読むときに導かれた Stale（保存は Good）だけ
+/// 7c の `hold` と 4・5・6・7・8 の並びが外すのは、読むときに導かれた Stale（保存は Good）だけ
 /// （#946・#947 のレビュー）。ブリッジが送った `stale`（保存も `stale`）は、経過がどれだけ長く
 /// ても外さない。Bad も外さない。
 #[test]
