@@ -217,7 +217,20 @@ describe('hostInfo（この画面から変えられるか）', () => {
 		['server', '[::1]', true],
 		// LAN の IP で開いた画面は LAN の listener 経由。
 		['server', '192.0.2.10', false],
-		['server', '127.0.0.2', false],
+		['server', '127.0.0.2', true],
+		['server', '127.255.255.254', true],
+		['server', '[::ffff:7f00:2]', true],
+		['server', '[::ffff:7f00:1]', true],
+		['server', '[::ffff:7fff:ffff]', true],
+		// ブラウザの正規化では出ない形（ドット付きの対応づけ）は受けない。
+		['server', '[::ffff:127.0.0.2]', false],
+		['server', '[::ffff:c000:20a]', false],
+		['server', '[::2]', false],
+		['server', '127.0.0.1.example', false],
+		['server', 'localhost.example', false],
+		['server', '127.0.0.256', false],
+		['server', '0127.0.0.1', false],
+		['server', '128.0.0.1', false],
 		['server', 'chronogazer.example', false],
 		// デスクトップ・banto-serve は REST の変更を受けない。
 		['desktop', '127.0.0.1', false],
