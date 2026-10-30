@@ -909,6 +909,14 @@ jobs:
           if (-not (Select-String -Path $modbusHubLog -Pattern '^test result: ok\. 10 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'Modbus Hub join tests did not all run'
           }
+          # #695: WASM の接続はシミュレーションのとき実ホストへ一度も接続・送信しない
+          # （t12_wasm_all_simulation。同じ Modbus component を使う）。
+          $wasmAllSimLog = Join-Path $env:RUNNER_TEMP 'wasm-all-simulation-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test wasm_all_simulation_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $wasmAllSimLog
+          if ($LASTEXITCODE -ne 0) { throw 'WASM all-simulation Hub tests failed' }
+          if (-not (Select-String -Path $wasmAllSimLog -Pattern '^test result: ok\. 4 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'WASM all-simulation Hub tests did not all run'
+          }
 
   # #ci-speed（2026-10-19）: `rust-test-build` のアーカイブを 3 台にシャーディングして
   # 走らせる。ビルドはしない（Rust ツールチェーンも rust-cache も使わない）。

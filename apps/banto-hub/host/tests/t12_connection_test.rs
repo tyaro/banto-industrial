@@ -45,10 +45,11 @@ use banto_hub_core::audit::AuditLogService;
 use banto_hub_core::broker_glue::{BrokerSimRegistry, HubSessions};
 use banto_hub_core::commissioning::CommissioningService;
 use banto_hub_core::computed::{ComputedEngine, ServerTagStore};
+use banto_hub_core::controller::CollectionController;
 use banto_hub_core::db::init_db;
 use banto_hub_core::grpc::{GrpcServer, GrpcService};
 use banto_hub_core::hub::CollectorManager;
-use banto_hub_core::rest::api_router;
+use banto_hub_core::rest::{api_router, api_router_with_controller};
 use banto_hub_core::settings::SettingsService;
 use banto_hub_core::users::{Role, UsersService};
 use banto_hub_core::write_audit::WriteAuditService;
@@ -225,6 +226,10 @@ struct TestApp {
     /// endpoint's broker-reuse path does not dial a second session.
     sessions: Arc<HubSessions>,
     write_control: Arc<WriteControl>,
+    /// 全シミュレーション運転を始めるための収集コントローラー。`Some` なのは
+    /// [`test_app_with_sim_controller`] だけ（そのときルーターも同じコントローラーの
+    /// 本番構成になる）。それ以外は従来どおり互換ルーターで、`None`。
+    controller: Option<Arc<CollectionController>>,
     _env: TempEnv,
 }
 
@@ -313,6 +318,22 @@ async fn test_app_with_operational_write_manifest(
     .await
 }
 
+/// [test_app_with_operational_write_manifest] と同じ WASM の登録で、ルーターを
+/// 本番構成（`api_router_with_controller`）にして収集コントローラーを返す。
+/// 全シミュレーション運転（#695）の試験用。
+async fn test_app_with_sim_controller(label: &str, manifest: &[u8], component: &[u8]) -> TestApp {
+    test_app_with_drivers_and_options(
+        label,
+        false,
+        Some(WasmFixture::OperationalWriteSimController {
+            manifest,
+            component,
+        }),
+        fast_options(),
+    )
+    .await
+}
+
 async fn test_app_with_controlled_r_test_manifest(
     label: &str,
     manifest: &[u8],
@@ -354,6 +375,11 @@ enum WasmFixture<'a> {
         manifest: &'a [u8],
         component: &'a [u8],
     },
+    /// [WasmFixture::OperationalWrite] と同じ登録＋本番構成のルーター。
+    OperationalWriteSimController {
+        manifest: &'a [u8],
+        component: &'a [u8],
+    },
 }
 
 async fn test_app_with_drivers(
@@ -372,6 +398,10 @@ async fn test_app_with_drivers_and_options(
     options: CollectorOptions,
 ) -> TestApp {
     let controlled_r_test = matches!(&wasm_component, Some(WasmFixture::ControlledRTest { .. }));
+    let with_sim_controller = matches!(
+        &wasm_component,
+        Some(WasmFixture::OperationalWriteSimController { .. })
+    );
     let env = TempEnv::new(TEMP_ENV_PREFIX, label);
     let pool = init_db(env.registry_path()).await.expect("init_db");
 
@@ -440,6 +470,10 @@ async fn test_app_with_drivers_and_options(
             WasmFixture::OperationalWrite {
                 manifest,
                 component,
+            }
+            | WasmFixture::OperationalWriteSimController {
+                manifest,
+                component,
             } => {
                 banto_drivers::register_wasm_operational_write(registry, manifest, component)
                     .expect("load isolated operational write guest");
@@ -499,7 +533,9 @@ async fn test_app_with_drivers_and_options(
         write_limit.per_tag_max = 2;
     }
     let rate_limiter = Arc::new(tokio::sync::Mutex::new(WriteRateLimiter::new(write_limit)));
-    let grpc_service = GrpcService::new(
+    let controller =
+        with_sim_controller.then(|| Arc::new(CollectionController::new(manager.clone())));
+    let mut grpc_service = GrpcService::new(
         manager.clone(),
         api_keys.clone(),
         audit.clone(),
@@ -508,6 +544,9 @@ async fn test_app_with_drivers_and_options(
         rate_limiter.clone(),
         events_tx.clone(),
     );
+    if let Some(controller) = &controller {
+        grpc_service = grpc_service.with_controller(controller.clone());
+    }
     let grpc_server = Arc::new(GrpcServer::new(grpc_service));
 
     let settings = SettingsService::new(Db::Sqlite(pool.clone()));
@@ -519,25 +558,48 @@ async fn test_app_with_drivers_and_options(
         .await
         .expect("lock_down the test environment");
 
-    let router = api_router(
-        users.clone(),
-        audit,
-        manager.plc_connections(),
-        manager.collection_groups(),
-        manager.tags(),
-        api_keys,
-        manager.clone(),
-        auth,
-        commissioning,
-        events_tx,
-        false,
-        write_control.clone(),
-        write_audit,
-        mqtt,
-        grpc_server,
-        rate_limiter,
-        banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
-    );
+    let router = if let Some(controller) = &controller {
+        api_router_with_controller(
+            users.clone(),
+            audit,
+            manager.plc_connections(),
+            manager.collection_groups(),
+            manager.tags(),
+            api_keys,
+            manager.clone(),
+            controller.clone(),
+            auth,
+            commissioning,
+            events_tx,
+            false,
+            write_control.clone(),
+            write_audit,
+            mqtt,
+            grpc_server,
+            rate_limiter,
+            banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
+        )
+    } else {
+        api_router(
+            users.clone(),
+            audit,
+            manager.plc_connections(),
+            manager.collection_groups(),
+            manager.tags(),
+            api_keys,
+            manager.clone(),
+            auth,
+            commissioning,
+            events_tx,
+            false,
+            write_control.clone(),
+            write_audit,
+            mqtt,
+            grpc_server,
+            rate_limiter,
+            banto_hub_core::profile_paths::DEFAULT_PROFILE_ID.to_string(),
+        )
+    };
 
     TestApp {
         router,
@@ -548,6 +610,7 @@ async fn test_app_with_drivers_and_options(
         manager,
         sessions,
         write_control,
+        controller,
         _env: env,
     }
 }
@@ -1878,6 +1941,9 @@ mod device_address_test;
 
 #[path = "t12_modbus_wasm_join/mod.rs"]
 mod modbus_wasm_join_test;
+
+#[path = "t12_wasm_all_simulation/mod.rs"]
+mod wasm_all_simulation_test;
 
 #[path = "t12_slmp_wasm/mod.rs"]
 mod slmp_wasm_test;
