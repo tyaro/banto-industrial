@@ -1031,7 +1031,7 @@ pub struct CollectorManager {
     /// `push` 接続の外部ソースとして、この manager が作る `Collector` に
     /// `start_with_sources` で渡す（`apply_config` は作った時の源を使い続ける）。
     /// 計画の commit（`push` 接続・キーの集合・ブリッジの送る集合）は catalog の
-    /// 入れ替えと同じ点（[`Self::apply_run`] の 2 つの枝と [`Self::commit_catalog`]）、
+    /// 入れ替えと同じ点（[`Self::commit_catalog`]）、
     /// 収集の遷移に連動する保持値の破棄と epoch は
     /// `crate::controller::CollectionController`（[`Self::ingest_hub`] 経由。
     /// `db_source` と同じ理由で manager の側には置かない）。`db_source` と同じく

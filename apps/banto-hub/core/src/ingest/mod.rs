@@ -895,8 +895,7 @@ impl IngestHub {
         }
     }
 
-    /// catalog の入れ替えと同じ点で呼ぶ（`CollectorManager::apply_run` と
-    /// `commit_catalog`）。`push` 接続の追加・削除と、キーの集合・送る集合・
+    /// catalog の入れ替えと同じ点で呼ぶ（`CollectorManager::commit_catalog`）。`push` 接続の追加・削除と、キーの集合・送る集合・
     /// `stale_timeout_ms` の更新。登録から消えたキー・無効になったキーの保持値は
     /// 捨てる（キーの改名で古い値が残らない）。ブリッジの設定・有効が変わった接続は
     /// [`commit_effect`] の表に従う。データ型が変わったキーの保持値も捨てる（型が
