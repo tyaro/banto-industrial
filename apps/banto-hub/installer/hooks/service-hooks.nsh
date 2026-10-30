@@ -120,75 +120,22 @@
 ; **削除しない**（§4.5「アンインストール」・オーナー決定 §7-7 - 再
 ; インストールで設定・データが戻ることを優先する）。
 
-!include "LogicLib.nsh"
+; --- 共通部品 -----------------------------------------------------------
+;
+; サービスの停止・シェルの終了・止めたサービスの再開は、ChronoGazer の
+; インストーラとも共通の installer-common/service-common.nsh に切り出した
+; （#392 B3-4、StopServiceIfRunning・TerminateProcessIfRunning・
+; StartServiceIfStopped。ラベルは `${__LINE__}` で一意化）。製品固有の文言は
+; include の前に定数で渡す。`BANTO_INSTALLER_COMMON_DIR`（共通ファイルの
+; ディレクトリの絶対パス）は、このフックを tauri-bundler に渡す前に
+; apps/banto-hub/installer/src/main.rs が先頭へ `!define` する（makensis の
+; 作業ディレクトリは tauri-bundler の出力先で、相対パスは頼れないため）。
+!define SERVICE_COMMON_LOG_PREFIX "banto-hub"
+!define SERVICE_COMMON_OPS_DOC "docs/banto-hub-operations.md §12"
+!include "${BANTO_INSTALLER_COMMON_DIR}\service-common.nsh"
 
 Var BantoHubWasRunning
 Var SinkWasRunning
-Var StopWaitCounter
-
-; --- 共通ヘルパー -----------------------------------------------------
-
-; `service_name` の Windows サービスが Running なら `sc stop` し、
-; `STOPPED` になるまで最大30秒ポーリングする。呼び出し前の状態
-; （止めた=1／もともと止まっていた・未登録=0）を `remember_var`
-; （`$BantoHubWasRunning`/`$SinkWasRunning` を渡す）に記録する。
-;
-; `sc query` の生出力を NSIS の文字列関数でパースする代わりに
-; `cmd /c "sc query ... | findstr /C:"RUNNING" >nul"` の終了コード
-; （0=見つかった、1=見つからない）だけを見る - サービス未登録
-; （`sc query` 自体が 1060 相当で失敗する場合を含む）でも findstr が
-; "RUNNING" を見つけられず終了コード1になるだけなので、「未登録」と
-; 「登録済みだが停止中」を区別する必要が無く、この呼び出し1つで両方
-; 静かに扱える（モジュール doc「PREINSTALL」節参照）。
-;
-; 同じマクロを BantoHubSink・BantoHub の2回呼ぶため、ラベルの衝突を
-; 避ける必要がある - tauri-bundler 自身の `CheckIfAppIsRunning`
-; マクロ（nsis/utils.nsh）と同じ `${__LINE__}` を使った一意化を踏襲する。
-!macro StopServiceIfRunning service_name remember_var
-  !define UniqueID ${__LINE__}
-
-  StrCpy ${remember_var} "0"
-  nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"RUNNING" >nul'
-  Pop $0
-  ${If} $0 == "0"
-    StrCpy ${remember_var} "1"
-    DetailPrint "banto-hub: Windows サービス (${service_name}) を停止しています..."
-    nsExec::ExecToStack 'sc stop "${service_name}"'
-    Pop $0
-
-    StrCpy $StopWaitCounter 0
-    stopsvc_wait_${UniqueID}:
-      nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"STOPPED" >nul'
-      Pop $0
-      ${If} $0 == "0"
-        Goto stopsvc_done_${UniqueID}
-      ${EndIf}
-      IntOp $StopWaitCounter $StopWaitCounter + 1
-      ${If} $StopWaitCounter >= 30
-        DetailPrint "banto-hub: (${service_name}) の停止待ちが30秒でタイムアウトしました。手動で状態を確認してください（docs/banto-hub-operations.md §12）"
-        Goto stopsvc_done_${UniqueID}
-      ${EndIf}
-      Sleep 1000
-      Goto stopsvc_wait_${UniqueID}
-    stopsvc_done_${UniqueID}:
-  ${EndIf}
-
-  !undef UniqueID
-!macroend
-
-; `banto-hub-shell.exe` が動いていれば `taskkill` で終了する
-; （single-instance のシェルは差し替え中のファイルロックを持ちうるため）。
-; PREINSTALL・PREUNINSTALL の両方から呼ぶ。
-!macro TerminateShellIfRunning
-  nsExec::ExecToStack 'cmd /c tasklist /FI "IMAGENAME eq banto-hub-shell.exe" | findstr /I "banto-hub-shell.exe" >nul'
-  Pop $0
-  ${If} $0 == "0"
-    DetailPrint "banto-hub: デスクトップシェル (banto-hub-shell.exe) を終了しています..."
-    nsExec::ExecToStack 'taskkill /IM banto-hub-shell.exe'
-    Pop $0
-    Sleep 500
-  ${EndIf}
-!macroend
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -246,7 +193,7 @@ Var StopWaitCounter
   !insertmacro FixupHubOnlyInstallerMainBinaryName
   !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
   !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
-  !insertmacro TerminateShellIfRunning
+  !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -294,16 +241,8 @@ Var StopWaitCounter
 
   ; §7 決定4: PREINSTALL で止めたものだけ再開する（Hub → Sink の順）。
   ; 新規インストールでは両変数とも未設定のため、このブロックは実行されない。
-  ${If} $BantoHubWasRunning == "1"
-    DetailPrint "banto-hub: 上書き前に稼働していた BantoHub サービスを再開します..."
-    nsExec::ExecToStack 'sc start "BantoHub"'
-    Pop $0
-  ${EndIf}
-  ${If} $SinkWasRunning == "1"
-    DetailPrint "banto-hub: 上書き前に稼働していた BantoHubSink サービスを再開します..."
-    nsExec::ExecToStack 'sc start "BantoHubSink"'
-    Pop $0
-  ${EndIf}
+  !insertmacro StartServiceIfStopped "BantoHub" $BantoHubWasRunning
+  !insertmacro StartServiceIfStopped "BantoHubSink" $SinkWasRunning
   ; (6) silent / passive でテンプレートが作ったデスクトップショートカットを削除
   ${If} ${FileExists} "$DESKTOP\${PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${PRODUCTNAME}.lnk"
@@ -312,7 +251,7 @@ Var StopWaitCounter
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
-  !insertmacro TerminateShellIfRunning
+  !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
 
   DetailPrint "banto-hub: DB Sink サイドカーサービス (BantoHubSink) の登録を解除しています..."
   ExecWait '"$INSTDIR\banto-hub-sink.exe" uninstall' $0
