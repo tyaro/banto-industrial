@@ -45,6 +45,10 @@
 #   hub の soak（収集 + WS + MQTT を同時に維持して件数の下限を見る。R2b-0 で
 #   banto-hub-core から banto-hub-host へ移った）と tsquery の
 #   performance_smoke / concurrency も、CPU を奪い合うと下限・時間切れで落ちるので同じ扱い。
+# - DB ブリッジの parity_9（§10.4 の 9。上限ちょうどの負荷を 60 秒）: `BANTO_TEST_PG_URL` が
+#   あるときだけ動く。CI で実 PostgreSQL に対して走らせるのは ubuntu の `rust-db-source` ジョブ
+#   の `cargo test` で、そちらは ci.yml で段を分けて 1 本だけ走らせる（#948）。この override は、
+#   手元で `BANTO_TEST_PG_URL` を付けて `cargo nextest run` するときのためのもの。
 #
 # ## ローカル（非管理者）での注意
 #
@@ -68,6 +72,10 @@ test-group = 'hub-default-mutex'
 [[profile.default.overrides]]
 filter = '(package(banto-collect) & kind(test)) | (package(banto-hub-host) & binary(soak)) | (package(banto-tsquery) & (binary(performance_smoke) | binary(concurrency)))'
 test-group = 'heavy-runtime'
+
+[[profile.default.overrides]]
+filter = 'package(banto-hub-sink) & binary(bridge_parity) & test(=parity_9_three_queries_at_the_registration_limit)'
+threads-required = 'num-test-threads'
 
 # CI 用: `cargo nextest run --profile ci`。
 [profile.ci]

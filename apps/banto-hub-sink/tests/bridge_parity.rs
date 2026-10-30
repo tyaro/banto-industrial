@@ -1855,6 +1855,11 @@ fn push_external(source_name: &str, i: usize) -> String {
 ///
 /// A の 1,800 キーは 18 列に写す（同じ列を複数のキーへ。PostgreSQL の射影は 1,664 列まで
 /// なので、ブリッジはラッパー SQL に列を 1 回だけ射影する - §10.3 の実装の注 (4)）。
+///
+/// CI の `rust-db-source` ジョブでは、ci.yml で段を分けてこの 1 本だけを走らせる（#948）。
+/// 手元の `cargo nextest run` では `.config/nextest.toml` の override で他と同時に走らせない。
+/// `cargo test` でまとめて走らせると同じバイナリの他の場面と並ぶので、CPU が足りない機では
+/// 落ちうる。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parity_9_three_queries_at_the_registration_limit() {
     let target = require_pg!();
