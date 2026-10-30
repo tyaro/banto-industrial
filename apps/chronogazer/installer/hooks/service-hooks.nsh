@@ -37,6 +37,12 @@
 ;
 ; ## PREINSTALL
 ;
+;   (0) インストール先が Program Files の中かを確かめる。外なら案内して `Abort`
+;       （まだ何も変えていない）。`chronogazer-elev service-install` は Program Files の
+;       外の `chronogazer-server.exe` を LocalSystem のサービスに登録しない（権限の
+;       昇格を防ぐため）ので、外に入れるとサービスの無いインストールが黙って
+;       できてしまう。PerMachine は既定の場所を決めるだけで、ディレクトリの頁や
+;       `/D=` で外を選べる（#972 の Codex の指摘）。
 ;   (1) O-3: 旧い利用者単位の版の案内（下記「旧い利用者単位の版」節）。
 ;   (2) シェルの終了（下記「シェルの終了」節）。[キャンセル] ならここで中止 -
 ;       サービスはまだ止めていないので、何も止めずに終わる。
@@ -213,6 +219,33 @@ Var ShellQuitWaitCounter
   !undef ShellQuitID
 !macroend
 
+; PREINSTALL (0): $INSTDIR が Program Files（64 ビット・x86）の中でなければ止める。
+; 判定は elev（`is_inside_program_files`）と同じく「どちらかの下」。NSIS の `==` は
+; 大文字小文字を区別しない。本当のパス（ジャンクションなど）は elev が確かめ直す。
+!macro RequireInstallDirInProgramFiles
+  StrCpy $1 0
+  StrLen $4 "$INSTDIR"
+  StrCpy $0 "$PROGRAMFILES64\"
+  StrLen $2 $0
+  StrCpy $3 "$INSTDIR" $2
+  ${If} $3 == $0
+  ${AndIf} $4 > $2
+    StrCpy $1 1
+  ${EndIf}
+  StrCpy $0 "$PROGRAMFILES32\"
+  StrLen $2 $0
+  StrCpy $3 "$INSTDIR" $2
+  ${If} $3 == $0
+  ${AndIf} $4 > $2
+    StrCpy $1 1
+  ${EndIf}
+  ${If} $1 != 1
+    DetailPrint "chronogazer: インストール先 $INSTDIR は Program Files の外です。記録エンジンのサービスを登録できないため、インストールを中止しました。"
+    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が Program Files の外です。$\r$\n$\r$\nChronoGazer の記録エンジンは、一般の利用者が書き換えられない Program Files の中に置かないとサービスとして登録できません。既定の場所 ($PROGRAMFILES64\ChronoGazer) のままインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
+    Abort "インストール先が Program Files の外のため、インストールを中止しました。"
+  ${EndIf}
+!macroend
+
 ; O-3: 旧い利用者単位の版があれば案内する（上の「旧い利用者単位の版」節）。
 !macro WarnAboutLegacyCurrentUserInstall
   ReadRegStr $0 HKCU "${CHRONOGAZER_LEGACY_UNINSTKEY}" "UninstallString"
@@ -226,6 +259,7 @@ Var ShellQuitWaitCounter
 ; --- フック本体 ---------------------------------------------------------
 
 !macro NSIS_HOOK_PREINSTALL
+  !insertmacro RequireInstallDirInProgramFiles
   !insertmacro WarnAboutLegacyCurrentUserInstall
   !insertmacro QuitShellForUpdate "インストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
