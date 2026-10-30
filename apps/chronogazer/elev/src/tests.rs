@@ -537,6 +537,9 @@ struct Fake {
     /// A1 の mutex をサービス・デスクトップのエンジンが持っている（`hold_instance_mutex` が
     /// `None`）。#623 PR-3。
     mutex_held: bool,
+    /// A1 の mutex の取得自体が失敗する（`hold_instance_mutex` が `Err`。名前を組み立て
+    /// られない・mutex を開けないなど）。使用中とは別物で、`service-install` も 1 で止まる。
+    mutex_error: Option<String>,
 }
 
 fn root_path() -> PathBuf {
@@ -610,6 +613,7 @@ impl Fake {
             pin_error: None,
             relax_skips: BTreeMap::new(),
             mutex_held: false,
+            mutex_error: None,
         };
         // ルートの親（ProgramData。SYSTEM の所有）。無いルートは、これを開いて確かめてから
         // その下に相対で作る（#642）。
@@ -803,6 +807,9 @@ impl ElevOps for Fake {
     }
     fn hold_instance_mutex(&self, root: &Path) -> Result<Option<Box<dyn std::any::Any>>, String> {
         self.record(format!("hold-mutex {}", root.display()));
+        if let Some(error) = &self.mutex_error {
+            return Err(error.clone());
+        }
         if self.mutex_held {
             return Ok(None);
         }
@@ -1985,8 +1992,9 @@ fn a_dir_owned_by_the_elevated_admin_is_accepted() {
 
 /// #623 PR-3（設計 §3.5）: サービスかデスクトップのエンジンが A1 の mutex を持っていれば、
 /// `grant-data-acl` は**何も書かずに** 1（secrets も作らない）。`service-install` は、ルートを
-/// 作らない（既にある）ときは登録まで進み、データの ACL の手順で同じく 1。ルートを作る
-/// ときは、書く前に確かめて 1（何も登録しない）。
+/// 作らない（既にある）ときは登録・Operators・サービス DACL まで済ませ、データの ACL の
+/// 手順だけを飛ばして警告 1 行で **0**（Hub の `service-install` と同じ。2026-10-31 オーナー
+/// 決定、B3-4 PR-E）。ルートを作るときは、登録の前の確かめで 1（何も登録しない）。
 #[test]
 fn grant_data_acl_refuses_while_the_engine_holds_the_instance_mutex() {
     let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
@@ -2008,20 +2016,48 @@ fn grant_data_acl_refuses_while_the_engine_holds_the_instance_mutex() {
     assert_eq!(exec(Action::GrantDataAcl, &fake).0, EXIT_OK);
     assert_eq!(resets(&fake).len(), 1);
 
-    // service-install（ルートは既にある）: 登録はするが、データの ACL で 1。
+    // service-install（ルートは既にある）: 登録・Operators・サービス DACL は済ませ、データの
+    // ACL の付け直しだけを飛ばして警告 1 行で 0（Hub と同じ）。何も書かず、secrets も作らない。
     let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
     fake.mutex_held = true;
-    let (code, _) = exec(
+    let (code, lines) = exec(
         Action::ServiceInstall {
             install_user_sid: None,
         },
         &fake,
     );
-    assert_eq!(code, EXIT_FAILED);
-    assert!(fake.calls().iter().any(|c| c.starts_with("install ")));
-    assert!(resets(&fake).is_empty());
+    assert_eq!(code, EXIT_OK, "{lines:#?}");
+    let calls = fake.calls();
+    assert!(calls.iter().any(|c| c.starts_with("install ")), "{calls:?}");
+    assert!(calls.contains(&"ensure_group".to_string()), "{calls:?}");
+    assert!(
+        calls.contains(&"grant_service_acl".to_string()),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&format!("hold-mutex {}", root_path().display())));
+    assert!(!calls.iter().any(|c| c.starts_with("create")), "{calls:?}");
+    assert!(resets(&fake).is_empty(), "{calls:?}");
+    assert!(
+        lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+            if t.contains("警告: ")
+                && t.contains("使用中なので ACL の付け直しを飛ばしました")
+                && t.contains("grant-data-acl を実行してください"))),
+        "{lines:#?}"
+    );
+    assert!(
+        !lines
+            .iter()
+            .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("書き直さずに止めます"))),
+        "{lines:#?}"
+    );
+    assert_eq!(
+        lines.last(),
+        Some(&stdout(
+            "chronogazer-elev: 'service-install' が完了しました"
+        ))
+    );
 
-    // service-install（ルートを作る）: 書く前に確かめて 1、何も登録しない。
+    // service-install（ルートを作る）: 登録の前の確かめで 1、何も登録しない。
     let mut fake = Fake::new();
     fake.mutex_held = true;
     let (code, lines) = exec(
@@ -2036,4 +2072,33 @@ fn grant_data_acl_refuses_while_the_engine_holds_the_instance_mutex() {
     assert!(lines
         .iter()
         .any(|l| matches!(l, ConsoleLine::Stderr(t) if t.contains("（何も登録していません）"))));
+}
+
+/// B3-4 PR-E: `service-install` が飛ばすのは**使用中**（mutex に持ち主がいる）だけ。A1 の
+/// 確かめ自体の失敗（名前を組み立てられない・mutex を開けないなど）は使用中と取り違えず、
+/// `service-install` も `grant-data-acl` も何も書かずに 1（警告の行は出ない）。
+#[test]
+fn a_failed_mutex_check_is_not_treated_as_in_use() {
+    for action in [
+        Action::ServiceInstall {
+            install_user_sid: None,
+        },
+        Action::GrantDataAcl,
+    ] {
+        let mut fake = Fake::new().with_dir(root_path(), true, false, "S-1-5-32-544");
+        fake.mutex_error = Some("mutex を開けません".to_string());
+        let (code, lines) = exec(action.clone(), &fake);
+        assert_eq!(code, EXIT_FAILED, "{action:?}: {lines:#?}");
+        assert!(resets(&fake).is_empty(), "{action:?}");
+        assert!(
+            lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+                if t.contains("使用中の確かめに失敗しました") && t.contains("mutex を開けません"))),
+            "{action:?}: {lines:#?}"
+        );
+        assert!(
+            !lines.iter().any(|l| matches!(l, ConsoleLine::Stderr(t)
+                if t.contains("飛ばしました") || t.contains("は使用中です"))),
+            "{action:?}: {lines:#?}"
+        );
+    }
 }
