@@ -718,6 +718,16 @@ fn openapi_snapshot_matches() {
     );
 }
 
+/// #954: 一括書込みの `writes` の OpenAPI `maxItems` が、実際の上限と一致する。
+#[test]
+fn openapi_max_items_matches_limit() {
+    let doc = serde_json::to_value(ApiDoc::openapi()).expect("openapi serialize");
+    assert_eq!(
+        doc["components"]["schemas"]["BatchWriteValueRequest"]["properties"]["writes"]["maxItems"],
+        crate::write_path::MAX_BATCH_WRITE_ENTRIES
+    );
+}
+
 /// axum 0.8 の `Router` はルート一覧を返す公開 API を持たないので、`Debug`
 /// 出力（`path_router.routes` の `RouteId(n): MethodRouter { get: Route, .. }`
 /// と `node` の `RouteId(n): "/path"`）から「METHOD path」を復元する。

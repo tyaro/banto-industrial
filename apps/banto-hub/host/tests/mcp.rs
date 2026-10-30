@@ -1443,6 +1443,36 @@ async fn write_recipe_missing_scope_on_one_entry_rejects_the_whole_batch() {
     sim.stop();
 }
 
+/// #954: 上限+1 件の `write_recipe` は件数エラーで、書込み監査の総数を増やさない
+/// (スコープ検査より前に断るので、拒否の集計表・行予算にも入らない)。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn write_recipe_over_the_max_entries_is_a_tool_error_without_audit() {
+    let app = test_app("recipe-over-max").await;
+    let key = issue_key(
+        &app.router,
+        &app.admin_token,
+        "noscope",
+        &["write:other.g.t"],
+    )
+    .await;
+    let max = banto_hub_core::write_path::MAX_BATCH_WRITE_ENTRIES;
+    let audit_before = write_audit_row_count(&app).await;
+    let writes: Vec<Value> = (0..=max)
+        .map(|i| json!({ "tag": format!("x.y.t{i}"), "value": 1 }))
+        .collect();
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&key),
+        tools_call("write_recipe", json!({ "writes": writes })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let text = body["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&max.to_string()), "{text}");
+    assert_eq!(write_audit_row_count(&app).await, audit_before);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_recipe_one_bad_entry_aborts_the_whole_batch_with_no_audit_rows_and_no_wire_writes() {
     let app = test_app("recipe-all-or-nothing").await;

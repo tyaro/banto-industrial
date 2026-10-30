@@ -380,7 +380,20 @@ pub enum WriteRejection {
     /// `execute_write`(単票)からは絶対に返らない([`BatchAborted`]と同じ
     /// 理由でREST/gRPCの変換に `unreachable!` を置く)。
     DuplicateTagInBatch(String),
+    /// #954: バッチのエントリ数が [`MAX_BATCH_WRITE_ENTRIES`] を超えた。
+    /// DB・監査・レート制限のどれにも触れずに全エントリを拒否する
+    /// ([`execute_write_batch`] の最初のゲート。transport 側の入口検査(スコープ検査より前、
+    /// 監査なし)をすり抜けたときの多層防御)。`execute_write`(単票)からは絶対に返らない。
+    BatchTooLarge,
 }
+
+/// #954: 1 回のバッチ書き込み(REST `POST /api/v1/values/batch`・MCP `write_recipe`)に
+/// 含められるエントリ数の上限。1 リクエストの仕事量(スコープ検査・重複検出・
+/// 解決と `convert_value`・応答封筒)が件数に比例し、2 MB の本文だけで数万件になりうる。
+/// 拒否の監査は件数に比例しない(#945: 拒否の表へはキーごとに
+/// `REJECTION_ROWS_PER_KEY` 組とまとめの組だけが入るので、この上限とは独立に有界)。
+/// REST と MCP で同じ値を共有し、スコープ検査より前に断る(監査は残さない)。
+pub const MAX_BATCH_WRITE_ENTRIES: usize = 1_000;
 
 /// [`execute_write`] が必要とする共有状態一式への借用。REST/gRPC いずれの
 /// ハンドラも自分の `State`/サービス構造体からこれを組み立てて渡す -
@@ -1211,6 +1224,19 @@ pub async fn execute_write_batch(
     ctx: &ApiKeyContext,
     entries: Vec<(String, Option<RequestedValue>)>,
 ) -> Vec<BatchEntryOutcome> {
+    // -1. 件数上限(#954、多層防御)。transport の入口検査(REST/MCP)を通った後は
+    // 到達しないはずだが、他の呼び出し元が増えても DB・監査・レート制限に
+    // 一切触れずに全件を断る。
+    if entries.len() > MAX_BATCH_WRITE_ENTRIES {
+        return entries
+            .into_iter()
+            .map(|(tag, _)| BatchEntryOutcome {
+                tag,
+                result: Err(WriteRejection::BatchTooLarge),
+            })
+            .collect();
+    }
+
     // 0. 重複タグ検出(2026-09-05 監査対応、このモジュール doc comment
     // 「契約」の0番参照)。DB にもレート制限にも一切触れない、最も安価な
     // 事前ゲート - 同じ外部名が2回以上現れたら全エントリを拒否する。
@@ -2083,6 +2109,7 @@ impl WriteRejection {
             WriteRejection::Internal(_) => "internal",
             WriteRejection::BatchAborted => "batch_aborted",
             WriteRejection::DuplicateTagInBatch(_) => "duplicate_tag_in_batch",
+            WriteRejection::BatchTooLarge => "batch_too_large",
         }
     }
 
@@ -2100,6 +2127,9 @@ impl WriteRejection {
             WriteRejection::DuplicateTagInBatch(tag) => {
                 Some(format!("レシピ内でタグ '{tag}' が重複しています"))
             }
+            WriteRejection::BatchTooLarge => Some(format!(
+                "バッチのエントリ数が上限({MAX_BATCH_WRITE_ENTRIES} 件)を超えているため、書き込みを行いませんでした"
+            )),
             _ => None,
         }
     }
