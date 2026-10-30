@@ -58,7 +58,11 @@
 //!   インストール利用者・この昇格した利用者のどれでもなければ**書き直さずに止める**。
 //!   **稼働中は断る**: 書く前に A1 の mutex（`Global\ChronoGazer.<scope>`）を取りにいき
 //!   （`banto_instance_lock::try_hold_named_mutex`。診断ファイルは書かない）、サービスか
-//!   デスクトップのエンジンが持っていれば何も変えずに 1。取れたら**書き終わるまで持つ**
+//!   デスクトップのエンジンが持っていれば何も変えずに 1。**`service-install` だけは**、
+//!   登録・Operators・サービス DACL の後のデータの ACL の手順で使用中なら、付け直しを
+//!   飛ばして警告を 1 行出し 0（Hub の `service-install` と同じ。2026-10-31 オーナー決定。
+//!   使用中 = mutex に持ち主がいることだけで、確かめ自体の失敗は 1 のまま。
+//!   [`InUsePolicy`]）。取れたら**書き終わるまで持つ**
 //!   （確かめてから書くまでの間にサービスが起動しないように）。elev は木を**締めない**
 //!   （締めるのはサービスだけ）。Users・Operators には何も付けない。
 //! - **無いフォルダは、確かめ済みの親のハンドルを基準に相対で作る**（#642。#626 PR-B の
@@ -84,7 +88,8 @@
 //! 無い・`chronogazer-server.exe` が隣に無い・ルートを決められない・無いルートの親の
 //! フォルダが無い（#642）・グループが無い）、
 //! [`EXIT_USAGE`] 64 = 使い方の誤り。Windows 以外はすべて 64。`service-install` は
-//! 最初に失敗した手順の終了コードで止める（後の手順は行わない）。
+//! 最初に失敗した手順の終了コードで止める（後の手順は行わない）。例外は最後の手順
+//! （データの ACL）が**使用中**で飛ばしたときだけで、警告を出して 0。
 //!
 //! ## 出力
 //!
@@ -754,14 +759,20 @@ fn service_install<O: ElevOps>(
     if code != EXIT_OK {
         return EXIT_FAILED;
     }
-    // 2〜4. 単独のアクションと同じ手順（記録した SID を読み直す）。最初の失敗で止める。
-    for step in [setup_operators, grant_service_acl, grant_data_acl] {
+    // 2〜3. 単独のアクションと同じ手順（記録した SID を読み直す）。最初の失敗で止める。
+    for step in [setup_operators, grant_service_acl] {
         let code = step(ops, out);
         if code != EXIT_OK {
             return code;
         }
     }
-    EXIT_OK
+    // 4. データの ACL。**使用中のときだけ**（A1 の mutex に持ち主がいる）、付け直しを
+    //    飛ばした警告を出して 0（Hub の `service-install` と同じ。2026-10-31 オーナー決定）。
+    //    インストーラの上書きインストールで、サービスかデスクトップのエンジンが動いた
+    //    ままでも、登録・Operators・サービス DACL は済んでいる。それ以外の断り（所有者・
+    //    本当のパス・reparse point・確かめの失敗・書き込みの失敗）は今どおり 1。手で実行する
+    //    `grant-data-acl` は使用中でも断って 1 のまま（[`grant_data_acl`]）。
+    grant_data_acl_with(ops, InUsePolicy::SkipWithWarning, out)
 }
 
 /// 段の親（無いフォルダを作るときの基準。#642）。
@@ -991,9 +1002,12 @@ fn preflight_root<O: ElevOps>(
     if created {
         let _held = match hold_instance_mutex(ops, &pinned.final_path(), out) {
             Ok(held) => held,
-            Err(code) => {
+            Err(stop) => {
+                if stop == HoldStop::InUse {
+                    out(err(&in_use_refusal_line(&pinned.final_path())));
+                }
                 out(err("（何も登録していません）"));
-                return Err(code);
+                return Err(EXIT_FAILED);
             }
         };
         match pinned.relax_tree(&mode_for(install_user)) {
@@ -1016,30 +1030,66 @@ fn mode_for(install_user: &InstallUserSid) -> ModeAccess {
     ModeAccess::for_users([install_user.clone()]).expect("利用者が 1 人いる")
 }
 
+/// [`hold_instance_mutex`] で A1 を取れなかった理由。**使用中**は mutex を取りにいって
+/// 「持ち主がいる」と分かったとき（[`ElevOps::hold_instance_mutex`] の `Ok(None)`）**だけ**。
+/// 名前を組み立てられない・mutex を開けないなどの取得の途中の失敗は [`HoldStop::Failed`]
+/// で、使用中とは区別する（`service-install` が飛ばすのは使用中だけ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HoldStop {
+    /// サービスかデスクトップのエンジンが持っている（行は呼ぶ側が出す）。
+    InUse,
+    /// 確かめ自体に失敗した（行は出した）。
+    Failed,
+}
+
 /// 書く前の A1 の確かめ（設計 §3.5）: サービスかデスクトップのエンジンが動いていれば
-/// 何も書かずに 1。取れたら、呼ぶ側が書き終わるまで持つ。
+/// 何も書かずに [`HoldStop::InUse`]（どう扱うかは呼ぶ側: 単独のアクションは断って 1、
+/// `service-install` は飛ばして 0）。確かめの失敗は行を出して [`HoldStop::Failed`]。
+/// 取れたら、呼ぶ側が書き終わるまで持つ。
 fn hold_instance_mutex<O: ElevOps>(
     ops: &O,
     real_root: &Path,
     out: Out<'_>,
-) -> Result<Box<dyn std::any::Any>, i32> {
+) -> Result<Box<dyn std::any::Any>, HoldStop> {
     match ops.hold_instance_mutex(real_root) {
         Ok(Some(held)) => Ok(held),
-        Ok(None) => {
-            out(err(&format!(
-                "データのルート（{}）は使用中です（ChronoGazer のサービスか、デスクトップの記録エンジンが動いています）。ACL を書き直さずに止めます（止めてから、もう一度実行してください）",
-                real_root.display()
-            )));
-            Err(EXIT_FAILED)
-        }
+        Ok(None) => Err(HoldStop::InUse),
         Err(error) => {
             out(err(&format!(
                 "データのルート（{}）の使用中の確かめに失敗しました: {error}。ACL を書き直さずに止めます",
                 real_root.display()
             )));
-            Err(EXIT_FAILED)
+            Err(HoldStop::Failed)
         }
     }
+}
+
+/// 使用中なので断った 1 行（`grant-data-acl`・登録の前のルートの用意。純関数）。
+fn in_use_refusal_line(real_root: &Path) -> String {
+    format!(
+        "データのルート（{}）は使用中です（ChronoGazer のサービスか、デスクトップの記録エンジンが動いています）。ACL を書き直さずに止めます（止めてから、もう一度実行してください）",
+        real_root.display()
+    )
+}
+
+/// `service-install` が、使用中なので ACL の付け直しを飛ばして成功にしたときの警告の
+/// 1 行（Hub の `service-install` の「profile が使用中なので ACL の付け直しを飛ばしました」と
+/// 同じ形。純関数）。
+fn in_use_skipped_line(real_root: &Path) -> String {
+    format!(
+        "警告: データのルート（{}）が使用中なので ACL の付け直しを飛ばしました（ChronoGazer のサービスか、デスクトップの記録エンジンが動いています）。サービスとアプリを止めてから grant-data-acl を実行してください",
+        real_root.display()
+    )
+}
+
+/// `grant-data-acl` の手順で、A1 を取れなかった（使用中）ときの扱い。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InUsePolicy {
+    /// 断って 1（単独の `grant-data-acl`。Hub の `grant-profile-acl` と同じ）。
+    Refuse,
+    /// 警告を 1 行出して、ACL の付け直しを飛ばして 0（`service-install`。Hub の
+    /// `service-install` と同じ。2026-10-31 オーナー決定）。
+    SkipWithWarning,
 }
 
 /// 断ったとき、**自分で作った**（SYSTEM・Administrators だけの）フォルダが残っていることを
@@ -1277,7 +1327,14 @@ fn refusal_line(kind: DataDir, dir: &Path, refusal: &DataAclRefusal) -> String {
     format!("{}（{}）は{reason}", kind.label(), dir.display())
 }
 
+/// 単独の `grant-data-acl`: 使用中なら断って 1。
 fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
+    grant_data_acl_with(ops, InUsePolicy::Refuse, out)
+}
+
+/// `grant-data-acl` の本体。`in_use` は A1 を取れなかった（使用中）ときの扱いだけを変える
+/// （それ以外の断り・失敗は同じ）。
+fn grant_data_acl_with<O: ElevOps>(ops: &O, in_use: InUsePolicy, out: Out<'_>) -> i32 {
     let sid = match recorded_install_user(ops, out) {
         Ok(sid) => sid,
         Err(code) => return code,
@@ -1324,12 +1381,24 @@ fn grant_data_acl<O: ElevOps>(ops: &O, out: Out<'_>) -> i32 {
         Err(code) => return code,
     };
     let real_root = root_pinned.final_path();
-    // A1（稼働中は断る）。取れたら `_held` が書き終わるまで持つ。
+    // A1（稼働中は書かない）。取れたら `_held` が書き終わるまで持つ。使用中（持ち主が
+    // いる）だけを `in_use` で扱い分け、確かめ自体の失敗は常に 1。
     let _held = match hold_instance_mutex(ops, &real_root, out) {
         Ok(held) => held,
-        Err(code) => {
+        Err(stop) => {
             left_behind_notice(root_created, DataDir::Root, layout.root(), &real_root, out);
-            return code;
+            return match (stop, in_use) {
+                (HoldStop::Failed, _) | (HoldStop::InUse, InUsePolicy::Refuse) => {
+                    if stop == HoldStop::InUse {
+                        out(err(&in_use_refusal_line(&real_root)));
+                    }
+                    EXIT_FAILED
+                }
+                (HoldStop::InUse, InUsePolicy::SkipWithWarning) => {
+                    out(err(&in_use_skipped_line(&real_root)));
+                    EXIT_OK
+                }
+            };
         }
     };
     let secrets = match prepare_dir(
