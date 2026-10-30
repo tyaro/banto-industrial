@@ -1041,8 +1041,14 @@ jobs:
       # `cargo test -p banto-hub-sink` で走る。
       # R2a-3c（R2a の完了条件）: Hub 内の Source との突き合わせ（tests/bridge_parity.rs -
       # §10.4 の 11 場面 1〜9・7b・7c。9 は 60 秒の上限ちょうどの 3 クエリ）も同じ。
+      # 9 は #948 で下の段に分けた（上の段から外し、ここで 1 本だけ走らせる）。
       - name: test (banto-hub-sink)
-        run: cargo test -p banto-hub-sink
+        run: cargo test -p banto-hub-sink -- --skip parity_9_three_queries_at_the_registration_limit
+      # #948: parity_9（上限ちょうどの負荷を 60 秒）は CPU を奪われると周期に間に合わず
+      # `superseded_cycles` が出る（製品どおり）。ほかの場面と同じプロセスで並ばないよう、
+      # 上の段で外して、ここで 1 本だけ走らせる。
+      - name: test (banto-hub-sink parity_9 alone)
+        run: cargo test -p banto-hub-sink --test bridge_parity -- --exact parity_9_three_queries_at_the_registration_limit
       # 配布物と同じく sink を単体で（dev-dependency の feature を混ぜずに）確かめる。
       # `cargo test` は dev 側（banto-hub-core など）の sqlx の feature と合わさって
       # 通ってしまい、#764 から `cargo build --release -p banto-hub-sink` が
