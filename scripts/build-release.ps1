@@ -47,13 +47,37 @@ if (-not $OutDir) {
     $OutDir = Join-Path $repoRoot "dist\$Version"
 }
 # 後段の [System.IO.File]::WriteAllText はプロセスの作業フォルダ基準で相対パスを解決し、
-# PowerShell の現在の場所（Copy-Item・Get-FileHash の基準）とずれることがある。
-# $OutDir の相対指定は呼び出し元の現在の場所の基準で絶対にする。
-if (-not [System.IO.Path]::IsPathRooted($OutDir)) {
-    $OutDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $OutDir))
-}
+# PowerShell の現在の場所（Copy-Item・Get-FileHash の基準）とずれることがある。また
+# New-PSDrive で作ったドライブ（rel:\out など）は .NET が解決できない。相対指定も
+# PSDrive も、PowerShell の現在の場所基準で実際のファイルシステムのパスにする。
+$OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 $releaseDir = Join-Path $repoRoot 'target\release'
 Write-Host "banto-hub リリースビルド version=$Version OutDir=$OutDir"
+
+# コピー先のリリース名の表（早い確かめと後段のコピーの両方で使う）。
+$copies = [ordered]@{
+    'banto-hub.exe'       = "banto-hub-v$Version-windows-x86_64.exe"
+    'banto-hub-shell.exe' = "banto-hub-shell-v$Version-windows-x86_64.exe"
+    'banto-hub-elev.exe'  = "banto-hub-elev-v$Version-windows-x86_64.exe"
+    'banto-hub-sink.exe'  = "banto-hub-sink-v$Version-windows-x86_64.exe"
+}
+$cdlaName = 'CDLA-Permissive-2.0.txt'
+$setupName = "BantoHub_${Version}_x64-setup.exe"
+$planned = @($copies.Values) + @($cdlaName)
+if (-not $SkipInstaller) { $planned += $setupName }
+$planned += 'SHA256SUMS.txt'
+
+# 前回の残りのファイルが $OutDir にあれば、長いビルドの前に失敗させる。ディレクトリ
+# ごと配布すると SHA256SUMS.txt に載らないファイル（-SkipInstaller のときの前回の
+# インストーラなど）まで配られるため。消しはしない。この実行で置く名前のファイルは
+# 上書きされるので許す。
+$plannedNames = [System.Collections.Generic.HashSet[string]]::new([string[]]$planned, [System.StringComparer]::OrdinalIgnoreCase)
+if (Test-Path -LiteralPath $OutDir -PathType Container) {
+    $leftover = @(Get-ChildItem -LiteralPath $OutDir -File | Where-Object { -not $plannedNames.Contains($_.Name) } | Sort-Object Name | ForEach-Object { $_.Name })
+    if ($leftover.Count -gt 0) {
+        throw ("$OutDir に、この実行で作らないファイルが残っています: " + ($leftover -join ', ') + "。SHA256SUMS.txt に載らないまま配られるのを避けるため中止します。消すか、別の -OutDir を指定してください。")
+    }
+}
 
 # --- (a) ツールチェーン確認 ------------------------------------------------
 Invoke-Native 'cargo --version' { cargo --version }
@@ -109,12 +133,6 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # この実行で置いたファイル名（SHA256SUMS.txt に載せるのはこれだけ）。
 $produced = [System.Collections.Generic.List[string]]::new()
 
-$copies = [ordered]@{
-    'banto-hub.exe'       = "banto-hub-v$Version-windows-x86_64.exe"
-    'banto-hub-shell.exe' = "banto-hub-shell-v$Version-windows-x86_64.exe"
-    'banto-hub-elev.exe'  = "banto-hub-elev-v$Version-windows-x86_64.exe"
-    'banto-hub-sink.exe'  = "banto-hub-sink-v$Version-windows-x86_64.exe"
-}
 foreach ($name in $copies.Keys) {
     Copy-Item -Path (Join-Path $releaseDir $name) -Destination (Join-Path $OutDir $copies[$name]) -Force
     $produced.Add($copies[$name])
@@ -126,8 +144,8 @@ $cdlaLicense = Join-Path $repoRoot 'apps\banto-hub\installer\assets\CDLA-Permiss
 if (-not (Test-Path -LiteralPath $cdlaLicense -PathType Leaf)) {
     throw "Missing bundled certificate data license: $cdlaLicense"
 }
-Copy-Item -LiteralPath $cdlaLicense -Destination (Join-Path $OutDir 'CDLA-Permissive-2.0.txt') -Force
-$produced.Add('CDLA-Permissive-2.0.txt')
+Copy-Item -LiteralPath $cdlaLicense -Destination (Join-Path $OutDir $cdlaName) -Force
+$produced.Add($cdlaName)
 
 if (-not $SkipInstaller) {
     # tauri-bundler の既定命名規則（apps/banto-hub/installer/src/main.rs 参照）。
@@ -135,14 +153,13 @@ if (-not $SkipInstaller) {
     if (-not (Test-Path $setupSrc)) {
         throw "インストーラが見つかりません: $setupSrc"
     }
-    $setupName = "BantoHub_${Version}_x64-setup.exe"
     Copy-Item -Path $setupSrc -Destination (Join-Path $OutDir $setupName) -Force
     $produced.Add($setupName)
 }
 
 # --- (h) SHA256SUMS.txt（sha256sum 互換の "<hash> *<name>" 形式） --------
 # この実行で置いたファイルだけ。前回の残り（-SkipInstaller のときの setup.exe
-# など）は載せず、下で警告する。
+# など）は、ビルドの前の確かめで失敗させてあるので載らない。
 $sumsPath = Join-Path $OutDir 'SHA256SUMS.txt'
 $lines = $produced | Sort-Object |
     ForEach-Object { '{0} *{1}' -f (Get-FileHash -Algorithm SHA256 -Path (Join-Path $OutDir $_)).Hash.ToLower(), $_ }
@@ -156,11 +173,5 @@ Write-Host ''
 Write-Host "生成物（$OutDir）:"
 $produced | Sort-Object | ForEach-Object { Write-Host "  $_" }
 Write-Host '  SHA256SUMS.txt'
-$stale = Get-ChildItem -Path $OutDir -File |
-    Where-Object { $_.Name -ne 'SHA256SUMS.txt' -and -not $produced.Contains($_.Name) } |
-    Sort-Object Name
-if ($stale) {
-    Write-Warning ("この実行で作っていないファイルが $OutDir に残っています（SHA256SUMS.txt には載せていません。配らないなら消してください）: " + (($stale | ForEach-Object { $_.Name }) -join ', '))
-}
 Write-Host ''
 Write-Host '注意: 生成したインストーラをビルド機の評価用 Hub に対して実行しないこと（Windows サービス化・ACL 付与が実環境に及ぶ - 実機確認は docs/banto-hub-installer-design.md §6 row I4 の手順で別途行う）。'
