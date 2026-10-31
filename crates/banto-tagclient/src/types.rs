@@ -334,8 +334,9 @@ impl GenerationSnapshot {
     }
 
     /// Look up one application `binding_key` in this generation. A resolved
-    /// key returns its catalog row and, while `Live`, its value (R4: always
-    /// `Some` while `Live`). A key that was never requested returns `None`.
+    /// key returns its catalog row and, while `Live`, its value. R4: the worker
+    /// checks, before publishing `Live`, that every resolved binding has a
+    /// catalog row and a value row, so `value` is always `Some` while `Live`. A key that was never requested returns `None`.
     ///
     /// The lookup is a linear scan of the resolution, catalog, and values.
     pub fn binding(&self, binding_key: &str) -> Option<BindingView<'_>> {

@@ -418,6 +418,7 @@ revision を同時に更新し、lock を離してから `revision_tx.send`）�
   REST snapshot は `finalize` で `RuntimeMetadataMismatch` になる（現状どおり）。
 - **R4（Live の完全性）**: `Live` の `values.values` は `resolution.resolved` の外部名と**完全一致**
   （`finalize` の件数一致チェック）。`BindingView::Resolved.value` は `Live` で必ず `Some`。
+  worker が公開の直前に、解決済みのすべての Binding に catalog の行と値の行があることを確かめ、欠けていれば `ProtocolError` で公開しない（2026-10-31、オーナーの Codex CLI の指摘による）。
 - **R5（Unbound の完全性）**: `Unbound` では `resolution.resolved` が空、`resolution.unresolved` が
   要求の全件、`values` が `None`。
 - **R6（`Arc`）**: `TagClientState::clone()` は `Arc` の参照カウントだけを増やす。catalog が数千行

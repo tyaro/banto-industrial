@@ -467,6 +467,7 @@ fn publish_snapshot(
     was_live: &mut bool,
 ) -> Result<()> {
     let values = gate.finalize(catalog)?;
+    check_live_complete(catalog, resolution, &values)?;
     let mut state = TagClientState::new(TagClientConnectionState::Stopped);
     state.publish(GenerationSnapshot {
         generation,
@@ -476,6 +477,33 @@ fn publish_snapshot(
     });
     state_tx.send_replace(state);
     *was_live = true;
+    Ok(())
+}
+
+/// Before publishing `Live`, require that every resolved binding has a
+/// catalog row and a value row (R4), so `GenerationSnapshot::binding()` never
+/// yields `Resolved { value: None }` while `Live`.
+fn check_live_complete(
+    catalog: &crate::types::CatalogSnapshot,
+    resolution: &crate::binding::BindingResolution,
+    values: &crate::types::ValuesSnapshot,
+) -> Result<()> {
+    let catalog_names: std::collections::HashSet<&str> = catalog
+        .tags
+        .iter()
+        .map(|tag| tag.external_name.as_str())
+        .collect();
+    let value_names: std::collections::HashSet<&str> = values
+        .values
+        .iter()
+        .map(|value| value.tag.as_str())
+        .collect();
+    for binding in &resolution.resolved {
+        let name = binding.external_name.as_str();
+        if !catalog_names.contains(name) || !value_names.contains(name) {
+            return Err(Error::new(ErrorKind::ProtocolError));
+        }
+    }
     Ok(())
 }
 
@@ -553,6 +581,43 @@ mod tests {
             collection_mode: CollectionMode::Configured,
             values,
         }
+    }
+
+    fn resolved(name: &str) -> crate::binding::BindingResolution {
+        crate::binding::BindingResolution {
+            resolved: vec![crate::binding::ResolvedBinding {
+                binding_key: format!("bk-{name}"),
+                external_name: name.into(),
+                tag_key: format!("key:{name}"),
+            }],
+            unresolved: vec![],
+        }
+    }
+
+    #[test]
+    fn check_live_complete_rejects_missing_value_row() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "a")]);
+        let values = values(vec![value("b", 1.0, 10)]);
+        let err = check_live_complete(&catalog, &resolution, &values).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ProtocolError);
+    }
+
+    #[test]
+    fn check_live_complete_rejects_missing_catalog_row() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "b")]);
+        let values = values(vec![value("a", 1.0, 10)]);
+        let err = check_live_complete(&catalog, &resolution, &values).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ProtocolError);
+    }
+
+    #[test]
+    fn check_live_complete_accepts_complete_generation() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "a")]);
+        let values = values(vec![value("a", 1.0, 10)]);
+        check_live_complete(&catalog, &resolution, &values).unwrap();
     }
 
     fn value(tag: &str, number: f64, timestamp: i64) -> ValueEntry {
