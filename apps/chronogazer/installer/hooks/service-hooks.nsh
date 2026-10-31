@@ -483,25 +483,26 @@ Var ShellQuitWaitCounter
 ; 失敗したら同じく止める（登録が無ければそのまま続ける。#972 のオーナーレビュー P2）。
 !macro UnregisterChronoGazerService
   DetailPrint "chronogazer: Windows サービス (ChronoGazer) の登録を解除しています..."
+  ; 登録が無ければ解除は要らない（インストールの登録が失敗した・利用者が先に
+  ; service-uninstall した）。elev の service-uninstall は未登録を終了コード 2 で
+  ; 返すので、先に確かめないとアンインストールできなくなる（#972 の Codex の指摘）。
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "ImagePath"
   ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
   ClearErrors
-  ${If} ${FileExists} "$INSTDIR\chronogazer-elev.exe"
+  ${If} $1 == ""
+    DetailPrint "chronogazer: サービス ChronoGazer は登録されていないので、登録の解除は飛ばします。"
+    StrCpy $0 0
+  ${ElseIf} ${FileExists} "$INSTDIR\chronogazer-elev.exe"
     ExecWait '"$INSTDIR\chronogazer-elev.exe" service-uninstall' $0
   ${ElseIf} ${FileExists} "$INSTDIR\chronogazer-server.exe"
     DetailPrint "chronogazer: chronogazer-elev.exe が見つからないため chronogazer-server.exe uninstall にフォールバックします"
     ExecWait '"$INSTDIR\chronogazer-server.exe" uninstall' $0
   ${Else}
-    ; 両方無くても、登録が残っていれば sc delete で解除する。解除できなければ
+    ; 両方無くても登録が残っていれば sc delete で解除する。解除できなければ
     ; 下の失敗の扱いでファイルを消す前に止める（#972 のオーナーレビュー P2）。
-    ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "ImagePath"
-    ${If} $1 == ""
-      DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つかりませんが、サービス ChronoGazer は登録されていません。"
-      StrCpy $0 0
-    ${Else}
-      DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つからないため、sc delete ChronoGazer で登録を解除します..."
-      nsExec::ExecToLog 'sc.exe delete ChronoGazer'
-      Pop $0
-    ${EndIf}
+    DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つからないため、sc delete ChronoGazer で登録を解除します..."
+    nsExec::ExecToLog 'sc.exe delete ChronoGazer'
+    Pop $0
   ${EndIf}
   ${If} ${Errors}
     StrCpy $0 "exec-error"
