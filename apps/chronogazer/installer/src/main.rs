@@ -123,8 +123,10 @@
 //!    （止めたままのサービスを戻す）を呼ぶ。
 //! 5. P5: インストーラ属性 `AllowSkipFiles off`（`OutFile` の直後。インストーラ
 //!    全体に効き、`File` の失敗の窓から「無視」が消え、silent では中止になる）、
-//!    `File` の直前に `ResetChronoGazerInstallDirAcl`（インストール先の所有者を
-//!    Administrators にして ACL を既定へ戻す。失敗なら `Abort`）と `ClearErrors`、外部バイナリの `File` の直後にフックの
+//!    `File` の直前に `ResetChronoGazerInstallDirAcl`（インストール先そのものと
+//!    直下の普通のファイルの所有者を Administrators にして ACL を既定へ戻す。
+//!    `icacls /T` は使わず、再解析ポイントやサブフォルダがあれば `Abort`。
+//!    失敗なら `Abort`）と `ClearErrors`、外部バイナリの `File` の直後にフックの
 //!    `RequireChronoGazerFilesCopied`（エラーフラグが立っていれば `Abort`。
 //!    `.onInstFailed` が止めたサービスを戻す）。
 //! 6. P6: Section Uninstall で、再確認の直後・登録の解除の前にフックの

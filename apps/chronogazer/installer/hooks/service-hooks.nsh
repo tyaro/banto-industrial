@@ -98,7 +98,10 @@
 ;   この後、テンプレートの再確認（P2、同じ QuitShellForUpdate。[キャンセル] は
 ;   止めたサービスを戻してから `Abort`）→ **インストール先の所有者・ACL の既定への
 ;   戻し**（ResetChronoGazerInstallDirAcl。弱い ACL の既存フォルダに exe を置かない。
-;   失敗なら `Abort`、まだファイルは変えていない。#972 のオーナーレビュー（2b9ad63））
+;   `icacls /T` ではなく、インストール先そのものと直下の普通のファイルだけを /L で
+;   1 つずつ戻し、再解析ポイントやサブフォルダがあれば `Abort`。
+;   失敗なら `Abort`、まだファイルは変えていない。#972 のオーナーレビュー（2b9ad63・
+;   fd7973e））
 ;   → `ClearErrors` → `File` でファイルの
 ;   上書き → **上書きの結果の確かめ**（RequireChronoGazerFilesCopied、P5。
 ;   #972 のオーナーレビュー 5 回目）。
@@ -444,23 +447,109 @@ Var ServiceStopWaitCounter
 ; が残っていると、一般の利用者が LocalSystem のサービスの exe を差し替えられる。
 ; そこで、ファイルを置く前（テンプレートの当て直しが `ClearErrors` の前に挿入）に、
 ; 所有者を BUILTIN\Administrators（S-1-5-32-544）にし、明示の ACE を捨てて Program
-; Files から継承する ACL だけにする。どちらかが非 0 なら案内して `Abort`
+; Files から継承する ACL だけにする。どれかが駄目なら案内して `Abort`
 ; （まだファイルは変えていない。止めたサービスは .onInstFailed が戻す）。
-; $0・$1 を壊す。
+;
+; **`icacls /T` は使わない**（#972 のオーナーレビュー（fd7973e）P1）: /T は子を再帰で
+; 辿り、/L を付けないとリンクそのものではなく**リンク先**を処理する。事前の確かめ
+; （RequireDefaultInstallDir）が見たのはインストール先とその上のフォルダだけなので、
+; 弱い ACL の既存フォルダに一般の利用者がシンボリックリンクやジャンクションを置いて
+; いれば、昇格した icacls がインストール先の**外**の所有者・ACL を書き換えていた。
+; そこで ACL を触る対象を「確かめ済みのインストール先そのもの」と「その直下の普通の
+; ファイル」に限る:
+;   (a) インストール先そのものが再解析ポイントでないことをもう一度確かめ
+;       （GetFileAttributesW の FILE_ATTRIBUTE_REPARSE_POINT = 0x400。上のフォルダは
+;       Program Files で一般の利用者は書けないので、事前の確かめのままとみなす）、
+;       `/setowner` と `/reset` を **/L（リンクを解かない）付き・/T なし**で掛ける。
+;       これで直下に新しい項目を作る・名前を変える（FILE_ADD_FILE・
+;       FILE_ADD_SUBDIRECTORY）のは管理者だけになる（継承する Program Files の ACL は
+;       Users に読み取りと実行だけ）。
+;   (b) 直下の項目を FindFirst/FindNext で 1 つずつ見る（`.`・`..` は飛ばす）:
+;       - 再解析ポイント（属性を読めないものも含む）→ 案内して `Abort`。icacls が
+;         インストール先の外に触らないようにするため。
+;       - フォルダ → 案内して `Abort`。このインストーラはインストール先に
+;         サブフォルダを作らない（tauri-bundler のテンプレートは main・外部バイナリの
+;         `File` と `uninstall.exe` の書き込みだけで、resources は無い）ので、あれば
+;         利用者か別のプログラムが置いた物。再帰で辿る代わりに、消してから（または
+;         アンインストールしてから）やり直してもらう。
+;       - 普通のファイル → `/setowner` と `/reset` を /L 付き・/T なしで掛ける。
+;         残っているファイルも既定の ACL に戻すのは、chronogazer-server.exe の隣に
+;         利用者が書ける DLL が残ると、LocalSystem のサービスが DLL の検索順で
+;         それを読み込みうるため（置き換えでなく「残ったまま」でも危ない）。
+;   (a) の後は一般の利用者が直下に項目を足せないので、(b) で見た項目が icacls までの
+;   間に別の物へ差し替わることはない（自分の項目を消すことはできるが、足せない）。
+;
+; $0〜$5 を壊す（$2 は FindFirst のハンドル。中止の道は全部 FindClose してから `Abort`）。
 !macro ResetChronoGazerInstallDirAcl
-  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  ; (a) インストール先そのもの。
+  StrCpy $4 "$INSTDIR"
+  System::Call 'kernel32::GetFileAttributesW(w r4) i .r5'
+  IntOp $0 $5 & 1024
+  ${If} $5 == -1
+  ${OrIf} $0 != 0
+    !insertmacro AbortChronoGazerInstallDirAcl "インストール先そのものが再解析ポイント（ジャンクションやリンク）になっているか、属性を読めませんでした。"
+  ${EndIf}
+  !insertmacro IcaclsResetChronoGazerEntry
+  ${If} $0 != "0"
+    DetailPrint "chronogazer: icacls の出力: $1"
+    !insertmacro AbortChronoGazerInstallDirAcl "icacls が失敗しました（終了コード $0）。"
+  ${EndIf}
+  ; (b) 直下の項目。
+  FindFirst $2 $3 "$INSTDIR\*.*"
+  ${If} $2 == ""
+    !insertmacro AbortChronoGazerInstallDirAcl "インストール先の中身を列挙できませんでした。"
+  ${EndIf}
+  ${Do}
+    ${If} $3 == ""
+      ${ExitDo}
+    ${EndIf}
+    ${If} $3 != "."
+    ${AndIf} $3 != ".."
+      StrCpy $4 "$INSTDIR\$3"
+      System::Call 'kernel32::GetFileAttributesW(w r4) i .r5'
+      IntOp $0 $5 & 1024
+      IntOp $1 $5 & 16
+      ${If} $5 == -1
+      ${OrIf} $0 != 0
+        FindClose $2
+        !insertmacro AbortChronoGazerInstallDirAcl "インストール先の中に再解析ポイント（ジャンクションやリンク）があるか、属性を読めませんでした。"
+      ${ElseIf} $1 != 0
+        FindClose $2
+        !insertmacro AbortChronoGazerInstallDirAcl "インストール先の中にサブフォルダがあります。ChronoGazer のインストーラはサブフォルダを作らないので、ChronoGazer の物ではありません。"
+      ${EndIf}
+      !insertmacro IcaclsResetChronoGazerEntry
+      ${If} $0 != "0"
+        DetailPrint "chronogazer: icacls の出力: $1"
+        FindClose $2
+        !insertmacro AbortChronoGazerInstallDirAcl "icacls が失敗しました（終了コード $0）。"
+      ${EndIf}
+    ${EndIf}
+    FindNext $2 $3
+  ${Loop}
+  FindClose $2
+!macroend
+
+; ResetChronoGazerInstallDirAcl の 1 項目分: $4 のパス（インストール先そのものか、
+; その直下の普通のファイル）の所有者を Administrators にし、明示の ACE を捨てる。
+; /L でリンクを解かず、/T を付けず（その項目だけ）。$0 に終了コード、$1 に出力。
+!macro IcaclsResetChronoGazerEntry
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$4" /setowner *S-1-5-32-544 /L /C /Q'
   Pop $0
   Pop $1
   ${If} $0 == "0"
-    nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
+    nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$4" /reset /L /C /Q'
     Pop $0
     Pop $1
   ${EndIf}
-  ${If} $0 != "0"
-    DetailPrint "chronogazer: インストール先 $INSTDIR の所有者・ACL を既定に戻せませんでした（icacls 終了コード $0）。$1"
-    MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした（icacls 終了コード $0）。$\r$\n$\r$\n既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。ファイルはまだ変更していません。上書き前に止めた ChronoGazer サービスは戻します。$\r$\n$\r$\nフォルダを使用しているプログラムを終了するか、管理者権限で $INSTDIR の所有者とアクセス権を確かめてから、もう一度実行してください。" /SD IDOK
-    Abort "インストール先の所有者・ACL を既定に戻せなかったため、インストールを中止しました。"
-  ${EndIf}
+!macroend
+
+; ResetChronoGazerInstallDirAcl の中止: $4 の項目について `reason` を案内して `Abort`。
+; まだファイルは変えていない。止めたサービスは .onInstFailed が戻す
+; （$ChronoGazerWasRunning はそのまま）。呼ぶ前に FindClose を済ませること。
+!macro AbortChronoGazerInstallDirAcl reason
+  DetailPrint "chronogazer: インストール先 $INSTDIR の所有者・ACL を既定に戻せませんでした。${reason}（対象: $4）"
+  MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした。$\r$\n${reason}$\r$\n対象: $4$\r$\n$\r$\n既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。ファイルはまだ変更していません。上書き前に止めた ChronoGazer サービスは戻します。$\r$\n$\r$\n対象のリンクやサブフォルダを取り除く（または先にアンインストールする）か、フォルダを使用しているプログラムを終了するか、管理者権限で $INSTDIR の所有者とアクセス権を確かめてから、もう一度実行してください。" /SD IDOK
+  Abort "インストール先の所有者・ACL を既定に戻せなかったため、インストールを中止しました。"
 !macroend
 
 ; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
