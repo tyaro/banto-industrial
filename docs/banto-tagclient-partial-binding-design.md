@@ -1,7 +1,7 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **設計（Issue #682）。PR-1（同一世代 snapshot）は実装済み・未マージ（設計の PR #982 の上に積んだ PR）。PR-H・PR-2・PR-3 は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+状態: **設計（Issue #682）。PR-1（同一世代 snapshot）は #983 でマージ済み（2026-10-31）。PR-H は実装済み・未マージ。PR-2・PR-3 は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
 閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
 Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
@@ -608,7 +608,7 @@ PR-2 より前なら従来の `BindingUnresolved` → 再試行で直る）。PR
   を返すアクセサ（`catalog_with_revision()` のような名前。既存の `tag_map()` / `revision()` は残す）を
   足す。`rest/tag_space.rs` の `build_catalog_response`（L149〜L150）と `v1_values` / `v1_value_single`
   → `build_values_response`（L326 / L469 の `tag_map()` と L432 の `revision()`）を、その 1 回の読みの
-  `map` と `revision` を使う形にする。`run_id` は `controller.status()` 由来で別物なので触らない（§5.2）。
+  `map` と `revision` を使う形にする。gRPC の `get_catalog` / `read_values`（`grpc.rs`）にも同じ別々の読みがあったので、同じ PR で揃える（実装時に見つけた）。`run_id` は `controller.status()` 由来で別物なので触らない（§5.2）。
   アクセサの doc に「`commit_catalog` は map と revision を同じ lock で更新するので、別々に読むと
   （旧 map, 新 revision）になりうる。REST 応答は必ずこちらで読む」と書く。
 - 完了条件: 既存テスト全緑。新規テスト = `commit_catalog` と GET catalog / GET values を並行に回し、

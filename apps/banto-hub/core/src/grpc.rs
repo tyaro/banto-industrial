@@ -655,8 +655,8 @@ impl TagServiceTrait for GrpcService {
     ) -> Result<Response<GetCatalogResponse>, Status> {
         self.authenticate(&request, RequireScope::Read).await?;
         let req = request.into_inner();
-        let map = self.manager.tag_map();
-        let revision = self.manager.revision();
+        // #682 PR-H: 応答の revision は map と同じ lock の読みから取る。
+        let (map, revision) = self.manager.catalog_with_revision();
         let tags = map
             .iter()
             .filter(|entry| req.connection.is_empty() || entry.connection == req.connection)
@@ -672,8 +672,8 @@ impl TagServiceTrait for GrpcService {
     ) -> Result<Response<ReadValuesResponse>, Status> {
         let ctx = self.authenticate(&request, RequireScope::Read).await?;
         let req = request.into_inner();
-        let map = self.manager.tag_map();
-        let revision = self.manager.revision();
+        // #682 PR-H: 応答の revision は map と同じ lock の読みから取る。
+        let (map, revision) = self.manager.catalog_with_revision();
         let now_ms = self.manager.clock().now_ms();
         let current = self.manager.current_values();
         let server_store = self.manager.server_store();
