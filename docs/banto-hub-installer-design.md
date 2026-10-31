@@ -47,6 +47,7 @@ v0.2.0-alpha.2 の配布物は、NSIS インストーラ（**Hub 本体のみ**�
 ### 4.1 配置と表示
 
 - インストール先: `C:\Program Files\BantoHub\`（PerMachine 固定、現状どおり）。
+- elev の `service-install` / `autostart-enable` / `autostart-disable` は、隣の `banto-hub.exe` が Program Files（x86 を含む）の外にあると、何も登録せずに止める（#973。一般の利用者が書き換えられる場所の exe を LocalSystem で登録させない。Program Files の場所が分からないときも止める。比べる前に、`banto-hub.exe` と Program Files の両方を `canonicalize`（長い名前・ジャンクションの解決・`\\?\` を外す）で正規化し、登録するのも正規化後のパス。8.3 や `\\?\` での起動を断らず、ジャンクションで外へ向けた配置は断る）。
 - 同梱: `banto-hub-shell.exe`（main）、`banto-hub.exe`、`banto-hub-elev.exe`、`banto-hub-sink.exe`、`banto-hub-sink.toml.example`、ライセンス・README 抜粋。
 - スタートメニューに **BantoHub（シェル）** のショートカット。デスクトップショートカットは既定では作らない（§7-3）。**補足（2026-09-07、I4 追従）**: tauri-bundler のテンプレートは silent / passive ではセクション内で無条件に作り、対話モードでは完了ページの「デスクトップにショートカットを作成」チェック（既定 ON、フックより後に実行）で作る。前者は POSTINSTALL で削除し、後者は利用者の選択に委ねる（フックからは介入できない）。
 - 完了ページの「インストール後に BantoHub を実行する」は、main がシェルになることで**意味のある動作**になる（現状の Hub 単体では消せない既知の制約だったもの）。
