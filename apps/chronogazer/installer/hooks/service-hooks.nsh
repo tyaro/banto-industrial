@@ -82,7 +82,30 @@
 ;       頼んであるので戻す操作は無く、$ChronoGazerWasRunning を "0" にして
 ;       （`.onInstFailed` が `sc start` を試みないように）止める。
 ;   この後、テンプレートの再確認（P2、同じ QuitShellForUpdate。[キャンセル] は
-;   止めたサービスを戻してから `Abort`）→ `File` でファイルの上書き。
+;   止めたサービスを戻してから `Abort`）→ `ClearErrors` → `File` でファイルの
+;   上書き → **上書きの結果の確かめ**（RequireChronoGazerFilesCopied、P5。
+;   #972 のオーナーレビュー 5 回目）。
+;
+; ## ファイルの上書きの結果（P5、Section Install の `File` の直後）
+;
+;   `File` が使用中などで書けないと NSIS は中止／再試行／無視の窓を出し、
+;   「無視」はそのファイルを飛ばしてエラーフラグを立てるだけで続行する。原本は
+;   フラグを見ないので、旧い exe と新しい exe が混ざったまま POSTINSTALL の
+;   `service-install`（`ClearErrors` する）を通って成功と報告されていた。そこで:
+;   - `AllowSkipFiles off`（P5、インストーラ属性。インストーラ全体に効く）で
+;     「無視」を出さない。窓は再試行／中止だけになり、silent では中止になる
+;     （`File` の失敗 = `Abort` = `.onInstFailed`）。
+;   - それでも `File`・`CreateDirectory` の失敗が成功扱いにならないよう、
+;     `File` の直前で `ClearErrors`、直後に `${If} ${Errors}` で確かめ、立っていれば
+;     案内して `Abort`（POSTINSTALL には進まない）。
+;   中止のとき `.onInstFailed` が止めたサービスを戻す。**一部だけ新しい状態で
+;   戻してよい理由**: `File` は書けなければ元のファイルに触らない（開けた時点で
+;   上書きする）ので、各 exe は丸ごと旧いか丸ごと新しいかのどちらかで、壊れた
+;   exe は無い。サービスは登録済みの `chronogazer-server.exe`（旧いか新しいか）で、
+;   上書きの前と同じ設定（登録・ACL は前回の service-install のまま。
+;   service-install は登録を作り直さない）で動く。収集を止めたままにする方が
+;   記録の欠けになるので、上書きの前の状態（動いていた）に戻す。インストーラは
+;   失敗で終わるので、利用者はもう一度実行して揃える（案内に書く）。
 ;
 ; ## POSTINSTALL
 ;
@@ -113,18 +136,39 @@
 ;   `Abort` する道は、戻すか（P2 の再確認の [キャンセル]）、戻さないと決めて
 ;   "0" にするか（(5)・POSTINSTALL の失敗）のどちらかを先に済ませているので、
 ;   ここが効くのは `File` の失敗（上書きの直前にシェルが起動された・ウイルス
-;   対策のロック）のときだけ。silent でも呼ばれる。
+;   対策のロック。NSIS の窓の [中止] と、P5 の確かめの `Abort` の両方）のとき
+;   だけ。silent でも呼ばれる。
 ;
 ; ## PREUNINSTALL
 ;
 ;   シェルの終了（PREINSTALL と同じ待ち。[キャンセル] でアンインストールを中止）
 ;   → サービスの停止 → RUNNING／*_PENDING のままなら `Abort`（(5) と同じ）、まで。
 ;   **登録の解除はここでしない**。Section Uninstall の再確認（下記）の後に
-;   UnregisterChronoGazerService が `chronogazer-elev.exe service-uninstall`
-;   （無ければ `chronogazer-server.exe uninstall`、それも無ければ登録が残って
-;   いれば `sc delete ChronoGazer`）を行う。非 0（または起動できない）で失敗したら
-;   止めたサービスを再開し（戻せなければそれも案内）、メッセージを出して `Abort`
-;   する（ファイルを消す前に止まる）。
+;   次の順で進む（テンプレートの当て直し P2・P6。#972 のオーナーレビュー 5 回目）:
+;   (a) **使用中の exe の確かめ**（RequireChronoGazerExesUnlocked）: 3 つの exe の
+;       それぞれを `FileOpen ... a`（読み書きで開く。中身は変えずすぐ閉じる）で
+;       開けるかを見る。動いている exe はローダーが書込みの共有を許さないので
+;       開けない（`Rename` は動いている exe でも通るので判定に使えない。
+;       `Delete` も動いている exe には失敗するが、消してから気づくのでは遅い）。
+;       1 つでも開けなければ、止めたサービスを戻して案内し `Abort`（まだ何も
+;       変更していない）。再確認の後にシェルが起動された・コンソール版の
+;       `chronogazer-server.exe` が動いている、が掛かる。
+;   (b) UnregisterChronoGazerService が `chronogazer-elev.exe service-uninstall`
+;       （無ければ `chronogazer-server.exe uninstall`、それも無ければ登録が残って
+;       いれば `sc delete ChronoGazer`）を行う。非 0（または起動できない）で失敗
+;       したら止めたサービスを再開し（戻せなければそれも案内）、メッセージを
+;       出して `Abort` する（ファイルを消す前に止まる）。
+;   (c) テンプレートの `Delete` で 3 つの exe を消す。
+;   (d) **消えたことの確かめ**（RequireChronoGazerExesDeleted）: 1 つでも残って
+;       いれば（(a) の後に起動された・ウイルス対策のロック）、`uninstall.exe` と
+;       「アプリ」の登録（HKLM の Uninstall キー）を消す**前に**止める。
+;       サービスの登録は (b) で消えているので、`chronogazer-elev.exe` が残って
+;       いれば `service-install` で戻し（起動種別は手動に戻る。自動開始にして
+;       いたなら付け直す、と案内）、止めていたサービスを再開する。elev が消えて
+;       いる・`service-install` が失敗したときは戻せないので、手順（このインス
+;       トーラをもう一度実行して入れ直す）を案内する。どちらも `Abort`。
+;       残った exe 以外は消えているので、もう一度アンインストールすると、
+;       (a) は無いファイルを飛ばし、(b) は elev が無ければフォールバックする。
 ;   `%ProgramData%\ChronoGazer\`（DB・時系列データ・Hub のキー・ログ）は
 ;   **削除しない**（再インストールでデータが戻ることを優先する。Hub と同じ）。
 ;
@@ -180,11 +224,14 @@
 ; ファイルの削除）で、再確認の [キャンセル] は止めたサービスを戻して `Abort`
 ; する（まだ何も変更していない）。
 ; 残る隙間は「再確認の後・ファイルの上書きの前にシェルが起動される」の一瞬だけで、
-; そのときは NSIS 自身の「ファイルが使用中」の中止／再試行／無視の窓になる
-; （強制終了にはならない）。
+; そのときは NSIS 自身の「ファイルが使用中」の中止／再試行の窓になる
+; （`AllowSkipFiles off` で「無視」は無い。強制終了にはならない。上の「ファイルの
+; 上書きの結果」節）。アンインストールでは上の PREUNINSTALL の (a)・(d) が掛かる。
 ;
 ; 当て直したテンプレートは `QuitShellForUpdate`・`ChronoGazerInstallPreflight`・
-; `UnregisterChronoGazerService`・`ChronoGazerOnInstFailed` を `!insertmacro` する
+; `UnregisterChronoGazerService`・`ChronoGazerOnInstFailed`・
+; `RequireChronoGazerFilesCopied`・`RequireChronoGazerExesUnlocked`・
+; `RequireChronoGazerExesDeleted` を `!insertmacro` する
 ; ので、マクロの名前・引数の並びを変えるときは src/main.rs の TEMPLATE_PATCHES も
 ; 一緒に直す（試験 `patch_template_applies_*` が名前と並びを見る）。
 ;
@@ -312,6 +359,94 @@ Var ShellQuitWaitCounter
     DetailPrint "chronogazer: ChronoGazer サービスが止まっていません（RUNNING か PENDING のまま）。実行ファイルを入れ替えられないため、${action}を中止しました。"
     MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ChronoGazer）、止まってからもう一度実行してください。" /SD IDOK
     Abort "ChronoGazer サービスが止まっていないため、${action}を中止しました。"
+  ${EndIf}
+!macroend
+
+; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
+; 当て直しが Section Install の `File` の直後に挿入する。直前の `ClearErrors` も
+; 当て直しが置く）。エラーフラグが立っていれば案内して `Abort`。止めたサービスは
+; `.onInstFailed` が戻す（$ChronoGazerWasRunning はそのまま）。
+!macro RequireChronoGazerFilesCopied
+  ${If} ${Errors}
+    DetailPrint "chronogazer: ファイルの上書きに失敗したものがあります。旧い実行ファイルと新しい実行ファイルが混ざらないよう、インストールを中止します。上書き前に止めた ChronoGazer サービスは戻します。"
+    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます。上書き前に止めていた ChronoGazer サービスは戻します（各ファイルは丸ごと旧いか丸ごと新しいかのどちらかで、壊れてはいません）。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    Abort "ファイルの上書きに失敗したため、インストールを失敗として終えました。"
+  ${EndIf}
+!macroend
+
+; 使用中の exe の確かめの 1 つ分（上の PREUNINSTALL の (a)）。あって読み書きで
+; 開けなければ $1 に名前を足す。`FileOpen ... a` は無いファイルを作るので、
+; 先に有無を見る。開けたら中身を変えずに閉じる。$0 を壊す。
+!macro CheckChronoGazerExeUnlocked exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    ClearErrors
+    FileOpen $0 "$INSTDIR\${exe_name}" a
+    ${If} ${Errors}
+      StrCpy $1 "$1 ${exe_name}"
+    ${Else}
+      FileClose $0
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; P6 (a): 3 つの exe のどれかが使用中なら、止めたサービスを戻して `Abort`
+; （まだ何も変更していない。上の PREUNINSTALL の (a)）。$0〜$2 を壊す。
+!macro RequireChronoGazerExesUnlocked
+  StrCpy $1 ""
+  !insertmacro CheckChronoGazerExeUnlocked "${CHRONOGAZER_SHELL_EXE}"
+  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
+  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
+  ${If} $1 != ""
+    ; 名前の並びを $2 に控える（RestartChronoGazerServiceOrWarn が $0・$1 を使うため）。
+    StrCpy $2 $1
+    DetailPrint "chronogazer: 使用中の実行ファイルがあります（$2）。消せないため、アンインストールを中止します（まだ何も変更していません）。"
+    !insertmacro RestartChronoGazerServiceOrWarn "アンインストール"
+    MessageBox MB_OK|MB_ICONSTOP "使用中の実行ファイルがあります（$2）。$\r$\n$\r$\n消せないため、アンインストールを中止しました。まだ何も変更していません（止めたサービスは再開を試みました）。$\r$\n$\r$\nChronoGazer のデスクトップシェル（タスクトレイの「終了」）とコンソール版の chronogazer-server.exe を終了してから、もう一度アンインストールしてください。" /SD IDOK
+    Abort "使用中の実行ファイルがあるため、アンインストールを中止しました。"
+  ${EndIf}
+!macroend
+
+; 消えたことの確かめの 1 つ分（上の PREUNINSTALL の (d)）。残っていれば $2 に名前を足す。
+!macro CheckChronoGazerExeDeleted exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    StrCpy $2 "$2 ${exe_name}"
+  ${EndIf}
+!macroend
+
+; P6 (d): テンプレートの `Delete` の後に exe が残っていれば、`uninstall.exe` と
+; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。サービスの登録は
+; もう解除されているので、elev が残っていれば `service-install` で戻してから
+; 止めていたサービスを再開する。戻せなければ手順を案内する。どちらも `Abort`。
+; $0〜$3 を壊す。
+!macro RequireChronoGazerExesDeleted
+  StrCpy $2 ""
+  !insertmacro CheckChronoGazerExeDeleted "${CHRONOGAZER_SHELL_EXE}"
+  !insertmacro CheckChronoGazerExeDeleted "chronogazer-server.exe"
+  !insertmacro CheckChronoGazerExeDeleted "chronogazer-elev.exe"
+  ${If} $2 != ""
+    DetailPrint "chronogazer: 実行ファイルを消せませんでした（$2）。uninstall.exe と「アプリ」の登録は残したまま、アンインストールを中止します。"
+    ${If} ${FileExists} "$INSTDIR\chronogazer-elev.exe"
+      DetailPrint "chronogazer: 解除した ChronoGazer サービスの登録を chronogazer-elev.exe service-install で戻します..."
+      ClearErrors
+      ExecWait '"$INSTDIR\chronogazer-elev.exe" service-install' $0
+      ${If} ${Errors}
+        StrCpy $0 "exec-error"
+      ${EndIf}
+      ${If} $0 == 0
+        !insertmacro RestartChronoGazerServiceOrWarn "アンインストール"
+        MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2。使用中か、消せませんでした）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残しています。解除していた ChronoGazer サービスの登録は戻しました（起動種別は手動に戻ります。自動開始にしていたなら、シェルの「運用モード」か chronogazer-elev.exe autostart-enable で付け直してください）。止めていたサービスは再開を試みました。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、もう一度アンインストールしてください。" /SD IDOK
+      ${Else}
+        StrCpy $3 $0
+        StrCpy $ChronoGazerWasRunning "0"
+        DetailPrint "chronogazer: ChronoGazer サービスの登録を戻せませんでした（終了コード $3）。このインストーラをもう一度実行して入れ直してください。"
+        MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残していますが、解除した ChronoGazer サービスの登録を戻せませんでした（chronogazer-elev.exe service-install の終了コード $3）。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行して入れ直す（サービスの登録も戻ります）か、もう一度アンインストールしてください。" /SD IDOK
+      ${EndIf}
+    ${Else}
+      StrCpy $ChronoGazerWasRunning "0"
+      DetailPrint "chronogazer: chronogazer-elev.exe が消えているため、ChronoGazer サービスの登録を戻せません。このインストーラをもう一度実行して入れ直してください。"
+      MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残していますが、chronogazer-elev.exe が消えているため、解除した ChronoGazer サービスの登録は戻せません。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行して入れ直す（サービスの登録も戻ります）か、もう一度アンインストールしてください。" /SD IDOK
+    ${EndIf}
+    Abort "実行ファイルを消せなかったため、アンインストールを中止しました。"
   ${EndIf}
 !macroend
 
@@ -468,15 +603,17 @@ Var ShellQuitWaitCounter
 
 !macro NSIS_HOOK_PREUNINSTALL
   ; ここではサービスの登録を解除しない。解除は Section Uninstall の再確認
-  ; （src/main.rs の P2-uninstall-check）の後、ファイルを消す直前の
-  ; UnregisterChronoGazerService で行う（再確認の [キャンセル] で、登録だけ消えて
-  ; ファイルが残る状態を作らないため。#972 のオーナーレビュー）。
+  ; （src/main.rs の P2-uninstall-check）と使用中の exe の確かめ（P6 (a)）の後、
+  ; ファイルを消す直前の UnregisterChronoGazerService で行う（再確認の
+  ; [キャンセル] で、登録だけ消えてファイルが残る状態を作らないため。#972 の
+  ; オーナーレビュー）。消した後の確かめは P6 (d)（上の「PREUNINSTALL」節）。
   !insertmacro QuitShellForUpdate "アンインストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
   !insertmacro RequireChronoGazerServiceInactive "アンインストール"
 !macroend
 
-; サービスの登録解除（Section Uninstall の再確認の直後に挿入される）。
+; サービスの登録解除（Section Uninstall の再確認と使用中の exe の確かめの直後に
+; 挿入される）。
 ; 失敗したら止めたサービスを戻して `Abort` する（ファイルを消す前に止まるので、
 ; 登録されたサービスが消えた exe を指す状態にならない）。chronogazer-elev.exe も
 ; chronogazer-server.exe も無いときは、登録が残っていれば `sc delete` で解除し、それも

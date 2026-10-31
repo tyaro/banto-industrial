@@ -67,7 +67,16 @@
 //! ## NSIS テンプレートの当て直し（`templates/installer.nsi`、[`TEMPLATE_PATCHES`]）
 //!
 //! tauri-bundler 2.9.4 の `installer.nsi` には、このインストーラの方針と合わない
-//! 箇所が 4 つある（PR #972 のオーナーレビュー P1・P2、Codex の指摘 P3、総点検 P4）:
+//! 箇所が 6 つある（PR #972 のオーナーレビュー P1・P2、Codex の指摘 P3、総点検 P4、
+//! 5 回目の P5・P6）:
+//!
+//! - **P5 `File` の失敗の無視**: 上書きの `File` が使用中で書けないと NSIS は
+//!   中止／再試行／無視の窓を出し、「無視」はエラーフラグを立てて続行する。原本は
+//!   フラグを見ないので、旧い exe と新しい exe が混ざったまま POSTINSTALL
+//!   （`ClearErrors` する）を通って成功と報告される。
+//! - **P6 `Delete` の失敗の無視**: Section Uninstall はサービスの登録を解除した
+//!   後にファイルを `Delete` するが、失敗（ロック）を見ずに `uninstall.exe` と
+//!   「アプリ」の登録まで消す。exe が残っているのにアンインストール済みに見える。
 //!
 //! - **P3 Section の順**: `Section EarlyChecks` → `Section WebView2`（ランタイムが
 //!   無ければ取得して入れる）→ `Section Install`（フック）の順なので、PREINSTALL の
@@ -110,6 +119,17 @@
 //!    （何も変えずに止められる確かめの全部）を挿入する。
 //! 4. P4: `Function .onInstFailed` を足し、フックの `ChronoGazerOnInstFailed`
 //!    （止めたままのサービスを戻す）を呼ぶ。
+//! 5. P5: インストーラ属性 `AllowSkipFiles off`（`OutFile` の直後。インストーラ
+//!    全体に効き、`File` の失敗の窓から「無視」が消え、silent では中止になる）、
+//!    `File` の直前に `ClearErrors`、外部バイナリの `File` の直後にフックの
+//!    `RequireChronoGazerFilesCopied`（エラーフラグが立っていれば `Abort`。
+//!    `.onInstFailed` が止めたサービスを戻す）。
+//! 6. P6: Section Uninstall で、再確認の直後・登録の解除の前にフックの
+//!    `RequireChronoGazerExesUnlocked`（3 つの exe を `FileOpen ... a` で開けなければ
+//!    止めたサービスを戻して `Abort`。まだ何も変更していない）、外部バイナリの
+//!    `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの削除の前に
+//!    `RequireChronoGazerExesDeleted`（残っていればサービスの登録を
+//!    `service-install` で戻して `Abort`）。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -242,7 +262,67 @@ const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
          \x20 ; chronogazer-installer (#972 P2): tauri-bundler の CheckIfAppIsRunning（残って\n\
          \x20 ; いれば KillProcess）の代わりに、フックと同じ強制終了しない再確認。\n\
          \x20 !insertmacro QuitShellForUpdate \"アンインストール\" 1 \"止めたサービスは再開します。まだ何も変更していません\"\n\
+         \x20 ; chronogazer-installer (#972 P6): 使用中の exe があれば、登録を解除する前に\n\
+         \x20 ; 止めたサービスを戻して中止（まだ何も変更していない）。\n\
+         \x20 !insertmacro RequireChronoGazerExesUnlocked\n\
          \x20 !insertmacro UnregisterChronoGazerService\n",
+    ),
+    (
+        // P5（属性）: `File` の失敗の窓から「無視」を消す。インストーラ属性なので
+        // どの Section にも効く（silent では中止 = `Abort` = `.onInstFailed`）。
+        "P5-allow-skip-files-off",
+        "OutFile \"${OUTFILE}\"\n",
+        "OutFile \"${OUTFILE}\"\n\
+         ; chronogazer-installer (#972 P5): 使用中で書けない File を「無視」で飛ばせない\n\
+         ; ようにする（再試行／中止だけ。silent では中止）。\n\
+         AllowSkipFiles off\n",
+    ),
+    (
+        // P5（Install、前）: 上書きの前にエラーフラグを落とす（直前の再確認や
+        // `ReadRegStr` の失敗で立っていることがある）。
+        "P5-clear-errors-before-file",
+        "  ; Copy main executable\n\
+         \x20 File \"${MAINBINARYSRCPATH}\"\n",
+        "  ; chronogazer-installer (#972 P5): File の失敗だけを見るため、直前で落とす。\n\
+         \x20 ClearErrors\n\
+         \n\
+         \x20 ; Copy main executable\n\
+         \x20 File \"${MAINBINARYSRCPATH}\"\n",
+    ),
+    (
+        // P5（Install、後）: main・resources・external binaries の `File` の直後に、
+        // エラーフラグが立っていれば `Abort`（POSTINSTALL に進まない）。
+        "P5-require-files-copied",
+        "  ; Copy external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   File /a \"/oname={{this}}\" \"{{no-escape @key}}\"\n\
+         \x20 {{/each}}\n",
+        "  ; Copy external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   File /a \"/oname={{this}}\" \"{{no-escape @key}}\"\n\
+         \x20 {{/each}}\n\
+         \n\
+         \x20 ; chronogazer-installer (#972 P5): 上書きに失敗したものがあれば（エラーフラグ）\n\
+         \x20 ; 混ざったまま成功にせず中止する（.onInstFailed が止めたサービスを戻す）。\n\
+         \x20 !insertmacro RequireChronoGazerFilesCopied\n",
+    ),
+    (
+        // P6（Uninstall、後）: 3 つの exe の `Delete` の直後に残っていないかを確かめ、
+        // 残っていれば `uninstall.exe` の `Delete` と Uninstall キーの削除より前に
+        // `Abort`（フック側でサービスの登録を戻す）。
+        "P6-require-exes-deleted",
+        "  ; Delete external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   Delete \"$INSTDIR\\\\{{this}}\"\n\
+         \x20 {{/each}}\n",
+        "  ; Delete external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   Delete \"$INSTDIR\\\\{{this}}\"\n\
+         \x20 {{/each}}\n\
+         \n\
+         \x20 ; chronogazer-installer (#972 P6): exe が残っていれば、uninstall.exe と「アプリ」の\n\
+         \x20 ; 登録を消す前に止める（サービスの登録は elev が残っていれば戻す）。\n\
+         \x20 !insertmacro RequireChronoGazerExesDeleted\n",
     ),
     (
         // P3: 事前の確かめを WebView2 の取得より前に置く（#972 の Codex の指摘:
@@ -641,7 +721,11 @@ mod tests {
         let un_unreg = uninstall_body
             .find("!insertmacro UnregisterChronoGazerService")
             .expect("unregister");
-        assert!(un_hook < un_recheck && un_recheck < un_unreg);
+        // 使用中の exe の確かめ（P6）は再確認の後・解除の前。
+        let un_unlocked = uninstall_body
+            .find("!insertmacro RequireChronoGazerExesUnlocked")
+            .expect("unlocked");
+        assert!(un_hook < un_recheck && un_recheck < un_unlocked && un_unlocked < un_unreg);
         // 再確認はフックの直後（テンプレートの挿入位置と同じ）。
         let hook = install_body
             .find("!insertmacro NSIS_HOOK_PREINSTALL")
@@ -723,6 +807,65 @@ mod tests {
                     .find("Function .onInstSuccess\n")
                     .expect("onInstSuccess")
         );
+    }
+
+    /// 当て直した結果: P5 - `AllowSkipFiles off` が 1 つ、Section より前にある。
+    /// Section Install では再確認 → `ClearErrors` → main の `File` → 外部バイナリの
+    /// `File` → `RequireChronoGazerFilesCopied` → `WriteUninstaller` → POSTINSTALL
+    /// の順。P6 - Section Uninstall では再確認 → `RequireChronoGazerExesUnlocked`
+    /// → 解除 → main の `Delete` → 外部バイナリの `Delete` →
+    /// `RequireChronoGazerExesDeleted` → `uninstall.exe` の `Delete` → Uninstall
+    /// キーの削除の順。
+    #[test]
+    fn patch_template_applies_p5_and_p6() {
+        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+
+        fn pos(text: &str, needle: &str) -> usize {
+            assert_eq!(text.matches(needle).count(), 1, "{needle} が 1 回ではない");
+            text.find(needle).expect("needle")
+        }
+
+        // P5: 属性は 1 つ、最初の Section より前（インストーラ属性は Section の外）。
+        let allow = pos(&out, "AllowSkipFiles off\n");
+        let early = pos(&out, "Section EarlyChecks\n");
+        assert!(allow < early);
+
+        let install = pos(&out, "Section Install\n");
+        let uninstall = pos(&out, "Section Uninstall\n");
+        let body = &out[install..uninstall];
+        let recheck = pos(body, "!insertmacro QuitShellForUpdate \"インストール\" 1 ");
+        let clear = pos(body, "  ClearErrors\n");
+        let main_file = pos(body, "File \"${MAINBINARYSRCPATH}\"");
+        let bin_file = pos(body, "File /a \"/oname={{this}}\"");
+        let copied = pos(body, "!insertmacro RequireChronoGazerFilesCopied");
+        let write_uninst = pos(body, "WriteUninstaller");
+        let post = pos(body, "!insertmacro NSIS_HOOK_POSTINSTALL");
+        assert!(recheck < clear && clear < main_file && main_file < bin_file);
+        assert!(bin_file < copied && copied < write_uninst && write_uninst < post);
+        // `ClearErrors` と main の `File` の間に命令が無い（再確認のマクロの中の
+        // 命令で立ったフラグを、落とした後に見る）。
+        let between = &body[clear + "  ClearErrors\n".len()..main_file];
+        assert!(between
+            .lines()
+            .map(str::trim)
+            .all(|line| line.is_empty() || line.starts_with(';')));
+
+        // P6: 解除の前の確かめ、Delete の後の確かめ、の順。
+        let un = &out[uninstall..];
+        let un_recheck = pos(
+            un,
+            "!insertmacro QuitShellForUpdate \"アンインストール\" 1 ",
+        );
+        let unlocked = pos(un, "!insertmacro RequireChronoGazerExesUnlocked");
+        let unreg = pos(un, "!insertmacro UnregisterChronoGazerService");
+        let main_del = pos(un, "Delete \"$INSTDIR\\${MAINBINARYNAME}.exe\"");
+        let bin_del = pos(un, "Delete \"$INSTDIR\\\\{{this}}\"");
+        let deleted = pos(un, "!insertmacro RequireChronoGazerExesDeleted");
+        let uninst_del = pos(un, "Delete \"$INSTDIR\\uninstall.exe\"");
+        let key_del = pos(un, "DeleteRegKey HKLM \"${UNINSTKEY}\"");
+        assert!(un_recheck < unlocked && unlocked < unreg && unreg < main_del);
+        assert!(main_del < bin_del && bin_del < deleted);
+        assert!(deleted < uninst_del && uninst_del < key_del);
     }
 
     /// 土台が 1 回だけでなければ名前を挙げて止まる（0 回・2 回の両方）。
