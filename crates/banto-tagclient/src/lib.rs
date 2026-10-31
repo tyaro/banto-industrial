@@ -34,6 +34,22 @@
 //! specific [`ErrorKind`] in `last_error`, and does not reconnect. Ordinary
 //! disconnects still reconnect with backoff.
 //!
+//! #682 PR-1: a `Live` [`TagClientState`] carries one [`GenerationSnapshot`]
+//! (`TagClientState::snapshot`) that holds the catalog, the
+//! [`BindingResolution`], and the values of the same attempt, so a caller
+//! never pairs values with a catalog from another generation
+//! (docs/banto-tagclient-partial-binding-design.md §6, R1-R7). The three parts
+//! are separate `Arc`s, so cloning the state out of `state_watch` is O(1)
+//! however large the catalog is. `generation` is a process-wide counter
+//! (unique across every handle, so a new `start` after `shutdown` never reuses
+//! a number); it advances on every attempt that fetched a catalog, so it is
+//! only guaranteed to grow, not to grow by one. Every non-`Live` state drops the
+//! snapshot together with `current`.
+//! `TagClientState::current` stays as the values of that snapshot. This slice
+//! does not change behaviour: one unresolved binding still fails the attempt
+//! with `binding_unresolved`; [`UnresolvedBinding::reason`] only names why
+//! ([`UnresolvedReason`]).
+//!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are
 //! retained as unknown values so a future Hub cannot silently become a real
@@ -58,6 +74,7 @@ mod ws_transport;
 
 pub use binding::{
     resolve_bindings, BindingRequest, BindingResolution, ResolvedBinding, UnresolvedBinding,
+    UnresolvedReason,
 };
 pub use endpoint::{Endpoint, RestUrls};
 pub use error::{Error, ErrorKind, Result};
@@ -66,7 +83,8 @@ pub use pinned_tls::PinnedHubTls;
 pub use rest::RestClient;
 pub use secret::{SecretApiKey, SecretError};
 pub use types::{
-    CatalogSnapshot, CatalogTag, CollectionMode, StableTagId, TagClientConnectionState,
-    TagClientState, ValueEntry, ValueQuality, ValueSource, ValuesSnapshot,
+    BindingView, CatalogSnapshot, CatalogTag, CollectionMode, GenerationSnapshot, StableTagId,
+    TagClientConnectionState, TagClientState, ValueEntry, ValueQuality, ValueSource,
+    ValuesSnapshot,
 };
 pub use write::RequestedValue;

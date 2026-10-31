@@ -43,6 +43,20 @@ pub struct ResolvedBinding {
 pub struct UnresolvedBinding {
     pub binding_key: String,
     pub external_name: String,
+    /// Why the name did not resolve (#682). Kept as a non-exhaustive enum so
+    /// a later reason (for example a scope-filtered catalog) does not change
+    /// the shape of [`crate::types::BindingView`].
+    pub reason: UnresolvedReason,
+}
+
+/// Why one requested binding is unresolved in a catalog.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[non_exhaustive]
+pub enum UnresolvedReason {
+    /// The catalog has no row with this external name (never created,
+    /// deleted, or the old name after a rename). Similar names are never
+    /// auto-assigned.
+    NotInCatalog,
 }
 
 /// Result of resolving all requested bindings against one catalog snapshot.
@@ -93,6 +107,7 @@ pub fn resolve_bindings(
             None => unresolved.push(UnresolvedBinding {
                 binding_key: request.binding_key.clone(),
                 external_name: request.external_name.clone(),
+                reason: UnresolvedReason::NotInCatalog,
             }),
         }
     }
@@ -173,6 +188,7 @@ mod tests {
             vec![UnresolvedBinding {
                 binding_key: "missing".into(),
                 external_name: "tag-x".into(),
+                reason: UnresolvedReason::NotInCatalog,
             }]
         );
     }

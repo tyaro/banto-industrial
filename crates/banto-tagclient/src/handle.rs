@@ -155,7 +155,7 @@ impl TagClientHandle {
         self.explicit_shutdown = true;
         let runtime = Handle::try_current().map_err(|_| Error::new(ErrorKind::Transport))?;
         let requests = std::mem::take(&mut self.requests);
-        Ok(Self::spawn(replacement, requests, runtime))
+        Ok(Self::spawn_inner(replacement, requests, runtime, None))
     }
 
     async fn stop_and_join(&mut self) -> std::result::Result<Result<()>, JoinError> {
@@ -1109,6 +1109,9 @@ mod tests {
             .unwrap();
         let mut old_state = old_handle.state_watch();
         wait_live(&mut old_state).await;
+        // #682 R2: the old handle published some generation >= 1.
+        let old_generation = old_state.borrow().snapshot().unwrap().generation;
+        assert!(old_generation >= 1);
         let replacement = client_with_secret(address, "replacement-secret");
         let new_handle =
             tokio::time::timeout(Duration::from_secs(2), old_handle.restart(replacement))
@@ -1121,6 +1124,7 @@ mod tests {
             TagClientConnectionState::Stopped
         );
         assert_eq!(old_state.borrow().current(), None);
+        assert_eq!(old_state.borrow().snapshot(), None);
         assert_eq!(old_state.borrow().last_error(), None);
         assert!(tokio::time::timeout(Duration::from_secs(1), old_close_rx)
             .await
@@ -1129,12 +1133,51 @@ mod tests {
 
         let mut new_state = new_handle.state_watch();
         wait_live(&mut new_state).await;
+        // R2: the replacement keeps counting instead of starting over at 1.
+        assert!(new_state.borrow().snapshot().unwrap().generation > old_generation);
         assert!(
             tokio::time::timeout(Duration::from_secs(1), new_handle.shutdown())
                 .await
                 .unwrap()
                 .is_ok()
         );
+        assert!(tokio::time::timeout(Duration::from_secs(2), new_close_rx)
+            .await
+            .unwrap()
+            .unwrap());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fresh_start_after_shutdown_gets_a_larger_generation() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (old_close_tx, old_close_rx) = oneshot::channel();
+        let (new_close_tx, new_close_rx) = oneshot::channel();
+        let server = tokio::spawn(serve_two_generations(listener, old_close_tx, new_close_tx));
+
+        let old_handle = client(address.clone())
+            .start(vec![request("alpha", "alpha")])
+            .unwrap();
+        let mut old_state = old_handle.state_watch();
+        wait_live(&mut old_state).await;
+        let old_generation = old_state.borrow().snapshot().unwrap().generation;
+        assert!(old_generation >= 1);
+        assert!(old_handle.shutdown().await.is_ok());
+        assert!(tokio::time::timeout(Duration::from_secs(2), old_close_rx)
+            .await
+            .unwrap()
+            .unwrap());
+
+        // #682 R2: the counter is process-wide, so a brand-new handle does not
+        // start over at 1 and collide with what the old handle showed.
+        let new_handle = client(address)
+            .start(vec![request("alpha", "alpha")])
+            .unwrap();
+        let mut new_state = new_handle.state_watch();
+        wait_live(&mut new_state).await;
+        assert!(new_state.borrow().snapshot().unwrap().generation > old_generation);
+        assert!(new_handle.shutdown().await.is_ok());
         assert!(tokio::time::timeout(Duration::from_secs(2), new_close_rx)
             .await
             .unwrap()
