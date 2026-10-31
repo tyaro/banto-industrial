@@ -1,10 +1,11 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **設計（Issue #682）。実装は未着手。** 実装は本書 §12 の 3 つの PR（同一世代 snapshot →
-部分解決 → 全件未解決時の再解決経路）に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
-Issue には未記録）。§15 判断 1（strict ポリシーを作らない）・判断 2（全件未解決は新状態 `Unbound`）は
-2026-10-31 オーナー決定で本書の立場を採用した。判断 3 は未決。
+状態: **設計（Issue #682）。実装は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
+閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
+Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
+判断 2（全件未解決は新状態 `Unbound`）は 2026-10-31 オーナー決定で本書の立場を採用した。判断 3 は未決。
 main へのマージは S7（2026-11-02〜11-08）の後。本書は
 [banto-tagclient-design.md](banto-tagclient-design.md) の §3.1・§3.2・§4・§5 を**上書きする差分**であり、
 本書に書いていないことは同書が正。実装が入ったら同書の該当節を本書に合わせて直し、本書の
@@ -212,14 +213,14 @@ stateDiagram-v2
 	stopped --> connecting: start
 	connecting --> handshaking: catalog → resolve（resolved の件数は問わない）
 	handshaking --> live: WS connect → subscribe(resolved) → 初回 data → REST snapshot → publish gate（resolved ≥ 1）
-	handshaking --> unbound: WS connect 成功 → catalog 取り直しで revision 一致（resolved = 0、subscribe しない）
+	handshaking --> unbound: WS connect 成功 → ping/pong → catalog 取り直しで revision 一致（resolved = 0、subscribe しない）
 	handshaking --> rebinding: unknown_tag / metadata 不一致 / config_changed / 取り直しの revision 不一致
 	handshaking --> reconnecting: 切断 / transport / protocol
 	handshaking --> unauthorized: 401 / 403 / close 1008 + 理由（#446）
 	live --> rebinding: config_changed / unknown_tag / metadata 不一致
 	unbound --> rebinding: config_changed
 	rebinding --> live: catalog → resolve → WS connect → subscribe → gate（resolved ≥ 1）
-	rebinding --> unbound: catalog → resolve（resolved = 0）→ WS connect 成功 → 取り直しで revision 一致
+	rebinding --> unbound: catalog → resolve（resolved = 0）→ WS connect 成功 → ping/pong → 取り直しで revision 一致
 	rebinding --> rebinding: config_changed の coalesce / 取り直しの revision 不一致（3 回まで）
 	rebinding --> reconnecting: 3 回使い切り / transport
 	rebinding --> unauthorized: 401 / 403 / close 1008 + 理由（#446）
@@ -262,15 +263,27 @@ generation = generation_counter.fetch_add(1) + 1          // handle の Arc<Atom
 if mode == Connecting: publish Handshaking               // 現状どおり（L383〜L385）。Rebinding モードでは Rebinding のまま
 connection = connect_stream() (stop 割り込み可)           // 401/403 → Unauthorized、transport → Reconnecting は現状どおり
 if resolution.resolved が空:
-    recheck = fetch_catalog() (stop 割り込み可)             // WS 確立後に catalog を取り直す（下の段落）
-    if recheck.revision != catalog.revision → Err(RevisionMismatch)   // その間にタグが作られた等 → Unbound を出さずに Rebinding へ
-    publish TagClientState { state: Unbound, snapshot: Some({generation, catalog, resolution, values: None}) }
-                                                          // WS 確立と revision の照合を終えた後にだけ publish する
+    connection.send_ping() (stop 割り込み可)               // {"op":"ping"}。Hub が revision_rx を登録し終えたことの同期（下の段落）
+                                                          // subscribe_on_change と同じ biased select! で包む（§5.2 場面 11）
+    loop: receive_text() (stop 割り込み可)                 // pong が来るまで。receive_text の Err はそのまま返す（§14）
+        pong           → break
+        config_changed → Err(RevisionMismatch)            // 待っている間に設定が変わった → Unbound を出さずに Rebinding へ
+        event          → 無視
+        data / error   → Err(ProtocolError)               // 購読していないので来ない
+        Err(e)         → Err(e)                           // 切断 → Transport、close 1008 → Unauthorized。分類を潰さない
+    recheck = fetch_catalog() (stop 割り込み可)             // pong の後に catalog を取り直す
+    if recheck.revision != catalog.revision → Err(RevisionMismatch)        // 最初の catalog と pong の間にタグが作られた等 → Rebinding へ
+    if recheck.run_id   != catalog.run_id   → Err(RuntimeMetadataMismatch) // Hub 再起動で revision が偶然一致（finalize と同じ考え、§5.2 場面 13）
+    resolution = resolve_bindings(requests, recheck.tags)?                 // 取り直した catalog で解決をやり直す（Hub の裂けた読みへの防衛、§5.2）
+    if resolution.resolved が空でない → Err(RevisionMismatch)              // タグが現れていれば不一致扱い → Rebinding へ
+    publish TagClientState { state: Unbound, snapshot: Some({generation, catalog: recheck, resolution, values: None}) }
+                                                          // WS 確立・pong・照合・再解決を終えた後にだけ publish する。載せる catalog は取り直した方
     reached_unbound = true                                // RebindTracker だけをリセットする印（§7）
-    loop: receive_text() (stop 割り込み可)
+    loop: receive_text() (stop 割り込み可)                 // receive_text の Err はそのまま返す（§14）
         config_changed → Err(RevisionMismatch)            // 既存の rebindable 経路に乗せる
-        data/ignored  → 無視（購読していないので data は来ない。来たら ProtocolError）
-        切断/transport → Err(Transport)                    // 既存の retryable 経路
+        event / pong   → 無視
+        data / error   → Err(ProtocolError)               // 購読していないので来ない
+        Err(e)         → Err(e)                           // 既存の retryable / Unauthorized 経路
 else:
     tags = resolution.resolved の external_name
     gate = PublishGate::new(subscription_id, tags)
@@ -282,23 +295,108 @@ else:
 publish するため（§5 の `handshaking --> unbound` / `rebinding --> unbound` は WS connect **成功**で遷移）。
 WS が張れなければ `Unbound` には入らず、現状どおり `Reconnecting` / `Unauthorized` へ進む。
 
-**WS 確立後の catalog の取り直し（2026-10-31 設計判断、Codex の指摘による）**: Hub の WS は接続を
-始めた時点で `revision_rx` を作り（`stream.rs` `handle_socket`）、それより前の変更は再送しない
-（`hub.rs` `subscribe_revision`）。`fetch_catalog()` と WS 確立の間に要求したタグが作られると、
-`Unbound` のまま次の設定変更か切断まで待ち続けてしまう。解決済みの側は初回 data の後の REST
-（`finalize` の revision 一致）でこの窓を閉じているが、`Unbound` 側にはそれが無い。そこで WS
-確立の**後に** catalog を取り直し、revision が最初の catalog と違えば `RevisionMismatch` として
-rebindable 経路に乗せる。revision が同じなら、それ以降の変更は WS の `config_changed` で必ず届く。
-取り直しと照合は **`Unbound` を publish する前に**終える。先に publish すると、その間にタグが
-作られた場合に利用者が古い解決結果を確定した `Unbound` として観測してしまう（オーナーの Codex CLI
-の指摘による）。照合で差があれば `Unbound` を出さず、直接 `Rebinding` に進む。
-PR-3 のテストに「`fetch_catalog()` と WS 確立の間にタグを作る」を入れる（§13）。
+**WS 確立後の ping/pong と catalog の取り直し（2026-10-31 設計判断、オーナーの Codex CLI の指摘による）**:
+Hub の `handle_socket`（`apps/banto-hub/core/src/stream.rs` L522〜）は `on_upgrade` のクロージャで走る
+（L519）ので、クライアントの WS connect が成功した（HTTP 101 を受けた）時点ではまだ始まっていないことが
+ある。`revision_rx` は `handle_socket` の中で作られ（L534 `manager.subscribe_revision()`）、
+`watch::Receiver` はそれより前の変更を再送しない（`hub.rs` L2408 `subscribe_revision`、`revision_tx`
+の doc）。Hub は接続直後に何も送らず、クライアントの要求は L548 からの `select!` ループ（`revision_rx`
+を作った**後**）でだけ処理する。したがって:
+
+- **connect 成功だけでは `revision_rx` の登録を保証できない**。最初の `fetch_catalog()` と登録の間に
+  要求したタグが作られると `config_changed` が来ず、`Unbound` のまま次の設定変更か切断まで待ち続ける。
+  catalog を WS 確立の直後に取り直しても、取り直しと登録の間に同じ窓が残る。
+- **同期の手段は `ping` / `pong`**（Hub の**プロトコル**を変えない。選択肢 (a)。Hub の実装に手を入れる
+  PR-H は別物、§5.2）。`{"op":"ping"}` への `pong`
+  は `handle_text`（L727）が返し、`handle_text` は L548 のループからしか呼ばれないので、**`pong` を
+  受けた時点で `revision_rx` は登録済み**。その後に `fetch_catalog()` で取り直し、revision が最初の
+  catalog と違えば `RevisionMismatch` として rebindable 経路に乗せる。同じなら、取り直しより前の変更は
+  revision に現れ、取り直しより後の変更は（登録済みの）`revision_rx` 経由で `config_changed` として
+  必ず届く。窓は無い。`pong` 待ちの間に `config_changed` が来たら、そのまま `RevisionMismatch`。
+- 代替の (b)「Hub が登録後に `ready { revision }` を送る」は採らない。Hub のプロトコルの変更と
+  Hub 側の PR が要り、`ping` / `pong` と REST の取り直し（どちらも今の Hub にある）で同じ保証が
+  取れるため。`ready` に revision を載せれば取り直しの REST 1 回は省けるが、REST は接続ごとに 1 回で
+  `Unbound` のときだけなので、省く価値が Hub の変更に見合わない（§15 未決 6 に席だけ残す）。
+- `ping` を送るのは `Unbound` 側だけ。**Live 側（resolved ≥ 1）に同じ窓は無い**: 初回 `data` は
+  L548 のループの `evaluate`（`tick`）が送るので `revision_rx` 登録後であり、その後の REST snapshot を
+  `finalize` が revision で照合する（banto-tagclient-design.md §3.2）。
+- 取り直しと照合は **`Unbound` を publish する前に**終える。先に publish すると、その間にタグが
+  作られた場合に利用者が古い解決結果を確定した `Unbound` として観測してしまう。照合で差があれば
+  `Unbound` を出さず、直接 `Rebinding` に進む。
+- 実装: `WebSocketConnection` に `send_ping()`（`ws_transport.rs` の `subscribe_on_change` L226 と同じ
+  形の 1 メソッド）を足す。`pong` の parse は既に `parse_hub_wire` が `Ignored` にしている
+  （`stream_core.rs` L110）ので、`Unbound` の受信ループでは `pong` を見分ける必要があり、`HubWireMessage`
+  に `Pong` を足すか、`Unbound` 専用の小さな parse を置く（実装者の判断。gate 側の `Ignored` 扱いは変えない）。
+- PR-3 のテストに「`fetch_catalog()` と `pong` の間にタグを作る」と「`ping` が 2 回目の catalog GET より
+  先に届く」を入れる（§12 PR-3・§13）。モック Hub は `pong` を返すまで止めることで、Hub 側の登録の遅れを
+  再現できる。
+- **取り直しの照合は `revision` だけでなく `run_id` も見る（2026-10-31 設計判断、§5.2 場面 13）**。
+  最初の catalog と `pong` の間に Hub が再起動すると、revision は保存した構成から数え直すので偶然一致
+  しうる。`PublishGate::finalize`（`stream_core.rs` L274〜）が REST snapshot を `revision`・`run_id`・
+  `collection_mode` の 3 つで照合しているのと同じ考えで、`run_id` 違いは `RuntimeMetadataMismatch`
+  （rebindable）にする。`collection_mode` は `Unbound` では値を扱わないので照合しない。
+- **取り直した catalog で `resolve_bindings` をやり直す（2026-10-31 設計判断、§5.2 場面 14）**。
+  Hub の REST 応答は map と revision を別々の lock で読む（§5.2）ので、revision が一致していても
+  map が古いことがある。取り直した catalog で解決をやり直し、`resolved` が空でなければ（＝要求した
+  タグが現れていれば）revision が一致していても不一致（`RevisionMismatch`）として `Rebinding` に
+  進む。publish する `snapshot.catalog` は**取り直した方**（新しい方）。Hub 側の直し（PR-H）に
+  依らずに `Unbound` 側の穴を閉じる防衛で、PR-H が入った後も残す（Hub の作りが変わっても SDK だけで
+  正しさを保つため。REST は既に 2 回目を引いているので追加の通信は無い）。
 
 `Unbound` で受けた `config_changed` を `RevisionMismatch` として返すのは、`plan_failure` の
 rebindable 経路（3 回の高速再試行 → backoff）をそのまま使うため。`last_error` には
 `RevisionMismatch` ではなく **`ConfigChanged` が無いので `RevisionMismatch`** が載る。
 これは Live 中の `config_changed` と同じ扱い（`PublishGate::accept_wire` L190、`ConfigChanged` の処理は
 L206〜）で、分類を増やさない。
+
+### 5.2 順序の総点検（2026-10-31、同じ箇所への指摘が 3 回続いたため）
+
+§5.1 の ping/pong 同期と取り直しに同じ箇所への指摘が 3 回続いたので、場面を列挙して組み直すか
+確かめた（同じ形の指摘が続いたら場面を列挙して総点検する、というプロジェクトの決まりによる）。**結論: ping/pong 同期と取り直しの骨格は正しく、
+作りの見直しは不要。** 穴は 3 つ（場面 11・13・14）で、どれも骨格に足す形で閉じる。
+
+**裂けた読み（場面 14、根本の 1 つ。Hub 側）**: Hub の `build_catalog_response`
+（`apps/banto-hub/core/src/rest/tag_space.rs` L149〜L150）は `manager.tag_map()` と `manager.revision()`
+を**別々の lock** で読む（`hub.rs` L1964 / L2072。`commit_catalog` L2144〜 は 1 つの lock の中で map と
+revision を同時に更新し、lock を離してから `revision_tx.send`）。`build_values_response`（L404〜。
+`map` は呼び元 L326 / L469 の `tag_map()`、`revision` は L432 で別に読む）も同じ形。GET の 2 つの読みの
+間に `commit_catalog` が走ると、応答が **（旧 map, 新 revision）** になる。この応答を受けると:
+
+- `Unbound` 側: 初回 GET が（旧 map, N+1）だと、`pong` 後の取り直しは（新 map, N+1）で revision が
+  一致し、旧 map の解決結果で `Unbound` を publish して待ち続ける（N+1 の `config_changed` は
+  `revision_rx` 登録前の変更なので来ない）。→ §5.1 の「取り直した catalog で再解決」で SDK 側だけでも閉じる。
+- Live 側: 初回 catalog が（旧 map, N+1）で resolve → REST values も revision N+1 → `finalize` を
+  通る → 作られたはずのタグが `unresolved` のまま `Live` になる。従来は `BindingUnresolved` で
+  再試行して直っていたが、**PR-2 の部分解決後は静かに古い解決結果が残る**。SDK 側では見分ける手段が
+  無い（REST values は要求した名前しか返さない）ので、**Hub 側で閉じる（PR-H）**。
+
+直し: Hub に **1 回の lock で `(Arc<TagMap>, revision)` を返すアクセサ**（`catalog_with_revision()`
+のような名前）を足し、catalog / values の応答で使う。`run_id` は `controller.status()`（collector
+側、manager の lock とは別物）から来るので同じ lock には入れない。catalog と values の `run_id` が
+別の読みでずれる場合は `finalize` の 3 項照合が既に捕まえる（`RuntimeMetadataMismatch` → 再試行）。
+**プロトコルの変更ではない**（応答の形も意味も同じ。値がずれなくなるだけ）。§5.1 の「Hub を変えない」は
+`ready` のような**プロトコル**の追加をしないという方針で、PR-H はそれに触れない。SDK の 3 PR とは
+独立の小さな Hub の PR とし、**PR-2 より前**にマージする（§12 PR-H）。
+
+| 場面 | 何が起きるか                                                                                 | 判定   | 根拠・直し                                                                                                                                                                       |
+| ---- | -------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1    | WS connect 成功後、Hub の `handle_socket` が始まる前（`revision_rx` 未登録）にタグが作られる | OK     | `pong` は登録後にしか返らない。取り直しの revision 不一致で `Rebinding`                                                                                                          |
+| 2    | 初回 GET と `ping` の間、`revision_rx` 登録前の変更                                          | OK     | 同上（`config_changed` は来ないが取り直しで見える）                                                                                                                              |
+| 3    | `revision_rx` 登録後・`pong` 前の変更                                                        | OK     | `config_changed` が `pong` より先に届く → `RevisionMismatch`。Hub は 1 本の送信順を守る                                                                                          |
+| 4    | `pong` 後・取り直しの前の変更                                                                | OK     | 取り直しで不一致。`config_changed` も届くが先に `Rebinding` に進むので読まずに閉じる                                                                                             |
+| 5    | 取り直しの後・`Unbound` publish 前の変更                                                     | OK     | `config_changed` は WS に積まれ、publish 直後の受信ループで読む → `Rebinding`                                                                                                    |
+| 6    | `Unbound` 中の変更                                                                           | OK     | `config_changed` → `Rebinding`（§7）                                                                                                                                             |
+| 7    | 短い間に複数の commit（revision が 2 以上進む / 作って消す）                                 | OK     | 照合は等しいかどうかで見る（revision は commit ごとに進む）。初回 GET と取り直しの間に作って消した場合も revision は進むので `Rebinding` に入り、再解決で正しく `Unbound` に戻る |
+| 8    | `pong` 待ち中の切断                                                                          | OK     | `Transport` → `Reconnecting`、backoff は `Unbound` でリセットしない（§7）                                                                                                        |
+| 9    | `pong` 待ち中・`Unbound` 中の close 1008                                                     | OK     | `receive_text()` の Err をそのまま返せば `Unauthorized` + 理由（§14 の注意。変換すると潰れる）                                                                                   |
+| 10   | `pong` 待ち中・`Unbound` 中に `data` / `error` が来る                                        | OK     | 購読していないので `ProtocolError` → `Reconnecting`                                                                                                                              |
+| 11   | `ping` の送信中（送信バッファが詰まっている）に `shutdown`                                   | **NG** | `send_ping()` を `subscribe_on_change`（`worker.rs` L392〜）と同じ `biased` `select!` で `stop` と並べる。送信が詰まると shutdown が遅れる                                       |
+| 12   | `pong` 待ち・取り直し・`Unbound` 受信中の `shutdown` / `restart`                             | OK     | どれも `stop` 割り込みの `select!`（§5.1）                                                                                                                                       |
+| 13   | 初回 GET と `pong` の間に Hub が再起動し、revision が偶然一致                                | **NG** | 取り直しの照合に `run_id` を足す（`RuntimeMetadataMismatch`）。`finalize` と同じ 3 項の考え                                                                                      |
+| 14   | Hub の REST 応答が（旧 map, 新 revision）＝裂けた読み。`Unbound` 側と Live 側の両方          | **NG** | Hub PR-H（1 回の lock で読む）+ SDK の取り直し後の再解決（`Unbound` 側の防衛）。Live 側は PR-H でだけ閉じるので PR-2 より前                                                      |
+| 15   | Live 側: 初回 `data` と REST の間の変更                                                      | OK     | `finalize` の revision 照合 → `RevisionMismatch`                                                                                                                                 |
+| 16   | Live 側: REST の後の変更                                                                     | OK     | `revision_rx` 登録後なので `config_changed` が届く                                                                                                                               |
+| 17   | `Unbound` → `config_changed` → `Unbound` の繰り返し / resolved ≥ 1 の接続                    | OK     | 前者は `reached_unbound` で rebind budget を新しくする（§7）。後者は `ping` を送らず従来どおり                                                                                   |
 
 ## 6. 世代と snapshot の整合規則
 
@@ -335,14 +433,24 @@ match (state.connection_state(), state.snapshot()) {
 		match snap.binding(key) {
 			Some(BindingView::Resolved { value: Some(v), tag, .. }) => draw(key, v, tag),
 			Some(BindingView::Unresolved(u)) => draw_unresolved(key, &u.reason),
-			_ => unreachable!("R4"),
+			// Project に足されたばかりの key。snapshot は旧い要求集合の世代で、
+			// shutdown() → start(new_requests) の反映待ち（§0）。落とさず「待ち」で描く。
+			None => draw_pending(key),
+			// R4: Live の Resolved は必ず value: Some。ここに来たら SDK のバグ。
+			Some(BindingView::Resolved { value: None, .. }) => draw_degraded(key),
 		}
 	},
-	(Unbound, Some(snap)) => all_unresolved(snap),
+	(Unbound, Some(snap)) => all_unresolved(snap),   // binding(key) == None の key は同じく「待ち」
 	(other, None) => degraded(other, state.last_error()),
-	_ => unreachable!("snapshot は Live/Unbound だけ"),
+	(other, Some(_)) => degraded(other, state.last_error()),   // snapshot は Live/Unbound だけ（R3）。panic させない
 }
 ```
+
+`snap.binding(key)` が `None` を返すのは **key が snapshot の世代の要求集合に無い**ときで、SCADA の
+Editor が Project に Binding を足した直後（`shutdown()` → `start(new_requests)` の切り替え中、旧
+handle の最後の snapshot か新 handle の最初の snapshot 前）に必ず起こる。**`unreachable!` にしない**
+（2026-10-31、オーナーの Codex CLI の指摘による）。描画は「新しい要求の反映待ち」として続け、
+新 handle の `Live` / `Unbound` で `Some` に変わる。
 
 ### 6.2 `unresolved` の理由
 
@@ -355,6 +463,12 @@ scada-design.md §9.6 案 C「改名候補の提示」は保留のまま）。
 ## 7. 全件未解決（`Unbound`）の規則
 
 - **空 `subscribe` を送らない**（受入条件 4）。WS は張る（認証・close 1008 の検出は Live と同じ）。
+- **Hub の受信登録と同期してから入る（2026-10-31 設計判断）**: WS connect の成功だけでは Hub の
+  `revision_rx` が登録済みとは言えない（§5.1）。`{"op":"ping"}` → `pong` で登録を確かめ、その後に
+  catalog を取り直して `revision`・`run_id` を照合し、取り直した catalog で解決をやり直しても
+  `resolved` が空のときだけ `Unbound` を publish する（§5.1・§5.2 場面 13・14）。`Unbound` に
+  入った後の変更は `config_changed` で必ず届く。Live 側は初回 `data` + REST の `finalize` で同じ窓が
+  閉じているので `ping` は送らない（Hub の裂けた読みだけは Live 側も影響を受け、PR-H で閉じる。§5.2）。
 - **値は無い**: `current() == None`、`snapshot().values == None`。
 - **再解決の経路**: `config_changed` を受けたら `Rebinding`（§5.1）。切断なら `Reconnecting` →
   backoff → catalog から。`shutdown` / `restart` はどの瞬間でも効く（`stop` の `select!` 割り込みは
@@ -439,22 +553,28 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
 
 ## 11. 受入条件との対応
 
-| #   | 受入条件（Issue #682）                                                                                       | 本書                          | 実装 PR                                            |
-| --- | ------------------------------------------------------------------------------------------------------------ | ----------------------------- | -------------------------------------------------- |
-| 1   | 正常タグと未解決タグが混在しても正常タグの current が取れる                                                  | §5.1・§8 P1〜P2               | PR-2                                               |
-| 2   | 未作成タグの追加後に SDK が再解決し、正常タグの監視も継続する                                                | §8 P6・D6                     | PR-2（Live から）/ PR-3（Unbound から）            |
-| 3   | 削除・rename 後はその名前を unresolved とし、類似名へ自動割り当てせず、他の正常表示を止めない                | §8 P5・§6.2                   | PR-2                                               |
-| 4   | 全件未解決のときは空 subscribe を送らず、無値の状態と停止可能な再解決経路を定義する                          | §7・D3                        | PR-3                                               |
-| 5   | catalog / resolution / current の revision・run_id・collection_mode が同一更新で整合。旧値を新世代に混ぜない | §6 R1〜R3・§9                 | PR-1                                               |
-| 6   | 切断・再解決・認証拒否で current を直ちに無効化し、shutdown / restart / backoff の保証を保つ                 | §9・§7「budget を消費しない」 | PR-1（snapshot の無効化）/ PR-3（Unbound の stop） |
-| 7   | Binding key・要求外部名・catalog 外部名の重複、不正プロトコルを部分成功として許容しない                      | D2・§8 P3                     | PR-2（回帰テスト）                                 |
-| 8   | 既存 strict 利用者への回帰と simulation / value_source / Quality の扱いを検証する                            | §10・§6 R7・§13               | PR-1〜PR-3 の各テスト + 利用者の追従 PR            |
+| #   | 受入条件（Issue #682）                                                                                       | 本書                                                                                                     | 実装 PR                                            |
+| --- | ------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | -------------------------------------------------- |
+| 1   | 正常タグと未解決タグが混在しても正常タグの current が取れる                                                  | §5.1・§8 P1〜P2                                                                                          | PR-2                                               |
+| 2   | 未作成タグの追加後に SDK が再解決し、正常タグの監視も継続する                                                | §8 P6・D6                                                                                                | PR-2（Live から）/ PR-3（Unbound から）            |
+| 3   | 削除・rename 後はその名前を unresolved とし、類似名へ自動割り当てせず、他の正常表示を止めない                | §8 P5・§6.2                                                                                              | PR-2                                               |
+| 4   | 全件未解決のときは空 subscribe を送らず、無値の状態と停止可能な再解決経路を定義する                          | §7・D3・§5.1（ping/pong と取り直しで Hub の受信登録と同期）・§5.2（run_id 照合・再解決・ping 中の stop） | PR-3                                               |
+| 5   | catalog / resolution / current の revision・run_id・collection_mode が同一更新で整合。旧値を新世代に混ぜない | §6 R1〜R3・§9・§5.2（Hub の応答で map と revision がずれない）                                           | PR-1（SDK）/ PR-H（Hub の裂けた読み）              |
+| 6   | 切断・再解決・認証拒否で current を直ちに無効化し、shutdown / restart / backoff の保証を保つ                 | §9・§7「budget を消費しない」                                                                            | PR-1（snapshot の無効化）/ PR-3（Unbound の stop） |
+| 7   | Binding key・要求外部名・catalog 外部名の重複、不正プロトコルを部分成功として許容しない                      | D2・§8 P3                                                                                                | PR-2（回帰テスト）                                 |
+| 8   | 既存 strict 利用者への回帰と simulation / value_source / Quality の扱いを検証する                            | §10・§6 R7・§13                                                                                          | PR-1〜PR-3 の各テスト + 利用者の追従 PR            |
 
 ## 12. 実装 PR の切り分け（2026-10-31 オーナー了承の順。会話での了承で、Issue には未記録）
 
-各 PR は原則 `crates/banto-tagclient` だけを触る。例外は PR-3 の ChronoGazer `connection_state_str`
-の列挙 1 行だけ（§10。利用者の追従そのものは別 PR）。モデルは sonnet、レビューは上位。
-各 PR の最後に `cargo test -p banto-tagclient` を 1 回（PR-3 は `-p chronogazer-core` の compile も）。
+SDK の PR（PR-1〜PR-3）は原則 `crates/banto-tagclient` だけを触る。例外は PR-3 の ChronoGazer
+`connection_state_str` の列挙 1 行だけ（§10。利用者の追従そのものは別 PR）。Hub の PR-H は
+`apps/banto-hub/core` だけを触る。モデルは sonnet、レビューは上位。
+各 PR の最後に `cargo test -p banto-tagclient` を 1 回（PR-3 は `-p chronogazer-core` の compile も。
+PR-H は `-p banto-hub-core` 相当のテストを名前で絞って）。
+
+順序: **PR-1 と PR-H は独立**（どちらが先でもよい）。**PR-H は PR-2 より前**にマージする（§5.2
+場面 14: PR-2 の部分解決後は Hub の裂けた読みが Live 側に「静かに古い解決結果が残る」形で出るため。
+PR-2 より前なら従来の `BindingUnresolved` → 再試行で直る）。PR-2 → PR-3 はこの順。
 
 ### PR-1: 同一世代 snapshot（`GenerationSnapshot`）
 
@@ -474,6 +594,25 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
   `Live` で `value: Some`）、R6（`TagClientState::clone` 後に `Arc::ptr_eq`）。
   `all_public_states_and_non_live_transitions_clear_current`（`stream_core.rs` L715）を snapshot にも広げる。
 - 利用者への影響: なし（追加だけ。`current()` の型は同じ）。
+
+### PR-H（Hub）: catalog / values 応答の map と revision を 1 つの lock で読む
+
+- 位置づけ: **Hub の実装の直し。プロトコルの変更ではない**（応答の形・意味は同じ。§5.1 の「Hub を
+  変えない」は `ready` のようなプロトコル追加をしない方針で、PR-H はそれに触れない）。SDK の 3 PR とは
+  独立で、**PR-2 より前**にマージする（§5.2 場面 14、上の順序）。2026-10-31 の順序の総点検で足した。
+- 範囲: `apps/banto-hub/core/src/hub.rs` に、`inner` の lock を 1 回取って `(Arc<TagMap>, revision)`
+  を返すアクセサ（`catalog_with_revision()` のような名前。既存の `tag_map()` / `revision()` は残す）を
+  足す。`rest/tag_space.rs` の `build_catalog_response`（L149〜L150）と `v1_values` / `v1_value_single`
+  → `build_values_response`（L326 / L469 の `tag_map()` と L432 の `revision()`）を、その 1 回の読みの
+  `map` と `revision` を使う形にする。`run_id` は `controller.status()` 由来で別物なので触らない（§5.2）。
+  アクセサの doc に「`commit_catalog` は map と revision を同じ lock で更新するので、別々に読むと
+  （旧 map, 新 revision）になりうる。REST 応答は必ずこちらで読む」と書く。
+- 完了条件: 既存テスト全緑。新規テスト = `commit_catalog` と GET catalog / GET values を並行に回し、
+  応答の `revision` が N+1 なら応答の `tags` / `values` に N+1 で作ったタグが**必ず**含まれる
+  （N なら含まれない）ことを多数回で assert する（lock の順序を直前の形に戻すと落ちることを 1 回確かめる。
+  checklist §5）。
+- 利用者への影響: なし（応答がずれなくなるだけ）。SDK のテストは PR-H に依存しない（モック Hub は
+  自前なので、裂けた読みの再現は PR-3 のモックで行う）。
 
 ### PR-2: 部分解決（既定を変える）
 
@@ -499,20 +638,41 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
 
 ### PR-3: 全件未解決（`Unbound`）と再解決経路
 
-- 範囲: `TagClientConnectionState::Unbound`、§5.1 の `Unbound` 分岐（WS connect 成功の後に publish・
-  subscribe なし・WS 確立後の catalog の取り直し・`config_changed` 待ち・stop 割り込み）、`reached_unbound` による `RebindTracker` だけの
-  リセット（§7。`was_live` / `RetryTracker` は変えない）、`Display`。PR-2 の暫定 `BindingUnresolved`
+- 範囲: `TagClientConnectionState::Unbound`、§5.1 の `Unbound` 分岐（WS connect 成功 → `ping`（`stop`
+  と並べた `biased` `select!`）/ `pong` → catalog の取り直しと `revision`・`run_id` の照合 → 取り直した
+  catalog で再解決 → publish。subscribe なし・`config_changed` 待ち・stop 割り込み・`receive_text()` の
+  Err はそのまま返す）、`WebSocketConnection::send_ping()` と `pong` の見分け（§5.1）、`TagClientState::unbound(snapshot)`
+  コンストラクタ（§14）、`reached_unbound` による `RebindTracker` だけの
+  リセット（§7。`was_live` / `RetryTracker` は変えない）、`Display`。**Hub のプロトコルは変えない**
+  （§5.1 の選択肢 (a)。Hub の実装の直しは PR-H で別に出し、PR-3 は PR-H に依存しない）。
+  PR-2 の暫定 `BindingUnresolved`
   と `error.rs` の暫定の注記を外す。**ChronoGazer `apps/chronogazer/core/src/hub.rs`
   `connection_state_str`（L1477）に `Unbound => "unbound"` を 1 行足す**（§10。足さないと
   `chronogazer-core` の compile が通らない）。banto-tagclient-design.md §4 の分類表・§5 の状態図を
   本書に合わせて直し、本書の `状態:` を「実装済み」に。
 - 完了条件: 受入 4・2（Unbound から）・6 のテスト。
   - 全件未解決 → `Unbound`、`snapshot().values == None`、`resolution.unresolved` が全件、モック Hub
-    が `subscribe` を**受けていない**。
+    が `subscribe` を**受けていない**。モック Hub が受けた順は `GET catalog` → WS → `ping` →
+    `GET catalog`（2 回目）で、**2 回目の catalog GET は `pong` を返した後**に届く（§5.1 の順序）。
   - `Unbound` 中に `config_changed` → `Rebinding` → タグが作られていれば `Live`。
-  - 最初の `fetch_catalog()` と WS 確立の間にタグを作る（モック Hub が 2 回目の catalog で revision を
-    進める）→ `Unbound` を**一度も publish せず**に `Rebinding` → `Live`（§5.1 の取り直し。state_watch の
-    履歴に `Unbound` が無いことを確かめる）。
+  - **Hub の受信登録の遅れを再現する**: モック Hub は WS を accept した後、`ping` を受けても `pong` を
+    すぐ返さず、テストがタグを作って（catalog の revision を進めて）から `pong` を返す（`revision_rx`
+    の登録前の変更なので `config_changed` は送らない）→ クライアントは 2 回目の catalog で revision
+    不一致 → `Unbound` を**一度も publish せず**に `Rebinding` → `Live`（state_watch の履歴に
+    `Unbound` が無いことを確かめる）。この順序は実 Hub でも起こる（`handle_socket` が `on_upgrade` で
+    遅れて始まる）。
+  - `pong` 待ちの間に `config_changed` が来る → `Unbound` を publish せずに `Rebinding`。
+  - **裂けた読みの再現（§5.2 場面 14）**: モック Hub が初回 GET catalog で（旧 tags, 新 revision）を
+    返し、2 回目の GET で（新 tags, 同じ revision）を返す → revision は一致するが再解決で `resolved` が
+    空でなくなるので `Unbound` を**一度も publish せず**に `Rebinding` → `Live`。再解決の 1 行を外すと
+    `Unbound` に留まって落ちることを 1 回確かめる。
+  - **`run_id` 違い（§5.2 場面 13）**: 2 回目の GET catalog が同じ revision・違う `run_id` を返す →
+    `Unbound` を publish せずに `RuntimeMetadataMismatch` で `Rebinding`。
+  - publish された `Unbound` の `snapshot.catalog` は 2 回目の GET のもの（`t` か tags の順で見分ける）。
+  - **`ping` 送信中の `shutdown`（§5.2 場面 11）**: モック Hub が WS の読みを止めて送信を詰まらせた
+    状態で `shutdown()` → 待たずに `Stopped`（`subscribe` 中の stop の既存テストの `ping` 版）。
+  - `pong` 待ち中の close 1008 → `Unauthorized` + 理由（Err を変換していないことの固定、§14）。
+  - 不要な `ping` を送らない: resolved ≥ 1 の接続ではモック Hub が `ping` を受けない。
   - `Unbound` → `config_changed` → `Unbound` を 4 回繰り返しても `Reconnecting` に落ちない（rebind の
     budget が `Unbound` で新しくなる。`live_rebind_success_starts_a_new_rebind_budget` L767 の `Unbound` 版）。
   - `Unbound` 中の切断 → `Reconnecting` → backoff → 再接続で `Unbound` に戻る。**backoff の遅延は
@@ -535,14 +695,15 @@ PR-4: ChronoGazer（§10）。PR-5: Sink（§10）。どちらも `plan_bindings
 既存の `worker.rs` のモック Hub（`serve_named_generation` ほか、TCP で REST と WS を手書き）を
 そのまま使う。新しい足場は要らない。
 
-| 層                 | 内容                                                                                                                                                                                                                                                            | PR   |
-| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
-| 純関数             | `resolve_bindings`: `reason` が付く。重複 3 分類は変更なし。`GenerationSnapshot::binding` の総当たり（resolved+値あり / resolved+値なし（Unbound）/ unresolved / 未知 key）。                                                                                   | 1    |
-| 状態 DTO           | 全状態 × `snapshot` / `current` の有無を表で（§9 の表そのまま）。`Clone` が `Arc::ptr_eq`。                                                                                                                                                                     | 1,3  |
-| worker（モック）   | §12 の各 PR の完了条件。加えて: `config_changed` 連打の coalesce が部分解決でも 1 回の rebind になる（`config_changed_burst_rebinds_once_...` L914 を混在要求に）。REST の値集合が `resolved` と食い違えば `ProtocolError`（R4）。                              | 2,3  |
-| 値の扱い（受入 8） | 混在要求で `value_source=simulation` / `derived_simulation` の値が `Live` で**そのまま**公開され、`Quality::Bad/Stale` も値側のまま。`CatalogTag.effective_simulation` で上書きされない（R7）。`collection_mode` 不一致は従来どおり `RuntimeMetadataMismatch`。 | 2    |
-| 回帰（受入 8）     | ChronoGazer `hub.rs`・Sink `values.rs` の既存テストが SDK の 3 PR の後も緑（CI の workspace テストで自動）。                                                                                                                                                    | 1〜3 |
-| 実機               | PR-3 の §12 項目。                                                                                                                                                                                                                                              | 3    |
+| 層                 | 内容                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    | PR   |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---- |
+| 純関数             | `resolve_bindings`: `reason` が付く。重複 3 分類は変更なし。`GenerationSnapshot::binding` の総当たり（`Live` の形 = resolved+値あり / unresolved / 未知 key → `None`、`Unbound` の形 = resolved 空 + `values: None` で全 key が `Unresolved`、未知 key → `None`）。「resolved+値なし」は R5 により作れないので試さない。                                                                                                                                                                | 1    |
+| 状態 DTO           | 全状態 × `snapshot` / `current` の有無を表で（§9 の表そのまま）。`Clone` が `Arc::ptr_eq`。                                                                                                                                                                                                                                                                                                                                                                                             | 1,3  |
+| worker（モック）   | §12 の各 PR の完了条件。加えて: `config_changed` 連打の coalesce が部分解決でも 1 回の rebind になる（`config_changed_burst_rebinds_once_...` L914 を混在要求に）。REST の値集合が `resolved` と食い違えば `ProtocolError`（R4）。PR-3 では Hub の `revision_rx` 登録の遅れ（`pong` を遅らせるモック）・裂けた読み（初回 GET が（旧 tags, 新 revision））・`run_id` 違いのどれでも `Unbound` を publish しないこと、`ping` 送信中の `shutdown` が待たないこと（§5.1・§5.2・§12 PR-3）。 | 2,3  |
+| Hub（PR-H）        | `commit_catalog` と GET catalog / values を並行に回し、応答の `revision` と `tags` / `values` の中身がずれない（§12 PR-H）。SDK のモック Hub とは別に、Hub 自身のテストとして置く。                                                                                                                                                                                                                                                                                                     | H    |
+| 値の扱い（受入 8） | 混在要求で `value_source=simulation` / `derived_simulation` の値が `Live` で**そのまま**公開され、`Quality::Bad/Stale` も値側のまま。`CatalogTag.effective_simulation` で上書きされない（R7）。`collection_mode` 不一致は従来どおり `RuntimeMetadataMismatch`。                                                                                                                                                                                                                         | 2    |
+| 回帰（受入 8）     | ChronoGazer `hub.rs`・Sink `values.rs` の既存テストが SDK の 3 PR の後も緑（CI の workspace テストで自動）。                                                                                                                                                                                                                                                                                                                                                                            | 1〜3 |
+| 実機               | PR-3 の §12 項目。                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | 3    |
 
 checklist §5 で先回りするもの: 「自動で再試行します」と書いたら経路があるか（`Unbound` →
 `config_changed` の経路をテストで固定）／見張りの「放置してよい状態」を状態名だけで決めない
@@ -552,25 +713,36 @@ checklist §5 で先回りするもの: 「自動で再試行します」と書�
 ## 14. 設計上の注意（実装者へ）
 
 - `TagClientState` の publish は `run_supervisor_with_config`・`run_attempt`・`publish_snapshot` の
-  3 か所に散っている。PR-1 で `TagClientState` のコンストラクタ（`live(snapshot)` / `unbound(snapshot)` /
-  `rebinding(kind)` …）を揃え、`snapshot` を `Live`・`Unbound` 以外で `Some` にできない形
-  （`pub(crate)` のコンストラクタ以外で `snapshot` を触れない）にする。
+  3 か所に散っている。PR-1 で `TagClientState` のコンストラクタ（`live(snapshot)` / `rebinding(kind)` …）を
+  揃え、`snapshot` を `Live` 以外で `Some` にできない形（`pub(crate)` のコンストラクタ以外で `snapshot`
+  を触れない）にする。**`unbound(snapshot)` は PR-3 で足す**（`Unbound` 列挙子が PR-3 の範囲なので、
+  PR-1 に置くと compile が通らない。2026-10-31、オーナーの Codex CLI の指摘による）。PR-3 で
+  「`Live`・`Unbound` 以外で `Some` にできない」に広げる。
 - `generation` は **catalog 取得の成功**で進める（gate 通過ではない）。`Unbound` にも番号が要るため。
 - `Arc<CatalogSnapshot>` を作るのは試行ごとに 1 回。`PublishGate::finalize(&catalog)` は `&` で
   受けているので `Arc` の中身をそのまま渡せる。
 - `BindingResolution` は要求順を保つ（`resolve_bindings` が `requests` の順で push）。SCADA が
   Project の順で描くために順序を変えない。
 - `UnresolvedReason` は `#[non_exhaustive]`。利用者の `match` に `_` を強いる。
+- **`pong` 待ちと `Unbound` の受信ループでは `receive_text()` の `Err` を変換せずにそのまま返す**
+  （2026-10-31 順序の総点検 §5.2 場面 9）。close 1008 の `Unauthorized`（#446）を `Transport` に
+  潰すと、認証拒否が `Reconnecting` の無限再接続になる。既存の Live 側のループ（`worker.rs` L408 /
+  L424 / L440 の `result?`）と同じく `?` で返す。`pong` / `config_changed` の見分けは `Ok(text)` の
+  中身にだけ行う。
+- **`send_ping()` は `stop` と並べた `biased` `select!` で呼ぶ**（§5.2 場面 11）。`subscribe_on_change`
+  （`worker.rs` L392〜）と同じ形で、`stop` 側では `close_best_effort()` してから `stopped()` を返す。
+  送信だけ `select!` の外に置くと、送信バッファが詰まったときに shutdown が待たされる。
 
 ## 15. 未決事項・オーナー判断待ち
 
-| #      | 事項                                                                                                                                                                                                                                                                                          | 本書の仮の立場                                                                                                                                                                                                          |
-| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 判断 1 | **2026-10-31 オーナー決定: 本書の立場で採用。** **strict ポリシーを用意しない**（D1）。Issue 本文の「既存 strict 利用者への影響がある場合は明示的な解決ポリシー等で互換性を扱う」に対し、リポジトリ内に strict を望む利用者が無いことを根拠に、ポリシー enum を作らず既定を部分解決に変える。 | 作らない。必要が出たら `start_with_policy` を後付けできる形（`start` の引数は増やさない）。                                                                                                                             |
-| 判断 2 | **2026-10-31 オーナー決定: 本書の立場で採用。** `Unbound` を**新しい接続状態**にするか、`Live` + `values` 空にするか。本書は新状態（`current()` が `Live` でだけ `Some` という既存の不変条件を守るため）。                                                                                    | 新状態 `Unbound`。                                                                                                                                                                                                      |
-| 判断 3 | PR-4 / PR-5（ChronoGazer・Sink の追従）を SDK の 3 PR の直後に続けるか、SCADA Host の着手まで待つか。追従しないと重複実装が残る（2026-10-01 方針）が、動いているものを触る。                                                                                                                  | SDK の 3 PR の直後に 1 利用者 1 PR で続ける。                                                                                                                                                                           |
-| 未決 1 | 要求集合の動的な変更（`rebind(requests)`）。今は `shutdown()` → `start(new_requests)` で入れ替える（`restart` は要求集合を引き継ぐので使えない、§0）。SCADA の Editor で Binding を足すたびに WS を張り直すので、将来は要るかもしれない。                                                     | 範囲外。必要が出たら別 Issue。                                                                                                                                                                                          |
-| 未決 2 | `UnresolvedReason` に「権限で見えない」を足すか。Hub が catalog をスコープで絞る作りになったときに要る。                                                                                                                                                                                      | 今は `NotInCatalog` だけ。enum と `#[non_exhaustive]` で席だけ確保。                                                                                                                                                    |
-| 未決 3 | `DuplicateCatalogExternalName` の terminal 扱い（§8 P4）。Hub の不整合が直った後に自動で戻るべきか。                                                                                                                                                                                          | 現状どおり terminal（利用者が `restart`）。Hub 側で外部名の一意性は DB 制約なので実際には起きないはず。                                                                                                                 |
-| 未決 4 | Hub が無購読の WS 接続を時間で閉じるか（§7）。                                                                                                                                                                                                                                                | PR-3 の実機確認で確かめる。閉じても `Reconnecting` → 再接続で戻るので設計は変えない。`RetryTracker` を `Unbound` でリセットしない（§7 の 2026-10-31 設計判断）ので、閉じられ続けても再接続は指数 backoff で暴走しない。 |
-| 未決 5 | `TagClientConnectionState` に `#[non_exhaustive]` を付けるか（利用者の `match` に `_` を強いる）。                                                                                                                                                                                            | 付けなくてよい（破壊的変更可の方針、2026-10-17）。PR-3 で `connection_state_str` の 1 行を足すほうが、状態の取りこぼしを compile で検出できる。付けるなら PR-3 で。                                                     |
+| #      | 事項                                                                                                                                                                                                                                                                                          | 本書の仮の立場                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 判断 1 | **2026-10-31 オーナー決定: 本書の立場で採用。** **strict ポリシーを用意しない**（D1）。Issue 本文の「既存 strict 利用者への影響がある場合は明示的な解決ポリシー等で互換性を扱う」に対し、リポジトリ内に strict を望む利用者が無いことを根拠に、ポリシー enum を作らず既定を部分解決に変える。 | 作らない。必要が出たら `start_with_policy` を後付けできる形（`start` の引数は増やさない）。                                                                                                                                                                                                                                                                                                                                                                                             |
+| 判断 2 | **2026-10-31 オーナー決定: 本書の立場で採用。** `Unbound` を**新しい接続状態**にするか、`Live` + `values` 空にするか。本書は新状態（`current()` が `Live` でだけ `Some` という既存の不変条件を守るため）。                                                                                    | 新状態 `Unbound`。                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| 判断 3 | PR-4 / PR-5（ChronoGazer・Sink の追従）を SDK の 3 PR の直後に続けるか、SCADA Host の着手まで待つか。追従しないと重複実装が残る（2026-10-01 方針）が、動いているものを触る。                                                                                                                  | SDK の 3 PR の直後に 1 利用者 1 PR で続ける。                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| 未決 1 | 要求集合の動的な変更（`rebind(requests)`）。今は `shutdown()` → `start(new_requests)` で入れ替える（`restart` は要求集合を引き継ぐので使えない、§0）。SCADA の Editor で Binding を足すたびに WS を張り直すので、将来は要るかもしれない。                                                     | 範囲外。必要が出たら別 Issue。                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| 未決 2 | `UnresolvedReason` に「権限で見えない」を足すか。Hub が catalog をスコープで絞る作りになったときに要る。                                                                                                                                                                                      | 今は `NotInCatalog` だけ。enum と `#[non_exhaustive]` で席だけ確保。                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| 未決 3 | `DuplicateCatalogExternalName` の terminal 扱い（§8 P4）。Hub の不整合が直った後に自動で戻るべきか。                                                                                                                                                                                          | 現状どおり terminal（利用者が `restart`）。Hub 側で外部名の一意性は DB 制約なので実際には起きないはず。                                                                                                                                                                                                                                                                                                                                                                                 |
+| 未決 4 | Hub が無購読の WS 接続を時間で閉じるか（§7）。                                                                                                                                                                                                                                                | PR-3 の実機確認で確かめる。閉じても `Reconnecting` → 再接続で戻るので設計は変えない。`RetryTracker` を `Unbound` でリセットしない（§7 の 2026-10-31 設計判断）ので、閉じられ続けても再接続は指数 backoff で暴走しない。                                                                                                                                                                                                                                                                 |
+| 未決 5 | `TagClientConnectionState` に `#[non_exhaustive]` を付けるか（利用者の `match` に `_` を強いる）。                                                                                                                                                                                            | 付けなくてよい（破壊的変更可の方針、2026-10-17）。PR-3 で `connection_state_str` の 1 行を足すほうが、状態の取りこぼしを compile で検出できる。付けるなら PR-3 で。                                                                                                                                                                                                                                                                                                                     |
+| 未決 6 | Hub に「`revision_rx` 登録後の準備完了（`ready { revision }`）」を足すか（§5.1 の選択肢 (b)）。足せば `Unbound` 側の取り直しの REST 1 回が省ける。                                                                                                                                            | 足さない。`ping` / `pong` + REST の取り直し（今の Hub にある手段）で同じ保証が取れる。省けるのは `Unbound` に入る接続ごとの REST 1 回だけで、Hub のプロトコル変更と Hub 側の PR に見合わない。要るなら別 Issue で Hub の PR を先に出し、SDK は `ready` が来れば REST を省き、来なければ従来どおり（破壊的変更可の方針なので旧 Hub の併存は保たなくてよい）。**PR-H（§12、裂けた読みの直し）はプロトコルに触れない Hub の実装の直しで、この未決とは別物**（2026-10-31 設計判断、§5.2）。 |
