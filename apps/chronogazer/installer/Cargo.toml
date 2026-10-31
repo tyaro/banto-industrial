@@ -21,10 +21,11 @@ publish = false
 # NSIS テンプレートの挙動 - フックの挿入位置・MainBinaryName の扱い・
 # アンインストール時に消すアプリデータの場所 - は hooks/service-hooks.nsh と
 # src/main.rs がこの版のテンプレートを前提に書いてあるので、上げるときは両方の
-# インストーラを一緒に上げる）。**`=` で固定する**: templates/installer.nsi は
-# この版の installer.nsi の写し（src/main.rs の TEMPLATE_PATCHES の土台。SHA-256 を
-# 試験で確かめる）なので、版を上げるときは写しを取り直し、当て直しが要るかを
-# 見る（#972 のオーナーレビュー P1・P2）。
+# インストーラを一緒に上げる）。**`=` で固定する**: Hub と共通の
+# installer-common/nsis-template/installer.nsi はこの版の installer.nsi の写し
+# （src/main.rs の TEMPLATE_PATCHES の土台。SHA-256 を試験で確かめる）なので、版を
+# 上げるときは写しを取り直し、当て直しが要るかを見る（#972 のオーナーレビュー P1・P2。
+# 写しの置き場は #973 PR-3b で installer-common/ に移した）。
 tauri-bundler = "=2.9.4"
 # `WebviewInstallMode`/`NSISInstallerMode` の型は tauri-bundler から再エクスポート
 # されていないため、tauri-bundler 2.9.4 が依存する tauri-utils と同じ版を直接指定する。
@@ -37,7 +38,7 @@ log = "0.4"
 [dev-dependencies]
 # `missing_binaries` の単体テスト（対象ディレクトリの exe 有無判定）用。
 tempfile = "3"
-# templates/installer.nsi が 2.9.4 の写しのままかを SHA-256 で確かめる試験だけが使う
+# installer-common/nsis-template/installer.nsi が 2.9.4 の写しのままかを SHA-256 で確かめる試験だけが使う
 # （tauri-bundler が既に依存している版と同じ）。
 sha2 = "0.10"
 hex = "0.4"

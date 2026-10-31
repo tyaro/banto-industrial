@@ -66,7 +66,7 @@
 //! `installer-common/service-common.nsh` にあり、このツールがフックの先頭へその
 //! 絶対パスを `!define` してから tauri-bundler に渡す（[`render_hooks`]）。
 //!
-//! ## NSIS テンプレートの当て直し（`templates/installer.nsi`、[`TEMPLATE_PATCHES`]）
+//! ## NSIS テンプレートの当て直し（`installer-common/nsis-template/`、[`TEMPLATE_PATCHES`]）
 //!
 //! tauri-bundler 2.9.4 の `installer.nsi` には、このインストーラの方針と合わない
 //! 箇所が 6 つある（PR #972 のオーナーレビュー P1・P2、Codex の指摘 P3、総点検 P4、
@@ -97,13 +97,13 @@
 //!   だけで、「強制終了はしない」（最終 flush を失わない）の約束が破れる。
 //!
 //! tauri-bundler の `NsisSettings::template`（handlebars の自前テンプレート）で、
-//! **2.9.4 の `installer.nsi` をそのまま写した `templates/installer.nsi`** に
-//! [`TEMPLATE_PATCHES`]（文字列の完全一致の置き換え。各 1 回だけ一致しなければ
-//! エラー）を当てたものを渡す（[`patch_template`]）。写しは byte 単位で同じ
-//! （[`VENDORED_TEMPLATE_SHA256`] を試験で確かめる。`Cargo.toml` は `=2.9.4`
-//! で固定）。tauri-bundler は自前テンプレートでも `utils.nsh`・
-//! `FileAssociation.nsh` を同じ出力先に書くので、`!include` はそのまま通る
-//! （`nsis/mod.rs` で確認済み）。
+//! **2.9.4 の `installer.nsi` をそのまま写した
+//! `installer-common/nsis-template/installer.nsi`** に [`TEMPLATE_PATCHES`]（文字列の
+//! 完全一致の置き換え。各 1 回だけ一致しなければエラー）を当てたものを渡す
+//! （[`patch_template`]）。写しと当てる部品は Hub の xtask と共通の
+//! [`nsis_template`]（`installer-common/nsis-template/vendored_template.rs`、#973 PR-3b
+//! でここから移した。写しが byte 単位で同じことの試験もそこ。`Cargo.toml` は `=2.9.4`
+//! で固定）。当て直しの表（何を当てるか）は製品ごとにこのファイルに置く。
 //!
 //! 当てる内容（決定は docs/chronogazer-service-design.md §4 の B3-4 PR-C の実装メモ）:
 //!
@@ -145,6 +145,12 @@ use tauri_bundler::{
     WindowsSettings,
 };
 use tauri_utils::config::{NSISInstallerMode, WebviewInstallMode};
+
+/// tauri-bundler 2.9.4 の `installer.nsi` の写しと当て直しの部品（Hub の xtask と
+/// 同じファイルを取り込む。モジュール doc「NSIS テンプレートの当て直し」）。
+#[path = "../../../../installer-common/nsis-template/vendored_template.rs"]
+mod nsis_template;
+use nsis_template::{patch_template, TemplatePatch, VENDORED_TEMPLATE};
 
 /// インストーラの識別子。**シェルの `tauri.conf.json` の `identifier`
 /// （`dev.tyaro.chronogazer`）とは意図的に変えてある**（2026-10-31 オーナー決定 O-8）。
@@ -188,30 +194,19 @@ const REQUIRED_BINARY_NAMES: [&str; 3] = [SHELL_BINARY_NAME, SERVER_BINARY_NAME,
 /// 版から組み立てるので、ずれると「インストーラが見つかりません」で止まる。
 const PRODUCT_VERSION: &str = "0.3.0-alpha.1";
 
-/// tauri-bundler **2.9.4** の `src/bundle/windows/nsis/installer.nsi` の写し
-/// （crates.io の tauri-bundler-2.9.4、2026-10-31 に byte 単位でそのまま写した。
-/// 改行は LF）。手を入れずに置き、当て直しは [`TEMPLATE_PATCHES`] で行う。
-/// tauri-bundler の版を上げるときは写しを取り直し（`Cargo.toml` の `=2.9.4` も）、
-/// [`VENDORED_TEMPLATE_SHA256`] を更新し、各パッチの土台がまだ 1 回だけ一致するかを
-/// 試験（`vendored_template_*`・`patch_template_*`）で確かめる。
-const VENDORED_TEMPLATE: &str = include_str!("../templates/installer.nsi");
-
-/// [`VENDORED_TEMPLATE`] の SHA-256（`sha256sum installer.nsi` の値）。写しが黙って
-/// 変わっていない（= 2.9.4 の原本のまま）ことを試験で確かめる（試験だけが使う）。
-#[cfg(test)]
-const VENDORED_TEMPLATE_SHA256: &str =
-    "20f4ecc730defb71f1342eaeaec4021df13be3d843abba0effe88ea5835fa079";
-
 /// [`VENDORED_TEMPLATE`] に当てる置き換え（`(名前, 土台, 置き換え後)`）。土台は
 /// 写しの中に**ちょうど 1 回**現れる文字列でなければならず、違えば
 /// [`patch_template`] が名前を挙げて止まる（tauri-bundler の版を上げて土台が
 /// 変わったときに黙って当たらないままにしない）。順に当てる。置き換え後の文字列は
 /// NSIS のソースなので LF 改行・2 空白のインデント（原本に合わせる）。
+/// 版を上げたときは、各パッチの土台がまだ 1 回だけ一致するかを試験
+/// （`vendored_template_contains_every_patch_anchor_exactly_once`・`patch_template_*`）
+/// で確かめる。
 ///
 /// 置き換え後で挿入する `QuitShellForUpdate` は `hooks/service-hooks.nsh` の
 /// マクロ（テンプレートはフックを先頭近くで `!include` するので、Section
 /// Install／Uninstall の時点で定義済み）。引数の意味はフック側を参照。
-const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
+const TEMPLATE_PATCHES: &[TemplatePatch] = &[
     (
         // P1: 再インストールの頁を出さない。頁の関数の `Abort` は「この頁を
         // 飛ばす」（テンプレート自身が「入っていなければ飛ばす」に使っている形）。
@@ -437,8 +432,11 @@ fn main() -> Result<()> {
     // tauri-bundler は handlebars で描画した結果を出力先の installer.nsi に書くので、
     // 生成物を確かめるときはそちら（<対象ディレクトリ>/bundle/nsis/installer.nsi）を見る。
     let installer_template = hooks_work_dir.join("installer.nsi");
-    std::fs::write(&installer_template, patch_template(VENDORED_TEMPLATE)?)
-        .context("テンプレートの書き出しに失敗しました")?;
+    std::fs::write(
+        &installer_template,
+        patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES)?,
+    )
+    .context("テンプレートの書き出しに失敗しました")?;
 
     let package_settings = PackageSettings {
         product_name: PRODUCT_NAME.to_string(),
@@ -565,24 +563,6 @@ fn render_hooks(hooks: &str, common_dir: &Path) -> Result<String> {
     ))
 }
 
-/// [`TEMPLATE_PATCHES`] を順に当てる。土台が 1 回も無い・2 回以上ある、の
-/// どちらも名前を挙げたエラー（tauri-bundler の版を上げて原本が変わったときの
-/// 合図）。写しそのものが原本と違うかは試験（`vendored_template_*`）で見る。
-fn patch_template(template: &str) -> Result<String> {
-    let mut out = template.to_string();
-    for (name, anchor, replacement) in TEMPLATE_PATCHES {
-        match out.matches(anchor).count() {
-            1 => out = out.replacen(anchor, replacement, 1),
-            n => bail!(
-                "NSIS テンプレートの当て直し {name} の土台が {n} 回一致しました（ちょうど 1 回のはず）。\
-                 tauri-bundler の installer.nsi が変わっていないか、templates/installer.nsi の写しと \
-                 TEMPLATE_PATCHES を見直してください"
-            ),
-        }
-    }
-    Ok(out)
-}
-
 fn require_file(path: PathBuf) -> Result<PathBuf> {
     if !path.is_file() {
         bail!("必要なファイルが見つかりません: {}", path.display());
@@ -677,19 +657,9 @@ mod tests {
         assert!(missing_binaries(dir.path()).contains(&SERVER_BINARY_NAME));
     }
 
-    /// 写しは tauri-bundler 2.9.4 の原本のまま（黙って手を入れない。当て直しは
-    /// `TEMPLATE_PATCHES` で）。版を上げたら写しを取り直してこの定数も更新する。
-    #[test]
-    fn vendored_template_is_the_unmodified_2_9_4_original() {
-        use sha2::{Digest, Sha256};
-        let digest = hex::encode(Sha256::digest(VENDORED_TEMPLATE.as_bytes()));
-        assert_eq!(digest, VENDORED_TEMPLATE_SHA256);
-        // 原本は LF。土台の文字列も LF で書いてあるので、CRLF に変わると当たらない。
-        assert!(!VENDORED_TEMPLATE.contains('\r'));
-    }
-
     /// 各パッチの土台が写しにちょうど 1 回ある（版を上げて原本が変わったら
-    /// ここで気づく）。置き換え後の文字列は土台と違う。
+    /// ここで気づく。写しそのものが原本のままかは共通の `nsis_template` の試験で見る）。
+    /// 置き換え後の文字列は土台と違う。
     #[test]
     fn vendored_template_contains_every_patch_anchor_exactly_once() {
         for (name, anchor, replacement) in TEMPLATE_PATCHES {
@@ -708,7 +678,7 @@ mod tests {
     /// `reinst_done` へ飛ぶ。フックの `!include` は Section より前にある。
     #[test]
     fn patch_template_applies_p1_and_p2() {
-        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
 
         // P2: KillProcess に進む挿入が残っていない（utils.nsh のマクロ定義はそのまま
         // include されるが、挿入が無ければ呼ばれない）。
@@ -777,7 +747,7 @@ mod tests {
     /// `.onInstFailed` が 1 つだけあり、`ChronoGazerOnInstFailed` を呼ぶ。
     #[test]
     fn patch_template_applies_p3_and_p4() {
-        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
 
         let include = out
             .find("!include \"{{installer_hooks}}\"")
@@ -828,7 +798,7 @@ mod tests {
     /// キーの削除の順。
     #[test]
     fn patch_template_applies_p5_and_p6() {
-        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
 
         fn pos(text: &str, needle: &str) -> usize {
             assert_eq!(text.matches(needle).count(), 1, "{needle} が 1 回ではない");
@@ -878,19 +848,5 @@ mod tests {
         assert!(un_recheck < unlocked && unlocked < unreg && unreg < main_del);
         assert!(main_del < bin_del && bin_del < deleted);
         assert!(deleted < uninst_del && uninst_del < key_del);
-    }
-
-    /// 土台が 1 回だけでなければ名前を挙げて止まる（0 回・2 回の両方）。
-    #[test]
-    fn patch_template_rejects_a_template_whose_anchor_count_is_not_one() {
-        let (name, anchor, _) = TEMPLATE_PATCHES[0];
-        let missing = VENDORED_TEMPLATE.replacen(anchor, "", 1);
-        let err = patch_template(&missing).expect_err("0 回");
-        assert!(err.to_string().contains(name), "{err}");
-        assert!(err.to_string().contains("0 回"), "{err}");
-
-        let doubled = format!("{VENDORED_TEMPLATE}\n{anchor}");
-        let err = patch_template(&doubled).expect_err("2 回");
-        assert!(err.to_string().contains("2 回"), "{err}");
     }
 }

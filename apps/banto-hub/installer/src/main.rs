@@ -81,9 +81,64 @@
 //! サービスの再開、の順で実行する。サービスの停止・シェルの終了・再開の部品は
 //! ChronoGazer のインストーラと共通の `installer-common/service-common.nsh` にあり、
 //! このツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す
-//! （[`render_hooks`]）。PREUNINSTALL はシェルとサイドカーを
-//! 止めてからサービス登録を解除する。どのステップも失敗してインストーラ
-//! 自体を中断させない（`DetailPrint` で案内するだけ - T5-2 以来の方針）。
+//! （[`render_hooks`]）。PREUNINSTALL はシェルを止め、サイドカーと Hub の
+//! サービスを止める（登録の解除は下の P6 で Section Uninstall の途中へ移した）。
+//! サブコマンドの失敗ではインストーラ自体を中断させない（`DetailPrint` で案内する
+//! だけ - T5-2 以来の方針）。例外（置き場・ファイルの状態が壊れたまま成功に
+//! 見えるのを防ぐ `Abort`）はフックの冒頭の一覧を参照。
+//!
+//! ## NSIS テンプレートの当て直し（`installer-common/nsis-template/`、[`TEMPLATE_PATCHES`]）
+//!
+//! tauri-bundler 2.9.4 の `installer.nsi` には、このインストーラの方針と合わない
+//! 箇所がある。ChronoGazer のインストーラ（`apps/chronogazer/installer`、#972 の
+//! P1〜P6）と同じ仕組み - tauri-bundler の `NsisSettings::template` に、**2.9.4 の
+//! `installer.nsi` をそのまま写した `installer-common/nsis-template/installer.nsi`**
+//! へ文字列の完全一致の置き換え（各 1 回だけ一致しなければエラー）を当てたものを
+//! 渡す - で直す（#973 PR-3b。写しと当てる部品は ChronoGazer と共通の
+//! [`nsis_template`]。写しが byte 単位で同じことの試験もそこ。`Cargo.toml` は
+//! `=2.9.4` で固定）。当て直しの表（何を当てるか）は製品ごとにこのファイルに置く。
+//! 番号は ChronoGazer の P1〜P6 と対応させてある。
+//!
+//! Hub に当てるもの（決定は docs/banto-hub-installer-design.md §4.1・§4.3）:
+//!
+//! 1. P1: `PageReinstall` の先頭で `Abort`（頁を出さない = 旧い版の
+//!    アンインストーラを走らせず、**常にその場で上書きする**）。原本は既に
+//!    入っていると「先にアンインストールしてから入れる」を既定の選択で出し、
+//!    旧い版の PREUNINSTALL がサービスを止めて `service-uninstall` するので、
+//!    新しい版の PREINSTALL にはサービスが「動いていない」と見え、POSTINSTALL は
+//!    再開せず、起動種別（遅延自動開始）も手動に戻る。`PageLeaveReinstall` も
+//!    先頭で `reinst_done` へ飛ばして二重に塞ぐ。
+//! 3. P3: `Section WebView2` の先頭にフックの `BantoHubInstallPreflight`
+//!    （インストール先の固定・所有者と ACL の戻し。何も変えずに止められる確かめ）
+//!    を挿入する。当て直しなしでは確かめが Section Install（WebView2 の導入と
+//!    `SetOutPath` の後）になり、駄目でも WebView2 だけ入り、空のフォルダが
+//!    できていた（#973 PR-3a の Codex の指摘 1。この PR の主眼）。
+//! 4. P4: `Function .onInstFailed` と `Function un.onUninstFailed` を足し、
+//!    フックの `BantoHubOnInstFailed`／`BantoHubOnUninstFailed`（止めたままの
+//!    サービスを戻す）を呼ぶ。原本には無く、`File` の「使用中」で中止すると
+//!    止めたサービスが止まったまま残っていた。UI では失敗の頁で [キャンセル] を
+//!    押すまで呼ばれないので、フックの各中止の道は案内の前に自分で戻し、この
+//!    コールバックはフックが割り込めない道（`File` の窓の [中止]、
+//!    `CheckIfAppIsRunning` の [キャンセル]）のための補助（#977 の指摘 P2）。
+//! 5. P5: インストーラ属性 `AllowSkipFiles off`（`File` の失敗の窓から「無視」が
+//!    消え、silent では中止になる）、`File` の直前に `ClearErrors`、外部バイナリの
+//!    `File` の直後にフックの `RequireBantoHubFilesCopied`（エラーフラグが
+//!    立っていれば `Abort`。旧い exe と新しい exe が混ざったまま POSTINSTALL に
+//!    進まない）。
+//! 6. P6: Section Uninstall で、テンプレートの `CheckIfAppIsRunning` の直後・
+//!    `Delete` の前にフックの `RequireBantoHubExesUnlocked`（4 つの exe を
+//!    `FileOpen ... a` で開けなければ `Abort`。まだ何も変更していない）と
+//!    `UnregisterBantoHubServices`（PREUNINSTALL から移した登録の解除。解除できなければ
+//!    ファイルを消す前に `Abort`）、外部
+//!    バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
+//!    削除の前に `RequireBantoHubExesDeleted`（残っていれば頼める分の登録を戻して
+//!    `Abort`）。
+//!
+//! 当てないもの: **P2**（`CheckIfAppIsRunning` をフックの「頼んで待つ」再確認に
+//! 置き換える）。ChronoGazer はシェルに `--quit-for-update` で終了を頼み「強制終了
+//! しない」約束があるが、Hub のシェルには終了を頼む道が無く、フック自身が
+//! `taskkill` で閉じる方針なので、テンプレートの確認（残っていれば案内の後に
+//! KillProcess）はそのまま使う。
 
 use std::collections::HashMap;
 use std::env;
@@ -95,6 +150,12 @@ use tauri_bundler::{
     WindowsSettings,
 };
 use tauri_utils::config::{NSISInstallerMode, WebviewInstallMode};
+
+/// tauri-bundler 2.9.4 の `installer.nsi` の写しと当て直しの部品（ChronoGazer の
+/// xtask と同じファイルを取り込む。モジュール doc「NSIS テンプレートの当て直し」）。
+#[path = "../../../../installer-common/nsis-template/vendored_template.rs"]
+mod nsis_template;
+use nsis_template::{patch_template, TemplatePatch, VENDORED_TEMPLATE};
 
 /// 既存2アプリの `dev.tyaro.{name}` 命名規則を踏襲
 /// （apps/relay-wright/src-tauri/tauri.conf.json の `identifier` 参照）。
@@ -128,6 +189,162 @@ const REQUIRED_BINARY_NAMES: [&str; 4] = [
 /// 手動で追従させる必要がある - バージョンを上げたら、ここも合わせて
 /// 更新すること。
 const PRODUCT_VERSION: &str = "0.3.0-alpha.1";
+
+/// [`VENDORED_TEMPLATE`] に当てる置き換え（`(名前, 土台, 置き換え後)`、モジュール doc
+/// 「NSIS テンプレートの当て直し」）。土台は写しの中に**ちょうど 1 回**現れる文字列で
+/// なければならず、違えば [`patch_template`] が名前を挙げて止まる（tauri-bundler の
+/// 版を上げて土台が変わったときに黙って当たらないままにしない）。順に当てる。
+/// 置き換え後の文字列は NSIS のソースなので LF 改行・2 空白のインデント（原本に
+/// 合わせる）。版を上げたときは、各パッチの土台がまだ 1 回だけ一致するかを試験
+/// （`vendored_template_contains_every_patch_anchor_exactly_once`・`patch_template_*`）
+/// で確かめる。
+///
+/// 置き換え後で挿入するマクロ（`BantoHubInstallPreflight` など）は
+/// `hooks/service-hooks.nsh` のもの（テンプレートはフックを先頭近くで `!include`
+/// するので、Section・関数の時点で定義済み）。
+const TEMPLATE_PATCHES: &[TemplatePatch] = &[
+    (
+        // P1: 再インストールの頁を出さない。頁の関数の `Abort` は「この頁を
+        // 飛ばす」（テンプレート自身が「入っていなければ飛ばす」に使っている形）。
+        // 頁が無いので `PageLeaveReinstall`（旧い版のアンインストーラの起動）は
+        // 呼ばれず、常にその場で上書きする。silent はもともと頁の関数を呼ばない
+        // ので、silent と UI の挙動が揃う。WiX（msi）版の検出も頁の中にあるが、
+        // Hub に WiX 版は無い。
+        "P1-reinstall-page",
+        "Function PageReinstall\n",
+        "Function PageReinstall\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P1): 旧い版のアンインストーラを走らせず、\n\
+         \x20 ; 常にその場で上書きするので、この頁は出さない（Abort = 頁を飛ばす）。\n\
+         \x20 Abort\n",
+    ),
+    (
+        // P1 の二重の塞ぎ: 万一 leave が呼ばれても `reinst_uninstall` には進まない
+        // （`/UPDATE` のときの `Goto reinst_done` と同じ道）。
+        "P1-reinstall-leave",
+        "Function PageLeaveReinstall\n",
+        "Function PageLeaveReinstall\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P1): 常にその場で上書き（/UPDATE と同じ道）。\n\
+         \x20 Goto reinst_done\n",
+    ),
+    (
+        // P5（属性）: `File` の失敗の窓から「無視」を消す。インストーラ属性なので
+        // どの Section にも効く（silent では中止 = `Abort` = `.onInstFailed`）。
+        "P5-allow-skip-files-off",
+        "OutFile \"${OUTFILE}\"\n",
+        "OutFile \"${OUTFILE}\"\n\
+         ; banto-hub-installer (#973 PR-3b P5): 使用中で書けない File を「無視」で飛ばせない\n\
+         ; ようにする（再試行／中止だけ。silent では中止）。\n\
+         AllowSkipFiles off\n",
+    ),
+    (
+        // P5（Install、前）: 上書きの前にエラーフラグを落とす（直前の
+        // `CheckIfAppIsRunning` や `ReadRegStr` の失敗で立っていることがある）。
+        "P5-clear-errors-before-file",
+        "  ; Copy main executable\n\
+         \x20 File \"${MAINBINARYSRCPATH}\"\n",
+        "  ; banto-hub-installer (#973 PR-3b P5): File の失敗だけを見るため、直前で落とす。\n\
+         \x20 ClearErrors\n\
+         \n\
+         \x20 ; Copy main executable\n\
+         \x20 File \"${MAINBINARYSRCPATH}\"\n",
+    ),
+    (
+        // P5（Install、後）: main・resources・external binaries の `File` の直後に、
+        // エラーフラグが立っていれば `Abort`（POSTINSTALL に進まない）。
+        "P5-require-files-copied",
+        "  ; Copy external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   File /a \"/oname={{this}}\" \"{{no-escape @key}}\"\n\
+         \x20 {{/each}}\n",
+        "  ; Copy external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   File /a \"/oname={{this}}\" \"{{no-escape @key}}\"\n\
+         \x20 {{/each}}\n\
+         \n\
+         \x20 ; banto-hub-installer (#973 PR-3b P5): 上書きに失敗したものがあれば（エラーフラグ）\n\
+         \x20 ; 混ざったまま成功にせず、止めたサービスを戻してから中止する。\n\
+         \x20 !insertmacro RequireBantoHubFilesCopied\n",
+    ),
+    (
+        // P6（Uninstall、前）: テンプレートの `CheckIfAppIsRunning`（P2 は当てないので
+        // 残る）の直後・`Delete` の前に、使用中の exe の確かめと、PREUNINSTALL から
+        // 移した登録の解除。土台は Uninstall 側の挿入（直後のコメントで Install 側と
+        // 区別する）。
+        "P6-uninstall-unlock-and-unregister",
+        "  !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n\
+         \n\
+         \x20 ; Delete the app directory and its content from disk\n",
+        "  !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n\
+         \n\
+         \x20 ; banto-hub-installer (#973 PR-3b P6): 使用中の exe があれば、登録を解除する前に\n\
+         \x20 ; 止めたサービスを戻してから中止（まだ何も変更していない）。\n\
+         \x20 !insertmacro RequireBantoHubExesUnlocked\n\
+         \x20 !insertmacro UnregisterBantoHubServices\n\
+         \n\
+         \x20 ; Delete the app directory and its content from disk\n",
+    ),
+    (
+        // P6（Uninstall、後）: 4 つの exe の `Delete` の直後に残っていないかを確かめ、
+        // 残っていれば `uninstall.exe` の `Delete` と Uninstall キーの削除より前に
+        // `Abort`（フック側で頼める分のサービスの登録を戻す）。
+        "P6-require-exes-deleted",
+        "  ; Delete external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   Delete \"$INSTDIR\\\\{{this}}\"\n\
+         \x20 {{/each}}\n",
+        "  ; Delete external binaries\n\
+         \x20 {{#each binaries}}\n\
+         \x20   Delete \"$INSTDIR\\\\{{this}}\"\n\
+         \x20 {{/each}}\n\
+         \n\
+         \x20 ; banto-hub-installer (#973 PR-3b P6): exe が残っていれば、uninstall.exe と「アプリ」の\n\
+         \x20 ; 登録を消す前に止める（サービスの登録は残っている exe で戻す）。\n\
+         \x20 !insertmacro RequireBantoHubExesDeleted\n",
+    ),
+    (
+        // P3: 事前の確かめを WebView2 の取得より前に置く（この PR の主眼）。Section は
+        // EarlyChecks → WebView2 → Install の順に全部走るので、WebView2 の先頭 =
+        // Install（`SetOutPath`）より前。ここでの `Abort` は Section WebView2 ごと
+        // 止める（Install には進まない）。
+        "P3-preflight-before-webview2",
+        "Section WebView2\n",
+        "Section WebView2\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P3): WebView2 を入れる前・インストール先を\n\
+         \x20 ; 作る前に、何も変えずに止められる確かめ（インストール先の固定・ACL の戻し）。\n\
+         \x20 !insertmacro BantoHubInstallPreflight\n",
+    ),
+    (
+        // P4（Install）: `.onInstFailed`（Section が `Abort` した・`File` の「使用中」で
+        // 中止した後に呼ばれる。silent でも呼ばれる）で、PREINSTALL で止めてまだ
+        // 戻していないサービスを戻す。UI では失敗の頁の [キャンセル] まで呼ばれない
+        // ので、フックの中止の道は自分で戻し終えている。ここで戻るのは `File` の窓の
+        // [中止]・`CheckIfAppIsRunning` の [キャンセル] の分だけ。
+        "P4-oninstfailed",
+        "Function .onInstSuccess\n",
+        "Function .onInstFailed\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P4): 途中で止まったら、上書き前に止めてまだ\n\
+         \x20 ; 戻していないサービスを戻す（フックの BantoHubOnInstFailed。フックの中止の\n\
+         \x20 ; 道は案内の前に戻し終えているので、ここは File の窓・CheckIfAppIsRunning の分）。\n\
+         \x20 !insertmacro BantoHubOnInstFailed\n\
+         FunctionEnd\n\
+         \n\
+         Function .onInstSuccess\n",
+    ),
+    (
+        // P4（Uninstall）: 同じく `un.onUninstFailed`（Section Uninstall の `Abort` の後に
+        // 呼ばれる）で、PREUNINSTALL で止めてまだ戻していないサービスを戻す。Hub も
+        // ChronoGazer と同じく中止の道ごとに案内の前に戻し、ここは補助。
+        "P4-onuninstfailed",
+        "Function un.onInit\n",
+        "Function un.onUninstFailed\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P4): アンインストールが途中で止まったら、\n\
+         \x20 ; その前に止めてまだ戻していないサービスを戻す（フックの BantoHubOnUninstFailed）。\n\
+         \x20 !insertmacro BantoHubOnUninstFailed\n\
+         FunctionEnd\n\
+         \n\
+         Function un.onInit\n",
+    ),
+];
 
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
@@ -194,6 +411,16 @@ fn main() -> Result<()> {
     )
     .context("フックの書き出しに失敗しました")?;
 
+    // 当て直した NSIS テンプレート（冒頭の「NSIS テンプレートの当て直し」）。
+    // tauri-bundler は handlebars で描画した結果を出力先の `nsis/x64/installer.nsi` に
+    // 書くので、生成物を確かめるときはそちらを見る。
+    let installer_template = hooks_work_dir.join("installer.nsi");
+    std::fs::write(
+        &installer_template,
+        patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES)?,
+    )
+    .context("テンプレートの書き出しに失敗しました")?;
+
     let sink_config_example = require_file(
         installer_dir
             .join("assets")
@@ -256,9 +483,10 @@ fn main() -> Result<()> {
                 // （Hub サービス登録 + Operators グループ・ACL 一式）→
                 // `banto-hub-sink.exe install` → `grant-service-acl` →
                 // ProgramData 作成、pre-install でサービス・シェルの停止、
-                // pre-uninstall でサービス登録解除（hooks/service-hooks.nsh
-                // 参照）。
+                // Section Uninstall の途中（P6）でサービス登録解除
+                // （hooks/service-hooks.nsh 参照）。
                 installer_hooks: Some(installer_hooks),
+                template: Some(installer_template),
                 ..Default::default()
             }),
             ..Default::default()
@@ -429,5 +657,178 @@ mod tests {
         std::fs::create_dir(dir.path().join(format!("{HUB_BINARY_NAME}.exe"))).expect("mkdir");
 
         assert!(missing_binaries(dir.path()).contains(&HUB_BINARY_NAME));
+    }
+
+    /// 各パッチの土台が写しにちょうど 1 回ある（版を上げて原本が変わったら
+    /// ここで気づく。写しそのものが原本のままかは共通の `nsis_template` の試験で見る）。
+    /// 置き換え後の文字列は土台と違う。
+    #[test]
+    fn vendored_template_contains_every_patch_anchor_exactly_once() {
+        for (name, anchor, replacement) in TEMPLATE_PATCHES {
+            assert_eq!(
+                VENDORED_TEMPLATE.matches(anchor).count(),
+                1,
+                "パッチ {name} の土台が 1 回だけ一致しない"
+            );
+            assert_ne!(anchor, replacement, "パッチ {name} が何も変えない");
+        }
+    }
+
+    /// 最初の命令（コメント以外）。
+    fn first_instruction<'a>(text: &'a str, function: &str) -> &'a str {
+        let start = text.find(function).expect("function") + function.len();
+        text[start..]
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with(';'))
+            .expect("instruction")
+    }
+
+    /// `needle` が 1 回だけあり、その位置。
+    fn pos(text: &str, needle: &str) -> usize {
+        assert_eq!(text.matches(needle).count(), 1, "{needle} が 1 回ではない");
+        text.find(needle).expect("needle")
+    }
+
+    /// 当て直した結果: P1 - 再インストールの頁の関数が先頭で `Abort`、leave が
+    /// 先頭で `reinst_done` へ飛ぶ。P2 は当てないので、Section Install／Uninstall の
+    /// `CheckIfAppIsRunning` は 2 つとも残り、フックの直後にある。
+    #[test]
+    fn patch_template_applies_p1_and_keeps_check_if_app_is_running() {
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
+
+        assert_eq!(first_instruction(&out, "Function PageReinstall\n"), "Abort");
+        assert_eq!(
+            first_instruction(&out, "Function PageLeaveReinstall\n"),
+            "Goto reinst_done"
+        );
+        // 原本の「入っていなければ飛ばす」と `reinst_uninstall` のラベル自体は
+        // 残る（届かないだけ）。
+        assert!(out.contains("reinst_uninstall:"));
+        assert!(out.contains("reinst_done:"));
+
+        assert_eq!(out.matches("!insertmacro CheckIfAppIsRunning").count(), 2);
+        let install = pos(&out, "Section Install\n");
+        let uninstall = pos(&out, "Section Uninstall\n");
+        let body = &out[install..uninstall];
+        let hook = pos(body, "!insertmacro NSIS_HOOK_PREINSTALL");
+        let check = pos(body, "!insertmacro CheckIfAppIsRunning");
+        assert!(hook < check);
+        // フックはテンプレートの先頭近くで include されるので、マクロは Section の
+        // 時点で定義済み。
+        let include = pos(&out, "!include \"{{installer_hooks}}\"");
+        assert!(include < install);
+    }
+
+    /// 当て直した結果: P3 - 事前の確かめ（`BantoHubInstallPreflight`）が
+    /// `Section WebView2` の最初の命令で、WebView2 の取得（`ExecWait`）より前・
+    /// `Section Install`（`SetOutPath`）より前にある。P4 - `.onInstFailed` と
+    /// `un.onUninstFailed` が 1 つずつあり、フックのマクロを呼ぶ。
+    #[test]
+    fn patch_template_applies_p3_and_p4() {
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
+
+        let include = pos(&out, "!include \"{{installer_hooks}}\"");
+        let webview2 = pos(&out, "Section WebView2\n");
+        let install = pos(&out, "Section Install\n");
+        let preflight = pos(&out, "!insertmacro BantoHubInstallPreflight");
+        assert!(include < webview2 && webview2 < preflight && preflight < install);
+        let webview2_body = &out[webview2..install];
+        let first_exec = webview2_body.find("ExecWait").expect("webview2 ExecWait");
+        assert!(preflight - webview2 < first_exec);
+        assert_eq!(
+            first_instruction(&out, "Section WebView2\n"),
+            "!insertmacro BantoHubInstallPreflight"
+        );
+        // Section Install の `SetOutPath`（空のインストール先の作成）より前。
+        let set_out_path = pos(&out, "  SetOutPath $INSTDIR\n");
+        assert!(preflight < set_out_path && install < set_out_path);
+
+        // P4: .onInstFailed が 1 つ、.onInstSuccess の前。
+        let failed = pos(&out, "Function .onInstFailed\n");
+        let failed_end = out[failed..].find("FunctionEnd").expect("FunctionEnd") + failed;
+        assert!(out[failed..failed_end].contains("!insertmacro BantoHubOnInstFailed"));
+        assert!(failed < pos(&out, "Function .onInstSuccess\n"));
+        // un.onUninstFailed が 1 つ、un.onInit の前。
+        let un_failed = pos(&out, "Function un.onUninstFailed\n");
+        let un_failed_end = out[un_failed..].find("FunctionEnd").expect("FunctionEnd") + un_failed;
+        assert!(out[un_failed..un_failed_end].contains("!insertmacro BantoHubOnUninstFailed"));
+        assert!(un_failed < pos(&out, "Function un.onInit\n"));
+    }
+
+    /// 当て直した結果: P5 - `AllowSkipFiles off` が 1 つ、Section より前にある。
+    /// Section Install では PREINSTALL → `CheckIfAppIsRunning` → `ClearErrors` →
+    /// main の `File` → 外部バイナリの `File` → `RequireBantoHubFilesCopied` →
+    /// `WriteUninstaller` → POSTINSTALL の順。P6 - Section Uninstall では
+    /// PREUNINSTALL → `CheckIfAppIsRunning` → `RequireBantoHubExesUnlocked` →
+    /// `UnregisterBantoHubServices` → main の `Delete` → 外部バイナリの `Delete` →
+    /// `RequireBantoHubExesDeleted` → `uninstall.exe` の `Delete` → Uninstall
+    /// キーの削除の順。
+    #[test]
+    fn patch_template_applies_p5_and_p6() {
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
+
+        // P5: 属性は 1 つ、最初の Section より前（インストーラ属性は Section の外）。
+        let allow = pos(&out, "AllowSkipFiles off\n");
+        let early = pos(&out, "Section EarlyChecks\n");
+        assert!(allow < early);
+
+        let install = pos(&out, "Section Install\n");
+        let uninstall = pos(&out, "Section Uninstall\n");
+        let body = &out[install..uninstall];
+        let hook = pos(body, "!insertmacro NSIS_HOOK_PREINSTALL");
+        let check = pos(body, "!insertmacro CheckIfAppIsRunning");
+        let clear = pos(body, "  ClearErrors\n");
+        let main_file = pos(body, "File \"${MAINBINARYSRCPATH}\"");
+        let bin_file = pos(body, "File /a \"/oname={{this}}\"");
+        let copied = pos(body, "!insertmacro RequireBantoHubFilesCopied");
+        let write_uninst = pos(body, "WriteUninstaller");
+        let post = pos(body, "!insertmacro NSIS_HOOK_POSTINSTALL");
+        assert!(hook < check && check < clear && clear < main_file && main_file < bin_file);
+        assert!(bin_file < copied && copied < write_uninst && write_uninst < post);
+        // `ClearErrors` と main の `File` の間に命令が無い（`CheckIfAppIsRunning` の
+        // 中の命令で立ったフラグを、落とした後に見る）。
+        let between = &body[clear + "  ClearErrors\n".len()..main_file];
+        assert!(between
+            .lines()
+            .map(str::trim)
+            .all(|line| line.is_empty() || line.starts_with(';')));
+
+        // P6: 解除の前の確かめ、Delete の後の確かめ、の順。
+        let un = &out[uninstall..];
+        let un_hook = pos(un, "!insertmacro NSIS_HOOK_PREUNINSTALL");
+        let un_check = pos(un, "!insertmacro CheckIfAppIsRunning");
+        let unlocked = pos(un, "!insertmacro RequireBantoHubExesUnlocked");
+        let unreg = pos(un, "!insertmacro UnregisterBantoHubServices");
+        let main_del = pos(un, "Delete \"$INSTDIR\\${MAINBINARYNAME}.exe\"");
+        let bin_del = pos(un, "Delete \"$INSTDIR\\\\{{this}}\"");
+        let deleted = pos(un, "!insertmacro RequireBantoHubExesDeleted");
+        let uninst_del = pos(un, "Delete \"$INSTDIR\\uninstall.exe\"");
+        let key_del = pos(un, "DeleteRegKey HKLM \"${UNINSTKEY}\"");
+        assert!(un_hook < un_check && un_check < unlocked && unlocked < unreg);
+        assert!(unreg < main_del && main_del < bin_del && bin_del < deleted);
+        assert!(deleted < uninst_del && uninst_del < key_del);
+    }
+
+    /// フックの当て直しが呼ぶマクロが、フックに全部ある（名前のずれで makensis まで
+    /// 気づかないのを防ぐ）。
+    #[test]
+    fn hooks_define_every_macro_the_patches_insert() {
+        let hooks = include_str!("../hooks/service-hooks.nsh");
+        let out = patch_template(VENDORED_TEMPLATE, TEMPLATE_PATCHES).expect("patch");
+        let inserted = out
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("!insertmacro "))
+            .map(|rest| rest.split_whitespace().next().expect("macro name"))
+            .filter(|name| name.starts_with("BantoHub") || name.contains("BantoHub"))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(!inserted.is_empty());
+        for name in inserted {
+            assert!(
+                hooks.contains(&format!("!macro {name}\n"))
+                    || hooks.contains(&format!("!macro {name}\r\n")),
+                "フックに !macro {name} が無い"
+            );
+        }
     }
 }

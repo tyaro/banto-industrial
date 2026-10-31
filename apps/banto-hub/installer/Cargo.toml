@@ -31,7 +31,11 @@ publish = false
 # https://github.com/tauri-apps/tauri のタグ `tauri-bundler-v2.9.4`
 # （モノレポ全体のタグ `tauri-v2.9.4` は別物 - tauri 本体クレートの
 # バージョンで、当時の tauri-bundler は 2.7.4 だった。要調査・要確認）。
-tauri-bundler = "2.9.4"
+# **`=` で固定する**（#973 PR-3b）: ChronoGazer と共通の
+# installer-common/nsis-template/installer.nsi はこの版の installer.nsi の写し
+# （src/main.rs の TEMPLATE_PATCHES の土台。SHA-256 を試験で確かめる）なので、版を
+# 上げるときは写しを取り直し、当て直しが要るかを見る。両インストーラを一緒に上げる。
+tauri-bundler = "=2.9.4"
 # `WindowsSettings::webview_install_mode` / `NsisSettings::install_mode` /
 # `NsisSettings::compression` の型（`WebviewInstallMode`/
 # `NSISInstallerMode`/`NsisCompression`）は tauri-bundler のクレートルート
@@ -51,3 +55,8 @@ log = "0.4"
 # - Win32 API を呼ばない純粋なファイルシステム確認なので、一時ディレクトリ
 # を使ってクロスプラットフォームでテストできる。
 tempfile = "3"
+# installer-common/nsis-template/installer.nsi が 2.9.4 の写しのままかを SHA-256 で
+# 確かめる試験（共通の vendored_template.rs の中）だけが使う（tauri-bundler が既に
+# 依存している版と同じ）。
+sha2 = "0.10"
+hex = "0.4"
