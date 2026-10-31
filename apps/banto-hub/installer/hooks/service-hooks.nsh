@@ -136,7 +136,13 @@
 ; `AllowSkipFiles off`（「無視」を出さない。silent では中止）、`File` の直前に
 ; `ClearErrors`、外部バイナリの `File` の直後にこのマクロを置く: フラグが立って
 ; いれば、止めたサービスを戻してから案内して `Abort`（POSTINSTALL には進まない）。
-; 各 exe は丸ごと旧いか丸ごと新しいかのどちらかで壊れてはいない。
+; 使用中などで `File` が開けなかったファイルは元のまま（開けない間は何も書かない）。
+; 開けた後の書込みの途中で失敗した（容量不足・I/O）ときは、NSIS は窓を出して中止し、
+; 書きかけのファイルを消さずに残す。このときはエラーフラグが立たないので、このマクロには
+; 届かない。`.onInstFailed` が止めたサービスを `sc start` しても、書きかけの exe は
+; ローダーが拒むので起動に失敗し、`BantoHubOnInstFailed` の案内が出る（空きを作ってから
+; このインストーラをもう一度実行する）。つまりこのマクロは `File` の失敗には保険で、
+; `AllowSkipFiles off` のもとで実際に届くのは resources の `CreateDirectory` の失敗くらい。
 ;
 ; ## 中止の道での止めたサービスの戻し（RestoreStoppedBantoHubServices、#973 PR-3b）
 ;
@@ -490,7 +496,7 @@ Var RestoreSaved3
   ${If} ${Errors}
     DetailPrint "banto-hub: ファイルの上書きに失敗したものがあります。旧い実行ファイルと新しい実行ファイルが混ざらないよう、上書き前に止めたサービスを戻してからインストールを中止します。"
     !insertmacro RestoreStoppedBantoHubServices
-    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます（各ファイルは丸ごと旧いか丸ごと新しいかのどちらかで、壊れてはいません）。$ServiceRestoreNote$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます（開けなかったファイルは元のままです）。$ServiceRestoreNote$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
     Abort "ファイルの上書きに失敗したため、インストールを失敗として終えました。"
   ${EndIf}
 !macroend
@@ -660,7 +666,7 @@ Var RestoreSaved3
 !macro BantoHubOnInstFailed
   !insertmacro RestoreStoppedBantoHubServices
   ${If} $ServiceRestoreFailed != ""
-    MessageBox MB_OK|MB_ICONEXCLAMATION "インストールを中止しましたが、$ServiceRestoreNote" /SD IDOK
+    MessageBox MB_OK|MB_ICONEXCLAMATION "インストールを中止しましたが、$ServiceRestoreNote$\r$\n$\r$\nファイルの書き込みの途中で失敗して中止した（容量不足など）ときは、書きかけの実行ファイルが残っていてサービスが起動できません。空きを作ってから、このインストーラをもう一度実行してください。" /SD IDOK
   ${EndIf}
 !macroend
 
