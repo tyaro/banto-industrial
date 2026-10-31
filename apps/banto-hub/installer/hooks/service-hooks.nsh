@@ -296,6 +296,12 @@ Var SinkUnregistered
 ; Note は中止の案内に含める 1 文、Failed は再開できなかったサービスの名前（無ければ ""）。
 Var ServiceRestoreNote
 Var ServiceRestoreFailed
+; RestoreStoppedBantoHubServices が呼び出し側の $0〜$3 を退避する先。nsExec::ExecToStack が
+; 出力をスタックに残すので、Push／Pop では保てない。
+Var RestoreSaved0
+Var RestoreSaved1
+Var RestoreSaved2
+Var RestoreSaved3
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -412,12 +418,13 @@ Var ServiceRestoreFailed
 ; フラグを "0" に戻す）。共通部品がフラグを "0" に戻すので、2 回呼ばれても 2 回目は
 ; 何もしない。窓は出さない: 結果を $ServiceRestoreNote（案内に含める 1 文）と
 ; $ServiceRestoreFailed（再開できなかったサービス。無ければ ""）に返す。
-; 呼び出し側が $1〜$3 に文言の材料を持っているので、$0〜$3 は Push／Pop で保つ。
+; 呼び出し側が $1〜$3 に文言の材料を持っているので、$0〜$3 は専用の変数（RestoreSaved0〜3）に退避して保つ
+; （共通部品の nsExec::ExecToStack が出力をスタックに残すので Push／Pop は使えない）。
 !macro RestoreStoppedBantoHubServices
-  Push $0
-  Push $1
-  Push $2
-  Push $3
+  StrCpy $RestoreSaved0 $0
+  StrCpy $RestoreSaved1 $1
+  StrCpy $RestoreSaved2 $2
+  StrCpy $RestoreSaved3 $3
   ; $2 = 再開できなかったサービス、$3 = 再開を試みたサービス（どちらも「・」区切り）。
   StrCpy $2 ""
   StrCpy $3 ""
@@ -452,10 +459,10 @@ Var ServiceRestoreFailed
     StrCpy $ServiceRestoreNote "その前に止めていたサービスのうち $2 は再開できませんでした。サービスの状態を確かめ（sc query BantoHub、sc query BantoHubSink）、管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
     DetailPrint "banto-hub: 止めていたサービスを再開できませんでした（$2）。管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
   ${EndIf}
-  Pop $3
-  Pop $2
-  Pop $1
-  Pop $0
+  StrCpy $3 $RestoreSaved3
+  StrCpy $2 $RestoreSaved2
+  StrCpy $1 $RestoreSaved1
+  StrCpy $0 $RestoreSaved0
 !macroend
 
 ; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
