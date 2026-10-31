@@ -56,6 +56,8 @@
 ;
 ;   (1) `chronogazer-elev.exe service-install`（登録 → `ChronoGazer Operators` →
 ;       サービスの ACL → データと secrets の ACL。README「昇格ヘルパー」の表）。
+;       失敗（非 0）は成功扱いにしない: 止めたサービスは再開せず、問いを出して
+;       `Abort` でインストーラをエラーで終える（#972 のオーナーレビュー P1）。
 ;       冪等 - 登録済みなら登録は変えない。データのルートが使用中（サービスが
 ;       まだ止まっていない・コンソール版が動いている）なら、ACL の付け直しだけを
 ;       飛ばして警告 1 行で 0（#971、Hub と同じ。警告は標準エラー出力だけで
@@ -73,7 +75,7 @@
 ;   → サービスの停止、まで。**登録の解除はここでしない**。Section Uninstall の
 ;   再確認（下記）の後に UnregisterChronoGazerService が `chronogazer-elev.exe
 ;   service-uninstall`（無ければ `chronogazer-server.exe uninstall`、それも無ければ
-;   手動の案内）を行う。非 0 で失敗したら止めたサービスを再開し、メッセージを出して
+;   登録が残っていれば `sc delete ChronoGazer`）を行う。非 0 で失敗したら止めたサービスを再開し、メッセージを出して
 ;   `Abort` する（ファイルを消す前に止まる）。
 ;   `%ProgramData%\ChronoGazer\`（DB・時系列データ・Hub のキー・ログ）は
 ;   **削除しない**（再インストールでデータが戻ることを優先する。Hub と同じ）。
@@ -309,6 +311,12 @@ Var ShellQuitWaitCounter
   ExecWait '"$INSTDIR\chronogazer-elev.exe" service-install' $0
   ${If} $0 != 0
     DetailPrint "chronogazer: ChronoGazer サービスの登録に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\chronogazer-elev.exe$\" service-install （apps/chronogazer/README.md「インストーラ」「昇格ヘルパー chronogazer-elev」参照）"
+    ; 失敗は成功扱いにしない（#972 のオーナーレビュー P1）。止めたサービスは再開せず
+    ; （登録・ACL が整っていない状態で動かさない）、問いを出してから Abort で
+    ; インストーラをエラーで終える（silent では終了コード 2）。ファイルは入ったまま
+    ; なので、手で service-install を通すか、入れ直す。
+    MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの登録に失敗しました（終了コード $0）。$\r$\n$\r$\nファイルは入りましたが、記録エンジンのサービスは使えません。上書きの前に止めたサービスは再開していません。$\r$\n$\r$\n管理者権限の PowerShell から次を実行してください:$\r$\n$\"$INSTDIR\chronogazer-elev.exe$\" service-install" /SD IDOK
+    Abort "ChronoGazer サービスの登録に失敗したため、インストールを失敗として終えました。"
   ${Else}
     DetailPrint "chronogazer: サービス (ChronoGazer) の登録・Operators グループ・サービス ACL・データの ACL を確認しました。起動種別は手動（Demand）です - OS 再起動では開始しません（自動開始は chronogazer-elev.exe autostart-enable か、シェルの設定「運用モード」）。"
   ${EndIf}
@@ -329,7 +337,8 @@ Var ShellQuitWaitCounter
 ; サービスの登録解除（Section Uninstall の再確認の直後に挿入される）。
 ; 失敗したら止めたサービスを戻して `Abort` する（ファイルを消す前に止まるので、
 ; 登録されたサービスが消えた exe を指す状態にならない）。chronogazer-elev.exe も
-; chronogazer-server.exe も無いときは守るものが無いので手動の案内だけで続ける。
+; chronogazer-server.exe も無いときは、登録が残っていれば `sc delete` で解除し、それも
+; 失敗したら同じく止める（登録が無ければそのまま続ける。#972 のオーナーレビュー P2）。
 !macro UnregisterChronoGazerService
   DetailPrint "chronogazer: Windows サービス (ChronoGazer) の登録を解除しています..."
   ${If} ${FileExists} "$INSTDIR\chronogazer-elev.exe"
@@ -338,8 +347,17 @@ Var ShellQuitWaitCounter
     DetailPrint "chronogazer: chronogazer-elev.exe が見つからないため chronogazer-server.exe uninstall にフォールバックします"
     ExecWait '"$INSTDIR\chronogazer-server.exe" uninstall' $0
   ${Else}
-    DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つからないため、サービス登録解除を手動で行ってください（管理者権限の PowerShell から sc delete ChronoGazer）"
-    StrCpy $0 0
+    ; 両方無くても、登録が残っていれば sc delete で解除する。解除できなければ
+    ; 下の失敗の扱いでファイルを消す前に止める（#972 のオーナーレビュー P2）。
+    ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "ImagePath"
+    ${If} $1 == ""
+      DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つかりませんが、サービス ChronoGazer は登録されていません。"
+      StrCpy $0 0
+    ${Else}
+      DetailPrint "chronogazer: chronogazer-elev.exe も chronogazer-server.exe も見つからないため、sc delete ChronoGazer で登録を解除します..."
+      nsExec::ExecToLog 'sc.exe delete ChronoGazer'
+      Pop $0
+    ${EndIf}
   ${EndIf}
   ${If} $0 != 0
     ; 終了コードを $1 に控える（StartServiceIfStopped が $0 を使うため）。
