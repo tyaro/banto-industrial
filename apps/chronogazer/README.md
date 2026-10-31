@@ -251,7 +251,8 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
 シェル `chronogazer.exe`・記録エンジン `chronogazer-server.exe`・昇格ヘルパー `chronogazer-elev.exe` を同じ
 フォルダに入れ、WebView2 が無い PC では取得し、`chronogazer-elev.exe service-install`（登録・Operators・
 サービスの ACL・データの ACL。登録は手動開始）まで行う。作り方は `scripts/build-release-chronogazer.ps1`
-（フロントエンド → 3 つの release ビルド → `apps/chronogazer/installer`（Hub と同じ xtask）→ `dist/chronogazer/<version>/`）。
+（フロントエンド → 3 つの release ビルド → `apps/chronogazer/installer`（Hub と同じ xtask）→ `dist/chronogazer/<version>/`。
+`SHA256SUMS.txt` はその実行で置いたファイルだけを載せ、残っているほかのファイルは警告する）。
 設計は [docs/chronogazer-service-design.md](../../docs/chronogazer-service-design.md) §3.3 と §4 の B3-4 の実装メモ。
 
 - **上書きインストール**: 動いているシェルには `chronogazer.exe --quit-for-update` で正常終了を頼み（確認なしで
@@ -262,6 +263,13 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
   してから入れる」は聞かず、同じ版・新しい版・古い版のどれでも**その場で上書き**する（旧い版のアンインストーラは
   走らせない。走らせるとサービスの登録が解除され、再開と自動開始が失われるため）。インストーラ自身がシェルを
   強制終了する道は無い（tauri-bundler の標準の強制終了は使わない）。
+- **順番と失敗の扱い（#972 のオーナーレビュー）**: インストール先が Program Files の中か・サービスと前回の
+  インストールが同じフォルダか・シェルの終了待ち、の確かめは **WebView2 を入れる前**に済ませる（駄目なら、
+  [キャンセル] なら、何も変えずに止まる）。サービスを止めても 30 秒で止まり切らなければ、ファイルに触らずに
+  止まる。`service-install` の失敗と、止めたサービスの再開の失敗（`sc start` が通らない・30 秒で RUNNING に
+  ならない・直後に止まる）は**インストールの失敗**として終わる（ファイルと登録は入っている。案内のとおり
+  `sc start ChronoGazer` かシェルの「運用モード」で開始する。silent では終了コード 2）。ファイルの上書きで
+  「使用中」になって中止したときは、止めたサービスを戻す。
 - **アンインストール**: 同じ手順でシェルを終え、サービスを止め、ファイルを消す前に登録を解除する（解除に失敗したらサービスを再開してアンインストールを中止し、ファイルは消さない）。**`%ProgramData%\ChronoGazer\`
   （DB・時系列データ・Hub のキー・ログ）は残す**。全部消すときは手で削除する。アンインストーラの「アプリの
   データを削除する」はこのフォルダに触らない（インストーラの識別子を `dev.tyaro.chronogazer-setup` にしてあるので、

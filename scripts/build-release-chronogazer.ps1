@@ -11,6 +11,10 @@
   Hub のスクリプトとの違い: 環境変数 CARGO_TARGET_DIR があればそれを cargo の
   出力先として使う（worktree からビルドするときに main の checkout の target を
   共有できるように）。無ければリポジトリルートの target\release。
+  SHA256SUMS.txt と最後の一覧は、この実行でコピーしたファイルだけから作る
+  （-SkipInstaller で既存の OutDir に重ねると、前回の setup.exe が残ったまま
+  一覧と検査和に載る、を防ぐ。#972 の Codex の指摘）。残っているほかの
+  ファイルは消さずに警告する。
 #>
 [CmdletBinding()]
 param(
@@ -109,6 +113,9 @@ finally {
 # --- (g) $OutDir へリリース名でコピー -------------------------------------
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
+# この実行で $OutDir に置いたファイル名（SHA256SUMS.txt と一覧はこれだけから作る）。
+$produced = [System.Collections.Generic.List[string]]::new()
+
 $copies = [ordered]@{
     'chronogazer.exe'        = "chronogazer-v$Version-windows-x86_64.exe"
     'chronogazer-server.exe' = "chronogazer-server-v$Version-windows-x86_64.exe"
@@ -116,6 +123,7 @@ $copies = [ordered]@{
 }
 foreach ($name in $copies.Keys) {
     Copy-Item -Path (Join-Path $releaseDir $name) -Destination (Join-Path $OutDir $copies[$name]) -Force
+    $produced.Add($copies[$name])
 }
 
 if (-not $SkipInstaller) {
@@ -125,20 +133,29 @@ if (-not $SkipInstaller) {
     if (-not (Test-Path $setupSrc)) {
         throw "インストーラが見つかりません: $setupSrc（apps/chronogazer/installer/src/main.rs の PRODUCT_VERSION がルートの版と合っているか確認）"
     }
-    Copy-Item -Path $setupSrc -Destination (Join-Path $OutDir "ChronoGazer_${Version}_x64-setup.exe") -Force
+    $setupName = "ChronoGazer_${Version}_x64-setup.exe"
+    Copy-Item -Path $setupSrc -Destination (Join-Path $OutDir $setupName) -Force
+    $produced.Add($setupName)
 }
 
 # --- (h) SHA256SUMS.txt（sha256sum 互換の "<hash> *<name>" 形式） --------
+# この実行で置いたファイルだけ。前回の残り（-SkipInstaller のときの setup.exe
+# など）は載せず、下で警告する。
 $sumsPath = Join-Path $OutDir 'SHA256SUMS.txt'
-$lines = Get-ChildItem -Path $OutDir -File |
-    Where-Object { $_.Name -ne 'SHA256SUMS.txt' } |
-    Sort-Object Name |
-    ForEach-Object { '{0} *{1}' -f (Get-FileHash -Algorithm SHA256 -Path $_.FullName).Hash.ToLower(), $_.Name }
+$lines = $produced | Sort-Object |
+    ForEach-Object { '{0} *{1}' -f (Get-FileHash -Algorithm SHA256 -Path (Join-Path $OutDir $_)).Hash.ToLower(), $_ }
 Set-Content -Path $sumsPath -Value $lines -Encoding utf8
 
 # --- (i) 一覧表示と注意喚起 -------------------------------------------------
 Write-Host ''
 Write-Host "生成物（$OutDir）:"
-Get-ChildItem -Path $OutDir -File | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
+$produced | Sort-Object | ForEach-Object { Write-Host "  $_" }
+Write-Host '  SHA256SUMS.txt'
+$stale = Get-ChildItem -Path $OutDir -File |
+    Where-Object { $_.Name -ne 'SHA256SUMS.txt' -and -not $produced.Contains($_.Name) } |
+    Sort-Object Name
+if ($stale) {
+    Write-Warning ("この実行で作っていないファイルが $OutDir に残っています（SHA256SUMS.txt には載せていません。配らないなら消してください）: " + (($stale | ForEach-Object { $_.Name }) -join ', '))
+}
 Write-Host ''
 Write-Host '注意: 生成したインストーラをビルド機で実行しないこと（Windows サービス化・ACL 付与が実環境に及ぶ - 実機確認はオーナー同席で別途行う）。'

@@ -51,21 +51,30 @@
 //!
 //! ## フックの流れ（`hooks/service-hooks.nsh`）
 //!
-//! PREINSTALL: 旧い利用者単位の版の案内（O-3）→ シェルに `--quit-for-update` で
-//! 正常終了を頼み、`chronogazer.exe` のプロセスが無くなるまで最大 90 秒待つ
-//! （超えたら強制終了せずに再試行／中止を聞く、O-5）→ サービス `ChronoGazer` が
-//! 動いていれば止めて記録。POSTINSTALL: `chronogazer-elev.exe service-install` →
-//! 止めたサービスだけ再開。PREUNINSTALL: シェルの終了（同じ待ち）→ サービスの停止
-//! →（再確認の後に）`service-uninstall`（`%ProgramData%\ChronoGazer` は残す）。サービスの停止・
-//! 再開の部品は Hub と共通の `installer-common/service-common.nsh` にあり、この
-//! ツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す
-//! （[`render_hooks`]）。
+//! 事前の確かめ（Section WebView2 の先頭、下の P3）: インストール先が Program Files の
+//! 中か・登録済みのサービスと前回の場所が `$INSTDIR` か → 旧い利用者単位の版の案内
+//! （O-3）→ シェルに `--quit-for-update` で正常終了を頼み、`chronogazer.exe` の
+//! プロセスが無くなるまで最大 90 秒待つ（超えたら強制終了せずに再試行／中止を聞く、
+//! O-5）。PREINSTALL: シェルの再確認 → サービス `ChronoGazer` が動いていれば止めて
+//! 記録 → 止まっていなければ中止。POSTINSTALL: `chronogazer-elev.exe service-install`
+//! → 止めたサービスだけ再開し RUNNING まで待つ（どちらも失敗は `Abort`）。
+//! `.onInstFailed`（下の P4）: 途中で止まったら止めたサービスを戻す。PREUNINSTALL:
+//! シェルの終了（同じ待ち）→ サービスの停止 →（再確認の後に）`service-uninstall`
+//! （`%ProgramData%\ChronoGazer` は残す）。サービスの停止・再開の部品は Hub と共通の
+//! `installer-common/service-common.nsh` にあり、このツールがフックの先頭へその
+//! 絶対パスを `!define` してから tauri-bundler に渡す（[`render_hooks`]）。
 //!
 //! ## NSIS テンプレートの当て直し（`templates/installer.nsi`、[`TEMPLATE_PATCHES`]）
 //!
 //! tauri-bundler 2.9.4 の `installer.nsi` には、このインストーラの方針と合わない
-//! 箇所が 2 つある（PR #972 のオーナーレビュー P1・P2）:
+//! 箇所が 4 つある（PR #972 のオーナーレビュー P1・P2、Codex の指摘 P3、総点検 P4）:
 //!
+//! - **P3 Section の順**: `Section EarlyChecks` → `Section WebView2`（ランタイムが
+//!   無ければ取得して入れる）→ `Section Install`（フック）の順なので、PREINSTALL の
+//!   確かめ（インストール先・登録済みのサービスの場所・シェルの終了待ち）は
+//!   WebView2 の後になり、駄目でも [キャンセル] でも WebView2 だけ入ってしまう。
+//! - **P4 `.onInstFailed`**: テンプレートに無い。`File` の「使用中」で中止すると、
+//!   PREINSTALL で止めたサービスが止まったまま残る。
 //! - **P1 再インストールの頁**（`PageReinstall`／`PageLeaveReinstall`）: 既に
 //!   入っていると「先にアンインストールしてから入れる」が既定の選択で、旧い版の
 //!   アンインストーラが走る。そのアンインストーラはサービスを止めて
@@ -97,6 +106,10 @@
 //! 2. P2: Section Install／Uninstall の `CheckIfAppIsRunning` の挿入を、フックの
 //!    `QuitShellForUpdate`（再試行／中止だけで強制終了しない。プロセスが無ければ
 //!    すぐ返る）の再確認に置き換える。
+//! 3. P3: `Section WebView2` の先頭にフックの `ChronoGazerInstallPreflight`
+//!    （何も変えずに止められる確かめの全部）を挿入する。
+//! 4. P4: `Function .onInstFailed` を足し、フックの `ChronoGazerOnInstFailed`
+//!    （止めたままのサービスを戻す）を呼ぶ。
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -230,6 +243,33 @@ const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
          \x20 ; いれば KillProcess）の代わりに、フックと同じ強制終了しない再確認。\n\
          \x20 !insertmacro QuitShellForUpdate \"アンインストール\" 1 \"止めたサービスは再開します。まだ何も変更していません\"\n\
          \x20 !insertmacro UnregisterChronoGazerService\n",
+    ),
+    (
+        // P3: 事前の確かめを WebView2 の取得より前に置く（#972 の Codex の指摘:
+        // インストール先が駄目でも、シェルの終了待ちで [キャンセル] しても、
+        // WebView2 だけ入ってしまう）。Section は EarlyChecks → WebView2 → Install の
+        // 順に全部走るので、WebView2 の先頭 = Install より前。ここでの `Abort` は
+        // Section WebView2 ごと止める（Install には進まない）。
+        "P3-preflight-before-webview2",
+        "Section WebView2\n",
+        "Section WebView2\n\
+         \x20 ; chronogazer-installer (#972 P3): WebView2 を入れる前に、何も変えずに\n\
+         \x20 ; 止められる確かめ（インストール先・サービスの場所・シェルの終了待ち）。\n\
+         \x20 !insertmacro ChronoGazerInstallPreflight\n",
+    ),
+    (
+        // P4: `.onInstFailed`（Section Install が `Abort` した・`File` の「使用中」で
+        // 中止した後に呼ばれる。silent でも呼ばれる）で、PREINSTALL で止めて
+        // まだ戻していないサービスを戻す。フックの ChronoGazerOnInstFailed を参照。
+        "P4-oninstfailed",
+        "Function .onInstSuccess\n",
+        "Function .onInstFailed\n\
+         \x20 ; chronogazer-installer (#972 P4): 途中で止まったら、上書き前に止めた\n\
+         \x20 ; サービスを戻す（フックの ChronoGazerOnInstFailed）。\n\
+         \x20 !insertmacro ChronoGazerOnInstFailed\n\
+         FunctionEnd\n\
+         \n\
+         Function .onInstSuccess\n",
     ),
 ];
 
@@ -635,6 +675,54 @@ mod tests {
         // 残る（届かないだけ）。
         assert!(out.contains("reinst_uninstall:"));
         assert!(out.contains("reinst_done:"));
+    }
+
+    /// 当て直した結果: P3 - 事前の確かめ（`ChronoGazerInstallPreflight`）が
+    /// `Section WebView2` の最初の命令で、WebView2 の取得（`webview2`）より前・
+    /// `Section Install` より前にある。フックの `!include` はその前。P4 -
+    /// `.onInstFailed` が 1 つだけあり、`ChronoGazerOnInstFailed` を呼ぶ。
+    #[test]
+    fn patch_template_applies_p3_and_p4() {
+        let out = patch_template(VENDORED_TEMPLATE).expect("patch");
+
+        let include = out
+            .find("!include \"{{installer_hooks}}\"")
+            .expect("include");
+        let webview2 = out.find("Section WebView2\n").expect("Section WebView2");
+        let install = out.find("Section Install\n").expect("Section Install");
+        let preflight = out
+            .find("!insertmacro ChronoGazerInstallPreflight")
+            .expect("preflight");
+        assert_eq!(
+            out.matches("!insertmacro ChronoGazerInstallPreflight")
+                .count(),
+            1
+        );
+        assert!(include < webview2 && webview2 < preflight && preflight < install);
+        // WebView2 の取得（ExecWait や download）より前。
+        let webview2_body = &out[webview2..install];
+        let first_exec = webview2_body.find("ExecWait").expect("webview2 ExecWait");
+        assert!(preflight - webview2 < first_exec);
+        // Section WebView2 の最初の命令（コメント以外）がこの挿入。
+        let first = out[webview2 + "Section WebView2\n".len()..]
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with(';'))
+            .expect("instruction");
+        assert_eq!(first, "!insertmacro ChronoGazerInstallPreflight");
+
+        // P4: .onInstFailed が 1 つ、フックのマクロを呼び、.onInstSuccess は残る。
+        assert_eq!(out.matches("Function .onInstFailed\n").count(), 1);
+        let failed = out.find("Function .onInstFailed\n").expect("onInstFailed");
+        let failed_end = out[failed..].find("FunctionEnd").expect("FunctionEnd") + failed;
+        assert!(out[failed..failed_end].contains("!insertmacro ChronoGazerOnInstFailed"));
+        assert_eq!(out.matches("Function .onInstSuccess\n").count(), 1);
+        assert!(
+            failed
+                < out
+                    .find("Function .onInstSuccess\n")
+                    .expect("onInstSuccess")
+        );
     }
 
     /// 土台が 1 回だけでなければ名前を挙げて止まる（0 回・2 回の両方）。

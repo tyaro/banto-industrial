@@ -103,4 +103,62 @@ Var StopWaitCounter
   ${EndIf}
 !macroend
 
+; `StartServiceIfStopped` と同じ条件（`flag_var` が "1"）で `sc start` し、
+; **RUNNING になるまで最大 30 秒待って結果を返す**版（ChronoGazer が使う。
+; #972 のオーナーレビュー: 再開の失敗を成功扱いにしない）。既存の
+; `StartServiceIfStopped`（結果を見ない。Hub が使う）の挙動は変えない。
+;   結果は $0: "0" = RUNNING になった（または `flag_var` が "1" でなく何もしなかった）、
+;   それ以外 = 失敗（`sc start` の終了コード、開始した直後に STOPPED に戻った
+;   "stopped"、30 秒で RUNNING にならない "timeout"）。$1 も壊す。
+;   試みた後は `flag_var` を "0" に戻す（同じインストーラの別の道 - 中止の後の
+;   後始末など - でもう一度起動しない）。失敗しても Abort はしない（判断は
+;   呼ぶ側）。ラベルは `${__COUNTER__}`（別のマクロの中から同じ行で 2 回
+;   挿入されても衝突しない）。
+!macro StartServiceIfStoppedAndWait service_name flag_var
+  !define StartSvcID ${__COUNTER__}
+
+  StrCpy $0 "0"
+  ${If} ${flag_var} == "1"
+    StrCpy ${flag_var} "0"
+    DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: 上書き前に稼働していた ${service_name} サービスを再開します..."
+    nsExec::ExecToStack 'sc start "${service_name}"'
+    Pop $0
+    ${If} $0 != "0"
+      DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: sc start (${service_name}) が失敗しました（終了コード $0）"
+      Goto startsvc_done_${StartSvcID}
+    ${EndIf}
+
+    StrCpy $StopWaitCounter 0
+    startsvc_wait_${StartSvcID}:
+      nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"RUNNING" >nul'
+      Pop $0
+      ${If} $0 == "0"
+        DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: ${service_name} サービスは RUNNING になりました。"
+        Goto startsvc_done_${StartSvcID}
+      ${EndIf}
+      ; sc start が通った直後は START_PENDING のはずなので、STOPPED に戻って
+      ; いれば開始に失敗して終わったと見る（最初の 1 秒は見ない）。
+      ${If} $StopWaitCounter > 0
+        nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"STOPPED" >nul'
+        Pop $1
+        ${If} $1 == "0"
+          StrCpy $0 "stopped"
+          DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: ${service_name} サービスは開始した直後に止まりました（${SERVICE_COMMON_OPS_DOC}）"
+          Goto startsvc_done_${StartSvcID}
+        ${EndIf}
+      ${EndIf}
+      IntOp $StopWaitCounter $StopWaitCounter + 1
+      ${If} $StopWaitCounter >= 30
+        StrCpy $0 "timeout"
+        DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: (${service_name}) の開始待ちが30秒でタイムアウトしました。手動で状態を確認してください（${SERVICE_COMMON_OPS_DOC}）"
+        Goto startsvc_done_${StartSvcID}
+      ${EndIf}
+      Sleep 1000
+      Goto startsvc_wait_${StartSvcID}
+    startsvc_done_${StartSvcID}:
+  ${EndIf}
+
+  !undef StartSvcID
+!macroend
+
 !endif
