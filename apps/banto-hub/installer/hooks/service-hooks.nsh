@@ -66,22 +66,27 @@
 ;       畳んだ形に揃え、`SetOutPath $INSTDIR` をやり直す（テンプレートの
 ;       `SetOutPath` は揃える前の表記で済んでいるため。同じ実体を指す）。
 ;       レジストリ（下の MainBinaryName の先読み）もサービスの停止も、この後。
-;   (1) alpha.2 の Hub 単体インストーラからの上書きに備えた MainBinaryName の
-;       先読み（下の節）。
-;   (2) BantoHubSink が Running なら停止し、$SinkWasRunning に "1" を記録
-;   (3) BantoHub が Running なら停止し、$BantoHubWasRunning に "1" を記録
-;   (3') banto-hub-shell.exe が動いていれば taskkill で終了する
-;   (4) **インストール先の所有者・ACL の既定への戻し**（共通部品 ResetInstallDirAcl、
+;       **注記**: 共通部品の中止の案内にある「まだ何も変更していません」は、Hub では
+;       厳密でない（WebView2 の導入と空のインストール先の作成が、テンプレートの
+;       都合でこの前に済み得る。ファイル・レジストリ・サービスは変えていない）。文言は
+;       ChronoGazer と共通なので変えない。確かめをそれらより前に出すのはテンプレートの
+;       当て直しが要るため PR-3b（#973）。
+;   (1) **インストール先の所有者・ACL の既定への戻し**（共通部品 ResetInstallDirAcl、
 ;       #973 PR-3a）: 管理者が弱い ACL で先に作った `C:\Program Files\BantoHub` が
 ;       残っていると、一般の利用者が LocalSystem のサービスの exe を差し替えられる
 ;       （#972 のオーナーレビュー（2b9ad63））。`icacls /setowner *S-1-5-32-544` と
 ;       `/reset` を、インストール先そのものと直下の普通のファイルだけに /L 付き・
-;       /T なしで掛ける（再解析ポイント・サブフォルダは `Abort`。この
-;       インストーラもサブフォルダを作らない - resources は `$INSTDIR` 直下）。
-;       失敗なら `Abort`。まだファイルは変えていないが、(2)(3) で止めたサービス
-;       はこのフックの `INSTALL_DIR_COMMON_ON_ACL_ABORT` が `sc start` で戻す
-;       （Hub のテンプレートには `.onInstFailed` が無いため。PR-3b で ChronoGazer
-;       と同じ `.onInstFailed` にそろえる候補）。
+;       /T なしで掛ける（再解析ポイント・サブフォルダは `Abort`。このインストーラも
+;       サブフォルダを作らない - resources は `$INSTDIR` 直下）。**サービスとシェルを
+;       止める前、レジストリを触る前に置く**（オーナーのレビュー）: 中止のダイアログを
+;       閉じるまで稼働中のものをそのままにでき、中止で戻すものが無い。使用中の exe でも
+;       所有者・DACL は書き換えられる（WRITE_OWNER・WRITE_DAC は共有モード
+;       FILE_SHARE_* の対象外。実行中イメージの排他は書込み・削除の拒否だけ）。
+;   (2) alpha.2 の Hub 単体インストーラからの上書きに備えた MainBinaryName の
+;       先読み（下の節）。
+;   (3) BantoHubSink が Running なら停止し、$SinkWasRunning に "1" を記録
+;   (4) BantoHub が Running なら停止し、$BantoHubWasRunning に "1" を記録
+;   (5) banto-hub-shell.exe が動いていれば taskkill で終了する
 ; 新規インストール（サービス未登録、`sc query` が失敗する = 1060 相当）は、
 ; RUNNING の文字列がそもそも見つからないため何も起きず静かに素通りする -
 ; 「見つからない」と「止まっている」を区別する必要はない（どちらも「今回は
@@ -175,21 +180,12 @@
 !define INSTALL_DIR_COMMON_PRODUCT "BantoHub"
 !define INSTALL_DIR_COMMON_DEFAULT_DIR "$PROGRAMFILES64\BantoHub"
 !define INSTALL_DIR_COMMON_SERVICE_NOUN "Hub"
-!define INSTALL_DIR_COMMON_ACL_ABORT_NOTE "上書き前に止めた BantoHub・BantoHubSink サービスは戻します。"
+; Hub は ACL の戻しをサービス・シェルを止める前に行うので、中止のときに戻すものが無い。
+!define INSTALL_DIR_COMMON_ACL_ABORT_NOTE ""
 !include "${BANTO_INSTALLER_COMMON_DIR}\install-dir-common.nsh"
 
 Var BantoHubWasRunning
 Var SinkWasRunning
-
-; ResetInstallDirAcl が中止するときに、PREINSTALL の (2)(3) で止めたサービスを戻す
-; （共通部品が `Abort` の直前に挿入する。Hub のテンプレートには `.onInstFailed` が
-; 無いので、ここで戻さないと止めたままになる）。POSTINSTALL の (5) と同じ
-; StartServiceIfStopped（Hub → Sink の順。失敗は DetailPrint だけ、$0 を壊す）。
-; 新規インストールでは両変数とも未設定なので何も起動しない。
-!macro INSTALL_DIR_COMMON_ON_ACL_ABORT
-  !insertmacro StartServiceIfStopped "BantoHub" $BantoHubWasRunning
-  !insertmacro StartServiceIfStopped "BantoHubSink" $SinkWasRunning
-!macroend
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -248,14 +244,17 @@ Var SinkWasRunning
   ; 畳んだ形に揃うので、テンプレートが済ませた SetOutPath をやり直す。
   !insertmacro RequireDefaultInstallDir
   SetOutPath $INSTDIR
-  ; (1)〜(3')
+  ; (1) 所有者・ACL の既定への戻し。サービスもシェルも止める前、レジストリも触る前に
+  ; 置く: 中止（ダイアログの [OK]）まで稼働中のサービスとシェルをそのままにできる。
+  ; 使用中の exe でも所有者・DACL は書き換えられる（WRITE_OWNER・WRITE_DAC は共有
+  ; モードの対象外。実行中イメージの排他は書込み・削除の拒否だけ）。戻した後は一般の
+  ; 利用者が直下に手を出せないので、ここから `File` までの間が空いても穴は開かない。
+  !insertmacro ResetInstallDirAcl
+  ; (2)〜(4)
   !insertmacro FixupHubOnlyInstallerMainBinaryName
   !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
   !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
   !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
-  ; (4) 所有者・ACL の既定への戻し（`File` の直前。テンプレートの CheckIfAppIsRunning
-  ; がこの後に挟まるが、ファイルは変えない）。失敗なら止めたサービスを戻して Abort。
-  !insertmacro ResetInstallDirAcl
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL

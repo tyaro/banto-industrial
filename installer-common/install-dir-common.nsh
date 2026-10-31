@@ -26,11 +26,7 @@
 ;                                     「${…}は、…この場所に置かないと」の形で使う）
 ;   INSTALL_DIR_COMMON_ACL_ABORT_NOTE ACL を戻せずに中止するときの案内の末尾の 1 文
 ;                                     （例: "上書き前に止めた ChronoGazer サービスは
-;                                     戻します。"。止めたサービスをどう戻すかは製品
-;                                     ごとに違うため）
-; 任意: マクロ INSTALL_DIR_COMMON_ON_ACL_ABORT が定義されていれば、ResetInstallDirAcl
-; の中止の道で `Abort` の直前に挿入する（`.onInstFailed` を持たない Hub が、止めた
-; サービスをここで戻すために使う。ChronoGazer は `.onInstFailed` が戻すので定義しない）。
+;                                     戻します。"。止めたものが無い製品は空文字でよい）
 ;
 ; どちらのマクロも $0〜$5 を壊す（呼び出し側はこの後に自分で入れ直す）。
 ; RequireDefaultInstallDir はファイルを変える前（ChronoGazer は事前の確かめの先頭、
@@ -267,7 +263,8 @@ FunctionEnd
 ; そこで、ファイルを置く前（`File` の直前）に、所有者を BUILTIN\Administrators
 ; （S-1-5-32-544）にし、明示の ACE を捨てて Program Files から継承する ACL だけにする。
 ; どれかが駄目なら案内して `Abort`（まだファイルは変えていない。止めたサービスは、
-; ChronoGazer は .onInstFailed が、Hub は INSTALL_DIR_COMMON_ON_ACL_ABORT が戻す）。
+; ChronoGazer は .onInstFailed が戻す。Hub はこの戻しをサービスを止める前に置くので
+; 止めたものが無い）。
 ;
 ; **`icacls /T` は使わない**（#972 のオーナーレビュー（fd7973e）P1）: /T は子を再帰で
 ; 辿り、/L を付けないとリンクそのものではなく**リンク先**を処理する。事前の確かめ
@@ -363,15 +360,12 @@ FunctionEnd
 !macroend
 
 ; ResetInstallDirAcl の中止: $4 の項目について `reason` を案内して `Abort`。
-; まだファイルは変えていない。止めたサービスの戻し方は製品ごと
-; （INSTALL_DIR_COMMON_ACL_ABORT_NOTE・INSTALL_DIR_COMMON_ON_ACL_ABORT）。
+; まだファイルは変えていない。止めたサービスの案内は製品ごと
+; （INSTALL_DIR_COMMON_ACL_ABORT_NOTE。止めたものが無い製品は空でよい）。
 ; 呼ぶ前に FindClose を済ませること。
 !macro AbortInstallDirAcl reason
   DetailPrint "${INSTALL_DIR_COMMON_LOG_PREFIX}: インストール先 $INSTDIR の所有者・ACL を既定に戻せませんでした。${reason}（対象: $4）"
   MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした。$\r$\n${reason}$\r$\n対象: $4$\r$\n$\r$\n既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。ファイルはまだ変更していません。${INSTALL_DIR_COMMON_ACL_ABORT_NOTE}$\r$\n$\r$\n対象のリンクやサブフォルダを取り除く（または先にアンインストールする）か、フォルダを使用しているプログラムを終了するか、管理者権限で $INSTDIR の所有者とアクセス権を確かめてから、もう一度実行してください。" /SD IDOK
-  !ifmacrodef INSTALL_DIR_COMMON_ON_ACL_ABORT
-    !insertmacro INSTALL_DIR_COMMON_ON_ACL_ABORT
-  !endif
   Abort "インストール先の所有者・ACL を既定に戻せなかったため、インストールを中止しました。"
 !macroend
 
