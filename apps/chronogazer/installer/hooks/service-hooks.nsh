@@ -67,8 +67,11 @@
 ; ## PREUNINSTALL
 ;
 ;   シェルの終了（PREINSTALL と同じ待ち。[キャンセル] でアンインストールを中止）
-;   → サービスの停止 → `chronogazer-elev.exe service-uninstall`（無ければ
-;   `chronogazer-server.exe uninstall`、それも無ければ手動の案内）。
+;   → サービスの停止、まで。**登録の解除はここでしない**。Section Uninstall の
+;   再確認（下記）の後に UnregisterChronoGazerService が `chronogazer-elev.exe
+;   service-uninstall`（無ければ `chronogazer-server.exe uninstall`、それも無ければ
+;   手動の案内）を行う。非 0 で失敗したら止めたサービスを再開し、メッセージを出して
+;   `Abort` する（ファイルを消す前に止まる）。
 ;   `%ProgramData%\ChronoGazer\`（DB・時系列データ・Hub のキー・ログ）は
 ;   **削除しない**（再インストールでデータが戻ることを優先する。Hub と同じ）。
 ;
@@ -118,8 +121,10 @@
 ; ている（プロセスが無ければすぐ返る。残っていれば同じ頼んで待つ・再試行／中止）。
 ; つまり Section Install では「フックの待ち → サービスの停止 → 再確認 → ファイルの
 ; 上書き」の順になり、再確認の [キャンセル] は止めたサービスを戻してから `Abort`
-; する（`restart_service_on_cancel` = 1）。Section Uninstall の再確認は、
-; PREUNINSTALL が既にサービスの登録を解除した後なので戻せない（文言で知らせる）。
+; する（`restart_service_on_cancel` = 1）。Section Uninstall も同じ順
+; （PREUNINSTALL = シェルの終了とサービスの停止 → 再確認 → サービスの登録解除 →
+; ファイルの削除）で、再確認の [キャンセル] は止めたサービスを戻して `Abort`
+; する（まだ何も変更していない）。
 ; 残る隙間は「再確認の後・ファイルの上書きの前にシェルが起動される」の一瞬だけで、
 ; そのときは NSIS 自身の「ファイルが使用中」の中止／再試行／無視の窓になる
 ; （強制終了にはならない）。
@@ -279,9 +284,19 @@ Var ShellQuitWaitCounter
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; ここではサービスの登録を解除しない。解除は Section Uninstall の再確認
+  ; （src/main.rs の P2-uninstall-check）の後、ファイルを消す直前の
+  ; UnregisterChronoGazerService で行う（再確認の [キャンセル] で、登録だけ消えて
+  ; ファイルが残る状態を作らないため。#972 のオーナーレビュー）。
   !insertmacro QuitShellForUpdate "アンインストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
+!macroend
 
+; サービスの登録解除（Section Uninstall の再確認の直後に挿入される）。
+; 失敗したら止めたサービスを戻して `Abort` する（ファイルを消す前に止まるので、
+; 登録されたサービスが消えた exe を指す状態にならない）。chronogazer-elev.exe も
+; chronogazer-server.exe も無いときは守るものが無いので手動の案内だけで続ける。
+!macro UnregisterChronoGazerService
   DetailPrint "chronogazer: Windows サービス (ChronoGazer) の登録を解除しています..."
   ${If} ${FileExists} "$INSTDIR\chronogazer-elev.exe"
     ExecWait '"$INSTDIR\chronogazer-elev.exe" service-uninstall' $0
@@ -293,7 +308,12 @@ Var ShellQuitWaitCounter
     StrCpy $0 0
   ${EndIf}
   ${If} $0 != 0
-    DetailPrint "chronogazer: ChronoGazer の登録解除に失敗しました（終了コード $0）。apps/chronogazer/README.md「昇格ヘルパー chronogazer-elev」の手順で手動対応してください"
+    ; 終了コードを $1 に控える（StartServiceIfStopped が $0 を使うため）。
+    StrCpy $1 $0
+    DetailPrint "chronogazer: ChronoGazer の登録解除に失敗しました（終了コード $1）。apps/chronogazer/README.md「昇格ヘルパー chronogazer-elev」の手順で手動対応してください"
+    !insertmacro StartServiceIfStopped "ChronoGazer" $ChronoGazerWasRunning
+    MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの登録解除に失敗しました（終了コード $1）。ファイルは消さずにアンインストールを中止します。止めたサービスは再開しました。apps/chronogazer/README.md「昇格ヘルパー chronogazer-elev」の手順で対処してから、もう一度アンインストールしてください。" /SD IDOK
+    Abort "ChronoGazer サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
 
   ; %ProgramData%\ChronoGazer\（DB・時系列データ・Hub のキー・ログ）は意図的に

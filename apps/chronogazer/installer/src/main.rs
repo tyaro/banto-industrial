@@ -56,7 +56,7 @@
 //! （超えたら強制終了せずに再試行／中止を聞く、O-5）→ サービス `ChronoGazer` が
 //! 動いていれば止めて記録。POSTINSTALL: `chronogazer-elev.exe service-install` →
 //! 止めたサービスだけ再開。PREUNINSTALL: シェルの終了（同じ待ち）→ サービスの停止
-//! → `service-uninstall`（`%ProgramData%\ChronoGazer` は残す）。サービスの停止・
+//! →（再確認の後に）`service-uninstall`（`%ProgramData%\ChronoGazer` は残す）。サービスの停止・
 //! 再開の部品は Hub と共通の `installer-common/service-common.nsh` にあり、この
 //! ツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す
 //! （[`render_hooks`]）。
@@ -68,7 +68,7 @@
 //!
 //! - **P1 再インストールの頁**（`PageReinstall`／`PageLeaveReinstall`）: 既に
 //!   入っていると「先にアンインストールしてから入れる」が既定の選択で、旧い版の
-//!   アンインストーラが走る。その `PREUNINSTALL` はサービスを止めて
+//!   アンインストーラが走る。そのアンインストーラはサービスを止めて
 //!   `service-uninstall` するので、新しい版の `PREINSTALL` にはサービスが「動いて
 //!   いない」と見え、`POSTINSTALL` は再開せず、起動種別（自動開始）も手動に戻る。
 //! - **P2 `CheckIfAppIsRunning`**（`utils.nsh`。Section Install／Uninstall の
@@ -214,8 +214,10 @@ const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
          \x20 !insertmacro QuitShellForUpdate \"インストール\" 1 \"まだファイルは変更していません。上書き前に止めたサービスは再開します\"\n",
     ),
     (
-        // P2（Uninstall）: 同上。ここでは PREUNINSTALL が既にサービスの登録を
-        // 解除しているので、[キャンセル] でもそれは戻らない（文言で知らせる）。
+        // P2（Uninstall）: 同上。PREUNINSTALL はサービスを止めるだけにして、登録の
+        // 解除（UnregisterChronoGazerService）をこの再確認の後に置く。[キャンセル]
+        // は止めたサービスを戻して中止（まだ何も変更していない）。解除に失敗したら
+        // マクロ側で `Abort` し、ファイルは消えない（#972 のオーナーレビュー）。
         "P2-uninstall-check",
         "    !insertmacro NSIS_HOOK_PREUNINSTALL\n\
          \x20 !endif\n\
@@ -226,7 +228,8 @@ const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
          \n\
          \x20 ; chronogazer-installer (#972 P2): tauri-bundler の CheckIfAppIsRunning（残って\n\
          \x20 ; いれば KillProcess）の代わりに、フックと同じ強制終了しない再確認。\n\
-         \x20 !insertmacro QuitShellForUpdate \"アンインストール\" 0 \"サービス ChronoGazer の登録は既に解除しています（ファイルは残ります。もう一度アンインストールするか、インストーラで入れ直してください）\"\n",
+         \x20 !insertmacro QuitShellForUpdate \"アンインストール\" 1 \"止めたサービスは再開します。まだ何も変更していません\"\n\
+         \x20 !insertmacro UnregisterChronoGazerService\n",
     ),
 ];
 
@@ -586,9 +589,19 @@ mod tests {
         let install_body = &out[install..uninstall];
         assert!(install_body.contains("!insertmacro NSIS_HOOK_PREINSTALL"));
         assert!(install_body.contains("!insertmacro QuitShellForUpdate \"インストール\" 1 "));
-        assert!(
-            out[uninstall..].contains("!insertmacro QuitShellForUpdate \"アンインストール\" 0 ")
-        );
+        let uninstall_body = &out[uninstall..];
+        assert!(uninstall_body.contains("!insertmacro QuitShellForUpdate \"アンインストール\" 1 "));
+        // 登録の解除は再確認の後（フックの後でも、ファイルを消す前）。
+        let un_hook = uninstall_body
+            .find("!insertmacro NSIS_HOOK_PREUNINSTALL")
+            .expect("un hook");
+        let un_recheck = uninstall_body
+            .find("!insertmacro QuitShellForUpdate")
+            .expect("un recheck");
+        let un_unreg = uninstall_body
+            .find("!insertmacro UnregisterChronoGazerService")
+            .expect("unregister");
+        assert!(un_hook < un_recheck && un_recheck < un_unreg);
         // 再確認はフックの直後（テンプレートの挿入位置と同じ）。
         let hook = install_body
             .find("!insertmacro NSIS_HOOK_PREINSTALL")
