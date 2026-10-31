@@ -162,6 +162,13 @@
 ;   対策のロック。NSIS の窓の [中止] と、P5 の確かめの `Abort` の両方）のとき
 ;   だけ。silent でも呼ばれる。
 ;
+;   NSIS が呼ぶのは失敗の頁で [キャンセル]／閉じるを押したときだけなので、DetailPrint
+;   は見えない。そこで言うことがあるときだけ情報の MessageBox を 1 回出す: 再開した
+;   とき「止めていた ChronoGazer サービスを再開しました。」、このインストーラが
+;   シェルを終了させたとき（$ChronoGazerShellWasQuit）「デスクトップシェルは終了した
+;   ままです…」。アンインストールは `un.onUninstFailed`（ChronoGazerOnUninstFailed）が
+;   シェルの案内だけを出す（サービスは各中止の道がその場で戻して案内する）。
+;
 ; ## PREUNINSTALL
 ;
 ;   シェルの終了（PREINSTALL と同じ待ち。[キャンセル] でアンインストールを中止）
@@ -299,6 +306,10 @@
 !define CHRONOGAZER_UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChronoGazer"
 
 Var ChronoGazerWasRunning
+; このインストーラ／アンインストーラがシェルに終了を頼み、実際に終了した（QuitShellForUpdate
+; の成功の道）なら "1"。中止の後、シェルは閉じたままなので ChronoGazerOnInstFailed／
+; ChronoGazerOnUninstFailed が起動し直しを案内する（Var はインストーラと共有）。
+Var ChronoGazerShellWasQuit
 Var ShellQuitWaitCounter
 Var ServiceStopWaitCounter
 
@@ -343,6 +354,7 @@ Var ServiceStopWaitCounter
     !insertmacro CheckShellProcess
     ${If} $0 != "0"
       DetailPrint "chronogazer: デスクトップシェルは終了しました。"
+      StrCpy $ChronoGazerShellWasQuit "1"
       Goto shellquit_done_${ShellQuitID}
     ${EndIf}
     IntOp $ShellQuitWaitCounter $ShellQuitWaitCounter + 1
@@ -481,7 +493,11 @@ Var ServiceStopWaitCounter
     ClearErrors
     FileOpen $0 "$INSTDIR\${exe_name}" a
     ${If} ${Errors}
-      StrCpy $1 "$1 ${exe_name}"
+      ${If} $1 == ""
+        StrCpy $1 "${exe_name}"
+      ${Else}
+        StrCpy $1 "$1 ${exe_name}"
+      ${EndIf}
     ${Else}
       FileClose $0
     ${EndIf}
@@ -496,7 +512,7 @@ Var ServiceStopWaitCounter
   !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
   !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
   ${If} $1 != ""
-    ; 名前の並びを $2 に控える（RestartChronoGazerServiceOrWarn が $0・$1 を使うため）。
+    ; 名前の並び（先頭に空白なし、空白区切り）を $2 に控える（RestartChronoGazerServiceOrWarn が $0・$1 を使うため）。
     StrCpy $2 $1
     DetailPrint "chronogazer: 使用中の実行ファイルがあります（$2）。消せないため、アンインストールを中止します（まだ何も変更していません）。"
     !insertmacro RestartChronoGazerServiceOrWarn "アンインストール"
@@ -508,7 +524,11 @@ Var ServiceStopWaitCounter
 ; 消えたことの確かめの 1 つ分（上の PREUNINSTALL の (d)）。残っていれば $2 に名前を足す。
 !macro CheckChronoGazerExeDeleted exe_name
   ${If} ${FileExists} "$INSTDIR\${exe_name}"
-    StrCpy $2 "$2 ${exe_name}"
+    ${If} $2 == ""
+      StrCpy $2 "${exe_name}"
+    ${Else}
+      StrCpy $2 "$2 ${exe_name}"
+    ${EndIf}
   ${EndIf}
 !macroend
 
@@ -636,10 +656,36 @@ Var ServiceStopWaitCounter
 !macroend
 
 ; `.onInstFailed`（上の「.onInstFailed」節。テンプレートの当て直し P4 が挿入する）。
+; NSIS はこれを失敗の頁で [キャンセル]／閉じるを押したときだけ呼ぶので DetailPrint は
+; 見えない。確認は MessageBox で 1 回だけ出す（再開した／シェルを閉じたままにした、の
+; 言うことがあるときだけ）。再開の失敗は RestartChronoGazerServiceOrWarn の
+; MessageBox が出す。$0〜$2 を壊す。
 !macro ChronoGazerOnInstFailed
+  StrCpy $2 ""
   ${If} $ChronoGazerWasRunning == "1"
     DetailPrint "chronogazer: インストールが途中で止まったため、上書き前に止めた ChronoGazer サービスを戻します..."
     !insertmacro RestartChronoGazerServiceOrWarn "インストール"
+    ${If} $0 == "0"
+      StrCpy $2 "止めていた ChronoGazer サービスを再開しました。"
+    ${EndIf}
+  ${EndIf}
+  ${If} $ChronoGazerShellWasQuit == "1"
+    ${If} $2 != ""
+      StrCpy $2 "$2$\r$\n"
+    ${EndIf}
+    StrCpy $2 "$2デスクトップシェルは終了したままです。スタートメニューの ChronoGazer から起動し直してください。"
+  ${EndIf}
+  ${If} $2 != ""
+    MessageBox MB_OK|MB_ICONINFORMATION "$2" /SD IDOK
+  ${EndIf}
+!macroend
+
+; `un.onUninstFailed`（テンプレートの当て直し P4 が挿入する）。アンインストールの
+; 中止の道はサービスをその場で戻して案内済みなので、ここはシェルの案内だけ
+; （シェルを終了させた後で中止したとき）。
+!macro ChronoGazerOnUninstFailed
+  ${If} $ChronoGazerShellWasQuit == "1"
+    MessageBox MB_OK|MB_ICONINFORMATION "デスクトップシェルは終了したままです。スタートメニューの ChronoGazer から起動し直してください。" /SD IDOK
   ${EndIf}
 !macroend
 

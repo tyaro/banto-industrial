@@ -119,8 +119,10 @@
 //!    すぐ返る）の再確認に置き換える。
 //! 3. P3: `Section WebView2` の先頭にフックの `ChronoGazerInstallPreflight`
 //!    （何も変えずに止められる確かめの全部）を挿入する。
-//! 4. P4: `Function .onInstFailed` を足し、フックの `ChronoGazerOnInstFailed`
-//!    （止めたままのサービスを戻す）を呼ぶ。
+//! 4. P4: `Function .onInstFailed` と `Function un.onUninstFailed` を足し、フックの
+//!    `ChronoGazerOnInstFailed`（止めたままのサービスを戻し、戻した／シェルが閉じた
+//!    ままの案内を MessageBox で 1 回出す）と `ChronoGazerOnUninstFailed`（シェルが
+//!    閉じたままの案内だけ）を呼ぶ。
 //! 5. P5: インストーラ属性 `AllowSkipFiles off`（`OutFile` の直後。インストーラ
 //!    全体に効き、`File` の失敗の窓から「無視」が消え、silent では中止になる）、
 //!    `File` の直前に `ResetChronoGazerInstallDirAcl`（インストール先そのものと
@@ -355,6 +357,20 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
          FunctionEnd\n\
          \n\
          Function .onInstSuccess\n",
+    ),
+    (
+        // P4（Uninstall）: `un.onUninstFailed`（Section Uninstall の `Abort` の後、
+        // 失敗の頁で [キャンセル] したときに呼ばれる）。シェルを終了させた後で中止
+        // したときの起動し直しの案内だけを出す（フックの ChronoGazerOnUninstFailed）。
+        "P4-onuninstfailed",
+        "Function un.onInit\n",
+        "Function un.onUninstFailed\n\
+         \x20 ; chronogazer-installer: アンインストールが途中で止まったら、終了させた\n\
+         \x20 ; シェルの起動し直しを案内する（フックの ChronoGazerOnUninstFailed）。\n\
+         \x20 !insertmacro ChronoGazerOnUninstFailed\n\
+         FunctionEnd\n\
+         \n\
+         Function un.onInit\n",
     ),
 ];
 
@@ -781,6 +797,14 @@ mod tests {
         let failed_end = out[failed..].find("FunctionEnd").expect("FunctionEnd") + failed;
         assert!(out[failed..failed_end].contains("!insertmacro ChronoGazerOnInstFailed"));
         assert_eq!(out.matches("Function .onInstSuccess\n").count(), 1);
+        // P4（Uninstall）: un.onUninstFailed が 1 つ、フックのマクロを呼び、un.onInit の前。
+        assert_eq!(out.matches("Function un.onUninstFailed\n").count(), 1);
+        let unfailed = out
+            .find("Function un.onUninstFailed\n")
+            .expect("onUninstFailed");
+        let unfailed_end = out[unfailed..].find("FunctionEnd").expect("FunctionEnd") + unfailed;
+        assert!(out[unfailed..unfailed_end].contains("!insertmacro ChronoGazerOnUninstFailed"));
+        assert!(unfailed < out.find("Function un.onInit\n").expect("un.onInit"));
         assert!(
             failed
                 < out
