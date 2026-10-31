@@ -3,7 +3,8 @@
 作成日: 2026-10-31
 状態: **設計（Issue #682）。実装は未着手。** 実装は本書 §12 の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
-Issue には未記録）。
+Issue には未記録）。§15 判断 1（strict ポリシーを作らない）・判断 2（全件未解決は新状態 `Unbound`）は
+2026-10-31 オーナー決定で本書の立場を採用した。判断 3 は未決。
 main へのマージは S7（2026-11-02〜11-08）の後。本書は
 [banto-tagclient-design.md](banto-tagclient-design.md) の §3.1・§3.2・§4・§5 を**上書きする差分**であり、
 本書に書いていないことは同書が正。実装が入ったら同書の該当節を本書に合わせて直し、本書の
@@ -25,8 +26,10 @@ SDK の購読契約を 2 点拡張する。
    取れるようにする（`Arc` で clone を避ける）。
 
 範囲外（Issue と同じ）: 認証・ユーザー管理、PLC 書き込み（`write_tag` は触らない）、SCADA の
-Tauri Host。要求集合（`Vec<BindingRequest>`）の**動的な追加・削除 API** も範囲外とし、従来どおり
-`restart` で入れ替える（§15 未決 1）。
+Tauri Host。要求集合（`Vec<BindingRequest>`）の**動的な追加・削除 API** も範囲外とする。
+`restart` は `RestClient` だけを差し替え、要求集合は旧 handle のものをそのまま引き継ぐ（`handle.rs`
+L138 `restart`）ので、**要求集合を入れ替える手段は `shutdown()` → `RestClient::start(new_requests)`**
+とする（2026-10-31 設計判断、Codex の指摘による。§15 未決 1）。
 
 ---
 
@@ -75,15 +78,15 @@ Tauri Host。要求集合（`Vec<BindingRequest>`）の**動的な追加・削�
 
 ## 3. 方針（2026-10-31 設計判断）
 
-| #   | 決定                                                                                                                                                                                                                  | 理由                                                                                                                                                                                                                                                                                                 |
-| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D1  | **部分解決を SDK の唯一の振る舞いにする**。「全件解決できなければ失敗」の strict ポリシーは**用意しない**（ポリシー enum を作らない）。                                                                               | リポジトリ内の購読利用者 2 つはどちらも strict を望んでおらず、strict を回避するコードを持っている（§1）。選べる口を作ると、使われない分岐を永久にテストし続けることになる。破壊的変更はしてよい（2026-10-17 オーナー方針）。**オーナー判断待ち（§15 判断 1）**。                                    |
-| D2  | 重複（要求 `binding_key`・要求外部名・catalog 外部名）と、購読プロトコルに載らない綴り（空・空白のみ・カンマ）は**従来どおり全体の失敗**。部分成功として扱わない。                                                    | Issue の受入条件 7。重複は「どちらの要求の値か」が決まらないので、1 件でも曖昧さを残すと値の誤表示になる。綴りは `start()` の通信前検証（`validate_start_requests`）で既に落としており、利用者は純関数で事前に除ける（ChronoGazer の `unsupported`、Sink の同名関数）。                              |
-| D3  | **全件未解決は失敗ではなく、新しい接続状態 `Unbound`**。WS は張るが `subscribe` は送らず、`config_changed` を待って再解決する。                                                                                       | 空の `subscribe` は Hub が拒否する（`stream.rs` の `invalid_request`）。Hub は `config_changed` を**購読の有無に関係なく全 WS 接続へ**送る（`apps/banto-hub/core/src/stream.rs` L595 `revision_rx.changed()`）ので、ポーリングせずに「タグが作られた」を知れる。**オーナー判断待ち（§15 判断 2）**。 |
-| D4  | 同一世代の catalog・解決結果・値を **1 つの `Arc<GenerationSnapshot>`** として `TagClientState` に載せ、`Live` と `Unbound` で公開する。`current()` の返り型は変えない（`Option<&ValuesSnapshot>`）。                 | 利用者の既存コードを壊さず、新しい口（`snapshot()`）を足すだけで metadata が取れる。`watch` は latest-only なので「同じ更新」は 1 つの値に同梱するしかない。                                                                                                                                         |
-| D5  | **世代番号 `generation: u64`** を SDK が振り、snapshot に載せる。catalog の取得に成功した試行ごとに +1。                                                                                                              | `revision` は Hub の構成世代、`run_id` は収集の実行世代で、どちらも「SDK が張り直した」ことを表さない（同じ revision で切断 → 再接続がある）。利用者がタグごとのキャッシュを捨てる鍵が要る。                                                                                                         |
-| D6  | 再解決のトリガは**既存のまま**（`config_changed`・`unknown_tag`・metadata 不一致・切断後の再接続）。部分解決に伴う新しいトリガは足さない。要求集合の変更は `restart` で入れ替える。                                   | 「削除・rename」は Hub が `config_changed` を送るので既存経路で捕まる。「未作成タグが作られた」も同じ。SDK 側の周期ポーリングは無駄撃ち（checklist §5「変わりようのない安定状態で外部を叩かない」）。                                                                                                |
-| D7  | 利用者（ChronoGazer・Sink）は**別 PR で追従**し、自前の catalog 取得・分割・`BindingUnresolved` 見張りを**消す**。SDK の 3 PR の中では、PR-3 の ChronoGazer `connection_state_str` の列挙 1 行以外は触らない（§10）。 | 2 つの利用者は「解決できる名前だけ渡す」ので、SDK が部分解決になっても挙動は変わらない（渡した名前は全部 catalog にある）。追従は SDK 完了後に 1 利用者 1 PR で小さく。**オーナー判断待ち（§15 判断 3）**。                                                                                          |
+| #   | 決定                                                                                                                                                                                                                  | 理由                                                                                                                                                                                                                                                                                                        |
+| --- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D1  | **部分解決を SDK の唯一の振る舞いにする**。「全件解決できなければ失敗」の strict ポリシーは**用意しない**（ポリシー enum を作らない）。                                                                               | リポジトリ内の購読利用者 2 つはどちらも strict を望んでおらず、strict を回避するコードを持っている（§1）。選べる口を作ると、使われない分岐を永久にテストし続けることになる。破壊的変更はしてよい（2026-10-17 オーナー方針）。**2026-10-31 オーナー決定（§15 判断 1）**。                                    |
+| D2  | 重複（要求 `binding_key`・要求外部名・catalog 外部名）と、購読プロトコルに載らない綴り（空・空白のみ・カンマ）は**従来どおり全体の失敗**。部分成功として扱わない。                                                    | Issue の受入条件 7。重複は「どちらの要求の値か」が決まらないので、1 件でも曖昧さを残すと値の誤表示になる。綴りは `start()` の通信前検証（`validate_start_requests`）で既に落としており、利用者は純関数で事前に除ける（ChronoGazer の `unsupported`、Sink の同名関数）。                                     |
+| D3  | **全件未解決は失敗ではなく、新しい接続状態 `Unbound`**。WS は張るが `subscribe` は送らず、`config_changed` を待って再解決する。                                                                                       | 空の `subscribe` は Hub が拒否する（`stream.rs` の `invalid_request`）。Hub は `config_changed` を**購読の有無に関係なく全 WS 接続へ**送る（`apps/banto-hub/core/src/stream.rs` L595 `revision_rx.changed()`）ので、ポーリングせずに「タグが作られた」を知れる。**2026-10-31 オーナー決定（§15 判断 2）**。 |
+| D4  | 同一世代の catalog・解決結果・値を **1 つの `Arc<GenerationSnapshot>`** として `TagClientState` に載せ、`Live` と `Unbound` で公開する。`current()` の返り型は変えない（`Option<&ValuesSnapshot>`）。                 | 利用者の既存コードを壊さず、新しい口（`snapshot()`）を足すだけで metadata が取れる。`watch` は latest-only なので「同じ更新」は 1 つの値に同梱するしかない。                                                                                                                                                |
+| D5  | **世代番号 `generation: u64`** を SDK が振り、snapshot に載せる。catalog の取得に成功した試行ごとに +1。                                                                                                              | `revision` は Hub の構成世代、`run_id` は収集の実行世代で、どちらも「SDK が張り直した」ことを表さない（同じ revision で切断 → 再接続がある）。利用者がタグごとのキャッシュを捨てる鍵が要る。                                                                                                                |
+| D6  | 再解決のトリガは**既存のまま**（`config_changed`・`unknown_tag`・metadata 不一致・切断後の再接続）。部分解決に伴う新しいトリガは足さない。要求集合の変更は `shutdown()` → `start(new_requests)` で入れ替える（§0）。  | 「削除・rename」は Hub が `config_changed` を送るので既存経路で捕まる。「未作成タグが作られた」も同じ。SDK 側の周期ポーリングは無駄撃ち（checklist §5「変わりようのない安定状態で外部を叩かない」）。                                                                                                       |
+| D7  | 利用者（ChronoGazer・Sink）は**別 PR で追従**し、自前の catalog 取得・分割・`BindingUnresolved` 見張りを**消す**。SDK の 3 PR の中では、PR-3 の ChronoGazer `connection_state_str` の列挙 1 行以外は触らない（§10）。 | 2 つの利用者は「解決できる名前だけ渡す」ので、SDK が部分解決になっても挙動は変わらない（渡した名前は全部 catalog にある）。追従は SDK 完了後に 1 利用者 1 PR で小さく。**オーナー判断待ち（§15 判断 3）**。                                                                                                 |
 
 ## 4. 公開 API の具体形
 
@@ -247,6 +250,8 @@ connection = connect_stream() (stop 割り込み可)           // 401/403 → Un
 if resolution.resolved が空:
     publish TagClientState { state: Unbound, snapshot: Some({generation, catalog, resolution, values: None}) }
                                                           // WS が張れた後にだけ publish する（§4.1 doc「WS は張っている」と一致）
+    recheck = fetch_catalog() (stop 割り込み可)             // WS 確立後に catalog を取り直す（下の段落）
+    if recheck.revision != catalog.revision → Err(RevisionMismatch)   // その間にタグが作られた等 → rebindable 経路
     reached_unbound = true                                // RebindTracker だけをリセットする印（§7）
     loop: receive_text() (stop 割り込み可)
         config_changed → Err(RevisionMismatch)            // 既存の rebindable 経路に乗せる
@@ -262,6 +267,15 @@ else:
 `connect_stream()` を `if` の外に出すのは、`Unbound` を「WS は張っているが購読が無い」状態として
 publish するため（§5 の `handshaking --> unbound` / `rebinding --> unbound` は WS connect **成功**で遷移）。
 WS が張れなければ `Unbound` には入らず、現状どおり `Reconnecting` / `Unauthorized` へ進む。
+
+**WS 確立後の catalog の取り直し（2026-10-31 設計判断、Codex の指摘による）**: Hub の WS は接続を
+始めた時点で `revision_rx` を作り（`stream.rs` `handle_socket`）、それより前の変更は再送しない
+（`hub.rs` `subscribe_revision`）。`fetch_catalog()` と WS 確立の間に要求したタグが作られると、
+`Unbound` のまま次の設定変更か切断まで待ち続けてしまう。解決済みの側は初回 data の後の REST
+（`finalize` の revision 一致）でこの窓を閉じているが、`Unbound` 側にはそれが無い。そこで WS
+確立の**後に** catalog を取り直し、revision が最初の catalog と違えば `RevisionMismatch` として
+rebindable 経路に乗せる。revision が同じなら、それ以降の変更は WS の `config_changed` で必ず届く。
+PR-3 のテストに「`fetch_catalog()` と WS 確立の間にタグを作る」を入れる（§13）。
 
 `Unbound` で受けた `config_changed` を `RevisionMismatch` として返すのは、`plan_failure` の
 rebindable 経路（3 回の高速再試行 → backoff）をそのまま使うため。`last_error` には
@@ -466,7 +480,7 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
 ### PR-3: 全件未解決（`Unbound`）と再解決経路
 
 - 範囲: `TagClientConnectionState::Unbound`、§5.1 の `Unbound` 分岐（WS connect 成功の後に publish・
-  subscribe なし・`config_changed` 待ち・stop 割り込み）、`reached_unbound` による `RebindTracker` だけの
+  subscribe なし・WS 確立後の catalog の取り直し・`config_changed` 待ち・stop 割り込み）、`reached_unbound` による `RebindTracker` だけの
   リセット（§7。`was_live` / `RetryTracker` は変えない）、`Display`。PR-2 の暫定 `BindingUnresolved`
   と `error.rs` の暫定の注記を外す。**ChronoGazer `apps/chronogazer/core/src/hub.rs`
   `connection_state_str`（L1477）に `Unbound => "unbound"` を 1 行足す**（§10。足さないと
@@ -476,6 +490,8 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
   - 全件未解決 → `Unbound`、`snapshot().values == None`、`resolution.unresolved` が全件、モック Hub
     が `subscribe` を**受けていない**。
   - `Unbound` 中に `config_changed` → `Rebinding` → タグが作られていれば `Live`。
+  - 最初の `fetch_catalog()` と WS 確立の間にタグを作る（モック Hub が 2 回目の catalog で revision を
+    進める）→ `Unbound` に留まらず `Rebinding` → `Live`（§5.1 の取り直し）。
   - `Unbound` → `config_changed` → `Unbound` を 4 回繰り返しても `Reconnecting` に落ちない（rebind の
     budget が `Unbound` で新しくなる。`live_rebind_success_starts_a_new_rebind_budget` L767 の `Unbound` 版）。
   - `Unbound` 中の切断 → `Reconnecting` → backoff → 再接続で `Unbound` に戻る。**backoff の遅延は
@@ -527,13 +543,13 @@ checklist §5 で先回りするもの: 「自動で再試行します」と書�
 
 ## 15. 未決事項・オーナー判断待ち
 
-| #      | 事項                                                                                                                                                                                                                                          | 本書の仮の立場                                                                                                                                                                                                          |
-| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 判断 1 | **strict ポリシーを用意しない**（D1）。Issue 本文の「既存 strict 利用者への影響がある場合は明示的な解決ポリシー等で互換性を扱う」に対し、リポジトリ内に strict を望む利用者が無いことを根拠に、ポリシー enum を作らず既定を部分解決に変える。 | 作らない。必要が出たら `start_with_policy` を後付けできる形（`start` の引数は増やさない）。                                                                                                                             |
-| 判断 2 | `Unbound` を**新しい接続状態**にするか、`Live` + `values` 空にするか。本書は新状態（`current()` が `Live` でだけ `Some` という既存の不変条件を守るため）。                                                                                    | 新状態 `Unbound`。                                                                                                                                                                                                      |
-| 判断 3 | PR-4 / PR-5（ChronoGazer・Sink の追従）を SDK の 3 PR の直後に続けるか、SCADA Host の着手まで待つか。追従しないと重複実装が残る（2026-10-01 方針）が、動いているものを触る。                                                                  | SDK の 3 PR の直後に 1 利用者 1 PR で続ける。                                                                                                                                                                           |
-| 未決 1 | 要求集合の動的な変更（`rebind(requests)`）。SCADA の Editor で Binding を足すたび `restart` するのは WS を張り直すので、将来は要るかもしれない。                                                                                              | 範囲外。必要が出たら別 Issue。                                                                                                                                                                                          |
-| 未決 2 | `UnresolvedReason` に「権限で見えない」を足すか。Hub が catalog をスコープで絞る作りになったときに要る。                                                                                                                                      | 今は `NotInCatalog` だけ。enum と `#[non_exhaustive]` で席だけ確保。                                                                                                                                                    |
-| 未決 3 | `DuplicateCatalogExternalName` の terminal 扱い（§8 P4）。Hub の不整合が直った後に自動で戻るべきか。                                                                                                                                          | 現状どおり terminal（利用者が `restart`）。Hub 側で外部名の一意性は DB 制約なので実際には起きないはず。                                                                                                                 |
-| 未決 4 | Hub が無購読の WS 接続を時間で閉じるか（§7）。                                                                                                                                                                                                | PR-3 の実機確認で確かめる。閉じても `Reconnecting` → 再接続で戻るので設計は変えない。`RetryTracker` を `Unbound` でリセットしない（§7 の 2026-10-31 設計判断）ので、閉じられ続けても再接続は指数 backoff で暴走しない。 |
-| 未決 5 | `TagClientConnectionState` に `#[non_exhaustive]` を付けるか（利用者の `match` に `_` を強いる）。                                                                                                                                            | 付けなくてよい（破壊的変更可の方針、2026-10-17）。PR-3 で `connection_state_str` の 1 行を足すほうが、状態の取りこぼしを compile で検出できる。付けるなら PR-3 で。                                                     |
+| #      | 事項                                                                                                                                                                                                                                                                                          | 本書の仮の立場                                                                                                                                                                                                          |
+| ------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 判断 1 | **2026-10-31 オーナー決定: 本書の立場で採用。** **strict ポリシーを用意しない**（D1）。Issue 本文の「既存 strict 利用者への影響がある場合は明示的な解決ポリシー等で互換性を扱う」に対し、リポジトリ内に strict を望む利用者が無いことを根拠に、ポリシー enum を作らず既定を部分解決に変える。 | 作らない。必要が出たら `start_with_policy` を後付けできる形（`start` の引数は増やさない）。                                                                                                                             |
+| 判断 2 | **2026-10-31 オーナー決定: 本書の立場で採用。** `Unbound` を**新しい接続状態**にするか、`Live` + `values` 空にするか。本書は新状態（`current()` が `Live` でだけ `Some` という既存の不変条件を守るため）。                                                                                    | 新状態 `Unbound`。                                                                                                                                                                                                      |
+| 判断 3 | PR-4 / PR-5（ChronoGazer・Sink の追従）を SDK の 3 PR の直後に続けるか、SCADA Host の着手まで待つか。追従しないと重複実装が残る（2026-10-01 方針）が、動いているものを触る。                                                                                                                  | SDK の 3 PR の直後に 1 利用者 1 PR で続ける。                                                                                                                                                                           |
+| 未決 1 | 要求集合の動的な変更（`rebind(requests)`）。今は `shutdown()` → `start(new_requests)` で入れ替える（`restart` は要求集合を引き継ぐので使えない、§0）。SCADA の Editor で Binding を足すたびに WS を張り直すので、将来は要るかもしれない。                                                     | 範囲外。必要が出たら別 Issue。                                                                                                                                                                                          |
+| 未決 2 | `UnresolvedReason` に「権限で見えない」を足すか。Hub が catalog をスコープで絞る作りになったときに要る。                                                                                                                                                                                      | 今は `NotInCatalog` だけ。enum と `#[non_exhaustive]` で席だけ確保。                                                                                                                                                    |
+| 未決 3 | `DuplicateCatalogExternalName` の terminal 扱い（§8 P4）。Hub の不整合が直った後に自動で戻るべきか。                                                                                                                                                                                          | 現状どおり terminal（利用者が `restart`）。Hub 側で外部名の一意性は DB 制約なので実際には起きないはず。                                                                                                                 |
+| 未決 4 | Hub が無購読の WS 接続を時間で閉じるか（§7）。                                                                                                                                                                                                                                                | PR-3 の実機確認で確かめる。閉じても `Reconnecting` → 再接続で戻るので設計は変えない。`RetryTracker` を `Unbound` でリセットしない（§7 の 2026-10-31 設計判断）ので、閉じられ続けても再接続は指数 backoff で暴走しない。 |
+| 未決 5 | `TagClientConnectionState` に `#[non_exhaustive]` を付けるか（利用者の `match` に `_` を強いる）。                                                                                                                                                                                            | 付けなくてよい（破壊的変更可の方針、2026-10-17）。PR-3 で `connection_state_str` の 1 行を足すほうが、状態の取りこぼしを compile で検出できる。付けるなら PR-3 で。                                                     |
