@@ -73,7 +73,7 @@ $planned += 'SHA256SUMS.txt'
 # 上書きされるので許す。
 $plannedNames = [System.Collections.Generic.HashSet[string]]::new([string[]]$planned, [System.StringComparer]::OrdinalIgnoreCase)
 if (Test-Path -LiteralPath $OutDir -PathType Container) {
-    $leftover = @(Get-ChildItem -LiteralPath $OutDir -File | Where-Object { -not $plannedNames.Contains($_.Name) } | Sort-Object Name | ForEach-Object { $_.Name })
+    $leftover = @(Get-ChildItem -LiteralPath $OutDir -Force | Where-Object { -not $plannedNames.Contains($_.Name) } | Sort-Object Name | ForEach-Object { $_.Name })
     if ($leftover.Count -gt 0) {
         throw ("$OutDir に、この実行で作らないファイルが残っています: " + ($leftover -join ', ') + "。SHA256SUMS.txt に載らないまま配られるのを避けるため中止します。消すか、別の -OutDir を指定してください。")
     }
