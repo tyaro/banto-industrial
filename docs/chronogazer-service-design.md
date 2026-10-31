@@ -774,6 +774,6 @@
 - `apps/banto-hub/core/src/bin/banto_hub/win_service.rs`、`service_manager.rs`、`service_install.rs`、`service_elevated.rs`、`profile_acl.rs`（#626 で `profile_grant.rs` に置き換え）、`host_switch.rs`、`http_hub_health.rs`
 - `apps/banto-hub/src-tauri/src/lib.rs`（`decide_startup`）
 - `apps/banto-hub/installer/hooks/service-hooks.nsh`
-- `apps/chronogazer/installer/src/main.rs`・`hooks/service-hooks.nsh`（B3-4 PR-C のインストーラ本体）、`installer-common/service-common.nsh`（Hub と共通の停止・再開、PR-A）、`scripts/build-release-chronogazer.ps1`
+- `apps/chronogazer/installer/src/main.rs`・`hooks/service-hooks.nsh`（B3-4 PR-C のインストーラ本体）、`installer-common/service-common.nsh`（Hub と共通の停止・再開、PR-A）、`installer-common/install-dir-common.nsh`（インストール先の固定 `RequireDefaultInstallDir` と所有者・ACL の戻し `ResetInstallDirAcl`。#973 PR-3a（2026-10-31）で PR-C のフックから Hub と共通の部品に移した。文言は定数で渡し、生成物は移す前と同じ）、`scripts/build-release-chronogazer.ps1`
 - `crates/banto-hub-bootstrap/src/state.rs`（`KeyStore`）、`crates/banto-instance-lock/src/lib.rs`、`apps/chronogazer/core/src/instance_lock.rs`
 - `apps/chronogazer/src/lib/banto/environment.ts`（`isTauri()`）
