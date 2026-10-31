@@ -713,7 +713,7 @@ mod tests {
 
     #[test]
     fn all_public_states_and_non_live_transitions_clear_current() {
-        use crate::types::{TagClientConnectionState, TagClientState};
+        use crate::types::{GenerationSnapshot, TagClientConnectionState, TagClientState};
         let states = [
             TagClientConnectionState::Stopped,
             TagClientConnectionState::Connecting,
@@ -725,12 +725,17 @@ mod tests {
         ];
         for state in states {
             let mut public = TagClientState::new(state);
-            public.publish(rest(vec![value("a", 1.0, 1), value("b", 2.0, 1)]));
+            public.publish(GenerationSnapshot::for_values(
+                1,
+                rest(vec![value("a", 1.0, 1), value("b", 2.0, 1)]),
+            ));
             assert!(public.current().is_some());
+            assert!(public.snapshot().is_some());
             assert_eq!(public.connection_state(), TagClientConnectionState::Live);
             public.transition(state);
             if state != TagClientConnectionState::Live {
                 assert_eq!(public.current(), None);
+                assert_eq!(public.snapshot(), None);
             }
         }
     }

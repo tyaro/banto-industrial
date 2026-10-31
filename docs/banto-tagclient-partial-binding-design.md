@@ -1,7 +1,7 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **設計（Issue #682）。実装は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+状態: **設計（Issue #682）。PR-1（同一世代 snapshot）は実装済み・未マージ（設計の PR #982 の上に積んだ PR）。PR-H・PR-2・PR-3 は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
 閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
 Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
@@ -418,6 +418,7 @@ revision を同時に更新し、lock を離してから `revision_tx.send`）�
   REST snapshot は `finalize` で `RuntimeMetadataMismatch` になる（現状どおり）。
 - **R4（Live の完全性）**: `Live` の `values.values` は `resolution.resolved` の外部名と**完全一致**
   （`finalize` の件数一致チェック）。`BindingView::Resolved.value` は `Live` で必ず `Some`。
+  worker が公開の直前に、解決済みのすべての Binding に catalog の行と値の行があることを確かめ、欠けていれば `ProtocolError` で公開しない（2026-10-31、オーナーの Codex CLI の指摘による）。
 - **R5（Unbound の完全性）**: `Unbound` では `resolution.resolved` が空、`resolution.unresolved` が
   要求の全件、`values` が `None`。
 - **R6（`Arc`）**: `TagClientState::clone()` は `Arc` の参照カウントだけを増やす。catalog が数千行

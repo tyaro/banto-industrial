@@ -4,7 +4,16 @@
 //! for task lifetime and explicit shutdown; S3b-1 adds sequential reconnect and
 //! backoff, bounded rebinding, and metadata re-resolution.
 
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
+
 use tokio::sync::{oneshot, watch};
+
+/// Process-wide generation counter (#682 R2): unique across every handle, so a
+/// fresh `start` after `shutdown` never reuses a number an observer has seen.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
 use tokio::time::Duration;
 
 use crate::{
@@ -12,7 +21,7 @@ use crate::{
     error::{Error, ErrorKind, Result},
     rest::RestClient,
     stream_core::{AcceptedWire, PublishGate},
-    types::{TagClientConnectionState, TagClientState},
+    types::{GenerationSnapshot, TagClientConnectionState, TagClientState},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -370,7 +379,11 @@ async fn run_generation_inner(
         _ = &mut *stop => return Err(stopped()),
         result = rest.fetch_catalog() => result?,
     };
-    let resolution = resolve_bindings(requests, &catalog.tags)?;
+    // R2: every attempt that fetched a catalog takes a new generation number,
+    // even if it later fails the publish gate.
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let catalog = Arc::new(catalog);
+    let resolution = Arc::new(resolve_bindings(requests, &catalog.tags)?);
     if !resolution.unresolved.is_empty() {
         return Err(Error::new(ErrorKind::BindingUnresolved));
     }
@@ -428,7 +441,7 @@ async fn run_generation_inner(
         }
     };
     gate.record_rest_snapshot(rest_snapshot)?;
-    publish_snapshot(&gate, &catalog, state_tx, was_live)?;
+    publish_snapshot(&gate, generation, &catalog, &resolution, state_tx, was_live)?;
 
     loop {
         let text = tokio::select! {
@@ -440,22 +453,57 @@ async fn run_generation_inner(
             result = connection.receive_text() => result?,
         };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
-            publish_snapshot(&gate, &catalog, state_tx, was_live)?;
+            publish_snapshot(&gate, generation, &catalog, &resolution, state_tx, was_live)?;
         }
     }
 }
 
 fn publish_snapshot(
     gate: &PublishGate,
-    catalog: &crate::types::CatalogSnapshot,
+    generation: u64,
+    catalog: &Arc<crate::types::CatalogSnapshot>,
+    resolution: &Arc<crate::binding::BindingResolution>,
     state_tx: &watch::Sender<TagClientState>,
     was_live: &mut bool,
 ) -> Result<()> {
-    let snapshot = gate.finalize(catalog)?;
+    let values = gate.finalize(catalog)?;
+    check_live_complete(catalog, resolution, &values)?;
     let mut state = TagClientState::new(TagClientConnectionState::Stopped);
-    state.publish(snapshot);
+    state.publish(GenerationSnapshot {
+        generation,
+        catalog: Arc::clone(catalog),
+        resolution: Arc::clone(resolution),
+        values: Some(Arc::new(values)),
+    });
     state_tx.send_replace(state);
     *was_live = true;
+    Ok(())
+}
+
+/// Before publishing `Live`, require that every resolved binding has a
+/// catalog row and a value row (R4), so `GenerationSnapshot::binding()` never
+/// yields `Resolved { value: None }` while `Live`.
+fn check_live_complete(
+    catalog: &crate::types::CatalogSnapshot,
+    resolution: &crate::binding::BindingResolution,
+    values: &crate::types::ValuesSnapshot,
+) -> Result<()> {
+    let catalog_names: std::collections::HashSet<&str> = catalog
+        .tags
+        .iter()
+        .map(|tag| tag.external_name.as_str())
+        .collect();
+    let value_names: std::collections::HashSet<&str> = values
+        .values
+        .iter()
+        .map(|value| value.tag.as_str())
+        .collect();
+    for binding in &resolution.resolved {
+        let name = binding.external_name.as_str();
+        if !catalog_names.contains(name) || !value_names.contains(name) {
+            return Err(Error::new(ErrorKind::ProtocolError));
+        }
+    }
     Ok(())
 }
 
@@ -533,6 +581,43 @@ mod tests {
             collection_mode: CollectionMode::Configured,
             values,
         }
+    }
+
+    fn resolved(name: &str) -> crate::binding::BindingResolution {
+        crate::binding::BindingResolution {
+            resolved: vec![crate::binding::ResolvedBinding {
+                binding_key: format!("bk-{name}"),
+                external_name: name.into(),
+                tag_key: format!("key:{name}"),
+            }],
+            unresolved: vec![],
+        }
+    }
+
+    #[test]
+    fn check_live_complete_rejects_missing_value_row() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "a")]);
+        let values = values(vec![value("b", 1.0, 10)]);
+        let err = check_live_complete(&catalog, &resolution, &values).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ProtocolError);
+    }
+
+    #[test]
+    fn check_live_complete_rejects_missing_catalog_row() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "b")]);
+        let values = values(vec![value("a", 1.0, 10)]);
+        let err = check_live_complete(&catalog, &resolution, &values).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::ProtocolError);
+    }
+
+    #[test]
+    fn check_live_complete_accepts_complete_generation() {
+        let resolution = resolved("a");
+        let catalog = catalog(vec![tag(StableTagId::new(1, 1, 1), "a")]);
+        let values = values(vec![value("a", 1.0, 10)]);
+        check_live_complete(&catalog, &resolution, &values).unwrap();
     }
 
     fn value(tag: &str, number: f64, timestamp: i64) -> ValueEntry {
@@ -705,6 +790,33 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// #682 R1 / R4 / R6: the published snapshot pairs values with the catalog of
+    /// the same generation, `binding(key)` returns the live value, and cloning
+    /// the state shares the `Arc`s. Returns the generation number.
+    fn assert_same_generation(state: &TagClientState, binding_key: &str, expected: f64) -> u64 {
+        let snapshot = state.snapshot().unwrap();
+        let values = snapshot.values.as_deref().unwrap();
+        assert_eq!(values.revision, snapshot.catalog.revision);
+        assert_eq!(values.run_id, snapshot.catalog.run_id);
+        assert_eq!(values.collection_mode, snapshot.catalog.collection_mode);
+        assert_eq!(snapshot.revision(), values.revision);
+        assert_eq!(state.current(), Some(values));
+        match snapshot.binding(binding_key) {
+            Some(crate::types::BindingView::Resolved {
+                binding,
+                tag,
+                value,
+            }) => {
+                assert_eq!(binding.external_name, tag.external_name);
+                assert_eq!(value.unwrap().v, Some(expected));
+            }
+            other => panic!("expected a resolved live binding, got {other:?}"),
+        }
+        let cloned = state.clone();
+        assert!(Arc::ptr_eq(cloned.snapshot().unwrap(), snapshot));
+        snapshot.generation
     }
 
     fn named_catalog(
@@ -901,7 +1013,10 @@ mod tests {
         let mut latest = None;
         for number in 0..256 {
             let mut state = TagClientState::new(TagClientConnectionState::Stopped);
-            state.publish(values(vec![value("tag", number as f64, number)]));
+            state.publish(GenerationSnapshot::for_values(
+                number as u64,
+                values(vec![value("tag", number as f64, number)]),
+            ));
             sender.send_replace(state);
             latest = Some(number as f64);
         }
@@ -1011,15 +1126,22 @@ mod tests {
         first_live_rx.await.unwrap();
         wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
         assert_eq!(receiver.borrow().current().unwrap().values[0].tag, "alpha");
+        // #682: the first Live carries one consistent generation.
+        let first_generation = assert_same_generation(&receiver.borrow(), "stable", 10.0);
         release_old_tx.send(()).unwrap();
         wait_rebinding(&mut receiver, ErrorKind::RevisionMismatch).await;
         assert_eq!(receiver.borrow().current(), None);
+        // R3: Rebinding drops the old generation together with `current`.
+        assert_eq!(receiver.borrow().snapshot(), None);
         release_rebind_tx.send(()).unwrap();
         second_live_rx.await.unwrap();
         wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
         let current = receiver.borrow().current().unwrap().clone();
         assert_eq!(current.values[0].tag, "alpha");
         assert_eq!(current.values[0].v, Some(20.0));
+        // R2: the rebind took a newer generation (a gate failure may skip numbers).
+        let second_generation = assert_same_generation(&receiver.borrow(), "stable", 20.0);
+        assert!(second_generation > first_generation);
         assert_eq!(catalog_count.load(Ordering::SeqCst), 2);
         second_live_seen_rx.await.unwrap();
         history_stop_tx.send(()).unwrap();
