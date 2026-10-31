@@ -20,7 +20,7 @@ use crate::{
     binding::{resolve_bindings, BindingRequest},
     error::{Error, ErrorKind, Result},
     rest::RestClient,
-    stream_core::{AcceptedWire, PublishGate},
+    stream_core::{parse_unbound_wire, AcceptedWire, PublishGate, UnboundWire},
     types::{GenerationSnapshot, TagClientConnectionState, TagClientState},
 };
 
@@ -97,13 +97,16 @@ impl RebindTracker {
     }
 }
 
+/// `established` is `was_live || reached_unbound`: an attempt that went
+/// `Live` or `Unbound` settled a generation, so the next rebind starts a new
+/// budget (#682 PR-3, docs/banto-tagclient-partial-binding-design.md §7).
 fn next_rebind_mode(
     tracker: &mut RebindTracker,
     mode: AttemptMode,
-    was_live: bool,
+    established: bool,
     reason: ErrorKind,
 ) -> Option<AttemptMode> {
-    if was_live || !matches!(mode, AttemptMode::Rebinding { .. }) {
+    if established || !matches!(mode, AttemptMode::Rebinding { .. }) {
         *tracker = RebindTracker::new();
     }
     tracker
@@ -141,7 +144,14 @@ impl RetryTracker {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AttemptFailure {
     error: Error,
+    /// The attempt published `Live` (received data). Resets both the rebind
+    /// budget and the reconnect backoff.
     was_live: bool,
+    /// The attempt published `Unbound` (#682 PR-3). Resets only the rebind
+    /// budget; the reconnect backoff keeps growing until data arrives, so a
+    /// peer that drops subscription-less sockets cannot cause a fixed-delay
+    /// reconnect loop (design §7).
+    reached_unbound: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,7 +172,12 @@ fn plan_failure(
         if failure.was_live {
             retry_tracker.reset();
         }
-        if let Some(next_mode) = next_rebind_mode(rebind_tracker, mode, failure.was_live, kind) {
+        if let Some(next_mode) = next_rebind_mode(
+            rebind_tracker,
+            mode,
+            failure.was_live || failure.reached_unbound,
+            kind,
+        ) {
             return FailurePlan::Rebind(next_mode);
         }
         *rebind_tracker = RebindTracker::new();
@@ -309,6 +324,7 @@ async fn run_attempt(
         }
     }
     let mut was_live = false;
+    let mut reached_unbound = false;
     run_generation_inner(
         rest,
         requests,
@@ -317,9 +333,14 @@ async fn run_attempt(
         stop,
         mode,
         &mut was_live,
+        &mut reached_unbound,
     )
     .await
-    .map_err(|error| AttemptFailure { error, was_live })
+    .map_err(|error| AttemptFailure {
+        error,
+        was_live,
+        reached_unbound,
+    })
 }
 
 /// Run exactly one connection generation. No task is spawned and no retry is
@@ -362,6 +383,10 @@ pub(crate) async fn run_generation(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one attempt's borrowed context; the two flags report how far it got"
+)]
 async fn run_generation_inner(
     rest: &RestClient,
     requests: &[BindingRequest],
@@ -370,6 +395,7 @@ async fn run_generation_inner(
     stop: &mut oneshot::Receiver<()>,
     mode: AttemptMode,
     was_live: &mut bool,
+    reached_unbound: &mut bool,
 ) -> Result<()> {
     if requests.is_empty() {
         return Err(Error::new(ErrorKind::InvalidTagSelection));
@@ -388,19 +414,18 @@ async fn run_generation_inner(
     // subscribed (WS `subscribe`), fetched (REST `?tags=`), and allowed by the
     // publish gate. Unresolved requests stay in `resolution.unresolved` of the
     // published snapshot without a value.
-    //
-    // Interim until PR-3 (`Unbound`): when nothing resolved there is nothing
-    // to subscribe, so the attempt still fails with `binding_unresolved`
-    // (rebind, then backoff) as before.
-    if resolution.resolved.is_empty() {
-        return Err(Error::new(ErrorKind::BindingUnresolved));
-    }
     let tags = resolution
         .resolved
         .iter()
         .map(|binding| binding.external_name.clone())
         .collect::<Vec<_>>();
-    let mut gate = PublishGate::new(subscription_id, tags.clone())?;
+    // #682 PR-3: with nothing resolved there is nothing to subscribe; the
+    // WebSocket is still opened and the attempt settles as `Unbound`.
+    let gate = if tags.is_empty() {
+        None
+    } else {
+        Some(PublishGate::new(subscription_id, tags.clone())?)
+    };
 
     if matches!(mode, AttemptMode::Connecting) {
         state_tx.send_replace(TagClientState::new(TagClientConnectionState::Handshaking));
@@ -409,6 +434,19 @@ async fn run_generation_inner(
         biased;
         _ = &mut *stop => return Err(stopped()),
         result = rest.connect_stream() => result?,
+    };
+    let Some(mut gate) = gate else {
+        return run_unbound(
+            rest,
+            requests,
+            &mut connection,
+            &catalog,
+            generation,
+            state_tx,
+            stop,
+            reached_unbound,
+        )
+        .await;
     };
     tokio::select! {
         biased;
@@ -462,6 +500,109 @@ async fn run_generation_inner(
         };
         if gate.accept_wire(&text)? == AcceptedWire::Data {
             publish_snapshot(&gate, generation, &catalog, &resolution, state_tx, was_live)?;
+        }
+    }
+}
+
+/// The `Unbound` branch of one attempt (#682 PR-3,
+/// docs/banto-tagclient-partial-binding-design.md §5.1 / §5.2 / §7).
+///
+/// The order is load-bearing:
+/// 1. `ping` (stop-interruptible like `subscribe_on_change`), then wait for
+///    `pong`. The Hub answers `pong` only from the request loop that runs
+///    after it registered its `revision_rx`, so after `pong` every later
+///    configuration change arrives as `config_changed`. A WebSocket connect
+///    alone does not prove that (the Hub's socket handler starts in
+///    `on_upgrade`, possibly later).
+/// 2. Fetch the catalog again. A different `revision` (a change before the
+///    registration) is `revision_mismatch`; a different `run_id` (a Hub
+///    restart whose revision happened to match) is
+///    `runtime_metadata_mismatch`.
+/// 3. Resolve again against the second catalog: if a requested name appears
+///    there although the revision matched (a torn Hub read), treat it as
+///    `revision_mismatch`. Kept even with the Hub fixed, so the SDK alone
+///    keeps `Unbound` correct.
+/// 4. Only then publish `Unbound` with the second catalog, and wait for
+///    `config_changed` (rebind) or a disconnect.
+///
+/// `receive_text()` errors are returned unchanged everywhere, so a close
+/// 1008 still stops as `Unauthorized` with its reason (#446).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one attempt's borrowed context, mirroring run_generation_inner"
+)]
+async fn run_unbound(
+    rest: &RestClient,
+    requests: &[BindingRequest],
+    connection: &mut crate::ws_transport::WebSocketConnection,
+    catalog: &crate::types::CatalogSnapshot,
+    generation: u64,
+    state_tx: &watch::Sender<TagClientState>,
+    stop: &mut oneshot::Receiver<()>,
+    reached_unbound: &mut bool,
+) -> Result<()> {
+    tokio::select! {
+        biased;
+        _ = &mut *stop => {
+            connection.close_best_effort().await;
+            return Err(stopped());
+        }
+        result = connection.send_ping() => result?,
+    }
+    loop {
+        let text = tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                connection.close_best_effort().await;
+                return Err(stopped());
+            }
+            result = connection.receive_text() => result?,
+        };
+        match parse_unbound_wire(&text)? {
+            UnboundWire::Pong => break,
+            UnboundWire::ConfigChanged => return Err(Error::new(ErrorKind::RevisionMismatch)),
+            UnboundWire::Ignored => {}
+        }
+    }
+
+    let recheck = tokio::select! {
+        biased;
+        _ = &mut *stop => {
+            connection.close_best_effort().await;
+            return Err(stopped());
+        }
+        result = rest.fetch_catalog() => result?,
+    };
+    if recheck.revision != catalog.revision {
+        return Err(Error::new(ErrorKind::RevisionMismatch));
+    }
+    if recheck.run_id != catalog.run_id {
+        return Err(Error::new(ErrorKind::RuntimeMetadataMismatch));
+    }
+    let resolution = resolve_bindings(requests, &recheck.tags)?;
+    if !resolution.resolved.is_empty() {
+        return Err(Error::new(ErrorKind::RevisionMismatch));
+    }
+    state_tx.send_replace(TagClientState::unbound(GenerationSnapshot {
+        generation,
+        catalog: Arc::new(recheck),
+        resolution: Arc::new(resolution),
+        values: None,
+    }));
+    *reached_unbound = true;
+
+    loop {
+        let text = tokio::select! {
+            biased;
+            _ = &mut *stop => {
+                connection.close_best_effort().await;
+                return Err(stopped());
+            }
+            result = connection.receive_text() => result?,
+        };
+        match parse_unbound_wire(&text)? {
+            UnboundWire::ConfigChanged => return Err(Error::new(ErrorKind::RevisionMismatch)),
+            UnboundWire::Pong | UnboundWire::Ignored => {}
         }
     }
 }
@@ -729,32 +870,44 @@ mod tests {
         socket
     }
 
+    /// Each of `attempts` attempts finds nothing resolved, so it opens the WS
+    /// and pings; the re-check catalog after `pong` has a new revision, so it
+    /// fails `revision_mismatch` (design §5.1). Reports whether a further
+    /// attempt connected within 40 ms.
     async fn serve_unresolved_attempts_and_check_backoff(
         listener: TcpListener,
         attempts: usize,
         fifth_connection: oneshot::Sender<bool>,
     ) {
-        for _ in 0..attempts {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_http_request(&mut stream).await;
-            write_json(
-                &mut stream,
-                serde_json::to_string(&catalog(Vec::new())).unwrap(),
-            )
-            .await;
+        let log = HubLog::default();
+        let mut sockets = Vec::new();
+        for attempt in 0..attempts as u64 {
+            sockets.push(
+                serve_unbound_handshake(
+                    &listener,
+                    &empty_catalog(attempt * 2 + 1, Some(7)),
+                    &empty_catalog(attempt * 2 + 2, Some(7)),
+                    &log,
+                )
+                .await,
+            );
         }
         let connected = tokio::time::timeout(Duration::from_millis(40), listener.accept())
             .await
             .is_ok();
         let _ = fifth_connection.send(connected);
+        drop(sockets);
     }
 
     async fn serve_rebind_catalog_wait(listener: TcpListener, second_started: oneshot::Sender<()>) {
-        let (mut first, _) = listener.accept().await.unwrap();
-        read_http_request(&mut first).await;
-        write_json(
-            &mut first,
-            serde_json::to_string(&catalog(Vec::new())).unwrap(),
+        // The first attempt's re-check catalog has a new revision, so the
+        // worker rebinds and its next catalog request is held.
+        let log = HubLog::default();
+        let socket = serve_unbound_handshake(
+            &listener,
+            &empty_catalog(1, Some(7)),
+            &empty_catalog(2, Some(7)),
+            &log,
         )
         .await;
         let (mut second, _) = listener.accept().await.unwrap();
@@ -762,6 +915,7 @@ mod tests {
         second_started.send(()).unwrap();
         let mut buffer = [0_u8; 64];
         let _ = tokio::time::timeout(Duration::from_secs(1), second.read(&mut buffer)).await;
+        drop(socket);
     }
 
     async fn wait_rebinding(receiver: &mut watch::Receiver<TagClientState>, reason: ErrorKind) {
@@ -922,6 +1076,7 @@ mod tests {
         let transport_failure = AttemptFailure {
             error: Error::new(ErrorKind::Transport),
             was_live: false,
+            reached_unbound: false,
         };
         assert_eq!(
             plan_failure(
@@ -955,6 +1110,7 @@ mod tests {
         let live_rebind_failure = AttemptFailure {
             error: Error::new(ErrorKind::RevisionMismatch),
             was_live: true,
+            reached_unbound: false,
         };
         mode = match plan_failure(
             &mut retry_tracker,
@@ -973,6 +1129,7 @@ mod tests {
                 AttemptFailure {
                     error: Error::new(ErrorKind::RevisionMismatch),
                     was_live: false,
+                    reached_unbound: false,
                 },
             ) {
                 FailurePlan::Rebind(next_mode) => next_mode,
@@ -987,6 +1144,7 @@ mod tests {
                 AttemptFailure {
                     error: Error::new(ErrorKind::RevisionMismatch),
                     was_live: false,
+                    reached_unbound: false,
                 }
             ),
             FailurePlan::Backoff
@@ -995,6 +1153,55 @@ mod tests {
             retry_tracker.delay_after_failure(backoff, false),
             Duration::from_secs(1)
         );
+    }
+
+    #[test]
+    fn reaching_unbound_resets_only_the_rebind_budget_not_the_backoff() {
+        // design §7: `Unbound` settles a generation, so a later
+        // config_changed starts a fresh rebind budget, but the reconnect
+        // backoff keeps growing until a `Live` generation received data.
+        let backoff = BackoffConfig::new(Duration::from_secs(1), Duration::from_secs(30));
+        let mut retry_tracker = RetryTracker::new();
+        let mut rebind_tracker = RebindTracker::new();
+        let mut mode = AttemptMode::Connecting;
+        let unbound_rebind = AttemptFailure {
+            error: Error::new(ErrorKind::RevisionMismatch),
+            was_live: false,
+            reached_unbound: true,
+        };
+        // Many Unbound -> config_changed -> Unbound rounds never run out.
+        for _ in 0..8 {
+            mode = match plan_failure(
+                &mut retry_tracker,
+                &mut rebind_tracker,
+                mode,
+                unbound_rebind,
+            ) {
+                FailurePlan::Rebind(next_mode) => next_mode,
+                other => panic!("an Unbound rebind must not fall back: {other:?}"),
+            };
+        }
+        let unbound_disconnect = AttemptFailure {
+            error: Error::new(ErrorKind::Transport),
+            was_live: false,
+            reached_unbound: true,
+        };
+        for expected in [1, 2, 4] {
+            assert_eq!(
+                plan_failure(
+                    &mut retry_tracker,
+                    &mut rebind_tracker,
+                    mode,
+                    unbound_disconnect
+                ),
+                FailurePlan::Backoff
+            );
+            assert_eq!(
+                retry_tracker.delay_after_failure(backoff, unbound_disconnect.was_live),
+                Duration::from_secs(expected)
+            );
+            mode = AttemptMode::Connecting;
+        }
     }
 
     #[test]
@@ -1369,214 +1576,6 @@ mod tests {
             ErrorKind::RevisionMismatch,
         )
         .await;
-    }
-
-    #[tokio::test]
-    async fn unresolved_catalog_rebinds_and_recovers_once_the_name_exists() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
-        let catalog_count = Arc::new(AtomicUsize::new(0));
-        let server_count = Arc::clone(&catalog_count);
-        let (rebind_gate_tx, rebind_gate_rx) = oneshot::channel();
-        let (live_tx, live_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            read_http_request(&mut stream).await;
-            server_count.fetch_add(1, Ordering::SeqCst);
-            write_json(
-                &mut stream,
-                serde_json::to_string(&catalog(Vec::new())).unwrap(),
-            )
-            .await;
-            let socket = serve_named_generation(
-                &listener,
-                "resolved-name",
-                named_catalog("resolved-name", 1, Some(7), CollectionMode::Configured),
-                named_values(
-                    "resolved-name",
-                    20.0,
-                    1,
-                    Some(7),
-                    CollectionMode::Configured,
-                ),
-                &server_count,
-                Some(rebind_gate_rx),
-            )
-            .await;
-            live_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            drop(socket);
-        });
-        let (sender, mut receiver) =
-            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let rest_client = client(address);
-        let requests = vec![BindingRequest {
-            binding_key: "stable".into(),
-            external_name: "resolved-name".into(),
-        }];
-        let worker_sender = sender.clone();
-        let task = tokio::spawn(async move {
-            run_supervisor_with_config(
-                &rest_client,
-                &requests,
-                1,
-                &worker_sender,
-                stop_rx,
-                BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
-            )
-            .await
-        });
-        wait_rebinding(&mut receiver, ErrorKind::BindingUnresolved).await;
-        assert_eq!(receiver.borrow().current(), None);
-        rebind_gate_tx.send(()).unwrap();
-        live_rx.await.unwrap();
-        wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
-        assert_eq!(catalog_count.load(Ordering::SeqCst), 2);
-        release_tx.send(()).unwrap();
-        stop_tx.send(()).unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_ok());
-        server.await.unwrap();
-    }
-
-    /// 2026-09-30 owner decision (docs/scada-design.md §9.6): a rename makes
-    /// the old name unresolved (tag-server-design.md §4.1 "rename is a
-    /// breaking change"); the worker never follows the tag to its new name and
-    /// never publishes a value as current. Once a tag with the old name exists
-    /// again (delete-and-recreate, new numeric ID), the next rebind resolves.
-    #[tokio::test]
-    async fn rename_leaves_the_old_name_unresolved_until_the_same_name_is_recreated() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
-        let catalog_count = Arc::new(AtomicUsize::new(0));
-        let server_count = Arc::clone(&catalog_count);
-        let recreated = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let server_recreated = Arc::clone(&recreated);
-        let (first_live_tx, first_live_rx) = oneshot::channel();
-        let (rename_tx, rename_rx) = oneshot::channel();
-        let (live_again_tx, live_again_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        let server = tokio::spawn(async move {
-            let mut old_socket = serve_named_generation(
-                &listener,
-                "old-name",
-                named_catalog("old-name", 1, Some(7), CollectionMode::Configured),
-                named_values("old-name", 10.0, 1, Some(7), CollectionMode::Configured),
-                &server_count,
-                None,
-            )
-            .await;
-            first_live_tx.send(()).unwrap();
-            rename_rx.await.unwrap();
-            old_socket
-                .send(Message::Text(
-                    r#"{"op":"config_changed","revision":2}"#.into(),
-                ))
-                .await
-                .unwrap();
-            // Until the name is recreated, every catalog only has the tag under
-            // its new name, and no WebSocket may be opened for the old one.
-            let new_socket = loop {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let request = read_http_request(&mut stream).await;
-                assert!(request.starts_with("GET /api/v1/tags HTTP/1.1"));
-                server_count.fetch_add(1, Ordering::SeqCst);
-                if server_recreated.load(Ordering::SeqCst) {
-                    write_json(
-                        &mut stream,
-                        serde_json::to_string(&recreated_catalog(
-                            "old-name",
-                            2,
-                            Some(7),
-                            CollectionMode::Configured,
-                        ))
-                        .unwrap(),
-                    )
-                    .await;
-                    break serve_stream_after_catalog(
-                        &listener,
-                        "old-name",
-                        named_values("old-name", 20.0, 2, Some(7), CollectionMode::Configured),
-                    )
-                    .await;
-                }
-                write_json(
-                    &mut stream,
-                    serde_json::to_string(&named_catalog(
-                        "new-name",
-                        2,
-                        Some(7),
-                        CollectionMode::Configured,
-                    ))
-                    .unwrap(),
-                )
-                .await;
-            };
-            live_again_tx.send(()).unwrap();
-            release_rx.await.unwrap();
-            drop(new_socket);
-            drop(old_socket);
-        });
-
-        let (sender, mut receiver) =
-            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let rest_client = client(address);
-        let requests = vec![BindingRequest {
-            binding_key: "stable".into(),
-            external_name: "old-name".into(),
-        }];
-        let worker_sender = sender.clone();
-        let task = tokio::spawn(async move {
-            run_supervisor_with_config(
-                &rest_client,
-                &requests,
-                1,
-                &worker_sender,
-                stop_rx,
-                BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
-            )
-            .await
-        });
-        first_live_rx.await.unwrap();
-        wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
-        assert_eq!(
-            receiver.borrow().current().unwrap().values[0].tag,
-            "old-name"
-        );
-        rename_tx.send(()).unwrap();
-        wait_rebinding(&mut receiver, ErrorKind::BindingUnresolved).await;
-        assert_eq!(receiver.borrow().current(), None);
-        // The bounded rebind budget is spent on the missing name and the
-        // worker settles into normal backoff, still without a current value.
-        wait_state(
-            &mut receiver,
-            TagClientConnectionState::Reconnecting,
-            Some(ErrorKind::BindingUnresolved),
-        )
-        .await;
-        assert_eq!(receiver.borrow().current(), None);
-        assert!(catalog_count.load(Ordering::SeqCst) >= 4);
-
-        recreated.store(true, Ordering::SeqCst);
-        live_again_rx.await.unwrap();
-        wait_state(&mut receiver, TagClientConnectionState::Live, None).await;
-        let current = receiver.borrow().current().unwrap().clone();
-        assert_eq!(current.values[0].tag, "old-name");
-        assert_eq!(current.values[0].v, Some(20.0));
-        release_tx.send(()).unwrap();
-        stop_tx.send(()).unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .unwrap()
-            .unwrap()
-            .is_ok());
-        server.await.unwrap();
     }
 
     fn binding_requests(pairs: &[(&str, &str)]) -> Vec<BindingRequest> {
@@ -2005,6 +2004,7 @@ mod tests {
 
     #[tokio::test]
     async fn four_rebind_failures_enter_normal_backoff_without_fast_fifth_attempt() {
+        // #682 PR-3: four Unbound handshakes whose re-check catalog moved on.
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
         let (fifth_tx, fifth_rx) = oneshot::channel();
@@ -2034,7 +2034,7 @@ mod tests {
         wait_state(
             &mut receiver,
             TagClientConnectionState::Reconnecting,
-            Some(ErrorKind::BindingUnresolved),
+            Some(ErrorKind::RevisionMismatch),
         )
         .await;
         assert_eq!(receiver.borrow().current(), None);
@@ -2410,41 +2410,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unresolved_binding_fails_before_websocket_and_keeps_current_empty() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let address = format!("http://{}", listener.local_addr().unwrap());
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let _ = read_http_request(&mut stream).await;
-            write_json(
-                &mut stream,
-                serde_json::to_string(&catalog(Vec::new())).unwrap(),
-            )
-            .await;
-        });
-        let (sender, receiver) =
-            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
-        let request = BindingRequest {
-            binding_key: "missing".into(),
-            external_name: "missing-name".into(),
-        };
-        let (_stop_tx, stop_rx) = oneshot::channel();
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            run_generation(&client(address), &[request], 1, &sender, stop_rx),
-        )
-        .await
-        .unwrap();
-        assert_eq!(result.unwrap_err().kind(), ErrorKind::BindingUnresolved);
-        assert_eq!(
-            receiver.borrow().connection_state(),
-            TagClientConnectionState::Stopped
-        );
-        assert_eq!(receiver.borrow().current(), None);
-        server.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn config_changed_during_generation_fails_closed_and_clears_current() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let address = format!("http://{}", listener.local_addr().unwrap());
@@ -2732,6 +2697,951 @@ mod tests {
             assert!(task.await.unwrap().is_ok());
             let _ = release_tx.send(());
             server.await.unwrap();
+        }
+    }
+
+    // --- #682 PR-3: Unbound (design §5.1 / §5.2 / §7 / §12 PR-3) -----------
+
+    /// What the mock Hub saw, in the order it saw it.
+    type HubLog = Arc<Mutex<Vec<&'static str>>>;
+
+    fn record(log: &HubLog, entry: &'static str) {
+        log.lock().unwrap().push(entry);
+    }
+
+    fn logged(log: &HubLog) -> Vec<&'static str> {
+        log.lock().unwrap().clone()
+    }
+
+    fn empty_catalog(revision: u64, run_id: Option<u64>) -> CatalogSnapshot {
+        let mut snapshot = catalog(Vec::new());
+        snapshot.revision = revision;
+        snapshot.run_id = run_id;
+        snapshot
+    }
+
+    async fn serve_catalog_once(listener: &TcpListener, snapshot: &CatalogSnapshot, log: &HubLog) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        assert!(
+            request.starts_with("GET /api/v1/tags HTTP/1.1"),
+            "expected a catalog request, got {request}"
+        );
+        record(log, "GET catalog");
+        write_json(&mut stream, serde_json::to_string(snapshot).unwrap()).await;
+    }
+
+    /// A synchronization point inside the second catalog request: the mock
+    /// signals `read` once it has read the request (before answering) and
+    /// answers only after `go` fired. Anything the worker publishes before the
+    /// answer therefore happens before the test's look.
+    struct SecondCatalogGate {
+        read: oneshot::Sender<()>,
+        go: oneshot::Receiver<()>,
+    }
+
+    /// Serve the second catalog request, gated by `gate`.
+    async fn serve_catalog_gated(
+        listener: &TcpListener,
+        snapshot: &CatalogSnapshot,
+        log: &HubLog,
+        gate: SecondCatalogGate,
+    ) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        assert!(
+            request.starts_with("GET /api/v1/tags HTTP/1.1"),
+            "expected a catalog request, got {request}"
+        );
+        record(log, "GET catalog");
+        gate.read.send(()).unwrap();
+        gate.go.await.unwrap();
+        write_json(&mut stream, serde_json::to_string(snapshot).unwrap()).await;
+    }
+
+    /// `serve_unbound_handshake`, but the second catalog is gated.
+    async fn serve_unbound_handshake_gated(
+        listener: &TcpListener,
+        first: &CatalogSnapshot,
+        second: &CatalogSnapshot,
+        log: &HubLog,
+        gate: SecondCatalogGate,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
+        serve_catalog_once(listener, first, log).await;
+        let mut socket = accept_ws(listener, log).await;
+        expect_ping(&mut socket, log).await;
+        send_pong(&mut socket, log).await;
+        serve_catalog_gated(listener, second, log, gate).await;
+        socket
+    }
+
+    /// Wait until the mock read the gated second catalog request, assert that
+    /// the worker has published neither `Unbound` nor any snapshot, then let
+    /// the mock answer.
+    async fn assert_nothing_unbound_before_second_catalog(
+        receiver: &watch::Receiver<TagClientState>,
+        read_rx: oneshot::Receiver<()>,
+        go_tx: oneshot::Sender<()>,
+    ) {
+        tokio::time::timeout(Duration::from_secs(3), read_rx)
+            .await
+            .expect("second catalog within 3s")
+            .unwrap();
+        {
+            let state = receiver.borrow();
+            assert_ne!(state.connection_state(), TagClientConnectionState::Unbound);
+            assert!(state.snapshot().is_none());
+        }
+        go_tx.send(()).unwrap();
+    }
+
+    async fn accept_ws(
+        listener: &TcpListener,
+        log: &HubLog,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        let socket = accept_async(stream).await.unwrap();
+        record(log, "WS");
+        socket
+    }
+
+    /// The next application text frame from the client, or `None` once it
+    /// closed the socket.
+    async fn next_client_text(
+        socket: &mut WebSocketStream<tokio::net::TcpStream>,
+    ) -> Option<String> {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match socket.next().await {
+                    Some(Ok(Message::Text(text))) => return Some(text.to_string()),
+                    Some(Ok(Message::Ping(_) | Message::Pong(_))) => continue,
+                    _ => return None,
+                }
+            }
+        })
+        .await
+        .expect("client frame within 2s")
+    }
+
+    async fn expect_ping(socket: &mut WebSocketStream<tokio::net::TcpStream>, log: &HubLog) {
+        let text = next_client_text(socket).await;
+        assert_eq!(text.as_deref(), Some(r#"{"op":"ping"}"#));
+        record(log, "ping");
+    }
+
+    async fn send_pong(socket: &mut WebSocketStream<tokio::net::TcpStream>, log: &HubLog) {
+        record(log, "pong");
+        socket
+            .send(Message::Text(r#"{"op":"pong"}"#.into()))
+            .await
+            .unwrap();
+    }
+
+    async fn send_config_changed(
+        socket: &mut WebSocketStream<tokio::net::TcpStream>,
+        revision: u64,
+    ) {
+        socket
+            .send(Message::Text(
+                format!(r#"{{"op":"config_changed","revision":{revision}}}"#).into(),
+            ))
+            .await
+            .unwrap();
+    }
+
+    /// One `Unbound` handshake as the Hub sees it: catalog, WS, `ping`,
+    /// `pong`, catalog again. Returns the open socket.
+    async fn serve_unbound_handshake(
+        listener: &TcpListener,
+        first: &CatalogSnapshot,
+        second: &CatalogSnapshot,
+        log: &HubLog,
+    ) -> WebSocketStream<tokio::net::TcpStream> {
+        serve_catalog_once(listener, first, log).await;
+        let mut socket = accept_ws(listener, log).await;
+        expect_ping(&mut socket, log).await;
+        send_pong(&mut socket, log).await;
+        serve_catalog_once(listener, second, log).await;
+        socket
+    }
+
+    /// Every text frame the client sent until it closed the socket.
+    async fn texts_until_close(socket: &mut WebSocketStream<tokio::net::TcpStream>) -> Vec<String> {
+        let mut texts = Vec::new();
+        while let Some(text) = next_client_text(socket).await {
+            texts.push(text);
+        }
+        texts
+    }
+
+    /// Wait for an `Unbound` state of a generation newer than `after`.
+    async fn wait_unbound_after(
+        receiver: &mut watch::Receiver<TagClientState>,
+        after: u64,
+    ) -> TagClientState {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let state = receiver.borrow().clone();
+                if state.connection_state() == TagClientConnectionState::Unbound
+                    && state.snapshot().is_some_and(|s| s.generation > after)
+                {
+                    return state;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Unbound within 3s")
+    }
+
+    /// Record every connection state the watch shows until `stop` fires.
+    fn record_states(
+        mut receiver: watch::Receiver<TagClientState>,
+    ) -> (
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Vec<TagClientConnectionState>>,
+    ) {
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut states = vec![receiver.borrow_and_update().connection_state()];
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => return states,
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            return states;
+                        }
+                        states.push(receiver.borrow_and_update().connection_state());
+                    }
+                }
+            }
+        });
+        (stop_tx, task)
+    }
+
+    fn spawn_worker_with_backoff(
+        address: String,
+        requests: Vec<BindingRequest>,
+        backoff: BackoffConfig,
+    ) -> (
+        watch::Receiver<TagClientState>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (sender, receiver) =
+            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let rest_client = client(address);
+        let task = tokio::spawn(async move {
+            run_supervisor_with_config(&rest_client, &requests, 1, &sender, stop_rx, backoff).await
+        });
+        (receiver, stop_tx, task)
+    }
+
+    fn assert_unbound_shape(state: &TagClientState, unresolved: &[UnresolvedBinding]) {
+        assert_eq!(state.connection_state(), TagClientConnectionState::Unbound);
+        assert_eq!(state.last_error(), None);
+        assert_eq!(state.current(), None);
+        let snapshot = state.snapshot().expect("Unbound carries its snapshot");
+        assert_eq!(snapshot.values, None);
+        assert!(snapshot.resolution.resolved.is_empty());
+        assert_eq!(snapshot.resolution.unresolved, unresolved);
+        for binding in unresolved {
+            assert!(matches!(
+                snapshot.binding(&binding.binding_key),
+                Some(crate::types::BindingView::Unresolved(_))
+            ));
+        }
+    }
+
+    /// Acceptance 4: nothing resolved → `Unbound` without a subscription. The
+    /// Hub sees catalog → WS → `ping` → (nothing until `pong`) → catalog, and
+    /// the published catalog is the second one.
+    #[tokio::test]
+    async fn all_unresolved_goes_unbound_after_ping_pong_and_a_second_catalog_without_subscribing()
+    {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let log = HubLog::default();
+        let server_log = Arc::clone(&log);
+        let server = tokio::spawn(async move {
+            serve_catalog_once(&listener, &empty_catalog(4, Some(7)), &server_log).await;
+            let mut socket = accept_ws(&listener, &server_log).await;
+            expect_ping(&mut socket, &server_log).await;
+            // The client must wait for `pong` before fetching the catalog
+            // again. (A negative check: it cannot fail a correct client.)
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "the client fetched the catalog again before pong"
+            );
+            send_pong(&mut socket, &server_log).await;
+            // The second catalog differs only in an unrelated tag.
+            let mut second = empty_catalog(4, Some(7));
+            second
+                .tags
+                .push(tag(StableTagId::new(1, 1, 5), "unrelated"));
+            serve_catalog_once(&listener, &second, &server_log).await;
+            texts_until_close(&mut socket).await
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha"), ("b", "beta")]));
+        let state = wait_unbound_after(&mut receiver, 0).await;
+        assert_unbound_shape(
+            &state,
+            &[not_in_catalog("a", "alpha"), not_in_catalog("b", "beta")],
+        );
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(snapshot.revision(), 4);
+        assert_eq!(snapshot.catalog.tags.len(), 1);
+        assert_eq!(snapshot.catalog.tags[0].external_name, "unrelated");
+        stop_partial_worker(stop_tx, task).await;
+        let after_ping = server.await.unwrap();
+        assert!(
+            after_ping.is_empty(),
+            "an Unbound connection sent {after_ping:?}"
+        );
+        assert_eq!(
+            logged(&log),
+            ["GET catalog", "WS", "ping", "pong", "GET catalog"]
+        );
+    }
+
+    /// PR-2's `unresolved_catalog_rebinds_and_recovers_once_the_name_exists`,
+    /// rewritten for `Unbound` (acceptance 2 from `Unbound`): `config_changed`
+    /// while `Unbound` → `Rebinding` → the created name goes `Live`.
+    #[tokio::test]
+    async fn unresolved_catalog_goes_unbound_and_goes_live_once_the_name_exists() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (unbound_seen_tx, unbound_seen_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let mut unbound_socket = serve_unbound_handshake(
+                &listener,
+                &empty_catalog(1, Some(7)),
+                &empty_catalog(1, Some(7)),
+                &log,
+            )
+            .await;
+            unbound_seen_rx.await.unwrap();
+            // The tag is created: revision 2.
+            send_config_changed(&mut unbound_socket, 2).await;
+            let (socket, received) = serve_multi_generation(
+                &listener,
+                multi_catalog(&["resolved-name"], 2),
+                &[("resolved-name", 20.0)],
+            )
+            .await;
+            release_rx.await.unwrap();
+            drop(socket);
+            drop(unbound_socket);
+            received
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("stable", "resolved-name")]));
+        let unbound = wait_unbound_after(&mut receiver, 0).await;
+        assert_unbound_shape(&unbound, &[not_in_catalog("stable", "resolved-name")]);
+        let unbound_generation = unbound.snapshot().unwrap().generation;
+        unbound_seen_tx.send(()).unwrap();
+        let live = wait_live_after(&mut receiver, unbound_generation).await;
+        assert_eq!(
+            assert_same_generation(&live, "stable", 20.0),
+            live.snapshot().unwrap().generation
+        );
+        assert_eq!(resolved_names(&live), ["resolved-name"]);
+        assert!(live.snapshot().unwrap().resolution.unresolved.is_empty());
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        let received = server.await.unwrap();
+        assert_eq!(received.subscribed, ["resolved-name"]);
+    }
+
+    /// PR-2's `rename_leaves_the_old_name_unresolved_until_the_same_name_is_recreated`,
+    /// rewritten for `Unbound`: after a rename the only binding is
+    /// unresolved, so the worker settles in `Unbound` (no backoff, no current
+    /// value) and goes `Live` again once the old name is recreated.
+    #[tokio::test]
+    async fn rename_leaves_the_old_name_unbound_until_the_same_name_is_recreated() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (rename_tx, rename_rx) = oneshot::channel::<()>();
+        let (recreate_tx, recreate_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let count = AtomicUsize::new(0);
+            let mut old_socket = serve_named_generation(
+                &listener,
+                "old-name",
+                named_catalog("old-name", 1, Some(7), CollectionMode::Configured),
+                named_values("old-name", 10.0, 1, Some(7), CollectionMode::Configured),
+                &count,
+                None,
+            )
+            .await;
+            rename_rx.await.unwrap();
+            send_config_changed(&mut old_socket, 2).await;
+            let renamed = named_catalog("new-name", 2, Some(7), CollectionMode::Configured);
+            let log = HubLog::default();
+            let mut unbound_socket =
+                serve_unbound_handshake(&listener, &renamed, &renamed, &log).await;
+            recreate_rx.await.unwrap();
+            send_config_changed(&mut unbound_socket, 3).await;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request = read_http_request(&mut stream).await;
+            assert!(request.starts_with("GET /api/v1/tags HTTP/1.1"));
+            write_json(
+                &mut stream,
+                serde_json::to_string(&recreated_catalog(
+                    "old-name",
+                    3,
+                    Some(7),
+                    CollectionMode::Configured,
+                ))
+                .unwrap(),
+            )
+            .await;
+            let new_socket = serve_stream_after_catalog(
+                &listener,
+                "old-name",
+                named_values("old-name", 20.0, 3, Some(7), CollectionMode::Configured),
+            )
+            .await;
+            release_rx.await.unwrap();
+            drop(new_socket);
+            drop(unbound_socket);
+            drop(old_socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("stable", "old-name")]));
+        let (history_stop, history) = record_states(receiver.clone());
+        let first = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(value_names(&first), ["old-name"]);
+        rename_tx.send(()).unwrap();
+        let unbound = wait_unbound_after(&mut receiver, first.snapshot().unwrap().generation).await;
+        assert_unbound_shape(&unbound, &[not_in_catalog("stable", "old-name")]);
+        assert_eq!(
+            unbound.snapshot().unwrap().catalog.tags[0].external_name,
+            "new-name"
+        );
+        recreate_tx.send(()).unwrap();
+        let again = wait_live_after(&mut receiver, unbound.snapshot().unwrap().generation).await;
+        let current = again.current().unwrap();
+        assert_eq!(current.values[0].tag, "old-name");
+        assert_eq!(current.values[0].v, Some(20.0));
+        assert_eq!(
+            again.snapshot().unwrap().catalog.tags[0].ids,
+            StableTagId::new(1, 1, 9)
+        );
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Reconnecting),
+            "{states:?}"
+        );
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// Design §5.1 / §5.2 scenes 1-2: the Hub's socket handler registers its
+    /// `revision_rx` late (it starts in `on_upgrade`), and a tag is created
+    /// before that, so no `config_changed` is ever sent. The mock holds
+    /// `pong` until the test created the tag; the second catalog then has a
+    /// new revision and the worker rebinds to `Live` without ever publishing
+    /// `Unbound`.
+    #[tokio::test]
+    async fn a_change_before_the_hub_registers_its_watch_never_publishes_unbound() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (ping_seen_tx, ping_seen_rx) = oneshot::channel::<()>();
+        let (created_tx, created_rx) = oneshot::channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (read_tx, read_rx) = oneshot::channel::<()>();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let gate = SecondCatalogGate {
+            read: read_tx,
+            go: go_rx,
+        };
+        let log = HubLog::default();
+        let server_log = Arc::clone(&log);
+        let server = tokio::spawn(async move {
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &server_log).await;
+            let mut socket = accept_ws(&listener, &server_log).await;
+            expect_ping(&mut socket, &server_log).await;
+            ping_seen_tx.send(()).unwrap();
+            // The tag is created before the Hub registered its watch, so no
+            // config_changed is sent for it.
+            created_rx.await.unwrap();
+            send_pong(&mut socket, &server_log).await;
+            let created = multi_catalog(&["alpha"], 2);
+            serve_catalog_gated(&listener, &created, &server_log, gate).await;
+            let (live_socket, _) =
+                serve_multi_generation(&listener, created, &[("alpha", 20.0)]).await;
+            release_rx.await.unwrap();
+            drop(live_socket);
+            drop(socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        let (history_stop, history) = record_states(receiver.clone());
+        ping_seen_rx.await.unwrap();
+        created_tx.send(()).unwrap();
+        assert_nothing_unbound_before_second_catalog(&receiver, read_rx, go_tx).await;
+        let live = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(resolved_names(&live), ["alpha"]);
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Unbound),
+            "{states:?}"
+        );
+        assert!(states.contains(&TagClientConnectionState::Rebinding));
+        assert_eq!(
+            logged(&log),
+            ["GET catalog", "WS", "ping", "pong", "GET catalog"]
+        );
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// Design §5.2 scene 3: a `config_changed` that arrives while waiting for
+    /// `pong` rebinds directly, without publishing `Unbound`.
+    #[tokio::test]
+    async fn config_changed_while_waiting_for_pong_rebinds_without_unbound() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &log).await;
+            let mut socket = accept_ws(&listener, &log).await;
+            expect_ping(&mut socket, &log).await;
+            send_config_changed(&mut socket, 2).await;
+            let (live_socket, _) =
+                serve_multi_generation(&listener, multi_catalog(&["alpha"], 2), &[("alpha", 20.0)])
+                    .await;
+            release_rx.await.unwrap();
+            drop(live_socket);
+            drop(socket);
+            logged(&log)
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        let (history_stop, history) = record_states(receiver.clone());
+        wait_live_after(&mut receiver, 0).await;
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Unbound),
+            "{states:?}"
+        );
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        // No second catalog of the first attempt: the next request after the
+        // ping was already the rebind's catalog (served by
+        // serve_multi_generation, not logged).
+        assert_eq!(server.await.unwrap(), ["GET catalog", "WS", "ping"]);
+    }
+
+    /// Design §5.2 scene 14 (torn Hub read): the first catalog is (old tags,
+    /// new revision) and the second (new tags, same revision). The revisions
+    /// match, but resolving the second catalog finds the name, so the worker
+    /// rebinds to `Live` without ever publishing `Unbound`.
+    #[tokio::test]
+    async fn a_torn_catalog_read_never_publishes_unbound() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let (read_tx, read_rx) = oneshot::channel::<()>();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let gate = SecondCatalogGate {
+            read: read_tx,
+            go: go_rx,
+        };
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let torn = empty_catalog(2, Some(7));
+            let created = multi_catalog(&["alpha"], 2);
+            let socket =
+                serve_unbound_handshake_gated(&listener, &torn, &created, &log, gate).await;
+            let (live_socket, _) =
+                serve_multi_generation(&listener, created, &[("alpha", 20.0)]).await;
+            release_rx.await.unwrap();
+            drop(live_socket);
+            drop(socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        let (history_stop, history) = record_states(receiver.clone());
+        assert_nothing_unbound_before_second_catalog(&receiver, read_rx, go_tx).await;
+        let live = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(resolved_names(&live), ["alpha"]);
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Unbound),
+            "{states:?}"
+        );
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// Design §5.2 scene 13: the Hub restarted between the first catalog and
+    /// `pong` and its revision happens to match. The different `run_id` is a
+    /// `runtime_metadata_mismatch` rebind, not `Unbound`.
+    #[tokio::test]
+    async fn a_run_id_change_before_pong_rebinds_as_metadata_mismatch() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (rebind_seen_tx, rebind_seen_rx) = oneshot::channel::<()>();
+        let (read_tx, read_rx) = oneshot::channel::<()>();
+        let (go_tx, go_rx) = oneshot::channel::<()>();
+        let gate = SecondCatalogGate {
+            read: read_tx,
+            go: go_rx,
+        };
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let socket = serve_unbound_handshake_gated(
+                &listener,
+                &empty_catalog(1, Some(7)),
+                &empty_catalog(1, Some(8)),
+                &log,
+                gate,
+            )
+            .await;
+            // Hold the rebind's catalog request until the test looked.
+            let (mut stream, _) = listener.accept().await.unwrap();
+            read_http_request(&mut stream).await;
+            let _ = rebind_seen_rx.await;
+            drop(stream);
+            drop(socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        let (history_stop, history) = record_states(receiver.clone());
+        assert_nothing_unbound_before_second_catalog(&receiver, read_rx, go_tx).await;
+        wait_rebinding(&mut receiver, ErrorKind::RuntimeMetadataMismatch).await;
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Unbound),
+            "{states:?}"
+        );
+        stop_partial_worker(stop_tx, task).await;
+        rebind_seen_tx.send(()).unwrap();
+        server.await.unwrap();
+    }
+
+    /// Design §5.2 scene 12 (`stop` while waiting for `pong`): `shutdown`
+    /// while the Hub does not read the `ping` (nor ever answers it) stops at
+    /// once, without another attempt. Scene 11 (the `ping` send itself is
+    /// stuck) cannot be reproduced because the 13 bytes fit into the TCP send
+    /// buffer; it is covered by the shape of the code instead: `send_ping` is
+    /// wrapped in a `biased` `select!` together with `stop`.
+    #[tokio::test]
+    async fn stop_while_the_hub_does_not_read_the_ping_stops_without_waiting() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (ws_open_tx, ws_open_rx) = oneshot::channel::<()>();
+        let (done_tx, done_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &log).await;
+            let socket = accept_ws(&listener, &log).await;
+            ws_open_tx.send(()).unwrap();
+            // Never read from the socket.
+            done_rx.await.unwrap();
+            let extra = tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_ok();
+            drop(socket);
+            extra
+        });
+        let (receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        ws_open_rx.await.unwrap();
+        stop_tx.send(()).unwrap();
+        // close_best_effort is bounded; the worker must not wait for pong.
+        assert!(tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(receiver.borrow().last_error(), None);
+        done_tx.send(()).unwrap();
+        assert!(!server.await.unwrap(), "the worker started another attempt");
+    }
+
+    /// Design §14 / §5.2 scene 9: a close 1008 while waiting for `pong` keeps
+    /// its reason (`receive_text()` errors are not converted).
+    #[tokio::test]
+    async fn a_1008_close_while_waiting_for_pong_stops_with_its_reason() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &log).await;
+            let mut socket = accept_ws(&listener, &log).await;
+            expect_ping(&mut socket, &log).await;
+            socket
+                .send(close_message(1008, "api_key_revoked"))
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+            tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_ok()
+        });
+        let (mut receiver, _stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        wait_state(
+            &mut receiver,
+            TagClientConnectionState::Unauthorized,
+            Some(ErrorKind::KeyRevoked),
+        )
+        .await;
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.unwrap_err().kind(), ErrorKind::KeyRevoked);
+        assert!(!server.await.unwrap(), "reconnected after a 1008 close");
+    }
+
+    /// Design §5.1: a connection with at least one resolved binding never
+    /// sends `ping` (its first frame is `subscribe`, and nothing follows).
+    #[tokio::test]
+    async fn a_live_connection_never_sends_ping() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, received) =
+                serve_multi_generation(&listener, multi_catalog(&["alpha"], 1), &[("alpha", 20.0)])
+                    .await;
+            (received, texts_until_close(&mut socket).await)
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha"), ("b", "beta")]));
+        wait_live_after(&mut receiver, 0).await;
+        stop_partial_worker(stop_tx, task).await;
+        let (received, after_subscribe) = server.await.unwrap();
+        assert_eq!(received.subscribed, ["alpha"]);
+        assert!(after_subscribe.is_empty(), "{after_subscribe:?}");
+    }
+
+    /// Design §7: `Unbound` → `config_changed` → `Unbound`, repeated more
+    /// often than the rebind budget, never falls back to `Reconnecting`
+    /// (`Unbound` starts a new budget; `live_rebind_success_starts_a_new_rebind_budget`
+    /// for `Unbound`). The long backoff would park a fallen-back worker in
+    /// `Reconnecting`, so the next `Unbound` would never come.
+    #[tokio::test]
+    async fn repeated_unbound_config_changed_never_falls_back_to_reconnecting() {
+        const ROUNDS: u64 = 5;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (round_tx, mut round_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let mut sockets = Vec::new();
+            for revision in 1..=ROUNDS + 1 {
+                let catalog = empty_catalog(revision, Some(7));
+                let mut socket = serve_unbound_handshake(&listener, &catalog, &catalog, &log).await;
+                if revision <= ROUNDS {
+                    round_rx.recv().await.unwrap();
+                    send_config_changed(&mut socket, revision + 1).await;
+                }
+                sockets.push(socket);
+            }
+            let _ = round_rx.recv().await;
+            drop(sockets);
+        });
+        let (mut receiver, stop_tx, task) = spawn_worker_with_backoff(
+            address,
+            binding_requests(&[("a", "alpha")]),
+            BackoffConfig::new(Duration::from_secs(30), Duration::from_secs(30)),
+        );
+        let (history_stop, history) = record_states(receiver.clone());
+        let mut generation = 0;
+        for revision in 1..=ROUNDS + 1 {
+            let state = wait_unbound_after(&mut receiver, generation).await;
+            assert_eq!(state.snapshot().unwrap().revision(), revision);
+            generation = state.snapshot().unwrap().generation;
+            if revision <= ROUNDS {
+                round_tx.send(()).unwrap();
+            }
+        }
+        history_stop.send(()).unwrap();
+        let states = history.await.unwrap();
+        assert!(
+            !states.contains(&TagClientConnectionState::Reconnecting),
+            "{states:?}"
+        );
+        // The mock does not read the last socket, so the client's close
+        // handshake runs into its bounded CLOSE_TIMEOUT (1 s).
+        stop_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+        drop(round_tx);
+        server.await.unwrap();
+    }
+
+    /// Design §7: a disconnect while `Unbound` goes `Reconnecting` and comes
+    /// back to `Unbound`, and `Unbound` does not reset the backoff: the
+    /// delays keep doubling (only lower bounds are asserted, since a sleep
+    /// never ends early).
+    #[tokio::test]
+    async fn unbound_disconnect_reconnects_to_unbound_and_the_backoff_keeps_growing() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (dropped_tx, mut dropped_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let catalog = empty_catalog(1, Some(7));
+            let mut gaps = Vec::new();
+            let mut socket = serve_unbound_handshake(&listener, &catalog, &catalog, &log).await;
+            for _ in 0..3 {
+                dropped_rx.recv().await.unwrap();
+                drop(socket);
+                let dropped_at = tokio::time::Instant::now();
+                let (mut stream, _) = listener.accept().await.unwrap();
+                gaps.push(dropped_at.elapsed());
+                read_http_request(&mut stream).await;
+                write_json(&mut stream, serde_json::to_string(&catalog).unwrap()).await;
+                socket = accept_ws(&listener, &log).await;
+                expect_ping(&mut socket, &log).await;
+                send_pong(&mut socket, &log).await;
+                serve_catalog_once(&listener, &catalog, &log).await;
+            }
+            release_rx.await.unwrap();
+            drop(socket);
+            gaps
+        });
+        let (mut receiver, stop_tx, task) = spawn_worker_with_backoff(
+            address,
+            binding_requests(&[("a", "alpha")]),
+            BackoffConfig::new(Duration::from_millis(100), Duration::from_secs(5)),
+        );
+        let mut generation = wait_unbound_after(&mut receiver, 0)
+            .await
+            .snapshot()
+            .unwrap()
+            .generation;
+        for _ in 0..3 {
+            dropped_tx.send(()).unwrap();
+            wait_state(
+                &mut receiver,
+                TagClientConnectionState::Reconnecting,
+                Some(ErrorKind::Transport),
+            )
+            .await;
+            assert_eq!(receiver.borrow().snapshot(), None);
+            generation = wait_unbound_after(&mut receiver, generation)
+                .await
+                .snapshot()
+                .unwrap()
+                .generation;
+        }
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        let gaps = server.await.unwrap();
+        for (gap, at_least_ms) in gaps.iter().zip([100, 200, 400]) {
+            assert!(
+                *gap >= Duration::from_millis(at_least_ms),
+                "backoff was reset while Unbound: {gaps:?}"
+            );
+        }
+    }
+
+    /// `stop_during_rebinding_catalog_waits_for_no_extra_attempt` for
+    /// `Unbound`: `shutdown` while `Unbound` stops without another attempt.
+    #[tokio::test]
+    async fn stop_while_unbound_stops_without_an_extra_attempt() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            let catalog = empty_catalog(1, Some(7));
+            let mut socket = serve_unbound_handshake(&listener, &catalog, &catalog, &log).await;
+            let texts = texts_until_close(&mut socket).await;
+            let extra = tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_ok();
+            (texts, extra)
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+        wait_unbound_after(&mut receiver, 0).await;
+        stop_partial_worker(stop_tx, task).await;
+        assert_eq!(
+            receiver.borrow().connection_state(),
+            TagClientConnectionState::Stopped
+        );
+        assert_eq!(receiver.borrow().snapshot(), None);
+        assert_eq!(receiver.borrow().last_error(), None);
+        let (texts, extra) = server.await.unwrap();
+        assert!(texts.is_empty(), "{texts:?}");
+        assert!(!extra, "the worker started another attempt after shutdown");
+    }
+
+    /// `a_1008_close_stops_with_its_reason_and_does_not_reconnect` for
+    /// `Unbound`.
+    #[tokio::test]
+    async fn a_1008_close_while_unbound_stops_with_its_reason_and_does_not_reconnect() {
+        for (reason, kind) in [
+            ("api_key_revoked", ErrorKind::KeyRevoked),
+            ("api_key_expired", ErrorKind::KeyExpired),
+            ("api_key_tripped", ErrorKind::KeyTripped),
+            ("api_key_not_found", ErrorKind::KeyNotFound),
+            ("future_reason", ErrorKind::CredentialRejected),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let (unbound_seen_tx, unbound_seen_rx) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let log = HubLog::default();
+                let catalog = empty_catalog(1, Some(7));
+                let mut socket = serve_unbound_handshake(&listener, &catalog, &catalog, &log).await;
+                unbound_seen_rx.await.unwrap();
+                socket.send(close_message(1008, reason)).await.unwrap();
+                let _ = tokio::time::timeout(Duration::from_millis(200), socket.next()).await;
+                tokio::time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_ok()
+            });
+            let (mut receiver, _stop_tx, task) =
+                spawn_partial_worker(address, binding_requests(&[("a", "alpha")]));
+            wait_unbound_after(&mut receiver, 0).await;
+            unbound_seen_tx.send(()).unwrap();
+            wait_state(
+                &mut receiver,
+                TagClientConnectionState::Unauthorized,
+                Some(kind),
+            )
+            .await;
+            assert_eq!(receiver.borrow().snapshot(), None, "{reason}");
+            let result = tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.unwrap_err().kind(), kind, "{reason}");
+            assert!(
+                !server.await.unwrap(),
+                "{reason}: reconnected after a 1008 close"
+            );
         }
     }
 }

@@ -1480,6 +1480,7 @@ fn connection_state_str(state: TagClientConnectionState) -> &'static str {
         TagClientConnectionState::Connecting => "connecting",
         TagClientConnectionState::Handshaking => "handshaking",
         TagClientConnectionState::Live => "live",
+        TagClientConnectionState::Unbound => "unbound",
         TagClientConnectionState::Rebinding => "rebinding",
         TagClientConnectionState::Reconnecting => "reconnecting",
         TagClientConnectionState::Unauthorized => "unauthorized",

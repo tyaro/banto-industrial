@@ -715,21 +715,50 @@ mod tests {
         let _ = peer_closed.send(closed);
     }
 
+    /// Resolve `alpha`, go `Live`, then have the Hub send `config_changed`
+    /// and hold the re-resolving catalog request: the client is `Rebinding`.
     async fn serve_rebinding_drop(listener: TcpListener, second_started: oneshot::Sender<()>) {
         let (mut first, _) = listener.accept().await.unwrap();
         read_http_request(&mut first).await;
         write_response(
             &mut first,
             "200 OK",
-            serde_json::to_string(&CatalogSnapshot {
-                revision: 1,
-                run_id: Some(7),
-                collection_mode: CollectionMode::Configured,
-                tags: Vec::new(),
-            })
-            .unwrap(),
+            serde_json::to_string(&catalog()).unwrap(),
         )
         .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(matches!(subscription, Message::Text(_)));
+        socket
+            .send(Message::Text(
+                r#"{"op":"data","id":1,"t":1,"values":[{"tag":"alpha","v":1,"q":"good","t":1}]}"#
+                    .into(),
+            ))
+            .await
+            .unwrap();
+        let (mut values_stream, _) = listener.accept().await.unwrap();
+        read_http_request(&mut values_stream).await;
+        write_response(
+            &mut values_stream,
+            "200 OK",
+            serde_json::to_string(&values()).unwrap(),
+        )
+        .await;
+        socket
+            .send(Message::Text(
+                r#"{"op":"config_changed","revision":2}"#.into(),
+            ))
+            .await
+            .unwrap();
+
+        // The re-resolving catalog request: hold it, so the client stays in
+        // `Rebinding` until the test drops the handle.
         let (mut second, _) = listener.accept().await.unwrap();
         read_http_request(&mut second).await;
         second_started.send(()).unwrap();
