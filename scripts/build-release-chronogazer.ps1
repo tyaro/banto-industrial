@@ -63,10 +63,9 @@ if (-not $OutDir) {
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
 $ownTarget = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target-release'))
 $prevCargoTargetDir = $env:CARGO_TARGET_DIR
-if ($prevCargoTargetDir -and ([System.IO.Path]::GetFullPath((Join-Path $repoRoot $prevCargoTargetDir)).TrimEnd('\') -ne $ownTarget.TrimEnd('\'))) {
+if ($prevCargoTargetDir -and ([System.IO.Path]::GetFullPath([System.IO.Path]::Combine($repoRoot, $prevCargoTargetDir)).TrimEnd('\') -ine $ownTarget.TrimEnd('\'))) {
     Write-Warning "環境変数 CARGO_TARGET_DIR（$prevCargoTargetDir）はリリースビルドでは無視し、専用の $ownTarget に作る。"
 }
-$env:CARGO_TARGET_DIR = $ownTarget
 $targetDir = $ownTarget
 $releaseDir = Join-Path $targetDir 'release'
 Write-Host "ChronoGazer リリースビルド version=$Version OutDir=$OutDir releaseDir=$releaseDir"
@@ -100,6 +99,8 @@ Invoke-Native 'pnpm --version' { pnpm --version }
 
 Push-Location $repoRoot
 try {
+    # finally で必ず戻せるよう、環境変数の変更は try の中の最初に行う。
+    $env:CARGO_TARGET_DIR = $ownTarget
     # --- (b) フロントエンド（UI）ビルド（apps/chronogazer/package.json の build = vite build） ---
     if (-not $SkipFrontend) {
         Invoke-Native 'pnpm --filter chronogazer build' { pnpm --filter chronogazer build }
