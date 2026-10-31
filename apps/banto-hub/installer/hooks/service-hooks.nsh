@@ -262,7 +262,7 @@ Var SinkWasRunning
   DetailPrint "banto-hub: Windows サービス (BantoHub) を登録しています..."
   ExecWait '"$INSTDIR\banto-hub-elev.exe" service-install' $0
   ${If} $0 != 0
-    DetailPrint "banto-hub: BantoHub サービス登録に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" service-install （docs/banto-hub-operations.md §12 参照）"
+    DetailPrint "banto-hub: BantoHub サービス登録に失敗しました（終了コード $0）。管理者権限の PowerShell から手動で次を実行してください: $\"$INSTDIR\banto-hub-elev.exe$\" service-install （docs/banto-hub-operations.md §12 参照） インストール先が Program Files の外（既定は C:\Program Files\BantoHub）だと、権限の昇格を防ぐためサービスは登録できません。その場合は既定の場所に入れ直してください。"
   ${Else}
     DetailPrint "banto-hub: サービス (BantoHub) の登録・Operators グループ・サービス ACL・profile ACL を確認しました。起動種別は手動（Demand）です - OS 再起動では開始しません。"
   ${EndIf}

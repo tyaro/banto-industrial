@@ -356,6 +356,20 @@ pub enum ElevatedError {
     /// `std::env::current_exe()`（自身の実行ファイルパス取得）の失敗。
     #[error("banto-hub-elev: 自身の実行ファイルパスの取得に失敗しました: {0}")]
     CurrentExePathFailed(String),
+    /// 登録する`banto-hub.exe`が Program Files（x86 を含む）の外にある（#973）。LocalSystem の
+    /// サービスとして一般の利用者が書き換えられる場所の exe を登録すると、その場所に書ける
+    /// 誰もが SYSTEM の権限を得るため、登録の前に止める。Program Files の場所が分からない
+    /// ときも止める。
+    #[error(
+        "banto-hub-elev: {0} は Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして使うと権限の昇格に使われるため、止めます（C:\\Program Files\\BantoHub\\ に置いた banto-hub-elev.exe を実行してください）"
+    )]
+    ExeOutsideProgramFiles(String),
+    /// Program Files の場所が 1 つも確かめられない（正規化後に空）ため止める（#973）。
+    #[error("banto-hub-elev: Program Files の場所を確かめられないため、サービスの登録を止めます")]
+    ProgramFilesUnavailable,
+    /// 隣の`banto-hub.exe`が無い・読めない（正規化の失敗、#973）。
+    #[error("banto-hub-elev: 隣の banto-hub.exe が見つからないか読めません（{0}）。インストール先の banto-hub-elev.exe を実行してください")]
+    SiblingExeUnavailable(String),
     /// `GetUserNameW`（現在の対話ユーザー名取得）の失敗。
     #[error(
         "banto-hub-elev: 現在の対話ユーザー名の取得に失敗しました (GetUserNameW, os error {0})"
@@ -739,6 +753,14 @@ pub async fn revert_to_commissioning_with_audit(
 /// 同じ`cargo build`出力先ディレクトリにインストールされる前提。
 /// `service_install.rs`のモジュール doc・`service_manager.rs`の
 /// `WindowsServiceManager`構造体 doc「`set_auto_start`の制約」参照）。
+///
+/// **Program Files（x86 を含む）の外なら [`ElevatedError::ExeOutsideProgramFiles`] で止める**
+/// （#973。ChronoGazer の elev の`is_inside_program_files`と同じ考え方）。比べる前に、
+/// `banto-hub.exe`と Program Files の各パスを [`normalize_existing`] でそろえる（`current_exe()`
+/// は読み込みに使われた表記を返すので、8.3 の短い名前・`\\?\`付きで起動しても、正しい配置を
+/// 断らない。ジャンクションで外へ向けた配置は、解決した先が外なので断る）。**SCM に登録する
+/// のも正規化した後のパス**（確かめたパスと登録するパスを同じにし、`\\?\`を ImagePath に
+/// 入れない）。`banto-hub.exe`が無い・正規化できないときは止める。
 #[cfg(windows)]
 fn sibling_banto_hub_exe_path() -> Result<std::path::PathBuf, ElevatedError> {
     let current_exe = std::env::current_exe()
@@ -748,7 +770,68 @@ fn sibling_banto_hub_exe_path() -> Result<std::path::PathBuf, ElevatedError> {
             "実行ファイルの親ディレクトリを取得できませんでした".to_string(),
         )
     })?;
-    Ok(dir.join("banto-hub.exe"))
+    let exe = dir.join("banto-hub.exe");
+    let exe = normalize_existing(&exe)
+        .map_err(|err| ElevatedError::SiblingExeUnavailable(format!("{}: {err}", exe.display())))?;
+    // 正規化できなかった Program Files の場所は候補から外す（全部外れたら空 = 止める側）。
+    let dirs: Vec<std::path::PathBuf> = banto_safe_root::guard::win::program_files_dirs()
+        .iter()
+        .filter_map(|dir| normalize_existing(dir).ok())
+        .collect();
+    ensure_inside_program_files(&exe, &dirs)?;
+    Ok(exe)
+}
+
+/// 実在するパスを`std::fs::canonicalize`（長い名前・ジャンクション等の解決）で正規化し、
+/// 先頭の`\\?\`（UNC は`\\?\UNC\`→`\\`）を外す。`exe`側と Program Files 側を同じ関数に
+/// 通して表記をそろえる。
+#[cfg(windows)]
+fn normalize_existing(path: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    std::fs::canonicalize(path).map(|p| strip_verbatim_prefix(&p))
+}
+
+#[cfg(windows)]
+fn strip_verbatim_prefix(path: &std::path::Path) -> std::path::PathBuf {
+    let text = path.to_string_lossy();
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        std::path::PathBuf::from(format!(r"\\{rest}"))
+    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+        std::path::PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+/// `exe` が Program Files（`program_files_dirs`のどれか。x86 を含む）の**中**にあるか
+/// （純関数。表記の比較だけ - 呼び出し側で正規化済みであること。要素の境界で比べ、
+/// 大文字小文字は無視。Program Files そのものは外）。場所が 1 つも分からなければ`false`
+/// （止める側）。
+#[cfg(windows)]
+fn is_inside_program_files(
+    exe: &std::path::Path,
+    program_files_dirs: &[std::path::PathBuf],
+) -> bool {
+    use banto_safe_root::guard;
+    program_files_dirs
+        .iter()
+        .any(|dir| guard::is_same_or_inside(exe, dir) && !guard::paths_match(exe, dir))
+}
+
+/// [`is_inside_program_files`]が`false`なら [`ElevatedError::ExeOutsideProgramFiles`]。
+#[cfg(windows)]
+fn ensure_inside_program_files(
+    exe: &std::path::Path,
+    program_files_dirs: &[std::path::PathBuf],
+) -> Result<(), ElevatedError> {
+    if program_files_dirs.is_empty() {
+        Err(ElevatedError::ProgramFilesUnavailable)
+    } else if is_inside_program_files(exe, program_files_dirs) {
+        Ok(())
+    } else {
+        Err(ElevatedError::ExeOutsideProgramFiles(
+            exe.display().to_string(),
+        ))
+    }
 }
 
 /// [`ElevatedAction::ServiceInstall`]の本体 - **登録の前に**`grant-profile-acl`の
@@ -1811,6 +1894,103 @@ mod tests {
     // `grant_profile_acl_applies_to_default_profile`（`#[ignore]`、本物の`%ProgramData%`を
     // 触る）は #626 で消した。手順・反証は`crate::profile_grant`のテスト（偽物の
     // `HubElevOps`と、一時フォルダのルートの実物）が受け持つ。
+
+    /// #973: Program Files の中だけ通す（境界・大文字小文字・場所が分からないときは止める）。
+    #[cfg(windows)]
+    #[test]
+    fn is_inside_program_files_checks_boundaries() {
+        use std::path::{Path, PathBuf};
+        let dirs = vec![
+            PathBuf::from(r"C:\Program Files"),
+            PathBuf::from(r"C:\Program Files (x86)"),
+        ];
+        let inside = |p: &str| is_inside_program_files(Path::new(p), &dirs);
+        assert!(inside(r"C:\Program Files\BantoHub\banto-hub.exe"));
+        assert!(inside(r"C:\Program Files (x86)\BantoHub\banto-hub.exe"));
+        assert!(inside(r"c:\PROGRAM FILES\bantohub\banto-hub.exe"));
+        assert!(!inside(r"C:\Program Files"));
+        assert!(!inside(r"C:\Program FilesX\BantoHub\banto-hub.exe"));
+        assert!(!inside(r"C:\Users\a\Program Files\banto-hub.exe"));
+        assert!(!inside(r"D:\BantoHub\banto-hub.exe"));
+        assert!(!is_inside_program_files(
+            Path::new(r"C:\Program Files\BantoHub\banto-hub.exe"),
+            &[]
+        ));
+    }
+
+    /// #973: 外なら前提条件の誤りとして止める文言（頭は 1 回だけ）。
+    #[cfg(windows)]
+    #[test]
+    fn ensure_inside_program_files_refuses_outside_with_a_clear_line() {
+        use std::path::{Path, PathBuf};
+        let dirs = vec![PathBuf::from(r"C:\Program Files")];
+        assert!(ensure_inside_program_files(
+            Path::new(r"C:\Program Files\BantoHub\banto-hub.exe"),
+            &dirs
+        )
+        .is_ok());
+        let err =
+            ensure_inside_program_files(Path::new(r"C:\Temp\banto-hub.exe"), &dirs).unwrap_err();
+        let line = failure_line(&err);
+        assert!(line.starts_with(
+            "banto-hub-elev: C:\\Temp\\banto-hub.exe は Program Files の外にあります"
+        ));
+        assert_eq!(line.matches("banto-hub-elev: ").count(), 1);
+        let err =
+            ensure_inside_program_files(Path::new(r"C:\Program Files\BantoHub\banto-hub.exe"), &[])
+                .unwrap_err();
+        let line = failure_line(&err);
+        assert!(line.starts_with("banto-hub-elev: Program Files の場所を確かめられない"));
+        assert_eq!(line.matches("banto-hub-elev: ").count(), 1);
+    }
+
+    /// #973: 正規化は実ファイルで、`\\?\`付き・付きでない・（取れれば）8.3 のどれからでも同じ
+    /// パスになり、Program Files 側と同じ表記で比べられる。無いファイルは`Err`。
+    #[cfg(windows)]
+    #[test]
+    fn normalize_existing_unifies_verbatim_and_short_names() {
+        use std::path::PathBuf;
+        let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("Program Files Long Name");
+        std::fs::create_dir(&sub).unwrap();
+        let exe = sub.join("banto-hub.exe");
+        std::fs::write(&exe, b"x").unwrap();
+
+        let plain = normalize_existing(&exe).unwrap();
+        assert!(!plain.to_string_lossy().starts_with(r"\\?\"));
+        let verbatim = PathBuf::from(format!(r"\\?\{}", plain.display()));
+        let from_verbatim = normalize_existing(&verbatim).unwrap();
+        assert_eq!(plain, from_verbatim);
+
+        // 同じ関数に通した親と比べられる（表記がそろう）。
+        let parent = normalize_existing(tmp.path()).unwrap();
+        assert!(is_inside_program_files(&from_verbatim, &[parent]));
+
+        // 8.3 は環境（ボリュームの設定）によって作られない。取れたときだけ確かめる。
+        if let Some(short) = short_path(&exe) {
+            if short.to_string_lossy().contains('~') {
+                assert_eq!(normalize_existing(&short).unwrap(), plain);
+            }
+        }
+
+        assert!(normalize_existing(&sub.join("missing.exe")).is_err());
+    }
+
+    #[cfg(windows)]
+    fn short_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: `wide`は NUL 終端、`buf`は`buf.len()`要素書ける。
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        if n == 0 || n as usize >= buf.len() {
+            return None;
+        }
+        Some(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+            &buf[..n as usize],
+        )))
+    }
 
     /// `ProfileAclRefused`の文言（[`failure_line`]で出す最後の行）。
     #[test]
