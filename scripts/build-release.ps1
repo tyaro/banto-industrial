@@ -8,6 +8,11 @@
   xtask 的な立ち位置）。生成したインストーラを実行はしない（インストーラ
   生成ツール自身の方針と同じ - 実行してのインストール確認はオーナー
   判断領域）。
+
+  cargo の出力先は常にリポジトリルートの target-release（これらのスクリプトだけが使う。
+  worktree が CARGO_TARGET_DIR に向ける共有の target ではない）。継承した環境変数
+  CARGO_TARGET_DIR は警告して無視する（2026-10-31、B3-5: 共有の target では別の
+  worktree が exe を上書きできる）。この変更後の最初のビルドはフルビルドになる。
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +56,12 @@ if (-not $OutDir) {
 # New-PSDrive で作ったドライブ（rel:\out など）は .NET が解決できない。相対指定も
 # PSDrive も、PowerShell の現在の場所基準で実際のファイルシステムのパスにする。
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
-$releaseDir = Join-Path $repoRoot 'target\release'
+$ownTarget = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target-release'))
+$prevCargoTargetDir = $env:CARGO_TARGET_DIR
+if ($prevCargoTargetDir -and ([System.IO.Path]::GetFullPath([System.IO.Path]::Combine($repoRoot, $prevCargoTargetDir)).TrimEnd('\') -ine $ownTarget.TrimEnd('\'))) {
+    Write-Warning "環境変数 CARGO_TARGET_DIR（$prevCargoTargetDir）はリリースビルドでは無視し、専用の $ownTarget に作る。"
+}
+$releaseDir = Join-Path $ownTarget 'release'
 Write-Host "banto-hub リリースビルド version=$Version OutDir=$OutDir"
 
 # コピー先のリリース名の表（早い確かめと後段のコピーの両方で使う）。
@@ -85,6 +95,8 @@ Invoke-Native 'pnpm --version' { pnpm --version }
 
 Push-Location $repoRoot
 try {
+    # finally で必ず戻せるよう、環境変数の変更は try の中の最初に行う。
+    $env:CARGO_TARGET_DIR = $ownTarget
     # --- (b) フロントエンド（UI）ビルド ---
     if (-not $SkipFrontend) {
         Invoke-Native 'pnpm --filter banto-hub build' { pnpm --filter banto-hub build }
@@ -115,7 +127,7 @@ try {
 
     # --- (f) 一体インストーラ生成 ---
     if (-not $SkipInstaller) {
-        Invoke-Native 'cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- target/release' {
+        Invoke-Native 'cargo run --manifest-path apps/banto-hub/installer/Cargo.toml --release -- <releaseDir>' {
             cargo run --manifest-path (Join-Path $repoRoot 'apps\banto-hub\installer\Cargo.toml') --release -- $releaseDir
         }
     }
@@ -125,6 +137,7 @@ try {
 }
 finally {
     Pop-Location
+    $env:CARGO_TARGET_DIR = $prevCargoTargetDir
 }
 
 # --- (g) $OutDir へリリース名でコピー -------------------------------------

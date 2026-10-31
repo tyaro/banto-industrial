@@ -8,9 +8,11 @@
   しない（インストーラ生成ツール自身の方針と同じ - 実行してのインストール確認は
   オーナー同席の実機確認）。
 
-  Hub のスクリプトとの違い: 環境変数 CARGO_TARGET_DIR があればそれを cargo の
-  出力先として使う（worktree からビルドするときに main の checkout の target を
-  共有できるように）。無ければリポジトリルートの target\release。
+  cargo の出力先は常にリポジトリルートの target-release（これらのスクリプトだけが使う。
+  worktree が CARGO_TARGET_DIR に向ける共有の target ではない）。継承した環境変数
+  CARGO_TARGET_DIR は警告して無視する（2026-10-31、B3-5: 共有の target に別の
+  worktree が置いた exe が、ビルドと梱包の間に上書きされ得る。時刻では出どころを
+  証明できない）。この変更後の最初のビルドはフルビルドになる。
   SHA256SUMS.txt と最後の一覧は、この実行でコピーしたファイルだけから作る
   （-SkipInstaller で既存の OutDir に重ねると、前回の setup.exe が残ったまま
   一覧と検査和に載る、を防ぐ。#972 の Codex の指摘）。残っているほかの
@@ -59,11 +61,12 @@ if (-not $OutDir) {
 # （rel:\out など。.NET は解決できない）も、PowerShell の現在の場所基準で実際の
 # ファイルシステムのパスにする。
 $OutDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutDir)
-$targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
-if (-not [System.IO.Path]::IsPathRooted($targetDir)) {
-    $targetDir = Join-Path $repoRoot $targetDir
+$ownTarget = [System.IO.Path]::GetFullPath((Join-Path $repoRoot 'target-release'))
+$prevCargoTargetDir = $env:CARGO_TARGET_DIR
+if ($prevCargoTargetDir -and ([System.IO.Path]::GetFullPath([System.IO.Path]::Combine($repoRoot, $prevCargoTargetDir)).TrimEnd('\') -ine $ownTarget.TrimEnd('\'))) {
+    Write-Warning "環境変数 CARGO_TARGET_DIR（$prevCargoTargetDir）はリリースビルドでは無視し、専用の $ownTarget に作る。"
 }
-$targetDir = [System.IO.Path]::GetFullPath($targetDir)
+$targetDir = $ownTarget
 $releaseDir = Join-Path $targetDir 'release'
 Write-Host "ChronoGazer リリースビルド version=$Version OutDir=$OutDir releaseDir=$releaseDir"
 
@@ -96,6 +99,8 @@ Invoke-Native 'pnpm --version' { pnpm --version }
 
 Push-Location $repoRoot
 try {
+    # finally で必ず戻せるよう、環境変数の変更は try の中の最初に行う。
+    $env:CARGO_TARGET_DIR = $ownTarget
     # --- (b) フロントエンド（UI）ビルド（apps/chronogazer/package.json の build = vite build） ---
     if (-not $SkipFrontend) {
         Invoke-Native 'pnpm --filter chronogazer build' { pnpm --filter chronogazer build }
@@ -141,6 +146,7 @@ try {
 }
 finally {
     Pop-Location
+    $env:CARGO_TARGET_DIR = $prevCargoTargetDir
 }
 
 # --- (g) $OutDir へリリース名でコピー -------------------------------------
