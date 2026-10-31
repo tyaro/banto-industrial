@@ -384,7 +384,15 @@ async fn run_generation_inner(
     let generation = GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let catalog = Arc::new(catalog);
     let resolution = Arc::new(resolve_bindings(requests, &catalog.tags)?);
-    if !resolution.unresolved.is_empty() {
+    // #682 PR-2 (partial binding, design §8 P2): only the resolved names are
+    // subscribed (WS `subscribe`), fetched (REST `?tags=`), and allowed by the
+    // publish gate. Unresolved requests stay in `resolution.unresolved` of the
+    // published snapshot without a value.
+    //
+    // Interim until PR-3 (`Unbound`): when nothing resolved there is nothing
+    // to subscribe, so the attempt still fails with `binding_unresolved`
+    // (rebind, then backoff) as before.
+    if resolution.resolved.is_empty() {
         return Err(Error::new(ErrorKind::BindingUnresolved));
     }
     let tags = resolution
@@ -531,6 +539,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        binding::{UnresolvedBinding, UnresolvedReason},
         endpoint::Endpoint,
         secret::SecretApiKey,
         types::{
@@ -1568,6 +1577,430 @@ mod tests {
             .unwrap()
             .is_ok());
         server.await.unwrap();
+    }
+
+    fn binding_requests(pairs: &[(&str, &str)]) -> Vec<BindingRequest> {
+        pairs
+            .iter()
+            .map(|(key, name)| BindingRequest {
+                binding_key: (*key).into(),
+                external_name: (*name).into(),
+            })
+            .collect()
+    }
+
+    fn multi_catalog(names: &[&str], revision: u64) -> CatalogSnapshot {
+        let mut snapshot = catalog(
+            names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| tag(StableTagId::new(1, 1, index as i64 + 1), name))
+                .collect(),
+        );
+        snapshot.revision = revision;
+        snapshot
+    }
+
+    /// What the mock Hub received from the client for one generation: the
+    /// `tags` of the WS `subscribe` and of the REST `?tags=` query.
+    #[derive(Debug)]
+    struct ReceivedSelection {
+        subscribed: Vec<String>,
+        fetched: Vec<String>,
+    }
+
+    /// #682 PR-2: one generation for several names. `live` is the names (and
+    /// REST values) the Hub publishes; the selection the client asked for is
+    /// returned so the test can assert unresolved names were never requested.
+    async fn serve_multi_generation(
+        listener: &TcpListener,
+        catalog_snapshot: CatalogSnapshot,
+        live: &[(&str, f64)],
+    ) -> (WebSocketStream<tokio::net::TcpStream>, ReceivedSelection) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        assert!(request.starts_with("GET /api/v1/tags HTTP/1.1"));
+        let revision = catalog_snapshot.revision;
+        write_json(
+            &mut stream,
+            serde_json::to_string(&catalog_snapshot).unwrap(),
+        )
+        .await;
+
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = accept_async(stream).await.unwrap();
+        let subscription = tokio::time::timeout(Duration::from_secs(1), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let Message::Text(text) = subscription else {
+            panic!("expected a subscribe text frame, got {subscription:?}");
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["op"], "subscribe");
+        let subscribed = parsed["tags"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tag| tag.as_str().unwrap().to_owned())
+            .collect();
+        let frame_values = live
+            .iter()
+            .map(|(name, _)| format!(r#"{{"tag":"{name}","v":1,"q":"good","t":10}}"#))
+            .collect::<Vec<_>>()
+            .join(",");
+        socket
+            .send(Message::Text(
+                format!(r#"{{"op":"data","id":1,"t":10,"values":[{frame_values}]}}"#).into(),
+            ))
+            .await
+            .unwrap();
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_http_request(&mut stream).await;
+        let line = request.lines().next().unwrap();
+        let query = line
+            .strip_prefix("GET /api/v1/values?tags=")
+            .and_then(|rest| rest.strip_suffix(" HTTP/1.1"))
+            .unwrap_or_else(|| panic!("unexpected values request {line}"));
+        let fetched = query.split("%2C").map(str::to_owned).collect();
+        let mut snapshot = values(
+            live.iter()
+                .map(|(name, number)| value(name, *number, 10))
+                .collect(),
+        );
+        snapshot.revision = revision;
+        write_json(&mut stream, serde_json::to_string(&snapshot).unwrap()).await;
+        (
+            socket,
+            ReceivedSelection {
+                subscribed,
+                fetched,
+            },
+        )
+    }
+
+    /// Wait for a `Live` state of a generation newer than `after`.
+    async fn wait_live_after(
+        receiver: &mut watch::Receiver<TagClientState>,
+        after: u64,
+    ) -> TagClientState {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let state = receiver.borrow().clone();
+                if state.connection_state() == TagClientConnectionState::Live
+                    && state.snapshot().is_some_and(|s| s.generation > after)
+                {
+                    return state;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    fn resolved_names(state: &TagClientState) -> Vec<String> {
+        state
+            .snapshot()
+            .unwrap()
+            .resolution
+            .resolved
+            .iter()
+            .map(|binding| binding.external_name.clone())
+            .collect()
+    }
+
+    fn value_names(state: &TagClientState) -> Vec<String> {
+        state
+            .current()
+            .unwrap()
+            .values
+            .iter()
+            .map(|value| value.tag.clone())
+            .collect()
+    }
+
+    fn not_in_catalog(binding_key: &str, external_name: &str) -> UnresolvedBinding {
+        UnresolvedBinding {
+            binding_key: binding_key.into(),
+            external_name: external_name.into(),
+            reason: UnresolvedReason::NotInCatalog,
+        }
+    }
+
+    fn spawn_partial_worker(
+        address: String,
+        requests: Vec<BindingRequest>,
+    ) -> (
+        watch::Receiver<TagClientState>,
+        oneshot::Sender<()>,
+        tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let (sender, receiver) =
+            watch::channel(TagClientState::new(TagClientConnectionState::Stopped));
+        let (stop_tx, stop_rx) = oneshot::channel();
+        let rest_client = client(address);
+        let task = tokio::spawn(async move {
+            run_supervisor_with_config(
+                &rest_client,
+                &requests,
+                1,
+                &sender,
+                stop_rx,
+                BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5)),
+            )
+            .await
+        });
+        (receiver, stop_tx, task)
+    }
+
+    async fn stop_partial_worker(
+        stop_tx: oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        stop_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
+    }
+
+    /// #682 PR-2 (design §8 P2, acceptance 1): one resolved and one missing
+    /// name go `Live` with only the resolved value, and the missing name is
+    /// neither subscribed nor fetched.
+    #[tokio::test]
+    async fn mixed_resolution_goes_live_and_requests_only_the_resolved_name() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (socket, received) =
+                serve_multi_generation(&listener, multi_catalog(&["alpha"], 1), &[("alpha", 20.0)])
+                    .await;
+            received_tx.send(received).unwrap();
+            release_rx.await.unwrap();
+            drop(socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha"), ("b", "beta")]));
+
+        let received = received_rx.await.unwrap();
+        let state = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(received.subscribed, ["alpha"]);
+        assert_eq!(received.fetched, ["alpha"]);
+        assert_same_generation(&state, "a", 20.0);
+        assert_eq!(value_names(&state), ["alpha"]);
+        assert_eq!(resolved_names(&state), ["alpha"]);
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(
+            snapshot.resolution.unresolved,
+            [not_in_catalog("b", "beta")]
+        );
+        match snapshot.binding("b") {
+            Some(crate::types::BindingView::Unresolved(unresolved)) => {
+                assert_eq!(unresolved.external_name, "beta");
+                assert_eq!(unresolved.reason, UnresolvedReason::NotInCatalog);
+            }
+            other => panic!("expected an unresolved binding, got {other:?}"),
+        }
+        assert_eq!(state.last_error(), None);
+
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// #682 PR-2 (design §8 P6, acceptance 2 from `Live`): a name created
+    /// while the other one is `Live` resolves on the `config_changed` rebind.
+    #[tokio::test]
+    async fn created_name_resolves_on_the_config_changed_rebind_while_live() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (first_tx, first_rx) = oneshot::channel();
+        let (create_tx, create_rx) = oneshot::channel::<()>();
+        let (second_tx, second_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut old_socket, first) =
+                serve_multi_generation(&listener, multi_catalog(&["alpha"], 1), &[("alpha", 20.0)])
+                    .await;
+            first_tx.send(first).unwrap();
+            create_rx.await.unwrap();
+            old_socket
+                .send(Message::Text(
+                    r#"{"op":"config_changed","revision":2}"#.into(),
+                ))
+                .await
+                .unwrap();
+            let (new_socket, second) = serve_multi_generation(
+                &listener,
+                multi_catalog(&["alpha", "beta"], 2),
+                &[("alpha", 21.0), ("beta", 30.0)],
+            )
+            .await;
+            second_tx.send(second).unwrap();
+            release_rx.await.unwrap();
+            drop(new_socket);
+            drop(old_socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha"), ("b", "beta")]));
+
+        let first = first_rx.await.unwrap();
+        let state = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(first.subscribed, ["alpha"]);
+        let first_generation = state.snapshot().unwrap().generation;
+        assert_eq!(
+            state.snapshot().unwrap().resolution.unresolved,
+            [not_in_catalog("b", "beta")]
+        );
+
+        create_tx.send(()).unwrap();
+        let second = second_rx.await.unwrap();
+        let state = wait_live_after(&mut receiver, first_generation).await;
+        assert_eq!(second.subscribed, ["alpha", "beta"]);
+        assert_eq!(second.fetched, ["alpha", "beta"]);
+        assert_eq!(resolved_names(&state), ["alpha", "beta"]);
+        assert!(state.snapshot().unwrap().resolution.unresolved.is_empty());
+        assert_eq!(value_names(&state), ["alpha", "beta"]);
+        assert_same_generation(&state, "b", 30.0);
+
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// #682 PR-2 (design §8 P5, acceptance 3): a rename while `Live` moves
+    /// only that binding to `unresolved`; the other keeps publishing, and a
+    /// similar name (`alpha2`) is never assigned to the old binding.
+    #[tokio::test]
+    async fn rename_while_live_moves_only_that_binding_to_unresolved() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (first_tx, first_rx) = oneshot::channel();
+        let (rename_tx, rename_rx) = oneshot::channel::<()>();
+        let (second_tx, second_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut old_socket, first) = serve_multi_generation(
+                &listener,
+                multi_catalog(&["alpha", "beta"], 1),
+                &[("alpha", 20.0), ("beta", 30.0)],
+            )
+            .await;
+            first_tx.send(first).unwrap();
+            rename_rx.await.unwrap();
+            old_socket
+                .send(Message::Text(
+                    r#"{"op":"config_changed","revision":2}"#.into(),
+                ))
+                .await
+                .unwrap();
+            let (new_socket, second) = serve_multi_generation(
+                &listener,
+                multi_catalog(&["alpha2", "beta"], 2),
+                &[("beta", 31.0)],
+            )
+            .await;
+            second_tx.send(second).unwrap();
+            release_rx.await.unwrap();
+            drop(new_socket);
+            drop(old_socket);
+        });
+        let (mut receiver, stop_tx, task) =
+            spawn_partial_worker(address, binding_requests(&[("a", "alpha"), ("b", "beta")]));
+
+        let first = first_rx.await.unwrap();
+        let state = wait_live_after(&mut receiver, 0).await;
+        assert_eq!(first.subscribed, ["alpha", "beta"]);
+        assert_eq!(resolved_names(&state), ["alpha", "beta"]);
+        let first_generation = state.snapshot().unwrap().generation;
+
+        rename_tx.send(()).unwrap();
+        let second = second_rx.await.unwrap();
+        let state = wait_live_after(&mut receiver, first_generation).await;
+        assert_eq!(second.subscribed, ["beta"]);
+        assert_eq!(second.fetched, ["beta"]);
+        assert_eq!(resolved_names(&state), ["beta"]);
+        let snapshot = state.snapshot().unwrap();
+        assert_eq!(
+            snapshot.resolution.unresolved,
+            [not_in_catalog("a", "alpha")]
+        );
+        assert!(matches!(
+            snapshot.binding("a"),
+            Some(crate::types::BindingView::Unresolved(_))
+        ));
+        assert_eq!(value_names(&state), ["beta"]);
+        assert_same_generation(&state, "b", 31.0);
+
+        release_tx.send(()).unwrap();
+        stop_partial_worker(stop_tx, task).await;
+        server.await.unwrap();
+    }
+
+    /// #682 PR-2 (design §8 P3, acceptance 7): every duplicate class still
+    /// fails the whole attempt through the worker - `Stopped` with the kind in
+    /// `last_error`, no snapshot, no WebSocket - even though other requested
+    /// names resolve and a partial result would be possible.
+    #[tokio::test]
+    async fn every_duplicate_class_stops_the_worker_instead_of_a_partial_live() {
+        let cases = [
+            (
+                binding_requests(&[("same", "alpha"), ("same", "beta")]),
+                vec!["alpha", "beta"],
+                ErrorKind::DuplicateBindingKey,
+            ),
+            (
+                binding_requests(&[("a", "alpha"), ("b", "alpha"), ("c", "beta")]),
+                vec!["alpha", "beta"],
+                ErrorKind::DuplicateRequestedExternalName,
+            ),
+            (
+                binding_requests(&[("a", "alpha"), ("c", "gamma")]),
+                vec!["alpha", "beta", "beta"],
+                ErrorKind::DuplicateCatalogExternalName,
+            ),
+        ];
+        for (requests, names, expected) in cases {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let address = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                write_json(
+                    &mut stream,
+                    serde_json::to_string(&multi_catalog(&names, 1)).unwrap(),
+                )
+                .await;
+                // No WebSocket (nor a second catalog) may follow.
+                tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            });
+            let (mut receiver, _stop_tx, task) = spawn_partial_worker(address, requests);
+            let result = tokio::time::timeout(Duration::from_secs(1), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.unwrap_err().kind(), expected);
+            wait_state(
+                &mut receiver,
+                TagClientConnectionState::Stopped,
+                Some(expected),
+            )
+            .await;
+            assert!(receiver.borrow().snapshot().is_none());
+            assert_eq!(receiver.borrow().current(), None);
+            assert!(
+                server.await.unwrap(),
+                "{expected:?} opened another connection"
+            );
+        }
     }
 
     #[tokio::test]
