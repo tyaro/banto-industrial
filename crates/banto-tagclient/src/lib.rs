@@ -18,8 +18,8 @@
 //! the write scope, MQTT) already speaks names, and a numeric ID changes on
 //! delete-and-recreate or a CSV re-import and cannot be carried across
 //! environments. A rename therefore leaves the old name unresolved
-//! (`binding_unresolved`; tag-server-design.md §4.1 "rename is a breaking
-//! change") until the application supplies the new name, while a
+//! (in [`BindingResolution::unresolved`]; tag-server-design.md §4.1 "rename
+//! is a breaking change") until the application supplies the new name, while a
 //! delete-and-recreate under the same name resolves again on the next rebind.
 //! [`StableTagId`] remains only as the Hub's wire shape in [`CatalogTag::ids`].
 //!
@@ -54,8 +54,20 @@
 //! value, and a later `config_changed` rebind moves names between the two
 //! lists (created names resolve, renamed or deleted ones become unresolved;
 //! similar names are never assigned). Duplicate bindings, requests, or
-//! catalog names still fail the whole attempt. Until PR-3, an attempt in
-//! which nothing resolved still fails with `binding_unresolved`.
+//! catalog names still fail the whole attempt.
+//!
+//! #682 PR-3: an attempt in which nothing resolved settles as
+//! [`TagClientConnectionState::Unbound`]: the WebSocket is open but nothing
+//! is subscribed, and `snapshot()` carries the catalog and the all-unresolved
+//! resolution with `values: None` (`current()` is `None`). Before publishing
+//! it the worker sends `{"op":"ping"}` and waits for `pong` (the Hub answers
+//! only after it registered for configuration changes), then fetches the
+//! catalog again and requires the same `revision` and `run_id` and still no
+//! resolved name; otherwise it rebinds without publishing `Unbound`. A
+//! `config_changed` while `Unbound` rebinds (and goes `Live` once a requested
+//! name exists). Reaching `Unbound` starts a new rebind budget but does not
+//! reset the reconnect backoff, which only `Live` data does
+//! (docs/banto-tagclient-partial-binding-design.md §5.1 / §7).
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are

@@ -112,6 +112,38 @@ pub(crate) fn parse_hub_wire(
     }
 }
 
+/// Hub wire message seen on an `Unbound` connection, which has no
+/// subscription (#682 PR-3, docs/banto-tagclient-partial-binding-design.md
+/// §5.1). Kept separate from [`parse_hub_wire`] so the publish gate's
+/// treatment of `pong` as `Ignored` does not change.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UnboundWire {
+    Pong,
+    ConfigChanged,
+    Ignored,
+}
+
+/// Parse one Hub wire message for a connection without a subscription.
+/// `data` and `error` cannot legitimately arrive (nothing was subscribed), so
+/// they and unknown ops are protocol errors.
+pub(crate) fn parse_unbound_wire(raw: &str) -> Result<UnboundWire> {
+    let object: Value = serde_json::from_str(raw).map_err(|_| protocol_error())?;
+    let op = object
+        .get("op")
+        .and_then(Value::as_str)
+        .ok_or_else(protocol_error)?;
+    match op {
+        "pong" => Ok(UnboundWire::Pong),
+        "config_changed" => {
+            let _: WireConfigChanged =
+                serde_json::from_value(object).map_err(|_| protocol_error())?;
+            Ok(UnboundWire::ConfigChanged)
+        }
+        "event" => Ok(UnboundWire::Ignored),
+        _ => Err(protocol_error()),
+    }
+}
+
 #[derive(Deserialize)]
 struct WireData {
     id: i64,
@@ -757,5 +789,39 @@ mod tests {
         let error = Error::new(ErrorKind::ProtocolError);
         assert!(!format!("{error:?}").contains("secret"));
         assert!(!error.to_string().contains("/private"));
+    }
+
+    #[test]
+    fn unbound_wire_tells_pong_and_config_changed_and_rejects_values() {
+        assert_eq!(
+            parse_unbound_wire(r#"{"op":"pong"}"#).unwrap(),
+            UnboundWire::Pong
+        );
+        assert_eq!(
+            parse_unbound_wire(r#"{"op":"config_changed","revision":3}"#).unwrap(),
+            UnboundWire::ConfigChanged
+        );
+        assert_eq!(
+            parse_unbound_wire(r#"{"op":"event","kind":"x"}"#).unwrap(),
+            UnboundWire::Ignored
+        );
+        for raw in [
+            r#"{"op":"data","id":1,"t":1,"values":[]}"#,
+            r#"{"op":"error","id":1,"code":"unknown_tag"}"#,
+            r#"{"op":"config_changed"}"#,
+            r#"{"op":"surprise"}"#,
+            "not json",
+        ] {
+            assert_eq!(
+                parse_unbound_wire(raw).unwrap_err().kind(),
+                ErrorKind::ProtocolError,
+                "{raw}"
+            );
+        }
+        // The publish gate still treats `pong` as ignorable.
+        assert_eq!(
+            parse_hub_wire(r#"{"op":"pong"}"#, 1, &HashSet::new()).unwrap(),
+            HubWireMessage::Ignored
+        );
     }
 }

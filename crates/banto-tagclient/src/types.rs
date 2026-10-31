@@ -262,14 +262,24 @@ pub struct ValuesSnapshot {
     pub values: Vec<ValueEntry>,
 }
 
-/// Public connection state for the future streaming client. A current value
-/// is only exposed while the state is `Live`.
+/// Public connection state for the streaming client. A current value is only
+/// exposed while the state is `Live`; a [`GenerationSnapshot`] is exposed
+/// while `Live` or `Unbound`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TagClientConnectionState {
     Stopped,
     Connecting,
     Handshaking,
     Live,
+    /// No requested binding is in the catalog (#682 PR-3,
+    /// docs/banto-tagclient-partial-binding-design.md §7). The WebSocket is
+    /// open but nothing is subscribed and there are no values: `snapshot()`
+    /// is `Some` with `values: None` and every request in
+    /// `resolution.unresolved`, `current()` is `None`. This is a settled
+    /// state, not a failure - the worker waits for the Hub's
+    /// `config_changed` and then rebinds (`Rebinding`), going `Live` once a
+    /// requested name exists. A disconnect goes `Reconnecting` as usual.
+    Unbound,
     Rebinding,
     /// Waiting out a backoff before fetching the catalog again, whatever the
     /// cause: a disconnect, a transport or protocol error, or a rebind budget
@@ -287,6 +297,7 @@ impl fmt::Display for TagClientConnectionState {
             Self::Connecting => "connecting",
             Self::Handshaking => "handshaking",
             Self::Live => "live",
+            Self::Unbound => "unbound",
             Self::Rebinding => "rebinding",
             Self::Reconnecting => "reconnecting",
             Self::Unauthorized => "unauthorized",
@@ -421,7 +432,8 @@ pub enum BindingView<'a> {
     Unresolved(&'a UnresolvedBinding),
 }
 
-/// Current public state. Non-live states must not retain a snapshot (R3).
+/// Current public state. States other than `Live` and `Unbound` must not
+/// retain a snapshot (R3), and only `Live` carries values.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TagClientState {
     state: TagClientConnectionState,
@@ -446,7 +458,8 @@ impl TagClientState {
         self.state
     }
 
-    /// The generation snapshot; `Some` only while `Live`.
+    /// The generation snapshot; `Some` only while `Live` or `Unbound`
+    /// (`Unbound` has `values: None`).
     pub fn snapshot(&self) -> Option<&Arc<GenerationSnapshot>> {
         self.snapshot.as_ref()
     }
@@ -507,6 +520,19 @@ impl TagClientState {
         self.state = TagClientConnectionState::Live;
         self.snapshot = Some(Arc::new(snapshot));
         self.last_error = None;
+    }
+
+    /// `Unbound` with the generation that established it (#682 PR-3). The
+    /// snapshot never carries values: `resolution.resolved` is empty, so
+    /// `values` is forced to `None` and `current()` stays `None`.
+    pub(crate) fn unbound(mut snapshot: GenerationSnapshot) -> Self {
+        debug_assert!(snapshot.resolution.resolved.is_empty());
+        snapshot.values = None;
+        Self {
+            state: TagClientConnectionState::Unbound,
+            snapshot: Some(Arc::new(snapshot)),
+            last_error: None,
+        }
     }
 
     pub(crate) fn fail(&mut self, error: crate::error::ErrorKind) {
@@ -755,5 +781,29 @@ mod tests {
         failed.fail(ErrorKind::ProtocolError);
         assert_eq!(failed.snapshot(), None);
         assert_eq!(failed.current(), None);
+    }
+
+    #[test]
+    fn unbound_carries_a_snapshot_without_values_and_displays_unbound() {
+        let generation = live_generation();
+        let unresolved = crate::binding::BindingResolution {
+            resolved: Vec::new(),
+            unresolved: generation.resolution.unresolved.clone(),
+        };
+        let state = TagClientState::unbound(GenerationSnapshot {
+            resolution: Arc::new(unresolved),
+            values: None,
+            ..generation
+        });
+        assert_eq!(state.connection_state(), TagClientConnectionState::Unbound);
+        assert_eq!(TagClientConnectionState::Unbound.to_string(), "unbound");
+        assert_eq!(state.current(), None);
+        assert_eq!(state.last_error(), None);
+        let snapshot = state.snapshot().expect("Unbound keeps its snapshot");
+        assert_eq!(snapshot.values, None);
+        assert!(snapshot.resolution.resolved.is_empty());
+        let mut later = state.clone();
+        later.transition(TagClientConnectionState::Rebinding);
+        assert_eq!(later.snapshot(), None);
     }
 }

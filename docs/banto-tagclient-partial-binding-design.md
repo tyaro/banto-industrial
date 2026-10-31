@@ -1,7 +1,7 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **設計（Issue #682）。PR-1（同一世代 snapshot）は #983、PR-H は #984 でマージ済み（2026-10-31）。PR-2（部分解決）は実装済み・未マージ。PR-3 は未着手。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+状態: **設計（Issue #682）。PR-1（同一世代 snapshot）は #983、PR-H は #984 でマージ済み（2026-10-31）。PR-2（部分解決）は #985 でマージ済み（2026-10-31）。PR-3（`Unbound` と再解決経路）は実装済み・未マージ。PR-3 の実機確認は 2026-11-01 に使い捨ての Hub（127.0.0.1）で済んだ: 未作成のタグだけで `unbound`、購読 0 件の WS を 644 秒保って切れず、タグの作成で 0.1 秒後に `live`、削除で 0.07 秒後に `unbound`。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
 閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
 Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
@@ -198,12 +198,12 @@ impl TagClientHandle {
 
 ### 4.3 エラー分類（`error.rs`）
 
-| 分類                     | 変更                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `binding_unresolved`     | **PR-3 の後は worker が解決結果から返すことはなくなる**。残る発生源は WS の `{"op":"error","code":"unknown_tag"}`（`stream_core.rs` `parse_hub_wire` L102〜）だけ: catalog 取得と subscribe の間に Hub 側でタグが消えた競合。rebindable のまま（catalog から再解決すれば `unresolved` に移る）。**暫定（PR-2 から PR-3 まで）**: `resolved` が空のときだけ worker からも返る（§12 PR-2）。この間は `error.rs` の doc に暫定の注記を置く。 |
-| `invalid_tag_selection`  | 変更なし（空の要求集合・カンマ入りは全体の失敗）。                                                                                                                                                                                                                                                                                                                                                                                        |
-| `duplicate_*` の 3 分類  | 変更なし（全体の失敗、terminal）。                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `revision_mismatch` ほか | 変更なし。                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| 分類                     | 変更                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `binding_unresolved`     | **PR-3 の後は worker が解決結果から返すことはなくなる**。残る発生源は WS の `{"op":"error","code":"unknown_tag"}`（`stream_core.rs` `parse_hub_wire` L102〜）だけ: catalog 取得と subscribe の間に Hub 側でタグが消えた競合。rebindable のまま（catalog から再解決すれば `unresolved` に移る）。**暫定（PR-2 から PR-3 まで、PR-3 で外した）**: `resolved` が空のときだけ worker からも返っていた（§12 PR-2）。この間は `error.rs` の doc に暫定の注記を置いていた。 |
+| `invalid_tag_selection`  | 変更なし（空の要求集合・カンマ入りは全体の失敗）。                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `duplicate_*` の 3 分類  | 変更なし（全体の失敗、terminal）。                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `revision_mismatch` ほか | 変更なし。                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 
 ## 5. 状態機械
 
@@ -266,6 +266,7 @@ if resolution.resolved が空:
     connection.send_ping() (stop 割り込み可)               // {"op":"ping"}。Hub が revision_rx を登録し終えたことの同期（下の段落）
                                                           // subscribe_on_change と同じ biased select! で包む（§5.2 場面 11）
     loop: receive_text() (stop 割り込み可)                 // pong が来るまで。receive_text の Err はそのまま返す（§14）
+                                                          // pong 待ち全体に期限 10 秒（超えたら close_best_effort → Err(Transport)、2026-11-01、§14）
         pong           → break
         config_changed → Err(RevisionMismatch)            // 待っている間に設定が変わった → Unbound を出さずに Rebinding へ
         event          → 無視
@@ -397,6 +398,7 @@ revision を同時に更新し、lock を離してから `revision_tx.send`）�
 | 15   | Live 側: 初回 `data` と REST の間の変更                                                      | OK     | `finalize` の revision 照合 → `RevisionMismatch`                                                                                                                                 |
 | 16   | Live 側: REST の後の変更                                                                     | OK     | `revision_rx` 登録後なので `config_changed` が届く                                                                                                                               |
 | 17   | `Unbound` → `config_changed` → `Unbound` の繰り返し / resolved ≥ 1 の接続                    | OK     | 前者は `reached_unbound` で rebind budget を新しくする（§7）。後者は `ping` を送らず従来どおり                                                                                   |
+| 18   | Hub が WS を保ったまま `ping` に `pong` を返さない（応答しない）                             | **NG** | `pong` 待ちに期限（10 秒）。超えたら `close_best_effort()` して `Transport` → 通常の backoff で `Reconnecting`（2026-11-01、オーナーの Codex CLI の指摘による）                  |
 
 ## 6. 世代と snapshot の整合規則
 
@@ -733,6 +735,7 @@ checklist §5 で先回りするもの: 「自動で再試行します」と書�
   潰すと、認証拒否が `Reconnecting` の無限再接続になる。既存の Live 側のループ（`worker.rs` L408 /
   L424 / L440 の `result?`）と同じく `?` で返す。`pong` / `config_changed` の見分けは `Ok(text)` の
   中身にだけ行う。
+- **`pong` 待ちには期限を置く**（2026-11-01、オーナーの Codex CLI の指摘による）。期限が無いと、WS を保ったまま `ping` に応答しない Hub に対し `Handshaking` / `Rebinding` に留まり続け、再接続できない。`worker.rs` の `BackoffConfig::pong_timeout`（既定 10 秒、テストで短くする）で `pong` 待ち全体を 1 本の期限にし、超えたら `close_best_effort()` してから retryable な `Transport` を返して通常の backoff で再試行する（`stop` 腕は期限より先）。
 - **`send_ping()` は `stop` と並べた `biased` `select!` で呼ぶ**（§5.2 場面 11）。`subscribe_on_change`
   （`worker.rs` L392〜）と同じ形で、`stop` 側では `close_best_effort()` してから `stopped()` を返す。
   送信だけ `select!` の外に置くと、送信バッファが詰まったときに shutdown が待たされる。

@@ -1,7 +1,7 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **#682（2026-10-31、設計のみ）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。実装後に本書 §3.1・§3.2・§4・§5 をそれに合わせて直す。**
+状態: **#682（2026-10-31〜11-01、PR-1〜PR-3 で実装。§3.1・§4・§5 は反映済み）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。本書と食い違う所があれば同書を正とする。**
 **2026-09-30 オーナー決定（docs/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
@@ -131,8 +131,8 @@ stable IDを保存する」を撤回し、SCADA・ChronoGazer・Sinkなど全ク
 書き込みも`external_name`で行う。根拠は、IDは削除→同名再作成やCSV再取り込みで変わり環境をまたいで
 持ち越せないこと、Hubの公開契約（WS subscribe、`POST /api/v1/values/{tag}`、write scope、MQTT）は
 すべて名前であること。**改名でbindingがunresolvedになるのは仕様**であり
-（tag-server-design.md §4.1「リネームは破壊的変更」）、`binding_unresolved`として値をcurrent扱い
-せず、アプリが新しい名前を設定し直すまで復帰しない。削除→同名再作成は名前が同じなので、次の
+（tag-server-design.md §4.1「リネームは破壊的変更」）、その名前は`resolution.unresolved`に載って値をcurrent扱い
+せず（ほかの名前は購読を続ける。全件が未解決なら`unbound`。#682）、アプリが新しい名前を設定し直すまで復帰しない。削除→同名再作成は名前が同じなので、次の
 再bindで自動的に解決される。`StableTagId`型と`CatalogTag.ids`はHubのwire形式なのでそのまま
 残す（DB行の識別子など、bindingと無関係な用途に使ってよい）。public文書・fixtureに案件固有の
 tag名、tag ID、接続情報を入れない。
@@ -268,7 +268,7 @@ shutdownはそのエラーを返す。公開Handleによるcatalog起点の再�
 | `transport`                         | 接続、timeout、切断                                                                                               | bounded exponential backoffで再接続する。                                                |
 | `protocol_error`                    | 不正JSON、期待外メッセージ、契約違反                                                                              | 接続を閉じ、backoff後にcatalogから再開する。                                             |
 | `catalog_unavailable`               | catalog取得不能                                                                                                   | backoff後にcatalogから再開する。                                                         |
-| `binding_unresolved`                | 外部名がcatalogで解決不能（改名・削除・未作成）                                                                   | 接続は継続可能。対象値をcurrent扱いしない。                                              |
+| `binding_unresolved`                | 購読名をHubが`unknown_tag`で拒否。catalogに無い名前は`unresolved`（全件なら`unbound`、#682）                      | rebindして再解決。対象値をcurrent扱いしない。                                            |
 | `revision_mismatch`                 | catalogとvalues/snapshotのrevision不一致                                                                          | bounded retry。整合するまでcurrentを公開しない。                                         |
 | `runtime_metadata_mismatch`         | revision/run_id/collection_mode不一致、または未知collection_mode                                                  | bounded retry。整合するまでcurrentを公開しない。                                         |
 | `duplicate_binding_key`             | 要求`binding_key`重複                                                                                             | fail-closed。部分bindingを公開しない。                                                   |
@@ -388,6 +388,12 @@ stateDiagram-v2
 	live --> reconnecting: disconnect
 	live --> unauthorized: close 1008 + 理由文（#446、再接続しない）
 	live --> rebinding: config_changed
+	connecting --> unbound: resolved 0 件 → WS connect → ping/pong → catalog 取り直しで一致（subscribe しない、#682）
+	rebinding --> unbound: 同上
+	unbound --> rebinding: config_changed
+	unbound --> reconnecting: disconnect / transport / protocol error
+	unbound --> unauthorized: close 1008 + 理由文（#446）
+	unbound --> stopped: shutdown
 	rebinding --> rebinding: coalesce further config_changed
 	rebinding --> live: catalog → resolve → WS subscribe → matching snapshot → publish gate
 	rebinding --> reconnecting: bounded retry exhausted / transport error
@@ -411,6 +417,11 @@ collection_modeが既知で、要求したgeneration中に`config_changed`も`un
 としてatomicに公開する。gate確認中に通知を
 受信した場合、または不一致ならWS世代を破棄し、catalog取得からbounded retryする。これに
 より「snapshot取得後からWS成立まで」に通知を取り逃がして旧bindingを公開する経路を持たない。
+
+要求が全件catalogに無い（resolvedが0件）試行は、subscribeせず`unbound`に入る。WS接続後に
+`{"op":"ping"}`を送って`pong`を待ち（Hubの`revision_rx`登録との同期）、catalogを取り直して
+`revision`・`run_id`の一致と再解決で0件のままであることを確かめてから公開する（値は持たない）。
+詳細はdocs/banto-tagclient-partial-binding-design.md §5.1・§7。
 
 ```mermaid
 sequenceDiagram
@@ -440,7 +451,7 @@ sequenceDiagram
 `config_changed`受信時は直ちに`rebinding`へ遷移し、旧値をcurrent扱いしない。rebinding中に
 同じまたは別revisionの通知が連打されても、通知をキューへ無制限に積まず「再解決が必要」
 という一つのpending状態へcoalesceする。1回の試行は必ずcatalog取得から始め、外部名を
-再解決し（改名された名前は新しいcatalogに無いので`binding_unresolved`になり、値をcurrent扱いしない。
+再解決し（改名された名前は新しいcatalogに無いので`unresolved`に移り（全件なら`unbound`）、値をcurrent扱いしない。
 削除→同名再作成は名前が同じなので自動的に解決される）、値snapshotのrevision、run_id、collection_modeがcatalogと一致した場合だけ新しい
 購読・currentを公開する。publish gate中のWS値はbinding/tagごとの最新1件だけを保持し、
 各値の`(source timestamp t, receive sequence)`を比較する。REST snapshotより古い、または
@@ -450,7 +461,7 @@ sequenceDiagram
 不一致ならbounded retry（回数・待ち時間上限あり）し、上限到達時は`revision_mismatch`または
 `runtime_metadata_mismatch`
 または`reconnecting`としてcurrentを公開しない。対象が消えた場合は
-`binding_unresolved`として値を保持してもcurrentにはしない。切断後もWebSocketだけを
+`unresolved`に移り、値をcurrentにはしない。切断後もWebSocketだけを
 張り直さず、必ずcatalogとsnapshotからやり直す。
 
 ## 6. バックプレッシャと所有権
@@ -685,7 +696,7 @@ feature不使用、既定features）を対象に、一時的に`banto-tagclient`
 | テスト                       | 確認する契約                                                                                      |
 | ---------------------------- | ------------------------------------------------------------------------------------------------- |
 | catalog resolve              | 外部名でcatalogを引き、購読対象を解決できる。                                                     |
-| unknown external name        | `binding_unresolved`になり、値をcurrent扱いしない。                                               |
+| unknown external name        | `resolution.unresolved`に載り、値をcurrent扱いしない（全件未解決なら`unbound`。#682）。           |
 | initial snapshot             | REST snapshotとWS初期dataでlatestが更新される。                                                   |
 | race-free publish gate       | WSを先に成立させ、snapshot後の通知取り逃しを防ぎ、gate確認前のdataを公開しない。                  |
 | handshake buffer latest-wins | pending mapはbinding/tagごとに最新1件だけを保持し、snapshotより古いWS frameは上書きせず破棄する。 |

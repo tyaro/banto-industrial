@@ -22,10 +22,8 @@ pub enum ErrorKind {
     /// A name missing from the catalog (never created, deleted, or the old
     /// name after a rename - tag-server-design.md §4.1) is not an error by
     /// itself: it is listed in `BindingResolution::unresolved` and the other
-    /// bindings still go `Live`. Its value is never treated as current.
-    ///
-    /// Interim (#682 PR-2 until PR-3): the worker also returns this when no
-    /// requested binding resolved at all (`resolved` is empty).
+    /// bindings still go `Live` (or, when nothing resolved, the worker
+    /// settles in `Unbound`). Its value is never treated as current.
     BindingUnresolved,
     Unauthorized,
     Transport,

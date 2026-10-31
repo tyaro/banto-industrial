@@ -246,6 +246,21 @@ impl WebSocketConnection {
             })
     }
 
+    /// Send one Hub application-level `{"op":"ping"}` (#682 PR-3). The Hub
+    /// answers `{"op":"pong"}` only from its request loop, which runs after
+    /// it registered its `revision_rx`, so a received `pong` proves later
+    /// configuration changes will reach this connection as `config_changed`
+    /// (docs/banto-tagclient-partial-binding-design.md §5.1).
+    pub(crate) async fn send_ping(&mut self) -> Result<()> {
+        self.stream
+            .send(Message::Text(r#"{"op":"ping"}"#.into()))
+            .await
+            .map_err(|error| {
+                log_stream_error(self.host.as_deref(), self.port, "ping", &error);
+                classify_stream_error(error)
+            })
+    }
+
     /// Receive exactly one application text frame, handling native control
     /// frames without adding an unbounded queue.
     pub(crate) async fn receive_text(&mut self) -> Result<String> {
