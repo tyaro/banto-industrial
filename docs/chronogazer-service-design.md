@@ -705,7 +705,7 @@
 **B3-4 PR-C のインストーラの実機確認の結果（2026-10-31、B3-5 の一部。main `3028eaad`、0.3.0-alpha.1）**:
 
 - **環境**: この PC（`MSI-A13`、Windows 11 Pro）。`scripts/build-release-chronogazer.ps1` で作ったインストーラを、オーナーが UAC と画面の問いに答えて走らせた。前提: `C:\Program Files\ChronoGazer` に 2026-10-19 の手作業の exe 3 つ（登録なし）、`C:\ProgramData\ChronoGazer` に前のデータ。`BantoHub` サービスは無い。
-- **ビルドの事故（インストーラの不具合ではない）**: 1 回目のビルドでは、共有の `CARGO_TARGET_DIR` に別の worktree が 12:08 に置いた `chronogazer-elev.exe`（main に無い文言を含む）が、main の elev が「変わっていない」と見なされて作り直されずにそのまま同梱された。新規インストールの `service-install` が終了コード 2（`C:\Program Files` を開けない、os error 5）で止まり、インストーラは「登録に失敗しました」の案内と `Abort`、ファイルと「アプリ」の登録は残った（案内どおり。アンインストールできる）。`target/release` の 3 つの exe を消して作り直すと通った。チェックリスト §5 に 1 行足した。
+- **ビルドの事故（インストーラの不具合ではない）**: 1 回目のビルドでは、共有の `CARGO_TARGET_DIR` に別の worktree が 12:08 に置いた `chronogazer-elev.exe`（main に無い文言を含む）が、main の elev が「変わっていない」と見なされて作り直されずにそのまま同梱された。新規インストールの `service-install` が終了コード 2（`C:\Program Files` を開けない、os error 5）で止まり、インストーラは「登録に失敗しました」の案内と `Abort`、ファイルと「アプリ」の登録は残った（案内どおり。アンインストールできる）。`target/release` の 3 つの exe を消して作り直すと通ったが、消すだけでは別の worktree の上書きを防げない（レビューの指摘）。ビルドのスクリプトは、常にリポジトリルートの `target-release`（スクリプトだけが使う。worktree が `CARGO_TARGET_DIR` に向ける共有の `target` ではない）に作り、継承した `CARGO_TARGET_DIR` は警告して無視するようにした（最初の 1 回はフルビルド）。チェックリスト §5 に 1 行足した。
 - **確かめた（すべて期待どおり）**:
   1. 新規（古い exe が残る場所、登録なし）: 上書きして `service-install` が成功。サービス `ChronoGazer` は Manual・Stopped、`"C:\Program Files\ChronoGazer\chronogazer-server.exe" run-service`。`ChronoGazer Operators` にインストール利用者。スタートメニューのショートカット。インストール先の ACL は Program Files の継承のまま。
   2. シェルが動いている上書き: `--quit-for-update` でシェルが自分から終わり（PR-B）、上書き・登録まで成功。
