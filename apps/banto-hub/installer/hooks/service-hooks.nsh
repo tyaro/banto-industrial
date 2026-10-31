@@ -39,16 +39,49 @@
 ;
 ; **どのステップが失敗してもインストーラ本体は中断させない** - DetailPrint
 ; で案内するだけに留め、必要なら docs/banto-hub-operations.md §12 の手順で
-; 手動対応してもらう（T5-2 以来の一貫した方針）。
+; 手動対応してもらう（T5-2 以来の一貫した方針）。**例外**は #973 PR-3a で
+; ChronoGazer（#972）にそろえた下の (0) と (4): ファイルを置く前に、置き場が
+; 既定の場所でない・所有者と ACL を既定に戻せないときは、何も変えずに
+; `Abort` する（置いてからでは LocalSystem のサービスの exe を一般の利用者が
+; 差し替えられる状態を作ってしまうため）。
 ;
 ; ## PREINSTALL（§4.3 表・§7 決定4「自動で停止し、動いていたものだけ再開」）
 ;
-; 上書きインストールでは、稼働中の exe をファイルコピーで差し替えられない
-; （File 命令が失敗する/ロックされたファイルを残したまま新旧混在になる）
-; ため、コピー前に次を止める:
-;   (1) BantoHubSink が Running なら停止し、$SinkWasRunning に "1" を記録
-;   (2) BantoHub が Running なら停止し、$BantoHubWasRunning に "1" を記録
-;   (3) banto-hub-shell.exe が動いていれば taskkill で終了する
+; テンプレート（tauri-bundler 2.9.4 の installer.nsi、当て直しなし）の Section
+; Install は `SetOutPath $INSTDIR` → **このフック** → CheckIfAppIsRunning →
+; `File` の順なので、このフックが「ファイルを変える前」の最後の場所になる。
+; Section WebView2 はこの前に済んでいる（インストール先が駄目でも WebView2 だけ
+; 入ってしまう。ChronoGazer はテンプレートの当て直しで事前の確かめを WebView2 の
+; 前に出した。Hub でそろえるのは PR-3b）。
+;
+;   (0) **インストール先の固定**（共通部品 RequireDefaultInstallDir、#973 PR-3a、
+;       オーナー決定 2026-10-31「基本 Hub と同じで」）: $INSTDIR の本当の置き場
+;       （`..` を畳み、ジャンクション・シンボリックリンクを解いた実パス）が
+;       `$PROGRAMFILES64\BantoHub` と書いたとおりに等しいときだけ通す。ディレクトリ
+;       の頁や `/D=` で別の場所を選ばれると、elev は Program Files の外の exe を
+;       サービスに登録しない（権限の昇格を防ぐため）ので、サービスの無いインストール
+;       が黙ってできてしまう。Program Files の中の一般の利用者が書けるサブフォルダや、
+;       Program Files の外へのジャンクションも、文字列ではなく実パスで見て断る
+;       （#972 のオーナーレビュー（2b9ad63・7f86c38・f9d858b））。通れば $INSTDIR を
+;       畳んだ形に揃え、`SetOutPath $INSTDIR` をやり直す（テンプレートの
+;       `SetOutPath` は揃える前の表記で済んでいるため。同じ実体を指す）。
+;       レジストリ（下の MainBinaryName の先読み）もサービスの停止も、この後。
+;   (1) alpha.2 の Hub 単体インストーラからの上書きに備えた MainBinaryName の
+;       先読み（下の節）。
+;   (2) BantoHubSink が Running なら停止し、$SinkWasRunning に "1" を記録
+;   (3) BantoHub が Running なら停止し、$BantoHubWasRunning に "1" を記録
+;   (3') banto-hub-shell.exe が動いていれば taskkill で終了する
+;   (4) **インストール先の所有者・ACL の既定への戻し**（共通部品 ResetInstallDirAcl、
+;       #973 PR-3a）: 管理者が弱い ACL で先に作った `C:\Program Files\BantoHub` が
+;       残っていると、一般の利用者が LocalSystem のサービスの exe を差し替えられる
+;       （#972 のオーナーレビュー（2b9ad63））。`icacls /setowner *S-1-5-32-544` と
+;       `/reset` を、インストール先そのものと直下の普通のファイルだけに /L 付き・
+;       /T なしで掛ける（再解析ポイント・サブフォルダは `Abort`。この
+;       インストーラもサブフォルダを作らない - resources は `$INSTDIR` 直下）。
+;       失敗なら `Abort`。まだファイルは変えていないが、(2)(3) で止めたサービス
+;       はこのフックの `INSTALL_DIR_COMMON_ON_ACL_ABORT` が `sc start` で戻す
+;       （Hub のテンプレートには `.onInstFailed` が無いため。PR-3b で ChronoGazer
+;       と同じ `.onInstFailed` にそろえる候補）。
 ; 新規インストール（サービス未登録、`sc query` が失敗する = 1060 相当）は、
 ; RUNNING の文字列がそもそも見つからないため何も起きず静かに素通りする -
 ; 「見つからない」と「止まっている」を区別する必要はない（どちらも「今回は
@@ -134,8 +167,29 @@
 !define SERVICE_COMMON_OPS_DOC "docs/banto-hub-operations.md §12"
 !include "${BANTO_INSTALLER_COMMON_DIR}\service-common.nsh"
 
+; インストール先の固定と所有者・ACL の既定への戻し（RequireDefaultInstallDir・
+; ResetInstallDirAcl）は ChronoGazer と共通の installer-common/install-dir-common.nsh
+; （#973 PR-3a。#972 で ChronoGazer に入れたものを切り出した）。製品固有の文言は
+; 同じく include の前に定数で渡す。
+!define INSTALL_DIR_COMMON_LOG_PREFIX "banto-hub"
+!define INSTALL_DIR_COMMON_PRODUCT "BantoHub"
+!define INSTALL_DIR_COMMON_DEFAULT_DIR "$PROGRAMFILES64\BantoHub"
+!define INSTALL_DIR_COMMON_SERVICE_NOUN "Hub"
+!define INSTALL_DIR_COMMON_ACL_ABORT_NOTE "上書き前に止めた BantoHub・BantoHubSink サービスは戻します。"
+!include "${BANTO_INSTALLER_COMMON_DIR}\install-dir-common.nsh"
+
 Var BantoHubWasRunning
 Var SinkWasRunning
+
+; ResetInstallDirAcl が中止するときに、PREINSTALL の (2)(3) で止めたサービスを戻す
+; （共通部品が `Abort` の直前に挿入する。Hub のテンプレートには `.onInstFailed` が
+; 無いので、ここで戻さないと止めたままになる）。POSTINSTALL の (5) と同じ
+; StartServiceIfStopped（Hub → Sink の順。失敗は DetailPrint だけ、$0 を壊す）。
+; 新規インストールでは両変数とも未設定なので何も起動しない。
+!macro INSTALL_DIR_COMMON_ON_ACL_ABORT
+  !insertmacro StartServiceIfStopped "BantoHub" $BantoHubWasRunning
+  !insertmacro StartServiceIfStopped "BantoHubSink" $SinkWasRunning
+!macroend
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -190,10 +244,18 @@ Var SinkWasRunning
 ; --- フック本体 ---------------------------------------------------------
 
 !macro NSIS_HOOK_PREINSTALL
+  ; (0) インストール先の固定（何も変える前。上の PREINSTALL 節）。通れば $INSTDIR が
+  ; 畳んだ形に揃うので、テンプレートが済ませた SetOutPath をやり直す。
+  !insertmacro RequireDefaultInstallDir
+  SetOutPath $INSTDIR
+  ; (1)〜(3')
   !insertmacro FixupHubOnlyInstallerMainBinaryName
   !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
   !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
   !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
+  ; (4) 所有者・ACL の既定への戻し（`File` の直前。テンプレートの CheckIfAppIsRunning
+  ; がこの後に挟まるが、ファイルは変えない）。失敗なら止めたサービスを戻して Abort。
+  !insertmacro ResetInstallDirAcl
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
