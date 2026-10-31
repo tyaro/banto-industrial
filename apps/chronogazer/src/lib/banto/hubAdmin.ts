@@ -1432,6 +1432,8 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
 			return '接続中';
 		case 'rebinding':
 			return '再バインド中';
+		case 'unbound':
+			return 'タグ待ち';
 		case 'reconnecting':
 			return '再接続中';
 		case 'unauthorized':
@@ -1494,6 +1496,10 @@ export function hubSubscriptionDetail(
 			return `Hubに接続しています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
 		case 'rebinding':
 			return `タグの対応を取り直しています（${subscription.subscribedCount}件）。Hub側でタグが変更された可能性があります。`;
+		case 'unbound':
+			// #682: 選んだタグが 1 件も Hub に無い。WS はつながっていて、タグが
+			// 作られれば SDK が自動で再解決する。
+			return '選んだタグがHubに見つかりません。Hubでタグが作られると自動で購読を始めます。';
 		case 'reconnecting':
 			return `再接続を待っています（${subscription.subscribedCount}件のタグを購読しようとしています）。`;
 	}
