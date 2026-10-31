@@ -74,7 +74,10 @@ L138 `restart`）ので、**要求集合を入れ替える手段は `shutdown()`
    タイミングで**自分で引くしかなく、`config_changed` を挟むと別世代の catalog と値を組み合わせうる。
 4. **`Reconnecting` が 2 つの意味を持つ。** transport の backoff と「要求集合が catalog と食い違った
    まま」が同じ状態名に載り、利用者が `last_error` の分類まで見ないと区別できない（checklist §5）。
-   部分解決にすると後者が消え、`Reconnecting` は transport の意味だけになる。
+   部分解決にすると「一部のタグが catalog に無い」ことでは `Reconnecting` に入らなくなる。ただし
+   `config_changed`・`unknown_tag`・metadata 不一致による再解決を 3 回使い切ったときは、今後も
+   `Reconnecting` の backoff に入る（§5）。`Reconnecting` は「原因を問わず、backoff を待ってから
+   catalog から取り直す」状態であり、原因は `last_error` で見る（§5 の後の段落）。
 
 ## 3. 方針（2026-10-31 設計判断）
 
@@ -235,8 +238,16 @@ stateDiagram-v2
 現状（banto-tagclient-design.md §5）との差は、`unbound` の追加と、`handshaking`/`rebinding` が
 「WS を張った後に resolved 件数で `live` 系と `unbound` に分岐する」ことだけ。`Handshaking` は現状
 どおり `Connecting` モードのときだけ `connect_stream()` の前に publish する（`worker.rs` L383〜L385）ので、
-`Rebinding` モードからは `handshaking` を経ずに `live` / `unbound` へ進む。`Reconnecting` は
-transport 系の backoff だけを表すようになる（§2 の問題 4 が消える）。
+`Rebinding` モードからは `handshaking` を経ずに `live` / `unbound` へ進む。
+
+**`Reconnecting` の意味（2026-10-31 設計判断、オーナーの Codex CLI の指摘による）**: `Reconnecting`
+は transport 専用ではない。切断・transport・protocol に加え、`rebinding --> reconnecting`（再解決の
+3 回使い切り）でも入る。状態名は「backoff を待ってから catalog から取り直す」ことだけを表し、
+**原因は `last_error` の分類**（`transport` 系か `revision_mismatch` / `runtime_metadata_mismatch` /
+`unknown_tag` 系か）で見る。再解決の backoff を別の状態に分けることはしない（状態を増やすと、
+利用者の `match` と表示の対応がまた増える。部分解決により、未解決のタグが残っているだけでは
+`Reconnecting` に入らなくなるので、再解決の使い切りは Hub の設定が短い間に繰り返し変わったときに限られる）。
+利用者向けの doc（`TagClientConnectionState::Reconnecting`）にもこの意味を書く（PR-2）。
 
 ### 5.1 `run_generation_inner` の変更点（擬似コード）
 
@@ -248,10 +259,10 @@ generation = generation_counter.fetch_add(1) + 1          // handle の Arc<Atom
 if mode == Connecting: publish Handshaking               // 現状どおり（L383〜L385）。Rebinding モードでは Rebinding のまま
 connection = connect_stream() (stop 割り込み可)           // 401/403 → Unauthorized、transport → Reconnecting は現状どおり
 if resolution.resolved が空:
-    publish TagClientState { state: Unbound, snapshot: Some({generation, catalog, resolution, values: None}) }
-                                                          // WS が張れた後にだけ publish する（§4.1 doc「WS は張っている」と一致）
     recheck = fetch_catalog() (stop 割り込み可)             // WS 確立後に catalog を取り直す（下の段落）
-    if recheck.revision != catalog.revision → Err(RevisionMismatch)   // その間にタグが作られた等 → rebindable 経路
+    if recheck.revision != catalog.revision → Err(RevisionMismatch)   // その間にタグが作られた等 → Unbound を出さずに Rebinding へ
+    publish TagClientState { state: Unbound, snapshot: Some({generation, catalog, resolution, values: None}) }
+                                                          // WS 確立と revision の照合を終えた後にだけ publish する
     reached_unbound = true                                // RebindTracker だけをリセットする印（§7）
     loop: receive_text() (stop 割り込み可)
         config_changed → Err(RevisionMismatch)            // 既存の rebindable 経路に乗せる
@@ -275,6 +286,9 @@ WS が張れなければ `Unbound` には入らず、現状どおり `Reconnecti
 （`finalize` の revision 一致）でこの窓を閉じているが、`Unbound` 側にはそれが無い。そこで WS
 確立の**後に** catalog を取り直し、revision が最初の catalog と違えば `RevisionMismatch` として
 rebindable 経路に乗せる。revision が同じなら、それ以降の変更は WS の `config_changed` で必ず届く。
+取り直しと照合は **`Unbound` を publish する前に**終える。先に publish すると、その間にタグが
+作られた場合に利用者が古い解決結果を確定した `Unbound` として観測してしまう（オーナーの Codex CLI
+の指摘による）。照合で差があれば `Unbound` を出さず、直接 `Rebinding` に進む。
 PR-3 のテストに「`fetch_catalog()` と WS 確立の間にタグを作る」を入れる（§13）。
 
 `Unbound` で受けた `config_changed` を `RevisionMismatch` として返すのは、`plan_failure` の
@@ -464,6 +478,8 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
   つまり PR-2 の時点では「全件未解決」だけが従来どおり rebind → backoff）。`is_rebindable` の
   `BindingUnresolved` は残す（`unknown_tag` 用）。`error.rs` の `BindingUnresolved` の doc を §4.3 に直し、
   「PR-3 までは `resolved` が空のときだけ worker からも返る」の暫定の注記を足す（PR-3 で外す）。
+  `TagClientConnectionState::Reconnecting` の doc に「原因を問わず backoff を待って catalog から取り直す。
+  原因は `last_error`」を書く（§5 の `Reconnecting` の意味）。
   利用者（ChronoGazer / Sink）には触らない。
 - 完了条件: 受入 1・2（Live から）・3・7 のテスト。具体的には
   - 混在（`A` あり + `B` 無し）で `Live`、`values` は `A` だけ、`resolution.unresolved == [B]`。
@@ -491,7 +507,8 @@ PR-3 の範囲に **`connection_state_str` に `Unbound => "unbound"` を 1 行�
     が `subscribe` を**受けていない**。
   - `Unbound` 中に `config_changed` → `Rebinding` → タグが作られていれば `Live`。
   - 最初の `fetch_catalog()` と WS 確立の間にタグを作る（モック Hub が 2 回目の catalog で revision を
-    進める）→ `Unbound` に留まらず `Rebinding` → `Live`（§5.1 の取り直し）。
+    進める）→ `Unbound` を**一度も publish せず**に `Rebinding` → `Live`（§5.1 の取り直し。state_watch の
+    履歴に `Unbound` が無いことを確かめる）。
   - `Unbound` → `config_changed` → `Unbound` を 4 回繰り返しても `Reconnecting` に落ちない（rebind の
     budget が `Unbound` で新しくなる。`live_rebind_success_starts_a_new_rebind_budget` L767 の `Unbound` 版）。
   - `Unbound` 中の切断 → `Reconnecting` → backoff → 再接続で `Unbound` に戻る。**backoff の遅延は
