@@ -28,13 +28,21 @@ use crate::{
 pub(crate) struct BackoffConfig {
     base: Duration,
     max: Duration,
+    /// How long `run_unbound` waits for `pong` after its `ping` (design
+    /// §5.1 / §14). A Hub that keeps the WebSocket but never answers would
+    /// otherwise pin the worker in `Handshaking` / `Rebinding` forever.
+    pong_timeout: Duration,
 }
+
+/// Default for [`BackoffConfig::pong_timeout`].
+const PONG_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Default for BackoffConfig {
     fn default() -> Self {
         Self {
             base: Duration::from_secs(1),
             max: Duration::from_secs(30),
+            pong_timeout: PONG_TIMEOUT,
         }
     }
 }
@@ -42,7 +50,17 @@ impl Default for BackoffConfig {
 impl BackoffConfig {
     #[cfg(test)]
     pub(crate) const fn new(base: Duration, max: Duration) -> Self {
-        Self { base, max }
+        Self {
+            base,
+            max,
+            pong_timeout: PONG_TIMEOUT,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn with_pong_timeout(mut self, pong_timeout: Duration) -> Self {
+        self.pong_timeout = pong_timeout;
+        self
     }
 
     fn delay_for(self, retry_number: u32) -> Duration {
@@ -221,7 +239,16 @@ pub(crate) async fn run_supervisor_with_config(
     let mut rebind_tracker = RebindTracker::new();
     let mut mode = AttemptMode::Connecting;
     loop {
-        let attempt = run_attempt(rest, requests, subscription_id, state_tx, &mut stop, mode).await;
+        let attempt = run_attempt(
+            rest,
+            requests,
+            subscription_id,
+            state_tx,
+            &mut stop,
+            mode,
+            backoff.pong_timeout,
+        )
+        .await;
         let failure = match attempt {
             Ok(()) => {
                 state_tx.send_replace(TagClientState::new(TagClientConnectionState::Stopped));
@@ -314,6 +341,7 @@ async fn run_attempt(
     state_tx: &watch::Sender<TagClientState>,
     stop: &mut oneshot::Receiver<()>,
     mode: AttemptMode,
+    pong_timeout: Duration,
 ) -> std::result::Result<(), AttemptFailure> {
     match mode {
         AttemptMode::Connecting => {
@@ -332,6 +360,7 @@ async fn run_attempt(
         state_tx,
         stop,
         mode,
+        pong_timeout,
         &mut was_live,
         &mut reached_unbound,
     )
@@ -363,6 +392,7 @@ pub(crate) async fn run_generation(
         state_tx,
         &mut stop,
         AttemptMode::Connecting,
+        PONG_TIMEOUT,
     )
     .await
     {
@@ -394,6 +424,7 @@ async fn run_generation_inner(
     state_tx: &watch::Sender<TagClientState>,
     stop: &mut oneshot::Receiver<()>,
     mode: AttemptMode,
+    pong_timeout: Duration,
     was_live: &mut bool,
     reached_unbound: &mut bool,
 ) -> Result<()> {
@@ -444,6 +475,7 @@ async fn run_generation_inner(
             generation,
             state_tx,
             stop,
+            pong_timeout,
             reached_unbound,
         )
         .await;
@@ -539,6 +571,7 @@ async fn run_unbound(
     generation: u64,
     state_tx: &watch::Sender<TagClientState>,
     stop: &mut oneshot::Receiver<()>,
+    pong_timeout: Duration,
     reached_unbound: &mut bool,
 ) -> Result<()> {
     tokio::select! {
@@ -549,12 +582,20 @@ async fn run_unbound(
         }
         result = connection.send_ping() => result?,
     }
+    // One deadline for the whole wait (frames other than `pong` do not
+    // extend it). Expiry is a retryable `Transport` failure: the connection
+    // is dropped and the supervisor retries with its normal backoff.
+    let pong_deadline = tokio::time::Instant::now() + pong_timeout;
     loop {
         let text = tokio::select! {
             biased;
             _ = &mut *stop => {
                 connection.close_best_effort().await;
                 return Err(stopped());
+            }
+            _ = tokio::time::sleep_until(pong_deadline) => {
+                connection.close_best_effort().await;
+                return Err(Error::new(ErrorKind::Transport));
             }
             result = connection.receive_text() => result?,
         };
@@ -3380,6 +3421,57 @@ mod tests {
         assert_eq!(receiver.borrow().last_error(), None);
         done_tx.send(()).unwrap();
         assert!(!server.await.unwrap(), "the worker started another attempt");
+    }
+
+    /// Design §5.1 / §14 (2026-11-01 review): a Hub that keeps the WebSocket
+    /// but never answers `ping` must not pin the worker. The deadline expires
+    /// as a retryable `Transport` failure and, after the backoff, a second
+    /// connection is made.
+    #[tokio::test]
+    async fn a_missing_pong_times_out_as_transport_and_reconnects() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let (second_tx, second_rx) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let log = HubLog::default();
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &log).await;
+            let mut socket = accept_ws(&listener, &log).await;
+            expect_ping(&mut socket, &log).await;
+            // Read the ping but never answer; keep the socket open.
+            serve_catalog_once(&listener, &empty_catalog(1, Some(7)), &log).await;
+            second_tx.send(()).unwrap();
+            let second = accept_ws(&listener, &log).await;
+            (socket, second)
+        });
+        let backoff = BackoffConfig::new(Duration::from_millis(1), Duration::from_millis(5))
+            .with_pong_timeout(Duration::from_millis(100));
+        let (mut receiver, stop_tx, task) =
+            spawn_worker_with_backoff(address, binding_requests(&[("a", "alpha")]), backoff);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if receiver.borrow().connection_state() == TagClientConnectionState::Reconnecting {
+                    break;
+                }
+                receiver.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("Reconnecting after the pong deadline");
+        assert_eq!(receiver.borrow().last_error(), Some(ErrorKind::Transport));
+        tokio::time::timeout(Duration::from_secs(3), second_rx)
+            .await
+            .expect("second connection attempt")
+            .unwrap();
+        let _sockets = tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .expect("second WS accepted")
+            .unwrap();
+        stop_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_ok());
     }
 
     /// Design §14 / §5.2 scene 9: a close 1008 while waiting for `pong` keeps
