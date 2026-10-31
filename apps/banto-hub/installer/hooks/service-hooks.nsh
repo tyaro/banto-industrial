@@ -8,7 +8,11 @@
 ; NSIS_HOOK_PREUNINSTALL の3つを実装する（NSIS_HOOK_POSTUNINSTALL は
 ; 使わない - アンインストール後に追加でやることが無い。
 ; %ProgramData%\BantoHub\ と profile は意図的に残す、下記「アンインス
-; トール」節参照）。
+; トール」節参照）。フックのほかに、当て直した NSIS テンプレート
+; （src/main.rs の TEMPLATE_PATCHES、#973 PR-3b）が Section WebView2 の先頭・
+; `.onInstFailed`・`File` の直後・Section Uninstall の途中・`un.onUninstFailed`
+; からこのファイルのマクロ（BantoHubInstallPreflight など、下の「フック本体」）
+; を呼ぶ。
 ;
 ; `$INSTDIR` は、tauri-bundler 2.9.4 の installer.nsi テンプレート側で
 ; Section Install / Section Uninstall 内の該当箇所まで展開済みの変数と
@@ -37,22 +41,33 @@
 ; `%ProgramData%` の意味で使う（後述、常に PerMachine 前提のこのインス
 ; トーラでは安全）。
 ;
-; **どのステップが失敗してもインストーラ本体は中断させない** - DetailPrint
-; で案内するだけに留め、必要なら docs/banto-hub-operations.md §12 の手順で
-; 手動対応してもらう（T5-2 以来の一貫した方針）。**例外**は #973 PR-3a で
-; ChronoGazer（#972）にそろえた下の (0) と (4): ファイルを置く前に、置き場が
-; 既定の場所でない・所有者と ACL を既定に戻せないときは、何も変えずに
-; `Abort` する（置いてからでは LocalSystem のサービスの exe を一般の利用者が
-; 差し替えられる状態を作ってしまうため）。
+; **サブコマンド（service-install など）の失敗ではインストーラ本体を中断させない**
+; - DetailPrint で案内するだけに留め、必要なら docs/banto-hub-operations.md §12
+; の手順で手動対応してもらう（T5-2 以来の方針）。**例外**は ChronoGazer（#972）に
+; そろえた次の 5 つで、どれも「置き場・ファイルの状態が壊れたまま成功に見える」
+; のを防ぐためのもの（#973 PR-3a・PR-3b）:
+;   - 事前の確かめ（下の「事前の確かめ」節）: 置き場が既定の場所でない・所有者と
+;     ACL を既定に戻せないときは、何も変えずに `Abort`（置いてからでは LocalSystem
+;     のサービスの exe を一般の利用者が差し替えられる状態を作ってしまうため）。
+;   - サービスが止まり切らない（RequireBantoHubServiceInactive）: 実行ファイルを
+;     入れ替えられないので `Abort`。
+;   - `File` の失敗（RequireBantoHubFilesCopied）: 旧い exe と新しい exe が混ざった
+;     まま POSTINSTALL に進まない。
+;   - アンインストールで exe が使用中（RequireBantoHubExesUnlocked）・消し残った
+;     （RequireBantoHubExesDeleted）: 登録だけ消えて exe が残る状態を作らない。
+;   途中で止めたときに、上書き前に止めたサービスを戻すのは `.onInstFailed`／
+;   `un.onUninstFailed`（下の節）。
 ;
-; ## PREINSTALL（§4.3 表・§7 決定4「自動で停止し、動いていたものだけ再開」）
+; ## 事前の確かめ（BantoHubInstallPreflight、Section WebView2 の先頭）
 ;
-; テンプレート（tauri-bundler 2.9.4 の installer.nsi、当て直しなし）の Section
-; Install は `SetOutPath $INSTDIR` → **このフック** → CheckIfAppIsRunning →
-; `File` の順なので、このフックが「ファイルを変える前」の最後の場所になる。
-; Section WebView2 はこの前に済んでいる（インストール先が駄目でも WebView2 だけ
-; 入ってしまう。ChronoGazer はテンプレートの当て直しで事前の確かめを WebView2 の
-; 前に出した。Hub でそろえるのは PR-3b）。
+; テンプレートの Section は EarlyChecks → WebView2（ランタイムが無ければ取得して
+; 入れる）→ Install（`SetOutPath` → PREINSTALL フック → `File`）の順。当て直し
+; （src/main.rs の P3）が `Section WebView2` の先頭に挿入するこのマクロが、
+; **何も変えずに止められる確かめ**を WebView2 の取得と `SetOutPath`（空の
+; インストール先の作成）より前に済ませる（#973 PR-3a の Codex の指摘 1: 当て直し
+; なしでは確かめが WebView2 の後になり、駄目でも WebView2 だけ入り、空のフォルダが
+; できていた）。ここで `Abort` すると Section WebView2 ごと止まり、Install には
+; 進まない。まだ `$INSTDIR` は作られておらず、サービスもシェルも止めていない。
 ;
 ;   (0) **インストール先の固定**（共通部品 RequireDefaultInstallDir、#973 PR-3a、
 ;       オーナー決定 2026-10-31「基本 Hub と同じで」）: $INSTDIR の本当の置き場
@@ -63,34 +78,69 @@
 ;       が黙ってできてしまう。Program Files の中の一般の利用者が書けるサブフォルダや、
 ;       Program Files の外へのジャンクションも、文字列ではなく実パスで見て断る
 ;       （#972 のオーナーレビュー（2b9ad63・7f86c38・f9d858b））。通れば $INSTDIR を
-;       畳んだ形に揃え、`SetOutPath $INSTDIR` をやり直す（テンプレートの
-;       `SetOutPath` は揃える前の表記で済んでいるため。同じ実体を指す）。
-;       レジストリ（下の MainBinaryName の先読み）もサービスの停止も、この後。
-;       **注記**: 共通部品の中止の案内にある「まだ何も変更していません」は、Hub では
-;       厳密でない（WebView2 の導入と空のインストール先の作成が、テンプレートの
-;       都合でこの前に済み得る。ファイル・レジストリ・サービスは変えていない）。文言は
-;       ChronoGazer と共通なので変えない。確かめをそれらより前に出すのはテンプレートの
-;       当て直しが要るため PR-3b（#973）。
+;       畳んだ形に揃える（テンプレートの `SetOutPath $INSTDIR` はこの後なので、
+;       やり直しは要らない）。
 ;   (1) **インストール先の所有者・ACL の既定への戻し**（共通部品 ResetInstallDirAcl、
 ;       #973 PR-3a）: 管理者が弱い ACL で先に作った `C:\Program Files\BantoHub` が
 ;       残っていると、一般の利用者が LocalSystem のサービスの exe を差し替えられる
 ;       （#972 のオーナーレビュー（2b9ad63））。`icacls /setowner *S-1-5-32-544` と
 ;       `/reset` を、インストール先そのものと直下の普通のファイルだけに /L 付き・
 ;       /T なしで掛ける（再解析ポイント・サブフォルダは `Abort`。このインストーラも
-;       サブフォルダを作らない - resources は `$INSTDIR` 直下）。**サービスとシェルを
-;       止める前、レジストリを触る前に置く**（オーナーのレビュー）: 中止のダイアログを
-;       閉じるまで稼働中のものをそのままにでき、中止で戻すものが無い。使用中の exe でも
-;       所有者・DACL は書き換えられる（WRITE_OWNER・WRITE_DAC は共有モード
-;       FILE_SHARE_* の対象外。実行中イメージの排他は書込み・削除の拒否だけ）。
+;       サブフォルダを作らない - resources は `$INSTDIR` 直下）。**インストール先が
+;       まだ無ければ飛ばす**（新規インストール。`SetOutPath` が Program Files から
+;       既定の ACL を継いで作る）。**サービスとシェルを止める前、レジストリを触る
+;       前に置く**（PR-3a のオーナーのレビュー。PR-3b で WebView2 の前へ）: 中止で
+;       戻すものが無い。使用中の exe でも所有者・DACL は書き換えられる
+;       （WRITE_OWNER・WRITE_DAC は共有モード FILE_SHARE_* の対象外。実行中イメージ
+;       の排他は書込み・削除の拒否だけ）。戻した後は一般の利用者が直下に手を出せない
+;       ので、ここから `File` までの間が空いても穴は開かない。
+;
+; ## PREINSTALL（§4.3 表・§7 決定4「自動で停止し、動いていたものだけ再開」）
+;
+; 当て直したテンプレートの Section Install は `SetOutPath $INSTDIR` → **このフック**
+; → CheckIfAppIsRunning → `ClearErrors` → `File` → RequireBantoHubFilesCopied →
+; POSTINSTALL の順。このフックが「ファイルを変える前」の最後の場所になる。
+;
 ;   (2) alpha.2 の Hub 単体インストーラからの上書きに備えた MainBinaryName の
 ;       先読み（下の節）。
 ;   (3) BantoHubSink が Running なら停止し、$SinkWasRunning に "1" を記録
 ;   (4) BantoHub が Running なら停止し、$BantoHubWasRunning に "1" を記録
-;   (5) banto-hub-shell.exe が動いていれば taskkill で終了する
+;   (5) どちらかが RUNNING／*_PENDING のままなら案内して `Abort`
+;       （RequireBantoHubServiceInactive、#973 PR-3b。ChronoGazer の同名の確かめと
+;       同じ形）。StopServiceIfRunning は 30 秒で止まり切らなくても案内して続行する
+;       ので、そのままだと `File` が使用中で失敗する。自分で止めたサービスなら
+;       さらに最大 60 秒だけ停止の完了を待ち、STOPPED になれば続行する。止まり
+;       切らなければそのサービスのフラグを "0" にして（戻す操作が無い）`Abort`。
+;       もう片方の止めたサービスは `.onInstFailed` が戻す。
+;   (6) banto-hub-shell.exe が動いていれば taskkill で終了する
 ; 新規インストール（サービス未登録、`sc query` が失敗する = 1060 相当）は、
 ; RUNNING の文字列がそもそも見つからないため何も起きず静かに素通りする -
 ; 「見つからない」と「止まっている」を区別する必要はない（どちらも「今回は
 ; 何もしない」で同じ扱いでよい）。
+;
+; テンプレートの `CheckIfAppIsRunning`（フックの直後。シェルが残っていれば案内の後に
+; KillProcess）はそのまま使う（ChronoGazer は「強制終了しない」約束のために
+; 置き換えたが、Hub のシェルには終了を頼む道が無く、(6) の taskkill と同じ方針）。
+;
+; ## ファイルの上書きの結果（RequireBantoHubFilesCopied、#973 PR-3b）
+;
+; 原本のテンプレートは、上書きの `File` が使用中で書けないと中止／再試行／無視の窓を
+; 出し、「無視」はエラーフラグを立てて続行する。フラグは誰も見ず、旧い exe と新しい
+; exe が混ざったまま POSTINSTALL を通って成功と報告される。当て直し（P5）で
+; `AllowSkipFiles off`（「無視」を出さない。silent では中止）、`File` の直前に
+; `ClearErrors`、外部バイナリの `File` の直後にこのマクロを置く: フラグが立って
+; いれば案内して `Abort`（POSTINSTALL には進まない。止めたサービスは `.onInstFailed`
+; が戻す）。各 exe は丸ごと旧いか丸ごと新しいかのどちらかで壊れてはいない。
+;
+; ## .onInstFailed／un.onUninstFailed（RestoreStoppedBantoHubServices、#973 PR-3b）
+;
+; Section Install が `Abort` した・`File` の「使用中」の窓で [中止] されたときに
+; 呼ばれる `.onInstFailed`（原本に無い。当て直し P4 が足す）で、PREINSTALL で止めて
+; まだ戻していないサービス（フラグが "1"）を Hub → Sink の順に `sc start` し、RUNNING
+; まで待つ（共通部品 StartServiceIfStoppedAndWait）。戻せなければ案内するだけ。
+; アンインストールの `Abort`（下の PREUNINSTALL の確かめ）も同じく `un.onUninstFailed`
+; で戻す。戻さないと決めた道（止まり切らなかったサービス、登録を戻せなかった
+; サービス）は、`Abort` の前にフラグを "0" にしておく。
 ;
 ; ## POSTINSTALL（§4.3 表・§7 決定5/6）
 ;
@@ -148,12 +198,37 @@
 ;     利用者の選択に委ねる（設計 §7-3 の補足、§8.2）。PerMachine では
 ;     `SetShellVarContext all` により `$DESKTOP` はパブリックデスクトップ。
 ;
-; ## PREUNINSTALL（§4.3 表・§7 決定7）
+; ## PREUNINSTALL と Section Uninstall の順（§4.3 表・§7 決定7、#973 PR-3b）
 ;
-; シェルを終了し、サイドカー→Hub の順でサービス登録を解除する。
-; `banto-hub-elev.exe` が見つからない壊れたインストールに備えて
-; `banto-hub.exe uninstall`（同等の処理、apps/banto-hub/host/src/bin/
-; banto_hub/win_service.rs 参照）へのフォールバックを持つ。
+; 当て直した Section Uninstall の順: **このフック**（シェルの終了 → Sink → Hub の
+; 停止 → 止まったことの確かめ）→ CheckIfAppIsRunning（テンプレート）→
+; RequireBantoHubExesUnlocked → UnregisterBantoHubServices → `Delete` 4 exe と
+; resources → RequireBantoHubExesDeleted → `uninstall.exe` の `Delete` →
+; ショートカット → Uninstall キーの削除。
+;
+;   (a) **使用中の exe の確かめ**（RequireBantoHubExesUnlocked。P6 の当て直しが
+;       CheckIfAppIsRunning の直後に挿入する）: 4 つの exe のそれぞれを
+;       `FileOpen ... a`（読み書きで開き、中身は変えずすぐ閉じる。無いファイルは
+;       飛ばす）で開けるかを見る。動いている exe はローダーが書込みの共有を許さない
+;       ので開けない。1 つでも開けなければ案内して `Abort`（まだ何も変更していない。
+;       止めたサービスは `un.onUninstFailed` が戻す）。
+;   (b) **サービス登録の解除**（UnregisterBantoHubServices。同じ当て直しが (a) の直後
+;       に挿入する）: サイドカー→Hub の順に解除する。`banto-hub-elev.exe` が
+;       見つからない壊れたインストールに備えて `banto-hub.exe uninstall`（同等の
+;       処理、apps/banto-hub/host/src/bin/banto_hub/win_service.rs 参照）への
+;       フォールバックを持つ。解除の失敗は従来どおり案内するだけで続行する。
+;       PR-3b より前はこのフックの中で解除していた（CheckIfAppIsRunning の前）。
+;   (d) **消えたことの確かめ**（RequireBantoHubExesDeleted。P6 の当て直しが外部
+;       バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
+;       削除の前に挿入する）: exe が残っていれば（再確認の後に起動されたシェル・
+;       ウイルス対策のロック）、`uninstall.exe` と「アプリ」の登録を消す前に止める。
+;       解除したサービスの登録は、残っている exe で頼める分だけ戻す（`banto-hub-elev.exe`
+;       と `banto-hub.exe` が残っていれば `service-install`、`banto-hub-sink.exe` が
+;       残っていれば `install` と `grant-service-acl`。起動種別は手動に戻る）。戻せた
+;       サービスだけ `un.onUninstFailed` が再開する。残った exe 以外は消えているが、
+;       `uninstall.exe` と「アプリ」の登録は残るので、もう一度アンインストールできる
+;       （(a) は無いファイルを飛ばし、(b) は exe が無ければ案内して続行する）。
+;
 ; `%ProgramData%\BantoHub\`（DB・サイドカー設定）とサービスログは
 ; **削除しない**（§4.5「アンインストール」・オーナー決定 §7-7 - 再
 ; インストールで設定・データが戻ることを優先する）。
@@ -163,11 +238,12 @@
 ; サービスの停止・シェルの終了・止めたサービスの再開は、ChronoGazer の
 ; インストーラとも共通の installer-common/service-common.nsh に切り出した
 ; （#392 B3-4、StopServiceIfRunning・TerminateProcessIfRunning・
-; StartServiceIfStopped。ラベルは `${__LINE__}` で一意化）。製品固有の文言は
-; include の前に定数で渡す。`BANTO_INSTALLER_COMMON_DIR`（共通ファイルの
-; ディレクトリの絶対パス）は、このフックを tauri-bundler に渡す前に
-; apps/banto-hub/installer/src/main.rs が先頭へ `!define` する（makensis の
-; 作業ディレクトリは tauri-bundler の出力先で、相対パスは頼れないため）。
+; StartServiceIfStopped・StartServiceIfStoppedAndWait。ラベルは `${__LINE__}`／
+; `${__COUNTER__}` で一意化）。製品固有の文言は include の前に定数で渡す。
+; `BANTO_INSTALLER_COMMON_DIR`（共通ファイルのディレクトリの絶対パス）は、この
+; フックを tauri-bundler に渡す前に apps/banto-hub/installer/src/main.rs が先頭へ
+; `!define` する（makensis の作業ディレクトリは tauri-bundler の出力先で、相対パスは
+; 頼れないため）。
 !define SERVICE_COMMON_LOG_PREFIX "banto-hub"
 !define SERVICE_COMMON_OPS_DOC "docs/banto-hub-operations.md §12"
 !include "${BANTO_INSTALLER_COMMON_DIR}\service-common.nsh"
@@ -180,9 +256,13 @@
 !define INSTALL_DIR_COMMON_PRODUCT "BantoHub"
 !define INSTALL_DIR_COMMON_DEFAULT_DIR "$PROGRAMFILES64\BantoHub"
 !define INSTALL_DIR_COMMON_SERVICE_NOUN "Hub"
-; Hub は ACL の戻しをサービス・シェルを止める前に行うので、中止のときに戻すものが無い。
+; Hub は ACL の戻しをサービス・シェルを止める前（WebView2 の前）に行うので、中止のときに
+; 戻すものが無い。
 !define INSTALL_DIR_COMMON_ACL_ABORT_NOTE ""
 !include "${BANTO_INSTALLER_COMMON_DIR}\install-dir-common.nsh"
+
+; 30 秒で止まり切らなかったサービスの停止完了を、Abort の前にさらに待つ上限（秒）。
+!define BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS 60
 
 Var BantoHubWasRunning
 Var SinkWasRunning
@@ -237,24 +317,226 @@ Var SinkWasRunning
   ${EndIf}
 !macroend
 
+; PREINSTALL (5)／PREUNINSTALL: `service_name` が RUNNING か *_PENDING のままなら止める
+; （上の「PREINSTALL」(5)）。未登録・STOPPED なら素通り。自分で止めた（`flag_var` が
+; "1"）のに 30 秒で止まり切らなかったときは、最大 ${BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS}
+; 秒だけ PENDING が明けるのを待ち、STOPPED になれば続行する（フラグは "1" のまま。
+; 再開は POSTINSTALL／.onInstFailed／un.onUninstFailed）。それ以外（RUNNING のまま =
+; 停止を拒否された、まだ PENDING、頼んでいない）は戻す操作が無いので `flag_var` を
+; "0" にして案内し `Abort`。$0・$1 と $StopWaitCounter（共通部品の変数）を壊す。
+;   `action`: 文言に出す「インストール」／「アンインストール」。
+!macro RequireBantoHubServiceInactive service_name flag_var action
+  nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"RUNNING" >nul'
+  Pop $0
+  ${If} $0 != "0"
+    nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"PENDING" >nul'
+    Pop $0
+  ${EndIf}
+  ${If} $0 == "0"
+    DetailPrint "banto-hub: ${service_name} サービスが止まっていません（RUNNING か PENDING のまま）。"
+    StrCpy $1 "nowait"
+    ${If} ${flag_var} == "1"
+      DetailPrint "banto-hub: 停止の完了を最大 ${BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ちます..."
+      StrCpy $StopWaitCounter 0
+      ${Do}
+        nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"PENDING" >nul'
+        Pop $0
+        ${If} $0 != "0"
+          ${Break}
+        ${EndIf}
+        IntOp $StopWaitCounter $StopWaitCounter + 1
+        ${If} $StopWaitCounter >= ${BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS}
+          ${Break}
+        ${EndIf}
+        Sleep 1000
+      ${Loop}
+      ${If} $0 == "0"
+        StrCpy $1 "pending"
+      ${Else}
+        nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"STOPPED" >nul'
+        Pop $0
+        ${If} $0 == "0"
+          StrCpy $1 "stopped"
+        ${Else}
+          StrCpy $1 "running"
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    ${If} $1 == "stopped"
+      DetailPrint "banto-hub: ${service_name} サービスの停止が完了しました。続行します。"
+    ${Else}
+      StrCpy ${flag_var} "0"
+      DetailPrint "banto-hub: ${service_name} サービスが止まり切らないため（$1）、${action}を中止します。ファイルはまだ変更していません。"
+      MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスがまだ止まっていません（RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ${service_name}）、止まってからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
+      Abort "${service_name} サービスが止まっていないため、${action}を中止しました。"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; `.onInstFailed`／`un.onUninstFailed`（上の節）。止めてまだ戻していないサービス
+; （フラグが "1"）を Hub → Sink の順に戻し、戻せなければ案内する（Abort はできない
+; 場所）。共通部品がフラグを "0" に戻すので 2 回呼ばれても 2 回目は何もしない。
+; $0〜$2 を壊す。
+;   `action`: 文言に出す「インストール」／「アンインストール」。
+!macro RestoreStoppedBantoHubServices action
+  StrCpy $2 ""
+  !insertmacro StartServiceIfStoppedAndWait "BantoHub" $BantoHubWasRunning
+  ${If} $0 != "0"
+    StrCpy $2 "$2 BantoHub ($0)"
+  ${EndIf}
+  !insertmacro StartServiceIfStoppedAndWait "BantoHubSink" $SinkWasRunning
+  ${If} $0 != "0"
+    StrCpy $2 "$2 BantoHubSink ($0)"
+  ${EndIf}
+  ${If} $2 != ""
+    DetailPrint "banto-hub: ${action}の中止の後、止めていたサービスを再開できませんでした（$2）。管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
+    MessageBox MB_OK|MB_ICONEXCLAMATION "${action}を中止しましたが、その前に止めていたサービスを再開できませんでした（$2）。$\r$\n$\r$\nサービスの状態を確かめ（sc query BantoHub、sc query BantoHubSink）、管理者権限の PowerShell から sc start で開始してください。" /SD IDOK
+  ${EndIf}
+!macroend
+
+; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
+; 当て直しが Section Install の `File` の直後に挿入する。直前の `ClearErrors` も
+; 当て直しが置く）。エラーフラグが立っていれば案内して `Abort`。止めたサービスは
+; `.onInstFailed` が戻す（フラグはそのまま）。
+!macro RequireBantoHubFilesCopied
+  ${If} ${Errors}
+    DetailPrint "banto-hub: ファイルの上書きに失敗したものがあります。旧い実行ファイルと新しい実行ファイルが混ざらないよう、インストールを中止します。上書き前に止めたサービスは戻します。"
+    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます。上書き前に止めていたサービス（BantoHub・BantoHubSink）は戻します（各ファイルは丸ごと旧いか丸ごと新しいかのどちらかで、壊れてはいません）。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    Abort "ファイルの上書きに失敗したため、インストールを失敗として終えました。"
+  ${EndIf}
+!macroend
+
+; 使用中の exe の確かめの 1 つ分（上の PREUNINSTALL の (a)）。あって読み書きで
+; 開けなければ $1 に名前を足す。`FileOpen ... a` は無いファイルを作るので、
+; 先に有無を見る。開けたら中身を変えずに閉じる。$0 を壊す。
+!macro CheckBantoHubExeUnlocked exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    ClearErrors
+    FileOpen $0 "$INSTDIR\${exe_name}" a
+    ${If} ${Errors}
+      StrCpy $1 "$1 ${exe_name}"
+    ${Else}
+      FileClose $0
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; P6 (a): 4 つの exe のどれかが使用中なら案内して `Abort`（まだ何も変更していない。
+; 止めたサービスは un.onUninstFailed が戻す。上の PREUNINSTALL の (a)）。$0〜$2 を壊す。
+!macro RequireBantoHubExesUnlocked
+  StrCpy $1 ""
+  !insertmacro CheckBantoHubExeUnlocked "banto-hub-shell.exe"
+  !insertmacro CheckBantoHubExeUnlocked "banto-hub.exe"
+  !insertmacro CheckBantoHubExeUnlocked "banto-hub-elev.exe"
+  !insertmacro CheckBantoHubExeUnlocked "banto-hub-sink.exe"
+  ${If} $1 != ""
+    StrCpy $2 $1
+    DetailPrint "banto-hub: 使用中の実行ファイルがあります（$2）。消せないため、アンインストールを中止します（まだ何も変更していません。止めたサービスは戻します）。"
+    MessageBox MB_OK|MB_ICONSTOP "使用中の実行ファイルがあります（$2）。$\r$\n$\r$\n消せないため、アンインストールを中止しました。まだ何も変更していません（止めたサービスは戻します）。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールしてください。" /SD IDOK
+    Abort "使用中の実行ファイルがあるため、アンインストールを中止しました。"
+  ${EndIf}
+!macroend
+
+; 消えたことの確かめの 1 つ分（上の PREUNINSTALL の (d)）。残っていれば $2 に名前を足す。
+!macro CheckBantoHubExeDeleted exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    StrCpy $2 "$2 ${exe_name}"
+  ${EndIf}
+!macroend
+
+; P6 (d): テンプレートの `Delete` の後に exe が残っていれば、`uninstall.exe` と
+; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。サービスの登録は
+; もう解除されているので、残っている exe で頼める分だけ戻し（結果は $3 に文で集める）、
+; 戻せなかったサービスはフラグを "0" にして un.onUninstFailed に再開させない。
+; $0〜$4 を壊す。
+!macro RequireBantoHubExesDeleted
+  StrCpy $2 ""
+  !insertmacro CheckBantoHubExeDeleted "banto-hub-shell.exe"
+  !insertmacro CheckBantoHubExeDeleted "banto-hub.exe"
+  !insertmacro CheckBantoHubExeDeleted "banto-hub-elev.exe"
+  !insertmacro CheckBantoHubExeDeleted "banto-hub-sink.exe"
+  ${If} $2 != ""
+    DetailPrint "banto-hub: 実行ファイルを消せませんでした（$2）。uninstall.exe と「アプリ」の登録は残したまま、アンインストールを中止します。"
+    StrCpy $3 ""
+    ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
+    ${If} ${FileExists} "$INSTDIR\banto-hub-elev.exe"
+    ${AndIf} ${FileExists} "$INSTDIR\banto-hub.exe"
+      DetailPrint "banto-hub: 解除した BantoHub サービスの登録を banto-hub-elev.exe service-install で戻します..."
+      ClearErrors
+      ExecWait '"$INSTDIR\banto-hub-elev.exe" service-install' $0
+      ${If} ${Errors}
+        StrCpy $0 "exec-error"
+      ${EndIf}
+      ${If} $0 == 0
+        StrCpy $3 "$3 BantoHub: 戻しました。"
+      ${Else}
+        StrCpy $BantoHubWasRunning "0"
+        StrCpy $3 "$3 BantoHub: 戻せませんでした（service-install の終了コード $0）。"
+      ${EndIf}
+    ${Else}
+      StrCpy $BantoHubWasRunning "0"
+      StrCpy $3 "$3 BantoHub: banto-hub-elev.exe か banto-hub.exe が消えているため戻せません。"
+    ${EndIf}
+    ${If} ${FileExists} "$INSTDIR\banto-hub-sink.exe"
+      DetailPrint "banto-hub: 解除した BantoHubSink サービスの登録を banto-hub-sink.exe install で戻します..."
+      ClearErrors
+      ExecWait '"$INSTDIR\banto-hub-sink.exe" install' $0
+      ${If} ${Errors}
+        StrCpy $0 "exec-error"
+      ${EndIf}
+      ${If} $0 == 0
+        ClearErrors
+        ExecWait '"$INSTDIR\banto-hub-sink.exe" grant-service-acl' $4
+        ${If} ${Errors}
+          StrCpy $4 "exec-error"
+        ${EndIf}
+        ${If} $4 == 0
+          StrCpy $3 "$3 BantoHubSink: 戻しました。"
+        ${Else}
+          StrCpy $3 "$3 BantoHubSink: 戻しましたが Operators のサービス ACL は付け直せませんでした（grant-service-acl の終了コード $4）。"
+        ${EndIf}
+      ${Else}
+        StrCpy $SinkWasRunning "0"
+        StrCpy $3 "$3 BantoHubSink: 戻せませんでした（install の終了コード $0）。"
+      ${EndIf}
+    ${Else}
+      StrCpy $SinkWasRunning "0"
+      StrCpy $3 "$3 BantoHubSink: banto-hub-sink.exe が消えているため戻せません。"
+    ${EndIf}
+    DetailPrint "banto-hub: サービスの登録の戻し:$3 戻した登録の起動種別は手動です。戻せなかったものは、このインストーラをもう一度実行して入れ直すと戻ります。"
+    MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2。使用中か、消せませんでした）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残しています。解除していたサービスの登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。戻せた分のうち止めていたサービスは再開します。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールするか、このインストーラをもう一度実行して入れ直してください（サービスの登録も戻ります）。" /SD IDOK
+    Abort "実行ファイルを消せなかったため、アンインストールを中止しました。"
+  ${EndIf}
+!macroend
+
 ; --- フック本体 ---------------------------------------------------------
 
-!macro NSIS_HOOK_PREINSTALL
-  ; (0) インストール先の固定（何も変える前。上の PREINSTALL 節）。通れば $INSTDIR が
-  ; 畳んだ形に揃うので、テンプレートが済ませた SetOutPath をやり直す。
+; 事前の確かめ（上の「事前の確かめ」節）。テンプレートの当て直し P3 が Section
+; WebView2 の先頭に挿入する。
+!macro BantoHubInstallPreflight
+  ; (0) インストール先の固定。通れば $INSTDIR が畳んだ形に揃う（テンプレートの
+  ; SetOutPath はこの後）。
   !insertmacro RequireDefaultInstallDir
-  SetOutPath $INSTDIR
-  ; (1) 所有者・ACL の既定への戻し。サービスもシェルも止める前、レジストリも触る前に
-  ; 置く: 中止（ダイアログの [OK]）まで稼働中のサービスとシェルをそのままにできる。
-  ; 使用中の exe でも所有者・DACL は書き換えられる（WRITE_OWNER・WRITE_DAC は共有
-  ; モードの対象外。実行中イメージの排他は書込み・削除の拒否だけ）。戻した後は一般の
-  ; 利用者が直下に手を出せないので、ここから `File` までの間が空いても穴は開かない。
-  !insertmacro ResetInstallDirAcl
-  ; (2)〜(4)
+  ; (1) 所有者・ACL の既定への戻し。インストール先がまだ無ければ（新規）飛ばす。
+  ${If} ${FileExists} "$INSTDIR\*.*"
+    !insertmacro ResetInstallDirAcl
+  ${EndIf}
+!macroend
+
+!macro NSIS_HOOK_PREINSTALL
+  ; (0)(1) は BantoHubInstallPreflight（Section WebView2 の先頭）で済んでいる。
+  ; (2)〜(6)
   !insertmacro FixupHubOnlyInstallerMainBinaryName
   !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
   !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
+  !insertmacro RequireBantoHubServiceInactive "BantoHubSink" $SinkWasRunning "インストール"
+  !insertmacro RequireBantoHubServiceInactive "BantoHub" $BantoHubWasRunning "インストール"
   !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
+!macroend
+
+; `.onInstFailed`（テンプレートの当て直し P4 が挿入する）。
+!macro BantoHubOnInstFailed
+  !insertmacro RestoreStoppedBantoHubServices "インストール"
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -312,8 +594,19 @@ Var SinkWasRunning
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
+  ; ここではサービスの登録を解除しない。解除は Section Uninstall の CheckIfAppIsRunning
+  ; と使用中の exe の確かめ（P6 (a)）の後、ファイルを消す直前の
+  ; UnregisterBantoHubServices で行う（上の「PREUNINSTALL と Section Uninstall の順」）。
   !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
+  !insertmacro StopServiceIfRunning "BantoHubSink" $SinkWasRunning
+  !insertmacro StopServiceIfRunning "BantoHub" $BantoHubWasRunning
+  !insertmacro RequireBantoHubServiceInactive "BantoHubSink" $SinkWasRunning "アンインストール"
+  !insertmacro RequireBantoHubServiceInactive "BantoHub" $BantoHubWasRunning "アンインストール"
+!macroend
 
+; サービス登録の解除（上の (b)。テンプレートの当て直し P6 が Section Uninstall の
+; 使用中の exe の確かめの直後に挿入する）。失敗は案内するだけで続行する。
+!macro UnregisterBantoHubServices
   DetailPrint "banto-hub: DB Sink サイドカーサービス (BantoHubSink) の登録を解除しています..."
   ExecWait '"$INSTDIR\banto-hub-sink.exe" uninstall' $0
   ${If} $0 != 0
@@ -337,4 +630,9 @@ Var SinkWasRunning
   ; %ProgramData%\BantoHub\（DB・サイドカー設定・サービスログ）は
   ; 意図的に削除しない（§4.5・§7 決定7 - 再インストールで設定・データが
   ; 戻ることを優先する）。完全削除は docs の手順に従い利用者が手動で行う。
+!macroend
+
+; `un.onUninstFailed`（テンプレートの当て直し P4 が挿入する）。
+!macro BantoHubOnUninstFailed
+  !insertmacro RestoreStoppedBantoHubServices "アンインストール"
 !macroend
