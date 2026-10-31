@@ -85,9 +85,11 @@
 ; `..`・`.`・重なった区切りを畳んだ形）に置き換える。後の確かめ（サービスの
 ; ImagePath や InstallLocation との比較）と、テンプレートが書く InstallLocation・
 ; elev が登録する exe のパスが同じ表記になるようにするため。このマクロは事前の
-; 確かめの先頭に置くこと。**`SetOutPath $INSTDIR` の後に呼ぶ側（Hub の PREINSTALL）
-; は、このマクロの後にもう一度 `SetOutPath $INSTDIR` すること**（`File` は $OUTDIR
-; に書く。同じ実体を指すが、表記を揃える）。
+; 確かめの先頭、テンプレートの `SetOutPath $INSTDIR` より前に置くこと（ChronoGazer・
+; Hub とも、当て直しが `Section WebView2` の先頭に挿入する preflight の中。#973 PR-3b
+; で Hub の PREINSTALL から移した）。もし `SetOutPath $INSTDIR` の後に呼ぶ側を作るなら、
+; このマクロの後にもう一度 `SetOutPath $INSTDIR` が要る（`File` は $OUTDIR に書く。
+; 同じ実体を指すが、表記を揃える）。いまはそういう呼び出し側は無い。
 ;
 ; $0〜$2 を壊す（呼び出し側はこの後に自分で入れ直す）。
 !macro RequireDefaultInstallDir

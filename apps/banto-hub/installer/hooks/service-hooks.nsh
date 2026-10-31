@@ -44,7 +44,7 @@
 ; **サブコマンド（service-install など）の失敗ではインストーラ本体を中断させない**
 ; - DetailPrint で案内するだけに留め、必要なら docs/banto-hub-operations.md §12
 ; の手順で手動対応してもらう（T5-2 以来の方針）。**例外**は ChronoGazer（#972）に
-; そろえた次の 5 つで、どれも「置き場・ファイルの状態が壊れたまま成功に見える」
+; そろえた次の 6 つで、どれも「置き場・ファイルの状態が壊れたまま成功に見える」
 ; のを防ぐためのもの（#973 PR-3a・PR-3b）:
 ;   - 事前の確かめ（下の「事前の確かめ」節）: 置き場が既定の場所でない・所有者と
 ;     ACL を既定に戻せないときは、何も変えずに `Abort`（置いてからでは LocalSystem
@@ -55,6 +55,9 @@
 ;     まま POSTINSTALL に進まない。
 ;   - アンインストールで exe が使用中（RequireBantoHubExesUnlocked）・消し残った
 ;     （RequireBantoHubExesDeleted）: 登録だけ消えて exe が残る状態を作らない。
+;   - アンインストールでサービスの登録を解除できない（UnregisterBantoHubServices）:
+;     ファイルを消す前に `Abort` し、登録が残ったまま ImagePath の exe が消える状態を
+;     作らない（#977 の指摘 P2）。
 ;   途中で止めたときに、上書き前に止めたサービスを戻すのは `.onInstFailed`／
 ;   `un.onUninstFailed`（下の節）。
 ;
@@ -213,21 +216,28 @@
 ;       ので開けない。1 つでも開けなければ案内して `Abort`（まだ何も変更していない。
 ;       止めたサービスは `un.onUninstFailed` が戻す）。
 ;   (b) **サービス登録の解除**（UnregisterBantoHubServices。同じ当て直しが (a) の直後
-;       に挿入する）: サイドカー→Hub の順に解除する。`banto-hub-elev.exe` が
-;       見つからない壊れたインストールに備えて `banto-hub.exe uninstall`（同等の
-;       処理、apps/banto-hub/host/src/bin/banto_hub/win_service.rs 参照）への
-;       フォールバックを持つ。解除の失敗は従来どおり案内するだけで続行する。
-;       PR-3b より前はこのフックの中で解除していた（CheckIfAppIsRunning の前）。
+;       に挿入する）: サイドカー→Hub の順に解除する。登録が無ければ飛ばし、登録が
+;       あって頼む exe が無ければ `sc delete`（`banto-hub-elev.exe` が無いだけなら
+;       `banto-hub.exe uninstall`（同等の処理、apps/banto-hub/host/src/bin/banto_hub/
+;       win_service.rs 参照）にフォールバック）。**解除に失敗したらファイルを消さずに
+;       案内して `Abort`**（ChronoGazer と同じ。登録が残ったまま ImagePath の exe が
+;       消えるのを防ぐ）。Sink の解除が通って Hub の解除が失敗したときは、`Abort` の
+;       前に Sink の登録を `install`＋`grant-service-acl` で戻す（(d) と同じ戻し方。
+;       戻せなければ $SinkWasRunning を "0" にして案内）。止めたサービスは
+;       `un.onUninstFailed` が戻す。PR-3b より前はこのフックの中で解除し、失敗は
+;       案内するだけで続行していた（CheckIfAppIsRunning の前）。
 ;   (d) **消えたことの確かめ**（RequireBantoHubExesDeleted。P6 の当て直しが外部
 ;       バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
 ;       削除の前に挿入する）: exe が残っていれば（再確認の後に起動されたシェル・
 ;       ウイルス対策のロック）、`uninstall.exe` と「アプリ」の登録を消す前に止める。
-;       解除したサービスの登録は、残っている exe で頼める分だけ戻す（`banto-hub-elev.exe`
-;       と `banto-hub.exe` が残っていれば `service-install`、`banto-hub-sink.exe` が
-;       残っていれば `install` と `grant-service-acl`。起動種別は手動に戻る）。戻せた
-;       サービスだけ `un.onUninstFailed` が再開する。残った exe 以外は消えているが、
-;       `uninstall.exe` と「アプリ」の登録は残るので、もう一度アンインストールできる
-;       （(a) は無いファイルを飛ばし、(b) は exe が無ければ案内して続行する）。
+;       (b) で解除したサービスの登録は、残っている exe で頼める分だけ戻す
+;       （`banto-hub-elev.exe` と `banto-hub.exe` が残っていれば `service-install`、
+;       `banto-hub-sink.exe` が残っていれば `install` と `grant-service-acl`。起動種別は
+;       手動に戻る。(b) で未登録だったものは戻さない）。戻せたサービスだけ
+;       `un.onUninstFailed` が再開する。残った exe 以外は消えているが、`uninstall.exe`
+;       と「アプリ」の登録は残るので、もう一度アンインストールできる（(a) は無い
+;       ファイルを飛ばし、(b) は登録が無ければ飛ばし、登録があって exe が無ければ
+;       `sc delete` で解除する）。
 ;
 ; `%ProgramData%\BantoHub\`（DB・サイドカー設定）とサービスログは
 ; **削除しない**（§4.5「アンインストール」・オーナー決定 §7-7 - 再
@@ -266,6 +276,10 @@
 
 Var BantoHubWasRunning
 Var SinkWasRunning
+; アンインストールの (b) でこのアンインストーラが登録を解除したら "1"（未登録で飛ばした
+; ときは ""）。(b) の Hub の失敗と (d) の消し残りで、解除した分だけ登録を戻すために見る。
+Var BantoHubUnregistered
+Var SinkUnregistered
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -444,6 +458,76 @@ Var SinkWasRunning
   ${EndIf}
 !macroend
 
+; 解除した BantoHub サービスの登録の戻し（P6 (d) で exe が消し残ったとき。(b) で Hub の
+; 解除に失敗したときは Hub の登録は残っているので使わない）。(b) で解除していなければ
+; （$BantoHubUnregistered が "1" でない = もともと未登録）戻すものは無い。
+; `banto-hub-elev.exe` と `banto-hub.exe` が残っていれば `service-install` で戻す
+; （起動種別は手動に戻る）。結果を $3 に文で足し、戻せなければ $BantoHubWasRunning を
+; "0" にして un.onUninstFailed に再開させない。$0・$3 を壊す。
+!macro RestoreBantoHubServiceRegistration
+  ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
+  ${If} $BantoHubUnregistered != "1"
+    StrCpy $BantoHubWasRunning "0"
+    StrCpy $3 "$3 BantoHub: もともと登録が無かったので戻すものはありません。"
+  ${ElseIf} ${FileExists} "$INSTDIR\banto-hub-elev.exe"
+  ${AndIf} ${FileExists} "$INSTDIR\banto-hub.exe"
+    DetailPrint "banto-hub: 解除した BantoHub サービスの登録を banto-hub-elev.exe service-install で戻します..."
+    ClearErrors
+    ExecWait '"$INSTDIR\banto-hub-elev.exe" service-install' $0
+    ${If} ${Errors}
+      StrCpy $0 "exec-error"
+    ${EndIf}
+    ${If} $0 == 0
+      StrCpy $3 "$3 BantoHub: 戻しました。"
+    ${Else}
+      StrCpy $BantoHubWasRunning "0"
+      StrCpy $3 "$3 BantoHub: 戻せませんでした（service-install の終了コード $0）。"
+    ${EndIf}
+  ${Else}
+    StrCpy $BantoHubWasRunning "0"
+    StrCpy $3 "$3 BantoHub: banto-hub-elev.exe か banto-hub.exe が消えているため戻せません。"
+  ${EndIf}
+!macroend
+
+; 解除した BantoHubSink サービスの登録の戻し（P6 (b) で Sink の解除が通って Hub の解除に
+; 失敗したときと、(d) で exe が消し残ったとき）。(b) で解除していなければ
+; （$SinkUnregistered が "1" でない = もともと未登録）戻すものは無い。
+; `banto-hub-sink.exe` が残っていれば `install` と `grant-service-acl` で戻す（起動種別は
+; 手動に戻る）。結果を $3 に文で足し、戻せなければ $SinkWasRunning を "0" にして
+; un.onUninstFailed に再開させない（ACL だけ付け直せなかったときは登録は戻っているので
+; 再開する）。$0・$3・$4 を壊す。
+!macro RestoreBantoHubSinkServiceRegistration
+  ${If} $SinkUnregistered != "1"
+    StrCpy $SinkWasRunning "0"
+    StrCpy $3 "$3 BantoHubSink: もともと登録が無かったので戻すものはありません。"
+  ${ElseIf} ${FileExists} "$INSTDIR\banto-hub-sink.exe"
+    DetailPrint "banto-hub: 解除した BantoHubSink サービスの登録を banto-hub-sink.exe install で戻します..."
+    ClearErrors
+    ExecWait '"$INSTDIR\banto-hub-sink.exe" install' $0
+    ${If} ${Errors}
+      StrCpy $0 "exec-error"
+    ${EndIf}
+    ${If} $0 == 0
+      ClearErrors
+      ExecWait '"$INSTDIR\banto-hub-sink.exe" grant-service-acl' $4
+      ${If} ${Errors}
+        StrCpy $4 "exec-error"
+      ${EndIf}
+      ${If} $4 == 0
+        StrCpy $3 "$3 BantoHubSink: 戻しました。"
+      ${Else}
+        StrCpy $3 "$3 BantoHubSink: 戻しましたが Operators のサービス ACL は付け直せませんでした（grant-service-acl の終了コード $4）。"
+      ${EndIf}
+    ${Else}
+      StrCpy $SinkWasRunning "0"
+      StrCpy $3 "$3 BantoHubSink: 戻せませんでした（install の終了コード $0）。"
+    ${EndIf}
+  ${Else}
+    StrCpy $SinkWasRunning "0"
+    StrCpy $3 "$3 BantoHubSink: banto-hub-sink.exe が消えているため戻せません。"
+  ${EndIf}
+!macroend
+
 ; P6 (d): テンプレートの `Delete` の後に exe が残っていれば、`uninstall.exe` と
 ; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。サービスの登録は
 ; もう解除されているので、残っている exe で頼める分だけ戻し（結果は $3 に文で集める）、
@@ -458,51 +542,8 @@ Var SinkWasRunning
   ${If} $2 != ""
     DetailPrint "banto-hub: 実行ファイルを消せませんでした（$2）。uninstall.exe と「アプリ」の登録は残したまま、アンインストールを中止します。"
     StrCpy $3 ""
-    ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
-    ${If} ${FileExists} "$INSTDIR\banto-hub-elev.exe"
-    ${AndIf} ${FileExists} "$INSTDIR\banto-hub.exe"
-      DetailPrint "banto-hub: 解除した BantoHub サービスの登録を banto-hub-elev.exe service-install で戻します..."
-      ClearErrors
-      ExecWait '"$INSTDIR\banto-hub-elev.exe" service-install' $0
-      ${If} ${Errors}
-        StrCpy $0 "exec-error"
-      ${EndIf}
-      ${If} $0 == 0
-        StrCpy $3 "$3 BantoHub: 戻しました。"
-      ${Else}
-        StrCpy $BantoHubWasRunning "0"
-        StrCpy $3 "$3 BantoHub: 戻せませんでした（service-install の終了コード $0）。"
-      ${EndIf}
-    ${Else}
-      StrCpy $BantoHubWasRunning "0"
-      StrCpy $3 "$3 BantoHub: banto-hub-elev.exe か banto-hub.exe が消えているため戻せません。"
-    ${EndIf}
-    ${If} ${FileExists} "$INSTDIR\banto-hub-sink.exe"
-      DetailPrint "banto-hub: 解除した BantoHubSink サービスの登録を banto-hub-sink.exe install で戻します..."
-      ClearErrors
-      ExecWait '"$INSTDIR\banto-hub-sink.exe" install' $0
-      ${If} ${Errors}
-        StrCpy $0 "exec-error"
-      ${EndIf}
-      ${If} $0 == 0
-        ClearErrors
-        ExecWait '"$INSTDIR\banto-hub-sink.exe" grant-service-acl' $4
-        ${If} ${Errors}
-          StrCpy $4 "exec-error"
-        ${EndIf}
-        ${If} $4 == 0
-          StrCpy $3 "$3 BantoHubSink: 戻しました。"
-        ${Else}
-          StrCpy $3 "$3 BantoHubSink: 戻しましたが Operators のサービス ACL は付け直せませんでした（grant-service-acl の終了コード $4）。"
-        ${EndIf}
-      ${Else}
-        StrCpy $SinkWasRunning "0"
-        StrCpy $3 "$3 BantoHubSink: 戻せませんでした（install の終了コード $0）。"
-      ${EndIf}
-    ${Else}
-      StrCpy $SinkWasRunning "0"
-      StrCpy $3 "$3 BantoHubSink: banto-hub-sink.exe が消えているため戻せません。"
-    ${EndIf}
+    !insertmacro RestoreBantoHubServiceRegistration
+    !insertmacro RestoreBantoHubSinkServiceRegistration
     DetailPrint "banto-hub: サービスの登録の戻し:$3 戻した登録の起動種別は手動です。戻せなかったものは、このインストーラをもう一度実行して入れ直すと戻ります。"
     MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2。使用中か、消せませんでした）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残しています。解除していたサービスの登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。戻せた分のうち止めていたサービスは再開します。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールするか、このインストーラをもう一度実行して入れ直してください（サービスの登録も戻ります）。" /SD IDOK
     Abort "実行ファイルを消せなかったため、アンインストールを中止しました。"
@@ -605,26 +646,91 @@ Var SinkWasRunning
 !macroend
 
 ; サービス登録の解除（上の (b)。テンプレートの当て直し P6 が Section Uninstall の
-; 使用中の exe の確かめの直後に挿入する）。失敗は案内するだけで続行する。
+; 使用中の exe の確かめの直後・`Delete` の前に挿入する）。ChronoGazer の
+; UnregisterChronoGazerService にそろえ、**解除に失敗したらファイルを消さずに案内して
+; `Abort`** する（登録が残ったまま ImagePath の exe が消えるのを防ぐ。#977 の指摘 P2）。
+; 止めたサービスは `un.onUninstFailed` が戻す。
+;
+; 順は Sink → Hub（サイドカーは Hub に接続する側なので、止める順と同じく先に片付ける。
+; 解除の順に依存は無い）。Sink の解除が通って Hub の解除が失敗したときは、Sink の登録が
+; もう無いので `un.onUninstFailed` が再開できない。`Abort` の前に Sink の登録を
+; RestoreBantoHubSinkServiceRegistration（(d) と同じ `install`＋`grant-service-acl`）で
+; 戻し、戻せなければ $SinkWasRunning を "0" にして案内する。
+;
+; 各サービスは先に登録の有無（ImagePath）を見る。未登録なら解除は要らず飛ばす
+; （インストールの登録が失敗した・利用者が先に解除した。`uninstall`／`service-uninstall`
+; は未登録を終了コード 1 で返すので、先に確かめないとアンインストールできなくなる）。
+; 登録が残っているのに頼む exe が無いとき（elev も banto-hub.exe も無い、または
+; banto-hub-sink.exe が無い）は `sc delete` で解除する: exe はもう無いので「ImagePath の
+; exe が消える」心配は無いが、登録を残して続行すると、インストール先ごと消えた後に
+; 壊れた登録だけが残り、次のインストールの `service-install`（登録済みは作り直さない）が
+; 旧いパスのまま通ってしまう。解除できなければ他と同じく `Abort`。
+; $0〜$4・$BantoHubUnregistered・$SinkUnregistered を壊す。
 !macro UnregisterBantoHubServices
+  StrCpy $BantoHubUnregistered ""
+  StrCpy $SinkUnregistered ""
+
   DetailPrint "banto-hub: DB Sink サイドカーサービス (BantoHubSink) の登録を解除しています..."
-  ExecWait '"$INSTDIR\banto-hub-sink.exe" uninstall' $0
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\BantoHubSink" "ImagePath"
+  ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
+  ClearErrors
+  ${If} $1 == ""
+    DetailPrint "banto-hub: サービス BantoHubSink は登録されていないので、登録の解除は飛ばします。"
+    StrCpy $0 0
+  ${ElseIf} ${FileExists} "$INSTDIR\banto-hub-sink.exe"
+    ExecWait '"$INSTDIR\banto-hub-sink.exe" uninstall' $0
+  ${Else}
+    DetailPrint "banto-hub: banto-hub-sink.exe が見つからないため、sc delete BantoHubSink で登録を解除します..."
+    nsExec::ExecToLog 'sc.exe delete BantoHubSink'
+    Pop $0
+  ${EndIf}
+  ${If} ${Errors}
+    StrCpy $0 "exec-error"
+  ${EndIf}
   ${If} $0 != 0
-    DetailPrint "banto-hub: BantoHubSink の登録解除に失敗しました（終了コード $0）。手動で次を実行してください: $\"$INSTDIR\banto-hub-sink.exe$\" uninstall"
+    StrCpy $2 $0
+    DetailPrint "banto-hub: BantoHubSink の登録解除に失敗しました（終了コード $2）。ファイルは消さずにアンインストールを中止します（まだ何も変更していません。止めたサービスは戻します）。${SERVICE_COMMON_OPS_DOC} の手順で手動対応してください。"
+    MessageBox MB_OK|MB_ICONSTOP "BantoHubSink サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。まだ何も変更していません（止めたサービスは戻します）。$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから（手動で解除するなら管理者権限の PowerShell から $\"$INSTDIR\banto-hub-sink.exe$\" uninstall）、もう一度アンインストールしてください。" /SD IDOK
+    Abort "BantoHubSink サービスの登録解除に失敗したため、アンインストールを中止しました。"
+  ${EndIf}
+  ${If} $1 != ""
+    StrCpy $SinkUnregistered "1"
   ${EndIf}
 
   DetailPrint "banto-hub: Windows サービス (BantoHub) の登録を解除しています..."
-  ${If} ${FileExists} "$INSTDIR\banto-hub-elev.exe"
+  ReadRegStr $1 HKLM "SYSTEM\CurrentControlSet\Services\BantoHub" "ImagePath"
+  ClearErrors
+  ${If} $1 == ""
+    DetailPrint "banto-hub: サービス BantoHub は登録されていないので、登録の解除は飛ばします。"
+    StrCpy $0 0
+  ${ElseIf} ${FileExists} "$INSTDIR\banto-hub-elev.exe"
     ExecWait '"$INSTDIR\banto-hub-elev.exe" service-uninstall' $0
   ${ElseIf} ${FileExists} "$INSTDIR\banto-hub.exe"
+    ; 壊れたインストール（elev が無い）に備えたフォールバック（同等の処理、
+    ; apps/banto-hub/host/src/bin/banto_hub/win_service.rs 参照）。
     DetailPrint "banto-hub: banto-hub-elev.exe が見つからないため banto-hub.exe uninstall にフォールバックします"
     ExecWait '"$INSTDIR\banto-hub.exe" uninstall' $0
   ${Else}
-    DetailPrint "banto-hub: banto-hub-elev.exe も banto-hub.exe も見つからないため、サービス登録解除を手動で行ってください（管理者権限の PowerShell から sc delete BantoHub）"
-    StrCpy $0 0
+    DetailPrint "banto-hub: banto-hub-elev.exe も banto-hub.exe も見つからないため、sc delete BantoHub で登録を解除します..."
+    nsExec::ExecToLog 'sc.exe delete BantoHub'
+    Pop $0
+  ${EndIf}
+  ${If} ${Errors}
+    StrCpy $0 "exec-error"
   ${EndIf}
   ${If} $0 != 0
-    DetailPrint "banto-hub: BantoHub の登録解除に失敗しました（終了コード $0）。docs/banto-hub-operations.md §12 の手順で手動対応してください"
+    StrCpy $2 $0
+    DetailPrint "banto-hub: BantoHub の登録解除に失敗しました（終了コード $2）。ファイルは消さずにアンインストールを中止します。${SERVICE_COMMON_OPS_DOC} の手順で手動対応してください。"
+    ; 先に解除した Sink の登録を戻してから止める（戻せなければ $SinkWasRunning が "0" に
+    ; なり、un.onUninstFailed は Hub だけ再開する）。結果は $3。
+    StrCpy $3 ""
+    !insertmacro RestoreBantoHubSinkServiceRegistration
+    DetailPrint "banto-hub: 先に解除した BantoHubSink の登録の戻し:$3 戻した登録の起動種別は手動です。"
+    MessageBox MB_OK|MB_ICONSTOP "BantoHub サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。先に解除していた BantoHubSink の登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。止めていたサービスは、登録がある分だけ再開します。$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから、もう一度アンインストールしてください。" /SD IDOK
+    Abort "BantoHub サービスの登録解除に失敗したため、アンインストールを中止しました。"
+  ${EndIf}
+  ${If} $1 != ""
+    StrCpy $BantoHubUnregistered "1"
   ${EndIf}
 
   ; %ProgramData%\BantoHub\（DB・サイドカー設定・サービスログ）は

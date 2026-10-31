@@ -125,7 +125,8 @@
 //! 6. P6: Section Uninstall で、テンプレートの `CheckIfAppIsRunning` の直後・
 //!    `Delete` の前にフックの `RequireBantoHubExesUnlocked`（4 つの exe を
 //!    `FileOpen ... a` で開けなければ `Abort`。まだ何も変更していない）と
-//!    `UnregisterBantoHubServices`（PREUNINSTALL から移した登録の解除）、外部
+//!    `UnregisterBantoHubServices`（PREUNINSTALL から移した登録の解除。解除できなければ
+//!    ファイルを消す前に `Abort`）、外部
 //!    バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
 //!    削除の前に `RequireBantoHubExesDeleted`（残っていれば頼める分の登録を戻して
 //!    `Abort`）。
@@ -476,8 +477,8 @@ fn main() -> Result<()> {
                 // （Hub サービス登録 + Operators グループ・ACL 一式）→
                 // `banto-hub-sink.exe install` → `grant-service-acl` →
                 // ProgramData 作成、pre-install でサービス・シェルの停止、
-                // pre-uninstall でサービス登録解除（hooks/service-hooks.nsh
-                // 参照）。
+                // Section Uninstall の途中（P6）でサービス登録解除
+                // （hooks/service-hooks.nsh 参照）。
                 installer_hooks: Some(installer_hooks),
                 template: Some(installer_template),
                 ..Default::default()
