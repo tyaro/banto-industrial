@@ -82,9 +82,12 @@
 ;       （RequireChronoGazerServiceInactive）。StopServiceIfRunning は 30 秒で
 ;       止まらなくても案内だけで続ける（Hub の方針）が、止まっていない exe への
 ;       `File` は NSIS の「使用中」の中止／再試行／無視になり、中止すると
-;       「サービスは止めたまま・ファイルは一部だけ新しい」になる。停止はもう
-;       頼んであるので戻す操作は無く、$ChronoGazerWasRunning を "0" にして
-;       （`.onInstFailed` が `sc start` を試みないように）止める。
+;       「サービスは止めたまま・ファイルは一部だけ新しい」になる。そこでファイルは
+;       替えずに止める。自分で止めたのに止まり切らなかったときは、`Abort` の前に
+;       最大 60 秒だけ停止の完了を待ち、STOPPED になれば再開する（RUNNING に戻って
+;       いれば再開は要らず、まだ PENDING なら戻せなかったと案内する。#972 の
+;       オーナーレビュー（799c643））。どの道でも $ChronoGazerWasRunning は "0" にする
+;       （`.onInstFailed` が `sc start` を二重に試みないように）。
 ;   この後、テンプレートの再確認（P2、同じ QuitShellForUpdate。[キャンセル] は
 ;   止めたサービスを戻してから `Abort`）→ `ClearErrors` → `File` でファイルの
 ;   上書き → **上書きの結果の確かめ**（RequireChronoGazerFilesCopied、P5。
@@ -266,12 +269,15 @@
 ; + 余裕 25 秒。シェル側の予算を変えたらここと設計書 §3.3 も直す。
 !define CHRONOGAZER_SHELL_QUIT_WAIT_SECONDS 90
 !define CHRONOGAZER_SHELL_EXE "chronogazer.exe"
+; 30 秒で止まり切らなかったサービスの停止完了を、Abort の前にさらに待つ上限（秒）。
+!define CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS 60
 ; tauri-bundler の Uninstall キー（`${UNINSTKEY}` と同じ値）。この版は HKLM、旧い
 ; 利用者単位の版は HKCU に同じ名前で書く。
 !define CHRONOGAZER_UNINSTKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\ChronoGazer"
 
 Var ChronoGazerWasRunning
 Var ShellQuitWaitCounter
+Var ServiceStopWaitCounter
 
 ; `chronogazer.exe` のプロセスが 1 つでもあれば $0 = "0"、無ければそれ以外。
 !macro CheckShellProcess
@@ -351,6 +357,13 @@ Var ShellQuitWaitCounter
 
 ; (5): サービス ChronoGazer が RUNNING か *_PENDING（START／STOP／PAUSE／CONTINUE）の
 ; ままなら止める（上の「PREINSTALL」(5)）。未登録・STOPPED なら素通り。
+; 止まっていなくてもファイルは替えない（`Abort`）が、自分で止めた（$ChronoGazerWasRunning
+; が "1"）のに 30 秒で止まり切らなかったときは、Abort の前に最大
+; ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒だけ停止の完了を待ち、STOPPED になれば
+; 再開する（#972 のオーナーレビュー（799c643）: 止まり切った後に誰も戻さず記録が止まる）。
+; RUNNING に戻っていれば再開は要らず、まだ PENDING なら戻せなかったと案内する。
+; どの道でも $ChronoGazerWasRunning は "0" にする（.onInstFailed が再度試みないため）。
+; $0・$1 を壊す（RestartChronoGazerServiceOrWarn と同じ。呼び出しの後ろで使わない）。
 ;   `action`: 文言に出す「インストール」／「アンインストール」。
 !macro RequireChronoGazerServiceInactive action
   nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"RUNNING" >nul'
@@ -360,11 +373,47 @@ Var ShellQuitWaitCounter
     Pop $0
   ${EndIf}
   ${If} $0 == "0"
-    ; 停止はもう頼んである（または頼めない状態）。戻す操作は無いので、
-    ; .onInstFailed が sc start を試みないよう "0" にしてから止める。
-    StrCpy $ChronoGazerWasRunning "0"
     DetailPrint "chronogazer: ChronoGazer サービスが止まっていません（RUNNING か PENDING のまま）。実行ファイルを入れ替えられないため、${action}を中止しました。"
-    MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ChronoGazer）、止まってからもう一度実行してください。" /SD IDOK
+    ${If} $ChronoGazerWasRunning == "1"
+      ; 自分で止めた。停止の完了を待ってから戻す。
+      DetailPrint "chronogazer: 停止の完了を最大 ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ってから、止めたサービスを戻します..."
+      StrCpy $ServiceStopWaitCounter 0
+      ${Do}
+        nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"PENDING" >nul'
+        Pop $0
+        ${If} $0 != "0"
+          ${Break}
+        ${EndIf}
+        IntOp $ServiceStopWaitCounter $ServiceStopWaitCounter + 1
+        ${If} $ServiceStopWaitCounter >= ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS}
+          ${Break}
+        ${EndIf}
+        Sleep 1000
+      ${Loop}
+      ${If} $0 == "0"
+        StrCpy $1 "停止がまだ終わらないため、止めたサービスを戻せませんでした。sc query ChronoGazer で STOPPED になってから、管理者権限の PowerShell から sc start ChronoGazer で開始するか、シェルの「運用モード」で開始してください。"
+      ${Else}
+        nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"STOPPED" >nul'
+        Pop $0
+        ${If} $0 == "0"
+          !insertmacro StartServiceIfStoppedAndWait "ChronoGazer" $ChronoGazerWasRunning
+          ${If} $0 == "0"
+            StrCpy $1 "止まり切ったサービスを再開しました。"
+          ${Else}
+            StrCpy $1 "止まり切ったサービスを再開できませんでした（$0）。sc query ChronoGazer で状態を確かめ、管理者権限の PowerShell から sc start ChronoGazer で開始するか、シェルの「運用モード」で開始してください。"
+          ${EndIf}
+        ${Else}
+          StrCpy $1 "サービスは停止せず、RUNNING のままです（再開は要りません）。"
+        ${EndIf}
+      ${EndIf}
+      DetailPrint "chronogazer: $1"
+      StrCpy $ChronoGazerWasRunning "0"
+      MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままでした）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$\r$\n$\r$\n$1" /SD IDOK
+    ${Else}
+      ; 停止はもう頼んである（または頼めない状態）。戻す操作は無い。
+      StrCpy $ChronoGazerWasRunning "0"
+      MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ChronoGazer）、止まってからもう一度実行してください。" /SD IDOK
+    ${EndIf}
     Abort "ChronoGazer サービスが止まっていないため、${action}を中止しました。"
   ${EndIf}
 !macroend
