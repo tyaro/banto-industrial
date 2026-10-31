@@ -63,7 +63,7 @@ Linux 専用の `.github/workflows/opcua-interop.yml` は Python 3.12 と固定 
 1. 管理者 PowerShell で今の `Environment` をファイルに控え（`(Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub).Environment`）、サービスを止める。
 2. **先に `banto-hub-elev.exe grant-profile-acl <利用者> <試験の profile-id>` を実行する。** 無い profile では戻す相手の記録（`Owners`）が無く、サービスは運用モードにできずに終了コード 4 で止まる（イベント 7024 の「ファイルを開くことができません」は 4 を Win32 のエラーとして読んだ文面）。
 3. `Environment` に `BANTO_HUB_PROFILE=<試験の profile-id>` と `BANTO_ALLOW_SETUP=1` を足して起動する。初回 setup の後に `BANTO_ALLOW_SETUP` を外して起動し直す。以降は手順 4〜6 と、手順 7 の再起動と同じ endpoint・NodeId での再接続の確かめだけを行う。**手順 7 の `Stop-Service` の後の `.\banto-hub.exe uninstall` と VM の破棄、手順 8 は行わない**（`uninstall` は本番と共有のサービスの登録を消すので、次の手順で `Environment` を戻しても本番に戻らない）。試運転モードの間は、loopback から `POST /api/auth/grant/commissioning`（ヘッダ `X-Banto-Client: banto`）で REST を操作できる。
-4. 終わったら、**また途中で setup・起動・確かめに失敗したり中断したりしたときも**、控えた `Environment` をそのまま書き戻して起動する（試験の `BANTO_HUB_PROFILE`・`BANTO_ALLOW_SETUP` が残ったままにしない）。控えはファイルから読み直す（例 `Set-ItemProperty <サービスのキー> -Name Environment -Type MultiString -Value (Get-Content <控えのファイル> -Encoding UTF8)`）。そのうえで、`Environment` の読み戻しと、サービスログで本番の profile の `DB at`・待ち受けを確かめる。試験の profile は残る（消すかは別に決める）。
+4. 終わったら、**また途中で setup・起動・確かめに失敗したり中断したりしたときも**、**先に `Stop-Service BantoHub` でサービスを止め、`Get-Service BantoHub` が `Stopped` なのを確かめてから**（動いたまま書き戻しても、起動中のプロセスは試験の profile を使い続ける）、控えた `Environment` をそのまま書き戻して起動する（試験の `BANTO_HUB_PROFILE`・`BANTO_ALLOW_SETUP` が残ったままにしない）。控えはファイルから読み直す（例 `Set-ItemProperty <サービスのキー> -Name Environment -Type MultiString -Value (Get-Content <控えのファイル> -Encoding UTF8)`）。そのうえで、`Environment` の読み戻しと、サービスログで本番の profile の `DB at`・待ち受けを確かめる。試験の profile は残る（消すかは別に決める）。
 
 ## 手動試験記録
 
