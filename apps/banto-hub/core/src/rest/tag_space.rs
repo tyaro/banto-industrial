@@ -145,9 +145,12 @@ pub(super) fn effective_simulation_for_connection(
 /// [`v1_value_single`]・[`v1_value_read_now`]の run 単位 AllSimulation
 /// ゲートも撤去した - 外部への読み取り出力はシミュレーションで一切
 /// ゲートしない（catalog は元々ゲート対象外だった）。
+///
+/// `map` と `revision` は [`CollectorManager::catalog_with_revision`] で 1 回の
+/// lock から読む（#682 PR-H）- 別々に読むと commit を挟んで（旧 map, 新
+/// revision）の応答になりうる。
 pub(super) fn build_catalog_response(state: &TagSpaceState, query: &TagsQuery) -> CatalogResponse {
-    let map = state.manager.tag_map();
-    let revision = state.manager.revision();
+    let (map, revision) = state.manager.catalog_with_revision();
     let runtime = state.controller.status();
     let tags: Vec<CatalogTagEntry> = map
         .iter()
@@ -323,7 +326,8 @@ async fn v1_values(
     Query(query): Query<ValuesQuery>,
     ctx: Option<Extension<ApiKeyContext>>,
 ) -> Response {
-    let map = state.manager.tag_map();
+    // #682 PR-H: 応答の `revision` は `map` と同じ lock の読みから取る。
+    let (map, revision) = state.manager.catalog_with_revision();
     let runtime = state.controller.status();
 
     let names = match resolve_value_names(&map, &query) {
@@ -355,7 +359,10 @@ async fn v1_values(
         names
     };
 
-    Json(build_values_response(&state, &map, &runtime, names)).into_response()
+    Json(build_values_response(
+        &state, &map, revision, &runtime, names,
+    ))
+    .into_response()
 }
 
 /// `GET /api/v1/values`・管理系`GET /api/values`([`admin_values`])が共有
@@ -400,10 +407,14 @@ pub(super) fn resolve_value_names(
 /// `map`/`runtime`は呼び出し元がAPIキーのper-tagスコープ絞り込み等を終えた
 /// 後の値を渡す想定（1リクエスト内で複数回`tag_map()`/`controller.status()`
 /// を呼んで状態がずれるのを避けるため、呼び出し元で1回だけ取得したものを
-/// 共有する）。
+/// 共有する）。`revision` は `map` と同じ
+/// [`CollectorManager::catalog_with_revision`] の読みから渡す（#682 PR-H。
+/// ここで別に `revision()` を読むと、commit を挟んで（旧 map, 新 revision）の
+/// 応答になりうる）。
 pub(super) fn build_values_response(
     state: &TagSpaceState,
     map: &TagMap,
+    revision: u64,
     runtime: &CollectionStatus,
     names: Vec<String>,
 ) -> ValuesResponse {
@@ -429,7 +440,7 @@ pub(super) fn build_values_response(
         .collect();
 
     ValuesResponse {
-        revision: state.manager.revision(),
+        revision,
         t: now_ms,
         run_id: runtime.run_id,
         collection_mode: runtime.mode.as_str().to_string(),

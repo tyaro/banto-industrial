@@ -1969,6 +1969,19 @@ impl CollectorManager {
             .clone()
     }
 
+    /// 今の catalog（`map`）とその `revision` を、`inner` の lock を 1 回だけ
+    /// 取って同時に返す（#682 PR-H）。
+    ///
+    /// [`Self::commit_catalog`] は map と revision を同じ lock の中で更新するので、
+    /// [`Self::tag_map`] と [`Self::revision`] を別々に読むと、その間に commit が
+    /// 挟まって（旧 map, 新 revision）の「裂けた読み」になりうる。応答に
+    /// `revision` を載せる REST・gRPC の catalog / values 応答は必ずこれで読む
+    /// （`crate::rest::build_catalog_response` / `build_values_response`、gRPC の `get_catalog` / `read_values`）。
+    pub fn catalog_with_revision(&self) -> (Arc<TagMap>, u64) {
+        let inner = self.inner.lock().expect("hub state lock poisoned");
+        (inner.map.clone(), inner.revision)
+    }
+
     /// Snapshot the applied registry, not an in-flight database edit. This
     /// keeps the diagnostic tag set aligned with the broker's catalog.
     pub(crate) fn diagnostic_registry_snapshot(&self) -> (u64, RegistrySnapshot) {

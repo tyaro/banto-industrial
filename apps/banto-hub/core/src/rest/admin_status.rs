@@ -492,7 +492,8 @@ async fn admin_values(
     State(state): State<TagSpaceState>,
     Query(query): Query<ValuesQuery>,
 ) -> Response {
-    let map = state.manager.tag_map();
+    // #682 PR-H: 応答の `revision` は `map` と同じ lock の読みから取る。
+    let (map, revision) = state.manager.catalog_with_revision();
     let runtime = state.controller.status();
 
     let names = match resolve_value_names(&map, &query) {
@@ -507,7 +508,7 @@ async fn admin_values(
     };
 
     Json(AdminValuesResponse::from(build_values_response(
-        &state, &map, &runtime, names,
+        &state, &map, revision, &runtime, names,
     )))
     .into_response()
 }

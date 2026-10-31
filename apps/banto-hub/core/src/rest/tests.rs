@@ -1,6 +1,7 @@
 mod api_keys;
 mod audit_retention;
 mod cascade_delete;
+mod catalog_revision;
 mod commissioning;
 mod common;
 mod general;

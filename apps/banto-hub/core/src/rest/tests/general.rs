@@ -930,7 +930,7 @@ async fn registry_writes_reject_a_new_external_name_collision() {
 
 /// A plain `modbus-tcp` connection input at `127.0.0.1:port` for the services without a
 /// registry (R2b-6b: the REST payload no longer has the flat fields).
-fn modbus_flat_input(name: &str, port: i64) -> banto_tags::PlcConnectionInput {
+pub(super) fn modbus_flat_input(name: &str, port: i64) -> banto_tags::PlcConnectionInput {
     banto_tags::PlcConnectionInput {
         name: name.to_string(),
         protocol: "modbus-tcp".to_string(),
