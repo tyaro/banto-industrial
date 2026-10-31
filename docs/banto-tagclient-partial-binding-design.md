@@ -259,7 +259,7 @@ stateDiagram-v2
 requests が空            → InvalidTagSelection（現状どおり、start() で先に落ちる）
 catalog = fetch_catalog() (stop 割り込み可)
 resolution = resolve_bindings(requests, catalog.tags)?   // 重複は Err → terminal
-generation = generation_counter.fetch_add(1) + 1          // handle の Arc<AtomicU64>（§6 R2）
+generation = GENERATION.fetch_add(1) + 1                  // プロセス全体で 1 つの static AtomicU64（§6 R2）
 if mode == Connecting: publish Handshaking               // 現状どおり（L383〜L385）。Rebinding モードでは Rebinding のまま
 connection = connect_stream() (stop 割り込み可)           // 401/403 → Unauthorized、transport → Reconnecting は現状どおり
 if resolution.resolved が空:
@@ -403,12 +403,15 @@ revision を同時に更新し、lock を離してから `revision_tx.send`）�
 - **R1（同一世代）**: `GenerationSnapshot` の `catalog`・`resolution`・`values` は同じ試行で得たもの。
   `values` があるとき `values.revision == catalog.revision`、`values.run_id == catalog.run_id`、
   `values.collection_mode == catalog.collection_mode`（`PublishGate::finalize` が既に保証）。
-- **R2（generation の単調増加）**: 同じ `TagClientHandle` の `state_watch` で観測される `generation`
-  は単調に増える。`restart` で返る新 handle は **1 から数え直さず、旧 handle の値を引き継ぐ**
-  （利用者が旧 handle の値と比べられるように）。**置き場は 1 つ**: `TagClientHandle` が
-  `generation: Arc<AtomicU64>` を持ち、`spawn` / `restart` が worker（`run_supervisor_with_config`）に
-  引数で渡す。worker は catalog を取れた試行ごとに `fetch_add(1)` する。gate で失敗した試行でも進むので、
-  利用者が観測する値は「+1」ではなく「前より大きい」だけが保証される。
+- **R2（generation の一意性と単調増加）**: `generation` は**プロセス全体で一意**で、同じ
+  `state_watch` で観測される値は単調に増える。**置き場は 1 つ**: `worker.rs` の
+  `static GENERATION: AtomicU64`。worker は catalog を取れた試行ごとに `fetch_add(1)` する。
+  `restart` でも、要求集合を入れ替える `shutdown()` → `start(new_requests)`（§0）でも、別の
+  Project の handle でも番号は衝突しないので、利用者は `generation` だけをタグ別キャッシュの鍵にしてよい
+  （2026-10-31 設計判断。当初は handle ごとの `Arc<AtomicU64>` を `restart` で引き継ぐ案だったが、
+  新規 `start` で 1 から数え直して旧 handle と衝突する、とのオーナーの Codex CLI の指摘で改めた）。
+  gate で失敗した試行や他の handle の試行でも進むので、利用者が観測する値は「+1」ではなく
+  「前より大きい」だけが保証される。
 - **R3（旧世代の値を混ぜない）**: `Live` 以外へ遷移したとき `snapshot` は `None`（`Unbound` だけは
   `values: None` の snapshot を持つ）。`config_changed` → `Rebinding` の瞬間に旧 `values` は消える。
   Hub 再起動は切断 → `Reconnecting` で消え、再接続は catalog から取り直す。`run_id` が変わった
@@ -581,15 +584,15 @@ PR-2 より前なら従来の `BindingUnresolved` → 再試行で直る）。PR
 - 範囲: `types.rs` に `GenerationSnapshot` / `BindingView` / `TagClientState::snapshot()`。
   `TagClientState` の内部を `current: Option<ValuesSnapshot>` → `snapshot: Option<Arc<GenerationSnapshot>>`
   に置き換え、`current()` は別名として残す。`worker.rs` の `publish_snapshot` が catalog と
-  resolution を `Arc` にして載せる。`generation` カウンタは `TagClientHandle` の `Arc<AtomicU64>` に置き、
-  `spawn` / `restart` が `run_supervisor_with_config` に引数で渡す（R2）。`binding.rs` の
+  resolution を `Arc` にして載せる。`generation` カウンタは `worker.rs` の `static GENERATION: AtomicU64`
+  （プロセス全体で 1 つ、R2）。`binding.rs` の
   `UnresolvedBinding.reason` と `UnresolvedReason`。
   `lib.rs` の re-export と冒頭 doc。
 - **振る舞いは変えない**: `unresolved` が 1 件でもあれば `BindingUnresolved`（L374）のまま。
   `Unbound` は足さない。
 - 完了条件: 既存テスト全緑。新規テスト = R1（`values` と `catalog` の 3 つの metadata が一致）、
   R2（`config_changed` 再 bind で `generation` が単調に増える（gate で失敗した試行でも進むので +1 以上）、
-  `restart` 後も続く）、R3（`Rebinding` /
+  `restart` 後も、`shutdown()` → 新規 `start()` 後も前の値より大きい）、R3（`Rebinding` /
   `Reconnecting` / `Unauthorized` / `Stopped` で `snapshot() == None`）、R4（`binding(key)` が
   `Live` で `value: Some`）、R6（`TagClientState::clone` 後に `Arc::ptr_eq`）。
   `all_public_states_and_non_live_transitions_clear_current`（`stream_core.rs` L715）を snapshot にも広げる。
