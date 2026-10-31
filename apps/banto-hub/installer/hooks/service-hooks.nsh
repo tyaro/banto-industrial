@@ -57,7 +57,9 @@
 ;     （RequireBantoHubExesDeleted）: 登録だけ消えて exe が残る状態を作らない。
 ;   - アンインストールでサービスの登録を解除できない（UnregisterBantoHubServices）:
 ;     ファイルを消す前に `Abort` し、登録が残ったまま ImagePath の exe が消える状態を
-;     作らない（#977 の指摘 P2）。
+;     作らない（#977 の指摘 P2）。解除が 0 で返っても削除の印だけ付いて登録が残る
+;     「削除の保留」（`DeleteFlag`=1）も同じ扱い（RequireBantoHubServiceDeleteNotPending。
+;     保留の登録は戻しも再開もしない）。
 ;   途中で止めるときは、各中止の道が案内の `MessageBox` と `Abort` より前に、上書き前に
 ;   止めたサービスを戻す（RestoreStoppedBantoHubServices、下の節）。フックが割り込め
 ;   ない 2 つの道だけ `.onInstFailed`／`un.onUninstFailed` が戻す。
@@ -236,8 +238,11 @@
 ;       消えるのを防ぐ）。Sink の解除が通って Hub の解除が失敗したときは、`Abort` の
 ;       前に Sink の登録を `install`＋`grant-service-acl` で戻す（(d) と同じ戻し方。
 ;       戻せなければ $SinkWasRunning を "0" にして案内）。どちらの失敗も、止めたサービス
-;       （登録がある分）を戻してから案内する。PR-3b より前はこのフックの中で解除し、失敗は
-;       案内するだけで続行していた（CheckIfAppIsRunning の前）。
+;       （登録がある分）を戻してから案内する。解除が 0 で返った直後には `DeleteFlag` を
+;       見て、別のプロセスがハンドルを持っていて削除が保留になっていれば、同じく
+;       ファイルを消さずに `Abort`（そのサービスは戻しも再開もできないのでフラグを "0"
+;       に。Hub が保留なら消えた Sink の登録だけ戻す）。PR-3b より前はこのフックの中で
+;       解除し、失敗は案内するだけで続行していた（CheckIfAppIsRunning の前）。
 ;   (d) **消えたことの確かめ**（RequireBantoHubExesDeleted。P6 の当て直しが外部
 ;       バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
 ;       削除の前に挿入する）: exe が残っていれば（再確認の後に起動されたシェル・
@@ -359,7 +364,10 @@ Var RestoreSaved3
 ; 秒だけ PENDING が明けるのを待ち、STOPPED になれば続行する（フラグは "1" のまま。
 ; 再開は POSTINSTALL か中止の道）。それ以外（RUNNING のまま = 停止を拒否された、まだ
 ; PENDING、頼んでいない）は戻す操作が無いので `flag_var` を "0" にし、もう片方の止めた
-; サービスを戻してから（RestoreStoppedBantoHubServices）案内し `Abort`。$0・$1 と
+; サービスを戻してから（RestoreStoppedBantoHubServices）案内し `Abort`。案内の文言は
+; $1（"pending"＝自分で止めたが止まり切らない／"running"＝停止を拒まれた／"nowait"＝
+; 頼んでいないのに動いている）で分け、"pending" は止まり切った後の `sc start` まで
+; 案内する（もう一度実行しても再開しないため）。$0・$1 と
 ; $StopWaitCounter（共通部品の変数）・$ServiceRestoreNote・$ServiceRestoreFailed を壊す。
 ;   `action`: 文言に出す「インストール」／「アンインストール」。
 !macro RequireBantoHubServiceInactive service_name flag_var action
@@ -405,7 +413,16 @@ Var RestoreSaved3
       StrCpy ${flag_var} "0"
       DetailPrint "banto-hub: ${service_name} サービスが止まり切らないため（$1）、${action}を中止します。ファイルはまだ変更していません。"
       !insertmacro RestoreStoppedBantoHubServices
-      MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスがまだ止まっていません（RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$ServiceRestoreNote$\r$\n$\r$\nサービスの状態を確かめ（sc query ${service_name}）、止まってからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
+      ; 文言は $1 で分ける（ChronoGazer の同名の確かめと同じ分け方）。"pending" はこの
+      ; インストーラが止めたサービスなので、止まり切った後の開始まで案内する（フラグは
+      ; "0" にしたので、もう一度実行しても再開しない）。
+      ${If} $1 == "pending"
+        MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスはこのインストーラが止めましたが、まだ止まり切っていません（停止を頼んで、さらに ${BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ちましたが、PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$ServiceRestoreNote$\r$\n$\r$\nsc query ${service_name} で STOPPED になってから、管理者権限の PowerShell から sc start ${service_name} で開始してください（${SERVICE_COMMON_OPS_DOC}）。このインストーラをもう一度実行しても、止まっているサービスは再開しません。" /SD IDOK
+      ${ElseIf} $1 == "running"
+        MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスが停止の要求を受け付けず、RUNNING のままです。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスは動いたままです。$ServiceRestoreNote$\r$\n$\r$\nサービスの状態を確かめ（sc query ${service_name}）、止めてからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
+      ${Else}
+        MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスがまだ止まっていません（RUNNING か PENDING のままです。このインストーラは停止を頼んでいません）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$ServiceRestoreNote$\r$\n$\r$\nサービスの状態を確かめ（sc query ${service_name}）、止まってからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
+      ${EndIf}
       Abort "${service_name} サービスが止まっていないため、${action}を中止しました。"
     ${EndIf}
   ${EndIf}
@@ -732,8 +749,50 @@ Var RestoreSaved3
 ; exe が消える」心配は無いが、登録を残して続行すると、インストール先ごと消えた後に
 ; 壊れた登録だけが残り、次のインストールの `service-install`（登録済みは作り直さない）が
 ; 旧いパスのまま通ってしまう。解除できなければ他と同じく `Abort`。
+; 解除が 0 で返っても登録が消えたとは限らない（下の RequireBantoHubServiceDeleteNotPending）。
 ; $0〜$4・$BantoHubUnregistered・$SinkUnregistered・$ServiceRestoreNote・
 ; $ServiceRestoreFailed を壊す。
+
+; 削除の保留の確かめ（UnregisterBantoHubServices の各解除が 0 で返った直後。未登録で
+; 飛ばしたときは呼ばない）。DeleteService は他のプロセス（サービスの管理画面・
+; `sc query` を開いたままのツールなど）がそのサービスのハンドルを持っていると、登録に
+; 「削除の印」を付けて成功を返す。印付きの登録は `HKLM\SYSTEM\CurrentControlSet\
+; Services\<名前>` に `DeleteFlag`=1 で残り、起動できず（1072）、ハンドルが全部閉じた
+; ときに消える。終了コードだけを見てファイルを消すと、登録が残ったまま ImagePath の
+; exe が消え、再インストールの `service-install` が印付きを「登録済み」として通して
+; 後からサービスだけ消える。そこで `DeleteFlag` を `ReadRegDWORD` で読む（キーごと
+; 消えていればエラーフラグが立つ = 消えた。値が 1 なら保留。ImagePath の有無では、
+; 消える前の一瞬の残りと保留を区別できないので DeleteFlag を使う）。
+; 保留なら**登録の戻しも再開も試みない**（戻しの `install`／`service-install` は
+; 「登録済み」で素通りし、`sc start` は 1072 で失敗する）: そのサービスの `flag_var` を
+; "0" にし、`restore_sink` が 1（Hub の解除の後）なら先に解除した Sink の登録を
+; RestoreBantoHubSinkServiceRegistration で戻し（結果は $3。Sink が保留のときは Hub を
+; まだ解除していないので戻すものは無く、Hub だけ再開する）、止めたサービスを戻して
+; から案内して `Abort`。もう一度アンインストールすると、消えた登録は未登録として
+; 飛ばすので先へ進める。$3・$4・$ServiceRestoreNote・$ServiceRestoreFailed を壊す
+; （`restore_sink` が 1 のときは $0 も）。
+!macro RequireBantoHubServiceDeleteNotPending service_name flag_var restore_sink
+  ClearErrors
+  ReadRegDWORD $4 HKLM "SYSTEM\CurrentControlSet\Services\${service_name}" "DeleteFlag"
+  ${If} ${Errors}
+    ; キーごと消えた（または DeleteFlag が無い）= 保留ではない。
+    ClearErrors
+  ${ElseIf} $4 == 1
+    StrCpy ${flag_var} "0"
+    DetailPrint "banto-hub: ${service_name} の登録の削除が保留中です（別のプロセスがサービスを開いたままです）。登録の戻しと再開はせず、ファイルは消さずにアンインストールを中止します。"
+    StrCpy $3 ""
+    !if "${restore_sink}" == "1"
+      ; 先に解除した Sink の登録を戻す（戻せなければ $SinkWasRunning が "0" になり再開しない）。
+      !insertmacro RestoreBantoHubSinkServiceRegistration
+      DetailPrint "banto-hub: 先に解除した BantoHubSink の登録の戻し:$3 戻した登録の起動種別は手動です。"
+      StrCpy $3 "先に解除していた BantoHubSink の登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。"
+    !endif
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスの登録の削除が保留中です（サービスの管理画面などの別のツールがサービスを開いたままです）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。保留中の登録は戻しも再開もしていません。$3$ServiceRestoreNote$\r$\n$\r$\n開いているツールを閉じるか、Windows を再起動してから、もう一度アンインストールしてください（もう一度実行すると、消えた登録は飛ばします）。" /SD IDOK
+    Abort "${service_name} サービスの登録の削除が保留中のため、アンインストールを中止しました。"
+  ${EndIf}
+!macroend
+
 !macro UnregisterBantoHubServices
   StrCpy $BantoHubUnregistered ""
   StrCpy $SinkUnregistered ""
@@ -763,6 +822,9 @@ Var RestoreSaved3
     Abort "BantoHubSink サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
   ${If} $1 != ""
+    ; 0 で返っても削除の印だけ付いて登録が残ることがある。保留なら Hub はまだ解除して
+    ; いないので、戻す登録は無く Hub だけ再開して止める。
+    !insertmacro RequireBantoHubServiceDeleteNotPending "BantoHubSink" $SinkWasRunning 0
     StrCpy $SinkUnregistered "1"
   ${EndIf}
 
@@ -801,6 +863,8 @@ Var RestoreSaved3
     Abort "BantoHub サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
   ${If} $1 != ""
+    ; 保留なら、先に解除した Sink の登録を戻してから（Sink が消えていれば）止める。
+    !insertmacro RequireBantoHubServiceDeleteNotPending "BantoHub" $BantoHubWasRunning 1
     StrCpy $BantoHubUnregistered "1"
   ${EndIf}
 
