@@ -267,7 +267,7 @@ pub struct HubValueView {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HubSubscriptionView {
-    /// `stopped|connecting|handshaking|live|rebinding|reconnecting|unauthorized`
+    /// `stopped|connecting|handshaking|live|rebinding|unbound|reconnecting|unauthorized`
     /// （[`TagClientConnectionState`] の `Display` と同じ綴り）。
     pub state: &'static str,
     /// 停止している理由（タグ未選択 / キーリング不可 / 未接続など）。

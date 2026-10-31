@@ -80,7 +80,14 @@ export interface HubView {
 
 /** `banto_tagclient::TagClientConnectionState` の綴りそのまま。 */
 export type HubSubscriptionState =
-	'stopped' | 'connecting' | 'handshaking' | 'live' | 'rebinding' | 'reconnecting' | 'unauthorized';
+	| 'stopped'
+	| 'connecting'
+	| 'handshaking'
+	| 'live'
+	| 'rebinding'
+	| 'unbound'
+	| 'reconnecting'
+	| 'unauthorized';
 
 /** Mirrors `chronogazer_core::hub::HubValueView`. */
 export interface HubValue {
@@ -1445,7 +1452,7 @@ export function hubSubscriptionLabel(state: HubSubscriptionState): string {
  * 件数を理由にしない。
  *
  * 同じ理由で、**「購読しています」と言い切れるのは `live` のときだけ**。
- * `connecting`/`handshaking`/`rebinding`/`reconnecting` は値を受けていない
+ * `connecting`/`handshaking`/`rebinding`/`unbound`/`reconnecting` は値を受けていない
  * （`values` も空）進行中の状態なので、件数に触れるときも「購読しようと
  * しています」と、**まだ受信していないことが分かる**言い方にする。
  */

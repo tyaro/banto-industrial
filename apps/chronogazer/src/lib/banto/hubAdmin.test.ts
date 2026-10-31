@@ -156,6 +156,7 @@ const ALL_SUBSCRIPTION_STATES: HubSubscriptionState[] = [
 	'handshaking',
 	'live',
 	'rebinding',
+	'unbound',
 	'reconnecting',
 	'unauthorized'
 ];
@@ -176,7 +177,7 @@ function subscription(overrides: Partial<HubSubscription> = {}): HubSubscription
 }
 
 describe('hubSubscriptionLabel', () => {
-	it('7状態すべてに空でない文言が付く', () => {
+	it('8状態すべてに空でない文言が付く', () => {
 		for (const state of ALL_SUBSCRIPTION_STATES) {
 			expect(hubSubscriptionLabel(state).length).toBeGreaterThan(0);
 		}
@@ -192,6 +193,7 @@ describe('hubSubscriptionLabel', () => {
 		expect(hubSubscriptionLabel('live')).toBe('受信中');
 		expect(hubSubscriptionLabel('reconnecting')).toBe('再接続中');
 		expect(hubSubscriptionLabel('rebinding')).toBe('再バインド中');
+		expect(hubSubscriptionLabel('unbound')).toBe('タグ待ち');
 		expect(hubSubscriptionLabel('unauthorized')).toBe('認証エラー');
 		expect(hubSubscriptionLabel('stopped')).toBe('停止');
 	});
@@ -221,7 +223,13 @@ describe('hubSubscriptionDetail', () => {
 	it('進行中の状態では「購読しています」と言い切らない（まだ受信していない）', () => {
 		// これらの状態では `current()` が値を返さない＝実際には受信していない。
 		// 「N件のタグを購読しています」と出すと状態ラベルと矛盾する。
-		for (const state of ['connecting', 'handshaking', 'rebinding', 'reconnecting'] as const) {
+		for (const state of [
+			'connecting',
+			'handshaking',
+			'rebinding',
+			'unbound',
+			'reconnecting'
+		] as const) {
 			const detail = hubSubscriptionDetail(subscription({ state, subscribedCount: 3 }));
 			expect(detail, state).not.toContain('購読しています');
 			expect(detail.length, state).toBeGreaterThan(0);
@@ -230,7 +238,7 @@ describe('hubSubscriptionDetail', () => {
 
 	it('進行中の状態の説明は互いに潰れない', () => {
 		const details = (
-			['live', 'connecting', 'handshaking', 'rebinding', 'reconnecting'] as const
+			['live', 'connecting', 'handshaking', 'rebinding', 'unbound', 'reconnecting'] as const
 		).map((state) => hubSubscriptionDetail(subscription({ state })));
 		// connecting と handshaking は見出しと同じく意図的に同じ説明。
 		expect(details[1]).toBe(details[2]);
@@ -996,6 +1004,7 @@ describe('hubLastValueLabel / hubTimeLabel', () => {
 			'connecting',
 			'handshaking',
 			'rebinding',
+			'unbound',
 			'reconnecting',
 			'unauthorized'
 		] as const) {
