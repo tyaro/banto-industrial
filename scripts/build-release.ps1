@@ -46,6 +46,12 @@ if (-not $Version) {
 if (-not $OutDir) {
     $OutDir = Join-Path $repoRoot "dist\$Version"
 }
+# 後段の [System.IO.File]::WriteAllText はプロセスの作業フォルダ基準で相対パスを解決し、
+# PowerShell の現在の場所（Copy-Item・Get-FileHash の基準）とずれることがある。
+# $OutDir の相対指定は呼び出し元の現在の場所の基準で絶対にする。
+if (-not [System.IO.Path]::IsPathRooted($OutDir)) {
+    $OutDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $OutDir))
+}
 $releaseDir = Join-Path $repoRoot 'target\release'
 Write-Host "banto-hub リリースビルド version=$Version OutDir=$OutDir"
 
