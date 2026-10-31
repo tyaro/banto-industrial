@@ -2,16 +2,35 @@
 
 banto-industrial のリリースノート。日付は JST。バージョンは [SemVer](https://semver.org/lang/ja/) 準拠（`publish = false` のワークスペースで、タグはリポジトリ状態の目印）。
 
-## v0.3.0-alpha.1 — 2026-10-25（アルファ、公開前）
+## v0.3.0-alpha.1 — 2026-11-01（アルファ）
 
-R2b-7（#827・#828・#829・#830・#842 と文書・版の更新）。接続の保存と公開 API をドライバの `settings` に揃えました。**旧い平らな接続入力とは互換性がありません。** 設定パッケージは `schemaVersion: 3` のままで、DB マイグレーションもありません。ChronoGazer 自身の版は 0.1.0 のままです。実機確認、タグ作成、リリース公開は未実施です。
+R2b-7（#827・#828・#829・#830・#842 と文書・版の更新）。接続の保存と公開 API をドライバの `settings` に揃えました。**旧い平らな接続入力とは互換性がありません。** 設定パッケージは `schemaVersion: 3` のままです。DB マイグレーションは 0108（API キーの削除）・0109（書込み監査の「拒否」）が加わります。ChronoGazer 自身の版は 0.1.0 のままです。2026-10-25 以降の変更（下の各項目）も含みます。このタグはタグだけを付け、配布物のリリースは作りません。SCADA 側（tyaro/temp-scada）の `banto-tagclient` の参照先として付けるタグです。この版全体の実機確認は済んでいません。
 
 ### 変更
 
 - **Hub の MCP 接続ツールを REST と同じ形にしました。** `create_connection`・`update_connection`・`test_connection` は `settings` を受け、`list_connections` も REST と同じ接続を返します。`update_connection` の `settings` は丸ごと置き換えで、秘密のキーだけ省略時に保存済みの値を保ちます。従来の直下の `host`・`unitId` などは受けません。`list_drivers` でドライバの設定スキーマを取得できます。
 - **接続の項目エラーを `settings.<key>` に揃えました。** ドライバの欄名はスキーマの snake_case です。`push` の入れ子はその場所を返します。ホスト提供の `postgres` 接続の旧い検証は R2b-8 まで残ります。
 - **ChronoGazer の接続の REST・Tauri・画面を `settings` の形にしました。** ドライバの一覧に基づくフォームを使い、保存時のアドレス検証は `banto-tags` のレジストリに揃えました。`hub` 接続は専用の許可口で扱います。既存タグの自動移行は行いません。
+- **`banto-tagclient` が、同じ世代の catalog・Binding の解決結果・現在値を 1 つの snapshot で返すようになりました（#682、SCADA 向け）。** `TagClientState::snapshot()` は `GenerationSnapshot`（`generation`・catalog・解決結果・値）を返し、`current()` は従来の型のままです。`UnresolvedBinding` に `reason`（今は `NotInCatalog`）が付きます。
+- **要求した Binding の一部が catalog に無くても、購読を止めず、解決できた名前だけで `Live` になります。** 以前は 1 件でも未解決だと rebind と backoff を繰り返していました。重複・空・不正な綴りは従来どおり全体の失敗です。
+- **全件が未解決のときは、新しい接続状態 `Unbound` で待ち、タグが作られたら自動で再解決します。** WS は張りますが `subscribe` は送らず、ping と catalog の取り直しで待ちます。このとき `current()` は `None` です。
+- **Hub の catalog / values の応答は、タグの一覧と revision を 1 回のロックで読みます（#984）。** commit が挟まって（旧タグ一覧、新 revision）の応答になる競合を防ぎます。プロトコルは変わりません。
+- **WASM ドライバの対応を広げました。** FC3 の読取り、独自アドレス文法、署名済みゲストの起動時登録、文字列タグ（読取り・書込み）、UDP、SLMP の 3E フレームと範囲書込み・ワード内ビット書込み、Modbus の FC15・FC22 を受け入れます。実機の確認結果は `apps/banto-hub/host/tests/t12_wasm_live_917/README.md` にあります。
+- **失効した API キーを削除できます（`DELETE /api/api-keys/{id}`、admin）。** 削除後も書込み監査にキーのプレフィックスを残すので、同じ名前を作り直しても見分けられます（マイグレーション 0108）。
+- **書込み監査に、定義上の拒否（書込み不可・タグなし・スコープ外・タグ無効）を「拒否」として残します。** 同じキー・タグ・理由の拒否は一定時間に 1 行へまとめます（0109）。応答を失った書込みは「結果不明（uncertain）」で残し、確認読みの不一致は `VerificationFailed` として分けます。
+- **OPC UA の鍵と証明書を profile の中（`opcua/pki`）に保存して使い回します（#943）。** 起動のたびに作り直しません。置き場の ACL が広いと鍵を作らず起動を失敗にします。
+- **一括書込み（`/api/v1/values/batch`・MCP `write_recipe`）は 1000 件までです。** 書込み監査などの時刻はローカル時刻で表示します。タグに任意のコメントを付けられます。
+- **ChronoGazer の全利用者向けインストーラを追加しました（#392 B3-4）。** インストール先は `C:\Program Files\ChronoGazer` に固定し、ファイルの前に所有者と ACL を戻します。更新時はシェルに `--quit-for-update` で正常終了を頼み、サービスの停止・再開は共通の部品を使います。Hub のインストーラにも同じ固定・ACL の戻し・停止の時間切れを当てました（#973）。Program Files の外の `banto-hub.exe` は、`service-install` と自動起動に登録しません。
+- **Hub の `SHA256SUMS.txt` は BOM なしの UTF-8・LF です。** 配布のビルドは出力先に前回の残りがあれば止まります。
 - **内部**: `banto-tags` の接続の平らな読み取り欄と `flat_view`、`banto-collect` の旧アドレス検証と通常の `banto-plc` 依存を撤去しました。ホスト接続とテストのための平らな書き込み入力は残ります。
+- **内部**: Hub の `CollectorManager::rebuild` を削除し、試験は `commit_catalog` + `apply_run` を使います（#958）。wasmtime を `=50.0.1` に固定しました（RUSTSEC-2026-0422〜0424）。`pulldown-cmark` の更新などの依存の更新、WASM 試験の CI 分離、flaky な試験（Sink の bridge_parity、ingest）の待ち方の修正があります。
+
+### 修正
+
+- **ChronoGazer の画面の loopback 判定をサーバーと同じ範囲にしました**（`127.0.0.0/8`・IPv4 に対応づけた loopback）。サーバーの設定の PUT は、lock を待つ間に失効したトークンでは保存しません（#941）。
+- **Sink の DB 操作に期限を設け、結果不明の行を再送します。** overflow 中の未送信行は ACK しません（#882・#883）。Sink の loopback 接続先は証明書 pin 付き TLS で検証します。
+- **昇格 exe の探索はシェルの隣に限定しました。** ChronoGazer のサービスの `data.dir` はデータルート配下に制限し、保持期間の掃除はハンドル基準にしました。
+- **狭幅のサイドバーを閉じたときのフォーカスを ☰ に戻し、折りたたむボタンをサイドバー側に移しました。**
 
 ## v0.2.0-alpha.39 — 2026-10-24（アルファ）
 
