@@ -53,7 +53,17 @@ if (-not $Version) {
 if (-not $OutDir) {
     $OutDir = Join-Path $repoRoot "dist\chronogazer\$Version"
 }
+# cargo は $repoRoot で走る（Push-Location）ので相対の CARGO_TARGET_DIR は $repoRoot 基準、
+# 後段の Copy-Item は Pop-Location 後の呼び出し元の cwd 基準になってずれる。ビルドの
+# 前に絶対パスへ解決する。$OutDir の相対指定は呼び出し元の cwd 基準で絶対にする。
+if (-not [System.IO.Path]::IsPathRooted($OutDir)) {
+    $OutDir = [System.IO.Path]::GetFullPath((Join-Path (Get-Location).Path $OutDir))
+}
 $targetDir = if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { Join-Path $repoRoot 'target' }
+if (-not [System.IO.Path]::IsPathRooted($targetDir)) {
+    $targetDir = Join-Path $repoRoot $targetDir
+}
+$targetDir = [System.IO.Path]::GetFullPath($targetDir)
 $releaseDir = Join-Path $targetDir 'release'
 Write-Host "ChronoGazer リリースビルド version=$Version OutDir=$OutDir releaseDir=$releaseDir"
 
