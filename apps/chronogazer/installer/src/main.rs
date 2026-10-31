@@ -51,8 +51,10 @@
 //!
 //! ## フックの流れ（`hooks/service-hooks.nsh`）
 //!
-//! 事前の確かめ（Section WebView2 の先頭、下の P3）: インストール先が Program Files の
-//! 中か・登録済みのサービスと前回の場所が `$INSTDIR` か → 旧い利用者単位の版の案内
+//! 事前の確かめ（Section WebView2 の先頭、下の P3）: インストール先が既定の場所
+//! `$PROGRAMFILES64\ChronoGazer` そのものか（Program Files の中の別のフォルダも不可。
+//! #972 のオーナーレビュー（2b9ad63））・登録済みのサービスと前回の場所が `$INSTDIR` か
+//! → 旧い利用者単位の版の案内
 //! （O-3）→ シェルに `--quit-for-update` で正常終了を頼み、`chronogazer.exe` の
 //! プロセスが無くなるまで最大 90 秒待つ（超えたら強制終了せずに再試行／中止を聞く、
 //! O-5）。PREINSTALL: シェルの再確認 → サービス `ChronoGazer` が動いていれば止めて
@@ -121,7 +123,8 @@
 //!    （止めたままのサービスを戻す）を呼ぶ。
 //! 5. P5: インストーラ属性 `AllowSkipFiles off`（`OutFile` の直後。インストーラ
 //!    全体に効き、`File` の失敗の窓から「無視」が消え、silent では中止になる）、
-//!    `File` の直前に `ClearErrors`、外部バイナリの `File` の直後にフックの
+//!    `File` の直前に `ResetChronoGazerInstallDirAcl`（インストール先の所有者を
+//!    Administrators にして ACL を既定へ戻す。失敗なら `Abort`）と `ClearErrors`、外部バイナリの `File` の直後にフックの
 //!    `RequireChronoGazerFilesCopied`（エラーフラグが立っていれば `Abort`。
 //!    `.onInstFailed` が止めたサービスを戻す）。
 //! 6. P6: Section Uninstall で、再確認の直後・登録の解除の前にフックの
@@ -283,7 +286,12 @@ const TEMPLATE_PATCHES: &[(&str, &str, &str)] = &[
         "P5-clear-errors-before-file",
         "  ; Copy main executable\n\
          \x20 File \"${MAINBINARYSRCPATH}\"\n",
-        "  ; chronogazer-installer (#972 P5): File の失敗だけを見るため、直前で落とす。\n\
+        "  ; chronogazer-installer (#972 のオーナーレビュー（2b9ad63）): 既存のインストール先の\n\
+         \x20 ; 所有者と ACL を、ファイルを置く前に既定へ戻す（弱い ACL のフォルダに置かない）。\n\
+         \x20 ; ClearErrors の前に置く（エラーフラグを乱さない）。\n\
+         \x20 !insertmacro ResetChronoGazerInstallDirAcl\n\
+         \n\
+         \x20 ; chronogazer-installer (#972 P5): File の失敗だけを見るため、直前で落とす。\n\
          \x20 ClearErrors\n\
          \n\
          \x20 ; Copy main executable\n\
@@ -835,6 +843,8 @@ mod tests {
         let body = &out[install..uninstall];
         let recheck = pos(body, "!insertmacro QuitShellForUpdate \"インストール\" 1 ");
         let clear = pos(body, "  ClearErrors\n");
+        let acl = pos(body, "!insertmacro ResetChronoGazerInstallDirAcl");
+        assert!(recheck < acl && acl < clear);
         let main_file = pos(body, "File \"${MAINBINARYSRCPATH}\"");
         let bin_file = pos(body, "File /a \"/oname={{this}}\"");
         let copied = pos(body, "!insertmacro RequireChronoGazerFilesCopied");

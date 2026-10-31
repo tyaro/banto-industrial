@@ -49,16 +49,20 @@
 ; ことがある。シェルは最終 flush を済ませて終わっているので、利用者が起動し直せば
 ; よい）。
 ;
-;   (0) インストール先が Program Files の中かを確かめる。外なら案内して `Abort`。
-;       `chronogazer-elev service-install` は Program Files の外の
-;       `chronogazer-server.exe` を LocalSystem のサービスに登録しない（権限の
-;       昇格を防ぐため）ので、外に入れるとサービスの無いインストールが黙って
-;       できてしまう。PerMachine は既定の場所を決めるだけで、ディレクトリの頁や
-;       `/D=` で外を選べる（#972 の Codex の指摘）。比べるのは文字列の接頭辞では
-;       なく**本当の置き場**（`..` を畳み、ジャンクションを解いた実パス。
-;       Program Files 側も同じに解く。求まらなければ「外」）。通れば $INSTDIR を
-;       `..` を畳んだ形に揃える（#972 のオーナーレビュー（7f86c38）。
-;       RequireInstallDirInProgramFiles）。
+;   (0) インストール先が**既定の場所 `$PROGRAMFILES64\ChronoGazer` そのもの**かを
+;       確かめる。違えば案内して `Abort`。`chronogazer-elev service-install` は
+;       Program Files の外の `chronogazer-server.exe` を LocalSystem のサービスに
+;       登録しない（権限の昇格を防ぐため）ので、外に入れるとサービスの無い
+;       インストールが黙ってできてしまう。PerMachine は既定の場所を決めるだけで、
+;       ディレクトリの頁や `/D=` で別の場所を選べる（#972 の Codex の指摘）。比べる
+;       のは文字列ではなく**本当の置き場**（`..` を畳み、ジャンクションを解いた
+;       実パス。既定の場所側も同じに解く。求まらなければ「違う」）。「Program Files
+;       の中ならどこでも」ではなく既定の場所だけにするのは、Program Files の中に
+;       一般の利用者が書けるサブフォルダ（別のアプリが緩めたものなど）があると、
+;       そこを `/D=` で選べば置いた exe を後から差し替えられるため（#972 の
+;       オーナーレビュー（2b9ad63）。既存のフォルダの ACL は、ファイルを置く前に
+;       ResetChronoGazerInstallDirAcl が既定へ戻す）。通れば $INSTDIR を `..` を畳んだ形に揃える（#972 の
+;       オーナーレビュー（7f86c38）。RequireDefaultInstallDir）。
 ;   (0b) サービスが登録済みなら、その exe がこの $INSTDIR のものかを確かめる。違えば
 ;       案内して `Abort`（service-install は登録済みのサービスを作り直さないので、別の
 ;       フォルダへ入れ直すとサービスが古い exe を指したまま残る。#972 の Codex の指摘）。
@@ -83,13 +87,17 @@
 ;       止まらなくても案内だけで続ける（Hub の方針）が、止まっていない exe への
 ;       `File` は NSIS の「使用中」の中止／再試行／無視になり、中止すると
 ;       「サービスは止めたまま・ファイルは一部だけ新しい」になる。そこでファイルは
-;       替えずに止める。自分で止めたのに止まり切らなかったときは、`Abort` の前に
-;       最大 60 秒だけ停止の完了を待ち、STOPPED になれば再開する（RUNNING に戻って
-;       いれば再開は要らず、まだ PENDING なら戻せなかったと案内する。#972 の
-;       オーナーレビュー（799c643））。どの道でも $ChronoGazerWasRunning は "0" にする
-;       （`.onInstFailed` が `sc start` を二重に試みないように）。
+;       替えずに止める。自分で止めたのに止まり切らなかったときは、最大 60 秒だけ
+;       停止の完了を待ち、STOPPED になれば**続行**する（Abort も再開もしない。
+;       $ChronoGazerWasRunning は "1" のまま、POSTINSTALL が入れ終えた後に再開し、
+;       失敗なら `.onInstFailed` が再開する）。RUNNING のまま（停止を拒否された）か
+;       まだ PENDING なら、$ChronoGazerWasRunning を "0" にして案内し `Abort`
+;       （#972 のオーナーレビュー（799c643）P2 の作り直し）。
 ;   この後、テンプレートの再確認（P2、同じ QuitShellForUpdate。[キャンセル] は
-;   止めたサービスを戻してから `Abort`）→ `ClearErrors` → `File` でファイルの
+;   止めたサービスを戻してから `Abort`）→ **インストール先の所有者・ACL の既定への
+;   戻し**（ResetChronoGazerInstallDirAcl。弱い ACL の既存フォルダに exe を置かない。
+;   失敗なら `Abort`、まだファイルは変えていない。#972 のオーナーレビュー（2b9ad63））
+;   → `ClearErrors` → `File` でファイルの
 ;   上書き → **上書きの結果の確かめ**（RequireChronoGazerFilesCopied、P5。
 ;   #972 のオーナーレビュー 5 回目）。
 ;
@@ -357,13 +365,16 @@ Var ServiceStopWaitCounter
 
 ; (5): サービス ChronoGazer が RUNNING か *_PENDING（START／STOP／PAUSE／CONTINUE）の
 ; ままなら止める（上の「PREINSTALL」(5)）。未登録・STOPPED なら素通り。
-; 止まっていなくてもファイルは替えない（`Abort`）が、自分で止めた（$ChronoGazerWasRunning
-; が "1"）のに 30 秒で止まり切らなかったときは、Abort の前に最大
-; ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒だけ停止の完了を待ち、STOPPED になれば
-; 再開する（#972 のオーナーレビュー（799c643）: 止まり切った後に誰も戻さず記録が止まる）。
-; RUNNING に戻っていれば再開は要らず、まだ PENDING なら戻せなかったと案内する。
-; どの道でも $ChronoGazerWasRunning は "0" にする（.onInstFailed が再度試みないため）。
-; $0・$1 を壊す（RestartChronoGazerServiceOrWarn と同じ。呼び出しの後ろで使わない）。
+; 自分で止めた（$ChronoGazerWasRunning が "1"）のに 30 秒で止まり切らなかったときは、
+; 最大 ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒だけ停止の完了を待つ
+; （#972 のオーナーレビュー（799c643）P2 の作り直し）:
+;   - STOPPED になった: 止まり切ったので**続行**する（Abort も再開もしない。
+;     $ChronoGazerWasRunning は "1" のまま、POSTINSTALL が入れ終えた後に再開し、
+;     失敗なら .onInstFailed が再開する。アンインストールでも続行が正しい）。
+;   - RUNNING のまま（停止を拒否された）: 戻すものは無い。"0" にして案内し Abort。
+;   - まだ PENDING: "0" にして案内（sc query が STOPPED になってから開始）し Abort。
+; フラグが "1" でなければ（頼めない状態）、従来どおり案内して Abort。
+; $0・$1 を壊す（呼び出しの後ろで使わない）。
 ;   `action`: 文言に出す「インストール」／「アンインストール」。
 !macro RequireChronoGazerServiceInactive action
   nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"RUNNING" >nul'
@@ -373,10 +384,11 @@ Var ServiceStopWaitCounter
     Pop $0
   ${EndIf}
   ${If} $0 == "0"
-    DetailPrint "chronogazer: ChronoGazer サービスが止まっていません（RUNNING か PENDING のまま）。実行ファイルを入れ替えられないため、${action}を中止しました。"
+    DetailPrint "chronogazer: ChronoGazer サービスが止まっていません（RUNNING か PENDING のまま）。"
+    StrCpy $1 "nowait"
     ${If} $ChronoGazerWasRunning == "1"
-      ; 自分で止めた。停止の完了を待ってから戻す。
-      DetailPrint "chronogazer: 停止の完了を最大 ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ってから、止めたサービスを戻します..."
+      ; 自分で止めた。停止の完了を待つ。
+      DetailPrint "chronogazer: 停止の完了を最大 ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ちます..."
       StrCpy $ServiceStopWaitCounter 0
       ${Do}
         nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"PENDING" >nul'
@@ -391,30 +403,61 @@ Var ServiceStopWaitCounter
         Sleep 1000
       ${Loop}
       ${If} $0 == "0"
-        StrCpy $1 "停止がまだ終わらないため、止めたサービスを戻せませんでした。sc query ChronoGazer で STOPPED になってから、管理者権限の PowerShell から sc start ChronoGazer で開始するか、シェルの「運用モード」で開始してください。"
+        StrCpy $1 "pending"
       ${Else}
         nsExec::ExecToStack 'cmd /c sc query "ChronoGazer" | findstr /C:"STOPPED" >nul'
         Pop $0
         ${If} $0 == "0"
-          !insertmacro StartServiceIfStoppedAndWait "ChronoGazer" $ChronoGazerWasRunning
-          ${If} $0 == "0"
-            StrCpy $1 "止まり切ったサービスを再開しました。"
-          ${Else}
-            StrCpy $1 "止まり切ったサービスを再開できませんでした（$0）。sc query ChronoGazer で状態を確かめ、管理者権限の PowerShell から sc start ChronoGazer で開始するか、シェルの「運用モード」で開始してください。"
-          ${EndIf}
+          StrCpy $1 "stopped"
         ${Else}
-          StrCpy $1 "サービスは停止せず、RUNNING のままです（再開は要りません）。"
+          StrCpy $1 "running"
         ${EndIf}
       ${EndIf}
-      DetailPrint "chronogazer: $1"
-      StrCpy $ChronoGazerWasRunning "0"
-      MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままでした）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$\r$\n$\r$\n$1" /SD IDOK
-    ${Else}
-      ; 停止はもう頼んである（または頼めない状態）。戻す操作は無い。
-      StrCpy $ChronoGazerWasRunning "0"
-      MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（停止を頼んで 30 秒待ちましたが、RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ChronoGazer）、止まってからもう一度実行してください。" /SD IDOK
     ${EndIf}
-    Abort "ChronoGazer サービスが止まっていないため、${action}を中止しました。"
+    ${If} $1 == "stopped"
+      ; 止まり切った。続行する（再開は POSTINSTALL／.onInstFailed が行うので、
+      ; $ChronoGazerWasRunning は "1" のまま）。
+      DetailPrint "chronogazer: ChronoGazer サービスの停止が完了しました。続行します。"
+    ${Else}
+      ${If} $1 == "running"
+        ; 停止を拒否された。戻すものは無い。
+        StrCpy $ChronoGazerWasRunning "0"
+        MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスが停止の要求を受け付けず、RUNNING のままです。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスは動いたままです。サービスの状態を確かめ（sc query ChronoGazer）、止めてからもう一度実行してください。" /SD IDOK
+      ${ElseIf} $1 == "pending"
+        ; 停止の途中のまま。自分で戻す操作は無い。
+        StrCpy $ChronoGazerWasRunning "0"
+        MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの停止がまだ終わっていません（停止を頼んで、さらに ${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ちましたが、PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。sc query ChronoGazer で STOPPED になってから、管理者権限の PowerShell から sc start ChronoGazer で開始するか、シェルの「運用モード」で開始してください。" /SD IDOK
+      ${Else}
+        ; 停止はもう頼んである（または頼めない状態）。戻す操作は無い。
+        StrCpy $ChronoGazerWasRunning "0"
+        MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスがまだ止まっていません（RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ChronoGazer）、止まってからもう一度実行してください。" /SD IDOK
+      ${EndIf}
+      Abort "ChronoGazer サービスが止まっていないため、${action}を中止しました。"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; #972 のオーナーレビュー（2b9ad63）: インストール先が Program Files の中で既定の
+; 場所だけに限っても、管理者が弱い ACL で先に作った `C:\Program Files\ChronoGazer`
+; が残っていると、一般の利用者が LocalSystem のサービスの exe を差し替えられる。
+; そこで、ファイルを置く前（テンプレートの当て直しが `ClearErrors` の前に挿入）に、
+; 所有者を BUILTIN\Administrators（S-1-5-32-544）にし、明示の ACE を捨てて Program
+; Files から継承する ACL だけにする。どちらかが非 0 なら案内して `Abort`
+; （まだファイルは変えていない。止めたサービスは .onInstFailed が戻す）。
+; $0・$1 を壊す。
+!macro ResetChronoGazerInstallDirAcl
+  nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$INSTDIR" /setowner *S-1-5-32-544 /T /C /Q'
+  Pop $0
+  Pop $1
+  ${If} $0 == "0"
+    nsExec::ExecToStack '"$SYSDIR\icacls.exe" "$INSTDIR" /reset /T /C /Q'
+    Pop $0
+    Pop $1
+  ${EndIf}
+  ${If} $0 != "0"
+    DetailPrint "chronogazer: インストール先 $INSTDIR の所有者・ACL を既定に戻せませんでした（icacls 終了コード $0）。$1"
+    MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした（icacls 終了コード $0）。$\r$\n$\r$\n既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。ファイルはまだ変更していません。上書き前に止めた ChronoGazer サービスは戻します。$\r$\n$\r$\nフォルダを使用しているプログラムを終了するか、管理者権限で $INSTDIR の所有者とアクセス権を確かめてから、もう一度実行してください。" /SD IDOK
+    Abort "インストール先の所有者・ACL を既定に戻せなかったため、インストールを中止しました。"
   ${EndIf}
 !macroend
 
@@ -527,19 +570,27 @@ Var ServiceStopWaitCounter
   ${EndIf}
 !macroend
 
-; 事前の確かめ (0): $INSTDIR が Program Files（64 ビット・x86）の中でなければ止める。
-; 判定は elev（`is_inside_program_files`）と同じく「どちらかの下」。NSIS の `==` は
-; 大文字小文字を区別しない。
+; 事前の確かめ (0): $INSTDIR が既定の場所 `$PROGRAMFILES64\ChronoGazer` **そのもの**で
+; なければ止める。NSIS の `==` は大文字小文字を区別しない。
 ;
-; 文字列の接頭辞だけで見ると `/D=C:\Program Files\..\Users\Public\ChronoGazer` や
+; 「Program Files（64 ビット・x86）の中ならどこでも」にはしない: Program Files の中に
+; 一般の利用者が書けるサブフォルダ（別のアプリが ACL を緩めたフォルダなど）があると、
+; そこを `/D=` で選べば、置いた `chronogazer-server.exe` が LocalSystem のサービスに
+; 登録されたうえで後から差し替えられる（#972 のオーナーレビュー（2b9ad63））。
+; 既定の場所は親（Program Files）から SYSTEM・Administrators・TrustedInstaller だけが
+; 書ける ACL を継ぐ。既存のフォルダの ACL は、ファイルを置く前に
+; ResetChronoGazerInstallDirAcl が既定へ戻す。elev 側の ACL の監査は Hub と合わせて
+; 別の Issue で検討する。
+;
+; 文字列だけで見ると `/D=C:\Program Files\..\Users\Public\ChronoGazer` や
 ; Program Files の中のジャンクションが通り、実際の置き場が外でも、ファイルを
-; 写した後の service-install（elev の `is_inside_program_files`）まで気付けない
-; （#972 のオーナーレビュー（7f86c38））。そこで、ファイルを変える前のここで
-; **本当の置き場**を比べる: $INSTDIR・$PROGRAMFILES64・$PROGRAMFILES32 をそれぞれ
-; ChronoGazerResolveRealPath（下。`..` の正規化 + ジャンクションを解いた実パス。
-; Program Files 自体が付け替えられていても同じに扱う）にしてから、接頭辞
-; `<実 Program Files>\` の後に何かが続くかを見る。実パスが求まらなければ
-; （API の失敗・ネットワークパスなど）「外」として止める（安全側）。
+; 写した後の service-install まで気付けない（#972 のオーナーレビュー（7f86c38））。
+; そこで、ファイルを変える前のここで**本当の置き場**を比べる: $INSTDIR と
+; `$PROGRAMFILES64\ChronoGazer` をそれぞれ ChronoGazerResolveRealPath（下。`..` の
+; 正規化 + ジャンクションを解いた実パス。Program Files 自体が付け替えられていても
+; 同じに扱う。まだ無いフォルダは、ある親まで解いて残りを継ぎ足す）にしてから、
+; 全体が等しいかを見る。実パスが求まらなければ（API の失敗・ネットワークパスなど）
+; 「違う」として止める（安全側）。
 ;
 ; 通ったときは $INSTDIR を `..`・`.`・重なった区切りを畳んだ形に置き換える
 ; （ジャンクションは解かない = 利用者が選んだ場所の表記は保つ）。後の (0b)
@@ -548,51 +599,30 @@ Var ServiceStopWaitCounter
 ; なるようにするため。このマクロは事前の確かめの先頭に置くこと。
 ;
 ; $0〜$5 を壊す（呼び出し側はこの後に自分で入れ直す。前からの $0〜$4 と同じ）。
-!macro RequireInstallDirInProgramFiles
+!macro RequireDefaultInstallDir
   Push "$INSTDIR"
   Call ChronoGazerNormalizePath
   Pop $5
   Push "$INSTDIR"
   Call ChronoGazerResolveRealPath
   Pop $0
+  Push "$PROGRAMFILES64\ChronoGazer"
+  Call ChronoGazerResolveRealPath
+  Pop $2
   StrCpy $1 0
   ${If} $0 != ""
   ${AndIf} $5 != ""
-    StrLen $4 $0
-    Push "$PROGRAMFILES64"
-    Call ChronoGazerResolveRealPath
-    Pop $2
-    ${If} $2 != ""
-      StrCpy $2 "$2\"
-      StrLen $3 $2
-      ${If} $4 > $3
-        StrCpy $3 $0 $3
-        ${If} $3 == $2
-          StrCpy $1 1
-        ${EndIf}
-      ${EndIf}
-    ${EndIf}
-    Push "$PROGRAMFILES32"
-    Call ChronoGazerResolveRealPath
-    Pop $2
-    ${If} $2 != ""
-      StrCpy $2 "$2\"
-      StrLen $3 $2
-      ${If} $4 > $3
-        StrCpy $3 $0 $3
-        ${If} $3 == $2
-          StrCpy $1 1
-        ${EndIf}
-      ${EndIf}
-    ${EndIf}
+  ${AndIf} $2 != ""
+  ${AndIf} $0 == $2
+    StrCpy $1 1
   ${EndIf}
   ${If} $1 != 1
     ${If} $0 == ""
       StrCpy $0 "（求められませんでした）"
     ${EndIf}
-    DetailPrint "chronogazer: インストール先 $INSTDIR（実際の場所: $0）は Program Files の外です。記録エンジンのサービスを登録できないため、インストールを中止しました。"
-    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が Program Files の外です。$\r$\n実際の場所: $0$\r$\n$\r$\nChronoGazer の記録エンジンは、一般の利用者が書き換えられない Program Files の中に置かないとサービスとして登録できません。既定の場所 ($PROGRAMFILES64\ChronoGazer) のままインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
-    Abort "インストール先が Program Files の外のため、インストールを中止しました。"
+    DetailPrint "chronogazer: インストール先 $INSTDIR（実際の場所: $0）は既定の場所 ($PROGRAMFILES64\ChronoGazer) ではありません。記録エンジンのサービスを登録できないため、インストールを中止しました。"
+    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が既定の場所ではありません。$\r$\n実際の場所: $0$\r$\n$\r$\nChronoGazer は既定の場所 ($PROGRAMFILES64\ChronoGazer) にしかインストールできません。記録エンジンは、一般の利用者が書き換えられないこの場所に置かないとサービスとして登録できません。インストール先を変えずにインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
+    Abort "インストール先が既定の場所ではないため、インストールを中止しました。"
   ${EndIf}
   ${If} $5 != "$INSTDIR"
     DetailPrint "chronogazer: インストール先 $INSTDIR を $5 として扱います。"
@@ -784,7 +814,7 @@ FunctionEnd
 ; WebView2 の先頭に挿入する（WebView2 を入れる前に、何も変えずに止められるものを
 ; 全部済ませる）。
 !macro ChronoGazerInstallPreflight
-  !insertmacro RequireInstallDirInProgramFiles
+  !insertmacro RequireDefaultInstallDir
   !insertmacro RequireRegisteredServiceInInstallDir
   !insertmacro RequirePreviousInstallInInstallDir
   !insertmacro WarnAboutLegacyCurrentUserInstall
