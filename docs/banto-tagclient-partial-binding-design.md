@@ -77,7 +77,8 @@ L138 `restart`）ので、**要求集合を入れ替える手段は `shutdown()`
    部分解決にすると「一部のタグが catalog に無い」ことでは `Reconnecting` に入らなくなる。ただし
    `config_changed`・`unknown_tag`・metadata 不一致による再解決を 3 回使い切ったときは、今後も
    `Reconnecting` の backoff に入る（§5）。`Reconnecting` は「原因を問わず、backoff を待ってから
-   catalog から取り直す」状態であり、原因は `last_error` で見る（§5 の後の段落）。
+   catalog から取り直す」状態であり、原因は `last_error` で見る（§5 の後の段落）。問題 4 は
+   この範囲で部分的に残す（2026-10-31 設計判断）。
 
 ## 3. 方針（2026-10-31 設計判断）
 
@@ -211,15 +212,15 @@ stateDiagram-v2
 	stopped --> connecting: start
 	connecting --> handshaking: catalog → resolve（resolved の件数は問わない）
 	handshaking --> live: WS connect → subscribe(resolved) → 初回 data → REST snapshot → publish gate（resolved ≥ 1）
-	handshaking --> unbound: WS connect 成功（resolved = 0、subscribe しない）
-	handshaking --> rebinding: unknown_tag / metadata 不一致 / config_changed
+	handshaking --> unbound: WS connect 成功 → catalog 取り直しで revision 一致（resolved = 0、subscribe しない）
+	handshaking --> rebinding: unknown_tag / metadata 不一致 / config_changed / 取り直しの revision 不一致
 	handshaking --> reconnecting: 切断 / transport / protocol
 	handshaking --> unauthorized: 401 / 403 / close 1008 + 理由（#446）
 	live --> rebinding: config_changed / unknown_tag / metadata 不一致
 	unbound --> rebinding: config_changed
 	rebinding --> live: catalog → resolve → WS connect → subscribe → gate（resolved ≥ 1）
-	rebinding --> unbound: catalog → resolve（resolved = 0）→ WS connect 成功
-	rebinding --> rebinding: config_changed の coalesce（3 回まで）
+	rebinding --> unbound: catalog → resolve（resolved = 0）→ WS connect 成功 → 取り直しで revision 一致
+	rebinding --> rebinding: config_changed の coalesce / 取り直しの revision 不一致（3 回まで）
 	rebinding --> reconnecting: 3 回使い切り / transport
 	rebinding --> unauthorized: 401 / 403 / close 1008 + 理由（#446）
 	live --> reconnecting: 切断 / transport / protocol
@@ -228,6 +229,8 @@ stateDiagram-v2
 	connecting --> unauthorized: 401 / 403
 	live --> unauthorized: close 1008 + 理由（#446）
 	unbound --> unauthorized: close 1008 + 理由（#446）
+	connecting --> stopped: shutdown
+	handshaking --> stopped: shutdown
 	live --> stopped: shutdown
 	unbound --> stopped: shutdown
 	rebinding --> stopped: shutdown
@@ -403,15 +406,16 @@ scada-design.md §9.6 案 C「改名候補の提示」は保留のまま）。
 現状の規則（`TagClientState::transition` が Live 以外で `current` を消す）を `snapshot` にも
 そのまま適用する。
 
-| 事象                                        | 遷移                             | `snapshot`               | `current` |
-| ------------------------------------------- | -------------------------------- | ------------------------ | --------- |
-| `config_changed`（Live / Unbound）          | → `Rebinding`                    | `None`                   | `None`    |
-| `unknown_tag` / metadata 不一致             | → `Rebinding`                    | `None`                   | `None`    |
-| 切断・transport・protocol・catalog 取得不能 | → `Reconnecting`                 | `None`                   | `None`    |
-| 401/403・close 1008（#446）                 | → `Unauthorized`（再接続しない） | `None`                   | `None`    |
-| `shutdown` / `restart`（旧 handle）         | → `Stopped`                      | `None`                   | `None`    |
-| 全件未解決で世代確立                        | → `Unbound`                      | `Some`（`values: None`） | `None`    |
-| 1 件以上解決で gate 通過                    | → `Live`                         | `Some`（`values: Some`） | `Some`    |
+| 事象                                                                          | 遷移                             | `snapshot`               | `current` |
+| ----------------------------------------------------------------------------- | -------------------------------- | ------------------------ | --------- |
+| `config_changed`（Live / Unbound）                                            | → `Rebinding`                    | `None`                   | `None`    |
+| `unknown_tag` / metadata 不一致                                               | → `Rebinding`                    | `None`                   | `None`    |
+| 切断・transport・protocol・catalog 取得不能                                   | → `Reconnecting`                 | `None`                   | `None`    |
+| 再解決（`config_changed` 等）を 3 回使い切り（`last_error` は rebindable 系） | → `Reconnecting`                 | `None`                   | `None`    |
+| 401/403・close 1008（#446）                                                   | → `Unauthorized`（再接続しない） | `None`                   | `None`    |
+| `shutdown` / `restart`（旧 handle）                                           | → `Stopped`                      | `None`                   | `None`    |
+| 全件未解決で世代確立                                                          | → `Unbound`                      | `Some`（`values: None`） | `None`    |
+| 1 件以上解決で gate 通過                                                      | → `Live`                         | `Some`（`values: Some`） | `Some`    |
 
 shutdown / restart / backoff の保証（banto-tagclient-design.md §4・§5・§6）は変えない。
 `Unbound` の受信ループにも `stop` の `biased` な `select!` を置き、`close_best_effort` してから
