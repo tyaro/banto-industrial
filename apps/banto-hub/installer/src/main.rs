@@ -116,7 +116,10 @@
 //! 4. P4: `Function .onInstFailed` と `Function un.onUninstFailed` を足し、
 //!    フックの `BantoHubOnInstFailed`／`BantoHubOnUninstFailed`（止めたままの
 //!    サービスを戻す）を呼ぶ。原本には無く、`File` の「使用中」で中止すると
-//!    止めたサービスが止まったまま残っていた。
+//!    止めたサービスが止まったまま残っていた。UI では失敗の頁で [キャンセル] を
+//!    押すまで呼ばれないので、フックの各中止の道は案内の前に自分で戻し、この
+//!    コールバックはフックが割り込めない道（`File` の窓の [中止]、
+//!    `CheckIfAppIsRunning` の [キャンセル]）のための補助（#977 の指摘 P2）。
 //! 5. P5: インストーラ属性 `AllowSkipFiles off`（`File` の失敗の窓から「無視」が
 //!    消え、silent では中止になる）、`File` の直前に `ClearErrors`、外部バイナリの
 //!    `File` の直後にフックの `RequireBantoHubFilesCopied`（エラーフラグが
@@ -259,7 +262,7 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
          \x20 {{/each}}\n\
          \n\
          \x20 ; banto-hub-installer (#973 PR-3b P5): 上書きに失敗したものがあれば（エラーフラグ）\n\
-         \x20 ; 混ざったまま成功にせず中止する（.onInstFailed が止めたサービスを戻す）。\n\
+         \x20 ; 混ざったまま成功にせず、止めたサービスを戻してから中止する。\n\
          \x20 !insertmacro RequireBantoHubFilesCopied\n",
     ),
     (
@@ -274,7 +277,7 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
         "  !insertmacro CheckIfAppIsRunning \"${MAINBINARYNAME}.exe\" \"${PRODUCTNAME}\"\n\
          \n\
          \x20 ; banto-hub-installer (#973 PR-3b P6): 使用中の exe があれば、登録を解除する前に\n\
-         \x20 ; 中止（まだ何も変更していない。止めたサービスは un.onUninstFailed が戻す）。\n\
+         \x20 ; 止めたサービスを戻してから中止（まだ何も変更していない）。\n\
          \x20 !insertmacro RequireBantoHubExesUnlocked\n\
          \x20 !insertmacro UnregisterBantoHubServices\n\
          \n\
@@ -313,12 +316,15 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
     (
         // P4（Install）: `.onInstFailed`（Section が `Abort` した・`File` の「使用中」で
         // 中止した後に呼ばれる。silent でも呼ばれる）で、PREINSTALL で止めてまだ
-        // 戻していないサービスを戻す。
+        // 戻していないサービスを戻す。UI では失敗の頁の [キャンセル] まで呼ばれない
+        // ので、フックの中止の道は自分で戻し終えている。ここで戻るのは `File` の窓の
+        // [中止]・`CheckIfAppIsRunning` の [キャンセル] の分だけ。
         "P4-oninstfailed",
         "Function .onInstSuccess\n",
         "Function .onInstFailed\n\
-         \x20 ; banto-hub-installer (#973 PR-3b P4): 途中で止まったら、上書き前に止めた\n\
-         \x20 ; サービスを戻す（フックの BantoHubOnInstFailed）。\n\
+         \x20 ; banto-hub-installer (#973 PR-3b P4): 途中で止まったら、上書き前に止めてまだ\n\
+         \x20 ; 戻していないサービスを戻す（フックの BantoHubOnInstFailed。フックの中止の\n\
+         \x20 ; 道は案内の前に戻し終えているので、ここは File の窓・CheckIfAppIsRunning の分）。\n\
          \x20 !insertmacro BantoHubOnInstFailed\n\
          FunctionEnd\n\
          \n\
@@ -326,13 +332,13 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
     ),
     (
         // P4（Uninstall）: 同じく `un.onUninstFailed`（Section Uninstall の `Abort` の後に
-        // 呼ばれる）で、PREUNINSTALL で止めたサービスを戻す。ChronoGazer は中止の道
-        // ごとに戻しているが、Hub は 1 か所にまとめる。
+        // 呼ばれる）で、PREUNINSTALL で止めてまだ戻していないサービスを戻す。Hub も
+        // ChronoGazer と同じく中止の道ごとに案内の前に戻し、ここは補助。
         "P4-onuninstfailed",
         "Function un.onInit\n",
         "Function un.onUninstFailed\n\
          \x20 ; banto-hub-installer (#973 PR-3b P4): アンインストールが途中で止まったら、\n\
-         \x20 ; その前に止めたサービスを戻す（フックの BantoHubOnUninstFailed）。\n\
+         \x20 ; その前に止めてまだ戻していないサービスを戻す（フックの BantoHubOnUninstFailed）。\n\
          \x20 !insertmacro BantoHubOnUninstFailed\n\
          FunctionEnd\n\
          \n\

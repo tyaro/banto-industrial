@@ -58,8 +58,9 @@
 ;   - アンインストールでサービスの登録を解除できない（UnregisterBantoHubServices）:
 ;     ファイルを消す前に `Abort` し、登録が残ったまま ImagePath の exe が消える状態を
 ;     作らない（#977 の指摘 P2）。
-;   途中で止めたときに、上書き前に止めたサービスを戻すのは `.onInstFailed`／
-;   `un.onUninstFailed`（下の節）。
+;   途中で止めるときは、各中止の道が案内の `MessageBox` と `Abort` より前に、上書き前に
+;   止めたサービスを戻す（RestoreStoppedBantoHubServices、下の節）。フックが割り込め
+;   ない 2 つの道だけ `.onInstFailed`／`un.onUninstFailed` が戻す。
 ;
 ; ## 事前の確かめ（BantoHubInstallPreflight、Section WebView2 の先頭）
 ;
@@ -113,8 +114,8 @@
 ;       同じ形）。StopServiceIfRunning は 30 秒で止まり切らなくても案内して続行する
 ;       ので、そのままだと `File` が使用中で失敗する。自分で止めたサービスなら
 ;       さらに最大 60 秒だけ停止の完了を待ち、STOPPED になれば続行する。止まり
-;       切らなければそのサービスのフラグを "0" にして（戻す操作が無い）`Abort`。
-;       もう片方の止めたサービスは `.onInstFailed` が戻す。
+;       切らなければそのサービスのフラグを "0" にして（戻す操作が無い）、もう片方の
+;       止めたサービスを案内より前に戻してから `Abort`。
 ;   (6) banto-hub-shell.exe が動いていれば taskkill で終了する
 ; 新規インストール（サービス未登録、`sc query` が失敗する = 1060 相当）は、
 ; RUNNING の文字列がそもそも見つからないため何も起きず静かに素通りする -
@@ -132,18 +133,29 @@
 ; exe が混ざったまま POSTINSTALL を通って成功と報告される。当て直し（P5）で
 ; `AllowSkipFiles off`（「無視」を出さない。silent では中止）、`File` の直前に
 ; `ClearErrors`、外部バイナリの `File` の直後にこのマクロを置く: フラグが立って
-; いれば案内して `Abort`（POSTINSTALL には進まない。止めたサービスは `.onInstFailed`
-; が戻す）。各 exe は丸ごと旧いか丸ごと新しいかのどちらかで壊れてはいない。
+; いれば、止めたサービスを戻してから案内して `Abort`（POSTINSTALL には進まない）。
+; 各 exe は丸ごと旧いか丸ごと新しいかのどちらかで壊れてはいない。
 ;
-; ## .onInstFailed／un.onUninstFailed（RestoreStoppedBantoHubServices、#973 PR-3b）
+; ## 中止の道での止めたサービスの戻し（RestoreStoppedBantoHubServices、#973 PR-3b）
 ;
-; Section Install が `Abort` した・`File` の「使用中」の窓で [中止] されたときに
-; 呼ばれる `.onInstFailed`（原本に無い。当て直し P4 が足す）で、PREINSTALL で止めて
-; まだ戻していないサービス（フラグが "1"）を Hub → Sink の順に `sc start` し、RUNNING
-; まで待つ（共通部品 StartServiceIfStoppedAndWait）。戻せなければ案内するだけ。
-; アンインストールの `Abort`（下の PREUNINSTALL の確かめ）も同じく `un.onUninstFailed`
-; で戻す。戻さないと決めた道（止まり切らなかったサービス、登録を戻せなかった
-; サービス）は、`Abort` の前にフラグを "0" にしておく。
+; UI では、Section の `Abort` の後、利用者が失敗の頁で [キャンセル] を押すまで
+; `.onInstFailed`／`un.onUninstFailed` は呼ばれない（NSIS の Ui.c。失敗時は autoclose も
+; 効かない）。戻しをコールバックだけに任せると、頁を開いたままの間 BantoHub・
+; BantoHubSink が止まったままになる（#977 のオーナーの Codex CLI レビューの P2）。
+; そこで**フックの各中止の道は、案内の `MessageBox` と `Abort` より前に
+; RestoreStoppedBantoHubServices を呼ぶ**: PREINSTALL／PREUNINSTALL で止めてまだ
+; 戻していないサービス（フラグが "1"）を Hub → Sink の順に `sc start` し、RUNNING まで
+; 待つ（共通部品 StartServiceIfStoppedAndWait）。結果は文で $ServiceRestoreNote に
+; 返し、中止の案内の MessageBox に含める（戻しの案内を別の窓で二重に出さない。
+; 戻せなかったサービスの名前は $ServiceRestoreFailed にも入る）。戻さないと決めた道
+; （止まり切らなかったサービス、登録を戻せなかったサービス）は、呼ぶ前にフラグを
+; "0" にしておく。
+;
+; `.onInstFailed`／`un.onUninstFailed`（原本に無い。当て直し P4 が足す）は補助で、
+; フックが割り込めない 2 つの道 - `File` の「使用中」の窓の [中止]（silent では自動の
+; 中止）と、テンプレートの `CheckIfAppIsRunning` の [キャンセル] - のために残す。
+; 共通部品がフラグを "0" に戻すので、フックの道で戻した後に呼ばれても何もしない
+; （二重に起動しない）。戻せなかったときだけ、ここで案内の窓を出す（他に窓が無い）。
 ;
 ; ## POSTINSTALL（§4.3 表・§7 決定5/6）
 ;
@@ -213,8 +225,8 @@
 ;       CheckIfAppIsRunning の直後に挿入する）: 4 つの exe のそれぞれを
 ;       `FileOpen ... a`（読み書きで開き、中身は変えずすぐ閉じる。無いファイルは
 ;       飛ばす）で開けるかを見る。動いている exe はローダーが書込みの共有を許さない
-;       ので開けない。1 つでも開けなければ案内して `Abort`（まだ何も変更していない。
-;       止めたサービスは `un.onUninstFailed` が戻す）。
+;       ので開けない。1 つでも開けなければ、止めたサービスを戻してから案内して `Abort`
+;       （まだ何も変更していない）。
 ;   (b) **サービス登録の解除**（UnregisterBantoHubServices。同じ当て直しが (a) の直後
 ;       に挿入する）: サイドカー→Hub の順に解除する。登録が無ければ飛ばし、登録が
 ;       あって頼む exe が無ければ `sc delete`（`banto-hub-elev.exe` が無いだけなら
@@ -223,8 +235,8 @@
 ;       案内して `Abort`**（ChronoGazer と同じ。登録が残ったまま ImagePath の exe が
 ;       消えるのを防ぐ）。Sink の解除が通って Hub の解除が失敗したときは、`Abort` の
 ;       前に Sink の登録を `install`＋`grant-service-acl` で戻す（(d) と同じ戻し方。
-;       戻せなければ $SinkWasRunning を "0" にして案内）。止めたサービスは
-;       `un.onUninstFailed` が戻す。PR-3b より前はこのフックの中で解除し、失敗は
+;       戻せなければ $SinkWasRunning を "0" にして案内）。どちらの失敗も、止めたサービス
+;       （登録がある分）を戻してから案内する。PR-3b より前はこのフックの中で解除し、失敗は
 ;       案内するだけで続行していた（CheckIfAppIsRunning の前）。
 ;   (d) **消えたことの確かめ**（RequireBantoHubExesDeleted。P6 の当て直しが外部
 ;       バイナリの `Delete` の直後・`uninstall.exe` の `Delete` と Uninstall キーの
@@ -233,8 +245,8 @@
 ;       (b) で解除したサービスの登録は、残っている exe で頼める分だけ戻す
 ;       （`banto-hub-elev.exe` と `banto-hub.exe` が残っていれば `service-install`、
 ;       `banto-hub-sink.exe` が残っていれば `install` と `grant-service-acl`。起動種別は
-;       手動に戻る。(b) で未登録だったものは戻さない）。戻せたサービスだけ
-;       `un.onUninstFailed` が再開する。残った exe 以外は消えているが、`uninstall.exe`
+;       手動に戻る。(b) で未登録だったものは戻さない）。戻せたサービスだけ、案内の前に
+;       再開する。残った exe 以外は消えているが、`uninstall.exe`
 ;       と「アプリ」の登録は残るので、もう一度アンインストールできる（(a) は無い
 ;       ファイルを飛ばし、(b) は登録が無ければ飛ばし、登録があって exe が無ければ
 ;       `sc delete` で解除する）。
@@ -280,6 +292,10 @@ Var SinkWasRunning
 ; ときは ""）。(b) の Hub の失敗と (d) の消し残りで、解除した分だけ登録を戻すために見る。
 Var BantoHubUnregistered
 Var SinkUnregistered
+; RestoreStoppedBantoHubServices の結果（上の「中止の道での止めたサービスの戻し」）。
+; Note は中止の案内に含める 1 文、Failed は再開できなかったサービスの名前（無ければ ""）。
+Var ServiceRestoreNote
+Var ServiceRestoreFailed
 
 ; alpha.2 で公開済みの Hub単体インストーラ（main=`banto-hub.exe`）から I1
 ; 一体インストーラ（main=`banto-hub-shell.exe`）へ上書きインストールすると
@@ -335,9 +351,10 @@ Var SinkUnregistered
 ; （上の「PREINSTALL」(5)）。未登録・STOPPED なら素通り。自分で止めた（`flag_var` が
 ; "1"）のに 30 秒で止まり切らなかったときは、最大 ${BANTO_HUB_SERVICE_STOP_EXTRA_WAIT_SECONDS}
 ; 秒だけ PENDING が明けるのを待ち、STOPPED になれば続行する（フラグは "1" のまま。
-; 再開は POSTINSTALL／.onInstFailed／un.onUninstFailed）。それ以外（RUNNING のまま =
-; 停止を拒否された、まだ PENDING、頼んでいない）は戻す操作が無いので `flag_var` を
-; "0" にして案内し `Abort`。$0・$1 と $StopWaitCounter（共通部品の変数）を壊す。
+; 再開は POSTINSTALL か中止の道）。それ以外（RUNNING のまま = 停止を拒否された、まだ
+; PENDING、頼んでいない）は戻す操作が無いので `flag_var` を "0" にし、もう片方の止めた
+; サービスを戻してから（RestoreStoppedBantoHubServices）案内し `Abort`。$0・$1 と
+; $StopWaitCounter（共通部品の変数）・$ServiceRestoreNote・$ServiceRestoreFailed を壊す。
 ;   `action`: 文言に出す「インストール」／「アンインストール」。
 !macro RequireBantoHubServiceInactive service_name flag_var action
   nsExec::ExecToStack 'cmd /c sc query "${service_name}" | findstr /C:"RUNNING" >nul'
@@ -381,41 +398,75 @@ Var SinkUnregistered
     ${Else}
       StrCpy ${flag_var} "0"
       DetailPrint "banto-hub: ${service_name} サービスが止まり切らないため（$1）、${action}を中止します。ファイルはまだ変更していません。"
-      MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスがまだ止まっていません（RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。サービスの状態を確かめ（sc query ${service_name}）、止まってからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
+      !insertmacro RestoreStoppedBantoHubServices
+      MessageBox MB_OK|MB_ICONSTOP "${service_name} サービスがまだ止まっていません（RUNNING か PENDING のままです）。$\r$\n$\r$\n実行ファイルを入れ替えられないため、${action}を中止しました。ファイルはまだ変更していません。$ServiceRestoreNote$\r$\n$\r$\nサービスの状態を確かめ（sc query ${service_name}）、止まってからもう一度実行してください（${SERVICE_COMMON_OPS_DOC}）。" /SD IDOK
       Abort "${service_name} サービスが止まっていないため、${action}を中止しました。"
     ${EndIf}
   ${EndIf}
 !macroend
 
-; `.onInstFailed`／`un.onUninstFailed`（上の節）。止めてまだ戻していないサービス
-; （フラグが "1"）を Hub → Sink の順に戻し、戻せなければ案内する（Abort はできない
-; 場所）。共通部品がフラグを "0" に戻すので 2 回呼ばれても 2 回目は何もしない。
-; $0〜$2 を壊す。
-;   `action`: 文言に出す「インストール」／「アンインストール」。
-!macro RestoreStoppedBantoHubServices action
+; 止めたサービスの戻し（上の「中止の道での止めたサービスの戻し」。各中止の道が案内の
+; MessageBox の前に呼び、`.onInstFailed`／`un.onUninstFailed` も呼ぶ）。止めてまだ
+; 戻していないサービス（フラグが "1"）を Hub → Sink の順に `sc start` し RUNNING まで
+; 待つ（共通部品 StartServiceIfStoppedAndWait が $0・$1・$StopWaitCounter を壊し、
+; フラグを "0" に戻す）。共通部品がフラグを "0" に戻すので、2 回呼ばれても 2 回目は
+; 何もしない。窓は出さない: 結果を $ServiceRestoreNote（案内に含める 1 文）と
+; $ServiceRestoreFailed（再開できなかったサービス。無ければ ""）に返す。
+; 呼び出し側が $1〜$3 に文言の材料を持っているので、$0〜$3 は Push／Pop で保つ。
+!macro RestoreStoppedBantoHubServices
+  Push $0
+  Push $1
+  Push $2
+  Push $3
+  ; $2 = 再開できなかったサービス、$3 = 再開を試みたサービス（どちらも「・」区切り）。
   StrCpy $2 ""
+  StrCpy $3 ""
+  ${If} $BantoHubWasRunning == "1"
+    StrCpy $3 "BantoHub"
+  ${EndIf}
   !insertmacro StartServiceIfStoppedAndWait "BantoHub" $BantoHubWasRunning
   ${If} $0 != "0"
-    StrCpy $2 "$2 BantoHub ($0)"
+    StrCpy $2 "BantoHub ($0)"
+  ${EndIf}
+  ${If} $SinkWasRunning == "1"
+    ${If} $3 == ""
+      StrCpy $3 "BantoHubSink"
+    ${Else}
+      StrCpy $3 "$3・BantoHubSink"
+    ${EndIf}
   ${EndIf}
   !insertmacro StartServiceIfStoppedAndWait "BantoHubSink" $SinkWasRunning
   ${If} $0 != "0"
-    StrCpy $2 "$2 BantoHubSink ($0)"
+    ${If} $2 == ""
+      StrCpy $2 "BantoHubSink ($0)"
+    ${Else}
+      StrCpy $2 "$2・BantoHubSink ($0)"
+    ${EndIf}
   ${EndIf}
-  ${If} $2 != ""
-    DetailPrint "banto-hub: ${action}の中止の後、止めていたサービスを再開できませんでした（$2）。管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
-    MessageBox MB_OK|MB_ICONEXCLAMATION "${action}を中止しましたが、その前に止めていたサービスを再開できませんでした（$2）。$\r$\n$\r$\nサービスの状態を確かめ（sc query BantoHub、sc query BantoHubSink）、管理者権限の PowerShell から sc start で開始してください。" /SD IDOK
+  StrCpy $ServiceRestoreFailed $2
+  ${If} $3 == ""
+    StrCpy $ServiceRestoreNote "再開するサービスはありません（その前に止めたサービスは無いか、戻さないと決めたものだけです）。"
+  ${ElseIf} $2 == ""
+    StrCpy $ServiceRestoreNote "その前に止めていたサービス（$3）は再開し、RUNNING になったことを確かめました。"
+  ${Else}
+    StrCpy $ServiceRestoreNote "その前に止めていたサービスのうち $2 は再開できませんでした。サービスの状態を確かめ（sc query BantoHub、sc query BantoHubSink）、管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
+    DetailPrint "banto-hub: 止めていたサービスを再開できませんでした（$2）。管理者権限の PowerShell から sc start で開始してください（${SERVICE_COMMON_OPS_DOC}）。"
   ${EndIf}
+  Pop $3
+  Pop $2
+  Pop $1
+  Pop $0
 !macroend
 
 ; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
 ; 当て直しが Section Install の `File` の直後に挿入する。直前の `ClearErrors` も
-; 当て直しが置く）。エラーフラグが立っていれば案内して `Abort`。止めたサービスは
-; `.onInstFailed` が戻す（フラグはそのまま）。
+; 当て直しが置く）。エラーフラグが立っていれば、上書き前に止めたサービスを戻してから
+; 案内して `Abort`。$ServiceRestoreNote・$ServiceRestoreFailed を壊す。
 !macro RequireBantoHubFilesCopied
   ${If} ${Errors}
-    DetailPrint "banto-hub: ファイルの上書きに失敗したものがあります。旧い実行ファイルと新しい実行ファイルが混ざらないよう、インストールを中止します。上書き前に止めたサービスは戻します。"
-    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます。上書き前に止めていたサービス（BantoHub・BantoHubSink）は戻します（各ファイルは丸ごと旧いか丸ごと新しいかのどちらかで、壊れてはいません）。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    DetailPrint "banto-hub: ファイルの上書きに失敗したものがあります。旧い実行ファイルと新しい実行ファイルが混ざらないよう、上書き前に止めたサービスを戻してからインストールを中止します。"
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "ファイルの上書きに失敗したものがあります（使用中か、書き込めませんでした）。$\r$\n$\r$\n一部のファイルだけ新しい状態なので、インストールを失敗として終えます（各ファイルは丸ごと旧いか丸ごと新しいかのどちらかで、壊れてはいません）。$ServiceRestoreNote$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
     Abort "ファイルの上書きに失敗したため、インストールを失敗として終えました。"
   ${EndIf}
 !macroend
@@ -435,8 +486,9 @@ Var SinkUnregistered
   ${EndIf}
 !macroend
 
-; P6 (a): 4 つの exe のどれかが使用中なら案内して `Abort`（まだ何も変更していない。
-; 止めたサービスは un.onUninstFailed が戻す。上の PREUNINSTALL の (a)）。$0〜$2 を壊す。
+; P6 (a): 4 つの exe のどれかが使用中なら、止めたサービスを戻してから案内して `Abort`
+; （まだ何も変更していない。上の PREUNINSTALL の (a)）。$0〜$2・$ServiceRestoreNote・
+; $ServiceRestoreFailed を壊す。
 !macro RequireBantoHubExesUnlocked
   StrCpy $1 ""
   !insertmacro CheckBantoHubExeUnlocked "banto-hub-shell.exe"
@@ -445,8 +497,9 @@ Var SinkUnregistered
   !insertmacro CheckBantoHubExeUnlocked "banto-hub-sink.exe"
   ${If} $1 != ""
     StrCpy $2 $1
-    DetailPrint "banto-hub: 使用中の実行ファイルがあります（$2）。消せないため、アンインストールを中止します（まだ何も変更していません。止めたサービスは戻します）。"
-    MessageBox MB_OK|MB_ICONSTOP "使用中の実行ファイルがあります（$2）。$\r$\n$\r$\n消せないため、アンインストールを中止しました。まだ何も変更していません（止めたサービスは戻します）。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールしてください。" /SD IDOK
+    DetailPrint "banto-hub: 使用中の実行ファイルがあります（$2）。消せないため、止めたサービスを戻してからアンインストールを中止します（まだ何も変更していません）。"
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "使用中の実行ファイルがあります（$2）。$\r$\n$\r$\n消せないため、アンインストールを中止しました。まだ何も変更していません。$ServiceRestoreNote$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールしてください。" /SD IDOK
     Abort "使用中の実行ファイルがあるため、アンインストールを中止しました。"
   ${EndIf}
 !macroend
@@ -463,7 +516,7 @@ Var SinkUnregistered
 ; （$BantoHubUnregistered が "1" でない = もともと未登録）戻すものは無い。
 ; `banto-hub-elev.exe` と `banto-hub.exe` が残っていれば `service-install` で戻す
 ; （起動種別は手動に戻る）。結果を $3 に文で足し、戻せなければ $BantoHubWasRunning を
-; "0" にして un.onUninstFailed に再開させない。$0・$3 を壊す。
+; "0" にして再開させない（RestoreStoppedBantoHubServices が飛ばす）。$0・$3 を壊す。
 !macro RestoreBantoHubServiceRegistration
   ; ExecWait は起動できないとエラーフラグを立てるだけで $0 を変えないので、フラグも見る。
   ${If} $BantoHubUnregistered != "1"
@@ -494,7 +547,7 @@ Var SinkUnregistered
 ; （$SinkUnregistered が "1" でない = もともと未登録）戻すものは無い。
 ; `banto-hub-sink.exe` が残っていれば `install` と `grant-service-acl` で戻す（起動種別は
 ; 手動に戻る）。結果を $3 に文で足し、戻せなければ $SinkWasRunning を "0" にして
-; un.onUninstFailed に再開させない（ACL だけ付け直せなかったときは登録は戻っているので
+; 再開させない（ACL だけ付け直せなかったときは登録は戻っているので
 ; 再開する）。$0・$3・$4 を壊す。
 !macro RestoreBantoHubSinkServiceRegistration
   ${If} $SinkUnregistered != "1"
@@ -531,8 +584,8 @@ Var SinkUnregistered
 ; P6 (d): テンプレートの `Delete` の後に exe が残っていれば、`uninstall.exe` と
 ; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。サービスの登録は
 ; もう解除されているので、残っている exe で頼める分だけ戻し（結果は $3 に文で集める）、
-; 戻せなかったサービスはフラグを "0" にして un.onUninstFailed に再開させない。
-; $0〜$4 を壊す。
+; 戻せなかったサービスはフラグを "0" にして再開させず、戻せた分は案内の前に再開する。
+; $0〜$4・$ServiceRestoreNote・$ServiceRestoreFailed を壊す。
 !macro RequireBantoHubExesDeleted
   StrCpy $2 ""
   !insertmacro CheckBantoHubExeDeleted "banto-hub-shell.exe"
@@ -545,7 +598,8 @@ Var SinkUnregistered
     !insertmacro RestoreBantoHubServiceRegistration
     !insertmacro RestoreBantoHubSinkServiceRegistration
     DetailPrint "banto-hub: サービスの登録の戻し:$3 戻した登録の起動種別は手動です。戻せなかったものは、このインストーラをもう一度実行して入れ直すと戻ります。"
-    MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2。使用中か、消せませんでした）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残しています。解除していたサービスの登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。戻せた分のうち止めていたサービスは再開します。$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールするか、このインストーラをもう一度実行して入れ直してください（サービスの登録も戻ります）。" /SD IDOK
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "実行ファイルを消せませんでした（$2。使用中か、消せませんでした）。$\r$\n$\r$\nアンインストールを中止しました。uninstall.exe と「アプリ」の登録は残しています。解除していたサービスの登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。$ServiceRestoreNote$\r$\n$\r$\nBantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールするか、このインストーラをもう一度実行して入れ直してください（サービスの登録も戻ります）。" /SD IDOK
     Abort "実行ファイルを消せなかったため、アンインストールを中止しました。"
   ${EndIf}
 !macroend
@@ -575,9 +629,15 @@ Var SinkUnregistered
   !insertmacro TerminateProcessIfRunning "banto-hub-shell.exe"
 !macroend
 
-; `.onInstFailed`（テンプレートの当て直し P4 が挿入する）。
+; `.onInstFailed`（テンプレートの当て直し P4 が挿入する）。フックの中止の道はもう
+; 戻し終えている（フラグが "0"）ので、ここで戻るのは `File` の窓の [中止]・
+; `CheckIfAppIsRunning` の [キャンセル] の分だけ。他に窓が無いので、戻せなかった
+; ときだけここで案内する。
 !macro BantoHubOnInstFailed
-  !insertmacro RestoreStoppedBantoHubServices "インストール"
+  !insertmacro RestoreStoppedBantoHubServices
+  ${If} $ServiceRestoreFailed != ""
+    MessageBox MB_OK|MB_ICONEXCLAMATION "インストールを中止しましたが、$ServiceRestoreNote" /SD IDOK
+  ${EndIf}
 !macroend
 
 !macro NSIS_HOOK_POSTINSTALL
@@ -649,11 +709,11 @@ Var SinkUnregistered
 ; 使用中の exe の確かめの直後・`Delete` の前に挿入する）。ChronoGazer の
 ; UnregisterChronoGazerService にそろえ、**解除に失敗したらファイルを消さずに案内して
 ; `Abort`** する（登録が残ったまま ImagePath の exe が消えるのを防ぐ。#977 の指摘 P2）。
-; 止めたサービスは `un.onUninstFailed` が戻す。
+; どちらの失敗の道も、止めたサービス（登録がある分）を戻してから案内する。
 ;
 ; 順は Sink → Hub（サイドカーは Hub に接続する側なので、止める順と同じく先に片付ける。
 ; 解除の順に依存は無い）。Sink の解除が通って Hub の解除が失敗したときは、Sink の登録が
-; もう無いので `un.onUninstFailed` が再開できない。`Abort` の前に Sink の登録を
+; もう無いので再開できない。戻しの前に Sink の登録を
 ; RestoreBantoHubSinkServiceRegistration（(d) と同じ `install`＋`grant-service-acl`）で
 ; 戻し、戻せなければ $SinkWasRunning を "0" にして案内する。
 ;
@@ -665,7 +725,8 @@ Var SinkUnregistered
 ; exe が消える」心配は無いが、登録を残して続行すると、インストール先ごと消えた後に
 ; 壊れた登録だけが残り、次のインストールの `service-install`（登録済みは作り直さない）が
 ; 旧いパスのまま通ってしまう。解除できなければ他と同じく `Abort`。
-; $0〜$4・$BantoHubUnregistered・$SinkUnregistered を壊す。
+; $0〜$4・$BantoHubUnregistered・$SinkUnregistered・$ServiceRestoreNote・
+; $ServiceRestoreFailed を壊す。
 !macro UnregisterBantoHubServices
   StrCpy $BantoHubUnregistered ""
   StrCpy $SinkUnregistered ""
@@ -689,8 +750,9 @@ Var SinkUnregistered
   ${EndIf}
   ${If} $0 != 0
     StrCpy $2 $0
-    DetailPrint "banto-hub: BantoHubSink の登録解除に失敗しました（終了コード $2）。ファイルは消さずにアンインストールを中止します（まだ何も変更していません。止めたサービスは戻します）。${SERVICE_COMMON_OPS_DOC} の手順で手動対応してください。"
-    MessageBox MB_OK|MB_ICONSTOP "BantoHubSink サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。まだ何も変更していません（止めたサービスは戻します）。$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから（手動で解除するなら管理者権限の PowerShell から $\"$INSTDIR\banto-hub-sink.exe$\" uninstall）、もう一度アンインストールしてください。" /SD IDOK
+    DetailPrint "banto-hub: BantoHubSink の登録解除に失敗しました（終了コード $2）。ファイルは消さずに、止めたサービスを戻してからアンインストールを中止します（まだ何も変更していません）。${SERVICE_COMMON_OPS_DOC} の手順で手動対応してください。"
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "BantoHubSink サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。まだ何も変更していません。$ServiceRestoreNote$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから（手動で解除するなら管理者権限の PowerShell から $\"$INSTDIR\banto-hub-sink.exe$\" uninstall）、もう一度アンインストールしてください。" /SD IDOK
     Abort "BantoHubSink サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
   ${If} $1 != ""
@@ -721,12 +783,14 @@ Var SinkUnregistered
   ${If} $0 != 0
     StrCpy $2 $0
     DetailPrint "banto-hub: BantoHub の登録解除に失敗しました（終了コード $2）。ファイルは消さずにアンインストールを中止します。${SERVICE_COMMON_OPS_DOC} の手順で手動対応してください。"
-    ; 先に解除した Sink の登録を戻してから止める（戻せなければ $SinkWasRunning が "0" に
-    ; なり、un.onUninstFailed は Hub だけ再開する）。結果は $3。
+    ; 先に解除した Sink の登録を戻してから、止めたサービスを再開し、案内して止める
+    ; （Sink の登録を戻せなければ $SinkWasRunning が "0" になり、Hub だけ再開する）。
+    ; 登録の戻しの結果は $3。
     StrCpy $3 ""
     !insertmacro RestoreBantoHubSinkServiceRegistration
     DetailPrint "banto-hub: 先に解除した BantoHubSink の登録の戻し:$3 戻した登録の起動種別は手動です。"
-    MessageBox MB_OK|MB_ICONSTOP "BantoHub サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。先に解除していた BantoHubSink の登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。止めていたサービスは、登録がある分だけ再開します。$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから、もう一度アンインストールしてください。" /SD IDOK
+    !insertmacro RestoreStoppedBantoHubServices
+    MessageBox MB_OK|MB_ICONSTOP "BantoHub サービスの登録解除に失敗しました（終了コード $2）。$\r$\n$\r$\nファイルは消さずにアンインストールを中止しました。先に解除していた BantoHubSink の登録:$3$\r$\n戻した登録の起動種別は手動です（自動開始にしていたなら付け直してください）。$ServiceRestoreNote$\r$\n$\r$\n${SERVICE_COMMON_OPS_DOC} の手順で対処してから、もう一度アンインストールしてください。" /SD IDOK
     Abort "BantoHub サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
   ${If} $1 != ""
@@ -738,7 +802,10 @@ Var SinkUnregistered
   ; 戻ることを優先する）。完全削除は docs の手順に従い利用者が手動で行う。
 !macroend
 
-; `un.onUninstFailed`（テンプレートの当て直し P4 が挿入する）。
+; `un.onUninstFailed`（テンプレートの当て直し P4 が挿入する）。`.onInstFailed` と同じ。
 !macro BantoHubOnUninstFailed
-  !insertmacro RestoreStoppedBantoHubServices "アンインストール"
+  !insertmacro RestoreStoppedBantoHubServices
+  ${If} $ServiceRestoreFailed != ""
+    MessageBox MB_OK|MB_ICONEXCLAMATION "アンインストールを中止しましたが、$ServiceRestoreNote" /SD IDOK
+  ${EndIf}
 !macroend
