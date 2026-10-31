@@ -154,7 +154,11 @@ if (-not $SkipInstaller) {
 $sumsPath = Join-Path $OutDir 'SHA256SUMS.txt'
 $lines = $produced | Sort-Object |
     ForEach-Object { '{0} *{1}' -f (Get-FileHash -Algorithm SHA256 -Path (Join-Path $OutDir $_)).Hash.ToLower(), $_ }
-Set-Content -Path $sumsPath -Value $lines -Encoding utf8
+# Set-Content -Encoding utf8 は Windows PowerShell 5.1 だと BOM を付け、sha256sum が
+# 1 行目のハッシュを読めなくなる（#972 のオーナーレビュー（7f86c38））。5.1 と 7 の
+# どちらでも BOM なしの UTF-8 で書く。改行は LF（sha256sum -c は CR を名前の一部と
+# 見るため）。
+[System.IO.File]::WriteAllText($sumsPath, (($lines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
 
 # --- (i) 一覧表示と注意喚起 -------------------------------------------------
 Write-Host ''

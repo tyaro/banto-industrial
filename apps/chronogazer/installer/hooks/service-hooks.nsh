@@ -54,7 +54,11 @@
 ;       `chronogazer-server.exe` を LocalSystem のサービスに登録しない（権限の
 ;       昇格を防ぐため）ので、外に入れるとサービスの無いインストールが黙って
 ;       できてしまう。PerMachine は既定の場所を決めるだけで、ディレクトリの頁や
-;       `/D=` で外を選べる（#972 の Codex の指摘）。
+;       `/D=` で外を選べる（#972 の Codex の指摘）。比べるのは文字列の接頭辞では
+;       なく**本当の置き場**（`..` を畳み、ジャンクションを解いた実パス。
+;       Program Files 側も同じに解く。求まらなければ「外」）。通れば $INSTDIR を
+;       `..` を畳んだ形に揃える（#972 のオーナーレビュー（7f86c38）。
+;       RequireInstallDirInProgramFiles）。
 ;   (0b) サービスが登録済みなら、その exe がこの $INSTDIR のものかを確かめる。違えば
 ;       案内して `Abort`（service-install は登録済みのサービスを作り直さないので、別の
 ;       フォルダへ入れ直すとサービスが古い exe を指したまま残る。#972 の Codex の指摘）。
@@ -476,30 +480,214 @@ Var ShellQuitWaitCounter
 
 ; 事前の確かめ (0): $INSTDIR が Program Files（64 ビット・x86）の中でなければ止める。
 ; 判定は elev（`is_inside_program_files`）と同じく「どちらかの下」。NSIS の `==` は
-; 大文字小文字を区別しない。本当のパス（ジャンクションなど）は elev が確かめ直す。
+; 大文字小文字を区別しない。
+;
+; 文字列の接頭辞だけで見ると `/D=C:\Program Files\..\Users\Public\ChronoGazer` や
+; Program Files の中のジャンクションが通り、実際の置き場が外でも、ファイルを
+; 写した後の service-install（elev の `is_inside_program_files`）まで気付けない
+; （#972 のオーナーレビュー（7f86c38））。そこで、ファイルを変える前のここで
+; **本当の置き場**を比べる: $INSTDIR・$PROGRAMFILES64・$PROGRAMFILES32 をそれぞれ
+; ChronoGazerResolveRealPath（下。`..` の正規化 + ジャンクションを解いた実パス。
+; Program Files 自体が付け替えられていても同じに扱う）にしてから、接頭辞
+; `<実 Program Files>\` の後に何かが続くかを見る。実パスが求まらなければ
+; （API の失敗・ネットワークパスなど）「外」として止める（安全側）。
+;
+; 通ったときは $INSTDIR を `..`・`.`・重なった区切りを畳んだ形に置き換える
+; （ジャンクションは解かない = 利用者が選んだ場所の表記は保つ）。後の (0b)
+; （サービスの ImagePath との比較）・(0c)（InstallLocation との比較）と、
+; テンプレートが書く InstallLocation・elev が登録する exe のパスが同じ表記に
+; なるようにするため。このマクロは事前の確かめの先頭に置くこと。
+;
+; $0〜$5 を壊す（呼び出し側はこの後に自分で入れ直す。前からの $0〜$4 と同じ）。
 !macro RequireInstallDirInProgramFiles
+  Push "$INSTDIR"
+  Call ChronoGazerNormalizePath
+  Pop $5
+  Push "$INSTDIR"
+  Call ChronoGazerResolveRealPath
+  Pop $0
   StrCpy $1 0
-  StrLen $4 "$INSTDIR"
-  StrCpy $0 "$PROGRAMFILES64\"
-  StrLen $2 $0
-  StrCpy $3 "$INSTDIR" $2
-  ${If} $3 == $0
-  ${AndIf} $4 > $2
-    StrCpy $1 1
-  ${EndIf}
-  StrCpy $0 "$PROGRAMFILES32\"
-  StrLen $2 $0
-  StrCpy $3 "$INSTDIR" $2
-  ${If} $3 == $0
-  ${AndIf} $4 > $2
-    StrCpy $1 1
+  ${If} $0 != ""
+  ${AndIf} $5 != ""
+    StrLen $4 $0
+    Push "$PROGRAMFILES64"
+    Call ChronoGazerResolveRealPath
+    Pop $2
+    ${If} $2 != ""
+      StrCpy $2 "$2\"
+      StrLen $3 $2
+      ${If} $4 > $3
+        StrCpy $3 $0 $3
+        ${If} $3 == $2
+          StrCpy $1 1
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
+    Push "$PROGRAMFILES32"
+    Call ChronoGazerResolveRealPath
+    Pop $2
+    ${If} $2 != ""
+      StrCpy $2 "$2\"
+      StrLen $3 $2
+      ${If} $4 > $3
+        StrCpy $3 $0 $3
+        ${If} $3 == $2
+          StrCpy $1 1
+        ${EndIf}
+      ${EndIf}
+    ${EndIf}
   ${EndIf}
   ${If} $1 != 1
-    DetailPrint "chronogazer: インストール先 $INSTDIR は Program Files の外です。記録エンジンのサービスを登録できないため、インストールを中止しました。"
-    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が Program Files の外です。$\r$\n$\r$\nChronoGazer の記録エンジンは、一般の利用者が書き換えられない Program Files の中に置かないとサービスとして登録できません。既定の場所 ($PROGRAMFILES64\ChronoGazer) のままインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
+    ${If} $0 == ""
+      StrCpy $0 "（求められませんでした）"
+    ${EndIf}
+    DetailPrint "chronogazer: インストール先 $INSTDIR（実際の場所: $0）は Program Files の外です。記録エンジンのサービスを登録できないため、インストールを中止しました。"
+    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が Program Files の外です。$\r$\n実際の場所: $0$\r$\n$\r$\nChronoGazer の記録エンジンは、一般の利用者が書き換えられない Program Files の中に置かないとサービスとして登録できません。既定の場所 ($PROGRAMFILES64\ChronoGazer) のままインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
     Abort "インストール先が Program Files の外のため、インストールを中止しました。"
   ${EndIf}
+  ${If} $5 != "$INSTDIR"
+    DetailPrint "chronogazer: インストール先 $INSTDIR を $5 として扱います。"
+    StrCpy $INSTDIR $5
+  ${EndIf}
 !macroend
+
+; パスを `kernel32::GetFullPathNameW` で正規化する（`..`・`.`・重なった区切りを
+; 畳む。ジャンクションは解かない）。末尾の `\` は取る（ルート `C:\` を除く）。
+;   入力: スタックの先頭にパス。出力: スタックの先頭に正規化したパス。失敗
+;   （API の失敗・${NSIS_MAX_STRLEN} に収まらない・`\\` で始まる UNC／`\\?\`）
+;   なら ""。$0〜$3 は保存して戻す。
+Function ChronoGazerNormalizePath
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  System::Call 'kernel32::GetFullPathNameW(w r0, i ${NSIS_MAX_STRLEN}, w .r1, p 0) i .r2'
+  ${If} $2 <= 0
+  ${OrIf} $2 >= ${NSIS_MAX_STRLEN}
+    StrCpy $0 ""
+  ${Else}
+    StrCpy $0 $1
+    StrCpy $3 $0 2
+    ${If} $3 == "\\"
+      StrCpy $0 ""
+    ${Else}
+      StrLen $2 $0
+      StrCpy $3 $0 1 -1
+      ${If} $3 == "\"
+      ${AndIf} $2 > 3
+        StrCpy $0 $0 -1
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+; パスの本当の置き場（ジャンクション・シンボリックリンク・SUBST を解いた DOS
+; パス）を求める。パスそのものはまだ無くてよい: 存在する最も深い親フォルダを
+; `CreateFileW`（FILE_FLAG_BACKUP_SEMANTICS）で開いて
+; `GetFinalPathNameByHandleW`（VOLUME_NAME_DOS）で実パスにし、無い残りの部分を
+; そのまま継ぎ足す。
+;   入力: スタックの先頭にパス。出力: スタックの先頭に実パス（末尾の `\` なし）。
+;   正規化の失敗・ルートまで遡っても無い・開けない・API の失敗・
+;   ${NSIS_MAX_STRLEN} に収まらない・結果が `\\?\UNC\`（ネットワーク）なら ""
+;   （呼び出し側は "" を「Program Files の外」として扱う = 安全側に倒す）。
+;   $0〜$5 は保存して戻す。
+Function ChronoGazerResolveRealPath
+  Exch $0
+  Push $1
+  Push $2
+  Push $3
+  Push $4
+  Push $5
+  ; $1 = 存在する親（正規化したパスから、無い末尾の部分を 1 つずつ外す）、
+  ; $2 = 外した部分（`\a\b` の形で前に積む）、$0 = 結果。
+  Push $0
+  Call ChronoGazerNormalizePath
+  Pop $1
+  StrCpy $2 ""
+  StrCpy $0 ""
+  ; ルート `C:\` は `C:` にしておく（`$1\*.*`・`$1$2` の継ぎ足しで `\` が重ならない
+  ; ように）。開くときだけ `C:\` に戻す（下）。
+  StrLen $4 $1
+  ${If} $4 == 3
+    StrCpy $3 $1 1 -1
+    ${If} $3 == "\"
+      StrCpy $1 $1 -1
+    ${EndIf}
+  ${EndIf}
+  ${If} $1 != ""
+    ${Do}
+      ${If} ${FileExists} "$1\*.*"
+        ${Break}
+      ${EndIf}
+      ; 最後の `\` を後ろから探す（$3 = 負の位置）。`C:` まで来て無ければ失敗。
+      StrLen $4 $1
+      ${If} $4 <= 3
+        StrCpy $1 ""
+        ${Break}
+      ${EndIf}
+      StrCpy $3 0
+      ${Do}
+        IntOp $3 $3 - 1
+        IntOp $5 0 - $3
+        ${If} $5 > $4
+          StrCpy $1 ""
+          ${Break}
+        ${EndIf}
+        StrCpy $5 $1 1 $3
+        ${If} $5 == "\"
+          ${Break}
+        ${EndIf}
+      ${Loop}
+      ${If} $1 == ""
+        ${Break}
+      ${EndIf}
+      StrCpy $5 $1 "" $3
+      StrCpy $2 "$5$2"
+      StrCpy $1 $1 $3
+    ${Loop}
+  ${EndIf}
+  ${If} $1 != ""
+    ; `C:` だけは `C:\`（`C:` は「C: のカレント」を指してしまう）。
+    StrLen $4 $1
+    ${If} $4 == 2
+      StrCpy $1 "$1\"
+    ${EndIf}
+    ; アクセス 0（属性だけ）・共有 読み|書き|削除 (7)・OPEN_EXISTING (3)・
+    ; FILE_FLAG_BACKUP_SEMANTICS (0x02000000 = 33554432。フォルダを開くのに要る)。
+    ; 開けなければ INVALID_HANDLE_VALUE で、次の GetFinalPathNameByHandleW が 0 を
+    ; 返すので、別に見なくても失敗になる。
+    System::Call 'kernel32::CreateFileW(w r1, i 0, i 7, p 0, i 3, i 33554432, p 0) p .r3'
+    System::Call 'kernel32::GetFinalPathNameByHandleW(p r3, w .r4, i ${NSIS_MAX_STRLEN}, i 0) i .r5'
+    System::Call 'kernel32::CloseHandle(p r3)'
+    ${If} $5 > 0
+    ${AndIf} $5 < ${NSIS_MAX_STRLEN}
+      StrCpy $3 $4 8
+      StrCpy $1 $4 4
+      ${If} $3 == "\\?\UNC\"
+        StrCpy $0 ""
+      ${ElseIf} $1 == "\\?\"
+        StrCpy $0 $4 "" 4
+        StrCpy $3 $0 1 -1
+        ${If} $3 == "\"
+          StrCpy $0 $0 -1
+        ${EndIf}
+        StrCpy $0 "$0$2"
+      ${Else}
+        StrCpy $0 ""
+      ${EndIf}
+    ${EndIf}
+  ${EndIf}
+  Pop $5
+  Pop $4
+  Pop $3
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
 
 ; 事前の確かめ (0b): サービス ChronoGazer が既に登録されていれば、その実行ファイルが
 ; この $INSTDIR の chronogazer-server.exe でなければ止める。service-install は登録済みの
