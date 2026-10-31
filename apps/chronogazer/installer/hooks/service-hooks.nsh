@@ -56,7 +56,9 @@
 ;       インストールが黙ってできてしまう。PerMachine は既定の場所を決めるだけで、
 ;       ディレクトリの頁や `/D=` で別の場所を選べる（#972 の Codex の指摘）。比べる
 ;       のは文字列ではなく**本当の置き場**（`..` を畳み、ジャンクションを解いた
-;       実パス。既定の場所側も同じに解く。求まらなければ「違う」）。「Program Files
+;       実パス）で、それが既定の場所の書いたとおりの形と等しいこと。既定の場所か
+;       その上のフォルダが再解析ポイントなら断る（#972 のオーナーレビュー
+;       （f9d858b）。求まらなければ「違う」）。「Program Files
 ;       の中ならどこでも」ではなく既定の場所だけにするのは、Program Files の中に
 ;       一般の利用者が書けるサブフォルダ（別のアプリが緩めたものなど）があると、
 ;       そこを `/D=` で選べば置いた exe を後から差し替えられるため（#972 の
@@ -585,33 +587,33 @@ Var ServiceStopWaitCounter
 ; 文字列だけで見ると `/D=C:\Program Files\..\Users\Public\ChronoGazer` や
 ; Program Files の中のジャンクションが通り、実際の置き場が外でも、ファイルを
 ; 写した後の service-install まで気付けない（#972 のオーナーレビュー（7f86c38））。
-; そこで、ファイルを変える前のここで**本当の置き場**を比べる: $INSTDIR と
-; `$PROGRAMFILES64\ChronoGazer` をそれぞれ ChronoGazerResolveRealPath（下。`..` の
-; 正規化 + ジャンクションを解いた実パス。Program Files 自体が付け替えられていても
-; 同じに扱う。まだ無いフォルダは、ある親まで解いて残りを継ぎ足す）にしてから、
-; 全体が等しいかを見る。実パスが求まらなければ（API の失敗・ネットワークパスなど）
-; 「違う」として止める（安全側）。
+; そこで、ファイルを変える前のここで**本当の置き場**を比べる: $INSTDIR を
+; ChronoGazerResolveRealPath（下。`..` の正規化 + ジャンクションを解いた実パス。
+; まだ無いフォルダは、ある親まで解いて残りを継ぎ足す）にし、既定の場所は**解かずに**
+; ChronoGazerNormalizePath（`..` などを畳むだけ）にして、全体が**書いたとおりに**
+; 等しいかを見る。実パスは存在する全ての構成要素を通して解くので、既定の場所
+; `C:\Program Files\ChronoGazer` かその上のフォルダがジャンクション／シンボリック
+; リンクだと実パスが書いた既定の場所と食い違い、止まる（Program Files 自体が
+; 付け替えられていても同じ。両方を解いて比べるとユーザーが書ける場所への
+; ジャンクションが通ってしまう。#972 のオーナーレビュー（f9d858b））。実パスが
+; 求まらなければ（API の失敗・ネットワークパスなど）「違う」として止める（安全側）。
 ;
-; 通ったときは $INSTDIR を `..`・`.`・重なった区切りを畳んだ形に置き換える
-; （ジャンクションは解かない = 利用者が選んだ場所の表記は保つ）。後の (0b)
+; 通ったときは $INSTDIR を既定の場所の書き方（`$PROGRAMFILES64\ChronoGazer` を
+; `..`・`.`・重なった区切りを畳んだ形）に置き換える。後の (0b)
 ; （サービスの ImagePath との比較）・(0c)（InstallLocation との比較）と、
 ; テンプレートが書く InstallLocation・elev が登録する exe のパスが同じ表記に
 ; なるようにするため。このマクロは事前の確かめの先頭に置くこと。
 ;
-; $0〜$5 を壊す（呼び出し側はこの後に自分で入れ直す。前からの $0〜$4 と同じ）。
+; $0〜$2 を壊す（呼び出し側はこの後に自分で入れ直す。前からの $0〜$4 と同じ）。
 !macro RequireDefaultInstallDir
-  Push "$INSTDIR"
-  Call ChronoGazerNormalizePath
-  Pop $5
   Push "$INSTDIR"
   Call ChronoGazerResolveRealPath
   Pop $0
   Push "$PROGRAMFILES64\ChronoGazer"
-  Call ChronoGazerResolveRealPath
+  Call ChronoGazerNormalizePath
   Pop $2
   StrCpy $1 0
   ${If} $0 != ""
-  ${AndIf} $5 != ""
   ${AndIf} $2 != ""
   ${AndIf} $0 == $2
     StrCpy $1 1
@@ -620,13 +622,13 @@ Var ServiceStopWaitCounter
     ${If} $0 == ""
       StrCpy $0 "（求められませんでした）"
     ${EndIf}
-    DetailPrint "chronogazer: インストール先 $INSTDIR（実際の場所: $0）は既定の場所 ($PROGRAMFILES64\ChronoGazer) ではありません。記録エンジンのサービスを登録できないため、インストールを中止しました。"
-    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が既定の場所ではありません。$\r$\n実際の場所: $0$\r$\n$\r$\nChronoGazer は既定の場所 ($PROGRAMFILES64\ChronoGazer) にしかインストールできません。記録エンジンは、一般の利用者が書き換えられないこの場所に置かないとサービスとして登録できません。インストール先を変えずにインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
+    DetailPrint "chronogazer: インストール先 $INSTDIR（実際の場所: $0）は既定の場所 ($PROGRAMFILES64\ChronoGazer) ではありません（既定の場所かその上のフォルダが、別の場所へのジャンクションやリンクになっている場合も含みます）。記録エンジンのサービスを登録できないため、インストールを中止しました。"
+    MessageBox MB_OK|MB_ICONSTOP "インストール先 ($INSTDIR) が既定の場所ではありません。$\r$\n実際の場所: $0$\r$\n$\r$\nChronoGazer は既定の場所 ($PROGRAMFILES64\ChronoGazer) にしかインストールできません（既定の場所かその上のフォルダが、別の場所へのジャンクションやリンクになっている場合も含みます）。記録エンジンは、一般の利用者が書き換えられないこの場所に置かないとサービスとして登録できません。インストール先を変えずにインストールし直してください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
     Abort "インストール先が既定の場所ではないため、インストールを中止しました。"
   ${EndIf}
-  ${If} $5 != "$INSTDIR"
-    DetailPrint "chronogazer: インストール先 $INSTDIR を $5 として扱います。"
-    StrCpy $INSTDIR $5
+  ${If} $2 != "$INSTDIR"
+    DetailPrint "chronogazer: インストール先 $INSTDIR を $2 として扱います。"
+    StrCpy $INSTDIR $2
   ${EndIf}
 !macroend
 

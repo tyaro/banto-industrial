@@ -265,7 +265,8 @@ Copy-Item target\release\chronogazer-elev.exe 'C:\Program Files\ChronoGazer\'
   強制終了する道は無い（tauri-bundler の標準の強制終了は使わない）。
 - **インストール先は既定の場所だけ（#972 のオーナーレビュー（2b9ad63））**: `C:\Program Files\ChronoGazer`
   （`$PROGRAMFILES64\ChronoGazer`）以外は、ディレクトリの頁や `/D=` で選んでも、何も変えずに案内して止まる（本当の
-  置き場（`..` を畳み、ジャンクションを解いた実パス）で比べる）。Program Files の中の別のフォルダも不可: 一般の利用者が
+  置き場（`..` を畳み、ジャンクションを解いた実パス）が既定の場所の書いたとおりの形と等しいことを求める。既定の場所かその上の
+  フォルダがジャンクションやリンクなら断る。#972 のオーナーレビュー（f9d858b））。Program Files の中の別のフォルダも不可: 一般の利用者が
   書けるサブフォルダを選べば、そこに置いた `chronogazer-server.exe` が LocalSystem のサービスとして登録されたうえで後から
   差し替えられるため。さらに、ファイルを置く前に `icacls` でインストール先の所有者を Administrators にし、明示の
   アクセス権を捨てて Program Files から継承するものだけに戻す（管理者が弱いアクセス権で先に作った
