@@ -120,7 +120,7 @@ Var StopWaitCounter
   StrCpy $0 "0"
   ${If} ${flag_var} == "1"
     StrCpy ${flag_var} "0"
-    DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: 上書き前に稼働していた ${service_name} サービスを再開します..."
+    DetailPrint "${SERVICE_COMMON_LOG_PREFIX}: 止めていた ${service_name} サービスを再開します..."
     nsExec::ExecToStack 'sc start "${service_name}"'
     Pop $0
     ${If} $0 != "0"
