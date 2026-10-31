@@ -1,7 +1,7 @@
 # banto-hub OPC UA 検証
 
-状態: **自動 interop smoke 実装・Linux 実接続検証済み。Windows Service と UaExpert の実機確認は未実施。**
-最終更新: 2026-10-17（#634: 有効化の PUT は起動の完了を待たずに返るので、手順 4 に状態の API での確認を足した。#636: 手動確認の手順 7 の文言の重複を直し、Machine 環境変数を消す後始末を手順 8 として追加）。2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
+状態: **自動 interop smoke 実装・Linux 実接続検証済み。Windows Service と UaExpert の実機確認も済み（2026-11-01、下の「手動試験記録」。全項目が期待どおり）。**
+最終更新: 2026-11-01（#201・#943: Windows Service と UaExpert の手動試験を、S7 の機材の BantoHub サービスを別の profile に切り替えて行い、記録の表を埋めた。サービスの鍵と証明書の置き場の ACL と、再起動での再利用も記録した。専用 VM でない PC で行う手順を「既にサービスがある PC で行うとき」に足した）。2026-10-17（#634: 有効化の PUT は起動の完了を待たずに返るので、手順 4 に状態の API での確認を足した。#636: 手動確認の手順 7 の文言の重複を直し、Machine 環境変数を消す後始末を手順 8 として追加）。2026-10-16（#201、Hub #627 マージ後の外部クライアント試験を追加）。
 
 ローカル確認: Hub `b130385`（`0.2.0-alpha.31`）、Rust 1.98.1、Python 3.12、asyncua 1.1.8。新しい CI ワークフローでの結果は PR のチェックを参照する。
 
@@ -56,18 +56,27 @@ Linux 専用の `.github/workflows/opcua-interop.yml` は Python 3.12 と固定 
 
    この手順も、専用 VM・実データなしの前提は変えない。既にこれらの変数を持っていた VM を再利用する場合は、手順 2 の前に元の値を記録しておき、削除ではなく元の値に戻す。
 
+### 既にサービスがある PC で行うとき（2026-11-01、オーナー決定）
+
+2026-11-01 の試験は、専用 VM ではなく S7 の機材（BantoHub サービスが入っている PC）で、**サービスを試験専用の profile に切り替えて**行った。本番の profile には触れない。Machine の環境変数は使わず、サービスの `Environment`（レジストリの複数行の文字列）に足して戻す。
+
+1. 管理者 PowerShell で今の `Environment` をファイルに控え（`(Get-ItemProperty HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub).Environment`）、サービスを止める。
+2. **先に `banto-hub-elev.exe grant-profile-acl <利用者> <試験の profile-id>` を実行する。** 無い profile では戻す相手の記録（`Owners`）が無く、サービスは運用モードにできずに終了コード 4 で止まる（イベント 7024 の「ファイルを開くことができません」は 4 を Win32 のエラーとして読んだ文面）。
+3. `Environment` に `BANTO_HUB_PROFILE=<試験の profile-id>` と `BANTO_ALLOW_SETUP=1` を足して起動する。初回 setup の後に `BANTO_ALLOW_SETUP` を外して起動し直す。以降は手順 4〜7 と同じ。試運転モードの間は、loopback から `POST /api/auth/grant/commissioning`（ヘッダ `X-Banto-Client: banto`）で REST を操作できる。
+4. 終わったら、控えた `Environment` をそのまま書き戻して起動し、`Environment` の読み戻しと、サービスログで本番の profile の `DB at`・待ち受けを確かめる。試験の profile は残る（消すかは別に決める）。
+
 ## 手動試験記録
 
-| 項目                                 | 期待値                                     | 実測結果 |
-| ------------------------------------ | ------------------------------------------ | -------- |
-| ビルド SHA / バージョン              |                                            |          |
-| Windows VM / OS build                | 専用・実データなし                         |          |
-| 実施者 / UTC 日時                    |                                            |          |
-| Service install/start/stop/uninstall | `BantoHub` が起動・停止し登録解除できる    |          |
-| UaExpert endpoint / security         | endpoint に接続、Security None / Anonymous |          |
-| Browse / Read / status               | 指定タグを発見、数値 Double、Good          |          |
-| REST 更新 / DataChange               | 新値を通知、Good                           |          |
-| SourceTimestamp                      | 値変更なしの連続 Read で同値               |          |
-| UaExpert Write                       | 拒否、元値を保持                           |          |
-| Service 再起動 / NodeId              | 同じ endpoint と NodeId で再接続           |          |
-| 備考・ログ参照                       | 秘密値を含まない記録先                     |          |
+| 項目                                 | 期待値                                     | 実測結果                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ------------------------------------ | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ビルド SHA / バージョン              |                                            | `b2d3e75c`・`0.3.0-alpha.1`（S7 の版。`banto-hub.exe` の SHA256 `e4c82ee1…`）                                                                                                                                                                                                                                                                                                                              |
+| Windows VM / OS build                | 専用・実データなし                         | 専用 VM ではない。S7 の機材 `MSI-A13`、Windows 11 Pro 10.0.26300。試験専用の profile `interop-201`（実データなし）に切り替えて行い、本番の profile `default` には触れていない（上の「既にサービスがある PC で行うとき」）                                                                                                                                                                                  |
+| 実施者 / UTC 日時                    |                                            | オーナー（管理者の操作・UaExpert）と Claude（REST・読み戻し）/ 2026-10-31 17:30〜17:44 UTC                                                                                                                                                                                                                                                                                                                 |
+| Service install/start/stop/uninstall | `BantoHub` が起動・停止し登録解除できる    | 起動・停止・再起動は可。登録・解除はしていない（S7 のサービスを使ったため。インストーラでの登録は 2026-10-31 の P-2 で済み）。最初の起動は `grant-profile-acl` の前で、終了コード 4 で止まった（期待どおりの断り）                                                                                                                                                                                         |
+| UaExpert endpoint / security         | endpoint に接続、Security None / Anonymous | `opc.tcp://127.0.0.1:4840/`、None / Anonymous で接続                                                                                                                                                                                                                                                                                                                                                       |
+| Browse / Read / status               | 指定タグを発見、数値 Double、Good          | `Objects/Banto/mem/interop/temp1`（`ns=2;s=mem.interop.temp1`、internal・f32）を発見。`Double`・12.5・Good                                                                                                                                                                                                                                                                                                 |
+| REST 更新 / DataChange               | 新値を通知、Good                           | REST で 20.25 を書くと Subscription に 20.25・Good が届いた。SourceTimestamp は REST の書込みの時刻                                                                                                                                                                                                                                                                                                        |
+| SourceTimestamp                      | 値変更なしの連続 Read で同値               | 連続の Read で同値。ServerTimestamp も値の変更の時刻のまま進まなかった                                                                                                                                                                                                                                                                                                                                     |
+| UaExpert Write                       | 拒否、元値を保持                           | `BadUserAccessDenied` で拒否。REST の読み戻しで値と時刻は元のまま                                                                                                                                                                                                                                                                                                                                          |
+| Service 再起動 / NodeId              | 同じ endpoint と NodeId で再接続           | 再起動の後、UaExpert が自分で同じ endpoint・NodeId に再接続。値は retain なしの internal のため未取得の Bad になり、REST で書き直すと Good                                                                                                                                                                                                                                                                 |
+| 備考・ログ参照                       | 秘密値を含まない記録先                     | #943 の鍵の置き場（サービス、LocalSystem）: `data\opcua\pki` は保護された ACL で SYSTEM・Administrators のフルだけ。`private`・`private.pem`・`own\cert.der` はそれを継承した同じ 2 つだけ。記録上の利用者（管理者でない）からは置き場も鍵も開けない。再起動の前後で鍵と証明書の SHA256 が一致（作り直していない）。サービスログは `C:\ProgramData\BantoHub\profiles\interop-201\logsanto-hub-service.log` |
