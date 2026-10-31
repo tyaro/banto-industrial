@@ -1,7 +1,8 @@
 # banto-tagclient 設計
 
 作成日: 2026-08-29
-状態: **2026-09-30 オーナー決定（docs/scada-design.md §9.6）で、bindingと書き込みの同一性を
+状態: **#682（2026-10-31、設計のみ）: 部分 Binding 解決（未解決名があっても解決できた名前だけで購読し、未解決は個別診断）と、同一世代の catalog / 解決結果 / current を 1 つの snapshot で公開する契約拡張は [banto-tagclient-partial-binding-design.md](banto-tagclient-partial-binding-design.md) が正。実装後に本書 §3.1・§3.2・§4・§5 をそれに合わせて直す。**
+**2026-09-30 オーナー決定（docs/scada-design.md §9.6）で、bindingと書き込みの同一性を
 Hub内部の数値ID（`StableTagId`）から外部名（`external_name`）に変更した（§3.1・§4.4。
 SDKと呼び出し側は追従済み）。改名でbindingがunresolvedになるのは仕様。**
 **S4統合ゲート完了（2026-09-02）。S4a・W1完了（2026-09-01）**。
