@@ -361,9 +361,15 @@ pub enum ElevatedError {
     /// 誰もが SYSTEM の権限を得るため、登録の前に止める。Program Files の場所が分からない
     /// ときも止める。
     #[error(
-        "banto-hub-elev: {0} は Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして使うと権限の昇格に使われるため、止めます（C:\\Program Files\\ に置いた banto-hub-elev.exe を実行してください）"
+        "banto-hub-elev: {0} は Program Files の外にあります。一般の利用者が書き換えられる場所の exe を LocalSystem のサービスとして使うと権限の昇格に使われるため、止めます（C:\\Program Files\\BantoHub\\ に置いた banto-hub-elev.exe を実行してください）"
     )]
     ExeOutsideProgramFiles(String),
+    /// Program Files の場所が 1 つも確かめられない（正規化後に空）ため止める（#973）。
+    #[error("banto-hub-elev: Program Files の場所を確かめられないため、サービスの登録を止めます")]
+    ProgramFilesUnavailable,
+    /// 隣の`banto-hub.exe`が無い・読めない（正規化の失敗、#973）。
+    #[error("banto-hub-elev: 隣の banto-hub.exe が見つからないか読めません（{0}）。インストール先の banto-hub-elev.exe を実行してください")]
+    SiblingExeUnavailable(String),
     /// `GetUserNameW`（現在の対話ユーザー名取得）の失敗。
     #[error(
         "banto-hub-elev: 現在の対話ユーザー名の取得に失敗しました (GetUserNameW, os error {0})"
@@ -765,12 +771,8 @@ fn sibling_banto_hub_exe_path() -> Result<std::path::PathBuf, ElevatedError> {
         )
     })?;
     let exe = dir.join("banto-hub.exe");
-    let exe = normalize_existing(&exe).map_err(|err| {
-        ElevatedError::CurrentExePathFailed(format!(
-            "{} のパスを正規化できません（無いか、読めません）: {err}",
-            exe.display()
-        ))
-    })?;
+    let exe = normalize_existing(&exe)
+        .map_err(|err| ElevatedError::SiblingExeUnavailable(format!("{}: {err}", exe.display())))?;
     // 正規化できなかった Program Files の場所は候補から外す（全部外れたら空 = 止める側）。
     let dirs: Vec<std::path::PathBuf> = banto_safe_root::guard::win::program_files_dirs()
         .iter()
@@ -821,7 +823,9 @@ fn ensure_inside_program_files(
     exe: &std::path::Path,
     program_files_dirs: &[std::path::PathBuf],
 ) -> Result<(), ElevatedError> {
-    if is_inside_program_files(exe, program_files_dirs) {
+    if program_files_dirs.is_empty() {
+        Err(ElevatedError::ProgramFilesUnavailable)
+    } else if is_inside_program_files(exe, program_files_dirs) {
         Ok(())
     } else {
         Err(ElevatedError::ExeOutsideProgramFiles(
@@ -1932,11 +1936,12 @@ mod tests {
             "banto-hub-elev: C:\\Temp\\banto-hub.exe は Program Files の外にあります"
         ));
         assert_eq!(line.matches("banto-hub-elev: ").count(), 1);
-        assert!(ensure_inside_program_files(
-            Path::new(r"C:\Program Files\BantoHub\banto-hub.exe"),
-            &[]
-        )
-        .is_err());
+        let err =
+            ensure_inside_program_files(Path::new(r"C:\Program Files\BantoHub\banto-hub.exe"), &[])
+                .unwrap_err();
+        let line = failure_line(&err);
+        assert!(line.starts_with("banto-hub-elev: Program Files の場所を確かめられない"));
+        assert_eq!(line.matches("banto-hub-elev: ").count(), 1);
     }
 
     /// #973: 正規化は実ファイルで、`\\?\`付き・付きでない・（取れれば）8.3 のどれからでも同じ
