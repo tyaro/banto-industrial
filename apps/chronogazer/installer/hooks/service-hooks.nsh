@@ -43,6 +43,9 @@
 ;       昇格を防ぐため）ので、外に入れるとサービスの無いインストールが黙って
 ;       できてしまう。PerMachine は既定の場所を決めるだけで、ディレクトリの頁や
 ;       `/D=` で外を選べる（#972 の Codex の指摘）。
+;   (0b) サービスが登録済みなら、その exe がこの $INSTDIR のものかを確かめる。違えば
+;       案内して `Abort`（service-install は登録済みのサービスを作り直さないので、別の
+;       フォルダへ入れ直すとサービスが古い exe を指したまま残る。#972 の Codex の指摘）。
 ;   (1) O-3: 旧い利用者単位の版の案内（下記「旧い利用者単位の版」節）。
 ;   (2) シェルの終了（下記「シェルの終了」節）。[キャンセル] ならここで中止 -
 ;       サービスはまだ止めていないので、何も止めずに終わる。
@@ -251,6 +254,36 @@ Var ShellQuitWaitCounter
   ${EndIf}
 !macroend
 
+; PREINSTALL (0b): サービス ChronoGazer が既に登録されていれば、その実行ファイルが
+; この $INSTDIR の chronogazer-server.exe でなければ止める。service-install は登録済みの
+; サービスを作り直さない（起動種別などを保つため）ので、別のフォルダへ入れ直すと
+; サービスは古い exe を指したまま残り、再開すると古い記録エンジンが動く（#972 の
+; Codex の指摘）。ImagePath は `"<exe>" run-service` の形（引用符なしも念のため受ける）。
+; NSIS の `==` は大文字小文字を区別しない。
+!macro RequireRegisteredServiceInInstallDir
+  ReadRegStr $0 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "ImagePath"
+  ${If} $0 != ""
+    StrCpy $1 0
+    StrCpy $2 '"$INSTDIR\chronogazer-server.exe"'
+    StrLen $3 $2
+    StrCpy $4 $0 $3
+    ${If} $4 == $2
+      StrCpy $1 1
+    ${EndIf}
+    StrCpy $2 "$INSTDIR\chronogazer-server.exe "
+    StrLen $3 $2
+    StrCpy $4 $0 $3
+    ${If} $4 == $2
+      StrCpy $1 1
+    ${EndIf}
+    ${If} $1 != 1
+      DetailPrint "chronogazer: サービス ChronoGazer は別の場所の実行ファイル ($0) で登録されています。インストール先 $INSTDIR と違うため、インストールを中止しました。"
+      MessageBox MB_OK|MB_ICONSTOP "サービス ChronoGazer は、別の場所の実行ファイルで登録されています。$\r$\n$\r$\n登録: $0$\r$\nインストール先: $INSTDIR$\r$\n$\r$\nこのまま入れると、サービスは古い実行ファイルを使い続けます。今の場所へインストールし直すか、先に今の ChronoGazer をアンインストールしてください。$\r$\n$\r$\nまだ何も変更していません。" /SD IDOK
+      Abort "サービス ChronoGazer の登録の場所がインストール先と違うため、インストールを中止しました。"
+    ${EndIf}
+  ${EndIf}
+!macroend
+
 ; O-3: 旧い利用者単位の版があれば案内する（上の「旧い利用者単位の版」節）。
 !macro WarnAboutLegacyCurrentUserInstall
   ReadRegStr $0 HKCU "${CHRONOGAZER_LEGACY_UNINSTKEY}" "UninstallString"
@@ -265,6 +298,7 @@ Var ShellQuitWaitCounter
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro RequireInstallDirInProgramFiles
+  !insertmacro RequireRegisteredServiceInInstallDir
   !insertmacro WarnAboutLegacyCurrentUserInstall
   !insertmacro QuitShellForUpdate "インストール" 0 "まだ何も変更していません"
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
