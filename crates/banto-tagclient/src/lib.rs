@@ -45,10 +45,17 @@
 //! a number); it advances on every attempt that fetched a catalog, so it is
 //! only guaranteed to grow, not to grow by one. Every non-`Live` state drops the
 //! snapshot together with `current`.
-//! `TagClientState::current` stays as the values of that snapshot. This slice
-//! does not change behaviour: one unresolved binding still fails the attempt
-//! with `binding_unresolved`; [`UnresolvedBinding::reason`] only names why
-//! ([`UnresolvedReason`]).
+//! `TagClientState::current` stays as the values of that snapshot.
+//!
+//! #682 PR-2 (partial binding, design §8): an attempt goes `Live` as soon as
+//! one requested binding resolves. Only the resolved names are subscribed,
+//! fetched, and published; each unresolved request is listed in
+//! [`BindingResolution::unresolved`] with its [`UnresolvedReason`] and no
+//! value, and a later `config_changed` rebind moves names between the two
+//! lists (created names resolve, renamed or deleted ones become unresolved;
+//! similar names are never assigned). Duplicate bindings, requests, or
+//! catalog names still fail the whole attempt. Until PR-3, an attempt in
+//! which nothing resolved still fails with `binding_unresolved`.
 //!
 //! The DTOs mirror the machine-facing snake_case `/api/v1/tags` and
 //! `/api/v1/values` responses. Unknown mode, source, and quality strings are

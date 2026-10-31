@@ -13,9 +13,19 @@ pub enum ErrorKind {
     DuplicateBindingKey,
     DuplicateRequestedExternalName,
     DuplicateCatalogExternalName,
-    /// The requested `external_name` is not in the current catalog (never
-    /// created, deleted, or renamed - a rename makes the old name unresolved,
-    /// tag-server-design.md §4.1). The value is never treated as current.
+    /// banto-hub rejected a subscribe with `{"op":"error","code":"unknown_tag"}`:
+    /// a requested tag disappeared between the catalog fetch and the
+    /// subscribe. Rebindable - the next catalog moves that name to
+    /// `BindingResolution::unresolved` (#682,
+    /// docs/banto-tagclient-partial-binding-design.md §4.3).
+    ///
+    /// A name missing from the catalog (never created, deleted, or the old
+    /// name after a rename - tag-server-design.md §4.1) is not an error by
+    /// itself: it is listed in `BindingResolution::unresolved` and the other
+    /// bindings still go `Live`. Its value is never treated as current.
+    ///
+    /// Interim (#682 PR-2 until PR-3): the worker also returns this when no
+    /// requested binding resolved at all (`resolved` is empty).
     BindingUnresolved,
     Unauthorized,
     Transport,

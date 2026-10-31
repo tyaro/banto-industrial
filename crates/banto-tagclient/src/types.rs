@@ -271,6 +271,11 @@ pub enum TagClientConnectionState {
     Handshaking,
     Live,
     Rebinding,
+    /// Waiting out a backoff before fetching the catalog again, whatever the
+    /// cause: a disconnect, a transport or protocol error, or a rebind budget
+    /// spent on repeated configuration changes / metadata mismatches. The
+    /// cause is in [`TagClientState::last_error`] (#682,
+    /// docs/banto-tagclient-partial-binding-design.md §5).
     Reconnecting,
     Unauthorized,
 }
