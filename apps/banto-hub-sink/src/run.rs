@@ -1789,6 +1789,117 @@ mod tests {
         }
     }
 
+    /// テーブルが変わる（書き先が変わる）とき、DB が生きていれば `flush_before_discard`
+    /// が旧テーブルへ流し切ってから捨てる道: 全行が旧テーブルに入り、`dropped` は
+    /// 増えず、上限（`shutdown_flush`）を待たずに終わり、新しい世代は新しい
+    /// テーブル名で動く。実 PostgreSQL（`BANTO_TEST_PG_URL`）が無ければスキップ。
+    #[tokio::test]
+    async fn changing_the_table_flushes_the_queue_into_the_old_table_when_the_db_is_alive() {
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let _log_guard = service_log_lock().await;
+        let _log_path = enable_test_service_log("flush-then-switch");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("BANTO_TEST_PG_URL に接続できる");
+        let suffix = format!("{}_{}", std::process::id(), ts_nanos());
+        let old_table = format!("sink_keep_old_{suffix}");
+        let new_table = format!("sink_keep_new_{suffix}");
+        for table in [&old_table, &new_table] {
+            sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(table)))
+                .execute(&pool)
+                .await
+                .expect("create table");
+        }
+
+        let flush_limit = Duration::from_secs(5);
+        let mut engine = offline_engine(flush_limit);
+        let connections = vec![connection(10, "pw")];
+        let applied = group(1, 10, &old_table);
+        let runtime = Arc::new(GroupRuntime::new(&applied, 100, 0).expect("group"));
+        const ROWS: usize = 5;
+        runtime.push_rows((1..=ROWS as i64).map(one_row).collect());
+        engine.groups.insert(runtime.clone());
+        engine
+            .producers
+            .insert(1, tokio::spawn(std::future::pending()));
+        engine.applied_groups.insert(1, applied.clone());
+        engine
+            .applied_connections
+            .insert(10, connections[0].clone());
+        // 周期は 60 秒なので、apply_plan の起床の頼みが無い限り流れない。
+        let handle = crate::flush::spawn_flusher(
+            connections[0].clone(),
+            pool.clone(),
+            engine.groups.clone(),
+            engine.flush_options(),
+            engine.redactor.clone(),
+        );
+        engine.flushers.insert(10, handle);
+
+        let mut changed = applied.clone();
+        changed.table_name = new_table.clone();
+        let started = StdInstant::now();
+        engine
+            .apply_plan(desired(vec![changed.clone()], connections))
+            .await;
+        let elapsed = started.elapsed();
+
+        let count = |table: &str| {
+            let sql = format!("SELECT count(*) FROM {table}");
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count")
+            }
+        };
+        let in_old = count(&old_table).await;
+        let in_new = count(&new_table).await;
+        let next = engine.groups.get(1).expect("new generation is registered");
+        let next_queued = next.queued();
+        let next_dropped = next.dropped();
+        let next_table = next.table.raw().to_owned();
+        let applied_table = engine.applied_groups.get(&1).map(|g| g.table_name.clone());
+        let has_producer = engine.producers.contains_key(&1);
+        let text = std::fs::read_to_string(&_log_path).unwrap_or_default();
+
+        for (_, task) in engine.producers.drain() {
+            task.abort();
+        }
+        for table in [&old_table, &new_table] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(in_old, ROWS as i64, "全行が旧テーブルに入る");
+        assert_eq!(in_new, 0, "新テーブルには旧世代の行は入らない");
+        assert!(!Arc::ptr_eq(&next, &runtime), "新しい世代に置き換わる");
+        assert_eq!(next_queued, 0, "書き先が変わった世代は空のキューで始まる");
+        assert_eq!(next_dropped, 0, "流し切れたので dropped は増えない");
+        assert_eq!(next_table, new_table, "新しいテーブル名で動く");
+        assert_eq!(applied_table.as_deref(), Some(new_table.as_str()));
+        assert!(has_producer);
+        assert!(
+            elapsed < flush_limit / 2,
+            "流し切れたら上限まで待たない: {elapsed:?}"
+        );
+        assert!(!text.contains("破棄しました"), "{text}");
+    }
+
+    fn ts_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
     /// 削除されるグループが `backoff`（DB 停止中）なら flush を待たずに捨てる。
     #[tokio::test]
     async fn a_removed_group_in_backoff_is_discarded_without_waiting() {
