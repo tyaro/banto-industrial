@@ -57,6 +57,11 @@
 
 use std::time::Duration;
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use banto_db_source::{
     cell_verdict, classify, describe_columns, describe_retry_interval, describe_wrapper_sql,
     pg_connect_options, query_timeout, resolve_columns, ColumnBadReason, GroupLadder, PgFailure,
@@ -416,6 +421,12 @@ pub async fn run_poller(
         status: StatusText::new(spec.queries.len()),
         redactor: &redactor,
     };
+    // Query log episodes outlive the PostgreSQL pool/quality-state generations.
+    let query_failures: Vec<_> = spec
+        .queries
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
     let mut attempt: u32 = 0;
     let mut last_delay: Option<Duration> = None;
     loop {
@@ -441,7 +452,8 @@ pub async fn run_poller(
                 attempt = 0;
                 last_delay = None;
                 events.status.connection = None;
-                let outcome = poll_until_failure(&pool, &spec, &mut events, &mut stop).await;
+                let outcome =
+                    poll_until_failure(&pool, &spec, &mut events, &mut stop, &query_failures).await;
                 pool.close().await;
                 match outcome {
                     PollOutcome::Stopped => return,
@@ -529,16 +541,15 @@ struct QueryRuntime {
     next_due: Instant,
     next_describe_retry: Option<Instant>,
     warned_multi_row: bool,
-    warned_failure: bool,
+    warned_failure: Arc<AtomicBool>,
 }
 
 impl QueryRuntime {
     fn on_query_failure(&mut self) -> (Vec<ValueItem>, bool) {
-        let (items, first) = self.state.on_query_failure();
-        let warn = first && !self.warned_failure;
-        if warn {
-            self.warned_failure = true;
-        }
+        let (items, _) = self.state.on_query_failure();
+        // Logging has a longer lifetime than the quality ladder (which is reset
+        // by re-describe/reconnect); warn once until SQL actually executes again.
+        let warn = !self.warned_failure.swap(true, Ordering::Relaxed);
         (items, warn)
     }
 
@@ -546,7 +557,7 @@ impl QueryRuntime {
     /// no rows (that remains a separate data-quality problem). Re-describing
     /// SQL alone must not announce recovery before execution has succeeded.
     fn take_recovery_message(&mut self, source_name: &str, redactor: &Redactor) -> Option<String> {
-        std::mem::take(&mut self.warned_failure).then(|| {
+        self.warned_failure.swap(false, Ordering::Relaxed).then(|| {
             redactor.apply(&format!(
                 "banto-hub-sink: ブリッジ {}.{}: クエリを実行できるようになりました",
                 source_name, self.state.plan.name
@@ -560,6 +571,7 @@ async fn poll_until_failure(
     spec: &PollerSpec,
     events: &mut Events<'_>,
     stop: &mut watch::Receiver<bool>,
+    query_failures: &[Arc<AtomicBool>],
 ) -> PollOutcome {
     let now = Instant::now();
     let mut queries = Vec::with_capacity(spec.queries.len());
@@ -604,7 +616,7 @@ async fn poll_until_failure(
             next_due: now,
             next_describe_retry,
             warned_multi_row: false,
-            warned_failure: false,
+            warned_failure: query_failures[index].clone(),
         });
     }
     if !events.flush_status().await {
@@ -1134,7 +1146,7 @@ mod tests {
             next_due: Instant::now(),
             next_describe_retry: None,
             warned_multi_row: false,
-            warned_failure: false,
+            warned_failure: Arc::new(AtomicBool::new(false)),
         };
         let mut redactor = Redactor::new();
         redactor.add_secret("pw-secret");
@@ -1163,6 +1175,66 @@ mod tests {
             query.take_recovery_message("source", &redactor).is_some(),
             "next failure episode"
         );
+    }
+
+    fn logging_query(episode: Arc<AtomicBool>) -> QueryRuntime {
+        QueryRuntime {
+            state: QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")])),
+            next_due: Instant::now(),
+            next_describe_retry: None,
+            warned_multi_row: false,
+            warned_failure: episode,
+        }
+    }
+
+    #[test]
+    fn query_failure_episode_survives_db_connection_reconstruction() {
+        let episode = Arc::new(AtomicBool::new(false));
+        let mut before_disconnect = logging_query(episode.clone());
+        assert!(before_disconnect.on_query_failure().1);
+        drop(before_disconnect); // poll_until_failure returns ConnectionLost.
+        let mut after_reconnect = logging_query(episode);
+        assert!(
+            !after_reconnect.on_query_failure().1,
+            "same statement-failure episode must not warn twice"
+        );
+        assert!(after_reconnect
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        assert!(after_reconnect
+            .take_recovery_message("source", &Redactor::new())
+            .is_none());
+        assert!(logging_query(Arc::new(AtomicBool::new(false)))
+            .take_recovery_message("other-query", &Redactor::new())
+            .is_none());
+    }
+
+    #[test]
+    fn zero_rows_end_the_execution_failure_episode_and_allow_a_new_warning() {
+        let mut query = logging_query(Arc::new(AtomicBool::new(false)));
+        assert!(query.on_query_failure().1);
+        assert!(query
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        // Actual run_tick ordering: SQL succeeded, then 0 rows updates quality.
+        assert!(query
+            .state
+            .on_zero_rows()
+            .iter()
+            .all(|item| item.q == WireQuality::Bad));
+        assert!(
+            query.on_query_failure().1,
+            "failure after zero rows starts a new log episode"
+        );
+        assert!(!query.on_query_failure().1);
+        assert!(query
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        // The original quality ladder also resets first on 0 rows (review #3).
+        let mut state = QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")]));
+        assert!(state.on_query_failure().1);
+        state.on_zero_rows();
+        assert!(state.on_query_failure().1);
     }
 
     #[test]

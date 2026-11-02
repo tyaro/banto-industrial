@@ -221,12 +221,21 @@ impl Subscription {
         desired: Vec<String>,
         view_tx: watch::Sender<Arc<ValueView>>,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
+        Self::start_with_recovery(config, desired, view_tx, SubscriptionRecovery::default()).await
+    }
+
+    pub(crate) async fn start_with_recovery(
+        config: &SidecarConfig,
+        desired: Vec<String>,
+        view_tx: watch::Sender<Arc<ValueView>>,
+        recovery: SubscriptionRecovery,
+    ) -> Result<Option<Self>, banto_tagclient::Error> {
         if desired.is_empty() {
             let _ = view_tx.send(Arc::new(ValueView::default()));
             return Ok(None);
         }
         let plan = plan_subscription(config, &desired).await?;
-        Self::start_with_plan(config, desired, plan, view_tx)
+        Self::start_with_plan_and_recovery(config, desired, plan, view_tx, recovery)
     }
 
     /// 計画済みの `plan.resolved` だけで購読を開始する。catalog は取らない
@@ -240,6 +249,22 @@ impl Subscription {
         desired: Vec<String>,
         plan: BindingPlan,
         view_tx: watch::Sender<Arc<ValueView>>,
+    ) -> Result<Option<Self>, banto_tagclient::Error> {
+        Self::start_with_plan_and_recovery(
+            config,
+            desired,
+            plan,
+            view_tx,
+            SubscriptionRecovery::default(),
+        )
+    }
+
+    pub(crate) fn start_with_plan_and_recovery(
+        config: &SidecarConfig,
+        desired: Vec<String>,
+        plan: BindingPlan,
+        view_tx: watch::Sender<Arc<ValueView>>,
+        recovery: SubscriptionRecovery,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
         if desired.is_empty() {
             let _ = view_tx.send(Arc::new(ValueView::default()));
@@ -273,7 +298,13 @@ impl Subscription {
             .collect();
         let handle = rest_client(config)?.start(requests)?;
         let state_rx = handle.state_watch();
-        let pump = tokio::spawn(pump_values(state_rx, view_tx, dead.clone(), replan.clone()));
+        let pump = tokio::spawn(pump_values(
+            state_rx,
+            view_tx,
+            dead.clone(),
+            replan.clone(),
+            recovery,
+        ));
         Ok(Some(Self {
             handle: Some(handle),
             pump: Some(pump),
@@ -334,6 +365,9 @@ impl Subscription {
         }
         if let Some(pump) = self.pump.take() {
             pump.abort();
+            // Finish retiring this observer before a new generation shares its
+            // episode latch; no late observation may clear/re-arm the new one.
+            let _ = pump.await;
         }
     }
 }
@@ -350,16 +384,26 @@ impl Drop for Subscription {
 
 /// Only a failed SDK generation arms recovery: normal startup and catalog
 /// rebinding are not outages. Keep the latch across intermediate handshake states.
-#[derive(Default)]
-struct SubscriptionRecovery {
-    reconnecting: bool,
+#[derive(Clone, Default)]
+pub(crate) struct SubscriptionRecovery {
+    reconnecting: Arc<AtomicBool>,
 }
 
 impl SubscriptionRecovery {
-    fn observe(&mut self, state: TagClientConnectionState) -> Option<&'static str> {
+    pub(crate) fn failed(&self) {
+        self.reconnecting.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset(&self) {
+        self.reconnecting.store(false, Ordering::Relaxed);
+    }
+
+    fn observe(&self, state: TagClientConnectionState) -> Option<&'static str> {
         match state {
-            TagClientConnectionState::Reconnecting => self.reconnecting = true,
-            TagClientConnectionState::Live if std::mem::take(&mut self.reconnecting) => {
+            TagClientConnectionState::Reconnecting | TagClientConnectionState::Unauthorized => {
+                self.failed()
+            }
+            TagClientConnectionState::Live if self.reconnecting.swap(false, Ordering::Relaxed) => {
                 return Some("banto-hub-sink: Hub へのタグ購読が復帰しました");
             }
             _ => {}
@@ -376,15 +420,13 @@ async fn pump_values(
     view_tx: watch::Sender<Arc<ValueView>>,
     dead: Arc<AtomicBool>,
     replan: Arc<AtomicBool>,
+    recovery: SubscriptionRecovery,
 ) {
     let mut saw_active = false;
-    let mut recovery = SubscriptionRecovery::default();
     loop {
-        {
+        let message = {
             let state = state_rx.borrow_and_update();
-            if let Some(message) = recovery.observe(state.connection_state()) {
-                crate::log::log_line(message);
-            }
+            let message = recovery.observe(state.connection_state());
             if state.connection_state() != TagClientConnectionState::Stopped {
                 saw_active = true;
             } else if saw_active {
@@ -416,6 +458,11 @@ async fn pump_values(
                 None => ValueView::default(),
             };
             view_tx.send_replace(Arc::new(view));
+            message
+        };
+        // File/console logging is synchronous; never retain the SDK watch Ref.
+        if let Some(message) = message {
+            crate::log::log_line(message);
         }
         if state_rx.changed().await.is_err() {
             // 送信端（SDK ハンドル）が落ちた = この世代は終わり。
@@ -441,7 +488,7 @@ mod tests {
     #[test]
     fn subscription_recovery_is_logged_once_after_a_failed_generation() {
         use TagClientConnectionState::*;
-        let mut recovery = SubscriptionRecovery::default();
+        let recovery = SubscriptionRecovery::default();
         for state in [
             Stopped,
             Connecting,
@@ -467,6 +514,39 @@ mod tests {
         assert_eq!(recovery.observe(Live), None, "repeat updates");
         assert_eq!(recovery.observe(Reconnecting), None);
         assert!(recovery.observe(Live).is_some(), "next outage");
+    }
+
+    #[test]
+    fn subscription_recovery_survives_replacement_but_not_an_intentional_reset() {
+        use TagClientConnectionState::*;
+        let owner = SubscriptionRecovery::default();
+        {
+            let first_pump = owner.clone();
+            assert_eq!(first_pump.observe(Live), None, "normal initial startup");
+            assert_eq!(first_pump.observe(Reconnecting), None);
+            assert_eq!(first_pump.observe(Stopped), None);
+        }
+        let replacement_pump = owner.clone();
+        assert_eq!(replacement_pump.observe(Connecting), None);
+        assert_eq!(replacement_pump.observe(Rebinding), None);
+        assert!(
+            replacement_pump.observe(Live).is_some(),
+            "outage survives pump replacement"
+        );
+        assert_eq!(owner.observe(Live), None, "one line across all generations");
+        assert_eq!(owner.clone().observe(Rebinding), None);
+        assert_eq!(
+            owner.clone().observe(Live),
+            None,
+            "intentional new generation is not an outage"
+        );
+        owner.failed(); // Engine observed an unexpected worker death/start error.
+        assert!(owner.clone().observe(Live).is_some());
+        assert_eq!(owner.observe(Unauthorized), None);
+        assert!(owner.clone().observe(Live).is_some());
+        owner.failed();
+        owner.reset(); // All desired tags removed: a later startup is intentional.
+        assert_eq!(owner.clone().observe(Live), None);
     }
 
     #[test]
