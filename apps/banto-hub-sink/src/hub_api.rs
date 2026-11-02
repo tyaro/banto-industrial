@@ -616,7 +616,13 @@ mod tests {
         assert!(timeout.is_timeout());
         assert_eq!(classify_transport(timeout), HubApiError::Transport);
         drop(listener);
-        let refused = client.get(&url).send().await.unwrap_err();
+        let refusal_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let refused = refusal_client.get(&url).send().await.unwrap_err();
+        assert!(refused.is_connect() && !refused.is_timeout());
         assert_eq!(classify_transport(refused), HubApiError::Transport);
     }
 
