@@ -532,6 +532,29 @@ struct QueryRuntime {
     warned_failure: bool,
 }
 
+impl QueryRuntime {
+    fn on_query_failure(&mut self) -> (Vec<ValueItem>, bool) {
+        let (items, first) = self.state.on_query_failure();
+        let warn = first && !self.warned_failure;
+        if warn {
+            self.warned_failure = true;
+        }
+        (items, warn)
+    }
+
+    /// A successful SQL execution ends the failure episode even if it returns
+    /// no rows (that remains a separate data-quality problem). Re-describing
+    /// SQL alone must not announce recovery before execution has succeeded.
+    fn take_recovery_message(&mut self, source_name: &str, redactor: &Redactor) -> Option<String> {
+        std::mem::take(&mut self.warned_failure).then(|| {
+            redactor.apply(&format!(
+                "banto-hub-sink: ブリッジ {}.{}: クエリを実行できるようになりました",
+                source_name, self.state.plan.name
+            ))
+        })
+    }
+}
+
 async fn poll_until_failure(
     pool: &PgPool,
     spec: &PollerSpec,
@@ -698,9 +721,8 @@ async fn run_tick(
         Err(PgFailure::Connection(message)) => return TickOutcome::ConnectionLost(message),
         Err(PgFailure::Statement(message)) => {
             let message = events.redactor.apply(&message);
-            let (items, first) = query.state.on_query_failure();
-            if first && !query.warned_failure {
-                query.warned_failure = true;
+            let (items, first) = query.on_query_failure();
+            if first {
                 log_err_line(&format!(
                     "banto-hub-sink: warn: ブリッジ {}.{name}: クエリが失敗しました: {message}",
                     spec.source_name
@@ -711,7 +733,9 @@ async fn run_tick(
             return cycle_outcome(events.cycle(index, items).await);
         }
     };
-    query.warned_failure = false;
+    if let Some(message) = query.take_recovery_message(&spec.source_name, events.redactor) {
+        log_line(&message);
+    }
 
     if rows.is_empty() {
         let items = query.state.on_zero_rows();
@@ -1101,6 +1125,44 @@ mod tests {
             .max(DESCRIBE_TIMEOUT)
             .max(banto_db_source::poll::MAX_QUERY_TIMEOUT);
         assert!(STOPPED_POLLER_BOUND >= longest + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn query_recovery_is_logged_once_per_failure_and_redacts() {
+        let mut query = QueryRuntime {
+            state: QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")])),
+            next_due: Instant::now(),
+            next_describe_retry: None,
+            warned_multi_row: false,
+            warned_failure: false,
+        };
+        let mut redactor = Redactor::new();
+        redactor.add_secret("pw-secret");
+        assert_eq!(
+            query.take_recovery_message("source", &redactor),
+            None,
+            "startup"
+        );
+        assert!(query.on_query_failure().1, "first failure warns");
+        assert!(!query.on_query_failure().1, "repeat failure is silent");
+        let message = query.take_recovery_message("pw-secret", &redactor).unwrap();
+        assert!(
+            message.contains("クエリを実行できるようになりました"),
+            "{message}"
+        );
+        assert!(message.contains("<redacted>"), "{message}");
+        assert!(!message.contains("pw-secret"), "{message}");
+        assert_eq!(
+            query.take_recovery_message("source", &redactor),
+            None,
+            "repeat success"
+        );
+        query.state.on_row(&[Some(1.0)]);
+        assert!(query.on_query_failure().1, "next failure warns again");
+        assert!(
+            query.take_recovery_message("source", &redactor).is_some(),
+            "next failure episode"
+        );
     }
 
     #[test]

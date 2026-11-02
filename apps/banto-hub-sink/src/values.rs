@@ -348,6 +348,26 @@ impl Drop for Subscription {
     }
 }
 
+/// Only a failed SDK generation arms recovery: normal startup and catalog
+/// rebinding are not outages. Keep the latch across intermediate handshake states.
+#[derive(Default)]
+struct SubscriptionRecovery {
+    reconnecting: bool,
+}
+
+impl SubscriptionRecovery {
+    fn observe(&mut self, state: TagClientConnectionState) -> Option<&'static str> {
+        match state {
+            TagClientConnectionState::Reconnecting => self.reconnecting = true,
+            TagClientConnectionState::Live if std::mem::take(&mut self.reconnecting) => {
+                return Some("banto-hub-sink: Hub へのタグ購読が復帰しました");
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 /// SDK の状態 watch を [`ValueView`] の watch へ変換し続けるタスク。
 /// 「SDK ハンドルは世代ごとに作り直すが、プロデューサが持つ受信端は
 /// 作り直さない」ための一枚。
@@ -358,9 +378,13 @@ async fn pump_values(
     replan: Arc<AtomicBool>,
 ) {
     let mut saw_active = false;
+    let mut recovery = SubscriptionRecovery::default();
     loop {
         {
             let state = state_rx.borrow_and_update();
+            if let Some(message) = recovery.observe(state.connection_state()) {
+                crate::log::log_line(message);
+            }
             if state.connection_state() != TagClientConnectionState::Stopped {
                 saw_active = true;
             } else if saw_active {
@@ -413,6 +437,37 @@ pub fn normalize_names(mut names: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_recovery_is_logged_once_after_a_failed_generation() {
+        use TagClientConnectionState::*;
+        let mut recovery = SubscriptionRecovery::default();
+        for state in [
+            Stopped,
+            Connecting,
+            Handshaking,
+            Live,
+            Live,
+            Rebinding,
+            Live,
+        ] {
+            assert_eq!(
+                recovery.observe(state),
+                None,
+                "startup / healthy rebind: {state}"
+            );
+        }
+        for state in [Reconnecting, Reconnecting, Connecting, Handshaking] {
+            assert_eq!(recovery.observe(state), None, "not recovered: {state}");
+        }
+        assert_eq!(
+            recovery.observe(Live),
+            Some("banto-hub-sink: Hub へのタグ購読が復帰しました")
+        );
+        assert_eq!(recovery.observe(Live), None, "repeat updates");
+        assert_eq!(recovery.observe(Reconnecting), None);
+        assert!(recovery.observe(Live).is_some(), "next outage");
+    }
 
     #[test]
     fn normalize_names_sorts_and_deduplicates() {
