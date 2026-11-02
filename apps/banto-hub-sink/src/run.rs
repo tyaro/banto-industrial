@@ -1759,10 +1759,6 @@ mod tests {
             .await
             .expect("connect test PostgreSQL");
         let table = format!("sink_identity_{}_{}", std::process::id(), ts_nanos());
-        sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(&table)))
-            .execute(&pool)
-            .await
-            .expect("create isolated table");
 
         // Keep the listener bound but do not accept: PostgreSQL handshakes time
         // out. Recovery starts forwarding on this SAME endpoint/pool/flusher.
@@ -1788,6 +1784,13 @@ mod tests {
         // enough headroom rather than using a short outage-only test deadline.
         options.operation_timeout = Duration::from_secs(10);
         options.batch_size = 2; // Force several commits after recovery.
+
+        // Complete fallible local setup before creating the persistent test table.
+        // Start the flusher only after the table exists.
+        sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(&table)))
+            .execute(&pool)
+            .await
+            .expect("create isolated table");
         let handle = crate::flush::spawn_flusher(
             connections[0].clone(),
             sink_pool.clone(),
@@ -1830,9 +1833,11 @@ mod tests {
             tag_id: 2,
             external_name: "line1.fast.t2".to_owned(),
         });
-        engine
-            .apply_plan(desired(vec![added.clone()], connections.clone()))
-            .await;
+        let add_applied = tokio::time::timeout(
+            Duration::from_secs(30),
+            engine.apply_plan(desired(vec![added.clone()], connections.clone())),
+        )
+        .await;
         let registered_after_add = engine.groups.get(1);
         // Retain missing-generation failures until cleanup. The previous runtime
         // only lets the remaining bounded steps proceed; it cannot satisfy the
@@ -1850,7 +1855,11 @@ mod tests {
         // Remove the ORIGINAL tag. Its older queued rows must still be written.
         let mut removed = added;
         removed.tags.retain(|tag| tag.tag_id == 2);
-        engine.apply_plan(desired(vec![removed], connections)).await;
+        let remove_applied = tokio::time::timeout(
+            Duration::from_secs(30),
+            engine.apply_plan(desired(vec![removed], connections)),
+        )
+        .await;
         let registered_after_remove = engine.groups.get(1);
         let after_remove = registered_after_remove
             .clone()
@@ -1941,6 +1950,8 @@ mod tests {
             .expect("drop isolated test table");
         sink_closed.expect("close sink pool");
         pool_closed.expect("close inspection pool");
+        add_applied.expect("add plan completes within 30 seconds");
+        remove_applied.expect("remove plan completes within 30 seconds");
         registered_after_add.expect("add registers the replacement generation");
         registered_after_remove.expect("remove registers the replacement generation");
         outage_observed.expect("observe actual failed DB handshake before reconfiguration");
@@ -2087,18 +2098,18 @@ mod tests {
         let suffix = format!("{}_{}", std::process::id(), ts_nanos());
         let old_table = format!("sink_keep_old_{suffix}");
         let new_table = format!("sink_keep_new_{suffix}");
-        for table in [&old_table, &new_table] {
-            sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(table)))
-                .execute(&pool)
-                .await
-                .expect("create table");
-        }
 
         let flush_limit = Duration::from_secs(5);
         let mut engine = offline_engine(flush_limit);
         let connections = vec![connection(10, "pw")];
         let applied = group(1, 10, &old_table);
         let runtime = Arc::new(GroupRuntime::new(&applied, 100, 0).expect("group"));
+        for table in [&old_table, &new_table] {
+            sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(table)))
+                .execute(&pool)
+                .await
+                .expect("create table");
+        }
         const ROWS: usize = 5;
         runtime.push_rows((1..=ROWS as i64).map(one_row).collect());
         engine.groups.insert(runtime.clone());
