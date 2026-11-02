@@ -356,18 +356,19 @@ impl Subscription {
         }
     }
 
-    /// worker を停止して join し、変換タスクも畳む。
+    /// 変換タスクを停止して join してから SDK worker を停止する。
     pub async fn stop(mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+            // Retire and join the observer BEFORE intentional SDK shutdown:
+            // shutdown may publish failure states that must not arm recovery.
+            // No late observation may clear/re-arm a replacement's shared latch.
+            let _ = pump.await;
+        }
         if let Some(handle) = self.handle.take() {
             // 停止時のエラー（`Unauthorized` で終わっていた世代など）は
             // ここでは意味を持たない - 呼び出し側は作り直すだけ。
             let _ = handle.shutdown().await;
-        }
-        if let Some(pump) = self.pump.take() {
-            pump.abort();
-            // Finish retiring this observer before a new generation shares its
-            // episode latch; no late observation may clear/re-arm the new one.
-            let _ = pump.await;
         }
     }
 }
