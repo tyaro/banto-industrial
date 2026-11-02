@@ -762,7 +762,8 @@ const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(こ�
 ///
 /// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
 ///   ダイヤルする。省いた欄はスキーマの既定値。
-/// - 秘密のキー: 省略は保存済み（`connectionId` の同じプロトコルの接続）の値を補う、
+/// - postgres は connectionId の秘密値を読まない。id 指定時だけ password の明示文字列が必須。
+/// - 機器の秘密のキー: 省略は保存済み（`connectionId` の同じプロトコルの接続）の値を補う、
 ///   `null`・空文字は値無し、文字列はその値で試す（保存しない・封印しない）。
 /// - `simulation: true` はダイヤルの前に断る（未保存のフォームの今の値。新規・編集中とも）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -879,7 +880,22 @@ pub(super) async fn requested_settings(
     driver: &dyn banto_driver_api::DriverBase,
     payload: &PlcConnectionTestPayload,
 ) -> Result<RequestedSettings, PlcConnectionTestError> {
-    let saved = match payload.connection_id {
+    let postgres = payload.protocol == banto_tags::POSTGRES_PROTOCOL;
+    // Never send a stored secret to a caller-controlled PostgreSQL endpoint.
+    // Without an id, omitted/null retains the passwordless new-wizard behavior.
+    if postgres
+        && payload.connection_id.is_some()
+        && !matches!(
+            payload.settings.get("password"),
+            Some(serde_json::Value::String(_))
+        )
+    {
+        return Err(refused_settings(&[banto_driver_api::FieldError::new(
+            "settings.password",
+            "文字列で明示してください（保存済み接続は専用の接続テストを使ってください）",
+        )]));
+    }
+    let saved = match payload.connection_id.filter(|_| !postgres) {
         Some(id) => manager
             .plc_connections()
             .get(id)

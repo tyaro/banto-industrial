@@ -1168,7 +1168,7 @@ async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
 // #1010: PostgreSQL probes in the new-connection wizard must not create registry rows.
 fn presave_pg_payload(port: u16) -> serde_json::Value {
     json!({"protocol": "postgres", "settings": {
-        "host": "127.0.0.1", "port": port, "database": "ephemeral", "username": "reader"
+        "host": "127.0.0.1", "port": port, "database": "ephemeral", "username": "reader", "password": ""
     }})
 }
 
@@ -1371,7 +1371,7 @@ async fn postgres_presave_probe_is_bounded_to_five_seconds() {
 }
 
 #[tokio::test]
-async fn postgres_presave_keeps_saved_secret_tristate_without_updating_the_saved_row() {
+async fn postgres_presave_never_inherits_saved_secrets_or_updates_the_saved_row() {
     let env = test_env().await;
     let (status, created) = admin_post(&env.router, "/api/plc-connections", &env.admin_token,
         json!({"name": "presave-secret-reference", "protocol": "postgres", "settings": {
@@ -1380,25 +1380,77 @@ async fn postgres_presave_keeps_saved_secret_tristate_without_updating_the_saved
     assert_eq!(status, StatusCode::OK, "{created}");
     let id = created["id"].as_i64().unwrap();
     let before = presave_persistent_counts(&env.pool).await;
-    for (connection_id, given, expected) in [
-        (Some(id), None, "saved-secret"),
-        (
-            Some(id),
-            Some(json!("replacement-secret")),
-            "replacement-secret",
-        ),
-        (Some(id), Some(json!(null)), ""),
-        (Some(id), Some(json!("")), ""),
-        (None, None, ""),
-    ] {
-        let (port, peer) = presave_pg_rejection_peer(expected).await;
-        let mut payload = presave_pg_payload(port);
-        if let Some(id) = connection_id {
-            payload["connectionId"] = json!(id);
+    let saved_before = PlcConnectionService::new(env.pool.clone())
+        .get(id)
+        .await
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for host in ["127.0.0.1", "localhost"] {
+        for connection_id in [Some(id), Some(id + 999)] {
+            for password in [None, Some(json!(null))] {
+                let mut payload = presave_pg_payload(listener.local_addr().unwrap().port());
+                payload["settings"]["host"] = json!(host);
+                payload["settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("password");
+                if let Some(password) = password {
+                    payload["settings"]["password"] = password;
+                }
+                if let Some(id) = connection_id {
+                    payload["connectionId"] = json!(id);
+                }
+                let (status, body) = admin_post(
+                    &env.router,
+                    "/api/plc-connections/test",
+                    &env.admin_token,
+                    payload,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["ok"], false);
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("settings.password"),
+                    "{body}"
+                );
+                assert!(!body.to_string().contains("saved-secret"), "{body}");
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            }
         }
+    }
+    // No saved id means there is no secret to inherit: retain passwordless wizard probes.
+    for given in [None, Some(json!(null))] {
+        let (port, peer) = presave_pg_rejection_peer("").await;
+        let mut payload = presave_pg_payload(port);
+        payload["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("password");
         if let Some(given) = given {
             payload["settings"]["password"] = given;
         }
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections/test",
+            &env.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(peer.await.unwrap().1, "");
+    }
+    for expected in ["replacement-secret", ""] {
+        let (port, peer) = presave_pg_rejection_peer(expected).await;
+        let mut payload = presave_pg_payload(port);
+        payload["connectionId"] = json!(id);
+        payload["settings"]["password"] = json!(expected);
         let (status, body) = admin_post(
             &env.router,
             "/api/plc-connections/test",
@@ -1412,11 +1464,20 @@ async fn postgres_presave_keeps_saved_secret_tristate_without_updating_the_saved
         if !expected.is_empty() {
             assert!(!body.to_string().contains(expected), "{body}");
         }
-        assert_eq!(
-            stored_password(&env.pool, id).await.as_deref(),
-            Some("saved-secret")
-        );
+        assert!(!body.to_string().contains("saved-secret"), "{body}");
     }
+    let saved_after = PlcConnectionService::new(env.pool.clone())
+        .get(id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(saved_before).unwrap(),
+        serde_json::to_value(saved_after).unwrap()
+    );
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("saved-secret")
+    );
     assert_eq!(presave_persistent_counts(&env.pool).await, before);
 }
 
@@ -1437,6 +1498,10 @@ async fn postgres_presave_with_unreadable_saved_secret_does_not_connect() {
     listener.set_nonblocking(true).unwrap();
     let mut payload = presave_pg_payload(listener.local_addr().unwrap().port());
     payload["connectionId"] = json!(id);
+    payload["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
     let (status, body) = admin_post(
         &env.router,
         "/api/plc-connections/test",
@@ -1449,7 +1514,7 @@ async fn postgres_presave_with_unreadable_saved_secret_does_not_connect() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("missing"),
+            .contains("settings.password"),
         "{body}"
     );
     assert!(

@@ -683,11 +683,11 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "settings": {
                         "type": "object",
-                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは、省略 = connectionId の保存済みの値を使う、null・空文字列 = 値無し、文字列 = その値で試す(保存しない)。",
+                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。postgres は connectionId 指定時のみ password の明示文字列が必須。id 無しの省略/null・空文字列はパスワード無し。保存済み秘密値は使わない。機器の秘密のキーは、省略 = connectionId の保存済みの値を使う、null・空文字列 = 値無し、文字列 = その値で試す(保存しない)。",
                     },
                     "connectionId": {
                         "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。機器のドライバで収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。postgres は別の単発接続で試す。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。省いた秘密値の補いにも使う。",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。機器のドライバで収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。機器の settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。機器の省いた秘密値の補いにも使う。postgres では保存済み接続の参照には使わず、保存済み秘密値も読まない。保存済み PostgreSQL は test_saved_connection を使う。",
                     },
                 },
                 "required": ["protocol", "settings"],
