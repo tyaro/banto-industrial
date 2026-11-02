@@ -1,6 +1,6 @@
 # banto-hub 運用ガイド
 
-最終更新: 2026-11-03（#1006: §12 の証明書発行を設定ファイル明示の手順にし、`CA:FALSE`・SAN・鍵の ACL と期限更新手順、S7 B-3 の実機確認状況を反映）。2026-10-30（#945 で拒否の監査の記録をメモリの表と 2 秒ごとの書き手に作り直した。2026-10-29: #634 で OPC UA の鍵と証明書を profile の中に保存して再利用するようにし、§22 に置き場・ACL・所有者（Unix）・リンクの扱い・作り直し・失敗の表示を足した。#711 で書込み監査に定義上の拒否 `rejected` を追加。#713 で失効した API キーの削除 `DELETE /api/api-keys/{id}` を追加。2026-10-28: #902 で確認読みの不一致の監査を `uncertain` にし、WIT に `verification-failed` を足した。#899 の FC22 無応答のヒントを追記。#898 の書き込み監査の結果「結果不明」を追記）
+最終更新: 2026-11-03（#1006: §12 の証明書発行を設定ファイル明示・日付付きの鍵とし、`CA:FALSE`・SAN・保管先の所有者と ACL・期限更新手順、S7 B-3 の実機確認状況を反映）。2026-10-30（#945 で拒否の監査の記録をメモリの表と 2 秒ごとの書き手に作り直した。2026-10-29: #634 で OPC UA の鍵と証明書を profile の中に保存して再利用するようにし、§22 に置き場・ACL・所有者（Unix）・リンクの扱い・作り直し・失敗の表示を足した。#711 で書込み監査に定義上の拒否 `rejected` を追加。#713 で失効した API キーの削除 `DELETE /api/api-keys/{id}` を追加。2026-10-28: #902 で確認読みの不一致の監査を `uncertain` にし、WIT に `verification-failed` を足した。#899 の FC22 無応答のヒントを追記。#898 の書き込み監査の結果「結果不明」を追記）
 
 状態: **運用中の実務ガイド。2026-10-30（#634、#943 のレビュー）: §22 の profile の利用者を、確かめ済みの記録（HKLM の `Owners`）か、記録が無ければアカウントの種類で絞るようにした（グループを許可リストに入れない）。2026-10-29（#634）: §22 を新設し、OPC UA の鍵と証明書の置き場（profile の `data\opcua\pki`）・鍵を作る前の ACL・所有者（Unix）の確かめ・親のリンクを辿らない確かめ・作り直し・失敗の表示を書いた（#943 の総点検で、確かめを決まった 5 つに絞り・親の `opcua` の所有者と ACL も確かめ・profile の利用者の名前の解決をやめた）。2026-10-29（#713）: 管理 REST に失効済み API キーの削除（`DELETE /api/api-keys/{id}`）を追加。2026-10-29（#711）: 書込み監査に、書込み不可・存在しない・スコープ外・タグ無効の拒否を `rejected` で残すようにした（同じキー・タグ・理由は 60 秒の窓に 1 行で、`detail` に窓の合計件数。キーごとに窓の中の行は 20 組まで、超えた分はまとめの行に数える。記録はメモリの表で件数を足し、2 秒ごとに背景の書き手が DB に書く（表は 1000 組まで、入らない分はあふれの行。名前は 256 文字まで。件数は 2 秒ほど遅れ、プロセスが落ちると最後の回のあとの分を失う。2026-10-30 の #945 の総点検で、キューの形から作り直した））。2026-10-29（#713）: 管理 REST に失効済み API キーの削除（`DELETE /api/api-keys/{id}`）を追加。2026-10-28（#902）: §5 に、ネイティブドライバの RMW の確認読みの不一致は書込み監査で `uncertain` になることを反映。同日、WIT の `item-error` に `verification-failed` を足し、WASM ゲストもこの区別を報告できるようにした（今のゲストは返さない）。2026-10-28（#899）: §4 に、保持レジスタのビット（FC22）の書込みが無応答で失敗したときの文言のヒントを追記。2026-10-28（#898）: §4 に書き込み監査の結果 `uncertain`（結果不明）を追記。2026-10-27（#644）: §6 と §12 に Hub–Sink 専用 TLS の現行設定・制約・未実施の管理者試験を追記。2026-10-24（R2b-6、v0.2.0-alpha.39）: 設定パッケージを版 3 にした（接続は `settings` の形、秘密は書き出さない、版 2 以前は読めない）記述を、設定パッケージの項（版 2 の項の次）に追記。2026-10-22（R2b-2e、v0.2.0-alpha.35）: §16 に「アドレスの正規形と保存時の検証」を、§17 に CSV の「既存更新」の比較が正規形であることを追記。2026-10-22（R2b-1f）: §1 に「alpha.34 への更新と、移行・戻し方」（戻せない DB の切り替え・自動バックアップ `.bak` にパスワードが無いこと・preflight で断られたとき・戻し方・別の PC への移設・非 Windows の平文・`plaintextRemaining`）を追記。2026-10-21（R2a-3c）: §12 の「DB ブリッジ（取り込み口 `push`）」に「値と品質（Hub 内の DB Source と同じ）」（突き合わせのテスト `bridge_parity.rs` で値と品質の一致を確かめたこと・事象ごとの品質の表・WS の切断ではすぐ Bad にならない・送り手が止まると `stale_timeout_ms` の後に Bad）・「状態の見方」（状態画面の「受信中」/「送り手待ち」・送り手の状態の文言・サービスログ）・「うまく動かないとき」（症状ごとの見るところと対処）を追記。同日（R2a-3b）: §12 のサイドカーの初回セットアップに「DB ブリッジ（取り込み口 `push`）」（同じサイドカーがブリッジの `push` 接続ごとに PostgreSQL へ問い合わせて Hub の取り込み口へ送る・API キーに `ingest:#{接続 id}` を足して差し替える・スコープの無い接続と無効な読み取り先は動かさない・収集の停止中は DB に繋がない・DB 側の問題は状態画面の「送り手の状態」・ループバックの前提）を追記。同日（R2a-2e）: §17 に設定パッケージの取り込み口 `push` 接続の扱い（`settings` を持ち運び、DB ブリッジの読み取り先は接続名 `dbConnectionName` で付け直す。**取り込みのキーは移りません** - 取り込み先で API キー `ingest:#{接続 id}` を発行し直し、送り手の URL の接続 id を直す）を追記。2026-10-20: §17 の設定パッケージの版 2 で、版 1 で省略できた項目（`wordOrder`・`cpuType`・`defaultWritable`・`stringEncoding`・`sinkGroups`）を必須にした（欠けていれば項目の場所を示して断る、オーナー決定）。2026-10-19: §17 に設定パッケージの版 2 を追記（収集グループ名が接続内で一意になったのに合わせ、グループ・タグを接続名との組で参照する。版 1 は読み込めない、オーナー決定）。2026-10-20（#661）: §11 に「設定モード ⇔ 運用モード」を新設（サービスが profile の ACL を締める・緩める、`relax-only`、終了コード 4・5、`grant-profile-acl <利用者> <profile-id>` による修復）。2026-10-17（#630 PR-2）: §12 のサイドカーの設定ファイルの置き場を `%ProgramData%\BantoHub\sink\` だけにした（保護されていなければ起動しない・旧い置き場にあれば起動しない・管理者のメモ帳で編集して `banto-hub-elev prepare-sink-config` を実行・インストーラは NSIS ではなく elev で置き場を整える・旧い置き場からの移し方・露出していたキーの失効と再発行・当時の残件 #644）。同日（#616）: §12 に外部 DB のユーザーには `INSERT` と `SELECT` が要ることを追記。2026-10-17（#642）: §11 の profile-id の予約名に `COM0`・`LPT0` を足した（全体の profile-id の確かめも同じ）。2026-10-17: §11 の `grant-profile-acl` に、無いフォルダは確かめ済みの親の中に相対で作る・ルートの親は既にあること・書き直しの間は排他を持つ・分からない ACE があれば断る、を追記（#626 PR-B の再レビュー）。2026-10-16: §11「profile ディレクトリの権限（ACL）」を #626 の作り直し（確かめてから書く・使用中は断る・利用者のアカウントだけ・マシンの環境のルート・保護された DACL で継承を切る・足していく・既知の制限）に合わせて書き直した（v0.2.0-alpha.31）。同日（監査の対応）: `service-install` で使用中なら ACL の段だけ飛ばして 0・拒否を持つ利用者は引き継がない・`reset-password`/`revert-to-commissioning` は DB の手前を辿らずに確かめる・既知の制限 7〜10 を追記。同日: §11「サービスの終了コードと本体の panic」に、イベント 7024 の文面は終了コードを Win32 のエラーとして読んだもので当てにならないことを追記（#392）。2026-10-15: §11 に「サービスの終了コードと本体の panic」（#392 B3-1。panic の終了コード 1 はほかの失敗と同じ値なのでサービスログの行で見分ける・`sc failureflag`）を追記。同日: §11 に、STOP の途中に来た OS シャットダウンの扱い・停止中の checkpoint の報告し直し（進める回数に上限あり）・PRESHUTDOWN を設定できなかったときの install の警告（標準エラー出力だけで、インストーラには残らない）を追記。同日: §11 に、応答しない Hub と DB でも OS シャットダウンの予算内に停止まで進むことを追記。2026-10-14: §11 に OS シャットダウン（PRESHUTDOWN、#589）の最終 flush と実機確認を追記。2026-10-10: §2 にデスクトップシェルのポートの退避（#479、オーナー決定「おすすめで」）を追記した（シェル内の Hub は既定の 8722 を先に試し、埋まっていて `PORT` も `server.port` も既定のままのときだけ OS 割り当てのポートで起動する）。同日: §9 の監査の保留の警告行・記録失敗の行が `banto-hub-service.log` にも出るようにした（banto v6.6.0 の `with_log_sink`）。同日: §4 の無効化の応答の上限から「DB を待って固まっている有効化の後ろに並ぶ」例外を外した（無効化が有効化を打ち切らせる。無効化が保存の順番を待っている間に届いた有効化は 409。要求の途中でクライアントが切断しても無効化・有効化とその監査は最後まで行う。どこにも保存できなかった無効化の後の再起動の説明を正確にした）。同日: §4・§9 に、DB に書けない・応答しないときの監査をデータディレクトリの保留（`audit-spool/`）に退避して復旧後に流し込むことを追記し、§4 の「監査は標準エラー出力への best-effort」を置き換えた（#437、banto v6.5.0）。同日: §13 の 72h ソークが日付をまたいでも判定まで走るようにし、途中経過（`SOAK_PROGRESS_SECS`）を追記した（#343）。2026-10-09: しきい値を Hub から外した（#533）。§17 の連続登録・CSV の列からしきい値を消し、旧形式の CSV と設定パッケージの扱いを追記した。2026-10-08: タグの一括登録・設定パッケージの記述に、しきい値を Hub から外す予定（#533）の注記を足した。2026-10-07: §6 の応答の CSP を広げる条件を「接続元と宛先（`Host`）の両方が loopback」に絞った（banto v5.1.0 の `request_is_loopback_local`）。同一ホストのプロキシが `Host` を保つ構成では LAN の閲覧者は厳格なままになるので、「CSP とリバースプロキシ」の「プロキシで CSP を上書き」を、運用条件（`Host` を保つ・共有キャッシュは `Host` ごとに分ける）に書き換えた。2026-10-06: §6 の `/status` の CSP 違反を解消済みに更新（banto v5.0.0 追従。応答の CSP は loopback の接続元にだけ Tauri IPC を足す）し、「CSP とリバースプロキシ」（同一ホストのプロキシ配下では LAN の閲覧者にも広げた CSP が届く・プロキシで厳格な値に上書きできる）を追記。同日: §6 にデスクトップ版の窓の CSP（#505）と、`/status` で出る IPC の CSP 違反（表示は動く）を追記。同日: §9 の `deletionEpoch` を監査ログ画面が使うようになったことを反映（banto の `SnapshotListResource` に寄せた）。2026-10-05: §6 にセキュリティヘッダー（`with_security_headers`、#500）を追記。2026-10-04: アカウント・監査ログ・設定のサービスと、`/api/auth/{status,setup,change-password}`・`/api/users/*`・`/api/audit-log/*` の REST の口を banto のものに置き換えた（banto に寄せる作業の I3'。版は上げない）。§1「初回セットアップの運用」に同時のセットアップは 1 つだけ成功すること（banto #277）、§9 に「監査ログに残るもの」（失敗ログインの名前の切り詰め・無効なログアウトを記録しない（banto #278）、保持設定の変更の記録の語彙、`deletionEpoch`）を追記。同日: banto v3.0.0（ADR-0017）追従で試運転モードを grant 方式に切り替えた（v0.2.0-alpha.28）。§19 を書き直し（試運転中も管理 REST/WS はトークンが要る・ロックダウンで試運転の grant は失効・ログアウトの扱い）、§6 にリバースプロキシ配下の運用条件 2 点、§3「Banto アプリからの自動発行」を 4 手順に更新。2026-10-02: §1 に「旧形式の DB で起動を拒否されたとき」を追記（DB スキーマを banto の admin-template と同じ形に整理。古い DB は自動移行せず起動を拒否する、オーナー決定）。同日: §1「ログインセッションの失効」に、banto v2.1.1 追従（v0.2.0-alpha.27）で試運転モードへの切り替え時に「別のユーザーでログインされました」が出なくなったことを追記。同日: §19 に「試運転中のログアウト」（試運転は終わらず、保存しているログインを捨てるだけ。オーナー決定）を追記。同日: §1「ログインセッションの失効」に、banto v2.0.0
 追従（v0.2.0-alpha.26）での画面側の挙動（確認できない間も画面を保って背景で確かめ続ける・
@@ -2030,11 +2030,34 @@ Hub のサービスが起動時に読む `BANTO_HUB_TLS_PORT`、`BANTO_HUB_TLS_C
 次の `hub-cert.cnf` を作ってから発行してください。既定の `CA:TRUE` では
 Sink の rustls がサーバー証明書として拒否します。
 管理者 PowerShell で先に鍵の保管先（例:
-`C:\ProgramData\BantoHub\tls`）を作り、`icacls 'C:\ProgramData\BantoHub\tls'` で SYSTEM と
-Administrators 以外に読み取り権限がないことを確認してください。条件を
-満たさない場合は ACL を直してから発行します。発行コマンドはその保管先に
-移動して実行し、秘密鍵を権限の広い作業フォルダに作らないでください。
-既存の鍵を同じファイル名で上書きせず、新しい名前で発行してください。
+`C:\ProgramData\BantoHub\tls`）を作ります。既存の置き場なら ACL を変更する前に
+所有者が SYSTEM・Administrators・作業中の信頼済み管理者のいずれかと確認し、
+それ以外なら中身を再利用せず、管理者が管理する別の保護先を用意してください。
+継承された ACE を外して SYSTEM と Administrators にだけ権限を付けます。
+`/inheritance:r` は既存の明示 ACE を
+消さないため、最後の `icacls` の出力にこの 2 者以外の ACE が残る場合は、
+それを除去して再確認するまで発行しないでください。読み取りだけでなく、
+ファイルの作成・書き換え権限も含めて確認します。
+
+```powershell
+$tlsDir = 'C:\ProgramData\BantoHub\tls'
+New-Item -ItemType Directory -Path $tlsDir -Force | Out-Null
+$operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$sidType = [System.Security.Principal.SecurityIdentifier]
+$ownerSid = (Get-Acl -LiteralPath $tlsDir).GetOwner($sidType).Value
+if ($ownerSid -notin @('S-1-5-18', 'S-1-5-32-544', $operatorSid)) { throw '保管先の所有者を信頼できません。既存の置き場を再利用しないでください。' }
+icacls $tlsDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
+if ($LASTEXITCODE -ne 0) { throw '保管先の ACL を設定できませんでした。' }
+icacls $tlsDir
+$acl = Get-Acl -LiteralPath $tlsDir
+if (-not $acl.AreAccessRulesProtected -or @($acl.Access | Where-Object { $_.IdentityReference.Translate($sidType).Value -notin @('S-1-5-18', 'S-1-5-32-544') }).Count -ne 0) { throw '保管先に許可外の ACE が残っています。発行しないでください。' }
+Set-Location $tlsDir
+```
+
+次の設定ファイルもこの保管先で作り、発行前に `Get-Acl hub-cert.cnf` と
+`icacls hub-cert.cnf` で所有者と ACE を確認してください。保管先・設定ファイル・
+発行後の鍵と証明書は、所有者が上記の信頼済みの相手で、ACE は SYSTEM・
+Administrators だけであることが条件です。
 
 ```ini
 [req]
@@ -2047,14 +2070,19 @@ subjectAltName = IP:127.0.0.1
 ```
 
 ```powershell
-openssl req -x509 -config hub-cert.cnf -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -nodes -subj /CN=banto-hub -keyout hub-key.pem -out hub-cert.pem
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$keyFile = Join-Path $tlsDir "hub-key-$stamp.pem"
+$certFile = Join-Path $tlsDir "hub-cert-$stamp.pem"
+if ((Test-Path -LiteralPath $keyFile) -or (Test-Path -LiteralPath $certFile)) { throw '同名の証明書または鍵があります。上書きせず別の名前を選んでください。' }
+openssl req -x509 -config hub-cert.cnf -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
 ```
 
 `-days 30` は S7 の試験用です。運用では更新の間隔を決め、その期間に応じた
-日数を指定してください。発行後も `icacls hub-key.pem` で、秘密鍵を
-SYSTEM・Administrators 以外が読めないことを確認してください。
+日数を指定してください。発行後に `Get-Acl $keyFile`・`Get-Acl $certFile` で
+所有者を、`icacls $keyFile`・`icacls $certFile` で ACE を確認し、どちらも
+上記の信頼済み所有者と SYSTEM・Administrators だけの ACE にしてください。
 発行後に `openssl version` の出力を記録し、
-`openssl x509 -in hub-cert.pem -noout -text` の出力で `Basic Constraints` が
+`openssl x509 -in $certFile -noout -text` の出力で `Basic Constraints` が
 1 つだけで `CA:FALSE`、`Subject Alternative Name` に `IP Address:127.0.0.1`
 があることを確認してください。重複や `CA:TRUE` があれば、その証明書は使わず、
 設定ファイルの内容を確認してから作り直してください。
@@ -2079,7 +2107,8 @@ Sink の `hub_url` は `https://127.0.0.1:<同じポート>` にし、
 PEM 全体**を 1 件指定してください。接続先から取得した証明書をそのまま
 信頼しないでください。pin は公開鍵だけではなく証明書 DER 全体の一致を確認し、
 有効期限・接続先名など通常の TLS 検証も行います。期限は
-`openssl x509 -in hub-cert.pem -noout -enddate` で確認し、失効前に更新します。
+`openssl x509 -in $certFile -noout -enddate` で確認し、失効前に更新します
+（更新時は `$certFile` に現行証明書のパスを設定します）。
 新しい証明書と鍵を保護された置き場へ別名で発行・配置し、上記の拡張と ACL を
 確かめます。新旧両方の証明書 PEM を `hub_tls_pinned_certs` に設定して
 `prepare-sink-config` を実行し、Sink を再起動します。次に Hub の
