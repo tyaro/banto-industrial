@@ -321,6 +321,7 @@ struct Engine {
     applied_groups: HashMap<i64, SinkConfigGroup>,
     applied_connections: HashMap<i64, SinkConfigConnection>,
     subscription: Option<Subscription>,
+    subscription_recovery: crate::values::SubscriptionRecovery,
     view_tx: watch::Sender<Arc<ValueView>>,
     view_rx: watch::Receiver<Arc<ValueView>>,
     redactor: Redactor,
@@ -355,6 +356,7 @@ impl Engine {
             applied_groups: HashMap::new(),
             applied_connections: HashMap::new(),
             subscription: None,
+            subscription_recovery: crate::values::SubscriptionRecovery::default(),
             view_tx,
             view_rx,
             redactor,
@@ -766,10 +768,19 @@ impl Engine {
             } else if !dead && !changed {
                 previous_plan = Some(subscription.plan());
             }
+            if dead {
+                self.subscription_recovery.failed();
+            }
             if let Some(subscription) = self.subscription.take() {
                 subscription.stop().await;
             }
             let _ = self.view_tx.send(Arc::new(ValueView::default()));
+            if desired.is_empty() {
+                // Retiring the final subscription is intentional, even if its
+                // worker also failed. Do not carry that outage into a later setup.
+                self.subscription_recovery.reset();
+                return;
+            }
             if dead {
                 self.subscription_attempt = self.subscription_attempt.saturating_add(1);
                 let delay = backoff_delay(self.subscription_attempt);
@@ -783,6 +794,7 @@ impl Engine {
         }
 
         if desired.is_empty() {
+            self.subscription_recovery.reset();
             return;
         }
         if let Some(retry_at) = self.subscription_retry_at {
@@ -792,10 +804,22 @@ impl Engine {
         }
         self.subscription_retry_at = None;
         let started = match fresh_plan {
-            Some(plan) => {
-                Subscription::start_with_plan(&self.config, desired, plan, self.view_tx.clone())
+            Some(plan) => Subscription::start_with_plan_and_recovery(
+                &self.config,
+                desired,
+                plan,
+                self.view_tx.clone(),
+                self.subscription_recovery.clone(),
+            ),
+            None => {
+                Subscription::start_with_recovery(
+                    &self.config,
+                    desired,
+                    self.view_tx.clone(),
+                    self.subscription_recovery.clone(),
+                )
+                .await
             }
-            None => Subscription::start(&self.config, desired, self.view_tx.clone()).await,
         };
         match started {
             Ok(subscription) => {
@@ -815,6 +839,7 @@ impl Engine {
                 }
             }
             Err(err) => {
+                self.subscription_recovery.failed();
                 self.subscription_attempt = self.subscription_attempt.saturating_add(1);
                 self.subscription_retry_at =
                     Some(Instant::now() + backoff_delay(self.subscription_attempt));

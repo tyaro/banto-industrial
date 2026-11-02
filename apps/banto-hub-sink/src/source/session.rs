@@ -101,7 +101,7 @@
 //! 含みうるので出さない（分類だけ）。
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -424,10 +424,19 @@ async fn run_source(
     mut stop: watch::Receiver<bool>,
     status: Arc<Mutex<SourceStatus>>,
 ) {
+    // A source's configuration is immutable for this Runtime. Keep failure
+    // episodes across poller/WS restarts, but never reuse them for changed SQL
+    // or DB credentials (the supervisor creates a new source for those).
+    let query_failures = config
+        .queries
+        .iter()
+        .map(|_| Arc::new(AtomicBool::new(false)))
+        .collect();
     let mut runtime = Runtime {
         config,
         ctx,
         status,
+        query_failures,
         budget: None,
         seq: 0,
         retiring: Vec::new(),
@@ -482,6 +491,8 @@ struct Runtime {
     config: BridgeSourceConfig,
     ctx: SourceContext,
     status: Arc<Mutex<SourceStatus>>,
+    /// One episode per query in this immutable source configuration.
+    query_failures: Vec<Arc<AtomicBool>>,
     budget: Option<SendBudget>,
     seq: u64,
     /// 止めたが終わりをまだ確かめていない問い合わせのタスク（手放さない）。止めた順。
@@ -582,10 +593,11 @@ impl Runtime {
         let (stop_tx, stop_rx) = watch::channel(false);
         let spec = PollerSpec::new(&self.config.name, &self.config.db, &self.config.queries);
         let redactor = self.ctx.redactor.clone();
+        let query_failures = self.query_failures.clone();
         // 枠はタスクの future が持つ: 終わったときも `abort` で落ちたときも空く。
         let handle = self.ctx.tasks.spawn(async move {
             let _permit = permit;
-            run_poller(spec, tx, stop_rx, redactor).await;
+            run_poller(spec, tx, stop_rx, redactor, query_failures).await;
         });
         self.update(|s| {
             s.pollers_started += 1;
