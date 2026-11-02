@@ -1,7 +1,7 @@
 # 外部 DB 連携 検証手順（S3 手動 smoke / S7 実 DB 検証 / R2a の DB ブリッジ）
 
 作成日: 2026-09-07
-状態: **手順のみ（S7 本番は 2026-11-01〜11-02 に D-1〜D-5 を実施、D-5 は #1002 修正入り `1c34a7fd` で同じ書き先の経路を再確認したが、行保全未証明で判定保留（残件 #1019）、D-1〜D-4 も合格、D-6 は対象外（#726 未完）、§3.2 の C-1〜C-14 は S7 の対象外（2026-11-02 オーナー決定）。結果は real-machine-test-2026-11-s7.md §2）**。2026-11-03（#1006: P-5 の証明書発行を設定ファイル明示の手順にし、検証条件と S7 B-3 の実施状況を更新）。2026-11-02（#1006: B-24 の操作対象、P-1 の Mac の IP 固定、P-5 の `CA:FALSE` を追記）。2026-10-28（#892）: 準備 P-1〜P-6 をオーナー同席で行い、結果を real-machine-test-2026-11-s7.md に記録した。DB の PC が Wi-Fi の Mac になったので、切断の手段を Mac の Wi-Fi を切ることに替え、Mac でのコマンドを P-1 の決定に足した。同日: §3.3 に S7 本番（2026-11-02〜11-08）の準備 P-1〜P-8・当日の順番 D-1〜D-6・#229 の確認項目のうち §3 に無いもの S-1〜S-5・記録様式 R-1〜R-6 を追加し、#644 で Hub–Sink が loopback の専用 TLS だけになったことを §1・B-3 に反映した。P-1・P-5・P-7 をオーナーが推奨案どおりに決め、結果の文書を足した（未実施）。2026-10-22（R2b-1f）: §3.2 に R2b-1 の移行・DPAPI の封印・戻し方の実機確認 C-1〜C-14 を追加（オーナー同席、未実施）。2026-10-21（R2a-3c）: §3.1 に DB ブリッジ（取り込み口 `push`）の実機確認 B-16〜B-28 を追加（Hub 内の DB Source と同じ SQL を読むブリッジを並べて値と品質の一致を確かめる。自動テスト `bridge_parity.rs` の実機版、オーナー同席で行う。未実施）。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。S3 の結果は §5、S7 の結果は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) §2 に記録する。
+状態: **手順のみ（S7 本番は 2026-11-01〜11-02 に D-1〜D-5 を実施、D-5 は #1002 修正入り `1c34a7fd` で同じ書き先の経路を再確認したが、行保全未証明で判定保留（残件 #1019）、D-1〜D-4 も合格、D-6 は対象外（#726 未完）、§3.2 の C-1〜C-14 は S7 の対象外（2026-11-02 オーナー決定）。結果は real-machine-test-2026-11-s7.md §2）**。2026-11-03（#1006: P-5 の証明書発行を設定ファイル明示の手順にし、鍵の ACL・期限と検証条件、S7 B-3 の実施状況を更新）。2026-11-02（#1006: B-24 の操作対象、P-1 の Mac の IP 固定、P-5 の `CA:FALSE` を追記）。2026-10-28（#892）: 準備 P-1〜P-6 をオーナー同席で行い、結果を real-machine-test-2026-11-s7.md に記録した。DB の PC が Wi-Fi の Mac になったので、切断の手段を Mac の Wi-Fi を切ることに替え、Mac でのコマンドを P-1 の決定に足した。同日: §3.3 に S7 本番（2026-11-02〜11-08）の準備 P-1〜P-8・当日の順番 D-1〜D-6・#229 の確認項目のうち §3 に無いもの S-1〜S-5・記録様式 R-1〜R-6 を追加し、#644 で Hub–Sink が loopback の専用 TLS だけになったことを §1・B-3 に反映した。P-1・P-5・P-7 をオーナーが推奨案どおりに決め、結果の文書を足した（未実施）。2026-10-22（R2b-1f）: §3.2 に R2b-1 の移行・DPAPI の封印・戻し方の実機確認 C-1〜C-14 を追加（オーナー同席、未実施）。2026-10-21（R2a-3c）: §3.1 に DB ブリッジ（取り込み口 `push`）の実機確認 B-16〜B-28 を追加（Hub 内の DB Source と同じ SQL を読むブリッジを並べて値と品質の一致を確かめる。自動テスト `bridge_parity.rs` の実機版、オーナー同席で行う。未実施）。2026-10-17: §1・B-3 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（#630）と DB ユーザーの `SELECT`（#616）に合わせて直した。2026-10-14: B-14（PRESHUTDOWN の読み戻し）と B-15（OS 再起動の最終 flush、#589）を追加。S3 の完了条件「手動 smoke 手順を docs に追加」と S7（実 DB 検証、オーナー同席）の手順書。S3 の結果は §5、S7 の結果は [real-machine-test-2026-11-s7.md](real-machine-test-2026-11-s7.md) §2 に記録する。
 対象: [banto-hub-external-db-design.md](banto-hub-external-db-design.md) の DB Source（#228）と DB Sink（#229）。設計の決定事項は同書 §6、実装の所在は §7。
 
 関連: [real-machine-test-2026-09.md](real-machine-test-2026-09.md)（実機検証の記録の書き方の先例）、[banto-hub-operations.md](banto-hub-operations.md)（Hub の起動・サービス化）。
@@ -141,7 +141,12 @@ R2b-1f（2026-10-22）で追加。**オーナー同席で行う（未実施）**
 | P-8 | 停止と再起動の予算を当日の前に頭に入れる: 通常の停止は drain 最大 5 秒 + flusher ごとの停止最大 2 秒、OS のシャットダウンは作業 27 秒まで（PRESHUTDOWN の待ち 30 秒、設計 §5.6）。`statement_timeout` は 30 秒（Sink の接続で `SHOW statement_timeout` が `30s`）                                                                                                                                                                                                                                                                                                                                                                               | S-3 の期待の数字が分かっている                                                                                                                                                                                                                                                                                                                                                                           |
 
 P-5 の証明書は、OpenSSL の既定の拡張設定に依存しないよう、次の `hub-cert.cnf` を
-作って発行する。詳細は [運用ガイド §12](banto-hub-operations.md#hubsink-専用-loopback-tls644)。
+作って発行する。管理者 PowerShell で先に保管先
+`C:\ProgramData\BantoHub\tls` を用意し、`icacls 'C:\ProgramData\BantoHub\tls'` で
+SYSTEM・Administrators 以外に読み取り権限がないことを確認する。条件を
+満たさない場合は ACL を直し、保管先に移動してから発行する。秘密鍵を
+権限の広い作業フォルダに作らない。詳細は
+[運用ガイド §12](banto-hub-operations.md) を参照。
 
 ```ini
 [req]
@@ -157,6 +162,8 @@ subjectAltName = IP:127.0.0.1
 openssl req -x509 -config hub-cert.cnf -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -nodes -subj /CN=banto-hub -keyout hub-key.pem -out hub-cert.pem
 ```
 
+`-days 30` は S7 の試験用。発行後に `icacls hub-key.pem` で鍵の読み取り権限を
+確認する。運用の期限設定と更新の順番は運用ガイド §12 に従う。
 発行後は `openssl version` の出力を記録し、
 `openssl x509 -in hub-cert.pem -noout -text` で `Basic Constraints` が 1 つだけの
 `CA:FALSE`、`Subject Alternative Name` が `IP Address:127.0.0.1` であることを
