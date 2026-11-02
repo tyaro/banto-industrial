@@ -366,7 +366,7 @@ impl HubApi {
         if !status.is_success() {
             return Err(classify_status(status));
         }
-        let body = response.bytes().await.map_err(classify_transport)?;
+        let body = response.bytes().await.map_err(|_| HubApiError::Transport)?;
         serde_json::from_slice(&body).map_err(|_| HubApiError::Protocol)
     }
 
@@ -385,7 +385,7 @@ impl HubApi {
         if !status.is_success() {
             return Err(classify_status(status));
         }
-        let body = response.bytes().await.map_err(classify_transport)?;
+        let body = response.bytes().await.map_err(|_| HubApiError::Transport)?;
         serde_json::from_slice(&body).map_err(|_| HubApiError::Protocol)
     }
 
@@ -420,6 +420,8 @@ fn classify_transport(error: reqwest::Error) -> HubApiError {
     }
 }
 
+// Only a typed rustls::Error proves TLS failure. A peer closing without an
+// alert exposes no such cause and remains a Transport error.
 fn has_tls_cause(error: &(dyn std::error::Error + 'static)) -> bool {
     if error.is::<rustls::Error>() {
         return true;
