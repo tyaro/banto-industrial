@@ -530,13 +530,31 @@ pub async fn test_connection(
         &conn.name,
     );
 
-    match tokio::time::timeout(DB_TEST_TIMEOUT, run_test(options)).await {
+    test_connection_options(options, &password).await
+}
+
+/// Shared read-only probe for saved connections and validated ephemeral inputs.
+/// Never persist/seal the password; mask it even if a remote error echoes it.
+pub(crate) async fn test_connection_options(
+    options: PgConnectOptions,
+    password: &str,
+) -> DbConnectionTestOutcome {
+    let mut outcome = match tokio::time::timeout(DB_TEST_TIMEOUT, run_test(options)).await {
         Ok(outcome) => outcome,
         Err(_elapsed) => DbConnectionTestOutcome::failed(format!(
             "接続タイムアウトです({}秒)。ホスト/ポート、ネットワーク到達性を確認してください。",
             DB_TEST_TIMEOUT.as_secs()
         )),
+    };
+    if !password.is_empty() {
+        for text in [&mut outcome.error, &mut outcome.server_version]
+            .into_iter()
+            .flatten()
+        {
+            *text = text.replace(password, "<redacted>");
+        }
     }
+    outcome
 }
 
 async fn run_test(options: PgConnectOptions) -> DbConnectionTestOutcome {

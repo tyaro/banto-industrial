@@ -1,11 +1,9 @@
 /**
  * S1（docs/banto-hub-external-db-design.md §3.1「案A: 既存3階層の流用」・
  * §4.1・§6-4）: `protocol: "postgres"`（DB Source）接続の SvelteKit/TS 側
- * 受け入れテスト。実 PostgreSQL には依存しない - 接続テスト自体
- * （`POST /api/plc-connections/{id}/test`）は
- * `ConnectionDrawer.svelte::runDbConnectionTest` を経由するボタンの存在・
- * 活性状態のみ確認し、実際にクリックして疎通させることはしない（CI には
- * まだ実 PostgreSQL が無い - 実装指示6「CI で実 PostgreSQL に依存しない」）。
+ * 受け入れテスト。実 PostgreSQL には依存しない。保存前テストの要求、
+ * 応答を待つ間の操作の制限、成功/失敗の表示、保存前に行を作らないことを確認する。
+ * PostgreSQL 自体は Rust のプロトコル試験と PostgreSQL CI で検証する。
  *
  * 固定する内容:
  * 1. 作成ウィザードでプロトコルを postgres に切り替えると、ポートが 5432
@@ -129,12 +127,81 @@ test.describe
 
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
 
-		// 確認ステップ: database/username/パスワードの有無を表示し、接続
-		// テストは「保存後にテストできます」のヒント付きで無効。
+		// #1010: testing in step 3 must send current fields without persisting.
 		await expect(wizard.getByText('appdb')).toBeVisible();
 		await expect(wizard.getByText('appuser')).toBeVisible();
-		await expect(wizard.getByText('保存後にテストできます')).toBeVisible();
-		await expect(wizard.getByRole('button', { name: '接続テスト' })).toBeDisabled();
+		const probeUrl = '**/api/plc-connections/test';
+		let failProbe = false;
+		let probes = 0;
+		let releaseProbe!: () => void;
+		const heldProbe = new Promise<void>((resolve) => {
+			releaseProbe = resolve;
+		});
+		await adminPage.route(probeUrl, async (route) => {
+			expect(route.request().postDataJSON()).toEqual({
+				protocol: 'postgres',
+				simulation: false,
+				settings: {
+					host: '10.0.0.5',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: 'hunter2'
+				}
+			});
+			probes++;
+			if (probes === 1) await heldProbe;
+			await route.fulfill({
+				json: failProbe
+					? { ok: false, elapsedMs: 1, error: { kind: 'protocol', message: '試験用の接続エラー' } }
+					: { ok: true, elapsedMs: 1, error: null }
+			});
+		});
+		const probeButton = wizard.getByRole('button', { name: '接続テスト', exact: true });
+		await expect(probeButton).toBeEnabled();
+		const startedProbe = adminPage.waitForRequest((request) =>
+			request.url().endsWith('/api/plc-connections/test')
+		);
+		let closeConfirmed = false;
+		const onDialog = (dialog: import('@playwright/test').Dialog): void => {
+			closeConfirmed = true;
+			void dialog.dismiss();
+		};
+		adminPage.on('dialog', onDialog);
+		try {
+			await probeButton.click();
+			await startedProbe;
+			await expect(wizard.getByRole('button', { name: '戻る', exact: true })).toBeDisabled();
+			await expect(wizard.getByRole('button', { name: '作成', exact: true })).toBeDisabled();
+			await wizard.getByRole('button', { name: '閉じる', exact: true }).click();
+			await expect(wizard).toBeVisible();
+			await adminPage.keyboard.press('Escape');
+			await expect(wizard).toBeVisible();
+			await adminPage.mouse.click(1, 1);
+			await expect(wizard).toBeVisible();
+			expect(closeConfirmed).toBe(false);
+		} finally {
+			adminPage.off('dialog', onDialog);
+			releaseProbe(); // Resolve before unroute, even when an assertion fails.
+		}
+		await expect(wizard.getByText('接続成功', { exact: true })).toBeVisible();
+		failProbe = true;
+		await probeButton.click();
+		await expect(wizard.getByText('試験用の接続エラー', { exact: true })).toBeVisible();
+		expect(probes).toBe(2);
+		const beforeSave = await adminPage.request.get('/api/plc-connections', {
+			headers: adminHeaders
+		});
+		expect(
+			((await beforeSave.json()) as ConnectionRow[]).some(
+				(connection) => connection.name === DB_CONN
+			)
+		).toBe(false);
+		await adminPage.unroute(probeUrl);
+		// Back clears old outcomes before any input can be changed/re-tested.
+		await wizard.getByRole('button', { name: '戻る', exact: true }).click();
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+		await expect(wizard.getByText('試験用の接続エラー', { exact: true })).toHaveCount(0);
 
 		const created = adminPage.waitForResponse(
 			(r) => r.url().includes('/api/plc-connections') && r.request().method() === 'POST'

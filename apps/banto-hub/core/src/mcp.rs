@@ -669,13 +669,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "test_connection",
-            "description": "保存前に PLC 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。TCP 接続だけでなく実プロトコルで軽い読み出しを1回試みる。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
+            "description": "保存前に PLC/PostgreSQL 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。機器は実プロトコルで軽い読み出しを1回試み、postgres は SELECT version() を5秒以内で試す。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "protocol": {
                         "type": "string",
-                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)。virtual は常に ok:false(テスト対象外)。",
+                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres。virtual は常に ok:false(テスト対象外)。",
                     },
                     "simulation": {
                         "type": "boolean",
@@ -687,7 +687,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "connectionId": {
                         "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。収集中の broker セッションがあれば(プロトコルによらず)それを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。省いた秘密値の補いにも使う。",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。機器のドライバで収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。postgres は別の単発接続で試す。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。省いた秘密値の補いにも使う。",
                     },
                 },
                 "required": ["protocol", "settings"],
@@ -695,7 +695,7 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
-        // 接続テスト - 上の`test_connection`（保存前のフォーム値、PLC 専用）
+        // 接続テスト - 上の`test_connection`（保存前のフォーム値）
         // とは別ツール。
         json!({
             "name": "test_saved_connection",

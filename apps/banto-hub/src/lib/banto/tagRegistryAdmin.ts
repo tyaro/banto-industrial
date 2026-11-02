@@ -225,14 +225,26 @@ export interface DbConnectionTestOutcome {
 }
 
 /**
- * S1: 保存済み postgres 接続の接続テスト。未保存（新規作成ウィザード中）の
- * 接続には呼べない - 呼び出し側（`ConnectionDrawer.svelte`）は `connection`
- * が非 `null` のときだけボタンを有効にする。
+ * 保存済み postgres 接続の接続テスト。編集 Drawer は保存済みの設定を試す。
+ * 未保存の作成ウィザードは testUnsavedPostgresConnection を使う（#1010）。
  */
 export async function testSavedPlcConnection(id: number): Promise<DbConnectionTestOutcome> {
 	return httpRequest<DbConnectionTestOutcome>(`/api/plc-connections/${id}/test`, {
+		readOnly: true,
 		method: 'POST'
 	});
+}
+
+/** #1010: test the wizard's current PostgreSQL settings without creating a row. */
+export async function testUnsavedPostgresConnection(
+	settings: Record<string, unknown>
+): Promise<DbConnectionTestOutcome> {
+	const result = await testPlcConnection({
+		protocol: POSTGRES_PROTOCOL,
+		simulation: false,
+		settings
+	});
+	return { ok: result.ok, ...(result.error ? { error: result.error.message } : {}) };
 }
 
 /** Mirrors `banto_tags::CollectionGroup`. */
@@ -539,7 +551,7 @@ interface HttpInit {
 	/**
 	 * `true` なら変更系のメソッド（POST）でも、タグ削除の取り消し猶予を打ち切らない
 	 * （`deferredDelete.flush()` を呼ばない）。副作用の無い読み取りの POST
-	 * （`POST /api/tags/parse-addresses`）専用 - 入力に追従して何度も呼ぶので、
+	 * （`POST /api/tags/parse-addresses`・接続テストなど）用 - 入力に追従して何度も呼ぶので、
 	 * 呼ぶたびに猶予を潰すと「元に戻す」が効かなくなる。
 	 */
 	readOnly?: boolean;
@@ -1146,6 +1158,7 @@ export async function testPlcConnection(
 	input: PlcConnectionTestRequest
 ): Promise<PlcConnectionTestResult> {
 	return httpRequest<PlcConnectionTestResult>('/api/plc-connections/test', {
+		readOnly: true,
 		method: 'POST',
 		body: input
 	});

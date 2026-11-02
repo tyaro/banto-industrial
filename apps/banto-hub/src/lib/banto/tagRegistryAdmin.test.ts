@@ -54,6 +54,8 @@ vi.mock('./deferredDelete.svelte', () => ({
 
 import {
 	createPlcConnection,
+	testUnsavedPostgresConnection,
+	testSavedPlcConnection,
 	updatePlcConnection,
 	createTag,
 	updateTagsBatch,
@@ -333,5 +335,48 @@ describe('#341 レビュー対応2: httpRequest の 500 live_reconfigure_failed 
 	it('無関係な 500 は従来どおりの汎用エラーのまま（回帰ガード）', async () => {
 		mockFetchOnce({ status: 500, ok: false, body: { kind: 'storage', message: 'disk full' } });
 		await expect(createTag(tagInput)).rejects.toThrow(/disk full/);
+	});
+});
+
+describe('PostgreSQL connection tests (#1010)', () => {
+	beforeEach(() => {
+		deferredDeleteFlush.mockClear();
+	});
+	it('tests current settings once without creating a connection or referencing a saved secret', async () => {
+		mockFetchOnce({ status: 200, ok: true, body: { ok: true, elapsedMs: 5, error: null } });
+		const settings = {
+			host: '127.0.0.1',
+			port: 5432,
+			database: 'plant',
+			username: 'reader',
+			password: 'ephemeral'
+		};
+		expect(await testUnsavedPostgresConnection(settings)).toEqual({ ok: true });
+		expect(fetch).toHaveBeenCalledTimes(1);
+		expect(deferredDeleteFlush).not.toHaveBeenCalled();
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/plc-connections/test',
+			expect.objectContaining({
+				method: 'POST',
+				body: JSON.stringify({ protocol: 'postgres', simulation: false, settings })
+			})
+		);
+	});
+	it('shows a normal failed probe response as its DB error text', async () => {
+		mockFetchOnce({
+			status: 200,
+			ok: true,
+			body: { ok: false, elapsedMs: 5, error: { kind: 'protocol', message: '接続できません' } }
+		});
+		expect(await testUnsavedPostgresConnection({})).toEqual({ ok: false, error: '接続できません' });
+	});
+	it('retains the saved-id endpoint and version response', async () => {
+		mockFetchOnce({ status: 200, ok: true, body: { ok: true, serverVersion: 'PostgreSQL 16' } });
+		expect(await testSavedPlcConnection(12)).toEqual({ ok: true, serverVersion: 'PostgreSQL 16' });
+		expect(deferredDeleteFlush).not.toHaveBeenCalled();
+		expect(fetch).toHaveBeenCalledWith(
+			'/api/plc-connections/12/test',
+			expect.objectContaining({ method: 'POST' })
+		);
 	});
 });

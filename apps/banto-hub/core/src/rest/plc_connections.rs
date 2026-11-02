@@ -864,7 +864,8 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 /// （`banto_tags::settings_from_schema` → `settings_to_api`、保存と同じ組み立て）、秘密のキーを
 /// 足したもの。秘密のキーは、フォームの文字列があればそれ、省略なら保存済み（`connectionId`
 /// があり、同じプロトコル）の値を開いて補う。`null`・空文字は値無し。スキーマで必須の秘密の
-/// 欄が埋まらなければ断る。
+/// 欄が埋まらなければ断る。スキーマを持たない postgres は同じ保存経路の
+/// `check_settings_input` で検証する（#1010、DB に書かない）。
 pub(super) struct RequestedSettings {
     pub(super) settings: Settings,
     /// 保存済みの接続（指紋に入る秘密値の参照の出どころ）。
@@ -910,8 +911,33 @@ pub(super) async fn requested_settings(
             }
         }
     }
-    let map = banto_tags::settings_from_schema(&driver.settings_schema(), &input)
-        .map_err(|errors| refused_settings(&errors))?;
+    let map = if payload.protocol == banto_tags::POSTGRES_PROTOCOL {
+        // Host-provided postgres intentionally has no device settings schema.
+        // Reuse the save path's pure host validation without sealing or writing.
+        manager
+            .plc_connections()
+            .check_settings_input(&banto_tags::ConnectionSettingsInput {
+                name: "connection-test".to_owned(),
+                protocol: payload.protocol.clone(),
+                enabled: true,
+                simulation: false,
+                settings: input.clone(),
+                secrets: Default::default(),
+            })
+            .map_err(|error| match error {
+                BantoError::Validation { field_errors } => refused_settings(
+                    &field_errors
+                        .into_iter()
+                        .map(|field| banto_driver_api::FieldError::new(field.field, field.message))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => test_error("protocol", "接続設定を検証できませんでした"),
+            })?;
+        input
+    } else {
+        banto_tags::settings_from_schema(&driver.settings_schema(), &input)
+            .map_err(|errors| refused_settings(&errors))?
+    };
     let mut settings = banto_tags::settings_to_api(&map);
     for (key, plain) in given {
         settings.insert(key.as_str(), plain);
@@ -1217,6 +1243,54 @@ pub(super) async fn plc_connections_test(
     ))
 }
 
+/// PostgreSQL uses the same secret tri-state and validation boundary as device
+/// probes, but its read-only SELECT version() belongs to the DB Source core.
+async fn test_postgres_connection(
+    manager: &CollectorManager,
+    payload: &PlcConnectionTestPayload,
+) -> (bool, Option<PlcConnectionTestError>) {
+    let registry = manager.registry();
+    let Some(entry) = registry.get(banto_tags::POSTGRES_PROTOCOL) else {
+        return (
+            false,
+            Some(test_error("unsupported", "PostgreSQL 接続を利用できません")),
+        );
+    };
+    let requested = match requested_settings(manager, entry.base(), payload).await {
+        Ok(requested) => requested,
+        Err(error) => return (false, Some(error)),
+    };
+    let errors = entry.base().validate_config(&requested.settings);
+    if !errors.is_empty() {
+        return (false, Some(refused_settings(&errors)));
+    }
+    let settings = &requested.settings;
+    let Some(port) = settings
+        .get(keys::PORT)
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+    else {
+        return (
+            false,
+            Some(test_error("tcp", "ポート番号が不正です(1〜65535)")),
+        );
+    };
+    let password = settings.get("password").unwrap_or("");
+    let options = crate::db_source::pg_connect_options(
+        settings.get(keys::HOST).unwrap_or("").trim(),
+        port,
+        settings.get("database").unwrap_or("").trim(),
+        settings.get("username").unwrap_or("").trim(),
+        password,
+        "connection-test",
+    );
+    let outcome = crate::db_source::test_connection_options(options, password).await;
+    (
+        outcome.ok,
+        outcome.error.map(|message| test_error("protocol", message)),
+    )
+}
+
 /// [`plc_connections_test`]のdoc comment参照 - REST ハンドラと MCP の
 /// `test_connection`ツールが共有する疎通確認本体。認可判定
 /// (`require_editor`/MCP 側の`require_admin_scope`)は呼び出し元の責務で、
@@ -1247,8 +1321,10 @@ pub(crate) async fn run_plc_connection_test(
                     .to_string(),
             }),
         )
+    } else if payload.protocol == banto_tags::POSTGRES_PROTOCOL {
+        test_postgres_connection(manager, payload).await
     } else {
-        // R2b-3a-2: プロトコル名で分けない。broker が管理しないプロトコル
+        // R2b-3a-2: 機器のプロトコル名で分けない。broker が管理しないプロトコル
         // (レジストリに Session / Frame ドライバが無い)は `test_connection` が
         // "unsupported" で返す。
         test_connection(manager, payload).await
