@@ -2027,39 +2027,66 @@ Hub のサービスが起動時に読む `BANTO_HUB_TLS_PORT`、`BANTO_HUB_TLS_C
 証明書と秘密鍵は PEM ファイルのパスです。証明書には接続先の IP
 `127.0.0.1` を SAN として含めてください。Hub は `::1` では待ち受けません。
 自己署名のサーバー証明書は、OpenSSL の既定の拡張設定に依存しないよう、
-次の `hub-cert.cnf` を作ってから発行してください。既定の `CA:TRUE` では
+次の設定ファイルを作ってから発行してください。既定の `CA:TRUE` では
 Sink の rustls がサーバー証明書として拒否します。
-管理者 PowerShell で先に鍵の保管先（例:
-`C:\ProgramData\BantoHub\tls`）を作ります。既存の置き場なら ACL を変更する前に
-所有者が SYSTEM・Administrators・作業中の信頼済み管理者のいずれかと確認し、
-それ以外なら中身を再利用せず、管理者が管理する別の保護先を用意してください。
-継承された ACE を外して SYSTEM と Administrators にだけ権限を付けます。
-`/inheritance:r` は既存の明示 ACE を
-消さないため、最後の `icacls` の出力にこの 2 者以外の ACE が残る場合は、
-それを除去して再確認するまで発行しないでください。読み取りだけでなく、
-ファイルの作成・書き換え権限も含めて確認します。
+管理者 PowerShell で、まず親の `C:\ProgramData\BantoHub` が管理者管理の
+通常のディレクトリであり、第三者に作成・削除・ACL 変更などの権限がない
+ことを確認します。親は Hub のほかのデータも持つため、この手順で ACL を
+変更しません。親がない、親や既存の `tls` がリンク、所有者や権限が条件を
+満たさない場合は、既存の内容を再利用せず、安全な保管先を管理者が別途
+用意してください。安全な親を確認してから `tls` を新規作成し、秘密鍵の
+発行前に継承を外します。`/inheritance:r` は既存の明示 ACE を消しません。
 
 ```powershell
 $tlsDir = 'C:\ProgramData\BantoHub\tls'
-New-Item -ItemType Directory -Path $tlsDir -Force | Out-Null
-$operatorSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$parentDir = Split-Path -Parent $tlsDir
+$identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+$operatorSid = $identity.User.Value
+if (-not ([System.Security.Principal.WindowsPrincipal]::new($identity)).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) { throw '管理者 PowerShell で実行してください。' }
 $sidType = [System.Security.Principal.SecurityIdentifier]
+$trustedOwners = @('S-1-5-18', 'S-1-5-32-544', $operatorSid)
+$systemAndAdmins = @('S-1-5-18', 'S-1-5-32-544')
+function Assert-PlainDirectory($path) {
+  $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+  if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) { throw "通常のディレクトリではありません: $path" }
+}
+Assert-PlainDirectory $parentDir
+$parentAcl = Get-Acl -LiteralPath $parentDir -ErrorAction Stop
+if ($parentAcl.GetOwner($sidType).Value -notin $trustedOwners) { throw '親の所有者を信頼できません。' }
+$readMask = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
+foreach ($rule in $parentAcl.GetAccessRules($true, $true, $sidType)) {
+  if ($rule.AccessControlType -eq [System.Security.AccessControl.AccessControlType]::Allow -and $rule.IdentityReference.Value -notin $trustedOwners -and (([int]$rule.FileSystemRights -band (-bnot $readMask)) -ne 0)) { throw '親に第三者の書き込み系 ACE があります。' }
+}
+$existingTls = Get-Item -LiteralPath $tlsDir -Force -ErrorAction SilentlyContinue
+if ($null -ne $existingTls) {
+  Assert-PlainDirectory $tlsDir
+  $existingAcl = Get-Acl -LiteralPath $tlsDir -ErrorAction Stop
+  if ($existingAcl.GetOwner($sidType).Value -notin $trustedOwners -or @($existingAcl.GetAccessRules($true, $true, $sidType) | Where-Object { $_.IdentityReference.Value -notin $systemAndAdmins }).Count -ne 0) { throw '既存の保管先を信頼できません。別の保管先を使ってください。' }
+} else {
+  New-Item -ItemType Directory -Path $tlsDir -ErrorAction Stop | Out-Null
+}
+Assert-PlainDirectory $tlsDir
 $ownerSid = (Get-Acl -LiteralPath $tlsDir).GetOwner($sidType).Value
-if ($ownerSid -notin @('S-1-5-18', 'S-1-5-32-544', $operatorSid)) { throw '保管先の所有者を信頼できません。既存の置き場を再利用しないでください。' }
+if ($ownerSid -notin $trustedOwners) { throw '保管先の所有者を信頼できません。' }
 icacls $tlsDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F'
 if ($LASTEXITCODE -ne 0) { throw '保管先の ACL を設定できませんでした。' }
 icacls $tlsDir
 $acl = Get-Acl -LiteralPath $tlsDir
-if (-not $acl.AreAccessRulesProtected -or @($acl.Access | Where-Object { $_.IdentityReference.Translate($sidType).Value -notin @('S-1-5-18', 'S-1-5-32-544') }).Count -ne 0) { throw '保管先に許可外の ACE が残っています。発行しないでください。' }
+if (-not $acl.AreAccessRulesProtected -or @($acl.GetAccessRules($true, $true, $sidType) | Where-Object { $_.IdentityReference.Value -notin $systemAndAdmins }).Count -ne 0) { throw '保管先に許可外の ACE が残っています。発行しないでください。' }
 Set-Location $tlsDir
 ```
 
-次の設定ファイルもこの保管先で作り、発行前に `Get-Acl hub-cert.cnf` と
-`icacls hub-cert.cnf` で所有者と ACE を確認してください。保管先・設定ファイル・
+設定ファイルも保護先で ASCII として新規作成します。保管先・設定ファイル・
 発行後の鍵と証明書は、所有者が上記の信頼済みの相手で、ACE は SYSTEM・
-Administrators だけであることが条件です。
+Administrators だけであることを確認してください。
 
-```ini
+```powershell
+$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+$configFile = Join-Path $tlsDir "hub-cert-$stamp.cnf"
+$keyFile = Join-Path $tlsDir "hub-key-$stamp.pem"
+$certFile = Join-Path $tlsDir "hub-cert-$stamp.pem"
+if ((Test-Path -LiteralPath $configFile) -or (Test-Path -LiteralPath $keyFile) -or (Test-Path -LiteralPath $certFile)) { throw '同名の設定・証明書・鍵があります。上書きしないでください。' }
+@'
 [req]
 distinguished_name = dn
 x509_extensions = v3
@@ -2067,14 +2094,11 @@ x509_extensions = v3
 [v3]
 basicConstraints = critical,CA:FALSE
 subjectAltName = IP:127.0.0.1
-```
-
-```powershell
-$stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-$keyFile = Join-Path $tlsDir "hub-key-$stamp.pem"
-$certFile = Join-Path $tlsDir "hub-cert-$stamp.pem"
-if ((Test-Path -LiteralPath $keyFile) -or (Test-Path -LiteralPath $certFile)) { throw '同名の証明書または鍵があります。上書きせず別の名前を選んでください。' }
-openssl req -x509 -config hub-cert.cnf -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
+'@ | Out-File -LiteralPath $configFile -Encoding ascii -NoClobber -ErrorAction Stop
+$configAcl = Get-Acl -LiteralPath $configFile -ErrorAction Stop
+if ($configAcl.GetOwner($sidType).Value -notin $trustedOwners -or @($configAcl.GetAccessRules($true, $true, $sidType) | Where-Object { $_.IdentityReference.Value -notin $systemAndAdmins }).Count -ne 0) { throw '設定ファイルの所有者または ACE を信頼できません。発行しないでください。' }
+openssl req -x509 -config $configFile -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days 30 -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
+if ($LASTEXITCODE -ne 0) { throw '証明書を発行できませんでした。' }
 ```
 
 `-days 30` は S7 の試験用です。運用では更新の間隔を決め、その期間に応じた
@@ -2114,7 +2138,10 @@ PEM 全体**を 1 件指定してください。接続先から取得した証�
 `prepare-sink-config` を実行し、Sink を再起動します。次に Hub の
 `BANTO_HUB_TLS_CERT` と `BANTO_HUB_TLS_KEY` を新しいファイルへ切り替えて
 Hub を再起動し、Sink の接続を確認します。最後に旧 pin を外し、再度
-`prepare-sink-config` を実行して Sink を再起動します。pin が未設定・不一致なら
+`prepare-sink-config` を実行して Sink を再起動し、新しい証明書での接続を
+再確認します。切り戻し期間が終わったら、Hub の環境変数が旧ファイルを
+指していないことを確かめ、不要な旧鍵・旧証明書を管理者が削除します。
+残す場合は理由と保管先を記録してください。pin が未設定・不一致なら
 Sink は API キーを送らず、平文 HTTP へ戻りません。配布される `.example` は
 pin と API キーが空で、そのままでは Sink は起動しません。
 デスクトップのシェル内 Hub も同じ環境変数を読みます。初回の API キー発行を
