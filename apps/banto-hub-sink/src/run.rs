@@ -1800,8 +1800,18 @@ mod tests {
         };
         let mut expected = vec![row(101, 1), row(102, 1)];
         runtime.push_rows(expected.clone());
+        // The operation budget expires while the proxy holds the handshake.
+        // BoundedSqlError::TimedOut is group-local (Error), not a classified
+        // connection error (Backoff). Observe the specific timeout as well as
+        // the state, so an unrelated setup error cannot satisfy this precondition.
+        let expected_timeout = format!(
+            "保存先検査が {:.1} 秒でタイムアウトしました",
+            options.operation_timeout.as_secs_f64()
+        );
         tokio::time::timeout(Duration::from_secs(10), async {
-            while runtime.state() != crate::status::GroupState::Backoff {
+            while runtime.state() != crate::status::GroupState::Error
+                || runtime.last_error().as_deref() != Some(expected_timeout.as_str())
+            {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
