@@ -1831,7 +1831,13 @@ mod tests {
         engine
             .apply_plan(desired(vec![added.clone()], connections.clone()))
             .await;
-        let after_add = engine.groups.get(1).unwrap();
+        let registered_after_add = engine.groups.get(1);
+        // Retain missing-generation failures until cleanup. The previous runtime
+        // only lets the remaining bounded steps proceed; it cannot satisfy the
+        // registration and generation assertions after DROP.
+        let after_add = registered_after_add
+            .clone()
+            .unwrap_or_else(|| runtime.clone());
         let added_broken_empty = engine.broken.is_empty();
         let added_rows = after_add.peek_batch(100).to_vec();
         let expected_added_rows = expected.clone();
@@ -1843,7 +1849,10 @@ mod tests {
         let mut removed = added;
         removed.tags.retain(|tag| tag.tag_id == 2);
         engine.apply_plan(desired(vec![removed], connections)).await;
-        let after_remove = engine.groups.get(1).unwrap();
+        let registered_after_remove = engine.groups.get(1);
+        let after_remove = registered_after_remove
+            .clone()
+            .unwrap_or_else(|| after_add.clone());
         let removed_broken_empty = engine.broken.is_empty();
         let removed_rows = after_remove.peek_batch(100).to_vec();
         let expected_removed_rows = expected.clone();
@@ -1881,12 +1890,10 @@ mod tests {
             task.abort();
             let _ = task.await;
         }
-        let stopped = engine
-            .flushers
-            .remove(&10)
-            .unwrap()
-            .stop(Duration::from_secs(2))
-            .await;
+        let stopped = match engine.flushers.remove(&10) {
+            Some(flusher) => Some(flusher.stop(Duration::from_secs(2)).await),
+            None => None,
+        };
         // Unique numeric identities are appended in ascending order; ORDER BY
         // value compares every column and multiplicity without relying on static ts.
         let actual = sqlx::query_as::<_, (i64, i64, String, Option<f64>, String)>(
@@ -1930,6 +1937,8 @@ mod tests {
             .expect("drop isolated test table");
         sink_closed.expect("close sink pool");
         pool_closed.expect("close inspection pool");
+        registered_after_add.expect("add registers the replacement generation");
+        registered_after_remove.expect("remove registers the replacement generation");
         outage_observed.expect("observe actual failed DB handshake before reconfiguration");
         assert!(
             !Arc::ptr_eq(&after_add, &runtime),
@@ -1970,7 +1979,10 @@ mod tests {
         assert_eq!(recovery_rows, expected);
         assert_eq!(dropped_before_recovery, 0);
         recovered.expect("same flusher recovers and commits all queued rows");
-        assert_eq!(stopped, crate::flush::FlusherStopOutcome::Completed);
+        assert_eq!(
+            stopped.expect("original flusher remains registered until cleanup"),
+            crate::flush::FlusherStopOutcome::Completed,
+        );
         assert_eq!(
             actual.expect("read all persisted identities"),
             expected,
@@ -2109,7 +2121,6 @@ mod tests {
                 sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
                     .fetch_one(&pool)
                     .await
-                    .expect("count")
             }
         };
         let in_old = count(&old_table).await;
@@ -2122,8 +2133,7 @@ mod tests {
             )),
         )
         .fetch_all(&pool)
-        .await
-        .expect("read old destination rows");
+        .await;
         let expected_old: Vec<_> = (1..=ROWS as i64)
             .map(|ts| {
                 (
@@ -2135,7 +2145,8 @@ mod tests {
                 )
             })
             .collect();
-        let next = engine.groups.get(1).expect("new generation is registered");
+        let registered_next = engine.groups.get(1);
+        let next = registered_next.clone().unwrap_or_else(|| runtime.clone());
         let next_queued = next.queued();
         let next_dropped = next.dropped();
         let next_table = next.table.raw().to_owned();
@@ -2152,9 +2163,22 @@ mod tests {
                 .await;
         }
 
-        assert_eq!(old_rows, expected_old, "旧テーブルへ全行の内容を保って書く");
-        assert_eq!(in_old, ROWS as i64, "全行が旧テーブルに入る");
-        assert_eq!(in_new, 0, "新テーブルには旧世代の行は入らない");
+        registered_next.expect("new generation is registered");
+        assert_eq!(
+            old_rows.expect("read old destination rows"),
+            expected_old,
+            "旧テーブルへ全行の内容を保って書く"
+        );
+        assert_eq!(
+            in_old.expect("count old destination rows"),
+            ROWS as i64,
+            "全行が旧テーブルに入る"
+        );
+        assert_eq!(
+            in_new.expect("count new destination rows"),
+            0,
+            "新テーブルには旧世代の行は入らない"
+        );
         assert!(!Arc::ptr_eq(&next, &runtime), "新しい世代に置き換わる");
         assert_eq!(next_queued, 0, "書き先が変わった世代は空のキューで始まる");
         assert_eq!(next_dropped, 0, "流し切れたので dropped は増えない");
