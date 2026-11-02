@@ -125,13 +125,13 @@ impl Parked {
         }
     }
 
-    fn message(self) -> &'static str {
+    fn message(self, connection_id: i64) -> String {
         match self {
             Self::NoPermission => {
-                "権限なし: API キーにこの接続の ingest:#{id} のスコープがありません（キーを発行し直して banto-hub-sink.toml を差し替えてください）"
+                format!("権限なし: API キーにこの接続の ingest:#{connection_id} のスコープがありません（キーを発行し直して banto-hub-sink.toml を差し替えてください）")
             }
-            Self::DbDisabled => "参照先の DB 接続が Hub で無効になっています",
-            Self::NothingToQuery => "クエリがありません",
+            Self::DbDisabled => "参照先の DB 接続が Hub で無効になっています".to_owned(),
+            Self::NothingToQuery => "クエリがありません".to_owned(),
         }
     }
 }
@@ -570,10 +570,11 @@ impl Supervisor {
         let parked_ids: Vec<i64> = plan.parked.iter().map(|(id, _, _)| *id).collect();
         self.logged_parked.retain(|id, _| parked_ids.contains(id));
         for (id, name, reason) in &plan.parked {
+            let message = reason.message(*id);
             if self.logged_parked.get(id) != Some(reason) {
                 log_err_line(&format!(
                     "banto-hub-sink: warn: ブリッジ {name}（#{id}）は動かしません: {}",
-                    reason.message()
+                    message
                 ));
                 self.logged_parked.insert(*id, *reason);
             }
@@ -583,7 +584,7 @@ impl Supervisor {
                     connection_id: *id,
                     name: name.clone(),
                     state: reason.state(),
-                    last_status: Some(reason.message().to_string()),
+                    last_status: Some(message),
                     ..SourceStatus::default()
                 })),
             );
@@ -634,6 +635,24 @@ impl Supervisor {
 mod tests {
     use super::*;
     use crate::hub_api::{BridgeColumnConfig, BridgeDbConfig, BridgeQueryConfig};
+
+    #[test]
+    fn missing_permission_names_the_actual_ingest_scope() {
+        for id in [1, 12, 987] {
+            let message = Parked::NoPermission.message(id);
+            assert!(
+                message.contains(&format!("ingest:#{id} のスコープ")),
+                "{message}"
+            );
+            assert!(!message.contains("{id}"), "{message}");
+            assert!(message.contains("キーを発行し直して"), "{message}");
+        }
+        assert_eq!(
+            Parked::DbDisabled.message(12),
+            "参照先の DB 接続が Hub で無効になっています"
+        );
+        assert_eq!(Parked::NothingToQuery.message(12), "クエリがありません");
+    }
 
     fn source(id: i64, fingerprint: &str) -> BridgeSourceConfig {
         BridgeSourceConfig {

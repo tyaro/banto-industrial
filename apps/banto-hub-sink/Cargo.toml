@@ -29,6 +29,9 @@ sqlx = { workspace = true, features = [
 # 同じ版を持っているので新規ノードは増えない。`json` feature は使わない
 # （本文は `serde_json` で組み立てて `body()` に渡す）。
 reqwest = { workspace = true }
+# Inspect typed TLS causes without exposing reqwest URLs or certificate details.
+# Same rustls version/features already used by banto-tagclient.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = [

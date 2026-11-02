@@ -6,7 +6,7 @@ mod tls_fixture;
 use std::time::Duration;
 
 use banto_hub_sink::config::ConfigError;
-use banto_hub_sink::hub_api::{HubApi, SinkStatusPush};
+use banto_hub_sink::hub_api::{HubApi, HubApiError, SinkStatusPush};
 use banto_hub_sink::SidecarConfig;
 use tls_fixture::TlsFixture;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -100,16 +100,35 @@ async fn hub_api_status_uses_the_pin_before_sending_bearer() {
     assert!(request.contains("PUT /api/sink/status"));
     assert!(request.contains("Bearer bh_dummy.secret"));
 
-    let (port, server) = status_listener(&real).await;
-    let config = SidecarConfig::from_toml_str(
-        &other.pinned_config(port, "bh_dummy.secret"),
-        other_dir.path(),
-    )
-    .unwrap();
-    assert!(HubApi::new(&config)
-        .unwrap()
-        .push_status(&SinkStatusPush { groups: vec![] })
-        .await
-        .is_err());
-    assert!(server.await.unwrap().is_empty());
+    // Each REST operation must classify the real certificate mismatch as TLS,
+    // before any HTTP request (especially its bearer token) can be sent.
+    for operation in 0..3 {
+        let (port, server) = status_listener(&real).await;
+        let config = SidecarConfig::from_toml_str(
+            &other.pinned_config(port, "bh_dummy.secret"),
+            other_dir.path(),
+        )
+        .unwrap();
+        let api = HubApi::new(&config).unwrap();
+        let error = match operation {
+            0 => api.fetch_config().await.map(|_| ()),
+            1 => api.fetch_bridge_config().await.map(|_| ()),
+            _ => api.push_status(&SinkStatusPush { groups: vec![] }).await,
+        }
+        .unwrap_err();
+        assert_eq!(error, HubApiError::Tls);
+        let text = error.to_string();
+        assert!(text.contains("hub_tls_pinned_certs"), "{text}");
+        for sensitive in [
+            "bh_dummy.secret",
+            "127.0.0.1",
+            "https://",
+            "BEGIN CERTIFICATE",
+        ] {
+            assert!(!text.contains(sensitive), "{text}");
+            assert!(!format!("{error:?}").contains(sensitive));
+        }
+        assert!(!error.is_auth());
+        assert!(server.await.unwrap().is_empty());
+    }
 }
