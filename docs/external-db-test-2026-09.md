@@ -209,7 +209,7 @@ GRANT INSERT, SELECT ON tag_history TO banto_sink;
   セッションなら、記録した証明書・鍵の絶対パスで次のように再構成する。
   `Environment` には他の秘密値も入り得る。値を表示したり、サービスキー全体を
   `reg export` したりしない。元のプロパティの有無と値の配列を**同じ PowerShell
-  セッション内**の `$environmentSnapshot` に保持し、TLS 以外の行を残して書く。
+  セッションで初回適用する直前**の `$environmentSnapshot` に保持し、TLS 以外の行を残して書く。
 
 ```powershell
 $cert = [pscustomobject]@{
@@ -221,7 +221,6 @@ $cert = [pscustomobject]@{
 ```powershell
 & {
   $ErrorActionPreference = 'Stop'
-  Set-Variable -Name environmentSnapshot -Scope 1 -Value $null
   $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub'
   if ($null -eq $cert -or -not (Test-Path -LiteralPath $cert.CertificatePath) -or -not (Test-Path -LiteralPath $cert.PrivateKeyPath)) { throw '発行済みの証明書と鍵のパスを設定してください。' }
   $serviceProperties = Get-ItemProperty -Path $serviceKey -ErrorAction Stop
@@ -231,7 +230,10 @@ $cert = [pscustomobject]@{
   [string[]]$values = @()
   if ($present) { $values = [string[]]$property.Value.Clone() }
   $snapshot = [pscustomobject]@{ Present = $present; Values = $values }
-  Set-Variable -Name environmentSnapshot -Scope 1 -Value $snapshot
+  $firstSnapshot = Get-Variable -Name environmentSnapshot -Scope 1 -ErrorAction SilentlyContinue
+  if ($null -eq $firstSnapshot -or $null -eq $firstSnapshot.Value) {
+    Set-Variable -Name environmentSnapshot -Scope 1 -Value $snapshot
+  }
   $remaining = @($snapshot.Values | Where-Object { $_ -and $_ -notmatch '^BANTO_HUB_TLS_(PORT|CERT|KEY)=' })
   Write-Host "元の Environment をこのセッション内に保持しました（TLS 以外: $($remaining.Count) 件）。"
   $updated = $remaining + @(
@@ -265,7 +267,7 @@ $cert = [pscustomobject]@{
 ```
 
 - 確かめ: Hub のサービスログに TLS の待受が出る・`Test-NetConnection 127.0.0.1 -Port 8723` が通る・LAN 側の IP の 8723 には繋がらない。
-- 戻し方: **上の `$environmentSnapshot` が残る同じセッションでのみ**、次を実行する。元のプロパティが無かったときだけ削除し、あったときは秘密値を含む元の配列をそのまま戻す。別セッション用に秘密入りのバックアップは作らない。S7 の後に戻すかは、そのときにオーナーが決める。
+- 戻し方: **上の `$environmentSnapshot` が残る同じセッションでのみ**、次を実行する。同じセッションで設定ブロックを再実行しても、初回適用直前の控えを使う。元のプロパティが無かったときだけ削除し、あったときは秘密値を含む元の配列をそのまま戻す。別セッション用に秘密入りのバックアップは作らない。S7 の後に戻すかは、そのときにオーナーが決める。
 
 ```powershell
 & {
@@ -286,6 +288,25 @@ $cert = [pscustomobject]@{
     $reason = if ($phase -eq 'service restart') { $_.Exception.Message } else { "レジストリ復元 ($($_.FullyQualifiedErrorId))" }
     throw "Environment の復元に失敗: $reason"
   }
+}
+```
+
+- 別セッションで、**この試験で初めて追加した TLS 設定を無効化する場合だけ**、次の手順で TLS の 3 行を外す。TLS 以外の `Environment` の行は残す。適用前から TLS 設定があった場合、これは原状復帰にならない。記録した旧 TLS のポート・証明書・鍵のパスから設定し直し、記録がなければこの解除手順を使わない。
+
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'
+  $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub'
+  $property = (Get-ItemProperty -Path $serviceKey -ErrorAction Stop).PSObject.Properties['Environment']
+  if ($null -eq $property) { return }
+  if ($property.Value -isnot [string[]]) { throw 'Environment が REG_MULTI_SZ ではありません。' }
+  $kept = @($property.Value | Where-Object { $_ -notmatch '^BANTO_HUB_TLS_(PORT|CERT|KEY)=' })
+  if ($kept.Count -eq 0) {
+    Remove-ItemProperty -Path $serviceKey -Name Environment -ErrorAction Stop
+  } else {
+    New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Force -Value ([string[]]$kept) | Out-Null
+  }
+  Restart-Service BantoHub
 }
 ```
 
