@@ -1739,8 +1739,10 @@ mod tests {
     /// Repeated source ptime is legal, so identity here is a unique test value,
     /// never (ts, tag_id). An identical constant source has no such identity in
     /// the five-column schema; this test cannot explain a historical duplicate.
-    /// The outage precedes authentication, so no INSERT can have committed with
-    /// its response lost. Exact-once here does not override at-least-once delivery.
+    /// The pre-authentication outage excludes ambiguous commits ONLY during that
+    /// outage. Recovery still uses at-least-once delivery: the exact comparison
+    /// assumes no post-recovery INSERT timeout / lost COMMIT response. A generous
+    /// operation budget reduces CI false duplicates; it cannot guarantee exactly-once.
     #[tokio::test]
     async fn tag_add_and_remove_preserve_each_queued_row_through_pg_recovery() {
         let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
@@ -1780,7 +1782,9 @@ mod tests {
             .insert(10, connections[0].clone());
         let mut options = engine.flush_options();
         options.flush_interval = Duration::from_millis(20);
-        options.operation_timeout = Duration::from_secs(2);
+        // The same flusher keeps this budget after recovery. Leave healthy INSERTs
+        // enough headroom rather than using a short outage-only test deadline.
+        options.operation_timeout = Duration::from_secs(10);
         options.batch_size = 2; // Force several commits after recovery.
         let handle = crate::flush::spawn_flusher(
             connections[0].clone(),
@@ -1808,15 +1812,14 @@ mod tests {
             "保存先検査が {:.1} 秒でタイムアウトしました",
             options.operation_timeout.as_secs_f64()
         );
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let outage_observed = tokio::time::timeout(Duration::from_secs(30), async {
             while runtime.state() != crate::status::GroupState::Error
                 || runtime.last_error().as_deref() != Some(expected_timeout.as_str())
             {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("observe actual failed DB handshake before reconfiguration");
+        .await;
 
         let mut added = initial.clone();
         added.tags.push(SinkConfigTag {
@@ -1829,7 +1832,9 @@ mod tests {
             .apply_plan(desired(vec![added.clone()], connections.clone()))
             .await;
         let after_add = engine.groups.get(1).unwrap();
-        assert_eq!(&*after_add.peek_batch(100), expected.as_slice());
+        let added_broken_empty = engine.broken.is_empty();
+        let added_rows = after_add.peek_batch(100).to_vec();
+        let expected_added_rows = expected.clone();
         let during_add = vec![row(201, 1), row(202, 2), row(203, 2)];
         after_add.push_rows(during_add.clone());
         expected.extend(during_add);
@@ -1839,11 +1844,13 @@ mod tests {
         removed.tags.retain(|tag| tag.tag_id == 2);
         engine.apply_plan(desired(vec![removed], connections)).await;
         let after_remove = engine.groups.get(1).unwrap();
-        assert_eq!(&*after_remove.peek_batch(100), expected.as_slice());
+        let removed_broken_empty = engine.broken.is_empty();
+        let removed_rows = after_remove.peek_batch(100).to_vec();
+        let expected_removed_rows = expected.clone();
         after_remove.push_rows(vec![row(301, 2)]);
         expected.push(row(301, 2));
-        assert_eq!(&*after_remove.peek_batch(100), expected.as_slice());
-        assert_eq!(after_remove.dropped(), 0);
+        let recovery_rows = after_remove.peek_batch(100).to_vec();
+        let dropped_before_recovery = after_remove.dropped();
 
         let forwarding = tokio::spawn(async move {
             let mut sockets = tokio::task::JoinSet::new();
@@ -1862,14 +1869,14 @@ mod tests {
                 }
             }
         });
-        tokio::time::timeout(Duration::from_secs(60), async {
+        let recovered = tokio::time::timeout(Duration::from_secs(60), async {
             while after_remove.queued() != 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("same flusher recovers and commits all queued rows");
-        // Quiesce before reading: no writer can add rows after this assertion.
+        .await;
+        // Quiesce before reading. Defer timeout/state/data assertions until after
+        // cleanup, so failure diagnostics do not leave tables or sockets behind.
         for (_, task) in engine.producers.drain() {
             task.abort();
             let _ = task.await;
@@ -1880,41 +1887,101 @@ mod tests {
             .unwrap()
             .stop(Duration::from_secs(2))
             .await;
-        assert_eq!(stopped, crate::flush::FlusherStopOutcome::Completed);
         // Unique numeric identities are appended in ascending order; ORDER BY
         // value compares every column and multiplicity without relying on static ts.
-        use sqlx::Row as _;
-        let actual: Vec<crate::queue::Row> = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT (extract(epoch FROM ts) * 1000)::bigint AS ts_ms, \
-             tag_id, external_name, value, quality FROM {table} ORDER BY value"
-        )))
+        let actual = sqlx::query_as::<_, (i64, i64, String, Option<f64>, String)>(
+            sqlx::AssertSqlSafe(format!(
+                "SELECT (extract(epoch FROM ts) * 1000)::bigint, \
+                 tag_id, external_name, value, quality FROM {table} ORDER BY value"
+            )),
+        )
         .fetch_all(&pool)
         .await
-        .expect("read all persisted identities")
-        .into_iter()
-        .map(|r| crate::queue::Row {
-            ts_ms: r.get("ts_ms"),
-            tag_id: r.get("tag_id"),
-            external_name: r.get("external_name"),
-            value: r.get("value"),
-            quality: r.get("quality"),
-        })
-        .collect();
-        assert_eq!(
-            actual, expected,
-            "all five columns, each identity exactly once"
-        );
-        assert_eq!(after_remove.dropped(), 0);
-        assert_eq!(runtime.queued(), 0, "old generations share the ACKed queue");
-        assert_eq!(after_add.queued(), 0);
-        sink_pool.close().await;
+        .map(|rows| {
+            rows.into_iter()
+                .map(
+                    |(ts_ms, tag_id, external_name, value, quality)| crate::queue::Row {
+                        ts_ms,
+                        tag_id,
+                        external_name,
+                        value,
+                        quality,
+                    },
+                )
+                .collect::<Vec<_>>()
+        });
+        let dropped_after_recovery = after_remove.dropped();
+        let queued_after_recovery = (runtime.queued(), after_add.queued(), after_remove.queued());
+
+        // Preserve query errors and all observations until every cleanup step has
+        // been attempted. In particular, a failed equality must not skip DROP.
+        let sink_closed = tokio::time::timeout(Duration::from_secs(5), sink_pool.close()).await;
         forwarding.abort();
         let _ = forwarding.await;
-        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}")))
-            .execute(&pool)
-            .await
-            .unwrap();
-        pool.close().await;
+        let dropped_table = tokio::time::timeout(
+            Duration::from_secs(15),
+            sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {table}"))).execute(&pool),
+        )
+        .await;
+        let pool_closed = tokio::time::timeout(Duration::from_secs(5), pool.close()).await;
+
+        dropped_table
+            .expect("drop isolated test table within cleanup budget")
+            .expect("drop isolated test table");
+        sink_closed.expect("close sink pool");
+        pool_closed.expect("close inspection pool");
+        outage_observed.expect("observe actual failed DB handshake before reconfiguration");
+        assert!(
+            !Arc::ptr_eq(&after_add, &runtime),
+            "add replaces the original generation"
+        );
+        assert_eq!(after_add.tags.len(), 2);
+        assert_eq!(
+            after_add
+                .tags
+                .iter()
+                .map(|tag| tag.tag_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(
+            added_broken_empty,
+            "adding tags must not leave a broken group"
+        );
+        assert_eq!(added_rows, expected_added_rows);
+        assert!(
+            !Arc::ptr_eq(&after_remove, &after_add),
+            "remove replaces the added generation"
+        );
+        assert!(
+            !Arc::ptr_eq(&after_remove, &runtime),
+            "remove must not restore the original generation"
+        );
+        assert_eq!(after_remove.tags.len(), 1);
+        assert_eq!(
+            after_remove.tags[0].tag_id, 2,
+            "the original tag was removed"
+        );
+        assert!(
+            removed_broken_empty,
+            "removing tags must not leave a broken group"
+        );
+        assert_eq!(removed_rows, expected_removed_rows);
+        assert_eq!(recovery_rows, expected);
+        assert_eq!(dropped_before_recovery, 0);
+        recovered.expect("same flusher recovers and commits all queued rows");
+        assert_eq!(stopped, crate::flush::FlusherStopOutcome::Completed);
+        assert_eq!(
+            actual.expect("read all persisted identities"),
+            expected,
+            "all five columns, each identity exactly once when recovery does not time out"
+        );
+        assert_eq!(dropped_after_recovery, 0);
+        assert_eq!(
+            queued_after_recovery,
+            (0, 0, 0),
+            "all generations share the ACKed queue"
+        );
     }
 
     /// テーブルが変わる（書き先が変わる）: 古い接続の flusher が生きている間に
