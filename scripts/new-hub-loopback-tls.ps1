@@ -10,6 +10,8 @@ param(
   [ValidateRange(1, 36500)]
   [int]$Days,
 
+  [Parameter(Mandatory = $true)]
+  [ValidateNotNullOrEmpty()]
   [string]$OpenSslPath
 )
 
@@ -26,17 +28,6 @@ if (-not $principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Adm
   throw '管理者 PowerShell で実行してください。'
 }
 
-# コマンドが無い場合も、古い $LASTEXITCODE を成功と誤認しないよう先に解決する。
-$opensslCommand = if ($OpenSslPath) {
-  Get-Command -Name $OpenSslPath -CommandType Application -ErrorAction Stop
-} else {
-  Get-Command -Name openssl.exe -CommandType Application -ErrorAction Stop
-}
-$openssl = $opensslCommand.Source
-$version = @(& $openssl version)
-if ($LASTEXITCODE -ne 0 -or $version.Count -ne 1) {
-  throw 'OpenSSL の版を取得できませんでした。'
-}
 if (-not [System.IO.Path]::IsPathRooted($TlsDirectory)) {
   throw 'TlsDirectory は絶対パスで指定してください。'
 }
@@ -58,7 +49,9 @@ $parentDir = [System.IO.Path]::GetDirectoryName($tlsDir)
 $sidType = [System.Security.Principal.SecurityIdentifier]
 $systemSid = 'S-1-5-18'
 $adminsSid = 'S-1-5-32-544'
+$trustedInstallerSid = 'S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464'
 $trustedOwners = @($systemSid, $adminsSid)
+$openSslOwners = @($systemSid, $adminsSid, $trustedInstallerSid)
 $serviceSids = @($systemSid, $adminsSid)
 $allowType = [System.Security.AccessControl.AccessControlType]::Allow
 $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
@@ -80,7 +73,7 @@ function Get-PlainDirectory {
 }
 
 function Get-CheckedAcl {
-  param([string]$Path)
+  param([string]$Path, [string[]]$AllowedOwners = $trustedOwners)
   $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
   $raw = [System.Security.AccessControl.RawSecurityDescriptor]::new($acl.GetSecurityDescriptorBinaryForm(), 0)
   if ($null -eq $raw.DiscretionaryAcl -or $raw.DiscretionaryAcl.Count -eq 0) {
@@ -97,7 +90,7 @@ function Get-CheckedAcl {
   if ($rules.Count -eq 0) {
     throw "ACL を確認できません: $Path"
   }
-  if ($acl.GetOwner($sidType).Value -notin $trustedOwners) {
+  if ($acl.GetOwner($sidType).Value -notin $AllowedOwners) {
     throw "所有者を信頼できません: $Path"
   }
   return $acl
@@ -154,6 +147,119 @@ function Assert-SafeAncestors {
       }
     }
   }
+}
+
+function Assert-SafeOpenSslFile {
+  param([string]$Path)
+  $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+  if ($item.PSIsContainer -or
+      (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+    throw "OpenSSL の通常ファイルではありません: $Path"
+  }
+  $acl = Get-CheckedAcl -Path $Path -AllowedOwners $openSslOwners
+  foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+    if ($rule.AccessControlType -eq $allowType -and
+        $rule.IdentityReference.Value -notin $openSslOwners -and
+        (($rule.PropagationFlags -band $inheritOnly) -eq 0) -and
+        (([int]$rule.FileSystemRights -band 0x500D0156) -ne 0)) {
+      throw "第三者が OpenSSL 実行ファイルを書き換えられます: $Path"
+    }
+  }
+}
+
+function Assert-SafeOpenSsl {
+  param([string]$Path)
+  if ($Path -notmatch '^[A-Za-z]:\\' -or
+      $Path -match '[*?\[\]]' -or
+      $Path -match '(^|[\\/])\.\.?([\\/]|$)') {
+    throw 'OpenSslPath はワイルドカードや相対成分のないローカルのドライブ絶対パスで指定してください。'
+  }
+  $openssl = [System.IO.Path]::GetFullPath($Path)
+  if ([System.IO.Path]::GetFileName($openssl) -ine 'openssl.exe') {
+    throw 'OpenSslPath には openssl.exe を指定してください。'
+  }
+  $opensslDir = [System.IO.Path]::GetDirectoryName($openssl)
+  $driveRoot = [System.IO.Path]::GetPathRoot($openssl)
+  $ancestors = [System.Collections.Generic.List[string]]::new()
+  $cursor = $opensslDir
+  while ($true) {
+    $ancestors.Add($cursor)
+    if ($cursor -eq $driveRoot) { break }
+    $cursor = [System.IO.Path]::GetDirectoryName($cursor)
+    if (-not $cursor) { throw "OpenSSL の祖先を確認できません: $openssl" }
+  }
+  $ancestors.Reverse()
+  $readMask = [int][System.Security.AccessControl.FileSystemRights]::ReadAndExecute -bor [int][System.Security.AccessControl.FileSystemRights]::Synchronize
+  foreach ($ancestor in $ancestors) {
+    [void](Get-PlainDirectory $ancestor)
+    $acl = Get-CheckedAcl -Path $ancestor -AllowedOwners $openSslOwners
+    foreach ($rule in $acl.GetAccessRules($true, $true, $sidType)) {
+      if ($rule.AccessControlType -ne $allowType -or
+          $rule.IdentityReference.Value -in $openSslOwners -or
+          (($rule.PropagationFlags -band $inheritOnly) -ne 0)) {
+        continue
+      }
+      if (([int]$rule.FileSystemRights -band $unsafeParentMask) -ne 0 -or
+          ($ancestor -eq $opensslDir -and
+           (([int]$rule.FileSystemRights -band (-bnot $readMask)) -ne 0))) {
+        throw "第三者が OpenSSL の祖先を入れ替え、または実行ディレクトリへ作成できます: $ancestor"
+      }
+    }
+  }
+  Assert-SafeOpenSslFile $openssl
+  foreach ($entry in Get-ChildItem -LiteralPath $opensslDir -Force -ErrorAction Stop) {
+    if ($entry.Extension -ieq '.dll') {
+      Assert-SafeOpenSslFile $entry.FullName
+    }
+  }
+  return [pscustomobject]@{ Executable = $openssl; Directory = $opensslDir }
+}
+
+function Invoke-CheckedOpenSsl {
+  param([string]$Operation, [string[]]$Arguments)
+  $start = [System.Diagnostics.ProcessStartInfo]::new()
+  $start.FileName = $openssl
+  $start.WorkingDirectory = $opensslDir
+  $start.UseShellExecute = $false
+  $start.CreateNoWindow = $true
+  $start.RedirectStandardOutput = $true
+  $start.RedirectStandardError = $true
+  # PS 5.1 の ProcessStartInfo には ArgumentList がない。渡す値に引用符は含めない。
+  $quoted = foreach ($argument in $Arguments) {
+    if ($argument -match '"') { throw 'OpenSSL 引数に引用符を含められません。' }
+    if ($argument -match '\s') { '"' + $argument + '"' } else { $argument }
+  }
+  $start.Arguments = $quoted -join ' '
+  $start.EnvironmentVariables['PATH'] = "$opensslDir;$([System.Environment]::SystemDirectory);$([System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::Windows))"
+  $start.EnvironmentVariables['OPENSSL_CONF'] = 'NUL'
+  foreach ($name in @('OPENSSL_CONF_INCLUDE', 'OPENSSL_MODULES', 'OPENSSL_ENGINES')) {
+    $start.EnvironmentVariables.Remove($name)
+  }
+  $process = [System.Diagnostics.Process]::new()
+  $process.StartInfo = $start
+  try {
+    if (-not $process.Start()) { throw "OpenSSL $Operation を起動できません。" }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    $process.WaitForExit()
+    $stdout = $stdoutTask.GetAwaiter().GetResult()
+    $stderr = $stderrTask.GetAwaiter().GetResult()
+    if ($process.ExitCode -ne 0) {
+      $stderrState = if ($stderr.Length -gt 0) { '標準エラー出力あり（内容は秘密情報保護のため省略）' } else { '標準エラー出力なし' }
+      throw "OpenSSL $Operation が終了コード $($process.ExitCode) で失敗しました: $stderrState"
+    }
+    return $stdout.TrimEnd()
+  } finally {
+    $process.Dispose()
+  }
+}
+
+$openSslInfo = Assert-SafeOpenSsl $OpenSslPath
+$openssl = $openSslInfo.Executable
+$opensslDir = $openSslInfo.Directory
+$version = Invoke-CheckedOpenSsl -Operation 'version' -Arguments @('version')
+if ($version -notmatch '^OpenSSL \S+') {
+  throw 'OpenSSL の版を取得できませんでした。'
 }
 
 Assert-SafeAncestors
@@ -214,19 +320,16 @@ subjectAltName = IP:127.0.0.1
   Assert-ServiceOnlyAcl $configFile $false
 
   $opensslStarted = $true
-  & $openssl req -x509 -config $configFile -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days $Days -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
-  if ($LASTEXITCODE -ne 0 -or
-      -not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
+  $null = Invoke-CheckedOpenSsl -Operation 'req' -Arguments @('req', '-x509', '-config', $configFile, '-newkey', 'ec', '-pkeyopt', 'ec_paramgen_curve:P-256', '-days', $Days.ToString(), '-nodes', '-subj', '/CN=banto-hub', '-keyout', $keyFile, '-out', $certFile)
+  if (-not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
       -not (Test-Path -LiteralPath $certFile -PathType Leaf)) {
     throw '証明書を発行できませんでした。'
   }
   Assert-ServiceOnlyAcl $keyFile $false
   Assert-ServiceOnlyAcl $certFile $false
 
-  $details = @(& $openssl x509 -in $certFile -noout -text)
-  if ($LASTEXITCODE -ne 0) {
-    throw '証明書の拡張を読めませんでした。'
-  }
+  $detailsText = Invoke-CheckedOpenSsl -Operation 'x509 text' -Arguments @('x509', '-in', $certFile, '-noout', '-text')
+  $details = @($detailsText -split '\r?\n')
   $constraintLines = @(for ($i = 0; $i -lt $details.Count; $i++) {
     if ($details[$i] -match '^\s*X509v3 Basic Constraints:') { $i }
   })
@@ -239,12 +342,12 @@ subjectAltName = IP:127.0.0.1
     throw 'SAN に IP:127.0.0.1 がありません。'
   }
 
-  $expiry = @(& $openssl x509 -in $certFile -noout -enddate)
-  if ($LASTEXITCODE -ne 0 -or $expiry.Count -ne 1 -or $expiry[0] -notmatch '^notAfter=.+ GMT$') {
+  $expiry = Invoke-CheckedOpenSsl -Operation 'x509 enddate' -Arguments @('x509', '-in', $certFile, '-noout', '-enddate')
+  if ($expiry -notmatch '^notAfter=.+ GMT$') {
     throw '証明書の有効期限を読めませんでした。'
   }
-  $fingerprint = @(& $openssl x509 -in $certFile -noout -fingerprint -sha256)
-  if ($LASTEXITCODE -ne 0 -or $fingerprint.Count -ne 1 -or $fingerprint[0] -notmatch '^sha256 Fingerprint=([0-9A-F]{2}:){31}[0-9A-F]{2}$') {
+  $fingerprint = Invoke-CheckedOpenSsl -Operation 'x509 fingerprint' -Arguments @('x509', '-in', $certFile, '-noout', '-fingerprint', '-sha256')
+  if ($fingerprint -notmatch '^sha256 Fingerprint=([0-9A-F]{2}:){31}[0-9A-F]{2}$') {
     throw '証明書の SHA-256 指紋を読めませんでした。'
   }
 
@@ -252,10 +355,10 @@ subjectAltName = IP:127.0.0.1
     CertificatePath = $certFile
     PrivateKeyPath = $keyFile
     ConfigPath = $configFile
-    FingerprintSha256 = $fingerprint[0].Substring($fingerprint[0].IndexOf('=') + 1)
-    NotAfterUtc = $expiry[0].Substring('notAfter='.Length)
+    FingerprintSha256 = $fingerprint.Substring($fingerprint.IndexOf('=') + 1)
+    NotAfterUtc = $expiry.Substring('notAfter='.Length)
     OpenSslPath = $openssl
-    OpenSslVersion = $version[0]
+    OpenSslVersion = $version
   }
 } catch {
   $originalError = $_

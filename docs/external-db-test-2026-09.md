@@ -143,14 +143,19 @@ R2b-1f（2026-10-22）で追加。**オーナー同席で行う（未実施）**
 P-5 の証明書は、[運用ガイド §12](banto-hub-operations.md) と共通の
 [scripts/new-hub-loopback-tls.ps1](../scripts/new-hub-loopback-tls.ps1) で発行する。
 リポジトリのルートから管理者 PowerShell で次を一度に実行する。
-OpenSSL が PATH に無ければ、確認した `openssl.exe` の絶対パスを
-`-OpenSslPath` に渡す。失敗したらサービスの設定へ進まない。
+管理者が正規配布物から設置した、信頼済み `openssl.exe` のローカル絶対パスを
+必須の `-OpenSslPath` に渡す。Git for Windows の
+`C:\Program Files\Git\mingw64\bin\openssl.exe` も同じ検査の対象。失敗したら
+サービスの設定へ進まない。
 
 ```powershell
 $cert = $null
-$cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\BantoHub\tls' -Days 30
+$cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\BantoHub\tls' -Days 30 -OpenSslPath 'C:\Program Files\OpenSSL-Win64\bin\openssl.exe'
 $cert | Format-List CertificatePath,PrivateKeyPath,ConfigPath,FingerprintSha256,NotAfterUtc,OpenSslPath,OpenSslVersion
 ```
+
+既定・代替の両候補とも、この共通スクリプトの昇格実行とサービス接続は未確認。
+S7 B-3 の接続記録は以前の手順による結果。
 
 スクリプトの実行がポリシーで拒否された場合だけ、信頼済みチェックアウトで
 あることを確かめ、組織のポリシーが許す範囲で次を実行して再試行する。
@@ -198,12 +203,18 @@ GRANT INSERT, SELECT ON tag_history TO banto_sink;
 **P-5 Hub のサービスに TLS の環境変数を渡す方法**: **サービスのレジストリの `Environment`（REG_MULTI_SZ）** を勧める。SCM はこの値をサービスのプロセスの環境に足して起動する。
 
 - ポートは **8723**（8722 の隣、ChronoGazer の 8721 と重ならない）。当日の前に `Get-NetTCPConnection -LocalPort 8723` で空きを確かめる。
-- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、OS の ProgramData から親まで検査する。既定の保管先または親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。Git for Windows 同梱の `openssl.exe` も、絶対パスを `-OpenSslPath` に渡して使える。期限は S7 の期間を覆う 30 日。
+- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、OS の ProgramData から親まで検査する。既定の保管先または親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。期限は S7 の期間を覆う 30 日。
 - 管理者の PowerShell で、成功した発行結果の `$cert` を使う。別の
-  セッションなら、記録した証明書・鍵の絶対パスを `$cert` の対応する
-  プロパティに設定し直す。
+  セッションなら、記録した証明書・鍵の絶対パスで次のように再構成する。
   **先に既存の値を確かめて**から書く（`Environment` が既にあれば、残す行を
   足して書き直す。上書きで消さない）:
+
+```powershell
+$cert = [pscustomobject]@{
+  CertificatePath = '<記録した証明書の絶対パス>'
+  PrivateKeyPath = '<記録した秘密鍵の絶対パス>'
+}
+```
 
 ```powershell
 & {

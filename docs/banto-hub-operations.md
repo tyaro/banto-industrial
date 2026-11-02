@@ -2026,7 +2026,8 @@ Hub のサービスが起動時に読む `BANTO_HUB_TLS_PORT`、`BANTO_HUB_TLS_C
 `127.0.0.1:<BANTO_HUB_TLS_PORT>` で HTTPS を待ち受けます。ポートは 0 以外、
 証明書と秘密鍵は PEM ファイルのパスです。証明書には接続先の IP
 `127.0.0.1` を SAN として含めてください。Hub は `::1` では待ち受けません。
-自己署名のサーバー証明書は、リポジトリの信頼済みチェックアウトから
+自己署名のサーバー証明書は、管理者が正規の配布物から OpenSSL を設置し、
+リポジトリの信頼済みチェックアウトから
 [scripts/new-hub-loopback-tls.ps1](../scripts/new-hub-loopback-tls.ps1) を管理者
 PowerShell で実行して発行してください。親ディレクトリと保管先の所有者・ACL・
 リンクを検査し、保護された保管先に設定ファイル・秘密鍵・証明書を新しい
@@ -2035,8 +2036,18 @@ PowerShell で実行して発行してください。親ディレクトリと保
 
 ```powershell
 $cert = $null
-$cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\BantoHub\tls' -Days 30
+$cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\BantoHub\tls' -Days 30 -OpenSslPath 'C:\Program Files\OpenSSL-Win64\bin\openssl.exe'
 $cert | Format-List CertificatePath,PrivateKeyPath,ConfigPath,FingerprintSha256,NotAfterUtc,OpenSslPath,OpenSslVersion
+```
+
+別の PowerShell セッションで記録済みの発行物を使う場合は、証明書と鍵の
+**記録した絶対パス**で `$cert` を再構成します。
+
+```powershell
+$cert = [pscustomobject]@{
+  CertificatePath = '<記録した証明書の絶対パス>'
+  PrivateKeyPath = '<記録した秘密鍵の絶対パス>'
+}
 ```
 
 スクリプトの実行がポリシーで拒否された場合だけ、信頼済みチェックアウトである
@@ -2048,15 +2059,17 @@ Get-ExecutionPolicy -List
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 ```
 
-リポジトリのルートで実行します。OpenSSL が PATH に無い場合は、確認した
-`openssl.exe` の絶対パスを `-OpenSslPath` に渡してください。発行に失敗したら
+リポジトリのルートで実行します。`-OpenSslPath` は必須で、管理者が設置した
+信頼済み `openssl.exe` のローカル絶対パスを指定します。Git for Windows の
+`C:\Program Files\Git\mingw64\bin\openssl.exe` も同じ検査の対象です。発行に失敗したら
 後続のサービス設定へ進まないでください。スクリプトが受け付ける保管先は
 `C:\ProgramData\BantoHub\tls` と `C:\ProgramData\BantoHubTls` の 2 つだけです。
 OS の ProgramData から保管先の親まで検査します。既定の保管先または親が検査を
 通らない場合は、
 後者を `-TlsDirectory` に指定し、同じ検査が成功したときだけ発行結果のパスを
-使います。この候補での
-実機発行・サービス接続は未確認です。`-Days 30` は S7 の試験用です。
+使います。**既定・代替の両候補とも、この共通スクリプトの昇格実行と
+サービス接続は未確認です。** S7 B-3 の接続記録は以前の手順による結果です。
+`-Days 30` は S7 の試験用です。
 運用では更新の間隔を決め、その期間に応じた日数を指定します。
 スクリプトが `Basic Constraints` 1 個の `CA:FALSE`、SAN
 `IP:127.0.0.1`、所有者・ACL、有効期限を検査し、成功時だけパスと指紋を返します。
