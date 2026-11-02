@@ -152,6 +152,15 @@ $cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\Banto
 $cert | Format-List CertificatePath,PrivateKeyPath,ConfigPath,FingerprintSha256,NotAfterUtc,OpenSslPath,OpenSslVersion
 ```
 
+スクリプトの実行がポリシーで拒否された場合だけ、信頼済みチェックアウトで
+あることを確かめ、組織のポリシーが許す範囲で次を実行して再試行する。
+`MachinePolicy`・`UserPolicy` が優先される場合は管理者の方針に従う。
+
+```powershell
+Get-ExecutionPolicy -List
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+```
+
 `-Days 30` は S7 の試験用。スクリプトは親と保管先のリンク・所有者・ACL を
 検査し、保護された保管先で ASCII の設定ファイル、日付付きの秘密鍵と
 証明書を新規作成する。証明書の `CA:FALSE`、SAN `IP:127.0.0.1` と
@@ -189,7 +198,7 @@ GRANT INSERT, SELECT ON tag_history TO banto_sink;
 **P-5 Hub のサービスに TLS の環境変数を渡す方法**: **サービスのレジストリの `Environment`（REG_MULTI_SZ）** を勧める。SCM はこの値をサービスのプロセスの環境に足して起動する。
 
 - ポートは **8723**（8722 の隣、ChronoGazer の 8721 と重ならない）。当日の前に `Get-NetTCPConnection -LocalPort 8723` で空きを確かめる。
-- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、OS の ProgramData から親まで検査する。既定の親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。Git for Windows 同梱の `openssl.exe` も、絶対パスを `-OpenSslPath` に渡して使える。期限は S7 の期間を覆う 30 日。
+- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、OS の ProgramData から親まで検査する。既定の保管先または親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。Git for Windows 同梱の `openssl.exe` も、絶対パスを `-OpenSslPath` に渡して使える。期限は S7 の期間を覆う 30 日。
 - 管理者の PowerShell で、成功した発行結果の `$cert` を使う。別の
   セッションなら、記録した証明書・鍵の絶対パスを `$cert` の対応する
   プロパティに設定し直す。

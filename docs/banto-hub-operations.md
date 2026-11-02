@@ -2039,11 +2039,21 @@ $cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\Banto
 $cert | Format-List CertificatePath,PrivateKeyPath,ConfigPath,FingerprintSha256,NotAfterUtc,OpenSslPath,OpenSslVersion
 ```
 
+スクリプトの実行がポリシーで拒否された場合だけ、信頼済みチェックアウトである
+ことを確かめ、組織のポリシーが許す範囲で次を実行してから再試行します。
+`MachinePolicy`・`UserPolicy` が優先される環境では管理者の方針に従います。
+
+```powershell
+Get-ExecutionPolicy -List
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
+```
+
 リポジトリのルートで実行します。OpenSSL が PATH に無い場合は、確認した
 `openssl.exe` の絶対パスを `-OpenSslPath` に渡してください。発行に失敗したら
 後続のサービス設定へ進まないでください。スクリプトが受け付ける保管先は
 `C:\ProgramData\BantoHub\tls` と `C:\ProgramData\BantoHubTls` の 2 つだけです。
-OS の ProgramData から保管先の親まで検査します。既定の親が検査を通らない場合は、
+OS の ProgramData から保管先の親まで検査します。既定の保管先または親が検査を
+通らない場合は、
 後者を `-TlsDirectory` に指定し、同じ検査が成功したときだけ発行結果のパスを
 使います。この候補での
 実機発行・サービス接続は未確認です。`-Days 30` は S7 の試験用です。

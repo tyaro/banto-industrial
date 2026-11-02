@@ -58,11 +58,13 @@ $parentDir = [System.IO.Path]::GetDirectoryName($tlsDir)
 $sidType = [System.Security.Principal.SecurityIdentifier]
 $systemSid = 'S-1-5-18'
 $adminsSid = 'S-1-5-32-544'
-$operatorSid = $identity.User.Value
-$trustedOwners = @($systemSid, $adminsSid, $operatorSid)
+$trustedOwners = @($systemSid, $adminsSid)
 $serviceSids = @($systemSid, $adminsSid)
 $allowType = [System.Security.AccessControl.AccessControlType]::Allow
 $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+if ($identity.Owner.Value -notin $trustedOwners) {
+  throw '昇格トークンの既定所有者が SYSTEM または Administrators ではありません。発行しません。'
+}
 # OPC UA の親ディレクトリ検査と同じ: DELETE / DELETE_CHILD / WRITE_DAC /
 # WRITE_OWNER / GENERIC_ALL / GENERIC_WRITE。作成だけの権利は許す。
 $unsafeParentMask = 0x500D0040
@@ -131,26 +133,30 @@ function Assert-ServiceOnlyAcl {
   }
 }
 
-# OS の ProgramData から保管先の親まで、入れ替え可能な祖先を残さない。
-# BantoHub は他のデータも持つため ACL を変更せず、危険な権限だけを拒否する。
-$ancestors = @($programData)
-if ($tlsDir -eq $defaultTlsDir) {
-  $ancestors += $parentDir
-}
-foreach ($ancestor in $ancestors) {
-  [void](Get-PlainDirectory $ancestor)
-  $ancestorAcl = Get-CheckedAcl $ancestor
-  foreach ($rule in $ancestorAcl.GetAccessRules($true, $true, $sidType)) {
-    if ($rule.AccessControlType -ne $allowType -or
-        $rule.IdentityReference.Value -in $trustedOwners -or
-        (($rule.PropagationFlags -band $inheritOnly) -ne 0)) {
-      continue
-    }
-    if (([int]$rule.FileSystemRights -band $unsafeParentMask) -ne 0) {
-      throw "祖先に第三者の入れ替え権限があります: $ancestor"
+function Assert-SafeAncestors {
+  # OS の ProgramData から保管先の親まで、入れ替え可能な祖先を残さない。
+  # BantoHub は他のデータも持つため ACL を変更せず、危険な権限だけを拒否する。
+  $ancestors = @($programData)
+  if ($tlsDir -eq $defaultTlsDir) {
+    $ancestors += $parentDir
+  }
+  foreach ($ancestor in $ancestors) {
+    [void](Get-PlainDirectory $ancestor)
+    $ancestorAcl = Get-CheckedAcl $ancestor
+    foreach ($rule in $ancestorAcl.GetAccessRules($true, $true, $sidType)) {
+      if ($rule.AccessControlType -ne $allowType -or
+          $rule.IdentityReference.Value -in $trustedOwners -or
+          (($rule.PropagationFlags -band $inheritOnly) -ne 0)) {
+        continue
+      }
+      if (([int]$rule.FileSystemRights -band $unsafeParentMask) -ne 0) {
+        throw "祖先に第三者の入れ替え権限があります: $ancestor"
+      }
     }
   }
 }
+
+Assert-SafeAncestors
 
 $existing = Get-Item -LiteralPath $tlsDir -Force -ErrorAction SilentlyContinue
 if ($null -ne $existing) {
@@ -159,6 +165,7 @@ if ($null -ne $existing) {
   Assert-ServiceOnlyAcl $tlsDir $true
 } else {
   $protectedAcl = [System.Security.AccessControl.DirectorySecurity]::new()
+  $protectedAcl.SetOwner([System.Security.Principal.SecurityIdentifier]::new($adminsSid))
   $protectedAcl.SetAccessRuleProtection($true, $false)
   foreach ($sid in $serviceSids) {
     $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
@@ -191,7 +198,10 @@ foreach ($path in @($configFile, $keyFile, $certFile)) {
   }
 }
 
-@'
+$configCreated = $false
+$opensslStarted = $false
+try {
+  @'
 [req]
 distinguished_name = dn
 x509_extensions = v3
@@ -200,48 +210,104 @@ x509_extensions = v3
 basicConstraints = critical,CA:FALSE
 subjectAltName = IP:127.0.0.1
 '@ | Out-File -LiteralPath $configFile -Encoding ascii -NoClobber -ErrorAction Stop
-Assert-ServiceOnlyAcl $configFile $false
+  $configCreated = $true
+  Assert-ServiceOnlyAcl $configFile $false
 
-& $openssl req -x509 -config $configFile -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days $Days -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
-if ($LASTEXITCODE -ne 0 -or
-    -not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
-    -not (Test-Path -LiteralPath $certFile -PathType Leaf)) {
-  throw '証明書を発行できませんでした。'
-}
-Assert-ServiceOnlyAcl $keyFile $false
-Assert-ServiceOnlyAcl $certFile $false
+  $opensslStarted = $true
+  & $openssl req -x509 -config $configFile -newkey ec -pkeyopt ec_paramgen_curve:P-256 -days $Days -nodes -subj /CN=banto-hub -keyout $keyFile -out $certFile
+  if ($LASTEXITCODE -ne 0 -or
+      -not (Test-Path -LiteralPath $keyFile -PathType Leaf) -or
+      -not (Test-Path -LiteralPath $certFile -PathType Leaf)) {
+    throw '証明書を発行できませんでした。'
+  }
+  Assert-ServiceOnlyAcl $keyFile $false
+  Assert-ServiceOnlyAcl $certFile $false
 
-$details = @(& $openssl x509 -in $certFile -noout -text)
-if ($LASTEXITCODE -ne 0) {
-  throw '証明書の拡張を読めませんでした。'
-}
-$constraintLines = @(for ($i = 0; $i -lt $details.Count; $i++) {
-  if ($details[$i] -match '^\s*X509v3 Basic Constraints:') { $i }
-})
-if ($constraintLines.Count -ne 1 -or
-    $constraintLines[0] + 1 -ge $details.Count -or
-    $details[$constraintLines[0] + 1] -notmatch '^\s*CA:FALSE\s*$') {
-  throw 'Basic Constraints が 1 個の CA:FALSE ではありません。'
-}
-if (@($details | Where-Object { $_ -match 'IP Address:127\.0\.0\.1' }).Count -eq 0) {
-  throw 'SAN に IP:127.0.0.1 がありません。'
+  $details = @(& $openssl x509 -in $certFile -noout -text)
+  if ($LASTEXITCODE -ne 0) {
+    throw '証明書の拡張を読めませんでした。'
+  }
+  $constraintLines = @(for ($i = 0; $i -lt $details.Count; $i++) {
+    if ($details[$i] -match '^\s*X509v3 Basic Constraints:') { $i }
+  })
+  if ($constraintLines.Count -ne 1 -or
+      $constraintLines[0] + 1 -ge $details.Count -or
+      $details[$constraintLines[0] + 1] -notmatch '^\s*CA:FALSE\s*$') {
+    throw 'Basic Constraints が 1 個の CA:FALSE ではありません。'
+  }
+  if (@($details | Where-Object { $_ -match 'IP Address:127\.0\.0\.1' }).Count -eq 0) {
+    throw 'SAN に IP:127.0.0.1 がありません。'
+  }
+
+  $expiry = @(& $openssl x509 -in $certFile -noout -enddate)
+  if ($LASTEXITCODE -ne 0 -or $expiry.Count -ne 1 -or $expiry[0] -notmatch '^notAfter=.+ GMT$') {
+    throw '証明書の有効期限を読めませんでした。'
+  }
+  $fingerprint = @(& $openssl x509 -in $certFile -noout -fingerprint -sha256)
+  if ($LASTEXITCODE -ne 0 -or $fingerprint.Count -ne 1 -or $fingerprint[0] -notmatch '^sha256 Fingerprint=([0-9A-F]{2}:){31}[0-9A-F]{2}$') {
+    throw '証明書の SHA-256 指紋を読めませんでした。'
+  }
+
+  $result = [pscustomobject]@{
+    CertificatePath = $certFile
+    PrivateKeyPath = $keyFile
+    ConfigPath = $configFile
+    FingerprintSha256 = $fingerprint[0].Substring($fingerprint[0].IndexOf('=') + 1)
+    NotAfterUtc = $expiry[0].Substring('notAfter='.Length)
+    OpenSslPath = $openssl
+    OpenSslVersion = $version[0]
+  }
+} catch {
+  $originalError = $_
+  $cleanupProblems = [System.Collections.Generic.List[string]]::new()
+  $remaining = [System.Collections.Generic.List[string]]::new()
+  $safeStore = $false
+  try {
+    Assert-SafeAncestors
+    [void](Get-PlainDirectory $tlsDir)
+    Assert-ServiceOnlyAcl $tlsDir $true
+    $safeStore = $true
+  } catch {
+    $cleanupProblems.Add("保管先の再確認に失敗: $($_.Exception.Message)")
+  }
+
+  # 自分が作ったと確認できた通常ファイルだけを個別に削除する。
+  foreach ($artifact in @(
+    [pscustomobject]@{ Path = $configFile; Created = $configCreated },
+    [pscustomobject]@{ Path = $keyFile; Created = $opensslStarted },
+    [pscustomobject]@{ Path = $certFile; Created = $opensslStarted }
+  )) {
+    try {
+      $item = Get-Item -LiteralPath $artifact.Path -Force -ErrorAction Stop
+    } catch [System.Management.Automation.ItemNotFoundException] {
+      continue
+    } catch {
+      $cleanupProblems.Add("対象の確認に失敗: $($artifact.Path): $($_.Exception.Message)")
+      $remaining.Add($artifact.Path)
+      continue
+    }
+    try {
+      if (-not $safeStore -or -not $artifact.Created) {
+        $remaining.Add($artifact.Path)
+        continue
+      }
+      if ($item.PSIsContainer -or
+          (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw '通常のファイルではありません。'
+      }
+      Assert-ServiceOnlyAcl $artifact.Path $false
+      Remove-Item -LiteralPath $artifact.Path -Force -ErrorAction Stop
+    } catch {
+      $cleanupProblems.Add("後始末に失敗: $($artifact.Path): $($_.Exception.Message)")
+      $remaining.Add($artifact.Path)
+    }
+  }
+  if ($cleanupProblems.Count -gt 0 -or $remaining.Count -gt 0) {
+    $cleanupDetail = if ($cleanupProblems.Count -gt 0) { $cleanupProblems -join ' / ' } else { '今回の作成物と確認できないファイルを残しました' }
+    $message = "元のエラー: $($originalError.Exception.Message)。後始末: $cleanupDetail。残留の可能性があるパス: $($remaining -join ', ')。手動で所有者・ACL・リンクを確認し、安全を確かめてから削除してください。"
+    throw [System.InvalidOperationException]::new($message, $originalError.Exception)
+  }
+  throw
 }
 
-$expiry = @(& $openssl x509 -in $certFile -noout -enddate)
-if ($LASTEXITCODE -ne 0 -or $expiry.Count -ne 1 -or $expiry[0] -notmatch '^notAfter=.+ GMT$') {
-  throw '証明書の有効期限を読めませんでした。'
-}
-$fingerprint = @(& $openssl x509 -in $certFile -noout -fingerprint -sha256)
-if ($LASTEXITCODE -ne 0 -or $fingerprint.Count -ne 1 -or $fingerprint[0] -notmatch '^sha256 Fingerprint=([0-9A-F]{2}:){31}[0-9A-F]{2}$') {
-  throw '証明書の SHA-256 指紋を読めませんでした。'
-}
-
-[pscustomobject]@{
-  CertificatePath = $certFile
-  PrivateKeyPath = $keyFile
-  ConfigPath = $configFile
-  FingerprintSha256 = $fingerprint[0].Substring($fingerprint[0].IndexOf('=') + 1)
-  NotAfterUtc = $expiry[0].Substring('notAfter='.Length)
-  OpenSslPath = $openssl
-  OpenSslVersion = $version[0]
-}
+$result
