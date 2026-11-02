@@ -1733,8 +1733,10 @@ mod tests {
         }
     }
 
-    /// S7 D-5 / #1019: exact row preservation across add AND remove while the
-    /// destination is unavailable. Rows enter at the queue boundary, deliberately:
+    /// S7 D-5 / #1019: exact row preservation across add AND remove while a
+    /// pre-authentication handshake stalls. This exercises group Error after a
+    /// bounded table-check timeout; classified connection Backoff is not covered.
+    /// Rows enter at the queue boundary, deliberately:
     /// this proves carryover/flush, not SDK re-subscription or producer uniqueness.
     /// Repeated source ptime is legal, so identity here is a unique test value,
     /// never (ts, tag_id). An identical constant source has no such identity in
@@ -1919,6 +1921,8 @@ mod tests {
         });
         let dropped_after_recovery = after_remove.dropped();
         let queued_after_recovery = (runtime.queued(), after_add.queued(), after_remove.queued());
+        let state_after_recovery = after_remove.state();
+        let error_after_recovery = after_remove.last_error();
 
         // Preserve query errors and all observations until every cleanup step has
         // been attempted. In particular, a failed equality must not skip DROP.
@@ -1989,6 +1993,15 @@ mod tests {
             "all five columns, each identity exactly once when recovery does not time out"
         );
         assert_eq!(dropped_after_recovery, 0);
+        assert_eq!(
+            state_after_recovery,
+            crate::status::GroupState::Running,
+            "recovery clears the group Error state"
+        );
+        assert_eq!(
+            error_after_recovery, None,
+            "recovery clears the handshake timeout message"
+        );
         assert_eq!(
             queued_after_recovery,
             (0, 0, 0),
