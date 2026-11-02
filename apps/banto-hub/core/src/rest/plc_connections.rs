@@ -1303,9 +1303,13 @@ async fn test_postgres_connection(
         "connection-test",
     );
     let outcome = crate::db_source::test_connection_options(options, password).await;
+    let kind = match outcome.failure_kind {
+        crate::db_source::DbConnectionTestFailureKind::Tcp => "tcp",
+        crate::db_source::DbConnectionTestFailureKind::Protocol => "protocol",
+    };
     (
         outcome.ok,
-        outcome.error.map(|message| test_error("protocol", message)),
+        outcome.error.map(|message| test_error(kind, message)),
     )
 }
 

@@ -1248,6 +1248,10 @@ async fn postgres_presave_probe_uses_ephemeral_inputs_and_never_persists_or_leak
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"]["kind"], "protocol",
+        "authentication is not a TCP failure"
+    );
     assert!(
         body["error"]["message"]
             .as_str()
@@ -1341,6 +1345,24 @@ async fn postgres_presave_rejects_invalid_settings_and_unauthorized_requests_bef
 }
 
 #[tokio::test]
+async fn postgres_presave_refused_connection_reports_tcp() {
+    let env = test_env().await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/plc-connections/test",
+        &env.admin_token,
+        presave_pg_payload(port),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["error"]["kind"], "tcp", "{body}");
+}
+
+#[tokio::test]
 async fn postgres_presave_probe_is_bounded_to_five_seconds() {
     let env = test_env().await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1359,6 +1381,7 @@ async fn postgres_presave_probe_is_bounded_to_five_seconds() {
     .expect("probe must not wait indefinitely on a held handshake");
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["ok"], false);
+    assert_eq!(body["error"]["kind"], "tcp", "{body}");
     assert!(
         body["error"]["message"]
             .as_str()
@@ -1522,6 +1545,40 @@ async fn postgres_presave_with_unreadable_saved_secret_does_not_connect() {
     );
 }
 
+// SQLx resolves userinfo and query-password precedence before producing this URL.
+// Decode its userinfo once; never print the URL or password in failure output.
+fn postgres_fixture_password(options: &sqlx::postgres::PgConnectOptions) -> Option<String> {
+    use sqlx::ConnectOptions;
+    options.to_url_lossy().password().map(|password| {
+        percent_encoding::percent_decode_str(password)
+            .decode_utf8()
+            .expect("test PostgreSQL password must be UTF-8")
+            .into_owned()
+    })
+}
+
+#[test]
+fn postgres_presave_db_source_fixture_decodes_userinfo_and_query_passwords() {
+    for (url, expected) in [
+        ("postgres://reader:p%40ss%3A%25%2B@127.0.0.1/db", "p@ss:%+"),
+        ("postgres://reader:p%2540ss@127.0.0.1/db", "p%40ss"),
+        (
+            "postgres://reader@127.0.0.1/db?password=q%40%3A%25%2B+value",
+            "q@:%+ value",
+        ),
+        (
+            "postgres://reader:old@127.0.0.1/db?password=first&password=last%2B",
+            "last+",
+        ),
+    ] {
+        let options = url.parse().expect("valid synthetic fixture URL");
+        assert!(
+            postgres_fixture_password(&options).as_deref() == Some(expected),
+            "fixture password decoding or precedence changed"
+        );
+    }
+}
+
 // Include db_source in the name: the PostgreSQL CI job runs --lib db_source.
 #[tokio::test]
 async fn postgres_presave_db_source_fixture_succeeds_without_creating_a_connection() {
@@ -1530,11 +1587,7 @@ async fn postgres_presave_db_source_fixture_succeeds_without_creating_a_connecti
         return;
     };
     let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
-    let password = url
-        .split_once("://")
-        .and_then(|(_, rest)| rest.split_once('@'))
-        .and_then(|(userinfo, _)| userinfo.split_once(':'))
-        .map(|(_, password)| password.to_owned());
+    let password = postgres_fixture_password(&options);
     let env = test_env().await;
     let before = presave_persistent_counts(&env.pool).await;
     let (status, body) = admin_post(&env.router, "/api/plc-connections/test", &env.admin_token,

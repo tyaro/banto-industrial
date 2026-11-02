@@ -891,6 +891,7 @@ dependencies = [
  "futures-util",
  "getrandom 0.4.3",
  "hex",
+ "percent-encoding",
  "prost",
  "protoc-bin-vendored",
  "rumqttc",

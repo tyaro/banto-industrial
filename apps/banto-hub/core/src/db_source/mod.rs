@@ -438,6 +438,13 @@ async fn join_tasks(tasks: Vec<ConnectionTask>) {
     }
 }
 
+/// Internal classification for the generic connection-test response only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DbConnectionTestFailureKind {
+    Tcp,
+    Protocol,
+}
+
 /// [`test_connection`]の結果。REST は`200 {"ok": true, "serverVersion":
 /// "..."}`または`200 {"ok": false, "error": "..."}`としてそのまま返す
 /// （design §4.6）。`ok: false`は疎通確認の失敗を表すだけで、REST 層は
@@ -451,6 +458,8 @@ pub struct DbConnectionTestOutcome {
     pub server_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip)]
+    pub(crate) failure_kind: DbConnectionTestFailureKind,
 }
 
 impl DbConnectionTestOutcome {
@@ -459,14 +468,28 @@ impl DbConnectionTestOutcome {
             ok: true,
             server_version: Some(server_version),
             error: None,
+            failure_kind: DbConnectionTestFailureKind::Protocol,
         }
     }
 
     fn failed(message: String) -> Self {
+        Self::failed_with_kind(message, DbConnectionTestFailureKind::Protocol)
+    }
+
+    fn failed_sqlx(error: &sqlx::Error) -> Self {
+        let kind = match error {
+            sqlx::Error::Io(_) => DbConnectionTestFailureKind::Tcp,
+            _ => DbConnectionTestFailureKind::Protocol,
+        };
+        Self::failed_with_kind(sanitize_postgres_error(error), kind)
+    }
+
+    fn failed_with_kind(message: String, failure_kind: DbConnectionTestFailureKind) -> Self {
         Self {
             ok: false,
             server_version: None,
             error: Some(message),
+            failure_kind,
         }
     }
 }
@@ -541,10 +564,13 @@ pub(crate) async fn test_connection_options(
 ) -> DbConnectionTestOutcome {
     let mut outcome = match tokio::time::timeout(DB_TEST_TIMEOUT, run_test(options)).await {
         Ok(outcome) => outcome,
-        Err(_elapsed) => DbConnectionTestOutcome::failed(format!(
-            "接続タイムアウトです({}秒)。ホスト/ポート、ネットワーク到達性を確認してください。",
-            DB_TEST_TIMEOUT.as_secs()
-        )),
+        Err(_elapsed) => DbConnectionTestOutcome::failed_with_kind(
+            format!(
+                "接続タイムアウトです({}秒)。ホスト/ポート、ネットワーク到達性を確認してください。",
+                DB_TEST_TIMEOUT.as_secs()
+            ),
+            DbConnectionTestFailureKind::Tcp,
+        ),
     };
     if !password.is_empty() {
         for text in [&mut outcome.error, &mut outcome.server_version]
@@ -560,7 +586,7 @@ pub(crate) async fn test_connection_options(
 async fn run_test(options: PgConnectOptions) -> DbConnectionTestOutcome {
     let mut pg_conn = match sqlx::postgres::PgConnection::connect_with(&options).await {
         Ok(pg_conn) => pg_conn,
-        Err(err) => return DbConnectionTestOutcome::failed(sanitize_postgres_error(&err)),
+        Err(err) => return DbConnectionTestOutcome::failed_sqlx(&err),
     };
 
     let version: Result<(String,), SqlxError> = sqlx::query_as("SELECT version()")
@@ -747,6 +773,24 @@ mod tests {
             settings_version: 1,
         };
         with_password(conn, "s3cret-password").0
+    }
+
+    #[test]
+    fn internal_probe_failure_kind_does_not_change_saved_api_json() {
+        for kind in [
+            DbConnectionTestFailureKind::Tcp,
+            DbConnectionTestFailureKind::Protocol,
+        ] {
+            let outcome = DbConnectionTestOutcome::failed_with_kind("redacted error".into(), kind);
+            assert_eq!(
+                serde_json::to_value(outcome).unwrap(),
+                serde_json::json!({"ok": false, "error": "redacted error"})
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(DbConnectionTestOutcome::ok("version".into())).unwrap(),
+            serde_json::json!({"ok": true, "serverVersion": "version"})
+        );
     }
 
     const PW_REF: &str = "0123456789abcdef0123456789abcdef";
