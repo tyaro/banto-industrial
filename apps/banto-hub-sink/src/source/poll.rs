@@ -57,6 +57,11 @@
 
 use std::time::Duration;
 
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+
 use banto_db_source::{
     cell_verdict, classify, describe_columns, describe_retry_interval, describe_wrapper_sql,
     pg_connect_options, query_timeout, resolve_columns, ColumnBadReason, GroupLadder, PgFailure,
@@ -410,12 +415,16 @@ pub async fn run_poller(
     tx: mpsc::Sender<PollEvent>,
     mut stop: watch::Receiver<bool>,
     redactor: Redactor,
+    query_failures: Vec<Arc<AtomicBool>>,
 ) {
     let mut events = Events {
         tx: &tx,
         status: StatusText::new(spec.queries.len()),
         redactor: &redactor,
     };
+    // The source owns these episodes across PostgreSQL pool and poller
+    // generations. Its immutable configuration keeps each index on the same SQL.
+    assert_eq!(query_failures.len(), spec.queries.len());
     let mut attempt: u32 = 0;
     let mut last_delay: Option<Duration> = None;
     loop {
@@ -441,7 +450,8 @@ pub async fn run_poller(
                 attempt = 0;
                 last_delay = None;
                 events.status.connection = None;
-                let outcome = poll_until_failure(&pool, &spec, &mut events, &mut stop).await;
+                let outcome =
+                    poll_until_failure(&pool, &spec, &mut events, &mut stop, &query_failures).await;
                 pool.close().await;
                 match outcome {
                     PollOutcome::Stopped => return,
@@ -529,7 +539,29 @@ struct QueryRuntime {
     next_due: Instant,
     next_describe_retry: Option<Instant>,
     warned_multi_row: bool,
-    warned_failure: bool,
+    warned_failure: Arc<AtomicBool>,
+}
+
+impl QueryRuntime {
+    fn on_query_failure(&mut self) -> (Vec<ValueItem>, bool) {
+        let (items, _) = self.state.on_query_failure();
+        // Logging has a longer lifetime than the quality ladder (which is reset
+        // by re-describe/reconnect); warn once until SQL actually executes again.
+        let warn = !self.warned_failure.swap(true, Ordering::Relaxed);
+        (items, warn)
+    }
+
+    /// A successful SQL execution ends the failure episode even if it returns
+    /// no rows (that remains a separate data-quality problem). Re-describing
+    /// SQL alone must not announce recovery before execution has succeeded.
+    fn take_recovery_message(&mut self, source_name: &str, redactor: &Redactor) -> Option<String> {
+        self.warned_failure.swap(false, Ordering::Relaxed).then(|| {
+            redactor.apply(&format!(
+                "banto-hub-sink: ブリッジ {}.{}: クエリを実行できるようになりました",
+                source_name, self.state.plan.name
+            ))
+        })
+    }
 }
 
 async fn poll_until_failure(
@@ -537,6 +569,7 @@ async fn poll_until_failure(
     spec: &PollerSpec,
     events: &mut Events<'_>,
     stop: &mut watch::Receiver<bool>,
+    query_failures: &[Arc<AtomicBool>],
 ) -> PollOutcome {
     let now = Instant::now();
     let mut queries = Vec::with_capacity(spec.queries.len());
@@ -581,7 +614,7 @@ async fn poll_until_failure(
             next_due: now,
             next_describe_retry,
             warned_multi_row: false,
-            warned_failure: false,
+            warned_failure: query_failures[index].clone(),
         });
     }
     if !events.flush_status().await {
@@ -693,14 +726,18 @@ async fn run_tick(
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(err)) => Err(classify(&err)),
     };
+    // An in-flight SQL may finish after its poller was retired. Leave the
+    // shared failure episode to the replacement poller in that case.
+    if should_stop(stop, events.tx) {
+        return TickOutcome::Stopped;
+    }
     let rows = match outcome {
         Ok(rows) => rows,
         Err(PgFailure::Connection(message)) => return TickOutcome::ConnectionLost(message),
         Err(PgFailure::Statement(message)) => {
             let message = events.redactor.apply(&message);
-            let (items, first) = query.state.on_query_failure();
-            if first && !query.warned_failure {
-                query.warned_failure = true;
+            let (items, first) = query.on_query_failure();
+            if first {
                 log_err_line(&format!(
                     "banto-hub-sink: warn: ブリッジ {}.{name}: クエリが失敗しました: {message}",
                     spec.source_name
@@ -711,7 +748,9 @@ async fn run_tick(
             return cycle_outcome(events.cycle(index, items).await);
         }
     };
-    query.warned_failure = false;
+    if let Some(message) = query.take_recovery_message(&spec.source_name, events.redactor) {
+        log_line(&message);
+    }
 
     if rows.is_empty() {
         let items = query.state.on_zero_rows();
@@ -942,7 +981,12 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+        let episodes = spec
+            .queries
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new(), episodes));
         // 接続が来た（握手の途中）ところで止め、それから接続を落とす。
         let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
@@ -1026,7 +1070,12 @@ mod tests {
         let application_name = format!("{APPLICATION_NAME_PREFIX} {source_name}");
         let (tx, mut rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
-        let mut task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+        let episodes = spec
+            .queries
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let mut task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new(), episodes));
 
         let waiting = |admin: PgPool, application_name: String| async move {
             sqlx::query_scalar::<_, i64>(
@@ -1101,6 +1150,214 @@ mod tests {
             .max(DESCRIBE_TIMEOUT)
             .max(banto_db_source::poll::MAX_QUERY_TIMEOUT);
         assert!(STOPPED_POLLER_BOUND >= longest + Duration::from_secs(5));
+    }
+
+    #[test]
+    fn query_recovery_is_logged_once_per_failure_and_redacts() {
+        let mut query = QueryRuntime {
+            state: QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")])),
+            next_due: Instant::now(),
+            next_describe_retry: None,
+            warned_multi_row: false,
+            warned_failure: Arc::new(AtomicBool::new(false)),
+        };
+        let mut redactor = Redactor::new();
+        redactor.add_secret("pw-secret");
+        assert_eq!(
+            query.take_recovery_message("source", &redactor),
+            None,
+            "startup"
+        );
+        assert!(query.on_query_failure().1, "first failure warns");
+        assert!(!query.on_query_failure().1, "repeat failure is silent");
+        let message = query.take_recovery_message("pw-secret", &redactor).unwrap();
+        assert!(
+            message.contains("クエリを実行できるようになりました"),
+            "{message}"
+        );
+        assert!(message.contains("<redacted>"), "{message}");
+        assert!(!message.contains("pw-secret"), "{message}");
+        assert_eq!(
+            query.take_recovery_message("source", &redactor),
+            None,
+            "repeat success"
+        );
+        query.state.on_row(&[Some(1.0)]);
+        assert!(query.on_query_failure().1, "next failure warns again");
+        assert!(
+            query.take_recovery_message("source", &redactor).is_some(),
+            "next failure episode"
+        );
+    }
+
+    fn logging_query(episode: Arc<AtomicBool>) -> QueryRuntime {
+        QueryRuntime {
+            state: QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")])),
+            next_due: Instant::now(),
+            next_describe_retry: None,
+            warned_multi_row: false,
+            warned_failure: episode,
+        }
+    }
+
+    #[test]
+    fn query_failure_episode_survives_db_connection_reconstruction() {
+        let episode = Arc::new(AtomicBool::new(false));
+        let mut before_disconnect = logging_query(episode.clone());
+        assert!(before_disconnect.on_query_failure().1);
+        drop(before_disconnect); // poll_until_failure returns ConnectionLost.
+        let mut after_reconnect = logging_query(episode);
+        assert!(
+            !after_reconnect.on_query_failure().1,
+            "same statement-failure episode must not warn twice"
+        );
+        assert!(after_reconnect
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        assert!(after_reconnect
+            .take_recovery_message("source", &Redactor::new())
+            .is_none());
+        assert!(logging_query(Arc::new(AtomicBool::new(false)))
+            .take_recovery_message("other-query", &Redactor::new())
+            .is_none());
+    }
+
+    /// The same source can replace its poller on an epoch change while SQL is
+    /// unchanged. A successful query in the replacement must close the warning.
+    #[tokio::test]
+    async fn query_recovery_survives_a_poller_restart_for_the_same_sql() {
+        use sqlx::postgres::PgConnectOptions;
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let options: PgConnectOptions = url.parse().expect("BANTO_TEST_PG_URL");
+        let admin = PgPool::connect(&url).await.expect("connect test pg");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("poll_recovery_{}_{}", std::process::id(), nanos);
+        let password = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password.to_string())
+            .unwrap_or_default();
+        let db = db_config(
+            options.get_host(),
+            i64::from(options.get_port()),
+            options.get_database().unwrap_or("postgres"),
+            options.get_username(),
+            &password,
+        );
+        let query = query_config("recover", &format!("SELECT 1.0 / n AS a FROM \"{table}\""));
+        let spec = PollerSpec::new("poller-recovery", &db, &[query]);
+        let episode = Arc::new(AtomicBool::new(false));
+
+        // Finish local setup before creating a persistent table, and seed it
+        // in the same DDL statement so no fallible insert precedes cleanup.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE \"{table}\" AS SELECT 0::float8 AS n"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create failing test row");
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let first = tokio::spawn(run_poller(
+            spec.clone(),
+            tx,
+            stop_rx,
+            Redactor::new(),
+            vec![episode.clone()],
+        ));
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            while !episode.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = stop_tx.send(true);
+        let first_stopped = tokio::time::timeout(Duration::from_secs(10), first).await;
+        // First poller's status/cycle messages are no longer relevant.
+        while rx.try_recv().is_ok() {}
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE \"{table}\" SET n = 1")))
+            .execute(&admin)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let second = tokio::spawn(run_poller(
+            spec,
+            tx,
+            stop_rx,
+            Redactor::new(),
+            vec![episode.clone()],
+        ));
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Some(PollEvent::Cycle { items, .. }) => {
+                        if items.iter().any(|item| item.q == WireQuality::Good) {
+                            break true;
+                        }
+                    }
+                    Some(PollEvent::Status(_)) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        let episode_cleared = !episode.load(Ordering::Relaxed);
+        let _ = stop_tx.send(true);
+        let second_stopped = tokio::time::timeout(Duration::from_secs(10), second).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
+            .execute(&admin)
+            .await
+            .expect("drop test table");
+        admin.close().await;
+
+        updated.expect("make query succeed");
+        failed.expect("first poller records a query failure");
+        first_stopped.expect("first poller stops").unwrap();
+        assert!(
+            recovered.expect("replacement poller executes the same SQL successfully"),
+            "replacement poller closed before producing a good value"
+        );
+        assert!(
+            episode_cleared,
+            "run_tick logs recovery before emitting Good; successful SQL must close the old failure episode"
+        );
+        second_stopped.expect("replacement poller stops").unwrap();
+    }
+
+    #[test]
+    fn zero_rows_end_the_execution_failure_episode_and_allow_a_new_warning() {
+        let mut query = logging_query(Arc::new(AtomicBool::new(false)));
+        assert!(query.on_query_failure().1);
+        assert!(query
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        // Actual run_tick ordering: SQL succeeded, then 0 rows updates quality.
+        assert!(query
+            .state
+            .on_zero_rows()
+            .iter()
+            .all(|item| item.q == WireQuality::Bad));
+        assert!(
+            query.on_query_failure().1,
+            "failure after zero rows starts a new log episode"
+        );
+        assert!(!query.on_query_failure().1);
+        assert!(query
+            .take_recovery_message("source", &Redactor::new())
+            .is_some());
+        // The original quality ladder also resets first on 0 rows (review #3).
+        let mut state = QueryState::resolved(plan(&[("a", "ka")]), &described(&[("a", "INT4")]));
+        assert!(state.on_query_failure().1);
+        state.on_zero_rows();
+        assert!(state.on_query_failure().1);
     }
 
     #[test]
