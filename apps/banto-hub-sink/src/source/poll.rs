@@ -415,18 +415,16 @@ pub async fn run_poller(
     tx: mpsc::Sender<PollEvent>,
     mut stop: watch::Receiver<bool>,
     redactor: Redactor,
+    query_failures: Vec<Arc<AtomicBool>>,
 ) {
     let mut events = Events {
         tx: &tx,
         status: StatusText::new(spec.queries.len()),
         redactor: &redactor,
     };
-    // Query log episodes outlive the PostgreSQL pool/quality-state generations.
-    let query_failures: Vec<_> = spec
-        .queries
-        .iter()
-        .map(|_| Arc::new(AtomicBool::new(false)))
-        .collect();
+    // The source owns these episodes across PostgreSQL pool and poller
+    // generations. Its immutable configuration keeps each index on the same SQL.
+    assert_eq!(query_failures.len(), spec.queries.len());
     let mut attempt: u32 = 0;
     let mut last_delay: Option<Duration> = None;
     loop {
@@ -978,7 +976,12 @@ mod tests {
         );
         let (tx, mut rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
-        let task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+        let episodes = spec
+            .queries
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new(), episodes));
         // 接続が来た（握手の途中）ところで止め、それから接続を落とす。
         let (socket, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
             .await
@@ -1062,7 +1065,12 @@ mod tests {
         let application_name = format!("{APPLICATION_NAME_PREFIX} {source_name}");
         let (tx, mut rx) = mpsc::channel(64);
         let (stop_tx, stop_rx) = watch::channel(false);
-        let mut task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new()));
+        let episodes = spec
+            .queries
+            .iter()
+            .map(|_| Arc::new(AtomicBool::new(false)))
+            .collect();
+        let mut task = tokio::spawn(run_poller(spec, tx, stop_rx, Redactor::new(), episodes));
 
         let waiting = |admin: PgPool, application_name: String| async move {
             sqlx::query_scalar::<_, i64>(
@@ -1207,6 +1215,116 @@ mod tests {
         assert!(logging_query(Arc::new(AtomicBool::new(false)))
             .take_recovery_message("other-query", &Redactor::new())
             .is_none());
+    }
+
+    /// The same source can replace its poller on an epoch change while SQL is
+    /// unchanged. A successful query in the replacement must close the warning.
+    #[tokio::test]
+    async fn query_recovery_survives_a_poller_restart_for_the_same_sql() {
+        use sqlx::postgres::PgConnectOptions;
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let options: PgConnectOptions = url.parse().expect("BANTO_TEST_PG_URL");
+        let admin = PgPool::connect(&url).await.expect("connect test pg");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let table = format!("poll_recovery_{}_{}", std::process::id(), nanos);
+        let password = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split_once('@'))
+            .and_then(|(userinfo, _)| userinfo.split_once(':'))
+            .map(|(_, password)| password.to_string())
+            .unwrap_or_default();
+        let db = db_config(
+            options.get_host(),
+            i64::from(options.get_port()),
+            options.get_database().unwrap_or("postgres"),
+            options.get_username(),
+            &password,
+        );
+        let query = query_config("recover", &format!("SELECT 1.0 / n AS a FROM \"{table}\""));
+        let spec = PollerSpec::new("poller-recovery", &db, &[query]);
+        let episode = Arc::new(AtomicBool::new(false));
+
+        // Finish local setup before creating a persistent table, and seed it
+        // in the same DDL statement so no fallible insert precedes cleanup.
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TABLE \"{table}\" AS SELECT 0::float8 AS n"
+        )))
+        .execute(&admin)
+        .await
+        .expect("create failing test row");
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let first = tokio::spawn(run_poller(
+            spec.clone(),
+            tx,
+            stop_rx,
+            Redactor::new(),
+            vec![episode.clone()],
+        ));
+        let failed = tokio::time::timeout(Duration::from_secs(10), async {
+            while !episode.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = stop_tx.send(true);
+        let first_stopped = tokio::time::timeout(Duration::from_secs(10), first).await;
+        // First poller's status/cycle messages are no longer relevant.
+        while rx.try_recv().is_ok() {}
+        let updated = sqlx::query(sqlx::AssertSqlSafe(format!("UPDATE \"{table}\" SET n = 1")))
+            .execute(&admin)
+            .await;
+
+        let (tx, mut rx) = mpsc::channel(64);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let second = tokio::spawn(run_poller(
+            spec,
+            tx,
+            stop_rx,
+            Redactor::new(),
+            vec![episode.clone()],
+        ));
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match rx.recv().await {
+                    Some(PollEvent::Cycle { items, .. }) => {
+                        if items.iter().any(|item| item.q == WireQuality::Good) {
+                            break true;
+                        }
+                    }
+                    Some(PollEvent::Status(_)) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        let episode_cleared = !episode.load(Ordering::Relaxed);
+        let _ = stop_tx.send(true);
+        let second_stopped = tokio::time::timeout(Duration::from_secs(10), second).await;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{table}\"")))
+            .execute(&admin)
+            .await
+            .expect("drop test table");
+        admin.close().await;
+
+        updated.expect("make query succeed");
+        failed.expect("first poller records a query failure");
+        first_stopped.expect("first poller stops").unwrap();
+        assert!(
+            recovered.expect("replacement poller executes the same SQL successfully"),
+            "replacement poller closed before producing a good value"
+        );
+        assert!(
+            episode_cleared,
+            "run_tick logs recovery before emitting Good; successful SQL must close the old failure episode"
+        );
+        second_stopped.expect("replacement poller stops").unwrap();
     }
 
     #[test]
