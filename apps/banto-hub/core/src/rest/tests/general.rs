@@ -273,14 +273,10 @@ async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_sa
     assert!(refused.message.contains("unit_id"), "{}", refused.message);
 }
 
-/// R2b-6b（設計 §5・§10）: 接続テストの秘密のキー。編集中（`connectionId`）にフォームが秘密の
-/// キーを省けば保存済みの値を開いて補い、文字列ならその値で試す（`secrets_changed`）。`null`・
-/// 空文字は値無しで、スキーマで必須ならダイヤルの前に断る。保存前（`connectionId` 無し）で
-/// 省いたときも必須の欠け。非秘密の欄はフォームの値（変えた host）。今の Modbus / SLMP には
-/// 秘密の欄が無いので、`postgres` の id を名乗る偽のドライバ（`password` を必須の秘密に持つ）で
-/// 確かめる（保存済みの行は Hub の `postgres` 接続として封印して作る）。
+/// PostgreSQL の汎用接続テストは保存済み秘密値を開かない。id ありの省略/null は拒否し、
+/// 明示した文字列だけを使う。必須 Secret スキーマを持つ偽ドライバでも継承しないことを確認。
 #[tokio::test]
-async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
+async fn the_postgres_test_rejects_omitted_saved_secrets_and_uses_only_explicit_input() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
     use banto_driver_api::{
         AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
@@ -363,33 +359,29 @@ async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
         settings
     };
 
-    // Editing, omitted: the saved value is opened; the changed host is the form's.
-    let requested = requested_settings(
-        &env.manager,
-        &driver,
-        &payload(Some(saved.id), base.clone()),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("{}", err.message));
-    assert_eq!(requested.settings.get("password"), Some("saved-pw"));
-    assert_eq!(requested.settings.get("host"), Some("db2"));
-    assert!(!requested.secrets_changed);
-    assert_eq!(requested.saved.map(|c| c.id), Some(saved.id));
+    // An explicit temporary value never resolves the saved row, with or without id.
+    for connection_id in [Some(saved.id), None] {
+        let requested = requested_settings(
+            &env.manager,
+            &driver,
+            &payload(connection_id, with(json!("typed-pw"))),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(requested.settings.get("password"), Some("typed-pw"));
+        assert_eq!(requested.settings.get("host"), Some("db2"));
+        assert!(
+            requested.saved.is_none(),
+            "postgres must not resolve a saved secret source"
+        );
+        assert!(requested.secrets_changed);
+    }
 
-    // Editing, a new value: that value, and the secret counts as changed.
-    let requested = requested_settings(
-        &env.manager,
-        &driver,
-        &payload(Some(saved.id), with(json!("typed-pw"))),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("{}", err.message));
-    assert_eq!(requested.settings.get("password"), Some("typed-pw"));
-    assert!(requested.secrets_changed);
-
-    // `null` / `""` (no value) and a new connection without one: the required secret is
-    // missing - refused before any dial, the message names the key and no value.
+    // Id + omitted/null is refused before any dial, regardless of saved credentials.
+    // This fixture additionally declares the secret required, so empty/new input
+    // is rejected by its schema (the actual host postgres schema is different).
     for (connection_id, settings) in [
+        (Some(saved.id), base.clone()),
         (Some(saved.id), with(json!(null))),
         (Some(saved.id), with(json!(""))),
         (None, base.clone()),

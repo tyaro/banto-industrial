@@ -863,9 +863,10 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 
 /// 試す設定（R2b-6b）: フォームの `settings` をドライバのスキーマに通し
 /// （`banto_tags::settings_from_schema` → `settings_to_api`、保存と同じ組み立て）、秘密のキーを
-/// 足したもの。秘密のキーは、フォームの文字列があればそれ、省略なら保存済み（`connectionId`
-/// があり、同じプロトコル）の値を開いて補う。`null`・空文字は値無し。スキーマで必須の秘密の
-/// 欄が埋まらなければ断る。スキーマを持たない postgres は同じ保存経路の
+/// 足したもの。機器の秘密のキーはフォームの文字列があればそれ、省略なら保存済み
+/// （`connectionId` があり、同じプロトコル）の値を開いて補う。`null`・空文字は値無し。
+/// postgres は保存済み値を開かず、id 指定時の省略/null は拒否する。
+/// スキーマで必須の秘密の欄が埋まらなければ断る。スキーマを持たない postgres は同じ保存経路の
 /// `check_settings_input` で検証する（#1010、DB に書かない）。
 pub(super) struct RequestedSettings {
     pub(super) settings: Settings,
@@ -1259,8 +1260,9 @@ pub(super) async fn plc_connections_test(
     ))
 }
 
-/// PostgreSQL uses the same secret tri-state and validation boundary as device
-/// probes, but its read-only SELECT version() belongs to the DB Source core.
+/// PostgreSQL never inherits saved secrets: with an id, password must be an
+/// explicit string; without an id, omitted/null means passwordless. Host settings
+/// validation is shared with saving; read-only SELECT version() uses DB Source core.
 async fn test_postgres_connection(
     manager: &CollectorManager,
     payload: &PlcConnectionTestPayload,
