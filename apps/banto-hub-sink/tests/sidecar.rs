@@ -472,13 +472,22 @@ async fn write_json(
 /// 接続 + クエリグループ + `db` タグを作って rebuild する（`db` 系の
 /// レジストリ項目は S3 の UI 前なので REST ではなくサービス直叩き -
 /// `tests/db_source.rs` と同じ）。戻り値は (接続 id, タグ id, 外部名)。
-async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
+/// `postgres` 接続を 1 件作る。`host`/`port` を分けて受けるのは、Sink の
+/// 書き先だけをテスト内の TCP プロキシ（[`TcpProxy`]）経由にして DB の
+/// 停止を模すため（認証情報は `target` のもの）。
+async fn create_postgres_connection(
+    app: &TestApp,
+    name: &str,
+    host: &str,
+    port: i64,
+    target: &PgTarget,
+) -> i64 {
     let connection = PlcConnectionService::new(app.pool.clone())
         .create(PlcConnectionInput {
-            name: "erp".to_string(),
+            name: name.to_string(),
             protocol: POSTGRES_PROTOCOL.to_string(),
-            host: target.host.clone(),
-            port: target.port,
+            host: host.to_string(),
+            port,
             unit_id: 1,
             enabled: true,
             simulation: false,
@@ -497,41 +506,64 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
         })
         .await
         .expect("postgres connection");
+    connection.id
+}
+
+async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
+    let (connection_id, tags) = seed_source_with(app, target, "SELECT 42.5 AS a", &["a"]).await;
+    let (tag_id, external_name) = tags.into_iter().next().expect("one tag");
+    (connection_id, tag_id, external_name)
+}
+
+/// DB Source（接続 `erp`・query group `q1`）と、`columns` の列ごとの DB タグを
+/// 作る。戻りは接続 id と `(tag_id, external_name)` の並び。
+async fn seed_source_with(
+    app: &TestApp,
+    target: &PgTarget,
+    query_sql: &str,
+    columns: &[&str],
+) -> (i64, Vec<(i64, String)>) {
+    let connection_id =
+        create_postgres_connection(app, "erp", &target.host, target.port, target).await;
     let group = CollectionGroupService::new(app.pool.clone())
         .create(CollectionGroupInput {
             name: "q1".to_string(),
-            plc_connection_id: connection.id,
+            plc_connection_id: connection_id,
             period_ms: SOURCE_PERIOD_MS,
             enabled: true,
             default_writable: true,
-            query_sql: Some("SELECT 42.5 AS a".to_string()),
+            query_sql: Some(query_sql.to_string()),
         })
         .await
         .expect("query group");
-    let tag = TagService::new(app.pool.clone())
-        .create(TagInput {
-            comment: None,
-            name: "a".to_string(),
-            collection_group_id: group.id,
-            address: "a".to_string(),
-            data_type: "f32".to_string(),
-            string_length: None,
-            string_encoding: "utf8".to_string(),
-            raw_lo: None,
-            raw_hi: None,
-            eng_lo: None,
-            eng_hi: None,
-            unit: None,
-            decimals: 3,
-            enabled: true,
-            writable: false,
-            tag_kind: DB_TAG_KIND.to_string(),
-            expression: None,
-            retain: false,
-            expected_revision: None,
-        })
-        .await
-        .expect("db tag");
+    let mut tags = Vec::new();
+    for column in columns {
+        let tag = TagService::new(app.pool.clone())
+            .create(TagInput {
+                comment: None,
+                name: (*column).to_string(),
+                collection_group_id: group.id,
+                address: (*column).to_string(),
+                data_type: "f32".to_string(),
+                string_length: None,
+                string_encoding: "utf8".to_string(),
+                raw_lo: None,
+                raw_hi: None,
+                eng_lo: None,
+                eng_hi: None,
+                unit: None,
+                decimals: 3,
+                enabled: true,
+                writable: false,
+                tag_kind: DB_TAG_KIND.to_string(),
+                expression: None,
+                retain: false,
+                expected_revision: None,
+            })
+            .await
+            .expect("db tag");
+        tags.push((tag.id, format!("erp.q1.{column}")));
+    }
     app.manager
         .commit_catalog(
             &banto_collect::RegistrySnapshot::load(&app.pool)
@@ -540,7 +572,80 @@ async fn seed_source(app: &TestApp, target: &PgTarget) -> (i64, i64, String) {
         )
         .await
         .expect("catalog commit after seeding");
-    (connection.id, tag.id, "erp.q1.a".to_string())
+    (connection_id, tags)
+}
+
+/// 127.0.0.1 の空きポートで待ち受け、PostgreSQL へ中継する TCP プロキシ。
+/// `stop` で待受と中継中の接続をすべて切り（Sink から見ると DB 停止）、
+/// `resume` で同じポートに戻す。
+struct TcpProxy {
+    port: u16,
+    upstream: String,
+    listener: Option<tokio::task::JoinHandle<()>>,
+    relays: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+}
+
+impl TcpProxy {
+    async fn start(upstream: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind proxy");
+        let port = listener.local_addr().expect("proxy addr").port();
+        let mut proxy = Self {
+            port,
+            upstream,
+            listener: None,
+            relays: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        proxy.serve(listener);
+        proxy
+    }
+
+    fn serve(&mut self, listener: tokio::net::TcpListener) {
+        let upstream = self.upstream.clone();
+        let relays = self.relays.clone();
+        self.listener = Some(tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let upstream = upstream.clone();
+                let relay = tokio::spawn(async move {
+                    let Ok(mut server) = tokio::net::TcpStream::connect(&upstream).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                });
+                relays.lock().expect("relays").push(relay);
+            }
+        }));
+    }
+
+    /// 待受を閉じ、中継中の接続を全部切る（ソケットは abort で drop される）。
+    fn stop(&mut self) {
+        if let Some(listener) = self.listener.take() {
+            listener.abort();
+        }
+        for relay in self.relays.lock().expect("relays").drain(..) {
+            relay.abort();
+        }
+    }
+
+    async fn resume(&mut self) {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.port))
+            .await
+            .expect("rebind proxy on the same port");
+        self.serve(listener);
+    }
+}
+
+/// `GET /api/status` の `sink.groups` の 1 件（`queued`・`dropped` を読むため）。
+fn sink_group_entry(sink: &Value, group_id: i64) -> Option<Value> {
+    sink["groups"]
+        .as_array()?
+        .iter()
+        .find(|entry| entry["id"].as_i64() == Some(group_id))
+        .cloned()
 }
 
 /// サイドカー専用の API キー: `admin`（`/api/sink/*`）と `read`
@@ -853,6 +958,160 @@ async fn on_change_mode_writes_once_for_a_constant_value() {
     let joined = tokio::time::timeout(Duration::from_secs(30), sidecar).await;
     assert!(joined.is_ok(), "サイドカーが停止しない");
 
+    drop_sink_table(&db, &table).await;
+    db.close().await;
+    app.shutdown().await;
+}
+
+/// 2026-11-02 オーナー決定（設計 §5.6「設定変更とキュー」）: DB が落ちている間に
+/// sink group へタグを足しても、溜まっていた未送信の行は失われず、DB が戻ると
+/// 書かれる。S7 の S-4 で「設定が変わったため、未送信の 5 行を破棄しました」が
+/// 出た件の再現と修正の確かめ。
+///
+/// Sink の書き先だけをテスト内の TCP プロキシ経由にし、プロキシを止めて
+/// DB 停止を模す（DB Source は直接繋ぐので値は流れ続け、行はキューに溜まる）。
+///
+/// 1. 行が書かれる → プロキシを止める → グループが `backoff`、`queued` が増える
+/// 2. タグを足す（接続・テーブルは同じ）→ 設定が反映されても `dropped` は 0 の
+///    まま `queued` が減らない（旧い作りなら `dropped` が `queued` ぶん増える）
+/// 3. プロキシを戻す → 止めた時点で溜まっていた行数以上が書かれ、足したタグの
+///    行も現れ（新しい設定で動いている）、`dropped` は 0 のまま
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adding_a_tag_while_the_db_is_down_keeps_the_queued_rows() {
+    let target = require_pg!();
+    let db = PgPool::connect(&target.url).await.expect("connect test pg");
+    let table = unique_table("keepq");
+    create_sink_table(&db, &table).await;
+    let mut proxy = TcpProxy::start(format!("{}:{}", target.host, target.port)).await;
+
+    let app = test_app().await;
+    let (_, tags) =
+        seed_source_with(&app, &target, "SELECT 42.5 AS a, 7.0 AS b", &["a", "b"]).await;
+    let (tag_a, _) = tags[0].clone();
+    let (tag_b, _) = tags[1].clone();
+    let sink_connection_id =
+        create_postgres_connection(&app, "sink-db", "127.0.0.1", i64::from(proxy.port), &target)
+            .await;
+    let group_id = create_sink_group(&app, sink_connection_id, tag_a, &table).await;
+    let api_key = issue_sidecar_key(&app).await;
+    start_collection(&app).await;
+
+    let config_dir = tempfile::Builder::new()
+        .prefix("banto-hub-sink-cfg-")
+        .tempdir()
+        .expect("config dir");
+    let config_path = config_dir.path().join("banto-hub-sink.toml");
+    std::fs::write(
+        &config_path,
+        sidecar_toml(&app.tls_fixture, app.tls_port, &api_key),
+    )
+    .expect("write toml");
+    let config = banto_hub_sink::config::load_config_from(&config_path).expect("load config");
+    let config_refresh = config.config_refresh;
+
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_signal = shutdown.clone();
+    let sidecar = tokio::spawn(async move {
+        run(config, fast_sidecar_options(), async move {
+            shutdown_signal.notified().await;
+            StopRequest::Graceful
+        })
+        .await
+    });
+
+    // 1. プロキシ経由で行が書かれる。
+    let wrote = wait_until(WAIT, || async {
+        !stored_rows(&db, &table).await.is_empty()
+    })
+    .await;
+    assert!(wrote, "プロキシ経由でサイドカーが行を書き込めていない");
+
+    // DB 停止: プロキシを止める → flusher の INSERT が接続レベルで失敗して
+    // `backoff`、行はキューに溜まる。
+    proxy.stop();
+    let backing_off = wait_until(WAIT, || async {
+        let sink = sink_status(&app).await;
+        sink_group_state(&sink, group_id).as_deref() == Some("backoff")
+            && sink_group_entry(&sink, group_id)
+                .and_then(|entry| entry["queued"].as_u64())
+                .is_some_and(|queued| queued >= 3)
+    })
+    .await;
+    assert!(
+        backing_off,
+        "DB を止めても backoff にならない、またはキューが溜まらない: {:?}",
+        sink_status(&app).await
+    );
+    let stored_before = stored_rows(&db, &table).await.len();
+    let entry_before = sink_group_entry(&sink_status(&app).await, group_id).expect("group entry");
+    let queued_before = entry_before["queued"].as_u64().expect("queued");
+    assert_eq!(
+        entry_before["dropped"].as_u64(),
+        Some(0),
+        "{entry_before:?}"
+    );
+
+    // 2. タグを足す（接続・テーブルは同じ）。
+    let (status, body) = write_json(
+        &app.router,
+        "PUT",
+        &format!("/api/sink/groups/{group_id}"),
+        &app.token,
+        json!({
+            "name": "line1-log",
+            "dbConnectionId": sink_connection_id,
+            "mode": "interval",
+            "intervalMs": SINK_INTERVAL_MS,
+            "tableName": table,
+            "storeBad": false,
+            "enabled": true,
+            "tagIds": [tag_a, tag_b],
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    // サイドカーが設定を取り直すまで（`config_refresh_secs`）待ってから見る。
+    // 旧い作りならここで `dropped` が `queued_before` 以上になり、`queued` は
+    // 小さく戻る。
+    tokio::time::sleep(config_refresh + Duration::from_secs(2)).await;
+    let entry_after = sink_group_entry(&sink_status(&app).await, group_id).expect("group entry");
+    assert_eq!(
+        entry_after["dropped"].as_u64(),
+        Some(0),
+        "タグを足しただけで未送信の行を捨てている: {entry_after:?}"
+    );
+    assert!(
+        entry_after["queued"].as_u64().expect("queued") > queued_before,
+        "キューが引き継がれていない（{queued_before} → {entry_after:?}）"
+    );
+
+    // 3. DB が戻る → 溜まっていた行が書かれ、足したタグの行も現れる。
+    proxy.resume().await;
+    let recovered = wait_until(Duration::from_secs(60), || async {
+        let rows = stored_rows(&db, &table).await;
+        rows.len() >= stored_before + queued_before as usize
+            && rows.iter().any(|row| row.tag_id == tag_b)
+            && sink_group_state(&sink_status(&app).await, group_id).as_deref() == Some("running")
+    })
+    .await;
+    assert!(
+        recovered,
+        "DB が戻っても溜まっていた行が書かれない（止めた時点 {stored_before}+{queued_before}）: 今 {} 行, {:?}",
+        stored_rows(&db, &table).await.len(),
+        sink_status(&app).await
+    );
+    let entry_final = sink_group_entry(&sink_status(&app).await, group_id).expect("group entry");
+    assert_eq!(entry_final["dropped"].as_u64(), Some(0), "{entry_final:?}");
+
+    shutdown.notify_one();
+    let joined = tokio::time::timeout(Duration::from_secs(30), sidecar).await;
+    assert!(joined.is_ok(), "サイドカーが停止しない");
+    joined
+        .unwrap()
+        .expect("sidecar task panicked")
+        .expect("sidecar run() should not fail");
+
+    proxy.stop();
     drop_sink_table(&db, &table).await;
     db.close().await;
     app.shutdown().await;

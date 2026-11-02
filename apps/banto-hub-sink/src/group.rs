@@ -25,6 +25,16 @@
 //! 挟んだ状態遷移を持たない。キューの排他は `std::sync::Mutex` で
 //! ロック中に `await` しないため、`JoinHandle::abort` で任意の時点に
 //! 止めても壊れる中間状態が無い（設定変更・停止で実際にそうする）。
+//!
+//! ## キューは世代をまたいで共有できる（2026-11-02 オーナー決定）
+//!
+//! 設定変更でグループを作り直すとき、書き先（接続とテーブル）が同じなら
+//! 新しい [`GroupRuntime`] は旧世代の**キューそのもの**を引き継ぐ
+//! （[`GroupRuntime::with_queue`]、`Arc<Mutex<RowQueue>>`）。行を写すのでは
+//! なく同じキューを指すので、flusher が旧世代の `Arc<GroupRuntime>` で
+//! INSERT 中でも、その `commit` は行の ID で同じキューに効き、新世代から
+//! 同じ行が二重に出ない。`dropped` もキューの中にあるのでそのまま続く。
+//! 状態（`state`・`table_ready` など）は世代ごとで、新世代は検査からやり直す。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -97,8 +107,20 @@ pub struct GroupRuntime {
     pub store_bad: bool,
     pub tags: Vec<TagRef>,
     pub table: Table,
-    queue: Mutex<RowQueue>,
+    /// 書き先が同じ次の世代と共有できる（モジュール doc「キューは世代を
+    /// またいで共有できる」）。
+    queue: Arc<Mutex<RowQueue>>,
     status: Mutex<GroupStatusInner>,
+}
+
+/// 新しい [`GroupRuntime`] に渡すキューの出どころ。
+#[derive(Debug)]
+pub enum QueueOrigin {
+    /// 新しく作る。`dropped` は同じ id の旧世代から引き継ぐ累計値
+    /// （[`RowQueue::with_dropped`]）。
+    Fresh { max_rows: usize, dropped: u64 },
+    /// 旧世代のキューをそのまま使う（[`GroupRuntime::shared_queue`]）。
+    Shared(Arc<Mutex<RowQueue>>),
 }
 
 /// 設定が壊れている（サイドカー側では直せない）グループの理由。
@@ -142,12 +164,30 @@ impl GroupSetupError {
 }
 
 impl GroupRuntime {
-    /// Hub の設定 1 件から実行時オブジェクトを作る。`dropped` は同じ id の
-    /// 旧世代から引き継ぐ累計値（[`RowQueue::with_dropped`]）。
+    /// Hub の設定 1 件から、新しいキューを持つ実行時オブジェクトを作る。
+    /// `carried_dropped` は同じ id の旧世代から引き継ぐ累計値
+    /// （[`RowQueue::with_dropped`]）。
     pub fn new(
         group: &SinkConfigGroup,
         queue_max_rows: usize,
         carried_dropped: u64,
+    ) -> Result<Self, GroupSetupError> {
+        Self::with_queue(
+            group,
+            QueueOrigin::Fresh {
+                max_rows: queue_max_rows,
+                dropped: carried_dropped,
+            },
+        )
+    }
+
+    /// Hub の設定 1 件から実行時オブジェクトを作る。`queue` が
+    /// [`QueueOrigin::Shared`] なら旧世代のキュー（未送信の行と `dropped`）
+    /// をそのまま引き継ぐ。設定が壊れていれば `Err` で、キューには触らない
+    /// （呼び出し側は旧世代の行を flush するか捨てる）。
+    pub fn with_queue(
+        group: &SinkConfigGroup,
+        queue: QueueOrigin,
     ) -> Result<Self, GroupSetupError> {
         let mode = SinkMode::parse(&group.mode)
             .ok_or_else(|| GroupSetupError::UnknownMode(group.mode.clone()))?;
@@ -164,6 +204,12 @@ impl GroupRuntime {
                 external_name: tag.external_name.clone(),
             })
             .collect();
+        let queue = match queue {
+            QueueOrigin::Fresh { max_rows, dropped } => {
+                Arc::new(Mutex::new(RowQueue::with_dropped(max_rows, dropped)))
+            }
+            QueueOrigin::Shared(queue) => queue,
+        };
         Ok(Self {
             id: group.id,
             name: group.name.clone(),
@@ -175,7 +221,7 @@ impl GroupRuntime {
             store_bad: group.store_bad,
             tags,
             table,
-            queue: Mutex::new(RowQueue::with_dropped(queue_max_rows, carried_dropped)),
+            queue,
             status: Mutex::new(GroupStatusInner {
                 state: GroupState::Running,
                 last_flush_at: None,
@@ -189,6 +235,12 @@ impl GroupRuntime {
 
     fn queue(&self) -> std::sync::MutexGuard<'_, RowQueue> {
         self.queue.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// 次の世代に渡すためのキューの共有ハンドル（[`QueueOrigin::Shared`]）。
+    /// この世代の `peek_batch` / `commit_batch` は以後も同じキューに効く。
+    pub fn shared_queue(&self) -> Arc<Mutex<RowQueue>> {
+        self.queue.clone()
     }
 
     fn status(&self) -> std::sync::MutexGuard<'_, GroupStatusInner> {
@@ -220,7 +272,8 @@ impl GroupRuntime {
         self.queue().commit(batch);
     }
 
-    /// 停止時に残った行を捨てて `dropped` に計上する（設計 §5.6）。
+    /// 残った行を捨てて `dropped` に計上する（停止時、設計 §5.6。設定変更で
+    /// 書き先が変わり、上限まで flush しても残った行にも使う）。
     pub fn discard_queue(&self) -> usize {
         self.queue().discard_all()
     }
@@ -796,6 +849,83 @@ mod tests {
 
         assert!(group.mark_backoff("db down".to_string()));
         assert!(!group.table_ready(), "バックオフ後は必ず再検査する");
+    }
+
+    fn row(tag_id: i64, ts_ms: i64) -> Row {
+        Row {
+            ts_ms,
+            tag_id,
+            external_name: format!("line1.fast.temp{tag_id:02}"),
+            value: Some(tag_id as f64),
+            quality: "good".to_string(),
+        }
+    }
+
+    /// 書き先が同じ次の世代はキューそのものを引き継ぐ: 旧世代が INSERT 中に
+    /// 取り出したバッチを、新世代を作った後に旧世代で `commit` しても、
+    /// 新世代から同じ行は出ない（写しではなく同じキューなので二重に送らない）。
+    #[test]
+    fn a_shared_queue_is_acked_through_the_old_generation_without_resending() {
+        let old = GroupRuntime::new(&config_group("interval", "t"), 10, 0).expect("valid config");
+        old.push_rows(vec![row(11, 1), row(11, 2), row(11, 3)]);
+        let in_flight = old.peek_batch(2);
+
+        let mut next_config = config_group("interval", "t");
+        next_config.tags.push(SinkConfigTag {
+            connection_id: 1,
+            group_id: 2,
+            tag_id: 12,
+            external_name: "line1.fast.temp02".to_string(),
+        });
+        let next = GroupRuntime::with_queue(&next_config, QueueOrigin::Shared(old.shared_queue()))
+            .expect("valid config");
+        assert_eq!(next.queued(), 3, "未送信の行は新世代から見える");
+        assert_eq!(next.tags.len(), 2);
+
+        old.commit_batch(&in_flight);
+        let remaining = next.peek_batch(10);
+        assert_eq!(
+            remaining.iter().map(|r| r.ts_ms).collect::<Vec<_>>(),
+            vec![3],
+            "旧世代で commit した行は新世代からも消える"
+        );
+        // 新世代が積む行の ID も続きなので、旧世代の遅れた commit が
+        // 新しい行を巻き込まない。
+        next.push_rows(vec![row(12, 4)]);
+        old.commit_batch(&in_flight);
+        assert_eq!(next.queued(), 2);
+    }
+
+    /// `dropped` はキューの中にあるので、引き継いだ世代でもそのまま続く。
+    #[test]
+    fn a_shared_queue_keeps_counting_dropped_rows() {
+        let old = GroupRuntime::new(&config_group("interval", "t"), 2, 5).expect("valid config");
+        old.push_rows(vec![row(11, 1), row(11, 2), row(11, 3)]);
+        assert_eq!(old.dropped(), 6);
+        let next = GroupRuntime::with_queue(
+            &config_group("interval", "t"),
+            QueueOrigin::Shared(old.shared_queue()),
+        )
+        .expect("valid config");
+        assert_eq!(next.dropped(), 6);
+        next.push_rows(vec![row(11, 4)]);
+        assert_eq!(next.dropped(), 7);
+        assert_eq!(old.dropped(), 7);
+    }
+
+    /// 設定が壊れていると `with_queue` は `Err` で、渡したキューには触らない。
+    #[test]
+    fn with_queue_rejects_a_broken_config_and_leaves_the_queue_alone() {
+        let old = GroupRuntime::new(&config_group("interval", "t"), 10, 0).expect("valid config");
+        old.push_rows(vec![row(11, 1)]);
+        let mut no_tags = config_group("interval", "t");
+        no_tags.tags.clear();
+        assert_eq!(
+            GroupRuntime::with_queue(&no_tags, QueueOrigin::Shared(old.shared_queue()))
+                .unwrap_err(),
+            GroupSetupError::NoTags
+        );
+        assert_eq!(old.queued(), 1);
     }
 
     #[test]

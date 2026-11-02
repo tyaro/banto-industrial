@@ -72,9 +72,12 @@ impl RowQueue {
         }
     }
 
-    /// グループの設定変更でキューを作り直すときに、捨てた行数を引き継ぐ
+    /// グループの設定変更でキューを**引き継げず**作り直すとき（書き先が
+    /// 変わった・新しい世代を作れない）に、捨てた行数を引き継ぐ
     /// （`dropped` は Hub の状態画面に出る累積値なので、設定を触った
-    /// だけで 0 に戻ると「取りこぼしていない」と誤読される）。
+    /// だけで 0 に戻ると「取りこぼしていない」と誤読される）。書き先が
+    /// 同じならキューそのものを次の世代が共有し、この関数は使わない
+    /// （[`crate::group::QueueOrigin`]）。
     pub fn with_dropped(max_rows: usize, dropped: u64) -> Self {
         let mut queue = Self::new(max_rows);
         queue.dropped = dropped;

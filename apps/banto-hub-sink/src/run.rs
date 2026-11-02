@@ -16,7 +16,8 @@
 //! - **設定取得**（既定 30 秒）: `GET /api/sink/config` を取り、前回適用した
 //!   集合との差分だけを start/stop する（`banto_hub_core::db_source::
 //!   DbSourceEngine::commit` と同じ考え方 - 変わっていないグループの
-//!   キューと接続はそのまま残す）。失敗中は取得間隔を待たず指数
+//!   キューと接続はそのまま残し、変わったグループも書き先が同じなら
+//!   キューを引き継ぐ。下の「差分適用の順序」）。失敗中は取得間隔を待たず指数
 //!   バックオフで再試行する（**Hub 未起動のまま起動しても待つだけで
 //!   終了しない** - 設計 §5.6）。
 //! - **状態 push**（既定 5 秒）: 全グループの `state`/`queued`/`dropped`/
@@ -30,6 +31,16 @@
 //!
 //! `グループ停止 → 接続停止 → 接続開始 → グループ開始`。プロデューサは
 //! 起床先（その接続の flusher）を持つので、接続を先に用意する必要がある。
+//!
+//! 変わったグループの**未送信の行は捨てない**（2026-11-02 オーナー決定、
+//! 設計 §5.6）。書き先（接続とテーブル）が同じで、その接続の flusher も
+//! 残り、新しい世代を作れるなら、新しい [`GroupRuntime`] は旧世代のキュー
+//! そのものを引き継ぐ（[`queue_carries_over`]。DB が落ちていても待たない）。
+//! 書き先が変わる・グループが消える・新しい世代を作れない（タグ 0 件など）
+//! ときは、プロデューサを止めてから、古い接続の flusher が生きている間に
+//! `shutdown_flush` を全体の上限として flush を待ち、残った行だけを
+//! `dropped` に計上して warn する。`running` でない（backoff・error）か
+//! flusher が無いグループは待たない。
 //!
 //! ## 停止（§5.6）
 //!
@@ -68,7 +79,7 @@ use crate::flush::{
 };
 use crate::group::{
     run_interval_producer, run_on_change_producer, GroupRegistry, GroupRuntime, GroupSetupError,
-    SinkMode, DEFAULT_TABLE_RECHECK,
+    QueueOrigin, SinkMode, DEFAULT_TABLE_RECHECK,
 };
 use crate::hub_api::{
     HubApi, HubApiError, SinkConfig, SinkConfigConnection, SinkConfigGroup, SinkStatusPush,
@@ -268,6 +279,36 @@ pub fn plan_changes(
     plan
 }
 
+/// 作り直すグループが旧世代のキューを引き継げるか（2026-11-02 オーナー決定、
+/// 設計 §5.6）。書き先が同じ - 同じ id の新しい設定があり、`db_connection_id`
+/// と `table_name` が同じで、その接続の flusher が止められない
+/// （`connections_to_stop` に無い）- なら、タグ・interval・mode・storeBad
+/// などが変わっても未送信の行はそのまま新しい世代が流す。タグが 0 件なら
+/// 新しい世代を作れないので引き継がない（呼び出し側が flush して捨てる）。
+pub fn queue_carries_over(
+    applied: &SinkConfigGroup,
+    desired: Option<&SinkConfigGroup>,
+    connections_to_stop: &[i64],
+) -> bool {
+    let Some(desired) = desired else {
+        return false;
+    };
+    desired.id == applied.id
+        && desired.db_connection_id == applied.db_connection_id
+        && desired.table_name == applied.table_name
+        && !desired.tags.is_empty()
+        && !connections_to_stop.contains(&desired.db_connection_id)
+}
+
+/// 新しい世代の [`GroupRuntime`] に旧世代から渡すもの。
+enum Carried {
+    /// キューは引き継がない。捨てた行数の累計だけ渡す。
+    Dropped(u64),
+    /// 旧世代のキューを共有する新しい世代（登録簿には入れてある。
+    /// プロデューサだけがまだ無い）。
+    Runtime(Arc<GroupRuntime>),
+}
+
 /// サイドカー本体。[`run`] だけが構築する。
 struct Engine {
     config: SidecarConfig,
@@ -362,6 +403,20 @@ impl Engine {
     }
 
     async fn apply_config(&mut self, desired: SinkConfig) {
+        self.apply_plan(desired).await;
+        self.ensure_subscription().await;
+    }
+
+    /// 差分を実行時オブジェクトへ反映する（購読の張り直しは
+    /// [`Self::ensure_subscription`] が別に行う）。
+    ///
+    /// 運転ループはこれを停止合図と一緒に `select!` しているので、途中で
+    /// drop されうる。await 点は 1.5 の `sleep` と 2 の `flusher.stop` だけで、
+    /// どちらの時点でも登録簿・プロデューサ・flusher の表は矛盾しない
+    /// （止めたプロデューサは表から外れ、flush 待ちのグループは登録簿に
+    /// 残ったまま、引き継いだ世代は登録簿に入っている）。残りは
+    /// `Engine::shutdown` が引き取る。
+    async fn apply_plan(&mut self, desired: SinkConfig) {
         let plan = plan_changes(&self.applied_groups, &self.applied_connections, &desired);
 
         // 接続のパスワードは秘密なので、伏せ字の対象へ足しておく
@@ -381,26 +436,74 @@ impl Engine {
                 plan.connections_to_start.len()
             ));
         }
+        let desired_groups: HashMap<i64, &SinkConfigGroup> =
+            desired.groups.iter().map(|g| (g.id, g)).collect();
 
-        // 1. 変わった/消えたグループを止める（捨てた行数は引き継ぐ）。
-        let mut carried_dropped: HashMap<i64, u64> = HashMap::new();
+        // 1. 変わった/消えたグループのプロデューサを止める。書き先が同じなら
+        //    新しい世代にキューを引き継いで登録簿を差し替える（flusher は
+        //    次の周回から新しい世代を見る。旧世代で INSERT 中のバッチの
+        //    commit も同じキューに効く）。引き継げないものは、flush を待つ
+        //    ため登録簿に残しておく。
+        let mut carried: HashMap<i64, Carried> = HashMap::new();
+        let mut to_flush: Vec<Arc<GroupRuntime>> = Vec::new();
         for id in &plan.groups_to_stop {
             if let Some(task) = self.producers.remove(id) {
                 task.abort();
             }
-            if let Some(runtime) = self.groups.remove(*id) {
-                let queued = runtime.queued();
-                let dropped = runtime.dropped() + queued as u64;
-                if queued > 0 {
-                    log_err_line(&format!(
-                        "banto-hub-sink: warn: グループ id={id} の設定が変わったため、未送信の {queued} 行を破棄しました"
-                    ));
+            if let Some(runtime) = self.groups.get(*id) {
+                let next = self
+                    .applied_groups
+                    .get(id)
+                    .filter(|applied| {
+                        queue_carries_over(
+                            applied,
+                            desired_groups.get(id).copied(),
+                            &plan.connections_to_stop,
+                        )
+                    })
+                    .and_then(|_| desired_groups.get(id))
+                    .and_then(|group| {
+                        GroupRuntime::with_queue(group, QueueOrigin::Shared(runtime.shared_queue()))
+                            .ok()
+                    });
+                match next {
+                    Some(next) => {
+                        let next = Arc::new(next);
+                        let queued = next.queued();
+                        if queued > 0 {
+                            log_line(&format!(
+                                "banto-hub-sink: グループ id={id} の設定が変わりました。書き先が同じなので未送信の {queued} 行を引き継ぎます"
+                            ));
+                        }
+                        self.groups.insert(next.clone());
+                        carried.insert(*id, Carried::Runtime(next));
+                    }
+                    None => to_flush.push(runtime),
                 }
-                carried_dropped.insert(*id, dropped);
             }
             if let Some(broken) = self.broken.remove(id) {
-                carried_dropped.insert(*id, broken.dropped);
+                carried.insert(*id, Carried::Dropped(broken.dropped));
             }
+        }
+
+        // 1.5. 引き継げないグループの残りを、古い接続の flusher が生きている
+        //    間に流す。全グループ合計で `shutdown_flush` を上限にする
+        //    （グループごとに足さない）。`running` でない（backoff・error）か
+        //    flusher が無いグループは待っても減らないので待たない。
+        self.flush_before_discard(&to_flush).await;
+        for runtime in to_flush {
+            let id = runtime.id;
+            self.groups.remove(id);
+            // 登録簿から外した後に旧世代の INSERT が commit しても、ここで
+            // 空にしたキューには何も残っていないので二重には数えない
+            // （停止時の `discard_queue` と同じ扱い）。
+            let discarded = runtime.discard_queue();
+            if discarded > 0 {
+                log_err_line(&format!(
+                    "banto-hub-sink: warn: グループ id={id} の設定が変わり、キューを引き継げないため、未送信の {discarded} 行を破棄しました（dropped に計上しました）"
+                ));
+            }
+            carried.insert(id, Carried::Dropped(runtime.dropped()));
         }
 
         // 2. 変わった/消えた接続の flusher を止める。
@@ -447,14 +550,38 @@ impl Engine {
 
         // 4. グループを開始する。
         for group in &plan.groups_to_start {
-            let carried = carried_dropped.get(&group.id).copied().unwrap_or(0);
+            let carried = carried.remove(&group.id).unwrap_or(Carried::Dropped(0));
             self.start_group(group, &connections, &unavailable, carried);
         }
 
         self.applied_groups = desired.groups.iter().map(|g| (g.id, g.clone())).collect();
         self.applied_connections = connections;
+    }
 
-        self.ensure_subscription().await;
+    /// 引き継げないグループの残りを、`shutdown_flush` を全体の上限として
+    /// 流し切るのを待つ。待つ価値があるのは「行が残っていて、`running` で、
+    /// その接続の flusher がまだいる」グループだけで、1 つも無くなれば
+    /// すぐ戻る（DB が落ちているときに 5 秒止めない）。flusher には
+    /// 周期を待たず 1 周回まわるよう起床を頼む（1 周回でキューが空になる
+    /// まで流す - [`crate::flush`]）。
+    async fn flush_before_discard(&self, groups: &[Arc<GroupRuntime>]) {
+        let worth_waiting = |group: &Arc<GroupRuntime>| {
+            group.queued() > 0
+                && group.state() == GroupState::Running
+                && self.flushers.contains_key(&group.db_connection_id)
+        };
+        if !groups.iter().any(worth_waiting) {
+            return;
+        }
+        for group in groups {
+            if let Some(flusher) = self.flushers.get(&group.db_connection_id) {
+                flusher.waker().notify_one();
+            }
+        }
+        let deadline = StdInstant::now() + self.config.shutdown_flush;
+        while StdInstant::now() < deadline && groups.iter().any(worth_waiting) {
+            tokio::time::sleep(DRAIN_POLL).await;
+        }
     }
 
     fn start_group(
@@ -462,45 +589,71 @@ impl Engine {
         group: &SinkConfigGroup,
         connections: &HashMap<i64, SinkConfigConnection>,
         unavailable: &HashMap<i64, UnavailableConnection>,
-        carried_dropped: u64,
+        carried: Carried,
     ) {
+        // 引き継いだ世代の行は、始められなければ捨てたことにする（この世代
+        // は登録簿から外す）。接続が残っている条件で引き継いでいるので、
+        // 構造上ここには来ないが、黙って失うより数える。
+        let fail = |this: &mut Self, message: String| {
+            let dropped = match &carried {
+                Carried::Dropped(dropped) => *dropped,
+                Carried::Runtime(runtime) => {
+                    this.groups.remove(runtime.id);
+                    let discarded = runtime.discard_queue();
+                    if discarded > 0 {
+                        log_err_line(&format!(
+                            "banto-hub-sink: warn: グループ id={} を始められないため、引き継いだ未送信の {discarded} 行を破棄しました（dropped に計上しました）",
+                            runtime.id
+                        ));
+                    }
+                    runtime.dropped()
+                }
+            };
+            this.mark_broken(group.id, message, dropped);
+        };
         if let Some(connection) = unavailable.get(&group.db_connection_id) {
-            self.mark_broken(
-                group.id,
+            fail(
+                self,
                 GroupSetupError::ConnectionUnavailable {
                     id: connection.id,
                     name: connection.name.clone(),
                     reason: connection.reason.clone(),
                 }
                 .message(),
-                carried_dropped,
             );
             return;
         }
         if !connections.contains_key(&group.db_connection_id) {
-            self.mark_broken(
-                group.id,
+            fail(
+                self,
                 GroupSetupError::MissingConnection(group.db_connection_id).message(),
-                carried_dropped,
             );
             return;
         }
-        let Some(flusher) = self.flushers.get(&group.db_connection_id) else {
+        if !self.flushers.contains_key(&group.db_connection_id) {
             // 接続の構成に失敗している（ポート範囲外など）。
-            self.mark_broken(
-                group.id,
+            fail(
+                self,
                 GroupSetupError::MissingConnection(group.db_connection_id).message(),
-                carried_dropped,
             );
             return;
-        };
-        let runtime = match GroupRuntime::new(group, self.config.queue_max_rows, carried_dropped) {
-            Ok(runtime) => Arc::new(runtime),
-            Err(err) => {
-                self.mark_broken(group.id, err.message(), carried_dropped);
-                return;
+        }
+        let runtime = match carried {
+            Carried::Runtime(runtime) => runtime,
+            Carried::Dropped(dropped) => {
+                match GroupRuntime::new(group, self.config.queue_max_rows, dropped) {
+                    Ok(runtime) => Arc::new(runtime),
+                    Err(err) => {
+                        self.mark_broken(group.id, err.message(), dropped);
+                        return;
+                    }
+                }
             }
         };
+        let flusher = self
+            .flushers
+            .get(&group.db_connection_id)
+            .expect("checked above");
         let waker = flusher.waker();
         let batch_size = self.config.batch_size;
         let rx = self.view_rx.clone();
@@ -1422,6 +1575,364 @@ mod tests {
         let plan = plan_changes(&ag, &ac, &desired(vec![], vec![]));
         assert_eq!(plan.connections_to_stop, vec![10]);
         assert!(plan.connections_to_start.is_empty());
+    }
+
+    /// 2026-11-02 オーナー決定: 書き先（接続とテーブル）が同じで flusher も
+    /// 残るなら、タグだけ・interval・mode などの変更ではキューを引き継ぐ。
+    #[test]
+    fn the_queue_carries_over_when_only_the_destination_stays_the_same() {
+        let applied = group(1, 10, "t1");
+
+        let mut tags_changed = applied.clone();
+        tags_changed.tags.push(SinkConfigTag {
+            connection_id: 1,
+            group_id: 2,
+            tag_id: 99,
+            external_name: "line1.fast.t99".to_string(),
+        });
+        assert!(queue_carries_over(&applied, Some(&tags_changed), &[]));
+
+        let mut interval_changed = applied.clone();
+        interval_changed.interval_ms = 5_000;
+        assert!(queue_carries_over(&applied, Some(&interval_changed), &[]));
+
+        let mut mode_changed = applied.clone();
+        mode_changed.mode = "on_change".to_string();
+        mode_changed.store_bad = true;
+        mode_changed.name = "renamed".to_string();
+        assert!(queue_carries_over(&applied, Some(&mode_changed), &[]));
+
+        // 別の接続が止まるだけなら関係ない。
+        assert!(queue_carries_over(&applied, Some(&tags_changed), &[11]));
+    }
+
+    #[test]
+    fn the_queue_is_not_carried_when_the_destination_changes_or_the_group_cannot_start() {
+        let applied = group(1, 10, "t1");
+
+        let mut table_changed = applied.clone();
+        table_changed.table_name = "t2".to_string();
+        assert!(!queue_carries_over(&applied, Some(&table_changed), &[]));
+
+        let mut connection_changed = applied.clone();
+        connection_changed.db_connection_id = 11;
+        assert!(!queue_carries_over(
+            &applied,
+            Some(&connection_changed),
+            &[]
+        ));
+
+        // 接続の設定が変わって flusher を張り直す（connections_to_stop に入る）。
+        let mut tags_changed = applied.clone();
+        tags_changed.tags.clear();
+        tags_changed.tags.push(SinkConfigTag {
+            connection_id: 1,
+            group_id: 2,
+            tag_id: 99,
+            external_name: "line1.fast.t99".to_string(),
+        });
+        assert!(!queue_carries_over(&applied, Some(&tags_changed), &[10]));
+
+        // グループの削除。
+        assert!(!queue_carries_over(&applied, None, &[]));
+
+        // タグが 0 件（`NoTags` で新しい世代を作れない）。
+        let mut no_tags = applied.clone();
+        no_tags.tags.clear();
+        assert!(!queue_carries_over(&applied, Some(&no_tags), &[]));
+    }
+
+    /// `apply_plan` を Hub 無しで動かすためのエンジン（`hub_url` には繋がない。
+    /// ループバック以外の http は TLS の pin 無しで構成できる形）。
+    fn offline_engine(shutdown_flush: Duration) -> Engine {
+        let config = SidecarConfig {
+            hub_url: "http://hub.invalid:1".to_owned(),
+            api_key: "bh_test.secret".to_owned(),
+            hub_tls: None,
+            config_refresh: Duration::from_secs(60),
+            status_push: Duration::from_secs(60),
+            queue_max_rows: 100,
+            flush_interval: Duration::from_secs(60),
+            batch_size: 100,
+            shutdown_flush,
+        };
+        Engine::new(config, SidecarOptions::default()).expect("engine")
+    }
+
+    fn one_row(ts_ms: i64) -> crate::queue::Row {
+        crate::queue::Row {
+            ts_ms,
+            tag_id: 1,
+            external_name: "line1.fast.t1".to_owned(),
+            value: Some(1.0),
+            quality: "good".to_owned(),
+        }
+    }
+
+    /// タグを足しただけ（書き先は同じ）: DB が応答しなくても待たず、未送信の
+    /// 行は新しい世代のキューにそのまま残り、`dropped` も続く。
+    #[tokio::test]
+    async fn adding_a_tag_keeps_the_queued_rows_without_waiting_for_the_db() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("carry-queue");
+        let mut engine = offline_engine(Duration::from_secs(5));
+        let connections = vec![connection(10, "pw")];
+        let applied = group(1, 10, "public.t1");
+        let runtime = Arc::new(GroupRuntime::new(&applied, 100, 3).expect("group"));
+        runtime.push_rows(vec![one_row(1), one_row(2)]);
+        engine.groups.insert(runtime.clone());
+        engine
+            .producers
+            .insert(1, tokio::spawn(std::future::pending()));
+        engine.applied_groups.insert(1, applied.clone());
+        engine
+            .applied_connections
+            .insert(10, connections[0].clone());
+        let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
+        engine.flushers.insert(10, handle);
+
+        let mut changed = applied.clone();
+        changed.tags.push(SinkConfigTag {
+            connection_id: 1,
+            group_id: 2,
+            tag_id: 2,
+            external_name: "line1.fast.t2".to_string(),
+        });
+        let started = StdInstant::now();
+        engine
+            .apply_plan(desired(vec![changed.clone()], connections))
+            .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "引き継ぐときは flush を待たない: {:?}",
+            started.elapsed()
+        );
+
+        let next = engine.groups.get(1).expect("new generation is registered");
+        assert!(!Arc::ptr_eq(&next, &runtime), "新しい世代に置き換わる");
+        assert_eq!(next.tags.len(), 2);
+        assert_eq!(next.queued(), 2, "未送信の行は引き継ぐ");
+        assert_eq!(next.dropped(), 3, "dropped も続く");
+        assert!(engine.producers.contains_key(&1));
+        assert!(engine.broken.is_empty());
+        assert_eq!(engine.applied_groups.get(&1), Some(&changed));
+        // 旧世代の遅れた commit は同じキューに効く。
+        let batch = runtime.peek_batch(1);
+        runtime.commit_batch(&batch);
+        assert_eq!(next.queued(), 1);
+
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("未送信の 2 行を引き継ぎます") && !text.contains("破棄しました"),
+            "{text}"
+        );
+        for (_, task) in engine.producers.drain() {
+            task.abort();
+        }
+    }
+
+    /// テーブルが変わる（書き先が変わる）: 古い接続の flusher が生きている間に
+    /// `shutdown_flush` まで待ち、残った行だけを捨てて `dropped` に計上する。
+    /// 応答しない DB なので上限で諦め、合計の上限を超えない。
+    #[tokio::test]
+    async fn changing_the_table_flushes_up_to_the_limit_then_discards_the_rest() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("discard-after-flush");
+        let flush_limit = Duration::from_millis(300);
+        let mut engine = offline_engine(flush_limit);
+        let connections = vec![connection(10, "pw")];
+        let applied_a = group(1, 10, "public.t1");
+        let applied_b = group(2, 10, "public.t2");
+        for applied in [&applied_a, &applied_b] {
+            let runtime = Arc::new(GroupRuntime::new(applied, 100, 1).expect("group"));
+            runtime.push_rows(vec![one_row(1), one_row(2)]);
+            engine.groups.insert(runtime);
+            engine
+                .producers
+                .insert(applied.id, tokio::spawn(std::future::pending()));
+            engine.applied_groups.insert(applied.id, applied.clone());
+        }
+        engine
+            .applied_connections
+            .insert(10, connections[0].clone());
+        let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
+        engine.flushers.insert(10, handle);
+
+        let mut changed_a = applied_a.clone();
+        changed_a.table_name = "public.t1_v2".to_string();
+        let mut changed_b = applied_b.clone();
+        changed_b.table_name = "public.t2_v2".to_string();
+        let started = StdInstant::now();
+        engine
+            .apply_plan(desired(vec![changed_a, changed_b], connections))
+            .await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= flush_limit && elapsed < flush_limit * 4,
+            "2 グループ合計で上限 1 回ぶんだけ待つ: {elapsed:?}"
+        );
+
+        for id in [1, 2] {
+            let next = engine.groups.get(id).expect("new generation is registered");
+            assert_eq!(next.queued(), 0, "書き先が変わった世代は空のキューで始まる");
+            assert_eq!(next.dropped(), 3, "捨てた 2 行を引き継いだ 1 に足す");
+            assert!(engine.producers.contains_key(&id));
+        }
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            text.contains("グループ id=1 の設定が変わり、キューを引き継げないため、未送信の 2 行を破棄しました")
+                && text.contains("グループ id=2 の設定が変わり、キューを引き継げないため、未送信の 2 行を破棄しました"),
+            "{text}"
+        );
+        for (_, task) in engine.producers.drain() {
+            task.abort();
+        }
+    }
+
+    /// テーブルが変わる（書き先が変わる）とき、DB が生きていれば `flush_before_discard`
+    /// が旧テーブルへ流し切ってから捨てる道: 全行が旧テーブルに入り、`dropped` は
+    /// 増えず、上限（`shutdown_flush`）を待たずに終わり、新しい世代は新しい
+    /// テーブル名で動く。実 PostgreSQL（`BANTO_TEST_PG_URL`）が無ければスキップ。
+    #[tokio::test]
+    async fn changing_the_table_flushes_the_queue_into_the_old_table_when_the_db_is_alive() {
+        let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+            eprintln!("skipped: BANTO_TEST_PG_URL unset");
+            return;
+        };
+        let _log_guard = service_log_lock().await;
+        let _log_path = enable_test_service_log("flush-then-switch");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("BANTO_TEST_PG_URL に接続できる");
+        let suffix = format!("{}_{}", std::process::id(), ts_nanos());
+        let old_table = format!("sink_keep_old_{suffix}");
+        let new_table = format!("sink_keep_new_{suffix}");
+        for table in [&old_table, &new_table] {
+            sqlx::query(sqlx::AssertSqlSafe(crate::sql::recommended_ddl(table)))
+                .execute(&pool)
+                .await
+                .expect("create table");
+        }
+
+        let flush_limit = Duration::from_secs(5);
+        let mut engine = offline_engine(flush_limit);
+        let connections = vec![connection(10, "pw")];
+        let applied = group(1, 10, &old_table);
+        let runtime = Arc::new(GroupRuntime::new(&applied, 100, 0).expect("group"));
+        const ROWS: usize = 5;
+        runtime.push_rows((1..=ROWS as i64).map(one_row).collect());
+        engine.groups.insert(runtime.clone());
+        engine
+            .producers
+            .insert(1, tokio::spawn(std::future::pending()));
+        engine.applied_groups.insert(1, applied.clone());
+        engine
+            .applied_connections
+            .insert(10, connections[0].clone());
+        // 周期は 60 秒なので、apply_plan の起床の頼みが無い限り流れない。
+        let handle = crate::flush::spawn_flusher(
+            connections[0].clone(),
+            pool.clone(),
+            engine.groups.clone(),
+            engine.flush_options(),
+            engine.redactor.clone(),
+        );
+        engine.flushers.insert(10, handle);
+
+        let mut changed = applied.clone();
+        changed.table_name = new_table.clone();
+        let started = StdInstant::now();
+        engine
+            .apply_plan(desired(vec![changed.clone()], connections))
+            .await;
+        let elapsed = started.elapsed();
+
+        let count = |table: &str| {
+            let sql = format!("SELECT count(*) FROM {table}");
+            let pool = pool.clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
+                    .fetch_one(&pool)
+                    .await
+                    .expect("count")
+            }
+        };
+        let in_old = count(&old_table).await;
+        let in_new = count(&new_table).await;
+        let next = engine.groups.get(1).expect("new generation is registered");
+        let next_queued = next.queued();
+        let next_dropped = next.dropped();
+        let next_table = next.table.raw().to_owned();
+        let applied_table = engine.applied_groups.get(&1).map(|g| g.table_name.clone());
+        let has_producer = engine.producers.contains_key(&1);
+        let text = std::fs::read_to_string(&_log_path).unwrap_or_default();
+
+        for (_, task) in engine.producers.drain() {
+            task.abort();
+        }
+        for table in [&old_table, &new_table] {
+            let _ = sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
+                .execute(&pool)
+                .await;
+        }
+
+        assert_eq!(in_old, ROWS as i64, "全行が旧テーブルに入る");
+        assert_eq!(in_new, 0, "新テーブルには旧世代の行は入らない");
+        assert!(!Arc::ptr_eq(&next, &runtime), "新しい世代に置き換わる");
+        assert_eq!(next_queued, 0, "書き先が変わった世代は空のキューで始まる");
+        assert_eq!(next_dropped, 0, "流し切れたので dropped は増えない");
+        assert_eq!(next_table, new_table, "新しいテーブル名で動く");
+        assert_eq!(applied_table.as_deref(), Some(new_table.as_str()));
+        assert!(has_producer);
+        assert!(
+            elapsed < flush_limit / 2,
+            "流し切れたら上限まで待たない: {elapsed:?}"
+        );
+        assert!(!text.contains("破棄しました"), "{text}");
+    }
+
+    fn ts_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    /// 削除されるグループが `backoff`（DB 停止中）なら flush を待たずに捨てる。
+    #[tokio::test]
+    async fn a_removed_group_in_backoff_is_discarded_without_waiting() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("discard-backoff");
+        let mut engine = offline_engine(Duration::from_secs(5));
+        let connections = vec![connection(10, "pw")];
+        let applied = group(1, 10, "public.t1");
+        let runtime = Arc::new(GroupRuntime::new(&applied, 100, 0).expect("group"));
+        runtime.push_rows(vec![one_row(1)]);
+        runtime.mark_backoff("db down".to_string());
+        engine.groups.insert(runtime);
+        engine
+            .producers
+            .insert(1, tokio::spawn(std::future::pending()));
+        engine.applied_groups.insert(1, applied);
+        engine
+            .applied_connections
+            .insert(10, connections[0].clone());
+        let (handle, _server) = crate::flush::flusher_on_blackhole_pool(10).await;
+        engine.flushers.insert(10, handle);
+
+        let started = StdInstant::now();
+        engine.apply_plan(desired(vec![], connections)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "backoff 中は待たない: {:?}",
+            started.elapsed()
+        );
+        assert!(engine.groups.get(1).is_none());
+        assert!(engine.producers.is_empty());
+        let text = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(text.contains("未送信の 1 行を破棄しました"), "{text}");
     }
 
     /// 空の設定（sink group が 1 つも無い）でも壊れない。
