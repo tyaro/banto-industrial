@@ -2095,7 +2095,8 @@ PEM 全体**を 1 件指定してください。接続先から取得した証�
 信頼しないでください。pin は公開鍵だけではなく証明書 DER 全体の一致を確認し、
 有効期限・接続先名など通常の TLS 検証も行います。発行時の期限は
 `$cert.NotAfterUtc` にあり、運用中は現行証明書のパスを指定して
-`openssl x509 -in <現行証明書のパス> -noout -enddate` で確認します。
+`[System.Security.Cryptography.X509Certificates.X509Certificate2]::new('<現行証明書の絶対パス>').NotAfter.ToUniversalTime()`
+で確認します。
 失効前に更新してください。
 新しい証明書と鍵を保護された置き場へ別名で発行・配置し、上記の拡張と ACL を
 確かめます。新旧両方の証明書 PEM を `hub_tls_pinned_certs` に設定して

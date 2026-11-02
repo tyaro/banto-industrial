@@ -187,6 +187,9 @@ function Assert-SafeOpenSsl {
   }
   $opensslDir = [System.IO.Path]::GetDirectoryName($openssl)
   $driveRoot = [System.IO.Path]::GetPathRoot($openssl)
+  if ([System.IO.DriveInfo]::new($driveRoot).DriveType -ne [System.IO.DriveType]::Fixed) {
+    throw "OpenSslPath はローカル固定ドライブ上に置いてください: $driveRoot"
+  }
   $ancestors = [System.Collections.Generic.List[string]]::new()
   $cursor = $opensslDir
   while ($true) {
