@@ -164,7 +164,9 @@
 		buildConfirmExternalName,
 		environmentLabel,
 		writePermissionLabel,
-		fieldErrorsFromList
+		fieldErrorsFromList,
+		displayTagKind,
+		tagKindOptionLabel
 	} from '#lib/banto/tagFormLayout.js';
 	import { addressHelpFor } from '#lib/banto/tagAddressHelp.js';
 	import {
@@ -5069,7 +5071,11 @@
 			{
 				id: 'tagKind',
 				header: '種別',
-				accessor: 'tagKind',
+				accessor: (row) =>
+					displayTagKind(
+						row.tagKind,
+						connectionForGroupId(String(row.collectionGroupId))?.protocol
+					),
 				width: 90
 			},
 			{
@@ -5194,7 +5200,12 @@
 					}}
 				>
 					{#each TAG_KIND_OPTIONS as opt (opt.value)}
-						<option value={opt.value}>{opt.label}</option>
+						<option value={opt.value}
+							>{tagKindOptionLabel(
+								opt,
+								connectionForGroupId(form.collectionGroupId)?.protocol
+							)}</option
+						>
 					{/each}
 				</select>
 			{/if}
