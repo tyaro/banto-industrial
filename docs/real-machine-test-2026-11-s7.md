@@ -264,7 +264,7 @@ B-20・B-21 は、問い合わせの失敗で 1 周期だけ Stale を挟んで 
 - 18:37:45 に済ませた: 起動の種類を 2 本とも `DEMAND_START` へ戻した。
 - やり直しの後まで残す: K-2、`pg_hba.conf` の 2 行（P-4）、`banto_s7`、接続 s7-db-source・s7-db-sink・s7-bridge・s7-sim、sink group s7-sink、TLS の証明書（期限 11-30 19:09 UTC）。Hub と Sink のサービスは Running のまま。
 
-### 気づき（2026-11-02 に起票）
+### 気づき（2026-11-02 に行き先を整理）
 
 各項目の末尾に行き先を書く。
 
