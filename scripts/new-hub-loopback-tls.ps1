@@ -127,18 +127,25 @@ function Assert-ServiceOnlyAcl {
 }
 
 function Assert-SafeAncestors {
-  # OS の ProgramData から保管先の親まで、入れ替え可能な祖先を残さない。
-  # BantoHub は他のデータも持つため ACL を変更せず、危険な権限だけを拒否する。
-  $ancestors = @($programData)
-  if ($tlsDir -eq $defaultTlsDir) {
-    $ancestors += $parentDir
+  # ドライブルートから保管先の親まで、入れ替え可能な祖先を残さない。
+  # ルートだけ TrustedInstaller を許し、中間ディレクトリも SYSTEM/Admin に限る。
+  $driveRoot = [System.IO.Path]::GetPathRoot($parentDir)
+  $ancestors = [System.Collections.Generic.List[string]]::new()
+  $cursor = $parentDir
+  while ($true) {
+    $ancestors.Add($cursor)
+    if ($cursor -eq $driveRoot) { break }
+    $cursor = [System.IO.Path]::GetDirectoryName($cursor)
+    if (-not $cursor) { throw "保管先の祖先を確認できません: $parentDir" }
   }
+  $ancestors.Reverse()
   foreach ($ancestor in $ancestors) {
     [void](Get-PlainDirectory $ancestor)
-    $ancestorAcl = Get-CheckedAcl $ancestor
+    $allowedOwners = if ($ancestor -eq $driveRoot) { $openSslOwners } else { $trustedOwners }
+    $ancestorAcl = Get-CheckedAcl -Path $ancestor -AllowedOwners $allowedOwners
     foreach ($rule in $ancestorAcl.GetAccessRules($true, $true, $sidType)) {
       if ($rule.AccessControlType -ne $allowType -or
-          $rule.IdentityReference.Value -in $trustedOwners -or
+          $rule.IdentityReference.Value -in $allowedOwners -or
           (($rule.PropagationFlags -band $inheritOnly) -ne 0)) {
         continue
       }
@@ -215,6 +222,32 @@ function Assert-SafeOpenSsl {
   return [pscustomobject]@{ Executable = $openssl; Directory = $opensslDir }
 }
 
+function Get-OpenSslFailureSummary {
+  param([string]$Stderr)
+  # stderr の任意本文にはパスや秘密値が含まれ得るため、固定分類とコードだけ返す。
+  $category = if ($Stderr -match '(?i)permission denied|access is denied|access denied') {
+    'アクセス拒否'
+  } elseif ($Stderr -match '(?i)no such file or directory|unable to open|cannot open|can.t open|fopen|BIO_new_file') {
+    'ファイルを開けない'
+  } elseif ($Stderr -match '(?i)configuration file|error in extension|error on line|missing equal sign|NCONF_|config parse') {
+    '設定ファイルの解析'
+  } elseif ($Stderr -match '(?i)unsupported|unknown algorithm|unknown option|disabled algorithm|provider routines') {
+    '非対応のアルゴリズムまたはオプション'
+  } elseif ($Stderr.Length -gt 0) {
+    '未分類の標準エラー'
+  } else {
+    '標準エラーなし'
+  }
+  $codes = [System.Collections.Generic.List[string]]::new()
+  foreach ($match in [regex]::Matches($Stderr, '(?i)error:([0-9a-f]{8})(?![0-9a-f])')) {
+    $code = $match.Groups[1].Value.ToUpperInvariant()
+    if (-not $codes.Contains($code)) { $codes.Add($code) }
+    if ($codes.Count -ge 3) { break }
+  }
+  $codeText = if ($codes.Count -gt 0) { $codes -join ', ' } else { 'なし' }
+  return "$category、OpenSSL error code: $codeText"
+}
+
 function Invoke-CheckedOpenSsl {
   param([string]$Operation, [string[]]$Arguments)
   $start = [System.Diagnostics.ProcessStartInfo]::new()
@@ -245,8 +278,8 @@ function Invoke-CheckedOpenSsl {
     $stdout = $stdoutTask.GetAwaiter().GetResult()
     $stderr = $stderrTask.GetAwaiter().GetResult()
     if ($process.ExitCode -ne 0) {
-      $stderrState = if ($stderr.Length -gt 0) { '標準エラー出力あり（内容は秘密情報保護のため省略）' } else { '標準エラー出力なし' }
-      throw "OpenSSL $Operation が終了コード $($process.ExitCode) で失敗しました: $stderrState"
+      $diagnostic = Get-OpenSslFailureSummary $stderr
+      throw "OpenSSL $Operation が終了コード $($process.ExitCode) で失敗しました: $diagnostic"
     }
     return $stdout.TrimEnd()
   } finally {

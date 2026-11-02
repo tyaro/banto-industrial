@@ -2064,11 +2064,11 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned
 `C:\Program Files\Git\mingw64\bin\openssl.exe` も同じ検査の対象です。発行に失敗したら
 後続のサービス設定へ進まないでください。スクリプトが受け付ける保管先は
 `C:\ProgramData\BantoHub\tls` と `C:\ProgramData\BantoHubTls` の 2 つだけです。
-OS の ProgramData から保管先の親まで検査します。既定の保管先または親が検査を
+OS のドライブルートから保管先の親まで検査します。既定の保管先または親が検査を
 通らない場合は、
 後者を `-TlsDirectory` に指定し、同じ検査が成功したときだけ発行結果のパスを
 使います。**既定・代替の両候補とも、この共通スクリプトの昇格実行と
-サービス接続は未確認です。** S7 B-3 の接続記録は以前の手順による結果です。
+サービス接続は未確認です（[追跡 #1006](https://github.com/tyaro/banto-industrial/issues/1006)）。** S7 B-3 の接続記録は以前の手順による結果です。
 `-Days 30` は S7 の試験用です。
 運用では更新の間隔を決め、その期間に応じた日数を指定します。
 スクリプトが `Basic Constraints` 1 個の `CA:FALSE`、SAN

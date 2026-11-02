@@ -154,7 +154,8 @@ $cert = & .\scripts\new-hub-loopback-tls.ps1 -TlsDirectory 'C:\ProgramData\Banto
 $cert | Format-List CertificatePath,PrivateKeyPath,ConfigPath,FingerprintSha256,NotAfterUtc,OpenSslPath,OpenSslVersion
 ```
 
-既定・代替の両候補とも、この共通スクリプトの昇格実行とサービス接続は未確認。
+既定・代替の両候補とも、この共通スクリプトの昇格実行とサービス接続は未確認
+（[追跡 #1006](https://github.com/tyaro/banto-industrial/issues/1006)）。
 S7 B-3 の接続記録は以前の手順による結果。
 
 スクリプトの実行がポリシーで拒否された場合だけ、信頼済みチェックアウトで
@@ -203,11 +204,12 @@ GRANT INSERT, SELECT ON tag_history TO banto_sink;
 **P-5 Hub のサービスに TLS の環境変数を渡す方法**: **サービスのレジストリの `Environment`（REG_MULTI_SZ）** を勧める。SCM はこの値をサービスのプロセスの環境に足して起動する。
 
 - ポートは **8723**（8722 の隣、ChronoGazer の 8721 と重ならない）。当日の前に `Get-NetTCPConnection -LocalPort 8723` で空きを確かめる。
-- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、OS の ProgramData から親まで検査する。既定の保管先または親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。期限は S7 の期間を覆う 30 日。
+- 証明書と秘密鍵は共通スクリプトの検査を通った保管先に置く。指定できるのは `%ProgramData%\BantoHub\tls\` と `%ProgramData%\BantoHubTls\` の 2 つだけで、ドライブルートから親まで検査する。既定の保管先または親が不合格なら、運用ガイド §12 の別候補で同じ検査を通してから使う。Hub のサービスは LocalSystem。期限は S7 の期間を覆う 30 日。
 - 管理者の PowerShell で、成功した発行結果の `$cert` を使う。別の
   セッションなら、記録した証明書・鍵の絶対パスで次のように再構成する。
-  **先に既存の値を確かめて**から書く（`Environment` が既にあれば、残す行を
-  足して書き直す。上書きで消さない）:
+  `Environment` には他の秘密値も入り得る。値を表示したり、サービスキー全体を
+  `reg export` したりしない。元のプロパティの有無と値の配列を**同じ PowerShell
+  セッション内**の `$environmentSnapshot` に保持し、TLS 以外の行を残して書く。
 
 ```powershell
 $cert = [pscustomobject]@{
@@ -219,21 +221,74 @@ $cert = [pscustomobject]@{
 ```powershell
 & {
   $ErrorActionPreference = 'Stop'
-  if ($null -eq $cert -or -not (Test-Path -LiteralPath $cert.CertificatePath) -or -not (Test-Path -LiteralPath $cert.PrivateKeyPath)) { throw '発行済みの証明書と鍵のパスを設定してください。' }
+  Set-Variable -Name environmentSnapshot -Scope 1 -Value $null
   $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub'
-  $previous = (Get-ItemProperty -Path $serviceKey -ErrorAction Stop).Environment
-  $remaining = @($previous | Where-Object { $_ -and $_ -notmatch '^BANTO_HUB_TLS_(PORT|CERT|KEY)=' })
+  if ($null -eq $cert -or -not (Test-Path -LiteralPath $cert.CertificatePath) -or -not (Test-Path -LiteralPath $cert.PrivateKeyPath)) { throw '発行済みの証明書と鍵のパスを設定してください。' }
+  $serviceProperties = Get-ItemProperty -Path $serviceKey -ErrorAction Stop
+  $property = $serviceProperties.PSObject.Properties['Environment']
+  $present = $null -ne $property
+  if ($present -and $property.Value -isnot [string[]]) { throw 'Environment が REG_MULTI_SZ ではありません。' }
+  [string[]]$values = @()
+  if ($present) { $values = [string[]]$property.Value.Clone() }
+  $snapshot = [pscustomobject]@{ Present = $present; Values = $values }
+  Set-Variable -Name environmentSnapshot -Scope 1 -Value $snapshot
+  $remaining = @($snapshot.Values | Where-Object { $_ -and $_ -notmatch '^BANTO_HUB_TLS_(PORT|CERT|KEY)=' })
+  Write-Host "元の Environment をこのセッション内に保持しました（TLS 以外: $($remaining.Count) 件）。"
   $updated = $remaining + @(
     'BANTO_HUB_TLS_PORT=8723',
     "BANTO_HUB_TLS_CERT=$($cert.CertificatePath)",
     "BANTO_HUB_TLS_KEY=$($cert.PrivateKeyPath)")
-  New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Force -Value $updated | Out-Null
-  Restart-Service BantoHub
+  $phase = 'registry write'
+  try {
+    New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Force -Value ([string[]]$updated) | Out-Null
+    $phase = 'service restart'
+    Restart-Service BantoHub
+  } catch {
+    $applyReason = if ($phase -eq 'service restart') { $_.Exception.Message } else { "レジストリ書込み ($($_.FullyQualifiedErrorId))" }
+    $restorePhase = 'registry restore'
+    try {
+      if ($snapshot.Present) {
+        New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Force -Value $snapshot.Values | Out-Null
+      } else {
+        $current = (Get-ItemProperty -Path $serviceKey -ErrorAction Stop).PSObject.Properties['Environment']
+        if ($null -ne $current) { Remove-ItemProperty -Path $serviceKey -Name Environment -ErrorAction Stop }
+      }
+      $restorePhase = 'service restart'
+      Restart-Service BantoHub
+    } catch {
+      $restoreReason = if ($restorePhase -eq 'service restart') { $_.Exception.Message } else { "レジストリ復元 ($($_.FullyQualifiedErrorId))" }
+      throw "TLS 設定に失敗: $applyReason。自動復元にも失敗: $restoreReason。同じセッションの控えで下の復元手順を実行してください。"
+    }
+    throw "TLS 設定に失敗: $applyReason。元の Environment へ自動復元しました。"
+  }
 }
 ```
 
 - 確かめ: Hub のサービスログに TLS の待受が出る・`Test-NetConnection 127.0.0.1 -Port 8723` が通る・LAN 側の IP の 8723 には繋がらない。
-- 戻し方: `Remove-ItemProperty ... -Name Environment`（または元の値に書き直す）→ `Restart-Service BantoHub`。S7 の後に戻すかは、そのときにオーナーが決める。
+- 戻し方: **上の `$environmentSnapshot` が残る同じセッションでのみ**、次を実行する。元のプロパティが無かったときだけ削除し、あったときは秘密値を含む元の配列をそのまま戻す。別セッション用に秘密入りのバックアップは作らない。S7 の後に戻すかは、そのときにオーナーが決める。
+
+```powershell
+& {
+  $ErrorActionPreference = 'Stop'
+  if ($null -eq $environmentSnapshot) { throw 'このセッションに元の Environment の控えがありません。' }
+  $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\BantoHub'
+  $phase = 'registry restore'
+  try {
+    if ($environmentSnapshot.Present) {
+      New-ItemProperty -Path $serviceKey -Name Environment -PropertyType MultiString -Force -Value $environmentSnapshot.Values | Out-Null
+    } else {
+      $current = (Get-ItemProperty -Path $serviceKey -ErrorAction Stop).PSObject.Properties['Environment']
+      if ($null -ne $current) { Remove-ItemProperty -Path $serviceKey -Name Environment -ErrorAction Stop }
+    }
+    $phase = 'service restart'
+    Restart-Service BantoHub
+  } catch {
+    $reason = if ($phase -eq 'service restart') { $_.Exception.Message } else { "レジストリ復元 ($($_.FullyQualifiedErrorId))" }
+    throw "Environment の復元に失敗: $reason"
+  }
+}
+```
+
 - `sc config` や `setx /M` は勧めない。`sc config` には環境変数を渡す口が無く、`setx /M` はマシン全体の環境を変えてほかのプロセスにも効く。
 
 **P-7 結果を書く文書の置き場**: **新しい文書 `docs/real-machine-test-2026-11-s7.md`** を勧める（#229 のオーナーのコメント「結果は real-machine 系 docs に記録」に合わせる）。
