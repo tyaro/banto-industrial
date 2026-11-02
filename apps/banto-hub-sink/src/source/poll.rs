@@ -726,6 +726,11 @@ async fn run_tick(
         Ok(Ok(rows)) => Ok(rows),
         Ok(Err(err)) => Err(classify(&err)),
     };
+    // An in-flight SQL may finish after its poller was retired. Leave the
+    // shared failure episode to the replacement poller in that case.
+    if should_stop(stop, events.tx) {
+        return TickOutcome::Stopped;
+    }
     let rows = match outcome {
         Ok(rows) => rows,
         Err(PgFailure::Connection(message)) => return TickOutcome::ConnectionLost(message),
