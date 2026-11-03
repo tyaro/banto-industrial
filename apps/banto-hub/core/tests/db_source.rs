@@ -577,7 +577,8 @@ async fn values_qualities_and_unsupported_columns_from_a_real_postgresql() {
 
     // 数値: numeric → float8。
     assert_eq!(value_of(&app, "erp.q1.a").await, (Some(1.5), "good".into()));
-    // double precision → f64。2^24 + 1 は f32 では正確に表現できない。
+    // f64 型の db タグを登録・収集し、double precision 列の値と品質を確認する。
+    // 収集経路は型によらず f64 を使うため、f32 タグとの精度差は検証しない。
     assert_eq!(
         value_of(&app, "erp.q1.precise").await,
         (Some(16_777_217.0), "good".into())
