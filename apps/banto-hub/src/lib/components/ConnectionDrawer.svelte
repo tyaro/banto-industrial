@@ -120,6 +120,7 @@
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
 	import {
 		REQUIRED_MESSAGE,
+		isSecretFormValue,
 		mapSettingsFieldErrors,
 		summarizeDriverValues,
 		validateDriverValues
@@ -881,6 +882,23 @@
 	async function handleSave(): Promise<void> {
 		if (!connection) return;
 		if (!validateBeforeSubmit()) return;
+		const secretChanges = [];
+		if (driver && connection.protocol === form.protocol) {
+			for (const field of driver.settingsSchema.fields) {
+				if (field.kind.type !== 'secret') continue;
+				const value = form.driver.values[field.key];
+				if (!isSecretFormValue(value) || value.state === 'none' || value.mode === 'keep') continue;
+				secretChanges.push(`${field.label}：${value.mode === 'clear' ? '消去' : '上書き'}`);
+			}
+		}
+		if (
+			secretChanges.length > 0 &&
+			!window.confirm(
+				`保存済みの秘密値を次のとおり変更します。\n\n${secretChanges.join('\n')}\n\n接続テストだけに使った変更は、キャンセルして「変えない」に戻してください。\nこの内容で保存しますか？`
+			)
+		) {
+			return;
+		}
 		saving = true;
 		errors = {};
 		driverErrors = {};
