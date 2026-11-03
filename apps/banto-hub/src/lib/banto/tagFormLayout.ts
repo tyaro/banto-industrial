@@ -167,3 +167,15 @@ export function fieldErrorsFromList(
 	}
 	return map;
 }
+
+/** Push tags retain the registry's plc kind; only the UI describes their source. */
+export function displayTagKind(kind: string | undefined, protocol?: string): string {
+	return (kind ?? 'plc') === 'plc' && protocol === 'push' ? 'push' : (kind ?? 'plc');
+}
+
+export function tagKindOptionLabel(
+	option: { value: string; label: string },
+	protocol?: string
+): string {
+	return displayTagKind(option.value, protocol) === 'push' ? 'push（外部取り込み）' : option.label;
+}

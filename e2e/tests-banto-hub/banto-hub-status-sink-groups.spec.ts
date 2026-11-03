@@ -329,3 +329,49 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 		await expect(adminPage.getByRole('button', { name: '新規作成', exact: true })).toBeFocused();
 	});
 });
+
+// #1009: reproduce a stopped broker row alongside the authoritative DB Source
+// runtime. Only status presentation is mocked; real auth, routing and DTO mapping run.
+test('DB Source connection list follows its runtime instead of the PLC broker', async ({
+	page
+}) => {
+	await page.goto('/login');
+	await injectAuthToken(page, await fetchAuthToken(page.request));
+	let dbState = 'connected';
+	await page.route('**/api/status', async (route) => {
+		const response = await route.fetch();
+		const body = await response.json();
+		body.connections.push({
+			id: 987654,
+			name: 'e2e-db-source-status',
+			status: 'stopped',
+			attempt: null
+		});
+		body.dbSource.push({
+			connectionId: 987654,
+			connectionName: 'e2e-db-source-status',
+			state: dbState,
+			lastPollAt: null,
+			lastError: null,
+			consecutiveFailures: 3,
+			restarts: 0,
+			lastRestartReason: null,
+			groups: []
+		});
+		await route.fulfill({ response, json: body });
+	});
+	for (const [state, label, tone] of [
+		['connected', '接続中', 'ok'],
+		['backoff', '再接続待ち', 'warn'],
+		['error', 'エラー', 'bad'],
+		['stopped', '停止中（収集停止）', 'muted'],
+		['disabled', '無効（構成）', 'muted']
+	]) {
+		dbState = state;
+		await page.goto('/status');
+		const row = page.locator('.conn-table tr').filter({ hasText: 'e2e-db-source-status' });
+		await expect(row).toContainText(label);
+		await expect(row).toHaveClass(new RegExp(`(^| )status-${tone}( |$)`));
+		await expect(row.locator('td').nth(2)).toHaveText(state === 'backoff' ? '3' : '-');
+	}
+});
