@@ -31,11 +31,10 @@
 //!
 //! そのほかの規律:
 //!
-//! * 選んだタグのうち catalog に無いもの（Hub から消えた／権限で見えない）
-//!   は `unresolved`、そのままでは購読要求に載せられないもの（名前にカンマを
-//!   含む・空白だけ）は `unsupported` に出し、
-//!   **残りだけで購読する**。1 個の事故で
-//!   購読全体を殺さない・空表示に潰さない。
+//! * 購読要求にはプロトコルで表せる名前をすべて渡す。SDK が現世代の catalog
+//!   に無い名前を部分解決し、アプリは同じスナップショットから `unresolved` と
+//!   値を出す。カンマ入り・空白だけの名前は `unsupported` として先に外す。
+//!   全件未解決でも SDK の `Unbound` を保ち、次の構成変更で再解決を待つ。
 //! * **購読の失敗で [`HubStatus`] の 6 状態を変えない**。接続設定の状態と
 //!   購読の状態は別物で、購読が張れない理由は
 //!   [`HubSubscriptionView::reason`] に出す。
@@ -44,10 +43,9 @@
 //!   これはエラーではなく、理由付きの「停止」として表示する。
 //! * **値が二度と流れない状態を作らない**: 1 本の常駐タスク（supervisor）が
 //!   30 秒ごとに「自力では復帰しない世代」だけを拾って張り直す - 世代が無い
-//!   ／`Unauthorized`／エラーで終了した `Stopped`／`Rebinding`／**要求セットが
-//!   catalog と食い違ったまま待っている `Reconnecting`**（状態名だけでなく
-//!   `last_error` の分類まで見る）。詳しくは
-//!   [`HubService::spawn_supervisor`]。
+//!   ／`Unauthorized`／エラーで終了した `Stopped`／メタデータ不一致で
+//!   backoff まで進んだ `Reconnecting`。タグの解決は SDK が担う。
+//!   詳しくは [`HubService::spawn_supervisor`]。
 //! * **Hub がキーを使えないと言って閉じた理由を落とさない**（#446）:
 //!   `banto-tagclient` は close 1008 の理由（失効・期限切れ・トリップ・
 //!   存在しない・未知）を `Unauthorized` + `last_error` で出す。こちらは
@@ -119,7 +117,7 @@
 //! `block_on`/`block_in_place` は使わない（tauri のコマンドは既に非同期
 //! ランタイム上で走っているため、同じランタイムで待つと panic する）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -134,8 +132,8 @@ use banto_hub_bootstrap::{
     KeyStore,
 };
 use banto_tagclient::{
-    BindingRequest, CatalogSnapshot, CatalogTag, Endpoint, ErrorKind as TagErrorKind,
-    TagClientConnectionState, TagClientHandle, TagClientState, ValueQuality, ValuesSnapshot,
+    BindingRequest, CatalogTag, Endpoint, ErrorKind as TagErrorKind, TagClientConnectionState,
+    TagClientHandle, TagClientState, ValueQuality, ValuesSnapshot,
 };
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -273,6 +271,7 @@ pub struct HubSubscriptionView {
     /// 停止している理由（タグ未選択 / キーリング不可 / 未接続など）。
     /// 世代を持っているときは `None`。
     pub reason: Option<String>,
+    /// SDK が確定した購読対象の件数。スナップショットが無い間は要求件数。
     pub subscribed_count: usize,
     /// 購読の対象として登録されている外部名（#383 段階3 P4: レジストリの
     /// **有効な** hub 接続の下のタグ。収集の有無に関わらず購読する。Hub 接続を
@@ -283,7 +282,7 @@ pub struct HubSubscriptionView {
     /// 見えない）。**空表示に潰さない**。
     pub unresolved: Vec<String>,
     /// そのままでは購読要求に載せられなかった external name（名前にカンマを
-    /// 含む・空白だけ、または他の名前と同じ安定 ID を指す重複）。
+    /// 含む・空白だけ）。
     /// `unresolved` とは**理由が違う**ので混ぜない。
     pub unsupported: Vec<String>,
     /// [`TagClientState::last_error`] の分類名（`ErrorKind::as_str`）。
@@ -303,13 +302,11 @@ pub struct HubSubscriptionView {
 }
 
 impl HubSubscriptionView {
-    /// 世代を持っていないときの形。`unresolved` / `unsupported` は理由と
-    /// 独立に出す。`last_value_at` も残す - 止まっていても「いつまで受けて
-    /// いたか」は有用な情報。
+    /// 世代を持っていないときの形。`unsupported` は理由と独立に出し、
+    /// 止まるまでに値を受けた時刻も残す。
     fn stopped(
         reason: Option<String>,
         registered: Vec<String>,
-        unresolved: Vec<String>,
         unsupported: Vec<String>,
         last_error: Option<TagErrorKind>,
         last_value_at: Option<i64>,
@@ -319,7 +316,7 @@ impl HubSubscriptionView {
             reason,
             subscribed_count: 0,
             registered,
-            unresolved,
+            unresolved: Vec::new(),
             unsupported,
             last_error: last_error.map(|kind| kind.as_str().to_owned()),
             last_value_at,
@@ -495,12 +492,8 @@ const REASON_NOT_CONFIGURED: &str = "Hubへの接続が設定されていませ�
 const REASON_NOT_CONNECTED: &str = "Hubに接続できていないため購読していません。";
 const REASON_NO_TAGS: &str =
     "Hub 経由のタグが登録されていないため購読していません（「タグ設定」の「Hub から追加」で登録します）。";
-const REASON_ALL_UNRESOLVED: &str =
-    "登録したタグがHubのタグ一覧に見つからないため、購読できるタグがありません。";
 const REASON_ALL_UNSUPPORTED: &str =
-    "登録したタグをそのままでは購読できないため（名前が購読プロトコルの制約に合わない、または同じタグを重複して指している）、購読できるタグがありません。";
-const REASON_NONE_SUBSCRIBABLE: &str =
-    "登録したタグはHubのタグ一覧に無いか、そのままでは購読できないため、購読できるタグがありません。";
+    "登録したタグの名前が購読プロトコルの制約に合わないため、購読できるタグがありません。";
 const REASON_NO_KEY: &str =
     "保存済みのAPIキーを取り出せないため購読できません（デスクトップアプリから接続し直してください）。";
 /// キーは取り出せたが Hub に拒否された。[`REASON_NO_KEY`] とは原因も次の
@@ -534,68 +527,32 @@ fn is_unsupported_tag_name(name: &str) -> bool {
     name.trim().is_empty() || name.contains(',')
 }
 
-/// [`plan_bindings`] の結果: 実際に購読する要求と、購読できなかった名前を
-/// **理由別に**分けたもの。`unresolved`（Hub から消えた／権限で見えない）と
-/// `unsupported`（そのままでは購読要求に載せられない）は次の一手が違うので
-/// 混ぜない。
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// 選択された外部名のうち、購読プロトコルに載せられない名前だけを分ける。
+/// SDK には対応する名前をすべて渡し、catalog との突き合わせを任せる。
 struct BindingPlan {
     requests: Vec<BindingRequest>,
-    unresolved: Vec<String>,
     unsupported: Vec<String>,
 }
 
-/// 選択タグ（external name）を catalog と突き合わせ、購読要求・未解決・
-/// 購読不可に分ける**純関数**（ネットワークも状態も触らないので、分岐を
-/// テストで固定できる）。
-///
-/// * `binding_key` は external name をそのまま使う - 画面の一覧と 1:1 に
-///   対応させ、返ってきた値をそのまま行に載せられるようにするため。
-/// * 購読プロトコルが受け付けない綴り（[`is_unsupported_tag_name`]）は
-///   catalog を引く前に `unsupported` へ落とす。catalog にあっても購読は
-///   できないので、「消えた」とは別の事実として扱う。
-/// * 購読の鍵は **external name**（2026-09-30 オーナー決定、
-///   docs/scada-design.md §9.6）。`BindingRequest` は
-///   `{ binding_key: name, external_name: name }` で、`StableTagId` は使わない。
-///   ID は削除→同名再作成で変わるが、名前は Hub の購読契約そのもので変わらない。
-/// * catalog に無い external name は `unresolved` に入れる。
-/// * どちらも**残りだけで購読する**。1 個の事故で購読全体を殺さない。
-/// * 重複する external name はここで 1 つに畳む
-///   （`resolve_bindings`/`start` は重複 `binding_key` / 重複 `external_name`
-///   をエラーにするため、通す前に潰しておく）。
-/// * `requests` が空なら購読しない（`start()` は空 requests を
-///   `InvalidTagSelection` で拒否する）。
-fn plan_bindings(selected: &[String], catalog: &CatalogSnapshot) -> BindingPlan {
-    let by_name: HashMap<&str, &CatalogTag> = catalog
-        .tags
-        .iter()
-        .map(|tag| (tag.external_name.as_str(), tag))
-        .collect();
+fn plan_bindings(selected: &[String]) -> BindingPlan {
     let mut seen: HashSet<&str> = HashSet::with_capacity(selected.len());
     let mut requests = Vec::with_capacity(selected.len());
-    let mut unresolved = Vec::new();
     let mut unsupported = Vec::new();
     for name in selected {
-        // 選択リスト内の同名重複は利用者の入力の話なので、黙って 1 つに畳む。
         if !seen.insert(name.as_str()) {
             continue;
         }
         if is_unsupported_tag_name(name) {
             unsupported.push(name.clone());
-            continue;
-        }
-        if by_name.contains_key(name.as_str()) {
+        } else {
             requests.push(BindingRequest {
                 binding_key: name.clone(),
                 external_name: name.clone(),
             });
-        } else {
-            unresolved.push(name.clone());
         }
     }
     BindingPlan {
         requests,
-        unresolved,
         unsupported,
     }
 }
@@ -732,12 +689,6 @@ struct Generation {
 struct GenerationHealth {
     state: TagClientConnectionState,
     /// 直近の失敗の分類。
-    ///
-    /// **状態名だけでは足りない**（2026-09-17 実機で判明）: `banto-tagclient`
-    /// は同じ `Reconnecting` に「transport の backoff 中」と「**要求セットが
-    /// catalog と食い違ったまま**待ち続けている」の両方を載せる。後者を
-    /// 状態名だけで「backoff の担当だから放置」と扱うと、タグが 1 つ消えた
-    /// だけで購読全体が二度と戻らない。
     last_error: Option<TagErrorKind>,
 }
 
@@ -775,90 +726,22 @@ fn is_terminal(health: GenerationHealth) -> bool {
     }
 }
 
-/// 要求セットと catalog の食い違いが原因で、**待っても直らない**分類か。
-///
-/// `banto-tagclient` はこれらを rebindable として数回やり直すが
-/// （`worker.rs` の `plan_failure`）、**回数を使い切ると `FailurePlan::Backoff`
-/// に落ちる**。`Backoff` は `Reconnecting` + `last_error` を publish するだけ
-/// なので、以後は**古い（存在しないタグを含む）要求セットのまま**永久に
-/// 再試行し続ける。直すには catalog を読み直して**要求を作り直す**しかなく、
-/// それはアプリの仕事（`banto-tagclient` は変更しない）。
-fn needs_replan(kind: TagErrorKind) -> bool {
-    matches!(
-        kind,
-        TagErrorKind::BindingUnresolved
-            | TagErrorKind::RevisionMismatch
-            | TagErrorKind::RuntimeMetadataMismatch
-    )
-}
-
-/// `Reconnecting` のうち、**古い要求セットのまま待ち続けている**ものか。
-///
-/// `Reconnecting` を状態名だけで「`banto-tagclient` の backoff の担当」と
-/// 扱ってはいけない、という唯一の例外。transport 系（`Transport` /
-/// `ProtocolError` / `CatalogUnavailable`）の `Reconnecting` は従来どおり
-/// 放置する - あちらは待てば直るので、割り込むと backoff と喧嘩するだけ。
-///
-/// この状態は**ワーカー自身が「要求セットが catalog と食い違っている」と
-/// 言っている**のだから、同じ要求のまま待たせても直らない。起こすだけでなく
-/// **張り直しても直す**必要がある（[`needs_rebuild`] に入れてある理由）。
-fn waits_on_a_stale_request_set(health: GenerationHealth) -> bool {
+/// SDK の再バインドを使い切って backoff に入ったメタデータ不一致か。
+/// 通信の backoff や未解決の Binding は SDK に任せる。
+fn waits_on_metadata_mismatch(health: GenerationHealth) -> bool {
     health.state == TagClientConnectionState::Reconnecting
-        && health.last_error.is_some_and(needs_replan)
+        && matches!(
+            health.last_error,
+            Some(TagErrorKind::RevisionMismatch | TagErrorKind::RuntimeMetadataMismatch)
+        )
 }
 
-/// この世代は**張り直さないと直らない**か。
-///
-/// [`needs_retry`]（見張りが起こすか）と
-/// [`must_restart_despite_same_fingerprint`]（起こしたあと実際に張り直すか）
-/// が**食い違わない**ように、1 つの述語を両方から使う。片方だけ真だと、
-/// 見張りが catalog を取り直しても同一性一致の早期 return に落ちて何もせず、
-/// ワーカーは壊れたループのまま残る（#383 実機で `Reconnecting` が、
-/// #385 で `Rebinding` が、それぞれこの形で壊れていた）。
-///
-/// * 終端（[`is_terminal`]）… 放っておくと復帰しない。
-/// * `Rebinding` … requests が catalog と合っていない。catalog が変わって
-///   いれば同一性も変わるので張り直されるが、変わらない原因
-///   （`RevisionMismatch` / `RuntimeMetadataMismatch`）だと同一性は同じまま
-///   なので、**ここで明示的に張り直さないと rebind ループから抜けられない**。
+/// 見張りが起こす条件と、同じ fingerprint でも張り直す条件を揃える。
 fn needs_rebuild(health: GenerationHealth) -> bool {
-    is_terminal(health)
-        || health.state == TagClientConnectionState::Rebinding
-        || waits_on_a_stale_request_set(health)
+    is_terminal(health) || waits_on_metadata_mismatch(health)
 }
 
-/// 同一性（[`Fingerprint`]）が一致しているのに、それでも張り直すべきか。
-///
-/// 純関数にしてあるのは、ここが**値が二度と流れない状態を作らない**ための
-/// 判断そのものだから:
-///
-/// * [`Trigger::CredentialsChanged`] … `connect` / `adopt_manual_key` の後。
-///   キーが増えた／差し替わったので、同じ接続先・同じタグでも新しいキーで
-///   張り直さないと意味が無い。
-/// * 現世代が [`needs_rebuild`] … 同一性が同じでも張り直す（ダメならまた
-///   同じ状態になるだけ）。これが無いと、見張りが再試行しても同一性一致で
-///   no-op になり、壊れた世代が居座り続ける。
-///
-/// [`waits_on_a_stale_request_set`] も [`needs_rebuild`] に含む。当初は
-/// 「catalog が変われば同一性も変わるので自然に張り直る」と考えて外していたが、
-/// **それが成り立つのは `BindingUnresolved` だけ**だった:
-///
-/// * `BindingUnresolved`（タグが消えた）… 再計画すると要求セットが変わる →
-///   同一性が変わって張り直る（実機で確認済み）。
-/// * `RevisionMismatch` / `RuntimeMetadataMismatch` … **タグ集合は同じまま**
-///   なので同一性が変わらず、早期 return に落ちて**見張りが 30 秒ごとに
-///   catalog を読むだけ**になる。ワーカーは壊れたループのまま。
-///
-/// ワーカー自身が「要求セットが catalog と食い違っている」と言っている以上、
-/// 同じ要求のまま待たせても直らない。張り直せば catalog を読み直して要求を
-/// 作り直すので、メタデータ不一致の 2 つも回復できる。条件が続く間は
-/// [`SUPERVISOR_INTERVAL`] ごとに張り直すことになるが、**永久に止まっている
-/// よりはよい**（周期で上限が付いている）。
-///
-/// これは [`Fingerprint`] に catalog の `revision` / `run_id` /
-/// `collection_mode` を**含めない**という選択と対になっている: 含めると Hub
-/// 側の無関係な構成変更のたびに購読を切ってしまうので含めず、そのぶん
-/// 「メタデータ不一致で詰まった世代」はこちらで拾って張り直す。
+/// 資格情報が変わったか、現世代が再作成を要するときだけ、同じ要求でも張り直す。
 fn must_restart_despite_same_fingerprint(
     trigger: Trigger,
     health: Option<GenerationHealth>,
@@ -866,17 +749,8 @@ fn must_restart_despite_same_fingerprint(
     trigger == Trigger::CredentialsChanged || health.is_some_and(needs_rebuild)
 }
 
-/// catalog を取り直しても変わらない「落ち着いた停止」か（世代が無いとき）。
-///
-/// 選択が空 / 選んだ名前が全部購読プロトコル非対応、のどちらも Hub 側で
-/// 何が起きても状況は変わらない（次に変わるのは**ユーザーが選び直したとき**
-/// で、それは明示操作の突き合わせが拾う）。ここで見張りを回すと 30 秒ごとに
-/// `GET /api/v1/tags` を撃ち続けるだけになる。
-///
-/// [`REASON_ALL_UNRESOLVED`] は**含めない** - Hub 側にタグが戻れば直るので
-/// 取り直す価値がある。[`REASON_NONE_SUBSCRIBABLE`]（未解決と購読不可の
-/// 混在）も未解決の分は戻り得るので同じ。キーリング不可・再取得失敗・
-/// 未確認も、環境が変われば直るので従来どおり再試行する。
+/// タグ未登録か、全件が購読プロトコル非対応なら、Hub 側が変わっても
+/// 購読できない。登録の変更は明示操作と見張りが別に拾う。
 fn is_settled_without_a_generation(reason: Option<&str>) -> bool {
     reason.is_some_and(|reason| reason == REASON_NO_TAGS || reason == REASON_ALL_UNSUPPORTED)
 }
@@ -888,9 +762,7 @@ fn needs_retry(health: Option<GenerationHealth>, reason: Option<&str>) -> bool {
         // 世代が無い: まだ／もう張れていない。ただし catalog を取り直しても
         // 変わらない理由なら撃たない。
         None => !is_settled_without_a_generation(reason),
-        // 張り直しが要る状態か、`Reconnecting` でも古い要求セットのまま
-        // 待ち続けている状態（再計画でしか直らない）。
-        Some(health) => needs_rebuild(health) || waits_on_a_stale_request_set(health),
+        Some(health) => needs_rebuild(health),
     }
 }
 
@@ -1021,7 +893,7 @@ struct RememberedRejection {
 ///
 /// * 世代が 1008 の分類で止まっている → それを覚える（新しい理由で上書き）。
 ///   対象の資格情報は**その世代を張ったキー**。
-/// * 世代が `Live` → 忘れる（このキーは今は使えている）。
+/// * 世代が `Live` / `Unbound` → 忘れる（このキーは今は使えている）。
 /// * それ以外（進行中・通信系の再試行中など）→ そのまま。
 fn advance_credential_rejection(
     remembered: Option<RememberedRejection>,
@@ -1034,7 +906,13 @@ fn advance_credential_rejection(
             kind,
             credential: generation_credential,
         }),
-        _ if state == TagClientConnectionState::Live => None,
+        _ if matches!(
+            state,
+            TagClientConnectionState::Live | TagClientConnectionState::Unbound
+        ) =>
+        {
+            None
+        }
         _ => remembered,
     }
 }
@@ -1106,17 +984,11 @@ fn credential_rejection_after_status(
 
 /// [`HubService`] が持つ購読スロット。
 ///
-/// 指示書の素案は `Option<Generation>` だったが、**未解決タグと停止理由は
-/// 世代が無いときにこそ画面に出す**必要がある（選んだタグが全部 catalog から
-/// 消えると `requests` が空になり世代を持てないが、そのとき何が消えたのかを
-/// 出さないと「タグ 0 件」に潰れてしまう）。そこで世代と並べて 1 つの
-/// ミューテックスに入れ、両者が食い違わないようにしている。
+/// 未解決の結果は SDK の現世代から、非対応の名前はアプリの要求から出す。
 struct Subscription {
     generation: Option<Generation>,
     /// 世代を持っていない理由。持っているときは `None`。
     reason: Option<String>,
-    /// 直近に catalog と突き合わせた結果の未解決タグ。
-    unresolved: Vec<String>,
     /// 直近の突き合わせで購読プロトコルに弾かれた名前。
     unsupported: Vec<String>,
     /// 最後に観測した [`ValuesSnapshot::t`]（「いつまで値を受けていたか」）。
@@ -1140,7 +1012,7 @@ struct Subscription {
     /// * 覚える: 世代を観測したとき・止めるとき
     ///   （[`advance_credential_rejection`]）、保存中のキーについての REST の
     ///   判定がトリップだったとき（[`settle_credential_rejection`]）。
-    /// * 忘れる: 世代が `Live` になった／保存中の資格情報が入れ替わった・
+    /// * 忘れる: 世代が `Live` / `Unbound` になった／保存中の資格情報が入れ替わった・
     ///   無くなった（最後の検証の成否に関わらない）／保存中のキーについての
     ///   REST の判定が矛盾した。
     /// * **どのキーの話かを必ず添える**（[`RememberedRejection`]）。
@@ -1173,7 +1045,6 @@ impl Default for Subscription {
         Self {
             generation: None,
             reason: Some(REASON_NOT_STARTED.to_owned()),
-            unresolved: Vec::new(),
             unsupported: Vec::new(),
             last_value_at: None,
             last_value_from: None,
@@ -1320,23 +1191,37 @@ impl Subscription {
             return HubSubscriptionView::stopped(
                 self.reason.clone(),
                 self.registered.clone(),
-                self.unresolved.clone(),
                 self.unsupported.clone(),
                 self.credential_rejection.map(|memory| memory.kind),
                 last_value_at,
             );
         };
         let state = generation.states.borrow();
+        let snapshot = state.snapshot();
         HubSubscriptionView {
             state: connection_state_str(state.connection_state()),
             reason: None,
-            subscribed_count: generation.fingerprint.1.len(),
+            subscribed_count: snapshot.map_or(generation.fingerprint.1.len(), |snapshot| {
+                snapshot.resolution.resolved.len()
+            }),
             registered: self.registered.clone(),
-            unresolved: self.unresolved.clone(),
+            unresolved: snapshot
+                .map(|snapshot| {
+                    snapshot
+                        .resolution
+                        .unresolved
+                        .iter()
+                        .map(|binding| binding.external_name.clone())
+                        .collect()
+                })
+                .unwrap_or_default(),
             unsupported: self.unsupported.clone(),
             last_error: state.last_error().map(|kind| kind.as_str().to_owned()),
             last_value_at,
-            values: state.current().map(value_views).unwrap_or_default(),
+            values: snapshot
+                .and_then(|snapshot| snapshot.values.as_deref())
+                .map(value_views)
+                .unwrap_or_default(),
         }
     }
 
@@ -2313,13 +2198,8 @@ impl HubService {
 
     /// 購読の見張りを 1 本だけ起動する（#385 レビュー対応 F1/F2）。
     ///
-    /// **なぜ要るか**: `resume()` は 1 回きりなので、そのとき Hub が落ちて
-    /// いれば購読は二度と張られない。さらに `banto-tagclient` のワーカーは
-    /// 未解決が 1 件でもあると `BindingUnresolved` を返して `Rebinding` を
-    /// 繰り返す（同じ requests で再試行し続ける）ので、**購読中に選んだタグ
-    /// が 1 つ Hub から消えると、残りのタグまで流れなくなる**。どちらも
-    /// 「catalog を読み直して再計画する」ことでしか直らず、それはアプリの
-    /// 仕事（`banto-tagclient` は変更しない）。
+    /// `resume()` は 1 回きりなので、起動時に Hub が落ちていても再試行する。
+    /// 購読開始後の再バインドと部分解決は SDK が担当する。
     ///
     /// **動く条件**（[`SUPERVISOR_INTERVAL`] ごとに評価）: 保存済みレコード
     /// があり、かつ次のいずれか。
@@ -2333,11 +2213,11 @@ impl HubService {
     /// | `Unauthorized`（`last_error` が `KeyRevoked` / `KeyExpired` / `KeyNotFound`）、または世代が無くそれを覚えている | × | #446。**同じキーでは二度と戻らない**。キーの入れ直し（`connect` / `adopt_manual_key`）が [`Trigger::CredentialsChanged`] で張り直す。状態名だけで「`Unauthorized` は ○」と決めない（checklist §5） |
     /// | `Stopped` + `last_error` あり | ○ | ワーカーが retryable でも rebindable でもない分類（`InvalidTagSelection` など）で**終了した**形。世代は残るので「無い」では拾えず、拾わないと永久に止まったまま |
     /// | `Stopped` + `last_error` 無し | × | 張った直後の初期状態（すぐ `Connecting` へ移る）。終端扱いにすると張った直後の `status()` で張り直してしまう |
-    /// | `Rebinding` | ○ | requests が catalog と合っていない。**再計画でしか直らない** |
+    /// | `Rebinding` / `Unbound` | × | SDK が catalog と再解決を管理する |
     /// | `Live` | × | 正常。触る理由が無い |
     /// | `Connecting` / `Handshaking` | × | 進行中。割り込むと無駄に張り直す |
-    /// | `Reconnecting`（`last_error` が `BindingUnresolved` / `RevisionMismatch` / `RuntimeMetadataMismatch`） | ○ | **一律放置ではない**。`banto-tagclient` は再バインドの回数を使い切ると `Backoff`（= `Reconnecting`）へ落ち、**古い要求セットのまま**永久に再試行する。catalog を読み直して要求を作り直すしかない（2026-09-17 実機: 選択中のタグを 1 つ消したら購読全体が戻らなくなった） |
-    /// | `Reconnecting`（transport 系） | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
+    /// | `Reconnecting`（メタデータ不一致） | ○ | 再バインドの回数を使い切った世代を張り直す |
+    /// | `Reconnecting`（それ以外） | × | **`banto-tagclient` 側の backoff の仕事**。ここで `stop → start` すると backoff と喧嘩し、再接続を遅らせるか Hub を叩く回数を増やすだけ |
     ///
     /// 起こす（[`needs_retry`]）と実際に張り直す
     /// （[`must_restart_despite_same_fingerprint`]）は同じ述語
@@ -2592,7 +2472,7 @@ impl HubService {
 
     /// 「未設定」の応答。記録が無い以上、購読も持てないので世代を落とす。
     async fn not_configured_view(&self) -> HubView {
-        self.reconcile_with(&HubStatus::NotConfigured, None, Trigger::Observe)
+        self.reconcile_with(&HubStatus::NotConfigured, Trigger::Observe)
             .await;
         HubView::new(
             HubStatus::NotConfigured,
@@ -2626,7 +2506,7 @@ impl HubService {
     /// | 状況                                                      | 世代                                            |
     /// | --------------------------------------------------------- | ----------------------------------------------- |
     /// | `Connected` 以外                                          | 落とす（理由を出す）                            |
-    /// | `Connected` だが購読要求が空                              | 落とす（**異常ではない**。理由と未解決/購読不可を出す） |
+    /// | `Connected` だが購読要求が空                              | 落とす（**異常ではない**。理由と購読不可の名前を出す） |
     /// | `Connected` で同一性が一致 かつ `Observe` かつ現世代が `Unauthorized` でない | **何もしない**                |
     /// | `Connected` で同一性が一致 だが [`Trigger::CredentialsChanged`] | 張り直す（新しいキーを使う）               |
     /// | `Connected` で同一性が一致 だが現世代が `Unauthorized`    | 張り直す（キーリングが更新されているかもしれない） |
@@ -2639,7 +2519,6 @@ impl HubService {
     async fn reconcile(&self, call: &HubCall, trigger: Trigger) {
         self.reconcile_with_reason(
             &call.connection.status,
-            call.connection.catalog.as_ref(),
             trigger,
             call.reason_override.as_deref(),
             call.connection.judged,
@@ -2648,15 +2527,9 @@ impl HubService {
     }
 
     /// [`Self::reconcile`] の本体。`HubConnection` を組み立てられない経路
-    /// （未設定・切断直後）からも同じ判断を通せるように、状態と catalog を
-    /// 直接受ける。
-    async fn reconcile_with(
-        &self,
-        status: &HubStatus,
-        catalog: Option<&CatalogSnapshot>,
-        trigger: Trigger,
-    ) {
-        self.reconcile_with_reason(status, catalog, trigger, None, None)
+    /// （未設定・切断直後）からも、接続状態だけで同じ判断を通せるようにする。
+    async fn reconcile_with(&self, status: &HubStatus, trigger: Trigger) {
+        self.reconcile_with_reason(status, trigger, None, None)
             .await;
     }
 
@@ -2667,7 +2540,7 @@ impl HubService {
     /// `Unreachable` に丸めた結果「Hubに接続できていないため購読していません」
     /// だけが出ると、**15 秒で打ち切ったという事実**が消えてしまうため。
     ///
-    /// 世代を張れる（`Connected` + catalog あり）経路では使われない: そこは
+    /// 世代を張れる（`Connected`）経路では使われない: そこは
     /// 購読が成立しているので、打ち切りの話はもう関係ない。
     ///
     /// `judged` はこの往復の判定の対象になった資格情報（#446、
@@ -2679,7 +2552,6 @@ impl HubService {
     async fn reconcile_with_reason(
         &self,
         status: &HubStatus,
-        catalog: Option<&CatalogSnapshot>,
         trigger: Trigger,
         reason_override: Option<&str>,
         judged: Option<CredentialIdentity>,
@@ -2692,7 +2564,7 @@ impl HubService {
                 return;
             }
         }
-        self.reconcile_generation(status, catalog, trigger, reason_override)
+        self.reconcile_generation(status, trigger, reason_override)
             .await;
         // 世代の停止（`stop` は止める前に観測する）で覚えた理由も含めて、
         // 最後に「今保存している資格情報」と「この往復の判定」で直す。操作
@@ -2712,7 +2584,6 @@ impl HubService {
     async fn reconcile_generation(
         &self,
         status: &HubStatus,
-        catalog: Option<&CatalogSnapshot>,
         trigger: Trigger,
         reason_override: Option<&str>,
     ) {
@@ -2734,15 +2605,9 @@ impl HubService {
         // ／無くなったなら捨てる。世代を張る前に決める。
         slot.retain_last_value_for(identity.as_ref());
 
-        // 1. 接続できていない / catalog を読めていない: 世代は持てない。
-        //    未解決タグは catalog と突き合わせて初めて分かるものなので、
-        //    ここでは伏せて（空にして）理由の方を出す - 古い判定を残して
-        //    「今も消えている」と誤読させない。購読不可の名前は catalog に
-        //    依らないので、こちらは残しても嘘にならない - が、対になる
-        //    未解決を消す以上まとめて伏せ、次の突き合わせで作り直す。
-        let (Some(record), HubStatus::Connected { .. }, Some(catalog)) = (record, status, catalog)
-        else {
-            slot.unresolved.clear();
+        // 1. 接続を確認できていなければ世代は持たない。未解決の結果も
+        //    SDK の世代と一緒に消え、停止理由を出す。
+        let (Some(record), HubStatus::Connected { .. }) = (record, status) else {
             slot.unsupported.clear();
             let reason = match (reason_override, status) {
                 (Some(reason), _) => reason.to_owned(),
@@ -2767,20 +2632,15 @@ impl HubService {
             return;
         };
 
-        // 2. 未解決タグ・購読できない名前は世代の有無に関わらず画面に出す。
-        //    購読するのは登録済みのタグと収集の需要の和集合（#383 段階3 P4）。
-        let plan = plan_bindings(
-            &wanted_tags(&slot.registered, &slot.collect_demand),
-            catalog,
-        );
-        slot.unresolved = plan.unresolved;
+        // 2. 購読するのは登録済みのタグと収集の需要の和集合（#383 段階3 P4）。
+        //    プロトコルで表せる要求は未解決でも SDK に渡す。
+        let plan = plan_bindings(&wanted_tags(&slot.registered, &slot.collect_demand));
         slot.unsupported = plan.unsupported;
         if plan.requests.is_empty() {
-            let reason = match (slot.unresolved.is_empty(), slot.unsupported.is_empty()) {
-                (true, true) => REASON_NO_TAGS,
-                (false, true) => REASON_ALL_UNRESOLVED,
-                (true, false) => REASON_ALL_UNSUPPORTED,
-                (false, false) => REASON_NONE_SUBSCRIBABLE,
+            let reason = if slot.unsupported.is_empty() {
+                REASON_NO_TAGS
+            } else {
+                REASON_ALL_UNSUPPORTED
             };
             slot.stop(Some(reason.to_owned())).await;
             return;
@@ -3026,6 +2886,7 @@ fn generate_installation_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    use banto_tagclient::CatalogSnapshot;
     use banto_tagclient::{StableTagId, ValueEntry, ValueSource};
 
     use super::*;
@@ -3782,147 +3643,30 @@ mod tests {
     }
 
     #[test]
-    fn plan_bindings_resolves_everything_when_the_catalog_still_has_it() {
-        let plan = plan_bindings(&owned(&["a", "b"]), &catalog(&["a", "b", "c"]));
-        assert_eq!(
-            plan.requests
-                .iter()
-                .map(|request| request.binding_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "b"],
-            "binding_key は external name そのまま（画面と 1:1）"
-        );
-        assert!(plan.unresolved.is_empty());
-    }
-
-    #[test]
-    fn plan_bindings_subscribes_to_the_rest_when_one_tag_vanished() {
-        let plan = plan_bindings(&owned(&["a", "gone", "b"]), &catalog(&["a", "b"]));
-        assert_eq!(plan.requests.len(), 2, "1 個消えただけで全部止めない");
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-    }
-
-    #[test]
-    fn plan_bindings_reports_every_missing_tag_instead_of_an_empty_list() {
-        let plan = plan_bindings(&owned(&["gone1", "gone2"]), &catalog(&["a"]));
-        assert!(
-            plan.requests.is_empty(),
-            "購読できるものが無ければ start しない"
-        );
-        assert_eq!(
-            plan.unresolved,
-            owned(&["gone1", "gone2"]),
-            "未解決を空表示に潰さない"
-        );
-    }
-
-    #[test]
-    fn plan_bindings_folds_duplicates_so_start_is_not_rejected() {
-        // `start()` は重複 binding_key / 重複 stable_id を拒否するので、
-        // ここで畳んでおかないと購読そのものが立ち上がらない。
-        let plan = plan_bindings(&owned(&["a", "a", "gone", "gone"]), &catalog(&["a"]));
-        assert_eq!(plan.requests.len(), 1);
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-    }
-
-    #[test]
-    fn plan_bindings_on_an_empty_selection_is_empty_but_not_an_error() {
-        let plan = plan_bindings(&[], &catalog(&["a"]));
-        assert!(plan.requests.is_empty());
-        assert!(plan.unresolved.is_empty());
-        assert!(plan.unsupported.is_empty());
-    }
-
-    /// 購読プロトコルはタグ名をカンマ区切りで並べるので、名前にカンマを
-    /// 含められない。1 件混ざるとワーカーが毎回 `InvalidTagSelection` で
-    /// 失敗し**購読全体が死ぬ**ので、先に落として残りを購読する。
-    #[test]
-    fn plan_bindings_separates_names_the_subscription_protocol_cannot_carry() {
-        let plan = plan_bindings(
-            &owned(&["a", "bad,name", "   ", "b"]),
-            &catalog(&["a", "b", "bad,name", "   "]),
-        );
-        assert_eq!(
-            plan.requests
-                .iter()
-                .map(|request| request.binding_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a", "b"],
-            "購読できる残りはそのまま購読する"
-        );
-        assert_eq!(
-            plan.unsupported,
-            owned(&["bad,name", "   "]),
-            "カンマ入りと空白だけの名前は購読不可として分けて出す"
-        );
-        assert!(
-            plan.unresolved.is_empty(),
-            "catalog にあるのだから「消えた」ではない - 理由が違うものを混ぜない"
-        );
-    }
-
-    /// 購読の鍵は external name。別々の名前が（Hub 側の不整合で）同じ
-    /// `StableTagId` を指していても、ID は購読に使わないので**両方とも購読する**。
-    #[test]
-    fn plan_bindings_keys_the_subscription_by_external_name_not_by_stable_id() {
-        let ids = StableTagId::new(1, 1, 1);
-        let duplicated = CatalogSnapshot {
-            tags: vec![catalog_tag("alpha", ids), catalog_tag("beta", ids)],
-            ..catalog(&[])
-        };
-
-        let plan = plan_bindings(&owned(&["alpha", "beta"]), &duplicated);
-
+    fn plan_bindings_passes_every_distinct_supported_name_to_the_sdk() {
+        let plan = plan_bindings(&owned(&[
+            "a", "a", "missing", "bad,name", "   ", "bad,name",
+        ]));
         assert_eq!(
             plan.requests,
-            vec![
+            [
                 BindingRequest {
-                    binding_key: "alpha".into(),
-                    external_name: "alpha".into(),
+                    binding_key: "a".into(),
+                    external_name: "a".into(),
                 },
                 BindingRequest {
-                    binding_key: "beta".into(),
-                    external_name: "beta".into(),
+                    binding_key: "missing".into(),
+                    external_name: "missing".into(),
                 },
-            ]
+            ],
         );
-        assert!(plan.unsupported.is_empty());
-        assert!(plan.unresolved.is_empty());
+        assert_eq!(plan.unsupported, owned(&["bad,name", "   "]));
     }
 
     #[test]
-    fn plan_bindings_keeps_unsupported_and_unresolved_apart() {
-        let plan = plan_bindings(&owned(&["a,b", "gone", "ok"]), &catalog(&["ok"]));
-        assert_eq!(plan.requests.len(), 1);
-        assert_eq!(plan.unsupported, owned(&["a,b"]));
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-    }
-
-    /// Hub 側でタグを消して**同じ名前で作り直す**と `StableTagId` は変わるが、
-    /// SDK は名前で購読・再バインドする（2026-09-30 オーナー決定、
-    /// docs/scada-design.md §9.6）ので、fingerprint は変わらず張り直しも不要。
-    /// 旧設計（ID を含める）で必要だった Copilot F4 の対策は要らなくなった。
-    #[test]
-    fn the_fingerprint_does_not_change_when_a_tag_is_recreated_under_the_same_name() {
-        let before = plan_bindings(&owned(&["a"]), &catalog(&["a"]));
-        let recreated = CatalogSnapshot {
-            tags: vec![catalog_tag("a", StableTagId::new(1, 1, 99))],
-            ..catalog(&["a"])
-        };
-        let after = plan_bindings(&owned(&["a"]), &recreated);
-
-        assert_eq!(
-            fingerprint_tags(&before.requests),
-            fingerprint_tags(&after.requests),
-            "同名なら ID が変わっても同じ世代（SDK が名前で解決し直す）"
-        );
-        assert_eq!(fingerprint_tags(&after.requests), owned(&["a"]));
-    }
-
-    #[test]
-    fn the_fingerprint_tag_order_does_not_depend_on_the_selection_order() {
-        let one = plan_bindings(&owned(&["b", "a"]), &catalog(&["a", "b"]));
-        let other = plan_bindings(&owned(&["a", "b"]), &catalog(&["a", "b"]));
+    fn fingerprint_ignores_request_order() {
+        let one = plan_bindings(&owned(&["b", "a"]));
+        let other = plan_bindings(&owned(&["a", "b"]));
         assert_eq!(
             fingerprint_tags(&one.requests),
             fingerprint_tags(&other.requests)
@@ -3973,10 +3717,6 @@ mod tests {
             "エラーで終了した世代は残っていても張り直す"
         );
         assert!(
-            must_restart_despite_same_fingerprint(Trigger::Observe, healthy(State::Rebinding)),
-            "catalog が変わらない原因の rebind ループは、起こすだけでは抜けられない"
-        );
-        assert!(
             must_restart_despite_same_fingerprint(
                 Trigger::Observe,
                 failing(State::Reconnecting, TagErrorKind::RevisionMismatch)
@@ -3992,6 +3732,8 @@ mod tests {
             healthy(State::Live),
             healthy(State::Connecting),
             healthy(State::Handshaking),
+            healthy(State::Rebinding),
+            healthy(State::Unbound),
             healthy(State::Reconnecting),
         ] {
             assert!(!must_restart_despite_same_fingerprint(
@@ -4022,6 +3764,7 @@ mod tests {
             State::Handshaking,
             State::Live,
             State::Rebinding,
+            State::Unbound,
             State::Reconnecting,
             State::Unauthorized,
         ] {
@@ -4362,11 +4105,13 @@ mod tests {
                 ),
                 remembered(kind, k2)
             );
-            // 受信できたら忘れる。
-            assert_eq!(
-                advance_credential_rejection(remembered(kind, k1), State::Live, None, Some(k1)),
-                None
-            );
+            // 有効なキーで新しい世代が確立したら忘れる。
+            for state in [State::Live, State::Unbound] {
+                assert_eq!(
+                    advance_credential_rejection(remembered(kind, k1), state, None, Some(k1)),
+                    None
+                );
+            }
             // 進行中・通信系の再試行中・理由無しの 401/403 では、覚えたまま。
             for (state, last_error) in [
                 (State::Stopped, None),
@@ -4530,7 +4275,7 @@ mod tests {
         }
         // 突き合わせは世代を持てない分岐でも旗を降ろす（待っても直らない
         // 状態で見張りに Hub を叩かせ続けない）。
-        hub.reconcile_with(&HubStatus::NotConfigured, None, Trigger::Observe)
+        hub.reconcile_with(&HubStatus::NotConfigured, Trigger::Observe)
             .await;
         assert!(!hub.inner.subscription.lock().await.demand_pending);
 
@@ -4717,12 +4462,8 @@ mod tests {
         hub.inner
             .mirror
             .reset(Some(keyring_record(&closed_endpoint(), &["a"])));
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
         assert!(
             generation_sequence(&hub).await.is_none(),
             "選択だけでは張らない"
@@ -4732,12 +4473,8 @@ mod tests {
         assert!(view.registered.is_empty());
 
         register_for_test(&hub, &["a"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
         assert!(generation_sequence(&hub).await.is_some(), "登録したら張る");
         let view = hub.subscription().await;
         assert_eq!(view.registered, owned(&["a"]));
@@ -4973,12 +4710,8 @@ mod tests {
     #[tokio::test]
     async fn disconnecting_forgets_the_last_value_time() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["alpha"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["alpha"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
         hub.inner.subscription.lock().await.last_value_at = Some(1_234);
         assert_eq!(hub.subscription().await.last_value_at, Some(1_234));
 
@@ -5001,17 +4734,13 @@ mod tests {
         ] {
             let changed = keyring_record(endpoint, &[]);
             let (_settings, hub) = service_with_keyring("http://127.0.0.1:3100", &["alpha"]).await;
-            hub.reconcile_with(
-                &HubStatus::Connected { tag_count: 1 },
-                Some(&catalog(&["alpha"])),
-                Trigger::Observe,
-            )
-            .await;
+            hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+                .await;
             hub.inner.subscription.lock().await.last_value_at = Some(1_234);
 
             hub.inner.mirror.reset(Some(changed));
             register_for_test(&hub, &registered).await;
-            hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+            hub.reconcile_with(&HubStatus::AuthFailed, Trigger::Observe)
                 .await;
 
             assert_eq!(
@@ -5027,12 +4756,8 @@ mod tests {
     #[tokio::test]
     async fn the_view_reports_the_remembered_last_value_time_outside_live() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
 
         // 到達不能な接続先なので世代は `Live` にならない＝`current()` は
         // `None`。Live の間に観測したことにして覚えさせる。
@@ -5048,7 +4773,7 @@ mod tests {
         );
 
         // 世代を止めても「いつまで受けていたか」は残す。
-        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+        hub.reconcile_with(&HubStatus::AuthFailed, Trigger::Observe)
             .await;
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
@@ -5071,12 +4796,13 @@ mod tests {
             needs_retry(failed(State::Stopped), None),
             "エラーで終了した世代は自力で復帰しない"
         );
-        assert!(needs_retry(healthy(State::Rebinding), None));
         for health in [
             healthy(State::Stopped),
             healthy(State::Live),
             healthy(State::Connecting),
             healthy(State::Handshaking),
+            healthy(State::Rebinding),
+            healthy(State::Unbound),
             healthy(State::Reconnecting),
         ] {
             assert!(
@@ -5086,60 +4812,24 @@ mod tests {
         }
     }
 
-    /// **`Reconnecting` は一律放置ではない**（2026-09-17 実機で判明）。
-    ///
-    /// `banto-tagclient` は再バインドの回数を使い切ると `Backoff`（=
-    /// `Reconnecting`）へ落ち、**古い要求セットのまま**永久に再試行する。
-    /// 選択中のタグを 1 つ消すとこれに入り、残りのタグまで流れなくなる。
-    /// 状態名が同じでも**分類で分ける**。
     #[test]
-    fn a_reconnecting_generation_is_replanned_only_for_a_stale_request_set() {
+    fn only_metadata_mismatch_backoff_is_rebuilt() {
         use TagClientConnectionState as State;
 
-        // 要求セットと catalog の食い違い = 待っても直らない。起こして、
-        // **同一性が同じでも張り直す** - `RevisionMismatch` /
-        // `RuntimeMetadataMismatch` はタグ集合が変わらないので、張り直さないと
-        // 見張りが 30 秒ごとに catalog を読むだけになる（#388）。
         for kind in [
-            TagErrorKind::BindingUnresolved,
             TagErrorKind::RevisionMismatch,
             TagErrorKind::RuntimeMetadataMismatch,
         ] {
-            let health = failing(State::Reconnecting, kind);
-            assert!(
-                needs_retry(health, None),
-                "{} は再計画でしか直らない",
-                kind.as_str()
-            );
-            assert!(
-                must_restart_despite_same_fingerprint(Trigger::Observe, health),
-                "{} は同一性が同じでも張り直す",
-                kind.as_str()
-            );
+            assert!(needs_retry(failing(State::Reconnecting, kind), None));
+            assert!(!needs_retry(failing(State::Rebinding, kind), None));
         }
-        // 通信系 = 待てば直る。`banto-tagclient` の backoff に任せる。
         for kind in [
+            TagErrorKind::BindingUnresolved,
             TagErrorKind::Transport,
             TagErrorKind::ProtocolError,
             TagErrorKind::CatalogUnavailable,
         ] {
-            let health = failing(State::Reconnecting, kind);
-            assert!(
-                !needs_retry(health, None),
-                "{} は backoff の担当。割り込むと再接続を遅らせるだけ",
-                kind.as_str()
-            );
-            assert!(
-                !must_restart_despite_same_fingerprint(Trigger::Observe, health),
-                "{} で張り直すと backoff と喧嘩する",
-                kind.as_str()
-            );
-        }
-        // 進行中の他の状態は分類を問わず放置（そちらは前に進んでいる）。
-        for state in [State::Connecting, State::Handshaking, State::Live] {
-            for kind in [TagErrorKind::BindingUnresolved, TagErrorKind::Transport] {
-                assert!(!needs_retry(failing(state, kind), None), "{state}");
-            }
+            assert!(!needs_retry(failing(State::Reconnecting, kind), None));
         }
     }
 
@@ -5155,8 +4845,6 @@ mod tests {
             );
         }
         for reason in [
-            REASON_ALL_UNRESOLVED,
-            REASON_NONE_SUBSCRIBABLE,
             REASON_NO_KEY,
             REASON_NOT_CONNECTED,
             REASON_NOT_CONFIGURED,
@@ -5203,20 +4891,15 @@ mod tests {
         hub.hydrate().await.unwrap();
         register_for_test(&hub, &["a", "gone"]).await;
 
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
 
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
         assert_eq!(view.subscribed_count, 0);
-        assert_eq!(
-            view.unresolved,
-            owned(&["gone"]),
-            "世代を持てなくても未解決タグは出す"
+        assert!(
+            view.unresolved.is_empty(),
+            "SDK の世代が無ければ判定は出さない"
         );
         assert!(view.reason.is_some(), "停止している理由を必ず出す");
         assert!(view.values.is_empty());
@@ -5226,71 +4909,6 @@ mod tests {
             .await
             .unwrap()
             .is_some_and(|raw| !raw.is_empty()));
-    }
-
-    /// 選択が全部 catalog から消えた状態。**異常ではない**ので理由付きで
-    /// 止まり、消えたタグを一覧に出す。
-    #[tokio::test]
-    async fn reconcile_with_only_unresolved_tags_stops_with_a_reason_and_lists_them() {
-        let (_settings, hub) = service().await;
-        hub.inner.mirror.reset(Some(HubRecord {
-            endpoint: "http://127.0.0.1:3100".to_owned(),
-            installation_id: "inst".to_owned(),
-            key_id: None,
-            key_name: None,
-            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
-            selected_tags: owned(&["gone1", "gone2"]),
-        }));
-        register_for_test(&hub, &["gone1", "gone2"]).await;
-
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
-
-        let view = hub.subscription().await;
-        assert_eq!(view.state, "stopped");
-        assert_eq!(view.unresolved, owned(&["gone1", "gone2"]));
-        assert_eq!(view.reason.as_deref(), Some(REASON_ALL_UNRESOLVED));
-    }
-
-    /// catalog を読めていない状態では未解決の判定ができないので、古い判定を
-    /// 残さず理由の方を出す（「今も消えている」と誤読させない）。
-    #[tokio::test]
-    async fn reconcile_when_disconnected_reports_the_reason_not_a_stale_unresolved_list() {
-        let (_settings, hub) = service().await;
-        hub.inner.mirror.reset(Some(HubRecord {
-            endpoint: "http://127.0.0.1:3100".to_owned(),
-            installation_id: "inst".to_owned(),
-            key_id: None,
-            key_name: None,
-            keyring_account: "hub:127.0.0.1:3100/:inst".to_owned(),
-            selected_tags: owned(&["gone"]),
-        }));
-        register_for_test(&hub, &["gone"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 0 },
-            Some(&catalog(&[])),
-            Trigger::Observe,
-        )
-        .await;
-        assert_eq!(hub.subscription().await.unresolved, owned(&["gone"]));
-
-        hub.reconcile_with(
-            &HubStatus::Unreachable {
-                cause: banto_hub_bootstrap::UnreachableCause::Transport,
-            },
-            None,
-            Trigger::Observe,
-        )
-        .await;
-
-        let view = hub.subscription().await;
-        assert_eq!(view.state, "stopped");
-        assert!(view.unresolved.is_empty());
-        assert_eq!(view.reason.as_deref(), Some(REASON_NOT_CONNECTED));
     }
 
     /// `AuthFailed` は「キーがそもそも無い」と「キーが拒否された」の両方で
@@ -5311,7 +4929,7 @@ mod tests {
         }));
         register_for_test(&hub, &["a"]).await;
 
-        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+        hub.reconcile_with(&HubStatus::AuthFailed, Trigger::Observe)
             .await;
 
         let view = hub.subscription().await;
@@ -5325,7 +4943,7 @@ mod tests {
     async fn auth_failed_with_a_stored_key_says_the_key_was_rejected() {
         let (_settings, hub) = service_with_keyring("http://127.0.0.1:3100", &["a"]).await;
 
-        hub.reconcile_with(&HubStatus::AuthFailed, None, Trigger::Observe)
+        hub.reconcile_with(&HubStatus::AuthFailed, Trigger::Observe)
             .await;
 
         let view = hub.subscription().await;
@@ -5348,12 +4966,8 @@ mod tests {
         }));
         register_for_test(&hub, &["a,b"]).await;
 
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a,b"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
 
         let view = hub.subscription().await;
         assert_eq!(view.state, "stopped");
@@ -5402,6 +5016,7 @@ mod tests {
             rest_script: StdMutex<std::collections::VecDeque<(u16, String)>>,
             /// 開いている WS をこの close コードと理由文で閉じる合図（#446）。
             close: tokio::sync::watch::Sender<Option<(u16, String)>>,
+            config_changed: tokio::sync::watch::Sender<u64>,
         }
 
         impl Default for MockHub {
@@ -5413,6 +5028,7 @@ mod tests {
                     rest_status: StdMutex::new((200, String::new())),
                     rest_script: StdMutex::default(),
                     close: tokio::sync::watch::channel(None).0,
+                    config_changed: tokio::sync::watch::channel(0).0,
                 }
             }
         }
@@ -5502,17 +5118,21 @@ mod tests {
                     // 新しい WS を閉じない）。
                     let mut close = hub.close.subscribe();
                     close.mark_unchanged();
+                    let mut config_changed = hub.config_changed.subscribe();
+                    config_changed.mark_unchanged();
                     tokio::spawn(async move {
                         let Ok(mut socket) = accept_async(stream).await else {
                             return;
                         };
-                        let subscribe =
-                            tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
-                        if !matches!(subscribe, Ok(Some(Ok(Message::Text(_))))) {
-                            return;
-                        }
-                        if socket.send(Message::Text(frame.into())).await.is_err() {
-                            return;
+                        // Unbound は subscribe を送らず、config_changed を待つ。
+                        if !frame.is_empty() {
+                            let subscribe =
+                                tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
+                            if !matches!(subscribe, Ok(Some(Ok(Message::Text(_)))))
+                                || socket.send(Message::Text(frame.into())).await.is_err()
+                            {
+                                return;
+                            }
                         }
                         // 閉じるまで開けたままにし、close には close で返す
                         // （`shutdown()` が待たされないように）。
@@ -5523,9 +5143,26 @@ mod tests {
                                         let _ = socket.send(Message::Close(reply)).await;
                                         break;
                                     }
+                                    Some(Ok(Message::Text(text))) if text == r#"{"op":"ping"}"# => {
+                                        if socket.send(Message::Text(r#"{"op":"pong"}"#.into())).await.is_err() {
+                                            break;
+                                        }
+                                    }
                                     Some(Ok(_)) => {}
                                     _ => break,
                                 },
+                                changed = config_changed.changed() => {
+                                    if changed.is_err() {
+                                        break;
+                                    }
+                                    let revision = *config_changed.borrow_and_update();
+                                    let frame = format!(
+                                        r#"{{"op":"config_changed","revision":{revision}}}"#
+                                    );
+                                    if socket.send(Message::Text(frame.into())).await.is_err() {
+                                        break;
+                                    }
+                                }
                                 changed = close.changed() => {
                                     if changed.is_err() {
                                         break;
@@ -5690,12 +5327,8 @@ mod tests {
             let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
 
             let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
-            hub.reconcile_with(
-                &HubStatus::Connected { tag_count: 2 },
-                Some(&catalog),
-                Trigger::Observe,
-            )
-            .await;
+            hub.reconcile_with(&HubStatus::Connected { tag_count: 2 }, Trigger::Observe)
+                .await;
             wait_live(&hub).await;
 
             let view = hub.subscription().await;
@@ -5799,74 +5432,103 @@ mod tests {
             server.abort();
         }
 
-        /// **選択中のタグが Hub から消えても、残りのタグで購読し直せること**
-        /// （2026-09-17 実機で壊れていた経路の出口側）。
-        ///
-        /// 見張りが「古い要求セットのまま `Reconnecting`」を起こす判断は
-        /// `a_reconnecting_generation_is_replanned_only_for_a_stale_request_set`
-        /// が固める。こちらは起こしたあとの**再計画 → 残りのタグで live に
-        /// 戻る → 消えた名前が `unresolved` に出る**ところを、実際に値が流れる
-        /// 経路で固める。
+        /// #682: SDK が config_changed から再解決し、同じハンドルで
+        /// 部分解決・全件未解決・同名再作成を扱う。
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn a_deleted_tag_is_replanned_and_the_rest_keeps_flowing() {
+        async fn the_sdk_rebinds_partial_and_unbound_subscriptions_without_restarting_the_handle() {
             let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
             let endpoint = format!("http://{}", listener.local_addr().unwrap());
-            let both = catalog(&["alpha", "beta"]);
-
             let mock = Arc::new(MockHub::default());
+            let initial_catalog = catalog(&["alpha", "beta"]);
             mock.set(
-                &both,
+                &initial_catalog,
                 &values_of(
-                    &both,
+                    &initial_catalog,
                     vec![
-                        entry("alpha", 1.0, ValueQuality::Good, ValueSource::Real),
-                        entry("beta", 2.0, ValueQuality::Good, ValueSource::Real),
+                        entry("alpha", 10.0, ValueQuality::Good, ValueSource::Real),
+                        entry("beta", 20.0, ValueQuality::Good, ValueSource::Real),
                     ],
                 ),
                 data_frame("alpha", 10.0, "good"),
             );
             let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
-
-            let (_settings, hub) = service_with_keyring(&endpoint, &["alpha", "beta"]).await;
-            hub.reconcile_with(
-                &HubStatus::Connected { tag_count: 2 },
-                Some(&both),
-                Trigger::Observe,
-            )
-            .await;
+            let (_settings, hub) =
+                service_with_keyring(&endpoint, &["alpha", "beta", "bad,name"]).await;
+            hub.reconcile_with(&HubStatus::Connected { tag_count: 2 }, Trigger::Observe)
+                .await;
             wait_live(&hub).await;
-            assert_eq!(hub.subscription().await.subscribed_count, 2);
-
-            // Hub 側で `beta` を削除する。
-            let only_alpha = CatalogSnapshot {
-                tags: both.tags.iter().take(1).cloned().collect(),
-                ..both.clone()
+            let first = generation_sequence(&hub).await;
+            let mut states = {
+                let slot = hub.inner.subscription.lock().await;
+                slot.generation.as_ref().unwrap().states.clone()
             };
-            mock.set(
-                &only_alpha,
-                &values_of(
-                    &only_alpha,
-                    vec![entry("alpha", 11.0, ValueQuality::Good, ValueSource::Real)],
-                ),
-                data_frame("alpha", 11.0, "good"),
-            );
+            assert_eq!(hub.subscription().await.subscribed_count, 2);
+            let sampler = hub.collect_source();
 
-            // 見張りが起こしたあとにやること = catalog を読み直して突き合わせ。
-            hub.refresh_catalog().await.unwrap();
-            wait_live(&hub).await;
+            for (revision, names, expected_unresolved) in [
+                (2, &["alpha"][..], &["beta"][..]),
+                (3, &[][..], &["alpha", "beta"][..]),
+                (4, &["alpha", "beta"][..], &[][..]),
+            ] {
+                // 再作成したタグは同名でも別 ID。購読は外部名で解決し直す。
+                let next = CatalogSnapshot {
+                    revision,
+                    tags: names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            catalog_tag(
+                                name,
+                                StableTagId::new(1, 1, revision as i64 * 10 + i as i64),
+                            )
+                        })
+                        .collect(),
+                    ..catalog(&[])
+                };
+                let values = names
+                    .iter()
+                    .map(|name| entry(name, 11.0, ValueQuality::Good, ValueSource::Real))
+                    .collect();
+                let frame = names
+                    .first()
+                    .map_or_else(String::new, |name| data_frame(name, 11.0, "good"));
+                mock.set(&next, &values_of(&next, values), frame);
+                mock.config_changed.send_replace(revision);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    loop {
+                        if states
+                            .borrow_and_update()
+                            .snapshot()
+                            .is_some_and(|snapshot| snapshot.revision() == revision)
+                        {
+                            break;
+                        }
+                        states.changed().await.unwrap();
+                    }
+                })
+                .await
+                .expect("SDK が同じハンドルで次の世代を確立する");
 
-            let view = hub.subscription().await;
-            assert_eq!(view.state, "live", "残りのタグで live に戻る");
-            assert_eq!(view.subscribed_count, 1);
-            assert_eq!(
-                view.unresolved,
-                owned(&["beta"]),
-                "消えた名前は黙って落とさず一覧に出す"
-            );
-            let received = sorted_values(&hub).await;
-            assert_eq!(received.len(), 1);
-            assert_eq!(received[0].tag, "alpha");
-            assert_eq!(received[0].v, Some(11.0), "残りのタグの値は流れ続ける");
+                let view = hub.subscription().await;
+                assert_eq!(
+                    view.state,
+                    if names.is_empty() { "unbound" } else { "live" }
+                );
+                assert_eq!(view.reason, None);
+                assert_eq!(view.subscribed_count, names.len());
+                assert_eq!(view.unresolved, owned(expected_unresolved));
+                assert_eq!(view.unsupported, owned(&["bad,name"]));
+                assert_eq!(generation_sequence(&hub).await, first);
+                let mut value_names: Vec<_> =
+                    view.values.into_iter().map(|entry| entry.tag).collect();
+                value_names.sort();
+                assert_eq!(value_names, owned(names));
+                let sample = sampler.snapshot("conn:1");
+                assert_eq!(sample.is_live(), !names.is_empty());
+                for name in expected_unresolved {
+                    assert!(sample.reading(name).is_none());
+                }
+            }
 
             hub.inner.subscription.lock().await.stop(None).await;
             server.abort();
@@ -5921,12 +5583,8 @@ mod tests {
             );
             let server = tokio::spawn(serve_hub(listener, Arc::clone(&mock)));
             let (settings, hub) = service_with_keyring(&endpoint, &["alpha"]).await;
-            hub.reconcile_with(
-                &HubStatus::Connected { tag_count: 1 },
-                Some(&catalog),
-                Trigger::Observe,
-            )
-            .await;
+            hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+                .await;
             wait_live(&hub).await;
             (mock, server, endpoint, settings, hub)
         }
@@ -6378,40 +6036,17 @@ mod tests {
             .map(|generation| generation.sequence)
     }
 
-    /// 同じ接続先・同じタグ名なら据え置く。**同じ名前で作り直された**（stable
-    /// ID が変わった）タグでも張り直さない: SDK は名前で購読・再バインドする
-    /// ので古い ID に固定されず、Copilot F4 の懸念は起きない
-    /// （2026-09-30 オーナー決定、docs/scada-design.md §9.6）。
+    /// 同じ接続先・同じ要求集合なら張り直さない。
     #[tokio::test]
-    async fn a_recreated_tag_under_the_same_name_keeps_the_generation() {
+    async fn identical_requests_keep_the_generation() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
         let connected = HubStatus::Connected { tag_count: 1 };
 
-        hub.reconcile_with(&connected, Some(&catalog(&["a"])), Trigger::Observe)
-            .await;
-        let first = generation_sequence(&hub)
-            .await
-            .expect("keyring があれば世代が立つ");
+        hub.reconcile_with(&connected, Trigger::Observe).await;
+        let first = generation_sequence(&hub).await.expect("世代が立つ");
 
-        hub.reconcile_with(&connected, Some(&catalog(&["a"])), Trigger::Observe)
-            .await;
-        assert_eq!(
-            generation_sequence(&hub).await,
-            Some(first),
-            "同じ接続先・同じタグ名なら張り直さない"
-        );
-
-        let recreated = CatalogSnapshot {
-            tags: vec![catalog_tag("a", StableTagId::new(1, 1, 99))],
-            ..catalog(&["a"])
-        };
-        hub.reconcile_with(&connected, Some(&recreated), Trigger::Observe)
-            .await;
-        assert_eq!(
-            generation_sequence(&hub).await,
-            Some(first),
-            "同名で作り直されても張り直さない（SDK が名前で再バインドする）"
-        );
+        hub.reconcile_with(&connected, Trigger::Observe).await;
+        assert_eq!(generation_sequence(&hub).await, Some(first));
     }
 
     /// `connect` / `adopt_manual_key` の後は、同一性が一致していても新しい
@@ -6421,16 +6056,11 @@ mod tests {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
         let connected = HubStatus::Connected { tag_count: 1 };
 
-        hub.reconcile_with(&connected, Some(&catalog(&["a"])), Trigger::Observe)
-            .await;
+        hub.reconcile_with(&connected, Trigger::Observe).await;
         let first = generation_sequence(&hub).await.expect("世代が立つ");
 
-        hub.reconcile_with(
-            &connected,
-            Some(&catalog(&["a"])),
-            Trigger::CredentialsChanged,
-        )
-        .await;
+        hub.reconcile_with(&connected, Trigger::CredentialsChanged)
+            .await;
         assert_eq!(
             generation_sequence(&hub).await,
             Some(first + 1),
@@ -6616,12 +6246,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_drops_the_subscription_generation() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
         assert_eq!(
             generation_sequence(&hub).await,
             Some(1),
@@ -6654,12 +6280,8 @@ mod tests {
     #[tokio::test]
     async fn shutdown_does_not_wait_for_the_operation_lock() {
         let (_settings, hub) = service_with_keyring(&closed_endpoint(), &["a"]).await;
-        hub.reconcile_with(
-            &HubStatus::Connected { tag_count: 1 },
-            Some(&catalog(&["a"])),
-            Trigger::Observe,
-        )
-        .await;
+        hub.reconcile_with(&HubStatus::Connected { tag_count: 1 }, Trigger::Observe)
+            .await;
         // 「いま `connect` が Hub の応答を待っている」状態を作る。
         let held = hub.inner.operation.lock().await;
 
