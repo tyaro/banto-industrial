@@ -1000,6 +1000,8 @@ impl Engine {
             log_err_line(&format!(
                 "banto-hub-sink: warn: 停止時に {lost} 行を送信できませんでした（dropped に計上しました）"
             ));
+        } else if os_deadline.is_none() {
+            log_line("banto-hub-sink: 停止時に送信できなかった行: 0");
         }
         // 6. 最後の状態 push（上の dropped を含んだ状態を Hub に残す）。
         // OS シャットダウンで予算が尽きたら push を待たずに打ち切る。
@@ -2349,6 +2351,19 @@ mod tests {
             std::env::temp_dir().join(format!("banto-hub-sink-{name}-{}.log", std::process::id()));
         crate::log::enable_service_log_file(&path).expect("service log");
         path
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_logs_zero_unsent_rows() {
+        let _log_guard = service_log_lock().await;
+        let log_path = enable_test_service_log("graceful-empty-queue");
+        offline_engine(Duration::ZERO)
+            .shutdown(StopRequest::Graceful)
+            .await;
+
+        let text = std::fs::read_to_string(log_path).expect("service log");
+        assert!(text.contains("停止時に送信できなかった行: 0"), "{text}");
+        assert!(text.contains("停止しました"), "{text}");
     }
 
     /// 起動後の catalog 再取得を握ったまま OsShutdown が来ても、
