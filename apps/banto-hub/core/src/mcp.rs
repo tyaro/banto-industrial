@@ -2273,7 +2273,10 @@ async fn tool_update_connection(
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        if let Err(err) = input.check_before_queue(&state.plc_connections, &secret_keys) {
+        if let Err(err) = input
+            .check_update_before_queue(&state.plc_connections, id, &secret_keys)
+            .await
+        {
             return Ok(banto_error_tool_error(&err));
         }
         let form = match input.clone().queue_form(&secret_keys) {

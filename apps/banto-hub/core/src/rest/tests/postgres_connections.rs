@@ -127,33 +127,24 @@ async fn queued_postgres_update_cannot_move_a_saved_password_to_a_different_host
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body:?}");
-    let (status, queued) = admin_put(
+    let pending_count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap()
+    };
+    let before = pending_count().await;
+    let (status, body) = admin_put(
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
         json!({ "name": "queued-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } }),
     )
     .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{queued:?}");
-    let pending_id = queued["pending"]["id"].as_i64().unwrap();
-    let (status, body) = admin_post(
-        &env.router,
-        "/api/collection/stop",
-        &env.admin_token,
-        json!({}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body:?}");
-    let (status, body) = admin_post(
-        &env.router,
-        &format!("/api/pending-changes/{pending_id}/apply"),
-        &env.admin_token,
-        json!({}),
-    )
-    .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert!(body.to_string().contains("settings.password"), "{body:?}");
     assert!(!body.to_string().contains("original-secret"));
+    assert_eq!(pending_count().await, before);
     let saved = env.manager.plc_connections().get(id).await.unwrap();
     assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
     assert_eq!(

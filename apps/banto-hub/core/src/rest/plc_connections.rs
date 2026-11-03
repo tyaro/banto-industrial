@@ -158,6 +158,16 @@ impl PlcConnectionPayload {
         service.check_settings_input(&input)
     }
 
+    pub(crate) async fn check_update_before_queue(
+        &self,
+        service: &banto_tags::PlcConnectionService,
+        id: i64,
+        secret_keys: &[String],
+    ) -> Result<(), BantoError> {
+        let input = self.clone().into_input(secret_keys)?;
+        service.check_settings_update(id, input).await
+    }
+
     /// 未適用キューに積む形（R2b-6b、`crate::pending_changes` の doc）: 秘密のキーの文字列の
     /// 値は**積む前に封印して** `sealedSecrets`（キー → `crate::secrets::sealed_password_json`
     /// の形）へ移し、`settings` から外す。空文字（消す）は `null` にする。省略（保つ）・`null`
@@ -492,7 +502,8 @@ pub(super) async fn plc_connections_update(
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
         input
-            .check_before_queue(&state.plc_connections, &secret_keys)
+            .check_update_before_queue(&state.plc_connections, id, &secret_keys)
+            .await
             .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(

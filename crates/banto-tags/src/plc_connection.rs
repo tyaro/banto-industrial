@@ -1913,27 +1913,7 @@ impl PlcConnectionService {
             }
         };
 
-        // An existing password belongs to its saved PostgreSQL target.
-        if existing_protocol == Some(POSTGRES_PROTOCOL)
-            && input.protocol == POSTGRES_PROTOCOL
-            && secret_ref_of(&existing_settings, PASSWORD_KEY).is_some()
-            && matches!(
-                input.secrets.get(PASSWORD_KEY),
-                None | Some(SecretChange::Keep)
-            )
-            && ["host", "port", "database", "username"]
-                .iter()
-                .any(|key| existing_settings.get(*key) != settings.get(*key))
-        {
-            return Err(BantoError::Validation {
-                field_errors: vec![FieldError {
-                    field: "settings.password".to_string(),
-                    message:
-                        "接続先を変更するには、パスワードを入力するか明示的に消去してください。"
-                            .to_string(),
-                }],
-            });
-        }
+        check_postgres_password_target(existing_protocol, &existing_settings, &input, &settings)?;
 
         let mut kept_refs = Vec::new();
         let mut new_rows = Vec::new();
@@ -2194,6 +2174,36 @@ impl PlcConnectionService {
 pub struct PlcConnectionCascadeOutcome {
     pub deleted_groups: i64,
     pub deleted_tags: i64,
+}
+
+fn check_postgres_password_target(
+    existing_protocol: Option<&str>,
+    existing_settings: &Map<String, Value>,
+    input: &PlcConnectionInput,
+    settings: &Map<String, Value>,
+) -> Result<(), BantoError> {
+    // An existing password belongs to its saved PostgreSQL target.
+    if existing_protocol == Some(POSTGRES_PROTOCOL)
+        && input.protocol == POSTGRES_PROTOCOL
+        && secret_ref_of(existing_settings, PASSWORD_KEY).is_some()
+        && matches!(
+            input.secrets.get(PASSWORD_KEY),
+            None | Some(SecretChange::Keep)
+        )
+        && ["host", "port", "database", "username"]
+            .iter()
+            .any(|key| existing_settings.get(*key) != settings.get(*key))
+    {
+        return Err(BantoError::Validation {
+            field_errors: vec![FieldError {
+                field: "settings.password".to_string(),
+                message: "接続先を変更するには、パスワードを入力するか明示的に消去してください。"
+                    .to_string(),
+            }],
+        });
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

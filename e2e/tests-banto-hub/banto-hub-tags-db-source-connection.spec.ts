@@ -13,7 +13,8 @@
  * 2. 作成できたら、ツリーに DB バッジが付いた状態で現れる。
  * 3. 再設定 Drawer を開くと「パスワード: 設定済み」（作成時に入力した
  *    パスワードがある）と出て、パスワード欄は空欄のまま（絶対にプリ
- *    フィルしない）。
+ *    フィルしない）。接続先を変えて保存した場合は、422 の項目エラーが
+ *    パスワード欄のそばに出る。
  * 4. **S3（docs/banto-hub-external-db-design.md §7 row S3）で更新**:
  *    「収集グループを作成」メニュー項目は S1 時点では無効化されていた
  *    （実装指示4「サーバーの422だけに頼らない」）が、S2/S2b で DB Source
@@ -237,6 +238,27 @@ test.describe
 		await expect(drawer.getByRole('button', { name: '接続テスト' })).toBeEnabled();
 
 		await adminPage.keyboard.press('Escape');
+	});
+
+	test('再設定 Drawer: 接続先変更に必要なパスワードのエラーを入力欄のそばに表示する', async () => {
+		await adminPage.goto('/tags');
+		await connectionNodeByName(adminPage, DB_CONN).click({ button: 'right' });
+		await adminPage.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+
+		const drawer = adminPage.getByRole('dialog', { name: `${DB_CONN} を編集`, exact: true });
+		await drawer.getByLabel('ホスト', { exact: true }).fill('10.0.0.51');
+		const saved = adminPage.waitForResponse(
+			(r) => r.url().includes('/api/plc-connections/') && r.request().method() === 'PUT'
+		);
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		expect((await saved).status()).toBe(422);
+		const passwordError = drawer
+			.getByLabel('パスワードを消去する', { exact: true })
+			.locator('..')
+			.locator('~ span.err');
+		await expect(passwordError).toHaveText(
+			'接続先を変更するには、パスワードを入力するか明示的に消去してください。'
+		);
 	});
 
 	test('4. S3: 「収集グループを作成」は常時有効になり、クリックすると作成ウィザードが開く', async () => {
