@@ -74,6 +74,39 @@ async fn update_omitting_password_keeps_the_existing_password() {
     );
 }
 
+#[tokio::test]
+async fn postgres_update_rejects_moving_a_saved_password_to_a_different_host() {
+    let env = test_env().await;
+    let (status, created) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "erp-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let id = created["id"].as_i64().unwrap();
+    let (status, response) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        json!({ "name": "erp-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response:?}");
+    assert!(
+        response.to_string().contains("settings.password"),
+        "{response:?}"
+    );
+    assert!(!response.to_string().contains("original-secret"));
+    let saved = env.manager.plc_connections().get(id).await.unwrap();
+    assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("original-secret")
+    );
+}
+
 /// `PUT`で`password: ""`を送ると、パスワードが消去される。
 #[tokio::test]
 async fn update_with_empty_password_clears_it() {

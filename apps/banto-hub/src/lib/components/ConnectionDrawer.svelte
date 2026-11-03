@@ -1073,6 +1073,12 @@
 						<input type="checkbox" bind:checked={form.clearPassword} />
 						パスワードを消去する
 					</label>
+					{#if form.passwordState !== 'none'}
+						<span class="hint">
+							ホスト・ポート・DB
+							名・ユーザー名を変更する場合は、パスワードを入力するか、消去を選んでください。
+						</span>
+					{/if}
 				{/if}
 				{#if errors.password}<span class="err">{errors.password}</span>{/if}
 			{/if}

@@ -1913,6 +1913,28 @@ impl PlcConnectionService {
             }
         };
 
+        // An existing password belongs to its saved PostgreSQL target.
+        if existing_protocol == Some(POSTGRES_PROTOCOL)
+            && input.protocol == POSTGRES_PROTOCOL
+            && secret_ref_of(&existing_settings, PASSWORD_KEY).is_some()
+            && matches!(
+                input.secrets.get(PASSWORD_KEY),
+                None | Some(SecretChange::Keep)
+            )
+            && ["host", "port", "database", "username"]
+                .iter()
+                .any(|key| existing_settings.get(*key) != settings.get(*key))
+        {
+            return Err(BantoError::Validation {
+                field_errors: vec![FieldError {
+                    field: "settings.password".to_string(),
+                    message:
+                        "接続先を変更するには、パスワードを入力するか明示的に消去してください。"
+                            .to_string(),
+                }],
+            });
+        }
+
         let mut kept_refs = Vec::new();
         let mut new_rows = Vec::new();
         for key in &secret_keys {
@@ -3566,6 +3588,79 @@ mod tests {
         assert_eq!(
             stored_password(&svc, created.id).await.as_deref(),
             Some("original")
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_target_change_requires_replacing_or_clearing_saved_password() {
+        let svc = service().await;
+        let original = svc
+            .create(with_password(postgres_input("PgTarget"), REF_A, "original"))
+            .await
+            .unwrap();
+        let target_changes: [fn(&mut PlcConnectionInput); 4] = [
+            |input| input.host = "other-db".into(),
+            |input| input.port = 15432,
+            |input| input.database = Some("other_database".into()),
+            |input| input.username = Some("other_user".into()),
+        ];
+        for change in target_changes {
+            for explicit_keep in [false, true] {
+                let mut input = postgres_input("PgTarget");
+                change(&mut input);
+                if explicit_keep {
+                    input = with_secret_change(input, SecretChange::Keep);
+                }
+                let error = svc.update(original.id, input).await.unwrap_err();
+                assert!(matches!(
+                    error,
+                    BantoError::Validation { field_errors }
+                        if field_errors.iter().any(|error| error.field == "settings.password")
+                ));
+                assert_eq!(
+                    svc.get(original.id).await.unwrap().settings,
+                    original.settings
+                );
+                assert_eq!(
+                    stored_password(&svc, original.id).await.as_deref(),
+                    Some("original")
+                );
+            }
+        }
+
+        let mut renamed = postgres_input("PgRenamed");
+        renamed.host = format!(" {} ", renamed.host);
+        let renamed = svc.update(original.id, renamed).await.unwrap();
+        assert_eq!(renamed.name, "PgRenamed");
+        assert_eq!(renamed.secret_ref(PASSWORD_KEY), Some(REF_A));
+
+        let mut moved = postgres_input("PgRenamed");
+        moved.host = "replacement-db".into();
+        let replaced = svc
+            .update(
+                original.id,
+                with_password(moved.clone(), REF_B, "replacement"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.secret_ref(PASSWORD_KEY), Some(REF_B));
+        moved.host = "passwordless-db".into();
+        let cleared = svc
+            .update(
+                original.id,
+                with_secret_change(moved.clone(), SecretChange::Clear),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.secret_ref(PASSWORD_KEY), None);
+        assert!(all_secret_rows(&svc).await.is_empty());
+        moved.host = "another-passwordless-db".into();
+        assert_eq!(
+            svc.update(original.id, moved)
+                .await
+                .unwrap()
+                .setting_str("host"),
+            Some("another-passwordless-db")
         );
     }
 

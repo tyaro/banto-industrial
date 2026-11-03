@@ -578,14 +578,19 @@ pub(crate) async fn test_connection_options(
 
 fn hide_test_password(outcome: &mut DbConnectionTestOutcome, password: &str) {
     if !password.is_empty() {
-        for text in [&mut outcome.error, &mut outcome.server_version]
-            .into_iter()
-            .flatten()
+        if let Some(text) = outcome
+            .error
+            .as_mut()
+            .filter(|text| text.contains(password))
         {
-            if text.contains(password) {
-                // Do not reveal where a guessed password matched the remote text.
-                *text = "接続テストの詳細に機密値が含まれるため表示できません。".into();
-            }
+            *text = "接続テストの詳細に機密値が含まれるため表示できません。".into();
+        }
+        if outcome
+            .server_version
+            .as_ref()
+            .is_some_and(|version| version.contains(password))
+        {
+            outcome.server_version = None;
         }
     }
 }
@@ -812,8 +817,11 @@ mod tests {
         for password in ["PostgreSQL", "SQL", "a"] {
             let mut outcome = DbConnectionTestOutcome::ok("PostgreSQL fake version".into());
             hide_test_password(&mut outcome, password);
-            assert_eq!(outcome.server_version.as_deref(), Some(hidden));
             assert!(outcome.ok);
+            assert!(serde_json::to_value(outcome)
+                .unwrap()
+                .get("serverVersion")
+                .is_none());
         }
         for password in ["", "unrelated-secret"] {
             let mut outcome = DbConnectionTestOutcome::failed(remote_error.into());
