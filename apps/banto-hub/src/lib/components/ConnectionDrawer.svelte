@@ -120,6 +120,7 @@
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
 	import {
 		REQUIRED_MESSAGE,
+		isSecretFormValue,
 		mapSettingsFieldErrors,
 		summarizeDriverValues,
 		validateDriverValues
@@ -715,8 +716,8 @@
 		testState.testing = true;
 		testState.result = null;
 		try {
-			// フォームの現在値（未保存でもよい）をそのまま送る。秘密の欄の「変えない」はキーを
-			// 送らず、`connectionId` の保存済みから補われる。
+			// フォームの現在値（未保存でもよい）を送る。「変えない」の秘密値は送らず、
+			// 一致する収集中の接続だけ再利用できる。直接接続では秘密値の明示入力が必要。
 			const input = formToConnectionInput(form, drivers);
 			testState.result = await testPlcConnection({
 				protocol: input.protocol,
@@ -881,6 +882,23 @@
 	async function handleSave(): Promise<void> {
 		if (!connection) return;
 		if (!validateBeforeSubmit()) return;
+		const secretChanges = [];
+		if (driver && connection.protocol === form.protocol) {
+			for (const field of driver.settingsSchema.fields) {
+				if (field.kind.type !== 'secret') continue;
+				const value = form.driver.values[field.key];
+				if (!isSecretFormValue(value) || value.state === 'none' || value.mode === 'keep') continue;
+				secretChanges.push(`${field.label}：${value.mode === 'clear' ? '消去' : '上書き'}`);
+			}
+		}
+		if (
+			secretChanges.length > 0 &&
+			!window.confirm(
+				`保存済みの秘密値を次のとおり変更します。\n\n${secretChanges.join('\n')}\n\n接続テストだけに使った変更は、キャンセルして「変えない」に戻してください。\nこの内容で保存しますか？`
+			)
+		) {
+			return;
+		}
 		saving = true;
 		errors = {};
 		driverErrors = {};
@@ -1351,6 +1369,11 @@
 			{#if testState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
 			接続テスト
 		</button>
+		{#if connection && driver?.settingsSchema.fields.some((field) => field.kind.type === 'secret')}
+			<p class="hint">
+				保存済みの秘密値は送信しません。収集中の接続を使えない場合は「変える」で入力してください。任意項目は「消す」で値無しを試せます。テスト後に元の秘密値を残して保存する場合は「変えない」に戻してください。
+			</p>
+		{/if}
 		{#if testState.testing}
 			<span class="test-result testing">テスト中…</span>
 		{:else if testState.result}

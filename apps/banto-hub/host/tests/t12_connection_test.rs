@@ -76,13 +76,15 @@ const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 /// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
 const TEMP_ENV_PREFIX: &str = "banto-hub-t12-it";
 
-/// 組み込み Modbus の文法・設定を使い、必須の秘密の欄だけを足すテスト専用ドライバ。
-struct RequiredSecretDriver {
+/// 組み込み Modbus の文法・設定を使い、秘密の欄だけを足すテスト専用ドライバ。
+struct TestSecretDriver {
     descriptor: DriverDescriptor,
     delegate: DriverEntry,
+    required: bool,
+    inputs: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
-impl DriverBase for RequiredSecretDriver {
+impl DriverBase for TestSecretDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &self.descriptor
     }
@@ -94,9 +96,12 @@ impl DriverBase for RequiredSecretDriver {
     }
     fn settings_schema(&self) -> SettingsSchema {
         let mut schema = self.delegate.base().settings_schema();
-        schema
-            .fields
-            .push(SettingField::new("token", "トークン", FieldKind::secret()).required());
+        let field = SettingField::new("token", "トークン", FieldKind::secret());
+        schema.fields.push(if self.required {
+            field.required()
+        } else {
+            field
+        });
         schema
     }
     fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
@@ -110,12 +115,19 @@ impl DriverBase for RequiredSecretDriver {
     }
 }
 
-impl FrameDriver for RequiredSecretDriver {
+impl FrameDriver for TestSecretDriver {
     fn create_connection(
         &self,
-        _settings: &Settings,
+        settings: &Settings,
     ) -> Result<Box<dyn FrameConnection>, FatalError> {
-        panic!("必須 Secret の保存テストは接続しない")
+        self.inputs
+            .lock()
+            .unwrap()
+            .push(settings.get("token").map(str::to_owned));
+        match self.delegate.kind() {
+            banto_driver_api::DriverKind::Frame(driver) => driver.create_connection(settings),
+            _ => unreachable!("fixture delegates to a frame driver"),
+        }
     }
 }
 
@@ -233,6 +245,8 @@ struct TestApp {
     /// 試験が収集を起こす入口（製品と同じ `CollectionController`）。`controller` が
     /// `Some` のときは同じもの、`None` のときはルーターに渡さない専用のもの。
     runner: Arc<CollectionController>,
+    /// Inputs received by this app's secret-driver fixture, never shared across tests.
+    secret_inputs: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     _env: TempEnv,
 }
 
@@ -511,24 +525,33 @@ async fn test_app_with_drivers_and_options(
             }
         }
     }
+    let secret_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
     if with_secret_driver {
         let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
-        Arc::get_mut(&mut drivers.registry)
-            .unwrap()
-            .register(DriverEntry::frame(Arc::new(RequiredSecretDriver {
-                descriptor: DriverDescriptor::new(
-                    DriverId::new("secret-test").unwrap(),
-                    "0.0.0-test",
-                    "必須 Secret のテスト",
-                    Capabilities::READ_WRITE,
-                ),
-                delegate,
-            })))
-            .unwrap();
+        for (id, required) in [("secret-test", true), ("optional-secret-test", false)] {
+            Arc::get_mut(&mut drivers.registry)
+                .unwrap()
+                .register(DriverEntry::frame(Arc::new(TestSecretDriver {
+                    descriptor: DriverDescriptor::new(
+                        DriverId::new(id).unwrap(),
+                        "0.0.0-test",
+                        "Secret のテスト",
+                        Capabilities::READ_WRITE,
+                    ),
+                    delegate: delegate.clone(),
+                    required,
+                    inputs: secret_inputs.clone(),
+                })))
+                .unwrap();
+        }
     }
-    let sessions = Arc::new(HubSessions::new(
+    let sessions = Arc::new(HubSessions::with_secret_opener(
         banto_broker::BackoffConfig::default(),
         drivers,
+        Arc::new(banto_hub_core::secrets::ConnectionSecretOpener::new(
+            pool.clone(),
+            banto_hub_core::secrets::ConnectionSecrets::platform_default(),
+        )),
     ));
     let sim_registry = Arc::new(BrokerSimRegistry::new());
     let computed = Arc::new(ComputedEngine::new(Arc::new(ServerTagStore::new())));
@@ -639,6 +662,7 @@ async fn test_app_with_drivers_and_options(
         write_control,
         runner,
         controller,
+        secret_inputs,
         _env: env,
     }
 }
@@ -1754,6 +1778,260 @@ async fn a_required_driver_secret_is_reported_as_a_settings_field() {
     assert_eq!(body["ok"], false, "{body:?}");
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("settings.token: 必須です"), "{message}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_session() {
+    let app = test_app_with_secret_driver("t12-secret-probe", true).await;
+    let sim = ModbusSimulator::start().await;
+    let (status, created) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({"name":"secret-line", "protocol":"secret-test", "settings":{
+            "host":"127.0.0.1", "port":sim.addr.port(), "unit_id":1, "word_order":"low_high", "token":"saved-token"
+        }}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_i64().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // There is no session: changing the endpoint must never open the saved token.
+    for host in ["127.0.0.1", "localhost"] {
+        let (status, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            json!({"protocol":"secret-test", "connectionId":id, "settings":{
+                "host":host, "port":listener.local_addr().unwrap().port(), "unit_id":1
+            }}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("settings.token"),
+            "{body}"
+        );
+        assert!(!body.to_string().contains("saved-token"));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+    assert!(app.secret_inputs.lock().unwrap().is_empty());
+    // Explicit inputs still permit a direct probe.
+    let settings =
+        json!({"host":"127.0.0.1", "port":sim.addr.port(), "unit_id":1, "word_order":"low_high"});
+    let mut explicit = settings.clone();
+    explicit["token"] = json!("temporary-token");
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"secret-test", "connectionId":id, "settings":explicit}),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(sim.connection_count(), 1);
+    assert_eq!(
+        *app.secret_inputs.lock().unwrap(),
+        vec![Some("temporary-token".to_owned())],
+        "direct probes must receive only the explicitly supplied token"
+    );
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("fast", id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("secret-value", group.id, "40001", "u16"))
+        .await
+        .unwrap();
+    app.commit_and_start().await;
+    let mut status = app.sessions.status_watch(id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sockets = sim.connection_count();
+    let inputs = app.secret_inputs.lock().unwrap().len();
+    // Destroy the sealed row after the broker has connected: reuse needs only the
+    // saved reference, never plaintext decryption. The active session is untouched.
+    sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+        .bind(id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"secret-test", "connectionId":id, "settings":settings}),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(sim.connection_count(), sockets, "reuse must not dial again");
+    assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
+    let mut changed = settings;
+    changed["port"] = json!(listener.local_addr().unwrap().port());
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"secret-test", "connectionId":id, "settings":changed}),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("保存してから"),
+        "{body}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
+    let app = test_app_with_secret_driver("t12-optional-secret-probe", true).await;
+    let sim = ModbusSimulator::start().await;
+    let settings =
+        json!({"host":"127.0.0.1", "port":sim.addr.port(), "unit_id":1, "word_order":"low_high"});
+    let mut saved_settings = settings.clone();
+    saved_settings["token"] = json!("saved-optional-token");
+    let (status, created) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({"name":"optional-secret-line", "protocol":"optional-secret-test", "settings":saved_settings}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_i64().unwrap();
+
+    // Omission must not silently test anonymous access instead of the saved token.
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"optional-secret-test", "connectionId":id, "settings":settings}),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("保存済みの秘密値はテストに使いません"),
+        "{message}"
+    );
+    assert!(message.contains("null"), "{message}");
+    assert!(!body.to_string().contains("saved-optional-token"));
+    assert_eq!(sim.connection_count(), 0, "omission must not dial");
+    assert!(app.secret_inputs.lock().unwrap().is_empty());
+
+    // Direct probes receive the explicit value, or no token for an explicit no-value choice.
+    for value in [json!("temporary-optional-token"), Value::Null, json!("")] {
+        let mut explicit = settings.clone();
+        explicit["token"] = value;
+        let (_, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            json!({"protocol":"optional-secret-test", "connectionId":id, "settings":explicit}),
+        )
+        .await;
+        assert_eq!(body["ok"], true, "{body}");
+    }
+    assert_eq!(sim.connection_count(), 3);
+    assert_eq!(
+        *app.secret_inputs.lock().unwrap(),
+        vec![Some("temporary-optional-token".to_owned()), None, None],
+        "direct probes must never receive the saved token"
+    );
+
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("optional-fast", id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("optional-secret-value", group.id, "40001", "u16"))
+        .await
+        .unwrap();
+    app.commit_and_start().await;
+    let mut status = app.sessions.status_watch(id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sockets = sim.connection_count();
+    let inputs = app.secret_inputs.lock().unwrap().len();
+    sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+        .bind(id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"optional-secret-test", "connectionId":id, "settings":settings}),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(
+        sim.connection_count(),
+        sockets,
+        "shared reuse must not dial"
+    );
+    assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
+    for token in [json!("changed-token"), Value::Null, json!("")] {
+        let mut changed = settings.clone();
+        changed["token"] = token;
+        let (_, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            json!({"protocol":"optional-secret-test", "connectionId":id, "settings":changed}),
+        )
+        .await;
+        assert_eq!(body["ok"], false, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("保存してから"),
+            "{body}"
+        );
+        assert_eq!(
+            sim.connection_count(),
+            sockets,
+            "changed secrets must not dial"
+        );
+        assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
+    }
+    sim.stop();
 }
 
 // ---------------------------------------------------------------------------

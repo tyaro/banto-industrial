@@ -171,7 +171,7 @@ async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identi
 /// R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 接続テストの `settings` はフォームの値だけを
 /// スキーマに通す（省いた `cpu_type`・`word_order` はスキーマの既定。保存済みからは引き継がない。
 /// #790 の「保存済みの CPU を引き継ぐ」は MCP の平らな形のアダプタに移した）。保存済みの接続は
-/// `connectionId` が**同じプロトコル**のときだけ返る（指紋と秘密値の補いの出どころ）。
+/// `connectionId` が**同じプロトコル**のときだけ返る（指紋用の参照の出どころ）。
 #[tokio::test]
 async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_same_protocol() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
@@ -273,14 +273,9 @@ async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_sa
     assert!(refused.message.contains("unit_id"), "{}", refused.message);
 }
 
-/// R2b-6b（設計 §5・§10）: 接続テストの秘密のキー。編集中（`connectionId`）にフォームが秘密の
-/// キーを省けば保存済みの値を開いて補い、文字列ならその値で試す（`secrets_changed`）。`null`・
-/// 空文字は値無しで、スキーマで必須ならダイヤルの前に断る。保存前（`connectionId` 無し）で
-/// 省いたときも必須の欠け。非秘密の欄はフォームの値（変えた host）。今の Modbus / SLMP には
-/// 秘密の欄が無いので、`postgres` の id を名乗る偽のドライバ（`password` を必須の秘密に持つ）で
-/// 確かめる（保存済みの行は Hub の `postgres` 接続として封印して作る）。
+/// 接続テストは保存済み秘密値を開かず、共有セッション照合用の参照だけを保つ。
 #[tokio::test]
-async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
+async fn the_test_keeps_only_saved_references_and_never_opens_saved_secrets() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
     use banto_driver_api::{
         AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
@@ -363,7 +358,7 @@ async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
         settings
     };
 
-    // Editing, omitted: the saved value is opened; the changed host is the form's.
+    // Editing, omitted: only the reference is retained for shared-session identity.
     let requested = requested_settings(
         &env.manager,
         &driver,
@@ -371,7 +366,8 @@ async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
     )
     .await
     .unwrap_or_else(|err| panic!("{}", err.message));
-    assert_eq!(requested.settings.get("password"), Some("saved-pw"));
+    assert_eq!(requested.settings.get("password"), None);
+    assert_eq!(requested.missing_secrets.len(), 1);
     assert_eq!(requested.settings.get("host"), Some("db2"));
     assert!(!requested.secrets_changed);
     assert_eq!(requested.saved.map(|c| c.id), Some(saved.id));
@@ -386,6 +382,7 @@ async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
     .unwrap_or_else(|err| panic!("{}", err.message));
     assert_eq!(requested.settings.get("password"), Some("typed-pw"));
     assert!(requested.secrets_changed);
+    assert!(requested.missing_secrets.is_empty());
 
     // `null` / `""` (no value) and a new connection without one: the required secret is
     // missing - refused before any dial, the message names the key and no value.
@@ -394,12 +391,14 @@ async fn the_test_supplies_the_saved_secret_only_when_the_form_omits_it() {
         (Some(saved.id), with(json!(""))),
         (None, base.clone()),
     ] {
-        let refused = requested_settings(&env.manager, &driver, &payload(connection_id, settings))
-            .await
-            .err()
-            .expect("refused");
-        assert!(refused.message.contains("password"), "{}", refused.message);
-        assert!(!refused.message.contains("saved-pw"), "{}", refused.message);
+        let requested =
+            requested_settings(&env.manager, &driver, &payload(connection_id, settings))
+                .await
+                .unwrap_or_else(|err| panic!("{}", err.message));
+        let refused = requested.missing_secrets;
+        assert_eq!(refused.len(), 1);
+        assert_eq!(refused[0].key, "settings.password");
+        assert!(!refused[0].message.contains("saved-pw"));
     }
 }
 
