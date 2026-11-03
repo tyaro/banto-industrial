@@ -1097,6 +1097,15 @@ mod tests {
         for stage in [StallAt::Begin, StallAt::Insert, StallAt::Commit] {
             let (pool, _connection, _server, reached, inserts) = mock_pool(stage).await;
             let group = group(1);
+            #[cfg(feature = "d5-trace")]
+            let (_trace_dir, trace_path, output) = {
+                let dir = tempfile::tempdir().expect("trace directory");
+                let path = dir.path().join("trace.jsonl");
+                let output =
+                    crate::d5_trace::TraceOutput::create(group.id, &path).expect("trace output");
+                group.enable_trace(&output.trace);
+                (dir, path, output)
+            };
             group.mark_table_ready();
             group.push_rows(vec![test_row(1)]);
             let groups = Arc::new(GroupRegistry::new());
@@ -1130,6 +1139,23 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), pool.close())
                 .await
                 .expect("pool close");
+            #[cfg(feature = "d5-trace")]
+            {
+                output.finish(true).expect("complete trace");
+                let outcomes: Vec<_> = std::fs::read_to_string(trace_path)
+                    .expect("trace contents")
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|event| event["event"] == "batch_outcome")
+                    .map(|event| event["outcome"].as_str().unwrap().to_owned())
+                    .collect();
+                let first = if stage == StallAt::Commit {
+                    "unknown"
+                } else {
+                    "not_committed"
+                };
+                assert_eq!(outcomes, [first, "confirmed"], "{stage:?}");
+            }
         }
     }
 

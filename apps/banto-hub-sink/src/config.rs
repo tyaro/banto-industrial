@@ -685,14 +685,22 @@ pub fn load_d5_trace_config() -> Result<SidecarConfig, String> {
     #[cfg(not(windows))]
     let _ = path;
     let config = load_config(RunMode::Console).map_err(|err| err.to_string())?;
-    let test_port = reqwest::Url::parse(&config.hub_url)
-        .ok()
-        .and_then(|url| url.port())
-        .is_some_and(|port| port != 0 && port != 8722);
-    if !config.hub_is_loopback() || !test_port {
+    if !d5_trace_allows_hub_url(&config.hub_url) {
         return Err("D-5 試験用 Hub は専用ポートのループバック接続を指定してください".into());
     }
     Ok(config)
+}
+
+#[cfg(feature = "d5-trace")]
+fn d5_trace_allows_hub_url(hub_url: &str) -> bool {
+    let Ok(endpoint) = banto_tagclient::Endpoint::new(hub_url) else {
+        return false;
+    };
+    endpoint.host().is_some_and(is_loopback_host)
+        && reqwest::Url::parse(hub_url)
+            .ok()
+            .and_then(|url| url.port())
+            .is_some_and(|port| port != 0 && port != 8722)
 }
 
 #[cfg(test)]
@@ -701,6 +709,22 @@ mod tests {
 
     fn path() -> PathBuf {
         PathBuf::from("banto-hub-sink.toml")
+    }
+
+    #[cfg(feature = "d5-trace")]
+    #[test]
+    fn d5_trace_requires_loopback_and_a_dedicated_port() {
+        for (url, allowed) in [
+            ("https://127.0.0.1:9443", true),
+            ("https://[::1]:9443", true),
+            ("https://127.0.0.1:8722", false),
+            ("https://127.0.0.1:0", false),
+            ("https://127.0.0.1", false),
+            ("https://127.0.0.1:443", false),
+            ("https://192.0.2.1:9443", false),
+        ] {
+            assert_eq!(d5_trace_allows_hub_url(url), allowed, "{url}");
+        }
     }
 
     const MINIMAL: &str = r#"

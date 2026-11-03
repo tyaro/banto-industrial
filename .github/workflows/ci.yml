@@ -1053,7 +1053,7 @@ jobs:
       - name: build (banto-hub-sink D-5 trace)
         run: cargo build -p banto-hub-sink --locked --features d5-trace
       - name: test (banto-hub-sink D-5 trace)
-        run: cargo test -p banto-hub-sink --locked --features d5-trace --lib d5_trace
+        run: cargo test -p banto-hub-sink --locked --features d5-trace --lib -- d5_trace begin_insert_and_commit_timeouts_keep_rows_for_retry
       # 配布物と同じく sink を単体で（dev-dependency の feature を混ぜずに）確かめる。
       # `cargo test` は dev 側（banto-hub-core など）の sqlx の feature と合わさって
       # 通ってしまい、#764 から `cargo build --release -p banto-hub-sink` が
