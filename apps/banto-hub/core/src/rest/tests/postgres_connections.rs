@@ -1252,11 +1252,8 @@ async fn postgres_presave_probe_uses_ephemeral_inputs_and_never_persists_or_leak
         body["error"]["kind"], "protocol",
         "authentication is not a TCP failure"
     );
-    assert!(
-        body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("<redacted>"),
+    assert_eq!(
+        body["error"]["message"], "接続テストの詳細に機密値が含まれるため表示できません。",
         "{body}"
     );
     assert!(!body.to_string().contains("ephemeral-secret"), "{body}");

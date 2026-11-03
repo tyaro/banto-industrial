@@ -572,15 +572,22 @@ pub(crate) async fn test_connection_options(
             DbConnectionTestFailureKind::Tcp,
         ),
     };
+    hide_test_password(&mut outcome, password);
+    outcome
+}
+
+fn hide_test_password(outcome: &mut DbConnectionTestOutcome, password: &str) {
     if !password.is_empty() {
         for text in [&mut outcome.error, &mut outcome.server_version]
             .into_iter()
             .flatten()
         {
-            *text = text.replace(password, "<redacted>");
+            if text.contains(password) {
+                // Do not reveal where a guessed password matched the remote text.
+                *text = "接続テストの詳細に機密値が含まれるため表示できません。".into();
+            }
         }
     }
-    outcome
 }
 
 async fn run_test(options: PgConnectOptions) -> DbConnectionTestOutcome {
@@ -791,6 +798,28 @@ mod tests {
             serde_json::to_value(DbConnectionTestOutcome::ok("version".into())).unwrap(),
             serde_json::json!({"ok": true, "serverVersion": "version"})
         );
+    }
+
+    #[test]
+    fn test_password_redaction_hides_the_whole_field_without_revealing_match_positions() {
+        let remote_error = "password authentication failed for user postgres";
+        let hidden = "接続テストの詳細に機密値が含まれるため表示できません。";
+        for password in ["password", "postgres", "a"] {
+            let mut outcome = DbConnectionTestOutcome::failed(remote_error.into());
+            hide_test_password(&mut outcome, password);
+            assert_eq!(outcome.error.as_deref(), Some(hidden));
+        }
+        for password in ["PostgreSQL", "SQL", "a"] {
+            let mut outcome = DbConnectionTestOutcome::ok("PostgreSQL fake version".into());
+            hide_test_password(&mut outcome, password);
+            assert_eq!(outcome.server_version.as_deref(), Some(hidden));
+            assert!(outcome.ok);
+        }
+        for password in ["", "unrelated-secret"] {
+            let mut outcome = DbConnectionTestOutcome::failed(remote_error.into());
+            hide_test_password(&mut outcome, password);
+            assert_eq!(outcome.error.as_deref(), Some(remote_error));
+        }
     }
 
     const PW_REF: &str = "0123456789abcdef0123456789abcdef";
