@@ -660,7 +660,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "settings": {
                         "type": "object",
-                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
+                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。保存済みパスワードのある postgres で host / port / database / username を変える場合は、password を明示して置き換えるか消去する必要があり、省略での保持はできません。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
                     },
                 },
                 "required": ["id", "name", "protocol", "enabled", "simulation", "settings"],

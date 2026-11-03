@@ -107,6 +107,61 @@ async fn postgres_update_rejects_moving_a_saved_password_to_a_different_host() {
     );
 }
 
+#[tokio::test]
+async fn queued_postgres_update_cannot_move_a_saved_password_to_a_different_host() {
+    let env = test_env().await;
+    let (status, created) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "queued-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let id = created["id"].as_i64().unwrap();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/start",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let (status, queued) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        json!({ "name": "queued-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{queued:?}");
+    let pending_id = queued["pending"]["id"].as_i64().unwrap();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/stop",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let (status, body) = admin_post(
+        &env.router,
+        &format!("/api/pending-changes/{pending_id}/apply"),
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(body.to_string().contains("settings.password"), "{body:?}");
+    assert!(!body.to_string().contains("original-secret"));
+    let saved = env.manager.plc_connections().get(id).await.unwrap();
+    assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("original-secret")
+    );
+}
+
 /// `PUT`で`password: ""`を送ると、パスワードが消去される。
 #[tokio::test]
 async fn update_with_empty_password_clears_it() {
