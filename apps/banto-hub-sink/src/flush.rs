@@ -522,11 +522,19 @@ async fn insert_batch_bounded(
     table: &Table,
     rows: &[Row],
     budget: Duration,
+    #[cfg(feature = "d5-trace")] attempt: Option<&mut crate::d5_trace::Attempt>,
 ) -> Result<(), BoundedSqlError> {
     let mut connection = OperationConnection::default();
     let result = tokio::time::timeout(budget, async {
         connection.0 = Some(pool.acquire().await?);
-        insert_batch(connection.as_mut(), table, rows).await
+        insert_batch(
+            connection.as_mut(),
+            table,
+            rows,
+            #[cfg(feature = "d5-trace")]
+            attempt,
+        )
+        .await
     })
     .await;
     match result {
@@ -674,17 +682,27 @@ impl Flusher {
             if batch.is_empty() {
                 return Ok(());
             }
+            #[cfg(feature = "d5-trace")]
+            let mut batch = batch;
+            #[cfg(feature = "d5-trace")]
+            let mut attempt = batch.trace_attempt();
             match insert_batch_bounded(
                 &self.pool,
                 &group.table,
                 &batch,
                 self.options.operation_timeout,
+                #[cfg(feature = "d5-trace")]
+                attempt.as_mut(),
             )
             .await
             {
                 Ok(()) => {
                     // commit されてからキューを進める（at-least-once）。
                     group.commit_batch(&batch);
+                    #[cfg(feature = "d5-trace")]
+                    if let Some(attempt) = attempt {
+                        attempt.confirm();
+                    }
                     if group.mark_flushed(now_ms()) {
                         log_line(&format!(
                             "banto-hub-sink: グループ {} (id={}) の保存を再開しました",
@@ -750,6 +768,7 @@ async fn insert_batch(
     conn: &mut PgConnection,
     table: &Table,
     rows: &[Row],
+    #[cfg(feature = "d5-trace")] attempt: Option<&mut crate::d5_trace::Attempt>,
 ) -> Result<(), SqlxError> {
     debug_assert!(!rows.is_empty());
     let sql = table.insert_sql(rows.len());
@@ -766,6 +785,10 @@ async fn insert_batch(
             .bind(row.quality.as_str());
     }
     query.execute(&mut *tx).await?;
+    #[cfg(feature = "d5-trace")]
+    if let Some(attempt) = attempt {
+        attempt.commit_started = true;
+    }
     tx.commit().await?;
     Ok(())
 }
@@ -1074,6 +1097,15 @@ mod tests {
         for stage in [StallAt::Begin, StallAt::Insert, StallAt::Commit] {
             let (pool, _connection, _server, reached, inserts) = mock_pool(stage).await;
             let group = group(1);
+            #[cfg(feature = "d5-trace")]
+            let (_trace_dir, trace_path, output) = {
+                let dir = tempfile::tempdir().expect("trace directory");
+                let path = dir.path().join("trace.jsonl");
+                let output =
+                    crate::d5_trace::TraceOutput::create(group.id, &path).expect("trace output");
+                group.enable_trace(&output.trace);
+                (dir, path, output)
+            };
             group.mark_table_ready();
             group.push_rows(vec![test_row(1)]);
             let groups = Arc::new(GroupRegistry::new());
@@ -1107,6 +1139,23 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), pool.close())
                 .await
                 .expect("pool close");
+            #[cfg(feature = "d5-trace")]
+            {
+                output.finish(true).expect("complete trace");
+                let outcomes: Vec<_> = std::fs::read_to_string(trace_path)
+                    .expect("trace contents")
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|event| event["event"] == "batch_outcome")
+                    .map(|event| event["outcome"].as_str().unwrap().to_owned())
+                    .collect();
+                let first = if stage == StallAt::Commit {
+                    "unknown"
+                } else {
+                    "not_committed"
+                };
+                assert_eq!(outcomes, [first, "confirmed"], "{stage:?}");
+            }
         }
     }
 

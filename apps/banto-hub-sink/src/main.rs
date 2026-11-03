@@ -42,6 +42,8 @@ use banto_hub_sink::{load_config, run, RunMode, SidecarOptions, StopRequest};
 fn main() {
     match std::env::args().nth(1).as_deref() {
         None | Some("run") => run_console(),
+        #[cfg(feature = "d5-trace")]
+        Some("run-d5-trace") => run_d5_trace_console(),
         #[cfg(windows)]
         Some(arg) if arg == service::INSTALL_ARG => service::install(),
         #[cfg(windows)]
@@ -61,6 +63,8 @@ fn main() {
 fn print_usage() {
     eprintln!("使い方: banto-hub-sink.exe [run|install|uninstall|run-service|grant-service-acl]");
     eprintln!("  （引数なし）/ run  コンソールモードで起動（Ctrl-C で停止）");
+    #[cfg(feature = "d5-trace")]
+    eprintln!("  run-d5-trace <sink-group-id> <new-absolute-jsonl>  D-5 隔離試験用");
     eprintln!(
         "  設定ファイル（{}）は %ProgramData%\\BantoHub\\sink\\ だけを読みます（run では\
          環境変数 BANTO_HUB_SINK_CONFIG で別のファイルも指せます）。置き場とファイルが\
@@ -120,6 +124,50 @@ fn run_console() {
     });
     if let Err(err) = result {
         eprintln!("banto-hub-sink: 実行を開始できませんでした: {err}");
+        std::process::exit(1);
+    }
+}
+
+#[cfg(feature = "d5-trace")]
+fn run_d5_trace_console() {
+    fn start() -> Result<(), String> {
+        let mut args = std::env::args_os().skip(2);
+        let (Some(group), Some(path), None) = (args.next(), args.next(), args.next()) else {
+            return Err(
+                "run-d5-trace <sink-group-id> <new-absolute-jsonl> を指定してください".into(),
+            );
+        };
+        let group_id = group
+            .to_str()
+            .and_then(|id| id.parse::<i64>().ok())
+            .filter(|id| *id > 0)
+            .ok_or("グループ ID は正の整数を指定してください")?;
+        let config = banto_hub_sink::config::load_d5_trace_config()?;
+        let output =
+            banto_hub_sink::d5_trace::TraceOutput::create(group_id, std::path::Path::new(&path))
+                .map_err(|err| err.to_string())?;
+        let runtime = tokio::runtime::Runtime::new().map_err(|err| err.to_string())?;
+        let result = runtime.block_on(banto_hub_sink::run::run_with_d5_trace(
+            config,
+            SidecarOptions::default(),
+            async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    eprintln!("banto-hub-sink: Ctrl-C の待受に失敗しました");
+                }
+                StopRequest::Graceful
+            },
+            &output,
+        ));
+        // abort 済みでも drop を待っていない producer/flusher がいる場合に備える。
+        // 全 async task の終了後にだけトレースを閉じる。
+        drop(runtime);
+        let finish = output.finish(result.is_ok());
+        result.map_err(|err| err.to_string())?;
+        finish.map_err(|err| err.to_string())
+    }
+
+    if let Err(err) = start() {
+        eprintln!("banto-hub-sink: D-5 trace: {err}");
         std::process::exit(1);
     }
 }

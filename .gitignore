@@ -64,6 +64,9 @@ e2e/perf-results/
 # Local T17 real-machine verification staging (binaries + private target/)
 _verify_t17/
 
+# Local S7 evidence retained separately from Cargo build output
+/_s7-evidence/
+
 # pnpm-lock.yaml is intentionally NOT ignored - the lockfile is committed
 
 # 作業の引き継ぎ（ローカルだけ。CLAUDE.md の「作業の引き継ぎ」、2026-10-21 オーナー指示）

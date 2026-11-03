@@ -20,8 +20,12 @@
 
 use std::collections::VecDeque;
 
+#[cfg(feature = "d5-trace")]
+use crate::d5_trace::{Attempt, Event, QueueTrace, MAX_IDS};
+
 /// 保存する 1 行（設計 §5.3 の long スキーマ）。
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "d5-trace", derive(serde::Serialize))]
 pub struct Row {
     /// 値の `ptime`（epoch ミリ秒）。取れない場合は採取時刻
     /// （[`crate::group`] が決める）。
@@ -42,6 +46,8 @@ pub struct RowQueue {
     next_id: u128,
     max_rows: usize,
     dropped: u64,
+    #[cfg(feature = "d5-trace")]
+    trace: Option<QueueTrace>,
 }
 
 /// INSERT に渡す行と、その時点で最後に送信する行のキュー内 ID。
@@ -50,6 +56,15 @@ pub struct RowQueue {
 pub struct RowBatch {
     rows: Vec<Row>,
     last_id: Option<u128>,
+    #[cfg(feature = "d5-trace")]
+    trace: Option<(QueueTrace, Vec<u128>)>,
+}
+
+#[cfg(feature = "d5-trace")]
+impl RowBatch {
+    pub(crate) fn trace_attempt(&mut self) -> Option<Attempt> {
+        self.trace.take().map(|(trace, ids)| trace.attempt(ids))
+    }
 }
 
 impl std::ops::Deref for RowBatch {
@@ -69,6 +84,8 @@ impl RowQueue {
             next_id: 0,
             max_rows,
             dropped: 0,
+            #[cfg(feature = "d5-trace")]
+            trace: None,
         }
     }
 
@@ -96,18 +113,52 @@ impl RowQueue {
         self.dropped
     }
 
+    #[cfg(feature = "d5-trace")]
+    pub(crate) fn enable_trace(&mut self, trace: QueueTrace) {
+        debug_assert!(self.trace.is_none() && self.rows.is_empty());
+        self.trace = Some(trace);
+    }
+
+    #[cfg(feature = "d5-trace")]
+    pub(crate) fn trace_config_boundary(&self, carries_over: bool) {
+        if let Some(trace) = &self.trace {
+            if self.rows.len() > MAX_IDS {
+                trace.invalidate();
+                return;
+            }
+            let row_ids = self.rows.iter().map(|(id, _)| *id).collect();
+            trace.record(if carries_over {
+                Event::Handoff { row_ids }
+            } else {
+                Event::QueueRetiring { row_ids }
+            });
+        }
+    }
+
     /// 1 行積む。満杯なら最古を 1 行捨てて `dropped` を増やす。
     pub fn push(&mut self, row: Row) {
         if self.max_rows == 0 {
+            #[cfg(feature = "d5-trace")]
+            if let Some(trace) = &self.trace {
+                trace.record(Event::RejectedAtZeroCapacity);
+            }
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
         while self.rows.len() >= self.max_rows {
-            self.rows.pop_front();
+            let _removed = self.rows.pop_front();
+            #[cfg(feature = "d5-trace")]
+            if let (Some(trace), Some((row_id, _))) = (&self.trace, _removed) {
+                trace.record(Event::Overflow { row_id });
+            }
             self.dropped = self.dropped.saturating_add(1);
         }
         let id = self.next_id;
         self.next_id = self.next_id.checked_add(1).expect("queue row ID exhausted");
+        #[cfg(feature = "d5-trace")]
+        if let Some(trace) = &self.trace {
+            trace.enqueue(id, &row);
+        }
         self.rows.push_back((id, row));
     }
 
@@ -120,7 +171,21 @@ impl RowQueue {
             rows.push(row.clone());
             last_id = Some(*id);
         }
-        RowBatch { rows, last_id }
+        RowBatch {
+            #[cfg(feature = "d5-trace")]
+            trace: self.trace.as_ref().and_then(|trace| {
+                if rows.len() > MAX_IDS {
+                    trace.invalidate();
+                    return None;
+                }
+                Some((
+                    trace.clone(),
+                    self.rows.iter().take(limit).map(|(id, _)| *id).collect(),
+                ))
+            }),
+            rows,
+            last_id,
+        }
     }
 
     /// INSERT が成功したバッチの行だけを削除する。送信中に overflow した行は
@@ -130,7 +195,11 @@ impl RowQueue {
             .last_id
             .is_some_and(|last_id| self.rows.front().is_some_and(|(id, _)| *id <= last_id))
         {
-            self.rows.pop_front();
+            let _removed = self.rows.pop_front();
+            #[cfg(feature = "d5-trace")]
+            if let (Some(trace), Some((row_id, _))) = (&self.trace, _removed) {
+                trace.record(Event::AckRemoved { row_id });
+            }
         }
     }
 
@@ -139,6 +208,17 @@ impl RowQueue {
     /// 返す。
     pub fn discard_all(&mut self) -> usize {
         let count = self.rows.len();
+        #[cfg(feature = "d5-trace")]
+        if let Some(trace) = &self.trace {
+            if count > MAX_IDS {
+                trace.invalidate();
+            } else if count != 0 {
+                // 大量の破棄も一つのイベントにまとめ、記録チャネルを埋めない。
+                trace.record(Event::Discarded {
+                    row_ids: self.rows.iter().map(|(id, _)| *id).collect(),
+                });
+            }
+        }
         self.rows.clear();
         self.dropped = self.dropped.saturating_add(count as u64);
         count
@@ -148,6 +228,68 @@ impl RowQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "d5-trace")]
+    #[test]
+    fn d5_trace_rejects_a_snapshot_that_cannot_list_every_row_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("trace.jsonl");
+        let output = crate::d5_trace::TraceOutput::create(42, &path).unwrap();
+        let mut queue = RowQueue::new(MAX_IDS + 1);
+        queue.enable_trace(output.trace.queue(42, 1, "test.rows").unwrap());
+        // バッファ上限の検査とは分け、スナップショット自体の上限だけを越える。
+        queue
+            .rows
+            .extend((0..=MAX_IDS).map(|id| (id as u128, row(1, 123))));
+        queue.trace_config_boundary(true);
+        assert!(output.finish(true).is_err());
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains("queue_opened"));
+        assert!(!text.contains("handoff") && !text.contains("complete"));
+    }
+
+    #[cfg(feature = "d5-trace")]
+    #[test]
+    fn d5_trace_records_large_discard_in_one_event_within_id_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [MAX_IDS, MAX_IDS + 1] {
+            let path = dir.path().join(format!("discard-{count}.jsonl"));
+            let output = crate::d5_trace::TraceOutput::create(42, &path).unwrap();
+            let mut queue = RowQueue::new(count);
+            queue.enable_trace(output.trace.queue(42, 1, "test.rows").unwrap());
+            // 破棄イベントだけを検証するため、投入イベントはチャネルに積まない。
+            queue
+                .rows
+                .extend((0..count).map(|id| (id as u128, row(1, 123))));
+            assert_eq!(queue.discard_all(), count);
+            assert_eq!(queue.discard_all(), 0);
+            assert!(queue.is_empty());
+            assert_eq!(queue.dropped(), count as u64);
+
+            let finished = output.finish(true);
+            let text = std::fs::read_to_string(path).unwrap();
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if count <= MAX_IDS {
+                finished.unwrap();
+                let ids: Vec<_> = (0..count).collect();
+                assert_eq!(events.len(), 4);
+                assert_eq!(
+                    events[2],
+                    serde_json::json!({"event": "discarded", "queue_id": 0, "row_ids": ids})
+                );
+                assert_eq!(
+                    events[3],
+                    serde_json::json!({"event": "complete", "records": 2})
+                );
+            } else {
+                assert!(finished.is_err());
+                assert_eq!(events.len(), 2, "only start and queue_opened remain");
+            }
+        }
+    }
 
     fn row(tag_id: i64, ts_ms: i64) -> Row {
         Row {
