@@ -12,6 +12,9 @@ jobs:
     name: ${{ matrix.shell }} / ${{ matrix.store }}
     runs-on: windows-2025
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +39,6 @@ jobs:
         with:
           persist-credentials: false
       - name: Verify issuance, failure cleanup and optional service connection
-        shell: ${{ matrix.shell }}
         env:
           S7_TLS_STORE: ${{ matrix.store }}
           S7_TLS_SERVICE: ${{ matrix.service }}
