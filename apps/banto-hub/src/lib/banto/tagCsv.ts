@@ -246,8 +246,8 @@ const TAG_DATA_TYPES: ReadonlySet<string> = new Set<TagDataType>([
 	'i32',
 	'u32',
 	'f32',
-	// 64bit 型の配置はサーバー側で検証する。Modbus と push は 3 型に対応し、
-	// PostgreSQL の db タグは f64 に対応する。CSV パーサは形式をチェックする。
+	// CSV パーサは型名の形式をチェックし、配置はサーバー側で検証する。
+	// Hub のレジストリは互換性のため PostgreSQL の db タグでも i64/u64 を受け付ける。
 	'i64',
 	'u64',
 	'f64',

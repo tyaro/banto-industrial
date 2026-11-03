@@ -798,12 +798,6 @@ fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<Validated
                         .to_string(),
                 });
             }
-            if matches!(input.data_type.as_str(), "i64" | "u64") {
-                errors.push(FieldError {
-                    field: "dataType".to_string(),
-                    message: "i64/u64 型は db タグに設定できません".to_string(),
-                });
-            }
             // §6-10「v1 は読み取り専用」: `computed` は `writable` を**エラー**
             // にするが、`db` は**黙って false へ正規化する**。両者の差は
             // `plc_connection.rs` の `"virtual"` (simulation を拒否) と
@@ -1101,8 +1095,7 @@ fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Resul
         return Ok(());
     }
 
-    // #1011: DB Source の db タグは f64 を使用できる。i64/u64 は共通の
-    // validate_tag_input で拒否する。
+    // #1011: レジストリなしでも PostgreSQL の db タグに f64 を許可する。
     let is_postgres_f64 =
         protocol == POSTGRES_PROTOCOL && tag_kind == DB_TAG_KIND && data_type == "f64";
     if MODBUS_ONLY_DATA_TYPES.contains(&data_type)
@@ -4648,25 +4641,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_db_tag_allows_f64_and_rejects_64bit_integers() {
+    async fn legacy_postgres_db_tag_allows_f64_and_rejects_64bit_integers() {
+        let (svc, _modbus_group) = setup().await;
+        let group_id = postgres_group(&svc.pool).await;
+        let mut input = db_tag_input("Rate", group_id, "rate");
+        input.data_type = "f64".to_string();
+        let created = svc.create(input.clone()).await.unwrap();
+        assert_eq!(created.data_type, "f64");
+        for data_type in ["i64", "u64"] {
+            input.data_type = data_type.to_string();
+            assert_64bit_placement_error(svc.create(input.clone()).await.unwrap_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_postgres_db_tags_keep_64bit_integer_compatibility() {
         let (legacy, _modbus_group) = setup().await;
         let group_id = postgres_group(&legacy.pool).await;
-        let registry =
-            TagService::with_registry(legacy.pool.clone(), Arc::new(DriverRegistry::new()));
-        for (svc, name) in [(legacy, "legacy"), (registry, "registry")] {
-            let mut input = db_tag_input(name, group_id, name);
-            input.data_type = "f64".to_string();
+        let svc = TagService::with_registry(legacy.pool.clone(), Arc::new(DriverRegistry::new()));
+        for data_type in ["i64", "u64"] {
+            let mut input = db_tag_input(data_type, group_id, data_type);
+            input.data_type = data_type.to_string();
             let created = svc.create(input.clone()).await.unwrap();
-            assert_eq!(created.data_type, "f64");
-            for data_type in ["i64", "u64"] {
-                input.data_type = data_type.to_string();
-                let err = svc.create(input.clone()).await.unwrap_err();
-                let BantoError::Validation { field_errors } = err else {
-                    panic!("expected Validation, got {err:?}");
-                };
-                assert_eq!(field_errors.len(), 1);
-                assert_eq!(field_errors[0].field, "dataType");
-            }
+            assert_eq!(created.data_type, data_type);
+
+            input.name = format!("{data_type}-renamed");
+            input.enabled = false;
+            let updated = svc.update(created.id, input.clone()).await.unwrap();
+            assert_eq!(updated.name, input.name);
+            assert_eq!(updated.data_type, data_type);
+            assert!(!updated.enabled);
         }
     }
 

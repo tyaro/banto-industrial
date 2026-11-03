@@ -308,8 +308,9 @@ export type TagDataType =
 export const MODBUS_ONLY_DATA_TYPES: readonly TagDataType[] = ['i64', 'u64', 'f64'];
 
 /**
- * PostgreSQL の DB タグは数値型と bit に対応する。#1011 で f64 を追加。
- * i64/u64 は現在値の倍精度浮動小数点表現で精度が落ちるため対象外。
+ * PostgreSQL の DB タグを画面で登録・編集する際の型の選択肢。#1011 で f64 を追加。
+ * i64/u64 は倍精度浮動小数点で精度が落ちるため候補から除く。Hub の API は
+ * 互換性のため i64/u64 の登録・更新を引き続き受け付ける。
  */
 export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
 	'bit',

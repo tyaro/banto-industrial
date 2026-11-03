@@ -1757,7 +1757,9 @@ BitInWord（ビット単体）は引き続き broker の Modbus ドライバが�
   （`calc`・`mem`）などの非対応の 64bit 型は `field: "dataType"` の
   バリデーションエラーになる。Hub のドライバレジストリを使う接続は
   ドライバの `supportedKinds` が型を決め、`push` の `plc` タグも
-  `i64`/`u64`/`f64` を受け付ける。
+  `i64`/`u64`/`f64` を受け付ける。Hub のレジストリ経路では、変更前から
+  `postgres` の `db` タグの `i64`/`u64` も API 経由で登録できたため、
+  CSV/API 経由の登録・更新互換性を保つ。画面の型候補には出さない。
   **この制約は SQL の CHECK 制約には入れていない**（判定にタグ →
   `collection_groups` → `plc_connections` の JOIN が要り、SQLite の CHECK
   では表現できないため）。強制は `banto-tags`（`crates/banto-tags/src/tag.rs`
@@ -1765,7 +1767,7 @@ BitInWord（ビット単体）は引き続き broker の Modbus ドライバが�
   `calc`/`mem`/`postgres` 配置ルール（§4.2 の表）と**全く同じ理由・同じ場所**
   の方式である。
 
-**2026-11-03 オーナー決定（#1011）**: PostgreSQL の DB Source では `f64` を追加で許可する。DB の数値列は `ServerTagStore` の `f64` に変換して保持するため、倍精度タグを選べるようにする。`i64`/`u64` は大きな整数の精度を別途決める必要があるため、PostgreSQL では引き続き拒否する。`f64` の Modbus 用の 4 ワード・ワード順の説明は PostgreSQL には適用しない。
+**2026-11-03 オーナー決定（#1011）**: PostgreSQL の DB Source 画面では `f64` を追加で選べるようにする。DB の数値列は `ServerTagStore` の `f64` に変換して保持するため。`i64`/`u64` は大きな整数の精度を別途決めるまで画面の候補には出さない。変更前からの CSV/API 経由の登録・更新は妨げない（2^53 超の整数は精度が落ちる）。`f64` の Modbus 用の 4 ワード・ワード順の説明は PostgreSQL には適用しない。
 
 - 値は既存どおり `f64`（`TagValue::F64`）で運ばれる。したがって **`i64`/`u64`
   は 2^53（9,007,199,254,740,992）を超える整数で精度が落ちる**。これは

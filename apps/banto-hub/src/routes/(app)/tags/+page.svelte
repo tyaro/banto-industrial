@@ -5730,11 +5730,9 @@
 				aria-describedby={describedBy(errors.dataType && 'tag-data-type-err')}
 			>
 				<!--
-					S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は
-					数値・bool・timestamp のみ」）: db タグは `string` 型を
-					選べない - `DB_TAG_ALLOWED_DATA_TYPES`（`dataTypeOptions`
-					から`string`を除いたもの、サーバー側`validate_tag_input`の
-					`DB_TAG_KIND`アームと同じ除外規則）で選択肢自体を絞る。
+					DB_TAG_ALLOWED_DATA_TYPES は db タグの画面上の型候補を絞る。
+					画面では string と i64/u64 を除く。Hub の API は string を拒否し、
+					互換性のため i64/u64 の登録・更新を引き続き受け付ける。
 				-->
 				{#each dataTypeOptionsFor(connectionForGroupId(form.collectionGroupId)?.protocol).filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
