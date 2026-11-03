@@ -1,7 +1,7 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **実装済み（Issue #682）。SDK の 3 つの PR と Hub の PR-H はすべて main に入った: PR-1（同一世代 snapshot）#983、PR-H #984、PR-2（部分解決）#985（いずれも 2026-10-31）、PR-3（`Unbound` と再解決経路）#986（2026-11-01）。ChronoGazer は PR-4 で SDK の部分解決と同一世代 snapshot に追従。利用者の残りは §10 の PR-5 Sink（§15 判断 3）。PR-3 の実機確認は 2026-11-01 に使い捨ての Hub（127.0.0.1）で済んだ: 未作成のタグだけで `unbound`、購読 0 件の WS を 644 秒保って切れず、タグの作成で 0.1 秒後に `live`、削除で 0.07 秒後に `unbound`。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+状態: **実装済み（Issue #682）。SDK の 3 つの PR と Hub の PR-H はすべて main に入った: PR-1（同一世代 snapshot）#983、PR-H #984、PR-2（部分解決）#985（いずれも 2026-10-31）、PR-3（`Unbound` と再解決経路）#986（2026-11-01）。ChronoGazer（PR-4、#1034）と Sink（PR-5）は SDK の部分解決と同一世代 snapshot に追従（§10）。Sink の S7 ブリッジ再検証は後続（§15 判断 3）。PR-3 の実機確認は 2026-11-01 に使い捨ての Hub（127.0.0.1）で済んだ: 未作成のタグだけで `unbound`、購読 0 件の WS を 644 秒保って切れず、タグの作成で 0.1 秒後に `live`、削除で 0.07 秒後に `unbound`。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
 閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
 Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
@@ -519,7 +519,7 @@ scada-design.md §9.6 案 C「改名候補の提示」は保留のまま）。
 - **P6（追加）**: 未作成だった名前が作られると `config_changed` → 再解決で `resolved` に移る。
   `Unbound` からは `Live` へ。
 - **P7（空の要求）**: `start(vec![])` は従来どおり `InvalidTagSelection`。「購読するものが無い」は
-  利用者が handle を作らないことで表す（Sink の `Subscription::start` が既にそうしている）。
+  利用者が handle を作らないことで表す。Sink は要求が空、または全件が購読プロトコルに載らないときにこの扱いにする。
 
 ## 9. current の無効化
 
