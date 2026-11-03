@@ -1432,7 +1432,11 @@
 			{#if dbTestState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
 			接続テスト
 		</button>
-		{#if !connection}<span class="hint">入力中の設定をテストします（保存はしません）。</span>{/if}
+		{#if connection}
+			<span class="hint">保存済みの設定をテストします（入力中の変更は反映されません）。</span>
+		{:else}
+			<span class="hint">入力中の設定をテストします（保存はしません）。</span>
+		{/if}
 		{#if dbTestState.testing}
 			<span class="test-result testing">テスト中…</span>
 		{:else if dbTestState.result}

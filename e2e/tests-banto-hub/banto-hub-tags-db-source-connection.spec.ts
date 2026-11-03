@@ -236,6 +236,11 @@ test.describe
 		// 保存済み接続なので接続テストボタンは有効（実際にクリックはしない
 		// - CI に実 PostgreSQL が無いため、ボタンの活性状態だけ固定する）。
 		await expect(drawer.getByRole('button', { name: '接続テスト' })).toBeEnabled();
+		await expect(
+			drawer.getByText('保存済みの設定をテストします（入力中の変更は反映されません）。', {
+				exact: true
+			})
+		).toBeVisible();
 
 		await adminPage.keyboard.press('Escape');
 	});

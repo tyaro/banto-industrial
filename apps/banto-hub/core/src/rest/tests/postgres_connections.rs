@@ -134,23 +134,158 @@ async fn queued_postgres_update_cannot_move_a_saved_password_to_a_different_host
             .unwrap()
     };
     let before = pending_count().await;
+    let input = json!({ "name": "queued-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } });
     let (status, body) = admin_put(
         &env.router,
         &format!("/api/plc-connections/{id}"),
         &env.admin_token,
-        json!({ "name": "queued-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } }),
+        input.clone(),
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
     assert!(body.to_string().contains("settings.password"), "{body:?}");
     assert!(!body.to_string().contains("original-secret"));
     assert_eq!(pending_count().await, before);
+    // A proposal already persisted before the enqueue guard must still fail at apply.
+    let pending_changes = PendingChangesService::new(env.pool.clone());
+    let payload = json!({ "id": id, "input": input });
+    let source = "plc_connections.update";
+    let fingerprint = compute_pending_base_fingerprint(
+        &env.manager.plc_connections(),
+        &CollectionGroupService::new(env.pool.clone()),
+        source,
+        &payload,
+    )
+    .await
+    .unwrap();
+    let pending = pending_changes
+        .create_pending(
+            source,
+            &payload,
+            env.manager.configured_revision() as i64,
+            Some(&fingerprint),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/stop",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let (status, body) = admin_post(
+        &env.router,
+        &format!("/api/pending-changes/{}/apply", pending.id),
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(body.to_string().contains("settings.password"), "{body:?}");
+    assert!(!body.to_string().contains("original-secret"));
+    assert_eq!(
+        pending_changes.get(pending.id).await.unwrap().state,
+        PendingChangeState::Failed
+    );
     let saved = env.manager.plc_connections().get(id).await.unwrap();
     assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
     assert_eq!(
         stored_password(&env.pool, id).await.as_deref(),
         Some("original-secret")
     );
+}
+
+#[tokio::test]
+async fn queued_postgres_updates_can_keep_replace_or_clear_the_saved_password() {
+    let env = test_env().await;
+    let settings =
+        |host: &str| json!({ "host": host, "port": 5432, "database": "erp", "username": "reader" });
+    let mut cases = Vec::new();
+    for (name, host, password, expected_password) in [
+        ("keep", "10.0.0.50", None, Some("original-secret")),
+        (
+            "replace",
+            "10.0.0.51",
+            Some(json!("new-secret")),
+            Some("new-secret"),
+        ),
+        ("clear", "10.0.0.51", Some(serde_json::Value::Null), None),
+    ] {
+        let mut original_settings = settings("10.0.0.50");
+        original_settings["password"] = json!("original-secret");
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": name, "protocol": "postgres", "settings": original_settings }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        let id = created["id"].as_i64().unwrap();
+        let mut updated_settings = settings(host);
+        if let Some(password) = password {
+            updated_settings["password"] = password;
+        }
+        cases.push((
+            id,
+            format!("{name}-updated"),
+            host,
+            updated_settings,
+            expected_password,
+        ));
+    }
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/start",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let mut queued = Vec::new();
+    for (id, name, host, settings, expected_password) in cases {
+        let (status, body) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{id}"),
+            &env.admin_token,
+            json!({ "name": name, "protocol": "postgres", "enabled": true, "simulation": false, "settings": settings }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{name}: {body:?}");
+        let pending_id = body["pending"]["id"].as_i64().unwrap();
+        queued.push((pending_id, id, name, host, expected_password));
+    }
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/stop",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    for (pending_id, id, name, host, expected_password) in queued {
+        let (status, body) = admin_post(
+            &env.router,
+            &format!("/api/pending-changes/{pending_id}/apply"),
+            &env.admin_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["state"], "applied", "{name}: {body:?}");
+        let saved = env.manager.plc_connections().get(id).await.unwrap();
+        assert_eq!(saved.name, name);
+        assert_eq!(saved.setting_str("host"), Some(host), "{name}");
+        assert_eq!(
+            stored_password(&env.pool, id).await.as_deref(),
+            expected_password,
+            "{name}"
+        );
+    }
 }
 
 /// `PUT`で`password: ""`を送ると、パスワードが消去される。
