@@ -1245,6 +1245,8 @@
 	let editForm = $state(blankForm());
 	/** T18-1（TAG-UX-C 一部）: `createBaseline` と同じ役割、edit 版。 */
 	let editBaseline: FormState = blankForm();
+	// 競合を検出して selected が更新されても、フォームを開いたときの型を表示する。
+	let editSourceTag = $state.raw<Tag | null>(null);
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
 
@@ -1476,6 +1478,7 @@
 	function selectTag(t: Tag): boolean {
 		if (!confirmDiscardIfNeeded()) return false;
 		selected = t;
+		editSourceTag = t;
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
 		editErrors = {};
@@ -1757,6 +1760,7 @@
 				focus: [externalNameForTag(updated)]
 			});
 			selected = updated;
+			editSourceTag = updated;
 			// 保存成功後はサーバーの正規化値を基準に取り直す - 未保存
 			// 変更は無くなったので直後の dirty 判定は false になる。
 			editForm = formFromTag(updated);
@@ -1809,6 +1813,7 @@
 	 */
 	function resolveConflictWithServer(): void {
 		if (!editConflict) return;
+		editSourceTag = editConflict.serverTag;
 		editForm = editConflict.serverForm;
 		editBaseline = editConflict.serverForm;
 		editConflict = null;
@@ -5160,7 +5165,8 @@
 	describeState: DescribeState,
 	onDescribeClick: () => void,
 	exprCheck: ExpressionCheckFieldHandlers,
-	writableArea: boolean | undefined
+	writableArea: boolean | undefined,
+	savedDbDataType?: TagDataType
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -5733,7 +5739,11 @@
 					DB_TAG_ALLOWED_DATA_TYPES は db タグの画面上の型候補を絞る。
 					画面では string と i64/u64 を除く。Hub の API は string を拒否し、
 					互換性のため i64/u64 の登録・更新を引き続き受け付ける。
+					保存済みの i64/u64 は編集フォームに表示し、変更時の選択候補からは外す。
 				-->
+				{#if form.tagKind === DB_TAG_KIND && (savedDbDataType === 'i64' || savedDbDataType === 'u64')}
+					<option value={savedDbDataType} disabled>{savedDbDataType}</option>
+				{/if}
 				{#each dataTypeOptionsFor(connectionForGroupId(form.collectionGroupId)?.protocol).filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
@@ -6309,7 +6319,8 @@
 			() => void runDescribeGroup(editForm.collectionGroupId, 'edit'),
 			editExprFieldHandlers(),
 			// R2b-2d: 領域の判定は既定の自動適用（create Drawer 限定）にだけ使う。
-			undefined
+			undefined,
+			editSourceTag?.tagKind === DB_TAG_KIND ? editSourceTag.dataType : undefined
 		)}
 		<div class="actions">
 			<button type="submit" disabled={isDrawerBusy()}>保存</button>
