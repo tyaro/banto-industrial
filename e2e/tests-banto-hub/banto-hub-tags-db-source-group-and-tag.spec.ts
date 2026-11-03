@@ -26,6 +26,7 @@
  *    欄が「結果列名」というラベルになっている。結果列名を手入力して作成
  *    できる。
  * 4. 作成したタグはグリッドの「種別」列に `db` と表示される。
+ * 5. API で登録済みの i64 型は単票で表示され、別項目を保存しても保持される。
  *
  * `banto-hub-tags-tree-context-menu.spec.ts`/`banto-hub-tags-db-source-connection.spec.ts`
  * と同じパターン: 別 `describe.serial` ブロック、前提データ（接続）は
@@ -41,6 +42,7 @@ const RUN_ID = Date.now();
 const PG_CONN = `e2e-dbsrc-grp-conn-${RUN_ID}`;
 const PG_GROUP = `e2e-dbsrc-grp-${RUN_ID}`;
 const DB_TAG_NAME = `e2e-dbsrc-tag-${RUN_ID}`;
+const LEGACY_DB_TAG_NAME = `${DB_TAG_NAME}-i64`;
 const RESULT_COLUMN = 'temperature';
 
 interface ConnectionRow {
@@ -81,7 +83,7 @@ async function cleanupFixtures(
 	const tagsRes = await request.get('/api/tags', { headers });
 	if (tagsRes.ok()) {
 		const tags = (await tagsRes.json()) as TagRow[];
-		for (const t of tags.filter((t) => t.name === DB_TAG_NAME)) {
+		for (const t of tags.filter((t) => t.name === DB_TAG_NAME || t.name === LEGACY_DB_TAG_NAME)) {
 			await request.delete(`/api/tags/${t.id}`, { headers });
 		}
 	}
@@ -188,7 +190,7 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 			(r) => r.url().includes('/api/collection-groups') && r.request().method() === 'POST'
 		);
 		await wizard.getByRole('button', { name: '作成', exact: true }).click();
-		await created;
+		expect(await (await created).json()).toMatchObject({ defaultWritable: false });
 
 		await expect(adminPage.getByText('作成しました')).toBeVisible();
 		const groupNode = groupNodeByName(adminPage, PG_GROUP);
@@ -214,6 +216,9 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 		await expect(drawer.getByTestId('tag-kind-db-badge')).toBeVisible();
 		await expect(drawer.getByTestId('tag-kind-db-badge')).toContainText('db');
 		await expect(drawer.locator('select#tag-kind')).toHaveCount(0);
+		await expect(
+			drawer.locator('#tag-data-type option:is([value="i64"], [value="u64"])')
+		).toHaveCount(0);
 
 		await drawer.locator('#tag-name').fill(DB_TAG_NAME);
 		// アドレス欄のラベルが「結果列名」になっている（PLC アドレスではない）。
@@ -242,5 +247,44 @@ test.describe.serial('banto-hub postgres（DB Source）グループ作成・db �
 		await expect(row).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: RESULT_COLUMN, exact: true })).toBeVisible();
 		await expect(row.getByRole('gridcell', { name: 'db', exact: true })).toBeVisible();
+	});
+
+	test('5. 登録済みの i64 型を表示し、単位だけを編集しても型を保持する', async () => {
+		const groupsRes = await adminPage.request.get('/api/collection-groups', {
+			headers: adminHeaders
+		});
+		expect(groupsRes.ok()).toBeTruthy();
+		const groups = (await groupsRes.json()) as GroupRow[];
+		const group = groups.find((g) => g.name === PG_GROUP);
+		expect(group).toBeDefined();
+		const created = await adminPage.request.post('/api/tags', {
+			headers: adminHeaders,
+			data: {
+				name: LEGACY_DB_TAG_NAME,
+				collectionGroupId: group!.id,
+				tagKind: 'db',
+				address: 'id',
+				dataType: 'i64'
+			}
+		});
+		expect(created.ok()).toBeTruthy();
+
+		await adminPage.goto('/tags');
+		await adminPage.getByPlaceholder('名前・アドレスで検索').fill(LEGACY_DB_TAG_NAME);
+		await adminPage.getByRole('gridcell', { name: LEGACY_DB_TAG_NAME, exact: true }).click();
+		const pane = adminPage.getByRole('complementary', { name: `${LEGACY_DB_TAG_NAME} を編集` });
+		const dataType = pane.locator('#tag-data-type');
+		await expect(dataType).toHaveValue('i64');
+		await expect(dataType.locator('option[value="i64"]:disabled')).toHaveCount(1);
+		await expect(dataType.locator('option[value="u64"]')).toHaveCount(0);
+
+		await pane.locator('#tag-unit').fill('count');
+		const saved = adminPage.waitForResponse(
+			(r) => r.url().includes('/api/tags/') && r.request().method() === 'PUT'
+		);
+		await pane.getByRole('button', { name: '保存', exact: true }).click();
+		const response = await saved;
+		expect(response.ok()).toBeTruthy();
+		expect(await response.json()).toMatchObject({ dataType: 'i64', unit: 'count' });
 	});
 });

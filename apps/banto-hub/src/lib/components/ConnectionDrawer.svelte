@@ -1232,9 +1232,7 @@
 					data-testid="bridge-load-estimate"
 				>
 					送る量の見積もり: 約 {bridgeLoadEstimate.messagesPerSecText} メッセージ/秒・{bridgeLoadEstimate.itemsPerSecText}
-					件/秒（上限の 8 割: {REGISTRATION_MESSAGES_PER_SEC} メッセージ・{REGISTRATION_ITEMS_PER_SEC.toLocaleString(
-						'ja-JP'
-					)} 件）
+					件/秒（{@render bridgeRateLimit()}）
 				</p>
 				{#if bridgeLoadEstimate.message}
 					<span class="err" role="alert">{bridgeLoadEstimate.message}</span>
@@ -1476,6 +1474,12 @@
 	</div>
 {/snippet}
 
+{#snippet bridgeRateLimit()}
+	上限の 8 割: {REGISTRATION_MESSAGES_PER_SEC} メッセージ・{REGISTRATION_ITEMS_PER_SEC.toLocaleString(
+		'ja-JP'
+	)} 件
+{/snippet}
+
 {#snippet confirmSummary()}
 	<dl class="summary">
 		<dt>名前</dt>
@@ -1495,7 +1499,7 @@
 					{postgresConnections.find((c) => String(c.id) === form.bridgeDbConnectionId)?.name ??
 						'（接続未選択）'} を読む・クエリ {form.bridgeQueries.length} 本{#if bridgeLoadEstimate}（約
 						{bridgeLoadEstimate.messagesPerSecText} メッセージ/秒・{bridgeLoadEstimate.itemsPerSecText}
-						件/秒）{/if}
+						件/秒、{@render bridgeRateLimit()}）{/if}
 				{:else}
 					なし（スクリプトなどの送り手が送る）
 				{/if}
@@ -1839,6 +1843,7 @@
 
 	.test-connection {
 		display: flex;
+		flex-wrap: wrap;
 		align-items: center;
 		gap: 0.6rem;
 		margin-bottom: 0.75rem;
@@ -1846,6 +1851,8 @@
 
 	.test-btn {
 		display: inline-flex;
+		flex-shrink: 0;
+		white-space: nowrap;
 		align-items: center;
 		gap: 0.4rem;
 		background: var(--banto-bg);
@@ -1875,6 +1882,8 @@
 
 	.test-result {
 		font-size: 0.8rem;
+		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 
 	.test-result.testing {

@@ -499,6 +499,21 @@ async fn stop_collection(app: &TestApp) {
 /// **catalog を commit するだけで収集は開始しない** - S2b 以降、値を待つテストは
 /// この後に [`start_collection`] を呼ぶ必要がある（停止中は DB へ繋がない）。
 async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&str]) -> i64 {
+    seed_typed(
+        app,
+        conn,
+        sql,
+        columns.iter().map(|&column| (column, "f32")),
+    )
+    .await
+}
+
+async fn seed_typed<'a>(
+    app: &TestApp,
+    conn: PlcConnectionInput,
+    sql: &str,
+    columns: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> i64 {
     let conn = PlcConnectionService::new(app.pool.clone())
         .create(conn)
         .await
@@ -507,9 +522,11 @@ async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&st
         .create(query_group_input("q1", conn.id, sql))
         .await
         .expect("query group should be created");
-    for column in columns {
+    for (column, data_type) in columns {
+        let mut input = db_tag_input(column, group.id, column);
+        input.data_type = data_type.to_string();
         TagService::new(app.pool.clone())
-            .create(db_tag_input(column, group.id, column))
+            .create(input)
             .await
             .unwrap_or_else(|e| panic!("db tag {column} should be created: {e:?}"));
     }
@@ -532,26 +549,40 @@ async fn seed(app: &TestApp, conn: PlcConnectionInput, sql: &str, columns: &[&st
 async fn values_qualities_and_unsupported_columns_from_a_real_postgresql() {
     let target = require_pg!();
     let app = test_app("values").await;
-    seed(
+    seed_typed(
         &app,
         pg_conn_input("erp", &target),
-        "SELECT 1.5 AS a, true AS b, NULL::int AS c, now() AS ts, 'x'::text AS s",
-        &["a", "b", "c", "ts", "s"],
+        "SELECT 1.5 AS a, true AS b, NULL::int AS c, now() AS ts, 'x'::text AS s, \
+         16777217::double precision AS precise",
+        [
+            ("a", "f32"),
+            ("b", "f32"),
+            ("c", "f32"),
+            ("ts", "f32"),
+            ("s", "f32"),
+            ("precise", "f64"),
+        ],
     )
     .await;
     start_collection(&app).await;
 
     let ready = wait_until(WAIT, || async {
-        value_of(&app, "erp.q1.a").await.1 == "good"
+        value_of(&app, "erp.q1.precise").await.1 == "good"
     })
     .await;
     assert!(
         ready,
-        "the db source should have produced a value for erp.q1.a"
+        "the db source should have produced a value for erp.q1.precise"
     );
 
     // 数値: numeric → float8。
     assert_eq!(value_of(&app, "erp.q1.a").await, (Some(1.5), "good".into()));
+    // f64 型の db タグを登録・収集し、double precision 列の値と品質を確認する。
+    // 収集経路は型によらず f64 を使うため、f32 タグとの精度差は検証しない。
+    assert_eq!(
+        value_of(&app, "erp.q1.precise").await,
+        (Some(16_777_217.0), "good".into())
+    );
     // bool → 1.0/0.0。
     assert_eq!(value_of(&app, "erp.q1.b").await, (Some(1.0), "good".into()));
     // NULL 列はタグ単位で Bad（§4.3）。

@@ -1245,6 +1245,8 @@
 	let editForm = $state(blankForm());
 	/** T18-1（TAG-UX-C 一部）: `createBaseline` と同じ役割、edit 版。 */
 	let editBaseline: FormState = blankForm();
+	// 競合を検出して selected が更新されても、フォームを開いたときの型を表示する。
+	let editSourceTag = $state.raw<Tag | null>(null);
 	let editErrors: Record<string, string> = $state({});
 	let saving = $state(false);
 
@@ -1476,6 +1478,7 @@
 	function selectTag(t: Tag): boolean {
 		if (!confirmDiscardIfNeeded()) return false;
 		selected = t;
+		editSourceTag = t;
 		editForm = formFromTag(t);
 		editBaseline = formFromTag(t);
 		editErrors = {};
@@ -1757,6 +1760,7 @@
 				focus: [externalNameForTag(updated)]
 			});
 			selected = updated;
+			editSourceTag = updated;
 			// 保存成功後はサーバーの正規化値を基準に取り直す - 未保存
 			// 変更は無くなったので直後の dirty 判定は false になる。
 			editForm = formFromTag(updated);
@@ -1809,6 +1813,7 @@
 	 */
 	function resolveConflictWithServer(): void {
 		if (!editConflict) return;
+		editSourceTag = editConflict.serverTag;
 		editForm = editConflict.serverForm;
 		editBaseline = editConflict.serverForm;
 		editConflict = null;
@@ -5125,6 +5130,29 @@
 	});
 </script>
 
+{#snippet dataType64BitHint(
+	dataType: TagDataType,
+	isModbus: boolean,
+	showExample = false,
+	wide = true
+)}
+	{@const showRegisters = isModbus && MODBUS_ONLY_DATA_TYPES.includes(dataType)}
+	{@const showPrecision = dataType === 'i64' || dataType === 'u64'}
+	{#if showRegisters || showPrecision}
+		<p class="hint" class:wide id={showExample ? 'tag-data-type-64bit-hint' : undefined}>
+			{#if showRegisters}4 レジスタ（64bit）を占有します。{/if}
+			{#if showPrecision}
+				値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
+			{/if}
+			{#if showRegisters}
+				ワード順は PLC 接続の設定（ワード順）に従います{#if showExample}
+					- 例えばオムロン KM-D1-ETN
+					のような機種は先頭レジスタが最下位ワード（LowHigh）です。機種のマニュアルで確認してください。{:else}。{/if}
+			{/if}
+		</p>
+	{/if}
+{/snippet}
+
 {#snippet tagFields(
 	form: FormState,
 	errors: Record<string, string>,
@@ -5137,7 +5165,8 @@
 	describeState: DescribeState,
 	onDescribeClick: () => void,
 	exprCheck: ExpressionCheckFieldHandlers,
-	writableArea: boolean | undefined
+	writableArea: boolean | undefined,
+	savedDbDataType?: TagDataType
 )}
 	<!--
 		TAG-P0-2（docs/banto-hub-desktop-plan.md §9.3、2026-08-10 実装メモ）:
@@ -5472,6 +5501,7 @@
 											<button
 												type="button"
 												class="db-column-candidate"
+												aria-pressed={trimmedAddress === col.name}
 												data-testid={`db-column-candidate-${col.name}`}
 												onclick={() => {
 													form.address = col.name;
@@ -5706,31 +5736,25 @@
 				aria-describedby={describedBy(errors.dataType && 'tag-data-type-err')}
 			>
 				<!--
-					S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は
-					数値・bool・timestamp のみ」）: db タグは `string` 型を
-					選べない - `DB_TAG_ALLOWED_DATA_TYPES`（`dataTypeOptions`
-					から`string`を除いたもの、サーバー側`validate_tag_input`の
-					`DB_TAG_KIND`アームと同じ除外規則）で選択肢自体を絞る。
+					DB_TAG_ALLOWED_DATA_TYPES は db タグの画面上の型候補を絞る。
+					画面では string と i64/u64 を除く。Hub の API は string を拒否し、
+					互換性のため i64/u64 の登録・更新を引き続き受け付ける。
+					保存済みの i64/u64 は編集フォームに表示し、変更時の選択候補からは外す。
 				-->
+				{#if form.tagKind === DB_TAG_KIND && (savedDbDataType === 'i64' || savedDbDataType === 'u64')}
+					<option value={savedDbDataType} disabled>{savedDbDataType}</option>
+				{/if}
 				{#each dataTypeOptionsFor(connectionForGroupId(form.collectionGroupId)?.protocol).filter((opt) => form.tagKind !== DB_TAG_KIND || DB_TAG_ALLOWED_DATA_TYPES.includes(opt.value)) as opt (opt.value)}
 					<option value={opt.value}>{opt.label}</option>
 				{/each}
 			</select>
 			{#if errors.dataType}<span class="err" id="tag-data-type-err">{errors.dataType}</span>{/if}
 		</label>
-		{#if MODBUS_ONLY_DATA_TYPES.includes(form.dataType)}
-			<!--
-				#325（2026-09-08 オーナー決定）: 64bit 型選択時の注記
-				（占有レジスタ数・精度制約・ワード順）。
-			-->
-			<p class="hint wide" id="tag-data-type-64bit-hint">
-				4 レジスタ（64bit）を占有します。
-				{#if form.dataType === 'i64' || form.dataType === 'u64'}
-					値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-				{/if}
-				ワード順は PLC 接続の設定（ワード順）に従います - 例えばオムロン KM-D1-ETN のような機種は先頭レジスタが最下位ワード（LowHigh）です。機種のマニュアルで確認してください。
-			</p>
-		{/if}
+		{@render dataType64BitHint(
+			form.dataType,
+			connectionForGroupId(form.collectionGroupId)?.protocol === 'modbus-tcp',
+			true
+		)}
 		{#if form.dataType === 'string'}
 			<label class="field">
 				文字列長（word数）
@@ -5968,15 +5992,7 @@
 			{/each}
 		</select>
 	</label>
-	{#if MODBUS_ONLY_DATA_TYPES.includes(continuousForm.dataType)}
-		<p class="hint wide">
-			4 レジスタ（64bit）を占有します。
-			{#if continuousForm.dataType === 'i64' || continuousForm.dataType === 'u64'}
-				値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-			{/if}
-			ワード順は PLC 接続の設定（ワード順）に従います。
-		</p>
-	{/if}
+	{@render dataType64BitHint(continuousForm.dataType, continuousProtocol === 'modbus-tcp')}
 	{#if continuousForm.dataType === 'string'}
 		<label class="field">
 			文字列長（word数）
@@ -6303,7 +6319,8 @@
 			() => void runDescribeGroup(editForm.collectionGroupId, 'edit'),
 			editExprFieldHandlers(),
 			// R2b-2d: 領域の判定は既定の自動適用（create Drawer 限定）にだけ使う。
-			undefined
+			undefined,
+			editSourceTag?.tagKind === DB_TAG_KIND ? editSourceTag.dataType : undefined
 		)}
 		<div class="actions">
 			<button type="submit" disabled={isDrawerBusy()}>保存</button>
@@ -7549,15 +7566,12 @@
 								{/each}
 							</select>
 						</label>
-						{#if MODBUS_ONLY_DATA_TYPES.includes(field.dataType)}
-							<p class="hint">
-								4 レジスタ（64bit）を占有します。
-								{#if field.dataType === 'i64' || field.dataType === 'u64'}
-									値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-								{/if}
-								ワード順は PLC 接続の設定（ワード順）に従います。
-							</p>
-						{/if}
+						{@render dataType64BitHint(
+							field.dataType,
+							structProtocol === 'modbus-tcp',
+							false,
+							false
+						)}
 						{#if field.dataType === 'string'}
 							<label class="field">
 								文字列長（word数）
@@ -8569,8 +8583,9 @@
 		cursor: pointer;
 	}
 
-	button.db-column-candidate:hover {
+	button.db-column-candidate[aria-pressed='true'] {
 		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		border-color: var(--banto-primary);
 	}
 
 	/*

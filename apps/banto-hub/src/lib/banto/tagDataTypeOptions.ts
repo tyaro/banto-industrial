@@ -10,8 +10,8 @@
  *   消えないようにするため。最終の検証はサーバー。
  * - **それ以外**（ホストの接続 `push`・`postgres`・`virtual`、接続の無いグループ
  *   `computed`・`internal`・`db`・未選択、一覧は届いたが載っていないドライバ）:
- *   ホストの表。`push` は string を除く全部（64bit を含む）、それ以外は 64bit を除く
- *   安全側（サーバー側 `banto-tags` が最終防衛線として拒否する）。
+ *   ホストの表。`push` は string を除く全部（64bit を含む）、`postgres` は
+ *   f64 を含む数値型と bit、それ以外は 64bit を除く。
  */
 import type { DriverInfo, PlcProtocol, TagDataType } from './tagRegistryAdmin';
 
@@ -77,5 +77,11 @@ export function dataTypeOptionsFor(
 	// R2a-2e（docs/banto-hub-ingest-design.md §3.3）: push のタグは数値（64bit を
 	// 含む）と bit だけ。string は送れない（サーバーの `push_tag_errors` が断る）。
 	if (protocol === 'push') return DATA_TYPE_OPTIONS.filter((opt) => opt.value !== 'string');
+	if (protocol === 'postgres') {
+		return DATA_TYPE_OPTIONS.filter(
+			(opt) =>
+				opt.value === 'f64' || (opt.value !== 'string' && !SIXTY_FOUR_BIT_TYPES.includes(opt.value))
+		);
+	}
 	return DATA_TYPE_OPTIONS.filter((opt) => !SIXTY_FOUR_BIT_TYPES.includes(opt.value));
 }

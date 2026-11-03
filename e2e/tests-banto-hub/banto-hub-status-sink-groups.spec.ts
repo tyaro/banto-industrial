@@ -175,9 +175,10 @@ test.describe.serial('banto-hub DB Sink: sink group の作成・編集・状態�
 
 		// タグ検索で対象タグだけに絞ってチェックする。
 		await drawer.getByPlaceholder('検索（タグ名・アドレス・接続・グループ）').fill(TAG_NAME);
-		const tagCheckbox = drawer
-			.locator('.tag-row', { hasText: TAG_NAME })
-			.locator('input[type="checkbox"]');
+		const tagRow = drawer.locator('.tag-row', { hasText: TAG_NAME });
+		await expect(tagRow).toContainText(PLC_CONN);
+		await expect(tagRow).toContainText(GROUP_NAME);
+		const tagCheckbox = tagRow.locator('input[type="checkbox"]');
 		await expect(tagCheckbox).toHaveCount(1);
 		await tagCheckbox.check();
 		await expect(drawer.getByText('1件選択中')).toBeVisible();
