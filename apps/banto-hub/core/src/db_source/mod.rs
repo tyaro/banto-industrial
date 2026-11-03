@@ -583,7 +583,11 @@ fn hide_test_password(outcome: &mut DbConnectionTestOutcome, password: &str) {
             .as_mut()
             .filter(|text| text.contains(password))
         {
-            *text = "接続テストの詳細に機密値が含まれるため表示できません。".into();
+            *text = match outcome.failure_kind {
+                DbConnectionTestFailureKind::Tcp => "通信エラーです。ホスト・ポートとネットワーク到達性を確認してください。詳細は機密値を含むため表示できません。",
+                DbConnectionTestFailureKind::Protocol => "PostgreSQL との通信または認証に失敗しました。詳細は機密値を含むため表示できません。",
+            }
+            .into();
         }
         if outcome
             .server_version
@@ -808,11 +812,16 @@ mod tests {
     #[test]
     fn test_password_redaction_hides_the_whole_field_without_revealing_match_positions() {
         let remote_error = "password authentication failed for user postgres";
-        let hidden = "接続テストの詳細に機密値が含まれるため表示できません。";
-        for password in ["password", "postgres", "a"] {
-            let mut outcome = DbConnectionTestOutcome::failed(remote_error.into());
-            hide_test_password(&mut outcome, password);
-            assert_eq!(outcome.error.as_deref(), Some(hidden));
+        for (kind, hidden) in [
+            (DbConnectionTestFailureKind::Tcp, "通信エラーです。ホスト・ポートとネットワーク到達性を確認してください。詳細は機密値を含むため表示できません。"),
+            (DbConnectionTestFailureKind::Protocol, "PostgreSQL との通信または認証に失敗しました。詳細は機密値を含むため表示できません。"),
+        ] {
+            for password in ["password", "postgres", "a"] {
+                let mut outcome = DbConnectionTestOutcome::failed_with_kind(remote_error.into(), kind);
+                hide_test_password(&mut outcome, password);
+                assert_eq!(outcome.error.as_deref(), Some(hidden));
+                assert_eq!(outcome.failure_kind, kind);
+            }
         }
         for password in ["PostgreSQL", "SQL", "a"] {
             let mut outcome = DbConnectionTestOutcome::ok("PostgreSQL fake version".into());

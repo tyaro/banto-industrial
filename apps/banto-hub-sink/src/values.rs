@@ -221,12 +221,21 @@ impl Subscription {
         desired: Vec<String>,
         view_tx: watch::Sender<Arc<ValueView>>,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
+        Self::start_with_recovery(config, desired, view_tx, SubscriptionRecovery::default()).await
+    }
+
+    pub(crate) async fn start_with_recovery(
+        config: &SidecarConfig,
+        desired: Vec<String>,
+        view_tx: watch::Sender<Arc<ValueView>>,
+        recovery: SubscriptionRecovery,
+    ) -> Result<Option<Self>, banto_tagclient::Error> {
         if desired.is_empty() {
             let _ = view_tx.send(Arc::new(ValueView::default()));
             return Ok(None);
         }
         let plan = plan_subscription(config, &desired).await?;
-        Self::start_with_plan(config, desired, plan, view_tx)
+        Self::start_with_plan_and_recovery(config, desired, plan, view_tx, recovery)
     }
 
     /// 計画済みの `plan.resolved` だけで購読を開始する。catalog は取らない
@@ -240,6 +249,22 @@ impl Subscription {
         desired: Vec<String>,
         plan: BindingPlan,
         view_tx: watch::Sender<Arc<ValueView>>,
+    ) -> Result<Option<Self>, banto_tagclient::Error> {
+        Self::start_with_plan_and_recovery(
+            config,
+            desired,
+            plan,
+            view_tx,
+            SubscriptionRecovery::default(),
+        )
+    }
+
+    pub(crate) fn start_with_plan_and_recovery(
+        config: &SidecarConfig,
+        desired: Vec<String>,
+        plan: BindingPlan,
+        view_tx: watch::Sender<Arc<ValueView>>,
+        recovery: SubscriptionRecovery,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
         if desired.is_empty() {
             let _ = view_tx.send(Arc::new(ValueView::default()));
@@ -273,7 +298,13 @@ impl Subscription {
             .collect();
         let handle = rest_client(config)?.start(requests)?;
         let state_rx = handle.state_watch();
-        let pump = tokio::spawn(pump_values(state_rx, view_tx, dead.clone(), replan.clone()));
+        let pump = tokio::spawn(pump_values(
+            state_rx,
+            view_tx,
+            dead.clone(),
+            replan.clone(),
+            recovery,
+        ));
         Ok(Some(Self {
             handle: Some(handle),
             pump: Some(pump),
@@ -325,15 +356,19 @@ impl Subscription {
         }
     }
 
-    /// worker を停止して join し、変換タスクも畳む。
+    /// 変換タスクを停止して join してから SDK worker を停止する。
     pub async fn stop(mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+            // Retire and join the observer BEFORE intentional SDK shutdown:
+            // shutdown may publish failure states that must not arm recovery.
+            // No late observation may clear/re-arm a replacement's shared latch.
+            let _ = pump.await;
+        }
         if let Some(handle) = self.handle.take() {
             // 停止時のエラー（`Unauthorized` で終わっていた世代など）は
             // ここでは意味を持たない - 呼び出し側は作り直すだけ。
             let _ = handle.shutdown().await;
-        }
-        if let Some(pump) = self.pump.take() {
-            pump.abort();
         }
     }
 }
@@ -348,6 +383,36 @@ impl Drop for Subscription {
     }
 }
 
+/// Only a failed SDK generation arms recovery: normal startup and catalog
+/// rebinding are not outages. Keep the latch across intermediate handshake states.
+#[derive(Clone, Default)]
+pub(crate) struct SubscriptionRecovery {
+    reconnecting: Arc<AtomicBool>,
+}
+
+impl SubscriptionRecovery {
+    pub(crate) fn failed(&self) {
+        self.reconnecting.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn reset(&self) {
+        self.reconnecting.store(false, Ordering::Relaxed);
+    }
+
+    fn observe(&self, state: TagClientConnectionState) -> Option<&'static str> {
+        match state {
+            TagClientConnectionState::Reconnecting | TagClientConnectionState::Unauthorized => {
+                self.failed()
+            }
+            TagClientConnectionState::Live if self.reconnecting.swap(false, Ordering::Relaxed) => {
+                return Some("banto-hub-sink: Hub へのタグ購読が復帰しました");
+            }
+            _ => {}
+        }
+        None
+    }
+}
+
 /// SDK の状態 watch を [`ValueView`] の watch へ変換し続けるタスク。
 /// 「SDK ハンドルは世代ごとに作り直すが、プロデューサが持つ受信端は
 /// 作り直さない」ための一枚。
@@ -356,11 +421,13 @@ async fn pump_values(
     view_tx: watch::Sender<Arc<ValueView>>,
     dead: Arc<AtomicBool>,
     replan: Arc<AtomicBool>,
+    recovery: SubscriptionRecovery,
 ) {
     let mut saw_active = false;
     loop {
-        {
+        let message = {
             let state = state_rx.borrow_and_update();
+            let message = recovery.observe(state.connection_state());
             if state.connection_state() != TagClientConnectionState::Stopped {
                 saw_active = true;
             } else if saw_active {
@@ -392,6 +459,11 @@ async fn pump_values(
                 None => ValueView::default(),
             };
             view_tx.send_replace(Arc::new(view));
+            message
+        };
+        // File/console logging is synchronous; never retain the SDK watch Ref.
+        if let Some(message) = message {
+            crate::log::log_line(message);
         }
         if state_rx.changed().await.is_err() {
             // 送信端（SDK ハンドル）が落ちた = この世代は終わり。
@@ -413,6 +485,70 @@ pub fn normalize_names(mut names: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_recovery_is_logged_once_after_a_failed_generation() {
+        use TagClientConnectionState::*;
+        let recovery = SubscriptionRecovery::default();
+        for state in [
+            Stopped,
+            Connecting,
+            Handshaking,
+            Live,
+            Live,
+            Rebinding,
+            Live,
+        ] {
+            assert_eq!(
+                recovery.observe(state),
+                None,
+                "startup / healthy rebind: {state}"
+            );
+        }
+        for state in [Reconnecting, Reconnecting, Connecting, Handshaking] {
+            assert_eq!(recovery.observe(state), None, "not recovered: {state}");
+        }
+        assert_eq!(
+            recovery.observe(Live),
+            Some("banto-hub-sink: Hub へのタグ購読が復帰しました")
+        );
+        assert_eq!(recovery.observe(Live), None, "repeat updates");
+        assert_eq!(recovery.observe(Reconnecting), None);
+        assert!(recovery.observe(Live).is_some(), "next outage");
+    }
+
+    #[test]
+    fn subscription_recovery_survives_replacement_but_not_an_intentional_reset() {
+        use TagClientConnectionState::*;
+        let owner = SubscriptionRecovery::default();
+        {
+            let first_pump = owner.clone();
+            assert_eq!(first_pump.observe(Live), None, "normal initial startup");
+            assert_eq!(first_pump.observe(Reconnecting), None);
+            assert_eq!(first_pump.observe(Stopped), None);
+        }
+        let replacement_pump = owner.clone();
+        assert_eq!(replacement_pump.observe(Connecting), None);
+        assert_eq!(replacement_pump.observe(Rebinding), None);
+        assert!(
+            replacement_pump.observe(Live).is_some(),
+            "outage survives pump replacement"
+        );
+        assert_eq!(owner.observe(Live), None, "one line across all generations");
+        assert_eq!(owner.clone().observe(Rebinding), None);
+        assert_eq!(
+            owner.clone().observe(Live),
+            None,
+            "intentional new generation is not an outage"
+        );
+        owner.failed(); // Engine observed an unexpected worker death/start error.
+        assert!(owner.clone().observe(Live).is_some());
+        assert_eq!(owner.observe(Unauthorized), None);
+        assert!(owner.clone().observe(Live).is_some());
+        owner.failed();
+        owner.reset(); // All desired tags removed: a later startup is intentional.
+        assert_eq!(owner.clone().observe(Live), None);
+    }
 
     #[test]
     fn normalize_names_sorts_and_deduplicates() {

@@ -171,7 +171,7 @@ async fn a_changed_modbus_unit_id_or_word_order_changes_the_resolved_dial_identi
 /// R2b-6b（docs/banto-hub-driver-ui-design.md §5）: 接続テストの `settings` はフォームの値だけを
 /// スキーマに通す（省いた `cpu_type`・`word_order` はスキーマの既定。保存済みからは引き継がない。
 /// #790 の「保存済みの CPU を引き継ぐ」は MCP の平らな形のアダプタに移した）。保存済みの接続は
-/// `connectionId` が**同じプロトコル**のときだけ返る（指紋と秘密値の補いの出どころ）。
+/// `connectionId` が**同じプロトコル**のときだけ返る（指紋用の参照の出どころ）。
 #[tokio::test]
 async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_same_protocol() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
@@ -378,13 +378,9 @@ async fn the_postgres_test_rejects_omitted_saved_secrets_and_uses_only_explicit_
     }
 
     // Id + omitted/null is refused before any dial, regardless of saved credentials.
-    // This fixture additionally declares the secret required, so empty/new input
-    // is rejected by its schema (the actual host postgres schema is different).
     for (connection_id, settings) in [
         (Some(saved.id), base.clone()),
         (Some(saved.id), with(json!(null))),
-        (Some(saved.id), with(json!(""))),
-        (None, base.clone()),
     ] {
         let refused = requested_settings(&env.manager, &driver, &payload(connection_id, settings))
             .await
@@ -392,6 +388,20 @@ async fn the_postgres_test_rejects_omitted_saved_secrets_and_uses_only_explicit_
             .expect("refused");
         assert!(refused.message.contains("password"), "{}", refused.message);
         assert!(!refused.message.contains("saved-pw"), "{}", refused.message);
+    }
+
+    // This fixture declares the secret required. Empty or absent input is
+    // reported as missing for the direct dial, unlike the host postgres schema.
+    for (connection_id, settings) in [(Some(saved.id), with(json!(""))), (None, base.clone())] {
+        let requested =
+            requested_settings(&env.manager, &driver, &payload(connection_id, settings))
+                .await
+                .unwrap_or_else(|err| panic!("{}", err.message));
+        assert!(requested.saved.is_none());
+        assert_eq!(requested.settings.get("password"), None);
+        assert_eq!(requested.missing_secrets.len(), 1);
+        assert_eq!(requested.missing_secrets[0].key, "settings.password");
+        assert!(!requested.missing_secrets[0].message.contains("saved-pw"));
     }
 }
 

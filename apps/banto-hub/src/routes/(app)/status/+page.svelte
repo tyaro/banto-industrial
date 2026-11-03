@@ -67,13 +67,9 @@
 	import { sessionStore } from '#lib/session.svelte.js';
 	import { commissioningState } from '#lib/banto/commissioningState.svelte.js';
 	import { isAdmin } from '#lib/permissions.js';
-	import {
-		getHubStatus,
-		type ConnectionStatusEntry,
-		type StatusResponse
-	} from '#lib/banto/hubStatus.js';
+	import { getHubStatus, type StatusResponse } from '#lib/banto/hubStatus.js';
 	import { formatBytes, formatPercent } from '#lib/banto/systemInfoFormat.js';
-	import { pushConnectionStatusLabel } from '#lib/banto/ingestStatusView.js';
+	import { connectionStatusView } from '#lib/banto/connectionStatusView.js';
 	import { listPlcConnections, isVirtualConnection } from '#lib/banto/tagRegistryAdmin.js';
 	import { enableWriteControl, disableWriteControl } from '#lib/banto/writeControlAdmin.js';
 	import { auditSpoolWarning } from '#lib/banto/auditSpoolWarning.js';
@@ -126,42 +122,6 @@
 
 	function errorMessage(err: unknown): string {
 		return isProviderError(err) ? err.message : String(err);
-	}
-
-	const statusLabels: Record<string, string> = {
-		connected: '接続中',
-		reconnecting: '再接続中',
-		stopped: '停止中',
-		// T19 S2-a（UX-48）: タグの無い接続はそもそもセッションを張らない
-		// ので「停止中」（本来動くはずが止まっている）とは区別する - 見た目
-		// が同じだと壊れていると誤解される（docs/banto-hub-t19-design.md
-		// §3.8）。
-		unused: '未使用（タグ未登録）'
-	};
-
-	function statusLabel(status: string): string {
-		return statusLabels[status] ?? status;
-	}
-
-	/**
-	 * R2a-2e（docs/banto-hub-ingest-design.md §9）: push（取り込み）接続は送り手を
-	 * 待つ側なので、`reconnecting`（`attempt: 0`）を「再接続中」ではなく
-	 * 「送り手待ち」、`connected` を「受信中」と読む。push かどうかは `ingest` 節に
-	 * その接続 id があるかで決める（接続の一覧の項目は増やさない）。
-	 */
-	function connectionStatusLabel(
-		conn: { id: number; status: string },
-		ingest: readonly { connection_id: number }[]
-	): string {
-		const isPush = ingest.some((entry) => entry.connection_id === conn.id);
-		return (isPush ? pushConnectionStatusLabel(conn.status) : null) ?? statusLabel(conn.status);
-	}
-
-	function statusClass(status: string): string {
-		if (status === 'connected') return 'ok';
-		if (status === 'reconnecting') return 'warn';
-		if (status === 'unused') return 'muted';
-		return 'bad';
 	}
 
 	function formatDateTime(value: string): string {
@@ -287,10 +247,6 @@
 		const timer = setInterval(() => void poll(), POLL_INTERVAL_MS);
 		return () => clearInterval(timer);
 	});
-
-	function connectionRowClass(conn: ConnectionStatusEntry): string {
-		return `status-${statusClass(conn.status)}`;
-	}
 
 	function pendingStateLabel(state: PendingChange['state']): string {
 		if (state === 'pending') return '保留中';
@@ -836,10 +792,11 @@
 					</thead>
 					<tbody>
 						{#each status.connections as conn (conn.id)}
-							<tr class={connectionRowClass(conn)}>
+							{@const view = connectionStatusView(conn, status.db_source, status.ingest)}
+							<tr class={`status-${view.tone}`}>
 								<td>{conn.name}</td>
-								<td>{connectionStatusLabel(conn, status.ingest)}</td>
-								<td>{conn.attempt ?? '-'}</td>
+								<td>{view.label}</td>
+								<td>{view.attempt ?? '-'}</td>
 							</tr>
 						{/each}
 					</tbody>

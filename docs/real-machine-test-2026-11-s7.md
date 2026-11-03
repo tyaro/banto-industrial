@@ -312,6 +312,8 @@ B-20・B-21 は、問い合わせの失敗で 1 周期だけ Stale を挟んで 
 
 ## 付録 R-2 の採取スクリプト
 
+`/api/v1/status` の応答は文字コードの推測に任せず、UTF-8 のバイト列として読む。
+
 PowerShell 7 と Windows PowerShell 5.1 のどちらでも動く。Hub の `GET /api/v1/status`（`Authorization: Bearer <read スコープの API キー>`）と `psql` の `SELECT count(*), max(ts) FROM tag_history` を 1 回ごとに CSV へ 1 行足す。API か psql の片方が失敗しても止まらず、その列を空にして `error` 列に短い理由を書き、次の回へ進む。`last_flush_at` はローカル時刻の ISO 8601 に直す。`delta_since_prev` は直前に取れた件数との差（psql が続けて失敗したときは、その間の合計の増分になる）。psql は `-w` でパスワードを対話で求めず、求められたら失敗として `error` 列に書く（夜間に入力待ちで止まらないため）。
 
 **キーは R-2 の採取用に `read` だけのものを 1 つ発行する**（`admin` を付けない。Sink のキーを流用しない。手順書 P-6）。
@@ -385,8 +387,12 @@ while ($true) {
     try {
         $key = [Environment]::GetEnvironmentVariable($KeyEnvName)
         if ([string]::IsNullOrEmpty($key)) { throw "env $KeyEnvName is not set" }
-        $st = Invoke-RestMethod -Uri ($HubUrl.TrimEnd('/') + '/api/v1/status') -Method Get -TimeoutSec 15 `
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ($HubUrl.TrimEnd('/') + '/api/v1/status') -Method Get -TimeoutSec 15 `
             -Headers @{ Authorization = "Bearer $key" }
+        $response.RawContentStream.Position = 0
+        $reader = [System.IO.StreamReader]::new($response.RawContentStream, [System.Text.Encoding]::UTF8)
+        try { $st = ConvertFrom-Json -InputObject $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
         $g = $st.sink.groups
         $row['sink_state'] = Join-Items $g { param($x) $x.id } { param($x) $x.state }
         $row['sink_queued'] = Join-Items $g { param($x) $x.id } { param($x) $x.queued }

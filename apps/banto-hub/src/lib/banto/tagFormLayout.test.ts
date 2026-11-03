@@ -13,7 +13,9 @@ import {
 	buildConfirmExternalName,
 	environmentLabel,
 	writePermissionLabel,
-	fieldErrorsFromList
+	fieldErrorsFromList,
+	displayTagKind,
+	tagKindOptionLabel
 } from './tagFormLayout';
 
 describe('hasFieldError', () => {
@@ -214,5 +216,23 @@ describe('fieldErrorsFromList', () => {
 		expect(
 			fieldErrorsFromList([{ field: 'configuration', message: '式の評価に失敗しました' }])
 		).toEqual({ configuration: '式の評価に失敗しました' });
+	});
+});
+
+describe('push tag source labels (#1008)', () => {
+	it('labels push-backed plc tags without changing the registry kind', () => {
+		const option = { value: 'plc', label: 'plc（PLC 収集）' };
+		expect(displayTagKind('plc', 'push')).toBe('push');
+		expect(tagKindOptionLabel(option, 'push')).toBe('push（外部取り込み）');
+		expect(option.value).toBe('plc');
+		expect(displayTagKind('plc', 'slmp')).toBe('plc');
+		expect(tagKindOptionLabel(option, 'slmp')).toBe(option.label);
+		expect(tagKindOptionLabel(option)).toBe(option.label);
+	});
+	it('keeps DB Source, computed and internal kinds distinct', () => {
+		for (const kind of ['db', 'computed', 'internal']) {
+			expect(displayTagKind(kind, 'push')).toBe(kind);
+			expect(displayTagKind(kind, 'postgres')).toBe(kind);
+		}
 	});
 });

@@ -1884,10 +1884,6 @@ impl PlcConnectionService {
             })?,
             None => Map::new(),
         };
-        let old_secret_keys = existing_protocol
-            .map(|protocol| self.secret_keys(protocol))
-            .unwrap_or_default();
-
         let mut settings = match &typed {
             Some(typed) => typed.settings.clone(),
             None => {
@@ -1920,7 +1916,8 @@ impl PlcConnectionService {
         for key in &secret_keys {
             match input.secrets.get(key).unwrap_or(&SecretChange::Keep) {
                 SecretChange::Keep => {
-                    if old_secret_keys.contains(key) {
+                    // A destination driver can declare the same key for a different credential.
+                    if existing_protocol == Some(input.protocol.as_str()) {
                         if let Some(r#ref) = secret_ref_of(&existing_settings, key) {
                             settings.insert(key.clone(), secret_ref_value(r#ref));
                             kept_refs.push(r#ref.to_string());
@@ -6877,6 +6874,23 @@ mod tests {
             .await
             .unwrap();
         assert!(all_secret_rows(&svc).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switching_from_postgres_drops_the_password_even_if_the_new_driver_uses_that_key() {
+        let svc = registry_service(&[
+            ("postgres", &[PASSWORD_KEY], 1),
+            ("modbus-tcp", &[PASSWORD_KEY], 1),
+        ])
+        .await;
+        let pg = svc
+            .create(with_password(postgres_input("PG"), REF_A, "pw-a"))
+            .await
+            .unwrap();
+        let switched = svc.update(pg.id, sample_input("PG")).await.unwrap();
+        assert_eq!(switched.protocol, "modbus-tcp");
+        assert_eq!(switched.secret_ref(PASSWORD_KEY), None);
+        assert!(svc.secret_rows(pg.id).await.unwrap().is_empty());
     }
 
     /// Delete, delete_tx, cascade_delete and cascade_delete_tx all remove the

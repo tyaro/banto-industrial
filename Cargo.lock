@@ -992,6 +992,7 @@ dependencies = [
  "banto-tstore",
  "futures-util",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "sqlx",

@@ -191,6 +191,16 @@ test.describe.serial('banto-hub 取り込み口 push（R2a-2e）', () => {
 		expect(tagRes.ok(), await tagRes.text()).toBe(true);
 
 		await page.goto('/tags');
+		// #1008: a push source is not described as PLC collection. The stored
+		// tag kind remains plc, as required by the registry/ingest contract.
+		await page.getByPlaceholder('名前・アドレスで検索').fill(PUSH_TAG);
+		const tagRow = page.getByRole('row').filter({ hasText: PUSH_TAG });
+		await expect(tagRow.getByRole('gridcell', { name: 'push', exact: true })).toBeVisible();
+		await tagRow.getByRole('gridcell', { name: PUSH_TAG, exact: true }).click();
+		const tagPane = page.getByRole('complementary', { name: `${PUSH_TAG} を編集` });
+		await expect(tagPane.locator('#tag-kind')).toHaveValue('plc');
+		await expect(tagPane.locator('#tag-kind option:checked')).toHaveText('push（外部取り込み）');
+		await tagPane.getByRole('button', { name: '閉じる', exact: true }).click();
 		await connectionNodeByName(page, PUSH_CONN).click({ button: 'right' });
 		await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
 		const drawer = page.getByRole('dialog', { name: `${PUSH_CONN} を編集`, exact: true });

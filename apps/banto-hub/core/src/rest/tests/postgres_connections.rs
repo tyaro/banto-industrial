@@ -1467,7 +1467,8 @@ async fn postgres_presave_probe_uses_ephemeral_inputs_and_never_persists_or_leak
         "authentication is not a TCP failure"
     );
     assert_eq!(
-        body["error"]["message"], "接続テストの詳細に機密値が含まれるため表示できません。",
+        body["error"]["message"],
+        "PostgreSQL との通信または認証に失敗しました。詳細は機密値を含むため表示できません。",
         "{body}"
     );
     assert!(!body.to_string().contains("ephemeral-secret"), "{body}");

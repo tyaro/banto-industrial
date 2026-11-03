@@ -773,8 +773,8 @@ const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(こ�
 ///
 /// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
 ///   ダイヤルする。省いた欄はスキーマの既定値。
-/// - postgres は connectionId の秘密値を読まない。id 指定時だけ password の明示文字列が必須。
-/// - 機器の秘密のキー: 省略は保存済み（`connectionId` の同じプロトコルの接続）の値を補う、
+/// - 秘密のキー: 保存済みの値は開かない。省略した必須値は直接ダイヤル前に断る。
+///   機器の同じ設定の共有セッションがあれば秘密値を開かず再利用する。
 ///   `null`・空文字は値無し、文字列はその値で試す（保存しない・封印しない）。
 /// - `simulation: true` はダイヤルの前に断る（未保存のフォームの今の値。新規・編集中とも）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -786,7 +786,7 @@ pub struct PlcConnectionTestPayload {
     #[serde(default)]
     pub settings: serde_json::Map<String, serde_json::Value>,
     /// 編集中の保存済み接続の id。broker のセッションの再利用（指紋が合うときだけ）と、
-    /// 省いた秘密値の補いに使う。
+    /// 保存済み設定の指紋照合用。秘密値は開かない。
     #[serde(default)]
     pub connection_id: Option<i64>,
 }
@@ -874,17 +874,19 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 
 /// 試す設定（R2b-6b）: フォームの `settings` をドライバのスキーマに通し
 /// （`banto_tags::settings_from_schema` → `settings_to_api`、保存と同じ組み立て）、秘密のキーを
-/// 足したもの。機器の秘密のキーはフォームの文字列があればそれ、省略なら保存済み
-/// （`connectionId` があり、同じプロトコル）の値を開いて補う。`null`・空文字は値無し。
-/// postgres は保存済み値を開かず、id 指定時の省略/null は拒否する。
-/// スキーマで必須の秘密の欄が埋まらなければ断る。スキーマを持たない postgres は同じ保存経路の
-/// `check_settings_input` で検証する（#1010、DB に書かない）。
+/// 足したもの。秘密のキーはフォームの文字列だけを使い、保存済みの値は開かない。
+/// `null`・空文字は値無し。必須の秘密の欠けと、保存済みの秘密を省略した場合は
+/// 共有セッションの照合後、直接ダイヤル前に断る。
+/// postgres は保存済み接続を参照せず、id 指定時の password の省略/null は拒否する。
+/// スキーマを持たない postgres は保存経路の `check_settings_input` で検証する（DB に書かない）。
 pub(super) struct RequestedSettings {
     pub(super) settings: Settings,
     /// 保存済みの接続（指紋に入る秘密値の参照の出どころ）。
     pub(super) saved: Option<PlcConnection>,
     /// フォームが秘密のキーを替えた・消したか（保存済みのセッションの読みは答えにならない）。
     pub(super) secrets_changed: bool,
+    /// Missing required or omitted saved secrets prevent direct dialing, but not an unchanged shared session.
+    pub(super) missing_secrets: Vec<banto_driver_api::FieldError>,
 }
 
 pub(super) async fn requested_settings(
@@ -919,11 +921,10 @@ pub(super) async fn requested_settings(
     let secret_keys = driver.secret_keys();
     let mut input = payload.settings.clone();
     let mut given: Vec<(String, String)> = Vec::new();
-    let mut omitted: Vec<String> = Vec::new();
     let mut secrets_changed = false;
     for key in &secret_keys {
         match input.remove(key) {
-            None => omitted.push(key.clone()),
+            None => {}
             Some(serde_json::Value::Null) => secrets_changed = true,
             Some(serde_json::Value::String(plain)) => {
                 secrets_changed = true;
@@ -970,51 +971,39 @@ pub(super) async fn requested_settings(
     for (key, plain) in given {
         settings.insert(key.as_str(), plain);
     }
-    if let (Some(conn), false) = (&saved, omitted.is_empty()) {
-        let rows = manager
-            .plc_connections()
-            .secret_rows(conn.id)
-            .await
-            .map_err(|err| {
-                test_error("protocol", format!("保存済みの秘密値を読めません: {err}"))
-            })?;
-        let secrets = crate::secrets::ConnectionSecrets::platform_default();
-        for key in &omitted {
-            match crate::secrets::open_connection_secret(&secrets, conn, key, &rows) {
-                Ok(Some(plain)) => settings.insert(key.as_str(), plain.as_str()),
-                Ok(None) => {}
-                Err(reason) => {
-                    return Err(test_error(
-                        "protocol",
-                        format!(
-                        "保存済みの {key} を読めません（{}）。入れ直してからテストしてください。",
-                        reason.as_str()
-                    ),
-                    ))
-                }
-            }
-        }
-    }
     let missing: Vec<banto_driver_api::FieldError> = driver
         .settings_schema()
         .fields
         .iter()
-        .filter(|field| {
-            field.required
-                && matches!(field.kind, banto_driver_api::FieldKind::Secret)
-                && settings.get(field.key.as_str()).is_none()
-        })
-        .map(|field| {
-            banto_driver_api::FieldError::new(format!("settings.{}", field.key), "必須です")
+        .filter_map(|field| {
+            if !matches!(field.kind, banto_driver_api::FieldKind::Secret)
+                || settings.get(field.key.as_str()).is_some()
+            {
+                return None;
+            }
+            let message = if field.required {
+                "必須です。接続テスト用に明示入力してください（保存済みの秘密値は使いません）"
+            } else if !payload.settings.contains_key(field.key.as_str())
+                && saved
+                    .as_ref()
+                    .and_then(|conn| conn.settings.get(field.key.as_str()))
+                    .is_some_and(banto_tags::settings_json::is_secret_ref)
+            {
+                "保存済みの秘密値はテストに使いません。「変える」で入力するか、値無しで試す場合は「消す」を選んでください（API では null を指定）"
+            } else {
+                return None;
+            };
+            Some(banto_driver_api::FieldError::new(
+                format!("settings.{}", field.key),
+                message,
+            ))
         })
         .collect();
-    if !missing.is_empty() {
-        return Err(refused_settings(&missing));
-    }
     Ok(RequestedSettings {
         settings,
         saved,
         secrets_changed,
+        missing_secrets: missing,
     })
 }
 
@@ -1077,7 +1066,7 @@ fn probe_outcome(results: Vec<Result<Value, ItemError>>) -> (bool, Option<PlcCon
 }
 
 /// 接続テストの本体(R2b-3a-2、docs/banto-hub-driver-io-design.md Q11)。
-/// プロトコルに依らない:
+/// 機器ドライバで共通の経路（PostgreSQL は専用のプローブを使う）。
 ///
 /// 1. 試す設定を作る([`requested_settings`])。
 /// 2. `payload.connection_id` があり、その接続の broker セッションが既に
@@ -1114,6 +1103,7 @@ async fn test_connection(
         settings,
         saved,
         secrets_changed,
+        missing_secrets,
     } = match requested_settings(manager, driver.as_ref(), payload).await {
         Ok(requested) => requested,
         Err(err) => return (false, Some(err)),
@@ -1183,6 +1173,11 @@ async fn test_connection(
                 Ok(Ok(results)) => probe_outcome(results),
             };
         }
+    }
+
+    // A caller-controlled direct dial may use only explicitly provided secrets.
+    if !missing_secrets.is_empty() {
+        return (false, Some(refused_settings(&missing_secrets)));
     }
 
     // 直接ダイヤル(connectionId が無い、またはセッションが見つからない場合)。
