@@ -1049,7 +1049,9 @@ jobs:
       # 上の段で外して、ここで 1 本だけ走らせる。
       - name: test (banto-hub-sink parity_9 alone)
         run: cargo test -p banto-hub-sink --test bridge_parity -- --exact parity_9_three_queries_at_the_registration_limit
-      # #1019: D-5 の行トレースは試験・調査用ビルドでだけ有効にする。
+      # #1019: 試験用コマンドの入口（main.rs）も dev-dependency を混ぜずにビルドする。
+      - name: build (banto-hub-sink D-5 trace)
+        run: cargo build -p banto-hub-sink --locked --features d5-trace
       - name: test (banto-hub-sink D-5 trace)
         run: cargo test -p banto-hub-sink --locked --features d5-trace --lib d5_trace
       # 配布物と同じく sink を単体で（dev-dependency の feature を混ぜずに）確かめる。

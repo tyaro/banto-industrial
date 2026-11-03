@@ -4,6 +4,20 @@
 
 対象: [#1019](https://github.com/tyaro/banto-industrial/issues/1019)、[S7 の観測 R-5](real-machine-test-2026-11-s7.md#r-5-欠ける範囲s-4)、[設計 §5.6](banto-hub-external-db-design.md)。
 
+## 試験に使った版と記録の場所
+
+2026-11-03 の隔離環境 A〜D、S7 実機 A・B、S7 実機 C・D は、いずれも `1140c8c1` を基点に `d5-trace` を追加した未コミットの作業ツリーで実施した。初回コミット `c5eccd8` は試験後の整形・Clippy 対応と文書・CI の追加を含むため、実行時点のコミットとしては扱わない。
+
+試験用プロキシ・設定・照合ハーネスと実行時のログは、この Windows PC の `target/d5-isolated-bc89bf66226e4dd48559299476f01da1/` に保管している。各 `run-*` 内の `evidence` に JSONL、標準出力・標準エラーのログに照合件数がある。
+
+| 実施          | ランチャー                        | 実施ログのフォルダ                                  |
+| ------------- | --------------------------------- | --------------------------------------------------- |
+| 隔離環境 A〜D | `run-rehearsal.ps1`               | `run-9356e307128a49b4ade7b8f6b677a49f/`             |
+| S7 実機 A・B  | `s7-mac/run-s7-mac.ps1`           | `s7-mac/run-70c9ba47700648d8acad8476ed69315b/`      |
+| S7 実機 C・D  | `s7-mac-move/run-s7-mac-move.ps1` | `s7-mac-move/run-861940613c8848ae9f3f6ff1cd015815/` |
+
+ランチャーとハーネスはローカル試験資材で、配布物や Git の管理対象には含まれない。実施時のハーネスは同じフォルダの `historical-v1/` に保存した。別の PC で再実行する場合は、隔離先と試験用 PostgreSQL の接続条件に合わせて用意する。
+
 ## 試験前にそろえるもの
 
 - 専用の Hub profile・設定 DB・データフォルダ・空きポート、専用の Sink 設定、実 PostgreSQL の空の試験用スキーマとテーブル。Hub と Sink は試験用のコンソールで起動する。SCM の既存サービス、運用 profile、既存の `tag_history` は使わない。S7 と同じく DB Source とブリッジの読み取り経路も含める。書き込みだけを遮断できる試験用プロキシを Sink の接続先に置き、読み取り経路と Hub–Sink の接続は維持する。
@@ -23,6 +37,8 @@ $env:BANTO_HUB_SINK_CONFIG = 'D:\d5-test\sink\banto-hub-sink.toml'
 ```
 
 Ctrl-C で停止し、JSONL の末尾に `complete` イベントがあることを確認する。記録の欠落、上限超過、異常終了で `complete` が無い場合は照合に使わない。試験はキューとバッチの採取を各 4,096 行以内、ファイルを 64 MiB 以内に収める。`batch_outcome` イベントの `outcome` に `unknown` があれば、そのケースの厳密一致は保留する。
+
+下記の実施ログは JSONL 形式 1 で、破棄行を `discarded` イベントの `row_id` に1行ずつ記録している。現在の形式 2 は、一度のキュー破棄を一つの `discarded` イベントにまとめ、`row_ids` に全行の ID を記録する。照合時は ID ごとに展開する。
 
 この採取はキューへの投入、設定反映時の残行、バッチの送信結果と破棄を対象にする。入力更新、producer の周期、購読の再確立を相互に照合する記録は別途用意する。
 

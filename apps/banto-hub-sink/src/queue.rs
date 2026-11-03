@@ -210,8 +210,13 @@ impl RowQueue {
         let count = self.rows.len();
         #[cfg(feature = "d5-trace")]
         if let Some(trace) = &self.trace {
-            for (row_id, _) in &self.rows {
-                trace.record(Event::Discarded { row_id: *row_id });
+            if count > MAX_IDS {
+                trace.invalidate();
+            } else if count != 0 {
+                // 大量の破棄も一つのイベントにまとめ、記録チャネルを埋めない。
+                trace.record(Event::Discarded {
+                    row_ids: self.rows.iter().map(|(id, _)| *id).collect(),
+                });
             }
         }
         self.rows.clear();
@@ -241,6 +246,49 @@ mod tests {
         let text = std::fs::read_to_string(path).unwrap();
         assert!(text.contains("queue_opened"));
         assert!(!text.contains("handoff") && !text.contains("complete"));
+    }
+
+    #[cfg(feature = "d5-trace")]
+    #[test]
+    fn d5_trace_records_large_discard_in_one_event_within_id_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        for count in [MAX_IDS, MAX_IDS + 1] {
+            let path = dir.path().join(format!("discard-{count}.jsonl"));
+            let output = crate::d5_trace::TraceOutput::create(42, &path).unwrap();
+            let mut queue = RowQueue::new(count);
+            queue.enable_trace(output.trace.queue(42, 1, "test.rows").unwrap());
+            // 破棄イベントだけを検証するため、投入イベントはチャネルに積まない。
+            queue
+                .rows
+                .extend((0..count).map(|id| (id as u128, row(1, 123))));
+            assert_eq!(queue.discard_all(), count);
+            assert_eq!(queue.discard_all(), 0);
+            assert!(queue.is_empty());
+            assert_eq!(queue.dropped(), count as u64);
+
+            let finished = output.finish(true);
+            let text = std::fs::read_to_string(path).unwrap();
+            let events: Vec<serde_json::Value> = text
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            if count <= MAX_IDS {
+                finished.unwrap();
+                let ids: Vec<_> = (0..count).collect();
+                assert_eq!(events.len(), 4);
+                assert_eq!(
+                    events[2],
+                    serde_json::json!({"event": "discarded", "queue_id": 0, "row_ids": ids})
+                );
+                assert_eq!(
+                    events[3],
+                    serde_json::json!({"event": "complete", "records": 2})
+                );
+            } else {
+                assert!(finished.is_err());
+                assert_eq!(events.len(), 2, "only start and queue_opened remain");
+            }
+        }
     }
 
     fn row(tag_id: i64, ts_ms: i64) -> Row {

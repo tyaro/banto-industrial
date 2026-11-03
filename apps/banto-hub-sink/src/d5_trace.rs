@@ -70,7 +70,7 @@ pub(crate) enum Event {
     },
     RejectedAtZeroCapacity,
     Discarded {
-        row_id: u128,
+        row_ids: Vec<u128>,
     },
     AckRemoved {
         row_id: u128,
@@ -282,7 +282,7 @@ fn write_trace(file: File, receiver: mpsc::Receiver<Record>, state: &Shared) -> 
     write_line(
         &mut writer,
         &mut remaining_bytes,
-        &serde_json::json!({"event": "start", "version": 1, "group_id": state.group_id}),
+        &serde_json::json!({"event": "start", "version": 2, "group_id": state.group_id}),
     )?;
     for record in receiver {
         if count == MAX_EVENTS {
@@ -386,7 +386,7 @@ mod tests {
         output.finish(true).unwrap();
 
         let lines = records(&path);
-        assert_eq!(lines[0], json!({"event":"start","version":1,"group_id":42}));
+        assert_eq!(lines[0], json!({"event":"start","version":2,"group_id":42}));
         assert_eq!(
             lines[2],
             json!({"event":"enqueued","queue_id":0,"row_id":0,
@@ -411,7 +411,7 @@ mod tests {
         assert_eq!(lines[14]["row_ids"], json!([2]));
         assert_eq!(
             lines[15],
-            json!({"event":"discarded","queue_id":0,"row_id":2})
+            json!({"event":"discarded","queue_id":0,"row_ids":[2]})
         );
         assert_eq!(lines[16], json!({"event":"complete","records":15}));
     }
