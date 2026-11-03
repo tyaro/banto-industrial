@@ -1,12 +1,12 @@
 # banto-tagclient 部分 Binding 解決と同一世代 snapshot の設計（#682）
 
 作成日: 2026-10-31
-状態: **実装済み（Issue #682）。SDK の 3 つの PR と Hub の PR-H はすべて main に入った: PR-1（同一世代 snapshot）#983、PR-H #984、PR-2（部分解決）#985（いずれも 2026-10-31）、PR-3（`Unbound` と再解決経路）#986（2026-11-01）。残りは §10 の利用者の追従（PR-4 ChronoGazer / PR-5 Sink、§15 判断 3 で時期は未決）。PR-3 の実機確認は 2026-11-01 に使い捨ての Hub（127.0.0.1）で済んだ: 未作成のタグだけで `unbound`、購読 0 件の WS を 644 秒保って切れず、タグの作成で 0.1 秒後に `live`、削除で 0.07 秒後に `unbound`。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
+状態: **実装済み（Issue #682）。SDK の 3 つの PR と Hub の PR-H はすべて main に入った: PR-1（同一世代 snapshot）#983、PR-H #984、PR-2（部分解決）#985（いずれも 2026-10-31）、PR-3（`Unbound` と再解決経路）#986（2026-11-01）。ChronoGazer は PR-4 で SDK の部分解決と同一世代 snapshot に追従。利用者の残りは §10 の PR-5 Sink（§15 判断 3）。PR-3 の実機確認は 2026-11-01 に使い捨ての Hub（127.0.0.1）で済んだ: 未作成のタグだけで `unbound`、購読 0 件の WS を 644 秒保って切れず、タグの作成で 0.1 秒後に `live`、削除で 0.07 秒後に `unbound`。** 実装は本書 §12 の SDK の 3 つの PR（同一世代 snapshot →
 部分解決 → 全件未解決時の再解決経路）と、**Hub の小さな PR 1 つ（PR-H、catalog / values 応答の裂けた読みを
 閉じる。PR-2 より前）**に分けて進める（2026-10-31 オーナー了承の進め方。会話での了承で、
 Issue には未記録。PR-H は 2026-10-31 の順序の総点検 §5.2 で足した）。§15 判断 1（strict ポリシーを作らない）・
 判断 2（全件未解決は新状態 `Unbound`）は 2026-10-31 オーナー決定で本書の立場を採用した。判断 3（ChronoGazer・Sink の追従の時期）は 2026-11-01 オーナー決定で S7 の後。
-main へのマージは S7（2026-11-02〜11-08）の後。本書は
+利用者の追従は S7 の D-1〜D-5 の確認後に進める。本書は
 [banto-tagclient-design.md](banto-tagclient-design.md) の §3.1・§3.2・§4・§5 を**上書きする差分**であり、
 本書に書いていないことは同書が正。実装が入ったら同書の該当節を本書に合わせて直し、本書の
 `状態:` 行を更新する。
@@ -543,7 +543,7 @@ shutdown / restart / backoff の保証（banto-tagclient-design.md §4・§5・�
 
 ## 10. 既存利用者の移行（D1・D7）
 
-| 利用者                                         | 今                                                                                                                                                                                           | SDK の 3 PR の後にすること（別 PR、1 利用者 1 PR）                                                                                                                                                                                                                                                                                                                                                                                                       |
+| 利用者                                         | SDK 追従前                                                                                                                                                                                   | SDK の 3 PR の後にすること（別 PR、1 利用者 1 PR）                                                                                                                                                                                                                                                                                                                                                                                                       |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ChronoGazer `apps/chronogazer/core/src/hub.rs` | `plan_bindings` で catalog を引いて `resolved` だけ `start`。`unresolved` / `unsupported` を `HubSubscriptionView` に出す。見張りが `Rebinding` / `BindingUnresolved` を張り直し対象にする。 | 選択タグを**全件** `start` に渡す（`unsupported` の綴り除外は純関数のまま残す）。`unresolved` は `snapshot().resolution.unresolved` から出す。`needs_replan` から `BindingUnresolved` を外し、`Rebinding` を `needs_rebuild` から外す（SDK が自力で戻る）。`Unbound` を「購読は張れているが全部無い」として表示に足す。`Fingerprint` の catalog 依存を外す（選択タグの変化による張り直し＝`shutdown` → `start(new_requests)` は残す、§0）。              |
 | Sink `apps/banto-hub-sink/src/values.rs`       | 同上 + `replan` で即時張り直し + 周期 replan。                                                                                                                                               | `plan_subscription` の catalog 取得・`replan`・周期 replan を消す。`unresolved` は snapshot から。`Unbound` を `ValueView { live: false }` に写す。`run.rs` `ensure_subscription` の作り直す条件のうち、`needs_replan`（SDK の解決失敗）と周期 replan（`periodic_due`）だけを消す。**`changed`（設定変更で要求集合が変わった）は残し**、従来どおり `shutdown` → `start(new_requests)` で入れ替える（SDK は要求集合を変えない、§0。Codex の指摘による）。 |
