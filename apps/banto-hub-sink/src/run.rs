@@ -313,6 +313,8 @@ enum Carried {
 struct Engine {
     config: SidecarConfig,
     options: SidecarOptions,
+    #[cfg(feature = "d5-trace")]
+    trace: Option<crate::d5_trace::Trace>,
     hub: HubApi,
     groups: Arc<GroupRegistry>,
     producers: HashMap<i64, JoinHandle<()>>,
@@ -348,6 +350,8 @@ impl Engine {
         Ok(Self {
             config,
             options,
+            #[cfg(feature = "d5-trace")]
+            trace: None,
             hub,
             groups: Arc::new(GroupRegistry::new()),
             producers: HashMap::new(),
@@ -468,6 +472,10 @@ impl Engine {
                         GroupRuntime::with_queue(group, QueueOrigin::Shared(runtime.shared_queue()))
                             .ok()
                     });
+                #[cfg(feature = "d5-trace")]
+                if self.trace.is_some() {
+                    runtime.trace_config_boundary(next.is_some());
+                }
                 match next {
                     Some(next) => {
                         let next = Arc::new(next);
@@ -644,7 +652,13 @@ impl Engine {
             Carried::Runtime(runtime) => runtime,
             Carried::Dropped(dropped) => {
                 match GroupRuntime::new(group, self.config.queue_max_rows, dropped) {
-                    Ok(runtime) => Arc::new(runtime),
+                    Ok(runtime) => {
+                        #[cfg(feature = "d5-trace")]
+                        if let Some(trace) = &self.trace {
+                            runtime.enable_trace(trace);
+                        }
+                        Arc::new(runtime)
+                    }
                     Err(err) => {
                         self.mark_broken(group.id, err.message(), dropped);
                         return;
@@ -1050,6 +1064,39 @@ pub async fn run<F>(
 where
     F: Future<Output = StopRequest>,
 {
+    run_inner(
+        config,
+        options,
+        shutdown,
+        #[cfg(feature = "d5-trace")]
+        None,
+    )
+    .await
+}
+
+/// 隔離試験のコンソール用。通常の run とサービスの起動からは呼ばない。
+#[cfg(feature = "d5-trace")]
+pub async fn run_with_d5_trace<F>(
+    config: SidecarConfig,
+    options: SidecarOptions,
+    shutdown: F,
+    output: &crate::d5_trace::TraceOutput,
+) -> Result<(), HubApiError>
+where
+    F: Future<Output = StopRequest>,
+{
+    run_inner(config, options, shutdown, Some(output.trace.clone())).await
+}
+
+async fn run_inner<F>(
+    config: SidecarConfig,
+    options: SidecarOptions,
+    shutdown: F,
+    #[cfg(feature = "d5-trace")] trace: Option<crate::d5_trace::Trace>,
+) -> Result<(), HubApiError>
+where
+    F: Future<Output = StopRequest>,
+{
     if !config.transport_is_valid() {
         return Err(HubApiError::Transport);
     }
@@ -1075,6 +1122,10 @@ where
     // R2a-3b: DB ブリッジ。エンジンとは別のタスク群で、設定の取得も独立（`crate::source`）。
     let bridge = BridgeSupervisor::spawn(&config)?;
     let mut engine = Engine::new(config, options)?;
+    #[cfg(feature = "d5-trace")]
+    {
+        engine.trace = trace;
+    }
     tokio::pin!(shutdown);
 
     // 起動直後は「取れるまで待つ」だけ - 取れなくても終了しない。

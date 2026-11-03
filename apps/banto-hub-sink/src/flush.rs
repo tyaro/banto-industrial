@@ -522,11 +522,19 @@ async fn insert_batch_bounded(
     table: &Table,
     rows: &[Row],
     budget: Duration,
+    #[cfg(feature = "d5-trace")] attempt: Option<&mut crate::d5_trace::Attempt>,
 ) -> Result<(), BoundedSqlError> {
     let mut connection = OperationConnection::default();
     let result = tokio::time::timeout(budget, async {
         connection.0 = Some(pool.acquire().await?);
-        insert_batch(connection.as_mut(), table, rows).await
+        insert_batch(
+            connection.as_mut(),
+            table,
+            rows,
+            #[cfg(feature = "d5-trace")]
+            attempt,
+        )
+        .await
     })
     .await;
     match result {
@@ -674,17 +682,27 @@ impl Flusher {
             if batch.is_empty() {
                 return Ok(());
             }
+            #[cfg(feature = "d5-trace")]
+            let mut batch = batch;
+            #[cfg(feature = "d5-trace")]
+            let mut attempt = batch.trace_attempt();
             match insert_batch_bounded(
                 &self.pool,
                 &group.table,
                 &batch,
                 self.options.operation_timeout,
+                #[cfg(feature = "d5-trace")]
+                attempt.as_mut(),
             )
             .await
             {
                 Ok(()) => {
                     // commit されてからキューを進める（at-least-once）。
                     group.commit_batch(&batch);
+                    #[cfg(feature = "d5-trace")]
+                    if let Some(attempt) = attempt {
+                        attempt.confirm();
+                    }
                     if group.mark_flushed(now_ms()) {
                         log_line(&format!(
                             "banto-hub-sink: グループ {} (id={}) の保存を再開しました",
@@ -750,6 +768,7 @@ async fn insert_batch(
     conn: &mut PgConnection,
     table: &Table,
     rows: &[Row],
+    #[cfg(feature = "d5-trace")] attempt: Option<&mut crate::d5_trace::Attempt>,
 ) -> Result<(), SqlxError> {
     debug_assert!(!rows.is_empty());
     let sql = table.insert_sql(rows.len());
@@ -766,6 +785,10 @@ async fn insert_batch(
             .bind(row.quality.as_str());
     }
     query.execute(&mut *tx).await?;
+    #[cfg(feature = "d5-trace")]
+    if let Some(attempt) = attempt {
+        attempt.commit_started = true;
+    }
     tx.commit().await?;
     Ok(())
 }

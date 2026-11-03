@@ -102,6 +102,8 @@
 //! モジュール doc「サービスログファイルの置き場」節参照、I4 追従）。
 
 pub mod config;
+#[cfg(feature = "d5-trace")]
+pub mod d5_trace;
 pub mod flush;
 pub mod group;
 pub mod hub_api;

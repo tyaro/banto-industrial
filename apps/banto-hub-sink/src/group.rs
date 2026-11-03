@@ -243,6 +243,18 @@ impl GroupRuntime {
         self.queue.clone()
     }
 
+    #[cfg(feature = "d5-trace")]
+    pub(crate) fn enable_trace(&self, trace: &crate::d5_trace::Trace) {
+        if let Some(trace) = trace.queue(self.id, self.db_connection_id, self.table.raw()) {
+            self.queue().enable_trace(trace);
+        }
+    }
+
+    #[cfg(feature = "d5-trace")]
+    pub(crate) fn trace_config_boundary(&self, carries_over: bool) {
+        self.queue().trace_config_boundary(carries_over);
+    }
+
     fn status(&self) -> std::sync::MutexGuard<'_, GroupStatusInner> {
         self.status.lock().unwrap_or_else(|p| p.into_inner())
     }
