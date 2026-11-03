@@ -26,7 +26,7 @@
 //! ## エラー
 //!
 //! [`HubApiError`] は「認証（401/403）」「その他の HTTP ステータス」
-//! 「トランスポート」「本文が解釈できない」の 4 分類だけを持つ。
+//! 「TLS」「トランスポート」「本文が解釈できない」の 5 分類を持つ。
 //! 401/403 は**設定の問題**（キーが失効した・スコープが足りない）で
 //! 再試行では直らないため、呼び出し側は 1 回だけ `warn` してバック
 //! オフする（設計 §5.2 の実装指示）。
@@ -289,6 +289,8 @@ pub enum HubApiError {
     Status(u16),
     /// 接続できない・タイムアウト（Hub 未起動を含む正常な待ち状態）。
     Transport,
+    /// TLS negotiation / certificate verification failed. Contains no remote details.
+    Tls,
     /// 本文が期待した JSON ではない。
     Protocol,
 }
@@ -301,6 +303,7 @@ impl fmt::Display for HubApiError {
             ),
             Self::Status(code) => write!(f, "Hub が想定外のステータスを返しました: HTTP {code}"),
             Self::Transport => f.write_str("Hub へ接続できません（未起動・ポート・ファイアウォール）"),
+            Self::Tls => f.write_str("Hub への TLS 接続を検証できません。Hub の証明書・接続先の名前・有効期限と、hub_tls_pinned_certs の設定を確認してください"),
             Self::Protocol => f.write_str("Hub の応答を解釈できませんでした"),
         }
     }
@@ -339,7 +342,7 @@ impl HubApi {
         if let Some(pins) = &config.hub_tls {
             builder = pins.configure_reqwest(builder);
         }
-        let http = builder.build().map_err(|_| HubApiError::Transport)?;
+        let http = builder.build().map_err(classify_transport)?;
         let base = config.hub_url.trim_end_matches('/');
         Ok(Self {
             http,
@@ -358,7 +361,7 @@ impl HubApi {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|_| HubApiError::Transport)?;
+            .map_err(classify_transport)?;
         let status = response.status();
         if !status.is_success() {
             return Err(classify_status(status));
@@ -377,7 +380,7 @@ impl HubApi {
             .bearer_auth(&self.api_key)
             .send()
             .await
-            .map_err(|_| HubApiError::Transport)?;
+            .map_err(classify_transport)?;
         let status = response.status();
         if !status.is_success() {
             return Err(classify_status(status));
@@ -397,7 +400,7 @@ impl HubApi {
             .body(payload)
             .send()
             .await
-            .map_err(|_| HubApiError::Transport)?;
+            .map_err(classify_transport)?;
         let status = response.status();
         if status.is_success() {
             Ok(())
@@ -405,6 +408,31 @@ impl HubApi {
             Err(classify_status(status))
         }
     }
+}
+
+/// Inspect types only: reqwest's Display/Debug can contain the full request URL.
+/// A timed-out handshake remains a timeout, rather than claiming a certificate error.
+fn classify_transport(error: reqwest::Error) -> HubApiError {
+    if !error.is_timeout() && has_tls_cause(&error) {
+        HubApiError::Tls
+    } else {
+        HubApiError::Transport
+    }
+}
+
+// Only a typed rustls::Error proves TLS failure. A peer closing without an
+// alert exposes no such cause and remains a Transport error.
+fn has_tls_cause(error: &(dyn std::error::Error + 'static)) -> bool {
+    if error.is::<rustls::Error>() {
+        return true;
+    }
+    // io::Error may wrap TLS failures; inspect its payload as well as source().
+    if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        if error.get_ref().is_some_and(|inner| has_tls_cause(inner)) {
+            return true;
+        }
+    }
+    error.source().is_some_and(has_tls_cause)
 }
 
 fn classify_status(status: StatusCode) -> HubApiError {
@@ -561,6 +589,46 @@ mod tests {
     }
 
     #[test]
+    fn tls_causes_are_identified_without_matching_error_text() {
+        let tls = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+        );
+        assert!(has_tls_cause(&tls));
+        assert!(!has_tls_cause(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "TLS certificate secret.example"
+        )));
+    }
+
+    #[tokio::test]
+    async fn connection_refusal_and_timeout_remain_transport_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/sensitive-path?api_key=secret",
+            listener.local_addr().unwrap()
+        );
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_millis(100))
+            .build()
+            .unwrap();
+        // A bound, unaccepted listener never answers HTTP.
+        let timeout = client.get(&url).send().await.unwrap_err();
+        assert!(timeout.is_timeout());
+        assert_eq!(classify_transport(timeout), HubApiError::Transport);
+        drop(listener);
+        let refusal_client = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let refused = refusal_client.get(&url).send().await.unwrap_err();
+        assert!(refused.is_connect() && !refused.is_timeout());
+        assert_eq!(classify_transport(refused), HubApiError::Transport);
+    }
+
+    #[test]
     fn status_codes_are_classified() {
         assert_eq!(
             classify_status(StatusCode::UNAUTHORIZED),
@@ -576,5 +644,6 @@ mod tests {
         );
         assert!(HubApiError::Unauthorized.is_auth());
         assert!(!HubApiError::Transport.is_auth());
+        assert!(!HubApiError::Tls.is_auth());
     }
 }
