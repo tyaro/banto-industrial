@@ -70,17 +70,16 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &[
     "bit", "i16", "u16", "i32", "u32", "f32", "i64", "u64", "f64",
 ];
 
-/// The 64-bit data types, which may only be used by a tag whose collection
-/// group sits under a [`crate::plc_connection::MODBUS_PROTOCOL`] connection
+/// The 64-bit types supported by [`crate::plc_connection::MODBUS_PROTOCOL`]
 /// (#325, **2026-09-08 オーナー決定**).
 ///
 /// Two halves of that decision, both deliberate:
 ///
-/// 1. **Modbus only.** 64-bit values occupy four consecutive registers
+/// 1. **Modbus register support.** 64-bit values occupy four consecutive registers
 ///    (`banto_plc::DataType::register_span() == 4`), which the Modbus
 ///    decoder handles like any other multi-register type; SLMP, the
-///    `"virtual"` `calc`/`mem` connections and `"postgres"` DB Source have
-///    no such story, so a 64-bit tag under any of them is rejected at
+///    `"virtual"` `calc`/`mem` connections do not support these types,
+///    so a 64-bit tag under any of them is rejected at
 ///    registration rather than silently never decoding. Enforced by
 ///    [`validate_tag_placement`] (which can join a tag's group back to its
 ///    connection), not by the SQL `CHECK` - exactly the same split, and for
@@ -90,6 +89,9 @@ pub const NUMERIC_DATA_TYPES: &[&str] = &[
 ///    as `f64` (`banto_plc::TagValue::F64`), so an `i64`/`u64` beyond 2^53
 ///    loses low-order bits. The owner accepted this rather than widening the
 ///    whole value pipeline to a 64-bit integer variant.
+///
+/// PostgreSQL DB Source tags support `f64` (#1011). Hub and push tags
+/// have their own placement rules.
 ///
 /// **Registry-less services only** ([`TagService::new`], ChronoGazer until
 /// R2b-7). With a registry (the Hub) the connection's driver decides through
@@ -796,6 +798,12 @@ fn validate_tag_input(input: &TagInput, rules: AddressRules) -> Result<Validated
                         .to_string(),
                 });
             }
+            if matches!(input.data_type.as_str(), "i64" | "u64") {
+                errors.push(FieldError {
+                    field: "dataType".to_string(),
+                    message: "i64/u64 型は db タグに設定できません".to_string(),
+                });
+            }
             // §6-10「v1 は読み取り専用」: `computed` は `writable` を**エラー**
             // にするが、`db` は**黙って false へ正規化する**。両者の差は
             // `plc_connection.rs` の `"virtual"` (simulation を拒否) と
@@ -1025,8 +1033,9 @@ fn tag_kind_placement_error(conn_name: &str, protocol: &str, tag_kind: &str) -> 
 /// - **`tag_kind` placement** (T6-2 / DB Source S2): which species of tag may
 ///   live under which connection - reported on `"tagKind"`.
 /// - **`data_type` placement** (#325, 2026-09-08 オーナー決定): the 64-bit
-///   types ([`MODBUS_ONLY_DATA_TYPES`]) only under a
-///   [`MODBUS_PROTOCOL`] connection - reported on `"dataType"`.
+///   types ([`MODBUS_ONLY_DATA_TYPES`]) under a [`MODBUS_PROTOCOL`] connection,
+///   with `f64` also available to PostgreSQL DB Source tags (#1011).
+///   Placement errors are reported on `"dataType"`.
 ///
 /// Both are checked, and the `tag_kind` verdict is returned first when both
 /// fail: a `computed` tag misplaced *and* typed `i64` is misplaced first and
@@ -1092,15 +1101,17 @@ fn placement_verdict(conn_name: &str, protocol: &str, input: &TagInput) -> Resul
         return Ok(());
     }
 
-    // #325 (2026-09-08 オーナー決定): 64bit 型は Modbus 接続配下限定 -
-    // `MODBUS_ONLY_DATA_TYPES` の doc comment 参照。`tag_kind` と独立した
-    // 規則なので、上の match を抜けた（＝種別としては正しい配置の）タグにも
-    // 必ず適用される。例外は Hub 経由のタグ（直上で返している - この関数の
-    // doc comment 参照）。
-    if MODBUS_ONLY_DATA_TYPES.contains(&data_type) && protocol != MODBUS_PROTOCOL {
+    // #1011: DB Source の db タグは f64 を使用できる。i64/u64 は共通の
+    // validate_tag_input で拒否する。
+    let is_postgres_f64 =
+        protocol == POSTGRES_PROTOCOL && tag_kind == DB_TAG_KIND && data_type == "f64";
+    if MODBUS_ONLY_DATA_TYPES.contains(&data_type)
+        && protocol != MODBUS_PROTOCOL
+        && !is_postgres_f64
+    {
         return placement_error(
             "dataType",
-            "64bit 型（i64/u64/f64）は Modbus 接続配下のタグでのみ使用できます".to_string(),
+            "64bit 型（i64/u64/f64）は Modbus 接続配下で使用できます。PostgreSQL の db タグでは f64 を使用できます".to_string(),
         );
     }
 
@@ -1845,7 +1856,7 @@ pub fn offset_tag_address(
         _ => {
             return Err(address_error(format!(
                 "この接続のプロトコル {protocol} はアドレスを動かせません"
-            )))
+            )));
         }
     };
     let current = parse_tag_address(conn_name, protocol, probe, registry)?;
@@ -4571,7 +4582,7 @@ mod tests {
                 assert_eq!(field_errors[0].field, "dataType");
                 assert_eq!(
                     field_errors[0].message,
-                    "64bit 型（i64/u64/f64）は Modbus 接続配下のタグでのみ使用できます"
+                    "64bit 型（i64/u64/f64）は Modbus 接続配下で使用できます。PostgreSQL の db タグでは f64 を使用できます"
                 );
             }
             other => panic!("expected Validation, got {other:?}"),
@@ -4637,12 +4648,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_rejects_a_64bit_tag_under_a_postgres_connection() {
-        let (svc, _modbus_group) = setup().await;
-        let group_id = postgres_group(&svc.pool).await;
-        let mut input = db_tag_input("Big", group_id, "big_count");
-        input.data_type = "i64".to_string();
-        assert_64bit_placement_error(svc.create(input).await.unwrap_err());
+    async fn postgres_db_tag_allows_f64_and_rejects_64bit_integers() {
+        let (legacy, _modbus_group) = setup().await;
+        let group_id = postgres_group(&legacy.pool).await;
+        let registry =
+            TagService::with_registry(legacy.pool.clone(), Arc::new(DriverRegistry::new()));
+        for (svc, name) in [(legacy, "legacy"), (registry, "registry")] {
+            let mut input = db_tag_input(name, group_id, name);
+            input.data_type = "f64".to_string();
+            let created = svc.create(input.clone()).await.unwrap();
+            assert_eq!(created.data_type, "f64");
+            for data_type in ["i64", "u64"] {
+                input.data_type = data_type.to_string();
+                let err = svc.create(input.clone()).await.unwrap_err();
+                let BantoError::Validation { field_errors } = err else {
+                    panic!("expected Validation, got {err:?}");
+                };
+                assert_eq!(field_errors.len(), 1);
+                assert_eq!(field_errors[0].field, "dataType");
+            }
+        }
     }
 
     /// `update` runs the same placement step as `create` (both call

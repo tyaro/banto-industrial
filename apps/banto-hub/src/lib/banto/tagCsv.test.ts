@@ -949,13 +949,20 @@ describe('parseTagsCsv', () => {
 			expect(rows[0].tag.tagKind).toBe('internal');
 		});
 
-		it('S3: "db" を postgres 接続配下のグループでは受理する', () => {
+		it('#1011: postgres 接続配下の f64 の db タグを受理する', () => {
 			const text = buildCsv([
-				row({ connection: 'ConnPg', group: 'GroupPg', tagKind: 'db', address: 'temperature' })
+				row({
+					connection: 'ConnPg',
+					group: 'GroupPg',
+					tagKind: 'db',
+					address: 'temperature',
+					dataType: 'f64'
+				})
 			]);
 			const rows = expectOk(parseTagsCsv(text, CONNECTIONS, GROUPS));
 			expect(rows[0].tag.tagKind).toBe('db');
 			expect(rows[0].tag.address).toBe('temperature');
+			expect(rows[0].tag.dataType).toBe('f64');
 			// §6-10: db タグは常に writable=false に強制される（CSV に何が
 			// 書いてあっても無視する - computed と同じ扱い）。
 			expect(rows[0].tag.writable).toBe(false);

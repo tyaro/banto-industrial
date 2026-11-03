@@ -5472,6 +5472,7 @@
 											<button
 												type="button"
 												class="db-column-candidate"
+												aria-pressed={trimmedAddress === col.name}
 												data-testid={`db-column-candidate-${col.name}`}
 												onclick={() => {
 													form.address = col.name;
@@ -5718,7 +5719,7 @@
 			</select>
 			{#if errors.dataType}<span class="err" id="tag-data-type-err">{errors.dataType}</span>{/if}
 		</label>
-		{#if MODBUS_ONLY_DATA_TYPES.includes(form.dataType)}
+		{#if connectionForGroupId(form.collectionGroupId)?.protocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(form.dataType)}
 			<!--
 				#325（2026-09-08 オーナー決定）: 64bit 型選択時の注記
 				（占有レジスタ数・精度制約・ワード順）。
@@ -5968,7 +5969,7 @@
 			{/each}
 		</select>
 	</label>
-	{#if MODBUS_ONLY_DATA_TYPES.includes(continuousForm.dataType)}
+	{#if continuousProtocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(continuousForm.dataType)}
 		<p class="hint wide">
 			4 レジスタ（64bit）を占有します。
 			{#if continuousForm.dataType === 'i64' || continuousForm.dataType === 'u64'}
@@ -7549,7 +7550,7 @@
 								{/each}
 							</select>
 						</label>
-						{#if MODBUS_ONLY_DATA_TYPES.includes(field.dataType)}
+						{#if structProtocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(field.dataType)}
 							<p class="hint">
 								4 レジスタ（64bit）を占有します。
 								{#if field.dataType === 'i64' || field.dataType === 'u64'}
@@ -8569,8 +8570,9 @@
 		cursor: pointer;
 	}
 
-	button.db-column-candidate:hover {
+	button.db-column-candidate[aria-pressed='true'] {
 		background: color-mix(in srgb, var(--banto-primary) 8%, transparent);
+		border-color: var(--banto-primary);
 	}
 
 	/*

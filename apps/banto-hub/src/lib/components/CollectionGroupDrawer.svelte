@@ -219,12 +219,22 @@
 	 * prop（再設定時に非 `null`）ではなく常に `form.plcConnectionId`
 	 * （現在の選択、新規作成のウィザード中に変わりうる）から都度判定する。
 	 */
-	const selectedIsDbSource = $derived.by((): boolean => {
-		const id = Number(form.plcConnectionId);
+	function isDbSourceId(value: string): boolean {
+		const id = Number(value);
 		if (!Number.isFinite(id)) return false;
 		const conn = connections.find((c) => c.id === id);
 		return conn !== undefined && isDbSourceConnection(conn);
-	});
+	}
+
+	const selectedIsDbSource = $derived(isDbSourceId(form.plcConnectionId));
+	let defaultWritableEdited = false;
+
+	function selectConnection(value: string) {
+		if (isCreate && !defaultWritableEdited) {
+			form.defaultWritable = !isDbSourceId(value);
+		}
+		form.plcConnectionId = value;
+	}
 
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
@@ -258,6 +268,7 @@
 		const key = group ? `edit:${group.id}` : 'create';
 		if (key === lastOpenKey) return;
 		lastOpenKey = key;
+		defaultWritableEdited = false;
 
 		if (group) {
 			form = groupToForm(group);
@@ -268,6 +279,7 @@
 			blank.name = initialName;
 			provisionalName = initialName;
 			if (presetPlcConnectionId != null) blank.plcConnectionId = String(presetPlcConnectionId);
+			if (isDbSourceId(blank.plcConnectionId)) blank.defaultWritable = false;
 			form = blank;
 			void refinePendingNamePrefill(key);
 		}
@@ -385,7 +397,8 @@
 		saving = true;
 		errors = {};
 		try {
-			const created = await createCollectionGroup(formToGroupInput(form, selectedIsDbSource));
+			const createForm = selectedIsDbSource ? { ...form, defaultWritable: false } : form;
+			const created = await createCollectionGroup(formToGroupInput(createForm, selectedIsDbSource));
 			toastStore.push('success', '作成しました');
 			onSaved(created);
 			onClose();
@@ -500,7 +513,7 @@
 	<div class="form-grid">
 		<label class="field">
 			PLC接続
-			<select bind:value={form.plcConnectionId} disabled={readOnly}>
+			<select bind:value={() => form.plcConnectionId, selectConnection} disabled={readOnly}>
 				<option value="" disabled>選択してください</option>
 				{#each selectableConnections as conn (conn.id)}
 					<option value={String(conn.id)}>{conn.name}</option>
@@ -564,15 +577,24 @@
 			一切影響しない - あくまで新規タグフォームを開いた瞬間の
 			チェックボックスの初期値だけを決める。
 		-->
-		<label class="field checkbox wide">
-			<input type="checkbox" bind:checked={form.defaultWritable} disabled={readOnly} />
-			このグループの新規タグは既定で書込可（writable）
-		</label>
-		<span class="hint wide">
-			チェックを入れると、このグループへ新規タグを登録するとき「外部クライアントから PLC
-			への書き込みを許可」が既定でオンになります（computed タグには適用されません）。個々の
-			タグ側でいつでも上書きできます。
-		</span>
+		{#if selectedIsDbSource}
+			<span class="hint wide">DB Source のタグは読み取り専用です。</span>
+		{:else}
+			<label class="field checkbox wide">
+				<input
+					type="checkbox"
+					bind:checked={form.defaultWritable}
+					onchange={() => (defaultWritableEdited = true)}
+					disabled={readOnly}
+				/>
+				このグループの新規タグは既定で書込可（writable）
+			</label>
+			<span class="hint wide">
+				チェックを入れると、このグループへ新規タグを登録するとき「外部クライアントから PLC
+				への書き込みを許可」が既定でオンになります（computed タグには適用されません）。個々の
+				タグ側でいつでも上書きできます。
+			</span>
+		{/if}
 	</div>
 {/snippet}
 
@@ -591,7 +613,13 @@
 		<dt>有効</dt>
 		<dd>{form.enabled ? 'はい' : 'いいえ'}</dd>
 		<dt>新規タグの書込可既定</dt>
-		<dd>{form.defaultWritable ? 'ON' : 'OFF'}</dd>
+		<dd>
+			{selectedIsDbSource
+				? '適用されません（DB Source のタグは読み取り専用）'
+				: form.defaultWritable
+					? 'ON'
+					: 'OFF'}
+		</dd>
 	</dl>
 {/snippet}
 

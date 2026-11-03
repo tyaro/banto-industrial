@@ -47,8 +47,20 @@ describe('dataTypeOptionsFor: ホストの表', () => {
 		expect(values(dataTypeOptionsFor('push'))).toEqual(ALL.filter((v) => v !== 'string'));
 	});
 
-	it('postgres・virtual・未選択: 64bit を除く', () => {
-		for (const protocol of ['postgres', 'virtual', undefined]) {
+	it('postgres: f64 を含む数値型と bit', () => {
+		expect(values(dataTypeOptionsFor('postgres'))).toEqual([
+			'bit',
+			'i16',
+			'u16',
+			'i32',
+			'u32',
+			'f32',
+			'f64'
+		]);
+	});
+
+	it('virtual・未選択: 64bit を除く', () => {
+		for (const protocol of ['virtual', undefined]) {
 			expect(values(dataTypeOptionsFor(protocol))).toEqual(NO_64);
 		}
 	});

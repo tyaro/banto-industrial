@@ -23,7 +23,6 @@
 		listPlcConnections,
 		listCollectionGroups,
 		listTags,
-		isDbSourceConnection,
 		type PlcConnection,
 		type CollectionGroup,
 		type Tag
@@ -69,8 +68,6 @@
 	$effect(() => {
 		void reload();
 	});
-
-	const dbConnectionOptions = $derived(connections.filter(isDbSourceConnection));
 
 	function connectionName(id: number): string {
 		return connections.find((c) => c.id === id)?.name ?? `#${id}`;
@@ -255,7 +252,7 @@ api_key = "&lt;発行したキー&gt;"</pre>
 	open={drawerOpen}
 	group={editingGroup}
 	existingNames={sinkGroups.map((g) => g.name)}
-	connections={dbConnectionOptions}
+	{connections}
 	{collectionGroups}
 	{tags}
 	onClose={closeDrawer}

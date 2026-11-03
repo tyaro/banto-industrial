@@ -302,28 +302,14 @@ export type TagDataType =
 	'bit' | 'i16' | 'u16' | 'i32' | 'u32' | 'f32' | 'i64' | 'u64' | 'f64' | 'string';
 
 /**
- * #325（2026-09-08 オーナー決定）: `i64`/`u64`/`f64`（Modbus の4レジスタ=64bit
- * 値）は `modbus-tcp` プロトコルの PLC 接続配下のタグでのみ登録できる（R2b-6d-2b 以降、
- * ドライバの接続は `GET /api/drivers` の `supportedKinds` が決める。この定数はサーバー側の
- * 定数の写しで、ホストの表（`tagDataTypeOptions.ts`）が 64bit を除く安全側の判定と、
- * 64bit の注記の要否判定に使う） -
- * mirrors `banto_tags::plc_connection::MODBUS_PROTOCOL`/
- * `banto_tags::tag::MODBUS_ONLY_DATA_TYPES`（サーバー側が最終防衛線として
- * 拒否する）。UI 側はこの定数でデータ型プルダウンの選択肢自体を絞る
- * （`tagDataTypeOptions.ts` の `dataTypeOptionsFor` 参照）ほか、`i64`/`u64`
- * の精度注記の要否判定にも使う。
+ * #325: Modbus で 4 レジスタを占有する 64bit 型。レジスタ数・精度・
+ * ワード順の注記に使う。型の選択肢は tagDataTypeOptions.ts が決める。
  */
 export const MODBUS_ONLY_DATA_TYPES: readonly TagDataType[] = ['i64', 'u64', 'f64'];
 
 /**
- * S3（docs/banto-hub-external-db-design.md §4.4・§6-5「v1 は数値・bool・
- * timestamp のみ」）: `db` タグに設定できる `dataType` - `'string'` を除く
- * 全種（`banto_tags::tag::validate_tag_input`の`DB_TAG_KIND`アームが
- * `string`だけを拒否するのをそのまま反映。`internal`タグの同じ除外規則と
- * 同型）。
- *
- * #325: `i64`/`u64`/`f64` は含めない - `db` タグは PLC 接続配下に置かれない
- * ため（{@link MODBUS_ONLY_DATA_TYPES} 参照）、64bit 型はそもそも対象外。
+ * PostgreSQL の DB タグは数値型と bit に対応する。#1011 で f64 を追加。
+ * i64/u64 は現在値の倍精度浮動小数点表現で精度が落ちるため対象外。
  */
 export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
 	'bit',
@@ -331,7 +317,8 @@ export const DB_TAG_ALLOWED_DATA_TYPES: readonly TagDataType[] = [
 	'u16',
 	'i32',
 	'u32',
-	'f32'
+	'f32',
+	'f64'
 ];
 
 /**
