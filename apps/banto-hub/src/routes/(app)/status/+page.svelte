@@ -749,14 +749,14 @@
 					ネットワークへ露出することはない（設計 §3.6。banto v3.0.0 以降は
 					試運転中も bearer が必須で、grant は loopback の接続元にだけ出る）。
 				-->
-				<dt>試運転モード</dt>
+				<dt>サーバーの管理アクセス</dt>
 				<dd>
 					{#if commissioningState.lockedDown === null}
 						確認中…
 					{:else if commissioningState.serverCommissioning}
-						有効（未ロックダウン・この PC からは試運転の grant で管理操作が可能）
+						試運転モード（未ロックダウン・この PC からは試運転の grant で管理操作が可能）
 					{:else}
-						無効（ロックダウン済み・ログイン必須）
+						ロックダウン済み（ログイン必須）
 					{/if}
 				</dd>
 			</dl>
@@ -1176,7 +1176,7 @@
 			<dl class="summary">
 				<dt>サービスの状態</dt>
 				<dd>{scmStateLabel(hostSwitch.scmState)}</dd>
-				<dt>モード</dt>
+				<dt>Hub の実行場所</dt>
 				<dd>
 					{hostSwitch.view === 'desktop'
 						? '設定モード（このアプリで Hub を動かしています）'
@@ -1215,18 +1215,25 @@
 			{/if}
 
 			<p class="note">{PAUSE_NOTE}</p>
+			<p class="note">
+				設定モードに戻した後は収集が停止したままです。再開するには、この状態画面の「収集の開始・停止」で「開始」を押してください。収集を再開するまで、Sink
+				の外部 DB への新しい収集データの書き込みも進みません。
+			</p>
 
 			{#if disabledReason && !allowSwitchToService && !allowSwitchToDesktop}
 				<p class="note">{disabledReason}</p>
 			{/if}
 
 			<div class="write-control-actions">
-				<button type="button" onclick={handleSwitchToService} disabled={!allowSwitchToService}>
-					運用モードに切り替える
-				</button>
-				<button type="button" onclick={handleSwitchToDesktop} disabled={!allowSwitchToDesktop}>
-					設定モードに戻す
-				</button>
+				{#if hostSwitch.view === 'service'}
+					<button type="button" onclick={handleSwitchToDesktop} disabled={!allowSwitchToDesktop}>
+						設定モードに戻す
+					</button>
+				{:else}
+					<button type="button" onclick={handleSwitchToService} disabled={!allowSwitchToService}>
+						運用モードに切り替える
+					</button>
+				{/if}
 			</div>
 
 			<div class="autostart-block">
