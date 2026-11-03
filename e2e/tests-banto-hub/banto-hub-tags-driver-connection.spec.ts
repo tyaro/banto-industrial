@@ -15,7 +15,15 @@
  *
  * 前提データは REST で作る/消す。同期点は `waitForResponse`（クリックより前に張る）。
  */
-import { expect, test, type APIRequestContext, type Page, type Route } from '@playwright/test';
+import {
+	expect,
+	test,
+	type APIRequestContext,
+	type Dialog,
+	type Page,
+	type Route
+} from '@playwright/test';
+import type { DriverInfo } from '../../apps/banto-hub/src/lib/banto/tagRegistryAdmin';
 import { CSRF_HEADERS, fetchAuthToken, injectAuthToken } from './banto-hub-auth';
 
 const RUN_ID = Date.now();
@@ -274,6 +282,115 @@ test.describe.serial('banto-hub ドライバの接続の作成・再設定（R2b
 			await expect(wizard.locator('#connection-name')).toHaveValue(`${CONN}-hold`);
 		} finally {
 			await page.unroute('**/api/drivers');
+		}
+	});
+
+	test('保存済みの秘密値の上書き・消去は確認を承認したときだけ送る', async () => {
+		const connections = '**/api/plc-connections';
+		const drivers = '**/api/drivers';
+		const res = await page.request.get('/api/plc-connections', { headers });
+		const saved = ((await res.json()) as ConnectionRow[]).find((c) => c.name === CONN)!;
+		const update = `**/api/plc-connections/${saved.id}`;
+		const writes: { settings: Record<string, unknown> }[] = [];
+		const secretState = { $secret: 'set' };
+		let hasSecret = true;
+
+		// 実機や追加ドライバに依存せず、スキーマに Secret がある接続の保存操作を確かめる。
+		await page.route(drivers, async (route) => {
+			const response = await route.fetch();
+			const rows = (await response.json()) as DriverInfo[];
+			const slmp = rows.find((row) => row.id === 'slmp')!;
+			slmp.settingsSchema.fields.push({
+				key: 'token',
+				label: '接続トークン',
+				required: false,
+				help: null,
+				default: null,
+				group: 'basic',
+				kind: { type: 'secret' }
+			});
+			await route.fulfill({ response, json: rows });
+		});
+		await page.route(connections, async (route) => {
+			const response = await route.fetch();
+			const rows = (await response.json()) as ConnectionRow[];
+			const row = rows.find((c) => c.id === saved.id)!;
+			if (hasSecret) row.settings.token = secretState;
+			await route.fulfill({ response, json: rows });
+		});
+		await page.route(update, async (route) => {
+			if (route.request().method() !== 'PUT') return route.continue();
+			const input = route.request().postDataJSON() as (typeof writes)[number];
+			writes.push(input);
+			if ('token' in input.settings) hasSecret = input.settings.token !== null;
+			const settings = { ...saved.settings };
+			if (hasSecret) settings.token = secretState;
+			await route.fulfill({ json: { ...saved, settings } });
+		});
+
+		const confirmations: string[] = [];
+		let accept = true;
+		const onDialog = (dialog: Dialog) => {
+			confirmations.push(dialog.message());
+			return accept ? dialog.accept() : dialog.dismiss();
+		};
+		page.on('dialog', onDialog);
+		try {
+			await page.goto('/tags');
+			await page
+				.getByRole('tree')
+				.getByRole('button', { name: new RegExp(`^${CONN}`) })
+				.click({ button: 'right' });
+			await page.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+			const drawer = page.getByRole('dialog', { name: `${CONN} を編集`, exact: true });
+			const clear = drawer.getByRole('radio', { name: '消す', exact: true });
+			const save = drawer.getByRole('button', { name: '保存', exact: true });
+			const token = drawer.locator('#conn-driver-token');
+			const saveAndWait = async () => {
+				const response = page.waitForResponse(
+					(r) =>
+						r.url().endsWith(`/api/plc-connections/${saved.id}`) && r.request().method() === 'PUT'
+				);
+				await save.click();
+				expect((await response).ok()).toBe(true);
+				await expect(save).toBeEnabled();
+			};
+
+			await expect(drawer.getByRole('radio', { name: '変えない', exact: true })).toBeChecked();
+			await saveAndWait();
+			expect(confirmations).toHaveLength(0);
+			expect(writes[0].settings).not.toHaveProperty('token');
+
+			await drawer.getByRole('radio', { name: '変える', exact: true }).check();
+			await token.fill('temporary-token');
+			accept = false;
+			await save.click();
+			await expect(token).toHaveValue('temporary-token');
+			expect(confirmations[0]).toContain('接続トークン：上書き');
+			expect(confirmations[0]).not.toContain('temporary-token');
+			expect(writes).toHaveLength(1);
+
+			accept = true;
+			await saveAndWait();
+			expect(confirmations[1]).toContain('接続トークン：上書き');
+			expect(writes[1].settings.token).toBe('temporary-token');
+
+			await clear.check();
+			await saveAndWait();
+			expect(confirmations[2]).toContain('接続トークン：消去');
+			expect(writes[2].settings.token).toBeNull();
+			await expect(clear).toHaveCount(0);
+
+			await token.fill('new-token');
+			await saveAndWait();
+			expect(confirmations).toHaveLength(3);
+			expect(writes).toHaveLength(4);
+			expect(writes[3].settings.token).toBe('new-token');
+		} finally {
+			page.off('dialog', onDialog);
+			await page.unroute(update);
+			await page.unroute(connections);
+			await page.unroute(drivers);
 		}
 	});
 });

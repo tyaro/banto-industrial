@@ -936,7 +936,7 @@ pub(super) async fn requested_settings(
                     .and_then(|conn| conn.settings.get(field.key.as_str()))
                     .is_some_and(banto_tags::settings_json::is_secret_ref)
             {
-                "保存済みの秘密値はテストに使いません。明示入力するか、値無しで試す場合は null を指定してください"
+                "保存済みの秘密値はテストに使いません。「変える」で入力するか、値無しで試す場合は「消す」を選んでください（API では null を指定）"
             } else {
                 return None;
             };
