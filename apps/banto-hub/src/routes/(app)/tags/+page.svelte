@@ -5125,6 +5125,29 @@
 	});
 </script>
 
+{#snippet dataType64BitHint(
+	dataType: TagDataType,
+	isModbus: boolean,
+	showExample = false,
+	wide = true
+)}
+	{@const showRegisters = isModbus && MODBUS_ONLY_DATA_TYPES.includes(dataType)}
+	{@const showPrecision = dataType === 'i64' || dataType === 'u64'}
+	{#if showRegisters || showPrecision}
+		<p class="hint" class:wide id={showExample ? 'tag-data-type-64bit-hint' : undefined}>
+			{#if showRegisters}4 レジスタ（64bit）を占有します。{/if}
+			{#if showPrecision}
+				値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
+			{/if}
+			{#if showRegisters}
+				ワード順は PLC 接続の設定（ワード順）に従います{#if showExample}
+					- 例えばオムロン KM-D1-ETN
+					のような機種は先頭レジスタが最下位ワード（LowHigh）です。機種のマニュアルで確認してください。{:else}。{/if}
+			{/if}
+		</p>
+	{/if}
+{/snippet}
+
 {#snippet tagFields(
 	form: FormState,
 	errors: Record<string, string>,
@@ -5719,19 +5742,11 @@
 			</select>
 			{#if errors.dataType}<span class="err" id="tag-data-type-err">{errors.dataType}</span>{/if}
 		</label>
-		{#if connectionForGroupId(form.collectionGroupId)?.protocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(form.dataType)}
-			<!--
-				#325（2026-09-08 オーナー決定）: 64bit 型選択時の注記
-				（占有レジスタ数・精度制約・ワード順）。
-			-->
-			<p class="hint wide" id="tag-data-type-64bit-hint">
-				4 レジスタ（64bit）を占有します。
-				{#if form.dataType === 'i64' || form.dataType === 'u64'}
-					値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-				{/if}
-				ワード順は PLC 接続の設定（ワード順）に従います - 例えばオムロン KM-D1-ETN のような機種は先頭レジスタが最下位ワード（LowHigh）です。機種のマニュアルで確認してください。
-			</p>
-		{/if}
+		{@render dataType64BitHint(
+			form.dataType,
+			connectionForGroupId(form.collectionGroupId)?.protocol === 'modbus-tcp',
+			true
+		)}
 		{#if form.dataType === 'string'}
 			<label class="field">
 				文字列長（word数）
@@ -5969,15 +5984,7 @@
 			{/each}
 		</select>
 	</label>
-	{#if continuousProtocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(continuousForm.dataType)}
-		<p class="hint wide">
-			4 レジスタ（64bit）を占有します。
-			{#if continuousForm.dataType === 'i64' || continuousForm.dataType === 'u64'}
-				値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-			{/if}
-			ワード順は PLC 接続の設定（ワード順）に従います。
-		</p>
-	{/if}
+	{@render dataType64BitHint(continuousForm.dataType, continuousProtocol === 'modbus-tcp')}
 	{#if continuousForm.dataType === 'string'}
 		<label class="field">
 			文字列長（word数）
@@ -7550,15 +7557,12 @@
 								{/each}
 							</select>
 						</label>
-						{#if structProtocol === 'modbus-tcp' && MODBUS_ONLY_DATA_TYPES.includes(field.dataType)}
-							<p class="hint">
-								4 レジスタ（64bit）を占有します。
-								{#if field.dataType === 'i64' || field.dataType === 'u64'}
-									値は倍精度浮動小数点で保持されるため、2^53（9,007,199,254,740,992）を超える整数は精度が落ちます。
-								{/if}
-								ワード順は PLC 接続の設定（ワード順）に従います。
-							</p>
-						{/if}
+						{@render dataType64BitHint(
+							field.dataType,
+							structProtocol === 'modbus-tcp',
+							false,
+							false
+						)}
 						{#if field.dataType === 'string'}
 							<label class="field">
 								文字列長（word数）

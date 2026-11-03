@@ -1751,10 +1751,13 @@ BitInWord（ビット単体）は引き続き broker の Modbus ドライバが�
 - タグの `data_type` に `i64`/`u64`/`f64` を追加した（migration `0016`、
   `tags.data_type` の CHECK に3値追加。列は増やさない）。Modbus では**4 レジスタ（64bit）
   を占有**する。
-- `i64`/`u64` を登録できるのは `modbus-tcp` プロトコルの PLC 接続配下のみ。
-  `f64` は Modbus のほか、`postgres` 接続配下の `db` タグでも登録できる
-  （2026-11-03、#1011）。それ以外の SLMP / virtual（`calc`・`mem`）
-  などの 64bit 型は `field: "dataType"` のバリデーションエラーになる。
+- この項の登録制限はレジストリを使わない従来の接続についてのもの。
+  `modbus-tcp` の PLC タグでは `i64`/`u64`/`f64`、`postgres` の `db`
+  タグでは `f64`（2026-11-03、#1011）を登録できる。SLMP / virtual
+  （`calc`・`mem`）などの非対応の 64bit 型は `field: "dataType"` の
+  バリデーションエラーになる。Hub のドライバレジストリを使う接続は
+  ドライバの `supportedKinds` が型を決め、`push` の `plc` タグも
+  `i64`/`u64`/`f64` を受け付ける。
   **この制約は SQL の CHECK 制約には入れていない**（判定にタグ →
   `collection_groups` → `plc_connections` の JOIN が要り、SQLite の CHECK
   では表現できないため）。強制は `banto-tags`（`crates/banto-tags/src/tag.rs`

@@ -2707,22 +2707,22 @@ T11-2（[ux-plan.md](ux-plan.md) §3）・T18-3d（[banto-hub-t18-design.md](ban
   します。テンプレート（ヘッダ行のみの空 CSV）は Drawer 先頭の
   「テンプレートをダウンロード」ボタンから取得できます。
 
-  | 列名             | 内容                                                                                                                                                                       |
-  | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-  | `connection`     | 接続名（`plc-connections` の `name`。名前で参照、存在しなければエラー）                                                                                                    |
-  | `group`          | 収集グループ名（同じ接続配下で一意。存在しなければエラー）                                                                                                                 |
-  | `name`           | タグ名                                                                                                                                                                     |
-  | `address`        | PLC アドレス（`tagKind=plc` のとき必須。computed/internal では無視）                                                                                                       |
-  | `dataType`       | `bit`/`i16`/`u16`/`i32`/`u32`/`f32`/`i64`/`u64`/`f64`/`string`。`i64`/`u64` は Modbus 接続配下のみ。`f64` は Modbus と PostgreSQL の DB Source タグで使用可（#325、#1011） |
-  | `stringLength`   | `dataType=string` のとき必須（1以上の整数）。それ以外は無視                                                                                                                |
-  | `unit`           | 単位（任意）                                                                                                                                                               |
-  | `decimals`       | 小数桁数（空欄は0）                                                                                                                                                        |
-  | `rawLo`〜`engHi` | スケーリング（すべて任意、数値）                                                                                                                                           |
-  | `enabled`        | 真偽値（`true`/`false`/`1`/`0`、空欄は `true`）                                                                                                                            |
-  | `writable`       | 真偽値（空欄は `false`）                                                                                                                                                   |
-  | `tagKind`        | `plc`/`computed`/`internal`（空欄は `plc`）                                                                                                                                |
-  | `expression`     | `tagKind=computed` のとき必須。それ以外は無視                                                                                                                              |
-  | `retain`         | 真偽値（空欄は `false`）。`tagKind=internal` 以外は常に `false`                                                                                                            |
+  | 列名             | 内容                                                                                                                                                                             |
+  | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+  | `connection`     | 接続名（`plc-connections` の `name`。名前で参照、存在しなければエラー）                                                                                                          |
+  | `group`          | 収集グループ名（同じ接続配下で一意。存在しなければエラー）                                                                                                                       |
+  | `name`           | タグ名                                                                                                                                                                           |
+  | `address`        | PLC アドレス（`tagKind=plc` のとき必須。computed/internal では無視）                                                                                                             |
+  | `dataType`       | `bit`/`i16`/`u16`/`i32`/`u32`/`f32`/`i64`/`u64`/`f64`/`string`。64bit 型は Modbus、対応ドライバ、`push` で使用可。PostgreSQL の DB Source タグは `f64` のみ使用可（#325、#1011） |
+  | `stringLength`   | `dataType=string` のとき必須（1以上の整数）。それ以外は無視                                                                                                                      |
+  | `unit`           | 単位（任意）                                                                                                                                                                     |
+  | `decimals`       | 小数桁数（空欄は0）                                                                                                                                                              |
+  | `rawLo`〜`engHi` | スケーリング（すべて任意、数値）                                                                                                                                                 |
+  | `enabled`        | 真偽値（`true`/`false`/`1`/`0`、空欄は `true`）                                                                                                                                  |
+  | `writable`       | 真偽値（空欄は `false`）                                                                                                                                                         |
+  | `tagKind`        | `plc`/`computed`/`internal`（空欄は `plc`）                                                                                                                                      |
+  | `expression`     | `tagKind=computed` のとき必須。それ以外は無視                                                                                                                                    |
+  | `retain`         | 真偽値（空欄は `false`）。`tagKind=internal` 以外は常に `false`                                                                                                                  |
 
 - **しきい値の列（#533、2026-10-09）**: banto-hub はしきい値（H/HH/L/LL）を
   持ちません（2026-10-08 オーナー決定。しきい値は記録計・SCADA の側の設定で、Hub は
