@@ -1353,7 +1353,7 @@
 		</button>
 		{#if connection && driver?.settingsSchema.fields.some((field) => field.kind.type === 'secret')}
 			<p class="hint">
-				保存済みの秘密値は送信しません。収集中の接続を使えない場合は「変える」で入力してください。任意項目は「消す」で値無しを試せます（テストでは保存されません）。
+				保存済みの秘密値は送信しません。収集中の接続を使えない場合は「変える」で入力してください。任意項目は「消す」で値無しを試せます。テスト後に元の秘密値を残して保存する場合は「変えない」に戻してください。
 			</p>
 		{/if}
 		{#if testState.testing}

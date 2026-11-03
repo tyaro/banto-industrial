@@ -81,6 +81,7 @@ struct TestSecretDriver {
     descriptor: DriverDescriptor,
     delegate: DriverEntry,
     required: bool,
+    inputs: Arc<std::sync::Mutex<Vec<Option<String>>>>,
 }
 
 impl DriverBase for TestSecretDriver {
@@ -119,6 +120,10 @@ impl FrameDriver for TestSecretDriver {
         &self,
         settings: &Settings,
     ) -> Result<Box<dyn FrameConnection>, FatalError> {
+        self.inputs
+            .lock()
+            .unwrap()
+            .push(settings.get("token").map(str::to_owned));
         match self.delegate.kind() {
             banto_driver_api::DriverKind::Frame(driver) => driver.create_connection(settings),
             _ => unreachable!("fixture delegates to a frame driver"),
@@ -240,6 +245,8 @@ struct TestApp {
     /// 試験が収集を起こす入口（製品と同じ `CollectionController`）。`controller` が
     /// `Some` のときは同じもの、`None` のときはルーターに渡さない専用のもの。
     runner: Arc<CollectionController>,
+    /// Inputs received by this app's secret-driver fixture, never shared across tests.
+    secret_inputs: Arc<std::sync::Mutex<Vec<Option<String>>>>,
     _env: TempEnv,
 }
 
@@ -518,6 +525,7 @@ async fn test_app_with_drivers_and_options(
             }
         }
     }
+    let secret_inputs = Arc::new(std::sync::Mutex::new(Vec::new()));
     if with_secret_driver {
         let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
         for (id, required) in [("secret-test", true), ("optional-secret-test", false)] {
@@ -532,6 +540,7 @@ async fn test_app_with_drivers_and_options(
                     ),
                     delegate: delegate.clone(),
                     required,
+                    inputs: secret_inputs.clone(),
                 })))
                 .unwrap();
         }
@@ -653,6 +662,7 @@ async fn test_app_with_drivers_and_options(
         write_control,
         runner,
         controller,
+        secret_inputs,
         _env: env,
     }
 }
@@ -1814,6 +1824,7 @@ async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_sessi
             matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
         );
     }
+    assert!(app.secret_inputs.lock().unwrap().is_empty());
     // Explicit inputs still permit a direct probe.
     let settings =
         json!({"host":"127.0.0.1", "port":sim.addr.port(), "unit_id":1, "word_order":"low_high"});
@@ -1829,6 +1840,11 @@ async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_sessi
     .await;
     assert_eq!(body["ok"], true, "{body}");
     assert_eq!(sim.connection_count(), 1);
+    assert_eq!(
+        *app.secret_inputs.lock().unwrap(),
+        vec![Some("temporary-token".to_owned())],
+        "direct probes must receive only the explicitly supplied token"
+    );
     let group = CollectionGroupService::new(app.pool.clone())
         .create(group_input("fast", id, 100))
         .await
@@ -1847,6 +1863,7 @@ async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_sessi
     .unwrap()
     .unwrap();
     let sockets = sim.connection_count();
+    let inputs = app.secret_inputs.lock().unwrap().len();
     // Destroy the sealed row after the broker has connected: reuse needs only the
     // saved reference, never plaintext decryption. The active session is untouched.
     sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
@@ -1864,6 +1881,7 @@ async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_sessi
     .await;
     assert_eq!(body["ok"], true, "{body}");
     assert_eq!(sim.connection_count(), sockets, "reuse must not dial again");
+    assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
     let mut changed = settings;
     changed["port"] = json!(listener.local_addr().unwrap().port());
     let (_, body) = admin_write(
@@ -1925,9 +1943,10 @@ async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
     assert!(message.contains("null"), "{message}");
     assert!(!body.to_string().contains("saved-optional-token"));
     assert_eq!(sim.connection_count(), 0, "omission must not dial");
+    assert!(app.secret_inputs.lock().unwrap().is_empty());
 
-    // An explicit no-value choice still permits anonymous access for an optional field.
-    for value in [Value::Null, json!("")] {
+    // Direct probes receive the explicit value, or no token for an explicit no-value choice.
+    for value in [json!("temporary-optional-token"), Value::Null, json!("")] {
         let mut explicit = settings.clone();
         explicit["token"] = value;
         let (_, body) = admin_write(
@@ -1940,7 +1959,12 @@ async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
         .await;
         assert_eq!(body["ok"], true, "{body}");
     }
-    assert_eq!(sim.connection_count(), 2);
+    assert_eq!(sim.connection_count(), 3);
+    assert_eq!(
+        *app.secret_inputs.lock().unwrap(),
+        vec![Some("temporary-optional-token".to_owned()), None, None],
+        "direct probes must never receive the saved token"
+    );
 
     let group = CollectionGroupService::new(app.pool.clone())
         .create(group_input("optional-fast", id, 100))
@@ -1960,6 +1984,7 @@ async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
     .unwrap()
     .unwrap();
     let sockets = sim.connection_count();
+    let inputs = app.secret_inputs.lock().unwrap().len();
     sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
         .bind(id)
         .execute(&app.pool)
@@ -1979,6 +2004,33 @@ async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
         sockets,
         "shared reuse must not dial"
     );
+    assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
+    for token in [json!("changed-token"), Value::Null, json!("")] {
+        let mut changed = settings.clone();
+        changed["token"] = token;
+        let (_, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            json!({"protocol":"optional-secret-test", "connectionId":id, "settings":changed}),
+        )
+        .await;
+        assert_eq!(body["ok"], false, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("保存してから"),
+            "{body}"
+        );
+        assert_eq!(
+            sim.connection_count(),
+            sockets,
+            "changed secrets must not dial"
+        );
+        assert_eq!(app.secret_inputs.lock().unwrap().len(), inputs);
+    }
     sim.stop();
 }
 
