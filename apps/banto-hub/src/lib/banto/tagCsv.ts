@@ -246,10 +246,8 @@ const TAG_DATA_TYPES: ReadonlySet<string> = new Set<TagDataType>([
 	'i32',
 	'u32',
 	'f32',
-	// #325（2026-09-08 オーナー決定）: 64bit 型（Modbus の4レジスタ値）。
-	// modbus-tcp 接続配下のタグのみ登録できる制約はサーバー側検証（および
-	// `POST /api/tags/batch` の preflight）が担い、CSV パーサ自体は他の
-	// dataType と同じく形式チェックのみを行う。
+	// 64bit 型の配置はサーバー側で検証する。Modbus と push は 3 型に対応し、
+	// PostgreSQL の db タグは f64 に対応する。CSV パーサは形式をチェックする。
 	'i64',
 	'u64',
 	'f64',
