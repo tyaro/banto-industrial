@@ -74,6 +74,220 @@ async fn update_omitting_password_keeps_the_existing_password() {
     );
 }
 
+#[tokio::test]
+async fn postgres_update_rejects_moving_a_saved_password_to_a_different_host() {
+    let env = test_env().await;
+    let (status, created) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "erp-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let id = created["id"].as_i64().unwrap();
+    let (status, response) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        json!({ "name": "erp-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{response:?}");
+    assert!(
+        response.to_string().contains("settings.password"),
+        "{response:?}"
+    );
+    assert!(!response.to_string().contains("original-secret"));
+    let saved = env.manager.plc_connections().get(id).await.unwrap();
+    assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("original-secret")
+    );
+}
+
+#[tokio::test]
+async fn queued_postgres_update_cannot_move_a_saved_password_to_a_different_host() {
+    let env = test_env().await;
+    let (status, created) = admin_post(
+        &env.router,
+        "/api/plc-connections",
+        &env.admin_token,
+        json!({ "name": "queued-db", "protocol": "postgres", "settings": { "host": "10.0.0.50", "port": 5432, "database": "erp", "username": "reader", "password": "original-secret" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created:?}");
+    let id = created["id"].as_i64().unwrap();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/start",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let pending_count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pending_changes")
+            .fetch_one(&env.pool)
+            .await
+            .unwrap()
+    };
+    let before = pending_count().await;
+    let input = json!({ "name": "queued-db", "protocol": "postgres", "enabled": true, "simulation": false, "settings": { "host": "10.0.0.51", "port": 5432, "database": "erp", "username": "reader" } });
+    let (status, body) = admin_put(
+        &env.router,
+        &format!("/api/plc-connections/{id}"),
+        &env.admin_token,
+        input.clone(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(body.to_string().contains("settings.password"), "{body:?}");
+    assert!(!body.to_string().contains("original-secret"));
+    assert_eq!(pending_count().await, before);
+    // A proposal already persisted before the enqueue guard must still fail at apply.
+    let pending_changes = PendingChangesService::new(env.pool.clone());
+    let payload = json!({ "id": id, "input": input });
+    let source = "plc_connections.update";
+    let fingerprint = compute_pending_base_fingerprint(
+        &env.manager.plc_connections(),
+        &CollectionGroupService::new(env.pool.clone()),
+        source,
+        &payload,
+    )
+    .await
+    .unwrap();
+    let pending = pending_changes
+        .create_pending(
+            source,
+            &payload,
+            env.manager.configured_revision() as i64,
+            Some(&fingerprint),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/stop",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let (status, body) = admin_post(
+        &env.router,
+        &format!("/api/pending-changes/{}/apply", pending.id),
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert!(body.to_string().contains("settings.password"), "{body:?}");
+    assert!(!body.to_string().contains("original-secret"));
+    assert_eq!(
+        pending_changes.get(pending.id).await.unwrap().state,
+        PendingChangeState::Failed
+    );
+    let saved = env.manager.plc_connections().get(id).await.unwrap();
+    assert_eq!(saved.setting_str("host"), Some("10.0.0.50"));
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("original-secret")
+    );
+}
+
+#[tokio::test]
+async fn queued_postgres_updates_can_keep_replace_or_clear_the_saved_password() {
+    let env = test_env().await;
+    let settings =
+        |host: &str| json!({ "host": host, "port": 5432, "database": "erp", "username": "reader" });
+    let mut cases = Vec::new();
+    for (name, host, password, expected_password) in [
+        ("keep", "10.0.0.50", None, Some("original-secret")),
+        (
+            "replace",
+            "10.0.0.51",
+            Some(json!("new-secret")),
+            Some("new-secret"),
+        ),
+        ("clear", "10.0.0.51", Some(serde_json::Value::Null), None),
+    ] {
+        let mut original_settings = settings("10.0.0.50");
+        original_settings["password"] = json!("original-secret");
+        let (status, created) = admin_post(
+            &env.router,
+            "/api/plc-connections",
+            &env.admin_token,
+            json!({ "name": name, "protocol": "postgres", "settings": original_settings }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created:?}");
+        let id = created["id"].as_i64().unwrap();
+        let mut updated_settings = settings(host);
+        if let Some(password) = password {
+            updated_settings["password"] = password;
+        }
+        cases.push((
+            id,
+            format!("{name}-updated"),
+            host,
+            updated_settings,
+            expected_password,
+        ));
+    }
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/start",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    let mut queued = Vec::new();
+    for (id, name, host, settings, expected_password) in cases {
+        let (status, body) = admin_put(
+            &env.router,
+            &format!("/api/plc-connections/{id}"),
+            &env.admin_token,
+            json!({ "name": name, "protocol": "postgres", "enabled": true, "simulation": false, "settings": settings }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{name}: {body:?}");
+        let pending_id = body["pending"]["id"].as_i64().unwrap();
+        queued.push((pending_id, id, name, host, expected_password));
+    }
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/collection/stop",
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    for (pending_id, id, name, host, expected_password) in queued {
+        let (status, body) = admin_post(
+            &env.router,
+            &format!("/api/pending-changes/{pending_id}/apply"),
+            &env.admin_token,
+            json!({}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name}: {body:?}");
+        assert_eq!(body["state"], "applied", "{name}: {body:?}");
+        let saved = env.manager.plc_connections().get(id).await.unwrap();
+        assert_eq!(saved.name, name);
+        assert_eq!(saved.setting_str("host"), Some(host), "{name}");
+        assert_eq!(
+            stored_password(&env.pool, id).await.as_deref(),
+            expected_password,
+            "{name}"
+        );
+    }
+}
+
 /// `PUT`で`password: ""`を送ると、パスワードが消去される。
 #[tokio::test]
 async fn update_with_empty_password_clears_it() {
@@ -1163,4 +1377,436 @@ async fn pending_apply_fingerprint_is_per_resource_not_global_revision() {
         .await
         .unwrap();
     assert_eq!(updated_b.name, "line-b-renamed");
+}
+
+// #1010: PostgreSQL probes in the new-connection wizard must not create registry rows.
+fn presave_pg_payload(port: u16) -> serde_json::Value {
+    json!({"protocol": "postgres", "settings": {
+        "host": "127.0.0.1", "port": port, "database": "ephemeral", "username": "reader", "password": ""
+    }})
+}
+
+async fn presave_persistent_counts(pool: &sqlx::SqlitePool) -> Vec<(String, i64)> {
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetch_all(pool).await.unwrap();
+    let mut counts = Vec::new();
+    for table in tables {
+        let quoted = table.replace('"', "\"\"");
+        let count = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT count(*) FROM \"{quoted}\""
+        )))
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        counts.push((table, count));
+    }
+    counts
+}
+
+/// Minimal local PostgreSQL peer: decline SSL, request a password, then return a
+/// synthetic error deliberately echoing it. No installed PostgreSQL is touched.
+async fn presave_pg_rejection_peer(
+    echo: &str,
+) -> (u16, tokio::task::JoinHandle<(Vec<u8>, String)>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let echo = echo.to_owned();
+    let task = tokio::spawn(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(8), async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut ssl = [0; 8];
+            socket.read_exact(&mut ssl).await.unwrap();
+            assert_eq!(ssl, [0, 0, 0, 8, 4, 210, 22, 47]);
+            socket.write_all(b"N").await.unwrap();
+            let length = socket.read_u32().await.unwrap() as usize;
+            assert!((4..65536).contains(&length));
+            let mut startup = vec![0; length - 4];
+            socket.read_exact(&mut startup).await.unwrap();
+            socket
+                .write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 3])
+                .await
+                .unwrap();
+            assert_eq!(socket.read_u8().await.unwrap(), b'p');
+            let length = socket.read_u32().await.unwrap() as usize;
+            assert!((5..65536).contains(&length));
+            let mut password = vec![0; length - 4];
+            socket.read_exact(&mut password).await.unwrap();
+            assert_eq!(password.pop(), Some(0));
+            let detail = format!("SFATAL\0C28000\0Msynthetic rejection: {echo}\0\0");
+            socket.write_u8(b'E').await.unwrap();
+            socket.write_u32((detail.len() + 4) as u32).await.unwrap();
+            socket.write_all(detail.as_bytes()).await.unwrap();
+            (startup, String::from_utf8(password).unwrap())
+        })
+        .await
+        .expect("local PostgreSQL peer finishes")
+    });
+    (port, task)
+}
+
+#[tokio::test]
+async fn postgres_presave_probe_uses_ephemeral_inputs_and_never_persists_or_leaks_password() {
+    let env = test_env().await;
+    let before = presave_persistent_counts(&env.pool).await;
+    let (port, peer) = presave_pg_rejection_peer("ephemeral-secret").await;
+    let mut payload = presave_pg_payload(port);
+    payload["settings"]["password"] = json!("ephemeral-secret");
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/plc-connections/test",
+        &env.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(
+        body["error"]["kind"], "protocol",
+        "authentication is not a TCP failure"
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "PostgreSQL との通信または認証に失敗しました。詳細は機密値を含むため表示できません。",
+        "{body}"
+    );
+    assert!(!body.to_string().contains("ephemeral-secret"), "{body}");
+    let (startup, password) = peer.await.unwrap();
+    assert_eq!(password, "ephemeral-secret");
+    assert!(startup
+        .windows(b"database\0ephemeral\0".len())
+        .any(|part| part == b"database\0ephemeral\0"));
+    assert!(startup
+        .windows(b"user\0reader\0".len())
+        .any(|part| part == b"user\0reader\0"));
+    assert_eq!(
+        presave_persistent_counts(&env.pool).await,
+        before,
+        "no registry, secret, pending-change or audit rows written"
+    );
+}
+
+#[tokio::test]
+async fn postgres_presave_rejects_invalid_settings_and_unauthorized_requests_before_connecting() {
+    let env = test_env().await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    for patch in [
+        json!({"host": 42}),
+        json!({"host": " "}),
+        json!({"port": 0}),
+        json!({"port": "5432"}),
+        json!({"database": " "}),
+        json!({"username": "x".repeat(129)}),
+        json!({"password": {"$secret": "not-an-input-password"}}),
+        json!({"extra": true}),
+    ] {
+        let mut payload = presave_pg_payload(port);
+        payload["settings"]
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections/test",
+            &env.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false, "{body}");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("settings."),
+            "{body}"
+        );
+    }
+    let (status, _) = admin_post(
+        &env.router,
+        "/api/plc-connections/test",
+        &env.viewer_token,
+        presave_pg_payload(port),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let response = env
+        .router
+        .clone()
+        .oneshot(
+            HttpRequest::post("/api/plc-connections/test")
+                .header("Authorization", format!("Bearer {}", env.admin_token))
+                .header("Content-Type", "application/json")
+                .body(Body::from(presave_pg_payload(port).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::FORBIDDEN,
+        "CSRF header remains required"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "nothing must connect"
+    );
+}
+
+#[tokio::test]
+async fn postgres_presave_refused_connection_reports_tcp() {
+    let env = test_env().await;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/plc-connections/test",
+        &env.admin_token,
+        presave_pg_payload(port),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false, "{body}");
+    assert_eq!(body["error"]["kind"], "tcp", "{body}");
+}
+
+#[tokio::test]
+async fn postgres_presave_probe_is_bounded_to_five_seconds() {
+    let env = test_env().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let before = presave_persistent_counts(&env.pool).await;
+    let started = std::time::Instant::now();
+    let (status, body) = tokio::time::timeout(
+        std::time::Duration::from_secs(9),
+        admin_post(
+            &env.router,
+            "/api/plc-connections/test",
+            &env.admin_token,
+            presave_pg_payload(listener.local_addr().unwrap().port()),
+        ),
+    )
+    .await
+    .expect("probe must not wait indefinitely on a held handshake");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], false);
+    assert_eq!(body["error"]["kind"], "tcp", "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("タイムアウトです(5秒)"),
+        "{body}"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(9));
+    assert_eq!(presave_persistent_counts(&env.pool).await, before);
+}
+
+#[tokio::test]
+async fn postgres_presave_never_inherits_saved_secrets_or_updates_the_saved_row() {
+    let env = test_env().await;
+    let (status, created) = admin_post(&env.router, "/api/plc-connections", &env.admin_token,
+        json!({"name": "presave-secret-reference", "protocol": "postgres", "settings": {
+            "host": "127.0.0.1", "port": 1, "database": "original-db", "username": "original-user", "password": "saved-secret"
+        }})).await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_i64().unwrap();
+    let before = presave_persistent_counts(&env.pool).await;
+    let saved_before = PlcConnectionService::new(env.pool.clone())
+        .get(id)
+        .await
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    for host in ["127.0.0.1", "localhost"] {
+        for connection_id in [Some(id), Some(id + 999)] {
+            for password in [None, Some(json!(null))] {
+                let mut payload = presave_pg_payload(listener.local_addr().unwrap().port());
+                payload["settings"]["host"] = json!(host);
+                payload["settings"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("password");
+                if let Some(password) = password {
+                    payload["settings"]["password"] = password;
+                }
+                if let Some(id) = connection_id {
+                    payload["connectionId"] = json!(id);
+                }
+                let (status, body) = admin_post(
+                    &env.router,
+                    "/api/plc-connections/test",
+                    &env.admin_token,
+                    payload,
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["ok"], false);
+                assert!(
+                    body["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("settings.password"),
+                    "{body}"
+                );
+                assert!(!body.to_string().contains("saved-secret"), "{body}");
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+                );
+            }
+        }
+    }
+    // No saved id means there is no secret to inherit: retain passwordless wizard probes.
+    for given in [None, Some(json!(null))] {
+        let (port, peer) = presave_pg_rejection_peer("").await;
+        let mut payload = presave_pg_payload(port);
+        payload["settings"]
+            .as_object_mut()
+            .unwrap()
+            .remove("password");
+        if let Some(given) = given {
+            payload["settings"]["password"] = given;
+        }
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections/test",
+            &env.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(peer.await.unwrap().1, "");
+    }
+    for expected in ["replacement-secret", ""] {
+        let (port, peer) = presave_pg_rejection_peer(expected).await;
+        let mut payload = presave_pg_payload(port);
+        payload["connectionId"] = json!(id);
+        payload["settings"]["password"] = json!(expected);
+        let (status, body) = admin_post(
+            &env.router,
+            "/api/plc-connections/test",
+            &env.admin_token,
+            payload,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ok"], false);
+        assert_eq!(peer.await.unwrap().1, expected);
+        if !expected.is_empty() {
+            assert!(!body.to_string().contains(expected), "{body}");
+        }
+        assert!(!body.to_string().contains("saved-secret"), "{body}");
+    }
+    let saved_after = PlcConnectionService::new(env.pool.clone())
+        .get(id)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(saved_before).unwrap(),
+        serde_json::to_value(saved_after).unwrap()
+    );
+    assert_eq!(
+        stored_password(&env.pool, id).await.as_deref(),
+        Some("saved-secret")
+    );
+    assert_eq!(presave_persistent_counts(&env.pool).await, before);
+}
+
+#[tokio::test]
+async fn postgres_presave_with_unreadable_saved_secret_does_not_connect() {
+    let env = test_env().await;
+    let (_, created) = admin_post(&env.router, "/api/plc-connections", &env.admin_token,
+        json!({"name": "presave-missing-secret", "protocol": "postgres", "settings": {
+            "host": "127.0.0.1", "port": 1, "database": "db", "username": "reader", "password": "saved-secret"
+        }})).await;
+    let id = created["id"].as_i64().unwrap();
+    sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+        .bind(id)
+        .execute(&env.pool)
+        .await
+        .unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut payload = presave_pg_payload(listener.local_addr().unwrap().port());
+    payload["connectionId"] = json!(id);
+    payload["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/plc-connections/test",
+        &env.admin_token,
+        payload,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("settings.password"),
+        "{body}"
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+// SQLx resolves userinfo and query-password precedence before producing this URL.
+// Decode its userinfo once; never print the URL or password in failure output.
+fn postgres_fixture_password(options: &sqlx::postgres::PgConnectOptions) -> Option<String> {
+    use sqlx::ConnectOptions;
+    options.to_url_lossy().password().map(|password| {
+        percent_encoding::percent_decode_str(password)
+            .decode_utf8()
+            .expect("test PostgreSQL password must be UTF-8")
+            .into_owned()
+    })
+}
+
+#[test]
+fn postgres_presave_db_source_fixture_decodes_userinfo_and_query_passwords() {
+    for (url, expected) in [
+        ("postgres://reader:p%40ss%3A%25%2B@127.0.0.1/db", "p@ss:%+"),
+        ("postgres://reader:p%2540ss@127.0.0.1/db", "p%40ss"),
+        (
+            "postgres://reader@127.0.0.1/db?password=q%40%3A%25%2B+value",
+            "q@:%+ value",
+        ),
+        (
+            "postgres://reader:old@127.0.0.1/db?password=first&password=last%2B",
+            "last+",
+        ),
+    ] {
+        let options = url.parse().expect("valid synthetic fixture URL");
+        assert!(
+            postgres_fixture_password(&options).as_deref() == Some(expected),
+            "fixture password decoding or precedence changed"
+        );
+    }
+}
+
+// Include db_source in the name: the PostgreSQL CI job runs --lib db_source.
+#[tokio::test]
+async fn postgres_presave_db_source_fixture_succeeds_without_creating_a_connection() {
+    let Ok(url) = std::env::var("BANTO_TEST_PG_URL") else {
+        eprintln!("skipped: BANTO_TEST_PG_URL unset");
+        return;
+    };
+    let options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    let password = postgres_fixture_password(&options);
+    let env = test_env().await;
+    let before = presave_persistent_counts(&env.pool).await;
+    let (status, body) = admin_post(&env.router, "/api/plc-connections/test", &env.admin_token,
+        json!({"protocol": "postgres", "settings": {"host": options.get_host(), "port": options.get_port(),
+            "database": options.get_database().unwrap_or("postgres"), "username": options.get_username(), "password": password }})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(body["error"], serde_json::Value::Null);
+    assert_eq!(presave_persistent_counts(&env.pool).await, before);
 }

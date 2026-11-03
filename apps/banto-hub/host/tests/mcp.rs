@@ -6602,6 +6602,23 @@ async fn mcp_connection_passwords_leave_no_plaintext_after_the_upkeep() {
     ] {
         update[key] = value;
     }
+    update["settings"]["host"] = json!("127.0.0.2");
+    let mut keep_password = update.clone();
+    keep_password["settings"]
+        .as_object_mut()
+        .unwrap()
+        .remove("password");
+    let (status, body) = mcp_post(
+        &app.router,
+        Some(&admin_key),
+        tools_call("update_connection", keep_password),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    assert!(body.to_string().contains("settings.password"), "{body:?}");
+    assert!(!body.to_string().contains(MCP_P_CREATE));
+
     for (tool, arguments, secret) in [
         (
             "create_connection",

@@ -1,11 +1,9 @@
 /**
  * S1（docs/banto-hub-external-db-design.md §3.1「案A: 既存3階層の流用」・
  * §4.1・§6-4）: `protocol: "postgres"`（DB Source）接続の SvelteKit/TS 側
- * 受け入れテスト。実 PostgreSQL には依存しない - 接続テスト自体
- * （`POST /api/plc-connections/{id}/test`）は
- * `ConnectionDrawer.svelte::runDbConnectionTest` を経由するボタンの存在・
- * 活性状態のみ確認し、実際にクリックして疎通させることはしない（CI には
- * まだ実 PostgreSQL が無い - 実装指示6「CI で実 PostgreSQL に依存しない」）。
+ * 受け入れテスト。実 PostgreSQL には依存しない。保存前テストの要求、
+ * 応答を待つ間の操作の制限、成功/失敗の表示、保存前に行を作らないことを確認する。
+ * PostgreSQL 自体は Rust のプロトコル試験と PostgreSQL CI で検証する。
  *
  * 固定する内容:
  * 1. 作成ウィザードでプロトコルを postgres に切り替えると、ポートが 5432
@@ -15,7 +13,8 @@
  * 2. 作成できたら、ツリーに DB バッジが付いた状態で現れる。
  * 3. 再設定 Drawer を開くと「パスワード: 設定済み」（作成時に入力した
  *    パスワードがある）と出て、パスワード欄は空欄のまま（絶対にプリ
- *    フィルしない）。
+ *    フィルしない）。接続先を変えて保存した場合は、422 の項目エラーが
+ *    パスワード欄のそばに出る。
  * 4. **S3（docs/banto-hub-external-db-design.md §7 row S3）で更新**:
  *    「収集グループを作成」メニュー項目は S1 時点では無効化されていた
  *    （実装指示4「サーバーの422だけに頼らない」）が、S2/S2b で DB Source
@@ -129,12 +128,81 @@ test.describe
 
 		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
 
-		// 確認ステップ: database/username/パスワードの有無を表示し、接続
-		// テストは「保存後にテストできます」のヒント付きで無効。
+		// #1010: testing in step 3 must send current fields without persisting.
 		await expect(wizard.getByText('appdb')).toBeVisible();
 		await expect(wizard.getByText('appuser')).toBeVisible();
-		await expect(wizard.getByText('保存後にテストできます')).toBeVisible();
-		await expect(wizard.getByRole('button', { name: '接続テスト' })).toBeDisabled();
+		const probeUrl = '**/api/plc-connections/test';
+		let failProbe = false;
+		let probes = 0;
+		let releaseProbe!: () => void;
+		const heldProbe = new Promise<void>((resolve) => {
+			releaseProbe = resolve;
+		});
+		await adminPage.route(probeUrl, async (route) => {
+			expect(route.request().postDataJSON()).toEqual({
+				protocol: 'postgres',
+				simulation: false,
+				settings: {
+					host: '10.0.0.5',
+					port: 5432,
+					database: 'appdb',
+					username: 'appuser',
+					password: 'hunter2'
+				}
+			});
+			probes++;
+			if (probes === 1) await heldProbe;
+			await route.fulfill({
+				json: failProbe
+					? { ok: false, elapsedMs: 1, error: { kind: 'protocol', message: '試験用の接続エラー' } }
+					: { ok: true, elapsedMs: 1, error: null }
+			});
+		});
+		const probeButton = wizard.getByRole('button', { name: '接続テスト', exact: true });
+		await expect(probeButton).toBeEnabled();
+		const startedProbe = adminPage.waitForRequest((request) =>
+			request.url().endsWith('/api/plc-connections/test')
+		);
+		let closeConfirmed = false;
+		const onDialog = (dialog: import('@playwright/test').Dialog): void => {
+			closeConfirmed = true;
+			void dialog.dismiss();
+		};
+		adminPage.on('dialog', onDialog);
+		try {
+			await probeButton.click();
+			await startedProbe;
+			await expect(wizard.getByRole('button', { name: '戻る', exact: true })).toBeDisabled();
+			await expect(wizard.getByRole('button', { name: '作成', exact: true })).toBeDisabled();
+			await wizard.getByRole('button', { name: '閉じる', exact: true }).click();
+			await expect(wizard).toBeVisible();
+			await adminPage.keyboard.press('Escape');
+			await expect(wizard).toBeVisible();
+			await adminPage.mouse.click(1, 1);
+			await expect(wizard).toBeVisible();
+			expect(closeConfirmed).toBe(false);
+		} finally {
+			adminPage.off('dialog', onDialog);
+			releaseProbe(); // Resolve before unroute, even when an assertion fails.
+		}
+		await expect(wizard.getByText('接続成功', { exact: true })).toBeVisible();
+		failProbe = true;
+		await probeButton.click();
+		await expect(wizard.getByText('試験用の接続エラー', { exact: true })).toBeVisible();
+		expect(probes).toBe(2);
+		const beforeSave = await adminPage.request.get('/api/plc-connections', {
+			headers: adminHeaders
+		});
+		expect(
+			((await beforeSave.json()) as ConnectionRow[]).some(
+				(connection) => connection.name === DB_CONN
+			)
+		).toBe(false);
+		await adminPage.unroute(probeUrl);
+		// Back clears old outcomes before any input can be changed/re-tested.
+		await wizard.getByRole('button', { name: '戻る', exact: true }).click();
+		await wizard.getByRole('button', { name: '次へ', exact: true }).click();
+		await expect(wizard.getByText('試験用の接続エラー', { exact: true })).toHaveCount(0);
 
 		const created = adminPage.waitForResponse(
 			(r) => r.url().includes('/api/plc-connections') && r.request().method() === 'POST'
@@ -168,8 +236,34 @@ test.describe
 		// 保存済み接続なので接続テストボタンは有効（実際にクリックはしない
 		// - CI に実 PostgreSQL が無いため、ボタンの活性状態だけ固定する）。
 		await expect(drawer.getByRole('button', { name: '接続テスト' })).toBeEnabled();
+		await expect(
+			drawer.getByText('保存済みの設定をテストします（入力中の変更は反映されません）。', {
+				exact: true
+			})
+		).toBeVisible();
 
 		await adminPage.keyboard.press('Escape');
+	});
+
+	test('再設定 Drawer: 接続先変更に必要なパスワードのエラーを入力欄のそばに表示する', async () => {
+		await adminPage.goto('/tags');
+		await connectionNodeByName(adminPage, DB_CONN).click({ button: 'right' });
+		await adminPage.getByRole('menuitem', { name: '接続を再設定', exact: true }).click();
+
+		const drawer = adminPage.getByRole('dialog', { name: `${DB_CONN} を編集`, exact: true });
+		await drawer.getByLabel('ホスト', { exact: true }).fill('10.0.0.51');
+		const saved = adminPage.waitForResponse(
+			(r) => r.url().includes('/api/plc-connections/') && r.request().method() === 'PUT'
+		);
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		expect((await saved).status()).toBe(422);
+		const passwordError = drawer
+			.getByLabel('パスワードを消去する', { exact: true })
+			.locator('..')
+			.locator('~ span.err');
+		await expect(passwordError).toHaveText(
+			'接続先を変更するには、パスワードを入力するか明示的に消去してください。'
+		);
 	});
 
 	test('4. S3: 「収集グループを作成」は常時有効になり、クリックすると作成ウィザードが開く', async () => {

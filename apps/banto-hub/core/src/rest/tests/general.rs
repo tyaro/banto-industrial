@@ -273,9 +273,10 @@ async fn the_test_settings_come_from_the_form_and_the_saved_row_only_from_the_sa
     assert!(refused.message.contains("unit_id"), "{}", refused.message);
 }
 
-/// 接続テストは保存済み秘密値を開かず、共有セッション照合用の参照だけを保つ。
+/// PostgreSQL の汎用接続テストは保存済み秘密値を開かない。id ありの省略/null は拒否し、
+/// 明示した文字列だけを使う。必須 Secret スキーマを持つ偽ドライバでも継承しないことを確認。
 #[tokio::test]
-async fn the_test_keeps_only_saved_references_and_never_opens_saved_secrets() {
+async fn the_postgres_test_rejects_omitted_saved_secrets_and_uses_only_explicit_input() {
     use super::super::plc_connections::{requested_settings, PlcConnectionTestPayload};
     use banto_driver_api::{
         AddressError, Capabilities, DriverAddress, DriverBase, DriverDescriptor, DriverId,
@@ -358,47 +359,49 @@ async fn the_test_keeps_only_saved_references_and_never_opens_saved_secrets() {
         settings
     };
 
-    // Editing, omitted: only the reference is retained for shared-session identity.
-    let requested = requested_settings(
-        &env.manager,
-        &driver,
-        &payload(Some(saved.id), base.clone()),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("{}", err.message));
-    assert_eq!(requested.settings.get("password"), None);
-    assert_eq!(requested.missing_secrets.len(), 1);
-    assert_eq!(requested.settings.get("host"), Some("db2"));
-    assert!(!requested.secrets_changed);
-    assert_eq!(requested.saved.map(|c| c.id), Some(saved.id));
+    // An explicit temporary value never resolves the saved row, with or without id.
+    for connection_id in [Some(saved.id), None] {
+        let requested = requested_settings(
+            &env.manager,
+            &driver,
+            &payload(connection_id, with(json!("typed-pw"))),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(requested.settings.get("password"), Some("typed-pw"));
+        assert_eq!(requested.settings.get("host"), Some("db2"));
+        assert!(
+            requested.saved.is_none(),
+            "postgres must not resolve a saved secret source"
+        );
+        assert!(requested.secrets_changed);
+    }
 
-    // Editing, a new value: that value, and the secret counts as changed.
-    let requested = requested_settings(
-        &env.manager,
-        &driver,
-        &payload(Some(saved.id), with(json!("typed-pw"))),
-    )
-    .await
-    .unwrap_or_else(|err| panic!("{}", err.message));
-    assert_eq!(requested.settings.get("password"), Some("typed-pw"));
-    assert!(requested.secrets_changed);
-    assert!(requested.missing_secrets.is_empty());
-
-    // `null` / `""` (no value) and a new connection without one: the required secret is
-    // missing - refused before any dial, the message names the key and no value.
+    // Id + omitted/null is refused before any dial, regardless of saved credentials.
     for (connection_id, settings) in [
+        (Some(saved.id), base.clone()),
         (Some(saved.id), with(json!(null))),
-        (Some(saved.id), with(json!(""))),
-        (None, base.clone()),
     ] {
+        let refused = requested_settings(&env.manager, &driver, &payload(connection_id, settings))
+            .await
+            .err()
+            .expect("refused");
+        assert!(refused.message.contains("password"), "{}", refused.message);
+        assert!(!refused.message.contains("saved-pw"), "{}", refused.message);
+    }
+
+    // This fixture declares the secret required. Empty or absent input is
+    // reported as missing for the direct dial, unlike the host postgres schema.
+    for (connection_id, settings) in [(Some(saved.id), with(json!(""))), (None, base.clone())] {
         let requested =
             requested_settings(&env.manager, &driver, &payload(connection_id, settings))
                 .await
                 .unwrap_or_else(|err| panic!("{}", err.message));
-        let refused = requested.missing_secrets;
-        assert_eq!(refused.len(), 1);
-        assert_eq!(refused[0].key, "settings.password");
-        assert!(!refused[0].message.contains("saved-pw"));
+        assert!(requested.saved.is_none());
+        assert_eq!(requested.settings.get("password"), None);
+        assert_eq!(requested.missing_secrets.len(), 1);
+        assert_eq!(requested.missing_secrets[0].key, "settings.password");
+        assert!(!requested.missing_secrets[0].message.contains("saved-pw"));
     }
 }
 

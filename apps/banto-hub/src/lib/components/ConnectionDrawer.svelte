@@ -109,6 +109,7 @@
 		listDrivers,
 		testPlcConnection,
 		testSavedPlcConnection,
+		testUnsavedPostgresConnection,
 		updatePlcConnection,
 		POSTGRES_PROTOCOL,
 		type DbConnectionTestOutcome,
@@ -313,10 +314,8 @@
 	}
 
 	/**
-	 * S1（docs/banto-hub-external-db-design.md §4.6）: 保存済み postgres
-	 * 接続専用の接続テスト状態。`TestState`（T12、PLC の保存前テスト）とは
-	 * 別に持つ - 対象エンドポイントも応答形も違う
-	 * （`testSavedPlcConnection`/{@link DbConnectionTestOutcome}）ため。
+	 * PostgreSQL 接続テストの表示。保存済みは封印済みパスワードの専用API、
+	 * 作成前は現在の入力を汎用APIで試し、DbConnectionTestOutcome へ写す（#1010）。
 	 */
 	interface DbTestState {
 		testing: boolean;
@@ -694,6 +693,8 @@
 	}
 
 	function goBack(): void {
+		if (dbTestState.testing) return;
+		dbTestState.result = null;
 		if (step > 1) step = (step - 1) as 1 | 2 | 3;
 	}
 
@@ -802,23 +803,16 @@
 		};
 	});
 
-	/**
-	 * S1（docs/banto-hub-external-db-design.md §4.6）:
-	 * `POST /api/plc-connections/{id}/test`（保存済み postgres 接続専用）を
-	 * 呼ぶ。**未保存の接続では呼ばない** - マークアップ側で`connection`が
-	 * `null`のときはボタン自体を disabled にし、「保存後にテストできます」
-	 * のヒントを出す（実装指示3）。フォームの現在入力値ではなく、常に
-	 * 保存済みの値（サーバー側で再取得）をテストする点が T12 の
-	 * `runConnectionTest`（フォームの現在値をそのまま送る）と違う - 設計上
-	 * postgres 接続はパスワードをフォームに再表示しないため、そもそも
-	 * フォームの現在値だけではテストしようがない。
-	 */
+	/** Saved drawers test the stored row; the wizard probes current inputs only. */
 	async function runDbConnectionTest(): Promise<void> {
-		if (!connection || dbTestState.testing) return; // 多重クリック防止・未保存ガード
+		if (dbTestState.testing || saving || deleting) return;
+		if (!connection && !validateBeforeSubmit()) return;
 		dbTestState.testing = true;
 		dbTestState.result = null;
 		try {
-			dbTestState.result = await testSavedPlcConnection(connection.id);
+			dbTestState.result = connection
+				? await testSavedPlcConnection(connection.id)
+				: await testUnsavedPostgresConnection(formToConnectionInput(form, drivers).settings);
 		} catch (err) {
 			// 401/403・CSRF拒否・ネットワークエラー・400（postgres以外）など
 			// （`ok: false` はここに来ない通常応答 — 上の try 内で result に
@@ -1097,6 +1091,12 @@
 						<input type="checkbox" bind:checked={form.clearPassword} />
 						パスワードを消去する
 					</label>
+					{#if form.passwordState !== 'none'}
+						<span class="hint">
+							ホスト・ポート・DB
+							名・ユーザー名を変更する場合は、パスワードを入力するか、消去を選んでください。
+						</span>
+					{/if}
 				{/if}
 				{#if errors.password}<span class="err">{errors.password}</span>{/if}
 			{/if}
@@ -1444,28 +1444,23 @@
 {/snippet}
 
 {#snippet dbTestConnectionBlock()}
-	<!--
-		S1（docs/banto-hub-external-db-design.md §4.6、実装指示3）: 保存済み
-		postgres 接続専用の接続テスト。T12 の`testConnectionBlock`（保存前の
-		フォーム値をそのまま送る）とは違い、`POST /api/plc-connections/{id}
-		/test`は保存済みの行しか対象にできない（サーバー側がパスワードを
-		DBから読み直す設計 - パスワードをフォームへ再表示しないため）ので、
-		未保存（新規作成ウィザード中）はボタンを disabled にし「保存後に
-		テストできます」のヒントを出す。
-	-->
+	<!-- Saved rows keep the sealed-secret endpoint; new inputs are never saved by the probe. -->
 	<div class="test-connection">
 		<button
 			type="button"
 			class="test-btn"
 			onclick={runDbConnectionTest}
-			disabled={!connection || dbTestState.testing}
+			disabled={dbTestState.testing || saving || deleting}
 		>
 			{#if dbTestState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
 			接続テスト
 		</button>
-		{#if !connection}
-			<span class="hint">保存後にテストできます</span>
-		{:else if dbTestState.testing}
+		{#if connection}
+			<span class="hint">保存済みの設定をテストします（入力中の変更は反映されません）。</span>
+		{:else}
+			<span class="hint">入力中の設定をテストします（保存はしません）。</span>
+		{/if}
+		{#if dbTestState.testing}
 			<span class="test-result testing">テスト中…</span>
 		{:else if dbTestState.result}
 			{#if dbTestState.result.ok}
@@ -1564,7 +1559,12 @@
 
 		<div class="wizard-actions">
 			{#if step > 1}
-				<button type="button" class="secondary" onclick={goBack} disabled={saving}>戻る</button>
+				<button
+					type="button"
+					class="secondary"
+					onclick={goBack}
+					disabled={saving || dbTestState.testing}>戻る</button
+				>
 			{/if}
 			{#if step === 1}
 				<button type="button" onclick={goNext} disabled={!canAdvanceFromStep1}>次へ</button>
@@ -1573,7 +1573,11 @@
 					次へ
 				</button>
 			{:else}
-				<button type="button" onclick={handleCreate} disabled={saving || driversBlocking}>
+				<button
+					type="button"
+					onclick={handleCreate}
+					disabled={saving || dbTestState.testing || driversBlocking}
+				>
 					作成
 				</button>
 			{/if}

@@ -660,7 +660,7 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "settings": {
                         "type": "object",
-                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
+                        "description": "接続の設定(REST の /api/plc-connections と同じ形)。丸ごと置き換え: 省いたキーはスキーマの既定値に戻る(list_connections で今の settings を読んでから全体を送る)。キーの意味は create_connection と同じ。秘密のキー(postgres の password)だけは、省略 = 保存済みを保つ、null または空文字列 = 消す、文字列 = 置き換え。保存済みパスワードのある postgres で host / port / database / username を変える場合は、password を明示して置き換えるか消去する必要があり、省略での保持はできません。応答では {\"$secret\": \"set\" | \"unreadable\"}(unreadable は参照はあるがこの PC で読めない - 入れ直すと直る)。",
                     },
                 },
                 "required": ["id", "name", "protocol", "enabled", "simulation", "settings"],
@@ -669,13 +669,13 @@ fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "test_connection",
-            "description": "保存前に PLC 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。TCP 接続だけでなく実プロトコルで軽い読み出しを1回試みる。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
+            "description": "保存前に PLC/PostgreSQL 接続の疎通を確認する(admin スコープ必須)。入力は { protocol, simulation, settings, connectionId? }(REST の POST /api/plc-connections/test と同じ形)。機器は実プロトコルで軽い読み出しを1回試み、postgres は SELECT version() を5秒以内で試す。レジストリへの保存は行わない副作用の無い操作。virtual/シミュレーション接続はテスト対象外(即座に ok:false)。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "protocol": {
                         "type": "string",
-                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)。virtual は常に ok:false(テスト対象外)。",
+                        "description": "list_drivers で得られる機器のドライバの id(modbus-tcp・slmp など)、または postgres。virtual は常に ok:false(テスト対象外)。",
                     },
                     "simulation": {
                         "type": "boolean",
@@ -683,11 +683,11 @@ fn tool_definitions() -> Vec<Value> {
                     },
                     "settings": {
                         "type": "object",
-                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは明示した文字列だけを直接接続に使う(保存しない)。保存済み秘密値は開かない。必須の秘密値の欠け、または保存済み秘密値の省略は直接接続前に断る。任意の秘密値を値無しで試す場合は null・空文字列を明示する。設定が一致する既存 broker セッションは秘密値を開かず再利用できる。",
+                        "description": "接続の設定(create_connection と同じ形。省いたキーはスキーマの既定値)。秘密のキーは明示した文字列だけを直接接続に使う(保存しない)。保存済み秘密値は開かない。必須の秘密値の欠け、または保存済み秘密値の省略は直接接続前に断る。任意の秘密値を値無しで試す場合は null・空文字列を明示する。postgres は connectionId 指定時に password の文字列が必須。id 無しの省略/null・空文字列はパスワード無し。",
                     },
                     "connectionId": {
                         "type": "integer",
-                        "description": "保存済み接続を編集中にテストする場合のみ指定。収集中の broker セッションがあれば(プロトコルによらず)それを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。保存済み設定の指紋照合用にだけ使い、秘密値の読み出しには使わない。",
+                        "description": "保存済み接続を編集中にテストする場合のみ指定。機器の収集中の broker セッションがあればそれを再利用し、2本目をダイヤルしない。settings がそのセッションの設定と違えば試さず「保存してからテスト」と返す。保存済み設定の指紋照合用にだけ使い、秘密値の読み出しには使わない。postgres では保存済み接続を参照しない。保存済み PostgreSQL は test_saved_connection を使う。",
                     },
                 },
                 "required": ["protocol", "settings"],
@@ -695,7 +695,7 @@ fn tool_definitions() -> Vec<Value> {
             },
         }),
         // S1a（docs/banto-hub-external-db-design.md §4.6）: 保存済み接続の
-        // 接続テスト - 上の`test_connection`（保存前のフォーム値、PLC 専用）
+        // 接続テスト - 上の`test_connection`（保存前のフォーム値）
         // とは別ツール。
         json!({
             "name": "test_saved_connection",
@@ -2273,7 +2273,10 @@ async fn tool_update_connection(
     if crate::rest::registry_change_should_queue(&state.status.controller, &state.commissioning)
         .is_some()
     {
-        if let Err(err) = input.check_before_queue(&state.plc_connections, &secret_keys) {
+        if let Err(err) = input
+            .check_update_before_queue(&state.plc_connections, id, &secret_keys)
+            .await
+        {
             return Ok(banto_error_tool_error(&err));
         }
         let form = match input.clone().queue_form(&secret_keys) {

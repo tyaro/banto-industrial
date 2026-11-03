@@ -158,6 +158,16 @@ impl PlcConnectionPayload {
         service.check_settings_input(&input)
     }
 
+    pub(crate) async fn check_update_before_queue(
+        &self,
+        service: &banto_tags::PlcConnectionService,
+        id: i64,
+        secret_keys: &[String],
+    ) -> Result<(), BantoError> {
+        let input = self.clone().into_input(secret_keys)?;
+        service.check_settings_update(id, input).await
+    }
+
     /// 未適用キューに積む形（R2b-6b、`crate::pending_changes` の doc）: 秘密のキーの文字列の
     /// 値は**積む前に封印して** `sealedSecrets`（キー → `crate::secrets::sealed_password_json`
     /// の形）へ移し、`settings` から外す。空文字（消す）は `null` にする。省略（保つ）・`null`
@@ -492,7 +502,8 @@ pub(super) async fn plc_connections_update(
     if let Some(status) = registry_change_should_queue(&state.controller, &state.commissioning) {
         // R2b-6b: secret values are sealed before they reach the queue.
         input
-            .check_before_queue(&state.plc_connections, &secret_keys)
+            .check_update_before_queue(&state.plc_connections, id, &secret_keys)
+            .await
             .map_err(ApiError)?;
         let form = input.queue_form(&secret_keys).map_err(ApiError)?;
         return queue_pending_registry_change(
@@ -763,7 +774,7 @@ const SESSION_HINT: &str = " 対象機器のポートが既に別の接続(こ�
 /// - `settings` はドライバのスキーマ（`banto_tags::settings_from_schema`）を通してから
 ///   ダイヤルする。省いた欄はスキーマの既定値。
 /// - 秘密のキー: 保存済みの値は開かない。省略した必須値は直接ダイヤル前に断る。
-///   同じ設定の共有セッションがあれば秘密値を開かず再利用する。
+///   機器の同じ設定の共有セッションがあれば秘密値を開かず再利用する。
 ///   `null`・空文字は値無し、文字列はその値で試す（保存しない・封印しない）。
 /// - `simulation: true` はダイヤルの前に断る（未保存のフォームの今の値。新規・編集中とも）。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -866,6 +877,8 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 /// 足したもの。秘密のキーはフォームの文字列だけを使い、保存済みの値は開かない。
 /// `null`・空文字は値無し。必須の秘密の欠けと、保存済みの秘密を省略した場合は
 /// 共有セッションの照合後、直接ダイヤル前に断る。
+/// postgres は保存済み接続を参照せず、id 指定時の password の省略/null は拒否する。
+/// スキーマを持たない postgres は保存経路の `check_settings_input` で検証する（DB に書かない）。
 pub(super) struct RequestedSettings {
     pub(super) settings: Settings,
     /// 保存済みの接続（指紋に入る秘密値の参照の出どころ）。
@@ -881,7 +894,22 @@ pub(super) async fn requested_settings(
     driver: &dyn banto_driver_api::DriverBase,
     payload: &PlcConnectionTestPayload,
 ) -> Result<RequestedSettings, PlcConnectionTestError> {
-    let saved = match payload.connection_id {
+    let postgres = payload.protocol == banto_tags::POSTGRES_PROTOCOL;
+    // Never send a stored secret to a caller-controlled PostgreSQL endpoint.
+    // Without an id, omitted/null retains the passwordless new-wizard behavior.
+    if postgres
+        && payload.connection_id.is_some()
+        && !matches!(
+            payload.settings.get("password"),
+            Some(serde_json::Value::String(_))
+        )
+    {
+        return Err(refused_settings(&[banto_driver_api::FieldError::new(
+            "settings.password",
+            "文字列で明示してください（保存済み接続は専用の接続テストを使ってください）",
+        )]));
+    }
+    let saved = match payload.connection_id.filter(|_| !postgres) {
         Some(id) => manager
             .plc_connections()
             .get(id)
@@ -912,8 +940,33 @@ pub(super) async fn requested_settings(
             }
         }
     }
-    let map = banto_tags::settings_from_schema(&driver.settings_schema(), &input)
-        .map_err(|errors| refused_settings(&errors))?;
+    let map = if payload.protocol == banto_tags::POSTGRES_PROTOCOL {
+        // Host-provided postgres intentionally has no device settings schema.
+        // Reuse the save path's pure host validation without sealing or writing.
+        manager
+            .plc_connections()
+            .check_settings_input(&banto_tags::ConnectionSettingsInput {
+                name: "connection-test".to_owned(),
+                protocol: payload.protocol.clone(),
+                enabled: true,
+                simulation: false,
+                settings: input.clone(),
+                secrets: Default::default(),
+            })
+            .map_err(|error| match error {
+                BantoError::Validation { field_errors } => refused_settings(
+                    &field_errors
+                        .into_iter()
+                        .map(|field| banto_driver_api::FieldError::new(field.field, field.message))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => test_error("protocol", "接続設定を検証できませんでした"),
+            })?;
+        input
+    } else {
+        banto_tags::settings_from_schema(&driver.settings_schema(), &input)
+            .map_err(|errors| refused_settings(&errors))?
+    };
     let mut settings = banto_tags::settings_to_api(&map);
     for (key, plain) in given {
         settings.insert(key.as_str(), plain);
@@ -1013,7 +1066,7 @@ fn probe_outcome(results: Vec<Result<Value, ItemError>>) -> (bool, Option<PlcCon
 }
 
 /// 接続テストの本体(R2b-3a-2、docs/banto-hub-driver-io-design.md Q11)。
-/// プロトコルに依らない:
+/// 機器ドライバで共通の経路（PostgreSQL は専用のプローブを使う）。
 ///
 /// 1. 試す設定を作る([`requested_settings`])。
 /// 2. `payload.connection_id` があり、その接続の broker セッションが既に
@@ -1213,6 +1266,59 @@ pub(super) async fn plc_connections_test(
     ))
 }
 
+/// PostgreSQL never inherits saved secrets: with an id, password must be an
+/// explicit string; without an id, omitted/null means passwordless. Host settings
+/// validation is shared with saving; read-only SELECT version() uses DB Source core.
+async fn test_postgres_connection(
+    manager: &CollectorManager,
+    payload: &PlcConnectionTestPayload,
+) -> (bool, Option<PlcConnectionTestError>) {
+    let registry = manager.registry();
+    let Some(entry) = registry.get(banto_tags::POSTGRES_PROTOCOL) else {
+        return (
+            false,
+            Some(test_error("unsupported", "PostgreSQL 接続を利用できません")),
+        );
+    };
+    let requested = match requested_settings(manager, entry.base(), payload).await {
+        Ok(requested) => requested,
+        Err(error) => return (false, Some(error)),
+    };
+    let errors = entry.base().validate_config(&requested.settings);
+    if !errors.is_empty() {
+        return (false, Some(refused_settings(&errors)));
+    }
+    let settings = &requested.settings;
+    let Some(port) = settings
+        .get(keys::PORT)
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port > 0)
+    else {
+        return (
+            false,
+            Some(test_error("tcp", "ポート番号が不正です(1〜65535)")),
+        );
+    };
+    let password = settings.get("password").unwrap_or("");
+    let options = crate::db_source::pg_connect_options(
+        settings.get(keys::HOST).unwrap_or("").trim(),
+        port,
+        settings.get("database").unwrap_or("").trim(),
+        settings.get("username").unwrap_or("").trim(),
+        password,
+        "connection-test",
+    );
+    let outcome = crate::db_source::test_connection_options(options, password).await;
+    let kind = match outcome.failure_kind {
+        crate::db_source::DbConnectionTestFailureKind::Tcp => "tcp",
+        crate::db_source::DbConnectionTestFailureKind::Protocol => "protocol",
+    };
+    (
+        outcome.ok,
+        outcome.error.map(|message| test_error(kind, message)),
+    )
+}
+
 /// [`plc_connections_test`]のdoc comment参照 - REST ハンドラと MCP の
 /// `test_connection`ツールが共有する疎通確認本体。認可判定
 /// (`require_editor`/MCP 側の`require_admin_scope`)は呼び出し元の責務で、
@@ -1243,8 +1349,10 @@ pub(crate) async fn run_plc_connection_test(
                     .to_string(),
             }),
         )
+    } else if payload.protocol == banto_tags::POSTGRES_PROTOCOL {
+        test_postgres_connection(manager, payload).await
     } else {
-        // R2b-3a-2: プロトコル名で分けない。broker が管理しないプロトコル
+        // R2b-3a-2: 機器のプロトコル名で分けない。broker が管理しないプロトコル
         // (レジストリに Session / Frame ドライバが無い)は `test_connection` が
         // "unsupported" で返す。
         test_connection(manager, payload).await

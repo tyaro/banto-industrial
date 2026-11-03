@@ -172,14 +172,47 @@ impl PlcConnectionService {
     /// 平らな検証（`validate_plc_connection_input`。`push` の `settings` の中身も含む）も通す。
     /// 機器のドライバの必須の秘密の欠けは、更新で保存済みを保つ場合があるので見ない。
     pub fn check_settings_input(&self, input: &ConnectionSettingsInput) -> Result<(), BantoError> {
-        match self.route(input.clone())? {
-            Route::Host(flat) => {
-                let flat = super::normalize_plc_connection_input(flat);
-                let secret_keys = self.secret_keys(&flat.protocol);
-                super::validate_plc_connection_input(&flat, &secret_keys)
-            }
-            Route::Driver(..) => Ok(()),
+        self.checked_host_input(input.clone()).map(|_| ())
+    }
+
+    fn checked_host_input(
+        &self,
+        input: ConnectionSettingsInput,
+    ) -> Result<Option<PlcConnectionInput>, BantoError> {
+        let Route::Host(flat) = self.route(input)? else {
+            return Ok(None);
+        };
+        let flat = super::normalize_plc_connection_input(flat);
+        let secret_keys = self.secret_keys(&flat.protocol);
+        super::validate_plc_connection_input(&flat, &secret_keys)?;
+        Ok(Some(flat))
+    }
+
+    /// 更新をキューに積む前に入力と保存済みの PostgreSQL 接続先を検査する。
+    /// 適用時にはトランザクション内で接続先を再検査する。
+    pub async fn check_settings_update(
+        &self,
+        id: i64,
+        input: ConnectionSettingsInput,
+    ) -> Result<(), BantoError> {
+        let Some(flat) = self.checked_host_input(input)? else {
+            return Ok(());
+        };
+        if flat.protocol != POSTGRES_PROTOCOL {
+            return Ok(());
         }
+        let existing = match self.get(id).await {
+            Ok(existing) => existing,
+            // 対象が無ければ保持するパスワードも無い。適用時に対象の有無を判定する。
+            Err(BantoError::NotFound { .. }) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        super::check_postgres_password_target(
+            Some(&existing.protocol),
+            &existing.settings,
+            &flat,
+            &super::settings_from_flat(&flat),
+        )
     }
 
     fn route(&self, input: ConnectionSettingsInput) -> Result<Route, BantoError> {
