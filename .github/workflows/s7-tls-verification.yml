@@ -1,0 +1,105 @@
+name: S7 TLS verification (#1006)
+
+on:
+  push:
+    branches: [codex/s7-tls-verification]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.shell }} / ${{ matrix.store }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shell: powershell
+            store: default
+            service: false
+          - shell: powershell
+            store: alternate
+            service: false
+          - shell: pwsh
+            store: default
+            service: false
+          - shell: pwsh
+            store: alternate
+            service: true
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify issuance, failure cleanup and optional service connection
+        shell: ${{ matrix.shell }}
+        env:
+          S7_TLS_STORE: ${{ matrix.store }}
+          S7_TLS_SERVICE: ${{ matrix.service }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
+            throw 'This verification requires a fresh GitHub-hosted Windows runner.'
+          }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          $administratorsSid = 'S-1-5-32-544'
+          $systemSid = 'S-1-5-18'
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) -or
+              $identity.Owner.Value -notin @($administratorsSid, $systemSid)) {
+            throw "An elevated token with a trusted default owner is required. Owner SID: $($identity.Owner.Value)"
+          }
+
+          # The image builder installs OpenSSL and its DLLs under Program Files.
+          # The issuance script checks the executable and all ancestor ACLs.
+          $openssl = Join-Path $env:ProgramFiles 'OpenSSL\bin\openssl.exe'
+          if (-not (Test-Path -LiteralPath $openssl -PathType Leaf)) {
+            $openssl = (Get-Command openssl.exe -CommandType Application -ErrorAction Stop).Source
+          }
+
+          # Provide a fresh parent for the default TLS store and the service trial.
+          # The issuer creates and checks the actual certificate store.
+          if ($env:S7_TLS_STORE -eq 'default' -or $env:S7_TLS_SERVICE -eq 'true') {
+            $programData = [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonApplicationData)
+            $parent = Join-Path $programData 'BantoHub'
+            if (Get-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue) {
+              throw "Expected an unused service data directory: $parent"
+            }
+            $acl = [Security.AccessControl.DirectorySecurity]::new()
+            $acl.SetOwner([Security.Principal.SecurityIdentifier]::new($administratorsSid))
+            $acl.SetAccessRuleProtection($true, $false)
+            foreach ($sid in @($systemSid, $administratorsSid)) {
+              $rule = [Security.AccessControl.FileSystemAccessRule]::new(
+                [Security.Principal.SecurityIdentifier]::new($sid),
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+              )
+              $acl.AddAccessRule($rule)
+            }
+            $directory = [IO.DirectoryInfo]::new($parent)
+            if ($PSVersionTable.PSVersion.Major -lt 6) {
+              $directory.Create($acl)
+            } else {
+              [IO.FileSystemAclExtensions]::Create($directory, $acl)
+            }
+          }
+
+          $issued = & .github/scripts/verify-s7-tls-issuance.ps1 -Store $env:S7_TLS_STORE -OpenSslPath $openssl
+          if ($env:S7_TLS_SERVICE -eq 'true') {
+            $env:CARGO_TARGET_DIR = Join-Path $env:RUNNER_TEMP 's7-tls-target'
+            cargo build --locked -p banto-hub-host -p banto-hub-sink --bin banto-hub --bin banto-hub-elev --bin banto-hub-sink
+            if ($LASTEXITCODE -ne 0) { throw "The service build failed ($LASTEXITCODE)." }
+            $bin = Join-Path $env:CARGO_TARGET_DIR 'debug'
+            & .github/scripts/verify-s7-tls-services.ps1 `
+              -HubExe (Join-Path $bin 'banto-hub.exe') `
+              -SinkExe (Join-Path $bin 'banto-hub-sink.exe') `
+              -ElevExe (Join-Path $bin 'banto-hub-elev.exe') `
+              -CertificatePath $issued.CertificatePath `
+              -PrivateKeyPath $issued.PrivateKeyPath
+          }
