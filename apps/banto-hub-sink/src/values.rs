@@ -36,34 +36,17 @@
 //! 安定 ID は DB 行（`ts, tag_id, external_name, value, quality`）用に
 //! [`crate::hub_api::SinkConfigTag`] へ残るだけで、購読には使わない。
 //!
-//! したがってタグをリネームすると、購読中の旧名は catalog に無くなる。SDK は
-//! **1 件でも unresolved があると世代全体を `binding_unresolved` で落とす**
-//! （`worker.rs` `run_generation_inner`）ので、全タグを 1 本にまとめている
-//! Sink が何もしなければ、100 タグ中 1 タグの rename で全タグの記録が
-//! 設定再取得（既定 30 秒）まで止まってしまう。そこで Sink 側で catalog を
-//! 引いて**解決できる名前だけを SDK へ渡す**（ChronoGazer の `plan_bindings`
-//! と同じ。[`plan_bindings`]）。rename されたタグだけが unresolved になり、
-//! **残りのタグの記録は続く**。
-//!
-//! unresolved の名前は周期的（`SidecarOptions::replan_interval`）に catalog を
-//! 引き直して計画を作り直すので、同名再作成や、設定再取得後に設定へ入った
-//! 新名で復帰する（tag-server-design.md §4.1「リネームは破壊的変更」。rename
-//! 後の行は新しい名前になる - §5.3）。購読中に subscribed タグが rename された
-//! 場合は、SDK が世代を落として catalog から再試行し続けるので、
-//! [`Subscription::needs_replan`] で検出して直ちに計画を作り直し、残りの
-//! タグで復帰させる。周期的な再計画は購読を止める**前**に catalog を引いて
-//! 計画だけを作り、計画が変わらなければ既存の購読は維持し、張り直さない
-//! （張り直すと正常なタグの記録が再ハンドシェイクの間だけ途切れ、その catalog
-//! 取得が一時失敗すると正常だった購読まで失うため。[`plan_subscription`] /
-//! [`Subscription::start_with_plan`]）。
+//! catalog との照合と再解決は SDK が行う。名前が一部だけ解決できる間も、
+//! 解決済みタグの値を取り込む。全件未解決では SDK が `Unbound` で待ち、
+//! 構成変更を受けて同じハンドルのまま再解決する。グループ設定で要求する
+//! 名前の集合が変わったときは、サイドカーがハンドルを入れ替える。
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use banto_tagclient::{
-    BindingRequest, CatalogSnapshot, Endpoint, ErrorKind, RestClient, SecretApiKey,
-    TagClientConnectionState, TagClientHandle,
+    BindingRequest, Endpoint, RestClient, SecretApiKey, TagClientConnectionState, TagClientHandle,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -99,64 +82,15 @@ impl ValueView {
     }
 }
 
-/// 購読の計画（[`plan_bindings`] の結果）。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct BindingPlan {
-    /// catalog で解決でき、SDK へ渡す external name（ソート済み）。
-    pub resolved: Vec<String>,
-    /// 今は購読できない external name（ソート済み）。catalog に無い名前
-    /// （rename / 削除 / 権限で見えない）と、購読プロトコルに載せられない
-    /// 綴り（空・空白のみ・カンマを含む）を**まとめて**入れる。
-    ///
-    /// ChronoGazer は前者を `unresolved`、後者を `unsupported` と別バケツに
-    /// 分けるが、Sink の利用者はどちらも「この名前は記録されない」という
-    /// 同じ結果しか見ないので分けない（ログにも同じ列挙で出す）。
-    pub unresolved: Vec<String>,
-}
-
 /// 空・空白のみ・カンマを含む名前は SDK の `start()` が
-/// `InvalidTagSelection` で**購読全体を**拒否する（購読要求はタグ名を
-/// カンマ区切りで並べるため）。ChronoGazer の `is_unsupported_tag_name` と
-/// 同じ規則。
+/// `InvalidTagSelection` で購読全体を拒否するため、要求から外す。
 fn is_unsupported_tag_name(name: &str) -> bool {
     name.trim().is_empty() || name.contains(',')
 }
 
-/// 購読したい名前を catalog と突き合わせ、SDK へ渡せる名前（`resolved`）と
-/// 今は渡せない名前（`unresolved`）に分ける**純関数**。
-///
-/// - SDK は 1 件でも unresolved があると世代全体を落とすので、Sink 側で
-///   解決できる名前だけを渡す（ChronoGazer の `plan_bindings` と同じ）。
-/// - 購読プロトコルに載せられない綴り（[`is_unsupported_tag_name`]）は
-///   catalog を引く前に `unresolved` へ落とす（1 件混ざると全体が死ぬため）。
-/// - `desired` は [`normalize_names`] 済みが前提だが、重複は SDK が
-///   `external_name` 重複として拒否するので、念のためここでも畳む。
-/// - 両方ソート済みで返す（差分判定・ログの順序を安定させる）。
-pub fn plan_bindings(desired: &[String], catalog: &CatalogSnapshot) -> BindingPlan {
-    let known: BTreeSet<&str> = catalog
-        .tags
-        .iter()
-        .map(|tag| tag.external_name.as_str())
-        .collect();
-    let mut resolved = BTreeSet::new();
-    let mut unresolved = BTreeSet::new();
-    for name in desired {
-        if !is_unsupported_tag_name(name) && known.contains(name.as_str()) {
-            resolved.insert(name.clone());
-        } else {
-            unresolved.insert(name.clone());
-        }
-    }
-    BindingPlan {
-        resolved: resolved.into_iter().collect(),
-        unresolved: unresolved.into_iter().collect(),
-    }
-}
-
 /// Hub の REST クライアント。1 回の REST 呼び出し（catalog・値の snapshot。
 /// 購読の worker が再接続で引くものも含む）を [`REQUEST_TIMEOUT`] で
-/// 頭打ちにする（#589）。応答しない Hub に通常運転の再計画が捕まり続けない
-/// ための歯止めで、停止はこれを待たない（運転ループが停止合図と `select` する）。
+/// 頭打ちにする（#589）。SDK worker は停止合図を受けると進行中の要求を中断する。
 ///
 /// 上限は SDK の既定ではなく、この Sink が opt-in で掛ける。SDK の既定に
 /// 上限を入れると、外側に自分の期限を持つ利用側（ChronoGazer の Hub 操作の
@@ -171,189 +105,77 @@ fn rest_client(config: &SidecarConfig) -> Result<RestClient, banto_tagclient::Er
     }
 }
 
-/// catalog を 1 回取得して `desired` の購読計画を返す。**購読は張らない**
-/// （SDK も WS も触らない、REST 1 リクエストだけの問い合わせ）。
-///
-/// 周期的な再計画が、現在の購読を止める**前**に「計画が変わるか」を調べる
-/// ために使う。catalog を取得できなければ `Err`（その場合、呼び出し側は
-/// 既存の購読を維持できる）。
-pub async fn plan_subscription(
-    config: &SidecarConfig,
-    desired: &[String],
-) -> Result<BindingPlan, banto_tagclient::Error> {
-    let catalog = rest_client(config)?.fetch_catalog().await?;
-    Ok(plan_bindings(desired, &catalog))
-}
-
-/// 購読 1 世代（SDK ハンドル + 変換タスク）。設定変更で対象タグの集合が
-/// 変わったとき、SDK の worker が終了したとき、または計画を作り直す
-/// 必要が出たとき（[`Self::needs_replan`]、`unresolved` が残っている間の
-/// 周期的な再計画）に作り直す。
-///
-/// `resolved` が空（全部 unresolved）のときは SDK ハンドルを持たない
-/// （`handle` / `pump` が `None`）。それでも `Some(Subscription)` として
-/// 残すのは、「全部 unresolved」の状態を「購読したいタグが無い」と区別して
-/// 再計画の契機を失わないため。
+/// 購読 1 本（SDK ハンドル + 変換タスク）。要求する名前の集合が
+/// 変わったときか、SDK の worker が終了したときに作り直す。
 pub struct Subscription {
     handle: Option<TagClientHandle>,
     pump: Option<JoinHandle<()>>,
     dead: Arc<AtomicBool>,
-    /// SDK が `BindingUnresolved` を報告した（購読中に subscribed タグが
-    /// rename された等）。true なら直ちに計画を作り直す。
-    replan: Arc<AtomicBool>,
-    /// 差分判定用の、購読したい名前の全体（順序正規化済み）。
+    /// SDK に渡せない名前も含めた、差分判定用の名前の集合。
     desired: Vec<String>,
-    /// SDK へ渡した名前（`desired` のうち catalog で解決できたもの）。
-    resolved: Vec<String>,
-    /// `desired` のうち今は購読できない名前。
-    unresolved: Vec<String>,
 }
 
 impl Subscription {
-    /// 購読を開始する。`desired` は重複除去・ソート済みであること
-    /// （[`normalize_names`]）。空なら `None`（購読するものが無い）。
-    ///
-    /// catalog を 1 度取得して [`plan_bindings`] で分け（[`plan_subscription`]）、
-    /// **`resolved` だけ**を SDK へ渡す（[`Self::start_with_plan`]）。catalog を
-    /// 取得できなければ `Err`（呼び出し側のバックオフに乗せる）。
-    pub async fn start(
-        config: &SidecarConfig,
-        desired: Vec<String>,
-        view_tx: watch::Sender<Arc<ValueView>>,
-    ) -> Result<Option<Self>, banto_tagclient::Error> {
-        Self::start_with_recovery(config, desired, view_tx, SubscriptionRecovery::default()).await
-    }
-
-    pub(crate) async fn start_with_recovery(
+    pub(crate) fn start_with_recovery(
         config: &SidecarConfig,
         desired: Vec<String>,
         view_tx: watch::Sender<Arc<ValueView>>,
         recovery: SubscriptionRecovery,
     ) -> Result<Option<Self>, banto_tagclient::Error> {
+        let desired = normalize_names(desired);
         if desired.is_empty() {
-            let _ = view_tx.send(Arc::new(ValueView::default()));
+            view_tx.send_replace(Arc::new(ValueView::default()));
             return Ok(None);
         }
-        let plan = plan_subscription(config, &desired).await?;
-        Self::start_with_plan_and_recovery(config, desired, plan, view_tx, recovery)
-    }
 
-    /// 計画済みの `plan.resolved` だけで購読を開始する。catalog は取らない
-    /// （周期的な再計画が [`plan_subscription`] で先に引いた結果をそのまま
-    /// 使い、catalog を二度取らないため）。`desired` は [`Self::start`] と
-    /// 同じく正規化済みで、空なら `None`。
-    ///
-    /// `resolved` が空なら SDK は起動せず、ハンドル無しの購読を返す。
-    pub fn start_with_plan(
-        config: &SidecarConfig,
-        desired: Vec<String>,
-        plan: BindingPlan,
-        view_tx: watch::Sender<Arc<ValueView>>,
-    ) -> Result<Option<Self>, banto_tagclient::Error> {
-        Self::start_with_plan_and_recovery(
-            config,
-            desired,
-            plan,
-            view_tx,
-            SubscriptionRecovery::default(),
-        )
-    }
-
-    pub(crate) fn start_with_plan_and_recovery(
-        config: &SidecarConfig,
-        desired: Vec<String>,
-        plan: BindingPlan,
-        view_tx: watch::Sender<Arc<ValueView>>,
-        recovery: SubscriptionRecovery,
-    ) -> Result<Option<Self>, banto_tagclient::Error> {
-        if desired.is_empty() {
-            let _ = view_tx.send(Arc::new(ValueView::default()));
-            return Ok(None);
+        let mut unsupported = Vec::new();
+        let mut requests = Vec::new();
+        for name in &desired {
+            if is_unsupported_tag_name(name) {
+                unsupported.push(name.clone());
+            } else {
+                requests.push(BindingRequest {
+                    binding_key: name.clone(),
+                    external_name: name.clone(),
+                });
+            }
         }
-        let BindingPlan {
-            resolved,
-            unresolved,
-        } = plan;
         let dead = Arc::new(AtomicBool::new(false));
-        let replan = Arc::new(AtomicBool::new(false));
-        if resolved.is_empty() {
-            // SDK は空の購読を拒否する。行は作らない（live = false）。
-            let _ = view_tx.send(Arc::new(ValueView::default()));
+        if requests.is_empty() {
+            // 全件がプロトコル非対応なら、設定が変わるまでこの要求集合を覚えておく。
+            view_tx.send_replace(Arc::new(ValueView::default()));
+            crate::log::log_line(&subscription_message(0, &unsupported));
             return Ok(Some(Self {
                 handle: None,
                 pump: None,
                 dead,
-                replan,
                 desired,
-                resolved,
-                unresolved,
             }));
         }
-        let requests: Vec<BindingRequest> = resolved
-            .iter()
-            .map(|name| BindingRequest {
-                binding_key: name.clone(),
-                external_name: name.clone(),
-            })
-            .collect();
+
         let handle = rest_client(config)?.start(requests)?;
-        let state_rx = handle.state_watch();
         let pump = tokio::spawn(pump_values(
-            state_rx,
+            handle.state_watch(),
             view_tx,
             dead.clone(),
-            replan.clone(),
+            unsupported,
             recovery,
         ));
         Ok(Some(Self {
             handle: Some(handle),
             pump: Some(pump),
             dead,
-            replan,
             desired,
-            resolved,
-            unresolved,
         }))
     }
 
-    /// SDK の worker が終了した（`Unauthorized` などの終端エラー）か。
-    /// true になったら呼び出し側は [`Self::stop`] してバックオフののち
-    /// 作り直す（設計 §5.6「Hub の再起動にも追従」- SDK 自身の再接続で
-    /// 直らない終端だけがここへ来る）。
+    /// SDK の worker が終了したか。終端エラーはサイドカーがバックオフ後に再試行する。
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::Relaxed)
     }
 
-    /// SDK が `BindingUnresolved` を報告したか。true なら呼び出し側は
-    /// バックオフなしで計画を作り直す（SDK は世代を落として catalog から
-    /// 再試行し続けるだけなので、残りのタグで復帰させるには Sink 側で
-    /// 解決できる名前だけの購読へ張り直すしかない）。
-    pub fn needs_replan(&self) -> bool {
-        self.replan.load(Ordering::Relaxed)
-    }
-
-    /// 購読したい名前の全体（差分判定用）。
     pub fn desired(&self) -> &[String] {
         &self.desired
-    }
-
-    /// 実際に SDK へ渡した名前。
-    pub fn resolved(&self) -> &[String] {
-        &self.resolved
-    }
-
-    /// 今は購読できない名前。
-    pub fn unresolved(&self) -> &[String] {
-        &self.unresolved
-    }
-
-    /// この世代の計画（`resolved` / `unresolved` のコピー）。周期的な再計画が
-    /// 新しい計画と比べて「変わらなければ購読を維持する」ために使う。
-    pub fn plan(&self) -> BindingPlan {
-        BindingPlan {
-            resolved: self.resolved.clone(),
-            unresolved: self.unresolved.clone(),
-        }
     }
 
     /// 変換タスクを停止して join してから SDK worker を停止する。
@@ -414,34 +236,32 @@ impl SubscriptionRecovery {
 }
 
 /// SDK の状態 watch を [`ValueView`] の watch へ変換し続けるタスク。
-/// 「SDK ハンドルは世代ごとに作り直すが、プロデューサが持つ受信端は
-/// 作り直さない」ための一枚。
+/// SDK ハンドルを入れ替えても、プロデューサが持つ受信端は維持する。
 async fn pump_values(
     mut state_rx: watch::Receiver<banto_tagclient::TagClientState>,
     view_tx: watch::Sender<Arc<ValueView>>,
     dead: Arc<AtomicBool>,
-    replan: Arc<AtomicBool>,
+    unsupported: Vec<String>,
     recovery: SubscriptionRecovery,
 ) {
     let mut saw_active = false;
+    let mut generation = None;
+    let mut last_resolution = None;
     loop {
-        let message = {
+        let (recovered, changed_resolution) = {
             let state = state_rx.borrow_and_update();
-            let message = recovery.observe(state.connection_state());
-            if state.connection_state() != TagClientConnectionState::Stopped {
-                saw_active = true;
-            } else if saw_active {
-                // worker が終了した（`run_supervisor` が `Unauthorized` /
-                // 終端エラーで抜けた、または shutdown された）。
-                dead.store(true, Ordering::Relaxed);
-            }
-            if state.last_error() == Some(ErrorKind::BindingUnresolved) {
-                replan.store(true, Ordering::Relaxed);
-            }
-            let view = match state.current() {
-                Some(snapshot) => ValueView {
+            let connection = state.connection_state();
+            let recovered = recovery.observe(connection);
+            let terminal = connection == TagClientConnectionState::Unauthorized
+                || (connection == TagClientConnectionState::Stopped
+                    && (saw_active || state.last_error().is_some()));
+            saw_active |= connection != TagClientConnectionState::Stopped;
+
+            let snapshot = state.snapshot();
+            let view = match snapshot.and_then(|snapshot| snapshot.values.as_deref()) {
+                Some(values) => ValueView {
                     live: true,
-                    values: snapshot
+                    values: values
                         .values
                         .iter()
                         .map(|entry| {
@@ -459,16 +279,43 @@ async fn pump_values(
                 None => ValueView::default(),
             };
             view_tx.send_replace(Arc::new(view));
-            message
+            if terminal {
+                dead.store(true, Ordering::Relaxed);
+            }
+
+            let changed_resolution = if let Some(snapshot) =
+                snapshot.filter(|snapshot| generation != Some(snapshot.generation))
+            {
+                generation = Some(snapshot.generation);
+                let mut unresolved = unsupported.clone();
+                unresolved.extend(
+                    snapshot
+                        .resolution
+                        .unresolved
+                        .iter()
+                        .map(|binding| binding.external_name.clone()),
+                );
+                unresolved.sort_unstable();
+                Some((snapshot.resolution.resolved.len(), unresolved))
+            } else {
+                None
+            };
+            (recovered, changed_resolution)
         };
-        // File/console logging is synchronous; never retain the SDK watch Ref.
-        if let Some(message) = message {
+        // ログは同期 I/O のため SDK の watch を解放してから書く。
+        if let Some(resolution) =
+            changed_resolution.filter(|next| Some(next) != last_resolution.as_ref())
+        {
+            crate::log::log_line(&subscription_message(resolution.0, &resolution.1));
+            last_resolution = Some(resolution);
+        }
+        if let Some(message) = recovered {
             crate::log::log_line(message);
         }
         if state_rx.changed().await.is_err() {
             // 送信端（SDK ハンドル）が落ちた = この世代は終わり。
-            dead.store(true, Ordering::Relaxed);
             view_tx.send_replace(Arc::new(ValueView::default()));
+            dead.store(true, Ordering::Relaxed);
             return;
         }
     }
@@ -482,9 +329,59 @@ pub fn normalize_names(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
+/// 未解決の名前を何件までログへ列挙するか。
+const UNRESOLVED_LOG_LIMIT: usize = 5;
+
+/// 購読対象を示すログの本文。未解決が 0 なら「N タグ」だけ、あれば名前を
+/// [`UNRESOLVED_LOG_LIMIT`] 件まで列挙し、超えた分は「ほか N 件」。
+fn subscription_message(resolved_len: usize, unresolved: &[String]) -> String {
+    if unresolved.is_empty() {
+        return format!("banto-hub-sink: Hub の購読対象が確定しました（{resolved_len} タグ）");
+    }
+    let mut names = unresolved
+        .iter()
+        .take(UNRESOLVED_LOG_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unresolved.len() > UNRESOLVED_LOG_LIMIT {
+        names.push_str(&format!(
+            "、ほか {} 件",
+            unresolved.len() - UNRESOLVED_LOG_LIMIT
+        ));
+    }
+    format!(
+        "banto-hub-sink: Hub の購読対象が確定しました（{resolved_len} タグ。未解決 {}: {names}）",
+        unresolved.len()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
+
+    #[test]
+    fn subscription_message_lists_up_to_five_unresolved_names() {
+        assert_eq!(
+            subscription_message(3, &[]),
+            "banto-hub-sink: Hub の購読対象が確定しました（3 タグ）"
+        );
+        let names: Vec<String> = ["a", "b", "c"].iter().map(|n| (*n).to_owned()).collect();
+        assert_eq!(
+            subscription_message(97, &names),
+            "banto-hub-sink: Hub の購読対象が確定しました（97 タグ。未解決 3: a, b, c）"
+        );
+        let many: Vec<String> = (1..=7).map(|n| format!("t{n}")).collect();
+        assert_eq!(
+            subscription_message(0, &many),
+            "banto-hub-sink: Hub の購読対象が確定しました（0 タグ。未解決 7: t1, t2, t3, t4, t5、ほか 2 件）"
+        );
+    }
 
     #[test]
     fn subscription_recovery_is_logged_once_after_a_failed_generation() {
@@ -565,286 +462,216 @@ mod tests {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    fn catalog_json(names: &[&str]) -> String {
-        let tags: Vec<String> = names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                format!(
-                    r#"{{"external_name":"{name}","tag_key":"tag:{index}","ids":[1,1,{index}],
-                    "connection":"c","group":"g","name":"{name}","address":"a","data_type":"f64",
-                    "unit":null,"decimals":0,"period_ms":100,"enabled":true,"writable":false,
-                    "tag_kind":"plc","expression":null,"retain":false,"simulation":false,
-                    "configured_simulation":false,"effective_simulation":false,
-                    "value_source":"real"}}"#
-                )
-            })
-            .collect();
-        format!(
-            r#"{{"revision":1,"run_id":1,"collection_mode":"configured","tags":[{}]}}"#,
-            tags.join(",")
-        )
-    }
-
-    fn catalog(names: &[&str]) -> CatalogSnapshot {
-        serde_json::from_str(&catalog_json(names)).unwrap()
-    }
-
-    #[test]
-    fn plan_bindings_splits_resolved_and_unresolved() {
-        let plan = plan_bindings(&owned(&["a", "gone", "b"]), &catalog(&["a", "b", "c"]));
-        assert_eq!(plan.resolved, owned(&["a", "b"]));
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-    }
-
-    #[test]
-    fn plan_bindings_folds_duplicates() {
-        let plan = plan_bindings(&owned(&["a", "a", "gone", "gone"]), &catalog(&["a"]));
-        assert_eq!(plan.resolved, owned(&["a"]));
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-    }
-
-    #[test]
-    fn plan_bindings_returns_both_lists_sorted() {
-        let plan = plan_bindings(
-            &owned(&["z", "y.gone", "b", "a.gone", "a"]),
-            &catalog(&["a", "b", "z"]),
-        );
-        assert_eq!(plan.resolved, owned(&["a", "b", "z"]));
-        assert_eq!(plan.unresolved, owned(&["a.gone", "y.gone"]));
-    }
-
-    #[test]
-    fn plan_bindings_drops_names_the_subscription_protocol_rejects() {
-        // catalog に同じ綴りがあっても、SDK の start() が全体を拒否する
-        // 綴り（空・空白のみ・カンマ入り）は購読へ渡さない。
-        let plan = plan_bindings(
-            &owned(&["", "  ", "a,b", "ok"]),
-            &catalog(&["", "  ", "a,b", "ok"]),
-        );
-        assert_eq!(plan.resolved, owned(&["ok"]));
-        assert_eq!(plan.unresolved, owned(&["", "  ", "a,b"]));
-    }
-
-    #[test]
-    fn plan_bindings_on_an_empty_desired_is_empty() {
-        let plan = plan_bindings(&[], &catalog(&["a"]));
-        assert_eq!(plan, BindingPlan::default());
-    }
-
-    /// `GET /api/v1/tags` に `catalog` を返し続ける最小の HTTP モック
-    /// （それ以外のリクエスト = SDK の WS 接続などは 404 で切る）。
-    /// 受けたリクエスト行を `requests` へ積む。
-    async fn spawn_catalog_server(
-        catalog: String,
-    ) -> (
-        SidecarConfig,
-        Arc<std::sync::Mutex<Vec<String>>>,
-        JoinHandle<()>,
-    ) {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let hub_url = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let seen = requests.clone();
-        let server = tokio::spawn(async move {
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 1024];
-                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    match stream.read(&mut buffer).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(count) => request.extend_from_slice(&buffer[..count]),
-                    }
-                }
-                let request = String::from_utf8_lossy(&request).into_owned();
-                let line = request.lines().next().unwrap_or_default().to_owned();
-                seen.lock().unwrap().push(line.clone());
-                let response = if line.starts_with("GET /api/v1/tags ") {
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{catalog}",
-                        catalog.len()
-                    )
-                } else {
-                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        .to_owned()
-                };
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-        let config = SidecarConfig {
+    fn config(hub_url: String) -> SidecarConfig {
+        SidecarConfig {
             hub_url,
             api_key: "bh_test.secret".to_owned(),
             hub_tls: None,
-            config_refresh: std::time::Duration::from_secs(30),
-            status_push: std::time::Duration::from_secs(10),
+            config_refresh: Duration::from_secs(30),
+            status_push: Duration::from_secs(10),
             queue_max_rows: 1000,
-            flush_interval: std::time::Duration::from_millis(100),
+            flush_interval: Duration::from_millis(100),
             batch_size: 100,
-            shutdown_flush: std::time::Duration::from_secs(1),
-        };
-        (config, requests, server)
+            shutdown_flush: Duration::from_secs(1),
+        }
     }
 
-    #[tokio::test]
-    async fn start_subscribes_only_to_names_the_catalog_resolves() {
-        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
-        let subscription = Subscription::start(&config, owned(&["a", "gone"]), view_tx)
-            .await
-            .unwrap()
-            .expect("解決できる名前があれば購読は作られる");
-        assert_eq!(subscription.desired(), owned(&["a", "gone"]).as_slice());
-        assert_eq!(subscription.resolved(), owned(&["a"]).as_slice());
-        assert_eq!(subscription.unresolved(), owned(&["gone"]).as_slice());
-        assert!(!subscription.needs_replan());
-        assert!(requests
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.starts_with("GET /api/v1/tags ")));
-        tokio::time::timeout(std::time::Duration::from_secs(5), subscription.stop())
-            .await
-            .expect("stop は WS 接続の失敗待ちで詰まらない");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn start_with_everything_unresolved_keeps_a_handle_less_subscription() {
-        let (config, requests, server) = spawn_catalog_server(catalog_json(&["other"])).await;
+    #[test]
+    fn empty_or_unsupported_names_never_start_the_sdk() {
+        // SDK を呼べば失敗する URL でも、要求が空ならクライアントを作らない。
+        let config = config("not a URL".to_owned());
         let (view_tx, view_rx) = watch::channel(Arc::new(ValueView {
             live: true,
             values: HashMap::new(),
         }));
-        let subscription = Subscription::start(&config, owned(&["gone1", "gone2"]), view_tx)
-            .await
-            .unwrap()
-            .expect("全部 unresolved でも Some（再計画の契機を残す）");
-        assert!(subscription.resolved().is_empty());
-        assert_eq!(
-            subscription.unresolved(),
-            owned(&["gone1", "gone2"]).as_slice()
-        );
-        assert!(!subscription.needs_replan());
-        assert!(!subscription.is_dead());
-        assert!(!view_rx.borrow().live, "行は作らない");
-        // SDK を起動していないので、catalog 取得の 1 回だけ。
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        subscription.stop().await;
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn plan_subscription_only_fetches_the_catalog() {
-        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        let plan = plan_subscription(&config, &owned(&["a", "gone"]))
-            .await
-            .unwrap();
-        assert_eq!(plan.resolved, owned(&["a"]));
-        assert_eq!(plan.unresolved, owned(&["gone"]));
-        // 購読は張らない（WS 接続を試みない）ので、catalog 取得の 1 回だけ。
-        // SDK が起動していれば WS 接続の試行が追加で届くので、少し待って確認する。
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let seen = requests.lock().unwrap().clone();
-        assert_eq!(seen.len(), 1, "{seen:?}");
-        assert!(seen[0].starts_with("GET /api/v1/tags "));
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn plan_subscription_fails_when_the_catalog_cannot_be_fetched() {
-        let (config, _requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        server.abort();
-        let _ = server.await;
-        assert!(plan_subscription(&config, &owned(&["a"])).await.is_err());
-    }
-
-    #[tokio::test]
-    async fn start_with_plan_without_resolved_names_has_no_handle() {
-        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        let (view_tx, view_rx) = watch::channel(Arc::new(ValueView {
-            live: true,
-            values: HashMap::new(),
-        }));
-        let plan = BindingPlan {
-            resolved: Vec::new(),
-            unresolved: owned(&["gone"]),
-        };
-        let subscription =
-            Subscription::start_with_plan(&config, owned(&["gone"]), plan.clone(), view_tx)
-                .unwrap()
-                .expect("全部 unresolved でも Some");
-        assert!(subscription.handle.is_none());
-        assert!(subscription.pump.is_none());
-        assert_eq!(subscription.plan(), plan);
-        assert!(!view_rx.borrow().live);
-        // catalog は取らない。
-        assert!(requests.lock().unwrap().is_empty());
-        subscription.stop().await;
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn start_with_plan_with_resolved_names_starts_the_sdk_without_a_catalog_fetch() {
-        let (config, requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
-        let plan = BindingPlan {
-            resolved: owned(&["a"]),
-            unresolved: owned(&["gone"]),
-        };
-        let subscription =
-            Subscription::start_with_plan(&config, owned(&["a", "gone"]), plan.clone(), view_tx)
-                .unwrap()
-                .expect("resolved があれば購読は作られる");
-        assert!(subscription.handle.is_some());
-        assert!(subscription.pump.is_some());
-        assert_eq!(subscription.plan(), plan);
-        assert_eq!(subscription.desired(), owned(&["a", "gone"]).as_slice());
-        assert!(
-            !requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|line| line.starts_with("GET /api/v1/tags ")),
-            "計画済みなので catalog は取らない"
-        );
-        // SDK の WS 接続はモックが 404 で切るので失敗するが、ここでは無視して畳む。
-        tokio::time::timeout(std::time::Duration::from_secs(5), subscription.stop())
-            .await
-            .expect("stop は WS 接続の失敗待ちで詰まらない");
-        server.abort();
-    }
-
-    #[tokio::test]
-    async fn start_with_plan_on_empty_desired_is_none() {
-        let (config, _requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
-        assert!(Subscription::start_with_plan(
+        assert!(Subscription::start_with_recovery(
             &config,
             Vec::new(),
-            BindingPlan::default(),
-            view_tx
+            view_tx.clone(),
+            SubscriptionRecovery::default(),
         )
         .unwrap()
         .is_none());
-        server.abort();
+
+        let subscription = Subscription::start_with_recovery(
+            &config,
+            owned(&["a,b", "", "  ", "a,b"]),
+            view_tx,
+            SubscriptionRecovery::default(),
+        )
+        .unwrap()
+        .expect("全件が購読不可なら要求集合だけを覚える");
+        assert_eq!(subscription.desired(), owned(&["", "  ", "a,b"]));
+        assert!(subscription.handle.is_none());
+        assert!(!subscription.is_dead());
+        assert!(!view_rx.borrow().live);
+    }
+
+    async fn serve_json(listener: &TcpListener, path: &str, body: serde_json::Value) {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            request.push(stream.read_u8().await.unwrap());
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with(&format!("GET {path} HTTP/1.1\r\n")));
+        let body = body.to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
+    }
+
+    async fn serve_catalog(listener: &TcpListener, revision: u64, tags: &[&str]) {
+        let tags = tags
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let tag_id = revision * 10 + index as u64;
+                serde_json::json!({
+                    "external_name": name, "tag_key": format!("tag:{tag_id}"),
+                    "ids": [1, 1, tag_id],
+                    "connection": "c", "group": "g", "name": name, "address": "a",
+                    "data_type": "f64", "decimals": 0, "period_ms": 100,
+                    "enabled": true, "writable": false, "tag_kind": "plc", "retain": false,
+                    "simulation": false, "configured_simulation": false,
+                    "effective_simulation": false, "value_source": "real",
+                })
+            })
+            .collect::<Vec<_>>();
+        serve_json(
+            listener,
+            "/api/v1/tags",
+            serde_json::json!({
+                "revision": revision, "run_id": 1, "collection_mode": "configured", "tags": tags,
+            }),
+        )
+        .await;
+    }
+
+    async fn accept_stream(listener: &TcpListener) -> WebSocketStream<TcpStream> {
+        let (stream, _) = listener.accept().await.unwrap();
+        accept_async(stream).await.unwrap()
+    }
+
+    async fn serve_live(
+        listener: &TcpListener,
+        revision: u64,
+        name: &str,
+        value: f64,
+    ) -> WebSocketStream<TcpStream> {
+        serve_catalog(listener, revision, &[name]).await;
+        let mut socket = accept_stream(listener).await;
+        let subscribe = socket.next().await.unwrap().unwrap().into_text().unwrap();
+        let subscribe: serde_json::Value = serde_json::from_str(&subscribe).unwrap();
+        assert_eq!(subscribe["op"], "subscribe");
+        assert_eq!(subscribe["tags"], serde_json::json!([name]));
+        let row = serde_json::json!({"tag": name, "v": value, "q": "good", "t": 20});
+        let frame =
+            serde_json::json!({"op": "data", "id": subscribe["id"], "t": 20, "values": [row]});
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
+        serve_json(
+            listener,
+            &format!("/api/v1/values?tags={name}"),
+            serde_json::json!({
+                "revision": revision, "run_id": 1, "collection_mode": "configured", "t": 20,
+                "values": [{"tag": name, "v": value, "q": "good", "t": 20, "value_source": "real"}],
+            }),
+        )
+        .await;
+        socket
+    }
+
+    async fn change_catalog(socket: &mut WebSocketStream<TcpStream>, revision: u64) {
+        let frame = serde_json::json!({"op": "config_changed", "revision": revision});
+        socket
+            .send(Message::Text(frame.to_string().into()))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
-    async fn start_fails_when_the_catalog_cannot_be_fetched() {
-        let (config, _requests, server) = spawn_catalog_server(catalog_json(&["a"])).await;
-        server.abort();
-        let _ = server.await;
-        // 落ちたサーバーのポートへ繋ぐ = 接続拒否。
-        let (view_tx, _view_rx) = watch::channel(Arc::new(ValueView::default()));
-        assert!(Subscription::start(&config, owned(&["a"]), view_tx)
-            .await
-            .is_err());
+    async fn sdk_keeps_the_subscription_across_partial_and_unbound_generations() {
+        use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let config = config(format!("http://{}", listener.local_addr().unwrap()));
+            let (view_tx, mut view_rx) = watch::channel(Arc::new(ValueView::default()));
+            let subscription = Subscription::start_with_recovery(
+                &config,
+                owned(&["good", "missing", "bad,name"]),
+                view_tx,
+                SubscriptionRecovery::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let mut states = subscription.handle.as_ref().unwrap().state_watch();
+
+            let mut partial = serve_live(&listener, 1, "good", 1.0).await;
+            {
+                let view = view_rx.wait_for(|view| view.live).await.unwrap();
+                assert_eq!(view.get("good").unwrap().value, Some(1.0));
+                assert!(view.get("missing").is_none());
+            }
+            change_catalog(&mut partial, 2).await;
+            drop(partial);
+
+            // Unbound では subscribe を送らず、ping/pong と catalog 再確認だけを行う。
+            serve_catalog(&listener, 2, &[]).await;
+            let mut unbound = accept_stream(&listener).await;
+            assert_eq!(
+                unbound.next().await.unwrap().unwrap().into_text().unwrap(),
+                r#"{"op":"ping"}"#
+            );
+            unbound
+                .send(Message::Text(r#"{"op":"pong"}"#.into()))
+                .await
+                .unwrap();
+            serve_catalog(&listener, 2, &[]).await;
+            {
+                let state = states
+                    .wait_for(|state| state.connection_state() == TagClientConnectionState::Unbound)
+                    .await
+                    .unwrap();
+                assert_eq!(state.snapshot().unwrap().resolution.unresolved.len(), 2);
+                assert!(state.current().is_none());
+            }
+            {
+                let view = view_rx.wait_for(|view| !view.live).await.unwrap();
+                assert!(view.values.is_empty());
+            }
+            assert!(!subscription.is_dead());
+            change_catalog(&mut unbound, 3).await;
+            drop(unbound);
+
+            // 最初に解決できなかった名前を、同じ要求・ハンドルのまま購読する。
+            let mut recovered = serve_live(&listener, 3, "missing", 3.0).await;
+            {
+                let view = view_rx.wait_for(|view| view.live).await.unwrap();
+                assert_eq!(view.get("missing").unwrap().value, Some(3.0));
+                assert!(view.get("good").is_none());
+            }
+
+            recovered
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: "api_key_revoked".into(),
+                })))
+                .await
+                .unwrap();
+            while !subscription.is_dead() {
+                tokio::task::yield_now().await;
+            }
+            assert!(view_rx.borrow().values.is_empty());
+            subscription.stop().await;
+        })
+        .await
+        .expect("同じハンドルの部分解決・再解決・停止が予算内に終わる");
     }
 
     #[test]

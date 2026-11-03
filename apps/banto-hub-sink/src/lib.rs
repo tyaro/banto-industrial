@@ -44,8 +44,8 @@
 //! - [`hub_api`][]: `GET /api/sink/config` / `PUT /api/sink/status`（admin
 //!   スコープの API キー + ループバック運用、§6-15）。
 //! - [`values`][]: banto-tagclient の `TagClientHandle` を1本だけ持ち、全
-//!   グループの対象タグの**和集合**を安定 ID で購読して、外部名で引ける
-//!   最新スナップショット（[`values::ValueView`]）へ変換して配る。
+//!   グループの対象タグの**和集合**を外部名で SDK に渡す。SDK が解決した
+//!   タグの値を最新スナップショット（[`values::ValueView`]）へ変換して配る。
 //! - [`group`][]: 1 sink group の実行時状態（対象タグ・キュー・運転状態）と、
 //!   `interval`（周期採取）/ `on_change`（変化時 + 最短発行間隔）の
 //!   プロデューサ。
