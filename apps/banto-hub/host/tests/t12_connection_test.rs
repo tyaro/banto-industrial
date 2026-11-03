@@ -76,13 +76,14 @@ const CLIENT_HEADER: (&str, &str) = ("X-Banto-Client", "banto");
 /// Temp-dir prefix passed to `TempEnv::new` (see `tests/common/mod.rs`).
 const TEMP_ENV_PREFIX: &str = "banto-hub-t12-it";
 
-/// 組み込み Modbus の文法・設定を使い、必須の秘密の欄だけを足すテスト専用ドライバ。
-struct RequiredSecretDriver {
+/// 組み込み Modbus の文法・設定を使い、秘密の欄だけを足すテスト専用ドライバ。
+struct TestSecretDriver {
     descriptor: DriverDescriptor,
     delegate: DriverEntry,
+    required: bool,
 }
 
-impl DriverBase for RequiredSecretDriver {
+impl DriverBase for TestSecretDriver {
     fn descriptor(&self) -> &DriverDescriptor {
         &self.descriptor
     }
@@ -94,9 +95,12 @@ impl DriverBase for RequiredSecretDriver {
     }
     fn settings_schema(&self) -> SettingsSchema {
         let mut schema = self.delegate.base().settings_schema();
-        schema
-            .fields
-            .push(SettingField::new("token", "トークン", FieldKind::secret()).required());
+        let field = SettingField::new("token", "トークン", FieldKind::secret());
+        schema.fields.push(if self.required {
+            field.required()
+        } else {
+            field
+        });
         schema
     }
     fn parse_address(&self, text: &str, kind: &TagKind) -> Result<DriverAddress, AddressError> {
@@ -110,7 +114,7 @@ impl DriverBase for RequiredSecretDriver {
     }
 }
 
-impl FrameDriver for RequiredSecretDriver {
+impl FrameDriver for TestSecretDriver {
     fn create_connection(
         &self,
         settings: &Settings,
@@ -516,18 +520,21 @@ async fn test_app_with_drivers_and_options(
     }
     if with_secret_driver {
         let delegate = drivers.registry.get("modbus-tcp").unwrap().clone();
-        Arc::get_mut(&mut drivers.registry)
-            .unwrap()
-            .register(DriverEntry::frame(Arc::new(RequiredSecretDriver {
-                descriptor: DriverDescriptor::new(
-                    DriverId::new("secret-test").unwrap(),
-                    "0.0.0-test",
-                    "必須 Secret のテスト",
-                    Capabilities::READ_WRITE,
-                ),
-                delegate,
-            })))
-            .unwrap();
+        for (id, required) in [("secret-test", true), ("optional-secret-test", false)] {
+            Arc::get_mut(&mut drivers.registry)
+                .unwrap()
+                .register(DriverEntry::frame(Arc::new(TestSecretDriver {
+                    descriptor: DriverDescriptor::new(
+                        DriverId::new(id).unwrap(),
+                        "0.0.0-test",
+                        "Secret のテスト",
+                        Capabilities::READ_WRITE,
+                    ),
+                    delegate: delegate.clone(),
+                    required,
+                })))
+                .unwrap();
+        }
     }
     let sessions = Arc::new(HubSessions::with_secret_opener(
         banto_broker::BackoffConfig::default(),
@@ -1877,6 +1884,100 @@ async fn secret_driver_probe_never_opens_saved_secret_and_reuses_unchanged_sessi
     );
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    sim.stop();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn optional_saved_secret_requires_explicit_input_before_direct_probe() {
+    let app = test_app_with_secret_driver("t12-optional-secret-probe", true).await;
+    let sim = ModbusSimulator::start().await;
+    let settings =
+        json!({"host":"127.0.0.1", "port":sim.addr.port(), "unit_id":1, "word_order":"low_high"});
+    let mut saved_settings = settings.clone();
+    saved_settings["token"] = json!("saved-optional-token");
+    let (status, created) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections",
+        &app.admin_token,
+        json!({"name":"optional-secret-line", "protocol":"optional-secret-test", "settings":saved_settings}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let id = created["id"].as_i64().unwrap();
+
+    // Omission must not silently test anonymous access instead of the saved token.
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"optional-secret-test", "connectionId":id, "settings":settings}),
+    )
+    .await;
+    assert_eq!(body["ok"], false, "{body}");
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("保存済みの秘密値はテストに使いません"),
+        "{message}"
+    );
+    assert!(message.contains("null"), "{message}");
+    assert!(!body.to_string().contains("saved-optional-token"));
+    assert_eq!(sim.connection_count(), 0, "omission must not dial");
+
+    // An explicit no-value choice still permits anonymous access for an optional field.
+    for value in [Value::Null, json!("")] {
+        let mut explicit = settings.clone();
+        explicit["token"] = value;
+        let (_, body) = admin_write(
+            &app.router,
+            "POST",
+            "/api/plc-connections/test",
+            &app.admin_token,
+            json!({"protocol":"optional-secret-test", "connectionId":id, "settings":explicit}),
+        )
+        .await;
+        assert_eq!(body["ok"], true, "{body}");
+    }
+    assert_eq!(sim.connection_count(), 2);
+
+    let group = CollectionGroupService::new(app.pool.clone())
+        .create(group_input("optional-fast", id, 100))
+        .await
+        .unwrap();
+    TagService::new(app.pool.clone())
+        .create(tag_input("optional-secret-value", group.id, "40001", "u16"))
+        .await
+        .unwrap();
+    app.commit_and_start().await;
+    let mut status = app.sessions.status_watch(id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|s| *s == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sockets = sim.connection_count();
+    sqlx::query("DELETE FROM plc_connection_secrets WHERE connection_id = ?")
+        .bind(id)
+        .execute(&app.pool)
+        .await
+        .unwrap();
+    let (_, body) = admin_write(
+        &app.router,
+        "POST",
+        "/api/plc-connections/test",
+        &app.admin_token,
+        json!({"protocol":"optional-secret-test", "connectionId":id, "settings":settings}),
+    )
+    .await;
+    assert_eq!(body["ok"], true, "{body}");
+    assert_eq!(
+        sim.connection_count(),
+        sockets,
+        "shared reuse must not dial"
     );
     sim.stop();
 }

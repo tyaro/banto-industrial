@@ -864,14 +864,15 @@ fn classify_item(err: &ItemError) -> PlcConnectionTestError {
 /// 試す設定（R2b-6b）: フォームの `settings` をドライバのスキーマに通し
 /// （`banto_tags::settings_from_schema` → `settings_to_api`、保存と同じ組み立て）、秘密のキーを
 /// 足したもの。秘密のキーはフォームの文字列だけを使い、保存済みの値は開かない。
-/// `null`・空文字は値無し。必須の秘密の欠けは共有セッションの照合後、直接ダイヤル前に断る。
+/// `null`・空文字は値無し。必須の秘密の欠けと、保存済みの秘密を省略した場合は
+/// 共有セッションの照合後、直接ダイヤル前に断る。
 pub(super) struct RequestedSettings {
     pub(super) settings: Settings,
     /// 保存済みの接続（指紋に入る秘密値の参照の出どころ）。
     pub(super) saved: Option<PlcConnection>,
     /// フォームが秘密のキーを替えた・消したか（保存済みのセッションの読みは答えにならない）。
     pub(super) secrets_changed: bool,
-    /// Missing required secrets prevent direct dialing, but not an unchanged shared session.
+    /// Missing required or omitted saved secrets prevent direct dialing, but not an unchanged shared session.
     pub(super) missing_secrets: Vec<banto_driver_api::FieldError>,
 }
 
@@ -921,16 +922,28 @@ pub(super) async fn requested_settings(
         .settings_schema()
         .fields
         .iter()
-        .filter(|field| {
-            field.required
-                && matches!(field.kind, banto_driver_api::FieldKind::Secret)
-                && settings.get(field.key.as_str()).is_none()
-        })
-        .map(|field| {
-            banto_driver_api::FieldError::new(
+        .filter_map(|field| {
+            if !matches!(field.kind, banto_driver_api::FieldKind::Secret)
+                || settings.get(field.key.as_str()).is_some()
+            {
+                return None;
+            }
+            let message = if field.required {
+                "必須です。接続テスト用に明示入力してください（保存済みの秘密値は使いません）"
+            } else if !payload.settings.contains_key(field.key.as_str())
+                && saved
+                    .as_ref()
+                    .and_then(|conn| conn.settings.get(field.key.as_str()))
+                    .is_some_and(banto_tags::settings_json::is_secret_ref)
+            {
+                "保存済みの秘密値はテストに使いません。明示入力するか、値無しで試す場合は null を指定してください"
+            } else {
+                return None;
+            };
+            Some(banto_driver_api::FieldError::new(
                 format!("settings.{}", field.key),
-                "必須です。接続テスト用に明示入力してください（保存済みの秘密値は使いません）",
-            )
+                message,
+            ))
         })
         .collect();
     Ok(RequestedSettings {

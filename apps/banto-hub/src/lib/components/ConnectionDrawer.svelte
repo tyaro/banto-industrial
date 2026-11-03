@@ -715,8 +715,8 @@
 		testState.testing = true;
 		testState.result = null;
 		try {
-			// フォームの現在値（未保存でもよい）をそのまま送る。秘密の欄の「変えない」はキーを
-			// 送らず、`connectionId` の保存済みから補われる。
+			// フォームの現在値（未保存でもよい）を送る。「変えない」の秘密値は送らず、
+			// 一致する収集中の接続だけ再利用できる。直接接続では秘密値の明示入力が必要。
 			const input = formToConnectionInput(form, drivers);
 			testState.result = await testPlcConnection({
 				protocol: input.protocol,
@@ -1351,6 +1351,11 @@
 			{#if testState.testing}<span class="spinner" aria-hidden="true"></span>{/if}
 			接続テスト
 		</button>
+		{#if connection && driver?.settingsSchema.fields.some((field) => field.kind.type === 'secret')}
+			<p class="hint">
+				保存済みの秘密値は送信しません。収集中の接続を使えない場合は「変える」で入力してください。任意項目は「消す」で値無しを試せます（テストでは保存されません）。
+			</p>
+		{/if}
 		{#if testState.testing}
 			<span class="test-result testing">テスト中…</span>
 		{:else if testState.result}
