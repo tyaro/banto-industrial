@@ -261,7 +261,7 @@ ts (timestamptz) | tag_id (bigint) | external_name (text) | value (double precis
 | S4    | **完了（#305）** Sink の Hub 側: `logger_groups` テーブルと CRUD（REST / MCP）、`GET /api/sink/config`、`PUT /api/sink/status`、状態 API の sink 節、config パッケージ往復 | （実装中）                                                                                                     |
 | S5    | **完了（#306）** サイドカー本体 `apps/banto-hub-sink`: SDK 購読、long INSERT、bounded queue、バックオフ、テーブル検査、status push、exe 隣 toml、SCM サービス化と MSI 登録 | 統合テスト: interval / on_change・DB 停止中のキュー上限・復帰後の flush・停止時の flush・Hub 再起動への追従    |
 | S6    | **完了（#313）** UI: logger group 画面、推奨 DDL 表示、状態画面の sink 節、デスクトップシェルのサービス一覧（Hub / sink の SCM 状態と起動停止）                            | E2E と Windows 実機での手動確認                                                                                |
-| S7    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動・sink 単独の停止と再起動                                 | 検証完了（2026-11-05）。結果は実機記録 R-7・R-8                                                                |
+| S7    | 実 DB 検証: 顧客相当の PostgreSQL（別マシン・LAN 越し）で Source / Sink を 24 h 連続動作。切断・再接続・DB 再起動・sink 単独の停止と再起動                                 | 検証完了（2026-11-05）。結果は実機記録 §2（R-1〜R-6）と R-7〜R-9。D-6 は対象外                                 |
 
 S0 / S1 / S4 は実機不要。S2 / S5 の統合テストは CI で PostgreSQL のサービスコンテナを使う（GitHub Actions の `services:`）。S6 のシェル部分は Windows 実機が要る。着手順は S0 → S1 → S2 → S2b → S4 → S5 → S3 → S6 → S7（Source の UI より先に Sink の骨格を通し、SDK の本番利用を早く始める）。
 
@@ -333,7 +333,7 @@ PostgreSQL 以外（SQL Server・Oracle・MySQL 等）に広げるとき、Hub �
 - `banto-hub-sink` を Source と Sink の両方を担う **DB ブリッジ**に広げる。
 - §12.3 と同じく、Hub 内の PostgreSQL Source とブリッジ版を**併用**し、ブリッジ版で使えると判断してから Hub 内の実装を消す。
 
-**実装状況（R2a、2026-10-21）**: 詳細設計は [banto-hub-ingest-design.md](banto-hub-ingest-design.md)（R2a-1〜R2a-3、Q1〜Q20 は 2026-10-21 オーナー決定）。R2a は「足すだけ」の段で、上の「壊れるもの」（`db_source`・`postgres`・`db` タグ・`query_sql` を外す・マイグレーション）は R2b-8 で行う。**R2a の完了条件の突き合わせのテスト（ingest-design §10.4 の 11 場面）は R2a-3c で実装し、Hub 内の Source とブリッジが同じ値（`f64` のビット）・同じ品質を出すことを確かめた。実機の確かめ（[external-db-test-2026-09.md](external-db-test-2026-09.md) の B-16〜B-28）はオーナー同席で未実施。**
+**実装状況（R2a、2026-10-21）**: 詳細設計は [banto-hub-ingest-design.md](banto-hub-ingest-design.md)（R2a-1〜R2a-3、Q1〜Q20 は 2026-10-21 オーナー決定）。R2a は「足すだけ」の段で、上の「壊れるもの」（`db_source`・`postgres`・`db` タグ・`query_sql` を外す・マイグレーション）は R2b-8 で行う。**R2a の完了条件の突き合わせのテスト（ingest-design §10.4 の 11 場面）は R2a-3c で実装し、Hub 内の Source とブリッジが同じ値（`f64` のビット）・同じ品質を出すことを確かめた。実機の確かめ（[external-db-test-2026-09.md](external-db-test-2026-09.md) の B-16〜B-28）は S7 で実施済み。#682 追従後の再確認とクローズ可否は実機記録 R-7〜R-9。**
 
 | 形   | 状況                                                                                                                                                                                                                                                                                                                                                              |
 | ---- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
