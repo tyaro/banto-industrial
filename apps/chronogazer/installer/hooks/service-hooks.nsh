@@ -504,14 +504,41 @@ Var ServiceStopWaitCounter
   ${EndIf}
 !macroend
 
-; 上書き前: 既存の 3 exe 全てを確認し、書込み可能でなければ File 開始前に中止する。
-; 不存在は CheckChronoGazerExeUnlocked が飛ばす。確認後の競合やコピーの完全性は保証しない。
-; $0〜$2 を壊す。アンインストールの検査とは呼出位置・案内を分ける。
+; インストール専用: NSIS File と同じく READONLY だけを外す。他の属性は保持する。
+; 不存在は作らない。属性取得・解除に失敗しても成功とはせず、後の FileOpen で書込み可否を確認する。
+; $0・$1 を壊す。共有の検査・アンインストールでは使用しない。
+!macro ClearChronoGazerInstallExeReadonly exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${exe_name}") i .r0'
+    ${If} $0 != -1
+      IntOp $0 $0 & 0xFFFFFFFE
+      System::Call 'kernel32::SetFileAttributesW(w "$INSTDIR\${exe_name}", i r0) i .r0'
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; 上書き前: 既存の 3 exe 全てを確認し、短期ロックなら最大約5秒（1秒間隔）待つ。
+; 不存在は飛ばす。確認後の競合やコピーの完全性は保証しない。
+; $2 は待機回数から失敗名の退避へ再利用する。$0〜$2 を壊す。
 !macro RequireChronoGazerInstallExesUnlocked
-  StrCpy $1 ""
-  !insertmacro CheckChronoGazerExeUnlocked "${CHRONOGAZER_SHELL_EXE}"
-  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
-  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
+  StrCpy $2 "0"
+  ${Do}
+    !insertmacro ClearChronoGazerInstallExeReadonly "${CHRONOGAZER_SHELL_EXE}"
+    !insertmacro ClearChronoGazerInstallExeReadonly "chronogazer-server.exe"
+    !insertmacro ClearChronoGazerInstallExeReadonly "chronogazer-elev.exe"
+    StrCpy $1 ""
+    !insertmacro CheckChronoGazerExeUnlocked "${CHRONOGAZER_SHELL_EXE}"
+    !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
+    !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
+    ${If} $1 == ""
+      ${Break}
+    ${EndIf}
+    ${If} $2 >= 5
+      ${Break}
+    ${EndIf}
+    Sleep 1000
+    IntOp $2 $2 + 1
+  ${Loop}
   ${If} $1 != ""
     ; 再開マクロが $0・$1 を壊すため、失敗名を先に退避する。
     StrCpy $2 $1

@@ -20,6 +20,8 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
+import time
 import uuid
 
 
@@ -34,6 +36,8 @@ CASES = (
     ("restart-failed", (1,), 1, 1, False),
     ("fresh", (), 0, 0, True),
     ("unlocked", (), 1, 0, False),
+    ("short-lock", (1,), 1, 0, False),
+    ("readonly", (), 1, 0, False),
 )
 
 # Include the real hook BEFORE overriding the one service-operation macro.
@@ -61,7 +65,12 @@ Section
   StrCpy $INSTDIR "@INSTALL@"
   StrCpy $ChronoGazerWasRunning "@RUNNING@"
   StrCpy $ChronoGazerShellWasQuit "0"
+  FileOpen $R9 "@LOG@" a
+  FileSeek $R9 0 END
+  FileWrite $R9 "gate-begins$\r$\n"
+  FileClose $R9
   !insertmacro RequireChronoGazerInstallExesUnlocked
+  @READONLY_CHECK@
   @FRESH_CHECK@
   FileOpen $R9 "@LOG@" a
   FileSeek $R9 0 END
@@ -115,6 +124,10 @@ def win32_api():
     api.CreateFileW.restype = ctypes.c_void_p
     api.CloseHandle.argtypes = [ctypes.c_void_p]
     api.CloseHandle.restype = ctypes.c_int
+    api.GetFileAttributesW.argtypes = [ctypes.c_wchar_p]
+    api.GetFileAttributesW.restype = ctypes.c_uint32
+    api.SetFileAttributesW.argtypes = [ctypes.c_wchar_p, ctypes.c_uint32]
+    api.SetFileAttributesW.restype = ctypes.c_int
     return api
 
 
@@ -133,6 +146,14 @@ def run_case(work, makensis, api, case):
             fixture.write_bytes(("OLD " + name + "\n").encode())
             before[name] = file_hash(fixture)
 
+    readonly_before = None
+    if case[0] == "readonly":
+        readonly_path = str(install / EXES[1])
+        attrs = api.GetFileAttributesW(readonly_path)
+        require(attrs != 0xFFFFFFFF, "get_fixture_attributes")
+        # ARCHIVE is a non-READONLY bit whose preservation is checked at the gate.
+        readonly_before = attrs | 0x21
+        require(api.SetFileAttributesW(readonly_path, readonly_before), "set_fixture_readonly")
     log = directory / "events.log"
     fresh_check = "\n".join(
         '${If} ${FileExists} "$INSTDIR\\' + name + '"\n'
@@ -149,10 +170,15 @@ def run_case(work, makensis, api, case):
         "@RUNNING@": was_running,
         "@PAYLOAD@": payload,
         "@FRESH_CHECK@": fresh_check,
+        "@READONLY_CHECK@": r"""System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\chronogazer-server.exe") i .r8'
+FileOpen $R9 "__LOG__" a
+FileSeek $R9 0 END
+FileWrite $R9 "gate-attributes=$8$\r$\n"
+FileClose $R9""".replace("__LOG__", str(log)) if readonly_before is not None else "",
     }
     script = TEMPLATE
     for marker, value in replacements.items():
-        if marker != "@FRESH_CHECK@":
+        if marker not in ("@FRESH_CHECK@", "@READONLY_CHECK@"):
             require(not any(char in str(value) for char in ('"', "$", "\n", "\r")),
                     "NSIS_special_character_in_input_path")
         script = script.replace(marker, str(value))
@@ -173,35 +199,93 @@ def run_case(work, makensis, api, case):
     require(compiled.returncode == 0, "NSIS_compile_failed")
 
     handles = []
+    handles_lock = threading.Lock()
+    cancel = threading.Event()
+    gate_observed = threading.Event()
+    released = threading.Event()
+    thread_errors = []
+    worker = None
+
+    def release_handles():
+        with handles_lock:
+            for handle in handles:
+                api.CloseHandle(handle)
+            handles.clear()
+
+    def release_short_lock():
+        try:
+            deadline = time.monotonic() + 10
+            while not cancel.is_set():
+                try:
+                    if "gate-begins" in log.read_text():
+                        gate_observed.set()
+                        break
+                except (FileNotFoundError, PermissionError):
+                    pass
+                require(time.monotonic() < deadline, "gate_marker_timeout")
+                cancel.wait(0.02)
+            if cancel.is_set():
+                return
+            probe = api.CreateFileW(str(install / EXES[1]), 0x40000000, 7, None, 3, 0, None)
+            denied = probe in (None, ctypes.c_void_p(-1).value)
+            if not denied:
+                api.CloseHandle(probe)
+            require(denied, "short_fixture_not_write_denied")
+            # Start timing only after the child reached the real gate and denial was observed.
+            if not cancel.wait(1.2):
+                release_handles()
+                released.set()
+        except Exception as error:
+            thread_errors.append(str(error))
+            release_handles()
+
+    started = time.monotonic()
     try:
         for index in locked_indexes:
-            # GENERIC_READ, FILE_SHARE_READ only: deny any writer until child exits.
             handle = api.CreateFileW(str(install / EXES[index]), 0x80000000, 1, None, 3, 0, None)
             require(handle not in (None, ctypes.c_void_p(-1).value), "fixture_lock_failed")
             handles.append(handle)
+        if case[0] == "short-lock":
+            worker = threading.Thread(target=release_short_lock)
+            worker.start()
         child = run_tool([directory / "harness.exe"], 20)
     finally:
-        for handle in handles:
-            api.CloseHandle(handle)
-
+        cancel.set()
+        if worker is not None:
+            worker.join(timeout=2)
+        release_handles()
+    require(worker is None or not worker.is_alive(), "release_thread_not_joined")
+    require(not thread_errors, "release_thread_failed")
+    elapsed = time.monotonic() - started
     events = log.read_text().splitlines()
     restarts = [event for event in events if event.startswith("restart ")]
-    if locked_indexes:
+    if locked_indexes and case[0] != "short-lock":
+        require(elapsed >= 4.5, "persistent_lock_was_not_retried")
         require(child.returncode == 2 and "copy-begins" not in events, "must_abort_before_any_copy")
         require(before == {name: file_hash(install / name) for name in EXES}, "old_hashes_changed")
         require(len(restarts) == was_running, "restart_count_wrong")
         require("callback-before flag=0" in events and "callback-after flag=0" in events,
                 "callback_restarted_or_flag_wrong")
         if was_running:
-            require(events[0].startswith("restart "), "restart_not_before_abort_callback")
-            require(all(EXES[index] in events[0] for index in locked_indexes), "failed_names_lost")
+            require(events.index(restarts[0]) < events.index("callback-before flag=0"),
+                    "restart_not_before_abort_callback")
+            require(all(EXES[index] in restarts[0] for index in locked_indexes), "failed_names_lost")
     else:
-        require(child.returncode == 0 and events == ["copy-begins"], "normal_path_failed")
+        require(child.returncode == 0 and "copy-begins" in events and not restarts,
+                "normal_path_failed")
+        if case[0] == "short-lock":
+            require(gate_observed.is_set() and released.is_set(), "short_lock_not_observed_and_released")
+        if readonly_before is not None:
+            gate_attrs = [int(event.split("=", 1)[1]) for event in events
+                          if event.startswith("gate-attributes=")]
+            require(gate_attrs == [readonly_before & ~1], "other_attributes_changed_at_gate")
         require(all((install / name).read_bytes() == payload.read_bytes() for name in EXES),
                 "normal_copy_incomplete")
     return {
         "case": case[0], "passed": True, "exitCode": child.returncode, "events": events,
-        "originalHashesPreserved": True if locked_indexes else None, "freshInput": fresh,
+        "originalHashesPreserved": True if locked_indexes and case[0] != "short-lock" else None,
+        "freshInput": fresh, "elapsedSeconds": round(elapsed, 3),
+        "readonlyOtherBitsPreservedAtGate": True if readonly_before is not None else None,
     }
 
 
@@ -221,6 +305,7 @@ def main():
         api = win32_api()
         for case in CASES:
             report["cases"].append(run_case(work, makensis, api, case))
+            print(json.dumps({"case": case[0], "passed": True}), flush=True)
         report["success"] = True
     finally:
         result = work / "result.json"

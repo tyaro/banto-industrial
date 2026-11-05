@@ -129,7 +129,8 @@
 //!    直下の普通のファイルの所有者を Administrators にして ACL を既定へ戻す。
 //!    `icacls /T` は使わず、再解析ポイントやサブフォルダがあれば `Abort`。
 //!    失敗なら `Abort`）の後、`RequireChronoGazerInstallExesUnlocked` で既存3 exe全ての
-//!    書込み可否を確認し、失敗なら再開を試みて案内・`Abort`。
+//!    READONLYだけを外し、最大約5秒再試行して書込み可否を確認する。
+//!    失敗なら再開を試みて案内・`Abort`。
 //!    その後 `ClearErrors`、外部バイナリの `File` の直後にフックの
 //!    `RequireChronoGazerFilesCopied`（resources 無しの現構成では、`File /a` の
 //!    属性設定等の残留エラーフラグを防御的に検出したときに、
