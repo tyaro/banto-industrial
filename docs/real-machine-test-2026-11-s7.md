@@ -290,18 +290,19 @@ S7 当時と SHA-256 が一致する `b2d3e75c` の Hub を、使い捨てのプ
 | 通常の非rememberedセッション                      | 活動を続けても8時間で失効                                         |
 | 無アクセスの別grant                               | idle1時間−1msは有効、1時間ちょうどで失効。絶対期限と分けて確認    |
 
-`cargo test --offline --locked -p banto-server --lib` の単一 exact filter で **1 passed・0 failed**（終了コード0）。原典888ファイルと診断コピーを照合し、差分はテスト追記のみ。元の依存ソース・製品コード・ロックファイルは変更していない。これは `AuthState` の判定器を手動時計で確認した試験であり、実時計で8時間待機した Hub HTTP・WS・UI の総合試験ではない。API キーは別の検証経路で、この診断の対象外。TTL を起点とする WS 終了から UI 再取得までの連結確認は未実施で、既存の実 Hub・UI の再現は明示logout失効によるものと区別する。
+`cargo test --offline --locked --manifest-path target/s7-1012-expiry-20261105/source/Cargo.toml --target-dir target/s7-1012-expiry-20261105/build -p banto-server --lib auth::tests::s7_1012_default_commissioning_absolute_boundary -- --exact --nocapture` で **1 passed・0 failed**（終了コード0）。追記したテストは、下記原記録内の `source/crates/banto-server/src/auth/tests.rs` にある。原典888ファイルと診断コピーを照合し、差分はテスト追記のみ。元の依存ソース・製品コード・ロックファイルは変更していない。これは `AuthState` の判定器を手動時計で確認した試験であり、実時計で8時間待機した Hub HTTP・WS・UI の総合試験ではない。API キーは別の検証経路で、この診断の対象外。TTL を起点とする WS 終了から UI 再取得までの連結確認は未実施で、既存の実 Hub・UI の再現は明示logout失効によるものと区別する。
 
 旧再現の保全4ファイルと旧 Hub のハッシュも再照合した。明示失効後の採取401×7はすべて認証・CSRFヘッダあり、その後 WS `1008 session_revoked`、grant再取得200、WS再接続を観測している。WS の再検証は15秒周期なので、一時的な401の回数は失効を検知する位相と採取周期に左右される。一方、期限・logout・同種grantの上限による失効は同じ終了理由に合流するため、理由だけでは原因を区別できない。**当日の発行時刻と各要求の資格情報の記録はなく、11-01の401×3の原因は未確定のまま #1012 を継続する。** 再発時には、既存の採取項目に加え、発行・再取得の時刻と資格情報を含まない世代ラベルを対応させる。通常 UI と追加採取の要求を区別し、トークンの値やハッシュは保存しない。
 
-追加診断の原記録は、R-7 と同じ保管ホスト・ルートの `_s7-evidence/2026-11-05-1012-expiry-c8346cb5-de57-4af8-8f58-33ce253938d9/`。ソース888件・テストexe・結果・実行ログ・手順等の898ファイルと、循環ハッシュを除いた `manifest.json` を保持する。親による全898件のサイズ・SHA-256再照合は不一致0。既存の保全条件（#1037）を適用し、別保管先への複製は未実施。`metadata.json` の `cargo_executed:false` は準備時点の記録で、実行成功と開始時刻・保全完了時刻は `execution.json` に別記した。
+追加診断の原記録は、R-7 と同じ保管ホスト・ルートの `_s7-evidence/2026-11-05-1012-expiry-c8346cb5-de57-4af8-8f58-33ce253938d9/`。ソース888件・テストexe・結果・実行ログ・手順等の898ファイルと、循環ハッシュを除いた `manifest.json` を保持する。保全完了後、Codex が同じ Windows PC 上で保全スクリプトとは別の PowerShell 処理を実行し、全898件のサイズ・SHA-256を再照合した結果は不一致0。既存の保全条件（#1037）を適用し、別保管先への複製は未実施。`metadata.json` の `cargo_executed:false` は準備時点の記録で、実行成功と開始時刻・保全完了時刻は `execution.json` に別記した。
 
-| 原記録                                       | SHA-256                                                            |
-| -------------------------------------------- | ------------------------------------------------------------------ |
-| `result.json`                                | `16a87596c53dcb68ebc0184e3c82a5d8ae39d210b86b45438ab7c242cae726b4` |
-| `execution.json`                             | `3b0d2d9f04065579aa022f6051988e9917b24a83f754eef12ee251220e75b066` |
-| `manifest.json`                              | `28e611b7bd99d915e2b465c3638a72f4473a5e9faa10ae0027ad2c87fc020063` |
-| `test-exe/banto_server-51b19a881d38c489.exe` | `a80fdcc0b65927c90e513e6f5c0be9932132262d78fe993f559d96d125aa0975` |
+| 原記録                                         | SHA-256                                                            |
+| ---------------------------------------------- | ------------------------------------------------------------------ |
+| `result.json`                                  | `16a87596c53dcb68ebc0184e3c82a5d8ae39d210b86b45438ab7c242cae726b4` |
+| `source/crates/banto-server/src/auth/tests.rs` | `ed7b38b9764a81aa0ade7954c2bf141314d85c2c65cf2e855d822297eb474916` |
+| `execution.json`                               | `3b0d2d9f04065579aa022f6051988e9917b24a83f754eef12ee251220e75b066` |
+| `manifest.json`                                | `28e611b7bd99d915e2b465c3638a72f4473a5e9faa10ae0027ad2c87fc020063` |
+| `test-exe/banto_server-51b19a881d38c489.exe`   | `a80fdcc0b65927c90e513e6f5c0be9932132262d78fe993f559d96d125aa0975` |
 
 ### R-5 欠ける範囲（S-4）
 
