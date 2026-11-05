@@ -57,7 +57,26 @@ pub(crate) fn hold_instance_mutex(root: &Path) -> Result<Option<Box<dyn std::any
 
 /// 実在する対象を解決し、境界判定と SCM に同じ通常表記を渡す。
 fn normalize_existing(path: &Path) -> std::io::Result<PathBuf> {
-    std::fs::canonicalize(path).map(|path| strip_verbatim_prefix(&path))
+    use std::path::{Component, Prefix};
+    let original = std::fs::canonicalize(path)?;
+    let normal = strip_verbatim_prefix(&original);
+    // SCM に渡せる通常の絶対 DOS/UNC 表記に限る。Volume GUID 等を相対化しない。
+    let disk_or_unc = matches!(normal.components().next(), Some(Component::Prefix(prefix))
+        if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..)));
+    if !normal.is_absolute() || !disk_or_unc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "通常の絶対 DOS/UNC パスへ変換できません",
+        ));
+    }
+    // 拡張長表記で有効な末尾 dot 等が、通常表記では別の対象を指すことがある。
+    if std::fs::canonicalize(&normal)? != original {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "通常表記の再解決先が元の実在パスと一致しません",
+        ));
+    }
+    Ok(normal)
 }
 
 fn strip_verbatim_prefix(path: &Path) -> PathBuf {
@@ -202,6 +221,31 @@ impl ElevOps for WindowsOps {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 通常 Win32 表記が別の対象になる末尾 dot は採用しない。
+    #[test]
+    fn normalization_refuses_a_trailing_dot_alias_but_accepts_the_normal_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let plain = root.join("app");
+        let dotted = root.join("app.");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(&dotted).unwrap();
+        let plain_exe = plain.join(SERVER_EXE_FILE_NAME);
+        let dotted_exe = dotted.join(SERVER_EXE_FILE_NAME);
+        std::fs::write(&plain_exe, b"plain-inert").unwrap();
+        std::fs::write(&dotted_exe, b"dotted-inert").unwrap();
+        assert_eq!(
+            normalize_existing(&dotted_exe).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            normalize_existing(&plain_exe).unwrap(),
+            strip_verbatim_prefix(&plain_exe)
+        );
+        assert_eq!(std::fs::read(&plain_exe).unwrap(), b"plain-inert");
+        assert_eq!(std::fs::read(&dotted_exe).unwrap(), b"dotted-inert");
+    }
 
     /// 純粋な prefix 処理は OS へアクセスせず UTF-16 の同一性を保つ。
     #[test]
