@@ -100,14 +100,17 @@ fn normalized_sibling_server(me: &Path) -> std::io::Result<PathBuf> {
     let dir = me.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "実行ファイルの親がありません",
+            format!("{} の親フォルダがありません", me.display()),
         )
     })?;
-    let server = normalize_existing(&dir.join(SERVER_EXE_FILE_NAME))?;
+    let candidate = dir.join(SERVER_EXE_FILE_NAME);
+    let server = normalize_existing(&candidate).map_err(|err| {
+        std::io::Error::new(err.kind(), format!("{}: {err}", candidate.display()))
+    })?;
     if !server.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "サーバーが通常のファイルではありません",
+            format!("{} が通常のファイルではありません", candidate.display()),
         ));
     }
     Ok(server)
@@ -308,10 +311,18 @@ mod tests {
         );
         assert!(crate::is_inside_program_files(&actual, &dirs));
         assert!(normalized_program_files(vec![server.clone()]).is_empty());
-        assert!(normalized_sibling_server(&tmp.path().join("elev.exe")).is_err());
+        let missing = normalized_sibling_server(&tmp.path().join("elev.exe")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(missing
+            .to_string()
+            .contains(&tmp.path().join(SERVER_EXE_FILE_NAME).display().to_string()));
         std::fs::remove_file(&server).unwrap();
         std::fs::create_dir(&server).unwrap();
-        assert!(normalized_sibling_server(&pf.join("elev.exe")).is_err());
+        let directory = normalized_sibling_server(&pf.join("elev.exe")).unwrap_err();
+        assert_eq!(directory.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(directory
+            .to_string()
+            .contains(&server.display().to_string()));
         std::fs::remove_dir(&server).unwrap();
         std::fs::write(&server, b"inert").unwrap();
         let wide: Vec<u16> = server.as_os_str().encode_wide().chain([0]).collect();
