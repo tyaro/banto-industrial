@@ -26,7 +26,10 @@
 ;                                     「${…}は、…この場所に置かないと」の形で使う）
 ;   INSTALL_DIR_COMMON_ACL_ABORT_NOTE ACL を戻せずに中止するときの案内の末尾の 1 文
 ;                                     （例: "上書き前に止めた ChronoGazer サービスは
-;                                     戻します。"。止めたものが無い製品は空文字でよい）
+;                                     再開を試みました。"。止めたものが無い製品は空文字でよい）
+;   任意マクロ INSTALL_DIR_COMMON_ON_ACL_ABORT: 主案内の前に呼ぶ。未定義なら従来どおり。
+;     include前でなく、AbortInstallDirAclの展開・呼出時点までに定義すればよい。
+;     reason の参照レジスタと対象 $4 は、コールバック側で保護すること。
 ;
 ; どちらのマクロも $0〜$5 を壊す（呼び出し側はこの後に自分で入れ直す）。
 ; RequireDefaultInstallDir はファイルを変える前（ChronoGazer は事前の確かめの先頭、
@@ -265,7 +268,7 @@ FunctionEnd
 ; そこで、ファイルを置く前（`File` の直前）に、所有者を BUILTIN\Administrators
 ; （S-1-5-32-544）にし、明示の ACE を捨てて Program Files から継承する ACL だけにする。
 ; どれかが駄目なら案内して `Abort`（まだファイルは変えていない。止めたサービスは、
-; ChronoGazer は .onInstFailed が戻す。Hub はこの戻しをサービスを止める前に置くので
+; ChronoGazer は任意コールバックで案内前に再開を試みる。Hub はサービスを止める前なので
 ; 止めたものが無い）。
 ;
 ; **`icacls /T` は使わない**（#972 のオーナーレビュー（fd7973e）P1）: /T は子を再帰で
@@ -367,6 +370,9 @@ FunctionEnd
 ; 呼ぶ前に FindClose を済ませること。
 !macro AbortInstallDirAcl reason
   DetailPrint "${INSTALL_DIR_COMMON_LOG_PREFIX}: インストール先 $INSTDIR の所有者・ACL を既定に戻せませんでした。${reason}（対象: $4）"
+  !ifmacrodef INSTALL_DIR_COMMON_ON_ACL_ABORT
+    !insertmacro INSTALL_DIR_COMMON_ON_ACL_ABORT
+  !endif
   MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした。$\r$\n${reason}$\r$\n対象: $4$\r$\n$\r$\n既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。ファイルはまだ変更していません。${INSTALL_DIR_COMMON_ACL_ABORT_NOTE}$\r$\n$\r$\n対象のリンクやサブフォルダを取り除く（または先にアンインストールする）か、フォルダを使用しているプログラムを終了するか、管理者権限で $INSTDIR の所有者とアクセス権を確かめてから、もう一度実行してください。" /SD IDOK
   Abort "インストール先の所有者・ACL を既定に戻せなかったため、インストールを中止しました。"
 !macroend
