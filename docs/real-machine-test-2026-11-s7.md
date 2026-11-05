@@ -323,13 +323,14 @@ git diff b2d3e75c 2899d25f -- apps/banto-hub/core/src/commissioning.rs apps/bant
 | 20.165秒         | 固定旧G1の `/api/status` が401。それ以前は200×19              |
 | 30.044秒         | 固定旧G1の独立WSが `1008 session_revoked`。終了前のpongは10件 |
 | 30.579秒         | UIの旧G1 WSも `1008 session_revoked`                          |
-| 30.604／30.607秒 | 本物UIがG2／G3を発行                                          |
+| 30.604／30.607秒 | UIのG2／G3発行応答を観測                                      |
 | 30.629秒         | UIのG2 WSがopen                                               |
 | 31.616秒         | 最新tokenの追加採取がG2で `/api/status` 200                   |
 
 grant発行は計3件で上限16未満。実験者・UIともlogout・revoke・lockdownは行っていない。最新tokenの追加採取の401は11件で、**旧G1付き10件と認証ヘッダなし1件**だった。後者はCSRFヘッダあり・要求時の格納tokenなしを回復過渡期に観測したもので、全件が旧token付きだったとは扱わない。Gラベルは各要求の実認証ヘッダとWSの実protocolに載ったtokenをメモリ内で対応させ、token値・hashは記録していない。SSEも並行するため、UIのWS終了が新grant発行の直接の原因だったとまでは証明しない。TTLによる旧HTTP拒否、独立WS終了、本物UIの新資格情報取得と回復を分けて確認した。
+ここで「最新」は各要求時に `sessionStorage.getItem('banto.auth.token')` にあった値で、最後に発行されたtokenという意味ではない。G番号はgrant応答JSONをNodeが観測した順で、サーバー内の発行順と各発行要求との対応は未採取。G2・G3はいずれもブラウザUIのgrant要求への応答として観測したが、採取対象のHTTP・WSイベントにG3付きはなく、追加採取の要求時点では、格納tokenなしと、その後のG2を読み出した。G3の保存・使用・破棄・有効期限は記録しておらず、WS／SSEのどちらがどの再取得に対応したか、二重発行の原因も未証明。上限16未満の確認はこの1cycleだけで、反復時の未使用grant蓄積やFIFO失効は検証していない。
 
-cleanupはbackend PID8068・終了コード0、起動ポートの接続拒否とexclusive bind可を確認し、`observer_failed`・`origin_violation`・`forced_kill` はすべてfalse。終了時の `SSE.finished` のTargetClosed取消1件は `intentional_cleanup` と分類し、セッション終了の推定には使わない。先行の `run-ed44c531-c2d1-400b-ae93-60e2d6422550` は機能cycleと停止を確認できたが、最終観測品質は **failedのまま**保全した。旧観測器にはflag・error詳細がなく、その失敗原因は未確定で、今回のpassedと混ぜない。
+cleanupはbackend PID8068・終了コード0、起動ポートの接続拒否とexclusive bind可を確認し、`observer_failed`・`origin_violation`・`forced_kill` はすべてfalse。終了時の `SSE.finished` のTargetClosed取消1件は `intentional_cleanup` と分類し、セッション終了の推定には使わない。先行の `run-ed44c531-c2d1-400b-ae93-60e2d6422550` は機能cycleと停止を確認できたが、最終観測品質は **failedのまま**保全した。旧観測器にはflag・error詳細がなく、その失敗原因は未確定で、今回のpassedと混ぜない。旧→新の観測器差分には、終了後の既知TargetClosed／Abort（およびSSEの既知transport取消）を観測取消として分類する合否条件の変更も含む。grant JSON取得などのcriticalエラー・未知エラーは失敗を維持し、機能の合格条件・Rust・TTL・UIは変更していない。
 
 成功原記録はR-7と同じ保管ホスト・ルートの `_s7-evidence/2026-11-05-1012-ttl-ui-a206983c-c014-4afb-bf37-ca00549f81ed/`。ハーネス・lock・buildmetadata・ログ・失敗したbuildのattempt1/2・exe・UI全84assetsなど115payloadと、自己hashを除いたmanifestの計116ファイルを保全した。UI assetsの前後hashは一致するが、現存UIビルドとsource commitの対応は未証明。SQLite・browser storageは含めない。保全完了後、Codexが同じWindows PCで保全スクリプトとは別のPowerShell処理により全115件のSHA-256・bytesを再照合し、不一致0。先行failedの保全先は `_s7-evidence/2026-11-05-1012-ttl-ui-2eeb34d2-0add-486f-b1b7-0f54f17b6090/`（同じ件数、独立再照合も不一致0、manifest `e017b5f1ae8d8963b4d8b41396cf9b8cbef7f528c1ec1b8058af011873090ee0`）。#1037の保全条件を適用し、別保管先への複製は未実施。
 
@@ -340,7 +341,7 @@ cleanupはbackend PID8068・終了コード0、起動ポートの接続拒否と
 | `manifest.json`             | `160c45cb32a7c2831369135fcba0bb4346c202035c6871210b83a80984293aba` |
 | `binary/s7-1012-ttl-ui.exe` | `cd00eaa5b835632063112b7f4dc3b1d3c886ad23b8b8db0957ef040ce2cd37dc` |
 
-ビルドはofflineのタグ参照不足で失敗したattempt1、診断lockだけをroot lockからseedして `cargo metadata --offline` 後、sandbox内のprotoc起動がos623で失敗したattempt2を経て、同入力のofflineビルドを権限付きで実行して成功した。製品source・lock・protoの前後は不変。診断手順は成功原記録の `harness/NOTES.txt`、観測器の取消分類は `harness/run.mjs` と `runtime/result.json`、ビルドの成功・失敗は各 `build.log` に記録した。再実行時は原記録の `harness/` と `ui-build/` を、`43bc7543` の別作業ツリーの `target/s7-1012-ttl-ui-20261105/` と `apps/banto-hub/build/` へ作業用コピーし、原記録を変更せず、移設先でbuildmetadataを再生成する。Rust1.98.1・Node24・依存cache・Edgeが必要。リポジトリルートから次を実行する。
+ビルドはofflineのタグ参照不足で失敗したattempt1、診断lockだけをroot lockからseedして `cargo metadata --offline` 後、sandbox内のprotoc起動がos623で失敗したattempt2を経て、同入力のofflineビルドをこの環境のsandbox外で実行して成功した。protocは `protoc-bin-vendored` が供給し、システムへの手動installは不要。このos623回避は当環境の条件で、一般に管理者権限が必須という意味ではない。製品source・lock・protoの前後は不変。診断手順は成功原記録の `harness/NOTES.txt`、観測器の取消分類は `harness/run.mjs` と `runtime/result.json`、ビルドの成功・失敗は各 `build.log` に記録した。再実行時は原記録の `harness/` と `ui-build/` を、`43bc7543` の別作業ツリーの `target/s7-1012-ttl-ui-20261105/` と `apps/banto-hub/build/` へ作業用コピーし、原記録を変更せず、移設先でbuildmetadataを再生成する。PowerShell7（`pwsh`）・Rust1.98.1・Node24・依存cache・Edgeが必要。同梱の `harness/Cargo.lock` を使い、`build.ps1 -Build` が移設先のbuildmetadataを再生成する。リポジトリルートから次を実行する。
 
 ```powershell
 pwsh -NoProfile -File target/s7-1012-ttl-ui-20261105/build.ps1 -Build
