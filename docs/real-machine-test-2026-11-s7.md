@@ -1,7 +1,7 @@
 # #229 S7 実 DB 検証の記録（外部 DB 連携、実機・別マシンの PostgreSQL）
 
 作成日: 2026-10-28
-最終検証日: 2026-11-05（#1012 の認証期限の隔離診断を R-4 に追加。#682 追従後の再確認を R-7・R-8 に整理。#229・#1019 の最終判断と #1019 の隔離環境での追加検証は R-9）
+最終検証日: 2026-11-05（#1012 の認証期限の判定器・短縮TTLとUI回復の隔離診断を R-4 に追加。#682 追従後の再確認を R-7・R-8 に整理。#229・#1019 の最終判断と #1019 の隔離環境での追加検証は R-9）
 状態: **#682 追従後の再確認を整理済み（B-16・B-17 は既存設定・キーで確認、B-18 はメモと B-28 開始記録で確認、B-19〜B-27 は再試験）。#229 は B-16・B-17 を初回合格と更新後の既存設定・キーの確認で代え、B-18〜B-27 の実施時判定と B-18 の根拠の範囲、件数差と版の対応の留保を確認したうえで、2026-11-05 にオーナーがクローズを決定（R-9）。B-28 は延長条件による結果確認後、2026-11-05 にオーナーが合格と判定（R-7）。D-1〜D-5 は合格。D-5 は Windows–Mac 間の行照合を経て 2026-11-03 にオーナーが合格と判定。#1019 は追加の隔離環境の行保全検証を経て 2026-11-05 にオーナーがクローズ。11-02 の重複・空き候補、差126、環境障害区間の収支は原因未確定のまま（R-9）。D-6 は対象外（#726 未完）。§3.2 の C-1〜C-14 は S7 の対象外（2026-11-02 オーナー決定）**（結果は §2。準備 P-1〜P-7 は 2026-10-28 にオーナー同席で行い §1 の表に記録、P-8 は 2026-11-01 に読んで `b2d3e75c` の Sink のコードと一致を確かめた。2026-10-31 に BantoHub を `b2d3e75c` から入れ直して P-2・P-5 をやり直した。初回 S7 はタグ `v0.3.0-alpha.1` ではなく `b2d3e75c` の版で行い、11 月 2 日の D-5 再確認は `1c34a7fd`、11 月 3 日の行照合は [試験用ビルド](s7-d5-retest-plan.md#試験に使った版と記録の場所) で行った。#682 追従後の再確認は `8b4e444a`（#1035）の配布物で行った（R-7・R-8。ソースコミットとの対応の留保は §1））
 
 [external-db-test-2026-09.md](external-db-test-2026-09.md) §3.3 の S7 本番（予定は 2026-11-02〜11-08、初回は 2026-11-01〜11-02、再確認は 11-03〜11-05。操作を伴うケースはオーナー同席、連続採取は無人）の結果を書く文書。**手順と期待は手順書が正で、この文書は記録だけ**（各段の順番は §3.3 D、期待は §2・§3・§3.1・§3.3 S）。キー・パスワードは書かない。
@@ -296,11 +296,11 @@ git diff b2d3e75c 2899d25f -- apps/banto-hub/core/src/commissioning.rs apps/bant
 | 同じ診断テスト内の通常セッショントークン（grantなし・remembered false、issue_tokenで発行） | 活動を続けても8時間で失効                                         |
 | 無アクセスの別grant                                                                        | idle1時間−1msは有効、1時間ちょうどで失効。絶対期限と分けて確認    |
 
-`cargo test --offline --locked --manifest-path target/s7-1012-expiry-20261105/source/Cargo.toml --target-dir target/s7-1012-expiry-20261105/build -p banto-server --lib auth::tests::s7_1012_default_commissioning_absolute_boundary -- --exact --nocapture` で **1 passed・0 failed**（終了コード0）。追記したテストは、下記原記録内の `source/crates/banto-server/src/auth/tests.rs` にある。原典888ファイルと診断コピーを照合し、差分はテスト追記のみ。元の依存ソース・製品コード・ロックファイルは変更していない。これは `AuthState` の判定器を手動時計で確認した試験であり、実時計で8時間待機した Hub HTTP・WS・UI の総合試験ではない。API キーは別の検証経路で、この診断の対象外。TTL を起点とする WS 終了から UI 再取得までの連結確認は未実施で、既存の実 Hub・UI の再現は明示logout失効によるものと区別する。
+`cargo test --offline --locked --manifest-path target/s7-1012-expiry-20261105/source/Cargo.toml --target-dir target/s7-1012-expiry-20261105/build -p banto-server --lib auth::tests::s7_1012_default_commissioning_absolute_boundary -- --exact --nocapture` で **1 passed・0 failed**（終了コード0）。追記したテストは、下記原記録内の `source/crates/banto-server/src/auth/tests.rs` にある。原典888ファイルと診断コピーを照合し、差分はテスト追記のみ。元の依存ソース・製品コード・ロックファイルは変更していない。これは `AuthState` の判定器を手動時計で確認した試験であり、実時計で8時間待機した Hub HTTP・WS・UI の総合試験ではない。API キーは別の検証経路で、この診断の対象外。この判定器試験の段階では TTL を起点とする Hub WS・UI の連結確認は未実施で、既存の実 Hub・UI の再現は明示logout失効によるものだった。後段の短縮TTL診断は別の試験として記録する。
 
 上記 cargo コマンドの起点もリポジトリルート。再実行の手順は原記録の `run.ps1`・`verify.ps1`・`NOTES.txt` にある。`run.ps1 -Run` はその配置場所を基準に `source/` と専用 `build/` を使うため、ソースとランチャーを原記録から作業用ディレクトリへ複製して実行できる。ただし原典照合は `metadata.json` の元 PC の checkout パスに依存するので、別環境では同版の原典を用意し、作業用コピーの照合パスを合わせる必要がある。保全済みの原記録や目録は変更しない。
 
-旧再現の保全4ファイルは `_s7-evidence/2026-11-03-1012/SHA256SUMS.txt` と再照合し、不一致0。旧 Hub も §1 P-2 の `b2d3e75c` の SHA-256 と一致した。明示失効後の採取401×7はすべて認証・CSRFヘッダあり、その後 WS `1008 session_revoked`、grant再取得200、WS再接続を観測している。WS の再検証は15秒周期なので、一時的な401の回数は失効を検知する位相と採取周期に左右される。コード上は `stream.rs` の `SessionStreamCredential::recheck`・`session_recheck_verdict`（診断準備時の `2899d25f` の360〜383行）で、`AuthState::revalidate` の `Ok(None)` を共通の `SessionRevoked` へ変換する。これが期限・logout・同種grantの上限による失効の終了理由を区別できないとした根拠で、TTL・FIFO起点のWSフレームを実測したという記述ではない。**当日の発行時刻と各要求の資格情報の記録はなく、11-01の401×3の原因は未確定のまま #1012 を継続する。** 再発時には、既存の採取項目に加え、発行・再取得の時刻と資格情報を含まない世代ラベルを対応させる。通常 UI と追加採取の要求を区別し、トークンの値やハッシュは保存しない。
+旧再現の保全4ファイルは `_s7-evidence/2026-11-03-1012/SHA256SUMS.txt` と再照合し、不一致0。旧 Hub も §1 P-2 の `b2d3e75c` の SHA-256 と一致した。明示失効後の採取401×7はすべて認証・CSRFヘッダあり、その後 WS `1008 session_revoked`、grant再取得200、WS再接続を観測している。WS の再検証は15秒周期なので、一時的な401の回数は失効を検知する位相と採取周期に左右される。コード上は `stream.rs` の `SessionStreamCredential::recheck`・`session_recheck_verdict`（診断準備時の `2899d25f` の360〜383行）で、`AuthState::revalidate` の `Ok(None)` を共通の `SessionRevoked` へ変換する。これが期限・logout・同種grantの上限による失効の終了理由を区別できないとした根拠で、この判定器試験でTTL・FIFO起点のWSフレームを実測したという記述ではない（後段の短縮TTL診断ではTTL起点を別途確認）。**当日の発行時刻と各要求の資格情報の記録はなく、11-01の401×3の原因は未確定のまま #1012 を継続する。** 再発時には、既存の採取項目に加え、発行・再取得の時刻と資格情報を含まない世代ラベルを対応させる。通常 UI と追加採取の要求を区別し、トークンの値やハッシュは保存しない。
 
 追加診断の原記録は、R-7 と同じ保管ホスト・ルートの `_s7-evidence/2026-11-05-1012-expiry-c8346cb5-de57-4af8-8f58-33ce253938d9/`。ソース888件・テストexe・結果・実行ログ・手順等の898ファイルと、循環ハッシュを除いた `manifest.json` を保持する。保全完了後、Codex が同じ Windows PC 上で保全スクリプトとは別の PowerShell 処理を実行し、全898件のサイズ・SHA-256を再照合した結果は不一致0。既存の保全条件（#1037）を適用し、別保管先への複製は未実施。`metadata.json` の `cargo_executed:false` は準備時点の記録で、実行成功と開始時刻・保全完了時刻は `execution.json` に別記した。
 
@@ -311,6 +311,44 @@ git diff b2d3e75c 2899d25f -- apps/banto-hub/core/src/commissioning.rs apps/bant
 | `execution.json`                               | `3b0d2d9f04065579aa022f6051988e9917b24a83f754eef12ee251220e75b066` |
 | `manifest.json`                                | `28e611b7bd99d915e2b465c3638a72f4473a5e9faa10ae0027ad2c87fc020063` |
 | `test-exe/banto_server-51b19a881d38c489.exe`   | `a80fdcc0b65927c90e513e6f5c0be9932132262d78fe993f559d96d125aa0975` |
+
+#### #1012 の短縮TTL・UI回復の追加診断（2026-11-05）
+
+`43bc7543` の本物 Hub core と banto v6.9.1（`10e3adb`）を、公開 API で組み立てる隔離ハーネスを使った。診断側だけで `AuthState::with_policy` を絶対20秒・idle600秒にし、本物の REST・WS・`commissioning_grant_spec` と現存の管理UIビルドを接続した。アカウントlogin検証は `None` を返すstubで、対象は試運転grantだけ。PLCドライバなし、loopback・OS割当ポート、専用SQLite、fresh headless Edgeで実施した。前段の本物8時間policyの手動単調時計による判定器試験とは別で、自然8時間・旧exe・当日のS7原因を証明する試験ではない。実機・Windowsサービス・Mac・Wi-Fi・PC時計は操作していない。
+
+`run-494f2ae8-6fc1-4e54-b447-8e99f10f2125` は **passed・Node終了コード0**。時刻はG1発行応答を観測してからの経過（Nodeの単調時計。サーバー側の発行時刻ではない）で、通常UI要求・最新tokenを毎要求読み直す追加採取・旧G1を固定した採取・独立した旧G1固定WSを区別した。
+
+| G1応答観測から   | 観測                                                          |
+| ---------------- | ------------------------------------------------------------- |
+| 20.165秒         | 固定旧G1の `/api/status` が401。それ以前は200×19              |
+| 30.044秒         | 固定旧G1の独立WSが `1008 session_revoked`。終了前のpongは10件 |
+| 30.579秒         | UIの旧G1 WSも `1008 session_revoked`                          |
+| 30.604／30.607秒 | UIのG2／G3発行応答を観測                                      |
+| 30.629秒         | UIのG2 WSがopen                                               |
+| 31.616秒         | 最新tokenの追加採取がG2で `/api/status` 200                   |
+
+grant発行は計3件で上限16未満。実験者・UIともlogout・revoke・lockdownは行っていない。最新tokenの追加採取の401は11件で、**旧G1付き10件と認証ヘッダなし1件**だった。後者はCSRFヘッダあり・要求時の格納tokenなしを回復過渡期に観測したもので、全件が旧token付きだったとは扱わない。Gラベルは各要求の実認証ヘッダとWSの実protocolに載ったtokenをメモリ内で対応させ、token値・hashは記録していない。SSEも並行するため、UIのWS終了が新grant発行の直接の原因だったとまでは証明しない。TTLによる旧HTTP拒否、独立WS終了、本物UIの新資格情報取得と回復を分けて確認した。
+ここで「最新」は各要求時に `sessionStorage.getItem('banto.auth.token')` にあった値で、最後に発行されたtokenという意味ではない。G番号はgrant応答JSONをNodeが観測した順で、サーバー内の発行順と各発行要求との対応は未採取。G2・G3はいずれもブラウザUIのgrant要求への応答として観測したが、採取対象のHTTP・WSイベントにG3付きはなく、追加採取の要求時点では、格納tokenなしと、その後のG2を読み出した。G3の保存・使用・破棄・有効期限は記録しておらず、WS／SSEのどちらがどの再取得に対応したか、二重発行の原因も未証明。上限16未満の確認はこの1cycleだけで、反復時の未使用grant蓄積やFIFO失効は検証していない。
+
+cleanupはbackend PID8068・終了コード0、起動ポートの接続拒否とexclusive bind可を確認し、`observer_failed`・`origin_violation`・`forced_kill` はすべてfalse。終了時の `SSE.finished` のTargetClosed取消1件は `intentional_cleanup` と分類し、セッション終了の推定には使わない。先行の `run-ed44c531-c2d1-400b-ae93-60e2d6422550` は機能cycleと停止を確認できたが、最終観測品質は **failedのまま**保全した。旧観測器にはflag・error詳細がなく、その失敗原因は未確定で、今回のpassedと混ぜない。旧→新の観測器差分には、終了後の既知TargetClosed／Abort（およびSSEの既知transport取消）を観測取消として分類する合否条件の変更も含む。grant JSON取得などのcriticalエラー・未知エラーは失敗を維持し、機能の合格条件・Rust・TTL・UIは変更していない。
+
+成功原記録はR-7と同じ保管ホスト・ルートの `_s7-evidence/2026-11-05-1012-ttl-ui-a206983c-c014-4afb-bf37-ca00549f81ed/`。ハーネス・lock・buildmetadata・ログ・失敗したbuildのattempt1/2・exe・UI全84assetsなど115payloadと、自己hashを除いたmanifestの計116ファイルを保全した。UI assetsの前後hashは一致するが、現存UIビルドとsource commitの対応は未証明。SQLite・browser storageは含めない。保全完了後、Codexが同じWindows PCで保全スクリプトとは別のPowerShell処理により全115件のSHA-256・bytesを再照合し、不一致0。先行failedの保全先は `_s7-evidence/2026-11-05-1012-ttl-ui-2eeb34d2-0add-486f-b1b7-0f54f17b6090/`（同じ件数、独立再照合も不一致0、manifest `e017b5f1ae8d8963b4d8b41396cf9b8cbef7f528c1ec1b8058af011873090ee0`）。#1037の保全条件を適用し、別保管先への複製は未実施。
+
+| 成功原記録                  | SHA-256                                                            |
+| --------------------------- | ------------------------------------------------------------------ |
+| `runtime/result.json`       | `0e1b7c276e65e7e50f590d94852749d41f6d997404c49b34fbc2d480cc0016b3` |
+| `preservation.json`         | `8c834accb02b9207c90715a0c148c5385a7ddae4098264c1f92e14e1a9547491` |
+| `manifest.json`             | `160c45cb32a7c2831369135fcba0bb4346c202035c6871210b83a80984293aba` |
+| `binary/s7-1012-ttl-ui.exe` | `cd00eaa5b835632063112b7f4dc3b1d3c886ad23b8b8db0957ef040ce2cd37dc` |
+
+ビルドはofflineのタグ参照不足で失敗したattempt1、診断lockだけをroot lockからseedして `cargo metadata --offline` 後、sandbox内のprotoc起動がos623で失敗したattempt2を経て、同入力のofflineビルドをこの環境のsandbox外で実行して成功した。protocは `protoc-bin-vendored` が供給し、システムへの手動installは不要。このos623回避は当環境の条件で、一般に管理者権限が必須という意味ではない。製品source・lock・protoの前後は不変。診断手順は成功原記録の `harness/NOTES.txt`、観測器の取消分類は `harness/run.mjs` と `runtime/result.json`、ビルドの成功・失敗は各 `build.log` に記録した。再実行時は原記録の `harness/` と `ui-build/` を、`43bc7543` の別作業ツリーの `target/s7-1012-ttl-ui-20261105/` と `apps/banto-hub/build/` へ作業用コピーし、原記録を変更せず、移設先でbuildmetadataを再生成する。PowerShell7（`pwsh`）・Rust1.98.1・Node24・依存cache・Edgeが必要。同梱の `harness/Cargo.lock` を使い、`build.ps1 -Build` が移設先のbuildmetadataを再生成する。リポジトリルートから次を実行する。
+
+```powershell
+pwsh -NoProfile -File target/s7-1012-ttl-ui-20261105/build.ps1 -Build
+node target/s7-1012-ttl-ui-20261105/run.mjs
+```
+
+**S7・D-5・B-28の既存合否は変更しない。11-01の401×3は当日の発行・要求資格情報の記録がなく原因未確定で、#1012は継続する。**
 
 ### R-5 欠ける範囲（S-4）
 
