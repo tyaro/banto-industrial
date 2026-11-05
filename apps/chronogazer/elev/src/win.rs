@@ -55,24 +55,85 @@ pub(crate) fn hold_instance_mutex(root: &Path) -> Result<Option<Box<dyn std::any
     Ok(held.map(|guard| Box::new(HeldMutex(guard)) as Box<dyn std::any::Any>))
 }
 
+/// 実在する対象を解決し、境界判定と SCM に同じ通常表記を渡す。
+fn normalize_existing(path: &Path) -> std::io::Result<PathBuf> {
+    use std::path::{Component, Prefix};
+    let original = std::fs::canonicalize(path)?;
+    let normal = strip_verbatim_prefix(&original);
+    // 通常の絶対 DOS/UNC 表記に限る。Volume GUID 等を相対化しない。
+    // MAX_PATH 超での SCM 起動は未検証。ここでは長さの制限は加えない（設計書の制約）。
+    let disk_or_unc = matches!(normal.components().next(), Some(Component::Prefix(prefix))
+        if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..)));
+    if !normal.is_absolute() || !disk_or_unc {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "通常の絶対 DOS/UNC パスへ変換できません",
+        ));
+    }
+    // 拡張長表記で有効な末尾 dot 等が、通常表記では別の対象を指すことがある。
+    if std::fs::canonicalize(&normal)? != original {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "通常表記の再解決先が元の実在パスと一致しません",
+        ));
+    }
+    Ok(normal)
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    // Windows のパスは不対サロゲートも保持する。lossy な文字列へ変換しない。
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let unc_prefix: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let local_prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if let Some(rest) = wide.strip_prefix(unc_prefix.as_slice()) {
+        let mut unc: Vec<u16> = r"\\".encode_utf16().collect();
+        unc.extend_from_slice(rest);
+        PathBuf::from(std::ffi::OsString::from_wide(&unc))
+    } else if let Some(rest) = wide.strip_prefix(local_prefix.as_slice()) {
+        PathBuf::from(std::ffi::OsString::from_wide(rest))
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn normalized_sibling_server(me: &Path) -> std::io::Result<PathBuf> {
+    let dir = me.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} の親フォルダがありません", me.display()),
+        )
+    })?;
+    let candidate = dir.join(SERVER_EXE_FILE_NAME);
+    let server = normalize_existing(&candidate).map_err(|err| {
+        std::io::Error::new(err.kind(), format!("{}: {err}", candidate.display()))
+    })?;
+    if !server.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} が通常のファイルではありません", candidate.display()),
+        ));
+    }
+    Ok(server)
+}
+
+fn normalized_program_files(dirs: Vec<PathBuf>) -> Vec<PathBuf> {
+    dirs.into_iter()
+        .filter_map(|dir| normalize_existing(&dir).ok())
+        .filter(|dir| dir.is_dir())
+        .collect()
+}
+
 impl ElevOps for WindowsOps {
     type Pinned = PinnedDir;
 
     fn server_executable(&self) -> Result<PathBuf, String> {
         let me = std::env::current_exe().map_err(|err| err.to_string())?;
-        let dir = me
-            .parent()
-            .ok_or_else(|| format!("{} の親フォルダが分かりません", me.display()))?;
-        let server = dir.join(SERVER_EXE_FILE_NAME);
-        if server.is_file() {
-            Ok(server)
-        } else {
-            Err(format!("{} がありません", server.display()))
-        }
+        normalized_sibling_server(&me).map_err(|err| err.to_string())
     }
 
     fn program_files_dirs(&self) -> Vec<PathBuf> {
-        banto_safe_root::guard::win::program_files_dirs()
+        normalized_program_files(banto_safe_root::guard::win::program_files_dirs())
     }
 
     fn registered_command_line(&self) -> Result<Option<String>, String> {
@@ -165,6 +226,146 @@ impl ElevOps for WindowsOps {
 mod tests {
     use super::*;
 
+    /// 通常 Win32 表記が別の対象になる末尾 dot は採用しない。
+    #[test]
+    fn normalization_refuses_a_trailing_dot_alias_but_accepts_the_normal_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(tmp.path()).unwrap();
+        let plain = root.join("app");
+        let dotted = root.join("app.");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(&dotted).unwrap();
+        let plain_exe = plain.join(SERVER_EXE_FILE_NAME);
+        let dotted_exe = dotted.join(SERVER_EXE_FILE_NAME);
+        std::fs::write(&plain_exe, b"plain-inert").unwrap();
+        std::fs::write(&dotted_exe, b"dotted-inert").unwrap();
+        assert_eq!(
+            normalize_existing(&dotted_exe).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            normalize_existing(&plain_exe).unwrap(),
+            strip_verbatim_prefix(&plain_exe)
+        );
+        assert_eq!(std::fs::read(&plain_exe).unwrap(), b"plain-inert");
+        assert_eq!(std::fs::read(&dotted_exe).unwrap(), b"dotted-inert");
+    }
+
+    /// 純粋な prefix 処理は OS へアクセスせず UTF-16 の同一性を保つ。
+    #[test]
+    fn verbatim_prefix_removal_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        for (prefix, expected_prefix) in [
+            (r"\\?\C:\fixture\", r"C:\fixture\"),
+            (r"\\?\UNC\server\share\", r"\\server\share\"),
+            (r"C:\fixture\", r"C:\fixture\"),
+        ] {
+            let mut input: Vec<u16> = prefix.encode_utf16().collect();
+            let mut expected: Vec<u16> = expected_prefix.encode_utf16().collect();
+            // 不対の high/low surrogate を含み、置換文字に化けると別の名前になる。
+            let suffix = [0xD800, b'x' as u16, 0xDC00];
+            input.extend_from_slice(&suffix);
+            expected.extend_from_slice(&suffix);
+            let actual = strip_verbatim_prefix(Path::new(&std::ffi::OsString::from_wide(&input)));
+            assert_eq!(
+                actual.as_os_str().encode_wide().collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\plain.exe")),
+            PathBuf::from(r"C:\plain.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\plain.exe")),
+            PathBuf::from(r"\\server\share\plain.exe")
+        );
+    }
+
+    /// 本番の両メソッドが使う helper を実在する inert file で検証する。
+    #[test]
+    fn sibling_and_program_files_resolve_to_the_same_normalized_paths() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let tmp = tempfile::tempdir().unwrap();
+        let pf = tmp.path().join("Program Files Long Name");
+        std::fs::create_dir(&pf).unwrap();
+        let pf_x86 = tmp.path().join("Program Files (x86)");
+        std::fs::create_dir(&pf_x86).unwrap();
+        let server = pf.join(SERVER_EXE_FILE_NAME);
+        std::fs::write(&server, b"inert").unwrap();
+        let expected = normalize_existing(&server).unwrap();
+        let parent = normalize_existing(&pf).unwrap();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", parent.display()));
+        let actual = normalized_sibling_server(&verbatim.join("chronogazer-elev.exe")).unwrap();
+        assert_eq!(actual, expected);
+        assert!(!actual.to_string_lossy().starts_with(r"\\?\"));
+        let dirs = normalized_program_files(vec![
+            verbatim,
+            pf_x86.clone(),
+            tmp.path().join("missing"),
+            server.clone(),
+        ]);
+        assert_eq!(
+            dirs,
+            vec![parent.clone(), normalize_existing(&pf_x86).unwrap()]
+        );
+        assert!(crate::is_inside_program_files(&actual, &dirs));
+        assert!(normalized_program_files(vec![server.clone()]).is_empty());
+        let missing = normalized_sibling_server(&tmp.path().join("elev.exe")).unwrap_err();
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound);
+        assert!(missing
+            .to_string()
+            .contains(&tmp.path().join(SERVER_EXE_FILE_NAME).display().to_string()));
+        std::fs::remove_file(&server).unwrap();
+        std::fs::create_dir(&server).unwrap();
+        let directory = normalized_sibling_server(&pf.join("elev.exe")).unwrap_err();
+        assert_eq!(directory.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(directory
+            .to_string()
+            .contains(&server.display().to_string()));
+        std::fs::remove_dir(&server).unwrap();
+        std::fs::write(&server, b"inert").unwrap();
+        let wide: Vec<u16> = server.as_os_str().encode_wide().chain([0]).collect();
+        let mut buf = vec![0u16; 32768];
+        // SAFETY: NUL 終端の入力と、指定長だけ書ける出力。
+        let n = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        if n > 0 && n < buf.len() {
+            let short = PathBuf::from(std::ffi::OsString::from_wide(&buf[..n]));
+            if short.to_string_lossy().contains('~') {
+                assert_eq!(normalize_existing(&short).unwrap(), expected);
+            } else {
+                eprintln!("8.3 alias unavailable: volume did not provide a shortened name");
+            }
+        } else {
+            eprintln!("8.3 alias unavailable: GetShortPathNameW returned no usable name");
+        }
+    }
+
+    #[test]
+    fn sibling_junction_resolves_outside_the_program_files_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pf = tmp.path().join("Program Files");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&pf).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join(SERVER_EXE_FILE_NAME), b"inert").unwrap();
+        let link = pf.join("linked");
+        junction(&link, &outside);
+        let exe = normalized_sibling_server(&link.join("elev.exe")).unwrap();
+        assert!(!crate::is_inside_program_files(
+            &exe,
+            &normalized_program_files(vec![pf])
+        ));
+        assert_eq!(
+            exe,
+            normalize_existing(&outside.join(SERVER_EXE_FILE_NAME)).unwrap()
+        );
+        // fixture の junction だけを外す。リンク先の内容には触れない。
+        std::fs::remove_dir(link).unwrap();
+    }
+
     /// 読むだけ: マシンの ProgramData は既知のフォルダから取れる（環境変数を見ない）。
     /// HKLM の読み取りそのもののテストは `banto_safe_root::guard::win` に移した
     /// （#626 PR-A）。
@@ -173,7 +374,7 @@ mod tests {
         let program_data = RegistryMachineEnvironment.program_data().unwrap();
         assert!(program_data.is_absolute(), "{program_data:?}");
         let dirs = WindowsOps.program_files_dirs();
-        assert_eq!(dirs.len(), 2, "{dirs:?}");
+        assert!(!dirs.is_empty(), "{dirs:?}");
         assert!(dirs.iter().all(|d| d.is_absolute()));
         // 既知のフォルダの一覧が取れ、ProgramData の下の既定のルートは断られない。
         let known = RegistryMachineEnvironment.known_folders().unwrap();
