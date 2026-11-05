@@ -210,6 +210,21 @@ Var ChronoGazerShellWasQuit'''
     main_events = [event for event in events if event.startswith("main-dialog ")]
     require(len(main_events) == 1, "main_dialog_count")
     main_at = events.index(main_events[0])
+    warnings = [event for event in events if event.startswith("other-dialog ")]
+    if running and restart_result:
+        require(len(warnings) == 1, "restart_warning_count")
+        require(events.index("restart") < events.index(warnings[0]) < main_at,
+                "restart_warning_order")
+    else:
+        require(not warnings, "unexpected_restart_warning")
+    # FileWriteUTF16LE preserves the dialog CR/LF, so the reason may be on
+    # later event lines. Inspect the entire main-text block, not its first line.
+    text_starts = [index for index, event in enumerate(events) if event.startswith("main-text=")]
+    text_ends = [index for index, event in enumerate(events) if event.startswith("onfailed-before ")]
+    require(len(text_starts) == 1 and len(text_ends) == 1 and text_starts[0] < text_ends[0],
+            "main_text_block_missing")
+    require(all("sentinel-" not in event for event in events[text_starts[0]:text_ends[0]]),
+            "main_dialog_contains_sentinel")
     require(events.count("restart") == running, "restart_count")
     require("onfailed-before flag=0" in events and "onfailed-after flag=0" in events,
             "onfailed_flag_or_double_restart")
