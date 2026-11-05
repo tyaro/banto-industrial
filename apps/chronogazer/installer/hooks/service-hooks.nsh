@@ -115,7 +115,8 @@
 ;   - `AllowSkipFiles off`（P5、インストーラ属性。インストーラ全体に効く）で
 ;     「無視」を出さない。窓は再試行／中止だけになり、silent では中止になる
 ;     （使用中での [中止]・書込み途中の失敗は NSIS 内部で中止し、P5 へ到達しない）。
-;   - P5 は `CreateDirectory` などのエラーフラグが後続まで残った場合の検出に限り、
+;   - 現構成は resources 無し。P5 は `File /a` の属性設定等の残留エラーフラグを
+;     防御的に検出し、
 ;     止めたサービスの再開を案内・Abort より前に試みる。再開マクロは成否を確認し、
 ;     再開失敗を警告してフラグを "0" にするため、.onInstFailed は二重に再開しない。
 ;   `File` は開いた後の書込み失敗で不完全なファイルを残す可能性があり、
@@ -473,13 +474,13 @@ Var ServiceStopWaitCounter
 
 ; P5: ファイルの上書きの結果の確かめ（上の「ファイルの上書きの結果」節。テンプレートの
 ; 当て直しが Section Install の `File` の直後に挿入する。直前の `ClearErrors` も
-; 当て直しが置く）。CreateDirectory 等の残留エラーフラグを検出したら再開を試み、
+; 当て直しが置く）。File /a の属性設定等の残留エラーフラグを検出したら再開を試み、
 ; 案内して `Abort`。共通部品がフラグを "0" にし、後のコールバックは再開しない。
 !macro RequireChronoGazerFilesCopied
   ${If} ${Errors}
     DetailPrint "chronogazer: インストール時のエラーフラグを検出しました。上書き前に止めた ChronoGazer サービスの再開を試みてから、インストールを中止します。"
     !insertmacro RestartChronoGazerServiceOrWarn "インストール"
-    MessageBox MB_OK|MB_ICONSTOP "インストール先の作成やファイル配置でエラーを検出しました。$\r$\n$\r$\nすべてのファイルの配置を確認できないため、インストールを失敗として終えます。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "ファイル配置の結果を確認できませんでした。$\r$\n$\r$\n詳細ログを確認し、書込み権限とディスクの空き容量を確かめてから、このインストーラをもう一度実行してください。インストールは失敗として終えます。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
     Abort "インストール時のエラーを検出したため、失敗として終えました。"
   ${EndIf}
 !macroend

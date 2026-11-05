@@ -129,7 +129,8 @@
 //!    直下の普通のファイルの所有者を Administrators にして ACL を既定へ戻す。
 //!    `icacls /T` は使わず、再解析ポイントやサブフォルダがあれば `Abort`。
 //!    失敗なら `Abort`）と `ClearErrors`、外部バイナリの `File` の直後にフックの
-//!    `RequireChronoGazerFilesCopied`（`CreateDirectory` 等の残留エラーフラグ検出時は、
+//!    `RequireChronoGazerFilesCopied`（resources 無しの現構成では、`File /a` の
+//!    属性設定等の残留エラーフラグを防御的に検出したときに、
 //!    止めたサービスの再開を案内・`Abort` より前に試みる。
 //!    使用中の中止・書込み途中失敗は到達せず、
 //!    `.onInstFailed` に依存し、UI では失敗の頁を閉じるまで再開が遅れる。
@@ -301,7 +302,7 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
     ),
     (
         // P5（Install、後）: main・resources・external binaries の `File` の直後に、
-        // CreateDirectory 等の残留エラーフラグなら再開を試みてから案内し `Abort`。
+        // File /a の属性設定等の残留エラーフラグなら再開を試みてから案内し `Abort`。
         "P5-require-files-copied",
         "  ; Copy external binaries\n\
          \x20 {{#each binaries}}\n\
@@ -312,7 +313,7 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
          \x20   File /a \"/oname={{this}}\" \"{{no-escape @key}}\"\n\
          \x20 {{/each}}\n\
          \n\
-         \x20 ; chronogazer-installer (#972 P5): CreateDirectory 等の残留エラーフラグを検出したら\n\
+         \x20 ; chronogazer-installer (#972 P5): File /a の属性設定等の残留エラーフラグを検出したら\n\
          \x20 ; フックで止めたサービスの再開を試みてから案内し、中止する。\n\
          \x20 !insertmacro RequireChronoGazerFilesCopied\n",
     ),
