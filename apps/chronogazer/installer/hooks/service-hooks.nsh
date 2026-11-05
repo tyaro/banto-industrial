@@ -485,7 +485,7 @@ Var ServiceStopWaitCounter
   ${EndIf}
 !macroend
 
-; 使用中の exe の確かめの 1 つ分（上の PREUNINSTALL の (a)）。あって読み書きで
+; 上書き前・PREUNINSTALL (a) で共用する exe 1本の確かめ。あって読み書きで
 ; 開けなければ $1 に名前を足す。`FileOpen ... a` は無いファイルを作るので、
 ; 先に有無を見る。開けたら中身を変えずに閉じる。$0 を壊す。
 !macro CheckChronoGazerExeUnlocked exe_name
@@ -501,6 +501,52 @@ Var ServiceStopWaitCounter
     ${Else}
       FileClose $0
     ${EndIf}
+  ${EndIf}
+!macroend
+
+; インストール専用: NSIS File と同じく READONLY だけを外す。他の属性は保持する。
+; 不存在は作らない。属性取得・解除に失敗しても成功とはせず、後の FileOpen で書込み可否を確認する。
+; $0・$1 を壊す。共有の検査・アンインストールでは使用しない。
+!macro ClearChronoGazerInstallExeReadonly exe_name
+  ${If} ${FileExists} "$INSTDIR\${exe_name}"
+    System::Call 'kernel32::GetFileAttributesW(w "$INSTDIR\${exe_name}") i .r0'
+    ${If} $0 != -1
+      IntOp $0 $0 & 0xFFFFFFFE
+      System::Call 'kernel32::SetFileAttributesW(w "$INSTDIR\${exe_name}", i r0) i .r0'
+    ${EndIf}
+  ${EndIf}
+!macroend
+
+; 上書き前: 既存の 3 exe 全てを確認し、短期ロックなら最大約5秒（1秒間隔）待つ。
+; 不存在は飛ばす。ACL/READONLY調整は上書き前に行い、中止でもREADONLY解除は戻さない。
+; 確認後の競合やコピーの完全性は保証しない。
+; $2 は待機回数から失敗名の退避へ再利用する。$0〜$2 を壊す。
+!macro RequireChronoGazerInstallExesUnlocked
+  StrCpy $2 "0"
+  ${Do}
+    !insertmacro ClearChronoGazerInstallExeReadonly "${CHRONOGAZER_SHELL_EXE}"
+    !insertmacro ClearChronoGazerInstallExeReadonly "chronogazer-server.exe"
+    !insertmacro ClearChronoGazerInstallExeReadonly "chronogazer-elev.exe"
+    StrCpy $1 ""
+    !insertmacro CheckChronoGazerExeUnlocked "${CHRONOGAZER_SHELL_EXE}"
+    !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
+    !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
+    ${If} $1 == ""
+      ${Break}
+    ${EndIf}
+    ${If} $2 >= 5
+      ${Break}
+    ${EndIf}
+    Sleep 1000
+    IntOp $2 $2 + 1
+  ${Loop}
+  ${If} $1 != ""
+    ; 再開マクロが $0・$1 を壊すため、失敗名を先に退避する。
+    StrCpy $2 $1
+    DetailPrint "chronogazer: 使用中、または書き込めない実行ファイルがあります（$2）。上書きを始めず、停止したサービスの再開を試みてから中止します。"
+    !insertmacro RestartChronoGazerServiceOrWarn "インストール"
+    MessageBox MB_OK|MB_ICONSTOP "使用中、または書き込めない実行ファイルがあります（$2）。$\r$\n$\r$\n上書きはまだ始めていません。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\n上記の実行ファイル（$2）を使用するアプリ・コンソール・操作を終了してください。終了後も続く場合は書込み権限・属性を確認してから、このインストーラをもう一度実行してください。" /SD IDOK
+    Abort "書込み可能でない実行ファイルがあるため、上書き前にインストールを中止しました。"
   ${EndIf}
 !macroend
 
