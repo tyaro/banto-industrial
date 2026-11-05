@@ -518,7 +518,8 @@ Var ServiceStopWaitCounter
 !macroend
 
 ; 上書き前: 既存の 3 exe 全てを確認し、短期ロックなら最大約5秒（1秒間隔）待つ。
-; 不存在は飛ばす。確認後の競合やコピーの完全性は保証しない。
+; 不存在は飛ばす。ACL/READONLY調整は上書き前に行い、中止でもREADONLY解除は戻さない。
+; 確認後の競合やコピーの完全性は保証しない。
 ; $2 は待機回数から失敗名の退避へ再利用する。$0〜$2 を壊す。
 !macro RequireChronoGazerInstallExesUnlocked
   StrCpy $2 "0"
@@ -544,7 +545,7 @@ Var ServiceStopWaitCounter
     StrCpy $2 $1
     DetailPrint "chronogazer: 使用中、または書き込めない実行ファイルがあります（$2）。上書きを始めず、停止したサービスの再開を試みてから中止します。"
     !insertmacro RestartChronoGazerServiceOrWarn "インストール"
-    MessageBox MB_OK|MB_ICONSTOP "使用中、または書き込めない実行ファイルがあります（$2）。$\r$\n$\r$\n上書きはまだ始めていません。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\nデスクトップシェルとコンソール版の chronogazer-server.exe を終了してください。終了後も続く場合は書込み権限・属性を確認してから、このインストーラをもう一度実行してください。" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "使用中、または書き込めない実行ファイルがあります（$2）。$\r$\n$\r$\n上書きはまだ始めていません。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\n上記の実行ファイル（$2）を使用するアプリ・コンソール・操作を終了してください。終了後も続く場合は書込み権限・属性を確認してから、このインストーラをもう一度実行してください。" /SD IDOK
     Abort "書込み可能でない実行ファイルがあるため、上書き前にインストールを中止しました。"
   ${EndIf}
 !macroend

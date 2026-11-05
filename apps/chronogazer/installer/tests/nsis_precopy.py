@@ -38,6 +38,7 @@ CASES = (
     ("unlocked", (), 1, 0, False),
     ("short-lock", (1,), 1, 0, False),
     ("readonly", (), 1, 0, False),
+    ("readonly-locked", (1,), 1, 0, False),
 )
 
 # Include the real hook BEFORE overriding the one service-operation macro.
@@ -84,7 +85,7 @@ SectionEnd
 Function .onInstFailed
   FileOpen $R9 "@LOG@" a
   FileSeek $R9 0 END
-  FileWrite $R9 "callback-before flag=$ChronoGazerWasRunning$\r$\n"
+  FileWrite $R9 "callback-before flag=$ChronoGazerWasRunning names=$2$\r$\n"
   FileClose $R9
   !insertmacro ChronoGazerOnInstFailed
   FileOpen $R9 "@LOG@" a
@@ -147,6 +148,7 @@ def run_case(work, makensis, api, case):
             before[name] = file_hash(fixture)
 
     readonly_before = None
+    readonly_abort_before = {}
     if case[0] == "readonly":
         readonly_path = str(install / EXES[1])
         attrs = api.GetFileAttributesW(readonly_path)
@@ -154,6 +156,14 @@ def run_case(work, makensis, api, case):
         # ARCHIVE is a non-READONLY bit whose preservation is checked at the gate.
         readonly_before = attrs | 0x21
         require(api.SetFileAttributesW(readonly_path, readonly_before), "set_fixture_readonly")
+    if case[0] == "readonly-locked":
+        # Both the locked server and an unlocked shell start READONLY.
+        for index in (0, 1):
+            path = str(install / EXES[index])
+            attrs = api.GetFileAttributesW(path)
+            require(attrs != 0xFFFFFFFF, "get_abort_fixture_attributes")
+            readonly_abort_before[EXES[index]] = attrs | 0x21
+            require(api.SetFileAttributesW(path, attrs | 0x21), "set_abort_fixture_readonly")
     log = directory / "events.log"
     fresh_check = "\n".join(
         '${If} ${FileExists} "$INSTDIR\\' + name + '"\n'
@@ -264,10 +274,17 @@ FileClose $R9""".replace("__LOG__", str(log)) if readonly_before is not None els
         require(child.returncode == 2 and "copy-begins" not in events, "must_abort_before_any_copy")
         require(before == {name: file_hash(install / name) for name in EXES}, "old_hashes_changed")
         require(len(restarts) == was_running, "restart_count_wrong")
-        require("callback-before flag=0" in events and "callback-after flag=0" in events,
-                "callback_restarted_or_flag_wrong")
+        callbacks = [event for event in events if event.startswith("callback-before ")]
+        require(len(callbacks) == 1 and callbacks[0].startswith("callback-before flag=0 names=")
+                and "callback-after flag=0" in events, "callback_restarted_or_flag_wrong")
+        callback_names = callbacks[0].split(" names=", 1)[1].split()
+        require(callback_names == [EXES[index] for index in locked_indexes],
+                "failed_names_lost_after_real_restart_wrapper")
+        for name, attrs in readonly_abort_before.items():
+            require(api.GetFileAttributesW(str(install / name)) == (attrs & ~1),
+                    "readonly_clear_not_retained_after_abort")
         if was_running:
-            require(events.index(restarts[0]) < events.index("callback-before flag=0"),
+            require(events.index(restarts[0]) < events.index(callbacks[0]),
                     "restart_not_before_abort_callback")
             require(all(EXES[index] in restarts[0] for index in locked_indexes), "failed_names_lost")
     else:
@@ -286,6 +303,7 @@ FileClose $R9""".replace("__LOG__", str(log)) if readonly_before is not None els
         "originalHashesPreserved": True if locked_indexes and case[0] != "short-lock" else None,
         "freshInput": fresh, "elapsedSeconds": round(elapsed, 3),
         "readonlyOtherBitsPreservedAtGate": True if readonly_before is not None else None,
+        "readonlyClearingRetainedAfterAbort": True if readonly_abort_before else None,
     }
 
 
