@@ -61,11 +61,17 @@ fn normalize_existing(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 fn strip_verbatim_prefix(path: &Path) -> PathBuf {
-    let text = path.to_string_lossy();
-    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
-        PathBuf::from(format!(r"\\{rest}"))
-    } else if let Some(rest) = text.strip_prefix(r"\\?\") {
-        PathBuf::from(rest)
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    // Windows のパスは不対サロゲートも保持する。lossy な文字列へ変換しない。
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let unc_prefix: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
+    let local_prefix: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if let Some(rest) = wide.strip_prefix(unc_prefix.as_slice()) {
+        let mut unc: Vec<u16> = r"\\".encode_utf16().collect();
+        unc.extend_from_slice(rest);
+        PathBuf::from(std::ffi::OsString::from_wide(&unc))
+    } else if let Some(rest) = wide.strip_prefix(local_prefix.as_slice()) {
+        PathBuf::from(std::ffi::OsString::from_wide(rest))
     } else {
         path.to_path_buf()
     }
@@ -197,6 +203,37 @@ impl ElevOps for WindowsOps {
 mod tests {
     use super::*;
 
+    /// 純粋な prefix 処理は OS へアクセスせず UTF-16 の同一性を保つ。
+    #[test]
+    fn verbatim_prefix_removal_preserves_unpaired_surrogates() {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        for (prefix, expected_prefix) in [
+            (r"\\?\C:\fixture\", r"C:\fixture\"),
+            (r"\\?\UNC\server\share\", r"\\server\share\"),
+            (r"C:\fixture\", r"C:\fixture\"),
+        ] {
+            let mut input: Vec<u16> = prefix.encode_utf16().collect();
+            let mut expected: Vec<u16> = expected_prefix.encode_utf16().collect();
+            // 不対の high/low surrogate を含み、置換文字に化けると別の名前になる。
+            let suffix = [0xD800, b'x' as u16, 0xDC00];
+            input.extend_from_slice(&suffix);
+            expected.extend_from_slice(&suffix);
+            let actual = strip_verbatim_prefix(Path::new(&std::ffi::OsString::from_wide(&input)));
+            assert_eq!(
+                actual.as_os_str().encode_wide().collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\C:\plain.exe")),
+            PathBuf::from(r"C:\plain.exe")
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\plain.exe")),
+            PathBuf::from(r"\\server\share\plain.exe")
+        );
+    }
+
     /// 本番の両メソッドが使う helper を実在する inert file で検証する。
     #[test]
     fn sibling_and_program_files_resolve_to_the_same_normalized_paths() {
@@ -205,6 +242,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pf = tmp.path().join("Program Files Long Name");
         std::fs::create_dir(&pf).unwrap();
+        let pf_x86 = tmp.path().join("Program Files (x86)");
+        std::fs::create_dir(&pf_x86).unwrap();
         let server = pf.join(SERVER_EXE_FILE_NAME);
         std::fs::write(&server, b"inert").unwrap();
         let expected = normalize_existing(&server).unwrap();
@@ -213,9 +252,16 @@ mod tests {
         let actual = normalized_sibling_server(&verbatim.join("chronogazer-elev.exe")).unwrap();
         assert_eq!(actual, expected);
         assert!(!actual.to_string_lossy().starts_with(r"\\?\"));
-        let dirs =
-            normalized_program_files(vec![verbatim, tmp.path().join("missing"), server.clone()]);
-        assert_eq!(dirs, vec![parent.clone()]);
+        let dirs = normalized_program_files(vec![
+            verbatim,
+            pf_x86.clone(),
+            tmp.path().join("missing"),
+            server.clone(),
+        ]);
+        assert_eq!(
+            dirs,
+            vec![parent.clone(), normalize_existing(&pf_x86).unwrap()]
+        );
         assert!(crate::is_inside_program_files(&actual, &dirs));
         assert!(normalized_program_files(vec![server.clone()]).is_empty());
         assert!(normalized_sibling_server(&tmp.path().join("elev.exe")).is_err());
