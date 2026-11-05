@@ -60,7 +60,8 @@ fn normalize_existing(path: &Path) -> std::io::Result<PathBuf> {
     use std::path::{Component, Prefix};
     let original = std::fs::canonicalize(path)?;
     let normal = strip_verbatim_prefix(&original);
-    // SCM に渡せる通常の絶対 DOS/UNC 表記に限る。Volume GUID 等を相対化しない。
+    // 通常の絶対 DOS/UNC 表記に限る。Volume GUID 等を相対化しない。
+    // MAX_PATH 超での SCM 起動は未検証。ここでは長さの制限は加えない（設計書の制約）。
     let disk_or_unc = matches!(normal.components().next(), Some(Component::Prefix(prefix))
         if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(..)));
     if !normal.is_absolute() || !disk_or_unc {
