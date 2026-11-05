@@ -22,8 +22,8 @@
 //!   （[`OPERATORS_GROUP`]）は固定で、引数で変えられない。
 //! - **パス・環境・コマンドを呼び出し元から受けない**（O4）:
 //!   - 登録する実行ファイルは、この exe の隣の `chronogazer-server.exe`
-//!     （[`SERVER_EXE_FILE_NAME`]。無ければ [`EXIT_PRECONDITION`]）。Program Files の外
-//!     なら警告する（LocalSystem のサービスとして一般の利用者が書き換えられる exe を
+//!     （[`SERVER_EXE_FILE_NAME`]。無い・通常ファイルでない・解決不能なら [`EXIT_PRECONDITION`]）。
+//!     実在パスを Program Files と同じ方式で正規化し、境界外なら拒否する（LocalSystem のサービスとして一般の利用者が書き換えられる exe を
 //!     登録すると、権限の昇格に使われる）。
 //!   - データのルートは**マシンの環境だけ**から決める（[`resolve_machine_root`]）:
 //!     `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment` の
@@ -394,7 +394,7 @@ pub fn resolve_machine_root(env: &impl MachineEnvironment) -> Result<PathBuf, St
 
 /// `exe` が Program Files（`program_files_dirs` のどれか。x86 を含む）の**中**にあるか
 /// （純関数。要素の境界で比べ、大文字小文字は無視。監査 B2）。場所が 1 つも分からなければ
-/// `false`（止める側）。
+/// `false`（止める側）。呼出側が両方を実在パスへ正規化して渡す。
 pub fn is_inside_program_files(exe: &Path, program_files_dirs: &[PathBuf]) -> bool {
     program_files_dirs
         .iter()
@@ -403,6 +403,7 @@ pub fn is_inside_program_files(exe: &Path, program_files_dirs: &[PathBuf]) -> bo
 
 /// 登録されているコマンドライン（SCM の生の文字列）が、`"<exe>" run-service` と同じか
 /// （純関数。監査 B3）。引用符の有無・前後の空白・大文字小文字の違いは同じとみなす。
+/// SCM 側の短名・拡張長・別名は解決しない。不一致なら登録し直す案内に進む。
 pub fn registered_command_matches(raw: &str, exe: &Path) -> bool {
     let raw = raw.trim();
     let (path, rest) = match raw.strip_prefix('"') {
@@ -465,10 +466,12 @@ pub trait ElevOps {
     /// [`ElevOps::pin_dir`] が返すもの。
     type Pinned: PinnedDirOps;
 
-    /// この exe の隣の `chronogazer-server.exe`（無ければ理由）。
+    /// この exe の隣の実在する通常ファイル `chronogazer-server.exe` を解決し、
+    /// 拡張長プレフィックスを外したパス（無い・解決不能・ディレクトリなら理由）。
+    /// 境界判定後も同じパスを登録・自動開始に渡す。
     fn server_executable(&self) -> Result<PathBuf, String>;
     /// マシンの Program Files と Program Files (x86)（取れたものだけ。1 つも無ければ
-    /// 隣の exe を使わずに止める）。
+    /// 隣の exe を使わずに止める）。実在ディレクトリをサーバーと同じ方式で正規化する。
     fn program_files_dirs(&self) -> Vec<PathBuf>;
     /// 登録されているサービスの実行のコマンドライン（SCM の生の文字列）。未登録なら
     /// `Ok(None)`。
