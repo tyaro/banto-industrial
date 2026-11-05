@@ -157,8 +157,8 @@
 ;   StartServiceIfStoppedAndWait で戻す（戻せなければ案内するだけ）。
 ;   自分で `Abort` する道のうち、P2 の再確認・P5 の残留エラーフラグ検出などは
 ;   先に再開を試み、(5)・POSTINSTALL の失敗などは戻さないときに "0" にする。
-;   ただし ResetChronoGazerInstallDirAcl の失敗は、その場で再開せずこのコールバックに
-;   依存する例外。NSIS 内部で中止する大半の `File` 失敗もここに依存する。
+;   ResetChronoGazerInstallDirAcl の失敗も主案内より先に再開を試みる。
+;   NSIS 内部で中止する大半の `File` 失敗など、まだ再開していない道はここに依存する。
 ;   silent でも呼ばれるが、UI では失敗の頁を閉じるまで呼ばれず、その間の再開は保証しない。
 ;
 ;   NSIS が呼ぶのは失敗の頁で [キャンセル]／閉じるを押したときだけなので、DetailPrint
@@ -291,7 +291,7 @@
 !define INSTALL_DIR_COMMON_PRODUCT "ChronoGazer"
 !define INSTALL_DIR_COMMON_DEFAULT_DIR "$PROGRAMFILES64\ChronoGazer"
 !define INSTALL_DIR_COMMON_SERVICE_NOUN "記録エンジン"
-!define INSTALL_DIR_COMMON_ACL_ABORT_NOTE "上書き前に止めた ChronoGazer サービスは戻します。"
+!define INSTALL_DIR_COMMON_ACL_ABORT_NOTE "上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。"
 !include "${BANTO_INSTALLER_COMMON_DIR}\install-dir-common.nsh"
 
 ; シェルの終了を待つ上限（秒）。`lifecycle::QUIT_FOR_UPDATE_WORST_CASE`（65 秒）
@@ -311,6 +311,9 @@ Var ChronoGazerWasRunning
 Var ChronoGazerShellWasQuit
 Var ShellQuitWaitCounter
 Var ServiceStopWaitCounter
+; 再開helperは $0/$1 とstackを変える。ACL診断の退避はPush/Popを使わない。
+Var ChronoGazerAclAbortCode
+Var ChronoGazerAclAbortTarget
 
 ; `chronogazer.exe` のプロセスが 1 つでもあれば $0 = "0"、無ければそれ以外。
 !macro CheckShellProcess
@@ -389,6 +392,17 @@ Var ServiceStopWaitCounter
   ${EndIf}
 !macroend
 
+; 共通ACL中止の任意コールバック。列挙ハンドルがある経路ではFindClose後に呼ばれ、
+; 主案内より前に再開を試みる。
+; reasonの終了コード $0 と対象 $4 を専用変数で保護する（nsExecの出力がstackに残り得る）。
+!macro INSTALL_DIR_COMMON_ON_ACL_ABORT
+  StrCpy $ChronoGazerAclAbortCode $0
+  StrCpy $ChronoGazerAclAbortTarget $4
+  !insertmacro RestartChronoGazerServiceOrWarn "インストール"
+  StrCpy $0 $ChronoGazerAclAbortCode
+  StrCpy $4 $ChronoGazerAclAbortTarget
+!macroend
+
 ; (5): サービス ChronoGazer が RUNNING か *_PENDING（START／STOP／PAUSE／CONTINUE）の
 ; ままなら止める（上の「PREINSTALL」(5)）。未登録・STOPPED なら素通り。
 ; 自分で止めた（$ChronoGazerWasRunning が "1"）のに 30 秒で止まり切らなかったときは、
@@ -465,9 +479,9 @@ Var ServiceStopWaitCounter
 
 ; インストール先の所有者・ACL の既定への戻しは Hub と共通の installer-common/
 ; install-dir-common.nsh の ResetInstallDirAcl（#973 PR-3a で #972 のここから移した。
-; 中身・文言は同じ。$0〜$5 を壊す）。テンプレートの当て直し（src/main.rs の P5）が
-; 挿入するこの名前はそのまま残す。中止の道の「止めたサービスを戻す」は .onInstFailed に
-; 任せる（INSTALL_DIR_COMMON_ON_ACL_ABORT は定義しない）。
+; 当初の抽出では中身・文言を維持。$0〜$5 を壊す）。テンプレートの当て直し（src/main.rs の P5）が
+; 挿入するこの名前はそのまま残す。中止時はINSTALL_DIR_COMMON_ON_ACL_ABORTで
+; 元の診断を保護して主案内より先に再開を試みる。後の.onInstFailedは二重再開しない。
 !macro ResetChronoGazerInstallDirAcl
   !insertmacro ResetInstallDirAcl
 !macroend
