@@ -764,13 +764,14 @@ Var RestoreSaved3
 ; `sc query` を開いたままのツールなど）がそのサービスのハンドルを持っていると、登録に
 ; 「削除の印」を付けて成功を返す。印付きの登録は `HKLM\SYSTEM\CurrentControlSet\
 ; Services\<名前>` に `DeleteFlag`=1 で残り、起動できず（1072）、ハンドルが全部閉じた
-; ときに消える。終了コードだけを見てファイルを消すと、登録が残ったまま ImagePath の
-; exe が消え、再インストールの `service-install` が印付きを「登録済み」として通して
-; 後からサービスだけ消える。そこで `DeleteFlag` を `ReadRegDWORD` で読む（キーごと
+; ときに消える。終了コードだけでファイルを消すと、保留登録が残ったまま ImagePath の
+; exe だけが消える。以前の `service-install` は印付きを「登録済み」として通したため、
+; 再インストール後にサービスだけ消えるおそれがあった。現在の共通 install は保留を
+; 拒否するが、ここでもファイル削除前に `DeleteFlag` を `ReadRegDWORD` で読む（キーごと
 ; 消えていればエラーフラグが立つ = 消えた。値が 1 なら保留。ImagePath の有無では、
 ; 消える前の一瞬の残りと保留を区別できないので DeleteFlag を使う）。
-; 保留なら**登録の戻しも再開も試みない**（戻しの `install`／`service-install` は
-; 「登録済み」で素通りし、`sc start` は 1072 で失敗する）: そのサービスの `flag_var` を
+; 保留なら**登録の戻しも再開も試みない**（現在の共通 `install`／`service-install` は
+; 削除保留を拒否し、`sc start` も 1072 で失敗する）: そのサービスの `flag_var` を
 ; "0" にし、`restore_sink` が 1（Hub の解除の後）なら先に解除した Sink の登録を
 ; RestoreBantoHubSinkServiceRegistration で戻し（結果は $3。Sink が保留のときは Hub を
 ; まだ解除していないので戻すものは無く、Hub だけ再開する）、止めたサービスを戻して

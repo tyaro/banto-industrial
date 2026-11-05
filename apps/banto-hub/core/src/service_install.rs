@@ -170,6 +170,16 @@ fn install_lines(
                 "{LABEL}: Service Control Manager への接続に失敗しました: {err}"
             ))];
         }
+        Err(InstallError::DeletePending) => {
+            return vec![ConsoleLine::Stderr(format!(
+                "{LABEL}: Windows サービス '{SERVICE_NAME}' の削除が保留中です。他のサービス管理ツールを閉じ、必要ならWindowsを再起動してから再実行してください"
+            ))];
+        }
+        Err(InstallError::CheckDeletion(err)) => {
+            return vec![ConsoleLine::Stderr(format!(
+                "{LABEL}: Windows サービス '{SERVICE_NAME}' の削除保留状態を確認できませんでした: {err}（登録が残っている可能性があります）"
+            ))];
+        }
         Err(InstallError::Create(err)) => {
             return vec![ConsoleLine::Stderr(format!(
                 "{LABEL}: サービスの登録に失敗しました: {err}"
@@ -417,5 +427,21 @@ mod tests {
                 err("banto-hub: サービスの削除に失敗しました: os error 1072"),
             ]
         );
+    }
+    #[test]
+    fn deletion_check_failures_never_report_install_success() {
+        for error in [
+            InstallError::DeletePending,
+            InstallError::CheckDeletion("read denied".into()),
+        ] {
+            let lines = install_lines(&exe(), &Err(error));
+            assert!(!lines.is_empty());
+            assert!(lines
+                .iter()
+                .all(|line| matches!(line, ConsoleLine::Stderr(_))));
+            assert!(lines
+                .iter()
+                .any(|line| matches!(line, ConsoleLine::Stderr(text) if text.contains("削除"))));
+        }
     }
 }
