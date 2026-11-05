@@ -128,7 +128,9 @@
 //!    `File` の直前に `ResetChronoGazerInstallDirAcl`（インストール先そのものと
 //!    直下の普通のファイルの所有者を Administrators にして ACL を既定へ戻す。
 //!    `icacls /T` は使わず、再解析ポイントやサブフォルダがあれば `Abort`。
-//!    失敗なら `Abort`）と `ClearErrors`、外部バイナリの `File` の直後にフックの
+//!    失敗なら `Abort`）の後、`RequireChronoGazerInstallExesUnlocked` で既存3 exe全ての
+//!    書込み可否を確認し、失敗なら再開を試みて案内・`Abort`。
+//!    その後 `ClearErrors`、外部バイナリの `File` の直後にフックの
 //!    `RequireChronoGazerFilesCopied`（resources 無しの現構成では、`File /a` の
 //!    属性設定等の残留エラーフラグを防御的に検出したときに、
 //!    止めたサービスの再開を案内・`Abort` より前に試みる。
@@ -293,6 +295,7 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
          \x20 ; 所有者と ACL を、ファイルを置く前に既定へ戻す（弱い ACL のフォルダに置かない）。\n\
          \x20 ; ClearErrors の前に置く（エラーフラグを乱さない）。\n\
          \x20 !insertmacro ResetChronoGazerInstallDirAcl\n\
+         \x20 !insertmacro RequireChronoGazerInstallExesUnlocked\n\
          \n\
          \x20 ; chronogazer-installer (#972 P5): File の失敗だけを見るため、直前で落とす。\n\
          \x20 ClearErrors\n\
@@ -818,7 +821,7 @@ mod tests {
     }
 
     /// 当て直した結果: P5 - `AllowSkipFiles off` が 1 つ、Section より前にある。
-    /// Section Install では再確認 → `ClearErrors` → main の `File` → 外部バイナリの
+    /// Section Install では再確認 → 全 exe の書込み可否確認 → `ClearErrors` → main の `File` → 外部バイナリの
     /// `File` → `RequireChronoGazerFilesCopied` → `WriteUninstaller` → POSTINSTALL
     /// の順。P6 - Section Uninstall では再確認 → `RequireChronoGazerExesUnlocked`
     /// → 解除 → main の `Delete` → 外部バイナリの `Delete` →
@@ -844,7 +847,12 @@ mod tests {
         let recheck = pos(body, "!insertmacro QuitShellForUpdate \"インストール\" 1 ");
         let clear = pos(body, "  ClearErrors\n");
         let acl = pos(body, "!insertmacro ResetChronoGazerInstallDirAcl");
-        assert!(recheck < acl && acl < clear);
+        let unlocked = pos(body, "!insertmacro RequireChronoGazerInstallExesUnlocked");
+        assert!(recheck < acl && acl < unlocked && unlocked < clear);
+        // 上書きの一部が始まる前に全 exe の検査を終える生成物の契約。
+        assert!(body[..unlocked]
+            .lines()
+            .all(|line| !line.trim_start().starts_with("File ")));
         let main_file = pos(body, "File \"${MAINBINARYSRCPATH}\"");
         let bin_file = pos(body, "File /a \"/oname={{this}}\"");
         let copied = pos(body, "!insertmacro RequireChronoGazerFilesCopied");

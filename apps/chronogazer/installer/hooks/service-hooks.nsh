@@ -485,7 +485,7 @@ Var ServiceStopWaitCounter
   ${EndIf}
 !macroend
 
-; 使用中の exe の確かめの 1 つ分（上の PREUNINSTALL の (a)）。あって読み書きで
+; 上書き前・PREUNINSTALL (a) で共用する exe 1本の確かめ。あって読み書きで
 ; 開けなければ $1 に名前を足す。`FileOpen ... a` は無いファイルを作るので、
 ; 先に有無を見る。開けたら中身を変えずに閉じる。$0 を壊す。
 !macro CheckChronoGazerExeUnlocked exe_name
@@ -501,6 +501,24 @@ Var ServiceStopWaitCounter
     ${Else}
       FileClose $0
     ${EndIf}
+  ${EndIf}
+!macroend
+
+; 上書き前: 既存の 3 exe 全てを確認し、書込み可能でなければ File 開始前に中止する。
+; 不存在は CheckChronoGazerExeUnlocked が飛ばす。確認後の競合やコピーの完全性は保証しない。
+; $0〜$2 を壊す。アンインストールの検査とは呼出位置・案内を分ける。
+!macro RequireChronoGazerInstallExesUnlocked
+  StrCpy $1 ""
+  !insertmacro CheckChronoGazerExeUnlocked "${CHRONOGAZER_SHELL_EXE}"
+  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-server.exe"
+  !insertmacro CheckChronoGazerExeUnlocked "chronogazer-elev.exe"
+  ${If} $1 != ""
+    ; 再開マクロが $0・$1 を壊すため、失敗名を先に退避する。
+    StrCpy $2 $1
+    DetailPrint "chronogazer: 使用中、または書き込めない実行ファイルがあります（$2）。上書きを始めず、停止したサービスの再開を試みてから中止します。"
+    !insertmacro RestartChronoGazerServiceOrWarn "インストール"
+    MessageBox MB_OK|MB_ICONSTOP "使用中、または書き込めない実行ファイルがあります（$2）。$\r$\n$\r$\n上書きはまだ始めていません。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\nデスクトップシェルとコンソール版の chronogazer-server.exe を終了してください。終了後も続く場合は書込み権限・属性を確認してから、このインストーラをもう一度実行してください。" /SD IDOK
+    Abort "書込み可能でない実行ファイルがあるため、上書き前にインストールを中止しました。"
   ${EndIf}
 !macroend
 
