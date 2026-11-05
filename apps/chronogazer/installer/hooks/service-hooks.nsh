@@ -480,7 +480,7 @@ Var ServiceStopWaitCounter
   ${If} ${Errors}
     DetailPrint "chronogazer: インストール時のエラーフラグを検出しました。上書き前に止めた ChronoGazer サービスの再開を試みてから、インストールを中止します。"
     !insertmacro RestartChronoGazerServiceOrWarn "インストール"
-    MessageBox MB_OK|MB_ICONSTOP "ファイル配置の結果を確認できませんでした。$\r$\n$\r$\n詳細ログを確認し、書込み権限とディスクの空き容量を確かめてから、このインストーラをもう一度実行してください。インストールは失敗として終えます。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。$\r$\n$\r$\nChronoGazer のデスクトップシェルとコンソール版の chronogazer-server.exe を終了してから、このインストーラをもう一度実行してください。" /SD IDOK
+    MessageBox MB_OK|MB_ICONSTOP "ファイル配置の結果を確認できませんでした。$\r$\n$\r$\n詳細ログを確認し、書込み権限とディスクの空き容量を確かめてから、このインストーラをもう一度実行してください。インストールは失敗として終えます。上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。" /SD IDOK
     Abort "インストール時のエラーを検出したため、失敗として終えました。"
   ${EndIf}
 !macroend
