@@ -154,14 +154,14 @@ fn install_lines(
             ));
         }
         Err(InstallError::DeletePending) => {
-            return vec![ConsoleLine::Stderr(format!(
+            return fail_lines(format!(
                 "{LABEL}: Windows サービス '{SERVICE_NAME}' の削除が保留中です。他のサービス管理ツールを閉じ、必要ならWindowsを再起動してから再実行してください"
-            ))];
+            ));
         }
         Err(InstallError::CheckDeletion(err)) => {
-            return vec![ConsoleLine::Stderr(format!(
+            return fail_lines(format!(
                 "{LABEL}: Windows サービス '{SERVICE_NAME}' の削除保留状態を確認できませんでした: {err}（登録が残っている可能性があります）"
-            ))];
+            ));
         }
         Err(InstallError::Create(err)) => {
             return fail_lines(format!("{LABEL}: サービスの登録に失敗しました: {err}"));
@@ -706,6 +706,10 @@ mod tests {
             assert!(lines
                 .iter()
                 .any(|line| matches!(line, ConsoleLine::Stderr(text) if text.contains("削除"))));
+            assert!(lines
+                .iter()
+                .any(|line| matches!(line, ConsoleLine::Stderr(text)
+                if text.contains("管理者権限の PowerShell"))));
         }
     }
 }
