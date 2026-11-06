@@ -9,6 +9,51 @@
 //! （run-id・sha）と `<root>\.banto-973-ci`・`binding.json`・自身の SHA-256 の束縛で
 //! 使い捨て runner の試験ビルドであることを確かめ、満たさなければ Running を報告せず終わる。
 
+use serde::{Deserialize, Serialize};
+
+/// `binding.json` の中身。未知キーは拒否し、重複キーは serde が `duplicate field` で拒否する。
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Binding {
+    run_id: String,
+    sha: String,
+    root: String,
+    exe_sha256: String,
+    service_name: String,
+    image_path: String,
+}
+
+/// `binding.json` と完全一致で比べる期待値。
+#[cfg_attr(not(windows), allow(dead_code))]
+struct Expected<'a> {
+    run_id: &'a str,
+    sha: &'a str,
+    root: &'a str,
+    exe_sha256: &'a str,
+    service_name: &'a str,
+    image_path: &'a str,
+}
+
+/// 型付きで解析し、トップレベルの各項目を完全一致で比べる（部分文字列では見ない）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn check_binding(text: &str, expected: &Expected) -> Result<(), String> {
+    let b: Binding = serde_json::from_str(text).map_err(|e| format!("binding.json parse: {e}"))?;
+    for (key, got, want) in [
+        ("run_id", &b.run_id, expected.run_id),
+        ("sha", &b.sha, expected.sha),
+        ("root", &b.root, expected.root),
+        ("exe_sha256", &b.exe_sha256, expected.exe_sha256),
+        ("service_name", &b.service_name, expected.service_name),
+        ("image_path", &b.image_path, expected.image_path),
+    ] {
+        if got != want {
+            return Err(format!("binding.json mismatch: {key}"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("running_dummy requires a disposable GitHub-hosted Windows runner");
@@ -25,6 +70,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows {
+    use super::{check_binding, Binding, Expected};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -242,16 +288,19 @@ mod windows {
             let exe_sha = sha256_file(&me)?;
             let binding = std::fs::read_to_string(dir.join("binding.json"))
                 .map_err(|e| format!("binding.json: {e}"))?;
-            for (key, value) in [
-                ("run_id", self.run_id.as_str()),
-                ("sha", self.sha.as_str()),
-                ("root", &root.display().to_string()),
-                ("exe_sha256", exe_sha.as_str()),
-            ] {
-                if !binding.contains(&format!("\"{key}\":{}", js(value))) {
-                    return Err(format!("binding.json mismatch: {key}"));
-                }
-            }
+            let root_text = root.display().to_string();
+            let image = image_path(&me, &self.run_id, &self.sha);
+            check_binding(
+                &binding,
+                &Expected {
+                    run_id: &self.run_id,
+                    sha: &self.sha,
+                    root: &root_text,
+                    exe_sha256: &exe_sha,
+                    service_name: SERVICE_NAME,
+                    image_path: &image,
+                },
+            )?;
             // 4. start_args[0] == サービス名。
             match ctx.start_args().first() {
                 Some(first) if first == SERVICE_NAME => {}
@@ -391,15 +440,17 @@ mod windows {
         let run_id = env("GITHUB_RUN_ID")?;
         let sha = env("BANTO_973_EXPECTED_SHA")?;
         let exe = within(&std::env::current_exe().map_err(|e| e.to_string())?, root)?;
-        let binding = format!(
-            "{{\"run_id\":{},\"sha\":{},\"root\":{},\"exe_sha256\":{},\"service_name\":{},\"image_path\":{}}}\n",
-            js(&run_id),
-            js(&sha),
-            js(&root.display().to_string()),
-            js(&sha256_file(&exe)?),
-            js(SERVICE_NAME),
-            js(&image_path(&exe, &run_id, &sha)),
-        );
+        let binding = serde_json::to_string(&Binding {
+            run_id: run_id.clone(),
+            sha: sha.clone(),
+            root: root.display().to_string(),
+            exe_sha256: sha256_file(&exe)?,
+            service_name: SERVICE_NAME.into(),
+            image_path: image_path(&exe, &run_id, &sha),
+        })
+        .map_err(|e| e.to_string())?
+            + "
+";
         // 登録より先に束縛を書く（run-service が起動時に読む）。
         std::fs::write(root.join("dummy").join("binding.json"), binding)
             .map_err(|e| format!("binding.json: {e}"))?;
@@ -434,5 +485,85 @@ mod windows {
             std::process::exit(1);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GOOD: &str = r#"{"run_id":"r1","sha":"s1","root":"C:/R","exe_sha256":"abc","service_name":"ChronoGazer","image_path":"\"x\" run-service"}"#;
+
+    fn exp() -> Expected<'static> {
+        Expected {
+            run_id: "r1",
+            sha: "s1",
+            root: "C:/R",
+            exe_sha256: "abc",
+            service_name: "ChronoGazer",
+            image_path: "\"x\" run-service",
+        }
+    }
+
+    #[test]
+    fn accepts_exact_binding() {
+        check_binding(GOOD, &exp()).unwrap();
+    }
+
+    #[test]
+    fn rejects_truncated_json() {
+        let cut = GOOD.find("\"abc\"").unwrap() + 5;
+        assert!(check_binding(&GOOD[..cut], &exp()).is_err());
+    }
+
+    #[test]
+    fn rejects_expected_only_in_nested_value() {
+        let t = r#"{"run_id":"r1","sha":"s1","root":"C:/R","exe_sha256":{"exe_sha256":"abc"},"service_name":"ChronoGazer","image_path":"\"x\" run-service"}"#;
+        assert!(check_binding(t, &exp()).is_err());
+    }
+
+    #[test]
+    fn rejects_missing_field() {
+        let t = GOOD.replace("\"sha\":\"s1\",", "");
+        assert!(check_binding(&t, &exp()).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_key() {
+        let t = GOOD.replace(
+            "{\"run_id\":\"r1\",",
+            "{\"run_id\":\"r1\",\"run_id\":\"r1\",",
+        );
+        let e = check_binding(&t, &exp()).unwrap_err();
+        assert!(e.contains("duplicate field"), "{e}");
+    }
+
+    #[test]
+    fn rejects_unknown_key() {
+        let t = GOOD.replace("{", "{\"extra\":\"1\",");
+        assert!(check_binding(&t, &exp()).is_err());
+    }
+
+    #[test]
+    fn rejects_each_mismatch() {
+        for (key, field) in [
+            ("run_id", "r1"),
+            ("sha", "s1"),
+            ("exe_sha256", "abc"),
+            ("service_name", "ChronoGazer"),
+        ] {
+            let t = GOOD.replace(
+                &format!("\"{key}\":\"{field}\""),
+                &format!("\"{key}\":\"zz\""),
+            );
+            let e = check_binding(&t, &exp()).unwrap_err();
+            assert!(e.contains(key), "{key}: {e}");
+        }
+        let t = GOOD.replace("C:/R", "C:/Z");
+        assert!(check_binding(&t, &exp()).unwrap_err().contains("root"));
+        let t = GOOD.replace("run-service", "run-other");
+        assert!(check_binding(&t, &exp())
+            .unwrap_err()
+            .contains("image_path"));
     }
 }
