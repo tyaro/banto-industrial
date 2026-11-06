@@ -15,6 +15,8 @@
 //! 自動開始に変えていても巻き戻さない）。揃えるのは OS シャットダウンの
 //! 待ち時間（PRESHUTDOWN、#589）だけで、読み戻して確かめる。揃えられなくても
 //! install は失敗にしない（[`crate::PreshutdownReport::Warning`]）。
+//! ただし削除保留・その判定不能は成功にしない。既設/作成済みの両方を
+//! DeleteFlagで設定処理の前後に確かめる（OS内部値依存、最終検査後の競合は残る）。
 //!
 //! 依存関係・回復の操作・遅延自動開始はここでは設定しない（新規の起動種別は
 //! 手動開始だけ。自動開始は [`crate::WindowsServiceManager::set_auto_start`]）。
@@ -73,11 +75,16 @@ pub struct InstallOutcome {
     pub preshutdown: PreshutdownReport,
 }
 
-/// [`install_service`] の失敗（何も登録していない）。中身は OS のエラーの文言。
+/// [`install_service`] の失敗。新規作成後の検査失敗では登録が残ることがある。
+/// 自動 rollback はしない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallError {
     /// SCM に接続できなかった（多くは権限不足）。
     Connect(String),
+    /// サービスの削除が保留中。成功扱いせず、他の管理ツールを閉じて再実行する。
+    DeletePending,
+    /// 削除保留かどうかを確かめられなかった。
+    CheckDeletion(String),
     /// サービスを作れなかった。
     Create(String),
 }
@@ -189,42 +196,173 @@ pub fn install_service(spec: &ServiceSpec) -> Result<InstallOutcome, InstallErro
     let manager = WinScm::local_computer(None::<&str>, manager_access)
         .map_err(|err| InstallError::Connect(err.to_string()))?;
 
-    // 開けたら「既に登録済み」。開けなかった理由は区別しない（権限エラーでも
-    // 未登録と同じく新規作成へ進む）- 移す前の Hub と sink の
-    // `open_service(..).is_ok()` と同じ判定。`CREATE_SERVICE` で接続できた
-    // （= 管理者）なら QUERY_CONFIG で開けないことは実際にはほぼ無く、その
-    // 場合も作成が「既に存在する」（1073）などで失敗して終了コード 1 になる。
-    if manager
-        .open_service(spec.name, ServiceAccess::QUERY_CONFIG)
-        .is_ok()
-    {
-        let preshutdown = preshutdown_report(&ensure_preshutdown_timeout(
-            spec.name,
-            spec.preshutdown_timeout,
-        ));
-        return Ok(InstallOutcome {
-            kind: InstallKind::AlreadyRegistered,
-            description_error: None,
-            preshutdown,
-        });
+    match manager.open_service(spec.name, ServiceAccess::QUERY_CONFIG) {
+        // handle は前後の検査と設定処理の完了まで保有する。
+        Ok(_existing) => finish_install(
+            InstallKind::AlreadyRegistered,
+            || deletion_registry::read(spec.name),
+            || {
+                Ok((
+                    None,
+                    preshutdown_report(&ensure_preshutdown_timeout(
+                        spec.name,
+                        spec.preshutdown_timeout,
+                    )),
+                ))
+            },
+        ),
+        Err(err) => {
+            if is_delete_pending_error(&err) {
+                return Err(InstallError::DeletePending);
+            }
+            // 既存の方針: それ以外の open 失敗は作成を試み、作成失敗を返す。
+            let service = manager
+                .create_service(&service_info(spec), ServiceAccess::CHANGE_CONFIG)
+                .map_err(|err| {
+                    if is_delete_pending_error(&err) {
+                        InstallError::DeletePending
+                    } else {
+                        InstallError::Create(err.to_string())
+                    }
+                })?;
+            finish_install(
+                InstallKind::Created,
+                || deletion_registry::read(spec.name),
+                || {
+                    let description_error = match spec
+                        .description
+                        .and_then(|description| service.set_description(description).err())
+                    {
+                        Some(err) if is_delete_pending_error(&err) => {
+                            return Err(InstallError::DeletePending)
+                        }
+                        other => other.map(|err| err.to_string()),
+                    };
+                    Ok((
+                        description_error,
+                        preshutdown_report(&ensure_preshutdown_timeout(
+                            spec.name,
+                            spec.preshutdown_timeout,
+                        )),
+                    ))
+                },
+            )
+        }
     }
+}
 
-    let service = manager
-        .create_service(&service_info(spec), ServiceAccess::CHANGE_CONFIG)
-        .map_err(|err| InstallError::Create(err.to_string()))?;
-    let description_error = spec
-        .description
-        .and_then(|description| service.set_description(description).err())
-        .map(|err| err.to_string());
-    let preshutdown = preshutdown_report(&ensure_preshutdown_timeout(
-        spec.name,
-        spec.preshutdown_timeout,
-    ));
+/// OS 内部の DeleteFlag に依存する前後検査。最終検査後の外部削除との競合は防がない。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn finish_install(
+    kind: InstallKind,
+    mut check: impl FnMut() -> Result<bool, String>,
+    configure: impl FnOnce() -> Result<(Option<String>, PreshutdownReport), InstallError>,
+) -> Result<InstallOutcome, InstallError> {
+    let mut require_not_pending = || match check() {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(InstallError::DeletePending),
+        Err(err) => Err(InstallError::CheckDeletion(err)),
+    };
+    require_not_pending()?;
+    let (description_error, preshutdown) = configure()?;
+    require_not_pending()?;
     Ok(InstallOutcome {
-        kind: InstallKind::Created,
+        kind,
         description_error,
         preshutdown,
     })
+}
+
+#[cfg(windows)]
+fn is_delete_pending_error(err: &windows_service::Error) -> bool {
+    matches!(err, windows_service::Error::Winapi(io) if io.raw_os_error() == Some(1072))
+}
+
+#[cfg(windows)]
+mod deletion_registry {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
+        REG_DWORD,
+    };
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
+    }
+    struct Key(HKEY);
+    impl Drop for Key {
+        fn drop(&mut self) {
+            // SAFETY: RegOpenKeyExWで開いたまだ閉じていないキー。
+            unsafe {
+                RegCloseKey(self.0);
+            }
+        }
+    }
+    pub(super) fn read(service: &str) -> Result<bool, String> {
+        read_in(
+            HKEY_LOCAL_MACHINE,
+            r"SYSTEM\CurrentControlSet\Services",
+            service,
+        )
+    }
+    pub(super) fn read_in(root: HKEY, base: &str, service: &str) -> Result<bool, String> {
+        if service.is_empty() || service.contains(['\\', '/', '\0']) {
+            return Err("サービス名が不正です".into());
+        }
+        let path = wide(&format!(r"{base}\{service}"));
+        let mut key = std::ptr::null_mut();
+        // SAFETY: NUL 終端入力と有効な出力。開くのは読取り権限だけ。
+        let status = unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "{service}: サービスキーを読めません: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+        let key = Key(key);
+        let mut kind = 0;
+        let mut value = 0u32;
+        let mut bytes = std::mem::size_of::<u32>() as u32;
+        // SAFETY: 値の出力先は bytes の大きさを持つ。型・サイズは使用前に検査する。
+        let status = unsafe {
+            RegQueryValueExW(
+                key.0,
+                wide("DeleteFlag").as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                &mut value as *mut u32 as *mut u8,
+                &mut bytes,
+            )
+        };
+        classify_value(status, kind, bytes, value).map_err(|err| format!("{service}: {err}"))
+    }
+    pub(super) fn classify_value(
+        status: u32,
+        kind: u32,
+        bytes: u32,
+        value: u32,
+    ) -> Result<bool, String> {
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(false);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(format!(
+                "DeleteFlag を読めません: {}",
+                std::io::Error::from_raw_os_error(status as i32)
+            ));
+        }
+        if kind != REG_DWORD || bytes != 4 {
+            return Err(format!(
+                "DeleteFlag の型またはサイズが不正です: type={kind}, bytes={bytes}"
+            ));
+        }
+        match value {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(format!("DeleteFlag が未知の値です: {value}")),
+        }
+    }
 }
 
 /// `ERROR_SERVICE_DOES_NOT_EXIST`。
@@ -318,6 +456,165 @@ pub fn query_service_command_line(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_checks_before_and_after_configuration_without_suppressing_warnings() {
+        use std::cell::Cell;
+        for kind in [InstallKind::Created, InstallKind::AlreadyRegistered] {
+            for (checks, configured, expected) in [
+                (vec![Ok(false), Ok(false)], true, Ok(())),
+                (vec![Ok(true)], false, Err(InstallError::DeletePending)),
+                (
+                    vec![Ok(false), Ok(true)],
+                    true,
+                    Err(InstallError::DeletePending),
+                ),
+                (
+                    vec![Err("before".into())],
+                    false,
+                    Err(InstallError::CheckDeletion("before".into())),
+                ),
+                (
+                    vec![Ok(false), Err("after".into())],
+                    true,
+                    Err(InstallError::CheckDeletion("after".into())),
+                ),
+            ] {
+                let called = Cell::new(false);
+                let mut checks = checks.into_iter();
+                let result = finish_install(
+                    kind,
+                    || checks.next().expect("unexpected check"),
+                    || {
+                        called.set(true);
+                        Ok((
+                            Some("description warning".into()),
+                            PreshutdownReport::Warning("ordinary configuration warning".into()),
+                        ))
+                    },
+                );
+                assert_eq!(called.get(), configured);
+                assert!(checks.next().is_none());
+                assert_eq!(result.as_ref().map(|_| ()).map_err(Clone::clone), expected);
+                if let Ok(outcome) = result {
+                    assert_eq!(outcome.kind, kind);
+                    assert!(matches!(outcome.preshutdown, PreshutdownReport::Warning(_)));
+                    assert_eq!(
+                        outcome.description_error.as_deref(),
+                        Some("description warning")
+                    );
+                }
+            }
+        }
+        let result = finish_install(
+            InstallKind::Created,
+            || Ok(false),
+            || Err(InstallError::DeletePending),
+        );
+        assert_eq!(result, Err(InstallError::DeletePending));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pending_is_classified_by_raw_os_number() {
+        for code in [5, 1060, 1072, 1073] {
+            let err = windows_service::Error::Winapi(std::io::Error::from_raw_os_error(code));
+            assert_eq!(is_delete_pending_error(&err), code == 1072);
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn deletion_registry_uses_only_its_temporary_hkcu_key() {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::Registry::*;
+        fn wide(s: &str) -> Vec<u16> {
+            std::ffi::OsStr::new(s).encode_wide().chain([0]).collect()
+        }
+        struct TestKey(HKEY);
+        impl Drop for TestKey {
+            fn drop(&mut self) {
+                // SAFETY: このfixtureが開いたキーを一度だけ閉じる。
+                unsafe {
+                    RegCloseKey(self.0);
+                }
+            }
+        }
+        struct Fixture(String);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                // SAFETY: uniqueなテスト専用HKCU subtreeだけを除去する。
+                unsafe {
+                    RegDeleteTreeW(HKEY_CURRENT_USER, wide(&self.0).as_ptr());
+                }
+            }
+        }
+        let base = format!(
+            r"Software\banto-service-control-test-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let fixture = Fixture(base);
+        let mut key = std::ptr::null_mut();
+        let path = wide(&format!(r"{}\Test", fixture.0));
+        // SAFETY: HKCUのunique専用パス、NUL終端入力と有効な出力。
+        assert_eq!(
+            unsafe { RegCreateKeyW(HKEY_CURRENT_USER, path.as_ptr(), &mut key) },
+            0
+        );
+        let key = TestKey(key);
+        let name = wide("DeleteFlag");
+        assert_eq!(
+            deletion_registry::read_in(HKEY_CURRENT_USER, &fixture.0, "Test"),
+            Ok(false)
+        );
+        for (value, expected) in [(0u32, Ok(false)), (1, Ok(true)), (2, Err(()))] {
+            // SAFETY: fixtureキーへ4bytesのDWORDだけを書く。
+            assert_eq!(
+                unsafe {
+                    RegSetValueExW(
+                        key.0,
+                        name.as_ptr(),
+                        0,
+                        REG_DWORD,
+                        &value as *const u32 as *const u8,
+                        4,
+                    )
+                },
+                0
+            );
+            assert_eq!(
+                deletion_registry::read_in(HKEY_CURRENT_USER, &fixture.0, "Test").map_err(|_| ()),
+                expected
+            );
+        }
+        let text = wide("1");
+        // SAFETY: fixtureキーへNUL終端文字列だけを書く（型不一致fixture）。
+        assert_eq!(
+            unsafe {
+                RegSetValueExW(
+                    key.0,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    text.as_ptr() as *const u8,
+                    (text.len() * 2) as u32,
+                )
+            },
+            0
+        );
+        assert!(deletion_registry::read_in(HKEY_CURRENT_USER, &fixture.0, "Test").is_err());
+        drop(key);
+        assert!(deletion_registry::read_in(HKEY_CURRENT_USER, &fixture.0, "missing").is_err());
+        for name in ["", "a/b", r"a\b", "a\0b"] {
+            assert!(deletion_registry::read_in(HKEY_CURRENT_USER, &fixture.0, name).is_err());
+        }
+        assert!(deletion_registry::classify_value(5, REG_DWORD, 4, 0).is_err());
+        assert!(deletion_registry::classify_value(0, REG_DWORD, 3, 0).is_err());
+    }
 
     #[test]
     fn only_the_os_number_1060_means_not_installed() {

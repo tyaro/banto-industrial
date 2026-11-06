@@ -188,7 +188,7 @@ const REQUIRED_BINARY_NAMES: [&str; 4] = [
 /// ワークスペース外にあるため `version.workspace = true` が使えず、
 /// 手動で追従させる必要がある - バージョンを上げたら、ここも合わせて
 /// 更新すること。
-const PRODUCT_VERSION: &str = "0.3.0-alpha.1";
+const PRODUCT_VERSION: &str = "0.3.0-alpha.2";
 
 /// [`VENDORED_TEMPLATE`] に当てる置き換え（`(名前, 土台, 置き換え後)`、モジュール doc
 /// 「NSIS テンプレートの当て直し」）。土台は写しの中に**ちょうど 1 回**現れる文字列で
