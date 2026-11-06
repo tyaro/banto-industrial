@@ -82,8 +82,7 @@ CI自動実行ではない。ReadReg/Exec/サービス操作はstub、Apps登録
 
 専用の `installer-delete-pending.yml` を追加した。GitHub-hosted Windows/admin tokenと
 明示試験env、fresh RUNNER_TEMPのmarkerを必須とし、このPC・self-hostedでは実行しない。
-ローカルではコンパイルと純テストだけ。実行結果の正は#973とActionsのrun/artifactであり、
-この追加時点ではremote未実行として準備している。
+ローカルではコンパイルと純テストだけ。実行結果の正は#973とActionsのrun/artifactである。
 
 production登録/解除でUUID付きstopped dummyのCreated→既設→実削除保留の登録拒否→
 handle解放後の再登録を確認する。さらにChronoGazer専用dummyと実hooksのuser/silent

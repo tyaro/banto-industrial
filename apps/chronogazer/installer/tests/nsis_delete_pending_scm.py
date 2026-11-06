@@ -385,16 +385,16 @@ def nsis_words(line):
 
 
 def reject_relative_jumps(line):
-    if not re.match(r'^(?:Goto|Call|IntCmp\w*|StrCmp\w*|IfErrors|IfFileExists|MessageBox|'
-                    r'IfSilent|IfAbort|IfRebootFlag|IfShellVarContextAll|IsWindow|GetLabelAddress)\b', line, re.I):
+    if not re.match(r'^(?:Goto|Call|IntCmp\w*|IntPtrCmp\w*|StrCmp\w*|IfErrors|IfFileExists|MessageBox|'
+                    r'IfSilent|IfAbort|IfRebootFlag|IfShellVarContextAll|IfAltRegView|IfRtlLanguage|IsWindow|GetLabelAddress)\b', line, re.I):
         return
     words = nsis_words(line)
     if not words:
         return
     instruction, args = words[0].lower(), words[1:]
-    if instruction in ('goto', 'call', 'iferrors', 'ifsilent', 'ifabort', 'ifrebootflag', 'ifshellvarcontextall'):
+    if instruction in ('goto', 'call', 'iferrors', 'ifsilent', 'ifabort', 'ifrebootflag', 'ifshellvarcontextall', 'ifaltregview', 'ifrtllanguage'):
         targets = args
-    elif instruction.startswith(('intcmp', 'strcmp')):
+    elif instruction.startswith(('intcmp', 'intptrcmp', 'strcmp')):
         targets = args[2:]  # Values may legitimately be signed integers.
     elif instruction in ('iffileexists', 'iswindow', 'getlabeladdress'):
         targets = args[1:]
