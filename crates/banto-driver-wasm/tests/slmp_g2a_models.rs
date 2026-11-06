@@ -365,7 +365,7 @@ fn sorted(mut frames: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
 }
 
 fn memory() -> Vec<(u8, u32, u16)> {
-    vec![(D, 100, 7), (ZR, 0x10, 0x2222), (W, 0x100, 0x3333)]
+    vec![(D, 100, 7), (ZR, 10, 0x2222), (W, 0x100, 0x3333)]
 }
 
 /// Connects as `name`/`code`, reads the common tag set once and returns the
@@ -427,7 +427,7 @@ async fn qnph_is_a_standard_non_u_q() {
             batch,
             sorted(vec![
                 plain_frame(D, 100, 1),
-                plain_frame(ZR, 0x10, 1),
+                plain_frame(ZR, 10, 1),
                 ug_frame(0xff, 7, 1),
             ]),
             "{name}: exactly D, ZR and UFF\\G are sent"
@@ -538,7 +538,7 @@ async fn melsec_l_is_treated_like_a_standard_q() {
         assert_eq!(peer.all(), q_peer.all(), "{name}: same requests as Q06H");
         assert_eq!(peer.sd(), vec![(302, 2)], "{name}: no SD310-311");
         assert_eq!(peer.ext(), vec![ug_frame(0xff, 7, 1)], "{name}");
-        assert!(peer.plain().contains(&(ZR, 0x10, 1)), "{name}");
+        assert!(peer.plain().contains(&(ZR, 10, 1)), "{name}");
     }
 
     // The write gate: no proof of the D span on a standard Q, so refused.

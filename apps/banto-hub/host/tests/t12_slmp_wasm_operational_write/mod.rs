@@ -290,11 +290,12 @@ impl Fixture {
                                             && end <= 65539)
                                         || (device == 0x93 && matches!(peer, Peer::R) && end <= 3)
                                         // Unknown-range read-only devices (new-guest tests only):
-                                        // S10, Z3, RD7 and ZR10, one tag per request.
+                                        // S10, Z3, RD7 and ZR10 (decimal since guest #71),
+                                        // one tag per request.
                                         || (device == 0x98 && (start, end) == (10, 11))
                                         || (device == 0xcc && (start, end) == (3, 4))
                                         || (device == 0x2c && (start, end) == (7, 8))
-                                        || (device == 0xb0 && (start, end) == (0x10, 0x11)))
+                                        || (device == 0xb0 && (start, end) == (10, 11)))
                             );
                             if matches!(device, 0x90 | 0x9c | 0xa1 | 0x93 | 0xa0 | 0x98) {
                                 assert_eq!(subcommand, if is_r { 3 } else { 1 });
@@ -1652,7 +1653,8 @@ async fn new_guest_w_word_bit_is_read_from_one_w_word_and_outside_is_never_sent(
 /// with range `Unknown`. The Hub therefore never gates them on a count: each tag
 /// is one explicit single-point 0401 request, and no write ever reaches the PLC
 /// even when the write policy is enabled for D. LZ needs 0403 and is refused at
-/// the address; RD is R-only; Q25PRH has no ZR path.
+/// the address; RD is R-only; Q25PRH has no ZR path. ZR numbers are decimal
+/// (guest #71): ZR10 is device 10 and ZR1A is refused at the address.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #58 component"]
 async fn new_guest_s_z_rd_zr_are_read_only_unknown_range_reads() {
@@ -1666,7 +1668,7 @@ async fn new_guest_s_z_rd_zr_are_read_only_unknown_range_reads() {
                 ("RD7", DataType::U16),
                 ("ZR10", DataType::U16),
             ],
-            vec![(0x98, 10), (0xcc, 3), (0x2c, 7), (0xb0, 0x10)],
+            vec![(0x98, 10), (0xcc, 3), (0x2c, 7), (0xb0, 10)],
         ),
         (
             Peer::StandardQ,
@@ -1675,7 +1677,7 @@ async fn new_guest_s_z_rd_zr_are_read_only_unknown_range_reads() {
                 ("Z3", DataType::U16),
                 ("ZR10", DataType::U16),
             ],
-            vec![(0x98, 10), (0xcc, 3), (0xb0, 0x10)],
+            vec![(0x98, 10), (0xcc, 3), (0xb0, 10)],
         ),
     ];
     for (peer, tags, wire) in cases {
@@ -1732,11 +1734,12 @@ async fn new_guest_s_z_rd_zr_are_read_only_unknown_range_reads() {
         session.disconnect().await;
     }
 
-    // LZ is refused at the address on every model; RD only exists on R; Q25PRH
-    // has no ZR path. None of them sends a read frame.
+    // LZ and a hexadecimal ZR (ZR1A) are refused at the address on every
+    // model; RD only exists on R; Q25PRH has no ZR path. None of them sends a
+    // read frame.
     let (fixture, driver, mut session) = connect_new_guest(Peer::R).await;
     let word = TagKind::numeric(DataType::U32);
-    for address in ["LZ0", "LZ1"] {
+    for address in ["LZ0", "LZ1", "ZR1A"] {
         assert!(driver.parse_address(address, &word).is_err(), "{address}");
     }
     session.disconnect().await;
@@ -4511,7 +4514,7 @@ impl UnitBufferPeer {
     }
 
     /// `model` is the 0101 (name, code) answer. On a Q peer SD310-311 answers
-    /// 8000; ZR reads answer 0x2222 and W reads 0x3333 per word.
+    /// 8000; ZR reads (any number) answer 0x2222 and W reads 0x3333 per word.
     async fn start_as(
         r: bool,
         model: (&'static str, u16),
@@ -5257,7 +5260,7 @@ async fn new_guest_saved_melsec_l_tags_are_read_like_a_standard_q() {
     .await;
     assert_eq!(record.sd, vec![(302, 2)], "no SD310-311 on MELSEC-L");
     assert_eq!(record.ext, vec![unit_buffer_frame(false, 0xff, 7, 1)]);
-    assert_eq!(record.plain, vec![(0xa8, 100, 1), (0xb0, 0x10, 1)]);
+    assert_eq!(record.plain, vec![(0xa8, 100, 1), (0xb0, 10, 1)]);
 }
 
 /// QnUDPV (Q26UDPVCPU/036CH) reads exactly like QnUDV (Q26UDVCPU/036CH): the
