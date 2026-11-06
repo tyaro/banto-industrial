@@ -752,8 +752,12 @@ jobs:
           # is read and written over 3E to the own station only (4E or another
           # station is treated like an unknown model), with monitoring timer
           # 0000H after 0101, and adds the read-only file register R (FX5
-          # only). WIT and Hub are unchanged.
-          $newSlmpSha = 'aa3a1c17d52d13614b17f80e85c90fece79985a1'
+          # only). WIT and Hub are unchanged. #74 (G3) reads GX Works3 global
+          # labels (@Name, area @, no index) with 041C and writes them with a
+          # 041C type check and one 141B on standard R only, under the new
+          # label_write_allowlist (Hub gate: same grammar in banto-driver-wasm,
+          # string area @). WIT is unchanged.
+          $newSlmpSha = 'fc0bd1052015251d9833d89def71e514594960fc'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -832,10 +836,19 @@ jobs:
           if (-not (Select-String -Path $slmpG2cLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP G2c component tests did not all run'
           }
+          # Component-level G3 (labels read by one 041C byte for byte incl. a
+          # UTF-16 non-ASCII name, per-item type mismatch, 041C check + 141B
+          # write, Hub label gate sends nothing, standard Q sends no label).
+          $slmpG3Log = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g3-labels-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_g3_labels --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpG3Log
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP G3 component tests failed' }
+          if (-not (Select-String -Path $slmpG3Log -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP G3 component tests did not all run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 54 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 57 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.

@@ -5990,3 +5990,761 @@ async fn new_guest_fx5_3e_d_write_is_one_1401_and_r_is_never_written() {
         "{requests:02x?}"
     );
 }
+
+/// One label request the peer saw: (command 041C or 141B, the label names).
+type LabelRequest = (u16, Vec<String>);
+
+/// Loopback TCP SLMP peer for guest #74 (G3, GX Works3 global labels): a PLC
+/// answering 0101 with `model` and following the frame it receives (3E or 4E).
+/// It answers the iQ-R handshake (SD280-283) and the Q one (SD302-303),
+/// D100 = 7, and 041C/141B for its labels: `タンク1.水位` u16 (ID 2) 1234,
+/// `Tank1.Level` f32 (ID 6) 2.5, `Arr[3]` bit (ID 1) on, `Name` string (ID 9)
+/// "ABC" in 8 bytes and `Word` i16 (ID 4) -1. A 041C naming another label is
+/// refused as a whole with 40C0H. It records every label request (command and
+/// names), every whole 141B, the plain device reads and the commands.
+struct LabelPeer {
+    address: std::net::SocketAddr,
+    labels: Arc<Mutex<Vec<LabelRequest>>>,
+    writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    plain: Arc<Mutex<Vec<(u8, u32, u16)>>>,
+    commands: Arc<Mutex<Vec<u16>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// The label names of a 041C/141B body after the subcommand.
+fn label_request_names(data: &[u8], with_data: bool) -> Vec<String> {
+    let count = usize::from(u16::from_le_bytes([data[0], data[1]]));
+    let mut at = 4;
+    let mut names = Vec::new();
+    for _ in 0..count {
+        let units = usize::from(u16::from_le_bytes([data[at], data[at + 1]]));
+        at += 2;
+        let name: Vec<u16> = (0..units)
+            .map(|i| u16::from_le_bytes([data[at + 2 * i], data[at + 2 * i + 1]]))
+            .collect();
+        at += 2 * units;
+        names.push(String::from_utf16(&name).unwrap());
+        if with_data {
+            at += 2 + usize::from(u16::from_le_bytes([data[at], data[at + 1]]));
+        }
+    }
+    assert_eq!(at, data.len(), "whole label request consumed");
+    names
+}
+
+impl LabelPeer {
+    async fn start(model: (&'static str, u16)) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let labels = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let plain = Arc::new(Mutex::new(Vec::new()));
+        let commands = Arc::new(Mutex::new(Vec::new()));
+        let memory: std::collections::BTreeMap<&str, (u8, Vec<u8>)> = [
+            ("タンク1.水位", (2u8, 1234u16.to_le_bytes().to_vec())),
+            ("Tank1.Level", (6, 2.5f32.to_le_bytes().to_vec())),
+            ("Arr[3]", (1, vec![1, 0])),
+            ("Name", (9, b"ABC\0\0\0\0\0".to_vec())),
+            ("Word", (4, (-1i16).to_le_bytes().to_vec())),
+        ]
+        .into_iter()
+        .collect();
+        let task = {
+            let (labels, writes, plain, commands) = (
+                labels.clone(),
+                writes.clone(),
+                plain.clone(),
+                commands.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    loop {
+                        let mut sub_header = [0u8; 2];
+                        if socket.read_exact(&mut sub_header).await.is_err() {
+                            break;
+                        }
+                        let three_e = match sub_header {
+                            [0x50, 0x00] => true,
+                            [0x54, 0x00] => false,
+                            other => panic!("unexpected sub-header {other:02x?}"),
+                        };
+                        let head_len = if three_e { 9 } else { 13 };
+                        let mut request = sub_header.to_vec();
+                        request.resize(head_len, 0);
+                        if socket.read_exact(&mut request[2..]).await.is_err() {
+                            break;
+                        }
+                        let length = usize::from(u16::from_le_bytes([
+                            request[head_len - 2],
+                            request[head_len - 1],
+                        ]));
+                        request.resize(head_len + length, 0);
+                        if socket.read_exact(&mut request[head_len..]).await.is_err() {
+                            break;
+                        }
+                        let command =
+                            u16::from_le_bytes([request[head_len + 2], request[head_len + 3]]);
+                        let sub =
+                            u16::from_le_bytes([request[head_len + 4], request[head_len + 5]]);
+                        let data = &request[head_len + 6..];
+                        commands.lock().unwrap().push(command);
+                        let (end_code, body): (u16, Vec<u8>) = match command {
+                            0x0101 => {
+                                let (name, code) = model;
+                                let mut body = vec![b' '; 18];
+                                body[..name.len()].copy_from_slice(name.as_bytes());
+                                body[16..18].copy_from_slice(&code.to_le_bytes());
+                                (0, body)
+                            }
+                            0x041c => {
+                                assert_eq!(sub, 0, "041C subcommand 0000");
+                                let names = label_request_names(data, false);
+                                labels.lock().unwrap().push((command, names.clone()));
+                                let mut body =
+                                    u16::try_from(names.len()).unwrap().to_le_bytes().to_vec();
+                                let mut end_code = 0;
+                                for name in &names {
+                                    let Some((type_id, value)) = memory.get(name.as_str()) else {
+                                        end_code = 0x40c0;
+                                        break;
+                                    };
+                                    body.extend_from_slice(&[*type_id, 0]);
+                                    body.extend_from_slice(
+                                        &u16::try_from(value.len()).unwrap().to_le_bytes(),
+                                    );
+                                    body.extend_from_slice(value);
+                                }
+                                if end_code == 0 {
+                                    (0, body)
+                                } else {
+                                    (end_code, Vec::new())
+                                }
+                            }
+                            0x141b => {
+                                assert_eq!(sub, 0, "141B subcommand 0000");
+                                let names = label_request_names(data, true);
+                                labels.lock().unwrap().push((command, names));
+                                writes.lock().unwrap().push(request.clone());
+                                (0, Vec::new())
+                            }
+                            0x0401 => {
+                                let (start, device, points) = match sub {
+                                    0 => (
+                                        u32::from_le_bytes([data[0], data[1], data[2], 0]),
+                                        data[3],
+                                        u16::from_le_bytes([data[4], data[5]]),
+                                    ),
+                                    2 => (
+                                        u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+                                        data[4],
+                                        u16::from_le_bytes([data[6], data[7]]),
+                                    ),
+                                    other => panic!("unexpected subcommand {other:#x}"),
+                                };
+                                match (device, start, points) {
+                                    (0xa9, 280, 4) => {
+                                        let mut body = 8000u32.to_le_bytes().to_vec();
+                                        body.extend_from_slice(&0x200u32.to_le_bytes());
+                                        (0, body)
+                                    }
+                                    (0xa9, 302, 2) => {
+                                        let mut body = 4000u16.to_le_bytes().to_vec();
+                                        body.extend_from_slice(&64u16.to_le_bytes());
+                                        (0, body)
+                                    }
+                                    (0xa9, ..) => (0xc051, Vec::new()),
+                                    (0xa8, ..) => {
+                                        plain.lock().unwrap().push((device, start, points));
+                                        (
+                                            0,
+                                            (0..u32::from(points))
+                                                .flat_map(|at| {
+                                                    if start + at == 100 { 7u16 } else { 0 }
+                                                        .to_le_bytes()
+                                                })
+                                                .collect(),
+                                        )
+                                    }
+                                    _ => (0xc051, Vec::new()),
+                                }
+                            }
+                            other => panic!("unexpected command {other:#x}"),
+                        };
+                        let mut response = if three_e {
+                            let mut head = vec![0xd0, 0];
+                            head.extend_from_slice(&request[2..7]);
+                            head
+                        } else {
+                            let mut head = vec![0xd4, 0, request[2], request[3], 0, 0];
+                            head.extend_from_slice(&request[6..11]);
+                            head
+                        };
+                        response.extend_from_slice(
+                            &u16::try_from(body.len() + 2).unwrap().to_le_bytes(),
+                        );
+                        response.extend_from_slice(&end_code.to_le_bytes());
+                        response.extend_from_slice(&body);
+                        if socket.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            address,
+            labels,
+            writes,
+            plain,
+            commands,
+            task,
+        }
+    }
+
+    fn labels(&self) -> Vec<LabelRequest> {
+        self.labels.lock().unwrap().clone()
+    }
+
+    fn writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().unwrap().clone()
+    }
+
+    fn commands(&self) -> Vec<u16> {
+        self.commands.lock().unwrap().clone()
+    }
+}
+
+impl Drop for LabelPeer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A saved connection `line` to `peer` with `settings` (besides host and
+/// port) and one collection group `group` of `interval_ms`, started after the
+/// tags are registered over REST: `(name, address, dataType, stringLength,
+/// writable)`. Returns the app, the connection id and the tag ids.
+async fn label_app(
+    label: &str,
+    peer: &LabelPeer,
+    settings: serde_json::Value,
+    interval_ms: i64,
+    tags: &[(&str, &str, &str, Option<i64>, bool)],
+) -> (super::TestApp, i64, Vec<i64>) {
+    let mut connection_settings = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": peer.address.port(),
+    });
+    for (key, value) in settings.as_object().unwrap() {
+        connection_settings[key] = value.clone();
+    }
+    let app =
+        super::test_app_with_operational_write_manifest(label, MANIFEST, &new_guest_component())
+            .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: connection_settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, interval_ms))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (name, address, data_type, length, writable) in tags {
+        let mut body = serde_json::json!({
+            "name": name, "collectionGroupId": group.id, "address": address,
+            "dataType": data_type, "enabled": true, "writable": writable
+        });
+        if let Some(length) = length {
+            body["stringLength"] = serde_json::json!(length);
+        }
+        let (status, body) =
+            super::admin_write(&app.router, "POST", "/api/tags", &app.admin_token, body).await;
+        assert_eq!(status, super::StatusCode::OK, "{address}: {body:?}");
+        // The label is saved exactly as the guest's canonical text.
+        ids.push(body["id"].as_i64().unwrap());
+    }
+    app.commit_and_start().await;
+    (app, saved.id, ids)
+}
+
+/// Guest #74 (G3) through the real Hub path on a standard iQ-R (R08CPU, 4E):
+/// label tags registered over REST (a non-ASCII name, an f32, a bit, a string,
+/// one whose PLC type differs) sit beside a D tag. `parse-addresses` reports
+/// area `@` with no index (the registration screen's overlap check then only
+/// compares the canonical text). The periodic collection reads every
+/// non-string label of the group with one 041C per cycle (string tags are
+/// read-now only, as for D/W): the matching ones are Good and they and the
+/// string label answer read-now with their values, the mismatched `@Word` (an i16 label read as
+/// u16) stays Bad and its read-now fails, and D100 is Good. No 141B is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #74 component"]
+async fn new_guest_saved_label_tags_are_collected_and_read_now_on_standard_r() {
+    let peer = LabelPeer::start(("R08CPU", 0x4801)).await;
+    let tags = [
+        (
+            "level",
+            "@タンク1.水位",
+            "u16",
+            None,
+            Some(serde_json::json!(1234.0)),
+        ),
+        (
+            "tank",
+            "@Tank1.Level",
+            "f32",
+            None,
+            Some(serde_json::json!(2.5)),
+        ),
+        (
+            "arr3",
+            "@Arr[03]",
+            "bit",
+            None,
+            Some(serde_json::json!(true)),
+        ),
+        (
+            "name",
+            "@Name",
+            "string",
+            Some(4),
+            Some(serde_json::json!("ABC")),
+        ),
+        ("word", "@Word", "u16", None, None),
+        ("d100", "D100", "u16", None, Some(serde_json::json!(7.0))),
+    ];
+    let (app, connection_id, ids) = label_app(
+        "t12-new-guest-labels-read",
+        &peer,
+        serde_json::json!({}),
+        100,
+        &tags
+            .iter()
+            .map(|(name, address, data_type, length, _)| {
+                (*name, *address, *data_type, *length, false)
+            })
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    // Saved as the guest's canonical text (`@Arr[03]` -> `@Arr[3]`), the
+    // non-ASCII name unchanged.
+    assert_eq!(
+        app.manager.tags().get(ids[0]).await.unwrap().address,
+        "@タンク1.水位"
+    );
+    assert_eq!(
+        app.manager.tags().get(ids[2]).await.unwrap().address,
+        "@Arr[3]"
+    );
+    let (status, parsed) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/tags/parse-addresses",
+        &app.admin_token,
+        serde_json::json!({
+            "connectionId": connection_id,
+            "items": [
+                {"tagKind": "plc", "address": "@タンク1.水位", "dataType": "u16"},
+                {"tagKind": "plc", "address": "@Name", "dataType": "string", "stringLength": 4},
+                {"tagKind": "plc", "address": "@Arr[01]", "dataType": "f64"},
+            ]
+        }),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{parsed:?}");
+    for (item, canonical, words) in parsed["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([("@タンク1.水位", 1), ("@Name", 4), ("@Arr[1]", 4)])
+        .map(|(item, (canonical, words))| (item, canonical, words))
+    {
+        assert_eq!(item["ok"], true, "{item:?}");
+        assert_eq!(item["canonical"], canonical, "{item:?}");
+        assert_eq!(item["area"], "@", "{item:?}");
+        assert_eq!(item["index"], serde_json::Value::Null, "{item:?}");
+        assert_eq!(item["writableArea"], true, "{item:?}");
+        assert_eq!(item["wordCount"], words, "{item:?}");
+    }
+
+    let mut status = app.sessions.status_watch(connection_id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // The periodic collection skips string tags (read-now only, as for
+            // D/W strings), so `@Name` is not awaited here.
+            if tags.iter().zip(&ids).all(|(tag, &id)| {
+                tag.2 == "string"
+                    || sample_of(id)
+                        .is_some_and(|s| (s.quality == Quality::Good) == tag.4.is_some())
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "labels are collected Good, the mismatched one Bad: {:?} {:?}",
+            ids.iter()
+                .map(|&id| sample_of(id).map(|s| s.quality))
+                .collect::<Vec<_>>(),
+            peer.labels()
+        )
+    });
+    for ((name, address, _, _, value), &id) in tags.iter().zip(&ids) {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        match value {
+            Some(value) => {
+                assert_eq!(status, super::StatusCode::OK, "{address}: {body:?}");
+                assert_eq!(body["v"], *value, "{address}: {body:?}");
+                assert_eq!(body["q"], "good", "{address}: {body:?}");
+            }
+            None => {
+                assert!(
+                    !status.is_success(),
+                    "{address} read-now: {status} {body:?}"
+                );
+                assert_ne!(
+                    sample_of(id).map(|s| s.quality),
+                    Some(Quality::Good),
+                    "{address}"
+                );
+            }
+        }
+    }
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+    let labels = peer.labels();
+    assert!(!labels.is_empty());
+    let mut every_label = vec!["タンク1.水位", "Tank1.Level", "Arr[3]", "Word"];
+    every_label.sort_unstable();
+    let mut cycles = 0;
+    for (command, names) in &labels {
+        assert_eq!(*command, 0x041c, "only 041C: {labels:?}");
+        let mut sorted: Vec<&str> = names.iter().map(String::as_str).collect();
+        sorted.sort_unstable();
+        if sorted == every_label {
+            cycles += 1;
+        } else {
+            // read-now asks one label at a time.
+            assert_eq!(names.len(), 1, "{labels:?}");
+        }
+    }
+    assert!(
+        cycles >= 1,
+        "a collection cycle reads every label in one 041C"
+    );
+    assert!(peer.writes().is_empty(), "no 141B");
+    assert!(!peer.commands().contains(&0x1401), "no 1401");
+    assert!(peer
+        .plain
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|&(device, start, _)| (device, start) == (0xa8, 100)));
+}
+
+/// Guest #74 (G3) through the Hub's REST write gate on a standard iQ-R with
+/// only `label_write_allowlist` set (the D/W list is empty, the mode enabled):
+/// an allowed label (a non-ASCII label, under a non-ASCII tag name) is one
+/// 041C type check and one 141B; a label outside the list and a writable label
+/// on a connection without it never reach the PLC; a label whose PLC type
+/// differs from the tag gets the 041C check only and no 141B. The audit rows
+/// carry the non-ASCII tag name and each outcome.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #74 component"]
+async fn new_guest_rest_label_write_is_one_041c_and_one_141b_and_outside_is_never_sent() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let peer = LabelPeer::start(("R08CPU", 0x4801)).await;
+    let (app, connection_id, ids) = label_app(
+        "t12-new-guest-labels-write",
+        &peer,
+        serde_json::json!({
+            "d_u16_write_mode": "enabled",
+            "label_write_allowlist": "@タンク1.水位;@Tank1.Level;@Word;@Arr[0-2]"
+        }),
+        500,
+        &[
+            ("水位", "@タンク1.水位", "u16", None, true),
+            ("tank", "@Tank1.Level", "f32", None, true),
+            ("arr3", "@Arr[3]", "bit", None, true),
+            ("word", "@Word", "u16", None, true),
+        ],
+    )
+    .await;
+    // The collection cycle reads all four labels in one 041C; the writes
+    // below are told apart by their own label requests.
+    let write_requests = |from: usize| -> Vec<LabelRequest> {
+        peer.labels()[from..]
+            .iter()
+            .filter(|(command, names)| !(*command == 0x041c && names.len() == 4))
+            .cloned()
+            .collect()
+    };
+    let mut status = app.sessions.status_watch(connection_id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    // Let the first collection cycle run before the writes are counted.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !peer
+            .labels()
+            .iter()
+            .any(|(command, names)| *command == 0x041c && names.len() == 4)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the first collection cycle");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let names = ["水位", "tank", "arr3", "word"].map(|name| format!("line.group.{name}"));
+    let issued = api_keys
+        .issue(
+            "label-loopback-writer",
+            names.iter().map(|tag| format!("write:{tag}")).collect(),
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let write = |at: usize, value: serde_json::Value| {
+        super::admin_write(
+            &app.router,
+            "POST",
+            "/api/v1/values/batch",
+            &issued.key,
+            serde_json::json!({ "writes": [{ "tag": names[at], "v": value }] }),
+        )
+    };
+    let before = peer.labels().len();
+    let allowed = write(0, serde_json::json!(4660)).await;
+    let after_allowed = write_requests(before);
+    let allowed_frames = peer.writes();
+    let outside = write(2, serde_json::json!(true)).await;
+    let after_outside = write_requests(before).len();
+    let mismatched = write(3, serde_json::json!(1)).await;
+    let after_mismatch = write_requests(before);
+    let audit = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/write-audit/list",
+        &app.admin_token,
+        serde_json::json!({}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    assert!(revoked.unwrap().revoked_at.is_some());
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+
+    for (label, (status, body), ok) in [
+        ("allowed", &allowed, true),
+        ("outside", &outside, false),
+        ("mismatched", &mismatched, false),
+    ] {
+        assert_eq!(*status, super::StatusCode::OK, "{label}: {body:?}");
+        assert_eq!(body["writes"][0]["ok"], ok, "{label}: {body:?}");
+    }
+    let name = |text: &str| vec![text.to_string()];
+    assert_eq!(
+        after_allowed,
+        vec![
+            (0x041c, name("タンク1.水位")),
+            (0x141b, name("タンク1.水位"))
+        ],
+        "one 041C check and one 141B"
+    );
+    // 4E (serial 2..4 left as sent), own station, timer 0010H, 141B/0000, one
+    // label, no abbreviation, `タンク1.水位` (7 UTF-16 units), 2 bytes 0x1234.
+    let mut expected = vec![0x1b, 0x14, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07, 0x00];
+    expected.extend("タンク1.水位".encode_utf16().flat_map(u16::to_le_bytes));
+    expected.extend_from_slice(&[0x02, 0x00, 0x34, 0x12]);
+    assert_eq!(allowed_frames.len(), 1);
+    let frame = &allowed_frames[0];
+    assert_eq!(&frame[..2], &[0x54, 0x00]);
+    assert_eq!(&frame[6..11], &OWN_ROUTE);
+    assert_eq!(
+        usize::from(u16::from_le_bytes([frame[11], frame[12]])),
+        expected.len() + 2
+    );
+    assert_eq!(&frame[13..15], &[0x10, 0x00]);
+    assert_eq!(&frame[15..], &expected[..]);
+    assert_eq!(after_outside, 2, "outside the list: nothing sent");
+    assert_eq!(
+        after_mismatch[2..].to_vec(),
+        vec![(0x041c, name("Word"))],
+        "a mismatched type is checked and never written"
+    );
+    assert_eq!(peer.writes().len(), 1, "no other 141B");
+    assert_eq!(audit.0, super::StatusCode::OK, "{:?}", audit.1);
+    let rows = audit.1["rows"].as_array().unwrap();
+    let rows_of = |at: usize| -> Vec<(String, String)> {
+        let mut rows: Vec<_> = rows
+            .iter()
+            .filter(|row| row["tagId"].as_i64() == Some(ids[at]))
+            .collect();
+        rows.sort_by_key(|row| row["id"].as_i64());
+        rows.iter()
+            .map(|row| {
+                (
+                    row["externalNameSnapshot"].as_str().unwrap().to_string(),
+                    row["result"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+    assert_eq!(
+        rows_of(0),
+        [("line.group.水位".to_string(), "ok".to_string())],
+        "{rows:?}"
+    );
+    assert_eq!(rows_of(2)[0].1, "failed", "{rows:?}");
+    assert_eq!(rows_of(3)[0].1, "failed", "{rows:?}");
+}
+
+/// Guest #74 (G3): on a standard Q (Q06HCPU over 3E) a saved label tag stays
+/// Bad and its read-now fails, a REST label write is refused although both
+/// gates allow it, and neither 041C nor 141B is ever sent; the D tag of the
+/// same group is still collected Good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #74 component"]
+async fn new_guest_saved_label_tags_on_standard_q_are_never_sent() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let peer = LabelPeer::start(("Q06HCPU", 0x0042)).await;
+    let (app, connection_id, ids) = label_app(
+        "t12-new-guest-labels-q",
+        &peer,
+        serde_json::json!({
+            "frame": "3e",
+            "d_u16_write_mode": "enabled",
+            "label_write_allowlist": "@Tank1.Level"
+        }),
+        100,
+        &[
+            ("tank", "@Tank1.Level", "f32", None, true),
+            ("d100", "D100", "u16", None, false),
+        ],
+    )
+    .await;
+    let mut status = app.sessions.status_watch(connection_id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !sample_of(ids[1]).is_some_and(|s| s.quality == Quality::Good) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("D100 is collected Good");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (read_status, read_body) = super::admin_get(
+        &app.router,
+        "/api/v1/values/line.group.tank/read-now",
+        &app.admin_token,
+    )
+    .await;
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "label-q-writer",
+            vec!["write:line.group.tank".into()],
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let (write_status, write_body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/v1/values/batch",
+        &issued.key,
+        serde_json::json!({"writes": [{"tag": "line.group.tank", "v": 1.5}]}),
+    )
+    .await;
+    let label_quality = sample_of(ids[0]).map(|s| s.quality);
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    assert!(revoked.unwrap().revoked_at.is_some());
+    drop(app);
+
+    assert!(
+        !read_status.is_success(),
+        "label read-now on Q: {read_status} {read_body:?}"
+    );
+    assert_ne!(label_quality, Some(Quality::Good));
+    assert_eq!(write_status, super::StatusCode::OK, "{write_body:?}");
+    assert_eq!(write_body["writes"][0]["ok"], false, "{write_body:?}");
+    assert!(peer.labels().is_empty(), "no 041C or 141B on Q");
+    let commands = peer.commands();
+    assert!(
+        commands
+            .iter()
+            .all(|command| matches!(command, 0x0101 | 0x0401)),
+        "{commands:x?}"
+    );
+}
