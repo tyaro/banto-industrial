@@ -1,6 +1,4 @@
-# Temporary branch-only GUI capability probe. Restore the main SCM workflow
-# after this dispatch; this job deliberately contains no SCM/NSIS/Rust operations.
-name: Installer GUI capability (temporary branch probe)
+name: Installer GUI capability
 
 on:
   workflow_dispatch:
@@ -44,7 +42,9 @@ jobs:
           New-Item -ItemType Directory -Path (Join-Path $root 'proof') | Out-Null
           [IO.File]::WriteAllText((Join-Path $root '.banto-973-gui'), "$env:GITHUB_RUN_ID`n$head`n", [Text.UTF8Encoding]::new($false))
           "BANTO_973_GUI_ROOT=$root" >> $env:GITHUB_ENV
-          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; runner_environment=$env:RUNNER_ENVIRONMENT; workflow_sha256=(Get-FileHash -LiteralPath '.github/workflows/installer-delete-pending.yml' -Algorithm SHA256).Hash; image_os=$env:ImageOS; image_version=$env:ImageVersion; service_operations=0; ChronoGazer_UI_test='not_executed' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
+          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; runner_environment=$env:RUNNER_ENVIRONMENT; workflow_sha256=(Get-FileHash -LiteralPath '.github/workflows/installer-gui-capability.yml' -Algorithm SHA256).Hash; image_os=$env:ImageOS; image_version=$env:ImageVersion; service_operations=0; ChronoGazer_UI_test='not_executed' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
+      - name: Pure GUI capability regression (no Win32 API loading)
+        run: python -B -m unittest discover -s apps/chronogazer/installer/tests -p test_windows_gui_capability.py
       - name: Observe own calibration window and desktop crop (not ChronoGazer acceptance)
         run: python -B apps/chronogazer/installer/tests/windows_gui_capability.py
       - uses: actions/upload-artifact@v7

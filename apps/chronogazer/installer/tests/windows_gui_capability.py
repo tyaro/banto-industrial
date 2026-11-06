@@ -1,6 +1,6 @@
 """Disposable GitHub-hosted Windows GUI capability gate, NOT a ChronoGazer UI test.
 
-Do not execute this on a developer PC. Only the temporary workflow supplies the
+Do not execute this on a developer PC. Only the dedicated manual workflow supplies the
 opt-in and fresh RUNNER_TEMP marker. Import/pure helpers do not open Win32 APIs.
 The owned child paints a two-color calibration window. Only its desktop crop is
 saved, and pixels must prove actual rendering. No service/SCM/registry/NSIS/UAC.
@@ -69,6 +69,26 @@ def pixel_counts(rgb):
             if all(abs(value - wanted) <= 5 for value, wanted in zip(pixel, expected)):
                 counts[name] += 1
     return counts
+
+
+def calibration_rendered(counts):
+    return counts["red"] >= 5000 and counts["green"] >= 5000
+
+
+def wait_for_ready_window(api, pid, title, label, observations, is_running,
+                          timeout=10, clock=time.monotonic, pause=time.sleep):
+    started = clock()
+    deadline = started + timeout
+    while clock() < deadline and is_running():
+        windows = api.windows(pid)
+        window = select_window(windows, pid, title)
+        children = api.windows(pid, window["hwnd"]) if window else []
+        observations.append({"elapsed_ms": round((clock() - started) * 1000),
+                             "windows": windows, "child_windows": children})
+        if window and any(item["title"] == label for item in children):
+            return window, children
+        pause(.1)
+    raise RuntimeError("owned_window_and_label_not_ready_before_deadline")
 
 
 def guard():
@@ -147,27 +167,35 @@ class API:
 
     def windows(self, pid, parent=None):
         result = []
+        callback_errors = []
 
         @self.callback
         def visit(handle, unused):
-            actual = W.DWORD()
-            self.u.GetWindowThreadProcessId(handle, C.byref(actual))
-            if actual.value == pid:  # Never read another process's window text.
-                text, class_name, rect = C.create_unicode_buffer(2048), C.create_unicode_buffer(256), W.RECT()
-                self.u.GetWindowTextW(handle, text, len(text))
-                if parent is not None:
-                    reply_length = C.c_size_t()
-                    self.u.SendMessageTimeoutW(handle, 0x000D, len(text), C.addressof(text), 3, 1000, C.byref(reply_length))
-                self.u.GetClassNameW(handle, class_name, len(class_name))
-                if self.u.GetWindowRect(handle, C.byref(rect)):
-                    result.append({"hwnd": int(handle), "pid": actual.value, "title": text.value,
-                                   "class": class_name.value, "visible": bool(self.u.IsWindowVisible(handle)),
-                                   "rect": [rect.left, rect.top, rect.right, rect.bottom]})
-            return True
+            try:
+                actual = W.DWORD()
+                self.u.GetWindowThreadProcessId(handle, C.byref(actual))
+                if actual.value == pid:  # Never read another process's window text.
+                    text, class_name, rect = C.create_unicode_buffer(2048), C.create_unicode_buffer(256), W.RECT()
+                    self.u.GetWindowTextW(handle, text, len(text))
+                    if parent is not None:
+                        reply_length = C.c_size_t()
+                        self.u.SendMessageTimeoutW(handle, 0x000D, len(text), C.addressof(text), 3, 1000, C.byref(reply_length))
+                    self.u.GetClassNameW(handle, class_name, len(class_name))
+                    if self.u.GetWindowRect(handle, C.byref(rect)):
+                        result.append({"hwnd": int(handle), "pid": actual.value, "title": text.value,
+                                       "class": class_name.value, "visible": bool(self.u.IsWindowVisible(handle)),
+                                       "rect": [rect.left, rect.top, rect.right, rect.bottom]})
+                return True
+            except Exception as error:
+                callback_errors.append(type(error).__name__ + ": " + str(error))
+                return False
         if parent is None:
-            require(bool(self.u.EnumWindows(visit, 0)), "EnumWindows_failed")
+            enumerated = bool(self.u.EnumWindows(visit, 0))
         else:
             self.u.EnumChildWindows(parent, visit, 0)
+            enumerated = True
+        require(not callback_errors, "window_callback_failed: " + '; '.join(callback_errors))
+        require(enumerated, "EnumWindows_failed")
         return result
 
     def capture(self, rect):
@@ -330,19 +358,13 @@ def main():
                                      stdout=stdout, stderr=stderr, creationflags=subprocess.CREATE_NO_WINDOW)
         report["fixture_pid"] = child.pid
         title = "Banto973 GUI capability " + root.name
-        deadline = time.monotonic() + 10
-        window = None
-        while time.monotonic() < deadline and child.poll() is None:
-            windows = api.windows(child.pid)
-            window = select_window(windows, child.pid, title)
-            if window:
-                break
-            time.sleep(.1)
-        require(window is not None, "owned_visible_window_not_found")
-        report["window"] = window
-        report["child_windows"] = api.windows(child.pid, window["hwnd"])
         expected_label = "Banto973 visible calibration " + root.name[-8:]
-        require(any(item["title"] == expected_label for item in report["child_windows"]), "owned_label_text_missing")
+        report["readiness_observations"] = []
+        window, children = wait_for_ready_window(
+            api, child.pid, title, expected_label, report["readiness_observations"],
+            is_running=lambda: child.poll() is None)
+        report["window"] = window
+        report["child_windows"] = children
         left, top, right, bottom = window["rect"]
         require(x <= left < right <= x + width and y <= top < bottom <= y + height, "window_not_fully_onscreen")
         time.sleep(.5)
@@ -352,7 +374,7 @@ def main():
         counts = pixel_counts(rgb)
         report["pixels"] = counts
         report["png_sha256"] = hashlib.sha256(png).hexdigest()
-        if counts["red"] < 5000 or counts["green"] < 5000:
+        if not calibration_rendered(counts):
             report.update(status="unsupported", reasons=["calibration_not_rendered_or_black_capture"])
         else:
             report.update(status="supported", capability_supported=True)
