@@ -744,8 +744,11 @@ jobs:
           # identifies the Q process CPU QnPH, QnUDPV (like QnUDV), MELSEC-L
           # (like standard Q) and Q12PRH (like Q25PRH) by the exact 0101
           # name/code pair. #71 reads ZR addresses as decimal on Q and R (ZR10
-          # is device 10; letters are rejected). WIT and Hub are unchanged.
-          $newSlmpSha = 'abb1a1a563a0c1dd7c4e1c23d4f03b4c549d46d9'
+          # is device 10; letters are rejected). #72 (G2b) identifies the iQ-R
+          # process CPU (RnPCPU, reads S like R), SIL2 process CPU (RnPSFCPU),
+          # safety CPU (RnSFCPU) and MX-R (these three have no S) as standard R
+          # by the exact 0101 name/code pair. WIT and Hub are unchanged.
+          $newSlmpSha = 'b705fd2478a1ab53ba33ed41aeab7e2e57efa360'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -807,10 +810,18 @@ jobs:
           if (-not (Select-String -Path $slmpG2aLog -Pattern '^test result: ok\. 5 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP G2a component tests did not all run'
           }
+          # Component-level G2b (iQ-R process, SIL2 process, safety CPU and MX-R
+          # recognized by the exact 0101 pair; S only on the process CPU).
+          $slmpG2bLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g2b-models-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_g2b_models --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpG2bLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP G2b component tests failed' }
+          if (-not (Select-String -Path $slmpG2bLog -Pattern '^test result: ok\. 4 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP G2b component tests did not all run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 48 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 51 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
