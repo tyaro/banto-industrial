@@ -62,6 +62,7 @@
 //! → 止めたサービスだけ再開し RUNNING まで待つ（どちらも失敗は `Abort`）。
 //! `.onInstFailed`（下の P4）: 途中で止まったら止めたサービスを戻す。PREUNINSTALL:
 //! シェルの終了（同じ待ち）→ サービスの停止 →（再確認の後に）`service-uninstall`
+//! → 削除保留の限定検査（DeleteFlag 1なら再開せず中止）
 //! （`%ProgramData%\ChronoGazer` は残す）。サービスの停止・再開の部品は Hub と共通の
 //! `installer-common/service-common.nsh` にあり、このツールがフックの先頭へその
 //! 絶対パスを `!define` してから tauri-bundler に渡す（[`render_hooks`]）。
@@ -257,7 +258,8 @@ const TEMPLATE_PATCHES: &[TemplatePatch] = &[
     ),
     (
         // P2（Uninstall）: 同上。PREUNINSTALL はサービスを止めるだけにして、登録の
-        // 解除（UnregisterChronoGazerService）をこの再確認の後に置く。[キャンセル]
+        // 解除（UnregisterChronoGazerService。成功/skip後もDeleteFlag 1なら中止）を
+        // この再確認の後・最初のDeleteより前に置く。[キャンセル]
         // は止めたサービスを戻して中止（まだ何も変更していない）。解除に失敗したら
         // マクロ側で `Abort` し、ファイルは消えない（#972 のオーナーレビュー）。
         "P2-uninstall-check",
