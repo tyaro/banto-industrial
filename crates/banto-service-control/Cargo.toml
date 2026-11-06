@@ -30,3 +30,8 @@ windows-sys = { version = "0.61", features = [
 [dev-dependencies]
 # ランナーのテストで、非同期の本体を current_thread のランタイムで動かす。
 tokio = { workspace = true, features = ["rt", "sync"] }
+
+[target.'cfg(windows)'.dev-dependencies]
+# examples/running_dummy.rs（#973）が自身の SHA-256 を束縛検証に使う。
+# workspace が既に持つ版で、製品の依存は増えない。
+sha2 = { workspace = true }
