@@ -4500,6 +4500,8 @@ struct UnitBufferPeer {
     /// `(device, start, points)` (G2a, #69).
     sd: Arc<Mutex<Vec<(u32, u16)>>>,
     plain: Arc<Mutex<Vec<(u8, u32, u16)>>>,
+    /// How many 0101 requests were answered (proves the handshake began).
+    type_name: Arc<AtomicU32>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -4530,8 +4532,10 @@ impl UnitBufferPeer {
         let writes = Arc::new(AtomicU32::new(0));
         let sd = Arc::new(Mutex::new(Vec::new()));
         let plain = Arc::new(Mutex::new(Vec::new()));
+        let type_name = Arc::new(AtomicU32::new(0));
         let task = {
             let (ext, writes, sd, plain) = (ext.clone(), writes.clone(), sd.clone(), plain.clone());
+            let type_name = type_name.clone();
             tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -4551,6 +4555,7 @@ impl UnitBufferPeer {
                         let sub = u16::from_le_bytes([request[17], request[18]]);
                         let (end_code, body): (u16, Vec<u8>) = match (command, sub) {
                             (0x0101, _) => {
+                                type_name.fetch_add(1, Ordering::SeqCst);
                                 let (name, code) = model;
                                 let mut body = vec![b' '; 18];
                                 body[..name.len()].copy_from_slice(name.as_bytes());
@@ -4659,6 +4664,15 @@ impl UnitBufferPeer {
                                     ),
                                     0xb0 => (0, vec![0x22; usize::from(points) * 2]),
                                     0xb4 => (0, vec![0x33; usize::from(points) * 2]),
+                                    // S bit read (iQ-R, subcommand 0003): every bit 1,
+                                    // two per byte, an odd last low nibble 0 (G2b, #72).
+                                    0x98 if r && sub == 3 => {
+                                        let mut body = vec![0x11; usize::from(points).div_ceil(2)];
+                                        if points % 2 == 1 {
+                                            *body.last_mut().unwrap() = 0x10;
+                                        }
+                                        (0, body)
+                                    }
                                     other => panic!("unexpected device {other:#x}"),
                                 }
                             }
@@ -4684,6 +4698,7 @@ impl UnitBufferPeer {
             writes,
             sd,
             plain,
+            type_name,
             task,
         }
     }
@@ -5126,7 +5141,17 @@ async fn g2a_model_collects_and_reads_now(
     model: (&'static str, u16),
     tags: &[G2aTag<'_>],
 ) -> G2aRecord {
-    let peer = UnitBufferPeer::start_as(false, model, &[(0xff, 7, 0x0abc)], &[(100, 77)]).await;
+    g2_model_collects_and_reads_now(false, label, model, tags).await
+}
+
+/// The same for an iQ-R wire mock PLC (`r`), used by guest #72 (G2b).
+async fn g2_model_collects_and_reads_now(
+    r: bool,
+    label: &str,
+    model: (&'static str, u16),
+    tags: &[G2aTag<'_>],
+) -> G2aRecord {
+    let peer = UnitBufferPeer::start_as(r, model, &[(0xff, 7, 0x0abc)], &[(100, 77)]).await;
     let app = super::test_app_with_operational_write_manifest(
         &format!("t12-new-guest-g2a-{label}"),
         MANIFEST,
@@ -5301,4 +5326,126 @@ async fn new_guest_saved_q12prh_tags_are_read_like_q25prh() {
     assert_eq!(q12.sd, vec![(302, 2)]);
     assert_eq!(q12.plain, vec![(0xa8, 100, 1)], "no ZR request");
     assert!(q12.ext.is_empty(), "no U\\G request");
+}
+
+/// Guest #72 (G2b): the iQ-R safety CPU (R08SFCPU/4891H), SIL2 process CPU and
+/// MX-R have no S. A D tag is collected Good and answers read-now, an S tag
+/// stays Bad (per-item Unsupported, never sent), and the requests equal the
+/// standard R08CPU's for the same D tag: SD280-283 at the handshake, one D read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #72 component"]
+async fn new_guest_saved_safety_and_mxr_tags_read_d_but_not_s() {
+    let d_only = [("d100", "D100", "u16", Some(serde_json::json!(77.0)))];
+    let std_r = g2_model_collects_and_reads_now(true, "r08", ("R08CPU", 0x4801), &d_only).await;
+    assert_eq!(std_r.sd, vec![(280, 4)]);
+    assert_eq!(std_r.plain, vec![(0xa8, 100, 1)]);
+    let tags = [
+        ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+        ("s10", "S10", "bit", None),
+    ];
+    for (label, model) in [
+        ("safety", ("R08SFCPU", 0x4891)),
+        ("sil2", ("R16PSFCPU", 0x4852)),
+        ("mxr", ("MXR300-32", 0x48ea)),
+    ] {
+        let record = g2_model_collects_and_reads_now(true, label, model, &tags).await;
+        assert_eq!(record, std_r, "{label}: the same requests as R08CPU");
+        assert!(
+            record.plain.iter().all(|&(device, ..)| device != 0x98),
+            "{label}: no S request: {:?}",
+            record.plain
+        );
+    }
+}
+
+/// Guest #72 (G2b): the iQ-R process CPU (R32PCPU/4843H) reads S like the
+/// standard R: D and S tags are both collected Good and answer read-now (S as
+/// a bit read, device 98), with the same requests as R08CPU.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #72 component"]
+async fn new_guest_saved_process_cpu_tags_read_s_like_standard_r() {
+    let tags = [
+        ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+        ("s10", "S10", "bit", Some(serde_json::json!(true))),
+    ];
+    let pcpu = g2_model_collects_and_reads_now(true, "pcpu", ("R32PCPU", 0x4843), &tags).await;
+    let std_r = g2_model_collects_and_reads_now(true, "r08s", ("R08CPU", 0x4801), &tags).await;
+    assert_eq!(pcpu, std_r, "R32PCPU and R08CPU send the same requests");
+    assert_eq!(pcpu.sd, vec![(280, 4)]);
+    assert_eq!(pcpu.plain, vec![(0x98, 10, 1), (0xa8, 100, 1)]);
+}
+
+/// Guest #72 (G2b): a mismatched name/code pair (R08SFCPU with the standard
+/// R08CPU code 4801H) is still Unknown: the handshake ends after 0101, so no
+/// tag is ever collected Good and no SD or device read is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #72 component"]
+async fn new_guest_saved_mismatched_safety_pair_stays_unknown() {
+    let peer = UnitBufferPeer::start_as(true, ("R08SFCPU", 0x4801), &[], &[(100, 77)]).await;
+    let app = super::test_app_with_operational_write_manifest(
+        "t12-new-guest-g2b-unknown",
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({"host": "127.0.0.1", "port": peer.address.port()})
+                .as_object()
+                .unwrap()
+                .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 100))
+    .await
+    .unwrap();
+    let tag = app
+        .manager
+        .tags()
+        .create(super::tag_input("d100", group.id, "D100", "u16"))
+        .await
+        .unwrap();
+    app.commit_and_start().await;
+    // Wait (bounded) until the guest has asked 0101 and read-now has failed.
+    let (status, body) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let (status, body) = super::admin_get(
+                &app.router,
+                "/api/v1/values/line.group.d100/read-now",
+                &app.admin_token,
+            )
+            .await;
+            if peer.type_name.load(Ordering::SeqCst) >= 1 && !status.is_success() {
+                break (status, body);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the guest sent 0101 and read-now failed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!status.is_success(), "read-now: {status} {body:?}");
+    assert_ne!(
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{}", tag.id)))
+            .map(|s| s.quality),
+        Some(Quality::Good)
+    );
+    drop(app);
+    assert!(peer.sd.lock().unwrap().is_empty(), "no SD read");
+    assert!(peer.plain.lock().unwrap().is_empty(), "no device read");
+    assert_eq!(peer.writes.load(Ordering::SeqCst), 0, "no 1401");
 }
