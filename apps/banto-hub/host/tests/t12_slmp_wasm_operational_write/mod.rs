@@ -4493,11 +4493,31 @@ struct UnitBufferPeer {
     address: std::net::SocketAddr,
     ext: Arc<Mutex<Vec<Vec<u8>>>>,
     writes: Arc<AtomicU32>,
+    /// Every SD read as `(start, points)` and every other plain word read as
+    /// `(device, start, points)` (G2a, #69).
+    sd: Arc<Mutex<Vec<(u32, u16)>>>,
+    plain: Arc<Mutex<Vec<(u8, u32, u16)>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl UnitBufferPeer {
     async fn start(r: bool, buffer: &[(u16, u32, u16)], d: &[(u32, u16)]) -> Self {
+        let model = if r {
+            ("R04CPU", 0x4800)
+        } else {
+            ("Q02UCPU", 0x0263)
+        };
+        Self::start_as(r, model, buffer, d).await
+    }
+
+    /// `model` is the 0101 (name, code) answer. On a Q peer SD310-311 answers
+    /// 8000; ZR reads answer 0x2222 and W reads 0x3333 per word.
+    async fn start_as(
+        r: bool,
+        model: (&'static str, u16),
+        buffer: &[(u16, u32, u16)],
+        d: &[(u32, u16)],
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let buffer: Arc<std::collections::BTreeMap<(u16, u32), u16>> =
@@ -4505,8 +4525,10 @@ impl UnitBufferPeer {
         let d: Arc<std::collections::BTreeMap<u32, u16>> = Arc::new(d.iter().copied().collect());
         let ext = Arc::new(Mutex::new(Vec::new()));
         let writes = Arc::new(AtomicU32::new(0));
+        let sd = Arc::new(Mutex::new(Vec::new()));
+        let plain = Arc::new(Mutex::new(Vec::new()));
         let task = {
-            let (ext, writes) = (ext.clone(), writes.clone());
+            let (ext, writes, sd, plain) = (ext.clone(), writes.clone(), sd.clone(), plain.clone());
             tokio::spawn(async move {
                 loop {
                     let (mut socket, _) = listener.accept().await.unwrap();
@@ -4526,11 +4548,7 @@ impl UnitBufferPeer {
                         let sub = u16::from_le_bytes([request[17], request[18]]);
                         let (end_code, body): (u16, Vec<u8>) = match (command, sub) {
                             (0x0101, _) => {
-                                let (name, code) = if r {
-                                    ("R04CPU", 0x4800u16)
-                                } else {
-                                    ("Q02UCPU", 0x0263)
-                                };
+                                let (name, code) = model;
                                 let mut body = vec![b' '; 18];
                                 body[..name.len()].copy_from_slice(name.as_bytes());
                                 body[16..18].copy_from_slice(&code.to_le_bytes());
@@ -4603,6 +4621,11 @@ impl UnitBufferPeer {
                                         u16::from_le_bytes([request[25], request[26]]),
                                     )
                                 };
+                                if device == 0xa9 {
+                                    sd.lock().unwrap().push((start, points));
+                                } else {
+                                    plain.lock().unwrap().push((device, start, points));
+                                }
                                 match device {
                                     0xa9 if r && (start, points) == (280, 4) => {
                                         let mut body = 4000u32.to_le_bytes().to_vec();
@@ -4616,6 +4639,9 @@ impl UnitBufferPeer {
                                         }
                                         (0, body)
                                     }
+                                    0xa9 if !r && (start, points) == (310, 2) => {
+                                        (0, 8000u32.to_le_bytes().to_vec())
+                                    }
                                     0xa9 => (0xc051, Vec::new()),
                                     0xa8 => (
                                         0,
@@ -4628,6 +4654,8 @@ impl UnitBufferPeer {
                                             })
                                             .collect(),
                                     ),
+                                    0xb0 => (0, vec![0x22; usize::from(points) * 2]),
+                                    0xb4 => (0, vec![0x33; usize::from(points) * 2]),
                                     other => panic!("unexpected device {other:#x}"),
                                 }
                             }
@@ -4651,6 +4679,8 @@ impl UnitBufferPeer {
             address,
             ext,
             writes,
+            sd,
+            plain,
             task,
         }
     }
@@ -5070,4 +5100,202 @@ async fn new_guest_saved_unit_buffer_tags_are_collected_and_read_now_on_r() {
 #[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #65 component"]
 async fn new_guest_saved_unit_buffer_tags_are_collected_and_read_now_on_q() {
     unit_buffer_tags_register_collect_and_read_now(false).await;
+}
+
+/// `(name, address, dataType, expected read-now value)`; `None` is a tag the
+/// guest cannot read on this model (never Good, read-now fails).
+type G2aTag<'a> = (&'a str, &'a str, &'a str, Option<serde_json::Value>);
+
+/// What the G2a peer saw, deduplicated (the periodic collection repeats).
+#[derive(Debug, PartialEq)]
+struct G2aRecord {
+    sd: Vec<(u32, u16)>,
+    plain: Vec<(u8, u32, u16)>,
+    ext: Vec<Vec<u8>>,
+}
+
+/// Guest #69 (G2a) through the real Hub path: a Q-wire mock PLC answers 0101
+/// with `model`; the saved tags are collected, the readable ones answer
+/// read-now with the expected value and the others stay Bad. Returns what the
+/// peer saw so a test can compare two models. No 1401 may have been sent.
+async fn g2a_model_collects_and_reads_now(
+    label: &str,
+    model: (&'static str, u16),
+    tags: &[G2aTag<'_>],
+) -> G2aRecord {
+    let peer = UnitBufferPeer::start_as(false, model, &[(0xff, 7, 0x0abc)], &[(100, 77)]).await;
+    let app = super::test_app_with_operational_write_manifest(
+        &format!("t12-new-guest-g2a-{label}"),
+        MANIFEST,
+        &new_guest_component(),
+    )
+    .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: serde_json::json!({
+                "host": "127.0.0.1",
+                "port": peer.address.port(),
+                "d_u16_write_mode": "enabled",
+                "d_u16_write_allowlist": "D3010-D3013"
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 100))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (name, address, data_type, _) in tags {
+        let tag = app
+            .manager
+            .tags()
+            .create(super::tag_input(name, group.id, address, data_type))
+            .await
+            .unwrap();
+        ids.push(tag.id);
+    }
+    app.commit_and_start().await;
+    let mut status = app.sessions.status_watch(saved.id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tags.iter().zip(&ids).all(|((.., value), &id)| {
+                value.is_none() || sample_of(id).is_some_and(|s| s.quality == Quality::Good)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{label}: every readable tag is collected Good"));
+    // Let a few more cycles run so a stray request would show.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for ((name, address, _, value), &id) in tags.iter().zip(&ids) {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        match value {
+            Some(value) => {
+                assert_eq!(status, super::StatusCode::OK, "{label} {address}: {body:?}");
+                assert_eq!(body["v"], *value, "{label} {address}: {body:?}");
+                assert_eq!(body["q"], "good", "{label} {address}: {body:?}");
+            }
+            None => {
+                assert!(
+                    !status.is_success(),
+                    "{label} {address} read-now: {status} {body:?}"
+                );
+                assert_ne!(
+                    sample_of(id).map(|s| s.quality),
+                    Some(Quality::Good),
+                    "{label} {address}"
+                );
+            }
+        }
+    }
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+    assert_eq!(peer.writes.load(Ordering::SeqCst), 0, "{label}: no 1401");
+    let mut sd = peer.sd.lock().unwrap().clone();
+    sd.sort_unstable();
+    sd.dedup();
+    let mut plain = peer.plain.lock().unwrap().clone();
+    plain.sort_unstable();
+    plain.dedup();
+    let mut ext = peer.ext();
+    ext.sort();
+    ext.dedup();
+    G2aRecord { sd, plain, ext }
+}
+
+/// MELSEC-L (L26CPU-PBT/0542H) is handled like a standard Q: a D, a ZR and a
+/// `UFF\G` tag are collected Good and answer read-now (ZR as plain 0401 with
+/// device B0, `UFF\G` as 0080), `U3E0\G` (the R CPU buffer) stays Bad and is
+/// never sent, and only SD302-303 is read at the handshake (no SD310-311).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #69 component"]
+async fn new_guest_saved_melsec_l_tags_are_read_like_a_standard_q() {
+    let record = g2a_model_collects_and_reads_now(
+        "l",
+        ("L26CPU-PBT", 0x0542),
+        &[
+            ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+            ("zr10", "ZR10", "u16", Some(serde_json::json!(8738.0))),
+            ("ug", "UFF\\G7", "u16", Some(serde_json::json!(2748.0))),
+            ("cpu", "U3E0\\G1", "u16", None),
+        ],
+    )
+    .await;
+    assert_eq!(record.sd, vec![(302, 2)], "no SD310-311 on MELSEC-L");
+    assert_eq!(record.ext, vec![unit_buffer_frame(false, 0xff, 7, 1)]);
+    assert_eq!(record.plain, vec![(0xa8, 100, 1), (0xb0, 0x10, 1)]);
+}
+
+/// QnUDPV (Q26UDPVCPU/036CH) reads exactly like QnUDV (Q26UDVCPU/036CH): the
+/// same SD reads (SD302-303, then SD310-311), the same requests, an extended
+/// W (W100, past SD303 = 64, below the SD310-311 total 8000) read Good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #69 component"]
+async fn new_guest_saved_qnudpv_tags_are_read_like_qnudv() {
+    let tags = [
+        ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+        ("zr10", "ZR10", "u16", Some(serde_json::json!(8738.0))),
+        ("w100", "W100", "u16", Some(serde_json::json!(13107.0))),
+        ("ug", "UFF\\G7", "u16", Some(serde_json::json!(2748.0))),
+        ("cpu", "U3E0\\G1", "u16", None),
+    ];
+    let pv = g2a_model_collects_and_reads_now("qnudpv", ("Q26UDPVCPU", 0x036c), &tags).await;
+    let v = g2a_model_collects_and_reads_now("qnudv", ("Q26UDVCPU", 0x036c), &tags).await;
+    assert_eq!(pv, v, "QnUDPV and QnUDV send the same requests");
+    assert_eq!(pv.sd, vec![(302, 2), (310, 2)]);
+    assert!(pv.plain.contains(&(0xb4, 0x100, 1)), "{:?}", pv.plain);
+    assert_eq!(pv.ext, vec![unit_buffer_frame(false, 0xff, 7, 1)]);
+}
+
+/// Q12PRHCPU/004BH reads exactly like Q25PRHCPU/004CH: only SD302-303 at the
+/// handshake, a D tag is Good, a ZR and a `U\G` tag stay Bad and are never
+/// sent (the same requests as the Q25PRH peer).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #69 component"]
+async fn new_guest_saved_q12prh_tags_are_read_like_q25prh() {
+    let tags = [
+        ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+        ("zr10", "ZR10", "u16", None),
+        ("ug", "U3\\G1", "u16", None),
+    ];
+    let q12 = g2a_model_collects_and_reads_now("q12prh", ("Q12PRHCPU", 0x004b), &tags).await;
+    let q25 = g2a_model_collects_and_reads_now("q25prh", ("Q25PRHCPU", 0x004c), &tags).await;
+    assert_eq!(q12, q25, "Q12PRH and Q25PRH send the same requests");
+    assert_eq!(q12.sd, vec![(302, 2)]);
+    assert_eq!(q12.plain, vec![(0xa8, 100, 1)], "no ZR request");
+    assert!(q12.ext.is_empty(), "no U\\G request");
 }
