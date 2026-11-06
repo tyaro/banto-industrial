@@ -215,6 +215,16 @@ class Dialogs(unittest.TestCase):
         self.assertEqual(lock.classify_dialog_children([{"class": "Static", "title": ""}, {"class": "Static", "title": MAIN_TEXT}]), "main")
         self.assertEqual(lock.classify_dialog_children([{"class": "Static", "title": "使用中、または書き込めない実行ファイルがあります（chronogazer.exe）"}]), "other")
 
+    def test_ok_button_must_be_unique_visible_button(self):
+        def btn(title="OK", visible=True, cls="Button", hwnd=5):
+            return {"hwnd": hwnd, "class": cls, "title": title, "visible": visible}
+
+        static = {"hwnd": 4, "class": "Static", "title": "x", "visible": True}
+        self.assertEqual(lock.ok_button([static, btn(cls="BUTTON")])["hwnd"], 5)
+        for children in ([static], [btn(), btn(hwnd=6)], [btn(visible=False)], [btn(title="Cancel")]):
+            with self.subTest(children=children), self.assertRaisesRegex(RuntimeError, "ok_button_not_unique"):
+                lock.ok_button(children)
+
     def test_owner_pid_title_and_text_identify_the_main_dialog(self):
         main_window = window(10, 0)  # NSIS 主窓も #32770・同 title だが owner が 0。
         dialog = window(11, 10)

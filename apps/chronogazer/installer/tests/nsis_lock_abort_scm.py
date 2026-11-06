@@ -48,7 +48,7 @@ INACTIVE_TEXTS = ("サービスが停止の要求を受け付けず", "サービ
 CALLBACK_DIALOG_TEXT = "$2"
 DIALOG_CLASS = "#32770"
 RUNNING, STOPPED = 4, 1
-WM_CLOSE, WM_COMMAND, IDOK, GW_OWNER = 0x0010, 0x0111, 1, 4
+WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
 
 SC_QUERIES = tuple("nsExec::ExecToStack 'cmd /c sc query \"ChronoGazer\" | findstr /C:\"" + state + "\" >nul'"
                    for state in ("RUNNING", "STOPPED", "PENDING"))
@@ -257,6 +257,13 @@ def classify_dialog_children(children, prefix=MAIN_DIALOG_PREFIX):
     if not texts:
         return "waiting"  # 子 Static が読めるまで待つ（checklist §3）。
     return "main" if any(text.startswith(prefix) for text in texts) else "other"
+
+
+def ok_button(children):
+    """MessageBox の OK ボタン（Button・visible・title が OK）がちょうど 1 つのときだけ返す。"""
+    found = [c for c in children if c["class"].casefold() == "button" and c["visible"] and c["title"] == "OK"]
+    require(len(found) == 1, "ok_button_not_unique")
+    return found[0]
 
 
 def owned_dialogs(windows, pid):
@@ -507,6 +514,7 @@ def case_c(trial, makensis, report):
     bind = gui.bind
     bind(api.u, "GetWindow", [W.HWND, W.UINT], W.HWND)
     bind(api.u, "IsWindow", [W.HWND], W.BOOL)
+    bind(api.u, "GetDlgCtrlID", [W.HWND], C.c_int)
     kernel = win32_api()
     invalid = C.c_void_p(-1).value
     lock = None
@@ -576,7 +584,12 @@ def case_c(trial, makensis, report):
         monitor.hold(1.5, "dialog")
         beats_two = observe("observation-2", beats_one)
         # 14. 主 dialog の OK。
-        require(bool(api.u.PostMessageW(dialog["hwnd"], WM_COMMAND, IDOK, 0)), "PostMessage_IDOK_failed")
+        button = ok_button(dialog_children)
+        control_id = int(api.u.GetDlgCtrlID(button["hwnd"]))
+        require(control_id > 0, "ok_button_control_id_invalid")
+        result["ok_button"] = {"hwnd": button["hwnd"], "control_id": control_id}
+        require(bool(api.u.PostMessageW(dialog["hwnd"], WM_COMMAND, (BN_CLICKED << 16) | control_id, button["hwnd"])),
+                "PostMessage_BN_CLICKED_failed")
         deadline = time.monotonic() + 10
         while api.u.IsWindow(dialog["hwnd"]):
             require(time.monotonic() < deadline, "dialog_did_not_close")
