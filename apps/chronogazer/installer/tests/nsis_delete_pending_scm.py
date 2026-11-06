@@ -247,16 +247,23 @@ class Trial:
                 if self.absent(name):
                     continue
                 observation = self.scm.observation(name)
-                if observation.get("open_error") == 1072:
+                deletion = self.deletion(name)
+                pending = observation.get("open_error") == 1072 or (
+                    deletion.get("value") == 1 and deletion.get("type") == self.reg.REG_DWORD)
+                if pending:
                     require(evidence.get("created"), "pending_ownership_unproven")
                 else:
                     require(observation.get("state") == 1 and self.command_is_ours(name), "foreign_or_running_service_refused")
                     handle, error = self.scm.open(name, 0x10000)
                     require(bool(handle), "cleanup_open_" + str(error))
                     try:
-                        require(bool(self.scm.api.DeleteService(handle)), "cleanup_delete_failed")
+                        deleted = bool(self.scm.api.DeleteService(handle))
+                        delete_error = 0 if deleted else C.get_last_error()
                     finally:
                         self.scm.close(handle)
+                    if not deleted:
+                        require(delete_error == 1072, "cleanup_delete_failed_" + str(delete_error))
+                        require(evidence.get("created"), "pending_ownership_unproven")
                 self.wait_absent(name)
             except Exception as error:
                 errors.append({"name": name, "failure": str(error)})
