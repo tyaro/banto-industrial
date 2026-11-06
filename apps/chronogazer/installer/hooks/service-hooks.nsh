@@ -826,6 +826,7 @@ Var ChronoGazerAclAbortTarget
 ; DeleteService が成功しても、他のハンドルが残ると削除完了が保留され得る。
 ; Hub同様、DeleteFlag DWORD 1だけを検出する。値なし/読取エラーは継続するため、
 ; 厳密なSCM判定ではなく、最終検査後の競合も防がない。
+; $4 を壊す。
 !macro RequireChronoGazerServiceDeleteNotPending
   ClearErrors
   ReadRegDWORD $4 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "DeleteFlag"
