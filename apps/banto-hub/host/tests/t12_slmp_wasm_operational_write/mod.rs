@@ -5449,3 +5449,544 @@ async fn new_guest_saved_mismatched_safety_pair_stays_unknown() {
     assert!(peer.plain.lock().unwrap().is_empty(), "no device read");
     assert_eq!(peer.writes.load(Ordering::SeqCst), 0, "no 1401");
 }
+
+/// (sub-header byte, route, monitoring timer, command)
+type Fx5Request = (u8, [u8; 5], u16, u16);
+
+/// Loopback TCP SLMP peer for guest #73 (G2c): an FX5 (or any model) that
+/// answers 0101 with `model` and follows the frame it receives (3E `50 00` or
+/// 4E `54 00`), so it can also be used to show what the guest does when an FX5
+/// is reached with 4E. It answers SD280-283 (D 8000, W 0x200), SD304-305
+/// (R 32768) and SD262-275, D100 = 77, R10 = 0x1234 (other words 0), and
+/// records every request: (sub-header byte, route, monitoring timer, command),
+/// the SD and plain reads, the whole 1401 frames, and the connections made.
+struct Fx5Peer {
+    address: std::net::SocketAddr,
+    requests: Arc<Mutex<Vec<Fx5Request>>>,
+    sd: Arc<Mutex<Vec<(u32, u16)>>>,
+    plain: Arc<Mutex<Vec<(u8, u32, u16)>>>,
+    writes: Arc<Mutex<Vec<Vec<u8>>>>,
+    /// How many 0101 requests were answered (proves the handshake began).
+    type_name: Arc<AtomicU32>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Fx5Peer {
+    async fn start(model: (&'static str, u16)) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let sd = Arc::new(Mutex::new(Vec::new()));
+        let plain = Arc::new(Mutex::new(Vec::new()));
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let type_name = Arc::new(AtomicU32::new(0));
+        let task = {
+            let (requests, sd, plain, writes, type_name) = (
+                requests.clone(),
+                sd.clone(),
+                plain.clone(),
+                writes.clone(),
+                type_name.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    loop {
+                        let mut sub_header = [0u8; 2];
+                        if socket.read_exact(&mut sub_header).await.is_err() {
+                            break;
+                        }
+                        let three_e = match sub_header {
+                            [0x50, 0x00] => true,
+                            [0x54, 0x00] => false,
+                            other => panic!("unexpected sub-header {other:02x?}"),
+                        };
+                        let head_len = if three_e { 9 } else { 13 };
+                        let mut request = sub_header.to_vec();
+                        request.resize(head_len, 0);
+                        if socket.read_exact(&mut request[2..]).await.is_err() {
+                            break;
+                        }
+                        let length = usize::from(u16::from_le_bytes([
+                            request[head_len - 2],
+                            request[head_len - 1],
+                        ]));
+                        request.resize(head_len + length, 0);
+                        if socket.read_exact(&mut request[head_len..]).await.is_err() {
+                            break;
+                        }
+                        let route: [u8; 5] = if three_e {
+                            request[2..7].try_into().unwrap()
+                        } else {
+                            request[6..11].try_into().unwrap()
+                        };
+                        let timer = u16::from_le_bytes([request[head_len], request[head_len + 1]]);
+                        let command =
+                            u16::from_le_bytes([request[head_len + 2], request[head_len + 3]]);
+                        let sub =
+                            u16::from_le_bytes([request[head_len + 4], request[head_len + 5]]);
+                        let data = &request[head_len + 6..];
+                        requests
+                            .lock()
+                            .unwrap()
+                            .push((sub_header[0], route, timer, command));
+                        let (end_code, body): (u16, Vec<u8>) = match command {
+                            0x0101 => {
+                                type_name.fetch_add(1, Ordering::SeqCst);
+                                let (name, code) = model;
+                                let mut body = vec![b' '; 18];
+                                body[..name.len()].copy_from_slice(name.as_bytes());
+                                body[16..18].copy_from_slice(&code.to_le_bytes());
+                                (0, body)
+                            }
+                            0x1401 => {
+                                writes.lock().unwrap().push(request.clone());
+                                (0, Vec::new())
+                            }
+                            0x0401 => {
+                                assert_eq!(sub, 0, "Q word access");
+                                let start = u32::from_le_bytes([data[0], data[1], data[2], 0]);
+                                let device = data[3];
+                                let points = u16::from_le_bytes([data[4], data[5]]);
+                                if device == 0xa9 {
+                                    sd.lock().unwrap().push((start, points));
+                                    match (start, points) {
+                                        (280, 4) => {
+                                            let mut body = 8000u32.to_le_bytes().to_vec();
+                                            body.extend_from_slice(&0x200u32.to_le_bytes());
+                                            (0, body)
+                                        }
+                                        (304, 2) => (0, 32768u32.to_le_bytes().to_vec()),
+                                        (262, 14) => (
+                                            0,
+                                            [0x100u32, 8000, 0x100, 0x200, 128, 0, 8000]
+                                                .into_iter()
+                                                .flat_map(u32::to_le_bytes)
+                                                .collect(),
+                                        ),
+                                        _ => (0xc051, Vec::new()),
+                                    }
+                                } else {
+                                    plain.lock().unwrap().push((device, start, points));
+                                    match device {
+                                        0xa8 | 0xaf => (
+                                            0,
+                                            (0..u32::from(points))
+                                                .flat_map(|at| {
+                                                    match (device, start + at) {
+                                                        (0xa8, 100) => 77u16,
+                                                        (0xaf, 10) => 0x1234,
+                                                        _ => 0,
+                                                    }
+                                                    .to_le_bytes()
+                                                })
+                                                .collect(),
+                                        ),
+                                        _ => (0xc051, Vec::new()),
+                                    }
+                                }
+                            }
+                            other => panic!("unexpected command {other:#x}"),
+                        };
+                        let mut response = if three_e {
+                            let mut head = vec![0xd0, 0];
+                            head.extend_from_slice(&route);
+                            head
+                        } else {
+                            let mut head = vec![0xd4, 0, request[2], request[3], 0, 0];
+                            head.extend_from_slice(&route);
+                            head
+                        };
+                        response.extend_from_slice(
+                            &u16::try_from(body.len() + 2).unwrap().to_le_bytes(),
+                        );
+                        response.extend_from_slice(&end_code.to_le_bytes());
+                        response.extend_from_slice(&body);
+                        if socket.write_all(&response).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+        Self {
+            address,
+            requests,
+            sd,
+            plain,
+            writes,
+            type_name,
+            task,
+        }
+    }
+
+    /// The SD reads, deduplicated and sorted (the periodic collection repeats).
+    fn sd_set(&self) -> Vec<(u32, u16)> {
+        let mut sd = self.sd.lock().unwrap().clone();
+        sd.sort_unstable();
+        sd.dedup();
+        sd
+    }
+
+    /// The non-SD word reads, deduplicated and sorted.
+    fn plain_set(&self) -> Vec<(u8, u32, u16)> {
+        let mut plain = self.plain.lock().unwrap().clone();
+        plain.sort_unstable();
+        plain.dedup();
+        plain
+    }
+
+    fn requests(&self) -> Vec<Fx5Request> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    fn writes(&self) -> Vec<Vec<u8>> {
+        self.writes.lock().unwrap().clone()
+    }
+}
+
+impl Drop for Fx5Peer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+/// A saved connection to `peer` (`settings` are the guest settings besides
+/// host and port; integer-looking values are sent as integers) with the given
+/// tags `(name, address, dataType, writable)` in one 100 ms group, started.
+async fn fx5_app(
+    label: &str,
+    peer: &Fx5Peer,
+    settings: &[(&str, &str)],
+    tags: &[(&str, &str, &str, bool)],
+) -> (super::TestApp, i64, Vec<i64>, i64) {
+    let mut connection_settings = serde_json::json!({
+        "host": "127.0.0.1",
+        "port": peer.address.port(),
+    });
+    for (key, value) in settings {
+        connection_settings[*key] = match value.parse::<i64>() {
+            Ok(number) => serde_json::json!(number),
+            Err(_) => serde_json::json!(value),
+        };
+    }
+    let app =
+        super::test_app_with_operational_write_manifest(label, MANIFEST, &new_guest_component())
+            .await;
+    let saved = app
+        .manager
+        .plc_connections()
+        .create_settings(super::ConnectionSettingsInput {
+            name: "line".into(),
+            protocol: "slmp-wasm-operational-write".into(),
+            enabled: true,
+            simulation: false,
+            settings: connection_settings.as_object().unwrap().clone(),
+            secrets: Default::default(),
+        })
+        .await
+        .unwrap();
+    let group = super::CollectionGroupService::with_registry(
+        app.pool.clone(),
+        app.manager.registry().clone(),
+    )
+    .create(super::group_input("group", saved.id, 100))
+    .await
+    .unwrap();
+    let mut ids = Vec::new();
+    for (name, address, data_type, writable) in tags {
+        let mut input = super::tag_input(name, group.id, address, data_type);
+        input.writable = *writable;
+        ids.push(app.manager.tags().create(input).await.unwrap().id);
+    }
+    app.commit_and_start().await;
+    (app, saved.id, ids, group.id)
+}
+
+/// Guest #73 (G2c) through the real Hub path: an FX5U on a `frame=3e` own
+/// station connection. Saved D and file register `R<n>` tags are collected Good
+/// and answer read-now (the Hub adapter accepts area `R` as a numeric tag);
+/// X, Y, ZR and `U\G` tags stay Bad and are never sent. The handshake is 0101
+/// with 0010H, then SD280-283 and SD304-305 (no bit SD, no write allowed), every
+/// request after 0101 carries 0000H, and every frame is a 3E to the own
+/// station. No 1401 is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #73 component"]
+async fn new_guest_saved_fx5_3e_tags_read_d_and_r_but_not_x_y_zr_or_ug() {
+    let peer = Fx5Peer::start(("FX5U-32MR/ES", 0x4a21)).await;
+    let tags = [
+        ("d100", "D100", "u16", Some(serde_json::json!(77.0))),
+        ("r10", "R10", "u16", Some(serde_json::json!(4660.0))),
+        ("x0", "X0", "bit", None),
+        ("y0", "Y0", "bit", None),
+        ("zr10", "ZR10", "u16", None),
+        ("ug", "U0\\G7", "u16", None),
+    ];
+    let (app, connection_id, ids, _) = fx5_app(
+        "t12-new-guest-fx5-3e",
+        &peer,
+        &[("frame", "3e")],
+        &tags
+            .iter()
+            .map(|(name, address, data_type, _)| (*name, *address, *data_type, false))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let mut status = app.sessions.status_watch(connection_id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let sample_of = |id: i64| {
+        app.manager
+            .current_values()
+            .and_then(|values| values.get(&format!("tag:{id}")))
+    };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if tags.iter().zip(&ids).all(|((.., value), &id)| {
+                value.is_none() || sample_of(id).is_some_and(|s| s.quality == Quality::Good)
+            }) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("D and R are collected Good");
+    // Let a few more cycles run so a stray request would show.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    for ((name, address, _, value), &id) in tags.iter().zip(&ids) {
+        let (status, body) = super::admin_get(
+            &app.router,
+            &format!("/api/v1/values/line.group.{name}/read-now"),
+            &app.admin_token,
+        )
+        .await;
+        match value {
+            Some(value) => {
+                assert_eq!(status, super::StatusCode::OK, "{address}: {body:?}");
+                assert_eq!(body["v"], *value, "{address}: {body:?}");
+                assert_eq!(body["q"], "good", "{address}: {body:?}");
+            }
+            None => {
+                assert!(
+                    !status.is_success(),
+                    "{address} read-now: {status} {body:?}"
+                );
+                assert_ne!(
+                    sample_of(id).map(|s| s.quality),
+                    Some(Quality::Good),
+                    "{address}"
+                );
+            }
+        }
+    }
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+    assert_eq!(peer.sd_set(), vec![(280, 4), (304, 2)]);
+    assert_eq!(peer.plain_set(), vec![(0xa8, 100, 1), (0xaf, 10, 1)]);
+    assert!(peer.writes().is_empty(), "no 1401");
+    let requests = peer.requests();
+    assert_eq!(requests[0], (0x50, OWN_ROUTE, 0x0010, 0x0101));
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|&(sub, route, timer, _)| sub == 0x50 && route == OWN_ROUTE && timer == 0),
+        "every request after 0101 is a 3E own-station request with timer 0000H: {requests:02x?}"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|&&(.., command)| command == 0x0101)
+            .count(),
+        1
+    );
+}
+
+/// Guest #73 (G2c): an FX5 pair reached with the default 4E frame, or with 3E
+/// but another station, is handled like an unknown model. The guest asks 0101
+/// (0010H) and then sends nothing: no SD read, no device read. No tag is ever
+/// collected Good and read-now fails. (The mock answers a 4E 0101 although a
+/// real FX5 does not.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #73 component"]
+async fn new_guest_saved_fx5_over_4e_or_another_station_is_never_good() {
+    let cases: [(&str, &[(&str, &str)]); 2] = [
+        ("4e", &[]),
+        (
+            "3e-station",
+            &[("frame", "3e"), ("network_no", "1"), ("station_no", "1")],
+        ),
+    ];
+    for (label, settings) in cases {
+        let peer = Fx5Peer::start(("FX5UC-32MT/D", 0x4a91)).await;
+        let (app, _, ids, _) = fx5_app(
+            &format!("t12-new-guest-fx5-{label}"),
+            &peer,
+            settings,
+            &[("d100", "D100", "u16", false), ("r10", "R10", "u16", false)],
+        )
+        .await;
+        // Wait (bounded) until the guest has asked 0101 and read-now has failed.
+        let statuses = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let mut results = Vec::new();
+                for name in ["d100", "r10"] {
+                    results.push(
+                        super::admin_get(
+                            &app.router,
+                            &format!("/api/v1/values/line.group.{name}/read-now"),
+                            &app.admin_token,
+                        )
+                        .await,
+                    );
+                }
+                if peer.type_name.load(Ordering::SeqCst) >= 1
+                    && results.iter().all(|(status, _)| !status.is_success())
+                {
+                    break results;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the guest sent 0101 and read-now failed");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        for (status, body) in &statuses {
+            assert!(!status.is_success(), "{label} read-now: {status} {body:?}");
+        }
+        for id in &ids {
+            assert_ne!(
+                app.manager
+                    .current_values()
+                    .and_then(|values| values.get(&format!("tag:{id}")))
+                    .map(|s| s.quality),
+                Some(Quality::Good),
+                "{label}"
+            );
+        }
+        drop(app);
+        let requests = peer.requests();
+        assert!(
+            requests
+                .iter()
+                .all(|&(.., timer, command)| command == 0x0101 && timer == 0x0010),
+            "{label}: only 0101 with 0010H: {requests:02x?}"
+        );
+        assert!(peer.sd_set().is_empty(), "{label}: no SD read");
+        assert!(peer.plain_set().is_empty(), "{label}: no device read");
+        assert!(peer.writes().is_empty(), "{label}: no 1401");
+    }
+}
+
+/// Guest #73 (G2c): through the Hub's REST write gate an allowed D write on an
+/// FX5 (3E) is one 1401/0000 with monitoring timer 0000H, and a write to the
+/// file register `R<n>` never reaches the PLC (not even with a key that allows
+/// the tag; the Hub also refuses to register a writable `R<n>` tag), so the peer
+/// still sees exactly the one D frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #73 component"]
+async fn new_guest_fx5_3e_d_write_is_one_1401_and_r_is_never_written() {
+    use banto_hub_core::api_keys::ApiKeysService;
+
+    let peer = Fx5Peer::start(("FX5S-30MR/ES", 0x4b4e)).await;
+    let (app, connection_id, _, group_id) = fx5_app(
+        "t12-new-guest-fx5-write",
+        &peer,
+        &[
+            ("frame", "3e"),
+            ("d_u16_write_mode", "enabled"),
+            ("d_u16_write_allowlist", "D3010-D3013"),
+        ],
+        &[
+            ("d3010", "D3010", "u16", true),
+            ("r10", "R10", "u16", false),
+        ],
+    )
+    .await;
+    // The Hub does not even let a file register tag be marked writable.
+    let mut writable_r = super::tag_input("r11", group_id, "R11", "u16");
+    writable_r.writable = true;
+    let refused = app.manager.tags().create(writable_r).await;
+    assert!(
+        matches!(&refused, Err(error) if format!("{error:?}").contains("writable")),
+        "a writable R tag is refused at registration: {refused:?}"
+    );
+    let mut status = app.sessions.status_watch(connection_id).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        status.wait_for(|state| *state == banto_broker::BrokerConnectionStatus::Connected),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let api_keys = ApiKeysService::new(app.pool.clone());
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    let issued = api_keys
+        .issue(
+            "fx5-loopback-writer",
+            vec![
+                "write:line.group.d3010".into(),
+                "write:line.group.r10".into(),
+            ],
+            Some(now_ms + 600_000),
+        )
+        .await
+        .unwrap();
+    app.write_control.enable();
+    let (r_status, r_body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/v1/values/batch",
+        &issued.key,
+        serde_json::json!({"writes": [{"tag": "line.group.r10", "v": 1}]}),
+    )
+    .await;
+    let after_r = peer.writes();
+    let (d_status, d_body) = super::admin_write(
+        &app.router,
+        "POST",
+        "/api/v1/values/batch",
+        &issued.key,
+        serde_json::json!({"writes": [{"tag": "line.group.d3010", "v": 4660}]}),
+    )
+    .await;
+    let revoked = api_keys.revoke(issued.id).await;
+    app.write_control.disable();
+    assert!(revoked.unwrap().revoked_at.is_some());
+    assert_eq!(app.sessions.connection_count(), 1);
+    drop(app);
+
+    assert!(
+        !r_status.is_success() || r_body["writes"][0]["ok"] == false,
+        "R write is refused: {r_status} {r_body:?}"
+    );
+    assert!(after_r.is_empty(), "no 1401 for R: {after_r:02x?}");
+    assert_eq!(d_status, super::StatusCode::OK, "{d_body:?}");
+    assert_eq!(d_body["writes"][0]["ok"], true, "{d_body:?}");
+    // 3E, own station, length 14 = timer + 1401/0000 + D3010 (0BC2) x 1.
+    assert_eq!(
+        peer.writes(),
+        vec![vec![
+            0x50, 0x00, 0x00, 0xff, 0xff, 0x03, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x01, 0x14, 0x00,
+            0x00, 0xc2, 0x0b, 0x00, 0xa8, 0x01, 0x00, 0x34, 0x12
+        ]]
+    );
+    let requests = peer.requests();
+    assert!(
+        requests[1..]
+            .iter()
+            .all(|&(sub, _, timer, _)| sub == 0x50 && timer == 0),
+        "{requests:02x?}"
+    );
+}

@@ -747,8 +747,13 @@ jobs:
           # is device 10; letters are rejected). #72 (G2b) identifies the iQ-R
           # process CPU (RnPCPU, reads S like R), SIL2 process CPU (RnPSFCPU),
           # safety CPU (RnSFCPU) and MX-R (these three have no S) as standard R
-          # by the exact 0101 name/code pair. WIT and Hub are unchanged.
-          $newSlmpSha = 'b705fd2478a1ab53ba33ed41aeab7e2e57efa360'
+          # by the exact 0101 name/code pair. #73 (G2c) identifies the FX5
+          # (iQ-F: a code in the FX5 table and a name starting with FX5); it
+          # is read and written over 3E to the own station only (4E or another
+          # station is treated like an unknown model), with monitoring timer
+          # 0000H after 0101, and adds the read-only file register R (FX5
+          # only). WIT and Hub are unchanged.
+          $newSlmpSha = 'aa3a1c17d52d13614b17f80e85c90fece79985a1'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
           foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
@@ -818,10 +823,19 @@ jobs:
           if (-not (Select-String -Path $slmpG2bLog -Pattern '^test result: ok\. 4 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP G2b component tests did not all run'
           }
+          # Component-level G2c (FX5 recognized by code table plus FX5 name on
+          # 3E own station; R<n> read-only and FX5 only; X/Y/ZR/U\G per-item
+          # Unsupported; 4E or another station is Unknown; D/M writes only).
+          $slmpG2cLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-g2c-models-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_g2c_models --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpG2cLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP G2c component tests failed' }
+          if (-not (Select-String -Path $slmpG2cLog -Pattern '^test result: ok\. 7 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP G2c component tests did not all run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
-          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 51 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 54 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.
