@@ -187,6 +187,9 @@
 ;       いれば `sc delete ChronoGazer`）を行う。非 0（または起動できない）で失敗
 ;       したら止めたサービスを再開し（戻せなければそれも案内）、メッセージを
 ;       出して `Abort` する（ファイルを消す前に止まる）。
+;       成功・未登録skip後もDeleteFlagを確認し、DWORD 1なら停止元フラグを消費して
+;       再登録・再開せずファイルを保持して中止する。値なし・読取エラーは継続する
+;       Hub同等の限定判定であり、厳密なSCM状態判定ではない。
 ;   (c) テンプレートの `Delete` で 3 つの exe を消す。
 ;   (d) **消えたことの確かめ**（RequireChronoGazerExesDeleted）: 1 つでも残って
 ;       いれば（(a) の後に起動された・ウイルス対策のロック）、`uninstall.exe` と
@@ -593,9 +596,10 @@ Var ChronoGazerAclAbortTarget
 !macroend
 
 ; P6 (d): テンプレートの `Delete` の後に exe が残っていれば、`uninstall.exe` と
-; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。サービスの登録は
-; もう解除されているので、elev が残っていれば `service-install` で戻してから
-; 止めていたサービスを再開する。戻せなければ手順を案内する。どちらも `Abort`。
+; 「アプリ」の登録を消す前に止める（上の PREUNINSTALL の (d)）。この処理へは
+; ファイル削除前の保留検査を通過した場合だけ進む。通常、登録は既に解除されて
+; いるため、elev が残っていれば `service-install` で戻してから再開を試みる。
+; 戻せなければ手順を案内する。どちらも `Abort`。
 ; $0〜$3 を壊す。
 !macro RequireChronoGazerExesDeleted
   StrCpy $2 ""
@@ -741,7 +745,8 @@ Var ChronoGazerAclAbortTarget
 !macroend
 
 ; `un.onUninstFailed`（テンプレートの当て直し P4 が挿入する）。アンインストールの
-; 中止の道はサービスをその場で戻して案内済みなので、ここはシェルの案内だけ
+; 中止時は復旧可能な道でのみ再開を試み、削除保留なら戻さずファイルを保持する。
+; いずれもその場で案内済みなので、ここはシェルの案内だけ
 ; （シェルを終了させた後で中止したとき）。
 !macro ChronoGazerOnUninstFailed
   ${If} $ChronoGazerShellWasQuit == "1"
@@ -818,6 +823,24 @@ Var ChronoGazerAclAbortTarget
 ; 登録されたサービスが消えた exe を指す状態にならない）。chronogazer-elev.exe も
 ; chronogazer-server.exe も無いときは、登録が残っていれば `sc delete` で解除し、それも
 ; 失敗したら同じく止める（登録が無ければそのまま続ける。#972 のオーナーレビュー P2）。
+; DeleteService が成功しても、他のハンドルが残ると削除完了が保留され得る。
+; Hub同様、DeleteFlag DWORD 1だけを検出する。値なし/読取エラーは継続するため、
+; 厳密なSCM判定ではなく、最終検査後の競合も防がない。
+; $4 を壊す。
+!macro RequireChronoGazerServiceDeleteNotPending
+  ClearErrors
+  ReadRegDWORD $4 HKLM "SYSTEM\CurrentControlSet\Services\ChronoGazer" "DeleteFlag"
+  ${If} ${Errors}
+    ClearErrors
+  ${ElseIf} $4 == 1
+    ; 削除保留は再登録・再開できないので、停止元のフラグを消費する。
+    StrCpy $ChronoGazerWasRunning "0"
+    DetailPrint "chronogazer: ChronoGazer サービスの削除が保留中です。再登録・再開はせず、ファイルを保持してアンインストールを中止します。"
+    MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの削除が保留中です（別の管理ツールなどがサービスを開いたままです）。ファイル・アンインストーラ・アプリの登録・データを残して中止します。保留中の登録の戻しと再開は試みていません。開いている管理ツールを閉じるか、Windowsを再起動してから、もう一度アンインストールしてください。" /SD IDOK
+    Abort "ChronoGazer サービスの削除が保留中のため、アンインストールを中止しました。"
+  ${EndIf}
+!macroend
+
 !macro UnregisterChronoGazerService
   DetailPrint "chronogazer: Windows サービス (ChronoGazer) の登録を解除しています..."
   ; 登録が無ければ解除は要らない（インストールの登録が失敗した・利用者が先に
@@ -853,6 +876,9 @@ Var ChronoGazerAclAbortTarget
     MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの登録解除に失敗しました（終了コード $2）。ファイルは消さずにアンインストールを中止します。止めたサービスは再開を試みました。apps/chronogazer/README.md「昇格ヘルパー chronogazer-elev」の手順で対処してから、もう一度アンインストールしてください。" /SD IDOK
     Abort "ChronoGazer サービスの登録解除に失敗したため、アンインストールを中止しました。"
   ${EndIf}
+
+  ; ImagePathが空で解除を飛ばした場合も、ファイル削除前に保留を確認する。
+  !insertmacro RequireChronoGazerServiceDeleteNotPending
 
   ; %ProgramData%\ChronoGazer\（DB・時系列データ・Hub のキー・ログ）は意図的に
   ; 削除しない（再インストールでデータが戻ることを優先する）。完全削除は利用者が
