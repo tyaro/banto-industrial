@@ -1,56 +1,90 @@
-name: Installer GUI capability
+name: Installer delete-pending (disposable Windows)
 
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/installer-delete-pending.yml'
+      - 'crates/banto-service-control/**'
+      - 'apps/chronogazer/installer/**'
+      - 'installer-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
 
 permissions:
   contents: read
 
 concurrency:
-  group: installer-gui-capability-${{ github.ref }}
+  group: installer-delete-pending-${{ github.workflow }}-${{ github.ref }}
+  # Allow in-flight cleanup to finish rather than cancel it for a new head.
   cancel-in-progress: false
 
 jobs:
-  gui-capability:
+  disposable-scm:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 30
     env:
-      BANTO_973_GUI_TEST: github-hosted-gui-capability-only-v1
-      BANTO_973_EXPECTED_SHA: ${{ github.sha }}
+      BANTO_973_SCM_TEST: github-hosted-disposable-only-v1
+      BANTO_973_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     defaults:
       run:
         shell: pwsh
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - name: Validate hosted environment and create fresh GUI-only root
+      - name: Refuse non-hosted/non-admin execution and create fresh proof root
         run: |
           $ErrorActionPreference = 'Stop'
-          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'GitHub-hosted Windows only' }
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable GitHub-hosted Windows only' }
           $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
           $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Admin token required; no UAC requested' }
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Admin token required; no UAC is requested' }
           $head = (git rev-parse HEAD).Trim()
-          if ($LASTEXITCODE -ne 0 -or $head -ne $env:BANTO_973_EXPECTED_SHA) { throw 'Immutable SHA mismatch' }
-          $root = Join-Path $env:RUNNER_TEMP ('Banto973Gui-' + [guid]::NewGuid())
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:BANTO_973_EXPECTED_SHA) { throw 'Immutable checkout SHA mismatch' }
+          $root = Join-Path $env:RUNNER_TEMP ('Banto973-' + [guid]::NewGuid())
           New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
           New-Item -ItemType Directory -Path (Join-Path $root 'proof') | Out-Null
-          [IO.File]::WriteAllText((Join-Path $root '.banto-973-gui'), "$env:GITHUB_RUN_ID`n$head`n", [Text.UTF8Encoding]::new($false))
-          "BANTO_973_GUI_ROOT=$root" >> $env:GITHUB_ENV
-          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; runner_environment=$env:RUNNER_ENVIRONMENT; workflow_sha256=(Get-FileHash -LiteralPath '.github/workflows/installer-gui-capability.yml' -Algorithm SHA256).Hash; image_os=$env:ImageOS; image_version=$env:ImageVersion; service_operations=0; ChronoGazer_UI_test='not_executed' } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
-      - name: Pure GUI capability regression (no Win32 API loading)
-        run: python -B -m unittest discover -s apps/chronogazer/installer/tests -p test_windows_gui_capability.py
-      - name: Observe own calibration window and desktop crop (not ChronoGazer acceptance)
-        run: python -B apps/chronogazer/installer/tests/windows_gui_capability.py
+          [IO.File]::WriteAllText((Join-Path $root '.banto-973-ci'), "$env:GITHUB_RUN_ID`n$head`n", [Text.UTF8Encoding]::new($false))
+          "BANTO_973_SCM_ROOT=$root" >> $env:GITHUB_ENV
+          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; runner_environment=$env:RUNNER_ENVIRONMENT; image_os=$env:ImageOS; image_version=$env:ImageVersion } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build guarded production probe (never start service)
+        run: |
+          cargo build -p banto-service-control --example delete_pending_probe --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath target/debug/examples/delete_pending_probe.exe -Destination (Join-Path $env:BANTO_973_SCM_ROOT 'probe.exe') -ErrorAction Stop
+      - name: Locate NSIS, or install explicit 3.13.0 package on disposable runner
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nsis = @((Get-Command makensis.exe -ErrorAction SilentlyContinue).Source, "${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $nsis) {
+            # Fixed published package: https://community.chocolatey.org/packages/nsis/3.13.0
+            choco install nsis --version=3.13.0 --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $nsis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          }
+          if (-not $nsis) { throw 'makensis missing after fixed installation' }
+          "BANTO_973_MAKENSIS=$nsis" >> $env:GITHUB_ENV
+          @{ makensis_version=(& $nsis /VERSION | Out-String).Trim(); rustc=(& rustc --version | Out-String).Trim(); python=(& python --version | Out-String).Trim() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BANTO_973_SCM_ROOT 'proof/toolchain.json')
+      - name: Production registration + actual NSIS delete-pending cases
+        run: python -B apps/chronogazer/installer/tests/nsis_delete_pending_scm.py --makensis $env:BANTO_973_MAKENSIS --include-counterexample
+      - name: Independently verify cleanup of this run's exact owned objects
+        if: always() && env.BANTO_973_SCM_ROOT != ''
+        run: python -B apps/chronogazer/installer/tests/nsis_delete_pending_scm.py --cleanup-only
       - uses: actions/upload-artifact@v7
-        if: always() && env.BANTO_973_GUI_ROOT != ''
+        if: always() && env.BANTO_973_SCM_ROOT != ''
         with:
-          name: installer-gui-capability-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ env.BANTO_973_GUI_ROOT }}/proof/
+          name: installer-delete-pending-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.BANTO_973_SCM_ROOT }}/proof/
+            !${{ env.BANTO_973_SCM_ROOT }}/proof/**/*.exe
+            !${{ env.BANTO_973_SCM_ROOT }}/proof/**/install/**
           if-no-files-found: error
           retention-days: 14
