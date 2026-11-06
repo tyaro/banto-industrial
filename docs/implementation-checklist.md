@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
+最終更新: 2026-11-07（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
 2026-11-06（§5 にWindows拡張長prefix除去後の同一対象確認を追加。#1050）
 2026-11-06（§6 に「head の push 前に PR 本文の対象範囲・検証欄を同期し、自動レビューが参照した本文・head を確認する」を追加。#1047）
 2026-11-02（§2 に「脆弱性の対応の `cargo update -p <crate> --precise` でも無関係な依存が付け替わる。`Cargo.lock` の差分を全部読む」を追加。RUSTSEC-2026-0433、#1016）
@@ -99,6 +99,9 @@
 
 ## 3. E2E の罠（全部踏んだ）
 
+- [ ] **MB_OK の MessageBox の OK ボタンの control ID は IDCANCEL（2）**。`WM_COMMAND(IDOK)` を送っても閉じない。子の Button を選び、`GetDlgCtrlID` で取った ID と hwnd を付けた BN_CLICKED で押す（#973 lock-abort、2026-11-07）。
+- [ ] **`#32770` は MessageBox も NSIS の主窓も同じ class**（title も `Caption` が同じ）。pid・owner（`GetWindow(GW_OWNER)` 非 0）・子 Static の文面で同定する。非 silent の `.onInstFailed` は、失敗頁の主窓を閉じたときに呼ばれる（#973 lock-abort、2026-11-07）。
+- [ ] **windows-service crate は空白の無い exe のパスをクォートせずに SCM へ登録する**。ImagePath の照合は、クォートありとなしの両方の形を受け付ける（#973 lock-abort、2026-11-07）。
 - [ ] **親HWNDがvisibleになっただけで待機を終えず、子labelなど必要状態が揃うまで上限付きで待つ**。GUI probeで親窓が子labelより先に観測され、直後の子列挙が空になった（#973、2026-11-06）。
 
 - [ ] `BantoGrid` は行を仮想化していて **CI の描画窓は 20 行**。行を名前でクリックする前に検索ボックスかツリーで絞る。

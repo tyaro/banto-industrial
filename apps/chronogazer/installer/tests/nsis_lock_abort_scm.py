@@ -613,9 +613,8 @@ def case_c(trial, makensis, report):
             time.sleep(.15)
         # 16. exit 後。
         result["returncode"] = child.returncode
-        # 非 silent の exit code は初回 run で確定する。現状は非 0 だけを要求し、
-        # 初回 run の観測値（abort で 2 の想定）を確かめたら == 2 に締める。
-        require(child.returncode != 0, "installer_exit_zero")
+        # 非 silent で Abort したときの終了コードは 2（run 42275525115 で確認）。
+        require(child.returncode == 2, "installer_exit_not_2")
         monitor.hold(1.0, "after-exit")
         entry, events, beats = monitor.sample("after-exit")
         problems = event_problems(events, final=True)
