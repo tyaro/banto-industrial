@@ -449,8 +449,7 @@ mod windows {
             image_path: image_path(&exe, &run_id, &sha),
         })
         .map_err(|e| e.to_string())?
-            + "
-";
+            + "\n";
         // 登録より先に束縛を書く（run-service が起動時に読む）。
         std::fs::write(root.join("dummy").join("binding.json"), binding)
             .map_err(|e| format!("binding.json: {e}"))?;
