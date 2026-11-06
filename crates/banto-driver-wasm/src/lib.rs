@@ -28,7 +28,10 @@ use api::{
     TagVerdict,
 };
 use banto_driver_api as api;
-use operational_write::{WriteArea, WritePolicy, ALLOWLIST_KEY, MODE_KEY};
+use operational_write::{
+    WriteArea, WritePolicy, ALLOWLIST_KEY, LABEL_ALLOWLIST_KEY, LABEL_AREA,
+    MAX_LABEL_ALLOWLIST_LEN, MODE_KEY,
+};
 use runtime::diagnostics_v1::{
     banto::driver::types as diagnostic_types,
     exports::banto::driver::{diagnostics_v1 as diagnostic, session as diagnostic_session},
@@ -449,7 +452,7 @@ fn validate_operational_schema(
 ) -> Result<(), LoadError> {
     if secrets
         .iter()
-        .any(|key| key == MODE_KEY || key == ALLOWLIST_KEY)
+        .any(|key| key == MODE_KEY || key == ALLOWLIST_KEY || key == LABEL_ALLOWLIST_KEY)
     {
         return Err(LoadError::Contract(
             "write policy fields must not be guest secrets".into(),
@@ -470,7 +473,21 @@ fn validate_operational_schema(
             && matches!(&field.kind, FieldKind::Text { max_len: Some(max_len), .. }
                 if *max_len <= 256)
     });
-    if !mode_ok || !allowlist_ok {
+    // G3 (banto-driver-wasm #74): a guest that declares the label allowlist
+    // must declare it like the D/W one: a text field, empty by default, no
+    // longer than the Host gate's own 2048-character limit. A guest without
+    // the field (before G3) never receives a label list, because the saved
+    // settings only hold keys of the guest's schema.
+    let labels_ok = fields
+        .iter()
+        .find(|field| field.key == LABEL_ALLOWLIST_KEY)
+        .is_none_or(|field| {
+            (field.default.is_none()
+                || matches!(&field.default, Some(SettingValue::Text(value)) if value.is_empty()))
+                && matches!(&field.kind, FieldKind::Text { max_len: Some(max_len), .. }
+                    if *max_len as usize <= MAX_LABEL_ALLOWLIST_LEN)
+        });
+    if !mode_ok || !allowlist_ok || !labels_ok {
         return Err(LoadError::Contract(
             "operational write requires disabled-by-default mode and bounded empty allowlist schema"
                 .into(),
@@ -535,8 +552,9 @@ fn checked_parsed_address(
 const MAX_STRING_WORDS: u16 = 128;
 
 /// #914 C1: a string tag spans `words` words of a word area, read and written
-/// as one request. The Hub accepts it only on SLMP D/W and Modbus holding /
-/// input registers. A Modbus request carries at most 123 registers, so a
+/// as one request. The Hub accepts it only on SLMP D/W (and, since G3, a
+/// GX Works3 global label, area `@`) and Modbus holding / input registers.
+/// A Modbus request carries at most 123 registers, so a
 /// Modbus string longer than that is refused here, at registration (the
 /// registry calls `parse_address`), and again by the write gate.
 fn checked_string_words(driver: &DriverId, words: u16, area: &str) -> Result<u16, AddressError> {
@@ -554,9 +572,9 @@ fn checked_string_words(driver: &DriverId, words: u16, area: &str) -> Result<u16
                 "Modbus WASM string tags need a holding or input register area",
             ));
         }
-    } else if !matches!(area, "D" | "W") && !is_unit_buffer_area(area) {
+    } else if !matches!(area, "D" | "W" | LABEL_AREA) && !is_unit_buffer_area(area) {
         return Err(AddressError::new(
-            "WASM string tags need a D, W or U\\G word area",
+            "WASM string tags need a D, W or U\\G word area or an @ label",
         ));
     }
     Ok(words)
@@ -898,6 +916,17 @@ fn operational_write_item(
     };
     if items
         .iter()
+        .any(|item| item.spec.address.area == LABEL_AREA)
+    {
+        return operational_label_items(items, driver_id, policy).map_err(|reason| {
+            WriteProgress::Done(vec![
+                Err(ItemError::Unsupported(reason.into()));
+                items.len()
+            ])
+        });
+    }
+    if items
+        .iter()
         .any(|item| matches!(item.spec.kind, TagKind::Str { .. }))
     {
         return operational_string_item(items, driver_id, policy).map_err(|reason| {
@@ -1063,6 +1092,99 @@ fn operational_string_item(
         },
         value: write_types::Value::Bytes(bytes),
     }])
+}
+
+/// G3 (banto-driver-wasm #74): a request naming a GX Works3 global label
+/// (area `@`, no index or bit) must consist only of distinct labels of this
+/// driver, each allowed by `label_write_allowlist` under the enabled mode. A
+/// request mixing labels with device tags, naming a label twice, or holding a
+/// label outside the list is refused as a whole before anything is planned,
+/// so the guest sends neither its type-check 041C nor the 141B.
+///
+/// Values follow the device tags' rules: bool for `bit`, integral and in range
+/// for u16/i16/u32/i32, finite for f32/f64 (labels have no 64-bit integer
+/// type, and the guest refuses i64/u64 at parse). A string label is the
+/// encoded text 0x00-padded to `2 x words` bytes ([`encoded_string`]); the
+/// Hub passes a value that fills every byte as is, and the guest refuses it
+/// (`rejected`, nothing written) because a label string needs a NUL end byte.
+/// The guest itself checks each label's data type ID and length with 041C
+/// before the 141B and writes nothing on any mismatch.
+fn operational_label_items(
+    items: &[WriteItem],
+    driver_id: &DriverId,
+    policy: &WritePolicy,
+) -> Result<Vec<write::WriteItem>, &'static str> {
+    const OUTSIDE: &str = "SLMP write is disabled or outside the connection allowlist";
+    let mut seen = BTreeSet::new();
+    let mut checked = Vec::with_capacity(items.len());
+    for item in items {
+        let address = &item.spec.address;
+        if address.area != LABEL_AREA {
+            return Err("labels cannot share a write request with device tags");
+        }
+        // `None` for a string label, else the numeric type.
+        let (words, numeric) = match item.spec.kind {
+            TagKind::Numeric(kind @ (DataType::Bit | DataType::U16 | DataType::I16)) => {
+                (1, Some(kind))
+            }
+            TagKind::Numeric(kind @ (DataType::U32 | DataType::I32 | DataType::F32)) => {
+                (2, Some(kind))
+            }
+            TagKind::Numeric(DataType::F64) => (4, Some(DataType::F64)),
+            TagKind::Str { words, .. } => (words, None),
+            _ => return Err("label tags are bit, u16, i16, u32, i32, f32, f64 or string"),
+        };
+        if words == 0
+            || address.driver != *driver_id
+            || address.index.is_some()
+            || address.bit.is_some()
+            || address.word_count != words
+            || !address.writable_area
+            || !policy.allows_label(&address.canonical)
+        {
+            return Err(OUTSIDE);
+        }
+        if !seen.insert(address.canonical.as_str()) {
+            return Err("a label must not be written twice in one request");
+        }
+        const MISFIT: &str = "label value does not fit the tag type";
+        let value = match (numeric, &item.spec.kind, &item.value) {
+            (None, TagKind::Str { words, encoding }, value) => {
+                write_types::Value::Bytes(encoded_string(value, *words, *encoding).ok_or(MISFIT)?)
+            }
+            (Some(DataType::Bit), _, api::Value::Bit(bit)) => write_types::Value::Bool(*bit),
+            (Some(kind), _, api::Value::F64(value))
+                if value.is_finite()
+                    && match kind {
+                        DataType::U16 => value.fract() == 0.0 && (0.0..=65535.0).contains(value),
+                        DataType::I16 => {
+                            value.fract() == 0.0 && (-32768.0..=32767.0).contains(value)
+                        }
+                        DataType::U32 => {
+                            value.fract() == 0.0 && (0.0..=4294967295.0).contains(value)
+                        }
+                        DataType::I32 => {
+                            value.fract() == 0.0 && (-2147483648.0..=2147483647.0).contains(value)
+                        }
+                        DataType::F32 => (*value as f32).is_finite(),
+                        DataType::F64 => true,
+                        _ => false,
+                    } =>
+            {
+                write_types::Value::Float(*value)
+            }
+            _ => return Err(MISFIT),
+        };
+        checked.push(write::WriteItem {
+            spec: write_types::TagSpec {
+                address: address.canonical.clone(),
+                data_type: numeric.map_or_else(|| "string".into(), |kind| kind.to_string()),
+                string_words: numeric.is_none().then_some(u32::from(words)),
+            },
+            value,
+        });
+    }
+    Ok(checked)
 }
 
 /// A request naming a word bit (`D100.5`, `W1A.0`) must consist only of
@@ -2638,6 +2760,321 @@ mod tests {
         assert!(checked_parsed_address(&slmp, &kind(8), unit("U3\\G", 7)).is_err());
         // Never a Modbus area.
         assert!(checked_parsed_address(&modbus, &kind(8), unit("U3\\G", 8)).is_err());
+    }
+
+    /// G3 (banto-driver-wasm #74): a global label is area `@` with no index.
+    /// Numeric labels and string labels pass the tag contract like any other
+    /// address; the string span check accepts `@` on SLMP only.
+    #[test]
+    fn label_addresses_have_no_index_and_strings_accept_the_label_area() {
+        let slmp = DriverId::new("slmp-read-wasm").unwrap();
+        let modbus = DriverId::new("modbus-fc3-wasm").unwrap();
+        let label = |canonical: &str, words: u32| address::Parsed {
+            canonical: canonical.into(),
+            area: "@".into(),
+            writable_area: true,
+            bit: None,
+            word_count: words,
+            index: None,
+        };
+        let string = string_kind(8, StringEncoding::Utf8);
+        let accepted = checked_parsed_address(&slmp, &string, label("@タンク.名前", 8)).unwrap();
+        assert_eq!(
+            (
+                accepted.canonical.as_str(),
+                accepted.area.as_str(),
+                accepted.index
+            ),
+            ("@タンク.名前", "@", None)
+        );
+        assert!(checked_parsed_address(&slmp, &string, label("@S", 7)).is_err());
+        assert!(checked_parsed_address(&modbus, &string, label("@S", 8)).is_err());
+        for (kind, words) in [
+            (DataType::Bit, 1),
+            (DataType::U16, 1),
+            (DataType::I16, 1),
+            (DataType::U32, 2),
+            (DataType::I32, 2),
+            (DataType::F32, 2),
+            (DataType::F64, 4),
+        ] {
+            let parsed =
+                checked_parsed_address(&slmp, &TagKind::numeric(kind), label("@Arr[3]", words))
+                    .unwrap();
+            assert_eq!((parsed.index, parsed.word_count), (None, words as u16));
+        }
+    }
+
+    fn label_item(canonical: &str, kind: TagKind, value: api::Value) -> WriteItem {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let words = kind.word_count();
+        let address = DriverAddress::new(id, canonical, "@", true, words);
+        WriteItem::new(TagSpec::new(address, kind), value)
+    }
+
+    fn label_write_policy(devices: &str, labels: &str) -> WritePolicy {
+        WritePolicy::parse(
+            &Settings::from_pairs([
+                (MODE_KEY, "enabled"),
+                (ALLOWLIST_KEY, devices),
+                (LABEL_ALLOWLIST_KEY, labels),
+            ])
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn operational_label_write_checks_every_label_value_and_the_label_list() {
+        let id = DriverId::new("slmp-wasm-write").unwrap();
+        let policy = label_write_policy("D100-D105", "@Tank1.Level;@Arr[0-9];@タンク.水位;@Name");
+        let numeric = |canonical: &str, kind, value| {
+            label_item(canonical, TagKind::numeric(kind), api::Value::F64(value))
+        };
+        let items = [
+            label_item(
+                "@タンク.水位",
+                TagKind::numeric(DataType::Bit),
+                api::Value::Bit(true),
+            ),
+            numeric("@Tank1.Level", DataType::I16, -32768.0),
+            numeric("@Arr[0]", DataType::U16, 65535.0),
+            numeric("@Arr[1]", DataType::U32, 4294967295.0),
+            numeric("@Arr[2]", DataType::I32, -2147483648.0),
+            numeric("@Arr[3]", DataType::F32, 1.5),
+            numeric("@Arr[9]", DataType::F64, -2.25),
+            label_item(
+                "@Name",
+                string_kind(4, StringEncoding::Utf8),
+                api::Value::Str("ABC".into()),
+            ),
+        ];
+        let checked = operational_write_item(&items, &id, &policy).unwrap();
+        let shape = checked
+            .iter()
+            .map(|item| {
+                (
+                    item.spec.address.as_str(),
+                    item.spec.data_type.as_str(),
+                    item.spec.string_words,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                ("@タンク.水位", "bit", None),
+                ("@Tank1.Level", "i16", None),
+                ("@Arr[0]", "u16", None),
+                ("@Arr[1]", "u32", None),
+                ("@Arr[2]", "i32", None),
+                ("@Arr[3]", "f32", None),
+                ("@Arr[9]", "f64", None),
+                ("@Name", "string", Some(4)),
+            ]
+        );
+        assert!(matches!(checked[0].value, write_types::Value::Bool(true)));
+        assert!(matches!(checked[1].value, write_types::Value::Float(v) if v == -32768.0));
+        assert!(matches!(&checked[7].value,
+            write_types::Value::Bytes(bytes) if bytes == b"ABC\0\0\0\0\0"));
+        // A string that fills every byte is passed on (the guest refuses it for
+        // lacking a NUL end byte).
+        let full = operational_write_item(
+            &[label_item(
+                "@Name",
+                string_kind(2, StringEncoding::Utf8),
+                api::Value::Str("ABCD".into()),
+            )],
+            &id,
+            &policy,
+        )
+        .unwrap();
+        assert!(matches!(&full[0].value, write_types::Value::Bytes(bytes) if bytes == b"ABCD"));
+
+        let outside = "SLMP write is disabled or outside the connection allowlist";
+        for item in [
+            numeric("@Arr[10]", DataType::U16, 1.0),
+            numeric("@tank1.level", DataType::U16, 1.0),
+            numeric("@Other", DataType::U16, 1.0),
+            numeric("@Arr[01]", DataType::U16, 1.0),
+        ] {
+            assert_eq!(
+                refusal(operational_write_item(&[item], &id, &policy), 1),
+                outside
+            );
+        }
+        // One label outside the list refuses the whole request.
+        let mut mixed_list = items.to_vec();
+        mixed_list.push(numeric("@Arr[10]", DataType::U16, 1.0));
+        assert_eq!(
+            refusal(operational_write_item(&mixed_list, &id, &policy), 9),
+            outside
+        );
+        // Labels never share a request with device tags (D100 is allowed).
+        let mixed = [
+            numeric("@Arr[0]", DataType::U16, 1.0),
+            operational_item(100, api::Value::F64(1.0)),
+        ];
+        assert_eq!(
+            refusal(operational_write_item(&mixed, &id, &policy), 2),
+            "labels cannot share a write request with device tags"
+        );
+        let reversed = [mixed[1].clone(), mixed[0].clone()];
+        assert_eq!(
+            refusal(operational_write_item(&reversed, &id, &policy), 2),
+            "labels cannot share a write request with device tags"
+        );
+        // The same label twice.
+        let twice = [
+            numeric("@Arr[0]", DataType::U16, 1.0),
+            numeric("@Arr[0]", DataType::U16, 2.0),
+        ];
+        assert_eq!(
+            refusal(operational_write_item(&twice, &id, &policy), 2),
+            "a label must not be written twice in one request"
+        );
+        // Values out of range, wrong kinds and 64-bit integers.
+        let misfit = "label value does not fit the tag type";
+        for item in [
+            numeric("@Arr[0]", DataType::U16, 65536.0),
+            numeric("@Arr[0]", DataType::U16, -1.0),
+            numeric("@Arr[0]", DataType::U16, 1.5),
+            numeric("@Arr[0]", DataType::I16, 32768.0),
+            numeric("@Arr[0]", DataType::U32, 4294967296.0),
+            numeric("@Arr[0]", DataType::I32, 2147483648.0),
+            numeric("@Arr[0]", DataType::F32, 1e39),
+            numeric("@Arr[0]", DataType::F64, f64::NAN),
+            label_item(
+                "@Arr[0]",
+                TagKind::numeric(DataType::Bit),
+                api::Value::F64(1.0),
+            ),
+            label_item(
+                "@Name",
+                string_kind(2, StringEncoding::Utf8),
+                api::Value::Str("ABCDE".into()),
+            ),
+        ] {
+            assert_eq!(
+                refusal(operational_write_item(&[item], &id, &policy), 1),
+                misfit
+            );
+        }
+        for kind in [DataType::I64, DataType::U64] {
+            assert_eq!(
+                refusal(
+                    operational_write_item(&[numeric("@Arr[0]", kind, 1.0)], &id, &policy),
+                    1
+                ),
+                "label tags are bit, u16, i16, u32, i32, f32, f64 or string"
+            );
+        }
+        // Address metadata that is not the guest's label shape.
+        let mut indexed = numeric("@Arr[0]", DataType::U16, 1.0);
+        indexed.spec.address.index = Some(0);
+        let mut bit = numeric("@Arr[0]", DataType::U16, 1.0);
+        bit.spec.address.bit = Some(0);
+        let mut read_only = numeric("@Arr[0]", DataType::U16, 1.0);
+        read_only.spec.address.writable_area = false;
+        let mut wide = numeric("@Arr[0]", DataType::U16, 1.0);
+        wide.spec.address.word_count = 2;
+        let mut other_driver = numeric("@Arr[0]", DataType::U16, 1.0);
+        other_driver.spec.address.driver = DriverId::new("other").unwrap();
+        for item in [indexed, bit, read_only, wide, other_driver] {
+            assert_eq!(
+                refusal(operational_write_item(&[item], &id, &policy), 1),
+                outside
+            );
+        }
+        // A device list alone, or a disabled mode, writes no label.
+        let devices = label_write_policy("D100-D105", "");
+        let item = numeric("@Arr[0]", DataType::U16, 1.0);
+        assert_eq!(
+            refusal(
+                operational_write_item(std::slice::from_ref(&item), &id, &devices),
+                1
+            ),
+            outside
+        );
+        let disabled = WritePolicy::parse(
+            &Settings::from_pairs([(MODE_KEY, "disabled"), (LABEL_ALLOWLIST_KEY, "@Arr[0-9]")])
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            refusal(operational_write_item(&[item], &id, &disabled), 1),
+            outside
+        );
+        // A label list alone enables labels but no device.
+        let labels_only = label_write_policy("", "@Arr[0-9]");
+        assert!(operational_write_item(
+            &[numeric("@Arr[0]", DataType::U16, 1.0)],
+            &id,
+            &labels_only
+        )
+        .is_ok());
+        assert!(operational_write_item(
+            &[operational_item(100, api::Value::F64(1.0))],
+            &id,
+            &labels_only
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn operational_schema_bounds_a_declared_label_allowlist() {
+        let mode = SettingField::new(
+            MODE_KEY,
+            "Write mode",
+            FieldKind::choice(vec![
+                api::ChoiceOption::new("disabled", "Disabled"),
+                api::ChoiceOption::new("enabled", "Enabled"),
+            ]),
+        )
+        .default("disabled");
+        let allowlist = SettingField::new(
+            ALLOWLIST_KEY,
+            "D/u16 allowlist",
+            FieldKind::Text {
+                max_len: Some(256),
+                placeholder: None,
+            },
+        )
+        .default("");
+        let labels = |max_len, default: &str| {
+            SettingField::new(
+                LABEL_ALLOWLIST_KEY,
+                "Labels",
+                FieldKind::Text {
+                    max_len,
+                    placeholder: None,
+                },
+            )
+            .default(default)
+        };
+        let base = [mode.clone(), allowlist.clone()];
+        let with = |field: SettingField| {
+            let mut fields = base.to_vec();
+            fields.push(field);
+            fields
+        };
+        // Before G3 the field is absent; the guest's G3 field is accepted.
+        assert!(validate_operational_schema(&base, &[]).is_ok());
+        assert!(validate_operational_schema(&with(labels(Some(2048), "")), &[]).is_ok());
+        assert!(validate_operational_schema(&with(labels(Some(64), "")), &[]).is_ok());
+        for bad in [
+            labels(Some(2049), ""),
+            labels(None, ""),
+            labels(Some(2048), "@A"),
+            SettingField::new(LABEL_ALLOWLIST_KEY, "Labels", FieldKind::Secret),
+        ] {
+            assert!(validate_operational_schema(&with(bad), &[]).is_err());
+        }
+        assert!(validate_operational_schema(
+            &with(labels(Some(2048), "")),
+            &[LABEL_ALLOWLIST_KEY.into()]
+        )
+        .is_err());
     }
 
     fn string_item(
