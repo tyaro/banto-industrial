@@ -50,8 +50,19 @@ mod windows {
         std::env::var(name).map_err(|_| format!("missing {name}"))
     }
 
+    /// `canonicalize` が返す `\\?\C:\...` を `C:\...` に戻す（`\\?\UNC\` は触らない）。
+    /// SCM の ImagePath・binding.json・実行時の比較をすべて同じ形に揃えるために使う。
+    fn plain(path: PathBuf) -> PathBuf {
+        match path.to_str() {
+            Some(s) if s.starts_with(r"\\?\") && !s.starts_with(r"\\?\UNC\") => {
+                PathBuf::from(&s[4..])
+            }
+            _ => path,
+        }
+    }
+
     fn within(path: &Path, root: &Path) -> Result<PathBuf, String> {
-        let resolved = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+        let resolved = plain(std::fs::canonicalize(path).map_err(|error| error.to_string())?);
         if resolved == root || !resolved.starts_with(root) || !resolved.is_file() {
             return Err("executable outside disposable root".into());
         }
@@ -74,9 +85,9 @@ mod windows {
         if unsafe { IsUserAnAdmin() } == 0 {
             return Err("administrator token required".into());
         }
-        let temp = std::fs::canonicalize(env("RUNNER_TEMP")?).map_err(|e| e.to_string())?;
+        let temp = plain(std::fs::canonicalize(env("RUNNER_TEMP")?).map_err(|e| e.to_string())?);
         let raw = PathBuf::from(env("BANTO_973_SCM_ROOT")?);
-        let root = std::fs::canonicalize(&raw).map_err(|e| e.to_string())?;
+        let root = plain(std::fs::canonicalize(&raw).map_err(|e| e.to_string())?);
         if root == temp || !root.starts_with(&temp) || !root.is_dir() {
             return Err("invalid disposable root".into());
         }
@@ -91,7 +102,7 @@ mod windows {
             {
                 return Err("reparse point in disposable root".into());
             }
-            if std::fs::canonicalize(ancestor).map_err(|e| e.to_string())? == temp {
+            if plain(std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?) == temp {
                 break;
             }
             ancestor = ancestor.parent().ok_or("root ancestor missing")?;
@@ -203,8 +214,10 @@ mod windows {
         /// 通れば (root, 自身の SHA-256)。
         fn verify(&self, ctx: &ServiceContext) -> Result<(PathBuf, String), String> {
             // 1. current_exe 正規化 → 親 dir 名 dummy、root 名が Banto973- で始まる。
-            let me = std::fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?;
+            let me = plain(
+                std::fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?,
+            );
             let dir = me.parent().ok_or("exe has no parent")?;
             if dir.file_name().and_then(|n| n.to_str()) != Some("dummy") || dir != self.dir {
                 return Err("exe parent is not <root>\\dummy".into());
@@ -340,6 +353,8 @@ mod windows {
             Some((action, rest)) if action == "run-service" => {
                 let (run_id, sha) = parse_run_args(rest)?;
                 let me = std::env::current_exe().map_err(|e| e.to_string())?;
+                // verify と同じ形（正規化 → plain）。失敗時は非正規の親で、verify が断る。
+                let me = std::fs::canonicalize(&me).map(plain).unwrap_or(me);
                 let dir = me.parent().ok_or("exe has no parent")?.to_path_buf();
                 if let Err(error) = run_service(Dummy { run_id, sha, dir }) {
                     // 5. SCM の外で起動された（runner の既存の形: 2 行を stderr、exit 1）。
