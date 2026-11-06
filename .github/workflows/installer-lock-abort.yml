@@ -1,0 +1,108 @@
+name: Installer lock-abort (disposable Windows, real SCM + visible dialog)
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/installer-lock-abort.yml'
+      - 'crates/banto-service-control/**'
+      - 'crates/banto-service-control/examples/running_dummy.rs'
+      - 'apps/chronogazer/installer/**'
+      - 'apps/chronogazer/installer/tests/windows_gui_capability.py'
+      - 'installer-common/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-lock-abort-${{ github.ref }}
+  # Allow in-flight cleanup to finish rather than cancel it for a new head.
+  cancel-in-progress: false
+
+jobs:
+  lock-abort-scm:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      BANTO_973_SCM_TEST: github-hosted-disposable-only-v1
+      BANTO_973_GUI_TEST: github-hosted-gui-capability-only-v1
+      BANTO_973_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Refuse non-hosted/non-admin execution and create fresh proof roots
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable GitHub-hosted Windows only' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Admin token required; no UAC is requested' }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:BANTO_973_EXPECTED_SHA) { throw 'Immutable checkout SHA mismatch' }
+          $marker = "$env:GITHUB_RUN_ID`n$head`n"
+          $root = Join-Path $env:RUNNER_TEMP ('Banto973-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root 'proof') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root 'dummy') | Out-Null
+          [IO.File]::WriteAllText((Join-Path $root '.banto-973-ci'), $marker, [Text.UTF8Encoding]::new($false))
+          "BANTO_973_SCM_ROOT=$root" >> $env:GITHUB_ENV
+          $gui = Join-Path $env:RUNNER_TEMP ('Banto973Gui-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $gui -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $gui 'proof') | Out-Null
+          [IO.File]::WriteAllText((Join-Path $gui '.banto-973-gui'), $marker, [Text.UTF8Encoding]::new($false))
+          "BANTO_973_GUI_ROOT=$gui" >> $env:GITHUB_ENV
+          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; runner_environment=$env:RUNNER_ENVIRONMENT; workflow_sha256=(Get-FileHash -LiteralPath '.github/workflows/installer-lock-abort.yml' -Algorithm SHA256).Hash; image_os=$env:ImageOS; image_version=$env:ImageVersion } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
+      - name: Pure regressions (no SCM/User32 loading)
+        run: |
+          python -B -m unittest discover -s apps/chronogazer/installer/tests -p test_nsis_lock_abort_scm.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -B -m unittest discover -s apps/chronogazer/installer/tests -p test_windows_gui_capability.py
+      - name: GUI capability gate (own calibration window; no service operations)
+        run: python -B apps/chronogazer/installer/tests/windows_gui_capability.py
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build guarded running dummy (started only by this run's SCM case)
+        run: |
+          cargo build -p banto-service-control --example running_dummy --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath target/debug/examples/running_dummy.exe -Destination (Join-Path $env:BANTO_973_SCM_ROOT 'dummy/running_dummy.exe') -ErrorAction Stop
+      - name: Locate NSIS, or install explicit 3.13.0 package on disposable runner
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $nsis = @((Get-Command makensis.exe -ErrorAction SilentlyContinue).Source, "${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) } | Select-Object -First 1
+          if (-not $nsis) {
+            # Fixed published package: https://community.chocolatey.org/packages/nsis/3.13.0
+            choco install nsis --version=3.13.0 --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $nsis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+          }
+          if (-not $nsis) { throw 'makensis missing after fixed installation' }
+          "BANTO_973_MAKENSIS=$nsis" >> $env:GITHUB_ENV
+          @{ makensis_version=(& $nsis /VERSION | Out-String).Trim(); rustc=(& rustc --version | Out-String).Trim(); python=(& python --version | Out-String).Trim() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BANTO_973_SCM_ROOT 'proof/toolchain.json')
+      - name: Real SCM dummy + non-silent NSIS harness with locked server exe
+        run: python -B apps/chronogazer/installer/tests/nsis_lock_abort_scm.py --makensis $env:BANTO_973_MAKENSIS
+      - name: Independently stop and remove this run's exact owned service
+        if: always() && env.BANTO_973_SCM_ROOT != ''
+        run: python -B apps/chronogazer/installer/tests/nsis_lock_abort_scm.py --cleanup-only
+      - uses: actions/upload-artifact@v7
+        if: always() && env.BANTO_973_SCM_ROOT != ''
+        with:
+          name: installer-lock-abort-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.BANTO_973_SCM_ROOT }}/proof/
+            ${{ env.BANTO_973_GUI_ROOT }}/proof/
+            !${{ env.BANTO_973_SCM_ROOT }}/proof/**/*.exe
+            !${{ env.BANTO_973_SCM_ROOT }}/proof/**/install/**
+          if-no-files-found: error
+          retention-days: 14
