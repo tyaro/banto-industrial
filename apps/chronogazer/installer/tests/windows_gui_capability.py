@@ -156,8 +156,8 @@ class API:
                 text, class_name, rect = C.create_unicode_buffer(2048), C.create_unicode_buffer(256), W.RECT()
                 self.u.GetWindowTextW(handle, text, len(text))
                 if parent is not None:
-                    result = C.c_size_t()
-                    self.u.SendMessageTimeoutW(handle, 0x000D, len(text), C.addressof(text), 3, 1000, C.byref(result))
+                    reply_length = C.c_size_t()
+                    self.u.SendMessageTimeoutW(handle, 0x000D, len(text), C.addressof(text), 3, 1000, C.byref(reply_length))
                 self.u.GetClassNameW(handle, class_name, len(class_name))
                 if self.u.GetWindowRect(handle, C.byref(rect)):
                     result.append({"hwnd": int(handle), "pid": actual.value, "title": text.value,
