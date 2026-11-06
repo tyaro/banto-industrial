@@ -47,6 +47,10 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def has_install_protocol(stdout, expected):
+    return expected in stdout.splitlines()
+
+
 def guard():
     validate_environment(os.environ)
     require(os.name == "nt", "Windows_required")
@@ -226,7 +230,7 @@ class Trial:
             require(self.absent(name), "preexisting_service_refused")
             self.record_ownership(name)
         result = self.call([self.probe, "install", name, self.probe], "install")
-        require(result.returncode == 0 and "kind: " + expected in result.stdout, "install_result_" + expected)
+        require(result.returncode == 0 and has_install_protocol(result.stdout, "install-kind=" + expected), "install_result_" + expected)
         require(self.command_is_ours(name), "installed_command_not_ours")
         require(self.scm.observation(name).get("state") == 1, "dummy_service_not_stopped")
         if expected == "Created":
@@ -290,7 +294,7 @@ class Trial:
             observed["pending_install_exit"] = result.returncode
             observed["pending_install_stdout"] = result.stdout
             write_json(self.proof / "A-observation.json", observed)
-            require(result.returncode != 0 and "Err(DeletePending)" in result.stdout, "pending_install_was_not_rejected")
+            require(result.returncode != 0 and has_install_protocol(result.stdout, "install-error=DeletePending"), "pending_install_was_not_rejected")
             observed["production_pending_rejected"] = True
         finally:
             self.scm.release(holder)
@@ -341,6 +345,67 @@ FunctionEnd
 '''
 
 
+def nsis_words(line):
+    """Tokenize NSIS quotes without treating Windows backslashes as shell escapes."""
+    words = []
+    word = []
+    active = False
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if line[index:index + 2] == '$\\' and index + 2 < len(line):
+            active = True
+            word.extend(line[index:index + 3])
+            index += 3
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            else:
+                word.append(char)
+        elif char in ('"', "'", '`'):
+            active = True
+            quote = char
+        elif char in (';', '#'):
+            break
+        elif char.isspace():
+            if active:
+                words.append(''.join(word))
+                word = []
+                active = False
+        else:
+            active = True
+            word.append(char)
+        index += 1
+    require(quote is None, "unclosed_NSIS_quote")
+    if active:
+        words.append(''.join(word))
+    return words
+
+
+def reject_relative_jumps(line):
+    if not re.match(r'^(?:Goto|Call|IntCmp\w*|StrCmp\w*|IfErrors|IfFileExists|MessageBox|'
+                    r'IfSilent|IfAbort|IfRebootFlag|IfShellVarContextAll|IsWindow|GetLabelAddress)\b', line, re.I):
+        return
+    words = nsis_words(line)
+    if not words:
+        return
+    instruction, args = words[0].lower(), words[1:]
+    if instruction in ('goto', 'call', 'iferrors', 'ifsilent', 'ifabort', 'ifrebootflag', 'ifshellvarcontextall'):
+        targets = args
+    elif instruction.startswith(('intcmp', 'strcmp')):
+        targets = args[2:]  # Values may legitimately be signed integers.
+    elif instruction in ('iffileexists', 'iswindow', 'getlabeladdress'):
+        targets = args[1:]
+    elif instruction == 'messagebox':
+        targets = args[2:]  # Ignore flags and quoted message text.
+    else:
+        return
+    require(not any(re.fullmatch(r'[+-][0-9]+', target) for target in targets),
+            "relative_jump_would_change_under_instrumentation")
+
+
 def audit_ppo(text):
     allowed = {
         'ReadRegStr $1 HKLM "SYSTEM\\CurrentControlSet\\Services\\ChronoGazer" "ImagePath"',
@@ -360,6 +425,7 @@ def audit_ppo(text):
     allowed.update("nsExec::ExecToStack 'cmd /c sc query \"ChronoGazer\" | findstr /C:\"" + state + "\" >nul'" for state in ("RUNNING", "STOPPED"))
     for line in logical_ppo_lines(text):
         line = line.strip()
+        reject_relative_jumps(line)
         if re.match(r'(?:Exec\w*\b|nsExec::|(?:Read|Write|Delete)Reg\w*\b|System::Call)', line):
             require(line in allowed, "PPO_operation_outside_allowlist")
 

@@ -21,7 +21,8 @@ mod windows {
     use std::time::Duration;
 
     use banto_service_control::{
-        install_service, uninstall_service, ServiceSpec, ServiceStartKind,
+        install_service, uninstall_service, InstallError, InstallKind, ServiceSpec,
+        ServiceStartKind,
     };
 
     #[link(name = "shell32")]
@@ -135,6 +136,17 @@ mod windows {
                 preshutdown_timeout: Duration::from_secs(30),
             });
             println!("install-result={result:?}");
+            println!(
+                "{}",
+                match &result {
+                    Ok(outcome) => match outcome.kind {
+                        InstallKind::Created => "install-kind=Created",
+                        InstallKind::AlreadyRegistered => "install-kind=AlreadyRegistered",
+                    },
+                    Err(InstallError::DeletePending) => "install-error=DeletePending",
+                    Err(_) => "install-error=Other",
+                }
+            );
             if result.is_err() {
                 std::process::exit(1);
             }
