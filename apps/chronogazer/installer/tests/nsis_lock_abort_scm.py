@@ -123,7 +123,7 @@ def image_path(dummy, run_id, sha):
 
 def command_matches(command, dummy, probe, run_id, sha):
     command = command.replace('\\\\?\\', '')
-    accepted = (image_path(dummy, run_id, sha), f'"{probe}" run-service', f'{probe} run-service')
+    accepted = (image_path(dummy, run_id, sha), f'{dummy} run-service --run-id {run_id} --sha {sha}', f'"{probe}" run-service', f'{probe} run-service')
     return command.casefold() in {item.casefold() for item in accepted}
 
 
@@ -478,6 +478,7 @@ def case_c(trial, makensis, report):
     installed = trial.call([trial.dummy, "install"], "dummy-install")
     require(installed.returncode == 0 and has_install_protocol(installed.stdout, "install-kind=Created"), "dummy_install_not_created")
     trial.record_ownership(SERVICE, created=True)
+    result["service_command"] = trial.scm.command(SERVICE)
     require(trial.command_is_ours(SERVICE), "installed_command_not_ours")
     require(trial.status().get("state") == STOPPED, "dummy_service_not_stopped")
     expected = {"run_id": trial.run_id, "sha": trial.sha, "root": str(trial.root), "exe_sha256": digest(trial.dummy),

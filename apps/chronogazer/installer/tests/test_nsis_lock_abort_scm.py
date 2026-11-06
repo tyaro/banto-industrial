@@ -58,6 +58,10 @@ class Ownership(unittest.TestCase):
         self.assertTrue(lock.command_matches(EXPECTED["image_path"], DUMMY, PROBE, RUN, SHA))
         self.assertTrue(lock.command_matches('"\\\\?\\' + DUMMY + f'" run-service --run-id {RUN} --sha {SHA}', DUMMY, PROBE, RUN, SHA))
         self.assertTrue(lock.command_matches(f'"{PROBE}" run-service', DUMMY, PROBE, RUN, SHA))
+        self.assertTrue(lock.command_matches(f'{DUMMY} run-service --run-id {RUN} --sha {SHA}', DUMMY, PROBE, RUN, SHA))
+        self.assertFalse(lock.command_matches(f'{DUMMY} run-service --run-id other --sha {SHA}', DUMMY, PROBE, RUN, SHA))
+        self.assertFalse(lock.command_matches(f'{DUMMY} run-service --run-id {RUN} --sha {"b" * 40}', DUMMY, PROBE, RUN, SHA))
+        self.assertFalse(lock.command_matches(f'{DUMMY} run-service --run-id {RUN} --sha {SHA} --extra', DUMMY, PROBE, RUN, SHA))
         self.assertFalse(lock.command_matches(f'"{DUMMY}" run-service --run-id {RUN} --sha {"b" * 40}', DUMMY, PROBE, RUN, SHA))
         self.assertFalse(lock.command_matches(f'"{DUMMY}" run-service', DUMMY, PROBE, RUN, SHA))
 
