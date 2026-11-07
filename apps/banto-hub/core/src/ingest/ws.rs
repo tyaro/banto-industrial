@@ -117,6 +117,7 @@
 //! | 1008 | `connection_removed` | 接続の削除（commit） | `connection_removed` |
 //! | 1009 | `message_too_big` | 1 メッセージ・1 フレームが 256 KiB を超えた | `message_too_big` |
 //! | 1013 | `backpressure` | 送信キューが満杯 | `backpressure` |
+//! | 1001 | `server_shutdown` | Hub の終了（`IngestHub::shutdown`。合図の後に開いた WS も upgrade の後すぐ） | `server_shutdown`（合図の後に開いた WS は監査しない） |
 //!
 //! 1009 は tungstenite の読み取りの上限（`WebSocketUpgrade::max_message_size` /
 //! `max_frame_size`、256 KiB ちょうどは通る）が返すエラーで判定する。axum は
@@ -124,8 +125,14 @@
 //! （`Message too long`）で見分ける（[`is_message_too_big`]。実際の WebSocket で 1 バイト
 //! 超を送るテストがこの判定を固定する）。
 //!
-//! Hub の終了（`server_shutdown`、§8）は今の `/api/v1/stream` と同じく WS に知らせる
-//! 経路が無い（プロセスの終わりで TCP ごと閉じる。監査の行は残らない）。
+//! Hub の終了（2026-11-07 オーナー決定）: `server.stop()` は upgrade 済みの接続を待たない
+//! （axum の `on_upgrade` が別のタスクで走らせる）ので、`RunningHub::shutdown_and_report` は
+//! 冒頭で [`IngestHub::shutdown`] を呼び、開いている WS を 1001 `server_shutdown` で閉じさせる
+//! （上の閉じ方の手順のまま。監査は `ingest_disconnected` `reason: server_shutdown`）。合図の
+//! 後に開いた WS は登録を断られ、upgrade の後すぐ同じ close で閉じる（commit と競ったときと
+//! 同じく `ingest_connected` を出していないので切断の行も出さない）。接続ごとの監査の記録の
+//! タスクは Hub の数え（`crate::detached`）に入っており、終了は pool を閉じる前にその終わりを
+//! 待つ。`/api/v1/stream` は変えていない（終了で知らせる経路は無いまま）。
 //!
 //! ## Live（§4.3）
 //!
@@ -184,6 +191,9 @@ pub const MESSAGE_TOO_BIG_CLOSE_CODE: u16 = 1009;
 /// `/api/v1/stream` と同じ）。
 pub const BACKPRESSURE_CLOSE_CODE: u16 = 1013;
 
+/// Hub の終了（`server_shutdown`、RFC 6455 の 1001 Going Away。2026-11-07 オーナー決定）。
+pub const SERVER_SHUTDOWN_CLOSE_CODE: u16 = 1001;
+
 /// 送信キューの容量と、送信のタスクを待つ上限。本番は [`Default`]。テストは router に
 /// `Extension(IngestWsTuning { .. })` を重ねて変える（`StreamRevalidationTiming` と同じ
 /// 差し込み方。外部の要求からは差し込めない）。
@@ -209,6 +219,8 @@ pub struct IngestWsState {
     pub audit: AuditLogService,
     pub clock: Arc<dyn Clock>,
     pub api_keys: ApiKeysService,
+    /// 接続ごとの監査の記録のタスクを数える Hub の数え（`CollectorManager::detached` の複製）。
+    pub detached: DetachedTasks,
 }
 
 /// `GET /api/v1/ingest/{id}/stream` のルーター。認証の層は `route_layer` でこのルート
@@ -228,7 +240,7 @@ pub fn ingest_ws_router(
         ingest: ingest.clone(),
         clock: clock.clone(),
         transport: Transport::Ws,
-        detached,
+        detached: detached.clone(),
     };
     Router::new()
         .route(STREAM_PATH, get(v1_ingest_stream))
@@ -241,6 +253,7 @@ pub fn ingest_ws_router(
             audit,
             clock,
             api_keys,
+            detached,
         })
 }
 
@@ -306,6 +319,9 @@ impl End {
     fn close_frame(self) -> Option<CloseFrame> {
         let (code, reason) = match self {
             Self::ClientClosed => return None,
+            Self::Hub(WsEnd::ServerShutdown) => {
+                (SERVER_SHUTDOWN_CLOSE_CODE, WsEnd::ServerShutdown.as_str())
+            }
             Self::Hub(end) => (REVOKED_CLOSE_CODE, end.as_str()),
             Self::Revoked(reason) => (REVOKED_CLOSE_CODE, reason.as_str()),
             Self::Backpressure => (BACKPRESSURE_CLOSE_CODE, "backpressure"),
@@ -442,7 +458,7 @@ async fn run_socket(
                 connection_name: Some(info.name.clone()),
                 ..caller.audit_context()
             };
-            let audit = IngestAuditWriter::spawn(&state.audit);
+            let audit = IngestAuditWriter::spawn(&state.audit, &state.detached);
             audit.push(vec![IngestAuditRow::connected(&ctx)]);
             let welcome = WelcomeWire {
                 op: "welcome",
@@ -477,16 +493,11 @@ async fn run_socket(
         }
         // 認証の層を通った後、登録までの間に commit と競った（§6.1）。監査の
         // `ingest_connected` は出していないので、切断の行も出さない。
+        // Hub の終了の合図の後も同じ（1001 `server_shutdown`）。
         Err(refusal) => {
             drop(outbound);
             drop(revalidator);
-            let end = match refusal {
-                ApplyRefusal::ConnectionDisabled => WsEnd::ConnectionChanged,
-                ApplyRefusal::UnknownConnection | ApplyRefusal::StaleEpoch { .. } => {
-                    WsEnd::ConnectionRemoved
-                }
-            };
-            (End::Hub(end), None)
+            (End::Hub(refusal.ws_end()), None)
         }
     };
 

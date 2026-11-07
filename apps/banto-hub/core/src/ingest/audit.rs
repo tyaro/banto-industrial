@@ -43,7 +43,8 @@
 //! `spawn_always` で切り離す: 起きてしまった事象の監査なので終了中でも断らず、終了は
 //! pool を閉じる前にその終わりを待つ。WebSocket は
 //! 受信のループを監査で止めないよう、接続ごとの記録のタスク（[`IngestAuditWriter`]）へ
-//! 渡して待たず、切断の後片付けでその終わりを待つ。
+//! 渡して待たず、切断の後片付けでその終わりを待つ。この記録のタスクも Hub の数えの
+//! `spawn_always` で立て、終了は pool を閉じる前にその終わりを待つ。
 
 use std::collections::{HashMap, HashSet};
 
@@ -346,24 +347,32 @@ pub async fn record(audit: &AuditLogService, detached: &DetachedTasks, rows: Vec
 ///   登録を外した後なので、待っている間に止まるものは無い）。
 /// - 記録のタスクが先に終わっていた（panic）ときは、その行を [`record`] と同じく
 ///   切り離したタスクで記録し直す（黙って落とさない）。
+/// - **Hub の終了の待ちに数える**: 記録のタスクと記録し直しは Hub の数え
+///   （`crate::detached`）の `spawn_always` で立てる（起きた事象の監査なので終了中も断らない）。
+///   記録のタスクは WS が開いている間ずっと数えられ、[`Self::finish`] でチャンネルを閉じて
+///   積み残しを記録し終えたときに数えから外れる。Hub の終了は冒頭で開いている WS を
+///   1001 `server_shutdown` で閉じさせ（`IngestHub::shutdown`）、pool を閉じる前にこの
+///   記録の終わり（`ingest_disconnected` まで）を待つ（`super::ws` のモジュール doc「close コード」）。
 pub struct IngestAuditWriter {
     audit: AuditLogService,
+    detached: DetachedTasks,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<IngestAuditRow>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl IngestAuditWriter {
-    /// 記録のタスクを立てる。
-    pub fn spawn(audit: &AuditLogService) -> Self {
+    /// 記録のタスクを立てる（`detached` で数える）。
+    pub fn spawn(audit: &AuditLogService, detached: &DetachedTasks) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<IngestAuditRow>>();
         let service = audit.clone();
-        let task = tokio::spawn(async move {
+        let task = detached.spawn_always(async move {
             while let Some(rows) = rx.recv().await {
                 record_rows(&service, rows).await;
             }
         });
         Self {
             audit: audit.clone(),
+            detached: detached.clone(),
             tx,
             task,
         }
@@ -380,7 +389,8 @@ impl IngestAuditWriter {
                 rows.len()
             );
             let audit = self.audit.clone();
-            tokio::spawn(async move { record_rows(&audit, rows).await });
+            self.detached
+                .spawn_always(async move { record_rows(&audit, rows).await });
         }
     }
 
@@ -1275,5 +1285,52 @@ mod tests {
         let revoked = IngestAuditRow::disconnected(&ctx, "revoked", Some("api_key_revoked"), 0);
         assert_eq!(revoked.detail["revoked_reason"], "api_key_revoked");
         assert_eq!(revoked.entity_id, "12");
+    }
+
+    /// 接続ごとの記録のタスクは Hub の数えに入り、終了の待ちは積んだ行（`ingest_disconnected`
+    /// まで）が DB に書かれるまで戻らない。docs/implementation-checklist.md §5 の形: 監査の
+    /// DB（接続 1 本のプール）のその 1 本を握って記録を決定的に止める → 待ちが戻らない →
+    /// 放す → 上限つきで待つ → 行がある。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_writer_is_counted_until_its_rows_are_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.db");
+        crate::db::init_db(&path)
+            .await
+            .expect("init_db")
+            .close()
+            .await;
+        let pool = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(120))
+            .connect_with(sqlx::sqlite::SqliteConnectOptions::new().filename(&path))
+            .await
+            .unwrap();
+        let audit = AuditLogService::new(crate::db::Db::Sqlite(pool.clone()));
+        let detached = DetachedTasks::new();
+        let held = pool.acquire().await.unwrap();
+
+        let writer = IngestAuditWriter::spawn(&audit, &detached);
+        writer.push(vec![IngestAuditRow::connected(&ctx())]);
+        assert_eq!(detached.pending(), 1, "the writer task is counted");
+        // 終了の冒頭と同じく受付を閉じても、監査は断らない（数えたまま）。
+        detached.close();
+        let finishing = tokio::spawn(writer.finish(vec![IngestAuditRow::disconnected(
+            &ctx(),
+            "client_closed",
+            None,
+            0,
+        )]));
+        assert!(!detached.wait(std::time::Duration::from_millis(100)).await);
+        drop(held);
+        assert!(detached.wait(std::time::Duration::from_secs(10)).await);
+        let rows: Vec<String> =
+            sqlx::query_scalar("SELECT action FROM audit_log WHERE origin = 'ingest' ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec!["ingest_connected", "ingest_disconnected"]);
+        finishing.await.unwrap();
+        pool.close().await;
     }
 }
