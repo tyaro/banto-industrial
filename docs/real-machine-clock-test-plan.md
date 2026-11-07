@@ -154,7 +154,7 @@ P6 と同じく、インストール済みのサービスを使わず、作業�
 5. ログ（`hub.log`）に `WASM plugin registered: <id>@<version>` が出ることを確かめる。`WASM plugin rejected` なら理由を記録して止める。
 6. 管理の操作は試運転モードの grant（`POST /api/auth/grant/commissioning`、loopback だけ）で得たトークンで行う。トークンは記録に書かない。応答の形は要確認（P6 のハーネスを参照）。
 
-読取り専用の loader（`BANTO_WASM_WRITE_PLUGIN` なし）で読み込むと、時計合わせは `notOffered`（何も送らない）になり、読取りだけが出る。
+読取り専用の loader（`BANTO_WASM_WRITE_PLUGIN` なし）で読み込むと、時計合わせは `notOffered`（何も送らない）になり、読取りだけが出る。ただしこれは**書込みを持たない manifest（`writeApi` なし・`capabilities` に `write` なし）を別に作って署名し直した場合だけ**。t12 の manifest（`writeApi: "1"`・`write`）のまま `BANTO_WASM_WRITE_PLUGIN` を外すと、起動時に `write manifest requires an exact BANTO_WASM_WRITE_PLUGIN opt-in` で登録が断られ、読取りもできない（`wasm_plugins.rs`）。この試験では読取り専用の loader は使わない。
 
 ### 3.4 接続・タグの作り方
 
