@@ -26,6 +26,13 @@ import {
 import { mapLiveReconfigureFailure } from './liveReconfigure';
 import { CSRF_HEADER } from './setup';
 import { deferredDelete } from './deferredDelete.svelte';
+import {
+	mapClockUnavailable,
+	type ClockReadView,
+	type ClockSyncRecord,
+	type ClockSyncSettings,
+	type ClockSyncView
+} from './plcClockAdmin';
 
 // --- wire types (camelCase, matching the Rust serde shapes) -----------------
 
@@ -1188,5 +1195,51 @@ export async function diagnosePlcConnection(id: number): Promise<PlcRangeDiagnos
 export async function getCurrentPlcRangeDiagnostic(id: number): Promise<PlcRangeDiagnostic> {
 	return httpRequest<PlcRangeDiagnostic>(`/api/plc-connections/${id}/diagnostics`, {
 		method: 'GET'
+	});
+}
+
+// --- PLC の時計（H2/H3、型と表示は `plcClockAdmin.ts`、画面は `PlcClockSection.svelte`） ---
+
+/** 時計合わせの設定と直近の結果（editor 以上）。 */
+export async function getClockSync(id: number): Promise<ClockSyncView> {
+	return httpRequest<ClockSyncView>(`/api/plc-connections/${id}/clock-sync`, {
+		method: 'GET',
+		mapErrorBody: mapClockUnavailable('saved')
+	});
+}
+
+/**
+ * 時計合わせの設定を即時に保存する（保留キューを通らない）。`readOnly: true` は
+ * タグと無関係な変更系のため、タグ削除の取り消し猶予を打ち切らない。
+ */
+export async function putClockSync(
+	id: number,
+	settings: ClockSyncSettings
+): Promise<ClockSyncView> {
+	return httpRequest<ClockSyncView>(`/api/plc-connections/${id}/clock-sync`, {
+		method: 'PUT',
+		body: settings,
+		readOnly: true,
+		mapErrorBody: mapClockUnavailable('saved')
+	});
+}
+
+/**
+ * PLC の時計を今すぐ書き換える（Hub の `enabled` を問わない）。`readOnly: true` は
+ * タグと無関係な変更系のため、タグ削除の取り消し猶予を打ち切らない。
+ */
+export async function runClockSync(id: number): Promise<ClockSyncRecord> {
+	return httpRequest<ClockSyncRecord>(`/api/plc-connections/${id}/clock-sync`, {
+		method: 'POST',
+		readOnly: true,
+		mapErrorBody: mapClockUnavailable('run')
+	});
+}
+
+/** PLC の時計を読むだけ（サーバーが 5 秒使い回す。ポーリングしない）。 */
+export async function readPlcClock(id: number): Promise<ClockReadView> {
+	return httpRequest<ClockReadView>(`/api/plc-connections/${id}/clock`, {
+		method: 'GET',
+		mapErrorBody: mapClockUnavailable('saved')
 	});
 }
