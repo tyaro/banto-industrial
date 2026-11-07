@@ -15,6 +15,8 @@
 	 * - 古い応答は捨てる: 要求ごとの番号と、`connectionId` が変わるたび（・破棄のとき）に進める
 	 *   世代で、応答が来た時点で今の接続・今の要求のものでなければ状態へ書かない
 	 *   （`ConnectionDrawer.svelte` の `rangeDiagnosticRequest` と同じ流儀）。
+	 *   `last` だけは専用の版（`lastVersion`）も持ち、手動実行が書くたびに進める。設定の読込み・
+	 *   保存は開始時の版と応答時の版が同じときだけ `last` を書く（遅れた応答が新しい結果を戻さない）。
 	 */
 	import { untrack } from 'svelte';
 	import { isProviderError } from '@banto/admin-core';
@@ -77,6 +79,8 @@
 
 	// 世代: 接続が変わる・部品が破棄されるたびに進める（遅れた応答を捨てる）。
 	let generation = 0;
+	// `last` 専用の版（手動実行が `last` を書くたびに進める）。
+	let lastVersion = 0;
 	let loadRequest = 0;
 	let saveRequest = 0;
 	let runRequest = 0;
@@ -87,6 +91,7 @@
 		form = blankForm();
 		formErrors = {};
 		last = null;
+		lastVersion = 0;
 		loading = true;
 		loadError = null;
 		saving = false;
@@ -99,6 +104,7 @@
 		const id = connectionId;
 		const gen = generation;
 		const request = ++loadRequest;
+		const lastAtStart = lastVersion;
 		const isCurrent = () => gen === generation && id === connectionId && request === loadRequest;
 		loading = true;
 		loadError = null;
@@ -108,7 +114,7 @@
 			baseline = view.settings;
 			form = settingsToForm(view.settings);
 			formErrors = {};
-			last = view.last;
+			if (lastVersion === lastAtStart) last = view.last;
 		} catch (err) {
 			if (isCurrent()) loadError = errorMessage(err);
 		} finally {
@@ -165,6 +171,7 @@
 		const id = connectionId;
 		const gen = generation;
 		const request = ++saveRequest;
+		const lastAtStart = lastVersion;
 		const isCurrent = () => gen === generation && id === connectionId && request === saveRequest;
 		saving = true;
 		try {
@@ -172,7 +179,7 @@
 			if (!isCurrent()) return;
 			baseline = view.settings;
 			form = settingsToForm(view.settings);
-			last = view.last;
+			if (lastVersion === lastAtStart) last = view.last;
 			toastStore.push('success', '時計合わせの設定を保存しました');
 		} catch (err) {
 			if (isCurrent()) toastStore.push('error', errorMessage(err));
@@ -197,7 +204,10 @@
 		running = true;
 		try {
 			const record = await runClockSync(id);
-			if (isCurrent()) last = record;
+			if (isCurrent()) {
+				last = record;
+				lastVersion += 1;
+			}
 		} catch (err) {
 			if (isCurrent()) toastStore.push('error', errorMessage(err));
 		} finally {

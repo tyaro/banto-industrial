@@ -50,6 +50,10 @@ interface ClockMock {
 	posts: number;
 	holdClock(): void;
 	nextClock(): Promise<Route>;
+	holdSyncGet(): void;
+	nextSyncGet(): Promise<Route>;
+	holdPut(): void;
+	nextPut(): Promise<Route>;
 }
 
 /** 時計の 4 本をモックする（GET clock-sync は既定、clock は保留もできる）。 */
@@ -57,28 +61,59 @@ async function mockClock(
 	page: Page,
 	opts: { postResult?: unknown; clockResult?: unknown } = {}
 ): Promise<ClockMock> {
-	const pendingClock: Route[] = [];
-	let wake: (() => void) | undefined;
-	let hold = false;
+	// 保留できる要求（clock の GET・clock-sync の GET・PUT）。各キューは同じ形。
+	const makeQueue = () => {
+		const routes: Route[] = [];
+		let wake: (() => void) | undefined;
+		return {
+			hold: false,
+			push(route: Route) {
+				routes.push(route);
+				wake?.();
+			},
+			async next() {
+				if (routes.length === 0) await new Promise<void>((resolve) => (wake = resolve));
+				wake = undefined;
+				return routes.shift()!;
+			}
+		};
+	};
+	const clockQueue = makeQueue();
+	const syncGetQueue = makeQueue();
+	const putQueue = makeQueue();
 	const mock: ClockMock = {
 		clockGets: 0,
 		puts: [],
 		posts: 0,
 		holdClock() {
-			hold = true;
+			clockQueue.hold = true;
 		},
-		async nextClock() {
-			if (pendingClock.length === 0) await new Promise<void>((resolve) => (wake = resolve));
-			wake = undefined;
-			return pendingClock.shift()!;
-		}
+		nextClock: () => clockQueue.next(),
+		holdSyncGet() {
+			syncGetQueue.hold = true;
+		},
+		nextSyncGet: () => syncGetQueue.next(),
+		holdPut() {
+			putQueue.hold = true;
+		},
+		nextPut: () => putQueue.next()
 	};
 	await page.route('**/api/plc-connections/*/clock-sync', (route) => {
 		const method = route.request().method();
-		if (method === 'GET') return route.fulfill({ json: defaultView });
+		if (method === 'GET') {
+			if (syncGetQueue.hold) {
+				syncGetQueue.push(route);
+				return;
+			}
+			return route.fulfill({ json: defaultView });
+		}
 		if (method === 'PUT') {
 			const body = route.request().postDataJSON();
 			mock.puts.push(body);
+			if (putQueue.hold) {
+				putQueue.push(route);
+				return;
+			}
 			return route.fulfill({ json: { settings: body, last: null } });
 		}
 		mock.posts += 1;
@@ -86,9 +121,8 @@ async function mockClock(
 	});
 	await page.route('**/api/plc-connections/*/clock', (route) => {
 		mock.clockGets += 1;
-		if (hold) {
-			pendingClock.push(route);
-			wake?.();
+		if (clockQueue.hold) {
+			clockQueue.push(route);
 			return;
 		}
 		void route.fulfill({ json: opts.clockResult });
@@ -220,5 +254,59 @@ test.describe('PLC の時計（接続編集 Drawer）', () => {
 		await expect(section.getByRole('button', { name: 'PLC の時計を読む' })).toBeEnabled();
 		await expect(section.getByText('2099-01-01 00:00:00')).toHaveCount(0);
 		await expect(section.getByTestId('clock-read-result')).toHaveCount(0);
+	});
+
+	const okRecord = {
+		at: '2026-11-07T01:05:00Z',
+		trigger: 'manual',
+		time: '2026-11-07T10:05:00',
+		result: 'ok',
+		code: null,
+		message: 'PLC の時計を合わせました',
+		before: null,
+		after: null
+	};
+
+	test('遅れた設定の読込み（last: null）が、先に終わった手動実行の結果を戻さない', async ({
+		page
+	}) => {
+		const mock = await mockClock(page, { postResult: okRecord });
+		mock.holdSyncGet();
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const held = await mock.nextSyncGet();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		const response = page.waitForResponse((item) => item.request() === held.request());
+		await held.fulfill({ json: defaultView });
+		await response;
+		// 設定の欄は読込みの応答で有効になる（応答の処理が済んだ印）。
+		await expect(section.getByLabel('時刻表', { exact: true })).toBeEnabled();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		await expect(section.getByText('まだ実行していません', { exact: false })).toHaveCount(0);
+	});
+
+	test('遅れた設定の保存の応答（last: null）が、先に終わった手動実行の結果を戻さない', async ({
+		page
+	}) => {
+		const mock = await mockClock(page, { postResult: okRecord });
+		mock.holdPut();
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		await section.getByLabel('時刻表で定期的に合わせる').check();
+		await section.getByRole('button', { name: '時計合わせの設定を保存' }).click();
+		const held = await mock.nextPut();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		const response = page.waitForResponse((item) => item.request() === held.request());
+		await held.fulfill({
+			json: { settings: { enabled: true, schedule: { kind: 'hourly', minute: 5 } }, last: null }
+		});
+		await response;
+		await expect(section.getByRole('button', { name: '時計合わせの設定を保存' })).toBeEnabled();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		await expect(section.getByText('まだ実行していません', { exact: false })).toHaveCount(0);
 	});
 });
