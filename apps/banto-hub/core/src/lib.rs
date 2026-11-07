@@ -80,6 +80,8 @@
 //! - [`clock_sync`]: H2（tyaro/banto-industrial#1053）。PLC の時計合わせの
 //!   接続ごとの設定（`hub_clock_sync`）・時刻表のスケジューラ・実行・監査・
 //!   直近の結果
+//! - [`clock_read`]: H3（同 #1053）。PLC の時計の読取りの結果の分類・PLC と PC の
+//!   時刻の差・REST の GET と MCP の使い回し（実行は [`clock_sync::ClockSync`]）
 //! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
 //!   composition root（[`runtime::HubRuntime::start`]/
 //!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
@@ -217,6 +219,7 @@ pub mod api_keys;
 pub mod assets;
 pub mod audit_spool;
 pub mod broker_glue;
+pub mod clock_read;
 pub mod clock_sync;
 pub mod commissioning;
 pub mod computed;

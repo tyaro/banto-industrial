@@ -23,6 +23,7 @@ GET /api/pending-changes
 GET /api/pending-changes/{id}
 GET /api/plc-connections
 GET /api/plc-connections/{id}
+GET /api/plc-connections/{id}/clock
 GET /api/plc-connections/{id}/clock-sync
 GET /api/plc-connections/{id}/diagnostics
 GET /api/sink/config

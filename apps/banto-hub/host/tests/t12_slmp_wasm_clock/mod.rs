@@ -1,6 +1,7 @@
 //! H2（tyaro/banto-industrial#1053 の H の後半）: PLC の時計合わせの Hub 模擬受入れ。
 //!
-//! `BANTO_SLMP_NEW_COMPONENT_WASM`（固定 `ea4d84c`、banto-driver-wasm #76）を運用書込みの
+//! `BANTO_SLMP_NEW_COMPONENT_WASM`（H2 の時点の固定は `ea4d84c`、banto-driver-wasm #76。
+//! 今は H3 の `5281578`、#78）を運用書込みの
 //! loader で読み込んだ Hub の実際の経路（保存済みの接続・収集の broker セッション・
 //! REST・`crate::clock_sync` のスケジューラ・監査）を、std のスレッドで動く模擬の
 //! SLMP 機器に対して通す。模擬機器の応答と期待するバイト列は H1 の component 試験
@@ -18,6 +19,23 @@
 //!    `verificationFailed`（SM210 が 3 回 ON）・`rejected`（SM210 が最初から ON）。
 //! 5. 時間切れ: 応答しない PLC は `unknown`、接続は張り直され、時計合わせは再送しない。
 //! 6. editor でない認証は 403。
+//!
+//! H3（PLC の時計の読取り、固定 `5281578`、banto-driver-wasm #78）で足したこと:
+//!
+//! 7. `GET /api/plc-connections/{id}/clock`: R04CPU（BIN、SD210–SD216）と Q02UCPU（BCD、
+//!    SD210–SD213）で PLC の時刻・PC の時刻・差を返す。Hub の `clockSync.enabled` は
+//!    既定の偽のまま。5 秒以内の 2 回目は模擬 PLC に送らない（`cached: true`）。
+//! 8. SM213 が OFF なら `rejected`。
+//! 9. 読取り専用の loader（運用書込みでない）の接続でも読める。
+//! 10. 時計合わせの手動実行の監査の `detail` に前後の読取り（`before`・`after`）が載る
+//!     （模擬 PLC は書かれた SD210–SD216 を以後の読取りで返す）。直前の読取りが
+//!     `rejected` でも時計合わせは進む。実行の後は GET の使い回しを捨てる。
+//!
+//! 模擬機器は時計の読取りの要求（SM210–SM213 の 4 点のビット読み、SD210 からの
+//! ワード読み）を時計合わせの要求（`clock`）とは別に `reads` に記録する。
+//! 期待するバイト列は H3 の component 試験
+//! `crates/banto-driver-wasm/tests/slmp_h3_clock_read.rs`（ゲストの
+//! `slmp-runtime/tests/clock_read.rs` と同じ）から写した。
 
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -55,6 +73,21 @@ const DATA_BODY: [u8; 26] = [
 /// 1401 subcommand 0003 (bit) of SM210 ON.
 const SET_BODY: [u8; 13] = [1, 0x14, 3, 0, 0xd2, 0, 0, 0, SM, 0, 1, 0, 0x10];
 
+/// H3 clock read, command onward: 0401 subcommand 0003 (bit, iQ-R device
+/// specification) of SM210, four points; then 0401 subcommand 0002 (word) of
+/// SD210, seven.
+const R_READ_STATUS_BODY: [u8; 12] = [1, 4, 3, 0, 0xd2, 0, 0, 0, SM, 0, 4, 0];
+const R_READ_DATA_BODY: [u8; 12] = [1, 4, 2, 0, 0xd2, 0, 0, 0, SD, 0, 7, 0];
+/// The same on the Q device specification (subcommands 0001 and 0000), SD210-SD213.
+const Q_READ_STATUS_BODY: [u8; 10] = [1, 4, 1, 0, 0xd2, 0, 0, SM, 4, 0];
+const Q_READ_DATA_BODY: [u8; 10] = [1, 4, 0, 0, 0xd2, 0, 0, SD, 4, 0];
+/// SM210-SM213 for a clock read: SM213 ON, the others OFF.
+const READY: [u8; 2] = [0x00, 0x01];
+/// SM213 OFF (the SD words are not the clock).
+const SM213_OFF: [u8; 2] = [0x00, 0x00];
+/// The mock PLC's clock before anything sets it: 2026-11-07 (Saturday) 09:00:00.
+const PLC_CLOCK: [u16; 7] = [2026, 11, 7, 9, 0, 0, 6];
+
 /// The Hub PC's local time the tests inject: 2026-11-07 (Saturday) 09:05:30.
 fn local(hour: u32, minute: u32, second: u32) -> chrono::NaiveDateTime {
     NaiveDate::from_ymd_opt(2026, 11, 7)
@@ -72,12 +105,20 @@ struct Script {
     end_code: Option<(usize, u16)>,
     /// Never answer the n-th clock request (the PLC goes silent).
     hang: Option<usize>,
+    /// H3: SM210-SM213 for each clock read in turn; [`READY`] when exhausted.
+    read_statuses: VecDeque<[u8; 2]>,
+    /// H3: the PLC's clock (SD210-SD216 in BIN, SD216 the weekday);
+    /// [`PLC_CLOCK`] when `None`. A clock set's SD210-SD216 write replaces it.
+    plc_clock: Option<[u16; 7]>,
 }
 
 #[derive(Default)]
 struct Seen {
-    /// Clock requests only (4E serial zeroed), in order.
+    /// Clock-set requests only (4E serial zeroed), in order.
     clock: Vec<Vec<u8>>,
+    /// H3: clock-read requests only (the 4-point bit read of SM210 and the
+    /// word read of SD210 onward, 4E serial zeroed), in order.
+    reads: Vec<Vec<u8>>,
     connections: u32,
 }
 
@@ -193,6 +234,10 @@ impl Peer {
     fn connections(&self) -> u32 {
         self.seen.lock().unwrap().connections
     }
+
+    fn reads(&self) -> Vec<Vec<u8>> {
+        self.seen.lock().unwrap().reads.clone()
+    }
 }
 
 impl Drop for Peer {
@@ -221,12 +266,57 @@ fn answer(
         body[16..18].copy_from_slice(&code.to_le_bytes());
         return Some((0, body));
     }
-    if command == 0x1401 || (command == 0x0401 && sub == 3) {
-        let mut recorded = request.to_vec();
-        if recorded[0] == 0x54 {
-            recorded[2] = 0;
-            recorded[3] = 0;
+    let mut recorded = request.to_vec();
+    if recorded[0] == 0x54 {
+        recorded[2] = 0;
+        recorded[3] = 0;
+    }
+    // Q wire (sub 0/1: 3-byte number, code, points) or R wire (sub 2/3:
+    // 4-byte number, 2-byte code, points); the 1401 of the clock set is R wire.
+    let (start, device, points, r_wire) = match sub {
+        0 | 1 => (
+            u32::from_le_bytes([data[0], data[1], data[2], 0]),
+            data[3],
+            u16::from_le_bytes([data[4], data[5]]),
+            false,
+        ),
+        2 | 3 => (
+            u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
+            data[4],
+            u16::from_le_bytes([data[6], data[7]]),
+            true,
+        ),
+        other => panic!("unexpected subcommand {other:#x}"),
+    };
+    let bits = sub & 1 == 1;
+    // H3: the clock read (SM210-SM213 as four bits, then SD210 onward as words).
+    if command == 0x0401
+        && start == 210
+        && ((device == SM && bits && points == 4) || (device == SD && !bits))
+    {
+        seen.lock().unwrap().reads.push(recorded);
+        if device == SM {
+            return Some((
+                0,
+                script.read_statuses.pop_front().unwrap_or(READY).to_vec(),
+            ));
         }
+        let clock = script.plc_clock.unwrap_or(PLC_CLOCK);
+        let words: Vec<u16> = if r_wire {
+            clock.to_vec()
+        } else {
+            let bcd = |v: u16| ((v / 10 % 10) << 4) | (v % 10);
+            vec![
+                (bcd(clock[0] % 100) << 8) | bcd(clock[1]),
+                (bcd(clock[2]) << 8) | bcd(clock[3]),
+                (bcd(clock[4]) << 8) | bcd(clock[5]),
+                (bcd(clock[0] / 100) << 8) | bcd(clock[6]),
+            ]
+        };
+        assert_eq!(usize::from(points), words.len(), "SD210 onward");
+        return Some((0, words.iter().flat_map(|w| w.to_le_bytes()).collect()));
+    }
+    if command == 0x1401 || (command == 0x0401 && sub == 3) {
         let n = {
             let mut seen = seen.lock().unwrap();
             seen.clock.push(recorded);
@@ -241,28 +331,26 @@ fn answer(
             }
         }
         return Some(match command {
-            0x1401 => (0, Vec::new()),
+            0x1401 => {
+                // The clock set's SD210-SD216: later clock reads answer it.
+                if !bits && device == SD && start == 210 && points == 7 {
+                    let mut clock = [0u16; 7];
+                    for (i, word) in clock.iter_mut().enumerate() {
+                        *word = u16::from_le_bytes([data[8 + 2 * i], data[9 + 2 * i]]);
+                    }
+                    script.plc_clock = Some(clock);
+                }
+                (0, Vec::new())
+            }
             _ => {
-                assert_eq!(data[4], SM, "only SM is read as bits");
+                assert_eq!(device, SM, "only SM is read as bits");
                 let (sm210, sm211) = script.statuses.pop_front().unwrap_or((false, false));
                 (0, vec![(u8::from(sm210) << 4) | u8::from(sm211)])
             }
         });
     }
     assert_eq!(command, 0x0401, "unexpected command {command:#x}");
-    let (start, device, points) = match sub {
-        0 => (
-            u32::from_le_bytes([data[0], data[1], data[2], 0]),
-            data[3],
-            u16::from_le_bytes([data[4], data[5]]),
-        ),
-        2 => (
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]),
-            data[4],
-            u16::from_le_bytes([data[6], data[7]]),
-        ),
-        other => panic!("unexpected subcommand {other:#x}"),
-    };
+    assert!(!bits, "unexpected bit read {sub:#x}");
     Some(match (device, start, points) {
         (SD, 280, 4) => {
             let mut body = 8000u32.to_le_bytes().to_vec();
@@ -413,7 +501,7 @@ async fn audit_rows(app: &super::TestApp) -> Vec<(Option<String>, String, String
 
 /// 1. 定期の実行。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn scheduled_clock_sync_runs_once_in_the_matching_minute_and_is_audited() {
     let peer = Peer::start("R08CPU", 0x4801, Script::default());
     let app = hub("t12-clock-schedule", true).await;
@@ -493,7 +581,7 @@ async fn scheduled_clock_sync_runs_once_in_the_matching_minute_and_is_audited() 
 
 /// 2. 手動の実行（Hub の enabled は既定の偽のまま）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn manual_clock_sync_sets_the_clock_and_is_audited_with_the_operator() {
     let peer = Peer::start("R08CPU", 0x4801, Script::default());
     let app = hub("t12-clock-manual", true).await;
@@ -519,7 +607,7 @@ async fn manual_clock_sync_sets_the_clock_and_is_audited_with_the_operator() {
 /// 3. ゲート: ゲストの `clock_set` が無効なら `rejected`、読取り専用の loader では
 /// `notOffered`。どちらも時計合わせの要求を 1 つも送らない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn the_guest_gate_and_the_read_only_loader_send_nothing() {
     let unset = Peer::start("R08CPU", 0x4801, Script::default());
     let disabled = Peer::start("R08CPU", 0x4801, Script::default());
@@ -567,7 +655,7 @@ type Case<'a> = (i64, &'a Peer, &'a str, Option<u32>, Vec<Vec<u8>>);
 
 /// 4. 各結果が直近の結果と監査に残る（どれも接続は保つ）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn each_refusal_is_audited_with_its_result() {
     let standard_q = Peer::start("Q06HCPU", 0x0042, Script::default());
     let device = Peer::start(
@@ -657,7 +745,7 @@ async fn each_refusal_is_audited_with_its_result() {
 
 /// 5. 応答しない PLC: `unknown`、接続は張り直され、時計合わせは再送しない。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn a_silent_plc_is_unknown_reconnects_and_is_never_resent() {
     let peer = Peer::start(
         "R08CPU",
@@ -674,6 +762,10 @@ async fn a_silent_plc_is_unknown_reconnects_and_is_never_resent() {
     let body = post(&app, id).await;
     assert_eq!(body["result"], "unknown", "{body:?}");
     assert_eq!(body["time"], "2026-11-07T09:05:30");
+    // H3: 直前の読取りは読めた。直後の読取りも（接続が落ちていても）試みて記録に残る
+    // （切断中なら送らずに unavailable）。
+    assert_eq!(body["before"]["result"], "ok", "{body:?}");
+    assert!(body["after"]["result"].is_string(), "{body:?}");
     tokio::time::timeout(Duration::from_secs(15), async {
         while peer.connections() < 2 {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -695,7 +787,7 @@ async fn a_silent_plc_is_unknown_reconnects_and_is_never_resent() {
 /// 6. editor でない認証は 403（設定・直近の結果・実行のどれも）。収集していない接続の
 /// POST は 404。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #76 component"]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
 async fn a_viewer_is_forbidden_and_nothing_runs() {
     let peer = Peer::start("R08CPU", 0x4801, Script::default());
     let app = hub("t12-clock-viewer", true).await;
@@ -725,5 +817,201 @@ async fn a_viewer_is_forbidden_and_nothing_runs() {
     }
     assert!(peer.clock().is_empty());
     assert!(audit_rows(&app).await.is_empty());
+    drop(app);
+}
+
+// --- H3: PLC の時計の読取り ---------------------------------------------------
+
+fn clock_path(id: i64) -> String {
+    format!("/api/plc-connections/{id}/clock")
+}
+
+async fn get_clock(app: &super::TestApp, id: i64) -> Value {
+    let (status, body) = super::admin_write(
+        &app.router,
+        "GET",
+        &clock_path(id),
+        &app.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, super::StatusCode::OK, "{body:?}");
+    body
+}
+
+/// The two requests of one clock read on the iQ-R or Q wire (4E).
+fn r_read_frames() -> Vec<Vec<u8>> {
+    vec![frame_4e(&R_READ_STATUS_BODY), frame_4e(&R_READ_DATA_BODY)]
+}
+
+fn q_read_frames() -> Vec<Vec<u8>> {
+    vec![frame_4e(&Q_READ_STATUS_BODY), frame_4e(&Q_READ_DATA_BODY)]
+}
+
+/// 7. R04CPU（BIN）と Q02UCPU（BCD）で GET が PLC の時刻・PC の時刻・差を返す。Hub の
+/// `clockSync.enabled` は既定の偽、ゲストの `clock_set` も無し。5 秒以内の 2 回目は
+/// 送らない（`cached: true`）。監査には残らない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
+async fn get_reads_the_plc_clock_on_r_and_q_and_reuses_it() {
+    let r = Peer::start("R04CPU", 0x4800, Script::default());
+    let q = Peer::start("Q02UCPU", 0x0263, Script::default());
+    let app = hub("t12-clock-read", true).await;
+    let r_id = add_connection(&app, "r", &r, true, json!({})).await;
+    let q_id = add_connection(&app, "q", &q, true, json!({})).await;
+    app.commit_and_start().await;
+    for (id, peer, frames) in [(r_id, &r, r_read_frames()), (q_id, &q, q_read_frames())] {
+        wait_connected(&app, id).await;
+        let (_, settings) =
+            super::admin_write(&app.router, "GET", &path(id), &app.admin_token, json!({})).await;
+        assert_eq!(settings["settings"]["enabled"], false);
+        let body = get_clock(&app, id).await;
+        assert_eq!(body["result"], "ok", "{body:?}");
+        assert_eq!(body["plcTime"], "2026-11-07T09:00:00", "{body:?}");
+        assert_eq!(body["pcTime"], "2026-11-07T09:05:30", "{body:?}");
+        assert_eq!(body["offsetSeconds"], -330, "{body:?}");
+        assert_eq!(body["cached"], false);
+        assert_eq!(peer.reads(), frames);
+        let again = get_clock(&app, id).await;
+        assert_eq!(again["cached"], true, "{again:?}");
+        assert_eq!(again["plcTime"], body["plcTime"]);
+        assert_eq!(again["at"], body["at"]);
+        assert_eq!(peer.reads(), frames, "the second GET sent nothing");
+        assert!(peer.clock().is_empty(), "a read sets nothing");
+        assert_eq!(peer.connections(), 1, "the collection session was reused");
+    }
+    assert!(audit_rows(&app).await.is_empty(), "the read is not audited");
+    drop(app);
+}
+
+/// 8. SM213 が OFF なら `rejected`（状態のビット読み 1 つだけ）。`rejected` も使い回す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
+async fn sm213_off_is_rejected_and_reused() {
+    let peer = Peer::start(
+        "R04CPU",
+        0x4800,
+        Script {
+            read_statuses: [SM213_OFF].into(),
+            ..Script::default()
+        },
+    );
+    let app = hub("t12-clock-read-sm213", true).await;
+    let id = add_connection(&app, "line", &peer, true, json!({})).await;
+    app.commit_and_start().await;
+    wait_connected(&app, id).await;
+    let body = get_clock(&app, id).await;
+    assert_eq!(body["result"], "rejected", "{body:?}");
+    assert!(
+        body["message"].as_str().unwrap().contains("SM213"),
+        "{body:?}"
+    );
+    assert_eq!(body["plcTime"], Value::Null);
+    assert_eq!(body["offsetSeconds"], Value::Null);
+    assert_eq!(body["pcTime"], "2026-11-07T09:05:30");
+    assert_eq!(peer.reads(), vec![frame_4e(&R_READ_STATUS_BODY)]);
+    let again = get_clock(&app, id).await;
+    assert_eq!(again["cached"], true);
+    assert_eq!(again["result"], "rejected");
+    assert_eq!(peer.reads().len(), 1);
+    assert_eq!(peer.connections(), 1);
+    drop(app);
+}
+
+/// 9. 読取り専用の loader（運用書込みでない）の接続でも読める（時計合わせは
+/// `notOffered` のまま）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
+async fn the_read_only_loader_reads_the_clock() {
+    let peer = Peer::start("R04CPU", 0x4800, Script::default());
+    let app = hub("t12-clock-read-read-only", false).await;
+    let id = add_connection(&app, "line", &peer, false, json!({})).await;
+    app.commit_and_start().await;
+    wait_connected(&app, id).await;
+    let body = get_clock(&app, id).await;
+    assert_eq!(body["result"], "ok", "{body:?}");
+    assert_eq!(body["plcTime"], "2026-11-07T09:00:00");
+    assert_eq!(body["offsetSeconds"], -330);
+    assert_eq!(peer.reads(), r_read_frames());
+    assert!(peer.clock().is_empty());
+    drop(app);
+}
+
+/// 10. 時計合わせの手動実行: 直前と直後に新しく読み（GET の使い回しは使わない）、
+/// 応答・監査の `detail` に `before`・`after` が載る。直後の読取りは合わせた時刻を返す。
+/// 実行の後は GET の使い回しを捨てる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
+async fn a_manual_clock_sync_records_the_reads_before_and_after() {
+    let peer = Peer::start("R08CPU", 0x4801, Script::default());
+    let app = hub("t12-clock-read-around-sync", true).await;
+    let id = add_connection(&app, "line", &peer, true, json!({ "clock_set": "enabled" })).await;
+    app.commit_and_start().await;
+    wait_connected(&app, id).await;
+    let first = get_clock(&app, id).await;
+    assert_eq!(first["plcTime"], "2026-11-07T09:00:00", "{first:?}");
+
+    let body = post(&app, id).await;
+    assert_eq!(body["result"], "ok", "{body:?}");
+    assert_eq!(body["before"]["result"], "ok", "{body:?}");
+    assert_eq!(body["before"]["plcTime"], "2026-11-07T09:00:00");
+    assert_eq!(body["before"]["pcTime"], "2026-11-07T09:05:30");
+    assert_eq!(body["before"]["offsetSeconds"], -330);
+    assert_eq!(body["after"]["result"], "ok", "{body:?}");
+    assert_eq!(body["after"]["plcTime"], "2026-11-07T09:05:30");
+    assert_eq!(body["after"]["offsetSeconds"], 0);
+    assert_eq!(peer.clock(), success_frames());
+    let mut reads: Vec<Vec<u8>> = [r_read_frames(), r_read_frames(), r_read_frames()].concat();
+    assert_eq!(peer.reads(), reads, "the GET, then before and after");
+
+    let rows = audit_rows(&app).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, "ok");
+    assert_eq!(rows[0].4["before"], body["before"]);
+    assert_eq!(rows[0].4["after"], body["after"]);
+    let (_, got) =
+        super::admin_write(&app.router, "GET", &path(id), &app.admin_token, json!({})).await;
+    assert_eq!(got["last"], body);
+
+    // 時計合わせで使い回しは捨てた: 5 秒以内でも新しく読む。
+    let after = get_clock(&app, id).await;
+    assert_eq!(after["cached"], false, "{after:?}");
+    assert_eq!(after["plcTime"], "2026-11-07T09:05:30");
+    reads.extend(r_read_frames());
+    assert_eq!(peer.reads(), reads);
+    assert_eq!(peer.connections(), 1);
+    drop(app);
+}
+
+/// 11. 直前の読取りが `rejected`（SM213 が OFF）でも時計合わせは進み、結果は変わらない。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "set BANTO_SLMP_NEW_COMPONENT_WASM to the pinned #78 component"]
+async fn a_rejected_read_before_does_not_stop_the_clock_sync() {
+    let peer = Peer::start(
+        "R08CPU",
+        0x4801,
+        Script {
+            read_statuses: [SM213_OFF].into(),
+            ..Script::default()
+        },
+    );
+    let app = hub("t12-clock-read-rejected-before", true).await;
+    let id = add_connection(&app, "line", &peer, true, json!({ "clock_set": "enabled" })).await;
+    app.commit_and_start().await;
+    wait_connected(&app, id).await;
+    let body = post(&app, id).await;
+    assert_eq!(body["before"]["result"], "rejected", "{body:?}");
+    assert_eq!(body["result"], "ok", "{body:?}");
+    assert_eq!(body["time"], "2026-11-07T09:05:30");
+    assert_eq!(body["after"]["result"], "ok", "{body:?}");
+    assert_eq!(body["after"]["plcTime"], "2026-11-07T09:05:30");
+    assert_eq!(peer.clock(), success_frames());
+    let mut reads = vec![frame_4e(&R_READ_STATUS_BODY)];
+    reads.extend(r_read_frames());
+    assert_eq!(peer.reads(), reads);
+    let rows = audit_rows(&app).await;
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].2, "ok");
+    assert_eq!(rows[0].4["before"]["result"], "rejected");
     drop(app);
 }

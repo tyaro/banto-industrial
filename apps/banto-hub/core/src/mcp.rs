@@ -602,6 +602,20 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // H3（同 #1053）: PLC の時計の読取り。PLC に何も書かない。REST の
+        // GET /api/plc-connections/{id}/clock と同じサービス・使い回しを通る。
+        json!({
+            "name": "read_plc_clock",
+            "description": "PLC 接続の今の PLC の時計を読む(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock と同じ形 { at, result, code, message, plcTime, pcTime, offsetSeconds, cached })。plcTime は PLC の現地時刻、pcTime は Hub の PC の現地時刻(応答を受けた直後、秒に切り捨て)、offsetSeconds は plcTime − pcTime(PLC が進んでいれば正、±1 秒の誤差。どちらも ok のときだけ)。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered。PLC に何も書かない。PLC のプログラムで SM213 を ON にしておく必要がある(OFF なら rejected)。iQ-R 系と標準 Q・L だけ(他は unsupported)。直近の結果を接続ごとに 5 秒使い回す(cached: true)。時計合わせの設定(enabled)は問わない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "PLC 接続の id" },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "list_drivers",
             "description": "機器のドライバの一覧を返す(admin スコープ必須。REST の GET /api/drivers と同じ中身)。各ドライバの id(create_connection の protocol)、settingsSchema(settings のキー・型・既定値・選択肢)、supportedKinds、addressHelp など。postgres・push・virtual のホストの接続は載らない。",
@@ -1311,6 +1325,7 @@ async fn handle_tools_call(
         "list_connections" => tool_list_connections(state, ctx).await,
         "list_drivers" => tool_list_drivers(state, ctx),
         "get_clock_sync" => tool_get_clock_sync(state, ctx, arguments).await?,
+        "read_plc_clock" => tool_read_plc_clock(state, ctx, arguments).await?,
         "create_connection" => tool_create_connection(state, ctx, arguments).await?,
         "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
         "update_connection" => tool_update_connection(state, ctx, arguments).await?,
@@ -1901,6 +1916,35 @@ async fn tool_get_clock_sync(
             "時計合わせの設定の取得に失敗しました: {err}"
         ))),
     }
+}
+
+// --- 7d. read_plc_clock (H3) -------------------------------------------------
+
+/// `GET /api/plc-connections/{id}/clock`（`crate::rest`）と同じサービス
+/// （`ClockSync::read_plc_clock`、5 秒の使い回し）と同じ形。PLC に何も書かず、
+/// REST と同じく監査もしない。保存済みの接続に無い id は `isError`。
+async fn tool_read_plc_clock(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    if let Err(err) = state.plc_connections.get(id).await {
+        return Ok(tool_error(format!("接続の取得に失敗しました: {err}")));
+    }
+    let view = state
+        .manager
+        .clock_sync()
+        .read_plc_clock(state.manager.sessions(), id)
+        .await;
+    Ok(tool_ok(json!(view)))
 }
 
 // --- 8. create_connection ----------------------------------------------------
