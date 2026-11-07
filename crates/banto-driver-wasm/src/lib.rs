@@ -9,6 +9,14 @@
 //! writes to the PLC. The read-only loader and the controlled test fixtures
 //! never offer it (a real-PLC clock set needs its own approval). The guest
 //! keeps its own gate (`clock_set`) and owns the per-model procedure.
+//!
+//! The optional `clock-read-v1` export (PLC clock read, H3) is bound through
+//! the small world `driver-with-clock-read-v1` when the component has it. It
+//! writes nothing to the PLC, so it is offered whatever the loader (like
+//! diagnostics; guest design option 1: the guest only reads SM210-SM213 and
+//! the SD clock words and refuses when SM213 is OFF). Its WIT `civil-time`
+//! is its own record with the same fields as `clock-v1`'s; the adapter maps
+//! it to [`banto_driver_api::CivilTime`].
 
 mod manifest;
 mod modbus_write;
@@ -34,11 +42,15 @@ use api::{
     AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
     TagVerdict,
 };
-use api::{CivilTime, ClockProgress};
+use api::{CivilTime, ClockProgress, ClockReadProgress};
 use banto_driver_api as api;
 use operational_write::{
     WriteArea, WritePolicy, ALLOWLIST_KEY, LABEL_ALLOWLIST_KEY, LABEL_AREA,
     MAX_LABEL_ALLOWLIST_LEN, MODE_KEY,
+};
+use runtime::clock_read_v1::{
+    banto::driver::types as clock_read_types,
+    exports::banto::driver::{clock_read_v1 as clock_read, session as clock_read_session},
 };
 use runtime::clock_v1::{
     banto::driver::types as clock_types,
@@ -744,6 +756,58 @@ fn api_clock_item_error(value: clock_types::ItemError) -> ItemError {
         clock_types::ItemError::Rejected(m) => ItemError::Rejected(m),
         clock_types::ItemError::VerificationFailed(m) => ItemError::VerificationFailed(m),
     }
+}
+
+fn clock_read_step(step: clock_read_session::Step) -> Step {
+    let rule = match step.expect {
+        clock_read_session::FrameRule::None => FrameRule::None,
+        clock_read_session::FrameRule::Fixed(n) => FrameRule::Fixed(n),
+        clock_read_session::FrameRule::LengthPrefixed(p) => FrameRule::LengthPrefixed(
+            PrefixSpec::new(p.offset, p.width, p.big_endian, p.adjust).with_encoding(
+                match p.encoding {
+                    clock_read_session::PrefixEncoding::Binary => PrefixEncoding::Binary,
+                    clock_read_session::PrefixEncoding::AsciiHex => PrefixEncoding::AsciiHex,
+                    clock_read_session::PrefixEncoding::AsciiDec => PrefixEncoding::AsciiDec,
+                },
+            ),
+        ),
+        clock_read_session::FrameRule::Terminator(bytes) => FrameRule::Terminator(bytes),
+        clock_read_session::FrameRule::PluginDecides => FrameRule::DriverDecides,
+    };
+    Step::new(step.send, rule, step.max_len)
+}
+
+fn api_clock_read_fatal(value: clock_read_types::FatalError) -> FatalError {
+    match value {
+        clock_read_types::FatalError::Framing(m) => FatalError::Framing(m),
+        clock_read_types::FatalError::Protocol(m) => FatalError::Protocol(m),
+        clock_read_types::FatalError::InvalidConfig(m) => FatalError::InvalidConfig(m),
+    }
+}
+
+/// Same mapping as [`api_write_item_error`], for the clock-read world's own types.
+fn api_clock_read_item_error(value: clock_read_types::ItemError) -> ItemError {
+    match value {
+        clock_read_types::ItemError::Device(e) => {
+            ItemError::Device(api::DeviceError::new(e.code, e.message))
+        }
+        clock_read_types::ItemError::Unsupported(m) => ItemError::Unsupported(m),
+        clock_read_types::ItemError::Rejected(m) => ItemError::Rejected(m),
+        clock_read_types::ItemError::VerificationFailed(m) => ItemError::VerificationFailed(m),
+    }
+}
+
+/// The clock-read world's own `civil-time` record (same fields as
+/// `clock-v1`'s) as the API's [`CivilTime`].
+fn api_clock_read_time(time: clock_read::CivilTime) -> CivilTime {
+    CivilTime::new(
+        time.year,
+        time.month,
+        time.day,
+        time.hour,
+        time.minute,
+        time.second,
+    )
 }
 
 fn diagnostic_report(report: diagnostic::Report) -> DiagnosticReport {
@@ -1674,6 +1738,40 @@ impl FrameConnection for WasmConnection {
             clock::ClockProgress::Done(result) => {
                 ClockProgress::Done(result.map_err(api_clock_item_error))
             }
+        })
+    }
+
+    /// Any component that exports `clock-read-v1`, whatever the loader: the
+    /// read writes nothing to the PLC (as diagnostics).
+    fn supports_clock_read(&self) -> bool {
+        self.runtime.clock_read_available()
+    }
+
+    fn read_clock_next(
+        &mut self,
+        prev_response: Option<&[u8]>,
+    ) -> Result<ClockReadProgress, FatalError> {
+        if !self.supports_clock_read() {
+            return Err(FatalError::Protocol("clock read unsupported".into()));
+        }
+        let progress = self
+            .call("clock-read-v1.read-clock-next", |i, resource| {
+                i.clock_read_driver
+                    .as_ref()
+                    .expect("clock-read export bound when available")
+                    .banto_driver_clock_read_v1()
+                    .call_read_clock_next(&mut i.store, resource, prev_response)
+            })?
+            .map_err(api_clock_read_fatal)?;
+        Ok(match progress {
+            clock_read::ClockReadProgress::Send(step) => {
+                ClockReadProgress::Send(clock_read_step(step))
+            }
+            clock_read::ClockReadProgress::Done(result) => ClockReadProgress::Done(
+                result
+                    .map(api_clock_read_time)
+                    .map_err(api_clock_read_item_error),
+            ),
         })
     }
 

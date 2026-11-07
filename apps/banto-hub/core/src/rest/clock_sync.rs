@@ -19,11 +19,20 @@
 //!   どちらも Hub の数え（`crate::detached`、`manager.detached().spawn`）で数え、Hub の
 //!   終了は pool を閉じる前に待つ。
 //!   終了の受付を閉じた後は spawn せずに 503（何も保存・送信しない）。
+//!
+//! H3: `GET /api/plc-connections/{id}/clock`（PLC の時計の読取り）もここに置く。
+//! 認可は editor（PLC と通信するため。診断の GET・上の 3 本と同じ）、保存済みの接続が
+//! 無ければ 404。Hub の `clockSync.enabled` は問わない。中身は
+//! `ClockSync::read_plc_clock`（直近の結果を 5 秒使い回す。`crate::clock_read`）。
+//! PLC に何も書かず監査もしないので、切り離しタスクは作らず handler の中で待つ
+//! （要求の接続が切れて読取りが捨てられても、broker のジョブは最後まで走り、
+//! 残すものは無い）。
 
 use super::{
     actor_identity, record_write, require_editor, shutting_down_response, ApiError, BantoError,
     HeaderMap, IntoResponse, Json, Path, Response, State, StatusCode, TagRegistryState,
 };
+use crate::clock_read::ClockReadView;
 use crate::clock_sync::{
     parse_settings, ClockActor, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger,
     AUDIT_RESOURCE,
@@ -32,6 +41,7 @@ use axum::body::Bytes;
 use serde_json::json;
 
 const PATH: &str = "/api/plc-connections/{id}/clock-sync";
+const CLOCK_PATH: &str = "/api/plc-connections/{id}/clock";
 
 /// 保存済みの接続か（無ければ 404）。
 async fn require_saved_connection(state: &TagRegistryState, id: i64) -> Result<(), ApiError> {
@@ -196,4 +206,40 @@ pub(super) async fn clock_sync_post(
         .await
         .map_err(|err| BantoError::Other(format!("時計合わせのタスクが異常終了しました: {err}")))?;
     Ok(Json(record).into_response())
+}
+
+/// PLC の今の時計を読む（H3）。
+#[utoipa::path(
+    get,
+    path = "/api/plc-connections/{id}/clock",
+    params(("id" = i64, Path, description = "PLC 接続の id")),
+    responses(
+        (status = 200, description = "PLC の時刻（plcTime、ok のときだけ）・Hub の PC の現地時刻（pcTime、broker の応答を受けた直後を秒に切り捨て）・差（offsetSeconds = plcTime − pcTime、PLC が進んでいれば正、±1 秒の誤差、ok のときだけ）。result は ok・unsupported・rejected・device（code に終了コード）・verificationFailed・unavailable（送っていない）・unknown（結果不明。読取りは何も書かないので時計には影響しない。接続は再接続される）・notOffered（このドライバは時計の読取りを出さない）。PLC に何も書かない。PLC のプログラムで SM213 を ON にしておく必要がある（OFF なら rejected）。iQ-R 系と標準 Q・L だけ（他は unsupported）。直近の結果を接続ごとに 5 秒使い回す（cached: true。unavailable は使い回さない）。Hub の clockSync.enabled は問わない。監査には残さない。", body = ClockReadView),
+        (status = 403, description = "editor 未満"),
+        (status = 404, description = "保存済みの接続に無い"),
+    ),
+    tag = "clock-sync",
+)]
+pub(super) async fn plc_clock_get(
+    State(state): State<TagRegistryState>,
+    headers: HeaderMap,
+    Path(connection_id): Path<i64>,
+) -> Result<Json<ClockReadView>, ApiError> {
+    require_editor(
+        &state.auth,
+        &state.audit,
+        &headers,
+        "plc_connections",
+        "GET",
+        CLOCK_PATH,
+    )
+    .await?;
+    require_saved_connection(&state, connection_id).await?;
+    Ok(Json(
+        state
+            .manager
+            .clock_sync()
+            .read_plc_clock(state.manager.sessions(), connection_id)
+            .await,
+    ))
 }

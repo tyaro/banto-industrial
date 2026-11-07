@@ -760,10 +760,15 @@ jobs:
           # clock-v1 (wit/clock-v1.wit): on a 0101-confirmed iQ-R, own station
           # only, it writes SD210-SD216 and turns SM210 ON (guest gate
           # clock_set); the Hub binds driver-with-clock-v1 and offers it only
-          # through the operational write loader.
-          $newSlmpSha = 'ea4d84cc1153a5e7316daaf50d648c7581e10bdb'
+          # through the operational write loader. #78 (H3) adds the optional
+          # clock-read-v1 (wit/clock-read-v1.wit): on a 0101-confirmed iQ-R or
+          # standard Q, own station only, it reads SM210-SM213 and then
+          # SD210-SD216 (BIN) or SD210-SD213 (BCD), writing nothing (SM213 OFF
+          # is rejected); the Hub binds driver-with-clock-read-v1 and offers it
+          # whatever the loader.
+          $newSlmpSha = '5281578d79fb2055a7af86c96691d15bf95dab65'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
-          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit', 'clock-v1.wit')) {
+          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit', 'clock-v1.wit', 'clock-read-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
             $hostBlob = git rev-parse --verify "HEAD:crates/banto-driver-wasm/wit/$wit"
             if ($LASTEXITCODE -ne 0 -or $guestBlob -ne $hostBlob) {
@@ -793,6 +798,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component clock world mismatch' }
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-clock-v1
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component small clock world mismatch' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-diagnostics-clock-and-clock-read-v1
+          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component clock read world mismatch' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-clock-read-v1
+          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component small clock read world mismatch' }
           $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           # Component-level word-bit RMW: a confirm-read mismatch is
@@ -862,6 +871,17 @@ jobs:
           if (-not (Select-String -Path $slmpHLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP H component tests did not all run'
           }
+          # Component-level H3 (clock-read-v1 on iQ-R and standard Q over 4E
+          # and 3E: the two exact requests, BIN and BCD, SM213 OFF / SM210 ON
+          # rejected, verification-failed, end codes, Q25PRH and FX5 send
+          # nothing, a short response is fatal, the read-only loader offers
+          # the read but not the clock set).
+          $slmpH3Log = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h3-clock-read-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_h3_clock_read --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpH3Log
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP H3 component tests failed' }
+          if (-not (Select-String -Path $slmpH3Log -Pattern '^test result: ok\. 8 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP H3 component tests did not all run'
+          }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP Hub acceptance tests failed' }
@@ -871,10 +891,13 @@ jobs:
           # H2 (Hub clock sync, #1053): the scheduler, manual REST, the two
           # gates, each result's audit and the timeout without a resend,
           # through the operational loader and a loopback SLMP peer.
+          # H3 (Hub clock read): GET /clock on R and Q, the 5 s reuse, SM213
+          # OFF, the read-only loader and the reads before/after a clock sync
+          # in its audit (5 more tests in the same module).
           $clockSyncLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h2-clock-sync-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_clock_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $clockSyncLog
           if ($LASTEXITCODE -ne 0) { throw 'H2 clock sync Hub acceptance tests failed' }
-          if (-not (Select-String -Path $clockSyncLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+          if (-not (Select-String -Path $clockSyncLog -Pattern '^test result: ok\. 11 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'H2 clock sync Hub acceptance tests did not all run'
           }
           # Stage-2 numeric reads use the separately reviewed guest revision.

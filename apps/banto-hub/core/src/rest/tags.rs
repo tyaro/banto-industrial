@@ -9,7 +9,7 @@
 
 use banto_tags::{offset_tag_address, parse_tag_address, AddressProbe, OffsetUnit};
 
-use super::clock_sync::{clock_sync_get, clock_sync_post, clock_sync_put};
+use super::clock_sync::{clock_sync_get, clock_sync_post, clock_sync_put, plc_clock_get};
 use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
     collection_groups_get, collection_groups_list, collection_groups_update,
@@ -1409,6 +1409,8 @@ pub(super) fn tag_registry_router(
                 .put(clock_sync_put)
                 .post(clock_sync_post),
         )
+        // H3: PLC の時計の読取り（何も書かない。直近の結果を 5 秒使い回す）。
+        .route("/api/plc-connections/{id}/clock", get(plc_clock_get))
         // S1a (docs/banto-hub-external-db-design.md §4.6): 保存済み接続の
         // 接続テスト - `{id}` の下の固定サブパスなので
         // `/api/plc-connections/{id}` の GET/PUT/DELETE とは axum のルート

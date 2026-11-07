@@ -138,6 +138,91 @@
         ],
         "description": "REST wire DTO for one catalog entry.\n\n`TagEntry` remains the saved/configured catalog owned by `CollectorManager`.\nThe runtime fields are layered here so an all-simulation run can be\nobserved without mutating the DB-backed catalog or the shared TagMap."
       },
+      "ClockReadResult": {
+        "description": "1 回の読取りの結果（JSON の `result`）。",
+        "enum": [
+          "ok",
+          "unsupported",
+          "rejected",
+          "device",
+          "verificationFailed",
+          "unavailable",
+          "unknown",
+          "notOffered"
+        ],
+        "type": "string"
+      },
+      "ClockReadView": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ClockReading"
+          },
+          {
+            "properties": {
+              "cached": {
+                "description": "直近の結果を使い回した（この要求では PLC に送っていない）。",
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "cached"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "REST の GET・MCP の応答: [`ClockReading`] に `cached` を足したもの。"
+      },
+      "ClockReading": {
+        "description": "1 回の読取りの記録（REST の GET・MCP の応答、時計合わせの `before`・`after`）。",
+        "properties": {
+          "at": {
+            "description": "読んだ時刻（UTC の RFC3339、秒まで）。",
+            "type": "string"
+          },
+          "code": {
+            "description": "`device` の終了コード。",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "人が読む文。",
+            "type": "string"
+          },
+          "offsetSeconds": {
+            "description": "`plcTime − pcTime` の秒（PLC が進んでいれば正）。`ok` のときだけ。両方とも\n秒に切り捨てなので ±1 s の誤差がある。",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pcTime": {
+            "description": "broker の応答を受けた直後（送らなかったときは送らないと決めたとき）の\nHub の PC の現地時刻を秒に切り捨てたもの（`YYYY-MM-DDTHH:MM:SS`）。",
+            "type": "string"
+          },
+          "plcTime": {
+            "description": "PLC の現地時刻（`YYYY-MM-DDTHH:MM:SS`）。`ok` のときだけ。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "result": {
+            "$ref": "#/components/schemas/ClockReadResult"
+          }
+        },
+        "required": [
+          "at",
+          "result",
+          "message",
+          "pcTime"
+        ],
+        "type": "object"
+      },
       "ClockResult": {
         "description": "1 回の結果（JSON の `result`）。",
         "enum": [
@@ -212,9 +297,31 @@
       "ClockSyncRecord": {
         "description": "1 回の実行の記録（直近の結果・POST の応答・監査の `detail`）。",
         "properties": {
+          "after": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClockReading",
+                "description": "H3: 時計合わせの直後の読取り。`before` と同じく `None` になりうる。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "at": {
             "description": "実行した時刻（UTC の RFC3339、秒まで）。",
             "type": "string"
+          },
+          "before": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClockReading",
+                "description": "H3: 送る直前の PLC の時計の読取り（使い回さない新しい読取り）。`busy`・\nセッション無し・切断中は `None`。"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "code": {
             "description": "`device` の終了コード。",
@@ -1404,7 +1511,7 @@
     }
   },
   "info": {
-    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。",
+    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）と時計の読取り（/api/plc-connections/{id}/clock、H3）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -1414,6 +1521,45 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/plc-connections/{id}/clock": {
+      "get": {
+        "operationId": "plc_clock_get",
+        "parameters": [
+          {
+            "description": "PLC 接続の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClockReadView"
+                }
+              }
+            },
+            "description": "PLC の時刻（plcTime、ok のときだけ）・Hub の PC の現地時刻（pcTime、broker の応答を受けた直後を秒に切り捨て）・差（offsetSeconds = plcTime − pcTime、PLC が進んでいれば正、±1 秒の誤差、ok のときだけ）。result は ok・unsupported・rejected・device（code に終了コード）・verificationFailed・unavailable（送っていない）・unknown（結果不明。読取りは何も書かないので時計には影響しない。接続は再接続される）・notOffered（このドライバは時計の読取りを出さない）。PLC に何も書かない。PLC のプログラムで SM213 を ON にしておく必要がある（OFF なら rejected）。iQ-R 系と標準 Q・L だけ（他は unsupported）。直近の結果を接続ごとに 5 秒使い回す（cached: true。unavailable は使い回さない）。Hub の clockSync.enabled は問わない。監査には残さない。"
+          },
+          "403": {
+            "description": "editor 未満"
+          },
+          "404": {
+            "description": "保存済みの接続に無い"
+          }
+        },
+        "summary": "PLC の今の時計を読む（H3）。",
+        "tags": [
+          "clock-sync"
+        ]
+      }
+    },
     "/api/plc-connections/{id}/clock-sync": {
       "get": {
         "operationId": "clock_sync_get",

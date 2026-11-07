@@ -529,6 +529,7 @@ async fn tools_list_returns_the_thirty_eight_tools() {
             "list_sink_groups",
             "list_tags",
             "lock_down",
+            "read_plc_clock",
             "read_tag_now",
             "read_tag_values",
             "revoke_api_key",
@@ -3343,6 +3344,40 @@ async fn get_clock_sync_returns_the_settings_and_the_last_result() {
         got["settings"],
         json!({ "enabled": true, "schedule": { "kind": "daily", "hour": 3, "minute": 7 } })
     );
+
+    let (_, body) = mcp_post(&app.router, Some(&admin_key), call(9999)).await;
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let reader = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_, body) = mcp_post(&app.router, Some(&reader), call(conn.id)).await;
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+}
+
+/// H3: `read_plc_clock` は admin スコープで、REST の `GET /api/plc-connections/{id}/clock`
+/// と同じ形を返す。収集していない接続は broker のセッションが無いので `unavailable`
+/// （何も送らない。使い回さないので 2 回目も `cached: false`）。read スコープ・保存済みに
+/// 無い接続は `isError`。PLC に届く経路は t12 の `t12_slmp_wasm_clock` が見る。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_plc_clock_returns_the_rest_shape() {
+    let app = test_app("h3-mcp-read-plc-clock").await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("clock-read-line", 15402))
+        .await
+        .unwrap();
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let call = |id: i64| tools_call("read_plc_clock", json!({ "id": id }));
+    for _ in 0..2 {
+        let (status, body) = mcp_post(&app.router, Some(&admin_key), call(conn.id)).await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        assert_eq!(body["result"]["isError"], false, "{body:?}");
+        let got: Value =
+            serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(got["result"], "unavailable", "{got:?}");
+        assert_eq!(got["cached"], false, "{got:?}");
+        assert_eq!(got["plcTime"], Value::Null);
+        assert_eq!(got["offsetSeconds"], Value::Null);
+        assert!(got["pcTime"].is_string(), "{got:?}");
+        assert!(got["at"].is_string(), "{got:?}");
+    }
 
     let (_, body) = mcp_post(&app.router, Some(&admin_key), call(9999)).await;
     assert_eq!(body["result"]["isError"], true, "{body:?}");

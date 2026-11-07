@@ -83,6 +83,13 @@
 //!   （以後は 503）、pool を閉じる前に残りを待つ（PLC に送った後の監査を pool の close と
 //!   競らせない）。
 //!
+//! - **前後の読取り（H3）**: 送る直前と直後に、同じハンドルで PLC の時計を新しく読み
+//!   （`BrokerHandle::read_clock`、`crate::clock_read`。使い回さない）、記録の
+//!   `before`・`after` に載せる。読取りの結果が何であっても時計合わせは止めず、
+//!   `result` も変えない。時計合わせが `unknown` などで接続が落ちていても直後の
+//!   読取りは試みる（`unavailable` などがそのまま残る）。`busy`・セッション無し・
+//!   切断中は前後とも `None`。実行の後は、その接続の GET の使い回しを捨てる。
+//!
 //! 結果の写像は純関数 [`classify`]（`Ok(Some(Ok))` → `ok`、`Unsupported` →
 //! `unsupported`、`Rejected` → `rejected`、`Device` → `device`（終了コードを
 //! `code`）、`VerificationFailed` → `verificationFailed`、送る前の broker の失敗
@@ -92,7 +99,8 @@
 //! ## 監査
 //!
 //! `audit_log` に `resource = "plc_connection_clock_sync"`・`entity_id = 接続 id`。
-//! 実行は `action = "clock_sync"`、`detail = {trigger, time, result, code, message}`
+//! 実行は `action = "clock_sync"`、`detail = {trigger, time, result, code, message,
+//! before, after}`（`before`・`after` は H3 の前後の読取り [`ClockReading`]、無ければ `null`）
 //! （`time` は渡した現地時刻 `YYYY-MM-DDTHH:MM:SS`、送らなかったときは `null`）。
 //! 設定の変更は `action = "update"`、`detail = {enabled, schedule}`。`result` 列は
 //! 成功だけ `ok`、ほかは `failed`。手動は `origin = "rest"` と操作者、定期は
@@ -110,7 +118,7 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-use banto_broker::{BrokerConnectionStatus, BrokerError, ClockOutcome};
+use banto_broker::{BrokerConnectionStatus, BrokerError, ClockOutcome, ClockReadOutcome};
 use banto_core::BantoError;
 use banto_driver_api::{CivilTime, ItemError};
 use chrono::{Datelike, NaiveDateTime, Timelike};
@@ -123,6 +131,7 @@ use utoipa::ToSchema;
 
 use crate::audit::{AuditEntry, AuditLogService};
 use crate::broker_glue::HubSessions;
+use crate::clock_read::{reading_from, unavailable, ClockReadCache, ClockReadView, ClockReading};
 use crate::hub::CollectorManager;
 
 /// 監査の `resource`。
@@ -280,6 +289,11 @@ pub struct ClockSyncRecord {
     pub code: Option<u32>,
     /// 人が読む文。
     pub message: String,
+    /// H3: 送る直前の PLC の時計の読取り（使い回さない新しい読取り）。`busy`・
+    /// セッション無し・切断中は `None`。
+    pub before: Option<ClockReading>,
+    /// H3: 時計合わせの直後の読取り。`before` と同じく `None` になりうる。
+    pub after: Option<ClockReading>,
 }
 
 impl ClockSyncRecord {
@@ -290,6 +304,8 @@ impl ClockSyncRecord {
             "result": self.result,
             "code": self.code,
             "message": self.message,
+            "before": self.before,
+            "after": self.after,
         })
     }
 }
@@ -428,6 +444,8 @@ pub struct ClockSync {
     last: Mutex<HashMap<i64, ClockSyncRecord>>,
     running: Mutex<HashSet<i64>>,
     fired: Mutex<FiredMinutes>,
+    /// H3: REST の GET・MCP の時計の読取りの使い回し（`crate::clock_read`）。
+    reads: ClockReadCache,
 }
 
 impl ClockSync {
@@ -438,6 +456,7 @@ impl ClockSync {
             last: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
             fired: Mutex::new(HashMap::new()),
+            reads: ClockReadCache::new(),
         }
     }
 
@@ -539,6 +558,8 @@ impl ClockSync {
         actor: Option<ClockActor<'_>>,
     ) -> ClockSyncRecord {
         let record = self.run_inner(sessions, connection_id, trigger).await;
+        // H3: 時計を変えたかもしれないので、GET の使い回しを捨てる。
+        self.reads.invalidate(connection_id);
         self.last
             .lock()
             .expect("clock sync last lock poisoned")
@@ -575,6 +596,8 @@ impl ClockSync {
             result,
             code: None,
             message: message.to_string(),
+            before: None,
+            after: None,
         };
         let inserted = self
             .running
@@ -604,6 +627,8 @@ impl ClockSync {
                 "この接続は切断中です（送っていません）",
             );
         }
+        // H3: 送る直前に読む（使い回さない。結果が何でも時計合わせは止めない）。
+        let before = self.read_via(true, handle.read_clock()).await;
         // broker がジョブを始めるとき（ドライバの `set_clock` の直前）に現地時刻から
         // 作る（キューの待ちを時刻の誤差にしない。秒は切り捨て、曜日は渡さない）。
         let now = self
@@ -615,6 +640,10 @@ impl ClockSync {
             .set_clock_now(Box::new(move || civil_time(now())))
             .await;
         let (result, code, message) = classify(&outcome);
+        // H3: 直後に読む。時計合わせで接続が落ちていても試みる（切断中なら送らずに
+        // `unavailable`）。
+        let connected = *handle.status_watch().borrow() == BrokerConnectionStatus::Connected;
+        let after = self.read_via(connected, handle.read_clock()).await;
         ClockSyncRecord {
             at: utc_now_rfc3339(),
             trigger,
@@ -624,7 +653,53 @@ impl ClockSync {
             result,
             code,
             message,
+            before: Some(before),
+            after: Some(after),
         }
+    }
+
+    /// H3: `read`（broker の `read_clock`）で 1 回読んで記録にする。`connected` が
+    /// 偽なら `read` を待たずに（何も送らずに）`unavailable`。`pcTime` は応答を
+    /// 受けた直後の現地時刻。
+    async fn read_via(
+        &self,
+        connected: bool,
+        read: impl Future<Output = ClockReadOutcome>,
+    ) -> ClockReading {
+        if !connected {
+            return unavailable("この接続は切断中です（送っていません）", self.local_now());
+        }
+        let outcome = read.await;
+        reading_from(&outcome, self.local_now())
+    }
+
+    /// H3: 接続 `connection_id` の PLC の時計を使い回さずに 1 回読む。ハンドルは
+    /// 非ダイヤルの読取り専用の peek（`HubSessions::handle_for`）。無い・切断中なら
+    /// 送らずに `unavailable`。
+    pub async fn read_now(&self, sessions: &HubSessions, connection_id: i64) -> ClockReading {
+        let Some(handle) = sessions.handle_for(connection_id) else {
+            return unavailable(
+                "この接続の broker セッションがありません（収集が止まっているか、接続が無効です。送っていません）",
+                self.local_now(),
+            );
+        };
+        let connected = *handle.status_watch().borrow() == BrokerConnectionStatus::Connected;
+        self.read_via(connected, handle.read_clock()).await
+    }
+
+    /// H3: REST の `GET /api/plc-connections/{id}/clock` と MCP の `read_plc_clock`。
+    /// 直近の結果を [`crate::clock_read::CLOCK_READ_REUSE`] 使い回す（同じ接続の同時の
+    /// 要求は 1 回の読取りにまとめる、`unavailable` は使い回さない）。監査はしない。
+    pub async fn read_plc_clock(
+        &self,
+        sessions: &HubSessions,
+        connection_id: i64,
+    ) -> ClockReadView {
+        let (reading, cached) = self
+            .reads
+            .get_or_read(connection_id, || self.read_now(sessions, connection_id))
+            .await;
+        ClockReadView { reading, cached }
     }
 
     /// 定期の 1 回の評価: 今の分 `minute` に出す接続を [`due_connections`] で決め、
@@ -1165,6 +1240,18 @@ mod tests {
         assert_eq!(record.result, ClockResult::Unavailable);
         assert_eq!(record.time, None);
         assert_eq!(sync.last(3), Some(record.clone()));
+        assert_eq!(
+            (record.before.as_ref(), record.after.as_ref()),
+            (None, None)
+        );
+        // H3: セッションが無ければ時計の読取りも送らずに unavailable（使い回さない）。
+        let reading = sync.read_plc_clock(&sessions, 3).await;
+        assert_eq!(
+            reading.reading.result,
+            crate::clock_read::ClockReadResult::Unavailable
+        );
+        assert!(!reading.cached);
+        assert!(!sync.read_plc_clock(&sessions, 3).await.cached);
 
         // 実行中の印があれば busy（送らない）。
         sync.running.lock().unwrap().insert(4);
@@ -1188,6 +1275,10 @@ mod tests {
         assert_eq!(rows[0].4["result"], "unavailable");
         assert_eq!(rows[0].4["trigger"], "manual");
         assert_eq!(rows[0].4["time"], Value::Null);
+        // H3: 送らなかった回は前後の読取りも無い。
+        assert_eq!(rows[0].4["before"], Value::Null);
+        assert_eq!(rows[0].4["after"], Value::Null);
+        assert_eq!(rows[1].4["before"], Value::Null);
         assert_eq!(rows[1].0, None);
         assert_eq!(rows[1].2, "schedule");
         assert_eq!(rows[1].4["result"], "busy");

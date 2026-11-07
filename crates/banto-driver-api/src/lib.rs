@@ -65,7 +65,9 @@
 //!   ([`SessionDriver`] / [`Session`], [`BoxFuture`]; R1-2, design §5)
 //! - [`clock`]: the optional PLC clock set ([`CivilTime`],
 //!   [`ClockProgress`], driven by [`FrameConnection::set_clock_next`] and
-//!   [`Session::set_clock`]; WIT `clock-v1`)
+//!   [`Session::set_clock`]; WIT `clock-v1`) and the optional PLC clock
+//!   read ([`ClockReadProgress`], [`FrameConnection::read_clock_next`],
+//!   [`Session::read_clock`]; WIT `clock-read-v1`)
 //! - [`registry`]: [`DriverRegistry`], driver id → [`DriverEntry`] of a
 //!   [`DriverKind`] (R1-2, design §6.1)
 //!
@@ -113,7 +115,7 @@ pub mod settings;
 pub mod types;
 
 pub use address::{DriverAddress, DriverId, InvalidDriverId};
-pub use clock::{CivilTime, ClockProgress};
+pub use clock::{CivilTime, ClockProgress, ClockReadProgress};
 pub use diagnostics::{
     AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
     TagVerdict,

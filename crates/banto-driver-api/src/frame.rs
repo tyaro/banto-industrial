@@ -281,6 +281,26 @@ pub trait FrameConnection: Send + 'static {
         Err(FatalError::Protocol("clock set unsupported".into()))
     }
 
+    /// Optional PLC clock read on this physical connection (WIT
+    /// `clock-read-v1`). It writes nothing, so the engine offers it on a
+    /// connection that may not write as well.
+    fn supports_clock_read(&self) -> bool {
+        false
+    }
+
+    /// One bounded clock-read step. The first call gets
+    /// `prev_response = None`, every later call the previous step's response,
+    /// until [`ClockReadProgress::Done`](crate::ClockReadProgress). The
+    /// engine caps the steps, keeps the entire sequence exclusive on the
+    /// connection and closes it if a send is abandoned. The default refuses
+    /// with [`FatalError::Protocol`].
+    fn read_clock_next(
+        &mut self,
+        _prev_response: Option<&[u8]>,
+    ) -> Result<crate::ClockReadProgress, FatalError> {
+        Err(FatalError::Protocol("clock read unsupported".into()))
+    }
+
     /// The handshake, one step at a time (WIT `handshake-next`). First call
     /// `None`, then the previous step's response; return `Ok(None)` when
     /// done. A refusal is `Err` (the connection is not considered up).
@@ -420,6 +440,16 @@ mod tests {
         assert!(!c.supports_clock());
         assert!(matches!(
             c.set_clock_next(&crate::CivilTime::new(2026, 11, 7, 9, 5, 30), None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn defaults_have_no_clock_read_contract() {
+        let mut c: Box<dyn FrameConnection> = Box::new(ReadOnly);
+        assert!(!c.supports_clock_read());
+        assert!(matches!(
+            c.read_clock_next(None),
             Err(FatalError::Protocol(_))
         ));
     }
