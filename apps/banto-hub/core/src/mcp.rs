@@ -3466,6 +3466,7 @@ async fn tool_set_write_control(
     let change = state
         .write_control
         .set_enabled_detached(
+            state.manager.detached(),
             &state.manager.pool(),
             enabled,
             Some(ctx.actor_label().as_str()),

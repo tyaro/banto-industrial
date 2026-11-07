@@ -38,7 +38,10 @@
 //!
 //! 記録は `tokio::spawn` で切り離し、ハンドラはその終わりを待つ
 //! （implementation-checklist §5「handler の中で `await` をまたぐ副作用は接続の
-//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。WebSocket は
+//! 切断で捨てられる」- 送り手が応答を待たずに切っても監査の行は残る）。REST と認証の
+//! 層の記録（[`record`]）は Hub の数え（`crate::detached`）の
+//! `spawn_always` で切り離す: 起きてしまった事象の監査なので終了中でも断らず、終了は
+//! pool を閉じる前にその終わりを待つ。WebSocket は
 //! 受信のループを監査で止めないよう、接続ごとの記録のタスク（[`IngestAuditWriter`]）へ
 //! 渡して待たず、切断の後片付けでその終わりを待つ。
 
@@ -47,6 +50,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Map, Value};
 
 use crate::audit::{AuditEntry, AuditLogService};
+use crate::detached::DetachedTasks;
 
 use super::limits::LimitEdge;
 use super::{ApplyRefusal, IngestHub};
@@ -301,14 +305,16 @@ impl IngestAuditRow {
     }
 }
 
-/// 行を記録する。`tokio::spawn` で切り離して、その終わりを待つ（モジュールの doc）。
+/// 行を記録する。`detached` で数えて切り離し、その終わりを待つ（モジュールの doc）。
+/// 起きた事象の監査なので、Hub の終了中（受付を閉じた後）も断らない
+/// （`DetachedTasks::spawn_always`。終了は pool を閉じる前にこれを待つ）。
 /// 記録の失敗は `AuditLogService` が保留・ログに回すので、ここでは返さない。
-pub async fn record(audit: &AuditLogService, rows: Vec<IngestAuditRow>) {
+pub async fn record(audit: &AuditLogService, detached: &DetachedTasks, rows: Vec<IngestAuditRow>) {
     if rows.is_empty() {
         return;
     }
     let audit = audit.clone();
-    let task = tokio::spawn(async move { record_rows(&audit, rows).await });
+    let task = detached.spawn_always(async move { record_rows(&audit, rows).await });
     if let Err(err) = task.await {
         eprintln!("banto-hub: 取り込みの監査の記録が異常終了しました: {err}");
     }

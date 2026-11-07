@@ -16,12 +16,13 @@
 //!   実行は `tokio::spawn` で切り離して `JoinHandle` を待つ（要求の接続が切れても
 //!   監査と直近の結果を書き切る、docs/implementation-checklist.md §5）。PUT の保存と
 //!   監査も同じ形（保存の後・監査の前に切れて、監査なしで時刻表が有効になるのを防ぐ）。
-//!   どちらも `ClockSync::spawn_tracked` で数え、Hub の終了は pool を閉じる前に待つ。
+//!   どちらも Hub の数え（`crate::detached`、`manager.detached().spawn`）で数え、Hub の
+//!   終了は pool を閉じる前に待つ。
 //!   終了の受付を閉じた後は spawn せずに 503（何も保存・送信しない）。
 
 use super::{
-    actor_identity, record_write, require_editor, ApiError, BantoError, HeaderMap, IntoResponse,
-    Json, Path, Response, State, StatusCode, TagRegistryState,
+    actor_identity, record_write, require_editor, shutting_down_response, ApiError, BantoError,
+    HeaderMap, IntoResponse, Json, Path, Response, State, StatusCode, TagRegistryState,
 };
 use crate::clock_sync::{
     parse_settings, ClockActor, ClockSyncRecord, ClockSyncSettings, ClockSyncView, ClockTrigger,
@@ -31,16 +32,6 @@ use axum::body::Bytes;
 use serde_json::json;
 
 const PATH: &str = "/api/plc-connections/{id}/clock-sync";
-
-/// Hub の終了中（切り離したタスクの受付を閉じた後）の 503。`BantoError` には 503 の
-/// 値が無い（`Other` は 500）ので、書込みの `WritesDisabled` などと同じく応答を直に作る。
-fn shutting_down() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        Json(json!({ "status": "unavailable", "reason": "hub is shutting down" })),
-    )
-        .into_response()
-}
 
 /// 保存済みの接続か（無ければ 404）。
 async fn require_saved_connection(state: &TagRegistryState, id: i64) -> Result<(), ApiError> {
@@ -118,7 +109,7 @@ pub(super) async fn clock_sync_put(
     let manager = state.manager.clone();
     let audit = state.audit.clone();
     let auth = state.auth.clone();
-    let Some(task) = state.manager.clock_sync().spawn_tracked(async move {
+    let Some(task) = state.manager.detached().spawn(async move {
         let clock_sync = manager.clock_sync();
         clock_sync.save_settings(connection_id, &settings).await?;
         record_write(
@@ -133,7 +124,7 @@ pub(super) async fn clock_sync_put(
         .await;
         clock_sync.view(connection_id).await
     }) else {
-        return Ok(shutting_down());
+        return Ok(shutting_down_response());
     };
     let view = task.await.map_err(|err| {
         BantoError::Other(format!("時計合わせの設定のタスクが異常終了しました: {err}"))
@@ -168,8 +159,8 @@ pub(super) async fn clock_sync_post(
         PATH,
     )
     .await?;
-    if state.manager.clock_sync().detached_closed() {
-        return Ok(shutting_down());
+    if state.manager.detached().is_closed() {
+        return Ok(shutting_down_response());
     }
     let (_, applied) = state.manager.diagnostic_registry_snapshot();
     if !applied.connections.iter().any(|c| c.id == connection_id) {
@@ -183,7 +174,7 @@ pub(super) async fn clock_sync_post(
     let actor = actor_identity(&headers, &state.auth).map(|identity| (identity.id, identity.role));
     let manager = state.manager.clone();
     let audit = state.audit.clone();
-    let Some(task) = state.manager.clock_sync().spawn_tracked(async move {
+    let Some(task) = state.manager.detached().spawn(async move {
         let actor = actor.as_ref().map(|(username, role)| ClockActor {
             username: username.as_str(),
             role: role.as_str(),
@@ -199,7 +190,7 @@ pub(super) async fn clock_sync_post(
             )
             .await
     }) else {
-        return Ok(shutting_down());
+        return Ok(shutting_down_response());
     };
     let record = task
         .await

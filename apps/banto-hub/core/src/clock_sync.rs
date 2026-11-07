@@ -78,9 +78,10 @@
 //!   しない**（次の回は時刻表どおり）。
 //! - 毎回（`busy`・`unavailable` も）監査し、直近の結果（メモリ、接続ごとに 1 件）を
 //!   更新する。
-//! - REST の POST・PUT が切り離すタスクは [`ClockSync::spawn_tracked`] で数え、Hub の
-//!   終了は冒頭で受付を閉じ（以後は 503）、pool を閉じる前に残りを待つ
-//!   （[`ClockSync::wait_detached`]。PLC に送った後の監査を pool の close と競らせない）。
+//! - REST の POST・PUT が切り離すタスクは Hub の数え（`crate::detached`、
+//!   `CollectorManager::detached` の `spawn`）で数える。Hub の終了は冒頭で受付を閉じ
+//!   （以後は 503）、pool を閉じる前に残りを待つ（PLC に送った後の監査を pool の close と
+//!   競らせない）。
 //!
 //! 結果の写像は純関数 [`classify`]（`Ok(Some(Ok))` → `ok`、`Unsupported` →
 //! `unsupported`、`Rejected` → `rejected`、`Device` → `device`（終了コードを
@@ -419,36 +420,6 @@ impl Drop for RunningGuard<'_> {
     }
 }
 
-/// REST が切り離したタスクの数と受付（[`ClockSync::spawn_tracked`]）。
-#[derive(Default)]
-struct DetachedTasks {
-    state: Mutex<DetachedState>,
-    idle: tokio::sync::Notify,
-}
-
-#[derive(Default)]
-struct DetachedState {
-    closed: bool,
-    count: usize,
-}
-
-/// 切り離したタスクの終わり（panic でも）で数を減らし、0 になれば待ち手を起こす。
-struct DetachedGuard(Arc<DetachedTasks>);
-
-impl Drop for DetachedGuard {
-    fn drop(&mut self) {
-        let mut state = self
-            .0
-            .state
-            .lock()
-            .expect("clock sync detached lock poisoned");
-        state.count -= 1;
-        if state.count == 0 {
-            self.0.idle.notify_waiters();
-        }
-    }
-}
-
 /// 時計合わせの状態（`CollectorManager` が 1 つ持つ。[`CollectorManager::clock_sync`]）。
 /// 設定は DB、直近の結果・実行中の印・定期で最後に出した分はメモリだけ。
 pub struct ClockSync {
@@ -456,7 +427,6 @@ pub struct ClockSync {
     now: RwLock<LocalNow>,
     last: Mutex<HashMap<i64, ClockSyncRecord>>,
     running: Mutex<HashSet<i64>>,
-    detached: Arc<DetachedTasks>,
     fired: Mutex<FiredMinutes>,
 }
 
@@ -467,7 +437,6 @@ impl ClockSync {
             now: RwLock::new(Arc::new(system_local_now)),
             last: Mutex::new(HashMap::new()),
             running: Mutex::new(HashSet::new()),
-            detached: Arc::new(DetachedTasks::default()),
             fired: Mutex::new(HashMap::new()),
         }
     }
@@ -548,74 +517,6 @@ impl ClockSync {
         rows.iter()
             .map(|row| Ok((row.get::<i64, _>("connection_id"), schedule_from_row(row)?)))
             .collect()
-    }
-
-    /// REST の POST・PUT が切り離すタスクを spawn する（数えて、終了のときに
-    /// [`Self::wait_detached`] で待てるように）。受付を閉じた後
-    /// （[`Self::close_detached`]）は spawn せずに `None`（呼び出し側は 503）。
-    pub fn spawn_tracked<F>(&self, future: F) -> Option<JoinHandle<F::Output>>
-    where
-        F: Future + Send + 'static,
-        F::Output: Send + 'static,
-    {
-        {
-            let mut state = self
-                .detached
-                .state
-                .lock()
-                .expect("clock sync detached lock poisoned");
-            if state.closed {
-                return None;
-            }
-            state.count += 1;
-        }
-        let guard = DetachedGuard(self.detached.clone());
-        Some(tokio::spawn(async move {
-            let _guard = guard;
-            future.await
-        }))
-    }
-
-    /// 切り離したタスクの受付を閉じる（終了の冒頭。以後の POST・PUT は 503）。
-    pub fn close_detached(&self) {
-        self.detached
-            .state
-            .lock()
-            .expect("clock sync detached lock poisoned")
-            .closed = true;
-    }
-
-    /// 受付を閉じているか。
-    pub fn detached_closed(&self) -> bool {
-        self.detached
-            .state
-            .lock()
-            .expect("clock sync detached lock poisoned")
-            .closed
-    }
-
-    /// 切り離したタスクが全部終わるのを `limit` まで待つ。待ちきれなければ `false`。
-    pub async fn wait_detached(&self, limit: Duration) -> bool {
-        let detached = self.detached.clone();
-        tokio::time::timeout(limit, async move {
-            loop {
-                let notified = detached.idle.notified();
-                tokio::pin!(notified);
-                notified.as_mut().enable();
-                if detached
-                    .state
-                    .lock()
-                    .expect("clock sync detached lock poisoned")
-                    .count
-                    == 0
-                {
-                    return;
-                }
-                notified.await;
-            }
-        })
-        .await
-        .is_ok()
     }
 
     /// 接続 `connection_id` の直近の結果（メモリだけ。Hub の再起動で消える）。
@@ -1387,27 +1288,6 @@ mod tests {
         release.notify_one();
         assert!(scheduler.stop_and_join(Duration::from_secs(5)).await);
         assert_eq!(*runs.lock().unwrap(), 0, "no run after the stop signal");
-    }
-
-    /// 切り離したタスクは終了の待ちが待ち、受付を閉じた後は spawn しない。
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn detached_tasks_are_waited_for_and_refused_after_close() {
-        let (pool, _dir) = pool().await;
-        let sync = ClockSync::new(pool.clone());
-        assert!(sync.wait_detached(Duration::from_millis(10)).await, "none");
-        let release = Arc::new(tokio::sync::Notify::new());
-        let held = release.clone();
-        let task = sync
-            .spawn_tracked(async move { held.notified().await })
-            .expect("accepting");
-        sync.close_detached();
-        assert!(sync.detached_closed());
-        assert!(sync.spawn_tracked(async {}).is_none(), "closed");
-        assert!(!sync.wait_detached(Duration::from_millis(100)).await);
-        release.notify_one();
-        assert!(sync.wait_detached(Duration::from_secs(5)).await);
-        task.await.unwrap();
-        pool.close().await;
     }
 
     /// 評価（`due`）を待つ間に分が変わったら、その評価の回は出さない。

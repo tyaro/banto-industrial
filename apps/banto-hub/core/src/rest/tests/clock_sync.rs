@@ -143,7 +143,7 @@ async fn put_and_post_are_503_after_the_shutdown_closed_them() {
     let env = test_env().await;
     let id = saved_connection(&env).await;
     let path = format!("/api/plc-connections/{id}/clock-sync");
-    env.manager.clock_sync().close_detached();
+    env.manager.detached().close();
     let ok = json!({ "enabled": true, "schedule": { "kind": "hourly", "minute": 5 } });
     let (status, body) = admin_put(&env.router, &path, &env.admin_token, ok).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");

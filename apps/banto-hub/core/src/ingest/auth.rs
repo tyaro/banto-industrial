@@ -59,6 +59,7 @@ use crate::api_keys::{
     api_key_verdict, parse_canonical_connection_id, ApiKeyContext, ApiKeysService,
 };
 use crate::audit::AuditLogService;
+use crate::detached::DetachedTasks;
 use crate::rest::{api_key_rejection_response, bearer_token, unauthorized_response};
 
 use super::audit::{self as ingest_audit, IngestAuditContext, IngestAuditRow, Transport};
@@ -78,6 +79,8 @@ pub struct IngestAuthState {
     pub clock: Arc<dyn Clock>,
     /// この層を被せたルートの経路（監査の `transport`）。
     pub transport: Transport,
+    /// 監査の記録を切り離すときの Hub の数え（`CollectorManager::detached` の複製）。
+    pub detached: DetachedTasks,
 }
 
 /// 認証を通った送り手（ハンドラが extension で受ける）。
@@ -231,7 +234,7 @@ pub async fn require_ingest_auth(
                     state
                         .ingest
                         .throttle_key_denial(denied.id, &denied.name, Some(row), now_ms);
-                ingest_audit::record(&state.audit, rows).await;
+                ingest_audit::record(&state.audit, &state.detached, rows).await;
             }
             return api_key_rejection_response(rejection);
         }
@@ -268,7 +271,7 @@ pub async fn require_ingest_auth(
             let rows = state
                 .ingest
                 .throttle_key_denial(key.id, &key.name, row, now_ms);
-            ingest_audit::record(&state.audit, rows).await;
+            ingest_audit::record(&state.audit, &state.detached, rows).await;
             return error_response(denial.status(), denial.code(), json!({}));
         }
     };
@@ -276,7 +279,7 @@ pub async fn require_ingest_auth(
     let rows = state
         .ingest
         .throttle_key_denial(key.id, &key.name, None, now_ms);
-    ingest_audit::record(&state.audit, rows).await;
+    ingest_audit::record(&state.audit, &state.detached, rows).await;
 
     if let Err(err) = state
         .api_keys

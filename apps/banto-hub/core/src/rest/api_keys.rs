@@ -4,12 +4,17 @@
 //! P0-1 の手順 2）。共通部品（認証・ガード・監査の補助）は親の `rest.rs` にあり、
 //! `use super::{...}` で使う。外から使われるパス（`crate::rest::X`）は親の re-export で
 //! 保つ。
+//!
+//! 変更（発行・失効・削除・トリップ解除）と監査は `CollectorManager::detached`
+//! （`crate::detached`）で数えて切り離す。Hub の終了中（受付を閉じた後）は spawn せずに
+//! 503 を返し、何も変えず・監査もしない。
 
 use super::{
-    get, json, middleware, post, record_write, require_session, require_session_role, ApiError,
-    ApiKeysService, Arc, AuditLogService, AuthGate, AuthState, BantoError, CollectorManager,
-    Deserialize, ErrorBody, FieldError, HeaderMap, IntoResponse, IssuedApiKey, Json, OperationKind,
-    Path, Response, Role, Router, Serialize, SessionRoleGuard, State, StatusCode, ToSchema,
+    get, json, middleware, post, record_write, require_session, require_session_role,
+    shutting_down_response, ApiError, ApiKeysService, Arc, AuditLogService, AuthGate, AuthState,
+    BantoError, CollectorManager, Deserialize, ErrorBody, FieldError, HeaderMap, IntoResponse,
+    IssuedApiKey, Json, OperationKind, Path, Response, Role, Router, Serialize, SessionRoleGuard,
+    State, StatusCode, ToSchema,
 };
 use crate::api_keys::ApiKeyDeleteOutcome;
 use axum::routing::delete;
@@ -112,7 +117,7 @@ async fn api_keys_create(
     State(state): State<ApiKeysAdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateApiKeyRequest>,
-) -> Result<(StatusCode, Json<IssuedApiKeyResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     if let Some(expires_at) = body.expires_at {
         let now_ms = state.manager.clock().now_ms();
         if expires_at <= now_ms {
@@ -126,7 +131,9 @@ async fn api_keys_create(
     }
 
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
-    let issued = tokio::spawn(async move {
+    // 終了の待ちに数え、受付を閉じた後は 503（`crate::detached`）。
+    let detached = state.manager.detached().clone();
+    let Some(task) = detached.spawn(async move {
         let issued = state
             .api_keys
             .issue(&body.name, body.scopes, body.expires_at)
@@ -146,10 +153,17 @@ async fn api_keys_create(
         )
         .await;
         Ok::<_, BantoError>(issued)
-    })
-    .await
-    .map_err(|err| ApiError(BantoError::Other(format!("API キー発行タスク: {err}"))))??;
-    Ok((StatusCode::CREATED, Json(issued.into())))
+    }) else {
+        return Ok(shutting_down_response());
+    };
+    let issued = task
+        .await
+        .map_err(|err| ApiError(BantoError::Other(format!("API キー発行タスク: {err}"))))??;
+    Ok((
+        StatusCode::CREATED,
+        Json(IssuedApiKeyResponse::from(issued)),
+    )
+        .into_response())
 }
 
 /// `GET /api/api-keys` - 一覧（`key_hash` は含まない、設計: 「key_hash は
@@ -166,9 +180,11 @@ async fn api_keys_revoke(
     State(state): State<ApiKeysAdminState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
+) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
-    let summary = tokio::spawn(async move {
+    // 終了の待ちに数え、受付を閉じた後は 503（`crate::detached`）。
+    let detached = state.manager.detached().clone();
+    let Some(task) = detached.spawn(async move {
         let summary = state.api_keys.revoke(id).await?;
         record_write(
             &state.audit,
@@ -181,10 +197,13 @@ async fn api_keys_revoke(
         )
         .await;
         Ok::<_, BantoError>(summary)
-    })
-    .await
-    .map_err(|err| ApiError(BantoError::Other(format!("API キー失効タスク: {err}"))))??;
-    Ok(Json(summary))
+    }) else {
+        return Ok(shutting_down_response());
+    };
+    let summary = task
+        .await
+        .map_err(|err| ApiError(BantoError::Other(format!("API キー失効タスク: {err}"))))??;
+    Ok(Json(summary).into_response())
 }
 
 /// `DELETE /api/api-keys/{id}` - 失効済みキーの削除（#713、2026-10-29
@@ -199,7 +218,9 @@ async fn api_keys_delete(
     Path(id): Path<i64>,
 ) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
-    let outcome = tokio::spawn(async move {
+    // 終了の待ちに数え、受付を閉じた後は 503（`crate::detached`）。
+    let detached = state.manager.detached().clone();
+    let Some(task) = detached.spawn(async move {
         let outcome = state.api_keys.delete(id).await?;
         if let ApiKeyDeleteOutcome::Deleted(summary) = &outcome {
             record_write(
@@ -214,9 +235,12 @@ async fn api_keys_delete(
             .await;
         }
         Ok::<_, BantoError>(outcome)
-    })
-    .await
-    .map_err(|err| ApiError(BantoError::Other(format!("API キー削除タスク: {err}"))))??;
+    }) else {
+        return Ok(shutting_down_response());
+    };
+    let outcome = task
+        .await
+        .map_err(|err| ApiError(BantoError::Other(format!("API キー削除タスク: {err}"))))??;
     match outcome {
         ApiKeyDeleteOutcome::Deleted(_) => Ok(StatusCode::NO_CONTENT.into_response()),
         ApiKeyDeleteOutcome::StillActive => Ok((
@@ -237,9 +261,11 @@ async fn api_keys_clear_trip(
     State(state): State<ApiKeysAdminState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
-) -> Result<Json<crate::api_keys::ApiKeySummary>, ApiError> {
+) -> Result<Response, ApiError> {
     // クライアントの切断で、変更だけが確定して監査が欠けることがないよう切り離す（#940 のレビュー）。
-    let summary = tokio::spawn(async move {
+    // 終了の待ちに数え、受付を閉じた後は 503（`crate::detached`）。
+    let detached = state.manager.detached().clone();
+    let Some(task) = detached.spawn(async move {
         let summary = state.api_keys.clear_trip(id).await?;
         record_write(
             &state.audit,
@@ -252,14 +278,15 @@ async fn api_keys_clear_trip(
         )
         .await;
         Ok::<_, BantoError>(summary)
-    })
-    .await
-    .map_err(|err| {
+    }) else {
+        return Ok(shutting_down_response());
+    };
+    let summary = task.await.map_err(|err| {
         ApiError(BantoError::Other(format!(
             "API キートリップ解除タスク: {err}"
         )))
     })??;
-    Ok(Json(summary))
+    Ok(Json(summary).into_response())
 }
 
 /// `/api/api-keys/*`（設計 §5.6・T0-2 実装指示: 「管理系ルーターに追加 —

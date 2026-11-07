@@ -229,6 +229,7 @@ use utoipa::ToSchema;
 use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::computed::{self, ComputedEngine, ServerTagStore};
 use crate::db_source::{self, DbConnectionStatus, DbSourceEngine};
+use crate::detached::DetachedTasks;
 use crate::diag_log::DiagLog;
 use crate::ingest::{build_hub_config, IngestHub};
 
@@ -1042,6 +1043,10 @@ pub struct CollectorManager {
     /// `db_source` と同じ理由で manager の側には置かない）。`db_source` と同じく
     /// この manager の内部で作る（`Self::new` の引数を増やさない）。
     ingest: Arc<IngestHub>,
+    /// REST・取り込みの handler が切り離した副作用のタスクの数え（`crate::detached`）。
+    /// 終了の冒頭で閉じ、pool を閉じる前に待つ（`crate::runtime` の「シャットダウン順序」）。
+    /// handler の state が持つ `manager` から届くので、この manager に置く。
+    detached: DetachedTasks,
     /// The running `Collector` itself (`None` when nothing is enabled to
     /// collect - a normal state, not an error, see
     /// [`CollectorManager::apply_run`]). **`tokio::sync::Mutex`, not
@@ -1158,6 +1163,7 @@ impl CollectorManager {
             computed,
             db_source,
             ingest,
+            detached: DetachedTasks::new(),
             collector: AsyncMutex::new(None),
             inner: Mutex::new(Inner {
                 map: Arc::new(TagMap::empty()),
@@ -1229,6 +1235,12 @@ impl CollectorManager {
     /// `on_collection_*` を呼ぶため、送信口（R2a-2c / R2a-2d）が `apply` を呼ぶために取る。
     pub fn ingest_hub(&self) -> Arc<IngestHub> {
         self.ingest.clone()
+    }
+
+    /// REST・取り込みの handler が切り離すタスクの数え（`crate::detached`）。
+    /// `crate::runtime::RunningHub::shutdown_and_report` が閉じて待つ。
+    pub fn detached(&self) -> &DetachedTasks {
+        &self.detached
     }
 
     /// 外部 DB 連携 S2: `GET /api/v1/status`・`GET /api/status` の

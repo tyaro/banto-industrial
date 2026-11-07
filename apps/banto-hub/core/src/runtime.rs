@@ -100,11 +100,20 @@
 //! **時計合わせのスケジューラ**（H2、`crate::clock_sync`）: 冒頭（収集の開始を
 //! 断る印の直後）で止める合図だけを出して新しい回を出さなくし、
 //! `sessions.shutdown()` の後に終わりを待つ（上限 [`CLOCK_SYNC_STOP_TIMEOUT`]）。
-//! REST の POST・PUT が切り離したタスクも、冒頭で受付を閉じ（以後は 503）、スケジューラの
-//! 後に同じ上限で待つ（pool を閉じる前）。
 //! 走っている回（接続ごとに別のタスク。スケジューラはそれを全部待ってから終わる）は
 //! broker が止まれば `TaskGone`（結果不明）で戻り、監査を書いて終わる。DB を触るので
 //! abort しない（docs/implementation-checklist.md §5）。
+//!
+//! **切り離したタスク**（`crate::detached`、`manager.detached()`）: REST・MCP・取り込みの
+//! handler が接続の切断に備えて `tokio::spawn` で切り離した保存・監査のタスク。冒頭
+//! （`begin_shutdown` の直後）で受付を閉じ（以後の API キーの変更・OPC UA 設定の PUT・
+//! 時計合わせの PUT（保存）と POST（手動実行）は 503 で何もしない。書込みの停止・再開と
+//! 取り込みの監査は `spawn_always` で断らずに数える）、HTTP サーバーを止めた後（新しい
+//! handler は来ない）・拒否の監査の書き切りと pool を閉じる前に、上限
+//! [`DETACHED_STOP_TIMEOUT`] で待つ。待ちきれなくても abort しない（DB を触るので。
+//! docs/implementation-checklist.md §5）。閉じる前に始まった OPC UA 設定の回の `apply` が
+//! `opcua.shutdown()` の後に届いても、`stopping` の印で何も起動せずに戻る。時計合わせの
+//! 手動実行の回が broker の停止の後に届いても、`TaskGone`（結果不明）で戻って監査を書く。
 //!
 //! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
@@ -1215,6 +1224,10 @@ pub const WRITE_AUDIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 /// 後に待つので、走っている回（全部を待つ）は監査を書くだけで終わる。
 pub const CLOCK_SYNC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 終了のとき、REST・MCP・取り込みの handler が切り離したタスク（`crate::detached`）の
+/// 終わりを待つ上限。過ぎても abort せず、残りの数をログに出して先へ進む。
+pub const DETACHED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl RunningHub {
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
     /// 選ばせた場合も実際の値が返る）。旧 `hub_run.rs`が `server.local_addr()`
@@ -1267,9 +1280,11 @@ impl RunningHub {
         // 止める。
         let _ = self.controller.begin_shutdown();
         // H2: 時計合わせの新しい回を出さない（待たない。終わりは broker を止めた後に待つ）。
-        // REST の POST・PUT が切り離すタスクの受付も閉じる（以後は 503）。
         self.clock_sync_scheduler.signal_stop();
-        self.manager.clock_sync().close_detached();
+        // handler が切り離す保存・監査のタスク（時計合わせの PUT・POST も）の受付を閉じる
+        // （以後は 503 で何もしない）。走っているものは `server.stop()` の後・pool を閉じる
+        // 前に待つ（このモジュール doc の「シャットダウン順序」節「切り離したタスク」）。
+        self.manager.detached().close();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
         // `JoinHandle`を捨てて「プロセス終了任せ」で止めていた - ここが
@@ -1315,18 +1330,6 @@ impl RunningHub {
                 CLOCK_SYNC_STOP_TIMEOUT.as_secs()
             ));
         }
-        // H2: REST の POST・PUT が切り離した回（監査を書く）も pool を閉じる前に待つ。
-        if !self
-            .manager
-            .clock_sync()
-            .wait_detached(CLOCK_SYNC_STOP_TIMEOUT)
-            .await
-        {
-            log_err_line(&format!(
-                "banto-hub: [WARN] 時計合わせの REST のタスクが {} 秒のうちに終わりませんでした",
-                CLOCK_SYNC_STOP_TIMEOUT.as_secs()
-            ));
-        }
         // T9-2: simulators must outlive both the collector's tasks
         // (`manager`) and the broker sessions that may be dialing them
         // (`sessions`), so they are stopped last - see this module's doc
@@ -1336,6 +1339,17 @@ impl RunningHub {
             tls_server.stop().await;
         }
         self.server.stop().await;
+        // サーバーを止めたので新しい handler は来ない。切断で捨てられた handler のものも
+        // 含め、切り離したタスク（監査を書く）の終わりを pool を閉じる前に待つ。上限を
+        // 過ぎても abort しない（DB を触るタスクを `abort()` で止めない）。
+        let detached = self.manager.detached();
+        if !detached.wait(DETACHED_STOP_TIMEOUT).await {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 切り離した保存・監査のタスクが {} 秒のうちに終わりませんでした（{} 件が残ったまま終了へ進みます）",
+                DETACHED_STOP_TIMEOUT.as_secs(),
+                detached.pending()
+            ));
+        }
         // #945 の総点検: 書込みの入口（REST・gRPC・MCP）が止まったので、拒否の監査の
         // 書き手を止めて、表の残りを書き切ってから pool を閉じる（閉じたあとでは書けず
         // 失われる）。DB が詰まっていても止めないよう上限で切り上げ、残りは 1 行のログに

@@ -991,6 +991,7 @@ async fn a_stalled_audit_store_does_not_stall_the_socket() {
         auth,
         env.api_keys.clone(),
         audit,
+        env.manager.detached().clone(),
     )
     .layer(axum::Extension(StreamRevalidationTiming {
         interval: Duration::from_millis(100),

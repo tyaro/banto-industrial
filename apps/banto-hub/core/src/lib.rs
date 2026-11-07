@@ -224,6 +224,7 @@ pub mod controller;
 pub mod db;
 pub mod db_source;
 pub mod desktop_log;
+pub mod detached;
 pub mod diag_log;
 pub mod events;
 pub mod grpc;
