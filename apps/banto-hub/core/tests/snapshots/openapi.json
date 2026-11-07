@@ -138,6 +138,168 @@
         ],
         "description": "REST wire DTO for one catalog entry.\n\n`TagEntry` remains the saved/configured catalog owned by `CollectorManager`.\nThe runtime fields are layered here so an all-simulation run can be\nobserved without mutating the DB-backed catalog or the shared TagMap."
       },
+      "ClockResult": {
+        "description": "1 回の結果（JSON の `result`）。",
+        "enum": [
+          "ok",
+          "unsupported",
+          "rejected",
+          "device",
+          "verificationFailed",
+          "unavailable",
+          "unknown",
+          "notOffered",
+          "busy"
+        ],
+        "type": "string"
+      },
+      "ClockSchedule": {
+        "description": "時刻表（cron は持たない）。JSON は `{\"kind\":\"hourly\",\"minute\":m}` と\n`{\"kind\":\"daily\",\"hour\":h,\"minute\":m}`。範囲は [`Self::validate`]。",
+        "oneOf": [
+          {
+            "description": "毎時 `minute` 分。",
+            "properties": {
+              "kind": {
+                "enum": [
+                  "hourly"
+                ],
+                "type": "string"
+              },
+              "minute": {
+                "format": "int32",
+                "maximum": 59,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "minute",
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "毎日 `hour`:`minute`。",
+            "properties": {
+              "hour": {
+                "format": "int32",
+                "maximum": 23,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "kind": {
+                "enum": [
+                  "daily"
+                ],
+                "type": "string"
+              },
+              "minute": {
+                "format": "int32",
+                "maximum": 59,
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "hour",
+              "minute",
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ClockSyncRecord": {
+        "description": "1 回の実行の記録（直近の結果・POST の応答・監査の `detail`）。",
+        "properties": {
+          "at": {
+            "description": "実行した時刻（UTC の RFC3339、秒まで）。",
+            "type": "string"
+          },
+          "code": {
+            "description": "`device` の終了コード。",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "人が読む文。",
+            "type": "string"
+          },
+          "result": {
+            "$ref": "#/components/schemas/ClockResult"
+          },
+          "time": {
+            "description": "渡した現地時刻（`YYYY-MM-DDTHH:MM:SS`）。送らなかったときは `None`。",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/ClockTrigger"
+          }
+        },
+        "required": [
+          "at",
+          "trigger",
+          "result",
+          "message"
+        ],
+        "type": "object"
+      },
+      "ClockSyncSettings": {
+        "additionalProperties": false,
+        "description": "接続ごとの設定（REST の PUT の本文・GET の `settings`）。",
+        "properties": {
+          "enabled": {
+            "description": "定期の実行を出すか（既定は無効）。手動の実行はこれを問わない。",
+            "type": "boolean"
+          },
+          "schedule": {
+            "$ref": "#/components/schemas/ClockSchedule"
+          }
+        },
+        "required": [
+          "enabled",
+          "schedule"
+        ],
+        "type": "object"
+      },
+      "ClockSyncView": {
+        "description": "GET・PUT・MCP の応答 `{\"settings\": {...}, \"last\": 直近の結果 | null}`。",
+        "properties": {
+          "last": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ClockSyncRecord",
+                "description": "直近の結果（メモリだけ。Hub の再起動で消える）。まだ無ければ `null`。"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ClockSyncSettings"
+          }
+        },
+        "required": [
+          "settings"
+        ],
+        "type": "object"
+      },
+      "ClockTrigger": {
+        "description": "実行の契機。",
+        "enum": [
+          "schedule",
+          "manual"
+        ],
+        "type": "string"
+      },
       "ConnectionStatusEntry": {
         "description": "`GET /api/v1/status` の `connections` 配列1件分。",
         "properties": {
@@ -1242,7 +1404,7 @@
     }
   },
   "info": {
-    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。",
+    "description": "banto-hub の /api/v1/* API（docs/tag-server-design.md §5.1）。catalog（/api/v1/tags）はクライアントとの互換性契約である（§4.1）: 外部名・安定 ID・revision を用いたバインディングを前提に、フィールド名や JSON 形はこのスキーマとコードが常に一致するよう utoipa で自動生成している。書き込み（POST /api/v1/values/{tag}、T2-4・§6）は writable タグのみ・write:{tag} スコープの API キー限定。取り込み（POST /api/v1/ingest/{id}/values、docs/banto-hub-ingest-design.md §6.2）は push 接続へ値を送る口で、ingest:#{id} スコープの API キー限定。PLC の時計合わせ（/api/plc-connections/{id}/clock-sync、H2）は管理系の REST で、editor のセッションと X-Banto-Client ヘッダが要る。",
     "license": {
       "identifier": "MIT",
       "name": "MIT"
@@ -1252,6 +1414,133 @@
   },
   "openapi": "3.1.0",
   "paths": {
+    "/api/plc-connections/{id}/clock-sync": {
+      "get": {
+        "operationId": "clock_sync_get",
+        "parameters": [
+          {
+            "description": "PLC 接続の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClockSyncView"
+                }
+              }
+            },
+            "description": "設定（行が無ければ既定の「無効・毎時 5 分」）と直近の結果（メモリだけ。無ければ null）"
+          },
+          "403": {
+            "description": "editor 未満"
+          },
+          "404": {
+            "description": "保存済みの接続に無い"
+          }
+        },
+        "summary": "接続の時計合わせの設定と直近の結果。",
+        "tags": [
+          "clock-sync"
+        ]
+      },
+      "post": {
+        "operationId": "clock_sync_post",
+        "parameters": [
+          {
+            "description": "PLC 接続の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClockSyncRecord"
+                }
+              }
+            },
+            "description": "この回の結果（result: ok・unsupported・rejected・device（code に終了コード）・verificationFailed・unavailable・unknown（結果不明。自動では再送しない）・notOffered（このドライバ・loader は時計合わせを出さない）・busy）。監査と直近の結果にも残る。Hub の enabled を問わず出せるが、ゲストの接続設定 clock_set と運用書込みの loader のゲートは残る。危険: PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などと互いに上書きする。毎回 PLC のイベント履歴に「時計設定」（24000）が残る。"
+          },
+          "403": {
+            "description": "editor 未満"
+          },
+          "404": {
+            "description": "適用済みのカタログ（収集中の構成）に無い接続"
+          }
+        },
+        "summary": "今すぐ 1 回、PLC の時計を合わせる。",
+        "tags": [
+          "clock-sync"
+        ]
+      },
+      "put": {
+        "operationId": "clock_sync_put",
+        "parameters": [
+          {
+            "description": "PLC 接続の id",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int64",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ClockSyncSettings"
+              }
+            }
+          },
+          "description": "enabled（定期の実行。既定は無効）と時刻表（毎時 m 分 {\"kind\":\"hourly\",\"minute\":m} か毎日 hh:mm {\"kind\":\"daily\",\"hour\":h,\"minute\":m}）。時刻は Hub の PC の現地時刻で、過ぎた回は後から実行しない（追いつかない）。危険: PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きする。毎回 PLC のイベント履歴に「時計設定」（イベントコード 24000）が残るので、間隔を短くしすぎないこと。実際に書くにはゲストの接続設定 clock_set と、署名付きで書込みを選んだ運用書込みの loader も要る。",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ClockSyncView"
+                }
+              }
+            },
+            "description": "保存した設定と直近の結果"
+          },
+          "400": {
+            "description": "未知のキー・型の違い・範囲外（分 0–59、時 0–23）"
+          },
+          "403": {
+            "description": "editor 未満"
+          },
+          "404": {
+            "description": "保存済みの接続に無い"
+          }
+        },
+        "summary": "接続の時計合わせの設定を変える（保留キューを通さず即時）。",
+        "tags": [
+          "clock-sync"
+        ]
+      }
+    },
     "/api/v1/events": {
       "get": {
         "operationId": "v1_events",

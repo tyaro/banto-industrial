@@ -157,6 +157,11 @@ tokio-stream = { workspace = true }
 # T19 S3-b（docs/banto-hub-t19-design.md §3.9、UX-46）: system_info.rs の
 # CPU/メモリサンプラー。
 sysinfo = { workspace = true }
+# H2（tyaro/banto-industrial#1053）: `clock_sync.rs` が PLC の時計合わせに渡す
+# この PC の現地時刻（`chrono::Local`、`clock` feature）と時刻表の分の判定。
+# Cargo.lock に既にある 0.4.45（`iana-time-zone` 入り）を使うので、新しい
+# パッケージは増えない（この crate の依存の行が増えるだけ）。
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [build-dependencies]
 # T4（docs/tag-server-design.md §5.4）: build.rs が proto/tagserver/v1/*.proto

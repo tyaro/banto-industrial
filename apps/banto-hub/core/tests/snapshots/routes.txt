@@ -23,6 +23,7 @@ GET /api/pending-changes
 GET /api/pending-changes/{id}
 GET /api/plc-connections
 GET /api/plc-connections/{id}
+GET /api/plc-connections/{id}/clock-sync
 GET /api/plc-connections/{id}/diagnostics
 GET /api/sink/config
 GET /api/sink/groups
@@ -71,6 +72,7 @@ POST /api/pending-changes/{id}/cancel
 POST /api/pending-changes/{id}/requeue
 POST /api/plc-connections
 POST /api/plc-connections/test
+POST /api/plc-connections/{id}/clock-sync
 POST /api/plc-connections/{id}/diagnostics
 POST /api/plc-connections/{id}/test
 POST /api/sink/groups
@@ -100,6 +102,7 @@ PUT /api/grpc-settings
 PUT /api/mqtt-settings
 PUT /api/opcua-settings
 PUT /api/plc-connections/{id}
+PUT /api/plc-connections/{id}/clock-sync
 PUT /api/sink/groups/{id}
 PUT /api/sink/status
 PUT /api/store-settings
