@@ -1244,6 +1244,96 @@ async fn push_tags_report_the_push_value_source() {
 
 // --- WebSocket の登録（R2a-2d、モジュールの doc「WebSocket の 1 本の制限」） -------
 
+/// 閉じさせられた WS が理由を受け取る前に値・`ping` を送っても（`NotCurrent`）、理由は
+/// その時点で `ended` に届いている（登録を外すのと同じ `Mutex` の下で送る。PR #1067 の
+/// Codex P2）。置き換え・commit の無効化・終了の 3 つで確かめる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_current_always_finds_the_end_reason_pending() {
+    let env = env("ingest-ws-not-current").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+
+    // 置き換え。
+    let (mut first, _) = hub.open_ws_session(conn).unwrap();
+    let (mut second, _) = hub.open_ws_session(conn).unwrap();
+    assert_eq!(
+        hub.ping_ws(&first, None, env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(first.ended.try_recv(), Ok(WsEnd::Superseded));
+
+    // commit の無効化: 拒否は接続の無効（`ConnectionDisabled`）が先だが、理由は届いている。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 0 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    assert_eq!(
+        hub.apply_ws(&second, None, &[value("k", 1.0)], env.now_ms()),
+        Err(WsRefusal::Refused(ApplyRefusal::ConnectionDisabled))
+    );
+    assert_eq!(second.ended.try_recv(), Ok(WsEnd::ConnectionChanged));
+
+    // 終了。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 1 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    let (mut third, _) = hub.open_ws_session(conn).unwrap();
+    hub.shutdown();
+    assert_eq!(
+        hub.ping_ws(&third, Some("s".into()), env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(third.ended.try_recv(), Ok(WsEnd::ServerShutdown));
+    drop((first, second, third));
+    env.finish().await;
+}
+
+/// Hub の終了の合図（`IngestHub::shutdown`）: 開いている WS に `ServerShutdown` が届いて
+/// 登録が外れ、以後の登録は `WsOpenRefusal::ServerShutdown` で断る。2 回目の合図も同じ。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_ends_open_sessions_and_refuses_new_ones() {
+    let env = env("ingest-ws-shutdown").await;
+    let a = env.push_connection("A", None).await;
+    let group = env.group(a, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    let b = env.push_connection("B", None).await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+
+    let (mut on_a, _) = hub.open_ws_session(a).unwrap();
+    let (mut on_b, _) = hub.open_ws_session(b).unwrap();
+    hub.shutdown();
+    assert_eq!(on_a.ended.try_recv(), Ok(WsEnd::ServerShutdown));
+    assert_eq!(on_b.ended.try_recv(), Ok(WsEnd::ServerShutdown));
+    assert!(!hub.has_ws_session(a) && !hub.has_ws_session(b));
+    assert_eq!(
+        hub.ping_ws(&on_a, None, env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(
+        hub.open_ws_session(a).map(|_| ()),
+        Err(WsOpenRefusal::ServerShutdown)
+    );
+    hub.shutdown();
+    assert_eq!(
+        hub.open_ws_session(b).map(|_| ()),
+        Err(WsOpenRefusal::ServerShutdown)
+    );
+    assert_eq!(
+        WsOpenRefusal::ServerShutdown.ws_end().as_str(),
+        "server_shutdown"
+    );
+    drop(on_a);
+    drop(on_b);
+    env.finish().await;
+}
+
 /// 1 接続に 1 本: 2 本目の登録で 1 本目に `Superseded` が届き、1 本目からの値・`ping` は
 /// もう入らない（`NotCurrent`）。1 本目の後片付け（`Drop`）は 2 本目の登録を消さない。
 /// commit は改名では閉じさせず、無効化で `ConnectionChanged`、`push` でなくなると
@@ -1307,7 +1397,7 @@ async fn ws_sessions_are_one_per_connection_and_ended_by_commit() {
     assert!(!hub.has_ws_session(conn));
     assert_eq!(
         hub.open_ws_session(conn).map(|_| ()),
-        Err(ApplyRefusal::ConnectionDisabled)
+        Err(WsOpenRefusal::Connection(ApplyRefusal::ConnectionDisabled))
     );
     drop(second);
 
@@ -1336,7 +1426,7 @@ async fn ws_sessions_are_one_per_connection_and_ended_by_commit() {
     assert_eq!(third.ended.try_recv(), Ok(WsEnd::ConnectionRemoved));
     assert_eq!(
         hub.open_ws_session(conn).map(|_| ()),
-        Err(ApplyRefusal::UnknownConnection)
+        Err(WsOpenRefusal::Connection(ApplyRefusal::UnknownConnection))
     );
     drop(third);
     drop(on_bare);

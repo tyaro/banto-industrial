@@ -1124,3 +1124,52 @@ async fn a_stalled_audit_store_does_not_stall_the_socket() {
         assert_eq!(first_socket.len(), 102, "{id}: {first_socket:?}");
     }
 }
+
+/// Hub の終了（2026-11-07 オーナー決定）: 終了の合図（`manager.ingest_hub().shutdown()`、
+/// `RunningHub::shutdown_and_report` の冒頭と同じ）で開いている WS は close 1001
+/// `server_shutdown` で閉じ、`ingest_disconnected`（`reason: server_shutdown`）が書かれ、
+/// 切り離したタスクの待ち（`manager.detached().wait`）が戻る。合図の後に開いた WS も
+/// upgrade の後すぐ同じく閉じる（`welcome` も監査の行も出さない）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_shutdown_signal_closes_open_sockets_with_1001() {
+    let ws = ws_env(Arc::new(banto_tstore::SystemClock), None).await;
+    let (a, _) = push_connection(&ws.env, "Bridge1").await;
+    let (_, key_a) = ingest_key(&ws.env, "a", a).await;
+    let (mut client, _) = ws.open(a, &key_a).await;
+    let detached = ws.env.manager.detached().clone();
+    detached.close();
+    ws.env.manager.ingest_hub().shutdown();
+
+    assert_eq!(
+        wait_close(&mut client).await,
+        (1001, "server_shutdown".to_string())
+    );
+    assert!(
+        detached.wait(RECV_BOUND).await,
+        "the socket's audit is done"
+    );
+    let rows = wait_disconnected_rows(&ws.env, 1).await;
+    assert_eq!(rows[0]["reason"], "server_shutdown");
+    assert!(!ws.env.manager.ingest_hub().has_ws_session(a));
+
+    // 合図の後に開いた WS: upgrade はされるが、すぐ 1001 で閉じる。
+    let mut late = ws
+        .try_connect(&a.to_string(), Some(&key_a), &[])
+        .await
+        .expect("ws handshake");
+    assert_eq!(
+        wait_close(&mut late).await,
+        (1001, "server_shutdown".to_string())
+    );
+    assert!(detached.wait(RECV_BOUND).await);
+    let rows = session_audit_rows(&ws.env).await;
+    let connected = rows
+        .iter()
+        .filter(|(action, ..)| action == "ingest_connected")
+        .count();
+    assert_eq!(
+        connected, 1,
+        "the late socket was never registered: {rows:?}"
+    );
+    ws.server.stop().await;
+}

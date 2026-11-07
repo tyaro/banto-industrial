@@ -114,6 +114,12 @@
 //! docs/implementation-checklist.md §5）。閉じる前に始まった OPC UA 設定の回の `apply` が
 //! `opcua.shutdown()` の後に届いても、`stopping` の印で何も起動せずに戻る。時計合わせの
 //! 手動実行の回が broker の停止の後に届いても、`TaskGone`（結果不明）で戻って監査を書く。
+//! 取り込みの WS の接続ごとの監査の記録のタスク（`crate::ingest::audit::IngestAuditWriter`）も
+//! 数える。upgrade 済みの WS は `server.stop()` では閉じない（axum の `on_upgrade` の別の
+//! タスク）ので、冒頭の `close()` の直後に `manager.ingest_hub().shutdown()` で開いている WS を
+//! close 1001 `server_shutdown` で閉じさせ、以後に開く WS も同じく閉じる（2026-11-07
+//! オーナー決定）。閉じる手順と `ingest_disconnected`（`reason: server_shutdown`）の記録は
+//! 残りの停止と並んで進み、この待ちが終わりを待つ。
 //!
 //! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
@@ -1285,6 +1291,12 @@ impl RunningHub {
         // （以後は 503 で何もしない）。走っているものは `server.stop()` の後・pool を閉じる
         // 前に待つ（このモジュール doc の「シャットダウン順序」節「切り離したタスク」）。
         self.manager.detached().close();
+        // 取り込みの WS を close 1001 `server_shutdown` で閉じさせ、以後に開く WS も同じく
+        // 閉じる（2026-11-07 オーナー決定）。upgrade 済みの WS は `server.stop()` では閉じない
+        // ので、ここで合図する。冒頭に置くのは、閉じる手順（相手の close の返事を待つ、上限
+        // `ingest::ws::WRITER_DRAIN_TIMEOUT`）と切断の監査を残りの停止と並べて進め、下の
+        // 切り離したタスクの待ちより前に終わらせるため（再接続して来たブリッジも断られる）。
+        self.manager.ingest_hub().shutdown();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
         // `JoinHandle`を捨てて「プロセス終了任せ」で止めていた - ここが
@@ -3516,5 +3528,133 @@ Host: {addr}
             1,
             "settings read failure must not fall back to the default retention"
         );
+    }
+
+    /// Hub の終了（`shutdown_and_report`）は開いている取り込みの WS を close 1001
+    /// `server_shutdown` で閉じ、その `ingest_disconnected`（`reason: server_shutdown`）を
+    /// 設定 DB を閉じる前に書き切る（2026-11-07 オーナー決定）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_closes_an_open_ingest_socket_and_audits_it() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+        let dir = crate::test_support::TempDir::new("hub-runtime-ingest-shutdown");
+        let db_path = dir
+            .path()
+            .join("registry.sqlite3")
+            .to_string_lossy()
+            .into_owned();
+        let pool = init_db(&db_path).await.expect("init DB");
+        UsersService::new(Db::Sqlite(pool.clone()))
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup admin");
+        pool.close().await;
+
+        let hub = HubRuntime::start(HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db_path.clone(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_owned()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test-ingest-shutdown".to_owned(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        })
+        .await
+        .expect("start Hub");
+        let addr = hub.local_addr();
+        let bound = Duration::from_secs(10);
+        let (status, login) = call_path(
+            addr,
+            "/api/auth/login",
+            "login",
+            "POST",
+            None,
+            Some(&serde_json::json!({ "username": "admin", "password": "password123" })),
+            bound,
+        )
+        .await;
+        assert_eq!(status, 200, "{login}");
+        let token = login["token"].as_str().expect("token").to_owned();
+        let post = |path: &'static str, body: serde_json::Value| {
+            let token = token.clone();
+            async move {
+                let (status, json) =
+                    call_path(addr, path, path, "POST", Some(&token), Some(&body), bound).await;
+                assert!(status == 200 || status == 201, "{path}: {status} {json}");
+                json
+            }
+        };
+        let conn = post(
+            "/api/plc-connections",
+            serde_json::json!({ "name": "Bridge1", "protocol": "push", "enabled": true }),
+        )
+        .await;
+        let conn_id = conn["id"].as_i64().expect("connection id");
+        let group = post(
+            "/api/collection-groups",
+            serde_json::json!({ "name": "g", "plcConnectionId": conn_id, "periodMs": 100 }),
+        )
+        .await;
+        post(
+            "/api/tags",
+            serde_json::json!({ "name": "t", "collectionGroupId": group["id"],
+                "address": "line1.temp", "dataType": "f32", "enabled": true }),
+        )
+        .await;
+        let issued = post(
+            "/api/api-keys",
+            serde_json::json!({ "name": "bridge", "scopes": [format!("ingest:#{conn_id}")] }),
+        )
+        .await;
+        let key = issued["key"].as_str().expect("key").to_owned();
+
+        let mut request = format!("ws://{addr}/api/v1/ingest/{conn_id}/stream")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", format!("Bearer {key}").parse().unwrap());
+        let (mut client, _) = tokio_tungstenite::connect_async(request)
+            .await
+            .expect("ws handshake");
+        let welcome = tokio::time::timeout(bound, client.next())
+            .await
+            .expect("welcome within the bound");
+        assert!(
+            matches!(&welcome, Some(Ok(WsMessage::Text(text))) if text.contains("welcome")),
+            "{welcome:?}"
+        );
+        // 送り手は読み続ける（close に返事を返す）。
+        let reader = tokio::spawn(async move {
+            while let Some(msg) = client.next().await {
+                if let Ok(WsMessage::Close(Some(frame))) = msg {
+                    return Some((u16::from(frame.code), frame.reason.to_string()));
+                }
+            }
+            None
+        });
+
+        let report = hub.shutdown_and_report().await;
+        assert!(report.db_closed);
+        let close = tokio::time::timeout(bound, reader)
+            .await
+            .expect("the socket ends")
+            .expect("reader task");
+        assert_eq!(close, Some((1001, "server_shutdown".to_owned())));
+
+        let pool = init_db(&db_path).await.expect("reopen DB");
+        let reasons: Vec<String> = sqlx::query_scalar(
+            "SELECT json_extract(detail, '$.reason') FROM audit_log \
+             WHERE origin = 'ingest' AND action = 'ingest_disconnected'",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reasons, vec!["server_shutdown".to_owned()]);
+        pool.close().await;
     }
 }

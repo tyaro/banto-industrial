@@ -26,8 +26,10 @@
 //!
 //! 使う側: API キーの変更・OPC UA 設定の PUT・時計合わせの PUT（保存）と POST（手動
 //! 実行、`crate::rest` の clock-sync）（`spawn`。終了中は 503）、取り込みの監査
-//! （`crate::ingest::audit::record`）と書込みの停止・再開（REST・MCP の
-//! `WriteControl::set_enabled_detached`）（`spawn_always`）。
+//! （`crate::ingest::audit::record`）・取り込みの WS の接続ごとの監査の記録のタスク
+//! （`crate::ingest::audit::IngestAuditWriter`。WS が開いている間ずっと数える。終了は冒頭で
+//! WS を閉じさせる）と書込みの
+//! 停止・再開（REST・MCP の `WriteControl::set_enabled_detached`）（`spawn_always`）。
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

@@ -104,6 +104,9 @@
 //!   ことは無い）。
 //! - 登録を外すのは [`WsSession`] の `Drop` だけで、**自分の番号のときだけ**外す
 //!   （閉じさせられた古い WS の後片付けが新しい WS の登録を消さない）。
+//! - [`IngestHub::shutdown`]（Hub の終了）は、開いている WS をすべて
+//!   [`WsEnd::ServerShutdown`] で閉じさせ、以後の登録を断る（2026-11-07 オーナー決定）。
+//!   `commit` と同じく外側の書き込みロックの下で印を立てるので、開く側と順序が付く。
 //! - [`IngestHub::commit`] は、接続が消えたら [`WsEnd::ConnectionRemoved`]、`push` でなく
 //!   なった・有効 / 無効が変わったら [`WsEnd::ConnectionChanged`] で閉じさせる。改名・
 //!   `stale_timeout_ms`・ブリッジの設定の変更では閉じない（束縛は id。ブリッジの設定の
@@ -306,7 +309,8 @@ pub struct IngestState {
     pub config_changed: bool,
 }
 
-/// `IngestHub` が WS を閉じさせる理由（§6.1。close 1008 の理由文）。
+/// `IngestHub` が WS を閉じさせる理由（§6.1。close の理由文。`ServerShutdown` だけ
+/// 1001、ほかは 1008）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WsEnd {
     /// 同じ接続に新しい WS が開いた（Q10 = (a)）。
@@ -315,6 +319,8 @@ pub enum WsEnd {
     ConnectionChanged,
     /// 接続が削除された。
     ConnectionRemoved,
+    /// Hub の終了（[`IngestHub::shutdown`]、2026-11-07 オーナー決定）。
+    ServerShutdown,
 }
 
 impl WsEnd {
@@ -324,6 +330,30 @@ impl WsEnd {
             Self::Superseded => "superseded",
             Self::ConnectionChanged => "connection_changed",
             Self::ConnectionRemoved => "connection_removed",
+            Self::ServerShutdown => "server_shutdown",
+        }
+    }
+}
+
+/// WS を開けなかった理由（[`IngestHub::open_ws_session`]）。upgrade の後なので、呼び出し側
+/// は [`Self::ws_end`] で閉じる（`ingest_connected` を出していないので切断の監査も出さない）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WsOpenRefusal {
+    /// 接続が無い・無効（認証の層を通った後に commit と競った）。
+    Connection(ApplyRefusal),
+    /// Hub の終了の合図（[`IngestHub::shutdown`]）の後。
+    ServerShutdown,
+}
+
+impl WsOpenRefusal {
+    /// 閉じる理由。
+    pub fn ws_end(self) -> WsEnd {
+        match self {
+            Self::Connection(ApplyRefusal::ConnectionDisabled) => WsEnd::ConnectionChanged,
+            Self::Connection(ApplyRefusal::UnknownConnection | ApplyRefusal::StaleEpoch { .. }) => {
+                WsEnd::ConnectionRemoved
+            }
+            Self::ServerShutdown => WsEnd::ServerShutdown,
         }
     }
 }
@@ -718,12 +748,17 @@ impl SlotShared {
         }
     }
 
-    /// 今の WS を `end` で閉じさせて登録を外す（無ければ何もしない）。
+    /// 今の WS を `end` で閉じさせて登録を外す（無ければ何もしない）。理由は登録の
+    /// `Mutex` を持ったまま送る: 登録が空なのを（同じ `Mutex` の下で）見て `NotCurrent` を
+    /// 返された WS は、その時点で必ず理由を受け取れる（`super::ws` の `Conn::run` は
+    /// `NotCurrent` のとき届いている理由を先に使う。PR #1067 の Codex P2）。
     fn end_ws(&self, end: WsEnd) {
-        if let Some(entry) = lock(&self.ws).take() {
+        let mut ws = lock(&self.ws);
+        if let Some(entry) = ws.take() {
             // 受け手（WS のループ）が既に終わっていれば届かないが、それで良い。
             let _ = entry.end.send(end);
         }
+        drop(ws);
     }
 
     /// `effect` を保持値に当て、知らせるなら `state` を送る。
@@ -759,6 +794,8 @@ struct Inner {
     slots: HashMap<i64, Arc<IngestSlot>>,
     /// 収集が Running か（`on_collection_started` で true、`on_collection_stopped` で false）。
     collecting: bool,
+    /// Hub の終了の合図の後か（[`IngestHub::shutdown`]。戻さない）。
+    shutting_down: bool,
 }
 
 /// 取り込みの受信側（§4.2）。`crate::hub::CollectorManager` が 1 つ作り、収集の
@@ -957,6 +994,20 @@ impl IngestHub {
             });
         }
         inner.slots = next;
+    }
+
+    /// Hub の終了の合図（`crate::runtime::RunningHub::shutdown_and_report` の冒頭、2026-11-07
+    /// オーナー決定）: 開いている WS をすべて [`WsEnd::ServerShutdown`]（close 1001
+    /// `server_shutdown`）で閉じさせ、以後の [`Self::open_ws_session`] を
+    /// [`WsOpenRefusal::ServerShutdown`] で断る。何度呼んでもよい。ロックは `commit` と同じ
+    /// 外側の書き込みロック → 接続の登録の順（開く側も外側のロックの下で印を見るので、
+    /// 合図の後に登録される WS は無い）。
+    pub fn shutdown(&self) {
+        let mut inner = write(&self.inner);
+        inner.shutting_down = true;
+        for slot in inner.slots.values() {
+            slot.shared.end_ws(WsEnd::ServerShutdown);
+        }
     }
 
     /// 収集の停止（`controller.rs` の `stop_locked`、`manager.stop()` の後 = 収集の
@@ -1192,7 +1243,7 @@ impl IngestHub {
     pub fn open_ws_session(
         &self,
         conn_id: i64,
-    ) -> Result<(WsSession, IngestConnectionInfo), ApplyRefusal> {
+    ) -> Result<(WsSession, IngestConnectionInfo), WsOpenRefusal> {
         self.open_ws_session_from(conn_id, None)
     }
 
@@ -1202,14 +1253,17 @@ impl IngestHub {
         &self,
         conn_id: i64,
         sender: Option<IngestSender>,
-    ) -> Result<(WsSession, IngestConnectionInfo), ApplyRefusal> {
+    ) -> Result<(WsSession, IngestConnectionInfo), WsOpenRefusal> {
         let inner = read(&self.inner);
+        if inner.shutting_down {
+            return Err(WsOpenRefusal::ServerShutdown);
+        }
         let slot = inner
             .slots
             .get(&conn_id)
-            .ok_or(ApplyRefusal::UnknownConnection)?;
+            .ok_or(WsOpenRefusal::Connection(ApplyRefusal::UnknownConnection))?;
         if !slot.config.enabled {
-            return Err(ApplyRefusal::ConnectionDisabled);
+            return Err(WsOpenRefusal::Connection(ApplyRefusal::ConnectionDisabled));
         }
         // 既読にしてから今の様子を読む: 読んだ後の変化は必ず通知として届く。
         let mut state = slot.shared.state.subscribe();
@@ -1228,10 +1282,13 @@ impl IngestHub {
         };
         let id = self.next_ws_id.fetch_add(1, Ordering::Relaxed);
         let (end, ended) = oneshot::channel();
-        let previous = lock(&slot.shared.ws).replace(WsEntry { id, end, sender });
-        if let Some(previous) = previous {
+        // 前の WS への `Superseded` も登録の `Mutex` を持ったまま送る（[`SlotShared::end_ws`]
+        // と同じ理由）。
+        let mut ws = lock(&slot.shared.ws);
+        if let Some(previous) = ws.replace(WsEntry { id, end, sender }) {
             let _ = previous.end.send(WsEnd::Superseded);
         }
+        drop(ws);
         Ok((
             WsSession {
                 id,

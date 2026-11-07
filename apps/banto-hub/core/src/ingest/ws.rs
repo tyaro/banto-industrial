@@ -103,7 +103,10 @@
 //! ## 監査（PR #759 のレビュー P2-2）
 //!
 //! 受信のループは監査の記録を待たない: 行は接続ごとの記録のタスクへ積むだけ
-//! （[`super::audit::IngestAuditWriter`]。順序を保ち、落とさない）。遅い監査の DB でも
+//! （[`super::audit::IngestAuditWriter`]。順序を保ち、落とさない）。記録のタスクは
+//! `IngestHub` への登録の前に立てて Hub の数え（`crate::detached`）に入れる
+//! （[`open_counted`]。登録の後・数える前に Hub の終了が待ちを抜けない）。断られたら行を
+//! 積まずに捨てる。遅い監査の DB でも
 //! ping・close の知らせ・`state`・再検証は止まらない。`ack` は行を積んだ時点で返す。
 //!
 //! ## close コード
@@ -117,6 +120,11 @@
 //! | 1008 | `connection_removed` | 接続の削除（commit） | `connection_removed` |
 //! | 1009 | `message_too_big` | 1 メッセージ・1 フレームが 256 KiB を超えた | `message_too_big` |
 //! | 1013 | `backpressure` | 送信キューが満杯 | `backpressure` |
+//! | 1001 | `server_shutdown` | Hub の終了（`IngestHub::shutdown`。合図の後に開いた WS も upgrade の後すぐ） | `server_shutdown`（合図の後に開いた WS は監査しない） |
+//!
+//! `IngestHub` が閉じさせる行（`superseded`・`connection_*`・`server_shutdown`）は、受信の
+//! メッセージを先に処理して拒否（`NotCurrent`・接続が無い・無効）になっても、届いている
+//! 理由で閉じる（`prefer_pending_end`。理由は登録を外すのと同じ `Mutex` の下で送られる）。
 //!
 //! 1009 は tungstenite の読み取りの上限（`WebSocketUpgrade::max_message_size` /
 //! `max_frame_size`、256 KiB ちょうどは通る）が返すエラーで判定する。axum は
@@ -124,8 +132,14 @@
 //! （`Message too long`）で見分ける（[`is_message_too_big`]。実際の WebSocket で 1 バイト
 //! 超を送るテストがこの判定を固定する）。
 //!
-//! Hub の終了（`server_shutdown`、§8）は今の `/api/v1/stream` と同じく WS に知らせる
-//! 経路が無い（プロセスの終わりで TCP ごと閉じる。監査の行は残らない）。
+//! Hub の終了（2026-11-07 オーナー決定）: `server.stop()` は upgrade 済みの接続を待たない
+//! （axum の `on_upgrade` が別のタスクで走らせる）ので、`RunningHub::shutdown_and_report` は
+//! 冒頭で [`IngestHub::shutdown`] を呼び、開いている WS を 1001 `server_shutdown` で閉じさせる
+//! （上の閉じ方の手順のまま。監査は `ingest_disconnected` `reason: server_shutdown`）。合図の
+//! 後に開いた WS は登録を断られ、upgrade の後すぐ同じ close で閉じる（commit と競ったときと
+//! 同じく `ingest_connected` を出していないので切断の行も出さない）。接続ごとの監査の記録の
+//! タスクは Hub の数え（`crate::detached`）に入っており、終了は pool を閉じる前にその終わりを
+//! 待つ。`/api/v1/stream` は変えていない（終了で知らせる経路は無いまま）。
 //!
 //! ## Live（§4.3）
 //!
@@ -184,6 +198,9 @@ pub const MESSAGE_TOO_BIG_CLOSE_CODE: u16 = 1009;
 /// `/api/v1/stream` と同じ）。
 pub const BACKPRESSURE_CLOSE_CODE: u16 = 1013;
 
+/// Hub の終了（`server_shutdown`、RFC 6455 の 1001 Going Away。2026-11-07 オーナー決定）。
+pub const SERVER_SHUTDOWN_CLOSE_CODE: u16 = 1001;
+
 /// 送信キューの容量と、送信のタスクを待つ上限。本番は [`Default`]。テストは router に
 /// `Extension(IngestWsTuning { .. })` を重ねて変える（`StreamRevalidationTiming` と同じ
 /// 差し込み方。外部の要求からは差し込めない）。
@@ -209,6 +226,8 @@ pub struct IngestWsState {
     pub audit: AuditLogService,
     pub clock: Arc<dyn Clock>,
     pub api_keys: ApiKeysService,
+    /// 接続ごとの監査の記録のタスクを数える Hub の数え（`CollectorManager::detached` の複製）。
+    pub detached: DetachedTasks,
 }
 
 /// `GET /api/v1/ingest/{id}/stream` のルーター。認証の層は `route_layer` でこのルート
@@ -228,7 +247,7 @@ pub fn ingest_ws_router(
         ingest: ingest.clone(),
         clock: clock.clone(),
         transport: Transport::Ws,
-        detached,
+        detached: detached.clone(),
     };
     Router::new()
         .route(STREAM_PATH, get(v1_ingest_stream))
@@ -241,6 +260,7 @@ pub fn ingest_ws_router(
             audit,
             clock,
             api_keys,
+            detached,
         })
 }
 
@@ -292,6 +312,26 @@ pub async fn v1_ingest_stream(
         .into_response()
 }
 
+/// 監査の記録のタスク（Hub の数えに入る）を立ててから `open`（`IngestHub` への登録）を
+/// 呼ぶ（PR #1067 のオーナーの相互レビュー P2）。登録の後に立てると、その間に Hub の終了が
+/// 合図を送り、数えが 0 のまま待ちを抜けて pool を閉じ、この WS の接続・切断の行が待たれない
+/// 記録のタスクで書かれうる。断られたら記録のタスクを行を積まずに捨てる（送り手を捨てると
+/// タスクは空のまま終わり、数えから外れる）。
+fn open_counted<T, E>(
+    audit: &AuditLogService,
+    detached: &DetachedTasks,
+    open: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, IngestAuditWriter), E> {
+    let writer = IngestAuditWriter::spawn(audit, detached);
+    match open() {
+        Ok(opened) => Ok((opened, writer)),
+        Err(refusal) => {
+            drop(writer);
+            Err(refusal)
+        }
+    }
+}
+
 /// WS が閉じた理由（モジュールの doc の close コードの表の行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
@@ -306,6 +346,9 @@ impl End {
     fn close_frame(self) -> Option<CloseFrame> {
         let (code, reason) = match self {
             Self::ClientClosed => return None,
+            Self::Hub(WsEnd::ServerShutdown) => {
+                (SERVER_SHUTDOWN_CLOSE_CODE, WsEnd::ServerShutdown.as_str())
+            }
             Self::Hub(end) => (REVOKED_CLOSE_CODE, end.as_str()),
             Self::Revoked(reason) => (REVOKED_CLOSE_CODE, reason.as_str()),
             Self::Backpressure => (BACKPRESSURE_CLOSE_CODE, "backpressure"),
@@ -432,17 +475,19 @@ async fn run_socket(
         peer: caller.peer.clone(),
         at_ms: state.clock.now_ms(),
     };
-    let (end, conn) = match state
-        .ingest
-        .open_ws_session_from(caller.connection_id, Some(sender))
-    {
-        Ok((session, info)) => {
+    // 監査の記録のタスクは登録の**前に**立てて Hub の数えに入れる（`open_counted`）。
+    let opened = open_counted(&state.audit, &state.detached, || {
+        state
+            .ingest
+            .open_ws_session_from(caller.connection_id, Some(sender))
+    });
+    let (end, conn) = match opened {
+        Ok(((session, info), audit)) => {
             let ctx = IngestAuditContext {
                 // 登録した時点の名前を控える（認証の層の後に改名されていても今の名前）。
                 connection_name: Some(info.name.clone()),
                 ..caller.audit_context()
             };
-            let audit = IngestAuditWriter::spawn(&state.audit);
             audit.push(vec![IngestAuditRow::connected(&ctx)]);
             let welcome = WelcomeWire {
                 op: "welcome",
@@ -477,16 +522,12 @@ async fn run_socket(
         }
         // 認証の層を通った後、登録までの間に commit と競った（§6.1）。監査の
         // `ingest_connected` は出していないので、切断の行も出さない。
+        // Hub の終了の合図の後も同じ（1001 `server_shutdown`）。記録のタスクは
+        // `open_counted` が行を積まずに捨てた（数えから外れる）。
         Err(refusal) => {
             drop(outbound);
             drop(revalidator);
-            let end = match refusal {
-                ApplyRefusal::ConnectionDisabled => WsEnd::ConnectionChanged,
-                ApplyRefusal::UnknownConnection | ApplyRefusal::StaleEpoch { .. } => {
-                    WsEnd::ConnectionRemoved
-                }
-            };
-            (End::Hub(end), None)
+            (End::Hub(refusal.ws_end()), None)
         }
     };
 
@@ -669,7 +710,7 @@ impl Conn {
                 },
             };
             if let Err(end) = step {
-                return end;
+                return prefer_pending_end(end, &mut session.ended);
             }
         }
     }
@@ -858,12 +899,29 @@ fn apply_refusal_end(refusal: ApplyRefusal) -> End {
     }
 }
 
-/// `apply_ws` / `ping_ws` の拒否で閉じる理由。`NotCurrent` は新しい WS に置き換えられた
-/// （commit が閉じさせた場合も、理由はすぐ `ended` に届くが、ここでは置き換えとして扱う）。
+/// `apply_ws` / `ping_ws` の拒否で閉じる理由。`NotCurrent` はここでは仮に `Superseded` とし、
+/// [`prefer_pending_end`] が `ended` に届いている本当の理由（`server_shutdown`・
+/// `connection_changed`・`connection_removed`・`superseded`）に置き換える。
 fn refusal_end(refusal: WsRefusal) -> End {
     match refusal {
         WsRefusal::NotCurrent => End::Hub(WsEnd::Superseded),
         WsRefusal::Refused(refusal) => apply_refusal_end(refusal),
+    }
+}
+
+/// 閉じる理由を決める最後の段（PR #1067 の Codex P2）: `select!` が `ended` より先に受信の
+/// メッセージを選び、`apply_ws` / `ping_ws` の拒否から理由を推した（`End::Hub(_)`。
+/// `NotCurrent` は仮の `Superseded`、接続が消えた・無効は `connection_removed` /
+/// `connection_changed`）とき、`IngestHub` が送った理由が `ended` に届いていればそれを使う
+/// （終了・置き換え・プロトコルの変更で、推した理由と違いうる）。`IngestHub` は登録を外す
+/// のと同じ `Mutex` の下で理由を送る（`SlotShared::end_ws`・`open_ws_session_from`）ので、
+/// `NotCurrent` を見た時点で理由は必ず届いている。届いていない（`ended` の腕で受け取り
+/// 済み、または `IngestHub` が閉じさせていない）ときは推した理由のまま。ほかの理由
+/// （再検証・背圧・上限・送り手の close）は置き換えない。
+fn prefer_pending_end(end: End, ended: &mut tokio::sync::oneshot::Receiver<WsEnd>) -> End {
+    match end {
+        End::Hub(_) => ended.try_recv().map(End::Hub).unwrap_or(end),
+        other => other,
     }
 }
 
@@ -884,6 +942,79 @@ pub fn sanitize_status(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 登録（`open`）の時点で記録のタスクはもう数えられている。断られたら行を書かずに
+    /// 数えから外れる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_audit_writer_is_counted_before_the_session_registers() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let audit = AuditLogService::new(crate::db::Db::Sqlite(pool.clone()));
+        let detached = DetachedTasks::new();
+
+        let (registered, writer) =
+            open_counted(&audit, &detached, || Ok::<_, ()>(detached.pending())).expect("opened");
+        assert_eq!(registered, 1, "counted when the session registers");
+        drop(writer);
+        assert!(detached.wait(Duration::from_secs(5)).await);
+
+        let refused = open_counted(&audit, &detached, || {
+            assert_eq!(detached.pending(), 1);
+            Err::<(), _>(crate::ingest::WsOpenRefusal::ServerShutdown)
+        });
+        assert!(matches!(
+            refused,
+            Err(crate::ingest::WsOpenRefusal::ServerShutdown)
+        ));
+        assert!(detached.wait(Duration::from_secs(5)).await);
+        assert_eq!(detached.pending(), 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused open writes no audit rows");
+        pool.close().await;
+    }
+
+    /// `NotCurrent`（仮の `Superseded`）は、`ended` に届いている理由で置き換える。届いて
+    /// いなければ仮の値のまま。ほかの理由は置き換えない。
+    #[test]
+    fn a_pending_end_reason_wins_over_the_not_current_placeholder() {
+        let not_current = refusal_end(WsRefusal::NotCurrent);
+        assert_eq!(not_current, End::Hub(WsEnd::Superseded));
+        for reason in [
+            WsEnd::ServerShutdown,
+            WsEnd::ConnectionChanged,
+            WsEnd::ConnectionRemoved,
+            WsEnd::Superseded,
+        ] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            tx.send(reason).unwrap();
+            assert_eq!(prefer_pending_end(not_current, &mut rx), End::Hub(reason));
+        }
+        let (_tx, mut rx) = tokio::sync::oneshot::channel::<WsEnd>();
+        assert_eq!(prefer_pending_end(not_current, &mut rx), not_current);
+        // 接続が消えたと推しても、commit が送った理由（プロトコルの変更）を使う。
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ConnectionChanged).unwrap();
+        assert_eq!(
+            prefer_pending_end(apply_refusal_end(ApplyRefusal::UnknownConnection), &mut rx),
+            End::Hub(WsEnd::ConnectionChanged)
+        );
+        // `ended` の腕で受け取り済みなら、その理由のまま。
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ServerShutdown).unwrap();
+        assert_eq!(rx.try_recv(), Ok(WsEnd::ServerShutdown));
+        assert_eq!(
+            prefer_pending_end(End::Hub(WsEnd::ServerShutdown), &mut rx),
+            End::Hub(WsEnd::ServerShutdown)
+        );
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ServerShutdown).unwrap();
+        assert_eq!(
+            prefer_pending_end(End::Backpressure, &mut rx),
+            End::Backpressure
+        );
+    }
 
     /// close コードの表（モジュールの doc）。
     #[test]
@@ -907,6 +1038,12 @@ mod tests {
                 End::Hub(WsEnd::ConnectionRemoved),
                 Some((1008, "connection_removed")),
                 "connection_removed",
+                None,
+            ),
+            (
+                End::Hub(WsEnd::ServerShutdown),
+                Some((1001, "server_shutdown")),
+                "server_shutdown",
                 None,
             ),
             (
