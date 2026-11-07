@@ -56,7 +56,9 @@
 //! - **実行を待たない**: 評価はループの中で行い、各回の実行は `JoinSet` に spawn
 //!   する。1 回の時計合わせが長引いても（`clock_job_limit` は応答の時間切れに比例し、
 //!   T = 5 s なら 81 s）次の分の評価と別の接続の回は遅れない。止める合図の後は
-//!   新しい回を出さず、残る回を全部待ってから終わる（abort しない）。
+//!   新しい回を出さず、残る回を全部待ってから終わる（abort しない）。評価（DB の
+//!   読取り）を待つ間に今の分が変わっていたら（スリープからの復帰など）、その評価の
+//!   回は出さずに捨てる（追いつかない。捨てた分の印は残すので同じ分で出し直さない）。
 //!
 //! 今の時刻の取得は差し替えられる（[`ClockSync::set_local_now`]）。試験は実時間を
 //! 待たずに分を進める。
@@ -68,8 +70,9 @@
 //!   無い・切断中なら送らずに `unavailable`。
 //! - 接続ごとの実行中の印で、同じ接続の時計合わせを重ねない（2 つ目は送らずに
 //!   `busy`）。
-//! - `CivilTime` は `set_clock` を呼ぶ**直前**に現地時刻から作る（秒は切り捨て、
-//!   曜日は渡さない）。
+//! - `CivilTime` は broker が**ジョブを始めるとき**（ドライバの `set_clock` の直前）に
+//!   現地時刻から作る（`BrokerHandle::set_clock_now`。キューの待ちを時刻の誤差に
+//!   しない。秒は切り捨て、曜日は渡さない）。渡した時刻は broker が返す。
 //! - 時間切れは broker の `clock_job_limit` が持つ。Hub は外側に別の時間切れを
 //!   足さない（足すと、捨てた後に broker のキューの中で送られる）。**自動で再送
 //!   しない**（次の回は時刻表どおり）。
@@ -597,17 +600,23 @@ impl ClockSync {
                 "この接続は切断中です（送っていません）",
             );
         }
-        // 呼ぶ直前に現地時刻から作る（秒は切り捨て、曜日は渡さない）。
-        let time = civil_time(self.local_now());
-        let outcome = handle.set_clock(time).await;
+        // broker がジョブを始めるとき（ドライバの `set_clock` の直前）に現地時刻から
+        // 作る（キューの待ちを時刻の誤差にしない。秒は切り捨て、曜日は渡さない）。
+        let now = self
+            .now
+            .read()
+            .expect("clock sync now lock poisoned")
+            .clone();
+        let (outcome, handed) = handle
+            .set_clock_now(Box::new(move || civil_time(now())))
+            .await;
         let (result, code, message) = classify(&outcome);
-        let sent = !matches!(result, ClockResult::Unavailable | ClockResult::NotOffered);
         ClockSyncRecord {
             at: utc_now_rfc3339(),
             trigger,
             // 渡した時刻。送らなかった（broker が送る前に断った・時計合わせを出さない）
-            // ときは載せない。
-            time: sent.then(|| civil_time_text(&time)),
+            // ときは broker が返さないので載せない。
+            time: handed.as_ref().map(civil_time_text),
             result,
             code,
             message,
@@ -781,6 +790,10 @@ where
                 // 評価を待つ間に止める合図が来ていたら、新しい回は出さない。
                 if *stop_rx.borrow() {
                     break;
+                }
+                // 評価を待つ間に分が変わっていたら、その回は捨てる（追いつかない）。
+                if truncate_to_minute(now()) != minute {
+                    continue;
                 }
                 for id in ids {
                     runs.spawn(run(id));
@@ -1271,6 +1284,46 @@ mod tests {
         release.notify_one();
         assert!(scheduler.stop_and_join(Duration::from_secs(5)).await);
         assert_eq!(*runs.lock().unwrap(), 0, "no run after the stop signal");
+    }
+
+    /// 評価（`due`）を待つ間に分が変わったら、その評価の回は出さない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_minute_that_passed_during_the_evaluation_starts_no_run() {
+        let now = Arc::new(Mutex::new(at(2026, 11, 7, 9, 5, 0)));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let runs = Arc::new(Mutex::new(0u32));
+        let (source, release_due, runs_seen) = (now.clone(), release.clone(), runs.clone());
+        let mut scheduler = spawn_loop(
+            move || *source.lock().unwrap(),
+            move |minute: NaiveDateTime| {
+                let (release, entered) = (release_due.clone(), entered_tx.clone());
+                async move {
+                    if minute.minute() != 5 {
+                        return Vec::new();
+                    }
+                    entered.send(()).unwrap();
+                    release.notified().await;
+                    vec![1]
+                }
+            },
+            move |_| {
+                let runs = runs_seen.clone();
+                async move {
+                    *runs.lock().unwrap() += 1;
+                }
+            },
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        *now.lock().unwrap() = at(2026, 11, 7, 9, 10, 0);
+        release.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(scheduler.stop_and_join(Duration::from_secs(5)).await);
+        assert_eq!(*runs.lock().unwrap(), 0, "09:05 is not run at 09:10");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
