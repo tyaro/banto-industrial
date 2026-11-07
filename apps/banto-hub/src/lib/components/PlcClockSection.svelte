@@ -48,11 +48,21 @@
 
 	let {
 		connectionId,
+		connectionName,
+		settingsMatch,
 		// 親が読む出力用の bindable（この部品の中では書くだけ）。
 		// eslint-disable-next-line no-useless-assignment
 		dirty = $bindable()
 	}: {
 		connectionId: number;
+		/** 確認ダイアログに出す、保存済みの接続名（フォームの未保存の名前ではない）。 */
+		connectionName: string;
+		/**
+		 * フォームの接続先が保存済みと同じか。違う間は読取りと手動の時計合わせを止める（REST は
+		 * 適用済みの＝変更前の接続先へ送るので、画面の変更後の PLC と取り違えないため）。
+		 * 設定の保存（PUT）は接続 id に付くので止めない。
+		 */
+		settingsMatch: boolean;
 		/** 時計合わせの設定に未保存の変更があるか（読み込んだ設定とフォームが違う）。 */
 		dirty?: boolean;
 	} = $props();
@@ -143,7 +153,7 @@
 	});
 
 	async function readClock(): Promise<void> {
-		if (reading) return;
+		if (reading || !settingsMatch) return;
 		const id = connectionId;
 		const gen = generation;
 		const request = ++readRequest;
@@ -189,10 +199,10 @@
 	}
 
 	async function runNow(): Promise<void> {
-		if (running) return;
+		if (running || !settingsMatch) return;
 		if (
 			!window.confirm(
-				'PLC の時計をこの PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？'
+				`接続「${connectionName}」の PLC の時計をこの PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
 			)
 		) {
 			return;
@@ -218,9 +228,14 @@
 
 <section class="test-connection clock" aria-label="PLC の時計">
 	<h4>PLC の時計</h4>
+	{#if !settingsMatch}
+		<p class="hint" data-testid="clock-unsaved">
+			接続の設定を保存してから使ってください（保存済みの接続先に送るため）。
+		</p>
+	{/if}
 
 	<div class="block">
-		<button type="button" class="test-btn" onclick={readClock} disabled={reading}>
+		<button type="button" class="test-btn" onclick={readClock} disabled={reading || !settingsMatch}>
 			{reading ? '読取り中…' : 'PLC の時計を読む'}
 		</button>
 		{#if readResult}
@@ -318,7 +333,12 @@
 	</div>
 
 	<div class="block">
-		<button type="button" class="test-btn danger" onclick={runNow} disabled={running}>
+		<button
+			type="button"
+			class="test-btn danger"
+			onclick={runNow}
+			disabled={running || !settingsMatch}
+		>
 			{running ? '時計合わせ中…' : '今すぐ PLC の時計を合わせる'}
 		</button>
 	</div>

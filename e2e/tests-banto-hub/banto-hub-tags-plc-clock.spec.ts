@@ -309,4 +309,55 @@ test.describe('PLC の時計（接続編集 Drawer）', () => {
 		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
 		await expect(section.getByText('まだ実行していません', { exact: false })).toHaveCount(0);
 	});
+
+	test('フォームの接続先が保存済みと違う間は読取りと手動の時計合わせを止める', async ({ page }) => {
+		const mock = await mockClock(page, { clockResult: reading('2026-11-07T10:00:03', 3) });
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const read = section.getByRole('button', { name: 'PLC の時計を読む' });
+		const run = section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' });
+		await expect(read).toBeEnabled();
+		await expect(run).toBeEnabled();
+		await expect(section.getByTestId('clock-unsaved')).toHaveCount(0);
+		await drawer.getByLabel('ホスト').fill('127.0.0.2');
+		await expect(read).toBeDisabled();
+		await expect(run).toBeDisabled();
+		await expect(section.getByTestId('clock-unsaved')).toBeVisible();
+		// 設定の保存（接続 id に付く）は止めない。
+		await expect(section.getByRole('button', { name: '時計合わせの設定を保存' })).toBeEnabled();
+		await drawer.getByLabel('ホスト').fill('127.0.0.1');
+		await expect(read).toBeEnabled();
+		await expect(run).toBeEnabled();
+		await expect(section.getByTestId('clock-unsaved')).toHaveCount(0);
+		expect(mock.clockGets).toBe(0);
+	});
+
+	test('プロトコルを一時的に替えても時計合わせの未保存の編集が消えない', async ({ page }) => {
+		await mockClock(page);
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const enabled = section.getByLabel('時刻表で定期的に合わせる');
+		await expect(enabled).toBeEnabled();
+		await enabled.check();
+		await drawer.getByLabel('プロトコル').selectOption({ value: 'postgres' });
+		await expect(drawer.getByRole('region', { name: 'PLC の時計' })).toBeVisible();
+		await expect(enabled).toBeChecked();
+		await drawer.getByLabel('プロトコル').selectOption({ value: 'modbus-tcp' });
+		await expect(drawer.getByRole('region', { name: 'PLC の時計' })).toBeVisible();
+		await expect(enabled).toBeChecked();
+	});
+
+	test('確認ダイアログに保存済みの接続名が入る', async ({ page }) => {
+		await mockClock(page, { postResult: okRecord });
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const messages: string[] = [];
+		page.once('dialog', (dialog) => {
+			messages.push(dialog.message());
+			void dialog.dismiss();
+		});
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect.poll(() => messages.length).toBe(1);
+		expect(messages[0]).toContain(`接続「${names[0]}」の PLC の時計`);
+	});
 });

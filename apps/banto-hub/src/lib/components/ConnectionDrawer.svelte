@@ -1622,9 +1622,17 @@
 			{:else if driver}
 				{@render testConnectionBlock()}
 				{@render rangeDiagnosticBlock()}
-				{#if savedConnection}
-					<PlcClockSection connectionId={savedConnection.id} bind:dirty={clockDirty} />
-				{/if}
+			{/if}
+			<!-- 出すかどうかは、フォームの途中のプロトコルでなく保存済みの接続で決める（プロトコルを
+			     一時的に替えても部品を壊さず、時計合わせの未保存の編集を消さない）。ドライバ一覧の
+			     読込み中に消えないよう、`drivers` は見ない。 -->
+			{#if savedConnection && savedConnection.protocol !== PUSH_PROTOCOL && savedConnection.protocol !== POSTGRES_PROTOCOL}
+				<PlcClockSection
+					connectionId={savedConnection.id}
+					connectionName={savedConnection.name}
+					settingsMatch={diagnosticSettingsMatch}
+					bind:dirty={clockDirty}
+				/>
 			{/if}
 			<div class="actions">
 				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>
