@@ -2,6 +2,8 @@
 //!
 //! 接続と手順の途中の状態は 1 個の Core が所有する。操作中は Session から取り出し、
 //! 成功した時だけ戻すため、外側の future のキャンセルでも接続を再利用しない。
+//! 任意の診断（`diagnostics-v1`）と時計合わせ（`clock-v1`、`MAX_CLOCK_STEPS`）も同じ Core の
+//! 上で、読み書きと同じく 1 回ずつ排他に実行する。
 //! broker は Frame をこの Session で実行する。接続の外側期限は TCP 接続 +
 //! 32 step × response_timeout + CLOSE_TIMEOUT + ゆとりを含む。
 //! シリアルの同期（設計 §7.3）は #803 で行う（2026-10-23 に後回しにした）。
@@ -23,14 +25,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_driver_api::{
-    BoxFuture, ConnectContext, DiagnosticProgress, DiagnosticReport, FatalError, FrameCheck,
-    FrameConnection, FrameDriver, FrameRule, ItemError, PrefixEncoding, PrefixSpec, RawValue,
-    Session, Settings, Step, TagSpec, Value, WriteItem, WriteProgress,
+    BoxFuture, CivilTime, ClockProgress, ConnectContext, DiagnosticProgress, DiagnosticReport,
+    FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError, PrefixEncoding,
+    PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value, WriteItem, WriteProgress,
 };
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
 
 pub const MAX_HANDSHAKE_STEPS: usize = 32;
+/// 時計合わせ（WIT `clock-v1`）1 回の step の上限。これを超える `Send` はドライバの
+/// 契約違反（C16）として致命にし、接続を閉じる（結果は不明。自動では送り直さない）。
+/// SLMP の iQ-R の手順は最大 6 step（確認読みの 3 回を含む）。broker の外側の上限も同じ数で計る。
+pub const MAX_CLOCK_STEPS: usize = 8;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 /// `inter_frame_gap` の上限。これを超える値はドライバの契約違反として、送信の前に
@@ -246,6 +252,32 @@ impl Session for FrameSession {
                 Ok(report) => {
                     self.core = Some(core);
                     Ok(Some(report))
+                }
+                Err(error) => {
+                    core.close().await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// 時計合わせ。契約の無いドライバ・書けない接続（`capabilities.write` が偽）では
+    /// 何も送らずに `None`。手順の途中の失敗（致命・step 超過・期限切れ・外側のキャンセル）は
+    /// 接続を閉じる（診断と同じ。時計が既に変わっているかは分からない）。
+    fn set_clock<'a>(
+        &'a mut self,
+        time: CivilTime,
+    ) -> BoxFuture<'a, Result<Option<Result<(), ItemError>>, FatalError>> {
+        Box::pin(async move {
+            let mut core = self.take_core()?;
+            if !core.can_write || !core.conn.supports_clock() {
+                self.core = Some(core);
+                return Ok(None);
+            }
+            match core.set_clock(&time).await {
+                Ok(result) => {
+                    self.core = Some(core);
+                    Ok(Some(result))
                 }
                 Err(error) => {
                     core.close().await;
@@ -485,6 +517,33 @@ impl Core {
                         ));
                     }
                     return Ok(report);
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn set_clock(&mut self, time: &CivilTime) -> Result<Result<(), ItemError>, FatalError> {
+        let mut previous = None;
+        for step in 0..=MAX_CLOCK_STEPS {
+            match self
+                .conn
+                .set_clock_next(time, previous.as_deref())
+                .map_err(|e| self.driver_fatal("set_clock_next", e))?
+            {
+                ClockProgress::Send(_) if step == MAX_CLOCK_STEPS => {
+                    return Err(self.violation_fatal(
+                        "C16",
+                        format!("時計合わせの手順が上限 {MAX_CLOCK_STEPS} step を超えた"),
+                    ));
+                }
+                ClockProgress::Send(next) => previous = Some(self.exchange(&next).await?),
+                ClockProgress::Done(result) => return Ok(result),
+                other => {
+                    return Err(self.violation_fatal(
+                        "C10",
+                        format!("set_clock_next が未知の ClockProgress を返した: {other:?}"),
+                    ))
                 }
             }
         }

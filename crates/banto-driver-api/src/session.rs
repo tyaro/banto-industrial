@@ -86,6 +86,19 @@ pub trait Session: Send + 'static {
         Box::pin(async { Ok(None) })
     }
 
+    /// Optional PLC clock set on the same connection as normal reads and
+    /// writes (WIT `clock-v1`). `None` means the driver has no clock
+    /// contract (or this connection may not write), not a successful set.
+    /// `Some(Err)` is the device's or driver's refusal and keeps the
+    /// connection; `Err` is connection-fatal, and the outcome of a fatal or
+    /// abandoned set is unknown (the clock may already have changed).
+    fn set_clock<'a>(
+        &'a mut self,
+        _time: crate::CivilTime,
+    ) -> BoxFuture<'a, Result<Option<Result<(), ItemError>>, FatalError>> {
+        Box::pin(async { Ok(None) })
+    }
+
     /// Apply a diagnostic only after its caller has accepted the complete
     /// report. A timed-out or superseded diagnostic must have no read effect.
     fn accept_diagnostic(&mut self, _specs: &[TagSpec], _report: &crate::DiagnosticReport) {}
@@ -165,5 +178,13 @@ mod tests {
         ));
         assert_eq!(block_on_ready(s.read_batch(&[])), Ok(Vec::new()));
         block_on_ready(s.disconnect());
+    }
+
+    #[test]
+    fn default_set_clock_has_no_contract_and_the_trait_stays_object_safe() {
+        let mut s: Box<dyn Session> = Box::new(ReadOnly);
+        let time = crate::CivilTime::new(2026, 11, 7, 9, 5, 30);
+        assert_eq!(block_on_ready(s.set_clock(time)), Ok(None));
+        assert_eq!(block_on_ready(s.diagnose_batch(&[])), Ok(None));
     }
 }

@@ -63,6 +63,9 @@
 //!   docs/banto-hub-driver-ui-design.md §3)
 //! - [`session`]: session-type drivers, which own their I/O
 //!   ([`SessionDriver`] / [`Session`], [`BoxFuture`]; R1-2, design §5)
+//! - [`clock`]: the optional PLC clock set ([`CivilTime`],
+//!   [`ClockProgress`], driven by [`FrameConnection::set_clock_next`] and
+//!   [`Session::set_clock`]; WIT `clock-v1`)
 //! - [`registry`]: [`DriverRegistry`], driver id → [`DriverEntry`] of a
 //!   [`DriverKind`] (R1-2, design §6.1)
 //!
@@ -98,6 +101,7 @@
 #![forbid(unsafe_code)]
 
 pub mod address;
+pub mod clock;
 pub mod diagnostics;
 pub mod driver;
 pub mod error;
@@ -109,6 +113,7 @@ pub mod settings;
 pub mod types;
 
 pub use address::{DriverAddress, DriverId, InvalidDriverId};
+pub use clock::{CivilTime, ClockProgress};
 pub use diagnostics::{
     AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
     TagVerdict,

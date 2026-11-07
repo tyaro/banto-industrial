@@ -2,6 +2,13 @@
 //! signed, explicitly selected write components have a separate loader and
 //! a per-connection host policy. Isolated controlled fixtures remain separate.
 //! The host owns transport, timeouts and frame limits.
+//!
+//! The optional `clock-v1` export (PLC clock set, H) is bound through the
+//! small world `driver-with-clock-v1` when the component has it, and is
+//! offered only through the operational write loader: setting a clock
+//! writes to the PLC. The read-only loader and the controlled test fixtures
+//! never offer it (a real-PLC clock set needs its own approval). The guest
+//! keeps its own gate (`clock_set`) and owns the per-model procedure.
 
 mod manifest;
 mod modbus_write;
@@ -27,10 +34,15 @@ use api::{
     AreaCount, CountBound, DiagnosticModel, DiagnosticProgress, DiagnosticReport, TagDiagnostic,
     TagVerdict,
 };
+use api::{CivilTime, ClockProgress};
 use banto_driver_api as api;
 use operational_write::{
     WriteArea, WritePolicy, ALLOWLIST_KEY, LABEL_ALLOWLIST_KEY, LABEL_AREA,
     MAX_LABEL_ALLOWLIST_LEN, MODE_KEY,
+};
+use runtime::clock_v1::{
+    banto::driver::types as clock_types,
+    exports::banto::driver::{clock_v1 as clock, session as clock_session},
 };
 use runtime::diagnostics_v1::{
     banto::driver::types as diagnostic_types,
@@ -693,6 +705,45 @@ fn diagnostic_step(step: diagnostic_session::Step) -> Step {
         diagnostic_session::FrameRule::PluginDecides => FrameRule::DriverDecides,
     };
     Step::new(step.send, rule, step.max_len)
+}
+
+fn clock_step(step: clock_session::Step) -> Step {
+    let rule = match step.expect {
+        clock_session::FrameRule::None => FrameRule::None,
+        clock_session::FrameRule::Fixed(n) => FrameRule::Fixed(n),
+        clock_session::FrameRule::LengthPrefixed(p) => FrameRule::LengthPrefixed(
+            PrefixSpec::new(p.offset, p.width, p.big_endian, p.adjust).with_encoding(
+                match p.encoding {
+                    clock_session::PrefixEncoding::Binary => PrefixEncoding::Binary,
+                    clock_session::PrefixEncoding::AsciiHex => PrefixEncoding::AsciiHex,
+                    clock_session::PrefixEncoding::AsciiDec => PrefixEncoding::AsciiDec,
+                },
+            ),
+        ),
+        clock_session::FrameRule::Terminator(bytes) => FrameRule::Terminator(bytes),
+        clock_session::FrameRule::PluginDecides => FrameRule::DriverDecides,
+    };
+    Step::new(step.send, rule, step.max_len)
+}
+
+fn api_clock_fatal(value: clock_types::FatalError) -> FatalError {
+    match value {
+        clock_types::FatalError::Framing(m) => FatalError::Framing(m),
+        clock_types::FatalError::Protocol(m) => FatalError::Protocol(m),
+        clock_types::FatalError::InvalidConfig(m) => FatalError::InvalidConfig(m),
+    }
+}
+
+/// Same mapping as [`api_write_item_error`], for the clock world's own types.
+fn api_clock_item_error(value: clock_types::ItemError) -> ItemError {
+    match value {
+        clock_types::ItemError::Device(e) => {
+            ItemError::Device(api::DeviceError::new(e.code, e.message))
+        }
+        clock_types::ItemError::Unsupported(m) => ItemError::Unsupported(m),
+        clock_types::ItemError::Rejected(m) => ItemError::Rejected(m),
+        clock_types::ItemError::VerificationFailed(m) => ItemError::VerificationFailed(m),
+    }
 }
 
 fn diagnostic_report(report: diagnostic::Report) -> DiagnosticReport {
@@ -1582,6 +1633,48 @@ impl FrameConnection for WasmConnection {
                 Ok(DiagnosticProgress::Done(diagnostic_report(report)))
             }
         }
+    }
+
+    /// Only an exported `clock-v1` on a component loaded through the signed,
+    /// explicitly selected operational write loader. Not the read-only
+    /// loader, and not the controlled fixtures (a real-PLC clock set needs
+    /// its own approval).
+    fn supports_clock(&self) -> bool {
+        self.runtime.clock_available()
+            && self.controlled_write_target == ControlledWriteTarget::Operational
+    }
+
+    fn set_clock_next(
+        &mut self,
+        time: &CivilTime,
+        prev_response: Option<&[u8]>,
+    ) -> Result<ClockProgress, FatalError> {
+        if !self.supports_clock() {
+            return Err(FatalError::Protocol("clock set unsupported".into()));
+        }
+        let wit_time = clock::CivilTime {
+            year: time.year,
+            month: time.month,
+            day: time.day,
+            hour: time.hour,
+            minute: time.minute,
+            second: time.second,
+        };
+        let progress = self
+            .call("clock-v1.set-clock-next", |i, resource| {
+                i.clock_driver
+                    .as_ref()
+                    .expect("clock export bound before capability enablement")
+                    .banto_driver_clock_v1()
+                    .call_set_clock_next(&mut i.store, resource, wit_time, prev_response)
+            })?
+            .map_err(api_clock_fatal)?;
+        Ok(match progress {
+            clock::ClockProgress::Send(step) => ClockProgress::Send(clock_step(step)),
+            clock::ClockProgress::Done(result) => {
+                ClockProgress::Done(result.map_err(api_clock_item_error))
+            }
+        })
     }
 
     fn write_next(
