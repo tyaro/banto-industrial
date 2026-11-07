@@ -66,6 +66,9 @@ windows-sys = { version = "0.61", features = [
 banto-driver-wasm = { path = "../../../crates/banto-driver-wasm", features = ["controlled-write-fixture", "controlled-live-write-fixture"] }
 sha2 = { workspace = true }
 tempfile = "3"
+# H2: `tests/t12_slmp_wasm_clock` が時計合わせに渡す現地時刻を差し替える（core と
+# 同じ 0.4.45。Cargo.lock に新しいパッケージは増えない）。
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 # `net` は空きポートの探索と TCP のプローブ、`test-util` は core と同じ（仮想時計）。
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "sync", "test-util"] }
 axum = { workspace = true, features = ["ws"] }

@@ -9,6 +9,7 @@
 
 use banto_tags::{offset_tag_address, parse_tag_address, AddressProbe, OffsetUnit};
 
+use super::clock_sync::{clock_sync_get, clock_sync_post, clock_sync_put};
 use super::collection_groups::{
     collection_groups_create, collection_groups_delete, collection_groups_describe,
     collection_groups_get, collection_groups_list, collection_groups_update,
@@ -1400,6 +1401,13 @@ pub(super) fn tag_registry_router(
         .route(
             "/api/plc-connections/{id}/diagnostics",
             get(range_diagnostic_get).post(range_diagnostic_post),
+        )
+        // H2: PLC の時計合わせ（設定・直近の結果・今すぐ 1 回。`rest/clock_sync.rs`）。
+        .route(
+            "/api/plc-connections/{id}/clock-sync",
+            get(clock_sync_get)
+                .put(clock_sync_put)
+                .post(clock_sync_post),
         )
         // S1a (docs/banto-hub-external-db-design.md §4.6): 保存済み接続の
         // 接続テスト - `{id}` の下の固定サブパスなので

@@ -46,6 +46,9 @@
 //!   残すため `hub_write_audit.result` の CHECK に `rejected` を足したもの。
 //!   0107 と同じ作り直しで、0108 の `api_key_prefix_snapshot` も写す（テスト
 //!   `an_existing_audit_row_and_key_prefix_survive_the_0109_rebuild`）。
+//! - `0110_hub_clock_sync.sql`（H2、tyaro/banto-industrial#1053、2026-11-07）は、
+//!   PLC の時計合わせの接続ごとの設定（`enabled`・時刻表）の表 `hub_clock_sync`
+//!   を足したもの（新しい表だけ。既存の表は変えない。`crate::clock_sync`）。
 //!
 //! ## なぜ `sqlx::migrate!` に戻せたか
 //!
@@ -370,7 +373,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
         );
     }
 
@@ -498,7 +501,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             versions,
-            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109]
+            vec![2, 3, 4, 5, 7, 8, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110]
         );
         let pending_id: Option<String> =
             sqlx::query_scalar("SELECT pending_id FROM audit_log WHERE action = 'probe'")

@@ -933,6 +933,11 @@ struct StoredRangeDiagnostic {
 }
 
 pub struct CollectorManager {
+    /// H2（`crate::clock_sync`）: PLC の時計合わせの設定（DB）と、直近の結果・
+    /// 実行中の印・定期で最後に出した分（メモリ）。`db_source` と同じく
+    /// この manager の内部で作る（`Self::new` の引数を増やさない）。REST・MCP・
+    /// スケジューラが [`Self::clock_sync`] で同じものを使う。
+    clock_sync: Arc<crate::clock_sync::ClockSync>,
     /// Ephemeral read-only discovery. A report is usable only while its
     /// physical broker session, catalog, driver version and latest attempt
     /// still match. Nothing is persisted or promoted to an allowlist.
@@ -1137,6 +1142,7 @@ impl CollectorManager {
         let db_source = Arc::new(DbSourceEngine::new(computed.server_store(), clock.clone()));
         let ingest = Arc::new(IngestHub::new(clock.clone()));
         Self {
+            clock_sync: Arc::new(crate::clock_sync::ClockSync::new(pool.clone())),
             range_diagnostics: Mutex::new(HashMap::new()),
             #[cfg(test)]
             fail_next_apply: std::sync::atomic::AtomicBool::new(false),
@@ -1185,6 +1191,11 @@ impl CollectorManager {
         self.db_source.set_diag_log(diag_log.clone());
         self.diag_log = diag_log;
         self
+    }
+
+    /// H2: PLC の時計合わせの状態（`crate::clock_sync` のモジュール doc）。
+    pub fn clock_sync(&self) -> &Arc<crate::clock_sync::ClockSync> {
+        &self.clock_sync
     }
 
     /// T6-2: the shared computed/internal-tag current-value store - the

@@ -868,6 +868,15 @@ jobs:
           if (-not (Select-String -Path $newSlmpLog -Pattern '^test result: ok\. 57 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'new SLMP Hub acceptance tests did not all run'
           }
+          # H2 (Hub clock sync, #1053): the scheduler, manual REST, the two
+          # gates, each result's audit and the timeout without a resend,
+          # through the operational loader and a loopback SLMP peer.
+          $clockSyncLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h2-clock-sync-hub-test.txt'
+          cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_clock_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $clockSyncLog
+          if ($LASTEXITCODE -ne 0) { throw 'H2 clock sync Hub acceptance tests failed' }
+          if (-not (Select-String -Path $clockSyncLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'H2 clock sync Hub acceptance tests did not all run'
+          }
           # Stage-2 numeric reads use the separately reviewed guest revision.
           # Keep the older guest revisions above for read and write regressions.
           $numericSha = '9ffa939ffc3551325551b28e4993ec62b8ddc34d'

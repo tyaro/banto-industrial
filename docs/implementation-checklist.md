@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-11-07（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
+最終更新: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
 2026-11-06（§5 にWindows拡張長prefix除去後の同一対象確認を追加。#1050）
 2026-11-06（§6 に「head の push 前に PR 本文の対象範囲・検証欄を同期し、自動レビューが参照した本文・head を確認する」を追加。#1047）
 2026-11-02（§2 に「脆弱性の対応の `cargo update -p <crate> --precise` でも無関係な依存が付け替わる。`Cargo.lock` の差分を全部読む」を追加。RUSTSEC-2026-0433、#1016）
@@ -125,6 +125,8 @@
 - [ ] **凍結・保留を決めたら、運用ガイドの「今後 ○○ も」という予告を消す**（#384: banto-hub-operations.md が凍結した relay-wright を案内し続けていた）。
 
 ## 5. 設計の規律（レビューで繰り返し出た指摘）
+
+- [ ] **SQLite の CHECK は NULL を偽と見なさない（NULL は通る）**。`hour BETWEEN 0 AND 23` だけでは `hour` が NULL の行が入る。必須にしたい列は `IS NOT NULL` を CHECK に書くか `NOT NULL` にし、NULL を入れて断られることを試験で確かめる（H2 の `hub_clock_sync`、2026-11-07。試験で初めて分かった）。
 
 - [ ] **Windowsの拡張長prefixを外したら、通常表記で再解決して同じ対象に戻ることを確認する**。`app.` → `app` で別ファイルになり、`is_file` だけでは拒否できなかった（#1050、2026-11-06）。
 
