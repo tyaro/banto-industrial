@@ -588,6 +588,20 @@ fn tool_definitions() -> Vec<Value> {
                 "additionalProperties": false,
             },
         }),
+        // H2（tyaro/banto-industrial#1053）: PLC の時計合わせは見るだけ。実行と
+        // 設定の変更は MCP に出さない（REST の editor の操作だけ）。
+        json!({
+            "name": "get_clock_sync",
+            "description": "PLC 接続の時計合わせの設定と直近の結果を返す(admin スコープ必須。REST の GET /api/plc-connections/{id}/clock-sync と同じ形 { settings: { enabled, schedule }, last })。schedule は毎時 m 分 {kind:\"hourly\",minute} か毎日 hh:mm {kind:\"daily\",hour,minute}(Hub の PC の現地時刻。過ぎた回は追いつかない)。last は直近の結果(メモリだけ。result は ok・unsupported・rejected・device・verificationFailed・unavailable・unknown・notOffered・busy)で、無ければ null。実行と設定の変更はこのツールでは出せない。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "PLC 接続の id" },
+                },
+                "required": ["id"],
+                "additionalProperties": false,
+            },
+        }),
         json!({
             "name": "list_drivers",
             "description": "機器のドライバの一覧を返す(admin スコープ必須。REST の GET /api/drivers と同じ中身)。各ドライバの id(create_connection の protocol)、settingsSchema(settings のキー・型・既定値・選択肢)、supportedKinds、addressHelp など。postgres・push・virtual のホストの接続は載らない。",
@@ -1296,6 +1310,7 @@ async fn handle_tools_call(
         "write_recipe" => tool_write_recipe(state, ctx, arguments).await?,
         "list_connections" => tool_list_connections(state, ctx).await,
         "list_drivers" => tool_list_drivers(state, ctx),
+        "get_clock_sync" => tool_get_clock_sync(state, ctx, arguments).await?,
         "create_connection" => tool_create_connection(state, ctx, arguments).await?,
         "delete_connection" => tool_delete_connection(state, ctx, arguments).await?,
         "update_connection" => tool_update_connection(state, ctx, arguments).await?,
@@ -1857,6 +1872,35 @@ fn tool_list_drivers(state: &McpState, ctx: &ApiKeyContext) -> Value {
         return err;
     }
     tool_ok(json!({ "drivers": crate::rest::driver_list(state.manager.registry()) }))
+}
+
+// --- 7c. get_clock_sync (H2) -------------------------------------------------
+
+/// `GET /api/plc-connections/{id}/clock-sync`（`crate::rest`）と同じ形。読むだけで
+/// 副作用が無いので監査もしない（[`tool_list_connections`] と同じ規律）。保存済みの
+/// 接続に無い id は `isError`。
+async fn tool_get_clock_sync(
+    state: &McpState,
+    ctx: &ApiKeyContext,
+    arguments: Option<Value>,
+) -> Result<Value, RpcError> {
+    if let Err(err) = require_admin_scope(ctx) {
+        return Ok(err);
+    }
+    let arguments = arguments.ok_or_else(|| RpcError::invalid_params("arguments is required"))?;
+    let id = arguments
+        .get("id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::invalid_params("arguments.id (integer) is required"))?;
+    if let Err(err) = state.plc_connections.get(id).await {
+        return Ok(tool_error(format!("接続の取得に失敗しました: {err}")));
+    }
+    match state.manager.clock_sync().view(id).await {
+        Ok(view) => Ok(tool_ok(json!(view))),
+        Err(err) => Ok(tool_error(format!(
+            "時計合わせの設定の取得に失敗しました: {err}"
+        ))),
+    }
 }
 
 // --- 8. create_connection ----------------------------------------------------

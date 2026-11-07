@@ -97,15 +97,23 @@
 //! `sessions.shutdown()`（broker タスク停止）→
 //! `sim_registry.shutdown()`（T9-2、broker シミュレータ停止）の順を守る。
 //!
+//! **時計合わせのスケジューラ**（H2、`crate::clock_sync`）: 冒頭（収集の開始を
+//! 断る印の直後）で止める合図だけを出して新しい回を出さなくし、
+//! `sessions.shutdown()` の後に終わりを待つ（上限 [`CLOCK_SYNC_STOP_TIMEOUT`]）。
+//! 走っている回（接続ごとに別のタスク。スケジューラはそれを全部待ってから終わる）は
+//! broker が止まれば `TaskGone`（結果不明）で戻り、監査を書いて終わる。DB を触るので
+//! abort しない（docs/implementation-checklist.md §5）。
+//!
 //! **切り離したタスク**（`crate::detached`、`manager.detached()`）: REST・MCP・取り込みの
 //! handler が接続の切断に備えて `tokio::spawn` で切り離した保存・監査のタスク。冒頭
-//! （`begin_shutdown` の直後）で受付を閉じ（以後の API キーの変更・OPC UA 設定の PUT は
-//! 503 で何もしない。書込みの停止・再開と取り込みの監査は `spawn_always` で断らずに数える）、
-//! HTTP サーバーを止めた後（新しい handler は来ない）・拒否の監査の
-//! 書き切りと pool を閉じる前に、上限 [`DETACHED_STOP_TIMEOUT`] で待つ。待ちきれなくても
-//! abort しない（DB を触るので。docs/implementation-checklist.md §5）。閉じる前に始まった
-//! OPC UA 設定の回の `apply` が `opcua.shutdown()` の後に届いても、`stopping` の印で何も
-//! 起動せずに戻る。
+//! （`begin_shutdown` の直後）で受付を閉じ（以後の API キーの変更・OPC UA 設定の PUT・
+//! 時計合わせの PUT（保存）と POST（手動実行）は 503 で何もしない。書込みの停止・再開と
+//! 取り込みの監査は `spawn_always` で断らずに数える）、HTTP サーバーを止めた後（新しい
+//! handler は来ない）・拒否の監査の書き切りと pool を閉じる前に、上限
+//! [`DETACHED_STOP_TIMEOUT`] で待つ。待ちきれなくても abort しない（DB を触るので。
+//! docs/implementation-checklist.md §5）。閉じる前に始まった OPC UA 設定の回の `apply` が
+//! `opcua.shutdown()` の後に届いても、`stopping` の印で何も起動せずに戻る。時計合わせの
+//! 手動実行の回が broker の停止の後に届いても、`TaskGone`（結果不明）で戻って監査を書く。
 //!
 //! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
@@ -877,6 +885,8 @@ impl HubRuntime {
         // 接続元にだけ CSP の `connect-src` に Tauri IPC を足す
         // （[`hub_security_headers`]、#505）。
         let audit_for_spool = audit.clone();
+        // H2: 時計合わせのスケジューラの監査（REST と同じ監査サービス）。
+        let audit_for_clock_sync = audit.clone();
         let opcua_admin = opcua_settings_router(
             manager.clone(),
             opcua.clone(),
@@ -959,6 +969,11 @@ impl HubRuntime {
         // 書き手が起きる前の拒否も表に残り、最初の周期で書かれる（書き手を起こすまでは
         // 「書き手が止まっている」のログも出さない）。
         let rejection_writer = write_audit.spawn_rejection_writer();
+        // H2（tyaro/banto-industrial#1053、`crate::clock_sync`）: PLC の時計合わせの
+        // スケジューラ。上の約束どおり、失敗しうる起動手順がすべて済んでから起こす。
+        // 止めるのは合図（`RunningHub::shutdown_and_report`。DB を触るので abort しない）。
+        let clock_sync_scheduler =
+            crate::clock_sync::spawn_scheduler(manager.clone(), audit_for_clock_sync);
 
         log_line(&format!("banto-hub: DB at {db_path}"));
         log_line(&format!("banto-hub: data dir at {}", data_dir.display()));
@@ -1021,6 +1036,7 @@ impl HubRuntime {
             pool,
             write_audit,
             rejection_writer,
+            clock_sync_scheduler,
             _profile_lock: profile_lock,
             _profile_dirs: given_dirs,
         })
@@ -1178,6 +1194,11 @@ pub struct RunningHub {
     write_audit: WriteAuditService,
     /// 拒否の監査の周期の書き手（pool を閉じる前に止めて書き切る。#945 の総点検）。
     rejection_writer: RejectionWriter,
+    /// H2: PLC の時計合わせのスケジューラ（`crate::clock_sync::spawn_scheduler`）。
+    /// [`RunningHub::shutdown_and_report`] の冒頭で合図を出して新しい回を止め、
+    /// broker を止めた後に終わりを待つ（走っている回を全部待つ。どれも broker が
+    /// 止まればすぐ終わる）。
+    clock_sync_scheduler: crate::clock_sync::ClockSyncScheduler,
     /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
     /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
     _profile_dirs: Option<ProfileDirs>,
@@ -1199,8 +1220,12 @@ pub const DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 終了のとき、拒否の監査の書き手を止めて表を書き切るのを待つ上限（#945 の総点検）。
 pub const WRITE_AUDIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 終了のとき、REST・取り込みの handler が切り離したタスク（`crate::detached`）の終わりを
-/// 待つ上限。過ぎても abort せず、残りの数をログに出して先へ進む。
+/// 終了のとき、時計合わせのスケジューラの終わりを待つ上限（H2）。broker を止めた
+/// 後に待つので、走っている回（全部を待つ）は監査を書くだけで終わる。
+pub const CLOCK_SYNC_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 終了のとき、REST・MCP・取り込みの handler が切り離したタスク（`crate::detached`）の
+/// 終わりを待つ上限。過ぎても abort せず、残りの数をログに出して先へ進む。
 pub const DETACHED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl RunningHub {
@@ -1242,7 +1267,7 @@ impl RunningHub {
     /// [`Self::shutdown`] と同じ順で畳み、最後に設定 DB の pool を閉じて（上限
     /// [`DB_CLOSE_TIMEOUT`]）、閉じ終えたかを返す（#661 661-1。661-2 のサービスは、
     /// 閉じ終えてから ACL を緩める）。
-    pub async fn shutdown_and_report(self) -> HubShutdownReport {
+    pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
         log_line("banto-hub: shutting down");
         // #392 A2 レビュー（2026-10-12）: 終了の受付の**取り消せない**印を立て、以降の収集の
         // 開始（REST/MCP はこの関数の最後の `server.stop()` まで受け付けて
@@ -1254,9 +1279,11 @@ impl RunningHub {
         // もの）は、ここでは待たない - 従来どおり下の `manager.shutdown()` が
         // 止める。
         let _ = self.controller.begin_shutdown();
-        // handler が切り離す保存・監査のタスクの受付を閉じる（以後は 503 で何もしない）。
-        // 走っているものは `server.stop()` の後・pool を閉じる前に待つ（このモジュール doc の
-        // 「シャットダウン順序」節「切り離したタスク」）。
+        // H2: 時計合わせの新しい回を出さない（待たない。終わりは broker を止めた後に待つ）。
+        self.clock_sync_scheduler.signal_stop();
+        // handler が切り離す保存・監査のタスク（時計合わせの PUT・POST も）の受付を閉じる
+        // （以後は 503 で何もしない）。走っているものは `server.stop()` の後・pool を閉じる
+        // 前に待つ（このモジュール doc の「シャットダウン順序」節「切り離したタスク」）。
         self.manager.detached().close();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
@@ -1291,6 +1318,18 @@ impl RunningHub {
         self.opcua.shutdown().await;
         self.manager.shutdown().await;
         self.sessions.shutdown().await;
+        // H2: broker を止めたので、走っていた時計合わせの回も終わっている（`TaskGone`
+        // → 結果不明として監査）。pool を閉じる前にスケジューラの終わりを待つ。
+        if !self
+            .clock_sync_scheduler
+            .stop_and_join(CLOCK_SYNC_STOP_TIMEOUT)
+            .await
+        {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 時計合わせのスケジューラが {} 秒のうちに止まりませんでした",
+                CLOCK_SYNC_STOP_TIMEOUT.as_secs()
+            ));
+        }
         // T9-2: simulators must outlive both the collector's tasks
         // (`manager`) and the broker sessions that may be dialing them
         // (`sessions`), so they are stopped last - see this module's doc

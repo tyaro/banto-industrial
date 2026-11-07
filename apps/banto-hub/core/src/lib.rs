@@ -77,6 +77,9 @@
 //! - [`pending_changes`]: TAG-P0-3（2026-08-11 方針改定）。運転中編集の
 //!   提案変更（pending queue）を保持する service 層。実行構成への反映
 //!   （手動 apply）と破棄（cancel）の前提となる永続化基盤
+//! - [`clock_sync`]: H2（tyaro/banto-industrial#1053）。PLC の時計合わせの
+//!   接続ごとの設定（`hub_clock_sync`）・時刻表のスケジューラ・実行・監査・
+//!   直近の結果
 //! - [`runtime`]: T14-1（docs/banto-hub-t14-design.md §3「D1」）。
 //!   composition root（[`runtime::HubRuntime::start`]/
 //!   [`runtime::RunningHub::shutdown`]）- DB初期化〜各サービス構築〜
@@ -214,6 +217,7 @@ pub mod api_keys;
 pub mod assets;
 pub mod audit_spool;
 pub mod broker_glue;
+pub mod clock_sync;
 pub mod commissioning;
 pub mod computed;
 pub mod controller;

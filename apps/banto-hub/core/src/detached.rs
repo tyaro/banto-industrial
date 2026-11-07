@@ -24,12 +24,10 @@
 //!   （DB を触るタスクを `abort()` で止めない、同 §5）。数はログに出す。
 //! - タスクの終わり（panic でも）で数を減らす。0 になれば待ち手を起こす。
 //!
-//! 使う側: API キーの変更・OPC UA 設定の PUT（`spawn`。終了中は 503）、取り込みの
-//! 監査（`crate::ingest::audit::record`）と書込みの停止・再開（REST・MCP の
+//! 使う側: API キーの変更・OPC UA 設定の PUT・時計合わせの PUT（保存）と POST（手動
+//! 実行、`crate::rest` の clock-sync）（`spawn`。終了中は 503）、取り込みの監査
+//! （`crate::ingest::audit::record`）と書込みの停止・再開（REST・MCP の
 //! `WriteControl::set_enabled_detached`）（`spawn_always`）。
-//!
-//! 時計合わせの REST（#1065、未マージ）は `ClockSync` の中に同じ形の数えを持つ。
-//! それが入ったら、この数えへ移す。
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};

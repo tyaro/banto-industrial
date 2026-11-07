@@ -515,6 +515,7 @@ async fn tools_list_returns_the_thirty_eight_tools() {
             "delete_group",
             "delete_sink_group",
             "delete_tag",
+            "get_clock_sync",
             "get_grpc_settings",
             "get_mqtt_settings",
             "get_retention",
@@ -3299,6 +3300,54 @@ async fn list_drivers_matches_the_rest_drivers_endpoint() {
         tools_call("list_drivers", json!({})),
     )
     .await;
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+}
+
+/// H2: `get_clock_sync` は admin スコープで、REST の GET と同じ形
+/// `{ settings, last }` を返すだけ（read スコープ・保存済みに無い接続は `isError`）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_clock_sync_returns_the_settings_and_the_last_result() {
+    use banto_hub_core::clock_sync::{ClockSchedule, ClockSyncSettings};
+
+    let app = test_app("h2-mcp-get-clock-sync").await;
+    let conn = PlcConnectionService::new(app.pool.clone())
+        .create(slmp_conn_input("clock-line", 15401))
+        .await
+        .unwrap();
+    let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
+    let call = |id: i64| tools_call("get_clock_sync", json!({ "id": id }));
+    let (status, body) = mcp_post(&app.router, Some(&admin_key), call(conn.id)).await;
+    assert_eq!(status, StatusCode::OK, "{body:?}");
+    assert_eq!(body["result"]["isError"], false, "{body:?}");
+    let got: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        got,
+        json!({ "settings": { "enabled": false, "schedule": { "kind": "hourly", "minute": 5 } }, "last": null })
+    );
+    app.manager
+        .clock_sync()
+        .save_settings(
+            conn.id,
+            &ClockSyncSettings {
+                enabled: true,
+                schedule: ClockSchedule::Daily { hour: 3, minute: 7 },
+            },
+        )
+        .await
+        .unwrap();
+    let (_, body) = mcp_post(&app.router, Some(&admin_key), call(conn.id)).await;
+    let got: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        got["settings"],
+        json!({ "enabled": true, "schedule": { "kind": "daily", "hour": 3, "minute": 7 } })
+    );
+
+    let (_, body) = mcp_post(&app.router, Some(&admin_key), call(9999)).await;
+    assert_eq!(body["result"]["isError"], true, "{body:?}");
+    let reader = issue_key(&app.router, &app.admin_token, "reader", &["read"]).await;
+    let (_, body) = mcp_post(&app.router, Some(&reader), call(conn.id)).await;
     assert_eq!(body["result"]["isError"], true, "{body:?}");
 }
 

@@ -661,9 +661,12 @@ enum Job {
         respond_to: oneshot::Sender<WriteOutcome>,
     },
     /// Writes the PLC clock, so only a full [`BrokerHandle`] can send it.
+    /// `make` builds the time when the task starts the job on a connected
+    /// session (so the wait in the queue is not an error in the time); the
+    /// answer carries the time handed to the driver.
     SetClock {
-        time: CivilTime,
-        respond_to: oneshot::Sender<ClockOutcome>,
+        make: ClockTimeSource,
+        respond_to: oneshot::Sender<(ClockOutcome, Option<CivilTime>)>,
     },
 }
 
@@ -681,6 +684,10 @@ pub type DiagnosticOutcome = Result<Option<DiagnosticReport>, BrokerError>;
 /// driver or device refused; the session is kept. `Err(ConnectionFailed)`:
 /// fatal, including the outer bound - the outcome is unknown.
 pub type ClockOutcome = Result<Option<Result<(), ItemError>>, BrokerError>;
+
+/// Builds the time for [`BrokerHandle::set_clock_now`], called once on the
+/// connection's task right before the driver's `set_clock`.
+pub type ClockTimeSource = Box<dyn FnOnce() -> CivilTime + Send>;
 
 /// Observable connection state for one broker task's session (I6 T2-1
 /// addition, 2026-08-05) - see the module doc's "Connection status
@@ -905,16 +912,30 @@ impl BrokerHandle {
     /// Fails fast with [`BrokerError::Disconnected`] if the session is down.
     /// Not on [`ReadOnlyHandle`]: it writes to the PLC.
     pub async fn set_clock(&self, time: CivilTime) -> ClockOutcome {
-        let (respond_to, rx) = oneshot::channel();
-        self.tx
-            .send(Job::SetClock { time, respond_to })
-            .await
-            .map_err(|_| BrokerError::TaskGone {
-                connection_id: self.connection_id,
-            })?;
-        rx.await.map_err(|_| BrokerError::TaskGone {
+        self.set_clock_now(Box::new(move || time)).await.0
+    }
+
+    /// [`Self::set_clock`] with the time built by `make` when the job starts
+    /// on the connected session, right before the driver's `set_clock` (jobs
+    /// run one at a time, so a clock set queued behind slow reads, writes or
+    /// diagnostics would otherwise hand over a time that is already old).
+    /// Also answers the time handed to the driver: `None` when nothing was
+    /// handed over (not connected, the task is gone, or `Ok(None)` - no clock
+    /// contract). `make` is not called when the session is down.
+    pub async fn set_clock_now(&self, make: ClockTimeSource) -> (ClockOutcome, Option<CivilTime>) {
+        let task_gone = || BrokerError::TaskGone {
             connection_id: self.connection_id,
-        })?
+        };
+        let (respond_to, rx) = oneshot::channel();
+        if self
+            .tx
+            .send(Job::SetClock { make, respond_to })
+            .await
+            .is_err()
+        {
+            return (Err(task_gone()), None);
+        }
+        rx.await.unwrap_or_else(|_| (Err(task_gone()), None))
     }
 
     /// A read-only view of this handle - clonable, structurally incapable of
@@ -1052,7 +1073,7 @@ pub fn spawn_test_handle_with_status(
                     let _ = respond_to.send(Ok(items.iter().map(|_| Ok(())).collect()));
                 }
                 Job::SetClock { respond_to, .. } => {
-                    let _ = respond_to.send(Ok(None));
+                    let _ = respond_to.send((Ok(None), None));
                 }
             }
         }
@@ -1933,19 +1954,26 @@ async fn run_broker_task(
                         };
                         answer(connection_id, respond_to, outcome)
                     }
-                    Job::SetClock { time, respond_to } => {
-                        let outcome = match &mut state {
-                            ConnState::Connected(session) => Some(
-                                tokio::time::timeout(
+                    Job::SetClock { make, respond_to } => {
+                        let (outcome, time) = match &mut state {
+                            ConnState::Connected(session) => {
+                                // Built now, when the job starts (not when it was queued).
+                                let time = make();
+                                let outcome = tokio::time::timeout(
                                     clock_job_limit(timeouts.response),
                                     session.set_clock(time),
                                 )
                                 .await
-                                .unwrap_or(Err(FatalError::Timeout)),
-                            ),
-                            _ => None,
+                                .unwrap_or(Err(FatalError::Timeout));
+                                (Some(outcome), Some(time))
+                            }
+                            _ => (None, None),
                         };
-                        answer(connection_id, respond_to, outcome)
+                        let (outcome, fatal) = settle(connection_id, outcome);
+                        // `Ok(None)`: the driver has no clock contract, nothing was sent.
+                        let time = time.filter(|_| !matches!(outcome, Ok(None)));
+                        let _ = respond_to.send((outcome, time));
+                        fatal
                     }
                 };
                 if fatal {
@@ -1994,22 +2022,27 @@ fn answer<T>(
     respond_to: oneshot::Sender<Result<T, BrokerError>>,
     outcome: Option<Result<T, FatalError>>,
 ) -> bool {
+    let (outcome, fatal) = settle(connection_id, outcome);
+    let _ = respond_to.send(outcome);
+    fatal
+}
+
+/// [`answer`]'s mapping without the send: the caller's result and whether it
+/// was fatal.
+fn settle<T>(
+    connection_id: i64,
+    outcome: Option<Result<T, FatalError>>,
+) -> (Result<T, BrokerError>, bool) {
     match outcome {
-        Some(Ok(results)) => {
-            let _ = respond_to.send(Ok(results));
-            false
-        }
-        Some(Err(err)) => {
-            let _ = respond_to.send(Err(BrokerError::ConnectionFailed {
+        Some(Ok(results)) => (Ok(results), false),
+        Some(Err(err)) => (
+            Err(BrokerError::ConnectionFailed {
                 connection_id,
                 reason: err.to_string(),
-            }));
-            true
-        }
-        None => {
-            let _ = respond_to.send(Err(BrokerError::Disconnected { connection_id }));
-            false
-        }
+            }),
+            true,
+        ),
+        None => (Err(BrokerError::Disconnected { connection_id }), false),
     }
 }
 
@@ -2941,6 +2974,58 @@ mod tests {
             handle.read(vec![rspec("D0", DataType::U16)]).await,
             Ok(vec![Ok(Value::F64(0.0))])
         );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// `set_clock_now` builds the time when the job starts, after the slow read
+    /// queued before it has finished, and answers the time it handed over.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_set_builds_its_time_when_the_job_starts_not_when_queued() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+        plc.set_behaviour(Behaviour::Steps {
+            steps: 1,
+            phase: Duration::from_secs(1),
+            deadline: Duration::from_secs(10),
+        });
+        let started = Instant::now();
+        let built = Arc::new(std::sync::Mutex::new(None));
+        let seen = built.clone();
+        let time = CivilTime::new(2026, 11, 7, 9, 5, 30);
+        let (read, (clock, handed)) = tokio::join!(
+            handle.read(vec![rspec("D0", DataType::U16)]),
+            handle.set_clock_now(Box::new(move || {
+                *seen.lock().unwrap() = Some(Instant::now());
+                time
+            })),
+        );
+        assert_eq!(read, Ok(vec![Ok(Value::F64(0.0))]));
+        assert_eq!(clock, Ok(Some(Ok(()))));
+        assert_eq!(handed, Some(time));
+        let built_at = built.lock().unwrap().expect("the time was built");
+        assert!(
+            built_at - started >= Duration::from_secs(2),
+            "built only after the 2 s read: {:?}",
+            built_at - started
+        );
+        assert_eq!(plc.clock_sets(), vec![time]);
+
+        // While the session is down the time is never built.
+        plc.set_behaviour(Behaviour::Prompt);
+        plc.refuse_connections(true);
+        plc.fail_next_call();
+        let _ = handle.read(vec![rspec("D0", DataType::U16)]).await;
+        let (clock, handed) = handle
+            .set_clock_now(Box::new(|| panic!("not built while down")))
+            .await;
+        assert_eq!(clock, Err(BrokerError::Disconnected { connection_id: 1 }));
+        assert_eq!(handed, None);
         drop(handle);
         let _ = task.join_handle.await;
     }

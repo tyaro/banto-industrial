@@ -2263,6 +2263,9 @@ mod slmp_wasm_q_write_test;
 #[path = "t12_slmp_wasm_operational_write/mod.rs"]
 mod slmp_wasm_operational_write_test;
 
+#[path = "t12_slmp_wasm_clock/mod.rs"]
+mod slmp_wasm_clock_test;
+
 #[path = "t12_slmp_wasm_hub_live/mod.rs"]
 mod slmp_wasm_hub_live_test;
 

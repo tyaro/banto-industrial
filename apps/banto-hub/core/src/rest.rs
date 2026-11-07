@@ -228,6 +228,9 @@ pub use plc_connections::{
 // 作成・更新ペイロード）は `rest/{collection_groups,tags}.rs` へ移した
 // （docs/banto-hub-driver-refactor-plan.md §8.1）。`crate::rest::X` のパスは
 // ここで re-export して保つ（`crate::mcp` が使う）。
+// H2（tyaro/banto-industrial#1053）: `GET`・`PUT`・`POST /api/plc-connections/{id}/clock-sync`
+// （PLC の時計合わせ。`tag_registry_router` に載る）。
+mod clock_sync;
 mod collection_groups;
 mod diagnostics;
 // R2b-6b: `GET /api/drivers`（ドライバの一覧。`tag_registry_router` に載る）。
