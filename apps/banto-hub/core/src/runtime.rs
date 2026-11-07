@@ -97,6 +97,16 @@
 //! `sessions.shutdown()`（broker タスク停止）→
 //! `sim_registry.shutdown()`（T9-2、broker シミュレータ停止）の順を守る。
 //!
+//! **切り離したタスク**（`crate::detached`、`manager.detached()`）: REST・MCP・取り込みの
+//! handler が接続の切断に備えて `tokio::spawn` で切り離した保存・監査のタスク。冒頭
+//! （`begin_shutdown` の直後）で受付を閉じ（以後の API キーの変更・OPC UA 設定の PUT は
+//! 503 で何もしない。書込みの停止・再開と取り込みの監査は `spawn_always` で断らずに数える）、
+//! HTTP サーバーを止めた後（新しい handler は来ない）・拒否の監査の
+//! 書き切りと pool を閉じる前に、上限 [`DETACHED_STOP_TIMEOUT`] で待つ。待ちきれなくても
+//! abort しない（DB を触るので。docs/implementation-checklist.md §5）。閉じる前に始まった
+//! OPC UA 設定の回の `apply` が `opcua.shutdown()` の後に届いても、`stopping` の印で何も
+//! 起動せずに戻る。
+//!
 //! **DB Source の位置**（S2、docs/banto-hub-external-db-design.md §4.2）:
 //! eval/prune ループの abort と同じ「消費者を先に止める」区画に置く -
 //! DB Source のタスクは `ServerTagStore`（`manager` が
@@ -1189,6 +1199,10 @@ pub const DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 /// 終了のとき、拒否の監査の書き手を止めて表を書き切るのを待つ上限（#945 の総点検）。
 pub const WRITE_AUDIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 終了のとき、REST・取り込みの handler が切り離したタスク（`crate::detached`）の終わりを
+/// 待つ上限。過ぎても abort せず、残りの数をログに出して先へ進む。
+pub const DETACHED_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
 impl RunningHub {
     /// axum サーバーの実バインドアドレス（`port: 0`で OS にポートを
     /// 選ばせた場合も実際の値が返る）。旧 `hub_run.rs`が `server.local_addr()`
@@ -1240,6 +1254,10 @@ impl RunningHub {
         // もの）は、ここでは待たない - 従来どおり下の `manager.shutdown()` が
         // 止める。
         let _ = self.controller.begin_shutdown();
+        // handler が切り離す保存・監査のタスクの受付を閉じる（以後は 503 で何もしない）。
+        // 走っているものは `server.stop()` の後・pool を閉じる前に待つ（このモジュール doc の
+        // 「シャットダウン順序」節「切り離したタスク」）。
+        self.manager.detached().close();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
         // `JoinHandle`を捨てて「プロセス終了任せ」で止めていた - ここが
@@ -1282,6 +1300,17 @@ impl RunningHub {
             tls_server.stop().await;
         }
         self.server.stop().await;
+        // サーバーを止めたので新しい handler は来ない。切断で捨てられた handler のものも
+        // 含め、切り離したタスク（監査を書く）の終わりを pool を閉じる前に待つ。上限を
+        // 過ぎても abort しない（DB を触るタスクを `abort()` で止めない）。
+        let detached = self.manager.detached();
+        if !detached.wait(DETACHED_STOP_TIMEOUT).await {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 切り離した保存・監査のタスクが {} 秒のうちに終わりませんでした（{} 件が残ったまま終了へ進みます）",
+                DETACHED_STOP_TIMEOUT.as_secs(),
+                detached.pending()
+            ));
+        }
         // #945 の総点検: 書込みの入口（REST・gRPC・MCP）が止まったので、拒否の監査の
         // 書き手を止めて、表の残りを書き切ってから pool を閉じる（閉じたあとでは書けず
         // 失われる）。DB が詰まっていても止めないよう上限で切り上げ、残りは 1 行のログに

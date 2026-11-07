@@ -603,6 +603,16 @@ pub(crate) fn api_key_rejection_response(rejection: ApiKeyRejection) -> Response
     }
 }
 
+/// Hub の終了中（`crate::detached::DetachedTasks` の受付を閉じた後）の 503。何も保存・
+/// 監査しない。`BantoError` には 503 の値が無い（`Other` は 500）ので応答を直に作る。
+pub(crate) fn shutting_down_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "unavailable", "reason": "hub is shutting down" })),
+    )
+        .into_response()
+}
+
 /// T2-4（設計 §6-8、実装指示 §5「認証」）: `POST /api/v1/values/{tag}` を
 /// セッション token で叩いた場合の明示的な 403（§6-8: 「セッション token
 /// では書けない」）。
@@ -1043,6 +1053,7 @@ fn api_router_with_controller_mode(
             auth.clone(),
             api_keys.clone(),
             audit.clone(),
+            manager.detached().clone(),
         ))
         // R2a-2d（docs/banto-hub-ingest-design.md §6.1）: 同じ取り込み口の WebSocket の
         // 送信口 `GET /api/v1/ingest/{id}/stream`。REST と同じ認証の層（経路は `ws`）を
@@ -1054,6 +1065,7 @@ fn api_router_with_controller_mode(
             auth.clone(),
             api_keys.clone(),
             audit.clone(),
+            manager.detached().clone(),
         ))
         .merge(tag_space_router(
             manager,

@@ -45,6 +45,7 @@ use utoipa::ToSchema;
 
 use crate::api_keys::ApiKeysService;
 use crate::audit::AuditLogService;
+use crate::detached::DetachedTasks;
 
 use super::audit::{self as ingest_audit, IngestAuditRow, Transport};
 use super::auth::{error_response, require_ingest_auth, IngestAuthState, IngestCaller};
@@ -86,6 +87,8 @@ pub struct IngestRestState {
     pub ingest: Arc<IngestHub>,
     pub audit: AuditLogService,
     pub clock: Arc<dyn Clock>,
+    /// 監査の記録を切り離すときの Hub の数え（`CollectorManager::detached` の複製）。
+    pub detached: DetachedTasks,
 }
 
 /// `POST /api/v1/ingest/{id}/values` のルーター。認証の層は `route_layer` で
@@ -97,6 +100,7 @@ pub fn ingest_rest_router(
     auth: AuthState,
     api_keys: ApiKeysService,
     audit: AuditLogService,
+    detached: DetachedTasks,
 ) -> Router {
     let auth_state = IngestAuthState {
         auth,
@@ -105,6 +109,7 @@ pub fn ingest_rest_router(
         ingest: ingest.clone(),
         clock: clock.clone(),
         transport: Transport::Rest,
+        detached: detached.clone(),
     };
     let body_limit = usize::try_from(PUSH_LIMITS.max_rest_body_bytes).unwrap_or(usize::MAX);
     Router::new()
@@ -120,6 +125,7 @@ pub fn ingest_rest_router(
             ingest,
             audit,
             clock,
+            detached,
         })
 }
 
@@ -215,7 +221,7 @@ pub async fn v1_ingest_values(
         Ok(admission) => admission,
         Err(refusal) => {
             let rows = ingest_audit::refusal_rows(&state.ingest, &ctx, refusal, now_ms);
-            ingest_audit::record(&state.audit, rows).await;
+            ingest_audit::record(&state.audit, &state.detached, rows).await;
             return refusal_response(refusal);
         }
     };
@@ -225,7 +231,7 @@ pub async fn v1_ingest_values(
         .map(|edge| IngestAuditRow::limit_edge(&ctx, edge))
         .collect();
     if let Err(limit) = admission.outcome {
-        ingest_audit::record(&state.audit, edge_rows).await;
+        ingest_audit::record(&state.audit, &state.detached, edge_rows).await;
         return match limit.kind {
             LimitKind::TooManyItems => error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -274,7 +280,7 @@ pub async fn v1_ingest_values(
                 refusal,
                 now_ms,
             ));
-            ingest_audit::record(&state.audit, rows).await;
+            ingest_audit::record(&state.audit, &state.detached, rows).await;
             return refusal_response(refusal);
         }
     };
@@ -292,7 +298,7 @@ pub async fn v1_ingest_values(
             .iter()
             .map(|record| IngestAuditRow::unknown_key(&ctx, record)),
     );
-    ingest_audit::record(&state.audit, rows).await;
+    ingest_audit::record(&state.audit, &state.detached, rows).await;
 
     let response = IngestValuesResponse {
         accepted: ack.accepted,

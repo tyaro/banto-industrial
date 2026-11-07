@@ -1002,6 +1002,83 @@ mod tests {
             .is_err());
     }
 
+    /// `PUT /api/opcua-settings` の要求の future が捨てられても（hyper が相手の FIN で
+    /// handler を捨てるのと同じ）、切り離した保存・適用・監査は走り切り、Hub の終了の
+    /// 待ち（`DetachedTasks::wait`）はその終わりを待つ。docs/implementation-checklist.md §5
+    /// の形: publisher の lock を外から持って適用の手前で止める → 要求を捨てる → 待ちが
+    /// 終わらないのを確かめる → lock を放す → 上限つきで待つ。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_settings_put_still_audits_and_the_shutdown_waits_for_it() {
+        use crate::settings::{HubSettingsExt, SettingsService};
+        use tower::ServiceExt;
+
+        let (publisher, _calls) = gated_publisher().await;
+        let manager = publisher.manager.clone();
+        let pool = manager.pool();
+        let db = || crate::db::Db::Sqlite(pool.clone());
+        let users = crate::users::UsersService::new(db());
+        users
+            .setup_first_user("admin", "password123", "管理者")
+            .await
+            .expect("setup admin");
+        let audit = crate::audit::AuditLogService::new(db());
+        let auth = crate::rest::user_auth_state(users, audit.clone());
+        let token = auth.login("admin", "password123").await.expect("login");
+        let (events, _rx) = tokio::sync::broadcast::channel(16);
+        let router = crate::rest::opcua_settings_router(
+            manager.clone(),
+            publisher.clone(),
+            audit.clone(),
+            auth,
+            events,
+        );
+        let port = free_port();
+        let audited = || async {
+            crate::audit::AuditLogService::new(db())
+                .list(banto_core::ListParams::default())
+                .await
+                .expect("list audit")
+                .rows
+                .iter()
+                .any(|row| row.resource == "opcua_settings" && row.action == "update")
+        };
+
+        let held = publisher.inner.lock().await;
+        let request = axum::http::Request::put("/api/opcua-settings")
+            .header("Authorization", format!("Bearer {token}"))
+            .header("X-Banto-Client", "banto")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::to_string(&disabled(port)).expect("body"),
+            ))
+            .expect("request");
+        let call = tokio::spawn(router.oneshot(request));
+        // 切り離したタスクが数えられ、保存を終えて publisher の lock の前で止まるまで待つ。
+        let saved = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let config = SettingsService::new(db())
+                    .opcua_config()
+                    .await
+                    .expect("read settings");
+                if manager.detached().pending() == 1 && config.port == port {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(saved.is_ok(), "the detached PUT saved and waits for apply");
+        call.abort();
+        assert!(call.await.expect_err("dropped").is_cancelled());
+        // 終了の冒頭と同じく受付を閉じる。走っているタスクは数えたまま。
+        manager.detached().close();
+        assert!(!manager.detached().wait(Duration::from_millis(100)).await);
+        assert!(!audited().await, "not audited while held");
+        drop(held);
+        assert!(manager.detached().wait(Duration::from_secs(5)).await);
+        assert!(audited().await, "audited after the request was dropped");
+    }
+
     /// #634: 鍵と証明書の置き場を渡すと、2 回目の起動は同じ鍵と証明書を再利用する
     /// （ファイルの中身が同じ。初回だけ生成するので 2 回目は速い）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

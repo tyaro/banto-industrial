@@ -174,6 +174,9 @@
 //! 監査を失わない」を切断にも広げる。監査は従来どおり
 //! `AuditLogService::record` = 3 秒で打ち切って保留、を通る)。停止・再開が
 //! panic しても、保存できなかったものとして `follow_up` (失敗の監査) を呼ぶ。
+//! この別タスクは Hub の数え (`crate::detached`) の `spawn_always` で切り離すので、
+//! Hub の終了は pool を閉じる前にその終わりを待つ。終了中でも停止・再開は断らない
+//! (書込みの停止を 503 にしない)。
 //!
 //! [`WriteControl::set_enabled`] の future を直接捨てたとき (テスト・
 //! ランタイムの終了) に守るのは、次の 2 つだけ:
@@ -263,6 +266,7 @@ use std::collections::VecDeque;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
+use crate::detached::DetachedTasks;
 use crate::hub_log::{log_err_line, log_line};
 
 /// データディレクトリ内の状態ファイル名 (#433)。tstore の剪定
@@ -955,8 +959,13 @@ impl WriteControl {
     /// `follow_up` は、停止・再開が終わった後に**同じ別タスクの中で**結果を
     /// 渡して呼ぶ (呼び出し側の監査・通知。切断されても最後まで走り、結果を
     /// 返すのはその完了の後)。停止・再開が panic したときは呼ばない。
+    ///
+    /// 別タスクは Hub の数え `detached`（`CollectorManager::detached`）の
+    /// `spawn_always` で切り離す: Hub の終了は pool を閉じる前にその終わり（監査まで）を
+    /// 待つ。終了中でも**断らない**（書込みの停止を 503 にしない。`crate::detached`）。
     pub async fn set_enabled_detached<A, Fut>(
         self: &Arc<Self>,
+        detached: &DetachedTasks,
         pool: &SqlitePool,
         enabled: bool,
         actor: Option<&str>,
@@ -969,6 +978,7 @@ impl WriteControl {
         let pool = pool.clone();
         let db_actor = actor.map(str::to_string);
         self.set_enabled_detached_with(
+            detached,
             enabled,
             actor,
             async move {
@@ -985,6 +995,7 @@ impl WriteControl {
     /// ため)。
     async fn set_enabled_detached_with<F, A, Fut>(
         self: &Arc<Self>,
+        detached: &DetachedTasks,
         enabled: bool,
         actor: Option<&str>,
         persist_db: F,
@@ -998,7 +1009,9 @@ impl WriteControl {
         let control = Arc::clone(self);
         let actor = actor.map(str::to_string);
         let has_state_file = self.state_file.is_some();
-        let task = tokio::spawn(async move {
+        // 終了の待ちに数える (終了中も断らない)。中の panic 隔離の spawn は、この
+        // タスクが待つので数えなくてよい。
+        let task = detached.spawn_always(async move {
             // 停止・再開はさらに別タスクにして、panic しても `follow_up` (失敗の
             // 監査) は呼ぶ。
             let operation = tokio::spawn(async move {
@@ -3228,6 +3241,7 @@ mod tests {
             tokio::spawn(async move {
                 control
                     .set_enabled_detached_with(
+                        &DetachedTasks::new(),
                         true,
                         None,
                         async move {
@@ -3289,6 +3303,7 @@ mod tests {
             tokio::spawn(async move {
                 control
                     .set_enabled_detached_with(
+                        &DetachedTasks::new(),
                         true,
                         None,
                         async move {
@@ -3311,6 +3326,7 @@ mod tests {
             tokio::spawn(async move {
                 control
                     .set_enabled_detached_with(
+                        &DetachedTasks::new(),
                         false,
                         None,
                         async move {
@@ -3365,6 +3381,7 @@ mod tests {
             tokio::spawn(async move {
                 control
                     .set_enabled_detached_with(
+                        &DetachedTasks::new(),
                         false,
                         None,
                         async move {
@@ -3404,5 +3421,63 @@ mod tests {
             !seen[0].requested_enabled && seen[0].succeeded(),
             "{seen:?}"
         );
+    }
+
+    /// Hub の終了で数えの受付を閉じた後も、停止・再開は断らずに受け付け
+    /// (`spawn_always`)、終了の待ちは停止・再開と `follow_up` (監査) の終わりを待つ。
+    /// 再開で確かめる (再開の DB 保存は止めたまま待つ。停止は DB を 5 秒で見切る)。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_detached_change_after_the_shutdown_closed_the_tracker_is_accepted_and_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let control = Arc::new(WriteControl::restore(
+            StartupDecision {
+                enabled: false,
+                warning: None,
+            },
+            state_file_path(dir.path()),
+        ));
+        let detached = DetachedTasks::new();
+        detached.close();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let follow_ups: FollowUps = Arc::default();
+
+        let caller = {
+            let control = control.clone();
+            let detached = detached.clone();
+            let (release, entered) = (release.clone(), entered.clone());
+            let follow_up = counting_follow_up(&follow_ups);
+            tokio::spawn(async move {
+                control
+                    .set_enabled_detached_with(
+                        &detached,
+                        true,
+                        None,
+                        async move {
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        },
+                        follow_up,
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        assert_eq!(detached.pending(), 1, "accepted and counted after close");
+        assert!(!detached.wait(Duration::from_millis(100)).await);
+        assert!(follow_ups.lock().unwrap().is_empty());
+
+        release.notify_one();
+        assert!(detached.wait(Duration::from_secs(5)).await);
+        let seen = follow_ups.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            1,
+            "the follow-up ran before the wait ended: {seen:?}"
+        );
+        assert!(seen[0].requested_enabled && seen[0].succeeded(), "{seen:?}");
+        assert!(caller.await.unwrap().succeeded());
+        assert!(control.is_enabled());
     }
 }

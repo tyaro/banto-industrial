@@ -1,7 +1,7 @@
 use super::super::*;
 use super::common::{
-    admin_get, issue_api_key, seed_scope_fixture, test_env, test_env_with_clock, v1_get,
-    CLIENT_HEADER,
+    admin_delete, admin_get, admin_post, admin_put, issue_api_key, seed_scope_fixture, test_env,
+    test_env_with_clock, v1_get, CLIENT_HEADER,
 };
 use axum::body::Body;
 use axum::http::Request as HttpRequest;
@@ -974,4 +974,111 @@ async fn last_used_at_is_populated_after_a_request() {
     let after = env.api_keys.list().await.unwrap();
     let after_entry = after.iter().find(|k| k.id == id).unwrap();
     assert!(after_entry.last_used_at.is_some());
+}
+
+/// 監査の `resource` ごとの行の数（503 の試験で「監査しない」を確かめる）。
+async fn audit_rows_for(pool: &sqlx::SqlitePool, resource: &str) -> usize {
+    AuditLogService::new(Db::Sqlite(pool.clone()))
+        .list(ListParams::default())
+        .await
+        .unwrap()
+        .rows
+        .iter()
+        .filter(|row| row.resource == resource)
+        .count()
+}
+
+/// Hub の終了中（`manager.detached()` の受付を閉じた後）は、API キーの発行・失効・
+/// 削除・トリップ解除のどれも 503 で、キーは変わらず、監査もしない。
+#[tokio::test]
+async fn api_key_changes_are_503_after_the_shutdown_closed_them() {
+    let env = test_env().await;
+    let (_s, active) = issue_api_key(&env.router, &env.admin_token, "active", &["read"]).await;
+    let active = active["id"].as_i64().unwrap();
+    let (_s, revoked) = issue_api_key(&env.router, &env.admin_token, "revoked", &["read"]).await;
+    let revoked = revoked["id"].as_i64().unwrap();
+    revoke_api_key(&env.router, &env.admin_token, revoked).await;
+    let keys_before = serde_json::to_value(env.api_keys.list().await.unwrap()).unwrap();
+    let audit_before = audit_rows_for(&env.pool, "api_keys").await;
+
+    env.manager.detached().close();
+    let unavailable = json!({ "status": "unavailable", "reason": "hub is shutting down" });
+    let (status, body) = admin_post(
+        &env.router,
+        "/api/api-keys",
+        &env.admin_token,
+        json!({ "name": "new", "scopes": ["read"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "create: {body:?}");
+    assert_eq!(body, unavailable);
+    let (status, body) = admin_post(
+        &env.router,
+        &format!("/api/api-keys/{active}/revoke"),
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "revoke: {body:?}");
+    let (status, body) = admin_delete(
+        &env.router,
+        &format!("/api/api-keys/{revoked}"),
+        &env.admin_token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "delete: {body:?}");
+    let (status, body) = admin_post(
+        &env.router,
+        &format!("/api/api-keys/{active}/clear-trip"),
+        &env.admin_token,
+        json!({}),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "clear-trip: {body:?}"
+    );
+
+    let keys_after = serde_json::to_value(env.api_keys.list().await.unwrap()).unwrap();
+    assert_eq!(keys_after, keys_before, "no key changed");
+    assert_eq!(audit_rows_for(&env.pool, "api_keys").await, audit_before);
+    assert_eq!(env.manager.detached().pending(), 0);
+}
+
+/// Hub の終了中は `PUT /api/opcua-settings` も 503 で、保存も監査もしない。
+#[tokio::test]
+async fn opcua_settings_put_is_503_after_the_shutdown_closed_it() {
+    let env = test_env().await;
+    let users = UsersService::new(Db::Sqlite(env.pool.clone()));
+    let audit = AuditLogService::new(Db::Sqlite(env.pool.clone()));
+    let auth = user_auth_state(users, audit.clone());
+    let token = auth.login("admin", "password123").await.unwrap();
+    let (tx, _rx) = tokio_broadcast::channel(16);
+    let router = opcua_settings_router(
+        env.manager.clone(),
+        crate::opcua::OpcUaPublisher::new(
+            env.manager.clone(),
+            std::env::temp_dir().join("banto-hub-opcua-503-pki-unused"),
+            None,
+        ),
+        audit,
+        auth,
+        tx,
+    );
+    let (status, initial) = admin_get(&router, "/api/opcua-settings", &token).await;
+    assert_eq!(status, StatusCode::OK);
+
+    env.manager.detached().close();
+    let mut changed = initial.clone();
+    changed["port"] = json!(14840);
+    let (status, body) = admin_put(&router, "/api/opcua-settings", &token, changed).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    assert_eq!(
+        body,
+        json!({ "status": "unavailable", "reason": "hub is shutting down" })
+    );
+    let (_, after) = admin_get(&router, "/api/opcua-settings", &token).await;
+    assert_eq!(after, initial, "nothing saved");
+    assert_eq!(audit_rows_for(&env.pool, "opcua_settings").await, 0);
 }

@@ -152,6 +152,7 @@ use tokio::sync::mpsc;
 
 use crate::api_keys::ApiKeysService;
 use crate::audit::AuditLogService;
+use crate::detached::DetachedTasks;
 use crate::rest::{bearer_token, unauthorized_response};
 use crate::stream::{
     api_key_recheck_verdict, RecheckVerdict, Revalidator, RevokedReason, StreamCredential,
@@ -218,6 +219,7 @@ pub fn ingest_ws_router(
     auth: AuthState,
     api_keys: ApiKeysService,
     audit: AuditLogService,
+    detached: DetachedTasks,
 ) -> Router {
     let auth_state = IngestAuthState {
         auth,
@@ -226,6 +228,7 @@ pub fn ingest_ws_router(
         ingest: ingest.clone(),
         clock: clock.clone(),
         transport: Transport::Ws,
+        detached,
     };
     Router::new()
         .route(STREAM_PATH, get(v1_ingest_stream))

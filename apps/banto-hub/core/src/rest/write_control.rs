@@ -98,7 +98,13 @@ async fn write_control_set(
     // `crate::write_control` のモジュール doc「呼び出し側が future を捨てても」）。
     let change = state
         .write_control
-        .set_enabled_detached(&state.manager.pool(), enabled, actor_id, follow_up)
+        .set_enabled_detached(
+            state.manager.detached(),
+            &state.manager.pool(),
+            enabled,
+            actor_id,
+            follow_up,
+        )
         .await;
 
     if !change.succeeded() {

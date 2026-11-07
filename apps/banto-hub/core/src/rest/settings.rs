@@ -8,11 +8,11 @@
 
 use super::{
     broadcast, get, json, middleware, post, record_write, require_banto_client_header,
-    require_session, require_session_role, ApiError, Arc, AsyncMutex, AuditLogService, AuthGate,
-    AuthState, BantoError, CollectorManager, Db, Deserialize, FieldError, HeaderMap,
-    HubSettingsExt, IpAddr, Json, LocalDate, MqttPublisher, MqttSettings, OperationKind, Role,
-    Router, Serialize, ServerEvent, SessionRoleGuard, SettingsService, State, StoreSettings,
-    ToSchema,
+    require_session, require_session_role, shutting_down_response, ApiError, Arc, AsyncMutex,
+    AuditLogService, AuthGate, AuthState, BantoError, CollectorManager, Db, Deserialize,
+    FieldError, HeaderMap, HubSettingsExt, IntoResponse, IpAddr, Json, LocalDate, MqttPublisher,
+    MqttSettings, OperationKind, Response, Role, Router, Serialize, ServerEvent, SessionRoleGuard,
+    SettingsService, State, StoreSettings, ToSchema,
 };
 
 // --- MQTT 設定 (T3、設計 §5.3): admin 限定、CSRF + bearer -------------------
@@ -807,7 +807,7 @@ async fn opcua_settings_put(
     State(state): State<OpcUaSettingsAdminState>,
     headers: HeaderMap,
     Json(mut config): Json<crate::settings::OpcUaSettings>,
-) -> Result<Json<crate::settings::OpcUaSettings>, ApiError> {
+) -> Result<Response, ApiError> {
     if config.advertised_host.as_deref() == Some("") {
         config.advertised_host = None;
     }
@@ -821,7 +821,11 @@ async fn opcua_settings_put(
     // #634: `apply` は古い listener を止めて起動を背景タスクへ渡したら返る
     // （起動の完了は待たない）。200 は「保存した・起動を始めた」までを意味し、
     // 起動の結果は `GET /api/opcua-status` に出る。
-    let applied = tokio::spawn(async move {
+    // 終了の待ちに数え、受付を閉じた後は 503 で何も保存しない（`crate::detached`）。
+    // 閉じる前に始まった回の `apply` が `OpcUaPublisher::shutdown` の後に届いても、
+    // `stopping` の印で何も起動せずに戻る（listener は残らない）。
+    let detached = state.manager.detached().clone();
+    let Some(task) = detached.spawn(async move {
         // 保存と適用を1つの順序にし、並行 PUT の古い設定が後から適用されることを
         // 防ぐ（起動どうしの順序と世代は `OpcUaPublisher` が守る）。
         let _write_guard = state.write_lock.lock().await;
@@ -847,10 +851,13 @@ async fn opcua_settings_put(
             resource: "opcua_settings".to_owned(),
         });
         Ok::<_, BantoError>(config)
-    })
-    .await
-    .map_err(|err| ApiError(BantoError::Other(format!("OPC UA 設定タスク: {err}"))))??;
-    Ok(Json(applied))
+    }) else {
+        return Ok(shutting_down_response());
+    };
+    let applied = task
+        .await
+        .map_err(|err| ApiError(BantoError::Other(format!("OPC UA 設定タスク: {err}"))))??;
+    Ok(Json(applied).into_response())
 }
 
 /// HubRuntime から共通 publisher を渡す管理系の追加ルーター。
