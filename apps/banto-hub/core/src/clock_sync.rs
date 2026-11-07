@@ -47,9 +47,12 @@
 //!   有効な接続だけを出す。
 //! - **追いつかない**: 今の分しか見ないので、一致した分のうちに評価できなかった
 //!   回（Hub の停止中・PC のスリープ・時計の飛び越し）は後から出さない。
-//! - **二重に出さない**: 接続ごとに「最後に定期で出した分」をメモリに持ち、同じ
-//!   分では 2 回目を出さない（夏時間の巻き戻しなどで同じ naive の分がもう一度
-//!   来ても出さない）。出すと決めた時点で印を付けるので、実行中の回とも重ならない。
+//! - **二重に出さない**: 接続ごとに「定期で出した分」の集合をメモリに持ち、集合に
+//!   ある分では 2 回目を出さない（夏時間の巻き戻しや時計の手直しで、いくつか前の
+//!   naive の分がもう一度来ても出さない）。出すと決めた時点で印を付けるので、実行中の
+//!   回とも重ならない。集合は評価のたびに今の分の前後 26 時間（[`FIRED_KEEP`]）より
+//!   離れた分を捨てる。夏時間の巻き戻しと日ごとの時刻表を覆いつつ、PC の時計が大きく
+//!   ずれていて直されたときに時刻表が永久に止まらないようにするため。
 //! - **実行を待たない**: 評価はループの中で行い、各回の実行は `JoinSet` に spawn
 //!   する。1 回の時計合わせが長引いても（`clock_job_limit` は応答の時間切れに比例し、
 //!   T = 5 s なら 81 s）次の分の評価と別の接続の回は遅れない。止める合図の後は
@@ -95,7 +98,7 @@
 //! いると互いに上書きする。毎回 PLC のイベント履歴に「時計設定」（イベント
 //! コード 24000）が残るので、間隔を短くしすぎない。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -353,28 +356,40 @@ fn utc_now_rfc3339() -> String {
 
 /// 定期の評価（純関数）: `rows`（`hub_clock_sync` の有効な行）のうち、今の分
 /// `minute` が時刻表に一致し、`runnable`（適用済みのカタログにある有効な接続）に
-/// 含まれ、`fired` の印が同じ分でないものの id を返し、`fired` に印を付ける。
-/// 今の分しか見ないので、過ぎた回は出さない（追いつかない）。
+/// 含まれ、`fired`（接続ごとの出した分の集合）に無いものの id を返し、`fired` に
+/// 入れる。今の分しか見ないので、過ぎた回は出さない（追いつかない）。評価のたびに、
+/// 今の分から [`FIRED_KEEP`] より離れた分を `fired` から捨てる。
 pub fn due_connections(
     rows: &[(i64, ClockSchedule)],
     runnable: &HashSet<i64>,
     minute: NaiveDateTime,
-    fired: &mut HashMap<i64, NaiveDateTime>,
+    fired: &mut FiredMinutes,
 ) -> Vec<i64> {
     let minute = truncate_to_minute(minute);
+    fired.retain(|_, minutes| {
+        minutes.retain(|m| (*m - minute).abs() <= FIRED_KEEP);
+        !minutes.is_empty()
+    });
     let mut due = Vec::new();
     for (id, schedule) in rows {
         if !runnable.contains(id) || !schedule.matches(minute) {
             continue;
         }
-        if fired.get(id) == Some(&minute) {
-            continue;
+        if fired.entry(*id).or_default().insert(minute) {
+            due.push(*id);
         }
-        fired.insert(*id, minute);
-        due.push(*id);
     }
+    fired.retain(|_, minutes| !minutes.is_empty());
     due
 }
+
+/// 接続ごとの、定期で出した分（naive の現地時刻、分に切り捨て）の集合。
+pub type FiredMinutes = HashMap<i64, BTreeSet<NaiveDateTime>>;
+
+/// 出した分を覚えておく幅（今の分の前後）。夏時間の巻き戻しと日ごとの時刻表を
+/// 覆う 24 時間に余裕を足した 26 時間。これより離れた分は捨てるので、PC の時計が
+/// 大きくずれていて直されても、その時刻表が永久に止まることはない。
+pub const FIRED_KEEP: chrono::TimeDelta = chrono::TimeDelta::hours(26);
 
 /// 手動の実行の操作者（監査の `actor_username`・`actor_role`）。
 #[derive(Debug, Clone, Copy)]
@@ -405,7 +420,7 @@ pub struct ClockSync {
     now: RwLock<LocalNow>,
     last: Mutex<HashMap<i64, ClockSyncRecord>>,
     running: Mutex<HashSet<i64>>,
-    fired: Mutex<HashMap<i64, NaiveDateTime>>,
+    fired: Mutex<FiredMinutes>,
 }
 
 impl ClockSync {
@@ -762,7 +777,12 @@ where
             let minute = truncate_to_minute(now());
             if evaluated != Some(minute) {
                 evaluated = Some(minute);
-                for id in due(minute).await {
+                let ids = due(minute).await;
+                // 評価を待つ間に止める合図が来ていたら、新しい回は出さない。
+                if *stop_rx.borrow() {
+                    break;
+                }
+                for id in ids {
                     runs.spawn(run(id));
                 }
             }
@@ -884,7 +904,7 @@ mod tests {
         ];
         // 3 は適用済みのカタログに無い（または無効）。
         let runnable: HashSet<i64> = [1, 2].into();
-        let mut fired = HashMap::new();
+        let mut fired = FiredMinutes::new();
         assert_eq!(
             due_connections(&rows, &runnable, at(2026, 11, 7, 9, 5, 0), &mut fired),
             vec![1, 2]
@@ -916,6 +936,29 @@ mod tests {
             due_connections(&rows, &runnable, at(2026, 11, 8, 9, 5, 0), &mut fired),
             vec![1, 2]
         );
+    }
+
+    /// 2 つ以上前の分へ巻き戻しても出さない。26 時間より離れた分は捨てる。
+    #[test]
+    fn rewinding_past_several_fired_minutes_does_not_fire_again() {
+        let rows = vec![(1, ClockSchedule::Hourly { minute: 5 })];
+        let runnable: HashSet<i64> = [1].into();
+        let mut fired = FiredMinutes::new();
+        let mut due = |time| due_connections(&rows, &runnable, time, &mut fired);
+        assert_eq!(due(at(2026, 11, 7, 9, 5, 0)), vec![1]);
+        assert_eq!(due(at(2026, 11, 7, 10, 5, 0)), vec![1]);
+        assert!(due(at(2026, 11, 7, 9, 5, 0)).is_empty(), "09:05 again");
+        // 時計が大きく進んでいて直された: 2099 年の分の後でも 2026 年の分は出る
+        // （2099 年から見て 2026 年の分は 26 時間より前なので捨ててある）。
+        assert_eq!(due(at(2099, 1, 1, 0, 5, 0)), vec![1]);
+        assert_eq!(due(at(2026, 11, 7, 11, 5, 0)), vec![1]);
+        assert_eq!(due(at(2026, 11, 7, 10, 5, 0)), vec![1], "2026 was dropped");
+        assert!(due(at(2026, 11, 7, 11, 5, 0)).is_empty());
+        // 26 時間ちょうどは覚えている、それより離れると捨てる。
+        assert_eq!(due(at(2026, 11, 8, 13, 5, 0)), vec![1]);
+        assert!(due(at(2026, 11, 7, 11, 5, 0)).is_empty(), "26 h is kept");
+        assert_eq!(due(at(2026, 11, 8, 14, 5, 0)), vec![1]);
+        assert_eq!(due(at(2026, 11, 7, 11, 5, 0)), vec![1], "27 h is dropped");
     }
 
     #[test]
@@ -1192,6 +1235,42 @@ mod tests {
         release.notify_one();
         assert!(scheduler.stop_and_join(Duration::from_secs(5)).await);
         assert_eq!(*finished.lock().unwrap(), vec![2, 1]);
+    }
+
+    /// 評価（`due`）を待つ間に止める合図が来たら、その評価の回は出さない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stop_during_the_evaluation_starts_no_run() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered) = tokio::sync::mpsc::unbounded_channel();
+        let runs = Arc::new(Mutex::new(0u32));
+        let release_due = release.clone();
+        let runs_seen = runs.clone();
+        let mut scheduler = spawn_loop(
+            || at(2026, 11, 7, 9, 5, 0),
+            move |_| {
+                let (release, entered) = (release_due.clone(), entered_tx.clone());
+                async move {
+                    entered.send(()).unwrap();
+                    release.notified().await;
+                    vec![1]
+                }
+            },
+            move |_| {
+                let runs = runs_seen.clone();
+                async move {
+                    *runs.lock().unwrap() += 1;
+                }
+            },
+            Duration::from_millis(5),
+        );
+        tokio::time::timeout(Duration::from_secs(5), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        scheduler.signal_stop();
+        release.notify_one();
+        assert!(scheduler.stop_and_join(Duration::from_secs(5)).await);
+        assert_eq!(*runs.lock().unwrap(), 0, "no run after the stop signal");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

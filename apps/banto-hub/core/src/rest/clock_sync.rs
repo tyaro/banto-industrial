@@ -8,12 +8,14 @@
 //!   カタログ（収集中だけある）ではなく保存済みで見るのは、収集を止めたまま
 //!   時刻表を設定できるようにするため。
 //! - `PUT` の本文は `{"enabled": bool, "schedule": {...}}`（未知のキー・範囲外は
-//!   400）。保留キューを通さず即時に保存し、監査（`update`）する。
+//!   400）。保留キューを通さず即時に保存し、監査（`update`）する。保存・監査・応答の
+//!   view は `tokio::spawn` で切り離して `JoinHandle` を待つ（下の POST と同じ理由）。
 //! - `POST` は適用済みのカタログに無い接続には 404（診断の POST と同じ）。Hub の
 //!   `enabled` を問わず今すぐ 1 回実行して結果を返す（PLC に書くのは editor の
 //!   明示の操作。ゲストの `clock_set` と運用書込みの loader のゲートは残る）。
 //!   実行は `tokio::spawn` で切り離して `JoinHandle` を待つ（要求の接続が切れても
-//!   監査と直近の結果を書き切る、docs/implementation-checklist.md §5）。
+//!   監査と直近の結果を書き切る、docs/implementation-checklist.md §5）。PUT の保存と
+//!   監査も同じ形（保存の後・監査の前に切れて、監査なしで時刻表が有効になるのを防ぐ）。
 
 use super::{
     actor_identity, record_write, require_editor, ApiError, BantoError, HeaderMap, IntoResponse,
@@ -98,19 +100,30 @@ pub(super) async fn clock_sync_put(
     .await?;
     let settings = parse_settings(&body).map_err(BantoError::BadRequest)?;
     require_saved_connection(&state, connection_id).await?;
-    let clock_sync = state.manager.clock_sync();
-    clock_sync.save_settings(connection_id, &settings).await?;
-    record_write(
-        &state.audit,
-        &state.auth,
-        &headers,
-        "update",
-        AUDIT_RESOURCE,
-        Some(&connection_id.to_string()),
-        Some(json!({ "enabled": settings.enabled, "schedule": settings.schedule })),
-    )
-    .await;
-    Ok(Json(clock_sync.view(connection_id).await?))
+    // 保存→監査→view を切り離す（保存の後・監査の前に要求の接続が切れても、監査なしで
+    // 時刻表が有効になることがないように。POST と同じ）。
+    let manager = state.manager.clone();
+    let audit = state.audit.clone();
+    let auth = state.auth.clone();
+    let task = tokio::spawn(async move {
+        let clock_sync = manager.clock_sync();
+        clock_sync.save_settings(connection_id, &settings).await?;
+        record_write(
+            &audit,
+            &auth,
+            &headers,
+            "update",
+            AUDIT_RESOURCE,
+            Some(&connection_id.to_string()),
+            Some(json!({ "enabled": settings.enabled, "schedule": settings.schedule })),
+        )
+        .await;
+        clock_sync.view(connection_id).await
+    });
+    let view = task.await.map_err(|err| {
+        BantoError::Other(format!("時計合わせの設定のタスクが異常終了しました: {err}"))
+    })??;
+    Ok(Json(view))
 }
 
 /// 今すぐ 1 回、PLC の時計を合わせる。
