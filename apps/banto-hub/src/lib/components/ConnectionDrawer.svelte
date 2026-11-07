@@ -119,6 +119,7 @@
 		type PlcConnectionTestResult
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
+	import PlcClockSection from '#lib/components/PlcClockSection.svelte';
 	import {
 		REQUIRED_MESSAGE,
 		isSecretFormValue,
@@ -347,8 +348,16 @@
 	 * 時点の最新値を読めれば十分。
 	 */
 	let baseline: PlcConnectionFormState = blankConnectionForm([]);
-	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte`/`Modal.svelte` の `dirty` prop）。 */
-	const dirty = $derived(isFormDirty(baseline, form));
+	/** フォームの未保存の変更（新規作成の Modal の `dirty` と、`dirty` の一部）。 */
+	const formDirty = $derived(isFormDirty(baseline, form));
+	/**
+	 * 「PLC の時計」の設定の未保存の変更（`PlcClockSection` の `bind:dirty`）。接続の「保存」は
+	 * これを保存しない（別の REST で即時に保存する）ので、`formDirty` とは別に持つ。
+	 * 閉じる確認（Esc・外側のクリック・×）にだけ足し、保存成功後の判定などには使わない。
+	 */
+	let clockDirty = $state(false);
+	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte` の `dirty` prop、×の破棄確認も）。 */
+	const dirty = $derived(formDirty || clockDirty);
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -481,6 +490,7 @@
 		driverErrors = {};
 		testState = blankTestState();
 		rangeDiagnostic = null;
+		clockDirty = false;
 		dbTestState = blankDbTestState();
 		step = 1;
 		lastProtocol = form.protocol;
@@ -1535,7 +1545,7 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="560px"
-		{dirty}
+		dirty={formDirty}
 		onBlockedClose={notifyBlockedClose}
 		{focusFallback}
 	>
@@ -1612,6 +1622,9 @@
 			{:else if driver}
 				{@render testConnectionBlock()}
 				{@render rangeDiagnosticBlock()}
+				{#if savedConnection}
+					<PlcClockSection connectionId={savedConnection.id} bind:dirty={clockDirty} />
+				{/if}
 			{/if}
 			<div class="actions">
 				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>
