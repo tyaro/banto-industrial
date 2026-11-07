@@ -103,7 +103,10 @@
 //! ## 監査（PR #759 のレビュー P2-2）
 //!
 //! 受信のループは監査の記録を待たない: 行は接続ごとの記録のタスクへ積むだけ
-//! （[`super::audit::IngestAuditWriter`]。順序を保ち、落とさない）。遅い監査の DB でも
+//! （[`super::audit::IngestAuditWriter`]。順序を保ち、落とさない）。記録のタスクは
+//! `IngestHub` への登録の前に立てて Hub の数え（`crate::detached`）に入れる
+//! （[`open_counted`]。登録の後・数える前に Hub の終了が待ちを抜けない）。断られたら行を
+//! 積まずに捨てる。遅い監査の DB でも
 //! ping・close の知らせ・`state`・再検証は止まらない。`ack` は行を積んだ時点で返す。
 //!
 //! ## close コード
@@ -309,6 +312,26 @@ pub async fn v1_ingest_stream(
         .into_response()
 }
 
+/// 監査の記録のタスク（Hub の数えに入る）を立ててから `open`（`IngestHub` への登録）を
+/// 呼ぶ（PR #1067 のオーナーの相互レビュー P2）。登録の後に立てると、その間に Hub の終了が
+/// 合図を送り、数えが 0 のまま待ちを抜けて pool を閉じ、この WS の接続・切断の行が待たれない
+/// 記録のタスクで書かれうる。断られたら記録のタスクを行を積まずに捨てる（送り手を捨てると
+/// タスクは空のまま終わり、数えから外れる）。
+fn open_counted<T, E>(
+    audit: &AuditLogService,
+    detached: &DetachedTasks,
+    open: impl FnOnce() -> Result<T, E>,
+) -> Result<(T, IngestAuditWriter), E> {
+    let writer = IngestAuditWriter::spawn(audit, detached);
+    match open() {
+        Ok(opened) => Ok((opened, writer)),
+        Err(refusal) => {
+            drop(writer);
+            Err(refusal)
+        }
+    }
+}
+
 /// WS が閉じた理由（モジュールの doc の close コードの表の行）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum End {
@@ -452,17 +475,19 @@ async fn run_socket(
         peer: caller.peer.clone(),
         at_ms: state.clock.now_ms(),
     };
-    let (end, conn) = match state
-        .ingest
-        .open_ws_session_from(caller.connection_id, Some(sender))
-    {
-        Ok((session, info)) => {
+    // 監査の記録のタスクは登録の**前に**立てて Hub の数えに入れる（`open_counted`）。
+    let opened = open_counted(&state.audit, &state.detached, || {
+        state
+            .ingest
+            .open_ws_session_from(caller.connection_id, Some(sender))
+    });
+    let (end, conn) = match opened {
+        Ok(((session, info), audit)) => {
             let ctx = IngestAuditContext {
                 // 登録した時点の名前を控える（認証の層の後に改名されていても今の名前）。
                 connection_name: Some(info.name.clone()),
                 ..caller.audit_context()
             };
-            let audit = IngestAuditWriter::spawn(&state.audit, &state.detached);
             audit.push(vec![IngestAuditRow::connected(&ctx)]);
             let welcome = WelcomeWire {
                 op: "welcome",
@@ -497,7 +522,8 @@ async fn run_socket(
         }
         // 認証の層を通った後、登録までの間に commit と競った（§6.1）。監査の
         // `ingest_connected` は出していないので、切断の行も出さない。
-        // Hub の終了の合図の後も同じ（1001 `server_shutdown`）。
+        // Hub の終了の合図の後も同じ（1001 `server_shutdown`）。記録のタスクは
+        // `open_counted` が行を積まずに捨てた（数えから外れる）。
         Err(refusal) => {
             drop(outbound);
             drop(revalidator);
@@ -916,6 +942,38 @@ pub fn sanitize_status(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 登録（`open`）の時点で記録のタスクはもう数えられている。断られたら行を書かずに
+    /// 数えから外れる。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_audit_writer_is_counted_before_the_session_registers() {
+        let pool = crate::db::migrate_memory().await.expect("migrate_memory");
+        let audit = AuditLogService::new(crate::db::Db::Sqlite(pool.clone()));
+        let detached = DetachedTasks::new();
+
+        let (registered, writer) =
+            open_counted(&audit, &detached, || Ok::<_, ()>(detached.pending())).expect("opened");
+        assert_eq!(registered, 1, "counted when the session registers");
+        drop(writer);
+        assert!(detached.wait(Duration::from_secs(5)).await);
+
+        let refused = open_counted(&audit, &detached, || {
+            assert_eq!(detached.pending(), 1);
+            Err::<(), _>(crate::ingest::WsOpenRefusal::ServerShutdown)
+        });
+        assert!(matches!(
+            refused,
+            Err(crate::ingest::WsOpenRefusal::ServerShutdown)
+        ));
+        assert!(detached.wait(Duration::from_secs(5)).await);
+        assert_eq!(detached.pending(), 0);
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_log")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "a refused open writes no audit rows");
+        pool.close().await;
+    }
 
     /// `NotCurrent`（仮の `Superseded`）は、`ended` に届いている理由で置き換える。届いて
     /// いなければ仮の値のまま。ほかの理由は置き換えない。

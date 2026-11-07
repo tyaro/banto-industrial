@@ -349,6 +349,9 @@ pub async fn record(audit: &AuditLogService, detached: &DetachedTasks, rows: Vec
 ///   切り離したタスクで記録し直す（黙って落とさない）。
 /// - **Hub の終了の待ちに数える**: 記録のタスクと記録し直しは Hub の数え
 ///   （`crate::detached`）の `spawn_always` で立てる（起きた事象の監査なので終了中も断らない）。
+///   WS の送信口は記録のタスクを `IngestHub` への登録の**前に**立てる（登録の直後に Hub の
+///   終了が来ても、数えが 0 のまま待ちを抜けない。登録を断られたら行を積まずに捨て、タスクは
+///   空のまま終わって数えから外れる。`super::ws` の `open_counted`）。
 ///   記録のタスクは WS が開いている間ずっと数えられ、[`Self::finish`] でチャンネルを閉じて
 ///   積み残しを記録し終えたときに数えから外れる。Hub の終了は冒頭で開いている WS を
 ///   1001 `server_shutdown` で閉じさせ（`IngestHub::shutdown`）、pool を閉じる前にこの
