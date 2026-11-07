@@ -100,6 +100,8 @@
 //! **時計合わせのスケジューラ**（H2、`crate::clock_sync`）: 冒頭（収集の開始を
 //! 断る印の直後）で止める合図だけを出して新しい回を出さなくし、
 //! `sessions.shutdown()` の後に終わりを待つ（上限 [`CLOCK_SYNC_STOP_TIMEOUT`]）。
+//! REST の POST・PUT が切り離したタスクも、冒頭で受付を閉じ（以後は 503）、スケジューラの
+//! 後に同じ上限で待つ（pool を閉じる前）。
 //! 走っている回（接続ごとに別のタスク。スケジューラはそれを全部待ってから終わる）は
 //! broker が止まれば `TaskGone`（結果不明）で戻り、監査を書いて終わる。DB を触るので
 //! abort しない（docs/implementation-checklist.md §5）。
@@ -1265,7 +1267,9 @@ impl RunningHub {
         // 止める。
         let _ = self.controller.begin_shutdown();
         // H2: 時計合わせの新しい回を出さない（待たない。終わりは broker を止めた後に待つ）。
+        // REST の POST・PUT が切り離すタスクの受付も閉じる（以後は 503）。
         self.clock_sync_scheduler.signal_stop();
+        self.manager.clock_sync().close_detached();
         // T14-1（このモジュール doc の「T14-1 での唯一の挙動変化」節・設計
         // §3「D1」・§9「D7」）: 旧 `hub_run::run`はこの2本のループの
         // `JoinHandle`を捨てて「プロセス終了任せ」で止めていた - ここが
@@ -1308,6 +1312,18 @@ impl RunningHub {
         {
             log_err_line(&format!(
                 "banto-hub: [WARN] 時計合わせのスケジューラが {} 秒のうちに止まりませんでした",
+                CLOCK_SYNC_STOP_TIMEOUT.as_secs()
+            ));
+        }
+        // H2: REST の POST・PUT が切り離した回（監査を書く）も pool を閉じる前に待つ。
+        if !self
+            .manager
+            .clock_sync()
+            .wait_detached(CLOCK_SYNC_STOP_TIMEOUT)
+            .await
+        {
+            log_err_line(&format!(
+                "banto-hub: [WARN] 時計合わせの REST のタスクが {} 秒のうちに終わりませんでした",
                 CLOCK_SYNC_STOP_TIMEOUT.as_secs()
             ));
         }

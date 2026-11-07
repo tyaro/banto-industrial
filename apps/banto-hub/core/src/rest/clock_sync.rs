@@ -16,6 +16,8 @@
 //!   実行は `tokio::spawn` で切り離して `JoinHandle` を待つ（要求の接続が切れても
 //!   監査と直近の結果を書き切る、docs/implementation-checklist.md §5）。PUT の保存と
 //!   監査も同じ形（保存の後・監査の前に切れて、監査なしで時刻表が有効になるのを防ぐ）。
+//!   どちらも `ClockSync::spawn_tracked` で数え、Hub の終了は pool を閉じる前に待つ。
+//!   終了の受付を閉じた後は spawn せずに 503（何も保存・送信しない）。
 
 use super::{
     actor_identity, record_write, require_editor, ApiError, BantoError, HeaderMap, IntoResponse,
@@ -29,6 +31,16 @@ use axum::body::Bytes;
 use serde_json::json;
 
 const PATH: &str = "/api/plc-connections/{id}/clock-sync";
+
+/// Hub の終了中（切り離したタスクの受付を閉じた後）の 503。`BantoError` には 503 の
+/// 値が無い（`Other` は 500）ので、書込みの `WritesDisabled` などと同じく応答を直に作る。
+fn shutting_down() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({ "status": "unavailable", "reason": "hub is shutting down" })),
+    )
+        .into_response()
+}
 
 /// 保存済みの接続か（無ければ 404）。
 async fn require_saved_connection(state: &TagRegistryState, id: i64) -> Result<(), ApiError> {
@@ -80,6 +92,7 @@ pub(super) async fn clock_sync_get(
         (status = 400, description = "未知のキー・型の違い・範囲外（分 0–59、時 0–23）"),
         (status = 403, description = "editor 未満"),
         (status = 404, description = "保存済みの接続に無い"),
+        (status = 503, description = "Hub の終了中（保存しない）"),
     ),
     tag = "clock-sync",
 )]
@@ -88,7 +101,7 @@ pub(super) async fn clock_sync_put(
     headers: HeaderMap,
     Path(connection_id): Path<i64>,
     body: Bytes,
-) -> Result<Json<ClockSyncView>, ApiError> {
+) -> Result<Response, ApiError> {
     require_editor(
         &state.auth,
         &state.audit,
@@ -105,7 +118,7 @@ pub(super) async fn clock_sync_put(
     let manager = state.manager.clone();
     let audit = state.audit.clone();
     let auth = state.auth.clone();
-    let task = tokio::spawn(async move {
+    let Some(task) = state.manager.clock_sync().spawn_tracked(async move {
         let clock_sync = manager.clock_sync();
         clock_sync.save_settings(connection_id, &settings).await?;
         record_write(
@@ -119,11 +132,13 @@ pub(super) async fn clock_sync_put(
         )
         .await;
         clock_sync.view(connection_id).await
-    });
+    }) else {
+        return Ok(shutting_down());
+    };
     let view = task.await.map_err(|err| {
         BantoError::Other(format!("時計合わせの設定のタスクが異常終了しました: {err}"))
     })??;
-    Ok(Json(view))
+    Ok(Json(view).into_response())
 }
 
 /// 今すぐ 1 回、PLC の時計を合わせる。
@@ -135,6 +150,7 @@ pub(super) async fn clock_sync_put(
         (status = 200, description = "この回の結果（result: ok・unsupported・rejected・device（code に終了コード）・verificationFailed・unavailable・unknown（結果不明。自動では再送しない）・notOffered（このドライバ・loader は時計合わせを出さない）・busy）。監査と直近の結果にも残る。Hub の enabled を問わず出せるが、ゲストの接続設定 clock_set と運用書込みの loader のゲートは残る。危険: PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などと互いに上書きする。毎回 PLC のイベント履歴に「時計設定」（24000）が残る。", body = ClockSyncRecord),
         (status = 403, description = "editor 未満"),
         (status = 404, description = "適用済みのカタログ（収集中の構成）に無い接続"),
+        (status = 503, description = "Hub の終了中（何も送らない）"),
     ),
     tag = "clock-sync",
 )]
@@ -152,6 +168,9 @@ pub(super) async fn clock_sync_post(
         PATH,
     )
     .await?;
+    if state.manager.clock_sync().detached_closed() {
+        return Ok(shutting_down());
+    }
     let (_, applied) = state.manager.diagnostic_registry_snapshot();
     if !applied.connections.iter().any(|c| c.id == connection_id) {
         return Ok((
@@ -164,7 +183,7 @@ pub(super) async fn clock_sync_post(
     let actor = actor_identity(&headers, &state.auth).map(|identity| (identity.id, identity.role));
     let manager = state.manager.clone();
     let audit = state.audit.clone();
-    let task = tokio::spawn(async move {
+    let Some(task) = state.manager.clock_sync().spawn_tracked(async move {
         let actor = actor.as_ref().map(|(username, role)| ClockActor {
             username: username.as_str(),
             role: role.as_str(),
@@ -179,7 +198,9 @@ pub(super) async fn clock_sync_post(
                 actor,
             )
             .await
-    });
+    }) else {
+        return Ok(shutting_down());
+    };
     let record = task
         .await
         .map_err(|err| BantoError::Other(format!("時計合わせのタスクが異常終了しました: {err}")))?;

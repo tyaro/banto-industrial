@@ -135,3 +135,22 @@ async fn unknown_connection_is_404_and_a_viewer_is_403() {
     );
     assert!(env.manager.clock_sync().last(id).is_none());
 }
+
+/// Hub の終了中（切り離したタスクの受付を閉じた後）は PUT・POST とも 503 で、保存も
+/// 実行も監査もしない。
+#[tokio::test]
+async fn put_and_post_are_503_after_the_shutdown_closed_them() {
+    let env = test_env().await;
+    let id = saved_connection(&env).await;
+    let path = format!("/api/plc-connections/{id}/clock-sync");
+    env.manager.clock_sync().close_detached();
+    let ok = json!({ "enabled": true, "schedule": { "kind": "hourly", "minute": 5 } });
+    let (status, body) = admin_put(&env.router, &path, &env.admin_token, ok).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    let (status, body) = admin_post(&env.router, &path, &env.admin_token, json!({})).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body:?}");
+    let (_, body) = admin_get(&env.router, &path, &env.admin_token).await;
+    assert_eq!(body["settings"]["enabled"], false, "nothing saved");
+    assert!(env.manager.clock_sync().last(id).is_none(), "nothing run");
+    assert!(clock_audit(&env.pool).await.is_empty());
+}
