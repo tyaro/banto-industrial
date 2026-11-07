@@ -12,7 +12,7 @@
  * - 時刻のうち `plcTime`・`pcTime`・`ClockSyncRecord.time` は **タイムゾーンなしの
  *   現地時刻**（`YYYY-MM-DDTHH:MM:SS`）で、変換せずに出す（{@link plcTimeText}）。
  *   `at` だけが UTC の RFC3339 で、画面の現地時刻にする（既存の `formatSqliteUtc`）。
- * - 差（`offsetSeconds`）は PLC の時刻 − この PC の時刻。秒までの時刻同士なので
+ * - 差（`offsetSeconds`）は PLC の時刻 − Hub の PC の時刻。秒までの時刻同士なので
  *   ±1 秒の誤差がある（画面の注記）。
  */
 

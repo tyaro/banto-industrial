@@ -2,7 +2,7 @@
 	/**
 	 * 接続の編集 Drawer の「PLC の時計」（H2 #1065・H3 #1068 の Hub の REST の画面）。
 	 *
-	 * - 表示: `GET /api/plc-connections/{id}/clock`（PLC の時刻・この PC の時刻・差）。
+	 * - 表示: `GET /api/plc-connections/{id}/clock`（PLC の時刻・Hub の PC の時刻・差）。
 	 *   **自動のポーリングはしない**。読むたびに PLC と通信するので、開いただけでは読まず、
 	 *   ボタンを押したときだけ読む（サーバー側も 5 秒は直近の結果を使い回す）。
 	 * - 設定: `PUT .../clock-sync`。接続の「保存」（保留キュー・適用）とは別に**即時に保存**される。
@@ -233,7 +233,7 @@
 		if (running || !settingsMatch) return;
 		if (
 			!window.confirm(
-				`接続「${connectionName}」の PLC の時計をこの PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
+				`接続「${connectionName}」の PLC の時計をHub の PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
 			)
 		) {
 			return;
@@ -273,7 +273,7 @@
 			<div class="test-result" data-testid="clock-read-result">
 				{#if readResult.result === 'ok' && readResult.plcTime !== null}
 					<div>PLC: {plcTimeText(readResult.plcTime)}</div>
-					<div>この PC: {plcTimeText(readResult.pcTime)}</div>
+					<div>Hub の PC: {plcTimeText(readResult.pcTime)}</div>
 					{#if readResult.offsetSeconds !== null}
 						<div>差: {formatOffset(readResult.offsetSeconds)}</div>
 					{/if}
@@ -349,8 +349,8 @@
 			{saving ? '保存中…' : '時計合わせの設定を保存'}
 		</button>
 		<p class="hint">
-			この設定は接続の「保存」とは別に、すぐに反映されます（保留中の変更・適用を通りません）。時刻はこの
-			PC の現地時刻です。Hub の停止中などで過ぎた回は後から実行しません。
+			この設定は接続の「保存」とは別に、すぐに反映されます（保留中の変更・適用を通りません）。時刻は
+			Hub の PC の現地時刻です。Hub の停止中などで過ぎた回は後から実行しません。
 		</p>
 		<p class="hint warn">
 			PLC 自身の SNTP・PLC のプログラム・GOT

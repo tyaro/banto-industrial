@@ -173,7 +173,7 @@ test.describe('PLC の時計（接続編集 Drawer）', () => {
 		expect(mock.clockGets).toBe(0);
 		await section.getByRole('button', { name: 'PLC の時計を読む' }).click();
 		await expect(section.getByText('PLC: 2026-11-07 10:00:03')).toBeVisible();
-		await expect(section.getByText('この PC: 2026-11-07 10:00:00')).toBeVisible();
+		await expect(section.getByText('Hub の PC: 2026-11-07 10:00:00')).toBeVisible();
 		await expect(section.getByText('差: +3 秒（PLC が進んでいる）')).toBeVisible();
 		await expect(section.getByText('差は ±1 秒の誤差があります')).toBeVisible();
 		expect(mock.clockGets).toBe(1);
