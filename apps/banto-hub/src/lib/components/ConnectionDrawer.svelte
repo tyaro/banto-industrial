@@ -887,7 +887,18 @@
 	}
 
 	async function handleSave(): Promise<void> {
-		if (!connection) return;
+		if (!connection || clockBusy) return;
+		// プロトコルを push・PostgreSQL にして保存すると「PLC の時計」の部品が消え、未保存の
+		// 時計合わせの設定が確認なしに失われる。ドライバのままなら部品は残るので確認しない。
+		if (
+			clockDirty &&
+			(form.protocol === PUSH_PROTOCOL || form.protocol === POSTGRES_PROTOCOL) &&
+			!window.confirm(
+				'時計合わせの設定の未保存の変更は破棄されます（プロトコルを変えると「PLC の時計」の欄はなくなります）。保存しますか？'
+			)
+		) {
+			return;
+		}
 		if (!validateBeforeSubmit()) return;
 		const secretChanges = [];
 		if (driver && connection.protocol === form.protocol) {
@@ -942,7 +953,7 @@
 	 * と事故になる。
 	 */
 	async function handleDelete(): Promise<void> {
-		if (!connection) return;
+		if (!connection || clockBusy) return;
 		// R2a-2e（§3.2）: push のブリッジが読んでいる postgres 接続は削除できない。
 		// 読み込み済みの一覧で分かるなら確認ダイアログより前に止める（サーバーも
 		// 同じ理由で断る - 一覧が古いときは下の catch に同じ趣旨の文言が来る）。
@@ -1635,15 +1646,25 @@
 					connectionName={savedConnection.name}
 					settingsMatch={diagnosticSettingsMatch}
 					savedKey={diagnosticSavedSignature}
+					hostBusy={saving || deleting}
 					bind:dirty={clockDirty}
 					bind:busy={clockBusy}
 				/>
 			{/if}
 			<div class="actions">
-				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>
+				<button
+					type="button"
+					onclick={handleSave}
+					disabled={saving || deleting || driversBlocking || clockBusy}
+				>
 					保存
 				</button>
-				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
+				<button
+					type="button"
+					class="danger"
+					onclick={handleDelete}
+					disabled={saving || deleting || clockBusy}
+				>
 					削除
 				</button>
 			</div>

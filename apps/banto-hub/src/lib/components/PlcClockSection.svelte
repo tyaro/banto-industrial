@@ -51,6 +51,7 @@
 		connectionName,
 		settingsMatch,
 		savedKey,
+		hostBusy,
 		// 親が読む出力用の bindable（この部品の中では書くだけ）。
 		// eslint-disable-next-line no-useless-assignment
 		dirty = $bindable(),
@@ -71,6 +72,11 @@
 		 * 変えて保存したら）前の PLC の読取り結果を捨てる。設定のフォーム・直近の結果は消さない。
 		 */
 		savedKey: string | null;
+		/**
+		 * 親が接続の保存・削除の最中か。その間は PLC に書く操作（設定の保存・手動の時計合わせ）を
+		 * 始めさせない（逆向きは親が `busy` で止める）。読取り（何も書かない）は止めない。
+		 */
+		hostBusy: boolean;
 		/** 時計合わせの設定に未保存の変更があるか（読み込んだ設定とフォームが違う）。 */
 		dirty?: boolean;
 		/** 設定の保存中・手動の時計合わせ中か（親は処理中の間 Drawer を閉じさせない）。 */
@@ -202,7 +208,7 @@
 
 	async function saveSettings(): Promise<void> {
 		// 読めていない既定値で上書き保存させない。
-		if (saving || loading || baseline === null) return;
+		if (saving || loading || baseline === null || hostBusy) return;
 		const parsed = validateClockSyncForm(form);
 		if (!parsed.ok) {
 			formErrors = parsed.errors;
@@ -230,7 +236,7 @@
 	}
 
 	async function runNow(): Promise<void> {
-		if (running || !settingsMatch) return;
+		if (running || !settingsMatch || hostBusy) return;
 		if (
 			!window.confirm(
 				`接続「${connectionName}」の PLC の時計を Hub の PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
@@ -248,6 +254,10 @@
 			if (isCurrent()) {
 				last = record;
 				lastVersion += 1;
+				// 合わせる前の読取り結果（と途中の読取り）は古い。「合わせた後の差」は直近の結果に出る。
+				readRequest += 1;
+				reading = false;
+				readResult = null;
 			}
 		} catch (err) {
 			if (isCurrent()) toastStore.push('error', errorMessage(err));
@@ -345,7 +355,12 @@
 				{#if formErrors.minute}<span class="err">{formErrors.minute}</span>{/if}
 			</div>
 		</div>
-		<button type="button" class="test-btn" onclick={saveSettings} disabled={settingsLocked}>
+		<button
+			type="button"
+			class="test-btn"
+			onclick={saveSettings}
+			disabled={settingsLocked || hostBusy}
+		>
 			{saving ? '保存中…' : '時計合わせの設定を保存'}
 		</button>
 		<p class="hint">
@@ -368,7 +383,7 @@
 			type="button"
 			class="test-btn danger"
 			onclick={runNow}
-			disabled={running || !settingsMatch}
+			disabled={running || !settingsMatch || hostBusy}
 		>
 			{running ? '時計合わせ中…' : '今すぐ PLC の時計を合わせる'}
 		</button>

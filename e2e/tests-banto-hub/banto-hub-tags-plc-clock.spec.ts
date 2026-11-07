@@ -429,4 +429,141 @@ test.describe('PLC の時計（接続編集 Drawer）', () => {
 		await drawer.getByRole('button', { name: '閉じる' }).click();
 		await expect(drawer).toBeHidden();
 	});
+
+	test('設定の保存（PUT）の待機中は接続の保存・削除を止める', async ({ page }) => {
+		const mock = await mockClock(page);
+		mock.holdPut();
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const save = drawer.getByRole('button', { name: '保存', exact: true });
+		const del = drawer.getByRole('button', { name: '削除', exact: true });
+		await expect(save).toBeEnabled();
+		await expect(del).toBeEnabled();
+		await section.getByLabel('時刻表で定期的に合わせる').check();
+		await section.getByRole('button', { name: '時計合わせの設定を保存' }).click();
+		const held = await mock.nextPut();
+		await expect(save).toBeDisabled();
+		await expect(del).toBeDisabled();
+		await held.fulfill({
+			json: { settings: { enabled: true, schedule: { kind: 'hourly', minute: 5 } }, last: null }
+		});
+		await expect(save).toBeEnabled();
+		await expect(del).toBeEnabled();
+	});
+
+	test('手動の時計合わせ（POST）の待機中は接続の保存・削除を止める', async ({ page }) => {
+		await mockClock(page, { postResult: okRecord });
+		let heldPost: Route | undefined;
+		await page.route('**/api/plc-connections/*/clock-sync', (route) => {
+			if (route.request().method() === 'POST') {
+				heldPost = route;
+				return;
+			}
+			void route.fallback();
+		});
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const save = drawer.getByRole('button', { name: '保存', exact: true });
+		const del = drawer.getByRole('button', { name: '削除', exact: true });
+		page.once('dialog', (dialog) => void dialog.accept());
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect.poll(() => heldPost !== undefined).toBe(true);
+		await expect(save).toBeDisabled();
+		await expect(del).toBeDisabled();
+		await heldPost!.fulfill({ json: okRecord });
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		await expect(save).toBeEnabled();
+		await expect(del).toBeEnabled();
+	});
+
+	test('接続の保存の待機中は時計の設定の保存と手動の時計合わせを止める', async ({ page }) => {
+		await mockClock(page);
+		let heldSave: Route | undefined;
+		await page.route(/\/api\/plc-connections\/\d+$/, (route) => {
+			if (route.request().method() === 'PUT') {
+				heldSave = route;
+				return;
+			}
+			void route.fallback();
+		});
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		const saveClock = section.getByRole('button', { name: '時計合わせの設定を保存' });
+		const run = section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' });
+		await expect(saveClock).toBeEnabled();
+		await expect(run).toBeEnabled();
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		await expect.poll(() => heldSave !== undefined).toBe(true);
+		await expect(saveClock).toBeDisabled();
+		await expect(run).toBeDisabled();
+		await heldSave!.continue();
+		await expect(page.getByText('更新しました')).toBeVisible();
+		await expect(saveClock).toBeEnabled();
+		await expect(run).toBeEnabled();
+	});
+
+	test('手動の時計合わせの後は、合わせる前の読取り結果を消し、直近の結果を出す', async ({
+		page
+	}) => {
+		await mockClock(page, {
+			clockResult: reading('2026-11-07T10:00:03', 3),
+			postResult: okRecord
+		});
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		await section.getByRole('button', { name: 'PLC の時計を読む' }).click();
+		await expect(section.getByTestId('clock-read-result')).toBeVisible();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		await expect(section.getByTestId('clock-read-result')).toHaveCount(0);
+	});
+
+	test('合わせる前に始めた読取りの遅れた応答は、手動の時計合わせの後に出さない', async ({
+		page
+	}) => {
+		const mock = await mockClock(page, { postResult: okRecord });
+		mock.holdClock();
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		await section.getByRole('button', { name: 'PLC の時計を読む' }).click();
+		const held = await mock.nextClock();
+		page.once('dialog', (dialog) => void dialog.accept());
+		await section.getByRole('button', { name: '今すぐ PLC の時計を合わせる' }).click();
+		await expect(section.getByText('PLC の時計を合わせました')).toBeVisible();
+		const response = page.waitForResponse((item) => item.request() === held.request());
+		await held.fulfill({ json: reading('2099-01-01T00:00:00', 42) });
+		await response;
+		await expect(section.getByRole('button', { name: 'PLC の時計を読む' })).toBeEnabled();
+		await expect(section.getByTestId('clock-read-result')).toHaveCount(0);
+	});
+
+	test('時計の未保存の設定があるときプロトコルを PostgreSQL にして保存すると確認し、拒否すれば保存しない', async ({
+		page
+	}) => {
+		await mockClock(page);
+		let saves = 0;
+		await page.route(/\/api\/plc-connections\/\d+$/, (route) => {
+			if (route.request().method() === 'PUT') {
+				saves += 1;
+				return route.abort();
+			}
+			return route.fallback();
+		});
+		const drawer = await openEditor(page, names[0]);
+		const section = drawer.getByRole('region', { name: 'PLC の時計' });
+		await section.getByLabel('時刻表で定期的に合わせる').check();
+		await drawer.getByLabel('プロトコル').selectOption({ value: 'postgres' });
+		const messages: string[] = [];
+		page.once('dialog', (dialog) => {
+			messages.push(dialog.message());
+			void dialog.dismiss();
+		});
+		await drawer.getByRole('button', { name: '保存', exact: true }).click();
+		await expect.poll(() => messages.length).toBe(1);
+		expect(messages[0]).toContain('時計合わせの設定の未保存の変更は破棄されます');
+		await page.waitForTimeout(300);
+		expect(saves).toBe(0);
+		await expect(section.getByLabel('時刻表で定期的に合わせる')).toBeChecked();
+	});
 });
