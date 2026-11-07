@@ -50,9 +50,12 @@
 		connectionId,
 		connectionName,
 		settingsMatch,
+		savedKey,
 		// 親が読む出力用の bindable（この部品の中では書くだけ）。
 		// eslint-disable-next-line no-useless-assignment
-		dirty = $bindable()
+		dirty = $bindable(),
+		// eslint-disable-next-line no-useless-assignment
+		busy = $bindable()
 	}: {
 		connectionId: number;
 		/** 確認ダイアログに出す、保存済みの接続名（フォームの未保存の名前ではない）。 */
@@ -63,8 +66,15 @@
 		 * 設定の保存（PUT）は接続 id に付くので止めない。
 		 */
 		settingsMatch: boolean;
+		/**
+		 * 保存済みの接続の接続先の署名（protocol・simulation・settings）。変わったら（接続先を
+		 * 変えて保存したら）前の PLC の読取り結果を捨てる。設定のフォーム・直近の結果は消さない。
+		 */
+		savedKey: string | null;
 		/** 時計合わせの設定に未保存の変更があるか（読み込んだ設定とフォームが違う）。 */
 		dirty?: boolean;
+		/** 設定の保存中・手動の時計合わせ中か（親は処理中の間 Drawer を閉じさせない）。 */
+		busy?: boolean;
 	} = $props();
 
 	function errorMessage(err: unknown): string {
@@ -132,8 +142,11 @@
 		}
 	}
 
+	// 親は保存のたびに接続のオブジェクトを作り直すので、prop の getter をそのまま追うと id が
+	// 同じでも effect が走り直して編集が消える。値が変わったときだけ通知する $derived を挟む。
+	const observedConnectionId = $derived(connectionId);
 	$effect(() => {
-		void connectionId;
+		void observedConnectionId;
 		untrack(() => {
 			generation += 1;
 			reset();
@@ -147,9 +160,27 @@
 	$effect(() => {
 		dirty = baseline !== null && isClockSyncFormDirty(baseline, form);
 	});
-	// 部品が消えた後に未保存の印を親へ残さない。
+	$effect(() => {
+		busy = saving || running;
+	});
+	// 部品が消えた後に未保存・処理中の印を親へ残さない。
 	$effect(() => () => {
 		dirty = false;
+		busy = false;
+	});
+
+	// 保存済みの接続先が変わったら、前の PLC の読取り結果（と途中の読取り）を捨てる。
+	let previousSavedKey: string | null | undefined;
+	$effect(() => {
+		const key = savedKey;
+		untrack(() => {
+			if (previousSavedKey !== undefined && key !== previousSavedKey) {
+				readResult = null;
+				readRequest += 1;
+				reading = false;
+			}
+			previousSavedKey = key;
+		});
 	});
 
 	async function readClock(): Promise<void> {

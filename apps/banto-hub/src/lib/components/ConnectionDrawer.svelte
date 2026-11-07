@@ -356,6 +356,8 @@
 	 * 閉じる確認（Esc・外側のクリック・×）にだけ足し、保存成功後の判定などには使わない。
 	 */
 	let clockDirty = $state(false);
+	/** 「PLC の時計」の設定の保存中・手動の時計合わせ中（処理中は閉じさせない）。 */
+	let clockBusy = $state(false);
 	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte` の `dirty` prop、×の破棄確認も）。 */
 	const dirty = $derived(formDirty || clockDirty);
 	let errors: Record<string, string> = $state({});
@@ -491,6 +493,7 @@
 		testState = blankTestState();
 		rangeDiagnostic = null;
 		clockDirty = false;
+		clockBusy = false;
 		dbTestState = blankDbTestState();
 		step = 1;
 		lastProtocol = form.protocol;
@@ -972,7 +975,7 @@
 	}
 
 	function isBusy(): boolean {
-		return saving || deleting || testState.testing || dbTestState.testing;
+		return saving || deleting || testState.testing || dbTestState.testing || clockBusy;
 	}
 
 	/**
@@ -1631,7 +1634,9 @@
 					connectionId={savedConnection.id}
 					connectionName={savedConnection.name}
 					settingsMatch={diagnosticSettingsMatch}
+					savedKey={diagnosticSavedSignature}
 					bind:dirty={clockDirty}
+					bind:busy={clockBusy}
 				/>
 			{/if}
 			<div class="actions">
