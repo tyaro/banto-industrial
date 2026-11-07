@@ -748,12 +748,17 @@ impl SlotShared {
         }
     }
 
-    /// 今の WS を `end` で閉じさせて登録を外す（無ければ何もしない）。
+    /// 今の WS を `end` で閉じさせて登録を外す（無ければ何もしない）。理由は登録の
+    /// `Mutex` を持ったまま送る: 登録が空なのを（同じ `Mutex` の下で）見て `NotCurrent` を
+    /// 返された WS は、その時点で必ず理由を受け取れる（`super::ws` の `Conn::run` は
+    /// `NotCurrent` のとき届いている理由を先に使う。PR #1067 の Codex P2）。
     fn end_ws(&self, end: WsEnd) {
-        if let Some(entry) = lock(&self.ws).take() {
+        let mut ws = lock(&self.ws);
+        if let Some(entry) = ws.take() {
             // 受け手（WS のループ）が既に終わっていれば届かないが、それで良い。
             let _ = entry.end.send(end);
         }
+        drop(ws);
     }
 
     /// `effect` を保持値に当て、知らせるなら `state` を送る。
@@ -1277,10 +1282,13 @@ impl IngestHub {
         };
         let id = self.next_ws_id.fetch_add(1, Ordering::Relaxed);
         let (end, ended) = oneshot::channel();
-        let previous = lock(&slot.shared.ws).replace(WsEntry { id, end, sender });
-        if let Some(previous) = previous {
+        // 前の WS への `Superseded` も登録の `Mutex` を持ったまま送る（[`SlotShared::end_ws`]
+        // と同じ理由）。
+        let mut ws = lock(&slot.shared.ws);
+        if let Some(previous) = ws.replace(WsEntry { id, end, sender }) {
             let _ = previous.end.send(WsEnd::Superseded);
         }
+        drop(ws);
         Ok((
             WsSession {
                 id,

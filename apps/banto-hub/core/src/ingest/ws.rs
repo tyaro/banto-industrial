@@ -119,6 +119,10 @@
 //! | 1013 | `backpressure` | 送信キューが満杯 | `backpressure` |
 //! | 1001 | `server_shutdown` | Hub の終了（`IngestHub::shutdown`。合図の後に開いた WS も upgrade の後すぐ） | `server_shutdown`（合図の後に開いた WS は監査しない） |
 //!
+//! `IngestHub` が閉じさせる行（`superseded`・`connection_*`・`server_shutdown`）は、受信の
+//! メッセージを先に処理して拒否（`NotCurrent`・接続が無い・無効）になっても、届いている
+//! 理由で閉じる（`prefer_pending_end`。理由は登録を外すのと同じ `Mutex` の下で送られる）。
+//!
 //! 1009 は tungstenite の読み取りの上限（`WebSocketUpgrade::max_message_size` /
 //! `max_frame_size`、256 KiB ちょうどは通る）が返すエラーで判定する。axum は
 //! tungstenite のエラーを `axum::Error` に包むだけで型を出さないので、表示の文
@@ -680,7 +684,7 @@ impl Conn {
                 },
             };
             if let Err(end) = step {
-                return end;
+                return prefer_pending_end(end, &mut session.ended);
             }
         }
     }
@@ -869,12 +873,29 @@ fn apply_refusal_end(refusal: ApplyRefusal) -> End {
     }
 }
 
-/// `apply_ws` / `ping_ws` の拒否で閉じる理由。`NotCurrent` は新しい WS に置き換えられた
-/// （commit が閉じさせた場合も、理由はすぐ `ended` に届くが、ここでは置き換えとして扱う）。
+/// `apply_ws` / `ping_ws` の拒否で閉じる理由。`NotCurrent` はここでは仮に `Superseded` とし、
+/// [`prefer_pending_end`] が `ended` に届いている本当の理由（`server_shutdown`・
+/// `connection_changed`・`connection_removed`・`superseded`）に置き換える。
 fn refusal_end(refusal: WsRefusal) -> End {
     match refusal {
         WsRefusal::NotCurrent => End::Hub(WsEnd::Superseded),
         WsRefusal::Refused(refusal) => apply_refusal_end(refusal),
+    }
+}
+
+/// 閉じる理由を決める最後の段（PR #1067 の Codex P2）: `select!` が `ended` より先に受信の
+/// メッセージを選び、`apply_ws` / `ping_ws` の拒否から理由を推した（`End::Hub(_)`。
+/// `NotCurrent` は仮の `Superseded`、接続が消えた・無効は `connection_removed` /
+/// `connection_changed`）とき、`IngestHub` が送った理由が `ended` に届いていればそれを使う
+/// （終了・置き換え・プロトコルの変更で、推した理由と違いうる）。`IngestHub` は登録を外す
+/// のと同じ `Mutex` の下で理由を送る（`SlotShared::end_ws`・`open_ws_session_from`）ので、
+/// `NotCurrent` を見た時点で理由は必ず届いている。届いていない（`ended` の腕で受け取り
+/// 済み、または `IngestHub` が閉じさせていない）ときは推した理由のまま。ほかの理由
+/// （再検証・背圧・上限・送り手の close）は置き換えない。
+fn prefer_pending_end(end: End, ended: &mut tokio::sync::oneshot::Receiver<WsEnd>) -> End {
+    match end {
+        End::Hub(_) => ended.try_recv().map(End::Hub).unwrap_or(end),
+        other => other,
     }
 }
 
@@ -895,6 +916,47 @@ pub fn sanitize_status(detail: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `NotCurrent`（仮の `Superseded`）は、`ended` に届いている理由で置き換える。届いて
+    /// いなければ仮の値のまま。ほかの理由は置き換えない。
+    #[test]
+    fn a_pending_end_reason_wins_over_the_not_current_placeholder() {
+        let not_current = refusal_end(WsRefusal::NotCurrent);
+        assert_eq!(not_current, End::Hub(WsEnd::Superseded));
+        for reason in [
+            WsEnd::ServerShutdown,
+            WsEnd::ConnectionChanged,
+            WsEnd::ConnectionRemoved,
+            WsEnd::Superseded,
+        ] {
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            tx.send(reason).unwrap();
+            assert_eq!(prefer_pending_end(not_current, &mut rx), End::Hub(reason));
+        }
+        let (_tx, mut rx) = tokio::sync::oneshot::channel::<WsEnd>();
+        assert_eq!(prefer_pending_end(not_current, &mut rx), not_current);
+        // 接続が消えたと推しても、commit が送った理由（プロトコルの変更）を使う。
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ConnectionChanged).unwrap();
+        assert_eq!(
+            prefer_pending_end(apply_refusal_end(ApplyRefusal::UnknownConnection), &mut rx),
+            End::Hub(WsEnd::ConnectionChanged)
+        );
+        // `ended` の腕で受け取り済みなら、その理由のまま。
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ServerShutdown).unwrap();
+        assert_eq!(rx.try_recv(), Ok(WsEnd::ServerShutdown));
+        assert_eq!(
+            prefer_pending_end(End::Hub(WsEnd::ServerShutdown), &mut rx),
+            End::Hub(WsEnd::ServerShutdown)
+        );
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        tx.send(WsEnd::ServerShutdown).unwrap();
+        assert_eq!(
+            prefer_pending_end(End::Backpressure, &mut rx),
+            End::Backpressure
+        );
+    }
 
     /// close コードの表（モジュールの doc）。
     #[test]
@@ -918,6 +980,12 @@ mod tests {
                 End::Hub(WsEnd::ConnectionRemoved),
                 Some((1008, "connection_removed")),
                 "connection_removed",
+                None,
+            ),
+            (
+                End::Hub(WsEnd::ServerShutdown),
+                Some((1001, "server_shutdown")),
+                "server_shutdown",
                 None,
             ),
             (

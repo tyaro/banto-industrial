@@ -1244,6 +1244,56 @@ async fn push_tags_report_the_push_value_source() {
 
 // --- WebSocket の登録（R2a-2d、モジュールの doc「WebSocket の 1 本の制限」） -------
 
+/// 閉じさせられた WS が理由を受け取る前に値・`ping` を送っても（`NotCurrent`）、理由は
+/// その時点で `ended` に届いている（登録を外すのと同じ `Mutex` の下で送る。PR #1067 の
+/// Codex P2）。置き換え・commit の無効化・終了の 3 つで確かめる。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn not_current_always_finds_the_end_reason_pending() {
+    let env = env("ingest-ws-not-current").await;
+    let conn = env.push_connection("P", None).await;
+    let group = env.group(conn, "g", 1000).await;
+    env.tag(group, "t", "k", "f32").await;
+    env.commit().await;
+    let hub = env.ingest.clone();
+
+    // 置き換え。
+    let (mut first, _) = hub.open_ws_session(conn).unwrap();
+    let (mut second, _) = hub.open_ws_session(conn).unwrap();
+    assert_eq!(
+        hub.ping_ws(&first, None, env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(first.ended.try_recv(), Ok(WsEnd::Superseded));
+
+    // commit の無効化: 拒否は接続の無効（`ConnectionDisabled`）が先だが、理由は届いている。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 0 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    assert_eq!(
+        hub.apply_ws(&second, None, &[value("k", 1.0)], env.now_ms()),
+        Err(WsRefusal::Refused(ApplyRefusal::ConnectionDisabled))
+    );
+    assert_eq!(second.ended.try_recv(), Ok(WsEnd::ConnectionChanged));
+
+    // 終了。
+    env.sql(&format!(
+        "UPDATE plc_connections SET enabled = 1 WHERE id = {conn}"
+    ))
+    .await;
+    env.commit().await;
+    let (mut third, _) = hub.open_ws_session(conn).unwrap();
+    hub.shutdown();
+    assert_eq!(
+        hub.ping_ws(&third, Some("s".into()), env.now_ms()),
+        Err(WsRefusal::NotCurrent)
+    );
+    assert_eq!(third.ended.try_recv(), Ok(WsEnd::ServerShutdown));
+    drop((first, second, third));
+    env.finish().await;
+}
+
 /// Hub の終了の合図（`IngestHub::shutdown`）: 開いている WS に `ServerShutdown` が届いて
 /// 登録が外れ、以後の登録は `WsOpenRefusal::ServerShutdown` で断る。2 回目の合図も同じ。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
