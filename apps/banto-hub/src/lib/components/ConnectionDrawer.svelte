@@ -119,6 +119,7 @@
 		type PlcConnectionTestResult
 	} from '#lib/banto/tagRegistryAdmin.js';
 	import DriverSettingsForm from '#lib/components/DriverSettingsForm.svelte';
+	import PlcClockSection from '#lib/components/PlcClockSection.svelte';
 	import {
 		REQUIRED_MESSAGE,
 		isSecretFormValue,
@@ -347,8 +348,18 @@
 	 * 時点の最新値を読めれば十分。
 	 */
 	let baseline: PlcConnectionFormState = blankConnectionForm([]);
-	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte`/`Modal.svelte` の `dirty` prop）。 */
-	const dirty = $derived(isFormDirty(baseline, form));
+	/** フォームの未保存の変更（新規作成の Modal の `dirty` と、`dirty` の一部）。 */
+	const formDirty = $derived(isFormDirty(baseline, form));
+	/**
+	 * 「PLC の時計」の設定の未保存の変更（`PlcClockSection` の `bind:dirty`）。接続の「保存」は
+	 * これを保存しない（別の REST で即時に保存する）ので、`formDirty` とは別に持つ。
+	 * 閉じる確認（Esc・外側のクリック・×）にだけ足し、保存成功後の判定などには使わない。
+	 */
+	let clockDirty = $state(false);
+	/** 「PLC の時計」の設定の保存中・手動の時計合わせ中（処理中は閉じさせない）。 */
+	let clockBusy = $state(false);
+	/** `dirty` の間は Esc・オーバーレイクリックで閉じない（`Drawer.svelte` の `dirty` prop、×の破棄確認も）。 */
+	const dirty = $derived(formDirty || clockDirty);
 	let errors: Record<string, string> = $state({});
 	let saving = $state(false);
 	let deleting = $state(false);
@@ -481,6 +492,8 @@
 		driverErrors = {};
 		testState = blankTestState();
 		rangeDiagnostic = null;
+		clockDirty = false;
+		clockBusy = false;
 		dbTestState = blankDbTestState();
 		step = 1;
 		lastProtocol = form.protocol;
@@ -874,7 +887,18 @@
 	}
 
 	async function handleSave(): Promise<void> {
-		if (!connection) return;
+		if (!connection || clockBusy) return;
+		// プロトコルを push・PostgreSQL にして保存すると「PLC の時計」の部品が消え、未保存の
+		// 時計合わせの設定が確認なしに失われる。ドライバのままなら部品は残るので確認しない。
+		if (
+			clockDirty &&
+			(form.protocol === PUSH_PROTOCOL || form.protocol === POSTGRES_PROTOCOL) &&
+			!window.confirm(
+				'時計合わせの設定の未保存の変更は破棄されます（プロトコルを変えると「PLC の時計」の欄はなくなります）。保存しますか？'
+			)
+		) {
+			return;
+		}
 		if (!validateBeforeSubmit()) return;
 		const secretChanges = [];
 		if (driver && connection.protocol === form.protocol) {
@@ -929,7 +953,7 @@
 	 * と事故になる。
 	 */
 	async function handleDelete(): Promise<void> {
-		if (!connection) return;
+		if (!connection || clockBusy) return;
 		// R2a-2e（§3.2）: push のブリッジが読んでいる postgres 接続は削除できない。
 		// 読み込み済みの一覧で分かるなら確認ダイアログより前に止める（サーバーも
 		// 同じ理由で断る - 一覧が古いときは下の catch に同じ趣旨の文言が来る）。
@@ -962,7 +986,7 @@
 	}
 
 	function isBusy(): boolean {
-		return saving || deleting || testState.testing || dbTestState.testing;
+		return saving || deleting || testState.testing || dbTestState.testing || clockBusy;
 	}
 
 	/**
@@ -1535,7 +1559,7 @@
 		{onRequestClose}
 		onclose={onClose}
 		width="560px"
-		{dirty}
+		dirty={formDirty}
 		onBlockedClose={notifyBlockedClose}
 		{focusFallback}
 	>
@@ -1613,11 +1637,34 @@
 				{@render testConnectionBlock()}
 				{@render rangeDiagnosticBlock()}
 			{/if}
+			<!-- 出すかどうかは、フォームの途中のプロトコルでなく保存済みの接続で決める（プロトコルを
+			     一時的に替えても部品を壊さず、時計合わせの未保存の編集を消さない）。ドライバ一覧の
+			     読込み中に消えないよう、`drivers` は見ない。 -->
+			{#if savedConnection && savedConnection.protocol !== PUSH_PROTOCOL && savedConnection.protocol !== POSTGRES_PROTOCOL}
+				<PlcClockSection
+					connectionId={savedConnection.id}
+					connectionName={savedConnection.name}
+					settingsMatch={diagnosticSettingsMatch}
+					savedKey={diagnosticSavedSignature}
+					hostBusy={saving || deleting}
+					bind:dirty={clockDirty}
+					bind:busy={clockBusy}
+				/>
+			{/if}
 			<div class="actions">
-				<button type="button" onclick={handleSave} disabled={saving || deleting || driversBlocking}>
+				<button
+					type="button"
+					onclick={handleSave}
+					disabled={saving || deleting || driversBlocking || clockBusy}
+				>
 					保存
 				</button>
-				<button type="button" class="danger" onclick={handleDelete} disabled={saving || deleting}>
+				<button
+					type="button"
+					class="danger"
+					onclick={handleDelete}
+					disabled={saving || deleting || clockBusy}
+				>
 					削除
 				</button>
 			</div>
