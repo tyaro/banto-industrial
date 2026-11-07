@@ -261,6 +261,26 @@ pub trait FrameConnection: Send + 'static {
         Err(FatalError::Protocol("range diagnostics unsupported".into()))
     }
 
+    /// Optional PLC clock set on this physical connection (WIT `clock-v1`).
+    /// Legacy drivers keep their existing read/write behavior without it.
+    fn supports_clock(&self) -> bool {
+        false
+    }
+
+    /// One bounded clock-set step. The first call gets
+    /// `prev_response = None`, every later call the previous step's response
+    /// and the same `time`, until [`ClockProgress::Done`](crate::ClockProgress).
+    /// The engine caps the steps, keeps the entire sequence exclusive on the
+    /// connection and closes it if a send is abandoned. The default refuses
+    /// with [`FatalError::Protocol`].
+    fn set_clock_next(
+        &mut self,
+        _time: &crate::CivilTime,
+        _prev_response: Option<&[u8]>,
+    ) -> Result<crate::ClockProgress, FatalError> {
+        Err(FatalError::Protocol("clock set unsupported".into()))
+    }
+
     /// The handshake, one step at a time (WIT `handshake-next`). First call
     /// `None`, then the previous step's response; return `Ok(None)` when
     /// done. A refusal is `Err` (the connection is not considered up).
@@ -390,6 +410,16 @@ mod tests {
         assert_eq!(c.farewell(), None);
         assert!(matches!(
             c.write_next(&[], None),
+            Err(FatalError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn defaults_have_no_clock_contract() {
+        let mut c: Box<dyn FrameConnection> = Box::new(ReadOnly);
+        assert!(!c.supports_clock());
+        assert!(matches!(
+            c.set_clock_next(&crate::CivilTime::new(2026, 11, 7, 9, 5, 30), None),
             Err(FatalError::Protocol(_))
         ));
     }

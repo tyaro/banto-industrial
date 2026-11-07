@@ -205,8 +205,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_driver_api::{
-    ConnectContext, DiagnosticReport, DriverKind, DriverRegistry, FatalError, ItemError, Session,
-    SessionDriver, Settings, TagSpec, Value, WordOrder, WriteItem,
+    CivilTime, ConnectContext, DiagnosticReport, DriverKind, DriverRegistry, FatalError, ItemError,
+    Session, SessionDriver, Settings, TagSpec, Value, WordOrder, WriteItem,
 };
 pub use banto_driver_engine::sim::SimDevice;
 use banto_tags::PlcConnection;
@@ -328,6 +328,15 @@ pub fn write_job_limit(items: usize, response: Duration) -> Duration {
 /// The frame engine independently caps the exchange at 16 steps.
 pub fn diagnostic_job_limit(response: Duration) -> Duration {
     steps_limit(16, response)
+}
+
+/// The outer bound on one clock set (WIT `clock-v1`): `8 × 2T + 1 s`, the
+/// frame engine's own step cap ([`banto_driver_engine::MAX_CLOCK_STEPS`]).
+/// Running out of it is fatal like any job: the session is dropped and
+/// re-dialed, and the clock set is never retried by the broker (the outcome
+/// is unknown; the clock may already have changed).
+pub fn clock_job_limit(response: Duration) -> Duration {
+    steps_limit(banto_driver_engine::MAX_CLOCK_STEPS, response)
 }
 
 fn steps_limit(steps: usize, response: Duration) -> Duration {
@@ -620,7 +629,7 @@ pub enum BrokerError {
 /// One thing a broker task can be asked to do, paired with where to send the
 /// result. Read and Diagnose are read-only; this is the read/write safety boundary a
 /// caller relies on: a caller that only ever gets a [`ReadOnlyHandle`] can
-/// never construct a `Write` job.
+/// never construct a `Write` or `SetClock` job.
 enum Job {
     RefreshDiagnostic {
         respond_to: oneshot::Sender<Result<(), BrokerError>>,
@@ -651,6 +660,11 @@ enum Job {
         items: Vec<WriteItem>,
         respond_to: oneshot::Sender<WriteOutcome>,
     },
+    /// Writes the PLC clock, so only a full [`BrokerHandle`] can send it.
+    SetClock {
+        time: CivilTime,
+        respond_to: oneshot::Sender<ClockOutcome>,
+    },
 }
 
 /// What a read job answers: one result per spec, in order.
@@ -661,6 +675,12 @@ pub type WriteOutcome = Result<Vec<Result<(), ItemError>>, BrokerError>;
 
 /// `None` means this session driver does not implement diagnostics.
 pub type DiagnosticOutcome = Result<Option<DiagnosticReport>, BrokerError>;
+
+/// What a clock-set job answers. `Ok(None)`: this connection's driver has no
+/// clock contract (or may not write), nothing was sent. `Ok(Some(Err))`: the
+/// driver or device refused; the session is kept. `Err(ConnectionFailed)`:
+/// fatal, including the outer bound - the outcome is unknown.
+pub type ClockOutcome = Result<Option<Result<(), ItemError>>, BrokerError>;
 
 /// Observable connection state for one broker task's session (I6 T2-1
 /// addition, 2026-08-05) - see the module doc's "Connection status
@@ -877,9 +897,29 @@ impl BrokerHandle {
         })?
     }
 
+    /// Set the PLC clock to `time` (WIT `clock-v1`) as one job. Jobs run one
+    /// at a time on the connection's task, so the whole procedure is
+    /// exclusive with reads, writes and diagnostics on the same session. The
+    /// job is bounded by [`clock_job_limit`]; a fatal failure or the bound
+    /// drops the session (reconnect with backoff) and is never retried here.
+    /// Fails fast with [`BrokerError::Disconnected`] if the session is down.
+    /// Not on [`ReadOnlyHandle`]: it writes to the PLC.
+    pub async fn set_clock(&self, time: CivilTime) -> ClockOutcome {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(Job::SetClock { time, respond_to })
+            .await
+            .map_err(|_| BrokerError::TaskGone {
+                connection_id: self.connection_id,
+            })?;
+        rx.await.map_err(|_| BrokerError::TaskGone {
+            connection_id: self.connection_id,
+        })?
+    }
+
     /// A read-only view of this handle - clonable, structurally incapable of
-    /// submitting a write (there is no `write` method on [`ReadOnlyHandle`]
-    /// at all).
+    /// submitting a write (there is no `write` or `set_clock` method on
+    /// [`ReadOnlyHandle`] at all).
     pub fn read_only(&self) -> ReadOnlyHandle {
         ReadOnlyHandle {
             inner: self.clone(),
@@ -1010,6 +1050,9 @@ pub fn spawn_test_handle_with_status(
                 }
                 Job::Write { items, respond_to } => {
                     let _ = respond_to.send(Ok(items.iter().map(|_| Ok(())).collect()));
+                }
+                Job::SetClock { respond_to, .. } => {
+                    let _ = respond_to.send(Ok(None));
                 }
             }
         }
@@ -1885,6 +1928,20 @@ async fn run_broker_task(
                                     session.write_batch(&items),
                                 )
                                 .await,
+                            ),
+                            _ => None,
+                        };
+                        answer(connection_id, respond_to, outcome)
+                    }
+                    Job::SetClock { time, respond_to } => {
+                        let outcome = match &mut state {
+                            ConnState::Connected(session) => Some(
+                                tokio::time::timeout(
+                                    clock_job_limit(timeouts.response),
+                                    session.set_clock(time),
+                                )
+                                .await
+                                .unwrap_or(Err(FatalError::Timeout)),
                             ),
                             _ => None,
                         };
@@ -2854,6 +2911,80 @@ mod tests {
         // The session was dropped and re-dialed: it answers again.
         plc.set_behaviour(Behaviour::Prompt);
         wait_connected(&handle).await;
+        assert_eq!(
+            handle.read(vec![rspec("D0", DataType::U16)]).await,
+            Ok(vec![Ok(Value::F64(0.0))])
+        );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// A clock set is one job on the connected session; the driver's answer
+    /// (here `Some(Ok(()))`) is passed through and the session is kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_set_passes_the_drivers_result_through_and_keeps_the_session() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+        let time = CivilTime::new(2026, 11, 7, 9, 5, 30);
+        assert_eq!(handle.set_clock(time).await, Ok(Some(Ok(()))));
+        assert_eq!(plc.clock_sets(), vec![time]);
+        assert_eq!(
+            *handle.status_watch().borrow(),
+            BrokerConnectionStatus::Connected
+        );
+        assert_eq!(
+            handle.read(vec![rspec("D0", DataType::U16)]).await,
+            Ok(vec![Ok(Value::F64(0.0))])
+        );
+        drop(handle);
+        let _ = task.join_handle.await;
+    }
+
+    /// A clock set that never finishes is cut at `clock_job_limit` as a
+    /// timeout; the session is dropped and re-dialed, and the broker does not
+    /// send the clock set again by itself. While the session is down a clock
+    /// set fails fast as `Disconnected`.
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_set_that_never_finishes_is_fatal_and_not_retried() {
+        let plc = FakePlc::new();
+        let timeouts = SessionTimeouts {
+            connect: Duration::from_secs(3),
+            response: T,
+        };
+        let (handle, task, _shutdown) = spawn_task(plc.connector(), quick_backoff(), timeouts);
+        wait_connected(&handle).await;
+        assert_eq!(clock_job_limit(T), T * 2 * 8 + JOB_SLACK);
+
+        plc.set_behaviour(Behaviour::Hang);
+        plc.refuse_connections(true);
+        let time = CivilTime::new(2026, 11, 7, 9, 5, 30);
+        let started = Instant::now();
+        let got = handle.set_clock(time).await;
+        assert_eq!(
+            got,
+            Err(BrokerError::ConnectionFailed {
+                connection_id: 1,
+                reason: FatalError::Timeout.to_string(),
+            })
+        );
+        assert_eq!(started.elapsed(), clock_job_limit(T));
+        assert!(plc.clock_sets().is_empty());
+        assert_eq!(
+            handle.set_clock(time).await,
+            Err(BrokerError::Disconnected { connection_id: 1 })
+        );
+
+        // Reconnects with backoff; nothing re-sends the clock set.
+        plc.set_behaviour(Behaviour::Prompt);
+        plc.refuse_connections(false);
+        wait_connected(&handle).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(plc.clock_sets().is_empty());
         assert_eq!(
             handle.read(vec![rspec("D0", DataType::U16)]).await,
             Ok(vec![Ok(Value::F64(0.0))])

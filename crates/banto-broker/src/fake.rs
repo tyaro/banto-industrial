@@ -69,6 +69,7 @@ struct State {
     fail_next_call: bool,
     behaviour: Behaviour,
     hang_disconnect: bool,
+    clock_sets: Vec<banto_driver_api::CivilTime>,
 }
 
 /// The fake device - see the module doc. Cheap to clone (`Arc`); every clone
@@ -106,6 +107,12 @@ impl FakePlc {
     /// How reads and writes run from now on.
     pub(crate) fn set_behaviour(&self, behaviour: Behaviour) {
         self.lock().behaviour = behaviour;
+    }
+
+    /// Every time a session of this device was asked to set the clock (after
+    /// any injected fatal error and the configured behaviour).
+    pub(crate) fn clock_sets(&self) -> Vec<banto_driver_api::CivilTime> {
+        self.lock().clock_sets.clone()
     }
 
     /// While `true`, `disconnect` never finishes.
@@ -232,6 +239,21 @@ impl Session for FakeSession {
                 results.pop();
             }
             Ok(results)
+        })
+    }
+
+    fn set_clock<'a>(
+        &'a mut self,
+        time: banto_driver_api::CivilTime,
+    ) -> BoxFuture<'a, Result<Option<Result<(), ItemError>>, FatalError>> {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            if let Some(err) = self.plc.take_fatal() {
+                return Err(err);
+            }
+            self.plc.run_behaviour().await?;
+            self.plc.lock().clock_sets.push(time);
+            Ok(Some(Ok(())))
         })
     }
 

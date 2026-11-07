@@ -26,6 +26,12 @@ pub(crate) mod diagnostics_v1 {
     wasmtime::component::bindgen!({ path: "wit", world: "driver-with-diagnostics-v1" });
 }
 
+/// Optional PLC clock set (H), bound to the same instance and connection
+/// resource. The small world has only `session` and `clock-v1`.
+pub(crate) mod clock_v1 {
+    wasmtime::component::bindgen!({ path: "wit", world: "driver-with-clock-v1" });
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeCause {
     Trap,
@@ -123,6 +129,7 @@ pub struct Instance {
     pub driver: Driver,
     pub write_driver: Option<write_v1::DriverWithWriteV1>,
     pub diagnostic_driver: Option<diagnostics_v1::DriverWithDiagnosticsV1>,
+    pub clock_driver: Option<clock_v1::DriverWithClockV1>,
 }
 
 pub struct Runtime {
@@ -130,6 +137,7 @@ pub struct Runtime {
     component: Component,
     write_requested: bool,
     diagnostics_available: bool,
+    clock_available: bool,
     diagnostics: Diagnostics,
     ticking: Arc<AtomicBool>,
     ticker: Option<std::thread::JoinHandle<()>>,
@@ -143,6 +151,9 @@ impl Runtime {
         let component = Component::new(&engine, bytes).map_err(|e| classify("compile", e))?;
         let diagnostics_available = component
             .get_export_index(None, "banto:driver/diagnostics-v1@1.0.0")
+            .is_some();
+        let clock_available = component
+            .get_export_index(None, "banto:driver/clock-v1@1.0.0")
             .is_some();
         let ticking = Arc::new(AtomicBool::new(true));
         let tick_enabled = ticking.clone();
@@ -158,6 +169,7 @@ impl Runtime {
             component,
             write_requested,
             diagnostics_available,
+            clock_available,
             diagnostics: Diagnostics(Arc::new(Mutex::new(VecDeque::new()))),
             ticking,
             ticker: Some(ticker),
@@ -170,6 +182,12 @@ impl Runtime {
 
     pub fn diagnostics_available(&self) -> bool {
         self.diagnostics_available
+    }
+
+    /// Whether the component exports `clock-v1`. Whether the Host offers it
+    /// is decided by the loader (only the operational write loader).
+    pub fn clock_available(&self) -> bool {
+        self.clock_available
     }
 
     pub fn instantiate(&self) -> Result<Instance, RuntimeError> {
@@ -204,11 +222,17 @@ impl Runtime {
             .then(|| diagnostics_v1::DriverWithDiagnosticsV1::new(&mut store, &component_instance))
             .transpose()
             .map_err(|e| self.record("bind-diagnostics-v1", e))?;
+        let clock_driver = self
+            .clock_available
+            .then(|| clock_v1::DriverWithClockV1::new(&mut store, &component_instance))
+            .transpose()
+            .map_err(|e| self.record("bind-clock-v1", e))?;
         Ok(Instance {
             store,
             driver,
             write_driver,
             diagnostic_driver,
+            clock_driver,
         })
     }
 

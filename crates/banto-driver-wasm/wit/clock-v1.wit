@@ -1,0 +1,31 @@
+// Optional PLC clock set (H). Only a guest that knows a connection's clock
+// procedure exports it; every existing interface and world is unchanged.
+interface clock-v1 {
+  use types.{item-error, fatal-error};
+  use session.{connection, step};
+
+  // Local civil date and time chosen by the Host. The guest derives the
+  // day of the week from the date.
+  record civil-time { year: u16, month: u8, day: u8, hour: u8, minute: u8, second: u8 }
+  variant clock-progress { send(step), done(result<_, item-error>) }
+
+  // Call with no response to start. If send is returned, pass its single
+  // response with the same time. Abandoning a send requires closing conn.
+  set-clock-next: func(conn: borrow<connection>, time: civil-time, prev-response: option<list<u8>>)
+    -> result<clock-progress, fatal-error>;
+}
+
+world driver-with-write-diagnostics-and-clock-v1 {
+  export session;
+  export read;
+  export address;
+  export config;
+  export write-v1;
+  export diagnostics-v1;
+  export clock-v1;
+}
+// The Host binds this small world to find out whether clock-v1 is exported.
+world driver-with-clock-v1 {
+  export session;
+  export clock-v1;
+}

@@ -756,10 +756,14 @@ jobs:
           # labels (@Name, area @, no index) with 041C and writes them with a
           # 041C type check and one 141B on standard R only, under the new
           # label_write_allowlist (Hub gate: same grammar in banto-driver-wasm,
-          # string area @). WIT is unchanged.
-          $newSlmpSha = 'fc0bd1052015251d9833d89def71e514594960fc'
+          # string area @). WIT is unchanged. #76 (H) adds the optional
+          # clock-v1 (wit/clock-v1.wit): on a 0101-confirmed iQ-R, own station
+          # only, it writes SD210-SD216 and turns SM210 ON (guest gate
+          # clock_set); the Hub binds driver-with-clock-v1 and offers it only
+          # through the operational write loader.
+          $newSlmpSha = 'ea4d84cc1153a5e7316daaf50d648c7581e10bdb'
           Enter-GuestPin $newSlmpSha 'new SLMP guest'
-          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit')) {
+          foreach ($wit in @('write-v1.wit', 'diagnostics-v1.wit', 'clock-v1.wit')) {
             $guestBlob = git -C $guest rev-parse --verify "${newSlmpSha}:wit/$wit"
             $hostBlob = git rev-parse --verify "HEAD:crates/banto-driver-wasm/wit/$wit"
             if ($LASTEXITCODE -ne 0 -or $guestBlob -ne $hostBlob) {
@@ -785,6 +789,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component validation failed' }
           wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-and-diagnostics-v1
           if ($LASTEXITCODE -ne 0) { throw 'new SLMP component world mismatch' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-write-diagnostics-and-clock-v1
+          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component clock world mismatch' }
+          wasm-tools component targets 'crates/banto-driver-wasm/wit' $env:BANTO_SLMP_NEW_COMPONENT_WASM --world driver-with-clock-v1
+          if ($LASTEXITCODE -ne 0) { throw 'new SLMP component small clock world mismatch' }
           $env:BANTO_SLMP_OPERATIONAL_WRITE_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           $env:BANTO_SLMP_DIAGNOSTICS_COMPONENT_WASM = $env:BANTO_SLMP_NEW_COMPONENT_WASM
           # Component-level word-bit RMW: a confirm-read mismatch is
@@ -844,6 +852,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'SLMP G3 component tests failed' }
           if (-not (Select-String -Path $slmpG3Log -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
             throw 'SLMP G3 component tests did not all run'
+          }
+          # Component-level H (clock-v1 on iQ-R over 4E and 3E: the four exact
+          # requests, SM210/SM211 outcomes, end code, guest gate, standard Q
+          # and the read-only loader send nothing, a short response is fatal).
+          $slmpHLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-h-clock-test.txt'
+          cargo +1.98.1 test -p banto-driver-wasm --test slmp_h_clock --locked -- --ignored 2>&1 | Tee-Object -FilePath $slmpHLog
+          if ($LASTEXITCODE -ne 0) { throw 'SLMP H component tests failed' }
+          if (-not (Select-String -Path $slmpHLog -Pattern '^test result: ok\. 6 passed; 0 failed; 0 ignored;' -Quiet)) {
+            throw 'SLMP H component tests did not all run'
           }
           $newSlmpLog = Join-Path $env:RUNNER_TEMP 'wasm-slmp-44-hub-test.txt'
           cargo +1.98.1 test -p banto-hub-host --test t12_connection_test slmp_wasm_operational_write_test:: --locked -- --ignored 2>&1 | Tee-Object -FilePath $newSlmpLog
