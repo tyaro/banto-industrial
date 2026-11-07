@@ -70,6 +70,8 @@ struct State {
     behaviour: Behaviour,
     hang_disconnect: bool,
     clock_sets: Vec<banto_driver_api::CivilTime>,
+    clock_reading: Option<banto_driver_api::CivilTime>,
+    clock_reads: usize,
 }
 
 /// The fake device - see the module doc. Cheap to clone (`Arc`); every clone
@@ -113,6 +115,18 @@ impl FakePlc {
     /// any injected fatal error and the configured behaviour).
     pub(crate) fn clock_sets(&self) -> Vec<banto_driver_api::CivilTime> {
         self.lock().clock_sets.clone()
+    }
+
+    /// What a clock read answers from now on: `Some(time)` is the PLC's
+    /// clock, `None` (the default) is "no clock-read contract".
+    pub(crate) fn set_clock_reading(&self, reading: Option<banto_driver_api::CivilTime>) {
+        self.lock().clock_reading = reading;
+    }
+
+    /// How many clock reads a session of this device finished (after any
+    /// injected fatal error and the configured behaviour).
+    pub(crate) fn clock_reads(&self) -> usize {
+        self.lock().clock_reads
     }
 
     /// While `true`, `disconnect` never finishes.
@@ -254,6 +268,22 @@ impl Session for FakeSession {
             self.plc.run_behaviour().await?;
             self.plc.lock().clock_sets.push(time);
             Ok(Some(Ok(())))
+        })
+    }
+
+    fn read_clock(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Option<Result<banto_driver_api::CivilTime, ItemError>>, FatalError>>
+    {
+        Box::pin(async move {
+            tokio::task::yield_now().await;
+            if let Some(err) = self.plc.take_fatal() {
+                return Err(err);
+            }
+            self.plc.run_behaviour().await?;
+            let mut state = self.plc.lock();
+            state.clock_reads += 1;
+            Ok(state.clock_reading.map(Ok))
         })
     }
 

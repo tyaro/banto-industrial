@@ -21,6 +21,7 @@ struct Stats {
     conn_drops: AtomicUsize,
     writes: AtomicUsize,
     clock_calls: AtomicUsize,
+    clock_read_calls: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -154,6 +155,12 @@ struct Conn {
     clock_result: Result<(), ItemError>,
     /// `set_clock_next` が受け取った（時刻, 前の応答があったか）。
     clock_seen: Arc<Mutex<Vec<(CivilTime, bool)>>>,
+    clock_read_supported: bool,
+    clock_read_steps: usize,
+    clock_read_sent: usize,
+    clock_read_result: Result<CivilTime, ItemError>,
+    /// `read_clock_next` が受け取った「前の応答があったか」。
+    clock_read_seen: Arc<Mutex<Vec<bool>>>,
 }
 impl Conn {
     fn new(stats: Arc<Stats>) -> Self {
@@ -179,6 +186,11 @@ impl Conn {
             clock_sent: 0,
             clock_result: Ok(()),
             clock_seen: Arc::default(),
+            clock_read_supported: true,
+            clock_read_steps: 2,
+            clock_read_sent: 0,
+            clock_read_result: Ok(CLOCK_TIME),
+            clock_read_seen: Arc::default(),
         }
     }
     fn fail(&self, method: &str) -> Result<(), FatalError> {
@@ -258,6 +270,28 @@ impl FrameConnection for Conn {
         }
         self.clock_sent += 1;
         Ok(ClockProgress::Send(self.step.clone()))
+    }
+    fn supports_clock_read(&self) -> bool {
+        self.clock_read_supported
+    }
+    fn read_clock_next(
+        &mut self,
+        previous: Option<&[u8]>,
+    ) -> Result<ClockReadProgress, FatalError> {
+        self.stats.clock_read_calls.fetch_add(1, Ordering::SeqCst);
+        self.clock_read_seen
+            .lock()
+            .unwrap()
+            .push(previous.is_some());
+        self.fail("read_clock_next")?;
+        if previous.is_none() {
+            self.clock_read_sent = 0;
+        }
+        if self.clock_read_sent == self.clock_read_steps {
+            return Ok(ClockReadProgress::Done(self.clock_read_result.clone()));
+        }
+        self.clock_read_sent += 1;
+        Ok(ClockReadProgress::Send(self.step.clone()))
     }
     fn write_next(
         &mut self,
@@ -1401,4 +1435,153 @@ async fn clock_set_without_the_contract_or_write_capability_sends_nothing() {
     assert!(s.is_connected());
     assert_eq!(stats.clock_calls.load(Ordering::SeqCst), 0);
     assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn clock_read_runs_its_steps_and_keeps_the_connection() {
+    for steps in [0, 1, 2, MAX_CLOCK_READ_STEPS] {
+        let stats = Arc::<Stats>::default();
+        let events = Arc::<Recorder>::default();
+        let mut conn = Conn::new(stats.clone());
+        conn.clock_read_steps = steps;
+        let seen = conn.clock_read_seen.clone();
+        let mut s = session(conn, Wire::new(stats.clone()), events.clone());
+        assert_eq!(s.read_clock().await, Ok(Some(Ok(CLOCK_TIME))), "{steps}");
+        assert!(s.is_connected());
+        assert_eq!(stats.sends.load(Ordering::SeqCst), steps);
+        assert_eq!(stats.closes.load(Ordering::SeqCst), 0);
+        assert!(!events.has("C16"));
+        // 1 回目だけ応答なし。
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), steps + 1);
+        for (index, had_response) in seen.iter().enumerate() {
+            assert_eq!(*had_response, index > 0);
+        }
+        // 時計合わせは呼ばれない。後の読み取りは同じ接続で動く。
+        assert_eq!(stats.clock_calls.load(Ordering::SeqCst), 0);
+        assert!(s.read_batch(&[spec()]).await.unwrap()[0].is_ok());
+        assert_eq!(stats.sends.load(Ordering::SeqCst), steps + 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn clock_read_refusal_is_passed_through_and_keeps_the_connection() {
+    let stats = Arc::<Stats>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.clock_read_steps = 1;
+    conn.clock_read_result = Err(ItemError::Rejected("SM213 is OFF".into()));
+    let mut s = session(conn, Wire::new(stats.clone()), Arc::default());
+    for _ in 0..2 {
+        assert_eq!(
+            s.read_clock().await,
+            Ok(Some(Err(ItemError::Rejected("SM213 is OFF".into()))))
+        );
+        assert!(s.is_connected());
+    }
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 0);
+    // 2 回目も `None` から始まる（1 step ずつ）。
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 2);
+    assert!(s.read_batch(&[spec()]).await.unwrap()[0].is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clock_read_send_over_the_step_limit_is_fatal_and_closes_the_connection() {
+    let stats = Arc::<Stats>::default();
+    let events = Arc::<Recorder>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.clock_read_steps = MAX_CLOCK_READ_STEPS + 1;
+    let mut s = session(conn, Wire::new(stats.clone()), events.clone());
+    assert!(matches!(s.read_clock().await, Err(FatalError::Protocol(_))));
+    assert!(events.has("C16"));
+    assert_eq!(stats.sends.load(Ordering::SeqCst), MAX_CLOCK_READ_STEPS);
+    assert!(!s.is_connected());
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.transport_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.conn_drops.load(Ordering::SeqCst), 1);
+    assert!(s.read_batch(&[spec()]).await.is_err());
+    assert!(s.read_clock().await.is_err());
+    assert_eq!(stats.sends.load(Ordering::SeqCst), MAX_CLOCK_READ_STEPS);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_clock_read_driver_error_timeout_or_cancel_closes_the_connection() {
+    // ドライバの Err（送る前）。
+    let stats = Arc::<Stats>::default();
+    let events = Arc::<Recorder>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.error = Some(("read_clock_next", FatalError::Framing("short".into())));
+    let mut s = session(conn, Wire::new(stats.clone()), events.clone());
+    assert_eq!(
+        s.read_clock().await,
+        Err(FatalError::Framing("short".into()))
+    );
+    assert!(!s.is_connected());
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+    assert!(events.0.lock().unwrap().iter().any(|event| matches!(
+        event,
+        EngineEvent::DriverFatal {
+            method: "read_clock_next",
+            ..
+        }
+    )));
+    assert!(s.read_batch(&[spec()]).await.is_err());
+
+    // step の応答の期限切れ。
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = T * 2;
+    let mut s = session(Conn::new(stats.clone()), wire, Arc::default());
+    assert_eq!(s.read_clock().await, Err(FatalError::Timeout));
+    assert!(!s.is_connected());
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.closes.load(Ordering::SeqCst), 1);
+
+    // 外側のキャンセル（応答待ちの間に future を捨てる）。
+    let stats = Arc::<Stats>::default();
+    let mut wire = Wire::new(stats.clone());
+    wire.recv_delay = Duration::from_secs(1);
+    let mut s = session(Conn::new(stats.clone()), wire, Arc::default());
+    assert!(timeout(Duration::from_millis(5), s.read_clock())
+        .await
+        .is_err());
+    assert!(!s.is_connected());
+    assert_eq!(stats.transport_drops.load(Ordering::SeqCst), 1);
+    assert_eq!(stats.conn_drops.load(Ordering::SeqCst), 1);
+    assert!(s.read_clock().await.is_err());
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn clock_read_without_the_contract_sends_nothing_but_a_read_only_connection_reads() {
+    // `supports_clock_read` が偽。
+    let stats = Arc::<Stats>::default();
+    let mut conn = Conn::new(stats.clone());
+    conn.clock_read_supported = false;
+    let mut s = session(conn, Wire::new(stats.clone()), Arc::default());
+    assert_eq!(s.read_clock().await, Ok(None));
+    assert!(s.is_connected());
+    assert_eq!(stats.clock_read_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert!(s.read_batch(&[spec()]).await.unwrap()[0].is_ok());
+
+    // 書き込みの能力を持たないドライバ（`capabilities.write` が偽）でも読取りは出す
+    // （時計合わせは出さない）。
+    let stats = Arc::<Stats>::default();
+    let driver = Driver::new(Conn::new(stats.clone()), false);
+    let mut s = FrameSession::with_transport(
+        &driver,
+        &Settings::new(),
+        Box::new(Wire::new(stats.clone())),
+        T,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(s.set_clock(CLOCK_TIME).await, Ok(None));
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 0);
+    assert_eq!(s.read_clock().await, Ok(Some(Ok(CLOCK_TIME))));
+    assert!(s.is_connected());
+    assert_eq!(stats.clock_read_calls.load(Ordering::SeqCst), 3);
+    assert_eq!(stats.sends.load(Ordering::SeqCst), 2);
 }

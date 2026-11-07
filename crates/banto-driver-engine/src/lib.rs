@@ -3,7 +3,10 @@
 //! 接続と手順の途中の状態は 1 個の Core が所有する。操作中は Session から取り出し、
 //! 成功した時だけ戻すため、外側の future のキャンセルでも接続を再利用しない。
 //! 任意の診断（`diagnostics-v1`）と時計合わせ（`clock-v1`、`MAX_CLOCK_STEPS`）も同じ Core の
-//! 上で、読み書きと同じく 1 回ずつ排他に実行する。
+//! 上で、読み書きと同じく 1 回ずつ排他に実行する。時計の読取り（`clock-read-v1`、
+//! `MAX_CLOCK_READ_STEPS`、H3）も同じ。読取りは PLC に何も書かないので、時計合わせと違い
+//! 書けない接続（`capabilities.write` が偽）でも出す。上限超過・途中の致命・キャンセルで
+//! 接続を閉じるのは時計合わせと同じ。
 //! broker は Frame をこの Session で実行する。接続の外側期限は TCP 接続 +
 //! 32 step × response_timeout + CLOSE_TIMEOUT + ゆとりを含む。
 //! シリアルの同期（設計 §7.3）は #803 で行う（2026-10-23 に後回しにした）。
@@ -25,9 +28,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use banto_driver_api::{
-    BoxFuture, CivilTime, ClockProgress, ConnectContext, DiagnosticProgress, DiagnosticReport,
-    FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError, PrefixEncoding,
-    PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value, WriteItem, WriteProgress,
+    BoxFuture, CivilTime, ClockProgress, ClockReadProgress, ConnectContext, DiagnosticProgress,
+    DiagnosticReport, FatalError, FrameCheck, FrameConnection, FrameDriver, FrameRule, ItemError,
+    PrefixEncoding, PrefixSpec, RawValue, Session, Settings, Step, TagSpec, Value, WriteItem,
+    WriteProgress,
 };
 use tokio::time::{sleep_until, timeout, timeout_at, Instant};
 use transport::{Transport, TransportSpec};
@@ -37,6 +41,10 @@ pub const MAX_HANDSHAKE_STEPS: usize = 32;
 /// 契約違反（C16）として致命にし、接続を閉じる（結果は不明。自動では送り直さない）。
 /// SLMP の iQ-R の手順は最大 6 step（確認読みの 3 回を含む）。broker の外側の上限も同じ数で計る。
 pub const MAX_CLOCK_STEPS: usize = 8;
+/// 時計の読取り（WIT `clock-read-v1`、H3）1 回の step の上限。超える `Send` は時計合わせと同じく
+/// 契約違反（C16）として致命にし、接続を閉じる。SLMP の手順は 2 step（SM210–SM213 の確認と
+/// SD の読取り）。broker の外側の上限も同じ数で計る。
+pub const MAX_CLOCK_READ_STEPS: usize = 4;
 /// broker の停止の上限（2 秒）より短い、致命時の後始末の上限。
 pub const CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
 /// `inter_frame_gap` の上限。これを超える値はドライバの契約違反として、送信の前に
@@ -275,6 +283,31 @@ impl Session for FrameSession {
                 return Ok(None);
             }
             match core.set_clock(&time).await {
+                Ok(result) => {
+                    self.core = Some(core);
+                    Ok(Some(result))
+                }
+                Err(error) => {
+                    core.close().await;
+                    Err(error)
+                }
+            }
+        })
+    }
+
+    /// 時計の読取り。契約の無いドライバでは何も送らずに `None`。PLC に何も書かないので、
+    /// 書けない接続でも出す。手順の途中の失敗（致命・step 超過・期限切れ・外側のキャンセル）は
+    /// 時計合わせと同じく接続を閉じる。
+    fn read_clock(
+        &mut self,
+    ) -> BoxFuture<'_, Result<Option<Result<CivilTime, ItemError>>, FatalError>> {
+        Box::pin(async move {
+            let mut core = self.take_core()?;
+            if !core.conn.supports_clock_read() {
+                self.core = Some(core);
+                return Ok(None);
+            }
+            match core.read_clock().await {
                 Ok(result) => {
                     self.core = Some(core);
                     Ok(Some(result))
@@ -543,6 +576,33 @@ impl Core {
                     return Err(self.violation_fatal(
                         "C10",
                         format!("set_clock_next が未知の ClockProgress を返した: {other:?}"),
+                    ))
+                }
+            }
+        }
+        unreachable!()
+    }
+
+    async fn read_clock(&mut self) -> Result<Result<CivilTime, ItemError>, FatalError> {
+        let mut previous = None;
+        for step in 0..=MAX_CLOCK_READ_STEPS {
+            match self
+                .conn
+                .read_clock_next(previous.as_deref())
+                .map_err(|e| self.driver_fatal("read_clock_next", e))?
+            {
+                ClockReadProgress::Send(_) if step == MAX_CLOCK_READ_STEPS => {
+                    return Err(self.violation_fatal(
+                        "C16",
+                        format!("時計の読取りの手順が上限 {MAX_CLOCK_READ_STEPS} step を超えた"),
+                    ));
+                }
+                ClockReadProgress::Send(next) => previous = Some(self.exchange(&next).await?),
+                ClockReadProgress::Done(result) => return Ok(result),
+                other => {
+                    return Err(self.violation_fatal(
+                        "C10",
+                        format!("read_clock_next が未知の ClockReadProgress を返した: {other:?}"),
                     ))
                 }
             }

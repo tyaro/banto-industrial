@@ -1,6 +1,7 @@
 //! Explicit optional-export compatibility check with two pinned components.
-//! Both pins predate `clock-v1` (H): they still load through the operational
-//! write loader, and the clock set is not offered (`Ok(None)`, nothing sent).
+//! Both pins predate `clock-v1` (H) and `clock-read-v1` (H3): they still
+//! load through the operational write loader, and neither the clock set nor
+//! the clock read is offered (`Ok(None)`, nothing sent).
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -75,10 +76,12 @@ impl Transport for HandshakePeer {
     }
 }
 
-/// A component without `clock-v1`, connected through the real engine: the
-/// clock set is `Ok(None)` and sends nothing after the handshake.
+/// A component without `clock-v1` and `clock-read-v1`, connected through the
+/// real engine: the clock set and the clock read are `Ok(None)` and send
+/// nothing after the handshake.
 async fn assert_no_clock(component: &[u8]) {
     assert!(!connection(component).supports_clock());
+    assert!(!connection(component).supports_clock_read());
     let sent = Arc::new(Mutex::new(0));
     let driver = driver(component);
     let mut session = FrameSession::with_transport(
@@ -101,6 +104,7 @@ async fn assert_no_clock(component: &[u8]) {
             .await,
         Ok(None)
     );
+    assert_eq!(session.read_clock().await, Ok(None));
     assert_eq!(*sent.lock().unwrap(), handshake, "nothing sent");
     assert!(session.is_connected());
     assert!(matches!(
@@ -108,6 +112,10 @@ async fn assert_no_clock(component: &[u8]) {
             .connection_mut()
             .unwrap()
             .set_clock_next(&CivilTime::new(2026, 11, 7, 9, 5, 30), None),
+        Err(FatalError::Protocol(_))
+    ));
+    assert!(matches!(
+        session.connection_mut().unwrap().read_clock_next(None),
         Err(FatalError::Protocol(_))
     ));
 }
@@ -123,7 +131,8 @@ async fn optional_export_preserves_the_legacy_world_and_binds_the_new_world() {
     assert!(legacy.diagnose_next(&[], None).is_err());
     let current = connection(&new);
     assert!(current.supports_diagnostics());
-    // Neither pin exports clock-v1 (H): both still load and offer no clock set.
+    // Neither pin exports clock-v1 (H) or clock-read-v1 (H3): both still load
+    // and offer no clock set and no clock read.
     assert_no_clock(&old).await;
     assert_no_clock(&new).await;
 }
