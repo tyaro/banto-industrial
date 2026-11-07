@@ -233,7 +233,7 @@
 		if (running || !settingsMatch) return;
 		if (
 			!window.confirm(
-				`接続「${connectionName}」の PLC の時計をHub の PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
+				`接続「${connectionName}」の PLC の時計を Hub の PC の現地時刻に書き換えます。PLC 自身の SNTP・PLC のプログラム・GOT の時刻同期などが同じ時計を合わせていると互いに上書きします。実行のたびに PLC のイベント履歴に「時計設定」（イベントコード 24000）が残ります。実行しますか？`
 			)
 		) {
 			return;
