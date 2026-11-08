@@ -26,6 +26,11 @@ jobs:
   lock-abort-scm:
     runs-on: windows-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        case: [C-server-locked, C-acl-subdir]
     env:
       BANTO_973_SCM_TEST: github-hosted-disposable-only-v1
       BANTO_973_GUI_TEST: github-hosted-gui-capability-only-v1
@@ -90,15 +95,15 @@ jobs:
           if (-not $nsis) { throw 'makensis missing after fixed installation' }
           "BANTO_973_MAKENSIS=$nsis" >> $env:GITHUB_ENV
           @{ makensis_version=(& $nsis /VERSION | Out-String).Trim(); rustc=(& rustc --version | Out-String).Trim(); python=(& python --version | Out-String).Trim() } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $env:BANTO_973_SCM_ROOT 'proof/toolchain.json')
-      - name: Real SCM dummy + non-silent NSIS harness with locked server exe
-        run: python -B apps/chronogazer/installer/tests/nsis_lock_abort_scm.py --makensis $env:BANTO_973_MAKENSIS
+      - name: Real SCM dummy + non-silent NSIS harness (matrix case)
+        run: python -B apps/chronogazer/installer/tests/nsis_lock_abort_scm.py --makensis $env:BANTO_973_MAKENSIS --case ${{ matrix.case }}
       - name: Independently stop and remove this run's exact owned service
         if: always() && env.BANTO_973_SCM_ROOT != ''
         run: python -B apps/chronogazer/installer/tests/nsis_lock_abort_scm.py --cleanup-only
       - uses: actions/upload-artifact@v7
         if: always() && env.BANTO_973_SCM_ROOT != ''
         with:
-          name: installer-lock-abort-${{ github.run_id }}-${{ github.run_attempt }}
+          name: installer-lock-abort-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ env.BANTO_973_SCM_ROOT }}/proof/
             ${{ env.BANTO_973_GUI_ROOT }}/proof/

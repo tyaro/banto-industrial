@@ -1,4 +1,4 @@
-"""#973 lock-abort (case C-server-locked) on a REAL SCM, ONLY on disposable GitHub-hosted Windows runners.
+"""#973 lock-abort on a REAL SCM, ONLY on disposable GitHub-hosted Windows runners (--case selects one).
 
 Never invoke this orchestrator on a developer PC. The dedicated workflow
 (installer-lock-abort.yml) supplies both explicit opt-ins, the fresh RUNNER_TEMP root
@@ -6,18 +6,30 @@ and its marker, and the guarded running dummy at <root>\\dummy\\running_dummy.ex
 Importing this module or calling its pure helpers opens no SCM/User32 API.
 
 The real hooks run in a user/NON-silent NSIS harness (the main MessageBox must be
-really shown). chronogazer-server.exe in a fixture INSTDIR is held open with
+really shown). In both cases the dummy service stopped by the harness is restarted
+BEFORE the main dialog, stays RUNNING with the same new PID while the dialog is visible
+and after exit, and the non-silent .onInstFailed (flag 0) does not restart it a second
+time. Production hooks are not modified; nsis_delete_pending_scm.py is reused by
+import/subclass only.
+
+Case C-server-locked: chronogazer-server.exe in a fixture INSTDIR is held open with
 GENERIC_READ + FILE_SHARE_READ only (the same lock as nsis_precopy.py), so the real
-RequireChronoGazerInstallExesUnlocked aborts before any copy. Proven here: the dummy
-service stopped by the harness is restarted BEFORE the main dialog, stays RUNNING with
-the same new PID while the dialog is visible and after exit, and the non-silent
-.onInstFailed (flag 0) does not restart it a second time. LockFileEx range locks and
-image locks of a running exe are out of scope. Production hooks are not modified;
-nsis_delete_pending_scm.py is reused by import/subclass only.
+RequireChronoGazerInstallExesUnlocked aborts before any copy. LockFileEx range locks
+and image locks of a running exe are out of scope.
+
+Case C-acl-subdir: no lock. The INSTDIR holds a stray sub-folder, so after the real
+Stop -> RequireInactive the real ResetChronoGazerInstallDirAcl runs the real icacls on
+the root and the 4 files in front of it, then enters the real AbortInstallDirAcl on the
+sub-folder (INSTALL_DIR_COMMON_ON_ACL_ABORT restarts the dummy before the main dialog).
+Weak BU ACEs are put on chronogazer.exe, data.txt and the sub-folder beforehand and the
+explicit ACEs are read back with icacls /save before and after. Limit: this proves the
+sub-folder path only, NOT an icacls failure itself (a non-zero icacls exit is out of scope).
 """
 
 import argparse
 import ctypes as C
+from dataclasses import dataclass
+from typing import Callable
 from ctypes import wintypes as W
 import json
 import os
@@ -36,7 +48,6 @@ from nsis_delete_pending_scm import Trial, digest, write_json, has_install_proto
 import windows_gui_capability as gui
 from windows_gui_capability import API, capability_reasons, png_bytes
 
-CASE = "C-server-locked"
 SERVICE = "ChronoGazer"
 LOCKED_EXE = "chronogazer-server.exe"
 # 文面定数はここだけに置く（hooks の MessageBox の文面と一致させる。hooks 側は変更しない）。
@@ -64,10 +75,59 @@ ALLOWED_PPO = frozenset(SC_QUERIES + (SC_STOP, SC_START) + tuple(
     "System::Call 'kernel32::GetFinalPathNameByHandleW(p r3, w .r4, i 1024, i 0) i .r5'",
     "System::Call 'kernel32::CloseHandle(p r3)'",
 ))
+# C-acl-subdir だけに許す行（ResetInstallDirAcl 内の実物。install-dir-common.nsh と一致させる）。
+ACL_PPO_EXTRA = frozenset((
+    "nsExec::ExecToStack '\"$SYSDIR\\icacls.exe\" \"$4\" /setowner *S-1-5-32-544 /L /C /Q'",
+    "nsExec::ExecToStack '\"$SYSDIR\\icacls.exe\" \"$4\" /reset /L /C /Q'",
+    "System::Call 'kernel32::GetFileAttributesW(w r4) i .r5'",
+))
+ICACLS_ATTEMPTS = frozenset(line for line in ACL_PPO_EXTRA if line.startswith("nsExec::"))
 
 # 期待する events の並び（sc-query を除く）。数・順序・不在（copy-begins・他の dialog）を一度に見る。
 EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt", "main-dialog flag=0")
-EVENTS_FINAL = EVENTS_AT_DIALOG + ("callback-before flag=0", "callback-after flag=0")
+CALLBACK_EVENTS = ("callback-before flag=0", "callback-after flag=0")
+EVENTS_FINAL = EVENTS_AT_DIALOG + CALLBACK_EVENTS
+# C-acl-subdir: icacls は root と直下 4 ファイル（3 exe + data.txt）に setowner/reset の 2 回ずつ、サブフォルダの前で中止。
+ACL_EVENTS_AT_DIALOG = (("section-begins", "stop-attempt", "preinstall-done flag=1") + ("icacls-attempt",) * 10
+                        + ("restart-attempt", "main-dialog flag=0"))
+
+ACL_MAIN_FIXED = "の所有者・アクセス権を既定に戻せませんでした"
+ACL_REASON_TEXT = "インストール先の中にサブフォルダがあります"
+ACL_SUBDIR = "zz-unexpected-subdir"  # NTFS の列挙順で最後になる名前。
+WEAK_SID = "BU"
+WEAK_SID_ARG = "*S-1-5-32-545"
+ACL_STEP_CODE = "!insertmacro ResetChronoGazerInstallDirAcl\n"
+
+
+def lock_dialog_matches(text, install):
+    return text.startswith(MAIN_DIALOG_PREFIX)
+
+
+def acl_dialog_matches(text, install):
+    install = str(install)
+    return (text.startswith(f"インストール先 {install} {ACL_MAIN_FIXED}。") and ACL_REASON_TEXT in text
+            and f"対象: {install}\\{ACL_SUBDIR}" in text)
+
+
+@dataclass(frozen=True)
+class CaseSpec:
+    name: str
+    acl_step: bool          # ResetChronoGazerInstallDirAcl を差し込み、サブフォルダ + 弱い ACE を用意する。
+    lock_server: bool       # chronogazer-server.exe を READ 共有で開き続ける。
+    main_text: str          # PPO の MessageBox 行を main-dialog と分類する固定部分。
+    dialog_matches: Callable[[str, str], bool]  # (Static の文面, install) -> 主 dialog か。
+    events_at_dialog: tuple
+    events_final: tuple
+    allowed_ppo: frozenset
+
+
+CASES = {spec.name: spec for spec in (
+    CaseSpec("C-server-locked", False, True, MAIN_DIALOG_TEXT, lock_dialog_matches,
+             EVENTS_AT_DIALOG, EVENTS_FINAL, ALLOWED_PPO),
+    CaseSpec("C-acl-subdir", True, False, ACL_MAIN_FIXED, acl_dialog_matches,
+             ACL_EVENTS_AT_DIALOG, ACL_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO | ACL_PPO_EXTRA),
+)}
+LOCK_SPEC = CASES["C-server-locked"]
 
 TEMPLATE = r'''Unicode true
 RequestExecutionLevel user
@@ -91,6 +151,7 @@ Section
   !insertmacro StopServiceIfRunning "ChronoGazer" $ChronoGazerWasRunning
   !insertmacro RequireChronoGazerServiceInactive "インストール"
   @LOG_PREINSTALL@
+  @ACL_STEP@
   !insertmacro RequireChronoGazerInstallExesUnlocked
   @LOG_COPY@
   SetOutPath "$INSTDIR"
@@ -139,10 +200,54 @@ def binding_problems(binding, expected):
     return problems
 
 
-def dialog_kind(line):
+def apply_acl_step(script, spec):
+    """@ACL_STEP@ の行を spec に従って差し込む。lock ケースでは行ごと消し、従来の展開結果と同一にする。"""
+    return script.replace("  @ACL_STEP@\n", "  " + ACL_STEP_CODE if spec.acl_step else "")
+
+
+def explicit_ace_sids(sddl):
+    """SDDL の DACL にある ACE のうち、継承（flags に ID）でないものの SID の集合。"""
+    found = re.search(r'D:(?=P|A[IR]|N|\()', sddl)
+    if not found:
+        return set()
+    dacl = re.split(r'(?<=\))S:', sddl[found.start():], maxsplit=1)[0]
+    sids = set()
+    for ace in re.findall(r'\(([^()]*)\)', dacl):
+        fields = ace.split(";")
+        if len(fields) < 6:
+            continue
+        flags = [fields[1][i:i + 2] for i in range(0, len(fields[1]), 2)]
+        if "ID" not in flags:
+            sids.add(fields[5])
+    return sids
+
+
+def saved_sddl(raw):
+    """icacls /save の出力（UTF-16LE）。1 行目がパス、2 行目が SDDL。"""
+    text = raw.decode("utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else raw.decode("utf-16-le")
+    lines = text.replace("\r", "").split("\n")
+    require(len(lines) >= 2 and lines[1].strip(), "icacls_save_unparsable")
+    return lines[1].strip()
+
+
+def acl_problems(before, after):
+    """before/after: {label: 明示 ACE の SID 集合}。弱い BU が 2 ファイルから消え、サブフォルダには残ること。"""
+    problems = []
+    for label in ("chronogazer.exe", "data.txt", "subdir"):
+        if WEAK_SID not in before.get(label, set()):
+            problems.append("acl_before_missing_" + label)
+    for label in ("chronogazer.exe", "data.txt"):
+        if WEAK_SID in after.get(label, {WEAK_SID}):
+            problems.append("acl_after_still_weak_" + label)
+    if WEAK_SID not in after.get("subdir", set()):
+        problems.append("acl_after_subdir_changed")
+    return problems
+
+
+def dialog_kind(line, main_text=MAIN_DIALOG_TEXT):
     words = nsis_words(line)
     text = words[2] if len(words) > 2 else ""
-    if MAIN_DIALOG_TEXT in text:
+    if main_text in text:
         return "main-dialog"
     if RESTART_FAILED_TEXT in text:
         return "restart-failed-dialog"
@@ -153,30 +258,31 @@ def dialog_kind(line):
     return "other-dialog"
 
 
-def audit_install_ppo(text):
+def audit_install_ppo(text, allowed=ALLOWED_PPO):
     counts = {}
     for line in logical_ppo_lines(text):
         line = line.strip()
         reject_relative_jumps(line)
         if re.match(r'(?:Exec\w*\b|nsExec::|(?:Read|Write|Delete)Reg\w*\b|System::Call)', line):
-            require(line in ALLOWED_PPO, "PPO_operation_outside_allowlist")
+            require(line in allowed, "PPO_operation_outside_allowlist")
             counts[line] = counts.get(line, 0) + 1
     require(counts.get(SC_STOP, 0) == 1 and counts.get(SC_START, 0) >= 1, "PPO_service_operations_missing")
     return counts
 
 
-def instrument(ppo_text, log):
+def instrument(ppo_text, log, main_text=MAIN_DIALOG_TEXT):
     """case_b と同形: production 行は全て残し、その直前に観測の 1 行を足す。"""
     out = []
     for line in logical_ppo_lines(ppo_text):
         stripped = line.strip()
         if stripped.startswith("nsExec::"):
             kind = ("stop-attempt" if stripped == SC_STOP else "restart-attempt" if stripped == SC_START
-                    else "sc-query" if stripped in SC_QUERIES else None)
+                    else "sc-query" if stripped in SC_QUERIES
+                    else "icacls-attempt" if stripped in ICACLS_ATTEMPTS else None)
             require(kind is not None, "unclassified_exec")
             out.append(log_code(log, kind))
         if stripped.startswith("MessageBox "):
-            out.append(log_code(log, dialog_kind(stripped) + " flag=$ChronoGazerWasRunning"))
+            out.append(log_code(log, dialog_kind(stripped, main_text) + " flag=$ChronoGazerWasRunning"))
         out.append(line)
     return '\n'.join(out) + '\n'
 
@@ -192,9 +298,9 @@ def parse_jsonl(text):
     return [json.loads(line) for line in text.split("\n")[:-1] if line.strip()]
 
 
-def event_problems(events, final):
+def event_problems(events, final, spec=LOCK_SPEC):
     core = [event for event in events if event != "sc-query"]
-    expected = list(EVENTS_FINAL if final else EVENTS_AT_DIALOG)
+    expected = list(spec.events_final if final else spec.events_at_dialog)
     return [] if core == expected else ["event_sequence:" + json.dumps(core, ensure_ascii=False)]
 
 
@@ -252,11 +358,12 @@ def timeline_problems(timeline, pid_b):
     return problems
 
 
-def classify_dialog_children(children, prefix=MAIN_DIALOG_PREFIX):
+def classify_dialog_children(children, prefix=MAIN_DIALOG_PREFIX, matches=None):
     texts = [child["title"] for child in children if child["class"].casefold() == "static" and child["title"]]
     if not texts:
         return "waiting"  # 子 Static が読めるまで待つ（checklist §3）。
-    return "main" if any(text.startswith(prefix) for text in texts) else "other"
+    matches = matches or (lambda text: text.startswith(prefix))
+    return "main" if any(matches(text) for text in texts) else "other"
 
 
 def ok_button(children):
@@ -274,11 +381,11 @@ def main_windows(windows, pid):
     return [w for w in windows if w["pid"] == pid and w["class"] == DIALOG_CLASS and w["visible"] and not w.get("owner")]
 
 
-def judge_dialogs(windows, children_of, pid, caption):
+def judge_dialogs(windows, children_of, pid, caption, matches=None):
     """MessageBox も NSIS 主窓も #32770。pid・owner 非 0・title・子 Static 文面で主 dialog を同定する。"""
     found, unexpected = [], []
     for window in owned_dialogs(windows, pid):
-        kind = classify_dialog_children(children_of(window["hwnd"])) if window["title"] == caption else "other"
+        kind = classify_dialog_children(children_of(window["hwnd"]), matches=matches) if window["title"] == caption else "other"
         if kind == "main":
             found.append(window)
         elif kind == "other":
@@ -302,8 +409,9 @@ def read_bytes(path):
 
 
 class LockTrial(Trial):
-    def __init__(self, root):
+    def __init__(self, root, case_name=None):
         super().__init__(root)
+        self.case_name = case_name
         self.dummy_dir = root / "dummy"
         self.dummy = self.dummy_dir / "running_dummy.exe"
         self.run_id = os.environ["GITHUB_RUN_ID"]
@@ -372,7 +480,7 @@ class LockTrial(Trial):
         return parse_jsonl(read_bytes(self.dummy_dir / name).decode("utf-8"))
 
     def collect_dummy_logs(self):
-        target = self.proof / CASE / "dummy-logs"
+        target = self.proof / (self.case_name or "cleanup-only") / "dummy-logs"
         target.mkdir(parents=True, exist_ok=True)
         for path in self.dummy_dir.glob("*"):
             if path.suffix in (".jsonl", ".log", ".json"):
@@ -439,7 +547,7 @@ def install_hashes(install):
     return {path.name: digest(path) for path in sorted(install.iterdir()) if path.is_file()}
 
 
-def build_harness(trial, makensis, case, install, log, name):
+def build_harness(trial, makensis, case, install, log, name, spec):
     payload = case / "payload.bin"
     payload.write_bytes(b"new payload that must never be copied #973 lock-abort\n")
     values = {"@OUT@": case / "harness.exe", "@COMMON@": ROOT / "installer-common",
@@ -447,7 +555,7 @@ def build_harness(trial, makensis, case, install, log, name):
               "@INSTALL@": install, "@PAYLOAD@": payload, "@NAME@": name}
     for value in (*values.values(), log):
         require(not any(c in str(value) for c in ('"', '$', '\r', '\n')), "NSIS_special_path")
-    script = TEMPLATE
+    script = apply_acl_step(TEMPLATE, spec)
     for marker, message in (("@LOG_SECTION@", "section-begins"), ("@LOG_PREINSTALL@", "preinstall-done flag=$ChronoGazerWasRunning"),
                             ("@LOG_COPY@", "copy-begins"), ("@CALLBACK_BEFORE@", "callback-before flag=$ChronoGazerWasRunning"),
                             ("@CALLBACK_AFTER@", "callback-after flag=$ChronoGazerWasRunning")):
@@ -459,18 +567,38 @@ def build_harness(trial, makensis, case, install, log, name):
     expanded = trial.call([makensis, "/INPUTCHARSET", "UTF8", "/OUTPUTCHARSET", "UTF8", "/PPO", nsi], "PPO", case)
     require(expanded.returncode == 0, "PPO_failed")
     (case / "expanded.nsi").write_text(expanded.stdout, encoding="utf-8")
-    write_json(case / "ppo-audit.json", audit_install_ppo(expanded.stdout))
+    write_json(case / "ppo-audit.json", audit_install_ppo(expanded.stdout, spec.allowed_ppo))
     instrumented = case / "instrumented.nsi"
-    instrumented.write_text(instrument(expanded.stdout, log), encoding="utf-8")
+    instrumented.write_text(instrument(expanded.stdout, log, spec.main_text), encoding="utf-8")
     require(trial.call([makensis, "/INPUTCHARSET", "UTF8", "/V2", instrumented], "compile", case).returncode == 0, "compile_failed")
     return case / "harness.exe"
 
 
-def case_c(trial, makensis, report):
+ICACLS = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "icacls.exe")
+
+
+def grant_weak_ace(trial, target, label, inherit):
+    result = trial.call([ICACLS, target, "/grant", WEAK_SID_ARG + (":(OI)(CI)(M)" if inherit else ":(M)")], "icacls-grant-" + label)
+    require(result.returncode == 0, "icacls_grant_failed_" + label)
+
+
+def read_explicit_sids(trial, case, targets, phase):
+    """targets: {label: path}。icacls /save の SDDL から明示 ACE の SID を読む。{label: {"sddl", "explicit_sids"}}。"""
+    found = {}
+    for label, target in targets.items():
+        out = case / f"acl-{phase}-{label}.txt"
+        result = trial.call([ICACLS, target, "/save", out, "/Q"], f"icacls-save-{phase}-{label}")
+        require(result.returncode == 0 and out.is_file(), "icacls_save_failed_" + label)
+        sddl = saved_sddl(out.read_bytes())
+        found[label] = {"sddl": sddl, "explicit_sids": sorted(explicit_ace_sids(sddl))}
+    return found
+
+
+def case_c(trial, makensis, report, spec):
     require(trial.absent(SERVICE) and trial.app_absent(), "preexisting_ChronoGazer_or_apps_key")
-    case = trial.proof / CASE
+    case = trial.proof / spec.name
     case.mkdir(parents=True, exist_ok=True)
-    result = {"case": CASE, "forced_termination": False}
+    result = {"case": spec.name, "forced_termination": False}
     report["C"] = result
     # 4. inert 3 exe + data.txt（INSTDIR は dummy の外）。
     install = case / "install"
@@ -478,8 +606,27 @@ def case_c(trial, makensis, report):
     for exe in EXES:
         (install / exe).write_bytes(f"inert {exe}, never executed #973\n".encode())
     (install / "data.txt").write_bytes(b"data retained\n")
+    subdir = install / ACL_SUBDIR
+    keep = subdir / "keep.txt"
+    acl_targets = {"chronogazer.exe": str(install / "chronogazer.exe"), "data.txt": str(install / "data.txt"),
+                   "subdir": str(subdir)}
+    acl_before = None
+    if spec.acl_step:
+        subdir.mkdir()
+        keep.write_bytes(b"keep retained #973 acl-subdir\n")
+        keep_before = digest(keep)
     before = install_hashes(install)
     write_json(case / "before-hashes.json", before)
+    if spec.acl_step:
+        # 弱い ACE（BU の変更権）を用意し、installer 起動前に明示 ACE として読み戻せることを確かめる。
+        for label in ("chronogazer.exe", "data.txt"):
+            grant_weak_ace(trial, acl_targets[label], label, False)
+        grant_weak_ace(trial, acl_targets["subdir"], "subdir", True)
+        acl_before = read_explicit_sids(trial, case, acl_targets, "before")
+        result["acl_before"] = acl_before
+        before_problems = [f"acl_before_missing_{label}" for label, item in acl_before.items()
+                           if WEAK_SID not in item["explicit_sids"]]
+        require(not before_problems, "acl_before_failed:" + ','.join(before_problems))
     # 5. dummy の登録。
     trial.record_ownership(SERVICE)
     installed = trial.call([trial.dummy, "install"], "dummy-install")
@@ -508,8 +655,9 @@ def case_c(trial, makensis, report):
     require(initial_heartbeat_ok(), "initial_heartbeat_not_advancing")
     # 7–9. harness。
     name = "Banto973 lock-abort " + trial.root.name[-8:]
+    matches = lambda text: spec.dialog_matches(text, str(install))
     log = case / "events.log"
-    harness = build_harness(trial, makensis, case, install, log, name)
+    harness = build_harness(trial, makensis, case, install, log, name, spec)
     api = API()
     bind = gui.bind
     bind(api.u, "GetWindow", [W.HWND, W.UINT], W.HWND)
@@ -522,13 +670,14 @@ def case_c(trial, makensis, report):
     last_windows = []
     try:
         # 10. lock（nsis_precopy.py と同じ開き方）と自己検証。
-        target = str(install / LOCKED_EXE)
-        lock = kernel.CreateFileW(target, 0x80000000, 1, None, 3, 0, None)
-        require(lock not in (None, invalid), "fixture_lock_failed")
-        probe = kernel.CreateFileW(target, 0x40000000, 7, None, 3, 0, None)
-        if probe not in (None, invalid):
-            kernel.CloseHandle(probe)
-        require(probe in (None, invalid), "lock_did_not_deny_write")
+        if spec.lock_server:
+            target = str(install / LOCKED_EXE)
+            lock = kernel.CreateFileW(target, 0x80000000, 1, None, 3, 0, None)
+            require(lock not in (None, invalid), "fixture_lock_failed")
+            probe = kernel.CreateFileW(target, 0x40000000, 7, None, 3, 0, None)
+            if probe not in (None, invalid):
+                kernel.CloseHandle(probe)
+            require(probe in (None, invalid), "lock_did_not_deny_write")
         # 11. 起動と timeline。
         environment = dict(os.environ)
         environment["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
@@ -541,7 +690,7 @@ def case_c(trial, makensis, report):
         while dialog is None:
             require(child.poll() is None, "installer_exited_before_dialog")
             last_windows = with_owner(api, api.windows(child.pid))
-            dialog, unexpected = judge_dialogs(last_windows, children_of, child.pid, name)
+            dialog, unexpected = judge_dialogs(last_windows, children_of, child.pid, name, matches)
             require(not unexpected, "unexpected_dialog")
             first, events, beats_first = monitor.sample("dialog" if dialog else "before-dialog")
             require(dialog is not None or time.monotonic() < deadline, "dialog_not_seen_within_90s")
@@ -568,7 +717,7 @@ def case_c(trial, makensis, report):
             hashes = install_hashes(install)
             problems = ([] if entry["state"] == RUNNING and entry["pid"] == pid_b else ["scm_not_running_pid_b"])
             problems += [] if alive else ["dialog_not_alive"]
-            problems += event_problems(events, final=False)
+            problems += event_problems(events, final=False, spec=spec)
             problems += start_problems(starts, expected, [pid_a, pid_b], first["wall_ms"])
             problems += stop_problems(stops, [pid_a])
             problems += [] if hashes == before else ["install_changed"]
@@ -617,16 +766,27 @@ def case_c(trial, makensis, report):
         require(child.returncode == 2, "installer_exit_not_2")
         monitor.hold(1.0, "after-exit")
         entry, events, beats = monitor.sample("after-exit")
-        problems = event_problems(events, final=True)
+        problems = event_problems(events, final=True, spec=spec)
         problems += heartbeat_problems(beats_two, beats, pid_a, pid_b, trial.run_id, trial.sha)
         problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
         problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
         problems += timeline_problems(monitor.timeline, pid_b)
         result.update(final_events=events, final_problems=problems)
         require(not problems, "after_exit_failed:" + ','.join(problems))
+        if spec.acl_step:
+            # 16b. 実 icacls は想定外サブフォルダの手前までしか進んでいない: BU は 2 ファイルから消え、subdir には残る。
+            acl_after = read_explicit_sids(trial, case, acl_targets, "after")
+            acl_failed = acl_problems({label: set(item["explicit_sids"]) for label, item in acl_before.items()},
+                                      {label: set(item["explicit_sids"]) for label, item in acl_after.items()})
+            if digest(keep) != keep_before:
+                acl_failed.append("keep_changed")
+            result.update(acl_after=acl_after, acl_problems=acl_failed)
+            write_json(case / "acl-proof.json", {"before": acl_before, "after": acl_after, "problems": acl_failed})
+            require(not acl_failed, "acl_failed:" + ','.join(acl_failed))
         # 17. lock 解放 → hash 再照合。
-        require(bool(kernel.CloseHandle(lock)), "lock_close_failed")
-        lock = None
+        if lock is not None:
+            require(bool(kernel.CloseHandle(lock)), "lock_close_failed")
+            lock = None
         require(install_hashes(install) == before, "install_changed_after_release")
         # 18. 後片付け（本経路）: 停止 → stops 2 行 → dummy uninstall → 消滅。
         trial.stop()
@@ -671,15 +831,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--makensis", type=Path)
     parser.add_argument("--cleanup-only", action="store_true")
+    parser.add_argument("--case", choices=sorted(CASES))
     args = parser.parse_args()
+    if not args.cleanup_only and args.case is None:
+        parser.error("--case is required unless --cleanup-only")
+    spec = CASES[args.case] if args.case else None
     root = guard()  # Must precede any SCM/registry/User32 access, including cleanup.
-    trial = LockTrial(root)
+    trial = LockTrial(root, spec.name if spec else None)
     if args.cleanup_only:
         finish_cleanup_only(trial)
-    report = {"status": "pending", "cleanup_success": False, "case": CASE,
+    report = {"status": "pending", "cleanup_success": False, "case": spec.name,
               "head_sha": os.environ["BANTO_973_EXPECTED_SHA"], "event_sha": os.environ["GITHUB_SHA"],
-              "limits": "running dummy service + inert fixture exes; READ-share CreateFileW lock only "
-                        "(no LockFileEx range lock / image lock); no collector/full setup/Tauri UI/B3-5."}
+              "limits": "running dummy service + inert fixture exes; C-server-locked: READ-share CreateFileW lock only "
+                        "(no LockFileEx range lock / image lock); C-acl-subdir: proves the sub-folder abort path after "
+                        "real icacls on earlier entries, NOT an icacls failure itself (non-zero icacls exit out of scope); "
+                        "no collector/full setup/Tauri UI/B3-5."}
     write_json(trial.proof / "summary.json", report)
     try:
         environment = API().environment()
@@ -700,9 +866,9 @@ def main():
             "head_sha": head, "event_sha": report["event_sha"], "dummy_sha256": digest(trial.dummy),
             "makensis_sha256": digest(args.makensis),
             "sources": {str(path.resolve().relative_to(ROOT)): digest(path) for path in files}})
-        case_c(trial, args.makensis, report)
+        case_c(trial, args.makensis, report, spec)
         report["status"] = "passed"
-        print(json.dumps({"case": CASE, "passed": True}), flush=True)
+        print(json.dumps({"case": spec.name, "passed": True}), flush=True)
     except GuiUnsupported:
         report["status"] = "gui_unsupported"  # 製品の失敗と区別する（それでも非 0 で終える）。
     except Exception as error:

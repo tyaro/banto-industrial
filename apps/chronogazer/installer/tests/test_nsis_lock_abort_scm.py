@@ -245,5 +245,130 @@ class Dialogs(unittest.TestCase):
             lock.judge_dialogs([dialog, window(15, 10)], lambda h: [{"class": "Static", "title": MAIN_TEXT}], 7, self.CAPTION)
 
 
+ACL = lock.CASES["C-acl-subdir"]
+INSTALL = r"C:\a\_temp\Banto973-x\proof\C-acl-subdir\install"
+ACL_TEXT = (f"インストール先 {INSTALL} の所有者・アクセス権を既定に戻せませんでした。\r\n"
+            "インストール先の中にサブフォルダがあります。ChronoGazer のインストーラはサブフォルダを作らないので、ChronoGazer の物ではありません。\r\n"
+            f"対象: {INSTALL}\\zz-unexpected-subdir\r\n\r\n既存のフォルダのアクセス権が弱いまま...")
+ICACLS_SETOWNER = next(line for line in lock.ACL_PPO_EXTRA if "/setowner" in line)
+ICACLS_RESET = next(line for line in lock.ACL_PPO_EXTRA if "/reset" in line)
+SDDL_EXPLICIT = "O:BAG:SYD:PAI(A;;FA;;;SY)(A;;0x1301bf;;;BU)(A;ID;FA;;;BA)(A;ID;0x1200a9;;;WD)"
+SDDL_INHERITED = "O:BAG:SYD:AI(A;ID;FA;;;SY)(A;OICIID;0x1200a9;;;BU)"
+
+
+class AclCase(unittest.TestCase):
+    def test_explicit_ace_sids_skip_inherited_and_collect_all_explicit(self):
+        self.assertEqual(lock.explicit_ace_sids(SDDL_EXPLICIT), {"SY", "BU"})
+        self.assertEqual(lock.explicit_ace_sids(SDDL_INHERITED), set())
+        self.assertEqual(lock.explicit_ace_sids("O:BAG:SYD:PAI(A;OICI;0x1301bf;;;BU)(A;;FA;;;BA)S:(AU;SA;FA;;;WD)"), {"BU", "BA"})
+        self.assertEqual(lock.explicit_ace_sids("O:BAG:SY"), set())
+
+    def test_saved_sddl_reads_second_line_of_utf16(self):
+        raw = ("C:\\x\\data.txt\r\n" + SDDL_EXPLICIT + "\r\n\r\n").encode("utf-16-le")
+        self.assertEqual(lock.saved_sddl(raw), SDDL_EXPLICIT)
+        self.assertEqual(lock.saved_sddl(b"\xff\xfe" + raw), SDDL_EXPLICIT)
+        with self.assertRaisesRegex(RuntimeError, "unparsable"):
+            lock.saved_sddl("only one line".encode("utf-16-le"))
+
+    def test_acl_problems(self):
+        weak = {"chronogazer.exe": {"BU"}, "data.txt": {"BU", "SY"}, "subdir": {"BU"}}
+        good_after = {"chronogazer.exe": set(), "data.txt": set(), "subdir": {"BU"}}
+        self.assertEqual(lock.acl_problems(weak, good_after), [])
+        self.assertIn("acl_before_missing_data.txt", lock.acl_problems(dict(weak, **{"data.txt": set()}), good_after))
+        self.assertIn("acl_after_still_weak_data.txt", lock.acl_problems(weak, dict(good_after, **{"data.txt": {"BU"}})))
+        self.assertIn("acl_after_subdir_changed", lock.acl_problems(weak, dict(good_after, subdir=set())))
+
+    PPO = ("Section\n" + lock.SC_QUERIES[0] + "\n" + lock.SC_STOP + "\n" + lock.SC_START + "\n"
+           + ICACLS_SETOWNER + "\n" + ICACLS_RESET + "\n"
+           "System::Call 'kernel32::GetFileAttributesW(w r4) i .r5'\n"
+           'MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした。" /SD IDOK\n'
+           "SectionEnd\n")
+
+    def test_ppo_allowlist_is_per_case(self):
+        self.assertEqual(lock.audit_install_ppo(self.PPO, ACL.allowed_ppo)[ICACLS_RESET], 1)
+        for audit in (lambda: lock.audit_install_ppo(self.PPO),
+                      lambda: lock.audit_install_ppo(self.PPO, lock.LOCK_SPEC.allowed_ppo)):
+            with self.assertRaisesRegex(RuntimeError, "outside_allowlist"):
+                audit()
+        with self.assertRaisesRegex(RuntimeError, "outside_allowlist"):
+            lock.audit_install_ppo(self.PPO.replace("/reset /L", "/reset /T"), ACL.allowed_ppo)
+
+    def test_acl_allowlist_strings_match_the_unchanged_common_nsh(self):
+        common = (ROOT / "installer-common/install-dir-common.nsh").read_text(encoding="utf-8")
+        self.assertIn(ICACLS_SETOWNER, common)
+        self.assertIn(ICACLS_RESET, common)
+        self.assertIn("System::Call 'kernel32::GetFileAttributesW(w r4) i .r5'", common)
+        for text in (lock.ACL_MAIN_FIXED, lock.ACL_REASON_TEXT):
+            self.assertIn(text, common)
+
+    def test_instrument_classifies_icacls_and_acl_dialog(self):
+        out = lock.instrument(self.PPO, r"C:\t\events.log", ACL.main_text).splitlines()
+        for production in (ICACLS_SETOWNER, ICACLS_RESET):
+            self.assertEqual(out[out.index(production) - 3], 'FileWriteUTF16LE $R9 "icacls-attempt$\\r$\\n"')
+        dialog = next(i for i, line in enumerate(out) if line.startswith("MessageBox "))
+        self.assertEqual(out[dialog - 3], 'FileWriteUTF16LE $R9 "main-dialog flag=$ChronoGazerWasRunning$\\r$\\n"')
+
+    def test_dialog_kind_for_acl_text(self):
+        line = 'MessageBox MB_OK|MB_ICONSTOP "インストール先 $INSTDIR の所有者・アクセス権を既定に戻せませんでした。$\\r$\\n理由" /SD IDOK'
+        self.assertEqual(lock.dialog_kind(line, ACL.main_text), "main-dialog")
+        self.assertEqual(lock.dialog_kind(line), "other-dialog")  # 既定（lock）の文面では main にならない。
+
+    def test_static_must_match_reason_and_target(self):
+        self.assertTrue(ACL.dialog_matches(ACL_TEXT, INSTALL))
+        self.assertFalse(ACL.dialog_matches(ACL_TEXT.replace("サブフォルダがあります", "再解析ポイントがあります"), INSTALL))
+        self.assertFalse(ACL.dialog_matches(ACL_TEXT.replace("zz-unexpected-subdir", "data.txt"), INSTALL))
+        self.assertFalse(ACL.dialog_matches(ACL_TEXT, r"C:\other"))
+        self.assertFalse(ACL.dialog_matches(MAIN_TEXT, INSTALL))
+        self.assertFalse(lock.LOCK_SPEC.dialog_matches(ACL_TEXT, INSTALL))
+        matches = lambda text: ACL.dialog_matches(text, INSTALL)
+        children = {11: [{"class": "Static", "title": ACL_TEXT}], 13: [{"class": "Static", "title": MAIN_TEXT}]}
+        caption = "Banto973 lock-abort 12345678"
+        self.assertEqual(lock.judge_dialogs([window(11, 10)], children.get, 7, caption, matches), (window(11, 10), []))
+        other = window(13, 10)
+        self.assertEqual(lock.judge_dialogs([other], children.get, 7, caption, matches), (None, [other]))
+        self.assertEqual(lock.classify_dialog_children([{"class": "Static", "title": ACL_TEXT}], matches=matches), "main")
+
+    AT_DIALOG = (["section-begins", "sc-query", "stop-attempt", "sc-query", "preinstall-done flag=1"]
+                 + ["icacls-attempt", "sc-query"] * 10 + ["restart-attempt", "sc-query", "main-dialog flag=0"])
+
+    def test_acl_event_sequence(self):
+        self.assertEqual(lock.event_problems(self.AT_DIALOG, final=False, spec=ACL), [])
+        final = self.AT_DIALOG + ["callback-before flag=0", "callback-after flag=0"]
+        self.assertEqual(lock.event_problems(final, final=True, spec=ACL), [])
+        self.assertTrue(lock.event_problems(self.AT_DIALOG, final=False))  # lock の列とは違う。
+
+    def test_acl_events_reject_wrong_icacls_count_copy_and_double_restart(self):
+        one_less = list(self.AT_DIALOG)
+        one_less.remove("icacls-attempt")
+        one_more = self.AT_DIALOG[:5] + ["icacls-attempt"] + self.AT_DIALOG[5:]
+        bad = (one_less, one_more, self.AT_DIALOG + ["copy-begins"],
+               self.AT_DIALOG[:-1] + ["restart-attempt", "main-dialog flag=0"],
+               [e.replace("flag=1", "flag=0") for e in self.AT_DIALOG])
+        for events in bad:
+            with self.subTest(events=events):
+                self.assertTrue(lock.event_problems(events, final=False, spec=ACL))
+        final = self.AT_DIALOG + ["callback-before flag=0", "restart-attempt", "callback-after flag=0"]
+        self.assertTrue(lock.event_problems(final, final=True, spec=ACL))
+
+    def test_acl_step_sits_before_unlocked_check_and_is_absent_for_lock(self):
+        template = lock.TEMPLATE
+        self.assertLess(template.index("@LOG_PREINSTALL@"), template.index("@ACL_STEP@"))
+        self.assertLess(template.index("@ACL_STEP@"), template.index("RequireChronoGazerInstallExesUnlocked"))
+        acl = lock.apply_acl_step(template, ACL)
+        self.assertNotIn("@ACL_STEP@", acl)
+        self.assertLess(acl.index("RequireChronoGazerServiceInactive"), acl.index("!insertmacro ResetChronoGazerInstallDirAcl"))
+        self.assertLess(acl.index("!insertmacro ResetChronoGazerInstallDirAcl"), acl.index("RequireChronoGazerInstallExesUnlocked"))
+        plain = lock.apply_acl_step(template, lock.LOCK_SPEC)
+        self.assertNotIn("ResetChronoGazerInstallDirAcl", plain)
+        self.assertNotIn("@ACL_STEP@", plain)
+        self.assertEqual(plain, template.replace("  @ACL_STEP@\n", ""))
+
+    def test_cases_are_keyed_by_name(self):
+        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir"})
+        self.assertTrue(lock.LOCK_SPEC.lock_server and not lock.LOCK_SPEC.acl_step)
+        self.assertTrue(ACL.acl_step and not ACL.lock_server)
+        self.assertEqual(lock.LOCK_SPEC.events_at_dialog, lock.EVENTS_AT_DIALOG)
+
+
 if __name__ == "__main__":
     unittest.main()
