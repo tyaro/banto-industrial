@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
+最終更新: 2026-11-09（§3 に受入スクリプトの空の観測と Hub の `/api/auth/*` の CSRF ヘッダーの 2 行を追加。#973 Hub 受入）。前回: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
 2026-11-06（§5 にWindows拡張長prefix除去後の同一対象確認を追加。#1050）
 2026-11-06（§6 に「head の push 前に PR 本文の対象範囲・検証欄を同期し、自動レビューが参照した本文・head を確認する」を追加。#1047）
 2026-11-02（§2 に「脆弱性の対応の `cargo update -p <crate> --precise` でも無関係な依存が付け替わる。`Cargo.lock` の差分を全部読む」を追加。RUSTSEC-2026-0433、#1016）
@@ -103,6 +103,8 @@
 - [ ] **`#32770` は MessageBox も NSIS の主窓も同じ class**（title も `Caption` が同じ）。pid・owner（`GetWindow(GW_OWNER)` 非 0）・子 Static の文面で同定する。非 silent の `.onInstFailed` は、失敗頁の主窓を閉じたときに呼ばれる（#973 lock-abort、2026-11-07）。
 - [ ] **windows-service crate は空白の無い exe のパスをクォートせずに SCM へ登録する**。ImagePath の照合は、クォートありとなしの両方の形を受け付ける（#973 lock-abort、2026-11-07）。
 - [ ] **親HWNDがvisibleになっただけで待機を終えず、子labelなど必要状態が揃うまで上限付きで待つ**。GUI probeで親窓が子labelより先に観測され、直後の子列挙が空になった（#973、2026-11-06）。
+- [ ] **受入スクリプトの観測が空のとき、「期待と違わない」として通さない**。`Get-Acl`・`icacls`・`sc sdshow` の失敗や空の出力は例外にする。空のままだと「Administrators でない」「変わっていない」という誤った判定になる（#973 Hub 受入、#1084）。
+- [ ] **Hub の `/api/auth/*` は CSRF のミドルウェアの内側にあり、GET・POST とも `X-Banto-Client` ヘッダーが要る**。受入スクリプトや curl で叩くときは付ける（#973 Hub 受入、#1084）。
 
 - [ ] `BantoGrid` は行を仮想化していて **CI の描画窓は 20 行**。行を名前でクリックする前に検索ボックスかツリーで絞る。
 - [ ] フィクスチャは `beforeAll` の先頭と `afterAll` の両方で掃除する（banto-hub は `banto-hub-fixture-cleanup.ts` の `cleanupFixtures`）。
