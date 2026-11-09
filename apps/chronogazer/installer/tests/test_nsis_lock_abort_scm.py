@@ -271,12 +271,29 @@ class AclCase(unittest.TestCase):
             lock.saved_sddl("only one line".encode("utf-16-le"))
 
     def test_acl_problems(self):
-        weak = {"chronogazer.exe": {"BU"}, "data.txt": {"BU", "SY"}, "subdir": {"BU"}}
-        good_after = {"chronogazer.exe": set(), "data.txt": set(), "subdir": {"BU"}}
-        self.assertEqual(lock.acl_problems(weak, good_after), [])
-        self.assertIn("acl_before_missing_data.txt", lock.acl_problems(dict(weak, **{"data.txt": set()}), good_after))
-        self.assertIn("acl_after_still_weak_data.txt", lock.acl_problems(weak, dict(good_after, **{"data.txt": {"BU"}})))
-        self.assertIn("acl_after_subdir_changed", lock.acl_problems(weak, dict(good_after, subdir=set())))
+        weak = {"install-root": {"BU"}, "chronogazer.exe": {"BU"}, "data.txt": {"BU", "SY"}, "subdir": {"BU"}}
+        both = ["chronogazer.exe", "data.txt", "chronogazer-elev.exe"]
+        good_after = {"install-root": set(), "chronogazer.exe": set(), "data.txt": set(), "subdir": {"BU"}}
+        self.assertEqual(lock.acl_problems(weak, good_after, both), [])
+        self.assertIn("acl_before_missing_data.txt", lock.acl_problems(dict(weak, **{"data.txt": set()}), good_after, both))
+        self.assertIn("acl_before_missing_install-root", lock.acl_problems(dict(weak, **{"install-root": set()}), good_after, both))
+        self.assertIn("acl_after_still_weak_data.txt", lock.acl_problems(weak, dict(good_after, **{"data.txt": {"BU"}}), both))
+        self.assertIn("acl_after_changed_subdir", lock.acl_problems(weak, dict(good_after, subdir=set()), both))
+        self.assertIn("acl_after_still_weak_install-root",
+                      lock.acl_problems(weak, dict(good_after, **{"install-root": {"BU"}}), both))
+
+    def test_acl_problems_follow_processed(self):
+        weak = {"install-root": {"BU"}, "chronogazer.exe": {"BU"}, "data.txt": {"BU"}, "subdir": {"BU"}}
+        # サブフォルダが最初: 何も処理されず、root だけ消える。ファイルは残る。
+        first = {"install-root": set(), "chronogazer.exe": {"BU"}, "data.txt": {"BU"}, "subdir": {"BU"}}
+        self.assertEqual(lock.acl_problems(weak, first, []), [])
+        # 処理済みなのに残る / 未処理なのに消える。
+        self.assertIn("acl_after_still_weak_data.txt", lock.acl_problems(weak, first, ["data.txt"]))
+        gone = dict(first, **{"data.txt": set()})
+        self.assertIn("acl_after_changed_data.txt", lock.acl_problems(weak, gone, []))
+        self.assertEqual(lock.acl_problems(weak, gone, ["data.txt"]), [])
+        # processed が空でも root が残れば拒否する。
+        self.assertIn("acl_after_still_weak_install-root", lock.acl_problems(weak, dict(first, **{"install-root": {"BU"}}), []))
 
     PPO = ("Section\n" + lock.SC_QUERIES[0] + "\n" + lock.SC_STOP + "\n" + lock.SC_START + "\n"
            + ICACLS_SETOWNER + "\n" + ICACLS_RESET + "\n"
@@ -304,7 +321,7 @@ class AclCase(unittest.TestCase):
     def test_instrument_classifies_icacls_and_acl_dialog(self):
         out = lock.instrument(self.PPO, r"C:\t\events.log", ACL.main_text).splitlines()
         for production in (ICACLS_SETOWNER, ICACLS_RESET):
-            self.assertEqual(out[out.index(production) - 3], 'FileWriteUTF16LE $R9 "icacls-attempt$\\r$\\n"')
+            self.assertEqual(out[out.index(production) - 3], 'FileWriteUTF16LE $R9 "icacls-attempt target=$4$\\r$\\n"')
         dialog = next(i for i, line in enumerate(out) if line.startswith("MessageBox "))
         self.assertEqual(out[dialog - 3], 'FileWriteUTF16LE $R9 "main-dialog flag=$ChronoGazerWasRunning$\\r$\\n"')
 
@@ -328,27 +345,68 @@ class AclCase(unittest.TestCase):
         self.assertEqual(lock.judge_dialogs([other], children.get, 7, caption, matches), (None, [other]))
         self.assertEqual(lock.classify_dialog_children([{"class": "Static", "title": ACL_TEXT}], matches=matches), "main")
 
-    AT_DIALOG = (["section-begins", "sc-query", "stop-attempt", "sc-query", "preinstall-done flag=1"]
-                 + ["icacls-attempt", "sc-query"] * 10 + ["restart-attempt", "sc-query", "main-dialog flag=0"])
+    HEAD = ["section-begins", "sc-query", "stop-attempt", "sc-query", "preinstall-done flag=1"]
+    TAIL = ["restart-attempt", "sc-query", "main-dialog flag=0"]
+
+    @staticmethod
+    def icacls(*names):
+        """root が 2 回 → 各項目が 2 回ずつ（間に sc-query）。"""
+        targets = [INSTALL] + [INSTALL + "\\" + name for name in names]
+        return [item for t in targets for item in ("icacls-attempt target=" + t, "sc-query") * 2]
+
+    def at_dialog(self, *names):
+        return self.HEAD + self.icacls(*names) + self.TAIL
+
+    # 列挙順は保証されない: サブフォルダが最初（processed が空）・途中・最後の全順序。
+    ORDERS = ([], ["data.txt"], ["chronogazer-elev.exe", "data.txt"],
+              ["chronogazer.exe", "chronogazer-server.exe", "chronogazer-elev.exe", "data.txt"])
 
     def test_acl_event_sequence(self):
-        self.assertEqual(lock.event_problems(self.AT_DIALOG, final=False, spec=ACL), [])
-        final = self.AT_DIALOG + ["callback-before flag=0", "callback-after flag=0"]
-        self.assertEqual(lock.event_problems(final, final=True, spec=ACL), [])
-        self.assertTrue(lock.event_problems(self.AT_DIALOG, final=False))  # lock の列とは違う。
+        for names in self.ORDERS:
+            with self.subTest(names=names):
+                events = self.at_dialog(*names)
+                self.assertEqual(lock.acl_processed(events, INSTALL), (names, []))
+                self.assertEqual(lock.event_problems(events, final=False, spec=ACL, install=INSTALL), [])
+                final = events + ["callback-before flag=0", "callback-after flag=0"]
+                self.assertEqual(lock.event_problems(final, final=True, spec=ACL, install=INSTALL), [])
+        self.assertEqual(lock.acl_processed(self.at_dialog("DATA.TXT"), INSTALL.upper())[1], [])  # casefold。
+        self.assertTrue(lock.event_problems(self.at_dialog("data.txt"), final=False))  # lock の列とは違う。
+
+    def test_acl_processed_rejects_bad_targets(self):
+        sub = "icacls-attempt target=" + INSTALL + "\\" + lock.ACL_SUBDIR
+        head, tail, root = self.HEAD, self.TAIL, ["icacls-attempt target=" + INSTALL] * 2
+        item = ["icacls-attempt target=" + INSTALL + "\\data.txt"] * 2
+        bad = {
+            "odd": head + root + item[:1] + tail,
+            "root_not_first": head + item + root + tail,
+            "subdir_processed": head + root + [sub] * 2 + tail,
+            "duplicate": head + root + item + item + tail,
+            "outside_install": head + root + ["icacls-attempt target=C:\\other\\data.txt"] * 2 + tail,
+            "nested": head + root + ["icacls-attempt target=" + INSTALL + "\\a\\data.txt"] * 2 + tail,
+            "unpaired": head + root + ["icacls-attempt target=" + INSTALL + "\\data.txt",
+                                       "icacls-attempt target=" + INSTALL + "\\chronogazer.exe"] + tail,
+            "none": head + tail,
+            "after_restart": head + root + tail[:1] + item + tail[1:],
+            "not_contiguous": head + root[:1] + ["sc-stop-x"] + root[1:] + tail,
+            "before_preinstall": head[:4] + root + head[4:] + tail,
+        }
+        for name, events in bad.items():
+            with self.subTest(name=name):
+                self.assertTrue(lock.acl_processed(events, INSTALL)[1])
+                self.assertTrue(lock.event_problems(events, final=False, spec=ACL, install=INSTALL))
 
     def test_acl_events_reject_wrong_icacls_count_copy_and_double_restart(self):
-        one_less = list(self.AT_DIALOG)
-        one_less.remove("icacls-attempt")
-        one_more = self.AT_DIALOG[:5] + ["icacls-attempt"] + self.AT_DIALOG[5:]
-        bad = (one_less, one_more, self.AT_DIALOG + ["copy-begins"],
-               self.AT_DIALOG[:-1] + ["restart-attempt", "main-dialog flag=0"],
-               [e.replace("flag=1", "flag=0") for e in self.AT_DIALOG])
-        for events in bad:
-            with self.subTest(events=events):
-                self.assertTrue(lock.event_problems(events, final=False, spec=ACL))
-        final = self.AT_DIALOG + ["callback-before flag=0", "restart-attempt", "callback-after flag=0"]
-        self.assertTrue(lock.event_problems(final, final=True, spec=ACL))
+        names = ["data.txt"]
+        events = self.at_dialog(*names)
+        one_less = list(events)
+        one_less.remove("icacls-attempt target=" + INSTALL + "\\data.txt")
+        bad = (one_less, events + ["copy-begins"], events[:-1] + ["restart-attempt", "main-dialog flag=0"],
+               [e.replace("flag=1", "flag=0") for e in events])
+        for bad_events in bad:
+            with self.subTest(events=bad_events):
+                self.assertTrue(lock.event_problems(bad_events, final=False, spec=ACL, install=INSTALL))
+        final = events + ["callback-before flag=0", "restart-attempt", "callback-after flag=0"]
+        self.assertTrue(lock.event_problems(final, final=True, spec=ACL, install=INSTALL))
 
     def test_acl_step_sits_before_unlocked_check_and_is_absent_for_lock(self):
         template = lock.TEMPLATE

@@ -19,11 +19,13 @@ and image locks of a running exe are out of scope.
 
 Case C-acl-subdir: no lock. The INSTDIR holds a stray sub-folder, so after the real
 Stop -> RequireInactive the real ResetChronoGazerInstallDirAcl runs the real icacls on
-the root and the 4 files in front of it, then enters the real AbortInstallDirAcl on the
-sub-folder (INSTALL_DIR_COMMON_ON_ACL_ABORT restarts the dummy before the main dialog).
-Weak BU ACEs are put on chronogazer.exe, data.txt and the sub-folder beforehand and the
-explicit ACEs are read back with icacls /save before and after. Limit: this proves the
-sub-folder path only, NOT an icacls failure itself (a non-zero icacls exit is out of scope).
+the root and the direct entries enumerated before the sub-folder (the Windows enumeration
+order is not guaranteed, so each icacls target is recorded as it is processed), then enters
+the real AbortInstallDirAcl on the sub-folder (INSTALL_DIR_COMMON_ON_ACL_ABORT restarts the
+dummy before the main dialog). Weak BU ACEs are put on the install root, chronogazer.exe,
+data.txt and the sub-folder beforehand and the explicit ACEs are read back with icacls /save
+before and after; BU must be gone from the root and from every processed target and must
+remain on the unprocessed ones. Limit: this proves the sub-folder path only, NOT an icacls failure itself (a non-zero icacls exit is out of scope).
 """
 
 import argparse
@@ -87,13 +89,13 @@ ICACLS_ATTEMPTS = frozenset(line for line in ACL_PPO_EXTRA if line.startswith("n
 EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt", "main-dialog flag=0")
 CALLBACK_EVENTS = ("callback-before flag=0", "callback-after flag=0")
 EVENTS_FINAL = EVENTS_AT_DIALOG + CALLBACK_EVENTS
-# C-acl-subdir: icacls は root と直下 4 ファイル（3 exe + data.txt）に setowner/reset の 2 回ずつ、サブフォルダの前で中止。
-ACL_EVENTS_AT_DIALOG = (("section-begins", "stop-attempt", "preinstall-done flag=1") + ("icacls-attempt",) * 10
-                        + ("restart-attempt", "main-dialog flag=0"))
+# C-acl-subdir: icacls-attempt（対象つき）は列挙順に依存するので、ここには含めない。数と対象は acl_processed が判定する。
+ACL_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt", "main-dialog flag=0")
+ICACLS_EVENT = "icacls-attempt target="
 
 ACL_MAIN_FIXED = "の所有者・アクセス権を既定に戻せませんでした"
 ACL_REASON_TEXT = "インストール先の中にサブフォルダがあります"
-ACL_SUBDIR = "zz-unexpected-subdir"  # NTFS の列挙順で最後になる名前。
+ACL_SUBDIR = "zz-unexpected-subdir"  # 想定外のサブフォルダ。処理済みの対象に出てはならない（出れば中止の前に icacls が触れている）。
 WEAK_SID = "BU"
 WEAK_SID_ARG = "*S-1-5-32-545"
 ACL_STEP_CODE = "!insertmacro ResetChronoGazerInstallDirAcl\n"
@@ -230,18 +232,59 @@ def saved_sddl(raw):
     return lines[1].strip()
 
 
-def acl_problems(before, after):
-    """before/after: {label: 明示 ACE の SID 集合}。弱い BU が 2 ファイルから消え、サブフォルダには残ること。"""
+ACL_LABELS = ("install-root", "chronogazer.exe", "data.txt", "subdir")
+
+
+def acl_problems(before, after, processed):
+    """before/after: {label: 明示 ACE の SID 集合}。processed: icacls が実際に処理した直下の名前。
+    install-root（常に処理される）と processed の label は BU が消え、processed に無い label（subdir を含む）は
+    BU が残ること。processed は grant していないファイルも含みうるので、ACL_LABELS の label だけを判定する。"""
     problems = []
-    for label in ("chronogazer.exe", "data.txt", "subdir"):
+    for label in ACL_LABELS:
         if WEAK_SID not in before.get(label, set()):
             problems.append("acl_before_missing_" + label)
-    for label in ("chronogazer.exe", "data.txt"):
-        if WEAK_SID in after.get(label, {WEAK_SID}):
-            problems.append("acl_after_still_weak_" + label)
-    if WEAK_SID not in after.get("subdir", set()):
-        problems.append("acl_after_subdir_changed")
+    for label in ACL_LABELS:
+        if label == "install-root" or label in processed:
+            if WEAK_SID in after.get(label, {WEAK_SID}):
+                problems.append("acl_after_still_weak_" + label)
+        elif WEAK_SID not in after.get(label, set()):
+            problems.append("acl_after_changed_" + label)
     return problems
+
+
+def acl_processed(events, install):
+    """events の icacls-attempt target= を検査する。(処理した直下の名前の list, problems)。
+    対象の並びは「root が 2 回 → 直下の 1 項目が 2 回ずつ」で、preinstall-done flag=1 の直後から
+    restart-attempt の直前まで連続する。列挙順には依存しない。"""
+    core = [event for event in events if event != "sc-query"]
+    install = str(install) if install is not None else ""
+    problems = []
+    attempts = [(i, e[len(ICACLS_EVENT):]) for i, e in enumerate(core) if e.startswith(ICACLS_EVENT)]
+    start = core.index("preinstall-done flag=1") + 1 if "preinstall-done flag=1" in core else None
+    end = core.index("restart-attempt") if "restart-attempt" in core else None
+    if start is None or end is None or [i for i, _ in attempts] != list(range(start, end)):
+        problems.append("acl_icacls_not_contiguous")
+    targets = [t for _, t in attempts]
+    if len(targets) < 2 or len(targets) % 2:
+        problems.append(f"acl_icacls_count_{len(targets)}")
+    if len(targets) < 2 or targets[0] != targets[1] or targets[0].casefold() != install.casefold():
+        problems.append("acl_root_not_install_twice_first")
+    rest = targets[2:]
+    if len(rest) % 2 or any(rest[i] != rest[i + 1] for i in range(0, len(rest) - 1, 2)):
+        problems.append("acl_items_not_in_pairs")
+    allowed = {name.casefold(): name for name in EXES + ("data.txt",)}
+    prefix = install.casefold() + "\\"
+    names = []
+    for target in rest[::2]:
+        name = target[len(prefix):] if target.casefold().startswith(prefix) else None
+        if name is None or "\\" in name or name.casefold() not in allowed:
+            problems.append("acl_unexpected_target:" + target)
+            continue
+        name = allowed[name.casefold()]
+        if name in names:
+            problems.append("acl_duplicate_target:" + name)
+        names.append(name)
+    return names, problems
 
 
 def dialog_kind(line, main_text=MAIN_DIALOG_TEXT):
@@ -278,7 +321,7 @@ def instrument(ppo_text, log, main_text=MAIN_DIALOG_TEXT):
         if stripped.startswith("nsExec::"):
             kind = ("stop-attempt" if stripped == SC_STOP else "restart-attempt" if stripped == SC_START
                     else "sc-query" if stripped in SC_QUERIES
-                    else "icacls-attempt" if stripped in ICACLS_ATTEMPTS else None)
+                    else "icacls-attempt target=$4" if stripped in ICACLS_ATTEMPTS else None)
             require(kind is not None, "unclassified_exec")
             out.append(log_code(log, kind))
         if stripped.startswith("MessageBox "):
@@ -298,10 +341,14 @@ def parse_jsonl(text):
     return [json.loads(line) for line in text.split("\n")[:-1] if line.strip()]
 
 
-def event_problems(events, final, spec=LOCK_SPEC):
+def event_problems(events, final, spec=LOCK_SPEC, install=None):
     core = [event for event in events if event != "sc-query"]
     expected = list(spec.events_final if final else spec.events_at_dialog)
-    return [] if core == expected else ["event_sequence:" + json.dumps(core, ensure_ascii=False)]
+    extra = []
+    if spec.acl_step:
+        extra = acl_processed(core, install)[1]
+        core = [event for event in core if not event.startswith(ICACLS_EVENT)]
+    return ([] if core == expected else ["event_sequence:" + json.dumps(core, ensure_ascii=False)]) + extra
 
 
 def start_problems(starts, expected, pids, dialog_wall_ms=None):
@@ -608,8 +655,8 @@ def case_c(trial, makensis, report, spec):
     (install / "data.txt").write_bytes(b"data retained\n")
     subdir = install / ACL_SUBDIR
     keep = subdir / "keep.txt"
-    acl_targets = {"chronogazer.exe": str(install / "chronogazer.exe"), "data.txt": str(install / "data.txt"),
-                   "subdir": str(subdir)}
+    acl_targets = {"install-root": str(install), "chronogazer.exe": str(install / "chronogazer.exe"),
+                   "data.txt": str(install / "data.txt"), "subdir": str(subdir)}
     acl_before = None
     if spec.acl_step:
         subdir.mkdir()
@@ -619,7 +666,7 @@ def case_c(trial, makensis, report, spec):
     write_json(case / "before-hashes.json", before)
     if spec.acl_step:
         # 弱い ACE（BU の変更権）を用意し、installer 起動前に明示 ACE として読み戻せることを確かめる。
-        for label in ("chronogazer.exe", "data.txt"):
+        for label in ("install-root", "chronogazer.exe", "data.txt"):
             grant_weak_ace(trial, acl_targets[label], label, False)
         grant_weak_ace(trial, acl_targets["subdir"], "subdir", True)
         acl_before = read_explicit_sids(trial, case, acl_targets, "before")
@@ -717,7 +764,7 @@ def case_c(trial, makensis, report, spec):
             hashes = install_hashes(install)
             problems = ([] if entry["state"] == RUNNING and entry["pid"] == pid_b else ["scm_not_running_pid_b"])
             problems += [] if alive else ["dialog_not_alive"]
-            problems += event_problems(events, final=False, spec=spec)
+            problems += event_problems(events, final=False, spec=spec, install=str(install))
             problems += start_problems(starts, expected, [pid_a, pid_b], first["wall_ms"])
             problems += stop_problems(stops, [pid_a])
             problems += [] if hashes == before else ["install_changed"]
@@ -766,7 +813,7 @@ def case_c(trial, makensis, report, spec):
         require(child.returncode == 2, "installer_exit_not_2")
         monitor.hold(1.0, "after-exit")
         entry, events, beats = monitor.sample("after-exit")
-        problems = event_problems(events, final=True, spec=spec)
+        problems = event_problems(events, final=True, spec=spec, install=str(install))
         problems += heartbeat_problems(beats_two, beats, pid_a, pid_b, trial.run_id, trial.sha)
         problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
         problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
@@ -774,14 +821,16 @@ def case_c(trial, makensis, report, spec):
         result.update(final_events=events, final_problems=problems)
         require(not problems, "after_exit_failed:" + ','.join(problems))
         if spec.acl_step:
-            # 16b. 実 icacls は想定外サブフォルダの手前までしか進んでいない: BU は 2 ファイルから消え、subdir には残る。
+            # 16b. 実 icacls が処理した対象（events の target）と root は BU が消え、未処理の対象（subdir など）には残る。
             acl_after = read_explicit_sids(trial, case, acl_targets, "after")
+            processed, _ = acl_processed(events, str(install))
             acl_failed = acl_problems({label: set(item["explicit_sids"]) for label, item in acl_before.items()},
-                                      {label: set(item["explicit_sids"]) for label, item in acl_after.items()})
+                                      {label: set(item["explicit_sids"]) for label, item in acl_after.items()}, processed)
             if digest(keep) != keep_before:
                 acl_failed.append("keep_changed")
-            result.update(acl_after=acl_after, acl_problems=acl_failed)
-            write_json(case / "acl-proof.json", {"before": acl_before, "after": acl_after, "problems": acl_failed})
+            result.update(acl_after=acl_after, acl_problems=acl_failed, processed=processed)
+            write_json(case / "acl-proof.json", {"before": acl_before, "after": acl_after, "processed": processed,
+                                                 "problems": acl_failed})
             require(not acl_failed, "acl_failed:" + ','.join(acl_failed))
         # 17. lock 解放 → hash 再照合。
         if lock is not None:
