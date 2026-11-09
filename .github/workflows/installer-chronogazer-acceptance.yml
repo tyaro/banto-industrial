@@ -1,0 +1,100 @@
+name: Installer ChronoGazer acceptance (disposable Windows, real setup + real SCM)
+
+# #973 残件A: 本物の ChronoGazer インストーラ（scripts/build-release-chronogazer.ps1 が作る
+# setup）を silent で実行し、実 SCM・実 chronogazer-server.exe の上で通常系のライフサイクル
+# （拒否・新規・稼働中の上書き・停止中の上書き・アンインストール・再インストール）を確かめる。
+# 使い捨てランナー専用: 実 C:\Program Files\ChronoGazer と ChronoGazer サービスを書き換える。
+# 対象外: 故障系・service-install 失敗・破損 exe・可視 UI とシェル 90 秒の問い・実 collector・#392 B3-5。
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/installer-chronogazer-acceptance.yml'
+      - 'apps/chronogazer/installer/**'
+      - 'installer-common/**'
+      - 'scripts/build-release-chronogazer.ps1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-chronogazer-acceptance-${{ github.ref }}
+  # Allow in-flight cleanup to finish rather than cancel it for a new head.
+  cancel-in-progress: false
+
+jobs:
+  chronogazer-setup-acceptance:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      BANTO_973_CG_SETUP_TEST: github-hosted-disposable-only-v1
+      BANTO_973_EXPECTED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Refuse non-hosted/non-admin execution and create fresh proof roots
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted' -or $env:RUNNER_OS -ne 'Windows') { throw 'Disposable GitHub-hosted Windows only' }
+          $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+          $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+          if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Admin token required; no UAC is requested' }
+          $head = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $head -ne $env:BANTO_973_EXPECTED_SHA) { throw 'Immutable checkout SHA mismatch' }
+          $marker = "$env:GITHUB_RUN_ID`n$head`n"
+          $root = Join-Path $env:RUNNER_TEMP ('Banto973CG-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $root -ErrorAction Stop | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root 'proof') | Out-Null
+          New-Item -ItemType Directory -Path (Join-Path $root 'dist') | Out-Null
+          [IO.File]::WriteAllText((Join-Path $root '.banto-973-ci'), $marker, [Text.UTF8Encoding]::new($false))
+          "BANTO_973_CG_ROOT=$root" >> $env:GITHUB_ENV
+          "BANTO_973_CG_DIST=$(Join-Path $root 'dist')" >> $env:GITHUB_ENV
+          @{ status='not_executed'; head_sha=$head; event_sha=$env:GITHUB_SHA; run_id=$env:GITHUB_RUN_ID; run_attempt=$env:GITHUB_RUN_ATTEMPT; runner_environment=$env:RUNNER_ENVIRONMENT; workflow_sha256=(Get-FileHash -LiteralPath '.github/workflows/installer-chronogazer-acceptance.yml' -Algorithm SHA256).Hash; image_os=$env:ImageOS; image_version=$env:ImageVersion } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $root 'proof/workflow-start.json')
+      - name: Pure regressions (no SCM loading)
+        run: python -B -m unittest discover -s apps/chronogazer/installer/tests -p test_chronogazer_setup_acceptance.py
+      # Version is intentionally omitted: pnpm/action-setup resolves it from
+      # the "packageManager" field in the root package.json.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target-release
+            apps/chronogazer/installer
+      - name: Build the real release setup (scripts/build-release-chronogazer.ps1)
+        run: |
+          ./scripts/build-release-chronogazer.ps1 -OutDir $env:BANTO_973_CG_DIST
+          if ($LASTEXITCODE -ne 0 -and $null -ne $LASTEXITCODE) { exit $LASTEXITCODE }
+          Get-ChildItem -LiteralPath $env:BANTO_973_CG_DIST | Select-Object Name, Length | Format-Table | Out-String | Write-Host
+      - name: Real setup acceptance (silent setup, real SCM; disposable runner only)
+        run: python -B apps/chronogazer/installer/tests/chronogazer_setup_acceptance.py
+      - name: Independently stop and remove this run's owned services
+        if: always() && env.BANTO_973_CG_ROOT != ''
+        run: python -B apps/chronogazer/installer/tests/chronogazer_setup_acceptance.py --cleanup-only
+      - uses: actions/upload-artifact@v7
+        if: always() && env.BANTO_973_CG_ROOT != ''
+        with:
+          name: installer-chronogazer-acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ env.BANTO_973_CG_ROOT }}/proof/
+            !${{ env.BANTO_973_CG_ROOT }}/proof/**/*.exe
+            !${{ env.BANTO_973_CG_ROOT }}/proof/**/install/**
+          if-no-files-found: error
+          retention-days: 14
