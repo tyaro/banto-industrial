@@ -1,7 +1,7 @@
 # banto-hub 一体インストーラ設計（シェル・Hub・elev・サイドカー同梱）
 
 作成日: 2026-09-07
-状態: **2026-11-06: #973の登録時DeleteFlag前後検査を追加（実SCM削除保留は未試験）。 I1〜I4 完了（2026-09-07）**。2026-10-31（#973 PR-3b、実機確認は未）: NSIS テンプレートの当て直しを ChronoGazer と同じ仕組みで Hub にも入れた（写しと部品は共通の `installer-common/nsis-template/`）。事前の確かめ（インストール先の固定・ACL の戻し）を `Section WebView2` の先頭へ（WebView2 の導入と `SetOutPath` より前。PR-3a の Codex の指摘 1）、再インストールの頁を出さず常にその場で上書き（P1）、中止の道では案内の前に止めたサービスを戻し、フックが割り込めない道だけ `.onInstFailed`／`un.onUninstFailed` で戻す（P4）、`AllowSkipFiles off` と `File` の失敗での中止（P5）、アンインストールで使用中の exe・消し残った exe での中止と登録の戻し（P6）、止まり切らないサービスでの中止。P2（`CheckIfAppIsRunning` の置き換え）は当てない。§4.1・§4.3・§4.5。2026-10-31（#973 PR-3a、実機確認は未）: §4.1・§4.3 に、ChronoGazer（#972）にそろえたインストール先の固定（既定の場所の実パスだけ）と、所有者・ACL の既定への戻し（共通部品 `installer-common/install-dir-common.nsh`。オーナーのレビューで、サービスとシェルを止める前の位置に移した。WebView2・`SetOutPath` より前への確かめの移動は PR-3b）を追記。#975 で elev が Program Files の外の `banto-hub.exe` を登録しない前提も §4.1 に追記済み。2026-10-20: §8.6 に alpha.32（migration 0022・設定パッケージ版 2）の実機の DB の複製での確認を追記。2026-10-17（#630 PR-2）: §4.4・§4.3 の POSTINSTALL (4)・決定 5 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（`banto-hub-elev prepare-sink-config` が整える）に改めた（§4.3 の「`.example` から複製」という実装とのずれも直した）。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
+状態: **2026-11-09: #973 の Hub の実 setup 受入を完了（通常系 #1084、故障系 #1085。実 SCM の削除保留を含む。範囲と対象外は下の #973 の節）。2026-11-06: #973の登録時DeleteFlag前後検査を追加。 I1〜I4 完了（2026-09-07）**。以下の「実機確認は未」は、それぞれの日付の時点の記録で、#973 の変更範囲は 2026-11-09 の受入で確かめた。2026-10-31（#973 PR-3b、実機確認は未）: NSIS テンプレートの当て直しを ChronoGazer と同じ仕組みで Hub にも入れた（写しと部品は共通の `installer-common/nsis-template/`）。事前の確かめ（インストール先の固定・ACL の戻し）を `Section WebView2` の先頭へ（WebView2 の導入と `SetOutPath` より前。PR-3a の Codex の指摘 1）、再インストールの頁を出さず常にその場で上書き（P1）、中止の道では案内の前に止めたサービスを戻し、フックが割り込めない道だけ `.onInstFailed`／`un.onUninstFailed` で戻す（P4）、`AllowSkipFiles off` と `File` の失敗での中止（P5）、アンインストールで使用中の exe・消し残った exe での中止と登録の戻し（P6）、止まり切らないサービスでの中止。P2（`CheckIfAppIsRunning` の置き換え）は当てない。§4.1・§4.3・§4.5。2026-10-31（#973 PR-3a、実機確認は未）: §4.1・§4.3 に、ChronoGazer（#972）にそろえたインストール先の固定（既定の場所の実パスだけ）と、所有者・ACL の既定への戻し（共通部品 `installer-common/install-dir-common.nsh`。オーナーのレビューで、サービスとシェルを止める前の位置に移した。WebView2・`SetOutPath` より前への確かめの移動は PR-3b）を追記。#975 で elev が Program Files の外の `banto-hub.exe` を登録しない前提も §4.1 に追記済み。2026-10-20: §8.6 に alpha.32（migration 0022・設定パッケージ版 2）の実機の DB の複製での確認を追記。2026-10-17（#630 PR-2）: §4.4・§4.3 の POSTINSTALL (4)・決定 5 を、サイドカーの設定の置き場 `%ProgramData%\BantoHub\sink\`（`banto-hub-elev prepare-sink-config` が整える）に改めた（§4.3 の「`.example` から複製」という実装とのずれも直した）。I4（Windows 実機検証、§8）で新規 / 稼働中の上書き / Hub 単体インストーラからの更新 / アンインストールが設計どおり動くことを確認。判明した不具合（シェルがロック保持中の `sc start BantoHub` が `START_PENDING` で固まる）と追従 2 件（サイドカーのサービスログ置き場、デスクトップショートカット抑止）は §8.2 参照。併せて VC++ ランタイム前提を `+crt-static` で排除（決定 11、§4.7、2026-09-07）。v0.2.0-alpha.3 の配布物で実機再確認済み（§8.3）。§8.3 で見つかった停止の二重報告（#330）は v0.2.0-alpha.4 で修正し、実機確認済み（§8.4）。v0.2.0-alpha.24 の配布物で、alpha.7 からの上書きインストールと DB の移行を実機確認済み（§8.5、2026-09-27）。
 対象: Windows 向け NSIS インストーラ 1 本で、デスクトップシェル（`banto-hub-shell.exe`）・Hub 本体（`banto-hub.exe`）・UAC ヘルパ（`banto-hub-elev.exe`）・DB Sink サイドカー（`banto-hub-sink.exe`）を同じディレクトリに配置し、サービス登録と権限設定まで行う。
 
 関連: [banto-hub-t17-design.md](banto-hub-t17-design.md)（SCM 管理・profile・UAC・インストーラ再設計。§2.3 に現行インストーラの棚卸し）、[banto-hub-desktop-plan.md](banto-hub-desktop-plan.md) §16.3（配布まわりの未決事項）、[banto-hub-operations.md](banto-hub-operations.md) §12（現行インストーラのビルド手順と挙動）、[banto-hub-external-db-design.md](banto-hub-external-db-design.md) §5（サイドカー）。
@@ -18,8 +18,17 @@
 新規作成後の検査失敗では登録が残り得る。設定前の検査で失敗すると説明文・PRESHUTDOWN未設定の登録が残り、再実行は既設経路なのでPRESHUTDOWNは再試行するが説明文は補わない。自動rollback・登録の戻し・再開は行わない。
 
 OS内部のレジストリ値に依存し、最終検査後の外部削除との競合は防がない。
-検証は同じproduction完了手順のstubとHKCU専用一時キーに限定し、実SCMの削除保留は未試験。
+単体の検証は同じproduction完了手順のstubとHKCU専用一時キーに限定している。実SCMの削除保留は、下の受入で確かめた（`service-install` は保留を拒否して非0で終わり、`DeleteFlag`=1は変わらない）。
 ChronoGazerのアンインストール時の削除保留判定は別単位。
+
+### #973: 本物の setup の受入（2026-11-09）
+
+使い捨ての GitHub-hosted Windows で、`scripts/build-release.ps1` が作る本物の setup を silent で実行し、実 SCM・実 `banto-hub.exe` の上で確かめた（`apps/banto-hub/installer/tests/hub_setup_acceptance.py`、workflow `installer-hub-acceptance.yml`）。run 42623245510（head `855025d6`、14 フェーズすべて成功）。
+
+- 通常系（#1084）: インストール先の拒否、新規、弱めた ACL の稼働中の上書き、停止中の上書き、稼働中のアンインストール、再インストール、設定・データの保持。
+- 故障系（#1085）: 使用中 exe でのインストールとアンインストールの中止、事前確認（サブフォルダ・直下のジャンクション）での中止、Sink と Hub の解除失敗、Sink と Hub の削除保留。止めたサービスの再開（事前確認の中止では止めないこと）、ファイル・登録・データの不変、ジャンクション先の所有者・ACL の不変、再実行での回復を確かめた。
+
+対象外: silent で流すので MessageBox の表示と `.onInstFailed` の二重再開の有無は見ていない。icacls の非 0 終了そのもの、`File` の書込み途中の失敗、消し残り（`RequireBantoHubExesDeleted`）、サービス停止 timeout、再開失敗、Sink 稼働中、実 collector、#392 B3-5 も対象外。アンインストールの故障系は完了と終了コードを得るため `_?=` でその場で走らせた。使用中 exe は READ 共有の `CreateFileW` のロックで作った。
 
 ## 1. 背景と狙い
 
