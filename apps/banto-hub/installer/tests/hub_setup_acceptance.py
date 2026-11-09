@@ -59,6 +59,9 @@ SINK_EXAMPLE = SINK_DIR / "banto-hub-sink.toml.example"
 HUB_SVC = "BantoHub"
 SINK_SVC = "BantoHubSink"
 SERVICES = (HUB_SVC, SINK_SVC)
+# 製品が停止の待ち切り（30 秒 + 追加 60 秒）で中止する道は最短でも 90 秒掛かる。
+# それより短ければ、停止の待ち切りではない理由で中止したと分かる。
+STOP_TIMEOUT_ABORT_SECONDS = 90.0
 EXES = ("banto-hub.exe", "banto-hub-shell.exe", "banto-hub-elev.exe", "banto-hub-sink.exe")
 STATUS_URL = "http://127.0.0.1:8722/api/auth/status"
 SETUP_URL = "http://127.0.0.1:8722/api/auth/setup"
@@ -522,10 +525,15 @@ class DenyServiceDelete:
             raise RuntimeError(f"DELETE 拒否が入っていない: {now}")
         return self
 
-    def __exit__(self, *exc):
+    def __exit__(self, exc_type, exc, tb):
         if self.original is not None:
-            run(["sc", "sdset", self.name, self.original], check=True)
+            r = run(["sc", "sdset", self.name, self.original])
             self.original = None
+            if r.returncode != 0:
+                message = f"sc sdset の戻しに失敗: {self.name} -> {r.returncode}: {r.stdout}{r.stderr}"
+                print(message)
+                if exc_type is None:
+                    raise RuntimeError(message)
         return False
 
 
@@ -573,6 +581,25 @@ def uninstall_registration() -> list[str]:
 def expect(phase: str, cond: bool, message: str, observation=None) -> None:
     if not cond:
         raise PhaseFailure(phase, message, observation)
+
+
+def timed(p: str, label: str, fn):
+    """fn() の所要秒を証拠に残して (結果, 秒) を返す。"""
+    start = time.monotonic()
+    result = fn()
+    elapsed = round(time.monotonic() - start, 1)
+    obs(p, f"{label}_elapsed_seconds", elapsed)
+    return result, elapsed
+
+
+def expect_not_stop_timeout(p: str, elapsed: float) -> None:
+    """同じ観測になる「停止の待ち切りでの中止」と見分ける。"""
+    expect(
+        p,
+        elapsed < STOP_TIMEOUT_ABORT_SECONDS,
+        "abort took as long as the stop-timeout path; the intended fault may not have been reached",
+        elapsed,
+    )
 
 
 def weakened_outside(p: str, name: str):
@@ -926,8 +953,9 @@ def phase_install_locked_exe(c: Ctx) -> None:
     pid = _ensure_hub_running(p)
     tampered = _tamper_sink(p, c)
     with ExclusiveFileLock(INSTDIR / "banto-hub-sink.exe"):
-        rc = run_setup(c.setup, [], p, "locked_setup")
+        rc, elapsed = timed(p, "locked_setup", lambda: run_setup(c.setup, [], p, "locked_setup"))
     expect(p, rc != 0, "setup over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
     _expect_hub_restarted(p, pid)
     sink = sc_state(SINK_SVC)
     obs(p, "sink_state", sink)
@@ -980,8 +1008,9 @@ def phase_uninstall_locked_exe(c: Ctx) -> None:
     pid = _ensure_hub_running(p)
     before = tree_snapshot(INSTDIR)
     with ExclusiveFileLock(INSTDIR / "banto-hub-sink.exe"):
-        rc = _uninstall_in_place(p, "locked_uninstall")
+        rc, elapsed = timed(p, "locked_uninstall", lambda: _uninstall_in_place(p, "locked_uninstall"))
     expect(p, rc != 0, "uninstall over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
     _expect_hub_restarted(p, pid)
     for name in SERVICES:
         _expect_registered(p, name)
@@ -995,8 +1024,9 @@ def phase_uninstall_sink_delete_fail(c: Ctx) -> None:
     set_service_marker(SINK_SVC)
     expect(p, service_marker_present(SINK_SVC), "could not set the Sink marker")
     with DenyServiceDelete(SINK_SVC):
-        rc = _uninstall_in_place(p, "uninstall")
+        rc, elapsed = timed(p, "uninstall", lambda: _uninstall_in_place(p, "uninstall"))
     expect(p, rc != 0, "uninstall must fail when the Sink cannot be deleted", rc)
+    expect_not_stop_timeout(p, elapsed)
     _expect_hub_restarted(p, pid)
     # Sink の削除は拒まれたので、キーは作り直されていない。
     marker = service_marker_present(SINK_SVC)
