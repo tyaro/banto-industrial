@@ -202,7 +202,7 @@ const REQUIRED_BINARY_NAMES: [&str; 3] = [SHELL_BINARY_NAME, SERVER_BINARY_NAME,
 /// 手動で追従させる（Hub のインストーラと同じ）。バージョンを上げたらここも更新する
 /// こと。`scripts/build-release-chronogazer.ps1` は生成物のファイル名をルートの
 /// 版から組み立てるので、ずれると「インストーラが見つかりません」で止まる。
-const PRODUCT_VERSION: &str = "0.3.0-alpha.1";
+const PRODUCT_VERSION: &str = "0.3.0-alpha.2";
 
 /// [`VENDORED_TEMPLATE`] に当てる置き換え（`(名前, 土台, 置き換え後)`）。土台は
 /// 写しの中に**ちょうど 1 回**現れる文字列でなければならず、違えば
