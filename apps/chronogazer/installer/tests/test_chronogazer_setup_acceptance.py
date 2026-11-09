@@ -156,6 +156,11 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(c.host_healthy(200, {}, "s"))
         self.assertFalse(c.host_healthy(200, [], "s"))
 
+    def test_endpoint_pid_matches(self):
+        self.assertTrue(c.endpoint_pid_matches(10, 10))
+        for a, b in ((10, 11), (None, 10), (10, None), (0, 0), (-1, -1), (True, True), ("10", "10")):
+            self.assertFalse(c.endpoint_pid_matches(a, b), msg=(a, b))
+
     def test_request_headers_carry_csrf_header(self):
         self.assertEqual(c.host_request_headers()["X-Banto-Client"], "banto")
         self.assertEqual(c.HOST_PATH, "/api/host")

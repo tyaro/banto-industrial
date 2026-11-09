@@ -205,6 +205,18 @@ def host_healthy(status: int, body, endpoint_scope: str) -> bool:
     )
 
 
+def endpoint_pid_matches(endpoint_pid, service_pid) -> bool:
+    """endpoint.json の pid が、いま SCM が報告しているサービスの PID と一致するか。
+
+    scope は DB のパス由来で再起動の前後で同じなので、これが無いと、STOPPED の報告の後も
+    port を握ったままの前のプロセスを「いま起動したプロセス」と区別できない。
+    """
+    for pid in (endpoint_pid, service_pid):
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            return False
+    return endpoint_pid == service_pid
+
+
 def host_request_headers() -> dict:
     # service_probe.rs の fetch_host と同じ（CSRF のヘッダー X-Banto-Client が要る）。
     return {"X-Banto-Client": "banto", "Accept": "application/json"}
@@ -354,16 +366,19 @@ def http_get_json(url: str, timeout: float = 5):
 
 
 def wait_healthy(timeout: float = 90) -> dict:
-    """製品（シェルの起動判定）と同じ要求で Healthy を待つ: endpoint.json の port へ
-    `GET /api/host`（X-Banto-Client 付き）が 200 かつ product/hostKind/scope が一致。"""
+    """Healthy を待つ: endpoint.json の port へ `GET /api/host`（X-Banto-Client 付き、シェルの
+    起動判定と同じ要求）が 200 かつ product/hostKind/scope が一致し、endpoint.json の pid が
+    SCM の PID と一致すること。シェルが見る pid の生存確認と自分の DB の scope は見ない。"""
     last: list = []
 
     def p():
         try:
             ep = parse_endpoint(ENDPOINT_FILE.read_text(encoding="utf-8"))
             code, body = http_get_json(f"http://127.0.0.1:{ep['port']}{HOST_PATH}")
-            last[:] = [ep, code, body]
-            return {"endpoint": ep, "body": body} if host_healthy(code, body, ep["scope"]) else None
+            service_pid = sc_state()["pid"]
+            last[:] = [ep, code, body, service_pid]
+            healthy = host_healthy(code, body, ep["scope"]) and endpoint_pid_matches(ep["pid"], service_pid)
+            return {"endpoint": ep, "body": body, "service_pid": service_pid} if healthy else None
         except Exception as e:  # noqa: BLE001 - 立ち上がるまでの待ち
             last[:] = [repr(e)]
             return None
