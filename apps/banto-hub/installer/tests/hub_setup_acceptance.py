@@ -167,6 +167,14 @@ def evidence_has_secret(evidence, secret: str) -> bool:
     return secret in json.dumps(evidence, ensure_ascii=False)
 
 
+def request_headers(has_body: bool) -> dict:
+    # Hub の /api/auth/* は CSRF のミドルウェアの内側にあるため、GET・POST とも付ける。
+    headers = {"X-Banto-Client": "banto"}
+    if has_body:
+        headers["Content-Type"] = "application/json"
+    return headers
+
+
 # ---------------------------------------------------------------- OS 操作
 
 EVIDENCE: dict = {"phases": {}}
@@ -253,9 +261,7 @@ def wait_state(name: str, want: str, timeout: float = 90) -> dict:
 
 def http_json(url: str, body: dict | None = None, timeout: float = 10):
     data = json.dumps(body).encode() if body is not None else None
-    req = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"} if data else {}
-    )
+    req = urllib.request.Request(url, data=data, headers=request_headers(data is not None))
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read() or b"{}")

@@ -113,6 +113,14 @@ class FileTests(unittest.TestCase):
             self.assertNotEqual(before, h.tree_hashes(Path(d)))
 
 
+class RequestHeaderTests(unittest.TestCase):
+    def test_get_and_post_carry_client_header_and_only_post_has_content_type(self):
+        get = h.request_headers(False)
+        post = h.request_headers(True)
+        self.assertEqual(get, {"X-Banto-Client": "banto"})
+        self.assertEqual(post, {"X-Banto-Client": "banto", "Content-Type": "application/json"})
+
+
 class SecretTests(unittest.TestCase):
     def test_password_random_and_not_in_evidence(self):
         a, b = h.random_password(), h.random_password()
