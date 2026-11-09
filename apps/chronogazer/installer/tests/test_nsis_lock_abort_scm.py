@@ -271,9 +271,12 @@ class AclCase(unittest.TestCase):
             lock.saved_sddl("only one line".encode("utf-16-le"))
 
     def test_acl_problems(self):
-        weak = {"install-root": {"BU"}, "chronogazer.exe": {"BU"}, "data.txt": {"BU", "SY"}, "subdir": {"BU"}}
-        both = ["chronogazer.exe", "data.txt", "chronogazer-elev.exe"]
-        good_after = {"install-root": set(), "chronogazer.exe": set(), "data.txt": set(), "subdir": {"BU"}}
+        labels = ("install-root", "chronogazer.exe", "chronogazer-server.exe", "chronogazer-elev.exe", "data.txt", "subdir")
+        self.assertEqual(lock.ACL_LABELS, labels)
+        weak = {label: {"BU"} for label in labels}
+        weak["data.txt"] = {"BU", "SY"}
+        both = ["chronogazer.exe", "data.txt", "chronogazer-elev.exe", "chronogazer-server.exe"]
+        good_after = dict(weak, **{label: set() for label in labels if label != "subdir"})
         self.assertEqual(lock.acl_problems(weak, good_after, both), [])
         self.assertIn("acl_before_missing_data.txt", lock.acl_problems(dict(weak, **{"data.txt": set()}), good_after, both))
         self.assertIn("acl_before_missing_install-root", lock.acl_problems(dict(weak, **{"install-root": set()}), good_after, both))
@@ -282,10 +285,25 @@ class AclCase(unittest.TestCase):
         self.assertIn("acl_after_still_weak_install-root",
                       lock.acl_problems(weak, dict(good_after, **{"install-root": {"BU"}}), both))
 
+    def test_acl_problems_cover_every_exe(self):
+        weak = {label: {"BU"} for label in lock.ACL_LABELS}
+        gone = {label: set() for label in lock.ACL_LABELS if label != "subdir"}
+        gone["subdir"] = {"BU"}
+        every = [label for label in lock.ACL_LABELS if label.endswith((".exe", ".txt"))]
+        for label in ("chronogazer-server.exe", "chronogazer-elev.exe"):
+            # processed にあるのに BU が残る。
+            self.assertIn("acl_after_still_weak_" + label,
+                          lock.acl_problems(weak, dict(gone, **{label: {"BU"}}), every))
+            # processed に無いのに BU が消える。
+            self.assertIn("acl_after_changed_" + label,
+                          lock.acl_problems(weak, gone, [name for name in every if name != label]))
+            # grant 前に BU が無い。
+            self.assertIn("acl_before_missing_" + label, lock.acl_problems(dict(weak, **{label: set()}), gone, every))
+
     def test_acl_problems_follow_processed(self):
-        weak = {"install-root": {"BU"}, "chronogazer.exe": {"BU"}, "data.txt": {"BU"}, "subdir": {"BU"}}
+        weak = {label: {"BU"} for label in lock.ACL_LABELS}
         # サブフォルダが最初: 何も処理されず、root だけ消える。ファイルは残る。
-        first = {"install-root": set(), "chronogazer.exe": {"BU"}, "data.txt": {"BU"}, "subdir": {"BU"}}
+        first = dict(weak, **{"install-root": set()})
         self.assertEqual(lock.acl_problems(weak, first, []), [])
         # 処理済みなのに残る / 未処理なのに消える。
         self.assertIn("acl_after_still_weak_data.txt", lock.acl_problems(weak, first, ["data.txt"]))

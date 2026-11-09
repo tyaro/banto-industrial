@@ -22,7 +22,7 @@ Stop -> RequireInactive the real ResetChronoGazerInstallDirAcl runs the real ica
 the root and the direct entries enumerated before the sub-folder (the Windows enumeration
 order is not guaranteed, so each icacls target is recorded as it is processed), then enters
 the real AbortInstallDirAcl on the sub-folder (INSTALL_DIR_COMMON_ON_ACL_ABORT restarts the
-dummy before the main dialog). Weak BU ACEs are put on the install root, chronogazer.exe,
+dummy before the main dialog). Weak BU ACEs are put on the install root, every exe,
 data.txt and the sub-folder beforehand and the explicit ACEs are read back with icacls /save
 before and after; BU must be gone from the root and from every processed target and must
 remain on the unprocessed ones. Limit: this proves the sub-folder path only, NOT an icacls failure itself (a non-zero icacls exit is out of scope).
@@ -232,13 +232,13 @@ def saved_sddl(raw):
     return lines[1].strip()
 
 
-ACL_LABELS = ("install-root", "chronogazer.exe", "data.txt", "subdir")
+ACL_LABELS = ("install-root", *EXES, "data.txt", "subdir")
 
 
 def acl_problems(before, after, processed):
     """before/after: {label: 明示 ACE の SID 集合}。processed: icacls が実際に処理した直下の名前。
     install-root（常に処理される）と processed の label は BU が消え、processed に無い label（subdir を含む）は
-    BU が残ること。processed は grant していないファイルも含みうるので、ACL_LABELS の label だけを判定する。"""
+    BU が残ること。ACL_LABELS（全 exe・data.txt・subdir）はすべて grant 済みなので、processed の名前はすべて判定に使われる。"""
     problems = []
     for label in ACL_LABELS:
         if WEAK_SID not in before.get(label, set()):
@@ -655,8 +655,8 @@ def case_c(trial, makensis, report, spec):
     (install / "data.txt").write_bytes(b"data retained\n")
     subdir = install / ACL_SUBDIR
     keep = subdir / "keep.txt"
-    acl_targets = {"install-root": str(install), "chronogazer.exe": str(install / "chronogazer.exe"),
-                   "data.txt": str(install / "data.txt"), "subdir": str(subdir)}
+    acl_targets = {"install-root": str(install), **{name: str(install / name) for name in (*EXES, "data.txt")},
+                   "subdir": str(subdir)}
     acl_before = None
     if spec.acl_step:
         subdir.mkdir()
@@ -666,9 +666,8 @@ def case_c(trial, makensis, report, spec):
     write_json(case / "before-hashes.json", before)
     if spec.acl_step:
         # 弱い ACE（BU の変更権）を用意し、installer 起動前に明示 ACE として読み戻せることを確かめる。
-        for label in ("install-root", "chronogazer.exe", "data.txt"):
-            grant_weak_ace(trial, acl_targets[label], label, False)
-        grant_weak_ace(trial, acl_targets["subdir"], "subdir", True)
+        for label in ACL_LABELS:
+            grant_weak_ace(trial, acl_targets[label], label, label == "subdir")
         acl_before = read_explicit_sids(trial, case, acl_targets, "before")
         result["acl_before"] = acl_before
         before_problems = [f"acl_before_missing_{label}" for label, item in acl_before.items()
