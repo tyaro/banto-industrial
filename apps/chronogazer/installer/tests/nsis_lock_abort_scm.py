@@ -43,6 +43,19 @@ The sc query count between sc stop and the dialog is exactly 92 (30 + 2 + 60) an
 Positive control: removing hold-stop.txt lets the dummy exit (hold-end released, STOPPED); a new start gets a new PID.
 Limit: the PENDING-for-30+60-seconds path only. The path where the service becomes STOPPED during the extra wait and the
 install continues, and the path rejected while still RUNNING, are out of scope.
+
+Case C-copy-fail: the real RequireChronoGazerInstallExesUnlocked passes, then the real NSIS File cannot open chronogazer-server.exe
+for writing and aborts internally (AllowSkipFiles off, so there is no Ignore). The failure is injected by holding the exe
+as a read-only memory-mapped view (CreateFileW GENERIC_READ share 7 + CreateFileMappingW PAGE_READONLY + MapViewOfFile): the
+pre-check's FileOpen a (READ|WRITE, OPEN_ALWAYS) still succeeds and only File's CREATE_ALWAYS fails. The first file
+(chronogazer.exe) is already replaced, the second (server) and third (elev) stay as they were. Flow: Stop -> pre-check ->
+copy-begins (flag 1, STOPPED/pid 0) -> the NSIS File error dialog (Retry/Cancel; the service stays stopped) -> Cancel -> the
+failed page. While the main window is open the service is NOT restarted (the design's known delay). Closing the main window
+runs .onInstFailed, which really runs sc start once (new PID, RUNNING) and shows the info MessageBox (flag 0). Its OK ends
+the installer with exit code 2; the service stays RUNNING with the same PID (no double restart).
+RequireChronoGazerFilesCopied after the File lines must not be reached (it would log other-dialog / restart-attempt).
+Limit: the open-stage failure only (CREATE_ALWAYS refused by a user-mapped section). Failures in the middle of a write (disk full,
+I/O error), a race between the pre-check and the copy, and the Retry path are out of scope.
 """
 
 import argparse
@@ -90,6 +103,11 @@ STOP_PENDING_DIALOG_PREFIX = "ChronoGazer サービスの停止がまだ終わ�
 STOP_WAIT_QUERIES = 92
 STOP_HOLD_MIN_MS = 85_000  # 30 秒 + 60 秒の待ち（Sleep 29 + 59 回 = 88 秒）より少し短い下限。
 WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
+# C-copy-fail: NSIS の File エラー dialog（MB_RETRYCANCEL）と、.onInstFailed の情報 MessageBox の文面。
+FILE_ERROR_PREFIX = "Error opening file for writing:"
+CALLBACK_RESTARTED_TEXT = "止めていた ChronoGazer サービスを再開しました。"
+FIRST_COPIED_EXE = "chronogazer.exe"  # File の 1 個目。開けない server の手前で新しい内容に置き換わる。
+IDCANCEL, IDRETRY = 2, 4
 
 SC_QUERIES = tuple("nsExec::ExecToStack 'cmd /c sc query \"ChronoGazer\" | findstr /C:\"" + state + "\" >nul'"
                    for state in ("RUNNING", "STOPPED", "PENDING"))
@@ -129,6 +147,11 @@ STOP_HELD_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "main-dialog fla
 
 ACL_MAIN_FIXED = "の所有者・アクセス権を既定に戻せませんでした"
 ACL_REASON_TEXT = "インストール先の中にサブフォルダがあります"
+# C-copy-fail: 再開は .onInstFailed（主窓を閉じた後）まで起きない。copy-begins まで進み、File が内部中止する。
+COPY_FAIL_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "copy-begins")
+COPY_FAIL_EVENTS_FINAL = COPY_FAIL_EVENTS_AT_DIALOG + ("callback-before flag=1", "restart-attempt",
+                                                       "callback-dialog flag=0", "callback-after flag=0")
+
 ACL_SUBDIR = "zz-unexpected-subdir"  # 想定外のサブフォルダ。処理済みの対象に出てはならない（出れば中止の前に icacls が触れている）。
 WEAK_SID = "BU"
 WEAK_SID_ARG = "*S-1-5-32-545"
@@ -189,6 +212,63 @@ def acl_dialog_matches(text, install):
             and f"対象: {install}\\{ACL_SUBDIR}" in text)
 
 
+def file_error_matches(text, install):
+    return (text.startswith(FILE_ERROR_PREFIX) and f"{install}\\{LOCKED_EXE}" in text
+            and "Click Retry to try again" in text)
+
+
+def callback_restarted_matches(text):
+    return text == CALLBACK_RESTARTED_TEXT
+
+
+def retry_cancel_button(children, control_id_of):
+    """File エラー dialog の Cancel。visible な Button がちょうど 2 つで ID が {IDCANCEL, IDRETRY}（ロケールに依らない）。"""
+    buttons = [c for c in children if c["class"].casefold() == "button" and c["visible"]]
+    ids = {c["hwnd"]: int(control_id_of(c["hwnd"])) for c in buttons}
+    require(len(buttons) == 2 and set(ids.values()) == {IDCANCEL, IDRETRY}, "retry_cancel_buttons_not_exact")
+    return next(c for c in buttons if ids[c["hwnd"]] == IDCANCEL)
+
+
+def partial_hashes(before, payload_digest):
+    """File の 1 個目だけが新しい内容に置き換わった後の hash。"""
+    return {**before, FIRST_COPIED_EXE: payload_digest}
+
+
+def callback_dialogs(windows, children_of, pid, caption, main_hwnd):
+    """.onInstFailed の情報 MessageBox。owner の有無は問わない（主窓 main_hwnd は除く）。(見つかった窓 or None, 想定外の窓の一覧)。"""
+    found, unexpected = [], []
+    for window in windows:
+        if not (window["pid"] == pid and window["class"] == DIALOG_CLASS and window["visible"]
+                and window["hwnd"] != main_hwnd and window["title"] == caption):
+            continue
+        kind = classify_dialog_children(children_of(window["hwnd"]), matches=callback_restarted_matches)
+        if kind == "main":
+            found.append(window)
+        elif kind == "other":
+            unexpected.append(window)
+    require(len(found) <= 1, "ambiguous_callback_dialog")
+    return (found[0] if found else None), unexpected
+
+
+def callback_event_problems(events):
+    """callback dialog が出ている間の events（sc-query を除く）: callback-after はまだ出ていない。"""
+    core = [event for event in events if event != "sc-query"]
+    return [] if core == list(COPY_FAIL_EVENTS_FINAL[:-1]) else ["callback_event_sequence:" + json.dumps(core, ensure_ascii=False)]
+
+
+def copy_fail_timeline_problems(timeline, pid_b):
+    """file-error / after-cancel / failed-page は STOPPED・pid 0、callback-dialog / after-exit は RUNNING・pid_b。各 phase が 1 件以上。"""
+    problems = []
+    for phase, state, pid in (("file-error", STOPPED, 0), ("after-cancel", STOPPED, 0), ("failed-page", STOPPED, 0),
+                              ("callback-dialog", RUNNING, pid_b), ("after-exit", RUNNING, pid_b)):
+        rows = [entry for entry in timeline if entry["phase"] == phase]
+        if not rows:
+            problems.append("timeline_phase_missing_" + phase)
+        elif any(entry["state"] != state or entry["pid"] != pid for entry in rows):
+            problems.append("timeline_phase_not_steady_" + phase)
+    return problems
+
+
 @dataclass(frozen=True)
 class CaseSpec:
     name: str
@@ -202,6 +282,7 @@ class CaseSpec:
     restart_fails: bool = False  # Disabled を注入し、再開が 1058 で失敗する（警告 → 主 dialog の順）。
     stop_held: bool = False  # dummy に停止を保留させ、STOP_PENDING のまま 30 + 60 秒待って中止する。
     dialog_wait: int = 90    # 主 dialog を待つ上限（秒）。
+    copy_fails: bool = False  # server をメモリマップで保持し、File の書込み用 open だけを失敗させる。
 
 
 CASES = {spec.name: spec for spec in (
@@ -215,6 +296,8 @@ CASES = {spec.name: spec for spec in (
     CaseSpec("C-stop-timeout", False, False, STOP_PENDING_MAIN_TEXT, stop_pending_dialog_matches,
              STOP_HELD_EVENTS_AT_DIALOG, STOP_HELD_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO,
              stop_held=True, dialog_wait=180),
+    CaseSpec("C-copy-fail", False, False, MAIN_DIALOG_TEXT, file_error_matches,
+             COPY_FAIL_EVENTS_AT_DIALOG, COPY_FAIL_EVENTS_FINAL, ALLOWED_PPO, copy_fails=True),
 )}
 LOCK_SPEC = CASES["C-server-locked"]
 
@@ -226,6 +309,7 @@ AutoCloseWindow false
 Name "@NAME@"
 Caption "@NAME@"
 OutFile "@OUT@"
+AllowSkipFiles off
 Page instfiles
 !include "LogicLib.nsh"
 !define BANTO_INSTALLER_COMMON_DIR "@COMMON@"
@@ -247,6 +331,7 @@ Section
   File "/oname=chronogazer.exe" "@PAYLOAD@"
   File "/oname=chronogazer-server.exe" "@PAYLOAD@"
   File "/oname=chronogazer-elev.exe" "@PAYLOAD@"
+  !insertmacro RequireChronoGazerFilesCopied
 SectionEnd
 Function .onInstFailed
   @CALLBACK_BEFORE@
@@ -835,6 +920,8 @@ def case_c(trial, makensis, report, spec):
     matches = lambda text: spec.dialog_matches(text, str(install))
     log = case / "events.log"
     harness = build_harness(trial, makensis, case, install, log, name, spec)
+    # File が失敗した後に残るのは 1 個目だけが新しい内容のインストール先。通常ケースは元のまま。
+    want_hashes = partial_hashes(before, digest(case / "payload.bin")) if spec.copy_fails else before
     api = API()
     bind = gui.bind
     bind(api.u, "GetWindow", [W.HWND, W.UINT], W.HWND)
@@ -842,9 +929,26 @@ def case_c(trial, makensis, report, spec):
     bind(api.u, "GetDlgCtrlID", [W.HWND], C.c_int)
     kernel = win32_api()
     invalid = C.c_void_p(-1).value
+    bind(kernel, "CreateFileMappingW", [C.c_void_p, C.c_void_p, W.DWORD, W.DWORD, W.DWORD, C.c_wchar_p], C.c_void_p)
+    bind(kernel, "MapViewOfFile", [C.c_void_p, W.DWORD, W.DWORD, W.DWORD, C.c_size_t], C.c_void_p)
+    bind(kernel, "UnmapViewOfFile", [C.c_void_p], W.BOOL)
     lock = None
+    mapped = None  # (file handle, mapping handle, view)
     child = None
     last_windows = []
+
+    def release_mapped():
+        """unmap → mapping を閉じる → file を閉じる。二重に呼んでも 2 回目は何もしない。成功なら True。"""
+        nonlocal mapped
+        held, mapped = mapped, None
+        if held is None:
+            return True
+        file_handle, mapping, view = held
+        results = [bool(kernel.UnmapViewOfFile(view)) if view else True,
+                   bool(kernel.CloseHandle(mapping)) if mapping else True,
+                   bool(kernel.CloseHandle(file_handle))]
+        return all(results)
+
     try:
         # 10. lock（nsis_precopy.py と同じ開き方）と自己検証。
         if spec.lock_server:
@@ -855,6 +959,20 @@ def case_c(trial, makensis, report, spec):
             if probe not in (None, invalid):
                 kernel.CloseHandle(probe)
             require(probe in (None, invalid), "lock_did_not_deny_write")
+        if spec.copy_fails:
+            # 故障の注入: READ で開いてメモリマップを保持する（事前確認の FileOpen a は通り、File の CREATE_ALWAYS だけが失敗する）。
+            target = str(install / LOCKED_EXE)
+            file_handle = kernel.CreateFileW(target, 0x80000000, 7, None, 3, 0, None)
+            require(file_handle not in (None, invalid), "copy_fail_fixture_open_failed")
+            mapping = kernel.CreateFileMappingW(file_handle, None, 2, 0, 0, None)
+            view = kernel.MapViewOfFile(mapping, 4, 0, 0, 0) if mapping else None
+            mapped = (file_handle, mapping, view)
+            require(bool(mapping) and bool(view), "copy_fail_fixture_map_failed")
+            # 自己検証: 事前確認と同じ開き方（READ|WRITE・share 1・OPEN_ALWAYS）が通ること。
+            precheck = kernel.CreateFileW(target, 0xC0000000, 1, None, 4, 0, None)
+            if precheck not in (None, invalid):
+                kernel.CloseHandle(precheck)
+            require(precheck not in (None, invalid), "copy_fail_fixture_precheck_would_fail")
         # 11. 起動と timeline。
         environment = dict(os.environ)
         environment["PATH"] = str(Path(os.environ["SystemRoot"]) / "System32")
@@ -874,7 +992,7 @@ def case_c(trial, makensis, report, spec):
             problems += event_check(events)
             problems += start_problems(starts, expected, [pid_a])
             problems += stop_problems(stops, [pid_a])
-            problems += [] if hashes == before else ["install_changed"]
+            problems += [] if hashes == want_hashes else ["install_changed"]
             if beats_earlier is not None:
                 problems += stopped_heartbeat_problems(beats_earlier, beats, pid_a)
             observed = {"label": label, "entry": entry, "events": events, "starts": starts, "stops": stops,
@@ -883,7 +1001,160 @@ def case_c(trial, makensis, report, spec):
             require(not problems, label + "_failed:" + ','.join(problems))
             return beats
 
+        def retire_service(second_pid):
+            """後片付け: 停止 → stops 2 行 → dummy uninstall → 消滅。"""
+            trial.stop()
+            trial.wait_state(STOPPED, 30)
+            require(not stop_problems(trial.jsonl("stops.jsonl"), [pid_a, second_pid]), "final_stops_mismatch")
+            require(trial.call([trial.dummy, "uninstall"], "dummy-uninstall").returncode == 0, "dummy_uninstall_failed")
+            trial.wait_absent(SERVICE)
+            result["double_restart_absent"] = True
+
+        def run_copy_fail():
+            """C-copy-fail: File エラー dialog → Cancel → 失敗の頁（再開しない）→ 主窓を閉じる → 再開と情報 MessageBox。"""
+            def save_png(window, filename, key):
+                try:
+                    width, height, rgb = api.capture(window["rect"])
+                    (case / filename).write_bytes(png_bytes(width, height, rgb))  # 画素は assert しない。
+                except Exception as error:
+                    result[key] = str(error)
+
+            # 1. File エラー dialog を待つ。
+            dialog = None
+            deadline = time.monotonic() + spec.dialog_wait
+            while dialog is None:
+                require(child.poll() is None, "installer_exited_before_file_error")
+                windows = with_owner(api, api.windows(child.pid))
+                dialog, unexpected = judge_dialogs(windows, children_of, child.pid, name, matches)
+                require(not unexpected, "unexpected_dialog")
+                shown, events, beats_shown = monitor.sample("file-error" if dialog else "before-dialog")
+                require(dialog is not None or time.monotonic() < deadline, "file_error_dialog_not_seen_within_limit")
+                if dialog is None:
+                    time.sleep(.15)
+            dialog_children = children_of(dialog["hwnd"])
+            write_json(case / "file-error.json", {"dialog": dialog, "children": dialog_children, "windows": windows})
+            save_png(dialog, "file-error.png", "file_error_png_error")
+            result["file_error_wall_ms"] = shown["wall_ms"]
+            # 2. 観測 2 回: STOPPED・pid 0 のまま（再開はまだ）。
+            check = lambda found: event_problems(found, final=False, spec=spec)
+            beats1 = observe_stopped("file-error-1", dialog, "file-error", check, None)
+            monitor.hold(1.5, "file-error")
+            observe_stopped("file-error-2", dialog, "file-error", check, beats1)
+            # 3. Cancel。
+            button = retry_cancel_button(dialog_children, lambda hwnd: int(api.u.GetDlgCtrlID(hwnd)))
+            result["cancel_button"] = {"hwnd": button["hwnd"], "control_id": IDCANCEL}
+            require(bool(api.u.PostMessageW(dialog["hwnd"], WM_COMMAND, (BN_CLICKED << 16) | IDCANCEL, button["hwnd"])),
+                    "PostMessage_BN_CLICKED_failed_cancel")
+            deadline = time.monotonic() + 10
+            while api.u.IsWindow(dialog["hwnd"]):
+                require(time.monotonic() < deadline, "file_error_dialog_did_not_close")
+                monitor.sample("after-cancel")
+                time.sleep(.15)
+            monitor.sample("after-cancel")
+            # 4. 失敗の頁: 主窓が開いている間は再開されない（設計書の既知の遅延）。
+            monitor.hold(2.0, "failed-page")
+            entry, events, beats_page = monitor.sample("failed-page")
+            windows = with_owner(api, api.windows(child.pid))
+            starts, stops = trial.jsonl("starts.jsonl"), trial.jsonl("stops.jsonl")
+            hashes = install_hashes(install)
+            problems = [] if child.poll() is None else ["installer_not_alive_on_failed_page"]
+            problems += [] if entry["state"] == STOPPED and entry["pid"] == 0 else ["scm_not_stopped"]
+            problems += event_problems(events, final=False, spec=spec)
+            problems += [] if not owned_dialogs(windows, child.pid) else ["unexpected_owned_dialog"]
+            problems += [] if hashes == want_hashes else ["install_changed"]
+            problems += start_problems(starts, expected, [pid_a])
+            problems += stopped_heartbeat_problems(beats1, beats_page, pid_a)
+            write_json(case / "failed-page.json", {"entry": entry, "events": events, "starts": starts, "stops": stops,
+                                                   "windows": windows, "hashes": hashes, "problems": problems})
+            require(not problems, "failed_page_failed:" + ','.join(problems))
+            # 5. 主窓を閉じ、.onInstFailed の情報 MessageBox を待つ。
+            mains = main_windows(windows, child.pid)
+            require(len(mains) == 1, "main_window_not_unique")
+            main_window = mains[0]
+            result["main_window"] = main_window
+            require(bool(api.u.PostMessageW(main_window["hwnd"], WM_CLOSE, 0, 0)), "PostMessage_WM_CLOSE_failed")
+            callback = None
+            deadline = time.monotonic() + 60
+            while callback is None:
+                require(child.poll() is None, "installer_exited_before_callback_dialog")
+                windows = with_owner(api, api.windows(child.pid))
+                callback, unexpected = callback_dialogs(windows, children_of, child.pid, name, main_window["hwnd"])
+                require(not unexpected, "unexpected_dialog_at_callback")
+                if callback is None:
+                    monitor.sample("closing")
+                    require(time.monotonic() < deadline, "callback_dialog_not_seen_within_60s")
+                    time.sleep(.15)
+            first, events, beats_first = monitor.sample("callback-dialog")
+            pid_b = first["pid"]
+            result.update(pid_b=pid_b, callback_dialog=callback, dialog_wall_ms=first["wall_ms"])
+            require(first["state"] == RUNNING, "not_running_when_callback_dialog_detected")
+            require(pid_b != pid_a, "pid_reused_rerun_required")
+            callback_children = children_of(callback["hwnd"])
+            write_json(case / "callback-dialog.json", {"dialog": callback, "children": callback_children, "windows": windows})
+            save_png(callback, "callback-dialog.png", "callback_dialog_png_error")
+
+            # 6. 観測 2 回: RUNNING・pid_b、再開は 1 回、callback-after はまだ。
+            def observe_callback(label, beats_earlier):
+                entry, events, beats = monitor.sample("callback-dialog")
+                starts, stops = trial.jsonl("starts.jsonl"), trial.jsonl("stops.jsonl")
+                alive = bool(api.u.IsWindow(callback["hwnd"]))
+                hashes = install_hashes(install)
+                problems = [] if entry["state"] == RUNNING and entry["pid"] == pid_b else ["scm_not_running_pid_b"]
+                problems += [] if alive else ["dialog_not_alive"]
+                problems += callback_event_problems(events)
+                problems += start_problems(starts, expected, [pid_a, pid_b], first["wall_ms"])
+                problems += stop_problems(stops, [pid_a])
+                problems += [] if hashes == want_hashes else ["install_changed"]
+                if beats_earlier is not None:
+                    problems += heartbeat_problems(beats_earlier, beats, pid_a, pid_b, trial.run_id, trial.sha)
+                write_json(case / f"{label}.json", {"label": label, "entry": entry, "events": events, "starts": starts,
+                                                    "stops": stops, "heartbeat_tail": beats[-3:], "dialog_alive": alive,
+                                                    "hashes": hashes, "problems": problems})
+                require(not problems, label + "_failed:" + ','.join(problems))
+                return beats
+
+            beats_c1 = observe_callback("callback-observation-1", None)
+            monitor.hold(1.5, "callback-dialog")
+            beats_c2 = observe_callback("callback-observation-2", beats_c1)
+            # 7. OK を押して終了を待つ（新しい dialog が出たら失敗）。
+            ok = ok_button(callback_children)
+            control_id = int(api.u.GetDlgCtrlID(ok["hwnd"]))
+            require(control_id > 0, "ok_button_control_id_invalid")
+            result["ok_button"] = {"hwnd": ok["hwnd"], "control_id": control_id}
+            require(bool(api.u.PostMessageW(callback["hwnd"], WM_COMMAND, (BN_CLICKED << 16) | control_id, ok["hwnd"])),
+                    "PostMessage_BN_CLICKED_failed")
+            deadline = time.monotonic() + 30
+            while child.poll() is None:
+                require(time.monotonic() < deadline, "installer_did_not_exit_after_ok")
+                windows = with_owner(api, api.windows(child.pid))
+                require(not [w for w in owned_dialogs(windows, child.pid) if w["hwnd"] != callback["hwnd"]],
+                        "unexpected_dialog_after_ok")
+                monitor.sample("closing")
+                time.sleep(.15)
+            result["returncode"] = child.returncode
+            require(child.returncode == 2, "installer_exit_not_2")
+            # 8. exit 後。
+            monitor.hold(1.0, "after-exit")
+            entry, events, beats = monitor.sample("after-exit")
+            problems = event_problems(events, final=True, spec=spec)
+            problems += heartbeat_problems(beats_c2, beats, pid_a, pid_b, trial.run_id, trial.sha)
+            problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
+            problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
+            problems += copy_fail_timeline_problems(monitor.timeline, pid_b)
+            result.update(final_events=events, final_problems=problems)
+            require(not problems, "after_exit_failed:" + ','.join(problems))
+            # 9. mapping を解放して hash を照合（server・elev・data.txt は元のまま、chronogazer.exe だけ新しい）。
+            require(release_mapped(), "mapping_release_failed")
+            final_hashes = install_hashes(install)
+            require(final_hashes[LOCKED_EXE] == before[LOCKED_EXE], "server_exe_changed")
+            require(final_hashes == want_hashes, "install_changed_after_release")
+            # 10. 後片付け。
+            retire_service(pid_b)
+            return result
+
         wait_phase = "before-dialog"
+        if spec.copy_fails:
+            return run_copy_fail()
         if spec.restart_fails:
             # 再開の失敗の警告（主 dialog より前）。検出まで before-dialog、検出後 warning。
             warning = None
@@ -1091,13 +1362,7 @@ def case_c(trial, makensis, report, spec):
                 time.sleep(.2)
             require(control_heartbeat_ok(), "positive_control_heartbeat_not_advancing")
             second_pid = pid_c
-        # 18. 後片付け（本経路）: 停止 → stops 2 行 → dummy uninstall → 消滅。
-        trial.stop()
-        trial.wait_state(STOPPED, 30)
-        require(not stop_problems(trial.jsonl("stops.jsonl"), [pid_a, second_pid]), "final_stops_mismatch")
-        require(trial.call([trial.dummy, "uninstall"], "dummy-uninstall").returncode == 0, "dummy_uninstall_failed")
-        trial.wait_absent(SERVICE)
-        result["double_restart_absent"] = True
+        retire_service(second_pid)
         return result
     finally:
         if child is not None and child.poll() is None:
@@ -1114,6 +1379,7 @@ def case_c(trial, makensis, report, spec):
                     result["installer_still_running"] = True
         if lock is not None:
             kernel.CloseHandle(lock)
+        release_mapped()
         write_json(case / "windows-last.json", last_windows)
         write_json(case / "result.json", result)
         trial.collect_dummy_logs()
@@ -1152,6 +1418,9 @@ def main():
                         "(returns to STOPPED right after start) and 30 s 'timeout' outcomes are out of scope; "
                         "C-stop-timeout: the stay-STOP_PENDING path (30 s + 60 s extra wait) only; becoming STOPPED during "
                         "the extra wait (install continues) and the path rejected while still RUNNING are out of scope; "
+                        "C-copy-fail: the open-stage failure only (CREATE_ALWAYS refused by a user-mapped section); "
+                        "mid-write failures (disk full, I/O error), a race between the pre-check and the copy, and the "
+                        "Retry path are out of scope; "
                         "no collector/full setup/Tauri UI/B3-5."}
     write_json(trial.proof / "summary.json", report)
     try:
