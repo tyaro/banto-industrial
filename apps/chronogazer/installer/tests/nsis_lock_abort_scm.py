@@ -26,6 +26,14 @@ dummy before the main dialog). Weak BU ACEs are put on the install root, every e
 data.txt and the sub-folder beforehand and the explicit ACEs are read back with icacls /save
 before and after; BU must be gone from the root and from every processed target and must
 remain on the unprocessed ones. Limit: this proves the sub-folder path only, NOT an icacls failure itself (a non-zero icacls exit is out of scope).
+
+Case C-restart-fail: the same lock abort as C-server-locked, but the service start type is set to Disabled
+(sc config start= disabled) while the dummy is RUNNING. The real restart then fails synchronously with 1058
+(ERROR_SERVICE_DISABLED) and RestartChronoGazerServiceOrWarn shows its warning BEFORE the main dialog (text
+carries the real exit code, flag already 0). After the warning's OK the main dialog follows; the non-silent
+.onInstFailed (flag 0) does not try again (exactly one sc start, exit code 2, no copy, hashes unchanged). The
+service stays STOPPED (pid 0) through the warning, the dialog and after exit. Positive control: after the
+installer exits, start= demand + start brings it back RUNNING with a new PID, so Disabled was the only cause.
 """
 
 import argparse
@@ -56,6 +64,8 @@ LOCKED_EXE = "chronogazer-server.exe"
 MAIN_DIALOG_TEXT = "使用中、または書き込めない実行ファイルがあります"
 MAIN_DIALOG_PREFIX = MAIN_DIALOG_TEXT + "（" + LOCKED_EXE + "）"
 RESTART_FAILED_TEXT = "再開できませんでした"
+# service-hooks.nsh の RestartChronoGazerServiceOrWarn の MessageBox（${action}=インストール、$0=sc start の終了コード 1058）。
+RESTART_WARNING_PREFIX = "インストールを中止しましたが、その前に止めていた ChronoGazer サービスを再開できませんでした（1058）。"
 INACTIVE_TEXTS = ("サービスが停止の要求を受け付けず", "サービスの停止がまだ終わっていません",
                   "サービスがまだ止まっていません")
 CALLBACK_DIALOG_TEXT = "$2"
@@ -92,6 +102,9 @@ EVENTS_FINAL = EVENTS_AT_DIALOG + CALLBACK_EVENTS
 # C-acl-subdir: icacls-attempt（対象つき）は列挙順に依存するので、ここには含めない。数と対象は acl_processed が判定する。
 ACL_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt", "main-dialog flag=0")
 ICACLS_EVENT = "icacls-attempt target="
+# C-restart-fail: 再開の失敗の警告が主 dialog より前に出る。警告の時点ですでに flag=0。
+RESTART_FAIL_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt",
+                                 "restart-failed-dialog flag=0", "main-dialog flag=0")
 
 ACL_MAIN_FIXED = "の所有者・アクセス権を既定に戻せませんでした"
 ACL_REASON_TEXT = "インストール先の中にサブフォルダがあります"
@@ -103,6 +116,15 @@ ACL_STEP_CODE = "!insertmacro ResetChronoGazerInstallDirAcl\n"
 
 def lock_dialog_matches(text, install):
     return text.startswith(MAIN_DIALOG_PREFIX)
+
+
+def restart_warning_matches(text):
+    return text.startswith(RESTART_WARNING_PREFIX)
+
+
+def start_type_is_disabled(stdout):
+    """sc qc の START_TYPE が 4（DISABLED）。語は見ない（ロケール差）。"""
+    return bool(re.search(r"START_TYPE\s*:\s*4\b", stdout))
 
 
 def acl_dialog_matches(text, install):
@@ -121,6 +143,7 @@ class CaseSpec:
     events_at_dialog: tuple
     events_final: tuple
     allowed_ppo: frozenset
+    restart_fails: bool = False  # Disabled を注入し、再開が 1058 で失敗する（警告 → 主 dialog の順）。
 
 
 CASES = {spec.name: spec for spec in (
@@ -128,6 +151,9 @@ CASES = {spec.name: spec for spec in (
              EVENTS_AT_DIALOG, EVENTS_FINAL, ALLOWED_PPO),
     CaseSpec("C-acl-subdir", True, False, ACL_MAIN_FIXED, acl_dialog_matches,
              ACL_EVENTS_AT_DIALOG, ACL_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO | ACL_PPO_EXTRA),
+    CaseSpec("C-restart-fail", False, True, MAIN_DIALOG_TEXT, lock_dialog_matches,
+             RESTART_FAIL_EVENTS_AT_DIALOG, RESTART_FAIL_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO,
+             restart_fails=True),
 )}
 LOCK_SPEC = CASES["C-server-locked"]
 
@@ -405,6 +431,34 @@ def timeline_problems(timeline, pid_b):
     return problems
 
 
+def warning_event_problems(events, spec):
+    """C-restart-fail: 警告の時点の events は main-dialog の手前（restart-failed-dialog flag=0）まで。"""
+    core = [event for event in events if event != "sc-query"]
+    return [] if core == list(spec.events_at_dialog[:-1]) else ["warning_event_sequence:" + json.dumps(core, ensure_ascii=False)]
+
+
+def stopped_heartbeat_problems(earlier, later, pid_a):
+    """再開に失敗したサービスは止まったまま: heartbeat は pid_a だけで、earlier から 1 行も増えない。"""
+    problems = []
+    if not earlier or not later:
+        return ["heartbeat_empty"]
+    if any(beat.get("pid") != pid_a for beat in (*earlier, *later)):
+        problems.append("heartbeat_foreign_pid")
+    if len(later) != len(earlier) or later[-1].get("seq") != earlier[-1].get("seq"):
+        problems.append("heartbeat_advanced_while_stopped")
+    return problems
+
+
+def stopped_timeline_problems(timeline):
+    after = [entry for entry in timeline if entry["phase"] != "before-dialog"]
+    problems = []
+    if not all(any(entry["phase"] == phase for entry in after) for phase in ("warning", "dialog", "after-exit")):
+        problems.append("timeline_phases_missing")
+    if any(entry["state"] != STOPPED or entry["pid"] != 0 for entry in after):
+        problems.append("service_not_steady_stopped")
+    return problems
+
+
 def classify_dialog_children(children, prefix=MAIN_DIALOG_PREFIX, matches=None):
     texts = [child["title"] for child in children if child["class"].casefold() == "static" and child["title"]]
     if not texts:
@@ -622,6 +676,7 @@ def build_harness(trial, makensis, case, install, log, name, spec):
 
 
 ICACLS = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "icacls.exe")
+SC_EXE = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "sc.exe")
 
 
 def grant_weak_ace(trial, target, label, inherit):
@@ -699,6 +754,14 @@ def case_c(trial, makensis, report, spec):
         time.sleep(.2)
     require(not start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a]), "initial_start_not_bound")
     require(initial_heartbeat_ok(), "initial_heartbeat_not_advancing")
+    if spec.restart_fails:
+        # 故障の注入: RUNNING のまま起動種別だけ Disabled にする（次の sc start は 1058 で失敗する）。
+        require(trial.call([SC_EXE, "config", SERVICE, "start=", "disabled"], "sc-config-disabled").returncode == 0,
+                "sc_config_disabled_failed")
+        require(start_type_is_disabled(trial.call([SC_EXE, "qc", SERVICE], "sc-qc-disabled-before").stdout),
+                "start_type_not_disabled_before")
+        injected = trial.status()
+        require(injected.get("state") == RUNNING and injected.get("pid") == pid_a, "not_running_pid_a_after_disable")
     # 7–9. harness。
     name = "Banto973 lock-abort " + trial.root.name[-8:]
     matches = lambda text: spec.dialog_matches(text, str(install))
@@ -731,6 +794,65 @@ def case_c(trial, makensis, report, spec):
         result["installer_pid"] = child.pid
         monitor = Monitor(trial, child, log, case / "timeline.jsonl")
         children_of = lambda hwnd: api.windows(child.pid, hwnd)
+        def observe_stopped(label, window, phase, event_check, beats_earlier):
+            """再開に失敗したケースの観測: STOPPED・pid 0 のまま、起動は pid_a の 1 回だけ。"""
+            windows = with_owner(api, api.windows(child.pid))
+            entry, events, beats = monitor.sample(phase)
+            starts, stops = trial.jsonl("starts.jsonl"), trial.jsonl("stops.jsonl")
+            alive = bool(api.u.IsWindow(window["hwnd"])) and any(w["hwnd"] == window["hwnd"] for w in owned_dialogs(windows, child.pid))
+            hashes = install_hashes(install)
+            problems = ([] if entry["state"] == STOPPED and entry["pid"] == 0 else ["scm_not_stopped"])
+            problems += [] if alive else ["dialog_not_alive"]
+            problems += event_check(events)
+            problems += start_problems(starts, expected, [pid_a])
+            problems += stop_problems(stops, [pid_a])
+            problems += [] if hashes == before else ["install_changed"]
+            if beats_earlier is not None:
+                problems += stopped_heartbeat_problems(beats_earlier, beats, pid_a)
+            observed = {"label": label, "entry": entry, "events": events, "starts": starts, "stops": stops,
+                        "heartbeat_tail": beats[-3:], "dialog_alive": alive, "hashes": hashes, "problems": problems}
+            write_json(case / f"{label}.json", observed)
+            require(not problems, label + "_failed:" + ','.join(problems))
+            return beats
+
+        wait_phase = "before-dialog"
+        if spec.restart_fails:
+            # 再開の失敗の警告（主 dialog より前）。検出まで before-dialog、検出後 warning。
+            warning = None
+            deadline = time.monotonic() + 90
+            while warning is None:
+                require(child.poll() is None, "installer_exited_before_warning")
+                last_windows = with_owner(api, api.windows(child.pid))
+                warning, unexpected = judge_dialogs(last_windows, children_of, child.pid, name, restart_warning_matches)
+                require(not unexpected, "unexpected_dialog")
+                warned, events, beats_warned = monitor.sample("warning" if warning else "before-dialog")
+                require(warning is not None or time.monotonic() < deadline, "warning_not_seen_within_90s")
+                if warning is None:
+                    time.sleep(.15)
+            warning_children = children_of(warning["hwnd"])
+            write_json(case / "warning.json", {"dialog": warning, "children": warning_children, "windows": last_windows})
+            try:
+                width, height, rgb = api.capture(warning["rect"])
+                (case / "warning.png").write_bytes(png_bytes(width, height, rgb))  # 画素は assert しない。
+            except Exception as error:
+                result["warning_png_error"] = str(error)
+            result["warning_wall_ms"] = warned["wall_ms"]
+            warning_events = lambda found: warning_event_problems(found, spec)
+            beats_w1 = observe_stopped("warning-1", warning, "warning", warning_events, None)
+            monitor.hold(1.5, "warning")
+            observe_stopped("warning-2", warning, "warning", warning_events, beats_w1)
+            button = ok_button(warning_children)
+            control_id = int(api.u.GetDlgCtrlID(button["hwnd"]))
+            require(control_id > 0, "warning_ok_button_control_id_invalid")
+            result["warning_ok_button"] = {"hwnd": button["hwnd"], "control_id": control_id}
+            require(bool(api.u.PostMessageW(warning["hwnd"], WM_COMMAND, (BN_CLICKED << 16) | control_id, button["hwnd"])),
+                    "PostMessage_BN_CLICKED_failed_warning")
+            deadline = time.monotonic() + 10
+            while api.u.IsWindow(warning["hwnd"]):
+                require(time.monotonic() < deadline, "warning_did_not_close")
+                monitor.sample("between")
+                time.sleep(.15)
+            wait_phase = "between"
         dialog = None
         deadline = time.monotonic() + 90
         while dialog is None:
@@ -738,7 +860,7 @@ def case_c(trial, makensis, report, spec):
             last_windows = with_owner(api, api.windows(child.pid))
             dialog, unexpected = judge_dialogs(last_windows, children_of, child.pid, name, matches)
             require(not unexpected, "unexpected_dialog")
-            first, events, beats_first = monitor.sample("dialog" if dialog else "before-dialog")
+            first, events, beats_first = monitor.sample("dialog" if dialog else wait_phase)
             require(dialog is not None or time.monotonic() < deadline, "dialog_not_seen_within_90s")
             if dialog is None:
                 time.sleep(.15)
@@ -750,10 +872,15 @@ def case_c(trial, makensis, report, spec):
             (case / "dialog.png").write_bytes(png_bytes(width, height, rgb))  # 画素は assert しない。
         except Exception as error:
             result["dialog_png_error"] = str(error)
-        pid_b = first["pid"]
-        result.update(pid_b=pid_b, dialog_wall_ms=first["wall_ms"])
-        require(first["state"] == RUNNING, "not_running_when_dialog_detected")
-        require(pid_b != pid_a, "pid_reused_rerun_required")
+        if spec.restart_fails:
+            pid_b = None
+            result.update(pid_b=None, dialog_wall_ms=first["wall_ms"])
+            require(first["state"] == STOPPED and first["pid"] == 0, "not_stopped_when_dialog_detected")
+        else:
+            pid_b = first["pid"]
+            result.update(pid_b=pid_b, dialog_wall_ms=first["wall_ms"])
+            require(first["state"] == RUNNING, "not_running_when_dialog_detected")
+            require(pid_b != pid_a, "pid_reused_rerun_required")
 
         def observe(label, beats_earlier):
             windows = with_owner(api, api.windows(child.pid))
@@ -775,9 +902,14 @@ def case_c(trial, makensis, report, spec):
             require(not problems, label + "_failed:" + ','.join(problems))
             return beats
 
-        beats_one = observe("observation-1", None)
+        if spec.restart_fails:
+            dialog_events = lambda found: event_problems(found, final=False, spec=spec, install=str(install))
+            observer = lambda label, earlier: observe_stopped(label, dialog, "dialog", dialog_events, earlier)
+        else:
+            observer = observe
+        beats_one = observer("observation-1", None)
         monitor.hold(1.5, "dialog")
-        beats_two = observe("observation-2", beats_one)
+        beats_two = observer("observation-2", beats_one)
         # 14. 主 dialog の OK。
         button = ok_button(dialog_children)
         control_id = int(api.u.GetDlgCtrlID(button["hwnd"]))
@@ -792,7 +924,10 @@ def case_c(trial, makensis, report, spec):
             time.sleep(.15)
         monitor.hold(1.0, "after-ok")
         entry = monitor.timeline[-1]
-        require(entry["state"] == RUNNING and entry["pid"] == pid_b and child.poll() is None, "after_ok_state")
+        if spec.restart_fails:
+            require(entry["state"] == STOPPED and entry["pid"] == 0 and child.poll() is None, "after_ok_state")
+        else:
+            require(entry["state"] == RUNNING and entry["pid"] == pid_b and child.poll() is None, "after_ok_state")
         # 15. 主窓（owner==0）を閉じる。新しい owned #32770 は押さずに失敗。
         last_windows = with_owner(api, api.windows(child.pid))
         mains = main_windows(last_windows, child.pid)
@@ -813,10 +948,17 @@ def case_c(trial, makensis, report, spec):
         monitor.hold(1.0, "after-exit")
         entry, events, beats = monitor.sample("after-exit")
         problems = event_problems(events, final=True, spec=spec, install=str(install))
-        problems += heartbeat_problems(beats_two, beats, pid_a, pid_b, trial.run_id, trial.sha)
-        problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
-        problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
-        problems += timeline_problems(monitor.timeline, pid_b)
+        if spec.restart_fails:
+            problems += [] if entry["state"] == STOPPED and entry["pid"] == 0 else ["scm_not_stopped_after_exit"]
+            problems += stopped_heartbeat_problems(beats_two, beats, pid_a)
+            problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a])
+            problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
+            problems += stopped_timeline_problems(monitor.timeline)
+        else:
+            problems += heartbeat_problems(beats_two, beats, pid_a, pid_b, trial.run_id, trial.sha)
+            problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
+            problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
+            problems += timeline_problems(monitor.timeline, pid_b)
         result.update(final_events=events, final_problems=problems)
         require(not problems, "after_exit_failed:" + ','.join(problems))
         if spec.acl_step:
@@ -836,10 +978,32 @@ def case_c(trial, makensis, report, spec):
             require(bool(kernel.CloseHandle(lock)), "lock_close_failed")
             lock = None
         require(install_hashes(install) == before, "install_changed_after_release")
+        second_pid = pid_b
+        if spec.restart_fails:
+            # 陽性対照: installer 終了後も Disabled のまま（installer は起動種別を変えない）→ demand に戻して起動できる。
+            require(start_type_is_disabled(trial.call([SC_EXE, "qc", SERVICE], "sc-qc-disabled-after").stdout),
+                    "start_type_not_disabled_after_exit")
+            require(trial.call([SC_EXE, "config", SERVICE, "start=", "demand"], "sc-config-demand").returncode == 0,
+                    "sc_config_demand_failed")
+            trial.start()
+            pid_c = trial.wait_state(RUNNING, 15)["pid"]
+            result["pid_c"] = pid_c
+            require(pid_c != pid_a, "pid_c_reused_rerun_required")
+            require(not start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_c]), "positive_control_start_not_bound")
+
+            def control_heartbeat_ok():
+                beats = trial.jsonl("heartbeat.jsonl")
+                return bool(beats) and beats[-1].get("pid") == pid_c and beats[-1].get("seq", 0) >= 2
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not control_heartbeat_ok():
+                time.sleep(.2)
+            require(control_heartbeat_ok(), "positive_control_heartbeat_not_advancing")
+            second_pid = pid_c
         # 18. 後片付け（本経路）: 停止 → stops 2 行 → dummy uninstall → 消滅。
         trial.stop()
         trial.wait_state(STOPPED, 30)
-        require(not stop_problems(trial.jsonl("stops.jsonl"), [pid_a, pid_b]), "final_stops_mismatch")
+        require(not stop_problems(trial.jsonl("stops.jsonl"), [pid_a, second_pid]), "final_stops_mismatch")
         require(trial.call([trial.dummy, "uninstall"], "dummy-uninstall").returncode == 0, "dummy_uninstall_failed")
         trial.wait_absent(SERVICE)
         result["double_restart_absent"] = True
@@ -893,6 +1057,8 @@ def main():
               "limits": "running dummy service + inert fixture exes; C-server-locked: READ-share CreateFileW lock only "
                         "(no LockFileEx range lock / image lock); C-acl-subdir: proves the sub-folder abort path after "
                         "real icacls on earlier entries, NOT an icacls failure itself (non-zero icacls exit out of scope); "
+                        "C-restart-fail: synchronous sc start failure by Disabled (1058) only; the 'stopped' "
+                        "(returns to STOPPED right after start) and 30 s 'timeout' outcomes are out of scope; "
                         "no collector/full setup/Tauri UI/B3-5."}
     write_json(trial.proof / "summary.json", report)
     try:

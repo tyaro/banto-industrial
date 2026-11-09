@@ -440,10 +440,74 @@ class AclCase(unittest.TestCase):
         self.assertEqual(plain, template.replace("  @ACL_STEP@\n", ""))
 
     def test_cases_are_keyed_by_name(self):
-        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir"})
+        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir", "C-restart-fail"})
         self.assertTrue(lock.LOCK_SPEC.lock_server and not lock.LOCK_SPEC.acl_step)
         self.assertTrue(ACL.acl_step and not ACL.lock_server)
         self.assertEqual(lock.LOCK_SPEC.events_at_dialog, lock.EVENTS_AT_DIALOG)
+
+
+class RestartFail(unittest.TestCase):
+    SPEC = lock.CASES["C-restart-fail"]
+    WARNING_TEXT = (lock.RESTART_WARNING_PREFIX + "\r\n\r\nサービスの状態を確かめ（sc query ChronoGazer）、"
+                    "管理者権限の PowerShell から sc start ChronoGazer で開始してください。")
+
+    def test_start_type_is_disabled(self):
+        self.assertTrue(lock.start_type_is_disabled("        START_TYPE         : 4   DISABLED"))
+        self.assertTrue(lock.start_type_is_disabled("START_TYPE  : 4"))
+        self.assertFalse(lock.start_type_is_disabled("        START_TYPE         : 3   DEMAND_START"))
+        self.assertFalse(lock.start_type_is_disabled("START_TYPE : 40"))
+
+    def test_restart_warning_matches(self):
+        self.assertTrue(lock.restart_warning_matches(self.WARNING_TEXT))
+        self.assertFalse(lock.restart_warning_matches(self.WARNING_TEXT.replace("（1058）", "（1062）")))
+        self.assertFalse(lock.restart_warning_matches(MAIN_TEXT))
+
+    def test_warning_text_matches_the_unchanged_hooks(self):
+        hooks = (ROOT / "apps/chronogazer/installer/hooks/service-hooks.nsh").read_text(encoding="utf-8")
+        self.assertIn(lock.RESTART_WARNING_PREFIX.replace("インストール", "${action}").replace("（1058）", "（$0）"), hooks)
+
+    def test_dialog_kind_of_the_warning_line(self):
+        line = ('MessageBox MB_OK|MB_ICONEXCLAMATION "インストールを中止しましたが、その前に止めていた ChronoGazer サービスを'
+                '再開できませんでした（$0）。$\\r$\\n$\\r$\\nサービスの状態を確かめ" /SD IDOK')
+        self.assertEqual(lock.dialog_kind(line), "restart-failed-dialog")
+
+    def test_stopped_heartbeat_problems(self):
+        earlier = [beat(5, PID_A), beat(6, PID_A)]
+        self.assertEqual(lock.stopped_heartbeat_problems(earlier, list(earlier), PID_A), [])
+        self.assertIn("heartbeat_advanced_while_stopped", lock.stopped_heartbeat_problems(earlier, [*earlier, beat(7, PID_A)], PID_A))
+        self.assertIn("heartbeat_foreign_pid", lock.stopped_heartbeat_problems(earlier, [*earlier, beat(1, PID_B)], PID_A))
+        self.assertTrue(lock.stopped_heartbeat_problems([], [], PID_A))
+        self.assertTrue(lock.stopped_heartbeat_problems(earlier, [], PID_A))
+
+    def test_stopped_timeline_problems(self):
+        def entries(*rows):
+            return [{"phase": phase, "state": state, "pid": pid} for phase, state, pid in rows]
+
+        ok = entries(("before-dialog", lock.RUNNING, PID_A), ("warning", lock.STOPPED, 0), ("between", lock.STOPPED, 0),
+                     ("dialog", lock.STOPPED, 0), ("after-exit", lock.STOPPED, 0))
+        self.assertEqual(lock.stopped_timeline_problems(ok), [])
+        running_mid = ok[:3] + [dict(ok[3], state=lock.RUNNING, pid=PID_B)] + ok[4:]
+        self.assertEqual(lock.stopped_timeline_problems(running_mid), ["service_not_steady_stopped"])
+        self.assertEqual(lock.stopped_timeline_problems([e for e in ok if e["phase"] != "warning"]), ["timeline_phases_missing"])
+        self.assertIn("service_not_steady_stopped", lock.stopped_timeline_problems(ok[:-1] + [dict(ok[-1], pid=PID_A)]))
+
+    def test_case_events_and_order(self):
+        spec = self.SPEC
+        self.assertTrue(spec.restart_fails and spec.lock_server and not spec.acl_step)
+        self.assertFalse(lock.LOCK_SPEC.restart_fails or ACL.restart_fails)
+        events = list(spec.events_at_dialog)
+        with_queries = events[:1] + ["sc-query"] + events[1:]
+        self.assertEqual(lock.event_problems(with_queries, final=False, spec=spec), [])
+        self.assertEqual(lock.event_problems(events + ["callback-before flag=0", "callback-after flag=0"], final=True, spec=spec), [])
+        swapped = events[:4] + [events[5], events[4]]
+        self.assertTrue(lock.event_problems(swapped, final=False, spec=spec))
+        self.assertTrue(lock.event_problems(events[:4] + events[5:], final=False, spec=spec))
+
+    def test_warning_events_stop_before_main_dialog(self):
+        events = list(self.SPEC.events_at_dialog[:-1])
+        self.assertEqual(lock.warning_event_problems(events[:2] + ["sc-query"] + events[2:], self.SPEC), [])
+        self.assertTrue(lock.warning_event_problems(events + ["main-dialog flag=0"], self.SPEC))
+        self.assertTrue(lock.warning_event_problems(events[:-1], self.SPEC))
 
 
 if __name__ == "__main__":
