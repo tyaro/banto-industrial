@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ChronoGazer インストーラ（本物の setup.exe）の実 SCM 受入試験（#973 残件A、silent の通常系だけ）。
+"""ChronoGazer インストーラ（本物の setup.exe）の実 SCM 受入試験（#973 残件A、silent の通常系＋故障系）。
 
 !!! 開発 PC では絶対に実行しない !!!
 このスクリプトは実 `C:\\Program Files\\ChronoGazer`・`C:\\ProgramData\\ChronoGazer`・
@@ -12,13 +12,19 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
+故障系: 8 使用中 exe でのインストール中止 / 9 ACL の段階（サブフォルダ・直下ジャンクション）での中止 /
+  10 事前確認（サービス登録・前のインストールの別の場所）での中止 / 11 使用中 exe でのアンインストール中止 /
+  12 サービス解除失敗 / 13 稼働中のサービスの service-install 失敗 / 14 破損 exe での再開失敗 /
+  15 DeleteFlag 保留（拒否、解消、完了まで）
+  故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
+  変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
+  同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 故障系（使用中 exe・ACL・事前確認での中止、
-アンインストールの中止、DeleteFlag 保留）・service-install の失敗・破損 exe・
-可視 UI とシェル 90 秒の問い（MessageBox）・停止 timeout・再開失敗・実 collector・
-#392 B3-5。silent なので MessageBox と二重再開は未確認。
+対象外（このスクリプトは確かめない）: 可視 UI とシェル 90 秒の問い（MessageBox）・
+サービス停止の timeout・`File` の書込み途中の失敗・消し残り（RequireChronoGazerExesDeleted）・
+実 collector・#392 B3-5。silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -31,6 +37,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -60,6 +67,9 @@ EXES = (SHELL_EXE, SERVER_EXE, ELEV_EXE)
 SENTINEL_TABLE = "banto_973_sentinel"
 USERS_SID = "*S-1-5-32-545"
 HOST_PATH = "/api/host"  # apps/chronogazer/core/src/service_probe.rs の HOST_PATH
+# 製品が停止の待ち切り（30 秒 + 追加 60 秒）で中止する道は最短でも 90 秒掛かる。
+# それより短ければ、停止の待ち切りではない理由で中止したと分かる。
+STOP_TIMEOUT_ABORT_SECONDS = 90.0
 
 
 class PhaseFailure(Exception):
@@ -246,6 +256,44 @@ def read_db_sentinel(db: Path) -> list[str]:
     return rows
 
 
+def parse_sc_sdshow(returncode: int, stdout: str, stderr: str) -> str:
+    """`sc sdshow` の SDDL 行（`D:` か `O:` で始まる最初の行）。失敗・空は例外（空の観測を「変わっていない」と誤判定させない）。"""
+    if returncode == 0:
+        for line in stdout.splitlines():
+            t = line.strip()
+            if t.startswith(("D:", "O:")):
+                return t
+    raise RuntimeError(f"sc sdshow に失敗（returncode={returncode}）: {(stdout + stderr)[-300:]}")
+
+
+_SDDL_DACL_HEAD = re.compile(r"(?:O:(?:S-[\d-]+|[A-Z]{2}))?(?:G:(?:S-[\d-]+|[A-Z]{2}))?D:(?:P|AI|AR)*")
+
+
+def sddl_with_deny(sddl: str, right: str) -> str:
+    """DACL の先頭に「Administrators に right（SD=DELETE、RC=READ_CONTROL 等）拒否」の ACE を入れる。O:/G: の中の文字や SACL は壊さない。"""
+    sddl = sddl.strip()
+    m = _SDDL_DACL_HEAD.match(sddl)
+    if not m:
+        raise RuntimeError(f"DACL が無い SDDL: {sddl!r}")
+    return sddl[: m.end()] + f"(D;;{right};;;BA)" + sddl[m.end() :]
+
+
+def uninstall_in_place_command(instdir) -> str:
+    """`_?=` 付きでその場で走らせる呼び方。`_?=` は最後の引数でクォートしない（NSIS の規則）ので文字列で渡す。"""
+    return f'"{instdir}\\uninstall.exe" /S _?={instdir}'
+
+
+def count_service_start_failures(returncode: int, stdout: str, stderr: str, needle: str = "chronogazer") -> int:
+    """`wevtutil qe System ... /f:text`（SCM の 7000 = 起動失敗）の出力のうち、needle を含む事象の数。
+
+    出力が空で returncode 0 は 0 件（正常）。returncode が非 0 は例外（取得失敗を 0 件と誤判定させない）。
+    """
+    if returncode != 0:
+        raise RuntimeError(f"wevtutil に失敗（returncode={returncode}）: {(stdout + stderr)[-300:]}")
+    blocks = re.split(r"(?m)^Event\[\d+\]", stdout)[1:]
+    return sum(1 for b in blocks if needle.lower() in b.lower())
+
+
 # ---------------------------------------------------------------- OS 操作
 
 EVIDENCE: dict = {"phases": {}}
@@ -325,6 +373,31 @@ def service_marker_present(name: str = SERVICE) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def read_delete_flag(name: str = SERVICE) -> int | None:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{name}") as k:
+            value, typ = winreg.QueryValueEx(k, "DeleteFlag")
+    except FileNotFoundError:
+        return None
+    if typ != winreg.REG_DWORD:
+        raise RuntimeError(f"DeleteFlag の型が REG_DWORD でない: {typ}")
+    return int(value)
+
+
+def service_start_failure_count() -> int:
+    """System ログの SCM 7000（起動失敗）のうち ChronoGazer のものの数。"""
+    r = run(
+        [
+            "wevtutil", "qe", "System",
+            "/q:*[System[Provider[@Name='Service Control Manager'] and (EventID=7000)]]",
+            "/f:text",
+        ]
+    )
+    return count_service_start_failures(r.returncode, r.stdout, r.stderr)
 
 
 def wait_until(pred, timeout: float, interval: float = 1.0):
@@ -459,9 +532,174 @@ def operators_group_exists() -> bool:
     return run(["net", "localgroup", OPERATORS_GROUP]).returncode == 0
 
 
+def _win_apis():
+    """kernel32 / advapi32。HANDLE は 64bit 幅で明示する（切り詰めない）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    k.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    a.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    a.OpenSCManagerW.restype = wintypes.HANDLE
+    a.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+    a.OpenServiceW.restype = wintypes.HANDLE
+    a.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+    a.CloseServiceHandle.restype = wintypes.BOOL
+    return ctypes, k, a
+
+
+_INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
+
+
+class ExclusiveFileLock:
+    """READ 共有だけで開いて保持し、書込みで開けない状態にする（使用中の exe を作る）。"""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.handle = None
+
+    def __enter__(self):
+        ctypes, k, _ = _win_apis()
+        h = k.CreateFileW(self.path, 0x80000000, 1, None, 3, 0, None)
+        if not h or h == _INVALID_HANDLE:
+            raise RuntimeError(f"ロック用の CreateFileW に失敗: {ctypes.get_last_error()}")
+        self.handle = h
+        w = k.CreateFileW(self.path, 0x40000000, 7, None, 3, 0, None)
+        if w and w != _INVALID_HANDLE:
+            k.CloseHandle(w)
+            self.__exit__()
+            raise RuntimeError("ロックが効いていない（書込みで開けた）")
+        err = ctypes.get_last_error()
+        if err != 32:
+            self.__exit__()
+            raise RuntimeError(f"書込みで開けない理由が共有違反でない: {err}")
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            _, k, _ = _win_apis()
+            k.CloseHandle(self.handle)
+            self.handle = None
+        return False
+
+
+class ServiceHandleHold:
+    """サービスのハンドルを保持する。DeleteService は 0 で返るが DeleteFlag が残る（削除保留）状態を作る。"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.scm = None
+        self.svc = None
+
+    def __enter__(self):
+        ctypes, _, a = _win_apis()
+        self.scm = a.OpenSCManagerW(None, None, 1)
+        if not self.scm:
+            raise RuntimeError(f"OpenSCManagerW に失敗: {ctypes.get_last_error()}")
+        self.svc = a.OpenServiceW(self.scm, self.name, 4)  # QUERY_STATUS
+        if not self.svc:
+            err = ctypes.get_last_error()
+            self.__exit__()
+            raise RuntimeError(f"OpenServiceW({self.name}) に失敗: {err}")
+        return self
+
+    def __exit__(self, *exc):
+        _, _, a = _win_apis()
+        if self.svc:
+            a.CloseServiceHandle(self.svc)
+            self.svc = None
+        if self.scm:
+            a.CloseServiceHandle(self.scm)
+            self.scm = None
+        return False
+
+
+def _sc_sdshow(name: str) -> str:
+    r = run(["sc", "sdshow", name])
+    return parse_sc_sdshow(r.returncode, r.stdout, r.stderr)
+
+
+class DenyServiceRight:
+    """サービスの SDDL に Administrators の right 拒否を入れる。抜けるとき元に戻す。
+
+    SD（DELETE）は DeleteService を、RC（READ_CONTROL）は grant-service-acl の読み取りを失敗させる。
+    RC を拒否している間は `sc sdshow` も失敗するので、with の中で sdshow を呼ばないこと。
+    """
+
+    def __init__(self, right: str, name: str = SERVICE):
+        self.right = right
+        self.name = name
+        self.original = None
+
+    def __enter__(self):
+        self.original = _sc_sdshow(self.name)
+        run(["sc", "sdset", self.name, sddl_with_deny(self.original, self.right)], check=True)
+        if self.right == "RC":
+            r = run(["sc", "sdshow", self.name])
+            if r.returncode == 0:
+                run(["sc", "sdset", self.name, self.original])
+                raise RuntimeError(f"READ_CONTROL 拒否が効いていない（sdshow が読めた）: {r.stdout}")
+        else:
+            now = _sc_sdshow(self.name)
+            if f"(D;;{self.right};;;BA)" not in now:
+                run(["sc", "sdset", self.name, self.original])
+                raise RuntimeError(f"{self.right} 拒否が入っていない: {now}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.original is not None:
+            original = self.original
+            r = run(["sc", "sdset", self.name, original])
+            self.original = None
+            if r.returncode != 0:
+                message = f"sc sdset の戻しに失敗: {self.name} -> {r.returncode}: {r.stdout}{r.stderr}"
+                print(message)
+                if exc_type is None:
+                    raise RuntimeError(message)
+            elif exc_type is None:
+                now = _sc_sdshow(self.name)
+                if now != original:
+                    raise RuntimeError(f"SDDL が元に戻っていない: {now} != {original}")
+        return False
+
+
+def tree_snapshot(root) -> dict[str, str]:
+    """中身のハッシュ。空は例外（観測が空のときに通さない）。再解析ポイントの中は辿らないよう、置く前に取り、外した後に比べる。"""
+    snap = tree_hashes(Path(root))
+    if not snap:
+        raise RuntimeError(f"tree_hashes が空: {root}")
+    return snap
+
+
+def timed(p: str, label: str, fn):
+    """fn() の所要秒を証拠に残して (結果, 秒) を返す。"""
+    start = time.monotonic()
+    result = fn()
+    elapsed = round(time.monotonic() - start, 1)
+    obs(p, f"{label}_elapsed_seconds", elapsed)
+    return result, elapsed
+
+
 def expect(phase: str, cond: bool, message: str, observation=None) -> None:
     if not cond:
         raise PhaseFailure(phase, message, observation)
+
+
+def expect_not_stop_timeout(p: str, elapsed: float) -> None:
+    """同じ観測になる「停止の待ち切りでの中止」と見分ける。"""
+    expect(
+        p,
+        elapsed < STOP_TIMEOUT_ABORT_SECONDS,
+        "abort took as long as the stop-timeout path; the intended fault may not have been reached",
+        elapsed,
+    )
 
 
 def weakened_outside(p: str, name: str):
@@ -716,6 +954,413 @@ def phase_reinstall(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
+# ---------------------------------------------------------------- 故障系
+
+CORRUPT_SERVER = b"banto-973 corrupt: not a PE\n"
+ELSEWHERE_IMAGE_PATH = rf'"{ELSEWHERE}\{SERVER_EXE}" run-service'
+SERVICE_KEY = rf"SYSTEM\CurrentControlSet\Services\{SERVICE}"
+UNINSTALL_KEY = rf"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{SERVICE}"
+
+
+def _dist_exe(c: Ctx, stem: str) -> Path:
+    return c.dist / dist_exe_name(stem, c.version)
+
+
+def _ensure_running(p: str) -> int:
+    if sc_state()["state"] != "RUNNING":
+        run(["sc", "start", SERVICE])
+        wait_state(SERVICE, "RUNNING")
+    health = wait_healthy()
+    pid = sc_state()["pid"]
+    obs(p, "pid_before", pid)
+    obs(p, "health_before", health)
+    expect(p, bool(pid), f"{SERVICE} has no PID")
+    return pid
+
+
+def _expect_restarted(p: str, before_pid: int) -> None:
+    st = wait_state(SERVICE, "RUNNING")
+    health = wait_healthy()
+    obs(p, "pid_after", st["pid"])
+    obs(p, "health_after", health)
+    expect(p, st["pid"] != before_pid, f"{SERVICE} PID unchanged (stopped service was not resumed)", st)
+
+
+def _expect_untouched(p: str, before_pid: int) -> None:
+    st = sc_state()
+    obs(p, "service_untouched", st)
+    expect(p, st["state"] == "RUNNING" and st["pid"] == before_pid, f"{SERVICE} was stopped before the precheck", st)
+
+
+def _tamper_elev(p: str, c: Ctx) -> str:
+    """同じ版を上書きするのでハッシュ比較では上書きを見分けられない。末尾の \\0 が残っているかで見る。"""
+    with open(INSTDIR / ELEV_EXE, "ab") as f:
+        f.write(b"\0")
+    got = sha256(INSTDIR / ELEV_EXE)
+    obs(p, "elev_tampered_hash", got)
+    expect(p, got != sha256(_dist_exe(c, "chronogazer-elev")), "elev exe tamper did not change hash")
+    return got
+
+
+def _expect_elev_still(p: str, tampered: str) -> None:
+    got = sha256(INSTDIR / ELEV_EXE)
+    obs(p, "elev_hash_after_abort", {"tampered": tampered, "now": got})
+    expect(p, got == tampered, "elev exe was overwritten despite the abort")
+
+
+def _expect_exes_match_dist(p: str, c: Ctx) -> None:
+    # chronogazer.exe は tauri-bundler が書き換えるので dist とは比べない（checklist §2-14）。
+    want = {ELEV_EXE: sha256(_dist_exe(c, "chronogazer-elev")), SERVER_EXE: sha256(_dist_exe(c, "chronogazer-server"))}
+    got = {ELEV_EXE: sha256(INSTDIR / ELEV_EXE), SERVER_EXE: sha256(INSTDIR / SERVER_EXE)}
+    obs(p, "exe_hash", {"dist": want, "installed": got})
+    for name in want:
+        expect(p, want[name] == got[name], f"installed {name} differs from dist")
+
+
+def _uninstall_in_place(p: str, label: str) -> int:
+    r = run(uninstall_in_place_command(INSTDIR), timeout=600)
+    obs(p, f"{label}_exit", r.returncode)
+    obs(p, f"{label}_stderr_tail", r.stderr[-300:])
+    return r.returncode
+
+
+def _expect_still_installed(p: str, c: Ctx, before: dict) -> None:
+    after = tree_snapshot(INSTDIR)
+    reg = uninstall_registration()
+    obs(p, "instdir_changed", sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k)))
+    obs(p, "apps_registration", reg)
+    expect(p, after == before, "INSTDIR content changed by the aborted uninstall")
+    expect(p, bool(reg), "Apps registration removed by the aborted uninstall")
+    expect(p, DB_PATH.is_file(), "sqlite was removed")
+    _expect_data_intact(p, c)
+
+
+def _expect_not_delete_pending(p: str) -> None:
+    flag = read_delete_flag()
+    obs(p, "delete_flag", flag)
+    expect(p, flag in (None, 0), f"{SERVICE} has DeleteFlag", flag)
+
+
+def _recover_by_setup(p: str, c: Ctx) -> None:
+    rc = run_setup(c.setup, [], p, "recover")
+    expect(p, rc == 0, "recovery setup failed", rc)
+    wait_state(SERVICE, "RUNNING")
+    obs(p, "recover_health", wait_healthy())
+    expect_registered(f"{p}_recover", "RUNNING")
+    _expect_exes_match_dist(p, c)
+    _expect_not_delete_pending(p)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+
+
+def phase_install_locked_exe(c: Ctx) -> None:
+    p = "8_install_locked_exe"
+    pid = _ensure_running(p)
+    tampered = _tamper_elev(p, c)
+    with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+        rc, elapsed = timed(p, "locked_setup", lambda: run_setup(c.setup, [], p, "locked_setup"))
+    expect(p, rc != 0, "setup over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_restarted(p, pid)
+    expect_registered(p, "RUNNING")
+    _expect_elev_still(p, tampered)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    _recover_by_setup(p, c)
+
+
+def phase_install_acl_refused(c: Ctx) -> None:
+    p = "9_install_acl_refused"
+    # ChronoGazer の ACL の段階はサービスを止めた後で、中止の前に再開を試みる（PID が変わる）。
+    pid = _ensure_running(p)
+    tampered = _tamper_elev(p, c)
+    before = tree_snapshot(INSTDIR)
+    # サブフォルダ
+    subdir = INSTDIR / "banto-973-subdir"
+    subdir.mkdir()
+    (subdir / "keep.txt").write_text("keep", encoding="utf-8")
+    try:
+        rc = run_setup(c.setup, [], p, "subdir_setup")
+        expect(p, rc != 0, "setup with a subfolder must fail", rc)
+        _expect_restarted(p, pid)
+        expect(p, subdir.is_dir() and (subdir / "keep.txt").is_file(), "subfolder was removed by the setup")
+    finally:
+        shutil.rmtree(subdir, ignore_errors=True)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (subfolder)")
+    _expect_elev_still(p, tampered)
+    # 直下のジャンクション
+    pid = sc_state()["pid"]
+    obs(p, "pid_before_junction", pid)
+    outside, targets, outside_before = weakened_outside(p, "cg-nested-junction-outside")
+    link = INSTDIR / "banto-973-link"
+    run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True)
+    try:
+        rc = run_setup(c.setup, [], p, "junction_setup")
+        expect(p, rc != 0, "setup with a nested junction must fail", rc)
+        _expect_restarted(p, pid)
+        expect_outside_unchanged(p, targets, outside_before)
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)  # ジャンクションだけ消す（中身は触らない）
+    expect(p, not os.path.lexists(link), "nested junction not removed")
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (junction)")
+    _expect_elev_still(p, tampered)
+    _recover_by_setup(p, c)
+
+
+def _read_image_path():
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_READ) as k:
+        value, typ = winreg.QueryValueEx(k, "ImagePath")
+    return str(value), typ
+
+
+def _write_image_path(value: str, typ: int) -> None:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, SERVICE_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        winreg.SetValueEx(k, "ImagePath", 0, typ, value)
+
+
+def _uninstall_views_with_location():
+    """InstallLocation を持つ Uninstall キーのビュー（KEY_WOW64_64KEY / 32KEY）と (値, 型) の一覧。"""
+    import winreg
+
+    found = []
+    for name, view in (("64", winreg.KEY_WOW64_64KEY), ("32", winreg.KEY_WOW64_32KEY)):
+        try:
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, winreg.KEY_READ | view) as k:
+                value, typ = winreg.QueryValueEx(k, "InstallLocation")
+        except FileNotFoundError:
+            continue
+        found.append((name, view, str(value), typ))
+    return found
+
+
+def _write_install_location(view: int, value: str, typ: int) -> None:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, winreg.KEY_SET_VALUE | view) as k:
+        winreg.SetValueEx(k, "InstallLocation", 0, typ, value)
+
+
+def _read_install_location(view: int):
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, UNINSTALL_KEY, 0, winreg.KEY_READ | view) as k:
+        value, typ = winreg.QueryValueEx(k, "InstallLocation")
+    return str(value), typ
+
+
+def phase_install_preflight_refused(c: Ctx) -> None:
+    p = "10_install_preflight_refused"
+    # サービスを止める前に断る事前確認。PID は変わらない。
+    pid = _ensure_running(p)
+    tampered = _tamper_elev(p, c)
+    before = tree_snapshot(INSTDIR)
+    # (0b) サービス登録が別の場所を指す。SCM の設定はキャッシュされ NSIS はレジストリを読むので sc config は使わない。
+    orig, typ = _read_image_path()
+    obs(p, "image_path_original", orig)
+    _write_image_path(ELSEWHERE_IMAGE_PATH, typ)
+    try:
+        expect(p, _read_image_path() == (ELSEWHERE_IMAGE_PATH, typ), "could not rewrite ImagePath", _read_image_path())
+        rc = run_setup(c.setup, [], p, "image_path_setup")
+    finally:
+        _write_image_path(orig, typ)
+    back = _read_image_path()
+    obs(p, "image_path_restored", back)
+    expect(p, back == (orig, typ), "ImagePath not restored", back)
+    expect(p, rc != 0, "setup with a foreign service registration must fail", rc)
+    _expect_untouched(p, pid)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (ImagePath)")
+    # (0c) 前のインストールが別の場所を指す。
+    views = _uninstall_views_with_location()
+    obs(p, "install_location_views", [{"view": n, "value": v, "type": t} for n, _, v, t in views])
+    if not views:
+        raise PhaseFailure(p, "no Uninstall key with InstallLocation in either registry view")
+    ELSEWHERE.mkdir(parents=True, exist_ok=True)
+    (ELSEWHERE / SHELL_EXE).write_bytes(b"banto-973 dummy\n")
+    foreign = f'"{ELSEWHERE}"'  # テンプレートと同じく両端に " を含む
+    try:
+        for _, view, _, typ_l in views:
+            _write_install_location(view, foreign, typ_l)
+        rc = run_setup(c.setup, [], p, "install_location_setup")
+    finally:
+        for _, view, value, typ_l in views:
+            _write_install_location(view, value, typ_l)
+        shutil.rmtree(ELSEWHERE, ignore_errors=True)
+    for name, view, value, typ_l in views:
+        back = _read_install_location(view)
+        obs(p, f"install_location_restored_{name}", back)
+        expect(p, back == (value, typ_l), f"InstallLocation ({name}) not restored", back)
+    expect(p, not ELSEWHERE.exists(), "foreign dir was not removed")
+    expect(p, rc != 0, "setup over a foreign previous install must fail", rc)
+    _expect_untouched(p, pid)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (InstallLocation)")
+    _expect_elev_still(p, tampered)
+    _recover_by_setup(p, c)
+
+
+def phase_uninstall_locked_exe(c: Ctx) -> None:
+    p = "11_uninstall_locked_exe"
+    pid = _ensure_running(p)
+    before = tree_snapshot(INSTDIR)
+    with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+        rc, elapsed = timed(p, "locked_uninstall", lambda: _uninstall_in_place(p, "locked_uninstall"))
+    expect(p, rc != 0, "uninstall over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_restarted(p, pid)
+    expect_registered(p, "RUNNING")
+    _expect_not_delete_pending(p)
+    _expect_still_installed(p, c, before)
+
+
+def phase_uninstall_delete_fail(c: Ctx) -> None:
+    p = "12_uninstall_delete_fail"
+    pid = _ensure_running(p)
+    before = tree_snapshot(INSTDIR)
+    set_service_marker()
+    expect(p, service_marker_present(), "could not set the service marker")
+    with DenyServiceRight("SD"):
+        rc, elapsed = timed(p, "uninstall", lambda: _uninstall_in_place(p, "uninstall"))
+    expect(p, rc != 0, "uninstall must fail when the service cannot be deleted", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_restarted(p, pid)
+    # 削除は拒まれたので、キーは作り直されていない。
+    marker = service_marker_present()
+    obs(p, "marker_after", marker)
+    expect(p, marker, "service registration was recreated although its deletion was denied")
+    expect_registered(p, "RUNNING")
+    _expect_not_delete_pending(p)
+    _expect_still_installed(p, c, before)
+
+
+def phase_install_service_install_fails_running(c: Ctx) -> None:
+    p = "13_install_service_install_fails_running"
+    # 動いていたサービスで service-install だけを失敗させる（grant-service-acl は READ_CONTROL|WRITE_DAC で開く）。
+    pid = _ensure_running(p)
+    tampered = _tamper_elev(p, c)
+    set_service_marker()
+    expect(p, service_marker_present(), "could not set the service marker")
+    with DenyServiceRight("RC"):  # この中で sc sdshow を呼ばない
+        rc, elapsed = timed(p, "setup", lambda: run_setup(c.setup, [], p, "setup"))
+    expect(p, rc != 0, "setup must fail when service-install fails", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_restarted(p, pid)  # 前回の登録のまま新しいファイルで再開
+    _expect_exes_match_dist(p, c)  # ファイルは入っている（改ざんした elev は dist に戻った）
+    marker = service_marker_present()
+    obs(p, "marker_after", marker)
+    expect(p, marker, "service registration was recreated")
+    expect_registered(p, "RUNNING")
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    _recover_by_setup(p, c)
+
+
+def phase_restart_fails_corrupt_exe(c: Ctx) -> None:
+    p = "14_restart_fails_corrupt_exe"
+    # 中止の後の再開が失敗する道: サービスの exe が壊れていて起動できない。
+    _ensure_running(p)
+    tampered = _tamper_elev(p, c)
+    set_service_marker()
+    expect(p, service_marker_present(), "could not set the service marker")
+    server = INSTDIR / SERVER_EXE
+    old = INSTDIR / "chronogazer-server.banto973-old"
+    os.rename(server, old)  # 動いている exe も rename はできる
+    server.write_bytes(CORRUPT_SERVER)
+    failures_before = service_start_failure_count()
+    obs(p, "start_failures_before", failures_before)
+    with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+        rc, elapsed = timed(p, "setup", lambda: run_setup(c.setup, [], p, "setup"))
+    expect(p, rc != 0, "setup over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
+    reached = wait_until(lambda: service_start_failure_count() >= failures_before + 1, 30)
+    time.sleep(3)  # 余分な再開の試みが続かないことを見る
+    failures_after = service_start_failure_count()
+    obs(p, "start_failures_after", failures_after)
+    expect(p, bool(reached), "no service start failure was logged (resume not attempted?)", failures_after)
+    expect(
+        p,
+        failures_after == failures_before + 1,
+        "the resume must be attempted exactly once",
+        {"before": failures_before, "after": failures_after},
+    )
+    st = sc_state()
+    obs(p, "service_state_after", st)
+    expect(p, st["state"] == "STOPPED", f"{SERVICE} not STOPPED after the failed resume", st)
+    expect_registered(p, "STOPPED")
+    marker = service_marker_present()
+    obs(p, "marker_after", marker)
+    expect(p, marker, "service registration was recreated")
+    expect(p, server.read_bytes() == CORRUPT_SERVER, "corrupt server exe was overwritten despite the abort")
+    _expect_elev_still(p, tampered)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    # 復旧: サービスは止まっているので控えの旧 exe を消し、setup を再実行して正しい exe に戻す。
+    old.unlink()
+    rc = run_setup(c.setup, [], p, "recover")
+    expect(p, rc == 0, "recovery setup failed", rc)
+    expect_registered(f"{p}_recover", "STOPPED")  # 止まっていたので再開しない
+    _expect_exes_match_dist(p, c)
+    run(["sc", "start", SERVICE])
+    wait_state(SERVICE, "RUNNING")
+    obs(p, "recover_health", wait_healthy())
+    _expect_data_intact(p, c)
+
+
+def phase_uninstall_delete_pending(c: Ctx) -> None:
+    p = "15_uninstall_delete_pending"
+    _ensure_running(p)  # 保留中のサービスは再開されないので PID の比較はしない
+    before = tree_snapshot(INSTDIR)
+    with ServiceHandleHold(SERVICE):
+        rc = _uninstall_in_place(p, "uninstall")
+        flag = read_delete_flag()
+        obs(p, "delete_flag", flag)
+        expect(p, rc != 0, "uninstall must abort on a pending deletion", rc)
+        expect(p, flag == 1, "DeleteFlag not set", flag)
+        st = sc_state()
+        obs(p, "state_pending", st)
+        expect(p, st["state"] != "RUNNING", "service with a pending deletion was resumed", st)
+        _expect_still_installed(p, c, before)
+        r = run([str(INSTDIR / ELEV_EXE), "service-install"])
+        obs(p, "service_install_while_pending", {"exit": r.returncode, "stderr_tail": r.stderr[-300:]})
+        expect(p, r.returncode != 0, "service-install must refuse a pending deletion", r.returncode)
+        flag = read_delete_flag()
+        obs(p, "delete_flag_after_install", flag)
+        expect(p, flag == 1, "DeleteFlag changed by service-install", flag)
+        # setup も service-install が断るので失敗する（止まっていたので再開しない）。
+        rc = run_setup(c.setup, [], p, "setup_while_pending")
+        expect(p, rc != 0, "setup must fail while the deletion is pending", rc)
+        flag = read_delete_flag()
+        obs(p, "delete_flag_after_setup", flag)
+        expect(p, flag == 1, "DeleteFlag changed by the setup", flag)
+        st = sc_state()
+        obs(p, "state_after_setup", st)
+        expect(p, st["state"] != "RUNNING", "service with a pending deletion was resumed by the setup", st)
+        _expect_data_intact(p, c)
+    # service_key_exists はレジストリだけを見るので、追加のハンドルを持たない
+    gone = wait_until(lambda: not service_key_exists(), 60)
+    obs(p, "key_gone", bool(gone))
+    expect(p, bool(gone), "service registration did not disappear after the handle closed")
+    # `_?=` なしの本物の呼び方。
+    r = run([str(INSTDIR / "uninstall.exe"), "/S"], timeout=600)
+    obs(p, "uninstall_parent_exit", r.returncode)
+    _wait_uninstall_done(p)
+    expect(p, DB_PATH.is_file(), "sqlite was removed")
+    _expect_data_intact(p, c)
+    rc = run_setup(c.setup, [], p, "reinstall")
+    expect(p, rc == 0, "reinstall after the pending deletion failed", rc)
+    if service_key_exists():
+        set_service_marker()
+    expect_registered(p, "STOPPED")
+    expect_apps_registration(p)
+    run(["sc", "start", SERVICE])
+    wait_state(SERVICE, "RUNNING")
+    obs(p, "health", wait_healthy())
+    _expect_data_intact(p, c)
+
+
 PHASES = (
     phase_reject,
     phase_fresh,
@@ -724,6 +1369,14 @@ PHASES = (
     phase_stopped_overwrite,
     phase_uninstall_running,
     phase_reinstall,
+    phase_install_locked_exe,
+    phase_install_acl_refused,
+    phase_install_preflight_refused,
+    phase_uninstall_locked_exe,
+    phase_uninstall_delete_fail,
+    phase_install_service_install_fails_running,
+    phase_restart_fails_corrupt_exe,
+    phase_uninstall_delete_pending,
 )
 
 

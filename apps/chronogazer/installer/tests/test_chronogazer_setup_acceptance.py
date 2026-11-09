@@ -205,11 +205,88 @@ class DbSentinelTests(unittest.TestCase):
                 c.read_db_sentinel(db)
 
 
+class FaultHelperTests(unittest.TestCase):
+    def test_sdshow(self):
+        out = "\r\nD:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\r\n"
+        self.assertTrue(c.parse_sc_sdshow(0, out, "").startswith("D:("))
+        for rc, o in ((1, out), (0, ""), (0, "[SC] OpenService FAILED 5")):
+            with self.assertRaises(RuntimeError):
+                c.parse_sc_sdshow(rc, o, "err")
+
+    def test_deny_inserted_at_dacl_head(self):
+        self.assertEqual(c.sddl_with_deny("D:(A;;GA;;;SY)", "SD"), "D:(D;;SD;;;BA)(A;;GA;;;SY)")
+        self.assertEqual(c.sddl_with_deny("D:(A;;GA;;;SY)", "RC"), "D:(D;;RC;;;BA)(A;;GA;;;SY)")
+        self.assertEqual(c.sddl_with_deny("D:PAI(A;;GA;;;SY)", "SD"), "D:PAI(D;;SD;;;BA)(A;;GA;;;SY)")
+        self.assertEqual(
+            c.sddl_with_deny("O:BAG:SYD:P(A;;GA;;;SY)S:(AU;FA;GA;;;WD)", "RC"),
+            "O:BAG:SYD:P(D;;RC;;;BA)(A;;GA;;;SY)S:(AU;FA;GA;;;WD)",
+        )
+        self.assertEqual(
+            c.sddl_with_deny("O:S-1-5-32-544G:DUD:(A;;GA;;;SY)", "SD"),
+            "O:S-1-5-32-544G:DUD:(D;;SD;;;BA)(A;;GA;;;SY)",
+        )
+
+    def test_deny_without_dacl_raises(self):
+        for s in ("", "O:BAG:SY", "S:(AU;FA;GA;;;WD)"):
+            for right in ("SD", "RC"):
+                with self.assertRaises(RuntimeError):
+                    c.sddl_with_deny(s, right)
+
+    def test_uninstall_in_place_command(self):
+        self.assertEqual(
+            c.uninstall_in_place_command(c.INSTDIR),
+            '"C:\\Program Files\\ChronoGazer\\uninstall.exe" /S _?=C:\\Program Files\\ChronoGazer',
+        )
+
+    def test_count_service_start_failures(self):
+        def ev(i, svc):
+            return (
+                f"Event[{i}]:\n  Log Name: System\n  Source: Service Control Manager\n  Event ID: 7000\n"
+                f"  Description:\n  The {svc} service failed to start due to the following error:\n"
+                "  %%193 is not a valid Win32 application.\n\n"
+            )
+
+        self.assertEqual(c.count_service_start_failures(0, "", ""), 0)
+        out = ev(0, "ChronoGazer") + ev(1, "OtherSvc") + ev(2, "CHRONOGAZER")
+        self.assertEqual(c.count_service_start_failures(0, out, ""), 2)
+        self.assertEqual(c.count_service_start_failures(0, ev(0, "OtherSvc"), ""), 0)
+        with self.assertRaises(RuntimeError):
+            c.count_service_start_failures(1, out, "denied")
+
+    def test_tree_snapshot_empty_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(RuntimeError):
+                c.tree_snapshot(d)
+            (Path(d) / "a").write_text("1")
+            self.assertEqual(len(c.tree_snapshot(d)), 1)
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 7)
+        self.assertEqual(len(c.PHASES), 15)
+
+    def test_fault_phases_follow_reinstall_in_order(self):
+        names = [ph.__name__ for ph in c.PHASES]
+        i = names.index("phase_reinstall")
+        self.assertEqual(names[:i], [
+            "phase_reject", "phase_fresh", "phase_start_seed", "phase_acl_overwrite",
+            "phase_stopped_overwrite", "phase_uninstall_running",
+        ])
+        self.assertEqual(
+            names[i + 1 :],
+            [
+                "phase_install_locked_exe",
+                "phase_install_acl_refused",
+                "phase_install_preflight_refused",
+                "phase_uninstall_locked_exe",
+                "phase_uninstall_delete_fail",
+                "phase_install_service_install_fails_running",
+                "phase_restart_fails_corrupt_exe",
+                "phase_uninstall_delete_pending",
+            ],
+        )
 
 
 if __name__ == "__main__":

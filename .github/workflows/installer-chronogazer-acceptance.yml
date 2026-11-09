@@ -2,9 +2,12 @@ name: Installer ChronoGazer acceptance (disposable Windows, real setup + real SC
 
 # #973 残件A: 本物の ChronoGazer インストーラ（scripts/build-release-chronogazer.ps1 が作る
 # setup）を silent で実行し、実 SCM・実 chronogazer-server.exe の上で通常系のライフサイクル
-# （拒否・新規・稼働中の上書き・停止中の上書き・アンインストール・再インストール）を確かめる。
+# （拒否・新規・稼働中の上書き・停止中の上書き・アンインストール・再インストール）と、
+# 故障系（使用中 exe・ACL・事前確認での中止、アンインストールの中止、service-install 失敗、
+# 破損 exe での再開失敗、DeleteFlag 保留）を確かめる。
 # 使い捨てランナー専用: 実 C:\Program Files\ChronoGazer と ChronoGazer サービスを書き換える。
-# 対象外: 故障系・service-install 失敗・破損 exe・可視 UI とシェル 90 秒の問い・実 collector・#392 B3-5。
+# 対象外: 可視 UI とシェル 90 秒の問い（MessageBox）・サービス停止の timeout・`File` の書込み途中の失敗・
+# 消し残り（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。
 
 on:
   workflow_dispatch:
