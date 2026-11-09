@@ -129,6 +129,51 @@ class OwnerParseTests(unittest.TestCase):
         self.assertLessEqual(len(str(cm.exception)), 400)
 
 
+class FaultHelperTests(unittest.TestCase):
+    def test_sdshow(self):
+        out = "\r\nD:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)\r\n"
+        self.assertTrue(h.parse_sc_sdshow(0, out, "").startswith("D:("))
+        for rc, o in ((1, out), (0, ""), (0, "[SC] OpenService FAILED 5")):
+            with self.assertRaises(RuntimeError):
+                h.parse_sc_sdshow(rc, o, "err")
+
+    def test_deny_delete_inserted_at_dacl_head(self):
+        self.assertEqual(h.sddl_with_deny_delete("D:(A;;GA;;;SY)"), "D:(D;;SD;;;BA)(A;;GA;;;SY)")
+        self.assertEqual(h.sddl_with_deny_delete("D:PAI(A;;GA;;;SY)"), "D:PAI(D;;SD;;;BA)(A;;GA;;;SY)")
+        self.assertEqual(
+            h.sddl_with_deny_delete("O:BAG:SYD:P(A;;GA;;;SY)S:(AU;FA;GA;;;WD)"),
+            "O:BAG:SYD:P(D;;SD;;;BA)(A;;GA;;;SY)S:(AU;FA;GA;;;WD)",
+        )
+        self.assertEqual(
+            h.sddl_with_deny_delete("O:S-1-5-32-544G:DUD:(A;;GA;;;SY)"),
+            "O:S-1-5-32-544G:DUD:(D;;SD;;;BA)(A;;GA;;;SY)",
+        )
+
+    def test_deny_delete_without_dacl_raises(self):
+        for s in ("", "O:BAG:SY", "S:(AU;FA;GA;;;WD)"):
+            with self.assertRaises(RuntimeError):
+                h.sddl_with_deny_delete(s)
+
+    def test_icacls_output(self):
+        self.assertEqual(h.parse_icacls_output(0, "x BUILTIN\\Users:(M)\n", ""), "x BUILTIN\\Users:(M)\n")
+        for rc, o in ((5, "x"), (0, " \n")):
+            with self.assertRaises(RuntimeError):
+                h.parse_icacls_output(rc, o, "denied")
+
+    def test_uninstall_in_place_command(self):
+        self.assertEqual(
+            h.uninstall_in_place_command(h.INSTDIR),
+            '"C:\\Program Files\\BantoHub\\uninstall.exe" /S _?=C:\\Program Files\\BantoHub',
+        )
+
+    def test_tree_snapshot_empty_raises(self):
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(RuntimeError):
+                h.tree_snapshot(d)
+            (Path(d) / "a").write_text("1")
+            self.assertEqual(len(h.tree_snapshot(d)), 1)
+
+
 class RequestHeaderTests(unittest.TestCase):
     def test_get_and_post_carry_client_header_and_only_post_has_content_type(self):
         get = h.request_headers(False)
@@ -148,8 +193,20 @@ class SecretTests(unittest.TestCase):
     def test_phases_in_order(self):
         names = [p.__name__ for p in h.PHASES]
         self.assertEqual(names[0], "phase_reject")
-        self.assertEqual(names[-1], "phase_reinstall")
-        self.assertEqual(len(names), 7)
+        self.assertEqual(names[6], "phase_reinstall")
+        self.assertEqual(
+            names[7:],
+            [
+                "phase_install_locked_exe",
+                "phase_install_acl_refused",
+                "phase_uninstall_locked_exe",
+                "phase_uninstall_sink_delete_fail",
+                "phase_uninstall_hub_delete_fail",
+                "phase_uninstall_sink_delete_pending",
+                "phase_uninstall_hub_delete_pending",
+            ],
+        )
+        self.assertEqual(len(names), 14)
 
 
 if __name__ == "__main__":

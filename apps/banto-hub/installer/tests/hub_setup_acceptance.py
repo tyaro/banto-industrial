@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hub 一体インストーラ（本物の setup.exe）の実 SCM 受入試験（#973 残件A、通常系）。
+"""Hub 一体インストーラ（本物の setup.exe）の実 SCM 受入試験（#973 残件A、通常系＋故障系）。
 
 !!! 開発 PC では絶対に実行しない !!!
 このスクリプトは実 `C:\\Program Files\\BantoHub`・`C:\\ProgramData\\BantoHub`・
@@ -8,9 +8,17 @@ BantoHub / BantoHubSink サービスを書き換え、アンインストール�
 `.github/workflows/installer-hub-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_hub_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。故障系は後続 PR で関数を足す）:
-  1 拒否 / 2 新規 / 3 起動と種まき / 4 ACL を弱めて稼働中の上書き /
-  5 停止中の上書き / 6 稼働中のアンインストール / 7 再インストール
+フェーズ（各 `phase_*` は独立の関数）:
+  通常系: 1 拒否 / 2 新規 / 3 起動と種まき / 4 ACL を弱めて稼働中の上書き /
+          5 停止中の上書き / 6 稼働中のアンインストール / 7 再インストール
+  故障系: 8 使用中 exe でのインストール中止 / 9 事前確認（サブフォルダ・直下ジャンクション）での中止 /
+          10 使用中 exe でのアンインストール中止 / 11 Sink 解除失敗 / 12 Hub 解除失敗（Sink の戻し）/
+          13 Sink の DeleteFlag 保留 / 14 Hub の DeleteFlag 保留（拒否、解消、完了まで）
+  故障系は、中止後に止めたサービスが再開され、ファイル・登録・データが変わらず、
+  setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
+  同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 14 の最後だけ本物の呼び方）。
+  対象外: icacls の非 0 終了そのもの・`File` の書込み途中の失敗・消し残り
+  （RequireBantoHubExesDeleted）・サービス停止 timeout・再開失敗・Sink 稼働中・実 collector。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。テスト用の管理者パスワードは実行ごとの乱数で、ログにも証拠にも出さない。
 
@@ -51,6 +59,9 @@ SINK_EXAMPLE = SINK_DIR / "banto-hub-sink.toml.example"
 HUB_SVC = "BantoHub"
 SINK_SVC = "BantoHubSink"
 SERVICES = (HUB_SVC, SINK_SVC)
+# 製品が停止の待ち切り（30 秒 + 追加 60 秒）で中止する道は最短でも 90 秒掛かる。
+# それより短ければ、停止の待ち切りではない理由で中止したと分かる。
+STOP_TIMEOUT_ABORT_SECONDS = 90.0
 EXES = ("banto-hub.exe", "banto-hub-shell.exe", "banto-hub-elev.exe", "banto-hub-sink.exe")
 STATUS_URL = "http://127.0.0.1:8722/api/auth/status"
 SETUP_URL = "http://127.0.0.1:8722/api/auth/setup"
@@ -144,6 +155,42 @@ def parse_owner_output(returncode: int, stdout: str, stderr: str) -> str:
             f"owner 取得に失敗（returncode={returncode}）: {stderr[-300:]}"
         )
     return stdout.strip()
+
+
+def parse_sc_sdshow(returncode: int, stdout: str, stderr: str) -> str:
+    """`sc sdshow` の SDDL 行（`D:` か `O:` で始まる最初の行）。失敗・空は例外（空の観測を「変わっていない」と誤判定させない）。"""
+    if returncode == 0:
+        for line in stdout.splitlines():
+            t = line.strip()
+            if t.startswith(("D:", "O:")):
+                return t
+    raise RuntimeError(f"sc sdshow に失敗（returncode={returncode}）: {(stdout + stderr)[-300:]}")
+
+
+_SDDL_DACL_HEAD = re.compile(
+    r"(?:O:(?:S-[\d-]+|[A-Z]{2}))?(?:G:(?:S-[\d-]+|[A-Z]{2}))?D:(?:P|AI|AR)*"
+)
+
+
+def sddl_with_deny_delete(sddl: str) -> str:
+    """DACL の先頭に「Administrators に DELETE 拒否」の ACE を入れる。O:/G: の中の文字や SACL は壊さない。"""
+    sddl = sddl.strip()
+    m = _SDDL_DACL_HEAD.match(sddl)
+    if not m:
+        raise RuntimeError(f"DACL が無い SDDL: {sddl!r}")
+    return sddl[: m.end()] + "(D;;SD;;;BA)" + sddl[m.end() :]
+
+
+def parse_icacls_output(returncode: int, stdout: str, stderr: str) -> str:
+    """`icacls <path>` の出力。失敗・空は例外。"""
+    if returncode != 0 or not stdout.strip():
+        raise RuntimeError(f"icacls に失敗（returncode={returncode}）: {stderr[-300:]}")
+    return stdout
+
+
+def uninstall_in_place_command(instdir) -> str:
+    """`_?=` 付きでその場で走らせる呼び方。`_?=` は最後の引数でクォートしない（NSIS の規則）ので文字列で渡す。"""
+    return f'"{instdir}\\uninstall.exe" /S _?={instdir}'
 
 
 def find_setup(dist: Path) -> tuple[Path, str]:
@@ -324,6 +371,180 @@ def owner_of(path: Path) -> str:
     return parse_owner_output(r.returncode, r.stdout, r.stderr)
 
 
+def icacls_output(path) -> str:
+    r = run(["icacls", str(path)])
+    return parse_icacls_output(r.returncode, r.stdout, r.stderr)
+
+
+def acl_snapshot(path) -> dict:
+    return {"owner": owner_of(path), "icacls": icacls_output(path)}
+
+
+def read_delete_flag(name: str) -> int | None:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{name}") as k:
+            value, typ = winreg.QueryValueEx(k, "DeleteFlag")
+    except FileNotFoundError:
+        return None
+    if typ != winreg.REG_DWORD:
+        raise RuntimeError(f"DeleteFlag の型が REG_DWORD でない: {typ}")
+    return int(value)
+
+
+SERVICE_MARKER = "Banto973Marker"
+
+
+def set_service_marker(name: str) -> None:
+    """サービスのキーに目印の値を置く。解除と再登録でキーが作り直されると消える。"""
+    run(
+        ["reg", "add", rf"HKLM\SYSTEM\CurrentControlSet\Services\{name}", "/v", SERVICE_MARKER, "/t", "REG_SZ", "/d", "1", "/f"],
+        check=True,
+    )
+
+
+def service_marker_present(name: str) -> bool:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, rf"SYSTEM\CurrentControlSet\Services\{name}") as k:
+            winreg.QueryValueEx(k, SERVICE_MARKER)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _win_apis():
+    """kernel32 / advapi32。HANDLE は 64bit 幅で明示する（切り詰めない）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    k = ctypes.WinDLL("kernel32", use_last_error=True)
+    a = ctypes.WinDLL("advapi32", use_last_error=True)
+    k.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    ]
+    k.CreateFileW.restype = wintypes.HANDLE
+    k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.CloseHandle.restype = wintypes.BOOL
+    a.OpenSCManagerW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+    a.OpenSCManagerW.restype = wintypes.HANDLE
+    a.OpenServiceW.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.DWORD]
+    a.OpenServiceW.restype = wintypes.HANDLE
+    a.CloseServiceHandle.argtypes = [wintypes.HANDLE]
+    a.CloseServiceHandle.restype = wintypes.BOOL
+    return ctypes, k, a
+
+
+_INVALID_HANDLE = 0xFFFFFFFFFFFFFFFF
+
+
+class ExclusiveFileLock:
+    """READ 共有だけで開いて保持し、書込みで開けない状態にする（使用中の exe を作る）。"""
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.handle = None
+
+    def __enter__(self):
+        ctypes, k, _ = _win_apis()
+        h = k.CreateFileW(self.path, 0x80000000, 1, None, 3, 0, None)
+        if not h or h == _INVALID_HANDLE:
+            raise RuntimeError(f"ロック用の CreateFileW に失敗: {ctypes.get_last_error()}")
+        self.handle = h
+        w = k.CreateFileW(self.path, 0x40000000, 7, None, 3, 0, None)
+        if w and w != _INVALID_HANDLE:
+            k.CloseHandle(w)
+            self.__exit__()
+            raise RuntimeError("ロックが効いていない（書込みで開けた）")
+        err = ctypes.get_last_error()
+        if err != 32:
+            self.__exit__()
+            raise RuntimeError(f"書込みで開けない理由が共有違反でない: {err}")
+        return self
+
+    def __exit__(self, *exc):
+        if self.handle:
+            _, k, _ = _win_apis()
+            k.CloseHandle(self.handle)
+            self.handle = None
+        return False
+
+
+class ServiceHandleHold:
+    """サービスのハンドルを保持する。DeleteService は 0 で返るが DeleteFlag が残る（削除保留）状態を作る。"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.scm = None
+        self.svc = None
+
+    def __enter__(self):
+        ctypes, _, a = _win_apis()
+        self.scm = a.OpenSCManagerW(None, None, 1)
+        if not self.scm:
+            raise RuntimeError(f"OpenSCManagerW に失敗: {ctypes.get_last_error()}")
+        self.svc = a.OpenServiceW(self.scm, self.name, 4)  # QUERY_STATUS
+        if not self.svc:
+            err = ctypes.get_last_error()
+            self.__exit__()
+            raise RuntimeError(f"OpenServiceW({self.name}) に失敗: {err}")
+        return self
+
+    def __exit__(self, *exc):
+        _, _, a = _win_apis()
+        if self.svc:
+            a.CloseServiceHandle(self.svc)
+            self.svc = None
+        if self.scm:
+            a.CloseServiceHandle(self.scm)
+            self.scm = None
+        return False
+
+
+def _sc_sdshow(name: str) -> str:
+    r = run(["sc", "sdshow", name])
+    return parse_sc_sdshow(r.returncode, r.stdout, r.stderr)
+
+
+class DenyServiceDelete:
+    """サービスの SDDL に Administrators の DELETE 拒否を入れる（DeleteService を失敗させる）。抜けるとき元に戻す。"""
+
+    def __init__(self, name: str):
+        self.name = name
+        self.original = None
+
+    def __enter__(self):
+        self.original = _sc_sdshow(self.name)
+        run(["sc", "sdset", self.name, sddl_with_deny_delete(self.original)], check=True)
+        now = _sc_sdshow(self.name)
+        if "(D;;SD;;;BA)" not in now:
+            run(["sc", "sdset", self.name, self.original])
+            raise RuntimeError(f"DELETE 拒否が入っていない: {now}")
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.original is not None:
+            r = run(["sc", "sdset", self.name, self.original])
+            self.original = None
+            if r.returncode != 0:
+                message = f"sc sdset の戻しに失敗: {self.name} -> {r.returncode}: {r.stdout}{r.stderr}"
+                print(message)
+                if exc_type is None:
+                    raise RuntimeError(message)
+        return False
+
+
+def tree_snapshot(root) -> dict[str, str]:
+    """中身のハッシュ。空は例外（観測が空のときに通さない）。再解析ポイントの中は辿らないよう、置く前に取り、外した後に比べる。"""
+    snap = tree_hashes(Path(root))
+    if not snap:
+        raise RuntimeError(f"tree_hashes が空: {root}")
+    return snap
+
+
 def uninstall_registration() -> list[str]:
     """Apps（Uninstall キー）のうち INSTDIR を指す登録。"""
     import winreg
@@ -360,6 +581,54 @@ def uninstall_registration() -> list[str]:
 def expect(phase: str, cond: bool, message: str, observation=None) -> None:
     if not cond:
         raise PhaseFailure(phase, message, observation)
+
+
+def timed(p: str, label: str, fn):
+    """fn() の所要秒を証拠に残して (結果, 秒) を返す。"""
+    start = time.monotonic()
+    result = fn()
+    elapsed = round(time.monotonic() - start, 1)
+    obs(p, f"{label}_elapsed_seconds", elapsed)
+    return result, elapsed
+
+
+def expect_not_stop_timeout(p: str, elapsed: float) -> None:
+    """同じ観測になる「停止の待ち切りでの中止」と見分ける。"""
+    expect(
+        p,
+        elapsed < STOP_TIMEOUT_ABORT_SECONDS,
+        "abort took as long as the stop-timeout path; the intended fault may not have been reached",
+        elapsed,
+    )
+
+
+def weakened_outside(p: str, name: str):
+    """RUNNER_TEMP 配下に ACL・owner を弱めた外部フォルダと keep.txt を作り、(dir, targets, before) を返す。"""
+    outside = Path(os.environ["RUNNER_TEMP"]) / name
+    outside.mkdir(parents=True, exist_ok=True)
+    keep = outside / "keep.txt"
+    keep.write_text("keep", encoding="utf-8")
+    targets = [outside, keep]
+    for t in targets:
+        run(["icacls", str(t), "/grant", f"{USERS_SID}:(M)"], check=True)
+        run(["icacls", str(t), "/setowner", os.environ["USERNAME"]], check=True)
+        snap = acl_snapshot(t)
+        weak = icacls_explicit_users_aces(snap["icacls"])
+        obs(p, f"outside_weakened_{name}_{t.name}", {"explicit_users": weak, "owner": snap["owner"]})
+        # 前提が崩れていると、setowner Administrators・reset への退行を検出できない
+        expect(p, bool(weak), f"could not weaken ACL on {t}", weak)
+        expect(p, "Administrators" not in snap["owner"], f"owner of {t} is already Administrators", snap["owner"])
+    before = {"hashes": tree_hashes(outside), "acl": {str(t): acl_snapshot(t) for t in targets}}
+    return outside, targets, before
+
+
+def expect_outside_unchanged(p: str, targets, before) -> None:
+    """targets[0] は外部フォルダ。中身のハッシュと所有者・ACL の不変を確かめる。"""
+    after = {"hashes": tree_hashes(targets[0]), "acl": {str(t): acl_snapshot(t) for t in targets}}
+    obs(p, "outside_before", before)
+    obs(p, "outside_after", after)
+    expect(p, before["hashes"] == after["hashes"], "outside folder content changed", after["hashes"])
+    expect(p, before["acl"] == after["acl"], "outside owner/ACL changed", after["acl"])
 
 
 def expect_services_registered_stopped(phase: str) -> None:
@@ -406,18 +675,12 @@ def phase_reject(c: Ctx) -> None:
     for name in SERVICES:
         expect(p, sc_state(name)["state"] is None, f"{name} registered after refusal")
 
-    outside = Path(os.environ["RUNNER_TEMP"]) / "hub-junction-outside"
-    outside.mkdir(parents=True, exist_ok=True)
-    (outside / "keep.txt").write_text("keep", encoding="utf-8")
-    before = tree_hashes(outside)
+    outside, targets, before = weakened_outside(p, "hub-junction-outside")
     run(["cmd", "/c", "mklink", "/J", str(INSTDIR), str(outside)], check=True)
     try:
         rc = run_setup(c.setup, [], p, "junction")
         expect(p, rc != 0, "setup over a junction must fail", rc)
-        after = tree_hashes(outside)
-        obs(p, "outside_before", before)
-        obs(p, "outside_after", after)
-        expect(p, before == after, "outside folder changed", after)
+        expect_outside_unchanged(p, targets, before)
         for name in SERVICES:
             expect(p, sc_state(name)["state"] is None, f"{name} registered after junction refusal")
     finally:
@@ -535,14 +798,8 @@ def phase_stopped_overwrite(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
-def phase_uninstall_running(c: Ctx) -> None:
-    p = "6_uninstall_running"
-    run(["sc", "start", HUB_SVC])
-    wait_state(HUB_SVC, "RUNNING")
-    wait_status()
-    # `_?=` を付けない実際の呼び方。親は子（temp にコピーされた本体）を残してすぐ戻る。
-    r = run([str(INSTDIR / "uninstall.exe"), "/S"], timeout=600)
-    obs(p, "uninstall_parent_exit", r.returncode)
+def _wait_uninstall_done(p: str) -> None:
+    """親が戻った後の子（temp 本体）の完了待ち。サービス・exe・Apps 登録がすべて消えること。"""
 
     def done():
         keys = [n for n in SERVICES if service_key_exists(n) or sc_state(n)["state"] is not None]
@@ -557,6 +814,18 @@ def phase_uninstall_running(c: Ctx) -> None:
     reg = uninstall_registration()
     obs(p, "apps_registration", reg)
     expect(p, not reg, "Apps registration remains", reg)
+
+
+def phase_uninstall_running(c: Ctx) -> None:
+    p = "6_uninstall_running"
+    run(["sc", "start", HUB_SVC])
+    wait_state(HUB_SVC, "RUNNING")
+    wait_status()
+    # `_?=` を付けない実際の呼び方。親は子（temp にコピーされた本体）を残してすぐ戻る。
+    r = run([str(INSTDIR / "uninstall.exe"), "/S"], timeout=600)
+    obs(p, "uninstall_parent_exit", r.returncode)
+
+    _wait_uninstall_done(p)
     expect(p, SQLITE.is_file(), "sqlite was removed")
     _expect_data_intact(p, c)
 
@@ -576,6 +845,281 @@ def phase_reinstall(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
+# ---------------------------------------------------------------- 故障系
+
+def _dist_sink(c: Ctx) -> Path:
+    return c.dist / f"banto-hub-sink-v{c.version}-windows-x86_64.exe"
+
+
+def _ensure_hub_running(p: str) -> int:
+    if sc_state(HUB_SVC)["state"] != "RUNNING":
+        run(["sc", "start", HUB_SVC])
+        wait_state(HUB_SVC, "RUNNING")
+    status = wait_status()
+    pid = sc_state(HUB_SVC)["pid"]
+    obs(p, "pid_before", pid)
+    expect(p, status_initialized(status), "status not initialized before fault", status)
+    expect(p, bool(pid), "BantoHub has no PID")
+    return pid
+
+
+def _expect_hub_restarted(p: str, before_pid: int) -> None:
+    st = wait_state(HUB_SVC, "RUNNING")
+    status = wait_status()
+    obs(p, "pid_after", st["pid"])
+    expect(p, st["pid"] != before_pid, "BantoHub PID unchanged (stopped service was not resumed)", st)
+    expect(p, status_initialized(status), "status not initialized after abort", status)
+
+
+def _expect_hub_untouched(p: str, before_pid: int) -> None:
+    st = sc_state(HUB_SVC)
+    obs(p, "hub_untouched", st)
+    expect(p, st["state"] == "RUNNING" and st["pid"] == before_pid, "BantoHub was stopped before the precheck", st)
+
+
+def _expect_registered(p: str, name: str) -> None:
+    st = sc_state(name)
+    qc = sc_config(name)
+    flag = read_delete_flag(name)
+    obs(p, f"{name}_state", st)
+    obs(p, f"{name}_config", qc)
+    obs(p, f"{name}_delete_flag", flag)
+    expect(p, st["state"] is not None, f"{name} not registered", st)
+    expect(p, flag in (None, 0), f"{name} has DeleteFlag", flag)
+    expect(p, qc["start_type"] == "DEMAND_START", f"{name} not DEMAND_START", qc)
+    expect(
+        p,
+        bool(qc["image_path"]) and image_path_inside(qc["image_path"], INSTDIR),
+        f"{name} ImagePath outside INSTDIR",
+        qc,
+    )
+
+
+def _tamper_sink(p: str, c: Ctx) -> str:
+    """同じ版を上書きするのでハッシュ比較では上書きを見分けられない。末尾の \\0 が残っているかで見る。"""
+    with open(INSTDIR / "banto-hub-sink.exe", "ab") as f:
+        f.write(b"\0")
+    got = sha256(INSTDIR / "banto-hub-sink.exe")
+    obs(p, "sink_tampered_hash", got)
+    expect(p, got != sha256(_dist_sink(c)), "sink exe tamper did not change hash")
+    return got
+
+
+def _expect_sink_matches_dist(p: str, c: Ctx) -> None:
+    want, got = sha256(_dist_sink(c)), sha256(INSTDIR / "banto-hub-sink.exe")
+    obs(p, "sink_hash", {"dist": want, "installed": got})
+    expect(p, want == got, "installed sink exe differs from dist")
+
+
+def _expect_sink_still(p: str, tampered: str) -> None:
+    got = sha256(INSTDIR / "banto-hub-sink.exe")
+    obs(p, "sink_hash_after_abort", {"tampered": tampered, "now": got})
+    expect(p, got == tampered, "sink exe was overwritten despite the abort")
+
+
+def _uninstall_in_place(p: str, label: str) -> int:
+    r = run(uninstall_in_place_command(INSTDIR), timeout=600)
+    obs(p, f"{label}_exit", r.returncode)
+    obs(p, f"{label}_stderr_tail", r.stderr[-300:])
+    return r.returncode
+
+
+def _expect_still_installed(p: str, c: Ctx, before: dict) -> None:
+    after = tree_snapshot(INSTDIR)
+    reg = uninstall_registration()
+    obs(p, "instdir_changed", sorted(k for k in set(before) | set(after) if before.get(k) != after.get(k)))
+    obs(p, "apps_registration", reg)
+    expect(p, after == before, "INSTDIR content changed by the aborted uninstall")
+    expect(p, bool(reg), "Apps registration removed by the aborted uninstall")
+    expect(p, SQLITE.is_file(), "sqlite was removed")
+    _expect_data_intact(p, c)
+
+
+def _recover_by_setup(p: str, c: Ctx) -> None:
+    rc = run_setup(c.setup, [], p, "recover")
+    expect(p, rc == 0, "recovery setup failed", rc)
+    wait_state(HUB_SVC, "RUNNING")
+    status = wait_status()
+    obs(p, "recover_status", status)
+    expect(p, status_initialized(status), "status not initialized after recovery", status)
+    for name in SERVICES:
+        _expect_registered(p, name)
+    _expect_sink_matches_dist(p, c)
+    _expect_data_intact(p, c)
+
+
+def phase_install_locked_exe(c: Ctx) -> None:
+    p = "8_install_locked_exe"
+    pid = _ensure_hub_running(p)
+    tampered = _tamper_sink(p, c)
+    with ExclusiveFileLock(INSTDIR / "banto-hub-sink.exe"):
+        rc, elapsed = timed(p, "locked_setup", lambda: run_setup(c.setup, [], p, "locked_setup"))
+    expect(p, rc != 0, "setup over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_hub_restarted(p, pid)
+    sink = sc_state(SINK_SVC)
+    obs(p, "sink_state", sink)
+    expect(p, sink["state"] == "STOPPED", "Sink was started by the aborted setup", sink)
+    _expect_registered(p, SINK_SVC)
+    _expect_sink_still(p, tampered)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    _recover_by_setup(p, c)
+
+
+def phase_install_acl_refused(c: Ctx) -> None:
+    p = "9_install_acl_refused"
+    pid = _ensure_hub_running(p)
+    tampered = _tamper_sink(p, c)
+    # サブフォルダ（ACL の段階はサービスを止める前に中止する）
+    before = tree_snapshot(INSTDIR)
+    subdir = INSTDIR / "banto-973-subdir"
+    subdir.mkdir()
+    (subdir / "keep.txt").write_text("keep", encoding="utf-8")
+    try:
+        rc = run_setup(c.setup, [], p, "subdir_setup")
+        expect(p, rc != 0, "setup with a subfolder must fail", rc)
+        _expect_hub_untouched(p, pid)
+        expect(p, subdir.is_dir() and (subdir / "keep.txt").is_file(), "subfolder was removed by the setup")
+    finally:
+        shutil.rmtree(subdir, ignore_errors=True)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (subfolder)")
+    _expect_sink_still(p, tampered)
+    # 直下のジャンクション
+    outside, targets, outside_before = weakened_outside(p, "hub-nested-junction-outside")
+    link = INSTDIR / "banto-973-link"
+    run(["cmd", "/c", "mklink", "/J", str(link), str(outside)], check=True)
+    try:
+        rc = run_setup(c.setup, [], p, "junction_setup")
+        expect(p, rc != 0, "setup with a nested junction must fail", rc)
+        _expect_hub_untouched(p, pid)
+        expect_outside_unchanged(p, targets, outside_before)
+    finally:
+        if os.path.lexists(link):
+            os.rmdir(link)  # ジャンクションだけ消す
+    expect(p, not os.path.lexists(link), "nested junction not removed")
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the refused setup (junction)")
+    _expect_sink_still(p, tampered)
+    _recover_by_setup(p, c)
+
+
+def phase_uninstall_locked_exe(c: Ctx) -> None:
+    p = "10_uninstall_locked_exe"
+    pid = _ensure_hub_running(p)
+    before = tree_snapshot(INSTDIR)
+    with ExclusiveFileLock(INSTDIR / "banto-hub-sink.exe"):
+        rc, elapsed = timed(p, "locked_uninstall", lambda: _uninstall_in_place(p, "locked_uninstall"))
+    expect(p, rc != 0, "uninstall over a locked exe must fail", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_hub_restarted(p, pid)
+    for name in SERVICES:
+        _expect_registered(p, name)
+    _expect_still_installed(p, c, before)
+
+
+def phase_uninstall_sink_delete_fail(c: Ctx) -> None:
+    p = "11_uninstall_sink_delete_fail"
+    pid = _ensure_hub_running(p)
+    before = tree_snapshot(INSTDIR)
+    set_service_marker(SINK_SVC)
+    expect(p, service_marker_present(SINK_SVC), "could not set the Sink marker")
+    with DenyServiceDelete(SINK_SVC):
+        rc, elapsed = timed(p, "uninstall", lambda: _uninstall_in_place(p, "uninstall"))
+    expect(p, rc != 0, "uninstall must fail when the Sink cannot be deleted", rc)
+    expect_not_stop_timeout(p, elapsed)
+    _expect_hub_restarted(p, pid)
+    # Sink の削除は拒まれたので、キーは作り直されていない。
+    marker = service_marker_present(SINK_SVC)
+    obs(p, "sink_marker_after", marker)
+    expect(p, marker, "Sink registration was recreated although its deletion was denied")
+    for name in SERVICES:
+        _expect_registered(p, name)
+    _expect_still_installed(p, c, before)
+
+
+def phase_uninstall_hub_delete_fail(c: Ctx) -> None:
+    p = "12_uninstall_hub_delete_fail"
+    pid = _ensure_hub_running(p)
+    before = tree_snapshot(INSTDIR)
+    set_service_marker(SINK_SVC)
+    expect(p, service_marker_present(SINK_SVC), "could not set the Sink marker")
+    with DenyServiceDelete(HUB_SVC):
+        rc = _uninstall_in_place(p, "uninstall")
+    expect(p, rc != 0, "uninstall must fail when the Hub cannot be deleted", rc)
+    _expect_hub_restarted(p, pid)
+    # 目印が消えていれば、Sink は実際に解除されて install で戻された（解除の前に中止していない）。
+    marker = service_marker_present(SINK_SVC)
+    obs(p, "sink_marker_after", marker)
+    expect(p, not marker, "Sink registration was not recreated (aborted before the unregister step?)")
+    for name in SERVICES:
+        _expect_registered(p, name)  # Sink は一度解除され、install + grant-service-acl で戻された登録
+    sink = sc_state(SINK_SVC)
+    obs(p, "sink_state_after", sink)
+    expect(p, sink["state"] == "STOPPED", "restored Sink was started", sink)
+    obs(p, "sink_sdshow", _sc_sdshow(SINK_SVC))
+    _expect_still_installed(p, c, before)
+
+
+def phase_uninstall_sink_delete_pending(c: Ctx) -> None:
+    p = "13_uninstall_sink_delete_pending"
+    pid = _ensure_hub_running(p)
+    before = tree_snapshot(INSTDIR)
+    with ServiceHandleHold(SINK_SVC):
+        rc = _uninstall_in_place(p, "uninstall")
+        flag = read_delete_flag(SINK_SVC)
+        obs(p, "sink_delete_flag", flag)
+        expect(p, rc != 0, "uninstall must abort on a pending Sink deletion", rc)
+        expect(p, flag == 1, "Sink DeleteFlag not set", flag)
+        _expect_hub_restarted(p, pid)
+        _expect_registered(p, HUB_SVC)
+        _expect_still_installed(p, c, before)
+    # service_key_exists はレジストリだけを見るので、追加のハンドルを持たない
+    gone = wait_until(lambda: not service_key_exists(SINK_SVC), 60)
+    obs(p, "sink_key_gone", bool(gone))
+    expect(p, bool(gone), "Sink registration did not disappear after the handle closed")
+    _recover_by_setup(p, c)
+
+
+def phase_uninstall_hub_delete_pending(c: Ctx) -> None:
+    p = "14_uninstall_hub_delete_pending"
+    _ensure_hub_running(p)  # 保留中の Hub は再開されないので PID の比較はしない
+    before = tree_snapshot(INSTDIR)
+    with ServiceHandleHold(HUB_SVC):
+        rc = _uninstall_in_place(p, "uninstall")
+        flag = read_delete_flag(HUB_SVC)
+        obs(p, "hub_delete_flag", flag)
+        expect(p, rc != 0, "uninstall must abort on a pending Hub deletion", rc)
+        expect(p, flag == 1, "Hub DeleteFlag not set", flag)
+        _expect_registered(p, SINK_SVC)
+        hub = sc_state(HUB_SVC)
+        obs(p, "hub_state_pending", hub)
+        expect(p, hub["state"] != "RUNNING", "Hub with a pending deletion was resumed", hub)
+        _expect_still_installed(p, c, before)
+        r = run([str(INSTDIR / "banto-hub-elev.exe"), "service-install"])
+        obs(p, "service_install_while_pending", {"exit": r.returncode, "stderr_tail": r.stderr[-300:]})
+        expect(p, r.returncode != 0, "service-install must refuse a pending deletion", r.returncode)
+        flag = read_delete_flag(HUB_SVC)
+        obs(p, "hub_delete_flag_after_install", flag)
+        expect(p, flag == 1, "Hub DeleteFlag changed by service-install", flag)
+    gone = wait_until(lambda: not service_key_exists(HUB_SVC), 60)
+    obs(p, "hub_key_gone", bool(gone))
+    expect(p, bool(gone), "Hub registration did not disappear after the handle closed")
+    # `_?=` なしの本物の呼び方。Hub の未登録を飛ばして最後まで進む。
+    r = run([str(INSTDIR / "uninstall.exe"), "/S"], timeout=600)
+    obs(p, "uninstall_parent_exit", r.returncode)
+    _wait_uninstall_done(p)
+    expect(p, SQLITE.is_file(), "sqlite was removed")
+    _expect_data_intact(p, c)
+    rc = run_setup(c.setup, [], p, "reinstall")
+    expect(p, rc == 0, "reinstall after the pending deletion failed", rc)
+    expect_services_registered_stopped(p)
+    _ensure_hub_running(p)
+    status = wait_status()
+    obs(p, "status", status)
+    expect(p, status_initialized(status), "status not initialized after reinstall", status)
+    _expect_data_intact(p, c)
+
+
 PHASES = (
     phase_reject,
     phase_fresh,
@@ -584,6 +1128,13 @@ PHASES = (
     phase_stopped_overwrite,
     phase_uninstall_running,
     phase_reinstall,
+    phase_install_locked_exe,
+    phase_install_acl_refused,
+    phase_uninstall_locked_exe,
+    phase_uninstall_sink_delete_fail,
+    phase_uninstall_hub_delete_fail,
+    phase_uninstall_sink_delete_pending,
+    phase_uninstall_hub_delete_pending,
 )
 
 
