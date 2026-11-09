@@ -8,6 +8,10 @@
 //! SCM 起動の子には試験の環境変数が継承されないため、`run-service` は ImagePath の引数
 //! （run-id・sha）と `<root>\.banto-973-ci`・`binding.json`・自身の SHA-256 の束縛で
 //! 使い捨て runner の試験ビルドであることを確かめ、満たさなければ Running を報告せず終わる。
+//!
+//! 保留モード（C-stop-timeout 用）: 停止の合図（Stop）を受けたとき、`<root>\dummy\hold-stop.txt` の
+//! 内容が `<run-id>\n<sha>\n` と完全一致なら、STOP_PENDING のまま heartbeat を続けて終わらない。
+//! ファイルが消えれば `released`、5 分で `expired` として `holds.jsonl` に残し、正常終了する。
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +58,12 @@ fn check_binding(text: &str, expected: &Expected) -> Result<(), String> {
     Ok(())
 }
 
+/// 停止の保留を頼む `hold-stop.txt` の内容か。`{run_id}\n{sha}\n` の完全一致だけ true。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn hold_requested(content: Option<&str>, run_id: &str, sha: &str) -> bool {
+    content == Some(format!("{run_id}\n{sha}\n").as_str())
+}
+
 #[cfg(not(windows))]
 fn main() {
     eprintln!("running_dummy requires a disposable GitHub-hosted Windows runner");
@@ -70,7 +80,7 @@ fn main() {
 
 #[cfg(windows)]
 mod windows {
-    use super::{check_binding, Binding, Expected};
+    use super::{check_binding, hold_requested, Binding, Expected};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -86,6 +96,10 @@ mod windows {
     const HEARTBEAT: Duration = Duration::from_millis(500);
     /// 試験の暴走を止める見張り。起動からこの時間で自分から止まる。
     const WATCHDOG: Duration = Duration::from_secs(20 * 60);
+    /// 停止の保留を頼むファイル（`<root>\dummy` 直下）。
+    const HOLD_FILE: &str = "hold-stop.txt";
+    /// 保留の上限。これを過ぎたら自分から抜ける（後片付けが漏れても残らない）。
+    const HOLD_MAX: Duration = Duration::from_secs(5 * 60);
 
     #[link(name = "shell32")]
     unsafe extern "system" {
@@ -241,6 +255,53 @@ mod windows {
             let _ = append(&self.dir, "errors.log", &format!("{} {line}", wall_ms()));
         }
 
+        /// heartbeat を 1 行書く（通常の周回と停止の保留中で同じ形）。
+        fn beat(&self, seq: u64, pid: u32) {
+            let _ = append(
+                &self.dir,
+                "heartbeat.jsonl",
+                &format!(
+                    "{{\"seq\":{seq},\"pid\":{pid},\"run_id\":{},\"sha\":{},\"wall_ms\":{}}}",
+                    js(&self.run_id),
+                    js(&self.sha),
+                    wall_ms()
+                ),
+            );
+        }
+
+        /// 停止の保留（STOP_PENDING のまま heartbeat を続ける）。`hold-stop.txt` が消えるか
+        /// `HOLD_MAX` を過ぎたら抜ける。
+        fn hold(&self, pid: u32, seq: &mut u64) {
+            let _ = append(
+                &self.dir,
+                "holds.jsonl",
+                &format!(
+                    "{{\"event\":\"hold-begin\",\"pid\":{pid},\"wall_ms\":{}}}",
+                    wall_ms()
+                ),
+            );
+            let begun = Instant::now();
+            let reason = loop {
+                std::thread::sleep(HEARTBEAT);
+                *seq += 1;
+                self.beat(*seq, pid);
+                if !self.dir.join(HOLD_FILE).exists() {
+                    break "released";
+                }
+                if begun.elapsed() >= HOLD_MAX {
+                    break "expired";
+                }
+            };
+            let _ = append(
+                &self.dir,
+                "holds.jsonl",
+                &format!(
+                    "{{\"event\":\"hold-end\",\"pid\":{pid},\"reason\":\"{reason}\",\"wall_ms\":{}}}",
+                    wall_ms()
+                ),
+            );
+        }
+
         fn refuse(&self, reason: &str) -> ServiceExit {
             self.note_error(&format!("refused: {reason}"));
             let _ = append(
@@ -355,16 +416,7 @@ mod windows {
             loop {
                 std::thread::sleep(HEARTBEAT);
                 seq += 1;
-                let _ = append(
-                    &self.dir,
-                    "heartbeat.jsonl",
-                    &format!(
-                        "{{\"seq\":{seq},\"pid\":{pid},\"run_id\":{},\"sha\":{},\"wall_ms\":{}}}",
-                        js(&self.run_id),
-                        js(&self.sha),
-                        wall_ms()
-                    ),
-                );
+                self.beat(seq, pid);
                 if let Some(notice) = ctx.stop_notice() {
                     let signal = match notice.signal {
                         StopSignal::ServiceStop => "Stop",
@@ -378,6 +430,12 @@ mod windows {
                             wall_ms()
                         ),
                     );
+                    if matches!(notice.signal, StopSignal::ServiceStop) {
+                        let content = std::fs::read_to_string(self.dir.join(HOLD_FILE)).ok();
+                        if hold_requested(content.as_deref(), &self.run_id, &self.sha) {
+                            self.hold(pid, &mut seq);
+                        }
+                    }
                     return ServiceExit::Success;
                 }
                 if started.elapsed() >= WATCHDOG {
@@ -507,6 +565,16 @@ mod tests {
     #[test]
     fn accepts_exact_binding() {
         check_binding(GOOD, &exp()).unwrap();
+    }
+
+    #[test]
+    fn hold_requires_exact_content() {
+        assert!(hold_requested(Some("r1\ns1\n"), "r1", "s1"));
+        assert!(!hold_requested(None, "r1", "s1"));
+        assert!(!hold_requested(Some("r2\ns1\n"), "r1", "s1"));
+        assert!(!hold_requested(Some("r1\ns2\n"), "r1", "s1"));
+        assert!(!hold_requested(Some("r1\ns1"), "r1", "s1"));
+        assert!(!hold_requested(Some("r1\ns1\nextra\n"), "r1", "s1"));
     }
 
     #[test]

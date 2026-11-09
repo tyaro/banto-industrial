@@ -34,6 +34,15 @@ carries the real exit code, flag already 0). After the warning's OK the main dia
 .onInstFailed (flag 0) does not try again (exactly one sc start, exit code 2, no copy, hashes unchanged). The
 service stays STOPPED (pid 0) through the warning, the dialog and after exit. Positive control: after the
 installer exits, start= demand + start brings it back RUNNING with a new PID, so Disabled was the only cause.
+
+Case C-stop-timeout: the dummy is told (hold-stop.txt, exact run-id/sha content) to stay STOP_PENDING after sc stop and
+keep writing heartbeats. The real StopServiceIfRunning waits 30 s, RequireChronoGazerServiceInactive waits the extra 60 s,
+then shows the "stop not finished" main dialog (flag 0) and aborts: no restart (the stop never finished), no copy, hashes
+unchanged, exit code 2, the service stays STOP_PENDING with the same PID throughout (the .onInstFailed does not touch it).
+The sc query count between sc stop and the dialog is exactly 92 (30 + 2 + 60) and the stop-to-dialog time is >= 85 s.
+Positive control: removing hold-stop.txt lets the dummy exit (hold-end released, STOPPED); a new start gets a new PID.
+Limit: the PENDING-for-30+60-seconds path only. The path where the service becomes STOPPED during the extra wait and the
+install continues, and the path rejected while still RUNNING, are out of scope.
 """
 
 import argparse
@@ -71,6 +80,15 @@ INACTIVE_TEXTS = ("サービスが停止の要求を受け付けず", "サービ
 CALLBACK_DIALOG_TEXT = "$2"
 DIALOG_CLASS = "#32770"
 RUNNING, STOPPED = 4, 1
+STOP_PENDING = 3
+# C-stop-timeout: 停止を保留させる合図ファイル（dummy が <root>\dummy\ から読む。内容は run-id と sha の完全一致）。
+STOP_HOLD_FILE = "hold-stop.txt"
+STOP_PENDING_MAIN_TEXT = "サービスの停止がまだ終わっていません"
+# service-hooks.nsh の RequireChronoGazerServiceInactive の MessageBox（60 は CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS）。
+STOP_PENDING_DIALOG_PREFIX = "ChronoGazer サービスの停止がまだ終わっていません（停止を頼んで、さらに 60 秒待ちましたが、PENDING のままです）。"
+# sc stop と主 dialog の間の STOPPED 照会: StopServiceIfRunning の最大 30 回 + RUNNING/PENDING の各 1 回 + PENDING のループ 60 回。
+STOP_WAIT_QUERIES = 92
+STOP_HOLD_MIN_MS = 85_000  # 30 秒 + 60 秒の待ち（Sleep 29 + 59 回 = 88 秒）より少し短い下限。
 WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
 
 SC_QUERIES = tuple("nsExec::ExecToStack 'cmd /c sc query \"ChronoGazer\" | findstr /C:\"" + state + "\" >nul'"
@@ -106,6 +124,9 @@ ICACLS_EVENT = "icacls-attempt target="
 RESTART_FAIL_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "preinstall-done flag=1", "restart-attempt",
                                  "restart-failed-dialog flag=0", "main-dialog flag=0")
 
+# C-stop-timeout: 停止が終わらず中止する。再開は無い（止められていない）ので restart-attempt も preinstall-done も出ない。
+STOP_HELD_EVENTS_AT_DIALOG = ("section-begins", "stop-attempt", "main-dialog flag=0")
+
 ACL_MAIN_FIXED = "の所有者・アクセス権を既定に戻せませんでした"
 ACL_REASON_TEXT = "インストール先の中にサブフォルダがあります"
 ACL_SUBDIR = "zz-unexpected-subdir"  # 想定外のサブフォルダ。処理済みの対象に出てはならない（出れば中止の前に icacls が触れている）。
@@ -127,6 +148,41 @@ def start_type_is_disabled(stdout):
     return bool(re.search(r"START_TYPE\s*:\s*4\b", stdout))
 
 
+def stop_pending_dialog_matches(text, install):
+    return (text.startswith(STOP_PENDING_DIALOG_PREFIX) and "インストールを中止しました" in text
+            and "ファイルはまだ変更していません" in text)
+
+
+def stop_wait_problems(events):
+    """sc-query の数: stop-attempt より前が 1、stop-attempt と主 dialog の間が STOP_WAIT_QUERIES。"""
+    if "stop-attempt" not in events or "main-dialog flag=0" not in events:
+        return ["stop_wait_marker_missing"]
+    stop_at = events.index("stop-attempt")
+    dialog_at = events.index("main-dialog flag=0")
+    before = events[:stop_at].count("sc-query")
+    between = events[stop_at:dialog_at].count("sc-query")
+    problems = [] if before == 1 else [f"stop_wait_queries_before_stop_{before}"]
+    return problems + ([] if between == STOP_WAIT_QUERIES else [f"stop_wait_queries_{between}"])
+
+
+def stop_hold_elapsed_problems(stop_wall_ms, dialog_wall_ms):
+    if not isinstance(stop_wall_ms, int) or not isinstance(dialog_wall_ms, int):
+        return ["stop_hold_wall_ms_missing"]
+    return [] if dialog_wall_ms - stop_wall_ms >= STOP_HOLD_MIN_MS else ["stop_hold_too_short"]
+
+
+def hold_problems(holds, pid_a, ended):
+    """holds.jsonl: 保留中は hold-begin の 1 行だけ。ended なら次に hold-end（released）の計 2 行だけ。"""
+    expected = [("hold-begin", None)] + ([("hold-end", "released")] if ended else [])
+    if len(holds) != len(expected):
+        return [f"holds_count_{len(holds)}"]
+    problems = []
+    for index, (row, (event, reason)) in enumerate(zip(holds, expected)):
+        if row.get("event") != event or row.get("pid") != pid_a or row.get("reason") != reason:
+            problems.append(f"hold{index}_mismatch")
+    return problems
+
+
 def acl_dialog_matches(text, install):
     install = str(install)
     return (text.startswith(f"インストール先 {install} {ACL_MAIN_FIXED}。") and ACL_REASON_TEXT in text
@@ -144,6 +200,8 @@ class CaseSpec:
     events_final: tuple
     allowed_ppo: frozenset
     restart_fails: bool = False  # Disabled を注入し、再開が 1058 で失敗する（警告 → 主 dialog の順）。
+    stop_held: bool = False  # dummy に停止を保留させ、STOP_PENDING のまま 30 + 60 秒待って中止する。
+    dialog_wait: int = 90    # 主 dialog を待つ上限（秒）。
 
 
 CASES = {spec.name: spec for spec in (
@@ -154,6 +212,9 @@ CASES = {spec.name: spec for spec in (
     CaseSpec("C-restart-fail", False, True, MAIN_DIALOG_TEXT, lock_dialog_matches,
              RESTART_FAIL_EVENTS_AT_DIALOG, RESTART_FAIL_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO,
              restart_fails=True),
+    CaseSpec("C-stop-timeout", False, False, STOP_PENDING_MAIN_TEXT, stop_pending_dialog_matches,
+             STOP_HELD_EVENTS_AT_DIALOG, STOP_HELD_EVENTS_AT_DIALOG + CALLBACK_EVENTS, ALLOWED_PPO,
+             stop_held=True, dialog_wait=180),
 )}
 LOCK_SPEC = CASES["C-server-locked"]
 
@@ -421,12 +482,12 @@ def heartbeat_problems(earlier, later, pid_a, pid_b, run_id, sha):
     return problems
 
 
-def timeline_problems(timeline, pid_b):
+def timeline_problems(timeline, pid_b, state=RUNNING):
     after = [entry for entry in timeline if entry["phase"] != "before-dialog"]
     problems = []
     if not any(entry["phase"] == "dialog" for entry in after) or not any(entry["phase"] == "after-exit" for entry in after):
         problems.append("timeline_phases_missing")
-    if any(entry["state"] != RUNNING or entry["pid"] != pid_b for entry in after):
+    if any(entry["state"] != state or entry["pid"] != pid_b for entry in after):
         problems.append("service_not_steady_running_pid_b")
     return problems
 
@@ -589,6 +650,10 @@ class LockTrial(Trial):
 
     def cleanup(self):
         errors = []
+        try:  # 停止の保留を先に解く（残すと STOP_PENDING の待ちで後片付けが詰まる）。
+            (self.dummy_dir / STOP_HOLD_FILE).unlink(missing_ok=True)
+        except Exception as error:
+            errors.append({"hold_file": STOP_HOLD_FILE, "failure": str(error)})
         for name in list(self.owned):
             try:  # Running の自分の dummy を先に止めてから、基底の削除に渡す。
                 state = self.status(name).get("state")
@@ -754,6 +819,9 @@ def case_c(trial, makensis, report, spec):
         time.sleep(.2)
     require(not start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a]), "initial_start_not_bound")
     require(initial_heartbeat_ok(), "initial_heartbeat_not_advancing")
+    if spec.stop_held:
+        # 故障の注入: 次の停止の合図で dummy は STOP_PENDING のまま終わらない（改行変換を避けて bytes で書く）。
+        (trial.dummy_dir / STOP_HOLD_FILE).write_bytes(f"{trial.run_id}\n{trial.sha}\n".encode())
     if spec.restart_fails:
         # 故障の注入: RUNNING のまま起動種別だけ Disabled にする（次の sc start は 1058 で失敗する）。
         require(trial.call([SC_EXE, "config", SERVICE, "start=", "disabled"], "sc-config-disabled").returncode == 0,
@@ -854,14 +922,14 @@ def case_c(trial, makensis, report, spec):
                 time.sleep(.15)
             wait_phase = "between"
         dialog = None
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + spec.dialog_wait
         while dialog is None:
             require(child.poll() is None, "installer_exited_before_dialog")
             last_windows = with_owner(api, api.windows(child.pid))
             dialog, unexpected = judge_dialogs(last_windows, children_of, child.pid, name, matches)
             require(not unexpected, "unexpected_dialog")
             first, events, beats_first = monitor.sample("dialog" if dialog else wait_phase)
-            require(dialog is not None or time.monotonic() < deadline, "dialog_not_seen_within_90s")
+            require(dialog is not None or time.monotonic() < deadline, "dialog_not_seen_within_limit")
             if dialog is None:
                 time.sleep(.15)
         # 12–13. 観測 1（検出直後）と観測 2（1.5s 後）。
@@ -872,15 +940,23 @@ def case_c(trial, makensis, report, spec):
             (case / "dialog.png").write_bytes(png_bytes(width, height, rgb))  # 画素は assert しない。
         except Exception as error:
             result["dialog_png_error"] = str(error)
+        # 再開される場合は新しい PID（pid_b）で RUNNING、保留の場合は同じ PID（pid_a）で STOP_PENDING のまま。
+        want_state = STOP_PENDING if spec.stop_held else RUNNING
+        first_wall = None if spec.stop_held else first["wall_ms"]
         if spec.restart_fails:
             pid_b = None
             result.update(pid_b=None, dialog_wall_ms=first["wall_ms"])
             require(first["state"] == STOPPED and first["pid"] == 0, "not_stopped_when_dialog_detected")
+        elif spec.stop_held:
+            pid_b = pid_a
+            result.update(pid_b=None, dialog_wall_ms=first["wall_ms"])
+            require(first["state"] == STOP_PENDING and first["pid"] == pid_a, "not_stop_pending_when_dialog_detected")
         else:
             pid_b = first["pid"]
             result.update(pid_b=pid_b, dialog_wall_ms=first["wall_ms"])
             require(first["state"] == RUNNING, "not_running_when_dialog_detected")
             require(pid_b != pid_a, "pid_reused_rerun_required")
+        want_starts = [pid_a] if spec.stop_held else [pid_a, pid_b]
 
         def observe(label, beats_earlier):
             windows = with_owner(api, api.windows(child.pid))
@@ -888,11 +964,17 @@ def case_c(trial, makensis, report, spec):
             starts, stops = trial.jsonl("starts.jsonl"), trial.jsonl("stops.jsonl")
             alive = bool(api.u.IsWindow(dialog["hwnd"])) and any(w["hwnd"] == dialog["hwnd"] for w in owned_dialogs(windows, child.pid))
             hashes = install_hashes(install)
-            problems = ([] if entry["state"] == RUNNING and entry["pid"] == pid_b else ["scm_not_running_pid_b"])
+            problems = ([] if entry["state"] == want_state and entry["pid"] == pid_b else ["scm_not_running_pid_b"])
             problems += [] if alive else ["dialog_not_alive"]
             problems += event_problems(events, final=False, spec=spec, install=str(install))
-            problems += start_problems(starts, expected, [pid_a, pid_b], first["wall_ms"])
+            problems += start_problems(starts, expected, want_starts, first_wall)
             problems += stop_problems(stops, [pid_a])
+            if spec.stop_held:
+                problems += hold_problems(trial.jsonl("holds.jsonl"), pid_a, False)
+                if label == "observation-1":
+                    problems += stop_wait_problems(events)
+                    if stops:  # 空なら stop_problems が落とす。
+                        problems += stop_hold_elapsed_problems(stops[0].get("wall_ms"), first["wall_ms"])
             problems += [] if hashes == before else ["install_changed"]
             if beats_earlier is not None:
                 problems += heartbeat_problems(beats_earlier, beats, pid_a, pid_b, trial.run_id, trial.sha)
@@ -927,7 +1009,7 @@ def case_c(trial, makensis, report, spec):
         if spec.restart_fails:
             require(entry["state"] == STOPPED and entry["pid"] == 0 and child.poll() is None, "after_ok_state")
         else:
-            require(entry["state"] == RUNNING and entry["pid"] == pid_b and child.poll() is None, "after_ok_state")
+            require(entry["state"] == want_state and entry["pid"] == pid_b and child.poll() is None, "after_ok_state")
         # 15. 主窓（owner==0）を閉じる。新しい owned #32770 は押さずに失敗。
         last_windows = with_owner(api, api.windows(child.pid))
         mains = main_windows(last_windows, child.pid)
@@ -956,9 +1038,11 @@ def case_c(trial, makensis, report, spec):
             problems += stopped_timeline_problems(monitor.timeline)
         else:
             problems += heartbeat_problems(beats_two, beats, pid_a, pid_b, trial.run_id, trial.sha)
-            problems += start_problems(trial.jsonl("starts.jsonl"), expected, [pid_a, pid_b])
+            problems += start_problems(trial.jsonl("starts.jsonl"), expected, want_starts)
             problems += stop_problems(trial.jsonl("stops.jsonl"), [pid_a])
-            problems += timeline_problems(monitor.timeline, pid_b)
+            problems += timeline_problems(monitor.timeline, pid_b, want_state)
+            if spec.stop_held:
+                problems += hold_problems(trial.jsonl("holds.jsonl"), pid_a, False)
         result.update(final_events=events, final_problems=problems)
         require(not problems, "after_exit_failed:" + ','.join(problems))
         if spec.acl_step:
@@ -979,12 +1063,19 @@ def case_c(trial, makensis, report, spec):
             lock = None
         require(install_hashes(install) == before, "install_changed_after_release")
         second_pid = pid_b
-        if spec.restart_fails:
-            # 陽性対照: installer 終了後も Disabled のまま（installer は起動種別を変えない）→ demand に戻して起動できる。
-            require(start_type_is_disabled(trial.call([SC_EXE, "qc", SERVICE], "sc-qc-disabled-after").stdout),
-                    "start_type_not_disabled_after_exit")
-            require(trial.call([SC_EXE, "config", SERVICE, "start=", "demand"], "sc-config-demand").returncode == 0,
-                    "sc_config_demand_failed")
+        if spec.restart_fails or spec.stop_held:
+            if spec.stop_held:
+                # 陽性対照: 保留を解くと dummy は終了して STOPPED になる（保留だけが原因）→ 新しい PID で起動できる。
+                (trial.dummy_dir / STOP_HOLD_FILE).unlink()
+                trial.wait_state(STOPPED, 30)
+                released = hold_problems(trial.jsonl("holds.jsonl"), pid_a, True)
+                require(not released, "hold_not_released:" + ','.join(released))
+            else:
+                # 陽性対照: installer 終了後も Disabled のまま（installer は起動種別を変えない）→ demand に戻して起動できる。
+                require(start_type_is_disabled(trial.call([SC_EXE, "qc", SERVICE], "sc-qc-disabled-after").stdout),
+                        "start_type_not_disabled_after_exit")
+                require(trial.call([SC_EXE, "config", SERVICE, "start=", "demand"], "sc-config-demand").returncode == 0,
+                        "sc_config_demand_failed")
             trial.start()
             pid_c = trial.wait_state(RUNNING, 15)["pid"]
             result["pid_c"] = pid_c
@@ -1059,6 +1150,8 @@ def main():
                         "real icacls on earlier entries, NOT an icacls failure itself (non-zero icacls exit out of scope); "
                         "C-restart-fail: synchronous sc start failure by Disabled (1058) only; the 'stopped' "
                         "(returns to STOPPED right after start) and 30 s 'timeout' outcomes are out of scope; "
+                        "C-stop-timeout: the stay-STOP_PENDING path (30 s + 60 s extra wait) only; becoming STOPPED during "
+                        "the extra wait (install continues) and the path rejected while still RUNNING are out of scope; "
                         "no collector/full setup/Tauri UI/B3-5."}
     write_json(trial.proof / "summary.json", report)
     try:
