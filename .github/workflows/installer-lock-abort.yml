@@ -30,7 +30,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        case: [C-server-locked, C-acl-subdir, C-restart-fail, C-stop-timeout]
+        case: [C-server-locked, C-acl-subdir, C-restart-fail, C-stop-timeout, C-copy-fail]
     env:
       BANTO_973_SCM_TEST: github-hosted-disposable-only-v1
       BANTO_973_GUI_TEST: github-hosted-gui-capability-only-v1

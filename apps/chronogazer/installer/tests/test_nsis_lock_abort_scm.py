@@ -440,7 +440,7 @@ class AclCase(unittest.TestCase):
         self.assertEqual(plain, template.replace("  @ACL_STEP@\n", ""))
 
     def test_cases_are_keyed_by_name(self):
-        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir", "C-restart-fail", "C-stop-timeout"})
+        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir", "C-restart-fail", "C-stop-timeout", "C-copy-fail"})
         for name in ("C-server-locked", "C-acl-subdir", "C-restart-fail"):
             self.assertFalse(lock.CASES[name].stop_held)
             self.assertEqual(lock.CASES[name].dialog_wait, 90)
@@ -598,6 +598,105 @@ class StopTimeout(unittest.TestCase):
         self.assertEqual(lock.timeline_problems(good, PID_A), ["service_not_steady_running_pid_b"])
         steady = [dict(row, state=lock.RUNNING) for row in good]
         self.assertEqual(lock.timeline_problems(steady, PID_A), [])
+
+
+class CopyFail(unittest.TestCase):
+    SPEC = lock.CASES["C-copy-fail"]
+    INSTALL = r"C:\a\_temp\Banto973-x\C-copy-fail\install"
+    FILE_ERROR = ("Error opening file for writing: \r\n\r\n" + INSTALL + "\\chronogazer-server.exe\r\n\r\n"
+                  "Click Retry to try again, or\r\nCancel to stop the installation.")
+    CAPTION = "Banto973 lock-abort 12345678"
+
+    def test_file_error_matches(self):
+        self.assertTrue(lock.file_error_matches(self.FILE_ERROR, self.INSTALL))
+        self.assertFalse(lock.file_error_matches(self.FILE_ERROR.replace("server", "elev"), self.INSTALL))
+        self.assertFalse(lock.file_error_matches(self.FILE_ERROR, r"C:\other\install"))
+        self.assertFalse(lock.file_error_matches(self.FILE_ERROR.replace("Click Retry to try again, or", "Click Abort to stop the installation, or"), self.INSTALL))
+        self.assertFalse(lock.file_error_matches(self.FILE_ERROR.replace("Error opening file for writing:", "Error opening file for reading:"), self.INSTALL))
+
+    def test_callback_text_matches_the_unchanged_hooks(self):
+        self.assertTrue(lock.callback_restarted_matches(lock.CALLBACK_RESTARTED_TEXT))
+        self.assertFalse(lock.callback_restarted_matches(lock.CALLBACK_RESTARTED_TEXT + " "))
+        self.assertFalse(lock.callback_restarted_matches(MAIN_TEXT))
+        hooks = (ROOT / "apps/chronogazer/installer/hooks/service-hooks.nsh").read_text(encoding="utf-8")
+        self.assertIn(lock.CALLBACK_RESTARTED_TEXT, hooks)
+
+    def test_template_matches_production_shape(self):
+        template = lock.TEMPLATE
+        self.assertEqual(template.count("AllowSkipFiles off\n"), 1)
+        self.assertLess(template.index("AllowSkipFiles off"), template.index("Section\n"))
+        self.assertGreater(template.index("RequireChronoGazerFilesCopied"), template.rindex("File \""))
+        main_rs = (ROOT / "apps/chronogazer/installer/src/main.rs").read_text(encoding="utf-8")
+        self.assertIn("AllowSkipFiles off", main_rs)
+
+    def test_retry_cancel_button(self):
+        def btn(hwnd, visible=True):
+            return {"hwnd": hwnd, "class": "Button", "title": "x", "visible": visible}
+        ids = {10: lock.IDRETRY, 11: lock.IDCANCEL, 12: 5}
+        self.assertEqual(lock.retry_cancel_button([btn(10), btn(11)], ids.get)["hwnd"], 11)
+        with self.assertRaises(RuntimeError):
+            lock.retry_cancel_button([btn(10), btn(11), btn(12)], ids.get)
+        with self.assertRaises(RuntimeError):
+            lock.retry_cancel_button([btn(12)], ids.get)
+        with self.assertRaises(RuntimeError):
+            lock.retry_cancel_button([btn(10), btn(11, visible=False)], ids.get)
+        self.assertEqual(lock.retry_cancel_button([btn(10), btn(11), btn(12, visible=False)], ids.get)["hwnd"], 11)
+
+    def test_callback_dialogs(self):
+        text = [{"class": "Static", "title": lock.CALLBACK_RESTARTED_TEXT}]
+        for owner in (0, 5):
+            self.assertEqual(lock.callback_dialogs([window(20, owner)], lambda h: text, 7, self.CAPTION, 5)[0]["hwnd"], 20)
+        self.assertEqual(lock.callback_dialogs([window(5, 0)], lambda h: text, 7, self.CAPTION, 5), (None, []))
+        other = window(21, 5)
+        self.assertEqual(lock.callback_dialogs([other], lambda h: [{"class": "Static", "title": MAIN_TEXT}], 7, self.CAPTION, 5), (None, [other]))
+        self.assertEqual(lock.callback_dialogs([other], lambda h: [{"class": "Static", "title": ""}], 7, self.CAPTION, 5), (None, []))
+        self.assertEqual(lock.callback_dialogs([window(22, 5, pid=8)], lambda h: text, 7, self.CAPTION, 5), (None, []))
+        with self.assertRaises(RuntimeError):
+            lock.callback_dialogs([window(20, 5), window(23, 0)], lambda h: text, 7, self.CAPTION, 5)
+
+    def test_partial_hashes_and_flags(self):
+        before = {"chronogazer.exe": "a", "chronogazer-server.exe": "b", "data.txt": "c"}
+        self.assertEqual(lock.partial_hashes(before, "n"), {"chronogazer.exe": "n", "chronogazer-server.exe": "b", "data.txt": "c"})
+        self.assertEqual(before["chronogazer.exe"], "a")
+        spec = self.SPEC
+        self.assertTrue(spec.copy_fails)
+        self.assertFalse(spec.lock_server or spec.acl_step or spec.restart_fails or spec.stop_held)
+        self.assertEqual(spec.events_at_dialog, lock.COPY_FAIL_EVENTS_AT_DIALOG)
+        self.assertEqual(spec.events_final, lock.COPY_FAIL_EVENTS_FINAL)
+
+    def test_event_problems(self):
+        spec = self.SPEC
+        at = list(lock.COPY_FAIL_EVENTS_AT_DIALOG)
+        final = list(lock.COPY_FAIL_EVENTS_FINAL)
+        self.assertEqual(lock.event_problems(at[:1] + ["sc-query"] + at[1:], final=False, spec=spec), [])
+        self.assertEqual(lock.event_problems(final, final=True, spec=spec), [])
+        self.assertTrue(lock.event_problems([at[1], at[0]] + at[2:], final=False, spec=spec))
+        self.assertTrue(lock.event_problems(final[:5] + ["restart-attempt"] + final[5:], final=True, spec=spec))
+        early = at[:3] + ["restart-attempt", "copy-begins"]
+        self.assertTrue(lock.event_problems(early, final=False, spec=spec))
+        self.assertTrue(lock.event_problems(at[:3], final=False, spec=spec))
+        self.assertTrue(lock.event_problems(at + ["other-dialog flag=1"], final=False, spec=spec))
+        self.assertTrue(lock.event_problems(final[:4] + ["other-dialog flag=1"] + final[4:], final=True, spec=spec))
+
+    def test_callback_event_problems(self):
+        final = list(lock.COPY_FAIL_EVENTS_FINAL)
+        self.assertEqual(lock.callback_event_problems(final[:-1]), [])
+        self.assertEqual(lock.callback_event_problems(final[:2] + ["sc-query"] + final[2:-1]), [])
+        self.assertTrue(lock.callback_event_problems(final))
+        self.assertTrue(lock.callback_event_problems(final[:-2]))
+
+    def test_timeline_problems(self):
+        rows = (("before-dialog", lock.RUNNING, PID_A), ("file-error", lock.STOPPED, 0), ("after-cancel", lock.STOPPED, 0),
+                ("failed-page", lock.STOPPED, 0), ("closing", lock.STOPPED, 0), ("callback-dialog", lock.RUNNING, PID_B),
+                ("closing", lock.RUNNING, PID_B), ("after-exit", lock.RUNNING, PID_B))
+        good = [{"phase": phase, "state": state, "pid": pid} for phase, state, pid in rows]
+        self.assertEqual(lock.copy_fail_timeline_problems(good, PID_B), [])
+        missing = [row for row in good if row["phase"] != "after-cancel"]
+        self.assertEqual(lock.copy_fail_timeline_problems(missing, PID_B), ["timeline_phase_missing_after-cancel"])
+        early = [dict(row, state=lock.RUNNING, pid=PID_B) if row["phase"] == "failed-page" else row for row in good]
+        self.assertEqual(lock.copy_fail_timeline_problems(early, PID_B), ["timeline_phase_not_steady_failed-page"])
+        other_pid = [dict(row, pid=PID_A) if row["phase"] == "after-exit" else row for row in good]
+        self.assertEqual(lock.copy_fail_timeline_problems(other_pid, PID_B), ["timeline_phase_not_steady_after-exit"])
 
 
 if __name__ == "__main__":
