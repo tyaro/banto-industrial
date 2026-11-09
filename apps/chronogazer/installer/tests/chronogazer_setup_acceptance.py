@@ -1057,6 +1057,7 @@ def phase_install_locked_exe(c: Ctx) -> None:
     p = "8_install_locked_exe"
     pid = _ensure_running(p)
     tampered = _tamper_elev(p, c)
+    before = tree_snapshot(INSTDIR)
     with ExclusiveFileLock(INSTDIR / ELEV_EXE):
         rc, elapsed = timed(p, "locked_setup", lambda: run_setup(c.setup, [], p, "locked_setup"))
     expect(p, rc != 0, "setup over a locked exe must fail", rc)
@@ -1064,6 +1065,7 @@ def phase_install_locked_exe(c: Ctx) -> None:
     _expect_restarted(p, pid)
     expect_registered(p, "RUNNING")
     _expect_elev_still(p, tampered)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
     _expect_data_intact(p, c)
     expect_no_shell(p)
     _recover_by_setup(p, c)
@@ -1218,6 +1220,25 @@ def phase_uninstall_locked_exe(c: Ctx) -> None:
 
 def phase_uninstall_delete_fail(c: Ctx) -> None:
     p = "12_uninstall_delete_fail"
+    # 止めた状態を先に確かめる: 止まっていれば使用中 exe の検査は通り、解除の失敗だけが中止の理由になる。
+    _ensure_running(p)
+    run(["sc", "stop", SERVICE])
+    wait_state(SERVICE, "STOPPED")
+    before = tree_snapshot(INSTDIR)
+    set_service_marker()
+    expect(p, service_marker_present(), "could not set the service marker")
+    with DenyServiceRight("SD"):
+        rc = _uninstall_in_place(p, "stopped_uninstall")
+    expect(p, rc != 0, "uninstall must fail when the service cannot be deleted (stopped)", rc)
+    st = sc_state()
+    obs(p, "stopped_state_after", st)
+    expect(p, st["state"] == "STOPPED", f"{SERVICE} was resumed although it was stopped", st)
+    marker = service_marker_present()
+    obs(p, "stopped_marker_after", marker)
+    expect(p, marker, "service registration was recreated although its deletion was denied (stopped)")
+    _expect_not_delete_pending(p)
+    _expect_still_installed(p, c, before)
+    # 稼働中の確かめ用に動かし直し、スナップショットと目印も取り直す。
     pid = _ensure_running(p)
     before = tree_snapshot(INSTDIR)
     set_service_marker()
