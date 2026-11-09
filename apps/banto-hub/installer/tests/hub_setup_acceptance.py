@@ -137,6 +137,15 @@ def icacls_explicit_users_aces(text: str) -> list[str]:
     return out
 
 
+def parse_owner_output(returncode: int, stdout: str, stderr: str) -> str:
+    """`Get-Acl` の結果を検証する。失敗・空の観測は例外にし、「Administrators でない」と誤判定させない。"""
+    if returncode != 0 or not stdout.strip():
+        raise RuntimeError(
+            f"owner 取得に失敗（returncode={returncode}）: {stderr[-300:]}"
+        )
+    return stdout.strip()
+
+
 def find_setup(dist: Path) -> tuple[Path, str]:
     cands = sorted(dist.glob("BantoHub_*_x64-setup.exe"))
     if len(cands) != 1:
@@ -306,13 +315,13 @@ def run_setup(setup: Path, extra: list[str], phase: str, label: str) -> int:
 def owner_of(path: Path) -> str:
     r = run(
         [
-            "powershell",
+            "pwsh",
             "-NoProfile",
             "-Command",
             f"(Get-Acl -LiteralPath '{path}').Owner",
         ]
     )
-    return r.stdout.strip()
+    return parse_owner_output(r.returncode, r.stdout, r.stderr)
 
 
 def uninstall_registration() -> list[str]:

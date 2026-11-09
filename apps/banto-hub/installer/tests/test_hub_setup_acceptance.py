@@ -113,6 +113,22 @@ class FileTests(unittest.TestCase):
             self.assertNotEqual(before, h.tree_hashes(Path(d)))
 
 
+class OwnerParseTests(unittest.TestCase):
+    def test_success_returns_stripped_owner(self):
+        self.assertEqual(h.parse_owner_output(0, "BUILTIN\\Administrators\r\n", ""), "BUILTIN\\Administrators")
+
+    def test_empty_stdout_raises(self):
+        with self.assertRaises(RuntimeError):
+            h.parse_owner_output(0, "  \n", "")
+
+    def test_nonzero_returncode_raises_with_stderr_tail(self):
+        with self.assertRaises(RuntimeError) as cm:
+            h.parse_owner_output(1, "Administrators", "x" * 400 + "Get-Acl failed")
+        self.assertIn("1", str(cm.exception))
+        self.assertIn("Get-Acl failed", str(cm.exception))
+        self.assertLessEqual(len(str(cm.exception)), 400)
+
+
 class RequestHeaderTests(unittest.TestCase):
     def test_get_and_post_carry_client_header_and_only_post_has_content_type(self):
         get = h.request_headers(False)
