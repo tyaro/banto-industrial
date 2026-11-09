@@ -440,7 +440,10 @@ class AclCase(unittest.TestCase):
         self.assertEqual(plain, template.replace("  @ACL_STEP@\n", ""))
 
     def test_cases_are_keyed_by_name(self):
-        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir", "C-restart-fail"})
+        self.assertEqual(set(lock.CASES), {"C-server-locked", "C-acl-subdir", "C-restart-fail", "C-stop-timeout"})
+        for name in ("C-server-locked", "C-acl-subdir", "C-restart-fail"):
+            self.assertFalse(lock.CASES[name].stop_held)
+            self.assertEqual(lock.CASES[name].dialog_wait, 90)
         self.assertTrue(lock.LOCK_SPEC.lock_server and not lock.LOCK_SPEC.acl_step)
         self.assertTrue(ACL.acl_step and not ACL.lock_server)
         self.assertEqual(lock.LOCK_SPEC.events_at_dialog, lock.EVENTS_AT_DIALOG)
@@ -508,6 +511,93 @@ class RestartFail(unittest.TestCase):
         self.assertEqual(lock.warning_event_problems(events[:2] + ["sc-query"] + events[2:], self.SPEC), [])
         self.assertTrue(lock.warning_event_problems(events + ["main-dialog flag=0"], self.SPEC))
         self.assertTrue(lock.warning_event_problems(events[:-1], self.SPEC))
+
+
+class StopTimeout(unittest.TestCase):
+    SPEC = lock.CASES["C-stop-timeout"]
+    DIALOG_TEXT = (lock.STOP_PENDING_DIALOG_PREFIX + "\r\n\r\n実行ファイルを入れ替えられないため、インストールを中止しました。"
+                   "ファイルはまだ変更していません。sc query ChronoGazer で STOPPED になってから開始してください。")
+    QUERIES = ["sc-query"] * lock.STOP_WAIT_QUERIES
+
+    def wait_events(self, between=lock.STOP_WAIT_QUERIES, before=1):
+        return (["section-begins"] + ["sc-query"] * before + ["stop-attempt"] + ["sc-query"] * between
+                + ["main-dialog flag=0"])
+
+    def test_dialog_matches(self):
+        self.assertTrue(lock.stop_pending_dialog_matches(self.DIALOG_TEXT, "C:\\i"))
+        self.assertFalse(lock.stop_pending_dialog_matches(self.DIALOG_TEXT.replace("ファイルはまだ変更していません", ""), "C:\\i"))
+        self.assertFalse(lock.stop_pending_dialog_matches(self.DIALOG_TEXT.replace("インストールを中止しました", "中止"), "C:\\i"))
+        self.assertFalse(lock.stop_pending_dialog_matches(self.DIALOG_TEXT.replace("さらに 60 秒", "さらに 30 秒"), "C:\\i"))
+        self.assertFalse(lock.stop_pending_dialog_matches(MAIN_TEXT, "C:\\i"))
+        self.assertFalse(lock.stop_pending_dialog_matches(lock.RESTART_WARNING_PREFIX, "C:\\i"))
+
+    def test_text_and_waits_match_the_unchanged_hooks(self):
+        hooks = (ROOT / "apps/chronogazer/installer/hooks/service-hooks.nsh").read_text(encoding="utf-8")
+        self.assertIn(lock.STOP_PENDING_DIALOG_PREFIX.replace("60 秒", "${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒"), hooks)
+        self.assertIn(lock.STOP_PENDING_MAIN_TEXT, hooks)
+        self.assertIn("!define CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS 60\n", hooks)
+        common = (ROOT / "installer-common/service-common.nsh").read_text(encoding="utf-8")
+        self.assertIn("${If} $StopWaitCounter >= 30", common)
+        self.assertEqual(lock.STOP_WAIT_QUERIES, 30 + 2 + 60)
+
+    def test_dialog_kind(self):
+        line = ('MessageBox MB_OK|MB_ICONSTOP "ChronoGazer サービスの停止がまだ終わっていません（停止を頼んで、さらに '
+                '${CHRONOGAZER_SERVICE_STOP_EXTRA_WAIT_SECONDS} 秒待ちましたが、PENDING のままです）。" /SD IDOK')
+        self.assertEqual(lock.dialog_kind(line, lock.STOP_PENDING_MAIN_TEXT), "main-dialog")
+        self.assertEqual(lock.dialog_kind(line), "inactive-dialog")
+
+    def test_case_flags(self):
+        spec = self.SPEC
+        self.assertTrue(spec.stop_held and not spec.lock_server and not spec.acl_step and not spec.restart_fails)
+        self.assertEqual(spec.dialog_wait, 180)
+        self.assertEqual(spec.events_at_dialog, lock.STOP_HELD_EVENTS_AT_DIALOG)
+
+    def test_event_sequences(self):
+        spec = self.SPEC
+        events = list(spec.events_at_dialog)
+        queried = events[:1] + ["sc-query"] + events[1:2] + ["sc-query"] * 92 + events[2:]
+        self.assertEqual(lock.event_problems(queried, final=False, spec=spec), [])
+        self.assertEqual(lock.event_problems(events + ["callback-before flag=0", "callback-after flag=0"], final=True, spec=spec), [])
+        for extra in ("restart-attempt", "copy-begins", "preinstall-done flag=1"):
+            self.assertTrue(lock.event_problems(events[:2] + [extra] + events[2:], final=False, spec=spec), extra)
+
+    def test_stop_wait_problems(self):
+        self.assertEqual(lock.stop_wait_problems(self.wait_events()), [])
+        self.assertEqual(lock.stop_wait_problems(self.wait_events(between=91)), ["stop_wait_queries_91"])
+        self.assertEqual(lock.stop_wait_problems(self.wait_events(between=93)), ["stop_wait_queries_93"])
+        self.assertEqual(lock.stop_wait_problems(self.wait_events(before=0)), ["stop_wait_queries_before_stop_0"])
+        self.assertEqual(lock.stop_wait_problems(["section-begins", "sc-query", "stop-attempt"]), ["stop_wait_marker_missing"])
+        self.assertEqual(lock.stop_wait_problems(["main-dialog flag=0"]), ["stop_wait_marker_missing"])
+
+    def test_stop_hold_elapsed_problems(self):
+        self.assertEqual(lock.stop_hold_elapsed_problems(1000, 1000 + lock.STOP_HOLD_MIN_MS), [])
+        self.assertEqual(lock.stop_hold_elapsed_problems(1000, 1000 + lock.STOP_HOLD_MIN_MS - 1), ["stop_hold_too_short"])
+        self.assertEqual(lock.stop_hold_elapsed_problems(None, 100000), ["stop_hold_wall_ms_missing"])
+
+    def test_hold_problems(self):
+        begin = {"event": "hold-begin", "pid": PID_A, "wall_ms": 1}
+        end = {"event": "hold-end", "pid": PID_A, "reason": "released", "wall_ms": 2}
+        self.assertEqual(lock.hold_problems([begin], PID_A, False), [])
+        self.assertEqual(lock.hold_problems([begin, end], PID_A, True), [])
+        self.assertEqual(lock.hold_problems([begin, dict(end, reason="expired")], PID_A, True), ["hold1_mismatch"])
+        self.assertEqual(lock.hold_problems([begin, dict(end, pid=PID_B)], PID_A, True), ["hold1_mismatch"])
+        self.assertEqual(lock.hold_problems([dict(begin, pid=PID_B)], PID_A, False), ["hold0_mismatch"])
+        self.assertEqual(lock.hold_problems([begin, end], PID_A, False), ["holds_count_2"])
+        self.assertEqual(lock.hold_problems([begin], PID_A, True), ["holds_count_1"])
+        self.assertEqual(lock.hold_problems([], PID_A, False), ["holds_count_0"])
+        self.assertEqual(lock.hold_problems([end, begin], PID_A, True), ["hold0_mismatch", "hold1_mismatch"])
+
+    def test_timeline_state(self):
+        rows = (("before-dialog", lock.RUNNING, PID_A), ("dialog", lock.STOP_PENDING, PID_A),
+                ("after-ok", lock.STOP_PENDING, PID_A), ("after-exit", lock.STOP_PENDING, PID_A))
+        good = [{"phase": phase, "state": state, "pid": pid} for phase, state, pid in rows]
+        self.assertEqual(lock.timeline_problems(good, PID_A, lock.STOP_PENDING), [])
+        running = good[:2] + [dict(good[2], state=lock.RUNNING)] + good[3:]
+        self.assertEqual(lock.timeline_problems(running, PID_A, lock.STOP_PENDING), ["service_not_steady_running_pid_b"])
+        # 既定は従来どおり RUNNING を要求する。
+        self.assertEqual(lock.timeline_problems(good, PID_A), ["service_not_steady_running_pid_b"])
+        steady = [dict(row, state=lock.RUNNING) for row in good]
+        self.assertEqual(lock.timeline_problems(steady, PID_A), [])
 
 
 if __name__ == "__main__":
