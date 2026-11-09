@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-11-09（§3 に受入スクリプトの空の観測と Hub の `/api/auth/*` の CSRF ヘッダーの 2 行を追加。#973 Hub 受入）。前回: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
+最終更新: 2026-11-10（§7 に ChronoGazer のインストーラの `PRODUCT_VERSION` をルートの版に揃えることを追加。#1086）。前回: 2026-11-09（§3 に受入スクリプトの空の観測と Hub の `/api/auth/*` の CSRF ヘッダーの 2 行を追加。#973 Hub 受入）。前回: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
 2026-11-06（§5 にWindows拡張長prefix除去後の同一対象確認を追加。#1050）
 2026-11-06（§6 に「head の push 前に PR 本文の対象範囲・検証欄を同期し、自動レビューが参照した本文・head を確認する」を追加。#1047）
 2026-11-02（§2 に「脆弱性の対応の `cargo update -p <crate> --precise` でも無関係な依存が付け替わる。`Cargo.lock` の差分を全部読む」を追加。RUSTSEC-2026-0433、#1016）
@@ -190,6 +190,7 @@
 ## 7. バージョン（banto-hub を変更したときだけ）
 
 - [ ] **4 点セット**を同じ PR で揃える: ルート `Cargo.toml` / `apps/banto-hub/package.json` / `apps/banto-hub/installer/src/main.rs` / `CHANGELOG.md` → 最後に `cargo update -w`。
-- [ ] chronogazer は 0.1.0 のまま（**bump も CHANGELOG も不要**）。relay-wright は
+- [ ] **ルートの版を上げたら `apps/chronogazer/installer/src/main.rs` の `PRODUCT_VERSION` も揃える**。`scripts/build-release-chronogazer.ps1` はルートの版の名前で setup を探すので、ずれると生成の後に「インストーラが見つかりません」で止まる。通常の CI はこのスクリプトを実行しないので表に出ない（2026-11-10、alpha.2 に上げたまま alpha.1 が残り、#973 の受入の実 run で初めて分かった。#1086）。
+- [ ] chronogazer の `tauri.conf.json` などの個別の版は 0.1.0 のまま（**bump も CHANGELOG も不要**）。relay-wright は
       2026-09-24 に main から外してタグ `archive/relay-wright-2026-09-24` に退避した
       ため対象外（復元時に再検討）。
