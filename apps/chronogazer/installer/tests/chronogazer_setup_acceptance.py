@@ -1606,6 +1606,69 @@ def phase_visible_retry_continues(c: Ctx) -> None:
     expect_no_shell(p)
 
 
+def phase_visible_recheck_retry_continues(c: Ctx) -> None:
+    p = "14f_visible_recheck_retry_continues"
+    # 再確認（上書き直前、QuitShellForUpdate(1)）の問いで、偽シェルを止めてから [再試行] を押すと、
+    # ほかの dialog なしに上書きまで通る。偽シェルは最初は置かず、サービスが止まった瞬間に出す
+    # （事前確認の 2 回は通り、再確認だけが問う）。問いの表示中はサービス停止・INSTDIR 不変。
+    pid = _visible_preamble(p)
+    fake_exe = _prepare_fake_shell(p)
+    fake = None
+    child = None
+    try:
+        # 本当に上書きされたことを示すため、elev exe を壊す（dist と違う hash にする）。
+        want_elev = sha256(_dist_exe(c, "chronogazer-elev"))
+        with open(INSTDIR / ELEV_EXE, "ab") as f:
+            f.write(b"\0")
+        tampered = sha256(INSTDIR / ELEV_EXE)
+        obs(p, "elev_hash", {"dist": want_elev, "tampered": tampered})
+        expect(p, tampered != want_elev, "elev exe tamper did not change hash")
+        before = tree_snapshot(INSTDIR)
+
+        def on_question(label: str, elapsed: float) -> None:
+            st = sc_state()
+            obs(p, f"{label}_service", st)
+            expect(p, st["state"] == "STOPPED", f"service not stopped while the {label} question is shown", st)
+            expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
+            expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
+
+        def before_retry() -> None:
+            obs(p, "stop_fake_shell", _stop_fake_shell(fake))
+            gone = wait_until(lambda: not process_running(SHELL_EXE), 10)
+            if not gone:
+                raise PhaseFailure(p, f"{SHELL_EXE} still running after stopping the fake shell")
+
+        child = subprocess.Popen([str(c.setup), "/P"])
+        fake, fake_started = _spawn_fake_when_service_stops(p, child, fake_exe)
+        try:
+            vis.drive_retry_continue(
+                child,
+                fake_started,
+                PROOF_DIR,
+                lambda k, v: obs(p, k, v),
+                on_question,
+                before_retry,
+                matches=vis.recheck_question_matches,
+                label="recheck",
+            )
+        except vis.VisibleFailure as e:
+            raise PhaseFailure(p, e.reason, e.observation) from e
+        try:
+            rc = child.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            raise PhaseFailure(p, "setup did not exit within 30 s after the overwrite") from e
+        obs(p, "setup_exit", rc)
+        expect(p, rc == 0, "retried setup must succeed", rc)
+        _expect_restarted(p, pid)
+        expect_registered(p, "RUNNING")
+        _expect_exes_match_dist(p, c)
+        _expect_not_delete_pending(p)
+        _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, fake)
+    expect_no_shell(p)
+
+
 def phase_uninstall_delete_pending(c: Ctx) -> None:
     p = "15_uninstall_delete_pending"
     _ensure_running(p)  # 保留中のサービスは再開されないので PID の比較はしない
@@ -1677,6 +1740,7 @@ PHASES = (
     phase_visible_recheck_cancel,
     phase_visible_retry_continues,
     phase_visible_uninstall_recheck_cancel,
+    phase_visible_recheck_retry_continues,
     phase_uninstall_delete_pending,
 )
 

@@ -310,11 +310,14 @@ def drive_recheck_cancel(
     d.finish_after_cancel(ready_to_close=service_resumed)
 
 
-def drive_retry_continue(child, started: float, proof_dir, record, on_question, before_retry) -> None:
-    """child は /P で起動済みの setup。最初の問いで、偽シェルを止めてから [再試行] を押し、上書きの完了を待つ。"""
+def drive_retry_continue(
+    child, started: float, proof_dir, record, on_question, before_retry, matches=question_matches, label: str = "first"
+) -> None:
+    """child は /P で起動済みの setup。matches に合う問い（既定は最初の問い、再確認なら recheck_question_matches）で、
+    偽シェルを止めてから [再試行] を押し、上書きの完了を待つ。"""
     d = _Driver(child, proof_dir, record, on_question)
-    dialog, children, elapsed = d.await_question(started)
-    buttons = d.check_question("first", dialog, children, elapsed)
+    dialog, children, elapsed = d.await_question(started, matches=matches)
+    buttons = d.check_question(label, dialog, children, elapsed)
     before_retry()
     d.press(dialog, buttons["retry"], IDRETRY, "retry")
     d.finish_after_retry()

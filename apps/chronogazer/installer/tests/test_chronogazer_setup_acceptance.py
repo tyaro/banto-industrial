@@ -284,7 +284,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 19)
+        self.assertEqual(len(c.PHASES), 20)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -307,6 +307,7 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_visible_recheck_cancel",
                 "phase_visible_retry_continues",
                 "phase_visible_uninstall_recheck_cancel",
+                "phase_visible_recheck_retry_continues",
                 "phase_uninstall_delete_pending",
             ],
         )
