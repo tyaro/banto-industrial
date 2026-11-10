@@ -114,6 +114,13 @@ class DriveRetryContinueTests(unittest.TestCase):
             v.drive_retry_continue(None, 0.0, None, None, None, lambda: None, matches=v.recheck_question_matches, label="recheck")
             d.await_question.assert_called_once_with(0.0, matches=v.recheck_question_matches)
             self.assertEqual(d.check_question.call_args.args[0], "recheck")
+            drv.reset_mock()
+            d.await_question.return_value = ("dlg", [], 1.0)
+            v.drive_retry_continue(
+                None, 0.0, None, None, None, lambda: None, matches=v.uninstall_recheck_question_matches, label="uninstall_recheck_retry"
+            )
+            d.await_question.assert_called_once_with(0.0, matches=v.uninstall_recheck_question_matches)
+            self.assertEqual(d.check_question.call_args.args[0], "uninstall_recheck_retry")
 
 
 class FakeChild:

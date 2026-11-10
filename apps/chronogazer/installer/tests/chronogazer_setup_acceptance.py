@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 4 つ以外はすべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 6 つ以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -19,16 +19,17 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 可視 UI（setup を /P で実画面に出す）: 14b シェル 90 秒の最初の問いの [再試行]→[キャンセル] /
   14c 再確認の問い（サービス停止の後）の [キャンセル]（止めたサービスの再開） /
   14d 最初の問いの [再試行] で続行して上書きまで通る道 /
-  14e アンインストールの再確認の問い（uninstall.exe /P、サービス停止の後）の [キャンセル]（止めたサービスの再開）
+  14e アンインストールの再確認の問い（uninstall.exe /P、サービス停止の後）の [キャンセル]（止めたサービスの再開） /
+  14f 再確認の問いの [再試行] で続行して上書きまで通る道 /
+  14g アンインストールの再確認の問いの [再試行] で続行して実際に消す道（`_?=`。消した後は setup で入れ直す）
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 上の 4 つ以外の可視 UI（WebView2 の後始末・
-再確認の [再試行]）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
-（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 4 つ以外は silent なので MessageBox は未確認。
+対象外（このスクリプトは確かめない）: 上の 6 つ以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
+（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 6 つ以外は silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -912,18 +913,20 @@ def phase_stopped_overwrite(c: Ctx) -> None:
     expect(p, sc_config()["start_type"] == "DEMAND_START", "could not restore DEMAND_START", sc_config())
 
 
-def _wait_uninstall_done(p: str) -> None:
-    """親が戻った後の子（temp 本体）の完了待ち。サービス・exe・Apps 登録がすべて消えること。"""
+def _wait_uninstall_done(p: str, files=(*EXES, "uninstall.exe")) -> None:
+    """親が戻った後の子（temp 本体）の完了待ち。サービス・exe・Apps 登録がすべて消えること。
+
+    `files` は消えているべきファイル（`_?=` でその場で走らせた場合は uninstall.exe 自身が残るので EXES だけ渡す）。"""
 
     def done():
         key = service_key_exists() or sc_state()["state"] is not None
-        files = [e for e in (*EXES, "uninstall.exe") if (INSTDIR / e).exists()]
+        left = [e for e in files if (INSTDIR / e).exists()]
         reg = uninstall_registration()
-        return {"ok": True} if not key and not files and not reg else None
+        return {"ok": True} if not key and not left and not reg else None
 
     ok = wait_until(done, 240, 2.0)
     obs(p, "service_key_exists", service_key_exists())
-    obs(p, "files_left", [e for e in (*EXES, "uninstall.exe") if (INSTDIR / e).exists()])
+    obs(p, "files_left", [e for e in files if (INSTDIR / e).exists()])
     expect(p, ok is not None, "uninstall did not finish (service/files/registration remain)")
     reg = uninstall_registration()
     obs(p, "apps_registration", reg)
@@ -1669,6 +1672,76 @@ def phase_visible_recheck_retry_continues(c: Ctx) -> None:
     expect_no_shell(p)
 
 
+def phase_visible_uninstall_recheck_retry_continues(c: Ctx) -> None:
+    p = "14g_visible_uninstall_recheck_retry_continues"
+    # uninstall.exe /P _?=<INSTDIR>（その場。/S は付けない）。PREUNINSTALL がサービスを止めた瞬間に偽シェルを出し、
+    # Section Uninstall の再確認の問い（QuitShellForUpdate "アンインストール" 1）だけを問わせる。問いの表示中に
+    # 偽シェルを止めて [再試行] を押すと、ほかの dialog なしにアンインストールが最後まで通る。
+    # `_?=` のため走っている uninstall.exe 自身は消えない（NSIS の性質）ので、完了の確認は 3 つの exe だけ。
+    # 次のフェーズ（15）はインストール済みを前提にするため、最後に setup で入れ直す（phase_reinstall と同じ流れ）。
+    _visible_preamble(p)
+    fake_exe = _prepare_fake_shell(p)
+    fake = None
+    child = None
+    before = tree_snapshot(INSTDIR)
+    try:
+
+        def on_question(label: str, elapsed: float) -> None:
+            st = sc_state()
+            obs(p, f"{label}_service", st)
+            expect(p, st["state"] == "STOPPED", f"service not stopped while the {label} question is shown", st)
+            expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
+            expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
+            expect(p, bool(uninstall_registration()), f"Apps registration gone while the {label} question is shown")
+
+        def before_retry() -> None:
+            obs(p, "stop_fake_shell", _stop_fake_shell(fake))
+            gone = wait_until(lambda: not process_running(SHELL_EXE), 10)
+            if not gone:
+                raise PhaseFailure(p, f"{SHELL_EXE} still running after stopping the fake shell")
+
+        child = subprocess.Popen(uninstall_in_place_command(INSTDIR, "/P"))
+        fake, fake_started = _spawn_fake_when_service_stops(p, child, fake_exe)
+        try:
+            vis.drive_retry_continue(
+                child,
+                fake_started,
+                PROOF_DIR,
+                lambda k, v: obs(p, k, v),
+                on_question,
+                before_retry,
+                matches=vis.uninstall_recheck_question_matches,
+                label="uninstall_recheck_retry",
+            )
+        except vis.VisibleFailure as e:
+            raise PhaseFailure(p, e.reason, e.observation) from e
+        try:
+            rc = child.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            raise PhaseFailure(p, "uninstall did not exit within 30 s after the retry") from e
+        obs(p, "uninstall_exit", rc)
+        expect(p, rc == 0, "retried uninstall must succeed", rc)
+        _wait_uninstall_done(p, files=EXES)
+        obs(p, "uninstaller_left_by_in_place_run", (INSTDIR / "uninstall.exe").exists())
+        expect(p, DB_PATH.is_file(), "sqlite was removed")
+        _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, fake)
+    expect_no_shell(p)
+    # フェーズ 15 のために入れ直す。
+    rc = run_setup(c.setup, [], p, "reinstall")
+    expect(p, rc == 0, "reinstall failed", rc)
+    if service_key_exists():
+        set_service_marker()
+    expect_registered(p, "STOPPED")
+    expect_apps_registration(p)
+    expect_no_shell(p)
+    run(["sc", "start", SERVICE])
+    wait_state(SERVICE, "RUNNING")
+    obs(p, "health", wait_healthy())
+    _expect_data_intact(p, c)
+
+
 def phase_uninstall_delete_pending(c: Ctx) -> None:
     p = "15_uninstall_delete_pending"
     _ensure_running(p)  # 保留中のサービスは再開されないので PID の比較はしない
@@ -1741,6 +1814,7 @@ PHASES = (
     phase_visible_retry_continues,
     phase_visible_uninstall_recheck_cancel,
     phase_visible_recheck_retry_continues,
+    phase_visible_uninstall_recheck_retry_continues,
     phase_uninstall_delete_pending,
 )
 

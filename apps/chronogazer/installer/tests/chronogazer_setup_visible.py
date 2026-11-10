@@ -2,7 +2,7 @@
 
 chronogazer.exe という名前の終わらないプロセス（偽シェル）を置いておくと、setup は
 `QuitShellForUpdate`（service-hooks.nsh）で最大 90 秒待った後、強制終了せずに
-MB_RETRYCANCEL で問う。このモジュールが押すのは次の 4 通り:
+MB_RETRYCANCEL で問う。このモジュールが押すのは次の 6 通り:
 - 最初の問い（Section WebView2 先頭の事前確認。サービスは止まっておらずファイルも変わらない）の
   [再試行] と [キャンセル]（`drive_shell_quit_cancel`）。
 - 再確認の問い（サービス停止の後・上書きの前、restart_service_on_cancel=1。本文に
@@ -12,6 +12,10 @@ MB_RETRYCANCEL で問う。このモジュールが押すのは次の 4 通り:
   `止めたサービスは再開します。まだ何も変更していません` を含む）の [キャンセル]。同じ `drive_recheck_cancel` に
   `matches=uninstall_recheck_question_matches` を渡す。
 - 最初の問いの [再試行]（偽シェルを止めてから）で上書きまで続行する道（`drive_retry_continue`）。
+- 再確認の問いの [再試行]（偽シェルを止めてから）で上書きまで続行する道。`drive_retry_continue` に
+  `matches=recheck_question_matches` を渡す。
+- アンインストールの再確認の問いの [再試行]（偽シェルを止めてから）で最後まで消す道。同じ
+  `drive_retry_continue` に `matches=uninstall_recheck_question_matches` を渡す。
 WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
