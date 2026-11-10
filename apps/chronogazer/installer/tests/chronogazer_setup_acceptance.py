@@ -1896,19 +1896,24 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
     try:
         with ExclusiveFileLock(INSTDIR / ELEV_EXE):
 
-            def stopped(what: str) -> None:
+            def stopped(what: str) -> dict:
                 st = sc_state()
                 expect(p, st["state"] == "STOPPED", f"service not STOPPED {what}", st)
+                return st
 
             def warning_shown(label: str, elapsed: float) -> None:
                 reached = wait_until(lambda: service_start_failure_count() >= failures_before + 1, 30)
                 expect(p, bool(reached), "no service start failure was logged before the warning", service_start_failure_count())
-                stopped("while the resume-failed warning is shown")
+                st = stopped("while the resume-failed warning is shown")
+                obs(p, f"{label}_service", st)
+                obs(p, f"{label}_start_failures", service_start_failure_count())
                 expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the resume-failed warning is shown")
 
             def notice_shown(label: str, elapsed: float) -> None:
-                stopped("while the locked-exe notice is shown")
+                st = stopped("while the locked-exe notice is shown")
                 count = service_start_failure_count()
+                obs(p, f"{label}_service", st)
+                obs(p, f"{label}_start_failures", count)
                 expect(
                     p,
                     count == failures_before + 1,
@@ -1951,7 +1956,9 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
             obs(p, "service_state_after", st)
             expect(p, st["state"] == "STOPPED", f"{SERVICE} not STOPPED after the failed resume", st)
             expect_registered(p, "STOPPED")
-            expect(p, service_marker_present(), "service registration was recreated")
+            marker = service_marker_present()
+            obs(p, "marker_after", marker)
+            expect(p, marker, "service registration was recreated")
             expect(p, server.read_bytes() == CORRUPT_SERVER, "corrupt server exe was overwritten despite the abort")
             expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
             _expect_elev_still(p, tampered)

@@ -82,7 +82,7 @@ def uninstall_recheck_question_matches(text: str) -> bool:
 
 
 def locked_exe_notice_matches(text: str) -> bool:
-    return text.startswith(LOCKED_EXE_NOTICE_PREFIX) and LOCKED_EXE_NOTICE_EXE in text and LOCKED_EXE_NOTICE_NOTE in text
+    return text.startswith(LOCKED_EXE_NOTICE_PREFIX + LOCKED_EXE_NOTICE_EXE + "）") and LOCKED_EXE_NOTICE_NOTE in text
 
 
 def resume_failed_warning_matches(text: str) -> bool:

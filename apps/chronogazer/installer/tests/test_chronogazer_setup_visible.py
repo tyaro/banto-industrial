@@ -340,6 +340,11 @@ class NoticeMatchTests(unittest.TestCase):
         self.assertTrue(v.locked_exe_notice_matches(LOCKED))
         self.assertFalse(v.locked_exe_notice_matches(v.LOCKED_EXE_NOTICE_PREFIX + "chronogazer-elev.exe）。"))
         self.assertFalse(v.locked_exe_notice_matches(v.LOCKED_EXE_NOTICE_PREFIX + "other.exe）。上書きはまだ始めていません。"))
+        self.assertFalse(
+            v.locked_exe_notice_matches(
+                v.LOCKED_EXE_NOTICE_PREFIX + "chronogazer-server.exe chronogazer-elev.exe）。上書きはまだ始めていません。"
+            )
+        )
         self.assertFalse(v.locked_exe_notice_matches("x" + LOCKED))
         self.assertFalse(v.locked_exe_notice_matches(RESUME_FAILED))
 
