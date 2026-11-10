@@ -7,9 +7,9 @@ name: Installer ChronoGazer acceptance (disposable Windows, real setup + real SC
 # 破損 exe での再開失敗、DeleteFlag 保留）を確かめる。加えて可視 UI のうち、setup を /P（passive）で
 # 実画面に出して、終わらない偽シェル（chronogazer.exe）がいるときの「シェル 90 秒の問い」の
 # 最初の問いの [再試行]→[キャンセル]、再確認の問い（サービス停止の後）の [キャンセル]（止めたサービスの再開）、
-# アンインストールの再確認の [キャンセル]、最初の問いの [再試行] で上書きまで続行する道を確かめる。
+# アンインストールの再確認の [キャンセル]、最初の問いの [再試行] で上書きまで続行する道、再確認の問いの [再試行] で上書きまで続行する道を確かめる。
 # 使い捨てランナー専用: 実 C:\Program Files\ChronoGazer と ChronoGazer サービスを書き換える。
-# 対象外: 上の問い以外の可視 UI（再確認の [再試行]・WebView2 の後始末）・サービス停止の timeout・`File` の書込み途中の失敗・
+# 対象外: 上の問い以外の可視 UI（WebView2 の後始末）・サービス停止の timeout・`File` の書込み途中の失敗・
 # 消し残り（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。
 
 on:

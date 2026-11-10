@@ -94,6 +94,28 @@ class UninstallRecheckMatchTests(unittest.TestCase):
             self.assertEqual(drv.return_value.check_question.call_args.args[0], "uninstall_recheck")
 
 
+class DriveRetryContinueTests(unittest.TestCase):
+    def test_default_and_custom_matches_and_order(self):
+        with mock.patch.object(v, "_Driver") as drv:
+            d = drv.return_value
+            d.await_question.return_value = ("dlg", [], 1.0)
+            d.check_question.return_value = {"retry": 7}
+            calls = mock.Mock()
+            d.check_question.side_effect = lambda *a, **k: (calls.check(), {"retry": 7})[1]
+            d.press.side_effect = lambda *a, **k: calls.press(a)
+            v.drive_retry_continue(None, 0.0, None, None, None, calls.before)
+            d.await_question.assert_called_once_with(0.0, matches=v.question_matches)
+            self.assertEqual(d.check_question.call_args.args[0], "first")
+            self.assertEqual([c[0] for c in calls.mock_calls[:3]], ["check", "before", "press"])
+            self.assertEqual(d.press.call_args.args[1:], (7, v.IDRETRY, "retry"))
+            d.finish_after_retry.assert_called_once_with()
+            drv.reset_mock()
+            d.await_question.return_value = ("dlg", [], 1.0)
+            v.drive_retry_continue(None, 0.0, None, None, None, lambda: None, matches=v.recheck_question_matches, label="recheck")
+            d.await_question.assert_called_once_with(0.0, matches=v.recheck_question_matches)
+            self.assertEqual(d.check_question.call_args.args[0], "recheck")
+
+
 class FakeChild:
     """poll() は exit_at 秒後に 0 を返す。forced_rc を入れるとその値で終わる。"""
 
