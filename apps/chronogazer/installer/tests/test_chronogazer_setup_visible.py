@@ -4,8 +4,10 @@
 """
 
 import sys
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import chronogazer_setup_visible as v  # noqa: E402
@@ -35,6 +37,206 @@ class QuestionTests(unittest.TestCase):
         self.assertTrue(v.question_matches(QUESTION))
         self.assertFalse(v.question_matches("旧い版が見つかりました。"))
         self.assertFalse(v.question_matches(" " + QUESTION))
+
+
+RECHECK = v.QUESTION_PREFIX + "まだファイルは変更していません。上書き前に止めたサービスは再開します。"
+EARLIER = v.QUESTION_PREFIX + "まだ何も変更していません。"
+
+
+class RecheckMatchTests(unittest.TestCase):
+    def test_recheck_matches(self):
+        self.assertTrue(v.recheck_question_matches(RECHECK))
+        self.assertFalse(v.recheck_question_matches(EARLIER))
+        self.assertFalse(v.recheck_question_matches("別の窓 " + RECHECK))
+        self.assertFalse(v.recheck_question_matches(v.RECHECK_NOTE))
+
+    def test_earlier_question_is_unexpected_in_recheck(self):
+        found, unexpected = v.judge_dialogs(
+            [window(2)], lambda h: [child("Static", EARLIER)], PID, matches=v.recheck_question_matches
+        )
+        self.assertIsNone(found)
+        self.assertEqual(unexpected[0]["texts"], [EARLIER])
+        found, _ = v.judge_dialogs(
+            [window(2)], lambda h: [child("Static", RECHECK)], PID, matches=v.recheck_question_matches
+        )
+        self.assertEqual(found[0]["hwnd"], 2)
+
+
+class FakeChild:
+    """poll() は exit_at 秒後に 0 を返す。forced_rc を入れるとその値で終わる。"""
+
+    def __init__(self, exit_at=None):
+        self.t0 = time.monotonic()
+        self.exit_at = exit_at
+        self.pid = PID
+        self.forced_rc = None
+
+    def poll(self):
+        if self.forced_rc is not None:
+            return self.forced_rc
+        if self.exit_at is not None and time.monotonic() - self.t0 >= self.exit_at:
+            return 0
+        return None
+
+
+class FakeUser32:
+    """PostMessageW の戻りと IsWindow を差し込める。close_ends は N 回目の WM_CLOSE で child を終わらせる。"""
+
+    def __init__(self, child, post_results=(), alive=True, close_ends=None):
+        self.child, self.results, self.alive, self.close_ends = child, list(post_results), alive, close_ends
+        self.posts = []
+
+    def PostMessageW(self, hwnd, msg, w, l):
+        self.posts.append(msg)
+        ok = self.results.pop(0) if self.results else True
+        if ok and self.close_ends is not None and len(self.posts) >= self.close_ends:
+            self.child.forced_rc = 1
+        return ok
+
+    def IsWindow(self, hwnd):
+        return self.alive
+
+
+def make_driver(child_, user32, windows=lambda: [window(1, owner=0)], dialog_text=None):
+    d = v._Driver.__new__(v._Driver)
+    d.child = child_
+    d.pid = PID
+    d.recorded = {}
+    d.record = lambda k, val: d.recorded.__setitem__(k, val)
+    d.api = mock.Mock()
+    d.api.u = user32
+    d.snapshot = lambda: windows()
+    d.children_of = lambda h: [child("Static", dialog_text)] if dialog_text else []
+    return d
+
+
+FAST = dict(
+    POLL_SECONDS=0.01,
+    QUIET_AFTER_CANCEL_SECONDS=0.0,
+    CLOSE_RESEND_SECONDS=0.05,
+    SERVICE_RESUME_LIMIT_SECONDS=0.3,
+    FINISH_LIMIT_SECONDS=0.5,
+    INSTALL_FINISH_LIMIT_SECONDS=0.2,
+)
+
+
+class FinishTests(unittest.TestCase):
+    def setUp(self):
+        for k, val in FAST.items():
+            m = mock.patch.object(v, k, val)
+            m.start()
+            self.addCleanup(m.stop)
+
+    def test_no_close_while_not_ready_then_resends_until_exit(self):
+        ch = FakeChild()
+        u = FakeUser32(ch, close_ends=3)
+        d = make_driver(ch, u)
+        calls = {"n": 0}
+
+        def ready_to_close():
+            calls["n"] += 1
+            self.assertEqual(u.posts, [])  # 真になるまでは WM_CLOSE を送らない
+            return calls["n"] > 5
+
+        d.finish_after_cancel(ready_to_close=ready_to_close)
+        self.assertEqual(len(u.posts), 3)  # 真になった後、終わるまで送り直す
+        self.assertEqual(d.recorded["main_window_close_posts"], 3)
+        self.assertTrue(d.recorded["main_window_closed"])
+
+    def test_never_ready_fails_without_posting(self):
+        ch = FakeChild()
+        u = FakeUser32(ch)
+        d = make_driver(ch, u)
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: False)
+        self.assertEqual(cm.exception.reason, "service_not_resumed_before_main_close")
+        self.assertEqual(u.posts, [])
+
+    def test_setup_exits_while_waiting(self):
+        ch = FakeChild(exit_at=0.05)
+        d = make_driver(ch, FakeUser32(ch))
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: False)
+        self.assertEqual(cm.exception.reason, "setup_exited_before_service_resumed")
+        self.assertEqual(cm.exception.observation, {"exit": 0})
+
+    def test_post_failure_after_window_gone_is_ignored(self):
+        ch = FakeChild(exit_at=0.15)
+        u = FakeUser32(ch, post_results=[True] + [False] * 50, alive=False)
+        d = make_driver(ch, u)
+        d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(d.recorded["main_window_close_posts"], 1)
+
+    def test_post_failure_with_live_window_fails(self):
+        ch = FakeChild()
+        u = FakeUser32(ch, post_results=[False], alive=True)
+        d = make_driver(ch, u)
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel()
+        self.assertEqual(cm.exception.reason, "PostMessage_WM_CLOSE_failed")
+
+    def test_owned_dialog_while_waiting_fails(self):
+        ch = FakeChild()
+        d = make_driver(ch, FakeUser32(ch), windows=lambda: [window(1, owner=0), window(2)], dialog_text="別の窓")
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: False)
+        self.assertEqual(cm.exception.reason, "unexpected_dialog_before_main_close")
+
+    def test_without_ready_resends_until_exit(self):
+        ch = FakeChild()
+        u = FakeUser32(ch, close_ends=2)
+        make_driver(ch, u).finish_after_cancel()
+        self.assertEqual(len(u.posts), 2)
+
+    def test_other_owner_zero_window_after_main_gone_fails(self):
+        ch = FakeChild()
+        u = FakeUser32(ch)
+        t0 = time.monotonic()
+        # 主窓(1)が消えた後に別の hwnd(9) の owner 0 窓が出る
+        d = make_driver(ch, u, windows=lambda: [window(1, owner=0)] if time.monotonic() - t0 < 0.1 else [window(9, owner=0)])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "unexpected_owner_zero_window")
+        self.assertGreaterEqual(len(u.posts), 1)
+
+    def test_two_owner_zero_windows_fail(self):
+        ch = FakeChild()
+        u = FakeUser32(ch)
+        d = make_driver(ch, u, windows=lambda: [window(1, owner=0), window(9, owner=0)])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "unexpected_owner_zero_window")
+        self.assertEqual(u.posts, [])
+
+    def test_no_main_window_seen_with_ready_fails(self):
+        ch = FakeChild(exit_at=0.05)
+        u = FakeUser32(ch)
+        d = make_driver(ch, u, windows=lambda: [])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "main_window_not_closed_after_resume")
+        self.assertEqual(u.posts, [])
+
+    def test_no_main_window_without_ready_is_not_judged(self):
+        ch = FakeChild(exit_at=0.05)
+        d = make_driver(ch, FakeUser32(ch), windows=lambda: [])
+        d.finish_after_cancel()
+        self.assertEqual(d.recorded["main_window_close_posts"], 0)
+
+    def test_retry_finish_ok_and_timeout(self):
+        ch = FakeChild(exit_at=0.05)
+        make_driver(ch, FakeUser32(ch)).finish_after_retry()
+        ch = FakeChild()
+        with self.assertRaises(v.VisibleFailure) as cm:
+            make_driver(ch, FakeUser32(ch)).finish_after_retry()
+        self.assertEqual(cm.exception.reason, "setup_did_not_finish_after_retry")
+
+    def test_retry_finish_owned_dialog_fails(self):
+        ch = FakeChild()
+        d = make_driver(ch, FakeUser32(ch), windows=lambda: [window(2)], dialog_text="別の窓")
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_retry()
+        self.assertEqual(cm.exception.reason, "unexpected_dialog_after_retry")
 
 
 class ElapsedTests(unittest.TestCase):

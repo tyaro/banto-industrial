@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。`phase_visible_shell_quit_cancel` 以外はすべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 3 つ以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -16,15 +16,18 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   10 事前確認（サービス登録・前のインストールの別の場所）での中止 / 11 使用中 exe でのアンインストール中止 /
   12 サービス解除失敗 / 13 稼働中のサービスの service-install 失敗 / 14 破損 exe での再開失敗 /
   15 DeleteFlag 保留（拒否、解消、完了まで）
+可視 UI（setup を /P で実画面に出す）: 14b シェル 90 秒の最初の問いの [再試行]→[キャンセル] /
+  14c 再確認の問い（サービス停止の後）の [キャンセル]（止めたサービスの再開） /
+  14d 最初の問いの [再試行] で続行して上書きまで通る道
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: シェル 90 秒の最初の問い（`/P` の [再試行]／[キャンセル]）以外の可視 UI（MessageBox）・
-サービス停止の timeout・`File` の書込み途中の失敗・消し残り（RequireChronoGazerExesDeleted）・
-実 collector・#392 B3-5。最初の問いのほかは silent なので MessageBox は未確認。
+対象外（このスクリプトは確かめない）: 上の 3 つ以外の可視 UI（アンインストールの再確認・WebView2 の後始末・
+再確認の [再試行]）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
+（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 3 つ以外は silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -1346,30 +1349,86 @@ def _stop_fake_shell(fake) -> str:
         return "killed"
 
 
-def phase_visible_shell_quit_cancel(c: Ctx) -> None:
-    p = "14b_visible_shell_quit_cancel"
-    # /P（passive）の本物の setup: シェルの終了待ち 90 秒の後の問い（最初の事前確認）で
-    # [再試行] → もう 90 秒 → [キャンセル]。何も変えず、偽シェルも強制終了されない。
+def _prepare_fake_shell(p: str):
+    """偽シェルの exe（ping.exe の写し。INSTDIR の外、artifact の外）を用意する。起動はしない。"""
+    root = Path(os.environ[ROOT_ENV])
+    fake_exe = root / "fake-shell" / SHELL_EXE
+    fake_exe.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "ping.exe", fake_exe)
+    obs(p, "fake_shell_path", str(fake_exe))
+    obs(p, "fake_shell_outside_instdir", not fake_exe.resolve().is_relative_to(INSTDIR))
+    expect(p, not fake_exe.resolve().is_relative_to(INSTDIR), "fake shell must be outside INSTDIR")
+    return fake_exe
+
+
+def _start_fake_shell(fake_exe: Path):
+    return subprocess.Popen(
+        [str(fake_exe), "-n", "900", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+
+
+def _visible_preamble(p: str) -> int:
     environment, reasons = vis.gui_check()
     obs(p, "gui_environment", environment)
     expect(p, not reasons, "gui_unsupported", reasons)
     expect(p, PROOF_DIR is not None, "proof dir is not initialised")
     pid = _ensure_running(p)
     expect_no_shell(p)
+    return pid
+
+
+def service_left_running(st: dict) -> bool:
+    """sc の結果が「RUNNING でない」か。sc の失敗や state 空を RUNNING でないと読まず例外にする。"""
+    if st.get("exit") != 0 or not st.get("state"):
+        raise RuntimeError(f"sc queryex unusable: {st}")
+    return st["state"] != "RUNNING"
+
+
+def _spawn_fake_when_service_stops(p: str, child, fake_exe: Path):
+    """setup の起動後、サービスが RUNNING でなくなった瞬間に偽シェルを起動する。(偽シェル, 起動直前の時刻)。
+
+    sleep は入れない（sc の起動が間隔になる）。再確認の tasklist より前に偽シェルを出すため。
+    """
+    deadline = time.monotonic() + 120
+    st = None
+    while True:
+        rc = child.poll()
+        if rc is not None:
+            raise PhaseFailure(p, "setup exited before the service was stopped", rc)
+        try:
+            st = sc_state()
+            left = service_left_running(st)
+        except RuntimeError as e:
+            raise PhaseFailure(p, "sc queryex failed while waiting for the service to stop", str(e)) from e
+        if left:
+            started = time.monotonic()
+            fake = _start_fake_shell(fake_exe)
+            obs(p, "trigger_service_state", st)
+            return fake, started
+        if time.monotonic() >= deadline:
+            raise PhaseFailure(p, "service did not leave RUNNING within 120 s of starting setup", st)
+
+
+def _cleanup_visible(p: str, child, fake) -> None:
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait(timeout=30)
+        obs(p, "cleanup_setup", "killed")
+    if fake is not None:
+        obs(p, "cleanup_fake_shell", _stop_fake_shell(fake))
+
+
+def phase_visible_shell_quit_cancel(c: Ctx) -> None:
+    p = "14b_visible_shell_quit_cancel"
+    # /P（passive）の本物の setup: シェルの終了待ち 90 秒の後の問い（最初の事前確認）で
+    # [再試行] → もう 90 秒 → [キャンセル]。何も変えず、偽シェルも強制終了されない。
+    pid = _visible_preamble(p)
     before = tree_snapshot(INSTDIR)
-    root = Path(os.environ[ROOT_ENV])
-    fake_exe = root / "fake-shell" / SHELL_EXE  # proof の外。exe は artifact に入れない
-    fake_exe.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "ping.exe", fake_exe)
-    obs(p, "fake_shell_path", str(fake_exe))
-    obs(p, "fake_shell_outside_instdir", not fake_exe.resolve().is_relative_to(INSTDIR))
-    expect(p, not fake_exe.resolve().is_relative_to(INSTDIR), "fake shell must be outside INSTDIR")
-    fake = subprocess.Popen(
-        [str(fake_exe), "-n", "900", "127.0.0.1"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    fake_exe = _prepare_fake_shell(p)
+    fake = _start_fake_shell(fake_exe)
     child = None
     try:
         time.sleep(2)
@@ -1402,13 +1461,122 @@ def phase_visible_shell_quit_cancel(c: Ctx) -> None:
         expect(p, fake.poll() is None and process_running(SHELL_EXE), "fake shell was killed by the setup")
         _expect_data_intact(p, c)
     finally:
-        if child is not None and child.poll() is None:
-            child.kill()
-            child.wait(timeout=30)
-            obs(p, "cleanup_setup", "killed")
-        obs(p, "cleanup_fake_shell", _stop_fake_shell(fake))
+        _cleanup_visible(p, child, fake)
     expect_no_shell(p)
     _recover_by_setup(p, c)
+
+
+def phase_visible_recheck_cancel(c: Ctx) -> None:
+    p = "14c_visible_recheck_cancel"
+    # 偽シェルは最初は置かない。/P の setup がサービスを止めた瞬間に偽シェルを出すと、事前確認の
+    # 2 回は通り、上書き直前の再確認（QuitShellForUpdate(1)）だけが問う。[キャンセル] で
+    # 止めたサービスが再開され、ファイルは変わらず、偽シェルも強制終了されない。
+    pid = _visible_preamble(p)
+    before = tree_snapshot(INSTDIR)
+    fake_exe = _prepare_fake_shell(p)
+    fake = None
+    child = None
+    resumed = {}
+    try:
+
+        def on_question(label: str, elapsed: float) -> None:
+            st = sc_state()
+            obs(p, f"{label}_service", st)
+            expect(p, st["state"] == "STOPPED", f"service not stopped while the {label} question is shown", st)
+            expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
+            expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
+
+        def service_resumed() -> bool:
+            st = sc_state()
+            if st["state"] == "RUNNING" and st["pid"] and st["pid"] != pid:
+                resumed["pid"] = st["pid"]
+                obs(p, "service_resumed", st)
+                return True
+            return False
+
+        child = subprocess.Popen([str(c.setup), "/P"])
+        fake, fake_started = _spawn_fake_when_service_stops(p, child, fake_exe)
+        try:
+            vis.drive_recheck_cancel(child, fake_started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, service_resumed)
+        except vis.VisibleFailure as e:
+            raise PhaseFailure(p, e.reason, e.observation) from e
+        try:
+            rc = child.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+        obs(p, "setup_exit", rc)
+        expect(p, rc != 0, "cancelled setup must exit non-zero", rc)
+        st = sc_state()
+        obs(p, "service_after", st)
+        expect(
+            p,
+            st["state"] == "RUNNING" and st["pid"] == resumed.get("pid"),
+            "service was restarted again after the resume (.onInstFailed)",
+            st,
+        )
+        obs(p, "health_after", wait_healthy())
+        expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the cancelled setup")
+        expect(p, fake.poll() is None and process_running(SHELL_EXE), "fake shell was killed by the setup")
+        _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, fake)
+    expect_no_shell(p)
+    # 次のフェーズが上書きを通すので _recover_by_setup は呼ばない。
+
+
+def phase_visible_retry_continues(c: Ctx) -> None:
+    p = "14d_visible_retry_continues"
+    # 最初の問いで偽シェルを止めてから [再試行] を押すと、事前確認を抜けて上書きまで通る。
+    pid = _visible_preamble(p)
+    fake_exe = _prepare_fake_shell(p)
+    fake = _start_fake_shell(fake_exe)
+    child = None
+    try:
+        time.sleep(2)
+        expect(p, fake.poll() is None, "fake shell exited early", fake.returncode)
+        expect(p, process_running(SHELL_EXE), f"{SHELL_EXE} (fake) not visible to tasklist")
+        # 本当に上書きされたことを示すため、elev exe を壊す（dist と違う hash にする）。
+        want_elev = sha256(_dist_exe(c, "chronogazer-elev"))
+        with open(INSTDIR / ELEV_EXE, "ab") as f:
+            f.write(b"\0")
+        tampered = sha256(INSTDIR / ELEV_EXE)
+        obs(p, "elev_hash", {"dist": want_elev, "tampered": tampered})
+        expect(p, tampered != want_elev, "elev exe tamper did not change hash")
+        before = tree_snapshot(INSTDIR)
+
+        def on_question(label: str, elapsed: float) -> None:
+            st = sc_state()
+            obs(p, f"{label}_service", st)
+            expect(p, st["state"] == "RUNNING" and st["pid"] == pid, f"service changed while the {label} question is shown", st)
+            expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
+            expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
+
+        def before_retry() -> None:
+            obs(p, "stop_fake_shell", _stop_fake_shell(fake))
+            gone = wait_until(lambda: not process_running(SHELL_EXE), 10)
+            if not gone:
+                raise PhaseFailure(p, f"{SHELL_EXE} still running after stopping the fake shell")
+
+        started = time.monotonic()
+        child = subprocess.Popen([str(c.setup), "/P"])
+        try:
+            vis.drive_retry_continue(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, before_retry)
+        except vis.VisibleFailure as e:
+            raise PhaseFailure(p, e.reason, e.observation) from e
+        try:
+            rc = child.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            raise PhaseFailure(p, "setup did not exit within 30 s after the overwrite") from e
+        obs(p, "setup_exit", rc)
+        expect(p, rc == 0, "retried setup must succeed", rc)
+        _expect_restarted(p, pid)
+        expect_registered(p, "RUNNING")
+        _expect_exes_match_dist(p, c)
+        _expect_not_delete_pending(p)
+        _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, fake)
+    expect_no_shell(p)
 
 
 def phase_uninstall_delete_pending(c: Ctx) -> None:
@@ -1479,6 +1647,8 @@ PHASES = (
     phase_install_service_install_fails_running,
     phase_restart_fails_corrupt_exe,
     phase_visible_shell_quit_cancel,
+    phase_visible_recheck_cancel,
+    phase_visible_retry_continues,
     phase_uninstall_delete_pending,
 )
 
