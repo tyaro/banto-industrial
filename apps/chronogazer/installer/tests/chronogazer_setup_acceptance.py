@@ -1091,7 +1091,7 @@ def phase_install_acl_refused(c: Ctx) -> None:
     tampered = _tamper_elev(p, c)
     before = tree_snapshot(INSTDIR)
     # サブフォルダ
-    subdir = INSTDIR / "banto-973-subdir"
+    subdir = INSTDIR / vis.ACL_REFUSED_SUBDIR
     subdir.mkdir()
     (subdir / "keep.txt").write_text("keep", encoding="utf-8")
     try:
@@ -1811,8 +1811,8 @@ class SubdirInInstdir:
     """INSTDIR 直下にサブフォルダを作る（ChronoGazer の ACL の段階の中止の原因。中に keep.txt を置く）。
     抜けるときに消すので、後の復旧の setup が同じ理由で失敗しない。"""
 
-    def __init__(self, instdir: Path = None):
-        self.path = (instdir or INSTDIR) / vis.ACL_REFUSED_SUBDIR
+    def __init__(self):
+        self.path = INSTDIR / vis.ACL_REFUSED_SUBDIR
 
     def __enter__(self):
         self.path.mkdir()
@@ -1828,11 +1828,12 @@ def _visible_abort_with_resume(p: str, c: Ctx, abort_ctx, label: str, matches, w
     # 止めたサービスを再開し、.onInstFailed で二重に再開しない。14h（使用中 exe）と 14j（サブフォルダ）が共有する。
     pid = _visible_preamble(p)
     tampered = _tamper_elev(p, c)
-    child = None
     resumed = {}
-    try:
-        with abort_ctx:
-            before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
+    # 失敗の道で setup が生きたまま原因が消えて上書きへ進まないよう、setup を片付けてから原因（abort_ctx）を消す順にする。
+    with abort_ctx:
+        before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
+        child = None
+        try:
 
             def on_shown(lbl: str, elapsed: float) -> None:
                 st = sc_state()
@@ -1888,8 +1889,8 @@ def _visible_abort_with_resume(p: str, c: Ctx, abort_ctx, label: str, matches, w
             expect_registered(p, "RUNNING")
             _expect_not_delete_pending(p)
             _expect_data_intact(p, c)
-    finally:
-        _cleanup_visible(p, child, None)
+        finally:
+            _cleanup_visible(p, child, None)
     expect_no_shell(p)
 
 
@@ -1928,10 +1929,11 @@ def _visible_abort_restart_fails(
     server.write_bytes(CORRUPT_SERVER)
     failures_before = service_start_failure_count()
     obs(p, "start_failures_before", failures_before)
-    child = None
-    try:
-        with abort_ctx:
-            before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
+    # 失敗の道で setup が生きたまま原因が消えて上書きへ進まないよう、setup を片付けてから原因（abort_ctx）を消す順にする。
+    with abort_ctx:
+        before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
+        child = None
+        try:
 
             def stopped(when: str) -> dict:
                 st = sc_state()
@@ -2000,8 +2002,8 @@ def _visible_abort_restart_fails(
             expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
             _expect_elev_still(p, tampered)
             _expect_data_intact(p, c)
-    finally:
-        _cleanup_visible(p, child, None)
+        finally:
+            _cleanup_visible(p, child, None)
     expect_no_shell(p)
     return old
 
