@@ -214,6 +214,7 @@ class _Driver:
         ready_to_close があれば、真になるまで（再確認の [キャンセル] でサービスを戻している間）
         WM_CLOSE を送らずに待つ。Section が走っている間の WM_CLOSE は無視されうるため、
         閉じる段階では setup が終わるまで CLOSE_RESEND_SECONDS おきに送り直す。
+        WM_CLOSE は最初に見た主窓の hwnd にだけ送る（後から出た owner 0 の別窓を黙って閉じて誤って通らないため）。
         """
         started = time.monotonic()
         quiet_until = started + QUIET_AFTER_CANCEL_SECONDS
@@ -237,25 +238,34 @@ class _Driver:
         posts = 0
         recorded = False
         last_post = None
+        main_hwnd = None
         while self.child.poll() is None:
             if time.monotonic() >= deadline:
                 break
             windows = self._no_owned_dialog("after_main_close" if posts else "on_failed_page")
             mains = main_windows(windows, self.pid)
+            if len(mains) > 1 or (
+                main_hwnd is not None and any(m["hwnd"] != main_hwnd for m in mains)
+            ):
+                raise VisibleFailure("unexpected_owner_zero_window", mains)
             if mains:
+                if main_hwnd is None:
+                    main_hwnd = mains[0]["hwnd"]
                 if not recorded:
                     self.record("main_window", mains)
                     recorded = True
                 now = time.monotonic()
                 if last_post is None or now - last_post >= CLOSE_RESEND_SECONDS:
                     last_post = now
-                    if self.api.u.PostMessageW(mains[0]["hwnd"], WM_CLOSE, 0, 0):
+                    if self.api.u.PostMessageW(main_hwnd, WM_CLOSE, 0, 0):
                         posts += 1
-                    elif self.api.u.IsWindow(mains[0]["hwnd"]) and self.child.poll() is None:
+                    elif self.api.u.IsWindow(main_hwnd) and self.child.poll() is None:
                         raise VisibleFailure("PostMessage_WM_CLOSE_failed")
             time.sleep(POLL_SECONDS)
         self.record("main_window_close_posts", posts)
         self.record("main_window_closed", posts > 0)
+        if ready_to_close is not None and posts == 0:
+            raise VisibleFailure("main_window_not_closed_after_resume")
 
     def finish_after_retry(self):
         """[再試行] の後: 上書きが通って setup が自分で終わるまで、他の dialog が出ないことを見る。"""

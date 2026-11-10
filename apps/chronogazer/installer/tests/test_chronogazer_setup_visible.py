@@ -188,6 +188,41 @@ class FinishTests(unittest.TestCase):
         make_driver(ch, u).finish_after_cancel()
         self.assertEqual(len(u.posts), 2)
 
+    def test_other_owner_zero_window_after_main_gone_fails(self):
+        ch = FakeChild()
+        u = FakeUser32(ch)
+        t0 = time.monotonic()
+        # 主窓(1)が消えた後に別の hwnd(9) の owner 0 窓が出る
+        d = make_driver(ch, u, windows=lambda: [window(1, owner=0)] if time.monotonic() - t0 < 0.1 else [window(9, owner=0)])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "unexpected_owner_zero_window")
+        self.assertGreaterEqual(len(u.posts), 1)
+
+    def test_two_owner_zero_windows_fail(self):
+        ch = FakeChild()
+        u = FakeUser32(ch)
+        d = make_driver(ch, u, windows=lambda: [window(1, owner=0), window(9, owner=0)])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "unexpected_owner_zero_window")
+        self.assertEqual(u.posts, [])
+
+    def test_no_main_window_seen_with_ready_fails(self):
+        ch = FakeChild(exit_at=0.05)
+        u = FakeUser32(ch)
+        d = make_driver(ch, u, windows=lambda: [])
+        with self.assertRaises(v.VisibleFailure) as cm:
+            d.finish_after_cancel(ready_to_close=lambda: True)
+        self.assertEqual(cm.exception.reason, "main_window_not_closed_after_resume")
+        self.assertEqual(u.posts, [])
+
+    def test_no_main_window_without_ready_is_not_judged(self):
+        ch = FakeChild(exit_at=0.05)
+        d = make_driver(ch, FakeUser32(ch), windows=lambda: [])
+        d.finish_after_cancel()
+        self.assertEqual(d.recorded["main_window_close_posts"], 0)
+
     def test_retry_finish_ok_and_timeout(self):
         ch = FakeChild(exit_at=0.05)
         make_driver(ch, FakeUser32(ch)).finish_after_retry()
