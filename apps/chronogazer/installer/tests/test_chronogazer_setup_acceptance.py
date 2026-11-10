@@ -7,6 +7,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -274,6 +275,28 @@ class ServiceLeftRunningTests(unittest.TestCase):
                 c.service_left_running(st)
 
 
+class WaitUninstallDoneTests(unittest.TestCase):
+    def _run(self, **kw):
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "uninstall.exe").write_text("x")
+            with (
+                mock.patch.object(c, "INSTDIR", Path(d)),
+                mock.patch.object(c, "service_key_exists", return_value=False),
+                mock.patch.object(c, "sc_state", return_value={"state": None}),
+                mock.patch.object(c, "uninstall_registration", return_value=[]),
+                mock.patch.object(c, "wait_until", side_effect=lambda fn, *a, **k: fn()),
+                mock.patch.object(c, "obs", lambda *a, **k: None),
+            ):
+                c._wait_uninstall_done("p", **kw)
+
+    def test_in_place_run_only_requires_exes_gone(self):
+        self._run(files=c.EXES)
+
+    def test_default_files_require_uninstall_exe_gone(self):
+        with self.assertRaises(c.PhaseFailure):
+            self._run()
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_uninstall_in_place_command_mode_flag(self):
         self.assertEqual(
@@ -284,7 +307,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 20)
+        self.assertEqual(len(c.PHASES), 21)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -308,6 +331,7 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_visible_retry_continues",
                 "phase_visible_uninstall_recheck_cancel",
                 "phase_visible_recheck_retry_continues",
+                "phase_visible_uninstall_recheck_retry_continues",
                 "phase_uninstall_delete_pending",
             ],
         )
