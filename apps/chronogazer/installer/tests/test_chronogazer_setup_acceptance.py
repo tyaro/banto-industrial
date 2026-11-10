@@ -265,7 +265,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 15)
+        self.assertEqual(len(c.PHASES), 16)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -284,6 +284,7 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_uninstall_delete_fail",
                 "phase_install_service_install_fails_running",
                 "phase_restart_fails_corrupt_exe",
+                "phase_visible_shell_quit_cancel",
                 "phase_uninstall_delete_pending",
             ],
         )
