@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。すべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_shell_quit_cancel` 以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -22,9 +22,9 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 可視 UI とシェル 90 秒の問い（MessageBox）・
+対象外（このスクリプトは確かめない）: シェル 90 秒の最初の問い（`/P` の [再試行]／[キャンセル]）以外の可視 UI（MessageBox）・
 サービス停止の timeout・`File` の書込み途中の失敗・消し残り（RequireChronoGazerExesDeleted）・
-実 collector・#392 B3-5。silent なので MessageBox は未確認。
+実 collector・#392 B3-5。最初の問いのほかは silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -45,6 +45,8 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+import chronogazer_setup_visible as vis
 
 GUARD_ENV = "BANTO_973_CG_SETUP_TEST"
 GUARD_VALUE = "github-hosted-disposable-only-v1"
@@ -1330,6 +1332,85 @@ def phase_restart_fails_corrupt_exe(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
+def _stop_fake_shell(fake) -> str:
+    """偽シェルを止める。terminate で足りなければ kill。結果を返す。"""
+    if fake.poll() is not None:
+        return f"already_exited:{fake.returncode}"
+    fake.terminate()
+    try:
+        fake.wait(timeout=10)
+        return "terminated"
+    except subprocess.TimeoutExpired:
+        fake.kill()
+        fake.wait(timeout=10)
+        return "killed"
+
+
+def phase_visible_shell_quit_cancel(c: Ctx) -> None:
+    p = "14b_visible_shell_quit_cancel"
+    # /P（passive）の本物の setup: シェルの終了待ち 90 秒の後の問い（最初の事前確認）で
+    # [再試行] → もう 90 秒 → [キャンセル]。何も変えず、偽シェルも強制終了されない。
+    environment, reasons = vis.gui_check()
+    obs(p, "gui_environment", environment)
+    expect(p, not reasons, "gui_unsupported", reasons)
+    expect(p, PROOF_DIR is not None, "proof dir is not initialised")
+    pid = _ensure_running(p)
+    expect_no_shell(p)
+    before = tree_snapshot(INSTDIR)
+    root = Path(os.environ[ROOT_ENV])
+    fake_exe = root / "fake-shell" / SHELL_EXE  # proof の外。exe は artifact に入れない
+    fake_exe.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(Path(os.environ["SystemRoot"]) / "System32" / "ping.exe", fake_exe)
+    obs(p, "fake_shell_path", str(fake_exe))
+    obs(p, "fake_shell_outside_instdir", not fake_exe.resolve().is_relative_to(INSTDIR))
+    expect(p, not fake_exe.resolve().is_relative_to(INSTDIR), "fake shell must be outside INSTDIR")
+    fake = subprocess.Popen(
+        [str(fake_exe), "-n", "900", "127.0.0.1"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    child = None
+    try:
+        time.sleep(2)
+        expect(p, fake.poll() is None, "fake shell exited early", fake.returncode)
+        expect(p, process_running(SHELL_EXE), f"{SHELL_EXE} (fake) not visible to tasklist")
+
+        def on_question(label: str, elapsed: float) -> None:
+            st = sc_state()
+            obs(p, f"{label}_service", st)
+            expect(p, st["state"] == "RUNNING" and st["pid"] == pid, f"service changed while the {label} question is shown", st)
+            expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
+            expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
+
+        started = time.monotonic()
+        child = subprocess.Popen([str(c.setup), "/P"])  # /S は付けない（MessageBox を実画面に出す）
+        try:
+            vis.drive_shell_quit_cancel(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question)
+        except vis.VisibleFailure as e:
+            raise PhaseFailure(p, e.reason, e.observation) from e
+        try:
+            rc = child.wait(timeout=30)
+        except subprocess.TimeoutExpired as e:
+            raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+        obs(p, "setup_exit", rc)
+        expect(p, rc != 0, "cancelled setup must exit non-zero", rc)
+        st = sc_state()
+        obs(p, "service_after", st)
+        expect(p, st["state"] == "RUNNING" and st["pid"] == pid, "service changed by the cancelled setup", st)
+        expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the cancelled setup")
+        expect(p, fake.poll() is None and process_running(SHELL_EXE), "fake shell was killed by the setup")
+        _expect_data_intact(p, c)
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+            child.wait(timeout=30)
+            obs(p, "cleanup_setup", "killed")
+        obs(p, "cleanup_fake_shell", _stop_fake_shell(fake))
+    expect_no_shell(p)
+    _recover_by_setup(p, c)
+
+
 def phase_uninstall_delete_pending(c: Ctx) -> None:
     p = "15_uninstall_delete_pending"
     _ensure_running(p)  # 保留中のサービスは再開されないので PID の比較はしない
@@ -1397,6 +1478,7 @@ PHASES = (
     phase_uninstall_delete_fail,
     phase_install_service_install_fails_running,
     phase_restart_fails_corrupt_exe,
+    phase_visible_shell_quit_cancel,
     phase_uninstall_delete_pending,
 )
 

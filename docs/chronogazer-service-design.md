@@ -151,7 +151,9 @@ stopsはinstaller由来の1行のみ）。INSTDIRのhashと名前の集合は不
   - 破損 exe での再開失敗: 再開を 1 回だけ試みて（SCM のイベント 7000 が 1 件）STOPPED のまま。再インストールで回復する。
   - 削除保留: 中止して `DeleteFlag`=1 のまま再開せず、`service-install` と setup は拒否する。解消後のアンインストールと再インストールが通る。
 
-対象外: silent で流すので MessageBox の表示は見ていない。可視 UI とシェル 90 秒の問い、サービス停止 timeout、`File` の書込み途中の失敗、消し残り（`RequireChronoGazerExesDeleted`）、実 collector、#392 B3-5 も対象外。アンインストールの故障系は完了と終了コードを得るため `_?=` でその場で走らせた。使用中 exe は READ 共有の `CreateFileW` のロックで作った。
+- 可視 UI の最初の問い（`chronogazer_setup_visible.py`、フェーズ `14b_visible_shell_quit_cancel`）: 本物の setup を `/P`（passive。頁は飛ばすが MessageBox は実画面に出る）で走らせ、`chronogazer.exe` という名前の終わらない偽シェル（`ping.exe` の写し。INSTDIR の外）を置いて、シェル終了待ち 90 秒の後の [再試行]／[キャンセル] の問いを確かめる。問いは pid・`#32770`・owner 非 0・子 Static の本文で同定し、ボタンは control id（IDRETRY=4・IDCANCEL=2）で選ぶ。問いの表示中はサービスが RUNNING で pid 不変・INSTDIR 不変・偽シェル生存、経過は 89 秒以上 200 秒以下。[再試行] でもう 90 秒待ち、2 回目の問いで [キャンセル] を押す。キャンセル後は失敗の頁だけが残り、他の dialog が出ないことを見てから閉じる。setup は非 0 で終わり、サービス・INSTDIR・データは変わらず、偽シェルは強制終了されない。dialog の画像は `first_question.png`・`second_question.png`。
+
+対象外: 上の最初の問い以外では silent で流すので MessageBox の表示は見ていない。可視 UI の2 回目以降の再確認（`restart_service_on_cancel=1`）・[再試行] で続行して上書きが通る道・WebView2 の本物の後始末、サービス停止 timeout、`File` の書込み途中の失敗、消し残り（`RequireChronoGazerExesDeleted`）、実 collector、#392 B3-5 も対象外。アンインストールの故障系は完了と終了コードを得るため `_?=` でその場で走らせた。使用中 exe は READ 共有の `CreateFileW` のロックで作った。
 
 ## 0. 結論（要約）
 
