@@ -16,6 +16,8 @@ MB_RETRYCANCEL で問う。このモジュールが押すのは次の 6 通り:
   `matches=recheck_question_matches` を渡す。
 - アンインストールの再確認の問いの [再試行]（偽シェルを止めてから）で最後まで消す道。同じ
   `drive_retry_continue` に `matches=uninstall_recheck_question_matches` を渡す。
+上の問いとは別に、使用中 exe で上書き前に中止する道の MB_OK の案内も確かめる（`drive_notices`。再開失敗の
+警告が主案内より先に出る道を含む。偽シェルは使わない）。
 WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
@@ -29,7 +31,7 @@ import time
 from pathlib import Path
 
 DIALOG_CLASS = "#32770"  # MessageBox も NSIS の主窓も同じ class。
-IDCANCEL, IDRETRY = 2, 4
+IDOK, IDCANCEL, IDRETRY = 1, 2, 4
 WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
 # service-hooks.nsh の QuitShellForUpdate の MessageBox の書き出し。
 QUESTION_PREFIX = "ChronoGazer のデスクトップシェル (chronogazer.exe) がまだ終了していません。"
@@ -37,6 +39,14 @@ QUESTION_PREFIX = "ChronoGazer のデスクトップシェル (chronogazer.exe) 
 RECHECK_NOTE = "上書き前に止めたサービスは再開します"
 # アンインストールの再確認（Section Uninstall、PREUNINSTALL でサービスを止めた後）の問いだけに入る一文。
 UNINSTALL_RECHECK_NOTE = "止めたサービスは再開します。まだ何も変更していません"
+# RequireChronoGazerInstallExesUnlocked（service-hooks.nsh）の MessageBox。主案内の前に、止めたサービスの再開に
+# 失敗した警告が出ることがある。
+LOCKED_EXE_NOTICE_PREFIX = "使用中、または書き込めない実行ファイルがあります（"
+LOCKED_EXE_NOTICE_EXE = "chronogazer-elev.exe"
+LOCKED_EXE_NOTICE_NOTE = "上書きはまだ始めていません"
+RESUME_FAILED_PREFIX = "インストールを中止しましたが、その前に止めていた ChronoGazer サービスを再開できませんでした（"
+# 案内の表示中に状態が変わらないことを見続ける秒数。
+NOTICE_HOLD_SECONDS = 3.0
 # 1 秒おきの poll で Sleep は 89 回なので、spawn からの経過は 89 秒以上。上限は遅い runner の余裕。
 MIN_ELAPSED_SECONDS = 89.0
 MAX_ELAPSED_SECONDS = 200.0
@@ -71,6 +81,14 @@ def uninstall_recheck_question_matches(text: str) -> bool:
     return question_matches(text) and UNINSTALL_RECHECK_NOTE in text
 
 
+def locked_exe_notice_matches(text: str) -> bool:
+    return text.startswith(LOCKED_EXE_NOTICE_PREFIX + LOCKED_EXE_NOTICE_EXE + "）") and LOCKED_EXE_NOTICE_NOTE in text
+
+
+def resume_failed_warning_matches(text: str) -> bool:
+    return text.startswith(RESUME_FAILED_PREFIX)
+
+
 def elapsed_problems(elapsed: float) -> list[str]:
     """問いが出るまでの経過秒。下限より早ければ待っていない、上限より遅ければ別の理由で詰まっている。"""
     problems = []
@@ -103,6 +121,17 @@ def retry_cancel_buttons(children, control_id_of) -> dict:
         "retry": next(c for c in buttons if ids[c["hwnd"]] == IDRETRY),
         "cancel": next(c for c in buttons if ids[c["hwnd"]] == IDCANCEL),
     }
+
+
+def ok_button(children, control_id_of):
+    """visible な Button がちょうど 1 つで、control id が {IDOK, IDCANCEL}（MB_OK の OK は実際は IDCANCEL。§3）。(button, control_id)。"""
+    buttons = [c for c in children if c["class"].casefold() == "button" and c["visible"]]
+    if len(buttons) != 1:
+        raise VisibleFailure("ok_button_not_exact", {"count": len(buttons)})
+    control_id = int(control_id_of(buttons[0]["hwnd"]))
+    if control_id not in (IDOK, IDCANCEL):
+        raise VisibleFailure("ok_button_unexpected_id", {"id": control_id})
+    return buttons[0], control_id
 
 
 def owned_dialogs(windows, pid):
@@ -210,6 +239,16 @@ class _Driver:
             if time.monotonic() >= deadline:
                 raise VisibleFailure(f"dialog_did_not_close_after_{name}")
             time.sleep(POLL_SECONDS)
+
+    def check_notice(self, label: str, dialog, children, elapsed: float):
+        texts = static_texts(children)
+        button, control_id = ok_button(children, lambda h: self.api.u.GetDlgCtrlID(h))
+        self.record(f"{label}_texts", texts)
+        self.record(f"{label}_elapsed_seconds", round(elapsed, 1))
+        self.record(f"{label}_ok_control_id", control_id)
+        width, height, rgb = self.api.capture(dialog["rect"])
+        (self.proof_dir / f"{label}_notice.png").write_bytes(self.gui.png_bytes(width, height, rgb))
+        return button, control_id
 
     def _no_owned_dialog(self, when: str):
         windows = self.snapshot()
@@ -325,3 +364,26 @@ def drive_retry_continue(
     before_retry()
     d.press(dialog, buttons["retry"], IDRETRY, "retry")
     d.finish_after_retry()
+
+
+def drive_notices(child, started: float, proof_dir, record, notices, ready_to_close) -> None:
+    """child は /P で起動済みの setup。notices の (label, matches, on_shown, while_shown) を順に待って OK を押し、
+    最後に失敗の頁を閉じる。想定外の dialog が先に出れば await_question が失敗する（順序の確認）。"""
+    d = _Driver(child, proof_dir, record, lambda *_: None)
+    since = started
+    for label, matches, on_shown, while_shown in notices:
+        dialog, children, elapsed = d.await_question(since, matches=matches)
+        button, control_id = d.check_notice(label, dialog, children, elapsed)
+        on_shown(label, elapsed)
+        hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
+        while time.monotonic() < hold_until:
+            if not d.api.u.IsWindow(dialog["hwnd"]):
+                raise VisibleFailure(f"notice_closed_by_itself_{label}")
+            rc = child.poll()
+            if rc is not None:
+                raise VisibleFailure(f"setup_exited_while_notice_shown_{label}", {"exit": rc})
+            while_shown(label)
+            time.sleep(POLL_SECONDS)
+        since = time.monotonic()
+        d.press(dialog, button, control_id, "ok")
+    d.finish_after_cancel(ready_to_close=ready_to_close)

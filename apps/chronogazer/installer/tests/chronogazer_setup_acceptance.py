@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 6 つ以外はすべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 8 つ以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -21,15 +21,17 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   14d 最初の問いの [再試行] で続行して上書きまで通る道 /
   14e アンインストールの再確認の問い（uninstall.exe /P、サービス停止の後）の [キャンセル]（止めたサービスの再開） /
   14f 再確認の問いの [再試行] で続行して上書きまで通る道 /
-  14g アンインストールの再確認の問いの [再試行] で続行して実際に消す道（`_?=`。消した後は setup で入れ直す）
+  14g アンインストールの再確認の問いの [再試行] で続行して実際に消す道（`_?=`。消した後は setup で入れ直す） /
+  14h 使用中 exe で上書き前に中止する道の主 MessageBox（案内より先に再開、二重再開なし） /
+  14i 同じ中止で再開も失敗する道（再開失敗の警告が主 MessageBox より先、再開の試みは 1 回）
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 上の 6 つ以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
-（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 6 つ以外は silent なので MessageBox は未確認。
+対象外（このスクリプトは確かめない）: 上の 8 つ以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
+（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 8 つ以外は silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -1288,6 +1290,19 @@ def phase_install_service_install_fails_running(c: Ctx) -> None:
     _recover_by_setup(p, c)
 
 
+def _recover_after_corrupt_server(p: str, c: Ctx, old: Path) -> None:
+    # 復旧: サービスは止まっているので控えの旧 exe を消し、setup を再実行して正しい exe に戻す。
+    old.unlink()
+    rc = run_setup(c.setup, [], p, "recover")
+    expect(p, rc == 0, "recovery setup failed", rc)
+    expect_registered(f"{p}_recover", "STOPPED")  # 止まっていたので再開しない
+    _expect_exes_match_dist(p, c)
+    run(["sc", "start", SERVICE])
+    wait_state(SERVICE, "RUNNING")
+    obs(p, "recover_health", wait_healthy())
+    _expect_data_intact(p, c)
+
+
 def phase_restart_fails_corrupt_exe(c: Ctx) -> None:
     p = "14_restart_fails_corrupt_exe"
     # 中止の後の再開が失敗する道: サービスの exe が壊れていて起動できない。
@@ -1327,16 +1342,7 @@ def phase_restart_fails_corrupt_exe(c: Ctx) -> None:
     _expect_elev_still(p, tampered)
     _expect_data_intact(p, c)
     expect_no_shell(p)
-    # 復旧: サービスは止まっているので控えの旧 exe を消し、setup を再実行して正しい exe に戻す。
-    old.unlink()
-    rc = run_setup(c.setup, [], p, "recover")
-    expect(p, rc == 0, "recovery setup failed", rc)
-    expect_registered(f"{p}_recover", "STOPPED")  # 止まっていたので再開しない
-    _expect_exes_match_dist(p, c)
-    run(["sc", "start", SERVICE])
-    wait_state(SERVICE, "RUNNING")
-    obs(p, "recover_health", wait_healthy())
-    _expect_data_intact(p, c)
+    _recover_after_corrupt_server(p, c, old)
 
 
 def _stop_fake_shell(fake) -> str:
@@ -1799,6 +1805,170 @@ def phase_uninstall_delete_pending(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
+def phase_visible_locked_exe_abort(c: Ctx) -> None:
+    p = "14h_visible_locked_exe_abort"
+    # /P の setup を使用中の elev exe のロックの中で最後まで走らせる。上書き前の中止では、主 MessageBox より先に
+    # 止めたサービスを再開し（RequireChronoGazerInstallExesUnlocked）、.onInstFailed で二重に再開しない。
+    pid = _visible_preamble(p)
+    tampered = _tamper_elev(p, c)
+    before = tree_snapshot(INSTDIR)
+    child = None
+    resumed = {}
+    try:
+        with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+
+            def on_shown(label: str, elapsed: float) -> None:
+                st = sc_state()
+                obs(p, f"{label}_service", st)
+                expect(
+                    p,
+                    st["state"] == "RUNNING" and bool(st["pid"]) and st["pid"] != pid,
+                    "service not resumed before the locked-exe notice",
+                    st,
+                )
+                resumed["pid"] = st["pid"]
+                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the locked-exe notice is shown")
+
+            def while_shown(label: str) -> None:
+                st = sc_state()
+                expect(
+                    p,
+                    st["state"] == "RUNNING" and st["pid"] == resumed.get("pid"),
+                    "service changed while the locked-exe notice is shown",
+                    st,
+                )
+
+            def ready_to_close() -> bool:
+                st = sc_state()
+                return st["state"] == "RUNNING" and st["pid"] == resumed.get("pid")
+
+            child = subprocess.Popen([str(c.setup), "/P"])
+            started = time.monotonic()
+            notices = [("locked_exe", vis.locked_exe_notice_matches, on_shown, while_shown)]
+            try:
+                vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            try:
+                rc = child.wait(timeout=30)
+            except subprocess.TimeoutExpired as e:
+                raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+            obs(p, "setup_exit", rc)
+            expect(p, rc != 0, "aborted setup must exit non-zero", rc)
+            st = sc_state()
+            obs(p, "service_after", st)
+            expect(
+                p,
+                st["state"] == "RUNNING" and st["pid"] == resumed.get("pid"),
+                "service was restarted again after the resume (.onInstFailed)",
+                st,
+            )
+            obs(p, "health_after", wait_healthy())
+            st = sc_state()
+            expect(p, st["state"] == "RUNNING" and st["pid"] == resumed.get("pid"), "service pid changed after health check", st)
+            expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
+            _expect_elev_still(p, tampered)
+            expect_registered(p, "RUNNING")
+            _expect_not_delete_pending(p)
+            _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, None)
+    expect_no_shell(p)
+    _recover_by_setup(p, c)
+
+
+def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
+    p = "14i_visible_locked_exe_restart_fails"
+    # 14h と同じ中止で、止めたサービスの再開が失敗する道（サービスの exe が壊れている）。再開の失敗の警告が
+    # 主 MessageBox より先に出る。再開の試みは 1 回だけで、.onInstFailed が再度試みない。
+    _visible_preamble(p)
+    tampered = _tamper_elev(p, c)
+    set_service_marker()
+    expect(p, service_marker_present(), "could not set the service marker")
+    server = INSTDIR / SERVER_EXE
+    old = INSTDIR / "chronogazer-server.banto973-old"
+    os.rename(server, old)
+    server.write_bytes(CORRUPT_SERVER)
+    failures_before = service_start_failure_count()
+    obs(p, "start_failures_before", failures_before)
+    before = tree_snapshot(INSTDIR)
+    child = None
+    try:
+        with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+
+            def stopped(what: str) -> dict:
+                st = sc_state()
+                expect(p, st["state"] == "STOPPED", f"service not STOPPED {what}", st)
+                return st
+
+            def warning_shown(label: str, elapsed: float) -> None:
+                reached = wait_until(lambda: service_start_failure_count() >= failures_before + 1, 30)
+                expect(p, bool(reached), "no service start failure was logged before the warning", service_start_failure_count())
+                st = stopped("while the resume-failed warning is shown")
+                obs(p, f"{label}_service", st)
+                obs(p, f"{label}_start_failures", service_start_failure_count())
+                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the resume-failed warning is shown")
+
+            def notice_shown(label: str, elapsed: float) -> None:
+                st = stopped("while the locked-exe notice is shown")
+                count = service_start_failure_count()
+                obs(p, f"{label}_service", st)
+                obs(p, f"{label}_start_failures", count)
+                expect(
+                    p,
+                    count == failures_before + 1,
+                    "the resume must be attempted exactly once",
+                    {"before": failures_before, "now": count},
+                )
+
+            def while_shown(label: str) -> None:
+                stopped(f"while the {label} notice is shown")
+
+            def ready_to_close() -> bool:
+                return sc_state()["state"] == "STOPPED"
+
+            child = subprocess.Popen([str(c.setup), "/P"])
+            started = time.monotonic()
+            notices = [
+                ("resume_failed", vis.resume_failed_warning_matches, warning_shown, while_shown),
+                ("locked_exe_after_resume_failed", vis.locked_exe_notice_matches, notice_shown, while_shown),
+            ]
+            try:
+                vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            try:
+                rc = child.wait(timeout=30)
+            except subprocess.TimeoutExpired as e:
+                raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+            obs(p, "setup_exit", rc)
+            expect(p, rc != 0, "aborted setup must exit non-zero", rc)
+            time.sleep(3)  # .onInstFailed が再度試みないことを見る
+            failures_after = service_start_failure_count()
+            obs(p, "start_failures_after", failures_after)
+            expect(
+                p,
+                failures_after == failures_before + 1,
+                "the resume must be attempted exactly once",
+                {"before": failures_before, "after": failures_after},
+            )
+            st = sc_state()
+            obs(p, "service_state_after", st)
+            expect(p, st["state"] == "STOPPED", f"{SERVICE} not STOPPED after the failed resume", st)
+            expect_registered(p, "STOPPED")
+            marker = service_marker_present()
+            obs(p, "marker_after", marker)
+            expect(p, marker, "service registration was recreated")
+            expect(p, server.read_bytes() == CORRUPT_SERVER, "corrupt server exe was overwritten despite the abort")
+            expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
+            _expect_elev_still(p, tampered)
+            _expect_data_intact(p, c)
+    finally:
+        _cleanup_visible(p, child, None)
+    expect_no_shell(p)
+    _recover_after_corrupt_server(p, c, old)
+
+
 PHASES = (
     phase_reject,
     phase_fresh,
@@ -1820,6 +1990,8 @@ PHASES = (
     phase_visible_uninstall_recheck_cancel,
     phase_visible_recheck_retry_continues,
     phase_visible_uninstall_recheck_retry_continues,
+    phase_visible_locked_exe_abort,
+    phase_visible_locked_exe_restart_fails,
     phase_uninstall_delete_pending,
 )
 
