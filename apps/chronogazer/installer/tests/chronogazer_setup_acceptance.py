@@ -1931,7 +1931,7 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
             started = time.monotonic()
             notices = [
                 ("resume_failed", vis.resume_failed_warning_matches, warning_shown, while_shown),
-                ("locked_exe", vis.locked_exe_notice_matches, notice_shown, while_shown),
+                ("locked_exe_after_resume_failed", vis.locked_exe_notice_matches, notice_shown, while_shown),
             ]
             try:
                 vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
