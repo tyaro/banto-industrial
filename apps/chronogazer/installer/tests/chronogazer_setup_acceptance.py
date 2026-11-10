@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 3 つ以外はすべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 4 つ以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -18,16 +18,17 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   15 DeleteFlag 保留（拒否、解消、完了まで）
 可視 UI（setup を /P で実画面に出す）: 14b シェル 90 秒の最初の問いの [再試行]→[キャンセル] /
   14c 再確認の問い（サービス停止の後）の [キャンセル]（止めたサービスの再開） /
-  14d 最初の問いの [再試行] で続行して上書きまで通る道
+  14d 最初の問いの [再試行] で続行して上書きまで通る道 /
+  14e アンインストールの再確認の問い（uninstall.exe /P、サービス停止の後）の [キャンセル]（止めたサービスの再開）
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 上の 3 つ以外の可視 UI（アンインストールの再確認・WebView2 の後始末・
+対象外（このスクリプトは確かめない）: 上の 4 つ以外の可視 UI（WebView2 の後始末・
 再確認の [再試行]）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
-（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 3 つ以外は silent なので MessageBox は未確認。
+（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 4 つ以外は silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -283,9 +284,9 @@ def sddl_with_deny(sddl: str, right: str) -> str:
     return sddl[: m.end()] + f"(D;;{right};;;BA)" + sddl[m.end() :]
 
 
-def uninstall_in_place_command(instdir) -> str:
+def uninstall_in_place_command(instdir, mode_flag: str = "/S") -> str:
     """`_?=` 付きでその場で走らせる呼び方。`_?=` は最後の引数でクォートしない（NSIS の規則）ので文字列で渡す。"""
-    return f'"{instdir}\\uninstall.exe" /S _?={instdir}'
+    return f'"{instdir}\\uninstall.exe" {mode_flag} _?={instdir}'
 
 
 def count_service_start_failures(returncode: int, stdout: str, stderr: str, needle: str = "chronogazer") -> int:
@@ -1466,11 +1467,10 @@ def phase_visible_shell_quit_cancel(c: Ctx) -> None:
     _recover_by_setup(p, c)
 
 
-def phase_visible_recheck_cancel(c: Ctx) -> None:
-    p = "14c_visible_recheck_cancel"
-    # 偽シェルは最初は置かない。/P の setup がサービスを止めた瞬間に偽シェルを出すと、事前確認の
-    # 2 回は通り、上書き直前の再確認（QuitShellForUpdate(1)）だけが問う。[キャンセル] で
-    # 止めたサービスが再開され、ファイルは変わらず、偽シェルも強制終了されない。
+def _run_visible_recheck_cancel(p: str, c: Ctx, command, matches, expect_after) -> None:
+    """14c と 14e の共通本体。command は Popen へそのまま渡す。偽シェルは最初は置かず、サービスが止まった
+    瞬間に出す（事前確認の 2 回は通り、再確認だけが問う）。[キャンセル] で止めたサービスが再開され、
+    ファイルは変わらず、偽シェルも強制終了されない。expect_after(before) は終了後のフェーズ固有の確認。"""
     pid = _visible_preamble(p)
     before = tree_snapshot(INSTDIR)
     fake_exe = _prepare_fake_shell(p)
@@ -1494,10 +1494,12 @@ def phase_visible_recheck_cancel(c: Ctx) -> None:
                 return True
             return False
 
-        child = subprocess.Popen([str(c.setup), "/P"])
+        child = subprocess.Popen(command)
         fake, fake_started = _spawn_fake_when_service_stops(p, child, fake_exe)
         try:
-            vis.drive_recheck_cancel(child, fake_started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, service_resumed)
+            vis.drive_recheck_cancel(
+                child, fake_started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, service_resumed, matches=matches
+            )
         except vis.VisibleFailure as e:
             raise PhaseFailure(p, e.reason, e.observation) from e
         try:
@@ -1517,11 +1519,36 @@ def phase_visible_recheck_cancel(c: Ctx) -> None:
         obs(p, "health_after", wait_healthy())
         expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the cancelled setup")
         expect(p, fake.poll() is None and process_running(SHELL_EXE), "fake shell was killed by the setup")
-        _expect_data_intact(p, c)
+        expect_after(before)
     finally:
         _cleanup_visible(p, child, fake)
     expect_no_shell(p)
+
+
+def phase_visible_recheck_cancel(c: Ctx) -> None:
+    p = "14c_visible_recheck_cancel"
+    # 再確認（上書き直前、QuitShellForUpdate(1)）の [キャンセル]。
     # 次のフェーズが上書きを通すので _recover_by_setup は呼ばない。
+    _run_visible_recheck_cancel(
+        p, c, [str(c.setup), "/P"], vis.recheck_question_matches, lambda before: _expect_data_intact(p, c)
+    )
+
+
+def phase_visible_uninstall_recheck_cancel(c: Ctx) -> None:
+    p = "14e_visible_uninstall_recheck_cancel"
+    # uninstall.exe /P（_?= でその場。/S は付けない）。PREUNINSTALL がサービスを止めた後の再確認
+    # （QuitShellForUpdate "アンインストール" 1）の [キャンセル] で、止めたサービスが再開され Abort する。
+    # 登録解除とファイル削除はその後なので何も変わらない（問いの表示中の STOPPED は登録が残る確認も兼ねる）。
+    # 何も変えていないので _recover_by_setup は呼ばない。
+
+    def expect_after(before: dict) -> None:
+        _expect_still_installed(p, c, before)
+        expect_registered(p, "RUNNING")
+        _expect_not_delete_pending(p)
+
+    _run_visible_recheck_cancel(
+        p, c, uninstall_in_place_command(INSTDIR, "/P"), vis.uninstall_recheck_question_matches, expect_after
+    )
 
 
 def phase_visible_retry_continues(c: Ctx) -> None:
@@ -1649,6 +1676,7 @@ PHASES = (
     phase_visible_shell_quit_cancel,
     phase_visible_recheck_cancel,
     phase_visible_retry_continues,
+    phase_visible_uninstall_recheck_cancel,
     phase_uninstall_delete_pending,
 )
 

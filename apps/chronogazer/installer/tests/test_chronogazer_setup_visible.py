@@ -62,6 +62,34 @@ class RecheckMatchTests(unittest.TestCase):
         self.assertEqual(found[0]["hwnd"], 2)
 
 
+UNINSTALL_RECHECK = v.QUESTION_PREFIX + "[キャンセル] でアンインストールを中止します。止めたサービスは再開します。まだ何も変更していません"
+UNINSTALL_FIRST = v.QUESTION_PREFIX + "[キャンセル] でアンインストールを中止します（強制終了はしません。まだ何も変更していません）"
+
+
+class UninstallRecheckMatchTests(unittest.TestCase):
+    def test_matches_table(self):
+        self.assertTrue(v.uninstall_recheck_question_matches(UNINSTALL_RECHECK))
+        self.assertFalse(v.uninstall_recheck_question_matches(RECHECK))
+        self.assertFalse(v.uninstall_recheck_question_matches(UNINSTALL_FIRST))
+        self.assertFalse(v.uninstall_recheck_question_matches(v.UNINSTALL_RECHECK_NOTE))
+
+    def test_first_question_is_unexpected(self):
+        found, unexpected = v.judge_dialogs(
+            [window(2)], lambda h: [child("Static", UNINSTALL_FIRST)], PID, matches=v.uninstall_recheck_question_matches
+        )
+        self.assertIsNone(found)
+        self.assertEqual(unexpected[0]["texts"], [UNINSTALL_FIRST])
+
+    def test_drive_recheck_cancel_passes_matches(self):
+        with mock.patch.object(v, "_Driver") as drv:
+            drv.return_value.await_question.return_value = ("dlg", [], 1.0)
+            v.drive_recheck_cancel(None, 0.0, None, None, None, None, matches=v.uninstall_recheck_question_matches)
+            drv.return_value.await_question.assert_called_once_with(0.0, matches=v.uninstall_recheck_question_matches)
+            drv.reset_mock()
+            v.drive_recheck_cancel(None, 0.0, None, None, None, None)
+            drv.return_value.await_question.assert_called_once_with(0.0, matches=v.recheck_question_matches)
+
+
 class FakeChild:
     """poll() は exit_at 秒後に 0 を返す。forced_rc を入れるとその値で終わる。"""
 
