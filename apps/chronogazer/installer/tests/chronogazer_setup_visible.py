@@ -17,7 +17,8 @@ MB_RETRYCANCEL で問う。このモジュールが押すのは次の 6 通り:
 - アンインストールの再確認の問いの [再試行]（偽シェルを止めてから）で最後まで消す道。同じ
   `drive_retry_continue` に `matches=uninstall_recheck_question_matches` を渡す。
 上の問いとは別に、使用中 exe で上書き前に中止する道の MB_OK の案内も確かめる（`drive_notices`。再開失敗の
-警告が主案内より先に出る道を含む。偽シェルは使わない）。
+警告が主案内より先に出る道を含む。偽シェルは使わない）。ACL の段階（INSTDIR 直下のサブフォルダ）で中止する
+道の案内も同じ `drive_notices` で確かめる（`acl_refused_notice_matches`）。
 WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
@@ -45,6 +46,15 @@ LOCKED_EXE_NOTICE_PREFIX = "使用中、または書き込めない実行ファ�
 LOCKED_EXE_NOTICE_EXE = "chronogazer-elev.exe"
 LOCKED_EXE_NOTICE_NOTE = "上書きはまだ始めていません"
 RESUME_FAILED_PREFIX = "インストールを中止しましたが、その前に止めていた ChronoGazer サービスを再開できませんでした（"
+# install-dir-common.nsh の AbortInstallDirAcl の MessageBox。INSTDIR 直下のサブフォルダで ACL の段階を中止する
+# ときの本文（理由の文は共通、止めたサービスの一文は service-hooks.nsh の INSTALL_DIR_COMMON_ACL_ABORT_NOTE）。
+ACL_REFUSED_NOTICE_PREFIX = "インストール先 "
+ACL_REFUSED_NOTICE_HEAD = "の所有者・アクセス権を既定に戻せませんでした。"
+ACL_REFUSED_NOTICE_REASON = "インストール先の中にサブフォルダがあります。"
+# 受入が INSTDIR 直下に作るサブフォルダ名（acceptance.py もこれを使う。本文の `対象:` の行に出る）。
+ACL_REFUSED_SUBDIR = "banto-973-subdir"
+ACL_REFUSED_NOTICE_NOTE = "ファイルはまだ変更していません。"
+ACL_REFUSED_NOTICE_RESUME = "上書き前に停止したサービスがあれば再開を試みました。"
 # 案内の表示中に状態が変わらないことを見続ける秒数。
 NOTICE_HOLD_SECONDS = 3.0
 # 1 秒おきの poll で Sleep は 89 回なので、spawn からの経過は 89 秒以上。上限は遅い runner の余裕。
@@ -87,6 +97,17 @@ def locked_exe_notice_matches(text: str) -> bool:
 
 def resume_failed_warning_matches(text: str) -> bool:
     return text.startswith(RESUME_FAILED_PREFIX)
+
+
+def acl_refused_notice_matches(text: str) -> bool:
+    return (
+        text.startswith(ACL_REFUSED_NOTICE_PREFIX)
+        and ACL_REFUSED_NOTICE_HEAD in text
+        and ACL_REFUSED_NOTICE_REASON in text
+        and ACL_REFUSED_SUBDIR in text
+        and ACL_REFUSED_NOTICE_NOTE in text
+        and ACL_REFUSED_NOTICE_RESUME in text
+    )
 
 
 def elapsed_problems(elapsed: float) -> list[str]:

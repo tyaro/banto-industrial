@@ -23,7 +23,9 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   14f 再確認の問いの [再試行] で続行して上書きまで通る道 /
   14g アンインストールの再確認の問いの [再試行] で続行して実際に消す道（`_?=`。消した後は setup で入れ直す） /
   14h 使用中 exe で上書き前に中止する道の主 MessageBox（案内より先に再開、二重再開なし） /
-  14i 同じ中止で再開も失敗する道（再開失敗の警告が主 MessageBox より先、再開の試みは 1 回）
+  14i 同じ中止で再開も失敗する道（再開失敗の警告が主 MessageBox より先、再開の試みは 1 回） /
+  14j ACL の段階（INSTDIR 直下のサブフォルダ）で中止する道の主 MessageBox（14h と同じ順序） /
+  14k 同じ ACL の中止で再開も失敗する道（14i と同じ順序）
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
@@ -1805,36 +1807,51 @@ def phase_uninstall_delete_pending(c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
-def phase_visible_locked_exe_abort(c: Ctx) -> None:
-    p = "14h_visible_locked_exe_abort"
-    # /P の setup を使用中の elev exe のロックの中で最後まで走らせる。上書き前の中止では、主 MessageBox より先に
-    # 止めたサービスを再開し（RequireChronoGazerInstallExesUnlocked）、.onInstFailed で二重に再開しない。
+class SubdirInInstdir:
+    """INSTDIR 直下にサブフォルダを作る（ChronoGazer の ACL の段階の中止の原因。中に keep.txt を置く）。
+    抜けるときに消すので、後の復旧の setup が同じ理由で失敗しない。"""
+
+    def __init__(self, instdir: Path = None):
+        self.path = (instdir or INSTDIR) / vis.ACL_REFUSED_SUBDIR
+
+    def __enter__(self):
+        self.path.mkdir()
+        (self.path / "keep.txt").write_text("keep", encoding="utf-8")
+        return self
+
+    def __exit__(self, *exc):
+        shutil.rmtree(self.path, ignore_errors=True)
+
+
+def _visible_abort_with_resume(p: str, c: Ctx, abort_ctx, label: str, matches, what: str) -> None:
+    # /P の setup を、中止の原因（abort_ctx）の中で最後まで走らせる。上書き前の中止では、主 MessageBox より先に
+    # 止めたサービスを再開し、.onInstFailed で二重に再開しない。14h（使用中 exe）と 14j（サブフォルダ）が共有する。
     pid = _visible_preamble(p)
     tampered = _tamper_elev(p, c)
-    before = tree_snapshot(INSTDIR)
     child = None
     resumed = {}
     try:
-        with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+        with abort_ctx:
+            before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
 
-            def on_shown(label: str, elapsed: float) -> None:
+            def on_shown(lbl: str, elapsed: float) -> None:
                 st = sc_state()
-                obs(p, f"{label}_service", st)
+                obs(p, f"{lbl}_service", st)
                 expect(
                     p,
                     st["state"] == "RUNNING" and bool(st["pid"]) and st["pid"] != pid,
-                    "service not resumed before the locked-exe notice",
+                    f"service not resumed before the {what} notice",
                     st,
                 )
                 resumed["pid"] = st["pid"]
-                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the locked-exe notice is shown")
+                expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {what} notice is shown")
 
-            def while_shown(label: str) -> None:
+            def while_shown(lbl: str) -> None:
                 st = sc_state()
                 expect(
                     p,
                     st["state"] == "RUNNING" and st["pid"] == resumed.get("pid"),
-                    "service changed while the locked-exe notice is shown",
+                    f"service changed while the {what} notice is shown",
                     st,
                 )
 
@@ -1844,7 +1861,7 @@ def phase_visible_locked_exe_abort(c: Ctx) -> None:
 
             child = subprocess.Popen([str(c.setup), "/P"])
             started = time.monotonic()
-            notices = [("locked_exe", vis.locked_exe_notice_matches, on_shown, while_shown)]
+            notices = [(label, matches, on_shown, while_shown)]
             try:
                 vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
             except vis.VisibleFailure as e:
@@ -1874,13 +1891,33 @@ def phase_visible_locked_exe_abort(c: Ctx) -> None:
     finally:
         _cleanup_visible(p, child, None)
     expect_no_shell(p)
+
+
+def phase_visible_locked_exe_abort(c: Ctx) -> None:
+    p = "14h_visible_locked_exe_abort"
+    # /P の setup を使用中の elev exe のロックの中で最後まで走らせる。上書き前の中止では、主 MessageBox より先に
+    # 止めたサービスを再開し（RequireChronoGazerInstallExesUnlocked）、.onInstFailed で二重に再開しない。
+    _visible_abort_with_resume(
+        p, c, ExclusiveFileLock(INSTDIR / ELEV_EXE), "locked_exe", vis.locked_exe_notice_matches, "locked-exe"
+    )
     _recover_by_setup(p, c)
 
 
-def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
-    p = "14i_visible_locked_exe_restart_fails"
-    # 14h と同じ中止で、止めたサービスの再開が失敗する道（サービスの exe が壊れている）。再開の失敗の警告が
-    # 主 MessageBox より先に出る。再開の試みは 1 回だけで、.onInstFailed が再度試みない。
+def phase_visible_acl_refused_abort(c: Ctx) -> None:
+    p = "14j_visible_acl_refused_abort"
+    # 14h と同じ流れで、中止の原因だけを INSTDIR 直下のサブフォルダにする。ACL の段階の中止では
+    # INSTALL_DIR_COMMON_ON_ACL_ABORT が主 MessageBox より先に止めたサービスを再開する（AbortInstallDirAcl）。
+    sub = SubdirInInstdir()
+    _visible_abort_with_resume(p, c, sub, "acl_refused", vis.acl_refused_notice_matches, "ACL-refused")
+    expect(p, not sub.path.exists(), "the test subfolder was not removed")  # 残ると復旧の setup が同じ理由で失敗する
+    _recover_by_setup(p, c)
+
+
+def _visible_abort_restart_fails(
+    p: str, c: Ctx, abort_ctx, warning_label: str, notice_label: str, matches, what: str
+) -> Path:
+    # 14h/14j と同じ中止で、止めたサービスの再開が失敗する道（サービスの exe が壊れている）。再開の失敗の警告が
+    # 主 MessageBox より先に出る。再開の試みは 1 回だけで、.onInstFailed が再度試みない。戻り値は復旧用の元 exe。
     _visible_preamble(p)
     tampered = _tamper_elev(p, c)
     set_service_marker()
@@ -1891,14 +1928,14 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
     server.write_bytes(CORRUPT_SERVER)
     failures_before = service_start_failure_count()
     obs(p, "start_failures_before", failures_before)
-    before = tree_snapshot(INSTDIR)
     child = None
     try:
-        with ExclusiveFileLock(INSTDIR / ELEV_EXE):
+        with abort_ctx:
+            before = tree_snapshot(INSTDIR)  # 原因（サブフォルダ）を作った後の姿
 
-            def stopped(what: str) -> dict:
+            def stopped(when: str) -> dict:
                 st = sc_state()
-                expect(p, st["state"] == "STOPPED", f"service not STOPPED {what}", st)
+                expect(p, st["state"] == "STOPPED", f"service not STOPPED {when}", st)
                 return st
 
             def warning_shown(label: str, elapsed: float) -> None:
@@ -1910,7 +1947,7 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
                 expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the resume-failed warning is shown")
 
             def notice_shown(label: str, elapsed: float) -> None:
-                st = stopped("while the locked-exe notice is shown")
+                st = stopped(f"while the {what} notice is shown")
                 count = service_start_failure_count()
                 obs(p, f"{label}_service", st)
                 obs(p, f"{label}_start_failures", count)
@@ -1930,8 +1967,8 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
             child = subprocess.Popen([str(c.setup), "/P"])
             started = time.monotonic()
             notices = [
-                ("resume_failed", vis.resume_failed_warning_matches, warning_shown, while_shown),
-                ("locked_exe_after_resume_failed", vis.locked_exe_notice_matches, notice_shown, while_shown),
+                (warning_label, vis.resume_failed_warning_matches, warning_shown, while_shown),
+                (notice_label, matches, notice_shown, while_shown),
             ]
             try:
                 vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
@@ -1966,6 +2003,38 @@ def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
     finally:
         _cleanup_visible(p, child, None)
     expect_no_shell(p)
+    return old
+
+
+def phase_visible_locked_exe_restart_fails(c: Ctx) -> None:
+    p = "14i_visible_locked_exe_restart_fails"
+    old = _visible_abort_restart_fails(
+        p,
+        c,
+        ExclusiveFileLock(INSTDIR / ELEV_EXE),
+        "resume_failed",
+        "locked_exe_after_resume_failed",
+        vis.locked_exe_notice_matches,
+        "locked-exe",
+    )
+    _recover_after_corrupt_server(p, c, old)
+
+
+def phase_visible_acl_refused_restart_fails(c: Ctx) -> None:
+    p = "14k_visible_acl_refused_restart_fails"
+    # 14i と同じ流れで、中止の原因を INSTDIR 直下のサブフォルダにする。ACL の段階の中止でも再開の失敗の警告が
+    # 主 MessageBox より先に出て、再開の試みは 1 回だけ。
+    sub = SubdirInInstdir()
+    old = _visible_abort_restart_fails(
+        p,
+        c,
+        sub,
+        "resume_failed_before_acl",
+        "acl_refused_after_resume_failed",
+        vis.acl_refused_notice_matches,
+        "ACL-refused",
+    )
+    expect(p, not sub.path.exists(), "the test subfolder was not removed")  # 残ると復旧の setup が同じ理由で失敗する
     _recover_after_corrupt_server(p, c, old)
 
 
@@ -1992,6 +2061,8 @@ PHASES = (
     phase_visible_uninstall_recheck_retry_continues,
     phase_visible_locked_exe_abort,
     phase_visible_locked_exe_restart_fails,
+    phase_visible_acl_refused_abort,
+    phase_visible_acl_refused_restart_fails,
     phase_uninstall_delete_pending,
 )
 
