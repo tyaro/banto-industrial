@@ -300,12 +300,12 @@ def drive_shell_quit_cancel(child, started: float, proof_dir, record, on_questio
 
 
 def drive_recheck_cancel(
-    child, fake_started: float, proof_dir, record, on_question, service_resumed, matches=recheck_question_matches
+    child, fake_started: float, proof_dir, record, on_question, service_resumed, matches=recheck_question_matches, label="recheck"
 ) -> None:
     """child は /P で起動済みの setup（アンインストールなら uninstall.exe /P）。再確認の問いで [キャンセル] を押し、サービスの再開を見てから頁を閉じる。"""
     d = _Driver(child, proof_dir, record, on_question)
     dialog, children, elapsed = d.await_question(fake_started, matches=matches)
-    buttons = d.check_question("recheck", dialog, children, elapsed)
+    buttons = d.check_question(label, dialog, children, elapsed)
     d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
     d.finish_after_cancel(ready_to_close=service_resumed)
 

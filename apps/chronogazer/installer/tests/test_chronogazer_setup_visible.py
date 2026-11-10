@@ -62,8 +62,8 @@ class RecheckMatchTests(unittest.TestCase):
         self.assertEqual(found[0]["hwnd"], 2)
 
 
-UNINSTALL_RECHECK = v.QUESTION_PREFIX + "[キャンセル] でアンインストールを中止します。止めたサービスは再開します。まだ何も変更していません"
-UNINSTALL_FIRST = v.QUESTION_PREFIX + "[キャンセル] でアンインストールを中止します（強制終了はしません。まだ何も変更していません）"
+UNINSTALL_RECHECK = v.QUESTION_PREFIX + "\r\n\r\nタスクトレイの ChronoGazer から「終了」を選び（後始末の知らせの窓が出ていれば OK を押し）、終了してから [再試行] を押してください（もう 90 秒待ちます）。\r\n[キャンセル] でアンインストールを中止します（強制終了はしません。止めたサービスは再開します。まだ何も変更していません）。"
+UNINSTALL_FIRST = v.QUESTION_PREFIX + "\r\n\r\nタスクトレイの ChronoGazer から「終了」を選び（後始末の知らせの窓が出ていれば OK を押し）、終了してから [再試行] を押してください（もう 90 秒待ちます）。\r\n[キャンセル] でアンインストールを中止します（強制終了はしません。まだ何も変更していません）。"
 
 
 class UninstallRecheckMatchTests(unittest.TestCase):
@@ -88,6 +88,10 @@ class UninstallRecheckMatchTests(unittest.TestCase):
             drv.reset_mock()
             v.drive_recheck_cancel(None, 0.0, None, None, None, None)
             drv.return_value.await_question.assert_called_once_with(0.0, matches=v.recheck_question_matches)
+            self.assertEqual(drv.return_value.check_question.call_args.args[0], "recheck")
+            drv.reset_mock()
+            v.drive_recheck_cancel(None, 0.0, None, None, None, None, label="uninstall_recheck")
+            self.assertEqual(drv.return_value.check_question.call_args.args[0], "uninstall_recheck")
 
 
 class FakeChild:

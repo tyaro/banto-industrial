@@ -1467,7 +1467,7 @@ def phase_visible_shell_quit_cancel(c: Ctx) -> None:
     _recover_by_setup(p, c)
 
 
-def _run_visible_recheck_cancel(p: str, c: Ctx, command, matches, expect_after) -> None:
+def _run_visible_recheck_cancel(p: str, c: Ctx, command, matches, expect_after, label: str = "recheck") -> None:
     """14c と 14e の共通本体。command は Popen へそのまま渡す。偽シェルは最初は置かず、サービスが止まった
     瞬間に出す（事前確認の 2 回は通り、再確認だけが問う）。[キャンセル] で止めたサービスが再開され、
     ファイルは変わらず、偽シェルも強制終了されない。expect_after(before) は終了後のフェーズ固有の確認。"""
@@ -1498,7 +1498,7 @@ def _run_visible_recheck_cancel(p: str, c: Ctx, command, matches, expect_after) 
         fake, fake_started = _spawn_fake_when_service_stops(p, child, fake_exe)
         try:
             vis.drive_recheck_cancel(
-                child, fake_started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, service_resumed, matches=matches
+                child, fake_started, PROOF_DIR, lambda k, v: obs(p, k, v), on_question, service_resumed, matches=matches, label=label
             )
         except vis.VisibleFailure as e:
             raise PhaseFailure(p, e.reason, e.observation) from e
@@ -1547,7 +1547,7 @@ def phase_visible_uninstall_recheck_cancel(c: Ctx) -> None:
         _expect_not_delete_pending(p)
 
     _run_visible_recheck_cancel(
-        p, c, uninstall_in_place_command(INSTDIR, "/P"), vis.uninstall_recheck_question_matches, expect_after
+        p, c, uninstall_in_place_command(INSTDIR, "/P"), vis.uninstall_recheck_question_matches, expect_after, label="uninstall_recheck"
     )
 
 
