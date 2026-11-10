@@ -281,7 +281,7 @@ class _Driver:
             raise VisibleFailure("main_window_not_closed_after_resume")
 
     def finish_after_retry(self):
-        """[再試行] の後: 上書きが通って setup が自分で終わるまで、他の dialog が出ないことを見る。"""
+        """[再試行] の後: 上書きまたはアンインストールが通って自分で終わるまで、他の dialog が出ないことを見る。"""
         deadline = time.monotonic() + INSTALL_FINISH_LIMIT_SECONDS
         while self.child.poll() is None:
             if time.monotonic() >= deadline:

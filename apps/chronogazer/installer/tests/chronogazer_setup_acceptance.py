@@ -1684,6 +1684,8 @@ def phase_visible_uninstall_recheck_retry_continues(c: Ctx) -> None:
     fake = None
     child = None
     before = tree_snapshot(INSTDIR)
+    reg_before = uninstall_registration()
+    expect(p, bool(reg_before), "Apps registration missing before the uninstall", reg_before)
     try:
 
         def on_question(label: str, elapsed: float) -> None:
@@ -1692,7 +1694,7 @@ def phase_visible_uninstall_recheck_retry_continues(c: Ctx) -> None:
             expect(p, st["state"] == "STOPPED", f"service not stopped while the {label} question is shown", st)
             expect(p, tree_snapshot(INSTDIR) == before, f"INSTDIR changed while the {label} question is shown")
             expect(p, fake.poll() is None and process_running(SHELL_EXE), f"fake shell gone during the {label} question")
-            expect(p, bool(uninstall_registration()), f"Apps registration gone while the {label} question is shown")
+            expect(p, uninstall_registration() == reg_before, f"Apps registration changed while the {label} question is shown")
 
         def before_retry() -> None:
             obs(p, "stop_fake_shell", _stop_fake_shell(fake))
@@ -1722,6 +1724,8 @@ def phase_visible_uninstall_recheck_retry_continues(c: Ctx) -> None:
         obs(p, "uninstall_exit", rc)
         expect(p, rc == 0, "retried uninstall must succeed", rc)
         _wait_uninstall_done(p, files=EXES)
+        obs(p, "apps_registration_after_uninstall", uninstall_registration())
+        obs(p, "instdir_left_after_uninstall", sorted(e.name for e in INSTDIR.iterdir()) if INSTDIR.exists() else [])
         obs(p, "uninstaller_left_by_in_place_run", (INSTDIR / "uninstall.exe").exists())
         expect(p, DB_PATH.is_file(), "sqlite was removed")
         _expect_data_intact(p, c)
@@ -1739,6 +1743,7 @@ def phase_visible_uninstall_recheck_retry_continues(c: Ctx) -> None:
     run(["sc", "start", SERVICE])
     wait_state(SERVICE, "RUNNING")
     obs(p, "health", wait_healthy())
+    _expect_exes_match_dist(p, c)
     _expect_data_intact(p, c)
 
 
