@@ -261,11 +261,24 @@ class FaultHelperTests(unittest.TestCase):
             self.assertEqual(len(c.tree_snapshot(d)), 1)
 
 
+class ServiceLeftRunningTests(unittest.TestCase):
+    def test_table(self):
+        self.assertFalse(c.service_left_running({"exit": 0, "state": "RUNNING", "pid": 1}))
+        self.assertTrue(c.service_left_running({"exit": 0, "state": "STOPPED", "pid": 0}))
+        self.assertTrue(c.service_left_running({"exit": 0, "state": "STOP_PENDING", "pid": 5}))
+
+    def test_unusable_sc_result_raises(self):
+        bad = ({"exit": 1060, "state": None}, {"exit": 1, "state": "RUNNING"}, {"exit": 0, "state": None}, {"exit": 0, "state": ""}, {})
+        for st in bad:
+            with self.assertRaises(RuntimeError, msg=st):
+                c.service_left_running(st)
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 16)
+        self.assertEqual(len(c.PHASES), 18)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -285,6 +298,8 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_install_service_install_fails_running",
                 "phase_restart_fails_corrupt_exe",
                 "phase_visible_shell_quit_cancel",
+                "phase_visible_recheck_cancel",
+                "phase_visible_retry_continues",
                 "phase_uninstall_delete_pending",
             ],
         )

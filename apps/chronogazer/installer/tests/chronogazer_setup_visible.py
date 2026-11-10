@@ -2,10 +2,14 @@
 
 chronogazer.exe という名前の終わらないプロセス（偽シェル）を置いておくと、setup は
 `QuitShellForUpdate`（service-hooks.nsh）で最大 90 秒待った後、強制終了せずに
-MB_RETRYCANCEL で問う。このモジュールは、その最初の問い（Section WebView2 先頭の事前確認。
-サービスは止まっておらずファイルも変わらない）の [再試行] と [キャンセル] だけを押す。
-2 回目以降の再確認（restart_service_on_cancel=1）・[再試行] で続行して上書きが通る道・
-WebView2 の後始末は対象外。
+MB_RETRYCANCEL で問う。このモジュールが押すのは次の 3 通り:
+- 最初の問い（Section WebView2 先頭の事前確認。サービスは止まっておらずファイルも変わらない）の
+  [再試行] と [キャンセル]（`drive_shell_quit_cancel`）。
+- 再確認の問い（サービス停止の後・上書きの前、restart_service_on_cancel=1。本文に
+  `上書き前に止めたサービスは再開します` を含む）の [キャンセル]（`drive_recheck_cancel`）。
+  サービスが再開されたのを見てから主窓を閉じる。
+- 最初の問いの [再試行]（偽シェルを止めてから）で上書きまで続行する道（`drive_retry_continue`）。
+アンインストールの再確認・WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
 import は関数の中でだけ行い、Linux でも import できる（純テストが読む）。
@@ -22,6 +26,8 @@ IDCANCEL, IDRETRY = 2, 4
 WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
 # service-hooks.nsh の QuitShellForUpdate の MessageBox の書き出し。
 QUESTION_PREFIX = "ChronoGazer のデスクトップシェル (chronogazer.exe) がまだ終了していません。"
+# 再確認（Section Install の上書き直前）の問いだけに入る一文。前の 2 回の問いは「まだ何も変更していません」。
+RECHECK_NOTE = "上書き前に止めたサービスは再開します"
 # 1 秒おきの poll で Sleep は 89 回なので、spawn からの経過は 89 秒以上。上限は遅い runner の余裕。
 MIN_ELAPSED_SECONDS = 89.0
 MAX_ELAPSED_SECONDS = 200.0
@@ -29,6 +35,9 @@ QUESTION_WAIT_LIMIT_SECONDS = 240.0
 DIALOG_CLOSE_LIMIT_SECONDS = 10.0
 QUIET_AFTER_CANCEL_SECONDS = 2.0
 FINISH_LIMIT_SECONDS = 30.0
+CLOSE_RESEND_SECONDS = 3.0
+SERVICE_RESUME_LIMIT_SECONDS = 60.0
+INSTALL_FINISH_LIMIT_SECONDS = 300.0
 POLL_SECONDS = 0.25
 
 
@@ -43,6 +52,10 @@ class VisibleFailure(RuntimeError):
 
 def question_matches(text: str) -> bool:
     return text.startswith(QUESTION_PREFIX)
+
+
+def recheck_question_matches(text: str) -> bool:
+    return question_matches(text) and RECHECK_NOTE in text
 
 
 def elapsed_problems(elapsed: float) -> list[str]:
@@ -146,14 +159,14 @@ class _Driver:
     def snapshot(self):
         return _with_owner(self.api, self.api.windows(self.pid))
 
-    def await_question(self, since: float):
+    def await_question(self, since: float, matches=question_matches):
         deadline = time.monotonic() + QUESTION_WAIT_LIMIT_SECONDS
         while True:
             rc = self.child.poll()
             if rc is not None:
                 raise VisibleFailure("setup_exited_before_question", {"exit": rc})
             windows = self.snapshot()
-            found, unexpected = judge_dialogs(windows, self.children_of, self.pid)
+            found, unexpected = judge_dialogs(windows, self.children_of, self.pid, matches=matches)
             if unexpected:
                 raise VisibleFailure("unexpected_dialog_before_question", unexpected)
             if found is not None:
@@ -195,27 +208,63 @@ class _Driver:
             )
         return windows
 
-    def finish_after_cancel(self):
-        """キャンセル後: 失敗の頁（主窓）が残るので、他の dialog が出ないことを見てから閉じる。閉じた後も見張る。"""
+    def finish_after_cancel(self, ready_to_close=None):
+        """キャンセル後: 失敗の頁（主窓）が残るので、他の dialog が出ないことを見てから閉じる。閉じた後も見張る。
+
+        ready_to_close があれば、真になるまで（再確認の [キャンセル] でサービスを戻している間）
+        WM_CLOSE を送らずに待つ。Section が走っている間の WM_CLOSE は無視されうるため、
+        閉じる段階では setup が終わるまで CLOSE_RESEND_SECONDS おきに送り直す。
+        """
         started = time.monotonic()
         quiet_until = started + QUIET_AFTER_CANCEL_SECONDS
         while time.monotonic() < quiet_until and self.child.poll() is None:
             self._no_owned_dialog("after_cancel")
             time.sleep(POLL_SECONDS)
+        if ready_to_close is not None:
+            wait_deadline = time.monotonic() + SERVICE_RESUME_LIMIT_SECONDS
+            while True:
+                rc = self.child.poll()
+                if rc is not None:
+                    raise VisibleFailure("setup_exited_before_service_resumed", {"exit": rc})
+                self._no_owned_dialog("before_main_close")
+                if ready_to_close():
+                    break
+                if time.monotonic() >= wait_deadline:
+                    raise VisibleFailure("service_not_resumed_before_main_close")
+                time.sleep(POLL_SECONDS)
+            started = time.monotonic()
         deadline = started + FINISH_LIMIT_SECONDS
-        closed = False
+        posts = 0
+        recorded = False
+        last_post = None
         while self.child.poll() is None:
             if time.monotonic() >= deadline:
                 break
-            windows = self._no_owned_dialog("after_main_close" if closed else "on_failed_page")
+            windows = self._no_owned_dialog("after_main_close" if posts else "on_failed_page")
             mains = main_windows(windows, self.pid)
-            if mains and not closed:
-                self.record("main_window", mains)
-                if not self.api.u.PostMessageW(mains[0]["hwnd"], WM_CLOSE, 0, 0):
-                    raise VisibleFailure("PostMessage_WM_CLOSE_failed")
-                closed = True
+            if mains:
+                if not recorded:
+                    self.record("main_window", mains)
+                    recorded = True
+                now = time.monotonic()
+                if last_post is None or now - last_post >= CLOSE_RESEND_SECONDS:
+                    last_post = now
+                    if self.api.u.PostMessageW(mains[0]["hwnd"], WM_CLOSE, 0, 0):
+                        posts += 1
+                    elif self.api.u.IsWindow(mains[0]["hwnd"]) and self.child.poll() is None:
+                        raise VisibleFailure("PostMessage_WM_CLOSE_failed")
             time.sleep(POLL_SECONDS)
-        self.record("main_window_closed", closed)
+        self.record("main_window_close_posts", posts)
+        self.record("main_window_closed", posts > 0)
+
+    def finish_after_retry(self):
+        """[再試行] の後: 上書きが通って setup が自分で終わるまで、他の dialog が出ないことを見る。"""
+        deadline = time.monotonic() + INSTALL_FINISH_LIMIT_SECONDS
+        while self.child.poll() is None:
+            if time.monotonic() >= deadline:
+                raise VisibleFailure("setup_did_not_finish_after_retry")
+            self._no_owned_dialog("after_retry")
+            time.sleep(POLL_SECONDS)
 
 
 def drive_shell_quit_cancel(child, started: float, proof_dir, record, on_question) -> None:
@@ -229,3 +278,22 @@ def drive_shell_quit_cancel(child, started: float, proof_dir, record, on_questio
     buttons = d.check_question("second", dialog, children, elapsed)
     d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
     d.finish_after_cancel()
+
+
+def drive_recheck_cancel(child, fake_started: float, proof_dir, record, on_question, service_resumed) -> None:
+    """child は /P で起動済みの setup。再確認の問いで [キャンセル] を押し、サービスの再開を見てから頁を閉じる。"""
+    d = _Driver(child, proof_dir, record, on_question)
+    dialog, children, elapsed = d.await_question(fake_started, matches=recheck_question_matches)
+    buttons = d.check_question("recheck", dialog, children, elapsed)
+    d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
+    d.finish_after_cancel(ready_to_close=service_resumed)
+
+
+def drive_retry_continue(child, started: float, proof_dir, record, on_question, before_retry) -> None:
+    """child は /P で起動済みの setup。最初の問いで、偽シェルを止めてから [再試行] を押し、上書きの完了を待つ。"""
+    d = _Driver(child, proof_dir, record, on_question)
+    dialog, children, elapsed = d.await_question(started)
+    buttons = d.check_question("first", dialog, children, elapsed)
+    before_retry()
+    d.press(dialog, buttons["retry"], IDRETRY, "retry")
+    d.finish_after_retry()
