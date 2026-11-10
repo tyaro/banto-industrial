@@ -1649,7 +1649,7 @@ def phase_visible_recheck_retry_continues(c: Ctx) -> None:
                 on_question,
                 before_retry,
                 matches=vis.recheck_question_matches,
-                label="recheck",
+                label="recheck_retry",
             )
         except vis.VisibleFailure as e:
             raise PhaseFailure(p, e.reason, e.observation) from e
