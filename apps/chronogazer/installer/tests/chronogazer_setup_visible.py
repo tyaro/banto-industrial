@@ -2,14 +2,17 @@
 
 chronogazer.exe という名前の終わらないプロセス（偽シェル）を置いておくと、setup は
 `QuitShellForUpdate`（service-hooks.nsh）で最大 90 秒待った後、強制終了せずに
-MB_RETRYCANCEL で問う。このモジュールが押すのは次の 3 通り:
+MB_RETRYCANCEL で問う。このモジュールが押すのは次の 4 通り:
 - 最初の問い（Section WebView2 先頭の事前確認。サービスは止まっておらずファイルも変わらない）の
   [再試行] と [キャンセル]（`drive_shell_quit_cancel`）。
 - 再確認の問い（サービス停止の後・上書きの前、restart_service_on_cancel=1。本文に
   `上書き前に止めたサービスは再開します` を含む）の [キャンセル]（`drive_recheck_cancel`）。
   サービスが再開されたのを見てから主窓を閉じる。
+- アンインストールの再確認の問い（`uninstall.exe /P`、PREUNINSTALL でサービスを止めた後。本文に
+  `止めたサービスは再開します。まだ何も変更していません` を含む）の [キャンセル]。同じ `drive_recheck_cancel` に
+  `matches=uninstall_recheck_question_matches` を渡す。
 - 最初の問いの [再試行]（偽シェルを止めてから）で上書きまで続行する道（`drive_retry_continue`）。
-アンインストールの再確認・WebView2 の後始末は対象外。
+WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
 import は関数の中でだけ行い、Linux でも import できる（純テストが読む）。
@@ -28,6 +31,8 @@ WM_CLOSE, WM_COMMAND, BN_CLICKED, GW_OWNER = 0x0010, 0x0111, 0, 4
 QUESTION_PREFIX = "ChronoGazer のデスクトップシェル (chronogazer.exe) がまだ終了していません。"
 # 再確認（Section Install の上書き直前）の問いだけに入る一文。前の 2 回の問いは「まだ何も変更していません」。
 RECHECK_NOTE = "上書き前に止めたサービスは再開します"
+# アンインストールの再確認（Section Uninstall、PREUNINSTALL でサービスを止めた後）の問いだけに入る一文。
+UNINSTALL_RECHECK_NOTE = "止めたサービスは再開します。まだ何も変更していません"
 # 1 秒おきの poll で Sleep は 89 回なので、spawn からの経過は 89 秒以上。上限は遅い runner の余裕。
 MIN_ELAPSED_SECONDS = 89.0
 MAX_ELAPSED_SECONDS = 200.0
@@ -56,6 +61,10 @@ def question_matches(text: str) -> bool:
 
 def recheck_question_matches(text: str) -> bool:
     return question_matches(text) and RECHECK_NOTE in text
+
+
+def uninstall_recheck_question_matches(text: str) -> bool:
+    return question_matches(text) and UNINSTALL_RECHECK_NOTE in text
 
 
 def elapsed_problems(elapsed: float) -> list[str]:
@@ -290,11 +299,13 @@ def drive_shell_quit_cancel(child, started: float, proof_dir, record, on_questio
     d.finish_after_cancel()
 
 
-def drive_recheck_cancel(child, fake_started: float, proof_dir, record, on_question, service_resumed) -> None:
-    """child は /P で起動済みの setup。再確認の問いで [キャンセル] を押し、サービスの再開を見てから頁を閉じる。"""
+def drive_recheck_cancel(
+    child, fake_started: float, proof_dir, record, on_question, service_resumed, matches=recheck_question_matches, label="recheck"
+) -> None:
+    """child は /P で起動済みの setup（アンインストールなら uninstall.exe /P）。再確認の問いで [キャンセル] を押し、サービスの再開を見てから頁を閉じる。"""
     d = _Driver(child, proof_dir, record, on_question)
-    dialog, children, elapsed = d.await_question(fake_started, matches=recheck_question_matches)
-    buttons = d.check_question("recheck", dialog, children, elapsed)
+    dialog, children, elapsed = d.await_question(fake_started, matches=matches)
+    buttons = d.check_question(label, dialog, children, elapsed)
     d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
     d.finish_after_cancel(ready_to_close=service_resumed)
 
