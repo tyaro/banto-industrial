@@ -331,6 +331,44 @@ class ButtonTests(unittest.TestCase):
             v.retry_cancel_buttons([child("Button", hwnd=10), child("Button", hwnd=11), child("Button", hwnd=12)], self.ids.get)
 
 
+LOCKED = v.LOCKED_EXE_NOTICE_PREFIX + "chronogazer-elev.exe）。上書きはまだ始めていません。"
+RESUME_FAILED = v.RESUME_FAILED_PREFIX + "エラー）。"
+
+
+class NoticeMatchTests(unittest.TestCase):
+    def test_locked_exe_notice_matches(self):
+        self.assertTrue(v.locked_exe_notice_matches(LOCKED))
+        self.assertFalse(v.locked_exe_notice_matches(v.LOCKED_EXE_NOTICE_PREFIX + "chronogazer-elev.exe）。"))
+        self.assertFalse(v.locked_exe_notice_matches(v.LOCKED_EXE_NOTICE_PREFIX + "other.exe）。上書きはまだ始めていません。"))
+        self.assertFalse(v.locked_exe_notice_matches("x" + LOCKED))
+        self.assertFalse(v.locked_exe_notice_matches(RESUME_FAILED))
+
+    def test_resume_failed_warning_matches(self):
+        self.assertTrue(v.resume_failed_warning_matches(RESUME_FAILED))
+        self.assertFalse(v.resume_failed_warning_matches(LOCKED))
+        self.assertFalse(v.resume_failed_warning_matches("x" + RESUME_FAILED))
+
+
+class OkButtonTests(unittest.TestCase):
+    ids = {10: 1, 11: 2, 12: 7}
+
+    def test_id_1_and_2_are_accepted(self):
+        for hwnd, want in ((10, 1), (11, 2)):
+            button, cid = v.ok_button([child("Static", LOCKED, hwnd=9), child("Button", hwnd=hwnd)], self.ids.get)
+            self.assertEqual((button["hwnd"], cid), (hwnd, want))
+
+    def test_other_id_fails(self):
+        with self.assertRaises(v.VisibleFailure):
+            v.ok_button([child("Button", hwnd=12)], self.ids.get)
+
+    def test_count_must_be_one(self):
+        with self.assertRaises(v.VisibleFailure):
+            v.ok_button([child("Static", LOCKED, hwnd=9)], self.ids.get)
+        with self.assertRaises(v.VisibleFailure):
+            v.ok_button([child("Button", hwnd=10), child("Button", hwnd=11)], self.ids.get)
+        self.assertEqual(v.ok_button([child("Button", hwnd=10), child("Button", visible=False, hwnd=11)], self.ids.get)[1], 1)
+
+
 class ClassifyTests(unittest.TestCase):
     def test_waiting_until_static_text_is_readable(self):
         self.assertEqual(v.classify_dialog_children([]), "waiting")
