@@ -199,14 +199,51 @@ class SecretTests(unittest.TestCase):
             [
                 "phase_install_locked_exe",
                 "phase_install_acl_refused",
+                "phase_visible_file_locked_cancel",
                 "phase_uninstall_locked_exe",
+                "phase_visible_uninstall_locked_abort",
                 "phase_uninstall_sink_delete_fail",
                 "phase_uninstall_hub_delete_fail",
                 "phase_uninstall_sink_delete_pending",
                 "phase_uninstall_hub_delete_pending",
             ],
         )
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 16)
+
+
+UNINSTALL_NOTICE = (
+    "使用中の実行ファイルがあります（ banto-hub-sink.exe）。\r\n\r\n消せないため、アンインストールを中止しました。"
+    "まだ何も変更していません。"
+    "その前に止めていたサービス（BantoHub）は再開し、RUNNING になったことを確かめました。\r\n\r\n"
+    "BantoHub のデスクトップシェルと、コンソールで動かしている banto-hub.exe・banto-hub-sink.exe を終了してから、もう一度アンインストールしてください。"
+)
+
+
+class VisibleMatcherTests(unittest.TestCase):
+    def test_uninstall_locked_notice_matches(self):
+        self.assertTrue(h.uninstall_locked_notice_matches(UNINSTALL_NOTICE))
+
+    def test_uninstall_locked_notice_requires_every_part(self):
+        for part in (h.UNINSTALL_LOCKED_ABORTED, h.UNINSTALL_LOCKED_RESUMED, h.FILE_LOCKED_EXE):
+            self.assertFalse(h.uninstall_locked_notice_matches(UNINSTALL_NOTICE.replace(part, "")), part)
+        self.assertFalse(h.uninstall_locked_notice_matches("別の窓 " + UNINSTALL_NOTICE))
+        failed_resume = UNINSTALL_NOTICE.replace(
+            h.UNINSTALL_LOCKED_RESUMED, "その前に止めていたサービスのうち BantoHub は再開できませんでした。"
+        )
+        self.assertFalse(h.uninstall_locked_notice_matches(failed_resume))
+
+    def test_file_locked_dialog_matches(self):
+        self.assertTrue(
+            h.file_locked_dialog_matches("Error opening file for writing:\n\nC:\\Program Files\\BantoHub\\banto-hub-sink.exe")
+        )
+        self.assertTrue(h.file_locked_dialog_matches("ファイルを書き込み用に開けません: banto-hub-sink.exe"))
+        self.assertFalse(h.file_locked_dialog_matches("Error opening file for writing: banto-hub.exe"))
+
+    def test_chronogazer_visible_driver_is_importable_and_win32_free(self):
+        self.assertTrue(hasattr(h.vis, "drive_notices"))
+        self.assertTrue(hasattr(h.vis, "drive_file_locked_cancel"))
+        self.assertNotIn("ctypes", vars(h.vis))
+        self.assertNotIn("windows_gui_capability", vars(h.vis))
 
 
 if __name__ == "__main__":

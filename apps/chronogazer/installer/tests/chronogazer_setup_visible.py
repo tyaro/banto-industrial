@@ -366,6 +366,58 @@ class _Driver:
             time.sleep(POLL_SECONDS)
 
 
+LANGUAGE_DIALOG_TITLE = "Installer Language"
+
+
+def select_language_dialog(windows, pid):
+    """pid の可視 #32770 のうち title が `Installer Language` の窓（NSIS の言語選択）。無ければ None。"""
+    found = [
+        w for w in windows
+        if w["pid"] == pid and w["class"] == DIALOG_CLASS and w["visible"] and w["title"] == LANGUAGE_DIALOG_TITLE
+    ]
+    if len(found) > 1:
+        raise VisibleFailure("ambiguous_language_dialog", found)
+    return found[0] if found else None
+
+
+def dismiss_language_dialog(child, proof_dir, record, limit: float = 60.0) -> bool:
+    """uninstall.exe は保存された言語が無いと先に言語選択の窓を出す（MUI_UNGETLANGUAGE）。
+    出たら既定の選択のまま OK を押して閉じて True、本来の案内（owned の #32770）が先に出たら触らず False。"""
+    d = _Driver(child, proof_dir, record, lambda *_: None)
+    deadline = time.monotonic() + limit
+    while True:
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure("setup_exited_before_language_dialog_or_notice", {"exit": rc})
+        windows = d.snapshot()
+        dialog = select_language_dialog(windows, d.pid)
+        if dialog is not None:
+            break
+        if owned_dialogs(windows, d.pid):
+            record("language_dialog", "not_shown")
+            return False
+        if time.monotonic() >= deadline:
+            raise VisibleFailure("language_dialog_or_notice_not_seen_within_limit", windows)
+        time.sleep(POLL_SECONDS)
+    children = d.children_of(dialog["hwnd"])
+    record("language_dialog_texts", {"static": static_texts(children), "all": [(c["class"], c["title"]) for c in children]})
+    try:
+        width, height, rgb = d.api.capture(dialog["rect"])
+        (d.proof_dir / "language_dialog.png").write_bytes(d.gui.png_bytes(width, height, rgb))
+    except Exception as e:  # 画像が取れなくても OK を押して進める（本文は上で記録済み）
+        record("language_dialog_capture_error", repr(e))
+    button = None
+    for c in children:
+        if c["class"].casefold() == "button" and c["visible"] and int(d.api.u.GetDlgCtrlID(c["hwnd"])) == IDOK:
+            button = c
+            break
+    if button is None:
+        raise VisibleFailure("language_dialog_ok_button_missing", children)
+    d.press(dialog, button, IDOK, "language_ok")
+    record("language_dialog", "accepted")
+    return True
+
+
 def drive_shell_quit_cancel(child, started: float, proof_dir, record, on_question) -> None:
     """child は /P で起動済みの setup。1 回目の問いで [再試行]、2 回目の問いで [キャンセル] を押し、頁を閉じる。"""
     d = _Driver(child, proof_dir, record, on_question)
@@ -423,4 +475,31 @@ def drive_notices(child, started: float, proof_dir, record, notices, ready_to_cl
             time.sleep(POLL_SECONDS)
         since = time.monotonic()
         d.press(dialog, button, control_id, "ok")
+    d.finish_after_cancel(ready_to_close=ready_to_close)
+
+
+def drive_file_locked_cancel(
+    child, started: float, proof_dir, record, matches, on_shown, while_shown, ready_to_close, label: str = "file_locked"
+) -> None:
+    """child は /P で起動済みの setup。NSIS の `File` の使用中の窓（[再試行]/[キャンセル]）を matches で待ち、
+    数秒保持して on_shown/while_shown で状態を見てから [キャンセル] を押し、失敗の頁を ready_to_close が真になるまで開いておく。
+    90 秒待ちの問いと違い経過時間の範囲は見ない。"""
+    d = _Driver(child, proof_dir, record, lambda *_: None)
+    dialog, children, elapsed = d.await_question(started, matches=matches)
+    d.record(f"{label}_texts", static_texts(children))
+    d.record(f"{label}_elapsed_seconds", round(elapsed, 1))
+    width, height, rgb = d.api.capture(dialog["rect"])
+    (d.proof_dir / f"{label}_question.png").write_bytes(d.gui.png_bytes(width, height, rgb))
+    buttons = retry_cancel_buttons(children, lambda h: d.api.u.GetDlgCtrlID(h))
+    on_shown(label, elapsed)
+    hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
+    while time.monotonic() < hold_until:
+        if not d.api.u.IsWindow(dialog["hwnd"]):
+            raise VisibleFailure(f"dialog_closed_by_itself_{label}")
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure(f"setup_exited_while_dialog_shown_{label}", {"exit": rc})
+        while_shown(label)
+        time.sleep(POLL_SECONDS)
+    d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
     d.finish_after_cancel(ready_to_close=ready_to_close)

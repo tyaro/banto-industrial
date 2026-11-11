@@ -17,8 +17,17 @@ BantoHub / BantoHubSink サービスを書き換え、アンインストール�
   故障系は、中止後に止めたサービスが再開され、ファイル・登録・データが変わらず、
   setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 14 の最後だけ本物の呼び方）。
-  対象外: icacls の非 0 終了そのもの・`File` の書込み途中の失敗・消し残り
-  （RequireBantoHubExesDeleted）・サービス停止 timeout・再開失敗・Sink 稼働中・実 collector。
+  可視 UI（setup / uninstall.exe を /P で実画面に出し、窓を読んでボタンを押す。駆動部品は
+  ChronoGazer 側の chronogazer_setup_visible.py を共有）:
+          8b 使用中の sink exe で `File` の窓（[再試行]/[キャンセル]）が出る道: 窓と失敗の頁の間は
+             BantoHub が STOPPED のまま、頁を閉じた後の .onInstFailed で RUNNING に戻る /
+          10b `_?=` 付きの /P のアンインストールが使用中の sink exe で中止する道: 主 MessageBox より先に
+             BantoHub を再開し、その結果が本文に入り、un.onUninstFailed で二重に再開しない
+             （二重再開は PID の不変でしか見ていない）。uninstall.exe は保存された言語が無いと先に
+             言語選択の窓（Installer Language）を出すので、OK を押してから案内を待つ
+  対象外: 上の 2 つ以外の可視 UI（MessageBox の表示と二重再開は silent では見ていない）・icacls の非 0
+  終了そのもの・`File` の書込み途中の失敗・消し残り（RequireBantoHubExesDeleted）・
+  サービス停止 timeout・再開失敗・Sink 稼働中・実 collector。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。テスト用の管理者パスワードは実行ごとの乱数で、ログにも証拠にも出さない。
 
@@ -41,6 +50,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+# 可視 UI の駆動部品は ChronoGazer 側と共有する（複製しない）。import は Win32 に触れない（関数の中でだけ読む）。
+_CG_TESTS_DIR = Path(__file__).resolve().parents[3] / "chronogazer" / "installer" / "tests"
+if str(_CG_TESTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_CG_TESTS_DIR))
+import chronogazer_setup_visible as vis  # noqa: E402
 
 GUARD_ENV = "BANTO_973_HUB_SETUP_TEST"
 GUARD_VALUE = "github-hosted-disposable-only-v1"
@@ -188,9 +203,30 @@ def parse_icacls_output(returncode: int, stdout: str, stderr: str) -> str:
     return stdout
 
 
-def uninstall_in_place_command(instdir) -> str:
+def uninstall_in_place_command(instdir, mode_flag: str = "/S") -> str:
     """`_?=` 付きでその場で走らせる呼び方。`_?=` は最後の引数でクォートしない（NSIS の規則）ので文字列で渡す。"""
-    return f'"{instdir}\\uninstall.exe" /S _?={instdir}'
+    return f'"{instdir}\\uninstall.exe" {mode_flag} _?={instdir}'
+
+
+FILE_LOCKED_EXE = "banto-hub-sink.exe"
+UNINSTALL_LOCKED_PREFIX = "使用中の実行ファイルがあります（"
+UNINSTALL_LOCKED_ABORTED = "アンインストールを中止しました"
+UNINSTALL_LOCKED_RESUMED = "その前に止めていたサービス（BantoHub）は再開し、RUNNING になったことを確かめました。"
+
+
+def file_locked_dialog_matches(text: str) -> bool:
+    """NSIS 自身の `File` の使用中の窓。文言は OS の言語で変わるので、書けないファイル名だけで照合する。"""
+    return FILE_LOCKED_EXE in text
+
+
+def uninstall_locked_notice_matches(text: str) -> bool:
+    """使用中 exe でアンインストールを中止する主 MessageBox。再開の結果（$ServiceRestoreNote）が本文に入っている。"""
+    return (
+        text.startswith(UNINSTALL_LOCKED_PREFIX)
+        and FILE_LOCKED_EXE in text
+        and UNINSTALL_LOCKED_ABORTED in text
+        and UNINSTALL_LOCKED_RESUMED in text
+    )
 
 
 def find_setup(dist: Path) -> tuple[Path, str]:
@@ -1003,6 +1039,96 @@ def phase_install_acl_refused(c: Ctx) -> None:
     _recover_by_setup(p, c)
 
 
+def _visible_preamble(p: str) -> int:
+    environment, reasons = vis.gui_check()
+    obs(p, "gui_environment", environment)
+    expect(p, not reasons, "gui_unsupported", reasons)
+    expect(p, PROOF_DIR is not None, "proof dir is not initialised")
+    pid = _ensure_hub_running(p)
+    expect_no_shell(p)
+    return pid
+
+
+def _cleanup_visible(p: str, child) -> None:
+    """例外時も setup を必ず kill して待つ（ロックを解く前に片付け、上書きへ進ませない）。"""
+    if child is not None and child.poll() is None:
+        child.kill()
+        child.wait(timeout=30)
+        obs(p, "cleanup_setup", "killed")
+
+
+def _wait_exit_within_30s(p: str, child) -> int:
+    try:
+        rc = child.wait(timeout=30)
+    except subprocess.TimeoutExpired as e:
+        raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+    obs(p, "setup_exit", rc)
+    return rc
+
+
+def phase_visible_file_locked_cancel(c: Ctx) -> None:
+    p = "8b_visible_file_locked_cancel"
+    # /P の本物の setup: 使用中の sink exe に `File` が書けず NSIS 自身の窓（[再試行]/[キャンセル]）が出る。
+    # フックが割り込めない道。窓の間と失敗の頁の間は止めたサービスが STOPPED のまま、
+    # 頁を閉じた後の .onInstFailed で RUNNING に戻る。
+    pid = _visible_preamble(p)
+    tampered = _tamper_sink(p, c)
+    # 失敗の道で setup が生きたままロックが消えて上書きへ進まないよう、setup を片付けてからロックを解く順にする。
+    with ExclusiveFileLock(INSTDIR / FILE_LOCKED_EXE):
+        child = None
+        try:
+
+            def on_shown(lbl: str, elapsed: float) -> None:
+                st = sc_state(HUB_SVC)
+                obs(p, f"{lbl}_hub", st)
+                expect(p, st["state"] == "STOPPED", f"BantoHub not STOPPED while the {lbl} window is shown", st)
+
+            def while_shown(lbl: str) -> None:
+                st = sc_state(HUB_SVC)
+                expect(p, st["state"] == "STOPPED", f"BantoHub changed while the {lbl} window is shown", st)
+
+            def ready_to_close() -> bool:
+                st = sc_state(HUB_SVC)
+                obs(p, "failed_page_hub", st)
+                expect(p, st["state"] == "STOPPED", "BantoHub resumed before the failed page was closed", st)
+                return True
+
+            child = subprocess.Popen([str(c.setup), "/P"])
+            started = time.monotonic()
+            try:
+                vis.drive_file_locked_cancel(
+                    child,
+                    started,
+                    PROOF_DIR,
+                    lambda k, v: obs(p, k, v),
+                    file_locked_dialog_matches,
+                    on_shown,
+                    while_shown,
+                    ready_to_close,
+                )
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            rc = _wait_exit_within_30s(p, child)
+            expect(p, rc != 0, "cancelled setup must exit non-zero", rc)
+            _expect_hub_restarted(p, pid)
+            resumed = sc_state(HUB_SVC)["pid"]
+            time.sleep(3)
+            st = sc_state(HUB_SVC)
+            obs(p, "hub_after_wait", st)
+            expect(p, st["state"] == "RUNNING" and st["pid"] == resumed, "BantoHub restarted again after the resume", st)
+            sink = sc_state(SINK_SVC)
+            obs(p, "sink_state", sink)
+            expect(p, sink["state"] == "STOPPED", "Sink was started by the cancelled setup", sink)
+            for name in SERVICES:
+                _expect_registered(p, name)
+            _expect_sink_still(p, tampered)
+            _expect_data_intact(p, c)
+            expect_no_shell(p)
+        finally:
+            _cleanup_visible(p, child)
+    _recover_by_setup(p, c)
+
+
 def phase_uninstall_locked_exe(c: Ctx) -> None:
     p = "10_uninstall_locked_exe"
     pid = _ensure_hub_running(p)
@@ -1015,6 +1141,67 @@ def phase_uninstall_locked_exe(c: Ctx) -> None:
     for name in SERVICES:
         _expect_registered(p, name)
     _expect_still_installed(p, c, before)
+
+
+def phase_visible_uninstall_locked_abort(c: Ctx) -> None:
+    p = "10b_visible_uninstall_locked_abort"
+    # `_?=` 付きの /P のアンインストーラ: 使用中の sink exe でフックが中止する道。主 MessageBox より先に
+    # 止めたサービスを再開し（その結果が本文に入る）、un.onUninstFailed で二重に再開しない。
+    pid = _visible_preamble(p)
+    before = tree_snapshot(INSTDIR)
+    resumed: dict = {}
+    with ExclusiveFileLock(INSTDIR / FILE_LOCKED_EXE):
+        child = None
+        try:
+
+            def same_pid_running() -> bool:
+                st = sc_state(HUB_SVC)
+                return st["state"] == "RUNNING" and st["pid"] == resumed.get("pid")
+
+            def on_shown(lbl: str, elapsed: float) -> None:
+                st = sc_state(HUB_SVC)
+                obs(p, f"{lbl}_hub", st)
+                expect(
+                    p,
+                    st["state"] == "RUNNING" and bool(st["pid"]) and st["pid"] != pid,
+                    "BantoHub not resumed before the uninstall notice",
+                    st,
+                )
+                resumed["pid"] = st["pid"]
+                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the uninstall notice is shown")
+
+            def while_shown(lbl: str) -> None:
+                expect(p, same_pid_running(), "BantoHub changed while the uninstall notice is shown", sc_state(HUB_SVC))
+
+            child = subprocess.Popen(uninstall_in_place_command(INSTDIR, "/P"))
+            # uninstall.exe は保存された言語が無いと先に言語選択の窓を出す（MUI_UNGETLANGUAGE）。
+            try:
+                vis.dismiss_language_dialog(child, PROOF_DIR, lambda k, v: obs(p, k, v))
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            started = time.monotonic()
+            notices = [("uninstall_locked", uninstall_locked_notice_matches, on_shown, while_shown)]
+            try:
+                vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, same_pid_running)
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            rc = _wait_exit_within_30s(p, child)
+            expect(p, rc != 0, "aborted uninstall must exit non-zero", rc)
+            st = sc_state(HUB_SVC)
+            obs(p, "hub_after", st)
+            expect(p, same_pid_running(), "BantoHub was restarted again after the resume (un.onUninstFailed)", st)
+            status = wait_status()
+            obs(p, "status_after", status)
+            expect(p, status_initialized(status), "status not initialized after abort", status)
+            time.sleep(3)
+            st = sc_state(HUB_SVC)
+            expect(p, same_pid_running(), "BantoHub pid changed after the status check", st)
+            for name in SERVICES:
+                _expect_registered(p, name)
+            _expect_still_installed(p, c, before)
+            expect_no_shell(p)
+        finally:
+            _cleanup_visible(p, child)
 
 
 def phase_uninstall_sink_delete_fail(c: Ctx) -> None:
@@ -1130,7 +1317,9 @@ PHASES = (
     phase_reinstall,
     phase_install_locked_exe,
     phase_install_acl_refused,
+    phase_visible_file_locked_cancel,
     phase_uninstall_locked_exe,
+    phase_visible_uninstall_locked_abort,
     phase_uninstall_sink_delete_fail,
     phase_uninstall_hub_delete_fail,
     phase_uninstall_sink_delete_pending,
