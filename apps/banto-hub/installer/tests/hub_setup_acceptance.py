@@ -1088,6 +1088,7 @@ def phase_visible_file_locked_cancel(c: Ctx) -> None:
 
             def ready_to_close() -> bool:
                 st = sc_state(HUB_SVC)
+                obs(p, "failed_page_hub", st)
                 expect(p, st["state"] == "STOPPED", "BantoHub resumed before the failed page was closed", st)
                 return True
 

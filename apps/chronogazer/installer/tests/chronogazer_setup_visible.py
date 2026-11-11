@@ -434,11 +434,11 @@ def drive_file_locked_cancel(
     90 秒待ちの問いと違い経過時間の範囲は見ない。"""
     d = _Driver(child, proof_dir, record, lambda *_: None)
     dialog, children, elapsed = d.await_question(started, matches=matches)
-    buttons = retry_cancel_buttons(children, lambda h: d.api.u.GetDlgCtrlID(h))
     d.record(f"{label}_texts", static_texts(children))
     d.record(f"{label}_elapsed_seconds", round(elapsed, 1))
     width, height, rgb = d.api.capture(dialog["rect"])
     (d.proof_dir / f"{label}_question.png").write_bytes(d.gui.png_bytes(width, height, rgb))
+    buttons = retry_cancel_buttons(children, lambda h: d.api.u.GetDlgCtrlID(h))
     on_shown(label, elapsed)
     hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
     while time.monotonic() < hold_until:
