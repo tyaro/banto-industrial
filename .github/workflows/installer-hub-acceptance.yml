@@ -10,7 +10,8 @@ name: Installer Hub acceptance (disposable Windows, real setup + real SCM)
 # `_?=` 付きのアンインストールが使用中 exe で中止する主 MessageBox（先に再開、二重再開なし）。
 # 加えて、止めたサービスの再開が失敗する 2 つ（banto-hub.exe を壊れた中身に差し替える）: `File` の窓の道は
 # .onInstFailed の警告の窓、アンインストールの道は主 MessageBox の本文。どちらも再開の試みは 1 回だけ。
-# 対象外: 上の 4 つ以外の可視 UI・icacls の非 0 終了そのもの・書込み途中の失敗・停止 timeout・実 collector。
+# 加えて、停止が PENDING のまま待ち切る道の主 MessageBox（8d。BantoHub の tokio ワーカーを一時停止し、再開しない）。
+# 対象外: 上の可視 UI 以外・icacls の非 0 終了そのもの・書込み途中の失敗・実 collector。
 
 on:
   workflow_dispatch:
@@ -20,6 +21,7 @@ on:
       - 'apps/banto-hub/installer/**'
       - 'installer-common/**'
       - 'apps/chronogazer/installer/tests/chronogazer_setup_visible.py'
+      - 'apps/chronogazer/installer/tests/chronogazer_setup_acceptance.py'
       - 'apps/chronogazer/installer/tests/windows_gui_capability.py'
       - 'scripts/build-release.ps1'
 

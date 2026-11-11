@@ -849,7 +849,8 @@ class StopWaitTimeline:
 
     SAMPLE_TIMEOUT = 20
 
-    def __init__(self, setup_pid: int, service_pid: int, interval: float = 10.0):
+    def __init__(self, setup_pid: int, service_pid: int, interval: float = 10.0, service: str = SERVICE):
+        self.service = service  # Hub の受入からも使う（既定は ChronoGazer）
         self.setup_pid = int(setup_pid)
         self.service_pid = int(service_pid)
         self.interval = interval
@@ -859,7 +860,7 @@ class StopWaitTimeline:
 
     def _script(self) -> str:
         return (
-            STOP_WAIT_SAMPLE_SCRIPT.replace("__SERVICE__", SERVICE)
+            STOP_WAIT_SAMPLE_SCRIPT.replace("__SERVICE__", self.service)
             .replace("__SERVICE_PID__", str(self.service_pid))
             .replace("__SETUP_PID__", str(self.setup_pid))
         )
