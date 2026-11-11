@@ -5,7 +5,10 @@ name: Installer Hub acceptance (disposable Windows, real setup + real SCM)
 # （拒否・新規・上書き・アンインストール・再インストール）を確かめる。
 # 使い捨てランナー専用: 実 C:\Program Files\BantoHub と BantoHub サービスを書き換える。
 # 通常系の後に故障系（使用中 exe での中止・事前確認での中止・解除失敗・DeleteFlag 保留）も確かめる。
-# 対象外: icacls の非 0 終了そのもの・書込み途中の失敗・停止 timeout・再開失敗・実 collector。
+# 加えて可視 UI を 2 つ確かめる（setup / uninstall.exe を /P で実画面に出す。画像は proof/ の png として artifact に入る）:
+# 使用中の sink exe で `File` の窓が出て [キャンセル] する道（.onInstFailed の再開）と、
+# `_?=` 付きのアンインストールが使用中 exe で中止する主 MessageBox（先に再開、二重再開なし）。
+# 対象外: 上の 2 つ以外の可視 UI・icacls の非 0 終了そのもの・書込み途中の失敗・停止 timeout・再開失敗・実 collector。
 
 on:
   workflow_dispatch:
@@ -14,6 +17,8 @@ on:
       - '.github/workflows/installer-hub-acceptance.yml'
       - 'apps/banto-hub/installer/**'
       - 'installer-common/**'
+      - 'apps/chronogazer/installer/tests/chronogazer_setup_visible.py'
+      - 'apps/chronogazer/installer/tests/windows_gui_capability.py'
       - 'scripts/build-release.ps1'
 
 permissions:

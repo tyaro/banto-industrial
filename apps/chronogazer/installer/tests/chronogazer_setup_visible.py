@@ -424,3 +424,30 @@ def drive_notices(child, started: float, proof_dir, record, notices, ready_to_cl
         since = time.monotonic()
         d.press(dialog, button, control_id, "ok")
     d.finish_after_cancel(ready_to_close=ready_to_close)
+
+
+def drive_file_locked_cancel(
+    child, started: float, proof_dir, record, matches, on_shown, while_shown, ready_to_close, label: str = "file_locked"
+) -> None:
+    """child は /P で起動済みの setup。NSIS の `File` の使用中の窓（[再試行]/[キャンセル]）を matches で待ち、
+    数秒保持して on_shown/while_shown で状態を見てから [キャンセル] を押し、失敗の頁を ready_to_close が真になるまで開いておく。
+    90 秒待ちの問いと違い経過時間の範囲は見ない。"""
+    d = _Driver(child, proof_dir, record, lambda *_: None)
+    dialog, children, elapsed = d.await_question(started, matches=matches)
+    buttons = retry_cancel_buttons(children, lambda h: d.api.u.GetDlgCtrlID(h))
+    d.record(f"{label}_texts", static_texts(children))
+    d.record(f"{label}_elapsed_seconds", round(elapsed, 1))
+    width, height, rgb = d.api.capture(dialog["rect"])
+    (d.proof_dir / f"{label}_question.png").write_bytes(d.gui.png_bytes(width, height, rgb))
+    on_shown(label, elapsed)
+    hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
+    while time.monotonic() < hold_until:
+        if not d.api.u.IsWindow(dialog["hwnd"]):
+            raise VisibleFailure(f"dialog_closed_by_itself_{label}")
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure(f"setup_exited_while_dialog_shown_{label}", {"exit": rc})
+        while_shown(label)
+        time.sleep(POLL_SECONDS)
+    d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
+    d.finish_after_cancel(ready_to_close=ready_to_close)
