@@ -51,6 +51,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -782,6 +783,102 @@ class SuspendedServiceWorkers:
             print(message)
             if exc_type is None:
                 raise RuntimeError(message)
+        return False
+
+
+def stop_wait_sample(t: float, returncode: int, stdout: str, stderr: str) -> dict:
+    """PowerShell の標本 1 件を dict にする。JSON として読めなければ生の出力の先頭 2000 字を残す（標本を失わない）。"""
+    try:
+        data = json.loads(stdout)
+        if not isinstance(data, dict):
+            raise ValueError("not an object")
+    except (ValueError, TypeError):
+        return {"t": round(t, 1), "rc": returncode, "raw_stdout": (stdout or "")[:2000], "raw_stderr": (stderr or "")[:2000]}
+    return {"t": round(t, 1), **data}
+
+
+STOP_WAIT_SAMPLE_SCRIPT = r"""
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$r = [ordered]@{}
+try {
+  $r.sc = ((& sc.exe queryex __SERVICE__) | Where-Object { $_ -match 'STATE|CHECKPOINT|WAIT_HINT' } | ForEach-Object { $_.Trim() }) -join ' | '
+} catch { $r.sc = 'error: ' + $_.Exception.Message }
+try {
+  $r.service_threads = @((Get-Process -Id __SERVICE_PID__ -ErrorAction Stop).Threads | ForEach-Object {
+    $th = $_
+    $st = ''
+    try { $st = [string]$th.StartTime } catch { $st = 'error: ' + $_.Exception.Message }
+    [ordered]@{ Id = $th.Id; ThreadState = [string]$th.ThreadState; WaitReason = [string]$th.WaitReason; StartTime = $st }
+  })
+} catch { $r.service_threads = 'error: ' + $_.Exception.Message }
+try {
+  $all = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+  $seen = @{}
+  $queue = New-Object System.Collections.Queue
+  $queue.Enqueue([int]__SETUP_PID__)
+  $out = @()
+  while ($queue.Count -gt 0) {
+    $parent = $queue.Dequeue()
+    foreach ($pr in ($all | Where-Object { $_.ParentProcessId -eq $parent })) {
+      if ($seen.ContainsKey([int]$pr.ProcessId)) { continue }
+      $seen[[int]$pr.ProcessId] = $true
+      $queue.Enqueue([int]$pr.ProcessId)
+      $out += [ordered]@{ ProcessId = $pr.ProcessId; ParentProcessId = $pr.ParentProcessId; Name = $pr.Name; CommandLine = [string]$pr.CommandLine; CreationDate = [string]$pr.CreationDate }
+    }
+  }
+  $r.setup_children = $out
+} catch { $r.setup_children = 'error: ' + $_.Exception.Message }
+$r | ConvertTo-Json -Compress -Depth 4
+"""
+
+
+class StopWaitTimeline:
+    """/P の setup が停止待ちのどこで止まっているかを interval 秒おきに記録する（案内が出ずに落ちた run の原因調査用）。
+
+    sc の状態・サービスの各スレッド・setup の子孫プロセスを PowerShell で採る。観測だけで判定には使わない。"""
+
+    SAMPLE_TIMEOUT = 20
+
+    def __init__(self, setup_pid: int, service_pid: int, interval: float = 10.0):
+        self.setup_pid = int(setup_pid)
+        self.service_pid = int(service_pid)
+        self.interval = interval
+        self.samples = []
+        self._stop = threading.Event()
+        self._thread = None
+
+    def _script(self) -> str:
+        return (
+            STOP_WAIT_SAMPLE_SCRIPT.replace("__SERVICE__", SERVICE)
+            .replace("__SERVICE_PID__", str(self.service_pid))
+            .replace("__SETUP_PID__", str(self.setup_pid))
+        )
+
+    def _sample(self, t: float) -> dict:
+        r = run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", self._script()],
+            timeout=self.SAMPLE_TIMEOUT,
+        )
+        return stop_wait_sample(t, r.returncode, r.stdout, r.stderr)
+
+    def _loop(self, start: float) -> None:
+        while not self._stop.is_set():
+            t = time.monotonic() - start
+            try:
+                self.samples.append(self._sample(t))
+            except Exception as e:  # noqa: BLE001  標本の失敗でスレッドを落とさない
+                self.samples.append({"t": round(t, 1), "error": str(e)})
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        self._thread = threading.Thread(target=self._loop, args=(time.monotonic(),), daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=self.SAMPLE_TIMEOUT + self.interval + 5)
         return False
 
 
@@ -2240,10 +2337,12 @@ def phase_visible_stop_timeout_abort(c: Ctx) -> None:
     before = tree_snapshot(INSTDIR)
     with SuspendedServiceWorkers(pid) as hold:
         obs(p, "suspended_threads", len(hold.suspended))
+        obs(p, "suspended_tids", list(hold.suspended))
         st = sc_state()
         obs(p, "service_while_suspended", st)
         expect(p, st["state"] == "RUNNING" and st["pid"] == pid, "service not RUNNING with the same pid after suspend", st)
         child = None
+        timeline = None
         try:
 
             def pending_and_same_pid(what: str) -> None:
@@ -2275,6 +2374,7 @@ def phase_visible_stop_timeout_abort(c: Ctx) -> None:
                 return st["state"] == "STOP_PENDING" and st["pid"] == pid
 
             child = subprocess.Popen([str(c.setup), "/P"])
+            timeline = StopWaitTimeline(child.pid, pid).__enter__()
             started = time.monotonic()
             notices = [("stop_timeout", vis.stop_pending_notice_matches, on_shown, while_shown)]
             try:
@@ -2291,6 +2391,10 @@ def phase_visible_stop_timeout_abort(c: Ctx) -> None:
             expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
             _expect_elev_still(p, tampered)
         finally:
+            # 失敗でも標本を必ず残す。setup を kill する前に止める（kill 後の標本で停止待ちの様子を汚さない）。
+            if timeline is not None:
+                timeline.__exit__(None, None, None)
+                obs(p, "stop_wait_timeline", timeline.samples)
             _cleanup_visible(p, child, None)
     # スレッドを再開した。停止の保留が解け、サービスが STOPPED になる（陽性対照）。
     try:

@@ -368,5 +368,19 @@ class ImportSafetyTests(unittest.TestCase):
         )
 
 
+class StopWaitSampleTests(unittest.TestCase):
+    def test_json_output_is_merged_with_elapsed_time(self):
+        out = c.stop_wait_sample(12.34, 0, '{"sc":"STATE : 3","service_threads":[]}', "")
+        self.assertEqual(out, {"t": 12.3, "sc": "STATE : 3", "service_threads": []})
+
+    def test_unparsable_output_falls_back_to_truncated_raw_text(self):
+        out = c.stop_wait_sample(5.0, 1, "x" * 5000, "boom")
+        self.assertEqual(out["t"], 5.0)
+        self.assertEqual(out["rc"], 1)
+        self.assertEqual(len(out["raw_stdout"]), 2000)
+        self.assertEqual(out["raw_stderr"], "boom")
+        self.assertEqual(c.stop_wait_sample(1.0, 0, "[1]", "")["raw_stdout"], "[1]")
+
+
 if __name__ == "__main__":
     unittest.main()
