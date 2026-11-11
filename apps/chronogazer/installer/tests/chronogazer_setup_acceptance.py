@@ -605,33 +605,34 @@ class ExclusiveFileLock:
         return False
 
 
-def threads_to_suspend(threads, done) -> list:
-    """(tid, 作成時刻) の列から、まだ止めていない非メインスレッドの tid を返す。最古の 1 本をメインとして除く。
+TOKIO_WORKER_THREAD_NAME = "tokio-runtime-worker"
 
-    メインは全スレッド（止め済みを含む）の中で作成時刻が最も古いもの。空なら例外。
-    作成時刻は刻みが粗く同着がありうるので、同着は列挙順の先頭（スレッド一覧は作成順に並ぶ）を採る。
-    外れてメインを止めた場合は STOP_PENDING にならず別の案内が出て、フェーズは失敗する（誤って合格しない）。"""
+
+def threads_to_suspend(threads, done) -> list:
+    """(tid, スレッド名) の列から、名前が tokio のワーカー名に一致し、まだ止めていないスレッドの tid を列挙順に返す。
+
+    名前が読めなかったスレッドは None で渡され、止めない。一致が無ければ空リスト。threads が空なら例外。"""
     threads = list(threads)
     if not threads:
-        raise RuntimeError("no threads to choose a main thread from")
-    oldest = min(created for _, created in threads)
-    mains = [tid for tid, created in threads if created == oldest]
+        raise RuntimeError("no threads to choose from")
     done = set(done)
-    return [tid for tid, _ in threads if tid != mains[0] and tid not in done]
+    return [tid for tid, name in threads if name == TOKIO_WORKER_THREAD_NAME and tid not in done]
 
 
 class SuspendedServiceWorkers:
-    """サービス exe のメインスレッド以外をすべて SuspendThread する（停止を PENDING のまま終わらせない）。
+    """サービス exe の tokio ワーカースレッド（名前 tokio-runtime-worker。blocking pool も同名）だけを SuspendThread する。
 
-    SCM の制御ハンドラはメインスレッド（service_dispatcher）で動いて STOP_PENDING を報告するが、本体は止まっているので
-    STOPPED にならない。止めた後にハンドラが作る STOP_PENDING の heartbeat のスレッドは止めない（checkpoint を進めるだけ）。抜けるときに全部 ResumeThread する。"""
+    停止を PENDING のまま終わらせるための故障の注入。メインスレッド以外をすべて止めると、SCM の停止制御を処理する
+    スレッドまで止まって `sc stop` が返らなかった（実 run 42951124931）。SCM のハンドラやサービス本体（block_on する
+    ServiceMain のスレッド）は生かす。`block_on(server.shutdown(budget))` はタイマーと spawn したタスクをワーカーに頼るので、
+    ワーカーが止まると終わらず STOP_PENDING のままになる（heartbeat のスレッドは動き続ける）。抜けるときに全部 ResumeThread する。"""
 
     MAX_PASSES = 20
     ERROR_NOT_ALL_ASSIGNED = 1300
 
     def __init__(self, pid: int):
         self.pid = int(pid)
-        self.handles = {}  # tid -> HANDLE（メイン含む。作成時刻を読むため開く）
+        self.handles = {}  # tid -> HANDLE（名前を読むため全スレッドを開く）
         self.suspended = []  # 止めた tid（順）
 
     @staticmethod
@@ -665,8 +666,10 @@ class SuspendedServiceWorkers:
         k.Thread32Next.restype = wintypes.BOOL
         k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         k.OpenThread.restype = wintypes.HANDLE
-        k.GetThreadTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
-        k.GetThreadTimes.restype = wintypes.BOOL
+        k.GetThreadDescription.argtypes = [wintypes.HANDLE, ctypes.POINTER(ctypes.c_void_p)]
+        k.GetThreadDescription.restype = ctypes.c_long  # HRESULT
+        k.LocalFree.argtypes = [ctypes.c_void_p]
+        k.LocalFree.restype = ctypes.c_void_p
         k.SuspendThread.argtypes = [wintypes.HANDLE]
         k.SuspendThread.restype = wintypes.DWORD
         k.ResumeThread.argtypes = [wintypes.HANDLE]
@@ -719,19 +722,24 @@ class SuspendedServiceWorkers:
         finally:
             k.CloseHandle(snap)
 
-    def _creation_time(self, apis, handle) -> int:
-        ctypes, wintypes, k, _, _, _, _ = apis
-        ft = [wintypes.FILETIME() for _ in range(4)]
-        if not k.GetThreadTimes(handle, *[ctypes.byref(f) for f in ft]):
-            raise RuntimeError(f"GetThreadTimes に失敗: {ctypes.get_last_error()}")
-        return (ft[0].dwHighDateTime << 32) | ft[0].dwLowDateTime
+    def _thread_name(self, apis, handle):
+        """GetThreadDescription でスレッド名を読む（THREAD_QUERY_LIMITED_INFORMATION が要る）。失敗や名前なしは None。"""
+        ctypes, _, k, _, _, _, _ = apis
+        pw = ctypes.c_void_p()
+        if k.GetThreadDescription(handle, ctypes.byref(pw)) < 0:  # 負の HRESULT は失敗
+            return None
+        try:
+            return ctypes.wstring_at(pw.value) if pw.value else None
+        finally:
+            if pw.value:
+                k.LocalFree(pw)
 
     def _suspend_all(self) -> None:
         apis = self._apis()
         ctypes, _, k, _, _, _, _ = apis
         self._enable_debug_privilege(apis)
         for _ in range(self.MAX_PASSES):
-            created = {}
+            named = {}
             for tid in self._thread_ids(apis):
                 if tid not in self.handles:
                     # THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION
@@ -742,9 +750,11 @@ class SuspendedServiceWorkers:
                             continue
                         raise RuntimeError(f"OpenThread({tid}) に失敗: {err}")
                     self.handles[tid] = h
-                created[tid] = self._creation_time(apis, self.handles[tid])
-            todo = threads_to_suspend(created.items(), self.suspended)
+                named[tid] = self._thread_name(apis, self.handles[tid])
+            todo = threads_to_suspend(named.items(), self.suspended)
             if not todo:
+                if not self.suspended:
+                    raise RuntimeError(f"{TOKIO_WORKER_THREAD_NAME} という名前のスレッドが見つからない（pid {self.pid}）")
                 return
             for tid in todo:
                 if k.SuspendThread(self.handles[tid]) == 0xFFFFFFFF:
@@ -2328,7 +2338,7 @@ def phase_visible_acl_refused_restart_fails(c: Ctx) -> None:
 
 def phase_visible_stop_timeout_abort(c: Ctx) -> None:
     p = "14l_visible_stop_timeout_abort"
-    # 実サーバー（LocalSystem のサービス）のメインスレッド以外を一時停止し、/P の setup が `sc stop` の後 30+60 秒待っても
+    # 実サーバー（LocalSystem のサービス）の tokio のワーカースレッドだけを一時停止し、/P の setup が `sc stop` の後 30+60 秒待っても
     # STOPPED にならない（PENDING のまま）道の主 MessageBox を確かめる。dummy は RequireRegisteredServiceInInstallDir と
     # 自身の guard を通らないので使わない。止められなかったので $ChronoGazerWasRunning は "0" になり、再開しない
     # （再開を試みれば失敗の警告 dialog が出て drive_notices が想定外の dialog で落ちる。それが再開しない確認）。
