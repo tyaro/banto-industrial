@@ -30,7 +30,7 @@ ChronoGazerのアンインストール時の削除保留判定は別単位。
 
 - 可視 UI（2026-11-11 追加、実 run は未。setup と `uninstall.exe` を `/P` で実画面に出し、窓を読んでボタンを押す。駆動部品は ChronoGazer 側の `chronogazer_setup_visible.py` を共有）:
   - `8b_visible_file_locked_cancel`: 使用中の `banto-hub-sink.exe` に `File` が書けず NSIS 自身の窓（[再試行]/[キャンセル]。文言は OS の言語で変わるので、書けないファイル名で照合しボタンは control id で取る）が出る道。窓と失敗の頁が開いている間は BantoHub が STOPPED のまま（フックはこの道に割り込めない）、頁を閉じた後の `.onInstFailed` で RUNNING に戻り、PID が変わり、3 秒後も同じ PID、Sink は STOPPED、登録・データ・Sink の exe は変わらない。その後 setup の再実行で回復する。
-  - `10b_visible_uninstall_locked_abort`: `_?=` 付きの `/P` のアンインストールが使用中の `banto-hub-sink.exe` で中止する道。主 MessageBox より先に BantoHub を再開し（PID が変わり RUNNING）、その結果（`$ServiceRestoreNote`）が主 MessageBox の本文に入る（別の窓は出ない）。OK を押して失敗の頁を閉じた後も同じ PID の RUNNING で、`un.onUninstFailed` で二重に再開していないことは PID の不変でしか見ていない。INSTDIR・登録・データは変わらない。
+  - `10b_visible_uninstall_locked_abort`: `_?=` 付きの `/P` のアンインストールが使用中の `banto-hub-sink.exe` で中止する道。主 MessageBox より先に BantoHub を再開し（PID が変わり RUNNING）、その結果（`$ServiceRestoreNote`）が主 MessageBox の本文に入る（別の窓は出ない）。OK を押して失敗の頁を閉じた後も同じ PID の RUNNING で、`un.onUninstFailed` で二重に再開していないことは PID の不変でしか見ていない。INSTDIR・登録・データは変わらない。`uninstall.exe` は保存された言語が無いと先に言語選択の窓（`Installer Language`）を出す（共通テンプレートの `MUI_UNGETLANGUAGE`）。既定の選択のまま OK を押してから案内を待つ。
 
 対象外: 上の 2 つ以外では、silent で流すので MessageBox の表示と `.onInstFailed` の二重再開の有無は見ていない。icacls の非 0 終了そのもの、`File` の書込み途中の失敗、消し残り（`RequireBantoHubExesDeleted`）、サービス停止 timeout、再開失敗、Sink 稼働中、実 collector、#392 B3-5 も対象外。アンインストールの故障系は完了と終了コードを得るため `_?=` でその場で走らせた。使用中 exe は READ 共有の `CreateFileW` のロックで作った。
 

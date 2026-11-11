@@ -495,5 +495,77 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual([w["hwnd"] for w in v.main_windows(windows, PID)], [1])
 
 
+def lang_window(hwnd=9, **kw):
+    w = window(hwnd, owner=0, **kw)
+    w["title"] = v.LANGUAGE_DIALOG_TITLE
+    w["rect"] = (0, 0, 10, 10)
+    return w
+
+
+class LanguageDialogTests(unittest.TestCase):
+    def test_select_picks_visible_same_pid_language_window(self):
+        windows = [window(1, owner=0), lang_window(9), lang_window(8, pid=1), lang_window(7, visible=False)]
+        self.assertEqual(v.select_language_dialog(windows, PID)["hwnd"], 9)
+
+    def test_select_none_without_language_window(self):
+        self.assertIsNone(v.select_language_dialog([window(1, owner=0), window(2)], PID))
+
+    def test_select_ignores_other_class(self):
+        self.assertIsNone(v.select_language_dialog([lang_window(9, cls="Button")], PID))
+
+    def test_select_ambiguous_fails(self):
+        with self.assertRaises(v.VisibleFailure):
+            v.select_language_dialog([lang_window(9), lang_window(10)], PID)
+
+    def _run(self, snapshots, child_=None):
+        rec = {}
+        it = iter(snapshots)
+        last = [snapshots[-1]]
+
+        def snap():
+            last[0] = next(it, last[0])
+            return last[0]
+
+        d = mock.Mock()
+        d.pid = PID
+        d.snapshot = snap
+        d.children_of = lambda h: [child("Static", "言語を選んでください"), child("Button", "OK", hwnd=5)]
+        d.api.u.GetDlgCtrlID = lambda h: 1
+        d.api.capture.return_value = (1, 1, b"")
+        d.gui.png_bytes.return_value = b"png"
+        d.proof_dir = Path(self._tmp)
+        with mock.patch.object(v, "_Driver", return_value=d), mock.patch.object(v, "POLL_SECONDS", 0.01):
+            ok = v.dismiss_language_dialog(child_ or FakeChild(), self._tmp, lambda k, val: rec.__setitem__(k, val), limit=0.3)
+        return ok, rec, d
+
+    def setUp(self):
+        import tempfile
+
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self._tmp = self._td.name
+
+    def test_accepts_language_dialog(self):
+        ok, rec, d = self._run([[window(1, owner=0)], [lang_window(9)]])
+        self.assertTrue(ok)
+        self.assertEqual(rec["language_dialog"], "accepted")
+        d.press.assert_called_once()
+        self.assertTrue((Path(self._tmp) / "language_dialog.png").exists())
+
+    def test_notice_first_means_not_shown(self):
+        ok, rec, d = self._run([[window(1, owner=0), window(2)]])
+        self.assertFalse(ok)
+        self.assertEqual(rec["language_dialog"], "not_shown")
+        d.press.assert_not_called()
+
+    def test_child_exit_fails(self):
+        with self.assertRaises(v.VisibleFailure):
+            self._run([[window(1, owner=0)]], child_=FakeChild(exit_at=0.0))
+
+    def test_limit_fails(self):
+        with self.assertRaises(v.VisibleFailure):
+            self._run([[window(1, owner=0)]])
+
+
 if __name__ == "__main__":
     unittest.main()

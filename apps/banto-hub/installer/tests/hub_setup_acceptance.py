@@ -23,7 +23,8 @@ BantoHub / BantoHubSink サービスを書き換え、アンインストール�
              BantoHub が STOPPED のまま、頁を閉じた後の .onInstFailed で RUNNING に戻る /
           10b `_?=` 付きの /P のアンインストールが使用中の sink exe で中止する道: 主 MessageBox より先に
              BantoHub を再開し、その結果が本文に入り、un.onUninstFailed で二重に再開しない
-             （二重再開は PID の不変でしか見ていない）
+             （二重再開は PID の不変でしか見ていない）。uninstall.exe は保存された言語が無いと先に
+             言語選択の窓（Installer Language）を出すので、OK を押してから案内を待つ
   対象外: 上の 2 つ以外の可視 UI（MessageBox の表示と二重再開は silent では見ていない）・icacls の非 0
   終了そのもの・`File` の書込み途中の失敗・消し残り（RequireBantoHubExesDeleted）・
   サービス停止 timeout・再開失敗・Sink 稼働中・実 collector。
@@ -1173,6 +1174,11 @@ def phase_visible_uninstall_locked_abort(c: Ctx) -> None:
                 expect(p, same_pid_running(), "BantoHub changed while the uninstall notice is shown", sc_state(HUB_SVC))
 
             child = subprocess.Popen(uninstall_in_place_command(INSTDIR, "/P"))
+            # uninstall.exe は保存された言語が無いと先に言語選択の窓を出す（MUI_UNGETLANGUAGE）。
+            try:
+                vis.dismiss_language_dialog(child, PROOF_DIR, lambda k, v: obs(p, k, v))
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
             started = time.monotonic()
             notices = [("uninstall_locked", uninstall_locked_notice_matches, on_shown, while_shown)]
             try:
