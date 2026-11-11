@@ -297,6 +297,36 @@ class WaitUninstallDoneTests(unittest.TestCase):
             self._run()
 
 
+class ThreadsToSuspendTests(unittest.TestCase):
+    W = c.TOKIO_WORKER_THREAD_NAME
+
+    def test_name_constant(self):
+        self.assertEqual(self.W, "tokio-rt-worker")
+
+    def test_picks_only_matching_names_in_enumeration_order(self):
+        threads = [(10, self.W), (11, "main"), (12, self.W)]
+        self.assertEqual(c.threads_to_suspend(threads, set()), [10, 12])
+
+    def test_skips_done(self):
+        threads = [(10, self.W), (11, "main"), (12, self.W)]
+        self.assertEqual(c.threads_to_suspend(threads, {12}), [10])
+        self.assertEqual(c.threads_to_suspend(threads, (10, 12)), [])
+
+    def test_unreadable_name_and_lookalikes_are_not_suspended(self):
+        threads = [(10, None), (11, self.W + "-2"), (12, "Tokio-Runtime-Worker"), (13, "")]
+        self.assertEqual(c.threads_to_suspend(threads, set()), [])
+
+    def test_no_match_is_empty(self):
+        self.assertEqual(c.threads_to_suspend([(11, "main")], set()), [])
+
+    def test_new_worker_is_picked_up_in_a_later_pass(self):
+        self.assertEqual(c.threads_to_suspend([(10, self.W), (13, self.W)], {10}), [13])
+
+    def test_empty_raises(self):
+        with self.assertRaises(RuntimeError):
+            c.threads_to_suspend([], set())
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_uninstall_in_place_command_mode_flag(self):
         self.assertEqual(
@@ -307,7 +337,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 25)
+        self.assertEqual(len(c.PHASES), 26)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -336,9 +366,24 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_visible_locked_exe_restart_fails",
                 "phase_visible_acl_refused_abort",
                 "phase_visible_acl_refused_restart_fails",
+                "phase_visible_stop_timeout_abort",
                 "phase_uninstall_delete_pending",
             ],
         )
+
+
+class StopWaitSampleTests(unittest.TestCase):
+    def test_json_output_is_merged_with_elapsed_time(self):
+        out = c.stop_wait_sample(12.34, 0, '{"sc":"STATE : 3","service_threads":[]}', "")
+        self.assertEqual(out, {"t": 12.3, "sc": "STATE : 3", "service_threads": []})
+
+    def test_unparsable_output_falls_back_to_truncated_raw_text(self):
+        out = c.stop_wait_sample(5.0, 1, "x" * 5000, "boom")
+        self.assertEqual(out["t"], 5.0)
+        self.assertEqual(out["rc"], 1)
+        self.assertEqual(len(out["raw_stdout"]), 2000)
+        self.assertEqual(out["raw_stderr"], "boom")
+        self.assertEqual(c.stop_wait_sample(1.0, 0, "[1]", "")["raw_stdout"], "[1]")
 
 
 if __name__ == "__main__":

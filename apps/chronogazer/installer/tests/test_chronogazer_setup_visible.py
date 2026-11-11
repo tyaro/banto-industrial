@@ -395,6 +395,42 @@ class NoticeMatchTests(unittest.TestCase):
         self.assertFalse(v.resume_failed_warning_matches("x" + RESUME_FAILED))
 
 
+STOP_PENDING = (
+    v.STOP_PENDING_NOTICE_PREFIX
+    + "\r\n\r\n実行ファイルを入れ替えられないため、インストールを中止しました。ファイルはまだ変更していません。"
+    "sc query ChronoGazer で STOPPED になってから、管理者権限の PowerShell から sc start ChronoGazer で開始してください。"
+)
+# hooks の RUNNING（停止を拒否された）と else（RUNNING か PENDING のまま）の文言。
+STOP_RUNNING_TEXT = (
+    "ChronoGazer サービスが停止の要求を受け付けず、RUNNING のままです。\r\n\r\n"
+    "実行ファイルを入れ替えられないため、インストールを中止しました。ファイルはまだ変更していません。サービスは動いたままです。"
+)
+STOP_ELSE_TEXT = (
+    "ChronoGazer サービスがまだ止まっていません（RUNNING か PENDING のままです）。\r\n\r\n"
+    "実行ファイルを入れ替えられないため、インストールを中止しました。ファイルはまだ変更していません。"
+)
+
+
+class StopPendingNoticeTests(unittest.TestCase):
+    def test_matches_full_text(self):
+        self.assertTrue(v.stop_pending_notice_matches(STOP_PENDING))
+
+    def test_each_required_part_is_needed(self):
+        self.assertFalse(v.stop_pending_notice_matches(STOP_PENDING.replace("インストールを中止しました", "")))
+        self.assertFalse(v.stop_pending_notice_matches(STOP_PENDING.replace("ファイルはまだ変更していません", "")))
+        self.assertFalse(v.stop_pending_notice_matches(STOP_PENDING.replace("さらに 60 秒", "さらに 30 秒")))
+
+    def test_prefix_and_other_notices(self):
+        self.assertFalse(v.stop_pending_notice_matches("x" + STOP_PENDING))
+        self.assertFalse(v.stop_pending_notice_matches(STOP_RUNNING_TEXT))
+        self.assertFalse(v.stop_pending_notice_matches(STOP_ELSE_TEXT))
+        self.assertFalse(v.stop_pending_notice_matches(LOCKED))
+        self.assertFalse(v.stop_pending_notice_matches(RESUME_FAILED))
+        self.assertFalse(v.stop_pending_notice_matches(acl_text()))
+        self.assertFalse(v.locked_exe_notice_matches(STOP_PENDING))
+        self.assertFalse(v.resume_failed_warning_matches(STOP_PENDING))
+
+
 class OkButtonTests(unittest.TestCase):
     ids = {10: 1, 11: 2, 12: 7}
 
