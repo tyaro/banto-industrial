@@ -503,3 +503,140 @@ def drive_file_locked_cancel(
         time.sleep(POLL_SECONDS)
     d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
     d.finish_after_cancel(ready_to_close=ready_to_close)
+
+
+NOTICE_AFTER_CLOSE_LIMIT_SECONDS = 90.0
+
+
+def drive_file_locked_cancel_then_notice(
+    child,
+    started: float,
+    proof_dir,
+    record,
+    matches,
+    notice_matches,
+    on_shown,
+    while_shown,
+    ready_to_close,
+    on_notice,
+    label: str = "file_locked",
+    notice_label: str = "resume_failed",
+) -> None:
+    """`drive_file_locked_cancel` の続き: [キャンセル] の後、失敗の頁を閉じると .onInstFailed が MB_OK の警告を出す道。
+
+    失敗の頁は ready_to_close が真になるまで開いておく。閉じた後に出る警告は、主窓が消えて owner が 0 になりうるので
+    「pid が同じ・visible・#32770・本文が notice_matches に合う」で探し、owner は記録だけする。主窓以外で本文が
+    合わない #32770 が出たら失敗。警告に OK を押した後も、ほかの窓が出ないことを setup の終了まで見る。"""
+    d = _Driver(child, proof_dir, record, lambda *_: None)
+    dialog, children, elapsed = d.await_question(started, matches=matches)
+    d.record(f"{label}_texts", static_texts(children))
+    d.record(f"{label}_elapsed_seconds", round(elapsed, 1))
+    width, height, rgb = d.api.capture(dialog["rect"])
+    (d.proof_dir / f"{label}_question.png").write_bytes(d.gui.png_bytes(width, height, rgb))
+    buttons = retry_cancel_buttons(children, lambda h: d.api.u.GetDlgCtrlID(h))
+    on_shown(label, elapsed)
+    hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
+    while time.monotonic() < hold_until:
+        if not d.api.u.IsWindow(dialog["hwnd"]):
+            raise VisibleFailure(f"dialog_closed_by_itself_{label}")
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure(f"setup_exited_while_dialog_shown_{label}", {"exit": rc})
+        while_shown(label)
+        time.sleep(POLL_SECONDS)
+    d.press(dialog, buttons["cancel"], IDCANCEL, "cancel")
+
+    # 失敗の頁（主窓）の間: 窓が増えないことを見て、ready_to_close が真になるまで閉じない。
+    quiet_until = time.monotonic() + QUIET_AFTER_CANCEL_SECONDS
+    while time.monotonic() < quiet_until and child.poll() is None:
+        d._no_owned_dialog("after_cancel")
+        time.sleep(POLL_SECONDS)
+    wait_deadline = time.monotonic() + SERVICE_RESUME_LIMIT_SECONDS
+    while True:
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure("setup_exited_before_failed_page_closed", {"exit": rc})
+        d._no_owned_dialog("before_main_close")
+        if ready_to_close():
+            break
+        if time.monotonic() >= wait_deadline:
+            raise VisibleFailure("not_ready_before_main_close")
+        time.sleep(POLL_SECONDS)
+
+    # 主窓を閉じて警告を待つ。主窓の hwnd にだけ WM_CLOSE を送る。
+    main_hwnd = None
+    posts = 0
+    last_post = None
+    notice = None
+    deadline = time.monotonic() + NOTICE_AFTER_CLOSE_LIMIT_SECONDS
+    while notice is None:
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure(f"setup_exited_before_notice_{notice_label}", {"exit": rc})
+        if time.monotonic() >= deadline:
+            raise VisibleFailure(f"notice_not_seen_within_limit_{notice_label}", d.snapshot())
+        shown = [
+            w for w in d.snapshot() if w["pid"] == d.pid and w["class"] == DIALOG_CLASS and w["visible"]
+        ]
+        if main_hwnd is None:
+            mains = [w for w in shown if not w.get("owner")]
+            if len(mains) > 1:
+                raise VisibleFailure("ambiguous_main_window", mains)
+            if mains:
+                main_hwnd = mains[0]["hwnd"]
+                d.record("main_window", mains)
+        found = []
+        for w in shown:
+            if w["hwnd"] == main_hwnd:
+                continue
+            kids = d.children_of(w["hwnd"])
+            texts = static_texts(kids)
+            if not texts:
+                continue  # label が揃うまで待つ
+            if any(notice_matches(t) for t in texts):
+                found.append((w, kids))
+            else:
+                raise VisibleFailure("unexpected_dialog_after_main_close", {"window": w, "texts": texts})
+        if len(found) > 1:
+            raise VisibleFailure("ambiguous_notice_dialog", [w for w, _ in found])
+        if found:
+            notice = found[0]
+            break
+        now = time.monotonic()
+        if main_hwnd is not None and (last_post is None or now - last_post >= CLOSE_RESEND_SECONDS):
+            last_post = now
+            if d.api.u.PostMessageW(main_hwnd, WM_CLOSE, 0, 0):
+                posts += 1
+            elif d.api.u.IsWindow(main_hwnd) and child.poll() is None:
+                raise VisibleFailure("PostMessage_WM_CLOSE_failed")
+        time.sleep(POLL_SECONDS)
+    d.record("main_window_close_posts", posts)
+    n_dialog, n_children = notice
+    n_elapsed = time.monotonic() - started
+    button, control_id = d.check_notice(notice_label, n_dialog, n_children, n_elapsed)
+    d.record(f"{notice_label}_owner", n_dialog.get("owner"))
+    on_notice(notice_label, n_elapsed)
+    hold_until = time.monotonic() + NOTICE_HOLD_SECONDS
+    while time.monotonic() < hold_until:
+        if not d.api.u.IsWindow(n_dialog["hwnd"]):
+            raise VisibleFailure(f"notice_closed_by_itself_{notice_label}")
+        rc = child.poll()
+        if rc is not None:
+            raise VisibleFailure(f"setup_exited_while_notice_shown_{notice_label}", {"exit": rc})
+        while_shown(notice_label)
+        time.sleep(POLL_SECONDS)
+    d.press(n_dialog, button, control_id, "ok")
+
+    finish_deadline = time.monotonic() + FINISH_LIMIT_SECONDS
+    while child.poll() is None and time.monotonic() < finish_deadline:
+        extra = [
+            w
+            for w in d.snapshot()
+            if w["pid"] == d.pid and w["class"] == DIALOG_CLASS and w["visible"] and w["hwnd"] != main_hwnd
+        ]
+        if extra:
+            raise VisibleFailure(
+                "unexpected_dialog_after_notice",
+                [{"window": w, "texts": static_texts(d.children_of(w["hwnd"]))} for w in extra],
+            )
+        time.sleep(POLL_SECONDS)

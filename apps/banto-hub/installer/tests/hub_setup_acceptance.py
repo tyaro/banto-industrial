@@ -24,10 +24,14 @@ BantoHub / BantoHubSink サービスを書き換え、アンインストール�
           10b `_?=` 付きの /P のアンインストールが使用中の sink exe で中止する道: 主 MessageBox より先に
              BantoHub を再開し、その結果が本文に入り、un.onUninstFailed で二重に再開しない
              （二重再開は PID の不変でしか見ていない）。uninstall.exe は保存された言語が無いと先に
-             言語選択の窓（Installer Language）を出すので、OK を押してから案内を待つ
-  対象外: 上の 2 つ以外の可視 UI（MessageBox の表示と二重再開は silent では見ていない）・icacls の非 0
+             言語選択の窓（Installer Language）を出すので、OK を押してから案内を待つ /
+          8c 8b と同じ `File` の窓（banto-hub.exe）の道で、止めたサービスの再開が失敗する（banto-hub.exe を
+             壊れた中身に差し替える）: 頁を閉じた後の .onInstFailed が再開を 1 回だけ試みて失敗し、警告の窓が出る /
+          10c 10b と同じ中止で再開が失敗する: 再開の失敗が主 MessageBox の本文に入り、un.onUninstFailed は
+             再度試みず窓も出さない（試みの回数は SCM の 7000 の数で見る）
+  対象外: 上の 4 つ以外の可視 UI（MessageBox の表示と二重再開は silent では見ていない）・icacls の非 0
   終了そのもの・`File` の書込み途中の失敗・消し残り（RequireBantoHubExesDeleted）・
-  サービス停止 timeout・再開失敗・Sink 稼働中・実 collector。
+  サービス停止 timeout・Sink 稼働中・実 collector。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。テスト用の管理者パスワードは実行ごとの乱数で、ログにも証拠にも出さない。
 
@@ -214,9 +218,44 @@ UNINSTALL_LOCKED_ABORTED = "アンインストールを中止しました"
 UNINSTALL_LOCKED_RESUMED = "その前に止めていたサービス（BantoHub）は再開し、RUNNING になったことを確かめました。"
 
 
-def file_locked_dialog_matches(text: str) -> bool:
+HUB_EXE = "banto-hub.exe"
+HUB_EXE_OLD = "banto-hub.banto973-old"
+CORRUPT_HUB = b"banto-973 corrupt: not a PE\n"
+RESTART_FAILED_NOTE = "再開できませんでした"
+INST_ABORTED_PREFIX = "インストールを中止しましたが、"
+SERVICE_CODE_MARK = f"{HUB_SVC} ("  # $ServiceRestoreFailed は "BantoHub (<コード>)" の形
+
+
+def file_locked_dialog_matches(text: str, exe: str = FILE_LOCKED_EXE) -> bool:
     """NSIS 自身の `File` の使用中の窓。文言は OS の言語で変わるので、書けないファイル名だけで照合する。"""
-    return FILE_LOCKED_EXE in text
+    return exe in text
+
+
+def restart_failed_warning_matches(text: str) -> bool:
+    """.onInstFailed の警告（MB_ICONEXCLAMATION）。止めたサービスの再開が失敗したときだけ出る。"""
+    return text.startswith(INST_ABORTED_PREFIX) and SERVICE_CODE_MARK in text and RESTART_FAILED_NOTE in text
+
+
+def uninstall_locked_restart_failed_notice_matches(text: str) -> bool:
+    """使用中 exe でアンインストールを中止する主 MessageBox のうち、再開の失敗（$ServiceRestoreNote）が本文に入ったもの。"""
+    return (
+        text.startswith(UNINSTALL_LOCKED_PREFIX)
+        and FILE_LOCKED_EXE in text
+        and UNINSTALL_LOCKED_ABORTED in text
+        and SERVICE_CODE_MARK in text
+        and f"は{RESTART_FAILED_NOTE}" in text
+    )
+
+
+def count_service_start_failures(returncode: int, stdout: str, stderr: str, needle: str = HUB_SVC) -> int:
+    """`wevtutil qe System ... /f:text`（SCM の 7000 = 起動失敗）の出力のうち、needle を含む事象の数。
+
+    出力が空で returncode 0 は 0 件（正常）。returncode が非 0 は例外（取得失敗を 0 件と誤判定させない）。
+    """
+    if returncode != 0:
+        raise RuntimeError(f"wevtutil に失敗（returncode={returncode}）: {(stdout + stderr)[-300:]}")
+    blocks = re.split(r"(?m)^Event\[\d+\]", stdout)[1:]
+    return sum(1 for b in blocks if needle.lower() in b.lower())
 
 
 def uninstall_locked_notice_matches(text: str) -> bool:
@@ -324,6 +363,18 @@ def service_key_exists(name: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def service_start_failure_count(name: str = HUB_SVC) -> int:
+    """System ログの SCM 7000（起動失敗）のうち name のものの数。"""
+    r = run(
+        [
+            "wevtutil", "qe", "System",
+            "/q:*[System[Provider[@Name='Service Control Manager'] and (EventID=7000)]]",
+            "/f:text",
+        ]
+    )
+    return count_service_start_failures(r.returncode, r.stdout, r.stderr, name)
 
 
 def wait_until(pred, timeout: float, interval: float = 1.0):
@@ -984,6 +1035,42 @@ def _recover_by_setup(p: str, c: Ctx) -> None:
     _expect_data_intact(p, c)
 
 
+class BrokenHubExe:
+    """稼働中の banto-hub.exe を rename で退避し、同名に壊れた中身を置く（止めた後の `sc start` が失敗する）。
+
+    稼働中の exe も rename はできる。restore() は冪等で、例外時も __exit__ で元に戻す（サービスが STOPPED のときに限る）。
+    """
+
+    def __init__(self) -> None:
+        self.exe = INSTDIR / HUB_EXE
+        self.old = INSTDIR / HUB_EXE_OLD
+
+    def __enter__(self) -> "BrokenHubExe":
+        os.rename(self.exe, self.old)
+        self.exe.write_bytes(CORRUPT_HUB)
+        return self
+
+    def corrupt_intact(self) -> bool:
+        return self.exe.is_file() and self.exe.read_bytes() == CORRUPT_HUB
+
+    def restore(self) -> None:
+        if self.old.exists():
+            if self.exe.exists():
+                self.exe.unlink()
+            os.replace(self.old, self.exe)
+
+    def __exit__(self, *exc) -> None:
+        self.restore()
+
+
+def _recover_after_broken_hub(p: str, c: Ctx, broken: BrokenHubExe) -> None:
+    # サービスは STOPPED のまま、壊れた exe を消して元の exe を戻し、起動してから setup で回復する。
+    broken.restore()
+    run(["sc", "start", HUB_SVC])
+    wait_state(HUB_SVC, "RUNNING")
+    _recover_by_setup(p, c)
+
+
 def phase_install_locked_exe(c: Ctx) -> None:
     p = "8_install_locked_exe"
     pid = _ensure_hub_running(p)
@@ -1129,6 +1216,96 @@ def phase_visible_file_locked_cancel(c: Ctx) -> None:
     _recover_by_setup(p, c)
 
 
+def phase_visible_file_locked_restart_fails(c: Ctx) -> None:
+    p = "8c_visible_file_locked_restart_fails"
+    # 8b と同じ `File` の窓の道で、止めたサービスの再開が失敗する（banto-hub.exe が壊れている）。窓と失敗の頁の間は
+    # STOPPED のまま、頁を閉じた後の .onInstFailed が再開を 1 回だけ試みて失敗し、警告の窓が出る。
+    _visible_preamble(p)
+    with BrokenHubExe() as broken:
+        failures_before = service_start_failure_count()
+        obs(p, "start_failures_before", failures_before)
+        # setup を片付けてからロックを解く順にする（上書きへ進ませない）。
+        with ExclusiveFileLock(INSTDIR / HUB_EXE):
+            child = None
+            try:
+
+                def stopped(when: str) -> dict:
+                    st = sc_state(HUB_SVC)
+                    expect(p, st["state"] == "STOPPED", f"BantoHub not STOPPED {when}", st)
+                    return st
+
+                def no_attempt_yet(when: str) -> None:
+                    count = service_start_failure_count()
+                    expect(
+                        p,
+                        count == failures_before,
+                        f"a resume was attempted {when} (.onInstFailed must not have run yet)",
+                        {"before": failures_before, "now": count},
+                    )
+
+                def on_shown(lbl: str, elapsed: float) -> None:
+                    obs(p, f"{lbl}_hub", stopped(f"while the {lbl} window is shown"))
+                    no_attempt_yet(f"while the {lbl} window is shown")
+
+                def while_shown(lbl: str) -> None:
+                    stopped(f"while the {lbl} window/notice is shown")
+
+                def ready_to_close() -> bool:
+                    obs(p, "failed_page_hub", stopped("before the failed page was closed"))
+                    no_attempt_yet("before the failed page was closed")
+                    return True
+
+                def on_notice(lbl: str, elapsed: float) -> None:
+                    reached = wait_until(lambda: service_start_failure_count() >= failures_before + 1, 30)
+                    count = service_start_failure_count()
+                    expect(p, bool(reached), "no service start failure was logged before the warning", count)
+                    obs(p, f"{lbl}_hub", stopped("while the resume-failed warning is shown"))
+                    obs(p, f"{lbl}_start_failures", count)
+                    expect(
+                        p,
+                        count == failures_before + 1,
+                        "the resume must be attempted exactly once",
+                        {"before": failures_before, "now": count},
+                    )
+
+                child = subprocess.Popen([str(c.setup), "/P"])
+                started = time.monotonic()
+                try:
+                    vis.drive_file_locked_cancel_then_notice(
+                        child,
+                        started,
+                        PROOF_DIR,
+                        lambda k, v: obs(p, k, v),
+                        lambda text: file_locked_dialog_matches(text, HUB_EXE),
+                        restart_failed_warning_matches,
+                        on_shown,
+                        while_shown,
+                        ready_to_close,
+                        on_notice,
+                    )
+                except vis.VisibleFailure as e:
+                    raise PhaseFailure(p, e.reason, e.observation) from e
+                rc = _wait_exit_within_30s(p, child)
+                expect(p, rc != 0, "cancelled setup must exit non-zero", rc)
+                time.sleep(3)  # .onInstFailed が再度試みないことを見る
+                failures_after = service_start_failure_count()
+                obs(p, "start_failures_after", failures_after)
+                expect(
+                    p,
+                    failures_after == failures_before + 1,
+                    "the resume must be attempted exactly once",
+                    {"before": failures_before, "after": failures_after},
+                )
+                stopped("after the failed resume")
+                for name in SERVICES:
+                    _expect_registered(p, name)
+                expect_no_shell(p)
+            finally:
+                _cleanup_visible(p, child)
+        expect(p, broken.corrupt_intact(), "corrupt banto-hub.exe was overwritten despite the cancel")
+        _recover_after_broken_hub(p, c, broken)
+
+
 def phase_uninstall_locked_exe(c: Ctx) -> None:
     p = "10_uninstall_locked_exe"
     pid = _ensure_hub_running(p)
@@ -1202,6 +1379,79 @@ def phase_visible_uninstall_locked_abort(c: Ctx) -> None:
             expect_no_shell(p)
         finally:
             _cleanup_visible(p, child)
+
+
+def phase_visible_uninstall_locked_restart_fails(c: Ctx) -> None:
+    p = "10c_visible_uninstall_locked_restart_fails"
+    # 10b と同じ中止で、止めたサービスの再開が失敗する（banto-hub.exe が壊れている）。再開の失敗が主 MessageBox の
+    # 本文に入り、un.onUninstFailed は再度試みず、窓も出さない（試みは 1 回だけ）。
+    _visible_preamble(p)
+    with BrokenHubExe() as broken:
+        failures_before = service_start_failure_count()
+        obs(p, "start_failures_before", failures_before)
+        before = tree_snapshot(INSTDIR)  # 壊した後の姿
+        with ExclusiveFileLock(INSTDIR / FILE_LOCKED_EXE):
+            child = None
+            try:
+
+                def stopped(when: str) -> dict:
+                    st = sc_state(HUB_SVC)
+                    expect(p, st["state"] == "STOPPED", f"BantoHub not STOPPED {when}", st)
+                    return st
+
+                def on_shown(lbl: str, elapsed: float) -> None:
+                    reached = wait_until(lambda: service_start_failure_count() >= failures_before + 1, 30)
+                    count = service_start_failure_count()
+                    expect(p, bool(reached), "no service start failure was logged before the notice", count)
+                    obs(p, f"{lbl}_hub", stopped("while the uninstall notice is shown"))
+                    obs(p, f"{lbl}_start_failures", count)
+                    expect(
+                        p,
+                        count == failures_before + 1,
+                        "the resume must be attempted exactly once",
+                        {"before": failures_before, "now": count},
+                    )
+                    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the uninstall notice is shown")
+
+                def while_shown(lbl: str) -> None:
+                    stopped("while the uninstall notice is shown")
+
+                def ready_to_close() -> bool:
+                    return sc_state(HUB_SVC)["state"] == "STOPPED"
+
+                child = subprocess.Popen(uninstall_in_place_command(INSTDIR, "/P"))
+                try:
+                    vis.dismiss_language_dialog(child, PROOF_DIR, lambda k, v: obs(p, k, v))
+                except vis.VisibleFailure as e:
+                    raise PhaseFailure(p, e.reason, e.observation) from e
+                started = time.monotonic()
+                notices = [
+                    ("uninstall_locked_restart_failed", uninstall_locked_restart_failed_notice_matches, on_shown, while_shown)
+                ]
+                try:
+                    vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
+                except vis.VisibleFailure as e:
+                    raise PhaseFailure(p, e.reason, e.observation) from e
+                rc = _wait_exit_within_30s(p, child)
+                expect(p, rc != 0, "aborted uninstall must exit non-zero", rc)
+                time.sleep(3)  # un.onUninstFailed が再度試みないことを見る
+                failures_after = service_start_failure_count()
+                obs(p, "start_failures_after", failures_after)
+                expect(
+                    p,
+                    failures_after == failures_before + 1,
+                    "the resume must be attempted exactly once (un.onUninstFailed retried?)",
+                    {"before": failures_before, "after": failures_after},
+                )
+                stopped("after the failed resume")
+                for name in SERVICES:
+                    _expect_registered(p, name)
+                _expect_still_installed(p, c, before)
+                expect_no_shell(p)
+            finally:
+                _cleanup_visible(p, child)
+        expect(p, broken.corrupt_intact(), "corrupt banto-hub.exe was changed by the aborted uninstall")
+        _recover_after_broken_hub(p, c, broken)
 
 
 def phase_uninstall_sink_delete_fail(c: Ctx) -> None:
@@ -1318,8 +1568,10 @@ PHASES = (
     phase_install_locked_exe,
     phase_install_acl_refused,
     phase_visible_file_locked_cancel,
+    phase_visible_file_locked_restart_fails,
     phase_uninstall_locked_exe,
     phase_visible_uninstall_locked_abort,
+    phase_visible_uninstall_locked_restart_fails,
     phase_uninstall_sink_delete_fail,
     phase_uninstall_hub_delete_fail,
     phase_uninstall_sink_delete_pending,
