@@ -297,6 +297,32 @@ class WaitUninstallDoneTests(unittest.TestCase):
             self._run()
 
 
+class ThreadsToSuspendTests(unittest.TestCase):
+    def test_excludes_the_oldest_as_main(self):
+        self.assertEqual(c.threads_to_suspend([(10, 300), (11, 100), (12, 200)], set()), [10, 12])
+
+    def test_skips_done_but_still_picks_main_from_all(self):
+        self.assertEqual(c.threads_to_suspend([(10, 300), (11, 100), (12, 200)], {12}), [10])
+        self.assertEqual(c.threads_to_suspend([(10, 300), (11, 100), (12, 200)], {10, 12}), [])
+
+    def test_main_only_means_nothing_to_suspend(self):
+        self.assertEqual(c.threads_to_suspend([(11, 100)], set()), [])
+
+    def test_new_thread_is_picked_up_in_a_later_pass(self):
+        self.assertEqual(c.threads_to_suspend([(11, 100), (10, 300), (13, 400)], {10}), [13])
+
+    def test_empty_raises(self):
+        with self.assertRaises(RuntimeError):
+            c.threads_to_suspend([], set())
+
+    def test_tied_oldest_takes_the_first_enumerated_as_main(self):
+        self.assertEqual(c.threads_to_suspend([(10, 100), (11, 100), (12, 200)], set()), [11, 12])
+        self.assertEqual(c.threads_to_suspend([(11, 100), (10, 100), (12, 200)], set()), [10, 12])
+
+    def test_tie_not_at_the_oldest_is_fine(self):
+        self.assertEqual(c.threads_to_suspend([(10, 100), (11, 200), (12, 200)], set()), [11, 12])
+
+
 class ImportSafetyTests(unittest.TestCase):
     def test_uninstall_in_place_command_mode_flag(self):
         self.assertEqual(
@@ -307,7 +333,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 25)
+        self.assertEqual(len(c.PHASES), 26)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -336,6 +362,7 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_visible_locked_exe_restart_fails",
                 "phase_visible_acl_refused_abort",
                 "phase_visible_acl_refused_restart_fails",
+                "phase_visible_stop_timeout_abort",
                 "phase_uninstall_delete_pending",
             ],
         )

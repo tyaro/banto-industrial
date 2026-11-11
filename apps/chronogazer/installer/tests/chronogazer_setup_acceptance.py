@@ -8,7 +8,7 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
 `.github/workflows/installer-chronogazer-acceptance.yml` から走らせる。ローカルで走らせて
 よいのは `test_chronogazer_setup_acceptance.py`（純粋部分のユニットテスト）だけ。
 
-フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 8 つ以外はすべて silent の setup / uninstall）:
+フェーズ（各 `phase_*` は独立の関数。`phase_visible_*` の 9 つ以外はすべて silent の setup / uninstall）:
   1 拒否 / 2 新規 / 3 起動と種まき（DB の番兵表＋番兵ファイル） /
   4 ACL を弱めて稼働中の上書き / 5 停止中の上書き（AUTO_START を保つ） /
   6 稼働中のアンインストール / 7 再インストール
@@ -25,15 +25,16 @@ ChronoGazer サービスを書き換え、アンインストールまで行う�
   14h 使用中 exe で上書き前に中止する道の主 MessageBox（案内より先に再開、二重再開なし） /
   14i 同じ中止で再開も失敗する道（再開失敗の警告が主 MessageBox より先、再開の試みは 1 回） /
   14j ACL の段階（INSTDIR 直下のサブフォルダ）で中止する道の主 MessageBox（14h と同じ順序） /
-  14k 同じ ACL の中止で再開も失敗する道（14i と同じ順序）
+  14k 同じ ACL の中止で再開も失敗する道（14i と同じ順序） /
+  14l サービスの停止が 30+60 秒待っても終わらない（PENDING のまま）道の主 MessageBox（実サーバーのスレッドを一時停止して作る）
   故障系は、中止後に止めたサービスが再開され（10 は止める前に断る）、ファイル・登録・データが
   変わらず、setup の再実行で回復できることを確かめる。アンインストールの故障系は `_?=` を付けて
   同じ本体をその場で走らせ、完了と終了コードを得る（フェーズ 15 の最後だけ本物の呼び方）。
 各フェーズの観測を証拠 JSON（proof/evidence.json）に残し、期待と違えばフェーズ名と
 観測を出して失敗する。
 
-対象外（このスクリプトは確かめない）: 上の 8 つ以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の timeout・`File` の書込み途中の失敗・消し残り
-（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 8 つ以外は silent なので MessageBox は未確認。
+対象外（このスクリプトは確かめない）: 上の 9 つ以外の可視 UI（WebView2 の後始末、`_?=` なしの可視のアンインストール）・サービス停止の RUNNING 拒否と追加待ち中に STOPPED になる道・`File` の書込み途中の失敗・消し残り
+（RequireChronoGazerExesDeleted）・実 collector・#392 B3-5。上の 9 つ以外は silent なので MessageBox は未確認。
 
 標準ライブラリのみ。
 """
@@ -81,6 +82,8 @@ HOST_PATH = "/api/host"  # apps/chronogazer/core/src/service_probe.rs の HOST_P
 # 製品が停止の待ち切り（30 秒 + 追加 60 秒）で中止する道は最短でも 90 秒掛かる。
 # それより短ければ、停止の待ち切りではない理由で中止したと分かる。
 STOP_TIMEOUT_ABORT_SECONDS = 90.0
+# 可視の 14l: 主 MessageBox が出るまでの下限（根拠は phase_visible_stop_timeout_abort の on_shown）。
+STOP_TIMEOUT_MIN_ELAPSED_SECONDS = 88.0
 
 
 class PhaseFailure(Exception):
@@ -598,6 +601,187 @@ class ExclusiveFileLock:
             _, k, _ = _win_apis()
             k.CloseHandle(self.handle)
             self.handle = None
+        return False
+
+
+def threads_to_suspend(threads, done) -> list:
+    """(tid, 作成時刻) の列から、まだ止めていない非メインスレッドの tid を返す。最古の 1 本をメインとして除く。
+
+    メインは全スレッド（止め済みを含む）の中で作成時刻が最も古いもの。空なら例外。
+    作成時刻は刻みが粗く同着がありうるので、同着は列挙順の先頭（スレッド一覧は作成順に並ぶ）を採る。
+    外れてメインを止めた場合は STOP_PENDING にならず別の案内が出て、フェーズは失敗する（誤って合格しない）。"""
+    threads = list(threads)
+    if not threads:
+        raise RuntimeError("no threads to choose a main thread from")
+    oldest = min(created for _, created in threads)
+    mains = [tid for tid, created in threads if created == oldest]
+    done = set(done)
+    return [tid for tid, _ in threads if tid != mains[0] and tid not in done]
+
+
+class SuspendedServiceWorkers:
+    """サービス exe のメインスレッド以外をすべて SuspendThread する（停止を PENDING のまま終わらせない）。
+
+    SCM の制御ハンドラはメインスレッド（service_dispatcher）で動いて STOP_PENDING を報告するが、本体は止まっているので
+    STOPPED にならない。抜けるときに全部 ResumeThread する。"""
+
+    MAX_PASSES = 20
+    ERROR_NOT_ALL_ASSIGNED = 1300
+
+    def __init__(self, pid: int):
+        self.pid = int(pid)
+        self.handles = {}  # tid -> HANDLE（メイン含む。作成時刻を読むため開く）
+        self.suspended = []  # 止めた tid（順）
+
+    @staticmethod
+    def _apis():
+        import ctypes
+        from ctypes import wintypes
+
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        a = ctypes.WinDLL("advapi32", use_last_error=True)
+
+        class THREADENTRY32(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ThreadID", wintypes.DWORD),
+                ("th32OwnerProcessID", wintypes.DWORD), ("tpBasePri", wintypes.LONG),
+                ("tpDeltaPri", wintypes.LONG), ("dwFlags", wintypes.DWORD),
+            ]
+
+        class LUID(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+        class TOKEN_PRIVILEGES(ctypes.Structure):
+            _fields_ = [("PrivilegeCount", wintypes.DWORD), ("Luid", LUID), ("Attributes", wintypes.DWORD)]
+
+        k.GetCurrentProcess.argtypes = []
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.Thread32First.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+        k.Thread32First.restype = wintypes.BOOL
+        k.Thread32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(THREADENTRY32)]
+        k.Thread32Next.restype = wintypes.BOOL
+        k.OpenThread.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.OpenThread.restype = wintypes.HANDLE
+        k.GetThreadTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        k.GetThreadTimes.restype = wintypes.BOOL
+        k.SuspendThread.argtypes = [wintypes.HANDLE]
+        k.SuspendThread.restype = wintypes.DWORD
+        k.ResumeThread.argtypes = [wintypes.HANDLE]
+        k.ResumeThread.restype = wintypes.DWORD
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.CloseHandle.restype = wintypes.BOOL
+        a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        a.OpenProcessToken.restype = wintypes.BOOL
+        a.LookupPrivilegeValueW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR, ctypes.POINTER(LUID)]
+        a.LookupPrivilegeValueW.restype = wintypes.BOOL
+        a.AdjustTokenPrivileges.argtypes = [
+            wintypes.HANDLE, wintypes.BOOL, ctypes.POINTER(TOKEN_PRIVILEGES), wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        a.AdjustTokenPrivileges.restype = wintypes.BOOL
+        return ctypes, wintypes, k, a, THREADENTRY32, LUID, TOKEN_PRIVILEGES
+
+    def _enable_debug_privilege(self, apis) -> None:
+        ctypes, wintypes, k, a, _, LUID, TOKEN_PRIVILEGES = apis
+        token = wintypes.HANDLE()
+        if not a.OpenProcessToken(k.GetCurrentProcess(), 0x28, ctypes.byref(token)):  # ADJUST_PRIVILEGES|QUERY
+            raise RuntimeError(f"OpenProcessToken に失敗: {ctypes.get_last_error()}")
+        try:
+            tp = TOKEN_PRIVILEGES()
+            tp.PrivilegeCount = 1
+            tp.Attributes = 2  # SE_PRIVILEGE_ENABLED
+            if not a.LookupPrivilegeValueW(None, "SeDebugPrivilege", ctypes.byref(tp.Luid)):
+                raise RuntimeError(f"LookupPrivilegeValueW に失敗: {ctypes.get_last_error()}")
+            ok = a.AdjustTokenPrivileges(token, False, ctypes.byref(tp), 0, None, None)
+            err = ctypes.get_last_error()
+            if not ok or err == self.ERROR_NOT_ALL_ASSIGNED:
+                raise RuntimeError(f"SeDebugPrivilege を有効にできない: ok={ok} err={err}")
+        finally:
+            k.CloseHandle(token)
+
+    def _thread_ids(self, apis) -> list:
+        ctypes, wintypes, k, _, THREADENTRY32, _, _ = apis
+        snap = k.CreateToolhelp32Snapshot(4, 0)  # TH32CS_SNAPTHREAD
+        if not snap or snap == _INVALID_HANDLE:
+            raise RuntimeError(f"CreateToolhelp32Snapshot に失敗: {ctypes.get_last_error()}")
+        try:
+            entry = THREADENTRY32()
+            entry.dwSize = ctypes.sizeof(THREADENTRY32)
+            tids = []
+            ok = k.Thread32First(snap, ctypes.byref(entry))
+            while ok:
+                if entry.th32OwnerProcessID == self.pid:
+                    tids.append(int(entry.th32ThreadID))
+                ok = k.Thread32Next(snap, ctypes.byref(entry))
+            return tids
+        finally:
+            k.CloseHandle(snap)
+
+    def _creation_time(self, apis, handle) -> int:
+        ctypes, wintypes, k, _, _, _, _ = apis
+        ft = [wintypes.FILETIME() for _ in range(4)]
+        if not k.GetThreadTimes(handle, *[ctypes.byref(f) for f in ft]):
+            raise RuntimeError(f"GetThreadTimes に失敗: {ctypes.get_last_error()}")
+        return (ft[0].dwHighDateTime << 32) | ft[0].dwLowDateTime
+
+    def _suspend_all(self) -> None:
+        apis = self._apis()
+        ctypes, _, k, _, _, _, _ = apis
+        self._enable_debug_privilege(apis)
+        for _ in range(self.MAX_PASSES):
+            created = {}
+            for tid in self._thread_ids(apis):
+                if tid not in self.handles:
+                    # THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION
+                    h = k.OpenThread(0x0002 | 0x0800, False, tid)
+                    if not h:
+                        err = ctypes.get_last_error()
+                        if err == 87:  # ERROR_INVALID_PARAMETER: 列挙の後に終わったスレッド
+                            continue
+                        raise RuntimeError(f"OpenThread({tid}) に失敗: {err}")
+                    self.handles[tid] = h
+                created[tid] = self._creation_time(apis, self.handles[tid])
+            todo = threads_to_suspend(created.items(), self.suspended)
+            if not todo:
+                return
+            for tid in todo:
+                if k.SuspendThread(self.handles[tid]) == 0xFFFFFFFF:
+                    raise RuntimeError(f"SuspendThread({tid}) に失敗: {ctypes.get_last_error()}")
+                self.suspended.append(tid)
+        raise RuntimeError(f"スレッドが増え続けて {self.MAX_PASSES} 回では止め切れない（pid {self.pid}）")
+
+    def _release(self) -> list:
+        """全 ResumeThread + CloseHandle。失敗は集めて最後まで回し、メッセージの一覧を返す。"""
+        errors = []
+        if not self.handles:
+            return errors
+        ctypes, _, k, _, _, _, _ = self._apis()
+        for tid in reversed(self.suspended):
+            if k.ResumeThread(self.handles[tid]) == 0xFFFFFFFF:
+                errors.append(f"ResumeThread({tid}) に失敗: {ctypes.get_last_error()}")
+        for tid, h in self.handles.items():
+            if not k.CloseHandle(h):
+                errors.append(f"CloseHandle({tid}) に失敗: {ctypes.get_last_error()}")
+        self.handles = {}
+        self.suspended = []
+        return errors
+
+    def __enter__(self):
+        try:
+            self._suspend_all()
+        except BaseException:
+            self._release()
+            raise
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        errors = self._release()
+        if errors:
+            message = f"スレッドの再開の後始末に失敗（pid {self.pid}）: {errors}"
+            print(message)
+            if exc_type is None:
+                raise RuntimeError(message)
         return False
 
 
@@ -1295,6 +1479,11 @@ def phase_install_service_install_fails_running(c: Ctx) -> None:
 def _recover_after_corrupt_server(p: str, c: Ctx, old: Path) -> None:
     # 復旧: サービスは止まっているので控えの旧 exe を消し、setup を再実行して正しい exe に戻す。
     old.unlink()
+    _recover_stopped_by_setup(p, c)
+
+
+def _recover_stopped_by_setup(p: str, c: Ctx) -> None:
+    # 止まったサービスに setup を再実行して正しい exe に戻す。止まっていたので再開されず、手で起動して確かめる。
     rc = run_setup(c.setup, [], p, "recover")
     expect(p, rc == 0, "recovery setup failed", rc)
     expect_registered(f"{p}_recover", "STOPPED")  # 止まっていたので再開しない
@@ -2040,6 +2229,82 @@ def phase_visible_acl_refused_restart_fails(c: Ctx) -> None:
     _recover_after_corrupt_server(p, c, old)
 
 
+def phase_visible_stop_timeout_abort(c: Ctx) -> None:
+    p = "14l_visible_stop_timeout_abort"
+    # 実サーバー（LocalSystem のサービス）のメインスレッド以外を一時停止し、/P の setup が `sc stop` の後 30+60 秒待っても
+    # STOPPED にならない（PENDING のまま）道の主 MessageBox を確かめる。dummy は RequireRegisteredServiceInInstallDir と
+    # 自身の guard を通らないので使わない。止められなかったので $ChronoGazerWasRunning は "0" になり、再開しない
+    # （再開を試みれば失敗の警告 dialog が出て drive_notices が想定外の dialog で落ちる。それが再開しない確認）。
+    pid = _visible_preamble(p)
+    tampered = _tamper_elev(p, c)
+    before = tree_snapshot(INSTDIR)
+    with SuspendedServiceWorkers(pid) as hold:
+        obs(p, "suspended_threads", len(hold.suspended))
+        st = sc_state()
+        obs(p, "service_while_suspended", st)
+        expect(p, st["state"] == "RUNNING" and st["pid"] == pid, "service not RUNNING with the same pid after suspend", st)
+        child = None
+        try:
+
+            def pending_and_same_pid(what: str) -> None:
+                st = sc_state()
+                expect(
+                    p,
+                    st["state"] == "STOP_PENDING" and st["pid"] == pid,
+                    f"service is not STOP_PENDING with the original pid {what}",
+                    st,
+                )
+
+            def on_shown(lbl: str, elapsed: float) -> None:
+                obs(p, f"{lbl}_service", sc_state())
+                # `sc stop` の後、StopServiceIfRunning の Sleep 29 回 + 追加待ちの Sleep 59 回（1 秒おき）で 88 秒以上。
+                expect(
+                    p,
+                    elapsed >= STOP_TIMEOUT_MIN_ELAPSED_SECONDS,
+                    "the notice came before the stop wait (30 s + 60 s) could have run out",
+                    elapsed,
+                )
+                pending_and_same_pid("when the notice is shown")
+                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the stop-timeout notice is shown")
+
+            def while_shown(lbl: str) -> None:
+                pending_and_same_pid("while the notice is shown")
+
+            def ready_to_close() -> bool:
+                st = sc_state()
+                return st["state"] == "STOP_PENDING" and st["pid"] == pid
+
+            child = subprocess.Popen([str(c.setup), "/P"])
+            started = time.monotonic()
+            notices = [("stop_timeout", vis.stop_pending_notice_matches, on_shown, while_shown)]
+            try:
+                vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            try:
+                rc = child.wait(timeout=30)
+            except subprocess.TimeoutExpired as e:
+                raise PhaseFailure(p, "setup did not exit within 30 s of closing the failed page") from e
+            obs(p, "setup_exit", rc)
+            expect(p, rc != 0, "aborted setup must exit non-zero", rc)
+            pending_and_same_pid("after setup exited")
+            expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
+            _expect_elev_still(p, tampered)
+        finally:
+            _cleanup_visible(p, child, None)
+    # スレッドを再開した。停止の保留が解け、サービスが STOPPED になる（陽性対照）。
+    try:
+        obs(p, "stopped_after_resume", wait_state(SERVICE, "STOPPED", 30))
+    except RuntimeError as e:
+        raise PhaseFailure(p, "service did not reach STOPPED within 30 s of resuming the threads", str(e)) from e
+    expect_registered(p, "STOPPED")
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup (after resume)")
+    _expect_not_delete_pending(p)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    _recover_stopped_by_setup(p, c)
+
+
 PHASES = (
     phase_reject,
     phase_fresh,
@@ -2065,6 +2330,7 @@ PHASES = (
     phase_visible_locked_exe_restart_fails,
     phase_visible_acl_refused_abort,
     phase_visible_acl_refused_restart_fails,
+    phase_visible_stop_timeout_abort,
     phase_uninstall_delete_pending,
 )
 

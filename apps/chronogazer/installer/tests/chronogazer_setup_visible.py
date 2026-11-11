@@ -18,7 +18,8 @@ MB_RETRYCANCEL で問う。このモジュールが押すのは次の 6 通り:
   `drive_retry_continue` に `matches=uninstall_recheck_question_matches` を渡す。
 上の問いとは別に、使用中 exe で上書き前に中止する道の MB_OK の案内も確かめる（`drive_notices`。再開失敗の
 警告が主案内より先に出る道を含む。偽シェルは使わない）。ACL の段階（INSTDIR 直下のサブフォルダ）で中止する
-道の案内も同じ `drive_notices` で確かめる（`acl_refused_notice_matches`）。
+道の案内も同じ `drive_notices` で確かめる（`acl_refused_notice_matches`）。サービスの停止が 30+60 秒待っても終わらない
+道の案内も同じ（`stop_pending_notice_matches`）。
 WebView2 の後始末は対象外。
 
 純粋な判定関数（本文・経過秒・ボタン・dialog の分類）と、Win32 を叩く駆動を分ける。Windows 専用の
@@ -55,6 +56,13 @@ ACL_REFUSED_NOTICE_REASON = "インストール先の中にサブフォルダが
 ACL_REFUSED_SUBDIR = "banto-973-subdir"
 ACL_REFUSED_NOTICE_NOTE = "ファイルはまだ変更していません。"
 ACL_REFUSED_NOTICE_RESUME = "上書き前に停止したサービスがあれば再開を試みました。"
+# RequireChronoGazerServiceInactive（service-hooks.nsh）の PENDING の MessageBox。`sc stop` の後 30 秒 + 追加 60 秒
+# 待っても止まらないとき。止めたサービスを再開する案内ではなく、何も変更せず中止した旨だけを伝える。
+STOP_PENDING_NOTICE_PREFIX = (
+    "ChronoGazer サービスの停止がまだ終わっていません（停止を頼んで、さらに 60 秒待ちましたが、PENDING のままです）。"
+)
+STOP_PENDING_NOTICE_ABORTED = "インストールを中止しました"
+STOP_PENDING_NOTICE_UNCHANGED = "ファイルはまだ変更していません"
 # 案内の表示中に状態が変わらないことを見続ける秒数。
 NOTICE_HOLD_SECONDS = 3.0
 # 1 秒おきの poll で Sleep は 89 回なので、spawn からの経過は 89 秒以上。上限は遅い runner の余裕。
@@ -107,6 +115,14 @@ def acl_refused_notice_matches(text: str) -> bool:
         and ACL_REFUSED_SUBDIR in text
         and ACL_REFUSED_NOTICE_NOTE in text
         and ACL_REFUSED_NOTICE_RESUME in text
+    )
+
+
+def stop_pending_notice_matches(text: str) -> bool:
+    return (
+        text.startswith(STOP_PENDING_NOTICE_PREFIX)
+        and STOP_PENDING_NOTICE_ABORTED in text
+        and STOP_PENDING_NOTICE_UNCHANGED in text
     )
 
 
