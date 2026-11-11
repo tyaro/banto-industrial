@@ -200,15 +200,17 @@ class SecretTests(unittest.TestCase):
                 "phase_install_locked_exe",
                 "phase_install_acl_refused",
                 "phase_visible_file_locked_cancel",
+                "phase_visible_file_locked_restart_fails",
                 "phase_uninstall_locked_exe",
                 "phase_visible_uninstall_locked_abort",
+                "phase_visible_uninstall_locked_restart_fails",
                 "phase_uninstall_sink_delete_fail",
                 "phase_uninstall_hub_delete_fail",
                 "phase_uninstall_sink_delete_pending",
                 "phase_uninstall_hub_delete_pending",
             ],
         )
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 18)
 
 
 UNINSTALL_NOTICE = (
@@ -238,6 +240,55 @@ class VisibleMatcherTests(unittest.TestCase):
         )
         self.assertTrue(h.file_locked_dialog_matches("ファイルを書き込み用に開けません: banto-hub-sink.exe"))
         self.assertFalse(h.file_locked_dialog_matches("Error opening file for writing: banto-hub.exe"))
+
+    def test_file_locked_dialog_matches_hub_exe(self):
+        self.assertTrue(h.file_locked_dialog_matches("Error opening file for writing: banto-hub.exe", h.HUB_EXE))
+        self.assertFalse(h.file_locked_dialog_matches("Error opening file for writing: banto-hub-sink.exe", h.HUB_EXE))
+
+    def test_restart_failed_warning_matches(self):
+        warning = (
+            "インストールを中止しましたが、その前に止めていたサービスのうち BantoHub (1053) は再開できませんでした。"
+            "サービスの状態を確かめ…\r\n\r\nファイルの書き込みの途中で失敗して…"
+        )
+        self.assertTrue(h.restart_failed_warning_matches(warning))
+        for part in (h.INST_ABORTED_PREFIX, h.SERVICE_CODE_MARK, h.RESTART_FAILED_NOTE):
+            self.assertFalse(h.restart_failed_warning_matches(warning.replace(part, "")), part)
+        self.assertFalse(h.restart_failed_warning_matches("別の窓 " + warning))
+
+    def test_uninstall_locked_restart_failed_notice_matches(self):
+        notice = (
+            "使用中の実行ファイルがあります（ banto-hub-sink.exe）。\r\n\r\nアンインストールを中止しました。"
+            "まだ何も変更していません。その前に止めていたサービスのうち BantoHub (1053) は再開できませんでした。"
+            "サービスの状態を確かめ…\r\n\r\nBantoHub のデスクトップシェルと…"
+        )
+        self.assertTrue(h.uninstall_locked_restart_failed_notice_matches(notice))
+        for part in (h.UNINSTALL_LOCKED_ABORTED, h.FILE_LOCKED_EXE, h.SERVICE_CODE_MARK, "は再開できませんでした"):
+            self.assertFalse(h.uninstall_locked_restart_failed_notice_matches(notice.replace(part, "")), part)
+        self.assertFalse(h.uninstall_locked_restart_failed_notice_matches("別の窓 " + notice))
+        # 再開に成功した本文（10b）は合わない。
+        self.assertFalse(h.uninstall_locked_restart_failed_notice_matches(UNINSTALL_NOTICE))
+        self.assertFalse(h.uninstall_locked_notice_matches(notice))
+
+    def test_count_service_start_failures(self):
+        def ev(i, svc):
+            return (
+                f"Event[{i}]:\n  Log Name: System\n  Source: Service Control Manager\n  Event ID: 7000\n"
+                f"  Description:\n  The {svc} service failed to start due to the following error:\n"
+                "  %%193 is not a valid Win32 application.\n\n"
+            )
+
+        hub = "banto-hub タグサーバー"
+        sink = "banto-hub DB Sink サイドカー"
+        self.assertEqual(h.count_service_start_failures(0, "", ""), 0)
+        out = ev(0, hub) + ev(1, "OtherSvc") + ev(2, "BANTO-HUB タグサーバー") + ev(3, sink)
+        self.assertEqual(h.count_service_start_failures(0, out, ""), 2)
+        self.assertEqual(h.count_service_start_failures(0, ev(0, sink), ""), 0)
+        self.assertEqual(h.count_service_start_failures(0, ev(0, "OtherSvc"), ""), 0)
+        with self.assertRaises(RuntimeError):
+            h.count_service_start_failures(1, out, "denied")
+
+    def test_driver_has_file_locked_notice_flow(self):
+        self.assertTrue(hasattr(h.vis, "drive_file_locked_cancel_then_notice"))
 
     def test_chronogazer_visible_driver_is_importable_and_win32_free(self):
         self.assertTrue(hasattr(h.vis, "drive_notices"))
