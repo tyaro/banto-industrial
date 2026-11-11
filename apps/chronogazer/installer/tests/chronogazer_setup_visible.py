@@ -600,6 +600,12 @@ def drive_file_locked_cancel_then_notice(
         if len(found) > 1:
             raise VisibleFailure("ambiguous_notice_dialog", [w for w, _ in found])
         if found:
+            if posts < 1:
+                # WM_CLOSE を送る前に警告が出ている = 閉じた結果ではない。早すぎる窓として失敗させる。
+                raise VisibleFailure(
+                    "unexpected_dialog_after_main_close",
+                    {"window": found[0][0], "reason": "notice_before_any_wm_close"},
+                )
             notice = found[0]
             break
         now = time.monotonic()

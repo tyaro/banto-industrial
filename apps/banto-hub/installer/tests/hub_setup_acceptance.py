@@ -223,6 +223,9 @@ HUB_EXE_OLD = "banto-hub.banto973-old"
 CORRUPT_HUB = b"banto-973 corrupt: not a PE\n"
 RESTART_FAILED_NOTE = "再開できませんでした"
 INST_ABORTED_PREFIX = "インストールを中止しましたが、"
+# SCM 7000 の本文に入るのは表示名（"banto-hub タグサーバー" / "banto-hub DB Sink サイドカー"）。ASCII 部分で照合する。
+HUB_EVENT_NEEDLE = "banto-hub"
+SINK_EVENT_EXCLUDE = "db sink"
 SERVICE_CODE_MARK = f"{HUB_SVC} ("  # $ServiceRestoreFailed は "BantoHub (<コード>)" の形
 
 
@@ -247,15 +250,22 @@ def uninstall_locked_restart_failed_notice_matches(text: str) -> bool:
     )
 
 
-def count_service_start_failures(returncode: int, stdout: str, stderr: str, needle: str = HUB_SVC) -> int:
-    """`wevtutil qe System ... /f:text`（SCM の 7000 = 起動失敗）の出力のうち、needle を含む事象の数。
+def count_service_start_failures(returncode: int, stdout: str, stderr: str) -> int:
+    """`wevtutil qe System ... /f:text`（SCM の 7000 = 起動失敗）の出力のうち、Hub の事象の数。
 
+    7000 の本文に入るのはキー名（BantoHub）ではなく表示名（"banto-hub タグサーバー"）。Sink の表示名
+    （"banto-hub DB Sink サイドカー"）にも "banto-hub" が入るので、"db sink" を含むものは除く。
+    日本語部分は使わず ASCII だけで照合する（コンソールの文字コードに左右されない）。
     出力が空で returncode 0 は 0 件（正常）。returncode が非 0 は例外（取得失敗を 0 件と誤判定させない）。
     """
     if returncode != 0:
         raise RuntimeError(f"wevtutil に失敗（returncode={returncode}）: {(stdout + stderr)[-300:]}")
     blocks = re.split(r"(?m)^Event\[\d+\]", stdout)[1:]
-    return sum(1 for b in blocks if needle.lower() in b.lower())
+    return sum(
+        1
+        for b in blocks
+        if HUB_EVENT_NEEDLE in b.lower() and SINK_EVENT_EXCLUDE not in b.lower()
+    )
 
 
 def uninstall_locked_notice_matches(text: str) -> bool:
@@ -365,8 +375,8 @@ def service_key_exists(name: str) -> bool:
         return False
 
 
-def service_start_failure_count(name: str = HUB_SVC) -> int:
-    """System ログの SCM 7000（起動失敗）のうち name のものの数。"""
+def service_start_failure_count() -> int:
+    """System ログの SCM 7000（起動失敗）のうち Hub（表示名 "banto-hub タグサーバー"）のものの数。"""
     r = run(
         [
             "wevtutil", "qe", "System",
@@ -374,7 +384,7 @@ def service_start_failure_count(name: str = HUB_SVC) -> int:
             "/f:text",
         ]
     )
-    return count_service_start_failures(r.returncode, r.stdout, r.stderr, name)
+    return count_service_start_failures(r.returncode, r.stdout, r.stderr)
 
 
 def wait_until(pred, timeout: float, interval: float = 1.0):
@@ -1047,7 +1057,15 @@ class BrokenHubExe:
 
     def __enter__(self) -> "BrokenHubExe":
         os.rename(self.exe, self.old)
-        self.exe.write_bytes(CORRUPT_HUB)
+        try:
+            self.exe.write_bytes(CORRUPT_HUB)
+        except BaseException:
+            # 書けなかったら退避した元の exe を戻してから投げ直す。
+            try:
+                self.restore()
+            except Exception as e:  # noqa: BLE001
+                print(f"[BrokenHubExe] restore after failed write also failed: {e!r}", flush=True)
+            raise
         return self
 
     def corrupt_intact(self) -> bool:
@@ -1059,8 +1077,14 @@ class BrokenHubExe:
                 self.exe.unlink()
             os.replace(self.old, self.exe)
 
-    def __exit__(self, *exc) -> None:
-        self.restore()
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            self.restore()
+        except Exception as e:  # noqa: BLE001
+            if exc_type is None:
+                raise
+            # 元の PhaseFailure を後始末の失敗で置き換えない。記録だけして元の例外を通す。
+            print(f"[BrokenHubExe] cleanup failed while propagating {exc_type.__name__}: {e!r}", flush=True)
 
 
 def _recover_after_broken_hub(p: str, c: Ctx, broken: BrokenHubExe) -> None:

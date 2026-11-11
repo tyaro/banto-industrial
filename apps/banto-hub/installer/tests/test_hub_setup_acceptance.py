@@ -277,9 +277,12 @@ class VisibleMatcherTests(unittest.TestCase):
                 "  %%193 is not a valid Win32 application.\n\n"
             )
 
+        hub = "banto-hub タグサーバー"
+        sink = "banto-hub DB Sink サイドカー"
         self.assertEqual(h.count_service_start_failures(0, "", ""), 0)
-        out = ev(0, "BantoHub") + ev(1, "OtherSvc") + ev(2, "BANTOHUB")
+        out = ev(0, hub) + ev(1, "OtherSvc") + ev(2, "BANTO-HUB タグサーバー") + ev(3, sink)
         self.assertEqual(h.count_service_start_failures(0, out, ""), 2)
+        self.assertEqual(h.count_service_start_failures(0, ev(0, sink), ""), 0)
         self.assertEqual(h.count_service_start_failures(0, ev(0, "OtherSvc"), ""), 0)
         with self.assertRaises(RuntimeError):
             h.count_service_start_failures(1, out, "denied")
