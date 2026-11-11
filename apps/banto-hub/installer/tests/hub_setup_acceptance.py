@@ -60,6 +60,9 @@ _CG_TESTS_DIR = Path(__file__).resolve().parents[3] / "chronogazer" / "installer
 if str(_CG_TESTS_DIR) not in sys.path:
     sys.path.insert(0, str(_CG_TESTS_DIR))
 import chronogazer_setup_visible as vis  # noqa: E402
+# サービスの tokio ワーカーを止める部品と停止待ちの標本は ChronoGazer 側と共有する。import は副作用が無い
+# （定数と関数・クラスの定義だけ。実行は `if __name__ == "__main__"` の中）。
+import chronogazer_setup_acceptance as cga  # noqa: E402
 
 GUARD_ENV = "BANTO_973_HUB_SETUP_TEST"
 GUARD_VALUE = "github-hosted-disposable-only-v1"
@@ -81,6 +84,9 @@ SERVICES = (HUB_SVC, SINK_SVC)
 # 製品が停止の待ち切り（30 秒 + 追加 60 秒）で中止する道は最短でも 90 秒掛かる。
 # それより短ければ、停止の待ち切りではない理由で中止したと分かる。
 STOP_TIMEOUT_ABORT_SECONDS = 90.0
+# 停止が PENDING のまま待ち切って中止する道の主 MessageBox が出るまでの下限。`sc stop` の後、StopServiceIfRunning の
+# Sleep 29 回 + 追加待ちの Sleep 59 回（どちらも 1 秒おき）で 88 秒以上。
+STOP_TIMEOUT_MIN_ELAPSED_SECONDS = 88.0
 EXES = ("banto-hub.exe", "banto-hub-shell.exe", "banto-hub-elev.exe", "banto-hub-sink.exe")
 STATUS_URL = "http://127.0.0.1:8722/api/auth/status"
 SETUP_URL = "http://127.0.0.1:8722/api/auth/setup"
@@ -247,6 +253,22 @@ def uninstall_locked_restart_failed_notice_matches(text: str) -> bool:
         and UNINSTALL_LOCKED_ABORTED in text
         and SERVICE_CODE_MARK in text
         and f"は{RESTART_FAILED_NOTE}" in text
+    )
+
+
+STOP_PENDING_NOTICE_PREFIX = f"{HUB_SVC} サービスはこのインストーラが止めましたが、まだ止まり切っていません（停止を頼んで、さらに 60 秒待ちましたが、PENDING のままです）。"
+STOP_PENDING_NOTICE_ABORTED = "インストールを中止しました"
+STOP_PENDING_NOTICE_COMMAND = f"sc start {HUB_SVC}"
+
+
+def stop_pending_notice_matches(text: str) -> bool:
+    """停止が PENDING のまま待ち切って中止する主 MessageBox（RequireBantoHubServiceInactive の "pending" の枝）。
+
+    "running"（停止要求を受け付けない）と "nowait"（停止を頼んでいない）の枝の本文、ChronoGazer の本文は含まない。"""
+    return (
+        text.startswith(STOP_PENDING_NOTICE_PREFIX)
+        and STOP_PENDING_NOTICE_ABORTED in text
+        and STOP_PENDING_NOTICE_COMMAND in text
     )
 
 
@@ -1330,6 +1352,107 @@ def phase_visible_file_locked_restart_fails(c: Ctx) -> None:
         _recover_after_broken_hub(p, c, broken)
 
 
+def phase_visible_stop_timeout_abort(c: Ctx) -> None:
+    p = "8d_visible_stop_timeout_abort"
+    # 実 banto-hub.exe（LocalSystem のサービス）の tokio ワーカーだけを一時停止し、/P の setup が `sc stop` の後
+    # 30+60 秒待っても STOPPED にならない（PENDING のまま）道の主 MessageBox を確かめる。止めたのは setup だが
+    # 待ち切れず、フラグは "0" になり .onInstFailed は再開しない（再開を試みれば SCM 7000 が増え、警告の窓も出る。
+    # 窓は drive_notices が想定外の dialog として落とし、7000 は下で数える）。Sink は止まっているので戻すものは無い。
+    pid = _visible_preamble(p)
+    sink = sc_state(SINK_SVC)
+    obs(p, "sink_before", sink)
+    expect(p, sink["state"] == "STOPPED", "Sink must be STOPPED before the phase", sink)
+    tampered = _tamper_sink(p, c)
+    before = tree_snapshot(INSTDIR)
+    failures_before = service_start_failure_count()
+    obs(p, "start_failures_before", failures_before)
+    with cga.SuspendedServiceWorkers(pid) as hold:
+        obs(p, "suspended_threads", len(hold.suspended))
+        obs(p, "suspended_tids", list(hold.suspended))
+        st = sc_state(HUB_SVC)
+        obs(p, "hub_while_suspended", st)
+        expect(p, st["state"] == "RUNNING" and st["pid"] == pid, "BantoHub not RUNNING with the same pid after suspend", st)
+        child = None
+        timeline = None
+        try:
+
+            def pending_and_same_pid(what: str) -> None:
+                st = sc_state(HUB_SVC)
+                expect(
+                    p,
+                    st["state"] == "STOP_PENDING" and st["pid"] == pid,
+                    f"BantoHub is not STOP_PENDING with the original pid {what}",
+                    st,
+                )
+
+            def no_resume_attempt(what: str) -> None:
+                count = service_start_failure_count()
+                expect(
+                    p,
+                    count == failures_before,
+                    f"a resume was attempted {what} (the flag must be 0)",
+                    {"before": failures_before, "now": count},
+                )
+
+            def on_shown(lbl: str, elapsed: float) -> None:
+                obs(p, f"{lbl}_hub", sc_state(HUB_SVC))
+                expect(
+                    p,
+                    elapsed >= STOP_TIMEOUT_MIN_ELAPSED_SECONDS,
+                    "the notice came before the stop wait (30 s + 60 s) could have run out",
+                    elapsed,
+                )
+                pending_and_same_pid("when the notice is shown")
+                expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed while the stop-timeout notice is shown")
+                no_resume_attempt("when the notice is shown")
+
+            def while_shown(lbl: str) -> None:
+                pending_and_same_pid("while the notice is shown")
+
+            def ready_to_close() -> bool:
+                st = sc_state(HUB_SVC)
+                return st["state"] == "STOP_PENDING" and st["pid"] == pid
+
+            child = subprocess.Popen([str(c.setup), "/P"])
+            timeline = cga.StopWaitTimeline(child.pid, pid, service=HUB_SVC).__enter__()
+            started = time.monotonic()
+            notices = [("stop_timeout", stop_pending_notice_matches, on_shown, while_shown)]
+            try:
+                vis.drive_notices(child, started, PROOF_DIR, lambda k, v: obs(p, k, v), notices, ready_to_close)
+            except vis.VisibleFailure as e:
+                raise PhaseFailure(p, e.reason, e.observation) from e
+            rc = _wait_exit_within_30s(p, child)
+            expect(p, rc != 0, "aborted setup must exit non-zero", rc)
+            pending_and_same_pid("after setup exited")
+            expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup")
+            no_resume_attempt("by the aborted setup")
+            _expect_sink_still(p, tampered)
+        finally:
+            # 失敗でも標本を必ず残す。setup を kill する前に止める（kill 後の標本で停止待ちの様子を汚さない）。
+            if timeline is not None:
+                timeline.__exit__(None, None, None)
+                obs(p, "stop_wait_timeline", timeline.samples)
+            _cleanup_visible(p, child)
+    # スレッドを再開した。停止の保留が解け、BantoHub が STOPPED になる（陽性対照）。Hub の停止は自前の上限を持つ。
+    try:
+        obs(p, "stopped_after_resume", wait_state(HUB_SVC, "STOPPED", 60))
+    except RuntimeError as e:
+        raise PhaseFailure(p, "BantoHub did not reach STOPPED within 60 s of resuming the threads", str(e)) from e
+    sink = sc_state(SINK_SVC)
+    obs(p, "sink_after", sink)
+    expect(p, sink["state"] == "STOPPED", "Sink was started by the aborted setup", sink)
+    for name in SERVICES:
+        _expect_registered(p, name)
+    expect(p, tree_snapshot(INSTDIR) == before, "INSTDIR changed by the aborted setup (after resume)")
+    _expect_sink_still(p, tampered)
+    _expect_data_intact(p, c)
+    expect_no_shell(p)
+    # 止まった Hub を起動し直してから setup で回復する（後のフェーズは RUNNING を前提にする）。
+    run(["sc", "start", HUB_SVC])
+    wait_state(HUB_SVC, "RUNNING")
+    _recover_by_setup(p, c)
+
+
 def phase_uninstall_locked_exe(c: Ctx) -> None:
     p = "10_uninstall_locked_exe"
     pid = _ensure_hub_running(p)
@@ -1593,6 +1716,7 @@ PHASES = (
     phase_install_acl_refused,
     phase_visible_file_locked_cancel,
     phase_visible_file_locked_restart_fails,
+    phase_visible_stop_timeout_abort,
     phase_uninstall_locked_exe,
     phase_visible_uninstall_locked_abort,
     phase_visible_uninstall_locked_restart_fails,

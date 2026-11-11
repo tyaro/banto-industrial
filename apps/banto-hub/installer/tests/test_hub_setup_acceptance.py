@@ -201,6 +201,7 @@ class SecretTests(unittest.TestCase):
                 "phase_install_acl_refused",
                 "phase_visible_file_locked_cancel",
                 "phase_visible_file_locked_restart_fails",
+                "phase_visible_stop_timeout_abort",
                 "phase_uninstall_locked_exe",
                 "phase_visible_uninstall_locked_abort",
                 "phase_visible_uninstall_locked_restart_fails",
@@ -210,7 +211,7 @@ class SecretTests(unittest.TestCase):
                 "phase_uninstall_hub_delete_pending",
             ],
         )
-        self.assertEqual(len(names), 18)
+        self.assertEqual(len(names), 19)
 
 
 UNINSTALL_NOTICE = (
@@ -233,6 +234,31 @@ class VisibleMatcherTests(unittest.TestCase):
             h.UNINSTALL_LOCKED_RESUMED, "その前に止めていたサービスのうち BantoHub は再開できませんでした。"
         )
         self.assertFalse(h.uninstall_locked_notice_matches(failed_resume))
+
+    def test_stop_pending_notice_matches(self):
+        pending = (
+            "BantoHub サービスはこのインストーラが止めましたが、まだ止まり切っていません"
+            "（停止を頼んで、さらに 60 秒待ちましたが、PENDING のままです）。\r\n\r\n"
+            "実行ファイルを入れ替えられないため、インストールを中止しました。ファイルはまだ変更していません。\r\n\r\n"
+            "sc query BantoHub で STOPPED になってから、管理者権限の PowerShell から sc start BantoHub で開始してください。"
+        )
+        running = (
+            "BantoHub サービスが停止の要求を受け付けず、RUNNING のままです。\r\n\r\n"
+            "実行ファイルを入れ替えられないため、インストールを中止しました。ファイルはまだ変更していません。"
+            "サービスは動いたままです。\r\n\r\nサービスの状態を確かめ（sc query BantoHub）、止めてからもう一度実行してください。"
+        )
+        nowait = (
+            "BantoHub サービスがまだ止まっていません（RUNNING か PENDING のままです。このインストーラは停止を頼んでいません）。"
+            "\r\n\r\n実行ファイルを入れ替えられないため、インストールを中止しました。"
+        )
+        chrono = pending.replace("BantoHub", "ChronoGazer")
+        self.assertTrue(h.stop_pending_notice_matches(pending))
+        self.assertFalse(h.stop_pending_notice_matches(running))
+        self.assertFalse(h.stop_pending_notice_matches(nowait))
+        self.assertFalse(h.stop_pending_notice_matches(chrono))
+        self.assertFalse(h.stop_pending_notice_matches("別の窓 " + pending))
+        for part in (h.STOP_PENDING_NOTICE_ABORTED, h.STOP_PENDING_NOTICE_COMMAND):
+            self.assertFalse(h.stop_pending_notice_matches(pending.replace(part, "")), part)
 
     def test_file_locked_dialog_matches(self):
         self.assertTrue(
