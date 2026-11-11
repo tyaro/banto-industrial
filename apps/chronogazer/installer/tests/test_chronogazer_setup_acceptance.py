@@ -301,7 +301,7 @@ class ThreadsToSuspendTests(unittest.TestCase):
     W = c.TOKIO_WORKER_THREAD_NAME
 
     def test_name_constant(self):
-        self.assertEqual(self.W, "tokio-runtime-worker")
+        self.assertEqual(self.W, "tokio-rt-worker")
 
     def test_picks_only_matching_names_in_enumeration_order(self):
         threads = [(10, self.W), (11, "main"), (12, self.W)]

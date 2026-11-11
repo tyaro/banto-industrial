@@ -605,7 +605,7 @@ class ExclusiveFileLock:
         return False
 
 
-TOKIO_WORKER_THREAD_NAME = "tokio-runtime-worker"
+TOKIO_WORKER_THREAD_NAME = "tokio-rt-worker"
 
 
 def threads_to_suspend(threads, done) -> list:
@@ -620,7 +620,7 @@ def threads_to_suspend(threads, done) -> list:
 
 
 class SuspendedServiceWorkers:
-    """サービス exe の tokio ワーカースレッド（名前 tokio-runtime-worker。blocking pool も同名）だけを SuspendThread する。
+    """サービス exe の tokio ワーカースレッド（名前 tokio-rt-worker。blocking pool も同名）だけを SuspendThread する。
 
     停止を PENDING のまま終わらせるための故障の注入。メインスレッド以外をすべて止めると、SCM の停止制御を処理する
     スレッドまで止まって `sc stop` が返らなかった（実 run 42951124931）。SCM のハンドラやサービス本体（block_on する
@@ -754,7 +754,7 @@ class SuspendedServiceWorkers:
             todo = threads_to_suspend(named.items(), self.suspended)
             if not todo:
                 if not self.suspended:
-                    raise RuntimeError(f"{TOKIO_WORKER_THREAD_NAME} という名前のスレッドが見つからない（pid {self.pid}）")
+                    raise RuntimeError(f"{TOKIO_WORKER_THREAD_NAME} という名前のスレッドが見つからない（pid {self.pid}、見えた名前: {sorted(set(map(str, named.values())))}）")
                 return
             for tid in todo:
                 if k.SuspendThread(self.handles[tid]) == 0xFFFFFFFF:
