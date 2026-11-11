@@ -623,7 +623,7 @@ class SuspendedServiceWorkers:
     """サービス exe のメインスレッド以外をすべて SuspendThread する（停止を PENDING のまま終わらせない）。
 
     SCM の制御ハンドラはメインスレッド（service_dispatcher）で動いて STOP_PENDING を報告するが、本体は止まっているので
-    STOPPED にならない。抜けるときに全部 ResumeThread する。"""
+    STOPPED にならない。止めた後にハンドラが作る STOP_PENDING の heartbeat のスレッドは止めない（checkpoint を進めるだけ）。抜けるときに全部 ResumeThread する。"""
 
     MAX_PASSES = 20
     ERROR_NOT_ALL_ASSIGNED = 1300
