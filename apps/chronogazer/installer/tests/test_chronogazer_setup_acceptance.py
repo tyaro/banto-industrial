@@ -307,7 +307,7 @@ class ImportSafetyTests(unittest.TestCase):
     def test_import_has_no_side_effects(self):
         self.assertEqual(c.EVIDENCE, {"phases": {}})
         self.assertIsNone(c.PROOF_DIR)
-        self.assertEqual(len(c.PHASES), 23)
+        self.assertEqual(len(c.PHASES), 25)
 
     def test_fault_phases_follow_reinstall_in_order(self):
         names = [ph.__name__ for ph in c.PHASES]
@@ -334,6 +334,8 @@ class ImportSafetyTests(unittest.TestCase):
                 "phase_visible_uninstall_recheck_retry_continues",
                 "phase_visible_locked_exe_abort",
                 "phase_visible_locked_exe_restart_fails",
+                "phase_visible_acl_refused_abort",
+                "phase_visible_acl_refused_restart_fails",
                 "phase_uninstall_delete_pending",
             ],
         )

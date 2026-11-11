@@ -335,6 +335,47 @@ LOCKED = v.LOCKED_EXE_NOTICE_PREFIX + "chronogazer-elev.exe）。上書きはま
 RESUME_FAILED = v.RESUME_FAILED_PREFIX + "エラー）。"
 
 
+# AbortInstallDirAcl の本文（`$\r$\n` は `\r\n`）。INSTDIR は C:\Program Files\ChronoGazer、理由はサブフォルダ。
+ACL_REASON = "インストール先の中にサブフォルダがあります。ChronoGazer のインストーラはサブフォルダを作らないので、ChronoGazer の物ではありません。"
+ACL_NOTE = "上書き前に停止したサービスがあれば再開を試みました。再開できなかった場合は直前の案内を確認してください。"
+
+
+def acl_text(
+    prefix=v.ACL_REFUSED_NOTICE_PREFIX,
+    head=v.ACL_REFUSED_NOTICE_HEAD,
+    reason=ACL_REASON,
+    target=v.ACL_REFUSED_SUBDIR,
+    changed=v.ACL_REFUSED_NOTICE_NOTE,
+    note=ACL_NOTE,
+):
+    return (
+        f"{prefix}C:\\Program Files\\ChronoGazer {head}\r\n{reason}\r\n対象: {target}\r\n\r\n"
+        f"既存のフォルダのアクセス権が弱いまま実行ファイルを置かないよう、インストールを中止しました。{changed}{note}\r\n\r\n"
+        "対象のリンクやサブフォルダを取り除く（または先にアンインストールする）か、フォルダを使用しているプログラムを終了するか、"
+        "管理者権限で C:\Program Files\ChronoGazer の所有者とアクセス権を確かめてから、もう一度実行してください。"
+    )
+
+
+class AclRefusedNoticeTests(unittest.TestCase):
+    def test_matches_full_text(self):
+        self.assertTrue(v.acl_refused_notice_matches(acl_text()))
+
+    def test_each_required_part_is_needed(self):
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(head="の所有者を戻せませんでした。")))
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(reason="icacls が失敗しました（終了コード 5）。")))
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(target="other")))
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(changed="")))
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(note="")))
+
+    def test_prefix_and_other_notices(self):
+        self.assertFalse(v.acl_refused_notice_matches("x" + acl_text()))
+        self.assertFalse(v.acl_refused_notice_matches(acl_text(prefix="")))
+        self.assertFalse(v.acl_refused_notice_matches(LOCKED))
+        self.assertFalse(v.acl_refused_notice_matches(RESUME_FAILED))
+        self.assertFalse(v.locked_exe_notice_matches(acl_text()))
+        self.assertFalse(v.resume_failed_warning_matches(acl_text()))
+
+
 class NoticeMatchTests(unittest.TestCase):
     def test_locked_exe_notice_matches(self):
         self.assertTrue(v.locked_exe_notice_matches(LOCKED))
