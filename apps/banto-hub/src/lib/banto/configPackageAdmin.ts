@@ -38,6 +38,7 @@ import {
 	planByName,
 	resolvePushSettings,
 	serializeConfigPackage,
+	ConfigPackageParseError,
 	type ConfigPackage,
 	type ConfigPackageIngestConnection,
 	type ConfigPackagePlcConnection,
@@ -46,6 +47,7 @@ import {
 	type ConfigPackageImportSummary,
 	type ConfigPackageInspection
 } from './configPackage';
+import { dottedNameError } from './dottedName';
 
 /**
  * 監査③（2026-08-12）是正: `settings/+page.svelte` は import 実行前に
@@ -142,6 +144,40 @@ function buildKeyedMap<T>(
 /** S6: `sinkGroups`の plan/apply 用（`buildConnectionMap`等と同じ形）。 */
 function buildSinkGroupMap(groups: readonly SinkGroup[]): Map<string, SinkGroup> {
 	return new Map(groups.map((group) => [group.name, group]));
+}
+
+/**
+ * 接続名・グループ名に `.` は使えない（2026-11-12 オーナー決定、`dottedName.ts`）。取り込みで
+ * **新しく作る**接続・グループのうち `.` を含む名前を、書き込む前にまとめて断る（途中まで
+ * 書いてからサーバーに断られないように）。同じ名前の既存のものは更新で名前が変わらないので、
+ * その規則より前の名前でも通す（サーバーと同じ）。確認の画面と書き込みの前の両方で呼ぶ。
+ */
+function checkConfigPackageDottedNames(
+	pkg: Pick<ConfigPackage, 'plcConnections' | 'collectionGroups'>,
+	currentConnections: readonly PlcConnection[],
+	currentGroups: readonly CollectionGroup[]
+): void {
+	const connectionNames = new Set(currentConnections.map((connection) => connection.name));
+	const keys = registryKeys(currentConnections, currentGroups);
+	const groupKeys = new Set(currentGroups.map((group) => keys.groupKey(group)));
+	const problems: string[] = [];
+	for (const connection of pkg.plcConnections) {
+		if (isVirtualConnection(connection) || connectionNames.has(connection.name)) continue;
+		const message = dottedNameError(connection.name, '接続名');
+		if (message !== null) problems.push(`接続 '${connection.name}': ${message}`);
+	}
+	for (const group of pkg.collectionGroups) {
+		if (groupKeys.has(configPackageGroupKey(group.plcConnectionName, group.name))) continue;
+		const message = dottedNameError(group.name, 'グループ名');
+		if (message !== null) {
+			problems.push(`収集グループ '${group.plcConnectionName} / ${group.name}': ${message}`);
+		}
+	}
+	if (problems.length > 0) {
+		throw new ConfigPackageParseError(
+			`構成パッケージに作れない名前があります。名前を変えて書き出し直してください（${problems.join('、')}）`
+		);
+	}
 }
 
 function collectConnectionNames(
@@ -271,6 +307,7 @@ export async function inspectConfigPackage(pkg: ConfigPackage): Promise<ConfigPa
 	// 版 3（設計 §7.1）: 欠けた欄・秘密の欄をこの Hub のドライバのスキーマで断る。確認の
 	// 画面に進む前（読み込みのエラーとして）に出す。
 	checkConfigPackageConnectionFields(pkg, drivers);
+	checkConfigPackageDottedNames(pkg, currentConnections, currentGroups);
 
 	const keys = registryKeys(currentConnections, currentGroups);
 	const currentConnectionNames = collectConnectionNames(currentConnections, pkg);
@@ -423,6 +460,7 @@ async function applyConfigPackageInner(
 	// 版 3: 確認の画面（`inspectConfigPackage`）と同じ確かめを、書き込む前にもう一度する
 	// （確認の後にドライバの構成が変わっても、欠けた欄を既定で埋めて書き込まない）。
 	checkConfigPackageConnectionFields(pkg, drivers);
+	checkConfigPackageDottedNames(pkg, currentConnections, currentGroups);
 
 	const warnings: string[] = [];
 	const connectionByName = buildConnectionMap(currentConnections);

@@ -782,6 +782,8 @@ async fn collection_group_names_are_unique_per_connection_over_rest() {
 /// #635（2026-10-17 オーナー決定 案 A）: 接続・グループ・タグの作成と改名で、
 /// ドットを含む名前をつないだ外部名が既存のタグと重なれば 422 で断り、
 /// どの既存のタグと重なるかを文言で示す。断った書き込みは残らない。
+/// 2026-11-12 から接続名・グループ名の `.` は作成・改名で断る（下の最初の確かめ）ので、
+/// `.` を含む接続・グループはその規則より前の行として SQL で名前を付ける。
 #[tokio::test]
 async fn registry_writes_reject_a_new_external_name_collision() {
     let env = test_env().await;
@@ -807,14 +809,41 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         );
     }
 
+    // 2026-11-12: 接続名・グループ名の `.` は作成で断る。
+    let (status, body) = admin_post(
+        router,
+        "/api/plc-connections",
+        token,
+        json!({ "protocol": "modbus-tcp", "name": "x.y", "settings": { "host": "127.0.0.1", "port": 15080 } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body:?}");
+    assert_eq!(body["field_errors"][0]["field"], "name", "{body:?}");
+    async fn legacy_rename(
+        pool: &sqlx::SqlitePool,
+        table: &str,
+        id: &serde_json::Value,
+        name: &str,
+    ) {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "UPDATE {table} SET name = ? WHERE id = ?"
+        )))
+        .bind(name)
+        .bind(id.as_i64().unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
     // 既存: 接続「a.b」/ グループ「c」/ タグ「d」= 外部名 a.b.c.d
     let ab = post_ok(
         router,
         token,
         "/api/plc-connections",
-        json!({ "protocol": "modbus-tcp", "name": "a.b", "settings": { "host": "127.0.0.1", "port": 15081 } }),
+        json!({ "protocol": "modbus-tcp", "name": "a_b", "settings": { "host": "127.0.0.1", "port": 15081 } }),
     )
     .await;
+    legacy_rename(&env.pool, "plc_connections", &ab["id"], "a.b").await;
     let c = post_ok(
         router,
         token,
@@ -844,9 +873,10 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/collection-groups",
-        json!({ "name": "b.c", "plcConnectionId": a["id"], "periodMs": 1000 }),
+        json!({ "name": "b_c", "plcConnectionId": a["id"], "periodMs": 1000 }),
     )
     .await;
+    legacy_rename(&env.pool, "collection_groups", &bc["id"], "b.c").await;
     let (status, body) = admin_post(router, "/api/tags", token, tag("d", &bc)).await;
     assert_collision(status, &body, "接続「a.b」/ グループ「c」/ タグ「d」");
     assert!(body["field_errors"][0]["message"]
@@ -864,8 +894,8 @@ async fn registry_writes_reject_a_new_external_name_collision() {
     .await;
     assert_collision(status, &body, "接続「a.b」/ グループ「c」/ タグ「d」");
 
-    // グループの改名: a.b / zz / y を作り、グループを「c2.x」へ変えると、
-    // 既存の a.b / c2 / x.y（= a.b.c2.x.y）と重なる。
+    // グループの改名: a / zz / c2.x.y を作り、グループを「b」へ変えると、
+    // 既存の a.b / c2 / x.y（= a.b.c2.x.y）と重なる（グループ名に `.` は付けられない）。
     let c2 = post_ok(
         router,
         token,
@@ -878,15 +908,15 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/collection-groups",
-        json!({ "name": "zz", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        json!({ "name": "zz", "plcConnectionId": a["id"], "periodMs": 1000 }),
     )
     .await;
-    post_ok(router, token, "/api/tags", tag("y", &zz)).await;
+    post_ok(router, token, "/api/tags", tag("c2.x.y", &zz)).await;
     let (status, body) = admin_put(
         router,
         &format!("/api/collection-groups/{}", zz["id"]),
         token,
-        json!({ "name": "c2.x", "plcConnectionId": ab["id"], "periodMs": 1000 }),
+        json!({ "name": "b", "plcConnectionId": a["id"], "periodMs": 1000 }),
     )
     .await;
     assert_collision(status, &body, "接続「a.b」/ グループ「c2」/ タグ「x.y」");
@@ -908,9 +938,10 @@ async fn registry_writes_reject_a_new_external_name_collision() {
         router,
         token,
         "/api/collection-groups",
-        json!({ "name": "b.c2", "plcConnectionId": m["id"], "periodMs": 1000 }),
+        json!({ "name": "b_c2", "plcConnectionId": m["id"], "periodMs": 1000 }),
     )
     .await;
+    legacy_rename(&env.pool, "collection_groups", &bc2["id"], "b.c2").await;
     post_ok(router, token, "/api/tags", tag("d", &bc2)).await;
     let (status, body) = admin_put(
         router,

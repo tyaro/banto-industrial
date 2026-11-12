@@ -278,7 +278,8 @@ use crate::push::{validate_push_settings, PushSettings};
 use crate::settings_json::legacy::{settings_from_flat, SLMP_PROTOCOL};
 use crate::settings_json::validate_settings_with_registry;
 use crate::support::{
-    map_write_error, max_length_message, range_message, required_message, NAME_ALREADY_USED,
+    dotted_name_error, map_write_error, max_length_message, range_message, required_message,
+    CONNECTION_NAME_LABEL, NAME_ALREADY_USED,
 };
 use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
@@ -1319,6 +1320,39 @@ const COLUMNS: &str = "id, name, protocol, enabled, simulation, settings, settin
 /// `SELECT protocol, settings` of the row an update is about to overwrite.
 const EXISTING_ROW_SQL: &str = "SELECT protocol, settings FROM plc_connections WHERE id = ?";
 
+/// 接続名の `.` の検査（[`dotted_name_error`]、2026-11-12 オーナー決定）。作成・更新の
+/// すべての入口（平らな入力・`settings` の形・未適用キューの前の検査）がここを通る。
+/// `stored_name` は更新で上書きされる行の今の名前（作成は `None`）。
+pub(super) fn reject_dotted_name(name: &str, stored_name: Option<&str>) -> Result<(), BantoError> {
+    validation(
+        dotted_name_error(name, stored_name, CONNECTION_NAME_LABEL)
+            .into_iter()
+            .collect(),
+    )
+}
+
+/// 更新の前に接続名の `.` を検査する。名前に `.` があるときだけ今の名前を読む
+/// （名前を変えない更新は通す。行が無ければここでは断らず、後の `NotFound` に任せる）。
+async fn check_dotted_name_update(
+    connection: &mut SqliteConnection,
+    id: i64,
+    name: &str,
+) -> Result<(), BantoError> {
+    if !name.trim().contains('.') {
+        return Ok(());
+    }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT name FROM plc_connections WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *connection)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    match stored {
+        Some(stored) => reject_dotted_name(name, Some(&stored)),
+        None => Ok(()),
+    }
+}
+
 /// The refusal for editing a reserved `"virtual"` connection.
 fn reserved_edit_error() -> BantoError {
     BantoError::Validation {
@@ -1662,6 +1696,7 @@ impl PlcConnectionService {
         typed: Option<TypedSettings>,
     ) -> Result<PlcConnection, BantoError> {
         let input = normalize_plc_connection_input(input);
+        reject_dotted_name(&input.name, None)?;
         let secret_keys = self.secret_keys(&input.protocol);
         let mut settings = match &typed {
             Some(typed) => typed.settings.clone(),
@@ -1800,6 +1835,7 @@ impl PlcConnectionService {
         // value was already valid when it was stored.
         input.simulation = simulation.unwrap_or(false);
         let input = normalize_plc_connection_input(input);
+        check_dotted_name_update(&mut *connection, id, &input.name).await?;
         let secret_keys = self.secret_keys(&input.protocol);
         if typed.is_none() {
             validate_plc_connection_input(&input, &secret_keys)?;
@@ -3900,6 +3936,43 @@ mod tests {
             .expect("update should succeed");
         assert_eq!(updated.name, "After");
         assert_eq!(updated.setting_i64("port").unwrap_or(0), 503);
+    }
+
+    /// 接続名に `.` は使えない（2026-11-12 オーナー決定）: 平らな入力の作成・改名を
+    /// `name` で断り、規則より前の `.` を含む名前は名前を変えない更新なら通す。
+    #[tokio::test]
+    async fn a_dotted_name_is_refused_on_create_and_rename_but_kept_on_update() {
+        let svc = service().await;
+        assert_eq!(
+            only_field_error(svc.create(sample_input("Line.1")).await.unwrap_err()).field,
+            "name"
+        );
+        let created = svc.create(sample_input("Line1")).await.unwrap();
+        assert_eq!(
+            only_field_error(
+                svc.update(created.id, sample_input("Line.1"))
+                    .await
+                    .unwrap_err()
+            )
+            .field,
+            "name"
+        );
+
+        sqlx::query("UPDATE plc_connections SET name = 'Old.Line' WHERE id = ?")
+            .bind(created.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        let mut keep = sample_input(" Old.Line ");
+        keep.port = 503;
+        let updated = svc.update(created.id, keep).await.unwrap();
+        assert_eq!(updated.name, "Old.Line");
+        assert_eq!(updated.setting_i64("port"), Some(503));
+        // A missing row stays a NotFound even with a dotted name.
+        assert!(matches!(
+            svc.update(999, sample_input("X.1")).await.unwrap_err(),
+            BantoError::NotFound { .. }
+        ));
     }
 
     // --- P3-b: "word_order" column (migration 0010) ------------------------

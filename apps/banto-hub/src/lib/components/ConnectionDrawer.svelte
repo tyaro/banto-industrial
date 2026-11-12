@@ -98,6 +98,7 @@
 	import { listPendingChanges, type PendingChange } from '#lib/banto/pendingChangesAdmin.js';
 	import { pendingCreateNames } from '#lib/banto/pendingCreateNames.js';
 	import { isFormDirty } from '#lib/banto/formDirty.js';
+	import { dottedNameError } from '#lib/banto/dottedName.js';
 	import { passwordStatusView } from '#lib/banto/secretStorageView.js';
 	import {
 		createPlcConnection,
@@ -846,6 +847,9 @@
 	function validateBeforeSubmit(): boolean {
 		// R2a-2e: push の欄（範囲・ブリッジの形・§7.1 の見積もり）も送る前に確かめる。
 		const fieldErrors = { ...validatePostgresFields(form), ...validatePushFields(form) };
+		// 接続名の `.`（`dottedName.ts`）。名前を変えない更新は通す。
+		const nameError = dottedNameError(form.name, '接続名', connection?.name);
+		if (nameError !== null) fieldErrors.name = nameError;
 		const driverFound = driver
 			? validateDriverValues(driver.settingsSchema.fields, form.driver.values)
 			: {};

@@ -196,7 +196,7 @@ async fn push_tag(env: &TestEnv, conn_id: i64, key: &str) -> i64 {
         &env.router,
         "/api/collection-groups",
         &env.admin_token,
-        json!({ "name": format!("g-{key}"), "plcConnectionId": conn_id, "periodMs": 100 }),
+        json!({ "name": format!("g-{}", key.replace('.', "-")), "plcConnectionId": conn_id, "periodMs": 100 }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{group:?}");

@@ -3591,6 +3591,8 @@ mod tests {
     /// #635: 既に外部名が重なっている DB（2026-10-17 の検証より前に書いた行）でも
     /// catalog の commit と収集の適用は失敗しない（起動を止めない、オーナー決定）。
     /// 重なりは catalog に載り、警告の行に出る（`warn_external_name_collisions`）。
+    /// 2026-11-12 から接続名・グループ名の `.` はサービスが断るので、`.` を含む名前は
+    /// その規則より前の行と同じく SQL で書く（`.` を含む名前の DB でも起動できる）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn commit_and_apply_keep_running_with_an_existing_external_name_collision() {
         let (_dir, manager, pool) = manager_env().await;
@@ -3598,7 +3600,7 @@ mod tests {
         for (conn_name, group_name, port) in [("a.b", "c", 15024), ("a", "b.c", 15025)] {
             let conn = PlcConnectionService::new(pool.clone())
                 .create(PlcConnectionInput {
-                    name: conn_name.to_string(),
+                    name: conn_name.replace('.', "_"),
                     protocol: "modbus-tcp".to_string(),
                     host: "127.0.0.1".to_string(),
                     port,
@@ -3616,13 +3618,25 @@ mod tests {
                 .unwrap();
             let group = CollectionGroupService::new(pool.clone())
                 .create(CollectionGroupInput {
-                    name: group_name.to_string(),
+                    name: group_name.replace('.', "_"),
                     plc_connection_id: conn.id,
                     period_ms: 100,
                     enabled: true,
                     default_writable: true,
                     query_sql: None,
                 })
+                .await
+                .unwrap();
+            sqlx::query("UPDATE plc_connections SET name = ? WHERE id = ?")
+                .bind(conn_name)
+                .bind(conn.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE collection_groups SET name = ? WHERE id = ?")
+                .bind(group_name)
+                .bind(group.id)
+                .execute(&pool)
                 .await
                 .unwrap();
             // サービスは外部名を知らないので、検証より前の行と同じく重なりを書ける。

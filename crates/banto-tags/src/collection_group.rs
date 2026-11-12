@@ -41,7 +41,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::plc_connection::{HUB_PROTOCOL, POSTGRES_PROTOCOL, PUSH_PROTOCOL};
-use crate::support::{map_write_error, max_length_message, required_message};
+use crate::support::{
+    dotted_name_error, map_write_error, max_length_message, required_message, GROUP_NAME_LABEL,
+};
 use crate::tag::{apply_address_rewrites, reparse_tags, ReparseScope};
 
 /// Selectable collection periods, milliseconds (recorder-requirements.md
@@ -118,7 +120,14 @@ pub struct CollectionGroupInput {
 /// (see [`crate::support::map_write_error`]), not here - a plain existence
 /// check here would be a second round trip for something the database
 /// constraint already guarantees atomically.
-fn validate_collection_group_input(input: &CollectionGroupInput) -> Result<(), BantoError> {
+///
+/// グループ名に `.` は使えない（[`dotted_name_error`]、2026-11-12 オーナー決定）。
+/// `stored_name` は更新で上書きされる行の今の名前（作成は `None`。
+/// [`stored_name_for_dot_check`] で読む）で、名前を変えない更新は通す。
+fn validate_collection_group_input(
+    input: &CollectionGroupInput,
+    stored_name: Option<&str>,
+) -> Result<(), BantoError> {
     let mut errors: Vec<FieldError> = Vec::new();
 
     let trimmed_name = input.name.trim();
@@ -133,6 +142,11 @@ fn validate_collection_group_input(input: &CollectionGroupInput) -> Result<(), B
             message: max_length_message(MAX_NAME_LEN),
         });
     }
+    errors.extend(dotted_name_error(
+        &input.name,
+        stored_name,
+        GROUP_NAME_LABEL,
+    ));
 
     if !ALLOWED_PERIOD_MS.contains(&input.period_ms) {
         let choices = ALLOWED_PERIOD_MS
@@ -153,6 +167,29 @@ fn validate_collection_group_input(input: &CollectionGroupInput) -> Result<(), B
             field_errors: errors,
         })
     }
+}
+
+/// 更新の `.` の検査（[`validate_collection_group_input`]）に渡す今の名前。名前に `.` が
+/// 無ければ読まずに `None`（検査は `.` が無い名前を断らない）。行が無ければ入力の名前を
+/// 返して `.` の検査を通し、対象の有無は後の `UPDATE` の `NotFound` に任せる。
+async fn stored_name_for_dot_check<'e, E>(
+    executor: E,
+    id: i64,
+    name: &str,
+) -> Result<Option<String>, BantoError>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Sqlite>,
+{
+    if !name.trim().contains('.') {
+        return Ok(None);
+    }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT name FROM collection_groups WHERE id = ?")
+            .bind(id)
+            .fetch_optional(executor)
+            .await
+            .map_err(banto_storage::storage_error)?;
+    Ok(Some(stored.unwrap_or_else(|| name.trim().to_string())))
 }
 
 /// [`CollectionGroupInput::query_sql`] の長さ上限（外部 DB 連携設計 §4.2
@@ -440,7 +477,7 @@ impl CollectionGroupService {
     }
 
     pub async fn create(&self, input: CollectionGroupInput) -> Result<CollectionGroup, BantoError> {
-        validate_collection_group_input(&input)?;
+        validate_collection_group_input(&input, None)?;
         let existing_protocol: Option<String> =
             sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
                 .bind(input.plc_connection_id)
@@ -480,7 +517,7 @@ impl CollectionGroupService {
         connection: &mut SqliteConnection,
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
-        validate_collection_group_input(&input)?;
+        validate_collection_group_input(&input, None)?;
         let existing_protocol: Option<String> =
             sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
                 .bind(input.plc_connection_id)
@@ -519,72 +556,20 @@ impl CollectionGroupService {
         id: i64,
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
-        if self.registry.is_some() {
-            // R2b-2b: a move can re-parse and rewrite the group's tags, which reads
-            // before it writes - one `BEGIN IMMEDIATE` transaction around
-            // [`Self::update_tx`] (checklist §5; same as `TagService::update_checked`).
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(banto_storage::storage_error)?;
-            let updated = self.update_tx(&mut tx, id, input).await?;
-            tx.commit().await.map_err(banto_storage::storage_error)?;
-            return Ok(updated);
-        }
-        validate_collection_group_input(&input)?;
-        let existing_protocol: Option<String> =
-            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
-                .bind(input.plc_connection_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-        let stored_query_sql =
-            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
-        let current: Option<(String, i64, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
-            .bind(id)
-            .fetch_optional(&self.pool)
+        // R2b-2b: a move can re-parse and rewrite the group's tags, which reads
+        // before it writes - one `BEGIN IMMEDIATE` transaction around
+        // [`Self::update_tx`] (checklist §5; same as `TagService::update_checked`).
+        // Without a registry the same transaction keeps the `.` check's read of the
+        // stored name and the `UPDATE` together (a concurrent rename cannot slip a
+        // dotted name back in between them).
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
-        if let Some(err) = hub_group_move_error(
-            current
-                .as_ref()
-                .map(|(protocol, count, _)| (protocol.as_str(), *count)),
-            existing_protocol.as_deref(),
-        ) {
-            return Err(err);
-        }
-        if let Some(err) = push_group_move_error(
-            current
-                .as_ref()
-                .map(|(protocol, count, conn)| (protocol.as_str(), *count, *conn)),
-            input.plc_connection_id,
-            existing_protocol.as_deref(),
-        ) {
-            return Err(err);
-        }
-        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
-        // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ?, query_sql = ? \
-             WHERE id = ? RETURNING {COLUMNS}"
-        )))
-        .bind(input.name.trim())
-        .bind(input.plc_connection_id)
-        .bind(input.period_ms)
-        .bind(input.enabled)
-        .bind(input.default_writable)
-        .bind(stored_query_sql)
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| match err {
-            sqlx::Error::RowNotFound => BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            },
-            other => map_write_error(other, "name", NAME_ALREADY_USED_IN_CONNECTION, "plcConnectionId", FK_MESSAGE),
-        })
+        let updated = self.update_tx(&mut tx, id, input).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(updated)
     }
 
     /// Transaction-compatible counterpart of [`Self::update`]. With a registry
@@ -596,7 +581,8 @@ impl CollectionGroupService {
         id: i64,
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
-        validate_collection_group_input(&input)?;
+        let stored_name = stored_name_for_dot_check(&mut *connection, id, &input.name).await?;
+        validate_collection_group_input(&input, stored_name.as_deref())?;
         let existing_protocol: Option<String> =
             sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
                 .bind(input.plc_connection_id)
@@ -1951,5 +1937,91 @@ mod tests {
         .unwrap();
         assert!(sql.contains("UNIQUE (plc_connection_id, name)"), "{sql}");
         assert!(!sql.contains("name TEXT NOT NULL UNIQUE"), "{sql}");
+    }
+
+    fn only_name_error(err: BantoError) -> String {
+        match err {
+            BantoError::Validation { field_errors } => {
+                assert_eq!(field_errors.len(), 1, "{field_errors:?}");
+                assert_eq!(field_errors[0].field, "name");
+                field_errors[0].message.clone()
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+    }
+
+    /// グループ名に `.` は使えない（2026-11-12 オーナー決定）: 作成・改名を `name` の
+    /// フィールドエラーで断る（`create`/`create_tx`/`update`/`update_tx` のどれも）。
+    #[tokio::test]
+    async fn a_dotted_group_name_is_refused_on_create_and_rename() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let message = only_name_error(
+            svc.create(sample_input("Fast.1", conn_id))
+                .await
+                .unwrap_err(),
+        );
+        assert_eq!(
+            message,
+            "グループ名に「.」は使えません（外部名「接続.グループ.タグ」の区切りに使うため）"
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        only_name_error(
+            svc.create_tx(&mut tx, sample_input(" Fast.1 ", conn_id))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+
+        let created = svc.create(sample_input("Fast", conn_id)).await.unwrap();
+        only_name_error(
+            svc.update(created.id, sample_input("Fast.2", conn_id))
+                .await
+                .unwrap_err(),
+        );
+        let mut tx = svc.pool.begin().await.unwrap();
+        only_name_error(
+            svc.update_tx(&mut tx, created.id, sample_input("Fast.2", conn_id))
+                .await
+                .unwrap_err(),
+        );
+        drop(tx);
+        // A missing row stays a NotFound even with a dotted name.
+        let err = svc
+            .update(999, sample_input("X.1", conn_id))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BantoError::NotFound { .. }), "{err:?}");
+    }
+
+    /// 規則より前に作られた `.` を含むグループは一覧でき、名前を変えない更新（周期などの
+    /// 編集）は `update`/`update_tx` とも通る。
+    #[tokio::test]
+    async fn an_existing_dotted_group_keeps_its_name_on_update() {
+        let (_plc_svc, svc, conn_id) = setup().await;
+        let created = svc.create(sample_input("Fast", conn_id)).await.unwrap();
+        sqlx::query("UPDATE collection_groups SET name = 'Old.Fast' WHERE id = ?")
+            .bind(created.id)
+            .execute(&svc.pool)
+            .await
+            .unwrap();
+        let listed = svc.list(ListParams::default()).await.expect("list");
+        assert!(listed.rows.iter().any(|g| g.name == "Old.Fast"));
+
+        let mut input = sample_input("Old.Fast", conn_id);
+        input.period_ms = 5_000;
+        let updated = svc.update(created.id, input.clone()).await.unwrap();
+        assert_eq!(
+            (updated.name.as_str(), updated.period_ms),
+            ("Old.Fast", 5_000)
+        );
+
+        input.period_ms = 2_000;
+        let mut tx = svc.pool.begin().await.unwrap();
+        let updated = svc.update_tx(&mut tx, created.id, input).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(
+            (updated.name.as_str(), updated.period_ms),
+            ("Old.Fast", 2_000)
+        );
     }
 }

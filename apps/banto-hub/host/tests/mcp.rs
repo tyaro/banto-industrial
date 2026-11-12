@@ -6185,7 +6185,13 @@ async fn create_and_update_connection_reject_the_hub_protocol_before_queueing() 
 async fn create_tag_rejects_a_dotted_external_name_collision() {
     let app = test_app("635-mcp-collision").await;
     let admin_key = issue_key(&app.router, &app.admin_token, "admin-key", &["admin"]).await;
-    let ab = create_test_connection(&app, "a.b", 15091).await;
+    // 新しい名前の「.」は断られる。旧版の DB に残る名前として SQL で入れる。
+    let ab = create_test_connection(&app, "ab", 15091).await;
+    sqlx::query("UPDATE plc_connections SET name = 'a.b' WHERE id = ?")
+        .bind(ab)
+        .execute(&app.pool)
+        .await
+        .unwrap();
     let c = CollectionGroupService::new(app.pool.clone())
         .create(group_input("c", ab, 100))
         .await
@@ -6196,7 +6202,12 @@ async fn create_tag_rejects_a_dotted_external_name_collision() {
         .unwrap();
     let a = create_test_connection(&app, "a", 15092).await;
     let bc = CollectionGroupService::new(app.pool.clone())
-        .create(group_input("b.c", a, 100))
+        .create(group_input("bc", a, 100))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE collection_groups SET name = 'b.c' WHERE id = ?")
+        .bind(bc.id)
+        .execute(&app.pool)
         .await
         .unwrap();
     let before_rows = tags_row_count(&app).await;
