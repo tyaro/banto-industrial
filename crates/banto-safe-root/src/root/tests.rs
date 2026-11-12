@@ -493,3 +493,44 @@ fn plain_pin_file_creates_but_does_not_hold() {
     }
     assert!(!d.final_path().join(crate::mode::MARKER_NAME).exists());
 }
+
+/// `rename_no_replace` の Plain（#623 PR3a）: 付け替わる・宛先があれば失敗して両方変わらない・
+/// 元が無ければ `Ok(false)`・名前でないものは断る。
+#[test]
+fn plain_rename_no_replace_moves_but_never_replaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&plain_spec(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    let p = |n: &str| d.final_path().join(n);
+
+    std::fs::write(p("a.partial"), b"AAA").unwrap();
+    assert!(d.rename_no_replace("a.partial", "a.bak").unwrap());
+    assert!(!p("a.partial").exists());
+    assert_eq!(std::fs::read(p("a.bak")).unwrap(), b"AAA");
+
+    std::fs::write(p("b.partial"), b"BBB").unwrap();
+    let err = d.rename_no_replace("b.partial", "a.bak").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SafeRootError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(p("b.partial")).unwrap(), b"BBB");
+    assert_eq!(std::fs::read(p("a.bak")).unwrap(), b"AAA");
+
+    assert!(!d.rename_no_replace("absent", "c").unwrap());
+    assert!(!p("c").exists());
+    for (from, to) in [
+        (crate::mode::MARKER_NAME, "x"),
+        ("b.partial", ".BANTO-SAFE-ROOT"),
+        ("a/b", "x"),
+        ("b.partial", ".."),
+    ] {
+        assert!(d.rename_no_replace(from, to).is_err(), "{from} {to}");
+    }
+}

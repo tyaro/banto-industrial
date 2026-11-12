@@ -259,6 +259,32 @@ pub(super) fn remove(dir: &PinnedDir, display: &Path, name: &str) -> Result<bool
     Ok(true)
 }
 
+/// [`ManagedDir::rename_no_replace`] の Guarded。`from` を削除の権利で相対に開き、開いた後の
+/// ハンドルで確かめて（reparse point・フォルダ・リンク数 1 でない・印の席は断る）、握った
+/// フォルダ基準で `to` へ**置き換えずに**付け替える。`from` が無ければ `Ok(false)`。
+pub(super) fn rename_no_replace(
+    dir: &PinnedDir,
+    display: &Path,
+    from: &str,
+    to: &str,
+) -> Result<bool> {
+    let Some(handle) = child_relative(dir, from, ChildHow::OpenForDelete)? else {
+        return Ok(false);
+    };
+    let facts = handle_io::facts(handle.raw())?;
+    if let Some(refusal) = handle_io::file_refusal(&facts) {
+        return Err(refused(&display.join(from), refusal));
+    }
+    if let Some(slot) = crate::acl::imp::marker_entry(dir.raw_handle())? {
+        if slot.file_id == crate::acl::imp::file_id_of(handle.raw())? {
+            return Err(super::invalid_name());
+        }
+    }
+    handle_io::rename_no_replace(handle.raw(), dir.raw_handle(), to)?;
+    drop(handle);
+    Ok(true)
+}
+
 pub(super) fn list(dir: &PinnedDir) -> Result<Vec<Entry>> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
