@@ -13,6 +13,7 @@ fn config(dir: &Path) -> EngineConfig {
         drivers: crate::test_support::drivers(),
         data_base: dir.to_path_buf(),
         service_data_root: None,
+        db_pin: crate::engine::DbPin::Off,
         db_path,
         key_store: Arc::new(UnavailableKeyStore),
         attach_hub: false,

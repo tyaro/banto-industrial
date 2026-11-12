@@ -748,7 +748,14 @@ async fn the_given_host_kind_reaches_the_lock_the_host_api_and_the_endpoint() {
     let instance_lock =
         crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Service)
             .expect("lock");
-    let locked = lock_held_with_root(layout.clone(), instance_lock, layout.db_path(), root, run);
+    let locked = lock_held_with_root(
+        layout.clone(),
+        instance_lock,
+        layout.db_path(),
+        root,
+        run,
+        None,
+    );
 
     // A1 の診断ファイル: 2 人目は持ち主を「service」と読む。
     match crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Desktop) {
@@ -960,4 +967,177 @@ fn desktop_log_uses_the_desktop_prefix_and_shares_the_file_with_mode_switch_line
     prune.run();
     assert!(!old_desktop.exists() && !old_server.exists());
     assert!(logs.join("chronogazer-desktop-2026-10-13.log").exists());
+}
+
+// --- #623 PR2b: サービスの設定 DB を握ったまま開く ---------------------------------
+
+/// サービスと同じく Guarded で握ったルートと `run\`（記述子は確かめない =
+/// `lock_held_with_root` の `db_expected` は `None`）で、A1 を取って `LockedServer` を組む。
+#[cfg(windows)]
+fn lock_pinned(layout: &DataLayout) -> LockedServer {
+    use banto_safe_root::acl::current_user_sid;
+
+    let root = Arc::new(
+        open_root(&RootSpec {
+            expected: layout.root().to_path_buf(),
+            known: KnownFolders::default(),
+            owners: vec![current_user_sid().expect("今の利用者の SID")],
+            create_access: None,
+            create: false,
+            mode: Mode::Guarded,
+        })
+        .expect("guarded root"),
+    );
+    let run = Arc::new(
+        root.open_managed(
+            &[ManagedSpec {
+                key: "run",
+                parent: None,
+                name: "run",
+                create: true,
+            }],
+            None,
+        )
+        .expect("run directory")
+        .take("run")
+        .expect("run directory"),
+    );
+    let instance_lock =
+        crate::instance_lock::acquire_for_db(&layout.db_path(), ChronoGazerHost::Service)
+            .expect("lock");
+    lock_held_with_root(
+        layout.clone(),
+        instance_lock,
+        layout.db_path(),
+        root,
+        run,
+        None,
+    )
+}
+
+/// 設定 DB の本体・`-wal`・`-shm` のパス。
+#[cfg(windows)]
+fn db_files(layout: &DataLayout) -> [PathBuf; 3] {
+    ["", "-wal", "-shm"]
+        .map(|suffix| PathBuf::from(format!("{}{suffix}", layout.db_path().display())))
+}
+
+/// 3 つとも在り、改名も削除もできない（握っている）。
+#[cfg(windows)]
+fn assert_db_held(files: &[PathBuf; 3]) {
+    for file in files {
+        assert!(file.is_file(), "{file:?} が無い");
+        let moved = file.with_extension("moved");
+        assert!(
+            std::fs::rename(file, &moved).is_err(),
+            "{file:?} を改名できた"
+        );
+        assert!(std::fs::remove_file(file).is_err(), "{file:?} を消せた");
+    }
+}
+
+/// 3 つとも在り、消せる（握りも接続も残っていない。PERSIST_WAL の接続が開いたままなら
+/// `-wal` は消せない）。
+#[cfg(windows)]
+fn assert_db_released(files: &[PathBuf; 3]) {
+    for file in files {
+        assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
+        std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+    }
+}
+
+/// #623 PR2b: サービスの経路（`lock_held_with_root`）は設定 DB の本体・`-wal`・`-shm` を
+/// 握ったまま開く。DB を開いた後の起動の失敗（ここでは `data.dir` が握ったルートの外 =
+/// `StoreDirNotAllowed`）でも、`Err` が返った時点で pool を閉じ終えて握りを離している。
+/// 稼働から停止までの握りは `engine::tests` で確かめる（Guarded のルートの中の `data.dir`
+/// は運用モードの持ち主でないと開けないので、ここでは起動し切れない）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_service_db_is_released_when_the_start_fails_after_opening_it() {
+    let dir = TempDir::new();
+    let outside = TempDir::new();
+    let outside_dir = outside.path().to_string_lossy().into_owned();
+    prepare_root(dir.path(), &[("data.dir", outside_dir.as_str())]).await;
+    let layout = DataLayout::new(dir.path());
+    let files = db_files(&layout);
+    let opened = lock_pinned(&layout).open().await.expect("open");
+    assert_db_held(&files);
+    let failure = opened
+        .start(Arc::new(MemoryKeyStore::new()))
+        .await
+        .err()
+        .expect("ルートの外の data.dir で起動できた");
+    assert!(!failure.message.is_empty());
+    assert_db_released(&files);
+}
+
+/// #623 PR2b: DB の初期化の中の失敗（旧形式の DB）でも、`Err` が返った時点で握りを離している。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pinned_service_db_is_released_when_the_db_init_fails() {
+    let dir = TempDir::new();
+    let layout = DataLayout::new(dir.path());
+    let pool = banto_storage::connect_sqlite(layout.db_path())
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let files = db_files(&layout);
+    let failure = lock_pinned(&layout)
+        .open()
+        .await
+        .err()
+        .expect("旧形式の DB を開けた");
+    assert!(!failure.message.is_empty());
+    assert_db_released(&files);
+}
+
+/// #623 PR2b: リストア予約がある状態でも、サービスの経路は予約を適用してから握るので
+/// 起動できる（先に握ると置き換えが共有違反になる）。前回の停止が残した `-wal`・`-shm`
+/// （PERSIST_WAL）がある状態から始め、適用後の DB を握ったまま開き、`close` で離す。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pending_restore_is_applied_before_the_service_pins_the_db() {
+    let dir = TempDir::new();
+    prepare_root(dir.path(), &[("test.marker", "current")]).await;
+    let layout = DataLayout::new(dir.path());
+    let files = db_files(&layout);
+    // 1 回握って開き、閉じる（PERSIST_WAL の `-wal`・`-shm` が残る）。
+    lock_pinned(&layout)
+        .open()
+        .await
+        .expect("open")
+        .close()
+        .await;
+    assert!(files[1].is_file() && files[2].is_file());
+
+    // 別の DB を予約として置く（`backups/<DB のファイル名>/restore-pending.sqlite3`）。
+    let other = TempDir::new();
+    let source = other.path().join("source.sqlite3");
+    let pool = crate::db::init_db(&source).await.expect("init_db");
+    SettingsService::new(Db::Sqlite(pool.clone()))
+        .set("test.marker", "restored")
+        .await
+        .unwrap();
+    pool.close().await;
+    let scope = dir.path().join("backups").join(crate::paths::DB_FILE_NAME);
+    std::fs::create_dir_all(&scope).unwrap();
+    let pending = scope.join("restore-pending.sqlite3");
+    std::fs::copy(&source, &pending).unwrap();
+
+    let opened = lock_pinned(&layout)
+        .open()
+        .await
+        .expect("予約を適用してから握って開ける");
+    assert!(!pending.exists(), "予約が適用されていない");
+    assert_eq!(
+        opened.settings().get("test.marker").await.unwrap(),
+        Some("restored".to_string())
+    );
+    assert_db_held(&files);
+    opened.close().await;
+    assert_db_released(&files);
 }

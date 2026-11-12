@@ -54,7 +54,10 @@ banto-tagclient = { path = "../../../crates/banto-tagclient" }
 # ファイル、`server_host::open_key_store`）。非 Windows では `UnsupportedPlatform`
 # で fail closed する（コンパイルは通る）。
 banto-secret-store = { path = "../../../crates/banto-secret-store" }
-banto-safe-root = { path = "../../../crates/banto-safe-root" }
+# `sqlite` feature（#623 PR2b）: サービスが握ったルートの直下の設定 DB の本体・`-wal`・
+# `-shm` を握ったまま開く口（`banto_safe_root::sqlite`。banto-hub と同じ）。sqlx・
+# libsqlite3-sys はこの crate が既に木に持つ版。
+banto-safe-root = { path = "../../../crates/banto-safe-root", features = ["sqlite"] }
 # #392 B1-5: `chronogazer-server` の終了（Ctrl-C と CTRL_CLOSE_EVENT）を 1 回に
 # する（デスクトップと同じ `ExitCleanupOnce`。std だけの crate）。
 banto-exit-once = { path = "../../../crates/banto-exit-once" }

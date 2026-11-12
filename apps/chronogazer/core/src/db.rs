@@ -158,6 +158,29 @@ impl From<InitDbError> for BantoError {
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
     let path = path.as_ref();
     let pool = banto_storage::connect_sqlite(path).await?;
+    init_db_on(pool, path).await
+}
+
+/// [`init_db`] の、握った組（[`banto_safe_root::sqlite::PinnedSqlite`]）で開く版（#623 PR2b。
+/// サービスが握ったルートの直下の設定 DB）。開き方は `banto_storage::connect_sqlite` と同じ
+/// 設定に、握っているときは接続ごとの `SQLITE_FCNTL_PERSIST_WAL` と `journal_size_limit` を
+/// 足したもの（`PinnedSqlite::connect`）。手順と失敗は [`init_db`] と同じ。`pinned` は返った
+/// pool を閉じ終えるまで生かすこと（呼ぶ側の責任）。`Err` のときは開いた接続をすべて閉じ
+/// 終えてから返す（`connect` の失敗は pool を返さず、その probe の接続は
+/// `PinnedSqlite::connect` が閉じる。[`init_db`] と同じ後半の失敗は pool を閉じてから返る）
+/// ので、`pinned` はすぐ離してよい。
+pub async fn init_db_pinned(
+    pinned: &banto_safe_root::sqlite::PinnedSqlite,
+) -> Result<SqlitePool, InitDbError> {
+    let pool = pinned
+        .connect()
+        .await
+        .map_err(banto_storage::storage_error)?;
+    init_db_on(pool, pinned.path()).await
+}
+
+/// [`init_db`]・[`init_db_pinned`] の、pool を開いた後の手順（旧形式の拒否 → migration）。
+async fn init_db_on(pool: SqlitePool, path: &Path) -> Result<SqlitePool, InitDbError> {
     // 失敗して戻る経路では必ず pool を閉じてから返す（#392 の起動時の対処:
     // 戻った直後に DB のファイルの名前を変えることがあり、Windows では開いた
     // ままのハンドルが名前の変更を拒む）。

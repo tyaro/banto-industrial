@@ -20,6 +20,12 @@
 //! 2. **リストア予約の適用**（`BackupService::apply_pending_restore_at_startup`、
 //!    pool を作る前でなければならない）。失敗しても起動は止めない（今までどおり）。
 //! 3. **`init_db`**。旧形式の DB・開けない DB は [`EngineStartError::Database`]。
+//!    サービス（[`DbPin::InRoot`]、#623 PR2b）は 2. の**後**・`init_db` の**前**に、握った
+//!    ルートで DB の本体・`-wal`・`-shm` を握り（`ManagedDir::pin_sqlite(_checked)`。先に
+//!    握ると 2. の置き換えが共有違反になる）、その組で開く（`crate::db::init_db_pinned`）。
+//!    握りは pool を閉じ終えるまで持つ: 起動の途中の失敗・[`OpenedEngine::close`] は pool を
+//!    閉じてから離し（`close_then_release`）、停止は 7. の後で離す。閉じ終えたと確かめられ
+//!    ないまま（停止の時間切れ）drop されたら離さない（`DbPins`）。
 //!
 //!    ここまでが [`EngineRuntime::open`]。**デスクトップは DB を開けてから
 //!    窓を作る**（旧形式の DB のときに空の画面を先に出さない）ので、B1-2 では
@@ -107,7 +113,8 @@
 //!    待ち、終わっていなければ [`ShutdownStep::RetentionStopped`] を報告せず、
 //!    **pool も閉じずに**時間切れを返す（PR #597 のレビュー。以前は handle を
 //!    取り出していたので、2 回目は掃除の途中でも素通りして pool を閉じていた）。
-//! 7. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む）。
+//! 7. **SQLite の pool を閉じる**（`-wal`/`-shm` を畳む。[`DbPin::InRoot`] なら閉じ終えた後に
+//!    設定 DB の握りを離す - #623 PR2b）。
 //!
 //! 残りの危険: 監査の保留の定期の流し込み（banto の `spawn_spool_flusher`）は
 //! 止める口が abort しかないので abort のままにしてある。30 秒ごとの流し込みの
@@ -308,6 +315,120 @@ pub struct EngineConfig {
     /// `false`（`banto-serve`）は今までどおり確かめない（開発・E2E 用。書けなければ
     /// 収集の開始がエラーを状態に残す）。
     pub store_dir_check_required: bool,
+    /// 設定 DB を本体・`-wal`・`-shm` を握ったまま開くか（#623 PR2b。[`DbPin`]）。サービス
+    /// だけ [`DbPin::InRoot`]、デスクトップ・`banto-serve`・コンソールは [`DbPin::Off`]
+    /// （今までどおりパスで開く）。
+    pub db_pin: DbPin,
+}
+
+/// 設定 DB の開き方（#623 PR2b、[`EngineConfig::db_pin`]）。
+#[derive(Debug, Clone, Default)]
+pub enum DbPin {
+    /// パスで開く（`init_db`）。
+    #[default]
+    Off,
+    /// [`EngineConfig::service_data_root`] の直下の DB（`db_path` はそのルートの直下で
+    /// なければならない）を、リストア予約の適用の**後**・`init_db` の**前**に
+    /// `ManagedDir::pin_sqlite(_checked)` で握り、その組で開く（banto-hub の `profile_db`
+    /// と同じ考え方）。`expected` が `Some`（運用モードの形）なら、ルートと 3 つのファイルの
+    /// 記述子がその形かも確かめる（`pin_sqlite_checked`。サービスの本番）。握りは pool を
+    /// 閉じ終えるまで持つ（`DbPins`）。
+    InRoot {
+        expected: Option<banto_safe_root::DirAccess>,
+    },
+}
+
+/// 設定 DB の握り（#623 PR2b、[`DbPin::InRoot`]）。pool を閉じ終えた後に
+/// [`DbPins::release`] で離す。**離さずに drop したら握りを離さない**（`forget`。ハンドルは
+/// プロセスの終わりに閉じる）: pool を閉じ終えたと確かめられないまま名前を空けない
+/// （返らない接続が残っている間・終了の時間切れ。banto-hub の `close_db_then_release` と
+/// 同じ扱い）。A1 の排他（`lock`）を持たせたら、それも同じく離さない（返らない接続が
+/// 残る間に同じ DB を別の host に開かせない。banto-hub の PR2a レビュー P2 と同じ）。
+/// [`DbPin::Off`] では空で、何もしない。
+#[derive(Default)]
+pub(crate) struct DbPins {
+    pinned: Option<banto_safe_root::sqlite::PinnedSqlite>,
+    lock: Option<Arc<InstanceGuard>>,
+}
+
+impl DbPins {
+    /// 握った組（[`DbPin::Off`] なら `None`）。
+    fn pinned(&self) -> Option<&banto_safe_root::sqlite::PinnedSqlite> {
+        self.pinned.as_ref()
+    }
+
+    /// 握りを離さない間、A1 の排他も持たせる（[`RunningEngine`] へ移すとき）。
+    fn holding_lock(mut self, lock: &Arc<InstanceGuard>) -> Self {
+        if self.pinned.is_some() {
+            self.lock = Some(lock.clone());
+        }
+        self
+    }
+
+    /// pool を閉じ終えた後に握り（と持たせた排他の写し）を離す。2 回目以降は何もしない。
+    fn release(&mut self) {
+        drop(self.pinned.take());
+        drop(self.lock.take());
+    }
+}
+
+impl Drop for DbPins {
+    fn drop(&mut self) {
+        if let Some(pinned) = self.pinned.take() {
+            std::mem::forget(pinned);
+            if let Some(lock) = self.lock.take() {
+                std::mem::forget(lock);
+            }
+        }
+    }
+}
+
+/// pool を閉じ終えてから握りを離す（#623 PR2b。起動の途中の失敗と `OpenedEngine::close`）。
+/// `close` は返るまで待つ（上限なし。今までどおり）ので、返らなければ握りも離れない。
+async fn close_then_release(pool: &DbPool, pins: &mut DbPins) {
+    pool.close().await;
+    pins.release();
+}
+
+/// [`DbPin::InRoot`] なら設定 DB の本体・`-wal`・`-shm` を握る（#623 PR2b）。`Off` なら空。
+/// 失敗は [`InitDbError::Storage`]（DB を開けない失敗と同じ分類）。
+fn pin_db(cfg: &EngineConfig) -> Result<DbPins, InitDbError> {
+    let DbPin::InRoot { expected } = &cfg.db_pin else {
+        return Ok(DbPins::default());
+    };
+    let refuse = |why: String| InitDbError::Storage(BantoError::Storage(why));
+    let root = cfg
+        .service_data_root
+        .as_deref()
+        .ok_or_else(|| refuse("設定 DB を握るルートのハンドルがありません".to_string()))?;
+    let name = cfg
+        .db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            refuse(format!(
+                "設定 DB のファイル名を読めません: {}",
+                cfg.db_path.display()
+            ))
+        })?;
+    let parent = cfg.db_path.parent();
+    if parent != Some(root.path()) && parent != Some(root.final_path()) {
+        return Err(refuse(format!(
+            "設定 DB（{}）が握ったルート（{}）の直下にありません",
+            cfg.db_path.display(),
+            root.final_path().display()
+        )));
+    }
+    let dir = root.as_dir();
+    let pinned = match expected {
+        Some(expected) => dir.pin_sqlite_checked(name, expected),
+        None => dir.pin_sqlite(name),
+    }
+    .map_err(|error| refuse(format!("設定 DB（{name}）を握れませんでした: {error}")))?;
+    Ok(DbPins {
+        pinned: Some(pinned),
+        lock: None,
+    })
 }
 
 impl EngineConfig {
@@ -726,15 +847,31 @@ impl EngineRuntime {
             },
         };
 
+        // #623 PR2b: サービス（`DbPin::InRoot`）は、リストア予約の適用（DB の本体を
+        // 置き換え、古い `-wal`・`-shm` を消す）の**後**に本体・`-wal`・`-shm` を握る
+        // （先に握ると置き換えが共有違反になる）。握りは最初の接続より前から、pool を
+        // 閉じ終えるまで持つ（`DbPins`）。
+        let mut db_pins = pin_db(&cfg).map_err(EngineStartError::Database)?;
+
         // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は
         // 無い）。何をすればよいかは `InitDbError::Legacy` の文言にある。
-        let pool = init_db(&cfg.db_path)
-            .await
-            .map_err(EngineStartError::Database)?;
+        let opened = match db_pins.pinned() {
+            Some(pinned) => crate::db::init_db_pinned(pinned).await,
+            None => init_db(&cfg.db_path).await,
+        };
+        let pool = match opened {
+            Ok(pool) => pool,
+            Err(err) => {
+                // `init_db(_pinned)` の失敗は接続をすべて閉じ終えてから返るので、すぐ離してよい。
+                db_pins.release();
+                return Err(EngineStartError::Database(err));
+            }
+        };
 
         Ok(OpenedEngine {
             cfg,
             pool,
+            db_pins,
             instance_lock,
             applied_restore,
             recovery_note: None,
@@ -768,6 +905,10 @@ impl LockedEngine {
 pub struct OpenedEngine {
     cfg: EngineConfig,
     pool: DbPool,
+    /// 設定 DB の握り（#623 PR2b、[`DbPin::InRoot`] のときだけ）。[`OpenedEngine::close`]・
+    /// `start` の失敗では pool を閉じ終えてから離す。`close` せずに drop すると離さない
+    /// （`DbPins` の doc）。
+    db_pins: DbPins,
     instance_lock: InstanceGuard,
     applied_restore: Option<AppliedRestoreInfo>,
     /// 起動時の対処の窓で選ばれた対処（[`OpenedEngine::with_recovery_note`]）。
@@ -804,10 +945,11 @@ impl OpenedEngine {
     pub async fn close(self) {
         let OpenedEngine {
             pool,
+            mut db_pins,
             instance_lock,
             ..
         } = self;
-        pool.close().await;
+        close_then_release(&pool, &mut db_pins).await;
         drop(instance_lock);
     }
     /// 開いた pool（`start` の前に設定を読みたい host 用）。
@@ -884,6 +1026,7 @@ impl OpenedEngine {
         let OpenedEngine {
             cfg,
             pool,
+            mut db_pins,
             instance_lock,
             applied_restore,
             recovery_note,
@@ -1008,7 +1151,7 @@ impl OpenedEngine {
         let hub = match HubService::new(settings.clone(), cfg.key_store.clone()).await {
             Ok(hub) => hub,
             Err(err) => {
-                pool.close().await;
+                close_then_release(&pool, &mut db_pins).await;
                 return Err(EngineStartError::Hub(err));
             }
         };
@@ -1026,7 +1169,7 @@ impl OpenedEngine {
                 // 確かめる（起動時の対処の窓が「保存先を選び直す」を出すか決める）。
                 let data_dir_unreadable = data_dir_value_unreadable(&pool).await;
                 hub.shutdown().await;
-                pool.close().await;
+                close_then_release(&pool, &mut db_pins).await;
                 return Err(EngineStartError::StoreConfig {
                     source: err,
                     data_dir_unreadable,
@@ -1049,7 +1192,7 @@ impl OpenedEngine {
                 Ok((dir, held)) => (dir, Some(held)),
                 Err(reason) => {
                     hub.shutdown().await;
-                    pool.close().await;
+                    close_then_release(&pool, &mut db_pins).await;
                     return Err(EngineStartError::StoreDirNotAllowed {
                         dir: resolve_data_dir(&cfg.data_base, &store_settings.data_dir),
                         reason,
@@ -1072,7 +1215,7 @@ impl OpenedEngine {
             };
             if let Err(err) = check {
                 hub.shutdown().await;
-                pool.close().await;
+                close_then_release(&pool, &mut db_pins).await;
                 return Err(EngineStartError::StoreDirUnwritable {
                     dir: collect_data_dir,
                     reason: err.0,
@@ -1119,7 +1262,7 @@ impl OpenedEngine {
                     Ok(bound) => Some(bound),
                     Err((config, source)) => {
                         hub.shutdown().await;
-                        pool.close().await;
+                        close_then_release(&pool, &mut db_pins).await;
                         return Err(EngineStartError::Listen { config, source });
                     }
                 }
@@ -1131,7 +1274,7 @@ impl OpenedEngine {
                 Ok(bound) => (Some(bound), None),
                 Err(source) => {
                     hub.shutdown().await;
-                    pool.close().await;
+                    close_then_release(&pool, &mut db_pins).await;
                     return Err(EngineStartError::Listen {
                         config: config.clone(),
                         source,
@@ -1254,6 +1397,7 @@ impl OpenedEngine {
             }),
             #[cfg(test)]
             observations: std::sync::Mutex::new(None),
+            db_pins: std::sync::Mutex::new(db_pins.holding_lock(&instance_lock)),
             _instance_lock: instance_lock,
         })
     }
@@ -1339,6 +1483,11 @@ pub struct RunningEngine {
     /// テスト専用: `Some` なら、終了の各手順の直前の状態を記録する。
     #[cfg(test)]
     observations: std::sync::Mutex<Option<Vec<ShutdownObservation>>>,
+    /// 設定 DB の握り（#623 PR2b、[`DbPin::InRoot`] のときだけ）。[`RunningEngine::shutdown`]
+    /// で pool を閉じ終えた後に離す。閉じ終える前に予算が切れた（`timed_out`）まま drop
+    /// されたら、握りと（持たせた写しの）A1 の排他を離さず、プロセスの終わりまで持つ
+    /// （`DbPins` の doc。サービスは時間切れなら緩めずに終了コード 5 で終わる）。
+    db_pins: std::sync::Mutex<DbPins>,
     /// A1 の排他。drop で返る（モジュール doc）。
     /// 保持期間の掃除のタスクも同じ `Arc` を持つので、排他が返るのは両方が
     /// いなくなったとき（[`spawn_retention`]）。
@@ -1469,6 +1618,12 @@ impl RunningEngine {
             // 7. みんなが書き込む先（DB）。
             self.observe(ShutdownStep::PoolClosed);
             services.pool.close().await;
+            // #623 PR2b: 閉じ終えたので設定 DB の握りを離す（予算が切れてここまで来なければ
+            // 離さない - `db_pins` の doc）。
+            self.db_pins
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .release();
             completed.push(ShutdownStep::PoolClosed);
         };
         let timed_out = tokio::time::timeout(budget, cleanup).await.is_err();
@@ -1546,6 +1701,7 @@ mod tests {
             drivers: crate::test_support::drivers(),
             data_base: EngineConfig::db_dir_of(&db_path),
             service_data_root: None,
+            db_pin: DbPin::Off,
             db_path,
             key_store: Arc::new(UnavailableKeyStore),
             attach_hub: false,
@@ -3263,5 +3419,119 @@ mod tests {
             "未初期化の間の admin のトークンが残っている: {me}"
         );
         assert!(!engine.shutdown(Duration::from_secs(10)).await.timed_out);
+    }
+
+    /// #623 PR2b: Guarded で握ったルートの直下の DB を [`DbPin::InRoot`] で開く設定と、本体・
+    /// `-wal`・`-shm` のパス。host はサービスにしない（Guarded のルートの中の `data.dir` は
+    /// 運用モードの持ち主でないと開けないので、収集の保存先はパスのまま）。
+    #[cfg(windows)]
+    fn pinned_config(dir: &Path) -> (EngineConfig, [PathBuf; 3]) {
+        let root = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: dir.to_path_buf(),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners: vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")],
+            create_access: None,
+            create: false,
+            mode: banto_safe_root::Mode::Guarded,
+        })
+        .expect("guarded root");
+        let mut cfg = config(dir, EngineListen::Disabled);
+        cfg.service_data_root = Some(Arc::new(root));
+        cfg.db_pin = DbPin::InRoot { expected: None };
+        let files = ["", "-wal", "-shm"]
+            .map(|suffix| PathBuf::from(format!("{}{suffix}", cfg.db_path.display())));
+        (cfg, files)
+    }
+
+    /// 3 つとも在り、改名も削除もできない（握っているか、接続が開いている）。
+    #[cfg(windows)]
+    fn assert_db_held(files: &[PathBuf; 3]) {
+        for file in files {
+            assert!(file.is_file(), "{file:?} が無い");
+            let moved = file.with_extension("moved");
+            assert!(
+                std::fs::rename(file, &moved).is_err(),
+                "{file:?} を改名できた"
+            );
+            assert!(std::fs::remove_file(file).is_err(), "{file:?} を消せた");
+        }
+    }
+
+    /// #623 PR2b: [`DbPin::InRoot`] は本体・`-wal`・`-shm` を握ったまま開き、動いている間は
+    /// 3 つとも改名・削除できない。`shutdown` で pool を閉じ終えたら（`RunningEngine` を drop
+    /// する前に）握りを離す。PERSIST_WAL なので `-wal`・`-shm` は残り、`-journal` は作らない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_db_is_held_while_running_and_released_by_shutdown() {
+        let dir = TempDir::new();
+        let (cfg, files) = pinned_config(dir.path());
+        let journal = PathBuf::from(format!("{}-journal", cfg.db_path.display()));
+        let engine = EngineRuntime::start(cfg).await.expect("start");
+        assert!(engine
+            .db_pins
+            .lock()
+            .unwrap()
+            .pinned()
+            .expect("握っていない")
+            .is_held());
+        assert_db_held(&files);
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out, "{report:?}");
+        assert!(engine.db_pins.lock().unwrap().pinned().is_none());
+        assert!(
+            files[1].is_file() && files[2].is_file(),
+            "PERSIST_WAL なら -wal・-shm を消さない"
+        );
+        assert!(!journal.exists());
+        for file in &files {
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+        drop(engine);
+    }
+
+    /// #623 PR2b: `shutdown` が pool を閉じる前に予算を使い切ったら（保持期間の掃除が
+    /// 止まっている）、握りを離さない。掃除が終わってからもう一度の `shutdown` が pool を
+    /// 閉じ終えたら離す。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_db_stays_held_while_the_shutdown_has_not_closed_the_pool() {
+        let dir = TempDir::new();
+        let (cfg, files) = pinned_config(dir.path());
+        let engine = EngineRuntime::start(cfg).await.expect("start");
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let stuck = {
+            let (entered, release) = (entered.clone(), release.clone());
+            Arc::new(spawn_retention(
+                &engine._instance_lock,
+                move |_stop| async move {
+                    entered.notify_one();
+                    release.notified().await;
+                },
+            ))
+        };
+        let original = {
+            let mut background = engine.background.lock().unwrap();
+            std::mem::replace(&mut background.retention, stuck)
+        };
+        original.stop().await;
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("掃除が途中に入る");
+
+        let report = engine.shutdown(Duration::from_millis(200)).await;
+        assert!(report.timed_out);
+        assert!(!report.completed.contains(&ShutdownStep::PoolClosed));
+        assert!(engine.db_pins.lock().unwrap().pinned().is_some());
+        assert_db_held(&files);
+
+        release.notify_one();
+        let report = engine.shutdown(Duration::from_secs(10)).await;
+        assert!(!report.timed_out, "{report:?}");
+        assert!(engine.db_pins.lock().unwrap().pinned().is_none());
+        for file in &files {
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
     }
 }
