@@ -188,8 +188,8 @@ pub struct ProfileDirs {
     /// `{profile_dir}/data/audit-spool`。開けなかったときは `None`（保留なしで続ける）。
     pub audit_spool: Option<Arc<ManagedDir>>,
     /// 運用モードの形（#661 661-2。[`open_profile_dirs_checked`] だけが `Some`）。`Some` なら
-    /// 設定 DB のパスは、渡す直前に `config` の記述子がこの形かを確かめてから渡す
-    /// （`ManagedDir::reopen_path_checked`）。
+    /// 設定 DB は、`config` と本体・`-wal`・`-shm` の記述子がこの形かを確かめて握ってから開く
+    /// （`ManagedDir::pin_sqlite_checked`。#623 PR2a）。
     pub checked_access: Option<DirAccess>,
 }
 
@@ -202,7 +202,8 @@ pub enum ProfileDirsError {
     /// profile の中のフォルダを開けない（`open_managed`）。
     #[error("profile の中の{0}")]
     Managed(#[from] ManagedStop),
-    /// 開き直す相手（SQLite など）に渡すパスを確かめられない（`reopen_path`）。
+    /// 開き直す相手（SQLite など）に渡すパスを確かめられない・名前を握れない
+    /// （`reopen_path`・`pin_sqlite`）。
     #[error("profile の中の「{name}」のパスを確かめられませんでした: {error}")]
     Reopen {
         name: String,

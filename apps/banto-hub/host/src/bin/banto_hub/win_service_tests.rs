@@ -344,6 +344,13 @@ impl Fixture {
     }
 
     fn program(&self) -> HubProgram {
+        self.program_binding("127.0.0.1")
+    }
+
+    /// `bind` で待ち受ける Hub の本体（`0.0.0.0` なら、試運転モードのままの新しい設定 DB を
+    /// 開いた後に `UnsafeCommissioningBind` で起動が失敗する）。
+    fn program_binding(&self, bind: &str) -> HubProgram {
+        let bind = bind.to_string();
         let paths = self.paths.clone();
         let read = self.stored.clone();
         let write = self.stored.clone();
@@ -355,7 +362,7 @@ impl Fixture {
                     db_path: paths.db_path.to_string_lossy().into_owned(),
                     allow_setup: false,
                     port_override: Some(0),
-                    bind_override: Some("127.0.0.1".to_string()),
+                    bind_override: Some(bind.clone()),
                     data_dir_override: Some(paths.data_dir.clone()),
                     profile_id: paths.profile_id.clone(),
                     host_kind: HubHostKind::Service,
@@ -621,6 +628,43 @@ fn an_unclosed_db_keeps_the_profile_tight_with_5() {
     assert!(has(&lines, RUNTIME_FINISHED_LINE), "{lines:#?}");
     assert!(!has(&lines, "acl:relax"), "{lines:#?}");
     assert!(!has(&lines, "緩め始めます"), "{lines:#?}");
+}
+
+/// Hub の起動が設定 DB を開いた後に失敗したら、Hub を動かさずに緩め直して 3。
+#[test]
+fn a_hub_start_failure_relaxes_back_with_3() {
+    let fx = Fixture::new("start-fail", loose(), None);
+    let running = spawn(fx.program_binding("0.0.0.0"));
+    assert_eq!(running.join(), Some(ServiceExit::Specific(3)));
+    let lines = fx.lines();
+    assert!(has(&lines, "起動に失敗しました"), "{lines:#?}");
+    assert!(has(&lines, DB_CLOSED_LINE), "{lines:#?}");
+    assert!(has(&lines, "acl:relax"), "{lines:#?}");
+}
+
+/// #623 PR2a のレビュー（P1）: Hub の起動の失敗で設定 DB も閉じ切れなければ
+/// （`HubStartError::DbLeftOpen`）、停止のときと同じく緩めずに 5（ランタイムは終える）。
+#[test]
+fn a_hub_start_failure_with_an_unclosed_db_keeps_the_profile_tight_with_5() {
+    let fx = Fixture::new("start-fail-db", loose(), None);
+    let program = fx.program_binding("0.0.0.0");
+    program.fake_db_not_closed.store(true, Ordering::SeqCst);
+    let running = spawn(program);
+    assert_eq!(running.join(), Some(ServiceExit::Specific(5)));
+    let lines = fx.lines();
+    assert_in_order(
+        &lines,
+        &[
+            "起動に失敗しました",
+            RUNTIME_FINISHED_LINE,
+            "設定 DB を閉じ切れなかった",
+            "log-closed",
+        ],
+    );
+    assert!(!has(&lines, DB_CLOSED_LINE), "{lines:#?}");
+    assert!(!has(&lines, "acl:relax"), "{lines:#?}");
+    assert!(!has(&lines, "緩め始めます"), "{lines:#?}");
+    assert_silent_after_log_closed(&lines);
 }
 
 // --- 運用中の見張り（#697 レビュー: 締める前からの `WRITE_DAC` のハンドルでの書き戻し） ---

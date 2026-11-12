@@ -195,7 +195,7 @@ use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
-use crate::db::{init_db_with_registry, Db, InitDbError, LegacyDatabase};
+use crate::db::{init_db_pinned, init_db_with_registry, Db, InitDbError, LegacyDatabase};
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
@@ -362,6 +362,27 @@ pub enum HubStartError {
     /// 拒否する（メッセージ自体に対処法を含む、同関数の doc comment参照）。
     #[error("{0}")]
     UnsafeCommissioningBind(String),
+    /// #623 PR2a のレビュー（P1）: 設定 DB を開いた後に起動が失敗し（中身は元の失敗）、続く
+    /// pool の close も [`DB_CLOSE_TIMEOUT`] のうちに終わらなかった（返らない接続が残って
+    /// いる）。停止の [`HubShutdownReport::db_closed`] が `false` のときと同じで、設定 DB の
+    /// 本体・`-wal`・`-shm` の握りと、渡された握ったフォルダの組はプロセスの終わりまで離さない。
+    /// サービスはこれを見て ACL を緩めずに終わる（[`Self::db_left_open`]）。
+    ///
+    /// 元の失敗を包む形にしたのは、`Display`（`transparent`）と、呼ぶ側の網羅しない match
+    /// （サービスの `describe_start_failure` は排他の失敗だけを見る。排他は DB を開く前に
+    /// 取るので包まれない）を変えずに済み、「閉じ終えたか」を起動の失敗のどの種類にも
+    /// 足せるため。`start_with_profile_dirs` の `Err` に別の値を持たせる形は、呼ぶ側すべての
+    /// 型が変わるので採らなかった。
+    #[error(transparent)]
+    DbLeftOpen(Box<HubStartError>),
+}
+
+impl HubStartError {
+    /// 起動に失敗し、設定 DB も閉じ終えられなかったか（[`Self::DbLeftOpen`]）。`true` なら、
+    /// 握りが残っているので呼ぶ側は保護を外さない（サービスは ACL を緩めずに終わる）。
+    pub fn db_left_open(&self) -> bool {
+        matches!(self, Self::DbLeftOpen(_))
+    }
 }
 
 /// 起動〜シャットダウンの共通シーケンス本体（このモジュール doc 参照）への
@@ -384,11 +405,12 @@ impl HubRuntime {
     ///
     /// - 排他は `dirs` を渡して取る（`crate::profile_lock::try_acquire_profile_lock_in`。
     ///   `skip_profile_lock` なら取らない）。
-    /// - 設定 DB が profile の `config\banto-hub.sqlite3` なら、`dirs.config` で確かめた
-    ///   パス（`ManagedDir::reopen_path`。付随の `-wal`・`-shm`・`-journal` も）を sqlx に
-    ///   渡す。データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、
-    ///   書き込み受付の状態ファイルは `dirs.data` のハンドル基準で書く
-    ///   （`WriteControl::restore_in`）。
+    /// - 設定 DB が profile の `config\banto-hub.sqlite3` なら、`dirs.config` で本体・`-wal`・
+    ///   `-shm` を握ってから（`ManagedDir::pin_sqlite`。#623 PR2a）そのパスを sqlx に渡し、
+    ///   接続ごとに `SQLITE_FCNTL_PERSIST_WAL` を立てる。握りは停止で pool を閉じ終えるまで
+    ///   持つ（[`RunningHub::shutdown_and_report`]）。
+    /// - データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、書き込み
+    ///   受付の状態ファイルは `dirs.data` のハンドル基準で書く（`WriteControl::restore_in`）。
     /// - それ以外（`BANTO_DB`・`BANTO_HUB_DATA`・設定 DB の `data.dir` が profile の外）は
     ///   渡されたパスのまま使う（[`crate::profile_paths::is_outside_profile`]。ログの
     ///   1 行は 661-2 で出す）。sqlx・tstore・banto の監査の保留はパスしか取らないので、
@@ -445,32 +467,108 @@ impl HubRuntime {
             Some(guard)
         };
 
-        // #661 661-1: 握った組を渡されたときだけ、profile の中の設定 DB は確かめたパスで
-        // 開く（`start` の経路 = デスクトップ・コンソールは以前と同じパスのまま）。
-        let db_path = match &given_dirs {
-            Some(dirs) => profile_db_path(dirs, db_path)
-                .map_err(|err| HubStartError::ProfileLock(ProfileLockError::Dirs(err)))?,
-            None => db_path,
+        // #661 661-1・#623 PR2a: 握った組を渡されたときだけ、profile の中の設定 DB は本体・
+        // `-wal`・`-shm` を握ってから開く（`start` の経路 = デスクトップ・コンソールは以前と
+        // 同じパスのまま）。握りは最初の接続より前から、停止で pool を閉じ終えるまで持つ
+        // （`RunningHub::db_pins`）。
+        let (db_path, db_pins) = match &given_dirs {
+            Some(dirs) => match profile_db(dirs, db_path)
+                .map_err(|err| HubStartError::ProfileLock(ProfileLockError::Dirs(err)))?
+            {
+                ProfileDb::Path(path) => (path, None),
+                ProfileDb::Pinned(pinned) => {
+                    (pinned.path().to_string_lossy().into_owned(), Some(pinned))
+                }
+            },
+            None => (db_path, None),
         };
 
         // R2b-1d（docs/banto-hub-connection-settings-design.md §6.1）: 2-a〜2-c。レジストリは
         // `drivers` を `HubSessions` へ渡す前に写しておく（予行の preflight・入口の
         // `with_registry`・予約接続が使う）。
         let registry = drivers.registry.clone();
-        let pool = init_db_with_registry(&db_path, &registry)
-            .await
-            .map_err(|err| match err {
-                InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
-                InitDbError::Upgrade(crate::upgrade::UpgradeError::Preflight(refusal)) => {
-                    HubStartError::ConnectionSettingsPreflight {
-                        db_path: refusal.db_path,
-                        rows: refusal.rows,
-                        problems: refusal.problems,
-                    }
+        let pool = match &db_pins {
+            Some(pinned) => init_db_pinned(pinned, &registry).await,
+            None => init_db_with_registry(&db_path, &registry).await,
+        }
+        .map_err(|err| match err {
+            InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
+            InitDbError::Upgrade(crate::upgrade::UpgradeError::Preflight(refusal)) => {
+                HubStartError::ConnectionSettingsPreflight {
+                    db_path: refusal.db_path,
+                    rows: refusal.rows,
+                    problems: refusal.problems,
                 }
-                InitDbError::Upgrade(err) => HubStartError::Upgrade(err),
-                InitDbError::Storage(err) => HubStartError::InitDb(err),
-            })?;
+            }
+            InitDbError::Upgrade(err) => HubStartError::Upgrade(err),
+            InitDbError::Storage(err) => HubStartError::InitDb(err),
+        })?;
+
+        // #623 PR2a のレビュー（P2）: pool を開いた後の起動の失敗は、どれも pool を閉じ終えて
+        // から握りを離す（停止と同じ [`close_db_then_release`]。sqlx は pool を落とすだけでは
+        // 接続の終わりを待たない）。profile の排他と握ったフォルダも、閉じ終えるまで持つ。
+        // DB の初期化（`init_db_pinned` → `init_db_on`）の中の失敗は、そこで pool を閉じて
+        // から返るので、上の `?` で握りを落としてよい。
+        let started = Self::start_on_db(StartOnDb {
+            pool: pool.clone(),
+            registry,
+            drivers,
+            tls_config,
+            allow_setup,
+            port_override,
+            bind_override,
+            data_dir_override,
+            profile_id,
+            host_kind,
+            db_path,
+            given_dirs: &given_dirs,
+        })
+        .await;
+        match started {
+            Ok(mut hub) => {
+                hub.db_pins = db_pins;
+                hub._profile_lock = profile_lock;
+                hub._profile_dirs = given_dirs;
+                Ok(hub)
+            }
+            Err(err) => {
+                let db_closed = close_db_then_release(&pool, db_pins).await;
+                if db_closed {
+                    drop(profile_lock);
+                    drop(given_dirs);
+                    Err(err)
+                } else {
+                    // #623 PR2a のレビュー（P1）: 閉じ終えられなかったら、握ったフォルダも
+                    // プロセスの終わりまで持つ（DB の握りと同じ。返らない接続が残っている間に
+                    // 名前を空けない）。呼ぶ側には `DbLeftOpen` で伝え、サービスは緩めない。
+                    // 同じく profile の排他も離さない（返らない接続が残る間に同じ profile で
+                    // 次の Hub を起動させない。#623 PR2a のレビュー P2）。
+                    std::mem::forget(profile_lock);
+                    std::mem::forget(given_dirs);
+                    Err(HubStartError::DbLeftOpen(Box::new(err)))
+                }
+            }
+        }
+    }
+
+    /// [`HubRuntime::start_inner`] の、設定 DB を開いた後の手順。失敗して返ると、呼ぶ側が
+    /// pool を閉じ終えてから握りを離す。返す [`RunningHub`] の `db_pins`・`_profile_lock`・
+    /// `_profile_dirs` は空で、呼ぶ側が入れる。
+    async fn start_on_db(on_db: StartOnDb<'_>) -> Result<RunningHub, HubStartError> {
+        let StartOnDb {
+            pool,
+            registry,
+            drivers,
+            tls_config,
+            allow_setup,
+            port_override,
+            bind_override,
+            data_dir_override,
+            profile_id,
+            host_kind,
+            db_path,
+            given_dirs,
+        } = on_db;
 
         // R2b-1d（設計 §5.3 の最後の行、毎回の起動）: 秘密値の行と `settings` の参照の
         // 突き合わせ。参照があって行が無い接続はログに出す（読む側は `Unreadable {
@@ -1043,10 +1141,63 @@ impl HubRuntime {
             write_audit,
             rejection_writer,
             clock_sync_scheduler,
-            _profile_lock: profile_lock,
-            _profile_dirs: given_dirs,
+            _profile_lock: None,
+            _profile_dirs: None,
+            db_pins: None,
         })
     }
+}
+
+/// [`HubRuntime::start_on_db`] に渡す、設定 DB を開くまでに決めたもの。
+struct StartOnDb<'a> {
+    pool: SqlitePool,
+    registry: Arc<banto_driver_api::DriverRegistry>,
+    drivers: crate::broker_glue::HubDrivers,
+    tls_config: Option<TlsConfig>,
+    allow_setup: bool,
+    port_override: Option<u16>,
+    bind_override: Option<String>,
+    data_dir_override: Option<PathBuf>,
+    profile_id: String,
+    host_kind: HubHostKind,
+    db_path: String,
+    given_dirs: &'a Option<ProfileDirs>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: [`close_db_then_release`] が閉じ終えられなかった（時間切れ）ことにする
+    /// （このスレッドで呼んだ分だけ。返らない接続を確実に作る口が無いため）。
+    static FAKE_DB_CLOSE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 設定 DB の pool を [`DB_CLOSE_TIMEOUT`] のうちに閉じ、閉じ終えたら握り（`pins`）を離す
+/// （#661 661-1・#623 PR2a。停止の [`RunningHub::shutdown_and_report`] と、DB を開いた後の
+/// 起動の失敗の両方）。閉じ終えられなければ握りは離さない（返らない接続が残っている間に
+/// 名前を空けない。ハンドルはプロセスの終わりに閉じる）。閉じ終えたかを返す。
+async fn close_db_then_release(
+    pool: &SqlitePool,
+    pins: Option<banto_safe_root::sqlite::PinnedSqlite>,
+) -> bool {
+    let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, pool.close())
+        .await
+        .is_ok();
+    #[cfg(test)]
+    let db_closed = db_closed && !FAKE_DB_CLOSE_TIMEOUT.with(std::cell::Cell::get);
+    if !db_closed {
+        log_err_line(&format!(
+            "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
+            DB_CLOSE_TIMEOUT.as_secs()
+        ));
+    }
+    if let Some(pins) = pins {
+        if db_closed {
+            drop(pins);
+        } else {
+            std::mem::forget(pins);
+        }
+    }
+    db_closed
 }
 
 /// #479（2026-10-10 オーナー決定「おすすめで」= 案 A'）: デスクトップシェル内の
@@ -1191,7 +1342,8 @@ pub struct RunningHub {
     /// `self`）が drop される時点で`ProfileLockGuard`自身の`Drop`が
     /// Windows mutex handle の`CloseHandle`／非 Windows lock file の fd
     /// close（`flock`自動解放）を行う。`skip_profile_lock: true`で構築した
-    /// 場合は`None`。
+    /// 場合は`None`。例外: [`RunningHub::shutdown_and_report`] で設定 DB を閉じ終えられ
+    /// なかったとき（`db_closed == false`）は drop で離さず、プロセスの終わりまで持つ。
     _profile_lock: Option<ProfileLockGuard>,
     /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
     /// （[`RunningHub::shutdown_and_report`]）。
@@ -1208,6 +1360,12 @@ pub struct RunningHub {
     /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
     /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
     _profile_dirs: Option<ProfileDirs>,
+    /// profile の設定 DB の本体・`-wal`・`-shm` の握り（#623 PR2a。[`profile_db`]）。最初の
+    /// 接続より前から持ち、[`RunningHub::shutdown_and_report`] で pool を閉じ終えた後に離す。
+    /// 閉じ終えられなかった（[`DB_CLOSE_TIMEOUT`]）ときは離さず、プロセスの終わりまで持つ
+    /// （返らない接続が残っている。サービスは緩めずに終わる）。profile の外の DB・`start`
+    /// の経路では `None`。
+    db_pins: Option<banto_safe_root::sqlite::PinnedSqlite>,
 }
 
 /// [`RunningHub::shutdown_and_report`] の結果（#661 661-1）。
@@ -1272,7 +1430,8 @@ impl RunningHub {
 
     /// [`Self::shutdown`] と同じ順で畳み、最後に設定 DB の pool を閉じて（上限
     /// [`DB_CLOSE_TIMEOUT`]）、閉じ終えたかを返す（#661 661-1。661-2 のサービスは、
-    /// 閉じ終えてから ACL を緩める）。
+    /// 閉じ終えてから ACL を緩める）。閉じ終えられなかったら、DB の握りに加えて profile の
+    /// 排他と握ったフォルダもプロセスの終わりまで離さない。
     pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
         log_line("banto-hub: shutting down");
         // #392 A2 レビュー（2026-10-12）: 終了の受付の**取り消せない**印を立て、以降の収集の
@@ -1378,44 +1537,51 @@ impl RunningHub {
         }
         // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
-        let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, self.pool.close())
-            .await
-            .is_ok();
+        // #623 PR2a: 閉じ終えたら握りを離す（[`close_db_then_release`]）。
+        let db_closed = close_db_then_release(&self.pool, self.db_pins.take()).await;
         if !db_closed {
-            log_err_line(&format!(
-                "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
-                DB_CLOSE_TIMEOUT.as_secs()
-            ));
+            // 閉じ終えられなかったら、profile の排他と握ったフォルダも離さない（`self` の
+            // drop で離れないよう忘れる。返らない接続が残る間に同じ profile で次の Hub を
+            // 起動させない。#623 PR2a のレビュー P2）。
+            std::mem::forget(self._profile_lock.take());
+            std::mem::forget(self._profile_dirs.take());
         }
         HubShutdownReport { db_closed }
     }
 }
 
-/// 設定 DB のパス（#661 661-1、[`HubRuntime::start_with_profile_dirs`]）。profile の
-/// `config\banto-hub.sqlite3`（渡された綴りか本当のパス）なら、`dirs.config` で確かめた
-/// パスに直す（付随の `-wal`・`-shm`・`-journal` も確かめる）。それ以外（`BANTO_DB` が
-/// profile の外など）はそのまま返す。
-fn profile_db_path(dirs: &ProfileDirs, db_path: String) -> Result<String, ProfileDirsError> {
+/// 設定 DB の開き方（#623 PR2a、[`profile_db`]）。
+enum ProfileDb {
+    /// profile の外（`BANTO_DB` など）: 渡されたパスのまま開く。
+    Path(String),
+    /// profile の `config\banto-hub.sqlite3`: 本体・`-wal`・`-shm` を握った組で開く。
+    Pinned(banto_safe_root::sqlite::PinnedSqlite),
+}
+
+/// 設定 DB の開き方（#661 661-1・#623 PR2a、[`HubRuntime::start_with_profile_dirs`]）。
+/// profile の `config\banto-hub.sqlite3`（渡された綴りか本当のパス）なら、`dirs.config` で
+/// 本体・`-wal`・`-shm` を無ければ空で作って握る（`ManagedDir::pin_sqlite`。`-journal` は
+/// 握らず作らず、在るならリンク・reparse point・フォルダでないかを確かめる）。それ以外
+/// （`BANTO_DB` が profile の外など）はそのまま返す。
+///
+/// 運用モードの形に締めた組（サービス、`checked_access`）なら、`config` と各ファイルの
+/// 記述子がその形かも確かめる（`pin_sqlite_checked`。締めた後に外から変えられていたら開かない）。
+fn profile_db(dirs: &ProfileDirs, db_path: String) -> Result<ProfileDb, ProfileDirsError> {
     let path = Path::new(&db_path);
     let in_config = path == dirs.config.path().join(DB_FILE_NAME)
         || path == dirs.config.final_path().join(DB_FILE_NAME);
     if !in_config {
-        return Ok(db_path);
+        return Ok(ProfileDb::Path(db_path));
     }
-    const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
-    // #661 661-2: 運用モードの形に締めた組（サービス）なら、渡す直前に `config` の記述子が
-    // その形かを確かめる（締めた後に外から変えられていたら渡さない）。
-    let checked = match &dirs.checked_access {
-        Some(expected) => dirs
-            .config
-            .reopen_path_checked(DB_FILE_NAME, &COMPANIONS, expected),
-        None => dirs.config.reopen_path(DB_FILE_NAME, &COMPANIONS),
+    let pinned = match &dirs.checked_access {
+        Some(expected) => dirs.config.pin_sqlite_checked(DB_FILE_NAME, expected),
+        None => dirs.config.pin_sqlite(DB_FILE_NAME),
     }
     .map_err(|error| ProfileDirsError::Reopen {
         name: DB_FILE_NAME.to_string(),
         error,
     })?;
-    Ok(checked.into_path().to_string_lossy().into_owned())
+    Ok(ProfileDb::Pinned(pinned))
 }
 
 /// `path` が握ったフォルダ `dir` そのもの（渡された綴りか本当のパス）か（#661 661-1）。
@@ -1740,6 +1906,300 @@ mod tests {
         std::fs::remove_file(&db).expect("閉じた DB は消せる");
     }
 
+    /// #623 PR2a: 握った（Guarded）profile の設定 DB は、本体・`-wal`・`-shm` を握ったまま
+    /// 開く。稼働中は 3 つとも改名・削除できず、停止の `close` は数秒待たずに閉じ終える
+    /// （`SQLITE_FCNTL_PERSIST_WAL`）。閉じた後はチェックポイント済みの `-wal`・`-shm` が残り、それがあるまま
+    /// 起動し直しても行は残る。停止の後は握りを離している（消せる）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_profile_db_is_pinned_until_the_pool_is_closed() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-pinned-db");
+        let paths = resolve_profile_paths(dir.path(), "pinned").expect("valid profile id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::root::Mode::Guarded;
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let open = || crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let config = |dirs: &ProfileDirs| HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "pinned".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let names = |dirs: &ProfileDirs| {
+            ["", "-wal", "-shm"].map(|suffix| {
+                dirs.config
+                    .final_path()
+                    .join(format!("{DB_FILE_NAME}{suffix}"))
+            })
+        };
+
+        let dirs = open();
+        let files = names(&dirs);
+        let hub = HubRuntime::start_with_profile_dirs(config(&dirs), dirs)
+            .await
+            .expect("start");
+        assert!(hub.db_pins.as_ref().expect("握っていない").is_held());
+        sqlx::query("CREATE TABLE pin_probe (v INTEGER)")
+            .execute(&hub.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pin_probe VALUES (42)")
+            .execute(&hub.pool)
+            .await
+            .unwrap();
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い");
+            let moved = file.with_extension("moved");
+            assert!(
+                std::fs::rename(file, &moved).is_err(),
+                "{file:?} を改名できた"
+            );
+            assert!(std::fs::remove_file(file).is_err(), "{file:?} を消せた");
+        }
+        let started = std::time::Instant::now();
+        let report = hub.shutdown_and_report().await;
+        let took = started.elapsed();
+        assert!(report.db_closed, "{report:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "停止に {took:?}（close が共有違反を待った？）"
+        );
+        assert!(
+            files[1].is_file() && files[2].is_file(),
+            "PERSIST_WAL なら -wal・-shm を消さない"
+        );
+        assert!(!dir
+            .path()
+            .join("profiles")
+            .join("pinned")
+            .join("config")
+            .join(format!("{DB_FILE_NAME}-journal"))
+            .exists());
+
+        // 残った `-wal`・`-shm` があるまま起動し直す。
+        let dirs = open();
+        let hub = HubRuntime::start_with_profile_dirs(config(&dirs), dirs)
+            .await
+            .expect("restart");
+        let v: i64 = sqlx::query_scalar("SELECT v FROM pin_probe")
+            .fetch_one(&hub.pool)
+            .await
+            .unwrap();
+        assert_eq!(v, 42);
+        assert!(hub.shutdown_and_report().await.db_closed);
+        // 握りを離したので消せる（profile のフォルダの握りも停止で離している）。
+        for file in &files {
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+    }
+
+    /// #623 PR2a のレビュー（P2）: Guarded の profile で、設定 DB を開いた後に起動が失敗した
+    /// ら、`Err` が返った時点で接続も握りも残っていない（本体・`-wal`・`-shm` を消せる。
+    /// PERSIST_WAL の接続が開いたままなら `-wal` は消せない）。`legacy` なら DB の初期化の
+    /// 中（旧形式の DB → `LegacyDatabase`）、でなければ初期化の後（試運転モードのまま
+    /// 非 loopback に bind → `UnsafeCommissioningBind`）で失敗させる。
+    #[cfg(windows)]
+    async fn guarded_start_failure_releases_the_db(id: &str, legacy: bool) -> HubStartError {
+        let (err, files, _dir) = guarded_start_failure(id, legacy, false).await;
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+        err
+    }
+
+    /// Guarded の profile で起動を失敗させ、失敗と、設定 DB の本体・`-wal`・`-shm` のパスを
+    /// 返す（[`guarded_start_failure_releases_the_db`] の `legacy` と同じ）。`take_lock` なら
+    /// profile の排他も取って起動する（`BANTO_HUB_ROOT` をテスト用の root にする間は
+    /// [`PROFILE_ENV_LOCK`] で他のテストと重ならないようにする）。
+    #[cfg(windows)]
+    async fn guarded_start_failure(
+        id: &str,
+        legacy: bool,
+        take_lock: bool,
+    ) -> (HubStartError, [PathBuf; 3], crate::test_support::TempDir) {
+        let dir = crate::test_support::TempDir::new(&format!("hub-runtime-fail-{id}"));
+        let paths = resolve_profile_paths(dir.path(), id).expect("valid profile id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::root::Mode::Guarded;
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let dirs = crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let db = dirs.config.final_path().join(DB_FILE_NAME);
+        if legacy {
+            // migration の記録が無く `users` がある = 2026-10-02 より前の形式。
+            let pool = banto_storage::connect_sqlite(&db)
+                .await
+                .expect("旧形式を作る");
+            sqlx::query("CREATE TABLE users (id INTEGER)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let files = ["", "-wal", "-shm"].map(|suffix| {
+            dirs.config
+                .final_path()
+                .join(format!("{DB_FILE_NAME}{suffix}"))
+        });
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db.to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some(if legacy { "127.0.0.1" } else { "0.0.0.0" }.to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: id.to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: !take_lock,
+        };
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
+        if take_lock {
+            std::env::set_var("BANTO_HUB_ROOT", dir.path().as_os_str());
+        }
+        let started = HubRuntime::start_with_profile_dirs(config, dirs).await;
+        if take_lock {
+            std::env::remove_var("BANTO_HUB_ROOT");
+        }
+        drop(env_guard);
+        let err = match started {
+            Ok(_) => panic!("起動が失敗するはず"),
+            Err(err) => err,
+        };
+        (err, files, dir)
+    }
+
+    /// #623 PR2a のレビュー（P1）: 設定 DB を開いた後に起動が失敗し、続く close も時間切れに
+    /// なったら（テスト専用の [`FAKE_DB_CLOSE_TIMEOUT`]）、`DbLeftOpen` で元の失敗を包んで
+    /// 返し、本体・`-wal`・`-shm` の握りを離さない（どれも消せない）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_with_close_timeout_keeps_the_db_pinned() {
+        // `start_with_profile_dirs` はこのテストのスレッドの上で await される（block_on）。
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let (err, files, _dir) = guarded_start_failure("fail-close", false, false).await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(err.db_left_open(), "{err:?}");
+        match &err {
+            HubStartError::DbLeftOpen(inner) => assert!(
+                matches!(**inner, HubStartError::UnsafeCommissioningBind(_)),
+                "{inner:?}"
+            ),
+            other => panic!("DbLeftOpen のはず: {other:?}"),
+        }
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
+            assert!(
+                std::fs::remove_file(file).is_err(),
+                "{file:?} を消せた（握りを離している）"
+            );
+        }
+    }
+
+    /// テスト専用: `BANTO_HUB_ROOT` を書き換えて `skip_profile_lock: false` で起動するテストが
+    /// 並行して走っても env が重ならないようにする。
+    static PROFILE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// #623 PR2a のレビュー（P2）: 起動の失敗で設定 DB を閉じ終えられなかったら、profile の排他も
+    /// 離さない（返らない接続が残る間に同じ profile で次の Hub を起動させない）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_with_close_timeout_keeps_the_profile_lock() {
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let (err, _files, dir) = guarded_start_failure("fail-close-lock", false, true).await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(err.db_left_open(), "{err:?}");
+        let paths = resolve_profile_paths(dir.path(), "fail-close-lock").expect("valid id");
+        assert!(
+            try_acquire_profile_lock(&paths, HubHostKind::Console).is_err(),
+            "排他を離している（返らない接続が残るのに次の Hub が起動できる）"
+        );
+    }
+
+    /// 対照: 閉じ終えられた起動の失敗では、profile の排他は離れて取り直せる。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_releases_the_profile_lock_when_the_db_closed() {
+        let (err, _files, dir) = guarded_start_failure("fail-lock-free", false, true).await;
+        assert!(!err.db_left_open(), "{err:?}");
+        let paths = resolve_profile_paths(dir.path(), "fail-lock-free").expect("valid id");
+        let _again = try_acquire_profile_lock(&paths, HubHostKind::Console)
+            .expect("閉じ終えたなら排他は取り直せる");
+    }
+
+    /// 停止の経路: 設定 DB を閉じ終えられなかったら（`db_closed == false`）、`RunningHub` を
+    /// drop しても profile の排他は離れない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_with_close_timeout_keeps_the_profile_lock() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-shutdown-lock");
+        let paths = resolve_profile_paths(dir.path(), "stop-lock").expect("valid id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let dirs = crate::profile_lock::open_profile_dirs(
+            &crate::profile_lock::plain_profile_root_spec(&paths),
+            None,
+        )
+        .expect("open dirs");
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "stop-lock".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: false,
+        };
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
+        std::env::set_var("BANTO_HUB_ROOT", dir.path().as_os_str());
+        let started = HubRuntime::start_with_profile_dirs(config, dirs).await;
+        std::env::remove_var("BANTO_HUB_ROOT");
+        drop(env_guard);
+        let hub = started.expect("start");
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let report = hub.shutdown_and_report().await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(!report.db_closed, "{report:?}");
+        assert!(
+            try_acquire_profile_lock(&paths, HubHostKind::Console).is_err(),
+            "排他を離している（返らない接続が残るのに次の Hub が起動できる）"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_in_db_init_releases_the_db() {
+        let err = guarded_start_failure_releases_the_db("fail-init", true).await;
+        assert!(matches!(err, HubStartError::LegacyDatabase(_)), "{err:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_after_db_init_releases_the_db() {
+        let err = guarded_start_failure_releases_the_db("fail-after", false).await;
+        assert!(
+            matches!(err, HubStartError::UnsafeCommissioningBind(_)),
+            "{err:?}"
+        );
+    }
+
     /// #945 の総点検: 終了のとき、書き手を止めて拒否の表の残りを、pool を閉じる前に
     /// 書き切る（閉じたあとでは書けずに失われる）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1845,7 +2305,7 @@ mod tests {
         hub.shutdown().await;
     }
 
-    /// #661 661-1: profile の `config\banto-hub.sqlite3` だけを確かめたパスに直し、外の
+    /// #661 661-1・#623 PR2a: profile の `config\banto-hub.sqlite3` だけを握った組にし、外の
     /// パス（`BANTO_DB`）はそのまま。`data\` も綴り・本当のパスのどちらでも中とみなす。
     #[test]
     fn profile_paths_are_rewritten_only_inside_the_profile() {
@@ -1853,20 +2313,24 @@ mod tests {
         let dirs = plain_profile_dirs(&dir);
 
         let inside = dirs.config.path().join(DB_FILE_NAME);
-        let rewritten =
-            profile_db_path(&dirs, inside.to_string_lossy().into_owned()).expect("inside");
-        assert_eq!(
-            PathBuf::from(&rewritten),
-            dirs.config.final_path().join(DB_FILE_NAME)
-        );
+        let ProfileDb::Pinned(pinned) =
+            profile_db(&dirs, inside.to_string_lossy().into_owned()).expect("inside")
+        else {
+            panic!("profile の中の DB を握らなかった");
+        };
+        assert_eq!(pinned.path(), dirs.config.final_path().join(DB_FILE_NAME));
+        assert!(!pinned.is_held(), "Plain は握らない");
 
         let outside = dir.path().join("elsewhere.sqlite3");
         let kept = outside.to_string_lossy().into_owned();
-        assert_eq!(profile_db_path(&dirs, kept.clone()).unwrap(), kept);
-        assert_eq!(
-            profile_db_path(&dirs, "./banto-hub.sqlite3".to_string()).unwrap(),
-            "./banto-hub.sqlite3"
-        );
+        assert!(matches!(
+            profile_db(&dirs, kept.clone()).unwrap(),
+            ProfileDb::Path(path) if path == kept
+        ));
+        assert!(matches!(
+            profile_db(&dirs, "./banto-hub.sqlite3".to_string()).unwrap(),
+            ProfileDb::Path(path) if path == "./banto-hub.sqlite3"
+        ));
 
         assert!(is_profile_dir(dirs.data.path(), &dirs.data));
         assert!(is_profile_dir(dirs.data.final_path(), &dirs.data));
@@ -3229,8 +3693,8 @@ Host: {addr}
     ///
     /// `BANTO_HUB_ROOT`を一時ディレクトリへ向けて`start`内部の root 解決
     /// （このモジュール doc「T17-1 での唯一の例外」節）を決定的にする -
-    /// このプロセス内で`BANTO_HUB_ROOT`を読むのはこのテストだけなので、
-    /// 他テストとの並行実行による競合は起きない。
+    /// `BANTO_HUB_ROOT`を書き換えて排他を取るテストは [`PROFILE_ENV_LOCK`] で
+    /// 順に走らせ、並行実行で env が重ならないようにする。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_fails_with_profile_lock_when_another_guard_already_holds_it() {
         let dir = crate::test_support::TempDir::new("hub-runtime-profile-lock");
@@ -3258,9 +3722,11 @@ Host: {addr}
             skip_profile_lock: false,
         };
 
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
         std::env::set_var("BANTO_HUB_ROOT", root.to_string_lossy().as_ref());
         let result = HubRuntime::start(config).await;
         std::env::remove_var("BANTO_HUB_ROOT");
+        drop(env_guard);
 
         match result {
             Err(HubStartError::ProfileLock(_)) => {}
