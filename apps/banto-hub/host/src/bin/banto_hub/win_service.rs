@@ -585,7 +585,8 @@ pub(crate) struct HubProgram {
     runtime_shutdown_wait: Duration,
     /// 運用中の定期の確かめ直しの間隔（本番は [`RECHECK_INTERVAL`]。テストは短くする）。
     recheck_interval: Duration,
-    /// テスト専用: `shutdown_and_report` の `db_closed` を `false` に偽る。
+    /// テスト専用: `shutdown_and_report` の `db_closed` を `false` に偽る（Hub の起動の
+    /// 失敗では、設定 DB も閉じ終えられなかった `HubStartError::DbLeftOpen` として扱う）。
     #[cfg(test)]
     fake_db_not_closed: std::sync::atomic::AtomicBool,
 }
@@ -611,6 +612,10 @@ struct WatchedDirs {
 struct Engine {
     runtime: EngineRuntime,
     hub: Option<RunningHub>,
+    /// Hub の起動が失敗し、設定 DB も閉じ終えられなかった（`HubStartError::db_left_open`。
+    /// #623 PR2a のレビュー P1）。[`HubProgram::stop_engine`] は、停止で閉じ切れなかった
+    /// ときと同じく緩めずに終わる。
+    db_left_open: bool,
 }
 
 impl HubProgram {
@@ -775,7 +780,8 @@ impl HubProgram {
                 };
                 report.db_closed
             }
-            None => true,
+            // 起動の失敗で閉じ切れなかった分（握りはプロセスの終わりまで残っている）。
+            None => !engine.db_left_open,
         };
         if db_closed {
             self.say(DB_CLOSED_LINE);
@@ -808,7 +814,8 @@ impl HubProgram {
     }
 
     /// 起動の途中（締めた後）で Hub を動かさずに終わる: Hub を止めてから緩め直す
-    /// （PRESHUTDOWN が来ていれば緩めない）。
+    /// （PRESHUTDOWN が来ていれば緩めない。Hub の起動の失敗で設定 DB を閉じ切れなかった
+    /// とき（`Engine::db_left_open`）は、停止と同じく緩めずに 5）。
     fn abandon_start(
         &self,
         ctx: &ServiceContext,
@@ -1080,7 +1087,11 @@ impl HubProgram {
                 );
             }
         };
-        let mut engine = Engine { runtime, hub: None };
+        let mut engine = Engine {
+            runtime,
+            hub: None,
+            db_left_open: false,
+        };
 
         // 11a. 見張りと定期の確かめ直し（Hub を動かす前に立てる。締める前から開かれていた
         // `WRITE_DAC` のハンドルで書き戻されても、運用中に気づいて締めたまま止まる）。
@@ -1116,6 +1127,14 @@ impl HubProgram {
             Err(err) => {
                 let (code, message) = describe_start_failure(&err);
                 self.say(&message);
+                // 設定 DB を閉じ切れずに失敗したら、`abandon_start` は緩め直さずに 5 で終わる。
+                engine.db_left_open = err.db_left_open();
+                #[cfg(test)]
+                {
+                    engine.db_left_open |= self
+                        .fake_db_not_closed
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                }
                 watchers.stop();
                 return self.abandon_start(ctx, engine, &root, &mode, code);
             }

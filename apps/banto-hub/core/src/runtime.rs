@@ -362,6 +362,27 @@ pub enum HubStartError {
     /// 拒否する（メッセージ自体に対処法を含む、同関数の doc comment参照）。
     #[error("{0}")]
     UnsafeCommissioningBind(String),
+    /// #623 PR2a のレビュー（P1）: 設定 DB を開いた後に起動が失敗し（中身は元の失敗）、続く
+    /// pool の close も [`DB_CLOSE_TIMEOUT`] のうちに終わらなかった（返らない接続が残って
+    /// いる）。停止の [`HubShutdownReport::db_closed`] が `false` のときと同じで、設定 DB の
+    /// 本体・`-wal`・`-shm` の握りと、渡された握ったフォルダの組はプロセスの終わりまで離さない。
+    /// サービスはこれを見て ACL を緩めずに終わる（[`Self::db_left_open`]）。
+    ///
+    /// 元の失敗を包む形にしたのは、`Display`（`transparent`）と、呼ぶ側の網羅しない match
+    /// （サービスの `describe_start_failure` は排他の失敗だけを見る。排他は DB を開く前に
+    /// 取るので包まれない）を変えずに済み、「閉じ終えたか」を起動の失敗のどの種類にも
+    /// 足せるため。`start_with_profile_dirs` の `Err` に別の値を持たせる形は、呼ぶ側すべての
+    /// 型が変わるので採らなかった。
+    #[error(transparent)]
+    DbLeftOpen(Box<HubStartError>),
+}
+
+impl HubStartError {
+    /// 起動に失敗し、設定 DB も閉じ終えられなかったか（[`Self::DbLeftOpen`]）。`true` なら、
+    /// 握りが残っているので呼ぶ側は保護を外さない（サービスは ACL を緩めずに終わる）。
+    pub fn db_left_open(&self) -> bool {
+        matches!(self, Self::DbLeftOpen(_))
+    }
 }
 
 /// 起動〜シャットダウンの共通シーケンス本体（このモジュール doc 参照）への
@@ -511,10 +532,21 @@ impl HubRuntime {
                 Ok(hub)
             }
             Err(err) => {
-                close_db_then_release(&pool, db_pins).await;
+                let db_closed = close_db_then_release(&pool, db_pins).await;
+                // profile の排他は、停止の経路（`shutdown_and_report` の後に `RunningHub` と
+                // 一緒に落ちる）と同じく、閉じ終えたかにかかわらず離す。排他は Hub どうしの
+                // 二重起動を防ぐ物で、返らない接続のファイルは下の握りが守る。
                 drop(profile_lock);
-                drop(given_dirs);
-                Err(err)
+                if db_closed {
+                    drop(given_dirs);
+                    Err(err)
+                } else {
+                    // #623 PR2a のレビュー（P1）: 閉じ終えられなかったら、握ったフォルダも
+                    // プロセスの終わりまで持つ（DB の握りと同じ。返らない接続が残っている間に
+                    // 名前を空けない）。呼ぶ側には `DbLeftOpen` で伝え、サービスは緩めない。
+                    std::mem::forget(given_dirs);
+                    Err(HubStartError::DbLeftOpen(Box::new(err)))
+                }
             }
         }
     }
@@ -1132,6 +1164,13 @@ struct StartOnDb<'a> {
     given_dirs: &'a Option<ProfileDirs>,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// テスト専用: [`close_db_then_release`] が閉じ終えられなかった（時間切れ）ことにする
+    /// （このスレッドで呼んだ分だけ。返らない接続を確実に作る口が無いため）。
+    static FAKE_DB_CLOSE_TIMEOUT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// 設定 DB の pool を [`DB_CLOSE_TIMEOUT`] のうちに閉じ、閉じ終えたら握り（`pins`）を離す
 /// （#661 661-1・#623 PR2a。停止の [`RunningHub::shutdown_and_report`] と、DB を開いた後の
 /// 起動の失敗の両方）。閉じ終えられなければ握りは離さない（返らない接続が残っている間に
@@ -1143,6 +1182,8 @@ async fn close_db_then_release(
     let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, pool.close())
         .await
         .is_ok();
+    #[cfg(test)]
+    let db_closed = db_closed && !FAKE_DB_CLOSE_TIMEOUT.with(std::cell::Cell::get);
     if !db_closed {
         log_err_line(&format!(
             "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
@@ -1961,6 +2002,21 @@ mod tests {
     /// 非 loopback に bind → `UnsafeCommissioningBind`）で失敗させる。
     #[cfg(windows)]
     async fn guarded_start_failure_releases_the_db(id: &str, legacy: bool) -> HubStartError {
+        let (err, files, _dir) = guarded_start_failure(id, legacy).await;
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+        err
+    }
+
+    /// Guarded の profile で起動を失敗させ、失敗と、設定 DB の本体・`-wal`・`-shm` のパスを
+    /// 返す（[`guarded_start_failure_releases_the_db`] の `legacy` と同じ）。
+    #[cfg(windows)]
+    async fn guarded_start_failure(
+        id: &str,
+        legacy: bool,
+    ) -> (HubStartError, [PathBuf; 3], crate::test_support::TempDir) {
         let dir = crate::test_support::TempDir::new(&format!("hub-runtime-fail-{id}"));
         let paths = resolve_profile_paths(dir.path(), id).expect("valid profile id");
         std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
@@ -2000,11 +2056,34 @@ mod tests {
             Ok(_) => panic!("起動が失敗するはず"),
             Err(err) => err,
         };
+        (err, files, dir)
+    }
+
+    /// #623 PR2a のレビュー（P1）: 設定 DB を開いた後に起動が失敗し、続く close も時間切れに
+    /// なったら（テスト専用の [`FAKE_DB_CLOSE_TIMEOUT`]）、`DbLeftOpen` で元の失敗を包んで
+    /// 返し、本体・`-wal`・`-shm` の握りを離さない（どれも消せない）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_with_close_timeout_keeps_the_db_pinned() {
+        // `start_with_profile_dirs` はこのテストのスレッドの上で await される（block_on）。
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let (err, files, _dir) = guarded_start_failure("fail-close", false).await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(err.db_left_open(), "{err:?}");
+        match &err {
+            HubStartError::DbLeftOpen(inner) => assert!(
+                matches!(**inner, HubStartError::UnsafeCommissioningBind(_)),
+                "{inner:?}"
+            ),
+            other => panic!("DbLeftOpen のはず: {other:?}"),
+        }
         for file in &files {
             assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
-            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+            assert!(
+                std::fs::remove_file(file).is_err(),
+                "{file:?} を消せた（握りを離している）"
+            );
         }
-        err
     }
 
     #[cfg(windows)]
