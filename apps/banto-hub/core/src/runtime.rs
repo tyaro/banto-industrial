@@ -3693,8 +3693,8 @@ Host: {addr}
     ///
     /// `BANTO_HUB_ROOT`を一時ディレクトリへ向けて`start`内部の root 解決
     /// （このモジュール doc「T17-1 での唯一の例外」節）を決定的にする -
-    /// このプロセス内で`BANTO_HUB_ROOT`を読むのはこのテストだけなので、
-    /// 他テストとの並行実行による競合は起きない。
+    /// `BANTO_HUB_ROOT`を書き換えて排他を取るテストは [`PROFILE_ENV_LOCK`] で
+    /// 順に走らせ、並行実行で env が重ならないようにする。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn start_fails_with_profile_lock_when_another_guard_already_holds_it() {
         let dir = crate::test_support::TempDir::new("hub-runtime-profile-lock");
