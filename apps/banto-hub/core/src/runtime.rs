@@ -483,6 +483,61 @@ impl HubRuntime {
             InitDbError::Storage(err) => HubStartError::InitDb(err),
         })?;
 
+        // #623 PR2a のレビュー（P2）: pool を開いた後の起動の失敗は、どれも pool を閉じ終えて
+        // から握りを離す（停止と同じ [`close_db_then_release`]。sqlx は pool を落とすだけでは
+        // 接続の終わりを待たない）。profile の排他と握ったフォルダも、閉じ終えるまで持つ。
+        // DB の初期化（`init_db_pinned` → `init_db_on`）の中の失敗は、そこで pool を閉じて
+        // から返るので、上の `?` で握りを落としてよい。
+        let started = Self::start_on_db(StartOnDb {
+            pool: pool.clone(),
+            registry,
+            drivers,
+            tls_config,
+            allow_setup,
+            port_override,
+            bind_override,
+            data_dir_override,
+            profile_id,
+            host_kind,
+            db_path,
+            given_dirs: &given_dirs,
+        })
+        .await;
+        match started {
+            Ok(mut hub) => {
+                hub.db_pins = db_pins;
+                hub._profile_lock = profile_lock;
+                hub._profile_dirs = given_dirs;
+                Ok(hub)
+            }
+            Err(err) => {
+                close_db_then_release(&pool, db_pins).await;
+                drop(profile_lock);
+                drop(given_dirs);
+                Err(err)
+            }
+        }
+    }
+
+    /// [`HubRuntime::start_inner`] の、設定 DB を開いた後の手順。失敗して返ると、呼ぶ側が
+    /// pool を閉じ終えてから握りを離す。返す [`RunningHub`] の `db_pins`・`_profile_lock`・
+    /// `_profile_dirs` は空で、呼ぶ側が入れる。
+    async fn start_on_db(on_db: StartOnDb<'_>) -> Result<RunningHub, HubStartError> {
+        let StartOnDb {
+            pool,
+            registry,
+            drivers,
+            tls_config,
+            allow_setup,
+            port_override,
+            bind_override,
+            data_dir_override,
+            profile_id,
+            host_kind,
+            db_path,
+            given_dirs,
+        } = on_db;
+
         // R2b-1d（設計 §5.3 の最後の行、毎回の起動）: 秘密値の行と `settings` の参照の
         // 突き合わせ。参照があって行が無い接続はログに出す（読む側は `Unreadable {
         // Missing }` として空のパスワードで繋がない）。参照の無い行は消す。失敗しても
@@ -1054,11 +1109,54 @@ impl HubRuntime {
             write_audit,
             rejection_writer,
             clock_sync_scheduler,
-            _profile_lock: profile_lock,
-            _profile_dirs: given_dirs,
-            db_pins,
+            _profile_lock: None,
+            _profile_dirs: None,
+            db_pins: None,
         })
     }
+}
+
+/// [`HubRuntime::start_on_db`] に渡す、設定 DB を開くまでに決めたもの。
+struct StartOnDb<'a> {
+    pool: SqlitePool,
+    registry: Arc<banto_driver_api::DriverRegistry>,
+    drivers: crate::broker_glue::HubDrivers,
+    tls_config: Option<TlsConfig>,
+    allow_setup: bool,
+    port_override: Option<u16>,
+    bind_override: Option<String>,
+    data_dir_override: Option<PathBuf>,
+    profile_id: String,
+    host_kind: HubHostKind,
+    db_path: String,
+    given_dirs: &'a Option<ProfileDirs>,
+}
+
+/// 設定 DB の pool を [`DB_CLOSE_TIMEOUT`] のうちに閉じ、閉じ終えたら握り（`pins`）を離す
+/// （#661 661-1・#623 PR2a。停止の [`RunningHub::shutdown_and_report`] と、DB を開いた後の
+/// 起動の失敗の両方）。閉じ終えられなければ握りは離さない（返らない接続が残っている間に
+/// 名前を空けない。ハンドルはプロセスの終わりに閉じる）。閉じ終えたかを返す。
+async fn close_db_then_release(
+    pool: &SqlitePool,
+    pins: Option<banto_safe_root::sqlite::PinnedSqlite>,
+) -> bool {
+    let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, pool.close())
+        .await
+        .is_ok();
+    if !db_closed {
+        log_err_line(&format!(
+            "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
+            DB_CLOSE_TIMEOUT.as_secs()
+        ));
+    }
+    if let Some(pins) = pins {
+        if db_closed {
+            drop(pins);
+        } else {
+            std::mem::forget(pins);
+        }
+    }
+    db_closed
 }
 
 /// #479（2026-10-10 オーナー決定「おすすめで」= 案 A'）: デスクトップシェル内の
@@ -1396,24 +1494,8 @@ impl RunningHub {
         }
         // #661 661-1: 書き手（サーバー・収集・監査の流し込み）を止めた後に、設定 DB を
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
-        let db_closed = tokio::time::timeout(DB_CLOSE_TIMEOUT, self.pool.close())
-            .await
-            .is_ok();
-        if !db_closed {
-            log_err_line(&format!(
-                "banto-hub: [WARN] 設定 DB を {} 秒のうちに閉じ終えられませんでした（返らない接続があります）",
-                DB_CLOSE_TIMEOUT.as_secs()
-            ));
-        }
-        // #623 PR2a: 閉じ終えたら握りを離す。閉じ終えられなければ離さない（返らない接続が
-        // 残っている間に名前を空けない。ハンドルはプロセスの終わりに閉じる）。
-        if let Some(pins) = self.db_pins.take() {
-            if db_closed {
-                drop(pins);
-            } else {
-                std::mem::forget(pins);
-            }
-        }
+        // #623 PR2a: 閉じ終えたら握りを離す（[`close_db_then_release`]）。
+        let db_closed = close_db_then_release(&self.pool, self.db_pins.take()).await;
         HubShutdownReport { db_closed }
     }
 }
@@ -1870,6 +1952,76 @@ mod tests {
         for file in &files {
             std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
         }
+    }
+
+    /// #623 PR2a のレビュー（P2）: Guarded の profile で、設定 DB を開いた後に起動が失敗した
+    /// ら、`Err` が返った時点で接続も握りも残っていない（本体・`-wal`・`-shm` を消せる。
+    /// PERSIST_WAL の接続が開いたままなら `-wal` は消せない）。`legacy` なら DB の初期化の
+    /// 中（旧形式の DB → `LegacyDatabase`）、でなければ初期化の後（試運転モードのまま
+    /// 非 loopback に bind → `UnsafeCommissioningBind`）で失敗させる。
+    #[cfg(windows)]
+    async fn guarded_start_failure_releases_the_db(id: &str, legacy: bool) -> HubStartError {
+        let dir = crate::test_support::TempDir::new(&format!("hub-runtime-fail-{id}"));
+        let paths = resolve_profile_paths(dir.path(), id).expect("valid profile id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::root::Mode::Guarded;
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let dirs = crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let db = dirs.config.final_path().join(DB_FILE_NAME);
+        if legacy {
+            // migration の記録が無く `users` がある = 2026-10-02 より前の形式。
+            let pool = banto_storage::connect_sqlite(&db)
+                .await
+                .expect("旧形式を作る");
+            sqlx::query("CREATE TABLE users (id INTEGER)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            pool.close().await;
+        }
+        let files = ["", "-wal", "-shm"].map(|suffix| {
+            dirs.config
+                .final_path()
+                .join(format!("{DB_FILE_NAME}{suffix}"))
+        });
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: db.to_string_lossy().into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some(if legacy { "127.0.0.1" } else { "0.0.0.0" }.to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: id.to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let err = match HubRuntime::start_with_profile_dirs(config, dirs).await {
+            Ok(_) => panic!("起動が失敗するはず"),
+            Err(err) => err,
+        };
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+        err
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_in_db_init_releases_the_db() {
+        let err = guarded_start_failure_releases_the_db("fail-init", true).await;
+        assert!(matches!(err, HubStartError::LegacyDatabase(_)), "{err:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_after_db_init_releases_the_db() {
+        let err = guarded_start_failure_releases_the_db("fail-after", false).await;
+        assert!(
+            matches!(err, HubStartError::UnsafeCommissioningBind(_)),
+            "{err:?}"
+        );
     }
 
     /// #945 の総点検: 終了のとき、書き手を止めて拒否の表の残りを、pool を閉じる前に
