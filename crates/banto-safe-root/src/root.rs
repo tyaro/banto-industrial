@@ -60,7 +60,10 @@
 //!   前の作りかけのバックアップ・予行の写しは、[`ManagedDir::pin_file_checked`] で空のまま作って
 //!   握ったまま `VACUUM INTO` の宛先にし（写しは `journal_mode=MEMORY` で開き、`-journal` を作ら
 //!   ない）、閉じて離してから [`ManagedDir::rename_no_replace_checked`]
-//!   で付け替える・[`ManagedDir::remove`] で消す（`banto_tags::upgrade`、#623 PR3b）。sidecar・
+//!   で付け替える・[`ManagedDir::remove`] で消す（`banto_tags::upgrade`、#623 PR3b）。
+//!   ChronoGazer のサービスの tstore の日付ファイルも同じく本体・`-wal`・`-shm` を
+//!   `pin_sqlite_checked` で握ったまま開き、列挙は [`ManagedDir::list`]、保持期間の削除は付随ごと
+//!   [`ManagedDir::remove`]（`banto_tstore::DataPlace`、#623 PR4）。sidecar・banto-hub の
 //!   tstore・banto の BackupService・監査の保留は [`ManagedDir::reopen_path`] などパスのまま。
 //!
 //! そこを守るのは運用モードのルート全体の ACL（PR-1c・PR-3/5）と、途中のジャンクションへの

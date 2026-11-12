@@ -188,11 +188,11 @@
 //! once no task remains to trigger a flush on its own.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use banto_tstore::{Clock, TsWriter, WriterOptions};
+use banto_tstore::{Clock, DataPlace, TsWriter, WriterOptions};
 use tokio::sync::{broadcast, watch};
 use tokio::task::JoinHandle;
 
@@ -307,7 +307,8 @@ pub struct Collector {
     clock: Arc<dyn Clock>,
     /// Needed by [`Collector::apply_config`] to reopen a rotated writer at
     /// the same location `start_with_client_factory` originally used.
-    data_dir: PathBuf,
+    /// #623 PR4: パスか握ったフォルダ（[`DataPlace`]）。再 open も同じ置き場で開く。
+    place: DataPlace,
     /// Retained so `apply_config` can spawn added/replaced connections with
     /// the exact same backoff/buffering tuning the collector was started
     /// with, without the caller having to pass it again on every call.
@@ -362,6 +363,30 @@ impl Collector {
         factory: ClientFactory,
         external: Option<Arc<dyn ExternalSource>>,
     ) -> Result<Self, CollectError> {
+        Self::start_in(
+            config,
+            DataPlace::Path(data_dir.to_path_buf()),
+            clock,
+            events,
+            options,
+            factory,
+            external,
+        )
+        .await
+    }
+
+    /// [`Self::start_with_sources`] の置き場を [`DataPlace`] で受ける版（#623 PR4）。
+    /// [`DataPlace::Managed`] なら書き手は日付ファイルを握ったフォルダの中で握ったまま開き
+    /// （[`TsWriter::open_in`]）、[`Self::apply_config`] の再 open も同じ置き場を使う。
+    pub async fn start_in(
+        config: CollectorConfig,
+        place: DataPlace,
+        clock: Arc<dyn Clock>,
+        events: EventSink,
+        options: CollectorOptions,
+        factory: ClientFactory,
+        external: Option<Arc<dyn ExternalSource>>,
+    ) -> Result<Self, CollectError> {
         if config.connections.is_empty() {
             return Err(CollectError::Config(
                 "収集対象がありません（有効な接続・グループ・タグを設定してください）".to_string(),
@@ -372,8 +397,8 @@ impl Collector {
         }
 
         let writer = Arc::new(
-            TsWriter::open_with_options(
-                data_dir,
+            TsWriter::open_in(
+                place.clone(),
                 config.store_config.clone(),
                 clock.clone(),
                 options.writer_options,
@@ -414,7 +439,7 @@ impl Collector {
             status,
             events,
             clock,
-            data_dir: data_dir.to_path_buf(),
+            place,
             options,
             config,
             tasks,
@@ -521,8 +546,8 @@ impl Collector {
             && new_config.store_config != self.config.store_config;
         let new_writer = if writer_rotated {
             Some(Arc::new(
-                TsWriter::open_with_options(
-                    &self.data_dir,
+                TsWriter::open_in(
+                    self.place.clone(),
                     new_config.store_config.clone(),
                     self.clock.clone(),
                     self.options.writer_options,

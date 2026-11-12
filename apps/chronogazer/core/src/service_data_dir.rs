@@ -8,8 +8,15 @@
 //!
 //! After policy validation, missing children are created relative to held
 //! handles with operation-mode ACLs, and the final child stays held by the
-//! collector. SQLite still reopens paths and sidecars; this does not solve
-//! races involving those opens or old write-capable handles.
+//! collector.
+//!
+//! #623 PR4: tstore の書き手はこの握った子の中で日付ファイルを列挙し、開く日付ファイルの
+//! 本体・`-wal`・`-shm` を `pin_sqlite(_checked)` で握ったまま開く（`banto_tstore::DataPlace`
+//! の `Managed`。`CollectorService::new_for_service`）。保持期間の削除も握った子の基準で、
+//! 本体と付随の `-wal`・`-shm`・`-journal` を消す（`banto_tstore::prune_managed_files_with`）。
+//! 守れないのは、握っていない名前（`-journal`・SQLite の一時ファイル）、開いていない日付の
+//! ファイル（消す直前に開いたハンドルで確かめ直すだけ）、運用モードに締める前から書き込みの
+//! 権利で開いていた古いハンドル（`banto_safe_root::root` の「守れないこと」）。
 
 use std::path::{Component, Path, PathBuf};
 
@@ -60,53 +67,6 @@ pub(crate) fn check_service_writable_dir(dir: &ManagedDir) -> Result<(), String>
         return Ok(());
     }
     Err("書き込み確認用の名前が重複しました".to_string())
-}
-
-/// List from the held directory and delete each selected name through that
-/// same handle. `remove` reopens the entry without following and rechecks its
-/// identity after a list-then-swap. SQLite sidecars are intentionally skipped.
-pub(crate) fn prune_service_data_files(
-    dir: &ManagedDir,
-    retention_days: u32,
-    today: banto_tstore::LocalDate,
-    pinned: &[banto_tstore::LocalDate],
-) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
-    prune_service_data_files_with(dir, retention_days, today, pinned, &|_| {})
-}
-
-fn prune_service_data_files_with(
-    dir: &ManagedDir,
-    retention_days: u32,
-    today: banto_tstore::LocalDate,
-    pinned: &[banto_tstore::LocalDate],
-    before_remove: &dyn Fn(&str),
-) -> Result<banto_tstore::PruneReport, banto_tstore::TstoreError> {
-    use banto_safe_root::root::EntryKind;
-    let mut files: Vec<_> = dir
-        .list()
-        .map_err(|error| banto_tstore::TstoreError::Storage(error.to_string()))?
-        .into_iter()
-        .filter(|entry| entry.kind == EntryKind::File && entry.reparse_tag.is_none())
-        .filter_map(|entry| banto_tstore::parse_data_file_info(dir.final_path(), &entry.name))
-        .collect();
-    files.sort_by_key(|file| (file.date, file.seq));
-    let plan = banto_tstore::plan_prune_candidates(files, retention_days, today, pinned);
-    for path in &plan.deleted {
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("parsed data file names are UTF-8");
-        before_remove(name);
-        let removed = dir
-            .remove(name)
-            .map_err(|error| banto_tstore::TstoreError::Storage(error.to_string()))?;
-        if !removed {
-            return Err(banto_tstore::TstoreError::Storage(format!(
-                "保持期間の削除対象が消えました: {name}"
-            )));
-        }
-    }
-    Ok(plan)
 }
 
 /// Resolve a service setting to a child of the held root without changing the
@@ -284,11 +244,14 @@ mod tests {
             std::fs::write(root_path.join("data").join(name), b"inside").unwrap();
         }
         std::fs::write(outside.join(old), b"outside").unwrap();
-        let held = held_child(&root_path);
+        let held = Arc::new(held_child(&root_path));
         check_service_writable_dir(&held).unwrap();
-        let report =
-            prune_service_data_files(&held, 0, banto_tstore::LocalDate::new(2026, 10, 26), &[])
-                .unwrap();
+        let report = banto_tstore::DataPlace::Managed {
+            dir: held.clone(),
+            expected: None,
+        }
+        .prune_files(0, banto_tstore::LocalDate::new(2026, 10, 26), &[])
+        .unwrap();
         // A Windows temp path may use an 8.3 alias while the held handle
         // reports its long spelling. Compare full paths from that handle.
         assert_eq!(
@@ -340,7 +303,7 @@ mod tests {
         std::fs::write(root_path.join("data").join(old), b"inside").unwrap();
         std::fs::write(outside.join(old), b"outside").unwrap();
         let held = held_child(&root_path);
-        let result = prune_service_data_files_with(
+        let result = banto_tstore::prune_managed_files_with(
             &held,
             0,
             banto_tstore::LocalDate::new(2026, 10, 26),

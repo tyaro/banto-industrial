@@ -1719,9 +1719,13 @@ struct CollectorContext {
     /// 時系列ファイル（`banto-tstore`）の置き場。設定 `data.dir` を
     /// [`resolve_data_dir`] で解決したもの。
     data_dir: PathBuf,
-    /// Service host only: held non-following child for probe and pruning.
-    /// SQLite writer opens remain path-based and require a separate fix.
+    /// サービスだけ: 握った `data.dir`（辿らずに開いた子）。書き込みの確かめ・tstore の書き手・
+    /// 保持期間の削除はこの握ったフォルダ基準で行う（#623 PR4。書き手は日付ファイルの本体・
+    /// `-wal`・`-shm` を握ったまま開く。[`banto_tstore::DataPlace::Managed`]）。
     service_data_dir: Option<Arc<banto_safe_root::root::ManagedDir>>,
+    /// `service_data_dir` の日付ファイルを握るときに確かめる記述子の形（設定 DB と同じ運用
+    /// モードの形。`None` は確かめずに握る。#623 PR4）。
+    service_data_expected: Option<banto_safe_root::DirAccess>,
     /// ストアのローテーションと現在値の Stale 判定が**同じ「今」**を見るための
     /// 時計。本番は [`SystemClock`]。
     clock: Arc<dyn Clock>,
@@ -1821,6 +1825,17 @@ struct Published {
 }
 
 impl CollectorContext {
+    /// tstore の書き手の置き場（#623 PR4）。サービスは握った `data.dir`、ほかはパス。
+    fn data_place(&self) -> banto_tstore::DataPlace {
+        match &self.service_data_dir {
+            Some(dir) => banto_tstore::DataPlace::Managed {
+                dir: dir.clone(),
+                expected: self.service_data_expected.clone(),
+            },
+            None => banto_tstore::DataPlace::Path(self.data_dir.clone()),
+        }
+    }
+
     /// [`Self::admission`] のロック。中身は数と真偽だけで、ロック中に panic
     /// しても壊れた値は残らないので、毒化は無視して中身を使う（札の `Drop`
     /// が panic の巻き戻し中に呼ばれても二重 panic にしないため）。
@@ -1984,11 +1999,16 @@ impl CollectorService {
 
     /// Service variant that keeps the validated child handle for this
     /// collector's entire lifetime, including stopped-writer pruning.
+    ///
+    /// #623 PR4: tstore の書き手もこの握ったフォルダの中で、日付ファイルを握ったまま開く
+    /// （[`banto_tstore::DataPlace::Managed`]）。`expected` は握るときに確かめる記述子の形
+    /// （設定 DB と同じ。`None` は確かめない）。
     pub fn new_for_service(
         pool: SqlitePool,
         data_dir: PathBuf,
         drivers: Arc<banto_driver_api::DriverRegistry>,
         held: Arc<banto_safe_root::root::ManagedDir>,
+        expected: Option<banto_safe_root::DirAccess>,
     ) -> Self {
         Self::build(
             pool,
@@ -1997,7 +2017,7 @@ impl CollectorService {
             CollectorOptions::default(),
             drivers,
             None,
-            Some(held),
+            Some((held, expected)),
         )
     }
 
@@ -2020,13 +2040,21 @@ impl CollectorService {
         options: CollectorOptions,
         drivers: Arc<banto_driver_api::DriverRegistry>,
         factory_override: Option<ClientFactory>,
-        service_data_dir: Option<Arc<banto_safe_root::root::ManagedDir>>,
+        service_data_dir: Option<(
+            Arc<banto_safe_root::root::ManagedDir>,
+            Option<banto_safe_root::DirAccess>,
+        )>,
     ) -> Self {
         let events = EventSink::new(pool.clone());
+        let (service_data_dir, service_data_expected) = match service_data_dir {
+            Some((dir, expected)) => (Some(dir), expected),
+            None => (None, None),
+        };
         Self::from_context(CollectorContext {
             pool,
             data_dir,
             service_data_dir,
+            service_data_expected,
             clock,
             events,
             options,
@@ -2319,25 +2347,14 @@ impl CollectorService {
         // 掴む間は停止の close が待つ。書き手が既に無ければ（停止済み・
         // 起動前）、ファイルを開いている者は居ないので素の削除でよい。
         let _gate = self.inner.ctx.writer_gate.lock().await;
+        // 書き手は自分の置き場（サービスは握った `data.dir`。#623 PR4）で消す
+        // （[`banto_tstore::DataPlace::prune_files`]。握った版は付随の `-wal`・`-shm` も消す）。
         if let Some(writer) = self.inner.ctx.writer().and_then(|weak| weak.upgrade()) {
-            if let Some(held) = &self.inner.ctx.service_data_dir {
-                return writer
-                    .prune_files_with(retention_days, today, |days, date, pinned| {
-                        crate::service_data_dir::prune_service_data_files(held, days, date, pinned)
-                    })
-                    .await;
-            }
             return writer.prune_files(retention_days, today).await;
         }
-        let held = self.inner.ctx.service_data_dir.clone();
-        let dir = self.inner.ctx.data_dir.clone();
-        match tokio::task::spawn_blocking(move || match held {
-            Some(held) => {
-                crate::service_data_dir::prune_service_data_files(&held, retention_days, today, &[])
-            }
-            None => banto_tstore::prune_files(&dir, retention_days, today),
-        })
-        .await
+        let place = self.inner.ctx.data_place();
+        match tokio::task::spawn_blocking(move || place.prune_files(retention_days, today, &[]))
+            .await
         {
             Ok(result) => result,
             Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
@@ -2745,6 +2762,7 @@ impl CollectorService {
             pool,
             data_dir,
             service_data_dir: None,
+            service_data_expected: None,
             clock: Arc::new(SystemClock),
             events,
             options,
@@ -3004,9 +3022,9 @@ impl Lifecycle {
                 (sync.factory, sync.stale)
             }
         };
-        let collector = match Collector::start_with_sources(
+        let collector = match Collector::start_in(
             config,
-            &self.ctx.data_dir,
+            self.ctx.data_place(),
             self.ctx.clock.clone(),
             self.ctx.events.clone(),
             self.ctx.options,
