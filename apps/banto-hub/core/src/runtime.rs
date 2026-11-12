@@ -533,17 +533,17 @@ impl HubRuntime {
             }
             Err(err) => {
                 let db_closed = close_db_then_release(&pool, db_pins).await;
-                // profile の排他は、停止の経路（`shutdown_and_report` の後に `RunningHub` と
-                // 一緒に落ちる）と同じく、閉じ終えたかにかかわらず離す。排他は Hub どうしの
-                // 二重起動を防ぐ物で、返らない接続のファイルは下の握りが守る。
-                drop(profile_lock);
                 if db_closed {
+                    drop(profile_lock);
                     drop(given_dirs);
                     Err(err)
                 } else {
                     // #623 PR2a のレビュー（P1）: 閉じ終えられなかったら、握ったフォルダも
                     // プロセスの終わりまで持つ（DB の握りと同じ。返らない接続が残っている間に
                     // 名前を空けない）。呼ぶ側には `DbLeftOpen` で伝え、サービスは緩めない。
+                    // 同じく profile の排他も離さない（返らない接続が残る間に同じ profile で
+                    // 次の Hub を起動させない。#623 PR2a のレビュー P2）。
+                    std::mem::forget(profile_lock);
                     std::mem::forget(given_dirs);
                     Err(HubStartError::DbLeftOpen(Box::new(err)))
                 }
@@ -1342,7 +1342,8 @@ pub struct RunningHub {
     /// `self`）が drop される時点で`ProfileLockGuard`自身の`Drop`が
     /// Windows mutex handle の`CloseHandle`／非 Windows lock file の fd
     /// close（`flock`自動解放）を行う。`skip_profile_lock: true`で構築した
-    /// 場合は`None`。
+    /// 場合は`None`。例外: [`RunningHub::shutdown_and_report`] で設定 DB を閉じ終えられ
+    /// なかったとき（`db_closed == false`）は drop で離さず、プロセスの終わりまで持つ。
     _profile_lock: Option<ProfileLockGuard>,
     /// 設定 DB の pool（#661 661-1）。[`RunningHub::shutdown`] の最後に閉じる
     /// （[`RunningHub::shutdown_and_report`]）。
@@ -1429,7 +1430,8 @@ impl RunningHub {
 
     /// [`Self::shutdown`] と同じ順で畳み、最後に設定 DB の pool を閉じて（上限
     /// [`DB_CLOSE_TIMEOUT`]）、閉じ終えたかを返す（#661 661-1。661-2 のサービスは、
-    /// 閉じ終えてから ACL を緩める）。
+    /// 閉じ終えてから ACL を緩める）。閉じ終えられなかったら、DB の握りに加えて profile の
+    /// 排他と握ったフォルダもプロセスの終わりまで離さない。
     pub async fn shutdown_and_report(mut self) -> HubShutdownReport {
         log_line("banto-hub: shutting down");
         // #392 A2 レビュー（2026-10-12）: 終了の受付の**取り消せない**印を立て、以降の収集の
@@ -1537,6 +1539,13 @@ impl RunningHub {
         // 閉じる（WAL を畳んでファイルを離す）。返らない接続があっても上限で切り上げる。
         // #623 PR2a: 閉じ終えたら握りを離す（[`close_db_then_release`]）。
         let db_closed = close_db_then_release(&self.pool, self.db_pins.take()).await;
+        if !db_closed {
+            // 閉じ終えられなかったら、profile の排他と握ったフォルダも離さない（`self` の
+            // drop で離れないよう忘れる。返らない接続が残る間に同じ profile で次の Hub を
+            // 起動させない。#623 PR2a のレビュー P2）。
+            std::mem::forget(self._profile_lock.take());
+            std::mem::forget(self._profile_dirs.take());
+        }
         HubShutdownReport { db_closed }
     }
 }
@@ -2002,7 +2011,7 @@ mod tests {
     /// 非 loopback に bind → `UnsafeCommissioningBind`）で失敗させる。
     #[cfg(windows)]
     async fn guarded_start_failure_releases_the_db(id: &str, legacy: bool) -> HubStartError {
-        let (err, files, _dir) = guarded_start_failure(id, legacy).await;
+        let (err, files, _dir) = guarded_start_failure(id, legacy, false).await;
         for file in &files {
             assert!(file.is_file(), "{file:?} が無い（握る前に失敗した？）");
             std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
@@ -2011,11 +2020,14 @@ mod tests {
     }
 
     /// Guarded の profile で起動を失敗させ、失敗と、設定 DB の本体・`-wal`・`-shm` のパスを
-    /// 返す（[`guarded_start_failure_releases_the_db`] の `legacy` と同じ）。
+    /// 返す（[`guarded_start_failure_releases_the_db`] の `legacy` と同じ）。`take_lock` なら
+    /// profile の排他も取って起動する（`BANTO_HUB_ROOT` をテスト用の root にする間は
+    /// [`PROFILE_ENV_LOCK`] で他のテストと重ならないようにする）。
     #[cfg(windows)]
     async fn guarded_start_failure(
         id: &str,
         legacy: bool,
+        take_lock: bool,
     ) -> (HubStartError, [PathBuf; 3], crate::test_support::TempDir) {
         let dir = crate::test_support::TempDir::new(&format!("hub-runtime-fail-{id}"));
         let paths = resolve_profile_paths(dir.path(), id).expect("valid profile id");
@@ -2050,9 +2062,18 @@ mod tests {
             data_dir_override: Some(dirs.data.path().to_path_buf()),
             profile_id: id.to_string(),
             host_kind: HubHostKind::Console,
-            skip_profile_lock: true,
+            skip_profile_lock: !take_lock,
         };
-        let err = match HubRuntime::start_with_profile_dirs(config, dirs).await {
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
+        if take_lock {
+            std::env::set_var("BANTO_HUB_ROOT", dir.path().as_os_str());
+        }
+        let started = HubRuntime::start_with_profile_dirs(config, dirs).await;
+        if take_lock {
+            std::env::remove_var("BANTO_HUB_ROOT");
+        }
+        drop(env_guard);
+        let err = match started {
             Ok(_) => panic!("起動が失敗するはず"),
             Err(err) => err,
         };
@@ -2067,7 +2088,7 @@ mod tests {
     async fn guarded_start_failure_with_close_timeout_keeps_the_db_pinned() {
         // `start_with_profile_dirs` はこのテストのスレッドの上で await される（block_on）。
         FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
-        let (err, files, _dir) = guarded_start_failure("fail-close", false).await;
+        let (err, files, _dir) = guarded_start_failure("fail-close", false, false).await;
         FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
         assert!(err.db_left_open(), "{err:?}");
         match &err {
@@ -2084,6 +2105,82 @@ mod tests {
                 "{file:?} を消せた（握りを離している）"
             );
         }
+    }
+
+    /// テスト専用: `BANTO_HUB_ROOT` を書き換えて `skip_profile_lock: false` で起動するテストが
+    /// 並行して走っても env が重ならないようにする。
+    static PROFILE_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// #623 PR2a のレビュー（P2）: 起動の失敗で設定 DB を閉じ終えられなかったら、profile の排他も
+    /// 離さない（返らない接続が残る間に同じ profile で次の Hub を起動させない）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_with_close_timeout_keeps_the_profile_lock() {
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let (err, _files, dir) = guarded_start_failure("fail-close-lock", false, true).await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(err.db_left_open(), "{err:?}");
+        let paths = resolve_profile_paths(dir.path(), "fail-close-lock").expect("valid id");
+        assert!(
+            try_acquire_profile_lock(&paths, HubHostKind::Console).is_err(),
+            "排他を離している（返らない接続が残るのに次の Hub が起動できる）"
+        );
+    }
+
+    /// 対照: 閉じ終えられた起動の失敗では、profile の排他は離れて取り直せる。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_start_failure_releases_the_profile_lock_when_the_db_closed() {
+        let (err, _files, dir) = guarded_start_failure("fail-lock-free", false, true).await;
+        assert!(!err.db_left_open(), "{err:?}");
+        let paths = resolve_profile_paths(dir.path(), "fail-lock-free").expect("valid id");
+        let _again = try_acquire_profile_lock(&paths, HubHostKind::Console)
+            .expect("閉じ終えたなら排他は取り直せる");
+    }
+
+    /// 停止の経路: 設定 DB を閉じ終えられなかったら（`db_closed == false`）、`RunningHub` を
+    /// drop しても profile の排他は離れない。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_with_close_timeout_keeps_the_profile_lock() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-shutdown-lock");
+        let paths = resolve_profile_paths(dir.path(), "stop-lock").expect("valid id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let dirs = crate::profile_lock::open_profile_dirs(
+            &crate::profile_lock::plain_profile_root_spec(&paths),
+            None,
+        )
+        .expect("open dirs");
+        let config = HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "stop-lock".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: false,
+        };
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
+        std::env::set_var("BANTO_HUB_ROOT", dir.path().as_os_str());
+        let started = HubRuntime::start_with_profile_dirs(config, dirs).await;
+        std::env::remove_var("BANTO_HUB_ROOT");
+        drop(env_guard);
+        let hub = started.expect("start");
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(true));
+        let report = hub.shutdown_and_report().await;
+        FAKE_DB_CLOSE_TIMEOUT.with(|fake| fake.set(false));
+        assert!(!report.db_closed, "{report:?}");
+        assert!(
+            try_acquire_profile_lock(&paths, HubHostKind::Console).is_err(),
+            "排他を離している（返らない接続が残るのに次の Hub が起動できる）"
+        );
     }
 
     #[cfg(windows)]
@@ -3625,9 +3722,11 @@ Host: {addr}
             skip_profile_lock: false,
         };
 
+        let env_guard = PROFILE_ENV_LOCK.lock().await;
         std::env::set_var("BANTO_HUB_ROOT", root.to_string_lossy().as_ref());
         let result = HubRuntime::start(config).await;
         std::env::remove_var("BANTO_HUB_ROOT");
+        drop(env_guard);
 
         match result {
             Err(HubStartError::ProfileLock(_)) => {}
