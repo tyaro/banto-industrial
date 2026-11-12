@@ -61,3 +61,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_Ioctl",
 ] }
+# `ManagedDir::pin_file` で本体・`-wal`・`-shm` を握ったまま、SQLite（WAL）が開いて書いて読んで
+# 閉じられるかの確かめ（#623）。テストだけで、本番の依存には足さない（「本番依存は
+# windows-sys・thiserror だけ」の条件を崩さない）。どちらもワークスペースに既にある版。
+sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
+tokio = { workspace = true, features = ["rt"] }

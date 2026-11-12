@@ -25,12 +25,30 @@
 //! ハンドルがあるフォルダの名前の変更・削除を NTFS が断る。API の契約ではないので、テスト
 //! `an_ancestor_of_a_held_root_cannot_be_renamed` で固定した。ReFS は未測。Fable B-4-1）。
 //!
-//! # 守れないこと（[`ReopenPath`] の doc も）
+//! # 守れないこと（[`ReopenPath`]・[`PinnedName`] の doc も）
 //!
 //! SQLite・tstore・banto の BackupService は、渡したパスで後から開き直し、付随のファイル
 //! （`-wal`・`-shm`・`-journal`）を自分でパスから作る。[`ManagedDir::reopen_path`] は確かめた
-//! 時点のことしか保証しない。そこを守るのは運用モードのルート全体の ACL（PR-1c・PR-3/5）と、
-//! 途中のジャンクションへの保険の Redirection Guard（[`crate::redirection`]）。
+//! 時点のことしか保証しない（確かめてから相手が開くまでの間の、名前の変更・削除・リンクへの
+//! 置換が残る）。[`ManagedDir::pin_file`] は名前を辿らずに開いて確かめ、**削除なしの共有で
+//! 握り続ける**ので、握っている名前についてはその間が塞がる（[`PinnedName`] が生きている間、
+//! 他者はその名前を変更・削除・置換できない）。残るのは、
+//!
+//! - **握っていない名前**: 相手が後から作る付随のファイル（握らなかった `-journal`、SQLite の
+//!   一時ファイル・`VACUUM` の作業ファイル・予期しない名前）は [`ManagedDir::reopen_path`] と
+//!   同じく確かめた時点まで。
+//! - **握る前の窓**: 握る時点で既に `DELETE` の権利で開いている他者のハンドルがあれば、握るのが
+//!   共有違反で失敗する（それは塞げないので失敗として返す）。
+//! - **同じファイルへの別名**: 握った後に、別の場所に同じファイルへのハードリンクを足すことは
+//!   止めない（ファイルへの書き込み権が要る。1903 以降の mitigation）。足した別名は握って
+//!   いないので改名・削除できる（【実測】）が、握った名前は変わらず、外へは書かない。
+//! - **SQLite が自分で消す名前**: 握った名前は SQLite も消せない。WAL の最後の接続が閉じるとき
+//!   `-wal`・`-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は無視され、
+//!   `close` 1 回に約 3 秒。`SQLITE_FCNTL_PERSIST_WAL` で消しに行かなくなる。`win_tests` の
+//!   `sqlite_with_pins` の実測）。`journal_mode=DELETE` の `-journal` は握らない。
+//!
+//! そこを守るのは運用モードのルート全体の ACL（PR-1c・PR-3/5）と、途中のジャンクションへの
+//! 保険の Redirection Guard（[`crate::redirection`]）。
 //!
 //! # 対象の OS
 //!
@@ -305,6 +323,8 @@ pub struct RemoveReport {
 }
 
 /// パスで開き直す相手（SQLite・tstore・banto の BackupService）に渡すパス（設計 §4.4）。
+/// 確かめてから相手が開くまでの間を塞ぎたい名前は、[`ManagedDir::pin_file`]（[`PinnedName`]）で
+/// 握ってから渡す。
 ///
 /// **残留リスク**: `ReopenPath` は「確かめた時点で、このフォルダ自身が reparse point でなく
 /// （握ったハンドルで読み直した属性）、このフォルダの中のこの名前と付随の名前がリンク（reparse
@@ -335,6 +355,45 @@ impl ReopenPath {
     /// 本体のパスを取り出す。
     pub fn into_path(self) -> PathBuf {
         self.path
+    }
+}
+
+/// 名前 1 要素のファイルを**握ったまま**、パスで開き直す相手（SQLite の本体・`-wal`・`-shm`、
+/// `VACUUM INTO` の宛先）に渡すためのガード（[`ManagedDir::pin_file`]、#623）。
+///
+/// **契約（[`Mode::Guarded`]）**: このガードが生きている間、[`PinnedName::path`] の名前は他者から
+/// 変更・削除・置換（別のファイル・ハードリンク・シンボリックリンク・ジャンクションへのすり替え）
+/// できない。握ったハンドルの共有に `FILE_SHARE_DELETE` を付けないので、`DELETE` の権利で開く
+/// こと（名前の変更・削除・置き換えの前提）が共有違反で失敗する。握った時点で、それが
+/// reparse point でもフォルダでもなく、リンク数 1 だったことを**開いた後のハンドルで**確かめて
+/// いる。相手が同じパスで開き直すとき、得るのは握っている同じファイル。
+///
+/// **相手への影響**: 共有は読み書きを許すので、読み書き共有で開く相手（SQLite）は開ける。
+/// ただし相手もこの名前を消せない。【実測】WAL の最後の接続が閉じるとき SQLite は `-wal`・
+/// `-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は `close` の結果に
+/// 出ず、`close` 1 回に約 3 秒かかる。チェックポイントは済んでいて行は失われない）。接続ごとに
+/// `SQLITE_FCNTL_PERSIST_WAL` を立てれば消しに行かない（`journal_size_limit=0` で `-wal` を
+/// 切り詰める）。`journal_mode=DELETE` の `-journal` のように、相手が毎回消す名前は握らない。
+/// drop で閉じ、以後は普通に変更・削除できる。
+///
+/// [`Mode::Plain`] は何も握らない（[`PinnedName::is_held`] が偽。パスを返すだけ）。
+#[derive(Debug)]
+pub struct PinnedName {
+    path: PathBuf,
+    /// 握っているハンドル（[`Mode::Guarded`] だけ）。drop で閉じる。
+    held: Option<std::fs::File>,
+}
+
+impl PinnedName {
+    /// 握っている名前のパス（[`ManagedDir::final_path`] + 名前。渡された綴りではなく本当のパス
+    /// 基準）。相手にはこのパスを渡す。
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 名前を削除なしの共有で握っているか（[`Mode::Guarded`]）。
+    pub fn is_held(&self) -> bool {
+        self.held.is_some()
     }
 }
 
@@ -558,6 +617,47 @@ impl ManagedDir {
             path,
             companions: paths.collect(),
         })
+    }
+
+    /// 名前 1 要素のファイルを辿らずに開いて（`create` なら無ければ空のファイルを作って）
+    /// **握り続ける**（[`PinnedName`] の契約）。`create` が偽で無ければ `Ok(None)`（`create` が
+    /// 真なら `None` にならない）。用途: SQLite の本体・`-wal`・`-shm`（`create` 真で空のまま
+    /// 渡してよい）、`VACUUM INTO` の宛先（空のファイル）。
+    ///
+    /// Guarded は (1) 握ったハンドルでこのフォルダ自身の属性を読み直し、reparse point なら断る
+    /// （[`ManagedDir::reopen_path`] と同じ）、(2) 名前を握ったハンドルを基準に相対に
+    /// `FILE_OPEN_REPARSE_POINT` で開き（作るときの記述子は親のフォルダから継承）、**開いた後に
+    /// ハンドルで** reparse point でない・フォルダでない・リンク数 1 を確かめ、合わなければ
+    /// 閉じて [`SafeRootError::Refused`]。共有は読み書き（削除なし）。握る時点で既に `DELETE` の
+    /// 権利で開いている他者のハンドルがあると、共有違反（`ERROR_SHARING_VIOLATION`）の
+    /// [`SafeRootError::Io`] で失敗する。握ったファイルがある間、このフォルダは空でないので
+    /// その場でジャンクションにもされない。
+    ///
+    /// Plain は確かめず、握らない（`create` なら `std::fs` で無ければ作り、偽なら有無だけ見る。
+    /// リンクを辿る）。印のファイル（[`crate::mode::MARKER_NAME`]）は綴りの大文字小文字を
+    /// 問わず断る。
+    pub fn pin_file(&self, name: &str, create: bool) -> Result<Option<PinnedName>> {
+        if !guard::is_plain_child_name(name) || name.eq_ignore_ascii_case(crate::mode::MARKER_NAME)
+        {
+            return Err(invalid_name());
+        }
+        let held = match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => match win::pin_file(pinned, &self.display, name, create)? {
+                Some(file) => Some(file),
+                None => return Ok(None),
+            },
+            Inner::Plain => {
+                if !plain::pin_file(&self.final_path, name, create)? {
+                    return Ok(None);
+                }
+                None
+            }
+        };
+        Ok(Some(PinnedName {
+            path: self.final_path.join(name),
+            held,
+        }))
     }
 
     /// [`ManagedDir::reopen_path`] に、握ったフォルダの**記述子の確かめ直し**を足したもの

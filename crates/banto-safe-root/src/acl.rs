@@ -3322,6 +3322,14 @@ pub(crate) mod imp {
         /// 属性だけを読むために開く（#623 PR-1b の `ManagedDir::reopen_path`）。中身の権利を
         /// 求めず、共有はすべて許す（相手の邪魔をしない）。
         OpenAttributes,
+        /// 名前を握り続けるために開く（#623 の `ManagedDir::pin_file`）。`create` なら無ければ
+        /// 作る（`FILE_OPEN_IF`）、偽なら `FILE_OPEN`（無ければ `Ok(None)`）。権利は読み取り
+        /// （`FILE_READ_DATA` を含める - 属性だけの権利では共有の取り決めが記録されず、握っても
+        /// 他者の `DELETE` を止められない）。共有は読み書き（**削除なし**）: 持っている間は
+        /// 他者が `DELETE` で開けない = 名前の変更・削除・置換ができない。後から開くパスの相手
+        /// （SQLite は読み書き共有）の邪魔はしない。`OpenAppend` と同じ理由でファイルの指定を
+        /// 付けず、種類を問わず開き、呼ぶ側が開いた後の属性で断る。
+        Pin { create: bool },
     }
 
     /// 開いている `parent` を `RootDirectory` に、名前 1 要素の子を `NtCreateFile` で作るか
@@ -3374,10 +3382,11 @@ pub(crate) mod imp {
             | ChildHow::OpenFileForUpdate
             | ChildHow::OpenAppend { create: false }
             | ChildHow::OpenForDelete
-            | ChildHow::OpenAttributes => "OpenChildFile(name)",
-            ChildHow::CreateFile(_) | ChildHow::OpenAppend { create: true } => {
-                "CreateChildFile(name)"
-            }
+            | ChildHow::OpenAttributes
+            | ChildHow::Pin { create: false } => "OpenChildFile(name)",
+            ChildHow::CreateFile(_)
+            | ChildHow::OpenAppend { create: true }
+            | ChildHow::Pin { create: true } => "CreateChildFile(name)",
         };
         // `NtCreateFile` は Win32 の正規化を通らないので、Win32 から見ると別の名前・別の
         // 物になるもの（末尾の `.` と空白・ワイルドカード・予約デバイス名など）も断る
@@ -3467,6 +3476,13 @@ pub(crate) mod imp {
                 FILE_READ_ATTRIBUTES | SYNCHRONIZE,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             ),
+            ChildHow::Pin { create } => (
+                None,
+                if create { FILE_OPEN_IF } else { FILE_OPEN },
+                0,
+                read_access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ),
         };
         let attributes = OBJECT_ATTRIBUTES {
             Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
@@ -3510,13 +3526,14 @@ pub(crate) mod imp {
         let absent = match how {
             ChildHow::Create(_) | ChildHow::CreateFile(_) => status == STATUS_OBJECT_NAME_COLLISION,
             // 無ければ作るので「無い」は起きない。
-            ChildHow::OpenAppend { create: true } => false,
+            ChildHow::OpenAppend { create: true } | ChildHow::Pin { create: true } => false,
             ChildHow::Open
             | ChildHow::OpenFile
             | ChildHow::OpenFileForUpdate
             | ChildHow::OpenAppend { create: false }
             | ChildHow::OpenForDelete
-            | ChildHow::OpenAttributes => {
+            | ChildHow::OpenAttributes
+            | ChildHow::Pin { create: false } => {
                 status == STATUS_OBJECT_NAME_NOT_FOUND || status == STATUS_OBJECT_PATH_NOT_FOUND
             }
         };
@@ -3533,16 +3550,17 @@ pub(crate) mod imp {
                 | ChildHow::OpenFileForUpdate
                 | ChildHow::OpenAppend { create: false }
                 | ChildHow::OpenForDelete
-                | ChildHow::OpenAttributes => SafeRootError::io(
+                | ChildHow::OpenAttributes
+                | ChildHow::Pin { create: false } => SafeRootError::io(
                     IoOp::OpenFile,
                     &std::io::Error::from_raw_os_error(os_error as i32),
                 ),
-                ChildHow::CreateFile(_) | ChildHow::OpenAppend { create: true } => {
-                    SafeRootError::io(
-                        IoOp::CreateFile,
-                        &std::io::Error::from_raw_os_error(os_error as i32),
-                    )
-                }
+                ChildHow::CreateFile(_)
+                | ChildHow::OpenAppend { create: true }
+                | ChildHow::Pin { create: true } => SafeRootError::io(
+                    IoOp::CreateFile,
+                    &std::io::Error::from_raw_os_error(os_error as i32),
+                ),
                 ChildHow::Create(_) | ChildHow::Open => api("NtCreateFile", os_error),
             });
         }

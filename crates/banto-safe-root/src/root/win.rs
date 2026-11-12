@@ -308,3 +308,20 @@ pub(super) fn check_reopen(dir: &PinnedDir, display: &Path, names: &[String]) ->
     }
     Ok(())
 }
+
+/// [`ManagedDir::pin_file`] の Guarded。フォルダ自身を読み直してから、名前を削除なしの共有で
+/// 開いて（[`ChildHow::Pin`]）、開いた後の属性で確かめる。
+pub(super) fn pin_file(
+    dir: &PinnedDir,
+    display: &Path,
+    name: &str,
+    create: bool,
+) -> Result<Option<File>> {
+    let own = handle_io::facts(dir.raw_handle())?;
+    if let Some(refusal) = dir_refusal(&own) {
+        return Err(refused(display, refusal));
+    }
+    child_relative(dir, name, ChildHow::Pin { create })?
+        .map(|handle| verified_file(handle, &display.join(name)))
+        .transpose()
+}
