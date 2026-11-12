@@ -1110,13 +1110,28 @@ fn pin_file_refuses_the_marker_by_its_short_name() {
         "{short_name}"
     );
     for create in [true, false] {
+        // 権限不足などの別の失敗で通らないよう、印の断り（`invalid_name` = InvalidInput）に絞る。
+        let pinned = d.pin_file(&short_name, create);
         assert!(
-            d.pin_file(&short_name, create).is_err(),
-            "pin_file {short_name}"
+            matches!(
+                pinned,
+                Err(crate::SafeRootError::Io {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                })
+            ),
+            "pin_file {short_name}: {pinned:?}"
         );
+        let checked = d.pin_file_checked(&short_name, create, &access);
         assert!(
-            d.pin_file_checked(&short_name, create, &access).is_err(),
-            "pin_file_checked {short_name}"
+            matches!(
+                checked,
+                Err(crate::SafeRootError::Io {
+                    kind: std::io::ErrorKind::InvalidInput,
+                    ..
+                })
+            ),
+            "pin_file_checked {short_name}: {checked:?}"
         );
     }
     // 握っていない: 印を改名・削除できる（握っていれば共有違反）。
