@@ -134,6 +134,27 @@ pub(super) fn open_append(dir: &Path, name: &str, create: bool) -> Result<File> 
         }))
 }
 
+/// [`ManagedDir::pin_file`] の Plain: 確かめず、握らない。`create` なら無ければ作る。有れば
+/// （作れば）`true`。
+pub(super) fn pin_file(dir: &Path, name: &str, create: bool) -> Result<bool> {
+    check_name(name)?;
+    let path = dir.join(name);
+    if create {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(io(IoOp::CreateFile))?;
+        return Ok(true);
+    }
+    match std::fs::metadata(&path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io(IoOp::OpenFile)(e)),
+    }
+}
+
 pub(super) fn open_read(dir: &Path, name: &str) -> Result<Option<File>> {
     check_name(name)?;
     match File::open(dir.join(name)) {

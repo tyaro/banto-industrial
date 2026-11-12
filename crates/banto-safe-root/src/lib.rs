@@ -85,6 +85,6 @@ pub use mode::{
 };
 pub use redirection::{enable_redirection_guard, RedirectionGuard};
 pub use root::{
-    open_root, ManagedDir, ManagedSet, ManagedSpec, ManagedStop, Mode, ReopenPath, RootRefusal,
-    RootSpec, SafeRoot,
+    open_root, ManagedDir, ManagedSet, ManagedSpec, ManagedStop, Mode, PinnedName, ReopenPath,
+    RootRefusal, RootSpec, SafeRoot,
 };

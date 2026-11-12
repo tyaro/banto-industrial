@@ -308,3 +308,51 @@ pub(super) fn check_reopen(dir: &PinnedDir, display: &Path, names: &[String]) ->
     }
     Ok(())
 }
+
+/// [`ManagedDir::pin_file`] の Guarded。フォルダ自身を読み直してから、名前を削除なしの共有で
+/// 開いて（[`ChildHow::Pin`]）、開いた後の属性で確かめる。
+pub(super) fn pin_file(
+    dir: &PinnedDir,
+    display: &Path,
+    name: &str,
+    create: bool,
+) -> Result<Option<File>> {
+    let own = handle_io::facts(dir.raw_handle())?;
+    if let Some(refusal) = dir_refusal(&own) {
+        return Err(refused(display, refusal));
+    }
+    let Some(handle) = child_relative(dir, name, ChildHow::Pin { create })? else {
+        return Ok(None);
+    };
+    // 開いた物が印の席（OS が `MARKER_NAME` に解決する子。親の列挙で解く）なら、綴りが違っても
+    // 握らない。8.3 の短縮名（`BANTO-~1` など）は文字列比較をすり抜けるので、本当の守りは
+    // ファイル ID（`remove` と同じ形）。握ったハンドルは閉じて返す。
+    if let Some(slot) = crate::acl::imp::marker_entry(dir.raw_handle())? {
+        if slot.file_id == crate::acl::imp::file_id_of(handle.raw())? {
+            drop(handle);
+            return Err(super::invalid_name());
+        }
+    }
+    verified_file(handle, &display.join(name)).map(Some)
+}
+
+/// [`ManagedDir::pin_file_checked`] の Guarded（フォルダの `recheck` は呼ぶ側）。[`pin_file`] で
+/// 握り、**握ったハンドルで**ファイルの記述子（DACL と所有者）を読み、
+/// [`crate::acl::check_file_dacl`] で `expected` の形か確かめる。合わなければハンドルを閉じて
+/// [`SafeRootError::AclMismatch`]。
+pub(super) fn pin_file_checked(
+    dir: &PinnedDir,
+    display: &Path,
+    name: &str,
+    create: bool,
+    expected: &DirAccess,
+) -> Result<Option<File>> {
+    use std::os::windows::io::AsRawHandle;
+
+    let Some(file) = pin_file(dir, display, name, create)? else {
+        return Ok(None);
+    };
+    let dacl = crate::acl::imp::read_dacl_of_handle(file.as_raw_handle() as _)?;
+    crate::acl::check_file_dacl(&dacl, expected).map_err(SafeRootError::AclMismatch)?;
+    Ok(Some(file))
+}

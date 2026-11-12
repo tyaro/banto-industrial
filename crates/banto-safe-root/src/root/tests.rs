@@ -175,6 +175,7 @@ fn handles_are_send_and_sync() {
     assert_send_sync::<SafeRoot>();
     assert_send_sync::<ManagedDir>();
     assert_send_sync::<ManagedSet>();
+    assert_send_sync::<PinnedName>();
 }
 
 fn plain_spec(expected: PathBuf) -> RootSpec {
@@ -460,4 +461,35 @@ fn the_final_directory_check_distinguishes_file_dir_and_missing() {
     assert!(plain::is_dir(dir.path()).unwrap());
     assert!(!plain::is_dir(&file).unwrap());
     assert!(plain::is_dir(&dir.path().join("absent")).is_err());
+}
+
+/// `pin_file` の Plain（#623）: 確かめず握らない。`create` なら無ければ空のファイルを作り
+/// （あれば中身を変えない）、偽なら有無だけ見る。握っていないので改名・削除できる。
+#[test]
+fn plain_pin_file_creates_but_does_not_hold() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&plain_spec(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+
+    assert!(d.pin_file("absent", false).unwrap().is_none());
+    assert!(!d.final_path().join("absent").exists(), "作った");
+
+    let pin = d.pin_file("db.sqlite3", true).unwrap().expect("作った");
+    assert!(!pin.is_held());
+    assert_eq!(pin.path(), d.final_path().join("db.sqlite3"));
+    assert_eq!(std::fs::read(pin.path()).unwrap(), b"");
+
+    std::fs::write(d.final_path().join("kept"), b"data").unwrap();
+    let kept = d.pin_file("kept", true).unwrap().unwrap();
+    assert_eq!(std::fs::read(kept.path()).unwrap(), b"data", "中身を変えた");
+    assert!(d.pin_file("kept", false).unwrap().is_some());
+
+    let moved = d.final_path().join("moved");
+    std::fs::rename(pin.path(), &moved).unwrap();
+    std::fs::remove_file(kept.path()).unwrap();
+
+    for name in [crate::mode::MARKER_NAME, ".BANTO-SAFE-ROOT", "a/b", ".."] {
+        assert!(d.pin_file(name, true).is_err(), "{name}");
+    }
+    assert!(!d.final_path().join(crate::mode::MARKER_NAME).exists());
 }
