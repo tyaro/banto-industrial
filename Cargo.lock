@@ -1076,6 +1076,7 @@ name = "banto-safe-root"
 version = "0.1.0"
 dependencies = [
  "banto-service-elev",
+ "libsqlite3-sys",
  "sqlx",
  "tempfile",
  "thiserror 2.0.21",

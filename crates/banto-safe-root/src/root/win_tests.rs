@@ -1202,27 +1202,15 @@ mod sqlite_with_pins {
         std::fs::metadata(path).ok().map(|m| m.len())
     }
 
-    extern "C" {
-        // 同梱の SQLite（sqlx の libsqlite3-sys が静的に入れる）の関数。テストの確かめだけ。
-        fn sqlite3_file_control(
-            db: *mut std::ffi::c_void,
-            name: *const std::ffi::c_char,
-            op: std::ffi::c_int,
-            arg: *mut std::ffi::c_void,
-        ) -> std::ffi::c_int;
-    }
-    /// `SQLITE_FCNTL_PERSIST_WAL`。
-    const SQLITE_FCNTL_PERSIST_WAL: std::ffi::c_int = 10;
-
     async fn persist_wal(conn: &mut sqlx::SqliteConnection) {
         let mut handle = conn.lock_handle().await.unwrap();
         let mut on: std::ffi::c_int = 1;
         // SAFETY: ロックした接続の生のハンドル。`"main"` は NUL 終端。`on` は呼び出しの間生きる。
         let rc = unsafe {
-            sqlite3_file_control(
-                handle.as_raw_handle().as_ptr().cast(),
+            libsqlite3_sys::sqlite3_file_control(
+                handle.as_raw_handle().as_ptr(),
                 c"main".as_ptr(),
-                SQLITE_FCNTL_PERSIST_WAL,
+                libsqlite3_sys::SQLITE_FCNTL_PERSIST_WAL,
                 (&mut on as *mut std::ffi::c_int).cast(),
             )
         };

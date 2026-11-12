@@ -183,11 +183,37 @@ pub async fn init_db_with_registry(
     init_db_inner(path.as_ref(), Some(registry)).await
 }
 
+/// [`init_db_with_registry`] の、握った組（[`banto_safe_root::sqlite::PinnedSqlite`]）で開く版
+/// （#623 PR2a。サービスが握った profile の `config\banto-hub.sqlite3`）。開き方は
+/// `banto_storage::connect_sqlite` と同じ設定に、握っているときは接続ごとの
+/// `SQLITE_FCNTL_PERSIST_WAL` を足したもの（`PinnedSqlite::connect`）。手順と失敗は
+/// [`init_db_with_registry`] と同じ。`pinned` は返った pool を閉じ終えるまで生かすこと
+/// （呼ぶ側の責任）。
+pub async fn init_db_pinned(
+    pinned: &banto_safe_root::sqlite::PinnedSqlite,
+    registry: &std::sync::Arc<banto_driver_api::DriverRegistry>,
+) -> Result<SqlitePool, InitDbError> {
+    let pool = pinned
+        .connect()
+        .await
+        .map_err(banto_storage::storage_error)?;
+    init_db_on(pool, pinned.path(), Some(registry)).await
+}
+
 async fn init_db_inner(
     path: &Path,
     registry: Option<&std::sync::Arc<banto_driver_api::DriverRegistry>>,
 ) -> Result<SqlitePool, InitDbError> {
     let pool = banto_storage::connect_sqlite(path).await?;
+    init_db_on(pool, path, registry).await
+}
+
+/// 開いた pool で 2-a〜2-c を行う（[`init_db_with_registry`] の doc の手順）。
+async fn init_db_on(
+    pool: SqlitePool,
+    path: &Path,
+    registry: Option<&std::sync::Arc<banto_driver_api::DriverRegistry>>,
+) -> Result<SqlitePool, InitDbError> {
     if is_legacy_schema(&pool).await? {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {

@@ -29,6 +29,9 @@
 //!   見分ける純関数（[`classify_mode`]・[`observe_root`]）。2 つの形は [`ModeAccess`]。
 //! - [`redirection`] モジュール（#623 の (3b)）: プロセスの Redirection Guard を有効にする
 //!   （[`enable_redirection_guard`]。配線は各アプリ）。
+//! - `sqlite` モジュール（#623 PR2a、`sqlite` feature）: SQLite の本体・`-wal`・`-shm` を
+//!   握ったまま開く口（`ManagedDir::pin_sqlite`・`PinnedSqlite`）。接続ごとに
+//!   `SQLITE_FCNTL_PERSIST_WAL` を立てる。
 //! - [`error`] モジュール: [`SafeRootError`]・[`Refusal`]。文言は製品に依らない中立の形で、
 //!   置き場の名前（「データのルート」「profile」など）は持たない。
 //!
@@ -49,8 +52,10 @@
 //!  banto-secret-store ── apps（chronogazer-core / chronogazer-elev / banto-hub-core / banto-hub-sink）
 //! ```
 //!
-//! 本番の依存は `windows-sys` と `thiserror` だけに限る。dev-dependency の
-//! `banto-service-elev`（昇格判定）と `tempfile` はテストのためだけ。
+//! 既定の本番の依存は `windows-sys` と `thiserror` だけに限る。`sqlite` feature を有効にした
+//! ときだけ `sqlx`・`libsqlite3-sys` が入る（使うアプリだけが有効にする。どちらもワーク
+//! スペースに既にある版）。dev-dependency の `banto-service-elev`（昇格判定）と `tempfile` は
+//! テストのためだけ。
 //!
 //! # banto へ移す条件
 //!
@@ -75,6 +80,8 @@ pub mod mode;
 pub mod nofollow;
 pub mod redirection;
 pub mod root;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 pub use acl::{DirAccess, InstallUserSid, UserRight};
 pub use error::{AclMismatch, IoOp, Refusal, Result, SafeRootError};

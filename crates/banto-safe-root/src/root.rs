@@ -53,6 +53,11 @@
 //!   `-wal`・`-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は無視され、
 //!   `close` 1 回に約 3 秒。`SQLITE_FCNTL_PERSIST_WAL` で消しに行かなくなる。`win_tests` の
 //!   `sqlite_with_pins` の実測）。`journal_mode=DELETE` の `-journal` は握らない。
+//!   SQLite の DB は `sqlite` feature の `ManagedDir::pin_sqlite`（`crate::sqlite`。#623 PR2a）が、
+//!   本体・`-wal`・`-shm` を握り、接続ごとに `SQLITE_FCNTL_PERSIST_WAL` を立てて開く
+//!   （`-journal` は握らず作らず、在ればリンクでないかを確かめた時点まで）。使っているのは
+//!   banto-hub のサービスの設定 DB だけ（ChronoGazer のサービスは次の PR。sidecar・0025 の `.bak`・
+//!   tstore・banto の BackupService・監査の保留は [`ManagedDir::reopen_path`] などパスのまま）。
 //!
 //! そこを守るのは運用モードのルート全体の ACL（PR-1c・PR-3/5）と、途中のジャンクションへの
 //! 保険の Redirection Guard（[`crate::redirection`]）。
@@ -390,8 +395,8 @@ impl ReopenPath {
 /// ただし相手もこの名前を消せない。【実測】WAL の最後の接続が閉じるとき SQLite は `-wal`・
 /// `-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は `close` の結果に
 /// 出ず、`close` 1 回に約 3 秒かかる。チェックポイントは済んでいて行は失われない）。接続ごとに
-/// `SQLITE_FCNTL_PERSIST_WAL` を立てれば消しに行かない（`journal_size_limit=0` で `-wal` を
-/// 切り詰める）。`journal_mode=DELETE` の `-journal` のように、相手が毎回消す名前は握らない。
+/// `SQLITE_FCNTL_PERSIST_WAL` を立てれば消しに行かない（`-wal` はチェックポイント済みのまま切り詰めない。
+/// `journal_size_limit` を立てていないため）。`journal_mode=DELETE` の `-journal` のように、相手が毎回消す名前は握らない。
 /// drop で閉じ、以後は普通に変更・削除できる。
 ///
 /// [`Mode::Plain`] は何も握らない（[`PinnedName::is_held`] が偽。パスを返すだけ）。

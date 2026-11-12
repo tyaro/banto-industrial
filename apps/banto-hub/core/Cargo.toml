@@ -58,8 +58,10 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # 走らせるので、Windows 限定にしない。`banto-hub-bootstrap`・`banto-tagclient`が
 # 付いてくるが、どちらもこの crate が既に持つ依存（reqwest・tungstenite 等）の上で、
 # Cargo.lock に新しい crate は増えない。これらの部品は `banto-safe-root`（#623 PR-1a で
-# `banto-secret-store` から分けた共有 crate）にある。
-banto-safe-root = { path = "../../../crates/banto-safe-root" }
+# `banto-secret-store` から分けた共有 crate）にある。`sqlite` feature（#623 PR2a）は、
+# サービスが profile の設定 DB の本体・`-wal`・`-shm` を握ったまま開く口
+# （`banto_safe_root::sqlite`）。sqlx・libsqlite3-sys はこの crate が既に木に持つ版。
+banto-safe-root = { path = "../../../crates/banto-safe-root", features = ["sqlite"] }
 # R2b-1b（docs/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
 # 秘密値を封印する部品（`Protector`・Windows の `DpapiMachine`・`MAX_SECRET_LEN`）を使う。
 # 保存先のファイル（`FileSecretStore`）は使わない - blob は DB に置く（設計 §5.1 の Q1 (c)）。

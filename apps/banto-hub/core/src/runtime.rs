@@ -195,7 +195,7 @@ use crate::broker_glue::{BrokerSimRegistry, HubSessions};
 use crate::commissioning::CommissioningService;
 use crate::computed::{load_retained_values, ComputedEngine, ServerTagStore};
 use crate::controller::CollectionController;
-use crate::db::{init_db_with_registry, Db, InitDbError, LegacyDatabase};
+use crate::db::{init_db_pinned, init_db_with_registry, Db, InitDbError, LegacyDatabase};
 use crate::diag_log::DiagLog;
 use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
@@ -384,11 +384,12 @@ impl HubRuntime {
     ///
     /// - 排他は `dirs` を渡して取る（`crate::profile_lock::try_acquire_profile_lock_in`。
     ///   `skip_profile_lock` なら取らない）。
-    /// - 設定 DB が profile の `config\banto-hub.sqlite3` なら、`dirs.config` で確かめた
-    ///   パス（`ManagedDir::reopen_path`。付随の `-wal`・`-shm`・`-journal` も）を sqlx に
-    ///   渡す。データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、
-    ///   書き込み受付の状態ファイルは `dirs.data` のハンドル基準で書く
-    ///   （`WriteControl::restore_in`）。
+    /// - 設定 DB が profile の `config\banto-hub.sqlite3` なら、`dirs.config` で本体・`-wal`・
+    ///   `-shm` を握ってから（`ManagedDir::pin_sqlite`。#623 PR2a）そのパスを sqlx に渡し、
+    ///   接続ごとに `SQLITE_FCNTL_PERSIST_WAL` を立てる。握りは停止で pool を閉じ終えるまで
+    ///   持つ（[`RunningHub::shutdown_and_report`]）。
+    /// - データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、書き込み
+    ///   受付の状態ファイルは `dirs.data` のハンドル基準で書く（`WriteControl::restore_in`）。
     /// - それ以外（`BANTO_DB`・`BANTO_HUB_DATA`・設定 DB の `data.dir` が profile の外）は
     ///   渡されたパスのまま使う（[`crate::profile_paths::is_outside_profile`]。ログの
     ///   1 行は 661-2 で出す）。sqlx・tstore・banto の監査の保留はパスしか取らないので、
@@ -445,32 +446,42 @@ impl HubRuntime {
             Some(guard)
         };
 
-        // #661 661-1: 握った組を渡されたときだけ、profile の中の設定 DB は確かめたパスで
-        // 開く（`start` の経路 = デスクトップ・コンソールは以前と同じパスのまま）。
-        let db_path = match &given_dirs {
-            Some(dirs) => profile_db_path(dirs, db_path)
-                .map_err(|err| HubStartError::ProfileLock(ProfileLockError::Dirs(err)))?,
-            None => db_path,
+        // #661 661-1・#623 PR2a: 握った組を渡されたときだけ、profile の中の設定 DB は本体・
+        // `-wal`・`-shm` を握ってから開く（`start` の経路 = デスクトップ・コンソールは以前と
+        // 同じパスのまま）。握りは最初の接続より前から、停止で pool を閉じ終えるまで持つ
+        // （`RunningHub::db_pins`）。
+        let (db_path, db_pins) = match &given_dirs {
+            Some(dirs) => match profile_db(dirs, db_path)
+                .map_err(|err| HubStartError::ProfileLock(ProfileLockError::Dirs(err)))?
+            {
+                ProfileDb::Path(path) => (path, None),
+                ProfileDb::Pinned(pinned) => {
+                    (pinned.path().to_string_lossy().into_owned(), Some(pinned))
+                }
+            },
+            None => (db_path, None),
         };
 
         // R2b-1d（docs/banto-hub-connection-settings-design.md §6.1）: 2-a〜2-c。レジストリは
         // `drivers` を `HubSessions` へ渡す前に写しておく（予行の preflight・入口の
         // `with_registry`・予約接続が使う）。
         let registry = drivers.registry.clone();
-        let pool = init_db_with_registry(&db_path, &registry)
-            .await
-            .map_err(|err| match err {
-                InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
-                InitDbError::Upgrade(crate::upgrade::UpgradeError::Preflight(refusal)) => {
-                    HubStartError::ConnectionSettingsPreflight {
-                        db_path: refusal.db_path,
-                        rows: refusal.rows,
-                        problems: refusal.problems,
-                    }
+        let pool = match &db_pins {
+            Some(pinned) => init_db_pinned(pinned, &registry).await,
+            None => init_db_with_registry(&db_path, &registry).await,
+        }
+        .map_err(|err| match err {
+            InitDbError::Legacy(legacy) => HubStartError::LegacyDatabase(legacy),
+            InitDbError::Upgrade(crate::upgrade::UpgradeError::Preflight(refusal)) => {
+                HubStartError::ConnectionSettingsPreflight {
+                    db_path: refusal.db_path,
+                    rows: refusal.rows,
+                    problems: refusal.problems,
                 }
-                InitDbError::Upgrade(err) => HubStartError::Upgrade(err),
-                InitDbError::Storage(err) => HubStartError::InitDb(err),
-            })?;
+            }
+            InitDbError::Upgrade(err) => HubStartError::Upgrade(err),
+            InitDbError::Storage(err) => HubStartError::InitDb(err),
+        })?;
 
         // R2b-1d（設計 §5.3 の最後の行、毎回の起動）: 秘密値の行と `settings` の参照の
         // 突き合わせ。参照があって行が無い接続はログに出す（読む側は `Unreadable {
@@ -1045,6 +1056,7 @@ impl HubRuntime {
             clock_sync_scheduler,
             _profile_lock: profile_lock,
             _profile_dirs: given_dirs,
+            db_pins,
         })
     }
 }
@@ -1208,6 +1220,12 @@ pub struct RunningHub {
     /// [`HubRuntime::start_with_profile_dirs`] に渡された握ったフォルダの組（#661 661-1。
     /// 排他を取ったときは `_profile_lock` も同じハンドルを持つ）。`start` では `None`。
     _profile_dirs: Option<ProfileDirs>,
+    /// profile の設定 DB の本体・`-wal`・`-shm` の握り（#623 PR2a。[`profile_db`]）。最初の
+    /// 接続より前から持ち、[`RunningHub::shutdown_and_report`] で pool を閉じ終えた後に離す。
+    /// 閉じ終えられなかった（[`DB_CLOSE_TIMEOUT`]）ときは離さず、プロセスの終わりまで持つ
+    /// （返らない接続が残っている。サービスは緩めずに終わる）。profile の外の DB・`start`
+    /// の経路では `None`。
+    db_pins: Option<banto_safe_root::sqlite::PinnedSqlite>,
 }
 
 /// [`RunningHub::shutdown_and_report`] の結果（#661 661-1）。
@@ -1387,35 +1405,51 @@ impl RunningHub {
                 DB_CLOSE_TIMEOUT.as_secs()
             ));
         }
+        // #623 PR2a: 閉じ終えたら握りを離す。閉じ終えられなければ離さない（返らない接続が
+        // 残っている間に名前を空けない。ハンドルはプロセスの終わりに閉じる）。
+        if let Some(pins) = self.db_pins.take() {
+            if db_closed {
+                drop(pins);
+            } else {
+                std::mem::forget(pins);
+            }
+        }
         HubShutdownReport { db_closed }
     }
 }
 
-/// 設定 DB のパス（#661 661-1、[`HubRuntime::start_with_profile_dirs`]）。profile の
-/// `config\banto-hub.sqlite3`（渡された綴りか本当のパス）なら、`dirs.config` で確かめた
-/// パスに直す（付随の `-wal`・`-shm`・`-journal` も確かめる）。それ以外（`BANTO_DB` が
-/// profile の外など）はそのまま返す。
-fn profile_db_path(dirs: &ProfileDirs, db_path: String) -> Result<String, ProfileDirsError> {
+/// 設定 DB の開き方（#623 PR2a、[`profile_db`]）。
+enum ProfileDb {
+    /// profile の外（`BANTO_DB` など）: 渡されたパスのまま開く。
+    Path(String),
+    /// profile の `config\banto-hub.sqlite3`: 本体・`-wal`・`-shm` を握った組で開く。
+    Pinned(banto_safe_root::sqlite::PinnedSqlite),
+}
+
+/// 設定 DB の開き方（#661 661-1・#623 PR2a、[`HubRuntime::start_with_profile_dirs`]）。
+/// profile の `config\banto-hub.sqlite3`（渡された綴りか本当のパス）なら、`dirs.config` で
+/// 本体・`-wal`・`-shm` を無ければ空で作って握る（`ManagedDir::pin_sqlite`。`-journal` は
+/// 握らず作らず、在るならリンク・reparse point・フォルダでないかを確かめる）。それ以外
+/// （`BANTO_DB` が profile の外など）はそのまま返す。
+///
+/// 運用モードの形に締めた組（サービス、`checked_access`）なら、`config` と各ファイルの
+/// 記述子がその形かも確かめる（`pin_sqlite_checked`。締めた後に外から変えられていたら開かない）。
+fn profile_db(dirs: &ProfileDirs, db_path: String) -> Result<ProfileDb, ProfileDirsError> {
     let path = Path::new(&db_path);
     let in_config = path == dirs.config.path().join(DB_FILE_NAME)
         || path == dirs.config.final_path().join(DB_FILE_NAME);
     if !in_config {
-        return Ok(db_path);
+        return Ok(ProfileDb::Path(db_path));
     }
-    const COMPANIONS: [&str; 3] = ["-wal", "-shm", "-journal"];
-    // #661 661-2: 運用モードの形に締めた組（サービス）なら、渡す直前に `config` の記述子が
-    // その形かを確かめる（締めた後に外から変えられていたら渡さない）。
-    let checked = match &dirs.checked_access {
-        Some(expected) => dirs
-            .config
-            .reopen_path_checked(DB_FILE_NAME, &COMPANIONS, expected),
-        None => dirs.config.reopen_path(DB_FILE_NAME, &COMPANIONS),
+    let pinned = match &dirs.checked_access {
+        Some(expected) => dirs.config.pin_sqlite_checked(DB_FILE_NAME, expected),
+        None => dirs.config.pin_sqlite(DB_FILE_NAME),
     }
     .map_err(|error| ProfileDirsError::Reopen {
         name: DB_FILE_NAME.to_string(),
         error,
     })?;
-    Ok(checked.into_path().to_string_lossy().into_owned())
+    Ok(ProfileDb::Pinned(pinned))
 }
 
 /// `path` が握ったフォルダ `dir` そのもの（渡された綴りか本当のパス）か（#661 661-1）。
@@ -1740,6 +1774,104 @@ mod tests {
         std::fs::remove_file(&db).expect("閉じた DB は消せる");
     }
 
+    /// #623 PR2a: 握った（Guarded）profile の設定 DB は、本体・`-wal`・`-shm` を握ったまま
+    /// 開く。稼働中は 3 つとも改名・削除できず、停止の `close` は数秒待たずに閉じ終える
+    /// （`SQLITE_FCNTL_PERSIST_WAL`）。閉じた後はチェックポイント済みの `-wal`・`-shm` が残り、それがあるまま
+    /// 起動し直しても行は残る。停止の後は握りを離している（消せる）。
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn guarded_profile_db_is_pinned_until_the_pool_is_closed() {
+        let dir = crate::test_support::TempDir::new("hub-runtime-pinned-db");
+        let paths = resolve_profile_paths(dir.path(), "pinned").expect("valid profile id");
+        std::fs::create_dir_all(dir.path().join("profiles")).unwrap();
+        let mut spec = crate::profile_lock::plain_profile_root_spec(&paths);
+        spec.mode = banto_safe_root::root::Mode::Guarded;
+        spec.owners = vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")];
+        let open = || crate::profile_lock::open_profile_dirs(&spec, None).expect("open dirs");
+        let config = |dirs: &ProfileDirs| HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dirs
+                .config
+                .path()
+                .join(DB_FILE_NAME)
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dirs.data.path().to_path_buf()),
+            profile_id: "pinned".to_string(),
+            host_kind: HubHostKind::Console,
+            skip_profile_lock: true,
+        };
+        let names = |dirs: &ProfileDirs| {
+            ["", "-wal", "-shm"].map(|suffix| {
+                dirs.config
+                    .final_path()
+                    .join(format!("{DB_FILE_NAME}{suffix}"))
+            })
+        };
+
+        let dirs = open();
+        let files = names(&dirs);
+        let hub = HubRuntime::start_with_profile_dirs(config(&dirs), dirs)
+            .await
+            .expect("start");
+        assert!(hub.db_pins.as_ref().expect("握っていない").is_held());
+        sqlx::query("CREATE TABLE pin_probe (v INTEGER)")
+            .execute(&hub.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO pin_probe VALUES (42)")
+            .execute(&hub.pool)
+            .await
+            .unwrap();
+        for file in &files {
+            assert!(file.is_file(), "{file:?} が無い");
+            let moved = file.with_extension("moved");
+            assert!(
+                std::fs::rename(file, &moved).is_err(),
+                "{file:?} を改名できた"
+            );
+            assert!(std::fs::remove_file(file).is_err(), "{file:?} を消せた");
+        }
+        let started = std::time::Instant::now();
+        let report = hub.shutdown_and_report().await;
+        let took = started.elapsed();
+        assert!(report.db_closed, "{report:?}");
+        assert!(
+            took < Duration::from_secs(2),
+            "停止に {took:?}（close が共有違反を待った？）"
+        );
+        assert!(
+            files[1].is_file() && files[2].is_file(),
+            "PERSIST_WAL なら -wal・-shm を消さない"
+        );
+        assert!(!dir
+            .path()
+            .join("profiles")
+            .join("pinned")
+            .join("config")
+            .join(format!("{DB_FILE_NAME}-journal"))
+            .exists());
+
+        // 残った `-wal`・`-shm` があるまま起動し直す。
+        let dirs = open();
+        let hub = HubRuntime::start_with_profile_dirs(config(&dirs), dirs)
+            .await
+            .expect("restart");
+        let v: i64 = sqlx::query_scalar("SELECT v FROM pin_probe")
+            .fetch_one(&hub.pool)
+            .await
+            .unwrap();
+        assert_eq!(v, 42);
+        assert!(hub.shutdown_and_report().await.db_closed);
+        // 握りを離したので消せる（profile のフォルダの握りも停止で離している）。
+        for file in &files {
+            std::fs::remove_file(file).unwrap_or_else(|e| panic!("{file:?} を消せない: {e}"));
+        }
+    }
+
     /// #945 の総点検: 終了のとき、書き手を止めて拒否の表の残りを、pool を閉じる前に
     /// 書き切る（閉じたあとでは書けずに失われる）。
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1845,7 +1977,7 @@ mod tests {
         hub.shutdown().await;
     }
 
-    /// #661 661-1: profile の `config\banto-hub.sqlite3` だけを確かめたパスに直し、外の
+    /// #661 661-1・#623 PR2a: profile の `config\banto-hub.sqlite3` だけを握った組にし、外の
     /// パス（`BANTO_DB`）はそのまま。`data\` も綴り・本当のパスのどちらでも中とみなす。
     #[test]
     fn profile_paths_are_rewritten_only_inside_the_profile() {
@@ -1853,20 +1985,24 @@ mod tests {
         let dirs = plain_profile_dirs(&dir);
 
         let inside = dirs.config.path().join(DB_FILE_NAME);
-        let rewritten =
-            profile_db_path(&dirs, inside.to_string_lossy().into_owned()).expect("inside");
-        assert_eq!(
-            PathBuf::from(&rewritten),
-            dirs.config.final_path().join(DB_FILE_NAME)
-        );
+        let ProfileDb::Pinned(pinned) =
+            profile_db(&dirs, inside.to_string_lossy().into_owned()).expect("inside")
+        else {
+            panic!("profile の中の DB を握らなかった");
+        };
+        assert_eq!(pinned.path(), dirs.config.final_path().join(DB_FILE_NAME));
+        assert!(!pinned.is_held(), "Plain は握らない");
 
         let outside = dir.path().join("elsewhere.sqlite3");
         let kept = outside.to_string_lossy().into_owned();
-        assert_eq!(profile_db_path(&dirs, kept.clone()).unwrap(), kept);
-        assert_eq!(
-            profile_db_path(&dirs, "./banto-hub.sqlite3".to_string()).unwrap(),
-            "./banto-hub.sqlite3"
-        );
+        assert!(matches!(
+            profile_db(&dirs, kept.clone()).unwrap(),
+            ProfileDb::Path(path) if path == kept
+        ));
+        assert!(matches!(
+            profile_db(&dirs, "./banto-hub.sqlite3".to_string()).unwrap(),
+            ProfileDb::Path(path) if path == "./banto-hub.sqlite3"
+        ));
 
         assert!(is_profile_dir(dirs.data.path(), &dirs.data));
         assert!(is_profile_dir(dirs.data.final_path(), &dirs.data));

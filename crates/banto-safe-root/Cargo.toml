@@ -6,8 +6,19 @@ edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+# #623 PR2a: SQLite の本体・`-wal`・`-shm` を握ったまま開く口（`sqlite` モジュール）。
+# 既定では入れない（既定の本番依存は `windows-sys`・`thiserror` だけのまま）。使う
+# アプリ（banto-hub-core）だけが有効にする。sqlx・libsqlite3-sys はどちらも
+# ワークスペースに既にある版で、Cargo.lock に新しい package は増えない。
+sqlite = ["dep:sqlx", "dep:libsqlite3-sys"]
+
 [dependencies]
 thiserror = { workspace = true }
+sqlx = { workspace = true, optional = true, features = ["runtime-tokio", "sqlite"] }
+# `sqlite3_file_control` と `SQLITE_FCNTL_PERSIST_WAL` を型付きで使う（sqlx-sqlite と同じ
+# 0.30 系。同梱の SQLite を入れる feature は sqlx-sqlite の側で決まる）。
+libsqlite3-sys = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # 既存の 0.61 系（banto-hub-core・banto-instance-lock と同じ版）。新しい crate は
@@ -66,3 +77,5 @@ windows-sys = { version = "0.61", features = [
 # windows-sys・thiserror だけ」の条件を崩さない）。どちらもワークスペースに既にある版。
 sqlx = { workspace = true, features = ["runtime-tokio", "sqlite"] }
 tokio = { workspace = true, features = ["rt"] }
+# テストの `persist_wal` も、本番の `sqlite` モジュールと同じ型付きの FFI を使う（#623 PR2a）。
+libsqlite3-sys = { workspace = true }
