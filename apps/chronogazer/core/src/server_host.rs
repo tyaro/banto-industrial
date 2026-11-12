@@ -534,12 +534,18 @@ pub fn lock_held(
 }
 
 /// Service entry with the same `SafeRoot` handle kept by `run-service`.
+///
+/// #623 PR2b: 設定 DB（`db_path`。`root` の直下）は、リストア予約の適用の後に `root` で
+/// 本体・`-wal`・`-shm` を握ってから開く（[`crate::engine::DbPin::InRoot`]）。`db_expected`
+/// はそのときに確かめる記述子の形（サービスの本番は運用モードの形。`None` は確かめずに
+/// 握る - テストの Plain・Guarded のルート用）。
 pub fn lock_held_with_root(
     layout: DataLayout,
     instance_lock: InstanceGuard,
     db_path: PathBuf,
     root: Arc<SafeRoot>,
     run_dir: Arc<ManagedDir>,
+    db_expected: Option<banto_safe_root::DirAccess>,
 ) -> LockedServer {
     let mut config = engine_config(
         root.final_path().to_path_buf(),
@@ -547,6 +553,9 @@ pub fn lock_held_with_root(
         ChronoGazerHost::Service,
     );
     config.service_data_root = Some(root);
+    config.db_pin = crate::engine::DbPin::InRoot {
+        expected: db_expected,
+    };
     let locked = EngineRuntime::lock_with(config, instance_lock);
     LockedServer {
         locked,
@@ -562,6 +571,7 @@ fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) ->
         drivers: EngineConfig::builtin_drivers(),
         data_base,
         service_data_root: None,
+        db_pin: crate::engine::DbPin::Off,
         db_path,
         // 本物は排他を取った後に `OpenedServer::start` が渡す（`with_key_store`）。
         key_store: Arc::new(FailedKeyStore::new(

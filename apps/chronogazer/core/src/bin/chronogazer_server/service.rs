@@ -42,8 +42,11 @@
 //! 11. セキュリティの変化の見張り（`SecurityWatch`）と定期の確かめ直し（`recheck`、60 秒）を
 //!     始める。どちらかが落ちたら、エンジンを止め・DB を閉じ・**締めたまま**終了コード 5。
 //! 12. 今の起動（`start::start_server`: DB → Hub のキー → エンジン）。DB のパスは
-//!     `reopen_path_checked`、`run\endpoint.json` は握った `run\` にハンドル基準、Hub のキーは
-//!     `FileSecretStore::open_in`。動き始めたら Running を報告し、完了の行（件数・所要時間）。
+//!     `reopen_path_checked` で確かめてからリストア予約の適用に渡し、適用の後・`init_db` の
+//!     前に本体・`-wal`・`-shm` を握ったルートで運用モードの形のまま握って（`pin_sqlite_checked`。
+//!     `-journal` は握らず、在ればリンクでないかを確かめる）その組で開き、pool を閉じ終えるまで
+//!     握る（#623 PR2b、`engine::DbPin::InRoot`）。`run\endpoint.json` は握った `run\` に
+//!     ハンドル基準、Hub のキーは `FileSecretStore::open_in`。動き始めたら Running を報告し、完了の行（件数・所要時間）。
 //! 13. 4〜12 の間は START_PENDING の checkpoint を進める（`report_start_progress`、1 秒ごと）。
 //!     この間 SCM は STOP を 1061／1052 で断る。
 //!
@@ -786,7 +789,10 @@ impl ServerProgram {
         }
         ctx.report_start_progress(START_WAIT_HINT);
 
-        // DB のパス（確かめてから渡す）と、A1 を引き継いだ `LockedServer`。
+        // DB のパス（確かめてから渡す）と、A1 を引き継いだ `LockedServer`。パスの確かめは
+        // リストア予約の適用（パスで DB を置き換える）の前の分。適用の後・`init_db` の前に、
+        // エンジンが握ったルートで本体・`-wal`・`-shm` を運用モードの形で握り直してから開き、
+        // pool を閉じ終えるまで握る（#623 PR2b、`DbPin::InRoot`）。
         let db = match root.as_dir().reopen_path_checked(
             DB_FILE_NAME,
             &["-wal", "-shm", "-journal"],
@@ -808,6 +814,7 @@ impl ServerProgram {
             db,
             root.clone(),
             run.clone(),
+            Some(mode.operation().clone()),
         );
         let key_store = open_key_store_in(hub_keys, mode.operation().clone());
         let held = Held {

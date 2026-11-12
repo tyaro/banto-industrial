@@ -355,7 +355,14 @@ mod tests {
             ChronoGazerHost::Service,
         )
         .expect("lock");
-        server_host::lock_held_with_root(layout.clone(), instance_lock, layout.db_path(), root, run)
+        server_host::lock_held_with_root(
+            layout.clone(),
+            instance_lock,
+            layout.db_path(),
+            root,
+            run,
+            None,
+        )
     }
 
     fn spec<'a>(layout: &'a DataLayout, access: &'a DirAccessSource) -> StartSpec<'a> {

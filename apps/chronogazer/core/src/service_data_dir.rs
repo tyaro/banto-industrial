@@ -453,6 +453,7 @@ mod tests {
             drivers: crate::test_support::drivers(),
             data_base: root.final_path().to_path_buf(),
             service_data_root: Some(root),
+            db_pin: crate::engine::DbPin::Off,
             key_store: Arc::new(UnavailableKeyStore),
             attach_hub: false,
             host: ChronoGazerHost::Service,
