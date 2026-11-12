@@ -1085,6 +1085,46 @@ fn pin_file_refuses_links_and_dirs_before_holding() {
     assert_eq!(std::fs::read(&victim).unwrap(), VICTIM);
 }
 
+/// 印のファイルの 8.3 短縮名（文字列比較をすり抜ける）でも `pin_file`・`pin_file_checked` は
+/// 断り、握らない（ファイル ID の確かめ。#623 レビュー P2）。短縮名が作られないボリュームは skip。
+#[test]
+fn pin_file_refuses_the_marker_by_its_short_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, access) = modify_root(dir.path());
+    let d = root.as_dir();
+    // 印は所有者 Administrators の記述子で置くので、置けるのは管理者だけ（CI）。
+    if !crate::acl::tests::windows::is_elevated_admin() {
+        eprintln!("skip: 印を置けるのは管理者だけ - CI で確かめる");
+        return;
+    }
+    d.pinned().unwrap().ensure_marker().expect("印を置く");
+    let marker = d.final_path().join(crate::mode::MARKER_NAME);
+    assert!(marker.exists(), "印のファイルが無い");
+    let Some(short) = crate::root::tests::short_path(&marker) else {
+        eprintln!("skip: 8.3 の短縮名が作られないボリューム");
+        return;
+    };
+    let short_name = short.file_name().unwrap().to_str().unwrap().to_owned();
+    assert!(
+        !short_name.eq_ignore_ascii_case(crate::mode::MARKER_NAME),
+        "{short_name}"
+    );
+    for create in [true, false] {
+        assert!(
+            d.pin_file(&short_name, create).is_err(),
+            "pin_file {short_name}"
+        );
+        assert!(
+            d.pin_file_checked(&short_name, create, &access).is_err(),
+            "pin_file_checked {short_name}"
+        );
+    }
+    // 握っていない: 印を改名・削除できる（握っていれば共有違反）。
+    let moved = d.final_path().join("moved-marker");
+    std::fs::rename(&marker, &moved).unwrap();
+    std::fs::rename(&moved, &marker).unwrap();
+}
+
 /// 握る時点で、既に `DELETE` の権利で開いている他者のハンドルがあれば、共有違反で失敗する
 /// （その間を塞げないので握らない）。
 #[test]
