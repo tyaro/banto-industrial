@@ -282,7 +282,7 @@ tokio-stream = "0.1"
 # rustc 1.95 を要求していたが、2026-09-06 にワークスペースのツールチェイン
 # を 1.98.1 へ引き上げたためこの制約は解消し、同日 dependabot PR #283 で
 # 0.39 系へ移行した。
-sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 
 # #ci-speed（2026-10-19）: 暗号まわりの第三者 crate だけ、開発・テストのビルド（dev / test
 # プロファイル）でも最適化する。最適化なし（opt-level 0）だと、パスワードのハッシュ
