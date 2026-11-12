@@ -395,8 +395,8 @@ impl ReopenPath {
 /// ただし相手もこの名前を消せない。【実測】WAL の最後の接続が閉じるとき SQLite は `-wal`・
 /// `-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は `close` の結果に
 /// 出ず、`close` 1 回に約 3 秒かかる。チェックポイントは済んでいて行は失われない）。接続ごとに
-/// `SQLITE_FCNTL_PERSIST_WAL` を立てれば消しに行かない（`-wal` はチェックポイント済みのまま切り詰めない。
-/// `journal_size_limit` を立てていないため）。`journal_mode=DELETE` の `-journal` のように、相手が毎回消す名前は握らない。
+/// `SQLITE_FCNTL_PERSIST_WAL` を立てれば消しに行かない（`-wal` は `journal_size_limit` で閉じるとき 0 バイトに
+/// 切り詰められる）。`journal_mode=DELETE` の `-journal` のように、相手が毎回消す名前は握らない。
 /// drop で閉じ、以後は普通に変更・削除できる。
 ///
 /// [`Mode::Plain`] は何も握らない（[`PinnedName::is_held`] が偽。パスを返すだけ）。

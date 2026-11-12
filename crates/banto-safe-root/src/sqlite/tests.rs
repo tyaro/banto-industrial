@@ -172,6 +172,55 @@ mod windows {
         });
     }
 
+    /// `journal_size_limit` が接続ごとに効き、大きな書き込みの後に閉じると `-wal` が切り詰められる。
+    /// 反証: `connect_options` から pragma を外すと、`PRAGMA journal_size_limit` の値の確かめで
+    /// 落ちる（外すと閉じた後も `-wal` が切り詰められずに残る。以前の実測で約 420KB）。
+    #[test]
+    fn a_big_write_leaves_no_big_wal_after_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+        let pinned = root.as_dir().pin_sqlite("t.sqlite3").unwrap();
+        block_on(async {
+            let pool = pinned.connect().await.unwrap();
+            let limit: i64 = sqlx::query("PRAGMA journal_size_limit")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(limit, JOURNAL_SIZE_LIMIT);
+            sqlx::query("CREATE TABLE b (v BLOB)")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let mut tx = pool.begin().await.unwrap();
+            for _ in 0..3000 {
+                sqlx::query("INSERT INTO b VALUES (?)")
+                    .bind(vec![7u8; 4096])
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+            let before = std::fs::metadata(pinned.wal_path()).unwrap().len();
+            eprintln!("wal before close: {before}");
+            assert!(before > 4 * 1024 * 1024, "-wal が膨らんでいない: {before}");
+            pool.close().await;
+        });
+        let after = std::fs::metadata(pinned.wal_path()).unwrap().len();
+        eprintln!("wal after close: {after}");
+        assert_eq!(after, 0, "閉じた後の -wal が切り詰められていない");
+        block_on(async {
+            let pool = pinned.connect().await.unwrap();
+            let n: i64 = sqlx::query("SELECT count(*) FROM b")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(n, 3000);
+            pool.close().await;
+        });
+    }
+
     /// 開いている（書き込み共有の）ファイルを読んで写す（`CopyFileW` は共有の都合で開けない
     /// ことがある）。
     fn copy_open(from: &std::path::Path, to: &std::path::Path) {

@@ -18,8 +18,8 @@
 //! `SQLITE_FCNTL_PERSIST_WAL` を立てる（[`set_persist_wal`]。[`PinnedSqlite::pool_options`] の
 //! `after_connect`）。立てられなければ（`SQLITE_OK` でない）その接続を失敗にする（黙って
 //! 3 秒待つ形へ戻さない）。消しに行かないので、閉じた後もチェックポイント済みの `-wal`
-//! （大きさは切り詰めない。`journal_size_limit` を立てていないため。【実測】行を書いて閉じた後で約 420KB）と
-//! `-shm` が残る。次に開くときは SQLite がそのまま使う。
+//! （`journal_size_limit` が 0 以上なので、閉じるとき SQLite が 0 バイトまで切り詰める。
+//! [`JOURNAL_SIZE_LIMIT`]）と `-shm` が残る。次に開くときは SQLite がそのまま使う。
 //!
 //! # `-journal`
 //!
@@ -55,6 +55,13 @@ use sqlx::{ConnectOptions, Connection};
 use crate::acl::DirAccess;
 use crate::error::Result;
 use crate::root::{ManagedDir, PinnedName};
+
+/// `-wal` の大きさの上限（バイト、64 MiB）。SQLite は `journal_size_limit` が 0 以上なら、
+/// PERSIST_WAL で閉じるとき `-wal` を 0 バイトまで切り詰め（`sqlite3WalClose` の
+/// `walLimitSize(pWal, 0)`）、稼働中はチェックポイントで WAL を先頭から使い直すときにこの上限まで
+/// 切り詰める。立てないと PERSIST_WAL の `-wal` は切り詰められず、大きな書き込みの後の大きさのまま
+/// 残る。Plain でも同じ（Plain は閉じると SQLite が `-wal` を消す）。
+pub const JOURNAL_SIZE_LIMIT: i64 = 64 * 1024 * 1024;
 
 /// WAL のファイルの接尾辞。
 pub const WAL_SUFFIX: &str = "-wal";
@@ -128,13 +135,15 @@ impl PinnedSqlite {
         self.db.is_held() && self.wal.is_held() && self.shm.is_held()
     }
 
-    /// 開き方（banto-storage の `connect` と同じ: `create_if_missing`・WAL・外部キー）。
+    /// 開き方（banto-storage の `connect` と同じ: `create_if_missing`・WAL・外部キー。
+    /// それに `journal_size_limit` = [`JOURNAL_SIZE_LIMIT`]。sqlx の `pragma` は接続を開くたびに流す）。
     pub fn connect_options(&self) -> SqliteConnectOptions {
         SqliteConnectOptions::new()
             .filename(self.path())
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
+            .pragma("journal_size_limit", JOURNAL_SIZE_LIMIT.to_string())
     }
 
     /// pool の設定（既定の [`SqlitePoolOptions`]）。握っているときは `after_connect` で接続ごとに
