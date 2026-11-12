@@ -2409,11 +2409,13 @@ mod tests {
         };
         // A の DB 書き込みは握ったまま: B は C が来た時点で待つのをやめ
         // (A の完了を待たない)、C はその場で保存して返る。
-        let resumed = tokio::time::timeout(Duration::from_secs(5), resume)
+        // 上限は A を待たないことの検証で、A は最後まで解放しないので 30 秒に緩めても
+        // 意味は保たれる。5 秒では遅い Windows runner の状態ファイルの fsync で落ちた（#1062）。
+        let resumed = tokio::time::timeout(Duration::from_secs(30), resume)
             .await
             .expect("the interrupted resume returns without waiting for stop A")
             .unwrap();
-        let stopped = tokio::time::timeout(Duration::from_secs(5), stop)
+        let stopped = tokio::time::timeout(Duration::from_secs(30), stop)
             .await
             .expect("stop C returns without waiting for stop A")
             .unwrap();
