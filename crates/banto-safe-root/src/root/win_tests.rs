@@ -1379,3 +1379,259 @@ fn pin_file_and_a_held_dir_turned_into_a_junction() {
     );
     assert_eq!(snapshot(outside.path()), before, "外が変わった");
 }
+
+// --- #623 Codex P2: 握ったファイルのその場の reparse 化と、記述子の確かめ -----------------
+
+/// `file` をその場で `target` へのシンボリックリンク（`IO_REPARSE_TAG_SYMLINK`、絶対パス）に
+/// する（`FSCTL_SET_REPARSE_POINT`）。書き込みの権利で、握っている相手の共有（読み書き）に
+/// 合わせて開く。シンボリックリンクの特権が無ければ `ERROR_PRIVILEGE_NOT_HELD` で失敗する。
+fn set_symlink_reparse(file: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Ioctl::FSCTL_SET_REPARSE_POINT;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    let sub: Vec<u16> = std::ffi::OsStr::new(r"\??\")
+        .encode_wide()
+        .chain(target.as_os_str().encode_wide())
+        .collect();
+    let print: Vec<u16> = target.as_os_str().encode_wide().collect();
+    let sub_bytes = (sub.len() * 2) as u16;
+    let print_bytes = (print.len() * 2) as u16;
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(&TAG_SYMLINK.to_le_bytes()); // ReparseTag
+    let data_len = 12 + sub_bytes as usize + print_bytes as usize;
+    buf.extend_from_slice(&(data_len as u16).to_le_bytes()); // ReparseDataLength
+    buf.extend_from_slice(&0u16.to_le_bytes()); // Reserved
+    buf.extend_from_slice(&0u16.to_le_bytes()); // SubstituteNameOffset
+    buf.extend_from_slice(&sub_bytes.to_le_bytes()); // SubstituteNameLength
+    buf.extend_from_slice(&sub_bytes.to_le_bytes()); // PrintNameOffset
+    buf.extend_from_slice(&print_bytes.to_le_bytes()); // PrintNameLength
+    buf.extend_from_slice(&0u32.to_le_bytes()); // Flags（0 = 絶対パス）
+    for w in sub.iter().chain(&print) {
+        buf.extend_from_slice(&w.to_le_bytes());
+    }
+
+    let path: Vec<u16> = file
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `path` は NUL 終端。
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut returned = 0u32;
+    // SAFETY: `handle` は有効、`buf` は reparse データ。
+    let ok = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_SET_REPARSE_POINT,
+            buf.as_ptr().cast(),
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut returned,
+            std::ptr::null_mut(),
+        )
+    };
+    let err = std::io::Error::last_os_error();
+    // SAFETY: `handle` は CreateFileW が返したもの。
+    unsafe {
+        CloseHandle(handle);
+    }
+    if ok == 0 {
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// 反証（`pin_file` の契約の外を固定する）: 確かめない `pin_file` で握った空のファイルでも、
+/// そのファイルへの書き込み権を持つ者は、別のハンドルから `FSCTL_SET_REPARSE_POINT` で
+/// その場でシンボリックリンクに変えられ、パスで開く相手はそれを辿って外を読む。名前を握る
+/// だけでは防げない（防ぐのは記述子 = `pin_file_checked`）。
+#[test]
+fn an_unchecked_pinned_empty_file_can_be_turned_into_a_symlink_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_outside, victim) = outside_with_victim();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let pin = root
+        .as_dir()
+        .pin_file("db.sqlite3", true)
+        .unwrap()
+        .expect("作った");
+    if let Err(e) = set_symlink_reparse(pin.path(), &victim) {
+        if std::env::var_os("CI").is_some() {
+            panic!("CI で FSCTL_SET_REPARSE_POINT（シンボリックリンク）が失敗した: {e}");
+        }
+        eprintln!(
+            "skip: シンボリックリンクの reparse を付けられない（特権?）: {e} - CI で確かめる"
+        );
+        return;
+    }
+    assert!(pin.is_held(), "握ったまま");
+    let attrs = std::fs::symlink_metadata(pin.path()).unwrap();
+    assert!(
+        attrs.file_type().is_symlink(),
+        "握った名前がその場でリンクになった"
+    );
+    assert_eq!(
+        std::fs::read(pin.path()).unwrap(),
+        VICTIM,
+        "パスで開く相手は外を辿る"
+    );
+}
+
+/// 期待の記述子（`with_install_user(me())` = 「変更」）でルートを作る（非昇格で走る）。
+fn modify_root(dir: &Path) -> (SafeRoot, DirAccess) {
+    let access = DirAccess::with_install_user(me());
+    let root = open_root(&RootSpec {
+        create_access: Some(access.clone()),
+        ..guarded(dir.join("root"))
+    })
+    .unwrap();
+    (root, access)
+}
+
+/// `pin_file_checked`: 期待の形のフォルダに作ったばかりのファイル（継承のまま = 形 (1)）と、
+/// 保護された flags 0 の形（形 (2)、`reset_acl` の書く形）は通る。無いのは `None`。
+#[test]
+fn pin_file_checked_accepts_inherited_and_protected_file_shapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, access) = modify_root(dir.path());
+    let d = root.as_dir();
+
+    assert!(d
+        .pin_file_checked("absent", false, &access)
+        .unwrap()
+        .is_none());
+    let pin = d
+        .pin_file_checked("db.sqlite3", true, &access)
+        .unwrap()
+        .expect("作った");
+    assert!(pin.is_held());
+    assert_eq!(pin.path(), d.final_path().join("db.sqlite3"));
+    let inherited = crate::acl::inspect_file(pin.path()).unwrap().unwrap();
+    assert!(!inherited.dacl.protected, "形 (1): {inherited:?}");
+    drop(pin);
+    // 既にあるもの（create 偽）も通る。
+    assert!(d
+        .pin_file_checked("db.sqlite3", false, &access)
+        .unwrap()
+        .is_some());
+
+    let me = me();
+    crate::acl::tests::windows::set_dacl_sddl(
+        &d.final_path().join("db.sqlite3"),
+        &format!("D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{})", me.as_str()),
+    );
+    let pin = d
+        .pin_file_checked("db.sqlite3", false, &access)
+        .unwrap()
+        .expect("形 (2) は通る");
+    assert!(pin.is_held());
+}
+
+/// `pin_file_checked`: ファイルに一般の主体（Users）への書き込みの ACE を足すと、保護された
+/// 形でも継承の形に足しても断る（握らない = 後で改名できる）。
+#[test]
+fn pin_file_checked_refuses_a_file_writable_by_others() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, access) = modify_root(dir.path());
+    let d = root.as_dir();
+    drop(d.pin_file_checked("db.sqlite3", true, &access).unwrap());
+    let path = d.final_path().join("db.sqlite3");
+    let me = me();
+
+    for sddl in [
+        // 形 (2) に Users の書き込みを足す。
+        format!(
+            "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1301bf;;;{me})(A;;FW;;;BU)",
+            me = me.as_str()
+        ),
+        // 継承のまま（形 (1)）に明示の Users の書き込みを足す（混在）。
+        format!(
+            "D:AI(A;;FW;;;BU)(A;ID;FA;;;SY)(A;ID;FA;;;BA)(A;ID;0x1301bf;;;{me})",
+            me = me.as_str()
+        ),
+    ] {
+        crate::acl::tests::windows::set_dacl_sddl(&path, &sddl);
+        let err = d
+            .pin_file_checked("db.sqlite3", false, &access)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SafeRootError::AclMismatch(crate::AclMismatch::UnexpectedAce { ref sid, .. })
+                    if sid == "S-1-5-32-545"
+            ),
+            "{sddl}: {err:?}"
+        );
+        // 断ったら握っていない（改名できる）。
+        let moved = d.final_path().join("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::rename(&moved, &path).unwrap();
+    }
+}
+
+/// `pin_file_checked`: フォルダの記述子が `expected` と違えば、開く前に断る（作らない）。
+#[test]
+fn pin_file_checked_refuses_when_the_dir_does_not_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, _access) = modify_root(dir.path());
+    let d = root.as_dir();
+    let readers = DirAccess::with_readers([me()]);
+    let err = d
+        .pin_file_checked("db.sqlite3", true, &readers)
+        .unwrap_err();
+    assert!(matches!(err, SafeRootError::AclMismatch(_)), "{err:?}");
+    assert!(!d.final_path().join("db.sqlite3").exists(), "作った");
+}
+
+/// `pin_file_checked`（運用モードの形。管理者だけ）: 利用者を「読み取り」にして所有者を
+/// 移した（`reset_acl`）後、既にあるファイル（形 (2)）も、新しく作るファイル（形 (1)）も通り、
+/// 「変更」の期待では断る。
+#[test]
+fn pin_file_checked_in_the_operating_shape() {
+    if !crate::acl::tests::windows::is_elevated_admin() {
+        eprintln!("skip: 所有者を移すのは管理者だけ - CI で確かめる");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let (root, access) = modify_root(dir.path());
+    let d = root.as_dir();
+    drop(d.pin_file_checked("db.sqlite3", true, &access).unwrap());
+    let readers = DirAccess::with_readers([me()]);
+    root.pinned()
+        .unwrap()
+        .reset_acl(&readers, crate::acl::Recurse::Tree)
+        .unwrap();
+
+    assert!(d
+        .pin_file_checked("db.sqlite3", false, &readers)
+        .unwrap()
+        .is_some());
+    assert!(d
+        .pin_file_checked("db.sqlite3-wal", true, &readers)
+        .unwrap()
+        .is_some());
+    assert!(matches!(
+        d.pin_file_checked("db.sqlite3", false, &access),
+        Err(SafeRootError::AclMismatch(_))
+    ));
+}

@@ -42,6 +42,13 @@
 //! - **同じファイルへの別名**: 握った後に、別の場所に同じファイルへのハードリンクを足すことは
 //!   止めない（ファイルへの書き込み権が要る。1903 以降の mitigation）。足した別名は握って
 //!   いないので改名・削除できる（【実測】）が、握った名前は変わらず、外へは書かない。
+//! - **握ったファイルのその場の reparse 化**: 握るハンドルの共有は読み書きを許す（SQLite が
+//!   書く）ので、そのファイルへの書き込み権（とシンボリックリンクの特権）を持つ他者は、握った
+//!   空のファイルを `FSCTL_SET_REPARSE_POINT` でその場でシンボリックリンクなどに変えられ、
+//!   相手が後でパスで開くとそれを辿りうる。名前を握っても防げない（Codex P2）。防ぐのは
+//!   ファイルの記述子で、運用モードの呼び出し側は [`ManagedDir::pin_file_checked`] を使う。
+//!   運用モードに締める前から書き込みの権利で開いていた他者の古いハンドルは記述子では防げない
+//!   （PR-3 の既知の制限と同じ残留リスク）。
 //! - **SQLite が自分で消す名前**: 握った名前は SQLite も消せない。WAL の最後の接続が閉じるとき
 //!   `-wal`・`-shm` を消しに行き、共有違反を数回待ってやり直してから諦める（失敗は無視され、
 //!   `close` 1 回に約 3 秒。`SQLITE_FCNTL_PERSIST_WAL` で消しに行かなくなる。`win_tests` の
@@ -323,8 +330,8 @@ pub struct RemoveReport {
 }
 
 /// パスで開き直す相手（SQLite・tstore・banto の BackupService）に渡すパス（設計 §4.4）。
-/// 確かめてから相手が開くまでの間を塞ぎたい名前は、[`ManagedDir::pin_file`]（[`PinnedName`]）で
-/// 握ってから渡す。
+/// 確かめてから相手が開くまでの間を塞ぎたい名前は、[`ManagedDir::pin_file_checked`]
+/// （[`PinnedName`]）で握ってから渡す。
 ///
 /// **残留リスク**: `ReopenPath` は「確かめた時点で、このフォルダ自身が reparse point でなく
 /// （握ったハンドルで読み直した属性）、このフォルダの中のこの名前と付随の名前がリンク（reparse
@@ -359,7 +366,8 @@ impl ReopenPath {
 }
 
 /// 名前 1 要素のファイルを**握ったまま**、パスで開き直す相手（SQLite の本体・`-wal`・`-shm`、
-/// `VACUUM INTO` の宛先）に渡すためのガード（[`ManagedDir::pin_file`]、#623）。
+/// `VACUUM INTO` の宛先）に渡すためのガード（[`ManagedDir::pin_file_checked`]・
+/// [`ManagedDir::pin_file`]、#623）。
 ///
 /// **契約（[`Mode::Guarded`]）**: このガードが生きている間、[`PinnedName::path`] の名前は他者から
 /// 変更・削除・置換（別のファイル・ハードリンク・シンボリックリンク・ジャンクションへのすり替え）
@@ -367,6 +375,16 @@ impl ReopenPath {
 /// こと（名前の変更・削除・置き換えの前提）が共有違反で失敗する。握った時点で、それが
 /// reparse point でもフォルダでもなく、リンク数 1 だったことを**開いた後のハンドルで**確かめて
 /// いる。相手が同じパスで開き直すとき、得るのは握っている同じファイル。
+///
+/// **契約の外（Codex P2）**: 名前を握っても、**ファイルそのもの**をその場で reparse point に
+/// 変えること（そのファイルへの書き込み権で開いた別のハンドルからの `FSCTL_SET_REPARSE_POINT`）
+/// は止めない。握るハンドルの共有は書き込みを許すので（SQLite が書く）、握ったのが空のファイル
+/// なら、書き込み権とシンボリックリンクの特権を持つ他者はそれをシンボリックリンクに変えられ、
+/// 相手が後でパスで開くとそれを辿りうる。防ぐのはファイルの記述子で、
+/// [`ManagedDir::pin_file_checked`] が握った後にハンドルで確かめる（他者に書き込み権が無い形
+/// だけを通す）。[`ManagedDir::pin_file`]（確かめない版）で握った名前はこれを守らない。運用
+/// モードに締める前から書き込みの権利で開いていた他者の古いハンドルは記述子では防げない
+/// （PR-3 の既知の制限と同じ残留リスク）。
 ///
 /// **相手への影響**: 共有は読み書きを許すので、読み書き共有で開く相手（SQLite）は開ける。
 /// ただし相手もこの名前を消せない。【実測】WAL の最後の接続が閉じるとき SQLite は `-wal`・
@@ -636,6 +654,10 @@ impl ManagedDir {
     /// Plain は確かめず、握らない（`create` なら `std::fs` で無ければ作り、偽なら有無だけ見る。
     /// リンクを辿る）。印のファイル（[`crate::mode::MARKER_NAME`]）は綴りの大文字小文字を
     /// 問わず断る。
+    ///
+    /// **ファイルの記述子は確かめない**: そのファイルへの書き込み権を持つ他者は、握った空の
+    /// ファイルをその場で reparse point に変えられる（[`PinnedName`] の「契約の外」）。運用モードの
+    /// 呼び出し側は [`ManagedDir::pin_file_checked`] を使う。
     pub fn pin_file(&self, name: &str, create: bool) -> Result<Option<PinnedName>> {
         if !guard::is_plain_child_name(name) || name.eq_ignore_ascii_case(crate::mode::MARKER_NAME)
         {
@@ -671,6 +693,56 @@ impl ManagedDir {
         companions: &[&str],
         expected: &DirAccess,
     ) -> Result<ReopenPath> {
+        self.recheck_as_error(expected)?;
+        self.reopen_path(name, companions)
+    }
+
+    /// [`ManagedDir::pin_file`] に、**記述子の確かめ**を足したもの（#623、Codex P2。運用モードの
+    /// サービスはこちらを使う）。握った名前でも、そのファイルへの書き込み権（とシンボリック
+    /// リンクの特権）を持つ他者は、握った空のファイルを `FSCTL_SET_REPARSE_POINT` で**その場で**
+    /// reparse point に変えられる（共有に `FILE_SHARE_WRITE` を含むため。SQLite が書くので外せ
+    /// ない）。それを防ぐのは記述子なので、ここで確かめる。
+    ///
+    /// Guarded は (1) [`ManagedDir::recheck`]（このフォルダの reparse 属性と、記述子が `expected`
+    /// = 運用モードの形か。[`ManagedDir::reopen_path_checked`] と同じ失敗の返し方）、(2)
+    /// [`ManagedDir::pin_file`] と同じく開いて握り、(3) **握ったハンドルで**ファイルの記述子
+    /// （DACL と所有者）を読み、[`crate::acl::check_file_dacl`] で `expected` の形（作った直後の
+    /// 継承のままか、締めた後の保護された形）か確かめ、合わなければ閉じて
+    /// [`SafeRootError::AclMismatch`]。`create` で作ったばかりのファイルは (1) を通ったフォルダから
+    /// 継承するので通る。Plain は確かめずに [`ManagedDir::pin_file`] と同じ。
+    ///
+    /// **残留リスク**: 運用モードに締める前から書き込みの権利でそのファイルを開いていた他者の
+    /// 古いハンドルは、記述子を締めても閉じられないので防げない（PR-3 の既知の制限と同じ）。
+    pub fn pin_file_checked(
+        &self,
+        name: &str,
+        create: bool,
+        expected: &DirAccess,
+    ) -> Result<Option<PinnedName>> {
+        if !guard::is_plain_child_name(name) || name.eq_ignore_ascii_case(crate::mode::MARKER_NAME)
+        {
+            return Err(invalid_name());
+        }
+        self.recheck_as_error(expected)?;
+        match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => {
+                Ok(
+                    win::pin_file_checked(pinned, &self.display, name, create, expected)?.map(
+                        |file| PinnedName {
+                            path: self.final_path.join(name),
+                            held: Some(file),
+                        },
+                    ),
+                )
+            }
+            Inner::Plain => self.pin_file(name, create),
+        }
+    }
+
+    /// [`ManagedDir::recheck`] の失敗を [`SafeRootError`] にする（reparse・フォルダでないは
+    /// [`SafeRootError::Refused`]、形は [`SafeRootError::AclMismatch`]）。
+    fn recheck_as_error(&self, expected: &DirAccess) -> Result<()> {
         self.recheck(expected).map_err(|failure| match failure {
             crate::mode::RecheckFailure::ReparsePoint { tag } => SafeRootError::Refused {
                 path: self.display.clone(),
@@ -682,8 +754,7 @@ impl ManagedDir {
             },
             crate::mode::RecheckFailure::Acl(mismatch) => SafeRootError::AclMismatch(mismatch),
             crate::mode::RecheckFailure::Io(error) => error,
-        })?;
-        self.reopen_path(name, companions)
+        })
     }
 
     /// 握ったフォルダの reparse 属性と記述子をハンドルで読み直し、`expected`（運用モードの形）に

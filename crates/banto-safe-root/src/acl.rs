@@ -490,6 +490,78 @@ pub fn check_dacl(
     Ok(())
 }
 
+/// 読み戻した**ファイル**の記述子が `access` の期待どおりか（#623 の
+/// `ManagedDir::pin_file_checked`、Codex P2）。純関数。
+///
+/// 正しいファイルの形は 2 つだけ:
+///
+/// 1. **作った直後**: [`check_dacl`] の形のフォルダから継承したまま = 保護なし・全 ACE の flags が
+///    `INHERITED_ACE_FLAG`（0x10）ちょうど（ファイルには OI/CI が付かない）。
+/// 2. **締めた後**: `PinnedDir::reset_acl` がファイルに書く形 = 保護あり・全 ACE の flags が 0。
+///
+/// どちらかなら flags を OICI に・保護をありに読み替えて [`check_dacl`] に通す（SID と mask の
+/// 完全一致・所有者の規則はフォルダと同じ）。それ以外の flags（`INHERIT_ONLY` など）・2 つの形の
+/// 混在・保護の有無と flags の食い違い・許可以外の ACE は断る（fail closed）。
+pub fn check_file_dacl(
+    observed: &ObservedDacl,
+    access: &DirAccess,
+) -> std::result::Result<(), AclMismatch> {
+    let Some(aces) = &observed.aces else {
+        return Err(AclMismatch::NoDacl);
+    };
+    let wanted = if observed.protected {
+        0
+    } else {
+        INHERITED_ACE_FLAG
+    };
+    for ace in aces {
+        if ace.flags == wanted && ace.ace_type == ACCESS_ALLOWED_ACE_TYPE {
+            continue;
+        }
+        return Err(
+            if observed.protected && ace.flags & INHERITED_ACE_FLAG != 0 {
+                AclMismatch::InheritedAce {
+                    sid: ace.sid.clone(),
+                }
+            } else {
+                AclMismatch::UnexpectedAce {
+                    ace_type: ace.ace_type,
+                    flags: ace.flags,
+                    mask: ace.mask,
+                    sid: ace.sid.clone(),
+                }
+            },
+        );
+    }
+    let as_dir = ObservedDacl {
+        protected: true,
+        owner: observed.owner.clone(),
+        aces: Some(
+            aces.iter()
+                .map(|ace| ObservedAce {
+                    flags: INHERIT_FLAGS,
+                    ..ace.clone()
+                })
+                .collect(),
+        ),
+    };
+    // 読み替えた flags ではなく、読んだ flags（全 ACE で `wanted`）を理由に出す。
+    check_dacl(&as_dir, access).map_err(|mismatch| match mismatch {
+        AclMismatch::UnexpectedAce {
+            ace_type,
+            mask,
+            sid,
+            ..
+        } => AclMismatch::UnexpectedAce {
+            ace_type,
+            flags: wanted,
+            mask,
+            sid,
+        },
+        other => other,
+    })
+}
+
 /// 無ければ期待の DACL で作り、あれば確かめる（モジュール doc「作るとき・
 /// 既にあるとき」）。親ディレクトリは無ければ普通に作る（親の ACL は B3-3 の
 /// 担当で、ここでは触らない）。
@@ -3724,6 +3796,150 @@ pub(crate) mod tests {
         assert_eq!(check_dacl(&service, &DirAccess::service_only()), Ok(()));
     }
 
+    /// `good` の ACE の flags を `flags` に、保護を `protected` にしたファイルの記述子。
+    fn file_dacl(owner: &str, protected: bool, flags: u8) -> ObservedDacl {
+        let mut dacl = good(owner);
+        dacl.protected = protected;
+        for ace in dacl.aces.as_mut().unwrap() {
+            ace.flags = flags;
+        }
+        dacl
+    }
+
+    /// `check_file_dacl`: 作った直後（保護なし・全 ACE が継承 0x10）と締めた後（保護あり・
+    /// flags 0）の 2 つの形だけを通し、SID・mask・所有者はフォルダと同じ規則。
+    #[test]
+    fn check_file_accepts_only_the_two_file_shapes() {
+        let access = DirAccess::with_install_user(user());
+        for owner in [SYSTEM_SID, ADMINISTRATORS_SID, USER] {
+            assert_eq!(
+                check_file_dacl(&file_dacl(owner, false, INHERITED_ACE_FLAG), &access),
+                Ok(())
+            );
+            assert_eq!(check_file_dacl(&file_dacl(owner, true, 0), &access), Ok(()));
+        }
+        // 運用モード（「読み取り」の利用者）: 利用者は所有者になれない。
+        let readers = DirAccess::with_readers([user()]);
+        let mut read = file_dacl(SYSTEM_SID, true, 0);
+        read.aces.as_mut().unwrap()[2].mask = READ_EXECUTE_ACCESS_MASK;
+        assert_eq!(check_file_dacl(&read, &readers), Ok(()));
+        read.owner = USER.to_owned();
+        assert_eq!(
+            check_file_dacl(&read, &readers),
+            Err(AclMismatch::DisallowedOwner {
+                sid: USER.to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn check_file_rejects_every_deviation() {
+        let access = DirAccess::with_install_user(user());
+        let unexpected = |flags: u8, mask: u32, sid: &str| AclMismatch::UnexpectedAce {
+            ace_type: ACCESS_ALLOWED_ACE_TYPE,
+            flags,
+            mask,
+            sid: sid.to_owned(),
+        };
+        // null DACL。
+        let mut none = file_dacl(USER, true, 0);
+        none.aces = None;
+        assert_eq!(check_file_dacl(&none, &access), Err(AclMismatch::NoDacl));
+        // フォルダの形（OICI）はファイルの形ではない。
+        assert_eq!(
+            check_file_dacl(&file_dacl(USER, true, INHERIT_FLAGS), &access),
+            Err(unexpected(INHERIT_FLAGS, FULL_ACCESS_MASK, SYSTEM_SID))
+        );
+        // 保護ありで継承の ACE。
+        assert_eq!(
+            check_file_dacl(&file_dacl(USER, true, INHERITED_ACE_FLAG), &access),
+            Err(AclMismatch::InheritedAce {
+                sid: SYSTEM_SID.to_owned()
+            })
+        );
+        // 保護なしで明示の ACE（flags 0）。
+        assert_eq!(
+            check_file_dacl(&file_dacl(USER, false, 0), &access),
+            Err(unexpected(0, FULL_ACCESS_MASK, SYSTEM_SID))
+        );
+        // INHERIT_ONLY（0x08）付きの継承。
+        assert_eq!(
+            check_file_dacl(&file_dacl(USER, false, INHERITED_ACE_FLAG | 0x08), &access),
+            Err(unexpected(
+                INHERITED_ACE_FLAG | 0x08,
+                FULL_ACCESS_MASK,
+                SYSTEM_SID
+            ))
+        );
+        // 2 つの形の混在（保護なしに明示の ACE を 1 つ足す）。
+        let mut mixed = file_dacl(USER, false, INHERITED_ACE_FLAG);
+        mixed.aces.as_mut().unwrap().insert(
+            0,
+            ObservedAce {
+                ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                flags: 0,
+                mask: FILE_GENERIC_WRITE_FOR_TEST,
+                sid: "S-1-5-32-545".to_owned(),
+            },
+        );
+        assert_eq!(
+            check_file_dacl(&mixed, &access),
+            Err(unexpected(0, FILE_GENERIC_WRITE_FOR_TEST, "S-1-5-32-545"))
+        );
+        // 拒否の ACE（形の flags でも）。
+        for (protected, flags) in [(true, 0), (false, INHERITED_ACE_FLAG)] {
+            let mut deny = file_dacl(USER, protected, flags);
+            deny.aces.as_mut().unwrap()[0].ace_type = 1;
+            assert_eq!(
+                check_file_dacl(&deny, &access),
+                Err(AclMismatch::UnexpectedAce {
+                    ace_type: 1,
+                    flags,
+                    mask: FULL_ACCESS_MASK,
+                    sid: SYSTEM_SID.to_owned(),
+                })
+            );
+        }
+        // 余分な許可の ACE（形の flags のまま）は読んだ flags で報告する。
+        for (protected, flags) in [(true, 0), (false, INHERITED_ACE_FLAG)] {
+            let mut extra = file_dacl(USER, protected, flags);
+            extra.aces.as_mut().unwrap().push(ObservedAce {
+                ace_type: ACCESS_ALLOWED_ACE_TYPE,
+                flags,
+                mask: FILE_GENERIC_WRITE_FOR_TEST,
+                sid: "S-1-5-32-545".to_owned(),
+            });
+            assert_eq!(
+                check_file_dacl(&extra, &access),
+                Err(unexpected(
+                    flags,
+                    FILE_GENERIC_WRITE_FOR_TEST,
+                    "S-1-5-32-545"
+                ))
+            );
+        }
+        // 欠けた ACE・違う mask。
+        let mut missing = file_dacl(USER, true, 0);
+        missing.aces.as_mut().unwrap().pop();
+        assert_eq!(
+            check_file_dacl(&missing, &access),
+            Err(AclMismatch::MissingAce {
+                sid: USER.to_owned(),
+                mask: MODIFY_ACCESS_MASK
+            })
+        );
+        // 所有者。
+        assert_eq!(
+            check_file_dacl(&file_dacl("S-1-5-32-545", true, 0), &access),
+            Err(AclMismatch::DisallowedOwner {
+                sid: "S-1-5-32-545".to_owned()
+            })
+        );
+    }
+
+    /// `FILE_GENERIC_WRITE`（0x120116）。
+    const FILE_GENERIC_WRITE_FOR_TEST: u32 = 0x0012_0116;
+
     #[test]
     fn check_rejects_every_deviation() {
         let access = DirAccess::with_install_user(user());
@@ -4201,16 +4417,16 @@ pub(crate) mod tests {
             admin
         }
 
-        /// ファイル用の確かめ。ファイルへは継承のフラグ（OICI）を外した記述子を書くので、
-        /// 全 ACE の flags が 0 であることを確かめ、フォルダ用の `check_dacl` が期待する
-        /// 形（flags = OICI）に読み替えて、所有者・PROTECTED・SID と mask の組を確かめる。
+        /// ファイル用の確かめ。ファイルへは継承のフラグ（OICI）を外した保護された記述子を
+        /// 書くので、その形（本番の [`crate::acl::check_file_dacl`] の形 (2)）であることを
+        /// 確かめる（作った直後の継承のままの形 (1) はここでは通さない）。
         fn check_file_dacl(observed: &ObservedDacl, access: &DirAccess) {
-            let mut as_dir = observed.clone();
-            for ace in as_dir.aces.as_mut().expect("DACL がある") {
-                assert_eq!(ace.flags, 0, "ファイルの ACE に継承のフラグ: {observed:?}");
-                ace.flags = INHERIT_FLAGS;
-            }
-            check_dacl(&as_dir, access).unwrap_or_else(|e| panic!("{e:?}: {observed:?}"));
+            assert!(
+                observed.protected,
+                "ファイルの DACL が保護されていない: {observed:?}"
+            );
+            crate::acl::check_file_dacl(observed, access)
+                .unwrap_or_else(|e| panic!("{e:?}: {observed:?}"));
         }
 
         fn has_no_broad_groups(dacl: &ObservedDacl) {

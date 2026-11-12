@@ -325,3 +325,24 @@ pub(super) fn pin_file(
         .map(|handle| verified_file(handle, &display.join(name)))
         .transpose()
 }
+
+/// [`ManagedDir::pin_file_checked`] の Guarded（フォルダの `recheck` は呼ぶ側）。[`pin_file`] で
+/// 握り、**握ったハンドルで**ファイルの記述子（DACL と所有者）を読み、
+/// [`crate::acl::check_file_dacl`] で `expected` の形か確かめる。合わなければハンドルを閉じて
+/// [`SafeRootError::AclMismatch`]。
+pub(super) fn pin_file_checked(
+    dir: &PinnedDir,
+    display: &Path,
+    name: &str,
+    create: bool,
+    expected: &DirAccess,
+) -> Result<Option<File>> {
+    use std::os::windows::io::AsRawHandle;
+
+    let Some(file) = pin_file(dir, display, name, create)? else {
+        return Ok(None);
+    };
+    let dacl = crate::acl::imp::read_dacl_of_handle(file.as_raw_handle() as _)?;
+    crate::acl::check_file_dacl(&dacl, expected).map_err(SafeRootError::AclMismatch)?;
+    Ok(Some(file))
+}
