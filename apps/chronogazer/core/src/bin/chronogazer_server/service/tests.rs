@@ -924,7 +924,7 @@ async fn a_log_prune_that_does_not_end_within_the_wait_keeps_the_tree_tight_with
     assert!(!layout.endpoint_file().exists(), "エンジンを止めていない");
 }
 
-/// 本物の日次ログ（`ServerLog::open_in` + `StdioRedirect` の向け直し）で動く本体。時計は
+/// 本物の日次ログ（Plain の FakeAcl ではパス版 + `StdioRedirect`）で動く本体。時計は
 /// `clock`（テストが日付を進めて、向け直しの書き込みに日付の切り替えを起こさせる）。
 fn real_log_program(
     layout: &DataLayout,
@@ -934,7 +934,9 @@ fn real_log_program(
 ) -> ServerProgram {
     let mut program = program(layout, trace, acl);
     program.open_log = Box::new(move |dir: Arc<ManagedDir>, prunes: Arc<LogPrunes>| {
-        crate::open_log_in_with_clock(dir, prunes, clock.clone())
+        let log = server_host::ServerLog::open(dir.final_path(), clock.clone())
+            .map_err(|error| error.to_string())?;
+        crate::redirect_opened_log(Arc::new(Mutex::new(log)), Some(prunes))
     });
     program
 }

@@ -404,6 +404,113 @@ fn server_log_rotates_by_local_date_and_prunes_only_after_retention_is_known() {
 }
 
 #[test]
+fn service_log_rejects_a_plain_directory_before_opening_a_file() {
+    let temp = TempDir::new();
+    let root = open_root(&RootSpec {
+        expected: temp.path().join("root"),
+        known: KnownFolders::default(),
+        owners: Vec::new(),
+        create_access: None,
+        create: true,
+        mode: Mode::Plain,
+    })
+    .unwrap();
+    let mut children = root
+        .open_managed(
+            &[ManagedSpec {
+                key: "logs",
+                parent: None,
+                name: "logs",
+                create: true,
+            }],
+            None,
+        )
+        .unwrap();
+    let logs = children.take("logs").unwrap();
+    let path = logs
+        .final_path()
+        .join(log_file_name(LocalDate::new(2026, 10, 13)));
+    let clock = Arc::new(ManualClock::new(just_before_midnight_jst(), JST));
+    let error = ServerLog::open_in(Arc::new(logs), clock)
+        .err()
+        .expect("plain service log directory must be refused");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+    assert!(!path.exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn service_log_rotation_rejects_a_swapped_hard_link_without_writing_outside() {
+    use banto_safe_root::acl::current_user_sid;
+
+    let temp = TempDir::new();
+    let root_path = temp.path().join("root");
+    std::fs::create_dir(&root_path).unwrap();
+    let root = open_root(&RootSpec {
+        expected: root_path,
+        known: KnownFolders::default(),
+        owners: vec![current_user_sid().unwrap()],
+        create_access: None,
+        create: false,
+        mode: Mode::Guarded,
+    })
+    .unwrap();
+    let mut children = root
+        .open_managed(
+            &[ManagedSpec {
+                key: "logs",
+                parent: None,
+                name: "logs",
+                create: true,
+            }],
+            None,
+        )
+        .unwrap();
+    let logs = Arc::new(children.take("logs").unwrap());
+    let clock = Arc::new(ManualClock::new(just_before_midnight_jst(), JST));
+    let mut log = ServerLog::open_in(logs.clone(), clock.clone()).unwrap();
+    log.write_line("before");
+
+    // Place a hard link to an external dummy at the next day's name after
+    // the directory and first day's file are open, before the rotation open.
+    // Hard links need no symlink privilege and exercise the same open-time
+    // handle validation without a scheduling race.
+    let dummy = temp.path().join("outside-dummy.log");
+    std::fs::write(&dummy, b"outside").unwrap();
+    let next = logs
+        .final_path()
+        .join(log_file_name(LocalDate::new(2026, 10, 14)));
+    std::fs::hard_link(&dummy, &next).unwrap();
+    clock.advance_ms(4_000);
+    log.write_line("blocked");
+    log.flush();
+    assert_eq!(std::fs::read(&dummy).unwrap(), b"outside");
+    assert_eq!(
+        log.current_path(),
+        logs.final_path()
+            .join(log_file_name(LocalDate::new(2026, 10, 13)))
+    );
+
+    // A failed rotation keeps the old file and retries on the next line.
+    std::fs::remove_file(&next).unwrap();
+    match std::os::windows::fs::symlink_file(&dummy, &next) {
+        Ok(()) => {
+            log.write_line("blocked-symlink");
+            assert_eq!(std::fs::read(&dummy).unwrap(), b"outside");
+            assert_ne!(log.current_path(), next);
+            std::fs::remove_file(&next).unwrap();
+        }
+        Err(error) => eprintln!("symlink injection unavailable: {error}"),
+    }
+    log.write_line("after");
+    assert_eq!(log.current_path(), next);
+    assert!(std::fs::rename(&next, temp.path().join("moved.log")).is_err());
+    log.close();
+    assert_eq!(std::fs::read(&dummy).unwrap(), b"outside");
+    assert!(!temp.path().join("moved.log").exists());
+}
+
+#[test]
 fn timestamps_are_local_and_zero_padded() {
     assert_eq!(format_timestamp(0, 0), "1970-01-01 00:00:00");
     let epoch_ms = LocalDate::new(2026, 1, 2).to_days_since_epoch() * DAY_MS + 3_723_000;

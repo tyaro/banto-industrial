@@ -1020,6 +1020,12 @@ impl ServerLog {
     /// ハンドルで確かめる。サービス。#623 PR-3、設計 §3.1 の 6）。日跨ぎの新しいファイルも
     /// 同じく開き、古いファイルの削除は `remove_where`（印のファイルは消さない）。
     pub fn open_in(dir: Arc<ManagedDir>, clock: Arc<dyn Clock>) -> std::io::Result<Self> {
+        if !dir.is_guarded() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "service log directory must be guarded",
+            ));
+        }
         Self::start(LogDir::Managed(dir), LOG_FILE_PREFIX, clock)
     }
 
