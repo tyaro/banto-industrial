@@ -1,7 +1,7 @@
 # 実装チェックリスト（毎セッション読み込み）
 
 状態: **運用中**。[CLAUDE.md](../CLAUDE.md) から `@` インポートされ、セッション開始時とサブエージェントに必ず読み込まれる。
-最終更新: 2026-11-10（§7 に ChronoGazer のインストーラの `PRODUCT_VERSION` をルートの版に揃えることを追加。#1086）。前回: 2026-11-09（§3 に受入スクリプトの空の観測と Hub の `/api/auth/*` の CSRF ヘッダーの 2 行を追加。#973 Hub 受入）。前回: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
+最終更新: 2026-11-12（§2 にコミット前に生成物が入っていないかを見ることを追加。#1099 の `.pyc`）。前回: 2026-11-10（§7 に ChronoGazer のインストーラの `PRODUCT_VERSION` をルートの版に揃えることを追加。#1086）。前回: 2026-11-09（§3 に受入スクリプトの空の観測と Hub の `/api/auth/*` の CSRF ヘッダーの 2 行を追加。#973 Hub 受入）。前回: 2026-11-07（§5 に SQLite の CHECK が NULL を通すことを追加。H2 の `hub_clock_sync`）。同日（§3 に非 silent NSIS の MessageBox の OK の ID・#32770 の同定・SCM の ImagePath のクォートの 3 行を追加。#973 lock-abort）。前回: 2026-11-06（§3 に親窓だけで待機を終えず子label/必要状態の準備を待つ確認を追加。#973 GUI probe）
 2026-11-06（§5 にWindows拡張長prefix除去後の同一対象確認を追加。#1050）
 2026-11-06（§6 に「head の push 前に PR 本文の対象範囲・検証欄を同期し、自動レビューが参照した本文・head を確認する」を追加。#1047）
 2026-11-02（§2 に「脆弱性の対応の `cargo update -p <crate> --precise` でも無関係な依存が付け替わる。`Cargo.lock` の差分を全部読む」を追加。RUSTSEC-2026-0433、#1016）
@@ -78,6 +78,7 @@
    - [ ] **`prettier --check .` をリポジトリ全体にかけない**（**`prettier --write .` は絶対にかけない**）。Windows の作業ツリーは CRLF なので、**main が CI で緑でもローカルでは 340 件の「差分あり」が出る**（CI は Linux/LF）。これを整形漏れと誤認して `--write .` を実行すると、**全ファイルの改行を書き換えた巨大な差分**になる。対象は**編集したファイルだけ**に絞る。全体を比べたいときは **`--end-of-line auto` を付ける**（2026-09-20: prettier 3.9.8 が整形結果を変えるかを調べて 340 件に当たった。**現行版で同じコマンドを回す対照**を取ったら同じ 340 件で、原因は版ではなく改行だった。**依存を上げる前後の比較は、必ず同じ条件で対照を取る**）。
    - [ ] **`npx sv migrate ...` は最後にルートの `pnpm run format`（= `prettier --write .`）を自分で走らせる**（`--no-install` でも止まらない）。2026-10-05 の banto-hub の SvelteKit 3 移行で、移行対象外の `.github/scripts/*.mjs`・`scripts/*.mjs` 4 ファイルが改行だけの差分になった。実行後は `git status --short` で対象アプリ外の変更を `git checkout --` で戻してからコミットする。
    - [ ] **新しいディレクトリやファイルを追加したら `git add` 後に `node --test .github/scripts/ci-changes.test.mjs` を実行する**。全ファイル網羅テストは `git ls-files` の一覧を判定するため、未追跡ファイルは見えず、ステージ後に初めて失敗する（#632 の `interop/opcua/`）。
+   - [ ] **コミット前に `git status --short` と `git diff --cached --stat` で生成物（`__pycache__/`・`*.pyc` など）が入っていないかを見る**。#1099 で受入スクリプトの unit test が作った `.pyc` 2 件をサブエージェントがコミットし、監査でも見落としてそのままマージした（2026-11-12。`.gitignore` に足して取り除いた）。
 7. [ ] E2E の前に必ず: `pnpm --filter <app> build` → **`cargo build -p <bin の package> --bin <bin> --features embed-ui`**（**`--features embed-ui` を落とすと smoke が全滅する**）。bin の package は banto-hub が `banto-hub-host`（R1-7a で `banto-hub-core` から分けた）、ChronoGazer が `chronogazer-core`
    - [ ] **実機確認・手元の検証で `--features embed-ui` の exe を作るときも、先に `pnpm --filter <app> build` で画面を建て直す**。embed-ui は手元のビルド済みの画面をそのまま埋め込むので、建て直さないと古い版の画面で確かめることになる（2026-10-20、alpha.32 の DB 複製での確認で、alpha.31 の画面が設定パッケージ版 2 を「重複した name」で拒否した。`scripts/build-release.ps1` は既定で画面も建て直すので、`-SkipFrontend` を付けない通常のリリースビルドでは起きない）。
    - [ ] **画面を建て直した後の `--features embed-ui` のビルドが、画面の変更を拾わずに古い画面のまま終わることがある**（2026-10-24、R2b-6c: `pnpm --filter banto-hub build` の後の cargo のビルドが 0.84 秒で終わり、exe は古い画面のままだった）。`apps/banto-hub/core/src/assets.rs` を `touch` してから建て直し、ビルドが実際に走ったことを確かめる。
