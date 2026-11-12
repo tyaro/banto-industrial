@@ -10,13 +10,37 @@
 //! 2. [`pending_0025`]: 0025 が未適用か（`_sqlx_migrations_banto_tags`）。
 //! 3. [`backup_before_0025`]: パスワードを除いた `.bak` を作る（§6.4）。
 //!
+//! # 置き場（[`Place`]、#623 PR3b）
+//!
+//! DB の横（profile の `config/`・ChronoGazer のサービスのルートの直下）に作る一時ファイルは、
+//! 置き場によって扱いを分ける:
+//!
+//! - [`Place::Path`]（デスクトップ・コンソール・テスト・`BANTO_DB` が profile の外）: 今までどおり
+//!   パス（`std::fs`）で作る・消す・付け替える。
+//! - [`Place::Managed`]（サービス。DB を `ManagedDir::pin_sqlite(_checked)` で握って開いたとき）:
+//!   握ったフォルダ（`banto_safe_root::ManagedDir`）のハンドル基準で、名前を辿らずに扱う。
+//!   一時ファイルは `ManagedDir::pin_file(_checked)` で空のまま作って**握ったまま**
+//!   `VACUUM INTO` の宛先にし（握っている間は他者が名前を変更・削除・置換できない）、閉じて
+//!   握りを離してから、消すのは `ManagedDir::remove`、`.bak` への付け替えは
+//!   `ManagedDir::rename_no_replace(_checked)`（置き換えない）。一覧は `ManagedDir::list`（握った
+//!   ハンドルの列挙）。`expected`（運用モードの形）が `Some` なら `_checked` 版を使い、フォルダと
+//!   作ったファイルの記述子がその形かも確かめる。握りを離してから付け替える・消すまでの間は
+//!   塞がらない（運用モードの ACL で利用者がこの木に名前を作れないことに頼る。safe-root の
+//!   `rename_no_replace` の doc の残留）。
+//!
+//! 写し（作りかけのバックアップ・予行の写し）は `journal_mode = MEMORY` で開く（[`copy_options`]）。
+//! `-journal` を作らないので、握っていない付随の名前が生まれない（落ちたときの写しの整合は
+//! 要らない。作りかけは次の起動で消す）。
+//!
 //! # バックアップ（§6.4）
 //!
-//! 作りかけの名前 `<DB>.before-0025-<UTC>.bak.partial` に `VACUUM INTO` し、
-//! `journal_mode = DELETE` で開いて `plc_connections.password` を NULL に、`pending_changes`
-//! 表があれば（Hub だけが持つ）そのペイロードから `password` を外し、`VACUUM` して閉じて
-//! から `.bak` へ `rename` する。平文を含みうるのは `.partial` の名前のものだけで、途中で
-//! 落ちれば次の起動の [`remove_leftovers`] で消える（§6.6）。完成した `.bak` は消さない。
+//! 作りかけの名前 `<DB>.before-0025-<UTC>.bak.partial`（既にある `.bak`・`.bak.partial` の名前は
+//! 使わず、同じ秒なら `-2`・`-3`… を足す）を空で用意して `VACUUM INTO` し、[`copy_options`] で
+//! 開いて `plc_connections.password` を NULL に、`pending_changes` 表があれば（Hub だけが持つ）
+//! そのペイロードから `password` を外し、`VACUUM` して閉じてから（[`Place::Managed`] は握りを
+//! 離して）`.bak` へ付け替える。平文を含みうるのは `.partial` の名前のものだけで、途中で
+//! 失敗すれば消し（[`TempFile`]）、プロセスごと落ちれば次の起動の [`remove_leftovers`] で
+//! 消える（§6.6）。完成した `.bak` は消さない。
 //!
 //! # 置かないもの
 //!
@@ -24,8 +48,10 @@
 //! `upgrade.rs`。ChronoGazer の行は `modbus-tcp` / `slmp` / `hub` だけで 0025 が断れない
 //! ので、予行は要らない（§6.7）。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use banto_safe_root::{DirAccess, ManagedDir, PinnedName, SafeRootError};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Connection, SqliteConnection, SqlitePool};
 
@@ -51,6 +77,9 @@ const SIDE_FILES: [&str; 3] = ["-journal", "-wal", "-shm"];
 #[derive(Debug, thiserror::Error)]
 pub enum UpgradeError {
     /// 前の起動の残り物（予行の写し・作りかけのバックアップ。平文を含みうる）を消せない。
+    /// [`Place::Managed`] の失敗（`SafeRootError`。フォルダ・reparse point で塞がれている
+    /// など）は `error` の中身に包む（`kind` は safe-root の I/O の失敗ならその種類、ほかは
+    /// `Other`）。
     #[error(
         "前回の起動で残ったファイル {path} を消せません（パスワードの平文を含みうるため、\
          消せるまで起動しません。手で消してから起動し直してください）: {error}"
@@ -73,6 +102,16 @@ fn storage(err: impl std::fmt::Display) -> UpgradeError {
     UpgradeError::Storage(err.to_string())
 }
 
+/// safe-root の失敗を `std::io::Error` に包む（[`UpgradeError::LeftoverNotRemoved`] と
+/// [`TempFile`] の結果の型を、パスの経路と揃える）。
+fn safe_root_io(err: SafeRootError) -> std::io::Error {
+    let kind = match &err {
+        SafeRootError::Io { kind, .. } => *kind,
+        _ => std::io::ErrorKind::Other,
+    };
+    std::io::Error::new(kind, err)
+}
+
 /// DB のファイルの置き場（profile の `config/`）。
 pub fn config_dir_of(db_path: &Path) -> PathBuf {
     match db_path.parent() {
@@ -86,6 +125,85 @@ fn db_file_name(db_path: &Path) -> String {
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "banto.sqlite3".to_string())
+}
+
+// ---- 置き場（#623 PR3b） ------------------------------------------------------------------
+
+/// DB と、その横に作る一時ファイル・バックアップの置き場（モジュール doc「置き場」）。
+#[derive(Clone, Copy)]
+pub enum Place<'a> {
+    /// DB のパス。横のファイルはパス（`std::fs`）で扱う。
+    Path(&'a Path),
+    /// 握ったフォルダ `dir` の直下の DB `db_name`。横のファイルは `dir` のハンドル基準で
+    /// 扱う。`expected`（運用モードの形）が `Some` なら `ManagedDir` の `_checked` 版を使う。
+    Managed {
+        dir: &'a ManagedDir,
+        db_name: &'a str,
+        expected: Option<&'a DirAccess>,
+    },
+}
+
+impl<'a> From<&'a Path> for Place<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self::Path(path)
+    }
+}
+
+impl<'a> From<&'a PathBuf> for Place<'a> {
+    fn from(path: &'a PathBuf) -> Self {
+        Self::Path(path.as_path())
+    }
+}
+
+impl<'a> Place<'a> {
+    /// [`Place::Managed`] を作る。
+    pub fn managed(dir: &'a ManagedDir, db_name: &'a str, expected: Option<&'a DirAccess>) -> Self {
+        Self::Managed {
+            dir,
+            db_name,
+            expected,
+        }
+    }
+
+    /// 置き場のフォルダのパス（表示用。[`Place::Managed`] は `ManagedDir::final_path`）。
+    pub fn dir_path(&self) -> PathBuf {
+        match self {
+            Self::Path(path) => config_dir_of(path),
+            Self::Managed { dir, .. } => dir.final_path().to_path_buf(),
+        }
+    }
+
+    /// DB のファイル名。
+    pub fn db_name(&self) -> String {
+        match self {
+            Self::Path(path) => db_file_name(path),
+            Self::Managed { db_name, .. } => (*db_name).to_string(),
+        }
+    }
+
+    /// DB のパス（表示用。[`Place::Managed`] は `ManagedDir::final_path` + 名前）。
+    pub fn db_path(&self) -> PathBuf {
+        match self {
+            Self::Path(path) => path.to_path_buf(),
+            Self::Managed { dir, db_name, .. } => dir.final_path().join(db_name),
+        }
+    }
+
+    /// 置き場の中の名前 `name` のパス（表示用・パスの経路の実体）。
+    fn child(&self, name: &str) -> PathBuf {
+        self.dir_path().join(name)
+    }
+
+    /// 置き場の中の名前の集合（作りかけ・完成の名前を選ぶため）。[`Place::Managed`] は握った
+    /// ハンドルの一覧。パスの経路は `None`（名前ごとに `exists` で見る）。
+    fn names(&self) -> Result<Option<HashSet<String>>, SafeRootError> {
+        match self {
+            Self::Path(_) => Ok(None),
+            Self::Managed { dir, .. } => Ok(Some(
+                dir.list()?.into_iter().map(|entry| entry.name).collect(),
+            )),
+        }
+    }
 }
 
 /// `name` が前の起動の残り物か（Hub の予行の写しと、`db_name` の作りかけのバックアップ、と
@@ -104,11 +222,50 @@ pub fn is_leftover(name: &str, db_name: &str) -> bool {
             .any(|side| name.ends_with(&format!("{PARTIAL_SUFFIX}{side}")))
 }
 
-/// 毎回の起動の最初（§6.3 の 4・§6.4）: config/ の残り物を消す。消したパスを返す。
+/// 毎回の起動の最初（§6.3 の 4・§6.4）: 置き場の残り物を消す。消したパスを返す。
 /// 1 つでも消せなければ [`UpgradeError::LeftoverNotRemoved`]（起動を止める）。
-pub fn remove_leftovers(db_path: &Path) -> Result<Vec<PathBuf>, UpgradeError> {
+///
+/// [`Place::Managed`] は握ったハンドルの一覧から [`is_leftover`] の名前を選び、
+/// `ManagedDir::remove`（開いた後のハンドルで確かめて消す）で消す。`ManagedDir::remove_where`
+/// は使わない（フォルダ・reparse point を黙って飛ばすので、残り物の名前を塞がれても起動が
+/// 進んでしまう）。名前を塞ぐフォルダ・リンクは `remove` が断る（Plain はパスの経路と同じく
+/// `remove_file` が失敗する）ので、それも起動を止める。
+pub fn remove_leftovers<'a>(place: impl Into<Place<'a>>) -> Result<Vec<PathBuf>, UpgradeError> {
+    let place = place.into();
+    let db_name = place.db_name();
+    let mut removed = match place {
+        Place::Path(db_path) => remove_leftovers_by_path(db_path, &db_name)?,
+        Place::Managed { dir, .. } => {
+            let entries = dir.list().map_err(|err| UpgradeError::LeftoverNotRemoved {
+                path: place.dir_path(),
+                error: safe_root_io(err),
+            })?;
+            let mut removed = Vec::new();
+            for entry in entries {
+                if !is_leftover(&entry.name, &db_name) {
+                    continue;
+                }
+                let path = place.child(&entry.name);
+                match dir.remove(&entry.name) {
+                    Ok(true) => removed.push(path),
+                    Ok(false) => {} // 一覧の後に消えた。
+                    Err(err) => {
+                        return Err(UpgradeError::LeftoverNotRemoved {
+                            path,
+                            error: safe_root_io(err),
+                        })
+                    }
+                }
+            }
+            removed
+        }
+    };
+    removed.sort();
+    Ok(removed)
+}
+
+fn remove_leftovers_by_path(db_path: &Path, db_name: &str) -> Result<Vec<PathBuf>, UpgradeError> {
     let dir = config_dir_of(db_path);
-    let db_name = db_file_name(db_path);
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -121,7 +278,7 @@ pub fn remove_leftovers(db_path: &Path) -> Result<Vec<PathBuf>, UpgradeError> {
             error,
         })?;
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_leftover(&name, &db_name) {
+        if !is_leftover(&name, db_name) {
             continue;
         }
         let path = entry.path();
@@ -131,7 +288,6 @@ pub fn remove_leftovers(db_path: &Path) -> Result<Vec<PathBuf>, UpgradeError> {
             Err(error) => return Err(UpgradeError::LeftoverNotRemoved { path, error }),
         }
     }
-    removed.sort();
     Ok(removed)
 }
 
@@ -220,31 +376,117 @@ where
 /// 付随ファイルを消す（パニックの経路でも）。[`TempFile::finish`] は消して結果を返す
 /// （消せなければ起動を止める）。[`TempFile::keep`] は消さずに手放す（完成した
 /// バックアップ、テストの「落ちた」の再現）。
-pub struct TempFile {
-    path: PathBuf,
+///
+/// [`Place::Managed`] で作ったもの（[`TempFile::create`]）は、空のファイルを作って**握った
+/// まま**持つ（`PinnedName`）。相手（SQLite）には [`TempFile::path`] を渡す。消す・付け替える・
+/// 手放すときは、先に握りを離す（握った名前は自分でも消せない）。消すのは握ったフォルダの
+/// `ManagedDir::remove`。相手の接続は、それより前に閉じておくこと（呼ぶ側の責任。閉じて
+/// いないと Windows では消せない）。
+pub struct TempFile<'a> {
+    inner: TempInner<'a>,
     armed: bool,
 }
 
-impl TempFile {
+enum TempInner<'a> {
+    Path(PathBuf),
+    Managed {
+        dir: &'a ManagedDir,
+        expected: Option<&'a DirAccess>,
+        name: String,
+        /// 握り。離した後は `None`。
+        pin: Option<PinnedName>,
+        /// 表示・相手に渡すパス（`PinnedName::path` と同じ）。
+        path: PathBuf,
+    },
+}
+
+impl TempFile<'static> {
+    /// パスの一時ファイル（まだ作らない。`VACUUM INTO` などの相手が作る）。
     pub fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+        Self {
+            inner: TempInner::Path(path),
+            armed: true,
+        }
+    }
+}
+
+impl<'a> TempFile<'a> {
+    /// 置き場 `place` の中の名前 `name` の一時ファイルを用意する。[`Place::Path`] はパスを
+    /// 決めるだけ（[`TempFile::new`]）。[`Place::Managed`] は `ManagedDir::pin_file(_checked)`
+    /// で空のファイルを作って握る（既にあればそれを握る。`VACUUM INTO` は空でない宛先を断る）。
+    pub fn create(place: Place<'a>, name: &str) -> Result<Self, SafeRootError> {
+        match place {
+            Place::Path(_) => Ok(TempFile::new(place.child(name))),
+            Place::Managed { dir, expected, .. } => {
+                let pin = match expected {
+                    Some(expected) => dir.pin_file_checked(name, true, expected)?,
+                    None => dir.pin_file(name, true)?,
+                }
+                // `create` が真なら `None` にならない（safe-root の契約）。念のため失敗にする。
+                .ok_or(SafeRootError::Io {
+                    op: banto_safe_root::IoOp::CreateFile,
+                    kind: std::io::ErrorKind::NotFound,
+                    os_error: None,
+                })?;
+                Ok(Self {
+                    inner: TempInner::Managed {
+                        dir,
+                        expected,
+                        name: name.to_string(),
+                        path: pin.path().to_path_buf(),
+                        pin: Some(pin),
+                    },
+                    armed: true,
+                })
+            }
+        }
     }
 
-    fn remove_all(path: &Path) -> Result<(), (PathBuf, std::io::Error)> {
-        let mut result = Ok(());
-        let mut paths = vec![path.to_path_buf()];
-        for side in SIDE_FILES {
-            let mut name = path.as_os_str().to_owned();
-            name.push(side);
-            paths.push(PathBuf::from(name));
+    /// 相手（SQLite）に渡すパス。
+    pub fn path(&self) -> &Path {
+        match &self.inner {
+            TempInner::Path(path) => path,
+            TempInner::Managed { path, .. } => path,
         }
-        for candidate in paths {
-            match std::fs::remove_file(&candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    if result.is_ok() {
-                        result = Err((candidate, error));
+    }
+
+    /// 握りを離す（[`Place::Managed`] だけ。2 回目以降は何もしない）。
+    fn release(&mut self) {
+        if let TempInner::Managed { pin, .. } = &mut self.inner {
+            drop(pin.take());
+        }
+    }
+
+    fn remove_all(&mut self) -> Result<(), (PathBuf, std::io::Error)> {
+        self.release();
+        let mut result = Ok(());
+        let mut record = |path: PathBuf, error: std::io::Error| {
+            if result.is_ok() {
+                result = Err((path, error));
+            }
+        };
+        match &self.inner {
+            TempInner::Path(path) => {
+                let mut paths = vec![path.clone()];
+                for side in SIDE_FILES {
+                    let mut name = path.as_os_str().to_owned();
+                    name.push(side);
+                    paths.push(PathBuf::from(name));
+                }
+                for candidate in paths {
+                    match std::fs::remove_file(&candidate) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => record(candidate, error),
+                    }
+                }
+            }
+            TempInner::Managed { dir, name, .. } => {
+                let mut names = vec![name.clone()];
+                names.extend(SIDE_FILES.iter().map(|side| format!("{name}{side}")));
+                for candidate in names {
+                    if let Err(err) = dir.remove(&candidate) {
+                        record(dir.final_path().join(&candidate), safe_root_io(err));
                     }
                 }
             }
@@ -252,22 +494,55 @@ impl TempFile {
         result
     }
 
+    /// 同じ置き場の `final_name` へ付け替える（完成したバックアップ）。[`Place::Managed`] は
+    /// 握りを離してから `ManagedDir::rename_no_replace(_checked)`（辿らず・置き換えない。
+    /// 宛先が既にあれば失敗）。パスの経路は `std::fs::rename`。失敗しても `self` は消す側の
+    /// まま（落とせば `Drop` が消す）。成功したら付け替えた先のパスを返す（`self` は手放して
+    /// よい）。
+    fn rename_to(&mut self, final_name: &str) -> Result<PathBuf, String> {
+        self.release();
+        match &self.inner {
+            TempInner::Path(path) => {
+                let final_path = path.with_file_name(final_name);
+                std::fs::rename(path, &final_path).map_err(|err| err.to_string())?;
+                Ok(final_path)
+            }
+            TempInner::Managed {
+                dir,
+                expected,
+                name,
+                ..
+            } => {
+                let renamed = match expected {
+                    Some(expected) => dir.rename_no_replace_checked(name, final_name, expected),
+                    None => dir.rename_no_replace(name, final_name),
+                }
+                .map_err(|err| err.to_string())?;
+                if !renamed {
+                    return Err(format!("作りかけの {name} が見つかりません"));
+                }
+                Ok(dir.final_path().join(final_name))
+            }
+        }
+    }
+
     /// 消して結果を返す。
     pub fn finish(mut self) -> Result<(), (PathBuf, std::io::Error)> {
         self.armed = false;
-        Self::remove_all(&self.path)
+        self.remove_all()
     }
 
-    /// 消さずに手放す。
+    /// 消さずに手放す（握りは離す）。
     pub fn keep(mut self) {
         self.armed = false;
+        self.release();
     }
 }
 
-impl Drop for TempFile {
+impl Drop for TempFile<'_> {
     fn drop(&mut self) {
         if self.armed {
-            if let Err((path, error)) = Self::remove_all(&self.path) {
+            if let Err((path, error)) = self.remove_all() {
                 eprintln!(
                     "banto-tags: [WARN] 一時ファイル {} を消せませんでした（次の起動で消します）: {error}",
                     path.display()
@@ -282,7 +557,8 @@ fn path_text(path: &Path) -> Result<&str, String> {
         .ok_or_else(|| format!("パスが UTF-8 ではありません: {}", path.display()))
 }
 
-/// `VACUUM INTO` で `pool` の DB の一貫した写しを `dest` に作る（`dest` は無いこと）。
+/// `VACUUM INTO` で `pool` の DB の一貫した写しを `dest` に作る（`dest` は無いか、空のファイル。
+/// [`Place::Managed`] では [`TempFile::create`] が握った空のファイル）。
 pub async fn vacuum_into(pool: &SqlitePool, dest: &Path) -> Result<(), String> {
     sqlx::query("VACUUM INTO ?")
         .bind(path_text(dest)?)
@@ -292,13 +568,14 @@ pub async fn vacuum_into(pool: &SqlitePool, dest: &Path) -> Result<(), String> {
         .map_err(|err| err.to_string())
 }
 
-/// 写し（予行・バックアップ）を開く設定: 作らない・ロールバックジャーナル（WAL を作らない）・
-/// FK を強制（0025 の park-and-restore の前提）。
+/// 写し（予行・バックアップ）を開く設定: 作らない・ジャーナルはメモリの中（`-journal`・WAL の
+/// 付随の名前を作らない。握っていない名前を生まないため。#623 PR3b）・FK を強制（0025 の
+/// park-and-restore の前提）。写しは落ちたら捨てるので、ジャーナルの耐久性は要らない。
 pub fn copy_options(path: &Path) -> SqliteConnectOptions {
     SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .journal_mode(SqliteJournalMode::Delete)
+        .journal_mode(SqliteJournalMode::Memory)
         .foreign_keys(true)
 }
 
@@ -318,51 +595,62 @@ pub enum BackupStep {
 }
 
 /// 移行の直前のバックアップ（§6.4）。完成した `.bak` のパスを返す。
-pub async fn backup_before_0025(
+pub async fn backup_before_0025<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
 ) -> Result<PathBuf, UpgradeError> {
-    backup_with(pool, db_path, None).await
+    backup_with(pool, place, None).await
 }
 
 /// [`backup_before_0025`] の本体。`crash_after` の工程に来たら、作りかけを**残したまま**
-/// 失敗で返る（プロセスが落ちたのと同じ。テストだけが使う）。
+/// 失敗で返る（プロセスが落ちたのと同じ。[`Place::Managed`] では握りは離す。テストだけが使う）。
 #[doc(hidden)]
-pub async fn backup_with(
+pub async fn backup_with<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
     crash_after: Option<BackupStep>,
 ) -> Result<PathBuf, UpgradeError> {
-    let dir = config_dir_of(db_path);
-    let db_name = db_file_name(db_path);
+    let place = place.into();
+    let db_name = place.db_name();
     let stamp: String = sqlx::query_scalar("SELECT strftime('%Y%m%dT%H%M%SZ', 'now')")
         .fetch_one(pool)
         .await
         .map_err(storage)?;
-    // 同じ秒に 2 回作る（移行が失敗して起動し直した）ときは連番を足す。
+    let fail_at = |path: PathBuf| {
+        move |message: String| UpgradeError::Backup {
+            path: path.clone(),
+            message,
+        }
+    };
+    // 同じ秒に 2 回作る（移行が失敗して起動し直した）ときは連番を足す。既にある `.bak`・
+    // `.bak.partial` の名前は使わない（上書き・再利用しない）。Managed の有無は握ったハンドルの
+    // 一覧で見る。
+    let names = place
+        .names()
+        .map_err(|err| fail_at(place.dir_path())(err.to_string()))?;
+    let taken = |name: &str| match &names {
+        Some(names) => names.contains(name),
+        None => place.child(name).exists(),
+    };
     let mut base = format!("{db_name}{BACKUP_INFIX}{stamp}");
     let mut n = 1;
-    while dir.join(format!("{base}{BACKUP_SUFFIX}")).exists()
-        || dir.join(format!("{base}{PARTIAL_SUFFIX}")).exists()
-    {
+    while taken(&format!("{base}{BACKUP_SUFFIX}")) || taken(&format!("{base}{PARTIAL_SUFFIX}")) {
         n += 1;
         base = format!("{db_name}{BACKUP_INFIX}{stamp}-{n}");
     }
-    let partial_path = dir.join(format!("{base}{PARTIAL_SUFFIX}"));
-    let final_path = dir.join(format!("{base}{BACKUP_SUFFIX}"));
-    let fail = |message: String| UpgradeError::Backup {
-        path: final_path.clone(),
-        message,
-    };
+    let partial_name = format!("{base}{PARTIAL_SUFFIX}");
+    let final_name = format!("{base}{BACKUP_SUFFIX}");
+    let fail = fail_at(place.child(&final_name));
 
-    let partial = TempFile::new(partial_path.clone());
-    vacuum_into(pool, &partial_path).await.map_err(&fail)?;
+    let mut partial =
+        TempFile::create(place, &partial_name).map_err(|err| fail(err.to_string()))?;
+    vacuum_into(pool, partial.path()).await.map_err(&fail)?;
     if crash_after == Some(BackupStep::AfterVacuumInto) {
         partial.keep();
         return Err(fail("（テスト）VACUUM INTO の後で落ちた".to_string()));
     }
 
-    let mut conn = SqliteConnection::connect_with(&copy_options(&partial_path))
+    let mut conn = SqliteConnection::connect_with(&copy_options(partial.path()))
         .await
         .map_err(|err| fail(err.to_string()))?;
     let stripped = strip_secrets(&mut conn, crash_after).await;
@@ -381,12 +669,8 @@ pub async fn backup_with(
         return Err(fail("（テスト）rename の前で落ちた".to_string()));
     }
 
-    std::fs::rename(&partial_path, &final_path).map_err(|err| fail(err.to_string()))?;
+    let final_path = partial.rename_to(&final_name).map_err(&fail)?;
     partial.keep();
-    // `journal_mode = DELETE` の正常な終わりではジャーナルは残らないが、念のため。
-    let mut journal = partial_path.into_os_string();
-    journal.push("-journal");
-    let _ = std::fs::remove_file(PathBuf::from(journal));
     Ok(final_path)
 }
 
@@ -634,5 +918,184 @@ mod tests {
             );
             pool.close().await;
         }
+    }
+
+    // ---- 握った置き場（#623 PR3b） -----------------------------------------------------------
+
+    fn root_of(dir: &Path, mode: banto_safe_root::Mode) -> banto_safe_root::SafeRoot {
+        let owners = match mode {
+            #[cfg(windows)]
+            banto_safe_root::Mode::Guarded => {
+                vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")]
+            }
+            _ => Vec::new(),
+        };
+        banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: dir.to_path_buf(),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners,
+            create_access: None,
+            create: false,
+            mode,
+        })
+        .expect("open the root")
+    }
+
+    fn modes() -> Vec<banto_safe_root::Mode> {
+        let mut modes = vec![banto_safe_root::Mode::Plain];
+        if cfg!(windows) {
+            modes.push(banto_safe_root::Mode::Guarded);
+        }
+        modes
+    }
+
+    /// 作りかけ・その付随（`-journal` など）の名前。
+    fn partial_names(dir: &Path) -> Vec<String> {
+        names(dir)
+            .into_iter()
+            .filter(|n| n.contains(PARTIAL_SUFFIX) || n.contains(DRYRUN_PREFIX))
+            .collect()
+    }
+
+    /// 握った置き場でも、バックアップは `.bak` を作り、パスワードの平文を持たず、作りかけと
+    /// `-journal` を残さない（Plain はどの OS でも、Windows は Guarded でも）。
+    #[tokio::test]
+    async fn a_managed_backup_makes_a_bak_and_leaves_no_partial_or_journal() {
+        for mode in modes() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, pool) = db_before_0025(dir.path(), true).await;
+            let root = root_of(dir.path(), mode);
+            let place = Place::managed(root.as_dir(), "app.sqlite3", None);
+            let backup = backup_before_0025(&pool, place).await.expect("backup");
+            assert!(
+                backup.to_string_lossy().ends_with(BACKUP_SUFFIX),
+                "{mode:?}: {backup:?}"
+            );
+            assert!(
+                !contains(&std::fs::read(&backup).unwrap(), PASSWORD),
+                "{mode:?}"
+            );
+            assert!(
+                partial_names(dir.path()).is_empty(),
+                "{mode:?}: {:?}",
+                names(dir.path())
+            );
+            assert!(
+                !names(dir.path()).iter().any(|n| n.ends_with("-journal")),
+                "{mode:?}: {:?}",
+                names(dir.path())
+            );
+            // 同じ秒の 2 本目は連番を足し、1 本目を上書きしない。
+            let second = backup_before_0025(&pool, place).await.expect("second");
+            assert_ne!(second, backup, "{mode:?}");
+            assert!(backup.exists() && second.exists(), "{mode:?}");
+            pool.close().await;
+        }
+    }
+
+    /// 握った置き場でも、どの工程の直後に落ちても残るのは `.partial` の名前のものだけで、
+    /// 次の掃除（握ったハンドルの一覧から消す）が消す。
+    #[tokio::test]
+    async fn a_managed_crash_between_backup_steps_is_removed_by_the_next_start() {
+        for mode in modes() {
+            for step in [
+                BackupStep::AfterVacuumInto,
+                BackupStep::AfterStrip,
+                BackupStep::AfterVacuum,
+                BackupStep::BeforeRename,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let (_, pool) = db_before_0025(dir.path(), true).await;
+                let root = root_of(dir.path(), mode);
+                let place = Place::managed(root.as_dir(), "app.sqlite3", None);
+                let err = backup_with(&pool, place, Some(step))
+                    .await
+                    .expect_err("the injected crash");
+                assert!(matches!(err, UpgradeError::Backup { .. }), "{err:?}");
+                assert_eq!(
+                    partial_names(dir.path()).len(),
+                    1,
+                    "{mode:?} {step:?}: {:?}",
+                    names(dir.path())
+                );
+                assert!(
+                    !names(dir.path()).iter().any(|n| n.ends_with(BACKUP_SUFFIX)),
+                    "{mode:?} {step:?}"
+                );
+                assert_eq!(
+                    remove_leftovers(place).unwrap().len(),
+                    1,
+                    "{mode:?} {step:?}"
+                );
+                assert!(partial_names(dir.path()).is_empty(), "{mode:?} {step:?}");
+                let backup = backup_before_0025(&pool, place).await.unwrap();
+                assert!(
+                    !contains(&std::fs::read(backup).unwrap(), PASSWORD),
+                    "{mode:?} {step:?}"
+                );
+                pool.close().await;
+            }
+        }
+    }
+
+    /// 握った置き場でも、残り物の名前をフォルダが塞いでいたら起動を止める（黙って飛ばさない）。
+    /// 完成した `.bak` と DB は消さない。
+    #[test]
+    fn a_managed_leftover_name_blocked_by_a_directory_stops_the_start() {
+        for mode in modes() {
+            let dir = tempfile::tempdir().unwrap();
+            for name in [
+                "app.sqlite3",
+                "app.sqlite3.before-0025-20261021T000000Z.bak",
+                "app.sqlite3.before-0025-20261021T000001Z.bak.partial",
+                ".banto-hub-0025-dryrun-00.sqlite3-journal",
+            ] {
+                std::fs::write(dir.path().join(name), b"x").unwrap();
+            }
+            let root = root_of(dir.path(), mode);
+            let place = Place::managed(root.as_dir(), "app.sqlite3", None);
+            assert_eq!(remove_leftovers(place).unwrap().len(), 2, "{mode:?}");
+            assert_eq!(
+                names(dir.path()),
+                vec![
+                    "app.sqlite3".to_string(),
+                    "app.sqlite3.before-0025-20261021T000000Z.bak".to_string()
+                ],
+                "{mode:?}"
+            );
+            let stuck = "app.sqlite3.before-0025-20261021T000002Z.bak.partial";
+            std::fs::create_dir(dir.path().join(stuck)).unwrap();
+            match remove_leftovers(place) {
+                Err(UpgradeError::LeftoverNotRemoved { path, .. }) => {
+                    assert_eq!(path.file_name().unwrap(), stuck, "{mode:?}")
+                }
+                other => panic!("{mode:?}: expected LeftoverNotRemoved, got {other:?}"),
+            }
+            assert!(dir.path().join(stuck).is_dir(), "{mode:?}");
+        }
+    }
+
+    /// Windows の Guarded: 握っている間、作りかけの名前は外から改名も削除もできない。
+    /// 離した後（`finish`）は握ったフォルダのハンドル基準で消える。
+    #[cfg(windows)]
+    #[test]
+    fn a_guarded_partial_cannot_be_renamed_or_removed_while_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_of(dir.path(), banto_safe_root::Mode::Guarded);
+        let place = Place::managed(root.as_dir(), "app.sqlite3", None);
+        let name = "app.sqlite3.before-0025-20261021T000000Z.bak.partial";
+        let partial = TempFile::create(place, name).expect("pin the partial");
+        let path = dir.path().join(name);
+        assert!(path.is_file());
+        assert!(
+            std::fs::rename(&path, dir.path().join("moved")).is_err(),
+            "握っている名前を改名できた"
+        );
+        assert!(
+            std::fs::remove_file(&path).is_err(),
+            "握っている名前を消せた"
+        );
+        partial.finish().expect("remove after release");
+        assert!(!path.exists());
     }
 }

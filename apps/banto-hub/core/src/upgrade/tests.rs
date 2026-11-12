@@ -217,6 +217,52 @@ async fn the_dry_run_passes_reports_notes_and_leaves_no_copy() {
     pool.close().await;
 }
 
+/// #623 PR3b: 握った置き場（`Place::Managed`。Plain の `ManagedDir`、Windows では Guarded も）
+/// でも予行が通り、写し（本体・`-journal` などの付随）を残さない。写しは握ったまま
+/// `VACUUM INTO` の宛先にし、閉じて握りを離してからハンドル基準で消す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_dry_run_in_a_managed_dir_leaves_no_copy() {
+    let mut modes = vec![banto_safe_root::Mode::Plain];
+    if cfg!(windows) {
+        modes.push(banto_safe_root::Mode::Guarded);
+    }
+    for mode in modes {
+        let dir = TempDir::new("upgrade-dry-run-managed");
+        let (_path, pool) = old_db(dir.path()).await;
+        seed_passing(&pool).await;
+        let owners = match mode {
+            #[cfg(windows)]
+            banto_safe_root::Mode::Guarded => {
+                vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")]
+            }
+            _ => Vec::new(),
+        };
+        let root = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: dir.path().to_path_buf(),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners,
+            create_access: None,
+            create: false,
+            mode,
+        })
+        .expect("open the root");
+        let place = Place::managed(root.as_dir(), "banto-hub.sqlite3", None);
+        let report = dry_run_and_preflight(&pool, place, &registry())
+            .await
+            .expect("dry run");
+        assert!(!report.is_refused(), "{mode:?}: {report:?}");
+        assert!(pending_0025(&pool).await.unwrap(), "{mode:?}");
+        assert!(
+            !names(dir.path())
+                .iter()
+                .any(|name| name.starts_with(DRYRUN_PREFIX)),
+            "{mode:?}: {:?}",
+            names(dir.path())
+        );
+        pool.close().await;
+    }
+}
+
 /// §6.3 の「断る」: ドライバの検証に落ちる行（postgres の host が空・port 70000、
 /// 0024 までの CHECK は通す）と、写しへの migrate が落ちる行（push の settings が
 /// オブジェクトでない）。どれも DB を変えず、写しを残さない。

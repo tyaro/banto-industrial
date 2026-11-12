@@ -1160,11 +1160,14 @@ test('実例 #637（banto-secret-store・banto-service-elev・chronogazer-elev�
 		'chronogazer',
 		// banto-service-elev → banto-hub-core（昇格の部品）。
 		'banto-hub-core',
-		'banto-hub-shell'
+		'banto-hub-shell',
+		// banto-service-elev →（dev）banto-safe-root → banto-tags（#623 PR3b で banto-tags が
+		// banto-safe-root に依存した。dev の辺もたどるのは分類器の決まり）。
+		'banto-tags'
 	]) {
 		assert.ok(pkgs.includes(p), `${p} が対象に無い`);
 	}
-	for (const p of ['banto-tags', 'banto-plc', 'banto-rtsp', 'banto-tsquery']) {
+	for (const p of ['banto-plc', 'banto-rtsp', 'banto-tsquery']) {
 		assert.ok(!pkgs.includes(p), `${p} は対象に要らない`);
 	}
 	assert.equal(jobs.run_frontend_hub, false);

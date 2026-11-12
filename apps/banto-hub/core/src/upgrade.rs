@@ -55,10 +55,14 @@
 //! # バックアップ（§6.4）
 //!
 //! 作りかけの名前 `<DB>.before-0025-<UTC>.bak.partial` に `VACUUM INTO` し、
-//! `journal_mode = DELETE` で開いて `plc_connections.password` を NULL に、
+//! `journal_mode = MEMORY` で開いて `plc_connections.password` を NULL に、
 //! `pending_changes.payload` から（状態を問わず）`password` を外し、`VACUUM` して閉じて
-//! から `.bak` へ `rename` する。平文を含みうるのは `.partial` の名前のものだけで、
+//! から `.bak` へ付け替える。平文を含みうるのは `.partial` の名前のものだけで、
 //! 途中で落ちれば次の起動の掃除（2-b の 1）で消える（§6.6）。完成した `.bak` は消さない。
+//!
+//! 写し・作りかけ・掃除の置き場は `banto_tags::upgrade::Place`: サービスの握った `config`
+//! （`crate::db::init_db_pinned`）では、名前を辿らず・握って扱う（#623 PR3b。手順は
+//! `banto_tags::upgrade` のモジュール doc「置き場」）。それ以外はパスのまま。
 //!
 //! # 秘密値の後処理（§6.5・§6.6、R2b-1e、毎回の起動・冪等）
 //!
@@ -119,8 +123,8 @@ use crate::hub_log::{log_err_line, log_line};
 
 // 名前の型と工程は `banto_tags::upgrade`（ChronoGazer と共有。R2b-1d、設計 §6.7）。
 pub use banto_tags::upgrade::{
-    config_dir_of, BackupStep, BACKUP_INFIX, BACKUP_SUFFIX, DRYRUN_PREFIX, MIGRATION_0025_VERSION,
-    PARTIAL_SUFFIX,
+    config_dir_of, BackupStep, Place, BACKUP_INFIX, BACKUP_SUFFIX, DRYRUN_PREFIX,
+    MIGRATION_0025_VERSION, PARTIAL_SUFFIX,
 };
 
 /// 予行の写しの末尾（`{DRYRUN_PREFIX}{nonce}{DRYRUN_SUFFIX}`）。
@@ -257,8 +261,9 @@ impl From<banto_tags::upgrade::UpgradeError> for UpgradeError {
 
 /// 2-b の 1（§6.3 の 4・§6.4、毎回の起動）: config/ の残り物を消す。消したパスを返す。
 /// 1 つでも消せなければ [`UpgradeError::LeftoverNotRemoved`]（起動を止める）。
-pub fn remove_leftovers(db_path: &Path) -> Result<Vec<PathBuf>, UpgradeError> {
-    Ok(banto_tags::upgrade::remove_leftovers(db_path)?)
+/// 置き場（[`Place`]）はパスか、サービスの握った `config`（#623 PR3b）。
+pub fn remove_leftovers<'a>(place: impl Into<Place<'a>>) -> Result<Vec<PathBuf>, UpgradeError> {
+    Ok(banto_tags::upgrade::remove_leftovers(place)?)
 }
 
 /// 0025 が未適用か（2-b の 2）。banto-tags の記録表が無い（新規の DB。migrate が全部を
@@ -274,11 +279,14 @@ pub async fn pending_0025(pool: &SqlitePool) -> Result<bool, UpgradeError> {
 /// - 未適用で `registry` が無い（昇格ヘルパーなど）: [`UpgradeError::NeedsHubStartup`]。
 /// - 未適用: 予行と preflight → 断れば [`UpgradeError::Preflight`]（DB は変わらない）→
 ///   バックアップ → 清掃待ちの印。報告だけの行・バックアップのパス・予行の時間はログに出す。
-pub async fn prepare_0025(
+pub async fn prepare_0025<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
     registry: Option<&Arc<DriverRegistry>>,
 ) -> Result<Option<UpgradeOutcome>, UpgradeError> {
+    let place = place.into();
+    let db_path = place.db_path();
+    let db_path = db_path.as_path();
     if !pending_0025(pool).await? {
         return Ok(None);
     }
@@ -292,7 +300,7 @@ pub async fn prepare_0025(
         db_path.display()
     ));
     let started = Instant::now();
-    let report = dry_run_and_preflight(pool, db_path, registry).await?;
+    let report = dry_run_and_preflight(pool, place, registry).await?;
     let dry_run_elapsed = started.elapsed();
     for note in &report.notes {
         log_line(&format!(
@@ -314,7 +322,7 @@ pub async fn prepare_0025(
         "banto-hub: 移行の予行が通りました（{} ms）",
         dry_run_elapsed.as_millis()
     ));
-    let backup = backup_before_0025(pool, db_path).await?;
+    let backup = backup_before_0025(pool, place).await?;
     log_line(&format!(
         "banto-hub: 移行の前のバックアップを作りました（postgres 接続のパスワードは含みません。\
          戻すときは入れ直してください）: {}",
@@ -374,15 +382,19 @@ struct OldRow {
 /// 写しで予行し、preflight の結果を返す（§6.3）。写しは成功・失敗・パニックのどれでも
 /// 消す。消せなければ [`UpgradeError::DryRunCopyNotRemoved`]。DB 本体には触らない
 /// （`VACUUM INTO` は読み取りだけ）。
-pub async fn dry_run_and_preflight(
+///
+/// 写しは DB と同じ置き場（[`Place`]）に作る。サービスの握った `config`（[`Place::Managed`]、
+/// #623 PR3b）では、空のファイルを作って握ったまま `VACUUM INTO` の宛先にし、写しの pool を
+/// 閉じてから握りを離して握ったフォルダのハンドル基準で消す（[`TempFile::create`]）。
+pub async fn dry_run_and_preflight<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
     registry: &Arc<DriverRegistry>,
 ) -> Result<PreflightReport, UpgradeError> {
-    let copy_path =
-        config_dir_of(db_path).join(format!("{DRYRUN_PREFIX}{}{DRYRUN_SUFFIX}", random_hex(8)?));
-    let copy = TempFile::new(copy_path.clone());
-    let result = dry_run_on_copy(pool, &copy_path, registry).await;
+    let name = format!("{DRYRUN_PREFIX}{}{DRYRUN_SUFFIX}", random_hex(8)?);
+    let copy = TempFile::create(place.into(), &name)
+        .map_err(|err| UpgradeError::DryRun(err.to_string()))?;
+    let result = dry_run_on_copy(pool, copy.path(), registry).await;
     copy.finish()
         .map_err(|(path, error)| UpgradeError::DryRunCopyNotRemoved { path, error })?;
     result
@@ -611,22 +623,22 @@ fn dropped_values(old: &OldRow, new: &PlcConnection) -> Vec<String> {
 /// 移行の直前のバックアップ（§6.4）。完成した `.bak` のパスを返す。手順は
 /// `banto_tags::upgrade::backup_before_0025`（ChronoGazer と共有。`pending_changes` を持つ
 /// Hub では、キューのペイロードの `password` も除く）。
-pub async fn backup_before_0025(
+pub async fn backup_before_0025<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
 ) -> Result<PathBuf, UpgradeError> {
-    Ok(banto_tags::upgrade::backup_before_0025(pool, db_path).await?)
+    Ok(banto_tags::upgrade::backup_before_0025(pool, place).await?)
 }
 
 /// [`backup_before_0025`] の本体。`crash_after` の工程に来たら、作りかけを**残したまま**
 /// 失敗で返る（プロセスが落ちたのと同じ。テストだけが使う）。
 #[cfg(test)]
-pub(crate) async fn backup_with(
+pub(crate) async fn backup_with<'a>(
     pool: &SqlitePool,
-    db_path: &Path,
+    place: impl Into<Place<'a>>,
     crash_after: Option<BackupStep>,
 ) -> Result<PathBuf, UpgradeError> {
-    Ok(banto_tags::upgrade::backup_with(pool, db_path, crash_after).await?)
+    Ok(banto_tags::upgrade::backup_with(pool, place, crash_after).await?)
 }
 
 // ---- 起動時の整合の確認（§5.3 の最後の行） ------------------------------------------------

@@ -25,6 +25,11 @@ serde = { workspace = true }
 # `upgrade.rs`: the error type of the pre-0025 backup (shared by banto-hub and ChronoGazer).
 thiserror = { workspace = true }
 serde_json = { workspace = true }
+# #623 PR3b: `upgrade.rs` がサービスの置き場（握ったフォルダ `ManagedDir`）で、0025 の前の
+# 作りかけのバックアップ・予行の写しを辿らず・握って扱う。既定の feature だけ（`sqlite` は
+# 使わない）。本番の依存は thiserror・windows-sys（どちらも既にある版）で、Cargo.lock に新しい
+# package は増えない。safe-root は banto-tags に依存しないので循環しない。
+banto-safe-root = { path = "../banto-safe-root" }
 # R2b-1d (docs/banto-hub-connection-settings-design.md §5.2・§5.3): the sealed secret rows
 # (`plc_connection_secrets.blob`) are carried in `Zeroizing` - a `plain-v1` blob is the
 # plaintext itself. Already in the workspace (banto-secret-store, banto-hub-core), so

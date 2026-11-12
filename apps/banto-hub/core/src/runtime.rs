@@ -487,8 +487,18 @@ impl HubRuntime {
         // `drivers` を `HubSessions` へ渡す前に写しておく（予行の preflight・入口の
         // `with_registry`・予約接続が使う）。
         let registry = drivers.registry.clone();
-        let pool = match &db_pins {
-            Some(pinned) => init_db_pinned(pinned, &registry).await,
+        // #623 PR3b: 握った組なら、0025 の前の一時ファイルも握った `config` のハンドル基準で扱う
+        // （`db_pins` が `Some` なのは `given_dirs` が `Some` のときだけ）。
+        let pool = match db_pins.as_ref().zip(given_dirs.as_ref()) {
+            Some((pinned, dirs)) => {
+                init_db_pinned(
+                    pinned,
+                    &dirs.config,
+                    dirs.checked_access.as_ref(),
+                    &registry,
+                )
+                .await
+            }
             None => init_db_with_registry(&db_path, &registry).await,
         }
         .map_err(|err| match err {
