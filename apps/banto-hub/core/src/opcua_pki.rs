@@ -697,8 +697,8 @@ mod imp {
     fn effective_uid() -> Result<u32, String> {
         use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
         let fail = |reason: &str| format!("実行している利用者の UID を読めません（{reason}）");
-        let pid = sysinfo::get_current_pid().map_err(fail)?;
-        let mut system = System::new();
+        let pid = sysinfo::get_current_pid().map_err(|err| fail(&err.to_string()))?;
+        let mut system = System::new().map_err(|err| fail(&err.to_string()))?;
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),
             false,
