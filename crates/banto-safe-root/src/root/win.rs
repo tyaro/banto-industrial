@@ -262,6 +262,9 @@ pub(super) fn remove(dir: &PinnedDir, display: &Path, name: &str) -> Result<bool
 /// [`ManagedDir::rename_no_replace`] の Guarded。`from` を削除の権利で相対に開き、開いた後の
 /// ハンドルで確かめて（reparse point・フォルダ・リンク数 1 でない・印の席は断る）、握った
 /// フォルダ基準で `to` へ**置き換えずに**付け替える。`from` が無ければ `Ok(false)`。
+/// `to` が `from` と同じファイルを指す名前（同じ綴り・大文字小文字違い・8.3 短縮名）だと OS の
+/// 付け替えは成功しうるので、付け替えの前に `to` を属性だけで開いて同一性を見て、同じなら
+/// AlreadyExists で断る（Plain と同じ契約）。違うファイルが在れば OS が断る。
 pub(super) fn rename_no_replace(
     dir: &PinnedDir,
     display: &Path,
@@ -278,6 +281,14 @@ pub(super) fn rename_no_replace(
     if let Some(slot) = crate::acl::imp::marker_entry(dir.raw_handle())? {
         if slot.file_id == crate::acl::imp::file_id_of(handle.raw())? {
             return Err(super::invalid_name());
+        }
+    }
+    if let Some(dest) = child_relative(dir, to, ChildHow::OpenAttributes)? {
+        if crate::acl::imp::file_id_of(dest.raw())? == crate::acl::imp::file_id_of(handle.raw())? {
+            return Err(SafeRootError::io(
+                IoOp::RenameFile,
+                &std::io::Error::from(std::io::ErrorKind::AlreadyExists),
+            ));
         }
     }
     handle_io::rename_no_replace(handle.raw(), dir.raw_handle(), to)?;

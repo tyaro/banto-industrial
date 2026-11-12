@@ -523,6 +523,19 @@ fn plain_rename_no_replace_moves_but_never_replaces() {
     assert_eq!(std::fs::read(p("b.partial")).unwrap(), b"BBB");
     assert_eq!(std::fs::read(p("a.bak")).unwrap(), b"AAA");
 
+    let err = d.rename_no_replace("b.partial", "b.partial").unwrap_err();
+    assert!(
+        matches!(
+            err,
+            SafeRootError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(p("b.partial")).unwrap(), b"BBB");
+
     assert!(!d.rename_no_replace("absent", "c").unwrap());
     assert!(!p("c").exists());
     for (from, to) in [

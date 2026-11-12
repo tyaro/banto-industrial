@@ -1734,6 +1734,45 @@ fn rename_no_replace_never_replaces_the_destination() {
     assert_eq!(snapshot(outside.path()), before, "外が変わった");
 }
 
+/// `to` が `from` と同じファイルを指す名前（同じ綴り・大文字小文字違い・8.3 短縮名）でも
+/// AlreadyExists で断り、元の綴りと中身が変わらない。
+#[test]
+fn rename_no_replace_refuses_a_name_for_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    let long = d.final_path().join("file.partial");
+    std::fs::write(&long, b"SAME").unwrap();
+    let mut names = vec!["file.partial".to_owned(), "FILE.PARTIAL".to_owned()];
+    match crate::root::tests::short_path(&long) {
+        Some(short) => names.push(short.file_name().unwrap().to_str().unwrap().to_owned()),
+        None => eprintln!("skip: 8.3 の短縮名が作られないボリューム"),
+    }
+    eprintln!("names: {names:?}");
+    for to in &names {
+        let err = d.rename_no_replace("file.partial", to).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SafeRootError::Io {
+                    kind: std::io::ErrorKind::AlreadyExists,
+                    ..
+                }
+            ),
+            "{to}: {err:?}"
+        );
+        let spelled: Vec<String> = std::fs::read_dir(d.final_path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            spelled.contains(&"file.partial".to_owned()),
+            "{to}: {spelled:?}"
+        );
+        assert_eq!(std::fs::read(&long).unwrap(), b"SAME");
+    }
+}
+
 /// 元が無ければ `Ok(false)`、ハードリンク（リンク数 2）・ジャンクション・フォルダの元は断る。
 #[test]
 fn rename_no_replace_refuses_bad_sources() {
