@@ -698,7 +698,9 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 		await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
 		const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
 		await expect(trend).toBeVisible({ timeout: 20_000 });
-		const yTicks = trend.locator('.chart-host svg text.y-tick');
+		// banto v7.0.0 の @banto/charts は文字サイズを測る隠しの <text data-banto-font-probe>（中身は '0'）を
+		// 目盛と同じクラスで足すので、目盛の文字を見るときは外す。
+		const yTicks = trend.locator('.chart-host svg text.y-tick:not([data-banto-font-probe])');
 		await expect
 			.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 				timeout: 30_000
@@ -762,7 +764,7 @@ test.describe.serial('chronogazer 監視画面（R1-D の D-1・D-2）', () => {
 			await page.goto(`/monitor?group=${groupIds[GROUP_BIT_TREND]}`);
 			const trend = panel().getByRole('region', { name: `${GROUP_BIT_TREND} のトレンド表示` });
 			await expect(trend).toBeVisible({ timeout: 20_000 });
-			const yTicks = trend.locator('.chart-host svg text.y-tick');
+			const yTicks = trend.locator('.chart-host svg text.y-tick:not([data-banto-font-probe])');
 			await expect
 				.poll(async () => (await yTicks.allTextContents()).map((t) => t.trim()), {
 					timeout: 30_000

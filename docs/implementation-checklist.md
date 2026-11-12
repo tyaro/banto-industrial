@@ -107,6 +107,7 @@
 - [ ] **受入スクリプトの観測が空のとき、「期待と違わない」として通さない**。`Get-Acl`・`icacls`・`sc sdshow` の失敗や空の出力は例外にする。空のままだと「Administrators でない」「変わっていない」という誤った判定になる（#973 Hub 受入、#1084）。
 - [ ] **Hub の `/api/auth/*` は CSRF のミドルウェアの内側にあり、GET・POST とも `X-Banto-Client` ヘッダーが要る**。受入スクリプトや curl で叩くときは付ける（#973 Hub 受入、#1084）。
 
+- [ ] **banto の部品の DOM をクラスで数える・読むセレクタは、banto を上げると壊れる**。v7.0.0 の `@banto/charts` は文字サイズを測る隠しの `<text data-banto-font-probe>`（中身は `'0'`）を目盛と同じ `y-tick` のクラスで足すので、`text.y-tick` が `"0"` を拾った。`:not([data-banto-font-probe])` で外す。banto を上げる PR では E2E の結果を必ず見る（#1103、2026-11-12）。
 - [ ] `BantoGrid` は行を仮想化していて **CI の描画窓は 20 行**。行を名前でクリックする前に検索ボックスかツリーで絞る。
 - [ ] フィクスチャは `beforeAll` の先頭と `afterAll` の両方で掃除する（banto-hub は `banto-hub-fixture-cleanup.ts` の `cleanupFixtures`）。
 - [ ] **スペックのファイル名は辞書順が実行順**。初回セットアップを行う `*smoke*` より後に来る名前にする（`workers: 1` / `fullyParallel: false`）。
