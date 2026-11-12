@@ -72,6 +72,7 @@
 	import { listPendingChanges, type PendingChange } from '#lib/banto/pendingChangesAdmin.js';
 	import { pendingCreateNames } from '#lib/banto/pendingCreateNames.js';
 	import { isFormDirty } from '#lib/banto/formDirty.js';
+	import { dottedNameError } from '#lib/banto/dottedName.js';
 	import {
 		createCollectionGroup,
 		deleteCollectionGroup,
@@ -385,6 +386,9 @@
 	 */
 	function validateBeforeSubmit(): boolean {
 		const fieldErrors = validateQuerySql(form, selectedIsDbSource);
+		// グループ名の `.`（`dottedName.ts`）。名前を変えない更新は通す。
+		const nameError = dottedNameError(form.name, 'グループ名', group?.name);
+		if (nameError !== null) fieldErrors.name = nameError;
 		if (Object.keys(fieldErrors).length === 0) return true;
 		errors = fieldErrors;
 		const target = stepForFieldErrors(fieldErrors);

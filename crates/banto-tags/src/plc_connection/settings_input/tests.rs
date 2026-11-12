@@ -445,3 +445,81 @@ async fn omitted_simulation_is_retained_by_settings_update() {
         .unwrap();
     assert!(!explicit.simulation);
 }
+
+/// 接続名に `.` は使えない（2026-11-12 オーナー決定）: 機器のドライバ・ホスト提供
+/// （postgres）・未適用キューの前の検査（作成）のどれも `name` のフィールドエラーで断る。
+#[tokio::test]
+async fn a_dotted_connection_name_is_refused_on_every_create_path() {
+    let svc = service().await;
+    let dotted = input("Line.1", "plain", json!({"host": "h"}));
+    let expected = (
+        "name".to_string(),
+        "接続名に「.」は使えません（外部名「接続.グループ.タグ」の区切りに使うため）".to_string(),
+    );
+    assert_eq!(
+        errors(svc.check_settings_input(&dotted).unwrap_err()),
+        std::slice::from_ref(&expected)
+    );
+    assert_eq!(
+        errors(svc.create_settings(dotted).await.unwrap_err()),
+        [expected]
+    );
+
+    let mut pg = input(
+        " PG.1 ",
+        "postgres",
+        json!({"host": "db", "port": 5432, "database": "d", "username": "u"}),
+    );
+    pg.secrets.insert("password".into(), set(REF_A));
+    assert_eq!(fields(svc.create_settings(pg).await.unwrap_err()), ["name"]);
+    // Tag names keep their dots; a dot-free connection name still creates.
+    svc.create_settings(input("Line1", "plain", json!({"host": "h"})))
+        .await
+        .unwrap();
+}
+
+/// 規則より前に作られた `.` を含む接続は一覧・取得でき、名前を変えない更新（他の項目の
+/// 編集）は通る。`.` を含む名前への改名は断る（適用時・キューの前の検査とも）。
+#[tokio::test]
+async fn an_existing_dotted_connection_keeps_its_name_but_cannot_be_renamed_to_a_dot() {
+    let svc = service().await;
+    let created = svc
+        .create_settings(input("Line1", "plain", json!({"host": "h"})))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE plc_connections SET name = 'Old.Line' WHERE id = ?")
+        .bind(created.id)
+        .execute(&svc.pool)
+        .await
+        .unwrap();
+    let listed = svc.list(banto_core::ListParams::default()).await.unwrap();
+    assert!(listed.rows.iter().any(|c| c.name == "Old.Line"));
+
+    let keep = input("Old.Line", "plain", json!({"host": "h2"}));
+    svc.check_settings_update(created.id, keep.clone())
+        .await
+        .unwrap();
+    let updated = svc.update_settings(created.id, keep).await.unwrap();
+    assert_eq!(updated.name, "Old.Line");
+    assert_eq!(updated.setting_str("host"), Some("h2"));
+
+    let rename = input("New.Line", "plain", json!({"host": "h2"}));
+    assert_eq!(
+        fields(
+            svc.check_settings_update(created.id, rename.clone())
+                .await
+                .unwrap_err()
+        ),
+        ["name"]
+    );
+    assert_eq!(
+        fields(svc.update_settings(created.id, rename).await.unwrap_err()),
+        ["name"]
+    );
+    // Renaming away from the dot is fine.
+    let renamed = svc
+        .update_settings(created.id, input("NewLine", "plain", json!({"host": "h2"})))
+        .await
+        .unwrap();
+    assert_eq!(renamed.name, "NewLine");
+}

@@ -19,6 +19,35 @@ pub(crate) fn range_message(min: i64, max: i64) -> String {
     format!("{min}〜{max}の範囲で入力してください")
 }
 
+/// 接続名・グループ名に `.` を使えない規則（2026-11-12 オーナー決定、#635 の続き）。
+/// Hub の外部名は `接続.グループ.タグ` なので、接続名・グループ名に `.` が無ければ
+/// 外部名は最初の 2 つの `.` で一意に分けられる（タグ名の `.` は引き続き使える）。
+///
+/// `stored_name` は更新で上書きされる行の今の名前（作成は `None`）。名前を変えない
+/// 更新は、この規則より前に作られたドットを含む名前のままでも通す（既存の DB を
+/// 拒否しない）。検査は前後の空白を除いた名前（保存される値）で行う。
+pub(crate) fn dotted_name_error(
+    name: &str,
+    stored_name: Option<&str>,
+    label: &str,
+) -> Option<FieldError> {
+    let trimmed = name.trim();
+    if !trimmed.contains('.') || stored_name.is_some_and(|stored| stored.trim() == trimmed) {
+        return None;
+    }
+    Some(FieldError {
+        field: "name".to_string(),
+        message: format!(
+            "{label}に「.」は使えません（外部名「接続.グループ.タグ」の区切りに使うため）"
+        ),
+    })
+}
+
+/// [`dotted_name_error`] の `label`（接続）。
+pub(crate) const CONNECTION_NAME_LABEL: &str = "接続名";
+/// [`dotted_name_error`] の `label`（収集グループ）。
+pub(crate) const GROUP_NAME_LABEL: &str = "グループ名";
+
 /// UNIQUE-violation message for entities whose `name` stays globally unique
 /// (`plc_connections` only, since migration 0022 made `collection_groups.name`
 /// unique per connection - that module has its own scoped message,

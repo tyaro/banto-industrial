@@ -171,8 +171,11 @@ impl PlcConnectionService {
     /// キューに残さない）。DB には触らない。ホストの接続（push・postgres など）は適用時の
     /// 平らな検証（`validate_plc_connection_input`。`push` の `settings` の中身も含む）も通す。
     /// 機器のドライバの必須の秘密の欠けは、更新で保存済みを保つ場合があるので見ない。
+    ///
+    /// 作成として検査する（接続名の `.` も断る。更新は [`Self::check_settings_update`]）。
     pub fn check_settings_input(&self, input: &ConnectionSettingsInput) -> Result<(), BantoError> {
-        self.checked_host_input(input.clone()).map(|_| ())
+        self.checked_host_input(input.clone())?;
+        super::reject_dotted_name(&input.name, None)
     }
 
     fn checked_host_input(
@@ -195,7 +198,18 @@ impl PlcConnectionService {
         id: i64,
         input: ConnectionSettingsInput,
     ) -> Result<(), BantoError> {
-        let Some(flat) = self.checked_host_input(input)? else {
+        let name = input.name.clone();
+        let flat = self.checked_host_input(input)?;
+        // 接続名の `.`: 名前を変えない更新は通す（[`super::reject_dotted_name`]）。
+        if name.trim().contains('.') {
+            match self.get(id).await {
+                Ok(existing) => super::reject_dotted_name(&name, Some(&existing.name))?,
+                // 対象が無ければ適用時に対象の有無を判定する。
+                Err(BantoError::NotFound { .. }) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        let Some(flat) = flat else {
             return Ok(());
         };
         if flat.protocol != POSTGRES_PROTOCOL {

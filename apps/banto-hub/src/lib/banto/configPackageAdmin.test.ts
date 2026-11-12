@@ -1540,3 +1540,42 @@ describe('秘密の欄が null のパッケージは書き込みの前に断る�
 		});
 	}
 });
+
+describe('applyConfigPackage / inspectConfigPackage: 接続名・グループ名の「.」（2026-11-12 オーナー決定）', () => {
+	function dottedPackage(connectionName: string, groupName: string): ConfigPackage {
+		return {
+			...pkg,
+			plcConnections: [{ ...pkg.plcConnections[0], name: connectionName }],
+			collectionGroups: [
+				{ ...pkg.collectionGroups[0], name: groupName, plcConnectionName: connectionName }
+			],
+			tags: [],
+			sinkGroups: []
+		};
+	}
+
+	it('新しく作る「.」を含む接続・グループは、確認の画面でも書き込みでも名前を示して断り、何も送らない', async () => {
+		const dotted = dottedPackage('plc.1', 'fast.1');
+		const expected =
+			/接続 'plc\.1': 接続名に「\.」は使えません.*収集グループ 'plc\.1 \/ fast\.1': グループ名に「\.」は使えません/;
+		await expect(inspectConfigPackage(dotted)).rejects.toThrow(expected);
+		await expect(applyConfigPackage(dotted)).rejects.toThrow(expected);
+		expect(createPlcConnection).not.toHaveBeenCalled();
+		expect(updatePlcConnection).not.toHaveBeenCalled();
+		expect(createCollectionGroup).not.toHaveBeenCalled();
+	});
+
+	it('既存と同じ名前（規則より前の「.」を含む名前）の接続・グループは更新として通す', async () => {
+		const conn = plcConnection(1, 'plc.1');
+		const group = collectionGroup(2, 'fast.1', 1);
+		vi.mocked(listPlcConnections).mockResolvedValue([conn]);
+		vi.mocked(listCollectionGroups).mockResolvedValue([group]);
+		vi.mocked(updatePlcConnection).mockResolvedValue(conn);
+		vi.mocked(updateCollectionGroup).mockResolvedValue(group);
+		await applyConfigPackage(dottedPackage('plc.1', 'fast.1'));
+		expect(updatePlcConnection).toHaveBeenCalledTimes(1);
+		expect(updateCollectionGroup).toHaveBeenCalledTimes(1);
+		expect(createPlcConnection).not.toHaveBeenCalled();
+		expect(createCollectionGroup).not.toHaveBeenCalled();
+	});
+});
