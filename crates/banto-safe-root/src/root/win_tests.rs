@@ -1678,3 +1678,163 @@ fn pin_file_checked_in_the_operating_shape() {
         Err(SafeRootError::AclMismatch(_))
     ));
 }
+
+/// `rename_no_replace`（#623 PR3a）: 普通のファイルが付け替わり、中身が同じ。元の名前は消える。
+#[test]
+fn rename_no_replace_moves_a_plain_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    std::fs::write(d.final_path().join("a.partial"), b"AAA").unwrap();
+    assert!(d.rename_no_replace("a.partial", "a.bak").unwrap());
+    assert!(!d.final_path().join("a.partial").exists());
+    assert_eq!(std::fs::read(d.final_path().join("a.bak")).unwrap(), b"AAA");
+}
+
+/// 宛先に普通のファイルがあれば失敗し（AlreadyExists）、両方の中身が変わらない。宛先がジャンクション
+/// でも失敗し、ジャンクションも外も変わらない。
+#[test]
+fn rename_no_replace_never_replaces_the_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outside, _victim) = outside_with_victim();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    let p = |n: &str| d.final_path().join(n);
+    std::fs::write(p("from"), b"FROM").unwrap();
+    std::fs::write(p("dest"), b"DEST").unwrap();
+    let err = d.rename_no_replace("from", "dest").unwrap_err();
+    eprintln!("rename_no_replace onto a file: {err:?}");
+    assert!(
+        matches!(
+            err,
+            SafeRootError::Io {
+                kind: std::io::ErrorKind::AlreadyExists,
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(p("from")).unwrap(), b"FROM");
+    assert_eq!(std::fs::read(p("dest")).unwrap(), b"DEST");
+
+    junction(&p("j"), outside.path());
+    let before = snapshot(outside.path());
+    let err = d.rename_no_replace("from", "j").unwrap_err();
+    eprintln!("rename_no_replace onto a junction: {err:?}");
+    assert!(matches!(err, SafeRootError::Io { .. }), "{err:?}");
+    assert_eq!(std::fs::read(p("from")).unwrap(), b"FROM");
+    assert!(
+        std::fs::symlink_metadata(p("j"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+            || std::fs::symlink_metadata(p("j")).unwrap().is_dir(),
+        "ジャンクションが消えた"
+    );
+    assert_eq!(snapshot(outside.path()), before, "外が変わった");
+}
+
+/// `to` が `from` と同じファイルを指す名前（同じ綴り・大文字小文字違い・8.3 短縮名）でも
+/// AlreadyExists で断り、元の綴りと中身が変わらない。
+#[test]
+fn rename_no_replace_refuses_a_name_for_the_same_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    let long = d.final_path().join("file.partial");
+    std::fs::write(&long, b"SAME").unwrap();
+    let mut names = vec!["file.partial".to_owned(), "FILE.PARTIAL".to_owned()];
+    match crate::root::tests::short_path(&long) {
+        Some(short) => names.push(short.file_name().unwrap().to_str().unwrap().to_owned()),
+        None => eprintln!("skip: 8.3 の短縮名が作られないボリューム"),
+    }
+    eprintln!("names: {names:?}");
+    for to in &names {
+        let err = d.rename_no_replace("file.partial", to).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SafeRootError::Io {
+                    kind: std::io::ErrorKind::AlreadyExists,
+                    ..
+                }
+            ),
+            "{to}: {err:?}"
+        );
+        let spelled: Vec<String> = std::fs::read_dir(d.final_path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert!(
+            spelled.contains(&"file.partial".to_owned()),
+            "{to}: {spelled:?}"
+        );
+        assert_eq!(std::fs::read(&long).unwrap(), b"SAME");
+    }
+}
+
+/// 元が無ければ `Ok(false)`、ハードリンク（リンク数 2）・ジャンクション・フォルダの元は断る。
+#[test]
+fn rename_no_replace_refuses_bad_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let (outside, victim) = outside_with_victim();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    let p = |n: &str| d.final_path().join(n);
+    assert!(!d.rename_no_replace("absent", "x").unwrap());
+
+    std::fs::hard_link(&victim, p("hard")).unwrap();
+    assert_eq!(
+        refusal_of(&d.rename_no_replace("hard", "x").unwrap_err()),
+        &Refusal::HardLinked { links: 2 }
+    );
+    assert!(p("hard").exists() && !p("x").exists());
+
+    junction(&p("j"), outside.path());
+    assert_eq!(
+        refusal_of(&d.rename_no_replace("j", "x").unwrap_err()),
+        &Refusal::ReparsePoint {
+            tag: TAG_MOUNT_POINT
+        }
+    );
+    std::fs::create_dir(p("sub")).unwrap();
+    assert_eq!(
+        refusal_of(&d.rename_no_replace("sub", "x").unwrap_err()),
+        &Refusal::NotAFile
+    );
+    assert!(!p("x").exists());
+    assert_eq!(std::fs::read(&victim).unwrap(), VICTIM);
+}
+
+/// 印のファイル名が `from` でも `to` でも断る（綴り違いも）。
+#[test]
+fn rename_no_replace_refuses_the_marker_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = open_root(&guarded(dir.path().join("root"))).unwrap();
+    let d = root.as_dir();
+    std::fs::write(d.final_path().join("f"), b"F").unwrap();
+    for (from, to) in [
+        (crate::mode::MARKER_NAME, "x"),
+        (".BANTO-SAFE-ROOT", "x"),
+        ("f", crate::mode::MARKER_NAME),
+        ("f", ".BANTO-SAFE-ROOT"),
+    ] {
+        assert!(d.rename_no_replace(from, to).is_err(), "{from} {to}");
+    }
+    assert_eq!(std::fs::read(d.final_path().join("f")).unwrap(), b"F");
+}
+
+/// `_checked` 版は、フォルダの記述子が `expected` と合わなければ付け替えずに断り、合えば付け替える。
+#[test]
+fn rename_no_replace_checked_refuses_when_the_dir_does_not_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let (root, access) = modify_root(dir.path());
+    let d = root.as_dir();
+    std::fs::write(d.final_path().join("f"), b"F").unwrap();
+    let readers = DirAccess::with_readers([me()]);
+    let err = d.rename_no_replace_checked("f", "g", &readers).unwrap_err();
+    assert!(matches!(err, SafeRootError::AclMismatch(_)), "{err:?}");
+    assert!(d.final_path().join("f").exists() && !d.final_path().join("g").exists());
+    assert!(d.rename_no_replace_checked("f", "g", &access).unwrap());
+    assert!(d.final_path().join("g").exists());
+}

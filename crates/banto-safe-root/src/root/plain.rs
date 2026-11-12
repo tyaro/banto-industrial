@@ -207,6 +207,33 @@ pub(super) fn remove(dir: &Path, name: &str) -> Result<bool> {
     }
 }
 
+/// [`ManagedDir::rename_no_replace`] の Plain。`from` が無ければ `Ok(false)`、`to` が（リンクを
+/// 辿らずに見て）在れば AlreadyExists の io エラー、無ければ `std::fs::rename`。Plain は
+/// リンクを辿る・確かめない位置づけで、**`to` の確かめと付け替えの間に別の主体が `to` を作る
+/// 競合は残る**（その場合は置き換わりうる）。
+pub(super) fn rename_no_replace(dir: &Path, from: &str, to: &str) -> Result<bool> {
+    check_name(from)?;
+    check_name(to)?;
+    let from_path = dir.join(from);
+    let to_path = dir.join(to);
+    match std::fs::symlink_metadata(&from_path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io(IoOp::RenameFile)(e)),
+    }
+    match std::fs::symlink_metadata(&to_path) {
+        Ok(_) => {
+            return Err(io(IoOp::RenameFile)(std::io::Error::from(
+                std::io::ErrorKind::AlreadyExists,
+            )))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(io(IoOp::RenameFile)(e)),
+    }
+    std::fs::rename(&from_path, &to_path).map_err(io(IoOp::RenameFile))?;
+    Ok(true)
+}
+
 pub(super) fn list(dir: &Path) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
     for item in std::fs::read_dir(dir).map_err(io(IoOp::ListDir))? {

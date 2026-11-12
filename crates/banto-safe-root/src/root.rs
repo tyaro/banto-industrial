@@ -746,6 +746,51 @@ impl ManagedDir {
         }
     }
 
+    /// 名前 1 要素のファイル `from` を、同じフォルダの中の `to` へ、**辿らずに開いて・置き換えずに**
+    /// 付け替える（`from` が無ければ `Ok(false)`）。用途: 作りかけの名前で書き終えたファイルを
+    /// 完成の名前に付け替える（0025 移行前の `.bak`、#623 PR3b）。
+    ///
+    /// Guarded は `from` を削除の権利で握ったフォルダ基準に開き、**開いた後のハンドルで**
+    /// reparse point・フォルダ・リンク数 1 でないを確かめて [`SafeRootError::Refused`]（印の席も
+    /// 断る）、付け替えも開いたハンドルで、宛先は握ったこのフォルダのハンドル基準に行う（パスを
+    /// 解決し直さない）。**置き換えない**: `to` が既にあれば（普通のファイル・フォルダ・
+    /// ジャンクション・シンボリックリンクのどれでも）何も変えずに [`SafeRootError::Io`] で失敗する
+    /// （[`ManagedDir::write_atomic`] のように宛先を先に確かめる必要がないのもそのため）。
+    /// `to` が `from` と同じファイルを指す名前（綴り・大文字小文字違い・8.3 短縮名）でも
+    /// AlreadyExists で失敗する。
+    /// `from` の中身は確かめない。印のファイル（[`crate::mode::MARKER_NAME`]）は綴りの大文字小文字を
+    /// 問わず `from`・`to` のどちらでも断る。
+    ///
+    /// **残留**: 呼ぶ側が `from` を握っていた（[`PinnedName`]）なら、その握りを離してからこれを呼ぶ
+    /// までの間は塞がらない（運用モードの ACL で利用者がこの木に名前を作れないことに頼る）。
+    /// Plain は確かめず（`to` の有無だけ見て `std::fs::rename`）、確かめと付け替えの間の競合は残る。
+    pub fn rename_no_replace(&self, from: &str, to: &str) -> Result<bool> {
+        for name in [from, to] {
+            if !guard::is_plain_child_name(name)
+                || name.eq_ignore_ascii_case(crate::mode::MARKER_NAME)
+            {
+                return Err(invalid_name());
+            }
+        }
+        match &self.inner {
+            #[cfg(windows)]
+            Inner::Guarded(pinned) => win::rename_no_replace(pinned, &self.display, from, to),
+            Inner::Plain => plain::rename_no_replace(&self.final_path, from, to),
+        }
+    }
+
+    /// [`ManagedDir::rename_no_replace`] に、握ったフォルダの記述子の確かめ直し
+    /// （[`ManagedDir::recheck`]。[`ManagedDir::pin_file_checked`] と同じ失敗の返し方）を足したもの。
+    pub fn rename_no_replace_checked(
+        &self,
+        from: &str,
+        to: &str,
+        expected: &DirAccess,
+    ) -> Result<bool> {
+        self.recheck_as_error(expected)?;
+        self.rename_no_replace(from, to)
+    }
+
     /// [`ManagedDir::recheck`] の失敗を [`SafeRootError`] にする（reparse・フォルダでないは
     /// [`SafeRootError::Refused`]、形は [`SafeRootError::AclMismatch`]）。
     fn recheck_as_error(&self, expected: &DirAccess) -> Result<()> {

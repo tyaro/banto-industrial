@@ -137,6 +137,17 @@ fn io_error(op: IoOp, os_error: u32) -> SafeRootError {
 /// 別名の中身は変わらない。POSIX の付け替えを知らないファイルシステムでは
 /// `FileRenameInformation`（`ReplaceIfExists`）でやり直す。
 pub(crate) fn rename_replace(handle: HANDLE, dir: HANDLE, name: &str) -> Result<()> {
+    rename_in(handle, dir, name, true)
+}
+
+/// [`rename_replace`] の**置き換えない**版（`FILE_RENAME_REPLACE_IF_EXISTS` なし、フォールバックは
+/// `ReplaceIfExists = 0`）。宛先の名前が既にあれば（ファイル・フォルダ・ジャンクション・
+/// シンボリックリンクのどれでも）何も変えずに失敗する（`IoOp::RenameFile` の io エラー）。
+pub(crate) fn rename_no_replace(handle: HANDLE, dir: HANDLE, name: &str) -> Result<()> {
+    rename_in(handle, dir, name, false)
+}
+
+fn rename_in(handle: HANDLE, dir: HANDLE, name: &str, replace: bool) -> Result<()> {
     use windows_sys::Wdk::Storage::FileSystem::{
         FileRenameInformation, FileRenameInformationEx, NtSetInformationFile,
         FILE_RENAME_INFORMATION, FILE_RENAME_POSIX_SEMANTICS, FILE_RENAME_REPLACE_IF_EXISTS,
@@ -186,14 +197,17 @@ pub(crate) fn rename_replace(handle: HANDLE, dir: HANDLE, name: &str) -> Result<
             Ok(())
         }
     };
-    match attempt(
-        FileRenameInformationEx,
-        FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS,
-    ) {
+    let ex_flags = if replace {
+        FILE_RENAME_REPLACE_IF_EXISTS | FILE_RENAME_POSIX_SEMANTICS
+    } else {
+        FILE_RENAME_POSIX_SEMANTICS
+    };
+    match attempt(FileRenameInformationEx, ex_flags) {
         Ok(()) => Ok(()),
         Err(e) if is_unsupported_class(e) => {
             // `ReplaceIfExists` は共用体の先頭の bool（1 = 置き換える）。
-            attempt(FileRenameInformation, 1).map_err(|e| io_error(IoOp::RenameFile, e))
+            attempt(FileRenameInformation, u32::from(replace))
+                .map_err(|e| io_error(IoOp::RenameFile, e))
         }
         Err(e) => Err(io_error(IoOp::RenameFile, e)),
     }
