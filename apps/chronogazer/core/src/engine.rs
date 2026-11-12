@@ -856,7 +856,16 @@ impl EngineRuntime {
         // DB スキーマの整理（2026-10-02）: 旧形式の DB は起動を拒否する（自動移行は
         // 無い）。何をすればよいかは `InitDbError::Legacy` の文言にある。
         let opened = match db_pins.pinned() {
-            Some(pinned) => crate::db::init_db_pinned(pinned).await,
+            // #623 PR3b: 0025 の前の一時ファイルも握ったルートのハンドル基準で扱う。`pin_db` が
+            // 握るのは `service_data_root` があり `DbPin::InRoot` のときだけ。
+            Some(pinned) => match (cfg.service_data_root.as_deref(), &cfg.db_pin) {
+                (Some(root), DbPin::InRoot { expected }) => {
+                    crate::db::init_db_pinned(pinned, root.as_dir(), expected.as_ref()).await
+                }
+                _ => Err(InitDbError::Storage(BantoError::Storage(
+                    "設定 DB を握ったルートのハンドルがありません".to_string(),
+                ))),
+            },
             None => init_db(&cfg.db_path).await,
         };
         let pool = match opened {

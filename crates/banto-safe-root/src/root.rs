@@ -56,8 +56,12 @@
 //!   SQLite の DB は `sqlite` feature の `ManagedDir::pin_sqlite`（`crate::sqlite`。#623 PR2a）が、
 //!   本体・`-wal`・`-shm` を握り、接続ごとに `SQLITE_FCNTL_PERSIST_WAL` を立てて開く
 //!   （`-journal` は握らず作らず、在ればリンクでないかを確かめた時点まで）。使っているのは
-//!   banto-hub のサービスの設定 DB だけ（ChronoGazer のサービスは次の PR。sidecar・0025 の `.bak`・
-//!   tstore・banto の BackupService・監査の保留は [`ManagedDir::reopen_path`] などパスのまま）。
+//!   banto-hub と ChronoGazer のサービスの設定 DB（#623 PR2a・PR2b）。その DB の横に作る 0025 の
+//!   前の作りかけのバックアップ・予行の写しは、[`ManagedDir::pin_file_checked`] で空のまま作って
+//!   握ったまま `VACUUM INTO` の宛先にし（写しは `journal_mode=MEMORY` で開き、`-journal` を作ら
+//!   ない）、閉じて離してから [`ManagedDir::rename_no_replace_checked`]
+//!   で付け替える・[`ManagedDir::remove`] で消す（`banto_tags::upgrade`、#623 PR3b）。sidecar・
+//!   tstore・banto の BackupService・監査の保留は [`ManagedDir::reopen_path`] などパスのまま。
 //!
 //! そこを守るのは運用モードのルート全体の ACL（PR-1c・PR-3/5）と、途中のジャンクションへの
 //! 保険の Redirection Guard（[`crate::redirection`]）。
@@ -748,7 +752,7 @@ impl ManagedDir {
 
     /// 名前 1 要素のファイル `from` を、同じフォルダの中の `to` へ、**辿らずに開いて・置き換えずに**
     /// 付け替える（`from` が無ければ `Ok(false)`）。用途: 作りかけの名前で書き終えたファイルを
-    /// 完成の名前に付け替える（0025 移行前の `.bak`、#623 PR3b）。
+    /// 完成の名前に付け替える（0025 移行前の `.bak`。`banto_tags::upgrade` が使う、#623 PR3b）。
     ///
     /// Guarded は `from` を削除の権利で握ったフォルダ基準に開き、**開いた後のハンドルで**
     /// reparse point・フォルダ・リンク数 1 でないを確かめて [`SafeRootError::Refused`]（印の席も

@@ -191,15 +191,33 @@ pub async fn init_db_with_registry(
 /// （呼ぶ側の責任）。`Err` のときは開いた接続をすべて閉じ終えてから返す（`connect` の
 /// 失敗は pool を返さず、その probe の接続は `PinnedSqlite::connect` が閉じる。`init_db_on`
 /// の失敗は pool を閉じてから返る）ので、`pinned` はすぐ離してよい。
+///
+/// `dir` は `pinned` を握ったフォルダ（profile の `config`）、`expected` はその運用モードの形
+/// （`ProfileDirs::checked_access`）。0025 の前の残り物の掃除・予行の写し・作りかけの
+/// バックアップは、パスで開かずに `dir` のハンドル基準で扱う（`banto_tags::upgrade::Place::Managed`、
+/// #623 PR3b。`expected` が `Some` なら `_checked` 版）。
 pub async fn init_db_pinned(
     pinned: &banto_safe_root::sqlite::PinnedSqlite,
+    dir: &banto_safe_root::ManagedDir,
+    expected: Option<&banto_safe_root::DirAccess>,
     registry: &std::sync::Arc<banto_driver_api::DriverRegistry>,
 ) -> Result<SqlitePool, InitDbError> {
+    let db_name = pinned
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BantoError::Storage(format!(
+                "設定 DB のファイル名を読めません: {}",
+                pinned.path().display()
+            ))
+        })?;
     let pool = pinned
         .connect()
         .await
         .map_err(banto_storage::storage_error)?;
-    init_db_on(pool, pinned.path(), Some(registry)).await
+    let place = banto_tags::upgrade::Place::managed(dir, db_name, expected);
+    init_db_on(pool, place, Some(registry)).await
 }
 
 async fn init_db_inner(
@@ -207,7 +225,7 @@ async fn init_db_inner(
     registry: Option<&std::sync::Arc<banto_driver_api::DriverRegistry>>,
 ) -> Result<SqlitePool, InitDbError> {
     let pool = banto_storage::connect_sqlite(path).await?;
-    init_db_on(pool, path, registry).await
+    init_db_on(pool, banto_tags::upgrade::Place::Path(path), registry).await
 }
 
 /// 開いた pool で 2-a〜2-c を行う（[`init_db_with_registry`] の doc の手順）。
@@ -216,7 +234,7 @@ async fn init_db_inner(
 /// 失敗を含む）。[`init_db_pinned`] の呼ぶ側は、`Err` を受けたらすぐ握りを離してよい。
 async fn init_db_on(
     pool: SqlitePool,
-    path: &Path,
+    place: banto_tags::upgrade::Place<'_>,
     registry: Option<&std::sync::Arc<banto_driver_api::DriverRegistry>>,
 ) -> Result<SqlitePool, InitDbError> {
     let legacy = match is_legacy_schema(&pool).await {
@@ -229,7 +247,7 @@ async fn init_db_on(
     if legacy {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {
-            path: path.to_path_buf(),
+            path: place.db_path(),
         }));
     }
     if let Err(err) = run_hub_migrations(&pool).await {
@@ -237,7 +255,7 @@ async fn init_db_on(
         return Err(err.into());
     }
     // 2-b の 1（残り物の掃除）は DB を開く前でもよいが、設計 §6.1 の順（2-a の後）に合わせる。
-    let prepared = match crate::upgrade::remove_leftovers(path) {
+    let prepared = match crate::upgrade::remove_leftovers(place) {
         Ok(removed) => {
             for leftover in removed {
                 crate::hub_log::log_line(&format!(
@@ -245,7 +263,7 @@ async fn init_db_on(
                     leftover.display()
                 ));
             }
-            crate::upgrade::prepare_0025(&pool, path, registry).await
+            crate::upgrade::prepare_0025(&pool, place, registry).await
         }
         Err(err) => Err(err),
     };

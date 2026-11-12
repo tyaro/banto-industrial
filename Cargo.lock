@@ -1172,6 +1172,7 @@ dependencies = [
  "banto-core",
  "banto-driver-api",
  "banto-plc-address",
+ "banto-safe-root",
  "banto-storage",
  "serde",
  "serde_json",

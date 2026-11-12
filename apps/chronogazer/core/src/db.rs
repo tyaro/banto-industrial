@@ -158,7 +158,7 @@ impl From<InitDbError> for BantoError {
 pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> {
     let path = path.as_ref();
     let pool = banto_storage::connect_sqlite(path).await?;
-    init_db_on(pool, path).await
+    init_db_on(pool, banto_tags::upgrade::Place::Path(path)).await
 }
 
 /// [`init_db`] の、握った組（[`banto_safe_root::sqlite::PinnedSqlite`]）で開く版（#623 PR2b。
@@ -169,18 +169,42 @@ pub async fn init_db(path: impl AsRef<Path>) -> Result<SqlitePool, InitDbError> 
 /// 終えてから返す（`connect` の失敗は pool を返さず、その probe の接続は
 /// `PinnedSqlite::connect` が閉じる。[`init_db`] と同じ後半の失敗は pool を閉じてから返る）
 /// ので、`pinned` はすぐ離してよい。
+///
+/// `dir` は `pinned` を握ったフォルダ（サービスのルート）、`expected` はその運用モードの形
+/// （`DbPin::InRoot` の `expected`）。0025 の前の残り物の掃除と作りかけのバックアップは、
+/// パスで開かずに `dir` のハンドル基準で扱う（`banto_tags::upgrade::Place::Managed`、
+/// #623 PR3b。`expected` が `Some` なら `_checked` 版）。
 pub async fn init_db_pinned(
     pinned: &banto_safe_root::sqlite::PinnedSqlite,
+    dir: &banto_safe_root::ManagedDir,
+    expected: Option<&banto_safe_root::DirAccess>,
 ) -> Result<SqlitePool, InitDbError> {
+    let db_name = pinned
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            BantoError::Storage(format!(
+                "設定 DB のファイル名を読めません: {}",
+                pinned.path().display()
+            ))
+        })?;
     let pool = pinned
         .connect()
         .await
         .map_err(banto_storage::storage_error)?;
-    init_db_on(pool, pinned.path()).await
+    init_db_on(
+        pool,
+        banto_tags::upgrade::Place::managed(dir, db_name, expected),
+    )
+    .await
 }
 
 /// [`init_db`]・[`init_db_pinned`] の、pool を開いた後の手順（旧形式の拒否 → migration）。
-async fn init_db_on(pool: SqlitePool, path: &Path) -> Result<SqlitePool, InitDbError> {
+async fn init_db_on(
+    pool: SqlitePool,
+    place: banto_tags::upgrade::Place<'_>,
+) -> Result<SqlitePool, InitDbError> {
     // 失敗して戻る経路では必ず pool を閉じてから返す（#392 の起動時の対処:
     // 戻った直後に DB のファイルの名前を変えることがあり、Windows では開いた
     // ままのハンドルが名前の変更を拒む）。
@@ -194,13 +218,13 @@ async fn init_db_on(pool: SqlitePool, path: &Path) -> Result<SqlitePool, InitDbE
     if legacy {
         pool.close().await;
         return Err(InitDbError::Legacy(LegacyDatabase {
-            path: path.to_path_buf(),
+            path: place.db_path(),
         }));
     }
     // R2b-1d（docs/banto-hub-connection-settings-design.md §6.7）: 戻せない migration 0025
     // （`banto_tags::migrate` に入っている）の前に、残り物の掃除とバックアップ。
     let prepared = match run_app_migrations(&pool).await {
-        Ok(()) => prepare_0025(&pool, path).await,
+        Ok(()) => prepare_0025(&pool, place).await,
         Err(err) => Err(err),
     };
     if let Err(err) = prepared {
@@ -226,10 +250,15 @@ async fn init_db_on(pool: SqlitePool, path: &Path) -> Result<SqlitePool, InitDbE
 /// 失敗は [`InitDbError::Storage`] に包む（他の DB 初期化の失敗と同じ経路:
 /// `EngineStartError::Database` → `startup_recovery::classify` の
 /// `DatabaseUnopenable`）。
-async fn prepare_0025(pool: &SqlitePool, path: &Path) -> Result<(), BantoError> {
+///
+/// 置き場（`banto_tags::upgrade::Place`）はパスか、サービスの握ったルート（#623 PR3b）。
+async fn prepare_0025(
+    pool: &SqlitePool,
+    place: banto_tags::upgrade::Place<'_>,
+) -> Result<(), BantoError> {
     use banto_tags::upgrade;
     let to_err = |err: upgrade::UpgradeError| BantoError::Storage(err.to_string());
-    for leftover in upgrade::remove_leftovers(path).map_err(to_err)? {
+    for leftover in upgrade::remove_leftovers(place).map_err(to_err)? {
         eprintln!(
             "banto: 前回の起動で残った移行の一時ファイルを消しました: {}",
             leftover.display()
@@ -238,7 +267,7 @@ async fn prepare_0025(pool: &SqlitePool, path: &Path) -> Result<(), BantoError> 
     if upgrade::pending_0025(pool).await.map_err(to_err)?
         && upgrade::has_rows_to_protect(pool).await.map_err(to_err)?
     {
-        let backup = upgrade::backup_before_0025(pool, path)
+        let backup = upgrade::backup_before_0025(pool, place)
             .await
             .map_err(to_err)?;
         eprintln!(
@@ -738,6 +767,109 @@ mod tests {
 
         let names = file_names(dir.path());
         assert!(!names.iter().any(|name| name.contains(".bak")), "{names:?}");
+    }
+
+    /// #623 PR3b: 握った組で開く経路（[`init_db_pinned`]）を試す握り方（Plain はどの OS でも、
+    /// Windows は Guarded も）。
+    fn pin_modes() -> Vec<banto_safe_root::Mode> {
+        let mut modes = vec![banto_safe_root::Mode::Plain];
+        if cfg!(windows) {
+            modes.push(banto_safe_root::Mode::Guarded);
+        }
+        modes
+    }
+
+    /// `dir`（既にあるフォルダ）を `mode` で握ったルート。
+    fn root_in(dir: &Path, mode: banto_safe_root::Mode) -> banto_safe_root::SafeRoot {
+        let owners = match mode {
+            #[cfg(windows)]
+            banto_safe_root::Mode::Guarded => {
+                vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")]
+            }
+            _ => Vec::new(),
+        };
+        banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: dir.to_path_buf(),
+            known: banto_safe_root::guard::KnownFolders::default(),
+            owners,
+            create_access: None,
+            create: false,
+            mode,
+        })
+        .expect("open the root")
+    }
+
+    /// #623 PR3b: 握った組で開く（[`init_db_pinned`]）と、前回の作りかけは握ったフォルダの
+    /// ハンドル基準で消え、`.bak` はパスワードを持たずにでき、作りかけ・`-journal` は残らない。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_init_backs_up_and_cleans_up_through_the_managed_dir() {
+        let base = crate::test_support::TempDir::new();
+        for mode in pin_modes() {
+            let root_dir = base.path().join(format!("{mode:?}"));
+            std::fs::create_dir(&root_dir).unwrap();
+            let root = root_in(&root_dir, mode);
+            let db_path = root_dir.join("chronogazer.sqlite3");
+            db_before_0025(&db_path, true).await;
+            let partial = "chronogazer.sqlite3.before-0025-20261021T000000Z.bak.partial";
+            std::fs::write(root_dir.join(partial), PG_PASSWORD).unwrap();
+
+            let pinned = root.as_dir().pin_sqlite("chronogazer.sqlite3").unwrap();
+            let pool = init_db_pinned(&pinned, root.as_dir(), None)
+                .await
+                .expect("init_db_pinned");
+            pool.close().await;
+            drop(pinned);
+
+            let names = file_names(&root_dir);
+            assert!(
+                !names.iter().any(|name| name.contains(".bak.partial")),
+                "{names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|name| name.contains(".before-0025-") && name.ends_with("-journal")),
+                "{names:?}"
+            );
+            let backups: Vec<&String> = names.iter().filter(|n| n.ends_with(".bak")).collect();
+            assert_eq!(backups.len(), 1, "{names:?}");
+            let bytes = std::fs::read(root_dir.join(backups[0])).unwrap();
+            assert!(
+                !contains(&bytes, PG_PASSWORD),
+                "the password is in the backup"
+            );
+        }
+    }
+
+    /// #623 PR3b: 握った組で開く経路でも、前回の作りかけの名前をディレクトリが塞いでいれば、
+    /// バックアップも移行もせずに `InitDbError::Storage` で失敗する（黙って飛ばさない）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_pinned_init_stops_on_a_leftover_blocked_by_a_directory() {
+        let base = crate::test_support::TempDir::new();
+        for mode in pin_modes() {
+            let root_dir = base.path().join(format!("{mode:?}"));
+            std::fs::create_dir(&root_dir).unwrap();
+            let root = root_in(&root_dir, mode);
+            let db_path = root_dir.join("chronogazer.sqlite3");
+            db_before_0025(&db_path, true).await;
+            let stuck =
+                root_dir.join("chronogazer.sqlite3.before-0025-20261021T000000Z.bak.partial");
+            std::fs::create_dir(&stuck).unwrap();
+
+            let pinned = root.as_dir().pin_sqlite("chronogazer.sqlite3").unwrap();
+            match init_db_pinned(&pinned, root.as_dir(), None).await {
+                Err(InitDbError::Storage(err)) => {
+                    assert!(err.to_string().contains("bak.partial"), "{err}")
+                }
+                other => panic!("expected InitDbError::Storage, got {other:?}"),
+            }
+            drop(pinned);
+            assert!(stuck.is_dir());
+            assert!(
+                !file_names(&root_dir).iter().any(|n| n.ends_with(".bak")),
+                "no backup"
+            );
+        }
     }
 
     /// 前回の作りかけを消せない（`.bak.partial` の名前をディレクトリが塞ぐ）ときは、バックアップも
