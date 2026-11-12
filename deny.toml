@@ -115,10 +115,10 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # オーナーのフォークへ移行)を許可する。".git" 有無はどちらでも cargo 側の
 # 正規化により一致する。
 allow-git = ["https://github.com/tyaro/banto", "https://github.com/tyaro/slmp", "https://github.com/tyaro/banto-opcua", "https://github.com/tyaro/async-opcua"]
-# #201 の banto-opcua #20 とその async-opcua 依存は Cargo.toml で commit rev
-# を固定する。cargo-deny の指定順は Any < Branch < Tag < Rev なので、
-# required-git-spec = "tag" は rev 固定も最低要件を満たす。既存の
-# banto/slmp は Cargo.toml の tag 指定を維持する。
+# banto-opcua も banto/slmp と同じく Cargo.toml で tag 指定にした(#1046、
+# v0.2.0)。async-opcua は banto-opcua 側の固定に従う間接依存。
+# cargo-deny の指定順は Any < Branch < Tag < Rev なので、
+# required-git-spec = "tag" は tag 固定を満たす。
 required-git-spec = "tag"
 
 [advisories]
