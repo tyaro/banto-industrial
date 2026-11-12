@@ -40,6 +40,8 @@ use serde::Serialize;
 use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
 use utoipa::ToSchema;
 
+use crate::hub_log::log_err_line;
+
 /// [`SystemInfoSampler::sample`]が返すスナップショット。単位はいずれも
 /// バイト・パーセントの生値 - MB/GB 表記やゲージ表示への整形はフロント側
 /// （`systemInfoFormat.ts`）の責務であり、ここでは行わない
@@ -80,19 +82,37 @@ pub struct SystemInfoSampler {
     /// 側の値を`0`として扱う。ホスト側の値は取得できるため状態画面全体は
     /// 引き続き機能する）。
     pid: Option<Pid>,
-    system: Mutex<System>,
+    /// 共有 `System`。sysinfo 0.40 で`System::new_with_specifics`が失敗しうる
+    /// （`Result`を返す）形になったため`Option`で持つ - 生成に失敗したら`None`
+    /// のまま警告を一度だけ出し、`sample`は全項目`0`のスナップショットを返す。
+    /// 状態画面の CPU/メモリ欄が`0`になるだけで、状態画面全体や hub の起動は
+    /// 止めない（PID が取れない場合にプロセス側だけ`0`にするのと同じ考え方）。
+    system: Mutex<Option<System>>,
 }
 
 impl SystemInfoSampler {
     /// `System`を1回だけ構築する。この時点では CPU 使用率の比較対象になる
     /// 前回スナップショットが無いため、直後の最初の`sample`呼び出しは
     /// `cpu_percent = 0.0`になりうる（モジュール doc comment参照）。
+    ///
+    /// `System`の生成に失敗しても`new`自体は失敗させない（呼び出し元は
+    /// 起動経路で、CPU/メモリ表示のためだけに hub を止めたくないため）。
+    /// 警告を一度だけ出して`System`を持たない状態になり、以降の`sample`は
+    /// 全項目`0`を返す。
     pub fn new() -> Self {
-        let system = System::new_with_specifics(
+        let system = match System::new_with_specifics(
             RefreshKind::nothing()
                 .with_memory(sysinfo::MemoryRefreshKind::everything())
                 .with_processes(ProcessRefreshKind::nothing().with_cpu().with_memory()),
-        );
+        ) {
+            Ok(system) => Some(system),
+            Err(err) => {
+                log_err_line(&format!(
+                    "banto-hub: CPU/メモリ状態の取得を初期化できませんでした（状態画面の該当欄は 0 になります）: {err}"
+                ));
+                None
+            }
+        };
         Self {
             pid: sysinfo::get_current_pid().ok(),
             system: Mutex::new(system),
@@ -106,6 +126,15 @@ impl SystemInfoSampler {
             .system
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // `System`を作れなかった場合は全項目 0（`new`の doc comment参照）。
+        let Some(system) = system.as_mut() else {
+            return SystemInfoSnapshot {
+                cpu_percent: 0.0,
+                process_memory_bytes: 0,
+                host_memory_used_bytes: 0,
+                host_memory_total_bytes: 0,
+            };
+        };
         system.refresh_memory();
         if let Some(pid) = self.pid {
             system.refresh_processes_specifics(
