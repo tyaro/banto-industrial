@@ -174,8 +174,9 @@ impl PlcConnectionService {
     ///
     /// 作成として検査する（接続名の `.` も断る。更新は [`Self::check_settings_update`]）。
     pub fn check_settings_input(&self, input: &ConnectionSettingsInput) -> Result<(), BantoError> {
-        self.checked_host_input(input.clone())?;
-        super::reject_dotted_name(&input.name, None)
+        // 名前の `.` を設定の検査より先に断る（両方が誤りでも `name` のエラーを返す）。
+        super::reject_dotted_name(&input.name, None)?;
+        self.checked_host_input(input.clone()).map(|_| ())
     }
 
     fn checked_host_input(
@@ -198,17 +199,17 @@ impl PlcConnectionService {
         id: i64,
         input: ConnectionSettingsInput,
     ) -> Result<(), BantoError> {
-        let name = input.name.clone();
-        let flat = self.checked_host_input(input)?;
-        // 接続名の `.`: 名前を変えない更新は通す（[`super::reject_dotted_name`]）。
-        if name.trim().contains('.') {
+        // 接続名の `.` を設定の検査より先に断る。名前を変えない更新は通す
+        // （[`super::reject_dotted_name`]）。
+        if input.name.trim().contains('.') {
             match self.get(id).await {
-                Ok(existing) => super::reject_dotted_name(&name, Some(&existing.name))?,
+                Ok(existing) => super::reject_dotted_name(&input.name, Some(&existing.name))?,
                 // 対象が無ければ適用時に対象の有無を判定する。
                 Err(BantoError::NotFound { .. }) => {}
                 Err(err) => return Err(err),
             }
         }
+        let flat = self.checked_host_input(input)?;
         let Some(flat) = flat else {
             return Ok(());
         };

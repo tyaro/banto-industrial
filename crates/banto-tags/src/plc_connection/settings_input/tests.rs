@@ -478,6 +478,30 @@ async fn a_dotted_connection_name_is_refused_on_every_create_path() {
         .unwrap();
 }
 
+/// 未適用キューの前の検査（作成・更新）は、設定も誤っていても接続名の `.` の
+/// `name` のエラーを先に単独で返す（設定の検査より前に断る）。
+#[tokio::test]
+async fn the_queue_checks_refuse_a_dotted_name_before_the_settings() {
+    let svc = service().await;
+    let both_wrong = input("Line.1", "plain", json!({"host": "h", "unit_id": 99}));
+    assert_eq!(
+        fields(svc.check_settings_input(&both_wrong).unwrap_err()),
+        ["name"]
+    );
+    let created = svc
+        .create_settings(input("Line1", "plain", json!({"host": "h"})))
+        .await
+        .unwrap();
+    assert_eq!(
+        fields(
+            svc.check_settings_update(created.id, both_wrong)
+                .await
+                .unwrap_err()
+        ),
+        ["name"]
+    );
+}
+
 /// 規則より前に作られた `.` を含む接続は一覧・取得でき、名前を変えない更新（他の項目の
 /// 編集）は通る。`.` を含む名前への改名は断る（適用時・キューの前の検査とも）。
 #[tokio::test]

@@ -556,73 +556,20 @@ impl CollectionGroupService {
         id: i64,
         input: CollectionGroupInput,
     ) -> Result<CollectionGroup, BantoError> {
-        if self.registry.is_some() {
-            // R2b-2b: a move can re-parse and rewrite the group's tags, which reads
-            // before it writes - one `BEGIN IMMEDIATE` transaction around
-            // [`Self::update_tx`] (checklist §5; same as `TagService::update_checked`).
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
-                .await
-                .map_err(banto_storage::storage_error)?;
-            let updated = self.update_tx(&mut tx, id, input).await?;
-            tx.commit().await.map_err(banto_storage::storage_error)?;
-            return Ok(updated);
-        }
-        let stored_name = stored_name_for_dot_check(&self.pool, id, &input.name).await?;
-        validate_collection_group_input(&input, stored_name.as_deref())?;
-        let existing_protocol: Option<String> =
-            sqlx::query_scalar("SELECT protocol FROM plc_connections WHERE id = ?")
-                .bind(input.plc_connection_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(banto_storage::storage_error)?;
-        let stored_query_sql =
-            validate_query_sql(existing_protocol.as_deref(), input.query_sql.as_deref())?;
-        let current: Option<(String, i64, i64)> = sqlx::query_as(GROUP_PROTOCOL_AND_TAG_COUNT_SQL)
-            .bind(id)
-            .fetch_optional(&self.pool)
+        // R2b-2b: a move can re-parse and rewrite the group's tags, which reads
+        // before it writes - one `BEGIN IMMEDIATE` transaction around
+        // [`Self::update_tx`] (checklist §5; same as `TagService::update_checked`).
+        // Without a registry the same transaction keeps the `.` check's read of the
+        // stored name and the `UPDATE` together (a concurrent rename cannot slip a
+        // dotted name back in between them).
+        let mut tx = self
+            .pool
+            .begin_with("BEGIN IMMEDIATE")
             .await
             .map_err(banto_storage::storage_error)?;
-        if let Some(err) = hub_group_move_error(
-            current
-                .as_ref()
-                .map(|(protocol, count, _)| (protocol.as_str(), *count)),
-            existing_protocol.as_deref(),
-        ) {
-            return Err(err);
-        }
-        if let Some(err) = push_group_move_error(
-            current
-                .as_ref()
-                .map(|(protocol, count, conn)| (protocol.as_str(), *count, *conn)),
-            input.plc_connection_id,
-            existing_protocol.as_deref(),
-        ) {
-            return Err(err);
-        }
-        // AssertSqlSafe: get() と同じ理由 - COLUMNS 定数のみを埋め込む固定
-        // 文字列。値はすべてプレースホルダでバインドする。
-        sqlx::query_as::<_, CollectionGroup>(sqlx::AssertSqlSafe(format!(
-            "UPDATE collection_groups SET name = ?, plc_connection_id = ?, period_ms = ?, enabled = ?, default_writable = ?, query_sql = ? \
-             WHERE id = ? RETURNING {COLUMNS}"
-        )))
-        .bind(input.name.trim())
-        .bind(input.plc_connection_id)
-        .bind(input.period_ms)
-        .bind(input.enabled)
-        .bind(input.default_writable)
-        .bind(stored_query_sql)
-        .bind(id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|err| match err {
-            sqlx::Error::RowNotFound => BantoError::NotFound {
-                resource: RESOURCE.to_string(),
-                id: id.to_string(),
-            },
-            other => map_write_error(other, "name", NAME_ALREADY_USED_IN_CONNECTION, "plcConnectionId", FK_MESSAGE),
-        })
+        let updated = self.update_tx(&mut tx, id, input).await?;
+        tx.commit().await.map_err(banto_storage::storage_error)?;
+        Ok(updated)
     }
 
     /// Transaction-compatible counterpart of [`Self::update`]. With a registry
