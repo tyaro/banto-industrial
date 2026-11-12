@@ -177,7 +177,8 @@ protoc-bin-vendored = { workspace = true }
 [dev-dependencies]
 # Decode test PostgreSQL URL passwords exactly as SQLx does (already in Cargo.lock).
 percent-encoding = "2.3.2"
-async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "60c4f9d72218d78177e59c70a03db7fddcf9d857", default-features = false, features = ["client"] }
+# banto-opcua v0.2.0 の固定と同じ rev に揃える（#1046）
+async-opcua = { git = "https://github.com/tyaro/async-opcua", rev = "9daa957a0ccf425bcb61bc488e828ccf2495c302", default-features = false, features = ["client"] }
 # T3（docs/tag-server-design.md §5.3）: `net`は元は tests/mqtt.rs のポート探索
 # （空きポートへ bind → drop → その番号で rumqttd を起動）と起動確認用の
 # TCP プローブ接続のため - `axum`側の推移的依存で実質的にはこれまでも
