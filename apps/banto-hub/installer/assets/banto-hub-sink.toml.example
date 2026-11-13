@@ -23,15 +23,30 @@
 #   4. Start-Service BantoHubSink
 #
 # 必須。Hub と同一マシンで使用する専用 TLS 待受のループバック URL。
-# Hub の TLS ポートを設定し、接続先証明書を確認してから有効化する。
-# Set this to Hub's separately configured loopback TLS listener. Plain
-# loopback HTTP is rejected before the Sink starts or sends an API key.
-hub_url = "https://127.0.0.1:9443"
+# Hub の Windows サービスは、既定で 127.0.0.1:8723 に TLS を待ち受けます
+# （鍵と証明書はインストーラが banto-hub-elev.exe prepare-hub-tls で
+# %ProgramData%\BantoHub\tls\ に作ります）。平文の http は、Sink が起動する
+# 前・API キーを送る前に断ります。
+# Hub's Windows service listens for loopback TLS on 127.0.0.1:8723 by default.
+# Plain loopback HTTP is rejected before the Sink starts or sends an API key.
+hub_url = "https://127.0.0.1:8723"
 
-# Paste the verified Hub server certificate here through the protected config
-# preparation workflow. Never retrieve a pin from the URL above. During a
-# planned rotation, list the old and new certificates (maximum two), then
-# remove the old one after the new listener is verified.
+# 必須。Hub の証明書の pin（最大 2 つ）。管理者のメモ帳で
+# %ProgramData%\BantoHub\tls\hub-cert.pem を開き、PEM 全体
+# （-----BEGIN CERTIFICATE----- から -----END CERTIFICATE----- まで）を
+# 次の形で貼ります:
+#   hub_tls_pinned_certs = ["""
+#   -----BEGIN CERTIFICATE-----
+#   ...
+#   -----END CERTIFICATE-----
+#   """]
+# 上の URL から取得した証明書を pin にしないでください（Hub が止まっている間に
+# 別のプロセスが 8723 を取っていれば、その相手の証明書になります）。
+# prepare-hub-tls --renew で作り直したら、新しい証明書に書き換えてください
+# （切り替えの間は旧い証明書と新しい証明書の 2 つを並べ、確かめてから旧い方を
+# 消します）。
+# Paste the whole PEM of %ProgramData%\BantoHub\tls\hub-cert.pem here.
+# Never retrieve a pin from the URL above.
 hub_tls_pinned_certs = []
 
 # 必須。Hub の管理 UI で発行した API キー。スコープは `admin` と

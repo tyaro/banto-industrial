@@ -5,8 +5,8 @@
 //! 付きの loopback 専用 TLS にしたが、Hub の TLS の待受（[`crate::tls_listener`]）は管理者が環境
 //! 変数と OpenSSL で手作りする形だった。これを既定にするため、Hub の loopback TLS の鍵と
 //! 証明書を、**作るのと同時に**保護された DACL を付けて
-//! `<ProgramData>\BantoHub\tls\` に作る。サービスがここを読んで 127.0.0.1:8723 で待ち受けるのは
-//! 次の PR（PR1b）で、この PR では Hub の起動は変えない。
+//! `<ProgramData>\BantoHub\tls\` に作る。Hub の Windows サービスは、TLS の環境変数が
+//! 無ければここを確かめてから読み、127.0.0.1:8723 で待ち受ける（[`load`]、#644 PR1b）。
 //!
 //! **ここは昇格の境界**（管理者として動き、一般の利用者が作れる場所 - ルート直下 - を扱う）。
 //! [`crate::sink_config_prepare`]（`prepare-sink-config`）の型をそのまま使い、受け付けるものを
@@ -17,8 +17,7 @@
 //! 1. 鍵と証明書は elev が Rust で作る（`rcgen`、ECDSA P-256・SHA-256、バックエンドは `ring`）。
 //!    インストーラが `prepare-sink-config` と同じように呼ぶ。
 //! 2. 置き場は `%ProgramData%\BantoHub\tls\`。フォルダは保護された DACL で SYSTEM・Administrators
-//!    がフル、`BUILTIN\Users` が読み取りと実行（後の PR でクライアントが証明書を pin として
-//!    読むため）、所有者 Administrators。秘密鍵（[`KEY_FILE`]）は SYSTEM・Administrators だけ。
+//!    がフル、`BUILTIN\Users` が読み取りと実行（クライアントが証明書を pin として読むため）、所有者 Administrators。秘密鍵（[`KEY_FILE`]）は SYSTEM・Administrators だけ。
 //!    証明書（[`CERT_FILE`]）は SYSTEM・Administrators にフル＋Users に読み取り。どれも作るのと
 //!    同時に DACL を付ける（作ってから絞るまでの間に広い権限で見える時間を作らない）。
 //! 3. 有効期限は 10 年。無いときだけ作る（再インストールでは既存を保つ）。壊れている・期限
@@ -99,6 +98,7 @@ use crate::sink_config_prepare::{
     dir_refusal_text, exposure_text, real_path_text, DirLevel, FileOpenError, PRODUCT_DIR,
 };
 
+pub mod load;
 #[cfg(windows)]
 pub mod win;
 

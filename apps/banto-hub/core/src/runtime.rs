@@ -164,7 +164,13 @@
 
 //! #644 exception: the optional TLS listener reads BANTO_HUB_TLS_PORT,
 //! BANTO_HUB_TLS_CERT and BANTO_HUB_TLS_KEY here so all Hub hosts retain
-//! their current public config shape. Incomplete settings fail before DB init.
+//! their current public config shape. Incomplete settings fail before DB init,
+//! and a bind failure of that explicit listener fails the start.
+//! When none of the three is set, [`HubConfig::default_tls`] (filled only by
+//! the Windows service, #644 PR1b, from `<ProgramData>\BantoHub\tls\` via
+//! `crate::hub_tls_prepare::load`) serves TLS on 127.0.0.1:8723 instead; if
+//! that port cannot be bound, the Hub starts without TLS and logs why
+//! (2026-11-13 owner decision B).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -201,6 +207,7 @@ use crate::events::event_channel;
 use crate::grpc::{GrpcServer, GrpcService};
 use crate::hub::CollectorManager;
 use crate::hub_log::{log_err_line, log_line};
+use crate::hub_tls_prepare::load::{bind_failure_lines, DefaultHubTls};
 use crate::mqtt::MqttPublisher;
 use crate::profile_lock::{
     try_acquire_profile_lock, try_acquire_profile_lock_in, HubHostKind, ProfileDirs,
@@ -269,6 +276,19 @@ pub struct HubConfig {
     /// 意味のない profile ロック競合が発生するため既定で`true`にして
     /// 呼び出す。
     pub skip_profile_lock: bool,
+    /// #644 PR1b: 既定の TLS の識別情報（確かめて読んだメモリ上の PEM とポート。本番は
+    /// Windows サービスだけが `crate::hub_tls_prepare::load::load_default_identity` で
+    /// 組み立てる。ほかのホスト・テストは `None`）。`BANTO_HUB_TLS_*` が設定されていれば
+    /// そちらを優先し、これは使わない。bind できなければ TLS 無しで起動してログに出す
+    /// （オーナー決定 B）。
+    pub default_tls: Option<DefaultHubTls>,
+}
+
+/// `BANTO_HUB_TLS_PORT`・`BANTO_HUB_TLS_CERT`・`BANTO_HUB_TLS_KEY` のどれかが設定されているか
+/// （#644 PR1b。設定されていれば [`HubConfig::default_tls`] より優先されるので、サービスは
+/// 既定の鍵と証明書を読まない）。
+pub fn hub_tls_env_present() -> bool {
+    TlsConfig::env_present()
 }
 
 /// Explicit TLS listener settings for callers that manage their own temporary
@@ -439,12 +459,17 @@ impl HubRuntime {
             profile_id,
             host_kind,
             skip_profile_lock,
+            default_tls,
         } = config;
 
         // Optional dedicated loopback transport. Validate all three operator
         // settings before taking a profile lock or opening the settings DB.
+        // They take precedence over the service's default identity (#644 PR1b).
         let tls_config =
-            TlsConfig::from_env().map_err(|err| HubStartError::Tls(err.to_string()))?;
+            match TlsConfig::from_env().map_err(|err| HubStartError::Tls(err.to_string()))? {
+                Some(config) => Some(TlsPlan::Explicit(config)),
+                None => default_tls.map(TlsPlan::Default),
+            };
 
         // T17-1（docs/banto-hub-t17-design.md §3「T17-1」・P2）: DB init を
         // 含む一切のリソース確保より前に profile 排他を取る - 失敗した場合
@@ -1067,8 +1092,10 @@ impl HubRuntime {
                     return Err(HubStartError::ServerStart(err));
                 }
             };
-        let tls_server = if let Some(config) = tls_config.as_ref() {
-            match tls_listener::start(config, app).await {
+        // `Some(line)` は既定の TLS を待ち受けたときの行（ログは下でまとめて出す）。
+        let mut default_tls_line: Option<String> = None;
+        let tls_server = match tls_config {
+            Some(TlsPlan::Explicit(config)) => match tls_listener::start(&config, app).await {
                 Ok(listener) => Some(listener),
                 Err(err) => {
                     server.stop().await;
@@ -1079,9 +1106,26 @@ impl HubRuntime {
                     opcua.shutdown().await;
                     return Err(HubStartError::Tls(err.to_string()));
                 }
+            },
+            Some(TlsPlan::Default(mut identity)) => {
+                // #644 PR1b・オーナー決定 B: 既定の 8723 を取れない（別のプロセスが先に取った）
+                // ときも Hub は TLS 無しで起動し、理由と対処をログに出す。
+                let (cert, key) = identity.take_pem();
+                let config = TlsConfig::in_memory(identity.port(), cert, key);
+                match tls_listener::start(&config, app).await {
+                    Ok(listener) => {
+                        default_tls_line = Some(identity.listening_line(listener.local_addr()));
+                        Some(listener)
+                    }
+                    Err(err) => {
+                        for line in bind_failure_lines(config.port(), &err.to_string()) {
+                            log_err_line(&line);
+                        }
+                        None
+                    }
+                }
             }
-        } else {
-            None
+            None => None,
         };
         // REST が先にポートを確保する。同じポートを OPC UA に指定しても
         // 失敗するのはオプションの OPC UA だけで、Hub 本体は継続する。
@@ -1117,7 +1161,9 @@ impl HubRuntime {
         for url in listening_urls(server.local_addr()) {
             log_line(&format!("  {url}"));
         }
-        if let Some(listener) = &tls_server {
+        if let Some(line) = &default_tls_line {
+            log_line(line);
+        } else if let Some(listener) = &tls_server {
             log_line(&format!(
                 "banto-hub: TLS listening at https://{}",
                 listener.local_addr()
@@ -1174,12 +1220,20 @@ impl HubRuntime {
     }
 }
 
+/// TLS の待受の決め方（#644 PR1b）。
+enum TlsPlan {
+    /// 環境変数で指定（bind の失敗は起動の失敗）。
+    Explicit(TlsConfig),
+    /// サービスの既定（bind の失敗は TLS 無しで続ける）。
+    Default(DefaultHubTls),
+}
+
 /// [`HubRuntime::start_on_db`] に渡す、設定 DB を開くまでに決めたもの。
 struct StartOnDb<'a> {
     pool: SqlitePool,
     registry: Arc<banto_driver_api::DriverRegistry>,
     drivers: crate::broker_glue::HubDrivers,
-    tls_config: Option<TlsConfig>,
+    tls_config: Option<TlsPlan>,
     allow_setup: bool,
     port_override: Option<u16>,
     bind_override: Option<String>,
@@ -1882,6 +1936,7 @@ mod tests {
             // 避けるため skip する（このモジュール doc の`skip_profile_lock`
             // フィールド doc comment参照）。
             skip_profile_lock: true,
+            default_tls: None,
         };
 
         let hub = HubRuntime::start(config)
@@ -1921,6 +1976,7 @@ mod tests {
             profile_id: "dirs".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
 
         let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
@@ -1961,6 +2017,7 @@ mod tests {
             profile_id: "pinned".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
         let names = |dirs: &ProfileDirs| {
             ["", "-wal", "-shm"].map(|suffix| {
@@ -2089,6 +2146,7 @@ mod tests {
             profile_id: id.to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: !take_lock,
+            default_tls: None,
         };
         let env_guard = PROFILE_ENV_LOCK.lock().await;
         if take_lock {
@@ -2192,6 +2250,7 @@ mod tests {
             profile_id: "stop-lock".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: false,
+            default_tls: None,
         };
         let env_guard = PROFILE_ENV_LOCK.lock().await;
         std::env::set_var("BANTO_HUB_ROOT", dir.path().as_os_str());
@@ -2243,6 +2302,7 @@ mod tests {
             profile_id: "dirs".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
         let hub = HubRuntime::start_with_profile_dirs(config, dirs.clone())
             .await
@@ -2324,6 +2384,7 @@ mod tests {
             profile_id: "dirs".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
         let hub = HubRuntime::start_with_profile_dirs(config, dirs)
             .await
@@ -2396,6 +2457,7 @@ mod tests {
             profile_id: "test-opcua-busy".to_owned(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         })
         .await
         .expect("Hub REST must start despite OPC UA bind failure");
@@ -2495,6 +2557,7 @@ mod tests {
             profile_id: "test-opcua-one-worker".to_owned(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         })
         .await
         .expect("start Hub");
@@ -2646,6 +2709,7 @@ mod tests {
             profile_id: "test-opcua-admin".to_owned(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         })
         .await
         .expect("start Hub");
@@ -2946,6 +3010,7 @@ mod tests {
             profile_id: "test-opcua-read".to_owned(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         })
         .await
         .expect("start Hub");
@@ -3442,6 +3507,7 @@ mod tests {
             profile_id: "test".to_string(),
             host_kind: HubHostKind::Shell,
             skip_profile_lock: true,
+            default_tls: None,
         };
 
         let err = match HubRuntime::start(make(busy)).await {
@@ -3455,6 +3521,66 @@ mod tests {
             .await
             .expect("restart after a failed bind should succeed");
         assert_eq!(hub.port_fallback_from(), None);
+        hub.shutdown().await;
+        drop(holder);
+    }
+
+    /// #644 PR1b: サービスの既定の TLS（メモリ上の PEM）で 127.0.0.1 に待ち受ける。既定の
+    /// ポートを別のプロセスが先に取っていれば、Hub は TLS 無しで起動する（オーナー決定 B。
+    /// 8723 そのものは埋めず、テストが握った任意のポートを使う）。環境変数
+    /// `BANTO_HUB_TLS_*` は設定しない前提（設定されていればそちらが優先される）。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_tls_listens_or_starts_without_tls_when_its_port_is_taken() {
+        use crate::hub_tls_prepare::load::DefaultHubTls;
+        if hub_tls_env_present() {
+            eprintln!("BANTO_HUB_TLS_* is set; skipping the default TLS test");
+            return;
+        }
+        let dir = crate::test_support::TempDir::new("hub-runtime-default-tls");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let identity = crate::hub_tls_prepare::generate_identity(now).unwrap();
+        let default_tls = DefaultHubTls::from_checked_pem(
+            0,
+            identity.cert_pem.as_bytes().to_vec(),
+            zeroize::Zeroizing::new(identity.key_pem.as_bytes().to_vec()),
+            dir.path().join("hub-cert.pem"),
+            now,
+        )
+        .unwrap();
+        let make = |tls: DefaultHubTls| HubConfig {
+            drivers: crate::test_support::test_drivers(),
+            db_path: dir
+                .path()
+                .join("registry.sqlite3")
+                .to_string_lossy()
+                .into_owned(),
+            allow_setup: false,
+            port_override: Some(0),
+            bind_override: Some("127.0.0.1".to_string()),
+            data_dir_override: Some(dir.path().join("data")),
+            profile_id: "test".to_string(),
+            host_kind: HubHostKind::Service,
+            skip_profile_lock: true,
+            default_tls: Some(tls),
+        };
+
+        let hub = HubRuntime::start(make(default_tls.clone()))
+            .await
+            .expect("default TLS should start");
+        let tls_addr = hub.tls_local_addr().expect("default TLS should listen");
+        assert_eq!(tls_addr.ip().to_string(), "127.0.0.1");
+        assert_ne!(tls_addr.port(), 0);
+        hub.shutdown().await;
+
+        let holder = std::net::TcpListener::bind("127.0.0.1:0").expect("hold a port");
+        let busy = holder.local_addr().unwrap().port();
+        let hub = HubRuntime::start(make(default_tls.with_port(busy)))
+            .await
+            .expect("a taken default TLS port must not stop the Hub");
+        assert_eq!(hub.tls_local_addr(), None);
         hub.shutdown().await;
         drop(holder);
     }
@@ -3484,6 +3610,7 @@ mod tests {
             profile_id: "test-security-headers".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
         let hub = HubRuntime::start(config)
             .await
@@ -3660,6 +3787,7 @@ Host: {addr}
             profile_id: "test-commissioning-reject".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
 
         match HubRuntime::start(config).await {
@@ -3704,6 +3832,7 @@ Host: {addr}
             profile_id: "test-commissioning-allow".to_string(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         };
 
         let hub = HubRuntime::start(config).await.expect(
@@ -3746,6 +3875,7 @@ Host: {addr}
             profile_id: profile_id.to_string(),
             host_kind: HubHostKind::Service,
             skip_profile_lock: false,
+            default_tls: None,
         };
 
         let env_guard = PROFILE_ENV_LOCK.lock().await;
@@ -4054,6 +4184,7 @@ Host: {addr}
             profile_id: "test-ingest-shutdown".to_owned(),
             host_kind: HubHostKind::Console,
             skip_profile_lock: true,
+            default_tls: None,
         })
         .await
         .expect("start Hub");

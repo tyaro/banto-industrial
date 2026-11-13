@@ -36,9 +36,9 @@
 //! ## 書式（すべての項目・既定値つき）
 //!
 //! ```toml
-//! # 必須。Hub のループバック TLS URL。既存の loopback HTTP 設定は
-//! # 証明書 pin の配布まで起動前に拒否する。
-//! hub_url = "https://127.0.0.1:9443"
+//! # 必須。Hub のループバック TLS URL（Hub のサービスは既定で 127.0.0.1:8723 に
+//! # TLS を待ち受ける。#644 PR1b）。loopback の平文 HTTP は起動前に拒否する。
+//! hub_url = "https://127.0.0.1:8723"
 //! # The protected config must contain one or two verified Hub server PEM
 //! # certificates. The Sink never learns a pin from its network endpoint.
 //! hub_tls_pinned_certs = ['''-----BEGIN CERTIFICATE-----

@@ -84,6 +84,7 @@ fn config(db_path: &Path, data_dir: PathBuf) -> HubConfig {
         profile_id: "upgrade-0025-test".to_string(),
         host_kind: HubHostKind::Console,
         skip_profile_lock: true,
+        default_tls: None,
     }
 }
 

@@ -1,8 +1,13 @@
 //! Optional, dedicated loopback TLS transport for the existing Hub router.
-//! The operator supplies PEM files; this module neither creates certificates
-//! nor changes their permissions. Protecting the private-key file is an
-//! installation responsibility. The listener binds IPv4 127.0.0.1 only;
-//! callers should use that literal address rather than localhost or ::1.
+//! The identity comes either from PEM files named by the operator
+//! (`BANTO_HUB_TLS_PORT/CERT/KEY`, read here by path) or, for the Windows
+//! service by default (#644 PR1b), from PEM bytes that the service already
+//! read through pinned handles and checked
+//! (`crate::hub_tls_prepare::load`; the files are created by
+//! `banto-hub-elev prepare-hub-tls`). This module neither creates
+//! certificates nor changes their permissions, and never logs the key.
+//! The listener binds IPv4 127.0.0.1 only; callers should use that literal
+//! address rather than localhost or ::1.
 
 use std::{
     env,
@@ -29,6 +34,7 @@ use tokio_rustls::{
     server::TlsStream,
     TlsAcceptor,
 };
+use zeroize::Zeroizing;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_PENDING_HANDSHAKES: usize = 32;
@@ -37,8 +43,37 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone)]
 pub(crate) struct TlsConfig {
     port: u16,
-    cert: PathBuf,
-    key: PathBuf,
+    identity: TlsIdentity,
+}
+
+/// Where the certificate chain and private key come from.
+#[derive(Clone)]
+enum TlsIdentity {
+    /// PEM files read by path when the acceptor is built (operator settings).
+    Files { cert: PathBuf, key: PathBuf },
+    /// PEM bytes already read and checked by the caller (#644 PR1b). The
+    /// files are not reopened by path.
+    Memory {
+        cert: Vec<u8>,
+        key: Zeroizing<Vec<u8>>,
+    },
+}
+
+impl std::fmt::Debug for TlsIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Files { cert, key } => f
+                .debug_struct("Files")
+                .field("cert", cert)
+                .field("key", key)
+                .finish(),
+            Self::Memory { cert, .. } => f
+                .debug_struct("Memory")
+                .field("cert_len", &cert.len())
+                .field("key", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -64,7 +99,37 @@ impl TlsConfig {
         if cert.as_os_str().is_empty() || key.as_os_str().is_empty() {
             return Err(TlsError::EmptyPath);
         }
-        Ok(Self { port, cert, key })
+        Ok(Self {
+            port,
+            identity: TlsIdentity::Files { cert, key },
+        })
+    }
+
+    /// PEM bytes the caller already read and checked (#644 PR1b).
+    pub(crate) fn in_memory(port: u16, cert_pem: Vec<u8>, key_pem: Zeroizing<Vec<u8>>) -> Self {
+        Self {
+            port,
+            identity: TlsIdentity::Memory {
+                cert: cert_pem,
+                key: key_pem,
+            },
+        }
+    }
+
+    /// Whether any of the three operator settings is present (they take
+    /// precedence over the service's default identity).
+    pub(crate) fn env_present() -> bool {
+        [
+            "BANTO_HUB_TLS_PORT",
+            "BANTO_HUB_TLS_CERT",
+            "BANTO_HUB_TLS_KEY",
+        ]
+        .iter()
+        .any(|name| env::var_os(name).is_some())
+    }
+
+    pub(crate) fn port(&self) -> u16 {
+        self.port
     }
 
     pub(crate) fn from_env() -> Result<Option<Self>, TlsError> {
@@ -99,14 +164,25 @@ impl TlsConfig {
 
     pub(crate) fn acceptor(&self) -> Result<TlsAcceptor, TlsError> {
         // Do not include the key file or parser's input in errors or logs.
-        let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&self.cert)
-            .map_err(|_| TlsError::Certificate)?
-            .collect::<Result<_, _>>()
-            .map_err(|_| TlsError::Certificate)?;
+        let (certs, key): (Vec<CertificateDer<'static>>, _) = match &self.identity {
+            TlsIdentity::Files { cert, key } => (
+                CertificateDer::pem_file_iter(cert)
+                    .map_err(|_| TlsError::Certificate)?
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| TlsError::Certificate)?,
+                PrivateKeyDer::from_pem_file(key),
+            ),
+            TlsIdentity::Memory { cert, key } => (
+                CertificateDer::pem_slice_iter(cert)
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| TlsError::Certificate)?,
+                PrivateKeyDer::from_pem_slice(key),
+            ),
+        };
         if certs.is_empty() {
             return Err(TlsError::Certificate);
         }
-        let key = PrivateKeyDer::from_pem_file(&self.key).map_err(|_| TlsError::PrivateKey)?;
+        let key = key.map_err(|_| TlsError::PrivateKey)?;
         let config = ServerConfig::builder_with_provider(Arc::new(
             tokio_rustls::rustls::crypto::ring::default_provider(),
         ))
@@ -251,7 +327,7 @@ mod tests {
             )
             .unwrap()
             .unwrap()
-            .port,
+            .port(),
             8723
         );
     }
@@ -261,8 +337,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let config = TlsConfig {
             port: 0,
-            cert: temp.path().join("missing-cert.pem"),
-            key: temp.path().join("missing-key.pem"),
+            identity: TlsIdentity::Files {
+                cert: temp.path().join("missing-cert.pem"),
+                key: temp.path().join("missing-key.pem"),
+            },
         };
         assert!(matches!(
             start(&config, Router::new()).await,
@@ -326,8 +404,10 @@ mod tests {
 
         let missing_key = TlsConfig {
             port: 0,
-            cert: cert.clone(),
-            key: temp.path().join("missing-key.pem"),
+            identity: TlsIdentity::Files {
+                cert: cert.clone(),
+                key: temp.path().join("missing-key.pem"),
+            },
         };
         assert!(matches!(missing_key.acceptor(), Err(TlsError::PrivateKey)));
 
@@ -347,8 +427,10 @@ mod tests {
         assert!(output.status.success(), "temporary key generation failed");
         let mismatched_identity = TlsConfig {
             port: 0,
-            cert: cert.clone(),
-            key: unrelated_key,
+            identity: TlsIdentity::Files {
+                cert: cert.clone(),
+                key: unrelated_key,
+            },
         };
         assert!(matches!(
             mismatched_identity.acceptor(),
@@ -367,8 +449,10 @@ mod tests {
         .unwrap();
         let config = TlsConfig {
             port: 0,
-            cert: cert.clone(),
-            key,
+            identity: TlsIdentity::Files {
+                cert: cert.clone(),
+                key,
+            },
         };
         let server = start(&config, app).await.unwrap();
         assert_eq!(server.local_addr().ip(), Ipv4Addr::LOCALHOST);
