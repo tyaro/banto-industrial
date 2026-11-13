@@ -221,7 +221,7 @@ use banto_collect::{
 };
 use banto_core::ListParams;
 use banto_tags::{CollectionGroupService, PlcConnection, PlcConnectionService, TagService};
-use banto_tstore::Clock;
+use banto_tstore::{Clock, DataPlace};
 use serde::Serialize;
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
@@ -959,7 +959,12 @@ pub struct CollectorManager {
     #[cfg(test)]
     delay_next_apply: std::sync::atomic::AtomicU64,
     pool: SqlitePool,
-    data_dir: PathBuf,
+    /// tstore の日付ファイルの置き場（#623 PR4b）。[`Self::new`] はパス
+    /// （[`banto_tstore::DataPlace::Path`]）、profile の `data\` を握っていれば
+    /// [`Self::with_data_place`] で握ったフォルダ（[`banto_tstore::DataPlace::Managed`]）に
+    /// 差し替える。書き手の開始（`Collector::start_in`）と、収集していないときの保持期間の
+    /// 削除・予行はこの置き場で行う。
+    place: DataPlace,
     clock: Arc<dyn Clock>,
     options: CollectorOptions,
     /// Built once in [`CollectorManager::new`] and cloned into every
@@ -1035,7 +1040,7 @@ pub struct CollectorManager {
     db_source: Arc<DbSourceEngine>,
     /// R2a-1c（docs/banto-hub-ingest-design.md §4.2）: 取り込み口 `push` の受信側。
     /// `push` 接続の外部ソースとして、この manager が作る `Collector` に
-    /// `start_with_sources` で渡す（`apply_config` は作った時の源を使い続ける）。
+    /// `start_in` で渡す（`apply_config` は作った時の源を使い続ける）。
     /// 計画の commit（`push` 接続・キーの集合・ブリッジの送る集合）は catalog の
     /// 入れ替えと同じ点（[`Self::commit_catalog`]）、
     /// 収集の遷移に連動する保持値の破棄と epoch は
@@ -1154,7 +1159,7 @@ impl CollectorManager {
             #[cfg(test)]
             delay_next_apply: std::sync::atomic::AtomicU64::new(0),
             pool,
-            data_dir,
+            place: DataPlace::Path(data_dir),
             clock,
             options,
             events,
@@ -1181,6 +1186,17 @@ impl CollectorManager {
             diag_log: DiagLog::default(),
             last_sim_warning: std::sync::Mutex::new(None),
         }
+    }
+
+    /// tstore の置き場を差し替える（#623 PR4b）。`crate::runtime::HubRuntime::start` が、
+    /// 実効のデータのフォルダが profile の `data\`（握ったフォルダ）のときに
+    /// [`banto_tstore::DataPlace::Managed`]（`expected` は profile の
+    /// `checked_access`、サービスでだけ `Some`）を渡す。外（`BANTO_HUB_DATA` など）は
+    /// 呼ばずに [`Self::new`] のパスのまま。Managed の [`Self::data_dir`] は握った
+    /// ハンドルの本当のパス。収集を始める前（構築の直後）に呼ぶ。
+    pub fn with_data_place(mut self, place: DataPlace) -> Self {
+        self.place = place;
+        self
     }
 
     /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
@@ -1310,9 +1326,10 @@ impl CollectorManager {
     /// override 環境で実ディレクトリとズレる可能性があるため使わない
     /// （`crate::runtime::HubRuntime::start`のdoc comment「PORT/BANTO_BIND/
     /// BANTO_HUB_DATA（via `*_override`）override the persisted settings」
-    /// 参照）。
+    /// 参照）。握ったフォルダの置き場（[`Self::with_data_place`]）では、握ったハンドルの
+    /// 本当のパス（表示用。削除は [`Self::prune_data_files`] がハンドル基準で行う）。
     pub fn data_dir(&self) -> &std::path::Path {
-        &self.data_dir
+        self.place.path()
     }
 
     /// 保持期間を過ぎたデータファイルを消す（定期の剪定と
@@ -1320,7 +1337,9 @@ impl CollectorManager {
     /// 収集が走っていれば、**書き込み側（`TsWriter`）のロックの下で**消す
     /// （[`banto_tstore::TsWriter::prune_files`]。ファイルの切り替えに失敗して
     /// 古い日付のまま開いているファイルは、保持日数を過ぎていても消さない）。
-    /// 走っていなければ書き手が無いので、そのまま [`banto_tstore::prune_files`]。
+    /// 走っていなければ書き手が無いので、置き場の [`DataPlace::prune_files`]（パスなら
+    /// [`banto_tstore::prune_files`] と同じ。握ったフォルダなら握ったハンドル基準で、
+    /// 1 件ごとに `-wal` → `-shm` → `-journal` → 本体の順に消す。#623 PR4b）。
     ///
     /// `apply_config` が書き手を入れ替えうるので、書き手は**毎回**
     /// `Collector::writer_handle` から読み直す。`collector` のロックは削除の
@@ -1342,11 +1361,9 @@ impl CollectorManager {
             return result;
         }
         drop(guard);
-        let dir = self.data_dir.clone();
-        match tokio::task::spawn_blocking(move || {
-            banto_tstore::prune_files(&dir, retention_days, today)
-        })
-        .await
+        let place = self.place.clone();
+        match tokio::task::spawn_blocking(move || place.prune_files(retention_days, today, &[]))
+            .await
         {
             Ok(result) => result,
             Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
@@ -1358,7 +1375,7 @@ impl CollectorManager {
     /// [`Self::prune_data_files`] の予行（何も消さない）。収集中は書き込み側の
     /// 「開いている日付は消さない」判定を含めて数えるので、設定画面の
     /// プレビューが約束した件数と、実際に消える件数がずれない（#541）。
-    /// 走っていなければ素の [`banto_tstore::plan_prune`]。ロックの取り方は
+    /// 走っていなければ置き場の [`DataPlace::plan_prune`]。ロックの取り方は
     /// `prune_data_files` と同じ。
     pub async fn plan_prune_data_files(
         &self,
@@ -1374,11 +1391,9 @@ impl CollectorManager {
             return result;
         }
         drop(guard);
-        let dir = self.data_dir.clone();
-        match tokio::task::spawn_blocking(move || {
-            banto_tstore::plan_prune(&dir, retention_days, today)
-        })
-        .await
+        let place = self.place.clone();
+        match tokio::task::spawn_blocking(move || place.plan_prune(retention_days, today, &[]))
+            .await
         {
             Ok(result) => result,
             Err(err) => Err(banto_tstore::TstoreError::Storage(format!(
@@ -2326,9 +2341,9 @@ impl CollectorManager {
                     Err(err) => Err(err.to_string()),
                 }
             } else {
-                match Collector::start_with_sources(
+                match Collector::start_in(
                     config,
-                    &self.data_dir,
+                    self.place.clone(),
                     self.clock.clone(),
                     self.events.clone(),
                     self.options,
@@ -2940,6 +2955,120 @@ mod tests {
 
         manager.shutdown().await;
         std::fs::remove_dir_all(&data_dir).expect("停止で書き手が閉じられていれば、すぐ消せる");
+    }
+
+    /// #623 PR4b: profile の `data\` を握ったフォルダの置き場（`DataPlace::Managed`）のテスト用。
+    /// `prof\data` を作って root から握る（`expected` は無し。Windows は Guarded = 本当に
+    /// 握る、ほかは Plain = SQLite が閉じるとき付随を消す）。返す組の
+    /// `ManagedDir` は root より先に drop する（宣言の順）。
+    fn held_data_dir(
+        base: &std::path::Path,
+    ) -> (Arc<banto_safe_root::ManagedDir>, banto_safe_root::SafeRoot) {
+        let root_path = base.join("prof");
+        std::fs::create_dir_all(root_path.join("data")).unwrap();
+        let root = banto_safe_root::open_root(&banto_safe_root::RootSpec {
+            expected: root_path,
+            known: banto_safe_root::guard::KnownFolders::default(),
+            #[cfg(windows)]
+            owners: vec![banto_safe_root::acl::current_user_sid().expect("今の利用者の SID")],
+            #[cfg(not(windows))]
+            owners: Vec::new(),
+            create_access: None,
+            create: false,
+            #[cfg(windows)]
+            mode: banto_safe_root::Mode::Guarded,
+            #[cfg(not(windows))]
+            mode: banto_safe_root::Mode::Plain,
+        })
+        .expect("open the root");
+        let mut set = root
+            .open_managed(
+                &[banto_safe_root::ManagedSpec {
+                    key: "data",
+                    parent: None,
+                    name: "data",
+                    create: false,
+                }],
+                None,
+            )
+            .expect("open data");
+        (Arc::new(set.take("data").unwrap()), root)
+    }
+
+    /// 握ったフォルダの置き場では、収集の書き手がその中で日付ファイルを握ったまま開き
+    /// （Windows の Guarded では PERSIST_WAL なので停止の後も `-wal`・`-shm` が残る = パスの
+    /// 版では残らない）、
+    /// `data_dir()` は握ったハンドルの本当のパスを返す。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_place_opens_the_date_file_inside_the_held_dir() {
+        let (dir, manager, pool) = manager_env().await;
+        let (data, _root) = held_data_dir(dir.path());
+        let data_path = data.final_path().to_path_buf();
+        let manager = manager.with_data_place(DataPlace::Managed {
+            dir: data.clone(),
+            expected: None,
+        });
+        assert_eq!(manager.data_dir(), data_path.as_path());
+        seed_running_simulation(&pool).await;
+        commit_and_apply(&manager).await.expect("commit and apply");
+
+        let files = banto_tstore::list_data_files(&data_path).unwrap();
+        assert_eq!(files.len(), 1, "握ったフォルダに今日のファイルができる");
+        assert!(
+            !dir.path().join("data").exists(),
+            "manager_env のパス（data）には書かない"
+        );
+        manager.shutdown().await;
+
+        if !cfg!(windows) {
+            return;
+        }
+        let name = files[0]
+            .path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        for suffix in ["-wal", "-shm"] {
+            assert!(
+                data_path.join(format!("{name}{suffix}")).exists(),
+                "握って開いた日付ファイルは PERSIST_WAL で {suffix} が残る"
+            );
+        }
+    }
+
+    /// 握ったフォルダの置き場で収集していないとき、保持期間の削除（予行も）は握った
+    /// ハンドル基準で行い、日付ファイルの本体と `-wal`・`-shm`・`-journal` を消す。
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn managed_place_prunes_aged_out_files_with_sidecars_when_stopped() {
+        let (dir, manager, _pool) = manager_env().await;
+        let (data, _root) = held_data_dir(dir.path());
+        let data_path = data.final_path().to_path_buf();
+        let manager = manager.with_data_place(DataPlace::Managed {
+            dir: data.clone(),
+            expected: None,
+        });
+        let old = data_path.join("20200101-001.sqlite3");
+        let sidecars: Vec<std::path::PathBuf> = ["-wal", "-shm", "-journal"]
+            .iter()
+            .map(|suffix| data_path.join(format!("20200101-001.sqlite3{suffix}")))
+            .collect();
+        std::fs::write(&old, b"").unwrap();
+        for sidecar in &sidecars {
+            std::fs::write(sidecar, b"").unwrap();
+        }
+        let today = local_today(manager.clock().as_ref());
+
+        let plan = manager.plan_prune_data_files(7, today).await.expect("plan");
+        assert_eq!(plan.deleted, vec![old.clone()]);
+        assert!(old.exists(), "予行は消さない");
+
+        let report = manager.prune_data_files(7, today).await.expect("prune");
+        assert_eq!(report.deleted, vec![old.clone()]);
+        assert!(!old.exists());
+        for sidecar in &sidecars {
+            assert!(!sidecar.exists(), "付随も消える: {}", sidecar.display());
+        }
     }
 
     /// 書き込みの失敗でファイルの切り替えができず古い日付のまま開いている間は、
