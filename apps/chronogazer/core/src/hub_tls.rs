@@ -9,12 +9,13 @@
 //!
 //! | 接続先                                   | 本番（[`HubTlsPolicy::production`]）                     |
 //! | ---------------------------------------- | -------------------------------------------------------- |
-//! | loopback（127.0.0.0/8・`localhost`）の http  | 断る（[`LOOPBACK_HTTP_REFUSED`] の案内。何も送らない）   |
+//! | loopback（127.0.0.0/8・`::1`・`localhost`）の http | 断る（[`LOOPBACK_HTTP_REFUSED`] の案内。何も送らない）   |
 //! | loopback の https                        | 証明書を確かめて読み、その 1 枚だけを信じる              |
 //! | それ以外（LAN）の http                   | 今までどおり pin なし（#644 の範囲外）                   |
 //! | それ以外の https                         | 今までどおり断る（pin が無いので bootstrap が `InvalidEndpoint`） |
 //!
-//! IPv6 の接続先（`[::1]` を含む）は扱いを変えない（IPv6 は当面対象外のオーナー決定）。
+//! IPv6 の loopback（`::1`、IPv4-mapped の `::ffff:127.x.x.x`）も loopback として扱う（Hub は `::1` では
+//! 待ち受けないので https は繋がらないだけ）。それ以外の IPv6 は LAN 扱い。
 //!
 //! # いつ読むか
 //!
@@ -39,7 +40,7 @@
 //! 固定で渡し、設定や環境変数で切り替える口を持たない。
 
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use banto_hub_bootstrap::{
@@ -210,13 +211,19 @@ fn refused(reason: impl Into<String>) -> BootstrapError {
     BootstrapError::with_detail(BootstrapErrorKind::HubTls, reason)
 }
 
-/// 接続先が loopback か（127.0.0.0/8、`localhost`・`*.localhost`、末尾の `.` は無視）。
-/// IPv6 は対象外（モジュール doc）。`Url` は `127.1` のような書き方も `127.0.0.1` に
-/// 正規化してから渡ってくる。
+/// 接続先が loopback か（127.0.0.0/8、`::1`、IPv4-mapped の `::ffff:127.x.x.x`、
+/// `localhost`・`*.localhost`、末尾の `.` は無視）。`Url` は `127.1` のような書き方も
+/// `127.0.0.1` に正規化してから渡ってくる。
 fn is_loopback(base: &Url) -> bool {
     let Some(host) = base.host_str() else {
         return false;
     };
+    // IPv6 は `host_str` が角括弧つきで返す（`url::Host::Ipv6` と同じ判定になる）。
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')) {
+        return inner.parse::<Ipv6Addr>().is_ok_and(|ip| {
+            ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        });
+    }
     if let Ok(ip) = host.parse::<Ipv4Addr>() {
         return ip.is_loopback();
     }
@@ -289,6 +296,8 @@ mod tests {
             "http://localhost:8722/",
             "http://LOCALHOST./",
             "http://hub.localhost:8722/",
+            "http://[::1]:8722/",
+            "http://[::ffff:127.0.0.1]:8722/",
         ] {
             assert_eq!(
                 refusal_of(policy.pins_for(&url(raw))),
@@ -361,7 +370,8 @@ mod tests {
             "http://192.168.11.5:8722/",
             "https://192.168.11.5:8723/",
             "http://hub.example:8722/",
-            "http://[::1]:8722/",
+            "http://[fe80::1]:8722/",
+            "http://[2001:db8::1]:8722/",
         ] {
             assert!(policy.pins_for(&url(raw)).unwrap().is_none(), "{raw}");
         }

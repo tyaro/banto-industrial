@@ -201,7 +201,7 @@ Hub が止まっている間に、その loopback のポートを別のプロセ
 | それ以外（LAN）の http                        | 今までどおり pin なし（#644 の範囲外）                                                                                               |
 | それ以外の https                              | 今までどおり断る（pin が無い）                                                                                                       |
 
-- IPv6 の接続先（`[::1]` を含む）は扱いを変えない（IPv6 は当面対象外）。
+- IPv6 の loopback（`::1`、IPv4-mapped の `::ffff:127.x.x.x`）も loopback として扱う（Hub は `::1` では待ち受けないので https は繋がらないだけ）。それ以外の IPv6 は LAN 扱い。
 - デスクトップ版の Hub（8722 の平文だけ）とは同じ PC では繋がらなくなる（受容）。
 - 証明書は**操作ごとに読み直す**（bootstrap は 1 回の操作で 1 回だけ聞き、その操作の管理の要求と
   catalog の読み取りは同じ pin を使う）。`prepare-hub-tls --renew` で作り直しても ChronoGazer の
