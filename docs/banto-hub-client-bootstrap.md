@@ -220,7 +220,8 @@ Hub が止まっている間に、その loopback のポートを別のプロセ
 - 製品の host（デスクトップ・`chronogazer-server`）はこの決まりを固定で使い、切り替える口は無い。
   loopback の http を受ける `HubTlsPolicy::plain_loopback_http_for_dev()` は、模擬 Hub を相手にする
   テスト・実機確認のハーネス（`examples/`）・開発用の `banto-serve` の `BANTO_HUB_LOOPBACK_HTTP=1`
-  （E2E のモック Hub 用。配布しない）だけが使う。
+  （E2E のモック Hub 用。配布しない）・`chronogazer-server` のデバッグビルドだけの同名の環境変数
+  （結合テスト用。`cfg(debug_assertions)` でリリースビルドからはコードごと消える）だけが使う。
 
 ## 7. 同一 PC 限定である理由
 

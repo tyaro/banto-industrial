@@ -1100,8 +1100,13 @@ async fn the_hub_key_lives_in_the_dpapi_file_and_resume_works_after_a_restart() 
     let sandbox = Sandbox::new();
     prepare_root(&sandbox, None, true).await;
 
-    // 1 回目: 接続（キーを保存）。
-    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    // 1 回目: 接続（キーを保存）。模擬 Hub は loopback の http なので、デバッグビルドだけの
+    // 口（#644）で loopback の http を受ける。
+    let mut server = Server::spawn_with_env(
+        &sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("BANTO_HUB_LOOPBACK_HTTP", "1")],
+    );
     let port = wait_ready(&sandbox, &server).await;
     let token = setup_admin(port).await;
     let (status, body) = request(
@@ -1137,7 +1142,11 @@ async fn the_hub_key_lives_in_the_dpapi_file_and_resume_works_after_a_restart() 
 
     // 2 回目: 何もしなくても、保存したキーで購読を張り直す。
     ws_heads.lock().unwrap().clear();
-    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let mut server = Server::spawn_with_env(
+        &sandbox,
+        sandbox.root.to_str().unwrap(),
+        &[("BANTO_HUB_LOOPBACK_HTTP", "1")],
+    );
     let port = wait_ready(&sandbox, &server).await;
     let expected = format!("authorization: bearer {HUB_KEY}");
     wait_for(
@@ -1163,4 +1172,29 @@ async fn the_hub_key_lives_in_the_dpapi_file_and_resume_works_after_a_restart() 
     );
     sandbox.assert_profile_untouched();
     hub.abort();
+}
+
+/// 環境変数なし（製品と同じ決まり）では、loopback の Hub へ http では接続せず、
+/// endpoint の validation で断る（#644）。
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_without_the_dev_switch_refuses_loopback_http_hub() {
+    let sandbox = Sandbox::new();
+    prepare_root(&sandbox, None, true).await;
+    let mut server = Server::spawn(&sandbox, sandbox.root.to_str().unwrap());
+    let port = wait_ready(&sandbox, &server).await;
+    let token = setup_admin(port).await;
+    let (status, body) = request(
+        reqwest::Method::POST,
+        format!("http://127.0.0.1:{port}/api/hub/adopt-key"),
+        Some(&token),
+        Some(serde_json::json!({"endpoint": "http://127.0.0.1:9", "key": HUB_KEY})),
+    )
+    .await;
+    assert_eq!(status, 422, "{body} / {}", sandbox.output_text());
+    let text = body.to_string();
+    assert!(text.contains("\"validation\""), "{body}");
+    assert!(text.contains("endpoint"), "{body}");
+    server.send("ctrl-c");
+    assert_eq!(server.wait_exit().await.code(), Some(0));
 }
