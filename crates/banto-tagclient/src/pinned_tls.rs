@@ -73,6 +73,13 @@ impl PinnedHubTls {
         self.config.clone()
     }
 
+    /// The same verifier as a plain rustls client configuration, for a caller
+    /// that drives its own blocking TLS stream (#644 PR4: the banto-hub desktop
+    /// shell's health probe of the Hub service on 127.0.0.1:8723).
+    pub fn rustls_client_config(&self) -> Arc<ClientConfig> {
+        self.rustls_config()
+    }
+
     /// Apply the same verifier to a separate REST client used by the Sink.
     pub fn configure_reqwest(&self, builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
         builder.tls_backend_preconfigured((*self.config).clone())

@@ -66,6 +66,12 @@ banto-safe-root = { path = "../../../crates/banto-safe-root", features = ["sqlit
 # 操作・確かめ（`hub_tls_prepare` の手順 1〜3）。クライアント（ChronoGazer）と同じコードを使う
 # ための共有 crate で、依存はこの crate が既に持つもの（新しい package は増えない）。
 banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
+# #644 PR4（2026-11-14）: デスクトップシェルの Service モードの health probe
+# （`src/pinned_hub_health.rs`）が、127.0.0.1:8723 の Hub の証明書を Sink・ChronoGazer と同じ
+# 検証器（`banto_tagclient::PinnedHubTls`。leaf の完全一致＋rustls の通常の検証）で確かめる。
+# 以前から dev-dependencies と `banto-secret-store` 経由で依存木に持っていた crate で、
+# Cargo.lock に新しい package は増えない。
+banto-tagclient = { path = "../../../crates/banto-tagclient" }
 # R2b-1b（docs/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
 # 秘密値を封印する部品（`Protector`・Windows の `DpapiMachine`・`MAX_SECRET_LEN`）を使う。
 # 保存先のファイル（`FileSecretStore`）は使わない - blob は DB に置く（設計 §5.1 の Q1 (c)）。
@@ -231,9 +237,8 @@ banto-broker = { path = "../../../crates/banto-broker", features = ["test-util"]
 tokio-tungstenite = { workspace = true }
 # #644 PR1a: `prepare-hub-tls` が作った証明書を Sink と同じ pin
 # （`banto_tagclient::PinnedHubTls::from_pem`）で読み、`tls_listener` の読み込みと TLS の
-# 握手ができることを確かめる（`src/hub_tls_prepare/tests.rs`）。この crate は既に
-# `banto-secret-store` 経由で依存木に持っている。
-banto-tagclient = { path = "../../../crates/banto-tagclient" }
+# 握手ができることを確かめる（`src/hub_tls_prepare/tests.rs`）。#644 PR4 から通常の依存
+# （[dependencies] の banto-tagclient）にも入ったので、テストもそちらを使う。
 # R2a-2a（docs/banto-hub-ingest-design.md §2・§11）: `src/ingest/driver.rs` の `PushDriver` を
 # 適合テストの静的な部分（`static_checks`、C1・C2）に掛ける。適合テスト一式は
 # `banto-driver-api` にだけ依存する公開 crate なので、下の「`banto-drivers` には dev でも

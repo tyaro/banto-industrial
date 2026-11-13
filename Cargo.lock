@@ -1002,6 +1002,7 @@ dependencies = [
  "banto-desktop-tray",
  "banto-drivers",
  "banto-hub-core",
+ "banto-hub-tls-trust",
  "banto-safe-root",
  "banto-server",
  "banto-service-elev",
@@ -1013,6 +1014,8 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-single-instance",
  "tempfile",
+ "webview2-com",
+ "windows-core 0.62.2",
 ]
 
 [[package]]
