@@ -113,6 +113,17 @@ async fn main() {
     } else {
         Arc::new(UnavailableKeyStore)
     };
+    // #644: Hub と話すときの TLS の決まり。既定は製品と同じ（loopback は pin した https
+    // だけ）。`BANTO_HUB_LOOPBACK_HTTP=1`（開発・E2E 用。E2E のモック Hub は 127.0.0.1 の
+    // http）のときだけ loopback の http を pin なしで受ける。この開発用サーバーは配布しない。
+    let hub_tls = if std::env::var("BANTO_HUB_LOOPBACK_HTTP").is_ok_and(|v| v == "1") {
+        eprintln!(
+            "banto-serve: BANTO_HUB_LOOPBACK_HTTP=1: loopback の Hub へ http で接続します（開発・E2E 用）"
+        );
+        chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev()
+    } else {
+        chronogazer_core::hub_tls::HubTlsPolicy::production()
+    };
 
     // #383 段階2b / R1-C（C-2）: `data.dir` の相対パスは **DB ファイルの置き場を
     // 基準**に解決する（デスクトップが「アプリのデータディレクトリ基準」で解決
@@ -128,6 +139,7 @@ async fn main() {
         db_pin: chronogazer_core::engine::DbPin::Off,
         db_path: db_path_buf,
         key_store,
+        hub_tls,
         attach_hub: hub_memory_keys,
         host: ChronoGazerHost::Serve,
         listen: EngineListen::Required(ServerConfig { bind, port }),

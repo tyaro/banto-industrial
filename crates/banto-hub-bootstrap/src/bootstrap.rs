@@ -38,10 +38,65 @@ pub struct Bootstrapper {
     /// Seed for [`CredentialIdentity`] (#446). Random per bootstrapper, so an
     /// identity means nothing outside this process.
     identity_seed: RandomState,
-    /// Certificate pin for an `https` Hub (#644). `Some` if and only if every
-    /// endpoint this bootstrapper accepts is `https`; see
-    /// [`with_hub_tls`](Self::with_hub_tls).
-    hub_tls: Option<PinnedHubTls>,
+    /// Where the certificate pin for an endpoint comes from (#644). Asked
+    /// once per operation; see [`HubTlsSource`] and
+    /// [`with_hub_tls_source`](Self::with_hub_tls_source).
+    hub_tls: Arc<dyn HubTlsSource>,
+}
+
+/// Decides, per endpoint, whether the Hub is reached over `https` with a
+/// certificate pin or over plain `http` (#644).
+///
+/// [`Bootstrapper`] asks this **once per operation**, before any network
+/// call, with the normalized base URL of the endpoint the operation is about
+/// (the saved one for `status`/`refresh_catalog`/`rest_client`, the given
+/// one for `connect`/`adopt_manual_key`). Everything that operation sends -
+/// the admin requests and the catalog read - uses the one answer, so a pin
+/// is never read twice within one operation. Because it is asked again on
+/// the next operation, a renewed Hub certificate is picked up without
+/// rebuilding the bootstrapper.
+///
+/// * `Ok(Some(pins))` - the endpoint must be `https`, and only the pinned
+///   certificate is trusted.
+/// * `Ok(None)` - the endpoint must be plain `http`.
+/// * `Err(error)` - the app refuses this endpoint (for example a loopback
+///   `http` endpoint where the app requires TLS) or cannot supply its pin
+///   (the Hub's certificate could not be read). Use
+///   [`ErrorKind::HubTls`] with a short reason the settings screen can show
+///   as is; the operation fails with that error and nothing is sent. The
+///   reason must not contain a key or an endpoint path prefix.
+///
+/// The answer is still checked against the endpoint's scheme ("pin set <=>
+/// `https`", [`ErrorKind::InvalidEndpoint`] otherwise), so a source cannot
+/// make the bootstrapper send an `https` request unpinned or a pinned
+/// request over `http`.
+pub trait HubTlsSource: Send + Sync {
+    fn pins_for(&self, base: &Url) -> Result<Option<PinnedHubTls>>;
+}
+
+/// The default source: no pin, so every endpoint must be plain `http`.
+struct PlainHttp;
+
+impl HubTlsSource for PlainHttp {
+    fn pins_for(&self, _base: &Url) -> Result<Option<PinnedHubTls>> {
+        Ok(None)
+    }
+}
+
+/// [`Bootstrapper::with_hub_tls`]: the same pin for every endpoint.
+struct FixedPin(PinnedHubTls);
+
+impl HubTlsSource for FixedPin {
+    fn pins_for(&self, _base: &Url) -> Result<Option<PinnedHubTls>> {
+        Ok(Some(self.0.clone()))
+    }
+}
+
+/// One operation's endpoint: the normalized base and the pin the
+/// [`HubTlsSource`] gave for it, already checked against each other.
+struct Resolved {
+    base: Url,
+    pins: Option<PinnedHubTls>,
 }
 
 impl Bootstrapper {
@@ -67,7 +122,7 @@ impl Bootstrapper {
             keys,
             state,
             identity_seed: RandomState::new(),
-            hub_tls: None,
+            hub_tls: Arc::new(PlainHttp),
         }
     }
 
@@ -81,33 +136,56 @@ impl Bootstrapper {
     /// does not match the server surfaces as
     /// [`UnreachableCause::Transport`]: nothing trusted answered, and no
     /// credential was sent.
+    ///
+    /// The same pin for every endpoint (a [`HubTlsSource`] that always
+    /// answers `Some(pins)`); an app that reaches some Hubs over `http` and
+    /// others over pinned `https` uses
+    /// [`with_hub_tls_source`](Self::with_hub_tls_source) instead.
     #[must_use]
-    pub fn with_hub_tls(mut self, pins: PinnedHubTls) -> Self {
-        self.hub_tls = Some(pins);
+    pub fn with_hub_tls(self, pins: PinnedHubTls) -> Self {
+        self.with_hub_tls_source(Arc::new(FixedPin(pins)))
+    }
+
+    /// Decide the pin per endpoint and per operation (#644). See
+    /// [`HubTlsSource`]: the source is asked once per operation before any
+    /// network call, its error fails the operation as is, and its answer
+    /// still has to agree with the endpoint's scheme.
+    #[must_use]
+    pub fn with_hub_tls_source(mut self, source: Arc<dyn HubTlsSource>) -> Self {
+        self.hub_tls = source;
         self
     }
 
     /// The one place the "pin set <=> `https`" rule is enforced. Parses the
-    /// endpoint and checks the rule before any client is built.
-    fn checked_base(&self, endpoint: &str) -> Result<Url> {
+    /// endpoint, asks the [`HubTlsSource`] once, and checks the rule before
+    /// any client is built.
+    fn resolve(&self, endpoint: &str) -> Result<Resolved> {
         let base = base_url(endpoint)?;
-        if self.hub_tls.is_some() != (base.scheme() == "https") {
+        let pins = self.hub_tls.pins_for(&base)?;
+        if pins.is_some() != (base.scheme() == "https") {
             return Err(Error::new(ErrorKind::InvalidEndpoint));
         }
-        Ok(base)
+        Ok(Resolved { base, pins })
     }
 
     fn admin_for(&self, endpoint: &str) -> Result<AdminClient> {
-        AdminClient::new(self.checked_base(endpoint)?, self.hub_tls.as_ref())
+        let Resolved { base, pins } = self.resolve(endpoint)?;
+        AdminClient::new(base, pins)
     }
 
-    fn rest_client_for(&self, endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
-        self.checked_base(endpoint)?;
+    /// A catalog/subscription client for `endpoint` with the pin this
+    /// operation already resolved (`pins` comes from [`Self::resolve`], so
+    /// the rule was checked there and the source is not asked again).
+    fn rest_client_with(
+        endpoint: &str,
+        pins: Option<&PinnedHubTls>,
+        key: &Zeroizing<String>,
+    ) -> Result<RestClient> {
         let tag_endpoint =
             Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
         let secret =
             SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
-        match &self.hub_tls {
+        match pins {
             Some(pins) => RestClient::new_pinned(tag_endpoint, secret, pins.clone()),
             None => RestClient::new(tag_endpoint, secret),
         }
@@ -393,7 +471,12 @@ impl Bootstrapper {
         let Some(stored) = self.stored_key(&record.keyring_account)? else {
             return Ok(None);
         };
-        Ok(Some(self.rest_client_for(&record.endpoint, &stored)?))
+        let Resolved { pins, .. } = self.resolve(&record.endpoint)?;
+        Ok(Some(Self::rest_client_with(
+            &record.endpoint,
+            pins.as_ref(),
+            &stored,
+        )?))
     }
 
     /// Persist the operator's tag selection. An empty selection is valid.
@@ -529,7 +612,9 @@ impl Bootstrapper {
         endpoint: &str,
         key: &Zeroizing<String>,
     ) -> Result<HubConnection> {
-        let client = self.rest_client_for(endpoint, key)?;
+        // The pin this operation resolved for the admin client - not a second
+        // answer from the source (see `HubTlsSource`).
+        let client = Self::rest_client_with(endpoint, admin.pins(), key)?;
         let judged = self.identity(endpoint, key);
 
         let connection = match client.fetch_catalog().await {
@@ -816,7 +901,166 @@ mod tests {
             keys.set(&account_for(hub), &key()).unwrap();
             let state = Arc::new(MemoryState::seeded(seeded_record(hub, None)));
             let mut bootstrapper = harness(keys, state);
-            bootstrapper.hub_tls = pin;
+            if let Some(pin) = pin {
+                bootstrapper = bootstrapper.with_hub_tls(pin);
+            }
+            assert_eq!(
+                bootstrapper.rest_client().err().map(|error| error.kind()),
+                Some(ErrorKind::InvalidEndpoint)
+            );
+        }
+
+        assert!(http_hub.seen().is_empty());
+        assert!(https_hub.seen().is_empty());
+    }
+
+    /// A [`HubTlsSource`] for the tests: a fixed answer per base URL, and a
+    /// log of every base it was asked about.
+    struct ScriptedSource {
+        answers: Vec<(Url, Result<Option<PinnedHubTls>>)>,
+        asked: std::sync::Mutex<Vec<Url>>,
+    }
+
+    impl ScriptedSource {
+        fn new(answers: Vec<(String, Result<Option<PinnedHubTls>>)>) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers
+                    .into_iter()
+                    .map(|(endpoint, answer)| (base_url(&endpoint).unwrap(), answer))
+                    .collect(),
+                asked: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn asked(&self) -> usize {
+            self.asked.lock().unwrap().len()
+        }
+    }
+
+    impl HubTlsSource for ScriptedSource {
+        fn pins_for(&self, base: &Url) -> Result<Option<PinnedHubTls>> {
+            self.asked.lock().unwrap().push(base.clone());
+            self.answers
+                .iter()
+                .find(|(known, _)| known == base)
+                .map(|(_, answer)| answer.clone())
+                .expect("the source was asked about an unexpected base")
+        }
+    }
+
+    fn sourced(
+        source: &Arc<ScriptedSource>,
+    ) -> (Bootstrapper, Arc<MemoryKeyStore>, Arc<MemoryState>) {
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let bootstrapper = harness(Arc::clone(&keys), Arc::clone(&state))
+            .with_hub_tls_source(Arc::clone(source) as Arc<dyn HubTlsSource>);
+        (bootstrapper, keys, state)
+    }
+
+    #[tokio::test]
+    async fn the_source_pins_one_endpoint_and_not_another_once_per_operation() {
+        let cert = TestCertificate::generate();
+        let pinned_hub = MockHub::start_tls(tls_routes(), Arc::clone(&cert.server));
+        let plain_hub = MockHub::start(tls_routes());
+        let pins = PinnedHubTls::from_pem(std::slice::from_ref(&cert.pem)).unwrap();
+        let source = ScriptedSource::new(vec![
+            (pinned_hub.endpoint(), Ok(Some(pins))),
+            (plain_hub.endpoint(), Ok(None)),
+        ]);
+        let (bootstrapper, _keys, _state) = sourced(&source);
+
+        // The pinned endpoint: admin requests and the catalog read all go
+        // over TLS, with a single answer from the source.
+        let connection = bootstrapper.connect(&pinned_hub.endpoint()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(source.asked(), 1, "one operation asks the source once");
+        assert_eq!(pinned_hub.hit_count(TAGS_ROUTE), 1);
+
+        // The saved record is the pinned one: `status` and `rest_client`
+        // each ask again (a renewed certificate would be read here).
+        assert_eq!(
+            bootstrapper.status().await.unwrap(),
+            HubStatus::Connected { tag_count: 1 }
+        );
+        assert_eq!(source.asked(), 2);
+        assert!(bootstrapper.rest_client().unwrap().is_some());
+        assert_eq!(source.asked(), 3);
+
+        // The same bootstrapper reaches the other endpoint over plain http.
+        let connection = bootstrapper.connect(&plain_hub.endpoint()).await.unwrap();
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        assert_eq!(source.asked(), 4);
+        assert_eq!(plain_hub.hit_count(TAGS_ROUTE), 1);
+    }
+
+    #[tokio::test]
+    async fn a_source_error_fails_the_operation_before_anything_is_sent() {
+        let hub = MockHub::start(tls_routes());
+        let refusal = || Error::with_detail(ErrorKind::HubTls, "use https for this Hub");
+        let source = ScriptedSource::new(vec![(hub.endpoint(), Err(refusal()))]);
+        let (bootstrapper, keys, state) = sourced(&source);
+
+        // A typed endpoint: `connect` and `adopt_manual_key`.
+        assert_eq!(
+            bootstrapper.connect(&hub.endpoint()).await.unwrap_err(),
+            refusal()
+        );
+        assert_eq!(
+            bootstrapper
+                .adopt_manual_key(&hub.endpoint(), key())
+                .await
+                .unwrap_err(),
+            refusal()
+        );
+        assert!(state.load().unwrap().is_none(), "nothing is saved");
+
+        // A saved record the source now refuses (an upgrade from a version
+        // that accepted it): `status`, `refresh_catalog` and `rest_client`.
+        keys.set(&account_for(&hub), &key()).unwrap();
+        state.save(&seeded_record(&hub, Some(7))).unwrap();
+        assert_eq!(bootstrapper.status().await.unwrap_err(), refusal());
+        assert_eq!(bootstrapper.refresh_catalog().await.unwrap_err(), refusal());
+        assert_eq!(bootstrapper.rest_client().unwrap_err(), refusal());
+        assert_eq!(
+            bootstrapper.connect(&hub.endpoint()).await.unwrap_err(),
+            refusal()
+        );
+        // The key and the record are left alone.
+        assert_eq!(keys.get(&account_for(&hub)).unwrap(), Some(key()));
+        assert_eq!(state.load().unwrap().unwrap().key_id, Some(7));
+
+        assert!(
+            hub.seen().is_empty(),
+            "no request may reach the listener: {:?}",
+            hub.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scheme_rule_also_holds_for_a_source_answer() {
+        let cert = TestCertificate::generate();
+        let http_hub = MockHub::start(tls_routes());
+        let https_hub = MockHub::start_tls(tls_routes(), Arc::clone(&cert.server));
+        let pins = PinnedHubTls::from_pem(std::slice::from_ref(&cert.pem)).unwrap();
+        // A pin for the http endpoint, none for the https one: both wrong.
+        let source = ScriptedSource::new(vec![
+            (http_hub.endpoint(), Ok(Some(pins))),
+            (https_hub.endpoint(), Ok(None)),
+        ]);
+        let (bootstrapper, keys, state) = sourced(&source);
+
+        for hub in [&http_hub, &https_hub] {
+            assert_eq!(
+                bootstrapper
+                    .connect(&hub.endpoint())
+                    .await
+                    .unwrap_err()
+                    .kind(),
+                ErrorKind::InvalidEndpoint
+            );
+            keys.set(&account_for(hub), &key()).unwrap();
+            state.save(&seeded_record(hub, None)).unwrap();
             assert_eq!(
                 bootstrapper.rest_client().err().map(|error| error.kind()),
                 Some(ErrorKind::InvalidEndpoint)

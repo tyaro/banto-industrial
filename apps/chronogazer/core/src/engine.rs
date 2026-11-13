@@ -282,6 +282,9 @@ pub struct EngineConfig {
     pub service_data_root: Option<Arc<banto_safe_root::SafeRoot>>,
     /// Hub の API キーの置き場（`HubService::new` に渡す）。
     pub key_store: Arc<dyn KeyStore>,
+    /// Hub と話すときの TLS の決まり（#644、`HubService::new` に渡す）。製品の host
+    /// （デスクトップ・`chronogazer-server`）は `HubTlsPolicy::production()` を固定で渡す。
+    pub hub_tls: crate::hub_tls::HubTlsPolicy,
     /// 収集に Hub を繋ぐか（`CollectorService::attach_hub`）。キーを保存できる
     /// host だけ `true`（繋いでもキーが無ければ hub 接続は購読できない）。
     pub attach_hub: bool,
@@ -1157,13 +1160,16 @@ impl OpenedEngine {
 
         // #332: Hub 接続。`installation_id` を設定から読む（無ければ作って保存する）。
         // 失敗は設定 DB が書けない状態なので起動の失敗にする（pool は閉じて返す）。
-        let hub = match HubService::new(settings.clone(), cfg.key_store.clone()).await {
-            Ok(hub) => hub,
-            Err(err) => {
-                close_then_release(&pool, &mut db_pins).await;
-                return Err(EngineStartError::Hub(err));
-            }
-        };
+        let hub =
+            match HubService::new(settings.clone(), cfg.key_store.clone(), cfg.hub_tls.clone())
+                .await
+            {
+                Ok(hub) => hub,
+                Err(err) => {
+                    close_then_release(&pool, &mut db_pins).await;
+                    return Err(EngineStartError::Hub(err));
+                }
+            };
         // #383 段階3 P4: 購読の対象（登録済みの hub タグ）をレジストリから読む。
         hub.attach_registry(pool.clone());
 
@@ -1720,6 +1726,7 @@ mod tests {
             db_pin: DbPin::Off,
             db_path,
             key_store: Arc::new(UnavailableKeyStore),
+            hub_tls: crate::hub_tls::HubTlsPolicy::production(),
             attach_hub: false,
             host: ChronoGazerHost::Serve,
             listen,

@@ -162,7 +162,11 @@ export default defineConfig({
 				// Hub を繋ぐ（`user-simulator-monitor-hub.spec.ts` がモック Hub 相手に
 				// Hub 経由のタグの収集を通す）。既定の banto-serve は OS キーリングが無く、
 				// Hub 経由の接続を収集しない。
-				BANTO_HUB_MEMORY_KEYS: '1'
+				BANTO_HUB_MEMORY_KEYS: '1',
+				// #644: モック Hub は 127.0.0.1 の http。banto-serve の既定（製品と同じ、
+				// loopback は証明書を pin した https だけ）では断られるので、開発・E2E 用に
+				// loopback の http を受ける決まりを選ぶ（`chronogazer_core::hub_tls`）。
+				BANTO_HUB_LOOPBACK_HTTP: '1'
 			}
 		},
 		{

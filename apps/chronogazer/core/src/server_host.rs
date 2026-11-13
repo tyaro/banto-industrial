@@ -565,6 +565,29 @@ pub fn lock_held_with_root(
     }
 }
 
+/// #644: Hub と話すときの TLS の決まり。製品は `production()`（loopback は pin した https
+/// だけ）。
+#[cfg(not(debug_assertions))]
+fn hub_tls_policy() -> crate::hub_tls::HubTlsPolicy {
+    crate::hub_tls::HubTlsPolicy::production()
+}
+
+/// デバッグビルドだけ、`BANTO_HUB_LOOPBACK_HTTP=1` で loopback の http を pin なしで受ける
+/// 決まりを選べる。配布物はリリースビルドなので製品には入らない（この分岐はコードごと
+/// 消える）。結合テストの模擬 Hub は loopback の http（Hub の発行は loopback の相手にしか
+/// 出さないので LAN にできない）。デスクトップ（src-tauri）には足さない。
+#[cfg(debug_assertions)]
+fn hub_tls_policy() -> crate::hub_tls::HubTlsPolicy {
+    if std::env::var("BANTO_HUB_LOOPBACK_HTTP").is_ok_and(|v| v == "1") {
+        eprintln!(
+            "chronogazer-server: BANTO_HUB_LOOPBACK_HTTP=1: loopback の Hub へ http で接続します（開発・E2E 用）"
+        );
+        crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev()
+    } else {
+        crate::hub_tls::HubTlsPolicy::production()
+    }
+}
+
 /// `chronogazer-server` のエンジンの設定（[`lock`]・[`lock_held`] で同じ）。
 fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) -> EngineConfig {
     EngineConfig {
@@ -577,6 +600,7 @@ fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) ->
         key_store: Arc::new(FailedKeyStore::new(
             "Hub の API キーの保存先をまだ開いていません",
         )),
+        hub_tls: hub_tls_policy(),
         attach_hub: true,
         host,
         listen: EngineListen::Disabled,

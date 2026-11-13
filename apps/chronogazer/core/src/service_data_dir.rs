@@ -418,6 +418,7 @@ mod tests {
             service_data_root: Some(root),
             db_pin: crate::engine::DbPin::Off,
             key_store: Arc::new(UnavailableKeyStore),
+            hub_tls: crate::hub_tls::HubTlsPolicy::production(),
             attach_hub: false,
             host: ChronoGazerHost::Service,
             listen: EngineListen::Disabled,

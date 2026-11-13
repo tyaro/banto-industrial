@@ -1127,7 +1127,13 @@ async fn main() {
         }
     };
     let settings1 = SettingsService::new(Db::Sqlite(pool1.clone()));
-    let hub1 = match HubService::new(settings1.clone(), keys.clone()).await {
+    let hub1 = match HubService::new(
+        settings1.clone(),
+        keys.clone(),
+        chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+    )
+    .await
+    {
         Ok(hub) => hub,
         Err(err) => {
             println!("  HubService初期化に失敗しました: {err}");
@@ -1396,7 +1402,13 @@ async fn main() {
             }
             Ok(pool2) => {
                 let settings2 = SettingsService::new(Db::Sqlite(pool2.clone()));
-                match HubService::new(settings2.clone(), keys.clone()).await {
+                match HubService::new(
+                    settings2.clone(),
+                    keys.clone(),
+                    chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+                )
+                .await
+                {
                     Ok(hub2) => {
                         // 指示どおり connect() は呼ばない。resume() だけで復帰する
                         // ことを確認する。

@@ -1223,9 +1223,13 @@ async fn main() {
                 .map_err(|e| format!("設定 DB: {e}"))?;
             let settings = SettingsService::new(Db::Sqlite(pool.clone()));
             let keys: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
-            let hub = HubService::new(settings.clone(), keys)
-                .await
-                .map_err(|e| format!("HubService: {e}"))?;
+            let hub = HubService::new(
+                settings.clone(),
+                keys,
+                chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+            )
+            .await
+            .map_err(|e| format!("HubService: {e}"))?;
             hub.attach_registry(pool.clone());
             cleanup_handles = Some((pool.clone(), settings.clone(), hub.clone()));
             // キーを発行させる前に、相手が今回の子であることを確かめ直す。

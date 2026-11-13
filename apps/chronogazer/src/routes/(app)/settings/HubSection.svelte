@@ -117,6 +117,8 @@
 	/** P4 より前のこの画面で選んでいたタグ（読むだけ。注記に件数を出す）。 */
 	let legacySelection = $state<string[]>([]);
 	let keyName = $state<string | null>(null);
+	/** 保存済みの接続先を TLS の決まりで使わなかった理由（#644、`HubView.endpointProblem`）。 */
+	let endpointProblem = $state<string | null>(null);
 	let subscription = $state<HubSubscription | null>(null);
 	/**
 	 * 購読状態のポーリングが連続で失敗した回数（成功で 0 に戻る）と、最後に
@@ -265,6 +267,7 @@
 		statusSnapshot = snapshot;
 		configured = view.endpoint !== null;
 		keyName = view.keyName;
+		endpointProblem = view.endpointProblem ?? null;
 		serverEndpoint = view.endpoint;
 		legacySelection = [...view.selectedTags];
 		// `null`（この往復では catalog を読めていない）と `[]`（読めた結果
@@ -641,7 +644,7 @@
 					接続先URL
 					<input
 						type="url"
-						placeholder="http://127.0.0.1:3100"
+						placeholder="https://127.0.0.1:8723"
 						bind:value={endpointDraft}
 						disabled={busy}
 					/>
@@ -666,6 +669,9 @@
 				状態: <strong>{statusDisplay.label}</strong>
 			</p>
 			<p class="note">{statusDisplay.detail}</p>
+			{#if endpointProblem}
+				<p class="error" role="status">{endpointProblem}</p>
+			{/if}
 			{#if showStatusRecheckButton(statusDisplay, status, configured)}
 				<!--
 					#449 再レビュー P2 / 3 回目のレビュー: 取り直しに失敗した、または

@@ -16,6 +16,7 @@ fn config(dir: &Path) -> EngineConfig {
         db_pin: crate::engine::DbPin::Off,
         db_path,
         key_store: Arc::new(UnavailableKeyStore),
+        hub_tls: crate::hub_tls::HubTlsPolicy::production(),
         attach_hub: false,
         host: ChronoGazerHost::Desktop,
         listen: EngineListen::Disabled,

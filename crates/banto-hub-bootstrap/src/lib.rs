@@ -65,16 +65,25 @@
 //! # TLS とピン（#644）
 //!
 //! The Hub is reached either over plain `http` (today's default) or over
-//! `https` with a certificate pin ([`Bootstrapper::with_hub_tls`], a
-//! `banto_tagclient::PinnedHubTls`). The rule is **pin set <=> `https`
-//! endpoint**, enforced in one place before any network call: a pin with an
-//! `http` endpoint, and an `https` endpoint without a pin, are both
-//! [`ErrorKind::InvalidEndpoint`]. Nothing falls back from https to http or
-//! from pinned to unpinned, so a process that took the Hub's loopback port
-//! while it was stopped never sees the commissioning request or an API key;
-//! a pin mismatch is [`UnreachableCause::Transport`]. The pin is held by the
-//! app and handed in per `Bootstrapper`; it is never stored in
-//! [`HubRecord`] or the settings store.
+//! `https` with a certificate pin (a `banto_tagclient::PinnedHubTls`). The
+//! rule is **pin set <=> `https` endpoint**, enforced in one place before any
+//! network call: a pin with an `http` endpoint, and an `https` endpoint
+//! without a pin, are both [`ErrorKind::InvalidEndpoint`]. Nothing falls back
+//! from https to http or from pinned to unpinned, so a process that took the
+//! Hub's loopback port while it was stopped never sees the commissioning
+//! request or an API key; a pin mismatch is [`UnreachableCause::Transport`].
+//!
+//! Where the pin comes from is the app's call, made **per endpoint and per
+//! operation** through a [`HubTlsSource`]
+//! ([`Bootstrapper::with_hub_tls_source`]): one bootstrapper can require a
+//! pinned `https` loopback Hub and still reach a LAN Hub over `http`, and a
+//! renewed certificate is read again on the next operation.
+//! [`Bootstrapper::with_hub_tls`] is the fixed-pin shorthand. The source is
+//! asked once per operation, before any network call, and every request of
+//! that operation (admin and catalog) uses that one answer. A source that
+//! refuses the endpoint or cannot read the pin fails the operation with
+//! [`ErrorKind::HubTls`] and its reason; nothing is sent. The pin is held by
+//! the app; it is never stored in [`HubRecord`] or the settings store.
 //!
 //! # 同一 PC 限定
 //!
@@ -95,8 +104,10 @@ pub mod status;
 #[cfg(test)]
 mod test_support;
 
-pub use bootstrap::Bootstrapper;
+pub use bootstrap::{Bootstrapper, HubTlsSource};
 pub use error::{Error, ErrorKind, Result};
+/// The normalized base URL a [`HubTlsSource`] is asked about.
+pub use reqwest::Url;
 pub use scopes::{validate_issue_scopes, DEFAULT_SCOPES, ISSUABLE_SCOPES};
 pub use state::{BootstrapState, HubRecord, KeyStore};
 pub use status::{CredentialIdentity, HubConnection, HubStatus, UnreachableCause};

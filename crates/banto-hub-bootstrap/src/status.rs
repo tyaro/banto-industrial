@@ -55,6 +55,14 @@ pub enum UnreachableCause {
     /// The Hub answered with a redirect, which this client never follows
     /// (the endpoint is pointed at the wrong thing).
     InvalidEndpoint,
+    /// Nothing was sent: the app's [`HubTlsSource`](crate::HubTlsSource)
+    /// refused the saved endpoint or could not supply its certificate pin
+    /// (#644). [`Bootstrapper`](crate::Bootstrapper) itself reports this as
+    /// [`ErrorKind::HubTls`](crate::ErrorKind::HubTls) with the reason; the
+    /// cause exists so an app can still render a **saved** connection it
+    /// refuses to use as one of the six states (with the reason shown
+    /// next to it) instead of hiding the record behind an error.
+    HubTls,
 }
 
 impl UnreachableCause {
@@ -64,6 +72,7 @@ impl UnreachableCause {
             Self::Protocol => "protocol",
             Self::ServerError => "server_error",
             Self::InvalidEndpoint => "invalid_endpoint",
+            Self::HubTls => "hub_tls",
         }
     }
 }

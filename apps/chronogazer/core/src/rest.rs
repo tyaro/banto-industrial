@@ -2163,6 +2163,7 @@ mod tests {
         crate::hub::HubService::new(
             settings,
             std::sync::Arc::new(crate::hub::UnavailableKeyStore),
+            crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
         )
         .await
         .expect("HubService::new")
