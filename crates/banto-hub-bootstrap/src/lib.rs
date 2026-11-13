@@ -62,6 +62,20 @@
 //!   locked-down Hub with no usable key is [`HubStatus::NeedsPairing`], full
 //!   stop.
 //!
+//! # TLS とピン（#644）
+//!
+//! The Hub is reached either over plain `http` (today's default) or over
+//! `https` with a certificate pin ([`Bootstrapper::with_hub_tls`], a
+//! `banto_tagclient::PinnedHubTls`). The rule is **pin set <=> `https`
+//! endpoint**, enforced in one place before any network call: a pin with an
+//! `http` endpoint, and an `https` endpoint without a pin, are both
+//! [`ErrorKind::InvalidEndpoint`]. Nothing falls back from https to http or
+//! from pinned to unpinned, so a process that took the Hub's loopback port
+//! while it was stopped never sees the commissioning request or an API key;
+//! a pin mismatch is [`UnreachableCause::Transport`]. The pin is held by the
+//! app and handed in per `Bootstrapper`; it is never stored in
+//! [`HubRecord`] or the settings store.
+//!
 //! # 同一 PC 限定
 //!
 //! banto-hub refuses to start on a non-loopback bind while commissioning is

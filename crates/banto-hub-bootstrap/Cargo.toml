@@ -13,9 +13,11 @@ publish.workspace = true
 banto-tagclient = { path = "../banto-tagclient" }
 # The two admin endpoints (`GET /api/commissioning/status`,
 # `POST /api/api-keys[/{id}/revoke]`) plus the 401/403 disambiguation probe.
-# Same `default-features = false` (no TLS) choice as `banto-tagclient`:
-# banto-hub is plain HTTP on a closed LAN (tag-server-design.md §5.6).
-reqwest = { workspace = true }
+# Same `default-features = false` choice as `banto-tagclient`. A plain-HTTP
+# Hub on a closed LAN stays the default (tag-server-design.md §5.6); the
+# loopback Hub is reached over https with a pinned certificate (#644), whose
+# rustls config comes from `banto_tagclient::PinnedHubTls`.
+reqwest = { workspace = true, features = ["rustls"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 # Safe, secret-free diagnostics, same redaction invariant as
@@ -26,4 +28,7 @@ tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util", "time"] }
+tempfile = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

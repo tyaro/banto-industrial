@@ -11,7 +11,9 @@ use std::hash::{BuildHasher, RandomState};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use banto_tagclient::{Endpoint, ErrorKind as TagErrorKind, RestClient, SecretApiKey};
+use banto_tagclient::{
+    Endpoint, ErrorKind as TagErrorKind, PinnedHubTls, RestClient, SecretApiKey,
+};
 use reqwest::Url;
 use zeroize::Zeroizing;
 
@@ -36,6 +38,10 @@ pub struct Bootstrapper {
     /// Seed for [`CredentialIdentity`] (#446). Random per bootstrapper, so an
     /// identity means nothing outside this process.
     identity_seed: RandomState,
+    /// Certificate pin for an `https` Hub (#644). `Some` if and only if every
+    /// endpoint this bootstrapper accepts is `https`; see
+    /// [`with_hub_tls`](Self::with_hub_tls).
+    hub_tls: Option<PinnedHubTls>,
 }
 
 impl Bootstrapper {
@@ -61,7 +67,51 @@ impl Bootstrapper {
             keys,
             state,
             identity_seed: RandomState::new(),
+            hub_tls: None,
         }
+    }
+
+    /// Talk to the Hub over TLS, trusting only the pinned certificate (#644).
+    ///
+    /// With a pin the endpoint must be `https`; without one it must be
+    /// `http` (today's behaviour). The two never mix: a pin with an `http`
+    /// endpoint, or an `https` endpoint without a pin, is
+    /// [`ErrorKind::InvalidEndpoint`] before any network call, and nothing
+    /// falls back from https to http or from pinned to unpinned. A pin that
+    /// does not match the server surfaces as
+    /// [`UnreachableCause::Transport`]: nothing trusted answered, and no
+    /// credential was sent.
+    #[must_use]
+    pub fn with_hub_tls(mut self, pins: PinnedHubTls) -> Self {
+        self.hub_tls = Some(pins);
+        self
+    }
+
+    /// The one place the "pin set <=> `https`" rule is enforced. Parses the
+    /// endpoint and checks the rule before any client is built.
+    fn checked_base(&self, endpoint: &str) -> Result<Url> {
+        let base = base_url(endpoint)?;
+        if self.hub_tls.is_some() != (base.scheme() == "https") {
+            return Err(Error::new(ErrorKind::InvalidEndpoint));
+        }
+        Ok(base)
+    }
+
+    fn admin_for(&self, endpoint: &str) -> Result<AdminClient> {
+        AdminClient::new(self.checked_base(endpoint)?, self.hub_tls.as_ref())
+    }
+
+    fn rest_client_for(&self, endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
+        self.checked_base(endpoint)?;
+        let tag_endpoint =
+            Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
+        let secret =
+            SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
+        match &self.hub_tls {
+            Some(pins) => RestClient::new_pinned(tag_endpoint, secret, pins.clone()),
+            None => RestClient::new(tag_endpoint, secret),
+        }
+        .map_err(|_| Error::new(ErrorKind::InvalidEndpoint))
     }
 
     /// #446: the identity of the credential stored **now** (saved endpoint +
@@ -109,7 +159,7 @@ impl Bootstrapper {
         scopes: &[&str],
     ) -> Result<HubConnection> {
         validate_issue_scopes(scopes)?;
-        let admin = AdminClient::new(base_url(endpoint)?)?;
+        let admin = self.admin_for(endpoint)?;
         // Only a record for THIS endpoint may contribute a `key_id` (see
         // `previous_for`): ids are per-Hub row ids, so carrying one across a
         // switch would revoke an unrelated key on the new Hub.
@@ -259,7 +309,7 @@ impl Bootstrapper {
     /// `None`: a pasted key does not come with the Hub-assigned id, and this
     /// crate refuses to go looking for one by name.
     pub async fn adopt_manual_key(&self, endpoint: &str, key: String) -> Result<HubConnection> {
-        let admin = AdminClient::new(base_url(endpoint)?)?;
+        let admin = self.admin_for(endpoint)?;
         let previous = self.previous_for(admin.base())?;
         let account = self.account_for(admin.base(), previous.as_ref());
         let key = Zeroizing::new(key);
@@ -280,7 +330,7 @@ impl Bootstrapper {
         let Some(record) = self.state.load()? else {
             return Ok(HubStatus::NotConfigured);
         };
-        let admin = AdminClient::new(base_url(&record.endpoint)?)?;
+        let admin = self.admin_for(&record.endpoint)?;
         let Some(stored) = self.stored_key(&record.keyring_account)? else {
             // The record survived but the keyring entry did not (a new
             // Windows user, a cleared store, a reinstall). Reconnecting
@@ -301,7 +351,7 @@ impl Bootstrapper {
         let Some(record) = self.state.load()? else {
             return Err(Error::new(ErrorKind::NotConfigured));
         };
-        let admin = AdminClient::new(base_url(&record.endpoint)?)?;
+        let admin = self.admin_for(&record.endpoint)?;
         let Some(stored) = self.stored_key(&record.keyring_account)? else {
             return Ok(HubConnection::failed(HubStatus::AuthFailed));
         };
@@ -343,7 +393,7 @@ impl Bootstrapper {
         let Some(stored) = self.stored_key(&record.keyring_account)? else {
             return Ok(None);
         };
-        Ok(Some(rest_client_for(&record.endpoint, &stored)?))
+        Ok(Some(self.rest_client_for(&record.endpoint, &stored)?))
     }
 
     /// Persist the operator's tag selection. An empty selection is valid.
@@ -479,7 +529,7 @@ impl Bootstrapper {
         endpoint: &str,
         key: &Zeroizing<String>,
     ) -> Result<HubConnection> {
-        let client = rest_client_for(endpoint, key)?;
+        let client = self.rest_client_for(endpoint, key)?;
         let judged = self.identity(endpoint, key);
 
         let connection = match client.fetch_catalog().await {
@@ -575,14 +625,6 @@ fn rejection_status(probe: Option<ProbedStatus>) -> HubStatus {
     }
 }
 
-fn rest_client_for(endpoint: &str, key: &Zeroizing<String>) -> Result<RestClient> {
-    let tag_endpoint =
-        Endpoint::new(endpoint).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
-    let secret =
-        SecretApiKey::new(key.to_string()).map_err(|_| Error::new(ErrorKind::InvalidKey))?;
-    RestClient::new(tag_endpoint, secret).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))
-}
-
 fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -598,7 +640,7 @@ mod tests {
     use crate::state::memory::{MemoryKeyStore, MemoryState};
     use crate::test_support::{
         catalog_body, commissioning_body, duplicate_name_body, grant_body, issued_body, MockHub,
-        Reply,
+        Reply, TestCertificate,
     };
 
     const APP_ID: &str = "chronogazer";
@@ -674,6 +716,115 @@ mod tests {
             state.load().unwrap().unwrap().selected_tags,
             vec!["line1.fast.tag0".to_owned()]
         );
+    }
+
+    fn tls_harness(pem: &str) -> (Bootstrapper, Arc<MemoryKeyStore>, Arc<MemoryState>) {
+        let keys = Arc::new(MemoryKeyStore::new());
+        let state = Arc::new(MemoryState::new());
+        let pins = PinnedHubTls::from_pem(&[pem.to_owned()]).unwrap();
+        (
+            harness(Arc::clone(&keys), Arc::clone(&state)).with_hub_tls(pins),
+            keys,
+            state,
+        )
+    }
+
+    fn tls_routes() -> HashMap<String, Vec<Reply>> {
+        routes(vec![
+            (STATUS_ROUTE, vec![(200, commissioning_body(false))]),
+            (ISSUE_ROUTE, vec![(201, issued_body(42, "n", &key()))]),
+            (TAGS_ROUTE, vec![(200, catalog_body(1))]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn a_pinned_https_hub_issues_and_reads_the_catalog_over_tls() {
+        let cert = TestCertificate::generate();
+        let hub = MockHub::start_tls(tls_routes(), Arc::clone(&cert.server));
+        let (bootstrapper, keys, _state) = tls_harness(&cert.pem);
+
+        let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+
+        assert_eq!(connection.status, HubStatus::Connected { tag_count: 1 });
+        // AdminClient (status, grant, issue, logout) and RestClient (catalog)
+        // both went through the pinned TLS connection.
+        for route in [
+            STATUS_ROUTE,
+            GRANT_ROUTE,
+            ISSUE_ROUTE,
+            LOGOUT_ROUTE,
+            TAGS_ROUTE,
+        ] {
+            assert_eq!(hub.hit_count(route), 1, "{route}");
+        }
+        assert_eq!(keys.get(&account_for(&hub)).unwrap(), Some(key()));
+        assert!(bootstrapper.rest_client().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_pin_is_transport_and_nothing_reaches_the_listener() {
+        let real = TestCertificate::generate();
+        let other = TestCertificate::generate();
+        let hub = MockHub::start_tls(tls_routes(), Arc::clone(&real.server));
+        let (bootstrapper, keys, state) = tls_harness(&other.pem);
+
+        // Fresh install: the admin client's first request is the one refused.
+        let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+        assert_eq!(
+            connection.status,
+            HubStatus::unreachable(UnreachableCause::Transport)
+        );
+        assert!(state.load().unwrap().is_none());
+
+        // A stored key: the catalog request is the one refused, so the key
+        // is never sent.
+        keys.set(&account_for(&hub), &key()).unwrap();
+        let connection = bootstrapper.connect(&hub.endpoint()).await.unwrap();
+        assert_eq!(
+            connection.status,
+            HubStatus::unreachable(UnreachableCause::Transport)
+        );
+
+        assert!(
+            hub.seen().is_empty(),
+            "no request line or Authorization header may reach the listener: {:?}",
+            hub.seen()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_pin_and_the_endpoint_scheme_must_agree_before_any_connection() {
+        let cert = TestCertificate::generate();
+        let http_hub = MockHub::start(routes(vec![]));
+        let https_hub = MockHub::start_tls(routes(vec![]), Arc::clone(&cert.server));
+        let pins = PinnedHubTls::from_pem(std::slice::from_ref(&cert.pem)).unwrap();
+
+        // Pin + http, and no pin + https: refused by `connect` ...
+        let (pinned, _, _) = tls_harness(&cert.pem);
+        let error = pinned.connect(&http_hub.endpoint()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidEndpoint);
+        let unpinned = harness(
+            Arc::new(MemoryKeyStore::new()),
+            Arc::new(MemoryState::new()),
+        );
+        let error = unpinned.connect(&https_hub.endpoint()).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidEndpoint);
+
+        // ... and by `rest_client` for a saved record of the wrong scheme.
+        for (hub, pin) in [(&http_hub, Some(pins)), (&https_hub, None)] {
+            let keys = Arc::new(MemoryKeyStore::new());
+            keys.set(&account_for(hub), &key()).unwrap();
+            let state = Arc::new(MemoryState::seeded(seeded_record(hub, None)));
+            let mut bootstrapper = harness(keys, state);
+            bootstrapper.hub_tls = pin;
+            assert_eq!(
+                bootstrapper.rest_client().err().map(|error| error.kind()),
+                Some(ErrorKind::InvalidEndpoint)
+            );
+        }
+
+        assert!(http_hub.seen().is_empty());
+        assert!(https_hub.seen().is_empty());
     }
 
     #[tokio::test]

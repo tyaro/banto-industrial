@@ -59,6 +59,21 @@ impl RestClient {
         Self::build(endpoint, secret, Some(timeout), None)
     }
 
+    /// Like [`new`](Self::new) (no per-request time limit), but trust only the
+    /// provided, protected Hub certificate pins on both REST and WebSocket
+    /// connections. Anything but an `https` endpoint is refused with
+    /// [`ErrorKind::InvalidEndpoint`]: a pin never falls back to plain HTTP.
+    pub fn new_pinned(
+        endpoint: Endpoint,
+        secret: SecretApiKey,
+        pins: PinnedHubTls,
+    ) -> Result<Self> {
+        if endpoint.scheme() != "https" {
+            return Err(Error::new(ErrorKind::InvalidEndpoint));
+        }
+        Self::build(endpoint, secret, None, Some(pins))
+    }
+
     /// Use only the provided, protected Hub certificate pins on both REST and
     /// WebSocket connections. A new TLS handshake rechecks the pin on reconnect.
     pub fn with_pinned_tls(
