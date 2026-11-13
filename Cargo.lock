@@ -885,9 +885,12 @@ version = "0.1.0"
 dependencies = [
  "banto-tagclient",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
  "zeroize",
 ]

@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,8 +50,27 @@ pub struct MockHub {
 
 impl MockHub {
     pub fn start(routes: HashMap<String, Vec<Reply>>) -> Self {
+        Self::start_with(routes, None)
+    }
+
+    /// The same scripted Hub behind TLS (`https://127.0.0.1:{port}`). A
+    /// handshake that fails (a client whose pin does not match) records
+    /// nothing in [`seen`](Self::seen): only a request that was actually
+    /// read counts.
+    pub fn start_tls(
+        routes: HashMap<String, Vec<Reply>>,
+        server: Arc<rustls::ServerConfig>,
+    ) -> Self {
+        Self::start_with(routes, Some(server))
+    }
+
+    fn start_with(
+        routes: HashMap<String, Vec<Reply>>,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock hub");
-        let address = format!("http://{}", listener.local_addr().expect("local_addr"));
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        let address = format!("{scheme}://{}", listener.local_addr().expect("local_addr"));
         let seen: Arc<Mutex<Vec<SeenRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -63,31 +83,21 @@ impl MockHub {
                 if thread_stop.load(Ordering::SeqCst) {
                     return;
                 }
-                let Ok(mut stream) = stream else { return };
-                let Some(request) = read_request(&mut stream) else {
-                    continue;
-                };
-                let route = request.route();
-                thread_seen
-                    .lock()
-                    .expect("mock hub log poisoned")
-                    .push(request);
-
-                let (status, body) = match routes.get_mut(&route) {
-                    Some(replies) if !replies.is_empty() => {
-                        let index = consumed.entry(route.clone()).or_insert(0);
-                        let reply = replies[(*index).min(replies.len() - 1)].clone();
-                        *index += 1;
-                        reply
+                let Ok(stream) = stream else { return };
+                match &tls {
+                    Some(config) => {
+                        let Ok(connection) = rustls::ServerConnection::new(Arc::clone(config))
+                        else {
+                            continue;
+                        };
+                        let mut stream = rustls::StreamOwned::new(connection, stream);
+                        serve(&mut stream, &mut routes, &mut consumed, &thread_seen);
                     }
-                    _ => (404, String::from("{}")),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
+                    None => {
+                        let mut stream = stream;
+                        serve(&mut stream, &mut routes, &mut consumed, &thread_seen);
+                    }
+                }
             }
         });
 
@@ -128,13 +138,110 @@ impl Drop for MockHub {
         // keep the test binary from exiting. One best-effort self-connect
         // wakes it; the request is never read, and a failure here (the
         // listener already gone) simply means there is nothing left to wake.
-        if let Some(address) = self.address.strip_prefix("http://") {
+        if let Some(address) = self
+            .address
+            .strip_prefix("http://")
+            .or_else(|| self.address.strip_prefix("https://"))
+        {
             let _ = std::net::TcpStream::connect(address);
         }
     }
 }
 
-fn read_request(stream: &mut std::net::TcpStream) -> Option<SeenRequest> {
+/// Read one request from `stream`, record it, and answer it from the route
+/// table. A connection that never yields a request (a failed TLS handshake,
+/// the wake-up self-connect) records nothing.
+fn serve(
+    stream: &mut (impl Read + Write),
+    routes: &mut HashMap<String, Vec<Reply>>,
+    consumed: &mut HashMap<String, usize>,
+    seen: &Mutex<Vec<SeenRequest>>,
+) {
+    let Some(request) = read_request(stream) else {
+        return;
+    };
+    let route = request.route();
+    seen.lock().expect("mock hub log poisoned").push(request);
+
+    let (status, body) = match routes.get_mut(&route) {
+        Some(replies) if !replies.is_empty() => {
+            let index = consumed.entry(route.clone()).or_insert(0);
+            let reply = replies[(*index).min(replies.len() - 1)].clone();
+            *index += 1;
+            reply
+        }
+        _ => (404, String::from("{}")),
+    };
+    let response = format!(
+        "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes());
+    let _ = stream.flush();
+}
+
+/// A throw-away self-signed server certificate for `127.0.0.1`, made with
+/// the `openssl` CLI exactly like `banto-tagclient`'s pin tests.
+pub struct TestCertificate {
+    _temp: tempfile::TempDir,
+    pub pem: String,
+    pub server: Arc<rustls::ServerConfig>,
+}
+
+impl TestCertificate {
+    pub fn generate() -> Self {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cert = temp.path().join("server.pem");
+        let key = temp.path().join("server.key");
+        let output = Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
+            ])
+            .arg("-keyout")
+            .arg(&key)
+            .arg("-out")
+            .arg(&cert)
+            .args([
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+                "-addext",
+                "basicConstraints=critical,CA:FALSE",
+            ])
+            .output()
+            .expect("OpenSSL is required for the temporary TLS fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let pem = std::fs::read_to_string(&cert).expect("read cert");
+        let certs = CertificateDer::pem_file_iter(&cert)
+            .expect("cert pem")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("cert der");
+        let key = PrivateKeyDer::from_pem_file(&key).expect("key pem");
+        let server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("protocol versions")
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .expect("server config");
+        Self {
+            _temp: temp,
+            pem,
+            server: Arc::new(server),
+        }
+    }
+}
+
+fn read_request(stream: &mut (impl Read + Write)) -> Option<SeenRequest> {
     let mut raw = Vec::new();
     let mut buffer = [0u8; 1024];
     let header_end = loop {

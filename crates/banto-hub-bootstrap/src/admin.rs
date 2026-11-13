@@ -28,6 +28,7 @@
 //! is *not* an admin route: see its doc comment for why the 401/403 split
 //! (and, #446, the tripped-key 403) cannot come from `fetch_catalog` alone.
 
+use banto_tagclient::PinnedHubTls;
 use reqwest::{Client, ClientBuilder, StatusCode, Url};
 use serde::Deserialize;
 use zeroize::Zeroizing;
@@ -143,7 +144,7 @@ pub(crate) enum IssueOutcome {
 
 /// Validate and normalize a Hub base URL.
 ///
-/// Mirrors `banto_tagclient::Endpoint`'s contract (plain `http`, a host, no
+/// Mirrors `banto_tagclient::Endpoint`'s contract (`http` or `https`, a host, no
 /// userinfo/query/fragment, no port `0`) because the same string is handed
 /// to `Endpoint::new` for the catalog check; keeping a private `Url` here as
 /// well is what lets this module build the two admin routes, which
@@ -155,12 +156,13 @@ pub(crate) fn base_url(endpoint: &str) -> Result<Url> {
     // `banto_tagclient::Endpoint::new` does.
     if raw
         .strip_prefix("http://")
+        .or_else(|| raw.strip_prefix("https://"))
         .is_some_and(|rest| rest.split(['/', '?', '#']).next().is_none_or(str::is_empty))
     {
         return Err(Error::new(ErrorKind::InvalidEndpoint));
     }
     let mut base = Url::parse(raw).map_err(|_| Error::new(ErrorKind::InvalidEndpoint))?;
-    if base.scheme() != "http"
+    if !matches!(base.scheme(), "http" | "https")
         || base.host_str().is_none()
         || !base.username().is_empty()
         || base.password().is_some()
@@ -241,15 +243,21 @@ impl AdminClient {
     /// Redirects and proxies are disabled for the same reasons
     /// `banto_tagclient::RestClient` disables them: a redirect would move
     /// a credential-bearing request somewhere the caller never named.
-    pub(crate) fn new(base: Url) -> Result<Self> {
-        let http = ClientBuilder::new()
+    ///
+    /// With `pins`, only the pinned Hub certificate is trusted (the caller
+    /// has already checked that `base` is `https`); without, the client is the
+    /// plain-HTTP one it always was.
+    pub(crate) fn new(base: Url, pins: Option<&PinnedHubTls>) -> Result<Self> {
+        let mut builder = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .build()
-            .map_err(|_| {
-                tracing::warn!("failed to build the banto-hub admin client");
-                Error::new(ErrorKind::InvalidEndpoint)
-            })?;
+            .no_proxy();
+        if let Some(pins) = pins {
+            builder = pins.configure_reqwest(builder);
+        }
+        let http = builder.build().map_err(|_| {
+            tracing::warn!("failed to build the banto-hub admin client");
+            Error::new(ErrorKind::InvalidEndpoint)
+        })?;
         Ok(Self { http, base })
     }
 
@@ -562,8 +570,11 @@ mod tests {
     #[test]
     fn base_url_matches_the_tagclient_endpoint_contract() {
         for input in [
-            "https://example.test",
             "ws://example.test",
+            "https://name:pass@example.test",
+            "https://example.test#fragment",
+            "https:///missing-host",
+            "https://example.test:0",
             "http://name@example.test",
             "http://name:pass@example.test",
             "http://example.test?query=1",
@@ -585,6 +596,14 @@ mod tests {
         assert_eq!(
             base_url("  http://example.test/hub///  ").unwrap().as_str(),
             "http://example.test/hub/"
+        );
+        assert_eq!(
+            base_url("  https://127.0.0.1:8723  ").unwrap().as_str(),
+            "https://127.0.0.1:8723/"
+        );
+        assert_eq!(
+            base_url("https://example.test/hub///").unwrap().as_str(),
+            "https://example.test/hub/"
         );
     }
 
@@ -631,6 +650,14 @@ mod tests {
         assert_eq!(
             keyring_account(&base_url("http://example.test:80").unwrap(), "inst-1"),
             keyring_account(&base_url("http://example.test").unwrap(), "inst-1")
+        );
+        assert_eq!(
+            keyring_account(&base_url("https://example.test").unwrap(), "inst-1"),
+            "hub:example.test:443/:inst-1"
+        );
+        assert_eq!(
+            keyring_account(&base_url("https://example.test:443").unwrap(), "inst-1"),
+            keyring_account(&base_url("https://example.test").unwrap(), "inst-1")
         );
     }
 

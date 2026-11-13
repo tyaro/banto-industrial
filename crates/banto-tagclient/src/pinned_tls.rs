@@ -276,6 +276,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn new_pinned_refuses_http_and_fetches_over_https_with_the_pin() {
+        let cert = TestCertificate::generate();
+        let pins = PinnedHubTls::from_pem(std::slice::from_ref(&cert.pem)).unwrap();
+        let secret = || SecretApiKey::new("bh_dummy.secret".to_string()).unwrap();
+
+        let error = RestClient::new_pinned(
+            Endpoint::new("http://127.0.0.1:1").unwrap(),
+            secret(),
+            pins.clone(),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidEndpoint);
+
+        let (url, server) = http_once(&cert, catalog_response()).await;
+        let client = RestClient::new_pinned(Endpoint::new(&url).unwrap(), secret(), pins).unwrap();
+        assert_eq!(client.fetch_catalog().await.unwrap().revision, 1);
+        assert!(server.await.unwrap().contains("Bearer bh_dummy.secret"));
+    }
+
+    #[tokio::test]
     async fn wrong_pin_fails_before_the_bearer_header_reaches_the_listener() {
         let real = TestCertificate::generate();
         let other = TestCertificate::generate();
