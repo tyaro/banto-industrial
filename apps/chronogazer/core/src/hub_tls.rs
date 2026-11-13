@@ -21,8 +21,9 @@
 //!
 //! `banto_hub_bootstrap::HubTlsSource` として 1 回の操作ごとに 1 回聞かれる。証明書は
 //! そのたびに置き場を確かめて読み直すので、管理者が `prepare-hub-tls --renew` で作り直しても
-//! ChronoGazer の再起動は要らない（購読は [`HubTlsPolicy::pin_marker`] が変わったときに
-//! 張り直す。`crate::hub` の `reconcile_generation`）。
+//! ChronoGazer の再起動は要らない（購読は [`HubTlsPolicy::marker_for`] の目印が変わったときに
+//! 張り直す。`crate::hub` の `reconcile_generation` と、再接続中の世代を見張りが確かめる
+//! `supervise_once`）。
 //!
 //! # 保存済みの loopback の http
 //!
@@ -41,7 +42,7 @@
 
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 use banto_hub_bootstrap::{
     Error as BootstrapError, ErrorKind as BootstrapErrorKind, HubTlsSource, Url,
@@ -117,14 +118,11 @@ enum Loopback {
     PlainHttp,
 }
 
-/// ChronoGazer の Hub 接続の TLS の決まり（モジュール doc）。`Clone` は同じ決まりと同じ
-/// [`pin_marker`](Self::pin_marker) を共有する。
+/// ChronoGazer の Hub 接続の TLS の決まり（モジュール doc）。状態を持たない（`Clone` は
+/// 同じ決まり）。
 #[derive(Clone)]
 pub struct HubTlsPolicy {
     loopback: Loopback,
-    /// 直近の操作で使った pin の目印（証明書の PEM のハッシュ）。pin を使わなかった
-    /// （http・断った）ときは `None`。
-    marker: Arc<Mutex<Option<u64>>>,
 }
 
 impl HubTlsPolicy {
@@ -139,7 +137,6 @@ impl HubTlsPolicy {
     pub fn plain_loopback_http_for_dev() -> Self {
         Self {
             loopback: Loopback::PlainHttp,
-            marker: Arc::default(),
         }
     }
 
@@ -147,18 +144,23 @@ impl HubTlsPolicy {
     pub(crate) fn with_reader(reader: Arc<dyn HubCertReader>) -> Self {
         Self {
             loopback: Loopback::Pinned(reader),
-            marker: Arc::default(),
         }
     }
 
-    /// 直近の操作で使った pin の目印。購読の世代の同一性に混ぜ、証明書が作り直されたら
-    /// 張り直す（`crate::hub` の `reconcile_generation`）。
-    pub(crate) fn pin_marker(&self) -> Option<u64> {
-        *self.marker.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    fn remember(&self, marker: Option<u64>) {
-        *self.marker.lock().unwrap_or_else(PoisonError::into_inner) = marker;
+    /// `endpoint` に今使う pin の目印（証明書の PEM のハッシュ）を、**この呼び出しで
+    /// 証明書を読んで**返す。pin を使わない接続先（LAN の http・開発用の決まり）は
+    /// `Ok(None)`、断る接続先・読めない証明書は [`HubTlsSource::pins_for`] と同じ `Err`。
+    ///
+    /// 購読の世代の同一性に混ぜ、証明書が作り直されたら張り直す（`crate::hub` の
+    /// `reconcile_generation`・`supervise_once`）。前の呼び出しの結果を覚えて共有する
+    /// 作りにはしない - 別の接続先や失敗の呼び出しで上書きされた値と比べてしまうため。
+    ///
+    /// 解釈できない綴りは `Ok(None)`（その接続先は bootstrap が `InvalidEndpoint` で断る）。
+    pub(crate) fn marker_for(&self, endpoint: &str) -> Result<Option<u64>, BootstrapError> {
+        let Ok(base) = Url::parse(endpoint.trim()) else {
+            return Ok(None);
+        };
+        Ok(self.decide(&base)?.map(|(_, marker)| marker))
     }
 
     /// 判定の本体（純関数に近い形。証明書を読むのは loopback の https のときだけ）。
@@ -190,20 +192,7 @@ impl HubTlsPolicy {
 
 impl HubTlsSource for HubTlsPolicy {
     fn pins_for(&self, base: &Url) -> banto_hub_bootstrap::Result<Option<PinnedHubTls>> {
-        match self.decide(base) {
-            Ok(Some((pins, marker))) => {
-                self.remember(Some(marker));
-                Ok(Some(pins))
-            }
-            Ok(None) => {
-                self.remember(None);
-                Ok(None)
-            }
-            Err(error) => {
-                self.remember(None);
-                Err(error)
-            }
-        }
+        Ok(self.decide(base)?.map(|(pins, _)| pins))
     }
 }
 
@@ -310,7 +299,14 @@ mod tests {
             0,
             "http is refused without reading the certificate"
         );
-        assert_eq!(policy.pin_marker(), None);
+        assert_eq!(
+            policy
+                .marker_for("http://127.0.0.1:8722")
+                .unwrap_err()
+                .kind(),
+            BootstrapErrorKind::HubTls
+        );
+        assert_eq!(cert.reads(), 0);
     }
 
     #[test]
@@ -323,24 +319,33 @@ mod tests {
             .unwrap()
             .is_some());
         assert_eq!(cert.reads(), 1);
-        let marker = policy.pin_marker();
+        let marker = policy.marker_for("https://127.0.0.1:8723").unwrap();
         assert!(marker.is_some());
+        assert_eq!(cert.reads(), 2, "the marker reads the certificate itself");
         assert!(policy
             .pins_for(&url("https://localhost:8723/"))
             .unwrap()
             .is_some());
-        assert_eq!(cert.reads(), 2, "read again on every operation (renew)");
-        assert_eq!(policy.pin_marker(), marker, "the same certificate");
+        assert_eq!(cert.reads(), 3, "read again on every operation (renew)");
+        assert_eq!(
+            policy.marker_for("https://localhost:8723").unwrap(),
+            marker,
+            "the same certificate"
+        );
+        // pin を使わない接続先は目印なし（証明書も読まない）。
+        assert_eq!(policy.marker_for("http://192.168.11.5:8722").unwrap(), None);
+        assert_eq!(cert.reads(), 4);
     }
 
     #[test]
     fn a_renewed_certificate_changes_the_marker() {
         let first = production_with(&FakeCert::new(Ok(cert_pem().into_bytes())));
         let second = production_with(&FakeCert::new(Ok(cert_pem().into_bytes())));
-        let base = url("https://127.0.0.1:8723/");
-        first.pins_for(&base).unwrap();
-        second.pins_for(&base).unwrap();
-        assert_ne!(first.pin_marker(), second.pin_marker());
+        let base = "https://127.0.0.1:8723";
+        assert_ne!(
+            first.marker_for(base).unwrap(),
+            second.marker_for(base).unwrap()
+        );
     }
 
     #[test]
