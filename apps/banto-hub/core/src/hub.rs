@@ -1188,13 +1188,6 @@ impl CollectorManager {
         }
     }
 
-    /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
-    /// （`apply_run`/`sync_broker_sessions_from`/`log_simulation_warnings`）を
-    /// `hub_log::log_line`/`log_err_line` 経由にルーティングし、Windows
-    /// サービスモードでもサービスログファイルへ届くようにする - `bin/
-    /// banto_hub` が呼ぶ。これを呼ばなければ既定の素の
-    /// `println!`/`eprintln!` 相当のまま（`crate::diag_log` モジュール doc
-    /// 参照）。
     /// tstore の置き場を差し替える（#623 PR4b）。`crate::runtime::HubRuntime::start` が、
     /// 実効のデータのフォルダが profile の `data\`（握ったフォルダ）のときに
     /// [`banto_tstore::DataPlace::Managed`]（`expected` は profile の
@@ -1206,6 +1199,13 @@ impl CollectorManager {
         self
     }
 
+    /// T9-2 フォローアップ (2026-08-06): この manager の診断ログ
+    /// （`apply_run`/`sync_broker_sessions_from`/`log_simulation_warnings`）を
+    /// `hub_log::log_line`/`log_err_line` 経由にルーティングし、Windows
+    /// サービスモードでもサービスログファイルへ届くようにする - `bin/
+    /// banto_hub` が呼ぶ。これを呼ばなければ既定の素の
+    /// `println!`/`eprintln!` 相当のまま（`crate::diag_log` モジュール doc
+    /// 参照）。
     pub fn with_diag_log(mut self, diag_log: DiagLog) -> Self {
         // 外部 DB 連携 S2: DB Source のタスクも同じ宛先へ流す（`db_source`
         // フィールドの doc comment 参照 - Windows サービスモードで warn が
