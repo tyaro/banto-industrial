@@ -474,6 +474,18 @@ impl ManagedDir {
         }
     }
 
+    /// 呼ぶ側が辿らずに開いて確かめた [`crate::acl::PinnedDir`]（[`crate::acl::pin_dir`]・
+    /// [`crate::acl::PinnedDir::open_child_dir`] など）を、[`Mode::Guarded`] の管理するフォルダ
+    /// として扱う（#644 PR1a。`banto-hub-elev prepare-hub-tls` が、自分で確かめた `tls\` の中の
+    /// 付け替え・削除に [`ManagedDir::rename_no_replace`]・[`ManagedDir::remove`] を使うため）。
+    /// 場所・形の確かめはしない（[`open_root`]・[`SafeRoot::open_managed`] を通っていない）ので、
+    /// 呼ぶ側が確かめ終えたものだけを渡す。表示用のパスは [`crate::acl::PinnedDir::path`]。
+    #[cfg(windows)]
+    pub fn from_pinned(pinned: crate::acl::PinnedDir) -> Self {
+        let display = pinned.path().to_path_buf();
+        Self::guarded(pinned, display)
+    }
+
     /// 表示用のパス（渡された綴り + 名前）。
     pub fn path(&self) -> &Path {
         &self.display

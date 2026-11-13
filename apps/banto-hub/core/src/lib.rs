@@ -141,6 +141,10 @@
 //!   `%ProgramData%\BantoHub\sink\` を、確かめ終えてから SYSTEM・Administrators だけの
 //!   保護された DACL・所有者 Administrators に整え、中の設定ファイルを整え直し、`.example`
 //!   を差し替える
+//! - [`hub_tls_prepare`]: `banto-hub-elev prepare-hub-tls`（#644 PR1a）。Hub の loopback TLS の
+//!   鍵（ECDSA P-256）と自己署名の証明書（10 年）を `%ProgramData%\BantoHub\tls\` に、作るのと
+//!   同時に保護された DACL（鍵は SYSTEM・Administrators だけ、証明書と置き場は利用者に読み取り）を
+//!   付けて作る。既にあれば確かめて保つ。作り直しは `--renew`
 //! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」
@@ -237,6 +241,7 @@ pub mod http_hub_health;
 pub mod hub;
 pub mod hub_health;
 pub mod hub_log;
+pub mod hub_tls_prepare;
 pub mod ingest;
 pub mod mcp;
 pub mod mqtt;

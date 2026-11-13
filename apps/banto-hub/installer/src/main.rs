@@ -77,7 +77,9 @@
 //! と Operators グループ・ACL 一式）→ `banto-hub-sink.exe install` →
 //! `banto-hub-sink.exe grant-service-acl` → `banto-hub-elev.exe
 //! prepare-sink-config`（#630: 保護された置き場 `%ProgramData%\BantoHub\sink\` を
-//! 整え、`$INSTDIR` の `banto-hub-sink.toml.example` をそこへ差し替える）→ PREINSTALL で止めた
+//! 整え、`$INSTDIR` の `banto-hub-sink.toml.example` をそこへ差し替える）→ `banto-hub-elev.exe
+//! prepare-hub-tls`（#644 PR1a: Hub の loopback TLS の鍵と証明書を
+//! `%ProgramData%\BantoHub\tls\` に、無いときだけ保護された DACL で作る）→ PREINSTALL で止めた
 //! サービスの再開、の順で実行する。サービスの停止・シェルの終了・再開の部品は
 //! ChronoGazer のインストーラと共通の `installer-common/service-common.nsh` にあり、
 //! このツールがフックの先頭へその絶対パスを `!define` してから tauri-bundler に渡す

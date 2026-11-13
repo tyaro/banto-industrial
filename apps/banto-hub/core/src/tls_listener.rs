@@ -97,7 +97,7 @@ impl TlsConfig {
         }
     }
 
-    fn acceptor(&self) -> Result<TlsAcceptor, TlsError> {
+    pub(crate) fn acceptor(&self) -> Result<TlsAcceptor, TlsError> {
         // Do not include the key file or parser's input in errors or logs.
         let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(&self.cert)
             .map_err(|_| TlsError::Certificate)?

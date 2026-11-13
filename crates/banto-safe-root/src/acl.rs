@@ -765,6 +765,31 @@ pub fn exposure(security: &FileSecurity) -> Vec<Exposure> {
     found
 }
 
+/// `BUILTIN\Users`（#644 PR1a）。[`exposure_beyond_users_read`] だけが読み取りを許す。
+pub const BUILTIN_USERS_SID: &str = "S-1-5-32-545";
+
+/// [`exposure`] から、`BUILTIN\Users` への**読み取りだけ**の許可を除いたもの（純関数、#644
+/// PR1a）。Hub の loopback TLS の置き場 `tls\` と証明書（公開してよい。クライアントが pin として
+/// 読む）の確かめに使う。除くのは、種類が普通の許可（`ACCESS_ALLOWED_ACE_TYPE`）で、相手が
+/// `BUILTIN\Users`、マスクが [`READ_EXECUTE_ACCESS_MASK`] に収まる ACE だけ（継承のフラグは
+/// 問わない）。それより広い許可（書き込み・汎用の権利の bit など）、条件付き・オブジェクトの
+/// 許可、ほかの相手への許可は [`exposure`] と同じく理由に残す。秘密鍵の確かめには使わない
+/// （鍵は [`exposure`] で SYSTEM・Administrators だけを許す）。
+pub fn exposure_beyond_users_read(security: &FileSecurity) -> Vec<Exposure> {
+    exposure(security)
+        .into_iter()
+        .filter(|found| {
+            !matches!(
+                found,
+                Exposure::AllowsOther { ace_type, mask, sid, .. }
+                    if *ace_type == ACCESS_ALLOWED_ACE_TYPE
+                        && sid == BUILTIN_USERS_SID
+                        && mask & !READ_EXECUTE_ACCESS_MASK == 0
+            )
+        })
+        .collect()
+}
+
 /// パスを**辿らずに**開き（最後の要素がリンクでもそのものを開く）、開いたハンドルから属性・
 /// リンク数・所有者・DACL を読む（#630。ファイルでもフォルダでもよい）。無ければ `Ok(None)`。
 /// 中身は読まない（`READ_CONTROL | FILE_READ_ATTRIBUTES` だけを求め、共有はすべて許す）。
@@ -1253,6 +1278,29 @@ impl PinnedDir {
         imp::create_child_file(self, name, contents)
     }
 
+    /// [`PinnedDir::create_child_dir`] の、記述子を「SYSTEM・Administrators にフル、
+    /// `BUILTIN\Users` に読み取りと実行、所有者 `BUILTIN\Administrators`、保護された DACL
+    /// （`OICI`）」に固定した版（#644 PR1a。Hub の loopback TLS の置き場 `tls\`。後の PR で
+    /// クライアントが証明書を pin として読むため、利用者が読めるフォルダにする）。作るのと同時に
+    /// 付ける。所有者を Administrators にするので、昇格した管理者・SYSTEM でしか作れない。既に
+    /// あれば `Ok(None)`。作った後の確かめ（[`exposure_beyond_users_read`]）は呼ぶ側がする。
+    pub fn create_child_dir_users_read(&self, name: &str) -> Result<Option<PinnedDir>> {
+        imp::create_child_dir_users_read(self, name)
+    }
+
+    /// [`PinnedDir::create_child_file`] の、記述子を「SYSTEM・Administrators にフル、
+    /// `BUILTIN\Users` に読み取りと実行、所有者 `BUILTIN\Administrators`、保護された DACL
+    /// （継承のフラグ無し）」に固定した版（#644 PR1a。Hub の loopback TLS の証明書）。作り・
+    /// 書き方・失敗したときに作ったハンドルで消すことは同じで、読み戻しの確かめは
+    /// [`exposure_beyond_users_read`] が空であること。
+    pub fn create_child_file_users_read(
+        &self,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Option<PinnedFile>> {
+        imp::create_child_file_users_read(self, name, contents)
+    }
+
     /// このフォルダ（確かめ済みの開いたハンドル）を基準に、名前 1 要素の子を**相対で辿らずに**
     /// 開く（#630 PR-2。`banto-hub-elev prepare-sink-config` が、置き場の中の設定ファイルの
     /// 所有者・DACL を整え直し（[`PinnedFile::reset_acl`]）、`.example` を消して作り直す
@@ -1739,9 +1787,24 @@ pub(crate) mod imp {
         Ok(LocalBox(sd))
     }
 
-    /// テスト用: 任意の SDDL から自己相対の記述子を作る（管理者でなくても書ける、所有者が自分の
-    /// 記述子で [`walk_dir`] を直接回す。#623 S-1）。
-    #[cfg(test)]
+    /// SYSTEM・Administrators にフル、`BUILTIN\Users` に「読み取りと実行」、所有者
+    /// `BUILTIN\Administrators`、保護された DACL の記述子（#644 PR1a。Hub の loopback TLS の
+    /// 置き場 `tls\` と、その中の証明書）。`inheritable` の意味は [`owned_protected_sd`] と同じ
+    /// （真ならフォルダ用の `OICI`、偽ならファイル用の継承のフラグ無し）。
+    pub(crate) fn users_read_sd(inheritable: bool) -> Result<LocalBox> {
+        let flags = if inheritable { "OICI" } else { "" };
+        sd_from_sddl(&format!(
+            "O:BAD:P(A;{flags};FA;;;{})(A;{flags};FA;;;{})(A;{flags};{:#x};;;{})",
+            super::SYSTEM_SID,
+            super::ADMINISTRATORS_SID,
+            super::READ_EXECUTE_ACCESS_MASK,
+            super::BUILTIN_USERS_SID,
+        ))
+    }
+
+    /// 決まった SDDL から自己相対の記述子を作る。本番では [`users_read_sd`]（#644 PR1a）が使い、
+    /// テストでは任意の SDDL（管理者でなくても書ける、所有者が自分の記述子で [`walk_dir`] を
+    /// 直接回す。#623 S-1）に使う。**利用者の入力から組み立てた SDDL を渡さない**。
     pub(crate) fn sd_from_sddl(sddl: &str) -> Result<LocalBox> {
         let sddl = wide_str(sddl);
         let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -3193,7 +3256,46 @@ pub(crate) mod imp {
     ) -> Result<Option<super::PinnedFile>> {
         // ファイル用（継承のフラグなし）・所有者 Administrators・保護された DACL。
         let descriptor = owned_protected_sd(&DirAccess::service_only(), false)?;
-        let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(Some(&descriptor)))?
+        create_child_file_with(parent, name, contents, &descriptor, super::exposure)
+    }
+
+    /// [`super::PinnedDir::create_child_dir_users_read`] の本体（#644 PR1a）。
+    pub(super) fn create_child_dir_users_read(
+        parent: &super::PinnedDir,
+        name: &str,
+    ) -> Result<Option<super::PinnedDir>> {
+        let descriptor = users_read_sd(true)?;
+        child_relative(parent, name, ChildHow::Create(Some(&descriptor)))?
+            .map(|handle| pinned_from_handle(handle, &parent.path.join(name)))
+            .transpose()
+    }
+
+    /// [`super::PinnedDir::create_child_file_users_read`] の本体（#644 PR1a）。
+    pub(super) fn create_child_file_users_read(
+        parent: &super::PinnedDir,
+        name: &str,
+        contents: &[u8],
+    ) -> Result<Option<super::PinnedFile>> {
+        let descriptor = users_read_sd(false)?;
+        create_child_file_with(
+            parent,
+            name,
+            contents,
+            &descriptor,
+            super::exposure_beyond_users_read,
+        )
+    }
+
+    /// `descriptor` を作るのと同時に付けてファイルを作り、書き、読み戻して `check` が空であることを
+    /// 確かめる（[`create_child_file`] と [`create_child_file_users_read`] の共通の本体）。
+    fn create_child_file_with(
+        parent: &super::PinnedDir,
+        name: &str,
+        contents: &[u8],
+        descriptor: &LocalBox,
+        check: fn(&super::FileSecurity) -> Vec<super::Exposure>,
+    ) -> Result<Option<super::PinnedFile>> {
+        let Some(handle) = child_relative(parent, name, ChildHow::CreateFile(Some(descriptor)))?
         else {
             return Ok(None);
         };
@@ -3202,7 +3304,7 @@ pub(crate) mod imp {
             write_all_and_flush(handle.raw(), contents)?;
             let security = security_of_handle(handle.raw())?;
             #[cfg_attr(not(test), allow(unused_mut))]
-            let mut found = super::exposure(&security);
+            let mut found = check(&security);
             #[cfg(test)]
             if FORCE_EXPOSED.with(std::cell::Cell::get) {
                 found.push(super::Exposure::NullDacl);
@@ -4350,6 +4452,47 @@ pub(crate) mod tests {
                 Exposure::NullDacl,
             ]
         );
+    }
+
+    /// `BUILTIN\Users` への読み取りだけの許可は除き、それ以外は [`exposure`] のまま（#644 PR1a）。
+    #[test]
+    fn exposure_beyond_users_read_allows_only_plain_users_read() {
+        // 読み取りと実行（継承のフラグは問わない）・読み取りだけは除く。
+        for (flags, mask) in [(0, READ_EXECUTE_ACCESS_MASK), (0x03, 0x0012_0089)] {
+            let security = with_ace(any_ace(0, flags, mask, BUILTIN_USERS_SID));
+            assert_eq!(exposure_beyond_users_read(&security), vec![], "{mask:#x}");
+            assert_eq!(exposure(&security).len(), 1, "exposure は数える");
+        }
+        // 書き込み・汎用の読み取り・条件付きの許可・ほかの相手は残す。
+        let wider = [
+            any_ace(0, 0, MODIFY_ACCESS_MASK, BUILTIN_USERS_SID),
+            any_ace(0, 0, READ_EXECUTE_ACCESS_MASK | 0x2, BUILTIN_USERS_SID),
+            any_ace(0, 0x0B, 0x8000_0000, BUILTIN_USERS_SID),
+            any_ace(9, 0, READ_EXECUTE_ACCESS_MASK, BUILTIN_USERS_SID),
+            any_ace(0, 0, READ_EXECUTE_ACCESS_MASK, "S-1-5-11"),
+            any_ace(0, 0, READ_EXECUTE_ACCESS_MASK, "S-1-1-0"),
+        ];
+        for ace in wider {
+            let security = with_ace(ace.clone());
+            assert_eq!(
+                exposure_beyond_users_read(&security),
+                allows(&ace),
+                "{ace:?}"
+            );
+        }
+        // 所有者・リンク・null DACL は exposure と同じ。
+        let mut worst = with_ace(any_ace(0, 0, READ_EXECUTE_ACCESS_MASK, BUILTIN_USERS_SID));
+        worst.dacl.owner = BUILTIN_USERS_SID.to_owned();
+        worst.links = 2;
+        assert_eq!(
+            exposure_beyond_users_read(&worst),
+            vec![
+                Exposure::HardLinked(2),
+                Exposure::ForeignOwner(BUILTIN_USERS_SID.to_owned()),
+            ]
+        );
+        worst.dacl.aces = None;
+        assert_eq!(exposure_beyond_users_read(&worst), exposure(&worst));
     }
 
     #[test]
@@ -6106,6 +6249,78 @@ pub(crate) mod tests {
                 !root.path().join("rolled-back.toml").exists(),
                 "作ったファイルが消えていない"
             );
+        }
+
+        /// `BUILTIN\Users` に読み取りを許す版（#644 PR1a）: フォルダもファイルも、作るのと同時に
+        /// 保護された DACL・所有者 Administrators・Users の読み取りが付き、それより広い許可は
+        /// 無い。所有者を Administrators にするので、管理者でなければ何も作らずに失敗する。
+        #[test]
+        fn create_users_read_attaches_the_dacl_at_creation() {
+            let root = tempfile::tempdir().unwrap();
+            let parent = pin_dir(root.path()).unwrap().unwrap();
+            if !is_elevated_admin() {
+                assert!(parent.create_child_dir_users_read("tls").is_err());
+                assert!(!root.path().join("tls").exists(), "何も作らない");
+                assert!(parent
+                    .create_child_file_users_read("hub-cert.pem", b"cert")
+                    .is_err());
+                assert!(!root.path().join("hub-cert.pem").exists(), "何も作らない");
+                eprintln!("skip: 所有者を Administrators にする作成は管理者でだけ確かめる（CI）");
+                return;
+            }
+            let tls = parent.create_child_dir_users_read("tls").unwrap().unwrap();
+            let security = tls.security().unwrap();
+            assert!(security.dacl.protected, "{security:?}");
+            assert_eq!(security.dacl.owner, ADMINISTRATORS_SID);
+            assert_eq!(
+                exposure_beyond_users_read(&security),
+                vec![],
+                "{security:?}"
+            );
+            let users: Vec<_> = security
+                .dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|ace| ace.sid == BUILTIN_USERS_SID)
+                .collect();
+            assert_eq!(users.len(), 1, "{security:?}");
+            assert_eq!(users[0].mask, READ_EXECUTE_ACCESS_MASK);
+            assert_eq!(
+                users[0].flags & INHERIT_FLAGS,
+                INHERIT_FLAGS,
+                "フォルダは OICI"
+            );
+            assert!(parent.create_child_dir_users_read("tls").unwrap().is_none());
+
+            let mut cert = tls
+                .create_child_file_users_read("hub-cert.pem", b"cert")
+                .unwrap()
+                .unwrap();
+            assert_eq!(cert.read_to_end(64).unwrap(), b"cert");
+            let file = cert.security().clone();
+            assert!(file.dacl.protected && file.links == 1, "{file:?}");
+            assert_eq!(file.dacl.owner, ADMINISTRATORS_SID);
+            assert_eq!(exposure_beyond_users_read(&file), vec![]);
+            assert!(file
+                .dacl
+                .aces
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|ace| ace.flags & INHERIT_FLAGS == 0));
+            drop(cert);
+            assert!(tls
+                .create_child_file_users_read("hub-cert.pem", b"other")
+                .unwrap()
+                .is_none());
+            // 中の秘密のファイルは従来どおり Users に開かない。
+            let key = tls
+                .create_child_file("hub-key.pem", b"key")
+                .unwrap()
+                .unwrap();
+            assert_eq!(exposure(key.security()), vec![]);
         }
 
         /// 記述子を書く・消す権利で開く（#630 PR-2）。中身は読めない。持っている間はほかの

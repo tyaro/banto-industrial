@@ -341,7 +341,7 @@ pub enum DirLevel {
 ///   ものでありうる。所有者だけ取り直すと、それを正規の置き場として使い続けることになる
 ///   （`prepare-sink-config` は `sink\` の中へ再帰して書かない）。消せば、次の実行が保護された
 ///   DACL で作り直す。
-fn dir_refusal_text(level: DirLevel, dir: &Path, refusal: &DataAclRefusal) -> String {
+pub(crate) fn dir_refusal_text(level: DirLevel, dir: &Path, refusal: &DataAclRefusal) -> String {
     let reason = match refusal {
         DataAclRefusal::ReparsePoint => "ジャンクションかシンボリックリンク（reparse point）です。リンクの先を書き換えないよう、止めます（リンクを外してから、もう一度実行してください）".to_string(),
         DataAclRefusal::NotADirectory => "フォルダではありません。止めます".to_string(),
@@ -365,7 +365,12 @@ fn dir_refusal_text(level: DirLevel, dir: &Path, refusal: &DataAclRefusal) -> St
 }
 
 /// 本当のパスの断りの文言。
-fn real_path_text(label: &str, expected: &Path, real: &Path, refusal: RealPathRefusal) -> String {
+pub(crate) fn real_path_text(
+    label: &str,
+    expected: &Path,
+    real: &Path,
+    refusal: RealPathRefusal,
+) -> String {
     match refusal {
         RealPathRefusal::Mismatch => format!(
             "{label}（{}）の本当の場所（{}）が期待と違います。途中のフォルダがジャンクションか短い名前の可能性があります。止めます",
