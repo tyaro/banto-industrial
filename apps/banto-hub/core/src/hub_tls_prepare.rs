@@ -63,7 +63,7 @@
 //!   変えずに断る。
 //! - ルートの DACL は書かない（`prepare-sink-config` と同じ。`profiles\` を巻き込まない）。
 //!   確かめて、合わなければ断る（[`root_dacl_problems`]。`tls\` の証明書は後でクライアントが
-//!   pin の根に使うので、sink の `dir_acl_plan` より厳しく、昇格した本人が所有者でも断る）。
+//!   pin の根に使うので、SYSTEM・Administrators・昇格した本人以外の所有者や広い許可は断る）。
 //!   既にある `tls\` の DACL も書き直さない（確かめて、合わなければ断る）。
 //!
 //! ## 出力・終了コード
@@ -553,22 +553,26 @@ const INHERIT_ONLY_ACE_FLAG: u8 = 0x08;
 /// 普通の許可（`ACCESS_ALLOWED_ACE_TYPE`）で inherit-only の ACE と、オブジェクト自身に効くが
 /// [`ROOT_TAKEOVER_MASK`] のどれも含まない ACE を除いたもの。残るのは:
 ///
-/// - 所有者が SYSTEM・Administrators・TrustedInstaller 以外（**昇格した本人も**。所有者は DACL に
-///   関わらず ACL を書き換えられる。`tls\` の証明書は後でクライアントが pin の根に使うので、
-///   sink の `dir_acl_plan` より厳しくする）。
+/// - 所有者が SYSTEM・Administrators・TrustedInstaller・`elevated`（実行した管理者本人）以外
+///   （所有者は DACL に関わらず ACL を書き換えられる）。本人は昇格できる管理者なので、sink の
+///   `dir_acl_plan` と同じく信頼する。ルートを継承で作ると、作った本人が所有者になり、親の
+///   `CREATOR OWNER` が本人へのフルの ACE になるため、これを断ると管理者の通常の実行が通らない。
 /// - null DACL・種類の分からない ACE・SID が読めない ACE。
-/// - 信頼する相手以外への、条件付き・オブジェクトの許可（中身を評価しないので、継承のフラグ・
-///   マスクを問わず断る側に倒す）。
+/// - 信頼する相手（`elevated` を含む）以外への、条件付き・オブジェクトの許可（中身を評価しない
+///   ので、継承のフラグ・マスクを問わず断る側に倒す）。
 /// - 信頼する相手以外への、オブジェクト自身に効く普通の許可で、[`ROOT_TAKEOVER_MASK`] を含む
 ///   もの。
 ///
 /// 既定の形（ProgramData から継承: SYSTEM・Administrators にフル、`CREATOR OWNER` に
 /// inherit-only のフル、`BUILTIN\Users` に読み取りと `(CI)(WD,AD,WEA,WA)`、所有者
 /// Administrators）は通る。
-pub fn root_dacl_problems(security: &FileSecurity) -> Vec<Exposure> {
+pub fn root_dacl_problems(security: &FileSecurity, elevated: Option<&str>) -> Vec<Exposure> {
     exposure(security)
         .into_iter()
         .filter(|found| match found {
+            // 実行した管理者本人（所有者としても、ACE の相手としても）は信頼する。
+            Exposure::ForeignOwner(sid) => Some(sid.as_str()) != elevated,
+            Exposure::AllowsOther { sid, .. } if Some(sid.as_str()) == elevated => false,
             Exposure::AllowsOther {
                 ace_type,
                 flags,
@@ -789,10 +793,10 @@ fn run<O: HubTlsOps>(
             plan.root.display()
         )
     })?;
-    let root_open = root_dacl_problems(&root_security);
+    let root_open = root_dacl_problems(&root_security, elevated);
     if !root_open.is_empty() {
         return Err(format!(
-            "{ROOT_LABEL}（{}）は保護されていません（{}）。一般の利用者が {TLS_DIR}\\ を消して差し替えられる恐れがあるため、何も変えずに止めます（{RENEW_FLAG} でも）。所有者を Administrators にし（takeown /a）、SYSTEM・Administrators 以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、もう一度実行してください",
+            "{ROOT_LABEL}（{}）は保護されていません（{}）。一般の利用者が {TLS_DIR}\\ を消して差し替えられる恐れがあるため、何も変えずに止めます（{RENEW_FLAG} でも）。所有者を Administrators にし（takeown /a）、SYSTEM・Administrators・実行した管理者以外への削除・子の削除・ACL と所有者の変更・書き込み・フルの許可を外してから、もう一度実行してください",
             plan.root.display(),
             reasons_text(&root_open)
         ));

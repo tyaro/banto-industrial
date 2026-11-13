@@ -1146,16 +1146,16 @@ fn root_security(owner: &str, aces: Option<Vec<ObservedAce>>) -> FileSecurity {
 #[test]
 fn root_dacl_accepts_the_default_program_data_shape() {
     assert_eq!(
-        root_dacl_problems(&root_security(
-            ADMINISTRATORS_SID,
-            Some(default_root_aces())
-        )),
+        root_dacl_problems(
+            &root_security(ADMINISTRATORS_SID, Some(default_root_aces())),
+            None
+        ),
         vec![]
     );
     // 所有者 SYSTEM・TrustedInstaller も通す。
     for owner in [SYSTEM_SID, banto_safe_root::acl::TRUSTED_INSTALLER_SID] {
         assert_eq!(
-            root_dacl_problems(&root_security(owner, Some(default_root_aces()))),
+            root_dacl_problems(&root_security(owner, Some(default_root_aces())), None),
             vec![]
         );
     }
@@ -1164,7 +1164,7 @@ fn root_dacl_accepts_the_default_program_data_shape() {
     aces.push(ace(USERS, 0x1F01FF, 0x0B));
     aces.push(ace(EVIL, 0x1000_0000, 0x08));
     assert_eq!(
-        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))),
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None),
         vec![]
     );
     // 拒否の ACE も理由にしない。
@@ -1176,7 +1176,7 @@ fn root_dacl_accepts_the_default_program_data_shape() {
         sid: EVIL.to_string(),
     });
     assert_eq!(
-        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))),
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None),
         vec![]
     );
 }
@@ -1201,7 +1201,7 @@ fn root_dacl_refuses_takeover_rights_owners_and_unreadable_aces() {
         ] {
             let mut aces = default_root_aces();
             aces.push(ace(sid, bit, flags));
-            let found = root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)));
+            let found = root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None);
             assert_eq!(
                 found,
                 vec![Exposure::AllowsOther {
@@ -1218,19 +1218,20 @@ fn root_dacl_refuses_takeover_rights_owners_and_unreadable_aces() {
     let mut aces = default_root_aces();
     aces.push(ace(USERS, MODIFY_ACCESS_MASK, 0x13));
     assert_eq!(
-        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None).len(),
         1
     );
     // 所有者が昇格した本人・一般の利用者。
-    for owner in [ME, EVIL] {
+    for (owner, elevated) in [(EVIL, None), (EVIL, Some(ME)), (ME, None), (ME, Some(EVIL))] {
         assert_eq!(
-            root_dacl_problems(&root_security(owner, Some(default_root_aces()))),
-            vec![Exposure::ForeignOwner(owner.to_string())]
+            root_dacl_problems(&root_security(owner, Some(default_root_aces())), elevated),
+            vec![Exposure::ForeignOwner(owner.to_string())],
+            "{owner} {elevated:?}"
         );
     }
     // null DACL。
     assert_eq!(
-        root_dacl_problems(&root_security(ADMINISTRATORS_SID, None)),
+        root_dacl_problems(&root_security(ADMINISTRATORS_SID, None), None),
         vec![Exposure::NullDacl]
     );
     // 条件付き（9）・オブジェクト（5）の許可は、読み取りだけ・inherit-only でも断る。
@@ -1243,7 +1244,7 @@ fn root_dacl_refuses_takeover_rights_owners_and_unreadable_aces() {
             sid: USERS.to_string(),
         });
         assert_eq!(
-            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None).len(),
             1,
             "{ace_type}"
         );
@@ -1258,11 +1259,31 @@ fn root_dacl_refuses_takeover_rights_owners_and_unreadable_aces() {
             sid: sid.to_string(),
         });
         assert_eq!(
-            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces))).len(),
+            root_dacl_problems(&root_security(ADMINISTRATORS_SID, Some(aces)), None).len(),
             1,
             "{ace_type}"
         );
     }
+}
+
+/// 実行した管理者（elevated）本人は、所有者としても、CREATOR OWNER から来るフルの ACE の相手
+/// としても信頼する（管理者がルートを継承で作ると、本人が所有者になる）。
+#[test]
+fn root_dacl_trusts_the_elevated_user() {
+    let mut aces = default_root_aces();
+    aces.push(ace(ME, 0x1F01FF, 0x13));
+    aces.push(ace(ME, 0x1000_0000, 0x00));
+    assert_eq!(
+        root_dacl_problems(&root_security(ME, Some(aces)), Some(ME)),
+        vec![]
+    );
+    // 本人にも、ほかの相手への許可は従来どおり断る。
+    let mut aces = default_root_aces();
+    aces.push(ace(EVIL, 0x1F01FF, 0x13));
+    assert_eq!(
+        root_dacl_problems(&root_security(ME, Some(aces)), Some(ME)).len(),
+        1
+    );
 }
 
 /// ルートが露出していれば、`tls\` を開きも作りもせずに断る（`--renew` でも）。既定の形の
@@ -1273,7 +1294,6 @@ fn refuses_an_exposed_root_without_opening_the_tls_dir() {
         Box::new(|e| e.aces.push(ace(USERS, 0x0000_0040, 0x13))),
         Box::new(|e| e.aces.push(ace(USERS, 0x0001_0000, 0x00))),
         Box::new(|e| e.aces.push(ace("S-1-1-0", 0x1000_0000, 0x03))),
-        Box::new(|e| e.owner = ME.to_string()),
     ];
     for edit in cases {
         for (renew, tls_exists) in [(false, true), (true, true), (false, false)] {

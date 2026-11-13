@@ -2080,8 +2080,8 @@ ECDSA with SHA-256 で自己署名を証明書の公開鍵で検証できる・�
 断るときと対処:
 
 - **ルート `%ProgramData%\BantoHub` が保護されていない**（所有者が SYSTEM・
-  Administrators・TrustedInstaller 以外 - 実行した管理者本人も含む・null DACL・
-  ほかの相手に削除・子の削除・ACL や所有者の変更・汎用の書き込み/全権・
+  Administrators・TrustedInstaller・実行した管理者（本人）以外・null DACL・
+  本人以外のほかの相手に削除・子の削除・ACL や所有者の変更・汎用の書き込み/全権・
   MAXIMUM_ALLOWED を許す ACE・条件付きなど読めない許可）: 一般の利用者が `tls\` を
   消して差し替えられるため、`tls\` を開く前に何も変えずに断ります（`--renew` でも）。
   ProgramData から継承した既定の形（Users の読み取りと、ファイル・フォルダの作成）は

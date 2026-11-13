@@ -326,8 +326,9 @@ fn refuses_an_exposed_key_and_renew_replaces_it() {
 }
 
 /// ジャンクションの `tls\`・利用者が自分で作った `tls\`（所有者がその利用者・継承の ACL）は、
-/// 何も書かずに断る（管理者でなくても走る。管理者でなければ、ルートの所有者が本人になるので
-/// `tls\` を開く前にルートの DACL の確かめで断る）。
+/// 何も書かずに断る（管理者でなくても走る。管理者でなければ、テンポラリの親から継承した本人以外の
+/// ACE があるので `tls\` を開く前にルートの DACL の確かめで断る。管理者なら本人（所有者・
+/// CREATOR OWNER 由来の ACE）は信頼され、`tls\` で断る）。
 #[test]
 fn refuses_a_junction_or_a_hand_made_tls_dir() {
     let admin = banto_service_elev::is_current_process_admin().unwrap_or(false);
