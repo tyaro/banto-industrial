@@ -40,6 +40,9 @@
 # #623 PR-1a: crates/banto-safe-root (banto-secret-store の `acl`・`guard` を移した。
 # 利用者が触れうるフォルダの木を LocalSystem が辿らずに扱う、製品に依らない部品。
 # 本番の依存は windows-sys・thiserror だけ).
+# #644 PR3a: crates/banto-hub-tls-trust (Hub の loopback TLS の置き場
+# `<ProgramData>\BantoHub\tls\` を書かずに確かめて読む部品。banto-hub-core の
+# `hub_tls_prepare` から移し、Hub のサービスとクライアント（ChronoGazer）が同じ確かめを使う).
 # R1-1: crates/banto-driver-api (ドライバの境界の型だけを持つ、crates.io へ公開する
 # crate。独自の版 0.1.0 と `publish = true`。banto-plc が共通の型をここから再輸出する.
 # docs/banto-driver-api-design.md §2.1).
@@ -80,6 +83,7 @@ members = [
     "crates/banto-rtsp",
     "crates/banto-tagclient",
     "crates/banto-hub-bootstrap",
+    "crates/banto-hub-tls-trust",
     "crates/banto-instance-lock",
     "crates/banto-desktop-tray",
     "crates/banto-exit-once",

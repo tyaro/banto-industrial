@@ -18,8 +18,8 @@ use banto_safe_root::InstallUserSid;
 use banto_service_control::ConsoleLine;
 
 use super::super::{
-    inspect_identity, prepare_hub_tls, DirHow, FileAcl, HubTlsOps, Refused, CERT_FILE, CERT_TEMP,
-    KEY_FILE, KEY_TEMP, TLS_DIR,
+    inspect_identity, prepare_hub_tls, DirHow, FileAcl, HubTlsOps, Refused, TlsTrustOps, CERT_FILE,
+    CERT_TEMP, KEY_FILE, KEY_TEMP, TLS_DIR,
 };
 use super::{RegistryMachineEnvironment, WinTlsDir, WindowsHubTlsOps};
 use crate::sink_config_prepare::FileOpenError;
@@ -62,35 +62,16 @@ struct TempOps {
     env: TempEnv,
 }
 
-impl HubTlsOps for TempOps {
+impl TlsTrustOps for TempOps {
     type Env = TempEnv;
     type Dir = WinTlsDir;
     type File = banto_safe_root::acl::PinnedFile;
-    /// 本物の名前付き mutex はテスト同士（並列）で取り合うので、ここでは取らない。
-    type Lock = ();
 
-    fn hold_lock(&self) -> Result<Option<()>, String> {
-        Ok(Some(()))
-    }
     fn machine_env(&self) -> &TempEnv {
         &self.env
     }
-    fn current_user_sid(&self) -> Result<InstallUserSid, String> {
-        WindowsHubTlsOps.current_user_sid()
-    }
-    fn now_unix(&self) -> i64 {
-        WindowsHubTlsOps.now_unix()
-    }
     fn pin_dir(&self, dir: &Path) -> Result<Option<WinTlsDir>, String> {
         WindowsHubTlsOps.pin_dir(dir)
-    }
-    fn create_child_dir(
-        &self,
-        parent: &WinTlsDir,
-        name: &str,
-        how: DirHow,
-    ) -> Result<Option<WinTlsDir>, String> {
-        WindowsHubTlsOps.create_child_dir(parent, name, how)
     }
     fn open_child_dir(&self, parent: &WinTlsDir, name: &str) -> Result<Option<WinTlsDir>, String> {
         WindowsHubTlsOps.open_child_dir(parent, name)
@@ -101,6 +82,29 @@ impl HubTlsOps for TempOps {
         name: &str,
     ) -> Result<Option<Self::File>, FileOpenError> {
         WindowsHubTlsOps.open_child_file(parent, name)
+    }
+}
+
+impl HubTlsOps for TempOps {
+    /// 本物の名前付き mutex はテスト同士（並列）で取り合うので、ここでは取らない。
+    type Lock = ();
+
+    fn hold_lock(&self) -> Result<Option<()>, String> {
+        Ok(Some(()))
+    }
+    fn current_user_sid(&self) -> Result<InstallUserSid, String> {
+        WindowsHubTlsOps.current_user_sid()
+    }
+    fn now_unix(&self) -> i64 {
+        WindowsHubTlsOps.now_unix()
+    }
+    fn create_child_dir(
+        &self,
+        parent: &WinTlsDir,
+        name: &str,
+        how: DirHow,
+    ) -> Result<Option<WinTlsDir>, String> {
+        WindowsHubTlsOps.create_child_dir(parent, name, how)
     }
     fn create_child_file(
         &self,

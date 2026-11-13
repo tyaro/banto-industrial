@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use banto_safe_root::acl::{
-    FileSecurity, ObservedAce, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID, MODIFY_ACCESS_MASK,
-    READ_EXECUTE_ACCESS_MASK, SYSTEM_SID,
+    Exposure, FileSecurity, ObservedAce, ObservedDacl, PinnedDirInfo, ADMINISTRATORS_SID,
+    MODIFY_ACCESS_MASK, READ_EXECUTE_ACCESS_MASK, SYSTEM_SID,
 };
 use banto_safe_root::guard::{KnownFolders, MachineEnvironment};
 use banto_safe_root::InstallUserSid;
@@ -308,10 +308,47 @@ impl FakeOps {
     }
 }
 
-impl HubTlsOps for FakeOps {
+impl TlsTrustOps for FakeOps {
     type Env = FakeEnv;
     type Dir = FakeDir;
     type File = FakeFile;
+
+    fn machine_env(&self) -> &FakeEnv {
+        &self.env
+    }
+    fn pin_dir(&self, dir: &Path) -> Result<Option<FakeDir>, String> {
+        self.log.borrow_mut().push(format!("pin {}", short(dir)));
+        Ok(self.dirs.borrow().get(dir).map(|entry| FakeDir {
+            path: dir.to_path_buf(),
+            entry: entry.clone(),
+        }))
+    }
+    fn open_child_dir(&self, parent: &FakeDir, name: &str) -> Result<Option<FakeDir>, String> {
+        let path = parent.path.join(name);
+        self.log.borrow_mut().push(format!("open_dir {name}"));
+        Ok(self.dirs.borrow().get(&path).map(|entry| FakeDir {
+            path: path.clone(),
+            entry: entry.clone(),
+        }))
+    }
+    fn open_child_file(
+        &self,
+        parent: &FakeDir,
+        name: &str,
+    ) -> Result<Option<FakeFile>, FileOpenError> {
+        let path = parent.path.join(name);
+        self.log.borrow_mut().push(format!("open_file {name}"));
+        if let Some(error) = self.open_error.get(name) {
+            return Err(error.clone());
+        }
+        Ok(self.files.borrow().get(&path).map(|entry| FakeFile {
+            path: path.clone(),
+            entry: entry.clone(),
+        }))
+    }
+}
+
+impl HubTlsOps for FakeOps {
     type Lock = ();
 
     fn hold_lock(&self) -> Result<Option<()>, String> {
@@ -322,21 +359,11 @@ impl HubTlsOps for FakeOps {
             LockState::Error => Err("拒否されました".to_string()),
         }
     }
-    fn machine_env(&self) -> &FakeEnv {
-        &self.env
-    }
     fn current_user_sid(&self) -> Result<InstallUserSid, String> {
         Ok(InstallUserSid::parse(ME).unwrap())
     }
     fn now_unix(&self) -> i64 {
         self.now
-    }
-    fn pin_dir(&self, dir: &Path) -> Result<Option<FakeDir>, String> {
-        self.log.borrow_mut().push(format!("pin {}", short(dir)));
-        Ok(self.dirs.borrow().get(dir).map(|entry| FakeDir {
-            path: dir.to_path_buf(),
-            entry: entry.clone(),
-        }))
     }
     fn create_child_dir(
         &self,
@@ -361,29 +388,6 @@ impl HubTlsOps for FakeOps {
             });
         self.dirs.borrow_mut().insert(path.clone(), entry.clone());
         Ok(Some(FakeDir { path, entry }))
-    }
-    fn open_child_dir(&self, parent: &FakeDir, name: &str) -> Result<Option<FakeDir>, String> {
-        let path = parent.path.join(name);
-        self.log.borrow_mut().push(format!("open_dir {name}"));
-        Ok(self.dirs.borrow().get(&path).map(|entry| FakeDir {
-            path: path.clone(),
-            entry: entry.clone(),
-        }))
-    }
-    fn open_child_file(
-        &self,
-        parent: &FakeDir,
-        name: &str,
-    ) -> Result<Option<FakeFile>, FileOpenError> {
-        let path = parent.path.join(name);
-        self.log.borrow_mut().push(format!("open_file {name}"));
-        if let Some(error) = self.open_error.get(name) {
-            return Err(error.clone());
-        }
-        Ok(self.files.borrow().get(&path).map(|entry| FakeFile {
-            path: path.clone(),
-            entry: entry.clone(),
-        }))
     }
     fn create_child_file(
         &self,

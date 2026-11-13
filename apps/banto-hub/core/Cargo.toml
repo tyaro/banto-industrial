@@ -62,6 +62,10 @@ banto-service-elev = { path = "../../../crates/banto-service-elev" }
 # サービスが profile の設定 DB の本体・`-wal`・`-shm` を握ったまま開く口
 # （`banto_safe_root::sqlite`）。sqlx・libsqlite3-sys はこの crate が既に木に持つ版。
 banto-safe-root = { path = "../../../crates/banto-safe-root", features = ["sqlite"] }
+# #644 PR3a: Hub の loopback TLS の置き場（`<ProgramData>\BantoHub\tls\`）の定数・読み取りの
+# 操作・確かめ（`hub_tls_prepare` の手順 1〜3）。クライアント（ChronoGazer）と同じコードを使う
+# ための共有 crate で、依存はこの crate が既に持つもの（新しい package は増えない）。
+banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 # R2b-1b（docs/banto-hub-connection-settings-design.md §5.1・§5.2）: `src/secrets.rs` が接続の
 # 秘密値を封印する部品（`Protector`・Windows の `DpapiMachine`・`MAX_SECRET_LEN`）を使う。
 # 保存先のファイル（`FileSecretStore`）は使わない - blob は DB に置く（設計 §5.1 の Q1 (c)）。
