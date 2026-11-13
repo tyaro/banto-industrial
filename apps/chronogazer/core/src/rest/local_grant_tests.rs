@@ -89,10 +89,13 @@ async fn fixture_with(
     if let Some(setting) = setting {
         write_setting(&settings, setting).await.expect("write");
     }
-    let hub =
-        crate::hub::HubService::new(settings.clone(), Arc::new(crate::hub::UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+    let hub = crate::hub::HubService::new(
+        settings.clone(),
+        Arc::new(crate::hub::UnavailableKeyStore),
+        crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+    )
+    .await
+    .expect("HubService::new");
     let auth = super::user_auth_state(users.clone(), audit.clone());
     let (tx, _rx) = broadcast::channel(16);
     let settings_lock = Arc::new(tokio::sync::Mutex::new(()));

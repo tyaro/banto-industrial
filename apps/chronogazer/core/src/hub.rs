@@ -129,7 +129,7 @@ use banto_core::BantoError;
 use banto_hub_bootstrap::{
     error::{Error as BootstrapError, ErrorKind as BootstrapErrorKind},
     BootstrapState, Bootstrapper, CredentialIdentity, HubConnection, HubRecord, HubStatus,
-    KeyStore,
+    HubTlsSource, KeyStore, UnreachableCause,
 };
 use banto_tagclient::{
     BindingRequest, CatalogTag, Endpoint, ErrorKind as TagErrorKind, TagClientConnectionState,
@@ -138,6 +138,7 @@ use banto_tagclient::{
 use serde::Serialize;
 use tokio::sync::{watch, Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
 
+use crate::hub_tls::HubTlsPolicy;
 use crate::settings::SettingsService;
 
 /// `banto-hub` が発行するキー名の先頭に付くアプリ識別子。
@@ -218,6 +219,10 @@ pub struct HubView {
     /// 購読の状態（#383 段階1）。`status` の 6 状態とは**別軸**で、購読が
     /// 張れなくても 6 状態は汚れない。
     pub subscription: HubSubscriptionView,
+    /// 保存済みの接続先を TLS の決まり（[`HubTlsPolicy`]、#644）で使わなかった理由と
+    /// 次の一手。このとき `status` は `Unreachable { cause: hub_tls }` で、何も送って
+    /// いない。それ以外は `None`。
+    pub endpoint_problem: Option<String>,
 }
 
 impl HubView {
@@ -226,6 +231,7 @@ impl HubView {
         record: Option<&HubRecord>,
         tags: Option<Vec<HubTagView>>,
         subscription: HubSubscriptionView,
+        endpoint_problem: Option<String>,
     ) -> Self {
         Self {
             status,
@@ -236,6 +242,7 @@ impl HubView {
                 .unwrap_or_default(),
             tags,
             subscription,
+            endpoint_problem,
         }
     }
 }
@@ -454,7 +461,22 @@ fn to_banto_error(error: BootstrapError) -> BantoError {
         BootstrapErrorKind::InvalidEndpoint => BantoError::Validation {
             field_errors: vec![banto_core::FieldError {
                 field: "endpoint".to_string(),
-                message: "接続先は http://ホスト:ポート の形式で入力してください".to_string(),
+                message: format!(
+                    "接続先は http://ホスト:ポート の形式で入力してください（同じ PC の Hub は {}）",
+                    crate::hub_tls::LOOPBACK_HUB_ENDPOINT
+                ),
+            }],
+        },
+        // #644: TLS の決まりで断った（loopback の http・証明書を読めない）。理由は
+        // `crate::hub_tls` が画面向けに書いたもので、キーや秘密を含まない。
+        BootstrapErrorKind::HubTls => BantoError::Validation {
+            field_errors: vec![banto_core::FieldError {
+                field: "endpoint".to_string(),
+                message: if detail.is_empty() {
+                    "Hub の TLS の設定のため、この接続先には接続しません".to_string()
+                } else {
+                    detail
+                },
             }],
         },
         BootstrapErrorKind::InvalidKey => BantoError::Validation {
@@ -663,6 +685,16 @@ fn fingerprint_endpoint(endpoint: &str) -> String {
     Endpoint::new(endpoint)
         .map(|parsed| parsed.tags_url().to_string())
         .unwrap_or_else(|_| endpoint.trim().to_owned())
+}
+
+/// 世代の同一性（[`Fingerprint`]）の接続先の部分: 正規化した接続先と、pin した https
+/// なら証明書の目印（#644）。
+fn fingerprint_endpoint_pinned(endpoint: &str, pin_marker: Option<u64>) -> String {
+    let endpoint = fingerprint_endpoint(endpoint);
+    match pin_marker {
+        Some(marker) => format!("{endpoint}#pin={marker:016x}"),
+        None => endpoint,
+    }
 }
 
 /// 1 つの購読世代。`TagClientHandle` を所有し、その `watch` を読むだけで
@@ -1522,6 +1554,8 @@ fn hub_mutating_timeout_reason(installation_id: &str) -> String {
 struct HubCall {
     connection: HubConnection,
     reason_override: Option<String>,
+    /// [`HubView::endpoint_problem`]。保存済みの接続先を TLS の決まりで断ったときだけ。
+    endpoint_problem: Option<String>,
 }
 
 /// bootstrapper の**ネットワークを伴う**呼び出しは、操作ロックを持ったまま
@@ -1566,11 +1600,49 @@ where
     with_timeout(HUB_OPERATION_TIMEOUT, hub_timeout_reason, future).await
 }
 
+/// **保存済みの接続先**を読むだけの往復（`status`・`refresh_catalog`・見張り）用の
+/// [`with_hub_timeout`]。違いは 1 つ: TLS の決まりで断った
+/// （[`BootstrapErrorKind::HubTls`]、#644）ときはエラーにせず
+/// [`HubCall::refused_by_tls`] にする - エラーにすると画面は保存済みの接続先ごと
+/// 見えなくなり、購読の停止理由も更新されない。入力された接続先を使う `connect`・
+/// `adopt_manual_key` はエラーのまま（入力欄の横に理由を出す）。
+async fn with_saved_hub_timeout<F>(future: F) -> Result<HubCall, BantoError>
+where
+    F: std::future::Future<Output = Result<HubConnection, BootstrapError>>,
+{
+    match tokio::time::timeout(HUB_OPERATION_TIMEOUT, future).await {
+        Ok(Err(error)) if error.kind() == BootstrapErrorKind::HubTls => {
+            Ok(HubCall::refused_by_tls(&error))
+        }
+        Ok(result) => result.map(HubCall::answered).map_err(to_banto_error),
+        Err(_elapsed) => Ok(HubCall::timed_out(hub_timeout_reason())),
+    }
+}
+
 impl HubCall {
     fn answered(connection: HubConnection) -> Self {
         Self {
             connection,
             reason_override: None,
+            endpoint_problem: None,
+        }
+    }
+
+    /// 保存済みの接続先を TLS の決まり（[`HubTlsPolicy`]、#644）で断った往復。何も
+    /// 送っていないので、どのキーについても判定していない（`judged: None`）。記録は
+    /// 書き換えず、キーも発行しない（オーナー決定 2026-11-13）。理由は購読の停止理由と
+    /// [`HubView::endpoint_problem`] の両方に出す。
+    fn refused_by_tls(error: &BootstrapError) -> Self {
+        let reason = error
+            .detail()
+            .unwrap_or("Hub の TLS の設定のため、保存済みの接続先には接続しません")
+            .to_owned();
+        Self {
+            connection: HubConnection::failed(HubStatus::Unreachable {
+                cause: UnreachableCause::HubTls,
+            }),
+            reason_override: Some(reason.clone()),
+            endpoint_problem: Some(reason),
         }
     }
 
@@ -1583,6 +1655,7 @@ impl HubCall {
                 cause: banto_hub_bootstrap::UnreachableCause::Transport,
             }),
             reason_override: Some(reason),
+            endpoint_problem: None,
         }
     }
 
@@ -1599,6 +1672,9 @@ struct HubInner {
     settings: SettingsService,
     mirror: Arc<SettingsMirror>,
     bootstrapper: Arc<Bootstrapper>,
+    /// bootstrapper に差した TLS の決まり（#644）。購読の世代の同一性に pin の目印を
+    /// 混ぜるために持つ（[`HubTlsPolicy::pin_marker`]）。
+    tls: HubTlsPolicy,
     /// このインストールの ID。発行されるキー名の接頭辞
     /// （`{APP_ID}-{installation_id}-`）を利用者に案内するために持つ
     /// （[`hub_mutating_timeout_reason`]）。`Bootstrapper` にも同じ値を
@@ -1694,9 +1770,13 @@ impl HubService {
     /// `keys` は実行形態ごとに差し替える: デスクトップ（`src-tauri`）と
     /// `chronogazer-server` は DPAPI のファイル（`crate::key_store`、#392 B2-4b）、
     /// `banto-serve` は [`UnavailableKeyStore`]。
+    ///
+    /// `tls` は Hub と話すときの TLS の決まり（#644、[`crate::hub_tls`]）。製品の host は
+    /// [`HubTlsPolicy::production`]（loopback は pin した https だけ）を渡す。
     pub async fn new(
         settings: SettingsService,
         keys: Arc<dyn KeyStore>,
+        tls: HubTlsPolicy,
     ) -> Result<Self, BantoError> {
         let installation_id = match settings.get(KEY_HUB_INSTALLATION_ID).await? {
             Some(value) if !value.trim().is_empty() => value,
@@ -1707,12 +1787,15 @@ impl HubService {
             }
         };
         let mirror = Arc::new(SettingsMirror::default());
-        let bootstrapper = Arc::new(Bootstrapper::new(
-            APP_ID,
-            installation_id.clone(),
-            keys,
-            Arc::clone(&mirror) as Arc<dyn BootstrapState>,
-        ));
+        let bootstrapper = Arc::new(
+            Bootstrapper::new(
+                APP_ID,
+                installation_id.clone(),
+                keys,
+                Arc::clone(&mirror) as Arc<dyn BootstrapState>,
+            )
+            .with_hub_tls_source(Arc::new(tls.clone()) as Arc<dyn HubTlsSource>),
+        );
         let subscription = Subscription::default();
         let feed = subscription.feed.clone();
         Ok(Self {
@@ -1720,6 +1803,7 @@ impl HubService {
                 settings,
                 mirror,
                 bootstrapper,
+                tls,
                 installation_id,
                 operation: AsyncMutex::new(()),
                 subscription: AsyncMutex::new(subscription),
@@ -1748,7 +1832,7 @@ impl HubService {
         if record.is_none() {
             return Ok(self.not_configured_view().await);
         }
-        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_saved_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         let saved = self.flush().await;
         self.finish(saved, call, Trigger::Observe).await
     }
@@ -2069,7 +2153,7 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return HubCollectReadiness::NotConfigured;
         }
-        let call = match with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
+        let call = match with_saved_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await {
             Ok(call) => call,
             Err(err) => {
                 eprintln!("banto: 収集の開始時にHubのタグ一覧を読めませんでした: {err}");
@@ -2375,7 +2459,7 @@ impl HubService {
         if self.inner.mirror.current().is_none() {
             return Ok(());
         }
-        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_saved_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         // 保存に失敗しても**突き合わせは必ず行う**（#394 のレビュー P1-2）。
         // 設定 DB が一時的に書けないことと、購読を張り直せるかどうかは別の
         // 話で、前者で後者を止めると値が流れないまま放置される。
@@ -2432,7 +2516,7 @@ impl HubService {
     /// タグ一覧の再取得。
     pub async fn refresh_catalog(&self) -> Result<HubView, BantoError> {
         let _operation = self.begin_operation().await?;
-        let call = with_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
+        let call = with_saved_hub_timeout(self.inner.bootstrapper.refresh_catalog()).await?;
         let saved = self.flush().await;
         self.finish(saved, call, Trigger::Observe).await
     }
@@ -2479,6 +2563,7 @@ impl HubService {
             None,
             None,
             self.subscription().await,
+            None,
         )
     }
 
@@ -2497,6 +2582,7 @@ impl HubService {
             record.as_ref(),
             tags,
             self.subscription().await,
+            call.endpoint_problem,
         )
     }
 
@@ -2652,8 +2738,11 @@ impl HubService {
         //    **現世代が `Unauthorized` で終端しているとき**は、同一性が
         //    一致していても張り直す - そうしないと新しいキーが使われず、
         //    値が二度と流れない状態が残る。
+        // #644: pin した https なら、この操作で使った証明書の目印も混ぜる - 管理者が
+        // `prepare-hub-tls --renew` で作り直したら、古い pin のまま再接続し続ける世代を
+        // 張り直す（[`HubTlsPolicy::pin_marker`]）。
         let fingerprint: Fingerprint = (
-            fingerprint_endpoint(&record.endpoint),
+            fingerprint_endpoint_pinned(&record.endpoint, self.inner.tls.pin_marker()),
             fingerprint_tags(&plan.requests),
         );
         let same_generation = slot
@@ -2687,6 +2776,16 @@ impl HubService {
             // エラーにして接続状態を壊さない。
             Ok(None) => {
                 slot.reason = Some(REASON_NO_KEY.to_owned());
+                return;
+            }
+            // #644: TLS の決まりで断った（証明書をこの間に読めなくなった等）なら、
+            // その理由（画面向けの文）をそのまま出す。
+            Err(err) if err.kind() == BootstrapErrorKind::HubTls => {
+                slot.reason = Some(
+                    err.detail()
+                        .unwrap_or("Hub の TLS の設定のため購読していません")
+                        .to_owned(),
+                );
                 return;
             }
             Err(err) => {
@@ -2903,9 +3002,13 @@ mod tests {
     async fn service_with_pool() -> (sqlx::SqlitePool, SettingsService, HubService) {
         let pool = init_db_memory().await.expect("init_db_memory");
         let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
-        let hub = HubService::new(settings.clone(), Arc::new(UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings.clone(),
+            Arc::new(UnavailableKeyStore),
+            HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         (pool, settings, hub)
     }
 
@@ -3364,9 +3467,13 @@ mod tests {
         assert_eq!(first.len(), 36, "canonical UUID form");
         assert_eq!(&first[14..15], "4", "version 4");
 
-        let again = HubService::new(settings.clone(), Arc::new(UnavailableKeyStore))
-            .await
-            .unwrap();
+        let again = HubService::new(
+            settings.clone(),
+            Arc::new(UnavailableKeyStore),
+            HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .unwrap();
         drop(again);
         assert_eq!(
             settings.get(KEY_HUB_INSTALLATION_ID).await.unwrap(),
@@ -4489,9 +4596,13 @@ mod tests {
         use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
         let pool = init_db_memory().await.expect("init_db_memory");
         let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
-        let hub = HubService::new(settings, Arc::new(UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings,
+            Arc::new(UnavailableKeyStore),
+            HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         assert!(
             !hub.refresh_registered().await,
             "レジストリ未接続なら何もしない"
@@ -4606,9 +4717,13 @@ mod tests {
         use banto_tags::{CollectionGroupService, PlcConnectionService, TagService};
         let pool = init_db_memory().await.expect("init_db_memory");
         let settings = SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
-        let hub = HubService::new(settings, Arc::new(UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings,
+            Arc::new(UnavailableKeyStore),
+            HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         hub.attach_registry(pool.clone());
         let connections =
             PlcConnectionService::with_registry(pool.clone(), crate::test_support::drivers())
@@ -6013,9 +6128,13 @@ mod tests {
         let keys = Arc::new(MemoryKeyStore::new());
         keys.set(KEYRING_ACCOUNT, "bh_abcd1234_opaque-secret")
             .unwrap();
-        let hub = HubService::new(settings.clone(), Arc::clone(&keys) as Arc<dyn KeyStore>)
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings.clone(),
+            Arc::clone(&keys) as Arc<dyn KeyStore>,
+            HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         let record = keyring_record(endpoint, &[]);
         settings
             .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
@@ -6024,6 +6143,125 @@ mod tests {
         hub.inner.mirror.reset(Some(record));
         register_for_test(&hub, registered).await;
         (settings, hub)
+    }
+
+    /// 本番の決まりで、証明書は読まれてはいけない（loopback の http は読む前に断る）。
+    struct CertMustNotBeRead;
+
+    impl crate::hub_tls::HubCertReader for CertMustNotBeRead {
+        fn read_cert_pem(&self) -> Result<Vec<u8>, String> {
+            panic!("a loopback http endpoint must be refused before the certificate is read")
+        }
+    }
+
+    /// #644 PR3b（オーナー決定 2026-11-13 の 2）: 以前の版で保存した loopback の http の
+    /// 記録は、本番の決まりでは使わない。状態・購読・収集の開始は案内を出して止まり、
+    /// 記録もキーも書き換えず、Hub へは何も送らない。入力された同じ接続先での「接続」も
+    /// 入力欄の横に同じ案内を出して断る（キーを発行しない）。
+    #[tokio::test]
+    async fn a_saved_loopback_http_record_is_refused_with_the_guidance_and_nothing_is_sent() {
+        use crate::hub_tls::LOOPBACK_HTTP_REFUSED;
+        use banto_hub_bootstrap::state::memory::MemoryKeyStore;
+
+        // 聞いているだけの相手。1 本でも繋がれば失敗にする。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+
+        let pool = init_db_memory().await.expect("init_db_memory");
+        let settings = SettingsService::new(crate::db::Db::Sqlite(pool));
+        let keys = Arc::new(MemoryKeyStore::new());
+        keys.set(KEYRING_ACCOUNT, "bh_abcd1234_opaque-secret")
+            .unwrap();
+        let hub = HubService::new(
+            settings.clone(),
+            Arc::clone(&keys) as Arc<dyn KeyStore>,
+            HubTlsPolicy::with_reader(Arc::new(CertMustNotBeRead)),
+        )
+        .await
+        .expect("HubService::new");
+        let record = keyring_record(&endpoint, &[]);
+        settings
+            .set(KEY_HUB_RECORD, &serde_json::to_string(&record).unwrap())
+            .await
+            .unwrap();
+        hub.inner.mirror.reset(Some(record.clone()));
+        register_for_test(&hub, &["a"]).await;
+
+        // 状態: 保存済みの接続先は見せたまま、`hub_tls` と案内。
+        let view = hub.status().await.expect("status answers with a view");
+        assert_eq!(
+            view.status,
+            HubStatus::Unreachable {
+                cause: UnreachableCause::HubTls
+            }
+        );
+        assert_eq!(view.endpoint.as_deref(), Some(endpoint.as_str()));
+        assert_eq!(
+            view.endpoint_problem.as_deref(),
+            Some(LOOPBACK_HTTP_REFUSED)
+        );
+        assert_eq!(view.subscription.state, "stopped");
+        assert_eq!(
+            view.subscription.reason.as_deref(),
+            Some(LOOPBACK_HTTP_REFUSED)
+        );
+        assert_eq!(
+            serde_json::to_value(&view.status).unwrap(),
+            serde_json::json!({"state": "unreachable", "cause": "hub_tls"})
+        );
+
+        // 購読の再開・収集の開始も同じ理由で止まる。
+        hub.resume().await;
+        assert_eq!(
+            hub.subscription().await.reason.as_deref(),
+            Some(LOOPBACK_HTTP_REFUSED)
+        );
+        assert!(matches!(
+            hub.prepare_collect(vec!["a".to_owned()]).await,
+            HubCollectReadiness::Ready { catalog: None }
+        ));
+        assert_eq!(generation_sequence(&hub).await, None);
+
+        // 同じ接続先で「接続」し直しても、入力欄の横に案内を出して断る。
+        match hub.connect(&endpoint).await {
+            Err(BantoError::Validation { field_errors }) => {
+                assert_eq!(field_errors.len(), 1);
+                assert_eq!(field_errors[0].field, "endpoint");
+                assert_eq!(field_errors[0].message, LOOPBACK_HTTP_REFUSED);
+            }
+            other => panic!("connect must be refused: {other:?}"),
+        }
+
+        // 記録もキーもそのまま、Hub へは何も届いていない。
+        assert_eq!(hub.inner.mirror.current(), Some(record));
+        assert_eq!(
+            keys.get(KEYRING_ACCOUNT).unwrap().as_deref(),
+            Some("bh_abcd1234_opaque-secret")
+        );
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "nothing may connect to the saved loopback http endpoint"
+        );
+    }
+
+    /// #644: 証明書の目印が変われば世代の同一性も変わる（`--renew` の後に張り直す）。
+    #[test]
+    fn the_pin_marker_is_part_of_the_endpoint_fingerprint() {
+        let endpoint = "https://127.0.0.1:8723";
+        assert_eq!(
+            fingerprint_endpoint_pinned(endpoint, None),
+            fingerprint_endpoint(endpoint)
+        );
+        assert_ne!(
+            fingerprint_endpoint_pinned(endpoint, Some(1)),
+            fingerprint_endpoint_pinned(endpoint, Some(2))
+        );
+        assert_ne!(
+            fingerprint_endpoint_pinned(endpoint, Some(1)),
+            fingerprint_endpoint(endpoint)
+        );
     }
 
     async fn generation_sequence(hub: &HubService) -> Option<usize> {

@@ -20,8 +20,10 @@ use std::fmt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ErrorKind {
-    /// The supplied endpoint is not a plain-`http` origin (plus optional
-    /// path prefix) - mirrors `banto_tagclient::ErrorKind::InvalidEndpoint`.
+    /// The supplied endpoint is not an `http`/`https` origin (plus optional
+    /// path prefix), or its scheme does not agree with the certificate pin
+    /// ("pin set <=> `https`", #644) - mirrors
+    /// `banto_tagclient::ErrorKind::InvalidEndpoint`.
     InvalidEndpoint,
     /// A scope outside the issue whitelist was requested (`admin`, any
     /// `write:*`, or anything else not in [`ISSUABLE_SCOPES`]).
@@ -44,6 +46,14 @@ pub enum ErrorKind {
     State,
     /// The operation needs a saved connection and there is none yet.
     NotConfigured,
+    /// The app's [`HubTlsSource`] refused the endpoint or could not supply
+    /// its certificate pin (#644) - for example a loopback `http` endpoint
+    /// where the app requires pinned `https`, or a Hub certificate that could
+    /// not be read. Nothing was sent. The detail is the source's reason,
+    /// written for the settings screen.
+    ///
+    /// [`HubTlsSource`]: crate::HubTlsSource
+    HubTls,
 }
 
 impl ErrorKind {
@@ -56,6 +66,7 @@ impl ErrorKind {
             Self::KeyStore => "key_store",
             Self::State => "state",
             Self::NotConfigured => "not_configured",
+            Self::HubTls => "hub_tls",
         }
     }
 }

@@ -408,9 +408,13 @@ async fn hub_sourced_tags_are_recorded_by_the_same_collector() {
     // Hub に手動キーで接続する（デスクトップの「APIキーを採用」と同じ経路）。
     let settings = SettingsService::new(Db::Sqlite(pool.clone()));
     let keys: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
-    let hub = HubService::new(settings, keys)
-        .await
-        .expect("HubService を組める");
+    let hub = HubService::new(
+        settings,
+        keys,
+        chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+    )
+    .await
+    .expect("HubService を組める");
     let view = hub
         .adopt_manual_key(&endpoint, "bh_abcd1234_opaque-secret".to_string())
         .await
@@ -650,9 +654,13 @@ impl Fixture {
         let data_dir = resolve_data_dir(dir.path(), "./data");
         let settings = SettingsService::new(Db::Sqlite(pool.clone()));
         let keys: Arc<dyn KeyStore> = Arc::new(MemoryKeyStore::new());
-        let hub = HubService::new(settings, keys)
-            .await
-            .expect("HubService を組める");
+        let hub = HubService::new(
+            settings,
+            keys,
+            chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService を組める");
         let view = hub
             .adopt_manual_key(endpoint, "bh_abcd1234_opaque-secret".to_string())
             .await

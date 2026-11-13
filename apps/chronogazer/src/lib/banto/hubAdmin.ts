@@ -43,8 +43,13 @@ export type HubStatus =
 	| { state: 'unreachable'; cause: HubUnreachableCause }
 	| { state: 'needsPairing' };
 
-/** `banto_hub_bootstrap::UnreachableCause`。 */
-export type HubUnreachableCause = 'transport' | 'protocol' | 'server_error' | 'invalid_endpoint';
+/**
+ * `banto_hub_bootstrap::UnreachableCause`。`hub_tls`（#644）は、保存済みの接続先を
+ * TLS の決まり（同じ PC の Hub は証明書を pin した https だけ）で使わなかったこと。
+ * 何も送っていない。理由と次の一手は `HubView.endpointProblem` にある。
+ */
+export type HubUnreachableCause =
+	'transport' | 'protocol' | 'server_error' | 'invalid_endpoint' | 'hub_tls';
 
 /** Mirrors `chronogazer_core::hub::HubTagView`. */
 export interface HubTag {
@@ -76,6 +81,12 @@ export interface HubView {
 	selectedTags: string[];
 	tags: HubTag[] | null;
 	subscription: HubSubscription;
+	/**
+	 * 保存済みの接続先を TLS の決まりで使わなかった理由と次の一手（#644、
+	 * `chronogazer_core::hub::HubView::endpoint_problem`）。このとき `status` は
+	 * `unreachable`（`hub_tls`）。それ以外は `null`（古い応答では欠ける）。
+	 */
+	endpointProblem?: string | null;
 }
 
 /** `banto_tagclient::TagClientConnectionState` の綴りそのまま。 */
@@ -391,7 +402,7 @@ export function hubStatusLabel(status: HubStatus): string {
 export function hubStatusDetail(status: HubStatus): string {
 	switch (status.state) {
 		case 'notConfigured':
-			return '接続先のURLを入力して「接続」を押してください。';
+			return '接続先のURLを入力して「接続」を押してください（同じPCのHubには https://127.0.0.1:8723 を使います。Hubをサービスで動かし、管理者で prepare-hub-tls を済ませておいてください）。';
 		case 'connected':
 			return status.tagCount === 0
 				? 'Hubにはまだタグが登録されていません。Hub側でタグを登録すると、ここに表示されます。'
@@ -420,6 +431,8 @@ export function hubUnreachableCauseLabel(cause: HubUnreachableCause): string {
 			return 'Hubがエラーを返しました。';
 		case 'invalid_endpoint':
 			return 'リダイレクトが返されました（接続先が別のサーバーを指している可能性があります）。';
+		case 'hub_tls':
+			return 'この接続先へは接続していません（下の理由を確認してください）。';
 		default:
 			return '原因を特定できませんでした。';
 	}

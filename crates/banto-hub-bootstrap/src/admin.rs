@@ -237,6 +237,9 @@ fn join(base: &Url, segments: &[&str]) -> Url {
 pub(crate) struct AdminClient {
     http: Client,
     base: Url,
+    /// The pin this client was built with, so the catalog client of the same
+    /// operation uses exactly the same one (`Bootstrapper::verify`).
+    pins: Option<PinnedHubTls>,
 }
 
 impl AdminClient {
@@ -247,22 +250,26 @@ impl AdminClient {
     /// With `pins`, only the pinned Hub certificate is trusted (the caller
     /// has already checked that `base` is `https`); without, the client is the
     /// plain-HTTP one it always was.
-    pub(crate) fn new(base: Url, pins: Option<&PinnedHubTls>) -> Result<Self> {
+    pub(crate) fn new(base: Url, pins: Option<PinnedHubTls>) -> Result<Self> {
         let mut builder = ClientBuilder::new()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy();
-        if let Some(pins) = pins {
+        if let Some(pins) = &pins {
             builder = pins.configure_reqwest(builder);
         }
         let http = builder.build().map_err(|_| {
             tracing::warn!("failed to build the banto-hub admin client");
             Error::new(ErrorKind::InvalidEndpoint)
         })?;
-        Ok(Self { http, base })
+        Ok(Self { http, base, pins })
     }
 
     pub(crate) fn base(&self) -> &Url {
         &self.base
+    }
+
+    pub(crate) fn pins(&self) -> Option<&PinnedHubTls> {
+        self.pins.as_ref()
     }
 
     /// `GET /api/commissioning/status`. `Err(cause)` means the answer is

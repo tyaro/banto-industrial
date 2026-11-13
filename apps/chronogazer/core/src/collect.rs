@@ -4396,9 +4396,13 @@ mod tests {
         let (hub_id, hub_group, hub_tag) = seed_hub_connection(&pool).await;
 
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
-        let hub = HubService::new(settings, Arc::new(crate::hub::UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings,
+            Arc::new(crate::hub::UnavailableKeyStore),
+            crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         assert!(svc.attach_hub(hub.clone()));
         assert!(!svc.attach_hub(hub.clone()), "2 回目は無視する");
 
@@ -4434,9 +4438,13 @@ mod tests {
         answer: HubCollectReadiness,
     ) -> HubService {
         let settings = crate::settings::SettingsService::new(crate::db::Db::Sqlite(pool.clone()));
-        let hub = HubService::new(settings, Arc::new(crate::hub::UnavailableKeyStore))
-            .await
-            .expect("HubService::new");
+        let hub = HubService::new(
+            settings,
+            Arc::new(crate::hub::UnavailableKeyStore),
+            crate::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
+        )
+        .await
+        .expect("HubService::new");
         hub.answer_prepare_for_test(answer);
         assert!(svc.attach_hub(hub.clone()));
         hub

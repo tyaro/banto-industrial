@@ -4237,6 +4237,8 @@ fn desktop_engine_config_for(paths: &startup::LaunchPaths) -> EngineConfig {
         key_store: Arc::new(chronogazer_core::key_store::FailedKeyStore::new(
             "Hub の API キーの保存先をまだ開いていません",
         )),
+        // #644: 製品の決まり（loopback は pin した https だけ）。切り替える口は持たない。
+        hub_tls: chronogazer_core::hub_tls::HubTlsPolicy::production(),
         // #383 段階3 P3: Hub 経由の接続を収集で記録する。
         attach_hub: true,
         host: ChronoGazerHost::Desktop,
@@ -5227,6 +5229,7 @@ mod tests {
         let hub = HubService::new(
             settings.clone(),
             std::sync::Arc::new(chronogazer_core::hub::UnavailableKeyStore),
+            chronogazer_core::hub_tls::HubTlsPolicy::plain_loopback_http_for_dev(),
         )
         .await
         .expect("HubService::new");
@@ -5316,6 +5319,7 @@ mod tests {
             service_data_root: None,
             db_pin: chronogazer_core::engine::DbPin::Off,
             key_store: Arc::new(chronogazer_core::hub::UnavailableKeyStore),
+            hub_tls: chronogazer_core::hub_tls::HubTlsPolicy::production(),
             attach_hub: true,
             host: ChronoGazerHost::Desktop,
             listen: EngineListen::Disabled,

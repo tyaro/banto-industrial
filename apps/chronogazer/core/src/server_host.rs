@@ -577,6 +577,8 @@ fn engine_config(data_base: PathBuf, db_path: PathBuf, host: ChronoGazerHost) ->
         key_store: Arc::new(FailedKeyStore::new(
             "Hub の API キーの保存先をまだ開いていません",
         )),
+        // #644: 製品の決まり（loopback は pin した https だけ）。切り替える口は持たない。
+        hub_tls: crate::hub_tls::HubTlsPolicy::production(),
         attach_hub: true,
         host,
         listen: EngineListen::Disabled,

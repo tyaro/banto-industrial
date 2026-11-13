@@ -99,6 +99,10 @@ qrcode = { workspace = true }
 # 0.61 系（banto-safe-root・banto-instance-lock と同じ版）で、feature を足す
 # だけ（Cargo.lock にノードは増えない）。
 [target.'cfg(windows)'.dependencies]
+# #644 PR3b: 同じ PC の Hub の証明書を、置き場（`%ProgramData%\BantoHub\tls\`）の所有者・
+# DACL を確かめてから読み取り専用で読む（`crate::hub_tls`）。banto-hub と共有の path crate で、
+# 依存はすべて既に木にあり、Cargo.lock に新しい package は増えない。非 Windows では読まない。
+banto-hub-tls-trust = { path = "../../../crates/banto-hub-tls-trust" }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
@@ -109,6 +113,9 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+# #644 PR3b: `crate::hub_tls` のテストの証明書を作る（banto-hub-tls-trust・banto-hub-core と
+# 同じ版・feature。新しい package は増えない）。
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring"] }
 # R2b-5c: ランプ波つきのワイヤのシミュレータ（`banto_plc::ramp`。`dev_plc` とテストの「対照の実機」）。
 banto-plc = { path = "../../../crates/banto-plc", features = ["simulator"] }
 # `test-util` (#394 レビュー P1-1): `HUB_OPERATION_TIMEOUT` のテストを

@@ -23,6 +23,8 @@ pub mod events;
 // #332: Hub 接続（`banto-hub-bootstrap` の配線）。keyring は src-tauri、
 // `banto-serve` は `hub::UnavailableKeyStore` を渡す - モジュール doc 参照。
 pub mod hub;
+// #644 PR3b: Hub 接続の TLS の決まり（loopback は pin した https だけ）。
+pub mod hub_tls;
 // #392 B1-4: `GET /api/host`（未認証。シェルの probe が別製品・別 DB を見分ける）。
 pub mod host_info;
 // #383 段階3 P4: 「Hub から追加」（Hub のカタログからタグを登録する）。REST と

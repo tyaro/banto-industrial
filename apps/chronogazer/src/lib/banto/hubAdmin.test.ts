@@ -126,10 +126,11 @@ describe('hubStatusDetail', () => {
 
 describe('hubUnreachableCauseLabel', () => {
 	it('原因ごとに別の文言になる', () => {
-		const labels = (['transport', 'protocol', 'server_error', 'invalid_endpoint'] as const).map(
-			hubUnreachableCauseLabel
-		);
-		expect(new Set(labels).size).toBe(4);
+		const labels = (
+			['transport', 'protocol', 'server_error', 'invalid_endpoint', 'hub_tls'] as const
+		).map(hubUnreachableCauseLabel);
+		expect(new Set(labels).size).toBe(5);
+		expect(labels).not.toContain('原因を特定できませんでした。');
 	});
 });
 
