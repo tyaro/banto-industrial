@@ -411,9 +411,12 @@ impl HubRuntime {
     ///   持つ（[`RunningHub::shutdown_and_report`]）。
     /// - データのフォルダが profile の `data\` なら `dirs.data` の本当のパスを使い、書き込み
     ///   受付の状態ファイルは `dirs.data` のハンドル基準で書く（`WriteControl::restore_in`）。
+    ///   tstore の書き手と、収集していないときの保持期間の削除も `dirs.data` の中で日付ファイルを
+    ///   握ったまま扱う（`banto_tstore::DataPlace::Managed`、`expected` は
+    ///   `dirs.checked_access`。#623 PR4b）。
     /// - それ以外（`BANTO_DB`・`BANTO_HUB_DATA`・設定 DB の `data.dir` が profile の外）は
     ///   渡されたパスのまま使う（[`crate::profile_paths::is_outside_profile`]。ログの
-    ///   1 行は 661-2 で出す）。sqlx・tstore・banto の監査の保留はパスしか取らないので、
+    ///   1 行は 661-2 で出す）。sqlx・tstore の読み手・banto の監査の保留はパスしか取らないので、
     ///   確かめた後もパスで渡す（ChronoGazer と同じ受け入れ）。
     pub async fn start_with_profile_dirs(
         config: HubConfig,
@@ -649,6 +652,18 @@ impl HubRuntime {
             Some(dir) => dir.final_path().to_path_buf(),
             None => data_dir,
         };
+        // #623 PR4b: tstore の日付ファイルも、profile の `data\` なら握ったフォルダの中で
+        // 握ったまま開く・消す（`expected` は運用モードの形、サービスでだけ `Some`）。
+        // 外はパスのまま。
+        let tstore_place = match &held_data {
+            Some(dir) => banto_tstore::DataPlace::Managed {
+                dir: dir.clone(),
+                expected: given_dirs
+                    .as_ref()
+                    .and_then(|dirs| dirs.checked_access.clone()),
+            },
+            None => banto_tstore::DataPlace::Path(data_dir.clone()),
+        };
         // #634: OPC UA の鍵と証明書の置き場は、profile を握っていれば profile の `data\` の
         // 本当のパスの下（`BANTO_HUB_DATA` で tstore を外へ移していても profile の中）、
         // 握っていなければ実効のデータのフォルダの下（`crate::opcua_pki` のモジュール doc）。
@@ -825,6 +840,7 @@ impl HubRuntime {
                 sim_registry.clone(),
                 computed_engine.clone(),
             )
+            .with_data_place(tstore_place)
             .with_diag_log(DiagLog::new(log_line, log_err_line)),
         );
 
