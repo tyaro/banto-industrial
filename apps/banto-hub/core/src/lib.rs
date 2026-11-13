@@ -144,7 +144,10 @@
 //! - [`hub_tls_prepare`]: `banto-hub-elev prepare-hub-tls`（#644 PR1a）。Hub の loopback TLS の
 //!   鍵（ECDSA P-256）と自己署名の証明書（10 年）を `%ProgramData%\BantoHub\tls\` に、作るのと
 //!   同時に保護された DACL（鍵は SYSTEM・Administrators だけ、証明書と置き場は利用者に読み取り）を
-//!   付けて作る。既にあれば確かめて保つ。作り直しは `--renew`
+//!   付けて作る。既にあれば確かめて保つ。作り直しは `--renew`。Hub の Windows サービスは
+//!   `BANTO_HUB_TLS_*` が無ければ、ここを書き込みなしで確かめて読み（[`hub_tls_prepare::load`]、
+//!   #644 PR1b）、127.0.0.1:8723 で TLS を待ち受ける（読めない・8723 を取れないときは TLS 無しで
+//!   起動してサービスログに理由と対処を出す）
 //! - [`hub_health`]: T17-3（docs/banto-hub-t17-design.md §3「T17-3」・§4）。
 //!   設計 §4 に記述だけがあった[`hub_health::HubHealthProbe`] trait を実装
 //!   した - fallback UI（T16-2）が「別 profile/version」「mutex 所有者不明」

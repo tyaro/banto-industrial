@@ -16,7 +16,7 @@ use tokio_rustls::TlsAcceptor;
 #[test]
 fn installer_template_requires_a_pin_even_with_a_dummy_api_key() {
     let template = include_str!("../../banto-hub/installer/assets/banto-hub-sink.toml.example");
-    assert!(template.contains("hub_url = \"https://127.0.0.1:9443\""));
+    assert!(template.contains("hub_url = \"https://127.0.0.1:8723\""));
     assert!(template.contains("hub_tls_pinned_certs = []"));
     assert!(template.contains("api_key = \"\""));
 

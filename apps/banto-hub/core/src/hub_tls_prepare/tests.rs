@@ -1429,3 +1429,6 @@ fn refuses_without_touching_anything_when_the_lock_cannot_be_taken() {
     assert_eq!(ops.calls(), vec!["lock".to_string()]);
     assert!(ops.file_names().is_empty());
 }
+
+/// サービスの既定の TLS の読み込み（`super::load`、#644 PR1b）。
+mod load;

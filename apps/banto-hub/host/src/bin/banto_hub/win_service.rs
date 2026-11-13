@@ -95,7 +95,11 @@
 //!     `skip_profile_lock`。設定 DB のパスは運用モードの形を確かめてから渡す）→ Configured の
 //!     収集 → Running →「切り替えを終えました（所要 N 秒）」。`BANTO_DB`・`BANTO_HUB_DATA` が
 //!     profile の外なら 1 行ずつ出す（締めない。既知の制限）。起動に失敗したら Hub を止めて
-//!     から緩め直す（終了コードは 1〜3、緩め直せなければ 5）。
+//!     から緩め直す（終了コードは 1〜3、緩め直せなければ 5）。起動の直前に、Hub の TLS の
+//!     環境変数（`BANTO_HUB_TLS_*`）がどれも無ければ、`<ProgramData>\BantoHub\tls\` の鍵と
+//!     証明書を確かめて読み（`banto_hub_core::hub_tls_prepare::load`、#644 PR1b）、
+//!     127.0.0.1:8723 で TLS を待ち受ける。読めなければ理由と対処をログに出して TLS 無しで
+//!     起動する（オーナー決定 A。8723 を取れないときも同じ、決定 B）。
 //!
 //! STOP（設定モードへ）: Hub を止めて設定 DB を閉じる（`shutdown_and_report`。閉じ切れなければ
 //! 緩めずに 5）→ tokio ランタイムを Stopped の報告の前に終える（上限 [`RUNTIME_SHUTDOWN_WAIT`]。
@@ -115,6 +119,9 @@ use std::time::{Duration, Instant};
 
 use banto_hub_core::controller::{CollectionState, RunMode};
 use banto_hub_core::hub_log;
+use banto_hub_core::hub_tls_prepare::load::{
+    load_default_identity, DefaultHubTls, DefaultTlsUnavailable,
+};
 use banto_hub_core::profile_lock::{
     open_profile_dirs_checked, try_acquire_profile_exclusive, HubHostKind, ProfileLockError,
     DIR_AUDIT_SPOOL, DIR_CONFIG, DIR_DATA, DIR_LOGS,
@@ -135,7 +142,9 @@ use banto_hub_core::profile_paths::{
     build_hub_config_from_env, external_path_line, is_outside_profile,
     resolve_profile_paths_from_env, ExternalPath, ProfilePaths,
 };
-use banto_hub_core::runtime::{HubConfig, HubRuntime, HubStartError, RunningHub};
+use banto_hub_core::runtime::{
+    hub_tls_env_present, HubConfig, HubRuntime, HubStartError, RunningHub,
+};
 use banto_hub_core::service_manager::{
     dispatch_failure_lines, run_service, OverrunWatch, ServiceContext, ServiceExit, ServiceProgram,
     StopSignal, HUB_EXIT_LEFT_TIGHT, HUB_EXIT_PROFILE_LOCK_HELD,
@@ -306,6 +315,11 @@ type OwnersWriter = Box<dyn Fn(&str, &[InstallUserSid]) -> Result<(), String> + 
 type KnownFoldersSource = Box<dyn Fn() -> Result<KnownFolders, String> + Send + Sync>;
 /// Redirection Guard を有効にする（テストは呼ばない - テストのプロセス全体に効くため）。
 type RedirectionGuardSource = Box<dyn Fn() -> RedirectionGuard + Send + Sync>;
+
+/// 既定の TLS の鍵と証明書（#644 PR1b）。本番は環境変数が無ければ
+/// `load_default_identity(&WindowsHubTlsOps)`、あれば `None`（環境変数を優先）。テストは差し替える。
+type DefaultTlsSource =
+    Box<dyn Fn() -> Option<Result<DefaultHubTls, DefaultTlsUnavailable>> + Send + Sync>;
 
 /// サービスログ（本番は `hub_log` のサービスログ。テストは行を集める偽物）。
 pub(crate) trait ServiceLog: Send + Sync {
@@ -580,6 +594,7 @@ pub(crate) struct HubProgram {
     write_owners: OwnersWriter,
     known_folders: KnownFoldersSource,
     redirection_guard: RedirectionGuardSource,
+    default_tls: DefaultTlsSource,
     acl: Arc<dyn AclOps>,
     log: Arc<dyn ServiceLog>,
     runtime_shutdown_wait: Duration,
@@ -598,6 +613,7 @@ pub(crate) struct ProgramParts {
     pub write_owners: OwnersWriter,
     pub known_folders: KnownFoldersSource,
     pub redirection_guard: RedirectionGuardSource,
+    pub default_tls: DefaultTlsSource,
     pub acl: Arc<dyn AclOps>,
     pub log: Arc<dyn ServiceLog>,
 }
@@ -633,6 +649,14 @@ impl HubProgram {
                 banto_safe_root::guard::win::RegistryMachineEnvironment.known_folders()
             }),
             redirection_guard: Box::new(enable_redirection_guard),
+            default_tls: Box::new(|| {
+                if hub_tls_env_present() {
+                    return None;
+                }
+                Some(load_default_identity(
+                    &banto_hub_core::hub_tls_prepare::win::WindowsHubTlsOps,
+                ))
+            }),
             acl: Arc::new(RealAcl),
             log: Arc::new(HubServiceLog),
         })
@@ -645,6 +669,7 @@ impl HubProgram {
             write_owners: parts.write_owners,
             known_folders: parts.known_folders,
             redirection_guard: parts.redirection_guard,
+            default_tls: parts.default_tls,
             acl: parts.acl,
             log: parts.log,
             runtime_shutdown_wait: RUNTIME_SHUTDOWN_WAIT,
@@ -1119,6 +1144,17 @@ impl HubProgram {
             }
         };
 
+        // #644 PR1b: 既定の TLS（環境変数が無いときだけ）。読めなければ TLS 無しで起動する。
+        config.default_tls = match (self.default_tls)() {
+            Some(Ok(identity)) => Some(identity),
+            Some(Err(unavailable)) => {
+                for line in unavailable.log_lines() {
+                    self.log.error(&line);
+                }
+                None
+            }
+            None => None,
+        };
         let started = engine
             .runtime
             .block_on(HubRuntime::start_with_profile_dirs(config, dirs));

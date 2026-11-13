@@ -328,6 +328,7 @@ pub fn build_hub_config_from_env(host_kind: HubHostKind, drivers: HubDrivers) ->
         profile_id: paths.profile_id,
         host_kind,
         skip_profile_lock: false,
+        default_tls: None,
     }
 }
 

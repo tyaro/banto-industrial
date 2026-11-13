@@ -367,6 +367,7 @@ impl Fixture {
                     profile_id: paths.profile_id.clone(),
                     host_kind: HubHostKind::Service,
                     skip_profile_lock: false,
+                    default_tls: None,
                 };
                 (paths.clone(), config)
             }),
@@ -379,6 +380,7 @@ impl Fixture {
             }),
             known_folders: Box::new(|| Ok(KnownFolders::default())),
             redirection_guard: Box::new(|| RedirectionGuard::NotWindows),
+            default_tls: Box::new(|| None),
             acl: self.acl.clone(),
             log: Arc::new(FakeLog(self.trace.clone())),
         })
@@ -966,6 +968,7 @@ async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
         profile_id: profile_id.to_string(),
         host_kind: HubHostKind::Service,
         skip_profile_lock: false,
+        default_tls: None,
     };
 
     // `HubRuntime::start`の profile root 解決は`BANTO_HUB_ROOT`を読む。
@@ -985,5 +988,70 @@ async fn hub_runtime_start_fails_fast_when_profile_lock_already_held() {
             hub.shutdown().await;
             panic!("expected HubRuntime::start to fail while the profile lock is held");
         }
+    }
+}
+
+// --- 既定の TLS（#644 PR1b） -----------------------------------------------------------
+
+/// 既定の TLS を読めなければ、理由と対処をサービスログに出し、Hub は TLS 無しで動く
+/// （オーナー決定 A）。
+#[test]
+fn an_unavailable_default_tls_is_logged_and_the_hub_still_runs() {
+    let fx = Fixture::new("tls-unavailable", loose(), None);
+    let mut program = fx.program();
+    program.default_tls = Box::new(|| {
+        Some(Err(DefaultTlsUnavailable {
+            reason: "置き場がありません".to_string(),
+            remedy: "prepare-hub-tls を実行してください".to_string(),
+        }))
+    });
+    let running = spawn(program);
+    running.wait_running();
+    running.send(ScmControlKind::Stop);
+    assert_eq!(running.join(), Some(ServiceExit::Success));
+
+    let lines = fx.lines();
+    assert_in_order(
+        &lines,
+        &[
+            "acl:marker audit-spool",
+            "既定の TLS（https://127.0.0.1:8723）を待ち受けずに、TLS 無しで起動します: 置き場がありません",
+            "対処: prepare-hub-tls を実行してください",
+            "Windows サービスとして起動しました",
+        ],
+    );
+}
+
+/// 既定の TLS を読めたら、それを渡して Hub が動く（ポートはテストでは OS に任せる）。環境
+/// 変数が設定されているとき（`None`）は何も出さない。
+#[test]
+fn a_loaded_default_tls_is_handed_to_the_hub() {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let identity = banto_hub_core::hub_tls_prepare::generate_identity(now).unwrap();
+    let loaded = DefaultHubTls::from_checked_pem(
+        0,
+        identity.cert_pem.as_bytes().to_vec(),
+        identity.key_pem.as_bytes().to_vec(),
+        PathBuf::from("hub-cert.pem"),
+        now,
+    )
+    .unwrap();
+    for source in [Some(loaded), None] {
+        let fx = Fixture::new("tls-loaded", loose(), None);
+        let mut program = fx.program();
+        program.default_tls = Box::new(move || source.clone().map(Ok));
+        let running = spawn(program);
+        running.wait_running();
+        running.send(ScmControlKind::Stop);
+        assert_eq!(running.join(), Some(ServiceExit::Success));
+        let lines = fx.lines();
+        assert!(
+            has(&lines, "Windows サービスとして起動しました"),
+            "{lines:#?}"
+        );
+        assert!(!has(&lines, "既定の TLS"), "{lines:#?}");
     }
 }
